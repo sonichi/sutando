@@ -19,6 +19,11 @@ Run: python3 tests/health-check-core-quota.test.py
 """
 from __future__ import annotations
 
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import json
 import time
@@ -193,6 +198,15 @@ class TestCoreQuotaExhausted(unittest.TestCase):
         c = self.hc.check_core_quota_exhausted()
         self.assertEqual(c["status"], "fail")
         self.assertIn("7d_oi (50%, rejected)", c["detail"])
+
+    def test_serving_on_extra_usage_does_not_page(self):
+        # Issue #5283: 7d rejected but overage allowed and requests succeed.
+        self._write(available=False, status="rejected", util=(0.2, 1.0), extra={
+            "anthropic-ratelimit-unified-7d-status": "rejected",
+            "anthropic-ratelimit-unified-overage-status": "allowed"})
+        c = self.hc.check_core_quota_exhausted()
+        self.assertEqual(c["status"], "ok", c)
+        self.assertIn("extra usage", c["detail"])
 
     def test_a_rejected_overage_window_never_pages_on_its_own(self):
         # overage-status: rejected is permanent with overage off and carries no

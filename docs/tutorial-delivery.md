@@ -1,13 +1,13 @@
-# Tutorial delivery (moved verbatim from CLAUDE.md 2026-08-17)
+# Tutorial delivery
 
-## Tutorial
+The procedure lives in the `tutorial` skill: [`skills/tutorial/SKILL.md`](../skills/tutorial/SKILL.md).
 
-When the user says "tutorial", "walk me through", or "show me what you can do" (via voice or text):
-1. Read `notes/first-time-tutorial.md`
-2. Deliver the first section as a voice-friendly summary (1–2 sentences)
-3. Wait for the user to try it
-4. When they come back, deliver the next section
-5. Continue until done or the user says stop
-
-Keep each step conversational and brief — this is spoken, not read. Focus on what to say/try, skip setup details unless asked.
-
+- **Voice mode.** On "tutorial", "walk me through" or "show me what you can do", read
+  `notes/first-time-tutorial.md` and deliver it one brief, voice-friendly section at a time,
+  waiting for the user to try each step.
+- **AG2 Space mode.** Right after the first-contact greeting in the owner's DM, the skill creates
+  one "Getting started" HTML page (Room Commons) in that DM, a short AG2 Space tour with one thing
+  to try per part (a Claude Code history import part only on a Claude Code core), and summons
+  the owner to it. A marker
+  under `<workspace>/state/tutorial/` keeps it to one page per room, so a re-link or reinstall
+  refreshes the page instead of adding another.

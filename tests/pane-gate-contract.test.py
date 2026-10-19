@@ -58,6 +58,59 @@ def state(text, runtime):
     return pg.classify_pane(text, pg.ADAPTERS[runtime]).state
 
 
+class GateEvidence(unittest.TestCase):
+    def test_completed_recap_requires_completion_context(self):
+        recap = "※ recap: if you typed X, press Enter there to send it."
+        pane = recap + "\nNothing needs you this round.\n❯ \n" + FOOTER
+        self.assertNotRegex(pg.gate_evidence(pane), pg.AWAIT_HINT)
+        self.assertEqual(state(pane, "claude"), "idle-ready")
+        self.assertIn(recap, pg.gate_evidence(recap + "\n❯ "))
+
+    def test_unknown_dialog_evidence_survives_idle_chrome(self):
+        for hint in ("Enter to confirm · Esc to cancel", "Keyboard: Enter to confirm",
+                     "Keyboard: Enter to confirm.", "Keyboard: Enter to confirm your choice",
+                     "Please press Enter to overwrite the file.",
+                     "※ Please press Enter to overwrite the file.",
+                     "※ recap: Please press Enter to overwrite the file."):
+            dialog = "Overwrite the existing config file?\n" + hint
+            for suffix in ("\n❯ ", "\n❯ \x1b[2mshow me how to navigate\x1b[0m",
+                           "\n" + FOOTER, "\n❯ \n" + FOOTER):
+                styled = dialog + suffix
+                with self.subTest(frame=styled):
+                    evidence = pg.gate_evidence(pg._SGR.sub("", styled), styled)
+                    self.assertIn(dialog, evidence)
+                    self.assertNotIn(FOOTER, evidence)
+
+    def test_footer_boundary_survives_filtering(self):
+        dialog = "Overwrite the existing config file?\nEnter to confirm · Esc to cancel"
+        for composer in ("❯ ", "❯ \x1b[2mshow me how to navigate\x1b[0m"):
+            for frame in (FOOTER + "\n" + dialog + "\n" + composer,
+                          composer + "\n" + FOOTER + "\n" + dialog):
+                with self.subTest(frame=frame):
+                    verdict = pg.classify_pane(frame, pg.CLAUDE)
+                    self.assertEqual((verdict.state, verdict.reason), ("busy", "unlisted"))
+
+    def test_no_footer_ghost_is_not_gate_evidence(self):
+        styled = "❯ \x1b[2mshow me how to navigate\x1b[0m"
+        self.assertEqual(pg.gate_evidence(pg._SGR.sub("", styled), styled), "")
+        self.assertEqual(state(styled, "claude"), "idle-ready")
+
+
+class SGRStrippingIsComplete(unittest.TestCase):
+    """sonichi/sutando#5418 review: tmux 3.6a's `-e` can emit colon-separated
+    SGR params and OSC 8 hyperlinks; `_SGR` must strip both, or residual
+    escape bytes reach every consumer's plain-text view."""
+
+    def test_colon_separated_sgr_is_stripped(self):
+        self.assertEqual(pg._SGR.sub("", "\x1b[4:3mhello\x1b[0m"), "hello")
+
+    def test_osc8_hyperlink_is_stripped_bel_and_st_terminated(self):
+        st = "\x1b]8;;http://example.com\x1b\\click\x1b]8;;\x1b\\"
+        bel = "\x1b]8;;http://example.com\x07click\x1b]8;;\x07"
+        self.assertEqual(pg._SGR.sub("", st), "click")
+        self.assertEqual(pg._SGR.sub("", bel), "click")
+
+
 class ClaudeClassification(unittest.TestCase):
     def test_idle_footer_with_empty_prompt_is_idle_ready(self):
         v = pg.classify_pane(f"❯ \n{FOOTER}\n", pg.CLAUDE)
@@ -242,6 +295,25 @@ class CodexClassification(unittest.TestCase):
         capture = f"{CODEX_IDLE}Login successful. Press Enter to continue\u2026\n"
         v = pg.classify_pane(capture, pg.CODEX)
         self.assertEqual((v.state, v.reason), ("busy", "press-enter"))
+
+
+class QuotedDialogAboveTheTurnIsTranscript(unittest.TestCase):
+    """Tool output quoting a dialog sits above the turn's spinner; only rows below it are live."""
+    QUOTED = ("  ⎿  │ ❯ 1. Yes                                          │\n"
+              "     │ Enter to select · ↑/↓ to navigate · Esc to cancel │\n"
+              "✻ Perambulating… (1m 46s · esc to interrupt)\n")
+
+    def test_a_working_turn_with_a_draft_is_not_held_by_quoted_output(self):
+        v = pg.classify_pane(f"{self.QUOTED}❯ half typed\n{FOOTER}\n", pg.CLAUDE)
+        self.assertEqual((v.state, v.reason), ("busy", "working"))
+
+    def test_a_live_dialog_below_the_spinner_still_holds_the_pane(self):
+        live = "Select an option:\n❯ 1. main.py\n  2. util.py\n  Enter to select · Esc to cancel\n"
+        v = pg.classify_pane(self.QUOTED + live, pg.CLAUDE)
+        self.assertEqual((v.state, v.reason), ("busy", "selection"))
+
+    def test_live_tail_keeps_everything_without_a_turn_row(self):
+        self.assertEqual(pg.live_tail(["a", "b"]), ["a", "b"])
 
 
 class GateSignaturesNeedACurrentAffordance(unittest.TestCase):
@@ -777,6 +849,7 @@ class ClaudeConstantsHaveOneOwner(unittest.TestCase):
         self.assertIs(ciw._IDLE, pg.CLAUDE_IDLE)
         self.assertIs(ciw._AWAIT_HINT, pg.AWAIT_HINT)
         self.assertIs(ciw._FABLE_TEXT, pg.FABLE_TEXT)
+        self.assertIs(ciw._ANSI_SGR, pg.SGR_STRIP)
         self.assertEqual(ciw._SIGNATURES, pg.CLAUDE_GATE_SIGNATURES)
         self.assertTrue(ciw._is_idle_ready(f"❯ \n{FOOTER}\n"))
 
@@ -873,6 +946,7 @@ class EndToEndThroughTheRealScript(unittest.TestCase):
         shim = self.bin / "tmux"
         shim.write_text(
             "#!/usr/bin/env bash\n"
+            f'. "{REPO}/tests/lib/tmux-fake-unwrap.sh"\n'
             "printf '%s\\n' \"$*\" >> \"$TMUX_LOG\"\n"
             "case \" $* \" in\n"
             "  *' capture-pane '*)\n"

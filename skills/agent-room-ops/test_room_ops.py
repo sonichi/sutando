@@ -14,6 +14,11 @@ import urllib.error
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(__file__))
+sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "tests"))
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
 
 # Shadow the vault boundary before any gateway() call can reach it. gateway() now
 # resolves the token from the Keychain when the env has none — and this file's
@@ -1304,15 +1309,16 @@ class EventAccumulatorTests(unittest.TestCase):
         lines = open(paths[0]).read().split("\n")
         self.assertEqual(lines[0], f"id: {base[:-4]}")
         self.assertTrue(lines[1].startswith("timestamp: ") and lines[1].endswith("Z"))
+        self.assertTrue(lines[2].startswith("local_time: "))
         # Origin must be explicit at a glance: the [taskify] marker leads the
         # task line and the promoted-from suffix names the room.
-        self.assertTrue(lines[2].startswith("task: [taskify] "))
-        self.assertIn(f"(promoted from 3 subscribed events in {ROOM})", lines[2])
-        self.assertEqual(lines[3], "source: events-promotion")
-        self.assertEqual(lines[4], f"channel_id: {ROOM}")
-        self.assertEqual(lines[5], "priority: low")          # never outranks humans
-        self.assertEqual(lines[6], "model_hint: efficient")  # cheap-model eligible
-        self.assertEqual(lines[7], "access_tier: ambient")  # trust boundary: never owner
+        self.assertTrue(lines[3].startswith("task: [taskify] "))
+        self.assertIn(f"(promoted from 3 subscribed events in {ROOM})", lines[3])
+        self.assertEqual(lines[4], "source: events-promotion")
+        self.assertEqual(lines[5], f"channel_id: {ROOM}")
+        self.assertEqual(lines[6], "priority: low")          # never outranks humans
+        self.assertEqual(lines[7], "model_hint: efficient")
+        self.assertEqual(lines[8], "access_tier: ambient")  # trust boundary: never owner
         prov_line = next(ln for ln in lines if ln.startswith("provenance: "))
         prov = json.loads(prov_line.split("provenance: ", 1)[1])
         self.assertEqual(prov["source_event_ids"], ["$a", "$b", "$c"])

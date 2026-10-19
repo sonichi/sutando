@@ -86,14 +86,49 @@ def limit_windows(headers: dict) -> dict:
     return {w: v for w, v in quota_windows(headers).items() if w != "overage"}
 
 
-def resolve_available(status: str, proxy_available: Any, headers: Optional[dict] = None) -> bool:
+OVERAGE_STATUS = "anthropic-ratelimit-unified-overage-status"
+OVERAGE_OK = ("allowed", "allowed_warning")
+
+
+def classify_limit_state(record: Any) -> str:
+    """`allowed`, `overage` or `rejected` for a quota-state record. `overage`: a
+    limit is rejected but extra usage is allowed and no 429 has landed since the
+    headers were written. The proxy's `limitState` implements the same rule;
+    tests/fixtures/quota-limit-state.parity.json pins both."""
+    payload = record if isinstance(record, dict) else {}
+    headers = payload.get("headers")
+    headers = headers if isinstance(headers, dict) else {}
+    limited = headers.get("anthropic-ratelimit-unified-status") == "rejected" or any(
+        st == "rejected" for _u, st in limit_windows(headers).values())
+    if not limited:
+        return "allowed"
+    if headers.get(OVERAGE_STATUS) not in OVERAGE_OK:
+        return "rejected"
+    checked = _parse_when(payload.get("last_checked"))
+    ledger = payload.get("recent_rejections")
+    for rej in ledger if isinstance(ledger, list) else []:
+        if not isinstance(rej, dict) or rej.get("status") != 429:
+            continue
+        at = _parse_when(rej.get("ts"))
+        # An unordered 429 (either stamp unreadable) is not known to be older.
+        if checked is None or at is None or at >= checked:
+            return "rejected"
+    return "overage"
+
+
+def resolve_available(status: str, proxy_available: Any, headers: Optional[dict] = None,
+                      limit_state: Optional[str] = None) -> bool:
     """Resolve the proxy's persisted availability signal without coercion.
 
     `headers`, when given, gates on EVERY reported window, not just the
     headline: the proxy's `available` flag only reflects the overall/5h
     windows, so a per-model or weekly window (e.g. `7d_oi`) can be rejected
     while the headline and `available` both still read allowed.
+    `limit_state` "overage" (from `classify_limit_state`) is available: the
+    provider is serving on extra usage.
     """
+    if limit_state == "overage":
+        return True
     if status == "rejected":
         return False
     if headers and any(st == "rejected" for _u, st in limit_windows(headers).values()):
@@ -115,12 +150,14 @@ def availability_decision(
     headers = headers if isinstance(headers, dict) else {}
     status = headers.get("anthropic-ratelimit-unified-status", "unknown")
     routed = points_at_credential_proxy(base_url)
-    accepted = resolve_available(str(status), payload.get("available"), headers)
+    limit_state = classify_limit_state(payload)
+    accepted = resolve_available(str(status), payload.get("available"), headers, limit_state)
     available = accepted and routed and not stale
     return {
         "available": available,
         "routed": routed,
         "status": status,
+        "limit_state": limit_state,
         "unavailable_reason": (
             None if available
             else "not-routed" if not routed
@@ -344,13 +381,49 @@ def record_model(quota: Any) -> Optional[str]:
     return _norm_model(last.get("model")) if isinstance(last, dict) else None
 
 
+#: skills/model-switch's bare aliases, mapped to the proxy's full-id prefix.
+#: `default` names no family on purpose (fail-closed: unknown, not a guess).
+_FAMILY_PREFIX = {"opus": "claude-opus-", "sonnet": "claude-sonnet-",
+                   "haiku": "claude-haiku-", "fable": "claude-fable-"}
+
+
+def _model_family(value: Optional[str]) -> Optional[str]:
+    """The model family `value` belongs to (a menu alias or a full proxy id),
+    or None when it names no known family (e.g. `default`, or anything else)."""
+    if not value:
+        return None
+    if value in _FAMILY_PREFIX:
+        return value
+    for family, prefix in _FAMILY_PREFIX.items():
+        if value.startswith(prefix):
+            return family
+    return None
+
+
 def record_speaks_for_seat(quota: Any, env: SeatEnv, workspace) -> bool:
-    """True only when the seat's model and the record's are both known and equal.
-    A record refreshed on another model may say allowed while THIS seat's model
-    is limited, and the proxy's headers carry no per-model window to catch that
-    (measured: status, 5h, 7d, overage -- nothing per model), so unknown holds."""
+    """True only when the seat's model and the record's are both known and name
+    the same model, EXACTLY, or by family when the seat is a bare alias. A
+    record refreshed on another model may say allowed while THIS seat's model
+    is limited, and the proxy's headers carry no per-model window to catch
+    that (measured: status, 5h, 7d, overage -- nothing per model), so unknown
+    holds.
+
+    A menu alias (`opus`, `sonnet[1m]`, ...) and the full id the proxy reports
+    (`claude-opus-5-5`, `claude-sonnet-5`, ...) name the same model but are
+    never string-equal, so the family match covers that pairing; `default`
+    carries no family and so can only match a record from a literal `default`.
+
+    The family match applies only when the SEAT is a bare alias, never between
+    two full ids: a seat pinned to `claude-opus-4-1` and a record refreshed on
+    `claude-opus-5-5` stays unknown, same as before this match existed, because
+    per-model windows may differ within one family and an alias is the only
+    name that cannot already identify its own exact pinned version."""
     mine, theirs = seat_model(env, workspace), record_model(quota)
-    return mine is not None and theirs is not None and mine == theirs
+    if mine is None or theirs is None:
+        return False
+    if mine == theirs:
+        return True
+    return mine in _FAMILY_PREFIX and mine == _model_family(theirs)
 
 
 # ---- refreshing a stale record on purpose ---------------------------------

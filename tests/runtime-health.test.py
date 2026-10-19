@@ -106,6 +106,16 @@ for _name, _pane in (
     check(f"needs_login agrees with worker_auth_state.auth_expired: {_name}",
           rh.needs_login(_pane) is was.auth_expired(_pane))
 
+# 1a') A Codex core reads its own `•` response as signed in again, as the seat monitor does.
+_CODEX_REFUSED = "› /startup\nAuthentication required\n"
+_CODEX_BACK = _CODEX_REFUSED + "› hi\n• Hello.\n\n» Ask Codex to do anything\n"
+check("needs_login: a codex response after the refusal clears it for runtime codex",
+      rh.needs_login(_CODEX_BACK, "codex") is False and was.auth_expired(_CODEX_BACK, "codex") is False)
+check("needs_login: the same pane read as claude still needs login",
+      rh.needs_login(_CODEX_BACK) is True)
+check("needs_login: a codex spinner after the refusal is not a sign-in",
+      rh.needs_login(_CODEX_REFUSED + "• Working (0m 9s • esc to interrupt)\n", "codex") is True)
+
 # 1b) _tmux_socket(): a detached probe does not inherit SUTANDO_TMUX_SOCKET, so the
 #     import-time default reports a live core as offline. Prefer the recorded socket.
 _sock_tmp = tempfile.mkdtemp()

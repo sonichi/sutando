@@ -81,7 +81,9 @@ PRIVATE = re.compile(r"\\d\{17,20\}")
 for sib, channel in (("slack-bridge.py", "slack"), ("telegram-bridge.py", "telegram")):
     q = REPO / "src" / sib
     src = q.read_text() if q.is_file() else ""
-    check(f'body_claimable_by(peek, "{channel}")' in src,
+    gate = ('should_claim_proactive_peeked(' if channel == "telegram"
+            else f'body_claimable_by(peek, "{channel}")')
+    check(gate in src,
           f"{sib} gates through proactive_routing (parity, not new policy)")
     check(not PRIVATE.search(src),
           f"{sib} keeps NO private copy of the id grammar")

@@ -30,6 +30,7 @@ from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE.parent))  # src/
+from activity_bus import in_progress
 from delivery.readiness import read_ready_result
 from file_lock import locked_file
 from local_task_protocol import (KNOWN_HEADER_KEYS, find_archived_task,  # noqa: E402
@@ -156,14 +157,14 @@ class TasksView:
         stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         content = (f"id: {task_id}\n"
                    f"timestamp: {stamp}\n"
-                   f"task: {text}\n"
                    f"source: runtime-api\n"
                    f"channel_id: runtime-api\n"
                    f"user_id: {_one_line(self.actor_id)}\n"
                    f"access_tier: owner\n"
                    f"priority: {priority}\n"
                    + (f"instance_id: {_one_line(self.instance)}\n"
-                      if self.instance else ""))
+                      if self.instance else "")
+                   + f"task: {text}\n")
         # HMAC envelope (#3014 writer census): stamp at this writer's edge,
         # fail-open so a stamping error costs the stamp, never the submit.
         try:
@@ -208,12 +209,13 @@ class TasksView:
                          "user_id", "access_tier", "priority"]
         if expected_instance is not None:
             expected_keys.append("instance_id")
+        task_last_keys = [key for key in expected_keys if key != "task"] + ["task"]
         known = set(KNOWN_HEADER_KEYS)
         record_keys = [line.partition(":")[0] for line in raw.splitlines()
                        if line.partition(":")[0] in known and ":" in line]
         same = (
             raw == canonical_raw
-            and record_keys == expected_keys
+            and record_keys in (expected_keys, task_last_keys)
             and parsed.get("id") == task_id
             and parsed.get("source") == "runtime-api"
             and parsed.get("channel_id") == "runtime-api"
@@ -240,8 +242,13 @@ class TasksView:
                 return {"taskId": task_id, "state": waiting["state"],
                         "waitingOn": waiting["requests"]}
             claimed = ".claimed-" in live.name
+            try:
+                active = claimed or in_progress(self.tasks_dir.parent, task_id)
+            except (UnicodeError, TypeError, OverflowError):
+                # Malformed activity must not block task reads or cancellation.
+                active = False
             return {"taskId": task_id,
-                    "state": "in_progress" if claimed else "pending"}
+                    "state": "in_progress" if active else "pending"}
         if find_archived_task(self.tasks_dir, task_id) is not None:
             # Archived task, result already delivered and rotated away.
             return {"taskId": task_id, "state": "done"}
@@ -269,8 +276,8 @@ class TasksView:
         return None
 
     def _result_files(self) -> "list[tuple[Path, int]]":
-        """(path, mtime) newest first, for `task-rtapi-` results only — source
-        isolation: other sources' results must not leak into this channel.
+        """(path, integer seconds), newest first by full filesystem precision.
+        Only `task-rtapi-` results: other sources must not leak into this channel.
 
         Returns the mtime it already read rather than letting callers stat
         again: archival unlinks a live name, so a second stat can raise on a
@@ -283,12 +290,12 @@ class TasksView:
         for f in self.results_dir.glob(f"{TASK_PREFIX}*.txt"):
             try:
                 st = f.stat()
-            except OSError:
+            except FileNotFoundError:
                 continue  # archived mid-scan — absent, not an error
             if stat_module.S_ISREG(st.st_mode):
-                found.append((f, int(st.st_mtime)))
-        found.sort(key=lambda pair: pair[1], reverse=True)
-        return found
+                found.append((f, int(st.st_mtime), st.st_mtime_ns))
+        found.sort(key=lambda entry: entry[2], reverse=True)
+        return [(path, ts) for path, ts, _ns in found]
 
     # ── task.list_results ────────────────────────────────────────────────────
     def list_results(self, limit: int = 50) -> dict:
@@ -345,11 +352,17 @@ class TasksView:
         deliberately not walked: done work is fetched per-id, not listed."""
         entries = []
         if self.tasks_dir.is_dir():
-            files = [f for f in self.tasks_dir.glob(f"{TASK_PREFIX}*.txt")
-                     if f.is_file()]
-            files.sort(key=lambda f: f.stat().st_mtime, reverse=True)
+            files = []
+            for f in self.tasks_dir.glob(f"{TASK_PREFIX}*.txt"):
+                try:
+                    metadata = f.stat()
+                except FileNotFoundError:
+                    continue
+                if stat_module.S_ISREG(metadata.st_mode):
+                    files.append((f, metadata.st_mtime))
+            files.sort(key=lambda item: item[1], reverse=True)
             truncated = len(files) > limit
-            for f in files[:limit]:
+            for f, _mtime in files[:limit]:
                 # Not a .claimed- split: the lead also renames to .assigned-<inst>,
                 # and a compound id has no result written under it, ever.
                 task_id = task_id_from_filename(f.name)
@@ -361,6 +374,7 @@ class TasksView:
                          "state": self.status(task_id)["state"]}
                 try:
                     th = parse_task_headers_lenient(f.read_text())
+                    entry["preview"] = " ".join(th.body.split())[:160]
                     for k in ("source", "priority", "timestamp", "instance_id"):
                         v = th.get(k)
                         if v:
@@ -385,7 +399,7 @@ class TasksView:
         if st == "done":
             return {"taskId": task_id, "state": "done", "cancelled": False,
                     "note": "already completed — nothing to cancel"}
-        sub = self.submit(f"CANCEL_INSTRUCTION: {task_id}", priority="urgent")
+        sub = self.submit(f"CANCEL_INSTRUCTION: stop processing {task_id}", priority="urgent")
         return {"taskId": task_id, "state": st, "cancelled": "requested",
                 "cancelTaskId": sub["taskId"]}
 

@@ -300,6 +300,10 @@ class RuntimeDispatcher:
             if method == "task.submit":
                 if not params.get("task"):
                     raise ProtocolError(-32602, "missing required param: task")
+                if "idempotencyKey" in params:
+                    return self.tasks.submit_idempotent(
+                        params["task"], idempotency_key=params["idempotencyKey"],
+                        priority=params.get("priority") or "normal")
                 return self.tasks.submit(params["task"],
                                          priority=params.get("priority") or "normal")
             if method == "task.list":

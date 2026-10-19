@@ -1,0 +1,11 @@
+{
+  "name": "tutorial",
+  "version": "1.0.0",
+  "owner": "github:sonichi/sutando",
+  "license": "MIT",
+  "stability": "experimental",
+  "description": "Show a new owner what to try first: a voice walkthrough of the workspace tutorial, and in AG2 Space one Getting started HTML page (a short AG2 Space tour) in the owner's DM, created after the first-contact greeting and refreshed in place on re-link or reinstall.",
+  "provenance": {
+    "source_repo": "https://github.com/sonichi/sutando"
+  }
+}

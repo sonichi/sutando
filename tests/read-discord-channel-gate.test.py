@@ -8,6 +8,12 @@ All ids below are FICTITIOUS placeholders (no real channels/guilds). The guild
 resolver is stubbed, so no live Discord is needed. Run:
   python3 tests/read-discord-channel-gate.test.py
 """
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import json
 import tempfile
 import os

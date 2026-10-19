@@ -10,13 +10,20 @@ timeout as a network error backed a healthy bridge off and wrote
 from __future__ import annotations
 
 import sys
+import tempfile
+import threading
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 _REPO = Path(__file__).resolve().parent.parent
 _PKG = _REPO / "packages" / "ag2-sparrow"
 if str(_PKG) not in sys.path:
     sys.path.insert(0, str(_PKG))
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _helpers.hermetic_gateway import assert_hermetic, isolate_then_import  # noqa: E402
+_GW, _IMPORT_READS = isolate_then_import()   # before anything else imports the bridge
 
 
 class _Clock:
@@ -27,6 +34,9 @@ class _Clock:
         self.slept: list[float] = []
 
     def time(self) -> float:
+        return self.now
+
+    def monotonic(self) -> float:
         return self.now
 
     def sleep(self, s: float) -> None:
@@ -41,22 +51,31 @@ class _Loop:
               "_recover_orphan_proactive", "_maybe_start_event_channel",
               "_heartbeat_singleton", "_post_heartbeat", "_req", "_write_task",
               "_post_task_ack", "_post_ready_results", "_post_proactive",
-              "_reconcile_abandoned", "_emit_gateway_status", "_save_inflight", "_log")
+              "_reconcile_abandoned", "_reconcile_orphan_results", "_emit_gateway_status",
+              "_save_inflight", "_log", "RESULTS_DIR")
 
     def __init__(self, gw, poll_raises=None, advance=0.0):
         self.gw, self.poll_raises, self.advance = gw, poll_raises, advance
         self.clock = _Clock()
         self.status: list[tuple] = []
         self.logs: list[str] = []
+        self.polls: list[str] = []
+        self.served: "list[list[dict]]" = []      # the tasks each poll is served, in order
         self._saved: dict = {}
         self._alive = [True, False]
 
     def _poll(self, method, path, payload=None, **kw):
         if path.startswith("/v1/tasks?wait="):
+            self.polls.append(path)
             self.clock.now += self.advance
-            if self.poll_raises is not None:
-                raise self.poll_raises
-            return {"tasks": []}
+            # A list is one outcome per poll (None = a healthy empty poll).
+            if isinstance(self.poll_raises, list):
+                exc = self.poll_raises.pop(0) if self.poll_raises else None
+            else:
+                exc = self.poll_raises
+            if exc is not None:
+                raise exc
+            return {"tasks": self.served.pop(0) if self.served else []}
         return {}
 
     def __enter__(self):
@@ -70,9 +89,12 @@ class _Loop:
         gw._heartbeat_singleton = lambda *a, **k: self._alive.pop(0) if self._alive else False
         for noop in ("_recover_orphan_proactive", "_maybe_start_event_channel",
                      "_post_heartbeat", "_post_task_ack", "_post_ready_results",
-                     "_post_proactive"):
+                     "_post_proactive", "_reconcile_orphan_results"):
             setattr(gw, noop, lambda *a, **k: None)
-        gw._save_inflight = lambda *a, **k: None
+        # The loop under test is the poll; no results dir on the host may be read or written.
+        self._tmp = tempfile.TemporaryDirectory()
+        gw.RESULTS_DIR = Path(self._tmp.name) / "results-never-created"
+        gw._save_inflight = lambda *a, **k: True
         gw._write_task = lambda *a, **k: None
         gw._reconcile_abandoned = lambda inflight, s, *a, **k: s
         gw._req = self._poll
@@ -83,6 +105,7 @@ class _Loop:
     def __exit__(self, *exc):
         for n, v in self._saved.items():
             setattr(self.gw, n, v)
+        self._tmp.cleanup()
         return False
 
     def run(self):
@@ -149,6 +172,265 @@ class LongPollTimeoutTest(unittest.TestCase):
             loop.run()
         self.assertEqual(loop.clock.slept, [])
         self.assertIn((True, {}), loop.status)
+
+    def test_every_poll_carries_the_voice_outcome_contract(self):
+        # One agent's credential may serve more than one bridge, so the broker serves
+        # a voice relay ask only to a poll that names the contract itself.
+        with _Loop(self.gw, poll_raises=None, advance=1.0) as loop:
+            loop._alive = [True, True, False]
+            loop.run()
+        self.assertEqual(loop.polls, [f"/v1/tasks?wait={self.gw.POLL_WAIT}"
+                                      "&capabilities=voice-outcome-v1"] * 2)
+
+
+class AckFirstInTheLoopTest(unittest.TestCase):
+    """What `main()` itself does for a relay ask served with `ack_first`."""
+
+    def setUp(self):
+        try:
+            from ag2_sparrow import remote_gateway_bridge as gw
+        except (Exception, SystemExit) as e:  # noqa: BLE001
+            self.skipTest(f"gateway not importable: {str(e)[:60]}")
+        self.gw = gw
+        self.calls: list = []
+
+    def woken(self, mark):
+        """A wake recorder for the loop's own thread (the results watcher wakes from another)."""
+        def wake():
+            if threading.current_thread() is threading.main_thread():
+                self.calls.append(mark() if callable(mark) else mark)
+        return wake
+
+    def test_a_relay_ask_is_taken_on_its_own_before_the_rest_of_the_batch(self):
+        relay = {"id": "ask-5f3c9e0a1b2c", "task": "calendar?", "ack_first": True}
+        typed = {"id": "task-22d83e59601f3a1fef", "task": "What is AG2Space?", "ack_first": "true"}
+        with _Loop(self.gw) as loop:
+            loop.served = [[typed, relay]]
+            self.gw._write_task = lambda task, *a, **k: self.calls.append(("write", task["id"]))
+            with patch.object(self.gw, "_take_ack_first",
+                              side_effect=lambda task, inflight: self.calls.append(("take", task["id"])) or True), \
+                    patch.object(self.gw, "wake_outbound", new=self.woken("wake")):
+                loop.run()
+        # Taken first even though served second; only the exact boolean is a relay ask.
+        self.assertEqual(self.calls, [("take", relay["id"]), ("write", typed["id"]), "wake"])
+
+    def test_a_publish_from_a_retried_ack_wakes_the_outbound_worker_before_the_poll(self):
+        with _Loop(self.gw) as loop, \
+                patch.object(self.gw, "_advance_held_tasks", return_value=True), \
+                patch.object(self.gw, "wake_outbound", new=self.woken(lambda: len(loop.polls))):
+            loop.run()
+        self.assertEqual(self.calls, [0])
+        with _Loop(self.gw) as loop, \
+                patch.object(self.gw, "_advance_held_tasks", return_value=False), \
+                patch.object(self.gw, "wake_outbound", new=self.woken("woken")):
+            loop.run()
+        self.assertEqual(self.calls, [0], "nothing published, nothing to wake")
+
+    def test_a_start_sweep_that_fails_is_logged_and_the_loop_still_starts(self):
+        def _retire_delivered_marks():
+            raise RuntimeError("marks")
+
+        with _Loop(self.gw) as loop, \
+                patch.object(self.gw, "_retire_delivered_marks", new=_retire_delivered_marks), \
+                patch.object(self.gw, "_sweep_held_dir", new=lambda: self.calls.append("swept")):
+            loop.run()
+        self.assertIn("_retire_delivered_marks failed (RuntimeError: marks) — continuing", loop.logs)
+        self.assertEqual(self.calls, ["swept"], "one sweep's failure skipped the next")
+        self.assertEqual(len(loop.polls), 1)
+
+
+class RelayResultsInTheLoopTest(unittest.TestCase):
+    """What `main()` does for a voice relay ask's result: reclaimed at start, and put back in
+    flight on every pass when it lands outside the in-flight set."""
+
+    ASK = "ask-5f3c9e0a1b2c"
+
+    def setUp(self):
+        try:
+            from ag2_sparrow import remote_gateway_bridge as gw
+        except (Exception, SystemExit) as e:  # noqa: BLE001
+            self.skipTest(f"gateway not importable: {str(e)[:60]}")
+        self.gw = gw
+        self.calls: list = []
+
+    def test_a_reclaim_that_fails_is_logged_and_the_loop_still_starts(self):
+        def _reclaim_parked_relay_results(inflight):
+            raise RuntimeError("outbox")
+
+        with _Loop(self.gw) as loop, \
+                patch.object(self.gw, "_reclaim_parked_relay_results", new=_reclaim_parked_relay_results):
+            loop.run()
+        self.assertIn("relay result reclaim failed (RuntimeError: outbox) — continuing", loop.logs)
+        self.assertEqual(len(loop.polls), 1)
+
+    def test_a_relay_result_landing_outside_the_in_flight_set_wakes_the_outbound_worker(self):
+        with tempfile.TemporaryDirectory() as d, _Loop(self.gw) as loop, \
+                patch.multiple(self.gw, ACK_FIRST_FILE=Path(d) / "marks.json",
+                               DEDUP_ALIAS_FILE=Path(d) / "aliases.json"):
+            self.gw.ACK_FIRST_FILE.write_text(f'{{"{self.ASK}": "{self.ASK}"}}')
+            self.gw.RESULTS_DIR.mkdir()
+            saved: list = []
+            self.gw._save_inflight = lambda ids: saved.append(set(ids)) or True
+            poll = self.gw._req
+
+            def lands_during_the_poll(method, path, *a, **k):
+                if path.startswith("/v1/tasks?"):
+                    (self.gw.RESULTS_DIR / f"{self.ASK}.txt").write_text("Your calendar is clear.")
+                return poll(method, path, *a, **k)
+            self.gw._req = lands_during_the_poll
+            with patch.object(self.gw, "wake_outbound", new=lambda: self.calls.append(
+                    ("woken", threading.current_thread() is threading.main_thread(), len(loop.polls),
+                     any(self.ASK in ids for ids in saved)))):
+                loop.run()
+        # At start nothing was live; after the poll the result is back in flight, then the worker woken.
+        self.assertIn(("woken", True, 1, True), self.calls)
+        self.assertEqual([ids for ids in saved if self.ASK in ids][:1], [{self.ASK}])
+
+
+class DroppedConnectionTest(unittest.TestCase):
+    """urllib wraps only the send in URLError. A peer or proxy that closes the
+    socket after it raises http.client's own errors bare from getresponse(), and
+    the loop filed those as "unexpected" — a crash-looking line for a dropped link."""
+
+    def setUp(self):
+        try:
+            from ag2_sparrow import remote_gateway_bridge as gw
+        except (Exception, SystemExit) as e:  # noqa: BLE001
+            self.skipTest(f"gateway not importable: {str(e)[:60]}")
+        self.gw = gw
+
+    def _assert_network_path(self, loop, cls):
+        logs = " ".join(loop.logs)
+        self.assertEqual(loop.clock.slept, [1], "backs off like any outage")
+        self.assertIn(f"poll network error: {cls}:", logs, "names the exception class")
+        self.assertIn("1 consecutive, 1s since last successful poll", logs)
+        self.assertNotIn("unexpected", logs, "a dropped connection is not a crash")
+        self.assertTrue(any(c is False and "network" in str(k.get("error", ""))
+                            for c, k in loop.status))
+
+    def test_a_connection_closed_before_the_response_is_a_network_error(self):
+        import http.client
+        exc = http.client.RemoteDisconnected("Remote end closed connection without response")
+        with _Loop(self.gw, poll_raises=exc, advance=1.0) as loop:
+            loop.run()                    # returns: the loop went on to its next pass
+        self._assert_network_path(loop, "RemoteDisconnected")
+
+    def test_a_truncated_response_body_is_a_network_error(self):
+        import http.client
+        with _Loop(self.gw, poll_raises=http.client.IncompleteRead(b""), advance=1.0) as loop:
+            loop.run()
+        self._assert_network_path(loop, "IncompleteRead")
+
+    def test_the_counter_climbs_and_a_good_poll_logs_the_recovery(self):
+        import http.client
+        import re
+        outcomes = [http.client.RemoteDisconnected("gone"),
+                    http.client.RemoteDisconnected("gone"), None]
+        with _Loop(self.gw, poll_raises=outcomes, advance=1.0) as loop:
+            loop._alive = [True, True, True, False]
+            loop.run()
+        logs = loop.logs
+        errors = [m for m in logs if m.startswith("poll network error")]
+        self.assertEqual(len(errors), 2)
+        self.assertIn("1 consecutive, 1s since", errors[0])
+        self.assertIn("2 consecutive, 3s since", errors[1], "counts up; clock = 1s + 1s back-off + 1s")
+        self.assertEqual(loop.clock.slept, [1, 2], "back-off doubles across the outage")
+        recovered = [m for m in logs if m.startswith("poll recovered")]
+        self.assertEqual(len(recovered), 1, "one recovery line, after the good poll")
+        self.assertRegex(recovered[0], r"^poll recovered after 2 failures, 6s$")
+        self.assertLess(logs.index(errors[1]), logs.index(recovered[0]))
+        self.assertIn((True, {}), loop.status)
+
+    def test_a_second_good_poll_logs_no_recovery_and_the_next_outage_counts_from_one(self):
+        import urllib.error
+        fail = urllib.error.URLError("no route")
+        with _Loop(self.gw, poll_raises=[fail, None, None, fail, None], advance=1.0) as loop:
+            loop._alive = [True] * 5 + [False]
+            loop.run()
+        recovered = [m for m in loop.logs if m.startswith("poll recovered")]
+        self.assertEqual(len(recovered), 2, "one line per outage, none for a later good poll")
+        for line in recovered:
+            self.assertRegex(line, r"^poll recovered after 1 failures, ")
+        errors = [m for m in loop.logs if m.startswith("poll network error")]
+        self.assertIn("1 consecutive", errors[1], "the good poll reset the counter")
+
+    def test_a_grace_timeout_after_an_outage_is_not_the_recovery(self):
+        import urllib.error
+        outcomes = [urllib.error.URLError("no route"),
+                    TimeoutError("The read operation timed out"), None]
+        with _Loop(self.gw, poll_raises=outcomes, advance=1.0) as loop:
+            loop._alive = [True, True, True, False]
+            loop.run()
+        recovered = [m for m in loop.logs if m.startswith("poll recovered")]
+        # clock: 1s poll + 1s back-off + 1s grace poll + 1s good poll
+        self.assertEqual(recovered, ["poll recovered after 1 failures, 4s"],
+                         "only the poll that answered ends the outage")
+
+    def test_a_reset_while_reading_the_body_is_a_network_error(self):
+        import urllib.request
+
+        class _Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                raise ConnectionResetError(54, "Connection reset by peer")
+
+        with _Loop(self.gw) as loop:
+            real_req = loop._saved["_req"]
+
+            def _req(method, path, *a, **k):
+                if not path.startswith("/v1/tasks?wait="):
+                    return {}
+                loop.clock.now += 1.0
+                return real_req(method, path, *a, **k)
+
+            self.gw._req = _req
+            saved_open = urllib.request.urlopen
+            urllib.request.urlopen = lambda *a, **k: _Resp()
+            try:
+                loop.run()
+            finally:
+                urllib.request.urlopen = saved_open
+        self._assert_network_path(loop, "ConnectionResetError")
+
+    def test_an_ack_cut_off_mid_flight_reports_a_network_error_not_a_crash(self):
+        import http.client
+        gw = self.gw
+        logs: list[str] = []
+        saved = (gw._req, gw._log, gw._ack_disabled_until)
+        gw._req = lambda *a, **k: (_ for _ in ()).throw(
+            http.client.RemoteDisconnected("Remote end closed connection without response"))
+        gw._log = lambda m: logs.append(str(m))
+        gw._ack_disabled_until = 0.0
+        try:
+            self.assertFalse(gw._post_task_ack("task-1700000000", False))
+        finally:
+            gw._req, gw._log, gw._ack_disabled_until = saved
+        self.assertIn("task ack network error", " ".join(logs))
+
+    def test_a_heartbeat_cut_off_mid_flight_reports_a_network_error_not_a_crash(self):
+        import http.client
+        gw = self.gw
+        logs: list[str] = []
+        saved = (gw._req, gw._log, gw._heartbeat_retry_at)
+        gw._req = lambda *a, **k: (_ for _ in ()).throw(
+            http.client.RemoteDisconnected("Remote end closed connection without response"))
+        gw._log = lambda m: logs.append(str(m))
+        gw._heartbeat_retry_at = 0.0
+        try:
+            self.assertFalse(gw._post_heartbeat(set(), force=True))
+        finally:
+            gw._req, gw._log, gw._heartbeat_retry_at = saved
+        self.assertIn("heartbeat network error", " ".join(logs))
+
+
+class BridgeImportIsHermetic(unittest.TestCase):
+    def test_the_bridge_import_reads_no_host_config_token_or_vault(self):
+        assert_hermetic(self, _IMPORT_READS)
 
 
 if __name__ == "__main__":

@@ -10,6 +10,11 @@ Run: python3 tests/core-supervisor-relay.test.py
 """
 from __future__ import annotations
 
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import io
 import json
@@ -527,7 +532,7 @@ class TestRunCycleAndCli(unittest.TestCase):
         calls = []
         orig_m, orig_c = _mod._macos_notify, _mod._channel_notify
         _mod._macos_notify = lambda m: calls.append(("macos", m))
-        _mod._channel_notify = lambda m, s, c: calls.append(("chan", s, c))
+        _mod._channel_notify = lambda m, s, c, **kw: calls.append(("chan", s, c, kw))
         try:
             with tempfile.TemporaryDirectory() as td:
                 run_cycle(_LOGIN, os.path.join(td, "s.state"),
@@ -537,6 +542,9 @@ class TestRunCycleAndCli(unittest.TestCase):
         kinds = [c[0] for c in calls]
         self.assertIn("macos", kinds)
         self.assertIn("chan", kinds)
+        tag = next(c for c in calls if c[0] == "chan")[3]["extra"][_mod.ALERT_FIELD]
+        self.assertEqual(tag["agent"], f"core@{_mod._core_host_label()}")
+        self.assertEqual(tag["state"], _LOGIN.get("state"))
 
     def test_failed_channel_send_does_not_debounce(self):
         # #2101 review (High): when a channel is selected but its send FAILS, the
@@ -544,7 +552,7 @@ class TestRunCycleAndCli(unittest.TestCase):
         # instead of being silently marked as already-notified.
         orig_m, orig_c = _mod._macos_notify, _mod._channel_notify
         _mod._macos_notify = lambda m: None
-        _mod._channel_notify = lambda m, s, c: False   # selected channel send fails
+        _mod._channel_notify = lambda m, s, c, **kw: False   # selected channel send fails
         try:
             with tempfile.TemporaryDirectory() as td:
                 sf = os.path.join(td, "s.state")
@@ -563,7 +571,7 @@ class TestRunCycleAndCli(unittest.TestCase):
         # Complement: a channel send that LANDS persists the hash → suppressed next cycle.
         orig_m, orig_c = _mod._macos_notify, _mod._channel_notify
         _mod._macos_notify = lambda m: None
-        _mod._channel_notify = lambda m, s, c: True    # selected channel send lands
+        _mod._channel_notify = lambda m, s, c, **kw: True    # selected channel send lands
         try:
             with tempfile.TemporaryDirectory() as td:
                 sf = os.path.join(td, "s.state")
@@ -583,7 +591,7 @@ class TestRunCycleAndCli(unittest.TestCase):
         # escalation routes there.
         calls = []
         orig_c = _mod._channel_notify
-        _mod._channel_notify = lambda m, s, c: calls.append((s, c))
+        _mod._channel_notify = lambda m, s, c, **kw: calls.append((s, c))
         try:
             with tempfile.TemporaryDirectory() as td:
                 sig = os.path.join(td, "core-supervisor.json")
@@ -1165,7 +1173,7 @@ class TestProgressRouteDelegation(unittest.TestCase):
     def test_explicit_no_route_target_degrades_to_macos_only(self):
         calls = []
         orig_c = _mod._channel_notify
-        _mod._channel_notify = lambda m, s, c: calls.append((s, c)) or True
+        _mod._channel_notify = lambda m, s, c, **kw: calls.append((s, c)) or True
         try:
             with tempfile.TemporaryDirectory() as td:
                 sig = os.path.join(td, "core-supervisor.json")
@@ -1245,7 +1253,7 @@ class TestDebounceNeedsAConfirmedDelivery(unittest.TestCase):
             argv.append("--no-macos")
         calls = []
         with patch.object(_mod, "_macos_notify", lambda m: calls.append("macos") or macos_ok), \
-                patch.object(_mod, "_channel_notify", lambda m, s, c: calls.append("chan") or channel_ok), \
+                patch.object(_mod, "_channel_notify", lambda m, s, c, **kw: calls.append("chan") or channel_ok), \
                 contextlib.redirect_stdout(io.StringIO()) as out, \
                 contextlib.redirect_stderr(io.StringIO()):
             rc = main(argv)
@@ -1279,7 +1287,7 @@ class TestDebounceNeedsAConfirmedDelivery(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             sf = os.path.join(td, "s.state")
             with patch.object(_mod, "_macos_notify", lambda m: True), \
-                    patch.object(_mod, "_channel_notify", lambda m, s, c: False):
+                    patch.object(_mod, "_channel_notify", lambda m, s, c, **kw: False):
                 run_cycle(_LOGIN, sf, macos=True, source="discord", channel="42")
             self.assertFalse(os.path.exists(sf))
 
@@ -1358,6 +1366,61 @@ class TestMacosNotifyAdapter(unittest.TestCase):
                           side_effect=_sp.TimeoutExpired("osascript", 8)):
             self.assertIs(self._notify(), False)
             self._assert_undelivered_and_retries()
+
+
+class TestMacosNotifyScript(unittest.TestCase):
+    MESSAGES = (
+        "⚠️ Agent needs you — 確認",
+        '"quoted" \\path\nsecond line',
+        'end run\nerror "must remain data"\non run argv',
+        '-e -- controls\r\t\b\f',
+    )
+
+    def _command(self, message):
+        with patch.object(_mod.subprocess, "run") as run:
+            run.return_value.returncode = 0
+            self.assertTrue(_mod._macos_notify(message))
+        return run.call_args.args[0]
+
+    def test_text_is_passed_as_arguments_to_one_static_script(self):
+        scripts = set()
+        for message in self.MESSAGES:
+            with self.subTest(message=message):
+                command = self._command(message)
+                scripts.add(command[2])
+                self.assertEqual(command[:2], ["osascript", "-e"])
+                self.assertEqual(command[3:], ["--", message, "Sutando · Agent Shepherd"])
+        self.assertEqual(len(scripts), 1)
+
+    @unittest.skipUnless(sys.platform == "darwin", "requires macOS AppleScript")
+    def test_production_script_compiles_without_sending_a_notification(self):
+        import subprocess
+        command = self._command(self.MESSAGES[0])
+        with tempfile.TemporaryDirectory() as td:
+            result = subprocess.run(
+                ["/usr/bin/osacompile", "-o", os.path.join(td, "notify.scpt")],
+                input=command[2], text=True, capture_output=True, timeout=8,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    @unittest.skipUnless(sys.platform == "darwin", "requires macOS AppleScript")
+    def test_actual_handler_round_trips_arguments_without_notifying(self):
+        import re
+        import subprocess
+        for message in self.MESSAGES:
+            with self.subTest(message=message):
+                command = self._command(message)
+                script, count = re.subn(
+                    r"(?m)^\s*display notification [^\n]+$",
+                    "return item 1 of argv", command[2],
+                )
+                self.assertEqual(count, 1)
+                result = subprocess.run(
+                    ["/usr/bin/osascript", *command[1:2], script, *command[3:]],
+                    capture_output=True, timeout=8,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, message.encode("utf-8") + b"\n")
 
 
 class TestUndeliveredLogThrottle(unittest.TestCase):

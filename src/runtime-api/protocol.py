@@ -28,7 +28,7 @@ v0 methods:
   sutando.status        {}
   sutando.owner         {}
   sutando.allowlist     {}
-  task.submit           {task, priority?}
+  task.submit           {task, priority?, idempotencyKey?}
   task.status           {taskId}
   task.get_result       {taskId?}   (no taskId → the newest result)
   task.list_results     {}          (all results, newest first, with preview)

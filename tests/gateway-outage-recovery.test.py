@@ -15,9 +15,19 @@ import urllib.error
 from pathlib import Path
 from unittest.mock import patch
 
+from _helpers.hermetic_env import hermetic_env, isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / 'packages' / 'ag2-sparrow'))
 from ag2_sparrow import outbox, remote_gateway_bridge as gw, undelivered_quarantine
+
+
+def _park_in_quarantine(rfile, results, when=None):
+    """Fixture: put a result where the quarantine reader lists it."""
+    return undelivered_quarantine.place(Path(rfile), results, Path(rfile).stem, when=when)
 from ag2_sparrow.delivery_core import DeliveryCore, DesignAClaimBackend, RetryPolicy, DrainStatus
 from ag2_sparrow.delivery_core.provider_ag2space import AG2SpaceResultProvider
 from ag2_sparrow.delivery_core import ProviderPermanentRefused
@@ -405,7 +415,7 @@ class RecoveryTest(unittest.TestCase):
     def test_quarantined_holder_is_reported_never_regenerated_or_replayed(self):
         self.bridge()
         inflight = self.seed_duplicates()
-        undelivered_quarantine.quarantine(self.results / f'{HOLDER}.txt', self.results)
+        _park_in_quarantine(self.results / f'{HOLDER}.txt', self.results)
         gw._post_ready_results(inflight)
         self.assertEqual(len(list(self.tasks.rglob('*.txt'))), 3)
         self.assertNotIn(HOLDER, self.server.accepted)
@@ -610,7 +620,7 @@ for _ in range(3):
     gw._post_ready_results(inflight)
 print('pending:', sorted(inflight))
 """
-        env = {k: v for k, v in os.environ.items() if not k.startswith('SUTANDO_')}
+        env = hermetic_env()
         env['PYTHONPATH'] = str(REPO / 'packages' / 'ag2-sparrow')
         url = f'http://127.0.0.1:{server.server_port}'
         self.server.available_at += 120

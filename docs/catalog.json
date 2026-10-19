@@ -95,8 +95,8 @@
     "contributors"
    ],
    "status": "active",
-   "canonical_for": "verbatim parking for relocated CLAUDE.md detail: marker-migration history, vault python bootstrap, liveness payload schema",
-   "last_verified": "2026-09-30"
+   "canonical_for": "verbatim parking for relocated CLAUDE.md detail: marker-migration history, vault python bootstrap, liveness payload schema, PR checklists, chat-path task/result recipes, workspace resolution, vault recipes, per-channel pull namespace, voice session context",
+   "last_verified": "2026-10-10"
   },
   "docs/codex-core.md": {
    "title": "Codex CLI as the Sutando core",
@@ -106,7 +106,7 @@
    ],
    "status": "active",
    "canonical_for": "Codex core setup, earned-reset policy, and rollback",
-   "last_verified": "2026-09-30"
+   "last_verified": "2026-10-16"
   },
   "docs/community-use-cases/README.md": {
    "title": "Community use cases",
@@ -167,6 +167,16 @@
    "status": "draft",
    "canonical_for": "the capability-not-key credential-resolver contract: tier order, managed-file schema, source observability, and the reader-sweep migration plan",
    "last_verified": "2026-08-05"
+  },
+  "docs/design-holder-lock.md": {
+   "title": "holder_lock: the one flock-and-holder primitive",
+   "audience": [
+    "contributors",
+    "maintainers"
+   ],
+   "status": "draft",
+   "canonical_for": "the shared flock-and-holder lock contract: acquire/wait results, the holder record, the work-root first-act rule and the install boundary that the adapter and notifier locks build on",
+   "last_verified": "2026-10-17"
   },
   "docs/design-mediated-capability-layer.md": {
    "title": "Mediated capability layer",
@@ -247,7 +257,7 @@
    ],
    "status": "canonical",
    "canonical_for": "remote gateway wire protocol",
-   "last_verified": "2026-10-08"
+   "last_verified": "2026-10-16"
   },
   "docs/runtime-dependencies.md": {
    "title": "External runtime dependencies",
@@ -343,14 +353,14 @@
    "last_verified": null
   },
   "docs/tutorial-delivery.md": {
-   "title": "Tutorial delivery (moved from CLAUDE.md)",
+   "title": "Tutorial delivery",
    "audience": [
     "agents",
     "contributors"
    ],
    "status": "active",
-   "canonical_for": "the section-by-section voice-friendly tutorial walkthrough procedure",
-   "last_verified": "2026-08-17"
+   "canonical_for": "the tutorial skill's two modes: the voice walkthrough and the AG2 Space Getting started page",
+   "last_verified": "2026-10-15"
   },
   "docs/voice-agent-test-framework.md": {
    "title": "Voice-agent test framework",
@@ -463,7 +473,7 @@
    ],
    "status": "canonical",
    "canonical_for": "why each proactive-loop step exists: the measurement, the incident and the reasoning the skill file no longer carries",
-   "last_verified": "2026-10-02"
+   "last_verified": "2026-10-15"
   },
   "docs/recovery-issue-metrics.md": {
    "title": "Recovery issue metrics",

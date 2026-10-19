@@ -25,6 +25,12 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+sys.path.append(str(Path(__file__).resolve().parents[1] / "tests"))
+from _helpers.hermetic_env import isolate_os_environ, isolated_child_env  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 SRC_DIR = Path(__file__).resolve().parent
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
@@ -45,7 +51,9 @@ STATE = {"tasks_served": 0, "results": [], "acks": [], "heartbeats": [],
          "room_posts": [], "force_room_502": False, "force_room_empty_200": False,
          "force_room_ok_only": False,
          "force_heartbeat_404": False, "force_media_redirect": False,
-         "force_results_502_once": False, "force_results_503": False}
+         "force_results_502_once": False, "force_results_503": False,
+         # GET /v1/results/<id>/delivery: None = a pre-route broker (404)
+         "delivery": {"status": "delivered", "terminal": True}}
 TASK = {"id": "task-MOCK1", "timestamp": "2026-05-23T00:00:00Z",
         "task": "hello from gateway", "source": "remote-gateway",
         "channel_id": "!room:example.org", "user_id": "@qingyun:example.org",
@@ -79,6 +87,15 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers(); self.wfile.write(body); return
+        if self.path.endswith("/delivery"):  # pragma: no cover - the server thread is outside the gate's trace
+            rid = self.path[len("/v1/results/"):-len("/delivery")]
+            posted = any(r.get("id") == rid for r in STATE["results"])
+            if STATE["delivery"] is None or not posted:
+                self.send_response(404); self.end_headers(); return
+            body = json.dumps({"id": rid, **STATE["delivery"]}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers(); self.wfile.write(body); return
         if self.path.startswith("/v1/tasks"):
             tasks = [TASK] if STATE["tasks_served"] == 0 else []
             STATE["tasks_served"] += 1
@@ -101,6 +118,8 @@ class Handler(BaseHTTPRequestHandler):
             n = int(self.headers.get("Content-Length") or 0)
             STATE["results"].append(json.loads(self.rfile.read(n).decode()))
             self.send_response(200); self.end_headers()
+            if STATE["delivery"] is not None:  # pragma: no cover - the server thread is outside the gate's trace
+                self.wfile.write(b'{"ok": true, "delivery_readable": true}')
         elif self.path.startswith("/v1/tasks/") and self.path.endswith("/ack"):
             if STATE["force_ack_404"]:
                 self.send_response(404); self.end_headers(); return
@@ -553,7 +572,7 @@ def main() -> int:
             for name, body in files.items():
                 with open(_os.path.join(ch, name), "w", encoding="utf-8", newline="\n") as fh:
                     fh.write(body)
-            env = dict(_os.environ, CLAUDE_CONFIG_DIR=d, SUTANDO_PY=sys.executable)
+            env = isolated_child_env(CLAUDE_CONFIG_DIR=d, SUTANDO_PY=sys.executable)
             r = _sp.run([_bash, _helper, "ag2space"], capture_output=True,
                         text=True, env=env, timeout=30)
             return r.returncode, r.stdout.strip()
@@ -592,8 +611,8 @@ def main() -> int:
               and "result-markers" not in h.get("capabilities", []),
               "heartbeat advertises only local skip-marker handling")
         check("core-status" in h.get("capabilities", [])
-              and "status" not in h and "step" not in h,
-              "no core-status.json → capability advertised, status/step omitted (no-clobber)")
+              and h.get("status") not in ("idle", "running"),
+              "no core-status.json and no core beat → capability advertised, no positive status")
         check("team-collaborator" in h.get("capabilities", []),
               "heartbeat advertises explicit Team collaborator support")
 
@@ -601,7 +620,7 @@ def main() -> int:
     # broker's presence sweep can derive the agent's activity + human text.
     (rtc.WS / "state").mkdir(parents=True, exist_ok=True)
     (rtc.WS / "state" / "core-status.json").write_text(
-        json.dumps({"status": "running", "step": "opening PR #20", "ts": 1}))
+        json.dumps({"status": "running", "step": "opening PR #20", "ts": time.time()}))
     STATE["heartbeats"].clear()
     rtc._last_heartbeat_at = 0.0
     rtc._post_heartbeat({"task-MOCK1"}, force=True)
@@ -610,7 +629,7 @@ def main() -> int:
           "heartbeat carries core-status status+step when core-status.json present")
     # An idle status drops the (stale) step so the sweep reads 'available'.
     (rtc.WS / "state" / "core-status.json").write_text(
-        json.dumps({"status": "idle", "ts": 2}))
+        json.dumps({"status": "idle", "ts": time.time()}))
     STATE["heartbeats"].clear()
     rtc._last_heartbeat_at = 0.0
     rtc._post_heartbeat(set(), force=True)
@@ -640,8 +659,8 @@ def main() -> int:
     STATE["heartbeats"].clear(); rtc._last_heartbeat_at = 0.0
     check(rtc._post_heartbeat(set(), force=True), "heartbeat still fires despite malformed core-status")
     hb3 = STATE["heartbeats"][-1] if STATE["heartbeats"] else {}
-    check("status" not in hb3 and "step" not in hb3,
-          "malformed core-status → heartbeat omits status/step (liveness-only)")
+    check(hb3.get("status") not in ("idle", "running"),
+          "malformed core-status and no core beat → no positive status")
 
     # Backwards compatibility: old gateways that only implement pull/results can
     # 404 optional protocol extensions; the client backs off (time-gated, so a
@@ -653,10 +672,11 @@ def main() -> int:
     rtc._ack_disabled_until = 0.0   # clear so later calls aren't skipped
     STATE["force_ack_404"] = False
     STATE["force_heartbeat_404"] = True
-    rtc._heartbeat_disabled = False
-    check(not rtc._post_heartbeat(set(), force=True) and rtc._heartbeat_disabled,
-          "heartbeat 404 disables heartbeat support")
+    rtc._heartbeat_retry_at = 0.0
+    check(not rtc._post_heartbeat(set(), force=True) and rtc._heartbeat_retry_at > 0,
+          "heartbeat 404 backs off heartbeat support (retryable)")
     STATE["force_heartbeat_404"] = False
+    rtc._heartbeat_retry_at = 0.0   # clear so later calls aren't skipped
 
     # SECURITY (review 2026-06-13)
     # Blocker 1 — unsafe task ids are rejected (path traversal write side)
@@ -763,7 +783,7 @@ def main() -> int:
         rtc._post_ready_results(_ifc)
     _out = _cap.getvalue()
     print(_out, end="")
-    check("accepted by gateway; Matrix delivery unconfirmed" in _out
+    check("delivered via DeliveryCore" in _out
           and "AG2SpaceResultProvider" in _out,
           "a CONFIRMED delivery announces the seam it went through "
           "(the live-path evidence CONTRIBUTING asks for)")
@@ -778,6 +798,70 @@ def main() -> int:
     (rtc.TASKS_DIR / "task-CORE1.txt").unlink(missing_ok=True)
     (rtc.ARCHIVE_RESULTS_DIR / "task-CORE1.txt").unlink(missing_ok=True)
     backend.clock = time.time
+
+    # The broker accepts the POST, then dead-letters the room send. The
+    # accept must not be logged or archived as a delivery.
+    _before = len(STATE["results"])
+    STATE["delivery"] = {"status": "dead", "terminal": True,
+                         "reason": "send-failed:permanent-masquerade-failure"}
+    (rtc.TASKS_DIR / "task-DEAD1.txt").write_text(
+        "id: task-DEAD1\naccess_tier: owner\ntask: fixture\n")
+    (rtc.RESULTS_DIR / "task-DEAD1.txt").write_text("lost answer")
+    _cap = _io.StringIO()
+    with contextlib.redirect_stdout(_cap):
+        rtc._post_ready_results({"task-DEAD1"})
+    _out = _cap.getvalue()
+    print(_out, end="")
+    check(len(STATE["results"]) == _before + 1
+          and STATE["results"][-1]["id"] == "task-DEAD1",
+          "the dead-lettered result was accepted by the broker (POST 200)")
+    check("delivered" not in _out.replace("not_delivered", "")
+          and "send-failed:permanent-masquerade-failure" in _out,
+          "an accepted-then-dead-lettered result is never logged delivered, "
+          "and the broker's reason is surfaced")
+    check((rtc.RESULTS_DIR / "task-DEAD1.txt").exists()
+          and not list(rtc.ARCHIVE_RESULTS_DIR.glob("task-DEAD1*")),
+          "...nor archived as a success: the result file stays for retry")
+    # The outbox retries on its schedule until its deadline: step the clock to each retry.
+    _bk = rtc._delivery_core().backend
+    for _ in range(64):
+        _rec = rtc.read_item(_bk.root, "task-DEAD1") or {}
+        if not (rtc.RESULTS_DIR / "task-DEAD1.txt").exists():
+            break
+        _next = (_rec.get("retry") or {}).get("next_attempt_at")
+        if _next:
+            _bk.clock = (lambda t=_next: t)
+        rtc._post_ready_results({"task-DEAD1"})
+    _bk.clock = time.time
+    _quar = list(rtc.UNDELIVERABLE_RESULTS_DIR.glob("task-DEAD1*"))
+    check(bool(_quar) and not (rtc.RESULTS_DIR / "task-DEAD1.txt").exists()
+          and not list(rtc.ARCHIVE_RESULTS_DIR.glob("task-DEAD1*")),
+          "at the outbox ceiling it is quarantined to undelivered/, not archived")
+    del STATE["results"][_before:]
+    for _q in _quar:
+        _q.unlink(missing_ok=True)
+    (rtc.TASKS_DIR / "task-DEAD1.txt").unlink(missing_ok=True)
+
+    # A broker without the delivery route: the accept stands, but is logged as
+    # unconfirmed rather than delivered.
+    STATE["delivery"] = None
+    (rtc.TASKS_DIR / "task-OLDB1.txt").write_text(
+        "id: task-OLDB1\naccess_tier: owner\ntask: fixture\n")
+    (rtc.RESULTS_DIR / "task-OLDB1.txt").write_text("answer")
+    _cap = _io.StringIO()
+    with contextlib.redirect_stdout(_cap):
+        rtc._post_ready_results({"task-OLDB1"})
+    _out = _cap.getvalue()
+    print(_out, end="")
+    check("room delivery unconfirmed" in _out
+          and "delivered" not in _out.replace("room delivery", "")
+          and not (rtc.RESULTS_DIR / "task-OLDB1.txt").exists(),
+          "no delivery read (older broker): accepted + archived, logged unconfirmed")
+    STATE["delivery"] = {"status": "delivered", "terminal": True}
+    STATE["results"].pop()
+    (rtc.TASKS_DIR / "task-OLDB1.txt").unlink(missing_ok=True)
+    for _a in rtc.ARCHIVE_RESULTS_DIR.glob("task-OLDB1*"):
+        _a.unlink(missing_ok=True)
     # Destined filenames outrank the gate's activity/grace logic entirely.
     check(rtc._ag2space_proactive_claim_gate(
               Path("proactive-1.to-ag2space.txt")) is True,
@@ -1097,12 +1181,23 @@ def main() -> int:
             raise OSError("simulated transient post-claim read failure")
         return _real_read_text(self, *a, **k)
 
+    # The post-claim read goes through the readiness owner, which opens the file itself.
+    _ready_mod = sys.modules[rtc.read_ready_result.__module__]
+    _real_identity_of = _ready_mod.identity_of
+
+    def _identity_of_fail_on_claim(path):
+        if ".sending." in _pl.Path(path).name:
+            raise OSError("simulated transient post-claim read failure")
+        return _real_identity_of(path)
+
     posts_rf = len(STATE["room_posts"])
     _pl.Path.read_text = _read_text_fail_on_claim
+    _ready_mod.identity_of = _identity_of_fail_on_claim
     try:
         rtc._post_proactive()
     finally:
         _pl.Path.read_text = _real_read_text
+        _ready_mod.identity_of = _real_identity_of
     check((rtc.RESULTS_DIR / "proactive-readfail.txt").exists()
           and not list(rtc.RESULTS_DIR.glob("proactive-readfail.sending.*"))
           and len(STATE["room_posts"]) == posts_rf,

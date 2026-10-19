@@ -25,7 +25,7 @@ Machine-readable ownership and lifecycle metadata lives in
 - [Worker pool design notes](worker-pool-design-notes.md) — the record behind the v1 design: rejected alternatives, the failure model taken from the #3860 draft, and the owner decisions it encodes.
 - [Migration transition window](migration-transition-window.md) — 30-day reader fallback.
 - [Learn from demonstration](learn-from-demonstration.md) — owner-taught preference capture.
-- [Tutorial delivery](tutorial-delivery.md) — walkthrough procedure.
+- [Tutorial delivery](tutorial-delivery.md) — the `tutorial` skill: voice walkthrough and the AG2 Space Getting started page.
 - [Graceful shutdown](graceful-shutdown.md) — which restart path signals the core to exit cleanly.
 - [Proactive loop rationale](proactive-loop-rationale.md) — the measurements and incidents behind each step of `skills/proactive-loop/SKILL.md`, which itself carries only the commands.
 - [Task watcher hosting modes](task-watcher-hosting-modes.md) — session watcher vs the supervisor's standby: the tag, the two per-inbox verdicts, the readiness proof, the handoff contract and its timings, the known gaps.
@@ -75,6 +75,7 @@ Machine-readable ownership and lifecycle metadata lives in
 - [Health snapshot: `GET /health`](health-snapshot.md)
 - [Pointer Teacher design](pointer-teacher-design.md)
 - [Credential resolution by capability (G8)](design-credential-capability-resolver.md)
+- [holder_lock: the one flock-and-holder primitive](design-holder-lock.md)
 - [ADR 0001: Pointer Teacher brain](adr/0001-pointer-teacher-brain.md)
 
 ## Documentation contract

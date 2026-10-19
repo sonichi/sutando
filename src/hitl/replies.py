@@ -20,6 +20,7 @@ import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from local_task_protocol import reply_action_text
 from workspace_default import resolve_workspace
 
 from .manager import HitlManager
@@ -269,11 +270,6 @@ def match_action(req: HumanRequirement, text: str):
     return None, None
 
 
-REPLY_CONTEXT_END = "[End AG2 Space reply context]"
-
-
 def _reply_text(task_text: str) -> str:
-    """The message text after the relay's quoted reply context. A wrong cut can
-    only fail to match a label (the task then stays a message), never pick one."""
-    head, sep, tail = task_text.rpartition(REPLY_CONTEXT_END)
-    return tail if sep else task_text
+    """The unquoted answer; owner, card identity and stale guards are checked separately."""
+    return reply_action_text(task_text)

@@ -591,6 +591,88 @@ class PendingCandidatesTest(unittest.TestCase):
                 list(pending_candidates(self.tasks_dir, self.results_dir)), ["task-real.txt"])
 
 
+class PendingCandidatesBatchTest(unittest.TestCase):
+    """pending_candidates resolves readiness for the whole queue at once: the same verdict as
+    has_ready_result per task, at a fixed number of archive listings however long the queue."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.tasks_dir = Path(self.tmp.name) / "tasks"
+        self.results_dir = Path(self.tmp.name) / "results"
+        self.tasks_dir.mkdir()
+        (self.results_dir / "archive" / "2026-09").mkdir(parents=True)
+
+    def _queue_every_fixture(self):
+        """One task per single-state and mixed fixture, all sharing one results tree."""
+        expected = {}
+        cases = [(n, [] if e is None else [e], n in EXPECTED_READY) for n, e in RESULT_FIXTURES.items()]
+        cases += [(n, entries, ready) for n, (entries, ready, _) in MIXED_FIXTURES.items()]
+        for i, (_, entries, ready) in enumerate(cases):
+            tid = f"task-fx{i:02d}"
+            (self.tasks_dir / f"{tid}.txt").write_text("priority: normal\ntask: x\n")
+            _populate(self.results_dir, [(rel.replace(TASK, tid), body) for rel, body in entries])
+            expected[f"{tid}.txt"] = ready
+        return expected
+
+    def test_same_verdict_as_has_ready_result_on_every_fixture(self):
+        expected = self._queue_every_fixture()
+        got = set(pending_candidates(self.tasks_dir, self.results_dir))
+        for name, ready in expected.items():
+            with self.subTest(task=name):
+                self.assertEqual(has_ready_result(self.results_dir, name), ready)
+                self.assertEqual(name not in got, ready)
+
+    def test_one_archived_file_satisfies_an_exact_id_and_its_epoch_base_id(self):
+        names = ["task-a.txt", "task-a-1700000000.txt"]
+        for layout in ("archive", "archive/2026-09", "archive-2026-09-20"):
+            with self.subTest(layout=layout):
+                for p in self.results_dir.rglob("*.txt"):
+                    p.unlink()
+                for name in names:
+                    (self.tasks_dir / name).write_text("priority: normal\ntask: fixture\n")
+                _write(self.results_dir / layout / names[1])
+                self.assertEqual([has_ready_result(self.results_dir, n) for n in names], [True, True])
+                self.assertEqual(list(pending_candidates(self.tasks_dir, self.results_dir)), [])
+
+    def test_overlapping_ids_match_has_ready_result_in_every_layout(self):
+        ids = ["task-o", "task-o-1700000000", "task-o-1700000000-1800000000", "task-o-x"]
+        layouts = ["", "archive/", "archive/2026-09/", "archive-2026-09-20/"]
+        bodies = {"ready": "done\n", "blank": WS}
+        for layout in layouts:
+            for archived in ids:
+                for kind, body in bodies.items():
+                    with self.subTest(layout=layout, archived=archived, body=kind):
+                        for p in [*self.tasks_dir.iterdir(), *self.results_dir.rglob("*.txt")]:
+                            p.unlink()
+                        for tid in ids:
+                            (self.tasks_dir / f"{tid}.txt").write_text("priority: normal\ntask: x\n")
+                        _write(self.results_dir / f"{layout}{archived}.txt", body)
+                        want = [f"{t}.txt" for t in ids if not has_ready_result(self.results_dir, f"{t}.txt")]
+                        self.assertEqual(sorted(pending_candidates(self.tasks_dir, self.results_dir)), sorted(want))
+
+    def _archive_listings(self, n_tasks):
+        for i in range(n_tasks):
+            (self.tasks_dir / f"task-q{i:03d}.txt").write_text("priority: normal\ntask: x\n")
+        archive = os.fspath(self.results_dir / "archive")
+        real, seen = os.scandir, []
+
+        def counting(path="."):
+            if os.fspath(path) == archive:
+                seen.append(path)
+            return real(path)
+
+        with mock.patch("os.scandir", side_effect=counting):
+            got = list(pending_candidates(self.tasks_dir, self.results_dir))
+        self.assertEqual(len(got), n_tasks)
+        return len(seen)
+
+    def test_archive_listings_do_not_grow_with_the_queue(self):
+        one = self._archive_listings(1)
+        self.assertLessEqual(one, 2)
+        self.assertEqual(self._archive_listings(40), one)
+
+
 class MainDispatchTest(unittest.TestCase):
     """In-process `_main` calls: the bash callers' whole contract, visible to coverage."""
 
