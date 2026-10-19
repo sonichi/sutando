@@ -159,8 +159,11 @@ python3 skills/process-hygiene/scripts/reap_orphans.py --spotlight          # re
 python3 skills/process-hygiene/scripts/reap_orphans.py --reap --spotlight   # stop candidates
 ```
 
-Its triggers come in a follow-up: a health-check load warning that runs it once
-when the cause matches, and the end of witness scripts.
+Witness scripts run it once at their end: `scripts/witness-reap.sh`, called from
+a witness's EXIT trap, runs `--reap --spotlight` with the normal thresholds when
+this skill is installed, skips with one line when it is not, and never changes the
+witness's exit code. A health-check load warning that runs it once when the cause
+matches comes in a follow-up.
 
 `--reap` refuses a minimum age under 600 s (exit 2), so a typo cannot reap young
 work. A run holds an exclusive `flock` on `process-hygiene.lock` beside its log;
