@@ -143,7 +143,7 @@
     "orphan_reaper": {
       "type": "string",
       "pattern": "^(?!/)(?!(.*/)?\\.\\.(/|$))[^\\s]+\\.py$",
-      "description": "A script that reports (no arguments) or stops (--reap) orphaned test processes, relative to the skill directory and resolving inside it. health-check runs it to classify sustained load and, once per high-load episode, to stop them; at most one installed skill may declare it (skills/MANIFEST.md)."
+      "description": "A script that reports (no arguments) or stops (--reap) orphaned test processes, relative to the skill directory and resolving inside it. health-check runs it, from the installed (linked) skills dir only, to classify sustained load; at most one installed skill may declare it (skills/MANIFEST.md)."
     }
   },
   "allOf": [

@@ -7832,11 +7832,16 @@ def check_disk_space() -> dict:
     return {"name": name, "status": "ok", "detail": where}
 
 
+def installed_skills_dir() -> Path:
+    """Where skills/install.sh links installed skills; the repo's own skills/ is the shipped copy."""
+    return Path(claude_home_path("skills"))
+
+
 def check_system_load(workspace: Optional[Path] = None, **probes) -> dict:
     """Sustained load against the core count (src/system_load.py). The cause classifier is the
-    script an installed skill declares for system_load.DECLARATION, resolved here and injected."""
+    script an installed (linked) skill declares for system_load.DECLARATION, resolved here and injected."""
     ws = WORKSPACE_DIR if workspace is None else Path(workspace)
-    found = skill_roots.declared(system_load.DECLARATION, ws)
+    found = skill_roots.declared(system_load.DECLARATION, roots=[installed_skills_dir()])
     return system_load.check(
         ws / "state" / system_load.STATE_NAME,
         ratio=system_load.setting(config_get(system_load.RATIO_KEY), system_load.DEFAULT_RATIO, float),

@@ -226,7 +226,7 @@ class Classification(Base):
     def test_without_a_classifier_the_cause_is_unclassified(self):
         row = self.warn_row()
         self.assertEqual(row["status"], "warn")
-        self.assertEqual(row["_cause"], sl.CAUSE_UNCLASSIFIED)
+        self.assertEqual(row["cause"], sl.CAUSE_UNCLASSIFIED)
         self.assertIn("cause: unclassified (no installed skill declares an orphan reaper)", row["detail"])
         self.assertIn("top CPU: 4211 (ppid 1, 97%, up 3-02:11:04) python3 spin.py --token ***", row["detail"])
         self.assertNotIn("/private", row["detail"])
@@ -236,7 +236,7 @@ class Classification(Base):
         script = stub_skill(self.tmp / "skills", "hygiene", printer(REPORT))
         runner = FakeRunner()
         row = self.warn_row(classifier=script, runner=runner)
-        self.assertEqual(row["_cause"], sl.CAUSE_LEFTOVER)
+        self.assertEqual(row["cause"], sl.CAUSE_LEFTOVER)
         self.assertIn("cause: leftover test processes from ended agent sessions (2 of the top 5)", row["detail"])
         self.assertEqual(runner.script_calls(), [[sys.executable, str(script)]])
 
@@ -244,7 +244,7 @@ class Classification(Base):
         script = stub_skill(self.tmp / "skills", "hygiene", printer(
             "would stop pid=901 pids=901 age=9000s\nx: mode=report roots=1 candidates=1\n"))
         row = self.warn_row(classifier=script)
-        self.assertEqual(row["_cause"], sl.CAUSE_OTHER)
+        self.assertEqual(row["cause"], sl.CAUSE_OTHER)
         self.assertIn("not leftover test processes (only 1 of the top 5)", row["detail"])
 
     def test_a_busy_failed_or_misused_classifier_is_unclassified(self):
@@ -295,11 +295,18 @@ class Edge(unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp(prefix="sysload-edge-"))
         self.addCleanup(lambda: subprocess.run(["rm", "-rf", str(self.tmp)]))
         self.ws = self.tmp / "ws"
-        self.repo_skills = self.tmp / "repo-skills"
-        self.repo_skills.mkdir()
-        p = mock.patch.object(skill_roots, "REPO_SKILLS", self.repo_skills)
+        self.installed = self.tmp / "claude-home" / "skills"
+        self.installed.mkdir(parents=True)
+        self.shipped = self.tmp / "shipped"
+        self.real_installed_skills_dir = self.hc.installed_skills_dir
+        p = mock.patch.object(self.hc, "installed_skills_dir", lambda: self.installed)
         p.start()
         self.addCleanup(p.stop)
+
+    def link(self, name):
+        """Install the way skills/install.sh does: a symlink in the installed skills dir."""
+        stub_skill(self.shipped, name, printer(REPORT))
+        (self.installed / name).symlink_to(self.shipped / name)
 
     def run_passes(self, cfg=None, n=3):
         cfg = cfg or {}
@@ -310,24 +317,29 @@ class Edge(unittest.TestCase):
                                                 cores_fn=lambda: 8, runner=FakeRunner())
         return row
 
-    def test_skill_absent_is_unclassified(self):
+    def test_shipped_but_not_installed_is_unclassified(self):
+        self.assertTrue(skill_roots.declared_scripts(sl.DECLARATION, REPO / "skills"))
+        stub_skill(self.ws / "skills", "in-workspace", printer(REPORT))
         row = self.run_passes()
-        self.assertEqual(row["_cause"], sl.CAUSE_UNCLASSIFIED)
+        self.assertEqual((row["cause"], row["action"]), (sl.CAUSE_UNCLASSIFIED, sl.ACTION_NONE))
+        self.assertTrue(row["detail"].endswith("; cause=unclassified action=none"))
         self.assertTrue((self.ws / "state" / sl.STATE_NAME).is_file())
 
-    def test_declaring_skill_in_the_workspace_is_found(self):
-        stub_skill(self.ws / "skills", "any-name", printer(REPORT))
-        self.assertEqual(self.run_passes()["_cause"], sl.CAUSE_LEFTOVER)
+    def test_a_linked_declaring_skill_is_found(self):
+        self.link("any-name")
+        row = self.run_passes()
+        self.assertEqual((row["cause"], row["action"]), (sl.CAUSE_LEFTOVER, sl.ACTION_REAP))
+        self.assertTrue(row["detail"].endswith("; cause=leftover-test-processes action=reap-once"))
 
-    def test_declaring_skill_in_the_engine_root_is_found(self):
-        stub_skill(self.repo_skills, "other-name", printer(REPORT))
-        self.assertEqual(self.run_passes()["_cause"], sl.CAUSE_LEFTOVER)
+    def test_the_default_installed_dir_is_claude_homes_skills(self):
+        with mock.patch.object(self.hc, "claude_home_path", lambda *p: self.tmp.joinpath("chp", *p)):
+            self.assertEqual(self.real_installed_skills_dir(), self.tmp / "chp" / "skills")
 
     def test_two_declarers_are_a_conflict_nobody_picks_from(self):
-        stub_skill(self.repo_skills, "one", printer(REPORT))
-        stub_skill(self.ws / "skills", "two", printer(REPORT))
+        self.link("one")
+        self.link("two")
         row = self.run_passes()
-        self.assertEqual(row["_cause"], sl.CAUSE_UNCLASSIFIED)
+        self.assertEqual(row["cause"], sl.CAUSE_UNCLASSIFIED)
         self.assertIn("more than one skill declares orphan_reaper", row["detail"])
 
     def test_threshold_and_passes_come_from_health_check_config(self):
@@ -342,8 +354,8 @@ class Edge(unittest.TestCase):
         called = {c.func.id for c in ast.walk(fn) if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)}
         self.assertIn("check_system_load", called)
 
-    def test_json_payload_drops_the_internal_cause(self):
-        row = {"name": sl.NAME, "status": "warn", "detail": "d", "_cause": sl.CAUSE_LEFTOVER}
+    def test_json_payload_carries_cause_and_action(self):
+        row = {"name": sl.NAME, "status": "warn", "detail": "d", "cause": sl.CAUSE_LEFTOVER, "action": sl.ACTION_REAP}
         with mock.patch.object(self.hc, "run_all_checks", return_value=[row]), \
                 mock.patch.object(self.hc, "publish_health_report"), \
                 mock.patch.object(self.hc, "track_health_fix"), \
@@ -351,7 +363,7 @@ class Edge(unittest.TestCase):
                 mock.patch("builtins.print") as out:
             self.hc.main()
         payload = json.loads(out.call_args[0][0])
-        self.assertEqual(payload["checks"], [{"name": sl.NAME, "status": "warn", "detail": "d"}])
+        self.assertEqual(payload["checks"], [row])
 
 
 class ShippedDeclaration(unittest.TestCase):

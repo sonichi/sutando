@@ -49,10 +49,12 @@ CLASSIFY_TIMEOUT_S = 60
 TOP_N = 5
 CMD_WIDTH = 60
 
-CAUSE_LEFTOVER = "leftover-tests"
+CAUSE_LEFTOVER = "leftover-test-processes"
 CAUSE_OTHER = "other"
 CAUSE_UNCLASSIFIED = "unclassified"
 LEFTOVER_PHRASE = "leftover test processes from ended agent sessions"
+ACTION_REAP = "reap-once"
+ACTION_NONE = "none"
 
 Runner = Callable[[Sequence[str], float], Tuple[int, str]]
 
@@ -254,7 +256,8 @@ def check(state_path: Path, ratio: float = DEFAULT_RATIO, passes: int = DEFAULT_
           classifier: Optional[Path] = None, unavailable: Optional[str] = None,
           now: Optional[float] = None, load_fn: Optional[Callable[[], Sequence[float]]] = None,
           cores_fn: Optional[Callable[[], Optional[int]]] = None, runner: Optional[Runner] = None) -> Dict:
-    """The `system-load` row. `_cause` carries the classification for the caller's remedy step."""
+    """The `system-load` row. A warning carries `cause` and `action` (also as `cause=... action=...`
+    at the end of its detail) so the core can decide; `reap-once` means the cause is leftover tests."""
     now = time.time() if now is None else now
     load_fn, cores_fn, runner = load_fn or os.getloadavg, cores_fn or os.cpu_count, runner or run_command
     try:
@@ -291,7 +294,9 @@ def check(state_path: Path, ratio: float = DEFAULT_RATIO, passes: int = DEFAULT_
             fresh = read_state(state_path)
             fresh["classification"] = {"at": now, "cause": cause, "note": note}
             write_state(state_path, fresh)
+    action = ACTION_REAP if cause == CAUSE_LEFTOVER else ACTION_NONE
     detail = f"{reading} for {passes} consecutive passes; cause: {_cause_text(cause, note)}"
     if top:
         detail += f"; top CPU: {describe_top(top)}"
-    return {"name": NAME, "status": "warn", "detail": detail, "_cause": cause}
+    return {"name": NAME, "status": "warn", "detail": f"{detail}; cause={cause} action={action}",
+            "cause": cause, "action": action}
