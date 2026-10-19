@@ -134,7 +134,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_response(502); self.end_headers(); return
             n = int(self.headers.get("Content-Length") or 0)
             STATE["room_posts"].append(json.loads(self.rfile.read(n).decode()))
-            if STATE["force_room_400_body"] is not None:
+            if STATE["force_room_400_body"] is not None:  # pragma: no cover - the server thread is outside the gate's trace
                 body = json.dumps(STATE["force_room_400_body"]).encode()
                 self.send_response(400)
                 self.send_header("Content-Type", "application/json")
@@ -218,6 +218,81 @@ def _test_owner_dm_room_upgraded(rtc) -> None:
         STATE["force_room_400_body"] = None
         rtc.OWNER_DM_UPGRADED_NOTIFY = real_hook
         rtc._upgrade_hold_file().unlink(missing_ok=True)
+
+
+def _test_owner_dm_upgrade_edges(rtc) -> None:
+    """Fail-open branches of the owner-DM upgrade hold and the ask-owner hook."""
+    import subprocess as _sp
+    check(rtc._room_upgraded_to("not json") is None, "a non-JSON 400 body is not an upgrade")
+    check(rtc._room_upgraded_to('{"reason": "room_upgraded"}') == "",
+          "an upgrade body without a replacement names an empty room")
+    logged: list = []
+    real_log, real_write, real_hook = rtc._log, rtc._atomic_private_json, rtc.OWNER_DM_UPGRADED_NOTIFY
+    real_rename, real_popen = Path.rename, _sp.Popen
+    hold = rtc._upgrade_hold_file()
+
+    def _no_write(*_a, **_k):
+        raise OSError("read-only state")
+
+    def _boom(*_a):
+        raise RuntimeError("notify broke")
+
+    try:
+        rtc._log = logged.append
+        hold.write_text(json.dumps({"room": "!a:example.org", "replacement": "!b:example.org"}))
+        rtc._atomic_private_json = _no_write
+        check(not rtc._owner_dm_upgrade_held("!other:example.org")
+              and json.loads(hold.read_text())["room"] == "!a:example.org",
+              "an unclearable stale hold is reported as not held")
+        rtc.OWNER_DM_UPGRADED_NOTIFY = _boom
+        rtc._hold_owner_dm_upgrade("!c:example.org", "")
+        check(any("could not record owner-DM upgrade hold" in m for m in logged)
+              and any("(unknown)" in m for m in logged)
+              and any("owner-DM upgrade notify failed" in m for m in logged),
+              "an unwritable hold and a failing notify are logged, not raised")
+        rtc._atomic_private_json = real_write
+        hold.unlink(missing_ok=True)
+        # The un-claim rename can lose a race; the upgrade is still held and notified.
+        calls: list = []
+        rtc.OWNER_DM_UPGRADED_NOTIFY = lambda old, new: calls.append((old, new))
+
+        def _rename(self, target):
+            if self.name.startswith("proactive-up4.sending"):
+                raise OSError("claim vanished")
+            return real_rename(self, target)
+
+        up = rtc.RESULTS_DIR / "proactive-up4.txt"
+        up.write_text("race nudge\n")
+        STATE["force_room_400_body"] = {"reason": "room_upgraded", "replacement_room": "!n:example.org"}
+        Path.rename = _rename
+        rtc._post_proactive()
+        Path.rename = real_rename
+        check(calls == [("!owner:example.org", "!n:example.org")]
+              and rtc._owner_dm_upgrade_held("!owner:example.org"),
+              "a failed un-claim rename still holds the owner DM and notifies")
+        for left in rtc.RESULTS_DIR.glob("proactive-up4*"):
+            left.unlink()
+        # The sutando hook launches ask-owner detached, and a failed launch is logged.
+        launched: list = []
+        _sp.Popen = lambda argv, **kw: launched.append((argv, kw))
+        real_hook("!owner:example.org", "!n:example.org")
+        check(len(launched) == 1 and launched[0][0][1].endswith("ask-owner.py")
+              and launched[0][0][-1] == "--unless-open"
+              and launched[0][1].get("start_new_session") is True,
+              "the owner-DM upgrade hook asks the owner via a detached ask-owner")
+
+        def _no_spawn(*_a, **_k):
+            raise OSError("no exec")
+
+        _sp.Popen = _no_spawn
+        real_hook("!owner:example.org", "!n:example.org")
+        check(any("ask-owner did not start" in m for m in logged),
+              "a failed ask-owner launch is logged, not raised")
+    finally:
+        Path.rename, _sp.Popen = real_rename, real_popen
+        STATE["force_room_400_body"] = None
+        rtc._log, rtc._atomic_private_json, rtc.OWNER_DM_UPGRADED_NOTIFY = real_log, real_write, real_hook
+        hold.unlink(missing_ok=True)
 
 
 def main() -> int:
@@ -1378,6 +1453,7 @@ def main() -> int:
     rtc._post_proactive()
     _it3b = _ob._read_item(_rroot, "proactive-r3")
     _test_owner_dm_room_upgraded(rtc)
+    _test_owner_dm_upgrade_edges(rtc)
     check(_it3b.get("status") == "DELIVERED"
           and _it3b.get("destination") == "!owner:example.org",
           "the successful retry records the receipt")
