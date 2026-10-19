@@ -5026,6 +5026,42 @@ def _relay_failed_sent(broker_id: str) -> bool:
     return False
 
 
+def _isolated(task: dict, take, *args) -> bool:
+    """`take(*args)`, where a raise costs only this task: it is logged and left unacked for
+    the broker to re-serve, and the rest of its batch is still taken and acked."""
+    try:
+        return bool(take(*args))
+    except Exception as e:  # noqa: BLE001 — one task must not withhold its batch's acks
+        _log(f"task {_one_line(task.get('id'))[:128]} not taken ({type(e).__name__}: {e}) "
+             "— not acked; the broker re-serves it")
+        return False
+
+
+def _take_served_task(task: dict, inflight: "set[str]", pending_ack: list) -> bool:
+    """One served task that is not `ack_first`: consumed as a control, or queued and its
+    ack added to `pending_ack`. True when it newly entered the in-flight set."""
+    hitl_out = _handle_hitl_action(task)
+    if hitl_out:
+        body = _hitl_control_body(hitl_out)
+        _queue_review_control_result(task, body=body)
+        _retry_review_control_results()
+        _log(f"hitl: consumed card click {task.get('id')} from the task relay ({hitl_out})")
+        return False
+    if _handle_review_decision(task):
+        _queue_review_control_result(task)
+        _retry_review_control_results()
+        _log(f"consumed private review decision {task.get('id')}")
+        return False
+    written = _write_task(task)
+    if not written:
+        return False
+    tid, durable = written
+    pending_ack.append((tid, durable, _lease_id_of(task)))
+    fresh = tid not in inflight
+    inflight.add(tid)
+    return fresh
+
+
 def _take_ack_first(task: dict, inflight: "set[str]") -> bool:
     """A task served with `ack_first`: staged, acked on its own and published only once
     the ack is accepted, so a withdrawn ask never reaches the core. True once published."""
@@ -7513,29 +7549,10 @@ def main() -> None:
             # First and on its own, so a slow task ahead cannot hold it past its delivery lease.
             for task in tasks:
                 if task.get("ack_first") is True:
-                    added |= _take_ack_first(task, inflight)
+                    added |= _isolated(task, _take_ack_first, task, inflight)
             for task in tasks:
-                if task.get("ack_first") is True:
-                    continue
-                hitl_out = _handle_hitl_action(task)
-                if hitl_out:
-                    body = _hitl_control_body(hitl_out)
-                    _queue_review_control_result(task, body=body)
-                    _retry_review_control_results()
-                    _log(f"hitl: consumed card click {task.get('id')} from the task relay ({hitl_out})")
-                    continue
-                if _handle_review_decision(task):
-                    _queue_review_control_result(task)
-                    _retry_review_control_results()
-                    _log(f"consumed private review decision {task.get('id')}")
-                    continue
-                written = _write_task(task)
-                if written:
-                    tid, durable = written
-                    if tid not in inflight:
-                        inflight.add(tid)
-                        added = True
-                    pending_ack.append((tid, durable, _lease_id_of(task)))
+                if task.get("ack_first") is not True:
+                    added |= _isolated(task, _take_served_task, task, inflight, pending_ack)
             # Ack only after task file, in-flight set and ack ledger are durable;
             # any failure withholds every ack this round, redeliveries included.
             committed = _save_inflight(inflight) if pending_ack else True

@@ -440,6 +440,60 @@ class AckFirstInTheLoopTest(unittest.TestCase):
         self.assertEqual(len(loop.polls), 1)
 
 
+class OneTaskFailsInABatchTest(unittest.TestCase):
+    """A task that raises while it is taken costs only itself: its batch-mates are still
+    queued and acked, so the broker does not re-serve the whole batch until each parks."""
+
+    def setUp(self):
+        try:
+            from ag2_sparrow import remote_gateway_bridge as gw
+        except (Exception, SystemExit) as e:  # noqa: BLE001
+            self.skipTest(f"gateway not importable: {str(e)[:60]}")
+        self.gw = gw
+        self.acked: list = []
+
+    def _run(self, served, write):
+        with _Loop(self.gw) as loop, \
+                patch.object(self.gw, "_record_pending_acks", return_value=True), \
+                patch.object(self.gw, "wake_outbound", new=lambda: None):
+            loop.served = [served]
+            self.gw._write_task = write
+            self.gw._post_task_ack = lambda tid, durable=False, lease=None: \
+                self.acked.append((tid, lease))
+            loop.run()
+        return loop
+
+    def test_a_task_that_raises_does_not_withhold_the_other_acks(self):
+        tasks = [{"id": f"task-{n}", "task": "hi", "lease_id": f"lease-{n}"}
+                 for n in ("a1", "b2", "c3")]
+
+        def write(task, *a, **k):
+            if task["id"] == "task-b2":
+                raise ValueError("bad field")
+            return task["id"], True
+
+        loop = self._run(tasks, write)
+        self.assertEqual(self.acked, [("task-a1", "lease-a1"), ("task-c3", "lease-c3")])
+        self.assertEqual(loop.clock.slept, [], "one bad task is not an outage: no back-off")
+        self.assertTrue(any("task-b2" in m and "ValueError" in m for m in loop.logs),
+                        "the failing task and its error are named")
+
+    def test_every_task_of_a_batch_is_acked_in_the_round_it_is_served(self):
+        # The ack is on receipt, before any worker runs, so serial answering never outlasts a lease.
+        tasks = [{"id": f"task-e{n}", "task": "hi", "lease_id": f"lease-e{n}"} for n in range(8)]
+        loop = self._run(tasks, lambda task, *a, **k: (task["id"], True))
+        self.assertEqual(self.acked, [(t["id"], t["lease_id"]) for t in tasks])
+        self.assertEqual(len(loop.polls), 1, "all eight acked before the next poll")
+
+    def test_an_ack_first_task_that_raises_does_not_stop_the_batch(self):
+        relay = {"id": "ask-5f3c9e0a1b2c", "task": "calendar?", "ack_first": True}
+        typed = {"id": "task-d4", "task": "hi", "lease_id": "lease-d4"}
+        with patch.object(self.gw, "_take_ack_first", side_effect=RuntimeError("held")):
+            loop = self._run([relay, typed], lambda task, *a, **k: (task["id"], True))
+        self.assertEqual(self.acked, [("task-d4", "lease-d4")])
+        self.assertTrue(any(relay["id"] in m and "RuntimeError" in m for m in loop.logs))
+
+
 class RelayResultsInTheLoopTest(unittest.TestCase):
     """What `main()` does for a voice relay ask's result: reclaimed at start, and put back in
     flight on every pass when it lands outside the in-flight set."""
