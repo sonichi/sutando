@@ -291,13 +291,23 @@ class TestClassify(unittest.TestCase):
     def test_continue_waits_for_the_switch_to_settle(self):
         pending = {"key": ("continue", "Enter"), "at": 100.0}
         # A picker or a still-running switch keeps it pending; idle-ready sends it once.
-        self.assertEqual(_mod.follow_up_step(pending, "blocked-human", 101.0), (None, pending))
-        self.assertEqual(_mod.follow_up_step(pending, "running", 101.0), (None, pending))
-        self.assertEqual(_mod.follow_up_step(pending, "idle-ready", 102.0), (("continue", "Enter"), None))
+        self.assertEqual(_mod.follow_up_step(pending, "blocked-human", 101.0, _IDLE), (None, pending))
+        self.assertEqual(_mod.follow_up_step(pending, "running", 101.0, _IDLE), (None, pending))
+        self.assertEqual(_mod.follow_up_step(pending, "idle-ready", 102.0, _IDLE), (("continue", "Enter"), None))
         # Past the window it is dropped unsent, whatever the pane then reads.
-        self.assertEqual(_mod.follow_up_step(pending, "idle-ready", 100.0 + _mod.FOLLOW_UP_WINDOW_S + 1),
+        self.assertEqual(_mod.follow_up_step(pending, "idle-ready", 100.0 + _mod.FOLLOW_UP_WINDOW_S + 1, _IDLE),
                          (None, None))
-        self.assertEqual(_mod.follow_up_step(None, "idle-ready", 102.0), (None, None))
+        self.assertEqual(_mod.follow_up_step(None, "idle-ready", 102.0, _IDLE), (None, None))
+
+    def test_a_draft_at_idle_ready_keeps_continue_unsent(self):
+        pending = {"key": ("continue", "Enter"), "at": 100.0}
+        draft = _IDLE.replace("❯ ", "❯ half-typed reply")
+        self.assertEqual(compose_state(draft, "idle", True)[0], "idle-ready")
+        self.assertEqual(_mod.follow_up_step(pending, "idle-ready", 102.0, draft), (None, pending))
+        # The draft outlasting the window drops it unsent; the draft is never submitted.
+        self.assertEqual(_mod.follow_up_step(pending, "idle-ready", 100.0 + _mod.FOLLOW_UP_WINDOW_S + 1, draft),
+                         (None, None))
+        self.assertEqual(_mod.follow_up_step(pending, "idle-ready", 103.0, _IDLE), (("continue", "Enter"), None))
 
     def test_the_refusal_wrapped_over_two_lines_is_still_seen(self):
         pane = _FABLE_REFUSED_MONITOR.replace(" or switch models", "\n  or switch models")
@@ -1391,6 +1401,11 @@ class TestMainAutoAnswerWiring(unittest.TestCase):
             ("/tmp/x.sock", "sutando-core", ("/model opus", "Enter")),
             ("/tmp/x.sock", "sutando-core", ("continue", "Enter")),
         ])
+
+    def test_a_draft_at_idle_ready_holds_the_follow_up_in_the_loop(self):
+        draft = _IDLE.replace("❯ ", "❯ half-typed reply")
+        sent = self._ticks([_FABLE_REFUSED_MONITOR, draft, draft])
+        self.assertEqual(sent, [("/tmp/x.sock", "sutando-core", ("/model opus", "Enter"))])
 
     def test_a_second_refusal_within_the_cooldown_is_not_retyped(self):
         # tick2 (idle) resets answered_prompt; tick3's recurring refusal must

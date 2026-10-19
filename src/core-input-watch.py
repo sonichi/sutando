@@ -607,12 +607,12 @@ def send_keys(socket, session, key):
     return True
 
 
-def follow_up_step(pending, state, now):
-    """(key to send now or None, pending to keep). A follow-up waits for idle-ready and
-    is dropped unsent once FOLLOW_UP_WINDOW_S passes."""
+def follow_up_step(pending, state, now, pane):
+    """(key to send now or None, pending to keep). A follow-up waits for idle-ready with an
+    empty composer, so a typed draft is never submitted with it; dropped after FOLLOW_UP_WINDOW_S."""
     if not pending or now - pending["at"] > FOLLOW_UP_WINDOW_S:
         return None, None
-    if state == "idle-ready":
+    if state == "idle-ready" and _composer_is_empty(pane):
         return pending["key"], None
     return None, pending
 
@@ -977,7 +977,7 @@ def main():
             if kind in _FOLLOW_UP:
                 follow_up = {"key": _FOLLOW_UP[kind], "at": last_answered["at"]}
         elif follow_up:
-            then, follow_up = follow_up_step(follow_up, state, time.time())
+            then, follow_up = follow_up_step(follow_up, state, time.time(), pane or "")
             if then:
                 send_keys(a.socket, a.session, then)
         dkey = dismiss_step(state_dir, a.session, state, kind, prompt, clock, time.time(), a.auto_answer)
