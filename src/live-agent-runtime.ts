@@ -14,14 +14,13 @@
  */
 
 import { writeFileSync } from 'node:fs';
-import { join } from 'node:path';
 import type { VoiceSession } from 'bodhi-realtime-agent';
 import { resolveWorkspace, statusPath } from './workspace_default.js';
 import { injectText } from './browser-tools.js';
 import { meetingHoldsModel } from './meeting-input-hold.js';
 import { frameContextDrop, frameNoteViewMetadata, frameNoteViewFull } from './inject-framing.js';
 import { deliverWithRetry } from './inject-delivery.js';
-import { startResultWatcher, startContextDropWatcher, startNoteViewingWatcher, voiceTaskStore, reconcileVoiceTasks, forwardOfflineVoiceResult, notPickedStillTrue } from './task-bridge.js';
+import { startResultWatcher, startContextDropWatcher, startNoteViewingWatcher, publishResultFile, voiceTaskStore, reconcileVoiceTasks, forwardOfflineVoiceResult, notPickedStillTrue } from './task-bridge.js';
 import { createHandoffPacer, frameResult, resultIsMoot, type Handoff, type RelayAgent, type ResultItem } from './relay-agent.js';
 
 const WORKSPACE_DIR = resolveWorkspace();
@@ -197,8 +196,7 @@ export function wireDurableChannels(session: VoiceSession, opts: DurableChannelO
 		console.log(`${ts()} [TaskBridge] Voice not active after waiting — falling back to Discord DM${cartesiaApiKey && generateSpeech ? ' + Cartesia' : ''}`);
 		try {
 			// One file per result: two can fall back in the same millisecond.
-			const proactivePath = join(WORKSPACE_DIR, 'results', `proactive-voice-stuck-${Date.now()}-${++stuckSeq}.txt`);
-			writeFileSync(proactivePath, `🎤 Voice session was stuck — couldn't speak this. Task result:\n\n${item.text}`);
+			publishResultFile(`proactive-voice-stuck-${Date.now()}-${++stuckSeq}.txt`, `🎤 Voice session was stuck — couldn't speak this. Task result:\n\n${item.text}`);
 		} catch (e) {
 			console.error(`${ts()} [TaskBridge] Failed to write stuck-voice Discord fallback:`, e);
 		}

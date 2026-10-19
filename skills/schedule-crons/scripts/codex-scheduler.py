@@ -24,6 +24,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
 from task_archive import find_task_file  # noqa: E402
+from result_publish import publish_text  # noqa: E402
 from cron_loop_policy import is_core_main_loop, main_loop_problem  # noqa: E402
 from loop_completion import write_completion  # noqa: E402
 from local_task_protocol import serialize_task_last  # noqa: E402
@@ -314,7 +315,7 @@ def _task_is_active(workspace: Path, task_ids: list[str]) -> bool:
 def _alert(workspace: Path, job_name: str, message: str, now: datetime) -> Path:
     stamp = int(now.timestamp())
     path = workspace / "results" / f"proactive-schedule-alert-{safe_name(job_name)}-{stamp}.txt"
-    atomic_text(path, f"Schedule alert — {job_name}: {message}\n")
+    publish_text(path, f"Schedule alert — {job_name}: {message}\n")
     return path
 
 

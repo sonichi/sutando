@@ -1181,12 +1181,23 @@ def main() -> int:
             raise OSError("simulated transient post-claim read failure")
         return _real_read_text(self, *a, **k)
 
+    # The post-claim read goes through the readiness owner, which opens the file itself.
+    _ready_mod = sys.modules[rtc.read_ready_result.__module__]
+    _real_identity_of = _ready_mod.identity_of
+
+    def _identity_of_fail_on_claim(path):
+        if ".sending." in _pl.Path(path).name:
+            raise OSError("simulated transient post-claim read failure")
+        return _real_identity_of(path)
+
     posts_rf = len(STATE["room_posts"])
     _pl.Path.read_text = _read_text_fail_on_claim
+    _ready_mod.identity_of = _identity_of_fail_on_claim
     try:
         rtc._post_proactive()
     finally:
         _pl.Path.read_text = _real_read_text
+        _ready_mod.identity_of = _real_identity_of
     check((rtc.RESULTS_DIR / "proactive-readfail.txt").exists()
           and not list(rtc.RESULTS_DIR.glob("proactive-readfail.sending.*"))
           and len(STATE["room_posts"]) == posts_rf,

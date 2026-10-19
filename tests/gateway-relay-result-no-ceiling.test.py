@@ -891,7 +891,7 @@ class WithdrawnAccess(_Bridge):
         """Staged under the owner cap, then acked under a guest cap: kept staged, unpublished."""
         with patch.object(gw, "_post_ack_first", return_value="retry"):
             self.assertFalse(gw._take_ack_first(voice_ask(), set(gw._load_inflight())))
-        [staged] = sorted(gw._held_dir().glob(f"{ASK_A}.txt.*.tmp"))
+        [staged] = sorted(gw._held_dir().glob(f".{ASK_A}.txt.*.tmp"))
         if age:
             landed = time.time() - age
             os.utime(staged, (landed, landed))
@@ -1364,7 +1364,7 @@ class WithdrawnAccessThroughTheLoop(_Loop):
     def test_withdrawn_past_the_threshold_after_a_restart_ends_once_and_stays_ended(self):
         self.relay.queue.append(voice_ask())
         self.bridges.crashed(self.bridges.start(crash="before-publish"), "the publish")
-        [staged] = sorted((self.ws / "tasks" / ".ack-first").glob(f"{ASK_A}.txt.*.tmp"))
+        [staged] = sorted((self.ws / "tasks" / ".ack-first").glob(f".{ASK_A}.txt.*.tmp"))
         landed = time.time() - 700.0                     # staged ten minutes and more ago
         os.utime(staged, (landed, landed))
         self.bridges.env["REMOTE_TASK_TIER"] = "guest"   # the operator withdrew local access
@@ -1386,7 +1386,7 @@ class WithdrawnAccessThroughTheLoop(_Loop):
     def test_a_crash_after_the_failed_is_accepted_leaves_the_mark_for_the_end_to_retire_last(self):
         self.relay.queue.append(voice_ask())
         self.bridges.crashed(self.bridges.start(crash="before-publish"), "the publish")
-        [staged] = sorted((self.ws / "tasks" / ".ack-first").glob(f"{ASK_A}.txt.*.tmp"))
+        [staged] = sorted((self.ws / "tasks" / ".ack-first").glob(f".{ASK_A}.txt.*.tmp"))
         landed = time.time() - 700.0
         os.utime(staged, (landed, landed))
         self.bridges.env["REMOTE_TASK_TIER"] = "guest"

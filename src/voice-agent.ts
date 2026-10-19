@@ -1297,7 +1297,7 @@ async function main() {
 
 	// Wire voice-failure classifier: when the Gemini Live transport closes
 	// with a non-retryable reason (credits depleted, quota exceeded, key
-	// invalid, model not found), surface an actionable message via the
+	// invalid, ephemeral token expired, model not found), surface an actionable message via the
 	// proactive-result channel + an OS notification. Throttled per category
 	// so the 30s reconnect loop doesn't spam.
 	(() => {
@@ -1327,11 +1327,10 @@ async function main() {
 			// task feed and the Discord/Telegram bridges if configured.
 			try {
 				const tsMs = Date.now();
-				const path = join(WORKSPACE_DIR, 'results', `proactive-voice-${c.category}-${tsMs}.txt`);
 				const body = c.userActionUrl
 					? `${c.userMessage} ${c.userActionUrl}`
 					: c.userMessage;
-				writeFileSync(path, body);
+				publishResultFile(`proactive-voice-${c.category}-${tsMs}.txt`, body);
 			} catch (e) {
 				console.error(`${ts()} [VoiceFailure] proactive write failed: ${(e as Error)?.message ?? e}`);
 			}
