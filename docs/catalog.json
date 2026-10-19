@@ -381,7 +381,7 @@
    ],
    "status": "canonical",
    "canonical_for": "workspace configuration and resolver APIs",
-   "last_verified": "2026-10-05"
+   "last_verified": "2026-10-19"
   },
   "docs/workspace-contract.md": {
    "title": "Workspace contract",

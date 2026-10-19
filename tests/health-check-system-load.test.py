@@ -373,6 +373,13 @@ class ShippedDeclaration(unittest.TestCase):
         found = skill_roots.declared_scripts(sl.DECLARATION, REPO / "skills")
         self.assertEqual([(n, p.name) for n, p in found], [("process-hygiene", "reap_orphans.py")])
 
+    def test_config_keys_are_documented_with_their_defaults(self):
+        env = json.loads((REPO / "docs" / "sutando-config.schema.json").read_text())["properties"]["env"]
+        for key, default in ((sl.RATIO_KEY, sl.DEFAULT_RATIO), (sl.PASSES_KEY, sl.DEFAULT_PASSES)):
+            with self.subTest(key=key):
+                self.assertEqual(env["properties"][key]["default"], str(default))
+                self.assertIn(f"| `{key}` | `{default}` |", (REPO / "docs" / "workspace-config.md").read_text())
+
     def test_lint_refuses_a_reaper_outside_the_skill(self):
         tmp = Path(tempfile.mkdtemp(prefix="sysload-lint-"))
         self.addCleanup(lambda: subprocess.run(["rm", "-rf", str(tmp)]))
