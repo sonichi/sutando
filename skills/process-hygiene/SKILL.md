@@ -61,10 +61,28 @@ each Claude config dir (`CLAUDE_CONFIG_DIR`, the home `.claude`, and every
   mistaken for the session), or the session transcript
   `<config>/projects/<slug>/<session-id>.jsonl` changed within the minimum age;
 - **gone** — that transcript exists, a `sessions/` directory exists to have held
-  a marker, and neither alive condition holds;
+  a marker, neither alive condition holds, and no live Claude process of the same
+  project could still own the scratchpad after a `/clear` (below);
 - **unknown** — anything else: no transcript in any known config dir, a marker or
   `sessions/` directory that cannot be read, a marker without `pid`/`procStart`.
   Unknown is treated as alive: never reaped.
+
+**`/clear`.** Measured with a throwaway interactive `claude`: `/clear` rewrites the
+running process's marker with a **new** `sessionId` (same `pid`, same
+`procStart`), starts a new session directory and transcript, and leaves the old
+session's scratchpad in place. Nothing on disk links the new id back to the old
+one (the new transcript does not name it; the process holds nothing open under
+the old session directory). So the old scratchpad, still the cwd of anything the
+session started, would read gone while its owner is alive. The rule that covers
+it: if any **live** marker (pid running with its `procStart`) belongs to the same
+project (its `cwd` mapped to a project name the way Claude Code does, every
+non-alphanumeric character to `-`) and that process started no later than
+`CLEAR_SLACK_S` (120 s) after the session directory was created, the owner is
+**unknown** and the scratchpad is spared. A process started after the directory
+existed cannot have owned it. A live marker with no `cwd` or no `procStart`
+counts as the same project. The consequence: on a host with a long-running
+session in a project, no ended session of that project created during its
+lifetime is reaped.
 
 Claude Code writes the marker while a session runs and it is the only per-session
 liveness record on disk; a session's main process does not hold its transcript

@@ -269,7 +269,7 @@ class Rules(unittest.TestCase):
                         "/x/ms-playwright/chrome-headless-shell --headless",
                         "bash src/watch-tasks-stream.sh /w/tasks --role session",
                         "bash src/agent/claude/cli/claude-task-notifier.sh", "node src/voice-agent.ts",
-                        "python3 src/discord-bridge.py", "python3 src/telegram-bridge.py",
+                        "python3 src/chat-bridge.py", "python3 /x/relay/example-bridge.py --once",
                         "python3 src/core_heartbeat.py", "node /x/@modelcontextprotocol/server-fs/dist/index.js",
                         "npx -y chrome-devtools-mcp@1 --browserUrl http://127.0.0.1:9222",
                         "python3 -m my_mcp_server", "node mcp-server.js", "sutando-station serve",
@@ -312,7 +312,11 @@ class OwnerState(unittest.TestCase):
         self.transcript.parent.mkdir(parents=True)
         self.transcript.write_text("{}\n")
         os.utime(self.transcript, (1000, 1000))
-        self.root = "/t/claude-1/proj/sess/scratchpad"
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, True)
+        self.root = str(tmp / "claude-1" / "proj" / "sess" / "scratchpad")
+        os.makedirs(self.root)
+        self.born = ro.created_at(os.path.dirname(self.root))
 
     def state(self, start_of=lambda pid: None, now=lambda: 1000 + 10_000, configs=None):
         return ro.owner_state(self.root, configs or [str(self.cfg)], 7200, start_of=start_of, now=now)
@@ -331,8 +335,42 @@ class OwnerState(unittest.TestCase):
         self.assertEqual(self.state(start_of=lambda pid: "Sat Oct 3 00:00:00 2026"), ro.GONE)
 
     def test_another_sessions_marker_does_not_count(self):
-        self.marker(session="other")
+        self.marker(session="other", cwd="/elsewhere")
         self.assertEqual(self.state(start_of=lambda pid: self.START), ro.GONE)
+
+    def utc(self, epoch):
+        return time.strftime("%a %b %d %H:%M:%S %Y", time.gmtime(epoch))
+
+    def test_a_live_process_in_the_project_that_predates_the_scratchpad_may_own_it_after_clear(self):
+        # /clear: same pid and procStart, a new sessionId, nothing pointing back at the old one
+        start = self.utc(self.born - 60)
+        self.marker(session="after-clear", cwd="proj", start=start)
+        self.assertEqual(self.state(start_of=lambda pid: start), ro.UNKNOWN)
+
+    def test_a_process_started_after_the_scratchpad_existed_cannot_own_it(self):
+        start = self.utc(self.born + 10 * ro.CLEAR_SLACK_S)
+        self.marker(session="later", cwd="proj", start=start)
+        self.assertEqual(self.state(start_of=lambda pid: start), ro.GONE)
+
+    def test_only_the_same_project_and_a_live_pid_count(self):
+        start = self.utc(self.born - 60)
+        self.marker(session="other-project", cwd="/elsewhere", start=start)
+        self.assertEqual(self.state(start_of=lambda pid: start), ro.GONE)
+        self.marker(session="after-clear", cwd="proj", start=start)
+        self.assertEqual(self.state(start_of=lambda pid: None), ro.GONE, "a dead marker pid owns nothing")
+
+    def test_a_same_project_marker_without_start_or_cwd_is_unknown(self):
+        (self.cfg / "sessions" / "9.json").write_text(json.dumps({"sessionId": "x", "cwd": "proj"}))
+        self.assertEqual(self.state(), ro.UNKNOWN)
+        (self.cfg / "sessions" / "9.json").write_text(json.dumps({"pid": 9, "sessionId": "x",
+                                                                  "procStart": self.utc(self.born - 60)}))
+        self.assertEqual(self.state(start_of=lambda pid: self.utc(self.born - 60)), ro.UNKNOWN,
+                         "a marker with no cwd may be in any project")
+
+    def test_slug_and_epoch_helpers(self):
+        self.assertEqual(ro.project_slug("/a/b.c_d/-e"), "-a-b-c-d--e")
+        self.assertEqual(ro.utc_epoch("Thu Jan  1 00:01:40 1970"), 100.0)
+        self.assertIsNone(ro.utc_epoch("not a time"))
 
     def test_a_recent_transcript_is_alive(self):
         self.assertEqual(self.state(now=lambda: 1000 + 60), ro.ALIVE)

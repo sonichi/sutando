@@ -40,6 +40,7 @@ Run: python3 skills/process-hygiene/scripts/reap_orphans.py [--reap] [--spotligh
 from __future__ import annotations
 
 import argparse
+import calendar
 import datetime
 import fcntl
 import glob
@@ -317,6 +318,26 @@ def default_config_dirs() -> List[str]:
     return seen
 
 
+CLEAR_SLACK_S = 120
+
+
+def project_slug(cwd: str) -> str:
+    """Claude Code's project directory name for a cwd: every non-alphanumeric becomes '-'."""
+    return re.sub(r"[^A-Za-z0-9]", "-", cwd)
+
+
+def utc_epoch(lstart: str) -> Optional[float]:
+    try:
+        return float(calendar.timegm(time.strptime(" ".join(lstart.split()), "%a %b %d %H:%M:%S %Y")))
+    except (ValueError, OverflowError):
+        return None
+
+
+def created_at(path: str) -> float:
+    st = os.stat(path)
+    return getattr(st, "st_birthtime", None) or min(st.st_mtime, st.st_ctime)
+
+
 def owner_state(root: str, config_dirs: Sequence[str], min_age_s: float,
                 start_of=utc_start, now=time.time) -> str:
     """Whether the session owning <tmp>/claude-<uid>/<slug>/<session>/scratchpad is ALIVE, GONE or UNKNOWN.
@@ -324,14 +345,18 @@ def owner_state(root: str, config_dirs: Sequence[str], min_age_s: float,
     Alive: a Claude Code session marker (<config>/sessions/<pid>.json) names the
     session and its pid is running with the marker's procStart, or the session
     transcript (<config>/projects/<slug>/<session>.jsonl) changed within the
-    minimum age. Gone: the transcript exists and neither holds. Anything that
-    cannot be read, including a transcript found nowhere, is UNKNOWN."""
+    minimum age. Unknown: anything that cannot be read, a transcript found
+    nowhere, or a live process in the same project that was already running
+    when this session's directory was created: /clear gives a running process
+    a new sessionId and leaves no link to the old one, so that process may
+    still own this scratchpad. Gone: the transcript exists and none of that holds."""
     parts = Path(root).parts
     if len(parts) < 3 or parts[-1] != "scratchpad":
         return UNKNOWN
     slug, session = parts[-3], parts[-2]
     transcript_found = False
     sessions_seen = False
+    others = []  # (cwd or None, start epoch or None) of live processes on other sessions
     try:
         for cfg in config_dirs:
             sessions = os.path.join(cfg, "sessions")
@@ -346,13 +371,19 @@ def owner_state(root: str, config_dirs: Sequence[str], min_age_s: float,
                         continue
                     with open(os.path.join(sessions, name)) as fh:
                         data = json.load(fh)
-                    if not isinstance(data, dict) or data.get("sessionId") != session:
-                        continue
+                    if not isinstance(data, dict):
+                        return UNKNOWN
                     pid, proc_start = data.get("pid"), data.get("procStart")
                     if not isinstance(pid, int) or not isinstance(proc_start, str):
-                        return UNKNOWN
-                    if start_of(pid) == " ".join(proc_start.split()):
+                        if data.get("sessionId") == session:
+                            return UNKNOWN
+                        others.append((data.get("cwd"), None))
+                        continue
+                    if start_of(pid) != " ".join(proc_start.split()):
+                        continue
+                    if data.get("sessionId") == session:
                         return ALIVE
+                    others.append((data.get("cwd"), utc_epoch(proc_start)))
             try:
                 mtime = os.stat(os.path.join(cfg, "projects", slug, f"{session}.jsonl")).st_mtime
             except FileNotFoundError:
@@ -360,9 +391,16 @@ def owner_state(root: str, config_dirs: Sequence[str], min_age_s: float,
             transcript_found = True
             if now() - mtime < min_age_s:
                 return ALIVE
+        if not (transcript_found and sessions_seen):
+            return UNKNOWN
+        born = created_at(os.path.dirname(root))
+        for cwd, started in others:
+            same_project = not isinstance(cwd, str) or project_slug(cwd) == project_slug(slug)
+            if same_project and (started is None or started <= born + CLEAR_SLACK_S):
+                return UNKNOWN
     except (OSError, ValueError):  # any probe that fails, on any Python version, is unknown
         return UNKNOWN
-    return GONE if transcript_found and sessions_seen else UNKNOWN
+    return GONE
 
 
 def owning_root(cwd: str, roots: Sequence[str]) -> Optional[str]:
