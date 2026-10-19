@@ -2481,6 +2481,37 @@ class LocalClaimTest(Base):
                 life.stage_result("task-a", b"body\n", "turn-1")
         return life.claims.load("task-a")["phase"]
 
+    def test_a_writer_killed_between_the_temp_fsync_and_the_link_then_a_same_bytes_retry_stages(self):
+        """A real kill leaves the fsynced temp behind (no finally runs); the retry writes its own temp,
+        links the final and stages; the dead writer's temp is swept, never taken for the final."""
+        self.local_dir()
+        life = self.life()
+        self.confirmed(life)
+        d = self.work / "state" / "claims" / "task-a"
+        pid = os.fork()
+        if pid == 0:                                    # the writer, killed at the link
+            try:
+                self.lc.os.link = lambda *a, **k: os.kill(os.getpid(), signal.SIGKILL)
+                life.stage_result("task-a", b"body\n", "turn-1")
+            finally:
+                os._exit(3)
+        _, status = os.waitpid(pid, 0)
+        self.assertTrue(os.WIFSIGNALED(status) and os.WTERMSIG(status) == signal.SIGKILL, status)
+        left = [n for n in os.listdir(d) if n.endswith(".tmp")]
+        self.assertEqual(len(left), 1, "the killed writer's fsynced temp is left")
+        self.assertEqual((d / left[0]).read_bytes(), b"body\n")
+        self.assertFalse(any(n.startswith("blob.") for n in os.listdir(d)), "no final was linked")
+        rec = life.claims.load("task-a")
+        self.assertEqual((rec["phase"], rec["staged"]["sha256"]), ("TURN_CONFIRMED", self.lc._sha256(b"body\n")))
+        again = self.life(lineage=lambda p, start: False if p == pid else None)
+        self.assertEqual(again.stage_result("task-a", b"body\n", "turn-1"), "staged", "the same bytes finish")
+        self.assertEqual((d / rec["staged"]["blob"]).read_bytes(), b"body\n")
+        self.assertEqual(again.stage_result("task-a", b"other\n", "turn-1"), "parked", "different bytes never")
+        again._sweep_temps("task-a", time.time())
+        self.assertEqual([n for n in os.listdir(d) if n.endswith(".tmp")], [], "the dead writer's temp is swept")
+        self.assertEqual(again.publish_and_settle("task-a"), "settled")
+        self.assertEqual((self.results / "task-a.txt").read_bytes(), b"body\n")
+
     def test_a_kill_at_each_of_the_six_boundaries_is_recovered_twice(self):
         for boundary, expect in (("descriptor", b"interrupted\n"), ("temp", b"interrupted\n"), ("link", b"body\n"),
                                  ("dirsync", b"body\n"), ("verify", b"body\n"), ("phase", b"body\n")):
