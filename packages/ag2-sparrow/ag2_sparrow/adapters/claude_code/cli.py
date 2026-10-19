@@ -383,7 +383,7 @@ def install(args) -> int:
         session_id = kept or mint_session_id()
         return dict(values, SESSION_ID=session_id)
     rc = cm.install(LOCAL, values, root, revise=revise,
-                    precheck=lambda r: inbox.root_problem(r) or records.agent_problem(r, agent_id))
+                    precheck=lambda r: inbox.root_problem(r) or records.agent_problem(r, agent_id), holder=holder_words)
     if rc != 0 or mode == EXTERNAL:
         return rc
     problem = wire_bridge(dict(values, ROOT=root))
@@ -439,16 +439,20 @@ def auth_problem(cfg: dict, run_=subprocess.run) -> str:
     return ""
 
 
+def holder_words(root: str, _rec=None) -> str:
+    """Who holds the root, as verify and install both say it: hold and, once attached, its claude."""
+    rec, consumer = task_io.lock_holder(root), task_io.holder_consumer(root)
+    return f"hold pid {rec.get('owner_pid')}" + (f", its claude pid {consumer['pid']}" if consumer and consumer.get("live")
+                                                 else ", no live claude attached")
+
+
 def occupancy_line(root: str) -> str:
     """The shared tri-state beside the manager's state: held names the lock's holder (hold) and, once
     attached, the claude whose liveness fences the root; unobserved never reads free."""
     occ = task_io.occupancy(root)
     manager = cm.manager_detail(LOCAL)
     if occ == "held":
-        rec, consumer = task_io.lock_holder(root), task_io.holder_consumer(root)
-        who = f"hold pid {rec.get('owner_pid')}" + (f", its claude pid {consumer['pid']}" if consumer and consumer.get("live")
-                                                   else ", no live claude attached")
-        return f"held by {who} (manager {manager})"
+        return f"held by {holder_words(root)} (manager {manager})"
     if occ == "unobserved":
         return f"unobserved (the root's holder or consumer cannot be verified; manager {manager})"
     return cm.occupancy_line(LOCAL, root)

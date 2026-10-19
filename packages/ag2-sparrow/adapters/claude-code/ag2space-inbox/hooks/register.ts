@@ -78,6 +78,7 @@ type State = {
   armedResults: string
   stop: (() => void) | null
   sessionId: string
+  stoppedFor: string
   intake: 'open' | 'closed'
   intakeReason: string
 }
@@ -121,14 +122,22 @@ async function reopenIntake($: any, s: State): Promise<boolean> {
   return true
 }
 
+function sessionStopped(s: State): boolean {
+  return s.intake === 'closed' && s.intakeReason.startsWith('session id')
+}
+
 async function witness($: any, s: State, where: string): Promise<boolean> {
-  // The session-id witness: the live id against the one seen at session.start; a change stops intake.
+  // The session-id witness: the live id against the one seen at session.start; a change stops intake,
+  // recorded once per new id (retried until durable) so the launcher sees it without a turn.
   let sid = ''
   try { sid = String(await $.session.id()) } catch (err: any) { await $.ui.log(`${PLUGIN}: session id unreadable at ${where}: ${err?.message ?? err}`, {}); return false }
   if (!s.sessionId) s.sessionId = sid
   if (sid !== s.sessionId) {
     closeIntake($, s, `session id changed in the pane (${s.sessionId} -> ${sid}); use /compact or install --new-session`)
-    await cli($, s, ['progress', '--session-id', sid, '--intake', 'stopped', '--reason', 'session-id-changed'])
+    if (s.stoppedFor !== sid) {
+      const r = await cli($, s, ['progress', '--session-id', sid, '--intake', 'stopped', '--reason', 'session-id-changed'])
+      if (r.ok) s.stoppedFor = sid
+    }
     return false
   }
   return true
@@ -172,9 +181,12 @@ async function arm($: any, s: State, inbox: string, results: string): Promise<{ 
     if (busy) return
     busy = true
     try {
-      if (s.intake === 'closed' && !(await reopenIntake($, s))) return
-      if (s.pending) return
-      for (const o of s.offers.values()) if (o.phase === 'CALLING' || o.phase === 'TURN_CONFIRMED') return
+      // Every tick, not only at a turn: an idle /clear must stop intake without waiting for one.
+      await witness($, s, 'scan')
+      const stopped = sessionStopped(s)
+      if (s.intake === 'closed' && !stopped && !(await reopenIntake($, s))) return
+      if (!stopped && s.pending) return
+      if (!stopped) for (const o of s.offers.values()) if (o.phase === 'CALLING' || o.phase === 'TURN_CONFIRMED') return
       for (const entry of await $.fs.list(inbox)) {
         if (entry.kind !== 'file' || !TASK_RE.test(entry.name) || s.seen.has(entry.name)) continue
         const prev = s.stale.get(entry.name)
@@ -196,6 +208,15 @@ async function arm($: any, s: State, inbox: string, results: string): Promise<{ 
         if (verdict === 'invalid' || (strict && verdict !== 'verified')) {
           s.seen.add(entry.name)
           log(`${rid} envelope ${verdict}; not submitted`)
+          continue
+        }
+        if (stopped) {
+          // This session can never take it: the sender gets the interrupted answer, never silence.
+          const r = await cli($, s, ['interrupt', rid, '--detail', s.intakeReason])
+          if (r.hard) return
+          s.seen.add(entry.name)
+          s.answered.add(rid)
+          await $.ui.log(`${PLUGIN}: ${rid} answered as interrupted (intake stopped: ${r.ok ? 'settled' : r.data?.refused ?? ''})`, {})
           continue
         }
         // The claim: only a task the classifier reads ABSENT and the shared admission policy admits may be
@@ -248,7 +269,7 @@ async function arm($: any, s: State, inbox: string, results: string): Promise<{ 
 
 export const register: Register = (on) => {
   const s: State = { seen: new Set(), answered: new Set(), offers: new Map(), pending: null, stale: new Map(),
-    armedResults: '', stop: null, sessionId: '', intake: 'open', intakeReason: '' }
+    armedResults: '', stop: null, sessionId: '', stoppedFor: '', intake: 'open', intakeReason: '' }
 
   on('session.start', async ($, e, next) => {
     await $.tool.register({
@@ -332,7 +353,10 @@ export const register: Register = (on) => {
   })
 
   on('session.end', async ($, e, next) => {
-    if (e.reason === 'clear' || e.reason === 'resume') closeIntake($, s, `session id changed in the pane (/${e.reason}); use /compact or install --new-session`)
+    if (e.reason === 'clear' || e.reason === 'resume') {
+      closeIntake($, s, `session id changed in the pane (/${e.reason}); use /compact or install --new-session`)
+      await cli($, s, ['progress', '--intake', 'stopped', '--reason', `session-${e.reason}`])
+    }
     return next(e)
   })
 

@@ -666,7 +666,8 @@ class ConnectInstall(ConnectBase):
         self.assertNotIn(TOKEN, unit + cfg_path.read_text())
         self.assertEqual(runner.verbs("systemctl"), ["show", "show-environment", "daemon-reload", "enable", "restart"],
                          "absent and free: no stop, then register and start")
-        self.assertIn(f"{self.ACQUIRED}: {self.work} (launcher pid {runner.pid()})", out)
+        self.assertIn(f"{self.ACQUIRED}: {self.work} (hold pid {runner.pid()}, no live claude attached)", out,
+                      "named as verify names it: hold, then its claude once attached")
         self.assertIn("linger: enabled for owner", out)
         self.assertIsNone(self.session(), "install starts no session itself; the manager does")
 
@@ -684,7 +685,7 @@ class ConnectInstall(ConnectBase):
         self.assertIn("changed: ", out)
         self.assertEqual(cli.read_config(cli.config_path())["PERMISSION_MODE"], "default")
         self.assertNotEqual(runner.pid(), old, "a fresh holder, not the old session")
-        self.assertIn(f"launcher pid {runner.pid()}", out)
+        self.assertIn(f"hold pid {runner.pid()}", out)
 
     def test_the_session_id_is_kept_across_reinstalls_and_rotated_by_new_session_only_over_a_dead_generation(self):
         """--new-session is quiescent: the id rotates only once the old generation is proven gone."""
@@ -745,7 +746,7 @@ class ConnectInstall(ConnectBase):
                          "the single service target, the only form --wait applies to")
         self.assertEqual(runner.calls[0], ["launchctl", "print", SERVICE_TARGET])
         self.assertNotEqual(runner.pid(), first)
-        self.assertIn(f"launcher pid {runner.pid()}", out)
+        self.assertIn(f"hold pid {runner.pid()}", out)
 
     def test_an_unconfirmed_start_fails_closed_keeps_the_files_and_the_same_install_retries(self):
         silent = self.runner(root=False)                      # the manager accepts, no launcher takes the lock
@@ -1100,7 +1101,7 @@ class ConnectMod(unittest.TestCase):
         src = REGISTER.read_text()
         self.assertNotIn("$.fs.write", src)
         self.assertNotIn("os.replace", src)
-        for verb in ("'claim'", "'authorize'", "'confirm'", "'stage'", "'publish'", "'park'", "'progress'", "'check-inode'"):
+        for verb in ("'claim'", "'interrupt'", "'authorize'", "'confirm'", "'stage'", "'publish'", "'park'", "'progress'", "'check-inode'"):
             self.assertIn(verb, src, verb)
         self.assertIn("'inbox'", src)
         self.assertIn("$.session.id()", src, "the session-id witness")
@@ -2533,6 +2534,22 @@ class InboxCli(ConnectBase):
             rc, out = self.verb("claim", t)
             self.assertEqual((rc, "only ABSENT may be submitted" in out["refused"]), (1, True), "answered once")
         self.assertIn("malformed: no access_tier header", self.verb("claim", self.task("task-n2", None))[1]["refused"])
+
+    def test_interrupt_answers_a_task_the_stopped_session_cannot_take_once_and_the_refusal_for_a_non_owner(self):
+        t = self.task("task-late")
+        rc, out = self.verb("interrupt", t, "--detail", "session id changed")
+        self.assertEqual((rc, out["outcome"], out["interrupted"]), (0, "settled", True))
+        self.assertEqual((self.results / "task-late.txt").read_text(), inbox.INTERRUPTED_BODY)
+        self.assertNotIn(t, records.load_plugin(self.root).get("inflight") or {})
+        rc, out = self.verb("interrupt", t)
+        self.assertEqual((rc, "only ABSENT is answered" in out["refused"]), (1, True), "answered once")
+        self.assertEqual(self.verb("claim", t)[0], 1, "and never submitted afterwards")
+        rc, out = self.verb("interrupt", self.task("task-g", "guest"))
+        self.assertEqual((rc, out["interrupted"]), (0, False))
+        self.assertEqual((self.results / "task-g.txt").read_text(), task_io.NON_OWNER_REFUSED, "the policy still answers")
+        with mock.patch.object(inbox.lifecycle.Lifecycle, "complete_without_call", return_value="parked"):
+            rc, out = self.verb("interrupt", self.task("task-p"))
+        self.assertEqual((rc, "publication parked" in out["refused"]), (1, True))
 
     def test_with_allow_non_owner_every_non_owner_is_claimed_with_its_admission_and_a_tierless_task_still_refused(self):
         self.configure(ALLOW_NON_OWNER="1")

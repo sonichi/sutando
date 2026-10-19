@@ -27,15 +27,15 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
   const claims: Record<string, Claim> = {}
   const progress: any[] = []
   const dirs = new Set(['/in', '/out', '.'])
-  const sessionIds = opts.sessionIds ?? ['sid-1']
-  let sidCalls = 0
+  // The CLI's live session id: every read sees the current value, as $.session.id() does.
+  const live = { sid: (opts.sessionIds ?? ['sid-1'])[0] }
   let rejectLeft = opts.rejectSubmits ?? 0
   let progressFailLeft = opts.progressFails ?? 0
   let failVerb = ''
   let marks = 0
   let markerFailLeft = opts.markerFails ?? 0
   on('session.start', () => ({ cwd: '/w' }))
-  on('session.id', () => ({ value: sessionIds[Math.min(sidCalls++, sessionIds.length - 1)] }))
+  on('session.id', () => ({ value: live.sid }))
   on('session.cwd', () => ({ value: '/w/tasks' }))
   on('session.end', (_: any, e: any) => ({ sessionId: e.sessionId }))
   on('turn.start', (_: any, e: any) => ({ turnId: e.turnId }))
@@ -122,6 +122,13 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
       c.phase = 'SETTLED'; files[`/out/${task}.txt`] = c.body!
       return answer({ outcome: 'settled' })
     }
+    if (verb === 'interrupt') {
+      if (`/out/${task}.txt` in files && files[`/out/${task}.txt`].length) return out(1, { refused: `${task} is LIVE_READY` })
+      if (c) return out(1, { refused: `${task}: attempt ${c.attempt} is ${c.phase}` })
+      claims[task] = { attempt: 0, phase: 'SETTLED', body: '[AG2 Space] This attempt was interrupted before the session answered' }
+      files[`/out/${task}.txt`] = claims[task].body!
+      return answer({ task_id: task, outcome: 'settled', interrupted: true })
+    }
     if (verb === 'park') {
       if (!c || c.phase !== 'TURN_CONFIRMED' || c.turnId !== argv[4]) return out(1, { refused: 'not this turn' })
       c.phase = 'SETTLED'; c.body = `[AG2 Space] The session's turn ended without a reply (${argv[argv.indexOf('--detail') + 1]})`
@@ -134,7 +141,8 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
     if (rejectLeft-- > 0) throw new Error('session busy')
     submitted.push(e.text); return { text: e.text }
   })
-  return { files, submitted, runs, claims, progress, clock, hash, failProgress: (n: number) => { progressFailLeft = n },
+  return { files, submitted, runs, claims, progress, clock, hash, setSid: (sid: string) => { live.sid = sid },
+    failProgress: (n: number) => { progressFailLeft = n },
     failAt: (verb: string) => { failVerb = verb } }
 }
 
@@ -420,20 +428,64 @@ test('the inode check: the held inbox arms and submits', async ($, on) => {
 })
 
 test('the session-id witness: recorded at session.start; a changed id at turn.start stops intake', async ($, on) => {
-  const h = host(on, { sessionIds: ['sid-1', 'sid-1', 'sid-2'] })
+  const h = host(on)
   h.files['/in/task-w.txt'] = TASK('task-w')
   await arm($, h)
   expect(h.progress[0]).toEqual(['--session-id', 'sid-1', '--intake', 'open', '--bind-generation'])
   await h.clock.advance(1000)
-  await $.turn.start({ text: h.submitted[0], turnId: 't-w' })   // the second read: unchanged, confirmed
+  await $.turn.start({ text: h.submitted[0], turnId: 't-w' })   // unchanged: confirmed
   expect(h.claims['task-w'].phase).toBe('TURN_CONFIRMED')
   await $.tool.call({ tool: REPLY, task_id: 'task-w', text: 'ok' })
-  h.files['/in/task-w2.txt'] = TASK('task-w2')
-  await $.turn.start({ text: 'after a /clear', turnId: 't-c' })   // the third read: a new id
+  h.setSid('sid-2')
+  await $.turn.start({ text: 'after a /clear', turnId: 't-c' })   // a new id, seen at the turn
   expect(h.progress.at(-1)).toEqual(['--session-id', 'sid-2', '--intake', 'stopped', '--reason', 'session-id-changed'])
   await h.clock.advance(5000)
+  expect(h.progress.filter((p: string[]) => p.includes('stopped')).length).toBe(1)   // recorded once per new id
   expect(h.submitted.length).toBe(1)
-  expect(h.claims['task-w2']).toBe(undefined)
+})
+
+test('an idle /clear: the next scan tick sees the new id, stops intake and records it, with no turn', async ($, on) => {
+  const h = host(on)
+  await arm($, h)
+  await h.clock.advance(3000)
+  expect(h.progress.length).toBe(1)
+  h.setSid('sid-2')                                   // /clear in an idle pane: no turn starts
+  await h.clock.advance(1000)
+  expect(h.progress.at(-1)).toEqual(['--session-id', 'sid-2', '--intake', 'stopped', '--reason', 'session-id-changed'])
+  await h.clock.advance(5000)
+  expect(h.progress.length).toBe(2)
+})
+
+test('a task arriving while intake is stopped gets the interrupted answer, never a submission or silence', async ($, on) => {
+  const h = host(on)
+  await arm($, h)
+  h.setSid('sid-2')
+  await h.clock.advance(1000)
+  h.files['/in/task-late.txt'] = TASK('task-late')
+  h.files['/in/task-bad.txt'] = TASK('task-bad')
+  await h.clock.advance(1000)
+  expect(h.submitted.length).toBe(0)
+  expect(h.claims['task-late'].phase).toBe('SETTLED')
+  expect(h.files['/out/task-late.txt']).toContain('interrupted')
+  expect(verbs(h).filter((v: string) => v === 'authorize' || v === 'claim')).toEqual([])
+  expect(h.runs.find((a: string[]) => a[2] === 'interrupt' && a[3] === 'task-late')?.slice(4))
+    .toEqual(['--detail', 'session id changed in the pane (sid-1 -> sid-2); use /compact or install --new-session'])
+  await h.clock.advance(5000)
+  expect(verbs(h).filter((v: string) => v === 'interrupt').length).toBe(2)   // each answered once
+})
+
+test('a hard progress failure while answering a stopped intake: the answer stands and is never repeated', async ($, on) => {
+  const h = host(on)
+  await arm($, h)
+  h.setSid('sid-2')
+  await h.clock.advance(1000)
+  h.files['/in/task-x.txt'] = TASK('task-x')
+  h.failAt('interrupt')
+  await h.clock.advance(1000)
+  expect(h.claims['task-x'].phase).toBe('SETTLED')
+  await h.clock.advance(3000)
+  expect(h.submitted.length).toBe(0)
+  expect(h.files['/out/task-x.txt']).toContain('interrupted')
 })
 
 test('compaction leaves the id unchanged and intake open; session.end with clear or resume closes it', async ($, on) => {
@@ -448,9 +500,11 @@ test('compaction leaves the id unchanged and intake open; session.end with clear
   await h.clock.advance(1000)
   expect(h.submitted.length).toBe(2)
   await $.session.end({ reason: 'clear', sessionId: 'sid-1', resume: { id: 'sid-1' } } as any)
+  expect(h.progress.at(-1)).toEqual(['--intake', 'stopped', '--reason', 'session-clear'])
   h.files['/in/task-m3.txt'] = TASK('task-m3')
   await h.clock.advance(5000)
   expect(h.submitted.length).toBe(2)
+  expect(h.files['/out/task-m3.txt']).toContain('interrupted')
 })
 
 test('a progress write that fails at session.start closes intake; a later durable write reopens it', async ($, on) => {
@@ -468,6 +522,7 @@ test('a progress write that fails at session.start closes intake; a later durabl
 test('a progress write that fails at claim, authorize, confirm, stage or publish closes intake until a durable write', async ($, on) => {
   const h = host(on)
   await arm($, h)
+  await h.clock.advance(1000)                        // the arming scan settles first
   h.files['/in/task-g.txt'] = TASK('task-g')
   h.failProgress(1)                                 // the claim's mirror write fails: the claim stands, intake closes
   await h.clock.advance(1000)

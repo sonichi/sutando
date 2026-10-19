@@ -44,9 +44,14 @@ resubmit; the `id:` header must equal the file stem.
 Intake stops, loudly, when the CLI answers a hard failure (exit 3: the
 progress record could not be written durably at the temp, fsync, replace or
 directory-fsync step) until a later write is durable; when the session id
-changes (the witness below); and the watch refuses to arm when its cwd's
+changes (read on every 1 s scan tick as well as at `session.start` and
+`turn.start`, so an idle `/clear` is seen within a tick, written to the record
+once and the launcher raises its card with no turn); and the watch refuses to arm when its cwd's
 inode is not `AG2_INBOX_INODE`, the `tasks` directory `hold` opened from the
-held root. Task I/O is relative to that cwd (`AG2_INBOX_DIR=.`,
+held root. While intake is stopped by a session-id change, a task that arrives
+is never left in silence: `inbox interrupt` claims it and answers it through
+the lifecycle with the interrupted answer (or the owner-only refusal for a
+sender the policy does not admit), once, without a call. Task I/O is relative to that cwd (`AG2_INBOX_DIR=.`,
 `AG2_RESULTS_DIR=../results`).
 
 The adapter lives beside the Python package on purpose, not inside it: it is a
@@ -214,7 +219,10 @@ and writes no bridge. Every root records its agent in the supervisor record on
 the first session; a later install or launch for another agent refuses, naming
 both. `verify` fails its `bridge` row unless a fresh, connected gateway status
 in the bridge's state dir reports exactly `<root>/tasks`, `<root>/results` and
-the recorded agent, and names the fix.
+the recorded agent, and names the fix. The bridge's `AGENT_CONNECT_STATE_DIR`
+must be the state dir install recorded (the parent of the HITL store in the
+config): `verify`'s bridge row reads the bridge's status there, and the bridge
+projects this adapter's cards from the store beside it.
 
 **Process tree.** The service manager (`systemd --user`, or a launchd user
 agent) runs `run`, the launcher; `run` refuses unless
@@ -393,8 +401,8 @@ mtime delta.
 
 - The Mods API moves between releases (2.1.287+). `install`, `run` and
   `verify` refuse an older CLI. Whether `$.session.id()` changes on `/clear` is
-  measured in the §15 witness on the real CLI; until then `session.end` with
-  reason `clear` or `resume` also closes intake.
+  witnessed on the real CLI (an idle `/clear` changes it); `session.end` with
+  reason `clear` or `resume` also closes intake and records it.
 - `/clear` and an in-pane `/resume` are disallowed in a managed session: the
   Mod stops intake on a session-id change and the card names it; use
   `/compact`, or `install --new-session`. There is no authenticated id

@@ -159,6 +159,22 @@ def claim(root, task_id) -> dict:
                    {"attempt": attempt})
 
 
+def interrupt(root, task_id, detail) -> dict:
+    """A task this session can no longer take (intake stopped for good): claimed and answered as
+    interrupted without a call, or the owner-only refusal for one the policy does not admit."""
+    lc = _lifecycle(root)
+    with records.flocked(records.claims_lock_path(root)):
+        verdict, state = lc.decide(task_id)
+        if verdict != "call":
+            raise Refused("%s is %s; only ABSENT is answered" % (task_id, state))
+        kind, _headers, why = admit(root, task_id, allow_non_owner())
+        body, reason = (INTERRUPTED_BODY, "intake stopped: %s" % detail) if kind else (task_io.NON_OWNER_REFUSED, why)
+        outcome = lc.complete_without_call(task_id, body, reason)
+    if outcome != "settled":
+        raise Refused("%s: publication %s" % (task_id, outcome))
+    return _mirror(root, task_id, None, {"task_id": task_id, "outcome": outcome, "interrupted": bool(kind)})
+
+
 def authorize(root, task_id, attempt, hash_) -> dict:
     lc = _lifecycle(root)
     with records.flocked(records.claims_lock_path(root)):
@@ -237,6 +253,8 @@ def main(args) -> int:
         verb = args.verb
         if verb == "claim":
             out = claim(root, args.task_id)
+        elif verb == "interrupt":
+            out = interrupt(root, args.task_id, args.detail)
         elif verb == "authorize":
             out = authorize(root, args.task_id, args.attempt, args.text_hash)
         elif verb == "confirm":
@@ -266,11 +284,12 @@ def main(args) -> int:
 
 
 def add_parser(sub) -> None:
-    p = sub.add_parser("inbox", help="the Mod's lifecycle verbs (claim, authorize, confirm, stage, publish, park, "
+    p = sub.add_parser("inbox", help="the Mod's lifecycle verbs (claim, interrupt, authorize, confirm, stage, publish, park, "
                        "progress, check-inode); never by hand")
     p.add_argument("--root", help="the work root (default: AG2_SPARROW_ROOT, else the cwd's parent)")
     v = p.add_subparsers(dest="verb", required=True)
     c = v.add_parser("claim"); c.add_argument("task_id")
+    n = v.add_parser("interrupt"); n.add_argument("task_id"); n.add_argument("--detail", default="")
     a = v.add_parser("authorize"); a.add_argument("task_id"); a.add_argument("attempt", type=int)
     a.add_argument("--text-hash", required=True)
     f = v.add_parser("confirm"); f.add_argument("task_id"); f.add_argument("turn_id"); f.add_argument("nonce")

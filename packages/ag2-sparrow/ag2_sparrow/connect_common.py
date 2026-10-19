@@ -649,13 +649,14 @@ def _fresh_holder(shape: Shape, root: str, before: dict) -> "dict | None":
 
 # ── install ──────────────────────────────────────────────────────────────────
 
-def install(shape: Shape, values: dict, root: str, revise=None, precheck=None) -> int:
+def install(shape: Shape, values: dict, root: str, revise=None, precheck=None, holder=None) -> int:
     """`revise(old_config, values) -> values` runs once the job is stopped and the root proven free,
     so a value that may only change over a quiescent root (a session id) is decided there.
-    `precheck(root) -> problem` is the launcher's own refusal of the root, asked before anything moves."""
+    `precheck(root) -> problem` is the launcher's own refusal of the root, asked before anything moves.
+    `holder(root, record)` names who holds the root in the closing line, in the shape's own words."""
     try:
         with operation_lock(shape):
-            return _install_locked(shape, values, root, revise, precheck)
+            return _install_locked(shape, values, root, revise, precheck, holder)
     except Busy as e:
         return _refuse(str(e))
 
@@ -665,7 +666,7 @@ def launcher_log(shape: Shape) -> str:
     return str(log_path(shape)) if is_macos() else f"journalctl --user -u {shape.service_name}"
 
 
-def _install_locked(shape: Shape, values: dict, root: str, revise=None, precheck=None) -> int:
+def _install_locked(shape: Shape, values: dict, root: str, revise=None, precheck=None, holder=None) -> int:
     """A quiescent replacement: both files owned, the same root as before, no orphan on it, the job
     stopped and absent, the root free; only then the files, the start, and the fresh holder."""
     conf, sup, marker = config_path(shape), supervisor_path(shape), supervisor_marker(shape)
@@ -719,7 +720,8 @@ def _install_locked(shape: Shape, values: dict, root: str, revise=None, precheck
         return _refuse(f"the managed launcher did not acquire {root} within {CONFIRM_TIMEOUT_S:.0f} s ({holder_line(root)}); "
                        f"its refusal is in {launcher_log(shape)}; run {shape.command} uninstall, then {shape.command} install")
     linger(shape)
-    print(f"the managed launcher acquired the expected root: {root} (launcher pid {rec['pid']})")
+    print(f"the managed launcher acquired the expected root: {root} "
+          f"({holder(root, rec) if holder is not None else 'launcher pid %s' % rec['pid']})")
     return 0
 
 
