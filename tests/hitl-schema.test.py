@@ -359,7 +359,7 @@ class DefaultPathsTest(unittest.TestCase):
         from hitl import manager, replies
         ws = Path(tempfile.mkdtemp(prefix="hitl-ws-"))
         fake = types.ModuleType("workspace_default")
-        fake.resolve_workspace = lambda: ws
+        fake.resolve_workspace = lambda *a, **kw: ws
         with mock.patch.dict(sys.modules, {"workspace_default": fake}):
             self.assertEqual(manager.default_store(), ws / "state" / "hitl" / "requirements")
             self.assertEqual(replies.actions_dir(), ws / "state" / "hitl" / "actions")
