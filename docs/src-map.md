@@ -219,6 +219,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`sutando_config.py`** — Canonical loader for `sutando.config.json` / `sutando.config.local.json`.
 - **`sutando_config.ts`** — Canonical loader for `sutando.config.json` / `sutando.config.local.json`.
 - **`sutando_platform.py`** — Cross-platform OS abstraction for Sutando Python services.
+- **`system_load.py`** — Sustained system load: one reading per health-check pass, a warning only when the last K passes all ran above a ratio of the core count, the top CPU users, and their cause.
 - **`task-bridge.ts`** — Voice → Claude Code session bridge.
 - **`task-delegation.ts`** — TaskDelegationService — step 4 of the interaction-planes refactor (issue #1947, built under the architecture names per design R3).
 - **`task-emit.sh`** — TASK_FILE emitters — sourceable so a test can invoke them in isolation.
