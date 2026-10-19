@@ -125,10 +125,13 @@ def admit(root, task_id, allow: bool) -> "tuple[str | None, dict, str]":
     return kind, headers, why
 
 
-def _mirror(root, task_id, phase, out: dict, extra=None) -> dict:
+def _mirror(root, task_id, phase, out: dict, extra=None, unstuck=False) -> dict:
     """The plugin record mirrors each claim's phase after the lifecycle step; a failed write marks the
-    answer `hard` (exit 3: the step stands, intake closes) instead of hiding it."""
+    answer `hard` (exit 3: the step stands, intake closes) instead of hiding it. `unstuck` also drops
+    the task's stuck mark, in the same write."""
     def mutate(rec):
+        if unstuck and isinstance(rec.get("stuck"), dict) and task_id in rec["stuck"]:
+            rec["stuck"] = {k: v for k, v in rec["stuck"].items() if k != task_id}
         inflight = dict(rec.get("inflight") or {})
         if phase is None:
             inflight.pop(task_id, None)
@@ -177,6 +180,18 @@ def resolved(lc, task_id) -> "tuple[bool, str]":
         return False, "%s: %s" % (type(e).__name__, e)
 
 
+def unresolved_stuck(root, marks) -> dict:
+    """The stuck marks whose task is still unresolved: a mark never outlives its answer, whoever
+    published it and whether or not the Mod ever sees the task file again."""
+    if not isinstance(marks, dict) or not marks:
+        return {}
+    try:
+        lc = _lifecycle(root)
+    except Exception:
+        return dict(marks)
+    return {k: v for k, v in marks.items() if not resolved(lc, k)[0]}
+
+
 def interrupt(root, task_id, detail) -> dict:
     """A task this session can no longer take (intake stopped for good): answered once without a call,
     with the interrupted answer or, for a sender the policy does not admit, the owner-only refusal.
@@ -207,7 +222,7 @@ def interrupt(root, task_id, detail) -> dict:
     if not done:
         raise Parked("%s: not answered yet (%s); retried" % (task_id, why or "disposition %s" % (state or "unknown")))
     return _mirror(root, task_id, None, {"task_id": task_id, "resolved": True, "answered": answered,
-                                         "interrupted": bool(answered and kind), "state": state})
+                                         "interrupted": bool(answered and kind), "state": state}, unstuck=True)
 
 
 def authorize(root, task_id, attempt, hash_) -> dict:
@@ -266,13 +281,13 @@ def progress(root, session_id=None, nonce=None, intake=None, reason=None, genera
                 rec[key] = value
         if generation is not None:
             rec["generation"] = generation
-        marks = dict(rec.get("stuck") or {})
+        marks = dict(rec["stuck"]) if isinstance(rec.get("stuck"), dict) else {}
         if stuck:
             marks[stuck] = dict(marks.get(stuck) or {"since": time.time()}, detail=stuck_detail)
         if unstuck:
             marks.pop(unstuck, None)
-        if stuck or unstuck:
-            rec["stuck"] = marks
+        if stuck or unstuck or marks:
+            rec["stuck"] = unresolved_stuck(root, marks)
         return rec
     return records.write_progress(root, mutate)
 

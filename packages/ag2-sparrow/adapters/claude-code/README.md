@@ -60,7 +60,11 @@ that did not run keeps it; the next call publishes a staged answer), backing off
 up to 60, with a log line on the first failure, each new delay and the
 success. One still failing after 300 s is marked `stuck` in the plugin record:
 `verify` fails its `interrupts` row naming it and the launcher raises the
-needs-attention card, both cleared once the answer lands. Task I/O is relative to that cwd (`AG2_INBOX_DIR=.`,
+needs-attention card. The mark never outlives the answer: the CLI drops it in
+the write that resolves the task, the Mod clears it on every retirement (a
+no-op without one, never from memory), and the record's writer, `verify` and
+the card all ignore a mark whose task is already resolved, however it was
+published. Task I/O is relative to that cwd (`AG2_INBOX_DIR=.`,
 `AG2_RESULTS_DIR=../results`).
 
 The adapter lives beside the Python package on purpose, not inside it: it is a

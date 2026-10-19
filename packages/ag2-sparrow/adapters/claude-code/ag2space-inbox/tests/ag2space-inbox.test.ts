@@ -21,7 +21,7 @@ type Claim = { attempt: number; phase: string; token?: string; hash?: string; tu
 function host(on: any, opts: { verdict?: string; env?: Record<string, string>; rejectSubmits?: number; verifierFails?: boolean; markerFails?: number;
                                progressFails?: number; sessionIds?: string[]; cwdInode?: string; allowNonOwner?: boolean;
                                claimAs?: Record<string, unknown>; interruptParks?: number; interruptThrows?: number;
-                               interruptSoft?: Record<string, string | number> } = {}) {
+                               interruptSoft?: Record<string, string | number>; stuckAtStart?: Record<string, unknown> } = {}) {
   const files: Record<string, string> = {}
   const submitted: string[] = []
   const runs: string[][] = []
@@ -38,6 +38,8 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
   let parksLeft = opts.interruptParks ?? 0
   let throwsLeft = opts.interruptThrows ?? 0
   const softLeft: Record<string, string | number> = { ...(opts.interruptSoft ?? {}) }
+  // The plugin record's stuck marks: durable across Mod starts, returned by every progress reply.
+  const stuck: Record<string, unknown> = { ...(opts.stuckAtStart ?? {}) }
   let sidReads = 0
   const interruptAt: number[] = []
   const logs: string[] = []
@@ -84,7 +86,11 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
     const task = argv[3]
     if (verb === 'progress') {
       if (progressFailLeft-- > 0) return out(3, { error: 'progress write failed: disk', hard: true })
-      progress.push(argv.slice(3)); return out(0, { ok: true })
+      progress.push(argv.slice(3))
+      const add = argv.indexOf('--stuck'), del = argv.indexOf('--unstuck')
+      if (add > 0) stuck[argv[add + 1]] = stuck[argv[add + 1]] ?? { since: 1 }
+      if (del > 0) delete stuck[argv[del + 1]]
+      return out(0, { ok: true, stuck: { ...stuck } })
     }
     if (verb === 'check-inode') return argv[argv.indexOf('--expect') + 1] === (opts.cwdInode ?? '1:1') ? out(0, { inode: '1:1' }) : out(1, { refused: 'inode mismatch' })
     // The lifecycle step stands; the mirror write may fail: exit 3 with the step's data and `hard`.
@@ -134,7 +140,10 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
     if (verb === 'interrupt') {
       // As the CLI: the reply is the disposition afterwards; a staged interrupt is published by the next call.
       const done = { task_id: task, resolved: true, answered: false, interrupted: false }
-      if ((`/out/${task}.txt` in files && files[`/out/${task}.txt`].length) || c?.phase === 'SETTLED') return out(0, done)
+      if ((`/out/${task}.txt` in files && files[`/out/${task}.txt`].length) || c?.phase === 'SETTLED') {
+        delete stuck[task]
+        return out(0, done)
+      }
       const soft = softLeft[task]
       delete softLeft[task]
       if (typeof soft === 'number') return { value: { exitCode: soft, stdout: 'not json', stderr: 'boom' } }
@@ -143,6 +152,7 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
       if (parksLeft-- > 0) return out(1, { refused: `${task}: not answered yet (disposition ABSENT); retried`, retry: true })
       claims[task].phase = 'SETTLED'
       files[`/out/${task}.txt`] = claims[task].body!
+      delete stuck[task]                                // the CLI clears the mark in the resolving write
       return answer({ ...done, answered: true, interrupted: true })
     }
     if (verb === 'park') {
@@ -157,7 +167,7 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
     if (rejectLeft-- > 0) throw new Error('session busy')
     submitted.push(e.text); return { text: e.text }
   })
-  return { files, submitted, runs, claims, progress, clock, hash, interruptAt, logs, setSid: (sid: string) => { live.sid = sid },
+  return { files, submitted, runs, claims, progress, clock, hash, interruptAt, logs, stuck, setSid: (sid: string) => { live.sid = sid },
     failProgress: (n: number) => { progressFailLeft = n },
     failAt: (verb: string) => { failVerb = verb } }
 }
@@ -567,8 +577,66 @@ test('a failing interrupt backs off 1, 2, 4 ... ticks capped at 60, logs per sta
   expect(h.logs.filter((l: string) => l.includes('task-stuck interrupted answer not published')).length).toBe(7)
   expect(h.progress.find((p: string[]) => p[0] === '--stuck')).toEqual(['--stuck', 'task-stuck', '--stuck-detail', 'task-stuck: not answered yet (disposition ABSENT); retried'])
   expect(h.files['/out/task-stuck.txt']).toContain('interrupted')   // the 12th attempt, at tick 363, publishes
-  expect(h.progress.at(-1)).toEqual(['--unstuck', 'task-stuck'])
+  expect(h.stuck).toEqual({})                         // cleared by the CLI's resolving write, not by Mod memory
   expect(h.logs.filter((l: string) => l.includes('task-stuck answered as interrupted')).length).toBe(1)
+})
+
+test('a result that lands during backoff retires the task and clears its durable stuck mark', async ($, on) => {
+  const h = host(on, { interruptParks: 1000 })
+  await arm($, h)
+  h.setSid('sid-2')
+  await h.clock.advance(1000)
+  h.files['/in/task-late2.txt'] = TASK('task-late2')
+  for (let i = 0; i < 320; i++) await h.clock.advance(1000)
+  expect(Object.keys(h.stuck)).toEqual(['task-late2'])
+  h.files['/out/task-late2.txt'] = 'answered elsewhere\n'       // the answer arrives while the task backs off
+  for (let i = 0; i < 120; i++) await h.clock.advance(1000)
+  expect(h.progress.at(-1)).toEqual(['--unstuck', 'task-late2'])
+  expect(h.stuck).toEqual({})
+  const calls = h.runs.length
+  await h.clock.advance(5000)
+  expect(h.runs.filter((a: string[]) => a[2] === 'interrupt').length).toBe(h.runs.slice(0, calls).filter((a: string[]) => a[2] === 'interrupt').length)
+})
+
+test('after a restart a pre-restart mark is cleared by the next retirement, with no remembered state', async ($, on) => {
+  const h = host(on, { stuckAtStart: { 'task-old': { since: 1 }, 'task-old2': { since: 1 } } })
+  h.files['/in/task-old.txt'] = TASK('task-old')
+  h.files['/out/task-old.txt'] = 'answered before the restart\n'
+  await arm($, h)                                     // a fresh Mod: nothing in memory about either mark
+  await h.clock.advance(1000)
+  expect(h.progress).toContainEqual(['--unstuck', 'task-old'])
+  expect(Object.keys(h.stuck)).toEqual(['task-old2'])
+  h.setSid('sid-2')
+  await h.clock.advance(1000)
+  h.files['/in/task-old2.txt'] = TASK('task-old2')
+  await h.clock.advance(2000)                          // its interrupt resolves: the CLI and the Mod both clear it
+  expect(h.progress).toContainEqual(['--unstuck', 'task-old2'])
+  expect(h.stuck).toEqual({})
+})
+
+test('a result published out of band retires the task on the next scan and clears its mark', async ($, on) => {
+  const h = host(on, { stuckAtStart: { 'task-oob': { since: 1 } } })
+  await arm($, h)
+  await h.clock.advance(1000)
+  h.files['/out/task-oob.txt'] = 'published by the lifecycle, not by this loop\n'
+  h.files['/in/task-oob.txt'] = TASK('task-oob')
+  await h.clock.advance(1000)
+  expect(h.stuck).toEqual({})
+  expect(h.submitted.length).toBe(0)
+  expect(verbs(h).filter((v: string) => v === 'claim' || v === 'interrupt')).toEqual([])
+})
+
+test('a mark that cannot be cleared keeps the task until the write lands', async ($, on) => {
+  const h = host(on, { stuckAtStart: { 'task-keep': { since: 1 } } })
+  await arm($, h)
+  await h.clock.advance(1000)
+  h.files['/out/task-keep.txt'] = 'done\n'
+  h.files['/in/task-keep.txt'] = TASK('task-keep')
+  h.failProgress(1)
+  await h.clock.advance(1000)
+  expect(Object.keys(h.stuck)).toEqual(['task-keep'])
+  await h.clock.advance(2000)
+  expect(h.stuck).toEqual({})
 })
 
 test('a hard progress failure while answering a stopped intake: the answer stands and is never repeated', async ($, on) => {

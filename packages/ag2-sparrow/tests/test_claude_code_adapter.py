@@ -2606,6 +2606,39 @@ class InboxCli(ConnectBase):
         self.assertEqual(inbox.resolved(broken, "task-x"), (False, "ClaimUnreadable: torn"),
                          "a disposition that cannot be read is unresolved")
 
+    def test_a_resolving_interrupt_clears_the_durable_stuck_mark_whatever_the_mod_remembers(self):
+        t = self.task("task-marked")
+        self.assertEqual(self.verb("progress", "--stuck", t, "--stuck-detail", "parked before a restart")[0], 0)
+        with mock.patch.object(cm, "_run", side_effect=self.runner(root=False)):
+            self.assertIn("FAIL interrupts", self.main("verify")[1])
+            rc, out = self.verb("interrupt", t)
+            self.assertEqual((rc, out["resolved"], out["answered"]), (0, True, True))
+            self.assertEqual(records.load_plugin(self.root)["stuck"], {}, "cleared in the resolving write")
+            self.assertNotIn("interrupts", self.main("verify")[1])
+            self.assertEqual(self.verb("progress", "--stuck", t)[0], 0)      # a mark left on an already-answered task
+            rc, out = self.verb("interrupt", t)
+            self.assertEqual((rc, out["resolved"], out["answered"]), (0, True, False))
+            self.assertEqual(records.load_plugin(self.root)["stuck"], {}, "a resolved reply always clears it")
+            self.assertNotIn("interrupts", self.main("verify")[1])
+        self.assertEqual(self.verb("progress", "--intake", "open")[1]["stuck"], {}, "every progress reply carries the marks")
+
+    def test_a_mark_never_outlives_its_answer_even_when_the_task_file_is_gone(self):
+        """Published out of band (not through interrupt or the Mod), the task file archived: the Mod never
+        retires it, yet verify, the card and the next record write all drop the mark."""
+        self.assertEqual(self.verb("progress", "--stuck", "task-gone", "--stuck-detail", "parked")[0], 0)
+        self.assertIn("task-gone", records.load_plugin(self.root)["stuck"])
+        (self.results / "task-gone.txt").write_text("published by another route\n")
+        with mock.patch.object(cm, "_run", side_effect=self.runner(root=False)):
+            self.assertNotIn("interrupts", self.main("verify")[1])
+        lc = launcher.Launcher(dict(cli.read_config(cli.config_path()), ROOT=self.root), cli.config_dir())
+        with mock.patch.object(lc.tm, "capture", return_value="pane"):
+            self.assertIsNone(lc.observe({"generation": {"pane_id": "%0"}, "stall": None}).get("stall"))
+        self.assertEqual(self.verb("progress", "--intake", "open")[1]["stuck"], {}, "pruned by the next write")
+        self.assertEqual(inbox.unresolved_stuck(self.root, ["not", "a", "map"]), {})
+        with mock.patch.object(inbox, "_lifecycle", side_effect=RuntimeError("no root")):
+            self.assertEqual(inbox.unresolved_stuck(self.root, {"t": {"since": 1}}), {"t": {"since": 1}},
+                             "an unreadable lifecycle keeps the marks rather than hiding them")
+
     def test_a_stuck_interrupt_is_named_by_verify_and_raises_the_card_and_clears(self):
         self.assertEqual(self.verb("progress", "--stuck", "task-s", "--stuck-detail", "parked")[0], 0)
         self.assertEqual(self.verb("progress", "--stuck", "task-s", "--stuck-detail", "still parked")[0], 0)

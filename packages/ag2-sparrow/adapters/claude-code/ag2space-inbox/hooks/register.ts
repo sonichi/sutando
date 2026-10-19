@@ -206,7 +206,15 @@ async function arm($: any, s: State, inbox: string, results: string): Promise<{ 
         const stem = entry.name.slice(0, -4)
         const rid = header(text, 'id') || stem
         if (rid !== stem) { log(`${entry.name}: header id ${rid} does not match the file stem; not submitted`); s.seen.add(entry.name); continue }
-        if (s.answered.has(rid) || s.offers.has(rid) || (await onDisk(rid))) { s.seen.add(entry.name); continue }
+        if (s.offers.has(rid)) { s.seen.add(entry.name); continue }
+        if (s.answered.has(rid) || (await onDisk(rid))) {
+          // Every retirement clears the record's stuck mark (a no-op without one), whoever published the
+          // result; kept until that write lands, so the record never outlives the answer.
+          if (!(await cli($, s, ['progress', '--unstuck', rid])).ok) continue
+          s.retry.delete(entry.name)
+          s.seen.add(entry.name)
+          continue
+        }
         let out = ''
         try {
           const v = await $.process.run(['python3', '-c', VERIFY_PY], { stdin: text, env: { AG2_HMAC_KEY_FILE: keyFile } })
@@ -238,8 +246,9 @@ async function arm($: any, s: State, inbox: string, results: string): Promise<{ 
             s.retry.set(entry.name, next)
             continue
           }
-          if (backoff?.stuck && !(await cli($, s, ['progress', '--unstuck', rid])).ok) {
-            s.retry.set(entry.name, { ...backoff, next: s.tick + backoff.delay })   // the mark must clear: kept
+          // The CLI cleared the mark in its resolving write; the Mod clears it too, so both converge.
+          if (!(await cli($, s, ['progress', '--unstuck', rid])).ok) {
+            s.retry.set(entry.name, { ...(backoff ?? { fails: 0, delay: 1, first: s.tick, stuck: false }), next: s.tick + (backoff?.delay ?? 1) })
             continue
           }
           s.retry.delete(entry.name)

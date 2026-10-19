@@ -317,6 +317,7 @@ class Launcher:
             self.log("the session waits at Claude Code's %s dialog; answer it in the pane (%s)" % (waiting, self.attach_command())
                      if waiting else "the session is past its startup dialog")
         plugin = records.load_plugin(self.root)
+        plugin = dict(plugin, stuck=inbox.unresolved_stuck(self.root, plugin.get("stuck")))
         self.observation = detector.derive(self.observation, text, plugin, self.clock())
         stall = self.observation["stall"]
         if (rec.get("stall") or None) != stall:

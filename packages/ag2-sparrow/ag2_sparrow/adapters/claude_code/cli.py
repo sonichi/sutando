@@ -546,7 +546,8 @@ def verify(_args) -> int:
     print(f"INFO session id: {cfg['SESSION_ID']}")
     print(f"INFO folder trust: {trust_line(cfg, root)}")
     try:
-        stuck = detector.stuck_answers(records.load_plugin(root))
+        plugin = records.load_plugin(root)
+        stuck = detector.stuck_answers(dict(plugin, stuck=inbox.unresolved_stuck(root, plugin.get("stuck"))))
     except records.RecordError:
         stuck = {}
     if stuck:
