@@ -14,6 +14,11 @@ import sys
 import unittest
 from pathlib import Path
 
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 _ROOT = Path(__file__).resolve().parent.parent
 _SKILL = _ROOT / "skills" / "agent-room-ops"
 if str(_SKILL) not in sys.path:

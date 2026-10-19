@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """The human report must name the workspace it measured, asserted on rendered
 output: a source substring stays green when the line is present but unreachable."""
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import contextlib
 import importlib.util
 import io

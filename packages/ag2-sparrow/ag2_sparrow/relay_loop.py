@@ -7,6 +7,7 @@ cap kept on disk, and the task/result loop (priority order, done ledger, retry t
 subclasses `RelayLoop`, implements `step()`, and keeps only its own transport. Stdlib only.
 """
 import argparse
+import math
 import json
 import os
 import re
@@ -16,16 +17,16 @@ import uuid
 from pathlib import Path
 
 from . import local_task_protocol, result_disposal, task_priority
-from .task_io import (load_done, non_owner_note, parse_task, record_done, stop_requested, stoppable_sleep,
-                      write_atomic)
+from .task_io import (NON_OWNER_REFUSED, admission, is_collaborator, load_done, non_owner_note,  # noqa: F401
+                      parse_task, record_done, stop_requested, stoppable_sleep, write_atomic)
 
 TEXT_MAX = 65536
 TRUNCATED = "\n[truncated]"
 HOUR = 3600.0
 NO_ROOM = "This message has no room to reply in, so it was not sent to the cloud agent.\n"
-# The cloud agent acts with the owner's AG2 Space connector, so non-owner tiers are refused
-# unless the adapter opts in; the sender sees only this plain line.
-NON_OWNER_REFUSED = "This agent only answers its owner here.\n"
+# A non-owner tier never learns a status or error detail: that is the owner's connector state.
+NON_OWNER_FAILED = "This message could not be sent to the cloud agent right now.\n"
+COLLAB_LIMITER_FILE = "collaborator-turns.json"
 
 
 def log(*a):
@@ -42,7 +43,7 @@ def build_payload(task_id, headers, message, operator_lines=(), note=None, text_
     non-owner tier, the note; then the untrusted body between nonce markers; then the bridge-written
     lines, outside them. Only the body is cut to fit `text_max`, so the markers and lines survive."""
     tier = headers.get("access_tier") or "guest"
-    collaborator = tier == "team" and headers.get("collaborator") == "true"
+    collaborator = is_collaborator(headers)
     room = _field(headers.get("channel_id")) or _field(headers.get("source_room_id"))
     thread = _field(headers.get("thread_root")) or "none"
     fields = "room=%s thread=%s tier=%s collaborator=%s task_id=%s" % (
@@ -67,6 +68,30 @@ def count_arg(text):
     return n
 
 
+def positive_arg(text):
+    """argparse type for a cap: an integer of one or more."""
+    n = int(text)
+    if n < 1:
+        raise argparse.ArgumentTypeError("must be 1 or more")
+    return n
+
+
+def positive_float(text):
+    """argparse type for a timeout: finite seconds, more than 0."""
+    x = float(text)
+    if not (math.isfinite(x) and x > 0):
+        raise argparse.ArgumentTypeError("must be a finite number more than 0")
+    return x
+
+
+def nonnegative_float(text):
+    """argparse type for an age bound: finite seconds, 0 or more (0 means off)."""
+    x = float(text)
+    if not (math.isfinite(x) and x >= 0):
+        raise argparse.ArgumentTypeError("must be a finite number, 0 or more")
+    return x
+
+
 class Outcome:
     """kind: ok | rate_limited | rejected | retry (provably not accepted) | ambiguous (may have been)."""
 
@@ -81,10 +106,8 @@ def result_body(outcome, mode, owner=True, label="claude routine session"):
         if mode == "echo" and owner:
             return "Sent to the cloud agent: %s\n" % url
         return "[no-send]\n# %s: %s\n" % (label, url)
-    # A non-owner tier never learns a status or error detail: that is the owner's
-    # connector state, and the sender is not the owner.
     if not owner:
-        return "This message could not be sent to the cloud agent right now.\n"
+        return NON_OWNER_FAILED
     if outcome.kind == "rejected":
         return "The cloud agent could not take this message (HTTP %s, %s).\n" % (outcome.status, outcome.detail)
     if outcome.kind == "rate_limited":
@@ -177,8 +200,12 @@ class RelayLoop:
     def init_loop(self, args, limiter_file, clock=time.time, sleep=stoppable_sleep):
         self.args, self.clock, self.sleep = args, clock, sleep
         self.limiter = RateLimiter(os.path.join(args.state, limiter_file), args.max_per_hour, clock)
+        # Collaborator turns never touch the provider, so they have their own cap, not the provider's.
+        self.collab_limiter = RateLimiter(os.path.join(args.state, COLLAB_LIMITER_FILE),
+                                          args.max_collaborator_per_hour, clock)
         self.done_path = os.path.join(args.state, "done")
         self.attempts, self.limited, self.not_before = {}, {}, {}   # task id -> pre-send failures, 429s, earliest retry
+        self.lanes, self.seen_at = {}, {}                         # task name -> which gates apply, first seen
         self.blocked_until = 0.0
 
     def pending(self, seen):
@@ -215,6 +242,8 @@ class RelayLoop:
         self.attempts.pop(name[:-4], None)
         self.limited.pop(name[:-4], None)
         self.not_before.pop(name[:-4], None)
+        self.lanes.pop(name, None)
+        self.seen_at.pop(name, None)
 
     def read_task(self, name, seen):
         """(headers, message, operator_lines), or None when the file is gone (marked seen)."""
@@ -225,13 +254,24 @@ class RelayLoop:
             seen.add(name[:-4])
             return None
 
+    def classify(self, headers):
+        """The one admission decision, from task_io.admission and both allow flags: owner | non_owner |
+        collaborator (served), or refused-collaborator | refused. refusal() and lane() both read it."""
+        kind = admission(headers, self.args.allow_non_owner)
+        if kind == "collaborator" and not self.args.allow_collaborator:
+            return "refused-collaborator"
+        return kind or "refused"
+
     def refusal(self, name, headers, seen):
-        """None when the task may be served. For a non-owner tier without --allow-non-owner the refusal
-        is finished and its step result returned: True when published, False when parked."""
-        tier = headers.get("access_tier") or "guest"
-        if tier == "owner" or self.args.allow_non_owner:
+        """None when classify() serves the task; otherwise the refusal is finished and its step result
+        returned: True when published, False when parked."""
+        kind = self.classify(headers)
+        if kind == "refused-collaborator":
+            log("refused (collaborator, --allow-collaborator not set) ->", name[:-4])
+        elif kind == "refused":
+            log("refused (non-owner, --allow-non-owner not set) ->", name[:-4], headers.get("access_tier") or "guest")
+        else:
             return None
-        log("refused (non-owner, --allow-non-owner not set) ->", name[:-4], tier)
         return self.finish(name, NON_OWNER_REFUSED, seen)
 
     def schedule_retry(self, task_id, detail, at_least=0.0):
@@ -251,20 +291,64 @@ class RelayLoop:
         """True for a task whose earlier attempt is already counted; it skips the send gates."""
         return False
 
+    def lane(self, name):
+        """Which gate applies, from classify(): `refuse` (none: the step refuses it at once), `collaborator`
+        (its own cap) or `provider` (the hold and the cap). Read once per task; a gone file is the step's."""
+        if name not in self.lanes:
+            try:
+                headers, _, _ = parse_task(os.path.join(self.args.inbox, name))
+            except OSError:
+                return "provider"
+            kind = self.classify(headers)
+            self.lanes[name] = ("refuse" if kind.startswith("refused") else
+                                "collaborator" if kind == "collaborator" else "provider")
+        return self.lanes[name]
+
+    def first_seen(self, name, now):
+        """When the task began waiting: its file time when that is earlier than this scan, so time in the
+        inbox before a restart or a hand-over counts too; a gone file is the step's to report."""
+        try:
+            return min(now, os.stat(os.path.join(self.args.inbox, name)).st_mtime)
+        except OSError:
+            return now
+
+    def too_old(self, name):
+        """True once a task has waited past --collaborator-max-age (0: never) since it was first seen."""
+        return 0 < self.args.collaborator_max_age < self.clock() - self.seen_at.get(name, self.clock())
+
+    def lane_wait(self, lane):
+        if lane == "refuse":
+            return 0.0
+        return self.collab_limiter.wait_seconds() if lane == "collaborator" else self.provider_wait()
+
+    def provider_wait(self):
+        """Seconds until the provider may be called: its hold first, then its sliding-hour cap."""
+        hold = self.blocked_until - self.clock()
+        return hold if hold > 0 else self.limiter.wait_seconds()
+
     def next_ready(self, names):
+        """The first ready task whose own lane's gate is open, else how long until some gate opens.
+        Every task in the scan is stamped as seen, selected or not: its age runs from its first scan."""
         now = self.clock()
+        for n in names:
+            if n not in self.seen_at:
+                self.seen_at[n] = self.first_seen(n, now)
         for n in names:
             if self.recovering(n):
                 return n, 0.0
-        if now < self.blocked_until:
-            return None, self.blocked_until - now
         ready = [n for n in names if self.not_before.get(n[:-4], 0) <= now]
         if not ready:
             return None, min(self.not_before[n[:-4]] for n in names) - now
-        wait = self.limiter.wait_seconds()
-        if wait > 0:
-            return None, wait
-        return ready[0], 0.0
+        waits = {}
+        for n in ready:
+            lane = self.lane(n)
+            if lane == "collaborator" and self.too_old(n):
+                lane = "refuse"      # the step answers it with the line, no turn: it waits on no cap
+            if lane not in waits:
+                waits[lane] = self.lane_wait(lane)
+            if waits[lane] <= 0:
+                return n, 0.0
+        return None, min(waits.values())
 
     def recover(self):
         """A staged body a crash left is that task's result, unless any generation of a result

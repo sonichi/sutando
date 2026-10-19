@@ -336,7 +336,7 @@ describe('readRoom: every outcome is something the model can say', () => {
 	});
 	it('read_room is declared as a tool that fetches the answer, so the turn check does not also send the turn', () => {
 		const src = readFileSync(join(PLUGIN_DIR, 'tools.ts'), 'utf-8');
-		assert.match(src, /answeringTools: roomRead\.tools\.map\(\(t\) => t\.name\)/);
+		assert.match(src, /answeringTools: \[\.\.\.\(where \? \[where\.name\] : \[\]\), \.\.\.roomRead\.tools\.map\(\(t\) => t\.name\)\]/);
 		assert.match(src, /tools: \[read, search, commons, page, write, comment, message, list, \.\.\.open\]/, 'list_rooms, search_room, search_commons, read_page, write_page, add_comment and send_message are declared with read_room');
 		assert.match(src, /roomIndexContextLines\(index\)/, 'the room names are in every prompt');
 		assert.match(src, /_rooms\.refresh\(\)\.then\(/, 'the index is the warm-up');

@@ -13,6 +13,12 @@ single-machine workspace with `vault.enabled=false`. The peer cases would pass
 against an implementation that changed nothing, so they prove nothing alone —
 they are here to pin that peer behaviour is untouched.
 """
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import os
 import sys

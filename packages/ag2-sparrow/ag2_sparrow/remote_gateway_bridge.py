@@ -330,6 +330,8 @@ from .delivery_core.provider_ag2space import (AG2SpaceResultProvider, RESULT_THR
 from .result_ready import (identity_of, read_ready_result, read_ready_result_with_identity,
                            ready_body_of, ResultIdentity)
 from . import result_disposal as disposal
+from .result_publish import (is_staged_for as _is_staged_for, publish_staged as _publish_staged_whole,
+                             stage_text as _stage_text)
 from .dedup_recovery import plan_dedup_recovery, classify_holder_delivery
 from . import pool_record
 from .send_allowlist import is_path_sendable
@@ -704,34 +706,20 @@ def _atomic_private_json(path: Path, payload: dict) -> None:
 
 
 def _stage_durable(path: Path, text: str) -> "Path | None":
-    """Write `text` to a sibling temp file and fsync it; None when nothing
+    """Stage `text` beside `path` through the shared publisher; None when nothing
     reached the disk. Staging is separate from publishing because a sidecar the
     published file refers to has to commit in between."""
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        # Per-INVOCATION, not per-PID: the poll loop and the outbound worker both
-        # publish through here, and a shared temp name lets one rename the other's bytes.
-        tmp = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
-        with open(tmp, "w", encoding="utf-8") as handle:
-            handle.write(text)
-            handle.flush()
-            os.fsync(handle.fileno())
-        return tmp
+        return _stage_text(path, text)
     except Exception as exc:  # noqa: BLE001
         _log(f"durable stage failed for {path.name} ({diagnostics.describe(exc)})")
         return None
 
 
 def _publish_staged(tmp: Path, path: Path) -> bool:
-    """Rename a staged file into place and fsync the directory where supported."""
+    """Rename a staged file into place through the shared publisher."""
     try:
-        os.replace(tmp, path)
-        if os.name != "nt":
-            dfd = os.open(path.parent, os.O_RDONLY)
-            try:
-                os.fsync(dfd)
-            finally:
-                os.close(dfd)
+        _publish_staged_whole(tmp, path)
         return True
     except Exception as exc:  # noqa: BLE001
         _log(f"durable publish failed for {path.name} ({diagnostics.describe(exc)})")
@@ -3541,7 +3529,8 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
     now = time.time()
     if _heartbeat_retry_at and now < _heartbeat_retry_at:
         return False
-    health = _HEALTH_COMMAND.row() if _HEALTH_COMMAND else _core_health(_health_snapshot())
+    health = (health_command.with_motion(_HEALTH_COMMAND.row(), bool(inflight))
+              if _HEALTH_COMMAND else _core_health(_health_snapshot()))
     changed = health is not None and health != _last_core_health
     if not force and not changed and now - _last_heartbeat_at < HEARTBEAT_INTERVAL:
         return False
@@ -4642,9 +4631,12 @@ def _held_entry_ok(tid: str, entry) -> bool:
     if not (_valid_local_tid(tid) and isinstance(entry, dict)):
         return False
     staged = entry.get("staged")
-    return (entry.get("broker_id") == _broker_tid(tid) and entry.get("dest") == f"{tid}.txt"
+    dest = f"{tid}.txt"
+    # The unprefixed form is what a bridge before the shared publisher staged; its entries stay valid.
+    legacy = isinstance(staged, str) and staged.startswith(f"{dest}.") and staged.endswith(".tmp")
+    return (entry.get("broker_id") == _broker_tid(tid) and entry.get("dest") == dest
             and isinstance(staged, str) and Path(staged).name == staged
-            and staged.startswith(f"{tid}.txt.") and staged.endswith(".tmp"))
+            and (_is_staged_for(staged, dest) or legacy))
 
 
 def _held_digest(text: str) -> str:
@@ -5498,21 +5490,23 @@ def _post_proactive() -> None:
             f.rename(claim)  # atomic claim; loser of a race just misses
         except OSError:
             continue
-        # Re-read and re-route AFTER the claim, and act only on THIS result.
-        # The peek above can observe a writer mid-write (file created, body not
-        try:
-            claimed_text = claim.read_text(encoding="utf-8")
-            route, room_override, routed_body = _proactive_route(claimed_text)
-        except OSError as exc:
-            # A TRANSIENT post-claim read failure must not strand the nudge: the
-            # file is now `.sending.<our-pid>`, and _recover_orphan_proactive()
+        # Re-read and re-route AFTER the claim, and act only on THIS result: the
+        # peek may have seen a writer mid-write, so the read goes through the readiness gate.
+        claimed_text = read_ready_result(claim)
+        if claimed_text is None:
+            # Unreadable, empty, or still growing: hand back, never post a prefix or strand the claim.
+            if f.name not in _EMPTY_LOGGED:
+                _EMPTY_LOGGED.add(f.name)
+                _log(f"proactive {f.name} not ready (empty, unreadable or still "
+                     f"being written) — handing back for a later pass")
             try:
                 claim.rename(f)
             except OSError as restore_exc:
-                _log(f"CRITICAL: proactive {claim.name} post-claim read failed "
-                     f"({diagnostics.describe(exc)}) AND restore to {f.name} failed ({diagnostics.describe(restore_exc)}) — "
-                     f"owner nudge stranded under live pid until restart")
+                _log(f"CRITICAL: proactive {claim.name} was not ready AND restore "
+                     f"to {f.name} failed ({diagnostics.describe(restore_exc)}) — owner nudge stranded "
+                     f"under live pid until restart")
             continue
+        route, room_override, routed_body = _proactive_route(claimed_text)
         if route == "foreign" or (
                 route == "send" and room_override is not None
                 and not _room_is_deliverable_here(room_override)) or (

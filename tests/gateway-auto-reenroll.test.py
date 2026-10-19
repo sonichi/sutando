@@ -12,6 +12,11 @@ import urllib.error
 from pathlib import Path
 from unittest import mock
 
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 _REPO = Path(__file__).resolve().parent.parent
 _PKG = _REPO / "packages" / "ag2-sparrow"
 if str(_PKG) not in sys.path:

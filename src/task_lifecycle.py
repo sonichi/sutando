@@ -62,7 +62,9 @@ PUBLISHED, SETTLED = "PUBLISHED", "SETTLED"
 CALLABLE = frozenset((PREPARED, NOT_DELIVERED))
 
 FORMAT = "cloud-session/1"
-STATE_ALLOWED = frozenset(("format", "claims", "settled-ids", "rate.jsonl", "done"))
+STATE_ALLOWED = frozenset(("format", "claims", "settled-ids", "rate.jsonl", "done", "collaborator-turns.json"))
+# Optional records the adapters rewrite in place: when present, each must be a plain file.
+STATE_OPTIONAL_FILES = frozenset(("collaborator-turns.json",))
 FORMAT_TEMP = re.compile(r"\.format\.\d+\.[0-9a-f]{6}\.tmp")
 
 
@@ -256,6 +258,8 @@ def prepare_work_dir(work):
                 return "refusing to start: state/%s in %s is not a plain %s" % (name, state, kind)
         for name in sorted(os.listdir(state)):
             if name in STATE_ALLOWED:
+                if name in STATE_OPTIONAL_FILES and not _is_type(os.path.join(state, name), "file"):
+                    return "refusing to start: state/%s in %s is not a plain file" % (name, state)
                 continue
             if name.startswith(".") and name.endswith(".tmp") and any(name[1:].startswith(a + ".")
                                                                       for a in STATE_ALLOWED - {"format"}):

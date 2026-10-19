@@ -9,7 +9,7 @@ python3 skills/secret-vault/secret-vault.py env CLAUDE_ROUTINE_TOKEN -- \
   python3 -m ag2_sparrow.adapters.claude_routine.routine_adapter --work <dir> --trigger-id trig_... [options]
 ```
 
-`<dir>/tasks/task-*.txt` in, `<dir>/results/task-<id>.txt` out, `<dir>/state/{done,fires.json,hold.json}`.
+`<dir>/tasks/task-*.txt` in, `<dir>/results/task-<id>.txt` out, `<dir>/state/{done,fires.json,hold.json,collaborator-turns.json}`.
 One process per work dir, through the package's `holder_lock` (its first act; exit 3 naming the holder if another adapter of any kind holds the dir, exit 2 for any other lock failure; released on exit and on SIGTERM), one fire in flight.
 Tasks are taken in the task protocol's priority order (`priority:` urgent, normal, low; oldest first
 within a priority). The loop, payload layout, result lines and hourly cap live in the shared
@@ -54,12 +54,42 @@ the package-level `task_io.parse_task` every adapter shares), never from message
 The note is the shared `ag2_sparrow.task_io.NON_OWNER_NOTE`, the same text every adapter renders; `routine-prompt.md`
 carries the same text so the rules do not depend on the payload. A task with no room is not fired.
 
-**Non-owner tiers are refused by default, not merely noted.** One routine holds one connector scope —
-the owner's — and unlike the Codex adapter (which runs a non-owner turn on its own ephemeral, read-only
-sandbox), there is no narrower scope to fall back to here: the prompt's note is the only boundary once a
-task is fired. A team or guest task is therefore refused before it is ever sent, with a plain-text result
-("This agent only answers its owner here."), unless `--allow-non-owner` is passed — which should only be true when this specific routine's
-connector scope is meant to be reachable by non-owner senders.
+**Who is served.** Admission is the shared `task_io.admission` gate over the attested headers: the owner,
+an attested collaborator (Team), nobody else. A non-owner without collaborator access (Guest, and any
+collaborator claim the broker did not attest) is refused before anything is sent, with a plain-text result
+("This agent only answers its owner here."), unless `--allow-non-owner` is passed — which fires such tasks
+at the same routine and connector scope as the owner, bounded only by the prompt's note, and should only be
+true when this specific routine's connector scope is meant to be reachable by them. An attested collaborator
+(the broker's `collaborator: true` on the team tier, from the parsed headers, never the message text) never
+reaches the routine at all: with `--allow-collaborator` it is served on the isolated local turn below;
+without it, it gets the same refusal line. `--allow-non-owner` does not imply `--allow-collaborator`. The
+owner path is unchanged.
+
+**The isolated collaborator turn.** `<--claude> -p --safe-mode --restricted --strict-mcp-config
+--no-session-persistence --tools Read,Grep,Glob --output-format json`, the same payload on stdin (one lead
+line naming the situation, then the note, `collaborator=true`, never `owner_dm`), in a fresh empty temp
+directory removed afterwards, with an environment of only `PATH`, `HOME`, `USER`, `LANG` and
+`CLAUDE_CONFIG_DIR`, bounded by `--collaborator-timeout` (default 30 s; the HTTP `--timeout` is the fire's
+alone). The turn runs synchronously inside the one serve loop: an owner task that arrives while it runs
+waits for it, so raising this delays owner fires by up to that much. What it can reach: the CLI's login and the three read
+tools over an empty directory. What it cannot: the routine and its connector, any session or history (no
+`--cloud`, no `--resume`, and the turn itself is never saved, so nothing can resume it), Bash or
+code-running tools, the web, MCP servers, CLAUDE.md, hooks, skills, settings, or the work dir. The JSON
+`result` string becomes the task's result as **inert text**: every result-delivery marker the shared
+parser knows (`[no-send]`, `[REPLIED]`, `[deduped:]`, `[channel:]`, `[thread:]`, `[thread]`, `[reply:]`,
+`[dm-only]`, `[file:]`/`[send:]`/`[attach:]`) is quoted in the parser's own form (`[ no-send]`) before
+publication and checked by the parser again, so the bridge executes nothing from it and posts it once in
+the originating room. Any failure (non-zero exit, no `result`, timeout, no temp dir, missing CLI) gets the
+generic "could not be sent" line — one try, no retry. These turns have their own cap,
+`--max-collaborator-per-hour` (1 or more, default 10, `state/collaborator-turns.json`), and their own gate:
+a collaborator waits only on that cap, never on `--max-per-hour` or a 429 hold, and an owner task waits
+only on its own gates, never on the collaborator cap. A turn is never counted against the owner provider's
+limiter; it still costs the owner's Claude plan. A task that has waited longer than `--collaborator-max-age`
+(default 1800 s; 0 turns the cut-off off) gets the generic line instead of a turn, so a burst is not answered
+hours late. The wait counts since the task was first seen in a pending scan, or its file time if earlier; a
+restart does not reset it. The line goes out at once: a stale task takes the ungated lane and never waits on
+the collaborator cap. This adapter keeps no call journal: a crash mid-turn re-runs the turn
+on restart, counted twice against the collaborator cap, with one result.
 
 ## Results: why `[no-send]`
 

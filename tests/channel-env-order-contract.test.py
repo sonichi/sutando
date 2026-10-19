@@ -22,6 +22,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from _helpers.hermetic_env import isolate_os_environ, isolated_child_env  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 sys.path.insert(0, str(REPO / "packages" / "ag2-sparrow"))
@@ -59,7 +64,7 @@ class OrderContract(unittest.TestCase):
 
     def _picks(self) -> tuple[str, str]:
         """(file channel-env.sh prints, file the bridge loads its token from)."""
-        env = dict(os.environ)
+        env = isolated_child_env()
         r = subprocess.run(["bash", str(REPO / "scripts" / "channel-env.sh"), "ag2space"],
                            capture_output=True, text=True, env=env)
         _tok, _url, bridge_path = bridge._token_from_ag2space_env()

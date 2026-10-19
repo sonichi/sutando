@@ -25,6 +25,12 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+sys.path.append(str(Path(__file__).resolve().parents[1] / "tests"))
+from _helpers.hermetic_env import isolate_os_environ, isolated_child_env  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 SRC_DIR = Path(__file__).resolve().parent
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
@@ -568,7 +574,7 @@ def main() -> int:
             for name, body in files.items():
                 with open(_os.path.join(ch, name), "w", encoding="utf-8", newline="\n") as fh:
                     fh.write(body)
-            env = dict(_os.environ, CLAUDE_CONFIG_DIR=d, SUTANDO_PY=sys.executable)
+            env = isolated_child_env(CLAUDE_CONFIG_DIR=d, SUTANDO_PY=sys.executable)
             r = _sp.run([_bash, _helper, "ag2space"], capture_output=True,
                         text=True, env=env, timeout=30)
             return r.returncode, r.stdout.strip()
@@ -1177,12 +1183,23 @@ def main() -> int:
             raise OSError("simulated transient post-claim read failure")
         return _real_read_text(self, *a, **k)
 
+    # The post-claim read goes through the readiness owner, which opens the file itself.
+    _ready_mod = sys.modules[rtc.read_ready_result.__module__]
+    _real_identity_of = _ready_mod.identity_of
+
+    def _identity_of_fail_on_claim(path):
+        if ".sending." in _pl.Path(path).name:
+            raise OSError("simulated transient post-claim read failure")
+        return _real_identity_of(path)
+
     posts_rf = len(STATE["room_posts"])
     _pl.Path.read_text = _read_text_fail_on_claim
+    _ready_mod.identity_of = _identity_of_fail_on_claim
     try:
         rtc._post_proactive()
     finally:
         _pl.Path.read_text = _real_read_text
+        _ready_mod.identity_of = _real_identity_of
     check((rtc.RESULTS_DIR / "proactive-readfail.txt").exists()
           and not list(rtc.RESULTS_DIR.glob("proactive-readfail.sending.*"))
           and len(STATE["room_posts"]) == posts_rf,

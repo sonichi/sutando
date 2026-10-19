@@ -2002,11 +2002,16 @@ def _carrier_target_verdict(workspace: Path, rep: Path) -> str:
     # `-z` makes git read NUL-separated input, which is the only delimiter a
     # POSIX filename cannot contain.
     rels = "\0".join(str(t.relative_to(workspace)) for t in targets)
+    # stdin is a file, not `input=`: with macOS's pipe pool spent, poll() calls a full pipe writable,
+    # communicate() blocks in os.write while git blocks on stdout, and timeout= never fires.
     try:
-        proc = subprocess.run(
-            git_argv("-C", str(workspace), "check-ignore", "--no-index", "-v", "-z", "--stdin"),
-            input=rels, capture_output=True, text=True, timeout=60,
-        )
+        with tempfile.TemporaryFile() as stdin:
+            stdin.write(rels.encode("utf-8"))
+            stdin.seek(0)
+            proc = subprocess.run(
+                git_argv("-C", str(workspace), "check-ignore", "--no-index", "-v", "-z", "--stdin"),
+                stdin=stdin, capture_output=True, text=True, timeout=60,
+            )
     except (GitUnavailable, OSError, subprocess.SubprocessError):
         return "unmeasured"
     # `-v` names the RULE that decided each path, and that is the whole point:
@@ -2390,11 +2395,15 @@ def _index_growth_note(index: Path, effective_bytes: int,
             stamps.append((sha, int(at)))
         if not stamps:
             return _TREND_UNAVAILABLE
-        batch = subprocess.run(
-            git_argv("-C", str(repo), "cat-file", "--batch"),
-            input="".join(f"{sha}:./{rel}\n" for sha, _ in stamps).encode(),
-            capture_output=True, timeout=20,
-        )
+        # Defensive: this stdin (<= 12 short specs) is too small to deadlock, but it stays
+        # off `input=` like `_carrier_target_verdict`, whose larger stdin can.
+        with tempfile.TemporaryFile() as stdin:
+            stdin.write("".join(f"{sha}:./{rel}\n" for sha, _ in stamps).encode())
+            stdin.seek(0)
+            batch = subprocess.run(
+                git_argv("-C", str(repo), "cat-file", "--batch"),
+                stdin=stdin, capture_output=True, timeout=20,
+            )
         if batch.returncode != 0:
             return _TREND_UNAVAILABLE
         points: "list[tuple[int, int]]" = []

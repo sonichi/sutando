@@ -29,6 +29,12 @@ import urllib.error
 from pathlib import Path
 from unittest import mock
 
+sys.path.append(str(Path(__file__).resolve().parents[3] / "tests"))
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 PKG_ROOT = Path(__file__).resolve().parents[1]
 REPO_SRC = PKG_ROOT.parents[1] / "src"
 sys.path.insert(0, str(PKG_ROOT))
@@ -620,6 +626,23 @@ class FreshDirTest(Base):
                 os.rename(p, moved)
                 self.assertIn("%s is missing" % name, self.lc.prepare_work_dir(str(self.work)))
                 os.rename(moved, p)
+
+    def test_an_optional_limiter_record_must_be_a_plain_file(self):
+        self.assertIsNone(self.lc.prepare_work_dir(str(self.work)), "absent: accepted")
+        p = self.work / "state" / "collaborator-turns.json"
+        p.write_text("[]")
+        self.assertIsNone(self.lc.prepare_work_dir(str(self.work)), "a plain file: accepted")
+        p.unlink()
+        p.mkdir()
+        line = self.lc.prepare_work_dir(str(self.work))
+        self.assertIn("state/collaborator-turns.json in", line)
+        self.assertIn("is not a plain file", line)
+        p.rmdir()
+        os.symlink(self.work / "state" / "settled-ids", p)
+        self.assertIn("is not a plain file", self.lc.prepare_work_dir(str(self.work)), "a link is not a plain file")
+        os.unlink(p)
+        self.assertIsNone(self.lc.prepare_work_dir(str(self.work)))
+        self.assertIn("collaborator-turns.json", self.lc.STATE_OPTIONAL_FILES)
 
     def test_the_bridge_may_create_tasks_and_results_first(self):
         (self.work / "tasks").mkdir()

@@ -6,6 +6,7 @@ script of canned outputs. No network, no real CLI. Run:
 """
 import contextlib
 import io
+import itertools
 import json
 import os
 import re
@@ -20,7 +21,7 @@ from unittest import mock
 
 PKG_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PKG_ROOT))
-from ag2_sparrow import team_guardrail  # noqa: E402
+from ag2_sparrow import collaborator_turn as ct, team_guardrail  # noqa: E402
 
 from ag2_sparrow.adapters.claude_cloud_session import session_adapter as sa  # noqa: E402
 from ag2_sparrow import relay_loop as rl, result_disposal, result_ready, task_lifecycle as lc  # noqa: E402
@@ -43,7 +44,8 @@ calls = os.path.join(d, "calls.jsonl")
 n = sum(1 for _ in open(calls)) if os.path.exists(calls) else 0
 stdin = sys.stdin.read()
 with open(calls, "a") as f:
-    f.write(json.dumps({"argv": sys.argv, "env": dict(os.environ), "stdin": stdin}) + "\n")
+    f.write(json.dumps({"argv": sys.argv, "env": dict(os.environ), "stdin": stdin, "cwd": os.getcwd(),
+                        "cwd_entries": os.listdir(".")}) + "\n")
 script = json.load(open(os.path.join(d, "script.json")))
 r = script[min(n, len(script) - 1)]
 time.sleep(r.get("sleep", 0))
@@ -56,6 +58,15 @@ sys.exit(r.get("rc", 0))
 def ok(i=1):
     return {"stdout": json.dumps({"ok": True, "session_id": SID,
                                   "url": "https://claude.ai/code/%s?turn=%d" % (SID, i)}) + "\n"}
+
+
+def turn_ok(text="Hello from the turn"):
+    """What `claude -p --output-format json` prints for a finished local turn."""
+    return {"stdout": json.dumps({"type": "result", "is_error": False, "result": text}) + "\n"}
+
+
+LEAKY_ENV = dict(ENV, CLAUDE_CONFIG_DIR="/cfg/claude-owner", SUTANDO_WORKSPACE_DIR="/secret/ws",
+                 SUTANDO_TASKS_DIR="/secret/ws/tasks", CLAUDE_CODE_ENTRYPOINT="cli", REMOTE_TASK_TOKEN="tok-no")
 
 
 class Fake:
@@ -75,8 +86,12 @@ class Fake:
         return [json.loads(l) for l in p.read_text().splitlines()] if p.exists() else []
 
 
+T0 = 1_800_000_000.0
+_WRITES = itertools.count()
+
+
 class FakeClock:
-    def __init__(self, t=1_800_000_000.0):
+    def __init__(self, t=T0):
         self.t = t
         self.sleeps = []
 
@@ -103,8 +118,9 @@ def write_task(work, tid, body, tier="owner", channel="!room:ag2.space", thread=
     p = Path(work) / "tasks" / (tid + ".txt")
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    if mtime is not None:
-        os.utime(p, (mtime, mtime))
+    # An explicit mtime is an ordering key; every fixture sits seconds before the fake clock's start.
+    t = T0 - 6 + (mtime / 1000.0 if mtime is not None else 1 + next(_WRITES) * 1e-3)
+    os.utime(p, (t, t))
     return p
 
 
@@ -129,9 +145,9 @@ def result(work, tid):
     return (Path(work) / "results" / (tid + ".txt")).read_text(encoding="utf-8")
 
 
-def run_adapter(work, fake, clock=None, run=subprocess.run, **kw):
+def run_adapter(work, fake, clock=None, run=subprocess.run, environ=ENV, **kw):
     clock = clock or FakeClock()
-    ad = sa.Adapter(args_for(work, fake.path, **kw), clock=clock, sleep=clock.sleep, note=NOTE, environ=ENV,
+    ad = sa.Adapter(args_for(work, fake.path, **kw), clock=clock, sleep=clock.sleep, note=NOTE, environ=environ,
                     run=run)
     err_buf = io.StringIO()
     with contextlib.redirect_stderr(err_buf):
@@ -381,6 +397,301 @@ class QueueLoopTest(unittest.TestCase):
             self.assertEqual(fake.calls(), [])
             for tier in ("team", "guest", "superuser"):
                 self.assertEqual(result(d, "task-" + tier), ra.NON_OWNER_REFUSED)
+
+    def test_a_collaborator_gets_an_isolated_local_turn_and_never_the_session(self):
+        with tempfile.TemporaryDirectory() as d:
+            fake = Fake(d, [turn_ok("Hello from the turn"), ok(7)])
+            write_task(d, "task-c", "collab asks SECRET-MARKER", tier="team", collaborator=True, mtime=1000)
+            write_task(d, "task-g", "guest asks", tier="guest", mtime=1100)
+            write_task(d, "task-fake", "claims it", tier="guest", collaborator=True, mtime=1200)
+            write_task(d, "task-team", "team without the flag", tier="team", mtime=1300)
+            write_task(d, "task-o", "owner asks", mtime=1400, kind="room")
+            ad, err = run_adapter(d, fake, once=5, owner_dm="!dm:ag2.space", environ=LEAKY_ENV, allow_collaborator=True)
+            collab, owner = fake.calls()
+            self.assertEqual(collab["argv"], [str(fake.path), "-p", "--safe-mode", "--restricted", "--strict-mcp-config",
+                                              "--no-session-persistence", "--tools", "Read,Grep,Glob",
+                                              "--output-format", "json"])
+            for flag in ("--cloud", SID, "--resume", "-r", "--dangerously-skip-permissions", "--permission-mode", "--bare"):
+                self.assertNotIn(flag, collab["argv"], flag)
+            self.assertNotIn("SECRET-MARKER", " ".join(collab["argv"]), "the text goes on stdin")
+            reminder, first, rest = text_of(collab).split("\n", 2)
+            self.assertEqual(reminder, ct.REMINDER, "the isolated turn's own line, not the session's")
+            self.assertEqual(first, "room=!room:ag2.space thread=none tier=team collaborator=true task_id=task-c",
+                             "no session reminder, no channel_kind, no owner_dm: nothing of the session's instructions")
+            self.assertTrue(rest.startswith("note: " + NOTE + "\n"), rest[:80])
+            self.assertEqual(SPAN_RE.search(rest).group(2), "collab asks SECRET-MARKER")
+            for owner_only in ("owner_dm", "!dm:ag2.space", sa.REMINDER):
+                self.assertNotIn(owner_only, text_of(collab))
+            # macOS stamps __CF_USER_TEXT_ENCODING on every child it spawns, whatever env was passed.
+            env = {k: v for k, v in collab["env"].items() if k != "__CF_USER_TEXT_ENCODING"}
+            self.assertTrue(set(env) <= set(sa.ENV_KEEP), sorted(env))
+            self.assertEqual(env["CLAUDE_CONFIG_DIR"], "/cfg/claude-owner", "the login is the one thing kept")
+            self.assertFalse([k for k in env if k.startswith(("SUTANDO", "ANTHROPIC", "CLAUDE_CODE"))
+                              or k in ("REMOTE_TASK_TOKEN", "TERM")], sorted(env))
+            self.assertEqual(collab["cwd_entries"], [], "an empty directory: nothing to read")
+            for owned in (d, ad.args.inbox, ad.args.results, ad.args.state):
+                self.assertNotEqual(os.path.realpath(collab["cwd"]), os.path.realpath(owned))
+            self.assertFalse(os.path.exists(collab["cwd"]), "removed after the turn")
+            self.assertEqual(result(d, "task-c"), "Hello from the turn", "the result string, verbatim")
+            self.assertNotIn("[dm-only]", result(d, "task-c"))
+            self.assertEqual(owner["argv"], [str(fake.path), "-p", "--cloud", SID, "--output-format", "json"])
+            self.assertIn("tier=owner collaborator=false task_id=task-o channel_kind=room owner_dm=!dm:ag2.space",
+                          text_of(owner))
+            self.assertEqual(result(d, "task-o"), "[no-send]\n# claude cloud session: https://claude.ai/code/%s?turn=7\n" % SID)
+            for tid in ("task-g", "task-fake", "task-team"):
+                self.assertEqual(result(d, tid), ra.NON_OWNER_REFUSED, tid)
+            self.assertIn("collaborator turn -> task-c", err)
+            self.assertNotIn("queue -> task-c", err)
+            self.assertIn("queue -> task-o", err)
+            rec = claim(d, "task-c")
+            self.assertEqual((rec["phase"], rec["attempt"], rec["outcome"]["kind"]), ("SETTLED", 1, "final"))
+            self.assertEqual(list(charges(d)), [("task-o", 1)], "only the owner's turn is charged")
+
+    def test_a_collaborator_is_refused_without_allow_collaborator(self):
+        with tempfile.TemporaryDirectory() as d:
+            fake = Fake(d, [turn_ok()])
+            write_task(d, "task-c", "collab asks", tier="team", collaborator=True)
+            _, err = run_adapter(d, fake, once=1, allow_non_owner=True)
+            self.assertEqual(fake.calls(), [], "no local turn and no session turn, even under --allow-non-owner")
+            self.assertEqual(result(d, "task-c"), ra.NON_OWNER_REFUSED)
+            self.assertIn("refused (collaborator, --allow-collaborator not set) -> task-c", err)
+            self.assertEqual(claim(d, "task-c")["attempt"], 0, "no call was prepared")
+            self.assertIs(sa.build_parser().get_default("allow_collaborator"), False)
+
+    def test_a_collaborator_turn_never_counts_against_the_owner_cap_or_min_gap(self):
+        with tempfile.TemporaryDirectory() as d:
+            fake = Fake(d, [turn_ok("one"), turn_ok("two")])
+            write_task(d, "task-c1", "one", tier="team", collaborator=True, mtime=1000)
+            write_task(d, "task-c2", "two", tier="team", collaborator=True, mtime=2000)
+            clock = FakeClock()
+            start = clock.t
+            ad, _ = run_adapter(d, fake, clock=clock, once=2, max_per_hour=1, min_gap_seconds=1000,
+                                allow_collaborator=True)
+            self.assertEqual([result(d, "task-c1"), result(d, "task-c2")], ["one", "two"])
+            self.assertEqual(charges(d), {}, "the rate journal holds no charge")
+            self.assertEqual(ad.limiter.times, [])
+            self.assertLess(clock.t - start, 1000, "no min-gap wait between two collaborator turns")
+            self.assertEqual(len(ad.collab_limiter.times), 2)
+            self.assertIn("collaborator-turns.json", os.listdir(ad.args.state))
+
+    def test_a_failed_collaborator_turn_gets_the_plain_line_once_and_no_retry(self):
+        for script in ([{"rc": 1, "stderr": "boom\n"}], [ok()], [{"stdout": '{"is_error": true, "result": "x"}'}]):
+            with tempfile.TemporaryDirectory() as d:
+                fake = Fake(d, script)
+                write_task(d, "task-c", "collab asks", tier="team", collaborator=True)
+                _, err = run_adapter(d, fake, once=1, allow_collaborator=True)
+                self.assertEqual(len(fake.calls()), 1, "one try")
+                self.assertEqual(result(d, "task-c"), rl.NON_OWNER_FAILED)
+                self.assertNotIn("--cloud", fake.calls()[0]["argv"], "no fallback to the session")
+                self.assertNotIn("retry", err)
+                self.assertEqual(charges(d), {})
+                self.assertEqual(claim(d, "task-c")["phase"], "SETTLED")
+
+    def test_the_collaborator_cap_holds_the_next_turn_for_the_window(self):
+        with tempfile.TemporaryDirectory() as d:
+            fake = Fake(d, [turn_ok("one")])
+            write_task(d, "task-c1", "one", tier="team", collaborator=True, mtime=1000)
+            write_task(d, "task-c2", "two", tier="team", collaborator=True, mtime=2000)
+            clock = FakeClock()
+            ad, _ = run_adapter(d, fake, clock=clock, once=1, max_collaborator_per_hour=1, allow_collaborator=True)
+            self.assertEqual(len(fake.calls()), 1)
+            self.assertEqual(result(d, "task-c1"), "one")
+            self.assertIsNone(claim(d, "task-c2"), "no call was prepared for the waiting task")
+            name, wait = ad.next_ready(["task-c2.txt"])
+            self.assertIsNone(name)
+            self.assertAlmostEqual(wait, rl.HOUR, delta=1.0)
+            clock.t += rl.HOUR
+            self.assertEqual(ad.next_ready(["task-c2.txt"]), ("task-c2.txt", 0.0))
+            self.assertEqual(sa.build_parser().get_default("max_collaborator_per_hour"), 10)
+
+    def test_a_collaborator_runs_under_a_full_session_cap_and_a_pending_min_gap(self):
+        with tempfile.TemporaryDirectory() as d:
+            fake = Fake(d, [ok(1), turn_ok("two")])
+            write_task(d, "task-o", "owner first", mtime=1000)
+            write_task(d, "task-c", "collab asks", tier="team", collaborator=True, mtime=2000)
+            clock = FakeClock()
+            start = clock.t
+            ad, _ = run_adapter(d, fake, clock=clock, once=2, max_per_hour=1, min_gap_seconds=1000,
+                                allow_collaborator=True)
+            self.assertEqual(len(fake.calls()), 2)
+            self.assertIn("--cloud", fake.calls()[0]["argv"])
+            self.assertEqual(result(d, "task-c"), "two")
+            self.assertLess(clock.t - start, 1000, "neither the full cap nor the gap held the collaborator")
+            self.assertGreater(ad.provider_wait(), 0, "the session's own gate is still shut")
+
+    def test_an_owner_turn_is_not_held_by_a_full_collaborator_cap(self):
+        with tempfile.TemporaryDirectory() as d:
+            fake = Fake(d, [turn_ok("one"), ok(5)])
+            write_task(d, "task-c1", "one", tier="team", collaborator=True, mtime=1000)
+            write_task(d, "task-c2", "two", tier="team", collaborator=True, mtime=2000)
+            write_task(d, "task-o", "owner last", mtime=3000)
+            clock = FakeClock()
+            start = clock.t
+            run_adapter(d, fake, clock=clock, once=2, max_collaborator_per_hour=1, allow_collaborator=True)
+            self.assertEqual([("--cloud" in c["argv"]) for c in fake.calls()], [False, True])
+            self.assertEqual(result(d, "task-c1"), "one")
+            self.assertIn("turn=5", result(d, "task-o"))
+            self.assertFalse((Path(d) / "results" / "task-c2.txt").exists(), "still waiting on its own cap")
+            self.assertLess(clock.t - start, rl.HOUR)
+
+    def test_refused_tasks_are_never_held_behind_a_saturated_cap(self):
+        with tempfile.TemporaryDirectory() as d:
+            fake = Fake(d, [ok(1)])
+            (Path(d) / "state").mkdir()
+            clock = FakeClock()
+            (Path(d) / "state" / rl.COLLAB_LIMITER_FILE).write_text(json.dumps([clock.t - 10]))
+            write_task(d, "task-o", "owner first", mtime=1000)
+            write_task(d, "task-g", "guest asks", tier="guest", mtime=2000)
+            write_task(d, "task-c", "collab asks", tier="team", collaborator=True, mtime=3000)
+            start = clock.t
+            ad, err = run_adapter(d, fake, clock=clock, once=3, max_per_hour=1, min_gap_seconds=1000,
+                                  max_collaborator_per_hour=1)
+            self.assertEqual(len(fake.calls()), 1, "only the owner's turn")
+            self.assertIn("--cloud", fake.calls()[0]["argv"])
+            for tid in ("task-g", "task-c"):
+                self.assertEqual(result(d, tid), ra.NON_OWNER_REFUSED, tid)
+                self.assertEqual(claim(d, tid)["attempt"], 0, "no call was prepared")
+            self.assertLess(clock.t - start, 1000, "refused at once, behind neither the full cap nor the gap")
+            self.assertGreater(ad.provider_wait(), 0, "the session's gate is shut")
+            write_task(d, "task-c2", "collab again", tier="team", collaborator=True, mtime=4000)
+            write_task(d, "task-g2", "guest again", tier="guest", mtime=5000)
+            ad.args.allow_collaborator = True
+            name, wait = ad.next_ready(["task-c2.txt"])
+            self.assertIsNone(name, "admitted, so it waits on its own full cap")
+            self.assertAlmostEqual(wait, rl.HOUR, delta=11.0)
+            self.assertEqual(ad.next_ready(["task-c2.txt", "task-g2.txt"]), ("task-g2.txt", 0.0), "the refusal goes first")
+
+    def test_a_collaborator_turn_uses_collaborator_timeout(self):
+        with tempfile.TemporaryDirectory() as d:
+            fake = Fake(d, [turn_ok()])
+            write_task(d, "task-c", "collab asks", tier="team", collaborator=True)
+            with mock.patch.object(sa.subprocess, "run", wraps=subprocess.run) as spy:
+                run_adapter(d, fake, run=sa.subprocess.run, once=1, allow_collaborator=True, collaborator_timeout=7)
+            self.assertEqual(spy.call_args.kwargs["timeout"], 7.0, "--collaborator-timeout, not --timeout (10 here)")
+            self.assertEqual(sa.build_parser().get_default("collaborator_timeout"), 60.0)
+            self.assertEqual(sa.build_parser().get_default("collaborator_max_age"), 1800.0)
+
+    def test_a_non_owner_turn_under_allow_non_owner_never_carries_owner_dm(self):
+        with tempfile.TemporaryDirectory() as d:
+            fake = Fake(d, [ok(1), ok(2)])
+            write_task(d, "task-g", "guest asks", tier="guest", mtime=1000)
+            write_task(d, "task-o", "owner asks", mtime=2000)
+            run_adapter(d, fake, once=2, allow_non_owner=True, owner_dm="!dm:ag2.space")
+            guest, owner = fake.calls()
+            self.assertIn("tier=guest", text_of(guest))
+            for owner_only in ("owner_dm", "!dm:ag2.space"):
+                self.assertNotIn(owner_only, text_of(guest))
+            self.assertIn("owner_dm=!dm:ag2.space", text_of(owner))
+            self.assertNotIn("owner_dm", sa.build_text("t", {"access_tier": "team", "channel_id": "!r:x"}, "m",
+                                                       owner_dm="!dm:x")[1])
+
+    def test_settling_drops_the_lane_and_first_seen_records(self):
+        with tempfile.TemporaryDirectory() as d:
+            fake = Fake(d, [turn_ok("one")])
+            write_task(d, "task-c", "collab asks", tier="team", collaborator=True)
+            ad, _ = run_adapter(d, fake, once=1, allow_collaborator=True)
+            self.assertEqual((ad.lanes, ad.seen_at), ({}, {}))
+            ad.lanes["task-x.txt"], ad.seen_at["task-x.txt"] = "provider", 1.0
+            ad._settled("task-x.txt", set())
+            self.assertEqual((ad.lanes, ad.seen_at), ({}, {}))
+
+    def test_a_collaborator_task_that_waited_past_the_max_age_gets_the_line_and_no_turn(self):
+        with tempfile.TemporaryDirectory() as d:
+            fake = Fake(d, [turn_ok("one")])
+            write_task(d, "task-c1", "one", tier="team", collaborator=True, mtime=1000)
+            write_task(d, "task-c2", "two", tier="team", collaborator=True, mtime=2000)
+            clock = FakeClock()
+            start = clock.t
+            ad, _ = run_adapter(d, fake, clock=clock, once=1, max_collaborator_per_hour=1, allow_collaborator=True,
+                                collaborator_max_age=600)
+            self.assertEqual(result(d, "task-c1"), "one", "fresh: it ran")
+            self.assertIsNone(ad.next_ready(["task-c2.txt"])[0], "the next poll sees c2 waiting on the cap")
+            self.assertLessEqual(ad.seen_at["task-c2.txt"], clock.t)
+            clock.t += 1000                  # past the max age, still inside the full cap's window
+            self.assertEqual(ad.next_ready(["task-c2.txt"]), ("task-c2.txt", 0.0),
+                             "stale: the ungated lane, ahead of the full cap")
+            ad.args.once = 2
+            err_buf = io.StringIO()
+            with contextlib.redirect_stderr(err_buf), mock.patch.object(ad.lc, "prepare", wraps=ad.lc.prepare) as prepare:
+                ad.serve()
+            self.assertEqual(result(d, "task-c2"), rl.NON_OWNER_FAILED, "stale: the line, no turn")
+            self.assertEqual(len(fake.calls()), 1)
+            self.assertEqual(prepare.call_count, 0, "no claim was prepared for the stale task")
+            self.assertEqual(claim(d, "task-c2")["attempt"], 0)
+            self.assertIn("collaborator task waited too long -> task-c2", err_buf.getvalue())
+            self.assertEqual(json.loads(Path(ad.args.state, rl.COLLAB_LIMITER_FILE).read_text()), [start],
+                             "the stale rejection consumed no cap entry: the file still holds only the first turn")
+
+    def test_a_backlog_task_aged_past_the_cutoff_by_the_turn_before_it_gets_the_line(self):
+        with tempfile.TemporaryDirectory() as d:
+            fake = Fake(d, [turn_ok("one"), turn_ok("two")])
+            write_task(d, "task-c1", "one", tier="team", collaborator=True, mtime=1000)
+            write_task(d, "task-c2", "two", tier="team", collaborator=True, mtime=2000)
+            clock = FakeClock()
+
+            def slow_run(argv, **kw):
+                clock.t += 20            # the first turn itself takes longer than the max age
+                return subprocess.run(argv, **kw)
+            start = clock.t
+            with mock.patch.object(lc.Lifecycle, "prepare", autospec=True, side_effect=lc.Lifecycle.prepare) as prepare:
+                ad, err = run_adapter(d, fake, clock=clock, run=slow_run, once=2, allow_collaborator=True,
+                                      collaborator_max_age=10)
+            self.assertEqual([c.args[1] for c in prepare.call_args_list], ["task-c1"], "one claim, for the turn that ran")
+            self.assertEqual(result(d, "task-c1"), "one")
+            self.assertEqual(result(d, "task-c2"), rl.NON_OWNER_FAILED, "seen at the first scan, aged by the turn before it")
+            self.assertEqual(len(fake.calls()), 1, "exactly one turn")
+            self.assertEqual(claim(d, "task-c2")["attempt"], 0, "no call was prepared")
+            self.assertIn("collaborator task waited too long -> task-c2", err)
+            self.assertEqual(ad.collab_limiter.times, [start], "the stale rejection consumed no cap entry")
+            self.assertEqual(json.loads(Path(ad.args.state, rl.COLLAB_LIMITER_FILE).read_text()), [start])
+
+    def test_a_collaborator_reply_never_executes_delivery_protocol(self):
+        from ag2_sparrow.result_markers import parse_markers
+        from ag2_sparrow.team_result_guard import guard_result_for_tier
+        bodies = ("[no-send]\nHI", "[REPLIED]\nHI", "[deduped: task-1]\nHI", "[channel: !other:x]\nHI",
+                  "[thread: $root]\nHI", "[thread]\nHI", "[reply: 12345678901234567]\nHI", "[dm-only]\nHI",
+                  "HI\n[dm-only]", "HI [dm-only] inline", "[file: /etc/passwd]\nHI", "HI\n[send: /x]\n[attach: /y]",
+                  "[channel: !other:x]\n[no-send]\nHI")
+        for raw in bodies:
+            with tempfile.TemporaryDirectory() as d:
+                fake = Fake(d, [turn_ok(raw)])
+                write_task(d, "task-c", "collab asks", tier="team", collaborator=True)
+                run_adapter(d, fake, once=1, allow_collaborator=True)
+                body = result(d, "task-c")
+                parsed = parse_markers(body)
+                self.assertEqual((parsed.actions, parsed.body), ([], body), raw)
+                self.assertEqual(parse_markers(body, skip_after_channel=True).actions, [], raw)
+                self.assertEqual(guard_result_for_tier(body, "team", PKG_ROOT, scan_sensitive_data=False),
+                                 (body, None), "the real guard delivers it as a room reply: " + raw)
+                self.assertIn("HI", body)
+                self.assertNotEqual(body, raw, "and it was changed to get there")
+
+    def test_the_limiter_file_is_this_adapters_state_across_a_restart(self):
+        with tempfile.TemporaryDirectory() as d:
+            work = Path(d) / "work"
+            work.mkdir()
+            self.assertIsNone(lc.prepare_work_dir(str(work)), "a fresh work dir, as the real start makes it")
+            fake = Fake(d, [turn_ok("one"), ok(2)])
+            write_task(work, "task-c", "collab asks", tier="team", collaborator=True)
+            run_adapter(work, fake, once=1, allow_collaborator=True)
+            self.assertEqual(result(work, "task-c"), "one")
+            state = work / "state"
+            self.assertIn(rl.COLLAB_LIMITER_FILE, os.listdir(state), "written by the production limiter")
+            (state / (".%s.123.tmp" % rl.COLLAB_LIMITER_FILE)).write_text("[]")
+            self.assertIsNone(sa.startup_refusal(str(work), ENV), "the restart validator accepts its own state")
+            self.assertIsNone(lc.prepare_work_dir(str(work)))
+            self.assertNotIn(".%s.123.tmp" % rl.COLLAB_LIMITER_FILE, os.listdir(state), "a torn write is cleaned")
+            write_task(work, "task-o", "owner after the restart")
+            run_adapter(work, fake, once=1)
+            self.assertIn("turn=2", result(work, "task-o"), "owner work goes on after the restart")
+            self.assertIn(rl.COLLAB_LIMITER_FILE, lc.STATE_ALLOWED)
+
+    def test_a_guest_stays_refused_with_the_same_message_beside_a_collaborator(self):
+        with tempfile.TemporaryDirectory() as d:
+            fake = Fake(d, [ok()])
+            write_task(d, "task-g", "x", tier="guest")
+            run_adapter(d, fake, once=1)
+            self.assertEqual((fake.calls(), result(d, "task-g")), ([], ra.NON_OWNER_REFUSED))
 
     def test_allow_non_owner_queues_with_the_note(self):
         with tempfile.TemporaryDirectory() as d:
