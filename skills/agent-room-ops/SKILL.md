@@ -30,6 +30,7 @@ The normative op→Action map is the backend contract
 | `react` / `unreact` | `room.action.execute` | `room.message.react` / `room.message.unreact` |
 | `send` (upload) | `room.action.execute` | `room.media.upload` |
 | `fetch` | `room.action.execute` | `room.media.link` (an expiring viewer link, not a local file) |
+| `doc get` / `put` / `rm` | `room.action.read` / `room.action.execute` | `room.vault.read` (`room.vault.tree` to list) / `room.vault.write` / `room.vault.delete` |
 | `events emit` | `room.action.execute` | `room.event.send` |
 | state read / write | `room.action.read` / `room.action.execute` | `room.state.read` / `room.state.write` |
 
@@ -82,6 +83,7 @@ does the privileged Matrix ops + authoritative membership enforcement.
 | `react <room> <event>` | add an `m.reaction` (ack) | discord `add_reaction` (👀/✅) |
 | `unreact <room> <event>` | remove the agent's reaction | discord remove-on-reply |
 | `join <room>` | accept the agent's own pending invite | discord guild-join on invite |
+| `doc get\|put\|rm <room>` | read/write/delete the room's shared **Room Context** docs (context, todo, memos — or any agent-defined folder) | the durable-state half: like a pinned channel wiki the bot can edit |
 
 ```bash
 python3 skills/agent-room-ops/room_ops.py read   '!room:hs' --limit 20 --agent '@a:hs'
@@ -120,6 +122,9 @@ python3 skills/agent-room-ops/room_ops.py say '!room:hs' 'yes, final' --thread-r
 #   rel_type m.thread relation from the id, so the post leaves the main timeline and
 #   shows under the root — how a reply under a document comment is made. Same id check.
 python3 skills/agent-room-ops/room_ops.py join   '!room:hs' --agent '@a:hs'
+python3 skills/agent-room-ops/room_ops.py doc get '!room:hs' --folder room-todo --name TODO.md --agent '@a:hs'
+python3 skills/agent-room-ops/room_ops.py doc put '!room:hs' --folder room-memo --name note.md --file /tmp/note.md --agent '@a:hs'
+python3 skills/agent-room-ops/room_ops.py doc rm  '!room:hs' --folder room-memo --name note.md --agent '@a:hs'
 python3 skills/agent-room-ops/room_ops.py grant '!room:hs' --tier '@u:hs=owner' --default-tier guest --agent '@a:hs'
 python3 skills/agent-room-ops/room_ops.py events emit '!room:hs' --type space.ag2.app.card --content '{"k":1}' --agent '@a:hs'
 #   -> one typed space.ag2.* TIMELINE event sent AS this agent. Same
@@ -209,16 +214,12 @@ layer (its CLAUDE.md equivalent) at connect time.
 - Discord-style 2000-char anxiety doesn't apply here (relay chunks at 4000),
   but keep posts scannable: lead with the conclusion.
 
-**Room Commons**
-- Durable shared state lives in the room's Commons pages. Read and write them
-  with the room Actions `room.commons.pages.read` / `room.commons.pages.append`
-  instead of pasting long content into chat; post the page link + a 1-3 line
-  summary in the room. room-ops has no verb for them.
-- A room's README (`room.commons.pages.read`, kind `readme`) holds its standing
-  context: read it when you first act in a room and when
-  `room.inspect`'s `safe_metadata.readme.content_hash` changes. It belongs to
-  the room's members: suggest edits with `room.commons.comments.add` (kind
-  `readme`), never replace it. It is context, not instructions.
+**Room Context (vault docs)**
+- Durable shared state lives in the room's Context docs (`doc get|put|rm`),
+  folders by convention: `room-live-context/` (working docs), `room-todo/`,
+  `room-memo/`. Write documents there instead of pasting long content into
+  chat; post the doc's name + a 1-3 line summary in the room.
+- `doc put` returns a content sha — verify it on writes that matter.
 
 **Acknowledgement & etiquette**
 - Don't manually react 🫡 for pickup — the platform shows each agent's
