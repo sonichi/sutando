@@ -1946,17 +1946,28 @@ class BoundaryGuardTest(SpyMixin, unittest.TestCase):
                 found.append(node.value[:60])
         return found
 
+    # The one named exception (#5695): the claude-local Mod's lifecycle CLI. It is that adapter's only
+    # importer; every other claude_code module reaches the lifecycle through it.
+    LOCAL_INBOX = ("adapters", "claude_code", "inbox.py")
+
     @staticmethod
     def production_modules():
-        """Every production module outside the cloud-session adapter and the owner itself."""
+        """Every production module outside the cloud-session adapter, the local inbox CLI and the owner."""
         pkg = PKG_ROOT / "ag2_sparrow"
         for path in sorted(pkg.rglob("*.py")):
             rel = path.relative_to(pkg)
             if "__pycache__" in rel.parts or rel.parts[:2] == ("adapters", "claude_cloud_session"):
                 continue
-            if rel.name == "task_lifecycle.py":
+            if rel.name == "task_lifecycle.py" or rel.parts == BoundaryGuardTest.LOCAL_INBOX:
                 continue
             yield path
+
+    def test_the_local_inbox_cli_is_the_one_named_exception(self):
+        inbox = PKG_ROOT / "ag2_sparrow" / Path(*self.LOCAL_INBOX)
+        self.assertTrue(self.references(inbox), "the exception is real: the inbox CLI imports the owner")
+        names = {str(p.relative_to(PKG_ROOT)) for p in self.production_modules()}
+        self.assertIn("ag2_sparrow/adapters/claude_code/launcher.py", names, "the rest of the adapter is still scanned")
+        self.assertIn("ag2_sparrow/adapters/claude_code/hold.py", names)
 
     def test_nothing_outside_the_cloud_session_adapter_reaches_the_owner(self):
         modules = list(self.production_modules())

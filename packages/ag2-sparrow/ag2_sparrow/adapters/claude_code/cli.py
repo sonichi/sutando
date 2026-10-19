@@ -1,18 +1,14 @@
 #!/usr/bin/env python3
-"""`ag2-sparrow-claude-local`: host a local Claude Code session as an AG2 Space agent.
+"""`ag2-sparrow-claude-local`: host a local Claude Code session, in a tmux pane, as an AG2 Space agent.
 
 One console script per adapter, as the Hatch adapter has, since the adapter-boundary rule forbids a
-shared dispatcher that imports adapters; the lifecycle itself (install, run, verify, uninstall) is
-`connect_common`'s, parametrised by this adapter's Shape.
-
-`install` records the session's paths and the canonical work root in a 0600 config, writes a service
-manager unit (a systemd user unit on Linux, a launchd agent on macOS) whose first line is a marker, has
-the manager start it, and confirms a fresh launcher holds the root. `run` is what the manager runs
-(gated on the marker the unit sets in its environment; by hand it names `debug-run`): it checks the
-CLI version, takes the one-session-per-root lock for its own life, starts `claude -p` in stream-json
-mode with the AG2 Space inbox plugin as its direct child, which arms its inbox watch itself from the
-launcher's env on every start, and holds stdin open so the session lives. The relay token stays in
-Sparrow's own env file, the Claude login stays in its config dir: neither is copied. Stdlib only.
+shared dispatcher that imports adapters; install, verify and uninstall are `connect_common`'s,
+parametrised by this adapter's Shape. `install` records the paths, mints the session id, persists the
+bridge's claude-local HITL store root and the canonical work root in a 0600 config, writes the unit
+or the plist, has the manager start it, and confirms a fresh holder of the root. `run` is the managed
+launcher (`run --launchd` is launchd's entry shim); `hold` is the pane's own command; `inbox` is the
+Mod's lifecycle CLI; `attach` opens the pane; `stop --confirm` is the local confirmation of a stall
+card. The relay token stays in Sparrow's env file, the Claude login in its config dir. Stdlib only.
 """
 from __future__ import annotations
 
@@ -22,29 +18,27 @@ import re
 import shutil
 import subprocess
 import sys
+import uuid
 from pathlib import Path
 
-from ... import _dirs, connect_common as cm
-from ...connect_common import EXIT_CHILD_HELD, EXIT_HELD, EXIT_UNUSABLE, Shape, _v  # noqa: F401
+from ... import _dirs, connect_common as cm, task_io
+from ...connect_common import EXIT_CHILD_HELD, EXIT_HELD, EXIT_UNUSABLE, _v  # noqa: F401
+from ... import claude_local_accepter as accepter, claude_local_card as card, claude_local_records as records
+from . import hold, inbox, launcher
+from .shape import AUTOARM_VAR, HITL_ROOT_NAME, LOCAL, SESSION_NAME  # noqa: F401
 
-LOCAL = Shape(name="claude-local", command="ag2-sparrow-claude-local",
-              description="a Claude Code session as an AG2 Space agent", cli="Claude Code CLI",
-              min_version=(2, 1, 287), version_anchor=r"\(Claude Code\)",
-              version_note="the Mods API it uses arrived there",
-              required_keys=("CLAUDE", "PLUGIN_DIR", "INBOX_DIR", "RESULTS_DIR"),
-              config_keys=("CLAUDE", "PLUGIN_DIR", "INBOX_DIR", "RESULTS_DIR", "CLAUDE_CONFIG_DIR", "HMAC_KEY_FILE",
-                           "HMAC_STRICT", "PERMISSION_MODE"),
-              env_keep=("PATH", "HOME", "USER", "ANTHROPIC_BASE_URL"), kept="the Claude login")
 SHAPE, COMMAND, MIN_CLI = LOCAL.name, LOCAL.command, LOCAL.min_version
 MARKER, PLIST_MARKER, SERVICE_NAME, AGENT_LABEL = LOCAL.marker, LOCAL.plist_marker, LOCAL.service_name, LOCAL.agent_label
-# The marker the plugin reads at session.start: with it, the watch arms itself, no model turn.
-AUTOARM_VAR = "AG2_AUTOARM"
-STREAM_ARGV = ("-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose")
 ENV_KEEP = LOCAL.env_keep
+SESSION_ID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 
 
 def config_path() -> Path:
     return cm.config_path(LOCAL)
+
+
+def config_dir() -> Path:
+    return config_path().parent
 
 
 def service_path() -> Path:
@@ -80,7 +74,15 @@ def read_config(path: Path) -> dict:
 
 
 def load_config() -> "tuple[dict, str]":
-    return cm.load_config(LOCAL)
+    cfg, problem = cm.load_config(LOCAL)
+    if not problem and not SESSION_ID_RE.match(cfg.get("SESSION_ID", "")):
+        return {}, f"{config_path()} carries a malformed SESSION_ID; run {COMMAND} install"
+    return cfg, problem
+
+
+def hitl_store_root() -> Path:
+    """The bridge's claude-local store root, beside its default store under its state dir."""
+    return card.store_root(_dirs.state_dir())
 
 
 def key_problem(path: str) -> str:
@@ -96,11 +98,15 @@ def key_problem(path: str) -> str:
     return ""
 
 
+def mint_session_id() -> str:
+    return str(uuid.uuid4())
+
+
 # ── commands ─────────────────────────────────────────────────────────────────
 
 def install(args) -> int:
     claude = shutil.which(args.claude) or args.claude
-    problem = version_problem(claude)
+    problem = version_problem(claude) or launcher.tmux_problem() or launcher.socket_problem(config_dir())
     if problem:
         print(f"error: {problem}", file=sys.stderr)
         return EXIT_UNUSABLE
@@ -118,75 +124,60 @@ def install(args) -> int:
     if problem:
         print(f"error: {problem}", file=sys.stderr)
         return EXIT_UNUSABLE
-    # The session reads tasks/ and results/ under the held root inode; the paths here are for verify.
-    inbox = Path(root) / "tasks" if args.work else Path(os.path.normpath(os.path.expanduser(args.inbox or _dirs.task_dir())))
-    values = {"CLAUDE": os.path.abspath(claude), "PLUGIN_DIR": str(plugin), "INBOX_DIR": str(inbox),
+    inbox_dir = Path(root) / "tasks" if args.work else Path(os.path.normpath(os.path.expanduser(args.inbox or _dirs.task_dir())))
+    values = {"CLAUDE": os.path.abspath(claude), "PLUGIN_DIR": str(plugin), "INBOX_DIR": str(inbox_dir),
               "RESULTS_DIR": str(Path(root) / "results"),
               "CLAUDE_CONFIG_DIR": str(Path(args.claude_config_dir).expanduser().resolve()) if args.claude_config_dir else "",
               "HMAC_KEY_FILE": key_file, "HMAC_STRICT": "1" if args.hmac_strict else "",
-              "PERMISSION_MODE": args.permission_mode}
-    return cm.install(LOCAL, values, root)
+              "PERMISSION_MODE": args.permission_mode, "SESSION_ID": "", "HITL_STORE": str(hitl_store_root())}
+
+    def revise(old: dict, values: dict) -> dict:
+        """The session id: kept from the old config; minted when there is none; rotated by
+        --new-session only once the old generation is proven gone (the job stopped, the root free
+        and the recorded server dead), else kept, and the command says so."""
+        kept = (old or {}).get("SESSION_ID") or ""
+        if kept and args.new_session:
+            rec = records.load_supervisor(root)
+            gen = rec.get("generation")
+            if gen and task_io.verify_lineage(gen["server_pid"], gen["server_start"]) is not False:
+                print(f"kept the session id {kept}: the old session (tmux server pid {gen['server_pid']}) is not proven gone")
+            else:
+                kept = ""
+                print("rotating the session id: the old generation is proven gone")
+        session_id = kept or mint_session_id()
+        return dict(values, SESSION_ID=session_id)
+    return cm.install(LOCAL, values, root, revise=revise)
 
 
 def child_env(cfg: dict, environ=None) -> dict:
-    """What the session sees: the login's config dir, the inbox, the results, the key; nothing else."""
+    """What `claude auth status` runs under: the allowlist plus the login's config dir."""
     env = cm.child_env_from(ENV_KEEP, environ)
-    env.update({"AG2_INBOX_DIR": cfg["INBOX_DIR"], "AG2_RESULTS_DIR": cfg["RESULTS_DIR"], AUTOARM_VAR: "1"})
-    for key, var in (("CLAUDE_CONFIG_DIR", "CLAUDE_CONFIG_DIR"), ("HMAC_KEY_FILE", "AG2_HMAC_KEY_FILE"),
-                     ("HMAC_STRICT", "AG2_HMAC_STRICT")):
-        if cfg.get(key):
-            env[var] = cfg[key]
+    if cfg.get("CLAUDE_CONFIG_DIR"):
+        env["CLAUDE_CONFIG_DIR"] = cfg["CLAUDE_CONFIG_DIR"]
     return env
 
 
-def session_argv(cfg: dict) -> list:
-    return [cfg["CLAUDE"], "--plugin-dir", cfg["PLUGIN_DIR"], "--permission-mode",
-            cfg.get("PERMISSION_MODE") or "bypassPermissions", *STREAM_ARGV]
-
-
-def run(args, popen=subprocess.Popen, op_lock=None) -> int:
-    """What the manager runs, and only it: refused without the marker the unit sets in its environment
-    (naming debug-run), else the session (`_run_session`)."""
+def run(args, popen=subprocess.Popen) -> int:
+    """What the manager runs, and only it: refused without the marker the unit sets; `--launchd` is
+    the entry shim that runs the launcher as a child and maps its outcome."""
     problem = cm.managed_problem(LOCAL)
     if problem:
         print(f"error: {problem}", file=sys.stderr)
         return EXIT_UNUSABLE
+    if args.launchd:
+        script = cm.console_script(LOCAL)
+        child = [script, "run"] if script else [sys.executable, "-c", "from ag2_sparrow.adapters.claude_code.cli import main; "
+                                                                         "raise SystemExit(main(['run']))"]
+        return launcher.run_launchd(child, popen)
     cfg, problem = load_config()
     if problem:
         print(f"error: {problem}", file=sys.stderr)
         return EXIT_UNUSABLE
-    return _run_session(cfg, popen, op_lock)
-
-
-def _run_session(cfg: dict, popen=subprocess.Popen, op_lock=None) -> int:
-    """The ungated session: the pin checked, then the canonical root's lock taken and recorded for this
-    process's life and the child run as its direct child under the held root (cm.serve). The marker is
-    not in the child's env: `child_env` is an allowlist."""
     problem = version_problem(cfg["CLAUDE"])
     if problem:
         print(f"error: {problem}", file=sys.stderr)
         return EXIT_UNUSABLE
-    return cm.serve(LOCAL, cm.work_root(cfg), session_argv(cfg), child_env(cfg), popen, op_lock=op_lock)
-
-
-def debug_run(args, popen=subprocess.Popen) -> int:
-    """The one human path: under the operation lock from the registered/absent check through the root
-    lock's acquisition, only with no registered job and the root free. No manager owns its tree: a
-    SIGKILLed debug-run leaves its session alive with the root free, yours to stop."""
-    cfg, problem = load_config()
-    if problem:
-        print(f"error: {problem}", file=sys.stderr)
-        return EXIT_UNUSABLE
-    try:
-        with cm.operation_lock(LOCAL) as op:
-            problem = cm.debug_run_problem(LOCAL, cm.work_root(cfg))
-            if problem:
-                print(f"error: {problem}", file=sys.stderr)
-                return EXIT_UNUSABLE
-            return _run_session(cfg, popen, op_lock=op)
-    except cm.Busy as e:
-        print(f"error: {e}", file=sys.stderr)
-        return EXIT_UNUSABLE
+    return launcher.Launcher(cfg, config_dir()).serve()
 
 
 def auth_problem(cfg: dict, run_=subprocess.run) -> str:
@@ -203,6 +194,35 @@ def auth_problem(cfg: dict, run_=subprocess.run) -> str:
     return ""
 
 
+def occupancy_line(root: str) -> str:
+    """The shared tri-state beside the manager's state: held names the fencing process (hold until the
+    consumer attaches, claude after), unobserved never reads free."""
+    occ = task_io.occupancy(root)
+    manager = cm.manager_detail(LOCAL)
+    if occ == "held":
+        rec, consumer = task_io.lock_holder(root), task_io.holder_consumer(root)
+        who = f"claude pid {consumer['pid']}" if consumer and consumer.get("live") else f"hold pid {rec.get('pid')}"
+        return f"held by {who} (manager {manager})"
+    if occ == "unobserved":
+        return f"unobserved (the root's holder or consumer cannot be verified; manager {manager})"
+    return cm.occupancy_line(LOCAL, root)
+
+
+def projection_lines(cfg: dict) -> list:
+    """Pending projection cases: a claude-local card nobody has projected yet, with why."""
+    out = []
+    store_root = Path(cfg.get("HITL_STORE") or "")
+    if not store_root.is_dir():
+        return out
+    store, mgr = card.manager(store_root)
+    for req in card.pending(store):
+        if mgr.needs_projection(req.id):
+            why = "no primary gateway" if not (store_root.parent.parent / "owner-routing.json").exists() \
+                else "gateway predates claude-local"
+            out.append(f"INFO pending projection: {req.id} ({why}); on this machine: {COMMAND} stop --confirm")
+    return out
+
+
 def verify(_args) -> int:
     results: list = []
     cfg, problem = load_config()
@@ -214,6 +234,11 @@ def verify(_args) -> int:
     if not problem:
         problem = auth_problem(cfg)
         cm.check(results, not problem, "login", problem or "claude auth status: logged in")
+    problem = launcher.tmux_problem()
+    cm.check(results, not problem, "tmux", problem or "tmux %s" % ".".join(map(str, launcher.tmux_version() or ())))
+    problem = launcher.socket_problem(config_dir())
+    sock = launcher.socket_path(config_dir())
+    cm.check(results, not problem, "socket", problem or f"{sock} ({len(str(sock).encode())} bytes)")
     plugin = Path(cfg["PLUGIN_DIR"])
     cm.check(results, (plugin / ".claude-plugin" / "plugin.json").is_file(), "plugin", str(plugin))
     for key in ("INBOX_DIR", "RESULTS_DIR"):
@@ -222,20 +247,89 @@ def verify(_args) -> int:
     problem = key_problem(key) if key or strict else ""
     cm.check(results, not problem, "hmac key",
              (f"strict mode: {problem}" if strict else problem) if problem else key or "none (every task reads unsigned)")
+    cm.check(results, cfg.get("HITL_STORE") == str(hitl_store_root()), "hitl store",
+             cfg.get("HITL_STORE") or "none" if cfg.get("HITL_STORE") != str(hitl_store_root())
+             else f"{cfg['HITL_STORE']} (the bridge's, beside its default store)")
     cm.verify_tail(LOCAL, cfg, results)
+    root = cm.work_root(cfg)
+    print(f"INFO session id: {cfg['SESSION_ID']}")
+    print(f"INFO occupancy: {root} {occupancy_line(root)}")
+    rec = records.load_supervisor(root)
+    if rec.get("stall"):
+        print(f"INFO {'needs attention' if rec['stall'].get('reason', '').startswith('abnormal') else 'suspected hang'}: "
+              f"{rec['stall'].get('reason')} (card {(rec.get('hitl') or {}).get('id') or 'not raised'})")
+    if rec.get("fence_uncertain"):
+        print(f"INFO the pane-key guard on {sock} is uncertain: creation is fenced until recovered")
+    for line in projection_lines(cfg):
+        print(line)
+    print(f"INFO attach: {COMMAND} attach")
     return 0 if all(results) else 1
 
 
+def stop_stray(cfg: dict) -> str:
+    """uninstall, after the manager stop: a session the dead launcher left is stopped through the
+    same fenced path (/exit, bounded, kill-session, the server's exit); '' or why not."""
+    rec = records.load_supervisor(cm.work_root(cfg))
+    if not rec.get("generation"):
+        return ""
+    lc = launcher.Launcher(cfg, config_dir())
+    if lc.tm.has_session() is not True:
+        return ""
+    outcome = lc.stop_session(rec, "uninstall")
+    return "" if outcome == "stopped" else f"the session could not be stopped ({outcome})"
+
+
+def _stop_and_unregister(cfg: dict) -> str:
+    problem = stop_stray(cfg)
+    if not problem and cfg.get("HITL_STORE"):
+        card.unregister_install(cfg["HITL_STORE"], card.opaque_install(task_io.install_id(), cm.work_root(cfg)))
+    return problem
+
+
 def uninstall(_args) -> int:
-    return cm.uninstall(LOCAL)
+    return cm.uninstall(LOCAL, before_free=_stop_and_unregister)
+
+
+def attach(_args) -> int:
+    """tmux attach on the adapter's socket: the same session, under the same lock; /exit ends it and
+    the launcher starts the next one by id."""
+    cfg, problem = load_config()
+    if problem:
+        print(f"error: {problem}", file=sys.stderr)
+        return EXIT_UNUSABLE
+    sock = str(launcher.socket_path(config_dir()))
+    tmux = shutil.which("tmux") or "tmux"
+    os.execvp(tmux, [tmux, "-S", sock, "attach", "-t", "=%s" % SESSION_NAME])
+
+
+def stop(args) -> int:
+    """The local confirmation of an open stall card, through the one accepter; the launcher applies it."""
+    if not args.confirm:
+        print("error: stop takes --confirm: it accepts the open stall card's Stop; without a card, attach and "
+              "type /exit", file=sys.stderr)
+        return EXIT_UNUSABLE
+    cfg, problem = load_config()
+    if problem:
+        print(f"error: {problem}", file=sys.stderr)
+        return EXIT_UNUSABLE
+    outcome = accepter.local_stop(_dirs.state_dir(), card.opaque_install(task_io.install_id(), cm.work_root(cfg)))
+    print(outcome)
+    if outcome.startswith("applied"):
+        print("recorded STOPPING; the supervisor stops the session and resumes it by id")
+        return 0
+    return 1
+
+
+def hold_cmd(args) -> int:
+    return hold.main(args)
 
 
 def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(prog=COMMAND, description="A Claude Code session on this machine as an AG2 Space "
-                                 "agent (Mods API, CLI %s+)." % _v(MIN_CLI))
+    ap = argparse.ArgumentParser(prog=COMMAND, description="A Claude Code session in a tmux pane on this machine as "
+                                 "an AG2 Space agent (Mods API, CLI %s+)." % _v(MIN_CLI))
     sub = ap.add_subparsers(dest="cmd", required=True)
-    p = sub.add_parser("install", help="record the paths, write the unit, have the manager start the session "
-                       "(a reinstall stops the old one first)")
+    p = sub.add_parser("install", help="record the paths, mint the session id, write the unit, have the manager "
+                       "start the session (a reinstall stops the old one first)")
     p.add_argument("--plugin-dir", required=True, help="the ag2space-inbox plugin directory from the repo")
     p.add_argument("--work", help="the work root: its tasks/ is the inbox, its results/ the result dir")
     p.add_argument("--inbox", help="Sparrow's task dir, <work>/tasks (default: as ag2-sparrow resolves it); the "
@@ -247,18 +341,34 @@ def main(argv=None) -> int:
     p.add_argument("--permission-mode", default="bypassPermissions",
                    help="the session's --permission-mode; bypassPermissions (default) suits an unattended "
                         "session, a narrower mode makes a prompting tool stall the queue")
+    p.add_argument("--new-session", action="store_true", help="rotate the session id, only once the old session "
+                   "is proven gone (quiescent); else the old id is kept and said so")
     p.add_argument("--claude", default="claude", help="the claude executable (default: claude on PATH)")
     p.set_defaults(func=install)
-    run_help = (f"what the manager runs: one session, armed on every start; refused unless {cm.MANAGED_VAR}=1 is in "
-                "the environment, as the unit sets it (a guard against an accidental hand start, not a security "
-                "boundary; use debug-run by hand)")
-    sub.add_parser("run", help=run_help, description=run_help).set_defaults(func=run)
-    debug_help = ("one session in the foreground; refused while the job is registered or the work root is held. "
-                  "No manager owns its tree: a SIGKILLed debug-run leaves its session alive with the root free, "
-                  "yours to stop")
-    sub.add_parser("debug-run", help=debug_help, description=debug_help).set_defaults(func=debug_run)
+    run_help = (f"what the manager runs: the launcher of one tmux-hosted session; refused unless {cm.MANAGED_VAR}=1 "
+                "is in the environment, as the unit sets it (a guard against an accidental hand start, not a "
+                "security boundary; use attach to look at the session)")
+    r = sub.add_parser("run", help=run_help, description=run_help)
+    r.add_argument("--launchd", action="store_true", help="launchd's entry shim: runs the launcher as a child and "
+                   "maps logical 75 to exit 0, everything else (and a signal death) to non-zero")
+    r.set_defaults(func=run)
+    h = sub.add_parser("hold", help="the pane's own command (started by the launcher, never by hand): takes the "
+                       "root, publishes, gates and attaches the claude child")
+    h.add_argument("--generation", required=True, help="the 32-hex generation nonce")
+    h.add_argument("rest", nargs=argparse.REMAINDER)
+    h.set_defaults(func=hold_cmd)
+    attach_help = ("tmux attach on the adapter's own socket. Limits: it is the same session under the same lock, so "
+                   "what you type is the session's (a /exit ends it and the launcher resumes it by id); /clear and "
+                   "an in-pane /resume are not supported (the Mod stops intake on a session-id change: use "
+                   "/compact or install --new-session); detach with the tmux prefix + d, never kill the server")
+    sub.add_parser("attach", help=attach_help, description=attach_help).set_defaults(func=attach)
+    s = sub.add_parser("stop", help="confirm the open stall card's Stop on this machine (requires --confirm)")
+    s.add_argument("--confirm", action="store_true")
+    s.set_defaults(func=stop)
     sub.add_parser("verify", help="check every part").set_defaults(func=verify)
-    sub.add_parser("uninstall", help="stop the job and remove what install wrote").set_defaults(func=uninstall)
+    sub.add_parser("uninstall", help="stop the job and the session, then remove what install wrote (config "
+                   "last)").set_defaults(func=uninstall)
+    inbox.add_parser(sub)
     args = ap.parse_args(argv)
     return args.func(args)
 

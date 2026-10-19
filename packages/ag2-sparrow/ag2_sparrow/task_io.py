@@ -274,6 +274,50 @@ def release_lock(owner):
         pass
 
 
+# ── the consumer contract (schema 2), reached only through here ──────────────
+
+def occupancy(work):
+    """free | held | unobserved: holder_lock's own tri-state words (lock_held maps unobserved to unknown)."""
+    try:
+        return holder_lock.occupancy(work)
+    except (OSError, holder_lock.LockError):
+        return "unobserved"
+
+
+def holder_record_bytes(owner):
+    """The holder record's bytes as this owner published them, read through the held lock directory:
+    the `expected` of attach_consumer."""
+    fd = os.open(holder_lock.HOLDER_NAME, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=owner.dir_fd)
+    with os.fdopen(fd, "rb") as f:
+        return f.read()
+
+
+def attach_consumer(owner, expected, pid, start):
+    """The holder's compare-and-swap naming the direct child whose liveness fences the root from now on."""
+    return holder_lock.attach_consumer(owner, expected, pid=pid, start=start)
+
+
+def tombstone_consumer(work, expected, by, reason):
+    return holder_lock.tombstone_consumer(work, expected, by=by, reason=reason)
+
+
+def holder_consumer(work):
+    """The record's consumer {pid, start, live} (live: tri-state lineage), else None."""
+    try:
+        state = holder_lock.status(work)
+    except (OSError, holder_lock.LockError):
+        return None
+    record = (state.get("record") or {}).get("record") or {}
+    consumer = record.get("consumer")
+    if not isinstance(consumer, dict):
+        return None
+    return {"pid": consumer.get("pid"), "start": consumer.get("start"), "live": state.get("consumer_lineage")}
+
+
+def start_time(pid):
+    return holder_lock.start_time(pid)
+
+
 _STOP = [0]
 
 

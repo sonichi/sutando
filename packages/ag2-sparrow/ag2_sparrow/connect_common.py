@@ -72,6 +72,13 @@ class Shape:
     config_keys: tuple
     env_keep: tuple
     kept: str
+    # Teardown: KillMode, the outer stop bound, the run argv, launchd's keep-alive on a clean exit
+    # (None: always), and the installer's manager-command bound, which outlasts that stop.
+    kill_mode: str = "control-group"
+    stop_timeout_s: int = STOP_TIMEOUT_S
+    run_args: tuple = ("run",)
+    keep_alive_on_success: "bool | None" = None
+    manager_timeout_s: int = RUN_TIMEOUT_S
 
     @property
     def marker(self) -> str:
@@ -314,13 +321,14 @@ def console_script(shape: Shape) -> str:
 
 
 def render_service(shape: Shape, exec_start: str) -> str:
-    """The manager owns the tree: KillMode=control-group tears the whole cgroup down on stop and after
-    the launcher's death before any restart (SIGTERM, then SIGKILL at TimeoutStopSec)."""
+    """KillMode=control-group tears the whole cgroup down on stop; KillMode=process signals only the
+    launcher and leaves a tmux-hosted session for the launcher's own stop path (then SIGKILL at
+    TimeoutStopSec)."""
     return (f"{shape.marker}\n[Unit]\nDescription=ag2-sparrow {shape.name} ({shape.description})\n"
             "# A session that dies 5 times in 5 minutes (e.g. a bad login) is left failed.\n"
             "StartLimitIntervalSec=300\nStartLimitBurst=5\n\n"
             f"[Service]\nExecStart={exec_start} run\nEnvironment={MANAGED_VAR}=1\nRestart=always\nRestartSec=10\n"
-            f"KillMode=control-group\nTimeoutStopSec={STOP_TIMEOUT_S}\n"
+            f"KillMode={shape.kill_mode}\nTimeoutStopSec={shape.stop_timeout_s}\n"
             f"# {EXIT_HELD}: another session already serves this work root; do not relaunch over it.\n"
             f"RestartPreventExitStatus={EXIT_HELD}\n\n[Install]\nWantedBy=default.target\n")
 
@@ -328,9 +336,10 @@ def render_service(shape: Shape, exec_start: str) -> str:
 def render_plist(shape: Shape, exec_start: str, path_env: str, log: str) -> str:
     """AbandonProcessGroup=false: when the launcher dies launchd SIGTERMs the rest of its process group
     once (never SIGKILL), then respawns after ThrottleInterval; ExitTimeOut bounds a bootout."""
-    body = {"Label": shape.agent_label, "ProgramArguments": [exec_start, "run"], "RunAtLoad": True,
-            "KeepAlive": True, "ThrottleInterval": THROTTLE_S, "AbandonProcessGroup": False,
-            "ExitTimeOut": STOP_TIMEOUT_S, "EnvironmentVariables": {"PATH": path_env, MANAGED_VAR: "1"},
+    keep_alive = True if shape.keep_alive_on_success is None else {"SuccessfulExit": shape.keep_alive_on_success}
+    body = {"Label": shape.agent_label, "ProgramArguments": [exec_start, *shape.run_args], "RunAtLoad": True,
+            "KeepAlive": keep_alive, "ThrottleInterval": THROTTLE_S, "AbandonProcessGroup": False,
+            "ExitTimeOut": shape.stop_timeout_s, "EnvironmentVariables": {"PATH": path_env, MANAGED_VAR: "1"},
             "StandardOutPath": log, "StandardErrorPath": log}
     text = plistlib.dumps(body, sort_keys=True).decode("utf-8")
     head, rest = text.split("\n", 1)
@@ -350,10 +359,10 @@ def render_supervisor(shape: Shape) -> "tuple[str, str]":
 
 # ── the manager: explicit outputs only ───────────────────────────────────────
 
-def _run(cmd: list) -> "subprocess.CompletedProcess | None":
+def _run(cmd: list, timeout: float = RUN_TIMEOUT_S) -> "subprocess.CompletedProcess | None":
     """A manager command; None when it could not run or did not return in time. Never prompts."""
     try:
-        return subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=RUN_TIMEOUT_S)
+        return subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout)
     except (OSError, subprocess.SubprocessError):
         return None
 
@@ -377,8 +386,8 @@ def _launchd_target() -> str:
     return f"gui/{os.getuid()}"
 
 
-def _systemctl(*args) -> "subprocess.CompletedProcess | None":
-    return _run(["systemctl", "--user", "--no-ask-password", *args])
+def _systemctl(*args, timeout: float = RUN_TIMEOUT_S) -> "subprocess.CompletedProcess | None":
+    return _run(["systemctl", "--user", "--no-ask-password", *args], timeout)
 
 
 def unit_state(shape: Shape) -> dict:
@@ -464,12 +473,12 @@ def start_supervisor(shape: Shape) -> str:
     path = supervisor_path(shape)
     if is_macos():
         log_path(shape).parent.mkdir(parents=True, exist_ok=True)
-        r = _run(["launchctl", "bootstrap", _launchd_target(), str(path)])
+        r = _run(["launchctl", "bootstrap", _launchd_target(), str(path)], shape.manager_timeout_s)
         return "" if _ok(r) else f"launchctl bootstrap failed ({_why(r)})"
     if not _ok(_systemctl("show-environment")):
         return "systemctl --user is not available here"
     for verb in (("daemon-reload",), ("enable", shape.service_name), ("restart", shape.service_name)):
-        r = _systemctl(*verb)
+        r = _systemctl(*verb, timeout=shape.manager_timeout_s)
         if not _ok(r):
             return f"systemctl --user {' '.join(verb)} failed ({_why(r)})"
     return ""
@@ -480,7 +489,7 @@ def stop_supervisor(shape: Shape) -> str:
     systemd: stop + disable) and require its own word for it: '' once launchd reports it absent or
     systemd reports it inactive and disabled, else why not."""
     if is_macos():
-        r = _run(["launchctl", "bootout", "--wait", launchd_service(shape)])
+        r = _run(["launchctl", "bootout", "--wait", launchd_service(shape)], shape.manager_timeout_s)
         if r is None:
             return f"the stop command for {job_name(shape)} could not run"
         state = manager_state(shape)
@@ -488,7 +497,7 @@ def stop_supervisor(shape: Shape) -> str:
             return ""
         return (f"{job_name(shape)} is still active after the stop ({_why(r)})" if state == "active" else
                 f"{job_name(shape)}'s state after the stop is unknown ({_why(r)})")
-    r = _systemctl("stop", shape.service_name)
+    r = _systemctl("stop", shape.service_name, timeout=shape.manager_timeout_s)
     if r is None:
         return f"the stop command for {job_name(shape)} could not run"
     _systemctl("disable", shape.service_name)
@@ -623,15 +632,17 @@ def _fresh_holder(shape: Shape, root: str, before: dict) -> "dict | None":
 
 # ── install ──────────────────────────────────────────────────────────────────
 
-def install(shape: Shape, values: dict, root: str) -> int:
+def install(shape: Shape, values: dict, root: str, revise=None) -> int:
+    """`revise(old_config, values) -> values` runs once the job is stopped and the root proven free,
+    so a value that may only change over a quiescent root (a session id) is decided there."""
     try:
         with operation_lock(shape):
-            return _install_locked(shape, values, root)
+            return _install_locked(shape, values, root, revise)
     except Busy as e:
         return _refuse(str(e))
 
 
-def _install_locked(shape: Shape, values: dict, root: str) -> int:
+def _install_locked(shape: Shape, values: dict, root: str, revise=None) -> int:
     """A quiescent replacement: both files owned, the same root as before, no orphan on it, the job
     stopped and absent, the root free; only then the files, the start, and the fresh holder."""
     conf, sup, marker = config_path(shape), supervisor_path(shape), supervisor_marker(shape)
@@ -665,6 +676,8 @@ def _install_locked(shape: Shape, values: dict, root: str) -> int:
     problem = _await_free(root)
     if problem:
         return _refuse(f"{problem} after the stop; nothing was applied")
+    if revise is not None:
+        values = revise(old, values)
     for key in ("INBOX_DIR", "RESULTS_DIR"):
         Path(values[key]).mkdir(parents=True, exist_ok=True)
     _write(conf, render_config(shape, dict(values, ROOT=root)), 0o600)
@@ -944,21 +957,26 @@ def verify_tail(shape: Shape, cfg: dict, results: list) -> None:
     print(f"INFO job: {job_name(shape)} {manager_state(shape)}")
     print(f"INFO session: {work_root(cfg)} {occupancy_line(shape, work_root(cfg))}")
     if not is_macos():
-        print("INFO systemd ordering is asserted from KillMode=control-group and not witnessed")
-    else:
+        print(f"INFO systemd ordering is asserted from KillMode={shape.kill_mode} and not witnessed")
+    elif shape.kill_mode == "control-group":
         print("INFO launchd SIGTERMs the group once after a launcher death and respawns after "
               f"{THROTTLE_S} s; a session that ignores SIGTERM overlaps the new one (bootout, then stop the stray)")
+    else:
+        print(f"INFO launchd respawns the launcher after {THROTTLE_S} s; the session in its tmux pane is not in "
+              "the launcher's process group and survives a launcher death until the next launcher adopts it")
 
 
-def uninstall(shape: Shape) -> int:
+def uninstall(shape: Shape, before_free=None) -> int:
+    """`before_free(config) -> problem` runs after the manager stop and before the root must read free:
+    a shape whose session outlives its launcher stops it there."""
     try:
         with operation_lock(shape):
-            return _uninstall_locked(shape)
+            return _uninstall_locked(shape, before_free)
     except Busy as e:
         return _refuse(str(e))
 
 
-def _uninstall_locked(shape: Shape) -> int:
+def _uninstall_locked(shape: Shape, before_free=None) -> int:
     """any -> absent, config last: stop through the manager, its explicit absent (systemd: inactive and
     disabled), the lock free, the marked unit removed, systemd reloaded with LoadState=not-found, then the
     config. Any unknown or failure keeps the config, so a rerun still knows the root; every step re-runs."""
@@ -985,6 +1003,10 @@ def _uninstall_locked(shape: Shape) -> int:
         if problem:
             return _refuse(f"{problem}; {kept}", recovery)
         print(f"stopped: {job_name(shape)}")
+    if root and before_free is not None:
+        problem = before_free(cfg)
+        if problem:
+            return _refuse(f"{problem}; {kept}", recovery)
     if root:
         problem = _await_free(root)
         if problem:

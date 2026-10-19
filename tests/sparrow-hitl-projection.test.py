@@ -131,14 +131,25 @@ class ProjectHitl(unittest.TestCase):
         self.assertEqual(self.calls, [])
 
     def test_an_absent_hitl_package_is_an_optional_tier_not_a_failure(self):
-        """Standalone sparrow has no monorepo `src/hitl`; the pulse must carry
+        """With neither the vendored `ag2_sparrow.hitl` nor the monorepo `src/hitl`, the pulse carries
         on without it rather than raising into the outbound worker."""
+        self._requirement()
+        saved = B._hitl_modules
+        B._hitl_modules = lambda: None
+        try:
+            self.assertEqual(B._project_hitl(log=lambda *a: None), 0)
+            self.assertEqual(self.calls, [])
+        finally:
+            B._hitl_modules = saved
+
+    def test_a_standalone_install_projects_through_the_vendored_hitl(self):
+        """#5695 v3.6 §2: no monorepo `src/hitl`, and the wheel's own copy still projects the card."""
         self._requirement()
         saved = B._monorepo_src
         B._monorepo_src = lambda marker: ""
         try:
-            self.assertEqual(B._project_hitl(log=lambda *a: None), 0)
-            self.assertEqual(self.calls, [])
+            self.assertEqual(B._project_hitl(log=lambda *a: None), 1)
+            self.assertEqual(len(self.calls), 1)
         finally:
             B._monorepo_src = saved
 

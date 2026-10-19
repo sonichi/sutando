@@ -201,6 +201,53 @@ class ScratchServer(unittest.TestCase):
                          "blocked until recovery")
         self.assertIs(vp.has_session(self.sock, "t"), False, "and the probe reads the server gone")
 
+    def test_a_respawned_pane_with_a_reused_pid_and_the_same_command_refuses_on_the_title(self):
+        """K4-b: each start of the pane's command sets a fresh title token; a respawn keeps the start
+        command and the nonce, so a predicate whose pid term happens to match (a reused pid) still
+        refuses on the recorded title."""
+        titled = Path(self.dir) / "titled"
+        titled.write_text("#!/bin/sh\nprintf '\\033]2;t%s\\007' \"$(od -An -N8 -tx1 /dev/urandom | tr -d ' \\n')\"\nexec cat\n")
+        titled.chmod(0o755)
+        command = "%s --generation=%s --" % (titled, NONCE)
+        subprocess.run(["tmux", "-S", self.sock, "new-session", "-d", "-s", "r", "-x", "80", "-y", "20", command], check=True)
+
+        def fields():
+            return subprocess.run(["tmux", "-S", self.sock, "display-message", "-p", "-t", "r:0",
+                                   "#{pane_pid} #{session_id} #{session_created} #{pane_title}"],
+                                  capture_output=True, text=True, check=True).stdout.split()
+
+        def holds(pred):
+            return subprocess.run(["tmux", "-S", self.sock, "display-message", "-p", "-t", "r:0", pred],
+                                  capture_output=True, text=True, check=True).stdout.strip()
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and not fields()[3].startswith("t"):
+            time.sleep(0.05)
+        pid, sid, created, title = fields()
+        self.assertEqual(holds(vk.predicate(NONCE, int(pid), sid, int(created), title)), "1", "the live generation")
+        subprocess.run(["tmux", "-S", self.sock, "respawn-pane", "-k", "-t", "r:0"], check=True)
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and fields()[3] == title:
+            time.sleep(0.05)
+        pid2, _, _, title2 = fields()
+        self.assertNotEqual((pid2, title2), (pid, title), "the respawn ran the command again")
+        self.assertEqual(holds("#{m:*--generation=%s --*,#{pane_start_command}}" % NONCE), "1",
+                         "the respawn keeps the start command and the nonce")
+        self.assertEqual(holds(vk.predicate(NONCE, int(pid2), sid, int(created))), "1",
+                         "without the title term a reused pid would pass")
+        self.assertEqual(holds(vk.predicate(NONCE, int(pid2), sid, int(created), title)), "0",
+                         "the recorded title refuses the respawned process")
+
+    def test_the_old_trailing_space_form_fails_on_a_command_that_ends_with_the_nonce(self):
+        """K4-a, measured: `--generation=<hex> --` with the `--*` glob matches the exact pane command;
+        the v3.13 `--generation <hex> *` form never matches a command ending in the nonce."""
+        ends = "%s --generation %s" % (Path(self.dir) / "hold", NONCE)
+        subprocess.run(["tmux", "-S", self.sock, "new-session", "-d", "-s", "e", "-x", "80", "-y", "20", ends], check=True)
+        out = subprocess.run(["tmux", "-S", self.sock, "display-message", "-p", "-t", "e:0",
+                              "#{m:*--generation %s *,#{pane_start_command}}" % NONCE], capture_output=True, text=True)
+        self.assertEqual(out.stdout.strip(), "0", "the trailing-space glob misses a command that ends with the nonce")
+        self.assertEqual(self.show("#{m:*--generation=%s --*,#{pane_start_command}}" % NONCE), "1",
+                         "the delimited form matches the exact pane command")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1309,6 +1309,9 @@ def _handle_hitl_action(task: dict):
     # click form, or a review decision); its form must not be re-derived.
     if task_id and _control_result_path(task_id).is_file():
         return "redelivered"
+    local = _handle_claude_local(task)
+    if local:
+        return local
     if not isinstance(task.get("hitl_action"), dict) and not task.get("reply_to_event"):
         return False
     owner = os.environ.get("SPARROW_HA_OWNER") or ""
@@ -1647,6 +1650,51 @@ def _hitl_backoff_reset() -> None:
     _HITL_BACKOFF["until"] = 0.0
 
 
+def _hitl_modules():
+    """(manager, projector, replies) modules: the wheel's own `ag2_sparrow.hitl` first, the monorepo
+    `src/hitl` only when the vendored copy is absent, so a standalone install has them."""
+    try:
+        from .hitl import manager, projector, replies
+        return manager, projector, replies
+    except ImportError:
+        src = _monorepo_src(os.path.join("hitl", "projector.py"))
+        if not src:
+            return None
+        if src not in sys.path:
+            sys.path.insert(0, src)
+        from hitl import manager, projector, replies
+        return manager, projector, replies
+
+
+def _claude_local_store_root() -> Path:
+    """The claude-local cards' own store root beside the default store: what an unmodified gateway
+    never reads, so old main neither projects nor accepts them."""
+    from .claude_local_card import store_root
+    return store_root(_STATE)
+
+
+def _project_claude_local(mods, room: str, log=print) -> list:
+    """Project the claude-local root's cards into the owner DM (the room filled on the
+    requirement under the store lock when the launcher could not know it)."""
+    manager_mod, projector, _ = mods
+    root = _claude_local_store_root()
+    if not root.is_dir():
+        return []
+    store = manager_mod.HitlStore(root)
+    manager = manager_mod.HitlManager(store, policy=None)
+    with store.locked():
+        for req in store.all():
+            if not req.room and not req.terminal:
+                req.room = room
+                sub = req.subject.get("claude-local") if isinstance(req.subject, dict) else None
+                if isinstance(sub, dict) and not sub.get("room"):
+                    sub["room"] = room
+                store.save(req, store.projection(req.id))
+    if not projector.pending_ids(manager):
+        return []
+    return projector.project(manager, lambda payload: _req("POST", "/v1/room", payload, timeout=20), room)
+
+
 def _project_hitl(log=print) -> int:
     """Push every un-projected HITL requirement out as a card, or 0 when
     `src/hitl` is absent (standalone sparrow) — same optional tier as the
@@ -1665,29 +1713,30 @@ def _project_hitl(log=print) -> int:
     if time.monotonic() < _HITL_BACKOFF["until"]:
         return 0
     try:
-        src = _monorepo_src(os.path.join("hitl", "projector.py"))
-        if not src:
+        mods = _hitl_modules()
+        if mods is None:
             return 0
-        if src not in sys.path:
-            sys.path.insert(0, src)
-        from hitl.manager import HitlManager, HitlStore, default_store
-        from hitl.projector import pending_ids, project
+        manager_mod, projector, _ = mods
+        HitlManager, HitlStore, default_store = manager_mod.HitlManager, manager_mod.HitlStore, manager_mod.default_store
+        pending_ids, project = projector.pending_ids, projector.project
     except Exception as e:  # noqa: BLE001 — an optional tier never breaks the pulse
         log(f"hitl: projector unavailable ({e}); cards will not be delivered")
         return 0
     workspace = _STATE.parent
     manager = HitlManager(HitlStore(default_store(workspace)))
-    if not pending_ids(manager):
-        _hitl_backoff_reset()  # idle is not failure; a new card must not wait out a backoff
-        return 0
+    done = []
     try:
-        done = project(manager, lambda payload: _req("POST", "/v1/room", payload, timeout=20),
-                       room)
+        if pending_ids(manager):
+            done = project(manager, lambda payload: _req("POST", "/v1/room", payload, timeout=20), room)
+            if not done:
+                _hitl_backoff_bump(log)
+                return 0
+        done += _project_claude_local(mods, room, log)
     except Exception:
         _hitl_backoff_bump(log)  # a raising sender is a refusal too
         raise
     if not done:
-        _hitl_backoff_bump(log)
+        _hitl_backoff_reset()  # idle is not failure; a new card must not wait out a backoff
         return 0
     _hitl_backoff_reset()
     for req_id, event_id in done:
@@ -1696,22 +1745,136 @@ def _project_hitl(log=print) -> int:
 
 
 def _hitl_reply_handler(owner_mxid: str, log=print):
-    """Owner card-click handler for HITL cards, or None when `src/hitl` is not
-    around (standalone sparrow) — the chain then simply lacks it, like the vault tier."""
+    """Owner card-click handler for HITL cards, or None when neither the vendored `ag2_sparrow.hitl`
+    nor `src/hitl` is around — the chain then simply lacks it, like the vault tier."""
     try:
-        src = _monorepo_src(os.path.join("hitl", "replies.py"))
-        if not src:
+        mods = _hitl_modules()
+        if mods is None:
             return None
-        if src not in sys.path:
-            sys.path.insert(0, src)
-        from hitl.manager import HitlManager, HitlStore, default_store
-        from hitl.replies import HitlReplyHandler
+        manager_mod, _, replies = mods
         workspace = _STATE.parent
-        return HitlReplyHandler(HitlManager(HitlStore(default_store(workspace))), owner_mxid,
-                                workspace=workspace, log=log)
+        return replies.HitlReplyHandler(manager_mod.HitlManager(manager_mod.HitlStore(manager_mod.default_store(workspace))),
+                                        owner_mxid, workspace=workspace, log=log)
     except Exception as e:  # noqa: BLE001 — an optional handler must never break the chain
         log(f"hitl: reply handler unavailable ({e}); card clicks will not be applied")
         return None
+
+
+CLAUDE_LOCAL_ID_PREFIX = "hitl_cl_"
+_EXIT_TEXT = "/exit"
+
+
+def _claude_local_accepter():
+    """The bridge-owned claude-local accepter; (None, why) when it cannot be imported."""
+    try:
+        from . import claude_local_accepter as accepter
+    except ImportError as e:  # part of this package; a missing piece is a packaging fault
+        return None, f"claude-local accepter unavailable ({e})"
+    return accepter, ""
+
+
+def _owner_dm_text(task: dict) -> bool:
+    """The owner's own top-level, unquoted, unforwarded, unrelayed message in the projected owner DM."""
+    owner = os.environ.get("SPARROW_HA_OWNER") or ""
+    uid = str(task.get("user_id") or "")
+    if not owner or uid != owner:
+        return False
+    if _tier_for(uid, _normalized_tier(task.get("access_tier"))) != "owner":
+        return False
+    room = str(task.get("channel_id") or "")
+    if not room or room != resolve_destination(OWNER_PRIVATE):
+        return False
+    if task.get("reply_to_event") or task.get("thread_root") or task.get("interaction_type") in ("forward", "forwarded"):
+        return False
+    text = str(task.get("task") or "")
+    stripped = text.strip()
+    return bool(stripped) and local_task_protocol.reply_action_text(text) == stripped and not stripped.startswith("[")
+
+
+def _handle_claude_local(task: dict):
+    """A click on a claude-local card (id namespaced hitl_cl_) or the owner's bare `/exit` in the owner
+    DM: both go to the adapter's one accepter; the outcome closes the task [no-send]. False = not ours."""
+    payload = task.get("hitl_action")
+    reply = None
+    if isinstance(payload, dict) and str(payload.get("hitl_id") or "").startswith(CLAUDE_LOCAL_ID_PREFIX):
+        accepter, problem = _claude_local_accepter()
+        if accepter is None:
+            return "rejected:" + problem
+        from .hitl.schema import ActionReply, MalformedActionError
+        try:
+            reply = ActionReply.from_wire(dict(payload, room=task.get("channel_id") or "", sender=task.get("user_id") or ""))
+        except MalformedActionError as e:
+            return f"rejected:{e}"
+    elif str(task.get("task") or "").strip() == _EXIT_TEXT and _owner_dm_text(task):
+        accepter, _ = _claude_local_accepter()
+        if accepter is None or not _claude_local_store_root().is_dir():
+            return False  # no claude-local card store here: the text stays a message
+        store = accepter.card.HitlStore(_claude_local_store_root())
+        reply = accepter.exit_text_reply(store, str(task.get("channel_id") or ""), str(task.get("user_id") or ""))
+        if reply == 0:
+            return False  # no open card: a bare /exit is an ordinary message
+        if isinstance(reply, int):
+            return f"rejected:{reply} stop cards are open; use the card's own button"
+    else:
+        return False
+    owner = os.environ.get("SPARROW_HA_OWNER") or ""
+    uid = str(task.get("user_id") or "")
+    owner_ok = bool(owner) and uid == owner and _tier_for(uid, _normalized_tier(task.get("access_tier"))) == "owner"
+    try:
+        out = accepter.accept(reply, state_dir=_STATE, owner_ok=owner_ok, log=_log)
+    except Exception as e:  # noqa: BLE001 — a broken click must not stall the poll loop
+        return f"rejected:{e}"
+    return out
+
+
+def _hitl_control_body(hitl_out) -> str:
+    """The control result closing a consumed click: a refusal or cancellation is the owner's to hear;
+    applied and commit-unknown (consumed, reconciled by the launcher) send nothing."""
+    out = str(hitl_out)
+    if out.startswith("rejected:"):
+        return f"That click did not apply: the card had already moved ({out[9:]}). Please use the current card."
+    if out.startswith("cancelled:"):
+        return f"Cancelled: {out[10:]}"
+    return "[no-send]"
+
+
+class _ClaudeLocalClicks:
+    """An event-channel click on a claude-local card, claimed ahead of the default store's handler so
+    it reaches the adapter's accepter and never the default store or taskify."""
+
+    def __init__(self, owner: str, log=print):
+        self.owner, self.log, self.last_path, self.last_outcome = owner, log, None, None
+
+    @staticmethod
+    def _payload(event: dict):
+        content = event.get("content") or {}
+        payload = content.get("space.ag2.hitl.action")
+        return payload if isinstance(payload, dict) else None
+
+    def claims(self, event: dict) -> bool:
+        payload = self._payload(event)
+        return (event.get("type") == "message.created" and payload is not None
+                and str(payload.get("hitl_id") or "").startswith(CLAUDE_LOCAL_ID_PREFIX))
+
+    def offer(self, event: dict) -> list:
+        eid = str(event.get("event_id") or "")
+        actor = str(event.get("actor_id") or "")
+        accepter, problem = _claude_local_accepter()
+        if accepter is None:
+            self.last_outcome = "rejected:" + problem
+        else:
+            from .hitl.schema import ActionReply, MalformedActionError
+            try:
+                reply = ActionReply.from_wire(dict(self._payload(event), room=str(event.get("room_id") or ""),
+                                                   sender=actor))
+                self.last_outcome = accepter.accept(reply, state_dir=_STATE,
+                                                    owner_ok=bool(self.owner) and actor == self.owner, log=self.log)
+            except MalformedActionError as e:
+                self.last_outcome = f"rejected:{e}"
+            except Exception as e:  # noqa: BLE001 — a broken click must not stall the drain
+                self.last_outcome = f"rejected:{e}"
+        self.log(f"hitl: claude-local click {eid or '?'} by {actor or '?'}: {self.last_outcome}")
+        return [eid] if eid else []
 
 
 def _vault_intercept_fns():
@@ -7150,7 +7313,7 @@ def _maybe_start_event_channel() -> None:
             from .human_action import ActionStore, CardPoster, DecisionHandler, HandlerChain
             store = ActionStore(str(_STATE / "human-actions"))
             # HITL card clicks ride the same owner-only chain, ahead of taskify.
-            claimants = [DecisionHandler(store, ha_owner, log=_log)]
+            claimants = [DecisionHandler(store, ha_owner, log=_log), _ClaudeLocalClicks(ha_owner, log=_log)]
             hitl = _hitl_reply_handler(ha_owner, log=_log)
             if hitl is not None:
                 claimants.append(hitl)
@@ -7290,10 +7453,7 @@ def main() -> None:
                     continue
                 hitl_out = _handle_hitl_action(task)
                 if hitl_out:
-                    body = "[no-send]"
-                    if str(hitl_out).startswith("rejected:"):
-                        body = ("That click did not apply: the card had already moved "
-                                f"({str(hitl_out)[9:]}). Please use the current card.")
+                    body = _hitl_control_body(hitl_out)
                     _queue_review_control_result(task, body=body)
                     _retry_review_control_results()
                     _log(f"hitl: consumed card click {task.get('id')} from the task relay ({hitl_out})")

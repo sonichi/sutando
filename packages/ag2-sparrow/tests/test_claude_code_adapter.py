@@ -217,8 +217,11 @@ class Measure(unittest.TestCase):
 
 # ── `ag2-sparrow-claude-local`: the installed local shape ─────────────
 
-from ag2_sparrow import _dirs, connect_common as cm, holder_lock  # noqa: E402
-from ag2_sparrow.adapters.claude_code import cli  # noqa: E402
+from ag2_sparrow import _dirs, connect_common as cm, holder_lock, tmux_pane_keys  # noqa: E402
+from ag2_sparrow import claude_local_accepter as accepter, claude_local_card as card, claude_local_records as records  # noqa: E402
+
+from ag2_sparrow.adapters.claude_code import cli, detector, hold as hold_mod, inbox, launcher  # noqa: E402
+from ag2_sparrow.hitl.schema import ActionReply, STATUS_IN_PROGRESS, STATUS_PENDING, STATUS_RESOLVED  # noqa: E402
 
 # Susan's nit: the fake is a #!/bin/sh wrapper that execs the quoted interpreter on the body beside
 # it, so an interpreter path containing a space works where a shebang could not carry it.
@@ -246,12 +249,22 @@ except OSError as e:
     listing = ["ERROR %s" % e]
 # PWD, SHLVL, OLDPWD and _ are the sh wrapper's own, never the launcher's.
 env = {k: v for k, v in os.environ.items() if k not in ("PWD", "SHLVL", "OLDPWD", "_")}
+import stat as _stat
+fifos = []
+for name in os.listdir("/dev/fd"):
+    try:
+        if _stat.S_ISFIFO(os.fstat(int(name)).st_mode):
+            fifos.append(int(name))
+    except OSError:
+        pass
 json.dump({"argv": sys.argv, "env": env, "cwd": os.getcwd(), "pid": os.getpid(), "ppid": os.getppid(),
-           "listing": listing},
+           "listing": listing, "fifos": fifos},
           open(os.path.join(home, "claude-session.json"), "w"))
 import signal, time
 if read("claude-ignore-term", ""):
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
+if read("claude-ignore-hup", ""):
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
 if read("claude-signal-parent", ""):
     os.kill(os.getppid(), getattr(signal, "SIG" + read("claude-signal-parent", "")))
 time.sleep(float(read("claude-linger", "0")))
@@ -269,7 +282,18 @@ def write_fake_claude(path, py=sys.executable):
 
 
 TOKEN = "tok-FAKE-RELAY-TOKEN-never-copied"
+NONCE = "0123456789abcdef0123456789abcdef"
+HOLD_DRIVER = ("import sys, os, time; sys.path.insert(0, %r)\n"
+               "from ag2_sparrow.adapters.claude_code import cli, hold\nfrom ag2_sparrow import task_io\n%s"
+               "sys.exit(cli.main(['hold', '--generation', %r, '--']))")
+# A consumer stand-in for the inbox CLI: the root held, a sleep child attached as the consumer.
+CONSUMER_HOLDER = ("import sys, subprocess; sys.path.insert(0, %r); from ag2_sparrow import task_io\n"
+                   "o = task_io.acquire_lock(%r, 'claude-local'); c = subprocess.Popen(['sleep', '300'])\n"
+                   "task_io.attach_consumer(o, task_io.holder_record_bytes(o), c.pid, task_io.start_time(c.pid))\n"
+                   "print('held', c.pid, flush=True); sys.stdin.read(); c.kill(); c.wait(); task_io.release_lock(o)")
+SESSION_ID = "0f3c5a9e-5b1d-4c2e-9a7b-1234567890ab"
 L = cli.LOCAL
+REAL_SOCKET_PROBLEM, REAL_TMUX_VERSION = launcher.socket_problem, launcher.tmux_version   # ConnectBase patches both
 STAND_IN = ("import sys; sys.path.insert(0, %r); from ag2_sparrow import holder_lock, task_io\n"
             "install = %r\n"
             "if install: holder_lock.install_id = lambda: install\n"
@@ -421,7 +445,7 @@ class Runner:
             return (0, "".join(words[k] + "\n" for k in props), "")
         return self.default
 
-    def __call__(self, cmd):
+    def __call__(self, cmd, timeout=30):
         self.calls.append(list(cmd))
         verb = self.verb(cmd)
         got = self.table[(cmd[0], verb)] if (cmd[0], verb) in self.table else self.answer(verb, cmd)
@@ -473,8 +497,10 @@ class FakeClaudeWrapper(unittest.TestCase):
 
 
 class ConnectBase(unittest.TestCase):
+    home_dir = None     # a suite that starts a scratch tmux server puts HOME under /tmp: a short socket path
+
     def setUp(self):
-        self.home = Path(tempfile.mkdtemp()).resolve()   # macOS: /var is /private/var once resolved
+        self.home = Path(tempfile.mkdtemp(prefix="cl", dir=self.home_dir)).resolve()   # macOS: /var is /private/var
         self.addCleanup(shutil.rmtree, self.home, ignore_errors=True)
         self.bin = self.home / "bin"
         self.bin.mkdir()
@@ -504,10 +530,12 @@ class ConnectBase(unittest.TestCase):
             os.environ.pop(key, None)
         # No test reaches the host's systemctl, loginctl or launchctl; the bounds are 2 s and 1 s, not 30.
         self.calls = []
-        self.patches = [mock.patch.object(cm, "_run", side_effect=lambda cmd: self.calls.append(cmd)),
+        self.patches = [mock.patch.object(cm, "_run", side_effect=lambda cmd, timeout=30: self.calls.append(cmd)),
                         mock.patch.object(cm, "is_macos", return_value=False),
                         mock.patch.object(cm, "console_script", return_value=str(self.bin / cli.COMMAND)),
-                        mock.patch.object(cm, "CONFIRM_TIMEOUT_S", 2.0), mock.patch.object(cm, "OP_WAIT_S", 1.0)]
+                        mock.patch.object(cm, "CONFIRM_TIMEOUT_S", 2.0), mock.patch.object(cm, "OP_WAIT_S", 1.0),
+                        mock.patch.object(launcher, "tmux_version", return_value=(3, 6)),
+                        mock.patch.object(launcher, "socket_problem", return_value="")]
         for p in self.patches:
             p.start()
             self.addCleanup(p.stop)
@@ -545,7 +573,7 @@ class ConnectBase(unittest.TestCase):
         v = {"CLAUDE": str(self.claude), "PLUGIN_DIR": str(self.plugin), "INBOX_DIR": str(self.inbox),
              "RESULTS_DIR": str(self.results), "CLAUDE_CONFIG_DIR": str(self.home / ".claude-sutando"),
              "HMAC_KEY_FILE": str(self.home / "task-hmac.key"), "HMAC_STRICT": "", "PERMISSION_MODE": "bypassPermissions",
-             "ROOT": str(self.work)}
+             "SESSION_ID": SESSION_ID, "HITL_STORE": str(cli.hitl_store_root()), "ROOT": str(self.work)}
         v.update(over)
         return v
 
@@ -560,6 +588,25 @@ class ConnectBase(unittest.TestCase):
         p = self.home / "claude-session.json"
         return json.loads(p.read_text()) if p.exists() else None
 
+    def hold_env(self, root=None, **extra):
+        env = dict(os.environ, PYTHONPATH=str(PKG))
+        env.update({hold_mod.ENV_ROOT: root or str(self.work), hold_mod.ENV_CONFIG_DIR: str(cli.config_dir()),
+                    hold_mod.ENV_SESSION_ID: SESSION_ID, hold_mod.ENV_HITL_STORE: str(cli.hitl_store_root())})
+        env.update(extra)
+        return env
+
+    def hold_proc(self, root=None, patch="", linger=None, **extra):
+        """`hold` in a child process (a real root lock, a real fchdir), stdin /dev/null."""
+        if linger is not None:
+            (self.home / "claude-linger").write_text(str(linger))
+        return subprocess.Popen([sys.executable, "-c", HOLD_DRIVER % (str(PKG), patch, NONCE)], env=self.hold_env(root, **extra),
+                                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+    def hold_cmd(self, root=None, patch="", linger=0, **extra):
+        p = self.hold_proc(root, patch, linger, **extra)
+        out, err = p.communicate(timeout=60)
+        return p.returncode, out, err
+
 
 def task_io_lock_holder(root):
     from ag2_sparrow import task_io
@@ -573,17 +620,23 @@ class ConnectRender(ConnectBase):
         self.assertEqual(unit.split("\n")[0], cli.MARKER)
         self.assertIn(f"ExecStart={exec_start} run\n", unit)
         for line in ("Restart=always", "RestartSec=10", "RestartPreventExitStatus=75", "WantedBy=default.target",
-                     "KillMode=control-group", "TimeoutStopSec=30", f"Environment={cm.MANAGED_VAR}=1"):
+                     "KillMode=process", "TimeoutStopSec=180", f"Environment={cm.MANAGED_VAR}=1"):
             self.assertIn(line + "\n", unit)
+        self.assertNotIn("control-group", unit, "K7/§1: systemd signals only the launcher; the tmux session survives it")
         plist = cm.render_plist(L, exec_start, "/opt/bin:/usr/bin", "/var/log/x.log")
         self.assertTrue(cm.marked(plist, cli.PLIST_MARKER), plist[:200])
         self.assertTrue(plist.startswith("<?xml"), "the declaration stays first")
         body = plistlib.loads(plist.encode())
-        self.assertEqual(body["ProgramArguments"], [exec_start, "run"])
-        self.assertEqual((body["Label"], body["KeepAlive"], body["RunAtLoad"]), (cli.AGENT_LABEL, True, True))
+        self.assertEqual(body["ProgramArguments"], [exec_start, "run", "--launchd"], "the entry shim maps the exit")
+        self.assertEqual((body["Label"], body["KeepAlive"], body["RunAtLoad"]), (cli.AGENT_LABEL, {"SuccessfulExit": False}, True))
+        self.assertNotIn("PathState", plist, "K7: no held marker; SuccessfulExit alone")
         self.assertEqual(body["EnvironmentVariables"], {"PATH": "/opt/bin:/usr/bin", cm.MANAGED_VAR: "1"})
-        self.assertEqual((body["AbandonProcessGroup"], body["ExitTimeOut"], body["ThrottleInterval"]), (False, 30, 30),
-                         "launchd SIGTERMs the group on the launcher's death, bounds a bootout, respawns after 30 s")
+        self.assertEqual((body["AbandonProcessGroup"], body["ExitTimeOut"], body["ThrottleInterval"]), (False, 180, 30),
+                         "outer stop 180 s over the 120 s inner bound; the throttle stays 30")
+        generic = cm.Shape(name="x", command="x", description="", cli="", min_version=(1,), version_anchor="", version_note="",
+                           required_keys=(), config_keys=(), env_keep=(), kept="")
+        self.assertIn("KillMode=control-group\nTimeoutStopSec=30\n", cm.render_service(generic, "/x"), "the default shape is unchanged")
+        self.assertEqual(plistlib.loads(cm.render_plist(generic, "/x", "/b", "/l").encode())["KeepAlive"], True)
         for text in (unit, plist, cli.render_config({"CLAUDE": "/x/claude", "INBOX_DIR": "/i"})):
             self.assertNotIn(TOKEN, text)
             self.assertNotIn("REMOTE_TASK_TOKEN", text)
@@ -610,6 +663,8 @@ class ConnectInstall(ConnectBase):
         self.assertEqual((cfg["CLAUDE"], cfg["PLUGIN_DIR"], cfg["INBOX_DIR"], cfg["RESULTS_DIR"], cfg["ROOT"]),
                          (str(self.claude), str(self.plugin), str(self.inbox), str(self.results), str(self.work)))
         self.assertEqual((cfg["PERMISSION_MODE"], cfg["HMAC_STRICT"]), ("bypassPermissions", ""))
+        self.assertTrue(cli.SESSION_ID_RE.match(cfg["SESSION_ID"]), "install mints the session id")
+        self.assertEqual(cfg["HITL_STORE"], str(cli.hitl_store_root()), "the bridge's claude-local root is persisted")
         self.assertTrue(self.inbox.is_dir() and self.results.is_dir())
         unit = cli.service_path().read_text()
         self.assertTrue(unit.startswith(cli.MARKER))
@@ -636,6 +691,30 @@ class ConnectInstall(ConnectBase):
         self.assertNotEqual(runner.pid(), old, "a fresh holder, not the old session")
         self.assertIn(f"launcher pid {runner.pid()}", out)
 
+    def test_the_session_id_is_kept_across_reinstalls_and_rotated_by_new_session_only_over_a_dead_generation(self):
+        """K3: --new-session is quiescent: the id rotates only once the old generation is proven gone."""
+        runner = self.runner()
+        self.assertEqual(self.install_with(runner)[0], 0)
+        first = cli.read_config(cli.config_path())["SESSION_ID"]
+        self.assertEqual(self.install_with(runner)[0], 0)
+        self.assertEqual(cli.read_config(cli.config_path())["SESSION_ID"], first, "kept without --new-session")
+        live = {"server_pid": os.getpid(), "server_start": holder_lock.start_time(os.getpid()), "session_id": "$1",
+                "session_created": 1, "pane_id": "%0", "pane_pid": 1, "start_command": "x", "nonce": "0" * 32}
+        records.save_supervisor(str(self.work), dict(records.empty_supervisor(), generation=live))
+        rc, out, _ = self.install_with(runner, False, "--new-session")
+        self.assertEqual(rc, 0)
+        self.assertIn(f"kept the session id {first}: the old session (tmux server pid {os.getpid()}) is not proven gone", out)
+        self.assertEqual(cli.read_config(cli.config_path())["SESSION_ID"], first)
+        dead = subprocess.Popen(["sleep", "0"]); dead.wait()
+        records.save_supervisor(str(self.work), dict(records.empty_supervisor(), generation=dict(live, server_pid=dead.pid,
+                                                                                                 server_start="never")))
+        rc, out, _ = self.install_with(runner, False, "--new-session")
+        self.assertEqual(rc, 0)
+        self.assertIn("rotating the session id: the old generation is proven gone", out)
+        second = cli.read_config(cli.config_path())["SESSION_ID"]
+        self.assertNotEqual(second, first)
+        self.assertTrue(cli.SESSION_ID_RE.match(second))
+
     def test_an_identical_retry_performs_the_whole_apply_again(self):
         runner = self.runner()
         self.assertEqual(self.install_with(runner)[0], 0)
@@ -655,7 +734,7 @@ class ConnectInstall(ConnectBase):
         self.assertEqual(rc, 0, err)
         plist = cli.plist_path().read_text()
         self.assertTrue(cm.marked(plist, cli.PLIST_MARKER))
-        self.assertEqual(plistlib.loads(plist.encode())["ProgramArguments"][1:], ["run"])
+        self.assertEqual(plistlib.loads(plist.encode())["ProgramArguments"][1:], ["run", "--launchd"])
         self.assertNotIn(TOKEN, plist)
         self.assertEqual(cli.read_config(cli.config_path())["PERMISSION_MODE"], "default")
         self.assertEqual(runner.verbs("launchctl"), ["print", "bootstrap"], "absent: no bootout before the bootstrap")
@@ -753,6 +832,24 @@ class ConnectInstall(ConnectBase):
         self.assertFalse(cli.config_path().exists() or cli.service_path().exists())
         self.assertIsNone(self.session())
 
+    def test_install_refuses_an_old_or_missing_tmux_and_an_over_long_socket_path(self):
+        """K4-b: tmux >= 3.2 for new-session -e; v3.4 §3: a socket path over 100 bytes fails tmux outright."""
+        with mock.patch.object(launcher, "tmux_version", return_value=(3, 1)):
+            rc, _, err = self.install()
+        self.assertEqual((rc, "tmux 3.1 is older than the 3.2" in err), (2, True), err)
+        with mock.patch.object(launcher, "tmux_version", return_value=None):
+            rc, _, err = self.install()
+        self.assertEqual((rc, "tmux -V did not answer" in err), (2, True))
+        long_dir = "/" + "d" * 90
+        self.assertIn("over the 100 the platform allows", REAL_SOCKET_PROBLEM(long_dir))
+        self.assertEqual(REAL_SOCKET_PROBLEM("/tmp/cl"), "")
+        with mock.patch.object(launcher, "socket_problem", return_value=REAL_SOCKET_PROBLEM(long_dir)):
+            rc, _, err = self.install()
+        self.assertEqual((rc, "use a shorter config dir" in err), (2, True))
+        self.assertFalse(cli.config_path().exists())
+        self.assertEqual(REAL_TMUX_VERSION(run=lambda *a, **k: subprocess.CompletedProcess(a, 0, "tmux 3.6b\n", "")), (3, 6))
+        self.assertIsNone(REAL_TMUX_VERSION(run=lambda *a, **k: subprocess.CompletedProcess(a, 1, "", "")))
+
     def test_ownership_refusals_are_final_and_name_the_file_to_remove_by_hand(self):
         cli.service_path().parent.mkdir(parents=True)
         cli.service_path().write_text("[Unit]\nDescription=mine\n")
@@ -823,15 +920,11 @@ class ConnectRoot(ConnectBase):
         self.runners[-1].stop_session()
         holder = hold(str(real), "codex")                      # a sibling adapter on the same root
         try:
-            rc, _, err = self.main("run")
-            self.assertEqual(rc, 75, "the persisted root is what run locks: " + err)
+            rc, _, err = self.hold_cmd(root=str(real))
+            self.assertEqual(rc, 75, "the persisted root is what hold locks: " + err)
             self.assertIsNone(self.session())
         finally:
             unhold(holder)
-        cfg_path = cli.config_path()
-        cfg_path.write_text(cfg_path.read_text().replace(f"ROOT={cfg['ROOT']}", "ROOT=" + str(self.home / "moved")))
-        rc, _, err = self.main("run")
-        self.assertEqual((rc, "refusing to start" in err), (2, True), "ROOT is read, never re-derived from the inbox")
 
     def test_a_tasks_symlink_is_refused_at_install_and_at_run(self):
         """A `tasks` that is itself a link would put the lock on this root and the session on the link's
@@ -850,7 +943,7 @@ class ConnectRoot(ConnectBase):
             self.assertEqual(runner.calls, [], "the manager is never touched")
         from ag2_sparrow import task_io
         self.configure(INBOX_DIR=str(link))
-        rc, _, err = self.main("run")
+        rc, _, err = self.hold_cmd()
         self.assertEqual((rc, "tasks/ under the held root is a symlink" in err), (2, True), "ERR=" + err)
         self.assertIsNone(self.session(), "no session started against the link's target")
         self.assertEqual(task_io.lock_held(str(self.work)), "free", "and the lock was released")
@@ -867,51 +960,6 @@ class ConnectRoot(ConnectBase):
         self.assertEqual(cli.config_path().read_text(), before)
         self.assertEqual(runner.calls, [], "refused before the manager is touched")
         self.assertFalse(other.exists(), "the proposed root is untouched: no tasks/ or results/ made")
-
-    def test_the_child_runs_against_tasks_under_the_held_root_inode_not_the_path(self):
-        self.configure()
-        from ag2_sparrow import task_io
-        held_tasks = os.stat(self.inbox)
-        seen, moved, real_acquire = {}, self.home / "moved-away", cm.acquire_lock
-
-        def acquire_then_replace_the_path(root, adapter, **kw):
-            owner = real_acquire(root, adapter, **kw)
-            os.rename(self.work, moved)                       # the path is replaced right after the lock check
-            self.work.mkdir()
-            (self.work / "tasks").mkdir()
-            return owner
-
-        class Child(StubChild):
-            def on_spawn(self):
-                st = os.stat(".")
-                seen["cwd_is_held"] = (st.st_dev, st.st_ino) == (held_tasks.st_dev, held_tasks.st_ino)
-                seen["sibling"] = task_io.lock_held(str(moved))
-        with mock.patch.object(cm, "acquire_lock", side_effect=acquire_then_replace_the_path):
-            rc = cli.run(type("A", (), {})(), popen=Child)
-        self.assertEqual(rc, 0)
-        self.assertTrue(seen["cwd_is_held"], "the spawn's cwd is tasks/ under the held root inode, not the new path")
-        self.assertEqual(seen["sibling"], "held", "the moved-away root (the held inode) is what a sibling contends on")
-        self.assertEqual(task_io.lock_held(str(moved)), "free", "released when the launcher is done")
-
-    def test_replacing_the_root_at_the_popen_seam_does_not_change_what_the_session_lists(self):
-        """The session's cwd is the held tasks inode and AG2_INBOX_DIR is '.', so a root replaced between
-        the env's construction and the spawn changes nothing it lists."""
-        self.configure()
-        (self.inbox / "task-held.txt").write_text("task: in the held inbox\n")
-        moved = self.home / "moved-away"
-
-        def replace_then_spawn(argv, **kw):
-            os.rename(self.work, moved)
-            self.work.mkdir()
-            (self.work / "tasks").mkdir()
-            (self.work / "tasks" / "task-replacement.txt").write_text("task: in the replacement\n")
-            return subprocess.Popen(argv, **kw)
-        rc = cli.run(type("A", (), {})(), popen=replace_then_spawn)
-        self.assertEqual(rc, 0)
-        rec = self.session()
-        self.assertEqual(rec["listing"], ["task-held.txt"], "the session lists the held inode, never the replacement")
-        self.assertEqual((rec["env"]["AG2_INBOX_DIR"], rec["env"]["AG2_RESULTS_DIR"]), (".", "../results"))
-        self.assertEqual(Path(rec["cwd"]).resolve(), (moved / "tasks").resolve())
 
     def test_a_config_without_a_root_is_one_line(self):
         self.configure()
@@ -930,23 +978,23 @@ class ConnectOrphan(ConnectBase):
         self.configure()
         from ag2_sparrow import task_io
         before = cli.config_path().read_text()
-        launcher, child = ConnectLauncherProcess.launcher(self)
+        proc, child = HoldProcess.start_hold(self)
         try:
-            self.assertEqual(task_io.lock_holder_pid(str(self.work)), launcher.pid)
+            self.assertEqual(task_io.lock_holder_pid(str(self.work)), child, "the consumer is the fencing pid")
             shutil.rmtree(self.results)
             runner = self.runner({})
             rc, out, err = self.install_with(runner, False, "--permission-mode", "default")
             self.assertEqual(rc, 1)
             self.assertFalse(self.results.exists(), "the refusal made no directory under the root")
-            self.assertIn(f"{self.work} is held by a session no job of {cli.SERVICE_NAME} manages (launcher pid {launcher.pid})", err)
+            self.assertIn(f"{self.work} is held by a session no job of {cli.SERVICE_NAME} manages (launcher pid {child})", err)
             self.assertIn("nothing was applied", err)
             self.assertNotIn(ConnectInstall.ACQUIRED, out)
             self.assertEqual(runner.verbs("systemctl"), ["show"], "probed, not applied")
             self.assertEqual(cli.config_path().read_text(), before, "config untouched")
             self.assertFalse(cli.service_path().exists(), "no unit written")
         finally:
-            os.kill(launcher.pid, signal.SIGTERM)
-            launcher.communicate(timeout=30)
+            os.kill(child, signal.SIGKILL)
+            proc.communicate(timeout=30)
             wait_gone(child)
 
     def test_a_manual_run_holding_the_root_refuses_a_reinstall_by_pid(self):
@@ -971,7 +1019,7 @@ class ConnectOrphan(ConnectBase):
 
         class Early(Runner):
             """bootout returns 0 at once and launchd forgets the job, but the old process keeps the lock."""
-            def __call__(self, cmd):
+            def __call__(self, cmd, timeout=30):
                 verb = self.verb(cmd)
                 if verb == "print":
                     self.table[("launchctl", "print")] = NOT_LOADED if any(c[1] == "bootout" for c in self.calls) else 0
@@ -1003,7 +1051,9 @@ class ConnectSerialize(ConnectBase):
         self.assertEqual(self.install_with(self.runner())[0], 0, "once it is released, the install proceeds")
         self.assertTrue(cm.oplock_path(L).exists())
 
-    def test_debug_run_and_uninstall_serialize_on_the_operation_lock(self):
+    def test_uninstall_serializes_on_the_operation_lock_and_the_managed_run_never_takes_it(self):
+        """K7: the managed start does not take the install operation lock, so a bootstrapped launcher
+        never deadlocks install, which keeps its own lock through confirmation."""
         self.assertEqual(self.install_with(self.runner())[0], 0)
         self.runners[-1].stop_session()
         other = hold(None, script=OP_HOLDER)
@@ -1012,164 +1062,18 @@ class ConnectSerialize(ConnectBase):
                 rc, _, err = self.main("uninstall")
             self.assertEqual((rc, "operation is in progress" in err), (1, True))
             self.assertTrue(cli.config_path().exists())
-            with mock.patch.object(cm, "_run", side_effect=Runner({})):
-                rc, _, err = self.main("debug-run")
-            self.assertEqual((rc, "operation is in progress" in err), (2, True))
-            self.assertIsNone(self.session())
+            seen = {}
+            with mock.patch.object(launcher.Launcher, "serve", lambda self_: seen.update(oplock_held=not oplock_free()) or 0):
+                self.assertEqual(self.main("run")[0], 0)
+            self.assertTrue(seen["oplock_held"], "run ran to the launcher while another operation held the lock")
         finally:
             unhold(other)
-        seen = {}
-
-        class Child(StubChild):
-            def on_spawn(self):
-                seen["oplock_free_at_spawn"] = oplock_free()
-        with mock.patch.object(cm, "_run", side_effect=self.runner()):
-            self.assertEqual(self.main("uninstall")[0], 0, "the job is gone, so debug-run may run")
-        self.configure()
-        with mock.patch.object(cm, "_run", side_effect=Runner({})):
-            rc = cli.debug_run(type("A", (), {})(), popen=Child)
-        self.assertEqual(rc, 0)
-        self.assertTrue(seen["oplock_free_at_spawn"], "debug-run releases the operation lock once the root lock is held")
-        self.assertTrue(cm.oplock_path(L).exists(), "the mutex file is never unlinked")
+        src = Path(launcher.__file__).read_text() + Path(cli.__file__).read_text().split("def run(")[1].split("\ndef ")[0]
+        self.assertNotIn("operation_lock", src.split("def install(")[0] if "def install(" in src else src,
+                         "neither the launcher nor run names the operation lock")
         with mock.patch.object(cm, "_run", side_effect=self.runner({})):
             self.assertEqual(self.main("uninstall")[0], 0)
-        self.assertTrue(cm.oplock_path(L).exists())
-
-
-class ConnectRun(ConnectBase):
-    def test_run_starts_the_session_with_the_isolated_env_and_the_autoarm_marker(self):
-        self.configure()
-        rc, _, err = self.main("run")
-        self.assertEqual(rc, 0, err)
-        rec = self.session()
-        self.assertEqual(rec["argv"][1:], ["--plugin-dir", str(self.plugin), "--permission-mode", "bypassPermissions",
-                                           "-p", "--input-format", "stream-json", "--output-format", "stream-json",
-                                           "--verbose"])
-        self.assertEqual(rec["argv"][0], str(self.claude))
-        self.assertEqual(rec["ppid"], os.getpid(), "the session is the launcher's direct child: no trampoline")
-        self.assertNotIn(cm.MANAGED_VAR, rec["env"], "the manager's marker is not passed on to the session")
-        # macOS stamps __CF_USER_TEXT_ENCODING on every child; the fake's own Python coerces LC_CTYPE.
-        env = {k: v for k, v in rec["env"].items() if k not in ("__CF_USER_TEXT_ENCODING", "LC_CTYPE")}
-        self.assertEqual(env["AG2_AUTOARM"], "1", "the plugin arms itself from this marker at session.start")
-        self.assertEqual(env["CLAUDE_CONFIG_DIR"], str(self.home / ".claude-sutando"))
-        self.assertEqual((env["AG2_INBOX_DIR"], env["AG2_RESULTS_DIR"], env["AG2_HMAC_KEY_FILE"]),
-                         (".", "../results", str(self.home / "task-hmac.key")), "task I/O bound to the held inode, by cwd")
-        self.assertEqual(env["USER"], "owner", "macOS needs USER for the Keychain login")
-        self.assertTrue(set(env) <= {"PATH", "HOME", "USER", "CLAUDE_CONFIG_DIR", "AG2_INBOX_DIR", "AG2_RESULTS_DIR",
-                                     "AG2_HMAC_KEY_FILE", "AG2_AUTOARM"}, sorted(env))
-        for secret in ("REMOTE_TASK_TOKEN", "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "AWS_SECRET_ACCESS_KEY",
-                       "SUTANDO_WORKSPACE_DIR", "AG2_DEVICE_ENV"):
-            self.assertNotIn(secret, env)
-        self.assertEqual(rec["cwd"], str(self.inbox))
-        self.assertEqual(rec["listing"], [], "the inbox it lists is its cwd")
-        self.assertIsNone(getattr(holder_lock.read_holder(str(self.work)), "record", None), "released after the child")
-
-    def test_run_refuses_an_old_cli_and_starts_no_session(self):
-        self.configure()
-        (self.home / "claude-version").write_text("2.0.0")
-        rc, _, err = self.main("run")
-        self.assertEqual(rc, 2)
-        self.assertIn("claude 2.0.0 is older than the 2.1.287", err)
-        self.assertIsNone(self.session())
-
-    def test_a_second_launcher_exits_75_and_starts_no_session(self):
-        self.configure()
-        holder = hold(str(self.work))
-        try:
-            rc, _, err = self.main("run")
-        finally:
-            unhold(holder)
-        self.assertEqual(rc, 75, err)
-        self.assertIn("refusing to start", err)
-        self.assertIsNone(self.session())
-
-    def test_the_lock_is_held_and_recorded_before_the_child_which_gets_no_descriptor_and_no_group(self):
-        """R1: the session is spawned directly: stdin a pipe, the env, close_fds, and nothing else (no
-        pass_fds, no new session or process group); the record is published before it exists."""
-        self.configure()
-        from ag2_sparrow import task_io
-        seen, work = {}, str(self.work)
-
-        class Child(StubChild):
-            def on_spawn(self):
-                seen["at_spawn"] = task_io.lock_holder(work)        # publish-before-spawn
-
-            def on_wait(self):
-                seen["during_wait"] = task_io.lock_holder_pid(work)
-                seen["stdin"] = self.stdin.getvalue()
-                seen["kw"], seen["env"] = self.kw, self.kw["env"]
-        rc = cli.run(type("A", (), {})(), popen=Child)
-        self.assertEqual(rc, 0)
-        self.assertEqual((seen["at_spawn"]["pid"], seen["at_spawn"]["live"], seen["at_spawn"]["adapter"],
-                          seen["at_spawn"]["install_id"]), (os.getpid(), True, "claude-local", holder_lock.install_id()))
-        self.assertEqual(seen["during_wait"], os.getpid(), "held by this launcher while the child runs")
-        self.assertEqual(sorted(seen["kw"]), ["close_fds", "env", "stdin"], "the spawn's whole keyword set")
-        self.assertEqual((seen["kw"]["close_fds"], seen["kw"]["stdin"]), (True, subprocess.PIPE))
-        self.assertEqual(seen["stdin"], "", "nothing is written to stdin: the plugin arms itself")
-        self.assertEqual(seen["env"]["AG2_AUTOARM"], "1")
-        self.assertIsNone(task_io.lock_holder_pid(work), "released when the launcher is done")
-
-    def test_a_probe_loop_beside_repeated_launcher_starts_never_forges_a_75(self):
-        from ag2_sparrow import task_io
-        self.configure()
-        prober = subprocess.Popen([sys.executable, "-c", "import sys; sys.path.insert(0, %r); from ag2_sparrow import task_io\n"
-                                   "print('probing', flush=True)\nwhile True: task_io.lock_held(%r)" % (str(PKG), str(self.work))],
-                                  stdout=subprocess.PIPE, text=True)
-        try:
-            self.assertEqual(prober.stdout.readline().strip(), "probing")
-            codes = [self.main("run")[0] for _ in range(25)]
-        finally:
-            prober.kill()
-            prober.wait(timeout=30)
-        self.assertEqual(codes, [0] * 25, "a probe's momentary flock is retried through, never reported as another holder")
-
-    def test_a_missing_tasks_dir_under_the_held_root_refuses(self):
-        self.configure()
-        shutil.rmtree(self.inbox)
-        rc, _, err = self.main("run")
-        self.assertEqual((rc, "no tasks/ under the held root" in err), (2, True))
-        from ag2_sparrow import task_io
-        self.assertEqual(task_io.lock_held(str(self.work)), "free")
-
-    def test_the_childs_exit_code_is_the_launchers_and_its_own_75_is_1(self):
-        self.configure()
-        (self.home / "claude-exit").write_text("3")
-        self.assertEqual(self.main("run")[0], 3)
-        (self.home / "claude-exit").write_text("75")
-        rc, _, err = self.main("run")
-        self.assertEqual(rc, 1)
-        self.assertIn("75 is reserved for another holder", err)
-
-
-class ConnectDebugRun(ConnectBase):
-    """No --no-service; debug-run refuses a registered job, an unknown one or a held root."""
-
-    def test_debug_run_refuses_a_registered_job_an_unknown_one_or_a_held_root_else_runs(self):
-        self.configure()
-        for show in (SHOW("loaded", "active", "enabled"), SHOW("loaded", "inactive", "enabled"), SHOW("loaded", "inactive", "disabled"),
-                     SHOW("not-found", "inactive", "enabled")):
-            with mock.patch.object(cm, "_run", side_effect=Runner({("systemctl", "show"): show})):
-                rc, _, err = self.main("debug-run")
-            self.assertEqual((rc, f"{cli.SERVICE_NAME} is registered" in err), (2, True), show)
-            self.assertIsNone(self.session())
-        with mock.patch.object(cm, "_run", side_effect=Runner({("systemctl", "show"): None})):
-            rc, _, err = self.main("debug-run")
-        self.assertEqual((rc, "unknown state" in err), (2, True))
-        holder = hold(str(self.work))
-        try:
-            with mock.patch.object(cm, "_run", side_effect=Runner({})):
-                rc, _, err = self.main("debug-run")
-        finally:
-            unhold(holder)
-        self.assertEqual(rc, 2)
-        self.assertIn(f"held by launcher pid {holder.pid}; stop that session first", err)
-        self.assertIsNone(self.session())
-        with mock.patch.object(cm, "_run", side_effect=Runner({})):
-            rc, _, err = self.main("debug-run")
-        self.assertEqual(rc, 0, err)
-        self.assertIsNotNone(self.session(), "absent and free: the session runs in the foreground")
-        rc, _, err = self.main("debug-run")
-        self.assertEqual((rc, "unreadable" in err or "lacks" in err), (2, False))
+        self.assertTrue(cm.oplock_path(L).exists(), "the mutex file is never unlinked")
 
 
 class ConnectMod(unittest.TestCase):
@@ -1181,6 +1085,19 @@ class ConnectMod(unittest.TestCase):
         self.assertIn("try {", start, "a failed auto-arm never breaks the session")
         self.assertIn("AG2_INBOX_DIR", src)
         self.assertIn("AG2_RESULTS_DIR", src)
+
+    def test_the_mod_writes_no_claim_or_progress_or_result_file_itself(self):
+        """K2/K5: every claim, authorize, confirm, stage, publish, park and progress mutation is one
+        `ag2-sparrow-claude-local inbox <verb>` call; the Mod never writes results/ or state/ directly."""
+        src = REGISTER.read_text()
+        self.assertNotIn("$.fs.write", src)
+        self.assertNotIn("os.replace", src)
+        for verb in ("'claim'", "'authorize'", "'confirm'", "'stage'", "'publish'", "'park'", "'progress'", "'check-inode'"):
+            self.assertIn(verb, src, verb)
+        self.assertIn("'inbox'", src)
+        self.assertIn("$.session.id()", src, "the session-id witness")
+        self.assertIn("AG2_INBOX_INODE", src, "the inode check")
+        self.assertIn("e.reason === 'clear'", src)
 
 
 class ConnectUninstall(ConnectBase):
@@ -1386,8 +1303,7 @@ class ConnectStrict(ConnectBase):
         cfg = cli.read_config(cli.config_path())
         self.assertEqual((cfg["HMAC_STRICT"], cfg["HMAC_KEY_FILE"]), ("1", str(self.home / "task-hmac.key")))
         self.runners[-1].stop_session()
-        self.assertEqual(self.main("run")[0], 0)
-        self.assertEqual(self.session()["env"]["AG2_HMAC_STRICT"], "1")
+        self.assertEqual(launcher.session_env(cfg, "/c", "/r")["AG2_HMAC_STRICT"], "1", "reaches the session's environment")
         rc, _, err = self.main("install", "--plugin-dir", str(self.plugin), "--inbox", str(self.inbox), "--hmac-strict")
         self.assertEqual((rc, "no key file" in err), (2, True))
 
@@ -1561,13 +1477,22 @@ class ConnectBranches(ConnectBase):
     def test_run_and_verify_edge_branches(self):
         rc, _, err = self.main("run")
         self.assertEqual((rc, "unreadable" in err), (2, True), "no config yet")
-        rc, _, err = self.main("debug-run")
+        rc, _, err = self.main("attach")
         self.assertEqual((rc, "unreadable" in err), (2, True))
+        rc, _, err = self.main("stop", "--confirm")
+        self.assertEqual((rc, "unreadable" in err), (2, True))
+        rc, _, err = self.main("stop")
+        self.assertEqual((rc, "stop takes --confirm" in err), (2, True))
         self.configure()
-        (self.home / "claude-exit").write_text("0")
         cfg = cli.read_config(cli.config_path())
-        self.assertEqual(cli.session_argv(dict(cfg, PERMISSION_MODE=""))[3:5], ["--permission-mode", "bypassPermissions"])
+        self.assertEqual(hold_mod.claude_argv(dict(cfg, PERMISSION_MODE=""), SESSION_ID)[3:7],
+                         ["--permission-mode", "bypassPermissions", "--session-id", SESSION_ID])
         self.assertNotIn("CLAUDE_CONFIG_DIR", cli.child_env(dict(cfg, CLAUDE_CONFIG_DIR=""), {"PATH": "/bin"}))
+        cfg_path = cli.config_path()
+        cfg_path.write_text(cfg_path.read_text().replace(SESSION_ID, "not-a-uuid"))
+        rc, _, err = self.main("run")
+        self.assertEqual((rc, "malformed SESSION_ID" in err), (2, True))
+        self.configure()
         self.assertIn("auth status did not run", cli.auth_problem(dict(cfg, CLAUDE=str(self.home / "none"))))
         self.assertIsNone(cli.cli_version(str(self.home / "none")))
         self.relay.unlink()
@@ -1629,190 +1554,6 @@ class LockHelpers(unittest.TestCase):
             self.assertEqual(cm.holder_line(str(root)), "free")
 
 
-class ConnectLauncherProcess(ConnectBase):
-    """Every launcher exit stops and reaps its direct child, as real processes; a SIGKILLed launcher
-    frees the lock at once and leaves the session to the manager (option A)."""
-
-    def launcher(self, linger=30, driver="sys.exit(cli.main(['run']))"):
-        (self.home / "claude-linger").write_text(str(linger))
-        env = dict(os.environ, PYTHONPATH=str(PKG))
-        proc = subprocess.Popen([sys.executable, "-c", "import sys, subprocess; from ag2_sparrow.adapters.claude_code import cli\n"
-                                 + driver], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        for _ in range(200):
-            if self.session():
-                break
-            time.sleep(0.05)
-        self.assertIsNotNone(self.session(), "the session started")
-        return proc, self.session()["pid"]
-
-    @staticmethod
-    def alive(pid):
-        return alive(pid)
-
-    def wait_gone(self, pid, seconds=10):
-        return wait_gone(pid, seconds)
-
-    def assert_reaped_and_released(self, child, work):
-        from ag2_sparrow import task_io
-        self.assertTrue(self.wait_gone(child), "the child was terminated and reaped")
-        self.assertEqual(task_io.lock_held(work), "free")
-        self.assertIsInstance(holder_lock.read_holder(work), holder_lock.Missing, "no stale record")
-
-    def test_sigterm_reaps_the_child_before_the_lock_is_released(self):
-        from ag2_sparrow import task_io
-        self.configure()
-        launcher, child = self.launcher()
-        work = str(self.work)
-        self.assertEqual(task_io.lock_holder_pid(work), launcher.pid, "verify would show the live launcher")
-        self.assertEqual(self.session()["cwd"], str(self.inbox), "the child's cwd is tasks/ under the held root")
-        self.assertEqual(self.session()["ppid"], launcher.pid, "the session is the launcher's direct child")
-        os.kill(launcher.pid, signal.SIGTERM)
-        _, err = launcher.communicate(timeout=30)
-        self.assertEqual(launcher.returncode, 143, err)
-        self.assert_reaped_and_released(child, work)
-
-    def test_sigint_reaps_the_child_before_the_lock_is_released(self):
-        self.configure()
-        launcher, child = self.launcher()
-        os.kill(launcher.pid, signal.SIGINT)
-        _, err = launcher.communicate(timeout=30)
-        self.assertEqual(launcher.returncode, 130, err)
-        self.assertIn("interrupted; child reaped", err)
-        self.assert_reaped_and_released(child, str(self.work))
-
-    def test_a_post_spawn_exception_reaps_the_child_before_the_lock_is_released(self):
-        driver = ("class Faulty(subprocess.Popen):\n"
-                  "    n = 0\n"
-                  "    def wait(self, timeout=None):\n"
-                  "        Faulty.n += 1\n"
-                  "        if Faulty.n == 2: raise RuntimeError('boom after spawn')\n"
-                  "        return super().wait(timeout=timeout)\n"
-                  "sys.exit(cli.run(type('A', (), {})(), popen=Faulty))")
-        self.configure()
-        launcher, child = self.launcher(driver=driver)
-        _, err = launcher.communicate(timeout=30)
-        self.assertEqual(launcher.returncode, 1, err)
-        self.assertIn("boom after spawn", err, "the exception is re-raised, not swallowed")
-        self.assert_reaped_and_released(child, str(self.work))
-
-    def test_a_sigkilled_launcher_frees_the_lock_at_once_and_the_managers_ordering_is_the_guard(self):
-        """R9, option A: no fence survives the launcher. After SIGKILL the lock reads free with the
-        session still alive and `verify` says so beside the manager's state; a second `run` is NOT
-        refused by the lock (the manager's ordering and the run gate are the guard). The test stops
-        the session itself, as launchd's group SIGTERM or systemd's cgroup teardown would."""
-        from ag2_sparrow import task_io
-        self.configure()
-        launcher, child = self.launcher()
-        work = str(self.work)
-        os.kill(launcher.pid, signal.SIGKILL)
-        launcher.wait(timeout=30)
-        try:
-            self.assertTrue(self.alive(child), "the session outlives its launcher")
-            self.assertEqual(task_io.lock_held(work), "free", "the flock died with the launcher: no fence")
-            self.assertFalse(task_io.lock_holder(work).get("live", False), "the record names a dead launcher")
-            respawning = SHOWING(LoadState="loaded", ActiveState="activating", SubState="auto-restart", UnitFileState="enabled")
-            with mock.patch.object(cm, "_run", side_effect=Runner({("systemctl", "show"): respawning})):
-                out = self.main("verify")[1]
-            self.assertIn(f"INFO session: {work} restarting (manager activating/auto-restart, lock free)", out, out)
-            self.assertNotIn(f"INFO session: {work} free", out, "a free lock under a live job never reads bare free")
-            (self.home / "claude-linger").write_text("0")
-            rc, _, err = self.main("run")
-            self.assertEqual(rc, 0, "a second launcher is not refused by the lock: " + err)
-            self.assertIsNotNone(self.session_after(child), "and it ran a second session beside the stray")
-            self.assertTrue(self.alive(child), "which the lock did nothing about: that is the manager's ordering")
-        finally:
-            os.kill(child, signal.SIGKILL)
-            self.wait_gone(child)
-            launcher.stdout.close()
-            launcher.stderr.close()
-        self.assertEqual(task_io.lock_held(work), "free")
-
-    def test_an_unconfirmed_kill_exits_within_the_bound_and_the_lock_goes_with_the_launcher(self):
-        """A kill that does not take: every timed wait expires; the launcher signals the handle once
-        each (terminate, then kill), waits the bound, exits with the signal's code, and the lock is
-        free, since only the launcher ever held it: the survivor is the manager's to clean."""
-        driver = ("import time\n"
-                  "class Immortal(subprocess.Popen):\n"
-                  "    def send_signal(self, sig): print('signal %d called' % sig, file=sys.stderr, flush=True)\n"
-                  "    def wait(self, timeout=None):\n"
-                  "        if timeout is not None: raise subprocess.TimeoutExpired(self.args, timeout)\n"
-                  "        time.sleep(600)\n"
-                  "import ag2_sparrow.connect_common as cm; cm.TERM_GRACE_S = 0.2; cm.REAP_BOUND_S = 0.5\n"
-                  "cm._pidfd = lambda child: None\n"
-                  "sys.exit(cli.run(type('A', (), {})(), popen=Immortal))")
-        from ag2_sparrow import task_io
-        self.configure()
-        for sig, want in ((signal.SIGINT, 130), (signal.SIGTERM, 143)):
-            launcher, child = self.launcher(driver=driver)
-            started = time.monotonic()
-            os.kill(launcher.pid, sig)
-            launcher.wait(timeout=30)                  # the child keeps the pipes, so no communicate() yet
-            elapsed = time.monotonic() - started
-            try:
-                self.assertEqual(launcher.returncode, want, sig)
-                self.assertLess(elapsed, 5.0, "grace + bound, not forever")
-                self.assertTrue(self.alive(child), "the child is still there")
-                self.assertEqual(task_io.lock_held(str(self.work)), "free", "the lock went with the launcher")
-            finally:
-                os.kill(child, signal.SIGKILL)
-                self.wait_gone(child)
-            _, err = launcher.communicate(timeout=30)
-            self.assertEqual((err.count("signal 15 called"), err.count("signal 9 called")), (1, 1), err)
-            self.assertIn("did not die within 0 s of the kill; what is left is the manager's to clean", err)
-            self.assertNotIn("child reaped", err, "never claimed without a confirmed wait")
-            (self.home / "claude-session.json").unlink()
-
-    def session_after(self, first_pid):
-        rec = self.session()
-        return None if rec is None or rec["pid"] == first_pid else rec
-
-    def test_a_forced_stop_reaches_a_direct_child_that_ignores_sigterm(self):
-        """The kill after the grace targets the unreaped direct child itself: a session that ignores
-        SIGTERM is killed, reaped, and the launcher exits 143 with the lock free."""
-        from ag2_sparrow import task_io
-        driver = ("import ag2_sparrow.connect_common as cm; cm.TERM_GRACE_S = 0.5\n"
-                  "sys.exit(cli.main(['run']))")
-        self.configure()
-        (self.home / "claude-ignore-term").write_text("1")
-        launcher, child = self.launcher(driver=driver)
-        self.assertEqual(self.session()["ppid"], launcher.pid, "the session is the direct child")
-        os.kill(launcher.pid, signal.SIGTERM)
-        _, err = launcher.communicate(timeout=30)
-        try:
-            self.assertEqual(launcher.returncode, 143, err)
-            self.assertTrue(self.wait_gone(child, 2), "the session that ignored SIGTERM was killed")
-            self.assertIn("child exited -9", err)
-            self.assertIn("stopped; child reaped", err)
-            self.assertEqual(task_io.lock_held(str(self.work)), "free")
-        finally:
-            if self.alive(child):
-                os.kill(child, signal.SIGKILL)
-
-    def test_an_inherited_ignored_sigchld_is_reset_so_the_child_is_reapable(self):
-        """SIGCHLD=SIG_IGN inherited from the manager's environment would let the kernel reap the child
-        before wait() could, and its exit code would read 0; the launcher resets it before the spawn."""
-        driver = ("import signal; signal.signal(signal.SIGCHLD, signal.SIG_IGN)\n"
-                  "sys.exit(cli.main(['run']))")
-        self.configure()
-        (self.home / "claude-exit").write_text("3")
-        launcher, child = self.launcher(linger=0.3, driver=driver)
-        _, err = launcher.communicate(timeout=30)
-        self.assertEqual(launcher.returncode, 3, "the child's own exit code, so it was reaped by us: " + err)
-        self.assertIn("child exited 3", err)
-
-    def test_sigint_is_an_explicit_stop_path_every_time(self):
-        """Repeated SIGINT: 130 and a reaped, released root each run, never a KeyboardInterrupt escaping
-        as -2. AG2_SPARROW_STRESS_N runs (default 5)."""
-        self.configure()
-        for i in range(int(os.environ.get("AG2_SPARROW_STRESS_N", "5"))):
-            launcher, child = self.launcher()
-            os.kill(launcher.pid, signal.SIGINT)
-            _, err = launcher.communicate(timeout=30)
-            self.assertEqual(launcher.returncode, 130, f"run {i}: {err}")
-            self.assert_reaped_and_released(child, str(self.work))
-            (self.home / "claude-session.json").unlink()
-
-
 class ConnectEnvAndPaths(ConnectBase):
     def test_auth_status_runs_under_the_same_allowlist(self):
         self.configure()
@@ -1858,8 +1599,12 @@ class ConnectEnvAndPaths(ConnectBase):
         self.assertEqual((rc, "lacks INBOX_DIR" in err), (2, True))
         self.assertNotIn("Traceback", err)
         self.assertIsNone(self.session())
+        cfg.write_text(good.replace("SESSION_ID=", "SESSION_WAS="))
+        rc, _, err = self.main("run")
+        self.assertEqual((rc, "lacks SESSION_ID" in err), (2, True))
+        cfg.write_text(good.replace("INBOX_DIR=", "INBOX_WAS="))
         rc, out, _ = self.main("verify")
-        self.assertEqual((rc, "lacks INBOX_DIR" in out), (1, True))
+        self.assertEqual((rc, "lacks INBOX_DIR" in out), (1, True), out)
 
 
 class ConnectVerify(ConnectBase):
@@ -1874,12 +1619,19 @@ class ConnectVerify(ConnectBase):
             rc, out, _ = self.main("verify")
         self.assertEqual(rc, 0, out)
         self.assertEqual(set(self.checks(out).values()), {"PASS"}, out)
-        self.assertEqual(set(self.checks(out)), {"config", "claude", "login", "plugin", "inbox", "results", "hmac", "relay",
-                                                 "supervisor"})
+        self.assertEqual(set(self.checks(out)), {"config", "claude", "login", "tmux", "socket", "plugin", "inbox", "results",
+                                                 "hmac", "hitl", "relay", "supervisor"})
         self.assertIn(f"INFO job: {cli.SERVICE_NAME} active", out)
         self.assertIn(f"INFO session: {self.work} held by launcher pid {runner.pid()}", out)
+        self.assertIn(f"INFO occupancy: {self.work} held by hold pid {runner.pid()} (manager", out, "the shared tri-state")
+        self.assertIn("INFO session id: %s" % cli.read_config(cli.config_path())["SESSION_ID"], out)
+        self.assertIn(f"INFO attach: {cli.COMMAND} attach", out)
+        self.assertIn("PASS hitl store: %s (the bridge's, beside its default store)" % cli.hitl_store_root(), out)
         runner.stop_session()
         self.assertIn(f"INFO session: {self.work} free", self.main("verify")[1])
+        self.configure(HITL_STORE="/elsewhere/hitl/requirements")
+        self.assertEqual(self.checks(self.main("verify")[1])["hitl"], "FAIL", "the store must be the bridge's")
+        self.configure()
         (self.plugin / ".claude-plugin" / "plugin.json").unlink()
         self.assertEqual(self.checks(self.main("verify")[1])["plugin"], "FAIL")
         (self.plugin / ".claude-plugin" / "plugin.json").write_text("{}")
@@ -1915,344 +1667,6 @@ class ConnectVerify(ConnectBase):
             self.assertEqual(_dirs.device_env_path(), Path("/elsewhere/relay.env"))
 
 
-class ConnectStopPath(ConnectBase):
-    """R2 and R3, in-process: SIGINT and SIGTERM are one deterministic stop path whose handler only
-    records; the adapter signals only its unreaped direct child, by pidfd or handle, never after wait()."""
-
-    def session_signals(self, name, linger="30", **knobs):
-        self.configure()
-        (self.home / "claude-signal-parent").write_text(name)
-        (self.home / "claude-linger").write_text(linger)
-        for key, value in knobs.items():
-            (self.home / key).write_text(value)
-
-    def assert_session_reaped_and_free(self):
-        from ag2_sparrow import task_io
-        self.assertTrue(wait_gone(self.session()["pid"]), "the session is gone")
-        self.assertEqual(task_io.lock_held(str(self.work)), "free")
-
-    def test_handlers_go_directly_over_the_inherited_dispositions_and_an_inherited_sig_ign_still_stops(self):
-        """No SIG_DFL step on the way in, so a signal in that window has no default action; an inherited
-        SIG_IGN is replaced, so bootout, systemctl stop and Ctrl-C always reach the handler: 130."""
-        installed, real = [], signal.signal
-
-        def spy(sig, handler):
-            installed.append((sig, handler))
-            return real(sig, handler)
-        was = signal.signal(signal.SIGINT, signal.SIG_IGN)
-        self.addCleanup(signal.signal, signal.SIGINT, was)
-        self.session_signals("INT", linger="3")
-        with mock.patch.object(cm.signal, "signal", side_effect=spy):
-            rc, _, err = self.main("run")
-        self.assertEqual(rc, 130, err)
-        self.assertIn("interrupted; child reaped", err)
-        self.assertEqual(signal.getsignal(signal.SIGINT), signal.SIG_IGN, "the inherited disposition is restored after")
-        stop_sigs = [(sig, h) for sig, h in installed if sig in (signal.SIGINT, signal.SIGTERM)]
-        self.assertEqual([sig for sig, _ in stop_sigs[:2]], [signal.SIGTERM, signal.SIGINT], "installed, then restored")
-        self.assertTrue(all(callable(h) for _, h in stop_sigs[:2]), "no SIG_DFL step: the handler goes straight over "
-                        "the inherited disposition; what follows is the restore")
-        self.assertEqual(stop_sigs[2:], [(signal.SIGTERM, signal.SIG_DFL), (signal.SIGINT, signal.SIG_IGN)], "restored as found")
-        self.assert_session_reaped_and_free()
-
-    def test_the_handler_only_records_the_first_signal_and_an_ignored_sigchld_is_reset(self):
-        state = cm.stop_state()
-        was_chld = signal.signal(signal.SIGCHLD, signal.SIG_IGN)
-        self.addCleanup(signal.signal, signal.SIGCHLD, was_chld)
-        before = cm.stop_handlers(state)
-        child, sent = StubChild([]), []
-        try:
-            self.assertEqual(signal.getsignal(signal.SIGCHLD), signal.SIG_DFL, "reset before any spawn, so wait() reaps")
-            state["child"] = child
-            child.send_signal = lambda sig: sent.append(sig)
-            handler = signal.getsignal(signal.SIGTERM)
-            self.assertIs(signal.getsignal(signal.SIGINT), handler, "one handler for both")
-            handler(signal.SIGTERM, None)
-            handler(signal.SIGINT, None)
-            self.assertEqual(state["sig"], signal.SIGTERM, "the first signal is the one recorded")
-            self.assertEqual(sent, [], "the handler signals nothing: terminate, kill, wait and release are the loop's")
-            self.assertIsNone(child.poll())
-        finally:
-            child.wait()
-            cm.restore_handlers(state, before)
-        self.assertEqual(signal.getsignal(signal.SIGCHLD), signal.SIG_IGN, "restored with the rest")
-        self.assertIsNone(state["installed"])
-
-    def test_a_stop_landing_inside_popen_is_neither_raised_nor_lost(self):
-        """The handle is published after Popen returned and the pidfd decision was made, and the loop
-        re-checks a stop recorded meanwhile: 130, the child reaped, 'reaped' only after the wait."""
-        from ag2_sparrow import task_io
-        seen = {}
-
-        class Inside(subprocess.Popen):
-            def __init__(self, argv, **kw):
-                os.kill(os.getpid(), signal.SIGINT)
-                super().__init__(argv, **kw)
-                seen["child"] = self
-
-            def wait(self, timeout=None):
-                rc = super().wait(timeout=timeout)
-                print("WAIT-RETURNED", file=sys.stderr)
-                return rc
-        self.configure()
-        (self.home / "claude-linger").write_text("30")
-        rc, _, err = self.run_cli(Inside)
-        self.assertEqual(rc, 130, err)
-        self.assertIn("child exited -15", err, "terminated by the loop once the handle existed")
-        self.assertEqual(err.count("WAIT-RETURNED"), 1)
-        self.assertLess(err.index("WAIT-RETURNED"), err.index("interrupted; child reaped"), "reaped is said after the wait")
-        self.assertEqual(seen["child"].returncode, -15)
-        self.assertTrue(wait_gone(seen["child"].pid))
-        self.assertEqual(task_io.lock_held(str(self.work)), "free")
-
-    def test_a_stop_before_the_spawn_starts_no_session(self):
-        from ag2_sparrow import task_io
-        real = cm.acquire_lock
-
-        def stop_then_acquire(*a, **kw):
-            os.kill(os.getpid(), signal.SIGTERM)
-            return real(*a, **kw)
-        self.configure()
-        with mock.patch.object(cm, "acquire_lock", side_effect=stop_then_acquire):
-            rc, _, err = self.main("run")
-        self.assertEqual(rc, 143, err)
-        self.assertIn("stopped before the session started", err)
-        self.assertIsNone(self.session())
-        self.assertEqual(task_io.lock_held(str(self.work)), "free")
-
-    def test_every_signal_targets_the_unreaped_direct_child_by_handle_or_pidfd_and_none_after_the_wait(self):
-        """The shim: every signal's target kind (handle | pidfd | pid | group) and whether the child was
-        already reaped. Never a group, never a bare pid, nothing after the reap; terminate then kill
-        for a child that ignores SIGTERM. A mutant that signals after wait() lands here."""
-        seen, log = {}, []
-        real_kill, real_killpg = os.kill, os.killpg
-
-        def reaped():
-            return seen["child"].returncode is not None if "child" in seen else None
-
-        def kill(pid, sig):
-            log.append(("pid", sig, reaped()))
-            return real_kill(pid, sig)
-
-        def killpg(pgid, sig):
-            log.append(("group", sig, reaped()))
-            return real_killpg(pgid, sig)
-
-        def send(self_, sig):
-            log.append(("handle", sig, self_.returncode is not None))
-            self_.poll()
-            if self_.returncode is None:
-                real_kill(self_.pid, sig)
-
-        def popen(argv, **kw):
-            seen["child"] = subprocess.Popen(argv, **kw)
-            return seen["child"]
-        patches = [mock.patch.object(os, "kill", kill), mock.patch.object(os, "killpg", killpg),
-                   mock.patch.object(subprocess.Popen, "send_signal", send), mock.patch.object(cm, "TERM_GRACE_S", 0.3)]
-        if hasattr(signal, "pidfd_send_signal"):
-            real_pidfd = signal.pidfd_send_signal
-
-            def pidfd_send(fd, sig, *a):
-                log.append(("pidfd", sig, reaped()))
-                return real_pidfd(fd, sig, *a)
-            patches.append(mock.patch.object(signal, "pidfd_send_signal", pidfd_send))
-        self.session_signals("TERM", **{"claude-ignore-term": "1"})
-        with contextlib.ExitStack() as stack:
-            for p in patches:
-                stack.enter_context(p)
-            rc, _, err = self.run_cli(popen)
-        self.assertEqual(rc, 143, err)
-        signalled = [entry for entry in log if entry[1] != 0]
-        self.assertEqual([sig for _, sig, _ in signalled], [signal.SIGTERM, signal.SIGKILL], signalled)
-        self.assertTrue({kind for kind, _, _ in signalled} <= {"handle", "pidfd"}, signalled)
-        self.assertEqual([r for _, _, r in signalled], [False, False], "never after the reap")
-        self.assertIsNotNone(seen["child"].returncode, "reaped by the loop")
-        self.assertIn("child exited -9", err)
-        self.assert_session_reaped_and_free()
-
-    def test_a_pidfd_open_failure_stops_the_session_bounded_and_refuses(self):
-        """The chosen failure path: ENOSYS, EMFILE or anything from pidfd_open is a bounded stop of the
-        child just spawned, then exit 2 with one line, the lock released. Patched to raise, so it runs
-        here on macOS too (where the real decision is the handle fallback)."""
-        from ag2_sparrow import task_io
-        self.configure()
-        (self.home / "claude-linger").write_text("30")
-        seen = {}
-
-        def popen(argv, **kw):
-            seen["child"] = subprocess.Popen(argv, **kw)
-            return seen["child"]
-        with mock.patch.object(cm.os, "pidfd_open", side_effect=OSError(errno.ENOSYS, "nope"), create=True):
-            rc, _, err = self.run_cli(popen)
-        self.assertEqual(rc, 2, err)
-        self.assertIn("refusing to start: pidfd_open failed (nope); the session was stopped and reaped", err)
-        self.assertEqual(seen["child"].returncode, -15, "the child just spawned was terminated and reaped")
-        self.assertTrue(wait_gone(seen["child"].pid))
-        self.assertEqual(task_io.lock_held(str(self.work)), "free")
-
-    def test_with_a_pidfd_every_signal_goes_through_it_and_it_is_closed_on_every_path(self):
-        """Linux's path (simulated where there is no pidfd): signals go through pidfd_send_signal, the
-        child's number is never used, and the descriptor is closed on the normal path and on a
-        post-spawn exception alike."""
-        seen, sent, closed, real_close = {}, [], [], os.close
-
-        def popen(argv, **kw):
-            seen["child"] = subprocess.Popen(argv, **kw)
-            return seen["child"]
-
-        def pidfd_open(pid):
-            self.assertEqual(pid, seen["child"].pid, "opened on the direct child, right after the spawn")
-            seen["pidfd"] = os.open("/dev/null", os.O_RDONLY)
-            return seen["pidfd"]
-
-        def pidfd_send(fd, sig, *a):
-            sent.append((fd, sig))
-            os.kill(seen["child"].pid, sig)
-
-        def close(fd):
-            closed.append(fd)
-            real_close(fd)
-        self.session_signals("TERM")
-        with mock.patch.object(os, "pidfd_open", pidfd_open, create=True), \
-                mock.patch.object(signal, "pidfd_send_signal", pidfd_send, create=True), \
-                mock.patch.object(os, "close", close):
-            rc, _, err = self.run_cli(popen)
-        self.assertEqual(rc, 143, err)
-        self.assertEqual(sent, [(seen["pidfd"], signal.SIGTERM)], "through the pidfd, once; nothing after the wait")
-        self.assertIn(seen["pidfd"], closed, "closed on the way out")
-        self.assert_session_reaped_and_free()
-
-        class Faulty(subprocess.Popen):
-            def wait(self, timeout=None):
-                raise RuntimeError("boom after spawn")
-
-        def faulty(argv, **kw):
-            seen["child"] = Faulty(argv, **kw)
-            return seen["child"]
-        closed.clear()
-        (self.home / "claude-session.json").unlink()
-        with mock.patch.object(os, "pidfd_open", pidfd_open, create=True), \
-                mock.patch.object(signal, "pidfd_send_signal", pidfd_send, create=True), \
-                mock.patch.object(os, "close", close), self.assertRaises(RuntimeError):
-            self.run_cli(faulty)
-        self.assertIn(seen["pidfd"], closed, "closed on the exception path too")
-        self.assertTrue(wait_gone(seen["child"].pid), "and the child was stopped before the re-raise")
-
-    def test_the_handle_is_published_only_after_popen_returned_and_the_pidfd_decision(self):
-        self.configure()
-        state, seen = cm.stop_state(), {}
-
-        class Child(StubChild):
-            def on_spawn(self):
-                seen["at_spawn"] = state["child"]
-
-        def pidfd(child):
-            seen["at_pidfd"] = state["child"]
-            return None
-        inbox_fd = os.open(self.inbox, os.O_RDONLY | os.O_DIRECTORY)
-        with mock.patch.object(cm, "_pidfd", pidfd):
-            rc = cm.supervise(L, [str(self.claude)], {}, Child, state, inbox_fd)
-        self.assertEqual(rc, 0)
-        self.assertIsNone(seen["at_spawn"], "no handle while Popen runs")
-        self.assertIsNone(seen["at_pidfd"], "none while the pidfd decision is made")
-        self.assertIsInstance(state["child"], Child, "published after both")
-        with self.assertRaises(OSError):
-            os.fstat(inbox_fd)       # the tasks descriptor is closed once the spawn is over
-        self.assertIsNone(state["installed"], "the handlers it installed are restored")
-
-
-class ConnectCwdAndThreads(ConnectBase):
-    """R4: the launcher fchdirs to the held tasks descriptor around the spawn and restores its cwd; the
-    cwd is process-wide, so it refuses to spawn with any other thread alive."""
-
-    def test_the_spawn_runs_under_the_held_tasks_fd_and_the_launchers_cwd_is_restored(self):
-        self.configure()
-        scratch = self.home / "launcher-cwd"
-        scratch.mkdir()
-        was = os.getcwd()
-        os.chdir(scratch)
-        self.addCleanup(os.chdir, was)
-        seen = {}
-
-        class Child(StubChild):
-            def on_spawn(self):
-                seen["cwd"] = os.getcwd()
-        self.assertEqual(cli.run(type("A", (), {})(), popen=Child), 0)
-        self.assertTrue(os.path.samefile(seen["cwd"], self.inbox), "spawned with cwd = the held tasks directory")
-        self.assertTrue(os.path.samefile(os.getcwd(), scratch), "and the launcher's cwd restored")
-        self.assertEqual(self.main("run")[0], 0)
-        self.assertEqual(self.session()["cwd"], str(self.inbox))
-        self.assertTrue(os.path.samefile(os.getcwd(), scratch))
-        (self.home / "claude-linger").write_text("30")
-        with mock.patch.object(cm.os, "pidfd_open", side_effect=OSError(errno.EMFILE, "full"), create=True):
-            self.assertEqual(self.main("run")[0], 2)
-        self.assertTrue(os.path.samefile(os.getcwd(), scratch), "restored on the refusal path too")
-        wait_gone(self.session()["pid"])
-
-    def test_a_launcher_with_another_thread_alive_refuses_to_spawn(self):
-        from ag2_sparrow import task_io
-        self.configure()
-        gate = threading.Event()
-        t = threading.Thread(target=gate.wait)
-        t.start()
-        try:
-            rc, _, err = self.main("run")
-        finally:
-            gate.set()
-            t.join()
-        self.assertEqual(rc, 2, err)
-        self.assertIn("refusing to start: the launcher runs 2 threads and the cwd switch around the spawn needs exactly one", err)
-        self.assertIsNone(self.session())
-        self.assertEqual(task_io.lock_held(str(self.work)), "free", "released on the refusal")
-
-
-class ConnectEntryPoints(ConnectBase):
-    """R5: `run` is the manager's entrypoint, gated on the marker the unit sets; `debug-run` is the
-    human path; the marker never reaches the session."""
-
-    def test_a_bare_run_refuses_naming_debug_run_and_a_managed_run_starts(self):
-        self.configure()
-        with mock.patch.dict(os.environ):
-            os.environ.pop(cm.MANAGED_VAR)
-            rc, _, err = self.main("run")
-        self.assertEqual(rc, 2)
-        self.assertIn(f"error: {cli.COMMAND} run is the manager's entrypoint ({cm.MANAGED_VAR}=1 in the unit's environment); "
-                      f"for a session by hand run {cli.COMMAND} debug-run", err)
-        self.assertIsNone(self.session(), "no session, no lock taken")
-        with mock.patch.dict(os.environ, {cm.MANAGED_VAR: "0"}):
-            self.assertEqual(self.main("run")[0], 2, "the value is 1, nothing else")
-        self.assertIsNone(self.session())
-        rc, _, err = self.main("run")
-        self.assertEqual(rc, 0, "managed: " + err)
-        self.assertIsNotNone(self.session())
-        (self.home / "claude-session.json").unlink()
-        with mock.patch.dict(os.environ), mock.patch.object(cm, "_run", side_effect=Runner({})):
-            os.environ.pop(cm.MANAGED_VAR)
-            rc, _, err = self.main("debug-run")
-        self.assertEqual(rc, 0, "a bare debug-run is the human path: " + err)
-        self.assertIsNotNone(self.session())
-
-    def test_the_marker_never_reaches_the_session_env(self):
-        self.configure()
-        self.assertEqual(self.main("run")[0], 0)
-        self.assertNotIn(cm.MANAGED_VAR, self.session()["env"])
-        cfg = cli.read_config(cli.config_path())
-        self.assertNotIn(cm.MANAGED_VAR, cli.child_env(cfg, {"PATH": "/bin", cm.MANAGED_VAR: "1"}), "an allowlist")
-        self.assertNotIn(cm.MANAGED_VAR, cli.ENV_KEEP)
-
-    def test_help_says_the_gate_is_a_guard_not_a_boundary_and_what_a_killed_debug_run_leaves(self):
-        for cmd, phrases in (("run", ["refused unless AG2_SPARROW_MANAGED=1 is in the environment, as the unit sets it",
-                                      "a guard against an accidental hand start, not a security boundary", "use debug-run by hand"]),
-                             ("debug-run", ["No manager owns its tree", "a SIGKILLed debug-run leaves its session alive with the "
-                                            "root free, yours to stop"])):
-            out = io.StringIO()
-            with contextlib.redirect_stdout(out), self.assertRaises(SystemExit) as e:
-                cli.main([cmd, "--help"])
-            self.assertEqual(e.exception.code, 0)
-            text = " ".join(out.getvalue().split())
-            for phrase in phrases:
-                self.assertIn(phrase, text, cmd)
-
-
 class ConnectOccupancy(ConnectBase):
     """R6: `verify` reports the manager's own state beside the lock, so a free lock under a live or
     respawning job never reads bare 'free'."""
@@ -2265,7 +1679,7 @@ class ConnectOccupancy(ConnectBase):
             out = self.main("verify")[1]
         self.assertIn(f"INFO session: {work} restarting (manager activating/auto-restart, lock free)", out)
         self.assertNotIn(f"INFO session: {work} free", out)
-        self.assertIn("INFO systemd ordering is asserted from KillMode=control-group and not witnessed", out)
+        self.assertIn("INFO systemd ordering is asserted from KillMode=process and not witnessed", out)
         holder = hold(work, "claude-local")
         try:
             running = SHOWING(LoadState="loaded", ActiveState="active", SubState="running", UnitFileState="enabled")
@@ -2289,7 +1703,8 @@ class ConnectOccupancy(ConnectBase):
                 out = self.main("verify")[1]
             self.assertIn(f"INFO session: {work} restarting (manager pid 4242, state running, lock free)", out)
             self.assertNotIn("KillMode", out)
-            self.assertIn(f"INFO launchd SIGTERMs the group once after a launcher death and respawns after {cm.THROTTLE_S} s", out)
+            self.assertIn(f"INFO launchd respawns the launcher after {cm.THROTTLE_S} s; the session in its tmux pane is not in "
+                          "the launcher's process group and survives a launcher death until the next launcher adopts it", out)
             with mock.patch.object(cm, "_run", side_effect=Runner({("launchctl", "print"): (0, "\tstate = waiting\n", "")})):
                 self.assertIn(f"INFO session: {work} restarting (manager state waiting, lock free)", self.main("verify")[1])
             with mock.patch.object(cm, "_run", side_effect=Runner({("launchctl", "print"): NOT_LOADED})):
@@ -2351,6 +1766,1233 @@ class ConnectSourceRules(unittest.TestCase):
         self.assertFalse(hasattr(holder_lock, words[0]))
         self.assertFalse(hasattr(holder_lock, words[1]))
         self.assertFalse(hasattr(task_io, "lease_fd") or hasattr(task_io, "release_after_reap"))
+
+
+def hold_consumer(root):
+    """A root held with a live sleep consumer in another process: (proc, consumer pid)."""
+    p = subprocess.Popen([sys.executable, "-c", CONSUMER_HOLDER % (str(PKG), str(root))], stdin=subprocess.PIPE,
+                         stdout=subprocess.PIPE, text=True)
+    line = p.stdout.readline().split()
+    assert line[:1] == ["held"], line
+    return p, int(line[1])
+
+
+def wait_for(predicate, seconds=10.0, step=0.05):
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        got = predicate()
+        if got:
+            return got
+        time.sleep(step)
+    return predicate()
+
+
+class HoldProcess(ConnectBase):
+    """K1 (Q1): `hold` is the pane's thin parent: the root taken and published, the dead generation
+    recovered under that flock, `tasks` opened O_NOFOLLOW from the held root fd and bound by inode, the
+    exec shim gated on one go byte, the consumer attached before the byte is written."""
+
+    @staticmethod
+    def start_hold(case, linger=300, patch="", **extra):
+        """A hold whose consumer is attached and live: (proc, consumer pid)."""
+        from ag2_sparrow import task_io
+        proc = case.hold_proc(patch=patch, linger=linger, **extra)
+        consumer = wait_for(lambda: (task_io.holder_consumer(str(case.work)) or {}).get("live") and task_io.holder_consumer(str(case.work)), 20)
+        case.assertTrue(consumer, "the consumer attached")
+        case.assertTrue(wait_for(lambda: case.session() is not None, 10), "the gated child started")
+        return proc, consumer["pid"]
+
+    def test_hold_takes_the_root_attaches_the_gated_child_and_binds_the_inbox_inode(self):
+        from ag2_sparrow import task_io
+        self.configure()
+        proc, consumer = self.start_hold(self, linger=2)
+        try:
+            rec = holder_lock.read_holder(str(self.work)).record
+            session = self.session()
+            self.assertEqual((rec["adapter"], rec["pid"], rec["consumer"]["pid"], rec["owner_pid"]),
+                             ("claude-local", consumer, consumer, proc.pid), "the consumer is the fencing pid, hold the owner")
+            self.assertEqual(session["pid"], consumer, "the consumer IS the claude process: the shim execs in place")
+            self.assertEqual(session["ppid"], proc.pid, "claude is hold's direct child")
+            st = os.stat(self.inbox)
+            self.assertEqual(Path(session["cwd"]).resolve(), self.inbox.resolve())
+            self.assertEqual((session["env"]["AG2_INBOX_INODE"], session["env"]["AG2_INBOX_DIR"], session["env"]["AG2_RESULTS_DIR"]),
+                             ("%d:%d" % (st.st_dev, st.st_ino), ".", "../results"), "the inode from the held fd, relative task I/O")
+            self.assertEqual(session["argv"][1:], ["--plugin-dir", str(self.plugin), "--permission-mode", "bypassPermissions",
+                                                   "--session-id", SESSION_ID], "no transcript yet: --session-id")
+            self.assertEqual(session["env"][hold_mod.ENV_SESSION_ID], SESSION_ID)
+            self.assertEqual([fd for fd in session["fifos"] if fd > 2], [],
+                             "no pipe beyond stdio reaches claude: the go fd is closed before the exec")
+            self.assertEqual(task_io.occupancy(str(self.work)), "held")
+            self.assertEqual(inbox.prepare_root(str(self.work)), "", "the work dir is prepared and fenced claude-local/1")
+            self.assertEqual((self.work / "state" / "format").read_text().strip(), "claude-local/1")
+        finally:
+            out, err = proc.communicate(timeout=60)
+        self.assertEqual(proc.returncode, 0, err)
+        self.assertIn("\033]2;t", out, "the pane title is set to a fresh token before the root is taken")
+        self.assertTrue(re.search(r"\033\]2;t[0-9a-f]{32}\007", out))
+        self.assertEqual(task_io.occupancy(str(self.work)), "free", "released after the child")
+
+    def test_hold_resumes_by_id_once_the_transcript_exists(self):
+        self.configure()
+        projects = self.home / ".claude-sutando" / "projects" / "-w"
+        projects.mkdir(parents=True)
+        (projects / (SESSION_ID + ".jsonl")).write_text("{}\n")
+        rc, _, err = self.hold_cmd(linger=0)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self.session()["argv"][-2:], ["--resume", SESSION_ID])
+
+    def test_hold_refuses_a_bad_nonce_a_missing_environment_and_a_held_root(self):
+        self.configure()
+        r = subprocess.run([sys.executable, "-c", HOLD_DRIVER % (str(PKG), "", "zz")], env=self.hold_env(),
+                           stdin=subprocess.DEVNULL, capture_output=True, text=True)
+        self.assertEqual((r.returncode, "32 hex" in r.stderr), (2, True), r.stderr)
+        env = self.hold_env()
+        env.pop(hold_mod.ENV_ROOT)
+        r = subprocess.run([sys.executable, "-c", HOLD_DRIVER % (str(PKG), "", NONCE)], env=env, stdin=subprocess.DEVNULL,
+                           capture_output=True, text=True)
+        self.assertEqual((r.returncode, "must be set in the pane's environment" in r.stderr), (2, True), r.stderr)
+        holder = hold(str(self.work), "claude-local")
+        try:
+            rc, _, err = self.hold_cmd()
+            self.assertEqual((rc, "refusing to start" in err), (75, True), err)
+            self.assertIsNone(self.session())
+        finally:
+            unhold(holder)
+        shutil.rmtree(self.inbox)
+        elsewhere = self.home / "elsewhere"
+        elsewhere.mkdir()
+        self.inbox.symlink_to(elsewhere)
+        rc, _, err = self.hold_cmd()
+        self.assertEqual((rc, "refusing to start" in err), (2, True), err)
+        self.assertIsNone(self.session(), "a tasks symlink is refused before any spawn")
+        from ag2_sparrow import task_io
+        self.assertEqual(task_io.occupancy(str(self.work)), "free")
+
+    def test_the_shim_execs_only_on_exactly_one_go_byte(self):
+        """K1 (v3.5 c): EOF, a short read, a read error or a wrong byte exits without exec."""
+        def run_shim(feed, close=True, fd_override=None):
+            r_, w_ = os.pipe()
+            argv = [sys.executable, "-c", hold_mod.SHIM, str(fd_override if fd_override is not None else r_), "/bin/echo", "EXECED"]
+            p = subprocess.Popen(argv, pass_fds=(r_,), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+            os.close(r_)
+            if feed:
+                os.write(w_, feed)
+            if close:
+                os.close(w_)
+            out, _ = p.communicate(timeout=30)
+            return p.returncode, out.strip()
+        self.assertEqual(run_shim(b""), (3, ""), "EOF: exit without exec")
+        self.assertEqual(run_shim(b"x"), (4, ""), "a wrong byte: exit without exec")
+        self.assertEqual(run_shim(hold_mod.GO), (0, "EXECED"), "the one byte: execv")
+        self.assertEqual(run_shim(b"", fd_override=99)[0], 5, "a read error: exit without exec")
+
+    def test_kill_9_hold_after_the_spawn_and_before_attach_starts_nothing_and_frees_the_root(self):
+        """K1 (v3.5 pin): the shim waits on the pipe; hold's death closes it; EOF, no exec, no consumer."""
+        from ag2_sparrow import task_io
+        self.configure()
+        marker = self.home / "paused"
+        patch = ("real = task_io.attach_consumer\n"
+                 "def pause(*a, **k):\n    open(%r, 'w').close(); time.sleep(60)\n"
+                 "task_io.attach_consumer = pause\n" % str(marker))
+        proc = self.hold_proc(patch=patch, linger=30)
+        try:
+            self.assertTrue(wait_for(marker.exists, 20), "hold paused between the spawn and attach_consumer")
+            self.assertEqual(task_io.occupancy(str(self.work)), "held", "the owner fences the root in the window")
+            self.assertIsNone(task_io.holder_consumer(str(self.work)), "no consumer yet")
+            shim_pids = [int(line.split()[0]) for line in subprocess.run(["ps", "-o", "pid=,ppid=", "-ax"], capture_output=True, text=True).stdout.splitlines() if line.split()[1:] == [str(proc.pid)]]
+            self.assertEqual(len(shim_pids), 1, "one gated shim is waiting")
+            os.kill(proc.pid, signal.SIGKILL)
+            proc.wait(timeout=30)
+            self.assertTrue(wait_gone(shim_pids[0], 10), "EOF on the pipe: the shim exited without exec")
+            self.assertIsNone(self.session(), "claude never started")
+            self.assertEqual(task_io.occupancy(str(self.work)), "free", "the dead owner with no consumer frees the root")
+        finally:
+            if proc.poll() is None:
+                os.kill(proc.pid, signal.SIGKILL)
+            proc.communicate()
+
+    def test_kill_9_hold_after_the_record_and_before_the_go_byte_leaves_a_consumer_that_never_started(self):
+        from ag2_sparrow import task_io
+        self.configure()
+        marker = self.home / "attached"
+        patch = ("real = task_io.attach_consumer\n"
+                 "def attach_then_pause(*a, **k):\n    out = real(*a, **k); open(%r, 'w').close(); time.sleep(60); return out\n"
+                 "task_io.attach_consumer = attach_then_pause\n" % str(marker))
+        proc = self.hold_proc(patch=patch, linger=30)
+        try:
+            self.assertTrue(wait_for(marker.exists, 20))
+            consumer = task_io.holder_consumer(str(self.work))
+            self.assertTrue(consumer and consumer["live"], "the record names the shim as the consumer")
+            self.assertEqual(task_io.occupancy(str(self.work)), "held")
+            os.kill(proc.pid, signal.SIGKILL)
+            proc.wait(timeout=30)
+            self.assertTrue(wait_gone(consumer["pid"], 10), "the shim read EOF and exited without exec")
+            self.assertIsNone(self.session())
+            self.assertEqual(wait_for(lambda: task_io.occupancy(str(self.work)) == "free" and "free", 10), "free",
+                             "a verified-dead consumer frees the root; while it lived the root read held")
+        finally:
+            if proc.poll() is None:
+                os.kill(proc.pid, signal.SIGKILL)
+            proc.communicate()
+
+    def test_a_failed_attach_reaps_the_shim_and_hold_exits_without_a_consumer(self):
+        from ag2_sparrow import task_io
+        self.configure()
+        patch = "task_io.attach_consumer = lambda *a, **k: (_ for _ in ()).throw(RuntimeError('record changed'))\n"
+        rc, _, err = self.hold_cmd(patch=patch, linger=30)
+        self.assertEqual((rc, "no consumer: record changed" in err), (2, True), err)
+        self.assertIsNone(self.session(), "the shim was reaped unstarted")
+        self.assertEqual(task_io.occupancy(str(self.work)), "free")
+
+    def test_kill_9_hold_with_a_hup_ignoring_consumer_never_shows_a_free_root_to_a_sibling_loop(self):
+        """K1, as written: no root-free/live-consumer overlap and zero sibling acquisitions until the
+        consumer exits; the loop runs through the gate windows too (it starts before hold)."""
+        from ag2_sparrow import task_io
+        self.configure()
+        (self.home / "claude-ignore-hup").write_text("1")
+        (self.home / "claude-ignore-term").write_text("1")
+        loop = subprocess.Popen([sys.executable, "-c", (
+            "import sys, time, json; sys.path.insert(0, %r); from ag2_sparrow import task_io\n"
+            "root = %r; acquired = 0; frees = 0; seen = set(); print('looping', flush=True)\n"
+            "while True:\n"
+            "    line = sys.stdin.readline()\n"
+            "    if line.strip() == 'stop': break\n"
+            "    occ = task_io.occupancy(root); seen.add(occ)\n"
+            "    if occ == 'free': frees += 1\n"
+            "    try:\n        o = task_io.acquire_lock(root, 'sibling'); acquired += 1; task_io.release_lock(o)\n"
+            "    except task_io.LockRefused: pass\n"
+            "    print(json.dumps({'acquired': acquired, 'frees': frees, 'seen': sorted(seen)}), flush=True)\n"
+        ) % (str(PKG), str(self.work))], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        self.assertEqual(loop.stdout.readline().strip(), "looping")
+
+        def probe():
+            loop.stdin.write("go\n"); loop.stdin.flush()
+            return json.loads(loop.stdout.readline())
+        proc = self.hold_proc(linger=60)
+        try:
+            consumer = wait_for(lambda: (task_io.holder_consumer(str(self.work)) or {}).get("live") and task_io.holder_consumer(str(self.work)), 20)
+            self.assertTrue(consumer)
+            os.kill(proc.pid, signal.SIGKILL)
+            proc.wait(timeout=30)
+            self.assertTrue(alive(consumer["pid"]), "the HUP-ignoring consumer outlives hold")
+            for _ in range(40):
+                got = probe()
+                self.assertEqual((got["acquired"], got["frees"]), (0, 0), got)
+                time.sleep(0.02)
+            self.assertTrue(task_io.lock_held(str(self.work)) in ("held",), "sticky: the live consumer holds the root")
+            os.kill(consumer["pid"], signal.SIGKILL)
+            self.assertTrue(wait_gone(consumer["pid"], 10))
+            got = wait_for(lambda: probe()["acquired"] and probe(), 10)
+            self.assertTrue(got and got["acquired"] >= 1, "once the consumer is gone the sibling acquires")
+        finally:
+            loop.stdin.write("stop\n"); loop.stdin.flush()
+            loop.wait(timeout=30)
+            if proc.poll() is None:
+                os.kill(proc.pid, signal.SIGKILL)
+            proc.communicate()
+
+    def test_hold_recovers_the_dead_generations_claims_under_its_flock_and_leaves_a_live_one(self):
+        """K2 (v3.8 a): recovery runs after acquire and publish, before the spawn; only claims of a
+        generation that verifies dead are touched: TURN_CONFIRMED without a blob answers interrupted."""
+        from ag2_sparrow import task_lifecycle as tl
+        self.configure()
+        self.assertEqual(inbox.prepare_root(str(self.work)), "")
+        dead = subprocess.Popen(["sleep", "0"]); dead.wait()
+        lc = tl.Lifecycle(str(self.work), lineage=lambda *a: True)
+        for task_id, gen in (("task-dead", {"pid": dead.pid, "start": "gone"}),
+                             ("task-live", {"pid": os.getpid(), "start": holder_lock.start_time(os.getpid())})):
+            (self.inbox / (task_id + ".txt")).write_text("task: hi\n")
+            lc.prepare(task_id, inbox.INTERRUPTED_BODY, mode=tl.LOCAL, generation=gen)
+            token = lc.authorize_call(task_id, 1, text_hash="h")
+            lc.confirm_turn(task_id, "t1", token, "h")
+        rc, _, err = self.hold_cmd(linger=0)
+        self.assertEqual(rc, 0, err)
+        self.assertIn("recovered 1 claim(s) of the dead generation", err)
+        self.assertEqual((self.results / "task-dead.txt").read_text(), inbox.INTERRUPTED_BODY)
+        self.assertEqual(lc.claims.load("task-dead")["phase"], tl.SETTLED)
+        self.assertEqual(lc.claims.load("task-live")["phase"], tl.TURN_CONFIRMED, "the live generation's claim is untouched")
+        self.assertFalse((self.results / "task-live.txt").exists())
+
+
+class InboxCli(ConnectBase):
+    """K2: the Mod's lifecycle verbs, each one CLI call under claims.lock, bound to the live consumer
+    generation, mirrored into the progress record under progress.lock."""
+
+    def setUp(self):
+        super().setUp()
+        self.configure()
+        self.assertEqual(inbox.prepare_root(str(self.work)), "")
+        self.holder, self.consumer = hold_consumer(self.work)
+        self.addCleanup(unhold, self.holder)
+        self.root = str(self.work)
+
+    def verb(self, *args, stdin=None):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), mock.patch.object(sys, "stdin", io.TextIOWrapper(io.BytesIO(stdin or b""))):
+            rc = cli.main(["inbox", "--root", self.root, *args])
+        return rc, json.loads(out.getvalue())
+
+    def task(self, task_id="task-a"):
+        (self.inbox / (task_id + ".txt")).write_text("id: %s\ntask: hi\n" % task_id)
+        return task_id
+
+    def test_claim_authorize_confirm_stage_publish_through_the_cli_with_the_record_mirrored(self):
+        t = self.task()
+        rc, out = self.verb("claim", t)
+        self.assertEqual((rc, out["attempt"], out["generation"]["pid"]), (0, 1, self.consumer))
+        self.assertEqual(records.load_plugin(self.root)["inflight"][t], {"attempt": 1, "phase": "PREPARED"})
+        rc, out = self.verb("authorize", t, "1", "--text-hash", "h1")
+        token = out["token"]
+        self.assertEqual((rc, len(token)), (0, 32))
+        self.assertEqual(records.load_plugin(self.root)["inflight"][t]["phase"], "CALLING")
+        rc, out = self.verb("authorize", t, "1", "--text-hash", "h1")
+        self.assertEqual((rc, "no submit authorization" in out["refused"]), (1, True), "exactly one token per attempt")
+        rc, out = self.verb("confirm", t, "turn-1", "bad", "--text-hash", "h1")
+        self.assertEqual((rc, "nonce or text hash" in out["refused"]), (1, True))
+        rc, out = self.verb("confirm", t, "turn-1", token, "--text-hash", "h2")
+        self.assertEqual(rc, 1)
+        rc, out = self.verb("confirm", t, "turn-1", token, "--text-hash", "h1")
+        self.assertEqual((rc, out["turn_id"]), (0, "turn-1"))
+        self.assertEqual(records.load_plugin(self.root)["inflight"][t], {"turn_id": "turn-1", "phase": "TURN_CONFIRMED"})
+        rc, out = self.verb("stage", t, "turn-9", stdin=b"four\n")
+        self.assertEqual((rc, "parked" in out["refused"]), (1, True), "only the recorded turn stages")
+        rc, out = self.verb("stage", t, "turn-1", stdin=b"four\n")
+        self.assertEqual((rc, out["outcome"]), (0, "staged"))
+        rc, out = self.verb("stage", t, "turn-1", stdin=b"four\n")
+        self.assertEqual(rc, 0, "an identical retry finishes")
+        rc, out = self.verb("stage", t, "turn-1", stdin=b"five\n")
+        self.assertEqual(rc, 1, "different bytes park with the first")
+        rc, out = self.verb("publish", t)
+        self.assertEqual((rc, out["outcome"]), (0, "settled"))
+        self.assertEqual((self.results / "task-a.txt").read_bytes(), b"four\n")
+        self.assertNotIn(t, records.load_plugin(self.root)["inflight"], "released at SETTLED")
+        rc, out = self.verb("claim", t)
+        self.assertEqual((rc, "LIVE_READY" in out["refused"]), (1, True), "only ABSENT may be submitted")
+
+    def test_claim_refuses_without_a_live_consumer_and_a_second_cli_gets_the_same_attempt_unchanged(self):
+        from ag2_sparrow import task_lifecycle as tl
+        t = self.task()
+        rc, out = self.verb("claim", t)
+        self.assertEqual(rc, 0)
+        claim_path = self.work / "state" / "claims" / t / "claim.json"
+        before = claim_path.read_bytes()
+        r = subprocess.run([sys.executable, "-c", "import sys; sys.path.insert(0, %r); from ag2_sparrow.adapters.claude_code import cli\n"
+                            "sys.exit(cli.main(['inbox', '--root', %r, 'claim', %r]))" % (str(PKG), self.root, t)],
+                           capture_output=True, text=True)
+        self.assertEqual((r.returncode, json.loads(r.stdout)["attempt"]), (0, 1), "CLI B under the same generation gets the attempt back")
+        self.assertEqual(claim_path.read_bytes(), before, "bytes unchanged")
+        other = self.task("task-o")
+        lc = tl.Lifecycle(self.root, lineage=lambda *a: True)
+        lc.prepare(other, "x", mode=tl.LOCAL, generation={"pid": os.getpid(), "start": holder_lock.start_time(os.getpid())})
+        rc, out = self.verb("claim", other)
+        self.assertEqual((rc, "PREPARED by a live or unobserved writer" in out["refused"]), (1, True), "another live generation's claim")
+        for live in (None, False):
+            with mock.patch.object(task_io, "holder_consumer", return_value={"pid": self.consumer, "start": "s", "live": live}):
+                rc, out = self.verb("claim", self.task("task-u%s" % live))
+            self.assertEqual((rc, "no live consumer" in out["refused"]), (1, True), "an unobserved or dead consumer binds nothing")
+        unhold(self.holder)
+        self.holder = type("H", (), {"stdin": io.StringIO(), "wait": lambda self_, timeout=0: None})()
+        self.assertTrue(wait_gone(self.consumer))
+        rc, out = self.verb("claim", self.task("task-n"))
+        self.assertEqual((rc, "no live consumer" in out["refused"]), (1, True))
+
+    def test_park_publishes_the_protocol_failure_once_and_never_replays(self):
+        t = self.task()
+        self.verb("claim", t)
+        token = self.verb("authorize", t, "1", "--text-hash", "h")[1]["token"]
+        self.verb("confirm", t, "turn-1", token, "--text-hash", "h")
+        rc, out = self.verb("park", t, "turn-1", "--detail", "turn aborted without a reply")
+        self.assertEqual((rc, out["outcome"], out["parked"]), (0, "settled", "turn aborted without a reply"))
+        self.assertIn("ended without a reply (turn aborted without a reply)", (self.results / "task-a.txt").read_text())
+        rc, out = self.verb("park", t, "turn-1")
+        self.assertEqual(rc, 1, "a settled claim parks nothing again")
+
+    def test_a_progress_write_failure_is_the_hard_exit_3_with_the_lifecycle_step_applied(self):
+        """K5-d: the step stands, the answer carries it with `hard`, and the Mod closes intake on 3."""
+        from ag2_sparrow import task_lifecycle as tl
+        t = self.task()
+        with mock.patch.object(records, "write_durable", side_effect=records.RecordError("disk full")):
+            rc, out = self.verb("claim", t)
+        self.assertEqual((rc, out["attempt"], out["hard"]), (3, 1, True))
+        self.assertIn("progress write failed", out["error"])
+        self.assertEqual(tl.Lifecycle(self.root).claims.load(t)["phase"], tl.PREPARED, "the claim stands")
+        self.assertEqual(records.load_plugin(self.root)["inflight"], {}, "no torn record: the old one stands")
+        with mock.patch.object(records, "write_durable", side_effect=records.RecordError("disk full")):
+            rc, out = self.verb("progress", "--intake", "open")
+        self.assertEqual((rc, out["hard"]), (3, True))
+        rc, out = self.verb("progress", "--session-id", SESSION_ID, "--intake", "open", "--bind-generation")
+        self.assertEqual(rc, 0)
+        plugin = records.load_plugin(self.root)
+        self.assertEqual((plugin["session_id"], plugin["intake"], plugin["generation"]["pid"]), (SESSION_ID, "open", self.consumer))
+        for target, step in ((records.tempfile, "mkstemp"), (records.os, "fsync"), (records.os, "replace"), (records, "fsync_dir")):
+            with mock.patch.object(target, step, side_effect=OSError("io")):
+                rc, out = self.verb("progress", "--intake", "stopped")
+            self.assertEqual((rc, out["hard"]), (3, True), step)
+            if step != "fsync_dir":
+                self.assertEqual(records.load_plugin(self.root)["intake"], "open", "a failed write leaves the previous record")
+            rc, out = self.verb("progress", "--intake", "open")
+            self.assertEqual((rc, records.load_plugin(self.root)["intake"]), (0, "open"), "a later durable write reopens")
+        self.assertEqual([n for n in os.listdir(self.work / "state") if n.endswith(".tmp")], [], "no temp survives")
+
+    def test_the_existing_final_path_fsyncs_the_blob_dir_before_the_phase_and_stays_turn_confirmed_while_it_fails(self):
+        """K2-c: blob committed, phase not saved; a retry finds the final, fsyncs the directory first; a
+        failing fsync keeps TURN_CONFIRMED with zero publication; sweep unlinks are followed by a fsync."""
+        from ag2_sparrow import task_lifecycle as tl
+        t = self.task()
+        self.verb("claim", t)
+        token = self.verb("authorize", t, "1", "--text-hash", "h")[1]["token"]
+        self.verb("confirm", t, "turn-1", token, "--text-hash", "h")
+        self.assertEqual(self.verb("stage", t, "turn-1", stdin=b"body\n")[0], 0)
+        lc = tl.Lifecycle(self.root)
+        rec = lc.claims.load(t)
+        rec["phase"] = tl.TURN_CONFIRMED                       # the crash between the blob commit and the phase save
+        lc.claims.save(rec)
+        claim_dir = lc.claims.dir(t)
+        calls = []
+        real = tl.fsync_dir
+
+        def failing(path):
+            calls.append(Path(path))
+            if Path(path) == claim_dir:
+                raise OSError("fsync failed")
+            return real(path)
+        with mock.patch.object(tl, "fsync_dir", failing):
+            for _ in range(3):
+                rc, out = self.verb("stage", t, "turn-1", stdin=b"body\n")
+                self.assertEqual((rc, out["refused"]), (1, "%s: staging parked" % t))
+        self.assertIn(claim_dir, calls, "the existing final's directory is fsynced before the phase")
+        self.assertEqual(lc.claims.load(t)["phase"], tl.TURN_CONFIRMED, "stays TURN_CONFIRMED while the fsync fails")
+        self.assertFalse((self.results / "task-a.txt").exists(), "zero publication")
+        self.assertEqual(self.verb("publish", t)[0], 1, "nothing to publish")
+        self.assertEqual(self.verb("stage", t, "turn-1", stdin=b"body\n")[0], 0, "a later fsync that works finishes")
+        self.assertEqual(self.verb("publish", t)[0], 0)
+        # The sweep: a dead writer's private temp is unlinked, then the directory fsynced.
+        t2 = self.task("task-s")
+        dead = subprocess.Popen(["sleep", "0"]); dead.wait()
+        lc2 = tl.Lifecycle(self.root, lineage=lambda *a: True)
+        lc2.prepare(t2, "x", mode=tl.LOCAL, generation={"pid": dead.pid, "start": "gone"})
+        temp = lc2.claims.dir(t2) / (".%s.1.%s.%d.%s.tmp" % (t2, "a" * 24, dead.pid, "b" * 8))
+        temp.write_bytes(b"partial")
+        order = []
+        real_unlink = os.unlink
+
+        def unlink(path, *a, **k):
+            order.append(("unlink", Path(path).name)); return real_unlink(path, *a, **k)
+
+        def fsync_spy(path):
+            order.append(("fsync", Path(path).name)); return real(path)
+        with mock.patch.object(tl.os, "unlink", unlink), mock.patch.object(tl, "fsync_dir", fsync_spy):
+            self.assertEqual(inbox.recover_dead_generation(self.root), 1)
+        self.assertFalse(temp.exists())
+        i = order.index(("unlink", temp.name))
+        self.assertEqual(order[i + 1], ("fsync", t2), "the unlink is followed by the directory fsync")
+
+    def test_check_inode_and_the_root_resolution(self):
+        st = os.stat(self.inbox)
+        rc, out = self.verb("check-inode", "--dir", str(self.inbox), "--expect", "%d:%d" % (st.st_dev, st.st_ino))
+        self.assertEqual((rc, out["inode"]), (0, "%d:%d" % (st.st_dev, st.st_ino)))
+        rc, out = self.verb("check-inode", "--dir", str(self.inbox), "--expect", "1:1")
+        self.assertEqual((rc, "not the held inbox 1:1" in out["refused"]), (1, True))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), mock.patch.dict(os.environ, {inbox.ROOT_VAR: "relative"}):
+            rc = cli.main(["inbox", "check-inode", "--expect", "1:1"])
+        self.assertEqual((rc, "must be absolute" in json.loads(out.getvalue())["refused"]), (1, True))
+
+
+class Detector(unittest.TestCase):
+    """K2/§5: raw-static-plus-outstanding is this adapter's rule; abnormal text through the shared grammar."""
+
+    def test_static_with_an_offer_in_flight_stalls_after_the_bound_and_progress_clears_it(self):
+        plugin = {"inflight": {"task-a": {"phase": "TURN_CONFIRMED", "turn_id": "t"}}}
+        obs = detector.derive({}, "working...\n", plugin, 1000.0, stall_min_s=10)
+        self.assertIsNone(obs["stall"])
+        obs = detector.derive(obs, "working...\n", plugin, 1009.0, stall_min_s=10)
+        self.assertIsNone(obs["stall"], "not yet")
+        obs = detector.derive(obs, "working...\n", plugin, 1010.0, stall_min_s=10)
+        self.assertEqual((obs["stall"]["task"], obs["stall"]["checks"]), ("task-a", "pane static while an offer is in flight"))
+        self.assertIn("static for 10 s with task-a in flight", obs["stall"]["reason"])
+        token = records.stall_token(obs["stall"])
+        self.assertEqual(records.stall_token(detector.derive(obs, "working...\n", plugin, 1011.0, stall_min_s=10)["stall"]), token,
+                         "the token is immutable while the evidence stands")
+        moved = detector.derive(obs, "working... done\n", plugin, 1012.0, stall_min_s=10)
+        self.assertIsNone(moved["stall"], "a changed frame is progress")
+        idle = detector.derive(obs, "working...\n", {"inflight": {}}, 1020.0, stall_min_s=10)
+        self.assertIsNone(idle["stall"], "static with nothing in flight is idle, not a hang")
+
+    def test_abnormal_text_is_read_line_anchored_and_needs_its_own_bound(self):
+        plugin = {"inflight": {}}
+        obs = detector.derive({}, "> Please run /login to continue\n", plugin, 0.0, abnormal_min_s=5)
+        self.assertEqual(obs["abnormal"], ["needs-login"])
+        self.assertIsNone(obs["stall"])
+        obs = detector.derive(obs, "> Please run /login to continue\n", plugin, 5.0, abnormal_min_s=5)
+        self.assertEqual(obs["stall"]["reason"], "abnormal:needs-login")
+        prose = detector.derive({}, "we talked about compaction in the meeting\n", plugin, 0.0)
+        self.assertEqual(prose["abnormal"], [], "prose mid-line never counts")
+        self.assertEqual(detector.abnormal_names("Compacting conversation...\n"), ["compacting"])
+
+
+
+CANARY = ("AG2_TEST_CANARY", "canary-must-not-reach-the-server")
+CONSOLE_SH = """#!/bin/sh
+exec "%(py)s" -c 'import sys; sys.path.insert(0, "%(pkg)s"); from ag2_sparrow.adapters.claude_code.cli import main; sys.exit(main(sys.argv[1:]))' "$@"
+"""
+STUB_SH = "#!/bin/sh\nexec cat\n"
+TMUX_DIR = os.path.dirname(shutil.which("tmux") or "/usr/bin/tmux")
+
+
+class LauncherTmux(ConnectBase):
+    """K3/K4/K6 and Q2 on a real scratch tmux server: the adapter's own socket under a short /tmp HOME,
+    created and killed here. The pane runs the real `hold` with the fake claude."""
+    home_dir = "/tmp"
+
+    def setUp(self):
+        super().setUp()
+        script = self.bin / cli.COMMAND
+        script.write_text(CONSOLE_SH % {"py": sys.executable, "pkg": PKG})
+        script.chmod(0o755)
+        os.environ[CANARY[0]] = CANARY[1]
+        os.environ["PATH"] = "%s:%s:/usr/bin:/bin" % (self.bin, TMUX_DIR)
+        self.configure()
+        (self.home / "claude-linger").write_text("300")
+        self.cfg = cli.load_config()[0]
+        self.sock = str(launcher.socket_path(cli.config_dir()))
+        self.addCleanup(self.kill_server)
+        for name, value in (("CLAUDE_GRACE_S", 1.0), ("SERVER_EXIT_S", 10.0), ("CONSUMER_WAIT_S", 30.0)):
+            p = mock.patch.object(launcher, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def kill_server(self):
+        subprocess.run(["tmux", "-S", self.sock, "kill-server"], capture_output=True)
+        wait_for(lambda: task_io.occupancy(str(self.work)) == "free", 15)
+
+    def tmux(self, *args):
+        return subprocess.run(["tmux", "-S", self.sock, *args], capture_output=True, text=True)
+
+    def launcher(self, **kw):
+        return launcher.Launcher(self.cfg, cli.config_dir(), sleep=time.sleep, **kw)
+
+    def created(self):
+        lc = self.launcher()
+        rec = lc.record()
+        self.assertEqual(launcher.classify(lc.tm, rec, self.cfg, str(self.work)), ("create", ""))
+        ok, problem = lc.create(rec)
+        self.assertTrue(ok, problem)
+        return lc, lc.record()
+
+    def witness(self, rec, session_id=SESSION_ID, generation=None):
+        records.write_progress(str(self.work), lambda r: dict(r, session_id=session_id,
+                                                            generation=generation or rec["consumer"]))
+
+    def test_create_runs_hold_under_a_clean_server_and_records_the_generation(self):
+        lc, rec = self.created()
+        gen = rec["generation"]
+        self.assertRegex(gen["start_command"], launcher.START_COMMAND_RE)
+        self.assertIn("--generation=%s --" % gen["nonce"], gen["start_command"])
+        self.assertNotIn(str(self.work), gen["start_command"], "the root reaches hold through the environment only")
+        self.assertRegex(rec["title_token"], r"^t[0-9a-f]{32}$")
+        session = wait_for(self.session, 10)
+        self.assertEqual(rec["consumer"]["pid"], session["pid"], "the consumer is the pane's claude")
+        self.assertEqual(task_io.lock_holder(str(self.work))["pid"], session["pid"])
+        env = session["env"]
+        for leaked in (CANARY[0], "SUTANDO_WORKSPACE_DIR", "REMOTE_TASK_TOKEN", "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"):
+            self.assertNotIn(leaked, env, "Q2: env -i keeps the host's environment out of the pane")
+        self.assertEqual((env[hold_mod.ENV_ROOT], env[hold_mod.ENV_SESSION_ID], env["AG2_AUTOARM"], env[hold_mod.TITLE_OFF_VAR]),
+                         (str(self.work), SESSION_ID, "1", "1"))
+        glob = self.tmux("show-environment", "-g").stdout
+        self.assertNotIn(CANARY[1], glob, "Q2: the server's global environment carries no canary")
+        self.assertNotIn("SUTANDO_WORKSPACE_DIR", glob)
+        self.assertEqual(self.tmux("show-options", "-gv", "update-environment").stdout.strip(), "",
+                         "update-environment cleared: an attach brings no client environment")
+        self.assertEqual(self.tmux("display-message", "-p", "-t", gen["pane_id"], "#{pane_title}").stdout.strip(),
+                         rec["title_token"])
+
+    def test_adoption_needs_the_pane_tuple_the_consumer_and_this_generations_witness(self):
+        lc, rec = self.created()
+        root = str(self.work)
+        self.assertEqual(launcher.classify(lc.tm, rec, self.cfg, root, created=rec["generation"]["nonce"])[0], "adopt",
+                         "the creating launcher waives the witness until the Mod writes one")
+        fresh = self.launcher()
+        verdict, why = launcher.classify(fresh.tm, rec, self.cfg, root)
+        self.assertEqual((verdict, "plugin witness" in why), ("unknown", True), "Q4: no witness, no adoption")
+        self.witness(rec, generation={"pid": rec["consumer"]["pid"] + 1, "start": rec["consumer"]["start"]})
+        self.assertEqual(launcher.classify(fresh.tm, rec, self.cfg, root)[0], "unknown", "another generation's witness")
+        self.witness(rec, session_id="11111111-2222-3333-4444-555555555555")
+        verdict, why = launcher.classify(fresh.tm, rec, self.cfg, root)
+        self.assertEqual((verdict, "session id 11111111" in why), ("unknown", True), "K3: a changed id is never adopted")
+        self.witness(rec)
+        self.assertEqual(launcher.classify(fresh.tm, rec, self.cfg, root), ("adopt", ""))
+        self.assertEqual(fresh.tick(fresh.record())[0], None, "adopt keeps serving")
+        self.assertEqual(fresh.record()["launcher"]["pid"], os.getpid(), "the adopter names itself in the record")
+        self.assertEqual(len(self.tmux("list-sessions").stdout.splitlines()), 1, "no second session")
+        self.assertEqual(launcher.classify(fresh.tm, dict(rec, title_token="t" + "0" * 32), self.cfg, root)[0], "unknown",
+                         "a pane whose title is not the recorded token is not adopted")
+
+    def test_stop_sends_exit_then_kills_the_session_through_the_fence_and_frees_the_root(self):
+        lc, rec = self.created()
+        seen = []
+        real = lc.fenced
+
+        def fenced(gen, title, action):
+            rc = real(gen, title, action)
+            if action.startswith("send-keys"):
+                seen.append((rc, self.tmux("capture-pane", "-p", "-t", gen["pane_id"]).stdout))
+            return rc
+        with mock.patch.object(lc, "fenced", fenced):
+            self.assertEqual(lc.stop_session(rec, "test"), "stopped")
+        self.assertEqual(seen[0][0], 0)
+        self.assertIn("/exit", seen[0][1], "/exit reached the pane")
+        self.assertIs(lc.tm.has_session(), False)
+        self.assertTrue(wait_for(lambda: task_io.occupancy(str(self.work)) == "free", 15), "hold released the root")
+        self.assertEqual(launcher.classify(lc.tm, lc.record(), self.cfg, str(self.work))[0], "create",
+                         "the next start creates and resumes by id")
+
+    def test_a_same_name_replacement_with_the_same_start_command_survives_both_fenced_actions(self):
+        """K4 ABA: the recorded tuple's server dies; a new server answers the same socket with the same
+        session name and the very start command (the nonce too). /exit and kill-session both refuse."""
+        lc, rec = self.created()
+        gen = rec["generation"]
+        self.kill_server()
+        stub_bin = self.home / "stub"
+        stub_bin.mkdir()
+        (stub_bin / cli.COMMAND).write_text(STUB_SH)
+        (stub_bin / cli.COMMAND).chmod(0o755)
+        subprocess.run(["env", "-i", "PATH=%s:%s:/usr/bin:/bin" % (stub_bin, TMUX_DIR), "HOME=%s" % self.home, "tmux", "-S", self.sock,
+                        "-f", "/dev/null", "new-session", "-d", "-s", launcher.SESSION_NAME, "--",
+                        hold_mod.pane_command(cli.COMMAND, gen["nonce"])],
+                       check=True)
+        fields = wait_for(lambda: lc.tm.pane_fields(gen["pane_id"]), 5)
+        self.assertEqual(fields["start_command"], gen["start_command"], "the replacement carries the same nonce")
+        self.tmux("select-pane", "-t", gen["pane_id"], "-T", rec["title_token"])   # and even the recorded title
+        self.assertEqual(lc.stop_session(rec, "test"), "cancelled: the tuple changed before /exit; nothing sent")
+        self.assertEqual(lc.fenced(gen, rec["title_token"], "kill-session -t %s" % tmux_pane_keys.tmux_quote(gen["session_id"])),
+                         tmux_pane_keys.WITHHELD)
+        self.assertIs(lc.tm.has_session(), True, "the replacement survives both paths")
+        self.assertNotIn("/exit", self.tmux("capture-pane", "-p", "-t", gen["pane_id"]).stdout, "zero keys reached it")
+        self.assertEqual(launcher.classify(lc.tm, rec, self.cfg, str(self.work))[0], "unknown")
+
+    def test_an_unrecorded_server_on_the_socket_reads_unknown_and_never_75(self):
+        subprocess.run(["tmux", "-S", self.sock, "-f", "/dev/null", "new-session", "-d", "-s", launcher.SESSION_NAME, "cat"],
+                       check=True)
+        lc = self.launcher(clock=lambda: 1000.0)
+        verdict, why = launcher.classify(lc.tm, lc.record(), self.cfg, str(self.work))
+        self.assertEqual((verdict, "did not create and record" in why), ("unknown", True))
+        self.assertEqual(lc.tick(lc.record())[0], None, "the live waiter, not an exit")
+        self.assertEqual(lc.record()["deadline"], 1000.0 + launcher.UNKNOWN_WAIT_S)
+
+    def test_a_root_with_hostile_bytes_runs_and_never_reaches_the_start_command(self):
+        hostile = self.home / "w #{pane_id} #(x),}; \\ 'q'"
+        hostile.mkdir()
+        (hostile / "tasks").mkdir()
+        (hostile / "results").mkdir()
+        self.configure(ROOT=str(hostile), INBOX_DIR=str(hostile / "tasks"), RESULTS_DIR=str(hostile / "results"))
+        self.cfg = cli.load_config()[0]
+        self.work = hostile
+        lc, rec = self.created()
+        self.assertNotIn("#{pane_id}", rec["generation"]["start_command"])
+        self.assertEqual(task_io.lock_holder(str(hostile))["pid"], rec["consumer"]["pid"])
+        self.assertEqual(lc.stop_session(rec, "test"), "stopped")
+
+    def test_uninstall_stops_the_session_its_dead_launcher_left_then_removes_the_config_last(self):
+        lc, rec = self.created()
+        order = []
+        real_free, real_stray = cm._await_free, cli.stop_stray
+        with mock.patch.object(cm, "_await_free", lambda root, *a, **k: order.append("free") or real_free(root, *a, **k)), \
+                mock.patch.object(cli, "stop_stray", lambda cfg: order.append("stray") or real_stray(cfg)), \
+                mock.patch.object(cm, "_run", side_effect=self.runner(root=False)):
+            rc, out, err = self.main("uninstall")
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(order[:2], ["stray", "free"], "the session stopped through the fence before the root must read free")
+        self.assertIs(lc.tm.has_session(), False)
+        self.assertFalse(cli.config_path().exists(), "config last")
+
+    def test_creation_is_fenced_while_the_pane_key_guard_is_uncertain(self):
+        guard = tmux_pane_keys.prepare_guard(self.sock).parent
+        (guard / "uncertain").touch()
+        lc = self.launcher()
+        ok, problem = lc.create(lc.record())
+        self.assertEqual((ok, "creation is fenced" in problem), (False, True))
+        self.assertIs(lc.tm.has_session(), False, "nothing was created")
+        self.assertEqual(lc.tick(lc.record())[0], launcher.EXIT_RETRY, "74, retryable, never 75")
+
+
+
+ROOM, OWNER_MXID = "!owner-dm:ag2.space", "@owner:ag2.space"
+STALL = {"reason": "static for 600 s with task-a in flight", "since": 100.0, "frame_hash": "f" * 16, "task": "task-a",
+         "checks": "pane static while an offer is in flight", "lines": ["working..."]}
+
+
+def tree_bytes(root):
+    """Every file under `root` (lock files aside) with its bytes: the store compared before and after."""
+    root = Path(root)
+    if not root.exists():
+        return {}
+    return {str(p.relative_to(root)): p.read_bytes() for p in sorted(root.rglob("*")) if p.is_file() and p.name != ".lock"}
+
+
+class CardBase(ConnectBase):
+    """A configured root, the bridge's claude-local store emptied, and a launcher whose stop is counted."""
+
+    def setUp(self):
+        super().setUp()
+        self.configure()
+        self.root = str(self.work)
+        self.assertEqual(inbox.prepare_root(self.root), "")
+        self.state_dir = _dirs.state_dir()
+        self.store_root = card.store_root(self.state_dir)
+        for d in (self.store_root.parent,):
+            shutil.rmtree(d, ignore_errors=True)
+            self.addCleanup(shutil.rmtree, d, True)
+        self.assertEqual(str(self.store_root), self.values()["HITL_STORE"])
+        self.lc = launcher.Launcher(cli.load_config()[0], cli.config_dir(), sleep=lambda s: None, clock=lambda: 5000.0)
+        self.stops = []
+        self.lc.stop_session = lambda rec, why: self.stops.append(why) or "stopped"
+        card.register_install(self.store_root, self.lc.opaque, self.root, self.lc.supervisor_lock)
+
+    def raise_card(self, stall=STALL, room=ROOM):
+        records.save_supervisor(self.root, dict(records.load_supervisor(self.root), stall=stall,
+                                                install_id=self.lc.opaque, generation={"pane_id": "%0"}))
+        rec = self.lc.raise_card(self.lc.record(), card.KIND_STALL, stall["checks"])
+        store, _ = card.manager(self.store_root)
+        req = store.load(rec["hitl"]["id"])
+        if room:
+            req.room = room
+            req.subject = {card.SUBJECT: dict(card.local(req), room=room)}
+            store.save(req, store.projection(req.id))
+        return store.load(req.id)
+
+    def reply(self, req, action=card.ACTION_STOP, room=ROOM, sender=OWNER_MXID, revision=None):
+        return ActionReply(hitl_id=req.id, expected_revision=req.revision if revision is None else revision,
+                           action_id=action, guard=req.guard, room=room, sender=sender)
+
+    def accept(self, reply, owner_ok=True, local=False):
+        return accepter.accept(reply, state_dir=self.state_dir, owner_ok=owner_ok, local=local, log=lambda *a: None)
+
+    def load(self, req_id):
+        return card.manager(self.store_root)[0].load(req_id)
+
+
+class CardAccepter(CardBase):
+    """K5 and the store fence: one accepter, one lock order, one save; the claude-local root beside the
+    default store; Keep waiting as a saga-keyed successor; commit-unknown reconciled before any effect."""
+
+    def test_the_card_carries_the_tail_the_attach_command_the_failed_check_and_two_actions_no_host_path(self):
+        req = self.raise_card(room="")
+        self.assertTrue(req.id.startswith("hitl_cl_"), "K5-e: local ids are namespaced")
+        self.assertEqual([a.id for a in req.actions], ["stop", "keep-waiting"])
+        self.assertIn("attach: %s attach" % cli.COMMAND, req.message)
+        self.assertIn("which check failed: pane static while an offer is in flight", req.message)
+        self.assertIn("last 20 pane lines", req.message)
+        sub = card.local(req)
+        self.assertEqual((sub["discriminator"], sub["stall_token"], sub["install_id"]),
+                         (card.KIND_STALL, records.stall_token(STALL), self.lc.opaque))
+        self.assertEqual((sub["progress_lock"], sub["supervisor_record"]),
+                         ("state/progress.lock", "state/claude-local-supervisor.json"), "root-relative coordinates")
+        wire = json.dumps(cm_dict(req))
+        for host in (str(self.work), str(self.home), str(PKG), cli.COMMAND + ".sock"):
+            self.assertNotIn(host, wire, "the projection carries no host path")
+        self.assertEqual(self.lc.record()["hitl"]["id"], req.id, "the card id lives in the supervisor record")
+        before = tree_bytes(self.store_root)
+        self.lc.raise_card(self.lc.record(), card.KIND_STALL, "again")
+        self.assertEqual(tree_bytes(self.store_root), before, "one card per incident: a retry raises no second")
+
+    def test_a_same_room_owner_stop_is_one_save_and_every_other_reply_is_refused_with_nothing_written(self):
+        req = self.raise_card()
+        before = tree_bytes(self.store_root)
+        for reply, owner_ok, why in ((self.reply(req, room="!other:ag2.space"), True, "another room"),
+                                     (self.reply(req), False, "only the owner"),
+                                     (self.reply(req, revision=req.revision - 1), True, "stale")):
+            out = self.accept(reply, owner_ok=owner_ok)
+            self.assertTrue(out.startswith("rejected:"), (why, out))
+            self.assertEqual(tree_bytes(self.store_root), before, why)
+        saves = []
+        real = card.HitlStore.save
+
+        def counting(store, r, projection=None):
+            saves.append(r.id)
+            return real(store, r, projection)
+        with mock.patch.object(card.HitlStore, "save", counting):
+            self.assertEqual(self.accept(self.reply(req)), "applied")
+        self.assertEqual(saves, [req.id], "the action, revision, status and phase in exactly one save")
+        got = self.load(req.id)
+        sub = card.local(got)
+        self.assertEqual((got.status, got.chosen_action, got.revision, sub["effect_phase"], sub["accepted_revision"]),
+                         ("in_progress", "stop", req.revision + 1, "STOPPING", req.revision))
+        self.assertTrue(self.accept(self.reply(got)).startswith(("rejected:", "applied:reconciled")), "first decision wins")
+        rec = self.lc.apply_effects(self.lc.record())
+        self.assertEqual(self.stops, ["the owner confirmed the stop"])
+        self.assertEqual((self.load(req.id).status, rec["hitl"], rec["effect"]["outcome"]), ("resolved", None, "stopped"))
+        self.lc.apply_effects(self.lc.record())
+        self.assertEqual(len(self.stops), 1, "one effect")
+
+    def test_an_unprojected_card_is_refused_from_any_room_and_applied_by_the_local_stop(self):
+        req = self.raise_card(room="")
+        self.assertTrue(self.accept(self.reply(req, room="")).startswith("rejected:"), "no room, no remote acceptance")
+        out = accepter.local_stop(self.state_dir, self.lc.opaque, log=lambda *a: None)
+        self.assertEqual(out, "applied", "v3.7: stop --confirm needs no projector")
+        self.assertEqual(card.local(self.load(req.id))["effect_phase"], "STOPPING")
+
+    def test_progress_since_the_card_cancels_every_action_with_nothing_written(self):
+        req = self.raise_card()
+        before = tree_bytes(self.store_root)
+        records.save_supervisor(self.root, dict(records.load_supervisor(self.root), stall=dict(STALL, frame_hash="0" * 16)))
+        for action in (card.ACTION_STOP, card.ACTION_KEEP):
+            out = self.accept(self.reply(req, action))
+            self.assertTrue(out.startswith("cancelled:"), out)
+        self.assertEqual(tree_bytes(self.store_root), before)
+        out = accepter.local_stop(self.state_dir, self.lc.opaque, log=lambda *a: None)
+        self.assertTrue(out.startswith("cancelled:"), out)
+        self.lc.apply_effects(self.lc.record())
+        self.assertEqual(self.stops, [], "no tmux effect, no successor")
+
+    def test_the_mod_holding_the_gate_makes_the_accepter_see_its_progress(self):
+        """K5 pause pin 1: the accepter waits on the gate the Mod holds; progress landed meanwhile cancels."""
+        req = self.raise_card()
+        got = {}
+        with records.flocked(records.progress_lock_path(self.root)):
+            t = threading.Thread(target=lambda: got.update(out=self.accept(self.reply(req))))
+            t.start()
+            time.sleep(0.3)
+            self.assertNotIn("out", got, "the accepter waits on the progress gate")
+            records.save_supervisor(self.root, dict(records.load_supervisor(self.root), stall=None))
+        t.join(10)
+        self.assertTrue(got["out"].startswith("cancelled:"), got)
+        self.assertEqual(self.load(req.id).status, "pending")
+
+    def test_an_accepter_that_committed_first_wins_over_later_progress(self):
+        """K5 pause pin 2: the phase recorded under the locks is the linearization point."""
+        req = self.raise_card()
+        self.assertEqual(self.accept(self.reply(req)), "applied")
+        self.lc.clear_card(None)                                   # the progress, after the commit
+        self.assertEqual(self.load(req.id).status, "in_progress", "a recorded phase is never cancelled by progress")
+        self.assertEqual(self.lc.record()["hitl"]["id"], req.id, "the pointer is kept for the effect")
+        self.lc.apply_effects(self.lc.record())
+        self.assertEqual(len(self.stops), 1)
+
+    def test_a_new_generation_retires_the_old_card_and_an_accepted_stop_never_reaches_it(self):
+        req = self.raise_card()
+        self.assertEqual(self.accept(self.reply(req)), "applied")
+        self.lc.retire_card()                                       # what create does before the new session
+        got = self.load(req.id)
+        self.assertEqual((got.status, card.local(got)["effect_evidence"]["outcome"]),
+                         ("resolved", "the session was gone before the stop"))
+        self.lc.apply_effects(self.lc.record())
+        self.assertEqual(self.stops, [], "the new generation is never stopped by the old decision")
+        pending = self.raise_card(stall=dict(STALL, frame_hash="3" * 16))
+        self.lc.retire_card()
+        self.assertEqual((self.load(pending.id).status, self.lc.record()["hitl"]), ("cancelled", None))
+
+    def test_a_pending_card_is_cancelled_when_its_stall_clears(self):
+        req = self.raise_card()
+        self.lc.clear_card(None)
+        self.assertEqual((self.load(req.id).status, self.lc.record()["hitl"]), ("cancelled", None))
+
+    def test_apply_action_only_inside_the_three_locks_and_on_the_outer_store(self):
+        req = self.raise_card()
+        store, mgr = card.manager(self.store_root)
+        with self.assertRaises(accepter.Refused):
+            accepter._apply(mgr, store, self.reply(req), None)
+        other, _ = card.manager(self.store_root)
+        with accepter.locks(self.root, self.lc.supervisor_lock, store):
+            with self.assertRaises(AssertionError):
+                accepter._apply(mgr, other, self.reply(req), None)
+            accepter._apply(mgr, store, self.reply(req), card.patch_for(card.ACTION_STOP, req.revision, "i"))
+        self.assertEqual(self.load(req.id).status, "in_progress", "entered with the outer two held: committed")
+
+    def test_a_coordinate_escaping_the_root_is_refused(self):
+        for bad in ("../outside.lock", "/etc/passwd", "state/../../x"):
+            req = self.raise_card()
+            req.subject = {card.SUBJECT: dict(card.local(req), progress_lock=bad)}
+            store, _ = card.manager(self.store_root)
+            store.save(req, store.projection(req.id))
+            out = self.accept(self.reply(req))
+            self.assertTrue(out.startswith("rejected:"), (bad, out))
+            self.assertEqual(self.load(req.id).status, "pending")
+            self.lc.clear_card(None)
+        self.assertEqual(card.resolve_under(self.root, "state/progress.lock"), Path(self.root).resolve() / "state" / "progress.lock")
+        with self.assertRaises(ValueError):
+            card.resolve_under(self.root, "state/../../x")
+
+    def test_keep_waiting_is_one_successor_derived_from_the_saga_key_at_every_crash_point(self):
+        req = self.raise_card()
+        saves = []
+        real = card.HitlStore.save
+        with mock.patch.object(card.HitlStore, "save", lambda st, r, projection=None: saves.append(r.id) or real(st, r, projection)), \
+                mock.patch.object(card, "reconcile_rearm"):          # the crash right after the one acceptance save
+            self.assertEqual(self.accept(self.reply(req, card.ACTION_KEEP)), "applied")
+        self.assertEqual(saves, [req.id])
+        pred = self.load(req.id)
+        saga = card.local(pred)["saga_key"]
+        self.assertEqual(saga, {"incident_id": card.local(pred)["incident"], "predecessor_id": req.id,
+                                "accepted_expected_revision": req.revision})
+        sid = card.successor_id(saga)
+        self.assertEqual(card.local(pred)["successor_id"], sid)
+        snapshot = tree_bytes(self.store_root), records.load_supervisor(self.root)
+
+        def restart():
+            fresh = launcher.Launcher(cli.load_config()[0], cli.config_dir(), sleep=lambda s: None, clock=lambda: 6000.0)
+            fresh.stop_session = lambda rec, why: self.stops.append(why) or "stopped"
+            return fresh.apply_effects(fresh.record())
+
+        def successors():
+            return [r for r in card.manager(self.store_root)[0].all() if card.local(r).get("predecessor_id") == req.id]
+        store, mgr = card.manager(self.store_root)
+        crashes = {"after acceptance": lambda: None,
+                   "after predecessor resolution": lambda: mgr.resolve(req.id),
+                   "after successor creation": lambda: card.reconcile_rearm(store, mgr, self.load(req.id), now=1.0)}
+        for name, crash in crashes.items():
+            for path, data in snapshot[0].items():
+                (self.store_root / path).write_bytes(data)
+            for extra in set(tree_bytes(self.store_root)) - set(snapshot[0]):
+                (self.store_root / extra).unlink()
+            records.save_supervisor(self.root, snapshot[1])
+            crash()
+            rec = restart()
+            rec = restart()                                          # recovered twice
+            got = successors()
+            self.assertEqual([r.id for r in got], [sid], name)
+            self.assertEqual((rec["hitl"]["id"], self.load(req.id).status, got[0].status), (sid, "resolved", "pending"), name)
+            self.assertEqual(got[0].guard, card.successor_guard(saga), "a distinct guard derived from the key")
+            self.assertNotEqual(got[0].guard, req.guard)
+            self.assertIsNone(got[0].decided_by, "policy=None: never auto-decided")
+            self.assertEqual(card.local(got[0])["stall_token"], card.local(req)["stall_token"])
+        restart()
+        self.assertEqual([r.id for r in successors()], [sid], "after the pointer move too")
+        self.assertEqual(self.stops, [], "Keep waiting stops nothing")
+        self.assertEqual(self.accept(self.reply(self.load(sid))), "applied", "the successor is the live card")
+
+    def test_a_planted_same_id_successor_with_another_saga_key_is_refused(self):
+        req = self.raise_card()
+        with mock.patch.object(card, "reconcile_rearm"):
+            self.assertEqual(self.accept(self.reply(req, card.ACTION_KEEP)), "applied")
+        saga = card.local(self.load(req.id))["saga_key"]
+        planted = card.build(card.KIND_STALL, incident="other", install_id="x", room=ROOM, stall=STALL, tail=[],
+                             attach_cmd="", failed_check="x", req_id=card.successor_id(saga), guard="g")
+        planted.subject = {card.SUBJECT: dict(card.local(planted), saga_key=dict(saga, accepted_expected_revision=99))}
+        store, mgr = card.manager(self.store_root)
+        store.save(planted)
+        before = tree_bytes(self.store_root)
+        rec = self.lc.apply_effects(self.lc.record())
+        self.assertEqual(tree_bytes(self.store_root), before, "fail closed: nothing created or moved")
+        self.assertEqual(rec["hitl"]["id"], req.id)
+
+    def test_commit_unknown_is_made_durable_before_the_one_effect_and_a_lost_or_unreplaced_save_is_pending(self):
+        from ag2_sparrow.hitl import manager as hm
+        real_fsync = hm.os.fsync
+
+        def dir_fsync_fails(fd):
+            if stat.S_ISDIR(os.fstat(fd).st_mode):
+                raise OSError(errno.EIO, "dir fsync failed")
+            return real_fsync(fd)
+        # Post-replace, pre-fsync, the replacement survives: recovered twice, one effect.
+        req = self.raise_card()
+        with mock.patch.object(hm.os, "fsync", dir_fsync_fails):
+            out = self.accept(self.reply(req))
+        self.assertTrue(out.startswith("commit-unknown:"), out)
+        self.assertEqual(card.local(self.load(req.id))["effect_phase"], "STOPPING", "visible, durability unknown")
+        self.assertEqual(self.stops, [], "no effect at acceptance")
+        fsynced = []
+        real_dir_fsync = records.fsync_dir
+        with mock.patch.object(accepter.records, "fsync_dir", lambda p: fsynced.append(Path(p)) or real_dir_fsync(p)):
+            self.lc.apply_effects(self.lc.record())
+        self.assertIn(self.store_root, fsynced, "re-fsync before the effect")
+        self.lc.apply_effects(self.lc.record())
+        self.assertEqual(len(self.stops), 1, "one effect")
+        # The same, with the replacement lost: pending, zero effect.
+        self.stops.clear()
+        self.lc.clear_card(None)
+        req = self.raise_card(stall=dict(STALL, frame_hash="1" * 16))
+        path = self.store_root / ("%s.json" % req.id)
+        old = path.read_bytes()
+        with mock.patch.object(hm.os, "fsync", dir_fsync_fails):
+            self.assertTrue(self.accept(self.reply(req)).startswith("commit-unknown:"))
+        path.write_bytes(old)
+        self.lc.apply_effects(self.lc.record())
+        self.assertEqual((self.load(req.id).status, self.stops), ("pending", []))
+        # Pre-replace failure: pending, zero effect, and a later ordinary acceptance applies once.
+        with mock.patch.object(hm.os, "replace", side_effect=OSError(errno.EIO, "replace failed")):
+            self.assertTrue(self.accept(self.reply(req)).startswith("commit-unknown:"))
+        self.assertEqual(self.load(req.id).status, "pending")
+        self.assertEqual(self.accept(self.reply(req)), "applied")
+        self.lc.apply_effects(self.lc.record())
+        self.assertEqual(len(self.stops), 1)
+
+    def test_the_store_fence_one_match_only_and_a_planted_collision_mutates_nothing(self):
+        """Kewei's (a) and (b): the claude-local root alone holds claude-local cards; the default store is
+        never touched; a same id in both stores is zero mutation and zero effect, by bytes."""
+        default_store, default_mgr = card.HitlStore(card.default_root(self.state_dir)), None
+        from ag2_sparrow.hitl.manager import HitlManager
+        from ag2_sparrow.hitl.schema import Action, HumanRequirement
+        default_mgr = HitlManager(default_store)
+        other = default_mgr.create(HumanRequirement(kind="permission", runtime="claude", message="m", guard="g1",
+                                                    device={"id": "d"}, room=ROOM,
+                                                    actions=[Action(id="stop", kind="allow_once", label="Stop")]))
+        default_before = tree_bytes(default_store.root)
+        req = self.raise_card()
+        self.assertEqual(tree_bytes(default_store.root), default_before, "(a) a claude-local card never lands in the default store")
+        self.assertIsNone(default_store.load(req.id))
+        out = self.accept(ActionReply(hitl_id=other.id, expected_revision=other.revision, action_id="stop", guard=other.guard,
+                                      room=ROOM, sender=OWNER_MXID))
+        self.assertTrue(out.startswith("rejected:"), out)
+        self.assertEqual(tree_bytes(default_store.root), default_before, "(a) the default store's card is never touched")
+        self.assertTrue(self.accept(self.reply(req, revision=req.revision)).startswith("applied"))
+        self.lc.apply_effects(self.lc.record())
+        self.assertEqual(len(self.stops), 1)
+        req2 = self.raise_card(stall=dict(STALL, frame_hash="2" * 16))
+        self.assertNotEqual(req2.id, req.id)
+        planted = json.loads((self.store_root / ("%s.json" % req2.id)).read_text())
+        (default_store.root / ("%s.json" % req2.id)).write_text(json.dumps(planted))
+        both = tree_bytes(self.store_root), tree_bytes(default_store.root)
+        out = self.accept(self.reply(req2))
+        self.assertTrue(out.startswith("rejected:") and "both stores" in out, out)
+        self.assertEqual((tree_bytes(self.store_root), tree_bytes(default_store.root)), both, "(b) zero mutation")
+        self.lc.apply_effects(self.lc.record())
+        self.assertEqual((len(self.stops), self.load(req2.id).status), (1, "pending"), "(b) zero effect")
+        self.assertTrue(self.accept(ActionReply(hitl_id="hitl_cl_nope", expected_revision=1, action_id="stop", guard="",
+                                                room=ROOM, sender=OWNER_MXID)).startswith("rejected:"), "zero matches")
+
+    def test_a_bare_exit_correlates_only_to_exactly_one_open_card_in_its_room(self):
+        store, _ = card.manager(self.store_root)
+        self.assertEqual(accepter.exit_text_reply(store, ROOM, OWNER_MXID), 0)
+        req = self.raise_card()
+        got = accepter.exit_text_reply(store, ROOM, OWNER_MXID)
+        self.assertEqual((got.hitl_id, got.action_id, got.room), (req.id, "stop", ROOM))
+        self.assertEqual(accepter.exit_text_reply(store, "!elsewhere:ag2.space", OWNER_MXID), 0)
+        second = card.build(card.KIND_UNKNOWN, incident="i2", install_id="x", room=ROOM, stall=STALL, tail=[], attach_cmd="",
+                            failed_check="x")
+        card.manager(self.store_root)[1].create(second)
+        self.assertEqual(accepter.exit_text_reply(store, ROOM, OWNER_MXID), 2, "more than one open: refused, never a guess")
+
+
+class FakeTmux:
+    """A Tmux stand-in for the classifier: what has-session answers and the pane's fields."""
+
+    def __init__(self, present=True, fields=None):
+        self.sock, self.present, self.fields = "/tmp/fake.sock", present, fields
+
+    def has_session(self, name=None):
+        return self.present
+
+    def pane_fields(self, pane_id):
+        return self.fields
+
+
+class LocalCommands(ConnectBase):
+    """§6: attach is tmux attach on the adapter's socket; stop needs --confirm; verify names what waits."""
+
+    def test_attach_execs_tmux_on_the_adapters_own_socket(self):
+        self.configure()
+        seen = []
+        with mock.patch.object(os, "execvp", lambda f, argv: seen.append(argv)):
+            self.main("attach")
+        self.assertEqual(seen[0][1:], ["-S", str(launcher.socket_path(cli.config_dir())), "attach", "-t", "=claude-local"])
+        self.assertNotIn("sutando-tmux", seen[0][2])
+        help_text = subprocess.run([sys.executable, "-c", "import sys; sys.path.insert(0, %r); from ag2_sparrow.adapters."
+                                    "claude_code.cli import main; main(['attach', '--help'])" % str(PKG)],
+                                   capture_output=True, text=True).stdout
+        for phrase in ("same session", "/clear", "/compact", "never kill the server"):
+            self.assertIn(phrase, " ".join(help_text.split()))
+
+    def test_stop_refuses_without_confirm_and_without_an_open_card(self):
+        self.configure()
+        rc, _, err = self.main("stop")
+        self.assertEqual((rc, "--confirm" in err), (2, True))
+        shutil.rmtree(card.store_root(_dirs.state_dir()).parent, ignore_errors=True)
+        rc, out, _ = self.main("stop", "--confirm")
+        self.assertEqual((rc, "no stall card is open" in out), (1, True))
+
+    def test_verify_names_a_card_waiting_for_projection_and_why(self):
+        self.configure()
+        state = _dirs.state_dir()
+        shutil.rmtree(card.store_root(state).parent, ignore_errors=True)
+        self.addCleanup(shutil.rmtree, card.store_root(state).parent, True)
+        req = card.manager(card.store_root(state))[1].create(card.build(
+            card.KIND_STALL, incident="i", install_id="x", room="", stall=STALL, tail=[], attach_cmd="", failed_check="x"))
+        routing = state / "owner-routing.json"
+        routing.unlink(missing_ok=True)
+        line = cli.projection_lines(cli.load_config()[0])
+        self.assertEqual(line, ["INFO pending projection: %s (no primary gateway); on this machine: %s stop --confirm"
+                                % (req.id, cli.COMMAND)])
+        routing.write_text("{}")
+        self.addCleanup(routing.unlink, missing_ok=True)
+        self.assertIn("(gateway predates claude-local)", cli.projection_lines(cli.load_config()[0])[0])
+
+
+class LauncherUnit(ConnectBase):
+    """K6/K7: the logical exits, the entry shim's table, the stop handlers' order, the classifier."""
+
+    def setUp(self):
+        super().setUp()
+        self.configure()
+        self.cfg = cli.load_config()[0]
+
+    def test_the_launchd_entry_shim_maps_logical_75_to_0_and_everything_else_to_non_zero(self):
+        self.assertEqual({rc: launcher.launchd_exit(rc) for rc in (-9, -15, 0, 1, 2, 74, 75)},
+                         {-9: 1, -15: 1, 0: 1, 1: 1, 2: 2, 74: 74, 75: 0})
+        for code, expect in (("import os, signal; os.kill(os.getpid(), signal.SIGKILL)", 1),
+                             ("import os, signal; os.kill(os.getpid(), signal.SIGTERM)", 1),
+                             ("raise SystemExit(0)", 1), ("raise SystemExit(74)", 74), ("raise SystemExit(75)", 0)):
+            self.assertEqual(launcher.run_launchd([sys.executable, "-c", code]), expect, code)
+
+    def test_run_launchd_is_the_shim_and_plain_run_is_the_launcher(self):
+        seen = []
+        with mock.patch.object(launcher, "run_launchd", lambda argv, popen=None: seen.append(argv) or 0):
+            self.assertEqual(self.main("run", "--launchd")[0], 0)
+        self.assertEqual(seen, [[str(self.bin / cli.COMMAND), "run"]], "the child is the plain launcher")
+        with mock.patch.dict(os.environ, {cm.MANAGED_VAR: ""}):
+            rc, _, err = self.main("run", "--launchd")
+        self.assertEqual((rc, cm.MANAGED_VAR in err), (2, True), "the gate holds for the shim too")
+
+    def test_the_classifier_returns_75_only_for_foreign_terminal_contention(self):
+        root = str(self.work)
+        gen = {"pane_id": "%0", "pane_pid": 1, "session_id": "$0", "session_created": 1, "server_pid": 1, "server_start": "s",
+               "start_command": "c", "nonce": NONCE}
+        mine = {"adapter": "claude-local", "install_id": task_io.install_id()}
+        cases = [("held", mine, {"generation": gen}, "unknown"), ("unobserved", mine, {"generation": gen}, "unknown"),
+                 ("unobserved", mine, {}, "unknown"), ("held", mine, {}, "unknown"),
+                 ("held", {"adapter": "codex", "install_id": "x"}, {}, "foreign"),
+                 ("held", {"adapter": "claude-local", "install_id": "another-install"}, {"generation": gen}, "foreign"),
+                 ("free", {}, {}, "create")]
+        for occ, holder, rec, expect in cases:
+            with mock.patch.object(task_io, "occupancy", return_value=occ), \
+                    mock.patch.object(task_io, "lock_holder", return_value=holder), \
+                    mock.patch.object(task_io, "verify_lineage", return_value=None):
+                verdict, _ = launcher.classify(FakeTmux(present=bool(rec), fields=None), dict(records.empty_supervisor(), **rec),
+                                               self.cfg, root)
+            self.assertEqual(verdict, expect, (occ, holder, rec))
+        lc = launcher.Launcher(self.cfg, cli.config_dir(), sleep=lambda s: None, clock=lambda: 1.0)
+        lc.tm = FakeTmux(present=None)
+        with mock.patch.object(task_io, "occupancy", return_value="unobserved"):
+            self.assertEqual(lc.tick(lc.record())[0], None, "unobserved is the waiter, never 75")
+        with mock.patch.object(task_io, "occupancy", return_value="held"), \
+                mock.patch.object(task_io, "lock_holder", return_value={"adapter": "codex", "install_id": "x"}):
+            self.assertEqual(lc.tick(lc.record())[0], cm.EXIT_HELD)
+
+    def test_the_stop_handlers_go_over_the_inherited_dispositions_before_any_lock(self):
+        seen = []
+        real = records.flocked
+
+        @contextlib.contextmanager
+        def spy(path, blocking=True):
+            seen.append((Path(path).name, signal.getsignal(signal.SIGTERM), signal.getsignal(signal.SIGINT)))
+            with real(path, blocking) as fd:
+                yield fd
+        before = signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        self.addCleanup(signal.signal, signal.SIGTERM, before)
+        lc = launcher.Launcher(self.cfg, cli.config_dir(), sleep=lambda s: None)
+        with mock.patch.object(launcher, "tmux_problem", return_value=""), mock.patch.object(records, "flocked", spy), \
+                mock.patch.object(launcher.Launcher, "_serve", lambda self: 0):
+            self.assertEqual(lc.serve(), 0)
+        name, term, intr = seen[0]
+        self.assertEqual(name, launcher.LAUNCHER_LOCK)
+        self.assertNotIn(term, (signal.SIG_IGN, signal.SIG_DFL), "the inherited SIG_IGN was replaced before the lock")
+        self.assertIs(term, intr, "one stop path")
+        self.assertIs(signal.getsignal(signal.SIGTERM), signal.SIG_IGN, "restored on the way out")
+
+    def test_a_second_launcher_of_the_install_is_retryable_and_a_bad_host_is_unusable(self):
+        lc = launcher.Launcher(self.cfg, cli.config_dir(), sleep=lambda s: None)
+        with mock.patch.object(launcher, "tmux_problem", return_value=""), \
+                records.flocked(cli.config_dir() / launcher.LAUNCHER_LOCK):
+            self.assertEqual(lc.serve(), launcher.EXIT_RETRY)
+        with mock.patch.object(launcher, "tmux_problem", return_value="tmux 3.1 is older"):
+            self.assertEqual(lc.serve(), cm.EXIT_UNUSABLE)
+        with mock.patch.object(launcher, "socket_problem", return_value="too long"):
+            self.assertEqual(lc.serve(), cm.EXIT_UNUSABLE)
+
+    def test_the_waiter_keeps_its_deadline_and_its_one_card_across_launcher_restarts(self):
+        """K6: the unknown episode is not an exit; each restarted launcher resumes the recorded deadline
+        and the recorded card instead of starting over or raising a second one."""
+        store_root = card.store_root(_dirs.state_dir())
+        shutil.rmtree(store_root.parent, ignore_errors=True)
+        self.addCleanup(shutil.rmtree, store_root.parent, True)
+
+        def launcher_at(now):
+            lc = launcher.Launcher(self.cfg, cli.config_dir(), sleep=lambda s: None, clock=lambda: now)
+            lc.tm = FakeTmux(present=None)
+            return lc
+        for now in (1000.0, 1050.0):
+            lc = launcher_at(now)
+            self.assertEqual(lc.tick(lc.record())[0], None, "the waiter stays alive")
+            self.assertEqual((lc.record()["deadline"], lc.record()["hitl"]), (1000.0 + launcher.UNKNOWN_WAIT_S, None),
+                             "silent until the original deadline")
+        lc = launcher_at(1091.0)
+        lc.tick(lc.record())
+        first = lc.record()["hitl"]["id"]
+        req = card.manager(store_root)[0].load(first)
+        self.assertEqual((card.local(req)["discriminator"], "tmux did not answer" in req.message), (card.KIND_UNKNOWN, True))
+        for now in (1100.0, 2000.0):
+            lc = launcher_at(now)
+            lc.tick(lc.record())
+            self.assertEqual(lc.record()["hitl"]["id"], first, "the same card after a restart")
+        self.assertEqual([r.id for r in card.manager(store_root)[0].all()], [first], "one card")
+
+    def test_the_stop_bounds_nest_inside_the_managers(self):
+        send = tmux_pane_keys.TIMEOUT_S + 5
+        inner = 2 * send + launcher.CLAUDE_GRACE_S + launcher.SERVER_EXIT_S
+        self.assertLessEqual(inner, launcher.INNER_STOP_S)
+        self.assertLess(launcher.INNER_STOP_S, cli.LOCAL.stop_timeout_s)
+        self.assertLess(cli.LOCAL.stop_timeout_s, cli.LOCAL.manager_timeout_s, "the installer outlasts the stop it waits on")
+        self.assertEqual((cli.LOCAL.stop_timeout_s, cli.LOCAL.manager_timeout_s), (180, 240))
+
+    def test_a_manager_stop_runs_the_fenced_stop_path_and_maps_its_outcome(self):
+        lc = launcher.Launcher(self.cfg, cli.config_dir(), sleep=lambda s: None)
+        for outcome, rc in (("stopped", 0), ("nothing to stop", 0), ("cancelled: the tuple changed before /exit; nothing sent", 74),
+                            ("uncertain: x", 74)):
+            lc.state["sig"] = signal.SIGTERM
+            with mock.patch.object(lc, "stop_session", return_value=outcome), mock.patch.object(lc, "apply_effects", lambda r: r):
+                self.assertEqual(lc._serve(), rc, outcome)
+
+
+class OldMainHitl(CardBase):
+    """v3.10/v3.14 K5 rolling pins against origin/main's src/hitl, loaded from git into a scratch dir."""
+
+    def old_main(self, code):
+        """Run `code` with origin/main's hitl package first on sys.path; its stdout."""
+        repo = PKG.parents[1]
+        scratch = Path(tempfile.mkdtemp(prefix="oldmain"))
+        self.addCleanup(shutil.rmtree, scratch, True)
+        names = subprocess.run(["git", "-C", str(repo), "ls-tree", "--name-only", "origin/main", "src/hitl/"],
+                               capture_output=True, text=True)
+        if names.returncode != 0 or not names.stdout.strip():
+            self.skipTest("origin/main is not available")
+        (scratch / "hitl").mkdir()
+        for name in names.stdout.split():
+            body = subprocess.run(["git", "-C", str(repo), "show", "origin/main:%s" % name], capture_output=True).stdout
+            (scratch / "hitl" / Path(name).name).write_bytes(body)
+        for dep in ("file_lock.py", "workspace_default.py", "local_task_protocol.py"):
+            body = subprocess.run(["git", "-C", str(repo), "show", "origin/main:src/%s" % dep], capture_output=True)
+            if body.returncode == 0:
+                (scratch / dep).write_bytes(body.stdout)
+        r = subprocess.run([sys.executable, "-c", "import sys; sys.path.insert(0, %r)\n%s" % (str(scratch), code)],
+                           capture_output=True, text=True, env=dict(os.environ, PYTHONPATH=""))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return r.stdout
+
+    def test_unmodified_main_keeps_the_nested_subject_on_re_save_and_never_sees_the_new_root(self):
+        req = self.raise_card()
+        self.assertEqual(self.accept(self.reply(req)), "applied")
+        path = self.store_root / ("%s.json" % req.id)
+        sub_before = json.loads(path.read_text())["requirement"]["subject"]
+        out = self.old_main(
+            "from hitl.manager import HitlManager, HitlStore\n"
+            "m = HitlManager(HitlStore(%r)); r = m.get(%r)\n"
+            "m.record_projection(r.id, r.revision + 5, '$old-main')\n"
+            "print(HitlManager(HitlStore(%r)).active().__len__())\n"
+            % (str(self.store_root), req.id, str(card.default_root(self.state_dir))))
+        self.assertEqual(out.strip(), "0", "unmodified main's default store holds no claude-local card: it projects nothing")
+        after = json.loads(path.read_text())["requirement"]
+        self.assertEqual(json.dumps(after["subject"], sort_keys=True), json.dumps(sub_before, sort_keys=True),
+                         "saga key, phase, room and discriminator survive an old writer's re-save")
+        got = self.load(req.id)
+        self.assertEqual((card.local(got)["room"], card.local(got)["discriminator"], card.local(got)["effect_phase"]),
+                         (ROOM, card.KIND_STALL, "STOPPING"), "the new reader derives them from the subject")
+        self.lc.apply_effects(self.lc.record())
+        self.assertEqual(len(self.stops), 1, "reconciles to the same requirement")
+
+
+def cm_dict(req):
+    from ag2_sparrow.hitl.manager import _req_to_dict
+    return _req_to_dict(req)
 
 
 if __name__ == "__main__":
