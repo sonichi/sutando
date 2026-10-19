@@ -159,6 +159,14 @@ python3 skills/process-hygiene/scripts/reap_orphans.py --spotlight          # re
 python3 skills/process-hygiene/scripts/reap_orphans.py --reap --spotlight   # stop candidates
 ```
 
+Witness scripts run it once at their end: `scripts/witness-reap.sh`, called from
+a witness's EXIT trap. It runs only when this skill is installed, meaning linked
+into the host's skills dir (`bash scripts/sutando-config.sh claude-home-path
+skills`, where `skills/install.sh` links); a skill that is only shipped in the repo
+is skipped with one line. By default it is report-only (`--spotlight`); with
+`PROCESS_HYGIENE_WITNESS_REAP=1` it runs `--reap --spotlight` with the normal
+thresholds. It never changes the witness's exit code.
+
 The manifest declares this script as `orphan_reaper` (skills/MANIFEST.md). Once the
 skill is installed (linked into the Claude skills dir), health-check's `system-load`
 item runs the script in report mode when load stays high, and calls the cause
@@ -190,6 +198,7 @@ Declared in `manifest.json`; read CLI > environment > manifest:
 |---|---|---|
 | `PROCESS_HYGIENE_MIN_AGE_S` | `7200` | `--min-age` |
 | `PROCESS_HYGIENE_GRACE_S` | `5` | `--grace` |
+| `PROCESS_HYGIENE_WITNESS_REAP` | `0` (report-only) | `scripts/witness-reap.sh --reap` / `--report-only` |
 
 `--claude-config-dir DIR` (repeatable) replaces the config dirs searched for
 session markers and transcripts. `--tmp-base DIR` (repeatable) replaces the default `/tmp` search base (on macOS

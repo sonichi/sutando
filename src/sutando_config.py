@@ -66,6 +66,7 @@ _KNOWN_TOP_LEVEL_KEYS = {
     "health_check",
     "bridges",
     "stand",          # this instance's `Stand:` commit-trailer value
+    "skills",
 }
 
 # Blocks every consumer reads with `.get()`. A scalar here is what the schema's
@@ -79,6 +80,7 @@ _OBJECT_TOP_LEVEL_KEYS = {
     "env",
     "health_check",
     "bridges",
+    "skills",
 }
 
 _SUPPORTED_CORE_RUNTIMES = {"claude", "codex"}
@@ -601,6 +603,25 @@ def resolve_progress_stream(repo_root: Optional[Path] = None) -> Optional[bool]:
         return val
     _warn_progress_stream_type(val)
     return None
+
+
+def resolve_skills_developer(repo_root: Optional[Path] = None) -> bool:
+    """``skills.developer``: whether installers link developer-only skills here.
+
+    Only a real JSON ``true`` opts in; anything else, or an unreadable config, is
+    false with a stderr note, so a malformed opt-in keeps developer skills out.
+    """
+    try:
+        val = (load_config(repo_root).get("skills") or {}).get("developer")
+    except (RuntimeError, AttributeError) as exc:
+        print(f"sutando config: cannot read skills.developer ({exc}); treated as false",
+              file=sys.stderr)
+        return False
+    if val is not None and not isinstance(val, bool):
+        print(f"sutando config: skills.developer must be a JSON boolean, got {val!r}; "
+              f"treated as false", file=sys.stderr)
+        return False
+    return val is True
 
 
 def resolve_dotenv(repo_root: Optional[Path] = None,
