@@ -8,7 +8,7 @@ event. The Manager's projection ledger makes this idempotent: a send that
 fails records nothing and is retried whole on the next drive; a duplicate
 drive re-sends with the same dedupe key and the gateway absorbs it.
 
-The sender is adapter-injected (a callable posting one /v1/room payload and
+The sender is adapter-injected (a callable posting one room-op payload and
 returning the gateway's dict answer) — this module never imports a bridge.
 """
 

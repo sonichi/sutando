@@ -98,7 +98,8 @@ class ScratchServer(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.dir, True)
         self.sock = os.path.join(self.dir, "s")
         hold = Path(self.dir) / "hold"
-        hold.write_text("#!/bin/sh\nexec cat\n")
+        self.typed = Path(self.dir) / "typed"
+        hold.write_text("#!/bin/sh\nexec cat > %s\n" % self.typed)
         hold.chmod(0o755)
         self.start_command = "%s --generation=%s --" % (hold, NONCE)
         subprocess.run(["tmux", "-S", self.sock, "new-session", "-d", "-s", "t", "-x", "80", "-y", "20",
@@ -150,20 +151,24 @@ class ScratchServer(unittest.TestCase):
 
     def test_a_false_predicate_orphans_the_ticket_returns_1_and_sends_nothing(self):
         wrong = vk.predicate(NONCE, self.pane_pid, self.session_id, self.created + 1)
-        rc, left = self.run_fenced("send-keys -t %s -l NEVER-SENT" % self.pane, predicate=wrong)
+        rc, left = self.run_fenced("send-keys -t %s NEVER-SENT Enter" % self.pane, predicate=wrong)
         self.assertEqual(rc, vk.WITHHELD)
         self.assertEqual(left, ["cmd", "err", "out", "stderr", "stdout", "ticket.orphaned"],
                          "orphaned before cleanup; no pending, claimed or uncertain ticket")
-        time.sleep(0.2)
-        self.assertNotIn("NEVER-SENT", self.pane_text())
         self.assertEqual(vk.fence_status(self.sock), "clear", "a withheld send leaves no uncertainty")
-        rc, left = self.run_fenced("send-keys -t %s -l LANDED" % self.pane)
+        rc, left = self.run_fenced("send-keys -t %s LANDED Enter" % self.pane)
         self.assertEqual((rc, left), (0, ["cmd", "err", "out", "stderr", "stdout", "ticket.claimed"]),
                          "the true predicate sends: claimed, then the ticket dir is removed")
-        deadline = time.monotonic() + 3
-        while time.monotonic() < deadline and "LANDED" not in self.pane_text():
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and "LANDED" not in self.typed_text():
             time.sleep(0.1)
-        self.assertIn("LANDED", self.pane_text())
+        self.assertEqual(self.typed_text(), "LANDED\n", "the pane received the true send and never the false one")
+
+    def typed_text(self):
+        try:
+            return self.typed.read_text()
+        except FileNotFoundError:
+            return ""
 
     def test_the_script_builds_exactly_what_fenced_describes(self):
         seen = {}

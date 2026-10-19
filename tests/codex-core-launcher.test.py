@@ -107,6 +107,7 @@ class CodexCoreLauncherTests(unittest.TestCase):
             # cli_wedge imports sutando_platform; without it every classify
             # dies on import and the gate reads every pane as unreadable.
             "src/cli_wedge.py",
+            "src/cli_wedge_patterns.py",
             "src/sutando_platform.py",
             "src/delivery/__init__.py",
             "src/delivery/worker-stage.sh",
