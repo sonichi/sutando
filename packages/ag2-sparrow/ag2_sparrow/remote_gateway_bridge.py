@@ -5053,13 +5053,17 @@ def _relay_failed_sent(broker_id: str) -> bool:
 _POLL_ANOMALIES = 0
 
 
+class _PollAnomaly(Exception):
+    """A 200 poll answer that carries no task list; the loop backs off as for any bad answer."""
+
+
 def _served_key(task: dict) -> str:
     return _one_line(task.get("id"))[:128]
 
 
 def _poll_task_list(resp) -> list:
     """The poll's served tasks. A 200 with no `tasks` list (an empty body, or other JSON) is
-    logged and counted: it can stand for a batch the broker served and the client never saw."""
+    counted and raised: it can stand for a batch the broker served and the client never saw."""
     global _POLL_ANOMALIES
     tasks = resp.get("tasks") if isinstance(resp, dict) else None
     if isinstance(tasks, list):
@@ -5067,10 +5071,10 @@ def _poll_task_list(resp) -> list:
     _POLL_ANOMALIES += 1
     meta = getattr(_RESP_META, "last", None) or {}
     shape = "an empty body" if resp == {} else f"{type(resp).__name__} without a tasks list"
-    _log(f"poll anomaly #{_POLL_ANOMALIES}: answered {shape} (status={meta.get('status')}, "
-         f"content-length={meta.get('content_length')}, cf-ray={meta.get('cf_ray')}) "
-         "— any task served in it is lost to this client until its lease expires")
-    return []
+    raise _PollAnomaly(
+        f"poll anomaly #{_POLL_ANOMALIES}: answered {shape} (status={meta.get('status')}, "
+        f"content-length={meta.get('content_length')}, cf-ray={meta.get('cf_ray')}) "
+        "— any task served in it is lost to this client until its lease expires")
 
 
 def _receive_round(tasks: list) -> "tuple[list, dict]":
@@ -5148,24 +5152,34 @@ def _set_fate(fates: "dict | None", task: dict, fate: str) -> None:
         fates[_served_key(task)] = fate
 
 
-def _take_ack_first(task: dict, inflight: "set[str]") -> bool:
+def _take_ack_first(task: dict, inflight: "set[str]", fates: "dict | None" = None) -> bool:
     """A task served with `ack_first`: staged, acked on its own and published only once
     the ack is accepted, so a withdrawn ask never reaches the core. True once published."""
     written = _write_task(task, hold=True)
     if written is None:
+        _set_fate(fates, task, "dropped")       # _write_task logged why
         return False
     tid, durable = written
     held = _load_held()
     if held is None:
+        _set_fate(fates, task, "dropped")       # _load_held logged why
         return False                            # nothing is acked while it cannot be read
     entry = held.get(tid)
     if not _held_entry_ok(tid, entry):
         # Already queued or handled here: acked as any redelivery is.
         lease = _lease_id_of(task)
-        if _track_durably(tid, inflight) and _record_pending_acks([(tid, durable, lease)]):
-            _post_task_ack(tid, durable, lease)
+        if (_track_durably(tid, inflight) and _record_pending_acks([(tid, durable, lease)])
+                and _post_task_ack(tid, durable, lease)):
+            _set_fate(fates, task, "acked")
         return False
-    return _advance_held(tid, entry, inflight)
+    published = _advance_held(tid, entry, inflight)
+    if published:
+        _set_fate(fates, task, "acked")
+    elif tid in (_load_held() or {}):
+        _set_fate(fates, task, "staged")
+    else:
+        _set_fate(fates, task, "dropped")       # _advance_held logged the refusal
+    return published
 
 
 def _fold_target(tid: str, wire: str, holder: "str | None") -> "str | None":
@@ -7638,8 +7652,7 @@ def main() -> None:
             # First and on its own, so a slow task ahead cannot hold it past its delivery lease.
             for task in tasks:
                 if task.get("ack_first") is True:
-                    added |= _isolated(task, _take_ack_first, task, inflight, fates=fates)
-                    fates[_served_key(task)] = fates[_served_key(task)] or "staged"
+                    added |= _isolated(task, _take_ack_first, task, inflight, fates, fates=fates)
             for task in tasks:
                 if task.get("ack_first") is not True:
                     added |= _isolated(task, _take_served_task, task, inflight, pending_ack,
@@ -7677,6 +7690,11 @@ def main() -> None:
                 sys.exit(f"FATAL: gateway auth rejected (HTTP {e.code}) — check REMOTE_TASK_TOKEN.")
             _log(f"poll HTTP {e.code} — backing off {backoff}s")
             _emit_gateway_status(False, error=f"HTTP {e.code}", backoff_s=backoff, poll_ok_ts=last_poll_ok)
+            time.sleep(backoff); backoff = min(backoff * 2, _POLL_BACKOFF_MAX_S)
+        except _PollAnomaly as e:
+            # Every anomaly is counted in its line; the log itself thins out a run of them.
+            _log_backoff(("poll-anomaly",), f"{e} — backing off {backoff}s")
+            _emit_gateway_status(False, error="poll answered without a task list", backoff_s=backoff)
             time.sleep(backoff); backoff = min(backoff * 2, _POLL_BACKOFF_MAX_S)
         except _NETWORK_ERRORS as e:
             poll_failures += 1

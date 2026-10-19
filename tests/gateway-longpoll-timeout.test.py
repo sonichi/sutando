@@ -409,7 +409,7 @@ class AckFirstInTheLoopTest(unittest.TestCase):
             loop.served = [[typed, relay]]
             self.gw._write_task = lambda task, *a, **k: self.calls.append(("write", task["id"]))
             with patch.object(self.gw, "_take_ack_first",
-                              side_effect=lambda task, inflight: self.calls.append(("take", task["id"])) or True), \
+                              side_effect=lambda task, inflight, *a: self.calls.append(("take", task["id"])) or True), \
                     patch.object(self.gw, "wake_outbound", new=self.woken("wake")):
                 loop.run()
         # Taken first even though served second; only the exact boolean is a relay ask.
@@ -581,7 +581,8 @@ class RoundAccountingTest(unittest.TestCase):
     def _run(self, served, ack=lambda tid: True, commit=True, poll=None):
         with _Loop(self.gw) as loop, \
                 patch.object(self.gw, "_record_pending_acks", return_value=commit), \
-                patch.object(self.gw, "wake_outbound", new=lambda: None):
+                patch.object(self.gw, "wake_outbound", new=lambda: None), \
+                patch.dict(self.gw._LOG_COUNTS, clear=True):
             loop.served = [served]
             if poll is not None:
                 self.gw._req = lambda method, path, *a, **k: (
@@ -614,7 +615,7 @@ class RoundAccountingTest(unittest.TestCase):
         flagged = [m.split()[1] for m in loop.logs if "was not acked" in m]
         self.assertEqual(flagged, ["task-r1", "task-r2"])
 
-    def test_dropped_and_staged_tasks_are_settled(self):
+    def test_dropped_tasks_are_settled_and_an_ack_first_task_without_a_fate_is_named(self):
         relay = {"id": "ask-5f3c9e0a1b2c", "task": "calendar?", "ack_first": True}
         with patch.object(self.gw, "_take_ack_first", return_value=False), \
                 patch.object(self.gw, "_handle_hitl_action", return_value=False), \
@@ -624,8 +625,42 @@ class RoundAccountingTest(unittest.TestCase):
                 loop.served = [[relay, self._task(3)]]
                 self.gw._write_task = lambda task, *a, **k: None      # logged its own reason
                 loop.run()
-        self.assertFalse(any("was not acked" in m for m in loop.logs))
+        flagged = [m.split()[1] for m in loop.logs if "was not acked" in m]
+        self.assertEqual(flagged, ["ask-5f3c9e0a1b2c"],
+                         "a False from _take_ack_first is not a fate; the dropped write is")
         self.assertIn("served ask-5f3c9e0a1b2c lease=none ack_first", loop.logs)
+
+    def test_take_ack_first_records_the_fate_it_reached(self):
+        gw = self.gw
+        task = {"id": "ask-5f3c9e0a1b2c", "task": "calendar?", "ack_first": True,
+                "lease_id": "lease-q"}
+        key = "ask-5f3c9e0a1b2c"
+
+        def fate(**patches):
+            fates = {key: None}
+            with patch.multiple(gw, **patches):
+                gw._take_ack_first(task, set(), fates)
+            return fates[key]
+
+        written = lambda *a, **k: (key, True)  # noqa: E731
+        self.assertEqual(fate(_write_task=lambda *a, **k: None), "dropped")
+        self.assertEqual(fate(_write_task=written, _load_held=lambda: None), "dropped")
+        redelivered = dict(_write_task=written, _load_held=lambda: {},
+                           _held_entry_ok=lambda tid, e: False,
+                           _track_durably=lambda tid, inflight: True,
+                           _record_pending_acks=lambda p: True)
+        self.assertEqual(fate(**redelivered, _post_task_ack=lambda *a: True), "acked")
+        self.assertIsNone(fate(**redelivered, _post_task_ack=lambda *a: False),
+                          "an ack that did not land is left for the round to name")
+        entry = {"staged": "x"}
+        advancing = dict(_write_task=written, _held_entry_ok=lambda tid, e: True)
+        self.assertEqual(fate(**advancing, _load_held=lambda: {key: entry},
+                              _advance_held=lambda tid, e, i: True), "acked")
+        self.assertEqual(fate(**advancing, _load_held=lambda: {key: entry},
+                              _advance_held=lambda tid, e, i: False), "staged")
+        held = [{key: entry}, {}]
+        self.assertEqual(fate(**advancing, _load_held=lambda: held.pop(0),
+                              _advance_held=lambda tid, e, i: False), "dropped")
 
     def test_an_empty_poll_body_is_a_logged_counted_anomaly(self):
         before = self.gw._POLL_ANOMALIES
@@ -634,8 +669,7 @@ class RoundAccountingTest(unittest.TestCase):
         self.assertEqual(len(lines), 1)
         self.assertIn("answered an empty body", lines[0])
         self.assertEqual(self.gw._POLL_ANOMALIES, before + 1)
-        self.assertEqual(loop.clock.slept, [], "still no back-off")
-        self.assertIn((True, {}), loop.status)
+        self.assertEqual(loop.clock.slept, [1], "an answer that settles nothing is not re-polled at once")
 
     def test_json_without_a_task_list_is_a_logged_anomaly(self):
         for answer, shape in (({"error": "busy"}, "dict without a tasks list"),
@@ -644,7 +678,18 @@ class RoundAccountingTest(unittest.TestCase):
             loop = self._run([], poll=lambda a=answer: a)
             self.assertTrue(any(shape in m for m in loop.logs if m.startswith("poll anomaly")),
                             answer)
-            self.assertEqual(loop.clock.slept, [], answer)
+            self.assertEqual(loop.clock.slept, [1], answer)
+
+    def test_a_run_of_malformed_answers_backs_off_and_thins_its_log(self):
+        with _Loop(self.gw) as loop, patch.dict(self.gw._LOG_COUNTS, clear=True):
+            loop._alive = [True] * 4 + [False]
+            self.gw._req = lambda method, path, *a, **k: (
+                loop.polls.append(path) or {"tasks": None} if path.startswith("/v1/tasks?") else {})
+            loop.run()
+        self.assertEqual(loop.clock.slept, [1, 2, 4, 8], "doubling, as before the anomaly line")
+        lines = [m for m in loop.logs if m.startswith("poll anomaly #")]
+        self.assertEqual(len(lines), 3, "logged the 1st, 2nd and 4th time")
+        self.assertIn("(seen 4 times)", lines[-1])
 
     def test_the_anomaly_names_status_length_and_edge_ray_from_the_real_request(self):
         import urllib.request
@@ -662,7 +707,7 @@ class RoundAccountingTest(unittest.TestCase):
             def read(self):
                 return b""
 
-        with _Loop(self.gw) as loop:
+        with _Loop(self.gw) as loop, patch.dict(self.gw._LOG_COUNTS, clear=True):
             real_req = loop._saved["_req"]
             self.gw._req = lambda method, path, *a, **k: (
                 real_req(method, path, *a, **k) if path.startswith("/v1/tasks?") else {})
