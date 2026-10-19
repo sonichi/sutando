@@ -304,7 +304,7 @@ from ._dirs import task_dir as _task_dir, result_dir as _result_dir, state_dir a
 from .chat_secret_filter import filter_chat_secrets, secret_handling_instruction
 from .task_archive import find_task_file
 from .local_task_protocol import find_archived_task
-from . import gateway_instance, local_task_protocol
+from . import agent_identity, gateway_instance, local_task_protocol
 from .result_markers import parse_markers, render_skill_prelude
 from .result_markers import neutralize_markers
 from . import undelivered_quarantine
@@ -479,13 +479,7 @@ _EVENT_CHANNEL = None
 _warned_legacy = set()
 
 
-def _unquote_env(v):
-    """Whitespace and surrounding quotes off a credential value.
-
-    The ONE definition every reader uses, so the env tier cannot disagree with
-    the file tiers about a quoted `.env` line.
-    """
-    return v.strip().strip("'\"") if v else v
+_unquote_env = agent_identity.unquote_env
 
 
 def _env_compat(new, old):
@@ -539,35 +533,13 @@ def _channel_env_candidates():
     _cfg = os.environ.get("CLAUDE_CONFIG_DIR")
     if _cfg:
         candidates.append(os.path.join(_cfg, "channels", CHANNEL_DIR, ".env"))
-    out = []
-    for path in candidates:
-        if not path:
-            continue
-        try:
-            with open(path, encoding="utf-8") as fh:
-                lines = fh.read().splitlines()
-        # Every candidate is read eagerly now, so one the old early-return never
-        # opened can be undecodable — and that is not an OSError.
-        except (OSError, UnicodeDecodeError):
-            continue
-        vals = {}
-        for ln in lines:
-            ln = ln.strip()
-            if not ln or ln.startswith("#") or "=" not in ln:
-                continue
-            key, _, val = ln.partition("=")
-            vals[key.strip()] = _unquote_env(val)
-        out.append((path, vals))
-    return out
+    return agent_identity.env_files(candidates)
 
 
 def _config_from_channel_env(key: str) -> str:
     """First candidate CARRYING `key`, else "". Presence decides, not truth: an
     explicit blank is a decision here exactly as it is in the environment."""
-    for _path, vals in _channel_env_candidates():
-        if key in vals:
-            return vals[key]
-    return ""
+    return agent_identity.file_value(_channel_env_candidates(), key)
 
 
 def _token_from_ag2space_env():
@@ -2220,25 +2192,9 @@ def _provision_base() -> str:
 def _reenroll_identity() -> str:
     """Agent mxid: process env, then the channel .env file — the same fallback
     the token uses (desktop launchers don't export either) — then the durable
-    per-host identity enrolment wrote to state/auth/ag2space.json."""
-    for key in ("AGENT_MXID", "AGENT_ID"):
-        v = (os.environ.get(key) or "").strip()
-        if v:
-            return v
-    for key in ("AGENT_MXID", "AGENT_ID", "AG2SPACE_USER_ID"):
-        v = _config_from_channel_env(key).strip()
-        if v:
-            return v
-    # Re-read per call, like the channel-env candidates: an identity that
-    # appears mid-episode must take effect without a restart.
-    try:
-        rec = json.loads((_STATE / "auth" / "ag2space.json").read_text())
-        # Non-string values must read as unknown, not be coerced into a
-        # garbage identity that _reenroll_claim would POST on the cadence.
-        v = rec.get("agent_id")
-        return v.strip() if isinstance(v, str) else ""
-    except Exception:  # absent, unreadable, or malformed — identity unknown
-        return ""
+    per-host identity enrolment wrote to state/auth/ag2space.json. Re-read per
+    call, so an identity that appears mid-episode takes effect without a restart."""
+    return agent_identity.resolve(_STATE, _config_from_channel_env)
 
 
 def _reenroll_claim() -> None:
@@ -3758,6 +3714,9 @@ def _emit_gateway_status(connected: bool, *, error: str | None = None,
             # Re-read on every write, so a lane switch or re-login shows at the next poll.
             "agent_id": (_reenroll_identity() or None) if connected else None,
             "launched_via": _LAUNCHED_VIA,
+            # Read by an adapter's verify: which inbox this bridge actually feeds.
+            "tasks_dir": os.path.realpath(TASKS_DIR),
+            "results_dir": os.path.realpath(RESULTS_DIR),
             "schema_version": 1,
             "runtime": {**RUNTIME_IDENTITY, "engine": _engine_desc(),
                         **_ENGINE_COUNTS},

@@ -559,6 +559,17 @@ class ConnectBase(unittest.TestCase):
         cm._write(cli.config_path(), cli.render_config(self.values(**over)), 0o600)
         return cli.config_path()
 
+    def status(self, state=None, name="gateway-status.json", **over):
+        """A bridge's gateway status, as the bridge writes it each poll, feeding this test's root by default."""
+        state = Path(state) if state else cli.bridge_state(cli.read_config(cli.config_path()))
+        state.mkdir(parents=True, exist_ok=True)
+        rec = {"connected": True, "ts": int(time.time()), "agent_id": None, "error": None,
+               "tasks_dir": os.path.realpath(self.inbox), "results_dir": os.path.realpath(self.results)}
+        rec.update(over)
+        (state / name).write_text(json.dumps(rec))
+        self.addCleanup((state / name).unlink, missing_ok=True)     # the default state dir outlives a test
+        return state / name
+
     def session(self):
         p = self.home / "claude-session.json"
         return json.loads(p.read_text()) if p.exists() else None
@@ -618,6 +629,12 @@ class ConnectRender(ConnectBase):
             self.assertNotIn("REMOTE_TASK_TOKEN", text)
         self.assertEqual([ln for ln in unit.splitlines() if ln.startswith("Environment=")], [f"Environment={cm.MANAGED_VAR}=1"],
                          "the unit carries paths in ExecStart and the one marker, no values")
+        bridge = cm.render_service(cli.BRIDGE, "/x/ag2-sparrow", {"B": 'p"q%r\\s', "A": "a b"})
+        self.assertIn("ExecStart=/x/ag2-sparrow\n", bridge, "no arguments")
+        self.assertIn('Environment="A=a b"\nEnvironment="B=p\\"q%%r\\\\s"\n', bridge,
+                      "sorted, quoted, with systemd's escapes and specifiers neutralized")
+        self.assertTrue(bridge.startswith(f"# Written by {cli.COMMAND} install;"), "the marker names who wrote it")
+        self.assertTrue(cm.marked(plist, cli.PLIST_MARKER), plist[:200])
         self.assertTrue(cm.marked("<?xml?>\n" + cli.MARKER + "\nx", cli.MARKER), "a marker on the second line counts")
         self.assertFalse(cm.marked("a\nb\n" + cli.MARKER, cli.MARKER), "the marker is a leading line")
 
@@ -1516,10 +1533,10 @@ class ConnectBranches(ConnectBase):
         self.configure()
         self.assertIn("auth status did not run", cli.auth_problem(dict(cfg, CLAUDE=str(self.home / "none"))))
         self.assertIsNone(cli.cli_version(str(self.home / "none")))
-        self.relay.unlink()
         rc, out, _ = self.main("verify")
-        self.assertIn("FAIL relay token", out)
-        self.assertIn("missing: Sparrow has no token", out)
+        self.assertIn("FAIL bridge: no bridge wrote a status under", out)
+        self.assertIn(f"start the bridge with AGENT_CONNECT_TASK_DIR={self.work}/tasks", out)
+        self.assertNotIn("relay token", out, "an explicit root's bridge is yours: no host relay.env is assumed")
         with self.assertRaises(SystemExit) as e, contextlib.redirect_stderr(io.StringIO()):
             cli.main(["nonsense"])
         self.assertEqual(e.exception.code, 2)
@@ -1655,12 +1672,13 @@ class ConnectVerify(ConnectBase):
         runner = self.runner()
         self.assertEqual(self.install_with(runner)[0], 0)
         (self.home / "task-hmac.key").write_text("ab" * 32)
+        self.status()
         with mock.patch.object(cm, "_run", side_effect=runner):
             rc, out, _ = self.main("verify")
         self.assertEqual(rc, 0, out)
         self.assertEqual(set(self.checks(out).values()), {"PASS"}, out)
         self.assertEqual(set(self.checks(out)), {"config", "claude", "login", "tmux", "socket", "plugin", "inbox", "results",
-                                                 "hmac", "hitl", "relay", "supervisor"})
+                                                 "hmac", "hitl", "bridge", "supervisor"})
         self.assertIn(f"INFO job: {cli.SERVICE_NAME} active", out)
         self.assertIn(f"INFO session: {self.work} held by hold pid {runner.pid()}, no live claude attached (manager", out,
                       "the shared tri-state, naming the lock's holder")
@@ -1676,9 +1694,9 @@ class ConnectVerify(ConnectBase):
         (self.plugin / ".claude-plugin" / "plugin.json").unlink()
         self.assertEqual(self.checks(self.main("verify")[1])["plugin"], "FAIL")
         (self.plugin / ".claude-plugin" / "plugin.json").write_text("{}")
-        self.relay.chmod(0o644)
-        self.assertEqual(self.checks(self.main("verify")[1])["relay"], "FAIL")
-        self.relay.chmod(0o600)
+        self.status(ts=int(time.time()) - cli.STATUS_MAX_AGE_S - 5)
+        self.assertEqual(self.checks(self.main("verify")[1])["bridge"], "FAIL", "a stale status is no bridge")
+        self.status()
         (self.home / "claude-auth").write_text('{"loggedIn": false}')
         out = self.main("verify")[1]
         self.assertEqual(self.checks(out)["login"], "FAIL")
@@ -1706,6 +1724,354 @@ class ConnectVerify(ConnectBase):
         self.assertEqual(_dirs.device_env_path(), self.relay)
         with mock.patch.dict(os.environ, {"AG2_DEVICE_ENV": "/elsewhere/relay.env"}):
             self.assertEqual(_dirs.device_env_path(), Path("/elsewhere/relay.env"))
+
+
+class BridgeFake:
+    """The agent bridge's own manager state, so its unit never reaches the launcher's Runner: commands
+    naming the bridge's service or label answer here, every other command goes to `runner`."""
+
+    def __init__(self, runner, table=None):
+        self.runner, self.table, self.calls = runner, dict(table or {}), []
+        self.active = self.enabled = self.registered = False
+
+    def ours(self, cmd):
+        return any(cli.BRIDGE.service_name in a or cli.BRIDGE.agent_label in a for a in cmd)
+
+    def __call__(self, cmd, timeout=30):
+        if not self.ours(cmd):
+            return self.runner(cmd, timeout)
+        self.calls.append(list(cmd))
+        verb = cmd[1] if cmd[0] == "launchctl" else next(a for a in cmd[1:] if not a.startswith("--"))
+        if verb in self.table:
+            got = self.table[verb]
+            return None if got is None else subprocess.CompletedProcess(cmd, got, "", "exit %s" % got)
+        out = ""
+        if verb == "show":
+            loaded = cm.service_path(cli.BRIDGE).exists() or self.registered
+            words = {"LoadState": "loaded" if loaded else "not-found", "ActiveState": "active" if self.active else "inactive",
+                     "UnitFileState": "enabled" if self.enabled else "disabled"}
+            out = "".join(words[k] + "\n" for k in cmd[cmd.index("-p") + 1].split(","))
+        elif verb == "print":
+            if not self.registered:
+                return subprocess.CompletedProcess(cmd, 113, "", 'Could not find service "%s" in domain\n' % cli.BRIDGE.agent_label)
+            return subprocess.CompletedProcess(cmd, 0, "\tstate = running\n" if self.active else "\tstate = waiting\n", "")
+        elif verb in ("enable", "disable"):
+            self.enabled = verb == "enable"
+        elif verb in ("restart", "bootstrap"):
+            self.active = self.registered = True
+        elif verb in ("stop", "bootout"):
+            self.active = False
+            self.registered = self.registered and verb == "stop"
+        return subprocess.CompletedProcess(cmd, 0, out, "")
+
+    def verbs(self):
+        return [c[1] if c[0] == "launchctl" else next(a for a in c[1:] if not a.startswith("--")) for c in self.calls]
+
+
+AGENT = "@probe.agent:ag2.space"
+
+
+class AgentRootBase(ConnectBase):
+    def setUp(self):
+        super().setUp()
+        self.relay.write_text(f"REMOTE_TASK_TOKEN={TOKEN}\nAGENT_MXID={AGENT}\n")
+        self.agents = self.home / ".ag2-sparrow" / "agents"
+        self.root = self.agents / "probe.agent_ag2.space"
+        self.scripts = mock.patch.object(cm, "console_script", side_effect=lambda shape: str(self.bin / shape.command))
+        self.scripts.start()
+        self.addCleanup(self.scripts.stop)
+
+    def bridged(self, table=None, root=None, **kw):
+        runner = Runner(table, 0, str(root or self.root), **kw)
+        self.runners.append(runner)
+        return BridgeFake(runner)
+
+    def install_default(self, fake, *extra, mac=False):
+        with mock.patch.object(cm, "_run", side_effect=fake), mock.patch.object(cm, "is_macos", return_value=mac):
+            return self.main("install", "--plugin-dir", str(self.plugin), "--claude-config-dir", str(self.home / ".claude-sutando"),
+                             "--hmac-key-file", str(self.home / "task-hmac.key"), *extra)
+
+    def cfg(self):
+        return cli.read_config(cli.config_path())
+
+
+class ConnectAgentRoot(AgentRootBase):
+    """With no explicit root the root is the agent's own, named by its id, and install wires the agent's
+    bridge to exactly that root: its own unit here, a declaration under a host supervisor."""
+
+    def test_the_default_root_is_the_agents_own_and_its_bridge_unit_feeds_exactly_it(self):
+        fake = self.bridged()
+        rc, out, err = self.install_default(fake)
+        self.assertEqual(rc, 0, err)
+        cfg = self.cfg()
+        self.assertEqual((cfg["ROOT"], cfg["INBOX_DIR"], cfg["RESULTS_DIR"], cfg["AGENT_ID"], cfg["BRIDGE"]),
+                         (str(self.root), str(self.root / "tasks"), str(self.root / "results"), AGENT, "unit"))
+        home = cli.bridge_home(self.root)
+        self.assertEqual(home, self.agents / "probe.agent_ag2.space.bridge", "beside the root, never in it")
+        self.assertEqual((cfg["TOKEN_ENV_FILE"], cfg["HITL_STORE"]),
+                         (str(self.relay), str(home / "state" / "hitl" / "requirements-claude-local")))
+        unit = cm.service_path(cli.BRIDGE).read_text()
+        self.assertTrue(cm.marked(unit, cli.BRIDGE.marker))
+        self.assertIn(f"Written by {cli.COMMAND} install", unit)
+        self.assertIn(f"ExecStart={self.bin / 'ag2-sparrow'}\n", unit, "the bridge's console script, no arguments")
+        env = sorted(ln for ln in unit.splitlines() if ln.startswith('Environment="'))
+        self.assertEqual(env, sorted([f'Environment="AGENT_CONNECT_TASK_DIR={self.root}/tasks"',
+                                      f'Environment="AGENT_CONNECT_RESULT_DIR={self.root}/results"',
+                                      f'Environment="AGENT_CONNECT_STATE_DIR={home}/state"',
+                                      f'Environment="AGENT_MXID={AGENT}"', f'Environment="AG2_DEVICE_ENV={self.relay}"']))
+        self.assertNotIn(TOKEN, unit + cli.config_path().read_text(), "the token stays in its file")
+        self.assertEqual(fake.verbs(), ["show", "enable", "restart"], "absent: registered and started, no stop")
+        self.assertIn(f"started: {cli.BRIDGE.service_name}, feeding {self.root}/tasks as {AGENT}", out)
+        self.assertTrue((home / "state").is_dir())
+        self.assertEqual(sorted(p.name for p in self.root.iterdir()), ["results", "tasks"], "the root stays fresh")
+
+        fake.calls.clear()
+        rc, out, err = self.install_default(fake)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(fake.verbs(), ["show", "stop", "disable", "show", "enable", "restart"],
+                         "a reinstall stops the old bridge, proves it stopped, then starts the new unit")
+
+    def test_on_macos_the_bridge_is_a_plist_with_the_same_dirs(self):
+        rc, _, err = self.install_default(self.bridged(), mac=True)
+        self.assertEqual(rc, 0, err)
+        body = plistlib.loads(cm.plist_path(cli.BRIDGE).read_bytes())
+        self.assertEqual(body["ProgramArguments"], [str(self.bin / "ag2-sparrow")])
+        self.assertEqual((body["Label"], body["KeepAlive"]), (cli.BRIDGE.agent_label, True))
+        self.assertEqual({k: body["EnvironmentVariables"][k] for k in ("AGENT_CONNECT_TASK_DIR", "AGENT_CONNECT_RESULT_DIR")},
+                         {"AGENT_CONNECT_TASK_DIR": f"{self.root}/tasks", "AGENT_CONNECT_RESULT_DIR": f"{self.root}/results"})
+
+    def test_verify_checks_the_running_bridge_against_the_root_the_agent_and_its_token(self):
+        fake = self.bridged()
+        self.assertEqual(self.install_default(fake)[0], 0)
+        state = cli.bridge_home(self.root) / "state"
+        self.status(state, agent_id=AGENT, tasks_dir=os.path.realpath(self.root / "tasks"),
+                    results_dir=os.path.realpath(self.root / "results"))
+        with mock.patch.object(cm, "_run", side_effect=fake):
+            rc, out, _ = self.main("verify")
+            checks = ConnectVerify.checks(None, out)
+            self.assertEqual((checks["bridge"], checks["relay"], checks["hitl"]), ("PASS", "PASS", "PASS"), out)
+            self.assertIn(f"PASS bridge unit: {cm.service_path(cli.BRIDGE)} ({cli.BRIDGE.service_name} active)", out)
+            self.assertIn(f"INFO agent: {AGENT}", out)
+            (state / "gateway-status.dev.json").write_text("{torn")
+            self.assertIn("PASS bridge", self.main("verify")[1], "an unreadable status is no bridge, never a crash")
+            for over, why in ((dict(agent_id="@other:x"), "the bridge serves @other:x, not " + AGENT),
+                              (dict(results_dir="/elsewhere"), "results go to /elsewhere"),
+                              (dict(connected=False, error="401"), "runs but is not connected (401)"),
+                              (dict(tasks_dir="/elsewhere/tasks"), "the running bridge feeds /elsewhere/tasks, not"),
+                              (dict(tasks_dir=None), "feeds an unreported inbox")):
+                self.status(state, **dict(dict(agent_id=AGENT, tasks_dir=os.path.realpath(self.root / "tasks"),
+                                               results_dir=os.path.realpath(self.root / "results")), **over))
+                out = self.main("verify")[1]
+                self.assertIn("FAIL bridge: ", out, over)
+                self.assertIn(why, out)
+            self.assertIn(f"see journalctl --user -u {cli.BRIDGE.service_name}, or run {cli.COMMAND} install again", out)
+            self.relay.chmod(0o644)
+            self.assertEqual(ConnectVerify.checks(None, self.main("verify")[1])["relay"], "FAIL", "the agent's token file")
+            cm.service_path(cli.BRIDGE).unlink()
+            self.assertIn(f"FAIL bridge unit: {cm.service_path(cli.BRIDGE)} missing", self.main("verify")[1])
+
+    def test_uninstall_removes_the_marked_bridge_unit_and_keeps_its_state_and_a_foreign_unit_refuses(self):
+        fake = self.bridged()
+        self.assertEqual(self.install_default(fake)[0], 0)
+        fake.calls.clear()
+        with mock.patch.object(cm, "_run", side_effect=fake):
+            rc, out, err = self.main("uninstall")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(fake.verbs(), ["show", "stop", "disable", "show"])
+        self.assertIn(f"removed: {cm.service_path(cli.BRIDGE)}", out)
+        self.assertLess(out.index(f"removed: {cm.service_path(cli.BRIDGE)}"), out.index(f"removed: {cli.config_path()}"))
+        self.assertTrue((cli.bridge_home(self.root) / "state").is_dir(), "the bridge's state is kept")
+        fake = self.bridged()
+        self.assertEqual(self.install_default(fake)[0], 0)
+        cm.service_path(cli.BRIDGE).write_text("[Service]\nExecStart=/mine\n")
+        with mock.patch.object(cm, "_run", side_effect=fake):
+            rc, _, err = self.main("uninstall")
+        self.assertEqual(rc, 1)
+        self.assertIn("was not written by install", err)
+        self.assertTrue(cli.config_path().exists(), "config last: kept on any refusal")
+        rc, _, err = self.install_default(fake)
+        self.assertEqual(rc, 2, err)
+        self.assertIn("the session is installed but its bridge is not", err)
+        cm.service_path(cli.BRIDGE).unlink()
+        for table, why in (({"show": None}, "state is unknown"), ({"stop": None}, "could not run"),
+                           ({"restart": 1}, "restart")):
+            fake.table = table
+            rc, _, err = self.install_default(fake)
+            self.assertEqual(rc, 2, table)
+            self.assertIn(why, err)
+            fake.table = {}
+        fake.table = {"show": None}
+        with mock.patch.object(cm, "_run", side_effect=fake):
+            rc, _, err = self.main("uninstall")
+        self.assertEqual((rc, "state is unknown" in err), (1, True))
+        fake.table = {"stop": None}
+        with mock.patch.object(cm, "_run", side_effect=fake):
+            self.assertEqual(self.main("uninstall")[0], 1)
+        fake.table = {}
+        with mock.patch.object(cm, "_run", side_effect=fake):
+            self.assertEqual(self.main("uninstall")[0], 0)
+        with mock.patch.object(cm, "console_script",
+                               side_effect=lambda shape: "" if shape is cli.BRIDGE else str(self.bin / shape.command)):
+            rc, _, err = self.install_default(fake)
+        self.assertEqual(rc, 2, err)
+        self.assertIn("its bridge is not: ag2-sparrow was not found beside", err)
+
+    def test_install_refuses_an_unknown_agent_a_missing_token_and_a_bridge_already_serving_it(self):
+        self.relay.write_text(f"REMOTE_TASK_TOKEN={TOKEN}\n")
+        rc, _, err = self.install_default(self.bridged())
+        self.assertEqual(rc, 2)
+        self.assertIn(f"the agent id is unknown, so its root cannot be named: bind the agent first, or set AGENT_MXID in "
+                      f"{self.relay} or the environment, or pass --work <dir>", err)
+        self.assertFalse(cli.config_path().exists() or self.agents.exists(), "nothing written")
+        with mock.patch.dict(os.environ, {"AGENT_MXID": AGENT}):
+            rc, _, err = self.install_default(self.bridged(), "--token-env-file", str(self.home / "none.env"))
+        self.assertEqual(rc, 2)
+        self.assertIn(f"{self.home / 'none.env'} is missing: put the agent's REMOTE_TASK_TOKEN there", err)
+        rc, _, err = self.install_default(self.bridged(), "--work", str(self.work), "--token-env-file", str(self.relay))
+        self.assertEqual((rc, "--token-env-file is for the bridge this install runs" in err), (2, True))
+        self.relay.write_text(f"REMOTE_TASK_TOKEN={TOKEN}\nAGENT_MXID={AGENT}\n")
+        self.status(_dirs.state_dir(), agent_id=AGENT, tasks_dir="/host/tasks")
+        rc, _, err = self.install_default(self.bridged())
+        self.assertEqual(rc, 2)
+        self.assertIn(f"a running bridge already serves {AGENT}", err)
+        self.assertIn("one token is one bridge", err)
+        self.assertFalse(cli.config_path().exists())
+
+    def test_the_host_binding_names_the_agent_only_for_the_hosts_own_token(self):
+        self.relay.write_text(f"REMOTE_TASK_TOKEN={TOKEN}\n")
+        auth = _dirs.state_dir() / "auth"
+        auth.mkdir(parents=True, exist_ok=True)
+        (auth / "ag2space.json").write_text(json.dumps({"agent_id": "@bound:ag2.space"}))
+        self.addCleanup((auth / "ag2space.json").unlink, missing_ok=True)
+        bound = self.agents / "bound_ag2.space"
+        fake = self.bridged(root=bound)
+        rc, _, err = self.install_default(fake)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self.cfg()["ROOT"], str(bound), "bind first: the host's binding names its own token's agent")
+        other = self.home / "second.env"
+        other.write_text(f"REMOTE_TASK_TOKEN={TOKEN}\n")
+        with mock.patch.object(cm, "_run", side_effect=fake):
+            self.assertEqual(self.main("uninstall")[0], 0)
+        rc, _, err = self.install_default(self.bridged(), "--token-env-file", str(other))
+        self.assertEqual(rc, 2)
+        self.assertIn(f"set AGENT_MXID in {other}", err, "another token never borrows the host's binding")
+        other.write_text(f"REMOTE_TASK_TOKEN={TOKEN}\nAGENT_MXID=@second:ag2.space\n")
+        second = self.agents / "second_ag2.space"
+        rc, _, err = self.install_default(self.bridged(root=second), "--token-env-file", str(other))
+        self.assertEqual(rc, 0, err)
+        self.assertEqual((self.cfg()["ROOT"], self.cfg()["TOKEN_ENV_FILE"]), (str(second), str(other)))
+        self.assertNotEqual(second, bound, "two agents, two roots")
+
+    def test_a_root_recorded_for_another_agent_is_refused_at_install_and_by_the_launcher(self):
+        self.work.mkdir()
+        self.assertEqual(inbox.prepare_root(str(self.work)), "")
+        records.save_supervisor(str(self.work), dict(records.empty_supervisor(), agent_id="@other:ag2.space"))
+        rc, _, err = self.install_with(self.runner(), False, "--work", str(self.work))
+        self.assertEqual(rc, 1)
+        self.assertIn(f"the work root {self.work} serves the agent @other:ag2.space, not {AGENT}; two agents never share "
+                      "a root", err)
+        self.assertFalse(cli.config_path().exists(), "refused before anything was applied")
+        cfg = dict(self.values(AGENT_ID=AGENT), ROOT=str(self.work))
+        lc = launcher.Launcher(cfg, cli.config_dir())
+        with mock.patch.object(tmux_pane_keys, "fence_status", return_value="clear"), \
+                mock.patch.object(task_io, "holder_consumer", return_value=None):
+            ok, problem = lc.create(records.empty_supervisor())
+        self.assertEqual((ok, lc.refused), (False, problem), "terminal: the manager stops")
+        self.assertIn("serves the agent @other:ag2.space", problem)
+        records.supervisor_path(str(self.work)).write_text("[")
+        self.assertIn("the work root's record is unreadable", records.agent_problem(str(self.work), AGENT))
+        self.assertEqual(records.agent_problem(str(self.home / "fresh"), AGENT), "", "nothing recorded yet")
+
+    def test_an_explicit_root_records_the_hosts_agent_and_an_old_config_reads_as_external(self):
+        rc, _, err = self.install_with(self.runner(), False, "--work", str(self.work))
+        self.assertEqual(rc, 0, err)
+        self.assertEqual((self.cfg()["BRIDGE"], self.cfg()["AGENT_ID"], self.cfg()["TOKEN_ENV_FILE"]), ("external", AGENT, ""))
+        self.assertFalse(cm.service_path(cli.BRIDGE).exists(), "an explicit root's bridge is yours")
+        self.assertEqual(cli.bridge_mode({}), "external", "a config from before BRIDGE existed")
+
+
+class ConnectHostSupervised(AgentRootBase):
+    """Under a host supervisor (injected through _dirs) install writes a declaration, never a job."""
+
+    def setUp(self):
+        super().setUp()
+        self.ws = self.home / "ws"
+        self.agents = self.ws / "agents"
+        self.root = self.agents / "probe.agent_ag2.space"
+        saved = _dirs._injected
+        _dirs.set_dirs(state_dir=self.ws / "state", agents_dir=self.agents, bridge_host="sparrowd")
+        self.addCleanup(setattr, _dirs, "_injected", saved)
+        os.environ["AGENT_MXID"] = AGENT
+
+    def decl(self):
+        return cli.bridge_home(self.root) / cli.DECLARATION
+
+    def test_the_declaration_points_a_named_worker_at_exactly_the_root_with_the_token_in_the_vault(self):
+        fake = self.bridged()
+        rc, out, err = self.install_default(fake)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(fake.calls, [], "no bridge job of its own")
+        self.assertFalse(cm.service_path(cli.BRIDGE).exists())
+        body = json.loads(self.decl().read_text())
+        seg = "probe.agent_ag2.space"
+        self.assertEqual(body["env"], {"AGENT_CONNECT_TASK_DIR": f"{self.root}/tasks",
+                                       "AGENT_CONNECT_RESULT_DIR": f"{self.root}/results",
+                                       "AGENT_CONNECT_STATE_DIR": f"{self.root}.bridge/state", "AGENT_MXID": AGENT})
+        self.assertEqual((body["name"], body["token_vault_key"], body["host"], body["module"]),
+                         (cli.worker_name(seg), cli.vault_key(seg), "sparrowd", "ag2_sparrow.remote_gateway_bridge"))
+        self.assertRegex(body["name"], r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$", "sparrowd's worker-name rule")
+        self.assertEqual((self.cfg()["BRIDGE"], self.cfg()["TOKEN_VAULT_KEY"], self.cfg()["TOKEN_ENV_FILE"]),
+                         ("sparrowd", cli.vault_key(seg), ""))
+        self.assertIn(f"vault set {cli.vault_key(seg)} <the agent's relay token>", out)
+        self.assertNotIn(TOKEN, self.decl().read_text())
+        for a, b in (("probe.agent_ag2.space", "probe-agent_ag2.space"), ("a_b", "a.b")):
+            self.assertNotEqual(cli.worker_name(a), cli.worker_name(b), "two agents never share a worker name")
+            self.assertNotEqual(cli.vault_key(a), cli.vault_key(b))
+        with mock.patch.object(cm, "_run", side_effect=fake):
+            out = self.main("verify")[1]
+        self.assertIn(f"INFO relay token: the vault key {cli.vault_key(seg)}, read by sparrowd at start", out)
+        self.assertIn(f"FAIL bridge: no bridge wrote a status under {self.root}.bridge/state", out)
+        self.assertIn(f"sparrowd runs no worker from {self.decl()} yet", out)
+        self.assertNotIn("relay token:", [ln.split(" ", 1)[1][:12] for ln in out.splitlines() if ln.startswith(("PASS", "FAIL"))])
+        with mock.patch.object(cm, "_run", side_effect=fake):
+            rc, out, err = self.main("uninstall")
+        self.assertEqual(rc, 0, err)
+        self.assertIn(f"removed: {self.decl()}", out)
+        self.assertFalse(self.decl().exists())
+
+    def test_a_foreign_declaration_is_never_replaced_or_removed(self):
+        self.decl().parent.mkdir(parents=True)
+        fake = self.bridged()
+        for text in ('{"written_by": "someone else"}', "not json", "[1]"):
+            self.decl().write_text(text)
+            rc, _, err = self.install_default(fake)
+            self.assertEqual(rc, 2, err)
+            self.assertIn("was not written by install", err)
+            self.assertEqual(self.decl().read_text(), text)
+            with mock.patch.object(cm, "_run", side_effect=fake):
+                self.assertEqual(self.main("uninstall")[0], 1)
+            self.assertTrue(cli.config_path().exists())
+        self.decl().unlink()
+        with mock.patch.object(cm, "_run", side_effect=fake):
+            self.assertEqual(self.main("uninstall")[0], 0)
+
+    def test_the_host_names_no_token_file_and_needs_the_id_from_the_environment(self):
+        rc, _, err = self.install_default(self.bridged(), "--token-env-file", str(self.relay))
+        self.assertEqual((rc, "--token-env-file is not read under sparrowd" in err), (2, True))
+        os.environ.pop("AGENT_MXID")
+        rc, _, err = self.install_default(self.bridged())
+        self.assertEqual(rc, 2)
+        self.assertIn("set AGENT_MXID in the environment, or pass --work <dir>", err, "the host's binding is its own agent")
+        self.status(self.ws / "state", agent_id=AGENT, tasks_dir=str(self.ws / "tasks"))
+        os.environ["AGENT_MXID"] = AGENT
+        rc, _, err = self.install_default(self.bridged())
+        self.assertIn(f"a running bridge already serves {AGENT}", err, "the host's own agent is never a second bridge")
+
+    def test_an_explicit_root_under_the_host_records_only_an_id_from_the_environment(self):
+        os.environ.pop("AGENT_MXID")
+        rc, _, err = self.install_with(self.runner(), False, "--work", str(self.work))
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self.cfg()["AGENT_ID"], "", "the host's binding is not this root's agent")
 
 
 class ConnectOccupancy(ConnectBase):

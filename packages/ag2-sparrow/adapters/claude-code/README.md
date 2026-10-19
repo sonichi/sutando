@@ -154,14 +154,52 @@ which the poll is ≤1 s. The installed shape is the interactive one.
 ```bash
 ag2-sparrow-claude-local install \
   --plugin-dir packages/ag2-sparrow/adapters/claude-code/ag2space-inbox \
-  --work <work> \
-  --claude-config-dir <workspace>/.claude-sutando \
-  --hmac-key-file <workspace>/state/auth/task-hmac.key
+  --claude-config-dir <dir> \
+  [--token-env-file <the agent's .env>] [--work <work>]
 ag2-sparrow-claude-local verify
 ag2-sparrow-claude-local attach          # the live pane; detach with the tmux prefix + d
 ag2-sparrow-claude-local stop --confirm  # confirm an open stall card's Stop on this machine
 ag2-sparrow-claude-local uninstall
 ```
+
+**The agent's root and its bridge.** One bridge serves one agent (its relay
+token), so each agent gets its own root and its own bridge. With no `--work`,
+install names the agent by the bridge's own identity chain (`AGENT_MXID` /
+`AGENT_ID` in the environment, then in the token's `.env` file, then the
+host's binding `<state>/auth/ag2space.json`, which counts only for the host's
+own token) and uses `<agents dir>/<segment>/` as the root: `~/.ag2-sparrow/agents/`
+for plain Sparrow. The segment is the id as one path segment: `@local:server`
+becomes `local_server` when both parts are lowercase `[a-z0-9.-]`; any other id
+becomes a readable prefix, `__` and 12 hex of its sha256, so two agents never
+share a root. An id install cannot learn refuses with one line (bind the agent,
+set `AGENT_MXID`, or pass `--work`). Install then runs the agent's bridge as a
+unit of its own beside the launcher's (`ag2-sparrow-claude-local-bridge.service`,
+or the `ai.ag2.sparrow.claude-local-bridge` agent): `ag2-sparrow` with
+`AGENT_CONNECT_TASK_DIR=<root>/tasks`, `AGENT_CONNECT_RESULT_DIR=<root>/results`,
+`AGENT_CONNECT_STATE_DIR=<root>.bridge/state` (beside the root, never in it),
+`AGENT_MXID` and `AG2_DEVICE_ENV=<token file>` (`--token-env-file`, default
+Sparrow's device env; the token is never copied). `uninstall` stops and
+removes that marked unit and keeps the bridge's state. Install refuses an agent
+whose fresh gateway status shows another bridge already serving it (one token,
+one bridge).
+
+Under Sutando, run the entry `python3 src/sparrow-claude-local.py` instead of
+the console script: it injects `<workspace>/state`, `<workspace>/agents` and the
+host supervisor through `_dirs.set_dirs()`, so the root is
+`<workspace>/agents/<segment>/`, the id comes from `AGENT_MXID` in the
+environment only (the workspace's own binding is the core's agent), and
+install writes no job: it writes `<root>.bridge/worker.json`, a declaration
+naming the worker, the module, the same environment and the vault key the
+token is read from (`vault set AG2_RELAY_TOKEN_BRIDGE_… <token>`). sparrowd
+does not read it yet; until it does, `verify` fails the bridge row and says so.
+
+An explicit root (`--work`, `--inbox`, or `AGENT_CONNECT_TASK_DIR`) is served
+by a bridge you run; install records its agent when the host's chain names one
+and writes no bridge. Every root records its agent in the supervisor record on
+the first session; a later install or launch for another agent refuses, naming
+both. `verify` fails its `bridge` row unless a fresh, connected gateway status
+in the bridge's state dir reports exactly `<root>/tasks`, `<root>/results` and
+the recorded agent, and names the fix.
 
 **Process tree.** The service manager (`systemd --user`, or a launchd user
 agent) runs `run`, the launcher; `run` refuses unless
@@ -295,7 +333,8 @@ every start.
 
 `verify` prints PASS/FAIL per part (config, claude, login, tmux, socket and
 its length, plugin, inbox, results, hmac key, the HITL store being the
-bridge's, relay token, supervisor) and INFO lines: the HMAC mode (strict or
+bridge's, the bridge feeding this root, the agent's token file and bridge unit
+when install runs the bridge, supervisor) and INFO lines: the agent, the HMAC mode (strict or
 not), whether non-owner tasks are refused or submitted, the manager's state, the
 occupancy beside it (`held by hold pid N, its claude pid M`, `held by hold
 pid N, no live claude attached`, `restarting`, `unobserved`, never a bare

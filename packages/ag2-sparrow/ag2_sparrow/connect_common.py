@@ -79,14 +79,16 @@ class Shape:
     run_args: tuple = ("run",)
     keep_alive_on_success: "bool | None" = None
     manager_timeout_s: int = RUN_TIMEOUT_S
+    service_args: tuple = ("run",)      # systemd's ExecStart arguments
+    writer: str = ""        # the install that writes the unit, when it is not `command`'s own
 
     @property
     def marker(self) -> str:
-        return f"# Written by {self.command} install; re-run install to update it."
+        return f"# Written by {self.writer or self.command} install; re-run install to update it."
 
     @property
     def plist_marker(self) -> str:
-        return f"<!-- Written by {self.command} install; re-run install to update it. -->"
+        return f"<!-- Written by {self.writer or self.command} install; re-run install to update it. -->"
 
     @property
     def service_name(self) -> str:
@@ -326,41 +328,50 @@ def console_script(shape: Shape) -> str:
     return shutil.which(shape.command) or ""
 
 
-def render_service(shape: Shape, exec_start: str) -> str:
+def _unit_env(key: str, value: str) -> str:
+    """One quoted Environment= line; systemd expands % specifiers and backslash escapes inside quotes."""
+    value = value.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%")
+    return f'Environment="{key}={value}"\n'
+
+
+def render_service(shape: Shape, exec_start: str, env=None) -> str:
     """KillMode=control-group tears the whole cgroup down on stop; KillMode=process signals only the
     launcher and leaves a tmux-hosted session for the launcher's own stop path (then SIGKILL at
-    TimeoutStopSec)."""
+    TimeoutStopSec). `env` adds the job's own variables, one quoted line each."""
+    args = "".join(f" {a}" for a in shape.service_args)
+    extra = "".join(_unit_env(k, v) for k, v in sorted((env or {}).items()))
     return (f"{shape.marker}\n[Unit]\nDescription=ag2-sparrow {shape.name} ({shape.description})\n"
             "# A session that dies 5 times in 5 minutes (e.g. a bad login) is left failed.\n"
             "StartLimitIntervalSec=300\nStartLimitBurst=5\n\n"
-            f"[Service]\nExecStart={exec_start} run\nEnvironment={MANAGED_VAR}=1\nRestart=always\nRestartSec=10\n"
+            f"[Service]\nExecStart={exec_start}{args}\nEnvironment={MANAGED_VAR}=1\n{extra}Restart=always\nRestartSec=10\n"
             f"KillMode={shape.kill_mode}\nTimeoutStopSec={shape.stop_timeout_s}\n"
             f"# {EXIT_HELD}: another session already serves this work root; do not relaunch over it.\n"
             f"RestartPreventExitStatus={EXIT_HELD}\n\n[Install]\nWantedBy=default.target\n")
 
 
-def render_plist(shape: Shape, exec_start: str, path_env: str, log: str) -> str:
+def render_plist(shape: Shape, exec_start: str, path_env: str, log: str, env=None) -> str:
     """AbandonProcessGroup=false: when the launcher dies launchd SIGTERMs the rest of its process group
     once (never SIGKILL), then respawns after ThrottleInterval; ExitTimeOut bounds a bootout."""
     keep_alive = True if shape.keep_alive_on_success is None else {"SuccessfulExit": shape.keep_alive_on_success}
     body = {"Label": shape.agent_label, "ProgramArguments": [exec_start, *shape.run_args], "RunAtLoad": True,
             "KeepAlive": keep_alive, "ThrottleInterval": THROTTLE_S, "AbandonProcessGroup": False,
-            "ExitTimeOut": shape.stop_timeout_s, "EnvironmentVariables": {"PATH": path_env, MANAGED_VAR: "1"},
+            "ExitTimeOut": shape.stop_timeout_s,
+            "EnvironmentVariables": dict(env or {}, PATH=path_env, **{MANAGED_VAR: "1"}),
             "StandardOutPath": log, "StandardErrorPath": log}
     text = plistlib.dumps(body, sort_keys=True).decode("utf-8")
     head, rest = text.split("\n", 1)
     return f"{head}\n{shape.plist_marker}\n{rest}"
 
 
-def render_supervisor(shape: Shape) -> "tuple[str, str]":
+def render_supervisor(shape: Shape, env=None) -> "tuple[str, str]":
     """(text, '') or ('', why) when this package's console script cannot be found."""
     exec_start = console_script(shape)
     if not exec_start:
         return "", (f"{shape.command} was not found beside {sys.executable} or on PATH; reinstall ag2-sparrow for "
                     "this Python, then run install again")
     if is_macos():
-        return render_plist(shape, exec_start, os.environ.get("PATH", "/usr/bin:/bin"), str(log_path(shape))), ""
-    return render_service(shape, exec_start), ""
+        return render_plist(shape, exec_start, os.environ.get("PATH", "/usr/bin:/bin"), str(log_path(shape)), env), ""
+    return render_service(shape, exec_start, env), ""
 
 
 # ── the manager: explicit outputs only ───────────────────────────────────────
@@ -797,15 +808,21 @@ def check(results: list, ok: bool, name: str, detail: str) -> None:
     print(f"{'PASS' if ok else 'FAIL'} {name}: {detail}")
 
 
-def verify_tail(shape: Shape, cfg: dict, results: list, occupancy=None) -> None:
-    """The rows every shape ends with: the relay token's mode (never its content), the marked unit, the
-    manager's word, and who holds the work root (`occupancy(root)`: a shape's own wording of it)."""
-    relay = _dirs.device_env_path()
+def relay_check(results: list, relay: Path) -> None:
+    """The token file's mode, never its content."""
     try:
         mode = stat.S_IMODE(relay.stat().st_mode)
         check(results, not mode & 0o077, "relay token", f"{relay} mode {oct(mode)[2:]} (Sparrow's; never copied here)")
     except OSError:
         check(results, False, "relay token", f"{relay} missing: Sparrow has no token to poll with")
+
+
+def verify_tail(shape: Shape, cfg: dict, results: list, occupancy=None, relay=None) -> None:
+    """The rows every shape ends with: its bridge's token rows (`relay(results)`: only the shape knows
+    which bridge and token serve its root), the marked unit, the manager's word, and who holds the work
+    root (`occupancy(root)`: a shape's own wording of it)."""
+    if relay is not None:
+        relay(results)
     sup = supervisor_path(shape)
     text, problem = supervisor_text(sup)
     check(results, text is not None and marked(text, supervisor_marker(shape)), "supervisor",

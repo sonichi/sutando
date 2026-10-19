@@ -134,6 +134,18 @@ def load_supervisor(root, path=None) -> dict:
     return out
 
 
+def agent_problem(root, agent_id: str) -> str:
+    """'' unless the root's record names another agent (or cannot be read): one root, one agent."""
+    try:
+        recorded = load_supervisor(root).get("agent_id")
+    except RecordError as e:
+        return "the work root's record is unreadable (%s)" % e
+    if agent_id and recorded and recorded != agent_id:
+        return ("the work root %s serves the agent %s, not %s; two agents never share a root, so give this one "
+                "its own" % (root, recorded, agent_id))
+    return ""
+
+
 def save_supervisor(root, rec: dict) -> dict:
     rec = dict(rec, schema=SUPERVISOR_SCHEMA, updated_at=time.time())
     write_durable(supervisor_path(root), json.dumps(rec, sort_keys=True, indent=1).encode("utf-8"))

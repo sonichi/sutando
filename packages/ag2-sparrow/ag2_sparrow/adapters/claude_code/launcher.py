@@ -279,6 +279,11 @@ class Launcher:
         if problem:
             self.refused = "" if inbox.retryable(problem) else problem
             return False, problem
+        agent_id = self.cfg.get("AGENT_ID") or None
+        problem = records.agent_problem(self.root, agent_id or "")
+        if problem:
+            self.refused = problem
+            return False, problem
         problem = trust.record(self.cfg.get("CLAUDE_CONFIG_DIR", ""), os.path.join(self.root, "tasks"),
                                home=(os.environ if self.environ is None else self.environ).get("HOME", ""))
         if problem:
@@ -290,7 +295,7 @@ class Launcher:
             return False, problem
         self.created, self.adopted = nonce, False
         self._with_record(lambda r: dict(r, generation=generation, consumer=None, title_token=None, title_changed=None,
-                                         incident=None,
+                                         incident=None, agent_id=r.get("agent_id") or agent_id,
                                          stall=None, deadline=None, effect=None, install_id=self.opaque,
                                          launcher=task_io.process_identity()))
         consumer, title = await_consumer(self.tm, self.root, generation["pane_id"], sleep=self.sleep)

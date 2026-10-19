@@ -1,0 +1,104 @@
+"""The AG2 Space agent a bridge serves, and the one path segment a per-agent work root is named by.
+
+`resolve` is the bridge's identity chain, in its order: the process env (`AGENT_MXID`, `AGENT_ID`),
+then the channel .env files (`AGENT_MXID`, `AGENT_ID`, `AG2SPACE_USER_ID`), then the durable binding
+`<state>/auth/ag2space.json`'s `agent_id`. The gateway bridge and the installers read it here, so an
+install derives its root from exactly the identity the bridge will report. Stdlib only.
+
+`root_segment` maps an id to one path segment, lowercase `[a-z0-9._-]`, no leading dot, at most
+`SEGMENT_MAX` bytes. A plain MXID `@local:server` whose parts are lowercase `[a-z0-9.-]` (first
+character alphanumeric) becomes `local_server`: exactly one `_`, so the id reads back from it. Any
+other id becomes a readable prefix plus `__` and 12 hex of its sha256, so it never equals a plain
+one (which has no `__`) and two such ids differ by their digest.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+from pathlib import Path
+
+ENV_KEYS = ("AGENT_MXID", "AGENT_ID")
+FILE_KEYS = ("AGENT_MXID", "AGENT_ID", "AG2SPACE_USER_ID")
+SEGMENT_MAX = 64
+DIGEST_HEX = 12
+_PLAIN = re.compile(r"@([a-z0-9][a-z0-9.-]*):([a-z0-9][a-z0-9.-]*)")
+_UNSAFE = re.compile(r"[^a-z0-9._-]")
+
+
+def unquote_env(v):
+    """Whitespace and surrounding quotes off a credential value: the one definition every reader uses,
+    so the env tier cannot disagree with the file tiers about a quoted `.env` line."""
+    return v.strip().strip("'\"") if v else v
+
+
+def env_files(paths) -> list:
+    """Readable .env files in the given order, as [(path, {key: value})]; unreadable ones are skipped."""
+    out = []
+    for path in paths:
+        if not path:
+            continue
+        try:
+            with open(path, encoding="utf-8") as fh:
+                lines = fh.read().splitlines()
+        except (OSError, UnicodeDecodeError):
+            continue
+        vals = {}
+        for ln in lines:
+            ln = ln.strip()
+            if not ln or ln.startswith("#") or "=" not in ln:
+                continue
+            key, _, val = ln.partition("=")
+            vals[key.strip()] = unquote_env(val)
+        out.append((path, vals))
+    return out
+
+
+def file_value(files: list, key: str) -> str:
+    """The first file CARRYING `key`, else "": an explicit blank is a decision, as in the environment."""
+    for _path, vals in files:
+        if key in vals:
+            return vals[key]
+    return ""
+
+
+def enrolled(state_dir) -> str:
+    """The binding's `agent_id`, '' when absent, unreadable, malformed or not a string."""
+    if state_dir is None:
+        return ""
+    try:
+        rec = json.loads((Path(state_dir) / "auth" / "ag2space.json").read_text())
+        v = rec.get("agent_id")
+        return v.strip() if isinstance(v, str) else ""
+    except Exception:
+        return ""
+
+
+def resolve(state_dir, channel_value, environ=None) -> str:
+    """The agent id by the bridge's chain; `channel_value(key)` reads the channel .env tier. '' = unknown."""
+    env = os.environ if environ is None else environ
+    for key in ENV_KEYS:
+        v = (env.get(key) or "").strip()
+        if v:
+            return v
+    for key in FILE_KEYS:
+        v = (channel_value(key) or "").strip()
+        if v:
+            return v
+    return enrolled(state_dir)
+
+
+def root_segment(agent_id: str) -> str:
+    """The one path segment for `agent_id`; ValueError on an empty id."""
+    raw = (agent_id or "").strip()
+    if not raw:
+        raise ValueError("the agent id is empty")
+    m = _PLAIN.fullmatch(raw)
+    if m:
+        plain = f"{m.group(1)}_{m.group(2)}"
+        if len(plain) <= SEGMENT_MAX:
+            return plain
+    readable = _UNSAFE.sub("-", raw.lower().lstrip("@").replace(":", "_")).lstrip("._-")
+    readable = readable[:SEGMENT_MAX - DIGEST_HEX - 2].rstrip("._-") or "agent"
+    return f"{readable}__{hashlib.sha256(raw.encode('utf-8')).hexdigest()[:DIGEST_HEX]}"
