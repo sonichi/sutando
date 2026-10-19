@@ -1092,13 +1092,24 @@ def tombstone_consumer(work_root, expected: bytes, *, by: str, reason: str) -> P
 
 def release(owner: Owner) -> Released:
     """Under the module guard: validate the handle, remove the record only if it names this owner,
-    unlock and close (the root fd last), and only then mark released. Owner pid only."""
+    unlock and close (the root fd last), and only then mark released. Owner pid only. A record whose
+    attached consumer verifies alive or unobserved is LockError("consumer alive") with nothing
+    removed, unlocked or closed: the owner keeps the flock until it exits, and the record keeps
+    fencing the root by the consumer after that."""
     global _OWNER
     _check_owner(owner)
     with _guarded:
         _held_fds(owner)
         if _same_at(owner.fd, owner.dir_fd, LOCK_NAME):
             _lock_still_held(owner)
+            try:
+                prior = _read_prior(owner.dir_fd)
+            except (OSError, UnicodeError, ValueError):
+                prior = None
+            consumer = consumer_of(prior.record) if isinstance(prior, Valid) else None
+            if consumer is not None and holder_identity(prior.record) == (owner.pid, owner.start) \
+                    and verify_lineage(consumer["pid"], consumer["start"], prior.record["host"]) is not False:
+                raise LockError("consumer alive")
         removed = False
         try:
             if _same_at(owner.fd, owner.dir_fd, LOCK_NAME):

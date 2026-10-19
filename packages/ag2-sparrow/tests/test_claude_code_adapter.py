@@ -1951,6 +1951,32 @@ class HoldProcess(ConnectBase):
         self.assertIsNone(self.session(), "the shim was reaped unstarted")
         self.assertEqual(task_io.occupancy(str(self.work)), "free")
 
+    def test_hold_returning_beside_a_live_consumer_leaves_the_record_and_the_root_held(self):
+        """The kill-timeout path: hold returns while its claude still lives; release refuses, so the
+        record stays and the root never reads free beside the live session."""
+        from ag2_sparrow import task_io
+        self.configure()
+        (self.home / "claude-ignore-term").write_text("1")
+        (self.home / "claude-linger").write_text("60")
+        log = self.home / "hold.err"
+        with open(log, "w") as stream:      # a file: the surviving claude would keep a pipe open
+            rc = subprocess.run([sys.executable, "-c", HOLD_DRIVER % (str(PKG), "hold._supervise = lambda child, state: 9\n",
+                                                                       NONCE)],
+                                env=self.hold_env(), stdin=subprocess.DEVNULL, stdout=stream, stderr=stream,
+                                timeout=60).returncode
+        err = log.read_text()
+        consumer = task_io.holder_consumer(str(self.work))
+        self.addCleanup(lambda: consumer and alive(consumer["pid"]) and os.kill(consumer["pid"], signal.SIGKILL))
+        self.assertEqual(rc, 9, err)
+        self.assertIn("root stays held", err)
+        self.assertTrue(consumer and consumer["live"], "the record still names the live consumer")
+        self.assertEqual(task_io.occupancy(str(self.work)), "held", "hold exited; its live claude still fences")
+        with self.assertRaises(task_io.LockRefused):
+            task_io.acquire_lock(str(self.work), "sibling")
+        os.kill(consumer["pid"], signal.SIGKILL)
+        self.assertTrue(wait_gone(consumer["pid"], 10))
+        self.assertTrue(wait_for(lambda: task_io.occupancy(str(self.work)) == "free", 10))
+
     def test_kill_9_hold_with_a_hup_ignoring_consumer_never_shows_a_free_root_to_a_sibling_loop(self):
         """K1, as written: no root-free/live-consumer overlap and zero sibling acquisitions until the
         consumer exits; the loop runs through the gate windows too (it starts before hold)."""

@@ -122,6 +122,7 @@ class HolderLockTest(unittest.TestCase):
         """A live process and its start time."""
         p = subprocess.Popen(["sleep", "30"])
         self.addCleanup(lambda: (p.kill(), p.wait(WAIT)))
+        self.procs = dict(getattr(self, "procs", {}), **{str(p.pid): p})
         start = None
         for _ in range(50):
             start = self.hl.start_time(p.pid)
@@ -129,6 +130,23 @@ class HolderLockTest(unittest.TestCase):
                 break
             time.sleep(0.05)
         return p.pid, start
+
+    def end(self, pid):
+        p = self.procs[str(pid)]
+        p.kill()
+        p.wait(WAIT)
+
+    @staticmethod
+    def kill_quiet(pid):
+        with contextlib.suppress(OSError):
+            os.kill(pid, signal.SIGKILL)
+
+    def exit_owner(self, owner):
+        """What the owner's process exit does to a handle release refused: its descriptors close."""
+        for fd in (owner.fd, owner.dir_fd, owner.root_fd):
+            os.close(fd)
+        owner.released = True
+        self.hl._OWNER = None
 
     def dead(self):
         """A pid that ran and is gone, with the start it had."""
@@ -2188,6 +2206,7 @@ class HolderLockTest(unittest.TestCase):
         self.assertEqual(str(e.exception), "consumer attached")
         self.assertEqual((self.ldir() / "holder").read_bytes(), attached)
         self.assertEqual(self.hl.status(str(self.root))["consumer_lineage"], True)
+        self.end(cpid)
         self.assertEqual(self.hl.release(owner), self.hl.Released(True), "release validates the owner fields")
         owner = self.owned()
         self.hl.publish(owner, "routine")
@@ -2195,6 +2214,40 @@ class HolderLockTest(unittest.TestCase):
         with self.assertRaises(self.hl.LockError) as e:
             self.hl.attach_consumer(owner, b"", pid=cpid, start=cstart)
         self.assertEqual(str(e.exception), "released")
+
+    def test_release_refuses_while_the_consumer_is_alive_or_unobserved_and_keeps_the_flock(self):
+        owner = self.owned()
+        self.hl.publish(owner, "claude-local")
+        cpid, cstart = self.proc()
+        self.hl.attach_consumer(owner, (self.ldir() / "holder").read_bytes(), pid=cpid, start=cstart)
+        attached = (self.ldir() / "holder").read_bytes()
+        for seen in (True, None):
+            with mock.patch.object(self.hl, "verify_lineage", side_effect=lambda pid, start, host=None:
+                                   seen if pid == cpid else True), self.assertRaises(self.hl.LockError) as e:
+                self.hl.release(owner)
+            self.assertEqual(str(e.exception), "consumer alive")
+            self.assertEqual((self.ldir() / "holder").read_bytes(), attached, "nothing removed")
+            self.assertFalse(owner.released)
+            self.assertFalse(self.lock_free(), "the flock is kept")
+        self.end(cpid)
+        self.assertEqual(self.hl.release(owner), self.hl.Released(True), "a dead consumer: the record goes")
+        code = ("import os, subprocess, time\nroot = %r\n"
+                "o = hl.acquire(root, install_id=hl.install_id()).owner; hl.publish(o, 'claude-local')\n"
+                "c = subprocess.Popen(['sleep', '300'], start_new_session=True, stdin=-3, stdout=-3, stderr=-3)\n"
+                "st = None\nwhile not st: st = hl.start_time(c.pid); time.sleep(0.02)\n"
+                "hl.attach_consumer(o, open(os.path.join(hl.lock_dir(root), 'holder'), 'rb').read(), pid=c.pid, start=st)\n"
+                "try:\n    hl.release(o); print('released', c.pid)\n"
+                "except hl.LockError as e:\n    print('refused', c.pid, e)\n") % str(self.root)
+        out, err = self.run_py(code).communicate(timeout=WAIT)
+        word, pid = out.split()[:2]
+        self.addCleanup(self.kill_quiet, int(pid))
+        self.assertEqual(word, "refused", out + err)
+        self.assertEqual(self.hl.occupancy(str(self.root)), "held", "the holder exited; its live consumer still fences")
+        os.kill(int(pid), signal.SIGKILL)
+        deadline = time.monotonic() + WAIT
+        while self.hl.occupancy(str(self.root)) != "free" and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertEqual(self.hl.occupancy(str(self.root)), "free", "the consumer gone, nobody fences")
 
     def test_release_validates_the_owner_fields_of_a_schema_2_record(self):
         owner = self.owned()
@@ -2208,7 +2261,7 @@ class HolderLockTest(unittest.TestCase):
         self.assertEqual(self.acquire().reason, "live consumer", "and that consumer (this process) still fences")
         os.unlink(self.ldir() / "holder")
         owner = self.owned()
-        cpid, cstart = self.proc()
+        cpid, cstart = self.dead()
         lock = {"dev": owner.lock_id[0], "ino": owner.lock_id[1]}
         self.put(self.record2(os.getpid(), owner.start, attached=(cpid, cstart), lock=lock))
         self.assertEqual(self.hl.release(owner), self.hl.Released(True),
@@ -2314,7 +2367,9 @@ class HolderLockTest(unittest.TestCase):
         cpid, cstart = self.proc()
         self.hl.attach_consumer(owner, (self.ldir() / "holder").read_bytes(), pid=cpid, start=cstart)
         attached = json.loads((self.ldir() / "holder").read_bytes())
-        self.hl.release(owner)
+        with self.assertRaises(self.hl.LockError):
+            self.hl.release(owner)
+        self.exit_owner(owner)
         hpid, hstart = self.dead()
         self.put(dict(attached, owner_pid=hpid, owner_start=hstart))   # the holder died, its consumer lives on
         self.assertIsInstance(old.read_holder(str(self.root)), old.Invalid, "schema 2 is unsupported there")

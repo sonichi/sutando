@@ -267,11 +267,13 @@ def make_dirs(owner, names):
 
 
 def release_lock(owner):
-    """Remove our record and drop the lock; a second call does nothing."""
+    """Remove our record and drop the lock; a second call does nothing. False only when release
+    refused because the attached consumer may be alive: then the flock stays until this process exits."""
     try:
         holder_lock.release(owner)
-    except holder_lock.LockError:
-        pass
+    except holder_lock.LockError as e:
+        return str(e) != "consumer alive"
+    return True
 
 
 # ── the consumer contract (schema 2), reached only through here ──────────────

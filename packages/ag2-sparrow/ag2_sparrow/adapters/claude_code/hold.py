@@ -197,7 +197,9 @@ def _held(root, cfg, session_id, nonce, env, popen, state) -> int:
             return _refuse("no consumer: %s" % e)
         return _supervise(child, state)
     finally:
-        task_io.release_lock(owner)
+        if not task_io.release_lock(owner):
+            print("hold: the session may still be alive; the root stays held by it and this flock until exit",
+                  file=sys.stderr)
 
 
 def _supervise(child, state) -> int:
