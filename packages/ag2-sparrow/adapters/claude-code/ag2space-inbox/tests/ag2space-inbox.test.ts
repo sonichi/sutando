@@ -21,7 +21,8 @@ type Claim = { attempt: number; phase: string; token?: string; hash?: string; tu
 function host(on: any, opts: { verdict?: string; env?: Record<string, string>; rejectSubmits?: number; verifierFails?: boolean; markerFails?: number;
                                progressFails?: number; sessionIds?: string[]; cwdInode?: string; allowNonOwner?: boolean;
                                claimAs?: Record<string, unknown>; interruptParks?: number; interruptThrows?: number;
-                               interruptSoft?: Record<string, string | number>; stuckAtStart?: Record<string, unknown> } = {}) {
+                               interruptSoft?: Record<string, string | number>; stuckAtStart?: Record<string, unknown>;
+                               unstuckFails?: number } = {}) {
   const files: Record<string, string> = {}
   const submitted: string[] = []
   const runs: string[][] = []
@@ -40,6 +41,7 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
   const softLeft: Record<string, string | number> = { ...(opts.interruptSoft ?? {}) }
   // The plugin record's stuck marks: durable across Mod starts, returned by every progress reply.
   const stuck: Record<string, unknown> = { ...(opts.stuckAtStart ?? {}) }
+  let unstuckFailsLeft = opts.unstuckFails ?? 0
   let sidReads = 0
   const interruptAt: number[] = []
   const logs: string[] = []
@@ -63,6 +65,12 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
   on('fs.read', (_: any, e: any) => e.path in files ? { value: files[e.path] } : { deny: 'ENOENT' })
   on('fs.write', (_: any, e: any) => { files[e.path] = e.text; return { value: undefined } })
   const hash = (t: string) => 'h' + t.length + ':' + t.split('').reduce((a, c) => (a * 31 + c.charCodeAt(0)) % 1000003, 7)
+  // The lifecycle's readiness (task_lifecycle.classify, pinned in Python): a body with text and no
+  // undecodable byte is ready; a whitespace-only or undecodable one is LIVE_UNREADY; the Mod never decides.
+  const result = (task: string) => {
+    const b = files[`/out/${task}.txt`]
+    return b === undefined ? 'ABSENT' : b.trim() && !b.includes('\uFFFD') ? 'LIVE_READY' : 'LIVE_UNREADY'
+  }
   const out = (exitCode: number, data: any) => ({ value: { exitCode, stdout: JSON.stringify(data) + '\n', stderr: '' } })
   on('process.run', (_: any, e: any) => {
     runs.push([...e.argv])
@@ -86,6 +94,7 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
     const task = argv[3]
     if (verb === 'progress') {
       if (progressFailLeft-- > 0) return out(3, { error: 'progress write failed: disk', hard: true })
+      if (argv.includes('--unstuck') && unstuckFailsLeft-- > 0) return out(1, { refused: 'progress lock busy' })
       progress.push(argv.slice(3))
       const add = argv.indexOf('--stuck'), del = argv.indexOf('--unstuck')
       if (add > 0) stuck[argv[add + 1]] = stuck[argv[add + 1]] ?? { since: 1 }
@@ -100,7 +109,8 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
       return fail ? out(3, { ...data, hard: true, error: 'progress write failed: disk' }) : out(0, data)
     }
     if (verb === 'claim') {
-      if (`/out/${task}.txt` in files && files[`/out/${task}.txt`].length) return out(1, { refused: `${task} is LIVE_READY` })
+      if (result(task) === 'LIVE_READY') { delete stuck[task]; return out(1, { refused: `${task} is LIVE_READY` }) }
+      if (result(task) === 'LIVE_UNREADY') return out(1, { refused: `${task} is LIVE_UNREADY, not claimable yet; retried`, retry: true })
       const c = claims[task]
       if (c && c.phase !== 'PREPARED') return out(1, { refused: `${task}: attempt ${c.attempt} is ${c.phase}` })
       // The CLI's admission (task_io.admission, pinned in Python): no tier is malformed; non-owners need the flag.
@@ -140,10 +150,11 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
     if (verb === 'interrupt') {
       // As the CLI: the reply is the disposition afterwards; a staged interrupt is published by the next call.
       const done = { task_id: task, resolved: true, answered: false, interrupted: false }
-      if ((`/out/${task}.txt` in files && files[`/out/${task}.txt`].length) || c?.phase === 'SETTLED') {
+      if (result(task) === 'LIVE_READY' || c?.phase === 'SETTLED') {
         delete stuck[task]
         return out(0, done)
       }
+      if (result(task) === 'LIVE_UNREADY') return out(1, { refused: `${task}: not answered yet (the result is LIVE_UNREADY); retried`, retry: true })
       const soft = softLeft[task]
       delete softLeft[task]
       if (typeof soft === 'number') return { value: { exitCode: soft, stdout: 'not json', stderr: 'boom' } }
@@ -379,17 +390,18 @@ test('reply is accepted only for a confirmed turn of a task this session receive
   expect(bad.isError).toBe(true)
 })
 
-test('an empty result file on disk is not an answer: the task is submitted and replied over', async ($, on) => {
+test('an empty result file is the lifecycle\'s LIVE_UNREADY: the task is kept, backed off, and submitted once it is gone', async ($, on) => {
   const h = host(on)
   h.files['/in/task-z.txt'] = TASK('task-z')
   h.files['/out/task-z.txt'] = ''
   await arm($, h)
-  await h.clock.advance(1000)
+  await h.clock.advance(5000)
+  expect(h.submitted.length).toBe(0)
+  const claims = h.runs.filter((a: string[]) => a[2] === 'claim').length
+  expect(claims).toBeLessThan(5)                       // backed off, not every tick
+  delete h.files['/out/task-z.txt']
+  await h.clock.advance(10000)
   expect(h.submitted.length).toBe(1)
-  await $.turn.start({ text: h.submitted[0], turnId: 't-z' })
-  const r = await $.tool.call({ tool: REPLY, task_id: 'task-z', text: 'zed' })
-  expect(String(r.text ?? r.result)).toContain('Published /out/task-z.txt')
-  expect(h.files['/out/task-z.txt']).toBe('zed\n')
 })
 
 test('the id header must match the file stem; a disagreement is retired, never submitted', async ($, on) => {
@@ -598,14 +610,13 @@ test('a result that lands during backoff retires the task and clears its durable
   expect(h.runs.filter((a: string[]) => a[2] === 'interrupt').length).toBe(h.runs.slice(0, calls).filter((a: string[]) => a[2] === 'interrupt').length)
 })
 
-test('after a restart a pre-restart mark is cleared by the next retirement, with no remembered state', async ($, on) => {
+test('after a restart a pre-restart mark is cleared by the next resolution, with no remembered state', async ($, on) => {
   const h = host(on, { stuckAtStart: { 'task-old': { since: 1 }, 'task-old2': { since: 1 } } })
   h.files['/in/task-old.txt'] = TASK('task-old')
   h.files['/out/task-old.txt'] = 'answered before the restart\n'
   await arm($, h)                                     // a fresh Mod: nothing in memory about either mark
   await h.clock.advance(1000)
-  expect(h.progress).toContainEqual(['--unstuck', 'task-old'])
-  expect(Object.keys(h.stuck)).toEqual(['task-old2'])
+  expect(Object.keys(h.stuck)).toEqual(['task-old2'])  // the claim's terminal refusal cleared it in the CLI
   h.setSid('sid-2')
   await h.clock.advance(1000)
   h.files['/in/task-old2.txt'] = TASK('task-old2')
@@ -614,7 +625,7 @@ test('after a restart a pre-restart mark is cleared by the next retirement, with
   expect(h.stuck).toEqual({})
 })
 
-test('a result published out of band retires the task on the next scan and clears its mark', async ($, on) => {
+test('a result published out of band retires the task through the lifecycle\'s answer and clears its mark', async ($, on) => {
   const h = host(on, { stuckAtStart: { 'task-oob': { since: 1 } } })
   await arm($, h)
   await h.clock.advance(1000)
@@ -623,20 +634,39 @@ test('a result published out of band retires the task on the next scan and clear
   await h.clock.advance(1000)
   expect(h.stuck).toEqual({})
   expect(h.submitted.length).toBe(0)
-  expect(verbs(h).filter((v: string) => v === 'claim' || v === 'interrupt')).toEqual([])
+  await h.clock.advance(5000)
+  expect(verbs(h).filter((v: string) => v === 'claim').length).toBe(1)   // retired on the terminal answer
 })
 
-test('a mark that cannot be cleared keeps the task until the write lands', async ($, on) => {
-  const h = host(on, { stuckAtStart: { 'task-keep': { since: 1 } } })
+test('a whitespace-only or undecodable result is not an answer: the durable mark stays and the task stays tracked', async ($, on) => {
+  const h = host(on, { stuckAtStart: { 'task-ws': { since: 1 }, 'task-bad': { since: 1 } } })
   await arm($, h)
+  h.setSid('sid-2')
   await h.clock.advance(1000)
-  h.files['/out/task-keep.txt'] = 'done\n'
-  h.files['/in/task-keep.txt'] = TASK('task-keep')
-  h.failProgress(1)
-  await h.clock.advance(1000)
-  expect(Object.keys(h.stuck)).toEqual(['task-keep'])
-  await h.clock.advance(2000)
+  h.files['/out/task-ws.txt'] = ' \n\t'
+  h.files['/out/task-bad.txt'] = 'bad \uFFFD byte'
+  h.files['/in/task-ws.txt'] = TASK('task-ws')
+  h.files['/in/task-bad.txt'] = TASK('task-bad')
+  await h.clock.advance(20000)
+  expect(Object.keys(h.stuck).sort()).toEqual(['task-bad', 'task-ws'])   // the lifecycle says LIVE_UNREADY
+  expect(h.progress.filter((p: string[]) => p[0] === '--unstuck')).toEqual([])
+  h.files['/out/task-ws.txt'] = 'a real answer\n'
+  delete h.files['/out/task-bad.txt']                  // removed: the next try answers it as interrupted
+  await h.clock.advance(70000)                          // the backed-off tries still come
   expect(h.stuck).toEqual({})
+  expect(h.files['/out/task-bad.txt']).toContain('interrupted')
+})
+
+test('thirty failed unstuck writes never age a retained task out: the next one lands (stopped-intake path)', async ($, on) => {
+  const h = host(on, { unstuckFails: 30, stuckAtStart: { 'task-s30': { since: 1 } } })
+  await arm($, h)
+  h.setSid('sid-2')
+  await h.clock.advance(1000)
+  h.files['/in/task-s30.txt'] = TASK('task-s30')
+  for (let i = 0; i < 40; i++) await h.clock.advance(1000)
+  expect(h.progress).toContainEqual(['--unstuck', 'task-s30'])
+  expect(h.stuck).toEqual({})
+  expect(h.runs.filter((a: string[]) => a.includes('--unstuck') && a.includes('task-s30')).length).toBe(31)
 })
 
 test('a hard progress failure while answering a stopped intake: the answer stands and is never repeated', async ($, on) => {

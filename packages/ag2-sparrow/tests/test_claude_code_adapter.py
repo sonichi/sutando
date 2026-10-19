@@ -2639,6 +2639,31 @@ class InboxCli(ConnectBase):
             self.assertEqual(inbox.unresolved_stuck(self.root, {"t": {"since": 1}}), {"t": {"since": 1}},
                              "an unreadable lifecycle keeps the marks rather than hiding them")
 
+    def test_an_unready_result_is_the_lifecycles_call_and_never_clears_a_mark(self):
+        """Whitespace-only and undecodable bodies classify LIVE_UNREADY: interrupt and claim retry, the mark
+        stays; a real body resolves and clears it, through interrupt and through the claim's refusal."""
+        for t, body in (("task-ws", b" \n\t"), ("task-bad", b"bad \xff\xfe byte\n")):
+            self.task(t)
+            self.assertEqual(self.verb("progress", "--stuck", t)[0], 0)
+            (self.results / (t + ".txt")).write_bytes(body)
+            rc, out = self.verb("interrupt", t)
+            self.assertEqual((rc, out.get("retry"), "LIVE_UNREADY" in out["refused"]), (1, True, True), t)
+            rc, out = self.verb("claim", t)
+            self.assertEqual((rc, out.get("retry")), (1, True), "a claim of an unready result is a retry too: " + t)
+            self.assertIn(t, records.load_plugin(self.root)["stuck"], "unresolved: the mark stays")
+            (self.results / (t + ".txt")).write_text("a real answer\n")
+        rc, out = self.verb("claim", "task-ws")
+        self.assertEqual((rc, "retry" in out), (1, False), "a ready result: the claim refuses for good")
+        self.assertNotIn("task-ws", records.load_plugin(self.root)["stuck"], "and the CLI cleared the mark")
+        rc, out = self.verb("interrupt", "task-bad")
+        self.assertEqual((rc, out["resolved"]), (0, True))
+        self.assertEqual(records.load_plugin(self.root)["stuck"], {})
+        t = self.task("task-lockfail")
+        (self.results / (t + ".txt")).write_text("answered\n")
+        with mock.patch.object(records, "write_progress", side_effect=records.RecordError("disk")):
+            rc, out = self.verb("claim", t)
+        self.assertEqual((rc, "retry" in out), (1, False), "a failed clear never turns a terminal refusal into a retry")
+
     def test_a_stuck_interrupt_is_named_by_verify_and_raises_the_card_and_clears(self):
         self.assertEqual(self.verb("progress", "--stuck", "task-s", "--stuck-detail", "parked")[0], 0)
         self.assertEqual(self.verb("progress", "--stuck", "task-s", "--stuck-detail", "still parked")[0], 0)

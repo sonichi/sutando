@@ -179,8 +179,6 @@ async function arm($: any, s: State, inbox: string, results: string): Promise<{ 
   s.armedResults = results
   s.stop?.()
   let busy = false
-  // Readiness as Sparrow's read_ready_result sees it: a file with bytes, not a path that exists.
-  const onDisk = async (id: string) => $.fs.stat(`${results}/${resultName(id)}`).then((st: any) => st.size > 0, () => false)
   const log = (line: string) => $.ui.log(`${PLUGIN}: ${line}`, { to: 'debug' })
 
   const scan = async () => {
@@ -197,7 +195,7 @@ async function arm($: any, s: State, inbox: string, results: string): Promise<{ 
       for (const entry of await $.fs.list(inbox)) {
         if (entry.kind !== 'file' || !TASK_RE.test(entry.name) || s.seen.has(entry.name)) continue
         const backoff = s.retry.get(entry.name)
-        if (stopped && backoff && s.tick < backoff.next) continue
+        if (backoff && s.tick < backoff.next) continue
         const prev = s.stale.get(entry.name)
         if (prev && prev.mtimeMs === entry.mtimeMs && prev.ticks >= STALE_TICKS) continue
         s.stale.set(entry.name, { mtimeMs: entry.mtimeMs, ticks: prev && prev.mtimeMs === entry.mtimeMs ? prev.ticks + 1 : 1 })
@@ -207,10 +205,11 @@ async function arm($: any, s: State, inbox: string, results: string): Promise<{ 
         const rid = header(text, 'id') || stem
         if (rid !== stem) { log(`${entry.name}: header id ${rid} does not match the file stem; not submitted`); s.seen.add(entry.name); continue }
         if (s.offers.has(rid)) { s.seen.add(entry.name); continue }
-        if (s.answered.has(rid) || (await onDisk(rid))) {
-          // Every retirement clears the record's stuck mark (a no-op without one), whoever published the
-          // result; kept until that write lands, so the record never outlives the answer.
-          if (!(await cli($, s, ['progress', '--unstuck', rid])).ok) continue
+        // Whether a result is ready is the lifecycle's call (claim, interrupt), never a size read here.
+        if (s.answered.has(rid)) {
+          // A retirement clears the record's stuck mark (a no-op without one); kept, and never aged out,
+          // until that write lands.
+          if (!(await cli($, s, ['progress', '--unstuck', rid])).ok) { s.stale.delete(entry.name); continue }
           s.retry.delete(entry.name)
           s.seen.add(entry.name)
           continue
@@ -248,6 +247,7 @@ async function arm($: any, s: State, inbox: string, results: string): Promise<{ 
           }
           // The CLI cleared the mark in its resolving write; the Mod clears it too, so both converge.
           if (!(await cli($, s, ['progress', '--unstuck', rid])).ok) {
+            s.stale.delete(entry.name)
             s.retry.set(entry.name, { ...(backoff ?? { fails: 0, delay: 1, first: s.tick, stuck: false }), next: s.tick + (backoff?.delay ?? 1) })
             continue
           }
@@ -258,9 +258,19 @@ async function arm($: any, s: State, inbox: string, results: string): Promise<{ 
           continue
         }
         // The claim: only a task the classifier reads ABSENT and the shared admission policy admits may be
-        // submitted; anything else is retired here (a refused non-owner task is answered by the CLI).
+        // submitted; a terminal refusal retires it here (a refused non-owner task is answered by the CLI), a
+        // nonterminal one (a result not ready yet) keeps it, backed off.
         const claimed = await cli($, s, ['claim', rid])
         if (claimed.hard) return
+        if (!claimed.ok && claimed.data?.retry) {
+          s.stale.delete(entry.name)
+          const fails = (backoff?.fails ?? 0) + 1
+          const delay = Math.min(BACKOFF_MAX_TICKS, 2 ** (fails - 1))
+          if (!backoff || delay !== backoff.delay) log(`${rid} not claimable yet (${claimed.data?.refused ?? ''}); next try in ${delay} s`)
+          s.retry.set(entry.name, { fails, delay, next: s.tick + delay, first: backoff?.first ?? s.tick, stuck: false })
+          continue
+        }
+        s.retry.delete(entry.name)
         if (!claimed.ok) { s.seen.add(entry.name); log(`${rid} not claimed: ${claimed.data?.refused ?? ''}`); continue }
         const admitted = String(claimed.data?.admission ?? '')
         const ctier = String(claimed.data?.access_tier ?? '')

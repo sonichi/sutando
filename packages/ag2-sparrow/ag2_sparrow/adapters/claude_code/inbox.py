@@ -125,6 +125,15 @@ def admit(root, task_id, allow: bool) -> "tuple[str | None, dict, str]":
     return kind, headers, why
 
 
+def _clear_stuck(root, task_id) -> None:
+    """Best effort: a resolved task's stuck mark dropped; the next record write prunes it otherwise."""
+    try:
+        records.write_progress(root, lambda rec: dict(rec, stuck={k: v for k, v in rec["stuck"].items() if k != task_id})
+                               if isinstance(rec.get("stuck"), dict) and task_id in rec["stuck"] else rec)
+    except records.RecordError:
+        pass
+
+
 def _mirror(root, task_id, phase, out: dict, extra=None, unstuck=False) -> dict:
     """The plugin record mirrors each claim's phase after the lifecycle step; a failed write marks the
     answer `hard` (exit 3: the step stands, intake closes) instead of hiding it. `unstuck` also drops
@@ -148,19 +157,26 @@ def _mirror(root, task_id, phase, out: dict, extra=None, unstuck=False) -> dict:
 
 def claim(root, task_id) -> dict:
     lc = _lifecycle(root)
+    terminal = False
     with records.flocked(records.claims_lock_path(root)):
         generation = _generation(root)
         verdict, state = lc.decide(task_id)
-        if verdict != "call":
-            raise Refused("%s is %s; only ABSENT may be submitted" % (task_id, state))
-        kind, headers, why = admit(root, task_id, allow_non_owner())
-        if kind is None:
-            outcome = lc.complete_without_call(task_id, task_io.NON_OWNER_REFUSED, why)
-            raise Refused("%s not admitted (%s); the owner-only refusal is %s" % (task_id, why, outcome))
-        try:
-            attempt = lc.prepare(task_id, INTERRUPTED_BODY, mode=lifecycle.LOCAL, generation=generation)
-        except lifecycle.AttemptInProgress as e:
-            raise Refused(str(e))
+        if verdict == "call":
+            kind, headers, why = admit(root, task_id, allow_non_owner())
+            if kind is None:
+                outcome = lc.complete_without_call(task_id, task_io.NON_OWNER_REFUSED, why)
+                raise Refused("%s not admitted (%s); the owner-only refusal is %s" % (task_id, why, outcome))
+            try:
+                attempt = lc.prepare(task_id, INTERRUPTED_BODY, mode=lifecycle.LOCAL, generation=generation)
+            except lifecycle.AttemptInProgress as e:
+                raise Refused(str(e))
+        else:
+            terminal = resolved(lc, task_id)[0]
+    if verdict != "call":
+        if not terminal:
+            raise Parked("%s is %s, not claimable yet; retried" % (task_id, state))
+        _clear_stuck(root, task_id)      # after claims.lock: the progress lock is never taken under it
+        raise Refused("%s is %s; only ABSENT may be submitted" % (task_id, state))
     return _mirror(root, task_id, lifecycle.PREPARED,
                    {"task_id": task_id, "attempt": attempt, "generation": generation, "admission": kind,
                     "access_tier": headers["access_tier"], "collaborator": headers["collaborator"] == "true"},

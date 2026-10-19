@@ -39,7 +39,11 @@ for that turn and publishes it (`RESULT_STAGED -> SETTLED`); in-flight is
 released only at `SETTLED`. A completed or aborted turn with nothing staged is
 the explicit protocol failure (`inbox park`), published once and never
 replayed. Claimed, archived, quarantined, blank and unreadable tasks never
-resubmit; the `id:` header must equal the file stem.
+resubmit; the `id:` header must equal the file stem. Whether a task's result is
+ready is never the Mod's call (it reads no result file): the claim and
+`interrupt` answer from the shared lifecycle, a terminal answer retires the
+task, and a result not ready yet (`LIVE_UNREADY`, e.g. whitespace-only or
+undecodable) keeps it, backed off, until that changes.
 
 Intake stops, loudly, when the CLI answers a hard failure (exit 3: the
 progress record could not be written durably at the temp, fsync, replace or
