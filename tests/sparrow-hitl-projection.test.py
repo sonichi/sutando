@@ -143,7 +143,7 @@ class ProjectHitl(unittest.TestCase):
             B._hitl_modules = saved
 
     def test_a_standalone_install_projects_through_the_vendored_hitl(self):
-        """#5695 v3.6 §2: no monorepo `src/hitl`, and the wheel's own copy still projects the card."""
+        """No monorepo `src/hitl`, and the wheel's own copy still projects the card."""
         self._requirement()
         saved = B._monorepo_src
         B._monorepo_src = lambda marker: ""

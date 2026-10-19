@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """cli_wedge's abnormal-banner table is the data module cli_wedge_patterns, importable without the
-detector and vendored byte-identical into ag2-sparrow (#5695 v3.4 §5): the detector's names are the
+detector and vendored byte-identical into ag2-sparrow: the detector's names are the
 module's own objects, the grammar matches the banners it names, and the vendored copy imports alone."""
 import subprocess
 import sys

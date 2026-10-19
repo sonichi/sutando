@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """The HITL decision domain is vendored into ag2_sparrow.hitl byte-identical (sync_from_src) and
 imports with no shim and no sys.path help: measured from an unrelated cwd in an isolated
-interpreter with only the package directory on the path (v3.4 §1, v3.6 §2)."""
+interpreter with only the package directory on the path."""
 import ast
 import subprocess
 import sys

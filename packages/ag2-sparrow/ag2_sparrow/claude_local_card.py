@@ -1,4 +1,4 @@
-"""The claude-local card: a HumanRequirement in its own store root (#5695 K5, v3.14). The bridge owns
+"""The claude-local card: a HumanRequirement in its own store root. The bridge owns
 the projector and the accepter for that root, so this lives outside the adapter, which imports it.
 
 Requirements live in `hitl/requirements-claude-local` beside the bridge's default store, which an

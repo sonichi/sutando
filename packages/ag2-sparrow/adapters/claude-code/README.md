@@ -161,7 +161,7 @@ and refuses a session whose command is not that fixed alphabet. tmux
 daemonizes, so the server and the pane are not the launcher's children: a
 launcher crash leaves the session running, and the next launcher adopts it.
 
-**`hold`, the pane's thin parent (K1).** `hold` sets the pane title to a fresh
+**`hold`, the pane's thin parent.** `hold` sets the pane title to a fresh
 random token, acquires the canonical work root (`holder_lock` schema 2),
 publishes the record, recovers the dead predecessor generation's claims
 under that flock (`recover(generation=…, proof=False)`, the only place
@@ -179,7 +179,7 @@ stays the pane's. The session runs `claude --plugin-dir … --permission-mode �
 `install --new-session` rotates it only once the old generation is proven
 gone (quiescent; otherwise the old id stays and the command says so).
 
-**The generation and its classifier (K3, K4, K6).** The supervisor record
+**The generation and its classifier.** The supervisor record
 (`state/claude-local-supervisor.json`, written only by the launcher under
 `<config dir>/claude-local.supervisor.lock`) holds the generation {server
 pid+start, session id, session created, pane id, pane pid, start command,
@@ -198,7 +198,7 @@ adapter's live holder, or a claude-local holder of another install) is the
 logical 75. 74 is the retryable exit. The managed start never takes the
 install operation lock.
 
-**Stop (K4).** `/exit` and `kill-session` each run as one tmux server command
+**Stop.** `/exit` and `kill-session` each run as one tmux server command
 through the packaged pane-key guard: `if-shell -F -t <recorded pane_id>` over
 the exact `pane_pid`, `session_id`, `session_created`, the nonce matched by
 glob against the pane's own start command
@@ -224,7 +224,7 @@ to non-zero. The installer's own manager commands (`bootstrap`, `bootout
 outlast the stop they wait on. `launchctl print` rc 0 reads as registered
 only; liveness comes from the typed records.
 
-**Hang detection and the card (K5).** Advisory: each tick derives, from the
+**Hang detection and the card.** Advisory: each tick derives, from the
 pane capture and the Mod's progress record, (a) the raw pane static for 10
 minutes while an offer is `CALLING` or `TURN_CONFIRMED` (this adapter's rule,
 not `cli_wedge`'s idle rule) or (b) abnormal text read line-anchored through

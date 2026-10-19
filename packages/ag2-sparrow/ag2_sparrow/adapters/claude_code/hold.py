@@ -1,4 +1,4 @@
-"""`ag2-sparrow-claude-local hold --generation=<32 hex> --`: the pane's thin parent (#5695 K1).
+"""`ag2-sparrow-claude-local hold --generation=<32 hex> --`: the pane's thin parent.
 
 Started by the launcher as the pane's exact command; the work root, config dir, session id and HITL
 store root come from the pane's session environment. It sets the pane title to a fresh token, takes

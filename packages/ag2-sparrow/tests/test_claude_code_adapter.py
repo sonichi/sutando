@@ -223,7 +223,7 @@ from ag2_sparrow import claude_local_accepter as accepter, claude_local_card as 
 from ag2_sparrow.adapters.claude_code import cli, detector, hold as hold_mod, inbox, launcher  # noqa: E402
 from ag2_sparrow.hitl.schema import ActionReply, STATUS_IN_PROGRESS, STATUS_PENDING, STATUS_RESOLVED  # noqa: E402
 
-# Susan's nit: the fake is a #!/bin/sh wrapper that execs the quoted interpreter on the body beside
+# The fake is a #!/bin/sh wrapper that execs the quoted interpreter on the body beside
 # it, so an interpreter path containing a space works where a shebang could not carry it.
 FAKE_CLAUDE_SH = '''#!/bin/sh
 exec "%(py)s" "$0.py" "$@"
@@ -627,14 +627,14 @@ class ConnectRender(ConnectBase):
         for line in ("Restart=always", "RestartSec=10", "RestartPreventExitStatus=75", "WantedBy=default.target",
                      "KillMode=process", "TimeoutStopSec=180", f"Environment={cm.MANAGED_VAR}=1"):
             self.assertIn(line + "\n", unit)
-        self.assertNotIn("control-group", unit, "K7/§1: systemd signals only the launcher; the tmux session survives it")
+        self.assertNotIn("control-group", unit, "systemd signals only the launcher; the tmux session survives it")
         plist = cm.render_plist(L, exec_start, "/opt/bin:/usr/bin", "/var/log/x.log")
         self.assertTrue(cm.marked(plist, cli.PLIST_MARKER), plist[:200])
         self.assertTrue(plist.startswith("<?xml"), "the declaration stays first")
         body = plistlib.loads(plist.encode())
         self.assertEqual(body["ProgramArguments"], [exec_start, "run", "--launchd"], "the entry shim maps the exit")
         self.assertEqual((body["Label"], body["KeepAlive"], body["RunAtLoad"]), (cli.AGENT_LABEL, {"SuccessfulExit": False}, True))
-        self.assertNotIn("PathState", plist, "K7: no held marker; SuccessfulExit alone")
+        self.assertNotIn("PathState", plist, "no held marker; SuccessfulExit alone")
         self.assertEqual(body["EnvironmentVariables"], {"PATH": "/opt/bin:/usr/bin", cm.MANAGED_VAR: "1"})
         self.assertEqual((body["AbandonProcessGroup"], body["ExitTimeOut"], body["ThrottleInterval"]), (False, 180, 30),
                          "outer stop 180 s over the 120 s inner bound; the throttle stays 30")
@@ -697,7 +697,7 @@ class ConnectInstall(ConnectBase):
         self.assertIn(f"launcher pid {runner.pid()}", out)
 
     def test_the_session_id_is_kept_across_reinstalls_and_rotated_by_new_session_only_over_a_dead_generation(self):
-        """K3: --new-session is quiescent: the id rotates only once the old generation is proven gone."""
+        """--new-session is quiescent: the id rotates only once the old generation is proven gone."""
         runner = self.runner()
         self.assertEqual(self.install_with(runner)[0], 0)
         first = cli.read_config(cli.config_path())["SESSION_ID"]
@@ -838,7 +838,7 @@ class ConnectInstall(ConnectBase):
         self.assertIsNone(self.session())
 
     def test_install_refuses_an_old_or_missing_tmux_and_an_over_long_socket_path(self):
-        """K4-b: tmux >= 3.2 for new-session -e; v3.4 §3: a socket path over 100 bytes fails tmux outright."""
+        """tmux >= 3.2 for new-session -e; a socket path over 100 bytes fails tmux outright."""
         with mock.patch.object(launcher, "tmux_version", return_value=(3, 1)):
             rc, _, err = self.install()
         self.assertEqual((rc, "tmux 3.1 is older than the 3.2" in err), (2, True), err)
@@ -1069,7 +1069,7 @@ class ConnectSerialize(ConnectBase):
         self.assertTrue(cm.oplock_path(L).exists())
 
     def test_uninstall_serializes_on_the_operation_lock_and_the_managed_run_never_takes_it(self):
-        """K7: the managed start does not take the install operation lock, so a bootstrapped launcher
+        """The managed start does not take the install operation lock, so a bootstrapped launcher
         never deadlocks install, which keeps its own lock through confirmation."""
         self.assertEqual(self.install_with(self.runner())[0], 0)
         self.runners[-1].stop_session()
@@ -1104,7 +1104,7 @@ class ConnectMod(unittest.TestCase):
         self.assertIn("AG2_RESULTS_DIR", src)
 
     def test_the_mod_writes_no_claim_or_progress_or_result_file_itself(self):
-        """K2/K5: every claim, authorize, confirm, stage, publish, park and progress mutation is one
+        """Every claim, authorize, confirm, stage, publish, park and progress mutation is one
         `ag2-sparrow-claude-local inbox <verb>` call; the Mod never writes results/ or state/ directly."""
         src = REGISTER.read_text()
         self.assertNotIn("$.fs.write", src)
@@ -1704,7 +1704,7 @@ class ConnectVerify(ConnectBase):
 
 
 class ConnectOccupancy(ConnectBase):
-    """R6: `verify` reports the manager's own state beside the lock, so a free lock under a live or
+    """`verify` reports the manager's own state beside the lock, so a free lock under a live or
     respawning job never reads bare 'free'."""
 
     def test_verify_reads_the_lock_beside_the_managers_state(self):
@@ -1781,8 +1781,19 @@ class ConnectReadme(unittest.TestCase):
 
 
 class ConnectSourceRules(unittest.TestCase):
-    """R1 and R7 as source pins: no group signal or descriptor passing in the package; no lease symbol
-    anywhere the design once named it."""
+    """Source pins: no group signal or descriptor passing in the package; no lease symbol anywhere the
+    design once named it; no review-round, PR or reviewer reference in the adapter's text."""
+
+    def test_the_adapter_its_shared_modules_docs_and_tests_carry_no_review_or_person_references(self):
+        pattern = re.compile("#" + "5695|" + r"\bv3" + r"\.\d|\b[KQR][1-7](?:-[a-e])?\b|" + "|".join(
+            ("Ke" + "wei", "Qing" + "yun", "Su" + "san")))
+        repo = PKG.parents[1]
+        files = sorted((PKG / "ag2_sparrow" / "adapters" / "claude_code").glob("*.py"))
+        files += sorted((PKG / "ag2_sparrow").glob("claude_local_*.py")) + [ADAPTER / "README.md", Path(__file__)]
+        files += [repo / "tests" / n for n in ("ag2-sparrow-claude-local-bridge.test.py", "ag2-sparrow-tmux-vendored.test.py",
+                                                "ag2-sparrow-claude-local-wheel.test.py", "hitl-schema.test.py")]
+        found = ["%s: %s" % (path.name, m.group(0)) for path in files for m in pattern.finditer(path.read_text())]
+        self.assertEqual(found, [])
 
     def test_no_killpg_anywhere_in_the_package_and_no_group_or_descriptor_passing_in_the_lifecycle(self):
         for path in sorted((PKG / "ag2_sparrow").rglob("*.py")):
@@ -1826,7 +1837,7 @@ def wait_for(predicate, seconds=10.0, step=0.05):
 
 
 class HoldProcess(ConnectBase):
-    """K1 (Q1): `hold` is the pane's thin parent: the root taken and published, the dead generation
+    """`hold` is the pane's thin parent: the root taken and published, the dead generation
     recovered under that flock, `tasks` opened O_NOFOLLOW from the held root fd and bound by inode, the
     exec shim gated on one go byte, the consumer attached before the byte is written."""
 
@@ -1907,7 +1918,7 @@ class HoldProcess(ConnectBase):
         self.assertEqual(task_io.occupancy(str(self.work)), "free")
 
     def test_the_shim_execs_only_on_exactly_one_go_byte(self):
-        """K1 (v3.5 c): EOF, a short read, a read error or a wrong byte exits without exec."""
+        """EOF, a short read, a read error or a wrong byte exits without exec."""
         def run_shim(feed, close=True, fd_override=None):
             r_, w_ = os.pipe()
             argv = [sys.executable, "-c", hold_mod.SHIM, str(fd_override if fd_override is not None else r_), "/bin/echo", "EXECED"]
@@ -1925,7 +1936,7 @@ class HoldProcess(ConnectBase):
         self.assertEqual(run_shim(b"", fd_override=99)[0], 5, "a read error: exit without exec")
 
     def test_kill_9_hold_after_the_spawn_and_before_attach_starts_nothing_and_frees_the_root(self):
-        """K1 (v3.5 pin): the shim waits on the pipe; hold's death closes it; EOF, no exec, no consumer."""
+        """The shim waits on the pipe; hold's death closes it; EOF, no exec, no consumer."""
         from ag2_sparrow import task_io
         self.configure()
         marker = self.home / "paused"
@@ -2009,7 +2020,7 @@ class HoldProcess(ConnectBase):
         self.assertTrue(wait_for(lambda: task_io.occupancy(str(self.work)) == "free", 10))
 
     def test_kill_9_hold_with_a_hup_ignoring_consumer_never_shows_a_free_root_to_a_sibling_loop(self):
-        """K1, as written: no root-free/live-consumer overlap and zero sibling acquisitions until the
+        """No root-free/live-consumer overlap and zero sibling acquisitions until the
         consumer exits; the loop runs through the gate windows too (it starts before hold)."""
         from ag2_sparrow import task_io
         self.configure()
@@ -2056,7 +2067,7 @@ class HoldProcess(ConnectBase):
             proc.communicate()
 
     def test_hold_recovers_the_dead_generations_claims_under_its_flock_and_leaves_a_live_one(self):
-        """K2 (v3.8 a): recovery runs after acquire and publish, before the spawn; only claims of a
+        """Recovery runs after acquire and publish, before the spawn; only claims of a
         generation that verifies dead are touched: TURN_CONFIRMED without a blob answers interrupted."""
         from ag2_sparrow import task_lifecycle as tl
         self.configure()
@@ -2079,7 +2090,7 @@ class HoldProcess(ConnectBase):
 
 
 class InboxCli(ConnectBase):
-    """K2: the Mod's lifecycle verbs, each one CLI call under claims.lock, bound to the live consumer
+    """The Mod's lifecycle verbs, each one CLI call under claims.lock, bound to the live consumer
     generation, mirrored into the progress record under progress.lock."""
 
     def setUp(self):
@@ -2172,7 +2183,7 @@ class InboxCli(ConnectBase):
         self.assertEqual(rc, 1, "a settled claim parks nothing again")
 
     def test_a_progress_write_failure_is_the_hard_exit_3_with_the_lifecycle_step_applied(self):
-        """K5-d: the step stands, the answer carries it with `hard`, and the Mod closes intake on 3."""
+        """The step stands, the answer carries it with `hard`, and the Mod closes intake on 3."""
         from ag2_sparrow import task_lifecycle as tl
         t = self.task()
         with mock.patch.object(records, "write_durable", side_effect=records.RecordError("disk full")):
@@ -2199,7 +2210,7 @@ class InboxCli(ConnectBase):
         self.assertEqual([n for n in os.listdir(self.work / "state") if n.endswith(".tmp")], [], "no temp survives")
 
     def test_the_existing_final_path_fsyncs_the_blob_dir_before_the_phase_and_stays_turn_confirmed_while_it_fails(self):
-        """K2-c: blob committed, phase not saved; a retry finds the final, fsyncs the directory first; a
+        """Blob committed, phase not saved; a retry finds the final, fsyncs the directory first; a
         failing fsync keeps TURN_CONFIRMED with zero publication; sweep unlinks are followed by a fsync."""
         from ag2_sparrow import task_lifecycle as tl
         t = self.task()
@@ -2264,7 +2275,7 @@ class InboxCli(ConnectBase):
 
 
 class Detector(unittest.TestCase):
-    """K2/§5: raw-static-plus-outstanding is this adapter's rule; abnormal text through the shared grammar."""
+    """Raw-static-plus-outstanding is this adapter's rule; abnormal text through the shared grammar."""
 
     def test_static_with_an_offer_in_flight_stalls_after_the_bound_and_progress_clears_it(self):
         plugin = {"inflight": {"task-a": {"phase": "TURN_CONFIRMED", "turn_id": "t"}}}
@@ -2305,7 +2316,7 @@ TMUX_DIR = os.path.dirname(shutil.which("tmux") or "/usr/bin/tmux")
 
 
 class LauncherTmux(ConnectBase):
-    """K3/K4/K6 and Q2 on a real scratch tmux server: the adapter's own socket under a short /tmp HOME,
+    """The generation, the fenced stop and the clean environment on a real scratch tmux server: the adapter's own socket under a short /tmp HOME,
     created and killed here. The pane runs the real `hold` with the fake claude."""
     home_dir = "/tmp"
 
@@ -2360,11 +2371,11 @@ class LauncherTmux(ConnectBase):
         self.assertEqual(task_io.lock_holder(str(self.work))["pid"], session["pid"])
         env = session["env"]
         for leaked in (CANARY[0], "SUTANDO_WORKSPACE_DIR", "REMOTE_TASK_TOKEN", "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"):
-            self.assertNotIn(leaked, env, "Q2: env -i keeps the host's environment out of the pane")
+            self.assertNotIn(leaked, env, "env -i keeps the host's environment out of the pane")
         self.assertEqual((env[hold_mod.ENV_ROOT], env[hold_mod.ENV_SESSION_ID], env["AG2_AUTOARM"], env[hold_mod.TITLE_OFF_VAR]),
                          (str(self.work), SESSION_ID, "1", "1"))
         glob = self.tmux("show-environment", "-g").stdout
-        self.assertNotIn(CANARY[1], glob, "Q2: the server's global environment carries no canary")
+        self.assertNotIn(CANARY[1], glob, "the server's global environment carries no canary")
         self.assertNotIn("SUTANDO_WORKSPACE_DIR", glob)
         self.assertEqual(self.tmux("show-options", "-gv", "update-environment").stdout.strip(), "",
                          "update-environment cleared: an attach brings no client environment")
@@ -2412,12 +2423,12 @@ class LauncherTmux(ConnectBase):
                          "the creating launcher waives the witness until the Mod writes one")
         fresh = self.launcher()
         verdict, why = launcher.classify(fresh.tm, rec, self.cfg, root)
-        self.assertEqual((verdict, "plugin witness" in why), ("unknown", True), "Q4: no witness, no adoption")
+        self.assertEqual((verdict, "plugin witness" in why), ("unknown", True), "no witness, no adoption")
         self.witness(rec, generation={"pid": rec["consumer"]["pid"] + 1, "start": rec["consumer"]["start"]})
         self.assertEqual(launcher.classify(fresh.tm, rec, self.cfg, root)[0], "unknown", "another generation's witness")
         self.witness(rec, session_id="11111111-2222-3333-4444-555555555555")
         verdict, why = launcher.classify(fresh.tm, rec, self.cfg, root)
-        self.assertEqual((verdict, "session id 11111111" in why), ("unknown", True), "K3: a changed id is never adopted")
+        self.assertEqual((verdict, "session id 11111111" in why), ("unknown", True), "a changed id is never adopted")
         self.witness(rec)
         self.assertEqual(launcher.classify(fresh.tm, rec, self.cfg, root), ("adopt", ""))
         self.assertEqual(fresh.tick(fresh.record())[0], None, "adopt keeps serving")
@@ -2504,7 +2515,7 @@ class LauncherTmux(ConnectBase):
         lc.tm.run("kill-session", "-t", rec["generation"]["session_id"])
 
     def test_a_same_name_replacement_with_the_same_start_command_survives_both_fenced_actions(self):
-        """K4 ABA: the recorded tuple's server dies; a new server answers the same socket with the same
+        """ABA: the recorded tuple's server dies; a new server answers the same socket with the same
         session name and the very start command (the nonce too). /exit and kill-session both refuse."""
         lc, rec = self.created()
         gen = rec["generation"]
@@ -2629,12 +2640,12 @@ class CardBase(ConnectBase):
 
 
 class CardAccepter(CardBase):
-    """K5 and the store fence: one accepter, one lock order, one save; the claude-local root beside the
+    """The store fence: one accepter, one lock order, one save; the claude-local root beside the
     default store; Keep waiting as a saga-keyed successor; commit-unknown reconciled before any effect."""
 
     def test_the_card_carries_the_tail_the_attach_command_the_failed_check_and_two_actions_no_host_path(self):
         req = self.raise_card(room="")
-        self.assertTrue(req.id.startswith("hitl_cl_"), "K5-e: local ids are namespaced")
+        self.assertTrue(req.id.startswith("hitl_cl_"), "local ids are namespaced")
         self.assertEqual([a.id for a in req.actions], ["stop", "keep-waiting"])
         self.assertIn("attach: %s attach" % cli.COMMAND, req.message)
         self.assertIn("which check failed: pane static while an offer is in flight", req.message)
@@ -2685,7 +2696,7 @@ class CardAccepter(CardBase):
         req = self.raise_card(room="")
         self.assertTrue(self.accept(self.reply(req, room="")).startswith("rejected:"), "no room, no remote acceptance")
         out = accepter.local_stop(self.state_dir, self.lc.opaque, log=lambda *a: None)
-        self.assertEqual(out, "applied", "v3.7: stop --confirm needs no projector")
+        self.assertEqual(out, "applied", "stop --confirm needs no projector")
         self.assertEqual(card.local(self.load(req.id))["effect_phase"], "STOPPING")
 
     def test_progress_since_the_card_cancels_every_action_with_nothing_written(self):
@@ -2702,7 +2713,7 @@ class CardAccepter(CardBase):
         self.assertEqual(self.stops, [], "no tmux effect, no successor")
 
     def test_the_mod_holding_the_gate_makes_the_accepter_see_its_progress(self):
-        """K5 pause pin 1: the accepter waits on the gate the Mod holds; progress landed meanwhile cancels."""
+        """The accepter waits on the gate the Mod holds; progress landed meanwhile cancels."""
         req = self.raise_card()
         got = {}
         with records.flocked(records.progress_lock_path(self.root)):
@@ -2716,7 +2727,7 @@ class CardAccepter(CardBase):
         self.assertEqual(self.load(req.id).status, "pending")
 
     def test_an_accepter_that_committed_first_wins_over_later_progress(self):
-        """K5 pause pin 2: the phase recorded under the locks is the linearization point."""
+        """The phase recorded under the locks is the linearization point."""
         req = self.raise_card()
         self.assertEqual(self.accept(self.reply(req)), "applied")
         self.lc.clear_card(None)                                   # the progress, after the commit
@@ -2930,7 +2941,7 @@ class CardAccepter(CardBase):
         self.assertEqual(len(self.stops), 1)
 
     def test_the_store_fence_one_match_only_and_a_planted_collision_mutates_nothing(self):
-        """Kewei's (a) and (b): the claude-local root alone holds claude-local cards; the default store is
+        """The claude-local root alone holds claude-local cards; the default store is
         never touched; a same id in both stores is zero mutation and zero effect, by bytes."""
         default_store, default_mgr = card.HitlStore(card.default_root(self.state_dir)), None
         from ag2_sparrow.hitl.manager import HitlManager
@@ -3078,7 +3089,7 @@ class LocalCommands(ConnectBase):
 
 
 class LauncherUnit(ConnectBase):
-    """K6/K7: the logical exits, the entry shim's table, the stop handlers' order, the classifier."""
+    """The logical exits, the entry shim's table, the stop handlers' order, the classifier."""
 
     def setUp(self):
         super().setUp()
@@ -3159,7 +3170,7 @@ class LauncherUnit(ConnectBase):
             self.assertEqual(lc.serve(), cm.EXIT_UNUSABLE)
 
     def test_the_waiter_keeps_its_deadline_and_its_one_card_across_launcher_restarts(self):
-        """K6: the unknown episode is not an exit; each restarted launcher resumes the recorded deadline
+        """The unknown episode is not an exit; each restarted launcher resumes the recorded deadline
         and the recorded card instead of starting over or raising a second one."""
         store_root = card.store_root(_dirs.state_dir())
         shutil.rmtree(store_root.parent, ignore_errors=True)

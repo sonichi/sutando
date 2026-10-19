@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The claude-local reuse bundle proved from an installed wheel (#5695 K6/his 5, v3.6 §2): build the
+"""The claude-local reuse bundle proved from an installed wheel: build the
 wheel, install it into a fresh venv, and from an unrelated cwd with no repo src on sys.path exercise
 hitl construction and apply_action, the claude-local accepter over its own store root, the lifecycle's
 claim/authorize/confirm/stage/publish and the dead-generation recover, the guarded key send against a

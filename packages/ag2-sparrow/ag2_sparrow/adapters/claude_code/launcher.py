@@ -1,4 +1,4 @@
-"""The managed launcher of the tmux-hosted session (#5695 K3, K4, K6, K7): `run`.
+"""The managed launcher of the tmux-hosted session: `run`.
 
 The session is one immutable generation {server pid+start, session id, session created, pane id,
 pane pid, start command, nonce, title token} recorded at creation; names alone are never trusted.

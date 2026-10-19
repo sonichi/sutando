@@ -46,14 +46,14 @@ def reply_for(req, action_id="reauth", **kw):
 
 class SchemaTests(unittest.TestCase):
     def test_wire_shape(self):
-        req = make_req(title="t", device={"id": "d1", "name": "Qingyun's Air"})
+        req = make_req(title="t", device={"id": "d1", "name": "the owner's laptop"})
         w = req.to_wire()
         self.assertEqual(w["kind"], "auth")
         self.assertEqual(w["status"], "pending")
         self.assertEqual(w["revision"], 1)
         self.assertEqual(w["guard"], "screen-hash-abc")
         self.assertEqual(w["actions"][0], {"id": "reauth", "kind": "authenticate", "label": "Re-authenticate"})
-        self.assertEqual(w["device"]["name"], "Qingyun's Air")
+        self.assertEqual(w["device"]["name"], "the owner's laptop")
         self.assertEqual(WIRE_FIELD, "space.ag2.hitl")
 
     def test_every_card_names_the_host_at_the_wire(self):
@@ -126,7 +126,7 @@ class SchemaTests(unittest.TestCase):
         self.assertTrue(req.terminal)
 
     def test_the_third_layer_pins_a_reply_to_the_requirements_room(self):
-        """v3.4 §2: when the requirement names a room, a reply from any other room is stale."""
+        """When the requirement names a room, a reply from any other room is stale."""
         req = make_req(room="!owner-dm:ag2.space")
         reply = reply_for(req)
         with self.assertRaises(StaleRequirementError) as e:
@@ -192,7 +192,7 @@ class ManagerTests(unittest.TestCase):
         self.assertEqual(self.mgr.get(req.id).chosen_action, "reauth")
 
     def test_apply_action_runs_the_patch_after_the_reload_inside_the_one_save(self):
-        """v3.12 K5: `patch(req)` runs after the reload and before the sole save, so what it sets lands
+        """`patch(req)` runs after the reload and before the sole save, so what it sets lands
         in the same write as the acceptance; the production save count is exactly one."""
         req = self.mgr.create(make_req(kind="choice"))
         saves = []
@@ -222,7 +222,7 @@ class ManagerTests(unittest.TestCase):
         self.assertNotIn("never", self.mgr.get(stale.id).subject, "a refused action runs no patch")
 
     def test_save_fsyncs_the_store_directory_after_the_replace_and_raises_when_it_fails(self):
-        """v3.12 K5: the record is durable, or the caller hears that it may not be."""
+        """The record is durable, or the caller hears that it may not be."""
         req = make_req()
         import os as _os
         real_fsync, real_replace = _os.fsync, _os.replace

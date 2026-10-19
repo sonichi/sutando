@@ -2,8 +2,7 @@
 """The tmux probe and the guarded pane-key send are vendored into ag2-sparrow byte-identical with
 their two shell scripts, take the interpreter from an explicit --python, and gain the in-command
 fence: `fenced()` / `predicate()` build the one server command whose false branch orphans the ticket
-(exit 1, nothing sent). Measured against a scratch tmux server on a short /tmp socket (#5695 K4,
-v3.6 §4, v3.7 §4, v3.10, v3.13 §2 and the phase-1 delta)."""
+(exit 1, nothing sent). Measured against a scratch tmux server on a short /tmp socket."""
 import contextlib
 import os
 import re
@@ -251,7 +250,7 @@ class ScratchServer(unittest.TestCase):
         self.assertIs(vp.has_session(self.sock, "t"), False, "and the probe reads the server gone")
 
     def test_a_respawned_pane_with_a_reused_pid_and_the_same_command_refuses_on_the_title(self):
-        """K4-b: each start of the pane's command sets a fresh title token; a respawn keeps the start
+        """Each start of the pane's command sets a fresh title token; a respawn keeps the start
         command and the nonce, so a predicate whose pid term happens to match (a reused pid) still
         refuses on the recorded title."""
         titled = Path(self.dir) / "titled"
@@ -287,8 +286,8 @@ class ScratchServer(unittest.TestCase):
                          "the recorded title refuses the respawned process")
 
     def test_the_old_trailing_space_form_fails_on_a_command_that_ends_with_the_nonce(self):
-        """K4-a, measured: `--generation=<hex> --` with the `--*` glob matches the exact pane command;
-        the v3.13 `--generation <hex> *` form never matches a command ending in the nonce."""
+        """Measured: `--generation=<hex> --` with the `--*` glob matches the exact pane command;
+        the older `--generation <hex> *` form never matches a command ending in the nonce."""
         ends = "%s --generation %s" % (Path(self.dir) / "hold", NONCE)
         subprocess.run(["tmux", "-S", self.sock, "new-session", "-d", "-s", "e", "-x", "80", "-y", "20", ends], check=True)
         out = subprocess.run(["tmux", "-S", self.sock, "display-message", "-p", "-t", "e:0",

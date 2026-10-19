@@ -1,4 +1,4 @@
-"""Hang detection, advisory and this adapter's own (#5695 §5, K2): one derivation per tick from the
+"""Hang detection, advisory and this adapter's own: one derivation per tick from the
 pane's capture and the Mod's progress record, never from the process.
 
 Two cases: (a) the raw pane static for STALL_MIN_S while the plugin record shows an offer in flight

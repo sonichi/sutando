@@ -1,4 +1,4 @@
-"""`ag2-sparrow-claude-local inbox <verb>`: the Mod's only path to the task lifecycle (#5695 K2).
+"""`ag2-sparrow-claude-local inbox <verb>`: the Mod's only path to the task lifecycle.
 
 The Mod keeps no shadow state machine and writes no claim or progress file: every claim, authorize,
 confirm, stage, publish, park and progress mutation is one CLI call here, serialized per work root

@@ -1946,7 +1946,7 @@ class BoundaryGuardTest(SpyMixin, unittest.TestCase):
                 found.append(node.value[:60])
         return found
 
-    # The one named exception (#5695): the claude-local Mod's lifecycle CLI. It is that adapter's only
+    # The one named exception: the claude-local Mod's lifecycle CLI. It is that adapter's only
     # importer; every other claude_code module reaches the lifecycle through it.
     LOCAL_INBOX = ("adapters", "claude_code", "inbox.py")
 
@@ -2130,7 +2130,7 @@ class ErrorBranchTest(Base):
         self.assertTrue((life.claims.root / "task-a").is_dir())
 
 
-# ── claim modes, the turn transitions and the staged commit (#5695 K2) ───────
+# ── claim modes, the turn transitions and the staged commit ───────────────────
 
 GEN = {"pid": 2 ** 22 - 1, "start": "2026-01-01T00:00:00Z"}
 OTHER = {"pid": 2 ** 22 - 2, "start": "2026-01-01T00:00:01Z"}

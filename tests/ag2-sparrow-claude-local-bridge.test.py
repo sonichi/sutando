@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""remote_gateway_bridge and the claude-local cards (#5695 K5, v3.14 store fence, Kewei's K5-e and the
-two store pins): the vendored hitl is imported first; the claude-local root is projected into the
+"""remote_gateway_bridge and the claude-local cards (the store fence, namespaced ids and the two store
+pins): the vendored hitl is imported first; the claude-local root is projected into the
 owner DM and accepted only through the adapter's one accepter; a click, the owner's bare `/exit` and
 an event-channel click are consumed and never become a chat task; the default store is untouched."""
 import contextlib
@@ -210,7 +210,7 @@ class Clicks(Base):
         with mock.patch.object(hm.os, "fsync", dir_fails):
             out = rgb._handle_hitl_action(self.click())
         self.assertTrue(str(out).startswith("commit-unknown:"), out)
-        self.assertEqual(rgb._hitl_control_body(out), "[no-send]", "K5-e: a pending outcome, never a rejection")
+        self.assertEqual(rgb._hitl_control_body(out), "[no-send]", "a pending outcome, never a rejection")
         lc = launcher.Launcher(cli.load_config()[0], cli.config_dir(), sleep=lambda s: None)
         stops = []
         lc.stop_session = lambda rec, why: stops.append(why) or "stopped"
