@@ -127,6 +127,27 @@ class HumanActionAdapter:
         self.manager.create(req)
         return req.id
 
+    @staticmethod
+    def _runtime_request_id(req: HumanRequirement) -> Optional[str]:
+        rid = (req.subject or {}).get("runtime_request_id")
+        if (isinstance(rid, str) and rid and req.runtime == RUNTIME
+                and req.id == ha_action_id(rid) and req.guard == f"runtime:{rid}"):
+            return rid
+        return None
+
+    def active_requests(self) -> List[str]:
+        """Runtime identities still awaiting a terminal mirror transition."""
+        return [rid for req in self.manager.active()
+                if (rid := self._runtime_request_id(req)) is not None]
+
+    def expire_request(self, request_id: str) -> None:
+        """Expire only this runtime's mirror, preserving the manager's terminal gate."""
+        aid = ha_action_id(request_id)
+        with self.manager.store.locked():
+            req = self.manager.get(aid)
+            if req is not None and self._runtime_request_id(req) == request_id:
+                self.manager.expire(aid)
+
     def close(self, action_id: str, resolved_by: str, note: Optional[str] = None) -> None:
         """Settle a still-open requirement out-of-band (API completion path) so
         the card does not dangle: the requester already settled it."""

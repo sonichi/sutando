@@ -15,7 +15,10 @@ import os
 import sys
 import tempfile
 import time
+import unittest
+from dataclasses import asdict
 from pathlib import Path
+from unittest.mock import patch
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src" / "runtime-api"))
@@ -373,6 +376,170 @@ raises("task.submit empty text is a ValueError -> -32602",
        lambda: run(d.handle("task.submit", {"task": "   "})), code=-32602)
 raises("request.wait without requestId",
        lambda: run(d.handle("request.wait", {})), code=-32602, substr="requestId")
+
+class ExpiryReconciliationTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.base = Path(self.tmp.name)
+        self.store = RequestStore(str(self.base / "runtime.sqlite"))
+        self.addCleanup(self.store.close)
+        self.ha = HumanActionAdapter(str(self.base / "ha"))
+        self.d = RuntimeDispatcher(self.store, self.ha, "expiry-test", executors={})
+        self.clock = patch("request_store.time.time", return_value=1000).start()
+        self.addCleanup(patch.stopall)
+
+    def issue(self, kind="elicitation", **extra):
+        params = ({"question": "Choose", "type": "single_select", "options": ["A", "B"]}
+                  if kind == "elicitation" else {"action": "test action"})
+        return asyncio.run(self.d.handle(
+            kind + ".request", {**params, "expiresInS": 10, **extra}))["requestId"]
+
+    def mirror(self, rid):
+        return asdict(self.ha.manager.get(ha_action_id(rid)))
+
+    def passes(self):
+        async def drive():
+            task = asyncio.create_task(self.d.resolver_loop())
+            try:
+                await asyncio.sleep(0.025)
+                self.assertFalse(task.done())
+            finally:
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+        with patch("dispatcher.RESOLVER_POLL_S", 0.001):
+            asyncio.run(drive())
+
+    def test_normal_resolver_expires_all_three_mirrors_once(self):
+        rids = [self.issue(kind) for kind in ("approval", "elicitation", "human_action")]
+        before = {rid: self.mirror(rid) for rid in rids}
+        self.clock.return_value = 1011
+        self.passes()
+        for rid in rids:
+            self.assertEqual(self.store.get(rid)["status"], "expired")
+            after = self.mirror(rid)
+            self.assertEqual(after["status"], "expired")
+            self.assertEqual(after["revision"], before[rid]["revision"] + 1)
+            for key in before[rid].keys() - {"status", "revision", "updated_at"}:
+                self.assertEqual(after[key], before[rid][key], key)
+        snapshot = {rid: (self.store.get(rid), self.mirror(rid)) for rid in rids}
+        self.passes()
+        self.d.recover()
+        self.assertEqual(snapshot, {rid: (self.store.get(rid), self.mirror(rid)) for rid in rids})
+        self.assertEqual(self.ha.manager.active(), [])
+
+    def test_recovery_finds_expired_rows_even_without_pending_rows_or_map(self):
+        rid = self.issue()
+        self.clock.return_value = 1011
+        self.assertEqual(self.store.get(rid)["status"], "expired")
+        self.assertEqual(self.store.pending(), [])
+        self.assertEqual(self.mirror(rid)["status"], "pending")
+        restarted = RuntimeDispatcher(self.store, self.ha, "expiry-test", executors={})
+        self.assertEqual(restarted._ha_of, {})
+        restarted.recover()
+        self.assertEqual(self.mirror(rid)["status"], "expired")
+
+    def test_failed_expiry_retries_in_resolver_and_after_recovery(self):
+        for restart in (False, True):
+            with self.subTest(restart=restart):
+                self.clock.return_value = 1000
+                stuck, healthy = self.issue(), self.issue("approval")
+                before = self.mirror(stuck)
+                save = self.ha.manager.store.save
+                failures = []
+
+                def fail_one(req, *args, **kwargs):
+                    if req.id == ha_action_id(stuck) and req.status == "expired":
+                        failures.append(req.id)
+                        raise OSError("controlled mirror-write failure")
+                    return save(req, *args, **kwargs)
+
+                self.clock.return_value = 1011
+                with patch.object(self.ha.manager.store, "save", side_effect=fail_one):
+                    self.d.recover()
+                    self.passes()
+                self.assertGreater(len(failures), 1)
+                self.assertEqual(self.store.get(stuck)["status"], "expired")
+                self.assertEqual(self.mirror(stuck), before)
+                self.assertEqual(self.mirror(healthy)["status"], "expired")
+                if restart:
+                    reopened = RequestStore(str(self.base / "runtime.sqlite"))
+                    try:
+                        RuntimeDispatcher(reopened, HumanActionAdapter(str(self.base / "ha")),
+                                          "expiry-test", executors={}).recover()
+                    finally:
+                        reopened.close()
+                else:
+                    self.passes()
+                self.assertEqual(self.mirror(stuck)["status"], "expired")
+                self.assertEqual(self.mirror(stuck)["revision"], before["revision"] + 1)
+
+    def test_scan_failure_is_isolated_and_retried(self):
+        rid = self.issue()
+        self.clock.return_value = 1011
+        with patch.object(self.ha, "active_requests", side_effect=OSError("scan refused")):
+            self.d.recover()
+            self.passes()
+        self.assertEqual(self.mirror(rid)["status"], "pending")
+        self.passes()
+        self.assertEqual(self.mirror(rid)["status"], "expired")
+
+    def test_terminal_outcomes_and_unexpired_answers_are_preserved(self):
+        outcomes = []
+        for kind, answer, expected in (("elicitation", 1, "resolved"),
+                                      ("approval", 1, "approved"),
+                                      ("approval", 2, "denied"),
+                                      ("human_action", 1, "completed"),
+                                      ("human_action", 2, "declined")):
+            rid = self.issue(kind)
+            self.ha.resolve(ha_action_id(rid), {"1": [answer]}, "owner")
+            self.d._settle(rid)
+            self.assertEqual(self.store.get(rid)["status"], expected)
+            outcomes.append(rid)
+        cancelled = self.issue()
+        self.d._cancel({"requestId": cancelled})
+        outcomes.append(cancelled)
+        before = {rid: (self.store.get(rid), self.mirror(rid)) for rid in outcomes}
+        live = self.issue(expiresInS=100)
+        self.clock.return_value = 1011
+        self.d.recover()
+        self.passes()
+        self.assertEqual(before, {rid: (self.store.get(rid), self.mirror(rid)) for rid in outcomes})
+        self.assertEqual(self.mirror(cancelled)["status"], "pending")
+        self.assertEqual(self.store.get(live)["status"], "pending")
+        self.ha.resolve(ha_action_id(live), {"1": [2]}, "owner")
+        self.passes()
+        self.assertEqual(self.store.get(live)["result"], {"answer": "B"})
+
+    def test_only_matching_human_rows_and_active_mirrors_are_reconciled(self):
+        from hitl.schema import HumanRequirement
+        missing = "elicitation-missing"
+        self.ha.open_elicitation({"requestId": missing, "expiresAt": 1001,
+                                  "params": {"question": "Missing row"}})
+        cap = self.store.create("capability", "capability.execute", "test", {}, expires_in_s=1)
+        self.ha.open_approval(cap)
+        unrelated = HumanRequirement(kind="choice", runtime="another-runtime",
+                                     message="Unrelated", expires_at=1001)
+        self.ha.manager.create(unrelated)
+        terminal = self.issue()
+        self.ha.manager.resolve(ha_action_id(terminal))
+        other = HumanActionAdapter(str(self.base / "other-workspace" / "ha"))
+        other.open_elicitation({"requestId": terminal, "expiresAt": 1001, "params": {}})
+        before = [asdict(req) for req in self.ha.manager.store.all()]
+        other_before = [asdict(req) for req in other.manager.store.all()]
+        self.clock.return_value = 1011
+        self.passes()
+        self.d.recover()
+        self.assertEqual([asdict(req) for req in self.ha.manager.store.all()], before)
+        self.assertEqual([asdict(req) for req in other.manager.store.all()], other_before)
+        self.assertEqual(self.store.get(terminal)["status"], "expired")
+
+
+expiry_result = unittest.TextTestRunner(verbosity=2).run(
+    unittest.defaultTestLoader.loadTestsFromTestCase(ExpiryReconciliationTests))
+if not expiry_result.wasSuccessful():
+    FAILS.append("expiry reconciliation")
 
 print()
 if FAILS:

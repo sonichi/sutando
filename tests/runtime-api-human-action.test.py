@@ -14,7 +14,9 @@ import asyncio
 import sys
 import tempfile
 import unittest
+from dataclasses import asdict, replace
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src" / "runtime-api"))
@@ -22,7 +24,7 @@ sys.path.insert(0, str(ROOT / "src" / "runtime-api"))
 from dispatcher import RuntimeDispatcher  # noqa: E402
 from request_store import RequestStore  # noqa: E402
 
-from ha_adapter import HumanActionAdapter  # noqa: E402
+from ha_adapter import HumanActionAdapter, ha_action_id  # noqa: E402
 from protocol import ProtocolError  # noqa: E402
 
 SETTLE_METHODS = ("human_action.complete", "human_action.decline")
@@ -172,6 +174,88 @@ class AdapterEdgeTests(unittest.TestCase):
         self.assertEqual(self.ha._answers(req), {})
         req.chosen_action = "approve"; req.subject["options"] = []
         self.assertEqual(self.ha._answers(req), {"1": "Approve"})
+
+
+class AdapterExpiryTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.ha = HumanActionAdapter(str(Path(self.tmp.name) / "ha"))
+        self.rid = "elicitation-expiry"
+        self.aid = self.ha.open_elicitation({
+            "requestId": self.rid, "expiresAt": 100,
+            "params": {"question": "Choose", "options": ["A", "B"]}})
+        self.manager = self.ha.manager
+        self.manager.record_projection(self.aid, 1, "$original")
+
+    def test_active_requests_require_all_runtime_identity_fields(self):
+        original = self.manager.get(self.aid)
+        for change in ({"runtime": "other"}, {"guard": "other"},
+                       {"subject": {}}, {"subject": {"runtime_request_id": 42}},
+                       {"subject": {"runtime_request_id": ""}},
+                       {"subject": {"runtime_request_id": "approval-other"}},
+                       {"status": "resolved"}, {"status": "cancelled"},
+                       {"status": "expired"}):
+            with self.subTest(change=change):
+                self.manager.store.save(replace(original, **change))
+                self.assertEqual(self.ha.active_requests(), [])
+        self.manager.store.save(original)
+        self.manager.store.save(replace(original, id="hitl_unrelated"))
+        self.assertEqual(self.ha.active_requests(), [self.rid])
+
+    def test_expiry_delegates_and_preserves_identity_answer_and_receipt(self):
+        from hitl.schema import ActionReply
+        req = self.manager.get(self.aid)
+        self.manager.apply_action(ActionReply(req.id, req.revision, "opt1",
+                                              req.guard, answer="A"))
+        before = asdict(self.manager.get(self.aid))
+        receipt = self.manager.store.projection(self.aid)
+        with patch.object(self.manager, "expire", wraps=self.manager.expire) as expire:
+            self.ha.expire_request(self.rid)
+            expire.assert_called_once_with(self.aid)
+        after = asdict(self.manager.get(self.aid))
+        self.assertEqual(after["status"], "expired")
+        self.assertEqual(after["revision"], before["revision"] + 1)
+        for key in before.keys() - {"status", "revision", "updated_at"}:
+            self.assertEqual(after[key], before[key], key)
+        self.assertEqual(self.manager.store.projection(self.aid), receipt)
+        self.assertEqual(self.ha.active_requests(), [])
+        self.ha.expire_request(self.rid)
+        self.assertEqual(asdict(self.manager.get(self.aid)), after)
+
+    def test_terminal_and_missing_mirrors_are_unchanged(self):
+        original = self.manager.get(self.aid)
+        for status in ("resolved", "cancelled", "expired"):
+            with self.subTest(status=status):
+                req = replace(original, status=status, answer="kept", decided_by="owner")
+                self.manager.store.save(req)
+                self.ha.expire_request(self.rid)
+                self.assertEqual(asdict(self.manager.get(self.aid)), asdict(req))
+        self.ha.expire_request("elicitation-missing")
+        self.assertIsNone(self.manager.get(ha_action_id("elicitation-missing")))
+
+    def test_identity_is_rechecked_before_expiring(self):
+        self.assertEqual(self.ha.active_requests(), [self.rid])
+        req = self.manager.get(self.aid)
+        req.guard = "replaced"
+        self.manager.store.save(req)
+        with patch.object(self.manager, "expire", wraps=self.manager.expire) as expire:
+            self.ha.expire_request(self.rid)
+            expire.assert_not_called()
+        self.assertEqual(asdict(self.manager.get(self.aid)), asdict(req))
+
+    def test_failed_save_keeps_durable_retry_state(self):
+        before = asdict(self.manager.get(self.aid))
+        receipt = self.manager.store.projection(self.aid)
+        with patch.object(self.manager.store, "save", side_effect=OSError("write refused")):
+            with self.assertRaises(OSError):
+                self.ha.expire_request(self.rid)
+        self.assertEqual(asdict(self.manager.get(self.aid)), before)
+        self.assertEqual(self.ha.active_requests(), [self.rid])
+        self.assertEqual(self.manager.store.projection(self.aid), receipt)
+        self.ha.expire_request(self.rid)
+        self.assertEqual(self.manager.get(self.aid).status, "expired")
+        self.assertEqual(self.manager.store.projection(self.aid), receipt)
 
 
 class ProductionComposedSettleTests(unittest.TestCase):

@@ -173,6 +173,7 @@ class RuntimeDispatcher:
                                      "needs a new approval)"},
                     resolved_by="daemon-recovery")
                 n += 1
+        self._reconcile_expired_requests()
         if relinked or n:
             _log(f"recovered {relinked} pending request(s)"
                  + (f", failed {n} interrupted capability execution(s)" if n else ""))
@@ -631,11 +632,29 @@ class RuntimeDispatcher:
                                   result={"answer": answer},
                                   resolved_by=resolved_by)
 
+    def _reconcile_expired_requests(self) -> None:
+        # Active mirrors are the durable retry set, including rows already expired
+        # by a read or an earlier daemon before the mirror could be written.
+        try:
+            request_ids = self.ha.active_requests()
+        except Exception as e:
+            _log(f"expiry reconciliation scan error (isolated): {e}")
+            return
+        for request_id in request_ids:
+            try:
+                rec = self.store.get(request_id)
+                if (rec and rec["requestType"] in ("approval", "elicitation", "human_action")
+                        and rec["status"] == "expired"):
+                    self.ha.expire_request(request_id)
+            except Exception as e:
+                _log(f"expiry reconciliation error for {request_id} (will retry): {e}")
+
     async def resolver_loop(self) -> None:
         while True:
             try:
                 for rec in self.store.pending():
                     self._settle(rec["requestId"])
+                self._reconcile_expired_requests()
             except Exception as e:  # noqa: BLE001 — resolver must never die
                 _log(f"resolver error (isolated): {e}")
             await asyncio.sleep(RESOLVER_POLL_S)
