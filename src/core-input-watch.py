@@ -122,8 +122,8 @@ from delivery.pane_gate import (  # noqa: E402
     ADAPTERS, AWAIT_HINT, BORDER_LINE, CLAUDE, CLAUDE_GATE_SIGNATURES, CLAUDE_IDLE,
     COMPOSER_PLACEHOLDER, FABLE_TEXT, SGR_STRIP as _ANSI_SGR, TURN_DONE, TURN_SHORT,
     classify_pane as _pg_classify_pane, composer_text as _pg_composer_text, gate_evidence,
-    limit_banner, limit_baseline, limit_is_stale, live_tail, prompt_line as _pg_prompt_line,
-    refusal_line, strip_limit_banners,
+    is_usage_limit, limit_baseline, limit_step, live_tail,
+    prompt_line as _pg_prompt_line, refusal_line, strip_limit_banners,
 )
 
 _FABLE_TEXT = FABLE_TEXT
@@ -333,21 +333,6 @@ def owes_work(seat, workspace):
     """Whether this seat has queued work: the core's own queue, else None. A worker's queue
     is the pool's to read, so the pool's supervisor is what pages a banner holding it."""
     return None if seat else core_gate_notice.queued_count(workspace) > 0
-
-
-def limit_step(pane, baseline, workspace=None, socket=None, session=None, owes_work=True):
-    """(stale, baseline) for this poll's limit banner. The baseline is taken when a banner
-    first shows, and again when its text changes; the newest turn since then decides.
-    A banner holds nothing on a seat that owes no work (`owes_work` False or unknown)."""
-    abn = limit_banner(pane or "")
-    if abn is None:
-        return False, None
-    current = limit_baseline(pane)
-    if baseline is None or baseline.banner != current.banner:
-        baseline = current
-    if owes_work is not True:
-        return True, baseline
-    return limit_is_stale(abn, workspace, socket, session, capture=pane, baseline=baseline), baseline
 
 
 def compose_state(pane, base_health, gateway_alive, process=True, prev_pane=None, runtime=None,
@@ -616,7 +601,7 @@ DRIVE_SETTLE_S = 15.0
 from prompt_excerpt import prompt_excerpt  # noqa: E402  (shared with core-supervisor-relay)
 
 
-def escalation_message(state, detail, kind, prompt):
+def escalation_message(state, detail, kind, prompt, session=None):
     """The card body. The core is blocked, so this is the only thing that will
     reach the owner until they act."""
     head = ("I am blocked and cannot continue without you."
@@ -630,8 +615,12 @@ def escalation_message(state, detail, kind, prompt):
         # Plain lines, not a code fence: the card renders text, and the prompt is what the owner
         # needs to read, not the pane's chrome around it.
         lines += ["", "What the terminal is showing:"] + [f"  {ln}" for ln in excerpt]
-    lines += ["", "Open the Runtime panel (or the core's terminal) and answer it. "
-                  "Nothing else I do can clear this one."]
+    if is_usage_limit(kind, prompt):
+        from hitl.tui_gate import limit_unblock
+        lines += ["", limit_unblock(session)]
+    else:
+        lines += ["", "Open the Runtime panel (or the core's terminal) and answer it. "
+                      "Nothing else I do can clear this one."]
     return "\n".join(lines)
 
 
@@ -668,7 +657,8 @@ def _name_seat(req, session, seat):
 def escalate(manager, state, detail, kind, prompt, session, seat=None, queued=0, runtime=None):
     """Raise ONE requirement per episode. The Manager dedups on
     (runtime, kind, device) + guard, so the prompt IS the episode key: the same
-    prompt returns the same record, a different one mints a new card.
+    prompt returns the same record, a different one mints a new card. A usage
+    limit is keyed on the session instead, whatever its screen shows.
 
     Returns the requirement, or None when nothing could be raised.
     """
@@ -676,9 +666,11 @@ def escalate(manager, state, detail, kind, prompt, session, seat=None, queued=0,
         return None
     try:
         from hitl import tui_gate
+        limit = is_usage_limit(kind, prompt)
         req = tui_gate.requirement_for(state, kind, prompt, session, detail,
-                                       escalation_message(state, detail, kind, prompt),
-                                       runtime=runtime)
+                                       escalation_message(state, detail, kind, prompt, session),
+                                       runtime=runtime,
+                                       episode=tui_gate.LIMIT_EPISODE if limit else None)
         if queued:
             req.message = f"{req.message}\n\n{core_gate_notice.card_line(queued)}"
         if seat:
@@ -719,12 +711,14 @@ def resolve_escalations(manager, session, pane=None, runtime=None):
     A signed-out card clears only on positive proof in `pane` that the CLI is signed in:
     a turn that ran, or output after the refusal (worker_auth_state). A newer prompt, a
     spinner, an empty capture or a health verdict read off another session's status
-    file is not "Sutando has continued its work".
+    file is not "Sutando has continued its work". A usage-limit card clears only once
+    `tui_gate.limit_card_holds` says the limit no longer holds the pane.
     """
     if manager is None:
         return []
     try:
         from hitl.manager import AUTH_KIND
+        from hitl.tui_gate import limit_card_holds
         signed_in = authenticated_turn(pane, runtime) or refusal_answered(pane, runtime)
         done = []
         for r in manager.active():
@@ -732,6 +726,8 @@ def resolve_escalations(manager, session, pane=None, runtime=None):
             if subj.get("source") != _TUI_SOURCE or subj.get("session") != session:
                 continue
             if r.kind == AUTH_KIND and not signed_in:
+                continue
+            if limit_card_holds(r, pane, runtime):
                 continue
             manager.resolve(r.id)   # returns blocked task ids, not a verdict
             done.append(r.id)
@@ -869,7 +865,7 @@ def main():
     idle_ticks = 0
     login_since = None
     prev_pane = None
-    limit_baseline = None
+    banner_baseline = None
     clock = (None, None, None)
     last_runtime = None  # a failed tmux read keeps the last runtime, not "claude"
     state_dir = os.path.dirname(os.path.abspath(a.out))
@@ -882,8 +878,8 @@ def main():
         base = rh.derive()  # shared: offline|needs_login|working|idle|unknown
         runtime = session_runtime(a.socket, a.session) or last_runtime
         last_runtime = runtime
-        limit_stale, limit_baseline = limit_step(pane, limit_baseline, workspace, a.socket, a.session,
-                                                 owes_work=owes_work(a.seat, workspace))
+        limit_stale, banner_baseline = limit_step(pane, banner_baseline, workspace, a.socket, a.session,
+                                                   owes_work=owes_work(a.seat, workspace))
         state, detail, prompt, kind = compose_state(
             pane or "", base.get("health", "unknown"),
             gateway_alive(a.app_data, os.path.dirname(os.path.abspath(a.out))),
@@ -898,8 +894,10 @@ def main():
         login_settling, login_since = login_confirm_step(login_since, state, kind, time.time(),
                                                          a.login_confirm_s)
         if state in ("blocked-human", "blocked-known"):
-            stable_prompt = stable_prompt + 1 if prompt == last_prompt else 1
-            last_prompt = prompt
+            # A limit's screen repaints (a clock, a refused delivery); the episode is what settles.
+            seen = "usage-limit" if is_usage_limit(kind, prompt) else prompt
+            stable_prompt = stable_prompt + 1 if seen == last_prompt else 1
+            last_prompt = seen
             if stable_prompt < a.stable:
                 settling = True
                 state, detail, prompt, kind = "running", "processing (prompt settling)", None, None
@@ -949,7 +947,9 @@ def main():
                 if not a.seat:
                     notice_queued(hitl, req, workspace, state, kind)
             elif verdict == "resolve":
-                resolve_escalations(hitl, a.session, pane, runtime)
+                # A banner judged outrun is not standing evidence, for the card as for the state.
+                resolve_escalations(hitl, a.session,
+                                    strip_limit_banners(pane) if limit_stale and pane else pane, runtime)
                 if not a.seat:
                     core_gate_notice.end_outage(workspace)
         if a.once:
