@@ -10,7 +10,7 @@
  * Any failure or delay lets the request through: the check never blocks work.
  */
 
-/** How long the core will take: a quick task is one lookup, command or short generation; a long one builds, writes or researches. */
+/** How long the core will take: a quick task is one lookup, command or message; a long one builds, writes, researches or generates a picture. */
 export type WorkLane = 'quick' | 'long';
 export type WorkCheck = { action: 'submit'; lane?: WorkLane } | { action: 'ask'; question: string } | { action: 'duplicate'; of: string };
 
@@ -46,7 +46,7 @@ export function workCheckPrompt(i: WorkCheckInput): string {
 		'- "the PR", "that file", "the meeting", "那个 PR" with no number, name or title = not identified. Do NOT fill it in from a PR, file or meeting that came up earlier, not even in the request just before: ask. The only exception is the user answering the assistant\'s own "which one?".',
 		'- A bare number is identified when the recent words show what kind of thing the numbers are (e.g. the user has been asking about PRs).',
 		'- The same request as one of the open tasks (same thing, same ask, maybe worded differently or misheard) = duplicate.',
-		'- lane "quick": one lookup, one command, one count, one message or file sent, one picture or short text generated; done in about a minute with no building. lane "long": building or writing something (an app, a document, code), research across sources, or many steps.',
+		'- lane "quick": one lookup, one command, one count, one message or file sent, a short text; done in well under a minute with no building. lane "long": building or writing something (an app, a document, code), generating or drawing a picture (a minute or more: 2026-10-18 a lizard picture held three lookups behind it), research across sources, or many steps.',
 		'Reply with JSON only:',
 		'{"action":"duplicate","of":"<id of the open task>"} when it is the same request as an open task.',
 		'{"action":"ask","question":"..."} when a specific thing is not identified. One short question in the user\'s language asking only for the missing piece.',
@@ -57,7 +57,7 @@ export function workCheckPrompt(i: WorkCheckInput): string {
 		'Request "Summarize the meeting notes"; recent words "帮我总结一下会议纪要" -> {"action":"ask","question":"哪一场会议的纪要？"}',
 		'Request "List the PRs merged this week in sonichi/sutando" -> {"action":"submit","lane":"quick"}',
 		'Request "Check 5332"; recent words "帮我查一下 5428 改了什么 … 帮我查一下 5332" -> {"action":"submit","lane":"quick"}',
-		'Request "Draw a picture of a squirrel" -> {"action":"submit","lane":"quick"}',
+		'Request "Draw a picture of a squirrel" -> {"action":"submit","lane":"long"}',
 		'Request "Create a calorie tracking app that estimates calories from food photos" -> {"action":"submit","lane":"long"}',
 		'Request "Write a report comparing the three vendors" -> {"action":"submit","lane":"long"}',
 		'Request "Check the status of that PR"; recent words "帮我查一下 PR 5302 的状态 … (answered) … 帮我查一下那个 PR 的状态" -> {"action":"ask","question":"你说的是哪个 PR？"}',
