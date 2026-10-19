@@ -34,6 +34,7 @@ CLAUDE_GRACE_S = 30.0
 SERVER_EXIT_S = 20.0
 CONSUMER_WAIT_S = 30.0
 INNER_STOP_S = 120.0
+TITLE_CHANGED = "title changed"
 START_COMMAND_RE = re.compile(r'^"?ag2-sparrow-claude-local hold --generation=[0-9a-f]{32} --"?$')
 TMUX_VERSION_RE = re.compile(r"(\d+)\.(\d+)")
 SESSION_ENV_KEYS = ("CLAUDE_CONFIG_DIR", "HMAC_KEY_FILE", "HMAC_STRICT")
@@ -210,7 +211,8 @@ def classify(tm: Tmux, rec: dict, cfg: dict, root, created=None) -> "tuple[str, 
                                                            {"pid": consumer["pid"], "start": consumer["start"]} != rec["consumer"]):
         return "unknown", "the pane's claude does not verify by pid and start"
     if rec.get("title_token") and fields["title"] != rec["title_token"]:
-        return "unknown", "the pane title is not the recorded token"
+        return "unknown", "%s: the pane title %r is not the recorded token; fenced actions are withheld" % (
+            TITLE_CHANGED, fields["title"])
     plugin = records.load_plugin(root)
     # The Mod's witness counts only for this generation's consumer; an older one reads absent.
     witness = plugin.get("session_id") if plugin.get("generation") == rec.get("consumer") else None
@@ -259,9 +261,9 @@ class Launcher:
     # ── create / adopt ───────────────────────────────────────────────────────
 
     def create(self, rec: dict) -> "tuple[bool, str]":
-        if tmux_pane_keys.fence_status(self.tm.sock) != "clear":
-            return False, "the pane-key guard on %s is %s; creation is fenced until it is recovered" % (
-                self.tm.sock, tmux_pane_keys.fence_status(self.tm.sock))
+        fence = tmux_pane_keys.fence_status(self.tm.sock)
+        if fence != "clear":
+            return False, "the pane-key guard on %s is %s; creation is fenced until it is recovered" % (self.tm.sock, fence)
         consumer = task_io.holder_consumer(self.root)
         if consumer and consumer.get("live") is not False:
             return False, "a recorded claude consumer still verifies or is unobserved; no second session"
@@ -277,7 +279,8 @@ class Launcher:
         if generation is None:
             return False, problem
         self.created, self.adopted = nonce, False
-        self._with_record(lambda r: dict(r, generation=generation, consumer=None, title_token=None, incident=None,
+        self._with_record(lambda r: dict(r, generation=generation, consumer=None, title_token=None, title_changed=None,
+                                         incident=None,
                                          stall=None, deadline=None, effect=None, install_id=self.opaque,
                                          launcher=task_io.process_identity()))
         consumer, title = await_consumer(self.tm, self.root, generation["pane_id"], sleep=self.sleep)
@@ -428,31 +431,47 @@ class Launcher:
         started = self.clock()
         self.log("stopping (%s): /exit to pane %s" % (why, gen["pane_id"]))
         rc = self.fenced(gen, title, "send-keys -t %s /exit Enter" % tmux_pane_keys.tmux_quote(gen["pane_id"]))
-        if rc == tmux_pane_keys.WITHHELD:
-            return "cancelled: the tuple changed before /exit; nothing sent"
-        if rc == tmux_pane_keys.UNCERTAIN:
-            self._with_record(lambda r: dict(r, fence_uncertain=True))
-            return "uncertain: the /exit send is unconfirmed; creation is fenced until the guard is recovered"
-        if rc not in (0,):
-            return "not sent: pane-key send exit %d" % rc
+        if rc != 0:
+            return self.unsent(gen, title, rc, "/exit") or self.stopped(started)
         deadline = time.monotonic() + CLAUDE_GRACE_S
         consumer = task_io.holder_consumer(self.root)
         while consumer and consumer.get("live") is not False and time.monotonic() < deadline:
             self.sleep(0.5)
             consumer = task_io.holder_consumer(self.root)
         rc = self.fenced(gen, title, "kill-session -t %s" % tmux_pane_keys.tmux_quote(gen["session_id"]))
-        if rc == tmux_pane_keys.WITHHELD:
-            return "cancelled: the tuple changed before kill-session"
-        if rc == tmux_pane_keys.UNCERTAIN:
-            self._with_record(lambda r: dict(r, fence_uncertain=True))
-            return "uncertain: kill-session unconfirmed; creation is fenced until the guard is recovered"
+        if rc != 0:
+            return self.unsent(gen, title, rc, "kill-session") or self.stopped(started)
         deadline = time.monotonic() + SERVER_EXIT_S
         while self.tm.has_session() is True and time.monotonic() < deadline:
             self.sleep(0.5)
         if self.tm.has_session() is True:
             return "kill-session sent but the session still answers after %d s" % SERVER_EXIT_S
+        return self.stopped(started)
+
+    def stopped(self, started) -> str:
         self.log("stopped in %.1f s" % (self.clock() - started))
         return "stopped"
+
+    def unsent(self, gen: dict, title: str, rc: int, what: str) -> str:
+        """A fenced action that did not report sent: '' when the session is already gone (a /exit
+        that worked takes the server with it), else the one-line outcome for its exit code."""
+        if rc == tmux_pane_keys.UNCERTAIN:
+            self._with_record(lambda r: dict(r, fence_uncertain=True))
+        if self.tm.has_session() is False:
+            return ""
+        if rc == tmux_pane_keys.WITHHELD:
+            fields = self.tm.pane_fields(gen["pane_id"])
+            if title and fields and tuple_matches(fields, gen) and fields["title"] != title:
+                self._with_record(lambda r: dict(r, title_changed={"recorded": title, "seen": fields["title"],
+                                                                   "at": self.clock()}))
+                return ("%s: the pane title changed from the recorded token (pid, session and nonce still "
+                        "match): the pane's claude retitled it; nothing sent" % TITLE_CHANGED)
+            return "cancelled: the tuple changed before %s; nothing sent" % what
+        if rc == tmux_pane_keys.UNCERTAIN:
+            return "uncertain: the %s send is unconfirmed; creation is fenced until the guard is recovered" % what
+        if rc == tmux_pane_keys.BUSY:
+            return "busy: another pane-key sender holds the guard; %s not sent, retry later" % what
+        return "error: the pane-key send of %s exited %d; nothing confirmed sent" % (what, rc)
 
     # ── the loop ─────────────────────────────────────────────────────────────
 

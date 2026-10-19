@@ -267,6 +267,11 @@ if read("claude-ignore-hup", ""):
     signal.signal(signal.SIGHUP, signal.SIG_IGN)
 if read("claude-signal-parent", ""):
     os.kill(os.getppid(), getattr(signal, "SIG" + read("claude-signal-parent", "")))
+if read("claude-exit-on-exit", ""):
+    for line in sys.stdin:
+        if line.strip() == "/exit":
+            break
+    sys.exit(0)
 time.sleep(float(read("claude-linger", "0")))
 sys.exit(int(read("claude-exit", "0")))
 '''
@@ -2277,7 +2282,7 @@ class LauncherTmux(ConnectBase):
     def created(self):
         lc = self.launcher()
         rec = lc.record()
-        self.assertEqual(launcher.classify(lc.tm, rec, self.cfg, str(self.work)), ("create", ""))
+        self.assertEqual(launcher.classify(lc.tm, rec, self.cfg, str(self.work))[0], "create")
         ok, problem = lc.create(rec)
         self.assertTrue(ok, problem)
         return lc, lc.record()
@@ -2359,6 +2364,64 @@ class LauncherTmux(ConnectBase):
         self.assertTrue(wait_for(lambda: task_io.occupancy(str(self.work)) == "free", 15), "hold released the root")
         self.assertEqual(launcher.classify(lc.tm, lc.record(), self.cfg, str(self.work))[0], "create",
                          "the next start creates and resumes by id")
+
+    def test_a_claude_that_exits_on_exit_is_stopped_for_the_manager_uninstall_and_the_card(self):
+        """The real stop path: /exit ends claude, hold and the server, so the fenced kill-session finds no
+        server; the session is gone, which is stopped, not cancelled."""
+        (self.home / "claude-exit-on-exit").write_text("1")
+        kills = []
+        lc, rec = self.created()
+        real = lc.fenced
+
+        def fenced(gen, title, action):
+            rc = real(gen, title, action)
+            if action.startswith("kill-session"):
+                kills.append(rc)
+            return rc
+        with mock.patch.object(lc, "fenced", fenced):
+            self.assertEqual(lc.stop_session(rec, "test"), "stopped")
+        self.assertEqual(len(kills), 1)
+        self.assertNotEqual(kills[0], 0, "the kill-session found no server to send to")
+        self.assertIs(lc.tm.has_session(), False)
+        self.assertTrue(wait_for(lambda: task_io.occupancy(str(self.work)) == "free", 15))
+
+        lc, rec = self.created()
+        lc.state["sig"] = signal.SIGTERM
+        self.assertEqual(lc._serve(), 0, "a manager stop of an exiting claude is 0, never 74")
+        self.assertTrue(wait_for(lambda: task_io.occupancy(str(self.work)) == "free", 15))
+
+        lc, rec = self.created()
+        self.assertEqual(cli.stop_stray(self.cfg), "", "uninstall stops it")
+        self.assertTrue(wait_for(lambda: task_io.occupancy(str(self.work)) == "free", 15))
+
+        lc, rec = self.created()
+        store_root = card.store_root(_dirs.state_dir())
+        shutil.rmtree(store_root.parent, ignore_errors=True)
+        self.addCleanup(shutil.rmtree, store_root.parent, True)
+        lc.store_root = store_root
+        card.register_install(store_root, lc.opaque, lc.root, lc.supervisor_lock)
+        lc._with_record(lambda r: dict(r, stall=STALL))
+        lc.raise_card(lc.record(), card.KIND_STALL, STALL["checks"])
+        self.assertEqual(accepter.local_stop(_dirs.state_dir(), lc.opaque, log=lambda *a: None), "applied")
+        after = lc.apply_effects(lc.record())
+        self.assertEqual((after["effect"]["outcome"], after["generation"]), ("stopped", None),
+                         "the card's stop retires the generation")
+
+    def test_a_retitled_pane_is_a_distinct_title_changed_outcome_in_the_stop_verify_and_the_card(self):
+        lc, rec = self.created()
+        self.tmux("select-pane", "-t", rec["generation"]["pane_id"], "-T", "retitled-by-claude")
+        out = lc.stop_session(rec, "test")
+        self.assertTrue(out.startswith(launcher.TITLE_CHANGED + ":"), out)
+        self.assertEqual(lc.record()["title_changed"]["seen"], "retitled-by-claude")
+        self.assertIs(lc.tm.has_session(), True, "withheld: nothing was sent")
+        verdict, why = launcher.classify(lc.tm, lc.record(), self.cfg, str(self.work))
+        self.assertEqual((verdict, why.startswith(launcher.TITLE_CHANGED + ":")), ("unknown", True),
+                         "the unknown card names it as its failed check")
+        with mock.patch.object(cli, "auth_problem", return_value=""):
+            _, text, _ = self.main("verify")
+        self.assertIn("INFO %s:" % launcher.TITLE_CHANGED, text)
+        self.tmux("select-pane", "-t", rec["generation"]["pane_id"], "-T", rec["title_token"])
+        lc.tm.run("kill-session", "-t", rec["generation"]["session_id"])
 
     def test_a_same_name_replacement_with_the_same_start_command_survives_both_fenced_actions(self):
         """K4 ABA: the recorded tuple's server dies; a new server answers the same socket with the same
@@ -2993,6 +3056,24 @@ class LauncherUnit(ConnectBase):
         self.assertLess(launcher.INNER_STOP_S, cli.LOCAL.stop_timeout_s)
         self.assertLess(cli.LOCAL.stop_timeout_s, cli.LOCAL.manager_timeout_s, "the installer outlasts the stop it waits on")
         self.assertEqual((cli.LOCAL.stop_timeout_s, cli.LOCAL.manager_timeout_s), (180, 240))
+
+    def test_a_kill_session_busy_or_usage_exit_is_never_read_as_sent(self):
+        gen = {"pane_id": "%0", "pane_pid": 1, "session_id": "$0", "session_created": 1, "server_pid": 1,
+               "server_start": "s", "start_command": "c", "nonce": NONCE}
+        lc = launcher.Launcher(self.cfg, cli.config_dir(), sleep=lambda s: None)
+        lc.tm = FakeTmux(present=True)
+        with mock.patch.object(launcher, "SERVER_EXIT_S", 0.0), mock.patch.object(launcher, "CLAUDE_GRACE_S", 0.0):
+            for rc, word in ((tmux_pane_keys.BUSY, "busy:"), (2, "error:")):
+                with mock.patch.object(lc, "fenced", side_effect=[0, rc]):
+                    out = lc.stop_session({"generation": gen, "title_token": None}, "test")
+                self.assertTrue(out.startswith(word), (rc, out))
+
+    def test_creation_reads_the_pane_key_guard_once(self):
+        lc = launcher.Launcher(self.cfg, cli.config_dir(), sleep=lambda s: None)
+        with mock.patch.object(tmux_pane_keys, "fence_status", side_effect=["uncertain", "clear"]) as status:
+            ok, problem = lc.create(lc.record())
+        self.assertEqual((ok, status.call_count), (False, 1))
+        self.assertIn("is uncertain", problem, "the reason is the reading that decided")
 
     def test_a_manager_stop_runs_the_fenced_stop_path_and_maps_its_outcome(self):
         lc = launcher.Launcher(self.cfg, cli.config_dir(), sleep=lambda s: None)

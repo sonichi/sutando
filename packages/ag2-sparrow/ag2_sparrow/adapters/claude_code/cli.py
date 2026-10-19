@@ -258,6 +258,10 @@ def verify(_args) -> int:
     if rec.get("stall"):
         print(f"INFO {'needs attention' if rec['stall'].get('reason', '').startswith('abnormal') else 'suspected hang'}: "
               f"{rec['stall'].get('reason')} (card {(rec.get('hitl') or {}).get('id') or 'not raised'})")
+    if rec.get("title_changed"):
+        seen = rec["title_changed"]
+        print(f"INFO {launcher.TITLE_CHANGED}: the pane title is {seen.get('seen')!r}, not the recorded token; every "
+              f"fenced stop is withheld until the session is recreated")
     if rec.get("fence_uncertain"):
         print(f"INFO the pane-key guard on {sock} is uncertain: creation is fenced until recovered")
     for line in projection_lines(cfg):

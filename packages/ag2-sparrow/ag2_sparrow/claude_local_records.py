@@ -122,7 +122,7 @@ def flocked(path: Path, blocking: bool = True):
 def empty_supervisor() -> dict:
     return {"schema": SUPERVISOR_SCHEMA, "generation": None, "consumer": None, "title_token": None,
             "launcher": None, "hitl": None, "stall": None, "deadline": None, "incident": None,
-            "effect": None, "observed_session_id": None, "updated_at": 0.0}
+            "effect": None, "observed_session_id": None, "title_changed": None, "updated_at": 0.0}
 
 
 def load_supervisor(root) -> dict:
