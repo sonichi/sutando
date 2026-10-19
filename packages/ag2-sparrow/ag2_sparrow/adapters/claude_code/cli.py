@@ -115,10 +115,12 @@ def install(args) -> int:
         print(f"error: {plugin} is not a Claude Code plugin (no .claude-plugin/plugin.json)", file=sys.stderr)
         return EXIT_UNUSABLE
     key_file = str(Path(args.hmac_key_file).expanduser().resolve()) if args.hmac_key_file else ""
-    if args.hmac_strict:
+    strict = args.hmac_strict or bool(key_file and not args.no_hmac_strict)
+    if strict:
         problem = key_problem(key_file)
         if problem:
-            print(f"error: --hmac-strict needs a usable key: {problem}", file=sys.stderr)
+            why = "--hmac-strict" if args.hmac_strict else "strict mode, the default with --hmac-key-file (--no-hmac-strict opts out),"
+            print(f"error: {why} needs a usable key: {problem}", file=sys.stderr)
             return EXIT_UNUSABLE
     root, problem = cm.canonical_root(args.work, args.inbox or _dirs.task_dir())
     if problem:
@@ -128,8 +130,9 @@ def install(args) -> int:
     values = {"CLAUDE": os.path.abspath(claude), "PLUGIN_DIR": str(plugin), "INBOX_DIR": str(inbox_dir),
               "RESULTS_DIR": str(Path(root) / "results"),
               "CLAUDE_CONFIG_DIR": str(Path(args.claude_config_dir).expanduser().resolve()) if args.claude_config_dir else "",
-              "HMAC_KEY_FILE": key_file, "HMAC_STRICT": "1" if args.hmac_strict else "",
-              "PERMISSION_MODE": args.permission_mode, "SESSION_ID": "", "HITL_STORE": str(hitl_store_root())}
+              "HMAC_KEY_FILE": key_file, "HMAC_STRICT": "1" if strict else "",
+              "PERMISSION_MODE": args.permission_mode, "SESSION_ID": "", "HITL_STORE": str(hitl_store_root()),
+              inbox.ALLOW_NON_OWNER: "1" if args.allow_non_owner else ""}
 
     def revise(old: dict, values: dict) -> dict:
         """The session id: kept from the old config; minted when there is none; rotated by
@@ -247,6 +250,10 @@ def verify(_args) -> int:
     problem = key_problem(key) if key or strict else ""
     cm.check(results, not problem, "hmac key",
              (f"strict mode: {problem}" if strict else problem) if problem else key or "none (every task reads unsigned)")
+    print("INFO hmac mode: " + ("strict (only verified envelopes are submitted)" if strict else
+                                "not strict (unsigned and unverifiable envelopes are submitted too)"))
+    print("INFO non-owner tasks: " + ("submitted with the non-owner note (--allow-non-owner)"
+                                      if cfg.get(inbox.ALLOW_NON_OWNER) == "1" else "refused (owner only)"))
     cm.check(results, cfg.get("HITL_STORE") == str(hitl_store_root()), "hitl store",
              cfg.get("HITL_STORE") or "none" if cfg.get("HITL_STORE") != str(hitl_store_root())
              else f"{cfg['HITL_STORE']} (the bridge's, beside its default store)")
@@ -341,7 +348,13 @@ def main(argv=None) -> int:
     p.add_argument("--claude-config-dir", help="CLAUDE_CONFIG_DIR holding the login the session uses (default: "
                    "the CLI's own)")
     p.add_argument("--hmac-key-file", help="the task-envelope key Sutando stamps with (AG2_HMAC_KEY_FILE)")
-    p.add_argument("--hmac-strict", action="store_true", help="submit verified envelopes only")
+    hm = p.add_mutually_exclusive_group()
+    hm.add_argument("--hmac-strict", action="store_true", help="submit verified envelopes only (the default with "
+                    "--hmac-key-file)")
+    hm.add_argument("--no-hmac-strict", action="store_true", help="with --hmac-key-file, also submit unsigned and "
+                    "unverifiable envelopes")
+    p.add_argument("--allow-non-owner", action="store_true", help="submit team and guest tasks (collaborator or not) "
+                   "with the non-owner note; off: they get the owner-only refusal and never reach the session")
     p.add_argument("--permission-mode", default="bypassPermissions",
                    help="the session's --permission-mode; bypassPermissions (default) suits an unattended "
                         "session, a narrower mode makes a prompting tool stall the queue")

@@ -489,6 +489,7 @@ class ConnectBase(unittest.TestCase):
         self.work = self.home / "work"
         self.inbox, self.results = self.work / "tasks", self.work / "results"
         self.plugin = self.home / "plugin"
+        (self.home / "task-hmac.key").write_text("ab" * 32)     # what install passes: strict by default needs it
         (self.plugin / ".claude-plugin").mkdir(parents=True)
         (self.plugin / ".claude-plugin" / "plugin.json").write_text('{"name": "ag2space-inbox"}')
         relay = self.home / ".config" / "ag2-sparrow" / "relay.env"
@@ -637,7 +638,8 @@ class ConnectInstall(ConnectBase):
         cfg = cli.read_config(cfg_path)
         self.assertEqual((cfg["CLAUDE"], cfg["PLUGIN_DIR"], cfg["INBOX_DIR"], cfg["RESULTS_DIR"], cfg["ROOT"]),
                          (str(self.claude), str(self.plugin), str(self.inbox), str(self.results), str(self.work)))
-        self.assertEqual((cfg["PERMISSION_MODE"], cfg["HMAC_STRICT"]), ("bypassPermissions", ""))
+        self.assertEqual((cfg["PERMISSION_MODE"], cfg["HMAC_STRICT"], cfg["ALLOW_NON_OWNER"]), ("bypassPermissions", "1", ""),
+                         "a key file alone is strict; non-owner tasks are off")
         self.assertTrue(cli.SESSION_ID_RE.match(cfg["SESSION_ID"]), "install mints the session id")
         self.assertEqual(cfg["HITL_STORE"], str(cli.hitl_store_root()), "the bridge's claude-local root is persisted")
         self.assertTrue(self.inbox.is_dir() and self.results.is_dir())
@@ -1279,6 +1281,7 @@ class ConnectStrict(ConnectBase):
         return self.install_with(self.runner(), False, "--hmac-strict", *extra)
 
     def test_strict_mode_needs_a_key_the_verifier_accepts(self):
+        (self.home / "task-hmac.key").unlink()
         rc, _, err = self.strict()
         self.assertEqual(rc, 2)
         self.assertIn("--hmac-strict needs a usable key", err)
@@ -1295,6 +1298,7 @@ class ConnectStrict(ConnectBase):
         self.assertEqual((rc, "no key file" in err), (2, True))
 
     def test_verify_fails_the_hmac_part_on_a_missing_or_malformed_key(self):
+        (self.home / "task-hmac.key").unlink()
         self.configure(HMAC_STRICT="1")
         rc, out, _ = self.main("verify")
         self.assertEqual(rc, 1)
@@ -1305,6 +1309,35 @@ class ConnectStrict(ConnectBase):
         self.assertIn("PASS hmac key", self.main("verify")[1])
         self.configure(HMAC_KEY_FILE="", HMAC_STRICT="")
         self.assertIn("PASS hmac key: none (every task reads unsigned)", self.main("verify")[1])
+
+    def test_a_key_file_alone_is_strict_and_no_hmac_strict_opts_out(self):
+        runner = self.runner()
+        self.assertEqual(self.install_with(runner)[0], 0)
+        self.assertEqual(cli.read_config(cli.config_path())["HMAC_STRICT"], "1", "a key file without --no-hmac-strict")
+        self.assertIn("INFO hmac mode: strict (only verified envelopes are submitted)", self.main("verify")[1])
+        self.assertEqual(self.install_with(runner, False, "--no-hmac-strict")[0], 0)
+        self.assertEqual(cli.read_config(cli.config_path())["HMAC_STRICT"], "")
+        self.assertIn("INFO hmac mode: not strict", self.main("verify")[1])
+        (self.home / "task-hmac.key").write_text("not-a-key")
+        rc, _, err = self.install_with(runner)
+        self.assertEqual((rc, "--no-hmac-strict opts out" in err), (2, True), err)
+        self.assertEqual(self.install_with(runner, False, "--no-hmac-strict")[0], 0, "the soak mode stays reachable")
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            self.install("--hmac-strict", "--no-hmac-strict")
+
+    def test_allow_non_owner_is_persisted_off_by_default_and_shown_by_verify(self):
+        runner = self.runner()
+        self.assertEqual(self.install_with(runner)[0], 0)
+        self.assertEqual(cli.read_config(cli.config_path())["ALLOW_NON_OWNER"], "")
+        self.assertIn("INFO non-owner tasks: refused (owner only)", self.main("verify")[1])
+        self.assertFalse(inbox.allow_non_owner())
+        self.assertEqual(self.install_with(runner, False, "--allow-non-owner")[0], 0)
+        self.assertEqual(cli.read_config(cli.config_path())["ALLOW_NON_OWNER"], "1")
+        self.assertIn("INFO non-owner tasks: submitted with the non-owner note (--allow-non-owner)", self.main("verify")[1])
+        self.assertTrue(inbox.allow_non_owner())
+        self.assertTrue(inbox.allow_non_owner({inbox.CONFIG_DIR_VAR: str(cli.config_dir())}), "the pane's config dir")
+        self.assertFalse(inbox.allow_non_owner({inbox.CONFIG_DIR_VAR: str(self.home / "none")}), "unreadable reads as off")
+        self.assertEqual(inbox.CONFIG_DIR_VAR, hold_mod.ENV_CONFIG_DIR)
 
 
 class ConnectOwnership(ConnectBase):
@@ -2079,9 +2112,34 @@ class InboxCli(ConnectBase):
             rc = cli.main(["inbox", "--root", self.root, *args])
         return rc, json.loads(out.getvalue())
 
-    def task(self, task_id="task-a"):
-        (self.inbox / (task_id + ".txt")).write_text("id: %s\ntask: hi\n" % task_id)
+    def task(self, task_id="task-a", tier="owner", extra=""):
+        lines = "" if tier is None else "access_tier: %s\n" % tier
+        (self.inbox / (task_id + ".txt")).write_text("id: %s\n%s%stask: hi\n" % (task_id, extra, lines))
         return task_id
+
+    def test_claim_admits_the_owner_and_answers_every_non_owner_and_a_tierless_task_with_the_refusal(self):
+        rc, out = self.verb("claim", self.task("task-o"))
+        self.assertEqual((rc, out["admission"], out["access_tier"], out["collaborator"]), (0, "owner", "owner", False))
+        refused = {"task-t": ("team", ""), "task-g": ("guest", ""), "task-c": ("team", "collaborator: true\n"),
+                   "task-n": (None, "")}
+        for t, (tier, extra) in refused.items():
+            rc, out = self.verb("claim", self.task(t, tier, extra))
+            self.assertEqual((rc, "not admitted" in out["refused"]), (1, True), (t, out))
+            self.assertEqual((self.results / (t + ".txt")).read_text(), task_io.NON_OWNER_REFUSED, t)
+            self.assertNotIn(t, records.load_plugin(self.root).get("inflight") or {}, "never claimed for the session")
+            rc, out = self.verb("claim", t)
+            self.assertEqual((rc, "only ABSENT may be submitted" in out["refused"]), (1, True), "answered once")
+        self.assertIn("malformed: no access_tier header", self.verb("claim", self.task("task-n2", None))[1]["refused"])
+
+    def test_with_allow_non_owner_every_non_owner_is_claimed_with_its_admission_and_a_tierless_task_still_refused(self):
+        self.configure(ALLOW_NON_OWNER="1")
+        for t, tier, extra, kind in (("task-t", "team", "", "non_owner"), ("task-g", "guest", "", "non_owner"),
+                                     ("task-c", "team", "collaborator: true\n", "collaborator")):
+            rc, out = self.verb("claim", self.task(t, tier, extra))
+            self.assertEqual((rc, out["admission"], out["access_tier"]), (0, kind, tier), t)
+        rc, out = self.verb("claim", self.task("task-n", None))
+        self.assertEqual((rc, "malformed" in out["refused"]), (1, True))
+        self.assertEqual(self.verb("claim", self.task("task-o"))[1]["admission"], "owner", "owner tasks unchanged")
 
     def test_claim_authorize_confirm_stage_publish_through_the_cli_with_the_record_mirrored(self):
         t = self.task()

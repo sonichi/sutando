@@ -14,15 +14,19 @@ import hashlib
 import json
 import os
 import sys
+from pathlib import Path
 
-from ... import task_io, task_lifecycle as lifecycle
+from ... import connect_common as cm, task_io, task_lifecycle as lifecycle
 from ... import claude_local_records as records
+from .shape import LOCAL
 
 EXIT_OK, EXIT_REFUSED, EXIT_USAGE, EXIT_PROGRESS = 0, 1, 2, 3
 INTERRUPTED_BODY = ("[AG2 Space] This attempt was interrupted before the session answered; send the request "
                     "again if it is still wanted.")
 PROTOCOL_FAILURE = "[AG2 Space] The session's turn ended without a reply (%s); send the request again if still wanted."
 ROOT_VAR = "AG2_SPARROW_ROOT"
+CONFIG_DIR_VAR = "AG2_SPARROW_CONFIG_DIR"
+ALLOW_NON_OWNER = "ALLOW_NON_OWNER"
 
 
 class Refused(Exception):
@@ -79,6 +83,34 @@ def recover_dead_generation(root) -> int:
     return len(dead)
 
 
+def allow_non_owner(environ=None) -> bool:
+    """The installed --allow-non-owner, read from the config the pane names; unreadable reads as off."""
+    config_dir = (os.environ if environ is None else environ).get(CONFIG_DIR_VAR)
+    path = Path(config_dir) / cm.config_path(LOCAL).name if config_dir else cm.config_path(LOCAL)
+    try:
+        return cm.read_config(path).get(ALLOW_NON_OWNER) == "1"
+    except (OSError, ValueError):
+        return False
+
+
+def admit(root, task_id, allow: bool) -> "tuple[str | None, dict, str]":
+    """(admission, headers, why refused) for tasks/<task_id>.txt through the shared task_io.admission. A
+    file with no access_tier header is malformed (Sparrow's bridge always writes one); a collaborator is
+    served only under --allow-non-owner, like every other non-owner."""
+    path = os.path.join(root, "tasks", task_id + ".txt")
+    with open(path, encoding="utf-8", errors="replace") as f:
+        raw = task_io.attested_headers(f.read()).headers
+    if "access_tier" not in raw:
+        return None, {}, "malformed: no access_tier header"
+    headers, _, _ = task_io.parse_task(path)
+    kind = task_io.admission(headers, allow)
+    if kind == "collaborator" and not allow:
+        kind = None
+    why = "" if kind else "sender tier %s (collaborator %s) and --allow-non-owner is off" % (
+        headers["access_tier"], headers["collaborator"])
+    return kind, headers, why
+
+
 def _mirror(root, task_id, phase, out: dict, extra=None) -> dict:
     """The plugin record mirrors each claim's phase after the lifecycle step; a failed write marks the
     answer `hard` (exit 3: the step stands, intake closes) instead of hiding it."""
@@ -104,11 +136,17 @@ def claim(root, task_id) -> dict:
         verdict, state = lc.decide(task_id)
         if verdict != "call":
             raise Refused("%s is %s; only ABSENT may be submitted" % (task_id, state))
+        kind, headers, why = admit(root, task_id, allow_non_owner())
+        if kind is None:
+            outcome = lc.complete_without_call(task_id, task_io.NON_OWNER_REFUSED, why)
+            raise Refused("%s not admitted (%s); the owner-only refusal is %s" % (task_id, why, outcome))
         try:
             attempt = lc.prepare(task_id, INTERRUPTED_BODY, mode=lifecycle.LOCAL, generation=generation)
         except lifecycle.AttemptInProgress as e:
             raise Refused(str(e))
-    return _mirror(root, task_id, lifecycle.PREPARED, {"task_id": task_id, "attempt": attempt, "generation": generation},
+    return _mirror(root, task_id, lifecycle.PREPARED,
+                   {"task_id": task_id, "attempt": attempt, "generation": generation, "admission": kind,
+                    "access_tier": headers["access_tier"], "collaborator": headers["collaborator"] == "true"},
                    {"attempt": attempt})
 
 
