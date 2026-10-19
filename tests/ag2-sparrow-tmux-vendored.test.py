@@ -21,6 +21,9 @@ PKG = REPO / "packages" / "ag2-sparrow"
 sys.path.insert(0, str(PKG))
 from ag2_sparrow import tmux_pane_keys as vk  # noqa: E402  (the vendored copy is what runs here)
 from ag2_sparrow import tmux_probe as vp  # noqa: E402
+sys.path.insert(0, str(REPO / "src"))
+import tmux_pane_keys as src_keys  # noqa: E402
+sys.path.remove(str(REPO / "src"))
 
 VENDORED = ("tmux_probe.py", "tmux_pane_keys.py", "tmux-pane-keys.sh", "bounded-wait.sh")
 NONCE = "0123456789abcdef0123456789abcdef"
@@ -63,13 +66,20 @@ class Packaging(unittest.TestCase):
 
 
 class Builder(unittest.TestCase):
+    """The pure builders, on the vendored copy here and on the canonical src one below."""
+    k = vk
+
+    def test_argv_and_fence_argv_take_this_interpreter(self):
+        self.assertEqual(self.k.argv("/s", "=c:0", "Enter")[5], sys.executable)
+        self.assertEqual(self.k.fence_argv("/s", "%3", "#{==:1,1}", "x", tmux="/t")[3:6], ["/t", "--python", sys.executable])
+
     def test_predicate_is_pane_local_with_the_nonce_glob_and_no_pane_id_term(self):
-        got = vk.predicate(NONCE, 4242, "$7", 1792361131)
+        got = self.k.predicate(NONCE, 4242, "$7", 1792361131)
         self.assertEqual(got, "#{&&:#{==:#{pane_pid},4242},#{&&:#{==:#{session_id},$7},"
                               "#{&&:#{==:#{session_created},1792361131},"
                               "#{m:*--generation=%s --*,#{pane_start_command}}}}}" % NONCE)
         self.assertNotIn("pane_id", got, "-t selects the pane; no pane_id term")
-        with_title = vk.predicate(NONCE, 4242, "$7", 1792361131, title_token="tok_1")
+        with_title = self.k.predicate(NONCE, 4242, "$7", 1792361131, title_token="tok_1")
         self.assertTrue(with_title.endswith("#{&&:#{m:*--generation=%s --*,#{pane_start_command}},"
                                             "#{==:#{pane_title},tok_1}}}}}" % NONCE))
         for bad in (dict(nonce="zz"), dict(nonce=NONCE + "0"), dict(session_id="7"), dict(title_token="a b"),
@@ -77,15 +87,19 @@ class Builder(unittest.TestCase):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 kw = dict(nonce=NONCE, pane_pid=1, session_id="$1", session_created=1)
                 kw.update(bad)
-                vk.predicate(**kw)
+                self.k.predicate(**kw)
 
     def test_fenced_is_the_if_shell_with_the_orphaning_false_branch(self):
-        got = vk.fenced("%3", "#{==:1,1}", "send-keys -t '%3' '/exit' Enter")
+        got = self.k.fenced("%3", "#{==:1,1}", "send-keys -t '%3' '/exit' Enter")
         self.assertEqual(got, "if-shell -F -t '%3' '#{==:1,1}' 'send-keys -t '\"'\"'%3'\"'\"' '\"'\"'/exit'\"'\"' Enter' "
                               "'run-shell '\"'\"'$ORPHAN'\"'\"''")
         orphan = "mv '/w/ticket.claimed' '/w/ticket.orphaned'"
-        self.assertIn(vk.tmux_quote("run-shell " + vk.tmux_quote(orphan)),
-                      vk.fenced("%3", "1", "kill-session -t '$1'", orphan=orphan))
+        self.assertIn(self.k.tmux_quote("run-shell " + self.k.tmux_quote(orphan)),
+                      self.k.fenced("%3", "1", "kill-session -t '$1'", orphan=orphan))
+
+
+class BuilderSrc(Builder):
+    k = src_keys
 
 
 @unittest.skipUnless(shutil.which("tmux"), "tmux not installed")

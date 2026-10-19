@@ -2195,6 +2195,112 @@ class LocalClaimTest(Base):
     def claim_bytes(self, tid="task-a"):
         return (self.work / "state" / "claims" / tid / "claim.json").read_bytes()
 
+    # each recovery and fence branch, on both copies
+
+    def test_generation_recovery_settles_or_keeps_each_phase_exactly_once(self):
+        self.local_dir()
+        life = self.life()
+        for tid in ("task-gone", "task-done", "task-wait", "task-call", "task-lost", "task-new", "task-old"):
+            self.claimed(life, tid)
+        (self.work / "tasks" / "task-gone.txt").unlink()
+        self.results.mkdir(exist_ok=True)
+        (self.results / "task-done.txt").write_text("already\n")
+        for tid, phase in (("task-call", "CALLING"), ("task-lost", "OUTCOME_UNKNOWN"), ("task-new", "SOMETHING_NEW")):
+            life.claims.save(dict(life.claims.load(tid), phase=phase))
+        lost = {"identity": "i", "length": 1, "sha256": "0" * 64, "blob": "blob.1.absent"}
+        life.claims.save(dict(life.claims.load("task-lost"), staged=lost))
+        old = self.clock.t - self.lc.COMPACT_AFTER - 1
+        life.claims.save(dict(life.claims.load("task-old"), phase="SETTLED", settled_at=old))
+        self.logs = []
+        again = self.life(lineage=lambda pid, start: False)
+        again.recover(generation=GEN, proof=False)
+        phase = {t: (again.claims.load(t) or {}).get("phase") for t in
+                 ("task-gone", "task-done", "task-wait", "task-call", "task-lost", "task-new", "task-old")}
+        self.assertEqual(phase, {"task-gone": "SETTLED", "task-done": "SETTLED", "task-wait": "PREPARED",
+                                 "task-call": "SETTLED", "task-lost": "RESULT_STAGED", "task-new": "SOMETHING_NEW",
+                                 "task-old": None})
+        self.assertEqual((self.results / "task-call.txt").read_bytes(), b"interrupted\n", "counted, never resent")
+        self.assertFalse((self.results / "task-lost.txt").exists(), "no verified staged body: parked")
+        self.assertIn("task-old", again.settled, "re-recorded before it was compacted")
+        self.assertIn("a phase this reader does not know, left alone -> task-new SOMETHING_NEW", self.logs)
+        self.assertIn("no verified staged body; parked -> task-lost", self.logs)
+
+    def test_the_cloud_recovery_leaves_an_unknown_phase_alone(self):
+        life = self.life()
+        self.task()
+        life.prepare("task-a", "i\n")
+        life.claims.save(dict(life.claims.load("task-a"), phase="SOMETHING_NEW"))
+        self.logs = []
+        self.life(lineage=lambda pid, start: False).recover()
+        self.assertEqual(life.claims.load("task-a")["phase"], "SOMETHING_NEW")
+        self.assertIn("a phase this reader does not know, left alone -> task-a SOMETHING_NEW", self.logs)
+
+    def test_the_sweep_survives_an_unlistable_dir_a_vanished_temp_and_a_failed_unlink(self):
+        self.local_dir()
+        life = self.life()
+        self.confirmed(life)
+        d = self.work / "state" / "claims" / "task-a"
+        temp = d / (".task-a.1.%s.%d.deadbeef.tmp" % ("a" * 24, 2 ** 22 - 1))
+        temp.write_bytes(b"x")
+        real_listdir, real_unlink = os.listdir, os.unlink
+        self.logs = []
+        dead = self.life(lineage=lambda pid, start: False)
+        with mock.patch.object(self.lc.os, "listdir", lambda p=".": (_ for _ in ()).throw(OSError(errno.EIO, "io"))
+                               if str(p) == str(d) else real_listdir(p)):
+            dead._sweep_temps("task-a", self.clock.t)
+        with mock.patch.object(self.lc, "_lstat", return_value=None):
+            dead._sweep_temps("task-a", self.clock.t)
+        self.assertTrue(temp.exists(), "unlisted or vanished: nothing removed")
+
+        def unlink(p, **k):
+            if str(p) == str(temp):
+                raise OSError(errno.EBUSY, "busy")
+            return real_unlink(p, **k)
+        with mock.patch.object(self.lc.os, "unlink", unlink):
+            dead._sweep_temps("task-a", self.clock.t)
+        self.assertTrue(temp.exists())
+        self.assertTrue(any(x.startswith("a leftover temp could not be swept -> task-a") for x in self.logs), self.logs)
+
+    def test_an_unknown_format_marker_is_refused_at_startup_and_by_the_fence(self):
+        self.assertIsNone(self.lc.prepare_work_dir(str(self.work)))
+        (self.work / "state" / "format").write_text("ag2-sparrow-work-v99\n")
+        self.assertIn("says 'ag2-sparrow-work-v99'", self.lc.prepare_work_dir(str(self.work)))
+        with self.assertRaises(self.lc.StateError):
+            self.lc.enable_local_format(str(self.work))
+        (self.work / "state" / "format").unlink()
+        self.assertIsNone(self.life()._format(), "an absent marker reads as no format")
+
+    def test_the_fence_reports_a_marker_it_cannot_write(self):
+        self.assertIsNone(self.lc.prepare_work_dir(str(self.work)))
+        with mock.patch.object(self.lc, "write_durable", side_effect=OSError(errno.EROFS, "read-only")):
+            with self.assertRaises(self.lc.StateError) as e:
+                self.lc.enable_local_format(str(self.work))
+        self.assertIn("read-only", str(e.exception))
+
+    def test_a_blob_that_is_not_a_file_is_a_state_error_never_absent(self):
+        self.local_dir()
+        life = self.life()
+        self.confirmed(life)
+        (self.work / "state" / "claims" / "task-a" / "blob.x").mkdir()
+        self.assertIsNone(life.claims.blob("task-a", "blob.none"))
+        with self.assertRaises(self.lc.StateError):
+            life.claims.blob("task-a", "blob.x")
+
+    def test_staging_parks_a_claim_past_its_turn_and_a_result_that_reads_back_wrong(self):
+        self.local_dir()
+        life = self.life()
+        self.confirmed(life)
+        rec = life.claims.load("task-a")
+        life.claims.save(dict(rec, phase="OUTCOME_UNKNOWN"))
+        self.logs = []
+        self.assertEqual(life.stage_result("task-a", b"ok\n", "turn-1"), "parked")
+        self.assertIn("stage refused: claim is OUTCOME_UNKNOWN -> task-a", self.logs)
+        life.claims.save(rec)
+        with mock.patch.object(life, "_verified", return_value=None):
+            self.assertEqual(life.stage_result("task-a", b"ok\n", "turn-1"), "parked")
+        self.assertIn("the result read back does not verify; parked -> task-a", self.logs)
+        self.assertEqual(life.claims.load("task-a")["phase"], "TURN_CONFIRMED")
+
     # claim modes and the PREPARED refusal
 
     def test_claims_carry_their_mode_and_a_legacy_claim_re_prepares_as_today(self):

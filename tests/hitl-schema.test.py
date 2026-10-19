@@ -352,5 +352,19 @@ class DefaultRunnerTest(unittest.TestCase):
         self.assertIn("hitl-runner-probe", out)
 
 
+class DefaultPathsTest(unittest.TestCase):
+    def test_no_workspace_resolves_through_the_repo_resolver_imported_at_the_call(self):
+        """The resolver is imported only when no workspace is given, so a vendored copy never needs it."""
+        import types
+        from hitl import manager, replies
+        ws = Path(tempfile.mkdtemp(prefix="hitl-ws-"))
+        fake = types.ModuleType("workspace_default")
+        fake.resolve_workspace = lambda: ws
+        with mock.patch.dict(sys.modules, {"workspace_default": fake}):
+            self.assertEqual(manager.default_store(), ws / "state" / "hitl" / "requirements")
+            self.assertEqual(replies.actions_dir(), ws / "state" / "hitl" / "actions")
+        self.assertEqual(manager.default_store(ws / "x"), ws / "x" / "state" / "hitl" / "requirements")
+
+
 if __name__ == "__main__":
     unittest.main()

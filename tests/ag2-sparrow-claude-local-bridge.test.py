@@ -288,6 +288,36 @@ class Clicks(Base):
         self.assertEqual(claimant.offer(event), ["$e1"])
         self.assertEqual(claimant.last_outcome, "applied")
 
+    def test_a_malformed_or_raising_click_is_a_rejection_never_a_stalled_loop(self):
+        from ag2_sparrow import claude_local_accepter as accepter
+        before = tree(self.store_root)
+        bad = self.click()
+        bad["hitl_action"] = dict(bad["hitl_action"], expected_revision="not-a-number")
+        self.assertTrue(str(rgb._handle_hitl_action(bad)).startswith("rejected:"))
+        with mock.patch.object(accepter, "accept", side_effect=RuntimeError("store exploded")):
+            self.assertEqual(rgb._handle_hitl_action(self.click()), "rejected:store exploded")
+        claimant = rgb._ClaudeLocalClicks(OWNER, log=lambda *a: None)
+        event = {"type": "message.created", "event_id": "$e3", "room_id": DM, "actor_id": OWNER,
+                 "content": {"space.ag2.hitl.action": bad["hitl_action"]}}
+        self.assertEqual(claimant.offer(event), ["$e3"])
+        self.assertTrue(claimant.last_outcome.startswith("rejected:"), claimant.last_outcome)
+        good = dict(event, content={"space.ag2.hitl.action": self.click()["hitl_action"]})
+        with mock.patch.object(accepter, "accept", side_effect=RuntimeError("store exploded")):
+            claimant.offer(good)
+        self.assertEqual(claimant.last_outcome, "rejected:store exploded")
+        with mock.patch.object(rgb, "_claude_local_accepter", return_value=(None, "unavailable")):
+            claimant.offer(good)
+        self.assertEqual(claimant.last_outcome, "rejected:unavailable")
+        self.assertEqual(tree(self.store_root), before, "nothing written")
+        self.assertEqual(rgb._hitl_control_body("cancelled:the session made progress"),
+                         "Cancelled: the session made progress")
+
+    def test_a_bare_exit_with_no_claude_local_store_stays_a_message(self):
+        t = self.click(task="/exit")
+        t.pop("hitl_action")
+        shutil.rmtree(self.store_root)
+        self.assertIs(rgb._handle_hitl_action(t), False)
+
     def test_a_click_with_no_attested_tier_is_the_owners_only_by_exact_identity(self):
         req = self.store().load(self.req.id)
         event = {"type": "message.created", "event_id": "$e2", "room_id": DM,

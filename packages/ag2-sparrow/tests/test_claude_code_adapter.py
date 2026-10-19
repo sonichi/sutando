@@ -31,6 +31,7 @@ from unittest import mock
 
 sys.path.append(str(Path(__file__).resolve().parents[3] / "tests"))
 from _helpers.hermetic_env import hermetic_env, isolate_os_environ  # noqa: E402
+from _helpers.subprocess_coverage import covered_code  # noqa: E402
 
 # Before anything below reads the environment: no outer credential selector survives.
 isolate_os_environ()
@@ -330,41 +331,11 @@ START_VERBS = ("restart", "bootstrap", "kickstart")
 STOP_VERBS = ("stop", "bootout")
 
 
-class StubChild:
-    """A Popen stand-in for in-process pins: a live `sleep` child gives it a real pid (a Linux pidfd
-    needs one), `wait` ends it at once, and the spawn-time kwargs are kept for inspection."""
-
-    def __init__(self, argv, **kw):
-        self.args, self.kw, self.stdin = argv, kw, io.StringIO()
-        self.proc = subprocess.Popen(["sleep", "30"])
-        self.pid, self.returncode = self.proc.pid, None
-        self.on_spawn()
-
-    def on_spawn(self):
-        pass
-
-    def on_wait(self):
-        pass
-
-    def poll(self):
-        return self.returncode
-
-    def wait(self, timeout=None):
-        self.on_wait()
-        self.proc.kill()
-        self.proc.wait(timeout=30)
-        self.returncode = 0
-        return 0
-
-    def send_signal(self, sig):
-        self.proc.send_signal(sig)
-
-
 def hold(root, name="first-launcher", script=STAND_IN, install=""):
     """A lock holder in another process (holder_lock allows one acquisition per process)."""
-    p = subprocess.Popen([sys.executable, "-c", script % ((str(PKG), install, str(root), name) if script is STAND_IN
-                                                             else (str(PKG), str(root)) if script is UNPUBLISHED
-                                                             else (str(PKG),))],
+    p = subprocess.Popen([sys.executable, "-c", covered_code(script % ((str(PKG), install, str(root), name) if script is STAND_IN
+                                                                          else (str(PKG), str(root)) if script is UNPUBLISHED
+                                                                          else (str(PKG),)))],
                          stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
     assert p.stdout.readline().strip() == "held"
     return p
@@ -563,13 +534,6 @@ class ConnectBase(unittest.TestCase):
             rc = cli.main(list(argv))
         return rc, out.getvalue(), err.getvalue()
 
-    def run_cli(self, popen=subprocess.Popen):
-        """cli.run in-process with a popen of the test's choosing, stdout and stderr captured."""
-        out, err = io.StringIO(), io.StringIO()
-        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-            rc = cli.run(type("A", (), {})(), popen=popen)
-        return rc, out.getvalue(), err.getvalue()
-
     def install(self, *extra):
         return self.main("install", "--plugin-dir", str(self.plugin), "--inbox", str(self.inbox),
                          "--claude-config-dir", str(self.home / ".claude-sutando"),
@@ -609,7 +573,8 @@ class ConnectBase(unittest.TestCase):
         """`hold` in a child process (a real root lock, a real fchdir), stdin /dev/null."""
         if linger is not None:
             (self.home / "claude-linger").write_text(str(linger))
-        return subprocess.Popen([sys.executable, "-c", HOLD_DRIVER % (str(PKG), patch, NONCE)], env=self.hold_env(root, **extra),
+        return subprocess.Popen([sys.executable, "-c", covered_code(HOLD_DRIVER % (str(PKG), patch, NONCE))],
+                                env=self.hold_env(root, **extra),
                                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
     def hold_cmd(self, root=None, patch="", linger=0, **extra):
@@ -1824,7 +1789,7 @@ class ConnectSourceRules(unittest.TestCase):
 
 def hold_consumer(root):
     """A root held with a live sleep consumer in another process: (proc, consumer pid)."""
-    p = subprocess.Popen([sys.executable, "-c", CONSUMER_HOLDER % (str(PKG), str(root))], stdin=subprocess.PIPE,
+    p = subprocess.Popen([sys.executable, "-c", covered_code(CONSUMER_HOLDER % (str(PKG), str(root)))], stdin=subprocess.PIPE,
                          stdout=subprocess.PIPE, text=True)
     line = p.stdout.readline().split()
     assert line[:1] == ["held"], line
@@ -1897,12 +1862,12 @@ class HoldProcess(ConnectBase):
 
     def test_hold_refuses_a_bad_nonce_a_missing_environment_and_a_held_root(self):
         self.configure()
-        r = subprocess.run([sys.executable, "-c", HOLD_DRIVER % (str(PKG), "", "zz")], env=self.hold_env(),
+        r = subprocess.run([sys.executable, "-c", covered_code(HOLD_DRIVER % (str(PKG), "", "zz"))], env=self.hold_env(),
                            stdin=subprocess.DEVNULL, capture_output=True, text=True)
         self.assertEqual((r.returncode, "32 hex" in r.stderr), (2, True), r.stderr)
         env = self.hold_env()
         env.pop(hold_mod.ENV_ROOT)
-        r = subprocess.run([sys.executable, "-c", HOLD_DRIVER % (str(PKG), "", NONCE)], env=env, stdin=subprocess.DEVNULL,
+        r = subprocess.run([sys.executable, "-c", covered_code(HOLD_DRIVER % (str(PKG), "", NONCE))], env=env, stdin=subprocess.DEVNULL,
                            capture_output=True, text=True)
         self.assertEqual((r.returncode, "must be set in the pane's environment" in r.stderr), (2, True), r.stderr)
         holder = hold(str(self.work), "claude-local")
@@ -2007,8 +1972,8 @@ class HoldProcess(ConnectBase):
         (self.home / "claude-linger").write_text("60")
         log = self.home / "hold.err"
         with open(log, "w") as stream:      # a file: the surviving claude would keep a pipe open
-            rc = subprocess.run([sys.executable, "-c", HOLD_DRIVER % (str(PKG), "hold._supervise = lambda child, state: 9\n",
-                                                                       NONCE)],
+            rc = subprocess.run([sys.executable, "-c", covered_code(HOLD_DRIVER % (str(PKG), "hold._supervise = lambda child, state: 9\n",
+                                                                                    NONCE))],
                                 env=self.hold_env(), stdin=subprocess.DEVNULL, stdout=stream, stderr=stream,
                                 timeout=60).returncode
         err = log.read_text()
@@ -2031,7 +1996,7 @@ class HoldProcess(ConnectBase):
         self.configure()
         (self.home / "claude-ignore-hup").write_text("1")
         (self.home / "claude-ignore-term").write_text("1")
-        loop = subprocess.Popen([sys.executable, "-c", (
+        loop = subprocess.Popen([sys.executable, "-c", covered_code((
             "import sys, time, json; sys.path.insert(0, %r); from ag2_sparrow import task_io\n"
             "root = %r; acquired = 0; frees = 0; seen = set(); print('looping', flush=True)\n"
             "while True:\n"
@@ -2042,7 +2007,7 @@ class HoldProcess(ConnectBase):
             "    try:\n        o = task_io.acquire_lock(root, 'sibling'); acquired += 1; task_io.release_lock(o)\n"
             "    except task_io.LockRefused: pass\n"
             "    print(json.dumps({'acquired': acquired, 'frees': frees, 'seen': sorted(seen)}), flush=True)\n"
-        ) % (str(PKG), str(self.work))], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        ) % (str(PKG), str(self.work)))], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
         self.assertEqual(loop.stdout.readline().strip(), "looping")
 
         def probe():
@@ -2156,8 +2121,8 @@ class InboxCli(ConnectBase):
         self.assertEqual(rc, 0)
         claim_path = self.work / "state" / "claims" / t / "claim.json"
         before = claim_path.read_bytes()
-        r = subprocess.run([sys.executable, "-c", "import sys; sys.path.insert(0, %r); from ag2_sparrow.adapters.claude_code import cli\n"
-                            "sys.exit(cli.main(['inbox', '--root', %r, 'claim', %r]))" % (str(PKG), self.root, t)],
+        r = subprocess.run([sys.executable, "-c", covered_code("import sys; sys.path.insert(0, %r); from ag2_sparrow.adapters.claude_code import cli\n"
+                            "sys.exit(cli.main(['inbox', '--root', %r, 'claim', %r]))" % (str(PKG), self.root, t))],
                            capture_output=True, text=True)
         self.assertEqual((r.returncode, json.loads(r.stdout)["attempt"]), (0, 1), "CLI B under the same generation gets the attempt back")
         self.assertEqual(claim_path.read_bytes(), before, "bytes unchanged")
@@ -2314,7 +2279,7 @@ class Detector(unittest.TestCase):
 
 CANARY = ("AG2_TEST_CANARY", "canary-must-not-reach-the-server")
 CONSOLE_SH = """#!/bin/sh
-exec "%(py)s" -c 'import sys; sys.path.insert(0, "%(pkg)s"); from ag2_sparrow.adapters.claude_code.cli import main; sys.exit(main(sys.argv[1:]))' "$@"
+exec "%(py)s" -c '%(cov)simport sys; sys.path.insert(0, "%(pkg)s"); from ag2_sparrow.adapters.claude_code.cli import main; sys.exit(main(sys.argv[1:]))' "$@"
 """
 STUB_SH = "#!/bin/sh\nexec cat\n"
 TMUX_DIR = os.path.dirname(shutil.which("tmux") or "/usr/bin/tmux")
@@ -2328,7 +2293,7 @@ class LauncherTmux(ConnectBase):
     def setUp(self):
         super().setUp()
         script = self.bin / cli.COMMAND
-        script.write_text(CONSOLE_SH % {"py": sys.executable, "pkg": PKG})
+        script.write_text(CONSOLE_SH % {"py": sys.executable, "pkg": PKG, "cov": covered_code("")})
         script.chmod(0o755)
         os.environ[CANARY[0]] = CANARY[1]
         os.environ["PATH"] = "%s:%s:/usr/bin:/bin" % (self.bin, TMUX_DIR)
@@ -2777,11 +2742,11 @@ class CardAccepter(CardBase):
         with self.assertRaises(accepter.Refused):
             accepter.same_store(mgr, other)
         accepter.same_store(mgr, store)
-        r = subprocess.run([sys.executable, "-O", "-c", "import sys; sys.path.insert(0, %r)\n"
+        r = subprocess.run([sys.executable, "-O", "-c", covered_code("import sys; sys.path.insert(0, %r)\n"
                             "from ag2_sparrow import claude_local_accepter as a, claude_local_card as c\n"
                             "s, m = c.manager(%r); o, _ = c.manager(%r)\n"
                             "try:\n    a.same_store(m, o)\nexcept a.Refused:\n    print('refused')\n"
-                            % (str(PKG), str(self.store_root), str(self.store_root))], capture_output=True, text=True)
+                            % (str(PKG), str(self.store_root), str(self.store_root)))], capture_output=True, text=True)
         self.assertEqual(r.stdout.strip(), "refused", r.stderr)
 
     def test_the_resolved_coordinates_are_the_gate_opened_and_the_record_read_under_the_lock_order(self):
@@ -2992,6 +2957,92 @@ class CardAccepter(CardBase):
         self.assertEqual(accepter.exit_text_reply(store, ROOM, OWNER_MXID), 2, "more than one open: refused, never a guess")
 
 
+class CardRefusals(CardBase):
+    """Every acceptance the reloaded card cannot back is refused with nothing written."""
+
+    def test_moved_coordinates_another_install_a_decided_card_and_a_second_keep_are_refused(self):
+        req = self.raise_card()
+        before = tree_bytes(self.store_root)
+        real = accepter.coordinates
+        calls = []
+
+        def moved(root, sub):
+            calls.append(1)
+            if len(calls) > 1:
+                raise ValueError("lock coordinates changed under the locks")
+            return real(root, sub)
+        with mock.patch.object(accepter, "coordinates", moved):
+            self.assertEqual(self.accept(self.reply(req)), "rejected:%s: lock coordinates changed under the locks" % req.id)
+        records.save_supervisor(self.root, dict(records.load_supervisor(self.root), install_id="another"))
+        self.assertTrue(self.accept(self.reply(req)).endswith("the card names another install"))
+        records.save_supervisor(self.root, dict(records.load_supervisor(self.root), install_id=self.lc.opaque))
+        self.assertEqual(tree_bytes(self.store_root), before, "nothing written")
+        store, mgr = card.manager(self.store_root)
+        keep = self.load(req.id)
+        keep.subject = {card.SUBJECT: dict(card.local(keep), saga_key={"predecessor_id": req.id})}
+        store.save(keep, store.projection(req.id))
+        self.assertEqual(self.accept(self.reply(self.load(req.id), card.ACTION_KEEP)), "rejected:%s already rearmed" % req.id)
+        self.assertFalse(accepter.reconcile_unconfirmed(store, mgr, self.load(req.id)), "pending: nothing to reconcile")
+        self.assertIsNone(card.reconcile_rearm(store, mgr, self.load(req.id)), "not rearming")
+        mgr.cancel(req.id)
+        self.assertEqual(self.accept(self.reply(self.load(req.id))), "rejected:%s already cancelled" % req.id)
+
+    def test_a_saga_key_that_does_not_derive_its_successor_is_refused(self):
+        req = self.raise_card()
+        store, mgr = card.manager(self.store_root)
+        bad = self.load(req.id)
+        saga = {"predecessor_id": "hitl_cl_someone-else"}
+        bad.subject = {card.SUBJECT: dict(card.local(bad), effect_phase=card.PHASE_REARMING, saga_key=saga,
+                                          successor_id=card.successor_id(saga))}
+        with self.assertRaises(ValueError):
+            card.reconcile_rearm(store, mgr, bad)
+
+    def test_the_local_stop_refuses_to_guess_between_two_open_cards(self):
+        self.raise_card()
+        second = card.build(card.KIND_UNKNOWN, incident="i2", install_id=self.lc.opaque, room=ROOM, stall=STALL, tail=[],
+                            attach_cmd="", failed_check="x")
+        card.manager(self.store_root)[1].create(second)
+        out = accepter.local_stop(self.state_dir, self.lc.opaque, log=lambda *a: None)
+        self.assertTrue(out.startswith("rejected:2 stall cards are open"), out)
+
+
+class RecordsAndTaskIo(unittest.TestCase):
+    """The record reader and the task_io delegations read every failure as a refusal or nobody."""
+
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp(prefix="cl-records-"))
+        self.addCleanup(shutil.rmtree, self.dir, True)
+
+    def test_a_record_that_is_unreadable_not_json_or_not_an_object_is_a_record_error(self):
+        (self.dir / "list.json").write_text("[1]")
+        (self.dir / "bad.json").write_text("{")
+        (self.dir / "dir.json").mkdir()
+        for name, why in (("list.json", "not a JSON object"), ("bad.json", "not a JSON record"), ("dir.json", "")):
+            with self.assertRaises(records.RecordError) as e:
+                records.read_json(self.dir / name)
+            self.assertIn(why, str(e.exception))
+        self.assertEqual(records.read_json(self.dir / "absent.json"), {})
+
+    def test_the_progress_gate_probe_reads_held_free_and_unopenable(self):
+        root = self.dir / "root"
+        self.assertFalse(records.progress_gate_held(root), "no state dir: nobody holds it")
+        records.progress_lock_path(root).parent.mkdir(parents=True)
+        self.assertFalse(records.progress_gate_held(root))
+        with records.flocked(records.progress_lock_path(root)):
+            self.assertTrue(records.progress_gate_held(root))
+
+    def test_task_io_reads_an_unreadable_lock_state_as_nobody_or_unobserved(self):
+        boom = mock.patch.object(holder_lock, "status", side_effect=OSError(errno.EIO, "io"))
+        with boom:
+            self.assertIsNone(task_io.lock_holder_pid(str(self.dir)))
+            self.assertIsNone(task_io.holder_consumer(str(self.dir)))
+        with mock.patch.object(holder_lock, "occupancy", side_effect=holder_lock.LockError("x")):
+            self.assertEqual(task_io.occupancy(str(self.dir)), "unobserved")
+        with mock.patch.object(holder_lock, "tombstone_consumer", return_value="published") as t:
+            self.assertEqual(task_io.tombstone_consumer(str(self.dir), b"x", "launcher", "gone"), "published")
+        t.assert_called_once_with(str(self.dir), b"x", by="launcher", reason="gone")
+
+
 class FakeTmux:
     """A Tmux stand-in for the classifier: what has-session answers and the pane's fields."""
 
@@ -3062,8 +3113,8 @@ class LocalCommands(ConnectBase):
             self.main("attach")
         self.assertEqual(seen[0][1:], ["-u", "-S", str(launcher.socket_path(cli.config_dir())), "attach", "-t", "=claude-local"])
         self.assertNotIn("sutando-tmux", seen[0][3])
-        help_text = subprocess.run([sys.executable, "-c", "import sys; sys.path.insert(0, %r); from ag2_sparrow.adapters."
-                                    "claude_code.cli import main; main(['attach', '--help'])" % str(PKG)],
+        help_text = subprocess.run([sys.executable, "-c", covered_code("import sys; sys.path.insert(0, %r); from ag2_sparrow.adapters."
+                                    "claude_code.cli import main; main(['attach', '--help'])" % str(PKG))],
                                    capture_output=True, text=True).stdout
         for phrase in ("same session", "/clear", "/compact", "never kill the server"):
             self.assertIn(phrase, " ".join(help_text.split()))
@@ -3234,6 +3285,359 @@ class LauncherUnit(ConnectBase):
             lc.state["sig"] = signal.SIGTERM
             with mock.patch.object(lc, "stop_session", return_value=outcome), mock.patch.object(lc, "apply_effects", lambda r: r):
                 self.assertEqual(lc._serve(), rc, outcome)
+
+
+GEN = {"pane_id": "%0", "pane_pid": 1, "session_id": "$0", "session_created": 1, "server_pid": 1, "server_start": "s",
+       "start_command": "c", "nonce": NONCE}
+
+
+def ran(rc=0, out="", err=""):
+    return type("R", (), {"returncode": rc, "stdout": out, "stderr": err})()
+
+
+def raises(*_, **__):
+    raise OSError(errno.ENOENT, "gone")
+
+
+class StubTm:
+    """The Tmux surface create_session and the stop path touch: the commands it ran, fixed fields."""
+
+    def __init__(self, fields=None, present=True):
+        self.tmux, self.sock, self.fields, self.present, self.calls = "tmux", "/tmp/stub.sock", fields, present, []
+
+    def run(self, *args, **_):
+        self.calls.append(args)
+
+    def pane_fields(self, pane_id):
+        return self.fields
+
+    def has_session(self, name=None):
+        return self.present
+
+    def capture(self, pane_id):
+        return None
+
+
+class LauncherBranches(ConnectBase):
+    """Every refusal of the tmux probes, the creation, the classifier, the card effects and the loop
+    is one outcome, never a traceback and never read as success."""
+
+    def setUp(self):
+        super().setUp()
+        self.configure()
+        self.cfg = cli.load_config()[0]
+        self.lines = []
+
+    def launcher(self, **kw):
+        kw.setdefault("sleep", lambda s: None)
+        return launcher.Launcher(self.cfg, cli.config_dir(), log=self.lines.append, **kw)
+
+    def test_a_tmux_that_does_not_run_or_answers_garbage_reads_as_no_answer(self):
+        self.assertIsNone(REAL_TMUX_VERSION("tmux", run=raises))
+        tm = launcher.Tmux("/tmp/stub.sock", tmux="tmux", run=lambda *a, **k: ran(1))
+        self.assertIsNone(tm.pane_fields("%0"), "a failed display-message")
+        tm = launcher.Tmux("/tmp/stub.sock", tmux="tmux", run=lambda *a, **k: ran(0, launcher.FIELD_SEP.join("abcdefg")))
+        self.assertIsNone(tm.pane_fields("%0"), "seven fields, not one of them a number")
+        self.assertIsNone(launcher.Tmux("/tmp/stub.sock", tmux="tmux", run=raises).run("list-sessions"))
+
+    def test_session_creation_refuses_each_unverifiable_step(self):
+        good = launcher.hold.pane_command(cli.LOCAL.command, NONCE)
+        fields = {"pane_id": "%0", "pane_pid": 2, "session_id": "$0", "session_created": 3, "server_pid": 4,
+                  "start_command": good, "title": ""}
+        cases = [(raises, None, "did not run"), (lambda *a, **k: ran(0), None, "could not be read back"),
+                 (lambda *a, **k: ran(0), dict(fields, start_command="sh -c evil"), "not the fixed command")]
+        for run, f, why in cases:
+            tm = StubTm(fields=f)
+            gen, problem = launcher.create_session(tm, self.cfg, cli.config_dir(), self.work, NONCE, {}, run)
+            self.assertEqual((gen, why in problem), (None, True), problem)
+        self.assertIn(("kill-session", "-t", "=%s" % launcher.SESSION_NAME), tm.calls, "the foreign pane is not kept")
+        with mock.patch.object(task_io, "start_time", return_value=None):
+            gen, problem = launcher.create_session(StubTm(fields=fields), self.cfg, cli.config_dir(), self.work, NONCE, {},
+                                                   lambda *a, **k: ran(0))
+        self.assertEqual((gen, problem), (None, "the server's start time is unreadable"))
+
+    def test_no_consumer_within_the_bound_is_none(self):
+        with mock.patch.object(task_io, "holder_consumer", return_value=None):
+            self.assertEqual(launcher.await_consumer(StubTm(), str(self.work), "%0", wait_s=0, sleep=lambda s: None),
+                             (None, None))
+
+    def test_the_classifier_withholds_adoption_on_each_failed_check(self):
+        mine = {"adapter": "claude-local", "install_id": task_io.install_id()}
+        fields = {k: GEN[k] for k in ("pane_id", "pane_pid", "session_id", "session_created", "server_pid", "start_command")}
+        rec = dict(records.empty_supervisor(), generation=GEN)
+        cases = [(FakeTmux(present=False), "held", None, None, "gone but the root reads held"),
+                 (FakeTmux(present=True, fields=fields), "held", False, None, "does not verify by pid and start"),
+                 (FakeTmux(present=True, fields=fields), "held", True, None, "claude does not verify"),
+                 (FakeTmux(present=True, fields=fields), "held", True, {"live": False}, "claude does not verify")]
+        for tm, occ, lineage, consumer, why in cases:
+            with mock.patch.object(task_io, "occupancy", return_value=occ), \
+                    mock.patch.object(task_io, "lock_holder", return_value=mine), \
+                    mock.patch.object(task_io, "verify_lineage", return_value=lineage), \
+                    mock.patch.object(task_io, "holder_consumer", return_value=consumer):
+                verdict, detail = launcher.classify(tm, rec, self.cfg, str(self.work))
+            self.assertEqual((verdict, why in detail), ("unknown", True), detail)
+
+    def test_creation_refuses_a_live_consumer_an_unproven_server_a_bad_root_and_a_failed_session(self):
+        lc = self.launcher()
+        rec = dict(lc.record(), generation=GEN)
+        clear = mock.patch.object(tmux_pane_keys, "fence_status", return_value="clear")
+        with clear, mock.patch.object(task_io, "holder_consumer", return_value={"live": None}):
+            self.assertEqual(lc.create(rec), (False, "a recorded claude consumer still verifies or is unobserved; no second session"))
+        with clear, mock.patch.object(task_io, "holder_consumer", return_value=None), \
+                mock.patch.object(task_io, "verify_lineage", return_value=None):
+            self.assertEqual(lc.create(rec), (False, "the recorded server is not proven gone"))
+        with clear, mock.patch.object(task_io, "holder_consumer", return_value=None), \
+                mock.patch.object(inbox, "prepare_root", return_value="the root is wrong"):
+            self.assertEqual(lc.create({}), (False, "the root is wrong"))
+        with clear, mock.patch.object(task_io, "holder_consumer", return_value=None), \
+                mock.patch.object(launcher, "create_session", return_value=(None, "tmux new-session failed: x")):
+            self.assertEqual(lc.create({}), (False, "tmux new-session failed: x"))
+        with clear, mock.patch.object(task_io, "holder_consumer", return_value=None), \
+                mock.patch.object(launcher, "create_session", return_value=(dict(GEN), "")), \
+                mock.patch.object(launcher, "await_consumer", return_value=(None, None)):
+            ok, problem = lc.create({})
+        self.assertEqual((ok, "no consumer attached" in problem), (False, True))
+        self.assertEqual(lc.record()["generation"], GEN, "the made generation is recorded before the wait")
+
+    def test_observation_without_a_pane_keeps_the_record_and_a_cleared_stall_is_logged(self):
+        lc = self.launcher()
+        rec = lc.record()
+        self.assertIs(lc.observe(rec), rec, "no generation, nothing captured")
+        lc.store_root, lc.tm = None, StubTm()
+        lc.tm.capture = lambda pane_id: "screen"
+        stalled = lc._with_record(lambda r: dict(r, generation=GEN, stall={"reason": "r", "checks": "c"}))
+        with mock.patch.object(detector, "derive", return_value={"stall": None}):
+            out = lc.observe(stalled)
+        self.assertEqual((out["stall"], self.lines), (None, ["progress: the stall cleared"]))
+        self.assertIsNone(lc.record()["stall"], "with no card store the evidence is recorded alone")
+
+    def card_mocks(self, req, sub):
+        store = mock.Mock()
+        store.load.return_value = req
+        return [mock.patch.object(card, "manager", return_value=(store, mock.Mock())),
+                mock.patch.object(accepter, "locks", lambda *a: contextlib.nullcontext()),
+                mock.patch.object(card, "local", return_value=sub),
+                mock.patch.object(card, "reconcile_rearm", side_effect=ValueError("the successor is foreign"))]
+
+    def test_retiring_a_rearm_that_cannot_reconcile_is_logged_and_the_pointer_cleared(self):
+        lc = self.launcher()
+        lc._with_record(lambda r: dict(r, hitl={"id": "h", "store_root": "s"}))
+        req = type("Req", (), {"status": "resolved", "id": "h"})()
+        with contextlib.ExitStack() as stack:
+            for p in self.card_mocks(req, {"effect_phase": card.PHASE_REARMING, "saga_key": "k"}):
+                stack.enter_context(p)
+            rec = lc.retire_card()
+        self.assertEqual((rec["hitl"], self.lines), (None, ["retiring the old card: the successor is foreign"]))
+
+    def test_effects_of_a_vanished_card_are_nothing(self):
+        lc = self.launcher()
+        rec = lc._with_record(lambda r: dict(r, hitl={"id": "h", "store_root": "s"}))
+        with contextlib.ExitStack() as stack:
+            for p in self.card_mocks(None, {}):
+                stack.enter_context(p)
+            self.assertIs(lc.apply_effects(rec), rec)
+
+    def test_a_fenced_send_that_cannot_run_is_uncertain_and_no_generation_is_nothing_to_stop(self):
+        lc = self.launcher(run=raises)
+        self.assertEqual(lc.fenced(GEN, "", "send-keys -t %0 /exit Enter"), tmux_pane_keys.UNCERTAIN)
+        self.assertEqual(lc.stop_session({"generation": None}, "test"), "nothing to stop")
+
+    def test_a_session_that_outlives_its_kill_is_not_stopped(self):
+        lc = self.launcher()
+        lc.tm = StubTm(present=True)
+        with mock.patch.object(launcher, "SERVER_EXIT_S", 0.05), mock.patch.object(launcher, "CLAUDE_GRACE_S", 0.0), \
+                mock.patch.object(lc, "fenced", side_effect=[0, 0]):
+            out = lc.stop_session({"generation": GEN, "title_token": None}, "test")
+        self.assertIn("still answers", out)
+
+    def test_an_unconfirmed_send_fences_creation_and_is_never_stopped(self):
+        lc = self.launcher()
+        lc.tm = StubTm(present=True)
+        with mock.patch.object(lc, "fenced", return_value=tmux_pane_keys.UNCERTAIN):
+            out = lc.stop_session({"generation": GEN, "title_token": None}, "test")
+        self.assertTrue(out.startswith("uncertain:"), out)
+        self.assertIs(lc.record()["fence_uncertain"], True)
+
+    def test_an_unknown_session_probe_never_turns_an_unsent_action_into_stopped(self):
+        """has-session answering nothing (None) is not 'gone': a withheld or unconfirmed /exit stays
+        that outcome, and the stop is not reported done."""
+        lc = self.launcher()
+        lc.tm = StubTm(present=None)
+        for rc, word in ((tmux_pane_keys.WITHHELD, "cancelled:"), (tmux_pane_keys.UNCERTAIN, "uncertain:")):
+            with mock.patch.object(lc, "fenced", return_value=rc):
+                out = lc.stop_session({"generation": GEN, "title_token": None}, "test")
+            self.assertNotEqual(out, "stopped", rc)
+            self.assertTrue(out.startswith(word), (rc, out))
+            self.assertEqual(lc.unsent(GEN, "", rc, "/exit")[:len(word)], word)
+
+    def test_a_created_session_clears_the_deadline_and_an_adopted_stall_raises_its_card(self):
+        lc = self.launcher()
+        lc._with_record(lambda r: dict(r, deadline=5.0))
+        with mock.patch.object(launcher, "classify", return_value=("create", "")), \
+                mock.patch.object(lc, "create", return_value=(True, "")):
+            rc, rec = lc.tick(lc.record())
+        self.assertEqual((rc, rec["deadline"]), (None, None))
+        raised = []
+        lc._with_record(lambda r: dict(r, generation=GEN))
+        stalled = dict(lc.record(), stall={"checks": "frozen"}, hitl=None)
+        with mock.patch.object(launcher, "classify", return_value=("adopt", "")), \
+                mock.patch.object(lc, "observe", lambda r: stalled), \
+                mock.patch.object(lc, "raise_card", lambda r, kind, check: raised.append((kind, check)) or r), \
+                mock.patch.object(lc, "apply_effects", lambda r: r):
+            self.assertEqual(lc.tick(lc.record())[0], None)
+        self.assertEqual(raised, [(card.KIND_STALL, "frozen")])
+
+    def test_the_loop_retries_an_unregistered_store_and_runs_until_a_tick_exits(self):
+        lc = self.launcher()
+        with mock.patch.object(card, "register_install", side_effect=OSError(errno.EACCES, "denied")):
+            self.assertEqual(lc._serve(), launcher.EXIT_RETRY)
+        self.assertIn("cannot register with the bridge's card store", self.lines[-1])
+        slept = []
+        lc = self.launcher(sleep=slept.append)
+        with mock.patch.object(card, "register_install"), mock.patch.object(lc, "apply_effects", lambda r: r), \
+                mock.patch.object(lc, "tick", side_effect=[(None, {}), (cm.EXIT_HELD, {})]):
+            self.assertEqual(lc._serve(), cm.EXIT_HELD)
+        self.assertEqual(slept, [launcher.TICK_S])
+
+    def test_the_launchd_shim_forwards_a_stop_to_its_live_child(self):
+        class Child:
+            sent = []
+
+            def poll(self):
+                return None
+
+            def send_signal(self, sig):
+                self.sent.append(sig)
+
+            def wait(self):
+                signal.raise_signal(signal.SIGTERM)
+                return 0
+        self.assertEqual(launcher.run_launchd(["x"], popen=lambda argv: Child()), 1)
+        self.assertEqual(Child.sent, [signal.SIGTERM])
+
+
+class HoldUnit(ConnectBase):
+    """hold's refusals in-process: each is one line and exit 2, the shim reaped, nothing left running."""
+
+    def setUp(self):
+        super().setUp()
+        self.configure()
+        self.cfg = cli.load_config()[0]
+        cwd = os.getcwd()
+        self.addCleanup(os.chdir, cwd)
+
+    def args(self):
+        return type("A", (), {"generation": NONCE})()
+
+    def pane_env(self, **over):
+        env = {hold_mod.ENV_ROOT: str(self.work), hold_mod.ENV_CONFIG_DIR: str(cli.config_dir()),
+               hold_mod.ENV_SESSION_ID: SESSION_ID}
+        env.update(over)
+        return env
+
+    def test_the_pane_command_takes_only_a_hex_generation(self):
+        with self.assertRaises(ValueError):
+            hold_mod.pane_command(cli.LOCAL.command, "zz")
+
+    def test_an_unreadable_or_incomplete_config_is_refused(self):
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(hold_mod.main(self.args(), environ=self.pane_env(**{hold_mod.ENV_CONFIG_DIR: str(self.home / "none")})),
+                             cm.EXIT_UNUSABLE)
+        self.assertIn("the config could not be read", err.getvalue())
+        self.configure(CLAUDE="")
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(hold_mod.main(self.args(), environ=self.pane_env()), cm.EXIT_UNUSABLE)
+        self.assertIn("lacks CLAUDE or PLUGIN_DIR", err.getvalue())
+
+    def test_a_shim_that_cannot_spawn_leaves_no_descriptor(self):
+        before = set(os.listdir("/dev/fd"))
+        with self.assertRaises(OSError):
+            hold_mod.spawn_shim(["x"], {}, popen=raises)
+        self.assertLessEqual(set(os.listdir("/dev/fd")), before | {str(n) for n in range(3)})
+
+    def test_reaping_tolerates_a_closed_pipe_and_kills_a_shim_that_will_not_exit(self):
+        r, w = os.pipe()
+        os.close(r)
+        os.close(w)
+        calls = []
+
+        class Stuck:
+            def wait(self, timeout=None):
+                calls.append("wait")
+                if len(calls) == 1:
+                    raise subprocess.TimeoutExpired("shim", timeout)
+                return -9
+
+            def kill(self):
+                calls.append("kill")
+        hold_mod.reap(Stuck(), w)
+        self.assertEqual(calls, ["wait", "kill", "wait"])
+
+    def held(self, popen=None, state=None, root=None):
+        root = Path(root or self.work)
+        fd = os.open(str(root), os.O_RDONLY | os.O_DIRECTORY)
+        self.addCleanup(os.close, fd)
+        owner = type("Owner", (), {"root_fd": fd})()
+        err = io.StringIO()
+        with mock.patch.object(task_io, "acquire_lock", return_value=owner), \
+                mock.patch.object(task_io, "release_lock", return_value=True), \
+                mock.patch.object(task_io, "holder_record_bytes", return_value=b"{}"), \
+                mock.patch.object(inbox, "recover_dead_generation", return_value=0), \
+                contextlib.redirect_stderr(err):
+            rc = hold_mod._held(str(root), self.cfg, SESSION_ID, NONCE, {}, popen or raises, state or cm.stop_state())
+        return rc, err.getvalue()
+
+    def test_each_refusal_under_the_held_root_is_one_line(self):
+        with mock.patch.object(inbox, "prepare_root", return_value="the root is not prepared"):
+            self.assertEqual(self.held(), (cm.EXIT_UNUSABLE, "hold: refusing to start: the root is not prepared\n"))
+        bare = self.home / "bare"
+        bare.mkdir()
+        with mock.patch.object(inbox, "prepare_root", return_value=""):
+            rc, err = self.held(root=bare)
+        self.assertEqual((rc, "no tasks/ under the held root" in err), (cm.EXIT_UNUSABLE, True), err)
+        (self.work / "tasks").mkdir(exist_ok=True)
+        state = dict(cm.stop_state(), sig=signal.SIGTERM)
+        self.assertEqual(self.held(state=state), (128 + signal.SIGTERM, "hold: stopped before the session started\n"))
+        rc, err = self.held()
+        self.assertEqual((rc, "the session could not be spawned" in err), (cm.EXIT_UNUSABLE, True), err)
+
+    def shim(self):
+        children = []
+
+        def popen(argv, **kw):
+            child = subprocess.Popen(["sleep", "0"])     # the real shim exits on the unwritten pipe's EOF
+            children.append(child)
+            return child
+        self.addCleanup(lambda: [c.kill() or c.wait() for c in children if c.poll() is None])
+        return popen, children
+
+    def test_an_unreadable_shim_start_or_a_short_go_write_reaps_the_shim(self):
+        (self.work / "tasks").mkdir(exist_ok=True)
+        popen, children = self.shim()
+        with mock.patch.object(task_io, "start_time", return_value=None):
+            rc, err = self.held(popen=popen)
+        self.assertEqual((rc, "no consumer: the shim's start time is unreadable" in err), (cm.EXIT_UNUSABLE, True), err)
+        real = os.write
+        tries = []
+
+        def write(fd, data):
+            if data == hold_mod.GO:
+                tries.append(fd)
+                if len(tries) == 1:
+                    raise InterruptedError()
+                return 0
+            return real(fd, data)
+        with mock.patch.object(task_io, "start_time", return_value="t"), \
+                mock.patch.object(task_io, "attach_consumer", return_value=None), mock.patch.object(os, "write", write):
+            rc, err = self.held(popen=popen)
+        self.assertEqual((rc, "no consumer: short write" in err, len(tries)), (cm.EXIT_UNUSABLE, True, 2), err)
+        self.assertEqual([c.returncode for c in children], [0, 0], "each shim reaped")
+
+    def test_a_session_that_survives_the_kill_is_left_to_the_manager(self):
+        state = dict(cm.stop_state(), sig=signal.SIGTERM)
+        with mock.patch.object(cm, "_run_until_end", return_value=None), contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(hold_mod._supervise(object(), state), 128 + signal.SIGTERM)
+        self.assertIn("did not die within the bound", err.getvalue())
 
 
 class OldMainHitl(CardBase):

@@ -2179,6 +2179,72 @@ class HolderLockTest(unittest.TestCase):
                 self.put(self.record2(hpid, hstart, **bad))
                 self.assertIsInstance(self.hl.read_holder(str(self.root)), self.hl.Invalid)
 
+    def test_each_unverifiable_read_is_a_refusal_or_unobserved_never_free(self):
+        self.assertIsNone(self.hl.parent_pid("not-a-pid"), "an unusable pid has no parent")
+        d = self.ldir()
+        d.mkdir(parents=True, exist_ok=True)
+        dfd = os.open(str(d), os.O_RDONLY)
+        self.addCleanup(os.close, dfd)
+        self.assertIsNone(self.hl._raw_record(dfd), "no record is None")
+        os.symlink("elsewhere", str(d / "holder"))
+        with self.assertRaises(self.hl.LockError):
+            self.hl._raw_record(dfd)
+        os.unlink(str(d / "holder"))
+        with self.assertRaises(self.hl.LockError) as e:
+            self.hl._own_record(object(), None)
+        self.assertEqual(str(e.exception), "not this owner's record")
+        with mock.patch.object(self.hl, "verify_lineage", return_value=None):
+            self.assertFalse(self.hl._proven_dead({"owner_pid": 1, "owner_start": "s", "host": "h",
+                                                   "consumer": {"pid": 2, "start": "t"}}))
+        with mock.patch.object(self.hl, "lock_dir", side_effect=PermissionError(13, "denied")):
+            self.assertEqual(self.hl.occupancy(str(self.root)), "unobserved")
+        os.symlink("lock", str(d / "lock"))                      # a loop: the lock cannot be opened
+        self.assertEqual(self.hl.occupancy(str(self.root)), "unobserved")
+        os.unlink(str(d / "lock"))
+        (d / "lock").touch()
+        with mock.patch.object(self.hl.file_lock, "try_lock_fd", side_effect=OSError(5, "io")):
+            self.assertEqual(self.hl.occupancy(str(self.root)), "unobserved")
+        with mock.patch.object(self.hl, "_read_prior", side_effect=ValueError("bad")):
+            self.assertEqual(self.hl.occupancy(str(self.root)), self.hl._occupant(self.hl.Invalid("x", b""))[0],
+                             "an undecodable record reads as an invalid one")
+
+    def test_attach_refuses_a_replaced_lock_and_a_record_it_cannot_validate(self):
+        owner = self.owned()
+        self.hl.publish(owner, "routine")
+        published = (self.ldir() / "holder").read_bytes()
+        cpid, cstart = self.proc()
+        with mock.patch.object(self.hl, "_same_at", return_value=False), self.assertRaises(self.hl.LockError) as e:
+            self.hl.attach_consumer(owner, published, pid=cpid, start=cstart)
+        self.assertEqual(str(e.exception), "replaced")
+        real = self.hl._record_problem
+        bad = mock.patch.object(self.hl, "_record_problem", lambda rec: "bad" if rec.get("consumer") else real(rec))
+        with bad, self.assertRaises(self.hl.LockError) as e:
+            self.hl.attach_consumer(owner, published, pid=cpid, start=cstart)
+        self.assertEqual(str(e.exception), "invalid record: bad")
+        self.assertEqual((self.ldir() / "holder").read_bytes(), published, "nothing written")
+        self.end(cpid)
+        self.hl.release(owner)
+
+    def test_tombstone_refuses_a_missing_lock_a_schema_1_record_and_an_invalid_result(self):
+        hpid, hstart = self.dead()
+        dpid, dstart = self.dead()
+        dead = self.put(self.record2(hpid, hstart, attached=(dpid, dstart)))
+        with self.assertRaises(self.hl.LockError) as e:
+            self.hl.tombstone_consumer(str(self.root), dead, by="launcher", reason="r")
+        self.assertTrue(str(e.exception).startswith("no lock to take"), e.exception)
+        (self.ldir() / "lock").touch()
+        old = self.put(self.record(hpid, hstart))
+        with self.assertRaises(self.hl.LockError) as e:
+            self.hl.tombstone_consumer(str(self.root), old, by="launcher", reason="r")
+        self.assertEqual(str(e.exception), "not a schema-2 record")
+        dead = self.put(self.record2(hpid, hstart, attached=(dpid, dstart)))
+        real = self.hl._record_problem
+        bad = mock.patch.object(self.hl, "_record_problem", lambda rec: "bad" if rec.get("tombstone") else real(rec))
+        with mock.patch.object(self.hl, "_proven_dead", return_value=True), bad, self.assertRaises(self.hl.LockError) as e:
+            self.hl.tombstone_consumer(str(self.root), dead, by="launcher", reason="r")
+        self.assertEqual(str(e.exception), "invalid record: bad")
+        self.assertEqual((self.ldir() / "holder").read_bytes(), dead, "nothing written")
+
     def test_attach_consumer_is_a_cas_that_moves_the_fencing_pid_to_the_consumer(self):
         owner = self.owned()
         with self.assertRaises(self.hl.LockError) as e:
