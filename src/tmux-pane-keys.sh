@@ -65,7 +65,7 @@ CLAIM="mv $(tmux_quote "$TICKET") $(tmux_quote "$TICKET.claimed") && case \"\$(L
 if [ -n "$FENCED" ]; then
   # The compare and the action are one server command: the predicate is evaluated against the pane
   # -t selects, and a false predicate orphans the ticket and fails, so nothing reaches a replacement.
-  SEND="if-shell -F -t $(tmux_quote "$TARGET") $(tmux_quote "$FENCE_PRED") $(tmux_quote "$FENCE_ACTION") $(tmux_quote "run-shell $(tmux_quote "$ORPHAN; false")")"
+  SEND="if-shell -F -t $(tmux_quote "$TARGET") $(tmux_quote "$FENCE_PRED") $(tmux_quote "$FENCE_ACTION") $(tmux_quote "run-shell $(tmux_quote "$ORPHAN")")"
 else
   # Hooks may run between the commands of a list, so the send is withheld (and its claim orphaned)
   # when the pane is back in a mode at the moment of sending.
@@ -79,5 +79,7 @@ else
 fi
 printf '%s\n' "$SEND" > "$WORK/cmd"
 bounded if-shell "$CLAIM" "$SEND"; rc=$?
+# Withheld is read from the orphaned ticket: a failing run-shell would put the pane in view mode (tmux < 3.5).
+[ -z "$FENCED" ] || [ "$rc" != 0 ] || [ ! -e "$TICKET.orphaned" ] || rc=1
 cat "$WORK/out"; cat "$WORK/err" >&2
 exit "$rc"

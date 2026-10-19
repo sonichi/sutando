@@ -83,9 +83,9 @@ class Builder(unittest.TestCase):
     def test_fenced_is_the_if_shell_with_the_orphaning_false_branch(self):
         got = vk.fenced("%3", "#{==:1,1}", "send-keys -t '%3' '/exit' Enter")
         self.assertEqual(got, "if-shell -F -t '%3' '#{==:1,1}' 'send-keys -t '\"'\"'%3'\"'\"' '\"'\"'/exit'\"'\"' Enter' "
-                              "'run-shell '\"'\"'$ORPHAN; false'\"'\"''")
+                              "'run-shell '\"'\"'$ORPHAN'\"'\"''")
         orphan = "mv '/w/ticket.claimed' '/w/ticket.orphaned'"
-        self.assertIn(vk.tmux_quote("run-shell " + vk.tmux_quote(orphan + "; false")),
+        self.assertIn(vk.tmux_quote("run-shell " + vk.tmux_quote(orphan)),
                       vk.fenced("%3", "1", "kill-session -t '$1'", orphan=orphan))
 
 
@@ -132,10 +132,13 @@ class ScratchServer(unittest.TestCase):
                     with contextlib.suppress(OSError):
                         self.ticket_files[name] = (Path(path) / name).read_text(errors="replace")
             return real(path, ignore_errors=ignore_errors, **k)
+        err = mock.Mock()
         with mock.patch.object(vk.shutil, "rmtree", spy), open(os.devnull, "wb") as sink, \
-                mock.patch.object(sys, "stdout", mock.Mock(buffer=sink)), mock.patch.object(sys, "stderr", mock.Mock(buffer=sink)):
+                mock.patch.object(sys, "stdout", mock.Mock(buffer=sink)), mock.patch.object(sys, "stderr", err):
+            err.buffer = sink
             rc = vk.run_guarded(self.sock, ["--tmux", "tmux", "-S", self.sock, "-t", self.pane,
                                             "--fence", predicate or self.pred, action])
+        self.guard_said = "".join(str(c.args[0]) for c in err.write.call_args_list if c.args)
         return rc, sorted(left)
 
     def test_the_nonce_delimiter_matches_this_pane_and_refuses_a_longer_nonce(self):
@@ -162,6 +165,11 @@ class ScratchServer(unittest.TestCase):
         self.assertEqual(left, ["cmd", "err", "out", "stderr", "stdout", "ticket.orphaned"],
                          "orphaned before cleanup; no pending, claimed or uncertain ticket")
         self.assertEqual(vk.fence_status(self.sock), "clear", "a withheld send leaves no uncertainty")
+        self.assertNotIn("returned", self.ticket_files.get("out", "") + self.ticket_files.get("err", ""),
+                         "the withheld branch's run-shell succeeds: a failing one prints its status")
+        self.assertNotIn("did not send", self.guard_said, "withheld is the script's own exit 1, not an unconfirmed send")
+        self.assertEqual(self.show("#{pane_in_mode}"), "0",
+                         "nor does it leave the pane in view mode, where the next keys would go (tmux < 3.5)")
         rc, left = self.run_fenced("send-keys -t %s LANDED Enter" % self.pane)
         self.assertEqual((rc, left), (0, ["cmd", "err", "out", "stderr", "stdout", "ticket.claimed"]),
                          "the true predicate sends: claimed, then the ticket dir is removed")

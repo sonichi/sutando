@@ -68,8 +68,8 @@ def predicate(nonce, pane_pid, session_id, session_created, title_token=None):
 
 def fenced(target_pane, predicate_format, action_cmd, orphan=ORPHAN):
     """The one server command of a fenced action, exactly as the script builds it: the action runs
-    only while the predicate holds; otherwise the ticket is orphaned and the command fails (rc 1)."""
-    false_branch = tmux_quote("run-shell " + tmux_quote(orphan + "; false"))
+    only while the predicate holds; otherwise the ticket is orphaned, which the script exits 1 on."""
+    false_branch = tmux_quote("run-shell " + tmux_quote(orphan))
     return "if-shell -F -t %s %s %s %s" % (tmux_quote(target_pane), tmux_quote(predicate_format),
                                             tmux_quote(action_cmd), false_branch)
 
