@@ -53,7 +53,7 @@ def socket_problem(config_dir) -> str:
 
 def tmux_version(tmux="tmux", run=subprocess.run) -> "tuple[int, int] | None":
     try:
-        r = run([tmux, "-V"], capture_output=True, text=True, timeout=cm.RUN_TIMEOUT_S)
+        r = run([tmux, "-u", "-V"], capture_output=True, text=True, timeout=cm.RUN_TIMEOUT_S)
     except (OSError, subprocess.SubprocessError):
         return None
     m = TMUX_VERSION_RE.search((r.stdout or "") + (r.stderr or "")) if r.returncode == 0 else None
@@ -77,7 +77,7 @@ class Tmux:
 
     def run(self, *args, timeout=PROBE_TIMEOUT_S, env=None):
         try:
-            return self._run([self.tmux, "-S", self.sock, *args], capture_output=True, text=True, timeout=timeout,
+            return self._run([self.tmux, "-u", "-S", self.sock, *args], capture_output=True, text=True, timeout=timeout,
                              env=env, stdin=subprocess.DEVNULL)
         except (OSError, subprocess.SubprocessError):
             return None
@@ -113,6 +113,8 @@ def server_env(cfg: dict, environ=None) -> dict:
     script = cm.console_script(LOCAL)
     env["PATH"] = ":".join([p for p in ([os.path.dirname(script)] if script else []) + (env.get("PATH") or "/usr/bin:/bin").split(":") if p])
     env.setdefault("TERM", "xterm-256color")
+    # The server renders the pane in its own locale: without UTF-8, Claude's UI draws as '_'.
+    env["LC_CTYPE"] = "en_US.UTF-8"
     return env
 
 
@@ -132,7 +134,7 @@ def create_session(tm: Tmux, cfg: dict, config_dir, root, nonce: str, environ=No
     command; then update-environment cleared and the start command read back against the fixed
     alphabet. (generation, '') or (None, why)."""
     command = hold.pane_command(LOCAL.command, nonce)
-    argv = ["env", "-i", *["%s=%s" % kv for kv in server_env(cfg, environ).items()], tm.tmux, "-S", tm.sock,
+    argv = ["env", "-i", *["%s=%s" % kv for kv in server_env(cfg, environ).items()], tm.tmux, "-u", "-S", tm.sock,
             "-f", "/dev/null", "new-session", "-d", "-s", SESSION_NAME, "-x", "200", "-y", "50", "-c", str(root)]
     for k, v in session_env(cfg, config_dir, root).items():
         argv += ["-e", "%s=%s" % (k, v)]

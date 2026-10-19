@@ -1125,12 +1125,12 @@ exit 0
 ''')
         fake = self.bin / "tmux"
         guard = r'''_hang_unclaimed=0
-[ "${3:-}" = if-shell ] && case "$5" in
+[ "${1:-}" = -u ] && [ "${4:-}" = if-shell ] && case "$6" in
   *C-m*) _hang_unclaimed=1;;
   *-l*) [ "$FAIL_KEY" = literal ] && _hang_unclaimed=1;;
 esac
 if [ "$_hang_unclaimed" = 1 ]; then
-  eval "set -- ${5#copy-mode -q -t * ; }"
+  eval "set -- ${6#copy-mode -q -t * ; }"
   eval "_keys=\${$#}"
   eval "set -- $_keys"
   printf '%s\n' "$*" >> "$TMUX_LOG"

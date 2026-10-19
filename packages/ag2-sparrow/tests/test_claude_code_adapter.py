@@ -217,7 +217,7 @@ class Measure(unittest.TestCase):
 
 # ── `ag2-sparrow-claude-local`: the installed local shape ─────────────
 
-from ag2_sparrow import _dirs, connect_common as cm, holder_lock, tmux_pane_keys  # noqa: E402
+from ag2_sparrow import _dirs, connect_common as cm, holder_lock, tmux_pane_keys, tmux_probe  # noqa: E402
 from ag2_sparrow import claude_local_accepter as accepter, claude_local_card as card, claude_local_records as records  # noqa: E402
 
 from ag2_sparrow.adapters.claude_code import cli, detector, hold as hold_mod, inbox, launcher  # noqa: E402
@@ -2309,6 +2309,17 @@ class LauncherTmux(ConnectBase):
         self.assertEqual(self.tmux("display-message", "-p", "-t", gen["pane_id"], "#{pane_title}").stdout.strip(),
                          rec["title_token"])
 
+    def test_create_reads_the_pane_back_when_the_launchers_environment_has_no_locale(self):
+        """B1: the managed job sets no locale; a client without one escapes the TAB pane_fields splits on."""
+        with mock.patch.dict(os.environ):
+            for name in [k for k in os.environ if k == "LANG" or k.startswith("LC_")]:
+                del os.environ[name]
+            lc, rec = self.created()
+            fields = lc.tm.pane_fields(rec["generation"]["pane_id"])
+        self.assertEqual(fields["pane_pid"], rec["generation"]["pane_pid"], "the pane is read back by its tuple")
+        self.assertEqual(wait_for(self.session, 10)["env"].get("LC_CTYPE"), "en_US.UTF-8",
+                         "the clean server gives the pane a UTF-8 locale")
+
     def test_adoption_needs_the_pane_tuple_the_consumer_and_this_generations_witness(self):
         lc, rec = self.created()
         root = str(self.work)
@@ -2779,6 +2790,53 @@ class FakeTmux:
         return self.fields
 
 
+class TmuxClientUtf8(unittest.TestCase):
+    """B1: every tmux client the adapter and its vendored helpers start passes -u, so a TAB in
+    display-message output survives a process with no UTF-8 locale."""
+
+    def recorder(self, seen, rc=0):
+        def run(argv, **_):
+            seen.append(list(argv))
+            return subprocess.CompletedProcess(argv, rc, "", "")
+        return run
+
+    def test_launcher_tmux_version_and_every_server_command(self):
+        seen = []
+        launcher.tmux_version("/x/tmux", run=self.recorder(seen))
+        tm = launcher.Tmux("/s", tmux="/x/tmux", run=self.recorder(seen))
+        tm.run("list-sessions")
+        tm.pane_fields("%1")
+        tm.capture("%1")
+        self.assertEqual([a[:2] for a in seen], [["/x/tmux", "-u"]] * 4)
+
+    def test_create_session_starts_a_utf8_client_and_a_utf8_server(self):
+        seen = []
+        tm = launcher.Tmux("/s", tmux="/x/tmux", run=self.recorder(seen))
+        launcher.create_session(tm, {"SESSION_ID": SESSION_ID}, "/c", "/r", "0" * 32, environ={},
+                                run=self.recorder(seen, rc=1))
+        [argv] = seen
+        self.assertEqual(argv[argv.index("/x/tmux") + 1], "-u")
+        self.assertIn("LC_CTYPE=en_US.UTF-8", argv[:argv.index("/x/tmux")], "the server's env -i environment")
+
+    def test_tmux_probe_has_session(self):
+        seen = []
+        with mock.patch.object(tmux_probe.subprocess, "run", self.recorder(seen)):
+            tmux_probe.has_session("/s", "x", tmux="/x/tmux")
+        self.assertEqual(seen[0][:2], ["/x/tmux", "-u"])
+
+    def test_pane_keys_send_and_fenced_action_reach_tmux_with_u(self):
+        with tempfile.TemporaryDirectory() as d:
+            fake, log = Path(d) / "tmux", Path(d) / "log"
+            fake.write_text("#!/bin/sh\nprintf '%%s\\n' \"$1\" >> '%s'\n" % log)
+            fake.chmod(0o755)
+            sock = str(Path(d) / "s")
+            pred = tmux_pane_keys.predicate("0" * 32, 1, "$1", 1)
+            for argv in (tmux_pane_keys.argv(sock, "%1", "Enter", tmux=str(fake)),
+                         tmux_pane_keys.fence_argv(sock, "%1", pred, "send-keys -t %1 Enter", tmux=str(fake))):
+                subprocess.run(argv, capture_output=True, timeout=30)
+            self.assertEqual(log.read_text().split(), ["-u", "-u"])
+
+
 class LocalCommands(ConnectBase):
     """§6: attach is tmux attach on the adapter's socket; stop needs --confirm; verify names what waits."""
 
@@ -2787,8 +2845,8 @@ class LocalCommands(ConnectBase):
         seen = []
         with mock.patch.object(os, "execvp", lambda f, argv: seen.append(argv)):
             self.main("attach")
-        self.assertEqual(seen[0][1:], ["-S", str(launcher.socket_path(cli.config_dir())), "attach", "-t", "=claude-local"])
-        self.assertNotIn("sutando-tmux", seen[0][2])
+        self.assertEqual(seen[0][1:], ["-u", "-S", str(launcher.socket_path(cli.config_dir())), "attach", "-t", "=claude-local"])
+        self.assertNotIn("sutando-tmux", seen[0][3])
         help_text = subprocess.run([sys.executable, "-c", "import sys; sys.path.insert(0, %r); from ag2_sparrow.adapters."
                                     "claude_code.cli import main; main(['attach', '--help'])" % str(PKG)],
                                    capture_output=True, text=True).stdout

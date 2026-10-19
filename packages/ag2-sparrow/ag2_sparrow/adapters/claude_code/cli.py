@@ -299,7 +299,7 @@ def attach(_args) -> int:
         return EXIT_UNUSABLE
     sock = str(launcher.socket_path(config_dir()))
     tmux = shutil.which("tmux") or "tmux"
-    os.execvp(tmux, [tmux, "-S", sock, "attach", "-t", "=%s" % SESSION_NAME])
+    os.execvp(tmux, [tmux, "-u", "-S", sock, "attach", "-t", "=%s" % SESSION_NAME])
 
 
 def stop(args) -> int:

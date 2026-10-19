@@ -4,6 +4,7 @@ their two shell scripts, take the interpreter from an explicit --python, and gai
 fence: `fenced()` / `predicate()` build the one server command whose false branch orphans the ticket
 (exit 1, nothing sent). Measured against a scratch tmux server on a short /tmp socket (#5695 K4,
 v3.6 §4, v3.7 §4, v3.10, v3.13 §2 and the phase-1 delta)."""
+import contextlib
 import os
 import re
 import shutil
@@ -122,10 +123,14 @@ class ScratchServer(unittest.TestCase):
         """The vendored wrapper in-process; (rc, names left in the ticket dir before cleanup)."""
         left = {}
         real = shutil.rmtree
+        self.ticket_files = {}
 
         def spy(path, ignore_errors=False, **k):
             if Path(path).name.startswith("tmux-pane-keys."):
                 left.update({n: 1 for n in os.listdir(path)})
+                for name in ("cmd", "out", "err", "stdout", "stderr"):
+                    with contextlib.suppress(OSError):
+                        self.ticket_files[name] = (Path(path) / name).read_text(errors="replace")
             return real(path, ignore_errors=ignore_errors, **k)
         with mock.patch.object(vk.shutil, "rmtree", spy), open(os.devnull, "wb") as sink, \
                 mock.patch.object(sys, "stdout", mock.Mock(buffer=sink)), mock.patch.object(sys, "stderr", mock.Mock(buffer=sink)):
@@ -151,6 +156,7 @@ class ScratchServer(unittest.TestCase):
 
     def test_a_false_predicate_orphans_the_ticket_returns_1_and_sends_nothing(self):
         wrong = vk.predicate(NONCE, self.pane_pid, self.session_id, self.created + 1)
+        self.wait_for_pane_start()
         rc, left = self.run_fenced("send-keys -t %s NEVER-SENT Enter" % self.pane, predicate=wrong)
         self.assertEqual(rc, vk.WITHHELD)
         self.assertEqual(left, ["cmd", "err", "out", "stderr", "stdout", "ticket.orphaned"],
@@ -162,7 +168,37 @@ class ScratchServer(unittest.TestCase):
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline and "LANDED" not in self.typed_text():
             time.sleep(0.1)
-        self.assertEqual(self.typed_text(), "LANDED\n", "the pane received the true send and never the false one")
+        typed = self.typed_text()
+        self.assertEqual(typed, "LANDED\n", "the pane received the true send and never the false one\n" +
+                         (self.diagnostics() if typed != "LANDED\n" else ""))
+
+    def wait_for_pane_start(self, seconds=5.0):
+        """`exec cat > typed`: the redirect makes the file, then cat takes the pane."""
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            if self.show("#{pane_current_command}") == "cat" or self.typed.exists():
+                return
+            time.sleep(0.05)
+
+    def diagnostics(self):
+        def tmux(*args):
+            r = subprocess.run(["tmux", *args], capture_output=True, text=True)
+            return (r.stdout + r.stderr).strip()
+        try:
+            os.kill(self.pane_pid, 0)
+            alive = "alive"
+        except OSError as e:
+            alive = "not alive (%s)" % e
+        typed = "size %d" % self.typed.stat().st_size if self.typed.exists() else "absent"
+        files = "\n".join("--- %s ---\n%s" % kv for kv in sorted(self.ticket_files.items()))
+        return "\n".join([
+            "tmux -V: " + tmux("-V"),
+            "wrapper ticket files (the server command is cmd):\n" + files,
+            "list-panes -a:\n" + tmux("-S", self.sock, "list-panes", "-a", "-F",
+                                       "#{pane_id} #{pane_pid} #{pane_dead} #{pane_current_command} #{pane_start_command}"),
+            "capture-pane -p:\n" + tmux("-S", self.sock, "capture-pane", "-p", "-t", self.pane),
+            "pane pid %d: %s" % (self.pane_pid, alive),
+            "typed file %s: %s" % (self.typed, typed)])
 
     def typed_text(self):
         try:

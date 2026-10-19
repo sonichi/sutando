@@ -2,6 +2,8 @@
 # Sourced first by a fake tmux: turns src/tmux-pane-keys.sh's ticket-guarded send back into argv.
 # Claims the ticket as tmux would, replays the mode exit as its own call, takes the send branch of the
 # in-mode check (a fake pane is never in a mode), then restores each key exactly as it was passed.
+# The callers pass -u (UTF-8 client) first; the fakes below match the argv after it.
+if [ "${1:-}" = -u ]; then shift; fi
 if [ "${1:-}" = -S ] && [ "${3:-}" = if-shell ]; then
   _tfu_sock="$2"
   _tfu_mode="${5%% ; *}"

@@ -280,7 +280,7 @@ class HookedServer(unittest.TestCase):
         while Path(self.bytes).read_text() != "FIRST" and time.monotonic() < deadline:
             time.sleep(0.05)
         self.assertEqual(Path(self.bytes).read_text(), "FIRST")
-        subprocess.run(["pkill", "-KILL", "-f", f"tmux -S {self.sock} if-shell"])
+        subprocess.run(["pkill", "-KILL", "-f", f"tmux -u -S {self.sock} if-shell"])
         _out, err = p.communicate(timeout=20)
         self.assertEqual(p.returncode, tmux_pane_keys.UNCERTAIN, err)
         self.assertEqual(tmux_pane_keys.fence_status(self.sock), "uncertain")
@@ -412,15 +412,15 @@ class Timeout(unittest.TestCase):
             sock = str(Path(d) / "s")
             ready = Path(d) / "ready"
             fake = Path(d) / "tmux"
-            claim = 'sh -c "$4"' if claimed else ":"
+            claim = 'sh -c "$5"' if claimed else ":"
             fake.write_text(f'''#!/bin/bash
-if [ "$3" = {phase} ] && [ ! -e '{ready}' ]; then
+if [ "$4" = {phase} ] && [ ! -e '{ready}' ]; then
   {claim}
   touch '{ready}'
   exec sleep 3
 fi
-[ "$3" = display-message ] && {{ echo 0; exit 0; }}
-[ "$3" = if-shell ] && sh -c "$4" && echo SENT
+[ "$4" = display-message ] && {{ echo 0; exit 0; }}
+[ "$4" = if-shell ] && sh -c "$5" && echo SENT
 ''')
             fake.chmod(0o755)
             args = ["--tmux", str(fake), *PY, "-S", sock, "-t", "=t:0", "--timeout", "5", "--", "Enter"]
@@ -460,8 +460,8 @@ fi
             claimed = Path(d) / "claimed"
             fake = Path(d) / "tmux"
             fake.write_text(f'''#!/bin/bash
-[ "$3" = display-message ] && {{ echo 0; exit 0; }}
-[ "$3" = if-shell ] && {{ sh -c "$4"; touch '{claimed}'; sleep 1; }}
+[ "$4" = display-message ] && {{ echo 0; exit 0; }}
+[ "$4" = if-shell ] && {{ sh -c "$5"; touch '{claimed}'; sleep 1; }}
 ''')
             fake.chmod(0o755)
             args = ["--tmux", str(fake), *PY, "-S", sock, "-t", "=t:0", "--", "Enter"]
@@ -488,8 +488,8 @@ fi
             log = Path(d) / "calls"
             fake.write_text(f'''#!/bin/bash
 echo "$*" >> '{log}'
-[ "$3" = display-message ] && {{ echo 0; exit 0; }}
-[ "$3" = if-shell ] && {{ sh -c "$4"; exec sleep 30; }}
+[ "$4" = display-message ] && {{ echo 0; exit 0; }}
+[ "$4" = if-shell ] && {{ sh -c "$5"; exec sleep 30; }}
 ''')
             fake.chmod(0o755)
             r = run("--tmux", str(fake), "-S", sock, "-t", "=t:0", "--timeout", "1", "--", "Enter")
@@ -521,7 +521,7 @@ echo "$*" >> '{log}'
             r = run("--tmux", str(fake), "-S", str(Path(d) / "s"), "-t", "=c:0", "--", "Enter")
             self.assertEqual(r.returncode, 3)
             [call] = log.read_text().splitlines()
-            self.assertRegex(call, rf"^-S {re.escape(str(Path(d) / 's'))} if-shell mv '([^']+/ticket)' '\1\.claimed' && "
+            self.assertRegex(call, rf"^-u -S {re.escape(str(Path(d) / 's'))} if-shell mv '([^']+/ticket)' '\1\.claimed' && "
                                    r'case "\$\(LC_ALL=C TZ=UTC ps -o lstart=,stat= -p \d+ 2>/dev/null\)" in ')
             self.assertIn(" copy-mode -q -t '=c:0' ; if-shell -F -t '=c:0' '#{pane_in_mode}' ", call)
             self.assertTrue(call.endswith("""'send-keys -t '"'"'=c:0'"'"' '"'"'Enter'"'"''"""), call)
@@ -569,7 +569,7 @@ esac
         with tempfile.TemporaryDirectory() as d:
             fake = Path(d) / "tmux"
             log = Path(d) / "log"
-            fake.write_text(f'#!/bin/bash\necho "$3" >> {log}\n[ "$3" = if-shell ] && sh -c "$4" && echo SENT\n')
+            fake.write_text(f'#!/bin/bash\necho "$4" >> {log}\n[ "$4" = if-shell ] && sh -c "$5" && echo SENT\n')
             fake.chmod(0o755)
             r = run("--tmux", str(fake), "-S", str(Path(d) / "s"), "-t", "=c:0", "--", "Enter")
             self.assertEqual((r.returncode, r.stdout.strip()), (0, "SENT"), r.stderr)

@@ -240,7 +240,8 @@ bridge projects it into the owner DM and owns the one accepter; a click,
 the owner's bare top-level `/exit` in the owner DM (owner tier, owner sender,
 unquoted, unforwarded, correlated to the one open card; more than one open
 refuses; task content never counts) and the local `stop --confirm` all land
-there. Lock order: progress gate → supervisor lock → one fresh `HitlStore`;
+there. A typed reply naming one of the card's buttons is not routed to it; only
+clicks, event-channel clicks and the bare owner-DM `/exit` are. Lock order: progress gate → supervisor lock → one fresh `HitlStore`;
 under all three the stall token is re-read, so progress before the acceptance
 cancels every action, and progress after it loses to the recorded phase
 (`STOPPING` or `REARMING`, written with the chosen action, revision and saga

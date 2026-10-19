@@ -42,7 +42,7 @@ TIMEOUT_FLAG="$WORK/timed-out"
 bounded() {
   local rc
   rm -f "$TIMEOUT_FLAG"
-  run_bounded "$TIMEOUT" "$TIMEOUT_FLAG" -- "$TMUX_BIN" -S "$SOCK" "$@" > "$WORK/out" 2> "$WORK/err" < /dev/null
+  run_bounded "$TIMEOUT" "$TIMEOUT_FLAG" -- "$TMUX_BIN" -u -S "$SOCK" "$@" > "$WORK/out" 2> "$WORK/err" < /dev/null
   rc=$?
   if [ -e "$TIMEOUT_FLAG" ]; then
     echo "tmux-pane-keys: $1 to $TARGET timed out after ${TIMEOUT}s" >&2
