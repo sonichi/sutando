@@ -324,7 +324,8 @@ class Clicks(Base):
                  "content": {"space.ag2.hitl.action": {"hitl_id": req.id, "expected_revision": req.revision,
                                                        "action_id": "stop", "guard": req.guard}}}
         before = tree(self.store_root)
-        for owner, actor in ((OWNER, "@guest:ag2.space"), (OWNER, OWNER + "x"), ("", OWNER), (OWNER, "")):
+        for owner, actor in ((OWNER, "@guest:ag2.space"), (OWNER, OWNER + "x"), (OWNER, OWNER.upper()), ("", OWNER),
+                             (OWNER, "")):
             claimant = rgb._ClaudeLocalClicks(owner, log=lambda *a: None)
             self.assertEqual(claimant.offer(dict(event, actor_id=actor)), ["$e2"], "consumed, never a chat task")
             self.assertTrue(claimant.last_outcome.startswith("rejected:"), (owner, actor, claimant.last_outcome))

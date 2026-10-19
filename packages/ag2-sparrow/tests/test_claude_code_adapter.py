@@ -1755,13 +1755,15 @@ class ConnectSourceRules(unittest.TestCase):
     design once named it; no review-round, PR or reviewer reference in the adapter's text."""
 
     def test_the_adapter_its_shared_modules_docs_and_tests_carry_no_review_or_person_references(self):
-        pattern = re.compile("#" + "5695|" + r"\bv3" + r"\.\d|\b[KQR][1-7](?:-[a-e])?\b|" + "|".join(
+        pattern = re.compile("#" + "5695|" + r"\bv\d+" + r"\.\d+\b|\b[BKQR][1-9](?:-[a-e])?\b|" + "|".join(
             ("Ke" + "wei", "Qing" + "yun", "Su" + "san")))
         repo = PKG.parents[1]
         files = sorted((PKG / "ag2_sparrow" / "adapters" / "claude_code").glob("*.py"))
         files += sorted((PKG / "ag2_sparrow").glob("claude_local_*.py")) + [ADAPTER / "README.md", Path(__file__)]
+        files += [Path(cm.__file__), Path(task_io.__file__)]
         files += [repo / "tests" / n for n in ("ag2-sparrow-claude-local-bridge.test.py", "ag2-sparrow-tmux-vendored.test.py",
-                                                "ag2-sparrow-claude-local-wheel.test.py", "hitl-schema.test.py")]
+                                                "ag2-sparrow-claude-local-wheel.test.py", "hitl-schema.test.py",
+                                                "holder-lock.test.py")]
         found = ["%s: %s" % (path.name, m.group(0)) for path in files for m in pattern.finditer(path.read_text())]
         self.assertEqual(found, [])
 
@@ -2353,7 +2355,7 @@ class LauncherTmux(ConnectBase):
                          rec["title_token"])
 
     def test_create_reads_the_pane_back_when_the_launchers_environment_has_no_locale(self):
-        """B1: the managed job sets no locale; a client without one escapes the TAB pane_fields splits on."""
+        """The managed job sets no locale; a client without one escapes the TAB pane_fields splits on."""
         with mock.patch.dict(os.environ):
             for name in [k for k in os.environ if k == "LANG" or k.startswith("LC_")]:
                 del os.environ[name]
@@ -3057,7 +3059,7 @@ class FakeTmux:
 
 
 class TmuxClientUtf8(unittest.TestCase):
-    """B1: every tmux client the adapter and its vendored helpers start passes -u, so a TAB in
+    """Every tmux client the adapter and its vendored helpers start passes -u, so a TAB in
     display-message output survives a process with no UTF-8 locale."""
 
     def recorder(self, seen, rc=0):

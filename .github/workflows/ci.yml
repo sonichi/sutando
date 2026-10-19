@@ -274,7 +274,7 @@ jobs:
           timeout -k 5 120 python3 skills/agent-room-ops/test_room_ops.py
           timeout -k 5 120 python3 skills/make-viral-video/scripts/test_source_tag.py
 
-      # The claude-local Mod own cases run only under the CLI engine harness (`claude plugin
+      # The claude-local Mod tests run only under the CLI engine harness (`claude plugin
       # test`), which needs no login. The CLI version is pinned so a release cannot move the harness.
       - name: Run the claude-local Mod harness tests
         env:

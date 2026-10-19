@@ -2152,7 +2152,7 @@ class HolderLockTest(unittest.TestCase):
                                 "%s: os.%s(%s) is path-based" % (fn.name, f.attr, first))
         self.assertEqual(found, held)
 
-    # ── v5.10 schema 2: the consumer, the two CAS writers, occupancy ──
+    # ── schema 2: the consumer, the two CAS writers, occupancy ──
 
     def test_a_schema_2_record_with_a_live_or_unobserved_consumer_is_held_and_a_dead_one_is_free(self):
         hpid, hstart = self.dead()
