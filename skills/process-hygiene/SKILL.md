@@ -36,7 +36,18 @@ ALL of:
 4. its working directory (`lsof -a -p PID -d cwd -Fn` on macOS, `/proc/PID/cwd`
    on Linux), as a realpath, is inside a scratchpad root matching
    `/private/tmp/claude-<uid>/*/*/scratchpad` or `/tmp/claude-<uid>/*/*/scratchpad`.
-5. the Claude Code session that owns that scratchpad has **ended** (below).
+   A root is used only when `claude-<uid>` is a real directory owned by this
+   user, nothing between it and `scratchpad` is a symlink, and the resolved root
+   sits under the resolved `claude-<uid>`; a symlinked scratchpad would otherwise
+   make its target (a repo, the workspace) a root, for reaping and for
+   `--spotlight` alike;
+5. the Claude Code session that owns that scratchpad has **ended** (below);
+6. **no process in its process group holds a server socket** — a listening TCP
+   socket or any UDP socket (`lsof -w -a -p PID -iTCP -sTCP:LISTEN -iUDP` on
+   macOS; the pid's socket inodes against `/proc/PID/net/{tcp,tcp6,udp,udp6}` on
+   Linux). A dev server, database or tunnel an agent started on purpose is spared
+   even after its session ended. If the sockets cannot be read for any member,
+   the whole group is spared.
 
 **The owning session.** A scratchpad is
 `<tmp>/claude-<uid>/<project-slug>/<session-id>/scratchpad`. A live session may
@@ -60,11 +71,26 @@ liveness record on disk; a session's main process does not hold its transcript
 open, and its task-output files are open only while a background command runs,
 so neither of those can tell an idle live session from an ended one.
 
-Never touched, whatever else holds: tmux servers, `claude` sessions (and the
-Claude Code node CLI), anything whose command names a Sutando core, worker, tmux
-socket or relay (`sutando-core`, `sutando-worker`, `sutando-tmux`,
-`sutando-relay`, `run-bridge.sh`, `remote_gateway_bridge`), Chrome/Chromium, apps
-under `/Applications`, this script and its ancestors.
+**Never touched, whatever else holds.** These are matched on the command line
+(`PROTECTED_SUBSTRINGS` and `PROTECTED_EXECUTABLES` in the script). They are
+normally safe anyway, because their cwd is not a scratchpad; the list is what
+keeps them safe when a Sutando checkout is run from a scratchpad worktree.
+
+| Matched | Why |
+|---|---|
+| executable `tmux`, `claude` (also `-claude`), `launchd` | terminal multiplexers and agent sessions own other work |
+| `claude-code` | the Claude Code node CLI |
+| `sutando-core`, `sutando-worker`, `sutando-tmux`, `sutando-relay`, `sutando-station` | the core, workers, their tmux sockets, relays and the Station |
+| `watch-tasks-stream.sh`, `task-notifier.sh` | the task watcher and the Claude and Codex task notifiers |
+| `voice-agent`, `core_heartbeat` | the voice agent and the core liveness writer |
+| `run-bridge.sh`, `remote_gateway_bridge`, `-bridge.py` | relay and channel bridges (Discord, Telegram, Slack, the remote gateway) |
+| `mcp-server`, `mcp_server`, `modelcontextprotocol`, `-mcp` | MCP servers |
+| `Google Chrome`, `Chromium`, `chrome-headless-shell`; executables `chrome`, `chromium`, `chromium-browser`, `google-chrome` | browsers, including test-automation shells |
+| an executable at `/Applications/<App>.app/Contents/MacOS/…` or the same under `~/Applications` | the user's apps (a toolchain inside an app bundle's `Contents/Developer`, such as Xcode's `swift-frontend` or its `python3`, is not an app) |
+
+Also never touched: every pid `launchctl list` reports, this script and its
+ancestors. A process outside this list that matches every rule above is a
+candidate; the list only ever adds exclusions.
 
 **Launchd jobs.** On macOS a launchd job also has PPID 1, so PPID alone cannot
 tell an orphan from a service. Two independent rules keep services out: every
@@ -126,6 +152,10 @@ that entry's `shell_command` in `<workspace>/hosts/<host-label>/crons.json` to:
 ```json
   "shell_command": "PY=\"$(bash scripts/sutando-config.sh python-bin)\" && \"$PY\" skills/process-hygiene/scripts/reap_orphans.py --reap --spotlight"
 ```
+
+`--reap` refuses a minimum age under 600 s (exit 2), so a typo cannot reap young
+work. A run holds an exclusive `flock` on `process-hygiene.lock` beside its log;
+a second run (a manual one during the cron's) prints that and does nothing.
 
 `python-bin` resolves a verified interpreter; a bare `python3` under launchd's
 `PATH` can be the Xcode Command Line Tools stub. It needs the OS-level runner

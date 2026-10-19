@@ -50,7 +50,7 @@ A fake Chrome serves /json/version on a free port and a mock agy records its arg
  27. Ownership of the reported group is revalidated before every signal: a group whose leader's start
      time changed (a reused PGID), or one that is not the launcher's own, is never signalled; start
      reports it and keeps the handshake directory.
- 28. A fake Chrome exits once the process named by FIXTURE_OWNER_PID (this test) is gone, so a test
+ 28. A fake Chrome exits once the process named by FIXTURE_OWNER_PID/START (this test) is gone, so a test
      killed before its `finally` runs leaves no fixture behind.
 
 Run: python3 tests/claude-gemini-agy-browser.test.py
@@ -67,7 +67,7 @@ import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _helpers.process_group import OWNER_LIFELINE_PY  # noqa: E402
+from _helpers.process_group import OWNER_LIFELINE_PY, owner_env  # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
 SCRIPT = REPO / "skills" / "claude-gemini" / "scripts" / "agy-browser.sh"
@@ -200,7 +200,7 @@ def main() -> None:
             MCP_STATE=str(tmp / "mcp.state"),
             AGY_LIST_COUNT=str(tmp / "agy-list.count"),
             SUTANDO_PY=sys.executable,
-            FIXTURE_OWNER_PID=str(os.getpid()),
+            **owner_env(),
         )
         args = ["--port", str(port), "--profile", str(profile), "--chrome", str(chrome)]
 
@@ -208,7 +208,7 @@ def main() -> None:
         life_port = free_port()
         orphan = subprocess.Popen([str(chrome), f"--user-data-dir={tmp / 'lifeline'}",
                                    f"--remote-debugging-port={life_port}"],
-                                  env=dict(env, FIXTURE_OWNER_PID=str(owner.pid), CHROME_LOG=str(tmp / "lifeline.log")))
+                                  env=dict(env, **owner_env(owner.pid), CHROME_LOG=str(tmp / "lifeline.log")))
         try:
             wait_up(life_port, "lifeline fake Chrome")
             owner.send_signal(signal.SIGTERM)

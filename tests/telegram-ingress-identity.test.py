@@ -21,6 +21,8 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _helpers.process_group import popen_bound  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "src"))
@@ -120,8 +122,8 @@ class Harness:
     def start(self, name, argv):
         out, err = self.logs / f"{name}.stdout", self.logs / f"{name}.stderr"
         with out.open("w") as stdout, err.open("w") as stderr:
-            proc = subprocess.Popen(argv, cwd=REPO, env=self.env, stdin=subprocess.PIPE,
-                                    stdout=stdout, stderr=stderr, text=True, start_new_session=True)
+            proc = popen_bound(argv, cwd=REPO, env=self.env, stdin=subprocess.PIPE,
+                                    stdout=stdout, stderr=stderr, text=True)
         self.processes.append(proc)
         self.witness.append({"argv": argv, "pid": proc.pid, "started": datetime.now(timezone.utc).isoformat()})
         return proc

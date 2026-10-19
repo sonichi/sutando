@@ -6,10 +6,16 @@ A process is a candidate only when ALL of these hold:
   - its parent is init (PPID 1), i.e. whatever started it is gone;
   - it has run longer than the minimum age (manifest config, default 2 h);
   - its working directory is inside an agent scratchpad,
-    <tmp>/claude-<uid>/<project>/<session>/scratchpad (realpaths compared);
-  - it is not on the never-touch list (tmux, claude sessions, Sutando core and
-    worker processes, relay bridges, launchd jobs, Chrome/Chromium, apps under
-    /Applications), and it is not this script or one of its ancestors.
+    <tmp>/claude-<uid>/<project>/<session>/scratchpad (realpaths compared; a
+    symlinked scratchpad, or one resolving outside claude-<uid>, is skipped);
+  - the Claude Code session that owns that scratchpad has ended (owner_state);
+    an owner whose state cannot be read is treated as alive;
+  - no process in its group holds a listening TCP socket or a UDP socket, so a
+    deliberate server is spared even after its session ended (unreadable counts
+    as holding one);
+  - it is not on the never-touch list (PROTECTED_SUBSTRINGS, PROTECTED_EXECUTABLES,
+    apps under Applications; see SKILL.md), launchd jobs, this script or one of
+    its ancestors.
 
 Launchd jobs also have PPID 1 on macOS. They are excluded twice: every pid
 `launchctl list` reports is skipped, and a job's working directory is `/` or the
@@ -35,11 +41,13 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import fcntl
 import glob
 import json
 import os
 import re
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -58,12 +66,14 @@ NEVER_INDEX = ".metadata_never_index"
 LOG_NAME = "process-hygiene.log"
 
 PROTECTED_SUBSTRINGS = (
-    "sutando-core", "sutando-worker", "sutando-tmux", "sutando-relay",
-    "run-bridge.sh", "remote_gateway_bridge", "remote-gateway-bridge",
+    "sutando-core", "sutando-worker", "sutando-tmux", "sutando-relay", "sutando-station",
+    "run-bridge.sh", "remote_gateway_bridge", "-bridge.py", "watch-tasks-stream.sh", "task-notifier.sh",
+    "voice-agent", "core_heartbeat", "mcp-server", "mcp_server", "modelcontextprotocol", "-mcp",
     "claude-code", "Google Chrome", "Chromium", "chrome-headless-shell",
 )
-# An installed app's own binary. A toolchain under an app bundle (Xcode's
-# swift-frontend) or a framework's Python.app is not the user's app.
+MIN_REAP_AGE_S = 600
+# An installed app's own binary. A toolchain inside a bundle (Xcode's Contents/Developer:
+# swift-frontend, its python3) or a framework's Python.app is not the user's app.
 APP_ROOTS = ("/Applications/", os.path.join(os.path.expanduser("~"), "Applications") + "/")
 APP_BINARY = re.compile(r"^[^\n]*?\.app/Contents/MacOS/[^/]*$")
 PROTECTED_EXECUTABLES = frozenset({
@@ -127,6 +137,7 @@ class Context:
     sleep: Callable[[float], None] = time.sleep
     clock: Callable[[], float] = time.monotonic
     owner_state: Callable[[str], str] = lambda root: UNKNOWN
+    listening: Callable[[int], Optional[bool]] = lambda pid: None
 
 
 def manifest_config(key: str, manifest: Path = MANIFEST) -> Optional[str]:
@@ -231,11 +242,26 @@ def launchd_pids(system: Optional[str] = None, run=subprocess.run) -> Set[int]:
 
 
 def scratchpad_roots(uid: int, tmp_bases: Sequence[str]) -> List[str]:
+    """Real scratchpad directories under each <base>/claude-<uid>. A symlink anywhere
+    below claude-<uid>, or a claude-<uid> that is a symlink or not this user's,
+    would widen the reach to its target, so such hits are skipped."""
     roots = set()
     for base in tmp_bases:
-        for hit in glob.glob(os.path.join(glob.escape(base), f"claude-{uid}", "*", "*", "scratchpad")):
-            if os.path.isdir(hit):
-                roots.add(os.path.realpath(hit))
+        top = os.path.join(base, f"claude-{uid}")
+        try:
+            st = os.lstat(top)
+        except OSError:
+            continue
+        if os.path.islink(top) or st.st_uid != uid:
+            continue
+        real_top = os.path.realpath(top)
+        for hit in glob.glob(os.path.join(glob.escape(top), "*", "*", "scratchpad")):
+            rel = os.path.relpath(hit, top).split(os.sep)
+            if any(os.path.islink(os.path.join(top, *rel[:i + 1])) for i in range(len(rel))):
+                continue
+            real = os.path.realpath(hit)
+            if os.path.isdir(real) and real.startswith(real_top + os.sep):
+                roots.add(real)
     return sorted(roots)
 
 
@@ -248,7 +274,8 @@ def protected_reason(command: str) -> Optional[str]:
         if needle in command:
             return f"never-touch ({needle})"
     for app_root in APP_ROOTS:
-        if command.startswith(app_root) and APP_BINARY.match(command.split(" -", 1)[0].rstrip()):
+        exe = command.split(" -", 1)[0].rstrip()
+        if command.startswith(app_root) and APP_BINARY.match(exe) and "/Contents/Developer/" not in exe:
             return "never-touch (an app under Applications)"
     argv0 = command.split(None, 1)[0] if command.strip() else ""
     if os.path.basename(argv0).lstrip("-") in PROTECTED_EXECUTABLES:
@@ -305,36 +332,36 @@ def owner_state(root: str, config_dirs: Sequence[str], min_age_s: float,
     slug, session = parts[-3], parts[-2]
     transcript_found = False
     sessions_seen = False
-    for cfg in config_dirs:
-        sessions = Path(cfg) / "sessions"
-        if sessions.is_dir():
-            sessions_seen = True
+    try:
+        for cfg in config_dirs:
+            sessions = os.path.join(cfg, "sessions")
             try:
-                markers = [sessions / n for n in sorted(os.listdir(sessions)) if n.endswith(".json")]
-            except OSError:
-                return UNKNOWN
-            for marker in markers:
-                try:
-                    data = json.loads(marker.read_text())
-                except (OSError, ValueError):
-                    return UNKNOWN
-                if not isinstance(data, dict) or data.get("sessionId") != session:
-                    continue
-                pid, proc_start = data.get("pid"), data.get("procStart")
-                if not isinstance(pid, int) or not isinstance(proc_start, str):
-                    return UNKNOWN
-                if start_of(pid) == " ".join(proc_start.split()):
-                    return ALIVE
-        transcript = Path(cfg) / "projects" / slug / f"{session}.jsonl"
-        try:
-            mtime = transcript.stat().st_mtime
-        except FileNotFoundError:
-            continue
-        except OSError:
-            return UNKNOWN
-        transcript_found = True
-        if now() - mtime < min_age_s:
-            return ALIVE
+                is_dir = stat.S_ISDIR(os.stat(sessions).st_mode)
+            except FileNotFoundError:
+                is_dir = False
+            if is_dir:
+                sessions_seen = True
+                for name in sorted(os.listdir(sessions)):
+                    if not name.endswith(".json"):
+                        continue
+                    with open(os.path.join(sessions, name)) as fh:
+                        data = json.load(fh)
+                    if not isinstance(data, dict) or data.get("sessionId") != session:
+                        continue
+                    pid, proc_start = data.get("pid"), data.get("procStart")
+                    if not isinstance(pid, int) or not isinstance(proc_start, str):
+                        return UNKNOWN
+                    if start_of(pid) == " ".join(proc_start.split()):
+                        return ALIVE
+            try:
+                mtime = os.stat(os.path.join(cfg, "projects", slug, f"{session}.jsonl")).st_mtime
+            except FileNotFoundError:
+                continue
+            transcript_found = True
+            if now() - mtime < min_age_s:
+                return ALIVE
+    except (OSError, ValueError):  # any probe that fails, on any Python version, is unknown
+        return UNKNOWN
     return GONE if transcript_found and sessions_seen else UNKNOWN
 
 
@@ -372,13 +399,68 @@ def classify(proc: Proc, ctx: Context) -> Tuple[Optional[str], Optional[str]]:
     return None, cwd
 
 
+def _proc_listens(pid: int, read=lambda p: Path(p).read_text(), listdir=os.listdir,
+                  readlink=os.readlink) -> Optional[bool]:
+    """Linux: a socket inode of the pid is a LISTEN tcp row or any udp row in its own net namespace."""
+    try:
+        inodes = set()
+        for fd in listdir(f"/proc/{pid}/fd"):
+            target = readlink(f"/proc/{pid}/fd/{fd}")
+            if target.startswith("socket:["):
+                inodes.add(target[8:-1])
+        if not inodes:
+            return False
+        for table in ("tcp", "tcp6", "udp", "udp6"):
+            try:
+                rows = read(f"/proc/{pid}/net/{table}").splitlines()[1:]
+            except FileNotFoundError:
+                continue
+            for row in rows:
+                cols = row.split()
+                if len(cols) > 9 and cols[9] in inodes and (table.startswith("udp") or cols[3] == "0A"):
+                    return True
+        return False
+    except OSError:
+        return None
+
+
+def listening(pid: int, system: Optional[str] = None, run=subprocess.run, linux=_proc_listens) -> Optional[bool]:
+    """True when the pid holds a listening TCP or any UDP socket; None when that cannot be read."""
+    if (system or sys.platform).startswith("linux"):
+        return linux(pid)
+    try:
+        out = run(["lsof", "-w", "-a", "-p", str(pid), "-iTCP", "-sTCP:LISTEN", "-iUDP", "-Fn"],
+                  capture_output=True, text=True, timeout=15, env={**os.environ, **C_LOCALE})
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if any(line.startswith("n") for line in out.stdout.splitlines()):
+        return True
+    return False if out.returncode in (0, 1) and not out.stderr.strip() else None
+
+
+def spare_servers(cands: Dict[int, Candidate], procs: Dict[int, Proc], ctx: Context) -> Dict[int, Candidate]:
+    """Drop every candidate whose process group has a member holding a server socket, or one unreadable."""
+    kept: Dict[int, Candidate] = {}
+    verdict: Dict[int, bool] = {}
+    for pid, cand in cands.items():
+        pgid = cand.proc.pgid
+        if pgid not in verdict:
+            members = group_members(procs, pgid) | {pid}
+            verdict[pgid] = all(ctx.listening(m) is False for m in sorted(members))
+            if not verdict[pgid]:
+                ctx.log(f"spared-server pgid={pgid} pids={','.join(str(m) for m in sorted(members))}")
+        if verdict[pgid]:
+            kept[pid] = cand
+    return kept
+
+
 def find_candidates(procs: Dict[int, Proc], ctx: Context) -> Dict[int, Candidate]:
     found: Dict[int, Candidate] = {}
     for proc in procs.values():
         reason, cwd = classify(proc, ctx)
         if reason is None and cwd is not None:
             found[proc.pid] = Candidate(proc, cwd)
-    return found
+    return spare_servers(found, procs, ctx)
 
 
 def group_members(procs: Dict[int, Proc], pgid: int) -> Set[int]:
@@ -590,22 +672,47 @@ def build_context(args: argparse.Namespace, log: Callable[[str], None], orphan_p
     return Context(uid=uid, min_age_s=min_age, grace_s=setting(args.grace, GRACE_KEY),
                    roots=scratchpad_roots(uid, bases), snapshot=snapshot, read_cwd=read_cwd, log=log,
                    protected_pids=launchd_pids(), own_pgid=os.getpgrp(), orphan_ppid=orphan_ppid,
-                   owner_state=owner)
+                   owner_state=owner, listening=listening)
+
+
+def run_lock(path: Path):
+    """An exclusive non-blocking flock beside the log, so a manual run never overlaps the cron run.
+    Returns the open file holding it, or None when another run has it."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fh = path.open("a")
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        fh.close()
+        return None
+    return fh
 
 
 def main(argv: Optional[Sequence[str]] = None, orphan_ppid: int = 1) -> int:
     args = parse_args(argv)
+    log_path = args.log or default_log_path()
     try:
-        log = file_logger(args.log or default_log_path())
+        log = file_logger(log_path)
         ctx = build_context(args, log, orphan_ppid)
     except ValueError as e:
         print(f"process-hygiene: {e}", file=sys.stderr)
         return 2
+    if args.reap and ctx.min_age_s < MIN_REAP_AGE_S:
+        print(f"process-hygiene: --reap needs a minimum age of at least {MIN_REAP_AGE_S} s, "
+              f"got {ctx.min_age_s:g}", file=sys.stderr)
+        return 2
+    lock = run_lock(log_path.with_name(LOG_NAME.replace(".log", ".lock")))
+    if lock is None:
+        print("process-hygiene: another run holds the lock; nothing done")
+        log("skipped another run holds the lock")
+        return 0
     try:
         run(args, ctx)
     except Exception as e:  # a cron job reports and exits 0; it never retries in a loop
         print(f"process-hygiene: run failed: {e!r}")
         log(f"run-failed err={e!r}")
+    finally:
+        lock.close()
     return 0
 
 

@@ -8,7 +8,7 @@ A teardown runs only when the test gets to run it. `bind_to_test` covers the
 rest: a watchdog holding the read end of a pipe kills every still-bound group
 when this test process exits, however it exits (return, SIGTERM, SIGKILL).
 Fixtures started indirectly, whose group the test never learns, embed
-`OWNER_LIFELINE_PY` and exit once the pid in FIXTURE_OWNER_PID is gone.
+`OWNER_LIFELINE_PY` and exit once their owner (`owner_env`: pid and start time) is gone.
 """
 from __future__ import annotations
 
@@ -138,32 +138,29 @@ def popen_bound(argv, **kw) -> subprocess.Popen:
     return p
 
 
-def run_in_own_group(argv, timeout: float, **kw) -> subprocess.CompletedProcess:
-    """subprocess.run(capture_output=True, text=True) whose timeout kills the whole
-    group: a timeout in subprocess.run kills the direct child only, and a
-    grandchild (a compiler's frontend, a shell's background job) outlives it."""
-    p = popen_bound(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, **kw)
-    try:
-        out, err = p.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        kill_group(p.pid)
-        p.communicate()
-        raise subprocess.TimeoutExpired(argv, timeout)
-    finally:
-        kill_group(p.pid)
-        unbind(p.pid)
-    return subprocess.CompletedProcess(argv, p.returncode, out, err)
-
-
 # Embedded in a Python fixture that the test starts only indirectly.
+# The system ps by path: a fixture may run under a test's PATH with a stubbed ps.
 OWNER_LIFELINE_PY = """
-import os as _os, threading as _threading, time as _time
-def _fixture_lifeline(owner=int(_os.environ.get("FIXTURE_OWNER_PID") or 0)):
+import os as _os, subprocess as _sp, threading as _threading, time as _time
+def _fixture_lifeline(owner=int(_os.environ.get("FIXTURE_OWNER_PID") or 0),
+                      start=_os.environ.get("FIXTURE_OWNER_START", "")):
     while owner:
         _time.sleep(0.5)
         try:
             _os.kill(owner, 0)
         except OSError:
             _os._exit(0)
+        if start:
+            ps = _sp.run(["/bin/ps", "-o", "lstart=", "-p", str(owner)], capture_output=True, text=True,
+                         env=dict(_os.environ, LC_ALL="C"))
+            if ps.returncode == 0 and " ".join(ps.stdout.split()) != start:
+                _os._exit(0)
 _threading.Thread(target=_fixture_lifeline, daemon=True).start()
 """
+
+
+def owner_env(pid: "int | None" = None) -> dict:
+    """The environment that ties an OWNER_LIFELINE_PY fixture to `pid` (default: this process),
+    by pid and start time, so a recycled owner pid does not keep the fixture alive."""
+    pid = os.getpid() if pid is None else pid
+    return {"FIXTURE_OWNER_PID": str(pid), "FIXTURE_OWNER_START": start_time(pid)}

@@ -5,8 +5,8 @@ Each case runs a stand-in "test" process that starts a fixture group, binds it
 with tests/_helpers/process_group.py and then exits normally, is SIGTERMed or
 is SIGKILLed. The fixture must be gone afterwards; an unbound group, and a
 group whose leader pid was recycled, must not be touched. Also pinned:
-run_in_own_group's timeout takes the grandchild that subprocess.run's would
-leave behind, and OWNER_LIFELINE_PY ends a fixture once its owner is gone.
+OWNER_LIFELINE_PY ends a fixture once its owner is gone, or once the owner pid
+belongs to a process with another start time.
 
 Run: python3 tests/process-group-binding.test.py
 """
@@ -114,48 +114,12 @@ class BoundGroupDiesWithTest(unittest.TestCase):
         self.assertTrue(alive(pid), "a group whose leader start time differs was signalled")
 
 
-class RunInOwnGroup(unittest.TestCase):
-    def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp(prefix="pg-run-"))
-
-    def _kill_if_mine(self, pid, lstart):
-        if lstart and pg.start_time(pid) == lstart:
-            os.kill(pid, signal.SIGKILL)
-
-    def test_timeout_takes_the_grandchild(self):
-        out = self.tmp / "grandchild"
-        with self.assertRaises(subprocess.TimeoutExpired):
-            pg.run_in_own_group(["bash", "-c", f'sleep 300 >/dev/null 2>&1 & echo $! > "{out}"; wait'],
-                                timeout=1.0)
-        pid = int(wait_file(out))
-        self.addCleanup(self._kill_if_mine, pid, pg.start_time(pid))
-        self.assertTrue(wait_gone(pid), "the grandchild survived the timeout")
-
-    def test_timeout_returns_promptly_when_the_grandchild_holds_the_pipe(self):
-        out = self.tmp / "grandchild"
-        started = time.monotonic()
-        with self.assertRaises(subprocess.TimeoutExpired):
-            pg.run_in_own_group(["bash", "-c", f'sleep 60 & echo $! > "{out}"; wait'], timeout=1.0)
-        self.assertLess(time.monotonic() - started, 15, "the timeout waited on the grandchild's pipe")
-        pid = int(wait_file(out))
-        self.addCleanup(self._kill_if_mine, pid, pg.start_time(pid))
-        self.assertTrue(wait_gone(pid), "the grandchild survived the timeout")
-
-    def test_background_child_of_a_finished_run_is_taken(self):
-        out = self.tmp / "grandchild"
-        r = pg.run_in_own_group(["bash", "-c", f'sleep 300 >/dev/null 2>&1 & echo $! > "{out}"; echo done'], timeout=30)
-        self.assertEqual((r.returncode, r.stdout.strip()), (0, "done"))
-        pid = int(wait_file(out))
-        self.addCleanup(self._kill_if_mine, pid, pg.start_time(pid))
-        self.assertTrue(wait_gone(pid), "a background child outlived the finished run")
-
-
 class OwnerLifeline(unittest.TestCase):
     def test_fixture_exits_when_its_owner_is_sigtermed(self):
         owner = subprocess.Popen(["sleep", "300"])
         fixture = subprocess.Popen(
             [sys.executable, "-c", pg.OWNER_LIFELINE_PY + "\nimport time\ntime.sleep(300)\n"],
-            env=dict(os.environ, FIXTURE_OWNER_PID=str(owner.pid)))
+            env=dict(os.environ, **pg.owner_env(owner.pid)))
         try:
             time.sleep(1.0)
             self.assertIsNone(fixture.poll(), "the fixture exited while its owner was alive")
@@ -167,6 +131,27 @@ class OwnerLifeline(unittest.TestCase):
                 if p.poll() is None:
                     p.kill()
                     p.wait()
+
+
+    def test_fixture_exits_when_the_owner_pid_has_another_start_time(self):
+        owner = subprocess.Popen(["sleep", "300"])
+        env = dict(os.environ, FIXTURE_OWNER_PID=str(owner.pid), FIXTURE_OWNER_START="Thu Jan 1 00:00:00 1970")
+        fixture = subprocess.Popen([sys.executable, "-c", pg.OWNER_LIFELINE_PY + "\nimport time\ntime.sleep(300)\n"],
+                                   env=env)
+        try:
+            self.assertEqual(fixture.wait(timeout=10), 0, "a recycled owner pid kept the fixture alive")
+            self.assertIsNone(owner.poll(), "the owner itself must still be running for this case")
+        finally:
+            for p in (owner, fixture):
+                if p.poll() is None:
+                    p.kill()
+                    p.wait()
+
+    def test_owner_env_records_pid_and_start_time(self):
+        env = pg.owner_env()
+        self.assertEqual(env["FIXTURE_OWNER_PID"], str(os.getpid()))
+        self.assertEqual(env["FIXTURE_OWNER_START"], pg.start_time(os.getpid()))
+        self.assertTrue(env["FIXTURE_OWNER_START"])
 
 
 if __name__ == "__main__":

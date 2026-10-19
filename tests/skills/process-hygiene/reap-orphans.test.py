@@ -74,7 +74,7 @@ class Recorder:
         base = dict(uid=UID, min_age_s=7200, grace_s=1.0, roots=[ROOT], snapshot=self.snapshot,
                     read_cwd=lambda pid: self.cwds.get(pid), log=self.lines.append, kill=self.kill,
                     killpg=self.killpg, sleep=self.sleep, clock=lambda: self.now,
-                    owner_state=lambda root: ro.GONE)
+                    owner_state=lambda root: ro.GONE, listening=lambda pid: False)
         base.update(kw)
         return ro.Context(**base)
 
@@ -164,16 +164,65 @@ class Parsing(unittest.TestCase):
     def test_roots_and_inside(self):
         base = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, base, True)
-        good = base / f"claude-{UID}" / "proj" / "sess" / "scratchpad"
+        me = os.getuid()
+        good = base / f"claude-{me}" / "proj" / "sess" / "scratchpad"
         good.mkdir(parents=True)
-        (base / f"claude-{UID}" / "proj" / "other").mkdir()
-        (base / f"claude-{UID + 1}" / "proj" / "sess" / "scratchpad").mkdir(parents=True)
-        self.assertEqual(ro.scratchpad_roots(UID, [str(base), str(base)]), [os.path.realpath(good)])
+        (base / f"claude-{me}" / "proj" / "other").mkdir()
+        (base / f"claude-{me + 1}" / "proj" / "sess" / "scratchpad").mkdir(parents=True)
+        self.assertEqual(ro.scratchpad_roots(me, [str(base), str(base)]), [os.path.realpath(good)])
+        self.assertEqual(ro.scratchpad_roots(me + 1, [str(base)]), [], "a claude-<uid> of another owner")
         root = os.path.realpath(good)
         self.assertTrue(ro.inside(root, [root]))
         self.assertTrue(ro.inside(root + "/a/b", [root]))
         self.assertFalse(ro.inside(root + "2/a", [root]))
         self.assertFalse(ro.inside(str(base), [root]))
+
+
+class SymlinkedRoots(unittest.TestCase):
+    """A symlink below claude-<uid> must never make its target a root, nor a Spotlight target."""
+
+    def setUp(self):
+        self.base = Path(tempfile.mkdtemp()).resolve()
+        self.addCleanup(shutil.rmtree, self.base, True)
+        self.me = os.getuid()
+        self.top = self.base / f"claude-{self.me}"
+        self.good = self.top / "proj" / "sess" / "scratchpad"
+        self.good.mkdir(parents=True)
+        self.outside = self.base / "repo"
+        (self.outside / "sess" / "scratchpad").mkdir(parents=True)
+
+    def roots(self):
+        return ro.scratchpad_roots(self.me, [str(self.base)])
+
+    def test_a_symlinked_scratchpad_is_skipped(self):
+        (self.top / "proj" / "linked").mkdir()
+        (self.top / "proj" / "linked" / "scratchpad").symlink_to(self.outside)
+        self.assertEqual(self.roots(), [str(self.good)])
+
+    def test_a_scratchpad_symlinked_to_a_plain_dir_inside_claude_uid_is_skipped(self):
+        data = self.top / "proj" / "sess" / "data"
+        data.mkdir()
+        (self.top / "proj" / "other").mkdir()
+        (self.top / "proj" / "other" / "scratchpad").symlink_to(data)
+        self.assertEqual(self.roots(), [str(self.good)], "a symlink must not make a non-scratchpad dir a root")
+
+    def test_a_symlinked_session_or_project_dir_is_skipped(self):
+        (self.top / "proj" / "other").symlink_to(self.outside / "sess")
+        (self.top / "elsewhere").symlink_to(self.outside)
+        self.assertEqual(self.roots(), [str(self.good)])
+
+    def test_a_symlinked_claude_uid_dir_is_skipped(self):
+        shutil.rmtree(self.top)
+        (self.outside / "proj" / "sess" / "scratchpad").mkdir(parents=True)
+        self.top.symlink_to(self.outside)
+        self.assertEqual(self.roots(), [])
+
+    def test_spotlight_never_writes_outside_claude_uid(self):
+        (self.top / "proj" / "linked").mkdir()
+        (self.top / "proj" / "linked" / "scratchpad").symlink_to(self.outside / "sess" / "scratchpad")
+        ro.ensure_never_index(self.roots(), lambda line: None)
+        written = sorted(str(p) for p in self.base.rglob(ro.NEVER_INDEX))
+        self.assertEqual(written, sorted([str(self.good / ro.NEVER_INDEX), str(self.top / ro.NEVER_INDEX)]))
 
 
 class Rules(unittest.TestCase):
@@ -218,6 +267,12 @@ class Rules(unittest.TestCase):
                         "/Applications/Foo Bar.app/Contents/MacOS/Foo Bar --flag",
                         os.path.expanduser("~") + "/Applications/Own.app/Contents/MacOS/Own",
                         "/x/ms-playwright/chrome-headless-shell --headless",
+                        "bash src/watch-tasks-stream.sh /w/tasks --role session",
+                        "bash src/agent/claude/cli/claude-task-notifier.sh", "node src/voice-agent.ts",
+                        "python3 src/discord-bridge.py", "python3 src/telegram-bridge.py",
+                        "python3 src/core_heartbeat.py", "node /x/@modelcontextprotocol/server-fs/dist/index.js",
+                        "npx -y chrome-devtools-mcp@1 --browserUrl http://127.0.0.1:9222",
+                        "python3 -m my_mcp_server", "node mcp-server.js", "sutando-station serve",
                         "/x/Google Chrome Helper --type=gpu", "/x/Chromium.app/Contents/MacOS/Chromium",
                         "/usr/bin/chromium-browser --headless", "google-chrome --headless", "launchd"):
             with self.subTest(command=command):
@@ -226,6 +281,8 @@ class Rules(unittest.TestCase):
                         "node --test tests/a.test.mjs", "swift -interpret x.swift", "fswatch -0 /tmp/x",
                         "/opt/homebrew/Frameworks/Python.framework/Resources/Python.app/Contents/MacOS/Python -u a.py",
                         "/Applications/Xcode.app/Contents/Developer/Toolchains/X/usr/bin/swift-frontend -interpret a",
+                        "/Applications/Xcode.app/Contents/Developer/Library/Frameworks/Python3.framework/Versions/3.9/"
+                        "Resources/Python.app/Contents/MacOS/Python -c x",
                         "/tmp/x/Applications/Fake.app/Contents/MacOS/Fake"):
             with self.subTest(command=command):
                 self.assertIsNone(self.reason(P(10, command=command)), command)
@@ -300,8 +357,44 @@ class OwnerState(unittest.TestCase):
             self.skipTest("running as a user that can read a mode-000 directory")
         self.assertEqual(self.state(), ro.UNKNOWN)
 
+    def refuse(self, suffix):
+        real = os.stat
+
+        def fake(path, *a, **kw):
+            if str(path).endswith(suffix):
+                raise PermissionError("EACCES")
+            return real(path, *a, **kw)
+        return mock.patch.object(ro.os, "stat", side_effect=fake)
+
     def test_unstattable_transcript_is_unknown(self):
-        with mock.patch.object(Path, "stat", side_effect=PermissionError("EACCES")):
+        with self.refuse(".jsonl"):
+            self.assertEqual(self.state(), ro.UNKNOWN)
+
+    def test_a_refused_sessions_probe_is_unknown_even_when_another_config_dir_reads_gone(self):
+        live = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, live, True)
+        (live / "sessions").mkdir()
+        (live / "sessions" / "77.json").write_text(json.dumps({"pid": 77, "sessionId": "sess",
+                                                               "procStart": self.START}))
+        real = os.stat
+
+        def fake(path, *a, **kw):
+            if str(path) == str(live / "sessions"):
+                raise PermissionError("EACCES")
+            return real(path, *a, **kw)
+        with mock.patch.object(ro.os, "stat", side_effect=fake):
+            state = ro.owner_state(self.root, [str(live), str(self.cfg)], 7200,
+                                   start_of=lambda pid: self.START, now=lambda: 1000 + 10_000)
+        self.assertEqual(state, ro.UNKNOWN, "a sessions/ dir that cannot be probed is not an absent one")
+
+    def test_a_sessions_dir_probe_that_raises_is_unknown(self):
+        self.marker()
+        with self.refuse("sessions"):
+            self.assertEqual(self.state(start_of=lambda pid: self.START), ro.UNKNOWN,
+                             "a raising directory probe must read unknown on every Python version")
+        with mock.patch.object(ro.os, "listdir", side_effect=PermissionError("EACCES")):
+            self.assertEqual(self.state(), ro.UNKNOWN)
+        with mock.patch("builtins.open", side_effect=PermissionError("EACCES")):
             self.assertEqual(self.state(), ro.UNKNOWN)
 
     def test_a_path_that_is_not_a_scratchpad_is_unknown(self):
@@ -330,6 +423,56 @@ class OwnerState(unittest.TestCase):
         self.assertIn(os.path.realpath(self.cfg), dirs)
         self.assertTrue(all(os.path.isdir(d) for d in dirs))
         self.assertEqual(len(dirs), len(set(dirs)))
+
+
+class Servers(unittest.TestCase):
+    def test_lsof_reader(self):
+        cp = subprocess.CompletedProcess
+        hit = mock.Mock(return_value=cp([], 0, "p7\nf3\nnlocalhost:5393\n", ""))
+        self.assertTrue(ro.listening(7, "darwin", run=hit))
+        argv = hit.call_args.args[0]
+        self.assertIn("-sTCP:LISTEN", argv)
+        self.assertIn("-iUDP", argv)
+        self.assertIs(ro.listening(7, "darwin", run=mock.Mock(return_value=cp([], 1, "", ""))), False)
+        self.assertIsNone(ro.listening(7, "darwin", run=mock.Mock(return_value=cp([], 1, "", "lsof: oops"))))
+        self.assertIsNone(ro.listening(7, "darwin", run=mock.Mock(return_value=cp([], 2, "", ""))))
+        self.assertIsNone(ro.listening(7, "darwin", run=mock.Mock(side_effect=OSError)))
+        self.assertIs(ro.listening(7, "linux", linux=lambda pid: True), True)
+
+    def test_proc_reader(self):
+        header = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n"
+
+        def row(state, inode):
+            return f"   0: 0100007F:1F90 00000000:0000 {state} 00000000:00000000 00:00000000 00000000 501 0 {inode}\n"
+
+        def reader(tables):
+            def read(path):
+                name = path.rsplit("/", 1)[1]
+                if name not in tables:
+                    raise FileNotFoundError(path)
+                return header + tables[name]
+            return read
+
+        fds = dict(listdir=lambda p: ["3", "4"],
+                   readlink=lambda p: "socket:[555]" if p.endswith("/3") else "/dev/null")
+        self.assertTrue(ro._proc_listens(9, read=reader({"tcp": row("0A", 555)}), **fds))
+        self.assertFalse(ro._proc_listens(9, read=reader({"tcp": row("01", 555)}), **fds),
+                         "an established connection is not a server")
+        self.assertTrue(ro._proc_listens(9, read=reader({"udp6": row("07", 555)}), **fds))
+        self.assertFalse(ro._proc_listens(9, read=reader({"tcp": row("0A", 999)}), **fds))
+        self.assertFalse(ro._proc_listens(9, read=reader({}), listdir=lambda p: ["1"],
+                                          readlink=lambda p: "/dev/null"))
+        self.assertIsNone(ro._proc_listens(9, listdir=mock.Mock(side_effect=PermissionError)))
+
+    def test_a_listening_or_unreadable_member_spares_the_whole_group(self):
+        procs = {20: P(20, pgid=20), 21: P(21, pgid=20), 30: P(30, pgid=30), 40: P(40, pgid=40),
+                 41: P(41, ppid=40, pgid=40, age=5)}
+        cands = {20: cand(procs[20]), 21: cand(procs[21]), 30: cand(procs[30]), 40: cand(procs[40])}
+        states = {20: False, 21: True, 30: False, 40: False, 41: None}
+        rec = Recorder([{}], {})
+        kept = ro.spare_servers(cands, procs, rec.ctx(listening=states.get))
+        self.assertEqual(sorted(kept), [30], "a group with a server, or an unreadable member, must be spared")
+        self.assertEqual(len([line for line in rec.lines if line.startswith("spared-server")]), 2)
 
 
 class Planning(unittest.TestCase):
@@ -677,6 +820,23 @@ class RealOrphans(unittest.TestCase):
         time.sleep(0.3)
         self.assertTrue(alive(orphan), "an orphan whose owner could not be read was stopped")
 
+    def test_a_server_of_an_ended_session_survives(self):
+        code = ("import socket, time\ns = socket.socket()\ns.bind(('127.0.0.1', 0))\ns.listen()\n"
+                "time.sleep(660)\n")
+        server = self.orphan(self.root, sys.executable, "-c", code)
+        plain = self.orphan(self.root, "sleep", "661")
+        deadline = time.monotonic() + 10
+        while ro.listening(server) is not True and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertIs(ro.listening(server), True, "the fixture never listened; the case proves nothing")
+        time.sleep(self.MIN_AGE + 1.5)
+        counts, out = self.run_reaper("--reap")
+        self.assertTrue(self.wait_gone(plain), "the plain orphan beside it should still be reaped")
+        self.assertEqual(counts["terminated"], 1, out)
+        time.sleep(0.3)
+        self.assertTrue(alive(server), "a listening server was stopped")
+        self.assertIn("spared-server", self.log.read_text())
+
     def test_main_reports_and_exits_zero(self):
         self.orphan(self.root, "sleep", "640")
         out = io.StringIO()
@@ -716,6 +876,35 @@ class Main(unittest.TestCase):
             with self.assertRaises(SystemExit) as cm:
                 ro.main(["--bogus"])
         self.assertEqual(cm.exception.code, 2)
+
+    def test_reap_refuses_a_minimum_age_under_the_floor(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), mock.patch.object(ro, "run") as run:
+            self.assertEqual(ro.main(["--reap", "--min-age", "599", "--tmp-base", str(self.tmp),
+                                      "--log", str(self.log)]), 2)
+            run.assert_not_called()
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(ro.main(["--reap", "--min-age", "600", "--tmp-base", str(self.tmp),
+                                          "--log", str(self.log)]), 0)
+            run.assert_called_once()
+            self.assertEqual(ro.main(["--min-age", "5", "--tmp-base", str(self.tmp), "--log", str(self.log)]), 0,
+                             "report mode has no floor")
+        self.assertIn("at least 600", err.getvalue())
+
+    def test_a_second_run_while_one_holds_the_lock_does_nothing(self):
+        held = ro.run_lock(self.tmp / "process-hygiene.lock")
+        self.assertIsNotNone(held)
+        self.addCleanup(held.close)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), mock.patch.object(ro, "run") as run:
+            self.assertEqual(ro.main(["--tmp-base", str(self.tmp), "--log", str(self.log)]), 0)
+        run.assert_not_called()
+        self.assertIn("another run holds the lock", out.getvalue())
+        held.close()
+        with contextlib.redirect_stdout(io.StringIO()), mock.patch.object(ro, "run") as run:
+            ro.main(["--tmp-base", str(self.tmp), "--log", str(self.log)])
+        run.assert_called_once()
 
     def test_a_failing_run_still_exits_zero_and_logs(self):
         out = io.StringIO()

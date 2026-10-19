@@ -26,7 +26,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _helpers.process_group import popen_bound, unbind  # noqa: E402
+from _helpers.process_group import kill_group, popen_bound, unbind  # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
 FAILURES: list[str] = []
@@ -116,6 +116,7 @@ def stop(p):
         p.wait(timeout=5)
     except Exception:
         pass
+    kill_group(p.pid)
     unbind(p.pid)
 
 

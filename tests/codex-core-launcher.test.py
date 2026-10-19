@@ -12,6 +12,8 @@ import time
 import unittest
 import pty
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _helpers.process_group import popen_bound  # noqa: E402
 
 REAL_REPO = Path(os.environ.get(
     "SUTANDO_TEST_REPO", Path(__file__).resolve().parents[1]
@@ -1015,13 +1017,12 @@ exit 0
             SUTANDO_NOTIFIER_CORE_READY_TIMEOUT="1",
         )
         notifier = self.root / "src/agent/codex/cli/task-notifier.sh"
-        process = subprocess.Popen(
+        process = popen_bound(
             ["/bin/bash", str(notifier)],
             env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            start_new_session=True,
         )
         try:
             stdout, stderr = process.communicate(timeout=8)
@@ -1784,13 +1785,12 @@ exit 0
             SUTANDO_NOTIFIER_COMPLETION_TIMEOUT="2",
         )
         script = self.root / "src/agent/codex/cli/task-notifier.sh"
-        process = subprocess.Popen(
+        process = popen_bound(
             ["/bin/bash", str(script)],
             env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            start_new_session=True,
         )
         try:
             with self.assertRaises(subprocess.TimeoutExpired):
@@ -1847,13 +1847,12 @@ exit 0
             SUTANDO_NOTIFIER_COMPLETION_TIMEOUT="2",
         )
         script = self.root / "src/agent/codex/cli/task-notifier.sh"
-        process = subprocess.Popen(
+        process = popen_bound(
             ["/bin/bash", str(script)],
             env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            start_new_session=True,
         )
         try:
             with self.assertRaises(subprocess.TimeoutExpired):
@@ -1915,13 +1914,12 @@ exit 0
             SUTANDO_NOTIFIER_COMPOSER_READY_TIMEOUT="1",
         )
         script = self.root / "src/agent/codex/cli/task-notifier.sh"
-        process = subprocess.Popen(
+        process = popen_bound(
             ["/bin/bash", str(script)],
             env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            start_new_session=True,
         )
         try:
             with self.assertRaises(subprocess.TimeoutExpired):
@@ -1970,10 +1968,9 @@ exit 0
             SUTANDO_NOTIFIER_COMPOSER_READY_TIMEOUT="1",
         )
         script = self.root / "src/agent/codex/cli/task-notifier.sh"
-        process = subprocess.Popen(
+        process = popen_bound(
             ["/bin/bash", str(script)], env=env,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-            start_new_session=True,
         )
         try:
             with self.assertRaises(subprocess.TimeoutExpired):

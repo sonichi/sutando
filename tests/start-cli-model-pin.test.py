@@ -7,6 +7,8 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _helpers.process_group import popen_bound  # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
 SCRIPT = REPO / "src" / "agent" / "claude" / "cli" / "start-cli.sh"
@@ -137,9 +139,9 @@ def _run_launcher(env: dict, log: Path, timeout: int = 45) -> "tuple[str, bool]"
     so any backgrounded descendant inheriting stdout blocks it until timeout."""
     import signal
     with open(log, "w") as fh:
-        proc = subprocess.Popen(
+        proc = popen_bound(
             ["/bin/bash", str(SCRIPT)], env=env, stdin=subprocess.DEVNULL,
-            stdout=fh, stderr=subprocess.STDOUT, text=True, start_new_session=True)
+            stdout=fh, stderr=subprocess.STDOUT, text=True)
         timed_out = False
         try:
             proc.wait(timeout=timeout)
