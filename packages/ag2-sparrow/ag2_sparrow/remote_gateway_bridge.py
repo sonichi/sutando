@@ -1845,6 +1845,19 @@ def _hitl_control_body(hitl_out) -> str:
     return "[no-send]"
 
 
+def _click_owner_problem(owner: str, actor: str, attested_tier) -> str:
+    """'' when a card click is the owner's, else why not. Fails closed: the actor must equal the configured
+    owner exactly; an attested tier, when present, must also be owner; the local tier cap always applies."""
+    if not owner:
+        return "no owner is configured, so no card click is the owner's"
+    if actor != owner:
+        return "only the owner may act on this card"
+    claimed = _normalized_tier(attested_tier) if attested_tier else "owner"
+    if _tier_for(actor, claimed) != "owner":
+        return "the click is not at owner tier"
+    return ""
+
+
 class _ClaudeLocalClicks:
     """An event-channel click on a claude-local card, claimed ahead of the default store's handler so
     it reaches the adapter's accepter and never the default store or taskify."""
@@ -1874,11 +1887,9 @@ class _ClaudeLocalClicks:
             try:
                 reply = ActionReply.from_wire(dict(self._payload(event), room=str(event.get("room_id") or ""),
                                                    sender=actor))
-                # The relay's predicate: the owner by id and by tier (an attested tier when the event has
-                # one; the actor itself is broker-attested), always under the local cap.
-                tier = _tier_for(actor, _normalized_tier(event.get("access_tier") or "owner"))
-                self.last_outcome = accepter.accept(reply, state_dir=_STATE, log=self.log,
-                                                    owner_ok=bool(self.owner) and actor == self.owner and tier == "owner")
+                problem = _click_owner_problem(self.owner, actor, event.get("access_tier"))
+                self.last_outcome = (f"rejected:{problem}" if problem else
+                                     accepter.accept(reply, state_dir=_STATE, log=self.log, owner_ok=True))
             except MalformedActionError as e:
                 self.last_outcome = f"rejected:{e}"
             except Exception as e:  # noqa: BLE001 — a broken click must not stall the drain

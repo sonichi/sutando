@@ -288,6 +288,22 @@ class Clicks(Base):
         self.assertEqual(claimant.offer(event), ["$e1"])
         self.assertEqual(claimant.last_outcome, "applied")
 
+    def test_a_click_with_no_attested_tier_is_the_owners_only_by_exact_identity(self):
+        req = self.store().load(self.req.id)
+        event = {"type": "message.created", "event_id": "$e2", "room_id": DM,
+                 "content": {"space.ag2.hitl.action": {"hitl_id": req.id, "expected_revision": req.revision,
+                                                       "action_id": "stop", "guard": req.guard}}}
+        before = tree(self.store_root)
+        for owner, actor in ((OWNER, "@guest:ag2.space"), (OWNER, OWNER + "x"), ("", OWNER), (OWNER, "")):
+            claimant = rgb._ClaudeLocalClicks(owner, log=lambda *a: None)
+            self.assertEqual(claimant.offer(dict(event, actor_id=actor)), ["$e2"], "consumed, never a chat task")
+            self.assertTrue(claimant.last_outcome.startswith("rejected:"), (owner, actor, claimant.last_outcome))
+            self.assertEqual(tree(self.store_root), before, "no tier and not the owner: nothing written")
+        self.assertIn("no owner is configured", rgb._click_owner_problem("", OWNER, None))
+        claimant = rgb._ClaudeLocalClicks(OWNER, log=lambda *a: None)
+        self.assertEqual(claimant.offer(dict(event, actor_id=OWNER)), ["$e2"])
+        self.assertEqual(claimant.last_outcome, "applied", "no tier, the configured owner exactly: accepted")
+
 
 if __name__ == "__main__":
     try:
