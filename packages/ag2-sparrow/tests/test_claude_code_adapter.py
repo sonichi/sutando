@@ -86,8 +86,13 @@ class PluginShape(unittest.TestCase):
         for path in sorted(p for p in ADAPTER.rglob("*") if p.is_file()):
             self.assertIsNone(HOST_PATH_RE.search(path.read_text(errors="replace")), path)
 
-    def test_mod_tests_exist_for_the_claude_harness(self):
+    def test_mod_tests_exist_for_the_claude_harness_and_ci_runs_them(self):
         self.assertTrue(list((MOD / "tests").glob("*.test.ts")))
+        ci = PKG.parents[1] / ".github" / "workflows" / "ci.yml"
+        if ci.exists():         # the repo checkout, not a standalone package
+            steps = [ln.strip() for ln in ci.read_text().splitlines() if not ln.strip().startswith("#")]
+            self.assertTrue(any(ln.endswith("plugin test ag2space-inbox") and "claude" in ln for ln in steps),
+                            "CI runs the Mod's cases under the CLI's harness")
 
     def test_pinned_non_owner_note_is_the_shared_owners(self):
         mod = re.search(r"^const NON_OWNER_NOTE = `(.*)`$", REGISTER.read_text(), re.M).group(1)
