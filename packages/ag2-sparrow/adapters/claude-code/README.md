@@ -51,9 +51,16 @@ inode is not `AG2_INBOX_INODE`, the `tasks` directory `hold` opened from the
 held root. While intake is stopped by a session-id change, a task that arrives
 is never left in silence: `inbox interrupt` claims it and answers it through
 the lifecycle with the interrupted answer (or the owner-only refusal for a
-sender the policy does not admit), once, without a call. A publication that
-parks, or a CLI that did not run, is retried on later ticks (the next call
-publishes the staged answer) until a result exists or the claim is terminal. Task I/O is relative to that cwd (`AG2_INBOX_DIR=.`,
+sender the policy does not admit), once, without a call. Terminal retires;
+everything else retries with backoff: whatever happened on the way, the reply
+is read from the disposition afterwards, `resolved` only when the claim is
+SETTLED or a terminal result exists, else `retry` with the reason, and the Mod
+retires a task only on a `resolved` reply (any other reply, exit code or a CLI
+that did not run keeps it; the next call publishes a staged answer), backing off 1, 2, 4 ... ticks
+up to 60, with a log line on the first failure, each new delay and the
+success. One still failing after 300 s is marked `stuck` in the plugin record:
+`verify` fails its `interrupts` row naming it and the launcher raises the
+needs-attention card, both cleared once the answer lands. Task I/O is relative to that cwd (`AG2_INBOX_DIR=.`,
 `AG2_RESULTS_DIR=../results`).
 
 The adapter lives beside the Python package on purpose, not inside it: it is a

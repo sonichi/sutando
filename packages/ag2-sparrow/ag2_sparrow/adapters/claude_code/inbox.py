@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 from ... import connect_common as cm, task_io, task_lifecycle as lifecycle
@@ -163,27 +164,50 @@ def claim(root, task_id) -> dict:
                    {"attempt": attempt})
 
 
-def interrupt(root, task_id, detail) -> dict:
-    """A task this session can no longer take (intake stopped for good): claimed and answered as
-    interrupted without a call, or the owner-only refusal for one the policy does not admit."""
-    lc = _lifecycle(root)
-    with records.flocked(records.claims_lock_path(root)):
+def resolved(lc, task_id) -> "tuple[bool, str]":
+    """Whether the task is resolved, read from its disposition alone: the claim SETTLED, or a result
+    already terminal in results/ (ready, archived, quarantined). Anything unreadable is unresolved."""
+    try:
         rec = lc.claims.load(task_id)
-        kind = None
-        if rec and rec.get("phase") in (lifecycle.RESULT_STAGED, lifecycle.PUBLISHED):
-            # An earlier interrupt staged its answer but could not publish it: publish that one, again.
-            kind = str((rec.get("outcome") or {}).get("detail") or "").startswith("intake stopped")
-            outcome = lc.publish_and_settle(task_id)
-        else:
-            verdict, state = lc.decide(task_id)
-            if verdict != "call":
-                raise Refused("%s is %s; only ABSENT is answered" % (task_id, state))
-            kind, _headers, why = admit(root, task_id, allow_non_owner())
-            body, reason = (INTERRUPTED_BODY, "intake stopped: %s" % detail) if kind else (task_io.NON_OWNER_REFUSED, why)
-            outcome = lc.complete_without_call(task_id, body, reason)
-    if outcome != "settled":
-        raise Parked("%s: publication %s; retried" % (task_id, outcome))
-    return _mirror(root, task_id, None, {"task_id": task_id, "outcome": outcome, "interrupted": bool(kind)})
+        if rec and rec.get("phase") == lifecycle.SETTLED:
+            return True, lifecycle.SETTLED
+        state = lc.classify(task_id)
+        return state in lifecycle.TERMINAL, state
+    except Exception as e:
+        return False, "%s: %s" % (type(e).__name__, e)
+
+
+def interrupt(root, task_id, detail) -> dict:
+    """A task this session can no longer take (intake stopped for good): answered once without a call,
+    with the interrupted answer or, for a sender the policy does not admit, the owner-only refusal.
+    Whatever happens on the way, the reply is decided by the disposition afterwards: resolved, or
+    Parked (retry) with the reason; no failure class is named."""
+    why, answered, kind, lc = "", False, None, None
+    try:
+        lc = _lifecycle(root)
+        with records.flocked(records.claims_lock_path(root)):
+            rec = lc.claims.load(task_id)
+            phase = rec.get("phase") if rec else None
+            if phase in (lifecycle.RESULT_STAGED, lifecycle.PUBLISHED):
+                # An earlier interrupt staged its answer but could not publish it: publish that one.
+                kind = str((rec.get("outcome") or {}).get("detail") or "").startswith("intake stopped")
+                answered = lc.publish_and_settle(task_id) == "settled"
+            elif phase != lifecycle.SETTLED:
+                verdict, state = lc.decide(task_id)
+                if verdict == "call":
+                    kind, _headers, refusal = admit(root, task_id, allow_non_owner())
+                    body, reason = (INTERRUPTED_BODY, "intake stopped: %s" % detail) if kind else (
+                        task_io.NON_OWNER_REFUSED, refusal)
+                    answered = lc.complete_without_call(task_id, body, reason) == "settled"
+                else:
+                    why = "the result is %s" % state
+    except Exception as e:
+        why = "%s: %s" % (type(e).__name__, e)
+    done, state = resolved(lc, task_id) if lc is not None else (False, "")
+    if not done:
+        raise Parked("%s: not answered yet (%s); retried" % (task_id, why or "disposition %s" % (state or "unknown")))
+    return _mirror(root, task_id, None, {"task_id": task_id, "resolved": True, "answered": answered,
+                                         "interrupted": bool(answered and kind), "state": state})
 
 
 def authorize(root, task_id, attempt, hash_) -> dict:
@@ -232,13 +256,23 @@ def park(root, task_id, turn_id, detail) -> dict:
     return dict(out, parked=detail)
 
 
-def progress(root, session_id=None, nonce=None, intake=None, reason=None, generation=None) -> dict:
+def progress(root, session_id=None, nonce=None, intake=None, reason=None, generation=None, stuck=None,
+             stuck_detail="", unstuck=None) -> dict:
+    """`stuck` marks an interrupted answer that has not been published for a while (verify and the card
+    name it); `unstuck` clears it once the answer lands or the claim is final."""
     def mutate(rec):
         for key, value in (("session_id", session_id), ("nonce", nonce), ("intake", intake), ("reason", reason)):
             if value is not None:
                 rec[key] = value
         if generation is not None:
             rec["generation"] = generation
+        marks = dict(rec.get("stuck") or {})
+        if stuck:
+            marks[stuck] = dict(marks.get(stuck) or {"since": time.time()}, detail=stuck_detail)
+        if unstuck:
+            marks.pop(unstuck, None)
+        if stuck or unstuck:
+            rec["stuck"] = marks
         return rec
     return records.write_progress(root, mutate)
 
@@ -279,7 +313,8 @@ def main(args) -> int:
         elif verb == "progress":
             gen = task_io.holder_consumer(root) if args.bind_generation else None
             out = progress(root, args.session_id, args.nonce, args.intake, args.reason,
-                           {"pid": gen["pid"], "start": gen["start"]} if gen and gen.get("pid") else None)
+                           {"pid": gen["pid"], "start": gen["start"]} if gen and gen.get("pid") else None,
+                           args.stuck, args.stuck_detail, args.unstuck)
         elif verb == "check-inode":
             out = check_inode(args.dir or os.getcwd(), args.expect)
         else:
@@ -314,5 +349,6 @@ def add_parser(sub) -> None:
     g = v.add_parser("progress")
     g.add_argument("--session-id"); g.add_argument("--nonce"); g.add_argument("--intake", choices=("open", "stopped"))
     g.add_argument("--reason"); g.add_argument("--bind-generation", action="store_true")
+    g.add_argument("--stuck"); g.add_argument("--stuck-detail", default=""); g.add_argument("--unstuck")
     i = v.add_parser("check-inode"); i.add_argument("--dir"); i.add_argument("--expect", required=True)
     p.set_defaults(func=main)

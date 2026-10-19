@@ -4,7 +4,8 @@ pane's capture and the Mod's progress record, never from the process.
 Two cases: (a) the raw pane static for STALL_MIN_S while the plugin record shows an offer in flight
 (CALLING or TURN_CONFIRMED with no result), which is this adapter's rule, not cli_wedge's; (b)
 abnormal text on the pane, read line-anchored through the shared banner grammar
-(cli_wedge_patterns), or a Claude Code startup dialog the pane waits at (trust.dialog). The verdict is data the launcher writes into the supervisor record; nothing
+(cli_wedge_patterns), or a Claude Code startup dialog the pane waits at (trust.dialog); (c) an
+interrupted answer the Mod could not publish for its stuck threshold (`stuck` in the record). The verdict is data the launcher writes into the supervisor record; nothing
 here acts.
 """
 from __future__ import annotations
@@ -41,6 +42,13 @@ def inflight_task(plugin: dict) -> "str | None":
     return None
 
 
+def stuck_answers(plugin: dict) -> dict:
+    """{task_id: {since, detail}} for interrupted answers the Mod marked stuck; malformed entries skipped."""
+    marks = plugin.get("stuck") or {}
+    return {k: v for k, v in marks.items() if isinstance(marks, dict) and isinstance(v, dict)
+            and isinstance(v.get("since"), (int, float))} if isinstance(marks, dict) else {}
+
+
 def derive(previous: dict, text: str, plugin: dict, now: float, stall_min_s: float = STALL_MIN_S,
            abnormal_min_s: float = ABNORMAL_MIN_S) -> dict:
     """The next observation: {frame_hash, static_since, task, abnormal, stall}. `stall` is None or
@@ -48,6 +56,15 @@ def derive(previous: dict, text: str, plugin: dict, now: float, stall_min_s: flo
     stall_min_s with an offer in flight, `abnormal:<names>` once abnormal text has shown for
     abnormal_min_s. Any change of frame, task or banner set resets the clock and clears the stall."""
     h = frame_hash(text)
+    stuck = stuck_answers(plugin)
+    if stuck:
+        # A stable stall (no frame, no lines), so the card stays the same one until the answers land.
+        ids, since = sorted(stuck), min(v["since"] for v in stuck.values())
+        return {"frame_hash": h, "static_since": now, "task": None, "abnormal": [], "abnormal_since": None,
+                "dialog": trust.dialog(text),
+                "stall": {"reason": "abnormal:interrupt-unpublished", "since": since, "frame_hash": "", "task": ids[0],
+                          "checks": "interrupted answers not published: %s" % ", ".join(
+                              "%s (%s)" % (i, stuck[i].get("detail") or "no detail") for i in ids), "lines": []}}
     task = inflight_task(plugin)
     names = abnormal_names(text)
     same = previous.get("frame_hash") == h and previous.get("task") == task

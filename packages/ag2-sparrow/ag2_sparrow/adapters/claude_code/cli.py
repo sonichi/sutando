@@ -29,7 +29,7 @@ from pathlib import Path
 from ... import _dirs, agent_identity, connect_common as cm, task_io
 from ...connect_common import EXIT_CHILD_HELD, EXIT_HELD, EXIT_UNUSABLE, _v  # noqa: F401
 from ... import claude_local_accepter as accepter, claude_local_card as card, claude_local_records as records
-from . import hold, inbox, launcher, trust
+from . import detector, hold, inbox, launcher, trust
 from .shape import AUTOARM_VAR, BRIDGE, HITL_ROOT_NAME, LOCAL, SESSION_NAME  # noqa: F401
 
 SHAPE, COMMAND, MIN_CLI = LOCAL.name, LOCAL.command, LOCAL.min_version
@@ -545,6 +545,14 @@ def verify(_args) -> int:
     cm.verify_tail(LOCAL, cfg, results, occupancy=occupancy_line, relay=relay)
     print(f"INFO session id: {cfg['SESSION_ID']}")
     print(f"INFO folder trust: {trust_line(cfg, root)}")
+    try:
+        stuck = detector.stuck_answers(records.load_plugin(root))
+    except records.RecordError:
+        stuck = {}
+    if stuck:
+        cm.check(results, False, "interrupts", "interrupted answers not published, retried with backoff: " + ", ".join(
+            "%s since %s (%s)" % (t, time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(v["since"])), v.get("detail") or "")
+            for t, v in sorted(stuck.items())))
     rec = records.load_supervisor(root)
     waiting = pane_dialog(rec)
     if waiting:

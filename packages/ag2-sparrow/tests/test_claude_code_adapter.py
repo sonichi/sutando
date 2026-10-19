@@ -2535,30 +2535,99 @@ class InboxCli(ConnectBase):
             self.assertEqual((rc, "only ABSENT may be submitted" in out["refused"]), (1, True), "answered once")
         self.assertIn("malformed: no access_tier header", self.verb("claim", self.task("task-n2", None))[1]["refused"])
 
+    def resolved(self, out):
+        return (out.get("resolved"), out.get("answered"), out.get("interrupted"), out.get("retry"))
+
     def test_interrupt_answers_a_task_the_stopped_session_cannot_take_once_and_the_refusal_for_a_non_owner(self):
         t = self.task("task-late")
         rc, out = self.verb("interrupt", t, "--detail", "session id changed")
-        self.assertEqual((rc, out["outcome"], out["interrupted"]), (0, "settled", True))
+        self.assertEqual((rc, *self.resolved(out)), (0, True, True, True, None))
         self.assertEqual((self.results / "task-late.txt").read_text(), inbox.INTERRUPTED_BODY)
         self.assertNotIn(t, records.load_plugin(self.root).get("inflight") or {})
         rc, out = self.verb("interrupt", t)
-        self.assertEqual((rc, "only ABSENT is answered" in out["refused"]), (1, True), "answered once")
+        self.assertEqual((rc, *self.resolved(out)), (0, True, False, False, None), "resolved, not answered again")
         self.assertEqual(self.verb("claim", t)[0], 1, "and never submitted afterwards")
         rc, out = self.verb("interrupt", self.task("task-g", "guest"))
-        self.assertEqual((rc, out["interrupted"]), (0, False))
+        self.assertEqual((rc, *self.resolved(out)), (0, True, True, False, None))
         self.assertEqual((self.results / "task-g.txt").read_text(), task_io.NON_OWNER_REFUSED, "the policy still answers")
         with mock.patch.object(inbox.lifecycle.Lifecycle, "_publish", return_value=None):
             rc, out = self.verb("interrupt", self.task("task-p"))
-        self.assertEqual((rc, "publication parked" in out["refused"], out["retry"]), (1, True, True), "soft: retried")
+        self.assertEqual((rc, out.get("retry"), "not answered yet" in out["refused"]), (1, True, True), "parked: retried")
         lc = inbox._lifecycle(self.root)
         self.assertEqual(lc.claims.load("task-p")["phase"], inbox.lifecycle.RESULT_STAGED)
         self.assertFalse((self.results / "task-p.txt").exists(), "no result yet")
         rc, out = self.verb("interrupt", "task-p")
-        self.assertEqual((rc, out["outcome"], out["interrupted"]), (0, "settled", True), "the staged answer is published")
+        self.assertEqual((rc, *self.resolved(out)), (0, True, True, True, None), "the staged answer is published")
         self.assertEqual((self.results / "task-p.txt").read_text(), inbox.INTERRUPTED_BODY)
         self.assertEqual(lc.claims.load("task-p")["phase"], inbox.lifecycle.SETTLED)
-        rc, out = self.verb("interrupt", "task-p")
-        self.assertEqual((rc, "retry" in out), (1, False), "settled: a hard refusal, never retried")
+        with mock.patch.object(inbox.lifecycle.Lifecycle, "decide", return_value=("settle", inbox.lifecycle.ARCHIVED)), \
+                mock.patch.object(inbox.lifecycle.Lifecycle, "classify", return_value=inbox.lifecycle.ARCHIVED):
+            rc, out = self.verb("interrupt", self.task("task-archived"))
+        self.assertEqual((rc, *self.resolved(out)), (0, True, False, False, None), "an archived task is resolved")
+        with mock.patch.object(inbox, "_lifecycle", side_effect=RuntimeError("no root")):
+            rc, out = self.verb("interrupt", self.task("task-nolc"))
+        self.assertEqual((rc, out.get("retry")), (1, True), "even the lifecycle failing to open is a retry")
+
+    def test_terminal_retires_and_every_other_outcome_retries_whatever_its_cause(self):
+        """No failure class decides: each case gives no result and retry, then the next call answers it once.
+        The custom exception is one nothing anticipates, which shows the rule holds by construction."""
+        L = inbox.lifecycle
+        real_wd = L.write_durable
+
+        class Unanticipated(Exception):
+            pass
+
+        def failing_body(error):
+            def write(path, data):
+                if str(path).endswith("/body"):
+                    raise error
+                return real_wd(path, data)
+            return write
+        cases = {
+            "enospc": mock.patch.object(L, "write_durable", side_effect=failing_body(OSError(errno.ENOSPC, "No space left"))),
+            "live-unready": mock.patch.object(L.Lifecycle, "decide", return_value=("park", L.LIVE_UNREADY)),
+            "unknown": mock.patch.object(L.Lifecycle, "decide", return_value=("park", L.UNKNOWN)),
+            "claim-unreadable": mock.patch.object(L.Lifecycle, "decide", side_effect=L.ClaimUnreadable("torn claim")),
+            "admission-oserror": mock.patch.object(inbox, "admit", side_effect=OSError(errno.EIO, "I/O error")),
+            "unanticipated": mock.patch.object(L, "write_durable", side_effect=failing_body(Unanticipated("surprise"))),
+        }
+        for name, patch in cases.items():
+            t = self.task("task-" + name)
+            with patch:
+                rc, out = self.verb("interrupt", t)
+            self.assertEqual((rc, out.get("retry"), out.get("resolved")), (1, True, None), (name, out))
+            self.assertFalse((self.results / (t + ".txt")).exists(), name)
+            rc, out = self.verb("interrupt", t)
+            self.assertEqual((rc, *self.resolved(out)), (0, True, True, True, None), name)
+            self.assertEqual(sorted(p.name for p in self.results.glob(t + "*")), [t + ".txt"], "one result: " + name)
+            self.assertEqual(self.resolved(self.verb("interrupt", t)[1])[:2], (True, False), "then resolved: " + name)
+        broken = mock.Mock()
+        broken.claims.load.side_effect = L.ClaimUnreadable("torn")
+        self.assertEqual(inbox.resolved(broken, "task-x"), (False, "ClaimUnreadable: torn"),
+                         "a disposition that cannot be read is unresolved")
+
+    def test_a_stuck_interrupt_is_named_by_verify_and_raises_the_card_and_clears(self):
+        self.assertEqual(self.verb("progress", "--stuck", "task-s", "--stuck-detail", "parked")[0], 0)
+        self.assertEqual(self.verb("progress", "--stuck", "task-s", "--stuck-detail", "still parked")[0], 0)
+        marks = records.load_plugin(self.root)["stuck"]
+        self.assertEqual(list(marks), ["task-s"])
+        self.assertEqual(marks["task-s"]["detail"], "still parked", "the first time is kept, the detail refreshed")
+        obs = detector.derive({}, "pane", records.load_plugin(self.root), 1000.0)
+        self.assertEqual((obs["stall"]["reason"], obs["stall"]["task"]), ("abnormal:interrupt-unpublished", "task-s"))
+        self.assertEqual(detector.derive(obs, "other pane", records.load_plugin(self.root), 2000.0)["stall"], obs["stall"],
+                         "the same stall across ticks, so one card")
+        with mock.patch.object(cm, "_run", side_effect=self.runner(root=False)):
+            out = self.main("verify")[1]
+        self.assertIn("FAIL interrupts: interrupted answers not published, retried with backoff: task-s since", out)
+        self.assertIn("(still parked)", out)
+        self.assertEqual(self.verb("progress", "--unstuck", "task-s")[0], 0)
+        self.assertEqual(records.load_plugin(self.root)["stuck"], {})
+        self.assertIsNone(detector.derive({}, "pane", records.load_plugin(self.root), 1000.0)["stall"])
+        self.assertNotIn("interrupts", self.main("verify")[1])
+        records.plugin_path(self.root).write_text("[")
+        self.assertNotIn("interrupts", self.main("verify")[1], "an unreadable record names no stuck answer, never crashes")
+        self.assertEqual(detector.stuck_answers({"stuck": {"a": {"since": "x"}, "b": 3}}), {})
+        self.assertEqual(detector.stuck_answers({"stuck": ["a"]}), {})
 
     def test_with_allow_non_owner_every_non_owner_is_claimed_with_its_admission_and_a_tierless_task_still_refused(self):
         self.configure(ALLOW_NON_OWNER="1")

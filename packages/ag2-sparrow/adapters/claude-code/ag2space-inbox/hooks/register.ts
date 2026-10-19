@@ -3,6 +3,10 @@ import type { Register } from 'claude-code'
 const PLUGIN = 'ag2space-inbox'
 const POLL_MS = 1000
 const STALE_TICKS = 30
+// An interrupted answer that did not land: retried after 1, 2, 4 ... ticks, capped; marked stuck in the
+// record (verify and the card name it) once it has failed for STUCK_TICKS.
+const BACKOFF_MAX_TICKS = 60
+const STUCK_TICKS = 300
 const TASK_RE = /^task-[A-Za-z0-9._~-]+\.txt$/
 const ID_RE = /^[A-Za-z0-9._~-]+$/
 const VERDICTS = new Set(['verified', 'unsigned', 'invalid', 'unverifiable'])
@@ -79,6 +83,8 @@ type State = {
   stop: (() => void) | null
   sessionId: string
   stoppedFor: string
+  tick: number
+  retry: Map<string, { fails: number; delay: number; next: number; first: number; stuck: boolean }>
   intake: 'open' | 'closed'
   intakeReason: string
 }
@@ -180,6 +186,7 @@ async function arm($: any, s: State, inbox: string, results: string): Promise<{ 
   const scan = async () => {
     if (busy) return
     busy = true
+    s.tick++
     try {
       // Every tick, not only at a turn: an idle /clear must stop intake without waiting for one.
       await witness($, s, 'scan')
@@ -189,6 +196,8 @@ async function arm($: any, s: State, inbox: string, results: string): Promise<{ 
       if (!stopped) for (const o of s.offers.values()) if (o.phase === 'CALLING' || o.phase === 'TURN_CONFIRMED') return
       for (const entry of await $.fs.list(inbox)) {
         if (entry.kind !== 'file' || !TASK_RE.test(entry.name) || s.seen.has(entry.name)) continue
+        const backoff = s.retry.get(entry.name)
+        if (stopped && backoff && s.tick < backoff.next) continue
         const prev = s.stale.get(entry.name)
         if (prev && prev.mtimeMs === entry.mtimeMs && prev.ticks >= STALE_TICKS) continue
         s.stale.set(entry.name, { mtimeMs: entry.mtimeMs, ticks: prev && prev.mtimeMs === entry.mtimeMs ? prev.ticks + 1 : 1 })
@@ -213,16 +222,30 @@ async function arm($: any, s: State, inbox: string, results: string): Promise<{ 
         if (stopped) {
           // This session can never take it: the sender gets the interrupted answer, never silence.
           const r = await cli($, s, ['interrupt', rid, '--detail', s.intakeReason])
-          if (r.hard) return
-          if (!r.ok && r.data?.retry) {
-            // No result yet (a parked publication, a CLI that did not run): kept, and never aged out.
+          // Retired only on a reply that says resolved (exit 3 too: the step stood, only the mirror failed);
+          // every other reply, exit code or failure to run keeps it, never aged out, backed off.
+          if (!((r.ok || r.hard) && r.data?.resolved === true)) {
             s.stale.delete(entry.name)
-            log(`${rid} interrupted answer not published yet (${r.data?.refused ?? ''}); retried next tick`)
+            const fails = (backoff?.fails ?? 0) + 1
+            const delay = Math.min(BACKOFF_MAX_TICKS, 2 ** (fails - 1))
+            const next = { fails, delay, next: s.tick + delay, first: backoff?.first ?? s.tick, stuck: backoff?.stuck ?? false }
+            const why = String(r.data?.refused ?? r.data?.error ?? 'no resolved reply')
+            if (!backoff || delay !== backoff.delay) await $.ui.log(`${PLUGIN}: ${rid} interrupted answer not published (${why}); next try in ${delay} s`, {})
+            if (!next.stuck && s.tick - next.first >= STUCK_TICKS) {
+              const p = await cli($, s, ['progress', '--stuck', rid, '--stuck-detail', why])
+              if (p.ok) { next.stuck = true; await $.ui.log(`${PLUGIN}: ${rid} interrupted answer STUCK for ${STUCK_TICKS} s; recorded for verify and the card`, {}) }
+            }
+            s.retry.set(entry.name, next)
             continue
           }
+          if (backoff?.stuck && !(await cli($, s, ['progress', '--unstuck', rid])).ok) {
+            s.retry.set(entry.name, { ...backoff, next: s.tick + backoff.delay })   // the mark must clear: kept
+            continue
+          }
+          s.retry.delete(entry.name)
           s.seen.add(entry.name)
           s.answered.add(rid)
-          await $.ui.log(`${PLUGIN}: ${rid} answered as interrupted (intake stopped: ${r.ok ? 'settled' : r.data?.refused ?? ''})`, {})
+          await $.ui.log(`${PLUGIN}: ${rid} ${r.data?.answered ? 'answered as interrupted' : 'already resolved'} (intake stopped)`, {})
           continue
         }
         // The claim: only a task the classifier reads ABSENT and the shared admission policy admits may be
@@ -275,7 +298,7 @@ async function arm($: any, s: State, inbox: string, results: string): Promise<{ 
 
 export const register: Register = (on) => {
   const s: State = { seen: new Set(), answered: new Set(), offers: new Map(), pending: null, stale: new Map(),
-    armedResults: '', stop: null, sessionId: '', stoppedFor: '', intake: 'open', intakeReason: '' }
+    armedResults: '', stop: null, sessionId: '', stoppedFor: '', tick: 0, retry: new Map(), intake: 'open', intakeReason: '' }
 
   on('session.start', async ($, e, next) => {
     await $.tool.register({
