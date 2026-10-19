@@ -49,7 +49,7 @@ def check(cond: bool, msg: str) -> None:
 STATE = {"tasks_served": 0, "results": [], "acks": [], "heartbeats": [],
          "auth_seen": [], "force_401": False, "force_ack_404": False,
          "room_posts": [], "force_room_502": False, "force_room_empty_200": False,
-         "force_room_ok_only": False,
+         "force_room_ok_only": False, "force_room_400_body": None,
          "force_heartbeat_404": False, "force_media_redirect": False,
          "force_results_502_once": False, "force_results_503": False,
          # GET /v1/results/<id>/delivery: None = a pre-route broker (404)
@@ -134,6 +134,11 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_response(502); self.end_headers(); return
             n = int(self.headers.get("Content-Length") or 0)
             STATE["room_posts"].append(json.loads(self.rfile.read(n).decode()))
+            if STATE["force_room_400_body"] is not None:
+                body = json.dumps(STATE["force_room_400_body"]).encode()
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers(); self.wfile.write(body); return
             if STATE["force_room_empty_200"]:
                 # Deployed-broker failure shape: room-send swallowed server-side,
                 # 200 with no event_id — must NOT count as delivered.
@@ -156,6 +161,63 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(200); self.end_headers()
         else:
             self.send_response(404); self.end_headers()
+
+
+def _test_owner_dm_room_upgraded(rtc) -> None:
+    """#5720: an owner DM upgraded to a room the agent is not in holds nudges and notifies once."""
+    check(getattr(rtc.OWNER_DM_UPGRADED_NOTIFY, "__name__", "") == "_ag2space_owner_dm_upgraded",
+          "sutando loader wires the owner-DM upgrade notify hook")
+    calls: list = []
+    real_hook = rtc.OWNER_DM_UPGRADED_NOTIFY
+    rtc.OWNER_DM_UPGRADED_NOTIFY = lambda old, new: calls.append((old, new))
+    undeliv = lambda stem: [p for p in rtc.UNDELIVERABLE_RESULTS_DIR.glob(f"{stem}*")]  # noqa: E731
+    upgraded = {"error": "room upgraded", "reason": "room_upgraded",
+                "replacement_room": "!new:example.org", "sender_joined_replacement": False}
+    try:
+        # (1) room_upgraded 400 twice: pending, never parked, owner notified once, second pass no POST.
+        up = rtc.RESULTS_DIR / "proactive-up1.txt"
+        up.write_text("upgrade nudge\n")
+        STATE["force_room_400_body"] = upgraded
+        n0 = len(STATE["room_posts"])
+        rtc._post_proactive()
+        rtc._post_proactive()
+        check(up.exists() and not undeliv("proactive-up1")
+              and "proactive-up1.txt" not in rtc._PROACTIVE_ATTEMPTS,
+              "room_upgraded 400 keeps the owner nudge pending, not parked or counted")
+        check(calls == [("!owner:example.org", "!new:example.org")],
+              "room_upgraded notifies the owner exactly once across passes")
+        check(len(STATE["room_posts"]) == n0 + 1,
+              "a held owner DM is not re-sent each pass")
+        rtc._hold_owner_dm_upgrade("!owner:example.org", "!new:example.org")
+        check(len(calls) == 1, "a repeat (room, replacement) hold does not notify again")
+        # A repointed owner DM clears the hold and the nudge delivers there.
+        STATE["force_room_400_body"] = None
+        rtc._ROUTING.update(owner_dm="!owner2:example.org")
+        rtc._post_proactive()
+        check(not up.exists() and STATE["room_posts"][-1]["room_id"] == "!owner2:example.org"
+              and not rtc._owner_dm_upgrade_held("!owner:example.org"),
+              "repointing the owner DM clears the hold and delivers")
+        rtc._ROUTING.update(owner_dm="!owner:example.org")
+        # (2) any other 400 still parks as before, with no notify.
+        other = rtc.RESULTS_DIR / "proactive-up2.txt"
+        other.write_text("bad nudge\n")
+        n_calls = len(calls)
+        STATE["force_room_400_body"] = {"reason": "bad_request"}
+        rtc._post_proactive()
+        check(not other.exists() and undeliv("proactive-up2") and len(calls) == n_calls,
+              "a non-upgrade 400 still parks the nudge")
+        # (3) a room-addressed nudge keeps today's behaviour: parked, no hold, no notify.
+        routed = rtc.RESULTS_DIR / "proactive-up3.txt"
+        routed.write_text("[channel: !other:example.org]\nroom nudge\n")
+        STATE["force_room_400_body"] = upgraded
+        rtc._post_proactive()
+        check(not routed.exists() and undeliv("proactive-up3") and len(calls) == n_calls
+              and not rtc._owner_dm_upgrade_held("!owner:example.org"),
+              "a room_upgraded 400 on a room-addressed nudge parks unchanged")
+    finally:
+        STATE["force_room_400_body"] = None
+        rtc.OWNER_DM_UPGRADED_NOTIFY = real_hook
+        rtc._upgrade_hold_file().unlink(missing_ok=True)
 
 
 def main() -> int:
@@ -1315,6 +1377,7 @@ def main() -> int:
           "a failed POST records no receipt")
     rtc._post_proactive()
     _it3b = _ob._read_item(_rroot, "proactive-r3")
+    _test_owner_dm_room_upgraded(rtc)
     check(_it3b.get("status") == "DELIVERED"
           and _it3b.get("destination") == "!owner:example.org",
           "the successful retry records the receipt")

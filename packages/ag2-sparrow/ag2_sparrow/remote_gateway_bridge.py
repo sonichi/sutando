@@ -1761,6 +1761,9 @@ PROACTIVE_CLAIM_GATE: Callable[[Path], bool] | None = None
 # Host-injected post-claim room gate ((original path, room) -> bool), consulted
 # on the CLAIMED body of a `proactive-result-*` naming a room; None allows all.
 PROACTIVE_ROOM_GATE: Callable[[Path, str], bool] | None = None
+# Host-injected (old_room, replacement_room) -> None, called once per upgrade of
+# the owner DM to a room this agent is not in; None only logs.
+OWNER_DM_UPGRADED_NOTIFY: Callable[[str, str], None] | None = None
 # Routing state belongs to the gateway (owner 2026-09-07): the agent row's owner_dm_room is read at
 # connect and on a slow cadence and kept while offline; the pinned room is bootstrap, never authority.
 _ROUTING: dict = {"owner_dm": "", "persisted": "", "identity": "", "gateway": "", "next": 0.0, "loaded": False,
@@ -5381,6 +5384,61 @@ def _resolve_send_failure(claim, original, exc) -> str:
     return "stuck"
 
 
+def _upgrade_hold_file() -> Path:
+    return _STATE / f"owner-dm-upgraded{_INST_SUFFIX}.json"
+
+
+def _room_upgraded_to(err_body: str) -> "str | None":
+    """The replacement room a 400 body names when the send room was upgraded, else None."""
+    try:
+        d = json.loads(err_body)
+    except ValueError:
+        return None
+    if not isinstance(d, dict) or d.get("reason") != "room_upgraded":
+        return None
+    return str(d.get("replacement_room") or "")
+
+
+def _owner_dm_upgrade_held(room: str) -> bool:
+    """True while `room` (the current owner DM) is held as upgraded; a hold on another room is stale."""
+    f = _upgrade_hold_file()
+    try:
+        d = json.loads(f.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(d, dict) or not d:
+        return False
+    if room and d.get("room") == room:
+        return True
+    try:
+        _atomic_private_json(f, {})  # the owner DM was repointed: the hold no longer applies
+    except OSError:
+        pass
+    return False
+
+
+def _hold_owner_dm_upgrade(room: str, replacement: str) -> None:
+    """Record the hold and notify once per (room, replacement); later passes skip the room."""
+    f = _upgrade_hold_file()
+    try:
+        d = json.loads(f.read_text(encoding="utf-8"))
+        if isinstance(d, dict) and (d.get("room"), d.get("replacement")) == (room, replacement):
+            return
+    except (OSError, ValueError):
+        pass
+    try:
+        _atomic_private_json(f, {"room": room, "replacement": replacement, "at": time.time()})
+    except OSError as e:
+        _log(f"could not record owner-DM upgrade hold ({e})")
+    _log(f"owner DM {room} was upgraded to {replacement or '(unknown)'}, which this agent "
+         "has not joined — holding owner-DM nudges until the owner DM is repointed")
+    if OWNER_DM_UPGRADED_NOTIFY is not None:
+        try:
+            OWNER_DM_UPGRADED_NOTIFY(room, replacement)
+        except Exception as exc:  # noqa: BLE001
+            _log(f"owner-DM upgrade notify failed ({exc})")
+
+
 def _post_proactive() -> None:
     """Deliver `results/proactive-*.txt` to PROACTIVE_ROOM as room messages.
 
@@ -5413,6 +5471,8 @@ def _post_proactive() -> None:
         if route == "send" and peek_room is None and not proactive_room():
             _held(f"owner-directed {f.name}")
             continue
+        if route == "send" and peek_room is None and _owner_dm_upgrade_held(proactive_room()):
+            continue  # each claim would only cost another room_upgraded 400
         if PROACTIVE_CLAIM_GATE is not None:
             try:
                 if not PROACTIVE_CLAIM_GATE(f):
@@ -5533,6 +5593,15 @@ def _post_proactive() -> None:
                 except OSError:
                     pass
                 raise
+            replacement = _room_upgraded_to(_http_error_body(e)) if (
+                e.code == 400 and room_override is None) else None
+            if replacement is not None:
+                try:
+                    claim.rename(f)  # stays pending: not a failed attempt, the room moved
+                except OSError:
+                    pass
+                _hold_owner_dm_upgrade(dest_room, replacement)
+                continue
             outcome = _resolve_send_failure(claim, f, e)
             _log(f"proactive send failed for {f.name}: HTTP {e.code} — {outcome}")
             continue
