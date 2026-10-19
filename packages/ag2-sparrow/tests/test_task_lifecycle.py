@@ -420,10 +420,14 @@ class FreshDirTest(Base):
 
     def test_with_the_marker_only_the_allowlist_is_accepted(self):
         self.assertEqual(self.main()[0], 0)
-        for name in ("done", ".rate.jsonl.123.abcd.tmp"):
+        for name in ("done", ".rate.jsonl.123.abcd.tmp", ".rate.jsonl.456.abcd.tmp"):
             (self.work / "state" / name).write_text("")
+        old = time.time() - vendored.TEMP_SWEEP_AFTER - 5
+        os.utime(self.work / "state" / ".rate.jsonl.123.abcd.tmp", (old, old))
         self.assertEqual(self.main()[0], 0)
         self.assertFalse((self.work / "state" / ".rate.jsonl.123.abcd.tmp").exists(), "a crash's temp is cleared")
+        self.assertTrue((self.work / "state" / ".rate.jsonl.456.abcd.tmp").exists(),
+                        "a fresh temp may be a live writer's, mid-replace: kept, and the start still accepted")
         stale = self.work / "state" / "connector.pid"
         stale.write_text("abc")
         os.utime(stale, (time.time() - 100, time.time() - 100))
@@ -2880,6 +2884,8 @@ class BridgeEntryTest(Base):
         self.assertIsNone(self.lc.prepare_work_dir(str(self.work)))
         temp = self.work / "state" / ".settled-ids.1.abcdef.tmp"
         temp.write_text("x")
+        old = time.time() - self.lc.TEMP_SWEEP_AFTER - 5
+        os.utime(temp, (old, old))
         self.assertIsNone(self.lc.prepare_work_dir(str(self.work), check_only=True))
         self.assertTrue(temp.exists(), "a check writes nothing")
         self.assertIsNone(self.lc.prepare_work_dir(str(self.work)))

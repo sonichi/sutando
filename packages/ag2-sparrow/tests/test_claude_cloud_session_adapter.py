@@ -677,7 +677,9 @@ class QueueLoopTest(unittest.TestCase):
             self.assertEqual(result(work, "task-c"), "one")
             state = work / "state"
             self.assertIn(rl.COLLAB_LIMITER_FILE, os.listdir(state), "written by the production limiter")
-            (state / (".%s.123.tmp" % rl.COLLAB_LIMITER_FILE)).write_text("[]")
+            torn = state / (".%s.123.tmp" % rl.COLLAB_LIMITER_FILE)
+            torn.write_text("[]")
+            os.utime(torn, (time.time() - lc.TEMP_SWEEP_AFTER - 5,) * 2)     # a crash's, not a live write's
             self.assertIsNone(sa.startup_refusal(str(work), ENV), "the restart validator accepts its own state")
             self.assertIsNone(lc.prepare_work_dir(str(work)))
             self.assertNotIn(".%s.123.tmp" % rl.COLLAB_LIMITER_FILE, os.listdir(state), "a torn write is cleaned")

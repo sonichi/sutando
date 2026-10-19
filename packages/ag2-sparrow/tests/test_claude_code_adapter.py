@@ -344,6 +344,7 @@ def hold(root, name="first-launcher", script=STAND_IN, install=""):
 def unhold(p):
     p.stdin.close()
     p.wait(timeout=30)
+    p.stdout.close()
 
 
 def alive(pid):
@@ -1546,6 +1547,30 @@ class ConnectBranches(ConnectBase):
             cli.main([])
 
 
+class RecordUnderHoldStart(unittest.TestCase):
+    """The launcher writes its record while the pane's hold prepares the same root: hold's startup
+    sweep must never take a live writer's temp (a replace with no source), only an abandoned one."""
+
+    def test_a_record_written_while_hold_prepares_the_root_lands(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = os.path.join(d, "work")
+            os.mkdir(root)
+            self.assertEqual(inbox.prepare_root(root), "")
+            real = os.replace
+
+            def hold_starts_mid_write(src, dst):
+                self.assertEqual(inbox.prepare_root(root), "", "hold's own prepare, between the temp and the replace")
+                return real(src, dst)
+            with mock.patch.object(records.os, "replace", side_effect=hold_starts_mid_write):
+                records.save_supervisor(root, dict(records.empty_supervisor(), agent_id="@a:x"))
+            self.assertEqual(records.load_supervisor(root)["agent_id"], "@a:x")
+            old = Path(root, "state", ".claude-local-supervisor.json.dead.tmp")
+            old.write_text("{}")
+            os.utime(old, (time.time() - 200, time.time() - 200))
+            self.assertEqual(inbox.prepare_root(root), "")
+            self.assertFalse(old.exists(), "an abandoned temp is still swept")
+
+
 class LockHelpers(unittest.TestCase):
     """task_io: lock_held is held | free | unknown (the flock, occupancy); lock_holder is attribution."""
 
@@ -1606,6 +1631,8 @@ class LockHelpers(unittest.TestCase):
             holder = hold(str(root))
             os.kill(holder.pid, signal.SIGKILL)
             holder.wait(timeout=30)
+            holder.stdin.close()
+            holder.stdout.close()
             self.assertEqual(task_io.lock_held(str(root)), "free", "the record may linger; the flock does not")
             self.assertFalse(task_io.lock_holder(str(root)).get("live", False))
             self.assertEqual(cm.holder_line(str(root)), "free")
@@ -2441,6 +2468,8 @@ class HoldProcess(ConnectBase):
         finally:
             loop.stdin.write("stop\n"); loop.stdin.flush()
             loop.wait(timeout=30)
+            loop.stdin.close()
+            loop.stdout.close()
             if proc.poll() is None:
                 os.kill(proc.pid, signal.SIGKILL)
             proc.communicate()

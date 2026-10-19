@@ -329,7 +329,8 @@ def prepare_work_dir(work, check_only=False):
                 continue
             if name.startswith(".") and name.endswith(".tmp") and any(name[1:].startswith(a + ".")
                                                                       for a in STATE_ALLOWED - {"format"}):
-                if not check_only:
+                # A fresh temp is a live writer's, mid-replace (the launcher's record as hold starts).
+                if not check_only and time.time() - os.lstat(os.path.join(state, name)).st_mtime > TEMP_SWEEP_AFTER:
                     os.unlink(os.path.join(state, name))
                 continue
             if bridge_entry(work, os.path.join("state", name)):
