@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { existsSync, readFileSync, readdirSync, unlinkSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { resolveWorkspace } from '../src/workspace_default.js';
-import { buildVoiceTaskHeader, queuedAheadInstruction, setVoiceSessionOrigin, getVoiceSessionOrigin, workTool } from '../src/task-bridge.js';
+import { buildVoiceTaskHeader, queuedAheadInstruction, setVoiceSessionOrigin, getVoiceSessionOrigin, workTool, voiceTasksAhead, _pendingTasksForTest } from '../src/task-bridge.js';
 import { readQueueDepth } from '../src/inline-tools.js';
 import { localTimeValue } from '../src/local_time.js';
 import { mkdtempSync, writeFileSync } from 'node:fs';
@@ -162,6 +162,32 @@ describe('buildVoiceTaskHeader (pure) — both header shapes', () => {
 		].join('\n'));
 		assert.doesNotMatch(header, /^task:/m, 'the header is everything ABOVE task: — the caller appends it');
 		assert.doesNotMatch(header, /^(channel_kind|source_room_id):/m);
+	});
+
+	it('the lane the check judged goes in above task:; no judgement, no line', () => {
+		const quick = buildVoiceTaskHeader('task-3', TS, 'owner-1', null, 'quick');
+		assert.match(quick, /^lane: quick$/m);
+		assert.ok(quick.indexOf('lane:') < quick.indexOf('priority:'));
+		assert.match(buildVoiceTaskHeader('task-4', TS, 'owner-1', null, 'long'), /^lane: long$/m);
+		assert.doesNotMatch(buildVoiceTaskHeader('task-5', TS, 'owner-1', null), /^lane:/m);
+	});
+
+	it('a quick task\'s queue position counts only quick tasks ahead of it, a long one only long ones', () => {
+		const base = Date.now() - 10_000;
+		const entry = (text: string, at: number, lane?: 'quick' | 'long') => ({ submittedAt: at, timeoutMs: 0, dmOnTimeout: false, taskText: text, lane });
+		_pendingTasksForTest.set('task-app', entry('build an app', base, 'long'));
+		_pendingTasksForTest.set('task-doc', entry('write a doc', base + 1, 'long'));
+		_pendingTasksForTest.set('task-prs', entry('count PRs', base + 2, 'quick'));
+		_pendingTasksForTest.set('task-cat', entry('draw a cat', base + 3, 'quick'));
+		_pendingTasksForTest.set('task-old', entry('an older build', base + 4));
+		try {
+			assert.equal(voiceTasksAhead('task-cat'), 1, 'one quick task ahead, not the two long ones');
+			assert.equal(voiceTasksAhead('task-prs'), 0);
+			assert.equal(voiceTasksAhead('task-doc'), 1, 'the app, not the quick ones');
+			assert.equal(voiceTasksAhead('task-old'), 2, 'unjudged counts with the long ones');
+		} finally {
+			for (const id of ['task-app', 'task-doc', 'task-prs', 'task-cat', 'task-old']) _pendingTasksForTest.delete(id);
+		}
 	});
 
 	it('origin shape: channel_id is the target, the adapter\'s keys follow it, still voice and urgent', () => {

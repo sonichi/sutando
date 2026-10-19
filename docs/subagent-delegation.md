@@ -12,6 +12,10 @@ Extends the CLAUDE.md rule that "at background" / "in parallel" means SPAWN A SU
 - An independent second pass materially improves correctness: adversarial review, reproduction,
   cross-checking evidence.
 - Access-control policy requires sandboxed handling of a non-owner task.
+- The task header says `lane: long` (a voice request the relay judged to be building, writing or research):
+  always a subagent, spawned as soon as the task is read, so a `lane: quick` task arriving next is done
+  inline at once instead of waiting for the long one's steps to end (one long Write held three quick
+  tasks for five minutes).
 
 Do NOT delegate tightly coupled work, concurrent edits to the same files, irreversible actions, or
 tasks whose coordination overhead exceeds the benefit. Subagents never bypass quota, presenter/pause,

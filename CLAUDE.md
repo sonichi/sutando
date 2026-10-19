@@ -276,6 +276,8 @@ room: 'I sent it to you in our DM.' Never move silently.
 
 If the watcher stops, start it again the same way; a start on a watched inbox exits 0 by itself. See [`docs/task-watcher-hosting-modes.md`](docs/task-watcher-hosting-modes.md).
 
+**Lanes: a quick task never waits behind a long one.** A voice task header may carry `lane: quick` or `lane: long`, the relay's judgement of the work. `lane: long` (building, writing, research, many steps): spawn a subagent for it at once and let that subagent write the result file; the main session stays free to take what arrives next. `lane: quick` (one lookup, command, count, message, picture): do it now, inline, before returning to anything else. Never start a long task's heavy steps inline while the inbox can still receive quick ones. A task with no lane is handled as before.
+
 **Cancel handling.** When you read a task whose `task:` body starts with `CANCEL_INSTRUCTION:` — written by the `cancel_task` voice tool — stop any in-flight work on the referenced task ID, write a brief confirm result for the CANCEL_INSTRUCTION task itself (e.g. `"Cancelled task-X (was in progress)"` or `"task-X already completed, nothing to cancel"`), and do NOT process the original referenced task. The CANCEL_INSTRUCTION task uses the regular task pipeline as its signal channel — picking it up means you've reached the user's cancel intent.
 
 **Voice session context.** On a durable decision the voice agent may reference later, update `state/voice-session-context.json` — schema and rules: [`docs/claude-md-moved-detail.md`](docs/claude-md-moved-detail.md#voice-session-context).

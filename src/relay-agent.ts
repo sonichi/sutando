@@ -8,7 +8,7 @@
 
 import type { PersistentSubagentInstance, SubagentConfig } from 'bodhi-realtime-agent';
 import { frameTaskResult, framedSystem } from './inject-framing.js';
-import type { OpenTask, TurnClassifier, WorkRequestCheck } from './work-request-check.js';
+import type { OpenTask, TurnClassifier, WorkCheck, WorkLane, WorkRequestCheck } from './work-request-check.js';
 
 /** How a voice task's result reached the user. `injected`: handed to the model, turn never confirmed. */
 export type Delivery = 'spoken' | 'injected' | 'dm';
@@ -17,6 +17,8 @@ export type Delivery = 'spoken' | 'injected' | 'dm';
 export interface VoiceTaskRecord {
 	text?: string;
 	submittedAt?: number;
+	/** Which worker lane it went to; quick tasks queue apart from long ones. */
+	lane?: WorkLane;
 	cancelRequested?: boolean;
 	delivery?: Delivery;
 	/** Times the relay handed an unheard result over again. */
@@ -71,8 +73,8 @@ export function createVoiceTaskStore(now: () => number = Date.now) {
 			return [...tasks.entries()].sort((a, b) => (a[1].submittedAt ?? a[1].at) - (b[1].submittedAt ?? b[1].at));
 		},
 		/** A `work` task was submitted (`submittedAt` for a row rebuilt from an older submission). */
-		add(taskId: string, text: string, submittedAt: number = now()): void {
-			update(taskId, (row) => ({ ...row, text: text.slice(0, 200), submittedAt }));
+		add(taskId: string, text: string, submittedAt: number = now(), lane?: WorkLane): void {
+			update(taskId, (row) => ({ ...row, text: text.slice(0, 200), submittedAt, ...(lane ? { lane } : {}) }));
 		},
 		/** The user asked to cancel it. */
 		markCancelRequested(taskId: string): void {
@@ -714,11 +716,13 @@ export class RelayAgent<O = unknown> implements PersistentSubagentInstance {
 		}
 		// bodhi cancelled the call (tool cancellation, the session closing) while it waited for the user or the check.
 		if (signal?.aborted) return framedSystem(ENDED.not_sent);
+		let lane: WorkLane | undefined;
 		if (this.deps.check) {
 			// A request with a blank in it (which PR? which file?) is not submitted: the user is asked.
 			const verdict = await this.deps.check({ task: String(args.task ?? ''), recentConversation: this.deps.recentConversation?.() ?? '', openTasks: this.openTasks(), answeredTasks: this.recentlyAnswered() }, signal)
-				.catch(() => ({ action: 'submit' as const }));
+				.catch((): WorkCheck => ({ action: 'submit' }));
 			if (signal?.aborted) return framedSystem(ENDED.not_sent);
+			if (verdict.action === 'submit') lane = verdict.lane;
 			// One question per request: the answer is sent as it is, even if the check still finds it vague
 			// ("the latest one") - the user is not interrogated (review of #5348).
 			if (verdict.action === 'ask' && Date.now() - this.askedAt < ONE_ASK_WINDOW_MS) {
@@ -756,7 +760,7 @@ export class RelayAgent<O = unknown> implements PersistentSubagentInstance {
 			}
 		}
 		this.askedAt = 0; // this request goes; the next vague one may be asked about again
-		const submitted = await this.deps.submit(args, origin);
+		const submitted = await this.deps.submit(lane ? { ...args, lane } : args, origin);
 		const taskId = submitted.taskId;
 		if (submitted.status !== 'pending' || typeof taskId !== 'string') return JSON.stringify(submitted);
 		const replaces = typeof args.replaces === 'string' ? args.replaces.trim() : '';

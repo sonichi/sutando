@@ -177,6 +177,9 @@ describe('relay agent: a text model checks a request before it is submitted', ()
 		assert.deepEqual(parseWorkCheck('{"action":"ask","question":"Which PR?"}'), { action: 'ask', question: 'Which PR?' });
 		assert.deepEqual(parseWorkCheck('```json\n{"action": "ask", "question": "哪个文件？"}\n```'), { action: 'ask', question: '哪个文件？' });
 		assert.deepEqual(parseWorkCheck('{"action":"submit"}'), { action: 'submit' });
+		assert.deepEqual(parseWorkCheck('{"action":"submit","lane":"quick"}'), { action: 'submit', lane: 'quick' });
+		assert.deepEqual(parseWorkCheck('{"action":"submit","lane":"long"}'), { action: 'submit', lane: 'long' });
+		assert.deepEqual(parseWorkCheck('{"action":"submit","lane":"fast"}'), { action: 'submit' }, 'an unknown lane is no lane');
 		assert.deepEqual(parseWorkCheck('{"action":"ask"}'), { action: 'submit' }, 'an ask with no question is not an ask');
 		assert.deepEqual(parseWorkCheck('sure, go ahead'), { action: 'submit' });
 	});
@@ -286,6 +289,17 @@ describe('relay agent: review of #5348, should-fixes', () => {
 		void relay.invoke('w', { task: '查一下最新的那个 PR' });
 		await tick(5);
 		assert.deepEqual(submitted, ['查一下最新的那个 PR'], 'not asked a second time');
+	});
+
+	it('the check\'s lane reaches the submission; without a check there is none', async () => {
+		const seen: Array<Record<string, unknown>> = [];
+		const submit = async (args: Record<string, unknown>) => { seen.push(args); return { status: 'pending', taskId: `task-${seen.length}`, queuedAhead: 0, watcherOnline: true, message: 'm' }; };
+		void new RelayAgent({ store: createVoiceTaskStore(), check: async () => ({ action: 'submit', lane: 'quick' }), submit }).invoke('w', { task: 'count the PRs merged this week' });
+		void new RelayAgent({ store: createVoiceTaskStore(), check: async () => ({ action: 'submit', lane: 'long' }), submit }).invoke('w', { task: 'build an app' });
+		void new RelayAgent({ store: createVoiceTaskStore(), submit }).invoke('w', { task: 'no check at all' });
+		await tick(5);
+		// Submission order is not the point (a relay with no check submits before the others' checks resolve).
+		assert.deepEqual(seen.map((a) => [a.task, a.lane]).sort(), [['build an app', 'long'], ['count the PRs merged this week', 'quick'], ['no check at all', undefined]]);
 	});
 
 	it('a call bodhi cancels while it waits is not submitted', async () => {
