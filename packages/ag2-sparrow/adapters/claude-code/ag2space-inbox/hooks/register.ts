@@ -93,7 +93,7 @@ async function cli($: any, s: State, args: string[], stdin?: string): Promise<Cl
   try {
     r = await $.process.run([bin, 'inbox', ...args], stdin === undefined ? {} : { stdin })
   } catch (err: any) {
-    return { ok: false, hard: false, data: { refused: `${bin} did not run: ${err?.message ?? err}` } }
+    return { ok: false, hard: false, data: { refused: `${bin} did not run: ${err?.message ?? err}`, retry: true } }
   }
   let data: any = {}
   try { data = JSON.parse(String(r.stdout || '{}')) } catch { data = { refused: String(r.stdout || r.stderr || '') } }
@@ -214,6 +214,12 @@ async function arm($: any, s: State, inbox: string, results: string): Promise<{ 
           // This session can never take it: the sender gets the interrupted answer, never silence.
           const r = await cli($, s, ['interrupt', rid, '--detail', s.intakeReason])
           if (r.hard) return
+          if (!r.ok && r.data?.retry) {
+            // No result yet (a parked publication, a CLI that did not run): kept, and never aged out.
+            s.stale.delete(entry.name)
+            log(`${rid} interrupted answer not published yet (${r.data?.refused ?? ''}); retried next tick`)
+            continue
+          }
           s.seen.add(entry.name)
           s.answered.add(rid)
           await $.ui.log(`${PLUGIN}: ${rid} answered as interrupted (intake stopped: ${r.ok ? 'settled' : r.data?.refused ?? ''})`, {})

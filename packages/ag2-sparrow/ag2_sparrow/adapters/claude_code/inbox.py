@@ -33,6 +33,10 @@ class Refused(Exception):
     pass
 
 
+class Parked(Refused):
+    """A step that may succeed on a later call (a parked publication): the caller retries."""
+
+
 def text_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
@@ -164,14 +168,21 @@ def interrupt(root, task_id, detail) -> dict:
     interrupted without a call, or the owner-only refusal for one the policy does not admit."""
     lc = _lifecycle(root)
     with records.flocked(records.claims_lock_path(root)):
-        verdict, state = lc.decide(task_id)
-        if verdict != "call":
-            raise Refused("%s is %s; only ABSENT is answered" % (task_id, state))
-        kind, _headers, why = admit(root, task_id, allow_non_owner())
-        body, reason = (INTERRUPTED_BODY, "intake stopped: %s" % detail) if kind else (task_io.NON_OWNER_REFUSED, why)
-        outcome = lc.complete_without_call(task_id, body, reason)
+        rec = lc.claims.load(task_id)
+        kind = None
+        if rec and rec.get("phase") in (lifecycle.RESULT_STAGED, lifecycle.PUBLISHED):
+            # An earlier interrupt staged its answer but could not publish it: publish that one, again.
+            kind = str((rec.get("outcome") or {}).get("detail") or "").startswith("intake stopped")
+            outcome = lc.publish_and_settle(task_id)
+        else:
+            verdict, state = lc.decide(task_id)
+            if verdict != "call":
+                raise Refused("%s is %s; only ABSENT is answered" % (task_id, state))
+            kind, _headers, why = admit(root, task_id, allow_non_owner())
+            body, reason = (INTERRUPTED_BODY, "intake stopped: %s" % detail) if kind else (task_io.NON_OWNER_REFUSED, why)
+            outcome = lc.complete_without_call(task_id, body, reason)
     if outcome != "settled":
-        raise Refused("%s: publication %s" % (task_id, outcome))
+        raise Parked("%s: publication %s; retried" % (task_id, outcome))
     return _mirror(root, task_id, None, {"task_id": task_id, "outcome": outcome, "interrupted": bool(kind)})
 
 
@@ -276,6 +287,9 @@ def main(args) -> int:
     except records.RecordError as e:
         print(json.dumps({"error": "progress write failed: %s" % e, "hard": True}))
         return EXIT_PROGRESS
+    except Parked as e:
+        print(json.dumps({"refused": str(e), "retry": True}))
+        return EXIT_REFUSED
     except (Refused, lifecycle.StateError, lifecycle.ClaimUnreadable, OSError, ValueError) as e:
         print(json.dumps({"refused": str(e)}))
         return EXIT_REFUSED

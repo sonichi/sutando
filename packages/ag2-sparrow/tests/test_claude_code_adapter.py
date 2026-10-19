@@ -2547,9 +2547,18 @@ class InboxCli(ConnectBase):
         rc, out = self.verb("interrupt", self.task("task-g", "guest"))
         self.assertEqual((rc, out["interrupted"]), (0, False))
         self.assertEqual((self.results / "task-g.txt").read_text(), task_io.NON_OWNER_REFUSED, "the policy still answers")
-        with mock.patch.object(inbox.lifecycle.Lifecycle, "complete_without_call", return_value="parked"):
+        with mock.patch.object(inbox.lifecycle.Lifecycle, "_publish", return_value=None):
             rc, out = self.verb("interrupt", self.task("task-p"))
-        self.assertEqual((rc, "publication parked" in out["refused"]), (1, True))
+        self.assertEqual((rc, "publication parked" in out["refused"], out["retry"]), (1, True, True), "soft: retried")
+        lc = inbox._lifecycle(self.root)
+        self.assertEqual(lc.claims.load("task-p")["phase"], inbox.lifecycle.RESULT_STAGED)
+        self.assertFalse((self.results / "task-p.txt").exists(), "no result yet")
+        rc, out = self.verb("interrupt", "task-p")
+        self.assertEqual((rc, out["outcome"], out["interrupted"]), (0, "settled", True), "the staged answer is published")
+        self.assertEqual((self.results / "task-p.txt").read_text(), inbox.INTERRUPTED_BODY)
+        self.assertEqual(lc.claims.load("task-p")["phase"], inbox.lifecycle.SETTLED)
+        rc, out = self.verb("interrupt", "task-p")
+        self.assertEqual((rc, "retry" in out), (1, False), "settled: a hard refusal, never retried")
 
     def test_with_allow_non_owner_every_non_owner_is_claimed_with_its_admission_and_a_tierless_task_still_refused(self):
         self.configure(ALLOW_NON_OWNER="1")

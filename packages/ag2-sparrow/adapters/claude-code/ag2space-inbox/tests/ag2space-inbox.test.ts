@@ -20,7 +20,7 @@ type Claim = { attempt: number; phase: string; token?: string; hash?: string; tu
 // tests/test_claude_code_adapter.py, and the lifecycle verbs by the Python inbox tests.
 function host(on: any, opts: { verdict?: string; env?: Record<string, string>; rejectSubmits?: number; verifierFails?: boolean; markerFails?: number;
                                progressFails?: number; sessionIds?: string[]; cwdInode?: string; allowNonOwner?: boolean;
-                               claimAs?: Record<string, unknown> } = {}) {
+                               claimAs?: Record<string, unknown>; interruptParks?: number; interruptThrows?: number } = {}) {
   const files: Record<string, string> = {}
   const submitted: string[] = []
   const runs: string[][] = []
@@ -34,6 +34,8 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
   let failVerb = ''
   let marks = 0
   let markerFailLeft = opts.markerFails ?? 0
+  let parksLeft = opts.interruptParks ?? 0
+  let throwsLeft = opts.interruptThrows ?? 0
   on('session.start', () => ({ cwd: '/w' }))
   on('session.id', () => ({ value: live.sid }))
   on('session.cwd', () => ({ value: '/w/tasks' }))
@@ -70,6 +72,7 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
       return { value: { exitCode: 0, stdout: (++marks).toString(16).padStart(16, '0') + '\n', stderr: '' } }
     }
     if (argv[0] === 'python3' && argv[2].includes('sha256')) return { value: { exitCode: 0, stdout: hash(e.init.stdin) + '\n', stderr: '' } }
+    if (argv[2] === 'interrupt' && throwsLeft-- > 0) throw new Error('spawn failed')
     if (argv[0] !== 'ag2-sparrow-claude-local' || argv[1] !== 'inbox') return { value: { exitCode: 2, stdout: '', stderr: 'unknown' } }
     const verb = argv[2]
     const task = argv[3]
@@ -123,9 +126,12 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
       return answer({ outcome: 'settled' })
     }
     if (verb === 'interrupt') {
+      // As the CLI: a staged interrupt is published by the next call; a parked publication is a soft retry.
       if (`/out/${task}.txt` in files && files[`/out/${task}.txt`].length) return out(1, { refused: `${task} is LIVE_READY` })
-      if (c) return out(1, { refused: `${task}: attempt ${c.attempt} is ${c.phase}` })
-      claims[task] = { attempt: 0, phase: 'SETTLED', body: '[AG2 Space] This attempt was interrupted before the session answered' }
+      if (c && c.phase !== 'RESULT_STAGED') return out(1, { refused: `${task}: attempt ${c.attempt} is ${c.phase}` })
+      if (!c) claims[task] = { attempt: 0, phase: 'RESULT_STAGED', body: '[AG2 Space] This attempt was interrupted before the session answered' }
+      if (parksLeft-- > 0) return out(1, { refused: `${task}: publication parked; retried`, retry: true })
+      claims[task].phase = 'SETTLED'
       files[`/out/${task}.txt`] = claims[task].body!
       return answer({ task_id: task, outcome: 'settled', interrupted: true })
     }
@@ -472,6 +478,49 @@ test('a task arriving while intake is stopped gets the interrupted answer, never
     .toEqual(['--detail', 'session id changed in the pane (sid-1 -> sid-2); use /compact or install --new-session'])
   await h.clock.advance(5000)
   expect(verbs(h).filter((v: string) => v === 'interrupt').length).toBe(2)   // each answered once
+})
+
+test('a parked interrupted answer is retried on the next tick until published, then answered once', async ($, on) => {
+  const h = host(on, { interruptParks: 1 })
+  await arm($, h)
+  h.setSid('sid-2')
+  await h.clock.advance(1000)
+  h.files['/in/task-soft.txt'] = TASK('task-soft')
+  await h.clock.advance(1000)
+  expect(h.claims['task-soft'].phase).toBe('RESULT_STAGED')
+  expect(h.files['/out/task-soft.txt']).toBe(undefined)
+  await h.clock.advance(1000)
+  expect(h.claims['task-soft'].phase).toBe('SETTLED')
+  expect(h.files['/out/task-soft.txt']).toContain('interrupted')
+  await h.clock.advance(40000)                      // past the stale-tick bound: nothing further
+  expect(verbs(h).filter((v: string) => v === 'interrupt').length).toBe(2)
+})
+
+test('a parked answer is retried past the stale-tick bound: no retry limit while no result exists', async ($, on) => {
+  const h = host(on, { interruptParks: 40 })
+  await arm($, h)
+  h.setSid('sid-2')
+  await h.clock.advance(1000)
+  h.files['/in/task-long.txt'] = TASK('task-long')
+  for (let i = 0; i < 42; i++) await h.clock.advance(1000)
+  expect(h.files['/out/task-long.txt']).toContain('interrupted')
+  expect(h.claims['task-long'].phase).toBe('SETTLED')
+})
+
+test('an interrupt whose CLI did not run is retried; a hard refusal is not', async ($, on) => {
+  const h = host(on, { interruptThrows: 1 })
+  await arm($, h)
+  h.setSid('sid-2')
+  await h.clock.advance(1000)
+  h.files['/in/task-thrown.txt'] = TASK('task-thrown')
+  await h.clock.advance(1000)
+  expect(h.files['/out/task-thrown.txt']).toBe(undefined)
+  await h.clock.advance(1000)
+  expect(h.files['/out/task-thrown.txt']).toContain('interrupted')
+  h.claims['task-done'] = { attempt: 1, phase: 'SETTLED' }
+  h.files['/in/task-done.txt'] = TASK('task-done')
+  await h.clock.advance(5000)
+  expect(h.runs.filter((a: string[]) => a[2] === 'interrupt' && a[3] === 'task-done').length).toBe(1)
 })
 
 test('a hard progress failure while answering a stopped intake: the answer stands and is never repeated', async ($, on) => {
