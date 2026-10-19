@@ -135,7 +135,7 @@ def _dispatch_events(a):
             try:
                 filters = json.loads(a.filters)
             except ValueError as e:
-                # Structured error, exit 0 — same convention as doc's --file failure.
+                # Structured error, exit 0 — same convention as `events emit --content`.
                 return {"ok": False, "reason": f"--filters is not valid JSON: {e}"}
         return _events.subscribe(a.room_id, types, filters=filters, agent_mxid=a.agent_mxid)
     if a.events_cmd == "unsubscribe":
