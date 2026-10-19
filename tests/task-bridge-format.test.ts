@@ -178,15 +178,15 @@ describe('buildVoiceTaskHeader (pure) — both header shapes', () => {
 		_pendingTasksForTest.set('task-app', entry('build an app', base, 'long'));
 		_pendingTasksForTest.set('task-doc', entry('write a doc', base + 1, 'long'));
 		_pendingTasksForTest.set('task-prs', entry('count PRs', base + 2, 'quick'));
-		_pendingTasksForTest.set('task-cat', entry('draw a cat', base + 3, 'quick'));
+		_pendingTasksForTest.set('task-file', entry('send the file to Discord', base + 3, 'quick'));
 		_pendingTasksForTest.set('task-old', entry('an older build', base + 4));
 		try {
-			assert.equal(voiceTasksAhead('task-cat'), 1, 'one quick task ahead, not the two long ones');
+			assert.equal(voiceTasksAhead('task-file'), 1, 'one quick task ahead, not the two long ones');
 			assert.equal(voiceTasksAhead('task-prs'), 0);
 			assert.equal(voiceTasksAhead('task-doc'), 1, 'the app, not the quick ones');
 			assert.equal(voiceTasksAhead('task-old'), 2, 'unjudged counts with the long ones');
 		} finally {
-			for (const id of ['task-app', 'task-doc', 'task-prs', 'task-cat', 'task-old']) _pendingTasksForTest.delete(id);
+			for (const id of ['task-app', 'task-doc', 'task-prs', 'task-file', 'task-old']) _pendingTasksForTest.delete(id);
 		}
 	});
 

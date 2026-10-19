@@ -760,7 +760,9 @@ export class RelayAgent<O = unknown> implements PersistentSubagentInstance {
 			}
 		}
 		this.askedAt = 0; // this request goes; the next vague one may be asked about again
-		const submitted = await this.deps.submit(lane ? { ...args, lane } : args, origin);
+		// The lane is the check's judgement alone: one the voice model wrote into its call is dropped.
+		const { lane: _fromModel, ...ownArgs } = args as Record<string, unknown> & { lane?: unknown };
+		const submitted = await this.deps.submit(lane ? { ...ownArgs, lane } : ownArgs, origin);
 		const taskId = submitted.taskId;
 		if (submitted.status !== 'pending' || typeof taskId !== 'string') return JSON.stringify(submitted);
 		const replaces = typeof args.replaces === 'string' ? args.replaces.trim() : '';

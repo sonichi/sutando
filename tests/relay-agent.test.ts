@@ -291,6 +291,17 @@ describe('relay agent: review of #5348, should-fixes', () => {
 		assert.deepEqual(submitted, ['查一下最新的那个 PR'], 'not asked a second time');
 	});
 
+	it('a lane the voice model wrote into its call never reaches the submission; only the check\'s does', async () => {
+		const seen: Array<Record<string, unknown>> = [];
+		const submit = async (a: Record<string, unknown>) => { seen.push(a); return { status: 'pending' as const, taskId: `t${seen.length}`, queuedAhead: 0, watcherOnline: true }; };
+		void new RelayAgent({ store: createVoiceTaskStore(), submit }).invoke('w', { task: 'count the PRs', lane: 'quick' });
+		void new RelayAgent({ store: createVoiceTaskStore(), check: async () => ({ action: 'submit' }), submit }).invoke('w', { task: 'build an app', lane: 'quick' });
+		void new RelayAgent({ store: createVoiceTaskStore(), check: async () => ({ action: 'submit', lane: 'long' }), submit }).invoke('w', { task: 'write a doc', lane: 'quick' });
+		await new Promise((r) => setTimeout(r, 50));
+		assert.deepEqual(seen.map((a) => [a.task, a.lane]).sort(), [['build an app', undefined], ['count the PRs', undefined], ['write a doc', 'long']]);
+		assert.ok(seen.every((a) => !('lane' in a) || a.lane === 'long'), 'no model-supplied lane survives');
+	});
+
 	it('the check\'s lane reaches the submission; without a check there is none', async () => {
 		const seen: Array<Record<string, unknown>> = [];
 		const submit = async (args: Record<string, unknown>) => { seen.push(args); return { status: 'pending', taskId: `task-${seen.length}`, queuedAhead: 0, watcherOnline: true, message: 'm' }; };
