@@ -270,6 +270,11 @@ function acquirePidLock(): void {
 
 // Model configuration — override via .env for cost/quality tuning
 const VOICE_MODEL = process.env.VOICE_MODEL || 'gemini-2.5-flash';
+/** How long the model may stay silent after the user's turn before stall recovery starts (bodhi's default 5 s). */
+const VOICE_RESPONSE_WATCHDOG_MS = Math.max(2_000, Number(process.env.VOICE_RESPONSE_WATCHDOG_MS) || 5_000);
+/** When the model stalls, bodhi first re-sends the user's last utterance as a complete turn on the same connection;
+ *  only if that fails does it reconnect. Off: VOICE_WATCHDOG_REPLAY=0. */
+const VOICE_WATCHDOG_REPLAY = process.env.VOICE_WATCHDOG_REPLAY !== '0';
 // Per-user voice config (native-audio model + googleSearch grounding) is
 // data, not code: it lives in the workspace, NOT in the git repo.
 //   live config: $SUTANDO_WORKSPACE/config/voice-agent.json
@@ -1065,6 +1070,10 @@ async function main() {
 		// A lost upstream parks in UPSTREAM_LOST with the WS listener up; bodhi's
 		// upstreamRecovery decides when to redial, park an idle upstream and back off.
 		upstreamLossPolicy: 'hold',
+		// Stall recovery: the silence that starts it is tunable per install, and stage one replays the
+		// retained utterance in place instead of reconnecting.
+		responseWatchdogMs: VOICE_RESPONSE_WATCHDOG_MS,
+		watchdogReplayRecovery: VOICE_WATCHDOG_REPLAY,
 		upstreamRecovery: {
 			idleParkMs: IDLE_TEARDOWN_MS,
 			stuckConnectingMs: parseStuckConnectingMs(process.env.VOICE_STUCK_CONNECTING_MS),
