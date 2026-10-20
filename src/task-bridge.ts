@@ -15,6 +15,7 @@ import { tmpdir } from 'node:os';
 import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
 import { renderItems } from './voice-conversation-summary.js';
+import type { WorkLane } from './work-request-check.js';
 import { resolveWorkspace } from './workspace_default.js';
 import { tryStampText } from './task_envelope.js';
 import { localTimeValue } from './local_time.js';
@@ -106,6 +107,7 @@ const _HEADER_KEYS = [
 	'schedule_name', 'schedule_slot',
 	'content_modalities', 'media_form', 'attachments', 'platform_card',
 	'instance_id', 'collaborator', 'requested_worker', 'wire_source', 'picker_command', 'picker_args', 'hitl_click', 'owner_mentioned', 'task_layout', 'local_time',
+	'lane',
 ];
 const _HEADER_RE = new RegExp(`^(?:${_HEADER_KEYS.join('|')})\\s*:`, 'i');
 const _FENCE_RE = /^={3,}/;
@@ -456,7 +458,7 @@ const DEFAULT_TASK_TIMEOUT_MS = 60 * 60 * 1000; // 1 hour default
 // from submission (user feedback P1-4: a 10-minute task timed out in the queue
 // behind other work, the agent said it "ran out of time", and the task file
 // was archived out from under the core).
-type PendingTask = { submittedAt: number; timeoutMs: number; dmOnTimeout: boolean; taskText: string; startedAt?: number };
+type PendingTask = { submittedAt: number; timeoutMs: number; dmOnTimeout: boolean; taskText: string; startedAt?: number; lane?: WorkLane };
 const _pendingTasks = new Map<string, PendingTask>();
 /** Test-only: the pending map, to seed and inspect around _sweepTimeouts. */
 export const _pendingTasksForTest = _pendingTasks;
@@ -559,14 +561,14 @@ export function voiceTaskState(taskId: string): VoiceTaskState {
 }
 
 /** Voice tasks still awaiting a result, latest first: this process's pending ones plus the table's (after a restart). */
-function _openVoiceTasks(): Array<{ id: string; text: string; submittedAt: number }> {
-	const open = new Map<string, { id: string; text: string; submittedAt: number }>();
+function _openVoiceTasks(): Array<{ id: string; text: string; submittedAt: number; lane?: WorkLane }> {
+	const open = new Map<string, { id: string; text: string; submittedAt: number; lane?: WorkLane }>();
 	for (const [id, row] of voiceTaskStore.list()) {
 		if (row.submittedAt === undefined || row.cancelRequested) continue;
 		const state = voiceTaskState(id);
-		if (state === 'queued' || state === 'started') open.set(id, { id, text: row.text ?? '', submittedAt: row.submittedAt });
+		if (state === 'queued' || state === 'started') open.set(id, { id, text: row.text ?? '', submittedAt: row.submittedAt, lane: row.lane });
 	}
-	for (const [id, p] of _pendingTasks) open.set(id, { id, text: p.taskText, submittedAt: p.submittedAt });
+	for (const [id, p] of _pendingTasks) open.set(id, { id, text: p.taskText, submittedAt: p.submittedAt, lane: p.lane });
 	return [...open.values()].filter((t) => !_cancelledVoiceTasks.has(t.id)).sort((a, b) => b.submittedAt - a.submittedAt);
 }
 
@@ -688,8 +690,11 @@ export function reconcileVoiceTasks(deliver: RelayDeliver, isInFlight: (taskId: 
 
 /** How many of the user's other voice tasks are still open ahead of `taskId`. */
 export function voiceTasksAhead(taskId: string): number {
-	const self = voiceTaskStore.get(taskId)?.submittedAt ?? Date.now();
-	return _openVoiceTasks().filter((t) => t.id !== taskId && t.submittedAt <= self).length;
+	const me = voiceTaskStore.get(taskId);
+	const self = me?.submittedAt ?? _pendingTasks.get(taskId)?.submittedAt ?? Date.now();
+	// A quick task waits only behind quick ones: the core does it at once, apart from the long work it has.
+	const quick = (me?.lane ?? _pendingTasks.get(taskId)?.lane) === 'quick';
+	return _openVoiceTasks().filter((t) => t.id !== taskId && t.submittedAt <= self && (t.lane === 'quick') === quick).length;
 }
 
 /** A task the voice agent submitted: only these may be reported as cancelled outright. */
@@ -906,7 +911,7 @@ export function _forwardOfflineThenArchive(
 
 /** Every header line of a voice task above `task:`; one writer for the work and cancel tools. An
  *  origin-bound task stays `source: voice`, takes the target as `channel_id`, and adds the adapter's keys. */
-export function buildVoiceTaskHeader(taskId: string, timestamp: string, ownerId: string, origin: VoiceSessionOrigin | null): string {
+export function buildVoiceTaskHeader(taskId: string, timestamp: string, ownerId: string, origin: VoiceSessionOrigin | null, lane?: WorkLane): string {
 	const lines = [
 		`id: ${taskId}`,
 		`timestamp: ${timestamp}`,
@@ -922,6 +927,9 @@ export function buildVoiceTaskHeader(taskId: string, timestamp: string, ownerId:
 		if (!_HEADER_KEYS.includes(key) || typeof value !== 'string') continue;
 		lines.push(`${key}: ${value.replace(/[\r\n]+/g, ' ')}`);
 	}
+	// The relay's check judged it quick (one lookup, command or short generation) or long (building, writing,
+	// research): the core does a quick one at once and gives a long one to a subagent, so neither waits on the other.
+	if (lane) lines.push(`lane: ${lane}`);
 	lines.push(`user_id: ${ownerId}`, 'access_tier: owner', 'priority: urgent');
 	return lines.join('\n') + '\n';
 }
@@ -1232,7 +1240,8 @@ export const workTool: ToolDefinition = {
 		}
 		// Reserved before the first await: an identical call during the spoken-turn wait
 		// must meet this entry in the dedup check above, not write a second task file.
-		const pendingEntry = () => ({ submittedAt: Date.now(), timeoutMs, dmOnTimeout: dm_on_timeout === true, taskText: task });
+		const lane: WorkLane | undefined = (args as { lane?: unknown }).lane === 'quick' ? 'quick' : (args as { lane?: unknown }).lane === 'long' ? 'long' : undefined;
+		const pendingEntry = () => ({ submittedAt: Date.now(), timeoutMs, dmOnTimeout: dm_on_timeout === true, taskText: task, lane });
 		_pendingTasks.set(taskId, pendingEntry());
 		try {
 			const timestamp = new Date().toISOString();
@@ -1276,7 +1285,7 @@ export const workTool: ToolDefinition = {
 			const originGuidance = origin?.contextLine ? `\n${origin.contextLine.replace(/[\r\n]+/g, ' ')}` : '';
 			_rememberTaskOrigin(taskId, origin);
 			const content =
-				buildVoiceTaskHeader(taskId, timestamp, ownerId, origin) +
+				buildVoiceTaskHeader(taskId, timestamp, ownerId, origin, lane) +
 				`task: ${confineUserContent(task)}${originGuidance}${spokenBlock}${contextBlock}\n`;
 			await _delegation.submitTask(taskId, content);
 		} catch (err) {
@@ -1288,10 +1297,10 @@ export const workTool: ToolDefinition = {
 		// default was producing unwanted DMs). Caller must explicitly pass
 		// dm_on_timeout: true on critical tasks where they want the fallback.
 		_pendingTasks.set(taskId, pendingEntry());
-		voiceTaskStore.add(taskId, task);
+		voiceTaskStore.add(taskId, task, undefined, lane);
 		// Record owner activity for status-aware-pivot in proactive loop
 		writeOwnerActivity('voice', task);
-		console.log(`${ts()} [TaskBridge] Task ${taskId}: ${task.slice(0, 100)}`);
+		console.log(`${ts()} [TaskBridge] Task ${taskId}${lane ? ` (${lane})` : ''}: ${task.slice(0, 100)}`);
 		_sendTaskStatus?.(taskId, 'working', task.slice(0, 60));
 		// The user's own voice tasks still open ahead of this one, from the relay agent's table.
 		const queuedAhead = voiceTasksAhead(taskId);

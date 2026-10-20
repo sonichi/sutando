@@ -10,7 +10,9 @@
  * Any failure or delay lets the request through: the check never blocks work.
  */
 
-export type WorkCheck = { action: 'submit' } | { action: 'ask'; question: string } | { action: 'duplicate'; of: string };
+/** How long the core will take: a quick task is one lookup, command or message; a long one builds, writes, researches or generates a picture. */
+export type WorkLane = 'quick' | 'long';
+export type WorkCheck = { action: 'submit'; lane?: WorkLane } | { action: 'ask'; question: string } | { action: 'duplicate'; of: string };
 
 /** A task the user asked for that has not been answered yet: the check compares a new request with these. */
 export interface OpenTask {
@@ -37,23 +39,27 @@ export const WORK_CHECK_TIMEOUT_MS = 4_000;
 
 export function workCheckPrompt(i: WorkCheckInput): string {
 	return [
-		'A voice assistant wrote a request for its back-end agent (the core), which does lookups, actions and file work. Before it is sent, decide one thing: does the request identify WHICH thing it is about?',
+		'A voice assistant wrote a request for its back-end agent (the core), which does lookups, actions and file work. Before it is sent, decide two things: does the request identify WHICH thing it is about, and is it quick or long?',
 		'Rules:',
 		'- The request is about a specific thing when it names a type: a PR, an issue, a file, a document, a person, a repository, a meeting, a place.',
 		'- It identifies it when it gives the number, name or title, or when the user is continuing the same request in the recent words (e.g. answering the assistant\'s "which PR?").',
 		'- "the PR", "that file", "the meeting", "那个 PR" with no number, name or title = not identified. Do NOT fill it in from a PR, file or meeting that came up earlier, not even in the request just before: ask. The only exception is the user answering the assistant\'s own "which one?".',
 		'- A bare number is identified when the recent words show what kind of thing the numbers are (e.g. the user has been asking about PRs).',
 		'- The same request as one of the open tasks (same thing, same ask, maybe worded differently or misheard) = duplicate.',
+		'- lane "quick": one lookup, one command, one count, one message or file sent, a short text; done in well under a minute with no building. lane "long": building or writing something (an app, a document, code), generating or drawing a picture (a minute or more: 2026-10-18 a lizard picture held three lookups behind it), research across sources, or many steps.',
 		'Reply with JSON only:',
 		'{"action":"duplicate","of":"<id of the open task>"} when it is the same request as an open task.',
 		'{"action":"ask","question":"..."} when a specific thing is not identified. One short question in the user\'s language asking only for the missing piece.',
-		'{"action":"submit"} otherwise, including requests about no specific thing (a general summary, a search, a how-to).',
+		'{"action":"submit","lane":"quick"|"long"} otherwise, including requests about no specific thing (a general summary, a search, a how-to).',
 		'Examples:',
 		'Request "Check the status of the PR"; recent words "帮我查一下那个 PR 的状态" -> {"action":"ask","question":"你说的是哪个 PR？"}',
-		'Request "Check the status of PR 5302"; recent words "帮我查一下 PR5302 的状态" -> {"action":"submit"}',
+		'Request "Check the status of PR 5302"; recent words "帮我查一下 PR5302 的状态" -> {"action":"submit","lane":"quick"}',
 		'Request "Summarize the meeting notes"; recent words "帮我总结一下会议纪要" -> {"action":"ask","question":"哪一场会议的纪要？"}',
-		'Request "List the PRs merged this week in sonichi/sutando" -> {"action":"submit"}',
-		'Request "Check 5332"; recent words "帮我查一下 5428 改了什么 … 帮我查一下 5332" -> {"action":"submit"}',
+		'Request "List the PRs merged this week in sonichi/sutando" -> {"action":"submit","lane":"quick"}',
+		'Request "Check 5332"; recent words "帮我查一下 5428 改了什么 … 帮我查一下 5332" -> {"action":"submit","lane":"quick"}',
+		'Request "Draw a picture of a squirrel" -> {"action":"submit","lane":"long"}',
+		'Request "Create a calorie tracking app that estimates calories from food photos" -> {"action":"submit","lane":"long"}',
+		'Request "Write a report comparing the three vendors" -> {"action":"submit","lane":"long"}',
 		'Request "Check the status of that PR"; recent words "帮我查一下 PR 5302 的状态 … (answered) … 帮我查一下那个 PR 的状态" -> {"action":"ask","question":"你说的是哪个 PR？"}',
 		'Request "Summarize PR 5333"; open task task-9 "帮我查一下 PR 5333 改了什么" -> {"action":"duplicate","of":"task-9"}',
 		'',
@@ -84,6 +90,8 @@ export function parseWorkCheck(text: string, openTasks: OpenTask[] = []): WorkCh
 		if (d.action === 'ask' && typeof d.question === 'string' && d.question.trim()) return { action: 'ask', question: d.question.trim() };
 		// Only an id that is really open: a made-up one must not swallow a request.
 		if (d.action === 'duplicate' && typeof d.of === 'string' && openTasks.some((t) => t.id === d.of)) return { action: 'duplicate', of: d.of };
+		const lane = (d as { lane?: unknown }).lane;
+		if (lane === 'quick' || lane === 'long') return { action: 'submit', lane };
 	} catch { /* not JSON: submit */ }
 	return { action: 'submit' };
 }

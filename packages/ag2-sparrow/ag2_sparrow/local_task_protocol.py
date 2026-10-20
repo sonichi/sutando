@@ -178,6 +178,8 @@ KNOWN_HEADER_KEYS = (
     # them, and the guard defangs forged body copies of the same names.
     "thread_ts", "reply_thread_ts", "reply_to_event", "reply_to_me", "reply_to_sender",
     "addressed_to", "callSid", "caller",
+    # The relay's judgement of a voice task: quick or long; the core dispatches on it.
+    "lane",
     # Thread membership, distinct from the reply target above; the room is
     # carried because a relation only resolves inside its own room.
     "thread_root", "source_room_id",
