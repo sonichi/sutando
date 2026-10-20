@@ -102,6 +102,7 @@ def recover_dead_generation(root) -> int:
                     dead[key] = {"pid": gen["pid"], "start": gen.get("start")}
         for gen in dead.values():
             lc.recover(generation=gen, proof=False)
+        lc.reconcile_unbound()
     return len(dead)
 
 
@@ -234,12 +235,12 @@ def _clear_stuck(root, task_id) -> bool:
 
 
 def _settle_terminal(lc, task_id) -> None:
-    """A local claim at RESULT_STAGED or PUBLISHED whose result already exists is settled on that result
+    """A local or call-less claim at RESULT_STAGED or PUBLISHED whose result already exists is settled on that result
     (the publisher records it and adds none); a SETTLED one has its settlement completed (the settled
     ledger, the staged body) before any cleanup; Parked when it does not settle now. The caller holds
     claims.lock."""
     rec = lc.claims.load(task_id)
-    if not rec or rec.get("claim_mode") != lifecycle.LOCAL:
+    if not rec or rec.get("claim_mode") not in (None, lifecycle.LOCAL):
         return
     if rec["phase"] == lifecycle.SETTLED:
         lc.reconcile_settled(task_id)
@@ -289,9 +290,9 @@ def claim(root, task_id) -> dict:
                 if not lost:
                     raise Refused(str(e))
         else:
-            terminal = resolved(lc, task_id)[0]
-            if terminal:
+            if state in lifecycle.TERMINAL:
                 _settle_terminal(lc, task_id)
+            terminal = resolved(lc, task_id)[0]
     if lost:
         # After claims.lock, as every mirror write; a mirror that fails is the hard answer, the Mod retries.
         out = _mirror(root, task_id, None, {"task_id": task_id, "phase": lifecycle.SETTLED, "answered": lost}, unstuck=True)
@@ -317,7 +318,8 @@ def resolved(lc, task_id) -> "tuple[bool, str]":
     try:
         rec = lc.claims.load(task_id)
         if rec and rec.get("phase") == lifecycle.SETTLED:
-            return True, lifecycle.SETTLED
+            # Final only once the settlement is whole (ledger entry, no staged body); else a retry.
+            return lc.settlement_complete(task_id), lifecycle.SETTLED
         state = lc.classify(task_id)
         return state in lifecycle.TERMINAL, state
     except Exception as e:
@@ -393,7 +395,9 @@ def interrupt(root, task_id, detail) -> dict:
                 # An earlier interrupt staged its answer but could not publish it: publish that one.
                 kind = str((rec.get("outcome") or {}).get("detail") or "").startswith("intake stopped")
                 answered = lc.publish_and_settle(task_id) == "settled"
-            elif phase != lifecycle.SETTLED:
+            elif phase == lifecycle.SETTLED:
+                lc.reconcile_settled(task_id)
+            else:
                 verdict, state = lc.decide(task_id)
                 if verdict == "call":
                     kind, _headers, refusal = admit(root, task_id, allow_non_owner())

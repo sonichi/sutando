@@ -2900,18 +2900,40 @@ class LocalClaimTest(Base):
         life = self.life()
         self.confirmed(life, "task-led")
         self.assertEqual(life.stage_result("task-led", b"answer\n", "turn-1"), "staged")
+        life.claims.stage("task-led", b"a legacy staged body\n")      # a real file, so an unstage that does nothing fails
         with mock.patch.object(self.lc.SettledIds, "add", side_effect=self.lc.LedgerIOError("cannot append")):
             with self.assertRaises(self.lc.LedgerIOError):
                 life.publish_and_settle("task-led")
         self.assertEqual((life.claims.load("task-led")["phase"], "task-led" in life.settled), (self.lc.SETTLED, False))
+        self.assertTrue((life.claims.dir("task-led") / "body").is_file())
+        self.assertFalse(life.settlement_complete("task-led"))
         self.assertTrue(life.reconcile_settled("task-led"))
         self.assertTrue(life.reconcile_settled("task-led"), "idempotent")
         self.assertIn("task-led", self.lc.SettledIds(life.settled.path).ids, "durable in the ledger, once")
         self.assertEqual(open(life.settled.path).read().count("task-led\n"), 1)
-        self.assertFalse((life.claims.dir("task-led") / "body").exists())
+        self.assertFalse((life.claims.dir("task-led") / "body").exists(), "the real staged body removed")
+        self.assertTrue(life.settlement_complete("task-led"))
         self.confirmed(life, "task-open")
         self.assertFalse(life.reconcile_settled("task-open"))
         self.assertFalse(life.reconcile_settled("task-none"))
+
+    def test_two_lifecycles_loaded_before_either_appends_record_a_settled_id_once(self):
+        """Two instances loaded while the ledger is empty (two waiting CLI calls) settle the same id one after
+        the other: the append re-reads the ledger under its lock, so the id is recorded exactly once."""
+        self.local_dir()
+        first, second = self.life(), self.life()
+        self.confirmed(first, "task-race")
+        self.assertEqual(first.stage_result("task-race", b"answer\n", "turn-1"), "staged")
+        first.claims.save(dict(first.claims.load("task-race"), phase=self.lc.SETTLED, settled_at=1.0))
+        self.assertEqual(("task-race" in first.settled, "task-race" in second.settled), (False, False), "both stale")
+        self.assertTrue(first.reconcile_settled("task-race"))
+        self.assertTrue(second.reconcile_settled("task-race"))
+        self.assertEqual(open(first.settled.path).read().count("task-race\n"), 1, "one ledger line")
+        third = self.lc.SettledIds(first.settled.path)
+        stale = self.lc.SettledIds(first.settled.path)
+        third.add("task-race2")
+        stale.add("task-race2")
+        self.assertEqual(open(first.settled.path).read().splitlines(), ["task-race", "task-race2"])
 
     def test_one_generation_recovery_pass_delivers_a_verifying_blob_with_no_blob_write(self):
         """One recovery pass, as hold runs it once per start, with the blob writer failing on every call:

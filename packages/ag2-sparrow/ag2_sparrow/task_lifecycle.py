@@ -34,6 +34,10 @@ from __future__ import annotations
 
 import errno
 import hashlib
+try:
+    import fcntl
+except ImportError:                                     # no flock: one writer per ledger, as before
+    fcntl = None
 import importlib
 import json
 import os
@@ -605,7 +609,8 @@ class SettledIds:
         return task_id in self.ids
 
     def add(self, task_id):
-        """Append, fsync, and only then remember. Any failure raises LedgerError."""
+        """Append, fsync, and only then remember. Any failure raises LedgerError. Read-check-append is one
+        critical section under the ledger's own flock, so instances loaded earlier never append an id twice."""
         if task_id in self.ids:
             return
         if not local_task_protocol.valid_task_id(task_id):
@@ -613,8 +618,13 @@ class SettledIds:
         data = (task_id + "\n").encode("utf-8")
         try:
             created = not os.path.exists(self.path)
-            fd = os.open(self.path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_CLOEXEC", 0), 0o644)
+            fd = os.open(self.path, os.O_RDWR | os.O_APPEND | os.O_CREAT | getattr(os, "O_CLOEXEC", 0), 0o644)
             try:
+                if fcntl is not None:
+                    fcntl.flock(fd, fcntl.LOCK_EX)
+                held = os.pread(fd, os.fstat(fd).st_size, 0).split(b"\n")[:-1]
+                if data[:-1] in held:
+                    data = b""
                 while data:
                     data = data[os.write(fd, data):]
                 os.fsync(fd)
@@ -988,7 +998,7 @@ class Lifecycle:
         rec = self.claims.load(task_id) or {"schema": 1, "task_id": task_id, "attempt": 0, "created_at": self.clock()}
         self.log("settled without a result ->", task_id, reason)
         self._save(rec, phase=SETTLED, settled_at=self.clock(), reason=reason)
-        self.settled.add(task_id)
+        self.reconcile_settled(task_id)
 
     def _settle(self, rec):
         self._save(rec, phase=SETTLED, settled_at=self.clock())
@@ -1006,6 +1016,25 @@ class Lifecycle:
             self.settled.add(task_id)
         self.claims.unstage(task_id)
         return True
+
+    def settlement_complete(self, task_id):
+        """Whether a SETTLED claim's settlement is whole: its id in the ledger and no staged body left. What
+        every report of a settled or final claim requires; reconcile_settled is what makes it so."""
+        rec = self.claims.load(task_id)
+        return bool(rec and rec["phase"] == SETTLED and task_id in self.settled
+                    and not os.path.lexists(self.claims.dir(task_id) / "body"))
+
+    def reconcile_unbound(self, now=None):
+        """The SETTLED claims no generation owns (answered without a call): each settlement completed, and
+        compacted once due, as generation recovery does for its own. Under claims.lock, by the caller."""
+        now = self.clock() if now is None else now
+        for task_id, rec in self._claims_readable().items():
+            if not rec or rec.get("generation") or rec.get("claim_mode") not in (None, LOCAL) or rec["phase"] != SETTLED:
+                continue
+            self.reconcile_settled(task_id)
+            if now - rec.get("settled_at", now) > COMPACT_AFTER:
+                self.claims.remove(task_id)
+        self.settled.sync()
 
     def _holds_body(self, task_id, body):
         """Labels a settled publication won when some generation holds exactly our bytes."""
@@ -1100,7 +1129,11 @@ class Lifecycle:
             rec = self._save(rec, phase=PUBLISHED, published=published)
         if rec["phase"] == PUBLISHED:
             self._settle(rec)
-        return "settled" if rec["phase"] == SETTLED else "parked"
+        if rec["phase"] != SETTLED:
+            return "parked"
+        # Settled is reported only once the settlement is whole, also for a claim found already SETTLED.
+        self.reconcile_settled(task_id)
+        return "settled"
 
     def _publish(self, rec):
         task_id, attempt = rec["task_id"], rec["attempt"]

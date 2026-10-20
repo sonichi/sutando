@@ -3433,6 +3433,7 @@ class InboxCli(ConnectBase):
         self.confirmed(t)
         self.assertEqual(self.verb("stage", t, "turn-1", stdin=b"the accepted answer\n")[0], 0)
         lc.claims.save(dict(lc.claims.load(t), phase=inbox.lifecycle.TURN_CONFIRMED))
+        lc.claims.stage(t, b"a legacy staged body\n")       # a real file, so an unstage that does nothing fails
         real_add, hits = inbox.lifecycle.SettledIds.add, []
 
         def add_faults_once(ledger, task_id):
@@ -3446,10 +3447,11 @@ class InboxCli(ConnectBase):
         ledger = lambda: inbox._lifecycle(self.root).settled.ids     # noqa: E731
         self.assertEqual((lc.claims.load(t)["phase"], t in ledger()), (inbox.lifecycle.SETTLED, False))
         self.assertEqual((self.results / (t + ".txt")).read_text(), "the accepted answer\n")
+        self.assertTrue((lc.claims.dir(t) / "body").is_file(), "the body is still there after the fault")
         rc, out = self.verb("claim", t)
         self.assertEqual((rc, "retry" in out, out["refused"]), (1, False, "%s is LIVE_READY; only ABSENT may be submitted" % t), out)
         self.assertIn(t, ledger(), "the settlement completed before the final refusal")
-        self.assertFalse((lc.claims.dir(t) / "body").exists())
+        self.assertFalse((lc.claims.dir(t) / "body").exists(), "the real staged body removed")
         self.assertNotIn(t, records.load_plugin(self.root).get("inflight") or {})
         dead = {"pid": 2 ** 22 - 1, "start": "2026-01-01T00:00:00Z"}
         rec = lc.claims.load(t)
@@ -3459,6 +3461,77 @@ class InboxCli(ConnectBase):
         self.assertIsNone(lc.claims.load(t), "compacted")
         self.assertIn(t, ledger())
         self.assertEqual(sum(1 for p in self.results.iterdir() if p.name == t + ".txt"), 1, "nothing published twice")
+
+    def test_every_settle_path_completes_its_settlement_after_one_ledger_fault_before_reporting_final(self):
+        """The settled-ids append faults once on each path that settles: publish, park, a non-admitted claim, an
+        interrupt, and a call-less claim nobody claims again (recovery). The first call is a retry, never final;
+        the next completes the settlement (ledger entry, the real staged body gone) before it says settled or final."""
+        lc = inbox._lifecycle(self.root)
+        real_add = inbox.lifecycle.SettledIds.add
+        ledger = lambda: inbox._lifecycle(self.root).settled.ids     # noqa: E731
+        body = lambda t: lc.claims.dir(t) / "body"                     # noqa: E731
+
+        def faulted_once(call):
+            hits = []
+
+            def add_faults_once(led, task_id):
+                if not hits:
+                    hits.append(task_id)
+                    raise inbox.lifecycle.LedgerIOError("cannot append to settled-ids ([Errno 5] I/O error)")
+                return real_add(led, task_id)
+            with mock.patch.object(inbox.lifecycle.SettledIds, "add", add_faults_once):
+                out = call()
+            self.assertEqual(len(hits), 1)
+            return out
+
+        def debt(t):
+            self.assertEqual((lc.claims.load(t)["phase"], t in ledger(), body(t).is_file()), (inbox.lifecycle.SETTLED, False, True))
+
+        def whole(t):
+            self.assertEqual((t in ledger(), body(t).exists()), (True, False), t)
+            self.assertEqual(open(inbox._lifecycle(self.root).settled.path).read().count(t + "\n"), 1)
+        t = "task-sweep-publish"
+        self.confirmed(t)
+        self.assertEqual(self.verb("stage", t, "turn-1", stdin=b"answer\n")[0], 0)
+        lc.claims.stage(t, b"legacy\n")
+        rc, out = faulted_once(lambda: self.verb("publish", t))
+        self.assertEqual((rc, out.get("retry")), (1, True), out)
+        debt(t)
+        rc, out = self.verb("publish", t)
+        self.assertEqual((rc, out.get("outcome")), (0, "settled"), out)
+        whole(t)
+        t = "task-sweep-park"
+        self.confirmed(t)
+        lc.claims.stage(t, b"legacy\n")
+        rc, out = faulted_once(lambda: self.verb("park", t, "turn-1", "--detail", "aborted"))
+        self.assertEqual((rc, out.get("retry")), (1, True), out)
+        debt(t)
+        rc, out = self.verb("park", t, "turn-1", "--detail", "aborted")
+        self.assertEqual((rc, out.get("outcome")), (0, "settled"), out)
+        whole(t)
+        t = self.task("task-sweep-guest", "guest")
+        rc, out = faulted_once(lambda: self.verb("claim", t))
+        self.assertEqual((rc, out.get("retry")), (1, True), out)
+        debt(t)
+        rc, out = self.verb("claim", t)
+        self.assertEqual((rc, "retry" in out, out["refused"]), (1, False, "%s is LIVE_READY; only ABSENT may be submitted" % t), out)
+        whole(t)
+        t = self.task("task-sweep-interrupt")
+        rc, out = faulted_once(lambda: self.verb("interrupt", t, "--detail", "stopped"))
+        self.assertEqual((rc, out.get("retry"), out.get("resolved")), (1, True, None), out)
+        debt(t)
+        rc, out = self.verb("interrupt", t, "--detail", "stopped")
+        self.assertEqual((rc, out["resolved"]), (0, True), out)
+        whole(t)
+        t = self.task("task-sweep-unbound", "guest")
+        faulted_once(lambda: self.verb("claim", t))
+        debt(t)
+        self.assertEqual(inbox.recover_dead_generation(self.root), 0, "no generation: the call-less claim is still reconciled")
+        whole(t)
+        rec = lc.claims.load(t)
+        lc.claims.save(dict(rec, settled_at=rec["settled_at"] - inbox.lifecycle.COMPACT_AFTER - 1))
+        inbox.recover_dead_generation(self.root)
+        self.assertIsNone(lc.claims.load(t), "a call-less claim compacts once due")
 
     def test_a_claim_the_mod_lost_past_its_call_is_finished_or_interrupted_at_once(self):
         """A Mod that lost its offers (a reload inside the generation) claims the task afresh: a descriptor
