@@ -12,6 +12,8 @@ const TASK = (id: string, tier = 'owner', extra = '') =>
 const FRAMED = (msg: string) => `The ag2space-inbox plugin sent a message:\n${msg}\n\nThis is how Claude Code surfaces ` +
   "a prompt a plugin submits between turns \u2014 it starts this turn in the user's place. Address the message above."
 
+const INTERRUPTED = '[AG2 Space] This attempt was interrupted before the session answered; send the request again if it is still wanted.'
+
 type Claim = { attempt: number; phase: string; token?: string; hash?: string; turnId?: string; body?: string; staged?: string
                 blobOk?: boolean }
 
@@ -27,6 +29,7 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
                                lockFailsOnce?: string[]; storeFailsOnce?: string[]; unreadableOnce?: string[];
                                committedHardOnce?: string[]; committedHardWhy?: string; stageLandsOnce?: boolean;
                                parkRefusedOnce?: boolean; authorizeLostOnce?: boolean; stageLinkFailsOnce?: boolean;
+                               lostTurnFsyncFails?: number;
                                parkAlwaysRefuses?: boolean; stageThrows?: number } = {}) {
   const files: Record<string, string> = {}
   const submitted: string[] = []
@@ -64,6 +67,7 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
   let authorizeLost = opts.authorizeLostOnce ?? false
   let stageLinkFails = opts.stageLinkFailsOnce ?? false
   let stageThrowsLeft = opts.stageThrows ?? 0
+  let lostTurnFsyncLeft = opts.lostTurnFsyncFails ?? 0
   let publishes = 0
   const committedHardWhy = opts.committedHardWhy ?? 'OSError: unlock I/O error'
   const clearFailsLeft: Record<string, string> = { ...(opts.clearFails ?? {}) }
@@ -159,6 +163,18 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
       }
       if (result(task) === 'LIVE_UNREADY') return out(1, { refused: `${task} is LIVE_UNREADY, not claimable yet; retried`, retry: true })
       const c = claims[task]
+      if (c && ((c.phase === 'TURN_CONFIRMED' && c.staged === undefined) || c.phase === 'RESULT_STAGED')) {
+        // As the CLI's lost-turn claim: interrupted in one durable transition to RESULT_STAGED, then published.
+        if (c.phase === 'TURN_CONFIRMED') {
+          c.phase = 'RESULT_STAGED'; c.body = INTERRUPTED
+          if (lostTurnFsyncLeft-- > 0) {
+            return out(3, { task_id: task, phase: 'RESULT_STAGED', hard: true,
+                            error: 'the step committed (claim.json was replaced, then its directory fsync failed)' })
+          }
+        }
+        c.phase = 'SETTLED'; files[`/out/${task}.txt`] = c.body!; publishes++
+        return out(1, { refused: `${task}: its staged answer is published now; only ABSENT may be submitted` })
+      }
       if (c && c.phase !== 'PREPARED') return out(1, { refused: `${task}: attempt ${c.attempt} is ${c.phase}` })
       // The CLI's admission (task_io.admission, pinned in Python): no tier is malformed; non-owners need the flag.
       const text = files[`/in/${task}.txt`] ?? ''
@@ -1278,4 +1294,24 @@ test('without a submission marker nothing is authorized or submitted, and the ta
   await h.clock.advance(1000)
   expect(h.submitted.length).toBe(1)
   expect(h.submitted[0]).toContain('[submission ')
+})
+
+test('a lost turn whose interruption landed before its directory fsync failed is published by the next claim, never retired', async ($, on) => {
+  const h = host(on, { lostTurnFsyncFails: 1 })
+  h.files['/in/task-lt.txt'] = TASK('task-lt')
+  h.claims['task-lt'] = { attempt: 1, phase: 'TURN_CONFIRMED', turnId: 't-gone' }   // this generation's, the Mod lost it
+  await arm($, h)
+  await h.clock.advance(500)                           // the arming scan only: the claim answers hard, the task is kept
+  expect(verbs(h).filter((v: string) => v === 'claim').length).toBe(1)
+  expect(h.claims['task-lt'].phase).toBe('RESULT_STAGED')
+  expect(h.files['/out/task-lt.txt']).toBe(undefined)
+  expect(h.logs.some((l: string) => l.includes('intake STOPPED'))).toBe(true)
+  await h.clock.advance(1000)                          // intake reopens; the next claim publishes the durable body
+  expect(verbs(h).filter((v: string) => v === 'claim').length).toBe(2)
+  expect(h.files['/out/task-lt.txt']).toBe(INTERRUPTED)
+  expect(h.claims['task-lt'].phase).toBe('SETTLED')
+  expect(h.publishes()).toBe(1)
+  await h.clock.advance(5000)
+  expect(verbs(h).filter((v: string) => v === 'claim').length).toBe(2)   // retired only once answered
+  expect(h.submitted.length).toBe(0)
 })

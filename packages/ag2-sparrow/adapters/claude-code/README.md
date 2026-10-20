@@ -112,9 +112,13 @@ accepted answer the lifecycle's one decision for such a turn (`close_turn`,
 the same one generation recovery takes) applies: a descriptor whose blob
 verifies is finished and published, a blob missing or not matching its
 descriptor is answered as interrupted at once (the detail says which), never
-a substituted body; at RESULT_STAGED or PUBLISHED the staged answer is
-published; a CALLING claim, or one confirmed with nothing accepted, waits for
-the next generation's recovery as before. When the progress record cannot be written at all, the CLI raises
+a substituted body; the interruption is one durable transition (a rename that
+lands leaves RESULT_STAGED, never an intermediate phase); at RESULT_STAGED or
+PUBLISHED the staged answer is published, and a claim a record from before
+left committed at OUTCOME_UNKNOWN is resumed to RESULT_STAGED and published
+(`resume_outcome`, the move recovery makes), never retired; a CALLING claim,
+or one confirmed with nothing accepted, waits for the next generation's
+recovery as before. When the progress record cannot be written at all, the CLI raises
 an alarm in the adapter's config dir (outside `state/`): `verify` fails its
 `progress` row and the launcher raises the needs-attention card until a durable
 write clears it. A record whose fields have the wrong shape reads as unreadable (hard),

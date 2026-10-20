@@ -313,6 +313,11 @@ def lost_turn_answered(lc, task_id, generation) -> str:
             raise Parked("%s: the accepted answer could not be closed now; retried" % task_id)
         answered = "its accepted answer, staged and never published, is published now" if closed == "finished" \
             else "its accepted answer could not be finished; answered as interrupted now"
+    elif phase == lifecycle.OUTCOME_UNKNOWN:
+        # A committed intermediate state (the rename landed, its directory fsync failed): resumed, never retired.
+        if lc.resume_outcome(task_id) != "staged":
+            raise Parked("%s: its recorded outcome could not be resumed now; retried" % task_id)
+        answered = "its recorded outcome, interrupted, is published now"
     elif phase in (lifecycle.RESULT_STAGED, lifecycle.PUBLISHED):
         answered = "its staged answer is published now"
     else:

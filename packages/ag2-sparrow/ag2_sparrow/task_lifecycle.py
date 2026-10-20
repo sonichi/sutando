@@ -1017,9 +1017,19 @@ class Lifecycle:
         now = self.clock() if now is None else now
         self.log("turn confirmed, no result; answered as interrupted ->", task_id)
         self.claims.stage(task_id, rec["interrupted_body"].encode("utf-8"))
-        rec = self._save(rec, phase=OUTCOME_UNKNOWN, staged=None, outcome={"kind": "unknown", "detail": detail, "at": now})
-        self._save(rec, phase=RESULT_STAGED)
+        # One durable transition: a rename that lands leaves a publishable claim, never an intermediate phase.
+        self._save(rec, phase=RESULT_STAGED, staged=None, outcome={"kind": "unknown", "detail": detail, "at": now})
         self.open_attempts.discard(task_id)
+        return "staged"
+
+    def resume_outcome(self, task_id):
+        """A local claim committed at OUTCOME_UNKNOWN (its body durable, the move to RESULT_STAGED not yet
+        saved) moved there now: what recovery does for it, and the live reclaim too, so a committed
+        intermediate state is always resumed and never retired. staged | parked (not such a claim)."""
+        rec = self.claims.load(task_id)
+        if rec is None or rec.get("claim_mode") != LOCAL or rec["phase"] != OUTCOME_UNKNOWN:
+            return "parked"
+        self._save(rec, phase=RESULT_STAGED)
         return "staged"
 
     def close_turn(self, task_id, detail, now=None):
@@ -1238,7 +1248,7 @@ class Lifecycle:
                     continue
             elif phase in (OUTCOME_UNKNOWN, RESULT_STAGED):
                 if phase != RESULT_STAGED:
-                    rec = self._save(rec, phase=RESULT_STAGED)
+                    self.resume_outcome(task_id)
             elif phase != PUBLISHED:
                 self.log("a phase this reader does not know, left alone ->", task_id, phase)
                 continue

@@ -2771,6 +2771,56 @@ class LocalClaimTest(Base):
         life.prepare("task-c", "ic\n")
         self.assertEqual(life.interrupt_turn("task-c", "x"), "parked", "a cloud claim is never a local turn")
 
+    def test_interrupt_turn_is_one_durable_transition_and_a_committed_outcome_unknown_is_resumed(self):
+        """A directory fsync that fails after the claim.json rename answers StateCommitted with RESULT_STAGED on
+        disk (no intermediate phase); resume_outcome moves a committed OUTCOME_UNKNOWN to RESULT_STAGED and
+        recovery takes that one move; both then publish the durable interrupted body."""
+        self.local_dir()
+        life = self.life()
+        self.confirmed(life, "task-fs")
+        real_replace, real_fsync_dir, last, hits = os.replace, self.lc.fsync_dir, [], []
+
+        def replace_noting(src, dst):
+            last[:] = [Path(dst).name]
+            return real_replace(src, dst)
+
+        def fsync_dir_eio_after_claim_rename(path):
+            if last == ["claim.json"] and not hits:
+                hits.append(path)
+                raise OSError(errno.EIO, "I/O error")
+            return real_fsync_dir(path)
+        with mock.patch.object(self.lc.os, "replace", replace_noting), \
+                mock.patch.object(self.lc, "fsync_dir", fsync_dir_eio_after_claim_rename):
+            with self.assertRaises(self.lc.StateCommitted):
+                life.interrupt_turn("task-fs", "turn confirmed, no result")
+        rec = life.claims.load("task-fs")
+        self.assertEqual((len(hits), rec["phase"], rec["staged"], rec["outcome"]["detail"]),
+                         (1, self.lc.RESULT_STAGED, None, "turn confirmed, no result"), "one transition landed")
+        self.assertEqual(life.publish_and_settle("task-fs"), "settled")
+        self.assertEqual((self.results / "task-fs.txt").read_bytes(), b"interrupted\n")
+        self.confirmed(life, "task-ou")
+        rec = life.claims.load("task-ou")
+        life.claims.stage("task-ou", b"interrupted\n")
+        life.claims.save(dict(rec, phase=self.lc.OUTCOME_UNKNOWN, staged=None, outcome={"kind": "unknown", "detail": "older", "at": 1.0}))
+        self.assertEqual(life.resume_outcome("task-ou"), "staged")
+        self.assertEqual(life.claims.load("task-ou")["phase"], self.lc.RESULT_STAGED)
+        self.assertEqual(life.resume_outcome("task-ou"), "parked", "only OUTCOME_UNKNOWN is resumed")
+        self.assertEqual(life.publish_and_settle("task-ou"), "settled")
+        self.assertEqual((self.results / "task-ou.txt").read_bytes(), b"interrupted\n")
+        self.confirmed(life, "task-rec")
+        rec = life.claims.load("task-rec")
+        life.claims.stage("task-rec", b"interrupted\n")
+        life.claims.save(dict(rec, phase=self.lc.OUTCOME_UNKNOWN, staged=None, outcome={"kind": "unknown", "detail": "older", "at": 1.0}))
+        again = self.life(lineage=lambda pid, start: False)
+        with mock.patch.object(self.lc.Lifecycle, "resume_outcome", wraps=again.resume_outcome) as resumed:
+            again.recover(generation=GEN, proof=False)
+        self.assertEqual([c.args[:1] for c in resumed.call_args_list], [("task-rec",)], "recovery takes the one move")
+        self.assertEqual((self.results / "task-rec.txt").read_bytes(), b"interrupted\n")
+        self.assertEqual(again.claims.load("task-rec")["phase"], self.lc.SETTLED)
+        self.task("task-cloud")
+        life.prepare("task-cloud", "ic\n")
+        self.assertEqual(life.resume_outcome("task-cloud"), "parked", "a cloud claim is never resumed here")
+
     def corrupt_blob(self, life, tid):
         """A committed blob whose bytes no longer match the claim's descriptor, the phase rolled back to
         TURN_CONFIRMED as if the move's last save never landed."""

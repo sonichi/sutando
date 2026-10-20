@@ -3299,6 +3299,49 @@ class InboxCli(ConnectBase):
                          "the identical park names the protocol failure it delivered, never 'the accepted answer'")
         self.assertIn("ended without a reply (turn completed without a reply)", (self.results / (p + ".txt")).read_text())
 
+    def test_an_interruption_whose_claim_rename_landed_without_its_directory_fsync_is_resumed_by_the_next_claim(self):
+        """EIO at the directory fsync after the claim.json rename inside the live reclaim's interruption: the
+        reply is hard with the committed phase RESULT_STAGED (one durable transition, no intermediate), and
+        the next same-generation claim publishes the durable interrupted body, never retiring the task; a
+        record an older write left committed at OUTCOME_UNKNOWN is resumed the same way. No holder death."""
+        lc = inbox._lifecycle(self.root)
+        t = "task-fsync-after-rename"
+        self.confirmed(t)
+        with mock.patch.object(inbox.lifecycle.os, "link", side_effect=OSError(errno.ENOSPC, "No space left on device")):
+            self.verb("stage", t, "turn-1", stdin=b"accepted text\n")
+        real_replace, real_fsync_dir, last, hits = os.replace, inbox.lifecycle.fsync_dir, [], []
+
+        def replace_noting(src, dst):
+            last[:] = [Path(dst).name]
+            return real_replace(src, dst)
+
+        def fsync_dir_eio_after_claim_rename(path):
+            if last == ["claim.json"] and not hits:
+                hits.append(path)
+                raise OSError(errno.EIO, "I/O error")
+            return real_fsync_dir(path)
+        with mock.patch.object(inbox.lifecycle.os, "replace", replace_noting), \
+                mock.patch.object(inbox.lifecycle, "fsync_dir", fsync_dir_eio_after_claim_rename):
+            rc, out = self.verb("claim", t)
+        self.assertEqual((rc, out.get("hard"), out.get("phase"), len(hits)), (3, True, inbox.lifecycle.RESULT_STAGED, 1), out)
+        self.assertIn("claim.json was replaced, then its directory fsync failed", out["error"])
+        self.assertFalse((self.results / (t + ".txt")).exists(), "the publication never ran")
+        rc, out = self.verb("claim", t)
+        self.assertEqual((rc, "retry" in out, "its staged answer is published now" in out["refused"]), (1, False, True), out)
+        self.assertEqual((self.results / (t + ".txt")).read_text(), inbox.INTERRUPTED_BODY, "the durable body, published")
+        self.assertEqual(lc.claims.load(t)["phase"], inbox.lifecycle.SETTLED)
+        u = "task-outcome-unknown"
+        self.confirmed(u)
+        rec = lc.claims.load(u)
+        lc.claims.stage(u, inbox.INTERRUPTED_BODY.encode("utf-8"))
+        lc.claims.save(dict(rec, phase=inbox.lifecycle.OUTCOME_UNKNOWN, staged=None,
+                            outcome={"kind": "unknown", "detail": "an older write", "at": 1.0}))
+        rc, out = self.verb("claim", u)
+        self.assertEqual((rc, "retry" in out, out["refused"]),
+                         (1, False, "%s: its recorded outcome, interrupted, is published now; only ABSENT may be submitted" % u))
+        self.assertEqual((self.results / (u + ".txt")).read_text(), inbox.INTERRUPTED_BODY, "a committed intermediate is resumed, never retired")
+        self.assertEqual(self.verb("claim", u)[1]["refused"], "%s is LIVE_READY; only ABSENT may be submitted" % u)
+
     def test_a_claim_the_mod_lost_past_its_call_is_finished_or_interrupted_at_once(self):
         """A Mod that lost its offers (a reload inside the generation) claims the task afresh: a descriptor
         with no verifying blob is answered as interrupted now, a verifying blob whose phase move was lost is
