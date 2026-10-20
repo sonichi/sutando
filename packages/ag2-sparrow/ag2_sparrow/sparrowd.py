@@ -34,6 +34,7 @@ class WorkerSpec:
     argv: List[str]
     cwd: Optional[str] = None
     env: Optional[Dict[str, str]] = None
+    revision: str = ""  # opaque to the shell: a spec that differs under the same name is a restart
 
 
 @dataclass
@@ -46,6 +47,7 @@ class _WorkerState:
     state: str = "pending"  # pending | running | backoff | stopped
     stop: threading.Event = field(default_factory=threading.Event)
     stop_at: float = 0.0  # when this one worker was told to stop (sync); 0 until then
+    after: Optional["_WorkerState"] = None  # the one it replaces: never two processes for one name
 
 
 def _running(ws: _WorkerState) -> bool:
@@ -125,14 +127,18 @@ class Supervisor:
             self._start_thread(ws)
 
     def sync(self, specs: List[WorkerSpec]) -> "tuple[list, list]":
-        """Make the supervised set equal `specs` by name: a new name is started,
-        a name no longer listed is stopped (SIGTERM, SIGKILL past the grace) and
-        stays owned until it has exited. Returns (added names, removed names)."""
+        """Make the supervised set equal `specs`: a new name is started, a name
+        no longer listed is stopped (SIGTERM, SIGKILL past the grace) and stays
+        owned until it has exited, a name whose spec changed is both: its
+        replacement starts once the old process has exited. Returns (added
+        names, removed names); a changed name is in both."""
         want = {s.name: s for s in specs}
         with self._lock:
-            added = [self._workers.setdefault(n, _WorkerState(spec=s))
+            removed = [self._workers.pop(n) for n in list(self._workers)
+                       if n not in want or self._workers[n].spec != want[n]]
+            gone = {ws.spec.name: ws for ws in removed}
+            added = [self._workers.setdefault(n, _WorkerState(spec=s, after=gone.get(n)))
                      for n, s in want.items() if n not in self._workers]
-            removed = [self._workers.pop(n) for n in list(self._workers) if n not in want]
             self._draining = [ws for ws in self._draining + removed if _running(ws)]
             for ws in removed:
                 ws.stop.set()
@@ -142,12 +148,13 @@ class Supervisor:
                         ws.proc.send_signal(signal.SIGTERM)
                     except OSError:  # pragma: no cover - died between poll and signal
                         pass
+        for ws in removed:
+            _log(f"worker {ws.spec.name}: {'changed — restarting' if ws.spec.name in want else 'removed — stopping'}")
         for ws in added:
-            _log(f"worker {ws.spec.name}: added")
+            if ws.after is None:
+                _log(f"worker {ws.spec.name}: added")
             if not self._stop.is_set():
                 self._start_thread(ws)
-        for ws in removed:
-            _log(f"worker {ws.spec.name}: removed — stopping")
         return [ws.spec.name for ws in added], [ws.spec.name for ws in removed]
 
     def _wait(self, ws: _WorkerState) -> int:
@@ -172,6 +179,8 @@ class Supervisor:
     def _run_worker(self, ws: _WorkerState) -> None:
         name = ws.spec.name
         backoff = self._backoff_initial
+        while ws.after is not None and _running(ws.after) and not ws.stop.wait(0.05):
+            pass
         while not ws.stop.is_set():
             spawn_err = None
             with self._lock:
@@ -330,22 +339,33 @@ class ControlServer:
 def run(specs: List[WorkerSpec], state_dir: Path,
         backoff_initial_s: float = 1.0,
         rescan: Optional[Callable[[], List[WorkerSpec]]] = None,
-        rescan_s: float = 30.0, grace_s: float = 10.0) -> int:
+        rescan_s: float = 30.0, grace_s: float = 10.0,
+        wait_for_lock: bool = False, lock_poll_s: float = 5.0) -> int:
     """Daemon entry: lock, supervise, serve control, wait for stop signal.
     With `rescan`, every `rescan_s` the supervised set is synced to what it
-    returns (by name): the launcher decides what exists, the shell only follows.
+    returns: the launcher decides what exists, the shell only follows.
     A rescan that raises is a scan that could not be made, not an empty one:
-    the current set is kept, logged once until the scan recovers."""
+    the current set is kept, logged once until the scan recovers.
+    With `wait_for_lock`, a held lock is waited for (one line when the wait
+    starts, one when it ends) instead of exiting, so a relauncher never loops."""
     state_dir = Path(state_dir)
     inst = SingleInstance(state_dir / "sparrowd.lock")
-    if not inst.acquire():
+    acquired = inst.acquire()
+    if not acquired and not wait_for_lock:
         _log("another sparrowd holds the lock — exiting cleanly")
         return 0
     stop_evt = threading.Event()
-    sup = Supervisor(specs, backoff_initial_s=backoff_initial_s, remove_grace_s=grace_s)
-    ctl = ControlServer(state_dir / "sparrowd.sock", sup, stop_evt.set)
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda *_: stop_evt.set())
+    if not acquired:
+        _log("another sparrowd holds the lock — waiting for it")
+        while not inst.acquire():
+            if stop_evt.wait(lock_poll_s):
+                _log("stopped while waiting for the lock")
+                return 0
+        _log("lock acquired")
+    sup = Supervisor(specs, backoff_initial_s=backoff_initial_s, remove_grace_s=grace_s)
+    ctl = ControlServer(state_dir / "sparrowd.sock", sup, stop_evt.set)
     _log(f"starting {len(specs)} worker(s): {', '.join(s.name for s in specs)}")
     ctl.start()
     sup.start()

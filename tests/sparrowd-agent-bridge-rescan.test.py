@@ -16,6 +16,7 @@ import os
 import shutil
 import signal
 import socket
+import subprocess
 import sys
 import tempfile
 import threading
@@ -84,6 +85,42 @@ class Reconcile(unittest.TestCase):
         self.assertEqual(sup.sync([]), ([], ["a"]))
         self.assertTrue(wait_for(lambda: not alive(a_pid)))
         self.assertEqual(sup.status()["workers"], {})
+
+    def test_a_changed_spec_restarts_its_worker_and_never_runs_two_for_the_name(self):
+        sup = Supervisor([WorkerSpec("s", STUBBORN, revision="1")], remove_grace_s=0.6)
+        sup.start()
+        self.addCleanup(sup.stop, 2)
+        self.assertTrue(wait_for(lambda: pid_of(sup, "s")))
+        old = pid_of(sup, "s")
+        time.sleep(0.3)  # the handler is installed before the loop
+        self.assertEqual(sup.sync([WorkerSpec("s", STUBBORN, revision="1")]), ([], []), "same spec: untouched")
+        self.assertEqual(pid_of(sup, "s"), old)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(sup.sync([WorkerSpec("s", SLEEPER, revision="2")]), (["s"], ["s"]))
+            time.sleep(0.3)
+            self.assertTrue(alive(old), "the old one ignores SIGTERM and is inside its grace")
+            self.assertIsNone(pid_of(sup, "s"), "its replacement waits: never two processes for one name")
+            self.assertEqual(sup.status()["draining"], ["s"])
+            self.assertTrue(wait_for(lambda: pid_of(sup, "s"), 5))
+        self.assertFalse(alive(old), "killed past the grace before the replacement started")
+        self.assertIn("worker s: changed — restarting", out.getvalue())
+        self.assertNotIn("worker s: added", out.getvalue())
+
+    def test_a_replacement_stopped_while_it_waits_never_spawns(self):
+        sup = Supervisor([WorkerSpec("w", SLEEPER)])
+        ws = sup._workers["w"]
+        ws.after = types.SimpleNamespace(proc=types.SimpleNamespace(poll=lambda: None))  # never exits
+
+        def stop():  # a loop that spawned anyway is ended too, so a regression fails instead of hanging
+            ws.stop.set()
+            if ws.proc is not None:
+                ws.proc.kill()
+        threading.Timer(0.2, stop).start()
+        with contextlib.redirect_stdout(io.StringIO()):
+            sup._run_worker(ws)
+        self.assertIsNone(ws.proc)
+        self.assertEqual(ws.state, "stopped")
 
     def test_a_removed_worker_that_ignores_sigterm_is_killed_past_the_grace(self):
         sup = Supervisor([WorkerSpec("s", STUBBORN)], remove_grace_s=0.3)
@@ -275,6 +312,50 @@ class Reconcile(unittest.TestCase):
             self.assertEqual(hb.stat().st_size, size, f"removed={removed}: still writing after shutdown")
             self.assertIn("SIGKILL", log)
 
+    def test_a_held_lock_is_waited_for_with_one_line_not_exited(self):
+        """Relaunched by the wrapper, an instance that exited on a held lock logged a line every
+        RESTART_DELAY; waiting, it logs once when the wait starts and once when it ends."""
+        from ag2_sparrow.sparrowd import SingleInstance
+        td = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, td, ignore_errors=True)
+        holder = SingleInstance(td / "sparrowd.lock")
+        self.assertTrue(holder.acquire())
+        sock = td / "sparrowd.sock"
+
+        def release_then_stop():
+            time.sleep(0.5)
+            holder.release()
+            wait_for(sock.exists, 5)
+            c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            c.connect(str(sock))
+            c.sendall(b'{"op": "stop"}\n')
+            c.makefile("r").readline()
+            c.close()
+        threading.Thread(target=release_then_stop, daemon=True).start()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = run([], td, wait_for_lock=True, lock_poll_s=0.05)
+        log = out.getvalue()
+        self.assertEqual(rc, 0)
+        self.assertEqual(log.count("another sparrowd holds the lock — waiting for it"), 1)
+        self.assertEqual(log.count("lock acquired"), 1)
+        self.assertNotIn("exiting cleanly", log)
+        self.assertIn("starting 0 worker(s)", log)
+
+    def test_a_stop_while_waiting_for_the_lock_exits_cleanly(self):
+        from ag2_sparrow.sparrowd import SingleInstance
+        td = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, td, ignore_errors=True)
+        holder = SingleInstance(td / "sparrowd.lock")
+        self.assertTrue(holder.acquire())
+        self.addCleanup(holder.release)
+        threading.Timer(0.3, os.kill, (os.getpid(), signal.SIGTERM)).start()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(run([], td, wait_for_lock=True, lock_poll_s=0.05), 0)
+        self.assertIn("stopped while waiting for the lock", out.getvalue())
+        self.assertNotIn("starting", out.getvalue())
+
     def test_a_removed_worker_stays_owned_until_it_has_exited(self):
         sup = Supervisor([WorkerSpec("s", STUBBORN)], remove_grace_s=0.3)
         sup.start()
@@ -291,6 +372,12 @@ class Reconcile(unittest.TestCase):
 
 AGENT = "@probe.agent:ag2.space"
 SEG = "probe.agent_ag2.space"
+
+
+def specs_of(case, decl):
+    """The launcher's spec for one declaration, as the scan builds it."""
+    specs, _ = case.sd._agent_bridge_specs(case.ws, vault_keys=list(case.keys))
+    return next(s for s in specs if s.argv[-1] == str(decl))
 
 
 def load_sparrowd():
@@ -468,7 +555,7 @@ class Launcher(unittest.TestCase):
         specs, _, rescan, _, err = self.main(["--agent-bridges"], external=external)
         self.assertEqual(specs, [], "live outside this daemon: never a second bridge for the agent")
         self.assertIn(f"{decl}: already supervised outside sparrowd: pid 4242", err.getvalue())
-        self.assertEqual(checked, [str(decl)])
+        self.assertEqual(checked, [self.sd.supervision_marker(specs_of(self, decl))])
         with contextlib.redirect_stderr(err):
             want = rescan()
         self.assertEqual([s.name for s in want], [cli.worker_name(SEG)], "picked up once that process is gone")
@@ -494,6 +581,112 @@ class Launcher(unittest.TestCase):
                 rescan()
             broken[0] = False
             self.assertEqual([s.argv[-1] for s in rescan()], [str(decl)])
+
+    def test_an_undecodable_declaration_is_skipped_with_a_reason_and_the_daemon_starts_the_valid_one(self):
+        """The reviewed regression: bytes that are not UTF-8 must never escape main as an exception
+        (at the reviewed head none of the valid bridges started); fixed later, it is picked up."""
+        good = self.declare()
+        bad = self.declare("@second:ag2.space", "second_ag2.space")
+        specs = self.main(["--agent-bridges"])[0]
+        self.assertEqual([s.argv[-1] for s in specs], [str(good), str(bad)], "both reach the daemon")
+        valid = bad.read_text()
+        bad.write_bytes(b"\xff\xfe\x00")
+        escaped = None
+        try:
+            specs, _, rescan, _, err = self.main(["--agent-bridges"])
+        except Exception as e:  # noqa: BLE001 - the regression is an exception escaping main
+            escaped = type(e).__name__
+        self.assertIsNone(escaped, "nothing escapes main; the daemon is reached")
+        self.assertEqual([s.argv[-1] for s in specs], [str(good)], "the daemon starts with the valid one")
+        self.assertEqual(err.getvalue().count(f"not supervised — {bad}: malformed (UnicodeDecodeError)"), 1)
+        with contextlib.redirect_stderr(err):
+            self.assertEqual([s.argv[-1] for s in rescan()], [str(good)])
+        self.assertEqual(err.getvalue().count("UnicodeDecodeError"), 1, "the reason is not repeated")
+        bad.write_text(valid)
+        with contextlib.redirect_stderr(err):
+            self.assertEqual([s.argv[-1] for s in rescan()], [str(good), str(bad)], "fixed: picked up next pass")
+
+    def test_an_unreadable_declaration_keeps_its_worker_and_the_rest_still_follow(self):
+        """One declaration that cannot be read must not freeze the others: the reviewed case uninstalls
+        B while A is unreadable, and B must stop on that pass while A keeps running unchanged."""
+        if os.geteuid() == 0:
+            self.skipTest("root reads any file")
+        a = self.declare()
+        b = self.declare("@second:ag2.space", "second_ag2.space")
+        specs, _, rescan, _, err = self.main(["--agent-bridges"])
+        self.assertEqual([s.argv[-1] for s in specs], [str(a), str(b)])
+        os.chmod(a, 0)
+        self.addCleanup(os.chmod, a, 0o644)
+        shutil.rmtree(b.parent)
+        outcome = None
+        with contextlib.redirect_stderr(err):
+            try:
+                outcome = rescan()
+            except bridge.ScanUnavailable as e:
+                outcome = f"unavailable: {e}"
+            again = rescan() if isinstance(outcome, list) else None
+        self.assertIsInstance(outcome, list, "one unreadable declaration is not an unavailable scan")
+        self.assertEqual(outcome, [specs[0]], "A kept exactly as it ran (no restart); B gone on this pass")
+        self.assertEqual(again, [specs[0]])
+        self.assertEqual(err.getvalue().count(f"not supervised — {a}: unreadable (PermissionError)"), 1)
+        os.chmod(a, 0o644)
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(rescan(), [specs[0]], "readable again and unchanged: the same spec, no restart")
+
+    def test_an_unreadable_declaration_at_start_is_not_started(self):
+        if os.geteuid() == 0:
+            self.skipTest("root reads any file")
+        a = self.declare()
+        os.chmod(a, 0)
+        self.addCleanup(os.chmod, a, 0o644)
+        specs, _, rescan, _, err = self.main(["--agent-bridges"])
+        self.assertEqual(specs, [], "nothing ran under its name: nothing to keep")
+        self.assertIn(f"{a}: unreadable (PermissionError)", err.getvalue())
+        os.chmod(a, 0o644)
+        with contextlib.redirect_stderr(err):
+            self.assertEqual([s.argv[-1] for s in rescan()], [str(a)], "readable: picked up")
+
+    def test_an_edited_declaration_is_a_changed_spec_an_unchanged_one_is_equal(self):
+        a = self.declare()
+        specs, _, rescan, _, err = self.main(["--agent-bridges"])
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(rescan(), specs, "unchanged bytes: an equal spec, so sync leaves it running")
+            self.declare()  # the installer rewriting the same declaration
+            self.assertEqual(rescan(), specs, "rewritten with the same content: still equal")
+            a.write_text(json.dumps(json.loads(a.read_text()), indent=4))
+            edited = rescan()
+        self.assertEqual([s.name for s in edited], [s.name for s in specs])
+        self.assertNotEqual(edited, specs, "different bytes: a changed spec, so sync restarts it")
+        sup = Supervisor([WorkerSpec(specs[0].name, SLEEPER, revision=specs[0].revision)])
+        self.assertEqual(sup.sync([WorkerSpec(s.name, SLEEPER, revision=s.revision) for s in edited]),
+                         ([specs[0].name], [specs[0].name]), "the supervisor restarts it through the drain")
+        sup.stop(1)
+
+    def test_the_external_owner_marker_matches_only_a_bridge_running_that_declaration(self):
+        """Real pgrep: an editor on the file or a bridge for `worker.json.bak` is not an owner."""
+        decl = self.declare()
+        marker = self.sd.supervision_marker(specs_of(self, decl))
+        procs = {}
+        for label, tail in (("editor", ["vi", str(decl)]),
+                            ("backup", [str(self.sd.AGENT_BRIDGE), str(decl) + ".bak"]),
+                            ("bridge", [str(self.sd.AGENT_BRIDGE), str(decl)])):
+            procs[label] = p = subprocess.Popen(["/bin/sh", "-c", "sleep 30; :", *tail])
+            self.addCleanup(p.wait)
+            self.addCleanup(p.kill)
+        time.sleep(0.3)
+        owner = self.sd.external_supervisor(marker)
+        self.assertIsNotNone(owner)
+        self.assertIn(f"pid {procs['bridge'].pid} ", owner)
+        self.assertNotIn(f"pid {procs['editor'].pid} ", owner)
+        self.assertNotIn(f"pid {procs['backup'].pid} ", owner)
+
+    def test_agent_bridges_mode_waits_for_the_lock_full_mode_does_not(self):
+        err = io.StringIO()
+        for argv, waits in ((["--agent-bridges"], True), ([], False)):
+            with mock.patch.object(self.sd, "external_supervisor", return_value=None), \
+                    mock.patch.object(self.sd, "run", return_value=0) as run_, contextlib.redirect_stderr(err):
+                self.sd.main(argv)
+            self.assertEqual(run_.call_args[1]["wait_for_lock"], waits, argv)
 
     def test_full_mode_prints_a_static_workers_skip_reason(self):
         with mock.patch.object(self.sd, "_static_specs", return_value=([], ["loop-x: no interpreter configured"])):

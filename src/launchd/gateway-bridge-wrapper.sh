@@ -14,12 +14,8 @@
 # the fix for the 2026-07-10 incident where the bridge died and stayed dead for
 # 3 days with nothing restarting it (mobile messages stranded in the cloud).
 #
-# Beside the bridge it keeps one more child alive: `src/sparrowd.py --agent-bridges`,
-# the supervisor of every agent bridge a claude-local install declared under
-# <workspace>/agents (sparrowd itself cannot run here: the bridge is ours). That
-# child scans the declarations itself, so one written after this wrapper started
-# is picked up on its next pass and an uninstalled one is stopped; this wrapper only
-# relaunches it when it exits and stops it when the bridge's loop ends.
+# Beside the bridge it keeps `src/sparrowd.py --agent-bridges` alive, the only supervisor of the
+# agent bridges declared under <workspace>/agents on this install; that child does its own scanning.
 
 set -euo pipefail
 

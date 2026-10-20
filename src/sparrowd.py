@@ -7,7 +7,7 @@ never imports or locates a repo-specific loop.
 
 The agent bridges a claude-local install declares under `<workspace>/agents`
 are rescanned every `--rescan-s`: a declaration written later is picked up, a
-removed one has its worker stopped. `--agent-bridges` supervises only those, for
+removed one has its worker stopped, an edited one has it restarted. `--agent-bridges` supervises only those, for
 a host whose gateway bridge another supervisor already runs (the launchd
 wrapper starts this mode beside the bridge).
 """
@@ -96,10 +96,11 @@ def _skill_worker_specs() -> "tuple[list, list[str]]":
 AGENT_BRIDGE = _SRC / "sparrow_agent_bridge.py"
 
 
-def _agent_bridge_specs(workspace=None, vault_keys=None) -> "tuple[list, list[str]]":
+def _agent_bridge_specs(workspace=None, vault_keys=None, held=None) -> "tuple[list, list[str]]":
     """One worker per agent bridge a claude-local install declared under <workspace>/agents; each skipped
     declaration is one reason, never run. A vault manifest or agents directory that cannot be read is
-    `sparrow_agent_bridge.ScanUnavailable`: the caller keeps what it runs, nothing is read as absent."""
+    `sparrow_agent_bridge.ScanUnavailable`: the caller keeps what it runs, nothing is read as absent. The
+    worker names whose declaration file alone could not be read are appended to `held`."""
     import sparrow_agent_bridge as agent_bridge
     if vault_keys is None:
         from vault_intercept import list_vault_keys
@@ -107,18 +108,24 @@ def _agent_bridge_specs(workspace=None, vault_keys=None) -> "tuple[list, list[st
             vault_keys = list_vault_keys()
         except Exception as exc:
             raise agent_bridge.ScanUnavailable(f"vault manifest unreadable ({type(exc).__name__}: {exc})") from exc
-    found, skipped = agent_bridge.declarations(workspace or resolve_workspace(), vault_keys)
+    found, skipped = agent_bridge.declarations(workspace or resolve_workspace(), vault_keys, held)
     specs = []
     for path, decl in found:     # names derive from distinct segments: never two alike
-        specs.append(WorkerSpec(name=decl["name"], argv=[sys.executable, str(AGENT_BRIDGE), str(path)], cwd=str(REPO)))
+        specs.append(WorkerSpec(name=decl["name"], argv=[sys.executable, str(AGENT_BRIDGE), str(path)],
+                                cwd=str(REPO), revision=decl["digest"]))
     return specs, skipped
 
 
+def _ere_literal(text: str) -> str:
+    return re.sub(r"([\\.^$|?*+()\[\]{}])", r"\\\1", text)
+
+
 def supervision_marker(spec) -> str:
-    """The pgrep pattern for a worker's process: an agent bridge by its own declaration path (one
-    wrapper runs every agent), any other worker by its script's name."""
+    """The pgrep pattern for a worker's process: an agent bridge by the wrapper and its own declaration
+    path ending the command line (an editor or a backup of the file is not a bridge), any other worker by
+    its script's name."""
     if len(spec.argv) > 2 and Path(spec.argv[1]).name == AGENT_BRIDGE.name:
-        return spec.argv[-1]
+        return f"(^|[/ ]){_ere_literal(AGENT_BRIDGE.name)} {_ere_literal(spec.argv[-1])}$"
     return Path(spec.argv[-1]).name
 
 
@@ -155,17 +162,19 @@ class AgentBridgeScan:
     appears, not every pass; a declaration another process already runs (its
     marker live outside this daemon) is skipped the same way, so a declaration
     never runs twice. A name this scan already returned is never re-checked:
-    its live process is this daemon's own worker. A scan that cannot be made
+    its live process is this daemon's own worker. A declaration file that alone
+    cannot be read keeps its worker as it was. A scan that cannot be made
     raises `ScanUnavailable` through to the supervisor, which keeps its set."""
 
     def __init__(self, workspace=None):
         self._workspace = workspace
         self._reported: set = set()
-        self._supervised: set = set()
+        self._supervised: dict = {}
 
     def __call__(self) -> list:
-        specs, skipped = _agent_bridge_specs(self._workspace)
-        kept = []
+        held: list = []
+        specs, skipped = _agent_bridge_specs(self._workspace, held=held)
+        kept = [self._supervised[name] for name in held if name in self._supervised]
         for spec in specs:
             owned = None if spec.name in self._supervised else external_supervisor(supervision_marker(spec))
             if owned:
@@ -176,7 +185,7 @@ class AgentBridgeScan:
             if why not in self._reported:
                 print(f"sparrowd: not supervised — {why}", file=sys.stderr)
         self._reported = set(skipped)
-        self._supervised = {spec.name for spec in kept}
+        self._supervised = {spec.name: spec for spec in kept}
         return kept
 
 
@@ -231,7 +240,8 @@ def main(argv=None) -> int:
         print(f"sparrowd: agent bridges not scanned yet — {e}", file=sys.stderr)
         agents = []
     state_dir = resolve_workspace() / "state" / "sparrowd"
-    return run(static + agents, state_dir, rescan=lambda: static + scan(), rescan_s=args.rescan_s)
+    return run(static + agents, state_dir, rescan=lambda: static + scan(), rescan_s=args.rescan_s,
+               wait_for_lock=args.agent_bridges)
 
 
 if __name__ == "__main__":  # pragma: no cover

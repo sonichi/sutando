@@ -261,7 +261,9 @@ that differs in any of them, adds any key, sits anywhere but directly under
 `<workspace>/agents`, is unmarked or malformed, or whose key the vault lacks
 is skipped with one reason line.
 A declaration written after sparrowd started is picked up on its next scan,
-and one `uninstall` removed has its worker stopped; until the scan `verify`
+one `uninstall` removed has its worker stopped, and one whose content changed
+has its worker restarted (once the old process has exited); a declaration file
+that exists but cannot be read keeps its worker as it is. Until the scan, `verify`
 fails the bridge row and says so. On a host whose gateway bridge the launchd
 job runs (`src/launchd/gateway-bridge-wrapper.sh`), that wrapper keeps
 `src/sparrowd.py --agent-bridges` alive beside the bridge: the same scanner and

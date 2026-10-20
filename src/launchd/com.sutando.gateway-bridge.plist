@@ -26,10 +26,8 @@
       (e.g. a persistently-502ing gateway) doesn't burn CPU.
     - Wrapper (gateway-bridge-wrapper.sh) loads the ag2space channel .env for
       REMOTE_TASK_TOKEN — launchd doesn't source .env itself.
-    - The wrapper also keeps the agent-bridges mode of src/sparrowd.py alive:
-      the supervisor of the agent bridges declared under <workspace>/agents,
-      which has no other supervisor on this install (a full sparrowd cannot run
-      beside this job). No job per agent: that child scans the declarations.
+    - The wrapper also keeps `src/sparrowd.py --agent-bridges` alive: the one
+      supervisor of the agent bridges declared under <workspace>/agents here.
     - StandardOut/Err → workspace logs so postmortems + the health-check log
       probe keep working.
 

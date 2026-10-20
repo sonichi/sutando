@@ -7,18 +7,23 @@ adapter's own functions, and the file is only checked to agree with it. The work
 key, the token variable and the exact env (three dirs plus `AGENT_MXID`, whose id must map to the same
 segment) are each compared; any difference skips the declaration with one reason line.
 
-`declarations(workspace, vault_keys)` lists the valid ones whose vault key exists; an agents directory or
-declaration that cannot be read is `ScanUnavailable` (nothing is known), never "nothing declared": a
-supervisor keeps what runs until the scan can be made again. Run as a script with
+`declarations(workspace, vault_keys)` lists the valid ones whose vault key exists. What a declaration's
+own bytes can be (not UTF-8, not JSON, too deep, too large, not a regular file) skips that one entry with a
+reason; so does a declaration file that exists but cannot be read, whose worker the supervisor keeps as it
+is (`held`). An agents directory that cannot be listed or a home that cannot be entered is `ScanUnavailable`
+(nothing is known), never "nothing declared": a supervisor keeps what runs until the scan can be made
+again. Each declaration carries the digest of its bytes, so an edited one is a changed worker. Run as a script with
 a declaration path, it re-checks it, builds the bridge's environment (sparrowd's own, minus the host's
 token, identity and owner-DM variables, plus the derived env and the vault token, never on disk),
 injects the agent's dirs and the workspace's task stamper, and runs the package bridge in this process.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import runpy
+import stat
 import sys
 from pathlib import Path
 
@@ -35,6 +40,8 @@ WRITTEN_BY = f"{adapter.COMMAND} install"
 BRIDGE_MODULE = "ag2_sparrow.remote_gateway_bridge"
 TOKEN_ENV = "REMOTE_TASK_TOKEN"
 SUFFIX = ".bridge"
+# A declaration is a few hundred bytes; anything past this is not one and is never read into memory.
+MAX_DECLARATION_BYTES = 64 * 1024
 # Never inherited from sparrowd: the host's token files, its agent identity and its owner DM.
 HOST_ONLY = ("AG2_DEVICE_ENV", "REMOTE_TASK_TOKEN_FILE", TOKEN_ENV, "AGENT_MXID", "AGENT_ID", "AG2SPACE_USER_ID",
              "GATEWAY_INSTANCE", "REMOTE_PROACTIVE_ROOM", "AGENT_CONNECT_TASK_DIR", "AGENT_CONNECT_RESULT_DIR",
@@ -43,6 +50,10 @@ HOST_ONLY = ("AG2_DEVICE_ENV", "REMOTE_TASK_TOKEN_FILE", TOKEN_ENV, "AGENT_MXID"
 
 class ScanUnavailable(Exception):
     """The declarations (or what they need) could not be read: not an empty set, an unknown one."""
+
+
+class DeclarationUnreadable(ScanUnavailable):
+    """One declaration file exists but cannot be read: unknown for that entry only."""
 
 
 def _stat(path: Path):
@@ -68,13 +79,21 @@ def load(path: Path, agents: Path) -> "tuple[dict | None, str]":
             home.resolve().parent != Path(agents).resolve():
         return None, f"{path}: not a declaration directly under {agents}"
     segment = home.name[:-len(SUFFIX)]
+    # What the file's own bytes can do is a skip with a reason; only a failure to look is unavailable.
+    st = _stat(path)
+    if st is None:
+        return None, f"{path}: absent"
+    if not stat.S_ISREG(st.st_mode):
+        return None, f"{path}: not a regular file"
+    if st.st_size > MAX_DECLARATION_BYTES:
+        return None, f"{path}: {st.st_size} bytes is not a declaration (cap {MAX_DECLARATION_BYTES})"
     try:
-        text = path.read_text(encoding="utf-8")
+        raw = path.read_bytes()
     except OSError as e:
-        raise ScanUnavailable(f"{path}: unreadable ({type(e).__name__})") from e
+        raise DeclarationUnreadable(f"{path}: unreadable ({type(e).__name__})") from e
     try:
-        decl = json.loads(text)
-    except ValueError as e:
+        decl = json.loads(raw.decode("utf-8"))
+    except (ValueError, RecursionError) as e:  # UnicodeDecodeError is a ValueError
         return None, f"{path}: malformed ({type(e).__name__})"
     if not isinstance(decl, dict) or decl.get("written_by") != WRITTEN_BY:
         return None, f"{path}: not written by {WRITTEN_BY}"
@@ -102,7 +121,7 @@ def load(path: Path, agents: Path) -> "tuple[dict | None, str]":
         same = False
     if not same:
         return None, f"{path}: env is not the canonical one for {segment}"
-    return want, ""
+    return dict(want, digest=hashlib.sha256(raw).hexdigest()), ""
 
 
 def bridge_environ(decl: dict, token: str, base=None) -> dict:
@@ -114,10 +133,11 @@ def bridge_environ(decl: dict, token: str, base=None) -> dict:
     return env
 
 
-def declarations(workspace: Path, vault_keys) -> "tuple[list, list]":
+def declarations(workspace: Path, vault_keys, held=None) -> "tuple[list, list]":
     """([(path, declaration)], [reason]) for the agent bridges under `workspace`. An absent agents
-    directory declares nothing; one that cannot be listed, or a declaration that cannot be read, raises
-    ScanUnavailable."""
+    directory declares nothing; one that cannot be listed, or a home that cannot be entered, raises
+    ScanUnavailable. A declaration file that cannot be read is a skip whose worker name is appended to
+    `held`: its state is unknown, so the caller keeps whatever runs under that name."""
     agents, found, skipped = Path(workspace) / "agents", [], []
     names = set(vault_keys)
     try:
@@ -130,7 +150,12 @@ def declarations(workspace: Path, vault_keys) -> "tuple[list, list]":
         path = home / adapter.DECLARATION
         if _stat(path) is None:
             continue
-        decl, why = load(path, agents)
+        try:
+            decl, why = load(path, agents)
+        except DeclarationUnreadable as e:
+            decl, why = None, str(e)
+            if held is not None:
+                held.append(adapter.worker_name(home.name[:-len(SUFFIX)]))
         if decl is not None and decl["token_vault_key"] not in names:
             decl, why = None, f"{path}: the vault has no {decl['token_vault_key']}; vault set it to the agent's relay token"
         if decl is None:
