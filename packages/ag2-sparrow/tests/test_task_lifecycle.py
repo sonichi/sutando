@@ -2893,6 +2893,26 @@ class LocalClaimTest(Base):
         self.assertEqual((self.results / "task-bad.txt").read_bytes(), b"interrupted\n")
         self.assertEqual(sorted(again.settled.ids), ["task-bad"])
 
+    def test_reconcile_settled_completes_a_settlement_whose_ledger_append_failed(self):
+        """_settle saves SETTLED, then appends the id and removes the staged body; an append that fails leaves
+        SETTLED without the id. reconcile_settled finishes both, idempotently; anything not SETTLED is False."""
+        self.local_dir()
+        life = self.life()
+        self.confirmed(life, "task-led")
+        self.assertEqual(life.stage_result("task-led", b"answer\n", "turn-1"), "staged")
+        with mock.patch.object(self.lc.SettledIds, "add", side_effect=self.lc.LedgerIOError("cannot append")):
+            with self.assertRaises(self.lc.LedgerIOError):
+                life.publish_and_settle("task-led")
+        self.assertEqual((life.claims.load("task-led")["phase"], "task-led" in life.settled), (self.lc.SETTLED, False))
+        self.assertTrue(life.reconcile_settled("task-led"))
+        self.assertTrue(life.reconcile_settled("task-led"), "idempotent")
+        self.assertIn("task-led", self.lc.SettledIds(life.settled.path).ids, "durable in the ledger, once")
+        self.assertEqual(open(life.settled.path).read().count("task-led\n"), 1)
+        self.assertFalse((life.claims.dir("task-led") / "body").exists())
+        self.confirmed(life, "task-open")
+        self.assertFalse(life.reconcile_settled("task-open"))
+        self.assertFalse(life.reconcile_settled("task-none"))
+
     def test_one_generation_recovery_pass_delivers_a_verifying_blob_with_no_blob_write(self):
         """One recovery pass, as hold runs it once per start, with the blob writer failing on every call:
         the verified blob is final, so the claim moves on by its own save and the accepted answer is

@@ -93,7 +93,10 @@ def recover_dead_generation(root) -> int:
             except lifecycle.ClaimUnreadable:
                 continue
             gen = (rec or {}).get("generation") if rec and rec.get("claim_mode") == lifecycle.LOCAL else None
-            if gen and gen.get("pid") and rec["phase"] != lifecycle.SETTLED:
+            # A SETTLED claim still owed its ledger entry or its compaction brings its generation in too.
+            owed = rec and rec["phase"] == lifecycle.SETTLED and (
+                task_id not in lc.settled or lc.clock() - rec.get("settled_at", lc.clock()) > lifecycle.COMPACT_AFTER)
+            if gen and gen.get("pid") and (rec["phase"] != lifecycle.SETTLED or owed):
                 key = (gen["pid"], gen.get("start"))
                 if key not in dead and task_io.verify_lineage(gen["pid"], gen.get("start")) is False:
                     dead[key] = {"pid": gen["pid"], "start": gen.get("start")}
@@ -232,9 +235,16 @@ def _clear_stuck(root, task_id) -> bool:
 
 def _settle_terminal(lc, task_id) -> None:
     """A local claim at RESULT_STAGED or PUBLISHED whose result already exists is settled on that result
-    (the publisher records it and adds none); Parked when it does not settle now. The caller holds claims.lock."""
+    (the publisher records it and adds none); a SETTLED one has its settlement completed (the settled
+    ledger, the staged body) before any cleanup; Parked when it does not settle now. The caller holds
+    claims.lock."""
     rec = lc.claims.load(task_id)
-    if not rec or rec.get("claim_mode") != lifecycle.LOCAL or rec["phase"] not in (lifecycle.RESULT_STAGED, lifecycle.PUBLISHED):
+    if not rec or rec.get("claim_mode") != lifecycle.LOCAL:
+        return
+    if rec["phase"] == lifecycle.SETTLED:
+        lc.reconcile_settled(task_id)
+        return
+    if rec["phase"] not in (lifecycle.RESULT_STAGED, lifecycle.PUBLISHED):
         return
     if lc.publish_and_settle(task_id) != "settled":
         raise Parked("%s: answered, but its claim did not settle now (%s); retried" % (task_id, lc.claims.load(task_id)["phase"]))

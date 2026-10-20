@@ -992,8 +992,20 @@ class Lifecycle:
 
     def _settle(self, rec):
         self._save(rec, phase=SETTLED, settled_at=self.clock())
-        self.settled.add(rec["task_id"])
-        self.claims.unstage(rec["task_id"])
+        self.reconcile_settled(rec["task_id"])
+
+    def reconcile_settled(self, task_id):
+        """A SETTLED claim's settlement completed: its id in the settled ledger (an idempotent append) and its
+        staged body removed, the steps _settle takes after the save; a retry after either failed finishes
+        them. True when the claim is SETTLED; any failure raises, as those steps do."""
+        rec = self.claims.load(task_id)
+        if rec is None or rec["phase"] != SETTLED:
+            return False
+        if task_id not in self.settled:
+            self.log("re-recording a settled id ->", task_id)
+            self.settled.add(task_id)
+        self.claims.unstage(task_id)
+        return True
 
     def _holds_body(self, task_id, body):
         """Labels a settled publication won when some generation holds exactly our bytes."""
@@ -1232,9 +1244,8 @@ class Lifecycle:
         recs = {t: r for t, r in self._claims_readable().items()
                 if r and r.get("claim_mode") == LOCAL and r.get("generation") == generation}
         for task_id, rec in recs.items():
-            if rec["phase"] == SETTLED and task_id not in self.settled:
-                self.log("re-recording a settled id ->", task_id)
-                self.settled.add(task_id)
+            if rec["phase"] == SETTLED:
+                self.reconcile_settled(task_id)
         self.settled.sync()
         for task_id, rec in recs.items():
             phase = rec["phase"]

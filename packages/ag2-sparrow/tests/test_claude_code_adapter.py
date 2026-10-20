@@ -3394,22 +3394,71 @@ class InboxCli(ConnectBase):
         self.confirmed(t)
         self.assertEqual(self.verb("stage", t, "turn-1", stdin=b"the accepted answer\n")[0], 0)
         lc.claims.save(dict(lc.claims.load(t), phase=inbox.lifecycle.TURN_CONFIRMED))     # the move's last save never landed
-        records.write_progress(self.root, lambda rec: dict(rec, inflight=dict(
-            rec.get("inflight") or {}, **{t: {"phase": inbox.lifecycle.TURN_CONFIRMED, "turn_id": "turn-1"}})))
+        neighbor = {"phase": inbox.lifecycle.TURN_CONFIRMED, "turn_id": "turn-9"}
+        records.write_progress(self.root, lambda rec: dict(
+            rec, inflight=dict(rec.get("inflight") or {}, **{t: {"phase": inbox.lifecycle.TURN_CONFIRMED, "turn_id": "turn-1"},
+                                                            "task-neighbor": neighbor}),
+            stuck=dict(rec.get("stuck") or {}, **{t: {"since": 1}, "task-neighbor": {"since": 2}})))
         with mock.patch.object(inbox.lifecycle.Lifecycle, "read_final", side_effect=OSError(errno.EIO, "I/O error")):
             rc, out = self.verb("claim", t)
         self.assertEqual((rc, out.get("retry")), (1, True), out)
         self.assertEqual(((self.results / (t + ".txt")).read_text(), lc.claims.load(t)["phase"]),
                          ("the accepted answer\n", inbox.lifecycle.RESULT_STAGED), "the rename landed")
-        rc, out = self.verb("claim", t)
+        plugin = records.load_plugin(self.root)
+        self.assertEqual((t in plugin["inflight"], t in plugin["stuck"]), (True, True), "both still seeded")
+        with mock.patch.object(records, "write_progress", wraps=records.write_progress) as writes:
+            rc, out = self.verb("claim", t)
         self.assertEqual((rc, "retry" in out, out["refused"]), (1, False, "%s is LIVE_READY; only ABSENT may be submitted" % t), out)
+        self.assertEqual(writes.call_count, 1, "the in-flight mirror and the stuck mark dropped in one production write")
         self.assertEqual(lc.claims.load(t)["phase"], inbox.lifecycle.SETTLED, "settled on the result it found")
         plugin = records.load_plugin(self.root)
         self.assertNotIn(t, plugin.get("inflight") or {}, "no claim path leaves a finished task in flight")
-        obs = detector.derive({}, "idle\n", plugin, 0.0, stall_min_s=10)
-        obs = detector.derive(obs, "idle\n", plugin, 601.0, stall_min_s=10)
+        self.assertNotIn(t, plugin.get("stuck") or {}, "nor its stuck mark")
+        self.assertEqual((plugin["inflight"].get("task-neighbor"), plugin["stuck"].get("task-neighbor")),
+                         (neighbor, {"since": 2}), "an unrelated task's entries are untouched")
+        # The neighbor is still owed, so the detector reads the record without it: this task adds nothing.
+        own = dict(plugin, inflight={k: v for k, v in plugin["inflight"].items() if k != "task-neighbor"},
+                   stuck={k: v for k, v in plugin["stuck"].items() if k != "task-neighbor"})
+        obs = detector.derive({}, "idle\n", own, 0.0, stall_min_s=10)
+        obs = detector.derive(obs, "idle\n", own, 601.0, stall_min_s=10)
         self.assertIsNone(obs["stall"], "no false stall")
         self.assertEqual(sum(1 for p in self.results.iterdir() if p.name == t + ".txt"), 1)
+
+    def test_a_settlement_whose_ledger_append_failed_is_completed_by_the_next_claim_and_compacts(self):
+        """The settled-ids append faults once after the SETTLED save: that claim is a retry (SETTLED, no ledger
+        entry); the next claim completes the settlement (ledger entry, staged body gone) before its cleanup and
+        final refusal; the dead generation's recovery, once the claim is due, compacts it."""
+        lc = inbox._lifecycle(self.root)
+        t = "task-ledger-fault"
+        self.confirmed(t)
+        self.assertEqual(self.verb("stage", t, "turn-1", stdin=b"the accepted answer\n")[0], 0)
+        lc.claims.save(dict(lc.claims.load(t), phase=inbox.lifecycle.TURN_CONFIRMED))
+        real_add, hits = inbox.lifecycle.SettledIds.add, []
+
+        def add_faults_once(ledger, task_id):
+            if not hits:
+                hits.append(task_id)
+                raise inbox.lifecycle.LedgerIOError("cannot append to settled-ids ([Errno 5] I/O error)")
+            return real_add(ledger, task_id)
+        with mock.patch.object(inbox.lifecycle.SettledIds, "add", add_faults_once):
+            rc, out = self.verb("claim", t)
+        self.assertEqual((rc, out.get("retry"), hits), (1, True, [t]), out)
+        ledger = lambda: inbox._lifecycle(self.root).settled.ids     # noqa: E731
+        self.assertEqual((lc.claims.load(t)["phase"], t in ledger()), (inbox.lifecycle.SETTLED, False))
+        self.assertEqual((self.results / (t + ".txt")).read_text(), "the accepted answer\n")
+        rc, out = self.verb("claim", t)
+        self.assertEqual((rc, "retry" in out, out["refused"]), (1, False, "%s is LIVE_READY; only ABSENT may be submitted" % t), out)
+        self.assertIn(t, ledger(), "the settlement completed before the final refusal")
+        self.assertFalse((lc.claims.dir(t) / "body").exists())
+        self.assertNotIn(t, records.load_plugin(self.root).get("inflight") or {})
+        dead = {"pid": 2 ** 22 - 1, "start": "2026-01-01T00:00:00Z"}
+        rec = lc.claims.load(t)
+        lc.claims.save(dict(rec, generation=dead, settled_at=rec["settled_at"] - inbox.lifecycle.COMPACT_AFTER - 1))
+        with mock.patch.object(task_io, "verify_lineage", return_value=False):
+            self.assertEqual(inbox.recover_dead_generation(self.root), 1, "a claim due for compaction brings its generation in")
+        self.assertIsNone(lc.claims.load(t), "compacted")
+        self.assertIn(t, ledger())
+        self.assertEqual(sum(1 for p in self.results.iterdir() if p.name == t + ".txt"), 1, "nothing published twice")
 
     def test_a_claim_the_mod_lost_past_its_call_is_finished_or_interrupted_at_once(self):
         """A Mod that lost its offers (a reload inside the generation) claims the task afresh: a descriptor

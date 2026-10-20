@@ -125,7 +125,11 @@ staged answer whose publication failed, a committed OUTCOME_UNKNOWN) is
 delivered by the new generation's live claim, once; its interruption stays
 recovery's. A claim whose result already exists settles the claim on that
 result and drops the task's in-flight mirror with its stuck mark in one
-write, so a delivered task is never left in flight for the stall detector. When the progress record cannot be written at all, the CLI raises
+write, so a delivered task is never left in flight for the stall detector.
+A SETTLED claim whose settled-ids append failed is completed first
+(`reconcile_settled`: the id appended once, the staged body removed) by the
+next claim, before that cleanup, and by recovery, which also brings in a
+generation whose SETTLED claims are owed the ledger entry or due for compaction. When the progress record cannot be written at all, the CLI raises
 an alarm in the adapter's config dir (outside `state/`): `verify` fails its
 `progress` row and the launcher raises the needs-attention card until a durable
 write clears it. A record whose fields have the wrong shape reads as unreadable (hard),
