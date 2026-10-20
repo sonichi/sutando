@@ -16,15 +16,19 @@ The rule, closed by default:
   key path, any other HMAC_STRICT   -> strict (a missing line or an unknown value is not an opt-out)
   no key path, not HMAC_STRICT=1    -> off: every verdict but invalid is submitted (unsigned reads)
 An incomplete or unreadable config is refused upstream (the verb parks it); it never reads as off.
+The verdict is bound to the key the verifier read (its digest, `key_seen`): when the key file reads
+otherwise here, the verdict is stale and the task is held to be verified again, never retired.
 """
 from __future__ import annotations
 
+import hashlib
 import re
 from pathlib import Path
 
 STRICT, LENIENT, OFF = "strict", "lenient", "off"
 VERDICTS = frozenset(("verified", "unsigned", "invalid", "unverifiable"))
 KEY_RE = re.compile(r"[0-9a-fA-F]{64}")
+ABSENT = "absent"
 KEY_FILE, STRICT_FLAG, OPT_OUT, LEGACY_OPT_OUT = "HMAC_KEY_FILE", "HMAC_STRICT", "0", ""
 MODE_LINES = {STRICT: "strict (only verified envelopes are submitted), decided per task from the key file as it is then",
               LENIENT: "not strict (unsigned and unverifiable envelopes are submitted too)",
@@ -35,18 +39,38 @@ def key_absent(path: str) -> bool:
     return not path or not Path(path).exists()
 
 
-def key_problem(path: str) -> str:
-    """'' when `path` holds the key the plugin's verifier accepts (64 hex characters), else why not."""
+def _read(path: str) -> "tuple[bytes | None, OSError | None]":
+    if not path:
+        return None, None
+    try:
+        return Path(path).read_bytes(), None
+    except OSError as e:
+        return None, e
+
+
+def _digest(raw: "bytes | None") -> str:
+    return ABSENT if raw is None else hashlib.sha256(raw).hexdigest()
+
+
+def _problem(path: str, raw: "bytes | None", err: "OSError | None") -> str:
     if not path:
         return "no key file recorded (HMAC_KEY_FILE is empty): strict mode submits nothing"
-    try:
-        text = Path(path).read_text(encoding="utf-8", errors="replace").strip()
-    except OSError as e:
-        what = "missing" if key_absent(path) else "unreadable (%s)" % (e.strerror or e)
+    if raw is None:
+        what = "missing" if key_absent(path) else "unreadable (%s)" % ((err and err.strerror) or err)
         return "%s %s: strict mode submits nothing until it is back" % (path, what)
-    if not KEY_RE.fullmatch(text):
+    if not KEY_RE.fullmatch(raw.decode("utf-8", errors="replace").strip()):
         return "%s is not a 64-hex-character key, so every envelope reads unverifiable" % path
     return ""
+
+
+def key_problem(path: str) -> str:
+    """'' when `path` holds the key the plugin's verifier accepts (64 hex characters), else why not."""
+    return _problem(path, *_read(path))
+
+
+def key_digest(path: str) -> str:
+    """sha256 hex of the key file's bytes, or "absent" when there is none to read: the verifier's digest."""
+    return _digest(_read(path)[0])
 
 
 def mode(cfg: dict) -> str:
@@ -67,17 +91,21 @@ def legacy_opt_out(cfg: dict) -> bool:
     return bool(cfg.get(KEY_FILE)) and cfg.get(STRICT_FLAG) == LEGACY_OPT_OUT
 
 
-def decide(cfg: dict, verdict: str) -> "tuple[bool, str, bool]":
-    """(submit, the one reason line when not, retry), read fresh for this task. retry is True only for a
-    refusal the key file's return would lift (strict mode with the key missing, unreadable or malformed):
-    the task is held and tried again, not retired."""
+def decide(cfg: dict, verdict: str, key_seen: "str | None" = None) -> "tuple[bool, str, bool]":
+    """(submit, the one reason line when not, retry), from one read of the key file for this task. retry
+    is True for a refusal the key file's return would lift (strict mode with the key missing, unreadable
+    or malformed), and for a verdict whose `key_seen` is not the key read here: held, never retired."""
     if verdict not in VERDICTS:
         return False, "no verdict (%r)" % (verdict,), False
+    path = cfg.get(KEY_FILE, "")
+    raw, err = _read(path)
+    if key_seen is not None and key_seen != _digest(raw):
+        return False, "the key file changed after this envelope was verified; verified again", True
     if verdict == "invalid":
         return False, "envelope invalid", False
     if mode(cfg) != STRICT:
         return True, "", False
-    problem = key_problem(cfg.get(KEY_FILE, ""))
+    problem = _problem(path, raw, err)
     if problem:
         return False, "strict mode: " + problem, True
     if verdict != "verified":

@@ -101,7 +101,7 @@ class PluginShape(unittest.TestCase):
         src = REGISTER.read_text()
         self.assertNotIn("AG2_HMAC_STRICT", src)
         self.assertNotIn("strict &&", src)
-        self.assertIn("['envelope', '--verdict', verdict]", src)
+        self.assertIn("['envelope', '--verdict', verdict, '--key-seen', seen]", src)
         self.assertIn("policy.data.submit", src)
 
     def test_pinned_non_owner_note_is_the_shared_owners(self):
@@ -174,11 +174,25 @@ class VerifierMirrorsSparrow(unittest.TestCase):
             self.assertEqual(self.check(verify_py(), str(kf), ws), [], repr(bad[:8]))
             self.assertEqual(run_verifier(verify_py(), self.vectors()[0], str(kf))[0], "unverifiable", repr(bad[:8]))
 
+    def test_the_key_digest_is_the_one_the_policy_reads(self):
+        """The fourth field binds the verdict to the key bytes the verifier read: the same digest
+        hmac_policy.key_digest gives for that file, "absent" when there is none."""
+        text = self.vectors()[0]
+        for content in (self.key, self.key + "\n", "short", ""):
+            self.key_file.write_text(content)
+            got = subprocess.run([sys.executable, "-c", verify_py()], input=text, capture_output=True, text=True,
+                                 env=hermetic_env(AG2_HMAC_KEY_FILE=str(self.key_file)), check=True).stdout.split()
+            self.assertEqual(got[3], hmac_policy.key_digest(str(self.key_file)), repr(content[:8]))
+        for missing in (str(self.ws / "none"), ""):
+            got = subprocess.run([sys.executable, "-c", verify_py()], input=text, capture_output=True, text=True,
+                                 env=hermetic_env(AG2_HMAC_KEY_FILE=missing), check=True).stdout.split()
+            self.assertEqual((got[0], got[3], hmac_policy.key_digest(missing)), ("unverifiable", "absent", "absent"))
+
     def test_mutants_are_caught(self):
         always_verified = verify_py().replace('out("verified" if', 'out("verified" if True or')
         self.assertIn('if True or', always_verified)
         self.assertTrue(self.check(always_verified, str(self.key_file), self.ws))
-        owner_only = verify_py().replace('def out(v): print(v,tier,collab)', 'def out(v): print(v,"owner",collab)')
+        owner_only = verify_py().replace('def out(v): print(v,tier,collab,seen)', 'def out(v): print(v,"owner",collab,seen)')
         self.assertIn('"owner",collab', owner_only)
         self.assertTrue(self.check(owner_only, str(self.key_file), self.ws))
 
@@ -1446,6 +1460,47 @@ class ConnectStrict(ConnectBase):
         self.assertEqual((rc, out.get("retry"), "unreadable" in out.get("refused", "")), (1, True, True), "fail closed, retried")
         self.assertNotIn("envelope", inbox.PROGRESS_VERBS, "a read: it never clears or raises the progress alarm")
 
+    def test_a_key_that_changes_between_the_verifiers_read_and_the_policys_holds_the_task_never_retires_it(self):
+        """The Mod's two reads, the verifier's and the envelope verb's: a valid signed task whose key lands
+        (missing -> valid) or is rotated (old -> new) between them is held for another verification, and
+        that verification submits it. The verdict carries the digest of the key it was made with."""
+        key = self.home / "task-hmac.key"
+        self.configure(HMAC_STRICT="1")
+
+        def verified(text):
+            out = subprocess.run([sys.executable, "-c", verify_py()], input=text, capture_output=True, text=True,
+                                 env=hermetic_env(AG2_HMAC_KEY_FILE=str(key)), check=True).stdout.split()
+            return out[0], out[3]
+
+        def verb(verdict, seen):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = cli.main(["inbox", "--root", str(self.work), "envelope", "--verdict", verdict, "--key-seen", seen])
+            data = json.loads(out.getvalue())
+            return rc, data["submit"], data["retry"]
+
+        k1, k2 = secrets.token_hex(32), secrets.token_hex(32)
+        text = stamp("id: task-r1\nsource: ag2space\naccess_tier: owner\ntask: hi\n", k1)
+        key.unlink()
+        first = verified(text)
+        self.assertEqual(first, ("unverifiable", "absent"))
+        key.write_text(k1)                                  # the key lands between the two reads
+        self.assertEqual(hmac_policy.decide(cli.read_config(cli.config_path()), *first)[1:],
+                         ("the key file changed after this envelope was verified; verified again", True))
+        self.assertEqual(verb(*first), (0, False, True), "held, not retired")
+        again = verified(text)
+        self.assertEqual(again[0], "verified")
+        self.assertEqual(verb(*again), (0, True, False))
+
+        text = stamp("id: task-r2\nsource: ag2space\naccess_tier: owner\ntask: hi\n", k2)
+        first = verified(text)
+        self.assertEqual(first[0], "invalid")
+        key.write_text(k2)                                  # rotated between the two reads
+        self.assertEqual(verb(*first), (0, False, True), "a stale invalid is held, not retired")
+        again = verified(text)
+        self.assertEqual(verb(*again), (0, True, False))
+        self.assertEqual(verb("invalid", again[1]), (0, False, False), "invalid under the key read here stays final")
+
     def test_an_empty_or_incomplete_config_parks_the_envelope_verb_never_off(self):
         """A readable config short of a required key (empty, or a marker line alone) is not a config that
         says off: the verb parks (retry) exactly as a missing one does."""
@@ -1510,6 +1565,8 @@ class ConnectStrict(ConnectBase):
                 self.assertEqual("HMAC_STRICT" in cfg, flag is not None)
                 want_mode = {"strict": "strict", "held": "strict", "lenient": "lenient", "off": "off"}[outcome]
                 self.assertEqual(hmac_policy.mode(cfg), want_mode)
+                seen = hmac_policy.key_digest(str(key))
+                stale = "0" * 64 if seen != "0" * 64 else hmac_policy.ABSENT
                 for verdict in verdicts:
                     submit, reason, retry = hmac_policy.decide(cfg, verdict)
                     if verdict == "invalid":
@@ -1528,6 +1585,16 @@ class ConnectStrict(ConnectBase):
                         rc = cli.main(["inbox", "--root", str(self.work), "envelope", "--verdict", verdict])
                     data = json.loads(out.getvalue())
                     self.assertEqual((rc, data["mode"], data["submit"], data["reason"], data["retry"]), (0, want_mode, *want), verdict)
+                    # The verdict bound to the key read here decides the same; one bound to another key is held.
+                    seen_here = seen if key_path == "present" else hmac_policy.ABSENT
+                    self.assertEqual(hmac_policy.decide(cfg, verdict, seen_here), want, verdict)
+                    self.assertEqual(hmac_policy.decide(cfg, verdict, stale if key_path == "present" else "0" * 64),
+                                     (False, "the key file changed after this envelope was verified; verified again", True), verdict)
+                    out = io.StringIO()
+                    with contextlib.redirect_stdout(out):
+                        rc = cli.main(["inbox", "--root", str(self.work), "envelope", "--verdict", verdict, "--key-seen", seen_here])
+                    data = json.loads(out.getvalue())
+                    self.assertEqual((rc, data["submit"], data["reason"], data["retry"]), (0, *want), verdict)
                 rc, out, _ = self.main("verify")
                 if outcome == "held":
                     self.assertIn("FAIL hmac key: strict mode: ", out)

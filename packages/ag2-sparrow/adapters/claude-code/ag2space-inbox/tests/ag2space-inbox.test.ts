@@ -15,12 +15,13 @@ const FRAMED = (msg: string) => `The ag2space-inbox plugin sent a message:\n${ms
 type Claim = { attempt: number; phase: string; token?: string; hash?: string; turnId?: string; body?: string; staged?: string
                 blobOk?: boolean }
 
-// An in-memory host: fs, process (the verifier's "<verdict> <tier> <collab>" line, the text hash, and
+// An in-memory host: fs, process (the verifier's "<verdict> <tier> <collab> <key digest>" line, the text hash, and
 // the inbox CLI's verbs over an in-memory claim store), clock, env, prompt sink, session id. Tier and
 // collaborator come from a plain read of the stdin text; the real rule is pinned to Sparrow's by
 // tests/test_claude_code_adapter.py, and the lifecycle verbs by the Python inbox tests.
 function host(on: any, opts: { verdict?: string; env?: Record<string, string>; rejectSubmits?: number; verifierFails?: boolean; markerFails?: number;
                                strict?: boolean; keyProblem?: string; policyFails?: number;
+                               keySwap?: { from: string; to: string; signedWith: string };
                                progressFails?: number; sessionIds?: string[]; cwdInode?: string; allowNonOwner?: boolean;
                                claimAs?: Record<string, unknown>; interruptParks?: number; interruptThrows?: number;
                                interruptSoft?: Record<string, string | number>; stuckAtStart?: Record<string, unknown>;
@@ -43,6 +44,9 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
   let marks = 0
   let markerFailLeft = opts.markerFails ?? 0
   let policyFailLeft = opts.policyFails ?? 0
+  // The key file as a digest ('absent' when there is none); with keySwap it changes right after the first
+  // verifier read, so the policy's read sees another key than the verdict was made with.
+  let keyNow = opts.keySwap?.from ?? 'absent'
   let parksLeft = opts.interruptParks ?? 0
   let throwsLeft = opts.interruptThrows ?? 0
   const softLeft: Record<string, string | number> = { ...(opts.interruptSoft ?? {}) }
@@ -100,7 +104,10 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
       const text: string = e.init.stdin
       const tier = (text.match(/^access_tier: (\S+)/m)?.[1] ?? 'owner')
       const collab = text.includes('\ncollaborator: true\n') ? 'true' : 'false'
-      return { value: { exitCode: 0, stdout: `${opts.verdict ?? 'verified'} ${tier} ${collab}\n`, stderr: '' } }
+      const seen = keyNow, sw = opts.keySwap
+      if (sw) keyNow = sw.to
+      const verdict = !sw ? opts.verdict ?? 'verified' : seen === 'absent' ? 'unverifiable' : seen === sw.signedWith ? 'verified' : 'invalid'
+      return { value: { exitCode: 0, stdout: `${verdict} ${tier} ${collab} ${seen}\n`, stderr: '' } }
     }
     if (argv[0] === 'python3' && argv[2].includes('secrets')) {
       if (markerFailLeft-- > 0) return { value: { exitCode: 1, stdout: '', stderr: 'python3: not found' } }
@@ -147,9 +154,15 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
       // file is missing or malformed; invalid is never submitted; an unreadable config is a retry.
       if (policyFailLeft-- > 0) return out(1, { refused: 'the installed config is unreadable (EIO); retried', retry: true })
       const verdict = argv[argv.indexOf('--verdict') + 1]
-      const reason = verdict === 'invalid' ? 'envelope invalid' : !opts.strict ? '' : opts.keyProblem ? `strict mode: ${opts.keyProblem}`
+      const at = argv.indexOf('--key-seen')
+      if (at > 0 && argv[at + 1] !== keyNow) {
+        return out(0, { verdict, mode: opts.strict ? 'strict' : 'off', submit: false, retry: true,
+                        reason: 'the key file changed after this envelope was verified; verified again' })
+      }
+      const keyProblem = opts.keySwap ? (keyNow === 'absent' ? '/k/task-hmac.key missing' : '') : opts.keyProblem
+      const reason = verdict === 'invalid' ? 'envelope invalid' : !opts.strict ? '' : keyProblem ? `strict mode: ${keyProblem}`
         : verdict !== 'verified' ? `strict mode: envelope ${verdict}` : ''
-      return out(0, { verdict, mode: opts.strict ? 'strict' : 'off', submit: !reason, reason, retry: !!(opts.strict && opts.keyProblem) })
+      return out(0, { verdict, mode: opts.strict ? 'strict' : 'off', submit: !reason, reason, retry: !!(opts.strict && keyProblem) })
     }
     if (verb === 'claim') {
       if (result(task) === 'LIVE_READY') {
@@ -521,6 +534,57 @@ test('a held task whose stuck mark cannot be cleared at its terminal refusal sta
   expect(h.runs.filter((a: string[]) => a[2] === 'progress' && a.includes('--unstuck')).length).toBe(3)
   expect(h.progress.filter((p: string[]) => p[0] === '--unstuck').length).toBe(1)   // the fake records only the one that landed
   expect(h.logs.filter(l => l.includes('task-h1 strict mode: envelope unsigned; its stuck mark could not be cleared')).length).toBe(2)
+})
+
+// A stuck mark recorded before this Mod started (a session restart or plugin reload during a long hold) is
+// in the durable record but not in this Mod's memory: a terminal refusal still clears it before retiring.
+for (const verdict of ['unsigned', 'invalid']) {
+  test(`a stuck mark from before the Mod started is cleared when the task is refused as ${verdict} on the first scan`, async ($, on) => {
+    const h = host(on, { verdict, strict: true, keyProblem: '', stuckAtStart: { 'task-h1': { since: 1 } } })
+    h.files['/in/task-h1.txt'] = TASK('task-h1')
+    await arm($, h)
+    for (let i = 0; i < 10; i++) await h.clock.advance(1000)
+    expect(h.submitted.length).toBe(0)
+    expect(h.logs.some(l => l.includes(`task-h1 ${verdict === 'invalid' ? 'envelope invalid' : 'strict mode: envelope unsigned'}; not submitted`))).toBe(true)
+    expect(h.stuck).toEqual({})
+    expect(h.progress.filter((p: string[]) => p[0] === '--unstuck')).toEqual([['--unstuck', 'task-h1']])
+  })
+}
+
+test('a stuck mark from before the Mod started whose clear fails keeps the task retryable until the clear lands', async ($, on) => {
+  const h = host(on, { verdict: 'unsigned', strict: true, keyProblem: '', stuckAtStart: { 'task-h1': { since: 1 } }, unstuckFails: 2 })
+  h.files['/in/task-h1.txt'] = TASK('task-h1')
+  await arm($, h)
+  for (let i = 0; i < 10; i++) await h.clock.advance(1000)
+  expect(h.submitted.length).toBe(0)
+  expect(h.stuck).toEqual({})
+  expect(h.runs.filter((a: string[]) => a[2] === 'progress' && a.includes('--unstuck')).length).toBe(3)
+})
+
+// The verifier and the policy each read the key; the verdict carries the digest of the key it was made with,
+// and a policy read that finds another key holds the task to be verified again, never retires it.
+test('a signed task whose key lands between the verifier\'s read and the policy\'s is held, verified again and submitted', async ($, on) => {
+  const K = 'a'.repeat(64)
+  const h = host(on, { strict: true, keySwap: { from: 'absent', to: K, signedWith: K } })
+  h.files['/in/task-r1.txt'] = TASK('task-r1')
+  await arm($, h)
+  for (let i = 0; i < 5; i++) await h.clock.advance(1000)
+  expect(h.submitted.length).toBe(1)
+  expect(h.submitted[0]).toContain('envelope verified')
+  const asked = h.runs.filter((a: string[]) => a[2] === 'envelope' && a.includes('--key-seen'))
+  expect(asked.map((a: string[]) => [a[4], a[6]])).toEqual([['unverifiable', 'absent'], ['verified', K]])
+  expect(h.logs.some(l => l.includes('not submitted'))).toBe(false)
+})
+
+test('a signed task whose key is rotated between the verifier\'s read and the policy\'s is held, verified again and submitted', async ($, on) => {
+  const K1 = 'a'.repeat(64), K2 = 'b'.repeat(64)
+  const h = host(on, { strict: true, keySwap: { from: K1, to: K2, signedWith: K2 } })
+  h.files['/in/task-r2.txt'] = TASK('task-r2')
+  await arm($, h)
+  for (let i = 0; i < 5; i++) await h.clock.advance(1000)
+  expect(h.submitted.length).toBe(1)
+  const asked = h.runs.filter((a: string[]) => a[2] === 'envelope' && a.includes('--key-seen'))
+  expect(asked.map((a: string[]) => [a[4], a[6]])).toEqual([['invalid', K1], ['verified', K2]])
 })
 
 test('an envelope policy that never answers is marked stuck after 300 ticks like any other retained task, never skipped silently', async ($, on) => {

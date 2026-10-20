@@ -215,11 +215,16 @@ older than the `envelope` verb, which read that bit itself; the current mod
 never reads it (pinned). And the verifier's key *path* (`AG2_HMAC_KEY_FILE`) is
 set in the session's environment at its creation, so a reinstall with another
 path takes a session restart; the key's presence and content at that path are
-read live, by the verifier and the policy alike. The watch tool's arm line
-names the mode as the CLI reads it then.
+read live, by the verifier and the policy alike. Those are two reads, so the
+verifier prints the sha256 of the key bytes it read (`absent` when none) and
+the mod passes it as `--key-seen`: when the policy's own read of the key file
+differs (the key landed or was rotated in between), the verdict is stale and
+the task is held to be verified again, never retired. The watch tool's arm
+line names the mode as the CLI reads it then.
 
-A task the mod held (backoff, then the durable stuck mark after 300 ticks)
-has that mark cleared before any terminal outcome retires it: a verdict the
+Any task the mod retires has its durable stuck mark cleared first, whether
+that mark was set by this mod or by one before a session restart or plugin
+reload (the clear is sent every time; clearing no mark is harmless): a verdict the
 policy refuses once the key lands (`unsigned`, `invalid`), a final claim or
 authorize refusal, or a delivered answer (the claim's own write clears it). A
 clear the CLI does not confirm keeps the task retryable; no mark outlives its
