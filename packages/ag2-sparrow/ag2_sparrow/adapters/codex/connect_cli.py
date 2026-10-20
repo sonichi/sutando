@@ -5,12 +5,13 @@ One console script per adapter, as `ag2-sparrow-claude-local` and `ag2-sparrow-h
 is `ag2_sparrow.connect_common`'s, as one owner: `install` records the work root and the Codex settings
 in a 0600 marked config and writes the marked unit (a systemd user unit on Linux, a launchd agent on
 macOS) as a quiescent replacement, then requires the managed launcher to hold the root. `run` is what
-the manager runs and nothing else: it checks the Codex CLI version, takes the work root's lock for its
-own life, starts the connector as its direct child on its own `codex app-server` (stdio) with `--held`,
-attaches it as the consumer whose liveness fences the root, and reaps it on SIGTERM; a root another
-session holds is exit 75, which the manager does not relaunch over. `verify` checks each part;
-`uninstall` removes only what install wrote. The relay token stays in Sparrow's env file and the Codex
-login in CODEX_HOME: neither is copied. Stdlib only.
+the manager runs and nothing else (`--launchd` is the shared entry shim): it checks the Codex CLI
+version, then the shared holder sequence takes the work root's lock for the launcher's life, starts
+the connector as its direct child on its own `codex app-server` (stdio) from the exact executable the
+check passed, with `--held`, attaches it as the consumer whose liveness fences the root, and reaps it
+on SIGTERM; a root another session holds is exit 75, which the manager does not relaunch over.
+`verify` checks each part; `uninstall` removes only what install wrote. The relay token stays in
+Sparrow's env file and the Codex login in CODEX_HOME: neither is copied. Stdlib only.
 """
 from __future__ import annotations
 
@@ -36,9 +37,11 @@ LOCAL = Shape(name=SHAPE, command=COMMAND, description="the Codex connector as a
               cli="Codex CLI", min_version=MIN_CODEX, version_anchor=r"^codex",
               version_note="the app-server stdio shape was measured there", required_keys=REQUIRED_KEYS,
               config_keys=CONFIG_KEYS, env_keep=ENV_KEEP,
-              kept="the Codex login (CODEX_HOME) and the work root with state/threads, the owner's thread history")
+              kept="the Codex login (CODEX_HOME) and the work root with state/threads, the owner's thread history",
+              run_args=("run", "--launchd"), keep_alive_on_success=False)
 MARKER, PLIST_MARKER, SERVICE_NAME, AGENT_LABEL = LOCAL.marker, LOCAL.plist_marker, LOCAL.service_name, LOCAL.agent_label
 WORK_DIRS = ("tasks", "results", "state", os.path.join("state", "threads"))
+LABELS = ("launcher", "connector")     # the holder and its consumer, in verify's and install's words
 
 
 def config_path() -> Path:
@@ -67,11 +70,12 @@ def child_env(cfg: dict, environ=None) -> dict:
 
 
 def connector_argv(cfg: dict, root: str) -> list:
-    """The connector under this launcher's lock (--held) on its own app-server: never --once, --idle-exit,
-    --push, --thread-id, --ephemeral, --developer-instructions, nor the stub or proxy server, none of
-    which belong under a manager."""
-    argv = [sys.executable, "-m", codex_connector.__name__, "--work", root, "--held", "--server", "stdio",
-            "--sandbox", cfg.get("SANDBOX") or "read-only"]
+    """The connector under this launcher's lock (--held), its app-server from the exact executable the
+    version check passed (--codex, never a PATH lookup): never --once, --idle-exit, --push, --thread-id,
+    --ephemeral, --developer-instructions, nor the stub or proxy server, none of which belong under a
+    manager."""
+    argv = [sys.executable, "-m", codex_connector.__name__, "--work", root, "--held", "--codex", cfg["CODEX"],
+            "--server", "stdio", "--sandbox", cfg.get("SANDBOX") or "read-only"]
     if cfg.get("ALLOW_NON_OWNER") == "1":
         argv.append("--allow-non-owner")
     if cfg.get("MODEL"):
@@ -93,21 +97,12 @@ def login_problem(cfg: dict, run_=subprocess.run) -> str:
 
 def holder_words(root: str, _rec=None) -> str:
     """Who holds the root, as verify and install both say it: the launcher and, once attached, its connector."""
-    rec, consumer = task_io.lock_holder(root), task_io.holder_consumer(root)
-    return f"launcher pid {rec.get('owner_pid')}" + (f", its connector pid {consumer['pid']}"
-                                                     if consumer and consumer.get("live") else ", no live connector attached")
+    return cm.holder_words(root, LABELS)
 
 
 def occupancy_line(root: str) -> str:
-    """The shared tri-state beside the manager's state: held names the launcher and, once attached, the
-    connector whose liveness fences the root; unobserved never reads free."""
-    occ = task_io.occupancy(root)
-    manager = cm.manager_detail(LOCAL)
-    if occ == "held":
-        return f"held by {holder_words(root)} (manager {manager})"
-    if occ == "unobserved":
-        return f"unobserved (the root's holder or consumer cannot be verified; manager {manager})"
-    return cm.occupancy_line(LOCAL, root)
+    """The shared tri-state beside the manager's state, in this shape's nouns."""
+    return cm.occupancy_line(LOCAL, root, LABELS)
 
 
 # ── commands ─────────────────────────────────────────────────────────────────
@@ -135,11 +130,14 @@ def install(args) -> int:
 
 def run(args, popen=subprocess.Popen) -> int:
     """What the manager runs, and only it: refused without the marker the unit sets (`debug-run` is the
-    hand start). The launcher holds the root for its own life and the connector is its consumer."""
+    hand start); `--launchd` is the shared entry shim that runs the launcher as a child and maps its
+    outcome (logical 75 to exit 0, so launchd stops instead of relaunching over the holder)."""
     problem = "" if args.debug else cm.managed_problem(LOCAL)
     if problem:
         print(f"error: {problem}", file=sys.stderr)
         return EXIT_UNUSABLE
+    if getattr(args, "launchd", False):
+        return cm.run_launchd(cm.run_child_argv(LOCAL, __name__), popen)
     cfg, problem = load_config()
     if problem:
         print(f"error: {problem}", file=sys.stderr)
@@ -157,73 +155,25 @@ def run(args, popen=subprocess.Popen) -> int:
 
 
 def _held(cfg: dict, root: str, popen, state: dict) -> int:
-    try:
-        owner = task_io.acquire_lock(root, LOCAL.name, retry_s=cm.ACQUIRE_RETRY_S)
-    except task_io.LockRefused as e:
-        print(e.line, file=sys.stderr)
-        return EXIT_HELD if e.code == 3 else EXIT_UNUSABLE
-    try:
-        if cm._is_link("tasks", owner.root_fd):
-            return _refuse("tasks/ under the held root is a symlink, not a directory")
+    """connect_common's holder sequence with this shape's steps: the connector's dirs under the held
+    inode, the connector spawned under the allowlist, its own 75 reported as 1."""
+    def prepare(owner, root):
         task_io.make_dirs(owner, WORK_DIRS)
-        try:
-            root = task_io.root_path(owner, root)
-        except task_io.LockRefused as e:
-            print(e.line, file=sys.stderr)
-            return EXIT_UNUSABLE
-        if state["sig"] is not None:
-            print("run: stopped before the connector started", file=sys.stderr)
-            return 128 + state["sig"]
-        expected = task_io.holder_record_bytes(owner)
-        try:
-            child = popen(connector_argv(cfg, root), env=child_env(cfg), cwd=root, stdin=subprocess.DEVNULL)
-        except OSError as e:
-            return _refuse(f"the connector could not be spawned ({e.strerror or e})")
-        try:
-            start = task_io.start_time(child.pid)
-            if start is None:
-                raise task_io.LockRefused(2, "the connector's start time is unreadable")
-            task_io.attach_consumer(owner, expected, child.pid, start)
-        except Exception as e:     # holder_lock.LockError arrives as Exception here
-            _reap(child)
-            return _refuse(f"no consumer: {e}")
-        return _supervise(child, state)
-    finally:
-        if not task_io.release_lock(owner):
-            print("run: the connector may still be alive; the root stays held by it and this flock until exit",
-                  file=sys.stderr)
+        return task_io.root_path(owner, root), ""
+
+    def spawn(held_root):
+        return popen(connector_argv(cfg, held_root), env=child_env(cfg), cwd=held_root, stdin=subprocess.DEVNULL)
+    return cm.hold_and_supervise(LOCAL, root, state, prepare, spawn, lambda child: _supervise(child, state),
+                                 cm.kill_and_reap, "run", "connector")
 
 
 def _supervise(child, state: dict) -> int:
-    """Wait for the direct child; a recorded stop terminates it, bounded, then kills; its exit code, with
-    the connector's own 75 reported as 1 so 75 means only another holder of the root."""
-    state["child"] = child
-    rc = cm._run_until_end(child, None, state)
-    if rc is None:
-        print("run: the connector did not die within the bound; the manager's to clean", file=sys.stderr)
-        return 128 + state["sig"]
-    if state["sig"] is not None:
-        return 128 + state["sig"]
-    if rc == EXIT_HELD:
+    """The shared wait; the connector's own 75 is reported as 1, so 75 means only another holder of the root."""
+    rc = cm.supervise_child(child, state, "run", "connector")
+    if rc == EXIT_HELD and state["sig"] is None:
         print(f"run: the connector exited {EXIT_HELD}; reported as {EXIT_CHILD_HELD}", file=sys.stderr)
         return EXIT_CHILD_HELD
     return rc
-
-
-def _reap(child) -> None:
-    try:
-        child.kill()
-    except OSError:
-        pass
-    try:
-        child.wait(timeout=cm.REAP_BOUND_S)
-    except subprocess.TimeoutExpired:
-        pass
-
-
-def _refuse(line: str) -> int:
-    print(f"run: {line}", file=sys.stderr)
-    return EXIT_UNUSABLE
 
 
 def verify(_args) -> int:
@@ -269,9 +219,12 @@ def main(argv=None) -> int:
     run_help = (f"what the manager runs: the launcher of the connector on its own app-server; refused unless "
                 f"{cm.MANAGED_VAR}=1 is in the environment, as the unit sets it (a guard against an accidental hand "
                 "start, not a security boundary)")
-    sub.add_parser("run", help=run_help, description=run_help).set_defaults(func=run, debug=False)
+    r = sub.add_parser("run", help=run_help, description=run_help)
+    r.add_argument("--launchd", action="store_true", help="launchd's entry shim: runs the launcher as a child and "
+                   "maps logical 75 to exit 0, everything else (and a signal death) to non-zero")
+    r.set_defaults(func=run, debug=False)
     sub.add_parser("debug-run", help="the same launcher by hand, for a look at the connector (stop the job first: a "
-                   "held root is refused with 75)").set_defaults(func=run, debug=True)
+                   "held root is refused with 75)").set_defaults(func=run, debug=True, launchd=False)
     sub.add_parser("verify", help="check every part").set_defaults(func=verify)
     sub.add_parser("uninstall", help="stop the job, then remove what install wrote (config last)").set_defaults(func=uninstall)
     args = ap.parse_args(argv)

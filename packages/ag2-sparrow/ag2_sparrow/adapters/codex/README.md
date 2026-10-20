@@ -10,7 +10,7 @@ python3 -m ag2_sparrow.adapters.codex.codex_connector --push <thread-id> <owner-
 ```
 
 `<dir>/tasks/task-*.txt` in, `<dir>/results/task-<id>.txt` out, `<dir>/state/{threads/,done,metrics.jsonl}`.
-One process per work dir, through the package's `holder_lock` (its first act; exit 3 naming the holder if another adapter of any kind holds the dir, exit 2 for any other lock failure; released on exit and on SIGTERM).
+One process per work dir, through the package's `holder_lock` (its first act when it runs on its own; exit 3 naming the holder if another adapter of any kind holds the dir, exit 2 for any other lock failure; released on exit and on SIGTERM). Under `--held` (the supervised launch below) the connector takes no lock: its launcher holds the root and attaches it as the consumer.
 
 ## Launch under a supervisor: `ag2-sparrow-codex-local`
 
@@ -36,24 +36,33 @@ held by a fresh launcher of this shape within 30 s; anything less is one line an
 written, so an identical install is the retry. A config or unit install did not write is a final
 refusal naming what to remove by hand. The unit is a systemd user unit (`Restart=always`,
 `RestartSec=10`, `KillMode=control-group`, `RestartPreventExitStatus=75`, linger asked) on Linux, a
-launchd agent (`KeepAlive`, `RunAtLoad`, `ThrottleInterval` 30, `AbandonProcessGroup` false) on macOS.
-Both run `ag2-sparrow-codex-local run` with `AG2_SPARROW_MANAGED=1` and carry paths only: the relay
+launchd agent (`KeepAlive` on anything but a clean exit, `RunAtLoad`, `ThrottleInterval` 30,
+`AbandonProcessGroup` false) on macOS. The unit runs `ag2-sparrow-codex-local run`; the agent runs
+`run --launchd`, the shared entry shim that runs the launcher as a child and maps its outcome
+(logical 75 to exit 0, so launchd stops instead of relaunching over another holder; anything else
+non-zero, so it respawns after the throttle). Both set `AG2_SPARROW_MANAGED=1` and carry paths only: the relay
 token stays in Sparrow's `relay.env` (verify checks its mode, never its content) and the Codex login
 stays in `CODEX_HOME` (verify runs `codex login status` there).
 
 `run` is the manager's entrypoint (refused without `AG2_SPARROW_MANAGED=1`; `debug-run` is the hand
-start). It checks the pin again, takes the work root's lock for its own life (adapter `codex-local`;
-a root another session holds is exit 75, which the manager does not relaunch over), makes `tasks`,
-`results`, `state` and `state/threads` under the held root inode, and starts the connector as its
-direct child, `python -m …codex_connector --work <dir> --held --server stdio --sandbox <s>
-[--allow-non-owner] [--model <m>]`, with an environment of only `PATH` (the configured `codex` first),
-`HOME`, `USER`, `PYTHONPATH` (this package) and `CODEX_HOME` when one was recorded (the connector
-passes it on to its app-server). It never passes `--once`, `--idle-exit`, `--push`, `--thread-id`,
-`--ephemeral`, `--developer-instructions` or the stub/proxy server. The launcher attaches the
-connector as the consumer whose liveness fences the root (`holder_lock.attach_consumer`); under
-`--held` the connector takes no lock and starts only once that record names it, else exits 2. A
-`SIGTERM` to the launcher terminates the connector, waits up to 15 s, kills, reaps, releases the lock
-and exits 143; a connector's own 75 is reported as 1, so 75 means only another holder. `--sandbox`
+start). It checks the pin again, then runs `connect_common`'s holder sequence, the one every
+launcher-side shape shares: take the work root's lock for the launcher's own life (adapter
+`codex-local`; a root another session holds is exit 75, which the manager does not relaunch over),
+make `tasks`, `results`, `state` and `state/threads` under the held root inode, start the connector
+as the direct child, `python -m …codex_connector --work <dir> --held --codex <the configured
+executable> --server stdio --sandbox <s> [--allow-non-owner] [--model <m>]`, with an environment of
+only `PATH` (the configured `codex` first), `HOME`, `USER`, `PYTHONPATH` (this package) and
+`CODEX_HOME` when one was recorded (the connector passes it on to its app-server), and attach it as
+the consumer whose liveness fences the root (`holder_lock.attach_consumer`). The app-server is
+started from the exact executable the version check passed, never a PATH lookup, so a different
+`codex` earlier on PATH never runs. It never passes `--once`, `--idle-exit`, `--push`, `--thread-id`,
+`--ephemeral`, `--developer-instructions` or the stub/proxy server. Under `--held` the connector
+takes no lock and starts only once the holder's record names this very process (pid and start time)
+and verifies it alive; a stale or unreadable record is exit 2. A `SIGTERM` to the launcher
+terminates the connector, waits up to 15 s, kills, reaps, releases the lock and exits 143; a
+connector's own 75 is reported as 1, so 75 means only another holder. Under `debug-run`, a launcher
+killed with SIGKILL cannot reap: the connector is orphaned, its liveness keeps the root held, and the
+next start exits 75 until it is stopped by hand. `--sandbox`
 defaults to `read-only` (the connector's own default); `workspace-write` prints the retry caveat from
 the table above. `verify` reports the config, the pin, the login, the dirs, the relay token's mode,
 the marked unit, the manager's own word for the job and who holds the root (the launcher and, once

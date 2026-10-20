@@ -418,10 +418,7 @@ def run(args, popen=subprocess.Popen) -> int:
         print(f"error: {problem}", file=sys.stderr)
         return EXIT_UNUSABLE
     if args.launchd:
-        script = cm.console_script(LOCAL)
-        child = [script, "run"] if script else [sys.executable, "-c", "from ag2_sparrow.adapters.claude_code.cli import main; "
-                                                                         "raise SystemExit(main(['run']))"]
-        return launcher.run_launchd(child, popen)
+        return launcher.run_launchd(cm.run_child_argv(LOCAL, __name__), popen)
     cfg, problem = load_config()
     if problem:
         print(f"error: {problem}", file=sys.stderr)
@@ -447,23 +444,17 @@ def auth_problem(cfg: dict, run_=subprocess.run) -> str:
     return ""
 
 
+LABELS = ("hold", "claude")     # the holder and its consumer, in verify's and install's words
+
+
 def holder_words(root: str, _rec=None) -> str:
     """Who holds the root, as verify and install both say it: hold and, once attached, its claude."""
-    rec, consumer = task_io.lock_holder(root), task_io.holder_consumer(root)
-    return f"hold pid {rec.get('owner_pid')}" + (f", its claude pid {consumer['pid']}" if consumer and consumer.get("live")
-                                                 else ", no live claude attached")
+    return cm.holder_words(root, LABELS)
 
 
 def occupancy_line(root: str) -> str:
-    """The shared tri-state beside the manager's state: held names the lock's holder (hold) and, once
-    attached, the claude whose liveness fences the root; unobserved never reads free."""
-    occ = task_io.occupancy(root)
-    manager = cm.manager_detail(LOCAL)
-    if occ == "held":
-        return f"held by {holder_words(root)} (manager {manager})"
-    if occ == "unobserved":
-        return f"unobserved (the root's holder or consumer cannot be verified; manager {manager})"
-    return cm.occupancy_line(LOCAL, root)
+    """The shared tri-state beside the manager's state, in this shape's nouns."""
+    return cm.occupancy_line(LOCAL, root, LABELS)
 
 
 def trust_line(cfg: dict, root: str) -> str:

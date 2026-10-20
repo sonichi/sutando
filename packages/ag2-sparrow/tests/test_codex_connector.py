@@ -38,10 +38,10 @@ REPO_ROOT = PKG_ROOT.parents[1]
 REAL_SERVER_ARGV = cc.server_argv
 
 
-def covered_server_argv(server):
+def covered_server_argv(server, codex="codex"):
     """Under the coverage gate the stub child is traced too; its fragment lands in the
     cwd, where the gate's `coverage combine` picks it up."""
-    argv = REAL_SERVER_ARGV(server)
+    argv = REAL_SERVER_ARGV(server, codex)
     if server == "stub" and os.environ.get("SUTANDO_TEST_SUBPROCESS_COVERAGE") == "1":
         return [sys.executable, "-m", "coverage", "run", "--rcfile=%s" % (REPO_ROOT / ".coveragerc")] + argv[1:]
     return argv
@@ -669,7 +669,8 @@ class PushTest(unittest.TestCase):
                 calls.append((argv, kw))
                 return mock.Mock(returncode=0, stdout="Queued message m for thread t.\n", stderr="")
 
-            rc = cc.push("t", str(p), run=fake_run)
+            with mock.patch.dict(cc.os.environ, {"PATH": "/bin", "HOME": "/h"}, clear=True):   # no ambient CODEX_HOME
+                rc = cc.push("t", str(p), run=fake_run)
         self.assertEqual(rc, 0)
         argv, kw = calls[0]
         self.assertEqual(argv[:5], ["codex", "queue", "--thread", "t", "--message"])

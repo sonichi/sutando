@@ -32,7 +32,7 @@ from ...relay_loop import count_arg
 from ...task_io import (DONE_KEEP, NON_OWNER_NOTE, NON_OWNER_REFUSED, LockRefused, acquire_lock,  # noqa: F401
                         admission, attested_headers, exit_on_sigterm, holder_consumer, load_done, make_dirs,
                         non_owner_note, parse_task, pid_alive, exit_code, record_done, release_lock, root_path,
-                        stop_requested, write_atomic)
+                        start_time, stop_requested, write_atomic)
 
 CLIENT = {"name": "ag2-sparrow-codex", "version": "0.1.0"}
 APPROVAL_REQUESTS = ("item/commandExecution/requestApproval", "item/fileChange/requestApproval",
@@ -436,10 +436,11 @@ class Connector:
             idle_since = time.time()
 
 
-def server_argv(server):
+def server_argv(server, codex="codex"):
+    """`codex` is the executable as configured: an exact path runs that program, whatever PATH holds."""
     here = os.path.dirname(os.path.abspath(__file__))
-    return {"stdio": ["codex", "app-server", "--listen", "stdio://"],
-            "proxy": ["codex", "app-server", "proxy"],
+    return {"stdio": [codex, "app-server", "--listen", "stdio://"],
+            "proxy": [codex, "app-server", "proxy"],
             "stub": [sys.executable, os.path.join(here, "stub_app_server.py")]}[server]
 
 
@@ -468,6 +469,8 @@ def build_parser():
                     help="the work root's lock is held by the launcher that spawned this process and attaches it as "
                          "the consumer; take no lock, refuse unless that record names this process")
     ap.add_argument("--cwd", default=None, help="thread cwd (default: --work)")
+    ap.add_argument("--codex", default="codex", help="the codex executable the app-server is started from (default: "
+                                                     "codex on PATH; a launcher passes the exact path it checked)")
     ap.add_argument("--model", default=None)
     ap.add_argument("--sandbox", default=NON_OWNER_SANDBOX, choices=["read-only", "workspace-write", "danger-full-access"],
                     help="sandbox for OWNER threads; every other tier is always read-only")
@@ -531,7 +534,15 @@ def serve_held(args, cwd_given):
     while True:
         consumer = holder_consumer(args.work)
         if consumer and consumer.get("pid") == os.getpid():
-            break
+            # The record must name this incarnation (pid and start) and verify it alive: a stale record
+            # naming a reused pid, or one whose lineage cannot be read, serves nothing.
+            if consumer.get("live") is True and consumer.get("start") == start_time(os.getpid()):
+                break
+            why = ("a start time that is not this process's" if consumer.get("start") != start_time(os.getpid())
+                   else "liveness unknown" if consumer.get("live") is None else "liveness false")
+            sys.stderr.write("refusing to start: --held, but the holder of %s names this pid with %s, not verified\n"
+                             % (args.work, why))
+            return 2
         if stop_requested() or time.monotonic() >= deadline:
             sys.stderr.write("refusing to start: --held, but no holder of %s attached this process\n" % args.work)
             return 2
@@ -544,7 +555,7 @@ def serve_held(args, cwd_given):
 
 
 def serve_locked(args):
-    argv_srv = server_argv(args.server)
+    argv_srv = server_argv(args.server, args.codex)
     stderr_path = os.path.join(args.state, "app-server-%s.stderr" % args.server)
 
     def factory():

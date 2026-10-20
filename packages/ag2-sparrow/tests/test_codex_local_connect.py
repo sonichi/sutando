@@ -17,6 +17,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -28,8 +29,9 @@ from ag2_sparrow import connect_common as cm, holder_lock, task_io  # noqa: E402
 from ag2_sparrow.adapters.codex import codex_connector as cc, connect_cli as cli  # noqa: E402
 
 STUB = Path(cc.__file__).with_name("stub_app_server.py")
-FAKE_CODEX = r'''#!%(py)s
-import json, os, sys
+# The wrapper survives an interpreter path with a space: exec of the quoted path on the body beside it.
+FAKE_CODEX_SH = '#!/bin/sh\nexec "%(py)s" "$0.py" "$@"\n'
+FAKE_CODEX = r'''import json, os, sys
 home = os.environ["HOME"]
 def read(name, default):
     try:
@@ -50,6 +52,34 @@ if sys.argv[1:3] == ["app-server", "--listen"]:
     os.execv(%(py)r, [%(py)r, %(stub)r])
 sys.exit(3)
 '''
+
+
+def write_fake_codex(path, py=sys.executable):
+    """The wrapper at `path` (what --codex names) and its Python body at `path`.py."""
+    path = Path(path)
+    path.write_text(FAKE_CODEX_SH % {"py": py})
+    path.chmod(0o755)
+    path.with_name(path.name + ".py").write_text(FAKE_CODEX % {"py": py, "stub": str(STUB)})
+    return path
+
+
+def bounded(fn, seconds=10.0):
+    """`fn()` on a thread, its value, or an AssertionError once `seconds` pass: a wait that never ends fails."""
+    box = {}
+
+    def target():
+        try:
+            box["value"] = fn()
+        except BaseException as e:   # surfaced on the test thread
+            box["error"] = e
+    t = threading.Thread(target=target, daemon=True)
+    t.start()
+    t.join(seconds)
+    if t.is_alive():
+        raise AssertionError("still running after %.0f s" % seconds)
+    if "error" in box:
+        raise box["error"]
+    return box["value"]
 TOKEN = "tok-FAKE-RELAY-TOKEN-never-copied"
 FORBIDDEN_ARGS = ("--once", "--idle-exit", "--push", "--thread-id", "--ephemeral", "--developer-instructions",
                   "stub", "proxy", "--list-models", "--list-loaded")
@@ -136,9 +166,7 @@ class Base(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.home, ignore_errors=True)
         self.bin = self.home / "bin"
         self.bin.mkdir()
-        self.codex = self.bin / "codex"
-        self.codex.write_text(FAKE_CODEX % {"py": sys.executable, "stub": str(STUB)})
-        self.codex.chmod(0o755)
+        self.codex = write_fake_codex(self.bin / "codex")
         self.work = self.home / "work"
         self.codex_home = self.home / ".codex-agent"
         self.codex_home.mkdir()
@@ -215,9 +243,11 @@ class Render(Base):
         plist = cm.render_plist(L, exec_start, "/opt/bin", "/var/log/x.log")
         self.assertTrue(cm.marked(plist, cli.PLIST_MARKER))
         body = plistlib.loads(plist.encode())
-        self.assertEqual((body["Label"], body["ProgramArguments"]), ("ai.ag2.sparrow.codex-local", [exec_start, "run"]))
+        self.assertEqual((body["Label"], body["ProgramArguments"]),
+                         ("ai.ag2.sparrow.codex-local", [exec_start, "run", "--launchd"]), "the shared entry shim")
         self.assertEqual(body["EnvironmentVariables"], {"PATH": "/opt/bin", cm.MANAGED_VAR: "1"})
-        self.assertTrue(body["KeepAlive"], "the connector exits only on a stop or a refusal: always relaunched")
+        self.assertEqual(body["KeepAlive"], {"SuccessfulExit": False},
+                         "a logical 75 exits 0 through the shim, so launchd does not relaunch over another holder")
         for text in (unit, plist, cm.render_config(L, {"CODEX": "/x", "ROOT": "/w"})):
             self.assertNotIn(TOKEN, text)
             self.assertNotIn("REMOTE_TASK_TOKEN", text)
@@ -322,7 +352,7 @@ class Run(Base):
                                     stdin=subprocess.DEVNULL)
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-            code = cli.run(argparse.Namespace(debug=debug), popen=popen)
+            code = cli.run(argparse.Namespace(debug=debug, launchd=False), popen=popen)
         return code, seen, err.getvalue()
 
     def test_the_connector_argv_env_and_cwd_under_the_launchers_lock(self):
@@ -330,7 +360,8 @@ class Run(Base):
         code, seen, err = self.run_with()
         self.assertEqual(code, 0, err)
         self.assertEqual(seen["argv"], [sys.executable, "-m", "ag2_sparrow.adapters.codex.codex_connector", "--work",
-                                        str(self.work), "--held", "--server", "stdio", "--sandbox", "read-only"])
+                                        str(self.work), "--held", "--codex", str(self.codex), "--server", "stdio",
+                                        "--sandbox", "read-only"])
         for arg in FORBIDDEN_ARGS:
             self.assertNotIn(arg, seen["argv"], arg)
         env = seen["env"]
@@ -386,6 +417,49 @@ class Run(Base):
         self.assertIn("other-adapter", err)
         self.assertEqual(seen, {}, "no connector was spawned")
 
+    def test_a_stop_before_the_spawn_a_spawn_error_and_a_connector_that_survives_the_kill(self):
+        self.configure()
+        stopped = dict(cm.stop_state(), sig=signal.SIGTERM)
+        with mock.patch.object(cm, "stop_state", return_value=stopped):
+            code, seen, err = self.run_with()
+        self.assertEqual((code, seen, err), (128 + signal.SIGTERM, {}, "run: stopped before the connector started\n"))
+        self.assertEqual(task_io.lock_held(str(self.work)), "free")
+
+        def raises(argv, **kw):
+            raise OSError(2, "No such file")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code = cli.run(argparse.Namespace(debug=False, launchd=False), popen=raises)
+        self.assertEqual((code, err.getvalue()), (2, "run: refusing to start: the connector could not be spawned (No such file)\n"))
+        # The child ends first (the release would otherwise keep the flock for the live consumer), then the
+        # wait reports a kill never confirmed.
+        with mock.patch.object(cm, "_run_until_end", side_effect=lambda child, pidfd, state: (child.wait(), state.update(sig=signal.SIGTERM))[1]):
+            code, _, err = self.run_with()
+        self.assertEqual(code, 128 + signal.SIGTERM)
+        self.assertIn("run: the connector did not die within the bound; the manager's to clean", err)
+
+    def test_run_launchd_is_the_shared_shim_over_this_launcher(self):
+        self.configure()
+        seen = []
+
+        class Child:
+            def __init__(self, rc):
+                self.rc = rc
+
+            def poll(self):
+                return self.rc
+
+            def wait(self):
+                return self.rc
+        for rc, expect in ((75, 0), (0, 1), (-15, 1), (2, 2), (1, 1)):
+            code = cli.run(argparse.Namespace(debug=False, launchd=True), popen=lambda argv, rc=rc: seen.append(argv) or Child(rc))
+            self.assertEqual(code, expect, rc)
+        self.assertEqual(seen[0], [str(self.bin / cli.COMMAND), "run"], "the console script with plain run")
+        with mock.patch.object(cm, "console_script", return_value=""):
+            cli.run(argparse.Namespace(debug=False, launchd=True), popen=lambda argv: seen.append(argv) or Child(75))
+        self.assertEqual(seen[-1][:2], [sys.executable, "-c"])
+        self.assertIn("from ag2_sparrow.adapters.codex.connect_cli import main", seen[-1][2])
+
     def test_a_connector_the_attach_cannot_name_is_reaped(self):
         self.configure()
         with mock.patch.object(task_io, "attach_consumer", side_effect=holder_lock.LockError("record changed")):
@@ -404,9 +478,26 @@ class HeldConnector(Base):
             (self.work / d).mkdir(parents=True, exist_ok=True)
         err = io.StringIO()
         with mock.patch.object(cc, "HELD_WAIT_S", 0.3), contextlib.redirect_stderr(err):
-            rc = cc.main(["--work", str(self.work), "--held", "--server", "stub"])
+            rc = bounded(lambda: cc.main(["--work", str(self.work), "--held", "--server", "stub"]))
         self.assertEqual(rc, 2)
         self.assertIn("no holder of %s attached this process" % self.work, err.getvalue())
+        self.assertEqual(task_io.lock_held(str(self.work)), "free")
+
+    def test_held_whose_record_names_this_pid_without_verified_liveness_is_refused(self):
+        """A stale record (a reused pid, live False) or an unreadable lineage (live None) serves nothing."""
+        self.work.mkdir()
+        for d in cli.WORK_DIRS:
+            (self.work / d).mkdir(parents=True, exist_ok=True)
+        mine = task_io.start_time(os.getpid())
+        for record, word in (({"start": mine, "live": False}, "liveness false"), ({"start": mine, "live": None}, "liveness unknown"),
+                             ({"start": "bogus", "live": True}, "a start time that is not this process's")):
+            err = io.StringIO()
+            with mock.patch.object(cc, "holder_consumer", return_value=dict(record, pid=os.getpid())), \
+                    mock.patch.object(cc, "HELD_WAIT_S", 0.3), contextlib.redirect_stderr(err):
+                rc = bounded(lambda: cc.main(["--work", str(self.work), "--held", "--server", "stub", "--idle-exit", "0.2"]))
+            self.assertEqual(rc, 2, (record, err.getvalue()))
+            self.assertIn("names this pid with %s, not verified" % word, err.getvalue())
+            self.assertFalse((self.work / "state" / "app-server-stub.stderr").exists(), "no app-server was started")
         self.assertEqual(task_io.lock_held(str(self.work)), "free")
 
     def test_held_under_a_holder_that_attached_another_process_is_refused(self):
@@ -422,7 +513,7 @@ class HeldConnector(Base):
         try:
             self.assertEqual(holder.stdout.readline().strip(), "held")
             with mock.patch.object(cc, "HELD_WAIT_S", 0.3), contextlib.redirect_stderr(io.StringIO()):
-                rc = cc.main(["--work", str(self.work), "--held", "--server", "stub"])
+                rc = bounded(lambda: cc.main(["--work", str(self.work), "--held", "--server", "stub"]))
         finally:
             holder.stdin.close()
             holder.wait(timeout=30)
@@ -444,6 +535,25 @@ class LauncherProcess(Base):
             time.sleep(0.05)
         self.assertIsNotNone(self.server(), "the connector started its app-server through the fake codex")
         return proc
+
+    def test_the_app_server_comes_from_the_configured_executable_not_a_codex_earlier_on_path(self):
+        """The executable the version check passed is the one that runs: a `codex` earlier on PATH is not."""
+        selected = write_fake_codex(self.bin / "codex-selected")
+        shadow = self.home / "shadow" / "bin"
+        shadow.mkdir(parents=True)
+        (shadow / "codex").write_text("#!%s\nimport json, os, sys\n"
+                                     "json.dump({'argv': sys.argv}, open(os.path.join(os.environ['HOME'], 'codex-shadow.json'), 'w'))\n"
+                                     "sys.exit(7)\n" % sys.executable)
+        (shadow / "codex").chmod(0o755)
+        self.configure(CODEX=str(selected))
+        with mock.patch.dict(os.environ, {"PATH": f"{shadow}:{self.bin}:/usr/bin:/bin"}):
+            launcher = self.launcher()
+        try:
+            self.assertEqual(self.server()["argv"][0], str(selected) + ".py", "the wrapper's body: the selected executable ran")
+            self.assertFalse((self.home / "codex-shadow.json").exists(), "the shadowing codex never ran")
+        finally:
+            os.kill(launcher.pid, signal.SIGTERM)
+            launcher.communicate(timeout=60)
 
     def test_sigterm_reaps_the_connector_and_frees_the_work_root(self):
         self.configure()
@@ -558,11 +668,28 @@ class VerifyUninstall(Base):
 
 class ConnectorEnv(unittest.TestCase):
     def test_the_connectors_child_env_passes_codex_home_only_when_set(self):
-        with mock.patch.dict(os.environ, {"PATH": "/bin", "HOME": "/h", "CODEX_HOME": "/h/.codex-agent", "OPENAI_API_KEY": "no"}):
+        with mock.patch.dict(os.environ, {"PATH": "/bin", "HOME": "/h", "CODEX_HOME": "/h/.codex-agent", "OPENAI_API_KEY": "no"},
+                             clear=True):
             self.assertEqual(cc.child_env(), {"PATH": "/bin", "HOME": "/h", "CODEX_HOME": "/h/.codex-agent"})
-        with mock.patch.dict(os.environ, {"PATH": "/bin", "HOME": "/h"}):
-            os.environ.pop("CODEX_HOME", None)
+        with mock.patch.dict(os.environ, {"PATH": "/bin", "HOME": "/h"}, clear=True):
             self.assertEqual(cc.child_env(), {"PATH": "/bin", "HOME": "/h"})
+
+
+class FakeCodexWrapper(unittest.TestCase):
+    """The harness's fake codex works through an interpreter path containing a space."""
+
+    def test_the_wrapper_execs_the_quoted_interpreter_from_a_path_with_a_space(self):
+        with tempfile.TemporaryDirectory() as d:
+            spaced = Path(d) / "py dir" / "python3"
+            spaced.parent.mkdir()
+            spaced.symlink_to(sys.executable)
+            home = Path(d) / "home"
+            home.mkdir()
+            codex = write_fake_codex(Path(d) / "codex", py=str(spaced))
+            self.assertEqual(codex.read_text().splitlines()[0], "#!/bin/sh")
+            r = subprocess.run([str(codex), "--version"], capture_output=True, text=True,
+                               env={"PATH": "/usr/bin:/bin", "HOME": str(home)}, cwd=d)
+            self.assertEqual((r.returncode, r.stdout), (0, "codex-cli 0.160.1\n"), r.stderr)
 
 
 if __name__ == "__main__":
