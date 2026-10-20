@@ -89,6 +89,7 @@ from _helpers.hermetic_env import hermetic_env  # noqa: E402
 with mock.patch.dict(os.environ, {"PATH": os.environ.get("PATH", ""), "POSTHOG_API_KEY": "phc_test"}, clear=True):
     built = hermetic_env()
 check("hermetic_env() sets SUTANDO_TELEMETRY=0 with no opt-out outside", built.get("SUTANDO_TELEMETRY") == "0")
+check("hermetic_env() sets DO_NOT_TRACK=1 with no opt-out outside", built.get("DO_NOT_TRACK") == "1")
 with mock.patch.dict(os.environ, {**built, "POSTHOG_API_KEY": "phc_test"}, clear=True):
     spec = importlib.util.spec_from_file_location("telemetry_hermetic", REPO / "src" / "telemetry.py")
     mod = importlib.util.module_from_spec(spec)
@@ -100,4 +101,4 @@ print()
 if failures:
     print(f"{len(failures)} FAILURE(S): {failures}")
     raise SystemExit(1)
-print(f"ALL PASS ({9} checks)")
+print(f"ALL PASS ({10} checks)")
