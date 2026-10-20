@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """sparrowd follows the agent-bridge declarations as they come and go, in both of its modes.
 
-The package shell reconciles its supervised set by name (a new name starts, a dropped name stops,
+The package shell syncs its supervised set by name (a new name starts, a dropped name stops,
 an unchanged name is left running); the launcher feeds it the declarations on every scan, prints
 each skip reason once, and never lists a declaration another process already runs. `--agent-bridges`
 is the mode the launchd wrapper keeps alive beside the gateway bridge: the declarations only.
@@ -69,16 +69,16 @@ class Reconcile(unittest.TestCase):
         self.addCleanup(sup.stop, 2)
         self.assertTrue(wait_for(lambda: pid_of(sup, "a")))
         a_pid = pid_of(sup, "a")
-        self.assertEqual(sup.reconcile([WorkerSpec("a", SLEEPER), WorkerSpec("b", SLEEPER)]), (["b"], []))
+        self.assertEqual(sup.sync([WorkerSpec("a", SLEEPER), WorkerSpec("b", SLEEPER)]), (["b"], []))
         self.assertTrue(wait_for(lambda: pid_of(sup, "b")), "the added name is started")
         b_pid = pid_of(sup, "b")
-        self.assertEqual(sup.reconcile([WorkerSpec("a", SLEEPER), WorkerSpec("b", SLEEPER)]), ([], []))
+        self.assertEqual(sup.sync([WorkerSpec("a", SLEEPER), WorkerSpec("b", SLEEPER)]), ([], []))
         self.assertEqual((pid_of(sup, "a"), pid_of(sup, "b")), (a_pid, b_pid), "an unchanged set restarts nothing")
-        self.assertEqual(sup.reconcile([WorkerSpec("a", SLEEPER)]), ([], ["b"]))
+        self.assertEqual(sup.sync([WorkerSpec("a", SLEEPER)]), ([], ["b"]))
         self.assertTrue(wait_for(lambda: not alive(b_pid)), "the dropped worker's process is gone")
         self.assertNotIn("b", sup.status()["workers"])
         self.assertEqual(pid_of(sup, "a"), a_pid, "the kept worker was not touched")
-        self.assertEqual(sup.reconcile([]), ([], ["a"]))
+        self.assertEqual(sup.sync([]), ([], ["a"]))
         self.assertTrue(wait_for(lambda: not alive(a_pid)))
         self.assertEqual(sup.status()["workers"], {})
 
@@ -89,7 +89,7 @@ class Reconcile(unittest.TestCase):
         self.assertTrue(wait_for(lambda: pid_of(sup, "s")))
         pid = pid_of(sup, "s")
         time.sleep(0.3)  # the handler is installed before the loop; give it that
-        sup.reconcile([])
+        sup.sync([])
         self.assertTrue(wait_for(lambda: not alive(pid), 5), "SIGKILL after the grace, no orphan")
 
     def test_a_removed_worker_in_backoff_never_respawns(self):
@@ -100,14 +100,14 @@ class Reconcile(unittest.TestCase):
         sup.start()
         self.addCleanup(sup.stop, 2)
         self.assertTrue(wait_for(lambda: len(sleeps) >= 1))
-        sup.reconcile([])
+        sup.sync([])
         restarts = sup.status()["workers"]
         self.assertEqual(restarts, {}, "gone from the table at once")
         n = len(sleeps)
         time.sleep(0.6)
         self.assertLessEqual(len(sleeps), n + 1, "at most the pause in flight; no further restart")
 
-    def test_run_reconciles_on_every_rescan(self):
+    def test_run_syncs_on_every_rescan(self):
         td = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, td, ignore_errors=True)
         passes = [[], [WorkerSpec("late", SLEEPER)], [WorkerSpec("late", SLEEPER)], []]

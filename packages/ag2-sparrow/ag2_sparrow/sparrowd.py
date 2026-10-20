@@ -45,7 +45,7 @@ class _WorkerState:
     last_exit: Optional[int] = None
     state: str = "pending"  # pending | running | backoff | stopped
     stop: threading.Event = field(default_factory=threading.Event)
-    stop_at: float = 0.0  # when this one worker was told to stop (reconcile); 0 until then
+    stop_at: float = 0.0  # when this one worker was told to stop (sync); 0 until then
 
 
 class SingleInstance:
@@ -118,7 +118,7 @@ class Supervisor:
         for ws in list(self._workers.values()):
             self._start_thread(ws)
 
-    def reconcile(self, specs: List[WorkerSpec]) -> "tuple[list, list]":
+    def sync(self, specs: List[WorkerSpec]) -> "tuple[list, list]":
         """Make the supervised set equal `specs` by name: a new name is started,
         a name no longer listed is stopped (SIGTERM, SIGKILL past the grace).
         Returns (added names, removed names)."""
@@ -144,7 +144,7 @@ class Supervisor:
         return [ws.spec.name for ws in added], [ws.spec.name for ws in removed]
 
     def _wait(self, ws: _WorkerState) -> int:
-        """The worker's exit code; a worker removed by reconcile that outlives
+        """The worker's exit code; a worker removed by sync that outlives
         the grace is killed here, on its own thread."""
         while True:
             try:
@@ -168,7 +168,7 @@ class Supervisor:
         while not ws.stop.is_set():
             spawn_err = None
             with self._lock:
-                # reconcile stops a worker under this lock: a stop set here is seen
+                # sync stops a worker under this lock: a stop set here is seen
                 # before the spawn, a spawn before the stop leaves a pid to signal.
                 if ws.stop.is_set():
                     break
@@ -320,7 +320,7 @@ def run(specs: List[WorkerSpec], state_dir: Path,
         rescan: Optional[Callable[[], List[WorkerSpec]]] = None,
         rescan_s: float = 30.0) -> int:
     """Daemon entry: lock, supervise, serve control, wait for stop signal.
-    With `rescan`, every `rescan_s` the supervised set is reconciled to what it
+    With `rescan`, every `rescan_s` the supervised set is synced to what it
     returns (by name): the launcher decides what exists, the shell only follows."""
     state_dir = Path(state_dir)
     inst = SingleInstance(state_dir / "sparrowd.lock")
@@ -341,7 +341,7 @@ def run(specs: List[WorkerSpec], state_dir: Path,
         except Exception as e:  # a launcher fault must not take the running workers down
             _log(f"rescan failed ({type(e).__name__}: {e}) — keeping the current workers")
             continue
-        sup.reconcile(want)
+        sup.sync(want)
     _log("shutdown requested")
     sup.stop()
     ctl.close()
