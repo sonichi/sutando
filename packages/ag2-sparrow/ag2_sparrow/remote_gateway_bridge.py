@@ -2986,6 +2986,9 @@ def _retry_pending_acks(inflight: "set[str]") -> None:
 
 
 ACK_DROP_RETRY_S = 0.5
+# Dropped acks are retried only while this long since the poll answered remains: well
+# inside the broker's 15 s delivery lease. Past it they are left to the pending-ack retry.
+ACK_RETRY_BUDGET_S = 10.0
 
 
 def _connection_dropped(e: BaseException) -> bool:
@@ -2994,12 +2997,14 @@ def _connection_dropped(e: BaseException) -> bool:
     return isinstance(reason, (ConnectionResetError, http.client.IncompleteRead))
 
 
-def _post_task_ack(tid: str, durable: bool = False, lease_id: "str | None" = None) -> bool:
+def _post_task_ack(tid: str, durable: bool = False, lease_id: "str | None" = None,
+                   dropped: "list | None" = None, timeout: float = 10) -> bool:
     """Tell the gateway a task made it safely into the local queue. `durable`
     says the task file, its media sidecar and the in-flight set are all fsync'd,
     which is the only thing that lets the relay call the task accepted.
     `lease_id` echoes the generation the task was served under; absent for a
-    broker that served none."""
+    broker that served none. With `dropped`, an ack lost to a dropped connection is
+    appended there for the caller to retry, instead of being retried inline."""
     global _ack_disabled_until
     # Validate the WIRE id (post-conversion): a named instance's LOCAL id may
     # legitimately exceed the 64-char wire bound (review P1 #1) — refusing on
@@ -3016,13 +3021,16 @@ def _post_task_ack(tid: str, durable: bool = False, lease_id: "str | None" = Non
         if durable:
             body["durable"] = True
         try:
-            _req("POST", f"/v1/tasks/{safe_tid}/ack", body, timeout=10)
+            _req("POST", f"/v1/tasks/{safe_tid}/ack", body, timeout=timeout)
         except _NETWORK_ERRORS as e:
             if not _connection_dropped(e):
                 raise
+            if dropped is not None:
+                dropped.append((tid, durable, lease_id))
+                raise
             # A dropped link loses the ack; one prompt retry lands it inside the delivery lease.
             time.sleep(ACK_DROP_RETRY_S)
-            _req("POST", f"/v1/tasks/{safe_tid}/ack", body, timeout=10)
+            _req("POST", f"/v1/tasks/{safe_tid}/ack", body, timeout=timeout)
         _ack_disabled_until = 0.0  # success (or re-enablement) → clear any backoff
         _forget_pending_ack(tid, lease_id)
         return True
@@ -5091,6 +5099,21 @@ def _receive_round(tasks: list) -> "tuple[list, dict]":
         taken.append(task)
         fates[key] = None
     return taken, fates
+
+
+def _retry_dropped_acks(dropped: list, received_at: float, fates: dict) -> None:
+    """One more try for each ack lost to a dropped connection, inside ACK_RETRY_BUDGET_S of
+    the poll's answer; whatever the budget cannot cover stays with the pending-ack retry."""
+    for n, (tid, durable, lease) in enumerate(dropped):
+        left = received_at + ACK_RETRY_BUDGET_S - time.monotonic() - ACK_DROP_RETRY_S
+        if left < 1:
+            _log(f"{len(dropped) - n} dropped ack(s) left to the pending-ack retry: the "
+                 f"{ACK_RETRY_BUDGET_S:g}s retry budget is spent")
+            return
+        time.sleep(ACK_DROP_RETRY_S)
+        # A list of its own, so a second drop is not retried inline past the budget.
+        if _post_task_ack(tid, durable, lease, dropped=[], timeout=min(10.0, left)):
+            fates[_broker_tid(tid)] = "acked"
 
 
 def _settle_round(fates: dict) -> None:
@@ -7643,6 +7666,7 @@ def main() -> None:
                 _log(f"poll read timed out after {POLL_WAIT + 10}s inside the "
                      f"{POLL_TIMEOUT_GRACE_S:g}s grace — treated as an empty poll")
                 resp = {"tasks": []}
+            received_at = time.monotonic()           # the dropped-ack retry budget runs from here
             if poll_failures and poll_grace_since != prev_ok:  # a real answer, not the grace path
                 _log(f"poll recovered after {poll_failures} failures, {int(poll_grace_since - prev_ok)}s")
                 poll_failures = 0
@@ -7665,9 +7689,12 @@ def main() -> None:
             if pending_ack and not committed:
                 _log(f"acks withheld for {len(pending_ack)} task(s): the in-flight set or "
                      "ack ledger did not commit")
+            # Every task's first ack goes before any retry, so one bad link delays no sibling.
+            dropped: list = []
             for tid, durable, lease in pending_ack if committed else ():
-                if _post_task_ack(tid, durable, lease):
+                if _post_task_ack(tid, durable, lease, dropped=dropped):
                     fates[_broker_tid(tid)] = "acked"
+            _retry_dropped_acks(dropped, received_at, fates)
             _settle_round(fates)
             if added:
                 wake_outbound()          # a fresh task often precedes its ack round-trip

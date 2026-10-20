@@ -458,7 +458,7 @@ class OneTaskFailsInABatchTest(unittest.TestCase):
                 patch.object(self.gw, "wake_outbound", new=lambda: None):
             loop.served = [served]
             self.gw._write_task = write
-            self.gw._post_task_ack = lambda tid, durable=False, lease=None: \
+            self.gw._post_task_ack = lambda tid, durable=False, lease=None, **k: \
                 self.acked.append((tid, lease)) or True
             loop.run()
         return loop
@@ -588,7 +588,7 @@ class RoundAccountingTest(unittest.TestCase):
                 self.gw._req = lambda method, path, *a, **k: (
                     loop.polls.append(path) or poll() if path.startswith("/v1/tasks?") else {})
             self.gw._write_task = lambda task, *a, **k: (task["id"], True)
-            self.gw._post_task_ack = lambda tid, durable=False, lease=None: ack(tid)
+            self.gw._post_task_ack = lambda tid, durable=False, lease=None, **k: ack(tid)
             loop.run()
         return loop
 
@@ -728,6 +728,75 @@ class RoundAccountingTest(unittest.TestCase):
             loop.run()
         self.assertTrue(any(m.startswith("poll read timed out after 35s inside the")
                             for m in loop.logs))
+
+
+class SlowAckTest(unittest.TestCase):
+    """One ack that drops, then hangs on its retry, must not push its healthy siblings' first
+    acks past the broker's 15 s delivery lease; the retry spends only a budget under it."""
+
+    LEASE_S = 15.0
+
+    def setUp(self):
+        try:
+            from ag2_sparrow import remote_gateway_bridge as gw
+        except (Exception, SystemExit) as e:  # noqa: BLE001
+            self.skipTest(f"gateway not importable: {str(e)[:60]}")
+        self.gw = gw
+
+    def _run(self, first_drop_after, hang=10.0, n_healthy=3):
+        import http.client
+        tasks = [{"id": "task-bad", "task": "hi", "lease_id": "lease-bad"}] + [
+            {"id": f"task-ok{n}", "task": "hi", "lease_id": f"lease-ok{n}"} for n in range(n_healthy)]
+        acks: list = []      # (task id, seconds since the poll answered, outcome, timeout)
+        with _Loop(self.gw) as loop, \
+                patch.object(self.gw, "_record_pending_acks", return_value=True), \
+                patch.object(self.gw, "_forget_pending_ack", new=lambda *a, **k: None), \
+                patch.object(self.gw, "wake_outbound", new=lambda: None), \
+                patch.dict(self.gw._LOG_COUNTS, clear=True):
+            self.gw._post_task_ack = loop._saved["_post_task_ack"]
+            self.gw._write_task = lambda task, *a, **k: (task["id"], True)
+            loop.served = [tasks]
+            served_at: list = []
+            bad_calls = [0]
+
+            def req(method, path, payload=None, timeout=None, **k):
+                if path.startswith("/v1/tasks?"):
+                    out = loop._poll(method, path)
+                    served_at.append(loop.clock.now)
+                    return out
+                if not path.endswith("/ack"):
+                    return {}
+                tid = payload["id"]
+                if tid == "task-bad":
+                    bad_calls[0] += 1
+                    loop.clock.now += first_drop_after if bad_calls[0] == 1 else min(hang, timeout)
+                    acks.append((tid, loop.clock.now - served_at[0], "dropped", timeout))
+                    raise http.client.RemoteDisconnected("Remote end closed connection without response")
+                loop.clock.now += 0.1
+                acks.append((tid, loop.clock.now - served_at[0], "ok", timeout))
+                return {"ok": True}
+            self.gw._req = req
+            loop.run()
+        return loop, acks
+
+    def test_a_dropped_then_hanging_ack_does_not_delay_its_siblings_past_the_lease(self):
+        loop, acks = self._run(first_drop_after=5.0)
+        healthy = [a for a in acks if a[0] != "task-bad"]
+        self.assertEqual([a[0] for a in healthy], ["task-ok0", "task-ok1", "task-ok2"])
+        self.assertTrue(all(a[1] < 6.0 for a in healthy), healthy)
+        self.assertTrue(all(a[1] < self.LEASE_S for a in acks), acks)
+        bad = [a for a in acks if a[0] == "task-bad"]
+        self.assertEqual(len(bad), 2, "the dropped ack gets exactly one retry")
+        self.assertLessEqual(bad[1][1], self.gw.ACK_RETRY_BUDGET_S + 1e-6,
+                             "the retry ends inside the budget")
+        self.assertTrue(any(m.startswith("served task-bad was not acked") for m in loop.logs))
+
+    def test_a_retry_the_budget_cannot_cover_is_left_to_the_pending_ack_retry(self):
+        loop, acks = self._run(first_drop_after=9.0)
+        self.assertEqual(len([a for a in acks if a[0] == "task-bad"]), 1, "no retry past the budget")
+        self.assertTrue(all(a[1] < 10.0 for a in acks if a[0] != "task-bad"), acks)
+        self.assertIn("1 dropped ack(s) left to the pending-ack retry: the 10s retry budget is spent",
+                      loop.logs)
 
 
 class RelayResultsInTheLoopTest(unittest.TestCase):
