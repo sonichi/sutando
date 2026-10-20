@@ -1,5 +1,6 @@
 """Runtime observations follow successful adapters, never requested or failed launches."""
 import importlib.util
+import io
 import json
 import os
 import sys
@@ -27,6 +28,24 @@ class WriterTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.ws = Path(self.tmp.name)
+
+    def test_cli_reports_publish_failure_without_replacing_last_record(self):
+        argv = ["core-runtime-record", str(self.ws), "claude", "sutando-core", "123"]
+        with mock.patch.object(sys, "argv", argv):
+            self.writer.main()
+        path = self.ws / "state/core-runtime.json"
+        before = path.read_bytes()
+        self.assertEqual(json.loads(before)["runtime"], "claude")
+        for failure in (OSError("refused"), ValueError("invalid session start time")):
+            with self.subTest(failure=type(failure).__name__), \
+                    mock.patch.object(sys, "argv", argv), \
+                    mock.patch.object(self.writer, "publish", side_effect=failure), \
+                    mock.patch.object(sys, "stderr", new_callable=io.StringIO) as err:
+                with self.assertRaises(SystemExit) as raised:
+                    self.writer.main()
+                self.assertEqual(raised.exception.code, 1)
+                self.assertIn(f"core runtime record: {failure}", err.getvalue())
+            self.assertEqual(path.read_bytes(), before)
 
     def test_validation_and_failed_publish_preserve_prior_record(self):
         path = self.writer.publish(self.ws, "claude", 'a"b', 123)
