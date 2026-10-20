@@ -1004,9 +1004,9 @@ class StepBranchTest(unittest.TestCase):
         self.assertTrue((claims.dir("task-l") / "body").is_file(), "never repaired by the cloud adapter")
         self.assertEqual(self.fake.calls(), [])
 
-    def test_serve_survives_an_io_error_reading_a_claim_and_delivers_once_it_recovers(self):
-        """The serve loop with one claim read failing on I/O: the adapter stays up, the task is parked, and once
-        the read works again it is called and delivered exactly once."""
+    def test_serve_survives_an_io_error_in_the_steps_claim_read_and_delivers_once_it_recovers(self):
+        """The serve loop with step()'s own claim read failing once on I/O: the adapter stays up, the task is
+        parked, and once the read works again it is called and delivered exactly once."""
         write_task(self.work, "task-a", "hi")
         real_load, real_step, hits, stepping = lc.ClaimStore.load, sa.Adapter.step, [], []
 
@@ -1024,6 +1024,32 @@ class StepBranchTest(unittest.TestCase):
         self.assertGreaterEqual(len(stepping), 2, "the loop went on after the parked step")
         self.assertEqual(hits, ["task-a"])
         self.assertIn("parked -> task-a", err)
+        self.assertEqual(len(self.fake.calls()), 1, "called once, after the read recovered")
+        self.assertTrue((self.work / "results" / "task-a.txt").exists(), "delivered")
+
+    def test_serve_survives_repeated_io_errors_in_the_loops_own_claim_read_and_delivers_once_it_recovers(self):
+        """The loop reads a claim before any step (next_ready -> recovering -> _phase). That read failing on I/O
+        three times: serve() keeps running, the task is skipped while parked (no read meanwhile), and once the
+        read works it is called and delivered exactly once."""
+        write_task(self.work, "task-a", "hi")
+        real_load, real_recovering, hits, inside = lc.ClaimStore.load, sa.Adapter.recovering, [], []
+
+        def load(store, task_id):
+            if task_id == "task-a" and inside and len(hits) < 3:
+                hits.append(task_id)
+                raise lc.StateIOError("cannot read claim.json ([Errno 5] I/O error)")
+            return real_load(store, task_id)
+
+        def recovering(ad, name):
+            inside.append(1)
+            try:
+                return real_recovering(ad, name)
+            finally:
+                inside.pop()
+        with mock.patch.object(lc.ClaimStore, "load", load), mock.patch.object(sa.Adapter, "recovering", recovering):
+            ad, err = run_adapter(self.work, self.fake, once=1)
+        self.assertEqual(len(hits), 3, "the loop's read failed three times, each after a park")
+        self.assertEqual(err.count("parked -> task-a"), 3)
         self.assertEqual(len(self.fake.calls()), 1, "called once, after the read recovered")
         self.assertTrue((self.work / "results" / "task-a.txt").exists(), "delivered")
 

@@ -133,9 +133,14 @@ class Adapter(RelayLoop):
         self.lc.recover()
 
     def _phase(self, task_id):
+        if self.not_before.get(task_id, 0) > self.clock():
+            return None                                 # parked: not read again until its park ends
         try:
             rec = self.lc.claims.load(task_id)
         except task_lifecycle.ClaimUnreadable:
+            return None
+        except task_lifecycle.StateError as e:          # a read I/O error skips the task for a retry, never the loop
+            self.park(task_id, e)
             return None
         return rec["phase"] if rec else None
 
