@@ -16,18 +16,23 @@ must build every environment with tests/_helpers/hermetic_env.py. Refused anywhe
               modules) in a test file that never calls isolate_os_environ() or isolate_then_import()
               as a module-level statement (a tests/_helpers library may instead isolate in the
               function, or spawn with the helper's env); a call under `if`, or a clearing patch
-              never entered or started, does not isolate
+              never entered or started, does not isolate; a `with` patch covers only its own body,
+              a started one only what follows until patch.stopall(), and none in a dead branch counts
   before-isolation  such code at module level above that call
 """
 from __future__ import annotations
 
 import ast
 import re
+import subprocess
 import sys
 import unittest
 from pathlib import Path
 
 from _helpers.credential_scope import credential_modules, reference_pattern, target_pattern
+from _helpers.hermetic_env import hermetic_env, isolate_os_environ
+
+isolate_os_environ()
 
 REPO = Path(__file__).resolve().parents[1]
 HELPER = REPO / "tests" / "_helpers" / "hermetic_env.py"
@@ -102,6 +107,13 @@ def _clearing_patch(call: ast.Call, imp: Imports) -> bool:
                     for k in call.keywords))
 
 
+def _always_false(test) -> bool:
+    """`if False`, `if 0`, `if TYPE_CHECKING`: a test that is false whenever the file runs."""
+    if isinstance(test, ast.Constant):
+        return not test.value
+    return _name(test) == "TYPE_CHECKING"
+
+
 def _imports_target(node) -> bool:
     if isinstance(node, ast.Import):
         return any(TARGET.search(a.name) or a.name in ROOM_OPS_MODULES for a in node.names)
@@ -174,21 +186,50 @@ def violations(source: str, name: str = "<sample>") -> "list[str]":
         return (isinstance(s, (ast.Expr, ast.Assign, ast.AnnAssign)) and s.value is n
                 and isinstance(holder, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef)) and s in holder.body)
 
-    def entered(n) -> bool:
-        """A patcher entered by `with`, applied as a decorator, or started as a statement."""
+    def dead(n) -> bool:
+        """`n` sits in a branch that never runs: under `if False`/`if 0`/`if TYPE_CHECKING`, or `while False`."""
+        while n in parents:
+            p = parents[n]
+            if isinstance(p, (ast.If, ast.While)) and _always_false(p.test) and n in p.body:
+                return True
+            if isinstance(p, ast.If) and isinstance(p.test, ast.Constant) and p.test.value and n in p.orelse:
+                return True
+            n = p
+        return False
+
+    def started(n) -> bool:
+        """A clearing patch started as a whole statement: in effect from there until patch.stopall()."""
         p = parents.get(n)
-        if isinstance(p, ast.withitem) or (isinstance(p, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
-                                           and n in p.decorator_list):
-            return True
-        return (isinstance(p, ast.Attribute) and p.attr == "start" and isinstance(parents.get(p), ast.Call)
-                and statement(parents[p]))
+        return (_clearing_patch(n, imp) and isinstance(p, ast.Attribute) and p.attr == "start"
+                and isinstance(parents.get(p), ast.Call) and statement(parents[p]) and not dead(n))
 
     def isolates(n) -> bool:
+        """An isolation in effect for the rest of its scope once its statement has run."""
         if not isinstance(n, ast.Call):
             return False
         if _name(n.func) in ISOLATORS:
-            return statement(n)
-        return _clearing_patch(n, imp) and entered(n)
+            return statement(n) and not dead(n)
+        if started(n):
+            return True
+        p = parents.get(n)
+        return (_clearing_patch(n, imp) and isinstance(p, ast.ClassDef) and n in p.decorator_list
+                and not dead(n))
+
+    def inside_patch(n) -> bool:
+        """`n` runs inside a live `with` clearing patch's body, or in a function a clearing patch decorates."""
+        while n in parents:
+            p = parents[n]
+            if (isinstance(p, (ast.With, ast.AsyncWith)) and n in p.body and not dead(p)
+                    and any(isinstance(i.context_expr, ast.Call) and _clearing_patch(i.context_expr, imp)
+                            for i in p.items)):
+                return True
+            if isinstance(p, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                return not dead(p) and any(isinstance(d, ast.Call) and _clearing_patch(d, imp)
+                                           for d in p.decorator_list)
+            if isinstance(p, (ast.Lambda, ast.ClassDef)):
+                return False
+            n = p
+        return False
 
     def runs_code(n) -> bool:
         return (isinstance(n, ast.Call) and (imp.spawn(n) or _name(n.func) in LOADERS)) or _imports_target(n)
@@ -197,6 +238,8 @@ def violations(source: str, name: str = "<sample>") -> "list[str]":
 
     def covered(n) -> bool:
         """In a helper library: isolated earlier in its function, or a spawn with a helper-built env."""
+        if inside_patch(n):
+            return True
         if not library:
             return False
         fn = enclosing_def(n)
@@ -212,14 +255,25 @@ def violations(source: str, name: str = "<sample>") -> "list[str]":
             and any(b in ast.unparse(a.value) for b in BUILDERS) for a in ast.walk(fn))
 
     nodes = list(ast.walk(tree))
-    module_iso = sorted(n.lineno for n in nodes if isolates(n) and enclosing_def(n) is None)
-    runs = sorted((n for n in nodes if runs_code(n) and not covered(n)), key=lambda n: n.lineno)
+    stops = sorted(n.lineno for n in nodes if isinstance(n, ast.Call) and _name(n.func) == "stopall"
+                   and statement(n) and enclosing_def(n) is None)
+    # Each module-level isolation as [from, until): a started patch ends at the next patch.stopall().
+    spans = [(n.lineno, next((s for s in stops if s > n.lineno), float("inf")) if started(n) else float("inf"))
+             for n in nodes if isolates(n) and enclosing_def(n) is None]
+
+    def in_effect(n) -> bool:
+        line = n.lineno if enclosing_def(n) is None else float("inf")
+        return any(a < line < b for a, b in spans) or (line == float("inf") and any(b == line for _, b in spans))
+
+    runs = sorted((n for n in nodes if runs_code(n) and not covered(n) and not in_effect(n)),
+                  key=lambda n: n.lineno)
     out = []
-    if runs and not module_iso:
+    if runs and not spans:
         out.append((runs[0].lineno, "unisolated"))
     elif runs:
-        out += [(n.lineno, "before-isolation") for n in runs
-                if enclosing_def(n) is None and n.lineno < module_iso[0]]
+        first = min(a for a, _ in spans)
+        out += [(n.lineno, "before-isolation" if enclosing_def(n) is None and n.lineno < first else "unisolated")
+                for n in runs]
     for n in nodes:
         rule = None
         if _copy_rule(n, imp):
@@ -294,6 +348,16 @@ def spawn(args, env=None):
 IN_SCOPE = 'BRIDGE = "src/remote-gateway-bridge.py"\n'
 ISOLATED = "from _helpers.hermetic_env import isolate_os_environ\nisolate_os_environ()\n" + IN_SCOPE
 GATEWAY_IMPORT = "from ag2_sparrow import remote_gateway_bridge\n"
+PATCH = "import os\nfrom unittest import mock\n"
+SPAWN = 'from subprocess import run\nrun(["true"])\n'
+CLEAR = "mock.patch.dict(os.environ, {}, clear=True)"
+EXPIRED = {
+    "dead-branch": 'BRIDGE = "remote_gateway_bridge"\n' + PATCH + f"if False:\n    with {CLEAR}:\n        pass\n" + SPAWN,
+    "exited": 'BRIDGE = "remote_gateway_bridge"\n' + PATCH + f"with {CLEAR}:\n    pass\n" + SPAWN,
+}
+INSIDE = 'BRIDGE = "remote_gateway_bridge"\n' + PATCH + f"with {CLEAR}:\n    " + SPAWN.replace("\n", "\n    ").rstrip() + "\n"
+SYNTHETIC = "qa-synthetic-token"
+CHILD = "import sys; run([sys.executable, '-c', 'import os; print(os.environ.get(\"GATEWAY_TOKEN\", \"\"))'])"
 
 
 class SelfTest(unittest.TestCase):
@@ -382,6 +446,30 @@ class SelfTest(unittest.TestCase):
                     "import os\nfrom unittest import mock\nmock.patch.dict(os.environ, {}, clear=True).start()\n"):
             with self.subTest(iso=iso):
                 self.assertEqual(violations(iso + GATEWAY_IMPORT), [])
+
+    def test_a_patch_counts_only_where_it_is_in_effect_at_the_spawn(self):
+        for name, sample in EXPIRED.items():
+            with self.subTest(name=name):
+                self.assertIn("unisolated", " ".join(violations(sample)))
+        for iso in ("if 0:\n    isolate_os_environ()\n", "if TYPE_CHECKING:\n    isolate_os_environ()\n",
+                    PATCH + "mock.patch.dict(os.environ, {}, clear=True).start()\nmock.patch.stopall()\n"):
+            with self.subTest(iso=iso):
+                self.assertIn("unisolated", " ".join(violations(iso + GATEWAY_IMPORT)))
+        late = PATCH + 'with mock.patch.dict(os.environ, {}, clear=True):\n    import ag2_sparrow.remote_gateway_bridge\n'
+        self.assertEqual(violations(late), [])
+        decorated = PATCH + "@mock.patch.dict(os.environ, {}, clear=True)\ndef t():\n    " + GATEWAY_IMPORT
+        self.assertEqual(violations(decorated), [])
+
+    def test_the_refused_lifetimes_really_leak_a_parent_token_and_the_body_does_not(self):
+        for name, sample in {**EXPIRED, "inside": INSIDE}.items():
+            with self.subTest(name=name):
+                child = sample.replace('run(["true"])', CHILD)
+                got = subprocess.run([sys.executable, "-c", child], capture_output=True, text=True,
+                                     env=hermetic_env(GATEWAY_TOKEN=SYNTHETIC), timeout=60)
+                self.assertEqual(got.returncode, 0, got.stderr)
+                leaked = SYNTHETIC in got.stdout
+                self.assertEqual(leaked, name != "inside", got.stdout)
+                self.assertEqual(violations(sample) == [], not leaked, violations(sample))
 
     def test_a_mention_only_in_a_comment_or_docstring_is_out_of_scope(self):
         body = "import os, subprocess\nenv = os.environ.copy()\nsubprocess.run(['x'])\n"
