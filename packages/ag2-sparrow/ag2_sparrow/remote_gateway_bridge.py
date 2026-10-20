@@ -3045,8 +3045,9 @@ def _post_task_ack(tid: str, durable: bool = False, lease_id: "str | None" = Non
             body["lease_id"] = lease_id
         if durable:
             body["durable"] = True
+        bound = {} if deadline is None else {"deadline": deadline}   # a healthy ack's call is unchanged
         try:
-            _req("POST", f"/v1/tasks/{safe_tid}/ack", body, timeout=10, deadline=deadline)
+            _req("POST", f"/v1/tasks/{safe_tid}/ack", body, timeout=10, **bound)
         except _NETWORK_ERRORS as e:
             if not _connection_dropped(e) or (dropped is None and not retry_inline):
                 raise
@@ -3056,7 +3057,7 @@ def _post_task_ack(tid: str, durable: bool = False, lease_id: "str | None" = Non
                 return False
             # A dropped link loses the ack; one prompt retry lands it inside the delivery lease.
             time.sleep(ACK_DROP_RETRY_S)
-            _req("POST", f"/v1/tasks/{safe_tid}/ack", body, timeout=10, deadline=deadline)
+            _req("POST", f"/v1/tasks/{safe_tid}/ack", body, timeout=10, **bound)
         _ack_disabled_until = 0.0  # success (or re-enablement) → clear any backoff
         _forget_pending_ack(tid, lease_id)
         return True
