@@ -40,6 +40,7 @@ ag2-sparrow = "ag2_sparrow.remote_gateway_bridge:main"
 # would change one of them.
 ag2-sparrow-outbox = "ag2_sparrow.outbox_cli:main"
 ag2-sparrow-hatch = "ag2_sparrow.adapters.hatch.cli:main"
+ag2-sparrow-mcp = "ag2_sparrow.mcp_auth:main"
 
 # Discovered, not listed: a hand-written list silently drops a new subpackage.
 [tool.setuptools.packages.find]
