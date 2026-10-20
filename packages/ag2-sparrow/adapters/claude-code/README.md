@@ -219,16 +219,22 @@ read live, by the verifier and the policy alike. Those are two reads, so the
 verifier prints the sha256 of the key bytes it read (`absent` when none) and
 the mod passes it as `--key-seen`: when the policy's own read of the key file
 differs (the key landed or was rotated in between), the verdict is stale and
-the task is held to be verified again, never retired. The watch tool's arm
+the task is held to be verified again, never retired. A reinstall that changes
+the key path without a session restart therefore holds every task (the
+verifier still reads the old path, so unless both hold the same bytes each task reads as a changed key) and marks it
+stuck until the session restarts: it fails closed. The watch tool's arm
 line names the mode as the CLI reads it then.
 
-Any task the mod retires has its durable stuck mark cleared first, whether
-that mark was set by this mod or by one before a session restart or plugin
-reload (the clear is sent every time; clearing no mark is harmless): a verdict the
-policy refuses once the key lands (`unsigned`, `invalid`), a final claim or
-authorize refusal, or a delivered answer (the claim's own write clears it). A
-clear the CLI does not confirm keeps the task retryable; no mark outlives its
-task.
+Any task the mod retires goes through one path that clears its durable stuck
+mark first, whether that mark was set by this mod or by one before a session
+restart or plugin reload (the clear is sent every time; clearing no mark is
+harmless): a verdict the policy refuses (`unsigned`, `invalid`), a header id
+that does not match the file stem (the stem's mark), a final claim or
+authorize refusal, an interrupted answer, or an answer delivered at a turn's
+end after a stuck mark. Until the CLI confirms the clear (a refusal, exit 3, or
+a CLI that did not run) the mod keeps the task, retries only the clear after
+1, 2, 4 ... ticks capped at 60, and marks it seen once the clear lands; no
+mark outlives its task.
 
 So `install --hmac-key-file <path>` records a path whose key is not there yet
 (it prints a warning and `verify` fails its `hmac key` part until the key

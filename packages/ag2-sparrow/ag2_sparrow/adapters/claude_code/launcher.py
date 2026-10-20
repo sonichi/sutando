@@ -39,7 +39,6 @@ TITLE_CHANGED = "title changed"
 FIELD_SEP = "|:ag2:|"
 START_COMMAND_RE = re.compile(r'^"?ag2-sparrow-claude-local hold --generation=[0-9a-f]{32} --"?$')
 TMUX_VERSION_RE = re.compile(r"(\d+)\.(\d+)")
-SESSION_ENV_KEYS = ("CLAUDE_CONFIG_DIR", "HMAC_KEY_FILE", "HMAC_STRICT")
 
 
 def socket_path(config_dir) -> Path:

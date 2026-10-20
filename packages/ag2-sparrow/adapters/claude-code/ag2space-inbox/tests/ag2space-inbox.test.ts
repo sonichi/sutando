@@ -25,11 +25,11 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
                                progressFails?: number; sessionIds?: string[]; cwdInode?: string; allowNonOwner?: boolean;
                                claimAs?: Record<string, unknown>; interruptParks?: number; interruptThrows?: number;
                                interruptSoft?: Record<string, string | number>; stuckAtStart?: Record<string, unknown>;
-                               unstuckFails?: number; clearFails?: Record<string, string>; stuckWriteFails?: number;
+                               unstuckFails?: number; unstuckHardFails?: number; unstuckThrows?: number; clearFails?: Record<string, string>; stuckWriteFails?: number;
                                lockFailsOnce?: string[]; storeFailsOnce?: string[]; unreadableOnce?: string[];
                                committedHardOnce?: string[]; committedHardWhy?: string; stageLandsOnce?: boolean;
                                parkRefusedOnce?: boolean; authorizeLostOnce?: boolean; stageLinkFailsOnce?: boolean;
-                               parkAlwaysRefuses?: boolean; stageThrows?: number } = {}) {
+                               parkAlwaysRefuses?: boolean; parkRefuses?: number; stageThrows?: number } = {}) {
   const files: Record<string, string> = {}
   const submitted: string[] = []
   const runs: string[][] = []
@@ -53,6 +53,8 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
   // The plugin record's stuck marks: durable across Mod starts, returned by every progress reply.
   const stuck: Record<string, unknown> = { ...(opts.stuckAtStart ?? {}) }
   let unstuckFailsLeft = opts.unstuckFails ?? 0
+  let unstuckHardLeft = opts.unstuckHardFails ?? 0
+  let unstuckThrowsLeft = opts.unstuckThrows ?? 0
   let stuckWriteFailsLeft = opts.stuckWriteFails ?? 0
   const lockFails = new Set(opts.lockFailsOnce ?? [])
   const storeFails = new Set(opts.storeFailsOnce ?? [])
@@ -60,6 +62,7 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
   const committedHard = new Set(opts.committedHardOnce ?? [])
   let stageLands = opts.stageLandsOnce ?? false
   let parkRefused = opts.parkRefusedOnce ?? false
+  let parkRefusesLeft = opts.parkRefuses ?? 0
   let authorizeLost = opts.authorizeLostOnce ?? false
   let stageLinkFails = opts.stageLinkFailsOnce ?? false
   let stageThrowsLeft = opts.stageThrows ?? 0
@@ -117,6 +120,7 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
     if (argv[2] === 'interrupt') interruptAt.push(sidReads)
     if (argv[2] === 'stage' && stageThrowsLeft-- > 0) throw new Error('spawn failed')      // the CLI did not run
     if (argv[2] === 'interrupt' && throwsLeft-- > 0) throw new Error('spawn failed')
+    if (argv[2] === 'progress' && argv.includes('--unstuck') && unstuckThrowsLeft-- > 0) throw new Error('spawn failed')
     if (argv[0] !== 'ag2-sparrow-claude-local' || argv[1] !== 'inbox') return { value: { exitCode: 2, stdout: '', stderr: 'unknown' } }
     const verb = argv[2]
     const task = argv[3]
@@ -135,6 +139,8 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
     if (verb === 'progress') {
       if (progressFailLeft-- > 0) return out(3, { error: 'progress write failed: disk', hard: true })
       if (argv.includes('--unstuck') && unstuckFailsLeft-- > 0) return out(1, { refused: 'progress lock busy' })
+      // As the CLI: a RecordError on the progress write is exit 3, hard.
+      if (argv.includes('--unstuck') && unstuckHardLeft-- > 0) return out(3, { error: 'progress write failed: RecordError: EIO', hard: true })
       if (argv.includes('--stuck') && stuckWriteFailsLeft-- > 0) return out(3, { error: 'progress write failed: progress.lock: EIO', hard: true })
       progress.push(argv.slice(3))
       const add = argv.indexOf('--stuck'), del = argv.indexOf('--unstuck')
@@ -162,7 +168,7 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
       const keyProblem = opts.keySwap ? (keyNow === 'absent' ? '/k/task-hmac.key missing' : '') : opts.keyProblem
       const reason = verdict === 'invalid' ? 'envelope invalid' : !opts.strict ? '' : keyProblem ? `strict mode: ${keyProblem}`
         : verdict !== 'verified' ? `strict mode: envelope ${verdict}` : ''
-      return out(0, { verdict, mode: opts.strict ? 'strict' : 'off', submit: !reason, reason, retry: !!(opts.strict && keyProblem) })
+      return out(0, { verdict, mode: opts.strict ? 'strict' : 'off', submit: !reason, reason, retry: verdict !== 'invalid' && !!(opts.strict && keyProblem) })
     }
     if (verb === 'claim') {
       if (result(task) === 'LIVE_READY') {
@@ -254,7 +260,7 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
     }
     if (verb === 'park') {
       if (!c || c.phase !== 'TURN_CONFIRMED' || c.turnId !== argv[4]) return out(1, { refused: 'not this turn' })
-      if (parkRefused || opts.parkAlwaysRefuses) { parkRefused = false; return out(1, { refused: `${task}: publication parked` }) }
+      if (parkRefused || opts.parkAlwaysRefuses || parkRefusesLeft-- > 0) { parkRefused = false; return out(1, { refused: `${task}: publication parked` }) }
       // As the CLI: a recorded descriptor with no verifying blob parks every time, until an identical stage.
       if (c.staged !== undefined && !c.blobOk) return out(1, { refused: `${task}: publication parked` })
       if (c.staged !== undefined) {         // an accepted answer: the CLI publishes it, never the protocol failure
@@ -493,6 +499,7 @@ const heldThenKeyLands = async ($: any, on: any, o: any) => {
   expect(h.submitted.length).toBe(0)
   expect(h.stuck).toEqual({ 'task-h1': { since: 1 } })
   o.keyProblem = ''
+  if (o.landsAs) o.verdict = o.landsAs                // the verifier reads the key that landed
   for (let i = 0; i < 70; i++) await h.clock.advance(1000)
   return h
 }
@@ -508,7 +515,7 @@ test('a task held past the stuck bound, refused as unsigned once the key lands, 
 })
 
 test('a task held past the stuck bound, found signed under another key (invalid) once the key lands, leaves no stuck mark behind', async ($, on) => {
-  const h = await heldThenKeyLands($, on, { verdict: 'invalid', strict: true, keyProblem: '/k/task-hmac.key missing: strict mode submits nothing until it is back' })
+  const h = await heldThenKeyLands($, on, { verdict: 'unverifiable', landsAs: 'invalid', strict: true, keyProblem: '/k/task-hmac.key missing: strict mode submits nothing until it is back' })
   expect(h.submitted.length).toBe(0)
   expect(h.stuck).toEqual({})
   expect(h.progress.filter((p: string[]) => p[0] === '--unstuck')).toEqual([['--unstuck', 'task-h1']])
@@ -559,6 +566,53 @@ test('a stuck mark from before the Mod started whose clear fails keeps the task 
   expect(h.submitted.length).toBe(0)
   expect(h.stuck).toEqual({})
   expect(h.runs.filter((a: string[]) => a[2] === 'progress' && a.includes('--unstuck')).length).toBe(3)
+})
+
+// Every terminal retirement goes through one clear of the durable mark; until it is confirmed the task stays
+// owned by the Mod and is retried with the per-task backoff, whatever the failure: refused, exit 3, not run.
+test('a stuck-mark clear that fails hard 45 times is retried with backoff until it lands, then the task is retired once', async ($, on) => {
+  const h = host(on, { verdict: 'unsigned', strict: true, keyProblem: '', stuckAtStart: { 'task-x': { since: 1 } }, unstuckHardFails: 45 })
+  h.files['/in/task-x.txt'] = TASK('task-x')
+  await arm($, h)
+  for (let i = 0; i < 2700; i++) await h.clock.advance(1000)
+  expect(h.stuck).toEqual({})
+  expect(h.runs.filter((a: string[]) => a[2] === 'progress' && a.includes('--unstuck')).length).toBe(46)
+  expect(h.logs.filter(l => l.includes('task-x strict mode: envelope unsigned; not submitted')).length).toBe(1)
+  expect(h.submitted.length).toBe(0)
+  for (let i = 0; i < 100; i++) await h.clock.advance(1000)
+  expect(h.runs.filter((a: string[]) => a[2] === 'progress' && a.includes('--unstuck')).length).toBe(46)   // retired: no more
+})
+
+test('a stuck-mark clear whose CLI does not run is retried until it lands', async ($, on) => {
+  const h = host(on, { verdict: 'unsigned', strict: true, keyProblem: '', stuckAtStart: { 'task-x': { since: 1 } }, unstuckThrows: 3 })
+  h.files['/in/task-x.txt'] = TASK('task-x')
+  await arm($, h)
+  for (let i = 0; i < 20; i++) await h.clock.advance(1000)
+  expect(h.stuck).toEqual({})
+  expect(h.runs.filter((a: string[]) => a[2] === 'progress' && a.includes('--unstuck')).length).toBe(4)
+})
+
+test('a header id that does not match the file stem clears the stem\'s stuck mark before the file is retired', async ($, on) => {
+  const h = host(on, { stuckAtStart: { 'task-x': { since: 1 } } })
+  h.files['/in/task-x.txt'] = TASK('task-other')
+  await arm($, h)
+  for (let i = 0; i < 5; i++) await h.clock.advance(1000)
+  expect(h.submitted.length).toBe(0)
+  expect(h.stuck).toEqual({})
+  expect(h.progress.filter((p: string[]) => p[0] === '--unstuck')).toEqual([['--unstuck', 'task-x']])
+  expect(h.logs.some(l => l.includes('task-x header id task-other does not match the file stem; not submitted'))).toBe(true)
+})
+
+test('a refused stuck-mark clear is backed off: bounded attempts and no re-verification per tick', async ($, on) => {
+  const h = host(on, { verdict: 'unsigned', strict: true, keyProblem: '', unstuckFails: 100000 })
+  h.files['/in/task-z.txt'] = TASK('task-z')
+  await arm($, h)
+  for (let i = 0; i < 600; i++) await h.clock.advance(1000)
+  // 1, 2, 4 ... 32 then every 60 ticks: 16 attempts in 600 ticks, one verifier run and one policy read.
+  expect(h.runs.filter((a: string[]) => a[2] === 'progress' && a.includes('--unstuck')).length).toBeLessThanOrEqual(16)
+  expect(h.runs.filter((a: string[]) => a[0] === 'python3' && a[2].includes('hmac')).length).toBe(1)
+  expect(verbs(h).filter(v => v === 'envelope').length).toBe(2)   // the arm line's and the task's
+  expect(h.submitted.length).toBe(0)
 })
 
 // The verifier and the policy each read the key; the verdict carries the digest of the key it was made with,
@@ -1244,6 +1298,20 @@ test('an undeliverable ended turn backs off, is marked stuck, and never holds in
   expect(h.progress.find((p: string[]) => p[0] === '--stuck' && p[1] === 'task-p1')).toBeDefined()
 })
 
+test('a turn-end delivery that lands after the stuck bound keeps its mark owned until the clear is confirmed', async ($, on) => {
+  const h = host(on, { parkRefuses: 12, unstuckFails: 2 })
+  h.files['/in/task-p1.txt'] = TASK('task-p1')
+  await arm($, h)
+  await h.clock.advance(1000)
+  await $.turn.start({ text: h.submitted[0], turnId: 't-p1' })
+  await $.turn.complete({ turnId: 't-p1', reason: 'completed', text: '' } as any)
+  for (let i = 0; i < 900; i++) await h.clock.advance(1000)
+  expect(h.files['/out/task-p1.txt']).toContain('without a reply')
+  expect(h.progress.find((p: string[]) => p[0] === '--stuck' && p[1] === 'task-p1')).toBeDefined()
+  expect(h.stuck).toEqual({})                                          // the third clear landed
+  expect(h.runs.filter((a: string[]) => a[2] === 'progress' && a.includes('--unstuck') && a.includes('task-p1')).length).toBe(3)
+})
+
 test('a pending authorization is dropped when its inbox file goes: a returning file is claimed afresh', async ($, on) => {
   const h = host(on, { authorizeLostOnce: true })
   h.files['/in/task-gone.txt'] = TASK('task-gone')
@@ -1305,13 +1373,15 @@ test('a staged answer whose publish fails at the turn\'s end is retried by publi
   expect(h.publishes()).toBe(1)
 })
 
-test('thirty failed unstuck writes never age a retained task out: the next one lands (stopped-intake path)', async ($, on) => {
+test('thirty failed unstuck writes never age a retained task out: backed off, the next one lands (stopped-intake path)', async ($, on) => {
   const h = host(on, { unstuckFails: 30, stuckAtStart: { 'task-s30': { since: 1 } } })
   await arm($, h)
   h.setSid('sid-2')
   await h.clock.advance(1000)
   h.files['/in/task-s30.txt'] = TASK('task-s30')
   for (let i = 0; i < 40; i++) await h.clock.advance(1000)
+  expect(h.runs.filter((a: string[]) => a.includes('--unstuck') && a.includes('task-s30')).length).toBe(6)   // 1, 2, 4 ... backoff
+  for (let i = 0; i < 1600; i++) await h.clock.advance(1000)
   expect(h.progress).toContainEqual(['--unstuck', 'task-s30'])
   expect(h.stuck).toEqual({})
   expect(h.runs.filter((a: string[]) => a.includes('--unstuck') && a.includes('task-s30')).length).toBe(31)

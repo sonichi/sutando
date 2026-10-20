@@ -92,11 +92,14 @@ type State = {
   tick: number
   authorizing: Map<string, { attempt: number; msg: string; hash: string; label: string }>
   retry: Map<string, { fails: number; delay: number; next: number; first: number; stuck: boolean }>
+  // Retired tasks whose stuck-mark clear is not confirmed yet: owned here, backed off, until it is.
+  cleanup: Map<string, Cleanup>
   intake: 'open' | 'closed'
   intakeReason: string
 }
 
 type CliOut = { ok: boolean; hard: boolean; data: any }
+type Cleanup = { rid: string; why: string; fails: number; delay: number; next: number; done?: () => Promise<void> }
 
 // Every lifecycle and progress mutation is one CLI call; a hard failure (exit 3: the progress record
 // was not written durably) closes intake until a later durable write reopens it.
@@ -251,23 +254,27 @@ async function arm($: any, s: State, inbox: string, results: string): Promise<{ 
     return hard
   }
 
-  // A terminal outcome: the durable stuck mark is cleared before the task is retired, every time, since a
-  // mark from an earlier Mod start is not in s.retry; an unconfirmed clear keeps it retryable. True if hard.
-  const retire = async (name: string, rid: string, why: string): Promise<boolean> => {
-    const held = s.retry.get(name) ?? { fails: 0, delay: 1, first: s.tick, stuck: false }
-    const r = await cli($, s, ['progress', '--unstuck', rid])
-    if (r.hard) return true
-    if (!r.ok) {
-      s.stale.delete(name)
-      s.retry.set(name, { ...held, next: s.tick + held.delay })
-      log(`${rid} ${why}; its stuck mark could not be cleared (${r.data?.refused ?? 'no reply'}); kept, retried`)
+  // Every terminal outcome: the task's durable stuck mark (whichever Mod start set it) is cleared first; until a
+  // clear is confirmed (refused, exit 3, not run) the task stays owned here, backed off, never seen. True if hard.
+  const clearMark = async (name: string, c: Cleanup): Promise<boolean> => {
+    const r = await cli($, s, ['progress', '--unstuck', c.rid])
+    if (r.ok) {
+      s.cleanup.delete(name); s.retry.delete(name); s.stale.delete(name); s.authorizing.delete(name)
+      s.seen.add(name)
+      if (c.done) await c.done()
+      else log(`${c.rid} ${c.why}; not submitted`)
       return false
     }
-    s.retry.delete(name)
-    s.seen.add(name)
-    log(`${rid} ${why}; not submitted`)
-    return false
+    c.fails++
+    const delay = Math.min(BACKOFF_MAX_TICKS, 2 ** (c.fails - 1))
+    if (delay !== c.delay) log(`${c.rid} ${c.why}; its stuck mark could not be cleared (${r.data?.refused ?? r.data?.error ?? 'no reply'}); kept, next try in ${delay} s`)
+    c.delay = delay
+    c.next = s.tick + delay
+    s.cleanup.set(name, c)
+    return r.hard
   }
+  const retire = (name: string, rid: string, why: string, done?: () => Promise<void>): Promise<boolean> =>
+    clearMark(name, { rid, why, fails: 0, delay: 0, next: s.tick, done })
 
   const scan = async () => {
     if (busy) return
@@ -287,17 +294,18 @@ async function arm($: any, s: State, inbox: string, results: string): Promise<{ 
           const why = await parkOffer($, s, o, o.parkPending)
           if (!why) {
             s.retry.delete(o.file)
-            if (held?.stuck) await cli($, s, ['progress', '--unstuck', o.rid])
+            if (held?.stuck && await retire(o.file, o.rid, "delivered at the turn's end", async () => {})) return
           } else if (await retain(o.file, o.rid, "not delivered at the turn's end", why)) return
         }
       }
+      for (const [name, c] of [...s.cleanup]) if (s.tick >= c.next && await clearMark(name, c)) return
       if (!stopped && s.pending) return
       // A delivery still owed for an ended turn is retried on its own schedule; it never holds intake.
       if (!stopped) for (const o of s.offers.values()) if ((o.phase === 'CALLING' || o.phase === 'TURN_CONFIRMED') && o.parkPending === undefined) return
       const listed = await $.fs.list(inbox)
       for (const name of [...s.authorizing.keys()]) if (stopped || !listed.some((e: any) => e.name === name)) s.authorizing.delete(name)
       for (const entry of listed) {
-        if (entry.kind !== 'file' || !TASK_RE.test(entry.name) || s.seen.has(entry.name)) continue
+        if (entry.kind !== 'file' || !TASK_RE.test(entry.name) || s.seen.has(entry.name) || s.cleanup.has(entry.name)) continue
         const backoff = s.retry.get(entry.name)
         if (backoff && s.tick < backoff.next) continue
         const prev = s.stale.get(entry.name)
@@ -307,7 +315,7 @@ async function arm($: any, s: State, inbox: string, results: string): Promise<{ 
         if (!hasTaskLine(text)) continue
         const stem = entry.name.slice(0, -4)
         const rid = header(text, 'id') || stem
-        if (rid !== stem) { log(`${entry.name}: header id ${rid} does not match the file stem; not submitted`); s.seen.add(entry.name); continue }
+        if (rid !== stem) { if (await retire(entry.name, stem, `header id ${rid} does not match the file stem`)) return; continue }
         if (s.offers.has(rid)) { s.seen.add(entry.name); continue }
         // Whether a result is ready is the lifecycle's call (claim, interrupt), never a size read here.
         let out = ''
@@ -343,15 +351,9 @@ async function arm($: any, s: State, inbox: string, results: string): Promise<{ 
             continue
           }
           // The CLI cleared the mark in its resolving write; the Mod clears it too, so both converge.
-          if (!(await cli($, s, ['progress', '--unstuck', rid])).ok) {
-            s.stale.delete(entry.name)
-            s.retry.set(entry.name, { ...(backoff ?? { fails: 0, delay: 1, first: s.tick, stuck: false }), next: s.tick + (backoff?.delay ?? 1) })
-            continue
-          }
-          s.retry.delete(entry.name)
-          s.seen.add(entry.name)
           s.answered.add(rid)
-          await $.ui.log(`${PLUGIN}: ${rid} ${r.data?.answered ? 'answered as interrupted' : 'already resolved'} (intake stopped)`, {})
+          const done = async () => { await $.ui.log(`${PLUGIN}: ${rid} ${r.data?.answered ? 'answered as interrupted' : 'already resolved'} (intake stopped)`, {}) }
+          if (await retire(entry.name, rid, 'interrupted answer published', done)) return
           continue
         }
         // An authorization whose reply was lost is asked for again with the same attempt and text: the CLI
@@ -371,7 +373,7 @@ async function arm($: any, s: State, inbox: string, results: string): Promise<{ 
           s.retry.delete(entry.name)          // the claim's own write cleared the mark
           const admitted = String(claimed.data?.admission ?? '')
           const ctier = String(claimed.data?.access_tier ?? '')
-          if (!ADMITTED.has(admitted) || !ctier) { s.seen.add(entry.name); log(`${rid} claim gave no admission; not submitted`); continue }
+          if (!ADMITTED.has(admitted) || !ctier) { if (await retire(entry.name, rid, 'claim gave no admission')) return; continue }
           // The frame is the CLI's reading of the attested headers, never the verifier's.
           const frame = admitted === 'owner'
             ? `[AG2 Space task ${rid}; sender tier owner; envelope ${verdict}; your owner's message follows]\n`
@@ -429,7 +431,7 @@ async function arm($: any, s: State, inbox: string, results: string): Promise<{ 
 
 export const register: Register = (on) => {
   const s: State = { seen: new Set(), answered: new Set(), offers: new Map(), pending: null, stale: new Map(),
-    armedResults: '', stop: null, sessionId: '', stoppedFor: '', tick: 0, retry: new Map(), authorizing: new Map(), intake: 'open', intakeReason: '' }
+    armedResults: '', stop: null, sessionId: '', stoppedFor: '', tick: 0, retry: new Map(), cleanup: new Map(), authorizing: new Map(), intake: 'open', intakeReason: '' }
 
   on('session.start', async ($, e, next) => {
     await $.tool.register({
