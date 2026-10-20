@@ -2012,6 +2012,24 @@ class BoundaryGuardTest(SpyMixin, unittest.TestCase):
 class ErrorBranchTest(Base):
     """The error and edge branches of the owner's helpers, driven with real files."""
 
+    def test_a_rename_that_landed_is_committed_and_a_failed_write_is_io(self):
+        lc = self.lc
+        store = lc.ClaimStore(self.work / "claims")
+        with mock.patch.object(lc, "fsync_dir", side_effect=OSError(errno.EIO, "dir fsync")):
+            with self.assertRaises(lc.RenamedNotDurable):
+                lc.write_durable(self.work / "f", b"x")
+            self.assertEqual((self.work / "f").read_bytes(), b"x", "the rename landed")
+            (self.work / "claims" / "t").mkdir(parents=True)
+            with self.assertRaises(lc.StateCommitted):
+                store.save({"task_id": "t", "phase": "PREPARED"})
+            with self.assertRaises(lc.StateCommitted):
+                store.stage("t", b"body")
+        with mock.patch.object(lc, "write_durable", side_effect=OSError(errno.ENOSPC, "full")):
+            with self.assertRaises(lc.StateIOError):
+                store.save({"task_id": "t", "phase": "PREPARED"})
+            with self.assertRaises(lc.StateIOError):
+                store.stage("t", b"body")
+
     def test_helpers_report_missing_paths_and_log_to_stderr(self):
         lc = self.lc
         self.assertIsNone(lc._lstat(self.work / "nope"))

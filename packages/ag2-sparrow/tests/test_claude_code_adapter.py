@@ -2810,6 +2810,49 @@ class InboxCli(ConnectBase):
         self.assertTrue(issubclass(inbox.lifecycle.LedgerIOError, inbox.lifecycle.StateIOError))
         self.assertIsInstance(inbox.lifecycle._state_io("write", "x", OSError("e")), inbox.lifecycle.StateIOError)
 
+    def test_anything_after_the_commit_point_is_hard_never_a_retry(self):
+        lc = inbox._lifecycle(self.root)
+        real = records.flocked
+
+        @contextlib.contextmanager
+        def release_fails(path, blocking=True):
+            with real(path, blocking) as fd:
+                yield fd
+            if Path(path).name == records.CLAIMS_LOCK:
+                raise OSError(errno.EIO, "unlock I/O error")
+        t = self.task("task-release")
+        with mock.patch.object(records, "flocked", release_fails):
+            rc, out = self.verb("claim", t)
+        self.assertEqual((rc, out.get("hard"), "retry" in out), (3, True, False), out)
+        self.assertEqual(lc.claims.load(t)["phase"], inbox.lifecycle.PREPARED, "the committed claim is kept")
+        rc, out = self.verb("claim", t)
+        self.assertEqual(rc, 0, "and claimed again for this generation")
+        token = self.verb("authorize", t, str(out["attempt"]), "--text-hash", "h1")[1]["token"]
+        with mock.patch.object(records, "flocked", release_fails):
+            rc, out = self.verb("confirm", t, "turn-9", token, "--text-hash", "h1")
+        self.assertEqual((rc, out.get("hard"), out.get("turn_id")), (3, True, "turn-9"), "hard, the turn kept")
+        self.assertEqual(lc.claims.load(t)["phase"], inbox.lifecycle.TURN_CONFIRMED)
+        real_fsync = inbox.lifecycle.fsync_dir
+        calls = []
+
+        def fsync_after_rename_fails(path):
+            calls.append(path)
+            if any(n.endswith("claim.json") for n in os.listdir(path)) and len(calls) > 1:
+                raise OSError(errno.EIO, "dir fsync")
+            return real_fsync(path)
+        u = self.task("task-fsync")
+        with mock.patch.object(inbox.lifecycle, "fsync_dir", side_effect=fsync_after_rename_fails):
+            rc, out = self.verb("claim", u)
+        self.assertEqual((rc, out.get("hard"), "retry" in out), (3, True, False), out)
+        self.assertIn("landed", out["error"])
+        self.assertEqual(lc.claims.load(u)["phase"], inbox.lifecycle.PREPARED, "the renamed claim stands")
+        with self.assertRaises(inbox.lifecycle.RenamedNotDurable), \
+                mock.patch.object(inbox.lifecycle, "fsync_dir", side_effect=OSError(errno.EIO, "x")):
+            inbox.lifecycle.write_durable(Path(self.root) / "state" / "probe", b"x")
+        with mock.patch.object(inbox.lifecycle, "fsync_dir", side_effect=OSError(errno.EIO, "x")), \
+                self.assertRaises(inbox.lifecycle.StateCommitted):
+            lc.claims.stage(u, b"body")
+
     def test_an_unwritable_progress_record_alarms_the_launcher_verify_and_the_card_until_a_write_lands(self):
         t = self.task("task-alarm")
         with mock.patch.object(records, "write_progress", side_effect=records.RecordError("progress.lock: EIO")):

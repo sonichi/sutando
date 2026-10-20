@@ -882,6 +882,24 @@ test('an unreadable claim at claim and at confirm resolved nothing: the task is 
   expect(h.submitted.length).toBe(1)
 })
 
+test('after a transient publish failure a different reply is refused: the staged answer is the one delivered', async ($, on) => {
+  const h = host(on, { lockFailsOnce: ['publish'] })
+  h.files['/in/task-ab.txt'] = TASK('task-ab')
+  await arm($, h)
+  await h.clock.advance(1000)
+  await $.turn.start({ text: h.submitted[0], turnId: 't-ab' })
+  const a = await $.tool.call({ tool: REPLY, task_id: 'task-ab', text: 'answer A' })
+  expect(String(a.text ?? a.result)).toContain('call ag2space_reply again')
+  const b = await $.tool.call({ tool: REPLY, task_id: 'task-ab', text: 'answer B' })
+  expect(String(b.text ?? b.result)).toContain('already staged')
+  expect(String(b.text ?? b.result)).toContain('answer A')
+  expect(h.files['/out/task-ab.txt']).toBe(undefined)            // B was never accepted, nothing went
+  const again = await $.tool.call({ tool: REPLY, task_id: 'task-ab', text: 'answer A' })
+  expect(String(again.text ?? again.result)).toContain('Published')
+  expect(h.files['/out/task-ab.txt']).toBe('answer A\n')         // what was accepted is what was delivered
+  expect(verbs(h).filter((v: string) => v === 'publish').length).toBe(2)
+})
+
 test('thirty failed unstuck writes never age a retained task out: the next one lands (stopped-intake path)', async ($, on) => {
   const h = host(on, { unstuckFails: 30, stuckAtStart: { 'task-s30': { since: 1 } } })
   await arm($, h)

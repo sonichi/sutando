@@ -75,9 +75,11 @@ an I/O failure there, or in the step before it commits, answers `retry` (decided
 anything raised inside the step left the claim as it was, so only a decision,
 a refused turn, an attempt in progress, the admission or a `StateError` that
 is not `StateIOError`, stays final; an unreadable claim resolved nothing and
-retries; the
+retries; anything from the commit point on, a rename that
+landed or only the lock's release left, is hard and never a retry; the
 task is kept, an unconfirmed turn's confirmation is retried by the next tick or
-by the reply itself, and a reply told to call again), and one after the commit
+by the reply itself, and a reply told to call again; after a retried publish the staged answer is
+the one delivered, so a reply with a different text is refused and names it), and one after the commit
 answers hard. When the progress record cannot be written at all, the CLI raises
 an alarm in the adapter's config dir (outside `state/`): `verify` fails its
 `progress` row and the launcher raises the needs-attention card until a durable

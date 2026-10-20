@@ -135,6 +135,14 @@ class LedgerIOError(LedgerError, StateIOError):
     pass
 
 
+class RenamedNotDurable(OSError):
+    """write_durable after its rename: the new contents are in place, their durability unknown."""
+
+
+class StateCommitted(StateError):
+    """A store write whose rename landed: the state changed, so the step counts as committed."""
+
+
 def _log(*a):
     print(time.strftime("%H:%M:%S"), *a, file=sys.stderr, flush=True)
 
@@ -163,7 +171,10 @@ def write_durable(path, data):
     finally:
         if os.path.lexists(tmp):
             os.unlink(tmp)
-    fsync_dir(path.parent)
+    try:
+        fsync_dir(path.parent)
+    except OSError as e:
+        raise RenamedNotDurable(e.errno, "%s was replaced, then its directory fsync failed (%s)" % (path, e.strerror or e))
 
 
 def append_durable(path, line):
@@ -652,12 +663,16 @@ class ClaimStore:
             if new:
                 fsync_dir(self.root)
             write_durable(d / "claim.json", json.dumps(rec, sort_keys=True).encode("utf-8"))
+        except RenamedNotDurable as e:
+            raise StateCommitted(str(e))
         except OSError as e:
             raise _state_io("write", d / "claim.json", e)
 
     def stage(self, task_id, body):
         try:
             write_durable(self.dir(task_id) / "body", body)
+        except RenamedNotDurable as e:
+            raise StateCommitted(str(e))
         except OSError as e:
             raise _state_io("write", self.dir(task_id) / "body", e)
 

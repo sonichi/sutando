@@ -70,7 +70,7 @@ function submittedAt(turnText: string, msg: string): number {
 
 // One lifecycle claim as the Mod sees it: the phase is the CLI's answer, never a shadow machine.
 type Offer = { file: string; rid: string; attempt: number; msg: string; hash: string; token: string; turnId: string; phase: string
-                confirming?: { turnId: string; hash: string; completed?: string } }
+                confirming?: { turnId: string; hash: string; completed?: string }; stagedText?: string }
 
 // One session's inbox state: what was seen and answered, the offers in flight, the live watch, the
 // session-id witness and whether intake is open.
@@ -450,10 +450,16 @@ export const register: Register = (on) => {
     if (!text.trim()) return { result: 'Error: text is empty; Sparrow never delivers a blank body', isError: true }
     if (!results) return { result: 'Error: no results dir: arm ag2space_inbox_watch or set AG2_RESULTS_DIR', isError: true }
     const again = ' (transient: call ag2space_reply again with the same text)'
+    if (offer.phase === 'RESULT_STAGED' && text !== offer.stagedText) {
+      // The staged answer is the one publication delivers: a different text is refused, never swapped in.
+      return { result: `Error: an answer is already staged for ${id} and is the one that will be delivered; call ` +
+        `ag2space_reply again with exactly that text to publish it:\n${offer.stagedText ?? ''}`, isError: true }
+    }
     if (offer.phase !== 'RESULT_STAGED') {
       const staged = await cli($, s, ['stage', id, offer.turnId], text + '\n')
       if (!(staged.ok || (staged.hard && staged.data?.outcome === 'staged'))) return { result: `Error: stage refused: ${staged.data?.refused ?? staged.data?.error ?? ''}${staged.data?.retry ? again : ''}`, isError: true }
       offer.phase = 'RESULT_STAGED'
+      offer.stagedText = text
     }
     const published = await cli($, s, ['publish', id])
     if (!(published.ok || (published.hard && published.data?.outcome === 'settled'))) return { result: `Error: publish refused: ${published.data?.refused ?? published.data?.error ?? ''}${published.data?.retry ? again : ''}`, isError: true }
