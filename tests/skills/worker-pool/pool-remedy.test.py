@@ -138,6 +138,195 @@ class ItResumesTheSameWorker(Base):
                          "launches on a tmux server the worker never ran on")
 
 
+class RecoverySessionSelection(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.ws = Path(tmp.name)
+        timer = mock.patch.object(sw, "ensure_remedy_timer", return_value={"installed": False})
+        timer.start()
+        self.addCleanup(timer.stop)
+        self.t = FakeTmux()
+        self.a_dir, self.b_dir = self.ws / "project-a", self.ws / "project-b"
+        self.a_dir.mkdir()
+        self.b_dir.mkdir()
+        first = wi.create_worker(self.ws, runtime="claude", cwd=str(self.a_dir),
+                                 tmux_socket=SOCK)
+        self.wid, self.a = first["worker_id"], first["runtime_session_id"]
+        wi.end_incarnation(self.ws, self.wid, first["incarnation_id"], "exited")
+        self.b = "later-session-b"
+        wi.record_session(self.ws, self.wid, self.b, runtime="claude",
+                          relation=wi.RELATION_NEW, cwd=str(self.b_dir))
+        b_run = wi.start_incarnation(self.ws, self.wid, self.b, tmux_socket=SOCK,
+                                     tmux_session=wi.tmux_session_name(self.wid))
+        wi.end_incarnation(self.ws, self.wid, b_run["incarnation_id"], "exited")
+        sw.pr.register_worker(self.ws, self.wid, "alpha", room="test-room", runtime="claude")
+        sw.spawn(self.ws, REPO, resume=self.a, socket=SOCK, runner=self.t)
+        self.t.live.clear()
+        other = wi.create_worker(self.ws, runtime="claude", cwd=str(self.b_dir))
+        self.other, self.other_session = other["worker_id"], other["runtime_session_id"]
+        sw.pr.register_worker(self.ws, self.other, "beta", runtime="claude")
+        import pool_router as router
+        self.router = router
+        (self.ws / "tasks").mkdir()
+        for task_id in ("task-pending", "task-accepted"):
+            rem.pd.payload_path(self.ws, task_id).write_text(
+                "source: test\nchannel_id: test-room\ntask: payload for " + task_id + "\n")
+            self.assertEqual(router.route(self.ws, {"id": task_id, "channel_id": "test-room"})
+                             ["delivered"], [self.wid])
+        rem.pd.accept(rem.pd.deliveries_dir(self.ws, self.wid) / "task-accepted.txt")
+
+    def snapshot(self, *, include_runs=False):
+        mutable = {wi.incarnations_path(self.ws, self.wid), wi.current_path(self.ws, self.wid)}
+        return {str(p.relative_to(self.ws)): p.read_bytes() for p in self.ws.rglob("*")
+                if p.is_file() and (include_runs or p not in mutable)}
+
+    def recover(self, *, reopened=False):
+        if reopened:
+            code = """
+import json, runpy, sys
+from unittest import mock
+m = runpy.run_path(sys.argv[1], run_name='recovery_fixture')
+rem, t = m['rem'], m['FakeTmux']()
+with mock.patch.object(rem.sw, 'ensure_remedy_timer', return_value={'installed': False}):
+    out = rem.recover(sys.argv[2], sys.argv[3], sys.argv[4], runner=t)
+keys = ('SUTANDO_CLAUDE_RESUME', 'SUTANDO_CLAUDE_WORKING_DIR', 'SUTANDO_TMUX_SOCKET',
+        'SUTANDO_WORKER_ID', 'SUTANDO_INSTANCE_ID', 'SUTANDO_TASKS_DIR')
+print(json.dumps({'out': out, 'launches': [{k: e.get(k) for k in keys}
+                                         for _, e in t.launches()]}))
+"""
+            cp = subprocess.run([sys.executable, "-c", code, __file__, str(self.ws),
+                                 str(REPO), self.wid], env=dict(os.environ),
+                                capture_output=True, text=True, timeout=20)
+            self.assertEqual(cp.returncode, 0, cp.stderr)
+            result = json.loads(cp.stdout)
+            self.assertEqual(len(result["launches"]), 1)
+            return result["out"], result["launches"][0]
+        before = len(self.t.launches())
+        out = rem.recover(self.ws, REPO, self.wid, runner=self.t)
+        self.assertEqual(len(self.t.launches()), before + 1)
+        return out, self.t.launches()[-1][1]
+
+    def assert_selected(self, out, env, sid, folder):
+        self.assertEqual(out["outcome"], rem.RECOVERED)
+        self.assertEqual(out["session_id"], sid)
+        for key, value in {"SUTANDO_CLAUDE_RESUME": sid,
+                           "SUTANDO_CLAUDE_WORKING_DIR": str(folder),
+                           "SUTANDO_TMUX_SOCKET": SOCK, "SUTANDO_WORKER_ID": self.wid,
+                           "SUTANDO_INSTANCE_ID": self.wid,
+                           "SUTANDO_TASKS_DIR": str(rem.pd.deliveries_dir(self.ws, self.wid))}.items():
+            self.assertEqual(env[key], value, key)
+
+    def test_latest_incarnation_selects_a_and_survives_reopening(self):
+        for reopened in (False, True):
+            with self.subTest(reopened=reopened):
+                self.t.live.clear()
+                before, runs = self.snapshot(), wi.incarnations(self.ws, self.wid)
+                with mock.patch.dict(os.environ, {"SUTANDO_TMUX_SOCKET": "/wrong/default.sock"}):
+                    out, env = self.recover(reopened=reopened)
+                self.assert_selected(out, env, self.a, self.a_dir)
+                self.assertEqual(self.snapshot(), before)
+                after = wi.incarnations(self.ws, self.wid)
+                self.assertEqual(len(after), len(runs) + 1)
+                self.assertEqual(after[:-2], runs[:-1])
+                self.assertEqual(after[-2], {**runs[-1], "ended_at": after[-2]["ended_at"],
+                                             "end_reason": "crashed"})
+                self.assertIsNotNone(after[-2]["ended_at"])
+                self.assertEqual(out["closed_runs"], [runs[-1]["incarnation_id"]])
+                self.assertEqual(after[-1]["session_id"], self.a)
+                self.assertIsNone(after[-1]["ended_at"])
+                self.assertEqual(wi.current(self.ws, self.wid), {
+                    "session_id": self.a, "incarnation_id": after[-1]["incarnation_id"]})
+                for task_id in ("task-pending", "task-accepted"):
+                    self.assertEqual(self.router.committed_recipient(self.ws, task_id), self.wid)
+                self.assertEqual([p.name for p in rem.pd.pending(self.ws, self.wid)],
+                                 ["task-pending.txt"])
+                self.assertEqual([p.name for p in rem.pd.accepted(self.ws, self.wid)],
+                                 ["task-accepted.accepted"])
+
+    def test_failed_recovery_retries_a_even_after_current_is_cleared(self):
+        before, runs = self.snapshot(), wi.incarnations(self.ws, self.wid)
+        self.t.launcher_fails = True
+        out, env = self.recover()
+        self.assertEqual(out["outcome"], rem.FAILED)
+        self.assertIn("not logged in", out["why"])
+        self.assertEqual(env["SUTANDO_CLAUDE_RESUME"], self.a)
+        self.assertEqual(env["SUTANDO_CLAUDE_WORKING_DIR"], str(self.a_dir))
+        failed = wi.incarnations(self.ws, self.wid)
+        self.assertEqual(len(failed), len(runs) + 1)
+        self.assertEqual(failed[-1]["session_id"], self.a)
+        self.assertEqual(failed[-1]["end_reason"], "crashed")
+        self.assertTrue(all(r["ended_at"] is not None for r in failed))
+        self.assertEqual(wi.current(self.ws, self.wid), {"session_id": None, "incarnation_id": None})
+        self.assertEqual(self.snapshot(), before)
+        out, env = self.recover(reopened=True)
+        self.assert_selected(out, env, self.a, self.a_dir)
+        self.assertEqual(out["closed_runs"], [])
+        retried = wi.incarnations(self.ws, self.wid)
+        self.assertEqual(retried[:-1], failed)
+        self.assertEqual(retried[-1]["session_id"], self.a)
+        self.assertIsNone(retried[-1]["ended_at"])
+        self.assertEqual(self.snapshot(), before)
+
+    def test_inconsistent_reference_refuses_without_mutation_or_launch(self):
+        path = wi.incarnations_path(self.ws, self.wid)
+        for missing in ("unrecorded-session", self.other_session):
+            with self.subTest(reference=missing):
+                runs = wi.incarnations(self.ws, self.wid)
+                runs[-1]["session_id"] = missing
+                path.write_text(json.dumps({"incarnations": runs}))
+                before, launches = self.snapshot(include_runs=True), len(self.t.launches())
+                out = rem.recover(self.ws, REPO, self.wid, runner=self.t)
+                self.assertEqual(out["outcome"], rem.NO_SESSION)
+                self.assertIn(missing, out["why"])
+                self.assertEqual(len(self.t.launches()), launches)
+                self.assertEqual(self.snapshot(include_runs=True), before)
+
+    def test_legacy_missing_or_empty_reference_uses_latest_lineage(self):
+        path = wi.incarnations_path(self.ws, self.wid)
+        for reference in (None, "", "absent"):
+            with self.subTest(reference=reference):
+                self.t.live.clear()
+                runs = wi.incarnations(self.ws, self.wid)
+                if reference == "absent":
+                    runs[-1].pop("session_id")
+                else:
+                    runs[-1]["session_id"] = reference
+                path.write_text(json.dumps({"incarnations": runs}))
+                out, env = self.recover()
+                self.assert_selected(out, env, self.b, self.b_dir)
+
+    def test_legacy_without_incarnations_uses_latest_lineage(self):
+        wi.incarnations_path(self.ws, self.wid).write_text(json.dumps({"incarnations": []}))
+        with mock.patch.dict(os.environ, {"SUTANDO_TMUX_SOCKET": SOCK}):
+            out, env = self.recover()
+        self.assert_selected(out, env, self.b, self.b_dir)
+
+    def test_selected_session_with_empty_folder_uses_repository(self):
+        rows = wi.sessions(self.ws, self.wid)
+        rows[0]["transcript"]["cwd"] = ""
+        wi.sessions_path(self.ws, self.wid).write_text(json.dumps({"sessions": rows}))
+        out, env = self.recover()
+        self.assert_selected(out, env, self.a, REPO)
+
+    def test_pause_and_suspension_preserve_the_multi_session_worker(self):
+        pause = wi.worker_dir(self.ws, self.wid) / sup.PAUSED_MARKER
+        pause.touch()
+        before, launches = self.snapshot(include_runs=True), len(self.t.launches())
+        out = rem.recover(self.ws, REPO, self.wid, runner=self.t)
+        self.assertEqual(out["outcome"], rem.PAUSED)
+        self.assertEqual(self.snapshot(include_runs=True), before)
+        pause.unlink()
+        rem.suspend(self.ws, "test suspension")
+        with rem.pool_lock(self.ws):
+            pass
+        before = self.snapshot(include_runs=True)
+        out = rem.restart(self.ws, REPO, self.wid, runner=self.t)
+        self.assertEqual(out["result"], rem.SUSPENDED)
+        self.assertEqual(self.snapshot(include_runs=True), before)
+        self.assertEqual(len(self.t.launches()), launches)
+
+
 class CodexRecovery(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
