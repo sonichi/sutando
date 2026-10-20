@@ -47,7 +47,8 @@ class _WorkerState:
     state: str = "pending"  # pending | running | backoff | stopped
     stop: threading.Event = field(default_factory=threading.Event)
     stop_at: float = 0.0  # when this one worker was told to stop (sync); 0 until then
-    after: Optional["_WorkerState"] = None  # the one it replaces: never two processes for one name
+    # every older process for this name still alive: never two processes for one name
+    after: List["_WorkerState"] = field(default_factory=list)
 
 
 def _running(ws: _WorkerState) -> bool:
@@ -130,16 +131,18 @@ class Supervisor:
         """Make the supervised set equal `specs`: a new name is started, a name
         no longer listed is stopped (SIGTERM, SIGKILL past the grace) and stays
         owned until it has exited, a name whose spec changed is both: its
-        replacement starts once the old process has exited. Returns (added
-        names, removed names); a changed name is in both."""
+        replacement starts once every older process for the name has exited (a
+        replacement that never started is dropped). Returns (added names,
+        removed names); a changed name is in both."""
         want = {s.name: s for s in specs}
         with self._lock:
             removed = [self._workers.pop(n) for n in list(self._workers)
                        if n not in want or self._workers[n].spec != want[n]]
-            gone = {ws.spec.name: ws for ws in removed}
-            added = [self._workers.setdefault(n, _WorkerState(spec=s, after=gone.get(n)))
+            added = [self._workers.setdefault(n, _WorkerState(spec=s))
                      for n, s in want.items() if n not in self._workers]
             self._draining = [ws for ws in self._draining + removed if _running(ws)]
+            for ws in added:
+                ws.after = [d for d in self._draining if d.spec.name == ws.spec.name]
             for ws in removed:
                 ws.stop.set()
                 ws.stop_at = self._clock()
@@ -150,8 +153,9 @@ class Supervisor:
                         pass
         for ws in removed:
             _log(f"worker {ws.spec.name}: {'changed — restarting' if ws.spec.name in want else 'removed — stopping'}")
+        changed = {ws.spec.name for ws in removed}
         for ws in added:
-            if ws.after is None:
+            if ws.spec.name not in changed:
                 _log(f"worker {ws.spec.name}: added")
             if not self._stop.is_set():
                 self._start_thread(ws)
@@ -179,7 +183,7 @@ class Supervisor:
     def _run_worker(self, ws: _WorkerState) -> None:
         name = ws.spec.name
         backoff = self._backoff_initial
-        while ws.after is not None and _running(ws.after) and not ws.stop.wait(0.05):
+        while any(_running(old) for old in ws.after) and not ws.stop.wait(0.05):
             pass
         while not ws.stop.is_set():
             spawn_err = None

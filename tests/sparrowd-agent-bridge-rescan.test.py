@@ -110,7 +110,7 @@ class Reconcile(unittest.TestCase):
     def test_a_replacement_stopped_while_it_waits_never_spawns(self):
         sup = Supervisor([WorkerSpec("w", SLEEPER)])
         ws = sup._workers["w"]
-        ws.after = types.SimpleNamespace(proc=types.SimpleNamespace(poll=lambda: None))  # never exits
+        ws.after = [types.SimpleNamespace(proc=types.SimpleNamespace(poll=lambda: None))]  # never exits
 
         def stop():  # a loop that spawned anyway is ended too, so a regression fails instead of hanging
             ws.stop.set()
@@ -311,6 +311,64 @@ class Reconcile(unittest.TestCase):
             time.sleep(0.3)
             self.assertEqual(hb.stat().st_size, size, f"removed={removed}: still writing after shutdown")
             self.assertIn("SIGKILL", log)
+
+    def test_two_quick_edits_never_run_two_processes_for_one_agent_under_run(self):
+        """The reviewed case: A ignores SIGTERM, an edit makes B, a second edit makes C before A has
+        exited. B never starts, C starts only once A is gone, and no sample sees two live processes."""
+        td = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, td, ignore_errors=True)
+        live = td / "live"
+        live.mkdir()
+        code = ("import os, signal, sys, time\nlive, label = sys.argv[1], sys.argv[2]\n"
+                "if label == 'A':\n signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                "a = os.path.join(live, 'A')\nwas = 'n/a'\n"
+                "if label != 'A' and os.path.exists(a):\n"
+                " try:\n  os.kill(int(open(a).read()), 0); was = 'alive'\n except OSError:\n  was = 'dead'\n"
+                "open(os.path.join(live, label + '.A'), 'w').write(was)\n"
+                "open(os.path.join(live, label), 'w').write(str(os.getpid()))\n"
+                "while True: time.sleep(0.05)")
+
+        def spec(label):
+            return WorkerSpec("agent", [sys.executable, "-c", code, str(live), label], revision=label)
+        passes = [[spec("B")], [spec("C")]]
+        calls, samples, peak = [], [], [0]
+        sock = td / "sparrowd.sock"
+
+        def rescan():
+            calls.append(1)
+            return passes.pop(0) if passes else [spec("C")]
+
+        def pids():
+            out = []
+            for f in live.iterdir():
+                if f.suffix != ".A" and f.read_text():
+                    out.append(int(f.read_text()))
+            return out
+
+        def sample_then_stop():
+            wait_for(lambda: (live / "A").exists(), 5)
+            deadline = time.monotonic() + 8
+            while time.monotonic() < deadline and not ((live / "C").exists() and len(calls) >= 6):
+                n = sum(alive(p) for p in pids())
+                samples.append(n)
+                peak[0] = max(peak[0], n)
+                time.sleep(0.01)
+            c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            c.connect(str(sock))
+            c.sendall(b'{"op": "stop"}\n')
+            c.makefile("r").readline()
+            c.close()
+        th = threading.Thread(target=sample_then_stop, daemon=True)
+        th.start()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = run([spec("A")], td, rescan=rescan, rescan_s=0.15, grace_s=1.2)
+        th.join(5)
+        self.assertEqual(rc, 0)
+        self.assertGreater(len(samples), 20)
+        self.assertLessEqual(peak[0], 1, "never two live processes for one agent at any sample")
+        self.assertFalse((live / "B").exists(), "the superseded replacement never started: dropped")
+        self.assertEqual((live / "C.A").read_text(), "dead", "C started only after A had exited")
 
     def test_a_held_lock_is_waited_for_with_one_line_not_exited(self):
         """Relaunched by the wrapper, an instance that exited on a held lock logged a line every
