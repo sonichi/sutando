@@ -23,7 +23,7 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
                                claimAs?: Record<string, unknown>; interruptParks?: number; interruptThrows?: number;
                                interruptSoft?: Record<string, string | number>; stuckAtStart?: Record<string, unknown>;
                                unstuckFails?: number; clearFails?: Record<string, string>; stuckWriteFails?: number;
-                               lockFailsOnce?: string[]; storeFailsOnce?: string[] } = {}) {
+                               lockFailsOnce?: string[]; storeFailsOnce?: string[]; unreadableOnce?: string[] } = {}) {
   const files: Record<string, string> = {}
   const submitted: string[] = []
   const runs: string[][] = []
@@ -46,6 +46,7 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
   let stuckWriteFailsLeft = opts.stuckWriteFails ?? 0
   const lockFails = new Set(opts.lockFailsOnce ?? [])
   const storeFails = new Set(opts.storeFailsOnce ?? [])
+  const unreadable = new Set(opts.unreadableOnce ?? [])
   const clearFailsLeft: Record<string, string> = { ...(opts.clearFails ?? {}) }
   let sidReads = 0
   const interruptAt: number[] = []
@@ -99,6 +100,7 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
     const task = argv[3]
     // As the CLI's claims-step boundary: an EIO before the step commits is a retry, nothing changed.
     if (lockFails.delete(verb)) return out(1, { refused: 'the step did not commit ([Errno 5] claims lock I/O error); retried', retry: true })
+    if (unreadable.delete(verb)) return out(1, { refused: 'the step did not commit (ClaimUnreadable: torn claim.json); retried', retry: true })
     if (storeFails.delete(verb)) return out(1, { refused: 'the step did not commit (refusing to serve: cannot write claim.json ([Errno 28] No space left on device)); retried', retry: true })
     if (verb === 'progress') {
       if (progressFailLeft-- > 0) return out(3, { error: 'progress write failed: disk', hard: true })
@@ -862,6 +864,21 @@ test('a transient store failure (StateIOError) at confirm keeps the offer and it
   expect((h.claims['task-sf'] as any).turnId).toBe('t-sf')
   await $.tool.call({ tool: REPLY, task_id: 'task-sf', text: 'kept its turn' })
   expect(h.files['/out/task-sf.txt']).toBe('kept its turn\n')
+  expect(h.submitted.length).toBe(1)
+})
+
+test('an unreadable claim at claim and at confirm resolved nothing: the task is kept and answered once', async ($, on) => {
+  const h = host(on, { unreadableOnce: ['claim', 'confirm'] })
+  h.files['/in/task-ur.txt'] = TASK('task-ur')
+  await arm($, h)
+  await h.clock.advance(3000)
+  expect(h.submitted.length).toBe(1)
+  await $.turn.start({ text: h.submitted[0], turnId: 't-ur' })
+  expect(h.claims['task-ur'].phase).toBe('CALLING')
+  await h.clock.advance(1000)
+  expect((h.claims['task-ur'] as any).turnId).toBe('t-ur')
+  await $.tool.call({ tool: REPLY, task_id: 'task-ur', text: 'read back' })
+  expect(h.files['/out/task-ur.txt']).toBe('read back\n')
   expect(h.submitted.length).toBe(1)
 })
 

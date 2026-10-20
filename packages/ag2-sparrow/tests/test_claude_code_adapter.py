@@ -2785,8 +2785,19 @@ class InboxCli(ConnectBase):
                 rc, out = self.verb("confirm", t, "turn-1", token, "--text-hash", "h1")
             self.assertEqual((rc, out.get("retry")), (1, True), (error, out))
             self.assertEqual(lc.claims.load(t)["phase"], inbox.lifecycle.CALLING, "the claim is as it was")
+        with mock.patch.object(inbox.lifecycle.Lifecycle, "confirm_turn",
+                               side_effect=inbox.lifecycle.ClaimUnreadable("torn claim.json")):
+            rc, out = self.verb("confirm", t, "turn-1", token, "--text-hash", "h1")
+        self.assertEqual((rc, out.get("retry")), (1, True), "an unreadable claim resolved nothing: a retry")
+        self.assertEqual(lc.claims.load(t)["phase"], inbox.lifecycle.CALLING)
         rc, out = self.verb("confirm", t, "turn-1", token, "--text-hash", "h1")
         self.assertEqual((rc, out["turn_id"]), (0, "turn-1"), "the reconfirm keeps its turn")
+        u = self.task("task-unreadable")
+        with mock.patch.object(inbox.lifecycle.Lifecycle, "decide", side_effect=inbox.lifecycle.ClaimUnreadable("torn")):
+            rc, out = self.verb("claim", u)
+        self.assertEqual((rc, out.get("retry")), (1, True), "at claim too")
+        self.assertIsNone(lc.claims.load(u), "unchanged")
+        self.assertEqual(self.verb("claim", u)[0], 0, "the healthy retry claims it")
         rc, out = self.verb("confirm", t, "turn-2", "bad", "--text-hash", "h1")
         self.assertEqual((rc, "retry" in out), (1, False), "TurnRefused stays final")
         rc, out = self.verb("claim", self.task("task-guest", "guest"))

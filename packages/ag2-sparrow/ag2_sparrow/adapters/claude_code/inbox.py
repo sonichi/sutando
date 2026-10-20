@@ -130,8 +130,9 @@ def admit(root, task_id, allow: bool) -> "tuple[str | None, dict, str]":
     return kind, headers, why
 
 
-# The lifecycle's answers about the claim itself: final, whatever raised them.
-DECISIONS = (Refused, lifecycle.TurnRefused, lifecycle.ClaimUnreadable, lifecycle.AttemptInProgress)
+# The lifecycle's answers about the claim itself: final, whatever raised them. An unreadable claim is not
+# one: it resolved nothing, so it retries like any other failure.
+DECISIONS = (Refused, lifecycle.TurnRefused, lifecycle.AttemptInProgress)
 
 
 @contextmanager
