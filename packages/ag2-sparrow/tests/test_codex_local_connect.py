@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import fcntl
 import io
 import json
 import os
@@ -24,6 +25,8 @@ from pathlib import Path
 from unittest import mock
 
 PKG = Path(__file__).resolve().parents[1]
+sys.path.append(str(Path(__file__).resolve().parents[3] / "tests"))
+from _helpers.subprocess_coverage import covered_code  # noqa: E402
 sys.path.insert(0, str(PKG))
 from ag2_sparrow import connect_common as cm, holder_lock, task_io  # noqa: E402
 from ag2_sparrow.adapters.codex import codex_connector as cc, connect_cli as cli  # noqa: E402
@@ -38,17 +41,20 @@ def read(name, default):
         return open(os.path.join(home, name)).read().strip()
     except OSError:
         return default
+def record(name, obj):
+    path = os.path.join(home, name)
+    with open(path + ".tmp", "w") as f:
+        json.dump(obj, f)
+    os.replace(path + ".tmp", path)    # a poller never reads a torn file
 if sys.argv[1:] == ["--version"]:
     print(read("codex-version-banner", "") or "codex-cli " + read("codex-version", "0.160.1"))
     sys.exit(int(read("codex-version-rc", "0")))
 if sys.argv[1:3] == ["login", "status"]:
-    with open(os.path.join(home, "codex-login.json"), "w") as f:
-        json.dump({"env": dict(os.environ)}, f)
+    record("codex-login.json", {"env": dict(os.environ)})
     print("Logged in using ChatGPT" if read("codex-login-rc", "0") == "0" else "Not logged in")
     sys.exit(int(read("codex-login-rc", "0")))
 if sys.argv[1:3] == ["app-server", "--listen"]:
-    with open(os.path.join(home, "codex-server.json"), "w") as f:
-        json.dump({"argv": sys.argv, "env": dict(os.environ), "pid": os.getpid()}, f)
+    record("codex-server.json", {"argv": sys.argv, "env": dict(os.environ), "pid": os.getpid()})
     os.execv(%(py)r, [%(py)r, %(stub)r])
 sys.exit(3)
 '''
@@ -65,26 +71,32 @@ def write_fake_codex(path, py=sys.executable):
 
 def bounded(fn, seconds=10.0):
     """`fn()` on a thread, its value, or an AssertionError once `seconds` pass: a wait that never ends fails."""
-    box = {}
-
-    def target():
-        try:
-            box["value"] = fn()
-        except BaseException as e:   # surfaced on the test thread
-            box["error"] = e
-    t = threading.Thread(target=target, daemon=True)
+    box = []
+    t = threading.Thread(target=lambda: box.append(fn()), daemon=True)
     t.start()
     t.join(seconds)
-    if t.is_alive():
-        raise AssertionError("still running after %.0f s" % seconds)
-    if "error" in box:
-        raise box["error"]
-    return box["value"]
+    assert not t.is_alive(), "still running after %.0f s" % seconds
+    return box[0]
+
+
+def wait_for(pred, seconds=10.0):
+    """True once `pred()` holds within `seconds`, polled; else False."""
+    deadline = time.monotonic() + seconds
+    while not pred():
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
+    return True
 TOKEN = "tok-FAKE-RELAY-TOKEN-never-copied"
 FORBIDDEN_ARGS = ("--once", "--idle-exit", "--push", "--thread-id", "--ephemeral", "--developer-instructions",
                   "stub", "proxy", "--list-models", "--list-loaded")
 STAND_IN = ("import sys; sys.path.insert(0, %r); from ag2_sparrow import task_io\n"
             "o = task_io.acquire_lock(%r, %r); print('held', flush=True); sys.stdin.read(); task_io.release_lock(o)")
+OP_HOLDER = ("import sys; sys.path.insert(0, %r); from ag2_sparrow import connect_common as cm\n"
+             "from ag2_sparrow.adapters.codex.connect_cli import LOCAL\n"
+             "with cm.operation_lock(LOCAL): print('held', flush=True); sys.stdin.read()")
+TASK = ("id: %s\ntimestamp: 2026-10-16T00:00:00Z\nsource: chat\nchannel_id: local-chat\naccess_tier: owner\n"
+        "priority: normal\ntask: %s\n")
 NOT_LOADED = (113, "", 'Could not find service "ai.ag2.sparrow.codex-local" in domain for uid: 501\n')
 START_VERBS = ("restart", "bootstrap", "kickstart")
 STOP_VERBS = ("stop", "bootout")
@@ -282,7 +294,7 @@ class Install(Base):
         self.assertIn("NOTE sandbox: workspace-write", out)
         cfg = cm.read_config(cli.config_path())
         self.assertEqual((cfg["SANDBOX"], cfg["ALLOW_NON_OWNER"], cfg["MODEL"]), ("workspace-write", "1", "m1"))
-        self.assertEqual(cli.connector_argv(cfg, str(self.work))[-5:],
+        self.assertEqual(cli.connector_argv(cfg, str(self.work), 7)[-5:],
                          ["--sandbox", "workspace-write", "--allow-non-owner", "--model", "m1"])
         with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
             cli.main(["install", "--work", str(self.work), "--sandbox", "danger-full-access"])
@@ -299,6 +311,12 @@ class Install(Base):
         (self.home / "codex-version-banner").unlink()
         (self.home / "codex-version-rc").write_text("1")
         self.assertIn("did not answer", cli.version_problem(str(self.codex)))
+
+    def test_a_root_with_a_line_break_is_refused_before_anything_is_written(self):
+        rc, _, err = self.main("install", "--work", str(self.home / "a\nb"))
+        self.assertEqual(rc, 2)
+        self.assertIn("contains a line break", err)
+        self.assertFalse(cli.config_path().exists())
 
     def test_an_unowned_config_is_a_final_refusal(self):
         cfg = cli.config_path()
@@ -327,6 +345,14 @@ class Install(Base):
         self.assertIn("did not acquire", err)
         self.assertEqual(cm.read_config(cli.config_path())["SANDBOX"], "read-only", "the files as written; the retry is the same install")
 
+    def test_a_debug_holder_that_won_the_root_is_never_taken_for_the_managed_launcher(self):
+        """The manager's start lost to a hand launcher (same adapter family, same install): install fails."""
+        runner = self.runner(adapter="codex-local.debug")
+        rc, _, err = self.install_with(runner)
+        self.assertEqual(rc, 1)
+        self.assertIn("did not acquire", err)
+        self.assertIn(f"held by launcher pid {runner.pid()}", err)
+
     def test_a_root_held_by_a_session_no_job_manages_is_refused(self):
         self.work.mkdir()
         holder = hold(self.work, "other-adapter")
@@ -346,7 +372,7 @@ class Run(Base):
         seen = {}
 
         def popen(argv, **kw):
-            seen.update(argv=argv, env=kw["env"], cwd=kw["cwd"], stdin=kw["stdin"])
+            seen.update(argv=argv, env=kw["env"], cwd=kw["cwd"], stdin=kw["stdin"], pass_fds=kw["pass_fds"])
             # A real child: the attach checks its ppid and start time.
             return subprocess.Popen([sys.executable, "-c", "import time, sys; time.sleep(0.4); sys.exit(%d)" % rc],
                                     stdin=subprocess.DEVNULL)
@@ -360,8 +386,9 @@ class Run(Base):
         code, seen, err = self.run_with()
         self.assertEqual(code, 0, err)
         self.assertEqual(seen["argv"], [sys.executable, "-m", "ag2_sparrow.adapters.codex.codex_connector", "--work",
-                                        str(self.work), "--held", "--codex", str(self.codex), "--server", "stdio",
-                                        "--sandbox", "read-only"])
+                                        str(self.work), "--held", "--root-fd", str(seen["pass_fds"][0]), "--codex",
+                                        str(self.codex), "--server", "stdio", "--sandbox", "read-only"])
+        self.assertEqual(len(seen["pass_fds"]), 1, "the held root's descriptor, and only it, reaches the connector")
         for arg in FORBIDDEN_ARGS:
             self.assertNotIn(arg, seen["argv"], arg)
         env = seen["env"]
@@ -397,6 +424,38 @@ class Run(Base):
             self.assertIn(f"{cm.MANAGED_VAR}=1", err)
             self.assertIn("debug-run", err)
             self.assertEqual(self.run_with(debug=True)[0], 0, "debug-run skips the gate only")
+
+    def test_debug_run_waits_for_the_operation_lock_then_refuses_without_touching_the_root(self):
+        self.configure()
+        holder = subprocess.Popen([sys.executable, "-c", OP_HOLDER % str(PKG)], stdin=subprocess.PIPE,
+                                  stdout=subprocess.PIPE, text=True)
+        try:
+            self.assertEqual(holder.stdout.readline().strip(), "held")
+            code, seen, err = self.run_with(debug=True)
+        finally:
+            unhold(holder)
+        self.assertEqual((code, seen), (2, {}))
+        self.assertIn("another ag2-sparrow-codex-local operation is in progress", err)
+        self.assertEqual(task_io.lock_held(str(self.work)), "free")
+
+    def test_debug_run_holds_under_the_debug_label_and_frees_the_operation_lock_once_acquired(self):
+        self.configure()
+        seen = {}
+
+        def during(child, pidfd, state):
+            seen["adapter"] = task_io.lock_holder(str(self.work)).get("adapter")
+            fd = os.open(cm.oplock_path(cli.LOCAL), os.O_RDWR | os.O_CREAT, 0o600)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                seen["oplock_free"] = True
+            except BlockingIOError:
+                seen["oplock_free"] = False
+            finally:
+                os.close(fd)
+            return child.wait()
+        with mock.patch.object(cm, "_run_until_end", side_effect=during):
+            self.assertEqual(self.run_with(debug=True)[0], 0)
+        self.assertEqual(seen, {"adapter": "codex-local.debug", "oplock_free": True})
 
     def test_run_refuses_an_old_codex_and_a_broken_config(self):
         rc, _, err = self.main("run")
@@ -446,9 +505,6 @@ class Run(Base):
             def __init__(self, rc):
                 self.rc = rc
 
-            def poll(self):
-                return self.rc
-
             def wait(self):
                 return self.rc
         for rc, expect in ((75, 0), (0, 1), (-15, 1), (2, 2), (1, 1)):
@@ -459,6 +515,35 @@ class Run(Base):
             cli.run(argparse.Namespace(debug=False, launchd=True), popen=lambda argv: seen.append(argv) or Child(75))
         self.assertEqual(seen[-1][:2], [sys.executable, "-c"])
         self.assertIn("from ag2_sparrow.adapters.codex.connect_cli import main", seen[-1][2])
+
+    def test_a_held_root_the_connector_cannot_be_pointed_at_is_refused(self):
+        """The prepare step may raise the lock's own refusal (a replaced root): its line and code, nothing spawned."""
+        self.configure()
+        for code, expect in ((2, 2), (3, 75)):
+            with mock.patch.object(task_io, "root_path", side_effect=task_io.LockRefused(code, "refusing to start: gone")):
+                rc, seen, err = self.run_with()
+            self.assertEqual((rc, seen, err), (expect, {}, "refusing to start: gone\n"))
+        self.assertEqual(task_io.lock_held(str(self.work)), "free")
+
+    def test_the_shared_reap_tolerates_a_child_that_cannot_be_killed_or_waited(self):
+        calls = []
+
+        class Stuck:
+            def kill(self):
+                calls.append("kill")
+                raise OSError("gone")
+
+            def wait(self, timeout=None):
+                calls.append("wait")
+                raise subprocess.TimeoutExpired("x", timeout)
+        self.assertIsNone(cm.kill_and_reap(Stuck()))
+        self.assertEqual(calls, ["kill", "wait"])
+
+    def test_an_unobserved_root_never_reads_free(self):
+        self.configure()
+        with mock.patch.object(task_io, "occupancy", return_value="unobserved"):
+            line = cli.occupancy_line(str(self.work))
+        self.assertTrue(line.startswith("unobserved (the root's holder or consumer cannot be verified; manager "), line)
 
     def test_a_connector_the_attach_cannot_name_is_reaped(self):
         self.configure()
@@ -472,38 +557,71 @@ class Run(Base):
 class HeldConnector(Base):
     """The connector's --held: no lock of its own, a start only once a holder attached it."""
 
-    def test_held_without_a_holder_is_refused_and_takes_no_lock(self):
+    HOLDER = ("import sys, subprocess; sys.path.insert(0, %r); from ag2_sparrow import task_io\n"
+              "o = task_io.acquire_lock(%r, 'codex-local')\n"
+              "c = subprocess.Popen([sys.executable, '-c', %r, str(o.root_fd)], pass_fds=(o.root_fd,))\n"
+              "task_io.attach_consumer(o, task_io.holder_record_bytes(o), c.pid, task_io.start_time(c.pid))\n"
+              "print('rc', c.wait(), flush=True); task_io.release_lock(o)")
+    CONNECTOR = ("import sys; sys.path.insert(0, %r); from ag2_sparrow.adapters.codex import codex_connector as cc\n"
+                 "sys.exit(cc.main(['--work', %r, '--held', '--root-fd', sys.argv[1], '--server', 'stub', '--idle-exit', '0.3']))")
+
+    def root_fd(self):
+        """The work root's descriptor for an in-process --held, the test's cwd restored afterwards."""
+        self.work.mkdir(exist_ok=True)
+        for d in cli.WORK_DIRS:
+            (self.work / d).mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(self.work), os.O_RDONLY | os.O_DIRECTORY)
+        self.addCleanup(os.close, fd)
+        self.addCleanup(os.chdir, os.getcwd())
+        return str(fd)
+
+    def test_held_needs_the_root_descriptor(self):
+        with self.assertRaises(SystemExit) as cm_, contextlib.redirect_stderr(io.StringIO()):
+            cc.main(["--work", str(self.work), "--held", "--server", "stub"])
+        self.assertEqual(cm_.exception.code, 2)
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            rc = cc.main(["--work", str(self.work), "--held", "--root-fd", "999", "--server", "stub"])
+        self.assertEqual((rc, "--root-fd 999 is not the held root's directory" in err.getvalue()), (2, True), err.getvalue())
+
+    def test_held_under_the_holder_that_attached_it_serves_on_the_stub_server(self):
+        """The happy path as real processes: the holder attaches its child, the child serves without a lock of its own."""
         self.work.mkdir()
         for d in cli.WORK_DIRS:
             (self.work / d).mkdir(parents=True, exist_ok=True)
+        connector = covered_code(self.CONNECTOR % (str(PKG), str(self.work)))
+        holder = subprocess.run([sys.executable, "-c", covered_code(self.HOLDER % (str(PKG), str(self.work), connector))],
+                                capture_output=True, text=True, timeout=60)
+        self.assertEqual((holder.returncode, holder.stdout), (0, "rc 0\n"), holder.stderr)
+        self.assertTrue((self.work / "state" / "app-server-stub.stderr").exists(), "the stub app-server was started")
+        self.assertEqual(task_io.lock_held(str(self.work)), "free")
+
+    def test_held_without_a_holder_is_refused_and_takes_no_lock(self):
+        fd = self.root_fd()
         err = io.StringIO()
         with mock.patch.object(cc, "HELD_WAIT_S", 0.3), contextlib.redirect_stderr(err):
-            rc = bounded(lambda: cc.main(["--work", str(self.work), "--held", "--server", "stub"]))
+            rc = bounded(lambda: cc.main(["--work", str(self.work), "--held", "--root-fd", fd, "--server", "stub"]))
         self.assertEqual(rc, 2)
         self.assertIn("no holder of %s attached this process" % self.work, err.getvalue())
         self.assertEqual(task_io.lock_held(str(self.work)), "free")
 
     def test_held_whose_record_names_this_pid_without_verified_liveness_is_refused(self):
         """A stale record (a reused pid, live False) or an unreadable lineage (live None) serves nothing."""
-        self.work.mkdir()
-        for d in cli.WORK_DIRS:
-            (self.work / d).mkdir(parents=True, exist_ok=True)
+        fd = self.root_fd()
         mine = task_io.start_time(os.getpid())
         for record, word in (({"start": mine, "live": False}, "liveness false"), ({"start": mine, "live": None}, "liveness unknown"),
                              ({"start": "bogus", "live": True}, "a start time that is not this process's")):
             err = io.StringIO()
             with mock.patch.object(cc, "holder_consumer", return_value=dict(record, pid=os.getpid())), \
                     mock.patch.object(cc, "HELD_WAIT_S", 0.3), contextlib.redirect_stderr(err):
-                rc = bounded(lambda: cc.main(["--work", str(self.work), "--held", "--server", "stub", "--idle-exit", "0.2"]))
+                rc = bounded(lambda: cc.main(["--work", str(self.work), "--held", "--root-fd", fd, "--server", "stub",
+                                              "--idle-exit", "0.2"]))
             self.assertEqual(rc, 2, (record, err.getvalue()))
             self.assertIn("names this pid with %s, not verified" % word, err.getvalue())
             self.assertFalse((self.work / "state" / "app-server-stub.stderr").exists(), "no app-server was started")
         self.assertEqual(task_io.lock_held(str(self.work)), "free")
 
     def test_held_under_a_holder_that_attached_another_process_is_refused(self):
-        self.work.mkdir()
-        for d in cli.WORK_DIRS:
-            (self.work / d).mkdir(parents=True, exist_ok=True)
+        fd = self.root_fd()
         holder = subprocess.Popen([sys.executable, "-c", (
             "import sys, subprocess; sys.path.insert(0, %r); from ag2_sparrow import task_io\n"
             "o = task_io.acquire_lock(%r, 'codex-local'); c = subprocess.Popen(['sleep', '300'])\n"
@@ -513,7 +631,7 @@ class HeldConnector(Base):
         try:
             self.assertEqual(holder.stdout.readline().strip(), "held")
             with mock.patch.object(cc, "HELD_WAIT_S", 0.3), contextlib.redirect_stderr(io.StringIO()):
-                rc = bounded(lambda: cc.main(["--work", str(self.work), "--held", "--server", "stub"]))
+                rc = bounded(lambda: cc.main(["--work", str(self.work), "--held", "--root-fd", fd, "--server", "stub"]))
         finally:
             holder.stdin.close()
             holder.wait(timeout=30)
@@ -526,15 +644,19 @@ class LauncherProcess(Base):
 
     def launcher(self):
         env = dict(os.environ, PYTHONPATH=str(PKG))
-        proc = subprocess.Popen([sys.executable, "-c", "import sys; from ag2_sparrow.adapters.codex import connect_cli\n"
-                                 "sys.exit(connect_cli.main(['run']))"], env=env, stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE, text=True)
-        for _ in range(400):
-            if self.server():
-                break
-            time.sleep(0.05)
-        self.assertIsNotNone(self.server(), "the connector started its app-server through the fake codex")
+        proc = subprocess.Popen([sys.executable, "-c", covered_code("import sys; from ag2_sparrow.adapters.codex import connect_cli\n"
+                                                                    "sys.exit(connect_cli.main(['run']))")], env=env,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.addCleanup(self.end, proc)
+        self.assertTrue(wait_for(self.server, 20), "the connector started its app-server through the fake codex")
         return proc
+
+    @staticmethod
+    def end(proc):
+        """Whatever the test decided: the launcher ended and its pipes closed, so nothing leaks into the next test."""
+        if proc.poll() is None:
+            proc.kill()
+        proc.communicate(timeout=30)
 
     def test_the_app_server_comes_from_the_configured_executable_not_a_codex_earlier_on_path(self):
         """The executable the version check passed is the one that runs: a `codex` earlier on PATH is not."""
@@ -548,23 +670,45 @@ class LauncherProcess(Base):
         self.configure(CODEX=str(selected))
         with mock.patch.dict(os.environ, {"PATH": f"{shadow}:{self.bin}:/usr/bin:/bin"}):
             launcher = self.launcher()
+        self.assertEqual(self.server()["argv"][0], str(selected) + ".py", "the wrapper's body: the selected executable ran")
+        self.assertFalse((self.home / "codex-shadow.json").exists(), "the shadowing codex never ran")
+        os.kill(launcher.pid, signal.SIGTERM)
+        launcher.communicate(timeout=60)
+        self.assertEqual(launcher.returncode, 143)
+
+    def test_a_root_renamed_and_replaced_after_startup_is_served_by_inode_and_the_replacement_untouched(self):
+        """The connector lives in the held inode: after the pathname is renamed and recreated, and the
+        replacement held by another process, the moved root still gets its results and the replacement
+        never loses a task to this connector."""
+        self.configure()
+        launcher = self.launcher()
+        self.assertTrue(wait_for(lambda: (task_io.holder_consumer(str(self.work)) or {}).get("live")), "the connector attached")
+        moved = self.home / "work.moved"
+        os.rename(self.work, moved)
+        for d in cli.WORK_DIRS:
+            (self.work / d).mkdir(parents=True)
+        replacement = hold(self.work, "other-adapter")
         try:
-            self.assertEqual(self.server()["argv"][0], str(selected) + ".py", "the wrapper's body: the selected executable ran")
-            self.assertFalse((self.home / "codex-shadow.json").exists(), "the shadowing codex never ran")
+            (moved / "tasks" / "task-a.txt").write_text(TASK % ("task-a", "say hi"))
+            self.assertTrue(wait_for(lambda: (moved / "results" / "task-a.txt").exists(), 30), "the moved root is still served")
+            (self.work / "tasks" / "task-b.txt").write_text(TASK % ("task-b", "say hi"))
+            self.assertFalse(wait_for(lambda: (self.work / "results" / "task-b.txt").exists(), 2.0),
+                             "the replacement root is another holder's")
+            self.assertTrue((self.work / "tasks" / "task-b.txt").exists())
+            self.assertEqual(sorted(os.listdir(self.work / "state")), ["threads"], "nothing of this connector's state landed there")
+            self.assertTrue((moved / "state" / "app-server-stdio.stderr").exists())
         finally:
-            os.kill(launcher.pid, signal.SIGTERM)
-            launcher.communicate(timeout=60)
+            unhold(replacement)
+        os.kill(launcher.pid, signal.SIGTERM)
+        launcher.communicate(timeout=60)
+        self.assertEqual(launcher.returncode, 143)
+        self.assertEqual(task_io.lock_held(str(moved)), "free")
 
     def test_sigterm_reaps_the_connector_and_frees_the_work_root(self):
         self.configure()
         launcher = self.launcher()
-        consumer = None
-        for _ in range(100):
-            consumer = task_io.holder_consumer(str(self.work))
-            if consumer and consumer.get("live"):
-                break
-            time.sleep(0.05)
-        rec = task_io.lock_holder(str(self.work))
+        self.assertTrue(wait_for(lambda: (task_io.holder_consumer(str(self.work)) or {}).get("live")), "the connector attached")
+        consumer, rec = task_io.holder_consumer(str(self.work)), task_io.lock_holder(str(self.work))
         self.assertEqual((rec.get("adapter"), rec.get("owner_pid")), ("codex-local", launcher.pid),
                          "the launcher, not the connector, holds the lock")
         self.assertTrue(consumer and consumer.get("live") and consumer["pid"] != launcher.pid,
@@ -577,17 +721,9 @@ class LauncherProcess(Base):
         os.kill(launcher.pid, signal.SIGTERM)
         _, err = launcher.communicate(timeout=60)
         self.assertEqual(launcher.returncode, 143, err)
-        for _ in range(100):
-            if task_io.lock_held(str(self.work)) == "free":
-                break
-            time.sleep(0.05)
-        self.assertEqual(task_io.lock_held(str(self.work)), "free")
+        self.assertTrue(wait_for(lambda: task_io.lock_held(str(self.work)) == "free"), "released with the launcher")
         self.assertIsInstance(holder_lock.read_holder(str(self.work)), holder_lock.Missing, "no stale record")
-        for _ in range(100):
-            if not task_io.pid_alive(connector_pid):
-                break
-            time.sleep(0.05)
-        self.assertFalse(task_io.pid_alive(connector_pid), "the connector is still alive")
+        self.assertTrue(wait_for(lambda: not task_io.pid_alive(connector_pid)), "the connector is still alive")
 
 
 class VerifyUninstall(Base):
@@ -604,6 +740,9 @@ class VerifyUninstall(Base):
         self.assertIn(f"INFO job: {L.service_name} active", out)
         self.assertIn(f"INFO session: {self.work} held by launcher pid {runner.pid()}, no live connector attached "
                       "(manager active/running)", out)
+        def raises(*a, **kw):
+            raise OSError("no exec")
+        self.assertEqual(cli.login_problem(cm.read_config(cli.config_path()), run_=raises), "codex login status did not run (OSError)")
         login_env = json.loads((self.home / "codex-login.json").read_text())["env"]
         self.assertEqual(login_env["CODEX_HOME"], str(self.codex_home))
         self.assertNotIn("REMOTE_TASK_TOKEN", login_env)

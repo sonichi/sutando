@@ -50,6 +50,9 @@ POLL_S = 0.2
 STOP_TIMEOUT_S = 30     # the manager's own SIGTERM-to-SIGKILL bound: past the launcher's grace + reap bound
 THROTTLE_S = 30         # launchd's respawn delay: behind a normal SIGTERM shutdown of the old session
 
+# A hand launcher (debug-run) publishes its holder record under this label: the managed launcher is the
+# shape's own name, and install confirms only that one, never a hand holder that won the root first.
+DEBUG_SUFFIX = ".debug"
 # Set by the unit and the plist in the launcher's environment; `run` refuses without it, so a hand
 # start never takes the root inside the manager's teardown window. A guard, not a security boundary.
 MANAGED_VAR = "AG2_SPARROW_MANAGED"
@@ -816,25 +819,35 @@ def _run_until_end(child, pidfd, state: dict) -> "int | None":
                     return None
 
 
+def debug_adapter(shape: Shape) -> str:
+    return shape.name + DEBUG_SUFFIX
+
+
 def hold_and_supervise(shape: Shape, root: str, state: dict, prepare, spawn, supervise, reap, label: str, noun: str,
-                       child_noun: str = "", started=None) -> int:
-    """The holder's one sequence, in `label`'s words: take the root (another holder is EXIT_HELD, any
-    other refusal EXIT_UNUSABLE), refuse a `tasks` symlink, `prepare(owner, root) -> (ctx, problem)` (it
-    may raise LockRefused), stop before start as 128+signal, read the record, `spawn(ctx) -> child`
-    (OSError is the refusal), attach the child as the consumer by its pid and start time, `started(child)`
-    once attached, then `supervise(child) -> int`; any failure between spawn and attach is `reap(child)`
-    and "no consumer". The lock is released with the holder; a release refused for a live consumer is
-    said in one line. Every `task_io` step is looked up at call time."""
+                       child_noun: str = "", started=None, adapter: str = "", acquired=None) -> int:
+    """The holder's one sequence, in `label`'s words: take the root as `adapter` (the shape's name unless a
+    hand launcher says otherwise; another holder is EXIT_HELD, any other refusal EXIT_UNUSABLE), then
+    `acquired()` (a hand launcher releases its operation lock there, the check-then-acquire done),
+    refuse a `tasks` symlink, `prepare(owner, root) -> (ctx, problem)` (it may raise LockRefused), stop
+    before start as 128+signal, read the record, `spawn(ctx) -> child` (OSError is the refusal), attach
+    the child as the consumer by its pid and start time, `started(child)` once attached, then
+    `supervise(child) -> int`; any failure between spawn and attach is `reap(child)` and "no consumer".
+    The lock is released with the holder; a release refused for a live consumer is said in one line.
+    Every `task_io` step is looked up at call time."""
     child_noun = child_noun or noun
 
     def refuse(line: str) -> int:
         print(f"{label}: refusing to start: {line}", file=sys.stderr)
         return EXIT_UNUSABLE
     try:
-        owner = task_io.acquire_lock(root, shape.name, retry_s=ACQUIRE_RETRY_S)
+        owner = task_io.acquire_lock(root, adapter or shape.name, retry_s=ACQUIRE_RETRY_S)
     except LockRefused as e:
+        if acquired is not None:
+            acquired()
         print(e.line, file=sys.stderr)
         return EXIT_HELD if e.code == 3 else EXIT_UNUSABLE
+    if acquired is not None:
+        acquired()
     try:
         if _is_link("tasks", owner.root_fd):
             return refuse("tasks/ under the held root is a symlink, not a directory")

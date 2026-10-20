@@ -49,8 +49,9 @@ start). It checks the pin again, then runs `connect_common`'s holder sequence, t
 launcher-side shape shares: take the work root's lock for the launcher's own life (adapter
 `codex-local`; a root another session holds is exit 75, which the manager does not relaunch over),
 make `tasks`, `results`, `state` and `state/threads` under the held root inode, start the connector
-as the direct child, `python -m …codex_connector --work <dir> --held --codex <the configured
-executable> --server stdio --sandbox <s> [--allow-non-owner] [--model <m>]`, with an environment of
+as the direct child, `python -m …codex_connector --work <dir> --held --root-fd <the held root's
+descriptor> --codex <the configured executable> --server stdio --sandbox <s> [--allow-non-owner]
+[--model <m>]`, with an environment of
 only `PATH` (the configured `codex` first), `HOME`, `USER`, `PYTHONPATH` (this package) and
 `CODEX_HOME` when one was recorded (the connector passes it on to its app-server), and attach it as
 the consumer whose liveness fences the root (`holder_lock.attach_consumer`). The app-server is
@@ -58,11 +59,17 @@ started from the exact executable the version check passed, never a PATH lookup,
 `codex` earlier on PATH never runs. It never passes `--once`, `--idle-exit`, `--push`, `--thread-id`,
 `--ephemeral`, `--developer-instructions` or the stub/proxy server. Under `--held` the connector
 takes no lock and starts only once the holder's record names this very process (pid and start time)
-and verifies it alive; a stale or unreadable record is exit 2. A `SIGTERM` to the launcher
+and verifies it alive; a stale or unreadable record is exit 2. It lives inside the held inode: it
+fchdirs into `--root-fd` and names `tasks/`, `results/` and `state/` relative to it, so a work root
+renamed or replaced under the same pathname after startup is never read or written (the owner
+thread's cwd, a pathname by protocol, is the inode's current one, resolved per turn). A `SIGTERM` to the launcher
 terminates the connector, waits up to 15 s, kills, reaps, releases the lock and exits 143; a
-connector's own 75 is reported as 1, so 75 means only another holder. Under `debug-run`, a launcher
-killed with SIGKILL cannot reap: the connector is orphaned, its liveness keeps the root held, and the
-next start exits 75 until it is stopped by hand. `--sandbox`
+connector's own 75 is reported as 1, so 75 means only another holder. `debug-run` takes the shape's
+operation lock (the one install and uninstall take) from its checks to its acquisition and publishes
+its holder record under the `codex-local.debug` label, so an install never mistakes a hand holder
+that won the root for its managed launcher (it reports "did not acquire" instead). Under `debug-run`,
+a launcher killed with SIGKILL cannot reap: the connector is orphaned, its liveness keeps the root
+held, and the next start exits 75 until it is stopped by hand. `--sandbox`
 defaults to `read-only` (the connector's own default); `workspace-write` prints the retry caveat from
 the table above. `verify` reports the config, the pin, the login, the dirs, the relay token's mode,
 the marked unit, the manager's own word for the job and who holds the root (the launcher and, once

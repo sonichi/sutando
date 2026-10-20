@@ -192,7 +192,7 @@ class Connector:
             self.rpc.respond(rid, {})
 
     def thread_params(self, owner):
-        p = {"cwd": self.args.cwd if owner else self.scratch_cwd, "approvalPolicy": "never",
+        p = {"cwd": (self.args.cwd or os.getcwd()) if owner else self.scratch_cwd, "approvalPolicy": "never",
              "sandbox": self.args.sandbox if owner else NON_OWNER_SANDBOX}
         if self.args.model:
             p["model"] = self.args.model
@@ -467,7 +467,11 @@ def build_parser():
     ap.add_argument("--work", help="dir holding tasks/ results/ state/ (required unless --push)")
     ap.add_argument("--held", action="store_true",
                     help="the work root's lock is held by the launcher that spawned this process and attaches it as "
-                         "the consumer; take no lock, refuse unless that record names this process")
+                         "the consumer; take no lock, refuse unless that record names this process (needs --root-fd)")
+    ap.add_argument("--root-fd", type=int, default=None,
+                    help="with --held: the held work root's directory descriptor the launcher passed; this process "
+                         "fchdirs into it and reads tasks/, results/ and state/ relative to it, so a renamed or "
+                         "replaced pathname never reaches it")
     ap.add_argument("--cwd", default=None, help="thread cwd (default: --work)")
     ap.add_argument("--codex", default="codex", help="the codex executable the app-server is started from (default: "
                                                      "codex on PATH; a launcher passes the exact path it checked)")
@@ -506,6 +510,8 @@ def main(argv=None):
     args.work = os.path.abspath(args.work)
     exit_on_sigterm()
     if args.held:
+        if args.root_fd is None:
+            build_parser().error("--held needs --root-fd, the launcher's descriptor of the held root")
         return serve_held(args, cwd_given)
     try:
         owner = acquire_lock(args.work, "codex")
@@ -529,7 +535,15 @@ def main(argv=None):
 
 def serve_held(args, cwd_given):
     """Under a launcher: no lock of our own, the dirs the holder made, and a start only once the
-    holder's record names this process as the consumer (a hand start with --held is refused)."""
+    holder's record names this process as the consumer (a hand start with --held is refused). The
+    process lives inside the held inode (fchdir on --root-fd) and names tasks/, results/ and state/
+    relative to it: the pathname the launcher saw may be renamed or replaced, this inode cannot."""
+    try:
+        os.fchdir(args.root_fd)
+    except OSError as e:
+        sys.stderr.write("refusing to start: --root-fd %d is not the held root's directory (%s)\n" % (args.root_fd, e))
+        return 2
+    args.work = "."     # the held inode, wherever its pathname goes
     deadline = time.monotonic() + HELD_WAIT_S
     while True:
         consumer = holder_consumer(args.work)
@@ -541,16 +555,15 @@ def serve_held(args, cwd_given):
             why = ("a start time that is not this process's" if consumer.get("start") != start_time(os.getpid())
                    else "liveness unknown" if consumer.get("live") is None else "liveness false")
             sys.stderr.write("refusing to start: --held, but the holder of %s names this pid with %s, not verified\n"
-                             % (args.work, why))
+                             % (os.getcwd(), why))
             return 2
         if stop_requested() or time.monotonic() >= deadline:
-            sys.stderr.write("refusing to start: --held, but no holder of %s attached this process\n" % args.work)
+            sys.stderr.write("refusing to start: --held, but no holder of %s attached this process\n" % os.getcwd())
             return 2
         time.sleep(0.05)
-    args.inbox = os.path.join(args.work, "tasks")
-    args.results = os.path.join(args.work, "results")
-    args.state = os.path.join(args.work, "state")
-    args.cwd = os.path.abspath(cwd_given or args.work)
+    args.inbox, args.results, args.state = "tasks", "results", "state"
+    # The owner thread's cwd is a pathname by protocol: None here means the inode's current one, per turn.
+    args.cwd = os.path.abspath(cwd_given) if cwd_given else None
     return exit_code(serve_locked(args))
 
 

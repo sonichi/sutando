@@ -69,13 +69,14 @@ def child_env(cfg: dict, environ=None) -> dict:
     return env
 
 
-def connector_argv(cfg: dict, root: str) -> list:
-    """The connector under this launcher's lock (--held), its app-server from the exact executable the
-    version check passed (--codex, never a PATH lookup): never --once, --idle-exit, --push, --thread-id,
+def connector_argv(cfg: dict, root: str, root_fd: int) -> list:
+    """The connector under this launcher's lock (--held, --root-fd: the held inode it fchdirs into, so a
+    renamed or replaced pathname never reaches it), its app-server from the exact executable the version
+    check passed (--codex, never a PATH lookup): never --once, --idle-exit, --push, --thread-id,
     --ephemeral, --developer-instructions, nor the stub or proxy server, none of which belong under a
     manager."""
-    argv = [sys.executable, "-m", codex_connector.__name__, "--work", root, "--held", "--codex", cfg["CODEX"],
-            "--server", "stdio", "--sandbox", cfg.get("SANDBOX") or "read-only"]
+    argv = [sys.executable, "-m", codex_connector.__name__, "--work", root, "--held", "--root-fd", str(root_fd),
+            "--codex", cfg["CODEX"], "--server", "stdio", "--sandbox", cfg.get("SANDBOX") or "read-only"]
     if cfg.get("ALLOW_NON_OWNER") == "1":
         argv.append("--allow-non-owner")
     if cfg.get("MODEL"):
@@ -129,15 +130,32 @@ def install(args) -> int:
 
 
 def run(args, popen=subprocess.Popen) -> int:
-    """What the manager runs, and only it: refused without the marker the unit sets (`debug-run` is the
-    hand start); `--launchd` is the shared entry shim that runs the launcher as a child and maps its
-    outcome (logical 75 to exit 0, so launchd stops instead of relaunching over the holder)."""
+    """What the manager runs, and only it: refused without the marker the unit sets; `--launchd` is the
+    shared entry shim that runs the launcher as a child and maps its outcome (logical 75 to exit 0, so
+    launchd stops instead of relaunching over the holder). `debug-run` is the hand start: its
+    check-then-acquire runs under the shape's operation lock (install and uninstall take the same one)
+    and its holder record carries the debug label, which install never accepts as its launcher."""
     problem = "" if args.debug else cm.managed_problem(LOCAL)
     if problem:
         print(f"error: {problem}", file=sys.stderr)
         return EXIT_UNUSABLE
     if getattr(args, "launchd", False):
         return cm.run_launchd(cm.run_child_argv(LOCAL, __name__), popen)
+    op = cm.operation_lock(LOCAL) if args.debug else None
+    if op is not None:
+        try:
+            op.__enter__()
+        except cm.Busy as e:
+            print(f"error: {e}", file=sys.stderr)
+            return EXIT_UNUSABLE
+    try:
+        return _checked(popen, op)
+    finally:
+        if op is not None:
+            op.release()
+
+
+def _checked(popen, op) -> int:
     cfg, problem = load_config()
     if problem:
         print(f"error: {problem}", file=sys.stderr)
@@ -149,22 +167,26 @@ def run(args, popen=subprocess.Popen) -> int:
     state = cm.stop_state()
     before = cm.stop_handlers(state)
     try:
-        return _held(cfg, cm.work_root(cfg), popen, state)
+        return _held(cfg, cm.work_root(cfg), popen, state, cm.debug_adapter(LOCAL) if op is not None else "",
+                     op.release if op is not None else None)
     finally:
         cm.restore_handlers(state, before)
 
 
-def _held(cfg: dict, root: str, popen, state: dict) -> int:
+def _held(cfg: dict, root: str, popen, state: dict, adapter: str = "", acquired=None) -> int:
     """connect_common's holder sequence with this shape's steps: the connector's dirs under the held
-    inode, the connector spawned under the allowlist, its own 75 reported as 1."""
+    inode, the connector spawned under the allowlist with the held root's descriptor, its own 75
+    reported as 1."""
     def prepare(owner, root):
         task_io.make_dirs(owner, WORK_DIRS)
-        return task_io.root_path(owner, root), ""
+        return (task_io.root_path(owner, root), owner.root_fd), ""
 
-    def spawn(held_root):
-        return popen(connector_argv(cfg, held_root), env=child_env(cfg), cwd=held_root, stdin=subprocess.DEVNULL)
+    def spawn(ctx):
+        held_root, root_fd = ctx
+        return popen(connector_argv(cfg, held_root, root_fd), env=child_env(cfg), cwd=held_root,
+                     stdin=subprocess.DEVNULL, pass_fds=(root_fd,))
     return cm.hold_and_supervise(LOCAL, root, state, prepare, spawn, lambda child: _supervise(child, state),
-                                 cm.kill_and_reap, "run", "connector")
+                                 cm.kill_and_reap, "run", "connector", adapter=adapter, acquired=acquired)
 
 
 def _supervise(child, state: dict) -> int:
@@ -224,7 +246,8 @@ def main(argv=None) -> int:
                    "maps logical 75 to exit 0, everything else (and a signal death) to non-zero")
     r.set_defaults(func=run, debug=False)
     sub.add_parser("debug-run", help="the same launcher by hand, for a look at the connector (stop the job first: a "
-                   "held root is refused with 75)").set_defaults(func=run, debug=True, launchd=False)
+                   "held root is refused with 75; its holder is never taken for the managed one)"
+                   ).set_defaults(func=run, debug=True, launchd=False)
     sub.add_parser("verify", help="check every part").set_defaults(func=verify)
     sub.add_parser("uninstall", help="stop the job, then remove what install wrote (config last)").set_defaults(func=uninstall)
     args = ap.parse_args(argv)
