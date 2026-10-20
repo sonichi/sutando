@@ -29,7 +29,7 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
                                lockFailsOnce?: string[]; storeFailsOnce?: string[]; unreadableOnce?: string[];
                                committedHardOnce?: string[]; committedHardWhy?: string; stageLandsOnce?: boolean;
                                parkRefusedOnce?: boolean; authorizeLostOnce?: boolean; stageLinkFailsOnce?: boolean;
-                               parkAlwaysRefuses?: boolean; parkRefuses?: number; stageThrows?: number } = {}) {
+                               parkAlwaysRefuses?: boolean; parkRefuses?: number; authorizeRetries?: number; stageThrows?: number } = {}) {
   const files: Record<string, string> = {}
   const submitted: string[] = []
   const runs: string[][] = []
@@ -63,6 +63,7 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
   let stageLands = opts.stageLandsOnce ?? false
   let parkRefused = opts.parkRefusedOnce ?? false
   let parkRefusesLeft = opts.parkRefuses ?? 0
+  let authorizeRetriesLeft = opts.authorizeRetries ?? 0
   let authorizeLost = opts.authorizeLostOnce ?? false
   let stageLinkFails = opts.stageLinkFailsOnce ?? false
   let stageThrowsLeft = opts.stageThrows ?? 0
@@ -198,6 +199,7 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
     }
     const c = claims[task]
     if (verb === 'authorize') {
+      if (authorizeRetriesLeft-- > 0) return out(1, { refused: `${task}: not authorized yet (claims lock busy); retried`, retry: true })
       const reqHash = argv[argv.indexOf('--text-hash') + 1]
       // As the CLI: the same request again gets the same token back; any other text gets none.
       if (c && c.phase === 'CALLING' && c.attempt === Number(argv[4]) && c.hash === reqHash) return answer({ task_id: task, token: c.token })
@@ -279,7 +281,9 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
   })
   return { files, submitted, runs, claims, progress, clock, hash, interruptAt, logs, stuck, publishes: () => publishes, setSid: (sid: string) => { live.sid = sid },
     failProgress: (n: number) => { progressFailLeft = n },
-    failAt: (verb: string) => { failVerb = verb } }
+    failAt: (verb: string) => { failVerb = verb },
+    refuseUnstuck: (n: number) => { unstuckFailsLeft = n }, refusePark: () => { parkRefused = true },
+    lockOnce: (verb: string) => { lockFails.add(verb) }, failStageLink: () => { stageLinkFails = true } }
 }
 
 async function arm($: any, h: any, args: Record<string, string> = { inbox_dir: '/in', results_dir: '/out' }) {
@@ -1311,6 +1315,87 @@ test('a turn-end delivery that lands after the stuck bound keeps its mark owned 
   expect(h.stuck).toEqual({})                                          // the third clear landed
   expect(h.runs.filter((a: string[]) => a[2] === 'progress' && a.includes('--unstuck') && a.includes('task-p1')).length).toBe(3)
 })
+
+// A mark acquired while the authorization was retried (past the stuck bound) is the offer's to clear: every way
+// an offer is released goes through the one mark clear, whoever wrote the mark.
+const authStuck = async ($: any, on: any, id: string) => {
+  const h = host(on, { authorizeRetries: 12 })
+  h.files[`/in/${id}.txt`] = TASK(id)
+  await arm($, h)
+  for (let i = 0; i < 700 && !h.submitted.length; i++) await h.clock.advance(1000)
+  expect(h.submitted.length).toBe(1)
+  expect(h.progress.find((p: string[]) => p[0] === '--stuck' && p[1] === id)).toBeDefined()
+  expect(h.stuck[id]).toBeDefined()
+  return h
+}
+
+test('a stuck mark from authorization retries is cleared when the offer is parked at an immediate turn end', async ($, on) => {
+  const h = await authStuck($, on, 'task-auth-stuck')
+  await $.turn.start({ text: FRAMED(h.submitted[0]), turnId: 't-a' })
+  await $.turn.complete({ turnId: 't-a', reason: 'completed', text: '' } as any)
+  expect(h.files['/out/task-auth-stuck.txt']).toContain('without a reply')
+  expect(h.stuck).toEqual({})
+})
+
+test('a stuck mark from authorization retries is cleared when the offer is published by a direct reply', async ($, on) => {
+  const h = await authStuck($, on, 'task-auth-reply')
+  await $.turn.start({ text: FRAMED(h.submitted[0]), turnId: 't-b' })
+  const r = await $.tool.call({ tool: REPLY, task_id: 'task-auth-reply', text: 'done' })
+  expect(String(r.text ?? r.result)).toContain('Published')
+  expect(h.stuck).toEqual({})
+})
+
+// Every offer-release path, each with a mark seeded after submission (whatever wrote it), and a clear that is
+// refused once: the mark is cleared through the backed-off clear, never left behind.
+const RELEASES: Record<string, (args: { $: any; h: any; msg: string }) => Promise<void>> = {
+  'park at the turn end': async ({ $, msg }) => {
+    await $.turn.start({ text: FRAMED(msg), turnId: 't1' })
+    await $.turn.complete({ turnId: 't1', reason: 'completed', text: '' } as any)
+  },
+  'direct reply': async ({ $, msg }) => {
+    await $.turn.start({ text: FRAMED(msg), turnId: 't1' })
+    await $.tool.call({ tool: REPLY, task_id: 'task-s', text: 'ok' })
+  },
+  'accepted answer delivered at the turn end': async ({ $, h, msg }) => {
+    await $.turn.start({ text: FRAMED(msg), turnId: 't1' })
+    h.failStageLink()                                  // accepted, not staged yet: delivered at the turn end
+    const r = await $.tool.call({ tool: REPLY, task_id: 'task-s', text: 'ok' })
+    expect(String(r.text ?? r.result)).toContain('stage refused')
+    await $.turn.complete({ turnId: 't1', reason: 'completed', text: '' } as any)
+  },
+  'delivery retried by the scan': async ({ $, h, msg }) => {
+    await $.turn.start({ text: FRAMED(msg), turnId: 't1' })
+    h.refusePark()
+    await $.turn.complete({ turnId: 't1', reason: 'completed', text: '' } as any)
+    await h.clock.advance(3000)
+  },
+  'turn end after a late confirmation': async ({ $, h, msg }) => {
+    h.lockOnce('confirm')
+    await $.turn.start({ text: FRAMED(msg), turnId: 't1' })
+    await $.turn.complete({ turnId: 't1', reason: 'completed', text: '' } as any)
+    await h.clock.advance(1000)
+  },
+  'turn not confirmed': async ({ $, h, msg }) => {
+    h.claims['task-s'].token = 'another'
+    await $.turn.start({ text: FRAMED(msg), turnId: 't1' })
+  },
+}
+for (const [path, drive] of Object.entries(RELEASES)) {
+  test(`an offer released by ${path} clears the task's stuck mark, retried until confirmed`, async ($, on) => {
+    const h = host(on)
+    h.files['/in/task-s.txt'] = TASK('task-s')
+    await arm($, h)
+    await h.clock.advance(1000)
+    expect(h.submitted.length).toBe(1)
+    h.stuck['task-s'] = { since: 1 }
+    h.refuseUnstuck(1)
+    await drive({ $, h, msg: h.submitted[0] })
+    for (let i = 0; i < 10; i++) await h.clock.advance(1000)
+    expect(h.files['/out/task-s.txt'] !== undefined).toBe(path !== 'turn not confirmed')
+    expect(h.stuck).toEqual({})
+    expect(h.runs.filter((a: string[]) => a[2] === 'progress' && a.includes('--unstuck') && a.includes('task-s')).length).toBe(2)
+  })
+}
 
 test('a pending authorization is dropped when its inbox file goes: a returning file is claimed afresh', async ($, on) => {
   const h = host(on, { authorizeLostOnce: true })

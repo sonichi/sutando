@@ -230,8 +230,10 @@ mark first, whether that mark was set by this mod or by one before a session
 restart or plugin reload (the clear is sent every time; clearing no mark is
 harmless): a verdict the policy refuses (`unsigned`, `invalid`), a header id
 that does not match the file stem (the stem's mark), a final claim or
-authorize refusal, an interrupted answer, or an answer delivered at a turn's
-end after a stuck mark. Until the CLI confirms the clear (a refusal, exit 3, or
+authorize refusal, an interrupted answer, and every release of a submitted
+task's offer (published by `ag2space_reply`, parked or delivered at a turn's
+end, retried by the scan, or dropped because its turn was not confirmed), so a
+mark written while the authorization was retried is the offer's to clear. Until the CLI confirms the clear (a refusal, exit 3, or
 a CLI that did not run) the mod keeps the task, retries only the clear after
 1, 2, 4 ... ticks capped at 60, and marks it seen once the clear lands; no
 mark outlives its task.

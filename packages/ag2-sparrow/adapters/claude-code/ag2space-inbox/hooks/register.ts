@@ -161,6 +161,39 @@ async function witness($: any, s: State, where: string): Promise<boolean> {
   return true
 }
 
+// Every terminal outcome and every offer released: the task's durable stuck mark (whichever Mod start or step set
+// it) is cleared first; until a clear is confirmed (refused, exit 3, not run) the task stays owned here, backed off.
+async function clearMark($: any, s: State, name: string, c: Cleanup): Promise<boolean> {
+  const log = (line: string) => $.ui.log(`${PLUGIN}: ${line}`, { to: 'debug' })
+  const r = await cli($, s, ['progress', '--unstuck', c.rid])
+  if (r.ok) {
+    s.cleanup.delete(name); s.retry.delete(name); s.stale.delete(name); s.authorizing.delete(name)
+    s.seen.add(name)
+    if (c.done) await c.done()
+    else await log(`${c.rid} ${c.why}; not submitted`)
+    return false
+  }
+  c.fails++
+  const delay = Math.min(BACKOFF_MAX_TICKS, 2 ** (c.fails - 1))
+  if (delay !== c.delay) await log(`${c.rid} ${c.why}; its stuck mark could not be cleared (${r.data?.refused ?? r.data?.error ?? 'no reply'}); kept, next try in ${delay} s`)
+  c.delay = delay
+  c.next = s.tick + delay
+  s.cleanup.set(name, c)
+  return r.hard
+}
+
+// True on a hard reply (intake closed).
+function retireTask($: any, s: State, name: string, rid: string, why: string, done?: () => Promise<void>): Promise<boolean> {
+  return clearMark($, s, name, { rid, why, fails: 0, delay: 0, next: s.tick, done })
+}
+
+// The one way an offer leaves the Mod's hands (settled, or its turn not confirmed): through the mark clear.
+async function releaseOffer($: any, s: State, offer: Offer, why: string): Promise<boolean> {
+  s.offers.delete(offer.rid)
+  if (s.pending === offer) s.pending = null
+  return retireTask($, s, offer.file, offer.rid, why, async () => {})
+}
+
 // The turn ended: an accepted answer is delivered as it is, else the protocol failure; '' once delivered,
 // else why not (the offer is kept and the scan retries it behind the per-task backoff).
 async function parkOffer($: any, s: State, offer: Offer, reason: string): Promise<string> {
@@ -180,9 +213,9 @@ async function parkOffer($: any, s: State, offer: Offer, reason: string): Promis
     return String(r.data?.refused ?? r.data?.error ?? 'not published')
   }
   await $.ui.log(`${PLUGIN}: ${offer.rid} delivered at the turn's end (${offer.stagedText !== undefined || r.data?.parked === false ? 'the accepted answer' : 'the protocol failure'})`, {})
-  s.offers.delete(offer.rid)
   s.answered.add(offer.rid)
   offer.parkPending = undefined
+  await releaseOffer($, s, offer, "delivered at the turn's end")
   return ''
 }
 
@@ -200,8 +233,8 @@ async function confirmOffer($: any, s: State, offer: Offer): Promise<void> {
     if (c.completed) await parkOffer($, s, offer, c.completed)
     return
   }
-  s.offers.delete(offer.rid)
   await $.ui.log(`${PLUGIN}: ${offer.rid} turn not confirmed: ${r.data?.refused ?? ''}`, {})
+  await releaseOffer($, s, offer, 'turn not confirmed')
 }
 
 async function sha256($: any, text: string): Promise<string> {
@@ -254,27 +287,7 @@ async function arm($: any, s: State, inbox: string, results: string): Promise<{ 
     return hard
   }
 
-  // Every terminal outcome: the task's durable stuck mark (whichever Mod start set it) is cleared first; until a
-  // clear is confirmed (refused, exit 3, not run) the task stays owned here, backed off, never seen. True if hard.
-  const clearMark = async (name: string, c: Cleanup): Promise<boolean> => {
-    const r = await cli($, s, ['progress', '--unstuck', c.rid])
-    if (r.ok) {
-      s.cleanup.delete(name); s.retry.delete(name); s.stale.delete(name); s.authorizing.delete(name)
-      s.seen.add(name)
-      if (c.done) await c.done()
-      else log(`${c.rid} ${c.why}; not submitted`)
-      return false
-    }
-    c.fails++
-    const delay = Math.min(BACKOFF_MAX_TICKS, 2 ** (c.fails - 1))
-    if (delay !== c.delay) log(`${c.rid} ${c.why}; its stuck mark could not be cleared (${r.data?.refused ?? r.data?.error ?? 'no reply'}); kept, next try in ${delay} s`)
-    c.delay = delay
-    c.next = s.tick + delay
-    s.cleanup.set(name, c)
-    return r.hard
-  }
-  const retire = (name: string, rid: string, why: string, done?: () => Promise<void>): Promise<boolean> =>
-    clearMark(name, { rid, why, fails: 0, delay: 0, next: s.tick, done })
+  const retire = (name: string, rid: string, why: string, done?: () => Promise<void>) => retireTask($, s, name, rid, why, done)
 
   const scan = async () => {
     if (busy) return
@@ -292,13 +305,11 @@ async function arm($: any, s: State, inbox: string, results: string): Promise<{ 
           const held = s.retry.get(o.file)
           if (held && s.tick < held.next) continue
           const why = await parkOffer($, s, o, o.parkPending)
-          if (!why) {
-            s.retry.delete(o.file)
-            if (held?.stuck && await retire(o.file, o.rid, "delivered at the turn's end", async () => {})) return
-          } else if (await retain(o.file, o.rid, "not delivered at the turn's end", why)) return
+          // Delivered: parkOffer released it through the mark clear; not delivered: kept, backed off.
+          if (why && await retain(o.file, o.rid, "not delivered at the turn's end", why)) return
         }
       }
-      for (const [name, c] of [...s.cleanup]) if (s.tick >= c.next && await clearMark(name, c)) return
+      for (const [name, c] of [...s.cleanup]) if (s.tick >= c.next && await clearMark($, s, name, c)) return
       if (!stopped && s.pending) return
       // A delivery still owed for an ended turn is retried on its own schedule; it never holds intake.
       if (!stopped) for (const o of s.offers.values()) if ((o.phase === 'CALLING' || o.phase === 'TURN_CONFIRMED') && o.parkPending === undefined) return
@@ -403,6 +414,7 @@ async function arm($: any, s: State, inbox: string, results: string): Promise<{ 
         s.offers.set(rid, offer)
         s.pending = offer
         s.seen.add(entry.name)
+        s.retry.delete(entry.name)            // the offer owns the task now; releasing it clears any mark
         log(`submitting ${rid} (${ask.label}, attempt ${offer.attempt})`)
         $.prompt.submit({ text: msg }).then(
           () => {},
@@ -551,8 +563,8 @@ export const register: Register = (on) => {
     const published = await cli($, s, ['publish', id])
     if (!(published.ok || (published.hard && published.data?.outcome === 'settled'))) return { result: `Error: publish refused: ${published.data?.refused ?? published.data?.error ?? ''}${published.data?.retry ? again : ''}`, isError: true }
     // inflight is released only at SETTLED, never on the submit promise.
-    s.offers.delete(id)
     s.answered.add(id)
+    await releaseOffer($, s, offer, 'published')
     return { result: `Published ${results}/${resultName(id)}` }
   }).catch(($, e, next) => ({ result: `Error: ag2space_reply failed: ${next.error.message}`, isError: true }))
 }
