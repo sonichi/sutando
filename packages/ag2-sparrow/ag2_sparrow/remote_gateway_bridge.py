@@ -1761,8 +1761,8 @@ PROACTIVE_CLAIM_GATE: Callable[[Path], bool] | None = None
 # Host-injected post-claim room gate ((original path, room) -> bool), consulted
 # on the CLAIMED body of a `proactive-result-*` naming a room; None allows all.
 PROACTIVE_ROOM_GATE: Callable[[Path, str], bool] | None = None
-# Host-injected (old_room, replacement_room) -> None, called once per upgrade of
-# the owner DM to a room this agent is not in; None only logs.
+# Host-injected (old_room, replacement_room) -> None, owed once per upgrade of the owner
+# DM to a room this agent is not in; raising is a failure and is retried, bounded.
 OWNER_DM_UPGRADED_NOTIFY: Callable[[str, str], None] | None = None
 # Routing state belongs to the gateway (owner 2026-09-07): the agent row's owner_dm_room is read at
 # connect and on a slow cadence and kept while offline; the pinned room is bootstrap, never authority.
@@ -5417,26 +5417,56 @@ def _owner_dm_upgrade_held(room: str) -> bool:
     return False
 
 
-def _hold_owner_dm_upgrade(room: str, replacement: str) -> None:
-    """Record the hold and notify once per (room, replacement); later passes skip the room."""
-    f = _upgrade_hold_file()
+# (room, replacement) pairs whose owner notice was delivered: no duplicate even if the hold file is unwritable.
+_UPGRADE_NOTICES_SENT: "set[tuple[str, str]]" = set()
+
+
+def _read_upgrade_hold() -> dict:
     try:
-        d = json.loads(f.read_text(encoding="utf-8"))
-        if isinstance(d, dict) and (d.get("room"), d.get("replacement")) == (room, replacement):
-            return
+        d = json.loads(_upgrade_hold_file().read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        pass
-    try:
-        _atomic_private_json(f, {"room": room, "replacement": replacement, "at": time.time()})
-    except OSError as e:
-        _log(f"could not record owner-DM upgrade hold ({e})")
-    _log(f"owner DM {room} was upgraded to {replacement or '(unknown)'}, which this agent "
-         "has not joined — holding owner-DM nudges until the owner DM is repointed")
-    if OWNER_DM_UPGRADED_NOTIFY is not None:
+        return {}
+    return d if isinstance(d, dict) else {}
+
+
+def _hold_owner_dm_upgrade(room: str, replacement: str) -> None:
+    """Record the hold (later passes skip the room), then try the owner notice if still owed."""
+    d = _read_upgrade_hold()
+    if (d.get("room"), d.get("replacement")) != (room, replacement):
+        d = {"room": room, "replacement": replacement, "at": time.time(),
+             "notice": "pending", "notice_attempts": 0}
         try:
+            _atomic_private_json(_upgrade_hold_file(), d)
+        except OSError as e:
+            _log(f"could not record owner-DM upgrade hold ({e})")
+        _log(f"owner DM {room} was upgraded to {replacement or '(unknown)'}, which this agent "
+             "has not joined — holding owner-DM nudges until the owner DM is repointed")
+    _notify_owner_dm_upgrade(d)
+
+
+def _notify_owner_dm_upgrade(d: dict) -> None:
+    """Deliver a pending owner notice; failures retry on later passes up to MAX_TRANSIENT_ATTEMPTS."""
+    room, replacement = str(d.get("room") or ""), str(d.get("replacement") or "")
+    if d.get("notice") != "pending" or (room, replacement) in _UPGRADE_NOTICES_SENT:
+        return
+    tried = int(d.get("notice_attempts") or 0) + 1
+    d["notice_attempts"] = tried
+    try:
+        if OWNER_DM_UPGRADED_NOTIFY is not None:
             OWNER_DM_UPGRADED_NOTIFY(room, replacement)
-        except Exception as exc:  # noqa: BLE001
-            _log(f"owner-DM upgrade notify failed ({exc})")
+        d["notice"] = "delivered"
+        _UPGRADE_NOTICES_SENT.add((room, replacement))
+    except Exception as exc:  # noqa: BLE001
+        if tried >= MAX_TRANSIENT_ATTEMPTS:
+            d["notice"] = "gave_up"
+            _log(f"owner-DM upgrade notify GAVE UP after {tried} attempt(s) ({exc}) — the owner was "
+                 f"NOT told that {room} was upgraded to {replacement or '(unknown)'}")
+        else:
+            _log(f"owner-DM upgrade notify failed ({exc}) — will retry ({tried}/{MAX_TRANSIENT_ATTEMPTS})")
+    try:
+        _atomic_private_json(_upgrade_hold_file(), d)
+    except OSError as e:
+        _log(f"could not record owner-DM upgrade notice state ({e})")
 
 
 def _post_proactive() -> None:
@@ -5453,6 +5483,7 @@ def _post_proactive() -> None:
     that belongs to another bridge (cross-bridge routing stays host policy); a
     PROACTIVE_ROOM_GATE re-judges the room the CLAIMED body names, since the
     peek may have read a body still being written."""
+    notice_retried = False
     for f in sorted(RESULTS_DIR.glob("proactive-*.txt")):
         # PEEK before claiming: a file explicitly routed to a non-Matrix
         # destination ([channel: <discord/slack id>]) belongs to that bridge —
@@ -5472,6 +5503,9 @@ def _post_proactive() -> None:
             _held(f"owner-directed {f.name}")
             continue
         if route == "send" and peek_room is None and _owner_dm_upgrade_held(proactive_room()):
+            if not notice_retried:
+                notice_retried = True  # one notice retry per pass, not per held file
+                _notify_owner_dm_upgrade(_read_upgrade_hold())
             continue  # each claim would only cost another room_upgraded 400
         if PROACTIVE_CLAIM_GATE is not None:
             try:

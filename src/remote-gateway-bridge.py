@@ -339,7 +339,7 @@ def _ag2space_proactive_claim_gate(path: Path) -> bool:
 
 
 def _ag2space_owner_dm_upgraded(room: str, replacement: str) -> None:
-    """Ask the owner to re-invite the agent; detached and fail-open, --unless-open dedupes the row."""
+    """Ask the owner to re-invite the agent; detached, --unless-open dedupes the row; a failed launch raises."""
     import subprocess
     try:
         subprocess.Popen(
@@ -350,6 +350,7 @@ def _ag2space_owner_dm_upgraded(room: str, replacement: str) -> None:
             start_new_session=True)
     except OSError as e:
         _log(f"owner-DM upgrade: ask-owner did not start ({e})")  # noqa: F821
+        raise
 
 
 # Assigned AFTER the exec: the canonical module's own `PROACTIVE_CLAIM_GATE =

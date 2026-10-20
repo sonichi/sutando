@@ -285,14 +285,79 @@ def _test_owner_dm_upgrade_edges(rtc) -> None:
             raise OSError("no exec")
 
         _sp.Popen = _no_spawn
-        real_hook("!owner:example.org", "!n:example.org")
-        check(any("ask-owner did not start" in m for m in logged),
-              "a failed ask-owner launch is logged, not raised")
+        raised = False
+        try:
+            real_hook("!owner:example.org", "!n:example.org")
+        except OSError:
+            raised = True
+        check(raised and any("ask-owner did not start" in m for m in logged),
+              "a failed ask-owner launch is logged and raised, so the bridge retries it")
     finally:
         Path.rename, _sp.Popen = real_rename, real_popen
         STATE["force_room_400_body"] = None
         rtc._log, rtc._atomic_private_json, rtc.OWNER_DM_UPGRADED_NOTIFY = real_log, real_write, real_hook
         hold.unlink(missing_ok=True)
+
+
+def _test_owner_dm_upgrade_notice_retry(rtc) -> None:
+    """A failed owner notice is retried on a later pass, bounded, and never re-sent once delivered."""
+    attempts: list = []
+    fail = {"n": 1}
+    real_hook = rtc.OWNER_DM_UPGRADED_NOTIFY
+    real_max = rtc.MAX_TRANSIENT_ATTEMPTS
+
+    def _hook(old, new):
+        attempts.append((old, new))
+        if fail["n"] > 0:
+            fail["n"] -= 1
+            raise RuntimeError("ask-owner down")
+
+    upgraded = {"reason": "room_upgraded", "replacement_room": "!new:example.org"}
+    up = rtc.RESULTS_DIR / "proactive-upr1.txt"
+    try:
+        rtc.OWNER_DM_UPGRADED_NOTIFY = _hook
+        rtc._upgrade_hold_file().unlink(missing_ok=True)
+        getattr(rtc, "_UPGRADE_NOTICES_SENT", set()).clear()
+        up.write_text("retry nudge\n")
+        STATE["force_room_400_body"] = upgraded
+        n0 = len(STATE["room_posts"])
+        rtc._post_proactive()  # pass 1: 400, hold recorded, the notice fails
+        check(len(attempts) == 1 and rtc._owner_dm_upgrade_held("!owner:example.org"),
+              "pass 1 holds the owner DM and attempts the notice once")
+        rtc._post_proactive()  # pass 2: the hook recovered
+        check(len(attempts) == 2 and fail["n"] == 0,
+              "a notice that failed once is retried on the next pass")
+        check(len(STATE["room_posts"]) == n0 + 1 and up.exists(),
+              "the retry does not re-POST the held DM nudge")
+        rtc._post_proactive()
+        rtc._hold_owner_dm_upgrade("!owner:example.org", "!new:example.org")
+        check(len(attempts) == 2, "a delivered notice is never re-sent")
+        # Bound: a hook that never recovers is tried MAX times, then given up loudly.
+        rtc._upgrade_hold_file().unlink(missing_ok=True)
+        rtc._UPGRADE_NOTICES_SENT.clear()
+        attempts.clear()
+        fail["n"] = 99
+        rtc.MAX_TRANSIENT_ATTEMPTS = 3
+        logged: list = []
+        real_log = rtc._log
+        rtc._log = logged.append
+        try:
+            for _ in range(6):
+                rtc._post_proactive()
+        finally:
+            rtc._log = real_log
+        check(len(attempts) == 3, f"the notice retry is bounded (got {len(attempts)} attempts)")
+        check(any("GAVE UP" in m for m in logged), "exhausting the bound is logged loudly")
+        check(rtc._owner_dm_upgrade_held("!owner:example.org") and up.exists()
+              and len(STATE["room_posts"]) == n0 + 2,
+              "the hold still suppresses DM nudges after the notice gives up")
+    finally:
+        STATE["force_room_400_body"] = None
+        rtc.OWNER_DM_UPGRADED_NOTIFY = real_hook
+        rtc.MAX_TRANSIENT_ATTEMPTS = real_max
+        rtc._upgrade_hold_file().unlink(missing_ok=True)
+        getattr(rtc, "_UPGRADE_NOTICES_SENT", set()).clear()
+        up.unlink(missing_ok=True)
 
 
 def main() -> int:
@@ -1454,6 +1519,7 @@ def main() -> int:
     _it3b = _ob._read_item(_rroot, "proactive-r3")
     _test_owner_dm_room_upgraded(rtc)
     _test_owner_dm_upgrade_edges(rtc)
+    _test_owner_dm_upgrade_notice_retry(rtc)
     check(_it3b.get("status") == "DELIVERED"
           and _it3b.get("destination") == "!owner:example.org",
           "the successful retry records the receipt")
