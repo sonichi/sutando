@@ -360,6 +360,36 @@ def _test_owner_dm_upgrade_notice_retry(rtc) -> None:
         up.unlink(missing_ok=True)
 
 
+def _test_owner_dm_upgrade_legacy_hold(rtc) -> None:
+    """A hold written before notice state existed is retried as pending, without re-posting the nudge."""
+    attempts: list = []
+    real_hook = rtc.OWNER_DM_UPGRADED_NOTIFY
+    up = rtc.RESULTS_DIR / "proactive-upl1.txt"
+    hold = rtc._upgrade_hold_file()
+    try:
+        rtc.OWNER_DM_UPGRADED_NOTIFY = lambda old, new: attempts.append((old, new))
+        rtc._UPGRADE_NOTICES_SENT.clear()
+        hold.write_text(json.dumps({"room": "!owner:example.org",
+                                    "replacement": "!new:example.org", "at": 1.0}))
+        up.write_text("legacy nudge\n")
+        STATE["force_room_400_body"] = {"reason": "room_upgraded", "replacement_room": "!new:example.org"}
+        n0 = len(STATE["room_posts"])
+        rtc._post_proactive()
+        rtc._post_proactive()
+        check(attempts == [("!owner:example.org", "!new:example.org")],
+              f"a legacy hold with no notice state delivers exactly one notice (got {attempts})")
+        check(len(STATE["room_posts"]) == n0 and up.exists(),
+              "recovering a legacy hold's notice does not POST the held nudge")
+        check(json.loads(hold.read_text()).get("notice") == "delivered",
+              "the legacy hold is rewritten with its delivered notice state")
+    finally:
+        STATE["force_room_400_body"] = None
+        rtc.OWNER_DM_UPGRADED_NOTIFY = real_hook
+        hold.unlink(missing_ok=True)
+        rtc._UPGRADE_NOTICES_SENT.clear()
+        up.unlink(missing_ok=True)
+
+
 def main() -> int:
     srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     port = srv.server_address[1]
@@ -1520,6 +1550,7 @@ def main() -> int:
     _test_owner_dm_room_upgraded(rtc)
     _test_owner_dm_upgrade_edges(rtc)
     _test_owner_dm_upgrade_notice_retry(rtc)
+    _test_owner_dm_upgrade_legacy_hold(rtc)
     check(_it3b.get("status") == "DELIVERED"
           and _it3b.get("destination") == "!owner:example.org",
           "the successful retry records the receipt")

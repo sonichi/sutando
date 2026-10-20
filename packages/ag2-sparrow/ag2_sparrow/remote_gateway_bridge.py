@@ -5426,7 +5426,11 @@ def _read_upgrade_hold() -> dict:
         d = json.loads(_upgrade_hold_file().read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
-    return d if isinstance(d, dict) else {}
+    if not isinstance(d, dict):
+        return {}
+    if d.get("room") and "notice" not in d:
+        d.update(notice="pending", notice_attempts=0)  # a pre-notice-state hold still owes its notice
+    return d
 
 
 def _hold_owner_dm_upgrade(room: str, replacement: str) -> None:
@@ -5454,6 +5458,7 @@ def _notify_owner_dm_upgrade(d: dict) -> None:
     try:
         if OWNER_DM_UPGRADED_NOTIFY is not None:
             OWNER_DM_UPGRADED_NOTIFY(room, replacement)
+        # "delivered" means the ask-owner hook was spawned, not that the owner received the question.
         d["notice"] = "delivered"
         _UPGRADE_NOTICES_SENT.add((room, replacement))
     except Exception as exc:  # noqa: BLE001
