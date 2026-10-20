@@ -39,7 +39,7 @@ TITLE_CHANGED = "title changed"
 FIELD_SEP = "|:ag2:|"
 START_COMMAND_RE = re.compile(r'^"?ag2-sparrow-claude-local hold --generation=[0-9a-f]{32} --"?$')
 TMUX_VERSION_RE = re.compile(r"(\d+)\.(\d+)")
-SESSION_ENV_KEYS = ("CLAUDE_CONFIG_DIR", "HMAC_KEY_FILE", "HMAC_STRICT")
+SESSION_ENV_KEYS = ("CLAUDE_CONFIG_DIR", "HMAC_KEY_FILE")
 
 
 def socket_path(config_dir) -> Path:
@@ -127,8 +127,8 @@ def session_env(cfg: dict, config_dir, root) -> dict:
     """The session environment set at creation with -e: what hold and the Mod read."""
     env = {hold.ENV_ROOT: str(root), hold.ENV_CONFIG_DIR: str(config_dir), hold.ENV_SESSION_ID: cfg["SESSION_ID"],
            hold.ENV_HITL_STORE: cfg.get("HITL_STORE", ""), AUTOARM_VAR: "1"}
-    for key, var in (("CLAUDE_CONFIG_DIR", "CLAUDE_CONFIG_DIR"), ("HMAC_KEY_FILE", "AG2_HMAC_KEY_FILE"),
-                     ("HMAC_STRICT", "AG2_HMAC_STRICT")):
+    # Strictness is never exported: the Mod asks `inbox envelope`, which reads the config and the key per task.
+    for key, var in (("CLAUDE_CONFIG_DIR", "CLAUDE_CONFIG_DIR"), ("HMAC_KEY_FILE", "AG2_HMAC_KEY_FILE")):
         if cfg.get(key):
             env[var] = cfg[key]
     return env

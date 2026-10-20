@@ -20,6 +20,7 @@ type Claim = { attempt: number; phase: string; token?: string; hash?: string; tu
 // collaborator come from a plain read of the stdin text; the real rule is pinned to Sparrow's by
 // tests/test_claude_code_adapter.py, and the lifecycle verbs by the Python inbox tests.
 function host(on: any, opts: { verdict?: string; env?: Record<string, string>; rejectSubmits?: number; verifierFails?: boolean; markerFails?: number;
+                               strict?: boolean; keyProblem?: string; policyFails?: number;
                                progressFails?: number; sessionIds?: string[]; cwdInode?: string; allowNonOwner?: boolean;
                                claimAs?: Record<string, unknown>; interruptParks?: number; interruptThrows?: number;
                                interruptSoft?: Record<string, string | number>; stuckAtStart?: Record<string, unknown>;
@@ -41,6 +42,7 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
   let failVerb = ''
   let marks = 0
   let markerFailLeft = opts.markerFails ?? 0
+  let policyFailLeft = opts.policyFails ?? 0
   let parksLeft = opts.interruptParks ?? 0
   let throwsLeft = opts.interruptThrows ?? 0
   const softLeft: Record<string, string | number> = { ...(opts.interruptSoft ?? {}) }
@@ -139,6 +141,15 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
       const fail = progressFailLeft-- > 0 || failVerb === verb
       if (failVerb === verb) failVerb = ''
       return fail ? out(3, { ...data, hard: true, error: 'progress write failed: disk' }) : out(0, data)
+    }
+    if (verb === 'envelope') {
+      // As the CLI's hmac_policy.decide (pinned in Python): strict submits verified only, and nothing while the key
+      // file is missing or malformed; invalid is never submitted; an unreadable config is a retry.
+      if (policyFailLeft-- > 0) return out(1, { refused: 'the installed config is unreadable (EIO); retried', retry: true })
+      const verdict = argv[argv.indexOf('--verdict') + 1]
+      const reason = verdict === 'invalid' ? 'envelope invalid' : !opts.strict ? '' : opts.keyProblem ? `strict mode: ${opts.keyProblem}`
+        : verdict !== 'verified' ? `strict mode: envelope ${verdict}` : ''
+      return out(0, { verdict, mode: opts.strict ? 'strict' : 'off', submit: !reason, reason })
     }
     if (verb === 'claim') {
       if (result(task) === 'LIVE_READY') {
@@ -273,7 +284,7 @@ test('each new task-*.txt is claimed, authorized and submitted once, wrapped in 
   expect(msg).not.toContain(NOTE_START)
   expect(h.claims['task-a1'].phase).toBe('CALLING')
   expect(h.claims['task-a1'].hash).toBe(h.hash(msg))
-  expect(verbs(h)).toEqual(['progress', 'claim', 'authorize'])
+  expect(verbs(h)).toEqual(['progress', 'envelope', 'claim', 'authorize'])
   await h.clock.advance(3000)
   expect(h.submitted.length).toBe(1)
   expect(msg.endsWith(`Reply only with the ag2space_reply tool (task_id task-a1); it publishes results/task-a1.txt for you, so do not write that file yourself. [submission ${'0'.repeat(15)}1]`)).toBe(true)
@@ -415,12 +426,38 @@ test('a tampered envelope is dropped; strict mode drops unsigned too', async ($,
   expect(h.claims['task-x']).toBe(undefined)
 })
 
-test('strict mode submits only verified envelopes', async ($, on) => {
-  const h = host(on, { verdict: 'unsigned', env: { AG2_RESULTS_DIR: '/out', AG2_HMAC_STRICT: '1' } })
+test('strict mode submits only verified envelopes: the CLI decides per task, the Mod reads no strictness itself', async ($, on) => {
+  const h = host(on, { verdict: 'unsigned', strict: true, env: { AG2_RESULTS_DIR: '/out', AG2_HMAC_STRICT: '' } })
   h.files['/in/task-y.txt'] = TASK('task-y')
   await arm($, h)
   await h.clock.advance(2000)
   expect(h.submitted.length).toBe(0)
+  expect(verbs(h).filter(v => v === 'claim')).toEqual([])
+  expect(h.logs.some(l => l.includes('task-y strict mode: envelope unsigned; not submitted'))).toBe(true)
+  expect(h.runs.some(a => a[0] === 'ag2-sparrow-claude-local' && a[2] === 'envelope' && a[4] === 'unsigned')).toBe(true)
+})
+
+test('strict mode with the key file gone refuses every task with the one reason line, never lenient', async ($, on) => {
+  const h = host(on, { verdict: 'unverifiable', strict: true, keyProblem: '/k/task-hmac.key missing: strict mode submits nothing until it is back' })
+  h.files['/in/task-k1.txt'] = TASK('task-k1')
+  await arm($, h)
+  await h.clock.advance(2000)
+  expect(h.submitted.length).toBe(0)
+  expect(verbs(h).filter(v => v === 'claim')).toEqual([])
+  expect(h.logs.filter(l => l.includes('task-k1 strict mode: /k/task-hmac.key missing')).length).toBe(1)
+})
+
+test('an envelope policy the CLI could not answer is retried next tick, never submitted and never retired', async ($, on) => {
+  const h = host(on, { policyFails: 2 })
+  h.files['/in/task-p1.txt'] = TASK('task-p1')
+  await arm($, h)
+  await h.clock.advance(1000)
+  expect(h.submitted.length).toBe(0)
+  expect(verbs(h).filter(v => v === 'envelope').length).toBe(2)
+  expect(verbs(h).filter(v => v === 'claim')).toEqual([])
+  await h.clock.advance(1000)
+  expect(h.submitted.length).toBe(1)
+  expect(h.submitted[0]).toContain('envelope verified')
 })
 
 test('a claim the CLI refuses (claimed, archived, quarantined, unreadable) never resubmits', async ($, on) => {
@@ -531,7 +568,7 @@ test('the inode check: the held inbox arms and submits', async ($, on) => {
   await $.session.start({ surface: 'terminal', isInteractive: false, cwd: '/w' })
   await ok.clock.advance(1000)
   expect(ok.submitted.length).toBe(1)
-  expect(verbs(ok)).toEqual(['progress', 'check-inode', 'claim', 'authorize'])
+  expect(verbs(ok)).toEqual(['progress', 'check-inode', 'envelope', 'claim', 'authorize'])
 })
 
 test('the session-id witness: recorded at session.start; a changed id at turn.start stops intake', async ($, on) => {
@@ -1185,7 +1222,7 @@ test('a progress write that fails at session.start closes intake; a later durabl
   expect(verbs(h)).toEqual(['progress', 'progress', 'progress'], 'closed: each scan only retries the progress write')
   await h.clock.advance(1000)                        // the retry is durable: reopened, then the claim proceeds
   expect(h.submitted.length).toBe(1)
-  expect(verbs(h).slice(3)).toEqual(['progress', 'claim', 'authorize'])
+  expect(verbs(h).slice(3)).toEqual(['progress', 'envelope', 'claim', 'authorize'])
 })
 
 test('a progress write that fails at claim, authorize, confirm, stage or publish closes intake until a durable write', async ($, on) => {

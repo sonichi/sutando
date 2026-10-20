@@ -223,7 +223,6 @@ async function arm($: any, s: State, inbox: string, results: string): Promise<{ 
     }
   }
   const keyFile = (await $.env.get('AG2_HMAC_KEY_FILE')) || ''
-  const strict = (await $.env.get('AG2_HMAC_STRICT')) === '1'
   s.armedResults = results
   s.stop?.()
   let busy = false
@@ -296,9 +295,13 @@ async function arm($: any, s: State, inbox: string, results: string): Promise<{ 
         } catch (err: any) { log(`${rid} verifier did not run: ${err?.message ?? err}`) }
         const [verdict, tier] = out.split(' ')
         if (!VERDICTS.has(verdict) || !tier) { log(`${rid} verifier gave no verdict; not submitted`); continue }
-        if (verdict === 'invalid' || (strict && verdict !== 'verified')) {
+        // Strict or not is the CLI's call, per task, from the installed config and the key file as it is now;
+        // the Mod holds no copy of that rule. No answer (the CLI did not run, the config unreadable): retried.
+        const policy = await cli($, s, ['envelope', '--verdict', verdict])
+        if (!policy.ok || typeof policy.data?.submit !== 'boolean') { log(`${rid} envelope policy gave no answer (${policy.data?.refused ?? 'no reply'}); not submitted`); continue }
+        if (!policy.data.submit) {
           s.seen.add(entry.name)
-          log(`${rid} envelope ${verdict}; not submitted`)
+          log(`${rid} ${policy.data.reason || `envelope ${verdict}`}; not submitted`)
           continue
         }
         if (stopped) {
@@ -389,7 +392,7 @@ async function arm($: any, s: State, inbox: string, results: string): Promise<{ 
   const timer = $.clock.every(POLL_MS, () => { void scan() })
   s.stop = () => timer.cancel()
   void scan()
-  return { result: `Watching ${inbox} every ${POLL_MS / 1000}s; replies go to ${results}. HMAC key: ${keyFile ? 'set' : 'none (envelopes read unverifiable)'}. ${NOTE}` }
+  return { result: `Watching ${inbox} every ${POLL_MS / 1000}s; replies go to ${results}. HMAC key: ${keyFile ? 'set' : 'none (envelopes read unverifiable)'}; strict or not is decided per task by the CLI. ${NOTE}` }
 }
 
 export const register: Register = (on) => {

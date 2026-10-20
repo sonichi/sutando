@@ -95,6 +95,15 @@ class PluginShape(unittest.TestCase):
             self.assertTrue(any(ln.endswith("plugin test ag2space-inbox") and "claude" in ln for ln in steps),
                             "CI runs the Mod's cases under the CLI's harness")
 
+    def test_the_mod_holds_no_copy_of_the_hmac_strictness_rule(self):
+        """Strict or not is hmac_policy's call through `inbox envelope`, per task: the Mod reads no
+        AG2_HMAC_STRICT and compares no verdict against a mode of its own."""
+        src = REGISTER.read_text()
+        self.assertNotIn("AG2_HMAC_STRICT", src)
+        self.assertNotIn("strict &&", src)
+        self.assertIn("['envelope', '--verdict', verdict]", src)
+        self.assertIn("policy.data.submit", src)
+
     def test_pinned_non_owner_note_is_the_shared_owners(self):
         mod = re.search(r"^const NON_OWNER_NOTE = `(.*)`$", REGISTER.read_text(), re.M).group(1)
         self.assertEqual(mod, task_io.NON_OWNER_NOTE)
@@ -226,7 +235,7 @@ class Measure(unittest.TestCase):
 from ag2_sparrow import _dirs, connect_common as cm, holder_lock, tmux_pane_keys, tmux_probe  # noqa: E402
 from ag2_sparrow import claude_local_accepter as accepter, claude_local_card as card, claude_local_records as records  # noqa: E402
 
-from ag2_sparrow.adapters.claude_code import cli, detector, hold as hold_mod, inbox, launcher, trust  # noqa: E402
+from ag2_sparrow.adapters.claude_code import cli, detector, hmac_policy, hold as hold_mod, inbox, launcher, trust  # noqa: E402
 from ag2_sparrow.hitl.schema import ActionReply, STATUS_IN_PROGRESS, STATUS_PENDING, STATUS_RESOLVED  # noqa: E402
 
 # The fake is a #!/bin/sh wrapper that execs the quoted interpreter on the body beside
@@ -1101,7 +1110,8 @@ class ConnectMod(unittest.TestCase):
         src = REGISTER.read_text()
         self.assertNotIn("$.fs.write", src)
         self.assertNotIn("os.replace", src)
-        for verb in ("'claim'", "'interrupt'", "'authorize'", "'confirm'", "'stage'", "'publish'", "'park'", "'progress'", "'check-inode'"):
+        for verb in ("'claim'", "'interrupt'", "'authorize'", "'confirm'", "'stage'", "'publish'", "'park'", "'progress'", "'check-inode'",
+                     "'envelope'"):
             self.assertIn(verb, src, verb)
         self.assertIn("'inbox'", src)
         self.assertIn("$.session.id()", src, "the session-id witness")
@@ -1300,20 +1310,27 @@ class ConnectStrict(ConnectBase):
             key.write_text(key_text)
         return self.install_with(self.runner(), False, "--hmac-strict", *extra)
 
-    def test_strict_mode_needs_a_key_the_verifier_accepts(self):
-        (self.home / "task-hmac.key").unlink()
-        rc, _, err = self.strict()
-        self.assertEqual(rc, 2)
-        self.assertIn("--hmac-strict needs a usable key", err)
-        self.assertFalse(cli.config_path().exists())
+    def test_strict_mode_refuses_a_malformed_key_and_records_a_key_not_there_yet(self):
         rc, _, err = self.strict("not-a-key")
-        self.assertEqual((rc, "not a 64-hex-character key" in err), (2, True))
+        self.assertEqual((rc, "not a 64-hex-character key" in err, "--hmac-strict needs a usable key" in err), (2, True, True))
+        self.assertFalse(cli.config_path().exists())
+        (self.home / "task-hmac.key").unlink()
+        rc, out, err = self.strict()
+        self.assertEqual(rc, 0, err)
+        self.assertIn("warning: %s missing: strict mode submits nothing until it is back" % (self.home / "task-hmac.key"), out)
+        self.assertIn("honoured without a reinstall", out)
+        cfg = cli.read_config(cli.config_path())
+        self.assertEqual((cfg["HMAC_STRICT"], cfg["HMAC_KEY_FILE"]), ("1", str(self.home / "task-hmac.key")), "strict, key absent")
+        self.runners[-1].stop_session()
         rc, _, err = self.strict("ab" * 32)
         self.assertEqual(rc, 0, err)
         cfg = cli.read_config(cli.config_path())
         self.assertEqual((cfg["HMAC_STRICT"], cfg["HMAC_KEY_FILE"]), ("1", str(self.home / "task-hmac.key")))
         self.runners[-1].stop_session()
-        self.assertEqual(launcher.session_env(cfg, "/c", "/r")["AG2_HMAC_STRICT"], "1", "reaches the session's environment")
+        env = launcher.session_env(cfg, "/c", "/r")
+        self.assertEqual(env["AG2_HMAC_KEY_FILE"], cfg["HMAC_KEY_FILE"], "the verifier's key path reaches the session")
+        self.assertNotIn("AG2_HMAC_STRICT", env, "strictness is read per task, never frozen into the session")
+        self.assertNotIn("HMAC_STRICT", launcher.SESSION_ENV_KEYS)
         rc, _, err = self.main("install", "--plugin-dir", str(self.plugin), "--inbox", str(self.inbox), "--hmac-strict")
         self.assertEqual((rc, "no key file" in err), (2, True))
 
@@ -1329,6 +1346,74 @@ class ConnectStrict(ConnectBase):
         self.assertIn("PASS hmac key", self.main("verify")[1])
         self.configure(HMAC_KEY_FILE="", HMAC_STRICT="")
         self.assertIn("PASS hmac key: none (every task reads unsigned)", self.main("verify")[1])
+
+    def test_strictness_is_derived_per_read_from_the_config_and_the_key_file_as_it_is_then(self):
+        """The one owner, hmac_policy.decide, and the Mod's `inbox envelope` verb over it: key present
+        and no opt-out is strict; the opt-out is lenient whatever the key; a key added after install is
+        honoured on the next read with no reinstall; a key removed under strict refuses, never lenient."""
+        key = self.home / "task-hmac.key"
+        key.unlink()
+        self.assertEqual(self.install_with(self.runner())[0], 0, "a key not there yet is recorded")
+        self.runners[-1].stop_session()
+        cfg = cli.read_config(cli.config_path())
+        self.assertEqual(hmac_policy.mode(cfg), hmac_policy.STRICT)
+        missing = "strict mode: %s missing: strict mode submits nothing until it is back" % key
+        for verdict in ("verified", "unsigned", "unverifiable"):
+            self.assertEqual(hmac_policy.decide(cfg, verdict), (False, missing), verdict)
+        self.assertIn("FAIL hmac key: strict mode: %s missing" % key, self.main("verify")[1])
+        key.write_text("ab" * 32)                       # added after install: strict on the next read, no reinstall
+        self.assertEqual(hmac_policy.decide(cfg, "verified"), (True, ""))
+        self.assertEqual(hmac_policy.decide(cfg, "unsigned"), (False, "strict mode: envelope unsigned"))
+        self.assertEqual(hmac_policy.decide(cfg, "unverifiable"), (False, "strict mode: envelope unverifiable"))
+        self.assertEqual(hmac_policy.decide(cfg, "invalid"), (False, "envelope invalid"))
+        self.assertEqual(hmac_policy.decide(cfg, "bogus")[0], False)
+        self.assertIn("PASS hmac key", self.main("verify")[1])
+        key.write_text("short")                          # malformed while strict: refused with the reason, never lenient
+        self.assertEqual(hmac_policy.decide(cfg, "verified"), (False, "strict mode: %s is not a 64-hex-character key, so every envelope reads unverifiable" % key))
+        key.unlink()                                     # removed while strict: refused with the one reason line
+        self.assertEqual(hmac_policy.decide(cfg, "verified"), (False, missing))
+        lenient = dict(cfg, HMAC_STRICT="")              # --no-hmac-strict recorded: lenient regardless of the key
+        self.assertEqual(hmac_policy.mode(lenient), hmac_policy.LENIENT)
+        for verdict in ("verified", "unsigned", "unverifiable"):
+            self.assertEqual(hmac_policy.decide(lenient, verdict), (True, ""), verdict)
+        self.assertEqual(hmac_policy.decide(lenient, "invalid"), (False, "envelope invalid"))
+        key.write_text("ab" * 32)
+        self.assertEqual(hmac_policy.decide(lenient, "unsigned"), (True, ""))
+        off = dict(cfg, HMAC_KEY_FILE="", HMAC_STRICT="")
+        self.assertEqual(hmac_policy.mode(off), hmac_policy.OFF)
+        self.assertEqual(hmac_policy.decide(off, "unsigned"), (True, ""))
+        self.assertEqual(hmac_policy.decide(off, "invalid"), (False, "envelope invalid"))
+        self.assertIs(cli.key_problem, hmac_policy.key_problem, "install reads the same owner")
+
+    def test_the_envelope_verb_answers_from_the_installed_config_and_the_key_file_at_that_call(self):
+        key = self.home / "task-hmac.key"
+        self.configure(HMAC_STRICT="1")
+
+        def verb(verdict, environ=None):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = cli.main(["inbox", "--root", str(self.work), "envelope", "--verdict", verdict])
+            return rc, json.loads(out.getvalue())
+
+        self.assertEqual(verb("verified"), (0, {"verdict": "verified", "mode": "strict", "submit": True, "reason": ""}))
+        rc, out = verb("unsigned")
+        self.assertEqual((rc, out["submit"], out["reason"]), (0, False, "strict mode: envelope unsigned"))
+        key.unlink()
+        rc, out = verb("verified")
+        self.assertEqual((rc, out["submit"]), (0, False))
+        self.assertEqual(out["reason"], "strict mode: %s missing: strict mode submits nothing until it is back" % key)
+        key.write_text("ab" * 32)
+        self.assertEqual(verb("verified")[1]["submit"], True, "the next call sees the key back; nothing was reinstalled")
+        self.configure(HMAC_STRICT="")
+        self.assertEqual(verb("unverifiable")[1], {"verdict": "unverifiable", "mode": "lenient", "submit": True, "reason": ""})
+        self.assertEqual(verb("invalid")[1]["submit"], False)
+        self.assertEqual(inbox.envelope("unsigned", {inbox.CONFIG_DIR_VAR: str(cli.config_dir())})["mode"], "lenient", "the pane's config dir")
+        with self.assertRaises(inbox.Parked):
+            inbox.envelope("verified", {inbox.CONFIG_DIR_VAR: str(self.home / "none")})
+        cli.config_path().unlink()
+        rc, out = verb("verified")
+        self.assertEqual((rc, out.get("retry"), "unreadable" in out.get("refused", "")), (1, True, True), "fail closed, retried")
+        self.assertNotIn("envelope", inbox.PROGRESS_VERBS, "a read: it never clears or raises the progress alarm")
 
     def test_a_key_file_alone_is_strict_and_no_hmac_strict_opts_out(self):
         runner = self.runner()

@@ -109,8 +109,9 @@ The adapter lives beside the Python package on purpose, not inside it: it is a
 Claude Code plugin, not Python, so it ships with the repo and not in the wheel.
 
 Environment: `AG2_INBOX_DIR` and `AG2_RESULTS_DIR` (defaults for the tool
-arguments), `AG2_HMAC_KEY_FILE`, `AG2_HMAC_STRICT`, `AG2_INBOX_INODE`,
-`AG2_AUTOARM`, `AG2_SPARROW_CLI` (default `ag2-sparrow-claude-local`).
+arguments), `AG2_HMAC_KEY_FILE` (the verifier's key path; strictness is never
+in the environment, see the HMAC policy), `AG2_INBOX_INODE`, `AG2_AUTOARM`,
+`AG2_SPARROW_CLI` (default `ag2-sparrow-claude-local`).
 
 ## Envelope and trust
 
@@ -175,13 +176,35 @@ stamp without `id:`, every tier shape) and checks that an always-verified or
 always-owner mutant fails. Verdicts: `verified` / `unsigned` (no stamp) /
 `invalid` (stamp present, content changed) / `unverifiable` (no key, or a key
 that is not exactly 64 hex characters). `invalid` is never submitted.
-`install --hmac-key-file` is strict by default (`AG2_HMAC_STRICT=1`: only
-`verified` is submitted, and `install` refuses a key the verifier would not
-accept); `--no-hmac-strict` opts out to the soak mode, where `unsigned` and
-`unverifiable` are submitted with the verdict in the envelope line. `verify`
-prints the mode. When the
-verifier itself cannot run (no `python3`, a timeout, no output) nothing is
-submitted and a debug line says so; the file is retried next tick.
+The verdict is the mod's; whether the task is then submitted is the CLI's,
+decided per task by `ag2-sparrow-claude-local inbox envelope --verdict <v>`
+from one owner, `ag2_sparrow/adapters/claude_code/hmac_policy.py`, which
+`install`, `verify` and that verb all read and the mod never copies. The config
+records only the choice (`HMAC_KEY_FILE`, the key path; `HMAC_STRICT` empty
+when `--no-hmac-strict` was given); strictness is derived at each read from
+that choice plus the key file as it is at that moment. The exact rule:
+
+- No key path recorded: off. Every task reads `unsigned` and is submitted.
+- Key path recorded and `--no-hmac-strict` recorded: lenient, whatever the key
+  file holds. `unsigned` and `unverifiable` are submitted with the verdict in
+  the envelope line.
+- Key path recorded and no `--no-hmac-strict` (the default with
+  `--hmac-key-file`, or `--hmac-strict`): strict. Only `verified` is submitted;
+  a task without a valid envelope is refused. While the key file is missing,
+  unreadable or not 64 hex characters, every task is refused with that one
+  reason line (`strict mode: <path> missing: strict mode submits nothing until
+  it is back`), never read as "no HMAC". A key written there later is honoured
+  on the next task, without a reinstall or a session restart.
+- `invalid` is never submitted in any mode.
+
+So `install --hmac-key-file <path>` records a path whose key is not there yet
+(it prints a warning and `verify` fails its `hmac key` part until the key
+appears); it still refuses a key file that exists but is not 64 hex characters,
+or `--hmac-strict` with no `--hmac-key-file`. A refused task is retired with the
+reason in a debug line; a task the CLI could not answer for (it did not run, or
+the installed config was unreadable) is retried next tick, as is one whose
+verifier itself cannot run (no `python3`, a timeout, no output). `verify` prints
+the mode, read the same way.
 
 Sparrow itself never stamps: the stamper is a host-injected seam
 (`local_task_protocol.set_task_stamper`), and only Sutando's
@@ -411,8 +434,9 @@ every start.
 `verify` prints PASS/FAIL per part (config, claude, login, tmux, socket and
 its length, plugin, inbox, results, hmac key, the HITL store being the
 bridge's, the bridge feeding this root, the agent's token file and bridge unit
-when install runs the bridge, supervisor) and INFO lines: the agent, the HMAC mode (strict or
-not), whether non-owner tasks are refused or submitted, the manager's state, the
+when install runs the bridge, supervisor) and INFO lines: the agent, the HMAC mode (strict,
+not strict or off, as the policy reads the config and the key file at that moment), whether
+non-owner tasks are refused or submitted, the manager's state, the
 occupancy beside it (`held by hold pid N, its claude pid M`, `held by hold
 pid N, no live claude attached`, `restarting`, `unobserved`, never a bare
 `free` under a live job), the session id, whether the inbox's folder trust is
