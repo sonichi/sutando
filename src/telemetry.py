@@ -115,7 +115,11 @@ def _durable_id_path() -> Path:
 
 
 def _fixed_temp_roots(nt: bool = os.name == "nt", env=None) -> list[str]:
-    """The OS's fixed temp locations; never one chosen through TMPDIR/TEMP/TMP or the cwd fallback."""
+    """The OS temp locations; never one chosen through TMPDIR/TEMP/TMP or the cwd fallback.
+
+    The POSIX roots are fixed. The Windows roots come from LOCALAPPDATA and SystemRoot, which the
+    environment can override, so they are only as fixed as those variables.
+    """
     env = os.environ if env is None else env
     if nt:
         return [ntpath.join(env[v], "Temp") for v in ("LOCALAPPDATA", "SYSTEMROOT") if env.get(v)]

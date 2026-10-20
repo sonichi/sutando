@@ -163,6 +163,21 @@ with tempfile.TemporaryDirectory() as fresh_home, mock.patch.dict(
     os.environ["SUTANDO_TELEMETRY_ID_FILE"] = os.path.join(fresh_home, "telemetry-id")
     check("in-process: an explicit SUTANDO_TELEMETRY_ID_FILE is kept", mod.ephemeral_identity() is False)
 
+# A root matches whole path components only (/tmpfoo is not under /tmp), and /var/tmp is a root.
+if os.name != "nt":
+    with mock.patch.dict(os.environ, {"POSTHOG_API_KEY": "phc_test"}):
+        for k in ("SUTANDO_TELEMETRY_ID_FILE", "XDG_DATA_HOME", "SUTANDO_TELEMETRY"):
+            os.environ.pop(k, None)
+        spec = importlib.util.spec_from_file_location("telemetry_roots", REPO / "src" / "telemetry.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        os.environ["HOME"] = os.path.realpath("/tmp") + "foo-sutando-telemetry-guard-home"
+        check("a HOME under /tmpfoo is not under /tmp → ephemeral_identity() False",
+              mod.ephemeral_identity() is False, os.environ["HOME"])
+        os.environ["HOME"] = os.path.join(os.path.realpath("/var/tmp"), "sutando-telemetry-guard-home")
+        check("a HOME under /var/tmp → ephemeral_identity() True", mod.ephemeral_identity() is True,
+              os.environ["HOME"])
+
 # TMPDIR (or the cwd fallback) can name a persistent HOME; only fixed system temp locations count.
 PERSISTENT_HOME = "/nonexistent-sutando-telemetry-guard-home"
 with mock.patch.dict(os.environ, {"HOME": PERSISTENT_HOME, "TMPDIR": PERSISTENT_HOME,
