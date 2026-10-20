@@ -29,7 +29,7 @@ from pathlib import Path
 from ... import _dirs, agent_identity, connect_common as cm, task_io
 from ...connect_common import EXIT_CHILD_HELD, EXIT_HELD, EXIT_UNUSABLE, _v  # noqa: F401
 from ... import claude_local_accepter as accepter, claude_local_card as card, claude_local_records as records
-from . import detector, hold, inbox, launcher, trust
+from . import detector, hmac_policy, hold, inbox, launcher, trust
 from .shape import AUTOARM_VAR, BRIDGE, HITL_ROOT_NAME, LOCAL, SESSION_NAME  # noqa: F401
 
 SHAPE, COMMAND, MIN_CLI = LOCAL.name, LOCAL.command, LOCAL.min_version
@@ -95,17 +95,7 @@ def hitl_store_root() -> Path:
     return card.store_root(_dirs.state_dir())
 
 
-def key_problem(path: str) -> str:
-    """'' when `path` holds the key the plugin's verifier accepts (64 hex characters), else why not."""
-    if not path:
-        return "no key file: strict mode would submit nothing"
-    try:
-        text = Path(path).read_text(encoding="utf-8", errors="replace").strip()
-    except OSError as e:
-        return f"{path} unreadable ({e.strerror or e}): strict mode would submit nothing"
-    if not re.fullmatch(r"[0-9a-fA-F]{64}", text):
-        return f"{path} is not a 64-hex-character key, so every envelope reads unverifiable"
-    return ""
+key_problem = hmac_policy.key_problem
 
 
 def mint_session_id() -> str:
@@ -346,10 +336,13 @@ def install(args) -> int:
     strict = args.hmac_strict or bool(key_file and not args.no_hmac_strict)
     if strict:
         problem = key_problem(key_file)
-        if problem:
+        # A key not there yet is recorded, not refused: strictness is decided per task from the file as it is then.
+        if problem and not (key_file and hmac_policy.key_absent(key_file)):
             why = "--hmac-strict" if args.hmac_strict else "strict mode, the default with --hmac-key-file (--no-hmac-strict opts out),"
             print(f"error: {why} needs a usable key: {problem}", file=sys.stderr)
             return EXIT_UNUSABLE
+        if problem:
+            print(f"warning: {problem}; it is read per task, so a key written there later is honoured without a reinstall")
     where, problem = resolve_root(args)
     if problem:
         print(f"error: {problem}", file=sys.stderr)
@@ -361,7 +354,7 @@ def install(args) -> int:
     values = {"CLAUDE": os.path.abspath(claude), "PLUGIN_DIR": str(plugin), "INBOX_DIR": str(inbox_dir),
               "RESULTS_DIR": str(Path(root) / "results"),
               "CLAUDE_CONFIG_DIR": str(Path(args.claude_config_dir).expanduser().resolve()) if args.claude_config_dir else "",
-              "HMAC_KEY_FILE": key_file, "HMAC_STRICT": "1" if strict else "",
+              "HMAC_KEY_FILE": key_file, "HMAC_STRICT": "1" if strict else hmac_policy.OPT_OUT if args.no_hmac_strict else "",
               "PERMISSION_MODE": args.permission_mode, "SESSION_ID": "",
               "HITL_STORE": str(hitl_store_root() if mode == EXTERNAL else card.store_root(bridge_home(root) / "state")),
               inbox.ALLOW_NON_OWNER: "1" if args.allow_non_owner else "", "AGENT_ID": agent_id, "BRIDGE": mode,
@@ -514,12 +507,15 @@ def verify(_args) -> int:
     cm.check(results, (plugin / ".claude-plugin" / "plugin.json").is_file(), "plugin", str(plugin))
     for key in ("INBOX_DIR", "RESULTS_DIR"):
         cm.check(results, Path(cfg[key]).is_dir(), key.lower().replace("_dir", ""), cfg[key])
-    key, strict = cfg.get("HMAC_KEY_FILE"), cfg.get("HMAC_STRICT") == "1"
-    problem = key_problem(key) if key or strict else ""
+    key, mode = cfg.get("HMAC_KEY_FILE"), hmac_policy.mode(cfg)
+    problem = key_problem(key) if mode != hmac_policy.OFF else ""
     cm.check(results, not problem, "hmac key",
-             (f"strict mode: {problem}" if strict else problem) if problem else key or "none (every task reads unsigned)")
-    print("INFO hmac mode: " + ("strict (only verified envelopes are submitted)" if strict else
-                                "not strict (unsigned and unverifiable envelopes are submitted too)"))
+             (f"strict mode: {problem}" if mode == hmac_policy.STRICT else problem) if problem
+             else key or "none (every task reads unsigned)")
+    print("INFO hmac mode: " + hmac_policy.describe(cfg))
+    if hmac_policy.legacy_opt_out(cfg):
+        print("WARN hmac mode: legacy opt-out (HMAC_STRICT recorded empty by an older install --no-hmac-strict): not "
+              "strict; unsigned and unverifiable envelopes are submitted. Reinstall without --no-hmac-strict for strict")
     print("INFO non-owner tasks: " + ("submitted with the non-owner note (--allow-non-owner)"
                                       if cfg.get(inbox.ALLOW_NON_OWNER) == "1" else "refused (owner only)"))
     root, mode = cm.work_root(cfg), bridge_mode(cfg)

@@ -195,7 +195,11 @@ def read_config(path: Path) -> dict:
 def load_config(shape: Shape) -> "tuple[dict, str]":
     """(config, '') or ({}, why): a missing, dangling, directory, unreadable, unparsable or key-less
     config is one line, never a traceback. The one loader every command reads through."""
-    path = config_path(shape)
+    return load_config_at(shape, config_path(shape))
+
+
+def load_config_at(shape: Shape, path: Path) -> "tuple[dict, str]":
+    """load_config for the config at `path`: what a pane's verb reads when its config dir is not the CLI's."""
     if path.is_symlink() and not path.exists():
         return {}, f"{path} is a dangling symlink; remove it by hand (rm {shlex.quote(str(path))}), then run {shape.command} install"
     try:

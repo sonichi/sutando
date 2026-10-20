@@ -109,8 +109,9 @@ The adapter lives beside the Python package on purpose, not inside it: it is a
 Claude Code plugin, not Python, so it ships with the repo and not in the wheel.
 
 Environment: `AG2_INBOX_DIR` and `AG2_RESULTS_DIR` (defaults for the tool
-arguments), `AG2_HMAC_KEY_FILE`, `AG2_HMAC_STRICT`, `AG2_INBOX_INODE`,
-`AG2_AUTOARM`, `AG2_SPARROW_CLI` (default `ag2-sparrow-claude-local`).
+arguments), `AG2_HMAC_KEY_FILE` (the verifier's key path; strictness is never
+in the environment, see the HMAC policy), `AG2_INBOX_INODE`, `AG2_AUTOARM`,
+`AG2_SPARROW_CLI` (default `ag2-sparrow-claude-local`).
 
 ## Envelope and trust
 
@@ -175,13 +176,90 @@ stamp without `id:`, every tier shape) and checks that an always-verified or
 always-owner mutant fails. Verdicts: `verified` / `unsigned` (no stamp) /
 `invalid` (stamp present, content changed) / `unverifiable` (no key, or a key
 that is not exactly 64 hex characters). `invalid` is never submitted.
-`install --hmac-key-file` is strict by default (`AG2_HMAC_STRICT=1`: only
-`verified` is submitted, and `install` refuses a key the verifier would not
-accept); `--no-hmac-strict` opts out to the soak mode, where `unsigned` and
-`unverifiable` are submitted with the verdict in the envelope line. `verify`
-prints the mode. When the
-verifier itself cannot run (no `python3`, a timeout, no output) nothing is
-submitted and a debug line says so; the file is retried next tick.
+The verdict is the mod's; whether the task is then submitted is the CLI's,
+decided per task by `ag2-sparrow-claude-local inbox envelope --verdict <v>`
+from one owner, `ag2_sparrow/adapters/claude_code/hmac_policy.py`, which
+`install`, `verify` and that verb all read and the mod never copies. The config
+records only the choice (`HMAC_KEY_FILE`, the key path; `HMAC_STRICT`, `1` for
+strict, `0` when `--no-hmac-strict` was given); strictness is derived at each
+read from that choice plus the key file as it is at that moment. The exact
+rule, closed by default:
+
+- `HMAC_STRICT=1` (a key path without `--no-hmac-strict`, the default with
+  `--hmac-key-file`; or `--hmac-strict`): strict, read before anything else.
+  Only `verified` is submitted; a task without a valid envelope is refused.
+  While the key file is missing, unreadable, not 64 hex characters, or no path
+  is recorded at all, every task is refused with that one reason line
+  (`strict mode: <path> missing: strict mode submits nothing until it is
+  back`), never read as "no HMAC": the mod holds such a task with the same
+  backoff and stuck mark as any other retried task, so it is submitted once
+  the key lands, without a reinstall or a session restart.
+- Key path recorded and `HMAC_STRICT=0` (the explicit `--no-hmac-strict`
+  record): lenient, whatever the key file holds. `unsigned` and `unverifiable`
+  are submitted with the verdict in the envelope line.
+- Key path recorded and `HMAC_STRICT` present but empty: lenient too; that is
+  the record an older install wrote for `--no-hmac-strict`, honoured as it
+  is, nothing to rerun. `verify` prints a `WARN hmac mode: legacy opt-out`
+  line so the lenient install is visible.
+- Key path recorded and `HMAC_STRICT` missing or any other value: strict, as
+  above. A missing line is no record.
+- No key path and `HMAC_STRICT` not `1`: off. Every task reads `unsigned` and
+  is submitted.
+- `invalid` is never submitted in any mode.
+- A config that is missing, unreadable, unparsable or short of a required key
+  is not a config that says off: the verb parks (retry) and the task is held.
+
+Two more things the rule rests on. The launcher still exports
+`AG2_HMAC_STRICT=1` into the session whenever the mode is strict, for a plugin
+older than the `envelope` verb, which read that bit itself; the current mod
+never reads it (pinned). And the verifier's key *path* (`AG2_HMAC_KEY_FILE`) is
+set in the session's environment at its creation, so a reinstall with another
+path takes a session restart; the key's presence and content at that path are
+read live, by the verifier and the policy alike. Those are two reads, so the
+verifier prints the sha256 of the key bytes it read (`absent` when none) and
+the mod passes it as `--key-seen`: when the policy's own read of the key file
+differs (the key landed or was rotated in between), the verdict is stale and
+the task is held to be verified again, never retired. A reinstall that changes
+the key path without a session restart therefore holds every task (the
+verifier still reads the old path, so unless both hold the same bytes each task reads as a changed key) and marks it
+stuck until the session restarts: it fails closed. The watch tool's arm
+line names the mode as the CLI reads it then.
+
+Any task the mod retires goes through one path that clears its durable stuck
+mark first, whether that mark was set by this mod or by one before a session
+restart or plugin reload (the clear is sent every time; clearing no mark is
+harmless): a verdict the policy refuses (`unsigned`, `invalid`), a header id
+that does not match the file stem (the stem's mark), a final claim or
+authorize refusal, an interrupted answer, and every release of a submitted
+task's offer (published by `ag2space_reply`, parked or delivered at a turn's
+end, or retried by the scan), so a mark written while the authorization was
+retried is the offer's to clear. An offer whose turn was not confirmed is the
+exception: its claim stays `CALLING` with no answer and the CLI refuses a second
+claim of it as final, so the mod keeps the offer and never claims it again.
+Instead it marks the task stuck on each backed-off try; the CLI's reply keeps
+only the marks of unresolved tasks (from the lifecycle: the claim settled, or a
+result live and ready, archived or quarantined), so once the next start answers
+it as interrupted, even if that answer is already archived, the mark is missing
+from the reply and the offer is released through the mark clear. Deferred
+(#5747): the held set lives in the mod's memory, so a fresh mod in a live
+session (a plugin reload without a session restart) claims such a task again,
+gets the CLI's final refusal for a `CALLING` attempt, and retires it, clearing
+its mark while it is still unanswered. Fix sketch: the mod persists its held
+set beside the stuck mark in the progress record and reads it back at arm.
+Until the CLI confirms the clear (a refusal, exit 3, or
+a CLI that did not run) the mod keeps the task, retries only the clear after
+1, 2, 4 ... ticks capped at 60, and marks it seen once the clear lands; no
+mark outlives its task.
+
+So `install --hmac-key-file <path>` records a path whose key is not there yet
+(it prints a warning and `verify` fails its `hmac key` part until the key
+appears); it still refuses a key file that exists but is not 64 hex characters,
+or `--hmac-strict` with no `--hmac-key-file`. A task refused for its verdict is
+retired with the reason in a debug line; one the CLI could not answer for (it
+did not run, or the installed config was unreadable) is held with backoff and
+the stuck mark, like one held for a missing key; one whose verifier itself
+cannot run (no `python3`, a timeout, no output) is retried next tick. `verify`
+prints the mode, read the same way.
 
 Sparrow itself never stamps: the stamper is a host-injected seam
 (`local_task_protocol.set_task_stamper`), and only Sutando's
@@ -411,8 +489,9 @@ every start.
 `verify` prints PASS/FAIL per part (config, claude, login, tmux, socket and
 its length, plugin, inbox, results, hmac key, the HITL store being the
 bridge's, the bridge feeding this root, the agent's token file and bridge unit
-when install runs the bridge, supervisor) and INFO lines: the agent, the HMAC mode (strict or
-not), whether non-owner tasks are refused or submitted, the manager's state, the
+when install runs the bridge, supervisor) and INFO lines: the agent, the HMAC mode (strict,
+not strict or off, as the policy reads the config and the key file at that moment), whether
+non-owner tasks are refused or submitted, the manager's state, the
 occupancy beside it (`held by hold pid N, its claude pid M`, `held by hold
 pid N, no live claude attached`, `restarting`, `unobserved`, never a bare
 `free` under a live job), the session id, whether the inbox's folder trust is
@@ -439,7 +518,28 @@ mtime delta.
   submission and a refused claim never submitted, once-only claims, one
   authorization per attempt, turn confirmation inside the CLI's frame, park on a turn without
   a reply, the inode refusal, the session-id witness, intake closing on a hard
-  progress failure).
+  progress failure). Its fake CLI is bound to `tests/cli-contract.ts`: each
+  scenario there is answered by the fake in the harness and by the real verbs in
+  the Python suite, and every step must have the same shape (exit code,
+  refused, retry, the named fields and keys). The scenario set is pinned by
+  name (`CONTRACT_NAMES`): each runner fails unless it ran exactly those. Covered: `claim` (absent,
+  not admitted, ready or unready result, prepared again, `CALLING`, after an
+  unconfirmed turn), `authorize` (twice, unclaimed, another text), `confirm`
+  (the authorized turn, a bad nonce), `stage` (another turn, this turn, another
+  body), `publish` (staged, nothing staged), `park` (another turn, the protocol
+  failure, a staged answer), `interrupt` (absent, again, unready, ready,
+  `CALLING`), `progress` (`--stuck`/`--unstuck`, the marks kept for an unresolved
+  task and dropped for a ready, archived or published one, session, intake and
+  generation writes), `envelope` with no key path (off), with the opt-out
+  (lenient) and strict (key present: only verified submitted; key file missing:
+  every task held with the one reason line; a verdict read with another key:
+  held), the fake's answer derived from the same config and key-file state, and
+  `check-inode` against another inode. Not covered: `check-inode` on the
+  matching inode, and the injected faults (claims-lock, store and
+  unreadable-claim failures, exit 3 mirror failures, a staged answer whose blob
+  is not in place, refused or failed `--unstuck` and `park`, a CLI that does not
+  run): those are failure modes the fake injects, pinned against the real verbs
+  separately in the Python suite.
 - `python3 packages/ag2-sparrow/tests/test_claude_code_adapter.py` (stdlib:
   `hold`, the inbox CLI, the detector, the launcher on a scratch tmux server
   under a short `/tmp` HOME, the card and the accepter, install, verify,

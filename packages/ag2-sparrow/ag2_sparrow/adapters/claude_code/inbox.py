@@ -20,6 +20,7 @@ from pathlib import Path
 
 from ... import connect_common as cm, task_io, task_lifecycle as lifecycle
 from ... import claude_local_records as records
+from . import hmac_policy
 from .shape import LOCAL
 
 EXIT_OK, EXIT_REFUSED, EXIT_USAGE, EXIT_PROGRESS = 0, 1, 2, 3
@@ -102,14 +103,30 @@ def recover_dead_generation(root) -> int:
     return len(dead)
 
 
+def _installed_config(environ=None) -> Path:
+    """The config the pane names (its config dir), else the CLI's own."""
+    config_dir = (os.environ if environ is None else environ).get(CONFIG_DIR_VAR)
+    return Path(config_dir) / cm.config_path(LOCAL).name if config_dir else cm.config_path(LOCAL)
+
+
 def allow_non_owner(environ=None) -> bool:
     """The installed --allow-non-owner, read from the config the pane names; unreadable reads as off."""
-    config_dir = (os.environ if environ is None else environ).get(CONFIG_DIR_VAR)
-    path = Path(config_dir) / cm.config_path(LOCAL).name if config_dir else cm.config_path(LOCAL)
     try:
-        return cm.read_config(path).get(ALLOW_NON_OWNER) == "1"
+        return cm.read_config(_installed_config(environ)).get(ALLOW_NON_OWNER) == "1"
     except (OSError, ValueError):
         return False
+
+
+def envelope(verdict: str, environ=None, key_seen=None) -> dict:
+    """The Mod's question before a claim: is a task with this envelope verdict submitted now? Answered
+    by hmac_policy from the installed config and the key file as it is at this call; a config that is
+    missing, unreadable, unparsable or short of a required key parks (fail closed) and the Mod retries.
+    `key_seen` is the digest of the key the verifier read; a different key here holds the task."""
+    cfg, why = cm.load_config_at(LOCAL, _installed_config(environ))
+    if why:
+        raise Parked("the installed config is not usable (%s); retried" % why)
+    submit, reason, retry = hmac_policy.decide(cfg, verdict, key_seen)
+    return {"verdict": verdict, "mode": hmac_policy.mode(cfg), "submit": submit, "reason": reason, "retry": retry}
 
 
 def admit(root, task_id, allow: bool) -> "tuple[str | None, dict, str]":
@@ -470,6 +487,8 @@ def main(args) -> int:
                            args.stuck, args.stuck_detail, args.unstuck)
         elif verb == "check-inode":
             out = check_inode(args.dir or os.getcwd(), args.expect)
+        elif verb == "envelope":
+            out = envelope(args.verdict, key_seen=args.key_seen)
         else:
             raise Refused("unknown verb %s" % verb)
     except records.RecordError as e:
@@ -496,7 +515,7 @@ def main(args) -> int:
 
 def add_parser(sub) -> None:
     p = sub.add_parser("inbox", help="the Mod's lifecycle verbs (claim, interrupt, authorize, confirm, stage, publish, park, "
-                       "progress, check-inode); never by hand")
+                       "progress, check-inode, envelope); never by hand")
     p.add_argument("--root", help="the work root (default: AG2_SPARROW_ROOT, else the cwd's parent)")
     v = p.add_subparsers(dest="verb", required=True)
     c = v.add_parser("claim"); c.add_argument("task_id")
@@ -513,4 +532,5 @@ def add_parser(sub) -> None:
     g.add_argument("--reason"); g.add_argument("--bind-generation", action="store_true")
     g.add_argument("--stuck"); g.add_argument("--stuck-detail", default=""); g.add_argument("--unstuck")
     i = v.add_parser("check-inode"); i.add_argument("--dir"); i.add_argument("--expect", required=True)
+    e = v.add_parser("envelope"); e.add_argument("--verdict", required=True); e.add_argument("--key-seen")
     p.set_defaults(func=main)

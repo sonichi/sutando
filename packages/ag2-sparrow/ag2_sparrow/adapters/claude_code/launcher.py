@@ -23,7 +23,7 @@ from pathlib import Path
 
 from ... import connect_common as cm, task_io, tmux_pane_keys, tmux_probe
 from ... import claude_local_accepter as accepter, claude_local_card as card, claude_local_records as records
-from . import detector, hold, inbox, trust
+from . import detector, hmac_policy, hold, inbox, trust
 from .shape import (AUTOARM_VAR, HITL_ID_PREFIX, LAUNCHER_LOCK, LOCAL, MIN_TMUX, SESSION_NAME, SOCKET_NAME,
                     SOCKET_PATH_MAX, SUPERVISOR_LOCK)
 
@@ -39,7 +39,6 @@ TITLE_CHANGED = "title changed"
 FIELD_SEP = "|:ag2:|"
 START_COMMAND_RE = re.compile(r'^"?ag2-sparrow-claude-local hold --generation=[0-9a-f]{32} --"?$')
 TMUX_VERSION_RE = re.compile(r"(\d+)\.(\d+)")
-SESSION_ENV_KEYS = ("CLAUDE_CONFIG_DIR", "HMAC_KEY_FILE", "HMAC_STRICT")
 
 
 def socket_path(config_dir) -> Path:
@@ -127,10 +126,12 @@ def session_env(cfg: dict, config_dir, root) -> dict:
     """The session environment set at creation with -e: what hold and the Mod read."""
     env = {hold.ENV_ROOT: str(root), hold.ENV_CONFIG_DIR: str(config_dir), hold.ENV_SESSION_ID: cfg["SESSION_ID"],
            hold.ENV_HITL_STORE: cfg.get("HITL_STORE", ""), AUTOARM_VAR: "1"}
-    for key, var in (("CLAUDE_CONFIG_DIR", "CLAUDE_CONFIG_DIR"), ("HMAC_KEY_FILE", "AG2_HMAC_KEY_FILE"),
-                     ("HMAC_STRICT", "AG2_HMAC_STRICT")):
+    for key, var in (("CLAUDE_CONFIG_DIR", "CLAUDE_CONFIG_DIR"), ("HMAC_KEY_FILE", "AG2_HMAC_KEY_FILE")):
         if cfg.get(key):
             env[var] = cfg[key]
+    # Only for a plugin older than `inbox envelope`, which read this bit itself: the current Mod asks the verb.
+    if hmac_policy.mode(cfg) == hmac_policy.STRICT:
+        env["AG2_HMAC_STRICT"] = "1"
     return env
 
 
