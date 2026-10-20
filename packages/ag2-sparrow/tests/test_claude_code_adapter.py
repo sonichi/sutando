@@ -2832,6 +2832,9 @@ def contract_shape(expect: dict, rc: int, out: dict) -> str:
     bad = ["%s %r != %r" % (k, got[k], expect[k]) for k in ("exit", "refused", "retry") if got[k] != expect[k]]
     bad += ["%s %r != %r" % (k, out.get(k), v) for k, v in (expect.get("fields") or {}).items() if out.get(k) != v]
     bad += ["no %s" % k for k in expect.get("has") or [] if k not in out]
+    reason = str(out.get("reason", ""))
+    bad += ["reason %r" % reason for k in ("reason_prefix",) if k in expect and not reason.startswith(expect[k])]
+    bad += ["reason %r" % reason for k in ("reason_suffix",) if k in expect and not reason.endswith(expect[k])]
     bad += ["%s not marked" % k for k in expect.get("marked") or [] if k not in (out.get("stuck") or {})]
     bad += ["%s still marked" % k for k in expect.get("unmarked") or [] if k in (out.get("stuck") or {})]
     return "; ".join(bad)
@@ -2912,7 +2915,13 @@ class InboxCli(ConnectBase):
         diffs = []
         for sc in contract_scenarios():
             # The harness answers envelope from its options; the same choice is recorded in the config here.
-            self.configure(**{"off": {"HMAC_KEY_FILE": "", "HMAC_STRICT": ""}, "lenient": {"HMAC_STRICT": "0"}}.get(sc.get("hmac"), {}))
+            self.configure(**{"off": {"HMAC_KEY_FILE": "", "HMAC_STRICT": ""}, "lenient": {"HMAC_STRICT": "0"},
+                              "strict": {"HMAC_STRICT": "1"}}.get(sc.get("hmac"), {}))
+            key = self.home / "task-hmac.key"
+            if sc.get("key") == "present":
+                key.write_text("ab" * 32)
+            elif sc.get("key") == "missing" and key.exists():
+                key.unlink()
             self.task(sc["task"], sc["tier"])
             if "result" in sc:
                 (self.results / (sc["task"] + ".txt")).write_text(sc["result"])

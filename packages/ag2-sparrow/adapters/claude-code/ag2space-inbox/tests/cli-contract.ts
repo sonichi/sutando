@@ -1449,5 +1449,211 @@ export const CONTRACT = [
     }
    }
   ]
+ },
+ {
+  "name": "strict envelope with the key present: only verified is submitted",
+  "task": "task-x1",
+  "tier": "owner",
+  "hmac": "strict",
+  "key": "present",
+  "steps": [
+   {
+    "argv": [
+     "envelope",
+     "--verdict",
+     "verified"
+    ],
+    "expect": {
+     "exit": 0,
+     "refused": false,
+     "retry": false,
+     "fields": {
+      "mode": "strict",
+      "submit": true,
+      "reason": ""
+     }
+    }
+   },
+   {
+    "argv": [
+     "envelope",
+     "--verdict",
+     "unsigned"
+    ],
+    "expect": {
+     "exit": 0,
+     "refused": false,
+     "retry": false,
+     "fields": {
+      "mode": "strict",
+      "submit": false,
+      "reason": "strict mode: envelope unsigned"
+     }
+    }
+   },
+   {
+    "argv": [
+     "envelope",
+     "--verdict",
+     "unverifiable"
+    ],
+    "expect": {
+     "exit": 0,
+     "refused": false,
+     "retry": false,
+     "fields": {
+      "mode": "strict",
+      "submit": false,
+      "reason": "strict mode: envelope unverifiable"
+     }
+    }
+   },
+   {
+    "argv": [
+     "envelope",
+     "--verdict",
+     "invalid"
+    ],
+    "expect": {
+     "exit": 0,
+     "refused": false,
+     "retry": false,
+     "fields": {
+      "mode": "strict",
+      "submit": false,
+      "reason": "envelope invalid"
+     }
+    }
+   }
+  ]
+ },
+ {
+  "name": "strict envelope with the key file missing: every task held",
+  "task": "task-x2",
+  "tier": "owner",
+  "hmac": "strict",
+  "key": "missing",
+  "steps": [
+   {
+    "argv": [
+     "envelope",
+     "--verdict",
+     "verified"
+    ],
+    "expect": {
+     "exit": 0,
+     "refused": false,
+     "retry": true,
+     "fields": {
+      "mode": "strict",
+      "submit": false
+     },
+     "reason_prefix": "strict mode: ",
+     "reason_suffix": " missing: strict mode submits nothing until it is back"
+    }
+   },
+   {
+    "argv": [
+     "envelope",
+     "--verdict",
+     "unsigned"
+    ],
+    "expect": {
+     "exit": 0,
+     "refused": false,
+     "retry": true,
+     "fields": {
+      "mode": "strict",
+      "submit": false
+     },
+     "reason_prefix": "strict mode: ",
+     "reason_suffix": " missing: strict mode submits nothing until it is back"
+    }
+   },
+   {
+    "argv": [
+     "envelope",
+     "--verdict",
+     "unverifiable"
+    ],
+    "expect": {
+     "exit": 0,
+     "refused": false,
+     "retry": true,
+     "fields": {
+      "mode": "strict",
+      "submit": false
+     },
+     "reason_prefix": "strict mode: ",
+     "reason_suffix": " missing: strict mode submits nothing until it is back"
+    }
+   }
+  ]
+ },
+ {
+  "name": "strict envelope whose verdict was read with another key: held",
+  "task": "task-x3",
+  "tier": "owner",
+  "hmac": "strict",
+  "key": "present",
+  "steps": [
+   {
+    "argv": [
+     "envelope",
+     "--verdict",
+     "verified",
+     "--key-seen",
+     "0000000000000000000000000000000000000000000000000000000000000000"
+    ],
+    "expect": {
+     "exit": 0,
+     "refused": false,
+     "retry": true,
+     "fields": {
+      "mode": "strict",
+      "submit": false,
+      "reason": "the key file changed after this envelope was verified; verified again"
+     }
+    }
+   },
+   {
+    "argv": [
+     "envelope",
+     "--verdict",
+     "unsigned",
+     "--key-seen",
+     "0000000000000000000000000000000000000000000000000000000000000000"
+    ],
+    "expect": {
+     "exit": 0,
+     "refused": false,
+     "retry": true,
+     "fields": {
+      "mode": "strict",
+      "submit": false,
+      "reason": "the key file changed after this envelope was verified; verified again"
+     }
+    }
+   },
+   {
+    "argv": [
+     "envelope",
+     "--verdict",
+     "invalid",
+     "--key-seen",
+     "0000000000000000000000000000000000000000000000000000000000000000"
+    ],
+    "expect": {
+     "exit": 0,
+     "refused": false,
+     "retry": true,
+     "fields": {
+      "mode": "strict",
+      "submit": false,
+      "reason": "the key file changed after this envelope was verified; verified again"
+     }
+    }
+   }
+  ]
  }
 ]

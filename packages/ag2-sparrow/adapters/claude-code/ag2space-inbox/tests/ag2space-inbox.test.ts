@@ -292,7 +292,7 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
     failProgress: (n: number) => { progressFailLeft = n },
     failAt: (verb: string) => { failVerb = verb },
     refuseUnstuck: (n: number) => { unstuckFailsLeft = n }, hardUnstuck: (n: number) => { unstuckHardLeft = n }, refusePark: () => { parkRefused = true },
-    lockOnce: (verb: string) => { lockFails.add(verb) }, failStageLink: () => { stageLinkFails = true },
+    lockOnce: (verb: string) => { lockFails.add(verb) }, setKey: (digest: string) => { keyNow = digest }, failStageLink: () => { stageLinkFails = true },
     // The fake CLI called directly, as the Mod calls it: the contract test's handle.
     cli: (argv: string[], stdin = '') => run(null, { argv: ['ag2-sparrow-claude-local', 'inbox', ...argv], init: { stdin } }) }
 }
@@ -1694,7 +1694,11 @@ test('the fake CLI answers every contract scenario as the real verbs do', async 
   const h = host(on, o)
   const diffs: string[] = []
   for (const sc of CONTRACT as any[]) {
-    o.lenient = sc.hmac === 'lenient'                  // the Python side records the same choice in the config
+    // The Python side records the same choice in the config and puts the key file in the same state.
+    o.lenient = sc.hmac === 'lenient'
+    o.strict = sc.hmac === 'strict'
+    o.keyProblem = sc.key === 'missing' ? '/k/task-hmac.key missing: strict mode submits nothing until it is back' : ''
+    h.setKey(sc.key === 'present' ? 'ab'.repeat(32) : 'absent')
     h.files[`/in/${sc.task}.txt`] = TASK(sc.task, sc.tier)
     if (sc.result !== undefined) h.files[`/out/${sc.task}.txt`] = sc.result
     if (sc.archived !== undefined) h.files[`/out/archive/${sc.task}.txt`] = sc.archived
@@ -1708,6 +1712,9 @@ test('the fake CLI answers every contract scenario as the real verbs do', async 
       const bad = (['exit', 'refused', 'retry'] as const).filter(k => got[k] !== step.expect[k]).map(k => `${k} ${got[k]} != ${step.expect[k]}`)
       for (const [k, v] of Object.entries(step.expect.fields ?? {})) if (data[k] !== v) bad.push(`${k} ${JSON.stringify(data[k])} != ${JSON.stringify(v)}`)
       for (const k of step.expect.has ?? []) if (!(k in data)) bad.push(`no ${k}`)
+      const reason = String(data.reason ?? '')
+      if (step.expect.reason_prefix !== undefined && !reason.startsWith(step.expect.reason_prefix)) bad.push(`reason ${JSON.stringify(reason)}`)
+      if (step.expect.reason_suffix !== undefined && !reason.endsWith(step.expect.reason_suffix)) bad.push(`reason ${JSON.stringify(reason)}`)
       for (const k of step.expect.marked ?? []) if (!(k in (data.stuck ?? {}))) bad.push(`${k} not marked`)
       for (const k of step.expect.unmarked ?? []) if (k in (data.stuck ?? {})) bad.push(`${k} still marked`)
       if (bad.length) diffs.push(`${sc.name}, step ${i} ${argv[0]}: ${bad.join('; ')}`)

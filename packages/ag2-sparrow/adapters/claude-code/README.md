@@ -529,11 +529,12 @@ mtime delta.
   failure, a staged answer), `interrupt` (absent, again, unready, ready,
   `CALLING`), `progress` (`--stuck`/`--unstuck`, the marks kept for an unresolved
   task and dropped for a ready, archived or published one, session, intake and
-  generation writes), `envelope` with no key path (off) and with the opt-out
-  (lenient), and `check-inode` against another inode. Not covered: `envelope`
-  in strict mode (the fake answers from the test's options; the rule itself is
-  pinned against `hmac_policy` and the verb by the Python sweep), `check-inode`
-  on the matching inode, and the injected faults (claims-lock, store and
+  generation writes), `envelope` with no key path (off), with the opt-out
+  (lenient) and strict (key present: only verified submitted; key file missing:
+  every task held with the one reason line; a verdict read with another key:
+  held), the fake's answer derived from the same config and key-file state, and
+  `check-inode` against another inode. Not covered: `check-inode` on the
+  matching inode, and the injected faults (claims-lock, store and
   unreadable-claim failures, exit 3 mirror failures, a staged answer whose blob
   is not in place, refused or failed `--unstuck` and `park`, a CLI that does not
   run): those are failure modes the fake injects, pinned against the real verbs
