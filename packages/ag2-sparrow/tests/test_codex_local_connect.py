@@ -95,8 +95,8 @@ STAND_IN = ("import sys; sys.path.insert(0, %r); from ag2_sparrow import task_io
 OP_HOLDER = ("import sys; sys.path.insert(0, %r); from ag2_sparrow import connect_common as cm\n"
              "from ag2_sparrow.adapters.codex.connect_cli import LOCAL\n"
              "with cm.operation_lock(LOCAL): print('held', flush=True); sys.stdin.read()")
-TASK = ("id: %s\ntimestamp: 2026-10-16T00:00:00Z\nsource: chat\nchannel_id: local-chat\naccess_tier: owner\n"
-        "priority: normal\ntask: %s\n")
+TASK = ("id: %s\ntimestamp: 2026-10-16T00:00:00Z\nsource: chat\nchannel_id: %s\naccess_tier: owner\n"
+        "priority: normal\ntask: say hi\n")
 NOT_LOADED = (113, "", 'Could not find service "ai.ag2.sparrow.codex-local" in domain for uid: 501\n')
 START_VERBS = ("restart", "bootstrap", "kickstart")
 STOP_VERBS = ("stop", "bootout")
@@ -655,7 +655,11 @@ class LauncherProcess(Base):
     def end(proc):
         """Whatever the test decided: the launcher ended and its pipes closed, so nothing leaks into the next test."""
         if proc.poll() is None:
-            proc.kill()
+            proc.terminate()  # the launcher reaps its connector on SIGTERM; a SIGKILL would orphan it
+            try:
+                proc.communicate(timeout=30)
+            except subprocess.TimeoutExpired:
+                proc.kill()
         proc.communicate(timeout=30)
 
     def test_the_app_server_comes_from_the_configured_executable_not_a_codex_earlier_on_path(self):
@@ -676,26 +680,37 @@ class LauncherProcess(Base):
         launcher.communicate(timeout=60)
         self.assertEqual(launcher.returncode, 143)
 
+    def answered(self, root, task_id, channel):
+        """A task on `channel` written into `root`, its result text once the connector answered it."""
+        (Path(root) / "tasks" / (task_id + ".txt")).write_text(TASK % (task_id, channel))
+        path = Path(root) / "results" / (task_id + ".txt")
+        self.assertTrue(wait_for(path.exists, 30), task_id)
+        return path.read_text()
+
     def test_a_root_renamed_and_replaced_after_startup_is_served_by_inode_and_the_replacement_untouched(self):
-        """The connector lives in the held inode: after the pathname is renamed and recreated, and the
-        replacement held by another process, the moved root still gets its results and the replacement
-        never loses a task to this connector."""
+        """The connector lives in the held inode: after an owner channel has completed a turn, the pathname is
+        renamed and recreated and the replacement held by another process; the next turn on that channel,
+        and a fresh channel's, work in the MOVED root (the turn's cwd, not the thread's remembered one),
+        results land in the held inode, and the replacement never loses a task to this connector."""
         self.configure()
         launcher = self.launcher()
         self.assertTrue(wait_for(lambda: (task_io.holder_consumer(str(self.work)) or {}).get("live")), "the connector attached")
+        self.assertIn("cwd=%s]" % self.work, self.answered(self.work, "task-a", "chan-a"), "the first turn, at the pathname")
         moved = self.home / "work.moved"
         os.rename(self.work, moved)
         for d in cli.WORK_DIRS:
             (self.work / d).mkdir(parents=True)
         replacement = hold(self.work, "other-adapter")
         try:
-            (moved / "tasks" / "task-a.txt").write_text(TASK % ("task-a", "say hi"))
-            self.assertTrue(wait_for(lambda: (moved / "results" / "task-a.txt").exists(), 30), "the moved root is still served")
-            (self.work / "tasks" / "task-b.txt").write_text(TASK % ("task-b", "say hi"))
+            self.assertIn("cwd=%s]" % moved, self.answered(moved, "task-c", "chan-a"),
+                          "the same channel's next turn follows the moved root, not the thread's old cwd")
+            self.assertIn("cwd=%s]" % moved, self.answered(moved, "task-d", "chan-b"), "a fresh channel too")
+            (self.work / "tasks" / "task-b.txt").write_text(TASK % ("task-b", "chan-a"))
             self.assertFalse(wait_for(lambda: (self.work / "results" / "task-b.txt").exists(), 2.0),
                              "the replacement root is another holder's")
             self.assertTrue((self.work / "tasks" / "task-b.txt").exists())
             self.assertEqual(sorted(os.listdir(self.work / "state")), ["threads"], "nothing of this connector's state landed there")
+            self.assertEqual(sorted(os.listdir(self.work / "results")), [], "the replacement has no connector results")
             self.assertTrue((moved / "state" / "app-server-stdio.stderr").exists())
         finally:
             unhold(replacement)

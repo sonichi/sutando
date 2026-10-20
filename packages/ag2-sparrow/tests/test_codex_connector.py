@@ -697,6 +697,29 @@ class PushTest(unittest.TestCase):
         self.assertEqual(rc, 3)
 
 
+class TurnCwdTest(unittest.TestCase):
+    def test_every_turn_carries_its_own_cwd_the_owners_from_the_root_the_non_owners_from_scratch(self):
+        """turn/start names the turn's working directory (the 0.160.1 override): a thread resumed after the
+        root moved would otherwise keep the old pathname for every later turn."""
+        with tempfile.TemporaryDirectory() as d:
+            calls = []
+
+            class Rpc:
+                def request(self, method, params, timeout=None):
+                    calls.append((method, dict(params)))
+                    return {"turn": {"id": "t1"}}
+            args = cc.build_parser().parse_args(["--work", d, "--server", "stub"])
+            args.cwd = None
+            c = cc.Connector(lambda: None, args)
+            c.rpc, c.thread_id, c.scratch_cwd = Rpc(), "th", "/scratch"
+            with mock.patch.object(c, "wait_turn", return_value=("completed", "ok", None)), \
+                    mock.patch.object(cc.os, "getcwd", return_value="/now/here"):
+                c.run_turn("hi", None, c.turn_cwd(True))
+                c.run_turn("hi", "m", c.turn_cwd(False))
+        self.assertEqual([(m, p.get("cwd"), p.get("model")) for m, p in calls],
+                         [("turn/start", "/now/here", None), ("turn/start", "/scratch", "m")])
+
+
 class HeldRootRefusalTest(unittest.TestCase):
     def test_a_held_root_that_has_no_path_exits_with_the_refusal_code(self):
         with tempfile.TemporaryDirectory() as d:

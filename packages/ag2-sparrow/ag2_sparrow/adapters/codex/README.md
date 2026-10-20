@@ -61,8 +61,10 @@ started from the exact executable the version check passed, never a PATH lookup,
 takes no lock and starts only once the holder's record names this very process (pid and start time)
 and verifies it alive; a stale or unreadable record is exit 2. It lives inside the held inode: it
 fchdirs into `--root-fd` and names `tasks/`, `results/` and `state/` relative to it, so a work root
-renamed or replaced under the same pathname after startup is never read or written (the owner
-thread's cwd, a pathname by protocol, is the inode's current one, resolved per turn). A `SIGTERM` to the launcher
+renamed or replaced under the same pathname after startup is never read or written. The model's
+working directory is a pathname by protocol: every `turn/start` carries it (the turn's own cwd, not
+the thread's remembered one), resolved from the held inode's current pathname at that turn, so an
+owner channel whose thread opened before a rename keeps working in the moved root. A `SIGTERM` to the launcher
 terminates the connector, waits up to 15 s, kills, reaps, releases the lock and exits 143; a
 connector's own 75 is reported as 1, so 75 means only another holder. `debug-run` takes the shape's
 operation lock (the one install and uninstall take) from its checks to its acquisition and publishes

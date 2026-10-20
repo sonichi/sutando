@@ -191,8 +191,14 @@ class Connector:
         else:
             self.rpc.respond(rid, {})
 
+    def turn_cwd(self, owner):
+        """The working directory of a turn, decided per turn: the owner's configured one, else the held
+        root's current pathname (a resumed thread keeps its own cwd otherwise, so a root renamed after
+        the thread opened would leave later turns at the old pathname); a non-owner's scratch dir."""
+        return (self.args.cwd or os.getcwd()) if owner else self.scratch_cwd
+
     def thread_params(self, owner):
-        p = {"cwd": (self.args.cwd or os.getcwd()) if owner else self.scratch_cwd, "approvalPolicy": "never",
+        p = {"cwd": self.turn_cwd(owner), "approvalPolicy": "never",
              "sandbox": self.args.sandbox if owner else NON_OWNER_SANDBOX}
         if self.args.model:
             p["model"] = self.args.model
@@ -312,13 +318,17 @@ class Connector:
             elif meth == "error":
                 log("error notification", json.dumps(p)[:300])
 
-    def run_turn(self, prompt, model=None):
+    def run_turn(self, prompt, model=None, cwd=None):
         """Submit one turn and block until it is over. A turn past --turn-timeout is
         interrupted; if it still does not complete within the grace, the server is
-        replaced, so the next task never shares the thread with a live turn."""
+        replaced, so the next task never shares the thread with a live turn. `cwd` is
+        the turn's working directory (the 0.160.1 turn/start override), never the
+        thread's remembered one."""
         params = {"threadId": self.thread_id, "input": [{"type": "text", "text": prompt}]}
         if model:
             params["model"] = model
+        if cwd:
+            params["cwd"] = cwd
         res = self.rpc.request("turn/start", params)
         turn_id = res["turn"]["id"]
         done = self.wait_turn(turn_id, self.args.turn_timeout)
@@ -347,7 +357,7 @@ class Connector:
         for attempt in (1, 2):
             self.open_for(headers)
             self.last_thread = self.thread_id
-            status, text, err = self.run_turn(prompt, self.args.model)
+            status, text, err = self.run_turn(prompt, self.args.model, self.turn_cwd(owner))
             if status == "server-exited":
                 self.restart_server()
                 if owner and attempt == 1:

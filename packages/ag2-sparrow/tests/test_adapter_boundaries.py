@@ -107,6 +107,14 @@ DELEGATES = {"adapters/claude_code/hold.py": ("cm.hold_and_supervise(", "cm.supe
                                                "cm.occupancy_line(", "cm.run_launchd(", "cm.run_child_argv(")}
 
 
+def direct_imports(text, steps):
+    """Names a step's `task_io.` or `cm.` function is imported as directly, which the substring scan misses."""
+    owned = {step.split(".", 1)[1].rstrip("(") for step in steps if step.startswith(("task_io.", "cm."))}
+    return sorted(a.name for n in ast.walk(ast.parse(text)) if isinstance(n, ast.ImportFrom)
+                  and (n.module or "").split(".")[-1] in ("task_io", "connect_common")
+                  for a in n.names if a.name in owned)
+
+
 class BoundaryTest(unittest.TestCase):
     def test_the_package_has_no_crossings(self):
         self.assertEqual(violations(PKG_ROOT), [])
@@ -116,8 +124,15 @@ class BoundaryTest(unittest.TestCase):
             text = (PKG_ROOT / PKG / rel).read_text(encoding="utf-8")
             with self.subTest(module=rel):
                 self.assertEqual([step for step in OWNED_STEPS[rel] if step in text], [], "a copy of connect_common's policy")
+                self.assertEqual(direct_imports(text, OWNED_STEPS[rel]), [], "a step imported under another name")
                 for call in DELEGATES.get(rel, ()):
                     self.assertIn(call, text, "the delegation")
+
+    def test_an_aliased_import_of_an_owned_step_is_caught(self):
+        steps = OWNED_STEPS["adapters/codex/connect_cli.py"]
+        self.assertEqual(direct_imports("from ...task_io import acquire_lock as take\n", steps), ["acquire_lock"])
+        self.assertEqual(direct_imports("from ..connect_common import _run_until_end\n", steps), ["_run_until_end"])
+        self.assertEqual(direct_imports("from ... import task_io\nfrom ...task_io import parse\n", steps), [])
 
     def test_the_scan_sees_every_module_and_resolves_relative_imports(self):
         seen = dict(modules(PKG_ROOT))
