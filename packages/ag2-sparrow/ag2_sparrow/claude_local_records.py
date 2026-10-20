@@ -167,10 +167,24 @@ def empty_plugin() -> dict:
             "inflight": {}, "generation": None, "updated_at": 0.0}
 
 
+# The plugin record's fields and the types a reader may rely on; any other shape is unreadable.
+PLUGIN_SHAPE = {"inflight": dict, "stuck": dict, "session_id": (str, type(None)), "nonce": (str, type(None)),
+                "intake": str, "reason": str, "generation": (dict, type(None))}
+
+
 def load_plugin(root) -> dict:
-    rec = read_json(plugin_path(root))
+    """The record, defaults filled; RecordError when a known field has the wrong shape (an inflight or
+    stuck entry included), so no reader acts on it as data."""
+    path = plugin_path(root)
+    rec = read_json(path)
     if not rec:
         return empty_plugin()
+    for key, kind in PLUGIN_SHAPE.items():
+        if key in rec and not isinstance(rec[key], kind):
+            raise RecordError("%s: %s is %s, not a valid value" % (path, key, type(rec[key]).__name__))
+    for key in ("inflight", "stuck"):
+        if not all(isinstance(v, dict) for v in (rec.get(key) or {}).values()):
+            raise RecordError("%s: an entry of %s is not an object" % (path, key))
     out = empty_plugin()
     out.update(rec)
     return out
@@ -178,8 +192,8 @@ def load_plugin(root) -> dict:
 
 def write_progress(root, mutate) -> dict:
     """The one progress writer: under state/progress.lock, load, `mutate(record)`, write durably.
-    Every failure, the lock's own I/O included, is RecordError (the CLI turns it into a hard failure
-    that closes the Mod's intake), so no caller sees a raw OSError."""
+    Every failure, the lock's own I/O and anything the mutate step raises included, is RecordError (the
+    CLI turns it into a hard failure that closes the Mod's intake), so no caller sees another exception."""
     try:
         with flocked(progress_lock_path(root)):
             rec = load_plugin(root)
@@ -187,8 +201,46 @@ def write_progress(root, mutate) -> dict:
             rec = dict(rec, schema=PLUGIN_SCHEMA, updated_at=time.time())
             write_durable(plugin_path(root), json.dumps(rec, sort_keys=True).encode("utf-8"))
             return rec
-    except OSError as e:
-        raise RecordError("%s: %s" % (progress_lock_path(root), e.strerror or e))
+    except RecordError:
+        raise
+    except Exception as e:
+        raise RecordError("%s: %s: %s" % (progress_lock_path(root), type(e).__name__, getattr(e, "strerror", None) or e))
+
+
+# ── the progress alarm: the CLI's word that the record could not be written ───
+
+PROGRESS_ALARM = "claude-local.progress-unwritable"
+
+
+def progress_alarm_path(config_dir) -> Path:
+    """In the adapter's config dir, never in state/: a broken state/ must not hide its own alarm."""
+    return Path(config_dir) / PROGRESS_ALARM
+
+
+def raise_progress_alarm(config_dir, error: str, now=None) -> None:
+    """Best effort; `since` is the first failure's, kept across later ones."""
+    path = progress_alarm_path(config_dir)
+    try:
+        since = read_progress_alarm(config_dir).get("since") or (time.time() if now is None else now)
+        write_durable(path, json.dumps({"since": since, "error": error[:300]}).encode("utf-8"))
+    except (RecordError, OSError):
+        pass
+
+
+def clear_progress_alarm(config_dir) -> None:
+    try:
+        progress_alarm_path(config_dir).unlink()
+    except OSError:
+        pass
+
+
+def read_progress_alarm(config_dir) -> dict:
+    """{since, error} while raised, else {} (an unreadable alarm reads as raised, since now unknown)."""
+    try:
+        rec = read_json(progress_alarm_path(config_dir))
+    except RecordError as e:
+        return {"since": None, "error": str(e)}
+    return rec if isinstance(rec, dict) and rec else {}
 
 
 def progress_gate_held(root) -> bool:

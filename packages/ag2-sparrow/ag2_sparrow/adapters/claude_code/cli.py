@@ -545,6 +545,12 @@ def verify(_args) -> int:
     cm.verify_tail(LOCAL, cfg, results, occupancy=occupancy_line, relay=relay)
     print(f"INFO session id: {cfg['SESSION_ID']}")
     print(f"INFO folder trust: {trust_line(cfg, root)}")
+    alarm = records.read_progress_alarm(config_dir())
+    if alarm:
+        since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(alarm["since"])) if isinstance(
+            alarm.get("since"), (int, float)) else "an unknown time"
+        cm.check(results, False, "progress", "progress record unwritable since %s (%s); intake stays closed until a "
+                 "durable write" % (since, alarm.get("error") or "unknown"))
     try:
         plugin = records.load_plugin(root)
         stuck = detector.stuck_answers(dict(plugin, stuck=inbox.unresolved_stuck(root, plugin.get("stuck"))))

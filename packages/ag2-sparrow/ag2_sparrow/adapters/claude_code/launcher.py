@@ -217,7 +217,10 @@ def classify(tm: Tmux, rec: dict, cfg: dict, root, created=None) -> "tuple[str, 
     if rec.get("title_token") and fields["title"] != rec["title_token"]:
         return "unknown", "%s: the pane title %r is not the recorded token; fenced actions are withheld" % (
             TITLE_CHANGED, fields["title"])
-    plugin = records.load_plugin(root)
+    try:
+        plugin = records.load_plugin(root)
+    except records.RecordError as e:
+        return "unknown", "the plugin record is unreadable (%s)" % e
     # The Mod's witness counts only for this generation's consumer; an older one reads absent.
     witness = plugin.get("session_id") if plugin.get("generation") == rec.get("consumer") else None
     if witness != cfg["SESSION_ID"] and not (witness is None and created and gen.get("nonce") == created):
@@ -316,8 +319,12 @@ class Launcher:
         if waiting != self.observation.get("dialog", None):
             self.log("the session waits at Claude Code's %s dialog; answer it in the pane (%s)" % (waiting, self.attach_command())
                      if waiting else "the session is past its startup dialog")
-        plugin = records.load_plugin(self.root)
-        plugin = dict(plugin, stuck=inbox.unresolved_stuck(self.root, plugin.get("stuck")))
+        try:
+            plugin = records.load_plugin(self.root)
+        except records.RecordError:
+            plugin = records.empty_plugin()     # a torn record still lets the alarm through
+        plugin = dict(plugin, stuck=inbox.unresolved_stuck(self.root, plugin.get("stuck")),
+                      progress_unwritable=records.read_progress_alarm(self.config_dir))
         self.observation = detector.derive(self.observation, text, plugin, self.clock())
         stall = self.observation["stall"]
         if (rec.get("stall") or None) != stall:

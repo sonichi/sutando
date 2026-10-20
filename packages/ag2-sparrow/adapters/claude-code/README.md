@@ -70,7 +70,17 @@ needs-attention card. The mark never outlives the answer: the CLI drops it in
 the write that resolves the task, the Mod clears it on every retirement (a
 no-op without one, never from memory), and the record's writer, `verify` and
 the card all ignore a mark whose task is already resolved, however it was
-published. Task I/O is relative to that cwd (`AG2_INBOX_DIR=.`,
+published. Every lifecycle verb takes `state/claims.lock` through one boundary:
+an I/O failure there, or in the step before it commits, answers `retry` (the
+task is kept, an unconfirmed turn's confirmation is retried by the next tick or
+by the reply itself, and a reply told to call again), and one after the commit
+answers hard. When the progress record cannot be written at all, the CLI raises
+an alarm in the adapter's config dir (outside `state/`): `verify` fails its
+`progress` row and the launcher raises the needs-attention card until a durable
+write clears it. A record whose fields have the wrong shape reads as unreadable (hard),
+never as data, and any failure inside the progress writer is that same hard
+answer. A session change replaces a transient close of intake and is never
+reopened. Task I/O is relative to that cwd (`AG2_INBOX_DIR=.`,
 `AG2_RESULTS_DIR=../results`).
 
 The adapter lives beside the Python package on purpose, not inside it: it is a

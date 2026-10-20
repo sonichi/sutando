@@ -2699,6 +2699,97 @@ class InboxCli(ConnectBase):
         with self.assertRaises(records.RecordError):
             records.write_progress(self.root, mock.Mock(side_effect=OSError(errno.EIO, "in the mutate")))
 
+    def claims_lock_fails(self, times=1):
+        real, left = records.flocked, [times]
+
+        @contextlib.contextmanager
+        def flocked(path, blocking=True):
+            if Path(path).name == records.CLAIMS_LOCK and left[0] > 0:
+                left[0] -= 1
+                raise OSError(errno.EIO, "claims lock I/O error")
+            with real(path, blocking) as fd:
+                yield fd
+        return mock.patch.object(records, "flocked", flocked)
+
+    def test_every_verb_retries_a_claims_lock_failure_before_its_step_and_answers_hard_after_it(self):
+        t = self.task("task-steps")
+        for args in (("claim", t), ("interrupt", t), ("authorize", t, "1", "--text-hash", "h1"),
+                     ("confirm", t, "turn-1", "tok", "--text-hash", "h1"), ("publish", t)):
+            with self.claims_lock_fails():
+                rc, out = self.verb(*args)
+            self.assertEqual((rc, out.get("retry"), "did not commit" in out["refused"]), (1, True, True), args[0])
+        with self.claims_lock_fails():
+            rc, out = self.verb("stage", t, "turn-1", stdin=b"body")
+        self.assertEqual((rc, out.get("retry")), (1, True), "stage")
+        self.assertFalse((self.results / (t + ".txt")).exists())
+        rc, out = self.verb("claim", t)
+        self.assertEqual(rc, 0, "nothing committed: the retry claims it")
+        with self.claims_lock_fails():
+            self.assertEqual(self.verb("authorize", t, "1", "--text-hash", "h1")[1].get("retry"), True)
+        rc, out = self.verb("authorize", t, "1", "--text-hash", "h1")
+        self.assertEqual(rc, 0, "and the retried authorize issues the one token")
+        with mock.patch.object(records, "write_progress", side_effect=records.RecordError("mirror")):
+            rc, out = self.verb("confirm", t, "turn-1", out["token"], "--text-hash", "h1")
+        self.assertEqual((rc, out.get("hard"), out.get("turn_id")), (3, True, "turn-1"),
+                         "after the step committed: hard, the answer saved")
+
+    def test_a_wrong_shaped_record_is_hard_and_the_claim_stays_recoverable(self):
+        lc = inbox._lifecycle(self.root)
+        for bad in (1, "bad", ["x"], {"t": 1}):
+            t = self.task("task-shape%d" % len(str(bad)))
+            records.plugin_path(self.root).write_text(json.dumps({"inflight": bad}))
+            rc, out = self.verb("claim", t)
+            self.assertEqual((rc, out.get("hard")), (3, True), (bad, out))
+            self.assertIn("inflight", out["error"])
+            self.assertEqual(lc.claims.load(t)["phase"], inbox.lifecycle.PREPARED, "the committed claim stands")
+            self.assertTrue(records.read_progress_alarm(cli.config_dir()), "and the launcher's alarm is up")
+            records.plugin_path(self.root).unlink()
+            rc, out = self.verb("claim", t)
+            self.assertEqual((rc, out["admission"]), (0, "owner"), "recovered once the record is sound")
+            self.assertEqual(records.read_progress_alarm(cli.config_dir()), {})
+        records.plugin_path(self.root).write_text(json.dumps({"stuck": {"t": 3}}))
+        with self.assertRaises(records.RecordError):
+            records.load_plugin(self.root)
+        records.plugin_path(self.root).unlink()
+        for error in (TypeError("int is not iterable"), ValueError("bad"), KeyError("k")):
+            with self.assertRaises(records.RecordError) as e:
+                records.write_progress(self.root, mock.Mock(side_effect=error))
+            self.assertIn(type(error).__name__, str(e.exception))
+
+    def test_an_unwritable_progress_record_alarms_the_launcher_verify_and_the_card_until_a_write_lands(self):
+        t = self.task("task-alarm")
+        with mock.patch.object(records, "write_progress", side_effect=records.RecordError("progress.lock: EIO")):
+            self.assertEqual(self.verb("progress", "--stuck", t)[0], 3)
+        alarm = records.read_progress_alarm(cli.config_dir())
+        self.assertIn("progress.lock: EIO", alarm["error"])
+        with mock.patch.object(records, "write_progress", side_effect=records.RecordError("still broken")):
+            self.assertEqual(self.verb("claim", t)[0], 3)
+        self.assertEqual(records.read_progress_alarm(cli.config_dir())["since"], alarm["since"], "the first failure's time")
+        with mock.patch.object(cm, "_run", side_effect=self.runner(root=False)):
+            out = self.main("verify")[1]
+        self.assertIn("FAIL progress: progress record unwritable since", out)
+        lc = launcher.Launcher(dict(cli.read_config(cli.config_path()), ROOT=self.root), cli.config_dir())
+        with mock.patch.object(lc.tm, "capture", return_value="pane"), \
+                mock.patch.object(records, "load_plugin", side_effect=records.RecordError("torn")):
+            obs = lc.observe({"generation": {"pane_id": "%0"}, "stall": None})
+        self.assertEqual(obs["stall"]["reason"], "abnormal:progress-unwritable", "the launcher's own record names it")
+        self.assertIn("still broken", obs["stall"]["checks"])
+        self.assertEqual(self.verb("progress", "--intake", "open")[0], 0, "the first durable write")
+        self.assertEqual(records.read_progress_alarm(cli.config_dir()), {})
+        with mock.patch.object(cm, "_run", side_effect=self.runner(root=False)):
+            self.assertNotIn("FAIL progress", self.main("verify")[1])
+        self.assertIsNone(detector.derive({}, "pane", records.load_plugin(self.root), 1.0)["stall"])
+        records.progress_alarm_path(cli.config_dir()).write_text("[")
+        self.assertEqual(records.read_progress_alarm(cli.config_dir())["since"], None, "an unreadable alarm stays raised")
+        with mock.patch.object(cm, "_run", side_effect=self.runner(root=False)):
+            self.assertIn("since an unknown time", self.main("verify")[1])
+        obs = detector.derive({}, "pane", {"progress_unwritable": {"since": None, "error": "x"}}, 5.0)
+        self.assertEqual(obs["stall"]["since"], 5.0)
+        with mock.patch.object(records, "write_durable", side_effect=OSError(errno.EROFS, "ro")):
+            records.raise_progress_alarm(cli.config_dir(), "best effort")      # never raises
+        records.clear_progress_alarm(cli.config_dir())
+        records.clear_progress_alarm(cli.config_dir())                          # idempotent
+
     def test_a_stuck_interrupt_is_named_by_verify_and_raises_the_card_and_clears(self):
         self.assertEqual(self.verb("progress", "--stuck", "task-s", "--stuck-detail", "parked")[0], 0)
         self.assertEqual(self.verb("progress", "--stuck", "task-s", "--stuck-detail", "still parked")[0], 0)
@@ -3054,6 +3145,9 @@ class LauncherTmux(ConnectBase):
         self.assertEqual((verdict, "session id 11111111" in why), ("unknown", True), "a changed id is never adopted")
         self.witness(rec)
         self.assertEqual(launcher.classify(fresh.tm, rec, self.cfg, root), ("adopt", ""))
+        with mock.patch.object(records, "load_plugin", side_effect=records.RecordError("inflight is int")):
+            self.assertEqual(launcher.classify(fresh.tm, rec, self.cfg, root),
+                             ("unknown", "the plugin record is unreadable (inflight is int)"), "never adopted on a bad record")
         self.assertEqual(fresh.tick(fresh.record())[0], None, "adopt keeps serving")
         self.assertEqual(fresh.record()["launcher"]["pid"], os.getpid(), "the adopter names itself in the record")
         self.assertEqual(len(self.tmux("list-sessions").stdout.splitlines()), 1, "no second session")

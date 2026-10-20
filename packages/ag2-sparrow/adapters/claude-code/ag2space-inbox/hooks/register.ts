@@ -69,7 +69,8 @@ function submittedAt(turnText: string, msg: string): number {
 }
 
 // One lifecycle claim as the Mod sees it: the phase is the CLI's answer, never a shadow machine.
-type Offer = { file: string; rid: string; attempt: number; msg: string; hash: string; token: string; turnId: string; phase: string }
+type Offer = { file: string; rid: string; attempt: number; msg: string; hash: string; token: string; turnId: string; phase: string
+                confirming?: { turnId: string; hash: string; completed?: string } }
 
 // One session's inbox state: what was seen and answered, the offers in flight, the live watch, the
 // session-id witness and whether intake is open.
@@ -111,7 +112,9 @@ async function cli($: any, s: State, args: string[], stdin?: string): Promise<Cl
 }
 
 function closeIntake($: any, s: State, reason: string) {
-  if (s.intake === 'closed') return
+  // A session change is a permanent fence: it replaces a transient close, never the reverse.
+  const permanent = reason.startsWith('session id')
+  if (s.intake === 'closed' && (!permanent || s.intakeReason.startsWith('session id'))) return
   s.intake = 'closed'
   s.intakeReason = reason
   void $.ui.log(`${PLUGIN}: intake STOPPED: ${reason}`, {})
@@ -147,6 +150,32 @@ async function witness($: any, s: State, where: string): Promise<boolean> {
     return false
   }
   return true
+}
+
+// A turn completed or aborted with nothing staged: the explicit protocol failure, published once, never replayed.
+async function parkOffer($: any, s: State, offer: Offer, reason: string) {
+  const r = await cli($, s, ['park', offer.rid, offer.turnId, '--detail', `turn ${reason} without a reply`])
+  await $.ui.log(`${PLUGIN}: ${offer.rid} parked: turn ${reason} without a reply (${r.ok ? 'answered as a protocol failure' : r.data?.refused ?? ''})`, {})
+  s.offers.delete(offer.rid)
+  s.answered.add(offer.rid)
+}
+
+// CALLING -> TURN_CONFIRMED for the turn recorded in `confirming`; a retry reply keeps it for the next try
+// (the scan tick, or the reply itself), anything else that is not a confirmation drops the offer.
+async function confirmOffer($: any, s: State, offer: Offer): Promise<void> {
+  const c = offer.confirming!
+  const r = await cli($, s, ['confirm', offer.rid, c.turnId, offer.token, '--text-hash', c.hash])
+  if (!r.ok && !r.hard && r.data?.retry) return
+  offer.confirming = undefined
+  if (s.pending === offer) s.pending = null
+  if (r.ok || (r.hard && r.data?.turn_id)) {
+    offer.turnId = c.turnId
+    offer.phase = 'TURN_CONFIRMED'
+    if (c.completed) await parkOffer($, s, offer, c.completed)
+    return
+  }
+  s.offers.delete(offer.rid)
+  await $.ui.log(`${PLUGIN}: ${offer.rid} turn not confirmed: ${r.data?.refused ?? ''}`, {})
 }
 
 async function sha256($: any, text: string): Promise<string> {
@@ -206,9 +235,11 @@ async function arm($: any, s: State, inbox: string, results: string): Promise<{ 
     s.tick++
     try {
       // Every tick, not only at a turn: an idle /clear must stop intake without waiting for one.
-      await witness($, s, 'scan')
+      const live = await witness($, s, 'scan')
       const stopped = sessionStopped(s)
-      if (s.intake === 'closed' && !stopped && !(await reopenIntake($, s))) return
+      // No reopen on a tick whose session id did not read back unchanged.
+      if (s.intake === 'closed' && !stopped && (!live || !(await reopenIntake($, s)))) return
+      for (const o of [...s.offers.values()]) if (o.confirming) await confirmOffer($, s, o)
       if (!stopped && s.pending) return
       if (!stopped) for (const o of s.offers.values()) if (o.phase === 'CALLING' || o.phase === 'TURN_CONFIRMED') return
       for (const entry of await $.fs.list(inbox)) {
@@ -284,6 +315,10 @@ async function arm($: any, s: State, inbox: string, results: string): Promise<{ 
         // The one-use authorization: exactly one PREPARED -> CALLING per attempt; CALLING never submits again.
         const auth = await cli($, s, ['authorize', rid, String(claimed.data.attempt), '--text-hash', hash])
         if (auth.hard) return
+        if (!auth.ok && auth.data?.retry) {
+          if (await retain(entry.name, rid, 'not authorized yet', String(auth.data?.refused ?? ''))) return
+          continue
+        }
         if (!auth.ok) { s.seen.add(entry.name); log(`${rid} not authorized: ${auth.data?.refused ?? ''}`); continue }
         const offer: Offer = { file: entry.name, rid, attempt: Number(claimed.data.attempt), msg, hash, token: String(auth.data.token), turnId: '', phase: 'CALLING' }
         s.offers.set(rid, offer)
@@ -373,10 +408,8 @@ export const register: Register = (on) => {
       const hash = await sha256($, String(e.text).slice(at, at + offer.msg.length))
       if (hash === offer.hash) {
         // The turn is ours: CALLING -> TURN_CONFIRMED with the turn id, the nonce and the hash the claim recorded.
-        const r = await cli($, s, ['confirm', offer.rid, e.turnId, offer.token, '--text-hash', hash])
-        s.pending = null
-        if (r.ok || (r.hard && r.data?.turn_id)) { offer.turnId = e.turnId; offer.phase = 'TURN_CONFIRMED' }
-        else { s.offers.delete(offer.rid); await $.ui.log(`${PLUGIN}: ${offer.rid} turn not confirmed: ${r.data?.refused ?? ''}`, {}) }
+        offer.confirming = { turnId: e.turnId, hash }
+        await confirmOffer($, s, offer)
       }
       // An unrelated manual turn: ours is still queued behind it; nothing changes.
     }
@@ -384,15 +417,10 @@ export const register: Register = (on) => {
   })
 
   on('turn.complete', async ($, e, next) => {
-    for (const offer of s.offers.values()) {
-      if (offer.turnId !== e.turnId) continue
-      if (offer.phase === 'TURN_CONFIRMED') {
-        // Completed or aborted with nothing staged: the explicit protocol failure, published once, never replayed.
-        const r = await cli($, s, ['park', offer.rid, offer.turnId, '--detail', `turn ${e.reason} without a reply`])
-        await $.ui.log(`${PLUGIN}: ${offer.rid} parked: turn ${e.reason} without a reply (${r.ok ? 'answered as a protocol failure' : r.data?.refused ?? ''})`, {})
-        s.offers.delete(offer.rid)
-        s.answered.add(offer.rid)
-      }
+    for (const offer of [...s.offers.values()]) {
+      // Its confirmation still pending: parked once it lands, so the turn's end is never lost.
+      if (offer.confirming?.turnId === e.turnId) { offer.confirming.completed = String(e.reason); continue }
+      if (offer.turnId === e.turnId && offer.phase === 'TURN_CONFIRMED') await parkOffer($, s, offer, String(e.reason))
     }
     return next(e)
   })
@@ -416,15 +444,19 @@ export const register: Register = (on) => {
     const text = String(e.text ?? '')
     if (!ID_RE.test(id)) return { result: 'Error: task_id must be a plain id', isError: true }
     const offer = s.offers.get(id)
-    if (!offer) return { result: `Error: ${id} is not a task this session received from the inbox${s.answered.has(id) ? ' (already answered; one reply per task)' : ''}`, isError: true }
-    if (offer.phase !== 'TURN_CONFIRMED' || !offer.turnId) return { result: `Error: ${id}'s turn is not confirmed yet (${offer.phase}); reply from the turn it started`, isError: true }
+    if (offer?.confirming) await confirmOffer($, s, offer)
+    if (!offer || !s.offers.has(id)) return { result: `Error: ${id} is not a task this session received from the inbox${s.answered.has(id) ? ' (already answered; one reply per task)' : ''}`, isError: true }
+    if ((offer.phase !== 'TURN_CONFIRMED' && offer.phase !== 'RESULT_STAGED') || !offer.turnId) return { result: `Error: ${id}'s turn is not confirmed yet (${offer.phase}); reply from the turn it started`, isError: true }
     if (!text.trim()) return { result: 'Error: text is empty; Sparrow never delivers a blank body', isError: true }
     if (!results) return { result: 'Error: no results dir: arm ag2space_inbox_watch or set AG2_RESULTS_DIR', isError: true }
-    const staged = await cli($, s, ['stage', id, offer.turnId], text + '\n')
-    if (!(staged.ok || (staged.hard && staged.data?.outcome === 'staged'))) return { result: `Error: stage refused: ${staged.data?.refused ?? staged.data?.error ?? ''}`, isError: true }
-    offer.phase = 'RESULT_STAGED'
+    const again = ' (transient: call ag2space_reply again with the same text)'
+    if (offer.phase !== 'RESULT_STAGED') {
+      const staged = await cli($, s, ['stage', id, offer.turnId], text + '\n')
+      if (!(staged.ok || (staged.hard && staged.data?.outcome === 'staged'))) return { result: `Error: stage refused: ${staged.data?.refused ?? staged.data?.error ?? ''}${staged.data?.retry ? again : ''}`, isError: true }
+      offer.phase = 'RESULT_STAGED'
+    }
     const published = await cli($, s, ['publish', id])
-    if (!(published.ok || (published.hard && published.data?.outcome === 'settled'))) return { result: `Error: publish refused: ${published.data?.refused ?? published.data?.error ?? ''}`, isError: true }
+    if (!(published.ok || (published.hard && published.data?.outcome === 'settled'))) return { result: `Error: publish refused: ${published.data?.refused ?? published.data?.error ?? ''}${published.data?.retry ? again : ''}`, isError: true }
     // inflight is released only at SETTLED, never on the submit promise.
     s.offers.delete(id)
     s.answered.add(id)

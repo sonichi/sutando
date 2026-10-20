@@ -22,7 +22,8 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
                                progressFails?: number; sessionIds?: string[]; cwdInode?: string; allowNonOwner?: boolean;
                                claimAs?: Record<string, unknown>; interruptParks?: number; interruptThrows?: number;
                                interruptSoft?: Record<string, string | number>; stuckAtStart?: Record<string, unknown>;
-                               unstuckFails?: number; clearFails?: Record<string, string>; stuckWriteFails?: number } = {}) {
+                               unstuckFails?: number; clearFails?: Record<string, string>; stuckWriteFails?: number;
+                               lockFailsOnce?: string[] } = {}) {
   const files: Record<string, string> = {}
   const submitted: string[] = []
   const runs: string[][] = []
@@ -43,6 +44,7 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
   const stuck: Record<string, unknown> = { ...(opts.stuckAtStart ?? {}) }
   let unstuckFailsLeft = opts.unstuckFails ?? 0
   let stuckWriteFailsLeft = opts.stuckWriteFails ?? 0
+  const lockFails = new Set(opts.lockFailsOnce ?? [])
   const clearFailsLeft: Record<string, string> = { ...(opts.clearFails ?? {}) }
   let sidReads = 0
   const interruptAt: number[] = []
@@ -94,6 +96,8 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
     if (argv[0] !== 'ag2-sparrow-claude-local' || argv[1] !== 'inbox') return { value: { exitCode: 2, stdout: '', stderr: 'unknown' } }
     const verb = argv[2]
     const task = argv[3]
+    // As the CLI's claims-step boundary: an EIO before the step commits is a retry, nothing changed.
+    if (lockFails.delete(verb)) return out(1, { refused: 'the step did not commit ([Errno 5] claims lock I/O error); retried', retry: true })
     if (verb === 'progress') {
       if (progressFailLeft-- > 0) return out(3, { error: 'progress write failed: disk', hard: true })
       if (argv.includes('--unstuck') && unstuckFailsLeft-- > 0) return out(1, { refused: 'progress lock busy' })
@@ -724,6 +728,114 @@ test('a stuck-mark write that fails hard closes intake and ends the scan: nothin
   expect(h.submitted.length).toBe(0)                     // nor the next: intake is read from the record's state
   for (let i = 0; i < 70; i++) await h.clock.advance(1000)
   expect(h.submitted.length).toBe(1)                     // a durable write reopens intake; then it goes
+})
+
+test('a one-shot claims-lock failure at claim keeps the task: claimed next time, submitted and answered once', async ($, on) => {
+  const h = host(on, { lockFailsOnce: ['claim'] })
+  h.files['/in/task-lc.txt'] = TASK('task-lc')
+  await arm($, h)
+  await h.clock.advance(3000)
+  expect(verbs(h).filter((v: string) => v === 'claim').length).toBe(2)
+  expect(h.submitted.length).toBe(1)
+  await $.turn.start({ text: h.submitted[0], turnId: 't-lc' })
+  await $.tool.call({ tool: REPLY, task_id: 'task-lc', text: 'ok' })
+  await h.clock.advance(5000)
+  expect(h.files['/out/task-lc.txt']).toBe('ok\n')
+  expect(h.submitted.length).toBe(1)
+})
+
+test('a one-shot claims-lock failure at authorize keeps the task and submits it once', async ($, on) => {
+  const h = host(on, { lockFailsOnce: ['authorize'] })
+  h.files['/in/task-auth.txt'] = TASK('task-auth')
+  await arm($, h)
+  await h.clock.advance(5000)
+  expect(h.submitted.length).toBe(1)
+  expect(verbs(h).filter((v: string) => v === 'authorize').length).toBe(2)
+})
+
+test('a one-shot claims-lock failure at confirm keeps the offer; the next tick confirms it; one submission, one result', async ($, on) => {
+  const h = host(on, { lockFailsOnce: ['confirm'] })
+  h.files['/in/task-conf.txt'] = TASK('task-conf')
+  await arm($, h)
+  await h.clock.advance(1000)
+  expect(h.submitted.length).toBe(1)
+  await $.turn.start({ text: h.submitted[0], turnId: 't-conf' })
+  expect(h.claims['task-conf'].phase).toBe('CALLING')       // the confirm did not commit: kept, not dropped
+  await h.clock.advance(1000)
+  expect(h.claims['task-conf'].phase).toBe('TURN_CONFIRMED')
+  const r = await $.tool.call({ tool: REPLY, task_id: 'task-conf', text: 'confirmed late' })
+  expect(String(r.text ?? r.result)).toContain('Published')
+  await h.clock.advance(5000)
+  expect(h.submitted.length).toBe(1)
+  expect(h.files['/out/task-conf.txt']).toBe('confirmed late\n')
+})
+
+test('a pending confirmation lands from the reply itself', async ($, on) => {
+  const h = host(on, { lockFailsOnce: ['confirm'] })
+  h.files['/in/task-r.txt'] = TASK('task-r')
+  await arm($, h)
+  await h.clock.advance(1000)
+  await $.turn.start({ text: h.submitted[0], turnId: 't-r' })
+  const r = await $.tool.call({ tool: REPLY, task_id: 'task-r', text: 'from the reply' })
+  expect(String(r.text ?? r.result)).toContain('Published')
+  expect(h.files['/out/task-r.txt']).toBe('from the reply\n')
+})
+
+test('a turn that ends while its confirmation is pending is parked once the confirmation lands', async ($, on) => {
+  const h = host(on, { lockFailsOnce: ['confirm'] })
+  h.files['/in/task-p.txt'] = TASK('task-p')
+  await arm($, h)
+  await h.clock.advance(1000)
+  await $.turn.start({ text: h.submitted[0], turnId: 't-p' })
+  await $.turn.complete({ turnId: 't-p', reason: 'completed', text: 'no reply' } as any)
+  await h.clock.advance(1000)
+  expect(h.claims['task-p'].phase).toBe('SETTLED')
+  expect(h.files['/out/task-p.txt']).toContain('without a reply')
+})
+
+test('a transient stage failure tells the session to reply again; the second reply publishes once', async ($, on) => {
+  const h = host(on, { lockFailsOnce: ['stage'] })
+  h.files['/in/task-st.txt'] = TASK('task-st')
+  await arm($, h)
+  await h.clock.advance(1000)
+  await $.turn.start({ text: h.submitted[0], turnId: 't-st' })
+  const first = await $.tool.call({ tool: REPLY, task_id: 'task-st', text: 'twice' })
+  expect(String(first.text ?? first.result)).toContain('call ag2space_reply again')
+  const second = await $.tool.call({ tool: REPLY, task_id: 'task-st', text: 'twice' })
+  expect(String(second.text ?? second.result)).toContain('Published')
+  expect(h.files['/out/task-st.txt']).toBe('twice\n')
+})
+
+test('a transient publish failure keeps the staged answer; the second reply publishes it without staging again', async ($, on) => {
+  const h = host(on, { lockFailsOnce: ['publish'] })
+  h.files['/in/task-pb.txt'] = TASK('task-pb')
+  await arm($, h)
+  await h.clock.advance(1000)
+  await $.turn.start({ text: h.submitted[0], turnId: 't-pb' })
+  const first = await $.tool.call({ tool: REPLY, task_id: 'task-pb', text: 'staged once' })
+  expect(String(first.text ?? first.result)).toContain('call ag2space_reply again')
+  const second = await $.tool.call({ tool: REPLY, task_id: 'task-pb', text: 'staged once' })
+  expect(String(second.text ?? second.result)).toContain('Published')
+  expect(verbs(h).filter((v: string) => v === 'stage').length).toBe(1)
+  expect(h.files['/out/task-pb.txt']).toBe('staged once\n')
+})
+
+test('a session change after a hard close is a permanent fence: no reopen, nothing submitted, the record says so', async ($, on) => {
+  const h = host(on, { stuckWriteFails: 1 })
+  h.files['/out/task-a-held.txt'] = ' '
+  h.files['/in/task-a-held.txt'] = TASK('task-a-held')
+  await arm($, h)
+  while (!h.runs.some((a: string[]) => a.includes('--stuck'))) await h.clock.advance(1000)   // hard: intake closed
+  const mark = h.progress.length
+  h.setSid('sid-2')                                       // the session changes while the close is transient
+  h.files['/in/task-b-new.txt'] = TASK('task-b-new')     // and a claimable task arrives; the writer is healthy
+  for (let i = 0; i < 10; i++) await h.clock.advance(1000)
+  const after = h.progress.slice(mark)
+  expect(after[0]).toEqual(['--session-id', 'sid-2', '--intake', 'stopped', '--reason', 'session-id-changed'])
+  expect(after.some((p: string[]) => p.includes('open'))).toBe(false)           // never reopened
+  expect(h.submitted.length).toBe(0)
+  expect(verbs(h).filter((v: string) => v === 'authorize')).toEqual([])
+  expect(h.files['/out/task-b-new.txt']).toContain('interrupted')               // answered as the stopped session must
 })
 
 test('thirty failed unstuck writes never age a retained task out: the next one lands (stopped-intake path)', async ($, on) => {

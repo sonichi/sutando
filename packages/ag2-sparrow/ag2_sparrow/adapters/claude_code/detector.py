@@ -5,7 +5,8 @@ Two cases: (a) the raw pane static for STALL_MIN_S while the plugin record shows
 (CALLING or TURN_CONFIRMED with no result), which is this adapter's rule, not cli_wedge's; (b)
 abnormal text on the pane, read line-anchored through the shared banner grammar
 (cli_wedge_patterns), or a Claude Code startup dialog the pane waits at (trust.dialog); (c) a
-task the Mod has kept without an answer past its stuck threshold (`stuck` in the record). The verdict is data the launcher writes into the supervisor record; nothing
+task the Mod has kept without an answer past its stuck threshold (`stuck` in the record); (d) the
+progress record unwritable (the CLI's alarm in the config dir, passed in as `progress_unwritable`). The verdict is data the launcher writes into the supervisor record; nothing
 here acts.
 """
 from __future__ import annotations
@@ -56,6 +57,14 @@ def derive(previous: dict, text: str, plugin: dict, now: float, stall_min_s: flo
     stall_min_s with an offer in flight, `abnormal:<names>` once abnormal text has shown for
     abnormal_min_s. Any change of frame, task or banner set resets the clock and clears the stall."""
     h = frame_hash(text)
+    alarm = plugin.get("progress_unwritable") or {}
+    if alarm:
+        # Before the stuck marks: with the record unwritable they cannot be recorded at all.
+        since = alarm.get("since") if isinstance(alarm.get("since"), (int, float)) else now
+        return {"frame_hash": h, "static_since": now, "task": None, "abnormal": [], "abnormal_since": None,
+                "dialog": trust.dialog(text),
+                "stall": {"reason": "abnormal:progress-unwritable", "since": since, "frame_hash": "", "task": None,
+                          "checks": "progress record unwritable: %s" % (alarm.get("error") or "unknown"), "lines": []}}
     stuck = stuck_answers(plugin)
     if stuck:
         # A stable stall (no frame, no lines), so the card stays the same one until the answers land.

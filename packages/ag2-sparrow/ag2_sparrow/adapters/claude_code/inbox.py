@@ -15,6 +15,7 @@ import json
 import os
 import sys
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 from ... import connect_common as cm, task_io, task_lifecycle as lifecycle
@@ -28,6 +29,10 @@ PROTOCOL_FAILURE = "[AG2 Space] The session's turn ended without a reply (%s); s
 ROOT_VAR = "AG2_SPARROW_ROOT"
 CONFIG_DIR_VAR = "AG2_SPARROW_CONFIG_DIR"
 ALLOW_NON_OWNER = "ALLOW_NON_OWNER"
+
+
+# The verbs whose success is a durable progress write: one clears the launcher's alarm.
+PROGRESS_VERBS = frozenset(("claim", "interrupt", "authorize", "confirm", "stage", "publish", "park", "progress"))
 
 
 class Refused(Exception):
@@ -125,6 +130,22 @@ def admit(root, task_id, allow: bool) -> "tuple[str | None, dict, str]":
     return kind, headers, why
 
 
+@contextmanager
+def _claims_step(root):
+    """claims.lock around one lifecycle step, for every verb: an OSError there (the lock's own I/O, or the
+    step failing before it commits) is a retry; one after the commit reaches the mirror, which answers hard."""
+    try:
+        with records.flocked(records.claims_lock_path(root)):
+            yield
+    except OSError as e:
+        raise Parked("the step did not commit (%s); retried" % (e.strerror or e))
+
+
+def _config_dir(environ=None) -> Path:
+    config_dir = (os.environ if environ is None else environ).get(CONFIG_DIR_VAR)
+    return Path(config_dir) if config_dir else cm.config_path(LOCAL).parent
+
+
 def _clear_stuck(root, task_id) -> bool:
     """A resolved task's stuck mark dropped: True once no mark is left (none to clear writes nothing),
     False when the record could not be read or written, so the caller keeps the task and retries."""
@@ -162,7 +183,7 @@ def _mirror(root, task_id, phase, out: dict, extra=None, unstuck=False) -> dict:
 def claim(root, task_id) -> dict:
     lc = _lifecycle(root)
     terminal = False
-    with records.flocked(records.claims_lock_path(root)):
+    with _claims_step(root):
         generation = _generation(root)
         verdict, state = lc.decide(task_id)
         if verdict == "call":
@@ -222,7 +243,7 @@ def interrupt(root, task_id, detail) -> dict:
     why, answered, kind, lc = "", False, None, None
     try:
         lc = _lifecycle(root)
-        with records.flocked(records.claims_lock_path(root)):
+        with _claims_step(root):
             rec = lc.claims.load(task_id)
             phase = rec.get("phase") if rec else None
             if phase in (lifecycle.RESULT_STAGED, lifecycle.PUBLISHED):
@@ -249,7 +270,7 @@ def interrupt(root, task_id, detail) -> dict:
 
 def authorize(root, task_id, attempt, hash_) -> dict:
     lc = _lifecycle(root)
-    with records.flocked(records.claims_lock_path(root)):
+    with _claims_step(root):
         token = lc.authorize_call(task_id, int(attempt), text_hash=hash_)
     if token is None:
         raise Refused("%s attempt %s is not PREPARED: no submit authorization" % (task_id, attempt))
@@ -258,7 +279,7 @@ def authorize(root, task_id, attempt, hash_) -> dict:
 
 def confirm(root, task_id, turn_id, nonce, hash_) -> dict:
     lc = _lifecycle(root)
-    with records.flocked(records.claims_lock_path(root)):
+    with _claims_step(root):
         try:
             lc.confirm_turn(task_id, turn_id, nonce, hash_)
         except lifecycle.TurnRefused as e:
@@ -268,7 +289,7 @@ def confirm(root, task_id, turn_id, nonce, hash_) -> dict:
 
 def stage(root, task_id, turn_id, body: bytes) -> dict:
     lc = _lifecycle(root)
-    with records.flocked(records.claims_lock_path(root)):
+    with _claims_step(root):
         outcome = lc.stage_result(task_id, body, turn_id)
     if outcome != "staged":
         raise Refused("%s: staging %s" % (task_id, outcome))
@@ -277,7 +298,7 @@ def stage(root, task_id, turn_id, body: bytes) -> dict:
 
 def publish(root, task_id) -> dict:
     lc = _lifecycle(root)
-    with records.flocked(records.claims_lock_path(root)):
+    with _claims_step(root):
         outcome = lc.publish_and_settle(task_id)
     if outcome != "settled":
         raise Refused("%s: publication %s" % (task_id, outcome))
@@ -357,6 +378,7 @@ def main(args) -> int:
         else:
             raise Refused("unknown verb %s" % verb)
     except records.RecordError as e:
+        records.raise_progress_alarm(_config_dir(), str(e))
         print(json.dumps({"error": "progress write failed: %s" % e, "hard": True}))
         return EXIT_PROGRESS
     except Parked as e:
@@ -365,6 +387,11 @@ def main(args) -> int:
     except (Refused, lifecycle.StateError, lifecycle.ClaimUnreadable, OSError, ValueError) as e:
         print(json.dumps({"refused": str(e)}))
         return EXIT_REFUSED
+    # The launcher's own view of the record's writability, in the config dir, so a broken state/ cannot hide it.
+    if out.get("hard"):
+        records.raise_progress_alarm(_config_dir(), str(out.get("error") or "progress write failed"))
+    elif verb in PROGRESS_VERBS:
+        records.clear_progress_alarm(_config_dir())
     print(json.dumps(out, sort_keys=True))
     return EXIT_PROGRESS if out.get("hard") else EXIT_OK
 
