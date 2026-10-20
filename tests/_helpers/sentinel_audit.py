@@ -17,7 +17,7 @@ child_envs: "list[dict]" = []
 import_envs: "list[dict]" = []
 GATEWAY_MODULE = re.compile(
     r"remote_gateway_bridge|gateway_credential|adapters\.hatch|bee_actions|(^|\.)_gateway$|(^|\.)room_ops$"
-    r"|(^|\.)channel_token$|(^|\.)channel_env_resolve$")
+    r"|(^|\.)channel_token$|(^|\.)channel_env_resolve$|(^|\.)dispatcher$")
 
 
 def _hook(event, args):
