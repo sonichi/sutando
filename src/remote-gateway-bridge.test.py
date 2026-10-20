@@ -360,6 +360,53 @@ def _test_owner_dm_upgrade_notice_retry(rtc) -> None:
         up.unlink(missing_ok=True)
 
 
+def _test_owner_dm_upgrade_notice_once_per_pass(rtc) -> None:
+    """Two held owner-DM files in one pass spend one notice attempt, not one per file."""
+    attempts: list = []
+    real_hook = rtc.OWNER_DM_UPGRADED_NOTIFY
+    hold = rtc._upgrade_hold_file()
+    files = [rtc.RESULTS_DIR / f"proactive-upp{i}.txt" for i in (1, 2)]
+
+    def _fail(old, new):
+        attempts.append((old, new))
+        raise RuntimeError("ask-owner down")
+
+    try:
+        rtc.OWNER_DM_UPGRADED_NOTIFY = _fail
+        hold.unlink(missing_ok=True)
+        rtc._UPGRADE_NOTICES_SENT.clear()
+        for f in files:
+            f.write_text("pass nudge\n")
+        STATE["force_room_400_body"] = {"reason": "room_upgraded", "replacement_room": "!new:example.org"}
+        rtc._post_proactive()
+        check(len(attempts) == 1 and json.loads(hold.read_text()).get("notice_attempts") == 1,
+              f"one pass with two held files counts one notice attempt (got {len(attempts)})")
+        rtc._post_proactive()
+        check(len(attempts) == 2 and json.loads(hold.read_text()).get("notice_attempts") == 2,
+              f"the next pass adds exactly one more attempt (got {len(attempts)})")
+    finally:
+        STATE["force_room_400_body"] = None
+        rtc.OWNER_DM_UPGRADED_NOTIFY = real_hook
+        hold.unlink(missing_ok=True)
+        rtc._UPGRADE_NOTICES_SENT.clear()
+        for f in files:
+            f.unlink(missing_ok=True)
+
+
+def _test_owner_dm_upgrade_empty_room(rtc) -> None:
+    """An empty or whitespace room is refused and never clears a standing hold."""
+    hold = rtc._upgrade_hold_file()
+    body = {"room": "!owner:example.org", "replacement": "!new:example.org", "notice": "pending"}
+    try:
+        hold.write_text(json.dumps(body))
+        for room in ("", "   "):
+            check(not rtc._owner_dm_upgrade_held(room)
+                  and json.loads(hold.read_text()) == body,
+                  f"an empty room {room!r} is refused and leaves the hold in place")
+    finally:
+        hold.unlink(missing_ok=True)
+
+
 def _test_owner_dm_upgrade_legacy_hold(rtc) -> None:
     """A hold written before notice state existed is retried as pending, without re-posting the nudge."""
     attempts: list = []
@@ -1551,6 +1598,8 @@ def main() -> int:
     _test_owner_dm_upgrade_edges(rtc)
     _test_owner_dm_upgrade_notice_retry(rtc)
     _test_owner_dm_upgrade_legacy_hold(rtc)
+    _test_owner_dm_upgrade_notice_once_per_pass(rtc)
+    _test_owner_dm_upgrade_empty_room(rtc)
     check(_it3b.get("status") == "DELIVERED"
           and _it3b.get("destination") == "!owner:example.org",
           "the successful retry records the receipt")

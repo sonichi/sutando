@@ -5530,7 +5530,9 @@ def _owner_dm_upgrade_held(room: str) -> bool:
         return False
     if not isinstance(d, dict) or not d:
         return False
-    if room and d.get("room") == room:
+    if not (room or "").strip():
+        return False  # no owner DM to compare: refuse rather than clear the hold
+    if d.get("room") == room:
         return True
     try:
         _atomic_private_json(f, {})  # the owner DM was repointed: the hold no longer applies
@@ -5555,7 +5557,7 @@ def _read_upgrade_hold() -> dict:
     return d
 
 
-def _hold_owner_dm_upgrade(room: str, replacement: str) -> None:
+def _hold_owner_dm_upgrade(room: str, replacement: str, noticed: "set | None" = None) -> None:
     """Record the hold (later passes skip the room), then try the owner notice if still owed."""
     d = _read_upgrade_hold()
     if (d.get("room"), d.get("replacement")) != (room, replacement):
@@ -5567,14 +5569,18 @@ def _hold_owner_dm_upgrade(room: str, replacement: str) -> None:
             _log(f"could not record owner-DM upgrade hold ({e})")
         _log(f"owner DM {room} was upgraded to {replacement or '(unknown)'}, which this agent "
              "has not joined — holding owner-DM nudges until the owner DM is repointed")
-    _notify_owner_dm_upgrade(d)
+    _notify_owner_dm_upgrade(d, noticed)
 
 
-def _notify_owner_dm_upgrade(d: dict) -> None:
+def _notify_owner_dm_upgrade(d: dict, noticed: "set | None" = None) -> None:
     """Deliver a pending owner notice; failures retry on later passes up to MAX_TRANSIENT_ATTEMPTS."""
     room, replacement = str(d.get("room") or ""), str(d.get("replacement") or "")
     if d.get("notice") != "pending" or (room, replacement) in _UPGRADE_NOTICES_SENT:
         return
+    if noticed is not None:
+        if (room, replacement) in noticed:
+            return  # one attempt per (room, replacement) per drain pass, however many files it holds
+        noticed.add((room, replacement))
     tried = int(d.get("notice_attempts") or 0) + 1
     d["notice_attempts"] = tried
     try:
@@ -5610,7 +5616,7 @@ def _post_proactive() -> None:
     that belongs to another bridge (cross-bridge routing stays host policy); a
     PROACTIVE_ROOM_GATE re-judges the room the CLAIMED body names, since the
     peek may have read a body still being written."""
-    notice_retried = False
+    noticed: "set[tuple[str, str]]" = set()
     for f in sorted(RESULTS_DIR.glob("proactive-*.txt")):
         # PEEK before claiming: a file explicitly routed to a non-Matrix
         # destination ([channel: <discord/slack id>]) belongs to that bridge —
@@ -5630,9 +5636,7 @@ def _post_proactive() -> None:
             _held(f"owner-directed {f.name}")
             continue
         if route == "send" and peek_room is None and _owner_dm_upgrade_held(proactive_room()):
-            if not notice_retried:
-                notice_retried = True  # one notice retry per pass, not per held file
-                _notify_owner_dm_upgrade(_read_upgrade_hold())
+            _notify_owner_dm_upgrade(_read_upgrade_hold(), noticed)
             continue  # each claim would only cost another room_upgraded 400
         if PROACTIVE_CLAIM_GATE is not None:
             try:
@@ -5761,7 +5765,7 @@ def _post_proactive() -> None:
                     claim.rename(f)  # stays pending: not a failed attempt, the room moved
                 except OSError:
                     pass
-                _hold_owner_dm_upgrade(dest_room, replacement)
+                _hold_owner_dm_upgrade(dest_room, replacement, noticed)
                 continue
             outcome = _resolve_send_failure(claim, f, e)
             _log(f"proactive send failed for {f.name}: HTTP {e.code} — {outcome}")
