@@ -108,6 +108,23 @@ class Base(unittest.TestCase):
 
 
 class ItResumesTheSameWorker(Base):
+    def test_shared_recovery_checks_suspension_before_probes_or_writes(self):
+        rem.suspend(self.ws, "renewed-stop")
+        before = {p: p.read_bytes() for p in wi.worker_dir(self.ws, self.wid).glob("*.json")}
+        with mock.patch.object(sup, "is_paused", side_effect=AssertionError("past guard")), \
+                mock.patch.object(wi, "sessions", side_effect=AssertionError("read lineage")), \
+                mock.patch.object(sw, "session_state", side_effect=AssertionError("probed")), \
+                mock.patch.object(rem, "close_dead_runs", side_effect=AssertionError("closed")), \
+                mock.patch.object(sw, "spawn", side_effect=AssertionError("launched")):
+            self.assertEqual(self.recover(), {"worker_id": self.wid, "outcome": rem.SUSPENDED})
+        self.assertEqual({p: p.read_bytes() for p in before}, before)
+        self.assertEqual(len(self.t.launches()), self.launched_before)
+
+    def test_another_workspaces_suspension_does_not_block_recovery(self):
+        rem.suspend(self.ws / "other", "unrelated-stop")
+        self.assertEqual(self.recover()["outcome"], rem.RECOVERED)
+        self.assertEqual(len(self.t.launches()), self.launched_before + 1)
+
     def test_a_dead_worker_comes_back_on_its_own_session(self):
         out = self.recover()
         self.assertEqual(out["outcome"], rem.RECOVERED)
