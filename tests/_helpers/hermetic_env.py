@@ -112,7 +112,8 @@ def hermetic_env(home: "Path | str | None" = None, **extra: str) -> "dict[str, s
         env["USERPROFILE"] = env["HOME"]
     env["USER"] = HERMETIC_USER
     env["PYTHONNOUSERSITE"] = "1"
-    # A rebuilt environment loses the runner's telemetry opt-out; tests never emit product telemetry.
+    # IMPORTANT: tests must never emit product telemetry; removing or weakening these lines makes CI test
+    # runs count as real users on the admin DAU. Enforced by tests/telemetry-test-optout-guard.test.py.
     env["SUTANDO_TELEMETRY"] = "0"
     env["DO_NOT_TRACK"] = "1"
     env.update({k: str(v) for k, v in extra.items()})

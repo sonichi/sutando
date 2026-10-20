@@ -78,6 +78,10 @@ export SUTANDO_TELEMETRY=0
 …or create the file `<workspace>/state/telemetry-disabled`. In the desktop app,
 use the Privacy toggle in Settings.
 
+Telemetry is also off whenever the install id would be stored under a temp
+directory (a throwaway `HOME`, as test harnesses use): such an id is new on
+every run and would count every run as a new user.
+
 ## Transparency
 
 - All telemetry lives in one file: [`src/telemetry.py`](src/telemetry.py).

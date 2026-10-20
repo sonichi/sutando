@@ -14,6 +14,14 @@ fails if either half regresses:
      - .github/workflows/windows-runtime.yml
   2. telemetry.opted_out() honors SUTANDO_TELEMETRY=0 (and enabled() → False)
   3. tests/_helpers/hermetic_env.py, which rebuilds a test's environment, keeps it off
+  4. a child process whose environment a test rebuilt by hand (env={"PATH": ..., "HOME": tmp})
+     carries no opt-out variable, so src/telemetry.py refuses to emit when the install id
+     would live under a temp directory (ephemeral_identity)
+
+IMPORTANT: every one of these is load-bearing. A test run that emits counts as a real user on
+the admin DAU, and each run mints a fresh install id, so a single CI run can add hundreds of
+"users". Do not remove, weaken or bypass the opt-out in the runners, in hermetic_env, or in
+telemetry.ephemeral_identity() to make a test pass; stub the network boundary instead.
 
 Run: python3 tests/telemetry-test-optout-guard.test.py
 """
@@ -97,8 +105,43 @@ with mock.patch.dict(os.environ, {**built, "POSTHOG_API_KEY": "phc_test"}, clear
     mod._KEY = "phc_test"
     check("telemetry.enabled() is False inside hermetic_env()", mod.enabled() is False)
 
+# 4. a child whose environment a test rebuilt from nothing (env={"PATH": ..., "HOME": <temp dir>})
+# inherits no opt-out variable at all; telemetry itself must still refuse to emit there.
+import subprocess  # noqa: E402
+import tempfile  # noqa: E402
+
+PROBE = ("import sys; sys.path.insert(0, sys.argv[1]); import telemetry; "
+         "telemetry._KEY = 'phc_test'; print(telemetry.enabled())")
+
+
+def _child_enabled(home):
+    env = {"PATH": os.environ.get("PATH", ""), "HOME": home, "POSTHOG_API_KEY": "phc_test",
+           "SUTANDO_STATE_DIR": os.path.join(home, "state")}
+    out = subprocess.run([sys.executable, "-c", PROBE, str(REPO / "src")], env=env,
+                         capture_output=True, text=True, timeout=60)
+    return out.stdout.strip() or out.stderr.strip()
+
+
+with tempfile.TemporaryDirectory() as fresh_home:
+    got = _child_enabled(fresh_home)
+check("child with a rebuilt env and a temp HOME → enabled() False", got == "False", got)
+# the same decision in this process, where the coverage gate can see it.
+with tempfile.TemporaryDirectory() as fresh_home, mock.patch.dict(
+        os.environ, {"HOME": fresh_home, "POSTHOG_API_KEY": "phc_test"}, clear=False):
+    os.environ.pop("SUTANDO_TELEMETRY_ID_FILE", None)
+    os.environ.pop("XDG_DATA_HOME", None)
+    spec = importlib.util.spec_from_file_location("telemetry_temp_home", REPO / "src" / "telemetry.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    check("in-process: a temp HOME → ephemeral_identity() True", mod.ephemeral_identity() is True)
+    os.environ["SUTANDO_TELEMETRY_ID_FILE"] = os.path.join(fresh_home, "telemetry-id")
+    check("in-process: an explicit SUTANDO_TELEMETRY_ID_FILE is kept", mod.ephemeral_identity() is False)
+# control: the same rebuilt env with a HOME outside any temp dir does emit, so the temp HOME is the gate.
+got = _child_enabled("/nonexistent-sutando-telemetry-guard-home")
+check("control: rebuilt env with a non-temp HOME → enabled() True", got == "True", got)
+
 print()
 if failures:
     print(f"{len(failures)} FAILURE(S): {failures}")
     raise SystemExit(1)
-print(f"ALL PASS ({10} checks)")
+print(f"ALL PASS ({14} checks)")

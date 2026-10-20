@@ -5,7 +5,8 @@ on:
   push:
     branches: [main]
 
-# Tests must never emit product telemetry (no PostHog writes from CI).
+# IMPORTANT: tests must never emit product telemetry; removing or weakening this makes CI test runs
+# count as real users on the admin DAU. Enforced by tests/telemetry-test-optout-guard.test.py.
 env:
   SUTANDO_TELEMETRY: "0"
 
