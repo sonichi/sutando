@@ -232,8 +232,11 @@ harmless): a verdict the policy refuses (`unsigned`, `invalid`), a header id
 that does not match the file stem (the stem's mark), a final claim or
 authorize refusal, an interrupted answer, and every release of a submitted
 task's offer (published by `ag2space_reply`, parked or delivered at a turn's
-end, retried by the scan, or dropped because its turn was not confirmed), so a
-mark written while the authorization was retried is the offer's to clear. Until the CLI confirms the clear (a refusal, exit 3, or
+end, or retried by the scan), so a mark written while the authorization was
+retried is the offer's to clear. An offer whose turn was not confirmed is the
+exception: its claim stays `CALLING` with no answer, so the mod takes the task
+back (its claim retried, backed off) and keeps the mark until the claim settles
+(the next start answers it as interrupted) and the claim's refusal retires it. Until the CLI confirms the clear (a refusal, exit 3, or
 a CLI that did not run) the mod keeps the task, retries only the clear after
 1, 2, 4 ... ticks capped at 60, and marks it seen once the clear lands; no
 mark outlives its task.

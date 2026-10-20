@@ -183,7 +183,9 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
       }
       if (result(task) === 'LIVE_UNREADY') return out(1, { refused: `${task} is LIVE_UNREADY, not claimable yet; retried`, retry: true })
       const c = claims[task]
-      if (c && c.phase !== 'PREPARED') return out(1, { refused: `${task}: attempt ${c.attempt} is ${c.phase}` })
+      // As the CLI: an attempt in flight is not claimable yet (retried); a resolved one clears the mark, refused.
+      if (c && ['CALLING', 'TURN_CONFIRMED', 'RESULT_STAGED'].includes(c.phase)) return out(1, { refused: `${task} is ${c.phase}, not claimable yet; retried`, retry: true })
+      if (c && c.phase !== 'PREPARED') { delete stuck[task]; return out(1, { refused: `${task}: attempt ${c.attempt} is ${c.phase}` }) }
       // The CLI's admission (task_io.admission, pinned in Python): no tier is malformed; non-owners need the flag.
       const text = files[`/in/${task}.txt`] ?? ''
       const tier = text.match(/^access_tier: (\S+)/m)?.[1]
@@ -1347,6 +1349,7 @@ test('a stuck mark from authorization retries is cleared when the offer is publi
 
 // Every offer-release path, each with a mark seeded after submission (whatever wrote it), and a clear that is
 // refused once: the mark is cleared through the backed-off clear, never left behind.
+// The unconfirmed turn is the exception: its claim stays CALLING with no answer, so its mark is kept.
 const RELEASES: Record<string, (args: { $: any; h: any; msg: string }) => Promise<void>> = {
   'park at the turn end': async ({ $, msg }) => {
     await $.turn.start({ text: FRAMED(msg), turnId: 't1' })
@@ -1381,7 +1384,7 @@ const RELEASES: Record<string, (args: { $: any; h: any; msg: string }) => Promis
   },
 }
 for (const [path, drive] of Object.entries(RELEASES)) {
-  test(`an offer released by ${path} clears the task's stuck mark, retried until confirmed`, async ($, on) => {
+  test(`an offer released by ${path} clears the task's stuck mark, retried until confirmed (kept if unanswered)`, async ($, on) => {
     const h = host(on)
     h.files['/in/task-s.txt'] = TASK('task-s')
     await arm($, h)
@@ -1391,11 +1394,37 @@ for (const [path, drive] of Object.entries(RELEASES)) {
     h.refuseUnstuck(1)
     await drive({ $, h, msg: h.submitted[0] })
     for (let i = 0; i < 10; i++) await h.clock.advance(1000)
-    expect(h.files['/out/task-s.txt'] !== undefined).toBe(path !== 'turn not confirmed')
-    expect(h.stuck).toEqual({})
-    expect(h.runs.filter((a: string[]) => a[2] === 'progress' && a.includes('--unstuck') && a.includes('task-s')).length).toBe(2)
+    const keeps = path === 'turn not confirmed'
+    expect(h.files['/out/task-s.txt'] !== undefined).toBe(!keeps)
+    expect(h.stuck).toEqual(keeps ? { 'task-s': { since: 1 } } : {})
+    expect(h.runs.filter((a: string[]) => a[2] === 'progress' && a.includes('--unstuck') && a.includes('task-s')).length).toBe(keeps ? 0 : 2)
   })
 }
+
+test('an unconfirmed turn keeps the task and its stuck mark until the claim settles; then it is retired once', async ($, on) => {
+  const h = host(on)
+  h.files['/in/task-u.txt'] = TASK('task-u')
+  await arm($, h)
+  await h.clock.advance(1000)
+  h.stuck['task-u'] = { since: 1 }
+  h.claims['task-u'].token = 'another'                 // the confirmation is refused: the claim stays CALLING
+  await $.turn.start({ text: FRAMED(h.submitted[0]), turnId: 't-u' })
+  for (let i = 0; i < 20; i++) await h.clock.advance(1000)
+  expect(h.claims['task-u'].phase).toBe('CALLING')
+  expect(h.files['/out/task-u.txt']).toBe(undefined)
+  expect(h.stuck).toEqual({ 'task-u': { since: 1 } })  // the unanswered alarm stays visible
+  expect(verbs(h).filter(v => v === 'claim').length).toBeGreaterThan(1)   // kept and retried, backed off
+  // The next start answers the CALLING claim as interrupted (the generation's recovery): settled, result written.
+  h.claims['task-u'].phase = 'SETTLED'
+  h.files['/out/task-u.txt'] = '[AG2 Space] This attempt was interrupted before the session answered\n'
+  for (let i = 0; i < 70; i++) await h.clock.advance(1000)
+  expect(h.stuck).toEqual({})
+  expect(h.logs.filter(l => l.includes('task-u not claimed:')).length).toBe(1)
+  const claims = verbs(h).filter(v => v === 'claim').length
+  for (let i = 0; i < 70; i++) await h.clock.advance(1000)
+  expect(verbs(h).filter(v => v === 'claim').length).toBe(claims)   // retired: tried no more
+  expect(h.submitted.length).toBe(1)
+})
 
 test('a pending authorization is dropped when its inbox file goes: a returning file is claimed afresh', async ($, on) => {
   const h = host(on, { authorizeLostOnce: true })

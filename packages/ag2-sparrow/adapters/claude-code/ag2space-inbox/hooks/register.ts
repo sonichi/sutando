@@ -187,7 +187,7 @@ function retireTask($: any, s: State, name: string, rid: string, why: string, do
   return clearMark($, s, name, { rid, why, fails: 0, delay: 0, next: s.tick, done })
 }
 
-// The one way an offer leaves the Mod's hands (settled, or its turn not confirmed): through the mark clear.
+// The one way a settled offer leaves the Mod's hands: through the mark clear.
 async function releaseOffer($: any, s: State, offer: Offer, why: string): Promise<boolean> {
   s.offers.delete(offer.rid)
   if (s.pending === offer) s.pending = null
@@ -234,7 +234,10 @@ async function confirmOffer($: any, s: State, offer: Offer): Promise<void> {
     return
   }
   await $.ui.log(`${PLUGIN}: ${offer.rid} turn not confirmed: ${r.data?.refused ?? ''}`, {})
-  await releaseOffer($, s, offer, 'turn not confirmed')
+  // The claim stays CALLING, unanswered: the scan takes the task back (the claim is retried, backed off) and its
+  // mark stays until the claim settles (the next start answers it as interrupted) and the claim retires it.
+  s.offers.delete(offer.rid)
+  s.seen.delete(offer.file)
 }
 
 async function sha256($: any, text: string): Promise<string> {
