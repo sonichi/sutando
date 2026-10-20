@@ -60,15 +60,15 @@ class TestTransientIsNotAnOutage(unittest.TestCase):
 
     def test_the_bound_is_the_bridge_s_own_grace_not_a_local_guess(self):
         """Review finding: a literal cannot track an env-tuned bridge constant."""
-        self.assertEqual(HC.GATEWAY_TRANSIENT_OUTAGE_S, 3 * (25 + 10))
+        self.assertEqual(HC.GATEWAY_TRANSIENT_OUTAGE_S, 3 * (35 + 25))
         with mock.patch.dict(os.environ, {"REMOTE_TASK_POLL_WAIT": "50"}):
             reloaded = _load()
-        self.assertEqual(reloaded.GATEWAY_TRANSIENT_OUTAGE_S, 3 * (50 + 10))
+        self.assertEqual(reloaded.GATEWAY_TRANSIENT_OUTAGE_S, 3 * (50 + 25))
 
     def test_past_the_grace_the_bridge_and_the_probe_agree_it_is_an_outage(self):
-        # Between the old 300s literal and the bridge's 105s the two disagreed:
+        # Between the old 300s literal and the bridge's grace the two disagreed:
         # the bridge called it an outage and this probe still said "transient".
-        self.assertEqual(_probe(106)["status"], "warn")
+        self.assertEqual(_probe(HC.GATEWAY_TRANSIENT_OUTAGE_S + 1)["status"], "warn")
         self.assertEqual(_probe(299)["status"], "warn")
 
     def test_a_negative_age_is_not_freshness(self):

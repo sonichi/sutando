@@ -2652,7 +2652,7 @@ def main() -> int:
     # bridge off (up to 60s) and flipped gateway-status.json to
     # `connected: false` while tasks were still arriving and results delivering.
     grace = rtc.POLL_TIMEOUT_GRACE_S
-    check(grace >= rtc.POLL_WAIT + 10,
+    check(grace >= rtc.POLL_READ_TIMEOUT_S,
           "poll-timeout: the grace covers at least one whole poll window")
     check(rtc._poll_timeout_is_empty(1000.0, 1000.0),
           "poll-timeout: a timeout right after a good poll reads as an empty poll")
@@ -2703,7 +2703,8 @@ def main() -> int:
     # it. Asserted against the loaded function, not a copy of the file.
     import inspect
     _loop = inspect.getsource(rtc.main)
-    _poll_call = _loop.split('"GET", f"/v1/tasks?wait=', 1)[-1][:400]
+    # The poll call through its timeout handler's benign-empty fallback.
+    _poll_call = _loop.split('"GET", f"/v1/tasks?wait=', 1)[-1].split('resp = {"tasks": []}', 1)[0]
     check("_poll_timeout_is_empty" in _poll_call,
           "poll-timeout: the poll call site consults the policy")
     check("except (TimeoutError, socket.timeout)" in _poll_call,

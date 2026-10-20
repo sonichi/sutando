@@ -455,6 +455,13 @@ Pass `--no-service` to skip all of this; the keepawake task then keeps Sparrow
 running alone. Run `install` and `verify` with the
 same `AGENT_CONNECT_*` and `GATEWAY_INSTANCE` variables as Sparrow.
 
+A task poll the relay holds past the read timeout is not a success: the status
+file says `connected: false` and keeps `last_ok_ts`. Five such polls in a row
+while other requests to the relay still answer mark a stuck relay session
+(`stuck_poll: true`, `consecutive_poll_timeouts`, `stuck_since`), and Sparrow
+exits 69 so its supervisor relaunches it, at most once every 10 minutes.
+Claimed tasks are on disk before that exit and reload on the next start.
+
 Sparrow rewrites `state/gateway-status.json` every poll. `verify` fails its
 `sparrow` check when that file is missing, not connected, or older than 3
 minutes, and `ag2-sparrow-hatch sparrow` runs the same check alone, exiting 10
