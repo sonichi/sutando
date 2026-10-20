@@ -13,6 +13,7 @@ fails if either half regresses:
      - .github/workflows/python39-compat.yml
      - .github/workflows/windows-runtime.yml
   2. telemetry.opted_out() honors SUTANDO_TELEMETRY=0 (and enabled() → False)
+  3. tests/_helpers/hermetic_env.py, which rebuilds a test's environment, keeps it off
 
 Run: python3 tests/telemetry-test-optout-guard.test.py
 """
@@ -78,8 +79,26 @@ opted_on, enab_on = _load_telemetry(None)
 check("without opt-out (key present) → enabled() True (opt-out is the gate)",
       opted_on is False and enab_on is True)
 
+# 3. the shared test environment carries the opt-out itself: it is rebuilt from an allowlist,
+# so a runner-level SUTANDO_TELEMETRY=0 does not reach a test that uses it.
+import sys
+from unittest import mock
+sys.path.insert(0, str(REPO / "tests"))
+from _helpers.hermetic_env import hermetic_env  # noqa: E402
+
+with mock.patch.dict(os.environ, {"PATH": os.environ.get("PATH", ""), "POSTHOG_API_KEY": "phc_test"}, clear=True):
+    built = hermetic_env()
+check("hermetic_env() sets SUTANDO_TELEMETRY=0 with no opt-out outside", built.get("SUTANDO_TELEMETRY") == "0")
+check("hermetic_env() sets DO_NOT_TRACK=1 with no opt-out outside", built.get("DO_NOT_TRACK") == "1")
+with mock.patch.dict(os.environ, {**built, "POSTHOG_API_KEY": "phc_test"}, clear=True):
+    spec = importlib.util.spec_from_file_location("telemetry_hermetic", REPO / "src" / "telemetry.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    mod._KEY = "phc_test"
+    check("telemetry.enabled() is False inside hermetic_env()", mod.enabled() is False)
+
 print()
 if failures:
     print(f"{len(failures)} FAILURE(S): {failures}")
     raise SystemExit(1)
-print(f"ALL PASS ({7} checks)")
+print(f"ALL PASS ({10} checks)")

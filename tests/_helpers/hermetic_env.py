@@ -101,7 +101,7 @@ def _test_control(name: str) -> bool:
 
 
 def hermetic_env(home: "Path | str | None" = None, **extra: str) -> "dict[str, str]":
-    """The allowlisted host and test-control variables, a temp HOME, a fixed USER, then `extra`.
+    """The allowlisted host and test-control variables, a temp HOME, a fixed USER, telemetry off, then `extra`.
 
     Without `home`, an isolated process's own temp HOME is reused, so its children share it."""
     allowed = HOST_ALLOWLIST + HARNESS_ALLOWLIST + (WINDOWS_ALLOWLIST if os.name == "nt" else ())
@@ -112,6 +112,9 @@ def hermetic_env(home: "Path | str | None" = None, **extra: str) -> "dict[str, s
         env["USERPROFILE"] = env["HOME"]
     env["USER"] = HERMETIC_USER
     env["PYTHONNOUSERSITE"] = "1"
+    # A rebuilt environment loses the runner's telemetry opt-out; tests never emit product telemetry.
+    env["SUTANDO_TELEMETRY"] = "0"
+    env["DO_NOT_TRACK"] = "1"
     env.update({k: str(v) for k, v in extra.items()})
     cov = _coverage_path()
     if cov is not None:

@@ -246,6 +246,11 @@ def recover(workspace, repo, worker_id, *, runner=None, spawn=None) -> dict:
         if not sessions:
             return {"worker_id": worker_id, "outcome": NO_SESSION}
         session = sessions[-1]
+        if last.get("session_id"):
+            session = next((s for s in sessions if s.get("session_id") == last["session_id"]), None)
+            if session is None:
+                return {"worker_id": worker_id, "outcome": NO_SESSION,
+                        "why": f"recorded incarnation session {last['session_id']!r} is not in this worker's lineage"}
         kw = {"resume": session["session_id"], "runtime": "claude", "socket": socket,
               "cwd": (session.get("transcript") or {}).get("cwd") or str(repo)}
     if runner is not None:
