@@ -42,6 +42,8 @@ def _load(name):
 rem = _load("pool_remedy")
 ps = rem.ps
 WID, OTHER = "a" * 32, "b" * 32
+# A loaded CI runner can take well past 10 s to reap a pane or drop a session.
+WAIT_SECONDS = 60
 
 
 class RestartSessionContinuity(unittest.TestCase):
@@ -113,17 +115,22 @@ int main(int argc, char **argv) {
         keeper = self.tmux("new-session", "-d", "-s", "test-keeper", str(self.endpoint / "claude"))
         self.assertEqual(keeper.returncode, 0, keeper.stderr)
 
-    def wait_for(self, predicate, seconds=10):
+    @staticmethod
+    def poll_until(predicate, seconds=WAIT_SECONDS):
         deadline = time.monotonic() + seconds
         while time.monotonic() < deadline:
             if predicate():
-                return
+                return True
             time.sleep(0.05)
-        self.fail("timed out waiting for disposable runtime state")
+        return predicate()
 
-    def tmux(self, *args):
+    def wait_for(self, predicate, seconds=WAIT_SECONDS):
+        if not self.poll_until(predicate, seconds):
+            self.fail(f"timed out after {seconds} s waiting for disposable runtime state")
+
+    def tmux(self, *args, timeout=30):
         return subprocess.run(["tmux", "-S", str(self.socket), *args], env=dict(os.environ),
-                              capture_output=True, text=True, timeout=10)
+                              capture_output=True, text=True, timeout=timeout)
 
     def alive(self, pid):
         try:
@@ -131,24 +138,35 @@ int main(int argc, char **argv) {
             return True
         except ProcessLookupError:
             return False
+        except PermissionError:
+            return False  # the pid was reaped and reused by another user's process
 
     def stop_server(self):
-        panes = self.tmux("list-panes", "-a", "-F", "#{pane_pid}")
-        self.pids.update(int(p) for p in panes.stdout.split() if p.isdigit())
+        # Teardown timing alone never fails the test; the kill-server below runs regardless.
+        try:
+            panes = self.tmux("list-panes", "-a", "-F", "#{pane_pid}")
+            self.pids.update(int(p) for p in panes.stdout.split() if p.isdigit())
+        except subprocess.TimeoutExpired:
+            pass
         for pid in self.pids:
             try:
                 os.kill(pid, signal.SIGTERM)
-            except ProcessLookupError:
+            except (ProcessLookupError, PermissionError):
                 pass
-        try:
-            self.wait_for(lambda: all(not self.alive(pid) for pid in self.pids))
-        finally:
-            self.tmux("kill-server")
+        self.poll_until(lambda: all(not self.alive(pid) for pid in self.pids))
+        for _ in range(3):
             try:
-                self.server.wait(timeout=10)
+                self.tmux("kill-server")
             except subprocess.TimeoutExpired:
-                self.server.kill()
-                self.server.wait(timeout=5)
+                pass
+            try:
+                self.server.wait(timeout=WAIT_SECONDS / 3)
+                break
+            except subprocess.TimeoutExpired:
+                continue
+        else:
+            self.server.kill()
+            self.server.wait(timeout=WAIT_SECONDS)
         self.assertIsNotNone(self.server.returncode)
         (self.diagnostics / "restart-cleanup.json").write_text(json.dumps({
             "server_pid": self.server.pid, "server_reaped": True,
