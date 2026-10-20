@@ -1,19 +1,14 @@
 #!/usr/bin/env python3
-"""A held long poll is the documented empty poll — until the grace expires.
-
-Drives the real poll loop for one iteration. The relay's contract is
-`200 {"tasks": []}` when the hold window expires; when it instead lets the
-client's read timeout fire, the two are indistinguishable, so classifying the
-timeout as a network error backed a healthy bridge off and wrote
-`connected: false` while tasks were still arriving.
-"""
+"""Long-poll timeout grace preserves retry timing without inventing poll evidence."""
 from __future__ import annotations
 
 import sys
+import json
 import tempfile
 import threading
 import unittest
-from unittest.mock import patch
+from contextlib import ExitStack
+from unittest.mock import Mock, patch
 from pathlib import Path
 
 _REPO = Path(__file__).resolve().parent.parent
@@ -24,6 +19,8 @@ if str(_PKG) not in sys.path:
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _helpers.hermetic_gateway import assert_hermetic, isolate_then_import  # noqa: E402
 _GW, _IMPORT_READS = isolate_then_import()   # before anything else imports the bridge
+sys.path.insert(0, str(_REPO / "src"))
+from gateway_serving import read_verdict  # noqa: E402
 
 
 class _Clock:
@@ -113,6 +110,209 @@ class _Loop:
         return self
 
 
+class _StatusLoop(_Loop):
+    """Controlled poll responses, with production status, task and ack persistence."""
+
+    def __enter__(self):
+        super().__enter__()
+        self.stack = ExitStack()
+        gw = self.gw
+        root = Path(self._tmp.name)
+        for name in ("_emit_gateway_status", "_write_task", "_save_inflight",
+                     "_load_inflight", "_post_task_ack"):
+            setattr(gw, name, self._saved[name])
+        for name in ("GATEWAY_STATUS_FILE", "INFLIGHT_FILE", "PENDING_ACK_FILE",
+                     "TASK_MEDIA_FILE", "TASK_ROOMS_FILE", "OWNER_ACTIVITY_FILE",
+                     "ACK_FIRST_FILE", "ACK_FIRST_MANIFEST_FILE", "DEDUP_ALIAS_FILE"):
+            self.stack.enter_context(patch.object(gw, name, root / "state" / getattr(gw, name).name))
+        self.stack.enter_context(patch.multiple(
+            gw, _STATE=root / "state", TASKS_DIR=root / "tasks",
+            ARCHIVE_RESULTS_DIR=root / "archive", UNDELIVERABLE_RESULTS_DIR=root / "undelivered",
+            GATEWAY_INSTANCE="", ON_TASK_CMD="", _ack_disabled_until=0.0,
+            _LOCK_LOST=threading.Event(), _OUTBOUND_STOP=threading.Event(),
+            _OUTBOUND_WAKE=threading.Event(), _INFLIGHT_DEGRADED=False))
+        for name in ("_resolve_host_label", "_start_lock_heartbeat", "_stamp_loop_progress",
+                     "refresh_routing", "_retire_delivered_marks", "_sweep_held_dir",
+                     "_reclaim_parked_relay_results", "_keep_relay_results_in_flight",
+                     "_retry_withheld_reviews", "_push_pool_advertisement", "_advance_held_tasks"):
+            self.stack.enter_context(patch.object(gw, name, return_value=None))
+        self.stack.enter_context(patch.object(gw, "_start_results_watcher", return_value=None))
+        self.stack.enter_context(patch.object(gw, "_start_outbound_worker", return_value=Mock()))
+        gw._heartbeat_singleton = self._next_iteration
+        self.acks = []
+        return self
+
+    def __exit__(self, *exc):
+        self.stack.close()
+        return super().__exit__(*exc)
+
+    def _next_iteration(self):
+        self.records.append(json.loads(self.gw.GATEWAY_STATUS_FILE.read_text()))
+        verdict = read_verdict(self.gw.GATEWAY_STATUS_FILE, now=self.clock.time(), max_age=90)
+        self.serving.append(verdict.serving if verdict is not None else None)
+        return bool(self.outcomes)
+
+    def _poll(self, method, path, payload=None, **kw):
+        if method == "GET" and path.startswith("/v1/tasks?wait="):
+            self.polls.append(path)
+            advance, outcome = self.outcomes.pop(0)
+            self.clock.now += advance
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+        if method == "POST" and path.endswith("/ack"):
+            gw = self.gw
+            tid = payload["id"]
+            self.acks.append({
+                "payload": dict(payload),
+                "task": (gw.TASKS_DIR / f"{tid}.txt").read_text(),
+                "inflight": json.loads(gw.INFLIGHT_FILE.read_text()),
+                "pending": json.loads(gw.PENDING_ACK_FILE.read_text()),
+                "leases": json.loads(gw._ack_lease_file().read_text()),
+                "status": json.loads(gw.GATEWAY_STATUS_FILE.read_text()),
+            })
+            return {}
+        raise AssertionError(f"unexpected request: {method} {path}")
+
+    def run(self, outcomes):
+        self.outcomes = list(outcomes)
+        self.records, self.serving = [], []
+        self.gw.main()
+        return self
+
+
+class GatewayStatusEvidenceTest(unittest.TestCase):
+    EMPTY = {"tasks": []}
+    TASK = {"id": "task-poll-evidence", "task": "synthetic task", "lease_id": "test-lease"}
+
+    def timeout(self, advance=1):
+        return advance, TimeoutError("The read operation timed out")
+
+    def test_startup_timeouts_without_a_success_never_serve(self):
+        with _StatusLoop(_GW) as loop:
+            loop.run([self.timeout(), self.timeout(), self.timeout(_GW.POLL_TIMEOUT_GRACE_S)])
+            self.assertEqual([r["last_ok_ts"] for r in loop.records], [None] * 4)
+            self.assertEqual([r["connected"] for r in loop.records], [False] * 4)
+            self.assertEqual(loop.serving, [False] * 4)
+            self.assertEqual(loop.clock.slept, [1])
+
+    def test_startup_timeouts_preserve_a_thirteen_hour_old_success(self):
+        with _StatusLoop(_GW) as loop:
+            loop.run([(1, self.EMPTY)])
+            old_ok = int(loop.clock.time())
+            self.assertEqual(loop.records[-1]["last_ok_ts"], old_ok)
+            loop.clock.now += 13 * 3600
+            loop.run([self.timeout(), self.timeout(), self.timeout(_GW.POLL_TIMEOUT_GRACE_S)])
+            self.assertEqual([r["last_ok_ts"] for r in loop.records], [old_ok] * 4)
+            self.assertEqual([r["connected"] for r in loop.records], [False] * 4)
+            self.assertEqual(loop.serving, [False] * 4)
+            self.assertEqual(loop.clock.slept, [1])
+
+    def test_confirmed_poll_retains_evidence_through_the_inclusive_grace_boundary(self):
+        with _StatusLoop(_GW) as loop:
+            ok = int(loop.clock.time()) + 1
+            loop.run([(1, self.EMPTY), self.timeout(), self.timeout(_GW.POLL_TIMEOUT_GRACE_S - 1)])
+            self.assertEqual([r["last_ok_ts"] for r in loop.records], [None, ok, ok, ok])
+            self.assertEqual(loop.serving, [False, True, True, True])
+            self.assertEqual(loop.clock.slept, [])
+            self.assertFalse(any("poll network error" in m for m in loop.logs))
+
+    def test_expired_grace_retains_success_and_bounded_backoff(self):
+        with _StatusLoop(_GW) as loop:
+            ok = int(loop.clock.time()) + 1
+            loop.run([(1, self.EMPTY), self.timeout(_GW.POLL_TIMEOUT_GRACE_S + 1)]
+                     + [self.timeout()] * 7)
+            self.assertEqual([r["last_ok_ts"] for r in loop.records[1:]], [ok] * 9)
+            self.assertEqual(loop.serving, [False, True] + [False] * 8)
+            self.assertEqual(loop.clock.slept, [1, 2, 4, 8, 16, 32, 60, 60])
+            self.assertEqual([r["backoff_s"] for r in loop.records[2:]], loop.clock.slept)
+
+    def test_empty_and_task_responses_restore_serving_and_ack_after_timeout(self):
+        with _StatusLoop(_GW) as loop:
+            loop.run([self.timeout(), (1, self.EMPTY), self.timeout(),
+                      self.timeout(_GW.POLL_TIMEOUT_GRACE_S + 1),
+                      (1, {"tasks": [self.TASK]}), self.timeout()])
+            empty_ok = 1_000_002
+            task_ok = empty_ok + _GW.POLL_TIMEOUT_GRACE_S + 4
+            self.assertEqual([r["last_ok_ts"] for r in loop.records],
+                             [None, None, empty_ok, empty_ok, empty_ok, task_ok, task_ok])
+            self.assertEqual(loop.serving, [False, False, True, True, False, True, True])
+            self.assertEqual(loop.clock.slept, [1])
+            self.assertEqual(len(loop.acks), 1)
+            ack = loop.acks[0]
+            tid = self.TASK["id"]
+            self.assertEqual(ack["payload"], {"id": tid, "durable": True, "lease_id": "test-lease"})
+            self.assertIn("task: synthetic task", ack["task"])
+            self.assertEqual(ack["inflight"], [tid])
+            self.assertEqual(ack["pending"], {tid: True})
+            self.assertEqual(ack["leases"], {tid: "test-lease"})
+            self.assertEqual(ack["status"]["last_ok_ts"], task_ok)
+            self.assertEqual(_GW._load_pending_acks(), {})
+
+    def test_task_write_error_cannot_discard_the_completed_poll(self):
+        for prior_success in (False, True):
+            with self.subTest(prior_success=prior_success), _StatusLoop(_GW) as loop:
+                _GW.TASKS_DIR.write_text("not a directory")
+                prefix = [(1, self.EMPTY)] if prior_success else []
+                ok = 1_000_001 + int(prior_success)
+                loop.run(prefix + [(1, {"tasks": [self.TASK]}), self.timeout(),
+                                   self.timeout(_GW.POLL_TIMEOUT_GRACE_S + 1)]
+                         + [self.timeout()] * 7)
+                records = loop.records[1 + len(prefix):]
+                self.assertEqual([r["last_ok_ts"] for r in records], [ok] * 10)
+                self.assertEqual(loop.serving[1 + len(prefix):], [False, True] + [False] * 8)
+                self.assertIn("unexpected:", records[0]["error"])
+                self.assertTrue(any("File exists" in m for m in loop.logs))
+                self.assertEqual(loop.clock.slept, [1, 1, 2, 4, 8, 16, 32, 60, 60])
+                self.assertEqual(loop.acks, [])
+                self.assertFalse(_GW.INFLIGHT_FILE.exists())
+                self.assertFalse(_GW.PENDING_ACK_FILE.exists())
+
+    def test_failed_status_write_is_retried_with_the_completed_poll_timestamp(self):
+        with _StatusLoop(_GW) as loop:
+            _GW.TASKS_DIR.write_text("not a directory")
+            replace = _GW.os.replace
+            failed = []
+
+            def fail_once(src, dst):
+                if dst == _GW.GATEWAY_STATUS_FILE and not failed:
+                    if json.loads(src.read_text())["last_ok_ts"] is not None:
+                        failed.append(True)
+                        raise OSError("status unavailable")
+                replace(src, dst)
+
+            with patch.object(_GW.os, "replace", side_effect=fail_once):
+                loop.run([(1, {"tasks": [self.TASK]}), self.timeout(),
+                          self.timeout(_GW.POLL_TIMEOUT_GRACE_S + 1)])
+            self.assertEqual(failed, [True])
+            self.assertEqual([r["last_ok_ts"] for r in loop.records],
+                             [None, 1_000_001, 1_000_001, 1_000_001])
+            self.assertEqual(loop.serving, [False, False, True, False])
+            self.assertEqual(loop.acks, [])
+
+    def test_http_and_auth_failures_preserve_evidence_and_existing_handling(self):
+        import urllib.error
+
+        for code in (500, 401, 403):
+            with self.subTest(code=code), _StatusLoop(_GW) as loop, \
+                    patch.object(_GW, "_recover_auth", return_value=False) as recover:
+                outcomes = [(1, self.EMPTY),
+                            (1, urllib.error.HTTPError(_GW.URL, code, "test rejection", {}, None))]
+                if code in (401, 403):
+                    with self.assertRaisesRegex(SystemExit, f"FATAL: gateway auth rejected \\(HTTP {code}\\)"):
+                        loop.run(outcomes)
+                    recover.assert_called_once_with(code)
+                    self.assertEqual(loop.clock.slept, [])
+                else:
+                    loop.run(outcomes)
+                    recover.assert_not_called()
+                    self.assertEqual(loop.clock.slept, [1])
+                rec = json.loads(_GW.GATEWAY_STATUS_FILE.read_text())
+                self.assertEqual(rec["last_ok_ts"], 1_000_001)
+                self.assertFalse(rec["connected"])
+                self.assertIn(f"HTTP {code}", rec["error"])
+
+
 class LongPollTimeoutTest(unittest.TestCase):
     def setUp(self):
         try:
@@ -143,8 +343,8 @@ class LongPollTimeoutTest(unittest.TestCase):
         self.assertEqual(loop.clock.slept, [], "a benign empty poll must not back off")
         self.assertNotIn("poll network error",
                          " ".join(loop.logs), "and must not log an outage")
-        self.assertIn((True, {}), loop.status,
-                      "the iteration completes, so the bridge reports connected")
+        self.assertIn((False, {"poll_ok_ts": None}), loop.status,
+                      "startup grace alone does not establish connectivity")
 
     def test_a_timeout_past_the_grace_takes_the_outage_path(self):
         grace = self.gw.POLL_TIMEOUT_GRACE_S
@@ -171,7 +371,7 @@ class LongPollTimeoutTest(unittest.TestCase):
         with _Loop(self.gw, poll_raises=None, advance=1.0) as loop:
             loop.run()
         self.assertEqual(loop.clock.slept, [])
-        self.assertIn((True, {}), loop.status)
+        self.assertIn((True, {"poll_ok_ts": loop.clock.time()}), loop.status)
 
     def test_every_poll_carries_the_voice_outcome_contract(self):
         # One agent's credential may serve more than one bridge, so the broker serves
@@ -339,7 +539,7 @@ class DroppedConnectionTest(unittest.TestCase):
         self.assertEqual(len(recovered), 1, "one recovery line, after the good poll")
         self.assertRegex(recovered[0], r"^poll recovered after 2 failures, 6s$")
         self.assertLess(logs.index(errors[1]), logs.index(recovered[0]))
-        self.assertIn((True, {}), loop.status)
+        self.assertIn((True, {"poll_ok_ts": loop.clock.time()}), loop.status)
 
     def test_a_second_good_poll_logs_no_recovery_and_the_next_outage_counts_from_one(self):
         import urllib.error
