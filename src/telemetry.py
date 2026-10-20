@@ -148,9 +148,12 @@ def ephemeral_identity() -> bool:
     if os.environ.get("SUTANDO_TELEMETRY", "").strip().lower() in _TRUTHY:
         return False
     try:
-        target = os.path.normcase(os.path.realpath(_durable_id_path()))
+        path = _durable_id_path()
+        if not path.is_absolute():  # a relative home would resolve against whatever the cwd is
+            return True
+        target = os.path.normcase(os.path.realpath(path))
         return _macos_user_temp(target) or any(_within(target, r) for r in _fixed_temp_roots())
-    except Exception:  # pragma: no cover — defensive; an unresolvable path counts as ephemeral
+    except Exception:  # no determinable home (Windows without USERPROFILE/HOMEPATH raises): ephemeral
         return True
 
 

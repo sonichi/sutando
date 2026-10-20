@@ -164,6 +164,32 @@ with mock.patch.dict(os.environ, {"HOME": PERSISTENT_HOME, "TMPDIR": PERSISTENT_
     mod._KEY = "phc_test"
     check("TMPDIR set to a persistent HOME → still enabled()", tempfile.gettempdir() == PERSISTENT_HOME
           and mod.ephemeral_identity() is False and mod.enabled() is True)
+# A home that cannot be determined (Windows: no USERPROFILE/HOMEPATH makes Path.home() raise) or
+# is relative (resolved against the cwd) gives no stable id either.
+with mock.patch.dict(os.environ, {"POSTHOG_API_KEY": "phc_test"}):
+    for k in ("SUTANDO_TELEMETRY_ID_FILE", "XDG_DATA_HOME", "SUTANDO_TELEMETRY"):
+        os.environ.pop(k, None)
+    spec = importlib.util.spec_from_file_location("telemetry_no_home", REPO / "src" / "telemetry.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    def _no_home():
+        raise RuntimeError("Could not determine home directory.")
+
+    with mock.patch.object(mod.Path, "home", _no_home):
+        check("an undeterminable home (Windows rebuilt env) → ephemeral_identity() True",
+              mod.ephemeral_identity() is True)
+        os.environ["SUTANDO_TELEMETRY"] = "1"
+        check("an undeterminable home with SUTANDO_TELEMETRY=1 → the opt-in wins", mod.ephemeral_identity() is False)
+        os.environ.pop("SUTANDO_TELEMETRY")
+    cwd = os.getcwd()
+    try:
+        os.chdir(os.path.abspath(os.sep))
+        with mock.patch.object(mod.Path, "home", lambda: Path("relative-home")):
+            check("a relative home → ephemeral_identity() True", mod.ephemeral_identity() is True)
+    finally:
+        os.chdir(cwd)
+
 # control: the same rebuilt env with a HOME outside any temp dir does emit, so the temp HOME is the gate.
 got = _child_enabled("/nonexistent-sutando-telemetry-guard-home")
 check("control: rebuilt env with a non-temp HOME → enabled() True", got == "True", got)
