@@ -13,6 +13,7 @@ unset _self_dir
 cd "$REPO"
 # Shared with the claude launcher: one owner for the in-session restart policy.
 . "$REPO/src/agent/restart-guard.sh"
+. "$REPO/src/agent/core-runtime-record.sh"
 
 # This entry point only launches the canonical core. A Codex pool worker uses
 # the pool's runtime launcher instead.
@@ -502,6 +503,7 @@ elif session_exists "$SESSION" && [ "$(session_runtime)" != "codex" ]; then
 fi
 
 if session_exists "$SESSION"; then
+  record_confirmed_core_runtime codex "$(heartbeat_python)"
   apply_tmux_defaults
   ensure_task_notifier
   ensure_codex_observer
@@ -594,7 +596,6 @@ fi
 apply_tmux_defaults
 if ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" && [ -n "$ws" ]; then
   mkdir -p "$ws/state"
-  printf '{"runtime":"codex","session":"%s","started_at":%s}\n' "$SESSION" "$(date +%s)" > "$ws/state/core-runtime.json"
   printf '{"host":"%s","session_started_at":%s,"iso":"%s","source":"start-cli","runtime":"codex"}\n' \
     "$(hostname | sed 's/\..*//')" "$(date +%s)" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     >> "$ws/state/session-starts.log"
@@ -609,9 +610,11 @@ start_core_session_and_helpers() {
     sleep 0.2
   done
   if session_exists "$SESSION"; then
+    record_confirmed_core_runtime codex "$(heartbeat_python)"
     clear_shutdown_sentinel
   else
     echo "  ⚠ $SESSION did not come up within ~${SESSION_UP_LABEL} — sentinel NOT cleared, no core is serving." >&2
+    return 1
   fi
   ensure_task_notifier
   ensure_codex_observer

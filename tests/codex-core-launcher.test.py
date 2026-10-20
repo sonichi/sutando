@@ -63,6 +63,10 @@ def _read_when_nonempty(path, deadline):
 SESSION_UP_AFTER_CREATE_TMUX = '''#!/bin/bash
 printf '%s\n' "$*" >> "$TMUX_LOG"
 [ "${1:-}" = -S ] && shift 2
+if [ "${1:-}" = display-message ] && [ "${!#}" = '#{session_created}' ]; then
+  echo 123
+  exit 0
+fi
 [ "${1:-}" = new-session ] && : > "$TMUX_STATE.created"
 if [ "${1:-}" = has-session ]; then
   [ -e "$TMUX_STATE.created" ] && exit 0
@@ -75,6 +79,10 @@ exit 0
 SESSION_UP_THIRD_POLL_TMUX = '''#!/bin/bash
 printf '%s\n' "$*" >> "$TMUX_LOG"
 [ "${1:-}" = -S ] && shift 2
+if [ "${1:-}" = display-message ] && [ "${!#}" = '#{session_created}' ]; then
+  echo 123
+  exit 0
+fi
 [ "${1:-}" = new-session ] && : > "$TMUX_STATE.created"
 if [ "${1:-}" = has-session ]; then
   [ -e "$TMUX_STATE.created" ] || exit 1
@@ -104,6 +112,9 @@ class CodexCoreLauncherTests(unittest.TestCase):
             "src/agent/codex/cli/codex-observer.mjs",
             "src/agent/start-cli.sh",
             "src/agent/restart-guard.sh",
+            "src/agent/core-runtime-record.sh",
+            "src/core_runtime_record.py",
+            "src/result_publish.py",
             "src/agent/task-event-handler-lookup.sh",
             "src/file_lock.py",
             # cli_wedge imports sutando_platform; without it every classify
@@ -204,7 +215,15 @@ exit 0
         self._write_exe("tmux", '''#!/bin/bash
 printf '%s\\n' "$*" >> "$TMUX_LOG"
 [ "${1:-}" = -S ] && shift 2
+if [ "${1:-}" = display-message ] && [ "${!#}" = '#{session_created}' ]; then
+  echo 123
+  exit 0
+fi
+if [ "${1:-}" = new-session ] && [ "${4:-}" = sutando-core ]; then
+  [ "${TMUX_SESSION_NEVER_UP:-}" = 1 ] || touch "$TMUX_STATE.created"
+fi
 if [ "${1:-}" = has-session ]; then
+  if [ "${3:-}" = =sutando-core ] && [ -f "$TMUX_STATE.created" ]; then exit 0; fi
   if [ -n "${TMUX_ACTIVE_RUNTIME:-}" ] && [ ! -f "$TMUX_STATE" ] && [ "${3:-}" = =sutando-core ]; then exit 0; fi
   if [ "${TMUX_WATCHER_EXISTS:-}" = 1 ] && [ "${3:-}" = =sutando-core-watcher ]; then exit 0; fi
   exit 1
@@ -587,6 +606,7 @@ if [ "${1:-}" = print ]; then [ -f "$LAUNCHCTL_STATE" ]; else exit 0; fi
     def test_a_core_launch_still_writes_its_runtime_record(self):
         """The other polarity: with no instance id the same launch is the core's,
         and the records the worker test proves untouched are written."""
+        self._write_exe("tmux", SESSION_UP_AFTER_CREATE_TMUX)
         result = self.run_launcher()
         self.assertEqual(result.returncode, 0, result.stderr)
         state = self.root / "workspace" / "state"
@@ -2308,8 +2328,9 @@ exit 0
         """When the session never appears the warning names the applied budget: a
         raw 0.9 is one poll and "~0.2s", so raw and effective differ cheaply."""
         sentinel = self._seed_sentinel()
-        result = self.run_launcher(env_extra={"SUTANDO_CORE_SESSION_WAIT_S": "0.9"})
-        self.assertEqual(result.returncode, 0, result.stderr)
+        result = self.run_launcher(env_extra={"SUTANDO_CORE_SESSION_WAIT_S": "0.9",
+                                              "TMUX_SESSION_NEVER_UP": "1"})
+        self.assertNotEqual(result.returncode, 0, result.stderr)
         self.assertIn("did not come up within ~0.2s", result.stderr)
         self.assertNotIn("0.9s", result.stderr)
         self.assertTrue(sentinel.exists(), "a session that never came up must leave the shutdown sentinel in place")
@@ -2334,7 +2355,8 @@ exit 0
         """Control: if the timeout warning printed the raw value again, the
         timeout test would fail on this very output."""
         self._mutate_launcher('within ~${SESSION_UP_LABEL}', 'within ~${SESSION_UP_WAIT_S}s')
-        result = self.run_launcher(env_extra={"SUTANDO_CORE_SESSION_WAIT_S": "0.9"})
+        result = self.run_launcher(env_extra={"SUTANDO_CORE_SESSION_WAIT_S": "0.9",
+                                              "TMUX_SESSION_NEVER_UP": "1"})
         self.assertIn("did not come up within ~0.9s", result.stderr)
         self.assertNotIn("within ~0.2s", result.stderr)
 

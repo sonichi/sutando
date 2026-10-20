@@ -92,6 +92,11 @@ for _arg in "$@"; do
   esac
 done
 
+if [ -z "$requested_runtime" ] && [ -n "${SUTANDO_CORE_RUNTIME:-}" ]; then
+  echo "start-cli: SUTANDO_CORE_RUNTIME=$runtime overrides core.runtime for this invocation." >&2
+  echo "start-cli: use --runtime codex or --runtime claude to select the intended runtime explicitly." >&2
+fi
+
 export SUTANDO_CORE_RUNTIME="$runtime"
 
 # A config switch may find the other runtime still occupying the canonical

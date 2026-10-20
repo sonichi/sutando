@@ -5268,26 +5268,8 @@ LAUNCH_RECORD_SKEW_SEC = 5
 
 
 def _runtime_may_skip_proxy() -> bool:
-    """True when this core's runtime is not expected to produce Anthropic quota headers.
-
-    Read from `state/core-runtime.json`. Today the **Codex launcher is its only writer**
-    (`src/agent/codex/cli/start-cli.sh` writes it unconditionally once the workspace
-    resolves), so its ABSENCE positively excludes Codex rather than merely being
-    unknown — which is why absence is treated as proxy-routed instead of silencing the
-    check everywhere. An unreadable or malformed file cannot rule Codex out, so it is
-    treated as non-proxy and stays silent: a corrupted status file must not manufacture
-    a health warning.
-
-    A marker left by a PREVIOUS core is ignored. Today only the Codex launcher writes
-    this file and nothing resets it, so after a Codex -> Claude switch a stale
-    `{"runtime": "codex"}` sits there describing a core that is no longer running
-    (#2406 documents exactly that happening live on 2026-07-30). Trusting it would
-    silence this check on a host that IS proxy-routed — the mirror of the false
-    positive this function was added to fix. So a marker whose `started_at` predates
-    the running core's own start is treated as absent, i.e. proxy-routed.
-
-    When #2406 lands a Claude-side writer, tighten this to positive identification of
-    a proxy-routed runtime instead of inferring it from absence.
+    """Interpret the last confirmed launch record, excluding observations older than the live core.
+    Missing records retain the legacy proxy expectation; malformed records fail silent.
     """
     path = status_read_path("core-runtime.json", WORKSPACE_DIR)
     try:
