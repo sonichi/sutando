@@ -48,6 +48,7 @@ MAP = {
     "src/chat_secret_filter.py": "chat_secret_filter.py",
     "src/policy/egress/result.py": "team_result_guard.py",
     "src/policy/guardrail.py": "team_guardrail.py",
+    "src/policy/sandbox_runner.py": "sandbox_runner.py",
     "src/vault_set_grammar.py": "vault_set_grammar.py",
     "src/send_failure_policy.py": "send_failure_policy.py",
     # send_failure_policy.resolve_failed_send imports it; vendoring one without

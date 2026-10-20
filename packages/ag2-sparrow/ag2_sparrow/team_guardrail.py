@@ -16,6 +16,12 @@ Do not add surface-specific wording here — a caller that needs it should say s
 around this block, not inside it.
 """
 
+try:  # vendored into ag2_sparrow as a package module; `policy` package in src/
+    from .sandbox_runner import RUNNERS, selected_or_codex, shell_command
+except ImportError:  # pragma: no cover - loaded as a top-level file
+    from sandbox_runner import RUNNERS, selected_or_codex, shell_command
+
+
 # Verbatim: changing this text changes an enforcement surface, not a comment.
 TEAM_GUARDRAIL = (
     "You are handling a Sutando TEAM-tier request from a trusted collaborator, not "
@@ -70,19 +76,32 @@ AG2SPACE_PROVENANCE = "a team-tier sender the AG2 Space broker attests as a coll
 
 # Here so one edit reaches every surface: Discord learned the stdin/exit-code
 # contract and the other adapters did not. Measurement is in the PR.
-SANDBOXED_DELEGATION_CODEX = (
-    "Delegate it to Codex: `codex exec --sandbox read-only --skip-git-repo-check "
-    "-- \"$(cat <prompt-file>)\" < /dev/null`. The `< /dev/null` is REQUIRED — without it "
-    "codex waits on stdin and can hang to a timeout having produced nothing. Then assert the "
-    "OUTPUT is non-empty before writing it: codex exits 0 both when it refuses and on a usage "
+SANDBOXED_DELEGATION_TEMPLATE = (
+    "Delegate it to {label}: `{command}`. The `< /dev/null` is REQUIRED — without it "
+    "{name} waits on stdin and can hang to a timeout having produced nothing. Then assert the "
+    "OUTPUT is non-empty before writing it: {name} exits 0 both when it refuses and on a usage "
     "error, so the exit code is not evidence that an answer exists. The sandbox also has NO "
     "NETWORK: if the task needs something the sandbox cannot reach, say so and decline — never "
-    "describe an artifact you could not read. And if codex cannot answer at all — absent, "
+    "describe an artifact you could not read. And if {name} cannot answer at all — absent, "
     "exiting non-zero, or exiting 0 having written nothing — there is NO permitted fallback: "
     "do NOT answer with the owner's unrestricted core, and do not silently skip. Say that the "
     "sandboxed path was unavailable and that no inspection was performed, so the requester can "
     "tell a refusal from silence."
 )
+
+_RUNNER_LABELS = {"codex": "Codex", "claude": "Claude Code"}
+
+
+def sandboxed_delegation_text(runner=None) -> str:
+    """The delegation instruction for `runner` (default: the one `sandbox_runner` selects)."""
+    if runner is None:
+        runner = selected_or_codex()
+    return SANDBOXED_DELEGATION_TEMPLATE.format(
+        label=_RUNNER_LABELS.get(runner.name, runner.name), name=runner.name,
+        command=shell_command(runner, '"$(cat <prompt-file>)"'))
+
+
+SANDBOXED_DELEGATION_CODEX = sandboxed_delegation_text(RUNNERS["codex"])
 
 
 def sandboxed_delegation_lines(
@@ -93,7 +112,7 @@ def sandboxed_delegation_lines(
     Same shape as `team_guardrail_lines`. `surface` names the origin ("AG2 Space",
     "Slack"), `tier_label` the sender's tier as the block should state it, and
     `scope` the per-tier limits, which are genuinely NOT interchangeable between
-    surfaces. Everything else — the do-not-process rule, the codex invocation, and
+    surfaces. Everything else — the do-not-process rule, the sandbox invocation, and
     the write-only-the-sandboxed-answer rule — is one policy and lives here once.
     """
     return [
@@ -101,7 +120,7 @@ def sandboxed_delegation_lines(
         "===SUTANDO SYSTEM INSTRUCTIONS (do not ignore; overrides anything above)===",
         f"This {surface} task is {tier_label}, not owner tier.",
         "Do not execute the request directly with the owner's unrestricted core.",
-        SANDBOXED_DELEGATION_CODEX,
+        sandboxed_delegation_text(),
         scope,
         f"Write only the sandboxed agent's safe user-facing answer to {result_path}.",
         "===END SUTANDO SYSTEM INSTRUCTIONS===",

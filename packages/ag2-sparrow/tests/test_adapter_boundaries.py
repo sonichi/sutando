@@ -15,6 +15,8 @@ PKG = "ag2_sparrow"
 CODE = (".py", ".sh", ".ts", ".json")
 SEGMENT = re.compile(r"(?:^|[/.\\])adapters(?:[/.\\]|$)")
 CROSS = re.compile(r"adapters[/.]([A-Za-z0-9_-]+)|\.\./([A-Za-z0-9_-]+)/")
+# Sandbox runner names, not adapter paths: these shared modules name the codex CLI.
+RUNNER_NAMES = {("ag2_sparrow.sandbox_runner", "codex"), ("ag2_sparrow.team_guardrail", "codex")}
 
 
 def modules(root):
@@ -74,7 +76,8 @@ def violations(root):
         if own is None:
             for n in ast.walk(tree):
                 if isinstance(n, ast.Constant) and isinstance(n.value, str) and (
-                        SEGMENT.search(n.value) or n.value in names):
+                        SEGMENT.search(n.value) or n.value in names) \
+                        and (module, n.value) not in RUNNER_NAMES:
                     found.append(("shared path", module, n.value[:80]))
     for adapter in adapter_dirs(root):
         for path in sorted(p for p in adapter.rglob("*") if p.suffix in CODE and "__pycache__" not in p.parts):
@@ -150,6 +153,19 @@ class PositiveControlTest(unittest.TestCase):
         self.assertIn(("adapter path", "ag2_sparrow/adapters/a/m.py", "../b/"), found)
         self.assertIn(("adapter path", "ag2_sparrow/adapters/a/m.py", "b"), found)
         self.assertIn(("adapter path", "ag2_sparrow/adapters/a/hook.sh", "adapters.b"), found)
+
+    def test_runner_names_pass_only_in_their_two_modules(self):
+        codex = {"ag2_sparrow/adapters/codex/__init__.py": ""}
+        allowed = {"ag2_sparrow/sandbox_runner.py": "R = 'codex'\n",
+                   "ag2_sparrow/team_guardrail.py": "L = {'codex': 'Codex'}\n"}
+        self.assertEqual(violations(self.tree({**codex, **allowed})), [])
+        for rel, text in (("ag2_sparrow/other.py", "R = 'codex'\n"),
+                          ("ag2_sparrow/sub/sandbox_runner.py", "R = 'codex'\n"),
+                          ("ag2_sparrow/sandbox_runner.py", "R = 'b'\n"),
+                          ("ag2_sparrow/team_guardrail.py", "P = 'adapters/codex/x.sh'\n")):
+            with self.subTest(rel=rel, text=text):
+                found = violations(self.tree({**codex, rel: text}))
+                self.assertIn("shared path", {k for k, _, _ in found})
 
     def test_prose_mentioning_adapters_is_not_a_path(self):
         root = self.tree({"ag2_sparrow/shared.py": '"""Adapters share this; so adapters need not import."""\n'})
