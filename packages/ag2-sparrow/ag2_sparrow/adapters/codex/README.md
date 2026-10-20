@@ -166,7 +166,7 @@ This adapter's single-instance check is the package's one-process lock, `ag2_spa
 - **POSIX only:** Linux and macOS; on Windows the adapter refuses to start with `LockError("unsupported platform: holder_lock is POSIX-only")`.
 - **Network-mounted home:** if the service user's home directory is on a network or FUSE filesystem, the adapter refuses to start with `LockError("not a local filesystem")`. Remedy: run it as a user with a local home directory.
 - **Upgrade order: stop → install → start.** Stop the adapter on its work root, install, then start it. A start while the old adapter still runs there is refused (exit 3) with the pid to stop.
-- **Supported upgrade paths: the Hatch installer, the keepawake self-upgrade, and `ag2-sparrow-codex-local install` for a connector it supervises**, each stop → install → start (the installer restarts its own unit). Anything else (a direct `pip` or `pipx` install or upgrade, a rollback, a supervisor restarting a unit the installer did not write, or a work root the upgrader does not know) must stop the adapters by hand before installing; `holder_lock.status(<work root>)` reports what is running there.
+- **Supported upgrade paths: the Hatch installer and the keepawake self-upgrade**, both stop → install → start; `ag2-sparrow-codex-local install` keeps that order for the connector it supervises (a reinstall stops the job and proves the work root free before it writes), it is not an exception to it. Anything else (a direct `pip` or `pipx` install or upgrade, a rollback, a process supervisor restarting a unit, or a work root the upgrader does not know) must stop the adapters by hand before installing; `holder_lock.status(<work root>)` reports what is running there.
 
 ## Unproven
 
