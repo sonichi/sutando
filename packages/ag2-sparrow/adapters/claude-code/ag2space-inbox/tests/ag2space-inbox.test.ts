@@ -284,7 +284,7 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
   return { files, submitted, runs, claims, progress, clock, hash, interruptAt, logs, stuck, publishes: () => publishes, setSid: (sid: string) => { live.sid = sid },
     failProgress: (n: number) => { progressFailLeft = n },
     failAt: (verb: string) => { failVerb = verb },
-    refuseUnstuck: (n: number) => { unstuckFailsLeft = n }, refusePark: () => { parkRefused = true },
+    refuseUnstuck: (n: number) => { unstuckFailsLeft = n }, hardUnstuck: (n: number) => { unstuckHardLeft = n }, refusePark: () => { parkRefused = true },
     lockOnce: (verb: string) => { lockFails.add(verb) }, failStageLink: () => { stageLinkFails = true } }
 }
 
@@ -1424,6 +1424,28 @@ test('an unconfirmed turn keeps the task and its stuck mark until the claim sett
   for (let i = 0; i < 70; i++) await h.clock.advance(1000)
   expect(verbs(h).filter(v => v === 'claim').length).toBe(claims)   // retired: tried no more
   expect(h.submitted.length).toBe(1)
+})
+
+test('a release clear that fails hard inside the scan ends that scan: nothing else is claimed or authorized in the tick', async ($, on) => {
+  const h = host(on)
+  h.files['/in/task-s.txt'] = TASK('task-s')
+  await arm($, h)
+  await h.clock.advance(1000)
+  await $.turn.start({ text: FRAMED(h.submitted[0]), turnId: 't1' })
+  h.refusePark()
+  await $.turn.complete({ turnId: 't1', reason: 'completed', text: '' } as any)
+  h.files['/in/task-t.txt'] = TASK('task-t')
+  h.hardUnstuck(1)
+  const before = h.runs.length
+  await h.clock.advance(1000)                         // the scan's park lands; its release clear exits 3
+  const tick = h.runs.slice(before).filter((a: string[]) => a[1] === 'inbox').map((a: string[]) => a[2])
+  expect(h.files['/out/task-s.txt']).toContain('without a reply')
+  expect(tick).toContain('park')
+  expect(tick.includes('claim') || tick.includes('authorize')).toBe(false)
+  expect(h.logs.some(l => l.includes('intake STOPPED'))).toBe(true)
+  for (let i = 0; i < 10; i++) await h.clock.advance(1000)
+  expect(h.submitted.length).toBe(2)                  // intake reopened by a durable write: task-t goes through
+  expect(h.stuck).toEqual({})
 })
 
 test('a pending authorization is dropped when its inbox file goes: a returning file is claimed afresh', async ($, on) => {

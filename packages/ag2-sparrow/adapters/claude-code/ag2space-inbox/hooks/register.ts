@@ -194,50 +194,51 @@ async function releaseOffer($: any, s: State, offer: Offer, why: string): Promis
   return retireTask($, s, offer.file, offer.rid, why, async () => {})
 }
 
-// The turn ended: an accepted answer is delivered as it is, else the protocol failure; '' once delivered,
-// else why not (the offer is kept and the scan retries it behind the per-task backoff).
-async function parkOffer($: any, s: State, offer: Offer, reason: string): Promise<string> {
+// The turn ended: an accepted answer is delivered as it is, else the protocol failure. why is '' once delivered,
+// else why not (kept, retried by the scan behind the backoff); hard: a write closed intake (the scan ends).
+async function parkOffer($: any, s: State, offer: Offer, reason: string): Promise<{ why: string; hard: boolean }> {
   if (offer.stagedText !== undefined && offer.phase === 'TURN_CONFIRMED') {
     const st = await cli($, s, ['stage', offer.rid, offer.turnId], offer.stagedText + '\n')
     if (st.ok || (st.hard && st.data?.outcome === 'staged')) offer.phase = 'RESULT_STAGED'
     else {
       // An accepted answer is never replaced by the protocol failure: kept until its own stage finishes.
       offer.parkPending = reason
-      return String(st.data?.refused ?? st.data?.error ?? 'the accepted answer is not staged yet')
+      return { why: String(st.data?.refused ?? st.data?.error ?? 'the accepted answer is not staged yet'), hard: st.hard }
     }
   }
   const r = offer.phase === 'RESULT_STAGED' ? await cli($, s, ['publish', offer.rid])
     : await cli($, s, ['park', offer.rid, offer.turnId, '--detail', `turn ${reason} without a reply`])
   if (!(r.ok || (r.hard && r.data?.outcome === 'settled'))) {
     offer.parkPending = reason
-    return String(r.data?.refused ?? r.data?.error ?? 'not published')
+    return { why: String(r.data?.refused ?? r.data?.error ?? 'not published'), hard: r.hard }
   }
   await $.ui.log(`${PLUGIN}: ${offer.rid} delivered at the turn's end (${offer.stagedText !== undefined || r.data?.parked === false ? 'the accepted answer' : 'the protocol failure'})`, {})
   s.answered.add(offer.rid)
   offer.parkPending = undefined
-  await releaseOffer($, s, offer, "delivered at the turn's end")
-  return ''
+  const hard = await releaseOffer($, s, offer, "delivered at the turn's end")
+  return { why: '', hard: hard || r.hard }
 }
 
 // CALLING -> TURN_CONFIRMED for the turn recorded in `confirming`; a retry reply keeps it for the next try
-// (the scan tick, or the reply itself), anything else that is not a confirmation drops the offer.
-async function confirmOffer($: any, s: State, offer: Offer): Promise<void> {
+// (the scan tick, or the reply itself), anything else that is not a confirmation drops the offer. True if a
+// write closed intake.
+async function confirmOffer($: any, s: State, offer: Offer): Promise<boolean> {
   const c = offer.confirming!
   const r = await cli($, s, ['confirm', offer.rid, c.turnId, offer.token, '--text-hash', c.hash])
-  if (!r.ok && !r.hard && r.data?.retry) return
+  if (!r.ok && !r.hard && r.data?.retry) return false
   offer.confirming = undefined
   if (s.pending === offer) s.pending = null
   if (r.ok || (r.hard && r.data?.turn_id)) {
     offer.turnId = c.turnId
     offer.phase = 'TURN_CONFIRMED'
-    if (c.completed) await parkOffer($, s, offer, c.completed)
-    return
+    return (c.completed ? (await parkOffer($, s, offer, c.completed)).hard : false) || r.hard
   }
   await $.ui.log(`${PLUGIN}: ${offer.rid} turn not confirmed: ${r.data?.refused ?? ''}`, {})
   // The claim stays CALLING, unanswered: the scan takes the task back (the claim is retried, backed off) and its
   // mark stays until the claim settles (the next start answers it as interrupted) and the claim retires it.
   s.offers.delete(offer.rid)
   s.seen.delete(offer.file)
+  return r.hard
 }
 
 async function sha256($: any, text: string): Promise<string> {
@@ -303,13 +304,13 @@ async function arm($: any, s: State, inbox: string, results: string): Promise<{ 
       // No reopen on a tick whose session id did not read back unchanged.
       if (s.intake === 'closed' && !stopped && (!live || !(await reopenIntake($, s)))) return
       for (const o of [...s.offers.values()]) {
-        if (o.confirming) await confirmOffer($, s, o)
+        if (o.confirming) { if (await confirmOffer($, s, o)) return }
         else if (o.parkPending !== undefined) {
           const held = s.retry.get(o.file)
           if (held && s.tick < held.next) continue
-          const why = await parkOffer($, s, o, o.parkPending)
-          // Delivered: parkOffer released it through the mark clear; not delivered: kept, backed off.
-          if (why && await retain(o.file, o.rid, "not delivered at the turn's end", why)) return
+          const { why, hard } = await parkOffer($, s, o, o.parkPending)
+          // Delivered: released through the mark clear; not delivered: kept, backed off. A hard write ends the scan.
+          if ((why && await retain(o.file, o.rid, "not delivered at the turn's end", why)) || hard) return
         }
       }
       for (const [name, c] of [...s.cleanup]) if (s.tick >= c.next && await clearMark($, s, name, c)) return
