@@ -12,7 +12,8 @@ const TASK = (id: string, tier = 'owner', extra = '') =>
 const FRAMED = (msg: string) => `The ag2space-inbox plugin sent a message:\n${msg}\n\nThis is how Claude Code surfaces ` +
   "a prompt a plugin submits between turns \u2014 it starts this turn in the user's place. Address the message above."
 
-type Claim = { attempt: number; phase: string; token?: string; hash?: string; turnId?: string; body?: string; staged?: string }
+type Claim = { attempt: number; phase: string; token?: string; hash?: string; turnId?: string; body?: string; staged?: string
+                blobOk?: boolean }
 
 // An in-memory host: fs, process (the verifier's "<verdict> <tier> <collab>" line, the text hash, and
 // the inbox CLI's verbs over an in-memory claim store), clock, env, prompt sink, session id. Tier and
@@ -186,9 +187,11 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
       if (c.staged !== undefined && c.staged !== e.init.stdin) return out(1, { refused: `${task}: staging parked` })
       c.staged = e.init.stdin
       if (stageLands) {
-        stageLands = false     // the descriptor's rename landed, its directory fsync failed
+        // The descriptor's claim.json rename landed and its directory fsync failed: no blob yet.
+        stageLands = false; c.blobOk = false
         return out(3, { task_id: task, phase: 'TURN_CONFIRMED', hard: true, error: "the step's write landed, then failed" })
       }
+      c.blobOk = true                       // an identical retry writes and verifies the blob, then the phase
       c.phase = 'RESULT_STAGED'; c.body = e.init.stdin
       return answer({ outcome: 'staged' })
     }
@@ -219,6 +222,8 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
     if (verb === 'park') {
       if (!c || c.phase !== 'TURN_CONFIRMED' || c.turnId !== argv[4]) return out(1, { refused: 'not this turn' })
       if (parkRefused) { parkRefused = false; return out(1, { refused: `${task}: publication parked` }) }
+      // As the CLI: a recorded descriptor with no verifying blob parks every time, until an identical stage.
+      if (c.staged !== undefined && !c.blobOk) return out(1, { refused: `${task}: publication parked` })
       if (c.staged !== undefined) {         // an accepted answer: the CLI publishes it, never the protocol failure
         c.phase = 'SETTLED'; c.body = c.staged; files[`/out/${task}.txt`] = c.body; publishes++
         return out(0, { outcome: 'settled', parked: false })
@@ -975,6 +980,9 @@ test('a stage whose descriptor landed before its fsync failed delivers that answ
   expect(h.files['/out/task-sl.txt']).toBe('answer A\n')                           // the accepted body, not a failure
   await h.clock.advance(5000)
   expect(h.publishes()).toBe(1)
+  const stages = h.runs.filter((a: string[]) => a[2] === 'stage' && a[3] === 'task-sl')
+  expect(stages.length).toBe(2)                     // the reply's, then the turn end's re-stage of the same text
+  expect(verbs(h).filter((v: string) => v === 'park')).toEqual([])   // never the park that would only answer parked
 })
 
 test('after a landed stage a different reply is refused and the accepted one publishes', async ($, on) => {
