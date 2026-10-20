@@ -2853,6 +2853,53 @@ class InboxCli(ConnectBase):
                 self.assertRaises(inbox.lifecycle.StateCommitted):
             lc.claims.stage(u, b"body")
 
+    def test_a_hard_reply_is_read_from_the_claim_as_it_stands(self):
+        """The hard reply after a committed step carries what the re-read claim proves: authorize's stored
+        token while CALLING, stage's "staged" only at RESULT_STAGED, else the actual phase."""
+        lc = inbox._lifecycle(self.root)
+        real = records.flocked
+
+        @contextlib.contextmanager
+        def release_fails(path, blocking=True):
+            with real(path, blocking) as fd:
+                yield fd
+            if Path(path).name == records.CLAIMS_LOCK:
+                raise OSError(errno.EIO, "unlock I/O error")
+        real_fsync = inbox.lifecycle.fsync_dir
+
+        def fsync_after(name):
+            def fsync(path):
+                if Path(path).name not in ("claims",) and any(n == name for n in os.listdir(path)):
+                    raise OSError(errno.EIO, "dir fsync")
+                return real_fsync(path)
+            return fsync
+        for t, failing in (("task-auth-release", mock.patch.object(records, "flocked", release_fails)),
+                           ("task-auth-fsync", mock.patch.object(inbox.lifecycle, "fsync_dir",
+                                                                 side_effect=fsync_after("claim.json")))):
+            self.task(t)
+            attempt = self.verb("claim", t)[1]["attempt"]
+            with failing:
+                rc, out = self.verb("authorize", t, str(attempt), "--text-hash", "h1")
+            rec = lc.claims.load(t)
+            self.assertEqual((rc, out.get("hard"), out.get("phase")), (3, True, "CALLING"), (t, out))
+            self.assertEqual(out["token"], rec["call"]["nonce"], "the stored one-use token: go ahead, once")
+            self.assertEqual(rec["phase"], inbox.lifecycle.CALLING)
+            rc, out = self.verb("authorize", t, str(attempt), "--text-hash", "h1")
+            self.assertEqual(rc, 1, "never a second authorization")
+        t = "task-auth-fsync"
+        token = lc.claims.load(t)["call"]["nonce"]
+        self.assertEqual(self.verb("confirm", t, "turn-1", token, "--text-hash", "h1")[0], 0)
+        with mock.patch.object(inbox.lifecycle, "fsync_dir", side_effect=fsync_after("claim.json")):
+            rc, out = self.verb("stage", t, "turn-1", stdin=b"answer\n")
+        self.assertEqual((rc, out.get("hard"), out.get("phase"), "outcome" in out), (3, True, "TURN_CONFIRMED", False),
+                         "a write landed but the claim never reached RESULT_STAGED: never 'staged'")
+        with mock.patch.object(inbox.lifecycle.ClaimStore, "load", side_effect=inbox.lifecycle.ClaimUnreadable("torn")):
+            self.assertEqual(inbox._committed(lc, t, "stage")["phase"], "unreadable (ClaimUnreadable)")
+        self.assertEqual(inbox._committed(lc, "task-none", "authorize"), {"task_id": "task-none", "phase": "absent"})
+        self.assertEqual(records.progress_alarm_path(cli.config_dir()).parent, cli.config_dir(),
+                         "the alarm lives in the config dir, outside state/")
+        self.assertNotIn(str(Path(self.root) / "state"), str(records.progress_alarm_path(cli.config_dir())))
+
     def test_an_unwritable_progress_record_alarms_the_launcher_verify_and_the_card_until_a_write_lands(self):
         t = self.task("task-alarm")
         with mock.patch.object(records, "write_progress", side_effect=records.RecordError("progress.lock: EIO")):

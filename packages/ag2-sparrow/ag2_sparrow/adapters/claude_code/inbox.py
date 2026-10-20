@@ -136,34 +136,53 @@ DECISIONS = (Refused, lifecycle.TurnRefused, lifecycle.AttemptInProgress)
 
 
 class Committed(Exception):
-    """The step committed, then something failed (the lock's release, a directory fsync after a rename):
-    the answer is hard, never a retry, and carries what the step decided (`data`)."""
+    """The step committed, then something failed: hard, never a retry; `data` is read from the claim
+    as it now stands, never from what the step meant to do."""
 
     def __init__(self, message, data=None):
         super().__init__(message)
         self.data = dict(data or {})
 
 
+# What a hard reply carries, per verb, from the re-read claim: only what that claim proves.
+COMMITTED_FIELDS = {
+    "claim": lambda rec: {"attempt": rec["attempt"]} if rec["phase"] == lifecycle.PREPARED else {},
+    "authorize": lambda rec: {"token": (rec.get("call") or {}).get("nonce"), "attempt": rec["attempt"]}
+    if rec["phase"] == lifecycle.CALLING and (rec.get("call") or {}).get("nonce") else {},
+    "confirm": lambda rec: {"turn_id": rec.get("turn_id")} if rec["phase"] == lifecycle.TURN_CONFIRMED else {},
+    "stage": lambda rec: {"outcome": "staged"} if rec["phase"] == lifecycle.RESULT_STAGED else {},
+}
+
+
+def _committed(lc, task_id, verb) -> dict:
+    """The hard reply's data, from the claim re-read now: its phase always, the verb's fields when proven."""
+    try:
+        rec = lc.claims.load(task_id)
+    except Exception as e:
+        return {"task_id": task_id, "phase": "unreadable (%s)" % type(e).__name__}
+    if not rec:
+        return {"task_id": task_id, "phase": "absent"}
+    return dict(COMMITTED_FIELDS.get(verb, lambda r: {})(rec), task_id=task_id, phase=rec["phase"])
+
+
 @contextmanager
-def _claims_step(root, committed=None):
-    """claims.lock around one lifecycle step, for every verb. Before the commit point anything raised
-    left the claim as it was: a retry, unless it is a decision (DECISIONS, or a StateError about what the
-    state says rather than StateIOError). From the commit point on (a rename that landed, the step done
-    and only the lock's release left) the answer is hard, carrying `committed`."""
+def _claims_step(root, lc, task_id, verb):
+    """claims.lock around one lifecycle step: anything raised before the commit point is a retry (unless
+    a decision); from it on (a rename that landed, only the release left) hard, as `_committed` reads it."""
     done = False
     try:
         with records.flocked(records.claims_lock_path(root)):
             try:
                 yield
             except lifecycle.StateCommitted as e:
-                raise Committed("the step's write landed, then failed (%s)" % e, committed)
+                raise Committed("the step's write landed, then failed (%s)" % e, _committed(lc, task_id, verb))
             done = True
     except (Committed,) + DECISIONS:
         raise
     except Exception as e:
         if done:
             raise Committed("the step committed, then %s: %s" % (type(e).__name__, getattr(e, "strerror", None) or e),
-                            committed)
+                            _committed(lc, task_id, verb))
         if isinstance(e, lifecycle.StateError) and not isinstance(e, lifecycle.StateIOError):
             raise
         raise Parked("the step did not commit (%s: %s); retried" % (type(e).__name__, getattr(e, "strerror", None) or e))
@@ -211,7 +230,7 @@ def _mirror(root, task_id, phase, out: dict, extra=None, unstuck=False) -> dict:
 def claim(root, task_id) -> dict:
     lc = _lifecycle(root)
     terminal = False
-    with _claims_step(root, {"task_id": task_id}):
+    with _claims_step(root, lc, task_id, "claim"):
         generation = _generation(root)
         verdict, state = lc.decide(task_id)
         if verdict == "call":
@@ -271,7 +290,7 @@ def interrupt(root, task_id, detail) -> dict:
     why, answered, kind, lc = "", False, None, None
     try:
         lc = _lifecycle(root)
-        with _claims_step(root, {"task_id": task_id}):
+        with _claims_step(root, lc, task_id, "interrupt"):
             rec = lc.claims.load(task_id)
             phase = rec.get("phase") if rec else None
             if phase in (lifecycle.RESULT_STAGED, lifecycle.PUBLISHED):
@@ -298,7 +317,7 @@ def interrupt(root, task_id, detail) -> dict:
 
 def authorize(root, task_id, attempt, hash_) -> dict:
     lc = _lifecycle(root)
-    with _claims_step(root, {"task_id": task_id}):
+    with _claims_step(root, lc, task_id, "authorize"):
         token = lc.authorize_call(task_id, int(attempt), text_hash=hash_)
     if token is None:
         raise Refused("%s attempt %s is not PREPARED: no submit authorization" % (task_id, attempt))
@@ -307,7 +326,7 @@ def authorize(root, task_id, attempt, hash_) -> dict:
 
 def confirm(root, task_id, turn_id, nonce, hash_) -> dict:
     lc = _lifecycle(root)
-    with _claims_step(root, {"task_id": task_id, "turn_id": turn_id}):
+    with _claims_step(root, lc, task_id, "confirm"):
         try:
             lc.confirm_turn(task_id, turn_id, nonce, hash_)
         except lifecycle.TurnRefused as e:
@@ -317,7 +336,7 @@ def confirm(root, task_id, turn_id, nonce, hash_) -> dict:
 
 def stage(root, task_id, turn_id, body: bytes) -> dict:
     lc = _lifecycle(root)
-    with _claims_step(root, {"task_id": task_id, "outcome": "staged"}):
+    with _claims_step(root, lc, task_id, "stage"):
         outcome = lc.stage_result(task_id, body, turn_id)
     if outcome != "staged":
         raise Refused("%s: staging %s" % (task_id, outcome))
@@ -326,7 +345,7 @@ def stage(root, task_id, turn_id, body: bytes) -> dict:
 
 def publish(root, task_id) -> dict:
     lc = _lifecycle(root)
-    with _claims_step(root, {"task_id": task_id}):
+    with _claims_step(root, lc, task_id, "publish"):
         outcome = lc.publish_and_settle(task_id)
     if outcome != "settled":
         raise Refused("%s: publication %s" % (task_id, outcome))

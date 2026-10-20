@@ -314,12 +314,15 @@ async function arm($: any, s: State, inbox: string, results: string): Promise<{ 
         if (!hash) { log(`${rid}: the text hash could not be computed; retried next tick`); continue }
         // The one-use authorization: exactly one PREPARED -> CALLING per attempt; CALLING never submits again.
         const auth = await cli($, s, ['authorize', rid, String(claimed.data.attempt), '--text-hash', hash])
-        if (auth.hard) return
-        if (!auth.ok && auth.data?.retry) {
+        // Hard with the stored token: the authorization committed (only the record lagged), so it is
+        // submitted exactly once; hard without one proves nothing and ends the scan.
+        const authorized = auth.ok || (auth.hard && typeof auth.data?.token === 'string' && auth.data.token !== '')
+        if (auth.hard && !authorized) return
+        if (!authorized && auth.data?.retry) {
           if (await retain(entry.name, rid, 'not authorized yet', String(auth.data?.refused ?? ''))) return
           continue
         }
-        if (!auth.ok) { s.seen.add(entry.name); log(`${rid} not authorized: ${auth.data?.refused ?? ''}`); continue }
+        if (!authorized) { s.seen.add(entry.name); log(`${rid} not authorized: ${auth.data?.refused ?? ''}`); continue }
         const offer: Offer = { file: entry.name, rid, attempt: Number(claimed.data.attempt), msg, hash, token: String(auth.data.token), turnId: '', phase: 'CALLING' }
         s.offers.set(rid, offer)
         s.pending = offer
@@ -403,7 +406,8 @@ export const register: Register = (on) => {
     await witness($, s, 'turn.start')
     const offer = s.pending
     const at = offer ? submittedAt(String(e.text ?? ''), offer.msg) : -1
-    if (offer && offer.phase === 'CALLING' && s.intake === 'open' && at >= 0) {
+    // A transient close does not stop our own submitted turn's confirmation; a session change does.
+    if (offer && offer.phase === 'CALLING' && !sessionStopped(s) && at >= 0) {
       // The bound hash is checked on the exact text the turn carries, not on the CLI's frame around it.
       const hash = await sha256($, String(e.text).slice(at, at + offer.msg.length))
       if (hash === offer.hash) {

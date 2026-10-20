@@ -23,7 +23,8 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
                                claimAs?: Record<string, unknown>; interruptParks?: number; interruptThrows?: number;
                                interruptSoft?: Record<string, string | number>; stuckAtStart?: Record<string, unknown>;
                                unstuckFails?: number; clearFails?: Record<string, string>; stuckWriteFails?: number;
-                               lockFailsOnce?: string[]; storeFailsOnce?: string[]; unreadableOnce?: string[] } = {}) {
+                               lockFailsOnce?: string[]; storeFailsOnce?: string[]; unreadableOnce?: string[];
+                               committedHardOnce?: string[]; committedHardWhy?: string } = {}) {
   const files: Record<string, string> = {}
   const submitted: string[] = []
   const runs: string[][] = []
@@ -47,6 +48,8 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
   const lockFails = new Set(opts.lockFailsOnce ?? [])
   const storeFails = new Set(opts.storeFailsOnce ?? [])
   const unreadable = new Set(opts.unreadableOnce ?? [])
+  const committedHard = new Set(opts.committedHardOnce ?? [])
+  const committedHardWhy = opts.committedHardWhy ?? 'OSError: unlock I/O error'
   const clearFailsLeft: Record<string, string> = { ...(opts.clearFails ?? {}) }
   let sidReads = 0
   const interruptAt: number[] = []
@@ -100,6 +103,14 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
     const task = argv[3]
     // As the CLI's claims-step boundary: an EIO before the step commits is a retry, nothing changed.
     if (lockFails.delete(verb)) return out(1, { refused: 'the step did not commit ([Errno 5] claims lock I/O error); retried', retry: true })
+    if (verb === 'authorize' && committedHard.delete('authorize')) {
+      // As the CLI: the authorization committed, then the lock's release or the rename's fsync failed.
+      const c0 = claims[task]
+      if (!c0 || c0.phase !== 'PREPARED') return out(1, { refused: 'not PREPARED' })
+      c0.phase = 'CALLING'; c0.token = 'tok-' + task; c0.hash = argv[argv.indexOf('--text-hash') + 1]
+      return out(3, { task_id: task, phase: 'CALLING', token: c0.token, attempt: c0.attempt, hard: true,
+                      error: `the step committed, then ${committedHardWhy}` })
+    }
     if (unreadable.delete(verb)) return out(1, { refused: 'the step did not commit (ClaimUnreadable: torn claim.json); retried', retry: true })
     if (storeFails.delete(verb)) return out(1, { refused: 'the step did not commit (refusing to serve: cannot write claim.json ([Errno 28] No space left on device)); retried', retry: true })
     if (verb === 'progress') {
@@ -900,6 +911,33 @@ test('after a transient publish failure a different reply is refused: the staged
   expect(verbs(h).filter((v: string) => v === 'publish').length).toBe(2)
 })
 
+test('an authorize that committed before the lock release failed is submitted exactly once, then answered', async ($, on) => {
+  const h = host(on, { committedHardOnce: ['authorize'] })
+  h.files['/in/task-ha.txt'] = TASK('task-ha')
+  await arm($, h)
+  await h.clock.advance(1000)
+  expect(h.submitted.length).toBe(1)
+  await h.clock.advance(5000)
+  expect(h.submitted.length).toBe(1)
+  expect(verbs(h).filter((v: string) => v === 'authorize').length).toBe(1)
+  await $.turn.start({ text: h.submitted[0], turnId: 't-ha' })
+  expect(h.claims['task-ha'].phase).toBe('TURN_CONFIRMED')
+  await $.tool.call({ tool: REPLY, task_id: 'task-ha', text: 'answered' })
+  expect(h.files['/out/task-ha.txt']).toBe('answered\n')
+})
+
+test('an authorize whose rename landed before its fsync failed is submitted exactly once, then answered', async ($, on) => {
+  const h = host(on, { committedHardOnce: ['authorize'], committedHardWhy: "the step's write landed, then failed (dir fsync)" })
+  h.files['/in/task-hf.txt'] = TASK('task-hf')
+  await arm($, h)
+  await h.clock.advance(3000)
+  expect(h.submitted.length).toBe(1)
+  await $.turn.start({ text: h.submitted[0], turnId: 't-hf' })
+  await $.tool.call({ tool: REPLY, task_id: 'task-hf', text: 'landed' })
+  expect(h.files['/out/task-hf.txt']).toBe('landed\n')
+  expect(verbs(h).filter((v: string) => v === 'authorize').length).toBe(1)
+})
+
 test('thirty failed unstuck writes never age a retained task out: the next one lands (stopped-intake path)', async ($, on) => {
   const h = host(on, { unstuckFails: 30, stuckAtStart: { 'task-s30': { since: 1 } } })
   await arm($, h)
@@ -985,12 +1023,13 @@ test('a progress write that fails at claim, authorize, confirm, stage or publish
   await $.turn.start({ text: h.submitted[1], turnId: 't-h' })
   await $.tool.call({ tool: REPLY, task_id: 'task-h', text: 'ok' })
   h.files['/in/task-i.txt'] = TASK('task-i')
-  h.failAt('authorize')                             // the authorize's mirror fails: CALLING stands, nothing submitted
+  h.failAt('authorize')                             // the authorize's mirror fails: CALLING stands, with its token
   await h.clock.advance(1000)
   expect(h.claims['task-i'].phase).toBe('CALLING')
-  expect(h.submitted.length).toBe(2)
+  expect(h.submitted.length).toBe(3)                 // hard with the stored token: submitted exactly once
   await h.clock.advance(3000)
-  expect(h.submitted.length).toBe(2)                 // the spent authorization is never resubmitted
+  expect(h.submitted.length).toBe(3)                 // and never a second authorize or submission
+  expect(h.runs.filter((a: string[]) => a[2] === 'authorize' && a[3] === 'task-i').length).toBe(1)
 })
 
 test('the CLI\'s frame around the submitted text confirms the turn; a manual turn, an altered text or a repeat does not', async ($, on) => {
