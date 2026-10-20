@@ -107,6 +107,74 @@ class Reconcile(unittest.TestCase):
         time.sleep(0.6)
         self.assertLessEqual(len(sleeps), n + 1, "at most the pause in flight; no further restart")
 
+    # The worker loop normally runs on a supervisor thread, which the gate's
+    # tracer does not follow; these drive it on the calling thread instead.
+    def test_the_worker_loop_stops_after_the_pause_that_sees_the_stop(self):
+        crasher = [sys.executable, "-c", "raise SystemExit(3)"]
+        sup = Supervisor([WorkerSpec("c", crasher)], backoff_initial_s=0.2,
+                         sleep=lambda s: ws.stop.set())
+        ws = sup._workers["c"]
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            sup._run_worker(ws)
+        self.assertEqual((ws.last_exit, ws.restarts, ws.state), (3, 1, "stopped"))
+        self.assertIn("worker c: exited rc=3 — restart in 0.2s (restart #1)", out.getvalue())
+        self.assertNotIn("restart #2", out.getvalue(), "the pause saw the stop: no respawn")
+
+    def test_a_stop_that_lands_while_the_loop_waits_for_the_lock_prevents_the_spawn(self):
+        sup = Supervisor([WorkerSpec("n", SLEEPER)])
+        ws = sup._workers["n"]
+        sup._lock.acquire()  # the loop passes its while check, then blocks here
+
+        def stop_then_release():
+            time.sleep(0.1)
+            ws.stop.set()
+            sup._lock.release()
+        threading.Thread(target=stop_then_release).start()
+        with contextlib.redirect_stdout(io.StringIO()):
+            sup._run_worker(ws)
+        self.assertIsNone(ws.proc, "never spawned: the stop was seen under the lock")
+        self.assertEqual(ws.state, "stopped")
+
+    def test_a_spawn_failure_pauses_and_a_pause_without_injected_sleep_waits_on_the_stop(self):
+        sup = Supervisor([WorkerSpec("g", ["/nonexistent/bin/worker"])], backoff_initial_s=0.05)
+        ws = sup._workers["g"]
+        threading.Timer(0.2, ws.stop.set).start()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            sup._run_worker(ws)
+        self.assertIn("worker g: spawn failed", out.getvalue())
+        self.assertEqual((ws.last_exit, ws.state), (None, "stopped"))
+
+    def test_a_worker_stopped_while_running_ends_the_loop_as_stopped(self):
+        sup = Supervisor([WorkerSpec("r", SLEEPER)])
+        ws = sup._workers["r"]
+
+        def stop_it():
+            wait_for(lambda: ws.proc is not None)
+            ws.stop.set()
+            ws.proc.terminate()
+        threading.Timer(0.05, stop_it).start()
+        with contextlib.redirect_stdout(io.StringIO()):
+            sup._run_worker(ws)
+        self.assertEqual((ws.state, ws.restarts), ("stopped", 0), "a stop during the run is not a crash")
+        self.assertIsNotNone(ws.last_exit)
+
+    def test_wait_kills_a_removed_worker_past_the_grace(self):
+        sup = Supervisor([WorkerSpec("s", STUBBORN)], remove_grace_s=0.2)
+        ws = sup._workers["s"]
+        with contextlib.redirect_stdout(io.StringIO()):
+            sup._spawn(ws)
+        time.sleep(0.3)  # the handler is installed before the loop
+        ws.stop.set()
+        ws.stop_at = time.monotonic()
+        ws.proc.send_signal(15)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = sup._wait(ws)
+        self.assertEqual(rc, -9)
+        self.assertIn(f"pid {ws.proc.pid}: did not exit in 0.2s — SIGKILL", out.getvalue())
+
     def test_run_syncs_on_every_rescan(self):
         td = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, td, ignore_errors=True)
@@ -267,6 +335,12 @@ class Launcher(unittest.TestCase):
         with contextlib.redirect_stderr(err):
             rescan()
         self.assertEqual(len(checked), 2, "its live process is now this daemon's own worker: not re-checked")
+
+    def test_full_mode_prints_a_static_workers_skip_reason(self):
+        with mock.patch.object(self.sd, "_static_specs", return_value=([], ["loop-x: no interpreter configured"])):
+            specs, _, _, _, err = self.main([])
+        self.assertEqual(specs, [])
+        self.assertIn("sparrowd: not supervised — loop-x: no interpreter configured", err.getvalue())
 
     def test_full_mode_still_refuses_a_gateway_bridge_supervised_elsewhere(self):
         err = io.StringIO()
