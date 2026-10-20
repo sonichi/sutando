@@ -23,7 +23,7 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
                                claimAs?: Record<string, unknown>; interruptParks?: number; interruptThrows?: number;
                                interruptSoft?: Record<string, string | number>; stuckAtStart?: Record<string, unknown>;
                                unstuckFails?: number; clearFails?: Record<string, string>; stuckWriteFails?: number;
-                               lockFailsOnce?: string[] } = {}) {
+                               lockFailsOnce?: string[]; storeFailsOnce?: string[] } = {}) {
   const files: Record<string, string> = {}
   const submitted: string[] = []
   const runs: string[][] = []
@@ -45,6 +45,7 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
   let unstuckFailsLeft = opts.unstuckFails ?? 0
   let stuckWriteFailsLeft = opts.stuckWriteFails ?? 0
   const lockFails = new Set(opts.lockFailsOnce ?? [])
+  const storeFails = new Set(opts.storeFailsOnce ?? [])
   const clearFailsLeft: Record<string, string> = { ...(opts.clearFails ?? {}) }
   let sidReads = 0
   const interruptAt: number[] = []
@@ -98,6 +99,7 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
     const task = argv[3]
     // As the CLI's claims-step boundary: an EIO before the step commits is a retry, nothing changed.
     if (lockFails.delete(verb)) return out(1, { refused: 'the step did not commit ([Errno 5] claims lock I/O error); retried', retry: true })
+    if (storeFails.delete(verb)) return out(1, { refused: 'the step did not commit (refusing to serve: cannot write claim.json ([Errno 28] No space left on device)); retried', retry: true })
     if (verb === 'progress') {
       if (progressFailLeft-- > 0) return out(3, { error: 'progress write failed: disk', hard: true })
       if (argv.includes('--unstuck') && unstuckFailsLeft-- > 0) return out(1, { refused: 'progress lock busy' })
@@ -836,6 +838,31 @@ test('a session change after a hard close is a permanent fence: no reopen, nothi
   expect(h.submitted.length).toBe(0)
   expect(verbs(h).filter((v: string) => v === 'authorize')).toEqual([])
   expect(h.files['/out/task-b-new.txt']).toContain('interrupted')               // answered as the stopped session must
+})
+
+test('a transient store failure (StateIOError) at claim is kept and recovers: one submission, one result', async ($, on) => {
+  const h = host(on, { storeFailsOnce: ['claim'] })
+  h.files['/in/task-sc.txt'] = TASK('task-sc')
+  await arm($, h)
+  await h.clock.advance(3000)
+  expect(h.submitted.length).toBe(1)
+  await $.turn.start({ text: h.submitted[0], turnId: 't-sc' })
+  await $.tool.call({ tool: REPLY, task_id: 'task-sc', text: 'stored' })
+  expect(h.files['/out/task-sc.txt']).toBe('stored\n')
+})
+
+test('a transient store failure (StateIOError) at confirm keeps the offer and its turn; one submission, one result', async ($, on) => {
+  const h = host(on, { storeFailsOnce: ['confirm'] })
+  h.files['/in/task-sf.txt'] = TASK('task-sf')
+  await arm($, h)
+  await h.clock.advance(1000)
+  await $.turn.start({ text: h.submitted[0], turnId: 't-sf' })
+  expect(h.claims['task-sf'].phase).toBe('CALLING')
+  await h.clock.advance(1000)
+  expect((h.claims['task-sf'] as any).turnId).toBe('t-sf')
+  await $.tool.call({ tool: REPLY, task_id: 'task-sf', text: 'kept its turn' })
+  expect(h.files['/out/task-sf.txt']).toBe('kept its turn\n')
+  expect(h.submitted.length).toBe(1)
 })
 
 test('thirty failed unstuck writes never age a retained task out: the next one lands (stopped-intake path)', async ($, on) => {

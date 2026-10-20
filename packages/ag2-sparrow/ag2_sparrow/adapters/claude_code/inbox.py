@@ -130,15 +130,26 @@ def admit(root, task_id, allow: bool) -> "tuple[str | None, dict, str]":
     return kind, headers, why
 
 
+# The lifecycle's answers about the claim itself: final, whatever raised them.
+DECISIONS = (Refused, lifecycle.TurnRefused, lifecycle.ClaimUnreadable, lifecycle.AttemptInProgress)
+
+
 @contextmanager
 def _claims_step(root):
-    """claims.lock around one lifecycle step, for every verb: an OSError there (the lock's own I/O, or the
-    step failing before it commits) is a retry; one after the commit reaches the mirror, which answers hard."""
+    """claims.lock around one lifecycle step, for every verb. The step commits atomically, so anything
+    raised in here left the claim as it was: a retry, unless it is a decision (DECISIONS, or a StateError
+    about what the state says rather than StateIOError). Failures after the commit reach the mirror: hard."""
     try:
         with records.flocked(records.claims_lock_path(root)):
             yield
-    except OSError as e:
-        raise Parked("the step did not commit (%s); retried" % (e.strerror or e))
+    except DECISIONS:
+        raise
+    except lifecycle.StateError as e:
+        if not isinstance(e, lifecycle.StateIOError):
+            raise
+        raise Parked("the step did not commit (%s); retried" % e)
+    except Exception as e:
+        raise Parked("the step did not commit (%s: %s); retried" % (type(e).__name__, getattr(e, "strerror", None) or e))
 
 
 def _config_dir(environ=None) -> Path:

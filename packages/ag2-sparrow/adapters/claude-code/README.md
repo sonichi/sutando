@@ -71,7 +71,10 @@ the write that resolves the task, the Mod clears it on every retirement (a
 no-op without one, never from memory), and the record's writer, `verify` and
 the card all ignore a mark whose task is already resolved, however it was
 published. Every lifecycle verb takes `state/claims.lock` through one boundary:
-an I/O failure there, or in the step before it commits, answers `retry` (the
+an I/O failure there, or in the step before it commits, answers `retry` (decided by disposition:
+anything raised inside the step left the claim as it was, so only a decision,
+a refused turn, an unreadable claim, an attempt in progress, the admission or
+a `StateError` that is not `StateIOError`, stays final; the
 task is kept, an unconfirmed turn's confirmation is retried by the next tick or
 by the reply itself, and a reply told to call again), and one after the commit
 answers hard. When the progress record cannot be written at all, the CLI raises

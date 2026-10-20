@@ -2756,6 +2756,49 @@ class InboxCli(ConnectBase):
                 records.write_progress(self.root, mock.Mock(side_effect=error))
             self.assertIn(type(error).__name__, str(e.exception))
 
+    def failing_claim_json(self, error, times=1):
+        real, left = inbox.lifecycle.write_durable, [times]
+
+        def write(path, data):
+            if Path(path).name == "claim.json" and left[0] > 0:
+                left[0] -= 1
+                raise error
+            return real(path, data)
+        return mock.patch.object(inbox.lifecycle, "write_durable", side_effect=write)
+
+    def test_a_store_write_that_fails_is_a_retry_by_disposition_and_a_decision_stays_final(self):
+        lc = inbox._lifecycle(self.root)
+        t = self.task("task-enospc")
+        with self.failing_claim_json(OSError(errno.ENOSPC, "No space left on device")):
+            rc, out = self.verb("claim", t)
+        self.assertEqual((rc, out.get("retry")), (1, True), out)
+        self.assertIsNone(lc.claims.load(t), "nothing committed")
+        rc, out = self.verb("claim", t)
+        self.assertEqual(rc, 0, "the healthy retry claims it")
+        rc, out = self.verb("authorize", t, "1", "--text-hash", "h1")
+        token = out["token"]
+
+        class Unanticipated(Exception):
+            pass
+        for error in (OSError(errno.ENOSPC, "No space left on device"), Unanticipated("surprise")):
+            with self.failing_claim_json(error):
+                rc, out = self.verb("confirm", t, "turn-1", token, "--text-hash", "h1")
+            self.assertEqual((rc, out.get("retry")), (1, True), (error, out))
+            self.assertEqual(lc.claims.load(t)["phase"], inbox.lifecycle.CALLING, "the claim is as it was")
+        rc, out = self.verb("confirm", t, "turn-1", token, "--text-hash", "h1")
+        self.assertEqual((rc, out["turn_id"]), (0, "turn-1"), "the reconfirm keeps its turn")
+        rc, out = self.verb("confirm", t, "turn-2", "bad", "--text-hash", "h1")
+        self.assertEqual((rc, "retry" in out), (1, False), "TurnRefused stays final")
+        rc, out = self.verb("claim", self.task("task-guest", "guest"))
+        self.assertEqual((rc, "retry" in out, "not admitted" in out["refused"]), (1, False, True), "the admission refusal")
+        with mock.patch.object(inbox.lifecycle.Lifecycle, "prepare", side_effect=inbox.lifecycle.StateError("not fenced")):
+            rc, out = self.verb("claim", self.task("task-fence"))
+        self.assertEqual((rc, "retry" in out), (1, False), "a StateError about what the state says stays final")
+        with mock.patch.object(inbox.lifecycle.Lifecycle, "prepare", side_effect=inbox.lifecycle.AttemptInProgress("busy")):
+            self.assertEqual("retry" in self.verb("claim", self.task("task-busy"))[1], False)
+        self.assertTrue(issubclass(inbox.lifecycle.LedgerIOError, inbox.lifecycle.StateIOError))
+        self.assertIsInstance(inbox.lifecycle._state_io("write", "x", OSError("e")), inbox.lifecycle.StateIOError)
+
     def test_an_unwritable_progress_record_alarms_the_launcher_verify_and_the_card_until_a_write_lands(self):
         t = self.task("task-alarm")
         with mock.patch.object(records, "write_progress", side_effect=records.RecordError("progress.lock: EIO")):

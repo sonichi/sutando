@@ -126,6 +126,15 @@ class LedgerError(StateError):
     pass
 
 
+class StateIOError(StateError):
+    """The I/O kind of StateError (a read or write that failed), as distinct from a refusal on what the
+    state says: a caller may retry the one, never the other."""
+
+
+class LedgerIOError(LedgerError, StateIOError):
+    pass
+
+
 def _log(*a):
     print(time.strftime("%H:%M:%S"), *a, file=sys.stderr, flush=True)
 
@@ -538,7 +547,7 @@ class SettledIds:
                 raise LedgerError("%s is missing" % self.path)
             data = b""
         except OSError as e:
-            raise LedgerError("%s cannot be read (%s)" % (self.path, e))
+            raise LedgerIOError("%s cannot be read (%s)" % (self.path, e))
         self.ids, offset = set(), 0
         records = data.split(b"\n")
         for raw in records[:-1]:
@@ -555,7 +564,7 @@ class SettledIds:
                 os.truncate(self.path, offset)
                 _fsync_file(self.path)
             except OSError as e:
-                raise LedgerError("%s cannot be repaired (%s)" % (self.path, e))
+                raise LedgerIOError("%s cannot be repaired (%s)" % (self.path, e))
 
     @staticmethod
     def create(path):
@@ -574,7 +583,7 @@ class SettledIds:
         except FileNotFoundError:
             return
         except OSError as e:
-            raise LedgerError("cannot fsync %s (%s)" % (self.path, e))
+            raise LedgerIOError("cannot fsync %s (%s)" % (self.path, e))
 
     def __contains__(self, task_id):
         return task_id in self.ids
@@ -598,14 +607,14 @@ class SettledIds:
             if created:
                 fsync_dir(os.path.dirname(self.path))
         except OSError as e:
-            raise LedgerError("cannot append to %s (%s)" % (self.path, e))
+            raise LedgerIOError("cannot append to %s (%s)" % (self.path, e))
         self.ids.add(task_id)
 
 
 # ── claims ───────────────────────────────────────────────────────────────────
 
 def _state_io(what, path, e):
-    return StateError("cannot %s %s (%s)" % (what, path, e))
+    return StateIOError("cannot %s %s (%s)" % (what, path, e))
 
 
 class ClaimStore:
