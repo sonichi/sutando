@@ -160,6 +160,11 @@ async function parkOffer($: any, s: State, offer: Offer, reason: string): Promis
   if (offer.stagedText !== undefined && offer.phase === 'TURN_CONFIRMED') {
     const st = await cli($, s, ['stage', offer.rid, offer.turnId], offer.stagedText + '\n')
     if (st.ok || (st.hard && st.data?.outcome === 'staged')) offer.phase = 'RESULT_STAGED'
+    else {
+      // An accepted answer is never replaced by the protocol failure: kept until its own stage finishes.
+      offer.parkPending = reason
+      return String(st.data?.refused ?? st.data?.error ?? 'the accepted answer is not staged yet')
+    }
   }
   const r = offer.phase === 'RESULT_STAGED' ? await cli($, s, ['publish', offer.rid])
     : await cli($, s, ['park', offer.rid, offer.turnId, '--detail', `turn ${reason} without a reply`])

@@ -27,7 +27,7 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
                                lockFailsOnce?: string[]; storeFailsOnce?: string[]; unreadableOnce?: string[];
                                committedHardOnce?: string[]; committedHardWhy?: string; stageLandsOnce?: boolean;
                                parkRefusedOnce?: boolean; authorizeLostOnce?: boolean; stageLinkFailsOnce?: boolean;
-                               parkAlwaysRefuses?: boolean } = {}) {
+                               parkAlwaysRefuses?: boolean; stageThrows?: number } = {}) {
   const files: Record<string, string> = {}
   const submitted: string[] = []
   const runs: string[][] = []
@@ -56,6 +56,7 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
   let parkRefused = opts.parkRefusedOnce ?? false
   let authorizeLost = opts.authorizeLostOnce ?? false
   let stageLinkFails = opts.stageLinkFailsOnce ?? false
+  let stageThrowsLeft = opts.stageThrows ?? 0
   let publishes = 0
   const committedHardWhy = opts.committedHardWhy ?? 'OSError: unlock I/O error'
   const clearFailsLeft: Record<string, string> = { ...(opts.clearFails ?? {}) }
@@ -105,6 +106,7 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
     }
     if (argv[0] === 'python3' && argv[2].includes('sha256')) return { value: { exitCode: 0, stdout: hash(e.init.stdin) + '\n', stderr: '' } }
     if (argv[2] === 'interrupt') interruptAt.push(sidReads)
+    if (argv[2] === 'stage' && stageThrowsLeft-- > 0) throw new Error('spawn failed')      // the CLI did not run
     if (argv[2] === 'interrupt' && throwsLeft-- > 0) throw new Error('spawn failed')
     if (argv[0] !== 'ag2-sparrow-claude-local' || argv[1] !== 'inbox') return { value: { exitCode: 2, stdout: '', stderr: 'unknown' } }
     const verb = argv[2]
@@ -1081,6 +1083,52 @@ test('a pending authorization is dropped when its inbox file goes: a returning f
   h.claims['task-gone'] = { attempt: 2, phase: 'PREPARED' }    // a new attempt for the returning file
   await h.clock.advance(3000)
   expect(verbs(h).filter((v: string) => v === 'claim').length).toBe(2)   // claimed afresh, not the stale ask
+})
+
+test('an accepted answer whose stage process never ran is never replaced by the protocol failure', async ($, on) => {
+  const h = host(on, { stageThrows: 2 })
+  h.files['/in/task-nr.txt'] = TASK('task-nr')
+  await arm($, h)
+  await h.clock.advance(1000)
+  await $.turn.start({ text: h.submitted[0], turnId: 't-nr' })
+  const r = await $.tool.call({ tool: REPLY, task_id: 'task-nr', text: 'accepted text' })
+  expect(String(r.text ?? r.result)).toContain('call ag2space_reply again')
+  await $.turn.complete({ turnId: 't-nr', reason: 'completed', text: '' } as any)   // the re-stage does not run either
+  expect(h.files['/out/task-nr.txt']).toBe(undefined)
+  expect(verbs(h).filter((v: string) => v === 'park')).toEqual([])                  // never the protocol failure
+  for (let i = 0; i < 10; i++) await h.clock.advance(1000)
+  expect(h.files['/out/task-nr.txt']).toBe('accepted text\n')
+  expect(h.publishes()).toBe(1)
+})
+
+test('a session change while an accepted answer is still owed delivers that answer, never the interrupted one', async ($, on) => {
+  const h = host(on, { stageThrows: 2 })
+  h.files['/in/task-sc2.txt'] = TASK('task-sc2')
+  await arm($, h)
+  await h.clock.advance(1000)
+  await $.turn.start({ text: h.submitted[0], turnId: 't-sc2' })
+  await $.tool.call({ tool: REPLY, task_id: 'task-sc2', text: 'owed answer' })
+  await $.turn.complete({ turnId: 't-sc2', reason: 'completed', text: '' } as any)
+  h.setSid('sid-2')                                   // intake stops for good while the delivery is pending
+  for (let i = 0; i < 10; i++) await h.clock.advance(1000)
+  expect(h.files['/out/task-sc2.txt']).toBe('owed answer\n')
+  expect(verbs(h).filter((v: string) => v === 'interrupt' || v === 'park')).toEqual([])
+  expect(h.publishes()).toBe(1)
+})
+
+test('a staged answer whose publish fails at the turn\'s end is retried by publish alone, never parked', async ($, on) => {
+  const h = host(on, { lockFailsOnce: ['publish'] })
+  h.files['/in/task-rs.txt'] = TASK('task-rs')
+  await arm($, h)
+  await h.clock.advance(1000)
+  await $.turn.start({ text: h.submitted[0], turnId: 't-rs' })
+  const r = await $.tool.call({ tool: REPLY, task_id: 'task-rs', text: 'staged answer' })
+  expect(String(r.text ?? r.result)).toContain('call ag2space_reply again')
+  await $.turn.complete({ turnId: 't-rs', reason: 'completed', text: '' } as any)
+  for (let i = 0; i < 5; i++) await h.clock.advance(1000)
+  expect(h.files['/out/task-rs.txt']).toBe('staged answer\n')
+  expect(verbs(h).filter((v: string) => v === 'park')).toEqual([])
+  expect(h.publishes()).toBe(1)
 })
 
 test('thirty failed unstuck writes never age a retained task out: the next one lands (stopped-intake path)', async ($, on) => {

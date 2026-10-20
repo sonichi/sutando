@@ -87,7 +87,10 @@ stage whose descriptor landed without finishing makes that text the accepted
 answer: the session is told to call again with it, `publish` and `park`
 complete the move and deliver exactly the recorded body, and at the turn's end
 the Mod delivers it; a stage whose blob did not land after its descriptor is a
-retry the same way; a park or publish that does not deliver keeps the task,
+retry the same way; once an answer is accepted only its own stage and publish
+ever run for it, so a re-stage that fails (even one whose CLI did not run) is
+kept and retried, never replaced by the protocol failure; a park or publish
+that does not deliver keeps the task,
 retried behind the same per-task backoff and stuck mark as any other kept task,
 and never holds intake for the next one; the
 task is kept, an unconfirmed turn's confirmation is retried by the next tick or
