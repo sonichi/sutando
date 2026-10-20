@@ -13,13 +13,14 @@ must build every environment with tests/_helpers/hermetic_env.py. Refused anywhe
   spawn-env   a subprocess handed env=None or env=os.environ, or an os.exec*e/spawn*e handed os.environ
   env-param   a subprocess handed an `env` parameter that defaults to None and is never rebuilt
   unisolated  code run (a subprocess or os/asyncio spawn, a module loader, an import of those
-              modules) in a test file that never calls isolate_os_environ() or isolate_then_import()
-              as a module-level statement (a tests/_helpers library may instead isolate in the
-              function, or spawn with the helper's env); a call under `if` does not isolate, and
-              a clearing mock.patch.dict never counts: its lifetime is not the spawn's
-  before-isolation  such code at module level above that call
-  patched-isolation  that call while a mock.patch.dict(os.environ) is live (entered by `with`, a
-              decorator, or started earlier in its scope and not stopped): stopping it restores the outer env
+              modules) in a test file without a module-top isolation (a tests/_helpers library may
+              instead spawn with the helper's env); a mock.patch.dict never counts as isolation
+  before-isolation  such code (an import) at module level above that call
+  misplaced-isolation  isolate_os_environ() or isolate_then_import() anywhere but a module-level
+              statement preceded only by the docstring, imports, sys.path.insert/append of a path and
+              other such calls. There no patcher of any shape can be live yet, so none can later put
+              the outer environment back; patches below it save an isolated one. Only the isolator's
+              own definition in tests/_helpers may call it elsewhere.
 """
 from __future__ import annotations
 
@@ -102,10 +103,23 @@ def _over_environ(it, imp: Imports) -> bool:
                                and it.func.attr in ("items", "keys") and imp.environ(it.func.value))
 
 
-def _environ_patch(n, imp: "Imports") -> bool:
-    """A mock.patch.dict over os.environ, under any alias or by its "os.environ" name."""
-    return (isinstance(n, ast.Call) and _name(n.func) == "dict" and bool(n.args)
-            and (imp.environ(n.args[0]) or (isinstance(n.args[0], ast.Constant) and n.args[0].value == "os.environ")))
+# A sys.path entry is computed from these alone, so the statement can start nothing.
+PATH_CALLS = {"str", "Path", "resolve", "dirname", "abspath", "join", "fspath"}
+
+
+def _module_top(stmt, index: int) -> bool:
+    """A statement that may precede a module-top isolation: the docstring, an import, or a path-only
+    sys.path.insert/append."""
+    if isinstance(stmt, (ast.Import, ast.ImportFrom)):
+        return True
+    if not isinstance(stmt, ast.Expr) or not isinstance(stmt.value, (ast.Call, ast.Constant)):
+        return False
+    if isinstance(stmt.value, ast.Constant):
+        return index == 0 and isinstance(stmt.value.value, str)
+    f = stmt.value.func
+    return (isinstance(f, ast.Attribute) and f.attr in ("insert", "append") and ast.unparse(f.value) == "sys.path"
+            and all(_name(c.func) in PATH_CALLS for a in stmt.value.args for c in ast.walk(a)
+                    if isinstance(c, ast.Call)))
 
 
 def _imports_target(node) -> bool:
@@ -161,6 +175,7 @@ def violations(source: str, name: str = "<sample>") -> "list[str]":
     if not REFERENCE.search(code_text(ast.parse(source))):
         return []
     imp = Imports(tree)
+    library = "/_helpers/" in name
     parents = {}
     for p in ast.walk(tree):
         for c in ast.iter_child_nodes(p):
@@ -173,59 +188,37 @@ def violations(source: str, name: str = "<sample>") -> "list[str]":
                 return n
         return None
 
-    def statement(n) -> bool:
-        """`n` is a whole statement's value directly in a module or function body: it runs."""
-        s = parents.get(n)
-        holder = parents.get(s)
-        return (isinstance(s, (ast.Expr, ast.Assign, ast.AnnAssign)) and s.value is n
-                and isinstance(holder, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef)) and s in holder.body)
+    def isolator_stmt(st) -> bool:
+        v = getattr(st, "value", None)
+        return (isinstance(st, (ast.Expr, ast.Assign, ast.AnnAssign)) and isinstance(v, ast.Call)
+                and _name(v.func) in ISOLATORS)
+
+    top = set()
+    for i, st in enumerate(tree.body):
+        if isolator_stmt(st):
+            top.add(st.value)
+        elif not _module_top(st, i):
+            break
 
     def isolates(n) -> bool:
-        """An isolator call run as a statement: in effect for the rest of the process."""
-        return isinstance(n, ast.Call) and _name(n.func) in ISOLATORS and statement(n)
+        """An isolation at the module top, before any statement that could start a patcher."""
+        return n in top
 
-    def under_environ_patch(n) -> bool:
-        """`n` runs inside a `with` or decorated def patching os.environ, or after such a patch was
-        started in the same scope and not stopped."""
-        p = n
-        while p in parents:
-            c, p = p, parents[p]
-            if isinstance(p, (ast.With, ast.AsyncWith)) and c in p.body and any(
-                    _environ_patch(i.context_expr, imp) for i in p.items):
-                return True
-            if (isinstance(p, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
-                    and any(_environ_patch(d, imp) for d in p.decorator_list)):
-                return True
-        scope = enclosing_def(n)
-        named = {t.id for a in nodes if isinstance(a, ast.Assign) and _environ_patch(a.value, imp)
-                 and enclosing_def(a) is scope for t in a.targets if isinstance(t, ast.Name)}
-        live: "set[str]" = set()
-        calls = sorted((c for c in nodes if isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute)
-                        and enclosing_def(c) is scope and c.lineno < n.lineno),
-                       key=lambda c: (c.lineno, c.col_offset))
-        for c in calls:
-            f = c.func
-            if f.attr == "start" and _environ_patch(f.value, imp):
-                live.add(f"@{c.lineno}:{c.col_offset}")
-            elif f.attr == "start" and isinstance(f.value, ast.Name) and f.value.id in named:
-                live.add(f.value.id)
-            elif f.attr == "stop" and isinstance(f.value, ast.Name):
-                live.discard(f.value.id)
-            elif f.attr == "stopall":
-                live.clear()
-        return bool(live)
+    def implementation(n) -> bool:
+        fn = enclosing_def(n)
+        return library and isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)) and fn.name in ISOLATORS
 
     def runs_code(n) -> bool:
         return (isinstance(n, ast.Call) and (imp.spawn(n) or _name(n.func) in LOADERS)) or _imports_target(n)
 
-    library = "/_helpers/" in name
-
     def covered(n) -> bool:
-        """In a helper library: isolated earlier in its function, or a spawn with a helper-built env."""
+        """In a helper library: the isolator's own definition after it isolates, or a spawn with a
+        helper-built env."""
         if not library:
             return False
         fn = enclosing_def(n)
-        if fn is not None and any(isolates(c) and c.lineno < n.lineno for c in ast.walk(fn)):
+        if fn is not None and any(isinstance(c, ast.Call) and _name(c.func) in ISOLATORS and implementation(c)
+                                  and c.lineno < n.lineno for c in ast.walk(fn)):
             return True
         env = {k.arg: k.value for k in n.keywords}.get("env") if isinstance(n, ast.Call) and imp.spawn(n) else None
         if env is None:
@@ -245,8 +238,8 @@ def violations(source: str, name: str = "<sample>") -> "list[str]":
     elif runs:
         out += [(n.lineno, "before-isolation") for n in runs
                 if enclosing_def(n) is None and n.lineno < module_iso[0]]
-    out += [(n.lineno, "patched-isolation") for n in nodes
-            if isinstance(n, ast.Call) and _name(n.func) in ISOLATORS and under_environ_patch(n)]
+    out += [(n.lineno, "misplaced-isolation") for n in nodes if isinstance(n, ast.Call)
+            and _name(n.func) in ISOLATORS and not isolates(n) and not implementation(n)]
     for n in nodes:
         rule = None
         if _copy_rule(n, imp):
@@ -347,6 +340,30 @@ PATCHED_FIRST = {
     "isolate_os_environ()\nmock.patch.stopall()\n" + PRINT
     for clear in (True, False)
 }
+PROBE_HEAD = ("import os, sys, contextlib\nfrom unittest import mock\nfrom subprocess import run\n"
+              f"sys.path.insert(0, {str(REPO / 'tests')!r})\nfrom _helpers.hermetic_env import isolate_os_environ\n")
+# Each isolates while some patch of os.environ is live; once that patch ends the outer environment is back.
+UNDER_A_PATCH = {
+    "keyword": "with mock.patch.dict(in_dict=os.environ, values={}):\n    isolate_os_environ()\n",
+    "alias": "from unittest.mock import patch as P\nwith P.dict(os.environ, {}):\n    isolate_os_environ()\n",
+    "patch.object": 'mock.patch.object(os, "environ", dict(os.environ)).start()\nisolate_os_environ()\n',
+    "patch-by-name": 'mock.patch("os.environ", dict(os.environ)).start()\nisolate_os_environ()\n',
+    "exitstack": "with contextlib.ExitStack() as s:\n    s.enter_context(mock.patch.dict(os.environ, {}))\n"
+                 "    isolate_os_environ()\n",
+    "nested": "with mock.patch.dict(os.environ, {}):\n    with mock.patch.dict(os.environ, {}):\n"
+              "        isolate_os_environ()\n",
+    "decorator": "@mock.patch.dict(os.environ, {})\ndef f():\n    isolate_os_environ()\nf()\n",
+    "entered-by-hand": "P = mock.patch.dict(os.environ, {})\nP.__enter__()\nisolate_os_environ()\n"
+                       "P.__exit__(None, None, None)\n",
+    "reassigned": "os.environ = dict(os.environ)\nisolate_os_environ()\n",
+}
+# os.environ no longer the process environment: the helper refuses to isolate a stand-in.
+REFUSED_AT_RUNTIME = {"patch.object", "patch-by-name", "reassigned"}
+MODULE_TOP = "isolate_os_environ()\nmock.patch.dict(os.environ, {'X': '1'}, clear=True).start()\n"
+
+
+def probe(body: str) -> str:
+    return PROBE_HEAD + body + "mock.patch.stopall()\n" + PRINT + 'BRIDGE = "remote_gateway_bridge"\n'
 
 
 class SelfTest(unittest.TestCase):
@@ -363,7 +380,8 @@ class SelfTest(unittest.TestCase):
 
     def test_isolation_after_the_import_does_not_count(self):
         late = SAMPLE_CLEAN.replace('isolate_os_environ(REMOTE_TASK_TOKEN="t")\n', "") + "isolate_os_environ()\n"
-        self.assertIn("before-isolation", " ".join(violations(late)))
+        self.assertIn("misplaced-isolation", " ".join(violations(late)))
+        self.assertIn("before-isolation", " ".join(violations(GATEWAY_IMPORT + "isolate_os_environ()\n")))
 
     def test_a_bridge_loaded_by_path_or_run_by_code_under_test_needs_isolation(self):
         by_path = ('import importlib.util\nBRIDGE = "src/remote-gateway-bridge.py"\n'
@@ -377,7 +395,7 @@ class SelfTest(unittest.TestCase):
     def test_only_a_helper_library_may_rely_on_a_helper_built_env_or_local_isolation(self):
         ok = ('import subprocess\n# remote_gateway_bridge child\n'
               'def start():\n    env = hermetic_env(X="1")\n    subprocess.Popen(["python3"], env=env)\n'
-              'def imp():\n    isolate_os_environ()\n    from ag2_sparrow import remote_gateway_bridge\n')
+              'def isolate_then_import():\n    isolate_os_environ()\n    from ag2_sparrow import remote_gateway_bridge\n')
         self.assertEqual(violations(ok, "tests/_helpers/sample.py"), [])
         self.assertIn("unisolated", " ".join(violations(ok, "tests/sample.test.py")))
 
@@ -443,22 +461,34 @@ class SelfTest(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertIn("unisolated", " ".join(violations(sample)))
 
-    def test_isolating_under_a_live_environ_patch_is_refused(self):
+    def test_isolation_counts_only_at_the_module_top(self):
+        for name, body in UNDER_A_PATCH.items():
+            with self.subTest(name=name):
+                self.assertIn("misplaced-isolation", " ".join(violations(probe(body))))
         for clear, sample in PATCHED_FIRST.items():
             with self.subTest(clear=clear):
-                self.assertIn("patched-isolation", " ".join(violations(sample)))
-        pre = "import os\nfrom unittest import mock\n"
-        for body in ("with mock.patch.dict(os.environ, {}):\n    isolate_os_environ()\n",
-                     "@mock.patch.dict('os.environ', {})\ndef f():\n    isolate_os_environ()\n",
-                     "from os import environ as E\nP = mock.patch.dict(E, {})\nP.start()\nisolate_os_environ()\n",
-                     "from unittest.mock import patch as P\nP.dict(os.environ, {}).start()\nisolate_os_environ()\n"):
+                self.assertIn("misplaced-isolation", " ".join(violations(sample)))
+        for body in ("def f():\n    isolate_os_environ()\n", "try:\n    isolate_os_environ()\nexcept OSError:\n    pass\n",
+                     "for _ in ():\n    isolate_os_environ()\n", "class C:\n    isolate_os_environ()\n",
+                     "REPO = 1\nisolate_os_environ()\n", 'sys.path.insert(0, open("p").read())\nisolate_os_environ()\n'):
             with self.subTest(body=body):
-                self.assertIn("patched-isolation", " ".join(violations(IN_SCOPE + pre + body)))
-        for body in ("P = mock.patch.dict(os.environ, {})\nP.start()\nP.stop()\nisolate_os_environ()\n",
-                     "mock.patch.dict(os.environ, {}).start()\nmock.patch.stopall()\nisolate_os_environ()\n",
-                     "isolate_os_environ()\nmock.patch.dict(os.environ, {}).start()\n"):
-            with self.subTest(body=body):
-                self.assertEqual(violations(IN_SCOPE + pre + body), [])
+                self.assertIn("misplaced-isolation", " ".join(violations("import sys\n" + body + GATEWAY_IMPORT)))
+        self.assertEqual(violations(probe(MODULE_TOP)), [])
+        top = ('"""Doc."""\nfrom __future__ import annotations\nimport sys\nfrom pathlib import Path\n'
+               "sys.path.insert(0, str(Path(__file__).resolve().parents[2]))\nisolate_os_environ()\n"
+               "isolate_then_import()\n" + GATEWAY_IMPORT)
+        self.assertEqual(violations(top), [])
+
+    def test_a_patch_live_at_isolation_leaks_unless_refused_and_one_after_a_module_top_isolation_does_not(self):
+        env = hermetic_env(GATEWAY_TOKEN=SYNTHETIC)
+        for name, body in {**UNDER_A_PATCH, "module-top": MODULE_TOP}.items():
+            with self.subTest(name=name):
+                got = subprocess.run([sys.executable, "-c", probe(body)], capture_output=True, text=True,
+                                     env=env, timeout=60)
+                refused = "os.environ replaced" in got.stderr
+                self.assertEqual(refused, name in REFUSED_AT_RUNTIME, got.stderr)
+                self.assertEqual(got.returncode != 0, refused, got.stderr)
+                self.assertEqual(SYNTHETIC in got.stdout, name != "module-top" and not refused, got.stdout)
 
     def test_isolating_under_a_started_environ_patch_fails_and_never_leaks(self):
         env = hermetic_env(GATEWAY_TOKEN=SYNTHETIC)
@@ -469,6 +499,7 @@ class SelfTest(unittest.TestCase):
                 self.assertNotIn(SYNTHETIC, got.stdout)
                 self.assertNotEqual(got.returncode, 0)
                 self.assertIn("isolate before patching os.environ", got.stderr)
+        # A suite loaded by an isolated one re-isolates under the loader's patch; that patch saved an isolated env.
         renested = (HEAD + ISOLATE + "isolate_os_environ()\nP = mock.patch.dict(os.environ)\nP.start()\n"
                     "isolate_os_environ()\nP.stop()\n" + PRINT)
         got = subprocess.run([sys.executable, "-c", renested], capture_output=True, text=True, env=env, timeout=60)

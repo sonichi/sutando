@@ -21,6 +21,7 @@ there would run at startup too.
 from __future__ import annotations
 
 import importlib.metadata
+import json
 import importlib.util
 import os
 import re
@@ -41,6 +42,8 @@ HARNESS_PREFIX = "COVERAGE_"
 TEST_CONTROL_ALLOWLIST = ("CI", "GITHUB_ACTIONS")
 TEST_CONTROL_PREFIX = "SUTANDO_TEST_"
 HERMETIC_USER = "hermetic-test"
+# Read when this helper is imported, so before any isolation: a runtime harness names its private root here.
+_HARNESS_SOCKET = os.environ.get("SUTANDO_RUNTIME_SOCKET")
 _process_home: "str | None" = None
 _coverage_dirs: "dict[str, str]" = {}
 
@@ -126,8 +129,13 @@ def hermetic_env(home: "Path | str | None" = None, **extra: str) -> "dict[str, s
 def _environ_patch_active() -> bool:
     """A started mock.patch.dict on os.environ: its stop() puts back the environment it saved."""
     from unittest import mock
-    return any(isinstance(p, mock._patch_dict) and (p.in_dict is os.environ or p.in_dict == "os.environ")
-               for p in getattr(mock._patch, "_active_patches", ()))
+    try:
+        active, patch_dict = list(mock._patch._active_patches), mock._patch_dict
+    except AttributeError as e:
+        raise RuntimeError("isolate_os_environ() cannot read mock's started patches to verify none "
+                           "covers os.environ; refusing to isolate unverified") from e
+    return any(isinstance(p, patch_dict) and (p.in_dict is os.environ or p.in_dict == "os.environ")
+               for p in active)
 
 
 def isolate_os_environ(home: "Path | str | None" = None, **extra: str) -> "os._Environ[str]":
@@ -136,6 +144,9 @@ def isolate_os_environ(home: "Path | str | None" = None, **extra: str) -> "os._E
 
     For a module that imports the bridge or room_ops at load time, before that import."""
     global _process_home
+    if not isinstance(os.environ, os._Environ):
+        raise RuntimeError("isolate_os_environ() with os.environ replaced (patch.object, patch('os.environ') or "
+                           "reassignment): clearing the stand-in leaves the process environment; isolate first")
     # A patch started after an earlier isolation saved an isolated environment: only an earlier one leaks.
     if _process_home is None and _environ_patch_active():
         raise RuntimeError("isolate_os_environ() under a mock.patch.dict(os.environ) started before any "
@@ -147,6 +158,15 @@ def isolate_os_environ(home: "Path | str | None" = None, **extra: str) -> "os._E
     os.environ.update(env)
     _process_home = env["HOME"]
     return os.environ
+
+
+def runtime_harness() -> "tuple[Path | None, dict[str, str]]":
+    """The environment.json a runtime harness writes beside SUTANDO_RUNTIME_SOCKET, and its variables;
+    (None, {}) without one. Stable across isolation, so it can be an isolator's argument and read later."""
+    if not _HARNESS_SOCKET:
+        return None, {}
+    path = Path(_HARNESS_SOCKET).parent / "environment.json"
+    return (path, json.loads(path.read_text())) if path.is_file() else (None, {})
 
 
 def isolated_child_env(**extra: str) -> "dict[str, str]":

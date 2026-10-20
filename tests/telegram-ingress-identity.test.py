@@ -12,10 +12,8 @@ from pathlib import Path
 
 from _helpers.hermetic_env import isolate_os_environ, isolated_child_env
 
-# A --bridge child keeps the hermetic environment its harness built; isolation would discard it.
-_BRIDGE_ENV = json.loads(Path(sys.argv[4]).read_text()) if sys.argv[1:2] == ["--bridge"] else {}
-# Before anything reads the environment: no outer credential selector survives.
-isolate_os_environ(**_BRIDGE_ENV)
+# Before anything reads the environment; a --bridge child keeps the hermetic environment its harness built.
+isolate_os_environ(**(json.loads(Path(sys.argv[4]).read_text()) if sys.argv[1:2] == ["--bridge"] else {}))
 
 import importlib.util
 import io

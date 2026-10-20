@@ -150,6 +150,17 @@ class Isolator(unittest.TestCase):
         self.assertEqual(got.returncode, 0, got.stderr)
         self.assertEqual(got.stdout.strip(), "absent")
 
+    def test_an_unreadable_patch_registry_refuses_isolation(self):
+        code = ("import sys; sys.path.insert(0, %r)\n"
+                "from unittest import mock\n"
+                "del mock._patch._active_patches\n"
+                "from _helpers.hermetic_env import isolate_os_environ\n"
+                "isolate_os_environ()\n" % str(REPO / "tests"))
+        got = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60,
+                             env=hermetic_env())
+        self.assertNotEqual(got.returncode, 0)
+        self.assertIn("refusing to isolate unverified", got.stderr)
+
 
 def _user_site(base: Path) -> Path:
     """Where a Python started with PYTHONUSERBASE=base looks for its user site-packages."""

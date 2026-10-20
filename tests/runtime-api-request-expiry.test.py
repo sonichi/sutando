@@ -12,9 +12,7 @@ import unittest
 from contextlib import closing
 from pathlib import Path
 
-# A harness may supply a private socket root; read before isolation clears it.
-SUPPLIED_SOCKET = os.environ.get("SUTANDO_RUNTIME_SOCKET")
-from _helpers.hermetic_env import isolate_os_environ, isolated_child_env  # noqa: E402
+from _helpers.hermetic_env import isolate_os_environ, isolated_child_env, runtime_harness  # noqa: E402
 
 # Before anything below reads the environment: no outer credential selector survives.
 isolate_os_environ()
@@ -36,11 +34,9 @@ OWNER = "@owner:synthetic"
 class ExpiryJourneyTests(unittest.TestCase):
     def setUp(self):
         self.env = isolated_child_env()
-        supplied_socket = SUPPLIED_SOCKET
-        environment_file = (Path(supplied_socket).parent / "environment.json"
-                            if supplied_socket else None)
-        if environment_file and environment_file.is_file():
-            self.env.update(json.loads(environment_file.read_text()))
+        environment_file, harness = runtime_harness()
+        if environment_file:
+            self.env.update(harness)
             private_root = environment_file.parent
         else:
             private_root = None
