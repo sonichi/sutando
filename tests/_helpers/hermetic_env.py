@@ -27,7 +27,6 @@ import re
 import shutil
 import tempfile
 from pathlib import Path
-from unittest import mock
 
 from _helpers.credential_scope import CREDENTIAL_NAME
 
@@ -125,12 +124,15 @@ def hermetic_env(home: "Path | str | None" = None, **extra: str) -> "dict[str, s
 
 
 def isolate_os_environ(home: "Path | str | None" = None, **extra: str) -> "os._Environ[str]":
-    """Replace this process's environment with `hermetic_env(...)` for the rest of the run.
+    """Replace this process's environment with `hermetic_env(...)` for the rest of the run; no
+    patcher state can restore the outer one.
 
     For a module that imports the bridge or room_ops at load time, before that import."""
     global _process_home
     env = hermetic_env(home, **extra)
-    mock.patch.dict(os.environ, env, clear=True).start()
+    # In place, not a patcher: mock.patch.stopall() would restore the outer environment.
+    os.environ.clear()
+    os.environ.update(env)
     _process_home = env["HOME"]
     return os.environ
 

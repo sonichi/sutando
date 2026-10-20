@@ -133,6 +133,23 @@ class Sentinels(unittest.TestCase):
     def test_channel_env_resolve_and_its_shell_children_read_no_outer_selector(self):
         self.check(["tests/channel-env-resolve.test.py"])
 
+    def test_a_suite_that_stops_all_patches_reads_no_outer_selector(self):
+        self.check(["tests/core-restart-heartbeat-and-cron-hold.test.py"])
+
+
+class Isolator(unittest.TestCase):
+    def test_stopping_every_patch_never_restores_the_outer_environment(self):
+        code = ("import os, sys; sys.path.insert(0, %r)\n"
+                "from unittest import mock\n"
+                "from _helpers.hermetic_env import isolate_os_environ\n"
+                "assert isolate_os_environ() is os.environ\n"
+                "mock.patch.stopall()\n"
+                "print(os.environ.get('GATEWAY_TOKEN', 'absent'))\n" % str(REPO / "tests"))
+        got = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60,
+                             env=hermetic_env(GATEWAY_TOKEN=f"{MARK}-gateway-token"))
+        self.assertEqual(got.returncode, 0, got.stderr)
+        self.assertEqual(got.stdout.strip(), "absent")
+
 
 def _user_site(base: Path) -> Path:
     """Where a Python started with PYTHONUSERBASE=base looks for its user site-packages."""
