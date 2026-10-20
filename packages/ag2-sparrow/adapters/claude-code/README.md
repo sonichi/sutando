@@ -197,9 +197,12 @@ rule, closed by default:
 - Key path recorded and `HMAC_STRICT=0` (the explicit `--no-hmac-strict`
   record): lenient, whatever the key file holds. `unsigned` and `unverifiable`
   are submitted with the verdict in the envelope line.
-- Key path recorded and any other `HMAC_STRICT` (absent, empty, unknown):
-  strict, as above. An opt-out written by an older install as an empty value
-  now reads strict; rerun `install --no-hmac-strict` to record it.
+- Key path recorded and `HMAC_STRICT` present but empty: lenient too; that is
+  the record an older install wrote for `--no-hmac-strict`, honoured as it
+  is, nothing to rerun. `verify` prints a `WARN hmac mode: legacy opt-out`
+  line so the lenient install is visible.
+- Key path recorded and `HMAC_STRICT` missing or any other value: strict, as
+  above. A missing line is no record.
 - No key path and `HMAC_STRICT` not `1`: off. Every task reads `unsigned` and
   is submitted.
 - `invalid` is never submitted in any mode.
@@ -214,6 +217,13 @@ set in the session's environment at its creation, so a reinstall with another
 path takes a session restart; the key's presence and content at that path are
 read live, by the verifier and the policy alike. The watch tool's arm line
 names the mode as the CLI reads it then.
+
+A task the mod held (backoff, then the durable stuck mark after 300 ticks)
+has that mark cleared before any terminal outcome retires it: a verdict the
+policy refuses once the key lands (`unsigned`, `invalid`), a final claim or
+authorize refusal, or a delivered answer (the claim's own write clears it). A
+clear the CLI does not confirm keeps the task retryable; no mark outlives its
+task.
 
 So `install --hmac-key-file <path>` records a path whose key is not there yet
 (it prints a warning and `verify` fails its `hmac key` part until the key

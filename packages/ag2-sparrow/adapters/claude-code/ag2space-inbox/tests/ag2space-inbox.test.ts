@@ -470,6 +470,59 @@ test('an envelope policy the CLI could not answer is held with backoff, then sub
   expect(h.submitted[0]).toContain('envelope verified')
 })
 
+// A task held past the stuck bound (key missing) whose final outcome, once the key lands, is terminal: the
+// durable mark is cleared before it is retired, for a verdict the policy refuses and for a delivered answer.
+const heldThenKeyLands = async ($: any, on: any, o: any) => {
+  const h = host(on, o)
+  h.files['/in/task-h1.txt'] = TASK('task-h1')
+  await arm($, h)
+  for (let i = 0; i < 400; i++) await h.clock.advance(1000)
+  expect(h.submitted.length).toBe(0)
+  expect(h.stuck).toEqual({ 'task-h1': { since: 1 } })
+  o.keyProblem = ''
+  for (let i = 0; i < 70; i++) await h.clock.advance(1000)
+  return h
+}
+
+test('a task held past the stuck bound, refused as unsigned once the key lands, leaves no stuck mark behind', async ($, on) => {
+  const h = await heldThenKeyLands($, on, { verdict: 'unsigned', strict: true, keyProblem: '/k/task-hmac.key missing: strict mode submits nothing until it is back' })
+  expect(h.submitted.length).toBe(0)
+  expect(h.stuck).toEqual({})
+  expect(h.progress.filter((p: string[]) => p[0] === '--unstuck')).toEqual([['--unstuck', 'task-h1']])
+  expect(h.logs.filter(l => l.includes('task-h1 strict mode: envelope unsigned; not submitted')).length).toBe(1)
+  await h.clock.advance(5000)
+  expect(h.progress.filter((p: string[]) => p[0] === '--unstuck').length).toBe(1)   // retired: tried no more
+})
+
+test('a task held past the stuck bound, found signed under another key (invalid) once the key lands, leaves no stuck mark behind', async ($, on) => {
+  const h = await heldThenKeyLands($, on, { verdict: 'invalid', strict: true, keyProblem: '/k/task-hmac.key missing: strict mode submits nothing until it is back' })
+  expect(h.submitted.length).toBe(0)
+  expect(h.stuck).toEqual({})
+  expect(h.progress.filter((p: string[]) => p[0] === '--unstuck')).toEqual([['--unstuck', 'task-h1']])
+})
+
+test('a task held past the stuck bound, verified once the key lands, is submitted and delivered with no stuck mark behind', async ($, on) => {
+  const h = await heldThenKeyLands($, on, { verdict: 'verified', strict: true, keyProblem: '/k/task-hmac.key missing: strict mode submits nothing until it is back' })
+  expect(h.submitted.length).toBe(1)
+  expect(h.stuck).toEqual({})                          // the claim's write cleared it
+  await $.turn.start({ turnId: 't1', text: FRAMED(h.submitted[0]) })
+  const r = await $.tool.call({ tool: REPLY, task_id: 'task-h1', text: 'done' })
+  expect(String(r.text ?? r.result)).toContain('ublished')
+  expect(h.files['/out/task-h1.txt']).toContain('done')
+  expect(h.stuck).toEqual({})
+})
+
+test('a held task whose stuck mark cannot be cleared at its terminal refusal stays retryable, never retired over a live mark', async ($, on) => {
+  const o = { verdict: 'unsigned', strict: true, keyProblem: '/k/task-hmac.key missing: strict mode submits nothing until it is back', unstuckFails: 2 }
+  const h = await heldThenKeyLands($, on, o)
+  for (let i = 0; i < 150; i++) await h.clock.advance(1000)   // the hold's delay is at its 60-tick cap by now
+  expect(h.submitted.length).toBe(0)
+  expect(h.stuck).toEqual({})                          // the third clear landed
+  expect(h.runs.filter((a: string[]) => a[2] === 'progress' && a.includes('--unstuck')).length).toBe(3)
+  expect(h.progress.filter((p: string[]) => p[0] === '--unstuck').length).toBe(1)   // the fake records only the one that landed
+  expect(h.logs.filter(l => l.includes('task-h1 strict mode: envelope unsigned; its stuck mark could not be cleared')).length).toBe(2)
+})
+
 test('an envelope policy that never answers is marked stuck after 300 ticks like any other retained task, never skipped silently', async ($, on) => {
   const h = host(on, { policyFails: 1000 })
   h.files['/in/task-p2.txt'] = TASK('task-p2')

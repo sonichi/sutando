@@ -513,6 +513,9 @@ def verify(_args) -> int:
              (f"strict mode: {problem}" if mode == hmac_policy.STRICT else problem) if problem
              else key or "none (every task reads unsigned)")
     print("INFO hmac mode: " + hmac_policy.describe(cfg))
+    if hmac_policy.legacy_opt_out(cfg):
+        print("WARN hmac mode: legacy opt-out (HMAC_STRICT recorded empty by an older install --no-hmac-strict): not "
+              "strict; unsigned and unverifiable envelopes are submitted. Reinstall without --no-hmac-strict for strict")
     print("INFO non-owner tasks: " + ("submitted with the non-owner note (--allow-non-owner)"
                                       if cfg.get(inbox.ALLOW_NON_OWNER) == "1" else "refused (owner only)"))
     root, mode = cm.work_root(cfg), bridge_mode(cfg)

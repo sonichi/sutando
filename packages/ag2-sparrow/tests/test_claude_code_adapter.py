@@ -1376,8 +1376,8 @@ class ConnectStrict(ConnectBase):
                          (False, "strict mode: %s is not a 64-hex-character key, so every envelope reads unverifiable" % key, True))
         key.unlink()                                     # removed while strict: refused with the one reason line, held
         self.assertEqual(hmac_policy.decide(cfg, "verified"), (False, missing, True))
-        self.assertEqual(hmac_policy.mode(dict(cfg, HMAC_STRICT="")), hmac_policy.STRICT, "an empty value is not an opt-out")
-        self.assertEqual(hmac_policy.mode({k: v for k, v in cfg.items() if k != "HMAC_STRICT"}), hmac_policy.STRICT, "nor an absent line")
+        self.assertEqual(hmac_policy.mode(dict(cfg, HMAC_STRICT="")), hmac_policy.LENIENT, "a present empty value: the older opt-out record")
+        self.assertEqual(hmac_policy.mode({k: v for k, v in cfg.items() if k != "HMAC_STRICT"}), hmac_policy.STRICT, "an absent line is no record")
         lenient = dict(cfg, HMAC_STRICT="0")             # --no-hmac-strict recorded as 0: lenient regardless of the key
         self.assertEqual(hmac_policy.mode(lenient), hmac_policy.LENIENT)
         for verdict in ("verified", "unsigned", "unverifiable"):
@@ -1470,9 +1470,9 @@ class ConnectStrict(ConnectBase):
         ("present", None,    "present",   "strict"),
         ("present", None,    "missing",   "held"),
         ("present", None,    "malformed", "held"),
-        ("present", "",      "present",   "strict"),
-        ("present", "",      "missing",   "held"),
-        ("present", "",      "malformed", "held"),
+        ("present", "",      "present",   "lenient"),     # the older install's --no-hmac-strict record
+        ("present", "",      "missing",   "lenient"),
+        ("present", "",      "malformed", "lenient"),
         ("present", "0",     "present",   "lenient"),
         ("present", "0",     "missing",   "lenient"),
         ("present", "0",     "malformed", "lenient"),
@@ -1548,6 +1548,39 @@ class ConnectStrict(ConnectBase):
         with contextlib.redirect_stdout(out):
             self.assertEqual(cli.main(["inbox", "--root", str(self.work), "envelope", "--verdict", "unsigned"]), 1)
         self.assertEqual(json.loads(out.getvalue()).get("retry"), True)
+
+    def test_the_opt_out_an_older_install_recorded_stays_lenient_through_the_verb_and_verify_warns(self):
+        """7f7f56a8's install persisted `--hmac-key-file <path> --no-hmac-strict` as HMAC_STRICT= (present,
+        empty: `"1" if strict else ""` through the same render_config). An unattended lenient install that
+        upgrades keeps submitting unsigned and unverifiable owner tasks, with no rerun; verify says so."""
+        runner = self.runner()
+        self.assertEqual(self.install_with(runner, False, "--no-hmac-strict")[0], 0)
+        self.runners[-1].stop_session()
+        cfg = cli.read_config(cli.config_path())
+        self.assertEqual(cfg["HMAC_STRICT"], "0")
+        parent = cm._write(cli.config_path(), cli.render_config(dict(cfg, HMAC_STRICT="")), 0o600)   # what 7f7f56a8 wrote
+        self.assertIn("\nHMAC_STRICT=''\n", cli.config_path().read_text())
+        self.assertEqual(cli.read_config(cli.config_path())["HMAC_STRICT"], "")
+        for verdict in ("unsigned", "unverifiable", "verified"):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = cli.main(["inbox", "--root", str(self.work), "envelope", "--verdict", verdict])
+            self.assertEqual((rc, json.loads(out.getvalue())),
+                             (0, {"verdict": verdict, "mode": "lenient", "submit": True, "reason": "", "retry": False}), verdict)
+        (self.home / "task-hmac.key").unlink()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            cli.main(["inbox", "--root", str(self.work), "envelope", "--verdict", "unverifiable"])
+        self.assertEqual(json.loads(out.getvalue())["submit"], True, "lenient whatever the key file holds")
+        self.assertTrue(hmac_policy.legacy_opt_out(cli.read_config(cli.config_path())))
+        rc, out, _ = self.main("verify")
+        self.assertIn("INFO hmac mode: not strict", out)
+        self.assertIn("WARN hmac mode: legacy opt-out (HMAC_STRICT recorded empty by an older install --no-hmac-strict): not strict", out)
+        self.assertNotIn("WARN hmac mode", self.main("verify")[1] if self.configure(HMAC_STRICT="0") else "", "the current record: no warning")
+        self.assertNotIn("WARN hmac mode", self.main("verify")[1] if self.configure(HMAC_STRICT="1") else "")
+        self.assertNotIn("WARN hmac mode", self.main("verify")[1] if self.configure(HMAC_KEY_FILE="", HMAC_STRICT="") else "", "off is not legacy")
+        self.assertFalse(hmac_policy.legacy_opt_out({"HMAC_KEY_FILE": str(self.home / "task-hmac.key")}), "a missing line is no record")
+        del parent
 
     def test_a_key_file_alone_is_strict_and_no_hmac_strict_opts_out(self):
         runner = self.runner()

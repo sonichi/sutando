@@ -11,7 +11,9 @@ The rule, closed by default:
                                        recorded, every task is refused with that reason and held for retry
   key path, HMAC_STRICT=0           -> lenient (the explicit --no-hmac-strict record): every verdict but
                                        invalid is submitted, whatever the key file holds
-  key path, any other HMAC_STRICT   -> strict (absent, empty or unknown is not an opt-out)
+  key path, HMAC_STRICT= (present, empty) -> lenient too: the record an older install wrote for
+                                       --no-hmac-strict; verify warns, nothing need be rerun
+  key path, any other HMAC_STRICT   -> strict (a missing line or an unknown value is not an opt-out)
   no key path, not HMAC_STRICT=1    -> off: every verdict but invalid is submitted (unsigned reads)
 An incomplete or unreadable config is refused upstream (the verb parks it); it never reads as off.
 """
@@ -23,7 +25,7 @@ from pathlib import Path
 STRICT, LENIENT, OFF = "strict", "lenient", "off"
 VERDICTS = frozenset(("verified", "unsigned", "invalid", "unverifiable"))
 KEY_RE = re.compile(r"[0-9a-fA-F]{64}")
-KEY_FILE, STRICT_FLAG, OPT_OUT = "HMAC_KEY_FILE", "HMAC_STRICT", "0"
+KEY_FILE, STRICT_FLAG, OPT_OUT, LEGACY_OPT_OUT = "HMAC_KEY_FILE", "HMAC_STRICT", "0", ""
 MODE_LINES = {STRICT: "strict (only verified envelopes are submitted), decided per task from the key file as it is then",
               LENIENT: "not strict (unsigned and unverifiable envelopes are submitted too)",
               OFF: "off (no key file: every task reads unsigned and is submitted)"}
@@ -50,13 +52,19 @@ def key_problem(path: str) -> str:
 def mode(cfg: dict) -> str:
     """From the recorded choice alone; the key file's state enters only in decide(). The strict flag is
     read first: with it and no key path the mode is strict and fails closed, never off. A key path is
-    strict unless the opt-out is recorded as exactly "0"."""
+    strict unless the opt-out is recorded: "0", or the empty value an older install wrote (a present
+    line; a missing one is not a record)."""
     flag = cfg.get(STRICT_FLAG)
     if flag == "1":
         return STRICT
     if not cfg.get(KEY_FILE):
         return OFF
-    return LENIENT if flag == OPT_OUT else STRICT
+    return LENIENT if flag in (OPT_OUT, LEGACY_OPT_OUT) else STRICT
+
+
+def legacy_opt_out(cfg: dict) -> bool:
+    """The opt-out as an older install recorded it: a key path with HMAC_STRICT present and empty."""
+    return bool(cfg.get(KEY_FILE)) and cfg.get(STRICT_FLAG) == LEGACY_OPT_OUT
 
 
 def decide(cfg: dict, verdict: str) -> "tuple[bool, str, bool]":

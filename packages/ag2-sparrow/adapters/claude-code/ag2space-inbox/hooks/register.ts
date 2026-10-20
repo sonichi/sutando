@@ -247,6 +247,26 @@ async function arm($: any, s: State, inbox: string, results: string): Promise<{ 
     return hard
   }
 
+  // A terminal outcome for a task that was held: its durable stuck mark is cleared before it is retired, so
+  // no mark outlives the task; a clear that is not confirmed keeps the task retryable. True on a hard reply.
+  const retire = async (name: string, rid: string, why: string): Promise<boolean> => {
+    const held = s.retry.get(name)
+    if (held) {
+      const r = await cli($, s, ['progress', '--unstuck', rid])
+      if (r.hard) return true
+      if (!r.ok) {
+        s.stale.delete(name)
+        s.retry.set(name, { ...held, next: s.tick + held.delay })
+        log(`${rid} ${why}; its stuck mark could not be cleared (${r.data?.refused ?? 'no reply'}); kept, retried`)
+        return false
+      }
+      s.retry.delete(name)
+    }
+    s.seen.add(name)
+    log(`${rid} ${why}; not submitted`)
+    return false
+  }
+
   const scan = async () => {
     if (busy) return
     busy = true
@@ -308,8 +328,7 @@ async function arm($: any, s: State, inbox: string, results: string): Promise<{ 
             if (await retain(entry.name, rid, 'held by the envelope policy', String(policy.data.reason ?? ''))) return
             continue
           }
-          s.seen.add(entry.name)
-          log(`${rid} ${policy.data.reason || `envelope ${verdict}`}; not submitted`)
+          if (await retire(entry.name, rid, String(policy.data.reason || `envelope ${verdict}`))) return
           continue
         }
         if (stopped) {
@@ -346,8 +365,8 @@ async function arm($: any, s: State, inbox: string, results: string): Promise<{ 
             if (await retain(entry.name, rid, 'not claimable yet', String(claimed.data?.refused ?? ''))) return
             continue
           }
-          s.retry.delete(entry.name)
-          if (!claimed.ok) { s.seen.add(entry.name); log(`${rid} not claimed: ${claimed.data?.refused ?? ''}`); continue }
+          if (!claimed.ok) { if (await retire(entry.name, rid, `not claimed: ${claimed.data?.refused ?? ''}`)) return; continue }
+          s.retry.delete(entry.name)          // the claim's own write cleared the mark
           const admitted = String(claimed.data?.admission ?? '')
           const ctier = String(claimed.data?.access_tier ?? '')
           if (!ADMITTED.has(admitted) || !ctier) { s.seen.add(entry.name); log(`${rid} claim gave no admission; not submitted`); continue }
@@ -374,7 +393,7 @@ async function arm($: any, s: State, inbox: string, results: string): Promise<{ 
           continue
         }
         s.authorizing.delete(entry.name)
-        if (!authorized) { s.seen.add(entry.name); log(`${rid} not authorized: ${auth.data?.refused ?? ''}`); continue }
+        if (!authorized) { if (await retire(entry.name, rid, `not authorized: ${auth.data?.refused ?? ''}`)) return; continue }
         const msg = ask.msg, hash = ask.hash
         const offer: Offer = { file: entry.name, rid, attempt: ask.attempt, msg, hash, token: String(auth.data.token), turnId: '', phase: 'CALLING' }
         s.offers.set(rid, offer)
