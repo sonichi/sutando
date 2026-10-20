@@ -2936,6 +2936,27 @@ class LocalClaimTest(Base):
         self.assertEqual((self.results / "task-bad.txt").read_bytes(), b"interrupted\n")
         self.assertEqual(sorted(again.settled.ids), ["task-bad"])
 
+    def test_reconcile_unbound_takes_only_claims_no_generation_owns(self):
+        """reconcile_unbound is for claims answered without a call: a SETTLED claim bound to a generation (live
+        or another) is its generation's recovery to repair and compact, never this pass's, even when due."""
+        self.local_dir()
+        life = self.life()
+        old = self.clock() - self.lc.COMPACT_AFTER - 1
+        for tid, gen in (("task-live", GEN), ("task-other", {"pid": 2 ** 22 - 1, "start": "gone"})):
+            self.confirmed(life, tid, gen=gen)
+            life.claims.save(dict(life.claims.load(tid), phase=self.lc.SETTLED, settled_at=old))
+            life.claims.stage(tid, b"left for its generation\n")
+        self.task("task-free")
+        life.complete_without_call("task-free", "refused\n", "not admitted")
+        life.claims.save(dict(life.claims.load("task-free"), settled_at=old))
+        with mock.patch.object(self.lc.Lifecycle, "reconcile_settled", wraps=life.reconcile_settled) as repaired:
+            life.reconcile_unbound()
+        self.assertEqual([c.args[:1] for c in repaired.call_args_list], [("task-free",)], "only the call-less claim")
+        self.assertIsNone(life.claims.load("task-free"), "the call-less claim compacts once due")
+        for tid in ("task-live", "task-other"):
+            self.assertEqual(life.claims.load(tid)["phase"], self.lc.SETTLED, "a generation's claim is left: %s" % tid)
+            self.assertTrue((life.claims.dir(tid) / "body").is_file(), tid)
+
     def test_reconcile_settled_completes_a_settlement_whose_ledger_append_failed(self):
         """_settle saves SETTLED, then appends the id and removes the staged body; an append that fails leaves
         SETTLED without the id. reconcile_settled finishes both, idempotently; anything not SETTLED is False."""
