@@ -136,9 +136,11 @@ def isolate_os_environ(home: "Path | str | None" = None, **extra: str) -> "os._E
 
     For a module that imports the bridge or room_ops at load time, before that import."""
     global _process_home
-    if _environ_patch_active():
-        raise RuntimeError("isolate_os_environ() under a started mock.patch.dict(os.environ): stopping that "
-                           "patch would restore the outer environment; isolate before patching os.environ")
+    # A patch started after an earlier isolation saved an isolated environment: only an earlier one leaks.
+    if _process_home is None and _environ_patch_active():
+        raise RuntimeError("isolate_os_environ() under a mock.patch.dict(os.environ) started before any "
+                           "isolation: stopping that patch would restore the outer environment; "
+                           "isolate before patching os.environ")
     env = hermetic_env(home, **extra)
     # In place, not a patcher: mock.patch.stopall() would restore the outer environment.
     os.environ.clear()

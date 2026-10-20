@@ -469,6 +469,10 @@ class SelfTest(unittest.TestCase):
                 self.assertNotIn(SYNTHETIC, got.stdout)
                 self.assertNotEqual(got.returncode, 0)
                 self.assertIn("isolate before patching os.environ", got.stderr)
+        renested = (HEAD + ISOLATE + "isolate_os_environ()\nP = mock.patch.dict(os.environ)\nP.start()\n"
+                    "isolate_os_environ()\nP.stop()\n" + PRINT)
+        got = subprocess.run([sys.executable, "-c", renested], capture_output=True, text=True, env=env, timeout=60)
+        self.assertEqual((got.returncode, got.stdout.strip()), (0, ""), got.stderr)
 
     def test_each_refused_shape_really_leaks_a_parent_token_and_the_isolator_does_not(self):
         env = hermetic_env(GATEWAY_TOKEN=SYNTHETIC, PYTHONPATH=str(REPO / "packages" / "ag2-sparrow"))
