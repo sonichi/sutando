@@ -54,13 +54,12 @@ check(
 
 DELEGATION_DOC = (REPO / "docs" / "subagent-delegation.md").read_text()
 check(
-    "heavy-work delegation default reaches both runtimes",
-    all("**Heavy work goes to a SUBAGENT by default**" in f for f in (CLAUDE, AGENTS))
-    and all("never report work as delegated when nothing was spawned" in f for f in (CLAUDE, AGENTS)),
-)
-check(
     "delegation doc names each runtime's mechanism",
     "run_in_background: true" in DELEGATION_DOC and "`spawn_agent`" in DELEGATION_DOC,
+)
+check(
+    "CLAUDE.md and AGENTS.md pointers name the delegation doc",
+    all("docs/subagent-delegation.md" in f and "per-runtime mechanism" in f for f in (CLAUDE, AGENTS)),
 )
 
 # Execute the documented import setup from a nested, repo-contained script.
