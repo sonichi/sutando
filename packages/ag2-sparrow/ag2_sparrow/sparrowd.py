@@ -44,6 +44,8 @@ class _WorkerState:
     started_at: float = 0.0
     last_exit: Optional[int] = None
     state: str = "pending"  # pending | running | backoff | stopped
+    stop: threading.Event = field(default_factory=threading.Event)
+    stop_at: float = 0.0  # when this one worker was told to stop (reconcile); 0 until then
 
 
 class SingleInstance:
@@ -84,32 +86,73 @@ class Supervisor:
 
     def __init__(self, specs: List[WorkerSpec], *,
                  backoff_initial_s: float = 1.0, backoff_max_s: float = 60.0,
+                 remove_grace_s: float = 10.0,
                  sleep: Optional[Callable[[float], None]] = None,
                  clock: Callable[[], float] = time.monotonic):
         self._workers = {s.name: _WorkerState(spec=s) for s in specs}
         self._backoff_initial = backoff_initial_s
         self._backoff_max = backoff_max_s
+        self._remove_grace = remove_grace_s
         self._sleep = sleep
         self._clock = clock
         self._stop = threading.Event()
         self._lock = threading.Lock()
         self._threads: List[threading.Thread] = []
 
-    def _pause(self, seconds: float) -> None:
+    def _pause(self, ws: _WorkerState, seconds: float) -> None:
         """Backoff wait: stop-interruptible by default; an injected sleep
         (tests) is honored but stop is still checked around it."""
         if self._sleep is not None:
-            if not self._stop.is_set():
+            if not ws.stop.is_set():
                 self._sleep(seconds)
             return
-        self._stop.wait(seconds)
+        ws.stop.wait(seconds)
+
+    def _start_thread(self, ws: _WorkerState) -> None:
+        t = threading.Thread(target=self._run_worker, args=(ws,),
+                             name=f"sup:{ws.spec.name}", daemon=True)
+        t.start()
+        self._threads.append(t)
 
     def start(self) -> None:
-        for name in self._workers:
-            t = threading.Thread(target=self._run_worker, args=(name,),
-                                 name=f"sup:{name}", daemon=True)
-            t.start()
-            self._threads.append(t)
+        for ws in list(self._workers.values()):
+            self._start_thread(ws)
+
+    def reconcile(self, specs: List[WorkerSpec]) -> "tuple[list, list]":
+        """Make the supervised set equal `specs` by name: a new name is started,
+        a name no longer listed is stopped (SIGTERM, SIGKILL past the grace).
+        Returns (added names, removed names)."""
+        want = {s.name: s for s in specs}
+        with self._lock:
+            added = [self._workers.setdefault(n, _WorkerState(spec=s))
+                     for n, s in want.items() if n not in self._workers]
+            removed = [self._workers.pop(n) for n in list(self._workers) if n not in want]
+            for ws in removed:
+                ws.stop.set()
+                ws.stop_at = self._clock()
+                if ws.proc is not None and ws.proc.poll() is None:
+                    try:
+                        ws.proc.send_signal(signal.SIGTERM)
+                    except OSError:  # pragma: no cover - died between poll and signal
+                        pass
+        for ws in added:
+            _log(f"worker {ws.spec.name}: added")
+            if not self._stop.is_set():
+                self._start_thread(ws)
+        for ws in removed:
+            _log(f"worker {ws.spec.name}: removed — stopping")
+        return [ws.spec.name for ws in added], [ws.spec.name for ws in removed]
+
+    def _wait(self, ws: _WorkerState) -> int:
+        """The worker's exit code; a worker removed by reconcile that outlives
+        the grace is killed here, on its own thread."""
+        while True:
+            try:
+                return ws.proc.wait(timeout=0.5)
+            except subprocess.TimeoutExpired:
+                if ws.stop_at and self._clock() - ws.stop_at > self._remove_grace:
+                    _log(f"pid {ws.proc.pid}: did not exit in {self._remove_grace}s — SIGKILL")
+                    ws.proc.kill()
 
     def _spawn(self, ws: _WorkerState) -> None:
         ws.proc = subprocess.Popen(
@@ -119,12 +162,16 @@ class Supervisor:
         ws.state = "running"
         _log(f"worker {ws.spec.name}: started pid {ws.proc.pid}")
 
-    def _run_worker(self, name: str) -> None:
-        ws = self._workers[name]
+    def _run_worker(self, ws: _WorkerState) -> None:
+        name = ws.spec.name
         backoff = self._backoff_initial
-        while not self._stop.is_set():
+        while not ws.stop.is_set():
             spawn_err = None
             with self._lock:
+                # reconcile stops a worker under this lock: a stop set here is seen
+                # before the spawn, a spawn before the stop leaves a pid to signal.
+                if ws.stop.is_set():
+                    break
                 try:
                     self._spawn(ws)
                 except OSError as e:
@@ -133,13 +180,13 @@ class Supervisor:
                     spawn_err = e
             if spawn_err is not None:
                 _log(f"worker {name}: spawn failed ({spawn_err}) — backoff {backoff:.1f}s")
-                self._pause(backoff)
+                self._pause(ws, backoff)
                 backoff = min(backoff * 2, self._backoff_max)
                 continue
-            rc = ws.proc.wait()
+            rc = self._wait(ws)
             with self._lock:
                 ws.last_exit = rc
-                if self._stop.is_set():
+                if ws.stop.is_set():
                     ws.state = "stopped"
                     return
                 # A long-lived run earns a reset; only rapid crash loops climb.
@@ -149,7 +196,7 @@ class Supervisor:
                 ws.state = "backoff"
             _log(f"worker {name}: exited rc={rc} — restart in {backoff:.1f}s "
                  f"(restart #{ws.restarts})")
-            self._pause(backoff)
+            self._pause(ws, backoff)
             backoff = min(backoff * 2, self._backoff_max)
         with self._lock:
             ws.state = "stopped"
@@ -166,6 +213,8 @@ class Supervisor:
     def stop(self, grace_s: float = 10.0) -> None:
         self._stop.set()
         with self._lock:
+            for ws in self._workers.values():
+                ws.stop.set()
             procs = [ws.proc for ws in self._workers.values()
                      if ws.proc and ws.proc.poll() is None]
         for p in procs:
@@ -267,8 +316,12 @@ class ControlServer:
 
 
 def run(specs: List[WorkerSpec], state_dir: Path,
-        backoff_initial_s: float = 1.0) -> int:
-    """Daemon entry: lock, supervise, serve control, wait for stop signal."""
+        backoff_initial_s: float = 1.0,
+        rescan: Optional[Callable[[], List[WorkerSpec]]] = None,
+        rescan_s: float = 30.0) -> int:
+    """Daemon entry: lock, supervise, serve control, wait for stop signal.
+    With `rescan`, every `rescan_s` the supervised set is reconciled to what it
+    returns (by name): the launcher decides what exists, the shell only follows."""
     state_dir = Path(state_dir)
     inst = SingleInstance(state_dir / "sparrowd.lock")
     if not inst.acquire():
@@ -282,7 +335,13 @@ def run(specs: List[WorkerSpec], state_dir: Path,
     _log(f"starting {len(specs)} worker(s): {', '.join(s.name for s in specs)}")
     ctl.start()
     sup.start()
-    stop_evt.wait()
+    while not stop_evt.wait(rescan_s if rescan is not None else None):
+        try:
+            want = rescan()
+        except Exception as e:  # a launcher fault must not take the running workers down
+            _log(f"rescan failed ({type(e).__name__}: {e}) — keeping the current workers")
+            continue
+        sup.reconcile(want)
     _log("shutdown requested")
     sup.stop()
     ctl.close()

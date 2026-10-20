@@ -4,7 +4,14 @@
 The package shell (ag2_sparrow.sparrowd) is deliberately blind to what it
 supervises; THIS file owns the worker list and resolved paths, so the core
 never imports or locates a repo-specific loop.
+
+The agent bridges a claude-local install declares under `<workspace>/agents`
+are rescanned every `--rescan-s`: a declaration written later is picked up, a
+removed one has its worker stopped. `--agent-bridges` supervises only those, for
+a host whose gateway bridge another supervisor already runs (the launchd
+wrapper starts this mode beside the bridge).
 """
+import argparse
 import os
 import sys
 from pathlib import Path
@@ -115,7 +122,8 @@ def supervision_marker(spec) -> str:
     return Path(spec.argv[-1]).name
 
 
-def worker_specs() -> list:
+def _static_specs() -> "tuple[list, list[str]]":
+    """The workers read once, at start: the host's gateway bridge and the skill loops."""
     specs = [
         WorkerSpec(
             name="remote-gateway-bridge",
@@ -125,12 +133,46 @@ def worker_specs() -> list:
     ]
     skill_specs, skipped = _skill_worker_specs()
     specs.extend(skill_specs)
+    return specs, skipped
+
+
+def worker_specs() -> list:
+    specs, skipped = _static_specs()
     agent_specs, agent_skipped = _agent_bridge_specs()
     specs.extend(agent_specs)
     skipped.extend(agent_skipped)
     for why in skipped:
         print(f"sparrowd: not supervised — {why}", file=sys.stderr)
     return specs
+
+
+class AgentBridgeScan:
+    """The agent-bridge workers as of each pass. A reason is printed when it first
+    appears, not every pass; a declaration another process already runs (its
+    marker live outside this daemon) is skipped the same way, so a declaration
+    never runs twice. A name this scan already returned is never re-checked:
+    its live process is this daemon's own worker."""
+
+    def __init__(self, workspace=None):
+        self._workspace = workspace
+        self._reported: set = set()
+        self._supervised: set = set()
+
+    def __call__(self) -> list:
+        specs, skipped = _agent_bridge_specs(self._workspace)
+        kept = []
+        for spec in specs:
+            owned = None if spec.name in self._supervised else external_supervisor(supervision_marker(spec))
+            if owned:
+                skipped.append(f"{spec.argv[-1]}: already supervised outside sparrowd: {owned}")
+            else:
+                kept.append(spec)
+        for why in skipped:
+            if why not in self._reported:
+                print(f"sparrowd: not supervised — {why}", file=sys.stderr)
+        self._reported = set(skipped)
+        self._supervised = {spec.name for spec in kept}
+        return kept
 
 
 def external_supervisor(marker: str) -> "str | None":
@@ -153,8 +195,22 @@ def external_supervisor(marker: str) -> "str | None":
     return "; ".join(lines)
 
 
-def main() -> int:
-    for spec in worker_specs():
+def parse_args(argv=None):
+    ap = argparse.ArgumentParser(description="supervise Sparrow's resident loops")
+    ap.add_argument("--agent-bridges", action="store_true",
+                    help="supervise only the agent bridges declared under <workspace>/agents (the host's "
+                         "gateway bridge and the skill loops run elsewhere)")
+    ap.add_argument("--rescan-s", type=float, default=30.0, metavar="S",
+                    help="seconds between scans of <workspace>/agents for added or removed declarations")
+    return ap.parse_args(argv)
+
+
+def main(argv=None) -> int:
+    args = parse_args(argv)
+    static, skipped = ([], []) if args.agent_bridges else _static_specs()
+    for why in skipped:
+        print(f"sparrowd: not supervised — {why}", file=sys.stderr)
+    for spec in static:
         owned = external_supervisor(supervision_marker(spec))
         if owned:
             print(f"sparrowd: refusing to start — {spec.name} already "
@@ -162,8 +218,9 @@ def main() -> int:
                   f"supervisor (e.g. the app's gateway-keepalive) first.",
                   file=sys.stderr)
             return 2
+    scan = AgentBridgeScan()
     state_dir = resolve_workspace() / "state" / "sparrowd"
-    return run(worker_specs(), state_dir)
+    return run(static + scan(), state_dir, rescan=lambda: static + scan(), rescan_s=args.rescan_s)
 
 
 if __name__ == "__main__":  # pragma: no cover

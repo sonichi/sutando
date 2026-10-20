@@ -2063,8 +2063,8 @@ class ConnectHostSupervised(AgentRootBase):
             out = self.main("verify")[1]
         self.assertIn(f"INFO relay token: the vault key {cli.vault_key(seg)}, read by sparrowd at start", out)
         self.assertIn(f"FAIL bridge: no bridge wrote a status under {self.root}.bridge/state", out)
-        self.assertIn(f"sparrowd reads its workers only at start: restart it after install (src/sparrowd.py) so "
-                      f"it runs {self.decl()}", out)
+        self.assertIn(f"sparrowd runs {self.decl()} on its next scan of the declarations: start it if it is not "
+                      f"running (src/sparrowd.py)", out)
         self.assertNotIn("relay token:", [ln.split(" ", 1)[1][:12] for ln in out.splitlines() if ln.startswith(("PASS", "FAIL"))])
         with mock.patch.object(cm, "_run", side_effect=fake):
             rc, out, err = self.main("uninstall")

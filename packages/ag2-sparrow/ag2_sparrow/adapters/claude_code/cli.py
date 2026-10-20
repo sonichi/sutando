@@ -184,8 +184,8 @@ def bridge_fix(cfg: dict) -> str:
     if mode == UNIT:
         return f"see {cm.launcher_log(BRIDGE)}, or run {COMMAND} install again"
     if mode != EXTERNAL:
-        return (f"{mode} reads its workers only at start: restart it after install (src/sparrowd.py) so it "
-                f"runs {bridge_home(root) / DECLARATION}, with the token in the vault under {cfg.get('TOKEN_VAULT_KEY')}")
+        return (f"{mode} runs {bridge_home(root) / DECLARATION} on its next scan of the declarations: start it if it "
+                f"is not running (src/sparrowd.py), with the token in the vault under {cfg.get('TOKEN_VAULT_KEY')}")
     return (f"start the bridge with AGENT_CONNECT_TASK_DIR={root}/tasks AGENT_CONNECT_RESULT_DIR={root}/results "
             f"AGENT_CONNECT_STATE_DIR={bridge_state(cfg)}")
 
@@ -240,7 +240,7 @@ def wire_bridge(cfg: dict) -> str:
                 "module": "ag2_sparrow.remote_gateway_bridge", "env": env, "token_vault_key": cfg["TOKEN_VAULT_KEY"],
                 "token_env": "REMOTE_TASK_TOKEN"}
         cm._write(path, json.dumps(body, indent=1, sort_keys=False) + "\n", 0o644)
-        print(f"declared: {path} ({mode} runs it as worker {body['name']} once restarted; the token is read from "
+        print(f"declared: {path} ({mode} runs it as worker {body['name']} on its next scan; the token is read from "
               f"the vault: vault set {cfg['TOKEN_VAULT_KEY']} <the agent's relay token>)")
         return ""
     sup = cm.supervisor_path(BRIDGE)
