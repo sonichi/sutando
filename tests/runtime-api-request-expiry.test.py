@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
-"""Request expiry and recovery through the real CLI, daemon and Unix socket."""
-from __future__ import annotations
-
+"""Expiry journeys through the shipped daemon/CLI and private Unix sockets."""
 import json
 import os
 import signal
@@ -12,320 +10,421 @@ import tempfile
 import time
 import unittest
 from contextlib import closing
-from dataclasses import asdict
 from pathlib import Path
 
-from _helpers.hermetic_env import isolate_os_environ, isolated_child_env
-
 ROOT = Path(__file__).resolve().parents[1]
-socket_setting = os.environ.get("SUTANDO_RUNTIME_SOCKET")
-ENVIRONMENT = Path(socket_setting).parent / "environment.json" if socket_setting else None
-if ENVIRONMENT is not None and not ENVIRONMENT.is_file():
-    ENVIRONMENT = None
-isolate_os_environ()
-if ENVIRONMENT is not None:
-    os.environ.update(json.loads(ENVIRONMENT.read_text()))
-
 sys.path.insert(0, str(ROOT / "src" / "runtime-api"))
-from ha_adapter import HumanActionAdapter, ha_action_id  # noqa: E402
-from request_store import RequestStore  # noqa: E402
+from ha_adapter import DEFAULT_TTL_S, HumanActionAdapter, ha_action_id
+from hitl.projector import project
+from hitl.replies import EVENT_TYPE, REPLY_FIELD, HitlReplyHandler
+from hitl.schema import HumanRequirement, WIRE_FIELD
+from request_store import RequestStore
 
-from hitl.projector import project  # noqa: E402
-from hitl.schema import (  # noqa: E402
-    ActionReply, HumanRequirement, StaleRequirementError, WIRE_FIELD,
-)
+KINDS = ("approval", "elicitation", "human_action")
+WAITING = {"approval": "waiting_for_approval", "elicitation": "waiting_for_input",
+           "human_action": "waiting_for_human_action"}
+OWNER = "@owner:synthetic"
 
 
-class RequestExpiryJourneyTests(unittest.TestCase):
+class ExpiryJourneyTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(
-            prefix="expiry-", dir=ENVIRONMENT.parent if ENVIRONMENT else None)
+        self.env = os.environ.copy()
+        supplied_socket = self.env.get("SUTANDO_RUNTIME_SOCKET")
+        environment_file = (Path(supplied_socket).parent / "environment.json"
+                            if supplied_socket else None)
+        if environment_file and environment_file.is_file():
+            self.env.update(json.loads(environment_file.read_text()))
+            private_root = environment_file.parent
+        else:
+            private_root = None
+        self.tmp = tempfile.TemporaryDirectory(prefix="expiry-", dir=private_root)
         self.addCleanup(self.tmp.cleanup)
         self.base = Path(self.tmp.name)
         self.ws = self.base / "workspace"
-        self.env = isolated_child_env()
-        if ENVIRONMENT is not None:
-            self.env.update(json.loads(ENVIRONMENT.read_text()))
+        self.state = self.ws / "state"
+        self.state.mkdir(parents=True)
+        for name in ("tasks", "results"):
+            (self.ws / name).mkdir()
+        self.socket = self.base / "api.sock"
+        self.db = self.state / "runtime.sqlite"
+        self.ha_dir = self.state / "ha"
         self.env.update({
-            "PYTHONDONTWRITEBYTECODE": "1", "SUTANDO_TEST_MODE": "1",
-            "SUTANDO_TELEMETRY": "0", "SUTANDO_PACKAGED": "", "SUTANDO_APP_SUPPORT": "",
+            "SUTANDO_TEST_MODE": "1", "SUTANDO_TELEMETRY": "0",
+            "SUTANDO_PACKAGED": "", "SUTANDO_APP_SUPPORT": "",
             "SUTANDO_WORKSPACE": str(self.ws), "SUTANDO_WORKSPACE_DIR": str(self.ws),
             "SUTANDO_DEFAULT_WORKSPACE": str(self.ws),
-            "SUTANDO_TASKS_DIR": str(self.ws / "tasks"),
             "SUTANDO_RESULTS_DIR": str(self.ws / "results"),
-            "SUTANDO_RUNTIME_STATE": str(self.ws / "state"),
-            "SUTANDO_RUNTIME_DB": str(self.ws / "state/runtime.sqlite"),
-            "SUTANDO_HA_DIR": str(self.ws / "state/ha"),
-            "SUTANDO_RUNTIME_SOCKET": str(self.base / "api.sock"),
+            "SUTANDO_RUNTIME_STATE": str(self.state),
+            "SUTANDO_RUNTIME_SOCKET": str(self.socket),
+            "SUTANDO_RUNTIME_DB": str(self.db), "SUTANDO_HA_DIR": str(self.ha_dir),
             "SUTANDO_RUN_DIR": str(self.base / "run"),
             "SUTANDO_INSTANCE_REGISTRY": str(self.base / "registry"),
-            "SUTANDO_RUNTIME_RESOLVE_POLL": "0.05",
-            "SUTANDO_AGENT_ID": "expiry-test", "SUTANDO_HOST_LABEL": "expiry-test",
-            "SUTANDO_INSTANCE_ID": "",
+            "SUTANDO_AGENT_ID": "expiry-synthetic", "SUTANDO_HOST_LABEL": "expiry-test",
+            "SUTANDO_INSTANCE_ID": "", "CLAUDE_CONFIG_DIR": str(self.base / "claude"),
+            "PYTHONDONTWRITEBYTECODE": "1",
         })
-        diagnostic_root = ENVIRONMENT.parent if ENVIRONMENT else self.base
-        self.diagnostics = diagnostic_root / "diagnostics" / self.base.name
-        self.diagnostics.mkdir(parents=True)
-        self.ha = HumanActionAdapter(self.env["SUTANDO_HA_DIR"])
+        for key in ("SUTANDO_RUNTIME_RESOLVE_POLL", "SUTANDO_SCP_WSS_URL",
+                    "SUTANDO_SCP_WSS_TOKEN"):
+            self.env.pop(key, None)
+        self.diagnostics = ((private_root / "diagnostics") if private_root else self.base)
+        self.diagnostics.mkdir(exist_ok=True)
+        self.label = self._testMethodName + "-" + self.base.name
+        self.observations = []
+        self.addCleanup(self.save_observations)
+        self.proc = None
+        self.boot = 0
+        self.addCleanup(self.stop)
+        self.ha = HumanActionAdapter(str(self.ha_dir))
         self.manager = self.ha.manager
-        self.sent = []
-        self.daemon = None
-        self.starts = 0
-        self.addCleanup(self.stop_daemon)
-        commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, env=self.env,
-                                capture_output=True, text=True, check=True, timeout=5)
-        self.record(event="environment", supplied=str(ENVIRONMENT),
-                    base_commit=commit.stdout.strip(), checkout=str(ROOT),
-                    socket=self.env["SUTANDO_RUNTIME_SOCKET"], workspace=str(self.ws))
-        self.start_daemon()
+        self.deliveries = []
+        self.handler = HitlReplyHandler(self.manager, OWNER, workspace=self.ws,
+                                        log=lambda message: None)
+        self.start()
 
-    def record(self, **fields):
-        with (self.diagnostics / "observations.jsonl").open("a") as output:
-            output.write(json.dumps({"ts": time.time(), **fields}) + "\n")
+    def note(self, kind, **fields):
+        self.observations.append({"time": time.time(), "kind": kind, **fields})
 
-    def run_cli(self, *args, timeout=5):
-        argv = [str(ROOT / "bin/sutando"), *args]
-        result = subprocess.run(argv, cwd=ROOT, env=self.env, capture_output=True,
-                                text=True, timeout=timeout)
-        self.record(event="cli", argv=argv, returncode=result.returncode,
-                    stdout=result.stdout[-8192:], stderr=result.stderr[-8192:])
-        return result
+    def save_observations(self):
+        path = self.diagnostics / (self.label + ".json")
+        path.write_text(json.dumps(self.observations, indent=2))
+        print("observations:", path, flush=True)
 
     def cli(self, *args):
-        result = self.run_cli(*args)
+        argv = ["bash", str(ROOT / "bin" / "sutando"), *map(str, args)]
+        result = subprocess.run(argv, cwd=ROOT, env=self.env, text=True,
+                                capture_output=True, timeout=10)
+        self.note("cli", argv=argv, exit=result.returncode,
+                  stdout=result.stdout, stderr=result.stderr)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         return json.loads(result.stdout)
 
-    def start_daemon(self):
-        self.starts += 1
-        self.log_path = self.diagnostics / f"daemon-{self.starts}.log"
+    def start(self):
+        self.boot += 1
+        log = self.diagnostics / f"{self.label}-server-{self.boot}.log"
+        self.server_log = log
         argv = [sys.executable, str(ROOT / "src/runtime-api/server.py")]
-        with self.log_path.open("w") as log:
-            self.daemon = subprocess.Popen(argv, cwd=ROOT, env=self.env,
-                                           stdout=log, stderr=subprocess.STDOUT)
-        self.record(event="start", argv=argv, pid=self.daemon.pid)
-        deadline = time.monotonic() + 10
-        while time.monotonic() < deadline:
-            if self.daemon.poll() is not None:
-                self.fail(f"daemon exited: {self.log_path.read_text()}")
-            if Path(self.env["SUTANDO_RUNTIME_SOCKET"]).exists():
-                result = self.run_cli("runtime", "health", timeout=2)
-                if result.returncode == 0:
-                    self.record(event="ready", pid=self.daemon.pid,
-                                response=json.loads(result.stdout))
-                    return
-            time.sleep(0.05)
-        self.fail(f"readiness timed out: {self.log_path.read_text()}")
-
-    def stop_daemon(self):
-        if self.daemon is None:
-            return
-        daemon, self.daemon = self.daemon, None
-        if daemon.poll() is None:
-            daemon.terminate()
-        forced = False
-        try:
-            daemon.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            forced = True
-            daemon.kill()
-            daemon.wait(timeout=5)
-        self.record(event="reaped", pid=daemon.pid, returncode=daemon.returncode,
-                    forced_kill=forced)
-        self.log_path.write_bytes(self.log_path.read_bytes()[-16384:])
-        self.assertEqual(daemon.returncode, -signal.SIGKILL if forced else 0,
-                         self.log_path.read_text())
-
-    def row(self, rid):
-        # Read-only SQL cannot trigger RequestStore.get's lazy expiry.
-        with closing(sqlite3.connect(
-                f"file:{self.env['SUTANDO_RUNTIME_DB']}?mode=ro", uri=True)) as db:
-            db.row_factory = sqlite3.Row
-            return dict(db.execute("SELECT * FROM runtime_requests WHERE request_id = ?",
-                                   (rid,)).fetchone())
-
-    def mirror(self, rid):
-        return asdict(self.manager.get(ha_action_id(rid)))
-
-    def snapshot(self, rids):
-        return {rid: {"row": self.row(rid), "mirror": self.mirror(rid),
-                      "projection": self.manager.store.projection(ha_action_id(rid))}
-                for rid in rids}
-
-    def eventually(self, predicate, timeout=8):
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            if predicate():
+        started = time.monotonic()
+        with log.open("w") as output:
+            self.proc = subprocess.Popen(argv, cwd=ROOT, env=self.env,
+                                         stdout=output, stderr=subprocess.STDOUT)
+        self.note("start", argv=argv, pid=self.proc.pid, log=str(log))
+        while time.monotonic() - started < 5:
+            self.assertIsNone(self.proc.poll(), log.read_text())
+            if self.socket.exists() and "listening on" in log.read_text():
+                response = self.cli("request", "list")
+                self.note("ready", pid=self.proc.pid, response=response,
+                          elapsed=time.monotonic() - started)
                 return
             time.sleep(0.05)
-        self.fail("persisted lifecycle did not converge before the deadline")
+        self.fail("daemon readiness timed out: " + log.read_text())
 
-    def issue(self, kind, *, ttl=4, task_id=None):
-        args = ({"approval": ["approval", "request", "--action", "synthetic approval"],
-                 "elicitation": ["elicitation", "request", "--question", "Choose A or B",
-                                 "--options", '["A", "B"]'],
-                 "human_action": ["human-action", "request", "--action", "synthetic action"]}
-                [kind])
-        args += ["--expires-in", str(ttl)]
-        if task_id:
-            args += ["--task-id", task_id]
-        result = self.cli(*args)
-        self.assertEqual(result["status"], "pending")
-        return result["requestId"]
+    def stop(self):
+        if self.proc is None:
+            return
+        process, self.proc = self.proc, None
+        # SIGINT lets asyncio cancel tasks without interrupting a dequeued callback.
+        process.send_signal(signal.SIGINT)
+        try:
+            code = process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
+            self.fail("daemon needed forced termination")
+        self.note("reaped", pid=process.pid, exit=code)
+        self.assertEqual(code, 0)
+
+    def raw(self, rid):
+        with closing(sqlite3.connect(self.db)) as conn:
+            conn.row_factory = sqlite3.Row
+            return dict(conn.execute("SELECT * FROM runtime_requests WHERE request_id = ?",
+                                     (rid,)).fetchone())
+
+    def issue(self, kind, expires=None):
+        tid = self.cli("task", "submit", "Synthetic local " + kind)["taskId"]
+        args = [kind.replace("_", "-"), "request", "--task-id", tid]
+        if kind == "elicitation":
+            args += ["--question", "Choose a local option", "--type", "single_select",
+                     "--options", '["Alpha", "Beta"]']
+        else:
+            args += ["--action", "Synthetic local action"]
+        if expires is not None:
+            args += ["--expires-in", str(expires)]
+        row = self.cli(*args)
+        rid = row["requestId"]
+        self.assertEqual(row["status"], "pending")
+        self.assertEqual(self.cli("task", "status", tid)["state"], WAITING[kind])
+        req = self.manager.get(ha_action_id(rid))
+        self.assertEqual(req.subject["runtime_request_id"], rid)
+        return {"rid": rid, "tid": tid, "req": req, "row": self.raw(rid)}
 
     def send(self, payload):
-        self.sent.append(payload)
-        self.record(event="projection", payload=payload)
-        return {"ok": True, "event_id": f"$synthetic-{len(self.sent)}"}
+        self.deliveries.append(payload)
+        self.note("synthetic-delivery", payload=payload)
+        return {"ok": True, "event_id": "$synthetic-" + str(len(self.deliveries))}
 
     def project(self):
-        return project(self.manager, self.send, "!synthetic:test")
+        return project(self.manager, self.send, "!local:synthetic")
 
-    def expire_journey(self, mode):
-        task_id = self.cli("task", "submit", "Synthetic expiry task")["taskId"]
-        rids = [self.issue(kind, task_id=task_id if kind == "elicitation" else None)
-                for kind in ("approval", "elicitation", "human_action")]
-        choice = rids[1]
-        unrelated = self.manager.create(HumanRequirement(
-            kind="choice", runtime="unrelated", message="Unrelated", expires_at=1))
-        other = HumanActionAdapter(str(self.base / "other-workspace/state/ha"))
-        other.open_elicitation({"requestId": choice, "expiresAt": 1,
-                               "params": {"question": "Other workspace"}})
-        other_before = {p.name: p.read_bytes() for p in other.manager.store.root.iterdir()}
-        unrelated_before = asdict(unrelated)
+    def reply(self, req, actor=OWNER, revision=None, action=None):
+        event = {"type": EVENT_TYPE, "event_id": "$synthetic-click",
+                 "actor_id": actor, "content": {REPLY_FIELD: {
+                     "hitl_id": req.id,
+                     "expected_revision": req.revision if revision is None else revision,
+                     "guard": req.guard, "action_id": action or req.actions[0].id}}}
+        self.handler.offer(event)
+        self.note("synthetic-reply", event=event, outcome=self.handler.last_outcome,
+                  reason=self.handler.last_reason)
+        return self.handler.last_outcome
+
+    def wait_expired(self, records, limit=None):
+        remaining = list(records)
+        while remaining:
+            for record in remaining[:]:
+                rid = record["rid"]
+                row, req = self.raw(rid), self.manager.get(record["req"].id)
+                bound = limit or record["row"]["expires_at"] + 6
+                if row["status"] == req.status == "expired":
+                    self.assertLessEqual(time.time(), bound, rid)
+                    self.note("expired", request=row, requirement=req.to_wire(),
+                              seconds_after_deadline=time.time() - row["expires_at"])
+                    remaining.remove(record)
+                elif time.time() > bound:
+                    self.fail(f"expiry did not reconcile: {rid}: {row['status']}/{req.status}")
+            if remaining:
+                time.sleep(0.05)
+
+    def assert_expired_projection(self, records, ledgers):
+        for record in records:
+            rid, before = record["rid"], record["req"]
+            row, req = self.raw(rid), self.manager.get(before.id)
+            self.assertEqual(req.revision, before.revision + 1)
+            for field in ("id", "subject", "guard", "expires_at", "answer", "chosen_action"):
+                self.assertEqual(getattr(req, field), getattr(before, field))
+            for field, value in record["row"].items():
+                if field not in ("status", "resolved_at"):
+                    self.assertEqual(row[field], value, field)
+            self.assertEqual(self.manager.store.projection(req.id), ledgers[req.id])
+            self.assertNotIn(req.id, {r.id for r in self.manager.active()})
+            status = self.cli("task", "status", record["tid"])
+            self.assertEqual(status["state"], "pending")
+            self.assertNotIn("waitingOn", status)
+            response = self.cli("request", "get", rid)
+            self.assertEqual(response, {"requestId": rid, "status": "expired"})
+            self.assertEqual(self.cli("request", "wait", rid, "--timeout", "0.1"),
+                             response)
+            self.assertEqual(self.reply(before), "rejected")
+            self.assertEqual(self.reply(req), "rejected")
+            self.assertIn("expired", self.handler.last_reason)
+            self.assertEqual(self.raw(rid), row)
+            self.assertEqual(self.manager.get(req.id), req)
+        start = len(self.deliveries)
         self.project()
-        before = self.snapshot(rids)
-        self.assertEqual(self.cli("task", "status", task_id)["state"], "waiting_for_input")
-        for rid in rids:
-            self.assertEqual(before[rid]["row"]["status"], "pending")
-            self.assertEqual(before[rid]["mirror"]["status"], "pending")
-            self.assertEqual(before[rid]["mirror"]["expires_at"], before[rid]["row"]["expires_at"])
-            self.assertEqual(before[rid]["mirror"]["id"], ha_action_id(rid))
-            self.assertEqual(before[rid]["mirror"]["guard"], f"runtime:{rid}")
-            self.assertTrue(before[rid]["projection"]["event_id"])
-        expired_rows = None
-        if mode != "running":
-            self.stop_daemon()
-            self.eventually(lambda: time.time() > max(self.row(r)["expires_at"] for r in rids))
-            for rid in rids:
-                self.assertEqual(self.row(rid)["status"], "pending")
-            if mode == "already-expired":
-                store = RequestStore(self.env["SUTANDO_RUNTIME_DB"])
-                try:
-                    for rid in rids:
-                        self.assertEqual(store.get(rid)["status"], "expired")
-                finally:
-                    store.close()
-                expired_rows = {rid: self.row(rid) for rid in rids}
-            for rid in rids:
-                self.assertEqual(self.mirror(rid), before[rid]["mirror"])
-            self.record(event="stopped-state", mode=mode, records=self.snapshot(rids))
-            self.start_daemon()
-        self.eventually(lambda: all(self.row(r)["status"] == "expired"
-                                   and self.mirror(r)["status"] == "expired" for r in rids))
-        if expired_rows is not None:
-            self.assertEqual({rid: self.row(rid) for rid in rids}, expired_rows)
-        for rid in rids:
-            old, current = before[rid], self.snapshot([rid])[rid]
-            self.assertEqual(current["mirror"]["revision"], old["mirror"]["revision"] + 1)
-            for key in old["mirror"].keys() - {"status", "revision", "updated_at"}:
-                self.assertEqual(current["mirror"][key], old["mirror"][key], key)
-            for key in old["row"].keys() - {"status", "resolved_at"}:
-                self.assertEqual(current["row"][key], old["row"][key], key)
-            self.assertEqual(current["projection"], old["projection"])
-        active = {r.id for r in self.manager.active()}
-        self.assertTrue(active.isdisjoint(map(ha_action_id, rids)))
-        self.assertEqual(self.cli("task", "status", task_id)["state"], "pending")
-        self.project()
-        for rid in rids:
-            cards = [p for p in self.sent if p["extra_content"].get(WIRE_FIELD, {}).get("id")
-                     == ha_action_id(rid)]
-            self.assertEqual(len(cards), 2, cards)
-            self.assertEqual(cards[0]["op"], "message")
-            self.assertEqual(cards[1]["op"], "edit")
-            self.assertEqual(cards[1]["event_id"], before[rid]["projection"]["event_id"])
-            self.assertEqual(cards[1]["extra_content"][WIRE_FIELD]["status"], "expired")
-            self.assertIn("Expired", cards[1]["body"])
-        settled = self.snapshot(rids)
-        for revision in (before[choice]["mirror"]["revision"], self.mirror(choice)["revision"]):
-            with self.assertRaises(StaleRequirementError):
-                self.manager.apply_action(ActionReply(ha_action_id(choice), revision,
-                                                       "opt1", f"runtime:{choice}"))
-        for _ in range(2):
-            time.sleep(0.15)
-            self.stop_daemon()
-            self.start_daemon()
-            for rid in rids:
-                expected = {"requestId": rid, "status": "expired"}
-                self.assertEqual(self.cli("request", "get", rid), expected)
-                self.assertEqual(self.cli("request", "wait", rid, "--timeout", "0.1"), expected)
-            self.assertEqual(self.project(), [])
-            self.assertEqual(self.snapshot(rids), settled)
-        self.assertEqual(asdict(self.manager.get(unrelated.id)), unrelated_before)
-        self.assertEqual({p.name: p.read_bytes() for p in other.manager.store.root.iterdir()}, other_before)
-        self.record(event="converged", mode=mode, records=settled,
-                    unrelated_preserved=True, other_workspace_preserved=True)
-
-    def test_expiry_during_normal_resolution(self):
-        self.expire_journey("running")
-
-    def test_expiry_while_stopped(self):
-        self.expire_journey("stopped")
-
-    def test_restart_with_already_expired_rows_and_pending_mirrors(self):
-        self.expire_journey("already-expired")
-
-    def test_terminal_answers_and_post_restart_choice_completion(self):
-        outcomes = {}
-        for kind, answer, expected in (("elicitation", 1, "resolved"),
-                                      ("approval", 1, "approved"),
-                                      ("approval", 2, "denied"),
-                                      ("human_action", 1, "completed")):
-            rid = self.issue(kind, ttl=6)
-            self.ha.resolve(ha_action_id(rid), {"1": [answer]}, "synthetic-owner")
-            self.eventually(lambda: self.row(rid)["status"] == expected)
-            result = {"requestId": rid, "status": expected, "resolvedBy": "synthetic-owner"}
-            if kind == "elicitation":
-                result["result"] = {"answer": "A"}
-            self.assertEqual(self.cli("request", "get", rid), result)
-            outcomes[rid] = result
-        cancelled = self.issue("elicitation", ttl=6)
-        outcomes[cancelled] = self.cli("request", "cancel", cancelled)
-        self.assertEqual(outcomes[cancelled]["status"], "cancelled")
-        self.project()
-        before = self.snapshot(outcomes)
-        task_id = self.cli("task", "submit", "Synthetic restart choice")["taskId"]
-        live = self.issue("elicitation", ttl=120, task_id=task_id)
-        pending = {"requestId": live, "status": "pending"}
-        self.assertEqual(self.cli("request", "get", live), pending)
-        self.assertEqual(self.cli("request", "wait", live, "--timeout", "0.05"),
-                         {**pending, "timedOut": True})
-        self.assertEqual(self.cli("task", "status", task_id)["state"], "waiting_for_input")
-        self.eventually(lambda: time.time() > max(self.row(r)["expires_at"] for r in outcomes))
-        self.stop_daemon()
-        self.start_daemon()
-        self.assertEqual(self.snapshot(outcomes), before)
-        self.assertEqual(self.mirror(cancelled)["status"], "pending")
-        for rid, expected in outcomes.items():
-            self.assertEqual(self.cli("request", "get", rid), expected)
-            self.assertEqual(self.cli("request", "wait", rid, "--timeout", "0.1"), expected)
-        self.assertEqual(self.cli("request", "get", live), pending)
-        self.assertEqual(self.mirror(live)["status"], "pending")
-        self.assertEqual(self.cli("task", "status", task_id)["state"], "waiting_for_input")
-        self.ha.resolve(ha_action_id(live), {"1": [2]}, "synthetic-owner")
-        self.eventually(lambda: self.row(live)["status"] == "resolved")
-        answer = {"requestId": live, "status": "resolved", "result": {"answer": "B"},
-                  "resolvedBy": "synthetic-owner"}
-        self.assertEqual(self.cli("request", "wait", live, "--timeout", "1"), answer)
-        self.assertEqual(self.cli("task", "status", task_id)["state"], "pending")
-        self.project()
-        settled = self.snapshot([*outcomes, live])
-        self.stop_daemon()
-        self.start_daemon()
-        self.assertEqual(self.cli("request", "get", live), answer)
+        edits = self.deliveries[start:]
+        self.assertEqual(len(edits), len(records))
+        for edit in edits:
+            wire = edit["extra_content"][WIRE_FIELD]
+            self.assertEqual(edit["op"], "edit")
+            self.assertEqual(wire["status"], "expired")
+            self.assertEqual(edit["event_id"], ledgers[wire["id"]]["event_id"])
+            ledger = self.manager.store.projection(wire["id"])
+            self.assertEqual(ledger, {**ledgers[wire["id"]], "revision": wire["revision"]})
         self.assertEqual(self.project(), [])
-        self.assertEqual(self.snapshot([*outcomes, live]), settled)
-        self.record(event="negative-controls", records=settled)
+        self.assertEqual(self.project(), [])
+        self.assertEqual(len(self.deliveries), start + len(records))
+
+    def snapshots(self, records):
+        return [(self.raw(r["rid"]), self.manager.get(r["req"].id),
+                 self.manager.store.projection(r["req"].id)) for r in records]
+
+    def assert_stable_after_restart(self, records):
+        before = self.snapshots(records)
+        self.stop()
+        self.start()
+        # The daemon uses its ordinary two-second resolver cadence.
+        time.sleep(4.1)
+        for record in records:
+            response = self.cli("request", "get", record["rid"])
+            self.assertEqual(self.cli("request", "wait", record["rid"], "--timeout", "0.1"),
+                             response)
+        self.assertEqual(self.snapshots(records), before)
+        delivered = len(self.deliveries)
+        self.assertEqual(self.project(), [])
+        self.assertEqual(self.project(), [])
+        self.assertEqual(len(self.deliveries), delivered)
+        self.note("stable-after-restart", requests=[r["rid"] for r in records])
+
+    def test_periodic_expiry_projection_and_negative_controls(self):
+        indefinite = [self.issue(kind) for kind in KINDS]
+        unrelated = [self.issue(kind, 3600) for kind in KINDS]
+        choice = next(r for r in unrelated if r["row"]["request_type"] == "elicitation")
+        self.assertEqual(self.cli("request", "wait", choice["rid"], "--timeout", "0.1"),
+                         {"requestId": choice["rid"], "status": "pending", "timedOut": True})
+        self.assertEqual(self.raw(choice["rid"]), choice["row"])
+        foreign = self.manager.create(HumanRequirement(
+            kind="choice", runtime="synthetic-other", message="Unrelated local requirement",
+            guard="foreign", expires_at=time.time() - 1))
+        resolved = [self.issue(kind, 30) for kind in KINDS]
+        for record in resolved:
+            req = record["req"]
+            self.assertEqual(self.reply(req, actor="@other:synthetic"), "ignored")
+            self.assertEqual(self.reply(req, revision=req.revision - 1), "rejected")
+            self.assertEqual(self.manager.get(req.id), req)
+            self.assertEqual(self.raw(record["rid"]), record["row"])
+            self.assertEqual(self.reply(req, action=req.actions[-1].id), "applied")
+            answer = self.cli("request", "wait", record["rid"], "--timeout", "4")
+            kind = record["row"]["request_type"]
+            self.assertEqual(answer["status"], {"approval": "denied", "elicitation": "resolved",
+                                                "human_action": "declined"}[kind])
+            if kind == "elicitation":
+                self.assertEqual(answer["result"], {"answer": "Beta"})
+            record["terminal_row"] = self.raw(record["rid"])
+            record["terminal_req"] = self.manager.get(req.id)
+        completed = self.issue("human_action", 30)
+        self.assertEqual(self.reply(completed["req"], action="done"), "applied")
+        self.assertEqual(self.cli("request", "wait", completed["rid"], "--timeout", "4")["status"],
+                         "completed")
+        cancelled = self.issue("elicitation", 30)
+        self.assertEqual(self.cli("request", "cancel", cancelled["rid"])["status"], "cancelled")
+        for record in (completed, cancelled):
+            record["terminal_row"] = self.raw(record["rid"])
+            record["terminal_req"] = self.manager.get(record["req"].id)
+        resolved += [completed, cancelled]
+        expiring = [self.issue(kind, 15) for kind in KINDS]
+        self.project()
+        terminal_snapshots = self.snapshots(resolved)
+        foreign_ledger = self.manager.store.projection(foreign.id)
+        ledgers = {r["req"].id: self.manager.store.projection(r["req"].id)
+                   for r in expiring}
+        for record in expiring:
+            creates = [p for p in self.deliveries
+                       if p.get("extra_content", {}).get(WIRE_FIELD, {}).get("id") == record["req"].id]
+            self.assertEqual(len(creates), 1)
+            self.assertEqual(creates[0]["op"], "message")
+            self.assertEqual(creates[0]["extra_content"][WIRE_FIELD]["status"], "pending")
+        result_file = self.ws / "results" / "task-synthetic-existing.txt"
+        result_file.write_text("Synthetic result payload\n")
+        payloads = {p: p.read_bytes() for folder in ("tasks", "results")
+                    for p in (self.ws / folder).glob("*.txt")}
+        other = self.base / "other-workspace"
+        other_store = RequestStore(str(other / "state" / "runtime.sqlite"))
+        other_ha = HumanActionAdapter(str(other / "state" / "ha"))
+        other_row = other_store.create("approval", "approval.request", "other", {}, expires_in_s=3600)
+        other_aid = other_ha.open_approval(other_row)
+        other_ha.manager.record_projection(other_aid, 1, "$other-original")
+        other_store.close()
+        other_bytes = {p: p.read_bytes() for p in other.rglob("*") if p.is_file()}
+        self.wait_expired(expiring)
+        self.assert_expired_projection(expiring, ledgers)
+        deadline = max(r["row"]["expires_at"] for r in resolved)
+        while time.time() <= deadline:
+            time.sleep(0.05)
+        self.assert_stable_after_restart(expiring + resolved)
+        for record in indefinite + unrelated:
+            self.assertEqual(self.raw(record["rid"]), record["row"])
+            self.assertEqual(self.manager.get(record["req"].id), record["req"])
+        for record in indefinite:
+            self.assertIsNone(record["row"]["expires_at"])
+            self.assertAlmostEqual(record["req"].expires_at - record["row"]["created_at"],
+                                   DEFAULT_TTL_S, delta=1)
+        for record in resolved:
+            self.assertEqual(self.raw(record["rid"]), record["terminal_row"])
+            self.assertEqual(self.manager.get(record["req"].id), record["terminal_req"])
+            result = self.cli("request", "get", record["rid"])
+            if record["terminal_row"]["status"] == "resolved":
+                self.assertEqual(result["result"], {"answer": "Beta"})
+            self.assertEqual(self.cli("task", "status", record["tid"])["state"], "pending")
+        self.assertEqual(self.snapshots(resolved), terminal_snapshots)
+        self.assertEqual(self.manager.get(foreign.id), foreign)
+        self.assertEqual(self.manager.store.projection(foreign.id), foreign_ledger)
+        self.assertIn(foreign.id, {r.id for r in self.manager.active()})
+        self.assertEqual(self.cli("task", "status", choice["tid"])["state"],
+                         "waiting_for_input")
+        self.assertLess(time.time(), choice["row"]["expires_at"])
+        self.assertEqual(self.reply(choice["req"], action="opt2"), "applied")
+        answer = self.cli("request", "wait", choice["rid"], "--timeout", "4")
+        self.assertEqual(answer["status"], "resolved")
+        self.assertEqual(answer["result"], {"answer": "Beta"})
+        self.assertEqual(self.cli("request", "get", choice["rid"]), answer)
+        self.assertEqual(self.manager.get(choice["req"].id).chosen_action, "opt2")
+        self.assertEqual(self.manager.get(choice["req"].id).status, "resolved")
+        status = self.cli("task", "status", choice["tid"])
+        self.assertEqual(status["state"], "pending")
+        self.assertNotIn("waitingOn", status)
+        self.assertEqual(payloads, {p: p.read_bytes() for p in payloads})
+        self.assertEqual(other_bytes, {p: p.read_bytes() for p in other.rglob("*") if p.is_file()})
+
+    def test_restart_recovers_downtime_and_already_expired_rows(self):
+        downtime = [self.issue(kind, 30) for kind in KINDS]
+        already_expired = [self.issue(kind, 30) for kind in KINDS]
+        records = downtime + already_expired
+        self.project()
+        ledgers = {r["req"].id: self.manager.store.projection(r["req"].id) for r in records}
+        self.stop()
+        margin = min(r["row"]["expires_at"] for r in records) - time.time()
+        self.note("offline-before-expiry", margin_seconds=margin)
+        self.assertGreater(margin, 2, "fixture setup must finish before the first deadline")
+        for record in records:
+            self.assertEqual(self.raw(record["rid"])["status"], "pending")
+            self.assertEqual(self.manager.get(record["req"].id), record["req"])
+        deadline = max(r["row"]["expires_at"] for r in records)
+        while time.time() <= deadline:
+            time.sleep(0.05)
+        store = RequestStore(str(self.db))
+        try:
+            for record in already_expired:
+                self.assertEqual(store.get(record["rid"])["status"], "expired")
+                record["expired_row"] = self.raw(record["rid"])
+        finally:
+            store.close()
+        for record in downtime:
+            self.assertEqual(self.raw(record["rid"])["status"], "pending")
+        for record in records:
+            self.assertEqual(self.manager.get(record["req"].id).status, "pending")
+        bound = time.time() + 6
+        self.start()
+        self.wait_expired(records, limit=bound)
+        for record in already_expired:
+            self.assertEqual(self.raw(record["rid"]), record["expired_row"])
+        self.assert_expired_projection(records, ledgers)
+        self.assert_stable_after_restart(records)
+
+    def test_mirror_write_failure_retries_across_restart(self):
+        record = self.issue("elicitation", 5)
+        rid, req = record["rid"], record["req"]
+        self.project()
+        ledger = self.manager.store.projection(req.id)
+        mode = self.ha_dir.stat().st_mode & 0o777
+        self.ha_dir.chmod(mode & ~0o222)
+        try:
+            bound = record["row"]["expires_at"] + 8
+            failure = f"requirement expiry error for {rid} (isolated)"
+            while failure not in self.server_log.read_text():
+                self.assertIsNone(self.proc.poll(), self.server_log.read_text())
+                self.assertLess(time.time(), bound, self.server_log.read_text())
+                time.sleep(0.05)
+            log = self.server_log.read_text()
+            self.assertIn("Permission denied", log)
+            self.assertIn(".tmp-", log)
+            expired_row = self.raw(rid)
+            self.assertEqual(expired_row["status"], "expired")
+            self.assertEqual(self.manager.get(req.id), req)
+            self.assertEqual(self.manager.store.projection(req.id), ledger)
+            self.assertIn(req.id, {r.id for r in self.manager.active()})
+            self.note("mirror-write-failure", request=expired_row, requirement=req.to_wire(),
+                      log=log)
+            self.stop()
+            self.start()
+            self.assertIn(failure, self.server_log.read_text())
+            self.assertIn("Permission denied", self.server_log.read_text())
+            self.assertEqual(self.raw(rid), expired_row)
+            self.assertEqual(self.manager.get(req.id), req)
+            self.assertEqual(self.manager.store.projection(req.id), ledger)
+        finally:
+            self.ha_dir.chmod(mode)
+        self.wait_expired([record], limit=time.time() + 6)
+        self.assertEqual(self.raw(rid), expired_row)
+        self.assert_expired_projection([record], {req.id: ledger})
+        self.assert_stable_after_restart([record])
 
 
 if __name__ == "__main__":

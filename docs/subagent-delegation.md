@@ -5,7 +5,12 @@ Extends the CLAUDE.md rule that "at background" / "in parallel" means SPAWN A SU
 
 - The owner is actively engaging or the task queue is busy, and an independent workstream can
   proceed without making the main lane unresponsive. During active engagement this covers
-  owner-requested work only — do not launch autonomous menu work under it.
+  owner-requested work only — do not launch autonomous menu work under it. For voice tasks the
+  relay makes this call before the task reaches you and writes it in the header: `lane: long`
+  (building, writing, research, a picture to generate, many steps) → spawn the subagent as soon as
+  you read the task and let it write the result file; `lane: quick` (one lookup, command, count,
+  message, file sent) → do it inline, now, before anything else. A header without a lane counts as long when the queue is
+  busy. One long Write run inline held three quick tasks for five minutes.
 - A task splits into two or more independent workstreams where parallelism materially cuts latency.
 - Mechanical, long-running, or context-heavy work would consume the main session's context:
   repository scans, evidence collection, test monitoring, transcript summarization, bounded research.

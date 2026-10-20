@@ -58,16 +58,18 @@ describe('relay agent subagent: the work call returns its task\'s result', () =>
 		assert.equal(relay.isWaiting('task-3'), false);
 	});
 
-	it('a queue position or an offline core is said at submission; the ordinary case says nothing extra', async () => {
+	it('a queue position or an offline core is said at submission; the ordinary case gets the plain acknowledgement', async () => {
 		const ahead = agent(pending('task-4', { queuedAhead: 2, message: 'Got it, 2 in line.' }));
 		void ahead.relay.invoke('w', {}).catch(() => {});
 		await tick(0);
-		assert.deepEqual(ahead.notices.length, 1);
+		assert.deepEqual(ahead.notices.length, 1, 'the queue position instead of the plain acknowledgement');
 		assert.match(ahead.notices[0], /Got it, 2 in line\./);
 		const plain = agent(pending('task-5'));
 		void plain.relay.invoke('w', {}).catch(() => {});
 		await tick(0);
-		assert.equal(plain.notices.length, 0);
+		// gemini-3.8-live stays silent while a NON_BLOCKING call is open: the acknowledgement is a notice of its own.
+		assert.equal(plain.notices.length, 1);
+		assert.match(plain.notices[0], /Tell the user in one short sentence that you are on it/);
 	});
 
 	it('an aborted call ends without a failure (bodhi would read a rejection out as one); the result goes another way', async () => {
@@ -152,7 +154,7 @@ describe('relay agent: a text model checks a request before it is submitted', ()
 		assert.deepEqual(submitted, [], 'nothing submitted');
 		assert.match(out, /Nothing was submitted/);
 		assert.match(out, /Ask the user now, in their language, exactly: "你说的是哪个 PR？"/);
-		assert.deepEqual(seen, [{ task: '查一下PR的状态', recentConversation: 'user: 帮我查一下那个 PR 的状态', openTasks: [] }], 'the check reads the request, the recent words and the open tasks');
+		assert.deepEqual(seen, [{ task: '查一下PR的状态', recentConversation: 'user: 帮我查一下那个 PR 的状态', openTasks: [], answeredTasks: [] }], 'the check reads the request, the recent words, the open and the answered tasks');
 		assert.ok(logs.some((l) => l.includes('not submitted, asking the user: 你说的是哪个 PR？')));
 	});
 
@@ -175,6 +177,9 @@ describe('relay agent: a text model checks a request before it is submitted', ()
 		assert.deepEqual(parseWorkCheck('{"action":"ask","question":"Which PR?"}'), { action: 'ask', question: 'Which PR?' });
 		assert.deepEqual(parseWorkCheck('```json\n{"action": "ask", "question": "哪个文件？"}\n```'), { action: 'ask', question: '哪个文件？' });
 		assert.deepEqual(parseWorkCheck('{"action":"submit"}'), { action: 'submit' });
+		assert.deepEqual(parseWorkCheck('{"action":"submit","lane":"quick"}'), { action: 'submit', lane: 'quick' });
+		assert.deepEqual(parseWorkCheck('{"action":"submit","lane":"long"}'), { action: 'submit', lane: 'long' });
+		assert.deepEqual(parseWorkCheck('{"action":"submit","lane":"fast"}'), { action: 'submit' }, 'an unknown lane is no lane');
 		assert.deepEqual(parseWorkCheck('{"action":"ask"}'), { action: 'submit' }, 'an ask with no question is not an ask');
 		assert.deepEqual(parseWorkCheck('sure, go ahead'), { action: 'submit' });
 	});
@@ -227,6 +232,37 @@ describe('the Gemini check call: every failure lets the request through', () => 
 		assert.equal(called, false, 'no key, no call');
 	});
 
+	it('the rules go in as the system instruction and the turn as the user message', async () => {
+		const { checkRequestBody, workCheckPrompt, turnClassifierPrompt } = await import('../src/work-request-check.js');
+		for (const prompt of [workCheckPrompt(input), turnClassifierPrompt({ utterance: 'u', recentConversation: 'user: u', openTasks: [] }, ['- none: a rule.'])]) {
+			const body = checkRequestBody(prompt) as { systemInstruction: { parts: Array<{ text: string }> }; contents: Array<{ role: string; parts: Array<{ text: string }> }> };
+			assert.doesNotMatch(body.systemInstruction.parts[0].text, /^Recent words/m);
+			assert.match(body.contents[0].parts[0].text, /^Recent words \(oldest first\):/);
+			assert.equal(body.contents[0].role, 'user');
+			assert.equal(body.systemInstruction.parts[0].text + '\n' + body.contents[0].parts[0].text, prompt, 'nothing is lost in the split');
+		}
+	});
+
+	it('a prompt Gemini\'s filter blocks is said as blocked; the turn check asks again without the surface rules', async () => {
+		const { createGeminiWorkCheck, createGeminiTurnClassifier } = await import('../src/work-request-check.js');
+		const bodies: string[] = [];
+		globalThis.fetch = (async (_u: unknown, init?: RequestInit) => {
+			const body = String(init?.body);
+			bodies.push(body);
+			return body.includes('- none: a rule.')
+				? new Response(JSON.stringify({ promptFeedback: { blockReason: 'PROHIBITED_CONTENT' } }))
+				: new Response(JSON.stringify({ candidates: [{ content: { parts: [{ text: '{"action":"none"}' }] } }] }));
+		}) as typeof fetch;
+		const logs: string[] = [];
+		assert.deepEqual(await createGeminiTurnClassifier({ apiKey: () => 'k', log: (m) => logs.push(m), extraRules: ['- none: a rule.'] })({ utterance: 'u', recentConversation: 'user: u', openTasks: [] }), { action: 'none' });
+		assert.equal(bodies.length, 2, 'one retry without the rules');
+		assert.ok(logs.some((l) => l.includes("turn check gave no answer (blocked by Gemini's prompt filter: PROHIBITED_CONTENT)")), logs.join('\n'));
+		globalThis.fetch = (async () => new Response(JSON.stringify({ promptFeedback: { blockReason: 'PROHIBITED_CONTENT' } }))) as typeof fetch;
+		logs.length = 0;
+		assert.deepEqual(await createGeminiWorkCheck({ apiKey: () => 'k', log: (m) => logs.push(m) })(input), { action: 'submit' });
+		assert.ok(logs.some((l) => l.includes('work check gave no answer (blocked')), logs.join('\n'));
+	});
+
 	it('a real answer is read, and the key goes in a header, never the URL', async () => {
 		const { createGeminiWorkCheck } = await import('../src/work-request-check.js');
 		let url = ''; let key = '';
@@ -253,6 +289,28 @@ describe('relay agent: review of #5348, should-fixes', () => {
 		void relay.invoke('w', { task: '查一下最新的那个 PR' });
 		await tick(5);
 		assert.deepEqual(submitted, ['查一下最新的那个 PR'], 'not asked a second time');
+	});
+
+	it('a lane the voice model wrote into its call never reaches the submission; only the check\'s does', async () => {
+		const seen: Array<Record<string, unknown>> = [];
+		const submit = async (a: Record<string, unknown>) => { seen.push(a); return { status: 'pending' as const, taskId: `t${seen.length}`, queuedAhead: 0, watcherOnline: true }; };
+		void new RelayAgent({ store: createVoiceTaskStore(), submit }).invoke('w', { task: 'count the PRs', lane: 'quick' });
+		void new RelayAgent({ store: createVoiceTaskStore(), check: async () => ({ action: 'submit' }), submit }).invoke('w', { task: 'build an app', lane: 'quick' });
+		void new RelayAgent({ store: createVoiceTaskStore(), check: async () => ({ action: 'submit', lane: 'long' }), submit }).invoke('w', { task: 'write a doc', lane: 'quick' });
+		await new Promise((r) => setTimeout(r, 50));
+		assert.deepEqual(seen.map((a) => [a.task, a.lane]).sort(), [['build an app', undefined], ['count the PRs', undefined], ['write a doc', 'long']]);
+		assert.ok(seen.every((a) => !('lane' in a) || a.lane === 'long'), 'no model-supplied lane survives');
+	});
+
+	it('the check\'s lane reaches the submission; without a check there is none', async () => {
+		const seen: Array<Record<string, unknown>> = [];
+		const submit = async (args: Record<string, unknown>) => { seen.push(args); return { status: 'pending', taskId: `task-${seen.length}`, queuedAhead: 0, watcherOnline: true, message: 'm' }; };
+		void new RelayAgent({ store: createVoiceTaskStore(), check: async () => ({ action: 'submit', lane: 'quick' }), submit }).invoke('w', { task: 'count the PRs merged this week' });
+		void new RelayAgent({ store: createVoiceTaskStore(), check: async () => ({ action: 'submit', lane: 'long' }), submit }).invoke('w', { task: 'build an app' });
+		void new RelayAgent({ store: createVoiceTaskStore(), submit }).invoke('w', { task: 'no check at all' });
+		await tick(5);
+		// Submission order is not the point (a relay with no check submits before the others' checks resolve).
+		assert.deepEqual(seen.map((a) => [a.task, a.lane]).sort(), [['build an app', 'long'], ['count the PRs merged this week', 'quick'], ['no check at all', undefined]]);
 	});
 
 	it('a call bodhi cancels while it waits is not submitted', async () => {
@@ -292,21 +350,24 @@ describe('relay agent: review of #5348, should-fixes', () => {
 });
 
 describe('relay agent: a question for the user is said as soon as the model stops speaking', () => {
-	it('at once when the model is quiet; after its turn ends when it is speaking; only the newest waits', async () => {
-		// 2026-10-13 00:41: decided at :16, said at :35, queued behind the model's answer and a noise turn.
+	it('at once when the model is quiet; after its turn ends when it is speaking; everything held goes, in order', async () => {
+		// A question decided mid-turn is said right after the model's answer, not after a later noise turn; and a result held
+		// behind a nudge for another result is not replaced by it.
 		const { createAskDelivery } = await import('../src/relay-agent.js');
 		const said: string[] = [];
+		const delivered: string[] = [];
 		const a = createAskDelivery({ inject: (t) => said.push(t), maxWaitMs: 5_000 });
-		a.ask('q1');
-		assert.deepEqual(said, ['q1'], 'quiet model: at once');
+		assert.equal(a.ask('q1', () => delivered.push('q1')), true, 'quiet model: at once');
+		assert.deepEqual([said, delivered], [['q1'], ['q1']]);
 		a.onModelAudio();
-		a.ask('q2');
-		a.ask('q3');
+		assert.equal(a.ask('q2', () => delivered.push('q2')), false, 'held while the model speaks');
+		assert.equal(a.ask('q3', () => delivered.push('q3')), false);
 		assert.deepEqual(said, ['q1'], 'waits while the model speaks');
 		a.onTurnEnd();
-		assert.deepEqual(said, ['q1', 'q3'], 'the newest, when the turn ends');
+		assert.deepEqual(said, ['q1', 'q2', 'q3'], 'all of it, in order, when the turn ends');
+		assert.deepEqual(delivered, ['q1', 'q2', 'q3'], 'the caller learns when each went in');
 		a.onTurnEnd();
-		assert.deepEqual(said, ['q1', 'q3'], 'said once');
+		assert.deepEqual(said, ['q1', 'q2', 'q3'], 'said once');
 	});
 
 	it('a model that keeps speaking does not hold the question past the cap', async () => {
@@ -549,7 +610,13 @@ describe('relay agent: every finished user turn is checked, whatever tool the vo
 		const agentSrc = readFileSync(join(import.meta.dirname ?? '.', '..', 'src', 'voice-agent.ts'), 'utf-8');
 		assert.match(agentSrc, /relayAgent\.onUserTurn\(item\.content\)/);
 		assert.match(agentSrc, /if \(answeringTools\.has\(e\.toolName\)\) relayAgent\.noteAnsweringTool\(e\.toolName\)/);
+		// "cancel that task" is answered by cancel_task alone; a status call is not an answering tool, so the turn check still sees the request.
+		assert.match(agentSrc, /const answeringTools = new Set\(\[\.\.\.personalVoiceSurface\.answeringTools, 'cancel_task'\]\)/);
 		assert.match(agentSrc, /classify: RELAY_CHECK \? createGeminiTurnClassifier\(/);
+		// After a barge-in the model may stop ending the user's turns; the in-place replay must be on so a stall does
+		// not go straight to a reconnect, which ends the open work calls.
+		assert.match(agentSrc, /watchdogReplayRecovery: VOICE_WATCHDOG_REPLAY,/);
+		assert.match(agentSrc, /responseWatchdogMs: VOICE_RESPONSE_WATCHDOG_MS,/);
 		assert.match(agentSrc, /extraRules: personalVoiceSurface\.turnCheckRules/, 'the turn check is told what the skills answer themselves');
 	});
 });
@@ -924,15 +991,16 @@ describe('reconcile pass (task-bridge, temp workspace)', () => {
 });
 
 describe('voice runs every work call through the relay agent', () => {
-	it('work is a background tool mapped to the relay agent subagent; the model hears the pending message at once', () => {
+	it('work is a NON_BLOCKING background tool mapped to the relay agent subagent; the call stays open until its result', () => {
 		assert.equal(tb.workTool.execution, 'background');
-		assert.equal(tb.workTool.pendingMessage, tb.WORK_PENDING_MESSAGE, 'without it the model says nothing until the result');
-		assert.equal(tb.workTool.behavior, undefined);
+		// A pending message would answer the call at once and close its id; the result returns under its own id.
+		assert.equal(tb.workTool.pendingMessage, undefined, 'a pending message would close the call id before the result');
+		assert.equal(tb.workTool.behavior, 'NON_BLOCKING');
 		const voice = readFileSync(join(import.meta.dirname ?? '.', '..', 'src/voice-agent.ts'), 'utf-8');
 		assert.match(voice, /subagentConfigs: \{ work: relayAgentSubagentConfig\(relayAgent\) \},/);
 		assert.match(voice, /wireDurableChannels\(session, \{ [^}]*relay: relayAgent \}\);/);
 		const runtime = readFileSync(join(import.meta.dirname ?? '.', '..', 'src/live-agent-runtime.ts'), 'utf-8');
-		assert.match(runtime, /if \(!opts\.relay\.offerResult\(current\(item\)\)\) return false;/);
+		assert.match(runtime, /if \(canSpeak\(\) && opts\.relay\.offerResult\(now\)\) \{/, 'an open call gets its result at once, not through the pacer');
 	});
 });
 
@@ -957,11 +1025,29 @@ describe('every status answer comes from the one table', () => {
 		const row = (text: string, state: string, delivery?: string) => ({ id: text, text, submittedAt: 1, state, delivery }) as never;
 		const retired = { id: 'r', text: 'cleared [no-send]', submittedAt: 1, state: 'done', retired: true } as never;
 		const rows = [row('merged PRs', 'done', 'spoken'), row('PR 5302', 'done', 'spoken'), row('PR 5167', 'done'), row('PR 5329', 'started'), row('non-spicy dishes', 'queued'), row('old one', 'cancelled'), retired];
-		assert.deepEqual(voiceTaskCounts(rows), { pending: 3, working: 2, doneNotHeard: 1 }, 'a task ended with nothing to say is not pending');
-		assert.match(describeVoiceTasks(rows), /^Pending for the user: 3 \(they have not heard an answer to these yet: 2 the core is still working on, 1 finished and waiting to be read to them\)\./);
+		assert.deepEqual(voiceTaskCounts(rows), { pending: 2, working: 2, doneNotHeard: 1, unknown: 0 }, 'pending is what the core still works on; a finished result not yet told is counted apart; a task ended with nothing to say is neither');
+		// A result returned to its work call (delivery injected) but not yet said: not heard, and not pending either.
+		const returned = [row('PR 5696', 'done', 'injected'), row('Angry Birds app', 'started')];
+		assert.deepEqual(voiceTaskCounts(returned), { pending: 1, working: 1, doneNotHeard: 1, unknown: 0 }, 'returned to the model is not heard, and is told apart from pending');
+		// A row the core left in an unknown state, or a done row with no readable result, is neither pending nor a result to say.
+		assert.deepEqual(voiceTaskCounts([row('PR 1', 'unknown'), row('PR 2', 'done'), row('PR 3', 'done')], (id) => (id === 'PR 3' ? 'three' : null)), { pending: 0, working: 0, doneNotHeard: 1, unknown: 1 });
+		assert.match(describeVoiceTasks([row('PR 1', 'unknown')]), /1 in an unknown state/);
+		assert.match(describeVoiceTasks(rows), /^Pending: 2 the core is still working on; 1 finished and not yet told to the user \(say those first, they are not pending\)\./);
+		assert.match(describeVoiceTasks([row('PR 5329', 'started')]), /^Pending: 1 the core is still working on\./);
 		assert.match(describeVoiceTasks(rows), /1 ended with nothing to say \("cleared \[no-send\]"\)/);
 		const tool = src('voice-agent.ts').split("name: 'get_task_status'")[1].split('};')[0];
-		assert.ok(tool.includes('voiceTaskCounts(rows)') && tool.includes('pendingTasks: counts.pending') && !tool.includes('openTasks'), 'the tool reports the table\'s count');
+		assert.ok(tool.includes('voiceTaskCounts(rows, voiceTaskResultText)') && tool.includes('pendingTasks: counts.pending') && !tool.includes('openTasks'), 'the tool reports the table\'s count, finished ones only with a readable result');
+	});
+
+	it('resultsNotYetTold lists a finished, unheard result with its text; spoken, empty and retired rows are left out', async () => {
+		const { resultsNotYetTold } = await import('../src/inline-tools.js');
+		const row = (id: string, state: string, delivery?: string, retired?: boolean) => ({ id, text: `request ${id}`, submittedAt: 1, state, delivery, retired }) as never;
+		const texts: Record<string, string> = { a: 'Sixty-one PRs merged.', b: 'Said already.', d: 'Cleared.' };
+		const rows = [row('a', 'done', 'injected'), row('b', 'done', 'spoken'), row('c', 'done'), row('d', 'done', undefined, true), row('e', 'started')];
+		assert.deepEqual(resultsNotYetTold(rows, (id) => texts[id] ?? null), [{ task: 'request a', result: 'Sixty-one PRs merged.' }]);
+		const tool = src('voice-agent.ts').split("name: 'get_task_status'")[1].split('};')[0];
+		assert.ok(tool.includes('resultsNotYetTold: resultsNotYetTold(rows, voiceTaskResultText, new Set(heldByPacer()))'), 'the tool reports exactly this list, minus what the pacer holds');
+		assert.deepEqual(resultsNotYetTold(rows, (id) => texts[id] ?? null, new Set(['a'])), [], 'a result the pacer is about to say is not read out here');
 	});
 
 	it('the live status snapshot carries every row, newest first, with the same pending count as the tool', async () => {
@@ -970,9 +1056,9 @@ describe('every status answer comes from the one table', () => {
 		const rows = [row('PR 5302', 1, 'done', 'spoken'), row('PR 5167', 2, 'done'), row('PR 5329', 3, 'started'), row('cleared', 4, 'done', undefined, true), row('dm one', 5, 'done', 'dm')];
 		const snap = voiceTaskStatusSnapshot(rows, 99);
 		assert.equal(snap.at, 99);
-		assert.deepEqual({ pending: snap.pending, working: snap.working, doneNotHeard: snap.doneNotHeard }, voiceTaskCounts(rows));
+		assert.deepEqual({ pending: snap.pending, working: snap.working, doneNotHeard: snap.doneNotHeard, unknown: snap.unknown }, voiceTaskCounts(rows));
 		assert.deepEqual(snap.tasks.map((t) => t.id), ['dm one', 'cleared', 'PR 5329', 'PR 5167', 'PR 5302'], 'newest first');
-		assert.deepEqual(snap.tasks.map((t) => t.pending), [true, false, true, true, false]);
+		assert.deepEqual(snap.tasks.map((t) => t.pending), [false, false, true, false, false], 'only what the core still works on');
 		assert.deepEqual(snap.tasks.map((t) => t.heard), [false, false, false, false, true]);
 		assert.equal(snap.tasks[1].retired, true);
 		assert.equal(snap.tasks[0].delivery, 'dm');

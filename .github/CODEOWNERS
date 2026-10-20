@@ -41,7 +41,7 @@
 /skills/worker-pool/       @qingyun-wu @keweichen @sonichi # Qingyun 29, Chi 19, Kewei 3 commits; Kewei wrote the two largest recent features (#4769 Codex workers, #4783 display names) and reviews every worker-pool PR; @sonichi owner-assigned
 /skills/task-progress/     @qingyun-wu
 /skills/phone-conversation/ @sonichi @liususan091219 @qingyun-wu @yixuan-ag2   # full history: Chi 46, Susan 28, Qingyun 21 (90 days: Qingyun); Yixuan added for the 3.8 voice-default work
-/packages/                 @qingyun-wu
+/packages/                 @qingyun-wu @sonichi
 /packages/ag2-sparrow/ag2_sparrow/adapters/hatch/ @qingyun-wu @sonichi  # Meta Hatch adapter; owner-assigned (Chi) at creation, no history yet
 
 # Susan: areas she leads or co-leads over the full history.

@@ -2431,23 +2431,6 @@ MEDIA_MARKER_TAG = re.sub(r"[^A-Za-z0-9_-]", "",
                           os.environ.get("REMOTE_MEDIA_MARKER") or "remote-media")
 MEDIA_MARKER_RE = re.compile(r"\[" + re.escape(MEDIA_MARKER_TAG) + r":([^\]]*)\]")
 
-# Untrusted room-ops metadata block: the gateway appends a free-text
-# `[room-ops metadata: …]` pointer to the operating card onto the message body.
-_ROOM_OPS_META_RE = re.compile(r"\s*\[room-ops metadata:[^\]]*\]", re.IGNORECASE)
-
-
-def _strip_room_ops_meta(body: str) -> "tuple[str, bool]":
-    """Remove any untrusted `[room-ops metadata: …]` block(s) from a task body.
-
-    Returns (cleaned_body, stripped) so the caller can log the quarantine. Runs
-    before _one_line so a block split across newlines is still caught."""
-    if not body or "room-ops metadata:" not in body.lower():
-        return body, False
-    cleaned = _ROOM_OPS_META_RE.sub("", body)
-    stripped = cleaned != body
-    # Return the cleaned body even when it is now empty: a metadata-ONLY body is
-    # pure injection with no legitimate task text, so it must degrade to an empty
-    return (cleaned.strip(), stripped)
 HS_MEDIA_TOKEN = os.environ.get("REMOTE_MEDIA_HS_TOKEN") or ""
 # The homeserver token is attached ONLY to media URLs on this exact origin
 # (scheme+host+port). Without it configured, Matrix media URLs are never
@@ -4078,11 +4061,7 @@ def _write_task(task: dict, hold: bool = False) -> "tuple[str, bool] | None":
                 lines.append("collaborator: true")
                 if task.get("sensitive_data_filter") is False:
                     lines.append("sensitive_data_filter: false")
-            # Quarantine the untrusted `[room-ops metadata: …]` block BEFORE it
-            # reaches the agent as body content (owner directive 2026-07-16) —
-            _raw_task, _stripped_meta = _strip_room_ops_meta(str(task["task"]))
-            if _stripped_meta:
-                _log(f"stripped untrusted room-ops metadata from {tid} body")
+            _raw_task = str(task["task"])
             # Resolve an inbound media marker to a local file the core can read.
             _media_refs: list = []
             _fetched = _maybe_fetch_media(_raw_task, _media_refs)
