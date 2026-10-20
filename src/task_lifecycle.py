@@ -555,8 +555,8 @@ def _fsync_file(path):
 
 class SettledIds:
     """Append-only, one validated id per newline-terminated record; never rewritten. A torn tail (an
-    unterminated suffix, or a last record that does not parse) is dropped under the ledger's flock, on
-    open and before every append; a malformed record before the tail fails closed (LedgerError)."""
+    unterminated suffix: what a short append leaves) is dropped under the ledger's flock, on open and
+    before every append; any malformed newline-terminated record fails closed (LedgerError)."""
 
     def __init__(self, path, required=False):
         self.path = str(path)
@@ -581,17 +581,14 @@ class SettledIds:
                 raise LedgerIOError("%s cannot be repaired (%s)" % (self.path, e))
 
     def _parse(self, data):
-        """(ids, the byte length of the whole records kept): a torn tail is not kept."""
+        """(ids, the byte length of the whole records kept): an unterminated tail is not kept."""
         ids, offset = set(), 0
-        records = data.split(b"\n")[:-1]
-        for i, raw in enumerate(records):
+        for raw in data.split(b"\n")[:-1]:
             try:
                 tid = raw.decode("utf-8")
             except UnicodeDecodeError:
                 tid = ""
             if not local_task_protocol.valid_task_id(tid):
-                if i == len(records) - 1:
-                    break
                 raise LedgerError("%s has a malformed record at byte %d" % (self.path, offset))
             ids.add(tid)
             offset += len(raw) + 1
@@ -1045,6 +1042,14 @@ class Lifecycle:
         return bool(rec and rec["phase"] == SETTLED and task_id in self.settled
                     and not os.path.lexists(self.claims.dir(task_id) / "body"))
 
+    def is_settled(self, task_id):
+        """Whether a reader may treat the id as final: in the ledger and, while its claim is still SETTLED on
+        disk, that settlement repaired and complete (reconcile_settled); a compacted claim is complete."""
+        if task_id not in self.settled:
+            return False
+        rec = self.claims.load(task_id)
+        return self.reconcile_settled(task_id) if rec and rec["phase"] == SETTLED else True
+
     def reconcile_unbound(self, now=None):
         """The SETTLED claims no generation owns (answered without a call): each settlement completed, and
         compacted once due, as generation recovery does for its own. Under claims.lock, by the caller."""
@@ -1222,9 +1227,8 @@ class Lifecycle:
             if rec and rec.get("claim_mode") == LOCAL:
                 self.log("foreign claim (local), left alone ->", task_id)
                 continue
-            if rec and rec["phase"] == SETTLED and task_id not in self.settled:
-                self.log("re-recording a settled id ->", task_id)
-                self.settled.add(task_id)
+            if rec and rec["phase"] == SETTLED:
+                self.reconcile_settled(task_id)
         self.settled.sync()                             # compaction below never runs ahead of durability
         for name in os.listdir(self.results):
             if name.startswith(".task-") and (".publish." in name):

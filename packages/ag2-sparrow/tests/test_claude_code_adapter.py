@@ -3462,14 +3462,44 @@ class InboxCli(ConnectBase):
         self.assertIn(t, ledger())
         self.assertEqual(sum(1 for p in self.results.iterdir() if p.name == t + ".txt"), 1, "nothing published twice")
 
+    def test_a_hard_publish_reply_claims_settled_only_over_a_complete_settlement(self):
+        """The SETTLED claim.json rename lands and its directory fsync fails: the hard reply names the phase but
+        not outcome=settled (the ledger entry and the body removal never ran), so the Mod retries; the identical
+        publish again completes the settlement and only then answers settled. park routes the same way."""
+        lc = inbox._lifecycle(self.root)
+        real_save = inbox.lifecycle.ClaimStore.save
+        for t, call in (("task-hard-publish", lambda t: self.verb("publish", t)),
+                        ("task-hard-park", lambda t: self.verb("park", t, "turn-1", "--detail", "aborted"))):
+            self.confirmed(t)
+            if t == "task-hard-publish":
+                self.assertEqual(self.verb("stage", t, "turn-1", stdin=b"answer\n")[0], 0)
+            lc.claims.stage(t, b"legacy\n")
+            once = []
+
+            def save(store, rec):
+                if not once and rec["phase"] == inbox.lifecycle.SETTLED:
+                    once.append(1)
+                    real_save(store, rec)
+                    raise inbox.lifecycle.StateCommitted("claim.json was replaced, then its directory fsync failed")
+                return real_save(store, rec)
+            with mock.patch.object(inbox.lifecycle.ClaimStore, "save", save):
+                rc, out = call(t)
+            self.assertEqual((rc, out.get("hard"), out.get("phase"), "outcome" in out, once), (3, True, inbox.lifecycle.SETTLED, False, [1]), out)
+            self.assertFalse(lc.settlement_complete(t))
+            rc, out = call(t)
+            self.assertEqual((rc, out.get("outcome")), (0, "settled"), out)
+            self.assertEqual((inbox._lifecycle(self.root).settlement_complete(t), (lc.claims.dir(t) / "body").exists()), (True, False))
+
     def test_settlement_property_every_entry_path_by_every_fault_by_every_schedule_converges(self):
         """The settlement invariant as one property. For every entry path that settles (publish, park, a non-admitted
         claim, interrupt, a lost claim, recovery's no-result settle, recovery's publication) x one fault at each step
         (the ledger append fails, the append is torn and an already-loaded writer runs next, the staged-body unlink
-        fails, the progress-mirror write fails) x each schedule production can run (the Mod retries; a restart's one
-        recovery pass, then claims; the task file gone, only that recovery pass), driven to quiescence: whenever a
-        verb reports final the settlement is complete, and at the end the result exists exactly once (none for the
-        no-result settle), the ledger holds the id exactly once and still opens, and the real staged body is gone."""
+        fails, the SETTLED claim.json rename lands and its directory fsync fails, the progress-mirror write fails)
+        x each schedule production can run (the Mod retries; a restart's one recovery pass, then claims; the task
+        file gone, only that recovery pass), driven to quiescence: every reply,
+        the first after the fault included, that reports final comes over a complete settlement, and at the end
+        the result exists exactly once (none for the no-result settle), the ledger holds the id exactly once and
+        still opens, and the real staged body is gone."""
         self.maxDiff = None
         lc = inbox._lifecycle(self.root)
         dead = {"pid": 2 ** 22 - 1, "start": "2026-01-01T00:00:00Z"}
@@ -3477,6 +3507,7 @@ class InboxCli(ConnectBase):
         real_add, real_unstage, real_write_progress = (inbox.lifecycle.SettledIds.add, inbox.lifecycle.ClaimStore.unstage,
                                                        records.write_progress)
         real_lifecycle = inbox._lifecycle
+        real_save = inbox.lifecycle.ClaimStore.save
 
         def recovery():
             with mock.patch.object(task_io, "verify_lineage", return_value=False):
@@ -3560,6 +3591,14 @@ class InboxCli(ConnectBase):
                     raise inbox.lifecycle.StateIOError("cannot remove body ([Errno 5] I/O error)")
                 return real_unstage(store, task_id)
 
+            def save(store, rec):
+                # The claim.json rename lands, then its directory fsync fails: the step is committed, the reply hard.
+                if not once and rec["phase"] == inbox.lifecycle.SETTLED:
+                    once.append(1); fired.append(kind)
+                    real_save(store, rec)
+                    raise inbox.lifecycle.StateCommitted("claim.json was replaced, then its directory fsync failed")
+                return real_save(store, rec)
+
             def write_progress(root, mutate):
                 if not once:
                     once.append(1); fired.append(kind)
@@ -3569,11 +3608,20 @@ class InboxCli(ConnectBase):
                 return mock.patch.object(inbox.lifecycle.SettledIds, "add", add)
             if kind == "unlink":
                 return mock.patch.object(inbox.lifecycle.ClaimStore, "unstage", unstage)
+            if kind == "rename":
+                return mock.patch.object(inbox.lifecycle.ClaimStore, "save", save)
             return mock.patch.object(records, "write_progress", write_progress)
 
         def final(rc, out):
             return rc == 0 or (rc == 3 and (out.get("resolved") is True or out.get("outcome") == "settled")) \
                 or (rc == 1 and not out.get("retry"))
+
+        def check(t, reply, where, problems):
+            """final => complete, on every reply; True when the reply is final."""
+            rc, out = reply
+            if final(rc, out) and not complete(t):
+                problems.append("%s, final %r, over an incomplete settlement" % (where, out))
+            return final(rc, out)
 
         def complete(t):
             try:
@@ -3584,15 +3632,16 @@ class InboxCli(ConnectBase):
                     and not (lc.claims.dir(t) / "body").exists())
         failures, fired_cases = [], 0
         for e_name, entry in entries.items():
-            for f_name in ("append", "torn", "unlink", "mirror"):
+            for f_name in ("append", "torn", "unlink", "rename", "mirror"):
                 for s_name in ("retry", "restart", "gone"):
                     t = "task-p-%s-%s-%s" % (e_name, f_name, s_name)
                     first, again, expected = entry(t)
                     fired, problems = [], []
                     preloaded = real_lifecycle(self.root)            # a writer loaded before the fault, run next
                     with fault(f_name, fired):
-                        first()
+                        reply = first()
                     fired_cases += bool(fired)
+                    done = isinstance(reply[0], int) and check(t, reply, "the first reply after the fault", problems)
                     stale = [preloaded] if f_name == "torn" and fired else []
                     with mock.patch.object(inbox, "_lifecycle", lambda root: stale.pop() if stale else real_lifecycle(root)):
                         if s_name == "gone":
@@ -3602,17 +3651,14 @@ class InboxCli(ConnectBase):
                             if s_name == "restart":
                                 recovery()
                                 again = (lambda t=t: self.verb("claim", t)) if e_name not in ("noresult", "recovered") else again
-                            for _ in range(8):
-                                rc, out = again()
-                                if final(rc, out):
-                                    if not complete(t):
-                                        problems.append("final %r reported over an incomplete settlement" % (out,))
+                            for _ in range(0 if done and s_name == "retry" else 8):
+                                if check(t, again(), "a retry", problems):
                                     break
                             else:
-                                problems.append("no final report: %r" % (out,))
-                            rc, out = self.verb("claim", t)
-                            if not final(rc, out):
-                                problems.append("a later claim is not final: %r" % (out,))
+                                if not (done and s_name == "retry"):
+                                    problems.append("no final report")
+                            if not check(t, self.verb("claim", t), "a later claim", problems):
+                                problems.append("a later claim is not final")
                             recovery()
                     if not complete_safe(ledger_path):
                         problems.append("the ledger does not open")
@@ -3627,8 +3673,8 @@ class InboxCli(ConnectBase):
                     if not complete_safe(ledger_path):
                         ledger_path.write_text("".join(sorted(x + "\n" for x in real_ids(ledger_path))))
         self.assertEqual(failures, [])
-        self.assertEqual(fired_cases, 75, "every fault fired except the mirror write where the first call writes no mirror "
-                         "(the non-admitted claim's refusal, and the two recovery-first entries): 84 - 9")
+        self.assertEqual(fired_cases, 96, "every fault fired except the mirror write where the first call writes no mirror "
+                         "(the non-admitted claim's refusal, and the two recovery-first entries): 105 - 9")
 
     def test_every_settle_path_completes_its_settlement_after_one_ledger_fault_before_reporting_final(self):
         """The settled-ids append faults once on each path that settles: publish, park, a non-admitted claim, an

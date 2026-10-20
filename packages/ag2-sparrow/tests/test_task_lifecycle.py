@@ -1414,13 +1414,14 @@ class SettledIdsTest(Base):
         self.assertEqual((self.work / "s").read_bytes(), b"task-a\ntask-bb\n")
         self.assertEqual(synced, [str(self.work / "s")])
 
-    def test_a_malformed_record_before_the_tail_is_refused_naming_its_offset_and_a_torn_tail_is_dropped(self):
-        for text, kept in (("task-a\ntask-c x\n", "task-a\n"), ("\n", ""), ("task-a\ntastask-a\n", "task-a\n")):
-            with self.subTest(tail=text):
-                (self.work / "s").write_text(text)
-                self.assertEqual(self.lc.SettledIds(self.work / "s").ids, {"task-a"} if kept else set())
-                self.assertEqual((self.work / "s").read_text(), kept, "the unparseable last record dropped")
-        for text, offset in (("task-a\nnot a task id\ntask-b\n", 7), ("\ntask-a\n", 0)):
+    def test_any_terminated_malformed_record_is_refused_naming_its_offset_and_only_an_unterminated_tail_is_cut(self):
+        """A short append leaves only a prefix of `id\\n`, never a newline-terminated malformed record: that shape
+        is corruption, refused with the bytes untouched (a settled id is never silently dropped)."""
+        (self.work / "s").write_text("task-a\ntask-b")
+        self.assertEqual(self.lc.SettledIds(self.work / "s").ids, {"task-a"})
+        self.assertEqual((self.work / "s").read_text(), "task-a\n", "the unterminated tail cut")
+        for text, offset in (("task-a\nnot a task id\ntask-b\n", 7), ("task-a\ntask-c x\n", 7), ("\n", 0),
+                             ("task-safe\nnot a task id\n", 10), ("task-a\ntastask-a\n", 7)):
             with self.subTest(text=text):
                 (self.work / "s").write_text(text)
                 with self.assertRaises(self.lc.LedgerError) as e:
@@ -1562,6 +1563,35 @@ class SettledIdsTest(Base):
         self.assertEqual(order, ["add", "compact"])
         self.assertIn("task-a", self.lc.SettledIds(path).ids)
         self.assertFalse(again.claims.dir("task-a").exists())
+
+    def test_cloud_recovery_completes_a_settlement_and_is_settled_requires_it(self):
+        """The generic recovery and the cloud adapter's reader take the same repair-then-check: a SETTLED claim
+        whose ledger append failed (id absent, body left) or whose body unlink failed (id present, body left)
+        is complete after one recover(); is_settled repairs before it answers and never reports a debt final."""
+        life = self.life()
+        for tid, patch in (("task-a", (self.lc.SettledIds, "add", self.lc.LedgerIOError("cannot append"))),
+                           ("task-b", (self.lc.ClaimStore, "unstage", self.lc.StateIOError("cannot remove body")))):
+            self.run_to_outcome(life, tid)
+            with mock.patch.object(patch[0], patch[1], side_effect=patch[2]):
+                with self.assertRaises(self.lc.StateError):
+                    life.publish_and_settle(tid)
+            self.assertTrue((life.claims.dir(tid) / "body").is_file(), tid)
+            self.assertFalse(life.settlement_complete(tid))
+        self.assertEqual(("task-a" in life.settled, "task-b" in life.settled), (False, True))
+        again = self.life()
+        again.recover()
+        for tid in ("task-a", "task-b"):
+            self.assertEqual((again.settlement_complete(tid), (again.claims.dir(tid) / "body").exists()), (True, False), tid)
+            self.assertTrue(again.is_settled(tid))
+        self.assertFalse(again.is_settled("task-zz"))
+        self.run_to_outcome(life, "task-c")
+        with mock.patch.object(self.lc.ClaimStore, "unstage", side_effect=self.lc.StateIOError("cannot remove body")):
+            with self.assertRaises(self.lc.StateError):
+                life.publish_and_settle("task-c")
+            with self.assertRaises(self.lc.StateError):
+                self.life().is_settled("task-c")
+        self.assertTrue(self.life().is_settled("task-c"), "repaired before it answers")
+        self.assertFalse((life.claims.dir("task-c") / "body").exists())
 
     def test_compaction_never_truncates_the_settled_ids(self):
         life = self.life()

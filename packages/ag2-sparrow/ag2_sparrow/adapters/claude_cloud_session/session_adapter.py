@@ -180,7 +180,11 @@ class Adapter(RelayLoop):
     def step(self, name, seen):
         """Handle one task; returns True when it reached a final result."""
         task_id = name[:-4]
-        if task_id in self.lc.settled:
+        try:
+            settled = self.lc.is_settled(task_id)
+        except task_lifecycle.StateError as e:
+            return self.park(task_id, e)
+        if settled:
             log("already settled, never called again ->", task_id)
             seen.add(task_id)
             return True

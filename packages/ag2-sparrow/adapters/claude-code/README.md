@@ -135,9 +135,14 @@ that are not complete (or are due for compaction), and claims answered
 without a call, which carry no generation, are reconciled and compacted too
 (`reconcile_unbound`). The ledger is append-only lines: each append is one
 write of the id and a newline under the ledger's own flock, after a repair
-that cuts a torn tail (an unterminated or unparseable last line); a torn
-append is cut and re-appended by the next repair, and two writers that loaded
-the ledger before either appended record an id once. When the progress record cannot be written at all, the CLI raises
+that cuts a torn tail (an unterminated last line, the only shape a short
+append leaves); a torn append is cut and re-appended by the next repair, and
+two writers that loaded the ledger before either appended record an id once.
+A newline-terminated malformed record is corruption and fails closed. A hard
+reply (a rename that landed, its directory fsync failed) claims
+`outcome: settled` only over a complete settlement; otherwise the caller
+retries and the retry completes it. The cloud adapter's recovery and its
+"already settled" reader (`is_settled`) take the same repair-then-check. When the progress record cannot be written at all, the CLI raises
 an alarm in the adapter's config dir (outside `state/`): `verify` fails its
 `progress` row and the launcher raises the needs-attention card until a durable
 write clears it. A record whose fields have the wrong shape reads as unreadable (hard),

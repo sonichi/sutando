@@ -164,7 +164,7 @@ COMMITTED_FIELDS = {
     if _token_for(rec, req["attempt"], req["text_hash"]) else {},
     "confirm": lambda rec, req: {"turn_id": rec.get("turn_id")} if rec["phase"] == lifecycle.TURN_CONFIRMED else {},
     "stage": lambda rec, req: {"outcome": "staged"} if rec["phase"] == lifecycle.RESULT_STAGED else {},
-    "publish": lambda rec, req: {"outcome": "settled"} if rec["phase"] == lifecycle.SETTLED else {},
+    "publish": lambda rec, req: {"outcome": "settled"} if rec["phase"] == lifecycle.SETTLED and req.get("complete") else {},
 }
 
 
@@ -177,7 +177,12 @@ def _committed(lc, task_id, verb, request=None) -> "dict | None":
         return None
     if not rec:
         return {"task_id": task_id, "phase": "absent"}
-    return dict(COMMITTED_FIELDS.get(verb, lambda r, q: {})(rec, request or {}), task_id=task_id, phase=rec["phase"])
+    try:
+        # A hard reply is final only over a complete settlement; otherwise the caller's retry completes it.
+        request = dict(request or {}, complete=lc.settlement_complete(task_id))
+    except Exception:
+        request = dict(request or {}, complete=False)
+    return dict(COMMITTED_FIELDS.get(verb, lambda r, q: {})(rec, request), task_id=task_id, phase=rec["phase"])
 
 
 def _committed_reply(lc, task_id, verb, request, message):
