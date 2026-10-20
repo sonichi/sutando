@@ -212,16 +212,32 @@ def _config_dir(environ=None) -> Path:
 
 
 def _clear_stuck(root, task_id) -> bool:
-    """A resolved task's stuck mark dropped: True once no mark is left (none to clear writes nothing),
-    False when the record could not be read or written, so the caller keeps the task and retries."""
+    """A resolved task's stuck mark and in-flight mirror dropped in one write: True once neither is left
+    (none to clear writes nothing), False when the record could not be read or written, so the caller
+    keeps the task and retries."""
+    def mutate(rec):
+        for key in ("stuck", "inflight"):
+            if isinstance(rec.get(key), dict) and task_id in rec[key]:
+                rec = dict(rec, **{key: {k: v for k, v in rec[key].items() if k != task_id}})
+        return rec
     try:
-        if task_id not in (records.load_plugin(root).get("stuck") or {}):
+        plugin = records.load_plugin(root)
+        if task_id not in (plugin.get("stuck") or {}) and task_id not in (plugin.get("inflight") or {}):
             return True
-        records.write_progress(root, lambda rec: dict(rec, stuck={k: v for k, v in rec["stuck"].items() if k != task_id})
-                               if isinstance(rec.get("stuck"), dict) and task_id in rec["stuck"] else rec)
+        records.write_progress(root, mutate)
         return True
     except (records.RecordError, OSError, TypeError):
         return False
+
+
+def _settle_terminal(lc, task_id) -> None:
+    """A local claim at RESULT_STAGED or PUBLISHED whose result already exists is settled on that result
+    (the publisher records it and adds none); Parked when it does not settle now. The caller holds claims.lock."""
+    rec = lc.claims.load(task_id)
+    if not rec or rec.get("claim_mode") != lifecycle.LOCAL or rec["phase"] not in (lifecycle.RESULT_STAGED, lifecycle.PUBLISHED):
+        return
+    if lc.publish_and_settle(task_id) != "settled":
+        raise Parked("%s: answered, but its claim did not settle now (%s); retried" % (task_id, lc.claims.load(task_id)["phase"]))
 
 
 def _mirror(root, task_id, phase, out: dict, extra=None, unstuck=False) -> dict:
@@ -264,6 +280,8 @@ def claim(root, task_id) -> dict:
                     raise Refused(str(e))
         else:
             terminal = resolved(lc, task_id)[0]
+            if terminal:
+                _settle_terminal(lc, task_id)
     if lost:
         # After claims.lock, as every mirror write; a mirror that fails is the hard answer, the Mod retries.
         out = _mirror(root, task_id, None, {"task_id": task_id, "phase": lifecycle.SETTLED, "answered": lost}, unstuck=True)
@@ -297,16 +315,23 @@ def resolved(lc, task_id) -> "tuple[bool, str]":
 
 
 def lost_turn_answered(lc, task_id, generation) -> str:
-    """A claim of the live `generation` past its call, claimed afresh: a Mod never re-claims a task it still
-    holds, so the text that could finish its stage is gone. An accepted answer is delivered as recorded
-    (its verifying blob, or the staged body), else the claim is answered as interrupted now, not at the
-    next generation. What was answered; '' when it is not such a claim; Parked when its publication did
-    not land, so the next claim retries it. The caller holds claims.lock."""
+    """A local claim past its call, claimed afresh: a Mod never re-claims a task it still holds, so the text
+    that could finish its stage is gone. An accepted answer is delivered as recorded (its verifying blob,
+    or the staged body), whichever generation's claim it is; a claim of the live `generation` with no such
+    answer is answered as interrupted now, not at the next generation. What was answered; '' when it is
+    not such a claim; Parked when its publication did not land, so the next claim retries it. The caller
+    holds claims.lock."""
     rec = lc.claims.load(task_id)
-    if not rec or rec.get("claim_mode") != lifecycle.LOCAL or rec.get("generation") != generation:
+    if not rec or rec.get("claim_mode") != lifecycle.LOCAL:
         return ""
+    live = rec.get("generation") == generation
     phase = rec["phase"]
-    if phase == lifecycle.TURN_CONFIRMED and rec.get("staged"):
+    if phase == lifecycle.TURN_CONFIRMED and rec.get("staged") and not live:
+        # Another generation's turn: only its verifying answer is ours to finish; an interruption is recovery's.
+        if lc.finish_verified(task_id) != "finished":
+            return ""
+        answered = "its accepted answer, staged and never published, is published now"
+    elif phase == lifecycle.TURN_CONFIRMED and rec.get("staged"):
         # The lifecycle decides what the recorded descriptor is worth, exactly as recovery lets it.
         closed = lc.close_turn(task_id, "turn confirmed, the accepted answer's staging was lost")
         if closed == "parked":
@@ -322,7 +347,11 @@ def lost_turn_answered(lc, task_id, generation) -> str:
         answered = "its staged answer is published now"
     else:
         return ""
-    if lc.publish_and_settle(task_id, io_raises=True) != "settled":
+    try:
+        published = lc.publish_and_settle(task_id, io_raises=True)
+    except lifecycle.PublishedNotDurable as e:
+        raise Parked("%s: the result landed, its durability unknown (%s); retried" % (task_id, e))
+    if published != "settled":
         raise Parked("%s: %s, its answer is not published yet; retried" % (task_id, lc.claims.load(task_id)["phase"]))
     return answered
 

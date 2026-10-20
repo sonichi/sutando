@@ -2830,8 +2830,9 @@ class LocalClaimTest(Base):
 
     def test_close_turn_is_the_one_decision_for_a_confirmed_turn_nobody_stages_again(self):
         """Verifying blob -> finished (published as recorded); no blob, or a committed blob that does not
-        match its descriptor -> interrupted, the detail naming the mismatch, never those bytes; a finish
-        that fails on I/O -> parked, nothing moved; not such a turn -> parked."""
+        match its descriptor -> interrupted, the detail naming the mismatch, never those bytes; a verifying
+        blob is never written again (finished with the blob writer failing); a claim save that fails raises,
+        nothing moved; not such a turn -> parked."""
         self.local_dir()
         life = self.life()
         self.confirmed(life, "task-ok")
@@ -2844,10 +2845,13 @@ class LocalClaimTest(Base):
         self.assertEqual(life.stage_result("task-io", b"recorded\n", "turn-1"), "staged")
         life.claims.save(dict(life.claims.load("task-io"), phase=self.lc.TURN_CONFIRMED))
         before = self.claim_bytes("task-io")
-        with mock.patch.object(self.lc.Lifecycle, "_commit_blob", side_effect=OSError(errno.EIO, "I/O error")):
-            self.assertEqual(life.close_turn("task-io", "lost"), "parked", "a finish that fails on I/O moves nothing")
-        self.assertEqual(self.claim_bytes("task-io"), before)
-        self.assertEqual(life.close_turn("task-io", "lost"), "finished", "and finishes once I/O works")
+        with mock.patch.object(self.lc, "write_durable", side_effect=OSError(errno.EIO, "I/O error")):
+            with self.assertRaises(self.lc.StateIOError):
+                life.close_turn("task-io", "lost")
+        self.assertEqual(self.claim_bytes("task-io"), before, "a save that fails moves nothing")
+        with mock.patch.object(self.lc.Lifecycle, "_commit_blob", side_effect=OSError(errno.EIO, "I/O error")) as blob:
+            self.assertEqual(life.close_turn("task-io", "lost"), "finished", "the verified blob is final: no blob write")
+        self.assertEqual((blob.call_count, life.claims.load("task-io")["phase"]), (0, self.lc.RESULT_STAGED))
         self.confirmed(life, "task-none")
         with mock.patch.object(self.lc.os, "link", side_effect=OSError(errno.ENOSPC, "No space left on device")):
             self.assertEqual(life.stage_result("task-none", b"accepted\n", "turn-1"), "parked")
@@ -2889,30 +2893,20 @@ class LocalClaimTest(Base):
         self.assertEqual((self.results / "task-bad.txt").read_bytes(), b"interrupted\n")
         self.assertEqual(sorted(again.settled.ids), ["task-bad"])
 
-    def test_generation_recovery_retries_a_verifying_blob_whose_finish_failed_on_io_never_interrupting(self):
-        """One EIO in _commit_blob's temp write while the final blob verifies: the pass parks the claim as it
-        is (descriptor kept, no result, nothing interrupted); the next pass delivers the accepted answer."""
+    def test_one_generation_recovery_pass_delivers_a_verifying_blob_with_no_blob_write(self):
+        """One recovery pass, as hold runs it once per start, with the blob writer failing on every call:
+        the verified blob is final, so the claim moves on by its own save and the accepted answer is
+        published exactly once, nothing interrupted; no second pass is needed."""
         self.local_dir()
         life = self.life()
         self.confirmed(life, "task-eio")
         self.assertEqual(life.stage_result("task-eio", b"the verified answer\n", "turn-1"), "staged")
         life.claims.save(dict(life.claims.load("task-eio"), phase=self.lc.TURN_CONFIRMED))
-        real_commit, hits = self.lc.Lifecycle._commit_blob, []
-
-        def temp_write_eio_once(tmp, final, body):
-            if not hits:
-                hits.append(tmp)
-                raise OSError(errno.EIO, "I/O error")
-            return real_commit(tmp, final, body)
         again = self.life(lineage=lambda pid, start: False)
-        before = self.claim_bytes("task-eio")
-        with mock.patch.object(self.lc.Lifecycle, "_commit_blob", staticmethod(temp_write_eio_once)), \
+        with mock.patch.object(self.lc.Lifecycle, "_commit_blob", side_effect=OSError(errno.EIO, "I/O error")) as blob, \
                 mock.patch.object(self.lc.Lifecycle, "close_turn", wraps=again.close_turn) as closed:
             again.recover(generation=GEN, proof=False)
-        self.assertEqual((closed.call_count, len(hits)), (1, 1), "the decision taken once, the temp write the failure")
-        self.assertEqual(self.claim_bytes("task-eio"), before, "parked: the claim as it was, descriptor kept")
-        self.assertFalse((self.results / "task-eio.txt").exists(), "nothing interrupted, nothing delivered yet")
-        again.recover(generation=GEN, proof=False)
+        self.assertEqual((closed.call_count, blob.call_count), (1, 0), "the decision taken once, no blob write")
         self.assertEqual((self.results / "task-eio.txt").read_bytes(), b"the verified answer\n", "the accepted answer, exactly")
         self.assertEqual(again.claims.load("task-eio")["phase"], self.lc.SETTLED)
 

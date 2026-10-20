@@ -1032,18 +1032,33 @@ class Lifecycle:
         self._save(rec, phase=RESULT_STAGED)
         return "staged"
 
+    def finish_verified(self, task_id):
+        """A TURN_CONFIRMED local claim whose recorded descriptor's blob verifies moved to RESULT_STAGED by
+        the claim save alone: the blob is final and is never written again. finished | parked (no such
+        claim, or no verifying blob). A save that fails raises, as every claim save does."""
+        rec = self.claims.load(task_id)
+        if rec is None or rec.get("claim_mode") != LOCAL or rec["phase"] != TURN_CONFIRMED:
+            return "parked"
+        descriptor = rec.get("staged")
+        if descriptor is None or self._verified(task_id, descriptor) is None:
+            return "parked"
+        # The blob shares claim.json's directory, so this save's directory fsync makes its link durable too.
+        self._save(rec, phase=RESULT_STAGED)
+        self.open_attempts.discard(task_id)
+        return "finished"
+
     def close_turn(self, task_id, detail, now=None):
         """The one decision for a TURN_CONFIRMED local claim nobody will stage again (a dead generation's,
-        or a live one whose Mod lost it): a descriptor whose blob verifies finishes the move and is the
-        answer (finished); no descriptor, or a blob missing or not matching it, is answered as interrupted
-        (interrupted), never a substituted body; a finish that fails on I/O, or a claim that is not such a
-        turn, is parked. Every outcome but parked leaves the claim RESULT_STAGED for publish_and_settle."""
+        or a live one whose Mod lost it): a descriptor whose blob verifies is the answer, moved on by
+        finish_verified with no blob write (finished); no descriptor, or a blob missing or not matching
+        it, is answered as interrupted (interrupted), never a substituted body; a claim that is not such
+        a turn is parked. Every outcome but parked leaves the claim RESULT_STAGED for publish_and_settle."""
         rec = self.claims.load(task_id)
         if rec is None or rec.get("claim_mode") != LOCAL or rec["phase"] != TURN_CONFIRMED:
             return "parked"
         descriptor = rec.get("staged")
         if descriptor is not None and self._verified(task_id, descriptor) is not None:
-            return "finished" if self.finish_staged(task_id) == "staged" else "parked"
+            return self.finish_verified(task_id)
         if descriptor is not None and self.claims.blob(task_id, descriptor["blob"]) is not None:
             self.log("a committed result does not match its descriptor; answered as interrupted ->", task_id)
             detail = "%s (the committed result does not match its descriptor)" % detail
@@ -1130,7 +1145,7 @@ class Lifecycle:
         touching the publisher, the ledger or any body. With `generation` {pid, start} and
         `proof=False` (that generation verified dead by the caller) it handles the local claims of
         exactly that generation: TURN_CONFIRMED with a verified blob publishes that body once, without
-        one answers "turn confirmed, no result", with a mismatched blob parks."""
+        one answers "turn confirmed, no result", with a mismatched blob answers as interrupted (close_turn)."""
         now = self.clock() if now is None else now
         if generation is not None:
             if proof is not False:

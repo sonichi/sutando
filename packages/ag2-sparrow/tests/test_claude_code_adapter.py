@@ -3342,6 +3342,75 @@ class InboxCli(ConnectBase):
         self.assertEqual((self.results / (u + ".txt")).read_text(), inbox.INTERRUPTED_BODY, "a committed intermediate is resumed, never retired")
         self.assertEqual(self.verb("claim", u)[1]["refused"], "%s is LIVE_READY; only ABSENT may be submitted" % u)
 
+    def test_one_recovery_pass_then_the_live_claim_delivers_a_dead_generations_verified_answer_once(self):
+        """Hold's cadence: ONE recovery pass per start, then the new generation's live claims; no second pass.
+        A verifying blob with the blob writer failing is delivered by that one pass (no blob write); one a pass
+        could not publish (results I/O) or never touched (lineage unknown) is delivered by the live claim, once."""
+        lc = inbox._lifecycle(self.root)
+        dead = {"pid": 2 ** 22 - 1, "start": "2026-01-01T00:00:00Z"}
+
+        def staged_then_rolled_back(t, body):
+            self.confirmed(t)
+            self.assertEqual(self.verb("stage", t, "turn-1", stdin=body)[0], 0)
+            lc.claims.save(dict(lc.claims.load(t), phase=inbox.lifecycle.TURN_CONFIRMED, generation=dead))
+        a, b = "task-dead-blob-eio", "task-dead-publish-eio"
+        staged_then_rolled_back(a, b"the verified answer\n")
+        staged_then_rolled_back(b, b"the other answer\n")
+        real_publish = inbox.lifecycle.Lifecycle._publish
+
+        def publish_eio_for_b(life, rec):
+            if rec["task_id"] == b:
+                raise OSError(errno.EIO, "I/O error")
+            return real_publish(life, rec)
+        with mock.patch.object(inbox.lifecycle.Lifecycle, "_commit_blob", side_effect=OSError(errno.EIO, "x")) as blob, \
+                mock.patch.object(inbox.lifecycle.Lifecycle, "_publish", publish_eio_for_b), \
+                mock.patch.object(task_io, "verify_lineage", return_value=False):
+            self.assertEqual(inbox.recover_dead_generation(self.root), 1)
+        self.assertEqual(blob.call_count, 0, "a verified blob is final: never written again")
+        self.assertEqual(((self.results / (a + ".txt")).read_text(), lc.claims.load(a)["phase"]),
+                         ("the verified answer\n", inbox.lifecycle.SETTLED), "delivered by the one pass")
+        self.assertEqual((lc.claims.load(b)["phase"], (self.results / (b + ".txt")).exists()), (inbox.lifecycle.RESULT_STAGED, False))
+        rc, out = self.verb("claim", b)
+        self.assertEqual((rc, "retry" in out, out["refused"]), (1, False, "%s: its staged answer is published now; only ABSENT may be submitted" % b), out)
+        self.assertEqual(((self.results / (b + ".txt")).read_text(), lc.claims.load(b)["phase"]), ("the other answer\n", inbox.lifecycle.SETTLED))
+        self.assertEqual(self.verb("claim", a)[1]["refused"], "%s is LIVE_READY; only ABSENT may be submitted" % a)
+        c = "task-unknown-lineage"
+        staged_then_rolled_back(c, b"the third answer\n")
+        with mock.patch.object(task_io, "verify_lineage", return_value=None):
+            self.assertEqual(inbox.recover_dead_generation(self.root), 0, "lineage unknown: recovery leaves it")
+        with mock.patch.object(inbox.lifecycle.Lifecycle, "_commit_blob", side_effect=OSError(errno.EIO, "x")) as blob:
+            rc, out = self.verb("claim", c)
+        self.assertEqual((rc, "staged and never published, is published now" in out["refused"], blob.call_count), (1, True, 0), out)
+        self.assertEqual(((self.results / (c + ".txt")).read_text(), lc.claims.load(c)["phase"]), ("the third answer\n", inbox.lifecycle.SETTLED))
+        for t in (a, b, c):
+            self.assertEqual(sum(1 for p in self.results.iterdir() if p.name == t + ".txt"), 1, "published once")
+
+    def test_a_lost_claims_publication_whose_read_back_fails_after_the_rename_settles_and_clears_in_flight(self):
+        """read_final faults after the result rename landed, inside the lost claim's publication: that claim is
+        a retry; the next claim finds the result, settles the claim on it, drops the in-flight mirror with the
+        stuck mark, and the detector sees nothing in flight (no stall)."""
+        lc = inbox._lifecycle(self.root)
+        t = "task-lost-publish-rename"
+        self.confirmed(t)
+        self.assertEqual(self.verb("stage", t, "turn-1", stdin=b"the accepted answer\n")[0], 0)
+        lc.claims.save(dict(lc.claims.load(t), phase=inbox.lifecycle.TURN_CONFIRMED))     # the move's last save never landed
+        records.write_progress(self.root, lambda rec: dict(rec, inflight=dict(
+            rec.get("inflight") or {}, **{t: {"phase": inbox.lifecycle.TURN_CONFIRMED, "turn_id": "turn-1"}})))
+        with mock.patch.object(inbox.lifecycle.Lifecycle, "read_final", side_effect=OSError(errno.EIO, "I/O error")):
+            rc, out = self.verb("claim", t)
+        self.assertEqual((rc, out.get("retry")), (1, True), out)
+        self.assertEqual(((self.results / (t + ".txt")).read_text(), lc.claims.load(t)["phase"]),
+                         ("the accepted answer\n", inbox.lifecycle.RESULT_STAGED), "the rename landed")
+        rc, out = self.verb("claim", t)
+        self.assertEqual((rc, "retry" in out, out["refused"]), (1, False, "%s is LIVE_READY; only ABSENT may be submitted" % t), out)
+        self.assertEqual(lc.claims.load(t)["phase"], inbox.lifecycle.SETTLED, "settled on the result it found")
+        plugin = records.load_plugin(self.root)
+        self.assertNotIn(t, plugin.get("inflight") or {}, "no claim path leaves a finished task in flight")
+        obs = detector.derive({}, "idle\n", plugin, 0.0, stall_min_s=10)
+        obs = detector.derive(obs, "idle\n", plugin, 601.0, stall_min_s=10)
+        self.assertIsNone(obs["stall"], "no false stall")
+        self.assertEqual(sum(1 for p in self.results.iterdir() if p.name == t + ".txt"), 1)
+
     def test_a_claim_the_mod_lost_past_its_call_is_finished_or_interrupted_at_once(self):
         """A Mod that lost its offers (a reload inside the generation) claims the task afresh: a descriptor
         with no verifying blob is answered as interrupted now, a verifying blob whose phase move was lost is
@@ -3383,24 +3452,25 @@ class InboxCli(ConnectBase):
         self.confirmed(t)
         self.assertEqual(self.verb("stage", t, "turn-1", stdin=b"the verified answer\n")[0], 0)
         lc.claims.save(dict(lc.claims.load(t), phase=inbox.lifecycle.TURN_CONFIRMED))
-        real_commit, hits = inbox.lifecycle.Lifecycle._commit_blob, []
+        real_write, hits = inbox.lifecycle.write_durable, []
 
-        def temp_write_eio_once(tmp, final, body):
-            # One EIO in _commit_blob's temp write; the final blob verifies throughout.
-            if not hits:
-                hits.append(tmp)
+        def claim_save_eio_once(path, data):
+            # One EIO in the claim save that moves the verified blob on; the blob itself is never written again.
+            if not hits and Path(path).name == "claim.json":
+                hits.append(path)
                 raise OSError(errno.EIO, "I/O error")
-            return real_commit(tmp, final, body)
-        with mock.patch.object(inbox.lifecycle.Lifecycle, "_commit_blob", staticmethod(temp_write_eio_once)):
+            return real_write(path, data)
+        with mock.patch.object(inbox.lifecycle, "write_durable", claim_save_eio_once), \
+                mock.patch.object(inbox.lifecycle.Lifecycle, "_commit_blob", side_effect=OSError(errno.EIO, "x")) as blob:
             rc, out = self.verb("claim", t)
-        self.assertEqual((rc, out.get("retry"), len(hits)), (1, True, 1), out)
-        self.assertIn("could not be closed now", out["refused"])
+        self.assertEqual((rc, out.get("retry"), len(hits), blob.call_count), (1, True, 1, 0), out)
         rec = lc.claims.load(t)
         self.assertEqual((rec["phase"], bool(rec.get("staged"))), (inbox.lifecycle.TURN_CONFIRMED, True),
                          "one I/O failure while finishing a verifying blob is a retry, never an interrupt")
         self.assertFalse((self.results / (t + ".txt")).exists())
-        rc, out = self.verb("claim", t)
-        self.assertEqual((rc, "staged and never published, is published now" in out["refused"]), (1, True), out)
+        with mock.patch.object(inbox.lifecycle.Lifecycle, "_commit_blob", side_effect=OSError(errno.EIO, "x")) as blob:
+            rc, out = self.verb("claim", t)
+        self.assertEqual((rc, "staged and never published, is published now" in out["refused"], blob.call_count), (1, True, 0), out)
         self.assertEqual((self.results / (t + ".txt")).read_text(), "the verified answer\n", "the accepted answer, nothing interrupted")
         t = "task-lost-delegated"
         self.confirmed(t)
