@@ -649,8 +649,8 @@ class RoundAccountingTest(unittest.TestCase):
                            _held_entry_ok=lambda tid, e: False,
                            _track_durably=lambda tid, inflight: True,
                            _record_pending_acks=lambda p: True)
-        self.assertEqual(fate(**redelivered, _post_task_ack=lambda *a: True), "acked")
-        self.assertIsNone(fate(**redelivered, _post_task_ack=lambda *a: False),
+        self.assertEqual(fate(**redelivered, _post_task_ack=lambda *a, **k: True), "acked")
+        self.assertIsNone(fate(**redelivered, _post_task_ack=lambda *a, **k: False),
                           "an ack that did not land is left for the round to name")
         entry = {"staged": "x"}
         advancing = dict(_write_task=written, _held_entry_ok=lambda tid, e: True)
@@ -743,23 +743,32 @@ class SlowAckTest(unittest.TestCase):
             self.skipTest(f"gateway not importable: {str(e)[:60]}")
         self.gw = gw
 
-    def _run(self, first_drop_after, hang=10.0, n_healthy=3):
+    def _run(self, first_drop_after, hang=10.0, n_healthy=3, ack_first=False):
+        import contextlib
         import http.client
-        tasks = [{"id": "task-bad", "task": "hi", "lease_id": "lease-bad"}] + [
+        bad_task = {"id": "task-bad", "task": "hi", "lease_id": "lease-bad"}
+        redelivery = contextlib.ExitStack()
+        if ack_first:
+            # A redelivered ack_first task: already queued here, so it is acked as any redelivery.
+            bad_task["ack_first"] = True
+            for name, value in (("_load_held", lambda: {}), ("_held_entry_ok", lambda tid, e: False),
+                                ("_track_durably", lambda tid, inflight: True)):
+                redelivery.enter_context(patch.object(self.gw, name, new=value))
+        tasks = [bad_task] + [
             {"id": f"task-ok{n}", "task": "hi", "lease_id": f"lease-ok{n}"} for n in range(n_healthy)]
         acks: list = []      # (task id, seconds since the poll answered, outcome, timeout)
         with _Loop(self.gw) as loop, \
                 patch.object(self.gw, "_record_pending_acks", return_value=True), \
                 patch.object(self.gw, "_forget_pending_ack", new=lambda *a, **k: None), \
                 patch.object(self.gw, "wake_outbound", new=lambda: None), \
-                patch.dict(self.gw._LOG_COUNTS, clear=True):
+                patch.dict(self.gw._LOG_COUNTS, clear=True), redelivery:
             self.gw._post_task_ack = loop._saved["_post_task_ack"]
             self.gw._write_task = lambda task, *a, **k: (task["id"], True)
             loop.served = [tasks]
             served_at: list = []
             bad_calls = [0]
 
-            def req(method, path, payload=None, timeout=None, **k):
+            def req(method, path, payload=None, timeout=None, deadline=None, **k):
                 if path.startswith("/v1/tasks?"):
                     out = loop._poll(method, path)
                     served_at.append(loop.clock.now)
@@ -769,9 +778,15 @@ class SlowAckTest(unittest.TestCase):
                 tid = payload["id"]
                 if tid == "task-bad":
                     bad_calls[0] += 1
-                    loop.clock.now += first_drop_after if bad_calls[0] == 1 else min(hang, timeout)
-                    acks.append((tid, loop.clock.now - served_at[0], "dropped", timeout))
-                    raise http.client.RemoteDisconnected("Remote end closed connection without response")
+                    if bad_calls[0] == 1:
+                        loop.clock.now += first_drop_after
+                        acks.append((tid, loop.clock.now - served_at[0], "dropped", deadline))
+                        raise http.client.RemoteDisconnected("Remote end closed connection without response")
+                    # The retry hangs; the real _req gives up at its deadline (see SlowDripTest).
+                    until = loop.clock.now + hang
+                    loop.clock.now = min(until, deadline) if deadline is not None else until
+                    acks.append((tid, loop.clock.now - served_at[0], "hung", deadline))
+                    raise TimeoutError("timed out")
                 loop.clock.now += 0.1
                 acks.append((tid, loop.clock.now - served_at[0], "ok", timeout))
                 return {"ok": True}
@@ -790,6 +805,19 @@ class SlowAckTest(unittest.TestCase):
         self.assertLessEqual(bad[1][1], self.gw.ACK_RETRY_BUDGET_S + 1e-6,
                              "the retry ends inside the budget")
         self.assertTrue(any(m.startswith("served task-bad was not acked") for m in loop.logs))
+        self.assertIn("task ack for task-bad lost to a dropped connection (Remote end closed "
+                      "connection without response) — set aside for retry", loop.logs)
+        self.assertFalse(any(m.startswith("task ack network error for task-bad: Remote end")
+                             for m in loop.logs), "pass 1 does not call a set-aside ack failed")
+
+    def test_a_redelivered_ack_first_ack_that_drops_does_not_delay_its_siblings(self):
+        loop, acks = self._run(first_drop_after=5.0, ack_first=True)
+        healthy = [a for a in acks if a[0] != "task-bad"]
+        self.assertEqual([a[0] for a in healthy], ["task-ok0", "task-ok1", "task-ok2"])
+        self.assertTrue(all(a[1] < 6.0 for a in healthy), healthy)
+        bad = [a for a in acks if a[0] == "task-bad"]
+        self.assertEqual(len(bad), 2, "the redelivery's dropped ack gets one budgeted retry")
+        self.assertLessEqual(bad[1][1], self.gw.ACK_RETRY_BUDGET_S + 1e-6, bad)
 
     def test_a_retry_the_budget_cannot_cover_is_left_to_the_pending_ack_retry(self):
         loop, acks = self._run(first_drop_after=9.0)
@@ -797,6 +825,68 @@ class SlowAckTest(unittest.TestCase):
         self.assertTrue(all(a[1] < 10.0 for a in acks if a[0] != "task-bad"), acks)
         self.assertIn("1 dropped ack(s) left to the pending-ack retry: the 10s retry budget is spent",
                       loop.logs)
+
+
+class SlowDripTest(unittest.TestCase):
+    """urllib's timeout bounds each socket operation; a body that drips in a byte at a time
+    must still end the request at its wall-clock deadline."""
+
+    def setUp(self):
+        try:
+            from ag2_sparrow import remote_gateway_bridge as gw
+        except (Exception, SystemExit) as e:  # noqa: BLE001
+            self.skipTest(f"gateway not importable: {str(e)[:60]}")
+        self.gw = gw
+
+    def _drip(self, clock, body=b'{"ok": true}' + b" " * 60, per_byte_s=1.0):
+        class _Resp:
+            status = 200
+            headers = {"Content-Length": str(len(body))}
+
+            def __init__(self):
+                self.left = body
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self, amt=None):
+                if not self.left:
+                    return b""
+                n = len(self.left) if amt is None else 1      # drips one byte per socket read
+                clock.now += per_byte_s * n
+                out, self.left = self.left[:n], self.left[n:]
+                return out
+        return _Resp
+
+    def test_a_dripping_ack_ends_at_its_deadline(self):
+        import urllib.request
+        clock = _Clock()
+        with patch.object(self.gw, "time", clock), \
+                patch.object(self.gw, "TOKEN", "secret"), patch.object(self.gw, "URL", "http://relay.invalid"), \
+                patch.object(urllib.request, "urlopen", new=lambda *a, **k: self._drip(clock)()):
+            start = clock.now
+            with self.assertRaises(TimeoutError):
+                self.gw._req("POST", "/v1/tasks/task-1/ack", {"id": "task-1"}, timeout=10,
+                             deadline=start + 5)
+            self.assertLessEqual(clock.now - start, 5 + 1, "one drip past the deadline at most")
+
+    def test_the_budgeted_retry_gives_up_at_the_budget(self):
+        import urllib.request
+        clock = _Clock()
+        logs: list = []
+        received = clock.now
+        fates = {"task-1": None}
+        with patch.object(self.gw, "time", clock), patch.object(self.gw, "_log", new=logs.append), \
+                patch.object(self.gw, "TOKEN", "secret"), patch.object(self.gw, "URL", "http://relay.invalid"), \
+                patch.object(self.gw, "_forget_pending_ack", new=lambda *a, **k: None), \
+                patch.object(urllib.request, "urlopen", new=lambda *a, **k: self._drip(clock)()):
+            self.gw._retry_dropped_acks([("task-1", True, "lease-1")], received, fates)
+        self.assertLessEqual(clock.now - received, self.gw.ACK_RETRY_BUDGET_S + 1)
+        self.assertIsNone(fates["task-1"], "a retry that ran out of budget is not acked")
+        self.assertTrue(any(m.startswith("task ack network error for task-1:") for m in logs), logs)
 
 
 class RelayResultsInTheLoopTest(unittest.TestCase):

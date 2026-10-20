@@ -2710,8 +2710,31 @@ _NETWORK_ERRORS = (urllib.error.URLError, TimeoutError, ConnectionResetError,
 _RESP_META = threading.local()
 
 
-def _req(method: str, path: str, payload: dict | None = None, timeout: int = _REQ_TIMEOUT_S):
-    """One authenticated HTTP request. Returns parsed JSON (or {} for empty)."""
+def _read_by(resp, deadline: float) -> bytes:
+    """The body, read in chunks against a wall-clock deadline: urllib's timeout bounds each
+    socket operation, so a body that drips in could otherwise run on past it."""
+    sock = getattr(getattr(getattr(resp, "fp", None), "raw", None), "_sock", None)
+    chunks = []
+    while True:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise TimeoutError("response body still arriving at its deadline")
+        if sock is not None:
+            sock.settimeout(left)
+        chunk = resp.read(4096)
+        if not chunk:
+            return b"".join(chunks)
+        chunks.append(chunk)
+
+
+def _req(method: str, path: str, payload: dict | None = None, timeout: int = _REQ_TIMEOUT_S,
+         deadline: "float | None" = None):
+    """One authenticated HTTP request. Returns parsed JSON (or {} for empty). With
+    `deadline` (time.monotonic()), the whole request must finish by then."""
+    if deadline is not None:
+        timeout = min(timeout, deadline - time.monotonic())
+        if timeout <= 0:
+            raise TimeoutError("request deadline already passed")
     data = json.dumps(payload).encode() if payload is not None else None
     req = urllib.request.Request(f"{URL}{path}", data=data, method=method)
     req.add_header("Authorization", f"Bearer {TOKEN}")
@@ -2726,7 +2749,7 @@ def _req(method: str, path: str, payload: dict | None = None, timeout: int = _RE
         _RESP_META.last = {"status": getattr(resp, "status", None),
                            "content_length": headers.get("Content-Length"),
                            "cf_ray": headers.get("CF-Ray")}
-        raw = resp.read().decode().strip()
+        raw = (resp.read() if deadline is None else _read_by(resp, deadline)).decode().strip()
         return json.loads(raw) if raw else {}
 
 
@@ -2998,13 +3021,15 @@ def _connection_dropped(e: BaseException) -> bool:
 
 
 def _post_task_ack(tid: str, durable: bool = False, lease_id: "str | None" = None,
-                   dropped: "list | None" = None, timeout: float = 10) -> bool:
+                   dropped: "list | None" = None, deadline: "float | None" = None,
+                   retry_inline: bool = True) -> bool:
     """Tell the gateway a task made it safely into the local queue. `durable`
     says the task file, its media sidecar and the in-flight set are all fsync'd,
     which is the only thing that lets the relay call the task accepted.
     `lease_id` echoes the generation the task was served under; absent for a
     broker that served none. With `dropped`, an ack lost to a dropped connection is
-    appended there for the caller to retry, instead of being retried inline."""
+    appended there for the caller to retry; without it, it is retried once inline unless
+    `retry_inline` is False. `deadline` (time.monotonic()) bounds the whole request."""
     global _ack_disabled_until
     # Validate the WIRE id (post-conversion): a named instance's LOCAL id may
     # legitimately exceed the 64-char wire bound (review P1 #1) — refusing on
@@ -3021,16 +3046,17 @@ def _post_task_ack(tid: str, durable: bool = False, lease_id: "str | None" = Non
         if durable:
             body["durable"] = True
         try:
-            _req("POST", f"/v1/tasks/{safe_tid}/ack", body, timeout=timeout)
+            _req("POST", f"/v1/tasks/{safe_tid}/ack", body, timeout=10, deadline=deadline)
         except _NETWORK_ERRORS as e:
-            if not _connection_dropped(e):
+            if not _connection_dropped(e) or (dropped is None and not retry_inline):
                 raise
             if dropped is not None:
                 dropped.append((tid, durable, lease_id))
-                raise
+                _log(f"task ack for {tid} lost to a dropped connection ({e}) — set aside for retry")
+                return False
             # A dropped link loses the ack; one prompt retry lands it inside the delivery lease.
             time.sleep(ACK_DROP_RETRY_S)
-            _req("POST", f"/v1/tasks/{safe_tid}/ack", body, timeout=timeout)
+            _req("POST", f"/v1/tasks/{safe_tid}/ack", body, timeout=10, deadline=deadline)
         _ack_disabled_until = 0.0  # success (or re-enablement) → clear any backoff
         _forget_pending_ack(tid, lease_id)
         return True
@@ -5111,8 +5137,8 @@ def _retry_dropped_acks(dropped: list, received_at: float, fates: dict) -> None:
                  f"{ACK_RETRY_BUDGET_S:g}s retry budget is spent")
             return
         time.sleep(ACK_DROP_RETRY_S)
-        # A list of its own, so a second drop is not retried inline past the budget.
-        if _post_task_ack(tid, durable, lease, dropped=[], timeout=min(10.0, left)):
+        if _post_task_ack(tid, durable, lease, retry_inline=False,
+                          deadline=received_at + ACK_RETRY_BUDGET_S):
             fates[_broker_tid(tid)] = "acked"
 
 
@@ -5175,7 +5201,8 @@ def _set_fate(fates: "dict | None", task: dict, fate: str) -> None:
         fates[_served_key(task)] = fate
 
 
-def _take_ack_first(task: dict, inflight: "set[str]", fates: "dict | None" = None) -> bool:
+def _take_ack_first(task: dict, inflight: "set[str]", fates: "dict | None" = None,
+                    dropped: "list | None" = None) -> bool:
     """A task served with `ack_first`: staged, acked on its own and published only once
     the ack is accepted, so a withdrawn ask never reaches the core. True once published."""
     written = _write_task(task, hold=True)
@@ -5192,7 +5219,7 @@ def _take_ack_first(task: dict, inflight: "set[str]", fates: "dict | None" = Non
         # Already queued or handled here: acked as any redelivery is.
         lease = _lease_id_of(task)
         if (_track_durably(tid, inflight) and _record_pending_acks([(tid, durable, lease)])
-                and _post_task_ack(tid, durable, lease)):
+                and _post_task_ack(tid, durable, lease, dropped=dropped)):
             _set_fate(fates, task, "acked")
         return False
     published = _advance_held(tid, entry, inflight)
@@ -7673,10 +7700,13 @@ def main() -> None:
             added = False
             pending_ack = []
             tasks, fates = _receive_round(_poll_task_list(resp))
+            # Every task's first ack goes before any retry, so one bad link delays no sibling.
+            dropped: list = []
             # First and on its own, so a slow task ahead cannot hold it past its delivery lease.
             for task in tasks:
                 if task.get("ack_first") is True:
-                    added |= _isolated(task, _take_ack_first, task, inflight, fates, fates=fates)
+                    added |= _isolated(task, _take_ack_first, task, inflight, fates, dropped,
+                                       fates=fates)
             for task in tasks:
                 if task.get("ack_first") is not True:
                     added |= _isolated(task, _take_served_task, task, inflight, pending_ack,
@@ -7689,8 +7719,6 @@ def main() -> None:
             if pending_ack and not committed:
                 _log(f"acks withheld for {len(pending_ack)} task(s): the in-flight set or "
                      "ack ledger did not commit")
-            # Every task's first ack goes before any retry, so one bad link delays no sibling.
-            dropped: list = []
             for tid, durable, lease in pending_ack if committed else ():
                 if _post_task_ack(tid, durable, lease, dropped=dropped):
                     fates[_broker_tid(tid)] = "acked"
