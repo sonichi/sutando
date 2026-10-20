@@ -75,7 +75,7 @@ function submittedAt(turnText: string, msg: string): number {
 // One lifecycle claim as the Mod sees it: the phase is the CLI's answer, never a shadow machine.
 type Offer = { file: string; rid: string; attempt: number; msg: string; hash: string; token: string; turnId: string; phase: string
                 confirming?: { turnId: string; hash: string; completed?: string }; stagedText?: string
-                parkPending?: string }
+                parkPending?: string; unconfirmed?: boolean }
 
 // One session's inbox state: what was seen and answered, the offers in flight, the live watch, the
 // session-id witness and whether intake is open.
@@ -233,11 +233,10 @@ async function confirmOffer($: any, s: State, offer: Offer): Promise<boolean> {
     offer.phase = 'TURN_CONFIRMED'
     return (c.completed ? (await parkOffer($, s, offer, c.completed)).hard : false) || r.hard
   }
-  await $.ui.log(`${PLUGIN}: ${offer.rid} turn not confirmed: ${r.data?.refused ?? ''}`, {})
-  // The claim stays CALLING, unanswered: the scan takes the task back (the claim is retried, backed off) and its
-  // mark stays until the claim settles (the next start answers it as interrupted) and the claim retires it.
-  s.offers.delete(offer.rid)
-  s.seen.delete(offer.file)
+  await $.ui.log(`${PLUGIN}: ${offer.rid} turn not confirmed: ${r.data?.refused ?? ''}; held until the next start answers it`, {})
+  // The claim stays CALLING with no answer and the CLI refuses to claim it again: the offer is kept, never
+  // re-claimed, and its mark stays until a result appears (the next start's interrupted answer).
+  offer.unconfirmed = true
   return r.hard
 }
 
@@ -293,6 +292,18 @@ async function arm($: any, s: State, inbox: string, results: string): Promise<{ 
 
   const retire = (name: string, rid: string, why: string, done?: () => Promise<void>) => retireTask($, s, name, rid, why, done)
 
+  // An offer whose turn was not confirmed, held: once a result appears the claim is asked again (the lifecycle
+  // decides: a resolved task is refused and released through the mark clear); until then kept, backed off.
+  const settleUnconfirmed = async (o: Offer): Promise<boolean> => {
+    const held = s.retry.get(o.file)
+    if (held && s.tick < held.next) return false
+    if (!(await $.fs.exists(`${results}/${resultName(o.rid)}`))) return retain(o.file, o.rid, 'turn not confirmed', 'no answer yet')
+    const c = await cli($, s, ['claim', o.rid])
+    if (c.hard) return true
+    if (c.ok || c.data?.retry) return retain(o.file, o.rid, 'turn not confirmed', String(c.data?.refused ?? 'claimed again'))
+    return releaseOffer($, s, o, `answered after its turn was not confirmed (${c.data?.refused ?? ''})`)
+  }
+
   const scan = async () => {
     if (busy) return
     busy = true
@@ -304,6 +315,7 @@ async function arm($: any, s: State, inbox: string, results: string): Promise<{ 
       // No reopen on a tick whose session id did not read back unchanged.
       if (s.intake === 'closed' && !stopped && (!live || !(await reopenIntake($, s)))) return
       for (const o of [...s.offers.values()]) {
+        if (o.unconfirmed) { if (await settleUnconfirmed(o)) return; continue }
         if (o.confirming) { if (await confirmOffer($, s, o)) return }
         else if (o.parkPending !== undefined) {
           const held = s.retry.get(o.file)
@@ -316,7 +328,7 @@ async function arm($: any, s: State, inbox: string, results: string): Promise<{ 
       for (const [name, c] of [...s.cleanup]) if (s.tick >= c.next && await clearMark($, s, name, c)) return
       if (!stopped && s.pending) return
       // A delivery still owed for an ended turn is retried on its own schedule; it never holds intake.
-      if (!stopped) for (const o of s.offers.values()) if ((o.phase === 'CALLING' || o.phase === 'TURN_CONFIRMED') && o.parkPending === undefined) return
+      if (!stopped) for (const o of s.offers.values()) if ((o.phase === 'CALLING' || o.phase === 'TURN_CONFIRMED') && o.parkPending === undefined && !o.unconfirmed) return
       const listed = await $.fs.list(inbox)
       for (const name of [...s.authorizing.keys()]) if (stopped || !listed.some((e: any) => e.name === name)) s.authorizing.delete(name)
       for (const entry of listed) {

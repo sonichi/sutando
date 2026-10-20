@@ -234,9 +234,11 @@ authorize refusal, an interrupted answer, and every release of a submitted
 task's offer (published by `ag2space_reply`, parked or delivered at a turn's
 end, or retried by the scan), so a mark written while the authorization was
 retried is the offer's to clear. An offer whose turn was not confirmed is the
-exception: its claim stays `CALLING` with no answer, so the mod takes the task
-back (its claim retried, backed off) and keeps the mark until the claim settles
-(the next start answers it as interrupted) and the claim's refusal retires it. Until the CLI confirms the clear (a refusal, exit 3, or
+exception: its claim stays `CALLING` with no answer and the CLI refuses a second
+claim of it as final, so the mod keeps the offer, never claims it again while it
+is unanswered, and keeps the mark. Once a result appears (the next start answers
+it as interrupted) the claim is asked again, refused as resolved, and the offer
+is released through the mark clear. Until the CLI confirms the clear (a refusal, exit 3, or
 a CLI that did not run) the mod keeps the task, retries only the clear after
 1, 2, 4 ... ticks capped at 60, and marks it seen once the clear lands; no
 mark outlives its task.
@@ -508,7 +510,10 @@ mtime delta.
   submission and a refused claim never submitted, once-only claims, one
   authorization per attempt, turn confirmation inside the CLI's frame, park on a turn without
   a reply, the inode refusal, the session-id witness, intake closing on a hard
-  progress failure).
+  progress failure). Its fake CLI is bound to `tests/cli-contract.ts`: each
+  scenario there is answered by the fake in the harness and by the real verbs in
+  the Python suite with the same shape, so the fake cannot answer what the CLI
+  does not.
 - `python3 packages/ag2-sparrow/tests/test_claude_code_adapter.py` (stdlib:
   `hold`, the inbox CLI, the detector, the launcher on a scratch tmux server
   under a short `/tmp` HOME, the card and the accepter, install, verify,

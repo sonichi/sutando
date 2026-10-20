@@ -1,4 +1,5 @@
 import { expect, mock, test } from 'claude-code/testing'
+import { CONTRACT } from './cli-contract'
 
 const WATCH = 'mcp__ag2space-inbox__ag2space_inbox_watch'
 const REPLY = 'mcp__ag2space-inbox__ag2space_reply'
@@ -100,7 +101,7 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
     return b === undefined ? 'ABSENT' : b.trim() && !b.includes('\uFFFD') ? 'LIVE_READY' : 'LIVE_UNREADY'
   }
   const out = (exitCode: number, data: any) => ({ value: { exitCode, stdout: JSON.stringify(data) + '\n', stderr: '' } })
-  on('process.run', (_: any, e: any) => {
+  const run = (_: any, e: any) => {
     runs.push([...e.argv])
     const argv: string[] = e.argv
     if (argv[0] === 'python3' && argv[2].includes('hmac')) {
@@ -183,9 +184,7 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
       }
       if (result(task) === 'LIVE_UNREADY') return out(1, { refused: `${task} is LIVE_UNREADY, not claimable yet; retried`, retry: true })
       const c = claims[task]
-      // As the CLI: an attempt in flight is not claimable yet (retried); a resolved one clears the mark, refused.
-      if (c && ['CALLING', 'TURN_CONFIRMED', 'RESULT_STAGED'].includes(c.phase)) return out(1, { refused: `${task} is ${c.phase}, not claimable yet; retried`, retry: true })
-      if (c && c.phase !== 'PREPARED') { delete stuck[task]; return out(1, { refused: `${task}: attempt ${c.attempt} is ${c.phase}` }) }
+      if (c && c.phase !== 'PREPARED') return out(1, { refused: `${task}: attempt ${c.attempt} is ${c.phase}` })
       // The CLI's admission (task_io.admission, pinned in Python): no tier is malformed; non-owners need the flag.
       const text = files[`/in/${task}.txt`] ?? ''
       const tier = text.match(/^access_tier: (\S+)/m)?.[1]
@@ -273,10 +272,11 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
       }
       c.phase = 'SETTLED'; c.body = `[AG2 Space] The session's turn ended without a reply (${argv[argv.indexOf('--detail') + 1]})`
       files[`/out/${task}.txt`] = c.body; publishes++
-      return out(0, { outcome: 'settled', parked: true })
+      return out(0, { outcome: 'settled', parked: argv[argv.indexOf('--detail') + 1] })
     }
     return out(2, { refused: 'unknown verb' })
-  })
+  }
+  on('process.run', run)
   on('prompt.submit', (_: any, e: any) => {
     if (rejectLeft-- > 0) throw new Error('session busy')
     submitted.push(e.text); return { text: e.text }
@@ -285,7 +285,9 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
     failProgress: (n: number) => { progressFailLeft = n },
     failAt: (verb: string) => { failVerb = verb },
     refuseUnstuck: (n: number) => { unstuckFailsLeft = n }, hardUnstuck: (n: number) => { unstuckHardLeft = n }, refusePark: () => { parkRefused = true },
-    lockOnce: (verb: string) => { lockFails.add(verb) }, failStageLink: () => { stageLinkFails = true } }
+    lockOnce: (verb: string) => { lockFails.add(verb) }, failStageLink: () => { stageLinkFails = true },
+    // The fake CLI called directly, as the Mod calls it: the contract test's handle.
+    cli: (argv: string[], stdin = '') => run(null, { argv: ['ag2-sparrow-claude-local', 'inbox', ...argv], init: { stdin } }) }
 }
 
 async function arm($: any, h: any, args: Record<string, string> = { inbox_dir: '/in', results_dir: '/out' }) {
@@ -1401,7 +1403,9 @@ for (const [path, drive] of Object.entries(RELEASES)) {
   })
 }
 
-test('an unconfirmed turn keeps the task and its stuck mark until the claim settles; then it is retired once', async ($, on) => {
+// The CLI refuses to claim a CALLING attempt as final (cli-contract.ts, "claim after an unconfirmed turn"), so the
+// Mod never asks it again while the claim is unanswered: it holds the offer and waits for a result.
+test('an unconfirmed turn keeps the task and its stuck mark, never re-claimed, until the next start answers it; then it is retired once', async ($, on) => {
   const h = host(on)
   h.files['/in/task-u.txt'] = TASK('task-u')
   await arm($, h)
@@ -1413,13 +1417,15 @@ test('an unconfirmed turn keeps the task and its stuck mark until the claim sett
   expect(h.claims['task-u'].phase).toBe('CALLING')
   expect(h.files['/out/task-u.txt']).toBe(undefined)
   expect(h.stuck).toEqual({ 'task-u': { since: 1 } })  // the unanswered alarm stays visible
-  expect(verbs(h).filter(v => v === 'claim').length).toBeGreaterThan(1)   // kept and retried, backed off
+  expect(verbs(h).filter(v => v === 'claim').length).toBe(1)   // held, never claimed again while unanswered
+  expect(h.runs.filter((a: string[]) => a.includes('--unstuck')).length).toBe(0)
   // The next start answers the CALLING claim as interrupted (the generation's recovery): settled, result written.
   h.claims['task-u'].phase = 'SETTLED'
   h.files['/out/task-u.txt'] = '[AG2 Space] This attempt was interrupted before the session answered\n'
   for (let i = 0; i < 70; i++) await h.clock.advance(1000)
   expect(h.stuck).toEqual({})
-  expect(h.logs.filter(l => l.includes('task-u not claimed:')).length).toBe(1)
+  expect(h.runs.filter((a: string[]) => a.includes('--unstuck') && a.includes('task-u')).length).toBe(1)
+  expect(verbs(h).filter(v => v === 'claim').length).toBe(2)   // asked once more, after the answer appeared
   const claims = verbs(h).filter(v => v === 'claim').length
   for (let i = 0; i < 70; i++) await h.clock.advance(1000)
   expect(verbs(h).filter(v => v === 'claim').length).toBe(claims)   // retired: tried no more
@@ -1647,4 +1653,28 @@ test('without a submission marker nothing is authorized or submitted, and the ta
   await h.clock.advance(1000)
   expect(h.submitted.length).toBe(1)
   expect(h.submitted[0]).toContain('[submission ')
+})
+
+// Every scenario in cli-contract.ts, which tests/test_claude_code_adapter.py runs against the real verbs: the fake
+// answers each step with the same shape (exit, refused, retry, fields, keys), so it cannot drift from the CLI.
+test('the fake CLI answers every contract scenario as the real verbs do', async ($, on) => {
+  const h = host(on, { allowNonOwner: false })
+  const diffs: string[] = []
+  for (const sc of CONTRACT as any[]) {
+    h.files[`/in/${sc.task}.txt`] = TASK(sc.task, sc.tier)
+    if (sc.result !== undefined) h.files[`/out/${sc.task}.txt`] = sc.result
+    const saved: Record<string, string> = {}
+    sc.steps.forEach((step: any, i: number) => {
+      const argv = step.argv.map((a: string) => a.startsWith('{') ? (saved[a.slice(1, -1)] ?? a) : a)
+      const r = h.cli(argv, step.stdin ?? '').value
+      const data = JSON.parse(String(r.stdout || '{}'))
+      if (step.save && data[step.save] !== undefined) saved[step.save] = String(data[step.save])
+      const got = { exit: r.exitCode, refused: 'refused' in data, retry: data.retry === true }
+      const bad = (['exit', 'refused', 'retry'] as const).filter(k => got[k] !== step.expect[k]).map(k => `${k} ${got[k]} != ${step.expect[k]}`)
+      for (const [k, v] of Object.entries(step.expect.fields ?? {})) if (data[k] !== v) bad.push(`${k} ${JSON.stringify(data[k])} != ${JSON.stringify(v)}`)
+      for (const k of step.expect.has ?? []) if (!(k in data)) bad.push(`no ${k}`)
+      if (bad.length) diffs.push(`${sc.name}, step ${i} ${argv[0]}: ${bad.join('; ')}`)
+    })
+  }
+  expect(diffs).toEqual([])
 })

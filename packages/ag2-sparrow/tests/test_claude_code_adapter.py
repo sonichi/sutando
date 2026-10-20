@@ -2817,6 +2817,24 @@ class HoldProcess(ConnectBase):
         self.assertFalse((self.results / "task-live.txt").exists())
 
 
+CONTRACT_TS = MOD / "tests" / "cli-contract.ts"
+
+
+def contract_scenarios() -> list:
+    """The scenarios the harness's fake CLI is bound to (one JSON literal in a .ts module the harness imports)."""
+    text = CONTRACT_TS.read_text()
+    return json.loads(text[text.index("export const CONTRACT = ") + len("export const CONTRACT = "):])
+
+
+def contract_shape(expect: dict, rc: int, out: dict) -> str:
+    """'' when the reply has the expected shape (exit, refused, retry, fields, keys), else what differs."""
+    got = {"exit": rc, "refused": "refused" in out, "retry": out.get("retry") is True}
+    bad = ["%s %r != %r" % (k, got[k], expect[k]) for k in ("exit", "refused", "retry") if got[k] != expect[k]]
+    bad += ["%s %r != %r" % (k, out.get(k), v) for k, v in (expect.get("fields") or {}).items() if out.get(k) != v]
+    bad += ["no %s" % k for k in expect.get("has") or [] if k not in out]
+    return "; ".join(bad)
+
+
 class InboxCli(ConnectBase):
     """The Mod's lifecycle verbs, each one CLI call under claims.lock, bound to the live consumer
     generation, mirrored into the progress record under progress.lock."""
@@ -2856,6 +2874,50 @@ class InboxCli(ConnectBase):
 
     def resolved(self, out):
         return (out.get("resolved"), out.get("answered"), out.get("interrupted"), out.get("retry"))
+
+    def test_an_unconfirmed_turn_on_the_real_verbs_stays_unresolved_with_its_mark_until_the_next_start_answers_it(self):
+        """The real verbs along the Mod's unconfirmed-turn path: a refused confirmation leaves the claim CALLING
+        and a second claim is a final refusal (so the Mod never asks it again while unanswered); the mark
+        survives reconciliation; the next start's recovery writes the interrupted answer, after which the
+        claim is refused as resolved, the mark is gone and the Mod's clear lands."""
+        t = self.task("task-uc")
+        rc, out = self.verb("claim", t)
+        attempt = str(out["attempt"])
+        h = "ab" * 32
+        token = self.verb("authorize", t, attempt, "--text-hash", h)[1]["token"]
+        rc, out = self.verb("confirm", t, "turn-1", "bad" + token, "--text-hash", h)
+        self.assertEqual((rc, out.get("retry")), (1, None), "a refused confirmation is final")
+        self.assertEqual(self.verb("progress", "--stuck", t, "--stuck-detail", "turn not confirmed")[0], 0)
+        rc, out = self.verb("claim", t)
+        self.assertEqual((rc, out.get("retry"), "is CALLING" in out["refused"]), (1, None, True), "final: never asked again")
+        self.assertEqual(self.verb("progress")[1]["stuck"].keys(), {t}, "the mark survives reconciliation while CALLING")
+        self.assertFalse((self.results / (t + ".txt")).exists())
+        with mock.patch.object(inbox.task_io, "verify_lineage", return_value=False):
+            self.assertEqual(inbox.recover_dead_generation(self.root), 1, "the next start")
+        self.assertEqual((self.results / (t + ".txt")).read_text(), inbox.INTERRUPTED_BODY)
+        rc, out = self.verb("claim", t)
+        self.assertEqual((rc, out.get("retry"), "only ABSENT" in out["refused"]), (1, None, True), "resolved: refused")
+        self.assertEqual(records.load_plugin(self.root).get("stuck") or {}, {}, "the claim cleared the mark")
+        self.assertEqual(self.verb("progress", "--unstuck", t)[0], 0, "the Mod's clear lands")
+
+    def test_every_answer_in_the_harness_contract_is_what_the_real_verbs_answer(self):
+        """The Mod harness's fake CLI is bound to tests/cli-contract.ts, scenario by scenario; the same
+        scenarios run here against the real verbs, so the fake cannot answer what the CLI does not."""
+        diffs = []
+        for sc in contract_scenarios():
+            self.task(sc["task"], sc["tier"])
+            if "result" in sc:
+                (self.results / (sc["task"] + ".txt")).write_text(sc["result"])
+            saved = {}
+            for i, step in enumerate(sc["steps"]):
+                argv = [saved.get(a[1:-1], a) if a.startswith("{") else a for a in step["argv"]]
+                rc, out = self.verb(*argv, stdin=step.get("stdin", "").encode() or None)
+                if step.get("save") and step["save"] in out:
+                    saved[step["save"]] = str(out[step["save"]])
+                want = contract_shape(step["expect"], rc, out)
+                if want:
+                    diffs.append("%s, step %d %s: %s; got %s %s" % (sc["name"], i, argv[0], want, rc, out))
+        self.assertEqual(diffs, [])
 
     def test_interrupt_answers_a_task_the_stopped_session_cannot_take_once_and_the_refusal_for_a_non_owner(self):
         t = self.task("task-late")
