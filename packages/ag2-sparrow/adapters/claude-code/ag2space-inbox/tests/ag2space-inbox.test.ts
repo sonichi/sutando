@@ -21,7 +21,7 @@ type Claim = { attempt: number; phase: string; token?: string; hash?: string; tu
 // collaborator come from a plain read of the stdin text; the real rule is pinned to Sparrow's by
 // tests/test_claude_code_adapter.py, and the lifecycle verbs by the Python inbox tests.
 function host(on: any, opts: { verdict?: string; env?: Record<string, string>; rejectSubmits?: number; verifierFails?: boolean; markerFails?: number;
-                               strict?: boolean; keyProblem?: string; policyFails?: number;
+                               strict?: boolean; lenient?: boolean; keyProblem?: string; policyFails?: number;
                                keySwap?: { from: string; to: string; signedWith: string };
                                progressFails?: number; sessionIds?: string[]; cwdInode?: string; allowNonOwner?: boolean;
                                claimAs?: Record<string, unknown>; interruptParks?: number; interruptThrows?: number;
@@ -169,13 +169,13 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
       const verdict = argv[argv.indexOf('--verdict') + 1]
       const at = argv.indexOf('--key-seen')
       if (at > 0 && argv[at + 1] !== keyNow) {
-        return out(0, { verdict, mode: opts.strict ? 'strict' : 'off', submit: false, retry: true,
+        return out(0, { verdict, mode: opts.strict ? 'strict' : opts.lenient ? 'lenient' : 'off', submit: false, retry: true,
                         reason: 'the key file changed after this envelope was verified; verified again' })
       }
       const keyProblem = opts.keySwap ? (keyNow === 'absent' ? '/k/task-hmac.key missing' : '') : opts.keyProblem
       const reason = verdict === 'invalid' ? 'envelope invalid' : !opts.strict ? '' : keyProblem ? `strict mode: ${keyProblem}`
         : verdict !== 'verified' ? `strict mode: envelope ${verdict}` : ''
-      return out(0, { verdict, mode: opts.strict ? 'strict' : 'off', submit: !reason, reason, retry: verdict !== 'invalid' && !!(opts.strict && keyProblem) })
+      return out(0, { verdict, mode: opts.strict ? 'strict' : opts.lenient ? 'lenient' : 'off', submit: !reason, reason, retry: verdict !== 'invalid' && !!(opts.strict && keyProblem) })
     }
     if (verb === 'claim') {
       if (result(task) === 'LIVE_READY') {
@@ -267,11 +267,13 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
       return answer({ ...done, answered: true, interrupted: true })
     }
     if (verb === 'park') {
-      if (!c || c.phase !== 'TURN_CONFIRMED' || c.turnId !== argv[4]) return out(1, { refused: 'not this turn' })
+      // As the CLI: an accepted answer (its descriptor recorded) is published whatever the turn, never the failure.
+      const accepted = !!c && c.staged !== undefined && (c.phase === 'TURN_CONFIRMED' || c.phase === 'RESULT_STAGED')
+      if (!accepted && (!c || c.phase !== 'TURN_CONFIRMED' || c.turnId !== argv[4])) return out(1, { refused: 'not this turn' })
       if (parkRefused || opts.parkAlwaysRefuses || parkRefusesLeft-- > 0) { parkRefused = false; return out(1, { refused: `${task}: publication parked` }) }
-      // As the CLI: a recorded descriptor with no verifying blob parks every time, until an identical stage.
-      if (c.staged !== undefined && !c.blobOk) return out(1, { refused: `${task}: publication parked` })
-      if (c.staged !== undefined) {         // an accepted answer: the CLI publishes it, never the protocol failure
+      // A recorded descriptor with no verifying blob is retried every time, until an identical stage.
+      if (accepted && !c!.blobOk) return out(1, { refused: `${task}: the accepted answer's staging has not finished; retried`, retry: true })
+      if (accepted) {
         c.phase = 'SETTLED'; c.body = c.staged; files[`/out/${task}.txt`] = c.body; publishes++
         return out(0, { outcome: 'settled', parked: false })
       }
@@ -1688,9 +1690,11 @@ test('without a submission marker nothing is authorized or submitted, and the ta
 // Every scenario in cli-contract.ts, which tests/test_claude_code_adapter.py runs against the real verbs: the fake
 // answers each step with the same shape (exit, refused, retry, fields, keys), so it cannot drift from the CLI.
 test('the fake CLI answers every contract scenario as the real verbs do', async ($, on) => {
-  const h = host(on, { allowNonOwner: false })
+  const o: any = { allowNonOwner: false }
+  const h = host(on, o)
   const diffs: string[] = []
   for (const sc of CONTRACT as any[]) {
+    o.lenient = sc.hmac === 'lenient'                  // the Python side records the same choice in the config
     h.files[`/in/${sc.task}.txt`] = TASK(sc.task, sc.tier)
     if (sc.result !== undefined) h.files[`/out/${sc.task}.txt`] = sc.result
     if (sc.archived !== undefined) h.files[`/out/archive/${sc.task}.txt`] = sc.archived

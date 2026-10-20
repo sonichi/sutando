@@ -240,7 +240,13 @@ Instead it marks the task stuck on each backed-off try; the CLI's reply keeps
 only the marks of unresolved tasks (from the lifecycle: the claim settled, or a
 result live and ready, archived or quarantined), so once the next start answers
 it as interrupted, even if that answer is already archived, the mark is missing
-from the reply and the offer is released through the mark clear. Until the CLI confirms the clear (a refusal, exit 3, or
+from the reply and the offer is released through the mark clear. Deferred
+(#5747): the held set lives in the mod's memory, so a fresh mod in a live
+session (a plugin reload without a session restart) claims such a task again,
+gets the CLI's final refusal for a `CALLING` attempt, and retires it, clearing
+its mark while it is still unanswered. Fix sketch: the mod persists its held
+set beside the stuck mark in the progress record and reads it back at arm.
+Until the CLI confirms the clear (a refusal, exit 3, or
 a CLI that did not run) the mod keeps the task, retries only the clear after
 1, 2, 4 ... ticks capped at 60, and marks it seen once the clear lands; no
 mark outlives its task.
@@ -514,8 +520,24 @@ mtime delta.
   a reply, the inode refusal, the session-id witness, intake closing on a hard
   progress failure). Its fake CLI is bound to `tests/cli-contract.ts`: each
   scenario there is answered by the fake in the harness and by the real verbs in
-  the Python suite with the same shape, so the fake cannot answer what the CLI
-  does not.
+  the Python suite, and every step must have the same shape (exit code,
+  refused, retry, the named fields and keys). Covered: `claim` (absent,
+  not admitted, ready or unready result, prepared again, `CALLING`, after an
+  unconfirmed turn), `authorize` (twice, unclaimed, another text), `confirm`
+  (the authorized turn, a bad nonce), `stage` (another turn, this turn, another
+  body), `publish` (staged, nothing staged), `park` (another turn, the protocol
+  failure, a staged answer), `interrupt` (absent, again, unready, ready,
+  `CALLING`), `progress` (`--stuck`/`--unstuck`, the marks kept for an unresolved
+  task and dropped for a ready, archived or published one, session, intake and
+  generation writes), `envelope` with no key path (off) and with the opt-out
+  (lenient), and `check-inode` against another inode. Not covered: `envelope`
+  in strict mode (the fake answers from the test's options; the rule itself is
+  pinned against `hmac_policy` and the verb by the Python sweep), `check-inode`
+  on the matching inode, and the injected faults (claims-lock, store and
+  unreadable-claim failures, exit 3 mirror failures, a staged answer whose blob
+  is not in place, refused or failed `--unstuck` and `park`, a CLI that does not
+  run): those are failure modes the fake injects, pinned against the real verbs
+  separately in the Python suite.
 - `python3 packages/ag2-sparrow/tests/test_claude_code_adapter.py` (stdlib:
   `hold`, the inbox CLI, the detector, the launcher on a scratch tmux server
   under a short `/tmp` HOME, the card and the accepter, install, verify,

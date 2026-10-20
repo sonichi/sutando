@@ -2911,6 +2911,8 @@ class InboxCli(ConnectBase):
         scenarios run here against the real verbs, so the fake cannot answer what the CLI does not."""
         diffs = []
         for sc in contract_scenarios():
+            # The harness answers envelope from its options; the same choice is recorded in the config here.
+            self.configure(**{"off": {"HMAC_KEY_FILE": "", "HMAC_STRICT": ""}, "lenient": {"HMAC_STRICT": "0"}}.get(sc.get("hmac"), {}))
             self.task(sc["task"], sc["tier"])
             if "result" in sc:
                 (self.results / (sc["task"] + ".txt")).write_text(sc["result"])

@@ -1089,5 +1089,365 @@ export const CONTRACT = [
     }
    }
   ]
+ },
+ {
+  "name": "envelope with no key path (off)",
+  "task": "task-e1",
+  "tier": "owner",
+  "hmac": "off",
+  "steps": [
+   {
+    "argv": [
+     "envelope",
+     "--verdict",
+     "unsigned"
+    ],
+    "expect": {
+     "exit": 0,
+     "refused": false,
+     "retry": false,
+     "fields": {
+      "mode": "off",
+      "submit": true
+     }
+    }
+   },
+   {
+    "argv": [
+     "envelope",
+     "--verdict",
+     "verified"
+    ],
+    "expect": {
+     "exit": 0,
+     "refused": false,
+     "retry": false,
+     "fields": {
+      "mode": "off",
+      "submit": true
+     }
+    }
+   },
+   {
+    "argv": [
+     "envelope",
+     "--verdict",
+     "unverifiable"
+    ],
+    "expect": {
+     "exit": 0,
+     "refused": false,
+     "retry": false,
+     "fields": {
+      "mode": "off",
+      "submit": true
+     }
+    }
+   },
+   {
+    "argv": [
+     "envelope",
+     "--verdict",
+     "invalid"
+    ],
+    "expect": {
+     "exit": 0,
+     "refused": false,
+     "retry": false,
+     "fields": {
+      "mode": "off",
+      "submit": false
+     }
+    }
+   }
+  ]
+ },
+ {
+  "name": "envelope with the opt-out recorded (lenient)",
+  "task": "task-e2",
+  "tier": "owner",
+  "hmac": "lenient",
+  "steps": [
+   {
+    "argv": [
+     "envelope",
+     "--verdict",
+     "unsigned"
+    ],
+    "expect": {
+     "exit": 0,
+     "refused": false,
+     "retry": false,
+     "fields": {
+      "mode": "lenient",
+      "submit": true
+     }
+    }
+   },
+   {
+    "argv": [
+     "envelope",
+     "--verdict",
+     "verified"
+    ],
+    "expect": {
+     "exit": 0,
+     "refused": false,
+     "retry": false,
+     "fields": {
+      "mode": "lenient",
+      "submit": true
+     }
+    }
+   },
+   {
+    "argv": [
+     "envelope",
+     "--verdict",
+     "unverifiable"
+    ],
+    "expect": {
+     "exit": 0,
+     "refused": false,
+     "retry": false,
+     "fields": {
+      "mode": "lenient",
+      "submit": true
+     }
+    }
+   },
+   {
+    "argv": [
+     "envelope",
+     "--verdict",
+     "invalid"
+    ],
+    "expect": {
+     "exit": 0,
+     "refused": false,
+     "retry": false,
+     "fields": {
+      "mode": "lenient",
+      "submit": false
+     }
+    }
+   }
+  ]
+ },
+ {
+  "name": "interrupt a calling task",
+  "task": "task-i4",
+  "tier": "owner",
+  "steps": [
+   {
+    "argv": [
+     "claim",
+     "task-i4"
+    ],
+    "save": "attempt",
+    "expect": {
+     "exit": 0,
+     "refused": false,
+     "retry": false,
+     "has": [
+      "attempt"
+     ]
+    }
+   },
+   {
+    "argv": [
+     "authorize",
+     "task-i4",
+     "{attempt}",
+     "--text-hash",
+     "abababababababababababababababababababababababababababababababab"
+    ],
+    "save": "token",
+    "expect": {
+     "exit": 0,
+     "refused": false,
+     "retry": false,
+     "has": [
+      "token"
+     ]
+    }
+   },
+   {
+    "argv": [
+     "interrupt",
+     "task-i4",
+     "--detail",
+     "stopped"
+    ],
+    "expect": {
+     "exit": 0,
+     "refused": false,
+     "retry": false,
+     "fields": {
+      "resolved": true
+     }
+    }
+   }
+  ]
+ },
+ {
+  "name": "check-inode against another inode",
+  "task": "task-n1",
+  "tier": "owner",
+  "steps": [
+   {
+    "argv": [
+     "check-inode",
+     "--dir",
+     ".",
+     "--expect",
+     "0:0"
+    ],
+    "expect": {
+     "exit": 1,
+     "refused": true,
+     "retry": false
+    }
+   }
+  ]
+ },
+ {
+  "name": "progress session, intake and generation writes",
+  "task": "task-g1",
+  "tier": "owner",
+  "steps": [
+   {
+    "argv": [
+     "progress",
+     "--session-id",
+     "sid-x",
+     "--intake",
+     "open",
+     "--bind-generation"
+    ],
+    "expect": {
+     "exit": 0,
+     "refused": false,
+     "retry": false
+    }
+   },
+   {
+    "argv": [
+     "progress",
+     "--intake",
+     "stopped",
+     "--reason",
+     "session-clear"
+    ],
+    "expect": {
+     "exit": 0,
+     "refused": false,
+     "retry": false
+    }
+   },
+   {
+    "argv": [
+     "progress",
+     "--intake",
+     "open",
+     "--reason",
+     ""
+    ],
+    "expect": {
+     "exit": 0,
+     "refused": false,
+     "retry": false
+    }
+   }
+  ]
+ },
+ {
+  "name": "park a turn whose answer is staged: the staged answer is published",
+  "task": "task-k2",
+  "tier": "owner",
+  "steps": [
+   {
+    "argv": [
+     "claim",
+     "task-k2"
+    ],
+    "save": "attempt",
+    "expect": {
+     "exit": 0,
+     "refused": false,
+     "retry": false,
+     "has": [
+      "attempt"
+     ]
+    }
+   },
+   {
+    "argv": [
+     "authorize",
+     "task-k2",
+     "{attempt}",
+     "--text-hash",
+     "abababababababababababababababababababababababababababababababab"
+    ],
+    "save": "token",
+    "expect": {
+     "exit": 0,
+     "refused": false,
+     "retry": false,
+     "has": [
+      "token"
+     ]
+    }
+   },
+   {
+    "argv": [
+     "confirm",
+     "task-k2",
+     "turn-1",
+     "{token}",
+     "--text-hash",
+     "abababababababababababababababababababababababababababababababab"
+    ],
+    "expect": {
+     "exit": 0,
+     "refused": false,
+     "retry": false
+    }
+   },
+   {
+    "argv": [
+     "stage",
+     "task-k2",
+     "turn-1"
+    ],
+    "stdin": "ans\n",
+    "expect": {
+     "exit": 0,
+     "refused": false,
+     "retry": false,
+     "fields": {
+      "outcome": "staged"
+     }
+    }
+   },
+   {
+    "argv": [
+     "park",
+     "task-k2",
+     "turn-1",
+     "--detail",
+     "turn completed without a reply"
+    ],
+    "expect": {
+     "exit": 0,
+     "refused": false,
+     "retry": false,
+     "fields": {
+      "outcome": "settled",
+      "parked": false
+     }
+    }
+   }
+  ]
  }
 ]
