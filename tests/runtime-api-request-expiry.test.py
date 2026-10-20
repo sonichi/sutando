@@ -12,6 +12,13 @@ import unittest
 from contextlib import closing
 from pathlib import Path
 
+# A harness may supply a private socket root; read before isolation clears it.
+SUPPLIED_SOCKET = os.environ.get("SUTANDO_RUNTIME_SOCKET")
+from _helpers.hermetic_env import isolate_os_environ, isolated_child_env  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src" / "runtime-api"))
 from ha_adapter import DEFAULT_TTL_S, HumanActionAdapter, ha_action_id
@@ -28,8 +35,8 @@ OWNER = "@owner:synthetic"
 
 class ExpiryJourneyTests(unittest.TestCase):
     def setUp(self):
-        self.env = os.environ.copy()
-        supplied_socket = self.env.get("SUTANDO_RUNTIME_SOCKET")
+        self.env = isolated_child_env()
+        supplied_socket = SUPPLIED_SOCKET
         environment_file = (Path(supplied_socket).parent / "environment.json"
                             if supplied_socket else None)
         if environment_file and environment_file.is_file():

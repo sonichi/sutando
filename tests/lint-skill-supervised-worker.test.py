@@ -16,6 +16,10 @@ import tempfile
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
 _spec = importlib.util.spec_from_file_location("lint_skill", REPO / "scripts" / "lint-skill.py")
 lint = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(lint)

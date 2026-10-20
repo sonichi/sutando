@@ -30,7 +30,7 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.append(str(Path(__file__).resolve().parents[3] / "tests"))
-from _helpers.hermetic_env import hermetic_env, isolate_os_environ  # noqa: E402
+from _helpers.hermetic_env import hermetic_env, isolate_os_environ, isolated_child_env  # noqa: E402
 from _helpers.subprocess_coverage import covered_code  # noqa: E402
 
 # Before anything below reads the environment: no outer credential selector survives.
@@ -599,7 +599,7 @@ class ConnectBase(unittest.TestCase):
         return json.loads(p.read_text()) if p.exists() else None
 
     def hold_env(self, root=None, **extra):
-        env = dict(os.environ, PYTHONPATH=str(PKG))
+        env = isolated_child_env(PYTHONPATH=str(PKG))
         env.update({hold_mod.ENV_ROOT: root or str(self.work), hold_mod.ENV_CONFIG_DIR: str(cli.config_dir()),
                     hold_mod.ENV_SESSION_ID: SESSION_ID, hold_mod.ENV_HITL_STORE: str(cli.hitl_store_root())})
         env.update(extra)
@@ -5098,7 +5098,7 @@ class OldMainHitl(CardBase):
         fixture = repo / "tests" / "fixtures" / "old_main" / "hitl_pre_local"
         self.assertTrue((fixture / "hitl" / "manager.py").is_file(), "the checked-in fixture")
         r = subprocess.run([sys.executable, "-c", "import sys; sys.path[:0] = [%r, %r]\n%s" % (str(fixture), str(repo / "src"), code)],
-                           capture_output=True, text=True, env=dict(os.environ, PYTHONPATH=""))
+                           capture_output=True, text=True, env=isolated_child_env(PYTHONPATH=""))
         self.assertEqual(r.returncode, 0, r.stderr)
         return r.stdout
 

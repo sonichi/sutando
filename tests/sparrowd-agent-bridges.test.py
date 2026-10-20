@@ -240,7 +240,7 @@ class Wrapper(Base):
                         device=os.environ.get("AG2_DEVICE_ENV"), token_file=os.environ.get("REMOTE_TASK_TOKEN_FILE"),
                         room=os.environ.get("REMOTE_PROACTIVE_ROOM"), keep=os.environ.get("KEEP_ME"),
                         extra=sorted(set(os.environ) - set(base) - set(bridge.HOST_ONLY)))
-        base = dict(os.environ)
+        base = set(os.environ)
         asked = []
         rc = bridge.main([str(decl)], workspace=self.ws, get_key=lambda k: asked.append(k) or "tok-agent", run=fake_run)
         self.assertEqual(rc, 0)

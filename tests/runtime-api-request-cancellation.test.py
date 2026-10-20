@@ -11,6 +11,11 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
+from _helpers.hermetic_env import isolate_os_environ, isolated_child_env  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src" / "runtime-api"))
 
@@ -43,7 +48,7 @@ class RequestCancellationTests(unittest.TestCase):
         self.workspace = self.base / "workspace"
         self.state = self.workspace / "state"
         self.socket = self.base / "api.sock"
-        self.env = dict(os.environ)
+        self.env = isolated_child_env()
         self.env.update({
             "SUTANDO_TEST_MODE": "1", "SUTANDO_PACKAGED": "", "SUTANDO_APP_SUPPORT": "",
             "SUTANDO_WORKSPACE": str(self.workspace),

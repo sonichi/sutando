@@ -26,6 +26,12 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from _helpers.hermetic_env import isolate_os_environ, isolated_child_env  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 REPO = Path(__file__).resolve().parents[3]
 SCRIPT = REPO / "skills" / "process-hygiene" / "scripts" / "reap_orphans.py"
 
@@ -645,7 +651,7 @@ class Spotlight(unittest.TestCase):
 
 def start_time(pid):
     out = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True,
-                         env=dict(os.environ, LC_ALL="C")).stdout
+                         env=isolated_child_env(LC_ALL="C")).stdout
     return " ".join(out.split())
 
 

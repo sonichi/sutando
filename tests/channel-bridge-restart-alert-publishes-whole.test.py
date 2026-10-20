@@ -23,6 +23,11 @@ import time
 import unittest
 from pathlib import Path
 
+from _helpers.hermetic_env import isolate_os_environ, isolated_child_env  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 REPO = Path(__file__).resolve().parents[1]
 NOW = "1700000000"
 
@@ -57,7 +62,7 @@ class RestartAlertPublishesWhole(unittest.TestCase):
             canary.write_text("")
             os.link(canary, alert)
 
-            env = {k: v for k, v in os.environ.items() if not k.startswith(("SUTANDO_", "AG2_", "REMOTE_"))}
+            env = isolated_child_env()
             env.update(PATH=f"{shims}:{env.get('PATH', '')}", HOME=str(root), SLACK_BOT_TOKEN="x-test",
                        SUTANDO_CHANNEL_BRIDGE_PYTHON=str(root / "python"),
                        SUTANDO_CHANNEL_BRIDGE_RESTART_DELAY="5")

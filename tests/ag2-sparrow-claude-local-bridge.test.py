@@ -16,6 +16,10 @@ from unittest import mock
 
 REPO = Path(__file__).resolve().parent.parent
 PKG = REPO / "packages" / "ag2-sparrow"
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
 TMP = Path(tempfile.mkdtemp(prefix="cl-bridge-"))
 os.environ["HOME"] = str(TMP / "home")
 (TMP / "home").mkdir()
