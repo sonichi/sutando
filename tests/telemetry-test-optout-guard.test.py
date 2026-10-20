@@ -145,6 +145,18 @@ with tempfile.TemporaryDirectory() as fresh_home, mock.patch.dict(
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     check("in-process: a temp HOME → ephemeral_identity() True", mod.ephemeral_identity() is True)
+    with mock.patch.dict(os.environ, {"SUTANDO_STATE_DIR": os.path.join(fresh_home, "state")}):
+        os.environ.pop("SUTANDO_TELEMETRY", None)
+        os.environ.pop("DO_NOT_TRACK", None)
+        check("in-process: a temp HOME with no opt-out variable → opted_out() True", mod.opted_out() is True)
+    folders = os.path.join(os.sep, "fake-var-folders")
+    check("the macOS per-user temp <folders>/<x>/<y>/T counts, its siblings do not",
+          mod._macos_user_temp(os.path.join(folders, "ab", "cd", "T", "tmp1"), folders)
+          and not mod._macos_user_temp(os.path.join(folders, "ab", "cd", "C", "x"), folders)
+          and not mod._macos_user_temp(os.path.join(folders, "ab"), folders))
+    win = {"LOCALAPPDATA": "C:\\Users\\u\\AppData\\Local", "SYSTEMROOT": "C:\\Windows", "TEMP": "D:\\custom"}
+    check("Windows roots are LOCALAPPDATA\\Temp and SystemRoot\\Temp, never TEMP",
+          mod._fixed_temp_roots(nt=True, env=win) == ["C:\\Users\\u\\AppData\\Local\\Temp", "C:\\Windows\\Temp"])
     os.environ["SUTANDO_TELEMETRY"] = "1"
     check("in-process: an explicit SUTANDO_TELEMETRY=1 wins over a temp HOME", mod.ephemeral_identity() is False)
     os.environ.pop("SUTANDO_TELEMETRY")

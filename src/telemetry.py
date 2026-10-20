@@ -52,6 +52,7 @@ Config
 from __future__ import annotations
 
 import json
+import ntpath
 import os
 import subprocess
 import sys
@@ -113,10 +114,11 @@ def _durable_id_path() -> Path:
     return base / "telemetry-id"
 
 
-def _fixed_temp_roots() -> list[str]:
+def _fixed_temp_roots(nt: bool = os.name == "nt", env=None) -> list[str]:
     """The OS's fixed temp locations; never one chosen through TMPDIR/TEMP/TMP or the cwd fallback."""
-    if os.name == "nt":
-        return [os.path.join(os.environ[v], "Temp") for v in ("LOCALAPPDATA", "SYSTEMROOT") if os.environ.get(v)]
+    env = os.environ if env is None else env
+    if nt:
+        return [ntpath.join(env[v], "Temp") for v in ("LOCALAPPDATA", "SYSTEMROOT") if env.get(v)]
     return ["/tmp", "/var/tmp"]
 
 
@@ -125,9 +127,9 @@ def _within(target: str, root: str) -> bool:
     return target == root or target.startswith(root + os.sep)
 
 
-def _macos_user_temp(target: str) -> bool:
+def _macos_user_temp(target: str, folders: str = "") -> bool:
     """Under the per-user temp dir macOS assigns, ``/var/folders/<x>/<y>/T``."""
-    folders = os.path.normcase(os.path.realpath("/var/folders")).rstrip(os.sep)
+    folders = (folders or os.path.normcase(os.path.realpath("/var/folders"))).rstrip(os.sep)
     if not target.startswith(folders + os.sep):
         return False
     parts = target[len(folders) + 1:].split(os.sep)
