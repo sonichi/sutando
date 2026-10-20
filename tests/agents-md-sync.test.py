@@ -16,12 +16,16 @@ CLAUDE = (REPO / "CLAUDE.md").read_text()
 AGENTS = (REPO / "AGENTS.md").read_text()
 
 failures = []
+passed = 0
 
 
 def check(name: str, condition: bool) -> None:
+    global passed
     print(("  ok  " if condition else "  FAIL ") + name)
     if not condition:
         failures.append(name)
+    else:
+        passed += 1
 
 
 sync = subprocess.run(
@@ -46,6 +50,17 @@ check(
     "For the Claude runtime" in AGENTS
     and "For the Codex runtime" in AGENTS
     and "refresh-skill.sh` does not update Codex" in AGENTS,
+)
+
+DELEGATION_DOC = (REPO / "docs" / "subagent-delegation.md").read_text()
+check(
+    "heavy-work delegation default reaches both runtimes",
+    all("**Heavy work goes to a SUBAGENT by default**" in f for f in (CLAUDE, AGENTS))
+    and all("never report work as delegated when nothing was spawned" in f for f in (CLAUDE, AGENTS)),
+)
+check(
+    "delegation doc names each runtime's mechanism",
+    "run_in_background: true" in DELEGATION_DOC and "`spawn_agent`" in DELEGATION_DOC,
 )
 
 # Execute the documented import setup from a nested, repo-contained script.
@@ -86,4 +101,4 @@ if failures:
     print(f"Results: {len(failures)} failed")
     raise SystemExit(1)
 
-print("Results: 5 passed")
+print(f"Results: {passed} passed")
