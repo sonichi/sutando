@@ -76,6 +76,8 @@ class StartCliPersonalClaudeHookWiringTest(unittest.TestCase):
             REPO / "src/agent/restart-guard.sh",
             self.root / "src/agent/restart-guard.sh",
         )
+        for name in ("src/agent/core-runtime-record.sh", "src/core_runtime_record.py", "src/result_publish.py"):
+            shutil.copy2(REPO / name, self.root / name)
         shutil.copy2(
             REPO / "src/agent/task-event-handler-lookup.sh",
             self.root / "src/agent/task-event-handler-lookup.sh",
