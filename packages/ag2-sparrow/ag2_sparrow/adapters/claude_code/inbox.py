@@ -151,6 +151,7 @@ COMMITTED_FIELDS = {
     if rec["phase"] == lifecycle.CALLING and (rec.get("call") or {}).get("nonce") else {},
     "confirm": lambda rec: {"turn_id": rec.get("turn_id")} if rec["phase"] == lifecycle.TURN_CONFIRMED else {},
     "stage": lambda rec: {"outcome": "staged"} if rec["phase"] == lifecycle.RESULT_STAGED else {},
+    "publish": lambda rec: {"outcome": "settled"} if rec["phase"] == lifecycle.SETTLED else {},
 }
 
 
@@ -346,6 +347,9 @@ def stage(root, task_id, turn_id, body: bytes) -> dict:
 def publish(root, task_id) -> dict:
     lc = _lifecycle(root)
     with _claims_step(root, lc, task_id, "publish"):
+        rec = lc.claims.load(task_id)
+        if rec and rec["phase"] == lifecycle.TURN_CONFIRMED and rec.get("staged"):
+            lc.finish_staged(task_id)       # an accepted answer whose move did not finish: that body, no other
         outcome = lc.publish_and_settle(task_id)
     if outcome != "settled":
         raise Refused("%s: publication %s" % (task_id, outcome))
@@ -353,7 +357,11 @@ def publish(root, task_id) -> dict:
 
 
 def park(root, task_id, turn_id, detail) -> dict:
-    """A completed or aborted turn with nothing staged: the explicit protocol failure, published once."""
+    """A completed or aborted turn with nothing staged: the explicit protocol failure, published once.
+    A turn whose answer was already accepted (its descriptor recorded) publishes that answer instead."""
+    rec = _lifecycle(root).claims.load(task_id)
+    if rec and rec.get("staged") and rec["phase"] in (lifecycle.TURN_CONFIRMED, lifecycle.RESULT_STAGED):
+        return dict(publish(root, task_id), parked=False)
     body = (PROTOCOL_FAILURE % detail).encode("utf-8")
     staged = stage(root, task_id, turn_id, body)
     out = publish(root, task_id)

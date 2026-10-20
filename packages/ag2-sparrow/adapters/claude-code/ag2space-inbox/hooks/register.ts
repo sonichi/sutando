@@ -70,7 +70,8 @@ function submittedAt(turnText: string, msg: string): number {
 
 // One lifecycle claim as the Mod sees it: the phase is the CLI's answer, never a shadow machine.
 type Offer = { file: string; rid: string; attempt: number; msg: string; hash: string; token: string; turnId: string; phase: string
-                confirming?: { turnId: string; hash: string; completed?: string }; stagedText?: string }
+                confirming?: { turnId: string; hash: string; completed?: string }; stagedText?: string
+                parkPending?: string }
 
 // One session's inbox state: what was seen and answered, the offers in flight, the live watch, the
 // session-id witness and whether intake is open.
@@ -153,9 +154,21 @@ async function witness($: any, s: State, where: string): Promise<boolean> {
 }
 
 // A turn completed or aborted with nothing staged: the explicit protocol failure, published once, never replayed.
+// The turn ended: an accepted answer (its text staged, or its stage left unfinished) is delivered as it
+// is, else the protocol failure; anything not published keeps the offer, retried by the next tick.
 async function parkOffer($: any, s: State, offer: Offer, reason: string) {
-  const r = await cli($, s, ['park', offer.rid, offer.turnId, '--detail', `turn ${reason} without a reply`])
-  await $.ui.log(`${PLUGIN}: ${offer.rid} parked: turn ${reason} without a reply (${r.ok ? 'answered as a protocol failure' : r.data?.refused ?? ''})`, {})
+  if (offer.stagedText !== undefined && offer.phase === 'TURN_CONFIRMED') {
+    const st = await cli($, s, ['stage', offer.rid, offer.turnId], offer.stagedText + '\n')
+    if (st.ok || (st.hard && st.data?.outcome === 'staged')) offer.phase = 'RESULT_STAGED'
+  }
+  const r = offer.phase === 'RESULT_STAGED' ? await cli($, s, ['publish', offer.rid])
+    : await cli($, s, ['park', offer.rid, offer.turnId, '--detail', `turn ${reason} without a reply`])
+  if (!(r.ok || (r.hard && r.data?.outcome === 'settled'))) {
+    if (offer.parkPending === undefined) await $.ui.log(`${PLUGIN}: ${offer.rid} not delivered at the turn's end (${r.data?.refused ?? r.data?.error ?? ''}); retried`, {})
+    offer.parkPending = reason
+    return
+  }
+  await $.ui.log(`${PLUGIN}: ${offer.rid} delivered at the turn's end (${offer.stagedText !== undefined || r.data?.parked === false ? 'the accepted answer' : 'the protocol failure'})`, {})
   s.offers.delete(offer.rid)
   s.answered.add(offer.rid)
 }
@@ -239,7 +252,10 @@ async function arm($: any, s: State, inbox: string, results: string): Promise<{ 
       const stopped = sessionStopped(s)
       // No reopen on a tick whose session id did not read back unchanged.
       if (s.intake === 'closed' && !stopped && (!live || !(await reopenIntake($, s)))) return
-      for (const o of [...s.offers.values()]) if (o.confirming) await confirmOffer($, s, o)
+      for (const o of [...s.offers.values()]) {
+        if (o.confirming) await confirmOffer($, s, o)
+        else if (o.parkPending !== undefined) await parkOffer($, s, o, o.parkPending)
+      }
       if (!stopped && s.pending) return
       if (!stopped) for (const o of s.offers.values()) if (o.phase === 'CALLING' || o.phase === 'TURN_CONFIRMED') return
       for (const entry of await $.fs.list(inbox)) {
@@ -424,7 +440,9 @@ export const register: Register = (on) => {
     for (const offer of [...s.offers.values()]) {
       // Its confirmation still pending: parked once it lands, so the turn's end is never lost.
       if (offer.confirming?.turnId === e.turnId) { offer.confirming.completed = String(e.reason); continue }
-      if (offer.turnId === e.turnId && offer.phase === 'TURN_CONFIRMED') await parkOffer($, s, offer, String(e.reason))
+      if (offer.turnId === e.turnId && (offer.phase === 'TURN_CONFIRMED' || offer.phase === 'RESULT_STAGED')) {
+        await parkOffer($, s, offer, String(e.reason))
+      }
     }
     return next(e)
   })
@@ -454,14 +472,16 @@ export const register: Register = (on) => {
     if (!text.trim()) return { result: 'Error: text is empty; Sparrow never delivers a blank body', isError: true }
     if (!results) return { result: 'Error: no results dir: arm ag2space_inbox_watch or set AG2_RESULTS_DIR', isError: true }
     const again = ' (transient: call ag2space_reply again with the same text)'
-    if (offer.phase === 'RESULT_STAGED' && text !== offer.stagedText) {
+    if ((offer.phase === 'RESULT_STAGED' || offer.stagedText !== undefined) && text !== offer.stagedText) {
       // The staged answer is the one publication delivers: a different text is refused, never swapped in.
       return { result: `Error: an answer is already staged for ${id} and is the one that will be delivered; call ` +
         `ag2space_reply again with exactly that text to publish it:\n${offer.stagedText ?? ''}`, isError: true }
     }
     if (offer.phase !== 'RESULT_STAGED') {
       const staged = await cli($, s, ['stage', id, offer.turnId], text + '\n')
-      if (!(staged.ok || (staged.hard && staged.data?.outcome === 'staged'))) return { result: `Error: stage refused: ${staged.data?.refused ?? staged.data?.error ?? ''}${staged.data?.retry ? again : ''}`, isError: true }
+      // Hard without "staged": the claim recorded this text's descriptor, so it is the accepted answer.
+      if (staged.hard && staged.data?.outcome !== 'staged') offer.stagedText = text
+      if (!(staged.ok || (staged.hard && staged.data?.outcome === 'staged'))) return { result: `Error: stage refused: ${staged.data?.refused ?? staged.data?.error ?? ''}${staged.data?.retry || staged.hard ? again : ''}`, isError: true }
       offer.phase = 'RESULT_STAGED'
       offer.stagedText = text
     }

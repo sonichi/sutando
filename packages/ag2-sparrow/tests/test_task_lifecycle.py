@@ -2012,6 +2012,24 @@ class BoundaryGuardTest(SpyMixin, unittest.TestCase):
 class ErrorBranchTest(Base):
     """The error and edge branches of the owner's helpers, driven with real files."""
 
+    def test_finish_staged_completes_only_with_the_recorded_verifying_body(self):
+        lc = self.lc
+        life = lc.Lifecycle(self.work, identity={"pid": 1, "start": 1}, lineage=lambda *a: True, log=lambda *a: None)
+        self.assertEqual(life.finish_staged("nope"), "parked")
+        store = life.claims
+        rec = {"schema": 1, "task_id": "t", "attempt": 1, "phase": lc.TURN_CONFIRMED, "claim_mode": lc.LOCAL,
+               "turn_id": "turn-1", "generation": {"pid": 1, "start": 1}}
+        store.save(rec)
+        self.assertEqual(life.finish_staged("t"), "parked", "no recorded descriptor")
+        body = b"answer\n"
+        identity = life._identity_of(rec, "turn-1")
+        name, _ = life._blob_name(rec, identity)
+        store.save(dict(rec, staged={"identity": identity, "length": len(body), "sha256": lc._sha256(body), "blob": name}))
+        self.assertEqual(life.finish_staged("t"), "parked", "the blob is missing")
+        (store.dir("t") / name).write_bytes(body)
+        self.assertEqual(life.finish_staged("t"), "staged")
+        self.assertEqual(store.load("t")["phase"], lc.RESULT_STAGED)
+
     def test_a_rename_that_landed_is_committed_and_a_failed_write_is_io(self):
         lc = self.lc
         store = lc.ClaimStore(self.work / "claims")

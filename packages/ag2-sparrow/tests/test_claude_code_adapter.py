@@ -2853,6 +2853,56 @@ class InboxCli(ConnectBase):
                 self.assertRaises(inbox.lifecycle.StateCommitted):
             lc.claims.stage(u, b"body")
 
+    def confirmed(self, t):
+        self.task(t)
+        attempt = self.verb("claim", t)[1]["attempt"]
+        token = self.verb("authorize", t, str(attempt), "--text-hash", "h1")[1]["token"]
+        self.assertEqual(self.verb("confirm", t, "turn-1", token, "--text-hash", "h1")[0], 0)
+
+    def test_publish_and_park_deliver_the_recorded_answer_of_an_unfinished_stage(self):
+        lc = inbox._lifecycle(self.root)
+        for verb, t in (("publish", "task-fin-pub"), ("park", "task-fin-park")):
+            self.confirmed(t)
+            self.assertEqual(self.verb("stage", t, "turn-1", stdin=b"the accepted answer\n")[0], 0)
+            rec = lc.claims.load(t)
+            lc.claims.save(dict(rec, phase=inbox.lifecycle.TURN_CONFIRMED))     # the move's last save never landed
+            args = (verb, t) if verb == "publish" else (verb, t, "turn-1", "--detail", "turn completed without a reply")
+            rc, out = self.verb(*args)
+            self.assertEqual((rc, out["outcome"]), (0, "settled"), (verb, out))
+            self.assertEqual((self.results / (t + ".txt")).read_text(), "the accepted answer\n",
+                             "%s delivers the recorded body, never a second one" % verb)
+            self.assertEqual(lc.claims.load(t)["phase"], inbox.lifecycle.SETTLED)
+        t = "task-fin-missing"
+        self.confirmed(t)
+        real_link = os.link
+        with mock.patch.object(inbox.lifecycle.os, "link", side_effect=OSError(errno.EIO, "no link")):
+            self.verb("stage", t, "turn-1", stdin=b"never linked\n")
+        self.assertTrue(lc.claims.load(t).get("staged"), "the descriptor is recorded, its blob is not")
+        rc, out = self.verb("publish", t)
+        self.assertEqual(rc, 1, "no verifying blob: nothing to publish yet")
+        rc, out = self.verb("park", t, "turn-1", "--detail", "x")
+        self.assertEqual(rc, 1, "and never the protocol failure in place of the accepted answer")
+        self.assertFalse((self.results / (t + ".txt")).exists())
+        self.assertEqual(self.verb("stage", t, "turn-1", stdin=b"never linked\n")[0], 0, "the identical retry finishes")
+        self.assertEqual(self.verb("publish", t)[0], 0)
+        self.assertEqual((self.results / (t + ".txt")).read_text(), "never linked\n")
+        del real_link
+        real = records.flocked
+
+        @contextlib.contextmanager
+        def release_fails(path, blocking=True):
+            with real(path, blocking) as fd:
+                yield fd
+            if Path(path).name == records.CLAIMS_LOCK:
+                raise OSError(errno.EIO, "unlock I/O error")
+        t = "task-pub-release"
+        self.confirmed(t)
+        self.assertEqual(self.verb("stage", t, "turn-1", stdin=b"done\n")[0], 0)
+        with mock.patch.object(records, "flocked", release_fails):
+            rc, out = self.verb("publish", t)
+        self.assertEqual((rc, out.get("hard"), out.get("outcome")), (3, True, "settled"),
+                         "a delivered answer is never reported refused")
+
     def test_a_hard_reply_is_read_from_the_claim_as_it_stands(self):
         """The hard reply after a committed step carries what the re-read claim proves: authorize's stored
         token while CALLING, stage's "staged" only at RESULT_STAGED, else the actual phase."""
@@ -3091,10 +3141,10 @@ class InboxCli(ConnectBase):
             for _ in range(3):
                 rc, out = self.verb("stage", t, "turn-1", stdin=b"body\n")
                 self.assertEqual((rc, out["refused"]), (1, "%s: staging parked" % t))
+            self.assertEqual(self.verb("publish", t)[0], 1, "nothing to publish while the fsync fails")
         self.assertIn(claim_dir, calls, "the existing final's directory is fsynced before the phase")
         self.assertEqual(lc.claims.load(t)["phase"], tl.TURN_CONFIRMED, "stays TURN_CONFIRMED while the fsync fails")
         self.assertFalse((self.results / "task-a.txt").exists(), "zero publication")
-        self.assertEqual(self.verb("publish", t)[0], 1, "nothing to publish")
         self.assertEqual(self.verb("stage", t, "turn-1", stdin=b"body\n")[0], 0, "a later fsync that works finishes")
         self.assertEqual(self.verb("publish", t)[0], 0)
         # The sweep: a dead writer's private temp is unlinked, then the directory fsynced.

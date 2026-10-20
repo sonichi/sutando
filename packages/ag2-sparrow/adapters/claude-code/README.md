@@ -78,7 +78,12 @@ is not `StateIOError`, stays final; an unreadable claim resolved nothing and
 retries; anything from the commit point on, a rename that
 landed or only the lock's release left, is hard and never a retry, its reply read
 from the claim as it then stands (an authorize still CALLING returns its stored
-token, which the Mod submits exactly once; "staged" only at RESULT_STAGED); the
+token, which the Mod submits exactly once; "staged" only at RESULT_STAGED). A
+stage whose descriptor landed without finishing makes that text the accepted
+answer: the session is told to call again with it, `publish` and `park`
+complete the move and deliver exactly the recorded body, and at the turn's end
+the Mod delivers it; a park or publish that does not deliver keeps the task for
+the next tick; the
 task is kept, an unconfirmed turn's confirmation is retried by the next tick or
 by the reply itself, and a reply told to call again; after a retried publish the staged answer is
 the one delivered, so a reply with a different text is refused and names it), and one after the commit

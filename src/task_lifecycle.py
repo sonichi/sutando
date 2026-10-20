@@ -918,6 +918,18 @@ class Lifecycle:
         self.open_attempts.discard(task_id)
         return "staged"
 
+    def finish_staged(self, task_id):
+        """A TURN_CONFIRMED claim that already recorded its staged descriptor completes the move with
+        exactly the recorded body (its blob verifying), so what publishes is the answer that was
+        accepted, never a second body. staged | parked (no descriptor, or no verifying blob)."""
+        rec = self.claims.load(task_id)
+        if rec is None or rec["phase"] != TURN_CONFIRMED or not rec.get("staged"):
+            return "parked"
+        body = self._verified(task_id, rec["staged"])
+        if body is None:
+            return "parked"
+        return self.stage_result(task_id, body, rec.get("turn_id"))
+
     @staticmethod
     def _commit_blob(tmp, final, body):
         """True when this call linked the final; False when it already existed. The temp never

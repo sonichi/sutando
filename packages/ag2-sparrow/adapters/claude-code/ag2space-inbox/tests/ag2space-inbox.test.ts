@@ -12,7 +12,7 @@ const TASK = (id: string, tier = 'owner', extra = '') =>
 const FRAMED = (msg: string) => `The ag2space-inbox plugin sent a message:\n${msg}\n\nThis is how Claude Code surfaces ` +
   "a prompt a plugin submits between turns \u2014 it starts this turn in the user's place. Address the message above."
 
-type Claim = { attempt: number; phase: string; token?: string; hash?: string; turnId?: string; body?: string }
+type Claim = { attempt: number; phase: string; token?: string; hash?: string; turnId?: string; body?: string; staged?: string }
 
 // An in-memory host: fs, process (the verifier's "<verdict> <tier> <collab>" line, the text hash, and
 // the inbox CLI's verbs over an in-memory claim store), clock, env, prompt sink, session id. Tier and
@@ -24,7 +24,8 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
                                interruptSoft?: Record<string, string | number>; stuckAtStart?: Record<string, unknown>;
                                unstuckFails?: number; clearFails?: Record<string, string>; stuckWriteFails?: number;
                                lockFailsOnce?: string[]; storeFailsOnce?: string[]; unreadableOnce?: string[];
-                               committedHardOnce?: string[]; committedHardWhy?: string } = {}) {
+                               committedHardOnce?: string[]; committedHardWhy?: string; stageLandsOnce?: boolean;
+                               parkRefusedOnce?: boolean } = {}) {
   const files: Record<string, string> = {}
   const submitted: string[] = []
   const runs: string[][] = []
@@ -49,6 +50,9 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
   const storeFails = new Set(opts.storeFailsOnce ?? [])
   const unreadable = new Set(opts.unreadableOnce ?? [])
   const committedHard = new Set(opts.committedHardOnce ?? [])
+  let stageLands = opts.stageLandsOnce ?? false
+  let parkRefused = opts.parkRefusedOnce ?? false
+  let publishes = 0
   const committedHardWhy = opts.committedHardWhy ?? 'OSError: unlock I/O error'
   const clearFailsLeft: Record<string, string> = { ...(opts.clearFails ?? {}) }
   let sidReads = 0
@@ -170,12 +174,19 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
     }
     if (verb === 'stage') {
       if (!c || c.phase !== 'TURN_CONFIRMED' || c.turnId !== argv[4]) return out(1, { refused: 'not this turn' })
+      // As the CLI: the descriptor is recorded first; a second, different body parks.
+      if (c.staged !== undefined && c.staged !== e.init.stdin) return out(1, { refused: `${task}: staging parked` })
+      c.staged = e.init.stdin
+      if (stageLands) {
+        stageLands = false     // the descriptor's rename landed, its directory fsync failed
+        return out(3, { task_id: task, phase: 'TURN_CONFIRMED', hard: true, error: "the step's write landed, then failed" })
+      }
       c.phase = 'RESULT_STAGED'; c.body = e.init.stdin
       return answer({ outcome: 'staged' })
     }
     if (verb === 'publish') {
       if (!c || c.phase !== 'RESULT_STAGED') return out(1, { refused: 'nothing staged' })
-      c.phase = 'SETTLED'; files[`/out/${task}.txt`] = c.body!
+      c.phase = 'SETTLED'; files[`/out/${task}.txt`] = c.body!; publishes++
       return answer({ outcome: 'settled' })
     }
     if (verb === 'interrupt') {
@@ -199,8 +210,13 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
     }
     if (verb === 'park') {
       if (!c || c.phase !== 'TURN_CONFIRMED' || c.turnId !== argv[4]) return out(1, { refused: 'not this turn' })
+      if (parkRefused) { parkRefused = false; return out(1, { refused: `${task}: publication parked` }) }
+      if (c.staged !== undefined) {         // an accepted answer: the CLI publishes it, never the protocol failure
+        c.phase = 'SETTLED'; c.body = c.staged; files[`/out/${task}.txt`] = c.body; publishes++
+        return out(0, { outcome: 'settled', parked: false })
+      }
       c.phase = 'SETTLED'; c.body = `[AG2 Space] The session's turn ended without a reply (${argv[argv.indexOf('--detail') + 1]})`
-      files[`/out/${task}.txt`] = c.body
+      files[`/out/${task}.txt`] = c.body; publishes++
       return out(0, { outcome: 'settled', parked: true })
     }
     return out(2, { refused: 'unknown verb' })
@@ -209,7 +225,7 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
     if (rejectLeft-- > 0) throw new Error('session busy')
     submitted.push(e.text); return { text: e.text }
   })
-  return { files, submitted, runs, claims, progress, clock, hash, interruptAt, logs, stuck, setSid: (sid: string) => { live.sid = sid },
+  return { files, submitted, runs, claims, progress, clock, hash, interruptAt, logs, stuck, publishes: () => publishes, setSid: (sid: string) => { live.sid = sid },
     failProgress: (n: number) => { progressFailLeft = n },
     failAt: (verb: string) => { failVerb = verb } }
 }
@@ -936,6 +952,51 @@ test('an authorize whose rename landed before its fsync failed is submitted exac
   await $.tool.call({ tool: REPLY, task_id: 'task-hf', text: 'landed' })
   expect(h.files['/out/task-hf.txt']).toBe('landed\n')
   expect(verbs(h).filter((v: string) => v === 'authorize').length).toBe(1)
+})
+
+test('a stage whose descriptor landed before its fsync failed delivers that answer at the turn\'s end, once', async ($, on) => {
+  const h = host(on, { stageLandsOnce: true })
+  h.files['/in/task-sl.txt'] = TASK('task-sl')
+  await arm($, h)
+  await h.clock.advance(1000)
+  await $.turn.start({ text: h.submitted[0], turnId: 't-sl' })
+  const r = await $.tool.call({ tool: REPLY, task_id: 'task-sl', text: 'answer A' })
+  expect(String(r.text ?? r.result)).toContain('call ag2space_reply again')
+  expect(h.claims['task-sl'].phase).toBe('TURN_CONFIRMED')
+  await $.turn.complete({ turnId: 't-sl', reason: 'completed', text: '' } as any)   // the session never retried
+  expect(h.files['/out/task-sl.txt']).toBe('answer A\n')                           // the accepted body, not a failure
+  await h.clock.advance(5000)
+  expect(h.publishes()).toBe(1)
+})
+
+test('after a landed stage a different reply is refused and the accepted one publishes', async ($, on) => {
+  const h = host(on, { stageLandsOnce: true })
+  h.files['/in/task-sd.txt'] = TASK('task-sd')
+  await arm($, h)
+  await h.clock.advance(1000)
+  await $.turn.start({ text: h.submitted[0], turnId: 't-sd' })
+  await $.tool.call({ tool: REPLY, task_id: 'task-sd', text: 'answer A' })
+  const b = await $.tool.call({ tool: REPLY, task_id: 'task-sd', text: 'answer B' })
+  expect(String(b.text ?? b.result)).toContain('already staged')
+  const a = await $.tool.call({ tool: REPLY, task_id: 'task-sd', text: 'answer A' })
+  expect(String(a.text ?? a.result)).toContain('Published')
+  expect(h.files['/out/task-sd.txt']).toBe('answer A\n')
+  expect(h.publishes()).toBe(1)
+})
+
+test('a refused park keeps the task: not marked answered, retried by the next tick, delivered once', async ($, on) => {
+  const h = host(on, { parkRefusedOnce: true })
+  h.files['/in/task-pr.txt'] = TASK('task-pr')
+  await arm($, h)
+  await h.clock.advance(1000)
+  await $.turn.start({ text: h.submitted[0], turnId: 't-pr' })
+  await $.turn.complete({ turnId: 't-pr', reason: 'completed', text: '' } as any)
+  expect(h.files['/out/task-pr.txt']).toBe(undefined)
+  const r = await $.tool.call({ tool: REPLY, task_id: 'task-pr', text: '' })
+  expect(String(r.text ?? r.result)).toContain('text is empty')     // still this session's offer, not marked answered
+  await h.clock.advance(1000)                                        // the tick retries the park
+  expect(h.files['/out/task-pr.txt']).toContain('without a reply')
+  expect(h.publishes()).toBe(1)
 })
 
 test('thirty failed unstuck writes never age a retained task out: the next one lands (stopped-intake path)', async ($, on) => {
