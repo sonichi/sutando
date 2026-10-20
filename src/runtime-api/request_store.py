@@ -193,11 +193,15 @@ class RequestStore:
             "SELECT request_id FROM runtime_requests WHERE status = 'pending'")
         return [self.get(r[0]) for r in cur.fetchall()]
 
-    def expired_human_requests(self) -> list:
-        """Durable candidates for retrying an incomplete requirement expiry."""
+    def expired(self, request_types) -> list:
+        """Durable candidates for retrying incomplete expiry side effects."""
+        types = tuple(request_types)
+        if not types:
+            return []
+        placeholders = ",".join("?" for _ in types)
         cur = self._db.execute(
             "SELECT request_id FROM runtime_requests WHERE status = 'expired'"
-            " AND request_type IN ('approval', 'elicitation', 'human_action')")
+            f" AND request_type IN ({placeholders})", types)
         return [self.get(r[0]) for r in cur.fetchall()]
 
     def close(self) -> None:

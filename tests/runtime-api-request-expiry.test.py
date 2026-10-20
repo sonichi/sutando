@@ -2,6 +2,7 @@
 """Expiry journeys through the shipped daemon/CLI and private Unix sockets."""
 import json
 import os
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -120,7 +121,8 @@ class ExpiryJourneyTests(unittest.TestCase):
         if self.proc is None:
             return
         process, self.proc = self.proc, None
-        process.terminate()
+        # SIGINT lets asyncio cancel tasks without interrupting a dequeued callback.
+        process.send_signal(signal.SIGINT)
         try:
             code = process.wait(timeout=5)
         except subprocess.TimeoutExpired:
@@ -224,7 +226,7 @@ class ExpiryJourneyTests(unittest.TestCase):
     def test_periodic_expiry_projection_and_negative_controls(self):
         indefinite = [self.issue(kind) for kind in KINDS]
         unrelated = [self.issue(kind, 3600) for kind in KINDS]
-        resolved = [self.issue(kind, 16) for kind in KINDS]
+        resolved = [self.issue(kind, 30) for kind in KINDS]
         for record in resolved:
             req = record["req"]
             self.assertEqual(self.reply(req, actor="@other:synthetic"), "ignored")
@@ -240,7 +242,7 @@ class ExpiryJourneyTests(unittest.TestCase):
                 self.assertEqual(answer["result"], {"answer": "Beta"})
             record["terminal_row"] = self.raw(record["rid"])
             record["terminal_req"] = self.manager.get(req.id)
-        expiring = [self.issue(kind, 8) for kind in KINDS]
+        expiring = [self.issue(kind, 15) for kind in KINDS]
         self.project()
         ledgers = {r["req"].id: self.manager.store.projection(r["req"].id)
                    for r in expiring}
@@ -286,12 +288,18 @@ class ExpiryJourneyTests(unittest.TestCase):
         self.assertEqual(other_bytes, {p: p.read_bytes() for p in other.rglob("*") if p.is_file()})
 
     def test_restart_recovers_downtime_and_already_expired_rows(self):
-        downtime = [self.issue(kind, 8) for kind in KINDS]
-        already_expired = [self.issue(kind, 8) for kind in KINDS]
+        downtime = [self.issue(kind, 30) for kind in KINDS]
+        already_expired = [self.issue(kind, 30) for kind in KINDS]
         records = downtime + already_expired
         self.project()
         ledgers = {r["req"].id: self.manager.store.projection(r["req"].id) for r in records}
         self.stop()
+        margin = min(r["row"]["expires_at"] for r in records) - time.time()
+        self.note("offline-before-expiry", margin_seconds=margin)
+        self.assertGreater(margin, 2, "fixture setup must finish before the first deadline")
+        for record in records:
+            self.assertEqual(self.raw(record["rid"])["status"], "pending")
+            self.assertEqual(self.manager.get(record["req"].id), record["req"])
         deadline = max(r["row"]["expires_at"] for r in records)
         while time.time() <= deadline:
             time.sleep(0.05)
@@ -299,6 +307,7 @@ class ExpiryJourneyTests(unittest.TestCase):
         try:
             for record in already_expired:
                 self.assertEqual(store.get(record["rid"])["status"], "expired")
+                record["expired_row"] = self.raw(record["rid"])
         finally:
             store.close()
         for record in downtime:
@@ -308,6 +317,8 @@ class ExpiryJourneyTests(unittest.TestCase):
         bound = time.time() + 6
         self.start()
         self.wait_expired(records, limit=bound)
+        for record in already_expired:
+            self.assertEqual(self.raw(record["rid"]), record["expired_row"])
         self.assert_expired_projection(records, ledgers)
         snapshots = [(self.raw(r["rid"]), self.manager.get(r["req"].id),
                       self.manager.store.projection(r["req"].id)) for r in records]

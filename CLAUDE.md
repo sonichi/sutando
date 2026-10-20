@@ -15,8 +15,10 @@ Be concise and direct. Prefer action over explanation. Default to the smallest a
 **"at background" / "in parallel" means SPAWN A SUBAGENT** (Chi 2026-08-21) — not "keep this in
 mind", and not a licence to defer to a later session. Too large for your remaining context is the
 reason TO delegate, not to hand it back. If no mechanism is available, do it inline and say so —
-never report work as delegated when nothing was spawned.
-Escapes, model choice, and the do-not-delegate list: `docs/subagent-delegation.md`.
+never report work as delegated when nothing was spawned. A voice task header's `lane: long` is the
+same trigger, judged by the relay before the task reaches you: spawn the subagent as you read the task;
+`lane: quick` is done inline, now. Escapes, model choice, lanes and the do-not-delegate list:
+`docs/subagent-delegation.md`.
 
 **Reply in the language your owner wrote in.** When you deliberately answer in English (a quoted
 error, a code identifier, a term with no good translation), say so in one clause. A stated
