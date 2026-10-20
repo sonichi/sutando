@@ -93,9 +93,9 @@ def recover_dead_generation(root) -> int:
             except lifecycle.ClaimUnreadable:
                 continue
             gen = (rec or {}).get("generation") if rec and rec.get("claim_mode") == lifecycle.LOCAL else None
-            # A SETTLED claim still owed its ledger entry or its compaction brings its generation in too.
+            # A SETTLED claim whose settlement is not complete, or due for compaction, brings its generation in too.
             owed = rec and rec["phase"] == lifecycle.SETTLED and (
-                task_id not in lc.settled or lc.clock() - rec.get("settled_at", lc.clock()) > lifecycle.COMPACT_AFTER)
+                not lc.settlement_complete(task_id) or lc.clock() - rec.get("settled_at", lc.clock()) > lifecycle.COMPACT_AFTER)
             if gen and gen.get("pid") and (rec["phase"] != lifecycle.SETTLED or owed):
                 key = (gen["pid"], gen.get("start"))
                 if key not in dead and task_io.verify_lineage(gen["pid"], gen.get("start")) is False:
@@ -236,14 +236,10 @@ def _clear_stuck(root, task_id) -> bool:
 
 def _settle_terminal(lc, task_id) -> None:
     """A local or call-less claim at RESULT_STAGED or PUBLISHED whose result already exists is settled on that result
-    (the publisher records it and adds none); a SETTLED one has its settlement completed (the settled
-    ledger, the staged body) before any cleanup; Parked when it does not settle now. The caller holds
+    (the publisher records it and adds none); Parked when it does not settle now. The caller holds
     claims.lock."""
     rec = lc.claims.load(task_id)
     if not rec or rec.get("claim_mode") not in (None, lifecycle.LOCAL):
-        return
-    if rec["phase"] == lifecycle.SETTLED:
-        lc.reconcile_settled(task_id)
         return
     if rec["phase"] not in (lifecycle.RESULT_STAGED, lifecycle.PUBLISHED):
         return
@@ -272,10 +268,19 @@ def _mirror(root, task_id, phase, out: dict, extra=None, unstuck=False) -> dict:
     return out
 
 
+def _repair_settled(lc, task_id) -> None:
+    """Before any reply that can be final: a SETTLED claim's settlement completed (lifecycle.reconcile_settled);
+    a repair that fails raises, the caller's retry. The caller holds claims.lock."""
+    rec = lc.claims.load(task_id)
+    if rec and rec["phase"] == lifecycle.SETTLED:
+        lc.reconcile_settled(task_id)
+
+
 def claim(root, task_id) -> dict:
     lc = _lifecycle(root)
     terminal, lost = False, ""
     with _claims_step(root, lc, task_id, "claim"):
+        _repair_settled(lc, task_id)
         generation = _generation(root)
         verdict, state = lc.decide(task_id)
         if verdict == "call":
@@ -389,15 +394,14 @@ def interrupt(root, task_id, detail) -> dict:
     try:
         lc = _lifecycle(root)
         with _claims_step(root, lc, task_id, "interrupt"):
+            _repair_settled(lc, task_id)
             rec = lc.claims.load(task_id)
             phase = rec.get("phase") if rec else None
             if phase in (lifecycle.RESULT_STAGED, lifecycle.PUBLISHED):
                 # An earlier interrupt staged its answer but could not publish it: publish that one.
                 kind = str((rec.get("outcome") or {}).get("detail") or "").startswith("intake stopped")
                 answered = lc.publish_and_settle(task_id) == "settled"
-            elif phase == lifecycle.SETTLED:
-                lc.reconcile_settled(task_id)
-            else:
+            elif phase != lifecycle.SETTLED:
                 verdict, state = lc.decide(task_id)
                 if verdict == "call":
                     kind, _headers, refusal = admit(root, task_id, allow_non_owner())

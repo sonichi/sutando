@@ -3462,6 +3462,174 @@ class InboxCli(ConnectBase):
         self.assertIn(t, ledger())
         self.assertEqual(sum(1 for p in self.results.iterdir() if p.name == t + ".txt"), 1, "nothing published twice")
 
+    def test_settlement_property_every_entry_path_by_every_fault_by_every_schedule_converges(self):
+        """The settlement invariant as one property. For every entry path that settles (publish, park, a non-admitted
+        claim, interrupt, a lost claim, recovery's no-result settle, recovery's publication) x one fault at each step
+        (the ledger append fails, the append is torn and an already-loaded writer runs next, the staged-body unlink
+        fails, the progress-mirror write fails) x each schedule production can run (the Mod retries; a restart's one
+        recovery pass, then claims; the task file gone, only that recovery pass), driven to quiescence: whenever a
+        verb reports final the settlement is complete, and at the end the result exists exactly once (none for the
+        no-result settle), the ledger holds the id exactly once and still opens, and the real staged body is gone."""
+        self.maxDiff = None
+        lc = inbox._lifecycle(self.root)
+        dead = {"pid": 2 ** 22 - 1, "start": "2026-01-01T00:00:00Z"}
+        ledger_path = Path(lc.settled.path)
+        real_add, real_unstage, real_write_progress = (inbox.lifecycle.SettledIds.add, inbox.lifecycle.ClaimStore.unstage,
+                                                       records.write_progress)
+        real_lifecycle = inbox._lifecycle
+
+        def recovery():
+            with mock.patch.object(task_io, "verify_lineage", return_value=False):
+                try:
+                    inbox.recover_dead_generation(self.root)
+                except Exception as e:                          # a hold start that fails: the next start retries
+                    return str(e)
+            return ""
+
+        def rolled_back(t, generation=None):
+            self.confirmed(t)
+            self.assertEqual(self.verb("stage", t, "turn-1", stdin=b"answer\n")[0], 0)
+            lc.claims.save(dict(lc.claims.load(t), phase=inbox.lifecycle.TURN_CONFIRMED, **({"generation": generation} if generation else {})))
+            lc.claims.stage(t, b"legacy\n")
+
+        def e_publish(t):
+            self.confirmed(t)
+            self.assertEqual(self.verb("stage", t, "turn-1", stdin=b"answer\n")[0], 0)
+            lc.claims.stage(t, b"legacy\n")
+            go = lambda: self.verb("publish", t)       # noqa: E731
+            return go, go, "answer\n"
+
+        def e_park(t):
+            self.confirmed(t)
+            lc.claims.stage(t, b"legacy\n")
+            go = lambda: self.verb("park", t, "turn-1", "--detail", "aborted")     # noqa: E731
+            return go, go, inbox.PROTOCOL_FAILURE % "aborted"
+
+        def e_refused(t):
+            self.task(t, "guest")
+            go = lambda: self.verb("claim", t)         # noqa: E731
+            return go, go, task_io.NON_OWNER_REFUSED
+
+        def e_interrupt(t):
+            self.task(t)
+            go = lambda: self.verb("interrupt", t, "--detail", "stopped")     # noqa: E731
+            return go, go, inbox.INTERRUPTED_BODY
+
+        def e_lost(t):
+            rolled_back(t)
+            go = lambda: self.verb("claim", t)         # noqa: E731
+            return go, go, "answer\n"
+
+        def e_no_result(t):
+            self.task(t)
+            self.assertEqual(self.verb("claim", t)[0], 0)
+            lc.claims.save(dict(lc.claims.load(t), generation=dead))
+            lc.claims.stage(t, b"legacy\n")
+            task_file = self.inbox / (t + ".txt")
+            text = task_file.read_text()
+            task_file.unlink()
+
+            def first():
+                out = recovery()
+                task_file.write_text(text)                 # the task file comes back; its claims must see the debt
+                return None, {"recovery": out}
+            return first, lambda: self.verb("claim", t), None
+
+        def e_recovered(t):
+            rolled_back(t, dead)
+            return (lambda: (None, {"recovery": recovery()})), (lambda: self.verb("claim", t)), "answer\n"
+
+        entries = {"publish": e_publish, "park": e_park, "refused": e_refused, "interrupt": e_interrupt,
+                   "lost": e_lost, "noresult": e_no_result, "recovered": e_recovered}
+
+        def fault(kind, fired):
+            once = []
+
+            def add(led, task_id):
+                if not once:
+                    once.append(1); fired.append(kind)
+                    if kind == "torn":
+                        with open(led.path, "ab") as f:
+                            f.write((task_id + "\n").encode()[:3])
+                    raise inbox.lifecycle.LedgerIOError("cannot append ([Errno 5] I/O error)")
+                return real_add(led, task_id)
+
+            def unstage(store, task_id):
+                if not once and (store.dir(task_id) / "body").exists():
+                    once.append(1); fired.append(kind)
+                    raise inbox.lifecycle.StateIOError("cannot remove body ([Errno 5] I/O error)")
+                return real_unstage(store, task_id)
+
+            def write_progress(root, mutate):
+                if not once:
+                    once.append(1); fired.append(kind)
+                    raise records.RecordError("progress.json: [Errno 5] I/O error")
+                return real_write_progress(root, mutate)
+            if kind in ("append", "torn"):
+                return mock.patch.object(inbox.lifecycle.SettledIds, "add", add)
+            if kind == "unlink":
+                return mock.patch.object(inbox.lifecycle.ClaimStore, "unstage", unstage)
+            return mock.patch.object(records, "write_progress", write_progress)
+
+        def final(rc, out):
+            return rc == 0 or (rc == 3 and (out.get("resolved") is True or out.get("outcome") == "settled")) \
+                or (rc == 1 and not out.get("retry"))
+
+        def complete(t):
+            try:
+                ids = inbox.lifecycle.SettledIds(ledger_path)         # still opens: no torn or merged record
+            except inbox.lifecycle.LedgerError:
+                return False
+            return (t in ids.ids and ledger_path.read_text().count(t + "\n") == 1
+                    and not (lc.claims.dir(t) / "body").exists())
+        failures, fired_cases = [], 0
+        for e_name, entry in entries.items():
+            for f_name in ("append", "torn", "unlink", "mirror"):
+                for s_name in ("retry", "restart", "gone"):
+                    t = "task-p-%s-%s-%s" % (e_name, f_name, s_name)
+                    first, again, expected = entry(t)
+                    fired, problems = [], []
+                    preloaded = real_lifecycle(self.root)            # a writer loaded before the fault, run next
+                    with fault(f_name, fired):
+                        first()
+                    fired_cases += bool(fired)
+                    stale = [preloaded] if f_name == "torn" and fired else []
+                    with mock.patch.object(inbox, "_lifecycle", lambda root: stale.pop() if stale else real_lifecycle(root)):
+                        if s_name == "gone":
+                            (self.inbox / (t + ".txt")).unlink(missing_ok=True)
+                            recovery()
+                        else:
+                            if s_name == "restart":
+                                recovery()
+                                again = (lambda t=t: self.verb("claim", t)) if e_name not in ("noresult", "recovered") else again
+                            for _ in range(8):
+                                rc, out = again()
+                                if final(rc, out):
+                                    if not complete(t):
+                                        problems.append("final %r reported over an incomplete settlement" % (out,))
+                                    break
+                            else:
+                                problems.append("no final report: %r" % (out,))
+                            rc, out = self.verb("claim", t)
+                            if not final(rc, out):
+                                problems.append("a later claim is not final: %r" % (out,))
+                            recovery()
+                    if not complete_safe(ledger_path):
+                        problems.append("the ledger does not open")
+                    elif not complete(t):
+                        problems.append("settlement incomplete at quiescence")
+                    got = [p.name for p in self.results.iterdir() if p.name == t + ".txt"]
+                    body = (self.results / (t + ".txt")).read_text() if got else None
+                    if body != expected:
+                        problems.append("result %r, expected %r" % (body, expected))
+                    if problems:
+                        failures.append("%s x %s x %s: %s" % (e_name, f_name, s_name, "; ".join(problems)))
+                    if not complete_safe(ledger_path):
+                        ledger_path.write_text("".join(sorted(x + "\n" for x in real_ids(ledger_path))))
+        self.assertEqual(failures, [])
+        self.assertEqual(fired_cases, 75, "every fault fired except the mirror write where the first call writes no mirror "
+                         "(the non-admitted claim's refusal, and the two recovery-first entries): 84 - 9")
+
     def test_every_settle_path_completes_its_settlement_after_one_ledger_fault_before_reporting_final(self):
         """The settled-ids append faults once on each path that settles: publish, park, a non-admitted claim, an
         interrupt, and a call-less claim nobody claims again (recovery). The first call is a retry, never final;
@@ -3727,6 +3895,20 @@ class InboxCli(ConnectBase):
         with contextlib.redirect_stdout(out), mock.patch.dict(os.environ, {inbox.ROOT_VAR: "relative"}):
             rc = cli.main(["inbox", "check-inode", "--expect", "1:1"])
         self.assertEqual((rc, "must be absolute" in json.loads(out.getvalue())["refused"]), (1, True))
+
+
+def complete_safe(path):
+    """Whether the ledger still opens (a corrupted one is reset so later property cases stay independent)."""
+    try:
+        inbox.lifecycle.SettledIds(path)
+        return True
+    except inbox.lifecycle.LedgerError:
+        return False
+
+
+def real_ids(path):
+    return [line for line in Path(path).read_text(errors="replace").splitlines()
+            if inbox.lifecycle.local_task_protocol.valid_task_id(line)]
 
 
 class Detector(unittest.TestCase):

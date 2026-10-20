@@ -1414,8 +1414,13 @@ class SettledIdsTest(Base):
         self.assertEqual((self.work / "s").read_bytes(), b"task-a\ntask-bb\n")
         self.assertEqual(synced, [str(self.work / "s")])
 
-    def test_any_terminated_malformed_record_is_refused_naming_its_offset(self):
-        for text, offset in (("task-a\nnot a task id\ntask-b\n", 7), ("task-a\ntask-c x\n", 7), ("\n", 0)):
+    def test_a_malformed_record_before_the_tail_is_refused_naming_its_offset_and_a_torn_tail_is_dropped(self):
+        for text, kept in (("task-a\ntask-c x\n", "task-a\n"), ("\n", ""), ("task-a\ntastask-a\n", "task-a\n")):
+            with self.subTest(tail=text):
+                (self.work / "s").write_text(text)
+                self.assertEqual(self.lc.SettledIds(self.work / "s").ids, {"task-a"} if kept else set())
+                self.assertEqual((self.work / "s").read_text(), kept, "the unparseable last record dropped")
+        for text, offset in (("task-a\nnot a task id\ntask-b\n", 7), ("\ntask-a\n", 0)):
             with self.subTest(text=text):
                 (self.work / "s").write_text(text)
                 with self.assertRaises(self.lc.LedgerError) as e:
@@ -1432,20 +1437,28 @@ class SettledIdsTest(Base):
         with self.assertRaises(self.lc.LedgerError):
             self.lc.SettledIds(self.work / "s")
 
-    def test_append_writes_every_byte_then_fsyncs_then_remembers(self):
+    def test_append_is_one_write_then_fsyncs_then_remembers_and_a_short_write_is_cut_and_re_appended(self):
         ids = self.lc.SettledIds(self.work / "s")
         real_write, order = os.write, []
 
-        def one_byte(fd, data):
+        def counted(fd, data):
             order.append("write")
-            return real_write(fd, data[:1])
-        with mock.patch.object(self.lc.os, "write", one_byte), \
+            return real_write(fd, data)
+        with mock.patch.object(self.lc.os, "write", counted), \
                 mock.patch.object(self.lc.os, "fsync", lambda fd: order.append("fsync")):
             ids.add("task-abc")
         self.assertEqual((self.work / "s").read_text(), "task-abc\n")
-        self.assertEqual(order.count("write"), len("task-abc\n"))
-        self.assertEqual(order[-2:], ["fsync", "fsync"], "the file, then its directory on creation")
+        self.assertEqual(order, ["write", "fsync", "fsync"], "one write, the file, then its directory on creation")
         self.assertIn("task-abc", ids)
+        with mock.patch.object(self.lc.os, "write", lambda fd, data: real_write(fd, data[:3])):
+            with self.assertRaises(self.lc.LedgerIOError):
+                ids.add("task-def")
+        self.assertEqual(((self.work / "s").read_bytes(), "task-def" in ids), (b"task-abc\ntas", False), "torn, not remembered")
+        stale = self.lc.SettledIds.__new__(self.lc.SettledIds)
+        stale.path, stale.ids = ids.path, {"task-abc"}                  # loaded before the torn write
+        stale.add("task-def")
+        self.assertEqual((self.work / "s").read_bytes(), b"task-abc\ntask-def\n", "the torn tail cut, the id re-appended once")
+        self.assertEqual(self.lc.SettledIds(self.work / "s").ids, {"task-abc", "task-def"})
         with self.assertRaises(self.lc.LedgerError):
             ids.add("../escape")
 
@@ -2096,11 +2109,11 @@ class ErrorBranchTest(Base):
 
     def test_the_ledger_fails_closed_and_adds_once(self):
         path = self.work / "ids"
-        path.write_bytes(b"\xff\xfe\n")
+        path.write_bytes(b"\xff\xfe\ntask-a\n")
         with self.assertRaises(self.lc.LedgerError):
             self.lc.SettledIds(path)
         path.write_bytes(b"task-a\ntask-b")
-        with mock.patch.object(self.lc.os, "truncate", side_effect=OSError(errno.EPERM, "no")):
+        with mock.patch.object(self.lc.os, "ftruncate", side_effect=OSError(errno.EPERM, "no")):
             with self.assertRaises(self.lc.LedgerError):
                 self.lc.SettledIds(path)
         path.write_bytes(b"task-a\n")

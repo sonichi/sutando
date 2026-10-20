@@ -126,18 +126,18 @@ delivered by the new generation's live claim, once; its interruption stays
 recovery's. A claim whose result already exists settles the claim on that
 result and drops the task's in-flight mirror with its stuck mark in one
 write, so a delivered task is never left in flight for the stall detector.
-A SETTLED claim whose settled-ids append failed is completed first
-(`reconcile_settled`: the id appended once, the staged body removed) by the
-next claim, before that cleanup, and by recovery, which also brings in a
-generation whose SETTLED claims are owed the ledger entry or due for compaction.
-Every path that reports a claim settled or final (publish, park, a
-non-admitted claim, interrupt, `publish_and_settle` on a claim found SETTLED)
-goes through `reconcile_settled` first, and `resolved` counts a SETTLED claim
-only once its settlement is whole (`settlement_complete`); claims answered
-without a call carry no generation, so `recover_dead_generation` reconciles
-and compacts them too (`reconcile_unbound`). The settled-ids append re-reads
-the ledger under its own lock before appending, so two calls that loaded it
-before either appended record an id once. When the progress record cannot be written at all, the CLI raises
+Settlement has one invariant: a SETTLED claim is complete when the
+settled-ids ledger holds its id and its staged body is gone. Every reader
+that can report a claim settled or final (claim, interrupt, publish, park,
+recovery) first runs the one repair-then-check, `reconcile_settled`; a repair
+that fails is a retry, never a final reply. Recovery selects SETTLED claims
+that are not complete (or are due for compaction), and claims answered
+without a call, which carry no generation, are reconciled and compacted too
+(`reconcile_unbound`). The ledger is append-only lines: each append is one
+write of the id and a newline under the ledger's own flock, after a repair
+that cuts a torn tail (an unterminated or unparseable last line); a torn
+append is cut and re-appended by the next repair, and two writers that loaded
+the ledger before either appended record an id once. When the progress record cannot be written at all, the CLI raises
 an alarm in the adapter's config dir (outside `state/`): `verify` fails its
 `progress` row and the launcher raises the needs-attention card until a durable
 write clears it. A record whose fields have the wrong shape reads as unreadable (hard),

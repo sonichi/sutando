@@ -554,8 +554,9 @@ def _fsync_file(path):
 
 
 class SettledIds:
-    """Append-only, one validated id per newline-terminated record; never rewritten. On open an
-    unterminated suffix is truncated away; anything else wrong fails closed (LedgerError)."""
+    """Append-only, one validated id per newline-terminated record; never rewritten. A torn tail (an
+    unterminated suffix, or a last record that does not parse) is dropped under the ledger's flock, on
+    open and before every append; a malformed record before the tail fails closed (LedgerError)."""
 
     def __init__(self, path, required=False):
         self.path = str(path)
@@ -568,23 +569,44 @@ class SettledIds:
             data = b""
         except OSError as e:
             raise LedgerIOError("%s cannot be read (%s)" % (self.path, e))
-        self.ids, offset = set(), 0
-        records = data.split(b"\n")
-        for raw in records[:-1]:
+        self.ids, keep = self._parse(data)
+        if keep < len(data):
+            try:
+                fd = os.open(self.path, os.O_RDWR | getattr(os, "O_CLOEXEC", 0))
+                try:
+                    self.ids = self._repair(fd)
+                finally:
+                    os.close(fd)
+            except OSError as e:
+                raise LedgerIOError("%s cannot be repaired (%s)" % (self.path, e))
+
+    def _parse(self, data):
+        """(ids, the byte length of the whole records kept): a torn tail is not kept."""
+        ids, offset = set(), 0
+        records = data.split(b"\n")[:-1]
+        for i, raw in enumerate(records):
             try:
                 tid = raw.decode("utf-8")
             except UnicodeDecodeError:
                 tid = ""
             if not local_task_protocol.valid_task_id(tid):
+                if i == len(records) - 1:
+                    break
                 raise LedgerError("%s has a malformed record at byte %d" % (self.path, offset))
-            self.ids.add(tid)
+            ids.add(tid)
             offset += len(raw) + 1
-        if records[-1]:
-            try:
-                os.truncate(self.path, offset)
-                _fsync_file(self.path)
-            except OSError as e:
-                raise LedgerIOError("%s cannot be repaired (%s)" % (self.path, e))
+        return ids, offset
+
+    def _repair(self, fd):
+        """Under the ledger's flock: the torn tail truncated away and the cut made durable; the ids held."""
+        if fcntl is not None:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        data = os.pread(fd, os.fstat(fd).st_size, 0)
+        ids, keep = self._parse(data)
+        if keep < len(data):
+            os.ftruncate(fd, keep)
+            _fsync_file(self.path)
+        return ids
 
     @staticmethod
     def create(path):
@@ -609,8 +631,9 @@ class SettledIds:
         return task_id in self.ids
 
     def add(self, task_id):
-        """Append, fsync, and only then remember. Any failure raises LedgerError. Read-check-append is one
-        critical section under the ledger's own flock, so instances loaded earlier never append an id twice."""
+        """Append, fsync, and only then remember. Any failure raises LedgerError. Repair-read-check-append is
+        one critical section under the ledger's own flock, so instances loaded earlier never append an id twice
+        and never append after a torn tail."""
         if task_id in self.ids:
             return
         if not local_task_protocol.valid_task_id(task_id):
@@ -620,13 +643,10 @@ class SettledIds:
             created = not os.path.exists(self.path)
             fd = os.open(self.path, os.O_RDWR | os.O_APPEND | os.O_CREAT | getattr(os, "O_CLOEXEC", 0), 0o644)
             try:
-                if fcntl is not None:
-                    fcntl.flock(fd, fcntl.LOCK_EX)
-                held = os.pread(fd, os.fstat(fd).st_size, 0).split(b"\n")[:-1]
-                if data[:-1] in held:
-                    data = b""
-                while data:
-                    data = data[os.write(fd, data):]
+                if task_id not in self._repair(fd):
+                    # One write of the whole record; a short one is torn, cut by the next repair and re-appended.
+                    if os.write(fd, data) != len(data):
+                        raise OSError(errno.EIO, "a short write of a settled id")
                 os.fsync(fd)
             finally:
                 os.close(fd)
@@ -1005,9 +1025,10 @@ class Lifecycle:
         self.reconcile_settled(rec["task_id"])
 
     def reconcile_settled(self, task_id):
-        """A SETTLED claim's settlement completed: its id in the settled ledger (an idempotent append) and its
-        staged body removed, the steps _settle takes after the save; a retry after either failed finishes
-        them. True when the claim is SETTLED; any failure raises, as those steps do."""
+        """The one repair-then-check every reader that can report a claim settled or final runs first: a
+        SETTLED claim's id appended to the settled ledger (idempotent) and its staged body removed, the steps
+        _settle takes after the save. settlement_complete afterwards (False for a claim not SETTLED); any
+        failure raises, as those steps do, so nothing reports final over an incomplete settlement."""
         rec = self.claims.load(task_id)
         if rec is None or rec["phase"] != SETTLED:
             return False
@@ -1015,7 +1036,7 @@ class Lifecycle:
             self.log("re-recording a settled id ->", task_id)
             self.settled.add(task_id)
         self.claims.unstage(task_id)
-        return True
+        return self.settlement_complete(task_id)
 
     def settlement_complete(self, task_id):
         """Whether a SETTLED claim's settlement is whole: its id in the ledger and no staged body left. What
