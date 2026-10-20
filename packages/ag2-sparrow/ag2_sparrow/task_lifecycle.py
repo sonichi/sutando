@@ -556,13 +556,21 @@ def _fsync_file(path):
 class SettledIds:
     """Append-only, one validated id per newline-terminated record; never rewritten. A torn tail (an
     unterminated suffix: what a short append leaves) is dropped under the ledger's flock, on open and
-    before every append; any malformed newline-terminated record fails closed (LedgerError)."""
+    before every append; any malformed newline-terminated record fails closed (LedgerError). `ids` is
+    what the file shows (enough never to call an id again); `durable` only what a successful fsync of
+    the file and its directory, by this instance, covered: what a settlement may count."""
 
     def __init__(self, path, required=False):
         self.path = str(path)
+        synced = False
         try:
             with open(self.path, "rb") as f:
                 data = f.read()
+                try:
+                    os.fsync(f.fileno())                # what this instance read is durable only once this succeeds
+                    synced = True
+                except OSError:
+                    pass
         except FileNotFoundError:
             if required:
                 raise LedgerError("%s is missing" % self.path)
@@ -579,6 +587,17 @@ class SettledIds:
                     os.close(fd)
             except OSError as e:
                 raise LedgerIOError("%s cannot be repaired (%s)" % (self.path, e))
+        self.durable = set()
+        if self.ids and synced:
+            try:
+                fsync_dir(os.path.dirname(self.path))
+                self.durable = set(self.ids)
+            except OSError:
+                pass                                    # visible, not yet durable: add() syncs before it counts
+
+    def _sync_file_and_dir(self):
+        _fsync_file(self.path)
+        fsync_dir(os.path.dirname(self.path))
 
     def _parse(self, data):
         """(ids, the byte length of the whole records kept): an unterminated tail is not kept."""
@@ -628,30 +647,29 @@ class SettledIds:
         return task_id in self.ids
 
     def add(self, task_id):
-        """Append, fsync, and only then remember. Any failure raises LedgerError. Repair-read-check-append is
-        one critical section under the ledger's own flock, so instances loaded earlier never append an id twice
-        and never append after a torn tail."""
-        if task_id in self.ids:
+        """Append, fsync, and only then count it durable. Any failure raises LedgerError. Repair-read-check-append
+        is one critical section under the ledger's own flock, so instances loaded earlier never append an id twice
+        and never append after a torn tail. An id already visible but not yet durable is synced, never trusted."""
+        if task_id in self.durable:
             return
         if not local_task_protocol.valid_task_id(task_id):
             raise LedgerError("%r is not a task id; not appended to %s" % (task_id, self.path))
         data = (task_id + "\n").encode("utf-8")
         try:
-            created = not os.path.exists(self.path)
             fd = os.open(self.path, os.O_RDWR | os.O_APPEND | os.O_CREAT | getattr(os, "O_CLOEXEC", 0), 0o644)
             try:
                 if task_id not in self._repair(fd):
                     # One write of the whole record; a short one is torn, cut by the next repair and re-appended.
                     if os.write(fd, data) != len(data):
                         raise OSError(errno.EIO, "a short write of a settled id")
-                os.fsync(fd)
+                    self.ids.add(task_id)
             finally:
                 os.close(fd)
-            if created:
-                fsync_dir(os.path.dirname(self.path))
+            self._sync_file_and_dir()
         except OSError as e:
             raise LedgerIOError("cannot append to %s (%s)" % (self.path, e))
         self.ids.add(task_id)
+        self.durable.add(task_id)
 
 
 # ── claims ───────────────────────────────────────────────────────────────────
@@ -1031,15 +1049,25 @@ class Lifecycle:
             return False
         if task_id not in self.settled:
             self.log("re-recording a settled id ->", task_id)
-            self.settled.add(task_id)
+        # Always a durable ledger sync first (an id already visible included); only then is the body removed.
+        self.settled.add(task_id)
         self.claims.unstage(task_id)
         return self.settlement_complete(task_id)
+
+    def _reconcile_or_skip(self, task_id):
+        """Recovery's repair of one SETTLED claim: an I/O failure skips this claim (logged, left for the next
+        pass, never compacted meanwhile) instead of stopping the start. True when the settlement is complete."""
+        try:
+            return self.reconcile_settled(task_id)
+        except StateIOError as e:
+            self.log("settlement repair skipped, retried next pass ->", task_id, e)
+            return False
 
     def settlement_complete(self, task_id):
         """Whether a SETTLED claim's settlement is whole: its id in the ledger and no staged body left. What
         every report of a settled or final claim requires; reconcile_settled is what makes it so."""
         rec = self.claims.load(task_id)
-        return bool(rec and rec["phase"] == SETTLED and task_id in self.settled
+        return bool(rec and rec["phase"] == SETTLED and task_id in self.settled.durable
                     and not os.path.lexists(self.claims.dir(task_id) / "body"))
 
     def is_settled(self, task_id):
@@ -1048,7 +1076,10 @@ class Lifecycle:
         if task_id not in self.settled:
             return False
         rec = self.claims.load(task_id)
-        return self.reconcile_settled(task_id) if rec and rec["phase"] == SETTLED else True
+        if rec and rec["phase"] == SETTLED:
+            return self.reconcile_settled(task_id)
+        self.settled.add(task_id)                       # a compacted claim: its id synced before it counts
+        return True
 
     def reconcile_unbound(self, now=None):
         """The SETTLED claims no generation owns (answered without a call): each settlement completed, and
@@ -1057,10 +1088,8 @@ class Lifecycle:
         for task_id, rec in self._claims_readable().items():
             if not rec or rec.get("generation") or rec.get("claim_mode") not in (None, LOCAL) or rec["phase"] != SETTLED:
                 continue
-            self.reconcile_settled(task_id)
-            if now - rec.get("settled_at", now) > COMPACT_AFTER:
+            if self._reconcile_or_skip(task_id) and now - rec.get("settled_at", now) > COMPACT_AFTER:
                 self.claims.remove(task_id)
-        self.settled.sync()
 
     def _holds_body(self, task_id, body):
         """Labels a settled publication won when some generation holds exactly our bytes."""
@@ -1228,7 +1257,7 @@ class Lifecycle:
                 self.log("foreign claim (local), left alone ->", task_id)
                 continue
             if rec and rec["phase"] == SETTLED:
-                self.reconcile_settled(task_id)
+                self._reconcile_or_skip(task_id)
         self.settled.sync()                             # compaction below never runs ahead of durability
         for name in os.listdir(self.results):
             if name.startswith(".task-") and (".publish." in name):
@@ -1238,7 +1267,8 @@ class Lifecycle:
                 continue
             phase = rec["phase"]
             if phase == SETTLED:
-                if now - rec.get("settled_at", now) > COMPACT_AFTER:
+                # Compaction only after the settlement's own durable ledger sync: the id outlives the claim.
+                if self.settlement_complete(task_id) and now - rec.get("settled_at", now) > COMPACT_AFTER:
                     self.claims.remove(task_id)
                 continue
             task_path = self.inbox / ("%s.txt" % task_id)
@@ -1303,12 +1333,13 @@ class Lifecycle:
                 if r and r.get("claim_mode") == LOCAL and r.get("generation") == generation}
         for task_id, rec in recs.items():
             if rec["phase"] == SETTLED:
-                self.reconcile_settled(task_id)
+                self._reconcile_or_skip(task_id)
         self.settled.sync()
         for task_id, rec in recs.items():
             phase = rec["phase"]
             if phase == SETTLED:
-                if now - rec.get("settled_at", now) > COMPACT_AFTER:
+                # Compaction only after the settlement's own durable ledger sync: the id outlives the claim.
+                if self.settlement_complete(task_id) and now - rec.get("settled_at", now) > COMPACT_AFTER:
                     self.claims.remove(task_id)
                 continue
             self._sweep_temps(task_id, now)

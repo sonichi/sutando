@@ -3467,7 +3467,7 @@ class InboxCli(ConnectBase):
         not outcome=settled (the ledger entry and the body removal never ran), so the Mod retries; the identical
         publish again completes the settlement and only then answers settled. park routes the same way."""
         lc = inbox._lifecycle(self.root)
-        real_save = inbox.lifecycle.ClaimStore.save
+        real_save, real_remove = inbox.lifecycle.ClaimStore.save, inbox.lifecycle.ClaimStore.remove
         for t, call in (("task-hard-publish", lambda t: self.verb("publish", t)),
                         ("task-hard-park", lambda t: self.verb("park", t, "turn-1", "--detail", "aborted"))):
             self.confirmed(t)
@@ -3493,10 +3493,12 @@ class InboxCli(ConnectBase):
     def test_settlement_property_every_entry_path_by_every_fault_by_every_schedule_converges(self):
         """The settlement invariant as one property. For every entry path that settles (publish, park, a non-admitted
         claim, interrupt, a lost claim, recovery's no-result settle, recovery's publication) x one fault at each step
-        (the ledger append fails, the append is torn and an already-loaded writer runs next, the staged-body unlink
-        fails, the SETTLED claim.json rename lands and its directory fsync fails, the progress-mirror write fails)
-        x each schedule production can run (the Mod retries; a restart's one recovery pass, then claims; the task
-        file gone, only that recovery pass), driven to quiescence: every reply,
+        (the ledger append fails, the append is torn and an already-loaded writer runs next, the whole record lands
+        but its fsync fails, the staged-body unlink fails, the SETTLED claim.json rename lands and its directory
+        fsync fails, the progress-mirror write fails) x each schedule production can run (the Mod retries; a
+        restart's one recovery pass, then claims; the task file gone, only that recovery pass; and that pass with
+        the claim due for compaction), driven to quiescence: no body or claim is removed before the id's ledger
+        sync succeeded (the crash-after-remove window), every reply,
         the first after the fault included, that reports final comes over a complete settlement, and at the end
         the result exists exactly once (none for the no-result settle), the ledger holds the id exactly once and
         still opens, and the real staged body is gone."""
@@ -3507,7 +3509,7 @@ class InboxCli(ConnectBase):
         real_add, real_unstage, real_write_progress = (inbox.lifecycle.SettledIds.add, inbox.lifecycle.ClaimStore.unstage,
                                                        records.write_progress)
         real_lifecycle = inbox._lifecycle
-        real_save = inbox.lifecycle.ClaimStore.save
+        real_save, real_remove = inbox.lifecycle.ClaimStore.save, inbox.lifecycle.ClaimStore.remove
 
         def recovery():
             with mock.patch.object(task_io, "verify_lineage", return_value=False):
@@ -3573,27 +3575,35 @@ class InboxCli(ConnectBase):
         entries = {"publish": e_publish, "park": e_park, "refused": e_refused, "interrupt": e_interrupt,
                    "lost": e_lost, "noresult": e_no_result, "recovered": e_recovered}
 
-        def fault(kind, fired):
+        def fault(kind, fired, t, undurable):
+            """One fault, once, on this case's task only."""
             once = []
 
             def add(led, task_id):
-                if not once:
+                if not once and task_id == t:
                     once.append(1); fired.append(kind)
                     if kind == "torn":
                         with open(led.path, "ab") as f:
                             f.write((task_id + "\n").encode()[:3])
+                    if kind == "fsync":
+                        # The whole record lands and is visible; its fsync fails: durable only after a later sync.
+                        if (task_id + "\n") not in ledger_path.read_text():
+                            with open(led.path, "ab") as f:
+                                f.write((task_id + "\n").encode())
+                        undurable.add(task_id)
+                        raise inbox.lifecycle.LedgerIOError("cannot fsync the ledger ([Errno 5] I/O error)")
                     raise inbox.lifecycle.LedgerIOError("cannot append ([Errno 5] I/O error)")
                 return real_add(led, task_id)
 
             def unstage(store, task_id):
-                if not once and (store.dir(task_id) / "body").exists():
+                if not once and task_id == t and (store.dir(task_id) / "body").exists():
                     once.append(1); fired.append(kind)
                     raise inbox.lifecycle.StateIOError("cannot remove body ([Errno 5] I/O error)")
                 return real_unstage(store, task_id)
 
             def save(store, rec):
                 # The claim.json rename lands, then its directory fsync fails: the step is committed, the reply hard.
-                if not once and rec["phase"] == inbox.lifecycle.SETTLED:
+                if not once and rec["task_id"] == t and rec["phase"] == inbox.lifecycle.SETTLED:
                     once.append(1); fired.append(kind)
                     real_save(store, rec)
                     raise inbox.lifecycle.StateCommitted("claim.json was replaced, then its directory fsync failed")
@@ -3604,7 +3614,7 @@ class InboxCli(ConnectBase):
                     once.append(1); fired.append(kind)
                     raise records.RecordError("progress.json: [Errno 5] I/O error")
                 return real_write_progress(root, mutate)
-            if kind in ("append", "torn"):
+            if kind in ("append", "torn", "fsync"):
                 return mock.patch.object(inbox.lifecycle.SettledIds, "add", add)
             if kind == "unlink":
                 return mock.patch.object(inbox.lifecycle.ClaimStore, "unstage", unstage)
@@ -3612,14 +3622,39 @@ class InboxCli(ConnectBase):
                 return mock.patch.object(inbox.lifecycle.ClaimStore, "save", save)
             return mock.patch.object(records, "write_progress", write_progress)
 
+        @contextlib.contextmanager
+        def durability_watch(undurable, problems):
+            """A visible id becomes durable only by a successful fsync of the ledger. Removing the body or the claim
+            of an id not yet durable is the crash window the invariant forbids: a crash there loses the only witness."""
+            real_fsync = inbox.lifecycle.os.fsync
+
+            def fsync(fd):
+                real_fsync(fd)
+                if undurable and fd_path(fd) == os.path.realpath(ledger_path):
+                    undurable.clear()
+
+            def unstage(store, task_id):
+                if task_id in undurable and (store.dir(task_id) / "body").exists():
+                    problems.append("the body removed before a successful ledger sync")
+                return real_unstage(store, task_id)
+
+            def remove(store, task_id):
+                if task_id in undurable:
+                    problems.append("the claim compacted before a successful ledger sync")
+                return real_remove(store, task_id)
+            with mock.patch.object(inbox.lifecycle.os, "fsync", fsync), \
+                    mock.patch.object(inbox.lifecycle.ClaimStore, "unstage", unstage), \
+                    mock.patch.object(inbox.lifecycle.ClaimStore, "remove", remove):
+                yield
+
         def final(rc, out):
             return rc == 0 or (rc == 3 and (out.get("resolved") is True or out.get("outcome") == "settled")) \
                 or (rc == 1 and not out.get("retry"))
 
-        def check(t, reply, where, problems):
-            """final => complete, on every reply; True when the reply is final."""
+        def check(t, reply, where, problems, undurable):
+            """final => complete (and durable), on every reply; True when the reply is final."""
             rc, out = reply
-            if final(rc, out) and not complete(t):
+            if final(rc, out) and (not complete(t) or t in undurable):
                 problems.append("%s, final %r, over an incomplete settlement" % (where, out))
             return final(rc, out)
 
@@ -3630,51 +3665,62 @@ class InboxCli(ConnectBase):
                 return False
             return (t in ids.ids and ledger_path.read_text().count(t + "\n") == 1
                     and not (lc.claims.dir(t) / "body").exists())
-        failures, fired_cases = [], 0
+
+        def aged(t):
+            rec = lc.claims.load(t)
+            if rec and rec["phase"] == inbox.lifecycle.SETTLED:
+                lc.claims.save(dict(rec, settled_at=rec["settled_at"] - inbox.lifecycle.COMPACT_AFTER - 1))
+        failures, fired_cases, cases = [], 0, 0
         for e_name, entry in entries.items():
-            for f_name in ("append", "torn", "unlink", "rename", "mirror"):
-                for s_name in ("retry", "restart", "gone"):
+            for f_name in ("append", "torn", "fsync", "unlink", "rename", "mirror"):
+                for s_name in ("retry", "restart", "gone", "late"):
                     t = "task-p-%s-%s-%s" % (e_name, f_name, s_name)
+                    cases += 1
                     first, again, expected = entry(t)
-                    fired, problems = [], []
+                    fired, problems, undurable = [], [], set()
                     preloaded = real_lifecycle(self.root)            # a writer loaded before the fault, run next
-                    with fault(f_name, fired):
-                        reply = first()
-                    fired_cases += bool(fired)
-                    done = isinstance(reply[0], int) and check(t, reply, "the first reply after the fault", problems)
-                    stale = [preloaded] if f_name == "torn" and fired else []
-                    with mock.patch.object(inbox, "_lifecycle", lambda root: stale.pop() if stale else real_lifecycle(root)):
-                        if s_name == "gone":
-                            (self.inbox / (t + ".txt")).unlink(missing_ok=True)
-                            recovery()
-                        else:
-                            if s_name == "restart":
+                    with durability_watch(undurable, problems):
+                        with fault(f_name, fired, t, undurable):
+                            reply = first()
+                        fired_cases += bool(fired)
+                        done = isinstance(reply[0], int) and check(t, reply, "the first reply after the fault", problems,
+                                                                   undurable)
+                        stale = [preloaded] if f_name == "torn" and fired else []
+                        with mock.patch.object(inbox, "_lifecycle", lambda root: stale.pop() if stale else real_lifecycle(root)):
+                            if s_name in ("gone", "late"):
+                                (self.inbox / (t + ".txt")).unlink(missing_ok=True)
+                                if s_name == "late":
+                                    aged(t)                      # due for compaction: the crash-after-remove window
                                 recovery()
-                                again = (lambda t=t: self.verb("claim", t)) if e_name not in ("noresult", "recovered") else again
-                            for _ in range(0 if done and s_name == "retry" else 8):
-                                if check(t, again(), "a retry", problems):
-                                    break
                             else:
-                                if not (done and s_name == "retry"):
-                                    problems.append("no final report")
-                            if not check(t, self.verb("claim", t), "a later claim", problems):
-                                problems.append("a later claim is not final")
-                            recovery()
+                                if s_name == "restart":
+                                    recovery()
+                                    again = (lambda t=t: self.verb("claim", t)) if e_name not in ("noresult", "recovered") else again
+                                for _ in range(0 if done and s_name == "retry" else 8):
+                                    if check(t, again(), "a retry", problems, undurable):
+                                        break
+                                else:
+                                    if not (done and s_name == "retry"):
+                                        problems.append("no final report")
+                                if not check(t, self.verb("claim", t), "a later claim", problems, undurable):
+                                    problems.append("a later claim is not final")
+                                recovery()
                     if not complete_safe(ledger_path):
                         problems.append("the ledger does not open")
-                    elif not complete(t):
+                    elif not complete(t) or t in undurable:
                         problems.append("settlement incomplete at quiescence")
                     got = [p.name for p in self.results.iterdir() if p.name == t + ".txt"]
                     body = (self.results / (t + ".txt")).read_text() if got else None
                     if body != expected:
                         problems.append("result %r, expected %r" % (body, expected))
                     if problems:
-                        failures.append("%s x %s x %s: %s" % (e_name, f_name, s_name, "; ".join(problems)))
+                        failures.append("%s x %s x %s: %s" % (e_name, f_name, s_name, "; ".join(dict.fromkeys(problems))))
                     if not complete_safe(ledger_path):
                         ledger_path.write_text("".join(sorted(x + "\n" for x in real_ids(ledger_path))))
         self.assertEqual(failures, [])
-        self.assertEqual(fired_cases, 96, "every fault fired except the mirror write where the first call writes no mirror "
-                         "(the non-admitted claim's refusal, and the two recovery-first entries): 105 - 9")
+        self.assertEqual(cases, 168)
+        self.assertEqual(fired_cases, 156, "every fault fired except the mirror write where the first call writes no mirror "
+                         "(the non-admitted claim's refusal, and the two recovery-first entries): 168 - 12")
 
     def test_every_settle_path_completes_its_settlement_after_one_ledger_fault_before_reporting_final(self):
         """The settled-ids append faults once on each path that settles: publish, park, a non-admitted claim, an
@@ -3941,6 +3987,17 @@ class InboxCli(ConnectBase):
         with contextlib.redirect_stdout(out), mock.patch.dict(os.environ, {inbox.ROOT_VAR: "relative"}):
             rc = cli.main(["inbox", "check-inode", "--expect", "1:1"])
         self.assertEqual((rc, "must be absolute" in json.loads(out.getvalue())["refused"]), (1, True))
+
+
+def fd_path(fd):
+    """The path an open fd names (macOS F_GETPATH, Linux /proc), or '' when it cannot be read."""
+    try:
+        if sys.platform == "darwin":
+            import fcntl
+            return os.path.realpath(fcntl.fcntl(fd, 50, b"\0" * 1024).split(b"\0", 1)[0].decode())
+        return os.path.realpath(os.readlink("/proc/self/fd/%d" % fd))
+    except OSError:
+        return ""
 
 
 def complete_safe(path):

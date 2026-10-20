@@ -968,6 +968,42 @@ class StepBranchTest(unittest.TestCase):
         self.assertEqual(self.seen, {"task-a"})
         self.assertEqual(self.fake.calls(), [])
 
+    def test_a_settled_id_with_settlement_debt_is_repaired_through_the_lifecycle_before_it_counts(self):
+        """step() asks the lifecycle (is_settled), never the ledger alone: a SETTLED claim whose id is in the ledger
+        but whose staged body was left is repaired before the task counts settled, and a repair that fails parks
+        the task instead of reporting it final."""
+        write_task(self.work, "task-a", "hi")
+        claims = self.ad.lc.claims
+        claims.save({"schema": 1, "task_id": "task-a", "attempt": 1, "created_at": 1.0, "phase": lc.SETTLED,
+                     "settled_at": 1.0})
+        claims.stage("task-a", b"staged body\n")
+        self.ad.lc.settled.add("task-a")
+        with contextlib.redirect_stderr(io.StringIO()), \
+                mock.patch.object(lc.ClaimStore, "unstage", side_effect=lc.StateIOError("cannot remove body")):
+            self.assertFalse(self.ad.step("task-a.txt", self.seen), "a repair that fails parks the task")
+        self.assertEqual(self.seen, set())
+        self.assertGreater(self.ad.not_before["task-a"], self.ad.clock())
+        self.assertTrue((claims.dir("task-a") / "body").is_file())
+        self.ad.not_before.clear()
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertTrue(self.ad.step("task-a.txt", self.seen))
+        self.assertEqual((self.seen, (claims.dir("task-a") / "body").exists()), ({"task-a"}, False), "repaired, then final")
+        self.assertEqual(self.fake.calls(), [])
+
+    def test_a_local_settled_claim_is_read_never_repaired_by_the_cloud_step(self):
+        """claim_mode first: a local SETTLED claim (its id in the ledger, its staged body left for its own owner) is
+        counted settled from the ledger and never repaired here; its body stays."""
+        write_task(self.work, "task-l", "hi")
+        claims = self.ad.lc.claims
+        claims.save({"schema": 1, "task_id": "task-l", "attempt": 1, "created_at": 1.0, "phase": lc.SETTLED,
+                     "settled_at": 1.0, "claim_mode": lc.LOCAL, "generation": {"pid": 1, "start": "x"}})
+        claims.stage("task-l", b"the local owner's\n")
+        self.ad.lc.settled.add("task-l")
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertTrue(self.ad.step("task-l.txt", self.seen))
+        self.assertTrue((claims.dir("task-l") / "body").is_file(), "never repaired by the cloud adapter")
+        self.assertEqual(self.fake.calls(), [])
+
     def test_a_claim_past_its_call_is_published_and_a_parked_publication_waits(self):
         write_task(self.work, "task-a", "hi")
         past = {"phase": "published", "task_id": "task-a"}

@@ -142,7 +142,14 @@ A newline-terminated malformed record is corruption and fails closed. A hard
 reply (a rename that landed, its directory fsync failed) claims
 `outcome: settled` only over a complete settlement; otherwise the caller
 retries and the retry completes it. The cloud adapter's recovery and its
-"already settled" reader (`is_settled`) take the same repair-then-check. When the progress record cannot be written at all, the CLI raises
+"already settled" reader (`is_settled`) take the same repair-then-check, for
+cloud claims only (a local claim is read from the ledger, never repaired
+there). A ledger id counts only after a successful fsync of the ledger (and
+its directory) seen by the counting process: an id that is visible but whose
+sync failed is synced again before the staged body is removed, the claim is
+compacted, or anything reports settled; a sync that fails removes nothing and
+is a retry. Recovery skips a claim whose repair fails on I/O (one log line)
+and finishes it on the next pass, so one bad claim never stops a start. When the progress record cannot be written at all, the CLI raises
 an alarm in the adapter's config dir (outside `state/`): `verify` fails its
 `progress` row and the launcher raises the needs-attention card until a durable
 write clears it. A record whose fields have the wrong shape reads as unreadable (hard),

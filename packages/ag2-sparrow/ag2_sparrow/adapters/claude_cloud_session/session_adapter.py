@@ -181,18 +181,24 @@ class Adapter(RelayLoop):
         """Handle one task; returns True when it reached a final result."""
         task_id = name[:-4]
         try:
-            settled = self.lc.is_settled(task_id)
+            rec = self.lc.claims.load(task_id)
+        except task_lifecycle.ClaimUnreadable as e:
+            if task_id in self.lc.settled:
+                log("already settled, never called again ->", task_id)
+                seen.add(task_id)
+                return True
+            return self.park(task_id, e)
+        # A local claim is never this adapter's to repair: it only reads the ledger for one.
+        local = bool(rec and rec.get("claim_mode") == task_lifecycle.LOCAL)
+        try:
+            settled = task_id in self.lc.settled if local else self.lc.is_settled(task_id)
         except task_lifecycle.StateError as e:
             return self.park(task_id, e)
         if settled:
             log("already settled, never called again ->", task_id)
             seen.add(task_id)
             return True
-        try:
-            rec = self.lc.claims.load(task_id)
-        except task_lifecycle.ClaimUnreadable as e:
-            return self.park(task_id, e)
-        if rec and rec.get("claim_mode") == task_lifecycle.LOCAL:
+        if local:
             log("foreign claim (local), left alone ->", task_id)
             return self.park(task_id, "a local claim")
         if rec and rec["phase"] not in task_lifecycle.CALLABLE:
