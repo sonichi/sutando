@@ -36,6 +36,7 @@ for _p in (str(REPO / "src"), str(REPO / "packages" / "ag2-sparrow")):
 
 import sparrow_agent_bridge as bridge  # noqa: E402
 from ag2_sparrow.sparrowd import Supervisor, WorkerSpec, run  # noqa: E402
+
 from ag2_sparrow.adapters.claude_code import cli  # noqa: E402
 
 SLEEPER = [sys.executable, "-c", "import time\nwhile True: time.sleep(0.2)"]
