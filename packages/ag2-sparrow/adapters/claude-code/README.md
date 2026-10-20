@@ -184,27 +184,36 @@ records only the choice (`HMAC_KEY_FILE`, the key path; `HMAC_STRICT` empty
 when `--no-hmac-strict` was given); strictness is derived at each read from
 that choice plus the key file as it is at that moment. The exact rule:
 
-- No key path recorded: off. Every task reads `unsigned` and is submitted.
+- `HMAC_STRICT=1` (a key path without `--no-hmac-strict`, the default with
+  `--hmac-key-file`; or `--hmac-strict`): strict, read before anything else.
+  Only `verified` is submitted; a task without a valid envelope is refused.
+  While the key file is missing, unreadable, not 64 hex characters, or no path
+  is recorded at all, every task is refused with that one reason line
+  (`strict mode: <path> missing: strict mode submits nothing until it is
+  back`), never read as "no HMAC": the mod holds such a task with the same
+  backoff and stuck mark as any other retried task, so it is submitted once
+  the key lands, without a reinstall or a session restart.
 - Key path recorded and `--no-hmac-strict` recorded: lenient, whatever the key
   file holds. `unsigned` and `unverifiable` are submitted with the verdict in
   the envelope line.
-- Key path recorded and no `--no-hmac-strict` (the default with
-  `--hmac-key-file`, or `--hmac-strict`): strict. Only `verified` is submitted;
-  a task without a valid envelope is refused. While the key file is missing,
-  unreadable or not 64 hex characters, every task is refused with that one
-  reason line (`strict mode: <path> missing: strict mode submits nothing until
-  it is back`), never read as "no HMAC". A key written there later is honoured
-  on the next task, without a reinstall or a session restart.
+- No key path and no strict flag: off. Every task reads `unsigned` and is
+  submitted.
 - `invalid` is never submitted in any mode.
+
+One limit: the verifier's key *path* (`AG2_HMAC_KEY_FILE`) is set in the
+session's environment at its creation, so a reinstall with another path takes a
+session restart; the key's presence and content at that path are read live, by
+the verifier and the policy alike.
 
 So `install --hmac-key-file <path>` records a path whose key is not there yet
 (it prints a warning and `verify` fails its `hmac key` part until the key
 appears); it still refuses a key file that exists but is not 64 hex characters,
-or `--hmac-strict` with no `--hmac-key-file`. A refused task is retired with the
-reason in a debug line; a task the CLI could not answer for (it did not run, or
-the installed config was unreadable) is retried next tick, as is one whose
-verifier itself cannot run (no `python3`, a timeout, no output). `verify` prints
-the mode, read the same way.
+or `--hmac-strict` with no `--hmac-key-file`. A task refused for its verdict is
+retired with the reason in a debug line; one the CLI could not answer for (it
+did not run, or the installed config was unreadable) is held with backoff and
+the stuck mark, like one held for a missing key; one whose verifier itself
+cannot run (no `python3`, a timeout, no output) is retried next tick. `verify`
+prints the mode, read the same way.
 
 Sparrow itself never stamps: the stamper is a host-injected seam
 (`local_task_protocol.set_task_stamper`), and only Sutando's

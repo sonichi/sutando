@@ -126,8 +126,8 @@ def envelope(verdict: str, environ=None) -> dict:
         cfg = cm.read_config(path)
     except (OSError, ValueError) as e:
         raise Parked("the installed config %s is unreadable (%s); retried" % (path, e))
-    submit, reason = hmac_policy.decide(cfg, verdict)
-    return {"verdict": verdict, "mode": hmac_policy.mode(cfg), "submit": submit, "reason": reason}
+    submit, reason, retry = hmac_policy.decide(cfg, verdict)
+    return {"verdict": verdict, "mode": hmac_policy.mode(cfg), "submit": submit, "reason": reason, "retry": retry}
 
 
 def admit(root, task_id, allow: bool) -> "tuple[str | None, dict, str]":

@@ -149,7 +149,7 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
       const verdict = argv[argv.indexOf('--verdict') + 1]
       const reason = verdict === 'invalid' ? 'envelope invalid' : !opts.strict ? '' : opts.keyProblem ? `strict mode: ${opts.keyProblem}`
         : verdict !== 'verified' ? `strict mode: envelope ${verdict}` : ''
-      return out(0, { verdict, mode: opts.strict ? 'strict' : 'off', submit: !reason, reason })
+      return out(0, { verdict, mode: opts.strict ? 'strict' : 'off', submit: !reason, reason, retry: !!(opts.strict && opts.keyProblem) })
     }
     if (verb === 'claim') {
       if (result(task) === 'LIVE_READY') {
@@ -437,27 +437,45 @@ test('strict mode submits only verified envelopes: the CLI decides per task, the
   expect(h.runs.some(a => a[0] === 'ag2-sparrow-claude-local' && a[2] === 'envelope' && a[4] === 'unsigned')).toBe(true)
 })
 
-test('strict mode with the key file gone refuses every task with the one reason line, never lenient', async ($, on) => {
-  const h = host(on, { verdict: 'unverifiable', strict: true, keyProblem: '/k/task-hmac.key missing: strict mode submits nothing until it is back' })
+test('strict mode with the key file gone refuses with the one reason line, never lenient, and holds the task until the key lands', async ($, on) => {
+  const o = { verdict: 'verified', strict: true, keyProblem: '/k/task-hmac.key missing: strict mode submits nothing until it is back' }
+  const h = host(on, o)
   h.files['/in/task-k1.txt'] = TASK('task-k1')
   await arm($, h)
-  await h.clock.advance(2000)
+  for (let i = 0; i < 8; i++) await h.clock.advance(1000)
   expect(h.submitted.length).toBe(0)
   expect(verbs(h).filter(v => v === 'claim')).toEqual([])
-  expect(h.logs.filter(l => l.includes('task-k1 strict mode: /k/task-hmac.key missing')).length).toBe(1)
+  // Held with backoff (tries at ticks 0, 1, 3, 7), never retired: one reason line per new delay, not per tick.
+  expect(verbs(h).filter(v => v === 'envelope').length).toBe(4)
+  expect(h.logs.filter(l => l.includes('task-k1 held by the envelope policy (strict mode: /k/task-hmac.key missing')).length).toBe(4)
+  o.keyProblem = ''                                   // the key lands: the next try submits it once, no reinstall
+  for (let i = 0; i < 8; i++) await h.clock.advance(1000)
+  expect(h.submitted.length).toBe(1)
+  expect(h.submitted[0]).toContain('envelope verified')
+  expect(h.claims['task-k1'].phase).toBe('CALLING')
 })
 
-test('an envelope policy the CLI could not answer is retried next tick, never submitted and never retired', async ($, on) => {
+test('an envelope policy the CLI could not answer is held with backoff, then submitted once it answers, never retired', async ($, on) => {
   const h = host(on, { policyFails: 2 })
   h.files['/in/task-p1.txt'] = TASK('task-p1')
   await arm($, h)
-  await h.clock.advance(1000)
+  await h.clock.advance(1000)                         // tries at ticks 0 and 1 fail; the next is at tick 3
   expect(h.submitted.length).toBe(0)
   expect(verbs(h).filter(v => v === 'envelope').length).toBe(2)
   expect(verbs(h).filter(v => v === 'claim')).toEqual([])
-  await h.clock.advance(1000)
+  await h.clock.advance(2000)
   expect(h.submitted.length).toBe(1)
   expect(h.submitted[0]).toContain('envelope verified')
+})
+
+test('an envelope policy that never answers is marked stuck after 300 ticks like any other retained task, never skipped silently', async ($, on) => {
+  const h = host(on, { policyFails: 1000 })
+  h.files['/in/task-p2.txt'] = TASK('task-p2')
+  await arm($, h)
+  for (let i = 0; i < 400; i++) await h.clock.advance(1000)
+  expect(h.submitted.length).toBe(0)
+  expect(verbs(h).filter(v => v === 'envelope').length).toBeGreaterThan(8)   // still tried past the 30-tick stale bound
+  expect(h.progress.find((p: string[]) => p[0] === '--stuck')).toEqual(['--stuck', 'task-p2', '--stuck-detail', 'envelope policy unanswered: the installed config is unreadable (EIO); retried'])
 })
 
 test('a claim the CLI refuses (claimed, archived, quarantined, unreadable) never resubmits', async ($, on) => {

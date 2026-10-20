@@ -298,8 +298,16 @@ async function arm($: any, s: State, inbox: string, results: string): Promise<{ 
         // Strict or not is the CLI's call, per task, from the installed config and the key file as it is now;
         // the Mod holds no copy of that rule. No answer (the CLI did not run, the config unreadable): retried.
         const policy = await cli($, s, ['envelope', '--verdict', verdict])
-        if (!policy.ok || typeof policy.data?.submit !== 'boolean') { log(`${rid} envelope policy gave no answer (${policy.data?.refused ?? 'no reply'}); not submitted`); continue }
+        if (!policy.ok || typeof policy.data?.submit !== 'boolean') {
+          // No answer, or a refusal the key's return lifts (strict, key missing): held, backed off, marked stuck.
+          if (await retain(entry.name, rid, 'envelope policy unanswered', String(policy.data?.refused ?? 'no reply'))) return
+          continue
+        }
         if (!policy.data.submit) {
+          if (policy.data.retry === true) {
+            if (await retain(entry.name, rid, 'held by the envelope policy', String(policy.data.reason ?? ''))) return
+            continue
+          }
           s.seen.add(entry.name)
           log(`${rid} ${policy.data.reason || `envelope ${verdict}`}; not submitted`)
           continue

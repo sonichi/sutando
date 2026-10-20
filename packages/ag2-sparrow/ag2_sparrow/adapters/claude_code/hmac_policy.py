@@ -6,10 +6,12 @@ plus the key file as it is at that moment: install, verify and the Mod's `inbox 
 read this module, and none of them keeps its own copy. Stdlib only.
 
 The rule:
-  no key path                       -> off: every verdict but invalid is submitted (unsigned reads)
+  HMAC_STRICT=1 (a key path without --no-hmac-strict, or --hmac-strict)
+                                    -> strict: only verified is submitted; while the key file is missing,
+                                       unreadable, malformed or not recorded at all, every task is
+                                       refused with that reason and held for retry, never read as off
   key path, --no-hmac-strict        -> lenient: every verdict but invalid is submitted, whatever the key
-  key path, no opt-out (the default) -> strict: only verified is submitted; while the key file is missing,
-                                        unreadable or malformed, every task is refused with that reason
+  no key path, no strict flag       -> off: every verdict but invalid is submitted (unsigned reads)
 """
 from __future__ import annotations
 
@@ -32,7 +34,7 @@ def key_absent(path: str) -> bool:
 def key_problem(path: str) -> str:
     """'' when `path` holds the key the plugin's verifier accepts (64 hex characters), else why not."""
     if not path:
-        return "no key file: strict mode would submit nothing"
+        return "no key file recorded (HMAC_KEY_FILE is empty): strict mode submits nothing"
     try:
         text = Path(path).read_text(encoding="utf-8", errors="replace").strip()
     except OSError as e:
@@ -44,27 +46,29 @@ def key_problem(path: str) -> str:
 
 
 def mode(cfg: dict) -> str:
-    """From the recorded choice alone; the key file's state enters only in decide()."""
-    if not cfg.get(KEY_FILE):
-        return OFF
-    return STRICT if cfg.get(STRICT_FLAG) == "1" else LENIENT
+    """From the recorded choice alone; the key file's state enters only in decide(). The strict flag is
+    read first: with it and no key path the mode is strict and fails closed, never off."""
+    if cfg.get(STRICT_FLAG) == "1":
+        return STRICT
+    return LENIENT if cfg.get(KEY_FILE) else OFF
 
 
-def decide(cfg: dict, verdict: str) -> "tuple[bool, str]":
-    """(submit, the one reason line when not), read fresh for this task."""
+def decide(cfg: dict, verdict: str) -> "tuple[bool, str, bool]":
+    """(submit, the one reason line when not, retry), read fresh for this task. retry is True only for a
+    refusal the key file's return would lift (strict mode with the key missing, unreadable or malformed):
+    the task is held and tried again, not retired."""
     if verdict not in VERDICTS:
-        return False, "no verdict (%r)" % (verdict,)
+        return False, "no verdict (%r)" % (verdict,), False
     if verdict == "invalid":
-        return False, "envelope invalid"
-    m = mode(cfg)
-    if m != STRICT:
-        return True, ""
+        return False, "envelope invalid", False
+    if mode(cfg) != STRICT:
+        return True, "", False
     problem = key_problem(cfg.get(KEY_FILE, ""))
     if problem:
-        return False, "strict mode: " + problem
+        return False, "strict mode: " + problem, True
     if verdict != "verified":
-        return False, "strict mode: envelope %s" % verdict
-    return True, ""
+        return False, "strict mode: envelope %s" % verdict, False
+    return True, "", False
 
 
 def describe(cfg: dict) -> str:

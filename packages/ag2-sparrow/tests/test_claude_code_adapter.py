@@ -1359,31 +1359,57 @@ class ConnectStrict(ConnectBase):
         self.assertEqual(hmac_policy.mode(cfg), hmac_policy.STRICT)
         missing = "strict mode: %s missing: strict mode submits nothing until it is back" % key
         for verdict in ("verified", "unsigned", "unverifiable"):
-            self.assertEqual(hmac_policy.decide(cfg, verdict), (False, missing), verdict)
+            self.assertEqual(hmac_policy.decide(cfg, verdict), (False, missing, True), verdict)
         self.assertIn("FAIL hmac key: strict mode: %s missing" % key, self.main("verify")[1])
         key.write_text("ab" * 32)                       # added after install: strict on the next read, no reinstall
-        self.assertEqual(hmac_policy.decide(cfg, "verified"), (True, ""))
-        self.assertEqual(hmac_policy.decide(cfg, "unsigned"), (False, "strict mode: envelope unsigned"))
-        self.assertEqual(hmac_policy.decide(cfg, "unverifiable"), (False, "strict mode: envelope unverifiable"))
-        self.assertEqual(hmac_policy.decide(cfg, "invalid"), (False, "envelope invalid"))
+        self.assertEqual(hmac_policy.decide(cfg, "verified"), (True, "", False))
+        self.assertEqual(hmac_policy.decide(cfg, "unsigned"), (False, "strict mode: envelope unsigned", False))
+        self.assertEqual(hmac_policy.decide(cfg, "unverifiable"), (False, "strict mode: envelope unverifiable", False))
+        self.assertEqual(hmac_policy.decide(cfg, "invalid"), (False, "envelope invalid", False))
         self.assertEqual(hmac_policy.decide(cfg, "bogus")[0], False)
         self.assertIn("PASS hmac key", self.main("verify")[1])
-        key.write_text("short")                          # malformed while strict: refused with the reason, never lenient
-        self.assertEqual(hmac_policy.decide(cfg, "verified"), (False, "strict mode: %s is not a 64-hex-character key, so every envelope reads unverifiable" % key))
-        key.unlink()                                     # removed while strict: refused with the one reason line
-        self.assertEqual(hmac_policy.decide(cfg, "verified"), (False, missing))
+        key.write_text("short")                          # malformed while strict: refused with the reason, held, never lenient
+        self.assertEqual(hmac_policy.decide(cfg, "verified"),
+                         (False, "strict mode: %s is not a 64-hex-character key, so every envelope reads unverifiable" % key, True))
+        key.unlink()                                     # removed while strict: refused with the one reason line, held
+        self.assertEqual(hmac_policy.decide(cfg, "verified"), (False, missing, True))
         lenient = dict(cfg, HMAC_STRICT="")              # --no-hmac-strict recorded: lenient regardless of the key
         self.assertEqual(hmac_policy.mode(lenient), hmac_policy.LENIENT)
         for verdict in ("verified", "unsigned", "unverifiable"):
-            self.assertEqual(hmac_policy.decide(lenient, verdict), (True, ""), verdict)
-        self.assertEqual(hmac_policy.decide(lenient, "invalid"), (False, "envelope invalid"))
+            self.assertEqual(hmac_policy.decide(lenient, verdict), (True, "", False), verdict)
+        self.assertEqual(hmac_policy.decide(lenient, "invalid"), (False, "envelope invalid", False))
         key.write_text("ab" * 32)
-        self.assertEqual(hmac_policy.decide(lenient, "unsigned"), (True, ""))
+        self.assertEqual(hmac_policy.decide(lenient, "unsigned"), (True, "", False))
         off = dict(cfg, HMAC_KEY_FILE="", HMAC_STRICT="")
         self.assertEqual(hmac_policy.mode(off), hmac_policy.OFF)
-        self.assertEqual(hmac_policy.decide(off, "unsigned"), (True, ""))
-        self.assertEqual(hmac_policy.decide(off, "invalid"), (False, "envelope invalid"))
+        self.assertEqual(hmac_policy.decide(off, "unsigned"), (True, "", False))
+        self.assertEqual(hmac_policy.decide(off, "invalid"), (False, "envelope invalid", False))
         self.assertIs(cli.key_problem, hmac_policy.key_problem, "install reads the same owner")
+
+    def test_a_strict_flag_with_no_key_path_fails_closed_never_off(self):
+        """HMAC_STRICT=1 and HMAC_KEY_FILE empty (main refused this config at install; a hand edit or an
+        older write can still hold it): strict, every task refused with the one reason line and held,
+        verify FAIL naming the missing key; never off, never a PASS."""
+        cfg = self.values(HMAC_KEY_FILE="", HMAC_STRICT="1")
+        self.assertEqual(hmac_policy.mode(cfg), hmac_policy.STRICT)
+        reason = "strict mode: no key file recorded (HMAC_KEY_FILE is empty): strict mode submits nothing"
+        for verdict in ("verified", "unsigned", "unverifiable"):
+            self.assertEqual(hmac_policy.decide(cfg, verdict), (False, reason, True), verdict)
+        self.assertEqual(hmac_policy.decide(cfg, "invalid"), (False, "envelope invalid", False))
+        self.configure(HMAC_KEY_FILE="", HMAC_STRICT="1")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = cli.main(["inbox", "--root", str(self.work), "envelope", "--verdict", "verified"])
+        self.assertEqual((rc, json.loads(out.getvalue())),
+                         (0, {"verdict": "verified", "mode": "strict", "submit": False, "reason": reason, "retry": True}))
+
+    def test_verify_fails_the_hmac_part_on_a_strict_flag_with_no_key_path(self):
+        self.configure(HMAC_KEY_FILE="", HMAC_STRICT="1")
+        rc, out, _ = self.main("verify")
+        self.assertEqual(rc, 1)
+        self.assertIn("FAIL hmac key: strict mode: no key file recorded (HMAC_KEY_FILE is empty)", out)
+        self.assertNotIn("PASS hmac key", out)
+        self.assertIn("INFO hmac mode: strict (only verified envelopes are submitted)", out)
 
     def test_the_envelope_verb_answers_from_the_installed_config_and_the_key_file_at_that_call(self):
         key = self.home / "task-hmac.key"
@@ -1395,17 +1421,17 @@ class ConnectStrict(ConnectBase):
                 rc = cli.main(["inbox", "--root", str(self.work), "envelope", "--verdict", verdict])
             return rc, json.loads(out.getvalue())
 
-        self.assertEqual(verb("verified"), (0, {"verdict": "verified", "mode": "strict", "submit": True, "reason": ""}))
+        self.assertEqual(verb("verified"), (0, {"verdict": "verified", "mode": "strict", "submit": True, "reason": "", "retry": False}))
         rc, out = verb("unsigned")
-        self.assertEqual((rc, out["submit"], out["reason"]), (0, False, "strict mode: envelope unsigned"))
+        self.assertEqual((rc, out["submit"], out["reason"], out["retry"]), (0, False, "strict mode: envelope unsigned", False))
         key.unlink()
         rc, out = verb("verified")
-        self.assertEqual((rc, out["submit"]), (0, False))
+        self.assertEqual((rc, out["submit"], out["retry"]), (0, False, True), "held for the key's return, not retired")
         self.assertEqual(out["reason"], "strict mode: %s missing: strict mode submits nothing until it is back" % key)
         key.write_text("ab" * 32)
         self.assertEqual(verb("verified")[1]["submit"], True, "the next call sees the key back; nothing was reinstalled")
         self.configure(HMAC_STRICT="")
-        self.assertEqual(verb("unverifiable")[1], {"verdict": "unverifiable", "mode": "lenient", "submit": True, "reason": ""})
+        self.assertEqual(verb("unverifiable")[1], {"verdict": "unverifiable", "mode": "lenient", "submit": True, "reason": "", "retry": False})
         self.assertEqual(verb("invalid")[1]["submit"], False)
         self.assertEqual(inbox.envelope("unsigned", {inbox.CONFIG_DIR_VAR: str(cli.config_dir())})["mode"], "lenient", "the pane's config dir")
         with self.assertRaises(inbox.Parked):
