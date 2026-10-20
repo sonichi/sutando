@@ -182,19 +182,22 @@ async function arm($: any, s: State, inbox: string, results: string): Promise<{ 
   const log = (line: string) => $.ui.log(`${PLUGIN}: ${line}`, { to: 'debug' })
 
   // A task kept without an answer: never aged out, retried after 1, 2, 4 ... ticks up to the cap, logged
-  // per state change, and marked stuck in the record once it has waited STUCK_TICKS.
-  const retain = async (name: string, rid: string, what: string, why: string) => {
+  // per state change, and marked stuck once it has waited STUCK_TICKS. True when that write closed intake.
+  const retain = async (name: string, rid: string, what: string, why: string): Promise<boolean> => {
     const prev = s.retry.get(name)
     s.stale.delete(name)
     const fails = (prev?.fails ?? 0) + 1
     const delay = Math.min(BACKOFF_MAX_TICKS, 2 ** (fails - 1))
     const next = { fails, delay, next: s.tick + delay, first: prev?.first ?? s.tick, stuck: prev?.stuck ?? false }
     if (!prev || delay !== prev.delay) await $.ui.log(`${PLUGIN}: ${rid} ${what} (${why}); next try in ${delay} s`, {})
+    let hard = false
     if (!next.stuck && s.tick - next.first >= STUCK_TICKS) {
       const p = await cli($, s, ['progress', '--stuck', rid, '--stuck-detail', `${what}: ${why}`])
+      hard = p.hard
       if (p.ok) { next.stuck = true; await $.ui.log(`${PLUGIN}: ${rid} ${what}: STUCK for ${STUCK_TICKS} s; recorded for verify and the card`, {}) }
     }
     s.retry.set(name, next)
+    return hard
   }
 
   const scan = async () => {
@@ -240,7 +243,7 @@ async function arm($: any, s: State, inbox: string, results: string): Promise<{ 
           // Retired only on a reply that says resolved (exit 3 too: the step stood, only the mirror failed);
           // every other reply, exit code or failure to run keeps it, never aged out, backed off.
           if (!((r.ok || r.hard) && r.data?.resolved === true)) {
-            await retain(entry.name, rid, 'interrupted answer not published', String(r.data?.refused ?? r.data?.error ?? 'no resolved reply'))
+            if (await retain(entry.name, rid, 'interrupted answer not published', String(r.data?.refused ?? r.data?.error ?? 'no resolved reply'))) return
             continue
           }
           // The CLI cleared the mark in its resolving write; the Mod clears it too, so both converge.
@@ -260,7 +263,8 @@ async function arm($: any, s: State, inbox: string, results: string): Promise<{ 
         const claimed = await cli($, s, ['claim', rid])
         if (claimed.hard) return
         if (!claimed.ok && claimed.data?.retry) {
-          await retain(entry.name, rid, 'not claimable yet', String(claimed.data?.refused ?? ''))
+          // A record write that failed closed intake: this scan ends before anything is submitted.
+          if (await retain(entry.name, rid, 'not claimable yet', String(claimed.data?.refused ?? ''))) return
           continue
         }
         s.retry.delete(entry.name)

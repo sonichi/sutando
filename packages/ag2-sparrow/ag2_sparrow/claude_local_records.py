@@ -178,13 +178,17 @@ def load_plugin(root) -> dict:
 
 def write_progress(root, mutate) -> dict:
     """The one progress writer: under state/progress.lock, load, `mutate(record)`, write durably.
-    RecordError propagates (the CLI turns it into a hard failure that closes the Mod's intake)."""
-    with flocked(progress_lock_path(root)):
-        rec = load_plugin(root)
-        rec = mutate(rec) or rec
-        rec = dict(rec, schema=PLUGIN_SCHEMA, updated_at=time.time())
-        write_durable(plugin_path(root), json.dumps(rec, sort_keys=True).encode("utf-8"))
-        return rec
+    Every failure, the lock's own I/O included, is RecordError (the CLI turns it into a hard failure
+    that closes the Mod's intake), so no caller sees a raw OSError."""
+    try:
+        with flocked(progress_lock_path(root)):
+            rec = load_plugin(root)
+            rec = mutate(rec) or rec
+            rec = dict(rec, schema=PLUGIN_SCHEMA, updated_at=time.time())
+            write_durable(plugin_path(root), json.dumps(rec, sort_keys=True).encode("utf-8"))
+            return rec
+    except OSError as e:
+        raise RecordError("%s: %s" % (progress_lock_path(root), e.strerror or e))
 
 
 def progress_gate_held(root) -> bool:

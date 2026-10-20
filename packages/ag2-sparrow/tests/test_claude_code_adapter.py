@@ -2663,11 +2663,21 @@ class InboxCli(ConnectBase):
         rc, out = self.verb("claim", t)
         self.assertEqual((rc, out["admission"]), (0, "owner"))
         self.assertNotIn(t, records.load_plugin(self.root)["stuck"], "a successful claim clears the mark in its write")
-        for t, error in (("task-clearfail", records.RecordError("disk")), ("task-lockfail", OSError(errno.EIO, "lock"))):
+        real_flocked = records.flocked
+
+        @contextlib.contextmanager
+        def progress_lock_fails(path, blocking=True):
+            if Path(path).name == records.PROGRESS_LOCK:
+                raise OSError(errno.EIO, "progress lock I/O error")
+            with real_flocked(path, blocking) as fd:
+                yield fd
+        cases = (("task-clearfail", mock.patch.object(records, "write_progress", side_effect=records.RecordError("disk"))),
+                 ("task-lockfail", mock.patch.object(records, "flocked", progress_lock_fails)))
+        for t, failing in cases:
             self.task(t)
             self.assertEqual(self.verb("progress", "--stuck", t)[0], 0)
             (self.results / (t + ".txt")).write_text("answered out of band\n")
-            with mock.patch.object(records, "write_progress", side_effect=error):
+            with failing:
                 rc, out = self.verb("claim", t)
             self.assertEqual((rc, out.get("retry"), "cleanup pending" in out["refused"]), (1, True, True),
                              "a terminal task whose mark could not be cleared is kept: " + t)
@@ -2677,6 +2687,17 @@ class InboxCli(ConnectBase):
             self.assertNotIn(t, records.load_plugin(self.root)["stuck"])
         with mock.patch.object(records, "load_plugin", side_effect=records.RecordError("torn")):
             self.assertFalse(inbox._clear_stuck(self.root, "task-x"), "an unreadable record is never read as cleared")
+        with mock.patch.object(records, "flocked", progress_lock_fails):
+            rc, out = self.verb("claim", self.task("task-mirrorlock"))
+        self.assertEqual((rc, out.get("hard"), "progress.lock" in out.get("error", "")), (3, True, True),
+                         "a lock failure at the claim's mirror is the hard contract, never a final refusal")
+        with mock.patch.object(records, "flocked", progress_lock_fails), self.assertRaises(records.RecordError):
+            records.write_progress(self.root, lambda r: r)
+        with mock.patch.object(records.fcntl, "flock", side_effect=OSError(errno.ENOLCK, "no locks")), \
+                self.assertRaises(records.RecordError):
+            records.write_progress(self.root, lambda r: r)
+        with self.assertRaises(records.RecordError):
+            records.write_progress(self.root, mock.Mock(side_effect=OSError(errno.EIO, "in the mutate")))
 
     def test_a_stuck_interrupt_is_named_by_verify_and_raises_the_card_and_clears(self):
         self.assertEqual(self.verb("progress", "--stuck", "task-s", "--stuck-detail", "parked")[0], 0)

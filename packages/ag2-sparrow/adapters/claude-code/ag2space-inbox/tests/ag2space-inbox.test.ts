@@ -22,7 +22,7 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
                                progressFails?: number; sessionIds?: string[]; cwdInode?: string; allowNonOwner?: boolean;
                                claimAs?: Record<string, unknown>; interruptParks?: number; interruptThrows?: number;
                                interruptSoft?: Record<string, string | number>; stuckAtStart?: Record<string, unknown>;
-                               unstuckFails?: number; clearFails?: Record<string, string> } = {}) {
+                               unstuckFails?: number; clearFails?: Record<string, string>; stuckWriteFails?: number } = {}) {
   const files: Record<string, string> = {}
   const submitted: string[] = []
   const runs: string[][] = []
@@ -42,6 +42,7 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
   // The plugin record's stuck marks: durable across Mod starts, returned by every progress reply.
   const stuck: Record<string, unknown> = { ...(opts.stuckAtStart ?? {}) }
   let unstuckFailsLeft = opts.unstuckFails ?? 0
+  let stuckWriteFailsLeft = opts.stuckWriteFails ?? 0
   const clearFailsLeft: Record<string, string> = { ...(opts.clearFails ?? {}) }
   let sidReads = 0
   const interruptAt: number[] = []
@@ -96,6 +97,7 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
     if (verb === 'progress') {
       if (progressFailLeft-- > 0) return out(3, { error: 'progress write failed: disk', hard: true })
       if (argv.includes('--unstuck') && unstuckFailsLeft-- > 0) return out(1, { refused: 'progress lock busy' })
+      if (argv.includes('--stuck') && stuckWriteFailsLeft-- > 0) return out(3, { error: 'progress write failed: progress.lock: EIO', hard: true })
       progress.push(argv.slice(3))
       const add = argv.indexOf('--stuck'), del = argv.indexOf('--unstuck')
       if (add > 0) stuck[argv[add + 1]] = stuck[argv[add + 1]] ?? { since: 1 }
@@ -703,6 +705,25 @@ test('a mark that could not be cleared at the final claim keeps the task until t
   for (const t of ['task-clear-fail', 'task-lock-fail'])
     expect(h.runs.filter((a: string[]) => a[2] === 'claim' && a[3] === t).length).toBe(2)
   expect(h.submitted.length).toBe(0)
+})
+
+test('a stuck-mark write that fails hard closes intake and ends the scan: nothing after it is submitted', async ($, on) => {
+  const h = host(on, { stuckWriteFails: 1 })
+  h.files['/out/task-a-held.txt'] = ' '              // never ready: escalates at the 303rd tick
+  h.files['/out/task-b-next.txt'] = ' '              // ready to claim from tick 250, retried on the same schedule
+  h.files['/in/task-a-held.txt'] = TASK('task-a-held')
+  h.files['/in/task-b-next.txt'] = TASK('task-b-next')
+  await arm($, h)
+  for (let i = 0; i < 250; i++) await h.clock.advance(1000)
+  delete h.files['/out/task-b-next.txt']
+  while (!h.runs.some((a: string[]) => a.includes('--stuck'))) await h.clock.advance(1000)
+  expect(h.submitted.length).toBe(0)                     // the same scan returned before task-b-next
+  expect(h.claims['task-b-next']).toBe(undefined)
+  h.failProgress(1)                                      // the lock is still failing at the next tick's reopen
+  await h.clock.advance(1000)
+  expect(h.submitted.length).toBe(0)                     // nor the next: intake is read from the record's state
+  for (let i = 0; i < 70; i++) await h.clock.advance(1000)
+  expect(h.submitted.length).toBe(1)                     // a durable write reopens intake; then it goes
 })
 
 test('thirty failed unstuck writes never age a retained task out: the next one lands (stopped-intake path)', async ($, on) => {
