@@ -276,6 +276,7 @@ test('each new task-*.txt is claimed, authorized and submitted once, wrapped in 
   h.files['/in/notes.txt'] = 'not a task'
   const armed = await arm($, h)
   expect(String(armed.text ?? armed.result)).toContain('Watching /in')
+  expect(String(armed.text ?? armed.result)).toContain('mode off, decided per task by the CLI')
   await h.clock.advance(1000)
   expect(h.submitted.length).toBe(1)
   const msg = h.submitted[0]
@@ -284,7 +285,7 @@ test('each new task-*.txt is claimed, authorized and submitted once, wrapped in 
   expect(msg).not.toContain(NOTE_START)
   expect(h.claims['task-a1'].phase).toBe('CALLING')
   expect(h.claims['task-a1'].hash).toBe(h.hash(msg))
-  expect(verbs(h)).toEqual(['progress', 'envelope', 'claim', 'authorize'])
+  expect(verbs(h)).toEqual(['progress', 'envelope', 'envelope', 'claim', 'authorize'])
   await h.clock.advance(3000)
   expect(h.submitted.length).toBe(1)
   expect(msg.endsWith(`Reply only with the ag2space_reply tool (task_id task-a1); it publishes results/task-a1.txt for you, so do not write that file yourself. [submission ${'0'.repeat(15)}1]`)).toBe(true)
@@ -414,7 +415,7 @@ test('a verifier that cannot run submits nothing and is retried', async ($, on) 
   await h.clock.advance(3000)
   expect(h.submitted.length).toBe(0)
   expect(h.runs.filter(a => a[0] === 'python3' && a[2].includes('hmac')).length).toBe(4)
-  expect(verbs(h)).toEqual(['progress'], 'no claim before a verdict')
+  expect(verbs(h)).toEqual(['progress', 'envelope'], 'no claim before a verdict (the one envelope call is the arm line\'s mode read)')
 })
 
 test('a tampered envelope is dropped; strict mode drops unsigned too', async ($, on) => {
@@ -429,11 +430,12 @@ test('a tampered envelope is dropped; strict mode drops unsigned too', async ($,
 test('strict mode submits only verified envelopes: the CLI decides per task, the Mod reads no strictness itself', async ($, on) => {
   const h = host(on, { verdict: 'unsigned', strict: true, env: { AG2_RESULTS_DIR: '/out', AG2_HMAC_STRICT: '' } })
   h.files['/in/task-y.txt'] = TASK('task-y')
-  await arm($, h)
+  const armed = await arm($, h)
   await h.clock.advance(2000)
   expect(h.submitted.length).toBe(0)
   expect(verbs(h).filter(v => v === 'claim')).toEqual([])
   expect(h.logs.some(l => l.includes('task-y strict mode: envelope unsigned; not submitted'))).toBe(true)
+  expect(String(armed.text ?? armed.result)).toContain('mode strict, decided per task by the CLI')
   expect(h.runs.some(a => a[0] === 'ag2-sparrow-claude-local' && a[2] === 'envelope' && a[4] === 'unsigned')).toBe(true)
 })
 
@@ -446,7 +448,7 @@ test('strict mode with the key file gone refuses with the one reason line, never
   expect(h.submitted.length).toBe(0)
   expect(verbs(h).filter(v => v === 'claim')).toEqual([])
   // Held with backoff (tries at ticks 0, 1, 3, 7), never retired: one reason line per new delay, not per tick.
-  expect(verbs(h).filter(v => v === 'envelope').length).toBe(4)
+  expect(verbs(h).filter(v => v === 'envelope').length).toBe(5)   // 4 tries and the arm line's read
   expect(h.logs.filter(l => l.includes('task-k1 held by the envelope policy (strict mode: /k/task-hmac.key missing')).length).toBe(4)
   o.keyProblem = ''                                   // the key lands: the next try submits it once, no reinstall
   for (let i = 0; i < 8; i++) await h.clock.advance(1000)
@@ -456,12 +458,12 @@ test('strict mode with the key file gone refuses with the one reason line, never
 })
 
 test('an envelope policy the CLI could not answer is held with backoff, then submitted once it answers, never retired', async ($, on) => {
-  const h = host(on, { policyFails: 2 })
+  const h = host(on, { policyFails: 3 })
   h.files['/in/task-p1.txt'] = TASK('task-p1')
   await arm($, h)
   await h.clock.advance(1000)                         // tries at ticks 0 and 1 fail; the next is at tick 3
   expect(h.submitted.length).toBe(0)
-  expect(verbs(h).filter(v => v === 'envelope').length).toBe(2)
+  expect(verbs(h).filter(v => v === 'envelope').length).toBe(3)   // the arm line's read and two tries
   expect(verbs(h).filter(v => v === 'claim')).toEqual([])
   await h.clock.advance(2000)
   expect(h.submitted.length).toBe(1)
@@ -586,7 +588,7 @@ test('the inode check: the held inbox arms and submits', async ($, on) => {
   await $.session.start({ surface: 'terminal', isInteractive: false, cwd: '/w' })
   await ok.clock.advance(1000)
   expect(ok.submitted.length).toBe(1)
-  expect(verbs(ok)).toEqual(['progress', 'check-inode', 'envelope', 'claim', 'authorize'])
+  expect(verbs(ok)).toEqual(['progress', 'check-inode', 'envelope', 'envelope', 'claim', 'authorize'])
 })
 
 test('the session-id witness: recorded at session.start; a changed id at turn.start stops intake', async ($, on) => {
@@ -1237,10 +1239,10 @@ test('a progress write that fails at session.start closes intake; a later durabl
   await arm($, h)                                   // the session.start write fails (closed); the arming scan's reopen fails
   await h.clock.advance(1000)                        // the tick's reopen attempt fails too: nothing claimed
   expect(h.submitted.length).toBe(0)
-  expect(verbs(h)).toEqual(['progress', 'progress', 'progress'], 'closed: each scan only retries the progress write')
+  expect(verbs(h)).toEqual(['progress', 'envelope', 'progress', 'progress'], 'closed: each scan only retries the progress write (the envelope call is the arm line)')
   await h.clock.advance(1000)                        // the retry is durable: reopened, then the claim proceeds
   expect(h.submitted.length).toBe(1)
-  expect(verbs(h).slice(3)).toEqual(['progress', 'envelope', 'claim', 'authorize'])
+  expect(verbs(h).slice(4)).toEqual(['progress', 'envelope', 'claim', 'authorize'])
 })
 
 test('a progress write that fails at claim, authorize, confirm, stage or publish closes intake until a durable write', async ($, on) => {

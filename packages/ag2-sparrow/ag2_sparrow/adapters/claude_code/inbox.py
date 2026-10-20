@@ -119,13 +119,11 @@ def allow_non_owner(environ=None) -> bool:
 
 def envelope(verdict: str, environ=None) -> dict:
     """The Mod's question before a claim: is a task with this envelope verdict submitted now? Answered
-    by hmac_policy from the installed config and the key file as it is at this call; an unreadable
-    config refuses (fail closed) and the Mod retries."""
-    path = _installed_config(environ)
-    try:
-        cfg = cm.read_config(path)
-    except (OSError, ValueError) as e:
-        raise Parked("the installed config %s is unreadable (%s); retried" % (path, e))
+    by hmac_policy from the installed config and the key file as it is at this call; a config that is
+    missing, unreadable, unparsable or short of a required key parks (fail closed) and the Mod retries."""
+    cfg, why = cm.load_config_at(LOCAL, _installed_config(environ))
+    if why:
+        raise Parked("the installed config is not usable (%s); retried" % why)
     submit, reason, retry = hmac_policy.decide(cfg, verdict)
     return {"verdict": verdict, "mode": hmac_policy.mode(cfg), "submit": submit, "reason": reason, "retry": retry}
 

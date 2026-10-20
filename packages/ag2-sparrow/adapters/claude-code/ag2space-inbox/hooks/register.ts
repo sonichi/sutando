@@ -397,10 +397,13 @@ async function arm($: any, s: State, inbox: string, results: string): Promise<{ 
       busy = false
     }
   }
+  // The mode as the CLI reads it now, for the arm line only; every task asks again.
+  const pol = await cli($, s, ['envelope', '--verdict', 'verified'])
+  const hmacMode = typeof pol.data?.mode === 'string' ? pol.data.mode : `unknown (${pol.data?.refused ?? 'the CLI gave no answer'})`
   const timer = $.clock.every(POLL_MS, () => { void scan() })
   s.stop = () => timer.cancel()
   void scan()
-  return { result: `Watching ${inbox} every ${POLL_MS / 1000}s; replies go to ${results}. HMAC key: ${keyFile ? 'set' : 'none (envelopes read unverifiable)'}; strict or not is decided per task by the CLI. ${NOTE}` }
+  return { result: `Watching ${inbox} every ${POLL_MS / 1000}s; replies go to ${results}. HMAC key: ${keyFile ? 'set' : 'none (envelopes read unverifiable)'}; mode ${hmacMode}, decided per task by the CLI. ${NOTE}` }
 }
 
 export const register: Register = (on) => {

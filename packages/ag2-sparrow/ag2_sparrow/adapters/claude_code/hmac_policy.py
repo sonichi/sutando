@@ -1,17 +1,19 @@
 """HMAC strict mode, decided at read time, never at install: the one owner of the rule.
 
-The config records only the owner's choice (HMAC_KEY_FILE, the key path; HMAC_STRICT, empty when
---no-hmac-strict was given). Whether a task is submitted is decided here, per task, from that choice
-plus the key file as it is at that moment: install, verify and the Mod's `inbox envelope` verb all
-read this module, and none of them keeps its own copy. Stdlib only.
+The config records only the owner's choice (HMAC_KEY_FILE, the key path; HMAC_STRICT, "1" for strict,
+"0" when --no-hmac-strict was given). Whether a task is submitted is decided here, per task, from that
+choice plus the key file as it is at that moment: install, verify and the Mod's `inbox envelope` verb
+all read this module, and none of them keeps its own copy. Stdlib only.
 
-The rule:
-  HMAC_STRICT=1 (a key path without --no-hmac-strict, or --hmac-strict)
-                                    -> strict: only verified is submitted; while the key file is missing,
-                                       unreadable, malformed or not recorded at all, every task is
-                                       refused with that reason and held for retry, never read as off
-  key path, --no-hmac-strict        -> lenient: every verdict but invalid is submitted, whatever the key
-  no key path, no strict flag       -> off: every verdict but invalid is submitted (unsigned reads)
+The rule, closed by default:
+  HMAC_STRICT=1                     -> strict, whatever else the config says: only verified is submitted;
+                                       while the key file is missing, unreadable, malformed or no path is
+                                       recorded, every task is refused with that reason and held for retry
+  key path, HMAC_STRICT=0           -> lenient (the explicit --no-hmac-strict record): every verdict but
+                                       invalid is submitted, whatever the key file holds
+  key path, any other HMAC_STRICT   -> strict (absent, empty or unknown is not an opt-out)
+  no key path, not HMAC_STRICT=1    -> off: every verdict but invalid is submitted (unsigned reads)
+An incomplete or unreadable config is refused upstream (the verb parks it); it never reads as off.
 """
 from __future__ import annotations
 
@@ -21,7 +23,7 @@ from pathlib import Path
 STRICT, LENIENT, OFF = "strict", "lenient", "off"
 VERDICTS = frozenset(("verified", "unsigned", "invalid", "unverifiable"))
 KEY_RE = re.compile(r"[0-9a-fA-F]{64}")
-KEY_FILE, STRICT_FLAG = "HMAC_KEY_FILE", "HMAC_STRICT"
+KEY_FILE, STRICT_FLAG, OPT_OUT = "HMAC_KEY_FILE", "HMAC_STRICT", "0"
 MODE_LINES = {STRICT: "strict (only verified envelopes are submitted), decided per task from the key file as it is then",
               LENIENT: "not strict (unsigned and unverifiable envelopes are submitted too)",
               OFF: "off (no key file: every task reads unsigned and is submitted)"}
@@ -47,10 +49,14 @@ def key_problem(path: str) -> str:
 
 def mode(cfg: dict) -> str:
     """From the recorded choice alone; the key file's state enters only in decide(). The strict flag is
-    read first: with it and no key path the mode is strict and fails closed, never off."""
-    if cfg.get(STRICT_FLAG) == "1":
+    read first: with it and no key path the mode is strict and fails closed, never off. A key path is
+    strict unless the opt-out is recorded as exactly "0"."""
+    flag = cfg.get(STRICT_FLAG)
+    if flag == "1":
         return STRICT
-    return LENIENT if cfg.get(KEY_FILE) else OFF
+    if not cfg.get(KEY_FILE):
+        return OFF
+    return LENIENT if flag == OPT_OUT else STRICT
 
 
 def decide(cfg: dict, verdict: str) -> "tuple[bool, str, bool]":

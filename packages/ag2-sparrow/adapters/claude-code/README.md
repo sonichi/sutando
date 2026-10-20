@@ -180,9 +180,10 @@ The verdict is the mod's; whether the task is then submitted is the CLI's,
 decided per task by `ag2-sparrow-claude-local inbox envelope --verdict <v>`
 from one owner, `ag2_sparrow/adapters/claude_code/hmac_policy.py`, which
 `install`, `verify` and that verb all read and the mod never copies. The config
-records only the choice (`HMAC_KEY_FILE`, the key path; `HMAC_STRICT` empty
-when `--no-hmac-strict` was given); strictness is derived at each read from
-that choice plus the key file as it is at that moment. The exact rule:
+records only the choice (`HMAC_KEY_FILE`, the key path; `HMAC_STRICT`, `1` for
+strict, `0` when `--no-hmac-strict` was given); strictness is derived at each
+read from that choice plus the key file as it is at that moment. The exact
+rule, closed by default:
 
 - `HMAC_STRICT=1` (a key path without `--no-hmac-strict`, the default with
   `--hmac-key-file`; or `--hmac-strict`): strict, read before anything else.
@@ -193,17 +194,26 @@ that choice plus the key file as it is at that moment. The exact rule:
   back`), never read as "no HMAC": the mod holds such a task with the same
   backoff and stuck mark as any other retried task, so it is submitted once
   the key lands, without a reinstall or a session restart.
-- Key path recorded and `--no-hmac-strict` recorded: lenient, whatever the key
-  file holds. `unsigned` and `unverifiable` are submitted with the verdict in
-  the envelope line.
-- No key path and no strict flag: off. Every task reads `unsigned` and is
-  submitted.
+- Key path recorded and `HMAC_STRICT=0` (the explicit `--no-hmac-strict`
+  record): lenient, whatever the key file holds. `unsigned` and `unverifiable`
+  are submitted with the verdict in the envelope line.
+- Key path recorded and any other `HMAC_STRICT` (absent, empty, unknown):
+  strict, as above. An opt-out written by an older install as an empty value
+  now reads strict; rerun `install --no-hmac-strict` to record it.
+- No key path and `HMAC_STRICT` not `1`: off. Every task reads `unsigned` and
+  is submitted.
 - `invalid` is never submitted in any mode.
+- A config that is missing, unreadable, unparsable or short of a required key
+  is not a config that says off: the verb parks (retry) and the task is held.
 
-One limit: the verifier's key *path* (`AG2_HMAC_KEY_FILE`) is set in the
-session's environment at its creation, so a reinstall with another path takes a
-session restart; the key's presence and content at that path are read live, by
-the verifier and the policy alike.
+Two more things the rule rests on. The launcher still exports
+`AG2_HMAC_STRICT=1` into the session whenever the mode is strict, for a plugin
+older than the `envelope` verb, which read that bit itself; the current mod
+never reads it (pinned). And the verifier's key *path* (`AG2_HMAC_KEY_FILE`) is
+set in the session's environment at its creation, so a reinstall with another
+path takes a session restart; the key's presence and content at that path are
+read live, by the verifier and the policy alike. The watch tool's arm line
+names the mode as the CLI reads it then.
 
 So `install --hmac-key-file <path>` records a path whose key is not there yet
 (it prints a warning and `verify` fails its `hmac key` part until the key

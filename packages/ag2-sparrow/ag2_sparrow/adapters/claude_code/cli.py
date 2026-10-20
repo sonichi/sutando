@@ -354,7 +354,7 @@ def install(args) -> int:
     values = {"CLAUDE": os.path.abspath(claude), "PLUGIN_DIR": str(plugin), "INBOX_DIR": str(inbox_dir),
               "RESULTS_DIR": str(Path(root) / "results"),
               "CLAUDE_CONFIG_DIR": str(Path(args.claude_config_dir).expanduser().resolve()) if args.claude_config_dir else "",
-              "HMAC_KEY_FILE": key_file, "HMAC_STRICT": "1" if strict else "",
+              "HMAC_KEY_FILE": key_file, "HMAC_STRICT": "1" if strict else hmac_policy.OPT_OUT if args.no_hmac_strict else "",
               "PERMISSION_MODE": args.permission_mode, "SESSION_ID": "",
               "HITL_STORE": str(hitl_store_root() if mode == EXTERNAL else card.store_root(bridge_home(root) / "state")),
               inbox.ALLOW_NON_OWNER: "1" if args.allow_non_owner else "", "AGENT_ID": agent_id, "BRIDGE": mode,
