@@ -259,6 +259,18 @@
    "canonical_for": "remote gateway wire protocol",
    "last_verified": "2026-10-16"
   },
+  "docs/runtime-compat-repair-matrix.md": {
+   "title": "Core CLI repair matrix",
+   "audience": [
+    "users",
+    "operators",
+    "contributors",
+    "maintainers"
+   ],
+   "status": "canonical",
+   "canonical_for": "Claude Code and Codex CLI version, capability and login states, and how each is repaired",
+   "last_verified": "2026-10-17"
+  },
   "docs/runtime-dependencies.md": {
    "title": "External runtime dependencies",
    "audience": [
@@ -269,7 +281,7 @@
    ],
    "status": "canonical",
    "canonical_for": "external tool and package requirements, and what to vendor when embedding Sutando",
-   "last_verified": "2026-09-18"
+   "last_verified": "2026-10-17"
   },
   "docs/runtime/claude-hook-contract-v1.md": {
    "title": "Claude Code Hook Contract \u2014 v1",

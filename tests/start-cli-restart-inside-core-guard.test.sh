@@ -56,7 +56,7 @@ run_launcher() {
   : > "$SESS_MARK"; : > "$CORE_MARK"
   env -i PATH="$BIN:/usr/bin:/bin" HOME="$TD" \
       SESS_MARK="$SESS_MARK" CORE_MARK="$CORE_MARK" \
-      SUTANDO_TEST_MODE=1 SUTANDO_WORKSPACE="$TD/workspace" \
+      SUTANDO_TEST_MODE=1 SUTANDO_SKIP_RUNTIME_COMPAT=1 SUTANDO_WORKSPACE="$TD/workspace" \
       SUTANDO_TMUX_SOCKET="$TD/sock" \
       ANTHROPIC_BASE_URL="http://localhost:7846" "$@" \
       /bin/bash "$SCRIPT" ${flag:+"$flag"} > "$TD/stdout" 2> "$TD/stderr" < /dev/null

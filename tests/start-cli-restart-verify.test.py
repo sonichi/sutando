@@ -112,6 +112,7 @@ def _run(restart: bool, session: bool, core: bool, force: bool = False, wedged: 
 
         env = {
             "PATH": f"{bind}:/usr/bin:/bin",
+            "SUTANDO_SKIP_RUNTIME_COMPAT": "1",
             "HOME": str(td),
             "SESS_MARK": str(sess_mark),
             "CORE_MARK": str(core_mark),

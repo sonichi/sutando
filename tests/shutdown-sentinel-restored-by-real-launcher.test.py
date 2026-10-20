@@ -94,7 +94,7 @@ with tempfile.TemporaryDirectory() as tmp:
 
     proc = subprocess.run(
         ["bash", str(root / "src/agent/claude/cli/start-cli.sh")],
-        env={"HOME": os.environ.get("HOME", tmp), "PATH": str(binp), "TERM": "dumb"},
+        env={"SUTANDO_SKIP_RUNTIME_COMPAT": "1", "HOME": os.environ.get("HOME", tmp), "PATH": str(binp), "TERM": "dumb"},
         capture_output=True, text=True, timeout=180,
     )
 

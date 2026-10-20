@@ -145,6 +145,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`output_sanitizer.ts`** — Pure predicate + state machine, no deps — importable so tests exercise THIS code rather than a copy that can pass while the real sanitizer drifts.
 - **`overlay-manager-ui.ts`** — Overlay Manager view for the Sutando web UI.
 - **`owner_activity.py`** — Atomic publication of the owner's most recent messaging activity.
+- **`owner_reply.py`** — Owner-reply plumbing for a launcher gate that runs while no core is up to read the owner's DM.
 - **`peer-watch.py`** — Read a peer host's restart-watch signal WITHOUT confusing a stale view for a dead peer.
 - **`pending_questions_reader.py`** — The one way core reads owner pending questions: through the store adapter an installed skill declares in its manifest (`pending_questions_store`), loaded by the path an edge injects — core names no skill, scans no root and carries no question schema.
 - **`pending_questions_triage.py`** — Triage-queue policy for owner pending questions: ranking, re-check verdict, dismissal.
@@ -183,6 +184,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`result_ready.py`** — Alias of `delivery.readiness` (phase-1a restructure); one transition window.
 - **`result_router.py`** — Alias of `delivery.router` (phase-1a restructure); one transition window.
 - **`runtime-health.py`** — runtime-health.py — derive this Sutando core's live health as one JSON object.
+- **`runtime_compat.py`** — Find, classify and repair the agent CLI (Claude Code or Codex) the core runs on.
 - **`runtime_observation.py`** — Runtime observations: one leased record per seat, written by whatever observes that seat's CLI.
 - **`scan-call-logs.py`** — Proactive call log scanner — detects issues and classifies by actionability.
 - **`schedule-crons-session-hint.sh`** — SessionStart hook — reminds the core agent to run /startup at the start of every session (including post-compaction restarts).
@@ -307,6 +309,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`graceful-restart.sh`** — Graceful core-restart orchestrator.
 - **`restart-guard.sh`** — Shared policy for both runtime launchers: a `--restart` issued from inside the core session kill-sessions the very agent running the command.
 - **`restart-prep.sh`** — Graceful-restart Phase-1 prep; see notes/graceful-restart-design.md.
+- **`runtime-compat-gate.sh`** — Shared by both runtime launchers: check the core CLI before a launch replaces a core.
 - **`start-cli.sh`** — Canonical persistent-core launcher.
 - **`stop-core.sh`** — src/agent/stop-core.sh — stop ONLY the core CLI tmux session (sonichi#2401).
 - **`task-event-handler-lookup.sh`** — Reads the task-event handler declared in a small JSON config file.

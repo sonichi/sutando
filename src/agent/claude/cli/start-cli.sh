@@ -31,6 +31,12 @@ unset _self_dir
 cd "$REPO"
 # Shared with the codex launcher: one owner for the in-session restart policy.
 . "$REPO/src/agent/restart-guard.sh"
+# Shared with the codex launcher: one owner for the core-CLI compatibility gate.
+if [ -r "$REPO/src/agent/runtime-compat-gate.sh" ]; then
+  . "$REPO/src/agent/runtime-compat-gate.sh"
+else
+  sutando_runtime_compat_gate() { SUTANDO_CORE_CLI_BIN="$2"; }
+fi
 # Named check before sourcing: an unexplained "No such file or directory" from
 # a bare `.` here reads as a broken launcher, not a fixture/checkout missing
 # this file's own sibling — a real trap for a scratch-repo test fixture.
@@ -252,7 +258,23 @@ if [ -n "$RESTART_REQUESTED" ] && sutando_restart_guard_refuses "$CALLER_CORE_SE
   log_restart_attempt "$SUTANDO_RESTART_GUARD_REASON"
   exit 1
 fi
+# Runs once, before any path that would replace the core, so an unusable CLI
+# never costs the user the core that is still running.
+CORE_CLI_CHECKED=""
+check_core_cli() {
+  [ -z "$CORE_CLI_CHECKED" ] || return 0
+  local _rc=0
+  sutando_runtime_compat_gate "$REPO" claude \
+    ${CLAUDE_CONFIG_DIR:+--claude-config-dir "$CLAUDE_CONFIG_DIR"} || _rc=$?
+  if [ "$_rc" -ne 0 ]; then
+    [ -n "$RESTART_REQUESTED" ] && log_restart_attempt "FAILED: core CLI unusable (runtime-compat rc=$_rc); running core kept"
+    release_orchestrator_lock
+    exit "$_rc"
+  fi
+  CORE_CLI_CHECKED=1
+}
 if [ -n "$RESTART_REQUESTED" ]; then
+  check_core_cli
   log_restart_attempt "begin (session=$(claude_named_tmux_session_exists && echo up || echo none) core=$(claude_named_process_running && echo up || echo none))"
   if claude_named_tmux_session_exists || claude_named_process_running; then
     echo "Killing existing $SESSION session..."
@@ -547,6 +569,7 @@ if [ -z "$RESTART_REQUESTED" ] && claude_named_process_running; then
   fi
 fi
 
+check_core_cli
 if claude_named_tmux_session_exists; then
   # Session alive but the core claude is gone. The old behavior here was
   # kill-session — but the desktop runtime keeps SIBLING windows in this
@@ -559,7 +582,7 @@ if claude_named_tmux_session_exists; then
   # restart-core (kill core window → rerun this script) truly window-scoped.
   echo "  ⚠ $SESSION exists but core Claude is gone — healing core window (sibling windows preserved)" >&2
   apply_claude_tmux_defaults
-  CORE_CMD=(claude --name "$SESSION" ${SURFACE_ARGS[@]+"${SURFACE_ARGS[@]}"} --dangerously-skip-permissions --add-dir "$HOME" \
+  CORE_CMD=("$SUTANDO_CORE_CLI_BIN" --name "$SESSION" ${SURFACE_ARGS[@]+"${SURFACE_ARGS[@]}"} --dangerously-skip-permissions --add-dir "$HOME" \
     ${SETTINGS_ARGS[@]+"${SETTINGS_ARGS[@]}"} ${SESSION_ARGS[@]+"${SESSION_ARGS[@]}"} -- "$BOOT_PROMPT")
   # -P -F prints the index the window ACTUALLY landed on: when index 0 is
   # occupied (e.g. a sibling drifted there) the fallback creates the core at a
@@ -627,7 +650,7 @@ if ! command -v tmux > /dev/null 2>&1; then
   echo "  ⚠ tmux not found — running without tmux wrapper"
   echo "    (Sutando.app's watcher-auto-restart won't work; brew install tmux to enable)"
   [ -n "${SUTANDO_CLAUDE_WORKING_DIR:-}" ] && cd "$SUTANDO_CLAUDE_WORKING_DIR"
-  if ! command -v claude >/dev/null 2>&1; then
+  if ! command -v "$SUTANDO_CORE_CLI_BIN" >/dev/null 2>&1; then
     echo "  ⚠ claude not found — not clearing the shutdown sentinel, no core can start." >&2
     exit 127
   fi
@@ -636,7 +659,7 @@ if ! command -v tmux > /dev/null 2>&1; then
   # errexit would exit on the failed exec before the restore below is reached;
   # drop it just around the exec and re-raise the exec's own status.
   set +e
-  exec claude --name "$SESSION" ${SURFACE_ARGS[@]+"${SURFACE_ARGS[@]}"} --dangerously-skip-permissions --add-dir "$HOME" \
+  exec "$SUTANDO_CORE_CLI_BIN" --name "$SESSION" ${SURFACE_ARGS[@]+"${SURFACE_ARGS[@]}"} --dangerously-skip-permissions --add-dir "$HOME" \
     ${SETTINGS_ARGS[@]+"${SETTINGS_ARGS[@]}"} ${SESSION_ARGS[@]+"${SESSION_ARGS[@]}"} \
     -- "$BOOT_PROMPT"
   _exec_rc=$?

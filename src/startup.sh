@@ -552,7 +552,7 @@ if ! command -v python3 > /dev/null 2>&1; then echo "  ✗ python3 not found"; m
 # just printed that Python-backed services would be skipped (CR #2599,
 # @qingyun-wu). Tolerate the failure and fall back, so the skip actually
 # happens instead of being promised.
-if ! command -v "$core_runtime" > /dev/null 2>&1; then
+if ! sutando_core_cli_path "$REPO" "$core_runtime" > /dev/null; then
   echo "  ✗ $core_runtime CLI not found — required by core.runtime"
   missing=1
 fi

@@ -174,6 +174,7 @@ def run_branch(label: str, launcher_rel: str, env_extra: dict, *, tty: bool = Fa
         env = dict(os.environ)
         env.update({
             "PATH": str(binp),
+            "SUTANDO_SKIP_RUNTIME_COMPAT": "1",
             "HOME": str(root),
             "SUTANDO_TMUX_SOCKET": str(root / "sock"),
             "SUTANDO_TMUX_SESSION": "sutando-core",

@@ -104,6 +104,7 @@ def _run(*, private: bool, session: bool, core: bool, in_pane: bool):
             p.chmod(0o755)
         env = {
             "PATH": f"{bind}:/usr/bin:/bin",
+            "SUTANDO_SKIP_RUNTIME_COMPAT": "1",
             "HOME": str(td),
             "SESS_MARK": str(marks["sess"]),
             "CORE_MARK": str(marks["core"]),

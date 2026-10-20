@@ -8,8 +8,13 @@ trap 'rm -rf "$TMP"' EXIT
 REPO="$TMP/repo"
 mkdir -p "$REPO/src" "$REPO/scripts" "$TMP/bin" "$TMP/home"
 cp "$REPO_REAL/src/startup-runtime.sh" "$REPO/src/startup-runtime.sh"
-# startup-runtime.sh sources its sibling resolver; a staged repo needs both.
+# startup-runtime.sh sources its sibling resolver and the core-CLI gate; stage them all.
 cp "$REPO_REAL/src/repo_root.sh" "$REPO/src/repo_root.sh"
+for f in src/agent/runtime-compat-gate.sh src/runtime_compat.py src/file_lock.py src/auth_preflight.py \
+         scripts/python-binary.sh; do
+  mkdir -p "$REPO/$(dirname "$f")"
+  cp "$REPO_REAL/$f" "$REPO/$f"
+done
 
 cat > "$REPO/scripts/sutando-config.sh" <<'SH'
 #!/bin/bash
@@ -31,10 +36,22 @@ chmod +x "$REPO/src/auth-preflight-gate.sh"
 
 cat > "$TMP/bin/codex" <<'SH'
 #!/bin/bash
+case "${1:-}" in
+  --version) echo "codex-cli 0.160.1"; exit 0 ;;
+  --help) echo "--cd --add-dir --sandbox --ask-for-approval --search --no-alt-screen --config --model"; exit 0 ;;
+esac
 printf 'codex:%s:CODEX_HOME=%s\n' "$*" "${CODEX_HOME:-}" >> "$TEST_CALLS"
 exit "${TEST_CODEX_RC:-0}"
 SH
 chmod +x "$TMP/bin/codex"
+cat > "$TMP/bin/claude" <<'SH'
+#!/bin/bash
+case "${1:-}" in
+  --version) echo "2.1.0 (Claude Code)" ;;
+  --help) echo "--name --dangerously-skip-permissions --add-dir --settings --remote-control --chrome --plugin-dir --resume --session-id" ;;
+esac
+SH
+chmod +x "$TMP/bin/claude"
 
 # shellcheck source=../src/startup-runtime.sh
 source "$REPO/src/startup-runtime.sh"
@@ -53,6 +70,7 @@ check() {
 
 export TEST_CALLS="$TMP/calls" TEST_CODEX_HOME="$TMP/codex-home"
 export PATH="$TMP/bin:/usr/bin:/bin"
+export HOME="$TMP/home" SUTANDO_RUNTIMES_DIR="$TMP/runtimes" SUTANDO_RUNTIME_SYSTEM_DIRS="" SUTANDO_RUNTIME_WAIT_S=0
 
 # .env participates in the early selector without leaking its other values.
 printf 'SUTANDO_CORE_RUNTIME=codex\nUNRELATED_SECRET=must-not-leak\n' > "$REPO/.env"
@@ -79,7 +97,7 @@ esac
 : > "$TEST_CALLS"
 TEST_CODEX_RC=1 preflight_selected_core_auth codex "$TMP/claude-home" >"$TMP/out" 2>"$TMP/err"
 rc=$?
-check "logged-out Codex fails closed" "$rc" "1"
+check "logged-out Codex fails closed with the gate's login code" "$rc" "4"
 if grep -q "codex login" "$TMP/err"; then
   ok "logged-out Codex names its own remedy"
 else
