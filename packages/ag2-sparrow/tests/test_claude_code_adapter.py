@@ -3698,7 +3698,7 @@ class InboxCli(ConnectBase):
         try:
             rc, out = self.verb("publish", t)
             self.assertEqual((rc, out.get("retry")), (1, True), out)
-            self.assertIn("the step did not commit (StateIOError: refusing to serve: cannot publish %s"
+            self.assertIn("the step did not commit (StateWriteError: refusing to serve: cannot publish %s"
                           % (self.results / (t + ".txt")), out["refused"])
             self.assertNotIn("publication parked", out["refused"])
             self.assertEqual(lc.claims.load(t)["phase"], inbox.lifecycle.RESULT_STAGED, "the claim is as it was")

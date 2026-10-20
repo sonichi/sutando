@@ -1071,21 +1071,123 @@ class StepBranchTest(unittest.TestCase):
         self.assertEqual(len(self.fake.calls()), 1, "called once, after the read recovered")
         self.assertTrue((self.work / "results" / "task-a.txt").exists(), "delivered")
 
-    def test_an_io_error_reading_the_claim_parks_the_step_never_raises(self):
-        """The reads the step makes before it decides (the claim, then is_settled's repair) are inside its
-        containment: a StateIOError there parks the task for a retry and never escapes step(); ClaimUnreadable
-        keeps its own branch. A failure while writing a publication still stops the adapter (exit 2), as pinned."""
+    def test_the_loop_boundary_parks_a_read_failure_and_stops_on_a_write_failure(self):
+        """The serve loop's one containment (contained()) around a task's probe and step: a state read that
+        failed (StateIOError) parks that task; a durable write that failed (StateWriteError) and a refusal on the
+        state still stop the adapter. ClaimUnreadable keeps its own branch inside the step."""
         write_task(self.work, "task-a", "hi")
         with contextlib.redirect_stderr(io.StringIO()), \
                 mock.patch.object(lc.ClaimStore, "load", side_effect=lc.StateIOError("cannot read claim.json ([Errno 5])")):
-            self.assertFalse(self.ad.step("task-a.txt", self.seen))
+            self.assertFalse(self.ad.contained("task-a.txt", self.ad.step, "task-a.txt", self.seen))
+            self.ad.not_before.clear()
+            self.assertFalse(self.ad.contained("task-a.txt", self.ad.recovering, "task-a.txt"))
         self.assertGreater(self.ad.not_before["task-a"], self.ad.clock())
         self.assertEqual((self.seen, self.fake.calls()), (set(), []))
+        for stops in (lc.StateWriteError("cannot write claim.json ([Errno 28])"), lc.LedgerError("malformed record")):
+            with mock.patch.object(lc.ClaimStore, "load", side_effect=stops), self.assertRaises(type(stops)):
+                self.ad.contained("task-a.txt", self.ad.step, "task-a.txt", self.seen)
         self.ad.not_before.clear()
         with contextlib.redirect_stderr(io.StringIO()), \
                 mock.patch.object(self.ad.lc, "is_settled", side_effect=lc.LedgerIOError("cannot fsync the ledger")):
-            self.assertFalse(self.ad.step("task-a.txt", self.seen))
+            self.assertFalse(self.ad.step("task-a.txt", self.seen), "the settlement repair parks inside the step")
         self.assertEqual((self.seen, self.fake.calls()), (set(), []))
+
+    def test_a_parked_task_is_not_read_again_until_its_park_ends(self):
+        """One read per park: while the task's park lasts, the loop's probe does not read its claim again."""
+        write_task(self.work, "task-a", "hi")
+        loads = []
+
+        def failing(store, task_id):
+            loads.append(task_id)
+            raise lc.StateIOError("cannot read claim.json ([Errno 5])")
+        with contextlib.redirect_stderr(io.StringIO()), mock.patch.object(lc.ClaimStore, "load", failing):
+            for _ in range(5):
+                self.assertFalse(self.ad.contained("task-a.txt", self.ad.recovering, "task-a.txt"))
+            self.assertEqual(loads, ["task-a"], "one read for the whole park")
+            self.ad.clock.t = self.ad.not_before["task-a"]
+            self.ad.contained("task-a.txt", self.ad.recovering, "task-a.txt")
+        self.assertEqual(loads, ["task-a", "task-a"], "read again once the park ended")
+
+    def test_every_state_read_of_a_serve_iteration_survives_one_fault(self):
+        """Property over the loop's own reads. A clean serve run records each ClaimStore read it makes after start-up
+        (N of them); then for k = 1..N a fresh run faults exactly read k once (StateIOError). Every read outside
+        the outcome record is parked and retried: serve() survives, makes exactly one provider call and publishes
+        exactly one result. A read inside the outcome record (after the call, part of that durable write) stops
+        the adapter with StateWriteError, and the restart's recovery answers the call: still one call, one result.
+        A read added to the loop later is enumerated and faulted the same way, with no change here."""
+        reads = ("load", "staged", "blob")
+
+        def run(fault_at, work=None, fake=None):
+            if work is None:
+                tmp = tempfile.TemporaryDirectory()
+                self.addCleanup(tmp.cleanup)
+                work = Path(tmp.name) / "work"
+                fake = Fake(tmp.name, [ok()])
+                write_task(work, "task-a", "hi")
+            seen, real = [], {r: getattr(lc.ClaimStore, r) for r in reads}
+            serving, fired, outcome = [], [], []
+
+            def wrap(name):
+                def read(store, *a):
+                    if serving:
+                        seen.append(name + ("@outcome" if outcome else ""))
+                        if len(seen) == fault_at:
+                            fired.append(seen[-1])
+                            raise lc.StateIOError("cannot read %s ([Errno 5] I/O error)" % name)
+                    return real[name](store, *a)
+                return read
+            real_recover, real_record = sa.Adapter.recover, lc.Lifecycle.record_outcome
+
+            def recover(ad):
+                real_recover(ad)
+                serving.append(1)                  # start-up refuses on a fault; the loop's reads come after
+
+            def record_outcome(life, *a, **k):
+                outcome.append(1)
+                try:
+                    return real_record(life, *a, **k)
+                finally:
+                    outcome.pop()
+            stopped = None
+            with contextlib.ExitStack() as stack:
+                for r in reads:
+                    stack.enter_context(mock.patch.object(lc.ClaimStore, r, wrap(r)))
+                stack.enter_context(mock.patch.object(sa.Adapter, "recover", recover))
+                stack.enter_context(mock.patch.object(lc.Lifecycle, "record_outcome", record_outcome))
+                clock = FakeClock()
+                real_sleep = clock.sleep
+
+                def bounded_sleep(secs):
+                    if clock.t - T0 > 3600:
+                        raise RuntimeError("no result within an hour of loop time")
+                    real_sleep(secs)
+                clock.sleep = bounded_sleep
+                try:
+                    run_adapter(work, fake, clock=clock, once=1)
+                except lc.StateWriteError as e:
+                    stopped = e
+            if stopped is not None:
+                run_adapter(work, fake, once=1)    # the restart: recovery answers the counted call
+            results = [p.name for p in (work / "results").iterdir() if p.name.startswith("task-a")]
+            return seen, fired, stopped is not None, len(fake.calls()), results
+        clean, _, _, calls, results = run(0)
+        self.assertEqual((calls, results), (1, ["task-a.txt"]))
+        n = len(clean)
+        failures, stops = [], []
+        for k in range(1, n + 1):
+            try:
+                _, fired, stopped, calls, results = run(k)
+            except Exception as e:                                  # noqa: BLE001 - the property reports any escape
+                failures.append("read %d (%s): serve() raised %s: %s" % (k, clean[k - 1], type(e).__name__, e))
+                continue
+            if stopped:
+                stops.append(clean[k - 1])
+            if stopped != clean[k - 1].endswith("@outcome") or (fired, calls, results) != ([clean[k - 1]], 1, ["task-a.txt"]):
+                failures.append("read %d (%s): fired %r, stopped %r, %d calls, results %r"
+                                % (k, clean[k - 1], fired, stopped, calls, results))
+        self.assertEqual(failures, [], "N = %d reads: %r" % (n, clean))
+        self.assertEqual(stops, [r for r in clean if r.endswith("@outcome")], "only the outcome record's reads stop")
+        self.assertTrue(stops, "the run reaches an outcome record, so the stop path is exercised")
 
     def test_a_claim_past_its_call_is_published_and_a_parked_publication_waits(self):
         write_task(self.work, "task-a", "hi")

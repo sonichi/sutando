@@ -135,6 +135,11 @@ class StateIOError(StateError):
     state says: a caller may retry the one, never the other."""
 
 
+class StateWriteError(StateIOError):
+    """A durable write to a claim or a publication that failed: a serving loop stops on it (exit 2) instead
+    of parking the task, which it does for a read that failed (a plain StateIOError)."""
+
+
 class LedgerIOError(LedgerError, StateIOError):
     pass
 
@@ -676,7 +681,8 @@ class SettledIds:
 # ── claims ───────────────────────────────────────────────────────────────────
 
 def _state_io(what, path, e):
-    return StateIOError("cannot %s %s (%s)" % (what, path, e))
+    kind = StateIOError if what in ("read", "list") else StateWriteError
+    return kind("cannot %s %s (%s)" % (what, path, e))
 
 
 class ClaimStore:
@@ -881,7 +887,22 @@ class Lifecycle:
         return True
 
     def mark_calling(self, task_id, attempt):
-        self._save(self.claims.load(task_id), phase=CALLING, attempt=attempt)
+        try:
+            rec = self.claims.load(task_id)
+        except StateIOError:
+            self.open_attempts.discard(task_id)         # CALLING was never written: the attempt may be prepared again
+            raise
+        self._save(rec, phase=CALLING, attempt=attempt)
+
+    def _outcome_claim(self, task_id):
+        """The claim an outcome is recorded on, after the provider was called: a read that fails here is part of
+        that durable write (StateWriteError), so a serving loop stops and recovery answers the call at restart."""
+        try:
+            return self.claims.load(task_id)
+        except StateWriteError:
+            raise
+        except StateIOError as e:
+            raise StateWriteError(e.message[len("refusing to serve: "):]) from e
 
     def authorize_call(self, task_id, attempt, *, text_hash="", expected_phase=PREPARED):
         """One PREPARED -> CALLING transition per attempt: the one-use submit token (a random nonce
@@ -1009,13 +1030,13 @@ class Lifecycle:
         return self._verified(rec["task_id"], descriptor)
 
     def not_delivered(self, task_id, attempt, detail):
-        self._save(self.claims.load(task_id), phase=NOT_DELIVERED, outcome={"kind": "unsent", "detail": detail})
+        self._save(self._outcome_claim(task_id), phase=NOT_DELIVERED, outcome={"kind": "unsent", "detail": detail})
         self.journal.append(task_id, attempt, "unsent")
         self.open_attempts.discard(task_id)
 
     def record_outcome(self, task_id, kind, body, detail="", url=None):
         """kind: queued (a receipt), unknown (may have been queued) or final (no call counted)."""
-        rec = self.claims.load(task_id)
+        rec = self._outcome_claim(task_id)
         phase = {"queued": CONFIRMED, "unknown": OUTCOME_UNKNOWN}.get(kind, rec["phase"] if rec else PREPARED)
         self.claims.stage(task_id, body.encode("utf-8"))
         rec = self._save(rec, phase=phase, outcome={"kind": kind, "detail": detail, "url": url, "at": self.clock()})

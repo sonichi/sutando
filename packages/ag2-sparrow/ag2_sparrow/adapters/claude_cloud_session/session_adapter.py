@@ -139,9 +139,6 @@ class Adapter(RelayLoop):
             rec = self.lc.claims.load(task_id)
         except task_lifecycle.ClaimUnreadable:
             return None
-        except task_lifecycle.StateError as e:          # a read I/O error skips the task for a retry, never the loop
-            self.park(task_id, e)
-            return None
         return rec["phase"] if rec else None
 
     def recovering(self, name):
@@ -156,6 +153,18 @@ class Adapter(RelayLoop):
         if wait > 0 or not self.limiter.times:
             return wait
         return max(max(self.limiter.times) + self.args.min_gap_seconds - self.clock(), 0.0)
+
+    def contained(self, name, unit, *args):
+        """The serve loop's one containment: a state read that failed on I/O (a plain StateIOError) anywhere in a
+        task's probe or step parks that task for a retry and the loop goes on. A failed durable write
+        (StateWriteError) and a refusal on what the state says still stop the adapter (exit 2)."""
+        try:
+            return unit(*args)
+        except task_lifecycle.StateWriteError:
+            raise
+        except task_lifecycle.StateIOError as e:
+            self.park(name[:-4], e)
+            return False
 
     def park(self, task_id, why):
         log("parked ->", task_id, why)
@@ -192,8 +201,6 @@ class Adapter(RelayLoop):
                 log("already settled, never called again ->", task_id)
                 seen.add(task_id)
                 return True
-            return self.park(task_id, e)
-        except task_lifecycle.StateError as e:              # an I/O error reading it: parked, retried
             return self.park(task_id, e)
         # A local claim is never this adapter's to repair: it only reads the ledger for one.
         local = bool(rec and rec.get("claim_mode") == task_lifecycle.LOCAL)
