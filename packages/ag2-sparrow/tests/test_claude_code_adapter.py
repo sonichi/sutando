@@ -2882,6 +2882,11 @@ class InboxCli(ConnectBase):
         self.assertEqual((rc, "token" in out), (1, False))
         rc, out = self.verb("authorize", t, attempt, "--text-hash", "hA")
         self.assertEqual((rc, out["token"]), (0, lc.claims.load(t)["call"]["nonce"]), "the same request: the stored token")
+        rc, out = self.verb("authorize", t, str(int(attempt) + 1), "--text-hash", "hA")
+        self.assertEqual((rc, "token" in out), (1, False), "the same text for another attempt gets none")
+        rec = lc.claims.load(t)
+        self.assertIsNone(inbox._token_for(rec, rec["attempt"] + 1, "hA"))
+        self.assertEqual(inbox._token_for(rec, rec["attempt"], "hA"), rec["call"]["nonce"])
         u = self.task("task-reread")
         attempt = str(self.verb("claim", u)[1]["attempt"])
         real_load = inbox.lifecycle.ClaimStore.load
@@ -2915,6 +2920,8 @@ class InboxCli(ConnectBase):
         self.assertEqual(self.verb("confirm", u, "turn-1", token, "--text-hash", "hA")[0], 0)
         rc, out = self.verb("confirm", u, "turn-1", token, "--text-hash", "hA")
         self.assertEqual((rc, out["turn_id"]), (0, "turn-1"), "the same confirmation again is its own answer")
+        rc, out = self.verb("confirm", u, "turn-1", "0" * 32, "--text-hash", "hA")
+        self.assertEqual(rc, 1, "the same turn with another nonce is refused")
         self.assertEqual(self.verb("confirm", u, "turn-2", token, "--text-hash", "hA")[0], 1, "another turn is refused")
         with mock.patch.object(records, "flocked", release_fails):
             rc, out = self.verb("authorize", self.task("task-noprep"), "9", "--text-hash", "h")
@@ -2941,11 +2948,14 @@ class InboxCli(ConnectBase):
         t = "task-fin-missing"
         self.confirmed(t)
         real_link = os.link
-        with mock.patch.object(inbox.lifecycle.os, "link", side_effect=OSError(errno.EIO, "no link")):
-            self.verb("stage", t, "turn-1", stdin=b"never linked\n")
+        with mock.patch.object(inbox.lifecycle.os, "link", side_effect=OSError(errno.ENOSPC, "No space left on device")):
+            rc, out = self.verb("stage", t, "turn-1", stdin=b"never linked\n")
+        self.assertEqual((rc, out.get("retry")), (1, True), "this answer is accepted, its staging unfinished: a retry")
         self.assertTrue(lc.claims.load(t).get("staged"), "the descriptor is recorded, its blob is not")
+        rc, out = self.verb("stage", t, "turn-1", stdin=b"another answer\n")
+        self.assertEqual((rc, "retry" in out), (1, False), "a different body is refused for good")
         rc, out = self.verb("publish", t)
-        self.assertEqual(rc, 1, "no verifying blob: nothing to publish yet")
+        self.assertEqual((rc, out.get("retry")), (1, True), "no verifying blob yet: a retry, nothing published")
         rc, out = self.verb("park", t, "turn-1", "--detail", "x")
         self.assertEqual(rc, 1, "and never the protocol failure in place of the accepted answer")
         self.assertFalse((self.results / (t + ".txt")).exists())
@@ -3209,7 +3219,7 @@ class InboxCli(ConnectBase):
         with mock.patch.object(tl, "fsync_dir", failing):
             for _ in range(3):
                 rc, out = self.verb("stage", t, "turn-1", stdin=b"body\n")
-                self.assertEqual((rc, out["refused"]), (1, "%s: staging parked" % t))
+                self.assertEqual((rc, out.get("retry")), (1, True), "the accepted body, unfinished: a retry")
             self.assertEqual(self.verb("publish", t)[0], 1, "nothing to publish while the fsync fails")
         self.assertIn(claim_dir, calls, "the existing final's directory is fsynced before the phase")
         self.assertEqual(lc.claims.load(t)["phase"], tl.TURN_CONFIRMED, "stays TURN_CONFIRMED while the fsync fails")

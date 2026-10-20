@@ -371,7 +371,13 @@ def stage(root, task_id, turn_id, body: bytes) -> dict:
     lc = _lifecycle(root)
     with _claims_step(root, lc, task_id, "stage"):
         outcome = lc.stage_result(task_id, body, turn_id)
+        rec = lc.claims.load(task_id) if outcome != "staged" else None
     if outcome != "staged":
+        staged = (rec or {}).get("staged") or {}
+        if rec and rec["phase"] == lifecycle.TURN_CONFIRMED and staged.get("length") == len(body) \
+                and staged.get("sha256") == hashlib.sha256(body).hexdigest():
+            # This body's descriptor is recorded but its blob is not in place: the identical retry finishes.
+            raise Parked("%s: this answer is accepted but its staging did not finish; retried" % task_id)
         raise Refused("%s: staging %s" % (task_id, outcome))
     return _mirror(root, task_id, lifecycle.RESULT_STAGED, {"task_id": task_id, "outcome": outcome}, {"turn_id": turn_id})
 
@@ -380,8 +386,10 @@ def publish(root, task_id) -> dict:
     lc = _lifecycle(root)
     with _claims_step(root, lc, task_id, "publish"):
         rec = lc.claims.load(task_id)
-        if rec and rec["phase"] == lifecycle.TURN_CONFIRMED and rec.get("staged"):
-            lc.finish_staged(task_id)       # an accepted answer whose move did not finish: that body, no other
+        if rec and rec["phase"] == lifecycle.TURN_CONFIRMED and rec.get("staged") and \
+                lc.finish_staged(task_id) != "staged":
+            # An accepted answer whose blob is not verified yet: only the identical stage retry finishes it.
+            raise Parked("%s: the accepted answer's staging has not finished; retried" % task_id)
         outcome = lc.publish_and_settle(task_id)
     if outcome != "settled":
         raise Refused("%s: publication %s" % (task_id, outcome))

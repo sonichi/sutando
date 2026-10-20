@@ -154,10 +154,9 @@ async function witness($: any, s: State, where: string): Promise<boolean> {
   return true
 }
 
-// A turn completed or aborted with nothing staged: the explicit protocol failure, published once, never replayed.
-// The turn ended: an accepted answer (its text staged, or its stage left unfinished) is delivered as it
-// is, else the protocol failure; anything not published keeps the offer, retried by the next tick.
-async function parkOffer($: any, s: State, offer: Offer, reason: string) {
+// The turn ended: an accepted answer is delivered as it is, else the protocol failure; '' once delivered,
+// else why not (the offer is kept and the scan retries it behind the per-task backoff).
+async function parkOffer($: any, s: State, offer: Offer, reason: string): Promise<string> {
   if (offer.stagedText !== undefined && offer.phase === 'TURN_CONFIRMED') {
     const st = await cli($, s, ['stage', offer.rid, offer.turnId], offer.stagedText + '\n')
     if (st.ok || (st.hard && st.data?.outcome === 'staged')) offer.phase = 'RESULT_STAGED'
@@ -165,13 +164,14 @@ async function parkOffer($: any, s: State, offer: Offer, reason: string) {
   const r = offer.phase === 'RESULT_STAGED' ? await cli($, s, ['publish', offer.rid])
     : await cli($, s, ['park', offer.rid, offer.turnId, '--detail', `turn ${reason} without a reply`])
   if (!(r.ok || (r.hard && r.data?.outcome === 'settled'))) {
-    if (offer.parkPending === undefined) await $.ui.log(`${PLUGIN}: ${offer.rid} not delivered at the turn's end (${r.data?.refused ?? r.data?.error ?? ''}); retried`, {})
     offer.parkPending = reason
-    return
+    return String(r.data?.refused ?? r.data?.error ?? 'not published')
   }
   await $.ui.log(`${PLUGIN}: ${offer.rid} delivered at the turn's end (${offer.stagedText !== undefined || r.data?.parked === false ? 'the accepted answer' : 'the protocol failure'})`, {})
   s.offers.delete(offer.rid)
   s.answered.add(offer.rid)
+  offer.parkPending = undefined
+  return ''
 }
 
 // CALLING -> TURN_CONFIRMED for the turn recorded in `confirming`; a retry reply keeps it for the next try
@@ -255,11 +255,22 @@ async function arm($: any, s: State, inbox: string, results: string): Promise<{ 
       if (s.intake === 'closed' && !stopped && (!live || !(await reopenIntake($, s)))) return
       for (const o of [...s.offers.values()]) {
         if (o.confirming) await confirmOffer($, s, o)
-        else if (o.parkPending !== undefined) await parkOffer($, s, o, o.parkPending)
+        else if (o.parkPending !== undefined) {
+          const held = s.retry.get(o.file)
+          if (held && s.tick < held.next) continue
+          const why = await parkOffer($, s, o, o.parkPending)
+          if (!why) {
+            s.retry.delete(o.file)
+            if (held?.stuck) await cli($, s, ['progress', '--unstuck', o.rid])
+          } else if (await retain(o.file, o.rid, "not delivered at the turn's end", why)) return
+        }
       }
       if (!stopped && s.pending) return
-      if (!stopped) for (const o of s.offers.values()) if (o.phase === 'CALLING' || o.phase === 'TURN_CONFIRMED') return
-      for (const entry of await $.fs.list(inbox)) {
+      // A delivery still owed for an ended turn is retried on its own schedule; it never holds intake.
+      if (!stopped) for (const o of s.offers.values()) if ((o.phase === 'CALLING' || o.phase === 'TURN_CONFIRMED') && o.parkPending === undefined) return
+      const listed = await $.fs.list(inbox)
+      for (const name of [...s.authorizing.keys()]) if (stopped || !listed.some((e: any) => e.name === name)) s.authorizing.delete(name)
+      for (const entry of listed) {
         if (entry.kind !== 'file' || !TASK_RE.test(entry.name) || s.seen.has(entry.name)) continue
         const backoff = s.retry.get(entry.name)
         if (backoff && s.tick < backoff.next) continue
@@ -489,8 +500,8 @@ export const register: Register = (on) => {
     }
     if (offer.phase !== 'RESULT_STAGED') {
       const staged = await cli($, s, ['stage', id, offer.turnId], text + '\n')
-      // Hard without "staged": the claim recorded this text's descriptor, so it is the accepted answer.
-      if (staged.hard && staged.data?.outcome !== 'staged') offer.stagedText = text
+      // Hard without "staged", or a retry: this text's descriptor may be recorded, so it is the accepted answer.
+      if ((staged.hard && staged.data?.outcome !== 'staged') || (!staged.ok && staged.data?.retry)) offer.stagedText = text
       if (!(staged.ok || (staged.hard && staged.data?.outcome === 'staged'))) return { result: `Error: stage refused: ${staged.data?.refused ?? staged.data?.error ?? ''}${staged.data?.retry || staged.hard ? again : ''}`, isError: true }
       offer.phase = 'RESULT_STAGED'
       offer.stagedText = text

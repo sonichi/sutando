@@ -26,7 +26,8 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
                                unstuckFails?: number; clearFails?: Record<string, string>; stuckWriteFails?: number;
                                lockFailsOnce?: string[]; storeFailsOnce?: string[]; unreadableOnce?: string[];
                                committedHardOnce?: string[]; committedHardWhy?: string; stageLandsOnce?: boolean;
-                               parkRefusedOnce?: boolean; authorizeLostOnce?: boolean } = {}) {
+                               parkRefusedOnce?: boolean; authorizeLostOnce?: boolean; stageLinkFailsOnce?: boolean;
+                               parkAlwaysRefuses?: boolean } = {}) {
   const files: Record<string, string> = {}
   const submitted: string[] = []
   const runs: string[][] = []
@@ -54,6 +55,7 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
   let stageLands = opts.stageLandsOnce ?? false
   let parkRefused = opts.parkRefusedOnce ?? false
   let authorizeLost = opts.authorizeLostOnce ?? false
+  let stageLinkFails = opts.stageLinkFailsOnce ?? false
   let publishes = 0
   const committedHardWhy = opts.committedHardWhy ?? 'OSError: unlock I/O error'
   const clearFailsLeft: Record<string, string> = { ...(opts.clearFails ?? {}) }
@@ -186,6 +188,11 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
       // As the CLI: the descriptor is recorded first; a second, different body parks.
       if (c.staged !== undefined && c.staged !== e.init.stdin) return out(1, { refused: `${task}: staging parked` })
       c.staged = e.init.stdin
+      if (stageLinkFails) {
+        // As the CLI: the descriptor was saved, then the blob's link failed (ENOSPC): a retry, the text accepted.
+        stageLinkFails = false; c.blobOk = false
+        return out(1, { refused: `${task}: this answer is accepted but its staging did not finish; retried`, retry: true })
+      }
       if (stageLands) {
         // The descriptor's claim.json rename landed and its directory fsync failed: no blob yet.
         stageLands = false; c.blobOk = false
@@ -221,7 +228,7 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
     }
     if (verb === 'park') {
       if (!c || c.phase !== 'TURN_CONFIRMED' || c.turnId !== argv[4]) return out(1, { refused: 'not this turn' })
-      if (parkRefused) { parkRefused = false; return out(1, { refused: `${task}: publication parked` }) }
+      if (parkRefused || opts.parkAlwaysRefuses) { parkRefused = false; return out(1, { refused: `${task}: publication parked` }) }
       // As the CLI: a recorded descriptor with no verifying blob parks every time, until an identical stage.
       if (c.staged !== undefined && !c.blobOk) return out(1, { refused: `${task}: publication parked` })
       if (c.staged !== undefined) {         // an accepted answer: the CLI publishes it, never the protocol failure
@@ -1028,6 +1035,52 @@ test('an authorize committed but not re-readable is asked again with the same te
   await $.turn.start({ text: h.submitted[0], turnId: 't-al' })
   await $.tool.call({ tool: REPLY, task_id: 'task-al', text: 'once' })
   expect(h.files['/out/task-al.txt']).toBe('once\n')
+})
+
+test('a stage whose blob link failed after its descriptor is a retry: the kept text is re-staged and published once', async ($, on) => {
+  const h = host(on, { stageLinkFailsOnce: true })
+  h.files['/in/task-lk.txt'] = TASK('task-lk')
+  await arm($, h)
+  await h.clock.advance(1000)
+  await $.turn.start({ text: h.submitted[0], turnId: 't-lk' })
+  const r = await $.tool.call({ tool: REPLY, task_id: 'task-lk', text: 'kept text' })
+  expect(String(r.text ?? r.result)).toContain('call ag2space_reply again')
+  await $.turn.complete({ turnId: 't-lk', reason: 'completed', text: '' } as any)
+  expect(h.files['/out/task-lk.txt']).toBe('kept text\n')
+  await h.clock.advance(5000)
+  expect(h.publishes()).toBe(1)
+  expect(verbs(h).filter((v: string) => v === 'park')).toEqual([])
+})
+
+test('an undeliverable ended turn backs off, is marked stuck, and never holds intake for the next task', async ($, on) => {
+  const h = host(on, { parkAlwaysRefuses: true })
+  h.files['/in/task-p1.txt'] = TASK('task-p1')
+  await arm($, h)
+  await h.clock.advance(1000)
+  await $.turn.start({ text: h.submitted[0], turnId: 't-p1' })
+  await $.turn.complete({ turnId: 't-p1', reason: 'completed', text: '' } as any)
+  h.files['/in/task-p2.txt'] = TASK('task-p2')
+  for (let i = 0; i < 400; i++) await h.clock.advance(1000)
+  expect(h.submitted.length).toBe(2)                                   // the second task was not held
+  expect(h.submitted[1]).toContain('task-p2')
+  const parks = verbs(h).filter((v: string) => v === 'park').length
+  expect(parks).toBeLessThan(15)                                       // backed off, not one a second
+  expect(h.progress.find((p: string[]) => p[0] === '--stuck' && p[1] === 'task-p1')).toBeDefined()
+})
+
+test('a pending authorization is dropped when its inbox file goes: a returning file is claimed afresh', async ($, on) => {
+  const h = host(on, { authorizeLostOnce: true })
+  h.files['/in/task-gone.txt'] = TASK('task-gone')
+  await arm($, h)
+  await h.clock.advance(500)                             // the arming scan only: claim, then the lost authorization
+  expect(h.submitted.length).toBe(0)                     // kept to ask again
+  const text = h.files['/in/task-gone.txt']
+  delete h.files['/in/task-gone.txt']
+  await h.clock.advance(1000)
+  h.files['/in/task-gone.txt'] = text
+  h.claims['task-gone'] = { attempt: 2, phase: 'PREPARED' }    // a new attempt for the returning file
+  await h.clock.advance(3000)
+  expect(verbs(h).filter((v: string) => v === 'claim').length).toBe(2)   // claimed afresh, not the stale ask
 })
 
 test('thirty failed unstuck writes never age a retained task out: the next one lands (stopped-intake path)', async ($, on) => {
