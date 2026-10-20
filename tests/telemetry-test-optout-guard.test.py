@@ -16,7 +16,8 @@ fails if either half regresses:
   3. tests/_helpers/hermetic_env.py, which rebuilds a test's environment, keeps it off
   4. a child process whose environment a test rebuilt by hand (env={"PATH": ..., "HOME": tmp})
      carries no opt-out variable, so src/telemetry.py refuses to emit when the install id
-     would live under a temp directory (ephemeral_identity)
+     would live under a fixed system temp location (ephemeral_identity), while a persistent
+     HOME stays counted even when TMPDIR points at it
 
 IMPORTANT: every one of these is load-bearing. A test run that emits counts as a real user on
 the admin DAU, and each run mints a fresh install id, so a single CI run can add hundreds of
@@ -34,7 +35,11 @@ REPO = Path(__file__).resolve().parent.parent
 failures = []
 
 
+checked = []
+
+
 def check(name, cond, detail=""):
+    checked.append(name)
     print(("ok   " if cond else "FAIL ") + name + (f" — {detail}" if detail and not cond else ""))
     if not cond:
         failures.append(name)
@@ -126,6 +131,11 @@ def _child_enabled(home):
 with tempfile.TemporaryDirectory() as fresh_home:
     got = _child_enabled(fresh_home)
 check("child with a rebuilt env and a temp HOME → enabled() False", got == "False", got)
+if sys.platform == "darwin":  # the per-user temp macOS assigns, whatever TMPDIR says
+    user_temp = subprocess.run(["getconf", "DARWIN_USER_TEMP_DIR"], capture_output=True, text=True).stdout.strip()
+    with tempfile.TemporaryDirectory(dir=user_temp) as fresh_home:
+        got = _child_enabled(fresh_home)
+    check("child with a rebuilt env and HOME under DARWIN_USER_TEMP_DIR → enabled() False", got == "False", got)
 # the same decision in this process, where the coverage gate can see it.
 with tempfile.TemporaryDirectory() as fresh_home, mock.patch.dict(
         os.environ, {"HOME": fresh_home, "POSTHOG_API_KEY": "phc_test"}, clear=False):
@@ -135,8 +145,25 @@ with tempfile.TemporaryDirectory() as fresh_home, mock.patch.dict(
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     check("in-process: a temp HOME → ephemeral_identity() True", mod.ephemeral_identity() is True)
+    os.environ["SUTANDO_TELEMETRY"] = "1"
+    check("in-process: an explicit SUTANDO_TELEMETRY=1 wins over a temp HOME", mod.ephemeral_identity() is False)
+    os.environ.pop("SUTANDO_TELEMETRY")
     os.environ["SUTANDO_TELEMETRY_ID_FILE"] = os.path.join(fresh_home, "telemetry-id")
     check("in-process: an explicit SUTANDO_TELEMETRY_ID_FILE is kept", mod.ephemeral_identity() is False)
+
+# TMPDIR (or the cwd fallback) can name a persistent HOME; only fixed system temp locations count.
+PERSISTENT_HOME = "/nonexistent-sutando-telemetry-guard-home"
+with mock.patch.dict(os.environ, {"HOME": PERSISTENT_HOME, "TMPDIR": PERSISTENT_HOME,
+                                  "POSTHOG_API_KEY": "phc_test", "SUTANDO_STATE_DIR": PERSISTENT_HOME + "/state"}), \
+        mock.patch.object(tempfile, "tempdir", PERSISTENT_HOME):
+    for k in ("SUTANDO_TELEMETRY_ID_FILE", "XDG_DATA_HOME", "SUTANDO_TELEMETRY", "DO_NOT_TRACK"):
+        os.environ.pop(k, None)
+    spec = importlib.util.spec_from_file_location("telemetry_tmpdir_home", REPO / "src" / "telemetry.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    mod._KEY = "phc_test"
+    check("TMPDIR set to a persistent HOME → still enabled()", tempfile.gettempdir() == PERSISTENT_HOME
+          and mod.ephemeral_identity() is False and mod.enabled() is True)
 # control: the same rebuilt env with a HOME outside any temp dir does emit, so the temp HOME is the gate.
 got = _child_enabled("/nonexistent-sutando-telemetry-guard-home")
 check("control: rebuilt env with a non-temp HOME → enabled() True", got == "True", got)
@@ -145,4 +172,4 @@ print()
 if failures:
     print(f"{len(failures)} FAILURE(S): {failures}")
     raise SystemExit(1)
-print(f"ALL PASS ({14} checks)")
+print(f"ALL PASS ({len(checked)} checks)")

@@ -78,9 +78,13 @@ export SUTANDO_TELEMETRY=0
 …or create the file `<workspace>/state/telemetry-disabled`. In the desktop app,
 use the Privacy toggle in Settings.
 
-Telemetry is also off whenever the install id would be stored under a temp
-directory (a throwaway `HOME`, as test harnesses use): such an id is new on
-every run and would count every run as a new user.
+Telemetry is also off when the install id would be stored under a fixed system
+temp location (`/tmp`, `/var/tmp`, the macOS per-user `/var/folders/<x>/<y>/T`,
+or `%LOCALAPPDATA%\Temp` / `%SystemRoot%\Temp` on Windows), as test harnesses do
+with a throwaway `HOME`. An install that deliberately runs with such a disposable
+`HOME` is not counted either: it would mint a new id on every run and count each
+run as a new user. `SUTANDO_TELEMETRY=1` (or an explicit
+`SUTANDO_TELEMETRY_ID_FILE`) overrides this.
 
 ## Transparency
 

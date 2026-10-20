@@ -23,8 +23,9 @@ Set ANY of the following and all telemetry becomes a silent no-op:
 
 * ``DO_NOT_TRACK=1``     — the cross-project standard (Astro, Bun, Prisma, …)
 * ``SUTANDO_TELEMETRY=0``
-* an install id that would live under a temp directory (a throwaway ``HOME``, as
-  test harnesses use): it would be new on every run, so it is never counted
+* an install id that would live under a fixed system temp location (a throwaway
+  ``HOME``, as test harnesses use), unless ``SUTANDO_TELEMETRY=1`` or
+  ``SUTANDO_TELEMETRY_ID_FILE`` is set: such an id is new on every run
 * a file named ``telemetry-disabled`` in EITHER the durable OS data dir (see
   Identity below — survives workspace churn / app updates) OR the legacy
   ``<workspace>/state/`` dir. A marker in either location opts you out.
@@ -54,7 +55,6 @@ import json
 import os
 import subprocess
 import sys
-import tempfile
 import threading
 import urllib.request
 import uuid
@@ -113,29 +113,45 @@ def _durable_id_path() -> Path:
     return base / "telemetry-id"
 
 
-def _temp_roots() -> list[Path]:
-    """System temp directories, including the defaults a rebuilt environment falls back to."""
-    return [Path(tempfile.gettempdir())] + [Path(r) for r in ("/tmp", "/var/tmp", "/var/folders")]
+def _fixed_temp_roots() -> list[str]:
+    """The OS's fixed temp locations; never one chosen through TMPDIR/TEMP/TMP or the cwd fallback."""
+    if os.name == "nt":
+        return [os.path.join(os.environ[v], "Temp") for v in ("LOCALAPPDATA", "SYSTEMROOT") if os.environ.get(v)]
+    return ["/tmp", "/var/tmp"]
+
+
+def _within(target: str, root: str) -> bool:
+    root = os.path.normcase(os.path.realpath(root)).rstrip(os.sep)
+    return target == root or target.startswith(root + os.sep)
+
+
+def _macos_user_temp(target: str) -> bool:
+    """Under the per-user temp dir macOS assigns, ``/var/folders/<x>/<y>/T``."""
+    folders = os.path.normcase(os.path.realpath("/var/folders")).rstrip(os.sep)
+    if not target.startswith(folders + os.sep):
+        return False
+    parts = target[len(folders) + 1:].split(os.sep)
+    return len(parts) >= 3 and parts[2] == "T"
 
 
 def ephemeral_identity() -> bool:
-    """True when the install id would live under a temp directory (a throwaway HOME).
+    """True when the install id would live under a fixed system temp location (a throwaway HOME).
 
     Such an id is new on every run, so each run would count as a new user. Test harnesses run
     children with a temp HOME, and that survives an environment rebuilt from nothing, unlike an
-    opt-out variable. An explicit ``SUTANDO_TELEMETRY_ID_FILE`` is the caller's choice and is kept.
+    opt-out variable. The cost: an install that deliberately runs with a disposable HOME under the
+    system temp is not counted either; it would mint a fresh id per run and inflate DAU anyway.
+    An explicit ``SUTANDO_TELEMETRY_ID_FILE`` or ``SUTANDO_TELEMETRY=1`` is the caller's choice and wins.
     """
     if os.environ.get("SUTANDO_TELEMETRY_ID_FILE"):
         return False
+    if os.environ.get("SUTANDO_TELEMETRY", "").strip().lower() in _TRUTHY:
+        return False
     try:
         target = os.path.normcase(os.path.realpath(_durable_id_path()))
-        for root in _temp_roots():
-            r = os.path.normcase(os.path.realpath(root))
-            if target == r or target.startswith(r.rstrip(os.sep) + os.sep):
-                return True
+        return _macos_user_temp(target) or any(_within(target, r) for r in _fixed_temp_roots())
     except Exception:  # pragma: no cover — defensive; an unresolvable path counts as ephemeral
         return True
-    return False
 
 
 def opted_out() -> bool:
