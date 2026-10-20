@@ -235,7 +235,7 @@ async function confirmOffer($: any, s: State, offer: Offer): Promise<boolean> {
   }
   await $.ui.log(`${PLUGIN}: ${offer.rid} turn not confirmed: ${r.data?.refused ?? ''}; held until the next start answers it`, {})
   // The claim stays CALLING with no answer and the CLI refuses to claim it again: the offer is kept, never
-  // re-claimed, and its mark stays until a result appears (the next start's interrupted answer).
+  // re-claimed, marked stuck until the CLI reads it resolved (the next start's interrupted answer).
   offer.unconfirmed = true
   return r.hard
 }
@@ -292,16 +292,18 @@ async function arm($: any, s: State, inbox: string, results: string): Promise<{ 
 
   const retire = (name: string, rid: string, why: string, done?: () => Promise<void>) => retireTask($, s, name, rid, why, done)
 
-  // An offer whose turn was not confirmed, held: once a result appears the claim is asked again (the lifecycle
-  // decides: a resolved task is refused and released through the mark clear); until then kept, backed off.
+  // An offer whose turn was not confirmed, held: each eligible tick its mark is written again, and the CLI's
+  // reply keeps only unresolved marks (the lifecycle's SETTLED or terminal disposition, archived included), so a
+  // mark missing from the reply means it was answered: released through the mark clear. Else kept, backed off.
   const settleUnconfirmed = async (o: Offer): Promise<boolean> => {
     const held = s.retry.get(o.file)
     if (held && s.tick < held.next) return false
-    if (!(await $.fs.exists(`${results}/${resultName(o.rid)}`))) return retain(o.file, o.rid, 'turn not confirmed', 'no answer yet')
-    const c = await cli($, s, ['claim', o.rid])
-    if (c.hard) return true
-    if (c.ok || c.data?.retry) return retain(o.file, o.rid, 'turn not confirmed', String(c.data?.refused ?? 'claimed again'))
-    return releaseOffer($, s, o, `answered after its turn was not confirmed (${c.data?.refused ?? ''})`)
+    const p = await cli($, s, ['progress', '--stuck', o.rid, '--stuck-detail', 'turn not confirmed: held until the next start answers it'])
+    if (p.hard) return true
+    const marks = p.data?.stuck
+    if (!p.ok || !marks || typeof marks !== 'object') return retain(o.file, o.rid, 'turn not confirmed', String(p.data?.refused ?? 'no reply'))
+    if (o.rid in marks) return retain(o.file, o.rid, 'turn not confirmed', 'not answered yet')
+    return releaseOffer($, s, o, 'answered after its turn was not confirmed')
   }
 
   const scan = async () => {

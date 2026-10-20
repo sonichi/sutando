@@ -2832,6 +2832,8 @@ def contract_shape(expect: dict, rc: int, out: dict) -> str:
     bad = ["%s %r != %r" % (k, got[k], expect[k]) for k in ("exit", "refused", "retry") if got[k] != expect[k]]
     bad += ["%s %r != %r" % (k, out.get(k), v) for k, v in (expect.get("fields") or {}).items() if out.get(k) != v]
     bad += ["no %s" % k for k in expect.get("has") or [] if k not in out]
+    bad += ["%s not marked" % k for k in expect.get("marked") or [] if k not in (out.get("stuck") or {})]
+    bad += ["%s still marked" % k for k in expect.get("unmarked") or [] if k in (out.get("stuck") or {})]
     return "; ".join(bad)
 
 
@@ -2895,6 +2897,10 @@ class InboxCli(ConnectBase):
         with mock.patch.object(inbox.task_io, "verify_lineage", return_value=False):
             self.assertEqual(inbox.recover_dead_generation(self.root), 1, "the next start")
         self.assertEqual((self.results / (t + ".txt")).read_text(), inbox.INTERRUPTED_BODY)
+        (self.results / "archive").mkdir(exist_ok=True)
+        (self.results / (t + ".txt")).rename(self.results / "archive" / (t + ".txt"))   # the gateway drains it
+        rc, out = self.verb("progress", "--stuck", t, "--stuck-detail", "turn not confirmed")
+        self.assertEqual((rc, t in out["stuck"]), (0, False), "the Mod's probe: the mark is dropped as resolved")
         rc, out = self.verb("claim", t)
         self.assertEqual((rc, out.get("retry"), "only ABSENT" in out["refused"]), (1, None, True), "resolved: refused")
         self.assertEqual(records.load_plugin(self.root).get("stuck") or {}, {}, "the claim cleared the mark")
@@ -2908,6 +2914,9 @@ class InboxCli(ConnectBase):
             self.task(sc["task"], sc["tier"])
             if "result" in sc:
                 (self.results / (sc["task"] + ".txt")).write_text(sc["result"])
+            if "archived" in sc:
+                (self.results / "archive").mkdir(exist_ok=True)
+                (self.results / "archive" / (sc["task"] + ".txt")).write_text(sc["archived"])
             saved = {}
             for i, step in enumerate(sc["steps"]):
                 argv = [saved.get(a[1:-1], a) if a.startswith("{") else a for a in step["argv"]]

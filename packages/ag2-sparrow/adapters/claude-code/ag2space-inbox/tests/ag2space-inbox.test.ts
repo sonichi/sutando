@@ -100,6 +100,9 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
     const b = files[`/out/${task}.txt`]
     return b === undefined ? 'ABSENT' : b.trim() && !b.includes('\uFFFD') ? 'LIVE_READY' : 'LIVE_UNREADY'
   }
+  // The lifecycle's resolved(): the claim SETTLED, or a terminal result (live and ready, or archived).
+  const resolvedTask = (task: string) => claims[task]?.phase === 'SETTLED' || result(task) === 'LIVE_READY' ||
+    `/out/archive/${task}.txt` in files
   const out = (exitCode: number, data: any) => ({ value: { exitCode, stdout: JSON.stringify(data) + '\n', stderr: '' } })
   const run = (_: any, e: any) => {
     runs.push([...e.argv])
@@ -148,6 +151,8 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
       const add = argv.indexOf('--stuck'), del = argv.indexOf('--unstuck')
       if (add > 0) stuck[argv[add + 1]] = stuck[argv[add + 1]] ?? { since: 1 }
       if (del > 0) delete stuck[argv[del + 1]]
+      // As the CLI (unresolved_stuck): a write keeps only the marks of unresolved tasks.
+      if (add > 0 || del > 0) for (const k of Object.keys(stuck)) if (resolvedTask(k)) delete stuck[k]
       return out(0, { ok: true, stuck: { ...stuck } })
     }
     if (verb === 'check-inode') return argv[argv.indexOf('--expect') + 1] === (opts.cwdInode ?? '1:1') ? out(0, { inode: '1:1' }) : out(1, { refused: 'inode mismatch' })
@@ -1425,11 +1430,36 @@ test('an unconfirmed turn keeps the task and its stuck mark, never re-claimed, u
   for (let i = 0; i < 70; i++) await h.clock.advance(1000)
   expect(h.stuck).toEqual({})
   expect(h.runs.filter((a: string[]) => a.includes('--unstuck') && a.includes('task-u')).length).toBe(1)
-  expect(verbs(h).filter(v => v === 'claim').length).toBe(2)   // asked once more, after the answer appeared
+  expect(verbs(h).filter(v => v === 'claim').length).toBe(1)   // never claimed again: the mark's reply decides
   const claims = verbs(h).filter(v => v === 'claim').length
   for (let i = 0; i < 70; i++) await h.clock.advance(1000)
   expect(verbs(h).filter(v => v === 'claim').length).toBe(claims)   // retired: tried no more
   expect(h.submitted.length).toBe(1)
+})
+
+test('an unconfirmed turn answered during its backoff and archived before the next try is still released, its mark cleared once', async ($, on) => {
+  const h = host(on)
+  h.files['/in/task-race.txt'] = TASK('task-race')
+  await arm($, h)
+  await h.clock.advance(1000)
+  h.stuck['task-race'] = { since: 1 }                 // marked while it was held (any writer)
+  h.claims['task-race'].token = 'another'
+  await $.turn.start({ text: FRAMED(h.submitted[0]), turnId: 't-r' })
+  await h.clock.advance(1000)
+  await h.clock.advance(1000)                          // two tries with no answer: backed off
+  expect(h.stuck['task-race']).toBeDefined()
+  // During the backoff the next start settles the claim and writes the answer; the gateway archives it at once.
+  h.claims['task-race'].phase = 'SETTLED'
+  h.files['/out/archive/task-race.txt'] = '[AG2 Space] This attempt was interrupted before the session answered\n'
+  expect(h.files['/out/task-race.txt']).toBe(undefined)
+  for (let i = 0; i < 10; i++) await h.clock.advance(1000)
+  expect(h.stuck).toEqual({})
+  expect(h.runs.filter((a: string[]) => a.includes('--unstuck') && a.includes('task-race')).length).toBe(1)
+  const r = await $.tool.call({ tool: REPLY, task_id: 'task-race', text: 'late' })
+  expect(String(r.text ?? r.result)).toContain('is not a task this session received')   // released
+  const n = h.runs.length
+  for (let i = 0; i < 70; i++) await h.clock.advance(1000)
+  expect(h.runs.slice(n).filter((a: string[]) => a.includes('task-race')).length).toBe(0)   // retired once
 })
 
 test('a release clear that fails hard inside the scan ends that scan: nothing else is claimed or authorized in the tick', async ($, on) => {
@@ -1663,6 +1693,7 @@ test('the fake CLI answers every contract scenario as the real verbs do', async 
   for (const sc of CONTRACT as any[]) {
     h.files[`/in/${sc.task}.txt`] = TASK(sc.task, sc.tier)
     if (sc.result !== undefined) h.files[`/out/${sc.task}.txt`] = sc.result
+    if (sc.archived !== undefined) h.files[`/out/archive/${sc.task}.txt`] = sc.archived
     const saved: Record<string, string> = {}
     sc.steps.forEach((step: any, i: number) => {
       const argv = step.argv.map((a: string) => a.startsWith('{') ? (saved[a.slice(1, -1)] ?? a) : a)
@@ -1673,6 +1704,8 @@ test('the fake CLI answers every contract scenario as the real verbs do', async 
       const bad = (['exit', 'refused', 'retry'] as const).filter(k => got[k] !== step.expect[k]).map(k => `${k} ${got[k]} != ${step.expect[k]}`)
       for (const [k, v] of Object.entries(step.expect.fields ?? {})) if (data[k] !== v) bad.push(`${k} ${JSON.stringify(data[k])} != ${JSON.stringify(v)}`)
       for (const k of step.expect.has ?? []) if (!(k in data)) bad.push(`no ${k}`)
+      for (const k of step.expect.marked ?? []) if (!(k in (data.stuck ?? {}))) bad.push(`${k} not marked`)
+      for (const k of step.expect.unmarked ?? []) if (k in (data.stuck ?? {})) bad.push(`${k} still marked`)
       if (bad.length) diffs.push(`${sc.name}, step ${i} ${argv[0]}: ${bad.join('; ')}`)
     })
   }

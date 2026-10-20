@@ -865,5 +865,229 @@ export const CONTRACT = [
     }
    }
   ]
+ },
+ {
+  "name": "mark an unconfirmed (calling) task stuck: kept",
+  "task": "task-q1",
+  "tier": "owner",
+  "steps": [
+   {
+    "argv": [
+     "claim",
+     "task-q1"
+    ],
+    "save": "attempt",
+    "expect": {
+     "exit": 0,
+     "refused": false,
+     "retry": false,
+     "has": [
+      "attempt"
+     ]
+    }
+   },
+   {
+    "argv": [
+     "authorize",
+     "task-q1",
+     "{attempt}",
+     "--text-hash",
+     "abababababababababababababababababababababababababababababababab"
+    ],
+    "save": "token",
+    "expect": {
+     "exit": 0,
+     "refused": false,
+     "retry": false,
+     "has": [
+      "token"
+     ]
+    }
+   },
+   {
+    "argv": [
+     "confirm",
+     "task-q1",
+     "turn-1",
+     "bad",
+     "--text-hash",
+     "abababababababababababababababababababababababababababababababab"
+    ],
+    "expect": {
+     "exit": 1,
+     "refused": true,
+     "retry": false
+    }
+   },
+   {
+    "argv": [
+     "progress",
+     "--stuck",
+     "task-q1",
+     "--stuck-detail",
+     "held"
+    ],
+    "expect": {
+     "exit": 0,
+     "refused": false,
+     "retry": false,
+     "marked": [
+      "task-q1"
+     ]
+    }
+   }
+  ]
+ },
+ {
+  "name": "mark a task with a ready result stuck: dropped as resolved",
+  "task": "task-q2",
+  "tier": "owner",
+  "result": "an answer\n",
+  "steps": [
+   {
+    "argv": [
+     "progress",
+     "--stuck",
+     "task-q2",
+     "--stuck-detail",
+     "held"
+    ],
+    "expect": {
+     "exit": 0,
+     "refused": false,
+     "retry": false,
+     "unmarked": [
+      "task-q2"
+     ]
+    }
+   }
+  ]
+ },
+ {
+  "name": "mark a task with an archived result stuck: dropped as resolved",
+  "task": "task-q3",
+  "tier": "owner",
+  "archived": "an answer\n",
+  "steps": [
+   {
+    "argv": [
+     "progress",
+     "--stuck",
+     "task-q3",
+     "--stuck-detail",
+     "held"
+    ],
+    "expect": {
+     "exit": 0,
+     "refused": false,
+     "retry": false,
+     "unmarked": [
+      "task-q3"
+     ]
+    }
+   }
+  ]
+ },
+ {
+  "name": "mark a published task stuck: dropped as resolved",
+  "task": "task-q4",
+  "tier": "owner",
+  "steps": [
+   {
+    "argv": [
+     "claim",
+     "task-q4"
+    ],
+    "save": "attempt",
+    "expect": {
+     "exit": 0,
+     "refused": false,
+     "retry": false,
+     "has": [
+      "attempt"
+     ]
+    }
+   },
+   {
+    "argv": [
+     "authorize",
+     "task-q4",
+     "{attempt}",
+     "--text-hash",
+     "abababababababababababababababababababababababababababababababab"
+    ],
+    "save": "token",
+    "expect": {
+     "exit": 0,
+     "refused": false,
+     "retry": false,
+     "has": [
+      "token"
+     ]
+    }
+   },
+   {
+    "argv": [
+     "confirm",
+     "task-q4",
+     "turn-1",
+     "{token}",
+     "--text-hash",
+     "abababababababababababababababababababababababababababababababab"
+    ],
+    "expect": {
+     "exit": 0,
+     "refused": false,
+     "retry": false
+    }
+   },
+   {
+    "argv": [
+     "stage",
+     "task-q4",
+     "turn-1"
+    ],
+    "stdin": "ans\n",
+    "expect": {
+     "exit": 0,
+     "refused": false,
+     "retry": false,
+     "fields": {
+      "outcome": "staged"
+     }
+    }
+   },
+   {
+    "argv": [
+     "publish",
+     "task-q4"
+    ],
+    "expect": {
+     "exit": 0,
+     "refused": false,
+     "retry": false,
+     "fields": {
+      "outcome": "settled"
+     }
+    }
+   },
+   {
+    "argv": [
+     "progress",
+     "--stuck",
+     "task-q4",
+     "--stuck-detail",
+     "held"
+    ],
+    "expect": {
+     "exit": 0,
+     "refused": false,
+     "retry": false,
+     "unmarked": [
+      "task-q4"
+     ]
+    }
+   }
+  ]
  }
 ]

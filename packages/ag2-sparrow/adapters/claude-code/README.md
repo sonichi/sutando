@@ -235,10 +235,12 @@ task's offer (published by `ag2space_reply`, parked or delivered at a turn's
 end, or retried by the scan), so a mark written while the authorization was
 retried is the offer's to clear. An offer whose turn was not confirmed is the
 exception: its claim stays `CALLING` with no answer and the CLI refuses a second
-claim of it as final, so the mod keeps the offer, never claims it again while it
-is unanswered, and keeps the mark. Once a result appears (the next start answers
-it as interrupted) the claim is asked again, refused as resolved, and the offer
-is released through the mark clear. Until the CLI confirms the clear (a refusal, exit 3, or
+claim of it as final, so the mod keeps the offer and never claims it again.
+Instead it marks the task stuck on each backed-off try; the CLI's reply keeps
+only the marks of unresolved tasks (from the lifecycle: the claim settled, or a
+result live and ready, archived or quarantined), so once the next start answers
+it as interrupted, even if that answer is already archived, the mark is missing
+from the reply and the offer is released through the mark clear. Until the CLI confirms the clear (a refusal, exit 3, or
 a CLI that did not run) the mod keeps the task, retries only the clear after
 1, 2, 4 ... ticks capped at 60, and marks it seen once the clear lands; no
 mark outlives its task.
