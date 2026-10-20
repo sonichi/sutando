@@ -237,16 +237,12 @@ def _voice_room_owner() -> str:
     bad_at = _VOICE_OWNER["bad_at"]
     if bad_at is not None and 0 <= now - bad_at < VOICE_OWNER_RETRY_S:
         return ""
-    identity = _reenroll_identity()  # noqa: F821
     try:
-        answer = _req("GET", "/v1/agents", timeout=10)  # noqa: F821
+        owner = _registry_owner(timeout=10)[0]  # noqa: F821
     except Exception as e:  # noqa: BLE001
         _voice_owner_read_failed(e)
-        answer = None
-    agents = answer.get("agents") if isinstance(answer, dict) else None
-    row = next((r for r in (agents or []) if isinstance(r, dict) and r.get("id") == identity), None)
-    owner = str((row or {}).get("owner") or "")
-    if not (owner.startswith("@") and ":" in owner):
+        owner = ""
+    if not owner:
         _VOICE_OWNER.update(mxid="", bad_at=now)
         return ""
     _VOICE_OWNER.update(mxid=owner, at=now, bad_at=None)
