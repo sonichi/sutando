@@ -18,6 +18,8 @@ must build every environment with tests/_helpers/hermetic_env.py. Refused anywhe
               function, or spawn with the helper's env); a call under `if` does not isolate, and
               a clearing mock.patch.dict never counts: its lifetime is not the spawn's
   before-isolation  such code at module level above that call
+  patched-isolation  that call while a mock.patch.dict(os.environ) is live (entered by `with`, a
+              decorator, or started earlier in its scope and not stopped): stopping it restores the outer env
 """
 from __future__ import annotations
 
@@ -100,6 +102,12 @@ def _over_environ(it, imp: Imports) -> bool:
                                and it.func.attr in ("items", "keys") and imp.environ(it.func.value))
 
 
+def _environ_patch(n, imp: "Imports") -> bool:
+    """A mock.patch.dict over os.environ, under any alias or by its "os.environ" name."""
+    return (isinstance(n, ast.Call) and _name(n.func) == "dict" and bool(n.args)
+            and (imp.environ(n.args[0]) or (isinstance(n.args[0], ast.Constant) and n.args[0].value == "os.environ")))
+
+
 def _imports_target(node) -> bool:
     if isinstance(node, ast.Import):
         return any(TARGET.search(a.name) or a.name in ROOM_OPS_MODULES for a in node.names)
@@ -176,6 +184,37 @@ def violations(source: str, name: str = "<sample>") -> "list[str]":
         """An isolator call run as a statement: in effect for the rest of the process."""
         return isinstance(n, ast.Call) and _name(n.func) in ISOLATORS and statement(n)
 
+    def under_environ_patch(n) -> bool:
+        """`n` runs inside a `with` or decorated def patching os.environ, or after such a patch was
+        started in the same scope and not stopped."""
+        p = n
+        while p in parents:
+            c, p = p, parents[p]
+            if isinstance(p, (ast.With, ast.AsyncWith)) and c in p.body and any(
+                    _environ_patch(i.context_expr, imp) for i in p.items):
+                return True
+            if (isinstance(p, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+                    and any(_environ_patch(d, imp) for d in p.decorator_list)):
+                return True
+        scope = enclosing_def(n)
+        named = {t.id for a in nodes if isinstance(a, ast.Assign) and _environ_patch(a.value, imp)
+                 and enclosing_def(a) is scope for t in a.targets if isinstance(t, ast.Name)}
+        live: "set[str]" = set()
+        calls = sorted((c for c in nodes if isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute)
+                        and enclosing_def(c) is scope and c.lineno < n.lineno),
+                       key=lambda c: (c.lineno, c.col_offset))
+        for c in calls:
+            f = c.func
+            if f.attr == "start" and _environ_patch(f.value, imp):
+                live.add(f"@{c.lineno}:{c.col_offset}")
+            elif f.attr == "start" and isinstance(f.value, ast.Name) and f.value.id in named:
+                live.add(f.value.id)
+            elif f.attr == "stop" and isinstance(f.value, ast.Name):
+                live.discard(f.value.id)
+            elif f.attr == "stopall":
+                live.clear()
+        return bool(live)
+
     def runs_code(n) -> bool:
         return (isinstance(n, ast.Call) and (imp.spawn(n) or _name(n.func) in LOADERS)) or _imports_target(n)
 
@@ -206,6 +245,8 @@ def violations(source: str, name: str = "<sample>") -> "list[str]":
     elif runs:
         out += [(n.lineno, "before-isolation") for n in runs
                 if enclosing_def(n) is None and n.lineno < module_iso[0]]
+    out += [(n.lineno, "patched-isolation") for n in nodes
+            if isinstance(n, ast.Call) and _name(n.func) in ISOLATORS and under_environ_patch(n)]
     for n in nodes:
         rule = None
         if _copy_rule(n, imp):
@@ -298,6 +339,14 @@ LEAKS = {
 ISOLATED_CONTROL = (f"import sys\nsys.path.insert(0, {str(REPO / 'tests')!r})\n"
                     "from _helpers.hermetic_env import isolate_os_environ\nisolate_os_environ()\n" + HEAD + PRINT)
 SYNTHETIC = "qa-synthetic-token"
+ISOLATE = (f"import sys\nsys.path.insert(0, {str(REPO / 'tests')!r})\n"
+           "from _helpers.hermetic_env import isolate_os_environ\n")
+# A patch over os.environ started before isolation: stopall() puts the outer environment back.
+PATCHED_FIRST = {
+    clear: HEAD + ISOLATE + f"mock.patch.dict(os.environ, {{'X': '1'}}, clear={clear}).start()\n"
+    "isolate_os_environ()\nmock.patch.stopall()\n" + PRINT
+    for clear in (True, False)
+}
 
 
 class SelfTest(unittest.TestCase):
@@ -393,6 +442,33 @@ class SelfTest(unittest.TestCase):
         for name, sample in LEAKS.items():
             with self.subTest(name=name):
                 self.assertIn("unisolated", " ".join(violations(sample)))
+
+    def test_isolating_under_a_live_environ_patch_is_refused(self):
+        for clear, sample in PATCHED_FIRST.items():
+            with self.subTest(clear=clear):
+                self.assertIn("patched-isolation", " ".join(violations(sample)))
+        pre = "import os\nfrom unittest import mock\n"
+        for body in ("with mock.patch.dict(os.environ, {}):\n    isolate_os_environ()\n",
+                     "@mock.patch.dict('os.environ', {})\ndef f():\n    isolate_os_environ()\n",
+                     "from os import environ as E\nP = mock.patch.dict(E, {})\nP.start()\nisolate_os_environ()\n",
+                     "from unittest.mock import patch as P\nP.dict(os.environ, {}).start()\nisolate_os_environ()\n"):
+            with self.subTest(body=body):
+                self.assertIn("patched-isolation", " ".join(violations(IN_SCOPE + pre + body)))
+        for body in ("P = mock.patch.dict(os.environ, {})\nP.start()\nP.stop()\nisolate_os_environ()\n",
+                     "mock.patch.dict(os.environ, {}).start()\nmock.patch.stopall()\nisolate_os_environ()\n",
+                     "isolate_os_environ()\nmock.patch.dict(os.environ, {}).start()\n"):
+            with self.subTest(body=body):
+                self.assertEqual(violations(IN_SCOPE + pre + body), [])
+
+    def test_isolating_under_a_started_environ_patch_fails_and_never_leaks(self):
+        env = hermetic_env(GATEWAY_TOKEN=SYNTHETIC)
+        for clear, sample in PATCHED_FIRST.items():
+            with self.subTest(clear=clear):
+                got = subprocess.run([sys.executable, "-c", sample], capture_output=True, text=True,
+                                     env=env, timeout=60)
+                self.assertNotIn(SYNTHETIC, got.stdout)
+                self.assertNotEqual(got.returncode, 0)
+                self.assertIn("isolate before patching os.environ", got.stderr)
 
     def test_each_refused_shape_really_leaks_a_parent_token_and_the_isolator_does_not(self):
         env = hermetic_env(GATEWAY_TOKEN=SYNTHETIC, PYTHONPATH=str(REPO / "packages" / "ag2-sparrow"))

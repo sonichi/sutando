@@ -123,12 +123,22 @@ def hermetic_env(home: "Path | str | None" = None, **extra: str) -> "dict[str, s
     return env
 
 
+def _environ_patch_active() -> bool:
+    """A started mock.patch.dict on os.environ: its stop() puts back the environment it saved."""
+    from unittest import mock
+    return any(isinstance(p, mock._patch_dict) and (p.in_dict is os.environ or p.in_dict == "os.environ")
+               for p in getattr(mock._patch, "_active_patches", ()))
+
+
 def isolate_os_environ(home: "Path | str | None" = None, **extra: str) -> "os._Environ[str]":
     """Replace this process's environment with `hermetic_env(...)` for the rest of the run; no
     patcher state can restore the outer one.
 
     For a module that imports the bridge or room_ops at load time, before that import."""
     global _process_home
+    if _environ_patch_active():
+        raise RuntimeError("isolate_os_environ() under a started mock.patch.dict(os.environ): stopping that "
+                           "patch would restore the outer environment; isolate before patching os.environ")
     env = hermetic_env(home, **extra)
     # In place, not a patcher: mock.patch.stopall() would restore the outer environment.
     os.environ.clear()
