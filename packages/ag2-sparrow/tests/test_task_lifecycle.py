@@ -1640,6 +1640,52 @@ class SettledIdsTest(Base):
         self.assertEqual(path.read_text().count("task-a\n"), 1)
         self.assertTrue(fresh.settlement_complete("task-a"))
 
+    def test_durable_is_only_what_this_instances_fsync_covered_never_what_a_repair_re_read(self):
+        """The open-time read sees a torn tail and fsyncs; before its repair takes the flock another writer cuts
+        that tail and appends task-b (its own fsync failing). The repair re-reads task-b: visible, never durable."""
+        path = self.work / "s"
+        path.write_bytes(b"task-a\ntask-")
+        real_repair = self.lc.SettledIds._repair
+
+        def other_writer_first(led, fd):
+            with open(path, "r+b") as f:                # the other writer: cut, append, its fsync never succeeded
+                f.truncate(len(b"task-a\n"))
+                f.seek(0, 2)
+                f.write(b"task-b\n")
+            return real_repair(led, fd)
+        with mock.patch.object(self.lc.SettledIds, "_repair", other_writer_first):
+            ids = self.lc.SettledIds(path)
+        self.assertEqual((ids.ids, ids.durable), ({"task-a", "task-b"}, {"task-a"}))
+
+    def test_settlement_complete_counts_a_ledger_id_only_once_it_is_durable(self):
+        """A complete settlement read by a process whose ledger fsync fails: visible, not durable, not complete."""
+        life = self.life()
+        self.run_to_outcome(life)
+        self.assertEqual(life.publish_and_settle("task-a"), "settled")
+        self.assertTrue(self.life().settlement_complete("task-a"))
+        with self.ledger_fsync_fails(self.work / "state" / "settled-ids"):
+            fresh = self.life()
+        self.assertEqual(("task-a" in fresh.settled, fresh.settlement_complete("task-a")), (True, False))
+
+    def test_generation_recovery_compacts_only_over_a_complete_settlement(self):
+        """Even with the trailing ledger sync not standing guard, a dead generation's due SETTLED claim whose id is
+        visible but not durable (its sync failing) is kept by recovery: compaction is gated on the settlement."""
+        (self.work / "state").mkdir(parents=True, exist_ok=True)
+        life = self.life()
+        claims = life.claims
+        claims.save({"schema": 1, "task_id": "task-g", "attempt": 1, "created_at": 1.0, "phase": self.lc.SETTLED,
+                     "settled_at": self.clock() - self.lc.COMPACT_AFTER - 1, "claim_mode": self.lc.LOCAL,
+                     "generation": dict(GEN)})
+        with open(self.work / "state" / "settled-ids", "ab") as f:
+            f.write(b"task-g\n")
+        with self.ledger_fsync_fails(self.work / "state" / "settled-ids"), \
+                mock.patch.object(self.lc.SettledIds, "sync", lambda led: None):
+            again = self.life()
+            again.recover(generation=dict(GEN), proof=False)
+        self.assertIsNotNone(claims.load("task-g"), "kept: never compacted over an undurable id")
+        self.life().recover(generation=dict(GEN), proof=False)
+        self.assertIsNone(claims.load("task-g"), "compacted once the sync succeeds")
+
     def test_compaction_never_runs_before_the_ledger_sync_succeeds(self):
         """A due call-less claim whose id is visible but whose ledger sync fails: reconcile_unbound skips it (one
         logged line) and the claim (the only other witness) is kept; once the sync succeeds it is compacted."""

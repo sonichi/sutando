@@ -188,6 +188,8 @@ class Adapter(RelayLoop):
                 seen.add(task_id)
                 return True
             return self.park(task_id, e)
+        except task_lifecycle.StateError as e:              # an I/O error reading it: parked, retried
+            return self.park(task_id, e)
         # A local claim is never this adapter's to repair: it only reads the ledger for one.
         local = bool(rec and rec.get("claim_mode") == task_lifecycle.LOCAL)
         try:

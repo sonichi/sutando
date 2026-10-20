@@ -149,7 +149,11 @@ its directory) seen by the counting process: an id that is visible but whose
 sync failed is synced again before the staged body is removed, the claim is
 compacted, or anything reports settled; a sync that fails removes nothing and
 is a retry. Recovery skips a claim whose repair fails on I/O (one log line)
-and finishes it on the next pass, so one bad claim never stops a start. When the progress record cannot be written at all, the CLI raises
+and finishes it on the next pass, so one bad claim never stops a start.
+"Durable" is only the lines wholly within the bytes a successful fsync by
+this process covered: a line a repair re-reads later never counts until this
+process syncs it. The cloud adapter's step parks a task on an I/O error
+reading its claim, and retries it, instead of stopping. When the progress record cannot be written at all, the CLI raises
 an alarm in the adapter's config dir (outside `state/`): `verify` fails its
 `progress` row and the launcher raises the needs-attention card until a durable
 write clears it. A record whose fields have the wrong shape reads as unreadable (hard),

@@ -578,6 +578,7 @@ class SettledIds:
         except OSError as e:
             raise LedgerIOError("%s cannot be read (%s)" % (self.path, e))
         self.ids, keep = self._parse(data)
+        read = set(self.ids)                            # only lines wholly within the bytes the fsync above covered
         if keep < len(data):
             try:
                 fd = os.open(self.path, os.O_RDWR | getattr(os, "O_CLOEXEC", 0))
@@ -588,10 +589,10 @@ class SettledIds:
             except OSError as e:
                 raise LedgerIOError("%s cannot be repaired (%s)" % (self.path, e))
         self.durable = set()
-        if self.ids and synced:
+        if read and synced:
             try:
                 fsync_dir(os.path.dirname(self.path))
-                self.durable = set(self.ids)
+                self.durable = read                     # never what a repair re-read later: no fsync of ours covered it
             except OSError:
                 pass                                    # visible, not yet durable: add() syncs before it counts
 

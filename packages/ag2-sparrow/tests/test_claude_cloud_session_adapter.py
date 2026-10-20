@@ -1004,6 +1004,45 @@ class StepBranchTest(unittest.TestCase):
         self.assertTrue((claims.dir("task-l") / "body").is_file(), "never repaired by the cloud adapter")
         self.assertEqual(self.fake.calls(), [])
 
+    def test_serve_survives_an_io_error_reading_a_claim_and_delivers_once_it_recovers(self):
+        """The serve loop with one claim read failing on I/O: the adapter stays up, the task is parked, and once
+        the read works again it is called and delivered exactly once."""
+        write_task(self.work, "task-a", "hi")
+        real_load, real_step, hits, stepping = lc.ClaimStore.load, sa.Adapter.step, [], []
+
+        def load_fails_once(store, task_id):
+            if task_id == "task-a" and stepping and not hits:        # in the serve loop, after startup recovery
+                hits.append(task_id)
+                raise lc.StateIOError("cannot read claim.json ([Errno 5] I/O error)")
+            return real_load(store, task_id)
+
+        def step(ad, name, seen):
+            stepping.append(name)
+            return real_step(ad, name, seen)
+        with mock.patch.object(lc.ClaimStore, "load", load_fails_once), mock.patch.object(sa.Adapter, "step", step):
+            ad, err = run_adapter(self.work, self.fake, once=1)
+        self.assertGreaterEqual(len(stepping), 2, "the loop went on after the parked step")
+        self.assertEqual(hits, ["task-a"])
+        self.assertIn("parked -> task-a", err)
+        self.assertEqual(len(self.fake.calls()), 1, "called once, after the read recovered")
+        self.assertTrue((self.work / "results" / "task-a.txt").exists(), "delivered")
+
+    def test_an_io_error_reading_the_claim_parks_the_step_never_raises(self):
+        """The reads the step makes before it decides (the claim, then is_settled's repair) are inside its
+        containment: a StateIOError there parks the task for a retry and never escapes step(); ClaimUnreadable
+        keeps its own branch. A failure while writing a publication still stops the adapter (exit 2), as pinned."""
+        write_task(self.work, "task-a", "hi")
+        with contextlib.redirect_stderr(io.StringIO()), \
+                mock.patch.object(lc.ClaimStore, "load", side_effect=lc.StateIOError("cannot read claim.json ([Errno 5])")):
+            self.assertFalse(self.ad.step("task-a.txt", self.seen))
+        self.assertGreater(self.ad.not_before["task-a"], self.ad.clock())
+        self.assertEqual((self.seen, self.fake.calls()), (set(), []))
+        self.ad.not_before.clear()
+        with contextlib.redirect_stderr(io.StringIO()), \
+                mock.patch.object(self.ad.lc, "is_settled", side_effect=lc.LedgerIOError("cannot fsync the ledger")):
+            self.assertFalse(self.ad.step("task-a.txt", self.seen))
+        self.assertEqual((self.seen, self.fake.calls()), (set(), []))
+
     def test_a_claim_past_its_call_is_published_and_a_parked_publication_waits(self):
         write_task(self.work, "task-a", "hi")
         past = {"phase": "published", "task_id": "task-a"}
