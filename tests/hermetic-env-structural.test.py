@@ -17,10 +17,17 @@ must build every environment with tests/_helpers/hermetic_env.py. Refused anywhe
               instead spawn with the helper's env); a mock.patch.dict never counts as isolation
   before-isolation  such code (an import) at module level above that call
   misplaced-isolation  isolate_os_environ() or isolate_then_import() anywhere but a module-level
-              statement preceded only by the docstring, imports, sys.path.insert/append of a path and
-              other such calls. There no patcher of any shape can be live yet, so none can later put
-              the outer environment back; patches below it save an isolated one. Only the isolator's
-              own definition in tests/_helpers may call it elsewhere.
+              statement preceded only by the docstring, imports of the standard library or _helpers.*,
+              sys.path.insert/append of a path and other such calls. A project or third-party import
+              runs code, so it goes below the isolation. At that point the file itself has started no
+              patch, so none of its patches can later put the outer environment back; patches below it
+              save an isolated one. Only the isolator's own definition in tests/_helpers may call it elsewhere.
+  foreign-isolator  an isolator name not bound by `from _helpers.hermetic_env import isolate_os_environ`
+              or `from _helpers.hermetic_gateway import isolate_then_import` (or those modules' attributes):
+              another import, a def or an assignment of that name certifies nothing
+
+Threat model: this gate and the helper catch ACCIDENTAL parent-environment leaks in test code.
+Deliberately adversarial code (monkeypatching the helper module itself, say) is out of scope.
 """
 from __future__ import annotations
 
@@ -28,6 +35,7 @@ import ast
 import re
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -105,13 +113,22 @@ def _over_environ(it, imp: Imports) -> bool:
 
 # A sys.path entry is computed from these alone, so the statement can start nothing.
 PATH_CALLS = {"str", "Path", "resolve", "dirname", "abspath", "join", "fspath"}
+# The one binding of each isolator name that certifies isolation.
+CANONICAL = {"_helpers.hermetic_env": "isolate_os_environ", "_helpers.hermetic_gateway": "isolate_then_import"}
+
+
+def _runs_no_project_code(module: "str | None") -> bool:
+    root = (module or "").split(".")[0]
+    return root == "_helpers" or root in sys.stdlib_module_names
 
 
 def _module_top(stmt, index: int) -> bool:
-    """A statement that may precede a module-top isolation: the docstring, an import, or a path-only
-    sys.path.insert/append."""
-    if isinstance(stmt, (ast.Import, ast.ImportFrom)):
-        return True
+    """A statement that may precede a module-top isolation: the docstring, an import of the standard
+    library or _helpers.*, or a path-only sys.path.insert/append."""
+    if isinstance(stmt, ast.Import):
+        return all(_runs_no_project_code(a.name) for a in stmt.names)
+    if isinstance(stmt, ast.ImportFrom):
+        return stmt.level == 0 and _runs_no_project_code(stmt.module)
     if not isinstance(stmt, ast.Expr) or not isinstance(stmt.value, (ast.Call, ast.Constant)):
         return False
     if isinstance(stmt.value, ast.Constant):
@@ -188,10 +205,42 @@ def violations(source: str, name: str = "<sample>") -> "list[str]":
                 return n
         return None
 
+    canon, modules, foreign = set(), dict(CANONICAL), []
+    for n in ast.walk(tree):
+        if isinstance(n, ast.ImportFrom):
+            for a in n.names:
+                local = a.asname or a.name
+                if n.level == 0 and CANONICAL.get(n.module or "") == a.name:
+                    canon.add(local)
+                elif n.level == 0 and n.module == "_helpers" and f"_helpers.{a.name}" in CANONICAL:
+                    modules[local] = f"_helpers.{a.name}"
+                elif local in ISOLATORS:
+                    foreign.append(n)
+        elif isinstance(n, ast.Import):
+            for a in n.names:
+                if a.name in CANONICAL and a.asname:
+                    modules[a.asname] = a.name
+                elif (a.asname or "") in ISOLATORS:
+                    foreign.append(n)
+        elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and n.name in ISOLATORS:
+            if not (library and name.endswith("hermetic_gateway.py") and n.name == "isolate_then_import"):
+                foreign.append(n)
+        elif isinstance(n, (ast.Name)) and isinstance(n.ctx, ast.Store) and n.id in ISOLATORS:
+            foreign.append(n)
+
+    def isolator_call(c) -> bool:
+        """A call of a canonically bound isolator."""
+        if not isinstance(c, ast.Call):
+            return False
+        f = c.func
+        if isinstance(f, ast.Name):
+            return f.id in canon
+        return (isinstance(f, ast.Attribute) and isinstance(f.value, (ast.Name, ast.Attribute))
+                and CANONICAL.get(modules.get(ast.unparse(f.value), "")) == f.attr)
+
     def isolator_stmt(st) -> bool:
         v = getattr(st, "value", None)
-        return (isinstance(st, (ast.Expr, ast.Assign, ast.AnnAssign)) and isinstance(v, ast.Call)
-                and _name(v.func) in ISOLATORS)
+        return isinstance(st, (ast.Expr, ast.Assign, ast.AnnAssign)) and isolator_call(v)
 
     top = set()
     for i, st in enumerate(tree.body):
@@ -206,7 +255,8 @@ def violations(source: str, name: str = "<sample>") -> "list[str]":
 
     def implementation(n) -> bool:
         fn = enclosing_def(n)
-        return library and isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)) and fn.name in ISOLATORS
+        return (library and isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)) and fn.name in ISOLATORS
+                and fn not in foreign)
 
     def runs_code(n) -> bool:
         return (isinstance(n, ast.Call) and (imp.spawn(n) or _name(n.func) in LOADERS)) or _imports_target(n)
@@ -217,7 +267,7 @@ def violations(source: str, name: str = "<sample>") -> "list[str]":
         if not library:
             return False
         fn = enclosing_def(n)
-        if fn is not None and any(isinstance(c, ast.Call) and _name(c.func) in ISOLATORS and implementation(c)
+        if fn is not None and any(isolator_call(c) and implementation(c)
                                   and c.lineno < n.lineno for c in ast.walk(fn)):
             return True
         env = {k.arg: k.value for k in n.keywords}.get("env") if isinstance(n, ast.Call) and imp.spawn(n) else None
@@ -238,8 +288,11 @@ def violations(source: str, name: str = "<sample>") -> "list[str]":
     elif runs:
         out += [(n.lineno, "before-isolation") for n in runs
                 if enclosing_def(n) is None and n.lineno < module_iso[0]]
-    out += [(n.lineno, "misplaced-isolation") for n in nodes if isinstance(n, ast.Call)
-            and _name(n.func) in ISOLATORS and not isolates(n) and not implementation(n)]
+    out += [(n.lineno, "misplaced-isolation") for n in nodes
+            if isolator_call(n) and not isolates(n) and not implementation(n)]
+    out += [(n.lineno, "foreign-isolator") for n in foreign]
+    out += [(n.lineno, "foreign-isolator") for n in nodes if isinstance(n, ast.Call)
+            and _name(n.func) in ISOLATORS and not isolator_call(n)]
     for n in nodes:
         rule = None
         if _copy_rule(n, imp):
@@ -362,6 +415,29 @@ REFUSED_AT_RUNTIME = {"patch.object", "patch-by-name", "reassigned"}
 MODULE_TOP = "isolate_os_environ()\nmock.patch.dict(os.environ, {'X': '1'}, clear=True).start()\n"
 
 
+# Project modules a test might import before isolating: each defeats an isolation that follows it.
+IMPORTED = {
+    "evil_entry": "import os\nfrom unittest import mock\nP = mock.patch.dict(os.environ, {})\nP.__enter__()\n",
+    "evil_stack": ("import contextlib, os\nfrom unittest import mock\nSTACK = contextlib.ExitStack()\n"
+                   "STACK.enter_context(mock.patch.dict(os.environ, {}))\n"),
+    "evil_helper": "def isolate_os_environ(*args, **kwargs):\n    return None\n",
+    "evil_environ": ("import os\ne = os.environ\n"
+                     "os.environ = os._Environ(dict(e._data), e.encodekey, e.decodekey, e.encodevalue, e.decodevalue)\n"),
+}
+CANON = "from _helpers.hermetic_env import isolate_os_environ\n"
+IMPORTED_CONTROLS = {
+    "imported-entry": "import evil_entry\n" + CANON + "isolate_os_environ()\nevil_entry.P.__exit__(None, None, None)\n",
+    "imported-exitstack": "import evil_stack\n" + CANON + "isolate_os_environ()\nevil_stack.STACK.close()\n",
+    "wrong-source": "from evil_helper import isolate_os_environ\nisolate_os_environ()\n",
+    "distinct-environ": CANON + "import evil_environ\nisolate_os_environ()\n",
+}
+
+
+def imported_probe(body: str, modules: Path) -> str:
+    return (f"import os, sys\nfrom subprocess import run\nsys.path.insert(0, {str(REPO / 'tests')!r})\n"
+            f"sys.path.insert(0, {str(modules)!r})\n" + body + PRINT + 'BRIDGE = "remote_gateway_bridge"\n')
+
+
 def probe(body: str) -> str:
     return PROBE_HEAD + body + "mock.patch.stopall()\n" + PRINT + 'BRIDGE = "remote_gateway_bridge"\n'
 
@@ -381,7 +457,7 @@ class SelfTest(unittest.TestCase):
     def test_isolation_after_the_import_does_not_count(self):
         late = SAMPLE_CLEAN.replace('isolate_os_environ(REMOTE_TASK_TOKEN="t")\n', "") + "isolate_os_environ()\n"
         self.assertIn("misplaced-isolation", " ".join(violations(late)))
-        self.assertIn("before-isolation", " ".join(violations(GATEWAY_IMPORT + "isolate_os_environ()\n")))
+        self.assertIn("misplaced-isolation", " ".join(violations(GATEWAY_IMPORT + CANON + "isolate_os_environ()\n")))
 
     def test_a_bridge_loaded_by_path_or_run_by_code_under_test_needs_isolation(self):
         by_path = ('import importlib.util\nBRIDGE = "src/remote-gateway-bridge.py"\n'
@@ -393,10 +469,10 @@ class SelfTest(unittest.TestCase):
         self.assertIn("unisolated", " ".join(violations(by_name)))
 
     def test_only_a_helper_library_may_rely_on_a_helper_built_env_or_local_isolation(self):
-        ok = ('import subprocess\n# remote_gateway_bridge child\n'
+        ok = ('import subprocess\n# remote_gateway_bridge child\n' + CANON +
               'def start():\n    env = hermetic_env(X="1")\n    subprocess.Popen(["python3"], env=env)\n'
               'def isolate_then_import():\n    isolate_os_environ()\n    from ag2_sparrow import remote_gateway_bridge\n')
-        self.assertEqual(violations(ok, "tests/_helpers/sample.py"), [])
+        self.assertEqual(violations(ok, "tests/_helpers/hermetic_gateway.py"), [])
         self.assertIn("unisolated", " ".join(violations(ok, "tests/sample.test.py")))
 
     def test_scope_is_derived_from_the_modules_that_read_credential_names(self):
@@ -449,7 +525,7 @@ class SelfTest(unittest.TestCase):
                 self.assertIn("unisolated", " ".join(violations(iso + GATEWAY_IMPORT)))
         for iso in ("isolate_os_environ()\n", "ENV = isolate_os_environ()\n"):
             with self.subTest(iso=iso):
-                self.assertEqual(violations(iso + GATEWAY_IMPORT), [])
+                self.assertEqual(violations(CANON + iso + GATEWAY_IMPORT), [])
 
     def test_a_clearing_patch_never_counts_as_isolation(self):
         for iso in (f"{CLEAR}\n", f"P = {CLEAR}\n", f"{CLEAR}.start()\n", f"with {CLEAR}:\n    pass\n",
@@ -472,10 +548,11 @@ class SelfTest(unittest.TestCase):
                      "for _ in ():\n    isolate_os_environ()\n", "class C:\n    isolate_os_environ()\n",
                      "REPO = 1\nisolate_os_environ()\n", 'sys.path.insert(0, open("p").read())\nisolate_os_environ()\n'):
             with self.subTest(body=body):
-                self.assertIn("misplaced-isolation", " ".join(violations("import sys\n" + body + GATEWAY_IMPORT)))
+                self.assertIn("misplaced-isolation", " ".join(violations("import sys\n" + CANON + body + GATEWAY_IMPORT)))
         self.assertEqual(violations(probe(MODULE_TOP)), [])
         top = ('"""Doc."""\nfrom __future__ import annotations\nimport sys\nfrom pathlib import Path\n'
-               "sys.path.insert(0, str(Path(__file__).resolve().parents[2]))\nisolate_os_environ()\n"
+               "sys.path.insert(0, str(Path(__file__).resolve().parents[2]))\n" + CANON +
+               "from _helpers.hermetic_gateway import isolate_then_import\nisolate_os_environ()\n"
                "isolate_then_import()\n" + GATEWAY_IMPORT)
         self.assertEqual(violations(top), [])
 
@@ -489,6 +566,22 @@ class SelfTest(unittest.TestCase):
                 self.assertEqual(refused, name in REFUSED_AT_RUNTIME, got.stderr)
                 self.assertEqual(got.returncode != 0, refused, got.stderr)
                 self.assertEqual(SYNTHETIC in got.stdout, name != "module-top" and not refused, got.stdout)
+
+    def test_an_import_or_a_same_named_helper_before_isolation_is_refused_and_would_leak(self):
+        with tempfile.TemporaryDirectory() as d:
+            for mod, src in IMPORTED.items():
+                (Path(d) / f"{mod}.py").write_text(src)
+            env = hermetic_env(GATEWAY_TOKEN=SYNTHETIC)
+            for name, body in IMPORTED_CONTROLS.items():
+                with self.subTest(name=name):
+                    sample = imported_probe(body, Path(d))
+                    self.assertTrue({"misplaced-isolation", "foreign-isolator"}
+                                    & {v.rsplit(": ", 1)[1] for v in violations(sample)}, violations(sample))
+                    got = subprocess.run([sys.executable, "-c", sample], capture_output=True, text=True,
+                                         env=env, timeout=60)
+                    refused = "os.environ replaced" in got.stderr
+                    self.assertEqual(refused, name == "distinct-environ", got.stderr)
+                    self.assertTrue(refused or SYNTHETIC in got.stdout, (got.stdout, got.stderr))
 
     def test_isolating_under_a_started_environ_patch_fails_and_never_leaks(self):
         env = hermetic_env(GATEWAY_TOKEN=SYNTHETIC)

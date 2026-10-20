@@ -44,6 +44,8 @@ TEST_CONTROL_PREFIX = "SUTANDO_TEST_"
 HERMETIC_USER = "hermetic-test"
 # Read when this helper is imported, so before any isolation: a runtime harness names its private root here.
 _HARNESS_SOCKET = os.environ.get("SUTANDO_RUNTIME_SOCKET")
+# The process environment as this helper first saw it; any other object is a stand-in.
+_ORIGINAL_ENVIRON = os.environ
 _process_home: "str | None" = None
 _coverage_dirs: "dict[str, str]" = {}
 
@@ -144,7 +146,7 @@ def isolate_os_environ(home: "Path | str | None" = None, **extra: str) -> "os._E
 
     For a module that imports the bridge or room_ops at load time, before that import."""
     global _process_home
-    if not isinstance(os.environ, os._Environ):
+    if os.environ is not _ORIGINAL_ENVIRON:
         raise RuntimeError("isolate_os_environ() with os.environ replaced (patch.object, patch('os.environ') or "
                            "reassignment): clearing the stand-in leaves the process environment; isolate first")
     # A patch started after an earlier isolation saved an isolated environment: only an earlier one leaks.
