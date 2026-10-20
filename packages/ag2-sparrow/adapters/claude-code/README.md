@@ -521,7 +521,8 @@ mtime delta.
   progress failure). Its fake CLI is bound to `tests/cli-contract.ts`: each
   scenario there is answered by the fake in the harness and by the real verbs in
   the Python suite, and every step must have the same shape (exit code,
-  refused, retry, the named fields and keys). Covered: `claim` (absent,
+  refused, retry, the named fields and keys). The scenario set is pinned by
+  name (`CONTRACT_NAMES`): each runner fails unless it ran exactly those. Covered: `claim` (absent,
   not admitted, ready or unready result, prepared again, `CALLING`, after an
   unconfirmed turn), `authorize` (twice, unclaimed, another text), `confirm`
   (the authorized turn, a bad nonce), `stage` (another turn, this turn, another

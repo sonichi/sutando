@@ -2826,6 +2826,22 @@ def contract_scenarios() -> list:
     return json.loads(text[text.index("export const CONTRACT = ") + len("export const CONTRACT = "):])
 
 
+def contract_names() -> list:
+    """The pinned scenario set: the names each runner must execute, exactly and in order."""
+    text = CONTRACT_TS.read_text()
+    start = text.index("export const CONTRACT_NAMES = ") + len("export const CONTRACT_NAMES = ")
+    return json.loads(text[start:text.index("export const CONTRACT = ")].rsplit("\n//", 1)[0])
+
+
+def contract_set_problem(ran: list) -> str:
+    """'' when `ran` is exactly the pinned scenario set, else the missing and extra names."""
+    want = contract_names()
+    if ran == want:
+        return ""
+    return "missing %s; extra %s" % ([n for n in want if n not in ran], [n for n in ran if n not in want]) \
+        if set(ran) != set(want) else "order differs"
+
+
 def contract_shape(expect: dict, rc: int, out: dict) -> str:
     """'' when the reply has the expected shape (exit, refused, retry, fields, keys), else what differs."""
     got = {"exit": rc, "refused": "refused" in out, "retry": out.get("retry") is True}
@@ -2912,8 +2928,9 @@ class InboxCli(ConnectBase):
     def test_every_answer_in_the_harness_contract_is_what_the_real_verbs_answer(self):
         """The Mod harness's fake CLI is bound to tests/cli-contract.ts, scenario by scenario; the same
         scenarios run here against the real verbs, so the fake cannot answer what the CLI does not."""
-        diffs = []
+        diffs, ran = [], []
         for sc in contract_scenarios():
+            ran.append(sc["name"])
             # The harness answers envelope from its options; the same choice is recorded in the config here.
             self.configure(**{"off": {"HMAC_KEY_FILE": "", "HMAC_STRICT": ""}, "lenient": {"HMAC_STRICT": "0"},
                               "strict": {"HMAC_STRICT": "1"}}.get(sc.get("hmac"), {}))
@@ -2938,6 +2955,16 @@ class InboxCli(ConnectBase):
                 if want:
                     diffs.append("%s, step %d %s: %s; got %s %s" % (sc["name"], i, argv[0], want, rc, out))
         self.assertEqual(diffs, [])
+        self.assertEqual(contract_set_problem(ran), "", "the pinned scenario set")
+
+    def test_the_contract_set_pin_fails_on_a_dropped_or_an_extra_scenario(self):
+        names = [sc["name"] for sc in contract_scenarios()]
+        self.assertEqual(len(names), 31)
+        self.assertEqual(contract_set_problem(names), "")
+        for i in (0, 17, len(names) - 1):
+            self.assertIn("missing [%r]" % names[i], contract_set_problem(names[:i] + names[i + 1:]), i)
+        self.assertIn("extra ['a new scenario']", contract_set_problem(names + ["a new scenario"]))
+        self.assertEqual(contract_set_problem(names[::-1]), "order differs")
 
     def test_interrupt_answers_a_task_the_stopped_session_cannot_take_once_and_the_refusal_for_a_non_owner(self):
         t = self.task("task-late")

@@ -1,5 +1,39 @@
 // The inbox CLI's answers, scenario by scenario: tests/test_claude_code_adapter.py runs each against the real
 // verbs, and the harness runs each against its fake, so the fake cannot answer what the CLI does not.
+// The scenario set itself, pinned: each runner fails unless it ran exactly these, in this order.
+export const CONTRACT_NAMES = [
+ "claim an absent owner task",
+ "claim a task whose tier is not admitted: answered once",
+ "claim a task with a ready result",
+ "claim a task with an unready result",
+ "claim a prepared task again",
+ "claim a calling task",
+ "claim after an unconfirmed turn",
+ "authorize the same request twice",
+ "authorize an unclaimed task",
+ "authorize another text after the first",
+ "confirm the authorized turn",
+ "stage on another turn, then this turn, then another body",
+ "publish with nothing staged",
+ "park on another turn, then this turn",
+ "interrupt an absent task, then again",
+ "interrupt a task with an unready result",
+ "interrupt a task with a ready result",
+ "mark a task stuck, then clear it",
+ "mark an unconfirmed (calling) task stuck: kept",
+ "mark a task with a ready result stuck: dropped as resolved",
+ "mark a task with an archived result stuck: dropped as resolved",
+ "mark a published task stuck: dropped as resolved",
+ "envelope with no key path (off)",
+ "envelope with the opt-out recorded (lenient)",
+ "interrupt a calling task",
+ "check-inode against another inode",
+ "progress session, intake and generation writes",
+ "park a turn whose answer is staged: the staged answer is published",
+ "strict envelope with the key present: only verified is submitted",
+ "strict envelope with the key file missing: every task held",
+ "strict envelope whose verdict was read with another key: held"
+]
 export const CONTRACT = [
  {
   "name": "claim an absent owner task",

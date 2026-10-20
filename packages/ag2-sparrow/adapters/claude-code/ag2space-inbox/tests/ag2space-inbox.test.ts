@@ -1,5 +1,5 @@
 import { expect, mock, test } from 'claude-code/testing'
-import { CONTRACT } from './cli-contract'
+import { CONTRACT, CONTRACT_NAMES } from './cli-contract'
 
 const WATCH = 'mcp__ag2space-inbox__ag2space_inbox_watch'
 const REPLY = 'mcp__ag2space-inbox__ag2space_reply'
@@ -1693,7 +1693,9 @@ test('the fake CLI answers every contract scenario as the real verbs do', async 
   const o: any = { allowNonOwner: false }
   const h = host(on, o)
   const diffs: string[] = []
+  const ran: string[] = []
   for (const sc of CONTRACT as any[]) {
+    ran.push(sc.name)
     // The Python side records the same choice in the config and puts the key file in the same state.
     o.lenient = sc.hmac === 'lenient'
     o.strict = sc.hmac === 'strict'
@@ -1721,4 +1723,24 @@ test('the fake CLI answers every contract scenario as the real verbs do', async 
     })
   }
   expect(diffs).toEqual([])
+  expect(scenarioSetProblem(ran)).toBe('')                // the pinned scenario set
+})
+
+// '' when `ran` is exactly the pinned scenario set (cli-contract.ts CONTRACT_NAMES), else what differs.
+function scenarioSetProblem(ran: string[]): string {
+  const want = CONTRACT_NAMES as string[]
+  if (JSON.stringify(ran) === JSON.stringify(want)) return ''
+  const missing = want.filter(n => !ran.includes(n)), extra = ran.filter(n => !want.includes(n))
+  return missing.length || extra.length ? `missing ${JSON.stringify(missing)}; extra ${JSON.stringify(extra)}` : 'order differs'
+}
+
+test('the contract set pin fails on a dropped or an extra scenario', async () => {
+  const names = (CONTRACT as any[]).map(sc => sc.name)
+  expect(names.length).toBe(31)
+  expect(scenarioSetProblem(names)).toBe('')
+  for (const i of [0, 17, names.length - 1]) {
+    expect(scenarioSetProblem(names.filter((_, j) => j !== i))).toContain(`missing ${JSON.stringify([names[i]])}`)
+  }
+  expect(scenarioSetProblem([...names, 'a new scenario'])).toContain('extra ["a new scenario"]')
+  expect(scenarioSetProblem([...names].reverse())).toBe('order differs')
 })
