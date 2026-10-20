@@ -1027,6 +1027,24 @@ class StepBranchTest(unittest.TestCase):
         self.assertEqual(len(self.fake.calls()), 1, "called once, after the read recovered")
         self.assertTrue((self.work / "results" / "task-a.txt").exists(), "delivered")
 
+    def test_serve_survives_the_first_claim_read_failing_and_publishes_exactly_one_result(self):
+        """The reviewer's shape, with no guard on who reads: the very first ClaimStore.load() of the task fails
+        once on I/O. serve() stays alive, retries, makes exactly one provider call and publishes one result."""
+        write_task(self.work, "task-a", "hi")
+        real_load, hits = lc.ClaimStore.load, []
+
+        def first_load_fails(store, task_id):
+            if task_id == "task-a" and not hits:
+                hits.append(task_id)
+                raise lc.StateIOError("cannot read claim.json ([Errno 5] I/O error)")
+            return real_load(store, task_id)
+        with mock.patch.object(lc.ClaimStore, "load", first_load_fails):
+            ad, err = run_adapter(self.work, self.fake, once=1)
+        self.assertEqual(hits, ["task-a"])
+        self.assertEqual(len(self.fake.calls()), 1, "exactly one provider call")
+        self.assertEqual([p.name for p in (self.work / "results").iterdir() if p.name.startswith("task-a")],
+                         ["task-a.txt"], "exactly one result")
+
     def test_serve_survives_repeated_io_errors_in_the_loops_own_claim_read_and_delivers_once_it_recovers(self):
         """The loop reads a claim before any step (next_ready -> recovering -> _phase). That read failing on I/O
         three times: serve() keeps running, the task is skipped while parked (no read meanwhile), and once the
