@@ -549,7 +549,8 @@ class ConnectBase(unittest.TestCase):
         v = {"CLAUDE": str(self.claude), "PLUGIN_DIR": str(self.plugin), "INBOX_DIR": str(self.inbox),
              "RESULTS_DIR": str(self.results), "CLAUDE_CONFIG_DIR": str(self.home / ".claude-sutando"),
              "HMAC_KEY_FILE": str(self.home / "task-hmac.key"), "HMAC_STRICT": "", "PERMISSION_MODE": "bypassPermissions",
-             "SESSION_ID": SESSION_ID, "HITL_STORE": str(cli.hitl_store_root()), "ROOT": str(self.work)}
+             "SESSION_ID": SESSION_ID, "HITL_STORE": str(cli.hitl_store_root()), "ROOT": str(self.work),
+             "BRIDGE_STATE_DIR": str(_dirs.state_dir())}
         v.update(over)
         return v
 
@@ -1719,6 +1720,11 @@ class ConnectVerify(ConnectBase):
         self.assertIn(f"INFO session: {self.work} free", self.main("verify")[1])
         self.configure(HITL_STORE="/elsewhere/hitl/requirements")
         self.assertEqual(self.checks(self.main("verify")[1])["hitl"], "FAIL", "the store must be the bridge's")
+        self.configure(BRIDGE_STATE_DIR="", HITL_STORE="/elsewhere/hitl/requirements-claude-local")
+        out = self.main("verify")[1]
+        self.assertNotIn("hitl", self.checks(out), "a config from before the key: no row derived from the store itself")
+        self.assertIn(f"INFO hitl store: /elsewhere/hitl/requirements-claude-local (a config from before BRIDGE_STATE_DIR: "
+                      f"the bridge's state dir is read as its parent; run {cli.COMMAND} install to record it)", out)
         self.configure()
         (self.plugin / ".claude-plugin" / "plugin.json").unlink()
         self.assertEqual(self.checks(self.main("verify")[1])["plugin"], "FAIL")
@@ -3255,8 +3261,9 @@ class InboxCli(ConnectBase):
         if os.geteuid() == 0:
             self.skipTest("root writes an unwritable dir")
         lc = inbox._lifecycle(self.root)
-        t = "task-ro-results"
+        t, p = "task-ro-results", "task-ro-park"
         self.confirmed(t)
+        self.confirmed(p)
         self.assertEqual(self.verb("stage", t, "turn-1", stdin=b"the answer\n")[0], 0)
         self.results.chmod(0)
         self.addCleanup(self.results.chmod, 0o755)
@@ -3269,13 +3276,28 @@ class InboxCli(ConnectBase):
             self.assertEqual(lc.claims.load(t)["phase"], inbox.lifecycle.RESULT_STAGED, "the claim is as it was")
             rc, out = self.verb("park", t, "turn-1", "--detail", "turn completed without a reply")
             self.assertEqual((rc, out.get("retry")), (1, True), "the turn's end gets the same retry")
+            rc, out = self.verb("park", p, "turn-1", "--detail", "turn completed without a reply")
+            self.assertEqual((rc, out.get("retry")), (1, True), "the failure staged, its publication a retry")
+            self.assertEqual(lc.claims.load(p)["phase"], inbox.lifecycle.RESULT_STAGED)
         finally:
             self.results.chmod(0o755)
+        with mock.patch.object(inbox.lifecycle.Lifecycle, "read_final", side_effect=OSError(errno.EIO, "I/O error")):
+            rc, out = self.verb("publish", t)
+        self.assertEqual((rc, out.get("retry")), (1, True), out)
+        self.assertIn("%s: the result landed, its durability unknown (refusing to serve: %s landed, then [Errno 5] I/O error); retried"
+                      % (t, self.results / (t + ".txt")), out["refused"], "after the rename, never 'did not commit'")
+        self.assertEqual((self.results / (t + ".txt")).read_text(), "the answer\n", "visible already")
+        self.assertEqual(lc.claims.load(t)["phase"], inbox.lifecycle.RESULT_STAGED)
         rc, out = self.verb("publish", t)
         self.assertEqual((rc, out["outcome"]), (0, "settled"), out)
         self.assertEqual((self.results / (t + ".txt")).read_text(), "the answer\n", "the staged answer, once")
+        self.assertEqual(lc.claims.load(t)["published"]["won"], True, "settled on the result it found")
         self.assertEqual(self.verb("publish", t)[1]["outcome"], "settled", "idempotent at SETTLED")
         self.assertEqual(lc.publish_and_settle("task-none"), "parked", "the default still parks")
+        rc, out = self.verb("park", p, "turn-1", "--detail", "turn completed without a reply")
+        self.assertEqual((rc, out["outcome"], out["parked"]), (0, "settled", "turn completed without a reply"),
+                         "the identical park names the protocol failure it delivered, never 'the accepted answer'")
+        self.assertIn("ended without a reply (turn completed without a reply)", (self.results / (p + ".txt")).read_text())
 
     def test_a_claim_the_mod_lost_past_its_call_is_finished_or_interrupted_at_once(self):
         """A Mod that lost its offers (a reload inside the generation) claims the task afresh: a descriptor
@@ -3303,6 +3325,49 @@ class InboxCli(ConnectBase):
         rc, out = self.verb("claim", t)
         self.assertEqual((rc, "staged and never published, is published now" in out["refused"]), (1, True), out)
         self.assertEqual((self.results / (t + ".txt")).read_text(), "the accepted answer\n", "the accepted answer, exactly")
+        t = "task-lost-corrupt"
+        self.confirmed(t)
+        self.assertEqual(self.verb("stage", t, "turn-1", stdin=b"the accepted answer\n")[0], 0)
+        rec = lc.claims.load(t)
+        lc.claims.save(dict(rec, phase=inbox.lifecycle.TURN_CONFIRMED))
+        (lc.claims.dir(t) / rec["staged"]["blob"]).write_bytes(b"not those bytes\n")     # a committed blob that does not verify
+        rc, out = self.verb("claim", t)
+        self.assertEqual((rc, "answered as interrupted now" in out["refused"]), (1, True), out)
+        self.assertEqual((self.results / (t + ".txt")).read_text(), inbox.INTERRUPTED_BODY, "never the bytes that do not verify")
+        self.assertEqual(lc.claims.load(t)["outcome"]["detail"], "turn confirmed, the accepted answer's staging was lost "
+                         "(the committed result does not match its descriptor)", "the one decision, recovery's, names it")
+        t = "task-lost-eio"
+        self.confirmed(t)
+        self.assertEqual(self.verb("stage", t, "turn-1", stdin=b"the verified answer\n")[0], 0)
+        lc.claims.save(dict(lc.claims.load(t), phase=inbox.lifecycle.TURN_CONFIRMED))
+        real_commit, hits = inbox.lifecycle.Lifecycle._commit_blob, []
+
+        def temp_write_eio_once(tmp, final, body):
+            # One EIO in _commit_blob's temp write; the final blob verifies throughout.
+            if not hits:
+                hits.append(tmp)
+                raise OSError(errno.EIO, "I/O error")
+            return real_commit(tmp, final, body)
+        with mock.patch.object(inbox.lifecycle.Lifecycle, "_commit_blob", staticmethod(temp_write_eio_once)):
+            rc, out = self.verb("claim", t)
+        self.assertEqual((rc, out.get("retry"), len(hits)), (1, True, 1), out)
+        self.assertIn("could not be closed now", out["refused"])
+        rec = lc.claims.load(t)
+        self.assertEqual((rec["phase"], bool(rec.get("staged"))), (inbox.lifecycle.TURN_CONFIRMED, True),
+                         "one I/O failure while finishing a verifying blob is a retry, never an interrupt")
+        self.assertFalse((self.results / (t + ".txt")).exists())
+        rc, out = self.verb("claim", t)
+        self.assertEqual((rc, "staged and never published, is published now" in out["refused"]), (1, True), out)
+        self.assertEqual((self.results / (t + ".txt")).read_text(), "the verified answer\n", "the accepted answer, nothing interrupted")
+        t = "task-lost-delegated"
+        self.confirmed(t)
+        with mock.patch.object(inbox.lifecycle.os, "link", side_effect=OSError(errno.ENOSPC, "No space left on device")):
+            self.verb("stage", t, "turn-1", stdin=b"accepted text\n")
+        with mock.patch.object(inbox.lifecycle.Lifecycle, "close_turn", return_value="parked") as closed:
+            rc, out = self.verb("claim", t)
+        self.assertEqual((closed.call_count, rc, out.get("retry")), (1, 1, True), "the decision is close_turn's alone")
+        self.assertIn("could not be closed now", out["refused"])
+        self.assertEqual(lc.claims.load(t)["phase"], inbox.lifecycle.TURN_CONFIRMED, "parked: nothing moved")
         t = "task-lost-staged"
         self.confirmed(t)
         self.assertEqual(self.verb("stage", t, "turn-1", stdin=b"staged answer\n")[0], 0)

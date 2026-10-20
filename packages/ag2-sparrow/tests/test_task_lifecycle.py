@@ -2545,8 +2545,11 @@ class LocalClaimTest(Base):
         self.assertEqual(life.publish_and_settle("task-a"), "parked")
         again = self.life(lineage=lambda pid, start: False)
         again.recover(generation=GEN, proof=False)
-        self.assertEqual(again.claims.load("task-a")["phase"], "TURN_CONFIRMED", "a mismatched blob parks in recovery too")
-        self.assertFalse((self.results / "task-a.txt").exists())
+        rec = again.claims.load("task-a")
+        self.assertEqual((rec["phase"], rec["outcome"]["detail"]),
+                         ("SETTLED", "turn confirmed, no result (the committed result does not match its descriptor)"),
+                         "once nobody will stage again, a mismatched blob is answered as interrupted, never kept parked")
+        self.assertEqual((self.results / "task-a.txt").read_bytes(), b"interrupted\n", "and never delivered")
 
     def test_the_existing_final_path_fsyncs_the_directory_before_the_phase_and_parks_while_it_fails(self):
         self.local_dir()
@@ -2767,6 +2770,101 @@ class LocalClaimTest(Base):
         self.task("task-c")
         life.prepare("task-c", "ic\n")
         self.assertEqual(life.interrupt_turn("task-c", "x"), "parked", "a cloud claim is never a local turn")
+
+    def corrupt_blob(self, life, tid):
+        """A committed blob whose bytes no longer match the claim's descriptor, the phase rolled back to
+        TURN_CONFIRMED as if the move's last save never landed."""
+        rec = life.claims.load(tid)
+        life.claims.save(dict(rec, phase=self.lc.TURN_CONFIRMED))
+        (life.claims.dir(tid) / rec["staged"]["blob"]).write_bytes(b"not those bytes\n")
+
+    def test_close_turn_is_the_one_decision_for_a_confirmed_turn_nobody_stages_again(self):
+        """Verifying blob -> finished (published as recorded); no blob, or a committed blob that does not
+        match its descriptor -> interrupted, the detail naming the mismatch, never those bytes; a finish
+        that fails on I/O -> parked, nothing moved; not such a turn -> parked."""
+        self.local_dir()
+        life = self.life()
+        self.confirmed(life, "task-ok")
+        self.assertEqual(life.stage_result("task-ok", b"recorded\n", "turn-1"), "staged")
+        life.claims.save(dict(life.claims.load("task-ok"), phase=self.lc.TURN_CONFIRMED))
+        self.assertEqual(life.close_turn("task-ok", "lost"), "finished")
+        self.assertEqual(life.publish_and_settle("task-ok"), "settled")
+        self.assertEqual((self.results / "task-ok.txt").read_bytes(), b"recorded\n")
+        self.confirmed(life, "task-io")
+        self.assertEqual(life.stage_result("task-io", b"recorded\n", "turn-1"), "staged")
+        life.claims.save(dict(life.claims.load("task-io"), phase=self.lc.TURN_CONFIRMED))
+        before = self.claim_bytes("task-io")
+        with mock.patch.object(self.lc.Lifecycle, "_commit_blob", side_effect=OSError(errno.EIO, "I/O error")):
+            self.assertEqual(life.close_turn("task-io", "lost"), "parked", "a finish that fails on I/O moves nothing")
+        self.assertEqual(self.claim_bytes("task-io"), before)
+        self.assertEqual(life.close_turn("task-io", "lost"), "finished", "and finishes once I/O works")
+        self.confirmed(life, "task-none")
+        with mock.patch.object(self.lc.os, "link", side_effect=OSError(errno.ENOSPC, "No space left on device")):
+            self.assertEqual(life.stage_result("task-none", b"accepted\n", "turn-1"), "parked")
+        self.assertEqual(life.close_turn("task-none", "turn confirmed, no result"), "interrupted")
+        self.assertEqual(life.claims.load("task-none")["outcome"]["detail"], "turn confirmed, no result")
+        self.confirmed(life, "task-bad")
+        self.assertEqual(life.stage_result("task-bad", b"recorded\n", "turn-1"), "staged")
+        self.corrupt_blob(life, "task-bad")
+        self.logs = []
+        self.assertEqual(life.close_turn("task-bad", "turn confirmed, no result"), "interrupted")
+        rec = life.claims.load("task-bad")
+        self.assertEqual((rec["phase"], rec["staged"], rec["outcome"]["detail"]),
+                         (self.lc.RESULT_STAGED, None, "turn confirmed, no result (the committed result does not match its descriptor)"))
+        self.assertIn("a committed result does not match its descriptor; answered as interrupted -> task-bad", self.logs)
+        self.assertEqual(life.publish_and_settle("task-bad"), "settled")
+        self.assertEqual((self.results / "task-bad.txt").read_bytes(), b"interrupted\n", "never the bytes that do not verify")
+        self.assertEqual(life.close_turn("task-bad", "x"), "parked", "SETTLED is not a confirmed turn")
+        self.claimed(life, "task-prep")
+        self.assertEqual(life.close_turn("task-prep", "x"), "parked")
+        self.assertEqual(life.close_turn("task-zz", "x"), "parked", "no claim")
+
+    def test_generation_recovery_answers_a_mismatched_committed_blob_as_interrupted_through_close_turn(self):
+        """The same state through the other caller: a dead generation's TURN_CONFIRMED claim whose committed
+        blob does not verify is answered as interrupted (the detail naming it), never parked with the
+        descriptor kept, and never delivered."""
+        self.local_dir()
+        life = self.life()
+        self.confirmed(life, "task-bad")
+        self.assertEqual(life.stage_result("task-bad", b"recorded\n", "turn-1"), "staged")
+        self.corrupt_blob(life, "task-bad")
+        again = self.life(lineage=lambda pid, start: False)
+        with mock.patch.object(self.lc.Lifecycle, "close_turn", wraps=again.close_turn) as closed:
+            again.recover(generation=GEN, proof=False)
+        self.assertEqual([c.args[:2] for c in closed.call_args_list], [("task-bad", "turn confirmed, no result")],
+                         "recovery takes the one decision")
+        rec = again.claims.load("task-bad")
+        self.assertEqual((rec["phase"], rec["staged"], rec["outcome"]["detail"]),
+                         (self.lc.SETTLED, None, "turn confirmed, no result (the committed result does not match its descriptor)"))
+        self.assertEqual((self.results / "task-bad.txt").read_bytes(), b"interrupted\n")
+        self.assertEqual(sorted(again.settled.ids), ["task-bad"])
+
+    def test_generation_recovery_retries_a_verifying_blob_whose_finish_failed_on_io_never_interrupting(self):
+        """One EIO in _commit_blob's temp write while the final blob verifies: the pass parks the claim as it
+        is (descriptor kept, no result, nothing interrupted); the next pass delivers the accepted answer."""
+        self.local_dir()
+        life = self.life()
+        self.confirmed(life, "task-eio")
+        self.assertEqual(life.stage_result("task-eio", b"the verified answer\n", "turn-1"), "staged")
+        life.claims.save(dict(life.claims.load("task-eio"), phase=self.lc.TURN_CONFIRMED))
+        real_commit, hits = self.lc.Lifecycle._commit_blob, []
+
+        def temp_write_eio_once(tmp, final, body):
+            if not hits:
+                hits.append(tmp)
+                raise OSError(errno.EIO, "I/O error")
+            return real_commit(tmp, final, body)
+        again = self.life(lineage=lambda pid, start: False)
+        before = self.claim_bytes("task-eio")
+        with mock.patch.object(self.lc.Lifecycle, "_commit_blob", staticmethod(temp_write_eio_once)), \
+                mock.patch.object(self.lc.Lifecycle, "close_turn", wraps=again.close_turn) as closed:
+            again.recover(generation=GEN, proof=False)
+        self.assertEqual((closed.call_count, len(hits)), (1, 1), "the decision taken once, the temp write the failure")
+        self.assertEqual(self.claim_bytes("task-eio"), before, "parked: the claim as it was, descriptor kept")
+        self.assertFalse((self.results / "task-eio.txt").exists(), "nothing interrupted, nothing delivered yet")
+        again.recover(generation=GEN, proof=False)
+        self.assertEqual((self.results / "task-eio.txt").read_bytes(), b"the verified answer\n", "the accepted answer, exactly")
+        self.assertEqual(again.claims.load("task-eio")["phase"], self.lc.SETTLED)
 
     def test_legacy_recover_refuses_local_claims_and_the_generation_path_settles_them(self):
         self.local_dir()

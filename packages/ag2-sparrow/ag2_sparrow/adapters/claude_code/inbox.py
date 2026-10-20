@@ -307,11 +307,12 @@ def lost_turn_answered(lc, task_id, generation) -> str:
         return ""
     phase = rec["phase"]
     if phase == lifecycle.TURN_CONFIRMED and rec.get("staged"):
-        if lc.finish_staged(task_id) == "staged":
-            answered = "its accepted answer, staged and never published, is published now"
-        else:
-            lc.interrupt_turn(task_id, "turn confirmed, the accepted answer's staging was lost")
-            answered = "its accepted answer could not be finished; answered as interrupted now"
+        # The lifecycle decides what the recorded descriptor is worth, exactly as recovery lets it.
+        closed = lc.close_turn(task_id, "turn confirmed, the accepted answer's staging was lost")
+        if closed == "parked":
+            raise Parked("%s: the accepted answer could not be closed now; retried" % task_id)
+        answered = "its accepted answer, staged and never published, is published now" if closed == "finished" \
+            else "its accepted answer could not be finished; answered as interrupted now"
     elif phase in (lifecycle.RESULT_STAGED, lifecycle.PUBLISHED):
         answered = "its staged answer is published now"
     else:
@@ -424,7 +425,10 @@ def publish(root, task_id) -> dict:
             # An accepted answer whose blob is not verified yet: only the identical stage retry finishes it.
             raise Parked("%s: the accepted answer's staging has not finished; retried" % task_id)
         # A publication that fails on I/O (an unwritable results dir) is the pre-commit retry, not a soft refusal.
-        outcome = lc.publish_and_settle(task_id, io_raises=True)
+        try:
+            outcome = lc.publish_and_settle(task_id, io_raises=True)
+        except lifecycle.PublishedNotDurable as e:
+            raise Parked("%s: the result landed, its durability unknown (%s); retried" % (task_id, e))
     if outcome != "settled":
         raise Refused("%s: publication %s" % (task_id, outcome))
     return _mirror(root, task_id, None, {"task_id": task_id, "outcome": outcome})
@@ -437,10 +441,11 @@ def park(root, task_id, turn_id, detail) -> dict:
     the protocol failure only when that is what it delivered; nothing is published twice."""
     rec = _lifecycle(root).claims.load(task_id)
     body = (PROTOCOL_FAILURE % detail).encode("utf-8")
-    if rec and rec["phase"] == lifecycle.SETTLED:
-        failure = (rec.get("staged") or {}).get("sha256") == hashlib.sha256(body).hexdigest()
+    if rec and rec.get("staged") and rec["phase"] in (lifecycle.TURN_CONFIRMED, lifecycle.RESULT_STAGED, lifecycle.SETTLED):
+        # `parked` names what the recorded descriptor delivers: this park's failure line, or an accepted answer.
+        failure = rec["staged"].get("sha256") == hashlib.sha256(body).hexdigest()
         return dict(publish(root, task_id), parked=detail if failure else False)
-    if rec and rec.get("staged") and rec["phase"] in (lifecycle.TURN_CONFIRMED, lifecycle.RESULT_STAGED):
+    if rec and rec["phase"] == lifecycle.SETTLED:
         return dict(publish(root, task_id), parked=False)
     staged = stage(root, task_id, turn_id, body)
     out = publish(root, task_id)

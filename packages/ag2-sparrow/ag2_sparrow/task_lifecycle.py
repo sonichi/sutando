@@ -139,6 +139,11 @@ class RenamedNotDurable(OSError):
     """write_durable after its rename: the new contents are in place, their durability unknown."""
 
 
+class PublishedNotDurable(StateIOError):
+    """A publication whose rename landed (the result is visible) but whose directory fsync or read-back
+    failed: a retry that finds the result settles on it; never "did not commit"."""
+
+
 class StateCommitted(StateError):
     """A store write whose rename landed: the state changed, so the step counts as committed."""
 
@@ -1017,6 +1022,23 @@ class Lifecycle:
         self.open_attempts.discard(task_id)
         return "staged"
 
+    def close_turn(self, task_id, detail, now=None):
+        """The one decision for a TURN_CONFIRMED local claim nobody will stage again (a dead generation's,
+        or a live one whose Mod lost it): a descriptor whose blob verifies finishes the move and is the
+        answer (finished); no descriptor, or a blob missing or not matching it, is answered as interrupted
+        (interrupted), never a substituted body; a finish that fails on I/O, or a claim that is not such a
+        turn, is parked. Every outcome but parked leaves the claim RESULT_STAGED for publish_and_settle."""
+        rec = self.claims.load(task_id)
+        if rec is None or rec.get("claim_mode") != LOCAL or rec["phase"] != TURN_CONFIRMED:
+            return "parked"
+        descriptor = rec.get("staged")
+        if descriptor is not None and self._verified(task_id, descriptor) is not None:
+            return "finished" if self.finish_staged(task_id) == "staged" else "parked"
+        if descriptor is not None and self.claims.blob(task_id, descriptor["blob"]) is not None:
+            self.log("a committed result does not match its descriptor; answered as interrupted ->", task_id)
+            detail = "%s (the committed result does not match its descriptor)" % detail
+        return "interrupted" if self.interrupt_turn(task_id, detail, now) == "staged" else "parked"
+
     def publish_and_settle(self, task_id, *, io_raises=False):
         """settled | parked: settled only for a claim this call published and settled, or one already
         SETTLED (the publisher is idempotent there); any phase it cannot advance is parked.
@@ -1031,6 +1053,8 @@ class Lifecycle:
                     published = self._publish(rec)
             except OSError as e:
                 self.log("publication parked ->", task_id, e)
+                if io_raises and isinstance(e, RenamedNotDurable):
+                    raise PublishedNotDurable(str(e))
                 if io_raises:
                     raise _state_io("publish", self.results / ("%s.txt" % task_id), e)
                 return "parked"
@@ -1080,11 +1104,15 @@ class Lifecycle:
             os.unlink(sibling)
             fsync_dir(self.results)
             return {"won": self._holds_body(task_id, body), "state": state, "at": self.clock()}
-        fsync_dir(self.results)
-        seen = self.read_final(final)
+        try:
+            fsync_dir(self.results)
+            seen = self.read_final(final)
+            state = LIVE_READY if seen is not None else self.classify(task_id)
+        except OSError as e:
+            raise RenamedNotDurable("%s landed, then %s" % (final, e))
         if seen is not None and seen != body:
             self.log("the published result differs from the stage ->", task_id)
-        return {"won": True, "state": LIVE_READY if seen is not None else self.classify(task_id), "at": self.clock()}
+        return {"won": True, "state": state, "at": self.clock()}
 
     def recover(self, now=None, *, generation=None, proof=None):
         """Settle what a dead predecessor left: run once, after the lock, before serving. Without a
@@ -1206,14 +1234,8 @@ class Lifecycle:
                                                                       "at": now})
                 rec = self._save(rec, phase=RESULT_STAGED)
             elif phase == TURN_CONFIRMED:
-                descriptor = rec.get("staged")
-                if descriptor is not None and self.claims.blob(task_id, descriptor["blob"]) is not None:
-                    if self._verified(task_id, descriptor) is None:
-                        self.log("a committed result does not match its descriptor; parked ->", task_id)
-                        continue
-                    rec = self._save(rec, phase=RESULT_STAGED)
-                else:
-                    self.interrupt_turn(task_id, "turn confirmed, no result", now)
+                if self.close_turn(task_id, "turn confirmed, no result", now) == "parked":
+                    continue
             elif phase in (OUTCOME_UNKNOWN, RESULT_STAGED):
                 if phase != RESULT_STAGED:
                     rec = self._save(rec, phase=RESULT_STAGED)

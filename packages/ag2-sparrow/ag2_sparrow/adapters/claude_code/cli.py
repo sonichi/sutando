@@ -538,10 +538,15 @@ def verify(_args) -> int:
     print("INFO non-owner tasks: " + ("submitted with the non-owner note (--allow-non-owner)"
                                       if cfg.get(inbox.ALLOW_NON_OWNER) == "1" else "refused (owner only)"))
     root, mode = cm.work_root(cfg), bridge_mode(cfg)
-    want = card.store_root(bridge_state(cfg))
-    cm.check(results, cfg.get("HITL_STORE") == str(want), "hitl store",
-             cfg.get("HITL_STORE") or "none" if cfg.get("HITL_STORE") != str(want)
-             else f"{cfg['HITL_STORE']} (the bridge's, beside its default store under {bridge_state(cfg)})")
+    if cfg.get("BRIDGE_STATE_DIR"):
+        want = card.store_root(bridge_state(cfg))
+        cm.check(results, cfg.get("HITL_STORE") == str(want), "hitl store",
+                 cfg.get("HITL_STORE") or "none" if cfg.get("HITL_STORE") != str(want)
+                 else f"{cfg['HITL_STORE']} (the bridge's, beside its default store under {bridge_state(cfg)})")
+    else:
+        # The store names the bridge's state dir itself here, so no row can check it against anything else.
+        print(f"INFO hitl store: {cfg.get('HITL_STORE')} (a config from before BRIDGE_STATE_DIR: the bridge's state dir "
+              f"is read as its parent; run {COMMAND} install to record it)")
     print(f"INFO agent: {cfg.get('AGENT_ID') or 'not recorded (an explicit root with no known agent id)'}")
     problem = bridge_problem(cfg)
     cm.check(results, not problem, "bridge", problem or f"a connected bridge feeds {root}/tasks and {root}/results")

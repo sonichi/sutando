@@ -98,15 +98,21 @@ by the reply itself, and a reply told to call again; after a retried publish the
 the one delivered, so a reply with a different text is refused and names it), and one after the commit
 answers hard. A publication that fails on I/O (an unwritable results dir) is
 that same pre-commit retry, never a soft refusal: the session is told to call
-again with the same text, and the turn's end retries it too. A park that
+again with the same text, and the turn's end retries it too; one whose rename
+landed but whose directory fsync or read-back failed answers retry naming that
+(the result is visible, its durability unknown), and the next publish settles
+on the result it finds. A park that
 settled but whose reply was lost (the lock's release failed and the claim
 could not be re-read) answers settled on the identical park again, naming the
 protocol failure only when that is what it delivered; nothing is published
 twice. A Mod that lost its offers inside one generation (a plugin reload, not
 a session restart) claims every listed task afresh, and a claim it already
 drove past its call is one it can never finish: at TURN_CONFIRMED with an
-accepted answer, the verifying blob is published, else the claim is answered
-as interrupted at once; at RESULT_STAGED or PUBLISHED the staged answer is
+accepted answer the lifecycle's one decision for such a turn (`close_turn`,
+the same one generation recovery takes) applies: a descriptor whose blob
+verifies is finished and published, a blob missing or not matching its
+descriptor is answered as interrupted at once (the detail says which), never
+a substituted body; at RESULT_STAGED or PUBLISHED the staged answer is
 published; a CALLING claim, or one confirmed with nothing accepted, waits for
 the next generation's recovery as before. When the progress record cannot be written at all, the CLI raises
 an alarm in the adapter's config dir (outside `state/`): `verify` fails its
@@ -290,7 +296,9 @@ derives the HITL store from it. `verify`'s bridge row reads the bridge's
 status there, and the bridge projects this adapter's cards from the store
 beside it, so a bridge on another `AGENT_CONNECT_STATE_DIR` passes the row
 once install names that dir. A config from before the key reads the HITL
-store's parent, as install then derived it.
+store's parent, as install then derived it; `verify` then prints the store as
+an INFO line instead of checking a row against a value derived from itself,
+and names the reinstall that records the dir.
 
 **Process tree.** The service manager (`systemd --user`, or a launchd user
 agent) runs `run`, the launcher; `run` refuses unless
@@ -477,7 +485,9 @@ mtime delta.
   transition in v1.
 - Delivery is **at-most-once** per attempt: an attempt left `CALLING` by a dead
   generation is answered as interrupted, never resent; a turn confirmed with no
-  staged reply is answered as "turn confirmed, no result"; a re-run is the
+  staged reply is answered as "turn confirmed, no result", and one whose
+  committed result does not match its descriptor the same way (the detail
+  says so; the bytes are never delivered); a re-run is the
   asker's to send. Launcher crash plus adoption is no-duplicate.
 - **commit-unknown**: when the store's directory fsync fails after the
   acceptance's replace, the accepted record is visible with durability
