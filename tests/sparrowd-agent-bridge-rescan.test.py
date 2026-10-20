@@ -14,6 +14,7 @@ import io
 import json
 import os
 import shutil
+import signal
 import socket
 import sys
 import tempfile
@@ -33,6 +34,7 @@ for _p in (str(REPO / "src"), str(REPO / "packages" / "ag2-sparrow")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+import sparrow_agent_bridge as bridge  # noqa: E402
 from ag2_sparrow.sparrowd import Supervisor, WorkerSpec, run  # noqa: E402
 from ag2_sparrow.adapters.claude_code import cli  # noqa: E402
 
@@ -206,18 +208,22 @@ class Reconcile(unittest.TestCase):
         self.assertEqual(log.count("worker late: added"), 1, "one worker for the declaration while it existed")
         self.assertEqual(log.count("worker late: removed"), 1, "stopped once it was gone")
 
-    def test_a_failing_rescan_keeps_the_running_workers(self):
+    def test_an_unavailable_rescan_keeps_the_running_workers_and_is_logged_once_per_episode(self):
         td = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, td, ignore_errors=True)
         sock = td / "sparrowd.sock"
         calls = []
+        # two failing passes, one good, two failing, one good: two episodes
+        script = ["fail", "fail", "ok", "fail", "fail", "ok"]
 
         def rescan():
             calls.append(1)
-            raise RuntimeError("vault down")
+            if script and script.pop(0) == "fail":
+                raise RuntimeError("vault down")
+            return [WorkerSpec("w", SLEEPER)]
 
         def stop_when_done():
-            wait_for(lambda: sock.exists() and len(calls) >= 2, 10)
+            wait_for(lambda: sock.exists() and len(calls) >= 7, 10)
             c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             c.connect(str(sock))
             c.sendall(b'{"op": "stop"}\n')
@@ -228,8 +234,58 @@ class Reconcile(unittest.TestCase):
         with contextlib.redirect_stdout(out):
             rc = run([WorkerSpec("w", SLEEPER)], td, rescan=rescan, rescan_s=0.1)
         self.assertEqual(rc, 0)
-        self.assertIn("rescan failed (RuntimeError: vault down)", out.getvalue())
-        self.assertNotIn("worker w: removed", out.getvalue())
+        log = out.getvalue()
+        self.assertEqual(log.count("rescan unavailable (RuntimeError: vault down)"), 2, "once per episode")
+        self.assertEqual(log.count("rescan recovered"), 2)
+        self.assertNotIn("worker w: removed", log)
+        self.assertEqual(log.count("worker w: started"), 1, "never restarted across the episodes")
+
+    def test_a_removed_worker_that_ignores_sigterm_is_reaped_before_shutdown_is_reported(self):
+        """The reviewed scenario: removed on one rescan, sparrowd signalled on the next; the retiring
+        worker must not outlive "all workers stopped". The control run keeps it supervised."""
+        for removed in (True, False):
+            td = Path(tempfile.mkdtemp())
+            self.addCleanup(shutil.rmtree, td, ignore_errors=True)
+            hb = td / "heartbeat"
+            worker = WorkerSpec("stubborn", [sys.executable, "-c", (
+                "import signal, time\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                f"while True:\n open({str(hb)!r}, 'a').write('.')\n time.sleep(0.05)")])
+            passes = [[] if removed else [worker]]
+            seen = []
+
+            def rescan():
+                want = passes.pop(0) if passes else ([] if removed else [worker])
+                seen.append(want)
+                if len(seen) == 2:
+                    os.kill(os.getpid(), signal.SIGTERM)
+                return want
+            wait_for(hb.exists, 5)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = run([worker], td, rescan=rescan, rescan_s=0.3, grace_s=0.5)
+            log = out.getvalue()
+            self.assertEqual(rc, 0)
+            self.assertIn("all workers stopped", log)
+            self.assertEqual("worker stubborn: removed — stopping" in log, removed)
+            pid = int(log.split("worker stubborn: started pid ")[1].split()[0])
+            self.assertFalse(alive(pid), f"removed={removed}: the worker outlived shutdown")
+            size = hb.stat().st_size
+            time.sleep(0.3)
+            self.assertEqual(hb.stat().st_size, size, f"removed={removed}: still writing after shutdown")
+            self.assertIn("SIGKILL", log)
+
+    def test_a_removed_worker_stays_owned_until_it_has_exited(self):
+        sup = Supervisor([WorkerSpec("s", STUBBORN)], remove_grace_s=0.3)
+        sup.start()
+        self.addCleanup(sup.stop, 2)
+        self.assertTrue(wait_for(lambda: pid_of(sup, "s")))
+        pid = pid_of(sup, "s")
+        time.sleep(0.3)
+        sup.sync([])
+        self.assertEqual(sup.status()["draining"], ["s"], "removed, not yet exited: still listed as owned")
+        self.assertTrue(wait_for(lambda: not alive(pid), 5))
+        sup.sync([])
+        self.assertEqual(sup.status()["draining"], [], "exited: released")
 
 
 AGENT = "@probe.agent:ag2.space"
@@ -241,6 +297,90 @@ def load_sparrowd():
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
+
+
+class VaultScan(unittest.TestCase):
+    """The reviewed scenario: the production vault reader on an isolated manifest that becomes a
+    directory (a real IsADirectoryError) through the real scanner into run(): the healthy worker is
+    never stopped, and the count goes 1 -> unavailable -> 1, not 1 -> 0 -> 1."""
+
+    def setUp(self):
+        self.ws = Path(tempfile.mkdtemp()).resolve()
+        self.addCleanup(shutil.rmtree, self.ws, ignore_errors=True)
+        self.sd = load_sparrowd()
+        sys.modules.pop("vault_intercept", None)
+        for patch in (mock.patch.object(self.sd, "resolve_workspace", return_value=self.ws),
+                      mock.patch("workspace_default.resolve_workspace", return_value=self.ws),
+                      mock.patch.object(self.sd, "external_supervisor", return_value=None)):
+            patch.start()
+            self.addCleanup(patch.stop)
+        root = self.ws / "agents" / SEG
+        cfg = {"ROOT": str(root), "BRIDGE": "sparrowd", "AGENT_ID": AGENT, "TOKEN_VAULT_KEY": cli.vault_key(SEG)}
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(cli.wire_bridge(cfg), "")
+        self.manifest = self.ws / "state" / "secret-vault" / "keys.json"
+        self.manifest.parent.mkdir(parents=True)
+        self.manifest.write_text(json.dumps({cli.vault_key(SEG): {"added": "fixture"}}))
+
+    def break_manifest(self):
+        self.manifest.unlink()
+        self.manifest.mkdir()
+
+    def mend_manifest(self):
+        self.manifest.rmdir()
+        self.manifest.write_text(json.dumps({cli.vault_key(SEG): {"added": "fixture"}}))
+
+    def test_a_vault_read_error_is_unavailable_not_empty(self):
+        import vault_intercept
+        scan = self.sd.AgentBridgeScan(self.ws)
+        self.assertEqual([s.name for s in scan()], [cli.worker_name(SEG)])
+        self.break_manifest()
+        with self.assertRaises(IsADirectoryError):
+            vault_intercept.list_vault_keys()
+        with self.assertRaises(bridge.ScanUnavailable) as cm:
+            scan()
+        self.assertIn("vault manifest unreadable (IsADirectoryError", str(cm.exception))
+        self.mend_manifest()
+        self.assertEqual([s.name for s in scan()], [cli.worker_name(SEG)])
+
+    def test_the_running_bridge_survives_the_vault_error_under_run(self):
+        td = self.ws / "state" / "sparrowd"
+        scan = self.sd.AgentBridgeScan(self.ws)
+        counts, passes = [], []
+
+        def rescan():
+            # the production scan decides the names; the fixture stands in for the bridge process
+            passes.append(1)
+            try:
+                want = [WorkerSpec(s.name, SLEEPER) for s in scan()]
+            except bridge.ScanUnavailable:
+                if len(passes) >= 3:  # two unavailable passes, then the manifest is back
+                    self.mend_manifest()
+                raise
+            counts.append(len(want))
+            if len(counts) == 1:
+                self.break_manifest()
+            return want
+
+        def stop_when_done():
+            wait_for(lambda: (td / "sparrowd.sock").exists() and len(counts) >= 2, 10)
+            c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            c.connect(str(td / "sparrowd.sock"))
+            c.sendall(b'{"op": "stop"}\n')
+            c.makefile("r").readline()
+            c.close()
+        threading.Thread(target=stop_when_done, daemon=True).start()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = run([WorkerSpec(cli.worker_name(SEG), SLEEPER)], td, rescan=rescan, rescan_s=0.1)
+        self.assertEqual(rc, 0)
+        log = out.getvalue()
+        self.assertEqual(counts[:2], [1, 1], "the count never reads 0: an unavailable scan is not an empty one")
+        self.assertGreaterEqual(len(passes), 4)
+        self.assertEqual(log.count("rescan unavailable (ScanUnavailable: vault manifest unreadable (IsADirectoryError"), 1)
+        self.assertIn("rescan recovered", log)
+        self.assertNotIn("removed", log)
+        self.assertEqual(log.count("started pid"), 1, "the healthy worker was never terminated")
 
 
 class Launcher(unittest.TestCase):
@@ -312,7 +452,7 @@ class Launcher(unittest.TestCase):
         decl.write_text("{torn")
         with contextlib.redirect_stderr(err):
             rescan()
-        self.assertEqual(err.getvalue().count("unreadable or malformed"), 1, "a new reason is printed")
+        self.assertEqual(err.getvalue().count("malformed (JSONDecodeError)"), 1, "a new reason is printed")
         decl.unlink()
         with contextlib.redirect_stderr(err):
             self.assertEqual(rescan(), [])
@@ -335,6 +475,24 @@ class Launcher(unittest.TestCase):
         with contextlib.redirect_stderr(err):
             rescan()
         self.assertEqual(len(checked), 2, "its live process is now this daemon's own worker: not re-checked")
+
+    def test_a_scan_unavailable_at_start_runs_nothing_yet_and_is_picked_up_on_the_first_good_pass(self):
+        decl = self.declare()
+        broken = [True]
+
+        def keys():
+            if broken[0]:
+                raise OSError("manifest locked")
+            return [cli.vault_key(SEG)]
+        with mock.patch.dict(sys.modules, {"vault_intercept": types.SimpleNamespace(list_vault_keys=keys)}):
+            specs, _, rescan, _, err = self.main(["--agent-bridges"])
+            self.assertEqual(specs, [])
+            self.assertIn("agent bridges not scanned yet — vault manifest unreadable (OSError: manifest locked)",
+                          err.getvalue())
+            with self.assertRaises(bridge.ScanUnavailable):
+                rescan()
+            broken[0] = False
+            self.assertEqual([s.argv[-1] for s in rescan()], [str(decl)])
 
     def test_full_mode_prints_a_static_workers_skip_reason(self):
         with mock.patch.object(self.sd, "_static_specs", return_value=([], ["loop-x: no interpreter configured"])):

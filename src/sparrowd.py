@@ -98,15 +98,15 @@ AGENT_BRIDGE = _SRC / "sparrow_agent_bridge.py"
 
 def _agent_bridge_specs(workspace=None, vault_keys=None) -> "tuple[list, list[str]]":
     """One worker per agent bridge a claude-local install declared under <workspace>/agents; each skipped
-    declaration is one reason, never run."""
+    declaration is one reason, never run. A vault manifest or agents directory that cannot be read is
+    `sparrow_agent_bridge.ScanUnavailable`: the caller keeps what it runs, nothing is read as absent."""
     import sparrow_agent_bridge as agent_bridge
     if vault_keys is None:
         from vault_intercept import list_vault_keys
         try:
             vault_keys = list_vault_keys()
-        except Exception as exc:  # an unreadable manifest: no key can be shown present
-            vault_keys = []
-            print(f"sparrowd: vault manifest unreadable ({type(exc).__name__})", file=sys.stderr)
+        except Exception as exc:
+            raise agent_bridge.ScanUnavailable(f"vault manifest unreadable ({type(exc).__name__}: {exc})") from exc
     found, skipped = agent_bridge.declarations(workspace or resolve_workspace(), vault_keys)
     specs = []
     for path, decl in found:     # names derive from distinct segments: never two alike
@@ -137,8 +137,12 @@ def _static_specs() -> "tuple[list, list[str]]":
 
 
 def worker_specs() -> list:
+    import sparrow_agent_bridge as agent_bridge
     specs, skipped = _static_specs()
-    agent_specs, agent_skipped = _agent_bridge_specs()
+    try:
+        agent_specs, agent_skipped = _agent_bridge_specs()
+    except agent_bridge.ScanUnavailable as e:
+        agent_specs, agent_skipped = [], [f"agent bridges not scanned: {e}"]
     specs.extend(agent_specs)
     skipped.extend(agent_skipped)
     for why in skipped:
@@ -151,7 +155,8 @@ class AgentBridgeScan:
     appears, not every pass; a declaration another process already runs (its
     marker live outside this daemon) is skipped the same way, so a declaration
     never runs twice. A name this scan already returned is never re-checked:
-    its live process is this daemon's own worker."""
+    its live process is this daemon's own worker. A scan that cannot be made
+    raises `ScanUnavailable` through to the supervisor, which keeps its set."""
 
     def __init__(self, workspace=None):
         self._workspace = workspace
@@ -218,9 +223,15 @@ def main(argv=None) -> int:
                   f"supervisor (e.g. the app's gateway-keepalive) first.",
                   file=sys.stderr)
             return 2
+    import sparrow_agent_bridge as agent_bridge
     scan = AgentBridgeScan()
+    try:
+        agents = scan()
+    except agent_bridge.ScanUnavailable as e:  # picked up on the first pass that can be made
+        print(f"sparrowd: agent bridges not scanned yet — {e}", file=sys.stderr)
+        agents = []
     state_dir = resolve_workspace() / "state" / "sparrowd"
-    return run(static + scan(), state_dir, rescan=lambda: static + scan(), rescan_s=args.rescan_s)
+    return run(static + agents, state_dir, rescan=lambda: static + scan(), rescan_s=args.rescan_s)
 
 
 if __name__ == "__main__":  # pragma: no cover

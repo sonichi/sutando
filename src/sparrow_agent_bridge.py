@@ -7,7 +7,9 @@ adapter's own functions, and the file is only checked to agree with it. The work
 key, the token variable and the exact env (three dirs plus `AGENT_MXID`, whose id must map to the same
 segment) are each compared; any difference skips the declaration with one reason line.
 
-`declarations(workspace, vault_keys)` lists the valid ones whose vault key exists. Run as a script with
+`declarations(workspace, vault_keys)` lists the valid ones whose vault key exists; an agents directory or
+declaration that cannot be read is `ScanUnavailable` (nothing is known), never "nothing declared": a
+supervisor keeps what runs until the scan can be made again. Run as a script with
 a declaration path, it re-checks it, builds the bridge's environment (sparrowd's own, minus the host's
 token, identity and owner-DM variables, plus the derived env and the vault token, never on disk),
 injects the agent's dirs and the workspace's task stamper, and runs the package bridge in this process.
@@ -39,6 +41,20 @@ HOST_ONLY = ("AG2_DEVICE_ENV", "REMOTE_TASK_TOKEN_FILE", TOKEN_ENV, "AGENT_MXID"
              "AGENT_CONNECT_STATE_DIR")
 
 
+class ScanUnavailable(Exception):
+    """The declarations (or what they need) could not be read: not an empty set, an unknown one."""
+
+
+def _stat(path: Path):
+    """The stat, None when absent; any other failure to look is ScanUnavailable."""
+    try:
+        return os.stat(path)
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        raise ScanUnavailable(f"{path}: unreadable ({type(e).__name__})") from e
+
+
 def _resolved(env: dict) -> dict:
     return {k: str(Path(v).resolve()) if k.startswith("AGENT_CONNECT_") else v for k, v in env.items()}
 
@@ -53,9 +69,13 @@ def load(path: Path, agents: Path) -> "tuple[dict | None, str]":
         return None, f"{path}: not a declaration directly under {agents}"
     segment = home.name[:-len(SUFFIX)]
     try:
-        decl = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as e:
-        return None, f"{path}: unreadable or malformed ({type(e).__name__})"
+        text = path.read_text(encoding="utf-8")
+    except OSError as e:
+        raise ScanUnavailable(f"{path}: unreadable ({type(e).__name__})") from e
+    try:
+        decl = json.loads(text)
+    except ValueError as e:
+        return None, f"{path}: malformed ({type(e).__name__})"
     if not isinstance(decl, dict) or decl.get("written_by") != WRITTEN_BY:
         return None, f"{path}: not written by {WRITTEN_BY}"
     env = decl.get("env")
@@ -95,10 +115,21 @@ def bridge_environ(decl: dict, token: str, base=None) -> dict:
 
 
 def declarations(workspace: Path, vault_keys) -> "tuple[list, list]":
-    """([(path, declaration)], [reason]) for the agent bridges under `workspace`."""
+    """([(path, declaration)], [reason]) for the agent bridges under `workspace`. An absent agents
+    directory declares nothing; one that cannot be listed, or a declaration that cannot be read, raises
+    ScanUnavailable."""
     agents, found, skipped = Path(workspace) / "agents", [], []
     names = set(vault_keys)
-    for path in sorted(agents.glob("*.bridge/worker.json")):
+    try:
+        homes = sorted(p for p in agents.iterdir() if p.name.endswith(SUFFIX))
+    except FileNotFoundError:
+        return [], []
+    except OSError as e:
+        raise ScanUnavailable(f"{agents}: unreadable ({type(e).__name__})") from e
+    for home in homes:
+        path = home / adapter.DECLARATION
+        if _stat(path) is None:
+            continue
         decl, why = load(path, agents)
         if decl is not None and decl["token_vault_key"] not in names:
             decl, why = None, f"{path}: the vault has no {decl['token_vault_key']}; vault set it to the agent's relay token"
@@ -117,7 +148,10 @@ def main(argv=None, workspace=None, get_key=None, run=runpy.run_module) -> int:
     if workspace is None:
         from workspace_default import resolve_workspace
         workspace = resolve_workspace()
-    decl, why = load(Path(args[0]), Path(workspace) / "agents")
+    try:
+        decl, why = load(Path(args[0]), Path(workspace) / "agents")
+    except ScanUnavailable as e:
+        decl, why = None, str(e)
     if decl is None:
         print(f"sparrow-agent-bridge: not starting: {why}", file=sys.stderr)
         return 2

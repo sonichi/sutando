@@ -86,7 +86,7 @@ class Specs(Base):
         key = cli.vault_key(SEG)
         good = decl.read_text()
         cases = [
-            (lambda: decl.write_text("{torn"), "unreadable or malformed"),
+            (lambda: decl.write_text("{torn"), "malformed"),
             (lambda: self.edit(decl, written_by="someone"), "not written by"),
             (lambda: self.edit(decl, name="../etc"), "name '../etc' is not the derived"),
             (lambda: self.edit(decl, name="bridge-other-0000"), "name 'bridge-other-0000' is not the derived"),
@@ -201,18 +201,57 @@ class Specs(Base):
             self.assertIn(str(cli.bridge_home(self.ws / "agents" / SEG) / cli.DECLARATION), seen)
             self.assertEqual(run.call_args[0][1], self.ws / "state" / "sparrowd")
 
-    def test_an_unreadable_vault_manifest_shows_no_key_present(self):
+    def test_an_unreadable_vault_manifest_is_a_scan_that_could_not_be_made(self):
+        """Not "no key present": a supervisor fed an empty set would stop every agent bridge."""
         self.declare()
 
         def broken():
             raise ValueError("manifest")
-        err = io.StringIO()
-        with mock.patch.dict(sys.modules, {"vault_intercept": types.SimpleNamespace(list_vault_keys=broken)}), \
-                contextlib.redirect_stderr(err):
-            specs, skipped = self.sd._agent_bridge_specs(self.ws)
-        self.assertEqual(specs, [])
-        self.assertIn("vault manifest unreadable", err.getvalue())
-        self.assertIn("the vault has no", skipped[0])
+        fake = types.SimpleNamespace(list_vault_keys=broken)
+        with mock.patch.dict(sys.modules, {"vault_intercept": fake}):
+            with self.assertRaises(bridge.ScanUnavailable) as cm:
+                self.sd._agent_bridge_specs(self.ws)
+            self.assertIn("vault manifest unreadable (ValueError: manifest)", str(cm.exception))
+            err = io.StringIO()
+            with mock.patch.object(self.sd, "resolve_workspace", return_value=self.ws), contextlib.redirect_stderr(err):
+                names = [s.name for s in self.sd.worker_specs()]
+        self.assertEqual(names, ["remote-gateway-bridge"], "the static workers still run")
+        self.assertIn("not supervised — agent bridges not scanned: vault manifest unreadable", err.getvalue())
+
+    def test_an_absent_agents_dir_declares_nothing_but_an_unreadable_one_is_unavailable(self):
+        self.assertEqual(bridge.declarations(self.ws, []), ([], []), "absent: nothing declared")
+        decl = self.declare()
+        key = cli.vault_key(SEG)
+        self.assertEqual(len(bridge.declarations(self.ws, [key])[0]), 1)
+        agents = self.ws / "agents"
+        if os.geteuid() == 0:
+            self.skipTest("root reads any directory")
+        for target in (agents, decl.parent, decl):
+            mode = target.stat().st_mode
+            os.chmod(target, 0)
+            try:
+                with self.assertRaises(bridge.ScanUnavailable) as cm:
+                    bridge.declarations(self.ws, [key])
+                # a home that cannot be entered fails at the declaration's own stat
+                named = decl if target == decl.parent else target
+                self.assertIn(f"{named}: unreadable (PermissionError)", str(cm.exception))
+                with self.assertRaises(bridge.ScanUnavailable):
+                    self.sd._agent_bridge_specs(self.ws, vault_keys=[key])
+            finally:
+                os.chmod(target, mode)
+        self.assertEqual(len(bridge.declarations(self.ws, [key])[0]), 1, "readable again: served again")
+        (agents / "stray.bridge").mkdir()
+        self.assertEqual(len(bridge.declarations(self.ws, [key])[0]), 1, "a home without a declaration is not one")
+        decl.write_text("{torn")
+        found, skipped = bridge.declarations(self.ws, [key])
+        self.assertEqual(found, [])
+        self.assertIn("malformed (JSONDecodeError)", skipped[0], "a malformed one is a skip, not an unavailable scan")
+        os.chmod(decl, 0)
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(bridge.main([str(decl)], workspace=self.ws, get_key=mock.Mock(), run=mock.Mock()), 2)
+        finally:
+            os.chmod(decl, 0o644)
 
 
 class Wrapper(Base):
