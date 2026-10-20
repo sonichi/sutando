@@ -144,30 +144,47 @@ class Committed(Exception):
         self.data = dict(data or {})
 
 
-# What a hard reply carries, per verb, from the re-read claim: only what that claim proves.
+def _token_for(rec, attempt, text_hash):
+    """The stored one-use token, only for the request it was issued to (same attempt and text hash)."""
+    call = (rec or {}).get("call") or {}
+    if rec and rec["phase"] == lifecycle.CALLING and rec["attempt"] == attempt and call.get("nonce") \
+            and call.get("text_hash") == text_hash:
+        return call["nonce"]
+    return None
+
+
+# What a hard reply carries, per verb, from the re-read claim: only what that claim proves for this request.
 COMMITTED_FIELDS = {
-    "claim": lambda rec: {"attempt": rec["attempt"]} if rec["phase"] == lifecycle.PREPARED else {},
-    "authorize": lambda rec: {"token": (rec.get("call") or {}).get("nonce"), "attempt": rec["attempt"]}
-    if rec["phase"] == lifecycle.CALLING and (rec.get("call") or {}).get("nonce") else {},
-    "confirm": lambda rec: {"turn_id": rec.get("turn_id")} if rec["phase"] == lifecycle.TURN_CONFIRMED else {},
-    "stage": lambda rec: {"outcome": "staged"} if rec["phase"] == lifecycle.RESULT_STAGED else {},
-    "publish": lambda rec: {"outcome": "settled"} if rec["phase"] == lifecycle.SETTLED else {},
+    "claim": lambda rec, req: {"attempt": rec["attempt"]} if rec["phase"] == lifecycle.PREPARED else {},
+    "authorize": lambda rec, req: {"token": _token_for(rec, req["attempt"], req["text_hash"]), "attempt": rec["attempt"]}
+    if _token_for(rec, req["attempt"], req["text_hash"]) else {},
+    "confirm": lambda rec, req: {"turn_id": rec.get("turn_id")} if rec["phase"] == lifecycle.TURN_CONFIRMED else {},
+    "stage": lambda rec, req: {"outcome": "staged"} if rec["phase"] == lifecycle.RESULT_STAGED else {},
+    "publish": lambda rec, req: {"outcome": "settled"} if rec["phase"] == lifecycle.SETTLED else {},
 }
 
 
-def _committed(lc, task_id, verb) -> dict:
-    """The hard reply's data, from the claim re-read now: its phase always, the verb's fields when proven."""
+def _committed(lc, task_id, verb, request=None) -> "dict | None":
+    """The hard reply's data, from the claim re-read now: its phase always, the verb's fields when proven;
+    None when it cannot be re-read, so the caller answers retry and the next call reconciles."""
     try:
         rec = lc.claims.load(task_id)
-    except Exception as e:
-        return {"task_id": task_id, "phase": "unreadable (%s)" % type(e).__name__}
+    except Exception:
+        return None
     if not rec:
         return {"task_id": task_id, "phase": "absent"}
-    return dict(COMMITTED_FIELDS.get(verb, lambda r: {})(rec), task_id=task_id, phase=rec["phase"])
+    return dict(COMMITTED_FIELDS.get(verb, lambda r, q: {})(rec, request or {}), task_id=task_id, phase=rec["phase"])
+
+
+def _committed_reply(lc, task_id, verb, request, message):
+    data = _committed(lc, task_id, verb, request)
+    if data is None:
+        return Parked("%s; the claim could not be re-read; retried" % message)
+    return Committed(message, data)
 
 
 @contextmanager
-def _claims_step(root, lc, task_id, verb):
+def _claims_step(root, lc, task_id, verb, request=None):
     """claims.lock around one lifecycle step: anything raised before the commit point is a retry (unless
     a decision); from it on (a rename that landed, only the release left) hard, as `_committed` reads it."""
     done = False
@@ -176,14 +193,14 @@ def _claims_step(root, lc, task_id, verb):
             try:
                 yield
             except lifecycle.StateCommitted as e:
-                raise Committed("the step's write landed, then failed (%s)" % e, _committed(lc, task_id, verb))
+                raise _committed_reply(lc, task_id, verb, request, "the step's write landed, then failed (%s)" % e)
             done = True
-    except (Committed,) + DECISIONS:
+    except (Committed, Parked) + DECISIONS:
         raise
     except Exception as e:
         if done:
-            raise Committed("the step committed, then %s: %s" % (type(e).__name__, getattr(e, "strerror", None) or e),
-                            _committed(lc, task_id, verb))
+            raise _committed_reply(lc, task_id, verb, request, "the step committed, then %s: %s" % (
+                type(e).__name__, getattr(e, "strerror", None) or e))
         if isinstance(e, lifecycle.StateError) and not isinstance(e, lifecycle.StateIOError):
             raise
         raise Parked("the step did not commit (%s: %s); retried" % (type(e).__name__, getattr(e, "strerror", None) or e))
@@ -317,9 +334,20 @@ def interrupt(root, task_id, detail) -> dict:
 
 
 def authorize(root, task_id, attempt, hash_) -> dict:
+    """The one-use token for this attempt and text: issued once, and the same one again to the same request
+    (a lost reply), never to another text."""
     lc = _lifecycle(root)
-    with _claims_step(root, lc, task_id, "authorize"):
-        token = lc.authorize_call(task_id, int(attempt), text_hash=hash_)
+    request = {"attempt": int(attempt), "text_hash": hash_}
+    try:
+        with _claims_step(root, lc, task_id, "authorize", request):
+            token = lc.authorize_call(task_id, int(attempt), text_hash=hash_) or \
+                _token_for(lc.claims.load(task_id), int(attempt), hash_)
+    except Committed as e:
+        if e.data.get("token"):
+            raise
+        if e.data.get("phase") == lifecycle.PREPARED:
+            raise Parked("%s attempt %s: not authorized yet (%s); retried" % (task_id, attempt, e))
+        raise Refused("%s attempt %s: no submit authorization for this text (%s)" % (task_id, attempt, e.data.get("phase")))
     if token is None:
         raise Refused("%s attempt %s is not PREPARED: no submit authorization" % (task_id, attempt))
     return _mirror(root, task_id, lifecycle.CALLING, {"task_id": task_id, "token": token}, {"attempt": int(attempt)})
@@ -331,7 +359,11 @@ def confirm(root, task_id, turn_id, nonce, hash_) -> dict:
         try:
             lc.confirm_turn(task_id, turn_id, nonce, hash_)
         except lifecycle.TurnRefused as e:
-            raise Refused(str(e))
+            rec = lc.claims.load(task_id)
+            same = rec and rec["phase"] == lifecycle.TURN_CONFIRMED and rec.get("turn_id") == turn_id and \
+                (rec.get("call") or {}).get("nonce") == nonce
+            if not same:        # the same confirmation again (a lost reply) is its own answer
+                raise Refused(str(e))
     return _mirror(root, task_id, lifecycle.TURN_CONFIRMED, {"task_id": task_id, "turn_id": turn_id}, {"turn_id": turn_id})
 
 

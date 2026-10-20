@@ -25,7 +25,7 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
                                unstuckFails?: number; clearFails?: Record<string, string>; stuckWriteFails?: number;
                                lockFailsOnce?: string[]; storeFailsOnce?: string[]; unreadableOnce?: string[];
                                committedHardOnce?: string[]; committedHardWhy?: string; stageLandsOnce?: boolean;
-                               parkRefusedOnce?: boolean } = {}) {
+                               parkRefusedOnce?: boolean; authorizeLostOnce?: boolean } = {}) {
   const files: Record<string, string> = {}
   const submitted: string[] = []
   const runs: string[][] = []
@@ -52,6 +52,7 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
   const committedHard = new Set(opts.committedHardOnce ?? [])
   let stageLands = opts.stageLandsOnce ?? false
   let parkRefused = opts.parkRefusedOnce ?? false
+  let authorizeLost = opts.authorizeLostOnce ?? false
   let publishes = 0
   const committedHardWhy = opts.committedHardWhy ?? 'OSError: unlock I/O error'
   const clearFailsLeft: Record<string, string> = { ...(opts.clearFails ?? {}) }
@@ -162,8 +163,15 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
     }
     const c = claims[task]
     if (verb === 'authorize') {
+      const reqHash = argv[argv.indexOf('--text-hash') + 1]
+      // As the CLI: the same request again gets the same token back; any other text gets none.
+      if (c && c.phase === 'CALLING' && c.attempt === Number(argv[4]) && c.hash === reqHash) return answer({ task_id: task, token: c.token })
       if (!c || c.phase !== 'PREPARED' || c.attempt !== Number(argv[4])) return out(1, { refused: 'not PREPARED' })
-      c.phase = 'CALLING'; c.token = 'tok-' + task; c.hash = argv[argv.indexOf('--text-hash') + 1]
+      c.phase = 'CALLING'; c.token = 'tok-' + task; c.hash = reqHash
+      if (authorizeLost) {
+        authorizeLost = false   // committed, then the claim could not be re-read: a retry, never hard without a token
+        return out(1, { refused: 'the step committed, then OSError; the claim could not be re-read; retried', retry: true })
+      }
       return answer({ task_id: task, token: c.token })
     }
     if (verb === 'confirm') {
@@ -997,6 +1005,21 @@ test('a refused park keeps the task: not marked answered, retried by the next ti
   await h.clock.advance(1000)                                        // the tick retries the park
   expect(h.files['/out/task-pr.txt']).toContain('without a reply')
   expect(h.publishes()).toBe(1)
+})
+
+test('an authorize committed but not re-readable is asked again with the same text: the stored token, one submission', async ($, on) => {
+  const h = host(on, { authorizeLostOnce: true })
+  h.files['/in/task-al.txt'] = TASK('task-al')
+  await arm($, h)
+  await h.clock.advance(5000)
+  expect(h.submitted.length).toBe(1)
+  const asks = h.runs.filter((a: string[]) => a[2] === 'authorize' && a[3] === 'task-al')
+  expect(asks.length).toBe(2)
+  expect(asks[0]).toEqual(asks[1])                              // the same attempt and text hash, asked again
+  expect(verbs(h).filter((v: string) => v === 'claim').length).toBe(1)   // never claimed twice
+  await $.turn.start({ text: h.submitted[0], turnId: 't-al' })
+  await $.tool.call({ tool: REPLY, task_id: 'task-al', text: 'once' })
+  expect(h.files['/out/task-al.txt']).toBe('once\n')
 })
 
 test('thirty failed unstuck writes never age a retained task out: the next one lands (stopped-intake path)', async ($, on) => {

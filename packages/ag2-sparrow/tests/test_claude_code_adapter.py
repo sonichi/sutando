@@ -2859,6 +2859,72 @@ class InboxCli(ConnectBase):
         token = self.verb("authorize", t, str(attempt), "--text-hash", "h1")[1]["token"]
         self.assertEqual(self.verb("confirm", t, "turn-1", token, "--text-hash", "h1")[0], 0)
 
+    def test_a_token_is_bound_to_its_request_and_a_lost_reply_is_reconcilable(self):
+        """Authorize A commits and the lock release fails; authorize B (another text) gets no token; authorize
+        A again gets the stored one; a committed step whose claim cannot be re-read is a retry, not hard."""
+        lc = inbox._lifecycle(self.root)
+        real = records.flocked
+
+        @contextlib.contextmanager
+        def release_fails(path, blocking=True):
+            with real(path, blocking) as fd:
+                yield fd
+            if Path(path).name == records.CLAIMS_LOCK:
+                raise OSError(errno.EIO, "unlock I/O error")
+        t = self.task("task-bind")
+        attempt = str(self.verb("claim", t)[1]["attempt"])
+        with mock.patch.object(records, "flocked", release_fails):
+            rc, out = self.verb("authorize", t, attempt, "--text-hash", "hA")
+            self.assertEqual((rc, out.get("token")), (3, lc.claims.load(t)["call"]["nonce"]))
+            rc, out = self.verb("authorize", t, attempt, "--text-hash", "hB")
+            self.assertEqual((rc, "token" in out, "retry" in out), (1, False, False), "another text: refused, no token")
+        rc, out = self.verb("authorize", t, attempt, "--text-hash", "hB")
+        self.assertEqual((rc, "token" in out), (1, False))
+        rc, out = self.verb("authorize", t, attempt, "--text-hash", "hA")
+        self.assertEqual((rc, out["token"]), (0, lc.claims.load(t)["call"]["nonce"]), "the same request: the stored token")
+        u = self.task("task-reread")
+        attempt = str(self.verb("claim", u)[1]["attempt"])
+        real_load = inbox.lifecycle.ClaimStore.load
+        calls = []
+
+        def load_fails_after_commit(store, task_id):
+            calls.append(task_id)
+            if task_id == u and store.load_fail_armed:
+                raise inbox.lifecycle.ClaimUnreadable("torn on re-read")
+            return real_load(store, task_id)
+        inbox.lifecycle.ClaimStore.load_fail_armed = False
+
+        @contextlib.contextmanager
+        def release_fails_then_reread_fails(path, blocking=True):
+            with real(path, blocking) as fd:
+                yield fd
+            if Path(path).name == records.CLAIMS_LOCK:
+                inbox.lifecycle.ClaimStore.load_fail_armed = True
+                raise OSError(errno.EIO, "unlock I/O error")
+        try:
+            with mock.patch.object(records, "flocked", release_fails_then_reread_fails), \
+                    mock.patch.object(inbox.lifecycle.ClaimStore, "load", load_fails_after_commit):
+                rc, out = self.verb("authorize", u, attempt, "--text-hash", "hA")
+        finally:
+            del inbox.lifecycle.ClaimStore.load_fail_armed
+        self.assertEqual((rc, out.get("retry"), "hard" in out), (1, True, False), "never hard without a token")
+        self.assertEqual(lc.claims.load(u)["phase"], inbox.lifecycle.CALLING, "the authorization did commit")
+        rc, out = self.verb("authorize", u, attempt, "--text-hash", "hA")
+        self.assertEqual((rc, out["token"]), (0, lc.claims.load(u)["call"]["nonce"]), "reconciled by the next ask")
+        token = out["token"]
+        self.assertEqual(self.verb("confirm", u, "turn-1", token, "--text-hash", "hA")[0], 0)
+        rc, out = self.verb("confirm", u, "turn-1", token, "--text-hash", "hA")
+        self.assertEqual((rc, out["turn_id"]), (0, "turn-1"), "the same confirmation again is its own answer")
+        self.assertEqual(self.verb("confirm", u, "turn-2", token, "--text-hash", "hA")[0], 1, "another turn is refused")
+        with mock.patch.object(records, "flocked", release_fails):
+            rc, out = self.verb("authorize", self.task("task-noprep"), "9", "--text-hash", "h")
+        self.assertEqual((rc, "retry" in out), (1, False), "an absent claim: refused")
+        p = self.task("task-wrong-attempt")
+        self.verb("claim", p)
+        with mock.patch.object(records, "flocked", release_fails):
+            rc, out = self.verb("authorize", p, "9", "--text-hash", "h")
+        self.assertEqual((rc, out.get("retry")), (1, True), "still PREPARED, nothing committed: a retry")
+
     def test_publish_and_park_deliver_the_recorded_answer_of_an_unfinished_stage(self):
         lc = inbox._lifecycle(self.root)
         for verb, t in (("publish", "task-fin-pub"), ("park", "task-fin-park")):
@@ -2935,7 +3001,8 @@ class InboxCli(ConnectBase):
             self.assertEqual(out["token"], rec["call"]["nonce"], "the stored one-use token: go ahead, once")
             self.assertEqual(rec["phase"], inbox.lifecycle.CALLING)
             rc, out = self.verb("authorize", t, str(attempt), "--text-hash", "h1")
-            self.assertEqual(rc, 1, "never a second authorization")
+            self.assertEqual((rc, out["token"]), (0, rec["call"]["nonce"]), "never a second token: the same one again")
+            self.assertEqual(self.verb("authorize", t, str(attempt), "--text-hash", "h2")[0], 1, "none for another text")
         t = "task-auth-fsync"
         token = lc.claims.load(t)["call"]["nonce"]
         self.assertEqual(self.verb("confirm", t, "turn-1", token, "--text-hash", "h1")[0], 0)
@@ -2944,7 +3011,7 @@ class InboxCli(ConnectBase):
         self.assertEqual((rc, out.get("hard"), out.get("phase"), "outcome" in out), (3, True, "TURN_CONFIRMED", False),
                          "a write landed but the claim never reached RESULT_STAGED: never 'staged'")
         with mock.patch.object(inbox.lifecycle.ClaimStore, "load", side_effect=inbox.lifecycle.ClaimUnreadable("torn")):
-            self.assertEqual(inbox._committed(lc, t, "stage")["phase"], "unreadable (ClaimUnreadable)")
+            self.assertIsNone(inbox._committed(lc, t, "stage"), "unreadable: the caller answers retry")
         self.assertEqual(inbox._committed(lc, "task-none", "authorize"), {"task_id": "task-none", "phase": "absent"})
         self.assertEqual(records.progress_alarm_path(cli.config_dir()).parent, cli.config_dir(),
                          "the alarm lives in the config dir, outside state/")
@@ -3027,7 +3094,9 @@ class InboxCli(ConnectBase):
         self.assertEqual((rc, len(token)), (0, 32))
         self.assertEqual(records.load_plugin(self.root)["inflight"][t]["phase"], "CALLING")
         rc, out = self.verb("authorize", t, "1", "--text-hash", "h1")
-        self.assertEqual((rc, "no submit authorization" in out["refused"]), (1, True), "exactly one token per attempt")
+        self.assertEqual((rc, out["token"]), (0, token), "one token per attempt: the same request gets that one again")
+        rc, out = self.verb("authorize", t, "1", "--text-hash", "h2")
+        self.assertEqual((rc, "no submit authorization" in out["refused"]), (1, True), "and another text gets none")
         rc, out = self.verb("confirm", t, "turn-1", "bad", "--text-hash", "h1")
         self.assertEqual((rc, "nonce or text hash" in out["refused"]), (1, True))
         rc, out = self.verb("confirm", t, "turn-1", token, "--text-hash", "h2")
