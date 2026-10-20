@@ -72,10 +72,8 @@ class StartCliPersonalClaudeHookWiringTest(unittest.TestCase):
         # The launcher sources this before the truncation point; without it the
         # fixture aborts under `set -euo pipefail` before the installer call.
         (self.root / "src/agent").mkdir(parents=True, exist_ok=True)
-        shutil.copy2(
-            REPO / "src/agent/restart-guard.sh",
-            self.root / "src/agent/restart-guard.sh",
-        )
+        for name in ("restart-guard.sh", "witness-flags.sh"):
+            shutil.copy2(REPO / "src/agent" / name, self.root / "src/agent" / name)
         shutil.copy2(
             REPO / "src/agent/task-event-handler-lookup.sh",
             self.root / "src/agent/task-event-handler-lookup.sh",

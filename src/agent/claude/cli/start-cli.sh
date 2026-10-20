@@ -11,6 +11,7 @@
 #   bash src/agent/claude/cli/start-cli.sh           # start (or attach if running)
 #   bash src/agent/claude/cli/start-cli.sh --restart # kill existing session then start fresh
 #   ... --restart --visible / --visible               # additionally open a Terminal window attached (macOS)
+#   bash src/agent/claude/cli/start-cli.sh --witness <name> / --witness-stop <name>  # see witness-mode.sh
 #
 # Per Chi's prompt 2026-05-05 ("shall we add core CLI-related commands in
 # sutando app"): extracting the launch command from startup.sh's inline tmux
@@ -28,6 +29,9 @@ case "$0" in
 esac
 REPO="$(cd "$_self_dir/../../../.." && pwd)"
 unset _self_dir
+# shellcheck source=../../witness-flags.sh
+. "$REPO/src/agent/witness-flags.sh"
+witness_flags_exact "$@"
 cd "$REPO"
 # Shared with the codex launcher: one owner for the in-session restart policy.
 . "$REPO/src/agent/restart-guard.sh"
@@ -40,6 +44,20 @@ if [ ! -r "$REPO/src/agent/claude/cli/session-launch.sh" ]; then
 fi
 # shellcheck source=session-launch.sh
 . "$REPO/src/agent/claude/cli/session-launch.sh"
+
+# Witness mode runs before anything touches shared state; see witness-mode.sh.
+WITNESS=""
+for _arg in "$@"; do
+  case "$_arg" in
+    --witness|--witness-stop|--witness-status|--witness-scrubbed)
+      # shellcheck source=witness-mode.sh
+      . "$REPO/src/agent/claude/cli/witness-mode.sh"
+      witness_dispatch "$@"
+      set --
+      break
+      ;;
+  esac
+done
 
 resolve_claude_py
 # shellcheck source=skill-manifest-config.sh
@@ -60,10 +78,18 @@ WATCHER_SESSION="${SESSION}-watcher"
 NOTIFIER_SUPERVISOR="$REPO/src/agent/codex/cli/task-notifier-supervisor.sh"
 NOTIFIER_SCRIPT="$REPO/src/agent/claude/cli/task-notifier.sh"
 SURFACE_ARGS=(--remote-control "Sutando" --chrome)
+# Remote control and Chrome are the owner's surfaces, held by the production core.
+[ -n "$WITNESS" ] && SURFACE_ARGS=()
+# The witness's claude alone gets the vault login; see witness-claude.sh.
+CLAUDE_LAUNCH_PREFIX=()
+[ -n "$WITNESS" ] && CLAUDE_LAUNCH_PREFIX=(/bin/bash "$REPO/src/agent/claude/cli/witness-claude.sh")
 add_skill_claude_plugins
 # `/startup` is the CANONICAL CORE's ceremony: orphan recovery, session crons,
 # a gate any watcher satisfies. One arg — the skill reads it as $ARGUMENTS.
 BOOT_PROMPT="/startup"
+if [ -n "$WITNESS" ]; then
+  BOOT_PROMPT="You are witness core '$WITNESS': a throwaway Sutando core launched from a PR checkout for a live test, beside the production core. Do not run /startup, register crons, or start or re-arm a task watcher yourself, even if asked to: the external task notifier types each task into this pane. Handle each task as CLAUDE.md says, but write files only under this checkout's resolved workspace, and send no messages, posts, PRs or pushes. Reply 'witness ready' now."
+fi
 SESSION_ARGS=()
 if [ -n "${SUTANDO_CLAUDE_RESUME:-}" ]; then
   SESSION_ARGS=(--resume "$SUTANDO_CLAUDE_RESUME")
@@ -433,17 +459,22 @@ ensure_task_notifier() {
 # The heartbeat writer exits once its core pane is gone, so every launch of the core must
 # re-ensure it; cron-runner holds every prompt-backed fire while .alive is missing.
 ensure_core_heartbeat() {
+  local log_args=()
   if [ -z "$PY" ] || [ ! -f "$REPO/src/core_heartbeat.py" ]; then
     echo "  ⚠ core heartbeat not ensured: no runnable Python interpreter; cron-runner fires stay held" >&2
     return 0
   fi
-  "$PY" "$REPO/src/core_heartbeat.py" --ensure > /dev/null 2>&1 \
+  # The beat itself already lands in the witness workspace; its log must too.
+  [ -n "$WITNESS" ] && log_args=(--log "$SUTANDO_WORKSPACE_DIR/logs/core-heartbeat.log")
+  "$PY" "$REPO/src/core_heartbeat.py" --ensure ${log_args[@]+"${log_args[@]}"} > /dev/null 2>&1 \
     || echo "  ⚠ core heartbeat --ensure failed; cron-runner fires stay held until it runs" >&2
 }
 
 # Core-only: a pool worker is never the subject of the Agent Shepherd monitor.
 ensure_core_monitor() {
   local ws mon_out relay_pid_file relay_state
+  # Its relay escalates to the owner's channels and it logs to shared /tmp files.
+  [ -z "$WITNESS" ] || return 0
   ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" || return 0
   [ -n "$ws" ] || return 0
   mon_out="$ws/state/core-supervisor.json"
@@ -606,7 +637,7 @@ fi
 
 # Auto-install tmux via Homebrew if missing. Sutando.app's
 # watcher-auto-restart depends on a tmux-wrapped CLI pane.
-if ! command -v tmux > /dev/null 2>&1 && command -v brew > /dev/null 2>&1; then
+if [ -z "$WITNESS" ] && ! command -v tmux > /dev/null 2>&1 && command -v brew > /dev/null 2>&1; then
   echo "tmux not found — installing via Homebrew (~30s, required for Sutando.app watcher-auto-restart)..."
   brew install tmux 2>&1 | tail -3
 fi
@@ -624,6 +655,8 @@ fi
 
 # Fall back to a bare `exec claude` if tmux is still missing.
 if ! command -v tmux > /dev/null 2>&1; then
+  # A witness exists only on its own tmux server; a bare claude here would be unstoppable.
+  [ -z "$WITNESS" ] || witness_refuse "tmux vanished before launch; clean up with --witness-stop $WITNESS"
   echo "  ⚠ tmux not found — running without tmux wrapper"
   echo "    (Sutando.app's watcher-auto-restart won't work; brew install tmux to enable)"
   [ -n "${SUTANDO_CLAUDE_WORKING_DIR:-}" ] && cd "$SUTANDO_CLAUDE_WORKING_DIR"
@@ -673,14 +706,19 @@ apply_claude_tmux_defaults
 if [ -t 1 ]; then
   ensure_core_monitor   # backgrounded child survives the exec below
   if ! launch_claude_session; then
+    [ -z "$WITNESS" ] || witness_record_partial
     echo "  ⚠ $SESSION did not come up within ~5s of launch — start FAILED." >&2
     [ -n "$RESTART_REQUESTED" ] && log_restart_attempt "FAILED: core did not come up within ~5s"
     exit 1
   fi
+  [ -z "$WITNESS" ] || witness_record_server_core || exit 1
   clear_shutdown_sentinel
   [ -n "$RESTART_REQUESTED" ] && log_restart_attempt "success: core live"
   ensure_task_notifier   # the supervisor needs the core session to exist first
+  [ -z "$WITNESS" ] || witness_record_watcher || exit 1
   ensure_core_heartbeat
+  [ -z "$WITNESS" ] || witness_record_heartbeat || exit 1
+  [ -z "$WITNESS" ] || witness_launch_complete
   exec tmux -S "$TMUX_SOCKET" attach -t "$SESSION"
 else
   # Verify the core actually came up before reporting success. Without this a
@@ -688,17 +726,22 @@ else
   # exits 0 and Sutando.app reports "Core restarted" while nothing is serving —
   # the same false-success class as the --restart kill race above.
   if ! launch_claude_session; then
+    [ -z "$WITNESS" ] || witness_record_partial
     echo "  ⚠ $SESSION did not come up within ~5s of launch — start FAILED." >&2
     [ -n "$RESTART_REQUESTED" ] && log_restart_attempt "FAILED: core did not come up within ~5s"
     exit 1
   fi
+  [ -z "$WITNESS" ] || witness_record_server_core || exit 1
   # Verified live above, so this is the first point at which clearing the
   # intentional-stop gate cannot open intake with nothing serving.
   clear_shutdown_sentinel
   [ -n "$RESTART_REQUESTED" ] && log_restart_attempt "success: core live"
   ensure_core_monitor   # canonical session now exists — start the supervisor monitor
   ensure_task_notifier
+  [ -z "$WITNESS" ] || witness_record_watcher || exit 1
   ensure_core_heartbeat
+  [ -z "$WITNESS" ] || witness_record_heartbeat || exit 1
+  [ -z "$WITNESS" ] || witness_launch_complete
   if [ "$VISIBLE" = 1 ]; then
     open_visible_terminal
     echo "Started $SESSION detached — opened a Terminal window attached to it."
