@@ -115,10 +115,7 @@ def _durable_id_path() -> Path:
 
 def _temp_roots() -> list[Path]:
     """System temp directories, including the defaults a rebuilt environment falls back to."""
-    roots = [Path(tempfile.gettempdir())]
-    roots += [Path(r) for r in ("/tmp", "/var/tmp", "/var/folders", "/private/tmp",
-                                "/private/var/tmp", "/private/var/folders")]
-    return roots
+    return [Path(tempfile.gettempdir())] + [Path(r) for r in ("/tmp", "/var/tmp", "/var/folders")]
 
 
 def ephemeral_identity() -> bool:

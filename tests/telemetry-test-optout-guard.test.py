@@ -105,10 +105,11 @@ with mock.patch.dict(os.environ, {**built, "POSTHOG_API_KEY": "phc_test"}, clear
     mod._KEY = "phc_test"
     check("telemetry.enabled() is False inside hermetic_env()", mod.enabled() is False)
 
-# 4. a child whose environment a test rebuilt from nothing (env={"PATH": ..., "HOME": <temp dir>})
-# inherits no opt-out variable at all; telemetry itself must still refuse to emit there.
 import subprocess  # noqa: E402
 import tempfile  # noqa: E402
+
+# 4. a child whose environment a test rebuilt from nothing (env={"PATH": ..., "HOME": <temp dir>})
+# inherits no opt-out variable at all; telemetry itself must still refuse to emit there.
 
 PROBE = ("import sys; sys.path.insert(0, sys.argv[1]); import telemetry; "
          "telemetry._KEY = 'phc_test'; print(telemetry.enabled())")
