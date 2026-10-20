@@ -96,7 +96,19 @@ and never holds intake for the next one; the
 task is kept, an unconfirmed turn's confirmation is retried by the next tick or
 by the reply itself, and a reply told to call again; after a retried publish the staged answer is
 the one delivered, so a reply with a different text is refused and names it), and one after the commit
-answers hard. When the progress record cannot be written at all, the CLI raises
+answers hard. A publication that fails on I/O (an unwritable results dir) is
+that same pre-commit retry, never a soft refusal: the session is told to call
+again with the same text, and the turn's end retries it too. A park that
+settled but whose reply was lost (the lock's release failed and the claim
+could not be re-read) answers settled on the identical park again, naming the
+protocol failure only when that is what it delivered; nothing is published
+twice. A Mod that lost its offers inside one generation (a plugin reload, not
+a session restart) claims every listed task afresh, and a claim it already
+drove past its call is one it can never finish: at TURN_CONFIRMED with an
+accepted answer, the verifying blob is published, else the claim is answered
+as interrupted at once; at RESULT_STAGED or PUBLISHED the staged answer is
+published; a CALLING claim, or one confirmed with nothing accepted, waits for
+the next generation's recovery as before. When the progress record cannot be written at all, the CLI raises
 an alarm in the adapter's config dir (outside `state/`): `verify` fails its
 `progress` row and the launcher raises the needs-attention card until a durable
 write clears it. A record whose fields have the wrong shape reads as unreadable (hard),
@@ -270,10 +282,15 @@ and writes no bridge. Every root records its agent in the supervisor record on
 the first session; a later install or launch for another agent refuses, naming
 both. `verify` fails its `bridge` row unless a fresh, connected gateway status
 in the bridge's state dir reports exactly `<root>/tasks`, `<root>/results` and
-the recorded agent, and names the fix. The bridge's `AGENT_CONNECT_STATE_DIR`
-must be the state dir install recorded (the parent of the HITL store in the
-config): `verify`'s bridge row reads the bridge's status there, and the bridge
-projects this adapter's cards from the store beside it.
+the recorded agent, and names the fix. Install records the bridge's state dir
+once, as `BRIDGE_STATE_DIR` in the config: the dir beside the root for the
+bridge it wires (the unit or declaration is written from that same value), or
+`--bridge-state-dir` for a bridge you run (default: Sparrow's state dir), and
+derives the HITL store from it. `verify`'s bridge row reads the bridge's
+status there, and the bridge projects this adapter's cards from the store
+beside it, so a bridge on another `AGENT_CONNECT_STATE_DIR` passes the row
+once install names that dir. A config from before the key reads the HITL
+store's parent, as install then derived it.
 
 **Process tree.** The service manager (`systemd --user`, or a launchd user
 agent) runs `run`, the launcher; `run` refuses unless
@@ -467,6 +484,15 @@ mtime delta.
   unknown; the accepter performs no effect and the click is consumed (never a
   chat task); the launcher re-fsyncs and re-saves the identical record before
   the one effect. A replace that never happened leaves the card pending.
+- Survive-and-adopt holds for the launcher's own death, the realistic crash:
+  the tmux server is not its child, so the session runs on and the next
+  launcher adopts it. On macOS the `run --launchd` forwarder is launchd's main
+  pid, and its death (witnessed with `SIGKILL`) is the other case: with
+  `AbandonProcessGroup` false launchd tears the process group down, the inner
+  launcher takes that `SIGTERM` as a manager stop (`/exit`, the session
+  stopped), and the respawn resumes the same conversation by id. Nothing is
+  lost (a settled task stays settled, a mid-turn one is re-driven by the
+  lifecycle's rules), but that is a stop and a resume, not an adoption.
 - `KillMode=process` on Linux: a `systemctl stop` while the launcher is
   already dead leaves the session for `uninstall`'s `/exit` → `kill-session`.
   systemd ordering is asserted from the unit and not witnessed; `verify` says

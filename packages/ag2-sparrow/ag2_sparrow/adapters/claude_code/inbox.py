@@ -247,7 +247,7 @@ def _mirror(root, task_id, phase, out: dict, extra=None, unstuck=False) -> dict:
 
 def claim(root, task_id) -> dict:
     lc = _lifecycle(root)
-    terminal = False
+    terminal, lost = False, ""
     with _claims_step(root, lc, task_id, "claim"):
         generation = _generation(root)
         verdict, state = lc.decide(task_id)
@@ -259,9 +259,17 @@ def claim(root, task_id) -> dict:
             try:
                 attempt = lc.prepare(task_id, INTERRUPTED_BODY, mode=lifecycle.LOCAL, generation=generation)
             except lifecycle.AttemptInProgress as e:
-                raise Refused(str(e))
+                lost = lost_turn_answered(lc, task_id, generation)
+                if not lost:
+                    raise Refused(str(e))
         else:
             terminal = resolved(lc, task_id)[0]
+    if lost:
+        # After claims.lock, as every mirror write; a mirror that fails is the hard answer, the Mod retries.
+        out = _mirror(root, task_id, None, {"task_id": task_id, "phase": lifecycle.SETTLED, "answered": lost}, unstuck=True)
+        if out.get("hard"):
+            return out
+        raise Refused("%s: %s; only ABSENT may be submitted" % (task_id, lost))
     if verdict != "call":
         if not terminal:
             raise Parked("%s is %s, not claimable yet; retried" % (task_id, state))
@@ -286,6 +294,31 @@ def resolved(lc, task_id) -> "tuple[bool, str]":
         return state in lifecycle.TERMINAL, state
     except Exception as e:
         return False, "%s: %s" % (type(e).__name__, e)
+
+
+def lost_turn_answered(lc, task_id, generation) -> str:
+    """A claim of the live `generation` past its call, claimed afresh: a Mod never re-claims a task it still
+    holds, so the text that could finish its stage is gone. An accepted answer is delivered as recorded
+    (its verifying blob, or the staged body), else the claim is answered as interrupted now, not at the
+    next generation. What was answered; '' when it is not such a claim; Parked when its publication did
+    not land, so the next claim retries it. The caller holds claims.lock."""
+    rec = lc.claims.load(task_id)
+    if not rec or rec.get("claim_mode") != lifecycle.LOCAL or rec.get("generation") != generation:
+        return ""
+    phase = rec["phase"]
+    if phase == lifecycle.TURN_CONFIRMED and rec.get("staged"):
+        if lc.finish_staged(task_id) == "staged":
+            answered = "its accepted answer, staged and never published, is published now"
+        else:
+            lc.interrupt_turn(task_id, "turn confirmed, the accepted answer's staging was lost")
+            answered = "its accepted answer could not be finished; answered as interrupted now"
+    elif phase in (lifecycle.RESULT_STAGED, lifecycle.PUBLISHED):
+        answered = "its staged answer is published now"
+    else:
+        return ""
+    if lc.publish_and_settle(task_id, io_raises=True) != "settled":
+        raise Parked("%s: %s, its answer is not published yet; retried" % (task_id, lc.claims.load(task_id)["phase"]))
+    return answered
 
 
 def unresolved_stuck(root, marks) -> dict:
@@ -390,7 +423,8 @@ def publish(root, task_id) -> dict:
                 lc.finish_staged(task_id) != "staged":
             # An accepted answer whose blob is not verified yet: only the identical stage retry finishes it.
             raise Parked("%s: the accepted answer's staging has not finished; retried" % task_id)
-        outcome = lc.publish_and_settle(task_id)
+        # A publication that fails on I/O (an unwritable results dir) is the pre-commit retry, not a soft refusal.
+        outcome = lc.publish_and_settle(task_id, io_raises=True)
     if outcome != "settled":
         raise Refused("%s: publication %s" % (task_id, outcome))
     return _mirror(root, task_id, None, {"task_id": task_id, "outcome": outcome})
@@ -398,11 +432,16 @@ def publish(root, task_id) -> dict:
 
 def park(root, task_id, turn_id, detail) -> dict:
     """A completed or aborted turn with nothing staged: the explicit protocol failure, published once.
-    A turn whose answer was already accepted (its descriptor recorded) publishes that answer instead."""
+    A turn whose answer was already accepted (its descriptor recorded) publishes that answer instead.
+    The identical park again after one that settled but whose reply was lost answers settled, naming
+    the protocol failure only when that is what it delivered; nothing is published twice."""
     rec = _lifecycle(root).claims.load(task_id)
+    body = (PROTOCOL_FAILURE % detail).encode("utf-8")
+    if rec and rec["phase"] == lifecycle.SETTLED:
+        failure = (rec.get("staged") or {}).get("sha256") == hashlib.sha256(body).hexdigest()
+        return dict(publish(root, task_id), parked=detail if failure else False)
     if rec and rec.get("staged") and rec["phase"] in (lifecycle.TURN_CONFIRMED, lifecycle.RESULT_STAGED):
         return dict(publish(root, task_id), parked=False)
-    body = (PROTOCOL_FAILURE % detail).encode("utf-8")
     staged = stage(root, task_id, turn_id, body)
     out = publish(root, task_id)
     out.update({k: v for k, v in staged.items() if k in ("hard", "error")})

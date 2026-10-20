@@ -2732,8 +2732,41 @@ class LocalClaimTest(Base):
         self.assertFalse((self.results / "task-a.txt").exists())
         life.claims.save(rec)
         self.assertEqual(life.stage_result("task-a", b"ok\n", "turn-1"), "staged")
+        with mock.patch.object(life, "_publish", side_effect=OSError(errno.EACCES, "Permission denied")):
+            self.assertEqual(life.publish_and_settle("task-a"), "parked", "an I/O failure parks by default")
+            with self.assertRaises(self.lc.StateIOError) as ctx:
+                life.publish_and_settle("task-a", io_raises=True)
+        self.assertIn("cannot publish %s" % (self.results / "task-a.txt"), str(ctx.exception))
+        self.assertEqual(life.claims.load("task-a")["phase"], self.lc.RESULT_STAGED, "the claim is as it was")
         self.assertEqual(life.publish_and_settle("task-a"), "settled")
         self.assertEqual(life.publish_and_settle("task-a"), "settled", "already SETTLED stays settled")
+        self.assertEqual(life.publish_and_settle("task-a", io_raises=True), "settled", "and raises nothing there")
+
+    def test_interrupt_turn_answers_a_confirmed_local_claim_in_place_of_what_it_recorded(self):
+        """The one move recovery and a live generation's lost claim share: TURN_CONFIRMED -> the interrupted
+        body staged, the descriptor dropped, the detail recorded; any other claim is left as it is."""
+        self.local_dir()
+        life = self.life()
+        self.confirmed(life)
+        with mock.patch.object(self.lc.os, "link", side_effect=OSError(errno.ENOSPC, "No space left on device")):
+            self.assertEqual(life.stage_result("task-a", b"accepted\n", "turn-1"), "parked")
+        self.assertTrue(life.claims.load("task-a").get("staged"), "a descriptor with no blob")
+        self.assertEqual(life.interrupt_turn("task-a", "the accepted answer's staging was lost"), "staged")
+        rec = life.claims.load("task-a")
+        self.assertEqual((rec["phase"], rec["staged"], rec["outcome"]["kind"], rec["outcome"]["detail"]),
+                         (self.lc.RESULT_STAGED, None, "unknown", "the accepted answer's staging was lost"))
+        self.assertEqual(rec["outcome"]["at"], self.clock(), "the clock's now by default")
+        self.assertEqual(life.publish_and_settle("task-a"), "settled")
+        self.assertEqual((self.results / "task-a.txt").read_bytes(), b"interrupted\n", "the interrupted body, nothing else")
+        self.assertEqual(life.interrupt_turn("task-a", "again"), "parked", "SETTLED is not a confirmed turn")
+        self.claimed(life, "task-b")
+        before = self.claim_bytes("task-b")
+        self.assertEqual(life.interrupt_turn("task-b", "x"), "parked", "PREPARED is left alone")
+        self.assertEqual(self.claim_bytes("task-b"), before)
+        self.assertEqual(life.interrupt_turn("task-zz", "x"), "parked", "no claim")
+        self.task("task-c")
+        life.prepare("task-c", "ic\n")
+        self.assertEqual(life.interrupt_turn("task-c", "x"), "parked", "a cloud claim is never a local turn")
 
     def test_legacy_recover_refuses_local_claims_and_the_generation_path_settles_them(self):
         self.local_dir()

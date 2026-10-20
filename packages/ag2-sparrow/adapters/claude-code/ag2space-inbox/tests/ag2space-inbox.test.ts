@@ -48,7 +48,14 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
   const stuck: Record<string, unknown> = { ...(opts.stuckAtStart ?? {}) }
   let unstuckFailsLeft = opts.unstuckFails ?? 0
   let stuckWriteFailsLeft = opts.stuckWriteFails ?? 0
-  const lockFails = new Set(opts.lockFailsOnce ?? [])
+  // A verb named twice fails twice: one failure the reply consumes, one the turn's end then meets.
+  const lockFails = new Map<string, number>()
+  for (const v of opts.lockFailsOnce ?? []) lockFails.set(v, (lockFails.get(v) ?? 0) + 1)
+  const lockFailsNow = (verb: string) => {
+    const n = lockFails.get(verb) ?? 0
+    if (n > 1) lockFails.set(verb, n - 1); else lockFails.delete(verb)
+    return n > 0
+  }
   const storeFails = new Set(opts.storeFailsOnce ?? [])
   const unreadable = new Set(opts.unreadableOnce ?? [])
   const committedHard = new Set(opts.committedHardOnce ?? [])
@@ -112,7 +119,7 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
     const verb = argv[2]
     const task = argv[3]
     // As the CLI's claims-step boundary: an EIO before the step commits is a retry, nothing changed.
-    if (lockFails.delete(verb)) return out(1, { refused: 'the step did not commit ([Errno 5] claims lock I/O error); retried', retry: true })
+    if (lockFailsNow(verb)) return out(1, { refused: 'the step did not commit ([Errno 5] claims lock I/O error); retried', retry: true })
     if (verb === 'authorize' && committedHard.delete('authorize')) {
       // As the CLI: the authorization committed, then the lock's release or the rename's fsync failed.
       const c0 = claims[task]
@@ -1117,7 +1124,8 @@ test('a session change while an accepted answer is still owed delivers that answ
 })
 
 test('a staged answer whose publish fails at the turn\'s end is retried by publish alone, never parked', async ($, on) => {
-  const h = host(on, { lockFailsOnce: ['publish'] })
+  // Two failures: the reply consumes the first, so the turn-end publish itself is the one that fails.
+  const h = host(on, { lockFailsOnce: ['publish', 'publish'] })
   h.files['/in/task-rs.txt'] = TASK('task-rs')
   await arm($, h)
   await h.clock.advance(1000)
@@ -1125,9 +1133,12 @@ test('a staged answer whose publish fails at the turn\'s end is retried by publi
   const r = await $.tool.call({ tool: REPLY, task_id: 'task-rs', text: 'staged answer' })
   expect(String(r.text ?? r.result)).toContain('call ag2space_reply again')
   await $.turn.complete({ turnId: 't-rs', reason: 'completed', text: '' } as any)
+  expect(verbs(h).filter((v: string) => v === 'publish').length).toBe(2)   // the turn's end published, and failed
+  expect(h.files['/out/task-rs.txt']).toBe(undefined)
   for (let i = 0; i < 5; i++) await h.clock.advance(1000)
   expect(h.files['/out/task-rs.txt']).toBe('staged answer\n')
   expect(verbs(h).filter((v: string) => v === 'park')).toEqual([])
+  expect(verbs(h).filter((v: string) => v === 'publish').length).toBe(3)   // the scan's retry delivered it
   expect(h.publishes()).toBe(1)
 })
 

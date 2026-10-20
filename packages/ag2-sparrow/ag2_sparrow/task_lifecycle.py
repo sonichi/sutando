@@ -1002,10 +1002,26 @@ class Lifecycle:
     def read_final(self, final):
         return _read_strict(final)
 
-    def publish_and_settle(self, task_id):
+    def interrupt_turn(self, task_id, detail, now=None):
+        """A TURN_CONFIRMED local claim answered with its interrupted body in place of any result it
+        recorded: what recovery gives a dead generation's, and a live one whose Mod lost the accepted
+        text. staged (RESULT_STAGED, for publish_and_settle) | parked (not such a claim)."""
+        rec = self.claims.load(task_id)
+        if rec is None or rec.get("claim_mode") != LOCAL or rec["phase"] != TURN_CONFIRMED:
+            return "parked"
+        now = self.clock() if now is None else now
+        self.log("turn confirmed, no result; answered as interrupted ->", task_id)
+        self.claims.stage(task_id, rec["interrupted_body"].encode("utf-8"))
+        rec = self._save(rec, phase=OUTCOME_UNKNOWN, staged=None, outcome={"kind": "unknown", "detail": detail, "at": now})
+        self._save(rec, phase=RESULT_STAGED)
+        self.open_attempts.discard(task_id)
+        return "staged"
+
+    def publish_and_settle(self, task_id, *, io_raises=False):
         """settled | parked: settled only for a claim this call published and settled, or one already
         SETTLED (the publisher is idempotent there); any phase it cannot advance is parked.
-        Publication never replaces a result and never repeats a won rename."""
+        Publication never replaces a result and never repeats a won rename. An I/O failure of the
+        publication parks, or with `io_raises` is the StateIOError a retrying caller distinguishes."""
         rec = self.claims.load(task_id)
         if rec is None:
             return "parked"
@@ -1015,6 +1031,8 @@ class Lifecycle:
                     published = self._publish(rec)
             except OSError as e:
                 self.log("publication parked ->", task_id, e)
+                if io_raises:
+                    raise _state_io("publish", self.results / ("%s.txt" % task_id), e)
                 return "parked"
             if published is None:
                 return "parked"
@@ -1195,11 +1213,7 @@ class Lifecycle:
                         continue
                     rec = self._save(rec, phase=RESULT_STAGED)
                 else:
-                    self.log("turn confirmed, no result; answered as interrupted ->", task_id)
-                    self.claims.stage(task_id, rec["interrupted_body"].encode("utf-8"))
-                    rec = self._save(rec, phase=OUTCOME_UNKNOWN, staged=None,
-                                     outcome={"kind": "unknown", "detail": "turn confirmed, no result", "at": now})
-                    rec = self._save(rec, phase=RESULT_STAGED)
+                    self.interrupt_turn(task_id, "turn confirmed, no result", now)
             elif phase in (OUTCOME_UNKNOWN, RESULT_STAGED):
                 if phase != RESULT_STAGED:
                     rec = self._save(rec, phase=RESULT_STAGED)

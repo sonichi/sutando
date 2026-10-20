@@ -1713,7 +1713,8 @@ class ConnectVerify(ConnectBase):
         self.assertNotIn("launcher pid", out)
         self.assertIn("INFO session id: %s" % cli.read_config(cli.config_path())["SESSION_ID"], out)
         self.assertIn(f"INFO attach: {cli.COMMAND} attach", out)
-        self.assertIn("PASS hitl store: %s (the bridge's, beside its default store)" % cli.hitl_store_root(), out)
+        self.assertIn("PASS hitl store: %s (the bridge's, beside its default store under %s)"
+                      % (cli.hitl_store_root(), _dirs.state_dir()), out)
         runner.stop_session()
         self.assertIn(f"INFO session: {self.work} free", self.main("verify")[1])
         self.configure(HITL_STORE="/elsewhere/hitl/requirements")
@@ -2020,6 +2021,50 @@ class ConnectAgentRoot(AgentRootBase):
         self.assertEqual((self.cfg()["BRIDGE"], self.cfg()["AGENT_ID"], self.cfg()["TOKEN_ENV_FILE"]), ("external", AGENT, ""))
         self.assertFalse(cm.service_path(cli.BRIDGE).exists(), "an explicit root's bridge is yours")
         self.assertEqual(cli.bridge_mode({}), "external", "a config from before BRIDGE existed")
+
+    def test_install_records_the_bridges_state_dir_once_and_verify_reads_the_bridge_there(self):
+        """One record, BRIDGE_STATE_DIR: the unit's AGENT_CONNECT_STATE_DIR, verify's bridge row and the HITL
+        store all name it; an explicit root names the bridge you run with --bridge-state-dir, so a bridge on
+        another state dir passes the row and projects from the store beside it."""
+        fake = self.bridged()
+        self.assertEqual(self.install_default(fake)[0], 0)
+        beside = cli.bridge_home(self.root) / "state"
+        self.assertEqual((self.cfg()["BRIDGE_STATE_DIR"], self.cfg()["HITL_STORE"], cli.bridge_state(self.cfg())),
+                         (str(beside), str(card.store_root(beside)), beside))
+        self.assertIn(f'Environment="AGENT_CONNECT_STATE_DIR={beside}"', cm.service_path(cli.BRIDGE).read_text(),
+                      "the unit is written from the recorded dir")
+        rc, _, err = self.install_default(fake, "--bridge-state-dir", str(self.home / "elsewhere"))
+        self.assertEqual(rc, 2)
+        self.assertIn(f"--bridge-state-dir is for a bridge you run (an explicit root); this install's bridge keeps its "
+                      f"state beside the root, {beside}", err)
+        with mock.patch.object(cm, "_run", side_effect=fake):
+            self.assertEqual(self.main("uninstall")[0], 0)
+        other = self.home / "other-bridge" / "state"
+        runner = self.runner()
+        rc, _, err = self.install_with(runner, False, "--work", str(self.work), "--bridge-state-dir", str(other))
+        self.assertEqual(rc, 0, err)
+        self.assertEqual((self.cfg()["BRIDGE"], self.cfg()["BRIDGE_STATE_DIR"], self.cfg()["HITL_STORE"]),
+                         ("external", str(other), str(card.store_root(other))))
+        self.status(other, agent_id=AGENT)
+        with mock.patch.object(cm, "_run", side_effect=runner):
+            rc, out, _ = self.main("verify")
+            checks = ConnectVerify.checks(None, out)
+            self.assertEqual((checks["bridge"], checks["hitl"]), ("PASS", "PASS"), out)
+            self.assertIn(f"PASS hitl store: {card.store_root(other)} (the bridge's, beside its default store under {other})", out)
+            shutil.rmtree(other)
+            out = self.main("verify")[1]
+            self.assertIn(f"FAIL bridge: no bridge wrote a status under {other}", out)
+            self.assertIn(f"AGENT_CONNECT_STATE_DIR={other}", out, "the fix names the recorded dir")
+        runner.stop_session()
+        rc, _, err = self.install_with(self.runner(), False, "--work", str(self.work))
+        self.assertEqual(rc, 0, err)
+        self.assertEqual((self.cfg()["BRIDGE_STATE_DIR"], self.cfg()["HITL_STORE"]),
+                         (str(_dirs.state_dir()), str(cli.hitl_store_root())), "without the flag: Sparrow's state dir")
+        old = {k: v for k, v in self.cfg().items() if k != "BRIDGE_STATE_DIR"}
+        self.assertEqual(cli.bridge_state(old), _dirs.state_dir(), "a config from before the key: the HITL store's")
+        self.assertEqual(cli.bridge_state({"HITL_STORE": str(card.store_root(beside))}), beside)
+        self.assertEqual(cli.bridge_state({"ROOT": str(self.root), "BRIDGE": "sparrowd"}), beside,
+                         "a host supervisor's declaration is written from the dir beside the root, as sparrowd recomputes it")
 
 
 class ConnectHostSupervised(AgentRootBase):
@@ -3164,8 +3209,133 @@ class InboxCli(ConnectBase):
         rc, out = self.verb("park", t, "turn-1", "--detail", "turn aborted without a reply")
         self.assertEqual((rc, out["outcome"], out["parked"]), (0, "settled", "turn aborted without a reply"))
         self.assertIn("ended without a reply (turn aborted without a reply)", (self.results / "task-a.txt").read_text())
+        delivered = (self.results / "task-a.txt").read_bytes()
+        rc, out = self.verb("park", t, "turn-1", "--detail", "turn aborted without a reply")
+        self.assertEqual((rc, out["outcome"], out["parked"]), (0, "settled", "turn aborted without a reply"),
+                         "the identical park again is its own answer: settled, the protocol failure named")
         rc, out = self.verb("park", t, "turn-1")
-        self.assertEqual(rc, 1, "a settled claim parks nothing again")
+        self.assertEqual((rc, out["outcome"], out["parked"]), (0, "settled", False), "another detail: not what was delivered")
+        self.assertEqual((self.results / "task-a.txt").read_bytes(), delivered, "a settled claim parks nothing again")
+        self.assertEqual(self.verb("stage", t, "turn-1", stdin=b"late\n")[0], 1, "and stages nothing")
+
+    def test_a_park_whose_reply_was_lost_after_it_settled_answers_settled_on_the_identical_retry(self):
+        """The compound I/O case: the park's publication settled, the lock's release failed and the claim could
+        not be re-read (retry); the Mod's identical park then answers settled, never 'staging parked', so it
+        retires the offer instead of retaining it until a restart."""
+        t = self.task("task-lost-park")
+        attempt = self.verb("claim", t)[1]["attempt"]
+        token = self.verb("authorize", t, str(attempt), "--text-hash", "h1")[1]["token"]
+        self.assertEqual(self.verb("confirm", t, "turn-1", token, "--text-hash", "h1")[0], 0)
+        real, releases = records.flocked, []
+
+        @contextlib.contextmanager
+        def release_fails(path, blocking=True):
+            with real(path, blocking) as fd:
+                yield fd
+            if Path(path).name == records.CLAIMS_LOCK:
+                releases.append(path)
+                if len(releases) == 2:      # the park's stage released; its publish, SETTLED, cannot
+                    raise OSError(errno.EIO, "unlock I/O error")
+        with mock.patch.object(records, "flocked", release_fails), mock.patch.object(inbox, "_committed", return_value=None):
+            rc, out = self.verb("park", t, "turn-1", "--detail", "turn completed without a reply")
+        self.assertEqual((rc, out.get("retry"), len(releases)), (1, True, 2), out)
+        self.assertIn("could not be re-read", out["refused"])
+        self.assertEqual(inbox._lifecycle(self.root).claims.load(t)["phase"], inbox.lifecycle.SETTLED)
+        delivered = (self.results / (t + ".txt")).read_bytes()
+        self.assertIn(b"ended without a reply (turn completed without a reply)", delivered, "the result exists")
+        rc, out = self.verb("park", t, "turn-1", "--detail", "turn completed without a reply")
+        self.assertEqual((rc, out["outcome"], out["parked"]), (0, "settled", "turn completed without a reply"), out)
+        self.assertEqual((self.results / (t + ".txt")).read_bytes(), delivered, "published once")
+        self.assertNotIn(t, records.load_plugin(self.root).get("inflight") or {})
+
+    def test_a_publication_that_fails_on_io_is_the_pre_commit_retry_with_the_call_again_hint(self):
+        """An unwritable results dir: publish answers retry (the step did not commit), as the Mod's reply tool
+        turns into 'call ag2space_reply again'; never the soft 'publication parked'. The turn-end park of a
+        staged answer carries the same retry."""
+        if os.geteuid() == 0:
+            self.skipTest("root writes an unwritable dir")
+        lc = inbox._lifecycle(self.root)
+        t = "task-ro-results"
+        self.confirmed(t)
+        self.assertEqual(self.verb("stage", t, "turn-1", stdin=b"the answer\n")[0], 0)
+        self.results.chmod(0)
+        self.addCleanup(self.results.chmod, 0o755)
+        try:
+            rc, out = self.verb("publish", t)
+            self.assertEqual((rc, out.get("retry")), (1, True), out)
+            self.assertIn("the step did not commit (StateIOError: refusing to serve: cannot publish %s"
+                          % (self.results / (t + ".txt")), out["refused"])
+            self.assertNotIn("publication parked", out["refused"])
+            self.assertEqual(lc.claims.load(t)["phase"], inbox.lifecycle.RESULT_STAGED, "the claim is as it was")
+            rc, out = self.verb("park", t, "turn-1", "--detail", "turn completed without a reply")
+            self.assertEqual((rc, out.get("retry")), (1, True), "the turn's end gets the same retry")
+        finally:
+            self.results.chmod(0o755)
+        rc, out = self.verb("publish", t)
+        self.assertEqual((rc, out["outcome"]), (0, "settled"), out)
+        self.assertEqual((self.results / (t + ".txt")).read_text(), "the answer\n", "the staged answer, once")
+        self.assertEqual(self.verb("publish", t)[1]["outcome"], "settled", "idempotent at SETTLED")
+        self.assertEqual(lc.publish_and_settle("task-none"), "parked", "the default still parks")
+
+    def test_a_claim_the_mod_lost_past_its_call_is_finished_or_interrupted_at_once(self):
+        """A Mod that lost its offers (a reload inside the generation) claims the task afresh: a descriptor
+        with no verifying blob is answered as interrupted now, a verifying blob whose phase move was lost is
+        published, a staged answer is published; a CALLING claim and one confirmed with nothing accepted still
+        wait for the next generation, and a dead generation's claim is left to hold's recovery."""
+        lc = inbox._lifecycle(self.root)
+        t = "task-lost-blob"
+        self.confirmed(t)
+        with mock.patch.object(inbox.lifecycle.os, "link", side_effect=OSError(errno.ENOSPC, "No space left on device")):
+            self.assertEqual(self.verb("stage", t, "turn-1", stdin=b"accepted text\n")[1].get("retry"), True)
+        self.assertEqual(lc.claims.load(t)["phase"], inbox.lifecycle.TURN_CONFIRMED)
+        rc, out = self.verb("claim", t)
+        self.assertEqual((rc, "retry" in out), (1, False), out)
+        self.assertIn("answered as interrupted now; only ABSENT may be submitted", out["refused"])
+        self.assertEqual((self.results / (t + ".txt")).read_text(), inbox.INTERRUPTED_BODY, "the interrupted line, not silence")
+        rec = lc.claims.load(t)
+        self.assertEqual((rec["phase"], rec["outcome"]["detail"]), (inbox.lifecycle.SETTLED, "turn confirmed, the accepted answer's staging was lost"))
+        self.assertNotIn(t, records.load_plugin(self.root).get("inflight") or {}, "the mirror is released")
+        self.assertEqual(self.verb("claim", t)[1]["refused"], "%s is LIVE_READY; only ABSENT may be submitted" % t)
+        t = "task-lost-move"
+        self.confirmed(t)
+        self.assertEqual(self.verb("stage", t, "turn-1", stdin=b"the accepted answer\n")[0], 0)
+        lc.claims.save(dict(lc.claims.load(t), phase=inbox.lifecycle.TURN_CONFIRMED))     # the move's last save never landed
+        rc, out = self.verb("claim", t)
+        self.assertEqual((rc, "staged and never published, is published now" in out["refused"]), (1, True), out)
+        self.assertEqual((self.results / (t + ".txt")).read_text(), "the accepted answer\n", "the accepted answer, exactly")
+        t = "task-lost-staged"
+        self.confirmed(t)
+        self.assertEqual(self.verb("stage", t, "turn-1", stdin=b"staged answer\n")[0], 0)
+        rc, out = self.verb("claim", t)
+        self.assertEqual((rc, "its staged answer is published now" in out["refused"]), (1, True), out)
+        self.assertEqual((self.results / (t + ".txt")).read_text(), "staged answer\n")
+        for t, phase in (("task-lost-calling", inbox.lifecycle.CALLING), ("task-lost-confirmed", inbox.lifecycle.TURN_CONFIRMED)):
+            self.task(t)
+            attempt = self.verb("claim", t)[1]["attempt"]
+            token = self.verb("authorize", t, str(attempt), "--text-hash", "h1")[1]["token"]
+            if phase == inbox.lifecycle.TURN_CONFIRMED:
+                self.verb("confirm", t, "turn-1", token, "--text-hash", "h1")
+            rc, out = self.verb("claim", t)
+            self.assertEqual((rc, "retry" in out, out["refused"]), (1, False, "%s: attempt %s is %s" % (t, attempt, phase)), out)
+            self.assertFalse((self.results / (t + ".txt")).exists(), "%s waits for the next generation" % phase)
+        t = "task-dead-gen"
+        self.confirmed(t)
+        lc.claims.save(dict(lc.claims.load(t), staged={"blob": "blob.1.none", "length": 1, "sha256": "0" * 64, "identity": {}},
+                            generation={"pid": 2 ** 22 - 1, "start": "2026-01-01T00:00:00Z"}))
+        rc, out = self.verb("claim", t)
+        self.assertEqual((rc, out["refused"]), (1, "%s: attempt 1 is TURN_CONFIRMED" % t), "another generation's: not ours to answer")
+        self.assertFalse((self.results / (t + ".txt")).exists())
+        t = "task-lost-parked"
+        self.confirmed(t)
+        with mock.patch.object(inbox.lifecycle.os, "link", side_effect=OSError(errno.ENOSPC, "No space left on device")):
+            self.verb("stage", t, "turn-1", stdin=b"accepted text\n")
+        with mock.patch.object(inbox.lifecycle.Lifecycle, "_publish", return_value=None):
+            rc, out = self.verb("claim", t)
+        self.assertEqual((rc, out.get("retry")), (1, True), "interrupted, its publication parked: the next claim retries")
+        self.assertEqual(lc.claims.load(t)["phase"], inbox.lifecycle.RESULT_STAGED)
+        rc, out = self.verb("claim", t)
+        self.assertEqual((rc, "its staged answer is published now" in out["refused"]), (1, True), out)
+        self.assertEqual((self.results / (t + ".txt")).read_text(), inbox.INTERRUPTED_BODY)
 
     def test_a_progress_write_failure_is_the_hard_exit_3_with_the_lifecycle_step_applied(self):
         """The step stands, the answer carries it with `hard`, and the Mod closes intake on 3."""
