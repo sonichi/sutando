@@ -44,6 +44,7 @@ from delivery.task_dispatch import (  # noqa: E402
     clear_inflight, inflight_is_live, mark_inflight,
     mark_partial_paste, partial_paste_leftover,
     _main,
+    _INBOX_PRIORITY_LIMIT,
     find_ready_result,
     find_ready_result_for_filename,
     has_ready_result,
@@ -57,6 +58,7 @@ from delivery.task_dispatch import (  # noqa: E402
 
 CLI = REPO / "src" / "delivery" / "task_dispatch.py"
 WATCHER = REPO / "src" / "watch-tasks-stream.sh"
+RESOLVER_HELPER = str(REPO / "src/inbox-resolve.sh")
 TASK = "task-probe"
 F = f"{TASK}.txt"
 
@@ -823,7 +825,7 @@ class MainDispatchTest(unittest.TestCase):
             "print(os.path.join(sys.argv[3], os.path.basename(sys.argv[1]) + ' '))\n")
         with mock.patch.dict(os.environ, SUTANDO_INBOX_RESOLVER=resolver):
             rc, out, err = self._run("sort-by-priority", str(self.tasks_dir),
-                                     "--resolve-inbox", str(workspace))
+                                     "--resolve-inbox", str(workspace), RESOLVER_HELPER)
             self.assertEqual((rc, err), (0, ""))
             self.assertEqual(out.splitlines(), [f"entry-{i}.txt" for i in (1, 3, 2, 0)])
             self.assertEqual(self._run("sort-by-priority", str(self.tasks_dir))[1].splitlines(),
@@ -842,24 +844,24 @@ class MainDispatchTest(unittest.TestCase):
                     "    print(sys.argv[1]); sys.exit(0)\n" + answer + "\n")
                 with mock.patch.dict(os.environ, SUTANDO_INBOX_RESOLVER=resolver):
                     rc, out, err = self._run("sort-by-priority", str(self.tasks_dir),
-                                             "--resolve-inbox", self.tmp.name)
+                                             "--resolve-inbox", self.tmp.name, RESOLVER_HELPER)
                 self.assertEqual((rc, out, err), (0, "normal.txt\nentry.txt\n", ""))
 
     def test_resolver_unavailable_keeps_every_entry(self):
         _write(self.tasks_dir / "entry.txt", "")
         with mock.patch.dict(os.environ, SUTANDO_INBOX_RESOLVER="/no/such/resolver"):
             self.assertEqual(self._run("sort-by-priority", str(self.tasks_dir),
-                                      "--resolve-inbox", self.tmp.name), (0, "entry.txt\n", ""))
+                                      "--resolve-inbox", self.tmp.name, RESOLVER_HELPER), (0, "entry.txt\n", ""))
             with mock.patch("delivery.task_dispatch.subprocess.run", side_effect=OSError):
                 self.assertEqual(self._run("sort-by-priority", str(self.tasks_dir),
-                                          "--resolve-inbox", self.tmp.name)[1], "entry.txt\n")
+                                          "--resolve-inbox", self.tmp.name, RESOLVER_HELPER)[1], "entry.txt\n")
 
     def test_resolved_sort_without_injected_resolver_is_the_core_sort(self):
         _write(self.tasks_dir / "low.txt", "priority: low\ntask: x\n")
         _write(self.tasks_dir / "urgent.txt", "priority: urgent\ntask: x\n")
         with mock.patch.dict(os.environ, SUTANDO_INBOX_RESOLVER=""):
             self.assertEqual(self._run("sort-by-priority", str(self.tasks_dir),
-                                      "--resolve-inbox", self.tmp.name)[1], "urgent.txt\nlow.txt\n")
+                                      "--resolve-inbox", self.tmp.name, RESOLVER_HELPER)[1], "urgent.txt\nlow.txt\n")
 
     def test_resolved_sort_bounds_and_reaps_a_term_resistant_resolver(self):
         _write(self.tasks_dir / "entry.txt", "")
@@ -874,16 +876,80 @@ class MainDispatchTest(unittest.TestCase):
         with mock.patch.dict(os.environ, SUTANDO_INBOX_RESOLVER=resolver,
                              SUTANDO_INBOX_RESOLVER_TIMEOUT="5"):
             self.assertEqual(self._run("sort-by-priority", str(self.tasks_dir),
-                                      "--resolve-inbox", self.tmp.name), (0, "entry.txt\n", ""))
+                                      "--resolve-inbox", self.tmp.name, RESOLVER_HELPER), (0, "entry.txt\n", ""))
         self.assertLess(time.monotonic() - start, 10)
         with self.assertRaises(ProcessLookupError):
             os.kill(int(pidfile.read_text()), 0)
 
     def test_resolved_sort_rejects_incomplete_or_unknown_options(self):
         for rest in (("--resolve-inbox",), ("--resolve-inbox", ""),
-                     ("--wrong", self.tmp.name), ("--resolve-inbox", self.tmp.name, "extra")):
+                     ("--resolve-inbox", self.tmp.name), ("--resolve-inbox", self.tmp.name, ""),
+                     ("--wrong", self.tmp.name, RESOLVER_HELPER),
+                     ("--resolve-inbox", self.tmp.name, RESOLVER_HELPER, "extra")):
             with self.subTest(rest=rest):
                 self.assertEqual(self._run("sort-by-priority", str(self.tasks_dir), *rest)[0], 2)
+
+    def test_thousand_entry_sort_bounds_lookup_and_preserves_fifo_fallback(self):
+        calls = Path(self.tmp.name) / "calls"
+        payloads = Path(self.tmp.name) / "payloads"
+        entries = []
+        for i in range(1000):
+            entry = _write(self.tasks_dir / f"entry-{999 - i:04d}.txt", "priority: urgent\n")
+            os.utime(entry, (100 + i, 100 + i))
+            priority = "low" if i == 0 else "urgent" if i in (1, 999) else "normal"
+            _write(payloads / entry.name, f"priority: {priority}\ntask: x\n")
+            entries.append(entry)
+        before = {p: (p.read_bytes(), p.stat().st_mtime_ns, p.stat().st_ino)
+                  for p in [*entries, *payloads.iterdir()]}
+        for refused in (False, True):
+            calls.write_text("")
+            resolver = self._resolver(
+                f"with open({str(calls)!r}, 'a') as out: out.write(sys.argv[1] + '\\n')\n"
+                + ("sys.exit(1)\n" if refused else
+                   f"print(os.path.join({str(payloads)!r}, os.path.basename(sys.argv[1])))\n"))
+            start = time.monotonic()
+            with mock.patch.dict(os.environ, SUTANDO_INBOX_RESOLVER=resolver):
+                rc, out, err = self._run("sort-by-priority", str(self.tasks_dir),
+                                         "--resolve-inbox", self.tmp.name, RESOLVER_HELPER)
+            elapsed = time.monotonic() - start
+            seen = calls.read_text().splitlines()
+            self.assertLess(elapsed, 15, "fixed budget including process launch and cleanup")
+            self.assertGreaterEqual(len(seen), 2)
+            self.assertLessEqual(len(seen), _INBOX_PRIORITY_LIMIT)
+            self.assertEqual(seen, list(map(str, entries[:len(seen)])))
+            expected = entries if refused else [entries[1], *entries[2:], entries[0]]
+            self.assertEqual((rc, err), (0, ""))
+            self.assertEqual(out.splitlines(), [p.name for p in expected])
+            self.assertEqual(before, {p: (p.read_bytes(), p.stat().st_mtime_ns, p.stat().st_ino)
+                                      for p in before})
+
+    def test_thousand_entry_sort_has_one_deadline_for_hung_resolvers(self):
+        entries = []
+        for i in range(1000):
+            entry = _write(self.tasks_dir / f"entry-{i:04d}.txt", "")
+            os.utime(entry, (100 + i, 100 + i))
+            entries.append(entry)
+        calls = Path(self.tmp.name) / "calls"
+        resolver = self._resolver(
+            "import signal, time\n"
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            f"with open({str(calls)!r}, 'a') as out: out.write(str(os.getpid()) + '\\n')\n"
+            "time.sleep(60)\n")
+        start = time.monotonic()
+        with mock.patch.dict(os.environ, SUTANDO_INBOX_RESOLVER=resolver,
+                             SUTANDO_INBOX_RESOLVER_TIMEOUT="120"):
+            rc, out, err = self._run("sort-by-priority", str(self.tasks_dir),
+                                     "--resolve-inbox", self.tmp.name, RESOLVER_HELPER)
+        self.assertLess(time.monotonic() - start, 15)
+        self.assertEqual((rc, err), (0, ""))
+        self.assertEqual(out.splitlines(), [p.name for p in entries])
+        pids = calls.read_text().splitlines()
+        self.assertEqual(len(pids), 1, "the timeout consumes the shared lookup budget")
+        for pid in pids:
+            with self.assertRaises(ProcessLookupError):
+                os.kill(int(pid), 0)
+        self.assertEqual(sorted(self.tasks_dir.iterdir()), entries)
+        self.assertFalse(any(p.read_bytes() for p in entries))
 
     def test_priority_tier_prints_the_parsed_tier(self):
         f = self.tasks_dir / "task-a.txt"

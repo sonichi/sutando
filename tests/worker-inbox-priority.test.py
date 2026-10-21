@@ -70,6 +70,8 @@ class WorkerStartupTest(unittest.TestCase):
         self.records = []
         self.logs = []
         self.addCleanup(self.save_evidence)
+        self.record("candidate", commit=self.run_command(["git", "rev-parse", "HEAD"]).strip(),
+                    diff_sha256=hashlib.sha256(self.run_command(["git", "diff", "HEAD"]).encode()).hexdigest())
         self.daemon, _ = self.start("daemon", [sys.executable, str(REPO / "src/runtime-api/server.py")])
         self.wait_for(self.socket_ready, "daemon Unix socket", self.daemon)
         ready = self.cli("details")
@@ -110,9 +112,11 @@ class WorkerStartupTest(unittest.TestCase):
             self.record("reaped", pid=proc.pid, returncode=proc.returncode)
 
     def run_command(self, argv, env=None, timeout=15):
+        started = time.monotonic()
         result = subprocess.run(argv, env=env or self.env, cwd=REPO,
                                 capture_output=True, text=True, timeout=timeout)
         self.record("command", argv=list(map(str, argv)), returncode=result.returncode,
+                    elapsed=time.monotonic() - started,
                     stdout=result.stdout[-12000:], stderr=result.stderr[-12000:])
         self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
         return result.stdout
@@ -163,25 +167,31 @@ class WorkerStartupTest(unittest.TestCase):
 
     def sort(self, inbox, env):
         return self.run_command([sys.executable, str(DISPATCH), "sort-by-priority", str(inbox),
-                                 "--resolve-inbox", str(self.ws)], env=env).splitlines()
+                                 "--resolve-inbox", str(self.ws), str(REPO / "src/inbox-resolve.sh")],
+                                env=env).splitlines()
 
     def announcements(self, log):
         return [Path(line.removeprefix("TASK_FILE: ")).stem
                 for line in log.read_text().splitlines() if line.startswith("TASK_FILE: ")]
 
-    def sweep(self, label, env, expected):
+    def sweep(self, label, env, expected, timeout=35):
         inbox = Path(env.get("SUTANDO_TASKS_DIR", self.ws / "tasks"))
         sentinel = Path(self.run_command([sys.executable, str(REPO / "src/util_paths.py"),
                                          "watcher-sentinel", str(self.ws / "state")], env).strip())
+        started = time.monotonic()
         proc, log = self.start(label, ["bash", str(WATCHER), "--role", "session", "--inbox", str(inbox)], env)
         self.wait_for(lambda: sentinel.is_file() and sentinel.read_text().strip() == str(proc.pid),
                       "watcher readiness sentinel", proc)
-        self.record("watcher-ready", pid=proc.pid, sentinel=str(sentinel))
-        self.wait_for(lambda: len(self.announcements(log)) >= len(expected), "startup announcements", proc, 35)
+        self.record("watcher-ready", pid=proc.pid, sentinel=str(sentinel), elapsed=time.monotonic() - started)
+        self.wait_for(lambda: bool(self.announcements(log)), "first startup announcement", proc, timeout)
+        self.record("first-announcement", pid=proc.pid, elapsed=time.monotonic() - started,
+                    task=self.announcements(log)[0])
+        self.wait_for(lambda: len(self.announcements(log)) >= len(expected), "startup announcements", proc, timeout)
         time.sleep(0.7)
         self.assertEqual(self.announcements(log), expected, log.read_text())
         self.assertIsNone(proc.poll(), log.read_text())
         self.record("startup-sweep", pid=proc.pid, announcements=self.announcements(log),
+                    elapsed=time.monotonic() - started,
                     standby="bounded wait expired" if "standby watcher still present" in log.read_text()
                     else "standby absent before sweep")
         self.stop(proc)
@@ -189,6 +199,12 @@ class WorkerStartupTest(unittest.TestCase):
         return log
 
     def test_worker_backlog_repeated_startup_preserves_records_and_ownership(self):
+        self.worker_backlog()
+
+    def test_worker_backlog_beyond_lookup_prefix_restarts_without_mutation(self):
+        self.worker_backlog(extra=32, timeout=60)
+
+    def worker_backlog(self, extra=0, timeout=35):
         env = self.register()
         ids = [self.submit(body, priority) for body, priority in (
             ("low one", "low"), ("normal one", "normal"), ("urgent ordinary", "urgent"),
@@ -208,22 +224,27 @@ class WorkerStartupTest(unittest.TestCase):
         accepted, completed, other = [self.submit(body, "urgent")
                                       for body in ("accepted", "completed", "other worker")]
         delivery.accept(self.assign(accepted))
-        self.assign(completed)
+        os.utime(self.assign(completed), (1000008, 1000008))
         publish_text(self.ws / "results" / f"{completed}.txt", "already done\n")
         self.assign(other, OTHER)
+        tail = []
+        for i in range(extra):
+            tid = self.submit(f"pending backlog {i}")
+            os.utime(self.assign(tid), (1000009 + i, 1000009 + i))
+            tail.append(tid)
         before = self.snapshot()
-        expected = [ids[i] for i in (2, 5, 1, 3, 6, 7, 0, 4)]
+        expected = [*[ids[i] for i in (2, 5, 1, 3, 6, 7)], *tail, ids[0], ids[4]]
         sorted_names = self.sort(Path(env["SUTANDO_TASKS_DIR"]), env)
         self.assertEqual(sorted_names, [f"{tid}.txt" for tid in [*expected[:2], completed, *expected[2:]]])
         self.assertEqual(before, self.snapshot(), "sorting must not mutate records or accept deliveries")
         for i in (1, 2):
-            self.sweep(f"worker-{i}", env, expected)
+            self.sweep(f"worker-{i}", env, expected, timeout)
             self.assertEqual(before, self.snapshot(), "startup must preserve the same pending records")
-            for tid in [*ids, accepted, completed]:
+            for tid in [*ids, *tail, accepted, completed]:
                 self.assertEqual(router.committed_recipient(self.ws, tid), WORKER)
             self.assertEqual(router.committed_recipient(self.ws, other), OTHER)
         self.record("records-preserved", snapshots_equal=True, records=before,
-                    excluded=[accepted, completed, other], expected=expected)
+                    excluded=[accepted, completed, other], expected=expected, pending_count=len(expected))
 
     def test_ordinary_core_inbox_keeps_priority_fifo_and_body_boundary(self):
         ids = [self.submit(body, priority) for body, priority in (
@@ -277,10 +298,18 @@ class WorkerStartupTest(unittest.TestCase):
         self.assertLess(time.monotonic() - started, 35, log.read_text())
         self.assertEqual(before, self.snapshot(), "failed resolution must retain assignments")
         rows = [json.loads(line) for line in calls.read_text().splitlines()]
-        expected_counts = {"missing-old": 2, "missing-fresh": 4, "refused": 4,
-                           "timeout": 4, "retry": 3, "urgent": 2, "low": 2}
-        for name, count in expected_counts.items():
-            self.assertEqual(sum(row["entry"] == ids[name] for row in rows), count, (name, rows))
+        dispatch_failures = {"missing-old": 1, "missing-fresh": 3, "refused": 3, "timeout": 3}
+        for name, count in dispatch_failures.items():
+            entry = Path(env["SUTANDO_TASKS_DIR"]) / f"{ids[name]}.txt"
+            self.assertEqual(log.read_text().count(f"file for {entry} (rc="), count, name)
+        # Priority probes may time out before the resolver starts; only dispatch
+        # retries are mandatory. The probes are silent in the watcher log.
+        expected_counts = {"missing-old": (1, 2), "missing-fresh": (3, 4), "refused": (3, 4),
+                           "timeout": (3, 4), "retry": (3, 3), "urgent": (1, 2), "low": (1, 2)}
+        for name, (least, most) in expected_counts.items():
+            count = sum(row["entry"] == ids[name] for row in rows)
+            self.assertGreaterEqual(count, least, (name, rows))
+            self.assertLessEqual(count, most, (name, rows))
         for row in rows:
             if row["entry"] == ids["timeout"]:
                 with self.assertRaises(ProcessLookupError):
@@ -288,6 +317,7 @@ class WorkerStartupTest(unittest.TestCase):
         self.assertIn("not dispatching (1 attempt)", log.read_text())
         self.assertEqual(log.read_text().count("after 3 attempts; not dispatching"), 3)
         self.record("resolver-failures", calls=rows, expected_counts=expected_counts,
+                    dispatch_failures=dispatch_failures,
                     elapsed=time.monotonic() - started, records_preserved=True)
 
 

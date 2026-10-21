@@ -13,7 +13,7 @@
 # shellcheck source=bounded-wait.sh
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/bounded-wait.sh"
 resolve_inbox_entry() {
-	local entry="$1" out rc resolved not_absolute out_file
+	local entry="$1" out rc resolved not_absolute out_file limit
 	if [ -z "${SUTANDO_INBOX_RESOLVER:-}" ]; then
 		printf '%s\n' "$entry"
 		return 0
@@ -23,9 +23,20 @@ resolve_inbox_entry() {
 		return 3
 	fi
 	out_file="$(mktemp -p "${TMPDIR:-/tmp}" "sutando-inbox-resolve.XXXXXX")" || return 3
+	limit="${SUTANDO_INBOX_RESOLVER_TIMEOUT:-5}"
+	# Priority lookup may shorten the dispatch timeout to its remaining sweep
+	# budget; dispatch itself passes no cap and keeps run_bounded's defaults.
+	if [ -n "${2:-}" ]; then
+		limit="${limit%%.*}"
+		case "$limit" in
+			''|*[!0-9]*) limit=1 ;;
+			*) limit="$(( 10#$limit ))" ;;
+		esac
+		[ "$limit" -le "$2" ] || limit="$2"
+	fi
 	# The assignment is APPENDED: $1 stays the entry, so a resolver written
 	# before this flag existed is unaffected, and a new one can require it.
-	run_bounded "${SUTANDO_INBOX_RESOLVER_TIMEOUT:-5}" -- \
+	run_bounded "$limit" -- \
 		"$SUTANDO_INBOX_RESOLVER" "$entry" --workspace "${WORKSPACE_DIR:-}" > "$out_file" 2>/dev/null
 	rc=$?
 	out="$(cat "$out_file" 2>/dev/null)"
@@ -52,5 +63,5 @@ resolve_inbox_entry() {
 
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
 	WORKSPACE_DIR="${2:-}"
-	resolve_inbox_entry "$1"
+	resolve_inbox_entry "$1" "${3:-}"
 fi

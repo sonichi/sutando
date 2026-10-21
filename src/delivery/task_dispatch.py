@@ -58,6 +58,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Iterator
 
@@ -397,7 +398,7 @@ def partial_paste_leftover(partial_dir: "Path | str", filename: str, incarnation
 _USAGE = (
     "usage: task_dispatch.py has-result <results_dir> <filename>\n"
     "       task_dispatch.py find-ready <results_dir> <filename>\n"
-    "       task_dispatch.py sort-by-priority <tasks_dir> [--resolve-inbox WORKSPACE]   # every *.txt, no filtering\n"
+    "       task_dispatch.py sort-by-priority <tasks_dir> [--resolve-inbox WORKSPACE HELPER]   # every *.txt, no filtering\n"
     "       task_dispatch.py priority-tier <task_file>   # prints urgent|normal|low, the file's own header\n"
     "       task_dispatch.py pending-candidates <tasks_dir> <results_dir> [--claims-dir DIR] [--deliveries-dir DIR]\n"
     "       task_dispatch.py next-pending <tasks_dir> <results_dir> [--claims-dir DIR] [--deliveries-dir DIR]\n"
@@ -429,12 +430,15 @@ def _parse_dir_options(rest: list[str]) -> dict:
     return opts
 
 
-def _inbox_priority(entry: Path, workspace: str) -> str:
+_INBOX_PRIORITY_LIMIT = 32
+_INBOX_PRIORITY_SECONDS = 10
+
+
+def _inbox_priority(entry: Path, workspace: str, helper: str, budget: int) -> str:
     """Use the dispatch resolver's bounds and validation without admitting the entry."""
     try:
         resolved = subprocess.run(
-            ["bash", str(Path(__file__).resolve().parent.parent / "inbox-resolve.sh"),
-             str(entry), workspace],
+            ["bash", helper, str(entry), workspace, str(budget)],
             capture_output=True, text=True, check=False,
         )
     except OSError:
@@ -444,18 +448,36 @@ def _inbox_priority(entry: Path, workspace: str) -> str:
     return parse_priority_from_file(Path(resolved.stdout.removesuffix("\n")))
 
 
+def _inbox_priorities(entries: list[Path], workspace: str, helper: str) -> dict[Path, str]:
+    """Resolve only the oldest prefix; unexamined entries retain normal/FIFO order."""
+    ordered = sort_tasks_by_priority(entries, priority_reader=lambda _: "normal")
+    deadline = time.monotonic() + _INBOX_PRIORITY_SECONDS
+    priorities = {}
+    for entry in ordered[:_INBOX_PRIORITY_LIMIT]:
+        # Reserve whole seconds for run_bounded; its TERM/KILL grace is at most
+        # one extra second plus polling overhead for the last lookup.
+        remaining = int(deadline - time.monotonic())
+        if remaining < 1:
+            break
+        priorities[entry] = _inbox_priority(entry, workspace, helper, remaining)
+    return priorities
+
+
 def _main(argv: list[str]) -> int:
     # A pure sort, no eligibility filtering -- the caller still decides
     # whether a file is eligible; this only changes the offered order.
     if argv and argv[0] == "sort-by-priority":
-        if len(argv) != 2 and not (len(argv) == 4 and argv[2] == "--resolve-inbox" and argv[3]):
+        if len(argv) != 2 and not (len(argv) == 5 and argv[2] == "--resolve-inbox"
+                                  and argv[3] and argv[4]):
             print(_USAGE, file=sys.stderr)
             return 2
         reader = parse_priority_from_file
-        if len(argv) == 4 and os.environ.get("SUTANDO_INBOX_RESOLVER"):
-            reader = lambda entry: _inbox_priority(entry, argv[3])
+        entries = list(Path(argv[1]).glob("*.txt"))
+        if len(argv) == 5 and os.environ.get("SUTANDO_INBOX_RESOLVER"):
+            priorities = _inbox_priorities(entries, argv[3], argv[4])
+            reader = lambda entry: priorities.get(entry, "normal")
         names = [p.name for p in sort_tasks_by_priority(
-            Path(argv[1]).glob("*.txt"), priority_reader=reader,
+            entries, priority_reader=reader,
         )]
         for name in names:
             print(name)
