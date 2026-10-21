@@ -204,10 +204,8 @@ class Adapter(RelayLoop):
             return self.park(task_id, e)
         # A local claim is never this adapter's to repair: it only reads the ledger for one.
         local = bool(rec and rec.get("claim_mode") == task_lifecycle.LOCAL)
-        try:
-            settled = task_id in self.lc.settled if local else self.lc.is_settled(task_id)
-        except task_lifecycle.StateError as e:
-            return self.park(task_id, e)
+        # Its repair's failures are classified by contained(), never here: a read parks, a write stops.
+        settled = task_id in self.lc.settled if local else self.lc.is_settled(task_id)
         if settled:
             log("already settled, never called again ->", task_id)
             seen.add(task_id)

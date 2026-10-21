@@ -970,8 +970,8 @@ class StepBranchTest(unittest.TestCase):
 
     def test_a_settled_id_with_settlement_debt_is_repaired_through_the_lifecycle_before_it_counts(self):
         """step() asks the lifecycle (is_settled), never the ledger alone: a SETTLED claim whose id is in the ledger
-        but whose staged body was left is repaired before the task counts settled, and a repair that fails parks
-        the task instead of reporting it final."""
+        but whose staged body was left is repaired before the task counts settled, and a repair whose read fails
+        parks the task (through the loop's boundary) instead of reporting it final."""
         write_task(self.work, "task-a", "hi")
         claims = self.ad.lc.claims
         claims.save({"schema": 1, "task_id": "task-a", "attempt": 1, "created_at": 1.0, "phase": lc.SETTLED,
@@ -980,7 +980,8 @@ class StepBranchTest(unittest.TestCase):
         self.ad.lc.settled.add("task-a")
         with contextlib.redirect_stderr(io.StringIO()), \
                 mock.patch.object(lc.ClaimStore, "unstage", side_effect=lc.StateIOError("cannot remove body")):
-            self.assertFalse(self.ad.step("task-a.txt", self.seen), "a repair that fails parks the task")
+            self.assertFalse(self.ad.contained("task-a.txt", self.ad.step, "task-a.txt", self.seen),
+                             "a repair that fails on a read parks the task")
         self.assertEqual(self.seen, set())
         self.assertGreater(self.ad.not_before["task-a"], self.ad.clock())
         self.assertTrue((claims.dir("task-a") / "body").is_file())
@@ -1089,8 +1090,44 @@ class StepBranchTest(unittest.TestCase):
         self.ad.not_before.clear()
         with contextlib.redirect_stderr(io.StringIO()), \
                 mock.patch.object(self.ad.lc, "is_settled", side_effect=lc.LedgerIOError("cannot fsync the ledger")):
-            self.assertFalse(self.ad.step("task-a.txt", self.seen), "the settlement repair parks inside the step")
+            self.assertFalse(self.ad.contained("task-a.txt", self.ad.step, "task-a.txt", self.seen),
+                             "a ledger I/O failure in the settlement repair parks, at the boundary")
         self.assertEqual((self.seen, self.fake.calls()), (set(), []))
+
+    def test_a_write_or_a_refusal_inside_the_settlement_repair_stops_the_adapter(self):
+        """is_settled() runs inside step() with no local catch: what its repair raises is classified by the boundary
+        alone. A real unstage failure (StateWriteError) and a corrupt ledger met by the repair's append
+        (LedgerError) escape the boundary, which stops the adapter with exit 2; neither is parked."""
+        for kind in ("unstage", "ledger"):
+            tmp = tempfile.TemporaryDirectory()
+            self.addCleanup(tmp.cleanup)
+            work = Path(tmp.name) / "work"
+            fake = Fake(tmp.name, [ok()])
+            write_task(work, "task-a", "hi")
+            clock = FakeClock()
+            ad = sa.Adapter(args_for(work, fake.path, once=1), clock=clock, sleep=clock.sleep, note=NOTE, environ=ENV)
+            ad.lc.claims.save({"schema": 1, "task_id": "task-a", "attempt": 1, "created_at": 1.0, "phase": lc.SETTLED,
+                               "settled_at": 1.0})
+            ad.lc.claims.stage("task-a", b"staged body\n")
+            ad.lc.settled.add("task-a")
+            real_unlink = os.unlink
+
+            def unlink(path, *a, **k):
+                if str(path).endswith("/body"):
+                    raise OSError(5, "Input/output error")
+                return real_unlink(path, *a, **k)
+            patch = mock.patch.object(lc.os, "unlink", unlink) if kind == "unstage" else contextlib.nullcontext()
+            if kind == "ledger":
+                ad.lc.settled.durable.discard("task-a")       # visible, not yet synced by this process: add() runs
+                Path(ad.lc.settled.path).write_text("not a task id\ntask-a\n")
+            with patch, contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(lc.StateError) as stopped:
+                    ad.contained("task-a.txt", ad.step, "task-a.txt", set())
+                self.assertIsInstance(stopped.exception, lc.StateWriteError if kind == "unstage" else lc.LedgerError, kind)
+                self.assertNotIn("task-a", ad.not_before, "not parked: %s" % kind)
+            # serve() has no catch of its own around contained(); serve_locked answers a StartupRefused with its code.
+            self.assertEqual(stopped.exception.code, 2, "the adapter stops with exit 2: %s" % kind)
+            self.assertEqual(fake.calls(), [])
 
     def test_a_parked_task_is_not_read_again_until_its_park_ends(self):
         """One read per park: while the task's park lasts, the loop's probe does not read its claim again."""
