@@ -1189,18 +1189,21 @@ READS = {"open", "read_text", "read_bytes", "readlines"}
 # Owner calls whose callable arguments read credentials: (positional index, keyword names).
 OWNER_READERS = {"env_files": (1, ("read_text",)), "discover": (None, ("read_token_file", "vault_lookup"))}
 # Where credential I/O may happen: the adapters' edge, as (module, function).
-# Hatch's systemd reachability probe discards what show-environment prints.
+# The shared systemd reachability probe discards what show-environment prints.
 IO_ALLOWED = {("remote_gateway_bridge.py", "_read_env_file"), ("remote_gateway_bridge.py", "_read_text"),
-              ("remote_gateway_bridge.py", "_vault_lookup"), ("adapters/hatch/cli.py", "systemd_user_available"),
+              ("remote_gateway_bridge.py", "_vault_lookup"), ("service_manager.py", "systemd_user_available"),
               ("gateway_credential_io.py", "read_file"), ("gateway_credential_io.py", "vault_lookup"),
               ("gateway_credential_io.py", "_vault"), ("gateway_credential_io.py", "_vault_once")}
 # A command whose output is a credential store: the Keychain. The systemd user manager's environment
 # is SYSTEMD_PROBE's closed-world rule below, which evaluates no constant.
 STORE_READS = ("security", "find-generic-password")
 SHOW_ENV = "show-environment"
-SYSTEMD_PROBE = ("adapters/hatch/cli.py", "systemd_user_available")
+SYSTEMD_PROBE = ("service_manager.py", "systemd_user_available")
 # The one place systemctl is named and run; every other use calls it with a literal tuple.
-SYSTEMCTL_HELPER = ("adapters/hatch/cli.py", "_systemctl")
+SYSTEMCTL_HELPER = ("service_manager.py", "_systemctl")
+# Keywords a helper call may pass besides the literal tuple: the unit, which the helper checks
+# against its UNIT_RE at runtime, and the bound.
+HELPER_KEYWORDS = ("unit", "timeout")
 SYSTEMD_RUNNERS = frozenset({SYSTEMCTL_HELPER[1], "_systemd_run"})
 
 
@@ -1274,10 +1277,11 @@ def _systemctl_literal(node) -> bool:
 
 
 def _literal_args(call) -> bool:
-    """The helper's call shape: one literal tuple of literal strings, and at most locate=True."""
+    """The helper's call shape: one literal tuple of literal strings, then at most locate=True and
+    the HELPER_KEYWORDS, each named."""
     return len(call.args) == 1 and isinstance(call.args[0], ast.Tuple) and all(_str(e) for e in call.args[0].elts) \
-        and all(k.arg == "locate" and isinstance(k.value, ast.Constant) and k.value.value is True
-                for k in call.keywords)
+        and all(k.arg in HELPER_KEYWORDS or (k.arg == "locate" and isinstance(k.value, ast.Constant)
+                                              and k.value.value is True) for k in call.keywords)
 
 
 def _systemd_findings(tree, parents, rel: str) -> "list[str]":
@@ -1491,9 +1495,8 @@ class Guard(unittest.TestCase):
                          "a docstring naming a key is prose, not a read")
 
     def test_the_reachability_probe_discards_what_show_environment_prints(self):
-        rel, run = "adapters/hatch/cli.py", '_systemctl(("--user", "show-environment"))'
-        shipped = (f'def systemd_user_available():\n    return _systemctl((), locate=True) is not None and \\\n'
-                   f"        _ok({run})\n")
+        rel, run = SYSTEMD_PROBE[0], '_systemctl(("--user", "show-environment"))'
+        shipped = f"def systemd_user_available():\n    return _ok({run})\n"
         self.assertEqual(credential_access(shipped, rel), [])
         self.assertTrue(credential_access(shipped, "adapters/hatch/keepalive.py"), "only the one allowlisted probe")
         self.assertTrue(credential_access(shipped.replace("systemd_user_available", "probe"), rel))
@@ -1522,7 +1525,7 @@ class Guard(unittest.TestCase):
               '    return _systemd_run(["systemctl", *args])\n')
 
     def test_every_non_literal_systemctl_argument_is_flagged(self):
-        rel = "adapters/hatch/cli.py"
+        rel = SYSTEMCTL_HELPER[0]
         for cmd in self.BUILT:
             with self.subTest(cmd=cmd):
                 for source in (f"def systemd_user_available():\n    return _ok(_systemctl(('--user', {cmd})))\n",
@@ -1554,6 +1557,10 @@ class Guard(unittest.TestCase):
                 'def f(rest):\n    run = _systemctl\n    return run(rest).stdout\n',
                 'def f(flag):\n    return _systemctl((), locate=flag)\n',
                 'def f(**kw):\n    return _systemctl(("--user",), **kw)\n',
+                'def f(u):\n    return _systemctl(("--user", "stop"), unit=u, env={"A": "b"})\n',
+                'def f(u, rest):\n    return _systemctl(rest, unit=u)\n',
+                'def f(u):\n    return _systemctl(("--user", "stop", u), unit=u)\n',
+                'def f(u):\n    return _systemctl(("--user", "stop"), u)\n',
                 'def f():\n    _systemd_run(CMD)\n', 'def f(rest):\n    run = _systemd_run\n    run(rest)\n',
                 'def f():\n    subprocess.run("systemctl --user show-environment", shell=True)\n',
                 'X = "show-environment"\n', 'def f():\n    print(f"run systemctl --user show-environment")\n',
@@ -1577,6 +1584,8 @@ class Guard(unittest.TestCase):
                        'def f():\n    _cli._systemctl(("--user", "restart", "ag2-sparrow.service"))\n',
                        'def f():\n    _systemd_run(["loginctl", "enable-linger", user])\n',
                        'def f():\n    return _systemctl((), locate=True)\n',
+                       'def f(shape):\n    _sm._systemctl(("--user", "stop"), unit=shape.service_name, timeout=shape.manager_timeout_s)\n',
+                       'def f(shape):\n    _systemctl(("--user", "daemon-reload"), timeout=shape.manager_timeout_s)\n',
                        'def f():\n    note(f"run systemctl --user restart {SERVICE_NAME}")\n'):
             self.assertEqual(credential_access(self.HELPER + source, rel), [], source)
 
@@ -1594,7 +1603,8 @@ class Guard(unittest.TestCase):
         self.assertEqual(package_systemd_findings(root), [])
         probe = '\ndef manager(rest):\n    return subprocess.run(["systemctl", *rest]).stdout\n'
         for module in ("gateway_credentials.py", "gateway_credential_sources.py", "remote_gateway_bridge.py",
-                       "adapters/hatch/keepalive.py"):
+                       "adapters/hatch/keepalive.py", "adapters/hatch/cli.py", "connect_common.py",
+                       "adapters/claude_code/cli.py"):
             with self.subTest(module=module), tempfile.TemporaryDirectory() as td:
                 copy = Path(td) / "ag2_sparrow"
                 shutil.copytree(root, copy, ignore=shutil.ignore_patterns("__pycache__"))
@@ -1603,6 +1613,7 @@ class Guard(unittest.TestCase):
                 found = package_systemd_findings(copy)
                 self.assertTrue(found and all(x.startswith(f"{module}:") for x in found), found)
         for module, extra in (("adapters/hatch/keepalive.py", "\ndef _systemctl(args):\n    return args\n"),
+                              ("connect_common.py", "\ndef _systemctl(*args, timeout=30):\n    return args\n"),
                               ("adapters/hatch/cli.py", "\nclass Unit:\n    def _systemctl(self, args):\n"
                                                         "        return args\n")):
             with self.subTest(module=module), tempfile.TemporaryDirectory() as td:
@@ -1613,6 +1624,20 @@ class Guard(unittest.TestCase):
                 found = package_systemd_findings(copy)
                 self.assertTrue(any(x.startswith(f"{SYSTEMCTL_HELPER[1]} is defined at") for x in found), found)
                 self.assertTrue(any(x.startswith(f"{module}:") and "a second definition" in x for x in found), found)
+
+    def test_the_helper_runs_only_an_ag2_sparrow_unit(self):
+        seen = []
+        with mock.patch.object(service_manager, "_run", side_effect=lambda cmd, timeout: seen.append((cmd, timeout))):
+            for unit in ("evil.service", "show-environment", "ag2-sparrow.service --all", "ag2-sparrow.socket",
+                         "AG2-SPARROW.service", "", b"ag2-sparrow.service", "-ag2-sparrow.service"):
+                with self.subTest(unit=unit), self.assertRaises(ValueError):
+                    service_manager._systemctl(("--user", "stop"), unit=unit)
+            self.assertEqual(seen, [], "a refused unit runs nothing")
+            service_manager._systemctl(("--user", "stop"), unit="ag2-sparrow-claude-local.service", timeout=7)
+            service_manager._systemctl(("--user", "restart", "ag2-sparrow.service"))
+        self.assertEqual(seen, [(["systemctl", "--no-ask-password", "--user", "stop", "ag2-sparrow-claude-local.service"], 7),
+                                (["systemctl", "--no-ask-password", "--user", "restart", "ag2-sparrow.service"],
+                                 service_manager.TIMEOUT_S)])
 
     def test_every_shipped_service_name_literal_is_the_service_name(self):
         tree = ast.parse((PKG / "ag2_sparrow" / "adapters" / "hatch" / "cli.py").read_text(encoding="utf-8"))
