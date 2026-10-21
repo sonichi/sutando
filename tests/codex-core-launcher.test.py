@@ -2163,6 +2163,9 @@ exit 0
         inbox.mkdir(parents=True)
         (tasks / "task-owner.txt").write_text("task: already delivered\n")
         (results / "task-owner.txt").write_text("done\n")
+        # The router stages the worker's body before its sentinel, then retires the tasks/ copy.
+        (inbox / "bodies").mkdir()
+        os.rename(tasks / "task-owner.txt", inbox / "bodies" / "task-owner.txt")
         sentinel = inbox / "task-owner.accepted"
         sentinel.touch()
         env = dict(os.environ, PATH=f"{self.bin}:/usr/bin:/bin",
@@ -2182,6 +2185,8 @@ exit 0
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(sentinel.exists(), "successful done must retire the spent hold")
         self.assertTrue((workspace / "state/workers/worker-3/done/task-owner.flag").exists())
+        self.assertEqual((tasks / "archive" / "task-owner.txt").read_text(), "task: already delivered\n",
+                         "the retired body is archived")
 
     def test_worker_prune_failure_is_logged_without_losing_completion(self):
         workspace = self.root / "workspace"

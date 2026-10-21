@@ -109,24 +109,25 @@ namesake.
 | execution attempt | which incarnation accepted it, and its progress | one or more |
 
 ```
-tasks/task-123.txt                                              the payload: immutable, never copied, never moved until finish
+tasks/task-123.txt                                              the payload as admitted; leaves tasks/ once every recipient holds its body
+deliveries/7c54b230a8d94ea9b86f52d70134ac68/bodies/task-123.txt the delivered body, named for its task, written before the sentinel
 deliveries/7c54b230a8d94ea9b86f52d70134ac68/task-123.txt        a sentinel, 0 bytes — existing IS the assignment
 deliveries/7c54b230a8d94ea9b86f52d70134ac68/task-123.accepted   the same sentinel, suffix substituted
-tasks/archive/task-123.txt                                      finish (sentinel removed, payload archived)
+tasks/archive/task-123.txt                                      finish (body linked here, then body and sentinel removed)
 ```
 
 **Files under `deliveries/` are sentinels, not tasks.** A sentinel needs no content:
-the id is its name, the recipient is its folder, and the worker reads the payload from
-`tasks/`. The sentinel's folder is the **one** record of ownership; the payload's
-location records nothing, because it does not move until `finish`. Two records, two
-different facts — who owns it, what it says — so nothing can disagree.
+the id is its name, the recipient is its folder, and the worker reads the body from
+its own `bodies/` folder. The sentinel's folder is the **one** record of ownership; the
+body sits under that same folder, so it can only repeat the owner, never contradict it.
+The `tasks/` copy goes once every recipient holds a body, so `tasks/*.txt` lists only the
+core's own work and no reader of `tasks/` adopts a routed task.
 
-**Why not move the payload into the folder instead** (the rescue line's shape, and a
-draft of this section): a set to N workers then costs N copies of the payload plus a
-persisted member list so a crash mid-copy resumes rather than repeats. With sentinels a
-set is N empty files and one payload, and that machinery does not exist. The price is
-two extra residue rows below — a sentinel whose payload was archived, and a payload
-archived between noticing the sentinel and reading it — both bounded and cheap.
+**A body per recipient, staged before its sentinel.** A set to N workers costs N bodies
+(hard links where the filesystem allows, else copies through a temporary name) and no
+member list: a pass that crashes mid-set replays, finds each staged body is the payload,
+and writes only the missing sentinels. The body folder is opened without following links
+and refused when it is a symlink, so a planted link never decides which body is read.
 
 **Creating the sentinel assigns; renaming it records acceptance.** A worker never
 selects its own work, so nothing is *accepted* — the folder already decided the
@@ -443,8 +444,9 @@ Everything below is normative and meant to be built from directly.
 
 ```
 <workspace>/
-  tasks/<task-id>.txt                     payload (bridge header format), immutable after admission
+  tasks/<task-id>.txt                     payload (bridge header format), immutable after admission; the core's own work only
   tasks/archive/<task-id>.txt             terminal
+  deliveries/<recipient-id>/bodies/<task-id>.txt  the delivered body, staged before the sentinel
   deliveries/<recipient-id>/<task-id>.txt      sentinel, 0 bytes, pending
   deliveries/<recipient-id>/<task-id>.accepted sentinel, 0 bytes, accepted by one incarnation
   results/<task-id>.txt                   reply body
@@ -495,8 +497,9 @@ Input is the roster and one admitted task; nothing else may be read.
 1. Load `state/roster.json`. **Unreadable or absent → refuse the pass and report.** Never default to the core.
 2. Resolve the target: `requested_worker` if present and non-null, else the binding for the task's source, else `core`. A set resolves to its member list.
 3. Any target not in the roster resolves to `core`. State is not read.
-4. For each target: if `deliveries/<target>/<task-id>.txt` **or** `<task-id>.accepted` already exists, it is delivered — do nothing. **Checking only the pending name would recreate a sentinel for work in flight and deliver it twice.** Otherwise `os.open(…, O_CREAT|O_EXCL)`, treating `EEXIST` as delivered.
-5. A set is step 4 once per member; the payload is never copied.
+4. For each target: if `deliveries/<target>/<task-id>.txt` **or** `<task-id>.accepted` already exists, it is delivered — do not deliver again, but stage its body when it has none, so a sentinel written before bodies existed stops pointing at `tasks/`. **Checking only the pending name would recreate a sentinel for work in flight and deliver it twice.** Otherwise stage the body in `bodies/`, then `os.open(…, O_CREAT|O_EXCL)`, treating `EEXIST` as delivered.
+5. A set is step 4 once per member. Once every member holds a body, the `tasks/` copy is removed. That check and the removal happen under every member's folder lock, the lock a withdrawn hold takes, so the last copy is never removed while a hold is being withdrawn.
+6. Deliveries made before bodies existed are migrated by `pool_router.py migrate` (also the first step of every remedy pass): each holder gets its body, then the `tasks/` copy goes by the same locked check. A body that exists but cannot be opened is unreadable, never absent: the resolver exits retryable and no sentinel is retired on it.
 
 The name keeps `.txt` because the watcher a worker runs emits for no other extension; accepting substitutes the suffix, so a accepted file stops waking anyone.
 
@@ -509,7 +512,7 @@ Order candidates `urgent > normal > low`, then oldest payload `created_at` first
 1. Watch `deliveries/<me>/`, plus one sweep of the same folder at boot. The sweep is not optional: a delivery written while the session was down produces no event.
 2. Candidates are entries ending in `.txt`.
 3. Accept: `os.rename(<task-id>.txt, <task-id>.accepted)`. **`OSError` means somebody won the race — skip the task and continue.** It is the core releasing, or another incarnation of this same worker.
-4. Read `tasks/<task-id>.txt`. **Missing → the payload was archived under it; remove the stale sentinel and continue.**
+4. Read `bodies/<task-id>.txt`, or `tasks/<task-id>.txt` for a sentinel that has no body yet. **Neither → the payload was archived under it; remove the stale sentinel and continue.**
 5. Execute, then `finish`.
 
 A worker reads no directory but its own, never lists `tasks/`, and never takes work
@@ -525,9 +528,9 @@ Then, in this order, each step durable before the next:
 
 1. `results/<task-id>.txt` — write to `results/.tmp-<me>-<task-id>`, `fsync`, `os.rename` into place.
 2. `state/workers/<me>/done/<task-id>.flag` — create, `fsync`.
-3. Remove the sentinel, then `os.rename` the payload into `tasks/archive/<task-id>.txt`.
+3. Under the folder's lock and through its fds, hard-link the body to `tasks/archive/<task-id>.txt`, then remove the body and the sentinel.
 
-Archiving is no-clobber: on collision mint `<task-id>.txt.1`, `.2`, …
+Archiving never replaces: a link fails on an existing name, which passes only when it is provably this body (a regular file, not followed, with the same inode or the same bytes). Any other collision, and any filesystem without hard links, keeps the body and its sentinel. A withdrawn hold returns the body to `tasks/` the same way, and retires the sentinel and the hold only after that link succeeds.
 
 ### Residue, read at boot
 

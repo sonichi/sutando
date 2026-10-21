@@ -41,8 +41,11 @@ bind a room. An unbound worker can receive tasks addressed to its ID.
 Codex assigns new conversation IDs itself. Until its assigned ID is captured,
 the worker's `runtime_session_id` is `null`, `--resume` refuses, and recovery
 starts a fresh Codex conversation with the same worker ID and inbox. The
-notifier resolves delivery sentinels to payloads in shared `tasks/`, writes
-results to shared `results/`, and records the worker's done flag.
+notifier resolves delivery sentinels to their payloads (the body the router wrote as
+`bodies/<task id>.txt` under the inbox, announced as `TASK_FILE: <absolute body path>`) and keys
+the task by that `<task id>.txt` name;
+it writes results to shared `results/<task id>.txt`, and records
+the worker's done flag.
 If the worker dies mid-turn, recovery re-delivers the task in that fresh
 conversation without memory of any partial work from the previous turn.
 
@@ -150,12 +153,29 @@ and zero or more **workers**, each with its own tmux session, watcher and inbox
 what there is, is the task file. `pool_ask` uses it, so an ask is an ordinary task
 the owner can see, and a reply is an ordinary result.
 
-**A worker's queue is its own inbox and nothing else.** `tasks/` holds every
-instance's payloads, the core's and every other worker's in flight; a task is yours
-only while its sentinel sits in `deliveries/<your id>/`. Never list `tasks/` to find
-work, and never answer a task file you found there: the result would be posted as a
-reply in a room bound to someone else. The watcher's `QUEUE: n pending after this`
+**A worker's queue is its own inbox and nothing else.** A task is yours only while
+its sentinel sits in `deliveries/<your id>/`; the router writes its text to
+`deliveries/<your id>/bodies/<task id>.txt` (body first, then the sentinel) and removes the `tasks/`
+copy once every recipient holds one, so `tasks/` lists the core's own work and
+nothing routed. Never list `tasks/` to find work, and never answer a task file you
+found there: the result would be posted as a reply in a room bound to someone else.
+A finished body is archived to `tasks/archive/` by the pool's own prune, by a hard link that never
+replaces anything (an archive name holding anything but that same body, or a filesystem without
+hard links, keeps the body and its sentinel); a withdrawn
+hold (`clear_pending`) puts it back in `tasks/` for the core. The watcher's `QUEUE: n pending after this`
 counts your inbox, and that count is the only queue you have.
+
+**Upgrading to body folders.** In this order, right after pulling:
+1. Migrate the deliveries made before bodies existed (a sentinel whose payload is still in `tasks/`):
+   `python3 skills/worker-pool/scripts/pool_router.py migrate --workspace <workspace>`. It stages each
+   body and retires the `tasks/` copy under the router's locks, so the core stops listing the task. The
+   remedy timer runs the same step first on every pass, so it also happens within 5 minutes unrun.
+2. Restart each worker's watcher and notifier together: a notifier started before the upgrade refuses
+   the absolute body path (it types nothing, never the empty sentinel). End its `<worker session>-watcher`
+   tmux session, and `worker-watcher-supervisor.sh` (or the remedy timer) starts both from the new code;
+   the new watcher's start-up sweep announces what the old pair refused.
+
+A worker's own session watcher needs nothing: an older one announces the same absolute path, named for its task.
 
 ```
 python3 skills/worker-pool/scripts/pool_ask.py --workspace "$WS" --who

@@ -154,6 +154,10 @@ def ask(workspace, to: str, question: str, *, wait_s: float = 0.0,
         # so whichever runs second reports `already` and delivers nothing twice.
         task = {"id": task_id, "source": SOURCE, "requested_worker": rid}
         out["route"] = rt.route(ws, task, roster)
+        # Routing moves the payload beside the recipient's sentinel; hand back where it is now.
+        moved = rt.pd.payload_location(ws, task_id, rid)
+        if moved is not None:
+            out["task_file"] = str(moved)
     if wait_s > 0:
         out["reply"] = wait_for_reply(ws, task_id, wait_s, sleep=sleep)
     return out

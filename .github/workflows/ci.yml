@@ -396,6 +396,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # The rolling-upgrade suites unpack main's own watcher and notifiers; a
+      # depth-1 checkout has no main ref, and those suites fail in CI without one.
+      - name: Fetch main for the rolling-upgrade suites
+        run: git fetch --no-tags --depth=1 origin +refs/heads/main:refs/remotes/origin/main
 
       - name: Setup Node
         uses: actions/setup-node@v4

@@ -462,7 +462,21 @@ def main(argv=None) -> int:
         print(json.dumps({"suspended": suspend(a.workspace, a.suspend)}))
         return 0
     with pool_lock(a.workspace):
+        if not a.dry_run:
+            migrate_main_era(a.workspace)
         return _sweep(a)
+
+
+def migrate_main_era(workspace) -> None:
+    """First, on every pass: deliveries made before bodies existed get theirs, and tasks/
+    stops listing them. Never fails the pass; what it cannot read it leaves as it was."""
+    try:
+        out = _sibling("pool_router").migrate_main_era(workspace)
+    except Exception as e:  # noqa: BLE001 — supervision must still run
+        print(f"pool_remedy: migrate skipped: {type(e).__name__}: {e}", file=sys.stderr)
+        return
+    if out["migrated"] or out["kept"]:
+        print(f"pool_remedy: migrate {json.dumps(out, sort_keys=True)}", file=sys.stderr)
 
 
 def _repair_human_cards(workspace, tick) -> None:

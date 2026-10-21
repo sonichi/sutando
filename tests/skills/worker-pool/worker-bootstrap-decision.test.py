@@ -181,6 +181,11 @@ class TestMain(Base):
         d.mkdir(parents=True, exist_ok=True)
         return d
 
+    def _sentinels(self, d):
+        """The folder's sentinels: its lock file and body folder are not ones."""
+        pd = self._pd()
+        return sorted(p.name for p in d.iterdir() if p.name not in (pd.LOCK_NAME, pd.BODY_DIR))
+
     def test_the_boot_decision_prunes_spent_sentinels_and_keeps_owed_ones(self):
         """A delivered task's sentinel outlived its payload and its result; every
         Stop hook and startup sweep re-walked all of them (#4614)."""
@@ -198,7 +203,7 @@ class TestMain(Base):
         self.assertEqual(len(sweep), 1, out)
         self.assertIn("stale=3", sweep[0])
         self.assertIn("kept=1", sweep[0])
-        self.assertEqual(sorted(p.name for p in d.iterdir()), ["task-owed.txt"])
+        self.assertEqual(self._sentinels(d), ["task-owed.txt"])
 
     def test_the_prune_never_releases_an_accepted_delivery(self):
         """On `skip` this worker's own watcher is live, so an accepted sentinel is
@@ -210,7 +215,7 @@ class TestMain(Base):
         (d / f"task-live{pd.ACCEPTED_SUFFIX}").touch()
         out = wb.prune_spent_sentinels(str(self.ws), WORKER)
         self.assertIn("kept=1", out)
-        self.assertEqual([p.name for p in d.iterdir()], [f"task-live{pd.ACCEPTED_SUFFIX}"],
+        self.assertEqual(self._sentinels(d), [f"task-live{pd.ACCEPTED_SUFFIX}"],
                          "an in-flight delivery was renamed back to pending")
 
     def test_every_way_a_finished_sentinel_can_be_spent(self):
@@ -231,14 +236,31 @@ class TestMain(Base):
         # task-arch: payload present, no live result, but the payload is archived.
         (tasks / "task-arch.txt").write_text("id: task-arch\nsource: test\ntask: x\n")
         arch = pd.archived_payload(Path(self.ws), "task-arch")
-        arch.parent.mkdir(parents=True, exist_ok=True); arch.write_text("archived")
+        arch.parent.mkdir(parents=True, exist_ok=True)
+        # The boot migrates this payload into a body first; archiving it then needs the archive to
+        # hold the same bytes, since a different file at that name keeps the body and sentinel.
+        arch.write_text((tasks / "task-arch.txt").read_text())
         # Each one alone, so a shared fixture cannot mask a branch that never runs.
         self.assertTrue(pd._nothing_can_re_queue(Path(self.ws), "task-gone"), "payload gone")
         self.assertTrue(pd._nothing_can_re_queue(Path(self.ws), "task-result"), "ready result")
         self.assertTrue(pd._nothing_can_re_queue(Path(self.ws), "task-arch"), "archived payload")
         out = wb.prune_spent_sentinels(str(self.ws), WORKER)
         self.assertIn("retired=3", out)
-        self.assertEqual(list(d.iterdir()), [])
+        self.assertEqual(self._sentinels(d), [])
+
+    def test_a_failing_migration_skips_this_boots_prune_and_keeps_every_sentinel(self):
+        import importlib
+        import unittest.mock as um
+        d = self._inbox_dir()
+        (d / "task-spent.txt").touch()                       # spent: no payload anywhere
+        router = importlib.import_module("pool_router")
+        with um.patch.object(router, "migrate_main_era", side_effect=RuntimeError("boom")):
+            out = wb.prune_spent_sentinels(str(self.ws), WORKER)
+        self.assertEqual(out, "migrate=failed (boom) prune=skipped")
+        self.assertEqual(self._sentinels(d), ["task-spent.txt"], "nothing pruned this boot")
+        # The next boot, with a working migration, prunes as usual.
+        self.assertIn("stale=1", wb.prune_spent_sentinels(str(self.ws), WORKER))
+        self.assertEqual(self._sentinels(d), [])
 
     def test_a_sentinel_named_by_both_stages_is_judged_once(self):
         """The same task can sit in the folder as `.accepted` and `.txt`; the
@@ -262,13 +284,18 @@ class TestMain(Base):
             (tasks / f"{tid}.txt").write_text(f"id: {tid}\nsource: test\ntask: x\n")
             (d / f"{tid}.txt").touch()
             pd.mark_done(self.ws, WORKER, tid, published=True)
+        # The core holds task-fin too, so the boot's migration leaves its tasks/ copy in place.
+        (Path(self.ws) / "deliveries" / "core").mkdir(exist_ok=True)
+        (Path(self.ws) / "deliveries" / "core" / "task-fin.txt").touch()
         # task-done's reply is archived, so nothing can re-queue it; task-fin's is not.
         arch = pd.archived_payload(Path(self.ws), "task-done"); arch.parent.mkdir(parents=True, exist_ok=True)
-        arch.write_text("archived")
+        # Same bytes as the payload: the boot migrates it into a body, and archiving that body
+        # over a different file at this name would keep it instead of retiring it.
+        arch.write_text((tasks / "task-done.txt").read_text())
         out = wb.prune_spent_sentinels(str(self.ws), WORKER)
         self.assertIn("retired=1", out)
         self.assertIn("kept=1", out)
-        self.assertEqual([p.name for p in d.iterdir()], ["task-fin.txt"])
+        self.assertEqual(self._sentinels(d), ["task-fin.txt"])
 
     def test_a_sweep_failure_is_reported_and_never_changes_the_decision(self):
         """A prune that raises must leave the decision, its exit code and its first

@@ -20,6 +20,8 @@ from __future__ import annotations
 import contextlib
 import fcntl
 import os
+import shutil
+import stat
 import sys
 from pathlib import Path
 
@@ -213,10 +215,18 @@ def deliver_one(workspace, recipient: str, task_id: str,
         if marker != "absent":
             raise ConflictingDelivery(
                 f"{task_id}: {recipient} carries {pd.NON_EXCLUSIVE_MARKER} ({marker}); refusing to deliver into it")
+        src = pd.payload_path(Path(workspace), task_id)
         if pd.find_in(dfd, task_id) is not None:
+            # A sentinel delivered before bodies existed names only the tasks/ copy:
+            # it gets its body now, so the route can retire that copy.
+            if recipient != pr.CORE and src.is_file():
+                _hold_body(src, recipient, task_id, dfd)
             _attribute(workspace, recipient, task_id)
             return "already"
-        if not pd.payload_path(Path(workspace), task_id).is_file():
+        if recipient == pr.CORE:
+            if not src.is_file():
+                return "no-payload"
+        elif _hold_body(src, recipient, task_id, dfd) is None:
             return "no-payload"
         try:
             os.close(os.open(task_id + pd.PENDING_SUFFIX, os.O_CREAT | os.O_EXCL, 0o644, dir_fd=dfd))
@@ -229,6 +239,137 @@ def deliver_one(workspace, recipient: str, task_id: str,
         # fact. Recording earlier attributed refusals that never delivered.
         _attribute(workspace, recipient, task_id)
     return "delivered"
+
+
+def _hold_body(src: Path, recipient: str, task_id: str, dfd: int) -> "str | None":
+    """Make sure the recipient holds the body, staged from `src` when absent; a body
+    from an earlier pass must BE the payload. None when there is neither."""
+    try:
+        bfd = pd.open_body_dir(dfd, create=src.is_file())
+    except OSError as e:
+        raise UnreadableEvidence(f"{task_id}: {recipient}/{pd.BODY_DIR} cannot be opened ({e}); refusing to deliver") from e
+    if bfd is None:
+        return None
+    try:
+        body = task_id + pd.PENDING_SUFFIX
+        state = pd.regular_file_state(body, dir_fd=bfd)
+        if state == "absent":
+            if not src.is_file():
+                return None
+            _stage_body(src, body, bfd)
+        elif state != "regular":
+            raise UnreadableEvidence(f"{task_id}: {recipient}/{pd.BODY_DIR}/{body} is {state}; refusing to deliver")
+        elif src.is_file():
+            _require_same_body(src, body, bfd, task_id)
+        return body
+    finally:
+        os.close(bfd)
+
+
+def _stage_body(src: Path, name: str, dfd: int) -> None:
+    """The payload in the recipient's body folder: a link when the filesystem allows it, else a
+    copy through a temporary name. EEXIST is a prior pass that got this far."""
+    try:
+        os.link(str(src), name, dst_dir_fd=dfd)
+        return
+    except FileExistsError:
+        _require_same_body(src, name, dfd, name)
+        return
+    except OSError:
+        pass
+    tmp = f".{name}.{os.getpid()}"
+    with open(src, "rb") as fh:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644, dir_fd=dfd)
+        try:
+            with os.fdopen(fd, "wb") as out:
+                shutil.copyfileobj(fh, out)
+            os.rename(tmp, name, src_dir_fd=dfd, dst_dir_fd=dfd)
+        except BaseException:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(tmp, dir_fd=dfd)
+            raise
+
+
+def _require_same_body(src: Path, name: str, dfd: int, task_id: str) -> None:
+    """An existing body counts as a prior pass only when it IS the payload: a regular
+    file, never followed, that is the same inode or holds the same bytes."""
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0), dir_fd=dfd)
+    except OSError as e:
+        raise UnreadableEvidence(f"{task_id}: existing body {name} cannot be opened ({e}); refusing to deliver") from e
+    with os.fdopen(fd, "rb") as fh:
+        st = os.fstat(fh.fileno())
+        if not stat.S_ISREG(st.st_mode):
+            raise ConflictingDelivery(f"{task_id}: existing body {name} is not a regular file; refusing to deliver")
+        try:
+            sst = os.stat(src)
+            if (sst.st_dev, sst.st_ino) == (st.st_dev, st.st_ino):
+                return
+            same = fh.read() == src.read_bytes()
+        except OSError as e:
+            raise UnreadableEvidence(f"{task_id}: cannot compare body {name} with {src} ({e})") from e
+    if not same:
+        raise ConflictingDelivery(f"{task_id}: existing body {name} differs from the payload; refusing to deliver")
+
+
+def _retire_core_copy(workspace, task_id: str, targets: list) -> None:
+    """The move completes: once every recipient holds the body, tasks/ stops
+    listing the task, so no reader of the core's inbox adopts it. Checked and done
+    under every recipient's lock (the one a withdrawn hold takes), so a body cannot
+    leave between the check and the unlink: one payload always survives."""
+    ws = Path(workspace)
+    with contextlib.ExitStack() as held:
+        for t in sorted(set(targets)):
+            try:
+                dfd = held.enter_context(pd.arbitration(ws, t))
+                bfd = pd.open_body_dir(dfd)
+            except OSError:
+                return
+            if bfd is None:
+                return
+            try:
+                if pd.regular_file_state(task_id + pd.PENDING_SUFFIX, dir_fd=bfd) != "regular":
+                    return
+            finally:
+                os.close(bfd)
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(pd.payload_path(ws, task_id))
+
+
+def migrate_main_era(workspace) -> dict:
+    """Give every delivery made before bodies existed (a sentinel, its payload still in
+    tasks/) its body, and retire the tasks/ copy once every holder has one. Idempotent;
+    a task whose evidence cannot be read is left exactly as it was."""
+    ws = Path(workspace)
+    out = {"migrated": [], "kept": []}
+    root = pd.deliveries_dir(ws, pr.CORE).parent
+    try:
+        names = prec.iter_recipients(root) if root.is_dir() else []
+    except OSError as e:
+        print(f"pool_router: migrate: cannot list {root}: {e}", file=sys.stderr)
+        return out
+    ids = sorted({pd.parse_sentinel(p.name)[0] for n in names if n != pr.CORE
+                  for p in pd.pending(ws, n) + pd.accepted(ws, n)})
+    for task_id in ids:
+        src = pd.payload_path(ws, task_id)
+        if not src.is_file():
+            continue
+        try:
+            with task_arbitration(ws, task_id):
+                held = holders(ws, task_id)
+                if not held or pr.CORE in held:
+                    continue
+                for h in held:
+                    with pd.arbitration(ws, h) as dfd:
+                        if pd.find_in(dfd, task_id) is not None and src.is_file():
+                            _hold_body(src, h, task_id, dfd)
+                _retire_core_copy(ws, task_id, held)
+        except (RouterRefused, OSError) as e:
+            print(f"pool_router: migrate: {task_id} kept as it was: {e}", file=sys.stderr)
+            out["kept"].append(task_id)
+            continue
+        out["migrated" if not src.exists() else "kept"].append(task_id)
+    return out
 
 
 def _attribute(workspace, recipient: str, task_id: str) -> None:
@@ -279,6 +420,8 @@ def route(workspace, task: dict, roster=FROM_DISK, _between_suffix_checks=None, 
         buckets = {"delivered": [], "already": [], "no-payload": []}
         for t in targets:
             buckets[deliver_one(workspace, t, task_id, _arbitration_seams=_arbitration_seams)].append(t)
+        if targets and pr.CORE not in targets and not buckets["no-payload"]:
+            _retire_core_copy(workspace, task_id, targets)
     return {"task_id": task_id, "version": r.get("version"), "targets": targets,
             "delivered": buckets["delivered"], "already": buckets["already"],
             "skipped": buckets["no-payload"],
@@ -292,3 +435,18 @@ def route_all(workspace, tasks, roster=None) -> list:
     if r is None:
         raise RouterRefused("roster is absent or unreadable — refusing the pass")
     return [route(workspace, t, r) for t in order_candidates(tasks)]
+
+
+def main(argv=None) -> int:
+    import argparse
+    import json
+    ap = argparse.ArgumentParser(description="worker-pool router maintenance")
+    ap.add_argument("command", choices=["migrate"])
+    ap.add_argument("--workspace", required=True)
+    a = ap.parse_args(argv)
+    print(json.dumps(migrate_main_era(a.workspace), sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

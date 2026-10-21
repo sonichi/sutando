@@ -123,7 +123,7 @@ class TestResolverExitCodes(unittest.TestCase):
         p.chmod(0o600)
         rc, out, _ = self.main(self.sentinel("task-u"))
         self.assertEqual(rc, 0)
-        self.assertEqual(Path(out).resolve(), p.resolve())
+        self.assertEqual(Path(out.splitlines()[0]).resolve(), p.resolve())
 
     @unittest.skipIf(os.geteuid() == 0, "root can open a mode-000 file")
     def test_the_shell_shim_keeps_rc_1_retryable_and_rc_3_typed(self):

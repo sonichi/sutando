@@ -37,7 +37,7 @@ CLI, for bash callers with only an interpreter path:
 `announced-entry` is the one reading of a watcher's `TASK_FILE:` line: a bare name is a file in
 `tasks_dir`; an absolute path is what a resolver-backed watcher announces (the payload a delivery
 sentinel stands for) and is accepted only from such a watcher, and only inside the payload store the
-caller names (`--resolved <payload_dir>`). The key is what every result, marker and queue entry is
+caller names (`--resolved <payload_dir>`), or in a folder directly under the inbox. The key is what every result, marker and queue entry is
 filed under; the payload is what the prompt tells the session to read.
 
 `inflight-*` is the at-most-once record a notifier keeps between a confirmed submit and a
@@ -55,6 +55,7 @@ answering about an archived body while reading an untouched live placeholder ins
 from __future__ import annotations
 
 import os
+import stat
 import sys
 import tempfile
 from pathlib import Path
@@ -77,27 +78,43 @@ __all__ = [
 ]
 
 
+# A worker's delivered bodies: `deliveries/<worker>/bodies/<id>.txt`. The pool's writer owns
+# the layout (pool_delivery.BODY_DIR); a test pins the two names together.
+DELIVERY_BODY_DIR = "bodies"
+
+
 def announced_entry(tasks_dir: "Path | str", announced: str, *,
                     payload_dir: "Path | str | None" = None) -> "tuple[str, Path] | None":
     """(queue key, payload path) for one `TASK_FILE:` announcement, or None to refuse it.
 
-    A bare name is a file in `tasks_dir`. An absolute path is accepted only when the
-    caller runs a resolver-backed watcher and says where that watcher's payloads live
-    (`payload_dir`, the owning workspace's task store), only for an existing regular
-    file directly inside it; its basename is the key. Anything else (empty, traversal,
-    a relative path, any absolute path when no `payload_dir` is given, a file anywhere
-    else) is refused: the caller then types nothing.
+    A bare name is a `*.txt` file in `tasks_dir`. An absolute path is accepted only when the
+    caller runs a resolver-backed watcher, only for an existing regular `*.txt` file (not a
+    symlink) directly inside the payload store it names (`payload_dir`, the owning
+    workspace's task store) or inside the real `bodies/` folder of a delivery inbox
+    (`deliveries/<worker>/`) that `tasks_dir` names; its basename is the key. Anything else
+    (empty, traversal, a relative path, any absolute path when no `payload_dir` is given, any
+    other folder such as an archive) is refused: the caller then types nothing.
     """
-    if not announced or ".." in announced:
+    if not announced or ".." in announced or not announced.endswith(".txt"):
         return None
     if "/" not in announced:
         return announced, Path(tasks_dir) / announced
     if payload_dir is None or not announced.startswith("/"):
         return None
     payload = Path(announced)
-    if not payload.name or payload.resolve().parent != Path(payload_dir).resolve() or not payload.is_file():
+    try:
+        if not stat.S_ISREG(os.lstat(payload).st_mode):
+            return None
+    except OSError:
         return None
-    return payload.name, payload
+    parent = payload.parent
+    if parent.resolve() == Path(payload_dir).resolve():
+        return payload.name, payload
+    inbox = Path(tasks_dir).resolve()
+    if (parent.name == DELIVERY_BODY_DIR and not parent.is_symlink() and inbox.parent.name == "deliveries"
+            and parent.parent.resolve() == inbox):
+        return payload.name, payload
+    return None
 
 
 def _task_id_for_filename(filename: str) -> str:
@@ -172,8 +189,9 @@ def worker_holds(deliveries_dir: "Path | str", filename: str) -> bool:
     """True iff some worker's own `deliveries/<worker>/` folder holds a sentinel for this task.
 
     The pool router hands a task to a worker by writing `<id>.txt` there (the
-    worker renames it `.accepted` / `.claimed`); the task file itself stays in
-    `tasks/`, so a queue reader that never looks here re-delivers it to the core.
+    worker renames it `.accepted` / `.claimed`); until every recipient holds the
+    payload the task file can still sit in `tasks/`, so a queue reader that never
+    looks here re-delivers it to the core.
     An absent root is the no-pool case (False); a root that exists but cannot be
     listed raises WorkerHoldUnreadable — a caller must hold, never deliver, on it.
     """

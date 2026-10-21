@@ -4,9 +4,11 @@
 Stage 1 of docs/worker-pool-design.md. A recipient — the core, or later a
 worker — receives work as *sentinels* in `deliveries/<recipient>/`:
 
-    tasks/<task-id>.txt                      the payload; immutable, never copied
+    tasks/<task-id>.txt                      the payload as admitted; gone once every recipient holds a body
+    deliveries/<me>/bodies/<task-id>.txt     the delivered body, staged before the sentinel
     deliveries/<me>/<task-id>.txt            a sentinel; existing IS the assignment
     deliveries/<me>/<task-id>.accepted       the same sentinel, suffix substituted
+    tasks/archive/<task-id>.txt              a finished body, by a link that never replaces
 
 Creating the sentinel assigns (the router's job, not this module's). Renaming it
 records that the ASSIGNED recipient accepted the work — a worker never selects
@@ -41,8 +43,8 @@ from workspace_default import resolve_workspace  # noqa: E402
 
 from delivery.readiness import read_ready_result  # noqa: E402
 from pool_record import (RECIPIENT, DONE_STAGE, PENDING_STAGE,  # noqa: E402
-                         RecipientAliasError, RecordState, read_record_state, record_path, require_own_dir,
-                         require_recipient, workers_root)
+                         RecipientAliasError, RecordState, iter_recipients, read_record_state, record_path,
+                         require_own_dir, require_recipient, workers_root)
 
 # `.txt` because the watcher that wakes a worker emits for no other extension.
 PENDING_SUFFIX = ".txt"
@@ -50,6 +52,10 @@ ACCEPTED_SUFFIX = ".accepted"
 # Sentinels written before the rename. Recognised so work already accepted under
 # the old name is never re-delivered; nothing writes this suffix.
 LEGACY_ACCEPTED_SUFFIX = ".claimed"
+# The delivered payload, `<dir>/<id>.txt` under the sentinel's folder: named for its task, so
+# any watcher announces it by an absolute path, and never in a folder a watcher lists.
+BODY_DIR = "bodies"
+
 # Not a sentinel: the regex below never matches it, so listings skip it.
 LOCK_NAME = ".lock"
 # A folder holding this file takes claims, not deliveries: the core's held-readers count
@@ -69,6 +75,11 @@ _SENTINEL = re.compile(
 
 class NotDelivered(Exception):
     """The sentinel named is absent, malformed, or not this recipient's."""
+
+
+class PayloadUnreadable(OSError):
+    """A delivered body exists but this call could not open it (EACCES, EIO): a fact
+    about the call, never that the payload is gone, so nothing may be retired on it."""
 
 
 def parse_sentinel(name: str) -> tuple[str, bool] | None:
@@ -95,6 +106,141 @@ def payload_path(workspace: Path, task_id: str) -> Path:
 
 def archived_payload(workspace: Path, task_id: str) -> Path:
     return _root(workspace) / "tasks" / "archive" / f"{task_id}{PENDING_SUFFIX}"
+
+
+def body_path(workspace: Path, recipient: str, task_id: str) -> Path:
+    """The payload as delivered: under the recipient's folder, so ownership is
+    the directory and no reader of tasks/ sees a routed task."""
+    return deliveries_dir(workspace, recipient) / BODY_DIR / f"{task_id}{PENDING_SUFFIX}"
+
+
+def require_body_dir(folder: Path) -> None:
+    """A symlink at the body folder would let a planted link decide which body is read."""
+    if (Path(folder) / BODY_DIR).is_symlink():
+        raise RecipientAliasError(errno.ELOOP, "body directory is a symlink alias", str(Path(folder) / BODY_DIR))
+
+
+def open_body_dir(dfd: int, create: bool = False) -> "int | None":
+    """The body folder opened relative to its recipient's folder fd, never followed;
+    None when it is absent and not created."""
+    if create:
+        with contextlib.suppress(FileExistsError):
+            os.mkdir(BODY_DIR, 0o755, dir_fd=dfd)
+    try:
+        return os.open(BODY_DIR, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0), dir_fd=dfd)
+    except FileNotFoundError:
+        return None
+
+
+def payload_location(workspace: Path, task_id: str, recipient: str | None = None) -> Path | None:
+    """Where the task text is: the core's tasks/ copy, else the delivered body
+    (this recipient's, or any recipient's when none is named). None when gone."""
+    ws = Path(workspace)
+    p = payload_path(ws, task_id)
+    if p.is_file():
+        return p
+    root = _root(ws) / "deliveries"
+    if recipient:
+        names = [require_recipient(recipient)]
+    else:
+        try:
+            names = iter_recipients(root)   # raises RecipientAliasError on an aliased folder
+        except FileNotFoundError:
+            names = []
+    for name in names:
+        d = root / name
+        if d.is_symlink():
+            raise RecipientAliasError(errno.ELOOP, "recipient directory is a symlink alias", str(d))
+        require_body_dir(d)
+        b = d / BODY_DIR / f"{task_id}{PENDING_SUFFIX}"
+        state = regular_file_state(b)
+        if state == "regular":
+            return b
+        if state == "unknown":
+            raise PayloadUnreadable(errno.EIO, "delivered body cannot be opened; retry", str(b))
+    return None
+
+
+def _publish_body(bfd: int, name: str, dst: Path) -> None:
+    """Link the body at `name` (relative to its folder's fd, never followed) to `dst`.
+    A link never replaces what is there; an existing `dst` passes only when it is provably
+    this body, and anything else raises OSError with both names left as they were."""
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.link(name, str(dst), src_dir_fd=bfd, follow_symlinks=False)
+    except FileExistsError:
+        if not _same_regular_body(name, dst, body_dir_fd=bfd):
+            raise OSError(errno.EEXIST, "destination holds a different file", str(dst)) from None
+
+
+def _archive_and_retire(ws: Path, recipient: str, task_id: str) -> bool:
+    """Archive a finished body to tasks/archive/ and retire its sentinel, as one transition
+    under the folder's lock and through its fds, so a folder swapped meanwhile is never read.
+    False (reason on stderr) keeps body and sentinel: a link failed, or the archive name
+    holds something that is not provably this body."""
+    try:
+        with arbitration(ws, recipient) as dfd:
+            bfd = open_body_dir(dfd)
+            if bfd is not None:
+                try:
+                    name = task_id + PENDING_SUFFIX
+                    state = regular_file_state(name, dir_fd=bfd)
+                    if state not in ("absent", "regular"):
+                        raise OSError(errno.EINVAL, f"body is {state}", name)
+                    if state == "regular":
+                        _publish_body(bfd, name, archived_payload(ws, task_id))
+                        with contextlib.suppress(FileNotFoundError):
+                            os.unlink(name, dir_fd=bfd)
+                finally:
+                    os.close(bfd)
+            sentinel = find_in(dfd, task_id)
+            if sentinel is not None:
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(sentinel, dir_fd=dfd)
+    except OSError as e:
+        print(f"pool_delivery: cannot archive {task_id} for {recipient}: {e}; keeping its body and sentinel",
+              file=sys.stderr)
+        return False
+    return True
+
+
+def _open_regular(path, dir_fd=None):
+    """An fd on a regular file at exactly that name, never followed, or None."""
+    try:
+        fd = os.open(str(path), os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0), dir_fd=dir_fd)
+    except OSError:
+        return None
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        return None
+    return fd
+
+
+def _same_regular_body(body, dst, body_dir_fd=None) -> bool:
+    """True only when both names are regular files (not followed) that are one inode
+    or hold the same bytes, compared in full."""
+    fds = [_open_regular(body, body_dir_fd), _open_regular(dst)]
+    try:
+        if None in fds:
+            return False
+        a, d = (os.fstat(fd) for fd in fds)
+        if (a.st_dev, a.st_ino) == (d.st_dev, d.st_ino):
+            return True
+        if a.st_size != d.st_size:
+            return False
+        with os.fdopen(os.dup(fds[0]), "rb") as fa, os.fdopen(os.dup(fds[1]), "rb") as fd_:
+            while True:
+                x, y = fa.read(65536), fd_.read(65536)
+                if x != y:
+                    return False
+                if not x:
+                    return True
+    except OSError:
+        return False
+    finally:
+        for fd in fds:
+            if fd is not None:
+                os.close(fd)
 
 
 def results_dir(workspace) -> Path:
@@ -172,23 +318,40 @@ def clear_pending(workspace, recipient: str, task_id: str) -> Path:
     the live core, or its handler never ran. Retires this recipient's sentinel with
     it. Never touches `.flag` -- a finish is never undone -- and is idempotent, so a
     fallback that fires twice is harmless.
+
+    The body goes back to tasks/ by a link that never replaces, and only a proven
+    restore retires anything: on any failure (OSError) body, sentinel and hold all stay.
     """
     require_recipient(recipient)
     if not _SENTINEL.match(task_id + PENDING_SUFFIX):
         raise ValueError(f"not a task id: {task_id!r}")
     pend = pending_flag(workspace, recipient, task_id)
-    with contextlib.suppress(FileNotFoundError):
-        os.unlink(pend)
     # The live core owns the payload now; a sentinel left here reads `completed`
     # once it publishes, and `sweep` retires only on a flag.
     if not is_done_flag(done_flag(workspace, recipient, task_id)):
         # Decide under the lock accept/release rename under; the flag check above is
         # not synchronized with mark_done, and a flag landing late only retires a finish.
         with arbitration(workspace, recipient) as dfd:
+            bfd = open_body_dir(dfd)
+            if bfd is not None:
+                try:
+                    body = task_id + PENDING_SUFFIX
+                    state = regular_file_state(body, dir_fd=bfd)
+                    if state not in ("absent", "regular"):
+                        raise OSError(errno.EINVAL, f"body is {state}", body)
+                    if state == "regular":
+                        # The core owns the payload again: a body left here would be a task nobody lists.
+                        _publish_body(bfd, body, payload_path(workspace, task_id))
+                        with contextlib.suppress(FileNotFoundError):
+                            os.unlink(body, dir_fd=bfd)
+                finally:
+                    os.close(bfd)
             name = find_in(dfd, task_id)
             if name is not None:
                 with contextlib.suppress(FileNotFoundError):
                     os.unlink(name, dir_fd=dfd)
+    with contextlib.suppress(FileNotFoundError):
+        os.unlink(pend)
     return pend
 
 
@@ -364,6 +527,7 @@ def residue(workspace: Path, recipient: str, task_id: str) -> str:
     """What a crash left behind, read without a journal.
 
     One name per state, each mapped by `sweep` to exactly one action.
+    `unreadable`: a delivered body exists but could not be opened; everything is kept.
     """
     ws = Path(workspace)
     # The shared readiness contract, not existence: an empty or whitespace-only
@@ -373,7 +537,10 @@ def residue(workspace: Path, recipient: str, task_id: str) -> str:
     # verdict is what `sweep` deletes on, so a planted link would retire real work.
     has_flag = is_done_flag(done_flag(ws, recipient, task_id))
     sentinel = find(ws, recipient, task_id)
-    payload = payload_path(ws, task_id).is_file()
+    try:
+        payload = payload_location(ws, task_id, recipient) is not None
+    except PayloadUnreadable:
+        return "unreadable"
 
     # The flag is terminal on its own: the bridge drains the result file on
     # delivery, so after a drain the flag is the only durable evidence left.
@@ -409,12 +576,20 @@ def prune_spent(workspace: Path, recipient: str) -> dict:
         if state == "stale-sentinel":
             p.unlink()
             actions["stale"].append(task_id)
-        elif state == "finished" and _nothing_can_re_queue(ws, task_id):
-            p.unlink()
-            actions["retired"].append(task_id)
+        elif state == "finished" and _nothing_can_re_queue(ws, task_id) and not _awaits_migration(
+                ws, recipient, task_id):
+            actions["retired" if _archive_and_retire(ws, recipient, task_id) else "kept"].append(task_id)
         else:
             actions["kept"].append(task_id)
     return actions
+
+
+def _awaits_migration(ws: Path, recipient: str, task_id: str) -> bool:
+    """A delivery made before bodies existed: its payload is only the tasks/ copy. Retiring
+    its sentinel would leave that copy with no holder, so it is kept for the migration."""
+    # The core reads tasks/ itself: its deliveries never get a body.
+    return (recipient != "core" and regular_file_state(payload_path(ws, task_id)) != "absent"
+            and regular_file_state(body_path(ws, recipient, task_id)) == "absent")
 
 
 def _nothing_can_re_queue(ws: Path, task_id: str) -> bool:
@@ -432,7 +607,7 @@ def sweep(workspace: Path, recipient: str) -> dict:
     so a reader that only streams never learns about it."""
     ws = Path(workspace)
     seen = set()
-    actions = {"ready": [], "released": [], "completed": [], "retired": [], "stale": []}
+    actions = {"ready": [], "released": [], "completed": [], "retired": [], "stale": [], "kept": []}
     for p in accepted(ws, recipient) + pending(ws, recipient):
         task_id = parse_sentinel(p.name)[0]
         if task_id in seen:
@@ -449,11 +624,15 @@ def sweep(workspace: Path, recipient: str) -> dict:
         elif state == "finished":
             # Both result and flag exist, so the delivery is spent. Leaving the
             # sentinel would hand finished work back as ready on the next boot.
-            p.unlink()
-            actions["retired"].append(task_id)
+            if _awaits_migration(ws, recipient, task_id):
+                actions["kept"].append(task_id)
+            else:
+                actions["retired" if _archive_and_retire(ws, recipient, task_id) else "kept"].append(task_id)
         elif state == "stale-sentinel":
             p.unlink()
             actions["stale"].append(task_id)
+        elif state == "unreadable":
+            actions["kept"].append(task_id)
         else:
             raise AssertionError(f"unmapped residue state {state!r} for {task_id}")
     return actions
@@ -465,8 +644,8 @@ def read_payload(workspace: Path, task_id: str) -> str | None:
     The bridges write header-format text, never JSON; a reader that wants
     fields parses it with local_task_protocol, not here.
     """
-    p = payload_path(Path(workspace), task_id)
-    if not p.is_file():
+    p = payload_location(Path(workspace), task_id)
+    if p is None:
         return None
     try:
         return p.read_text(encoding="utf-8", errors="replace")

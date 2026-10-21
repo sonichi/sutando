@@ -81,6 +81,64 @@ class AnnouncedEntry(_Workspace):
                     str(self.ws / "tasks"), f"{self.ws}/tasks/../tasks/task-abc.txt"):
             self.assertIsNone(td.announced_entry(self.inbox, bad, payload_dir=self.ws / "tasks"), bad)
 
+    def test_a_body_in_the_inbox_bodies_folder_keys_by_its_name(self):
+        (self.inbox / "bodies").mkdir()
+        body = self.inbox / "bodies" / "task-abc.txt"
+        body.write_text("id: task-abc\n")
+        self.assertEqual(td.announced_entry(self.inbox, str(body), payload_dir=self.ws / "tasks"),
+                         ("task-abc.txt", body))
+        self.assertIsNone(td.announced_entry(self.inbox, str(body)), "absolute needs a resolver-backed caller")
+
+    def test_the_body_folder_name_is_the_pool_writers_own(self):
+        sys.path.insert(0, str(REPO / "skills" / "worker-pool" / "scripts"))
+        import pool_delivery
+        self.assertEqual(td.DELIVERY_BODY_DIR, pool_delivery.BODY_DIR)
+
+    def test_an_archived_task_or_any_other_folder_is_refused(self):
+        tasks = self.ws / "tasks"
+        (tasks / "archive").mkdir()
+        archived = tasks / "archive" / "task-abc.txt"
+        archived.write_text("id: task-abc\n")
+        # Announced on the core's own inbox, the archive is a folder directly under it: still refused.
+        self.assertIsNone(td.announced_entry(tasks, str(archived), payload_dir=tasks))
+        (tasks / "bodies").mkdir()
+        (tasks / "bodies" / "task-abc.txt").write_text("x\n")
+        self.assertIsNone(td.announced_entry(tasks, str(tasks / "bodies" / "task-abc.txt"), payload_dir=tasks),
+                          "a bodies/ folder counts only under a delivery inbox")
+        (self.inbox / "other").mkdir()
+        (self.inbox / "other" / "task-abc.txt").write_text("x\n")
+        self.assertIsNone(td.announced_entry(self.inbox, str(self.inbox / "other" / "task-abc.txt"),
+                                             payload_dir=tasks))
+
+    def test_only_a_regular_txt_one_level_under_a_real_inbox_folder_is_accepted(self):
+        (self.inbox / "bodies" / "deeper").mkdir(parents=True)
+        (self.inbox / "bodies" / "deeper" / "task-abc.txt").write_text("x\n")
+        (self.inbox / "bodies" / "task-abc.body").write_text("x\n")
+        real = self.ws / "elsewhere"
+        real.mkdir()
+        (real / "task-abc.txt").write_text("x\n")
+        (self.inbox / "alias").symlink_to(real)
+        (self.inbox / "bodies" / "task-link.txt").symlink_to(real / "task-abc.txt")
+        other = self.ws / "deliveries" / "w2" / "bodies"
+        other.mkdir(parents=True)
+        (other / "task-abc.txt").write_text("x\n")
+        for bad in (self.inbox / "bodies" / "deeper" / "task-abc.txt", self.inbox / "bodies" / "task-abc.body",
+                    self.inbox / "alias" / "task-abc.txt", self.inbox / "bodies" / "task-link.txt",
+                    self.inbox / "bodies" / "task-none.txt", other / "task-abc.txt", self.inbox / "bodies"):
+            self.assertIsNone(td.announced_entry(self.inbox, str(bad), payload_dir=self.ws / "tasks"), bad)
+
+    def test_a_symlinked_bodies_folder_is_refused(self):
+        real = self.ws / "elsewhere-bodies"
+        real.mkdir()
+        (real / "task-abc.txt").write_text("x\n")
+        (self.inbox / "bodies").symlink_to(real)
+        self.assertIsNone(td.announced_entry(self.inbox, str(self.inbox / "bodies" / "task-abc.txt"),
+                                             payload_dir=self.ws / "tasks"))
+
+    def test_a_bare_name_that_is_not_a_task_file_is_refused(self):
+        for bad in ("task-abc.body", "task-abc", "bodies"):
+            self.assertIsNone(td.announced_entry(self.inbox, bad), bad)
+
     def _cli(self, *argv: str) -> tuple[int, str]:
         # In-process, so the entry point's own branch is what runs (and is measured).
         import contextlib
@@ -164,12 +222,13 @@ class ShippedEnqueue(_Workspace):
                 self.assertEqual(self._log(), "")
                 self._reset()
 
-    def test_the_same_announcement_from_a_watcher_without_a_resolver_types_nothing_quietly(self):
+    def test_the_same_announcement_from_a_watcher_without_a_resolver_is_refused_visibly(self):
         for runtime in NOTIFIERS:
             with self.subTest(runtime=runtime):
                 self._enqueue(runtime, str(self.payload), inbox=self.inbox, resolver="", kind="deliveries")
                 self.assertEqual(self._queued(), [])
-                self.assertEqual(self._log(), "")
+                self.assertEqual(self._log(), f"announcement refused: {self.payload}; not queuing\n")
+                self._reset()
 
     def test_on_the_cores_inbox_a_worker_held_task_is_still_refused(self):
         core = self.ws / "tasks"

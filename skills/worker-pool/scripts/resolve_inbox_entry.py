@@ -2,7 +2,8 @@
 """Resolve one delivery sentinel to the task payload it stands for.
 
 The pool is the only layer that knows a sentinel in a recipient's delivery
-folder names a body in `tasks/`, so the mapping lives here and the core runs
+folder names a body in its `bodies/` folder (or, for a sentinel delivered before
+bodies existed, in `tasks/`), so the mapping lives here and the core runs
 this as an opaque executable (`SUTANDO_INBOX_RESOLVER`) and verifies the answer.
 
 Contract, because the caller enforces it and a violation fails closed there:
@@ -37,8 +38,21 @@ def resolve(entry: str, workspace=None) -> Path:
     and its validation belong to pool_delivery; this reads the payload it names.
     """
     ws, _recipient, task_id, _accepted = pd.parse_entry(entry, workspace)
-    # abspath, NOT resolve(): resolving would follow a symlink at the payload
-    # name, and the caller adopts the returned basename as the task's identity.
+    if Path(entry).parent.is_symlink():
+        raise pd.NotDelivered(f"sentinel {task_id}: its recipient folder is a symlink alias")
+    # abspath, NOT resolve(): resolving would follow a symlink at the payload name, and
+    # the caller adopts the basename as the task's identity: the body is named for it.
+    try:
+        pd.require_body_dir(Path(entry).parent)
+    except pd.RecipientAliasError as e:
+        raise pd.NotDelivered(f"sentinel {task_id}: {e}") from e
+    body = Path(os.path.abspath(Path(entry).parent / pd.BODY_DIR / (task_id + pd.PENDING_SUFFIX)))
+    body_state = pd.regular_file_state(body)
+    if body_state == "regular":
+        return body
+    if body_state == "unknown":
+        # The body exists but this call could not open it: retry, never "no payload".
+        raise pd.NotDelivered(f"sentinel {task_id}: body at {body} could not be opened; retry")
     path = Path(os.path.abspath(pd.payload_path(ws, task_id)))
     state = pd.regular_file_state(path)
     if state == "regular":

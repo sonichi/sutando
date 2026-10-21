@@ -2,8 +2,9 @@
 """Who, if anyone, the router already handed a task to.
 
 The router delegates by writing a SENTINEL into
-``deliveries/<recipient>/<task-id>{.txt,.accepted,.claimed}``; the payload
-itself never leaves ``tasks/``. Two sessions read that state and ask different
+``deliveries/<recipient>/<task-id>{.txt,.accepted,.claimed}``, after staging the
+payload as ``deliveries/<recipient>/bodies/<task-id>.txt``; the ``tasks/`` copy goes
+once every recipient holds a body. Two sessions read that state and ask different
 questions, and only the first one lives here:
 
   - the core asks "is this still mine to report?" — no, once ANY worker holds a

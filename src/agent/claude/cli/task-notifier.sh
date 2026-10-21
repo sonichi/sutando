@@ -895,6 +895,8 @@ enqueue_announced_task() {
   entry="$("$NOTIFIER_PY" "$DISPATCH_PY" announced-entry "$TASKS_DIR" "$announced" ${resolved[@]+"${resolved[@]}"} 2>/dev/null)" || rc=$?
   if [ "$rc" -ne 0 ]; then
     [ "$rc" -eq 1 ] || log_notifier "announcement not read: $announced (announced-entry rc $rc); not queuing"
+    # A refused path is a watcher this notifier cannot read; restarting both together clears it.
+    [ "$rc" -ne 1 ] || [ "${announced#/}" = "$announced" ] || log_notifier "announcement refused: $announced; not queuing"
     return 0
   fi
   filename="${entry%%$'\t'*}"; payload="${entry#*$'\t'}"
