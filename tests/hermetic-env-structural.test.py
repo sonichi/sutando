@@ -37,10 +37,11 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
-from _helpers.credential_scope import credential_modules, reference_pattern, target_pattern
 from _helpers.hermetic_env import hermetic_env, isolate_os_environ
+from _helpers.credential_scope import credential_modules, reference_pattern, target_pattern
 
 isolate_os_environ()
 
@@ -117,9 +118,20 @@ PATH_CALLS = {"str", "Path", "resolve", "dirname", "abspath", "join", "fspath"}
 CANONICAL = {"_helpers.hermetic_env": "isolate_os_environ", "_helpers.hermetic_gateway": "isolate_then_import"}
 
 
+# Python 3.9 has no sys.stdlib_module_names: the stdlib roots this tree imports above an isolation.
+# Anything else fails closed there; add it here when a test needs it.
+STDLIB_FALLBACK = frozenset({
+    "__future__", "argparse", "ast", "atexit", "base64", "builtins", "concurrent", "contextlib", "ctypes",
+    "datetime", "errno", "glob", "hashlib", "hmac", "http", "importlib", "inspect", "io", "json",
+    "multiprocessing", "os", "pathlib", "plistlib", "random", "re", "runpy", "secrets", "select", "shlex",
+    "shutil", "signal", "socket", "sqlite3", "stat", "struct", "subprocess", "sys", "sysconfig", "tarfile",
+    "tempfile", "textwrap", "threading", "time", "types", "unittest", "urllib", "venv", "zipfile"})
+STDLIB = getattr(sys, "stdlib_module_names", None) or STDLIB_FALLBACK
+
+
 def _runs_no_project_code(module: "str | None") -> bool:
     root = (module or "").split(".")[0]
-    return root == "_helpers" or root in sys.stdlib_module_names
+    return root == "_helpers" or root in STDLIB
 
 
 def _module_top(stmt, index: int) -> bool:
@@ -205,28 +217,44 @@ def violations(source: str, name: str = "<sample>") -> "list[str]":
                 return n
         return None
 
-    canon, modules, foreign = set(), dict(CANONICAL), []
+    canon, modules, canonical_sites = set(), dict(CANONICAL), set()
     for n in ast.walk(tree):
-        if isinstance(n, ast.ImportFrom):
+        if isinstance(n, ast.ImportFrom) and n.level == 0:
             for a in n.names:
-                local = a.asname or a.name
-                if n.level == 0 and CANONICAL.get(n.module or "") == a.name:
-                    canon.add(local)
-                elif n.level == 0 and n.module == "_helpers" and f"_helpers.{a.name}" in CANONICAL:
-                    modules[local] = f"_helpers.{a.name}"
-                elif local in ISOLATORS:
-                    foreign.append(n)
+                if CANONICAL.get(n.module or "") == a.name:
+                    canon.add(a.asname or a.name)
+                    canonical_sites.add(a)
+                elif n.module == "_helpers" and f"_helpers.{a.name}" in CANONICAL:
+                    modules[a.asname or a.name] = f"_helpers.{a.name}"
+                    canonical_sites.add(a)
         elif isinstance(n, ast.Import):
             for a in n.names:
                 if a.name in CANONICAL and a.asname:
                     modules[a.asname] = a.name
-                elif (a.asname or "") in ISOLATORS:
-                    foreign.append(n)
-        elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and n.name in ISOLATORS:
-            if not (library and name.endswith("hermetic_gateway.py") and n.name == "isolate_then_import"):
-                foreign.append(n)
-        elif isinstance(n, (ast.Name)) and isinstance(n.ctx, ast.Store) and n.id in ISOLATORS:
-            foreign.append(n)
+                    canonical_sites.add(a)
+    # A watched name bound anywhere else (import-as, assignment, def, loop, with, except) is not the isolator.
+    watched = ISOLATORS | canon | {k for k in modules if "." not in k}
+    foreign, rebound = [], set()
+    alias_import = {a: n for n in ast.walk(tree) if isinstance(n, (ast.Import, ast.ImportFrom)) for a in n.names}
+    for n in ast.walk(tree):
+        if isinstance(n, ast.alias):
+            local = (n.asname or n.name).split(".")[0]
+            site = n
+        elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.ExceptHandler)):
+            local, site = n.name, n
+        elif isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store):
+            local, site = n.id, n
+        elif isinstance(n, ast.arg):
+            local, site = n.arg, n
+        else:
+            continue
+        if local not in watched or site in canonical_sites:
+            continue
+        if (isinstance(n, ast.FunctionDef) and library and name.endswith("hermetic_gateway.py")
+                and n.name == "isolate_then_import"):
+            continue
+        foreign.append(alias_import.get(n, n))
+        rebound.add(local)
 
     def isolator_call(c) -> bool:
         """A call of a canonically bound isolator."""
@@ -234,20 +262,34 @@ def violations(source: str, name: str = "<sample>") -> "list[str]":
             return False
         f = c.func
         if isinstance(f, ast.Name):
-            return f.id in canon
-        return (isinstance(f, ast.Attribute) and isinstance(f.value, (ast.Name, ast.Attribute))
-                and CANONICAL.get(modules.get(ast.unparse(f.value), "")) == f.attr)
+            return f.id in canon and f.id not in rebound
+        base = ast.unparse(f.value) if isinstance(f, ast.Attribute) else ""
+        return (bool(base) and base.split(".")[0] not in rebound
+                and CANONICAL.get(modules.get(base, "")) == f.attr)
 
     def isolator_stmt(st) -> bool:
         v = getattr(st, "value", None)
         return isinstance(st, (ast.Expr, ast.Assign, ast.AnnAssign)) and isolator_call(v)
 
-    top = set()
+    top, helpers_seen = set(), False
     for i, st in enumerate(tree.body):
         if isolator_stmt(st):
             top.add(st.value)
-        elif not _module_top(st, i):
+            continue
+        if not _module_top(st, i):
             break
+        # The first _helpers import must be the isolator's own module: another could run before the snapshot.
+        mods = [a.name for a in st.names] if isinstance(st, ast.Import) else (
+            [st.module or ""] if isinstance(st, ast.ImportFrom) else [])
+        for m in mods:
+            if m.split(".")[0] == "_helpers" and not helpers_seen:
+                helpers_seen = True
+                if m not in CANONICAL and not (m == "_helpers" and any(
+                        f"_helpers.{a.name}" in CANONICAL for a in st.names)):
+                    break
+        else:
+            continue
+        break
 
     def isolates(n) -> bool:
         """An isolation at the module top, before any statement that could start a patcher."""
@@ -583,6 +625,30 @@ class SelfTest(unittest.TestCase):
                     self.assertEqual(refused, name == "distinct-environ", got.stderr)
                     self.assertTrue(refused or SYNTHETIC in got.stdout, (got.stdout, got.stderr))
 
+    def test_a_rebound_isolator_name_certifies_nothing_and_leaks(self):
+        for body in ("from _helpers.hermetic_env import isolate_os_environ as iso\nfrom os import getpid as iso\niso()\n",
+                     CANON + "isolate_os_environ()\ntry:\n    pass\nexcept OSError as isolate_os_environ:\n    pass\n",
+                     "import _helpers.hermetic_env as he\nimport json as he\nhe.isolate_os_environ()\n",
+                     CANON + "def f(isolate_os_environ):\n    pass\nisolate_os_environ()\n"):
+            with self.subTest(body=body):
+                self.assertIn("foreign-isolator", " ".join(violations(body + GATEWAY_IMPORT)))
+        leak = imported_probe("from _helpers.hermetic_env import isolate_os_environ as iso\n"
+                              "from os import getpid as iso\niso()\n", REPO / "tests")
+        got = subprocess.run([sys.executable, "-c", leak], capture_output=True, text=True,
+                             env=hermetic_env(GATEWAY_TOKEN=SYNTHETIC), timeout=60)
+        self.assertIn(SYNTHETIC, got.stdout, got.stderr)
+
+    def test_the_first_helpers_import_is_the_isolators_and_the_snapshot_predates_every_helper(self):
+        early = "from _helpers.credential_scope import CREDENTIAL_NAME\n" + CANON + "isolate_os_environ()\n"
+        self.assertIn("misplaced-isolation", " ".join(violations(early + GATEWAY_IMPORT)))
+        swapped = ("import sys\nsys.path.insert(0, %r)\nimport os\nimport _helpers\ne = os.environ\n"
+                   "os.environ = os._Environ(dict(e._data), e.encodekey, e.decodekey, e.encodevalue, e.decodevalue)\n"
+                   "from _helpers.hermetic_env import isolate_os_environ\nisolate_os_environ()\n" % str(REPO / "tests"))
+        got = subprocess.run([sys.executable, "-c", swapped], capture_output=True, text=True,
+                             env=hermetic_env(), timeout=60)
+        self.assertNotEqual(got.returncode, 0)
+        self.assertIn("os.environ replaced", got.stderr)
+
     def test_isolating_under_a_started_environ_patch_fails_and_never_leaks(self):
         env = hermetic_env(GATEWAY_TOKEN=SYNTHETIC)
         for clear, sample in PATCHED_FIRST.items():
@@ -628,6 +694,15 @@ class Tree(unittest.TestCase):
         self.assertGreater(len(files), 100, "the scan found almost no files: the roots moved")
         bad = [v for p in files for v in violations(p.read_text(errors="replace"), str(p.relative_to(REPO)))]
         self.assertEqual(bad, [], "build these environments with tests/_helpers/hermetic_env.py:\n" + "\n".join(bad))
+
+    def test_the_python_3_9_fallback_covers_the_tree_and_fails_closed_on_anything_else(self):
+        with mock.patch.dict(globals(), {"STDLIB": STDLIB_FALLBACK}):
+            files = scanned_files()
+            bad = [v for p in files for v in violations(p.read_text(errors="replace"), str(p.relative_to(REPO)))]
+            self.assertEqual(bad, [], "\n".join(bad))
+            unknown = "import tkinter\n" + CANON + "isolate_os_environ()\n" + GATEWAY_IMPORT
+            self.assertIn("misplaced-isolation", " ".join(violations(unknown)))
+        self.assertLessEqual(STDLIB_FALLBACK, set(getattr(sys, "stdlib_module_names", STDLIB_FALLBACK)))
 
 
 if __name__ == "__main__":

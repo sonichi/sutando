@@ -22,8 +22,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from _helpers.credential_scope import selector_names
 from _helpers.hermetic_env import hermetic_env, isolate_os_environ
+from _helpers.credential_scope import selector_names
 
 isolate_os_environ()
 
