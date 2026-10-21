@@ -12,8 +12,11 @@ Extends the CLAUDE.md rule that "at background" / "in parallel" means SPAWN A SU
   message, file sent) → do it inline, now, before anything else. A header without a lane counts as long when the queue is
   busy. One long Write run inline held three quick tasks for five minutes.
 - A task splits into two or more independent workstreams where parallelism materially cuts latency.
-- Mechanical, long-running, or context-heavy work would consume the main session's context:
+- The work is **heavy**: sustained work that would hold this thread for more than a few minutes
+  (investigations, test runs, scans, long reviews), or that would consume the main session's context:
   repository scans, evidence collection, test monitoring, transcript summarization, bounded research.
+  This is the single definition of "heavy"; `CLAUDE.md` points here. Delegate it without being asked, taking the
+  quota tier into account: for example, delegate freely at FULL; when the budget is tight, run it inline and say so (see below).
 - An independent second pass materially improves correctness: adversarial review, reproduction,
   cross-checking evidence.
 - Access-control policy requires sandboxed handling of a non-owner task.
@@ -21,6 +24,15 @@ Extends the CLAUDE.md rule that "at background" / "in parallel" means SPAWN A SU
 Do NOT delegate tightly coupled work, concurrent edits to the same files, irreversible actions, or
 tasks whose coordination overhead exceeds the benefit. Subagents never bypass quota, presenter/pause,
 or self-development gates.
+
+## Bounded scope and checkpoint
+
+A spawned worker gets a bounded brief: scope (one question or deliverable), the files it may touch,
+and what it must not do. It also gets a checkpoint: when it reports back. The main thread verifies
+the result before reporting it; a subagent's "done" is a claim, not evidence.
+
+If there is no capacity to spawn (quota tier, queue), say that constraint instead of claiming
+delegation.
 
 ## Model selection — explicit on every spawn
 
