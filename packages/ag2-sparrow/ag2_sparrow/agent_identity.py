@@ -3,7 +3,8 @@
 `resolve` is the bridge's identity chain, in its order: the process env (`AGENT_MXID`, `AGENT_ID`),
 then the channel .env files (`AGENT_MXID`, `AGENT_ID`, `AG2SPACE_USER_ID`), then the durable binding
 `<state>/auth/ag2space.json`'s `agent_id`. The gateway bridge and the installers read it here, so an
-install derives its root from exactly the identity the bridge will report. Stdlib only.
+install derives its root from exactly the identity the bridge will report. A .env file's lines
+are parsed by the credential owner, gateway_credential_sources. Stdlib only.
 
 `root_segment` maps an id to one path segment, lowercase `[a-z0-9._-]`, no leading dot, at most
 `SEGMENT_MAX` bytes. A plain MXID `@local:server` whose parts are lowercase `[a-z0-9.-]` (first
@@ -19,6 +20,8 @@ import os
 import re
 from pathlib import Path
 
+from . import gateway_credential_sources as _sources
+
 ENV_KEYS = ("AGENT_MXID", "AGENT_ID")
 FILE_KEYS = ("AGENT_MXID", "AGENT_ID", "AG2SPACE_USER_ID")
 SEGMENT_MAX = 64
@@ -27,10 +30,9 @@ _PLAIN = re.compile(r"@([a-z0-9][a-z0-9.-]*):([a-z0-9][a-z0-9.-]*)")
 _UNSAFE = re.compile(r"[^a-z0-9._-]")
 
 
-def unquote_env(v):
-    """Whitespace and surrounding quotes off a credential value: the one definition every reader uses,
-    so the env tier cannot disagree with the file tiers about a quoted `.env` line."""
-    return v.strip().strip("'\"") if v else v
+# Parsing has one owner, so the identity tiers cannot disagree with the credential tiers.
+unquote_env = _sources.unquote
+file_value = _sources.config_from_files
 
 
 def env_files(paths) -> list:
@@ -41,26 +43,11 @@ def env_files(paths) -> list:
             continue
         try:
             with open(path, encoding="utf-8") as fh:
-                lines = fh.read().splitlines()
+                text = fh.read()
         except (OSError, UnicodeDecodeError):
             continue
-        vals = {}
-        for ln in lines:
-            ln = ln.strip()
-            if not ln or ln.startswith("#") or "=" not in ln:
-                continue
-            key, _, val = ln.partition("=")
-            vals[key.strip()] = unquote_env(val)
-        out.append((path, vals))
+        out.append((path, _sources.parse_env_text(text)))
     return out
-
-
-def file_value(files: list, key: str) -> str:
-    """The first file CARRYING `key`, else "": an explicit blank is a decision, as in the environment."""
-    for _path, vals in files:
-        if key in vals:
-            return vals[key]
-    return ""
 
 
 def enrolled(state_dir) -> str:
