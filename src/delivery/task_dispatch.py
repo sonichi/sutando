@@ -139,10 +139,11 @@ def find_ready_result_for_filename(results_dir: "Path | str", filename: str, *,
 
 
 def head_abandoned(results_dir: "Path | str", filename: str, payload: "Path | str") -> bool:
-    """True iff a queued task can never resolve: no ready result and its payload is gone.
+    """True iff a queued or submitted task can never resolve: no ready result and its payload is gone.
 
-    A task archived without a result findable here would otherwise hold a notifier's
-    queue head forever, blocking every task behind it.
+    A task archived without a result findable here (never answered, or answered and its
+    result removed by another consumer) would otherwise hold a notifier's queue head, or
+    its in-flight wait, forever, blocking every task behind it.
     """
     return not Path(payload).exists() and not has_ready_result(results_dir, filename)
 
