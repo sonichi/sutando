@@ -2,7 +2,7 @@
 """The converted harnesses never read a credential source the outer environment names.
 
 Each case runs a real entry point (the hermetic gateway import, room_ops' gateway tests,
-bee-actions, the Hatch adapter, the relay harness) in a child whose
+bee-actions, the Hatch adapter, the relay harness, the credential owner's suite) in a child whose
 environment names sentinel credential sources (a token file, a device .env, a channel dir,
 a config dir holding channel .env files) and carries marked token, URL and instance or
 agent identity values. An audit hook records every open, every environment handed to a
@@ -130,6 +130,9 @@ class Sentinels(unittest.TestCase):
 
     def test_the_hatch_adapter_suite_reads_no_outer_selector(self):
         self.check(["packages/ag2-sparrow/tests/test_hatch_adapter.py"])
+
+    def test_the_credential_owner_suite_reads_no_outer_selector(self):
+        self.check(["tests/gateway-credential-sources.test.py"])
 
     def test_channel_env_resolve_and_its_shell_children_read_no_outer_selector(self):
         self.check(["tests/channel-env-resolve.test.py"])
