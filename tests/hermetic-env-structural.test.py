@@ -17,13 +17,15 @@ must build every environment with tests/_helpers/hermetic_env.py. Refused anywhe
               instead spawn with the helper's env); a mock.patch.dict never counts as isolation
   before-isolation  such code (an import) at module level above that call
   misplaced-isolation  isolate_os_environ() or isolate_then_import() anywhere but a module-level
-              statement preceded only by the docstring, imports of the standard library or _helpers.*,
-              sys.path.insert/append of a path and other such calls. A project or third-party import
+              statement preceded only by the docstring, imports that resolve (by module spec, not name)
+              to the standard library or tests/_helpers, sys.path.insert/append of a literal or a path
+              built from __file__ by pathlib/os.path, and other such calls. A project or third-party import
               runs code, so it goes below the isolation. At that point the file itself has started no
               patch, so none of its patches can later put the outer environment back; patches below it
               save an isolated one. Only the isolator's own definition in tests/_helpers may call it elsewhere.
   foreign-isolator  an isolator name not bound by `from _helpers.hermetic_env import isolate_os_environ`
-              or `from _helpers.hermetic_gateway import isolate_then_import` (or those modules' attributes):
+              or `from _helpers.hermetic_gateway import isolate_then_import` (or those modules, dotted or
+              aliased), or any of those names rebound or assigned through:
               another import, a def or an assignment of that name certifies nothing
 
 Threat model: this gate and the helper catch ACCIDENTAL parent-environment leaks in test code.
@@ -32,13 +34,16 @@ Deliberately adversarial code (monkeypatching the helper module itself, say) is 
 from __future__ import annotations
 
 import ast
+import functools
+import importlib.util
 import re
 import subprocess
 import sys
+import sysconfig
 import tempfile
 import unittest
 from unittest import mock
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 from _helpers.hermetic_env import hermetic_env, isolate_os_environ
 from _helpers.credential_scope import credential_modules, reference_pattern, target_pattern
@@ -112,8 +117,9 @@ def _over_environ(it, imp: Imports) -> bool:
                                and it.func.attr in ("items", "keys") and imp.environ(it.func.value))
 
 
-# A sys.path entry is computed from these alone, so the statement can start nothing.
-PATH_CALLS = {"str", "Path", "resolve", "dirname", "abspath", "join", "fspath"}
+HELPERS_DIR = (REPO / "tests" / "_helpers").resolve()
+STDLIB_DIRS = {Path(sysconfig.get_paths()[k]).resolve() for k in ("stdlib", "platstdlib")}
+OS_PATH_FUNCS = {"dirname", "abspath", "join", "realpath", "normpath"}
 # The one binding of each isolator name that certifies isolation.
 CANONICAL = {"_helpers.hermetic_env": "isolate_os_environ", "_helpers.hermetic_gateway": "isolate_then_import"}
 
@@ -122,21 +128,95 @@ CANONICAL = {"_helpers.hermetic_env": "isolate_os_environ", "_helpers.hermetic_g
 # Anything else fails closed there; add it here when a test needs it.
 STDLIB_FALLBACK = frozenset({
     "__future__", "argparse", "ast", "atexit", "base64", "builtins", "concurrent", "contextlib", "ctypes",
-    "datetime", "errno", "glob", "hashlib", "hmac", "http", "importlib", "inspect", "io", "json",
+    "datetime", "errno", "functools", "glob", "hashlib", "hmac", "http", "importlib", "inspect", "io", "json",
     "multiprocessing", "os", "pathlib", "plistlib", "random", "re", "runpy", "secrets", "select", "shlex",
     "shutil", "signal", "socket", "sqlite3", "stat", "struct", "subprocess", "sys", "sysconfig", "tarfile",
     "tempfile", "textwrap", "threading", "time", "types", "unittest", "urllib", "venv", "zipfile"})
 STDLIB = getattr(sys, "stdlib_module_names", None) or STDLIB_FALLBACK
 
 
+def _source_path(name: str) -> Path:
+    """A scanned file's name as a resolved path: repo-relative or absolute, either separator."""
+    p = Path(PureWindowsPath(name).as_posix()) if "\\" in name else Path(name)
+    return (p if p.is_absolute() else REPO / p).resolve()
+
+
+@functools.lru_cache(maxsize=None)
+def _origin(module: str) -> "Path | str | None":
+    """Where `module` would be loaded from on this sys.path ("built-in"/"frozen", a file, or None)."""
+    try:
+        spec = importlib.util.find_spec(module)
+    except (ImportError, ValueError):
+        return None
+    if spec is None:
+        return None
+    if spec.origin in ("built-in", "frozen"):
+        return spec.origin
+    loc = spec.origin if spec.origin not in (None, "namespace") else next(iter(spec.submodule_search_locations or ()), None)
+    return Path(loc).resolve() if loc else None
+
+
 def _runs_no_project_code(module: "str | None") -> bool:
+    """`module` resolves to the standard library or to a file in tests/_helpers, not by name alone."""
     root = (module or "").split(".")[0]
-    return root == "_helpers" or root in STDLIB
+    if root == "_helpers":
+        o = _origin(module)
+        return isinstance(o, Path) and (o == HELPERS_DIR or HELPERS_DIR in o.parents)
+    if root not in STDLIB:
+        return False
+    o = _origin(root)
+    return o in ("built-in", "frozen") or (isinstance(o, Path) and "site-packages" not in o.parts
+                                           and any(d in o.parents for d in STDLIB_DIRS))
 
 
-def _module_top(stmt, index: int) -> bool:
-    """A statement that may precede a module-top isolation: the docstring, an import of the standard
-    library or _helpers.*, or a path-only sys.path.insert/append."""
+class PathNames:
+    """The local names a file binds to pathlib.Path, pathlib, os and os.path's path functions."""
+
+    def __init__(self, tree, imp: "Imports"):
+        self.cls, self.pathlib, self.funcs, self.os = set(), set(), set(), imp.mods["os"]
+        for n in tree.body:
+            if isinstance(n, ast.ImportFrom) and n.level == 0:
+                for a in n.names:
+                    if n.module == "pathlib" and a.name == "Path":
+                        self.cls.add(a.asname or a.name)
+                    elif n.module == "os.path" and a.name in OS_PATH_FUNCS:
+                        self.funcs.add(a.asname or a.name)
+            elif isinstance(n, ast.Import):
+                self.pathlib |= {a.asname or a.name for a in n.names if a.name == "pathlib"}
+
+    def ok(self, e) -> bool:
+        """A literal, or a path computed from __file__ by pathlib and os.path alone."""
+        if isinstance(e, ast.Constant):
+            return isinstance(e.value, str)
+        if isinstance(e, ast.Name):
+            return e.id == "__file__"
+        if isinstance(e, ast.BinOp):
+            return isinstance(e.op, ast.Div) and self.ok(e.left) and self.ok(e.right)
+        if isinstance(e, ast.Attribute):
+            return e.attr == "parent" and self.ok(e.value)
+        if isinstance(e, ast.Subscript):
+            index = e.slice.value if isinstance(e.slice, getattr(ast, "Index", ())) else e.slice
+            return (isinstance(e.value, ast.Attribute) and e.value.attr == "parents" and self.ok(e.value.value)
+                    and isinstance(index, ast.Constant) and isinstance(index.value, int))
+        if not isinstance(e, ast.Call) or e.keywords:
+            return False
+        f, args = e.func, e.args
+        if isinstance(f, ast.Name):
+            known = f.id == "str" or f.id in self.cls or f.id in self.funcs
+            return known and all(self.ok(a) for a in args)
+        if not isinstance(f, ast.Attribute):
+            return False
+        if f.attr in ("resolve", "absolute") and not args:
+            return self.ok(f.value)
+        base = ast.unparse(f.value)
+        known = ((f.attr in OS_PATH_FUNCS and base in {f"{o}.path" for o in self.os})
+                 or (f.attr == "fspath" and base in self.os) or (f.attr == "Path" and base in self.pathlib))
+        return known and all(self.ok(a) for a in args)
+
+
+def _module_top(stmt, index: int, paths: PathNames) -> bool:
+    """A statement that may precede a module-top isolation: the docstring, an import that resolves to
+    the standard library or tests/_helpers, or a sys.path.insert/append of a path built from __file__."""
     if isinstance(stmt, ast.Import):
         return all(_runs_no_project_code(a.name) for a in stmt.names)
     if isinstance(stmt, ast.ImportFrom):
@@ -145,10 +225,11 @@ def _module_top(stmt, index: int) -> bool:
         return False
     if isinstance(stmt.value, ast.Constant):
         return index == 0 and isinstance(stmt.value.value, str)
-    f = stmt.value.func
-    return (isinstance(f, ast.Attribute) and f.attr in ("insert", "append") and ast.unparse(f.value) == "sys.path"
-            and all(_name(c.func) in PATH_CALLS for a in stmt.value.args for c in ast.walk(a)
-                    if isinstance(c, ast.Call)))
+    f, args = stmt.value.func, stmt.value.args
+    return (isinstance(f, ast.Attribute) and ast.unparse(f.value) == "sys.path" and not stmt.value.keywords
+            and ((f.attr == "append" and len(args) == 1 and paths.ok(args[0]))
+                 or (f.attr == "insert" and len(args) == 2 and isinstance(args[0], ast.Constant)
+                     and paths.ok(args[1]))))
 
 
 def _imports_target(node) -> bool:
@@ -204,7 +285,9 @@ def violations(source: str, name: str = "<sample>") -> "list[str]":
     if not REFERENCE.search(code_text(ast.parse(source))):
         return []
     imp = Imports(tree)
-    library = "/_helpers/" in name
+    source = _source_path(name)
+    library = HELPERS_DIR in source.parents
+    paths = PathNames(tree, imp)
     parents = {}
     for p in ast.walk(tree):
         for c in ast.iter_child_nodes(p):
@@ -217,7 +300,7 @@ def violations(source: str, name: str = "<sample>") -> "list[str]":
                 return n
         return None
 
-    canon, modules, canonical_sites = set(), dict(CANONICAL), set()
+    canon, modules, canonical_sites = set(), {}, set()
     for n in ast.walk(tree):
         if isinstance(n, ast.ImportFrom) and n.level == 0:
             for a in n.names:
@@ -229,11 +312,14 @@ def violations(source: str, name: str = "<sample>") -> "list[str]":
                     canonical_sites.add(a)
         elif isinstance(n, ast.Import):
             for a in n.names:
+                if a.name in CANONICAL:
+                    modules[a.asname or a.name] = a.name
                 if a.name in CANONICAL and a.asname:
-                    modules[a.asname] = a.name
+                    canonical_sites.add(a)
+                elif not a.asname and a.name.split(".")[0] == "_helpers":
                     canonical_sites.add(a)
     # A watched name bound anywhere else (import-as, assignment, def, loop, with, except) is not the isolator.
-    watched = ISOLATORS | canon | {k for k in modules if "." not in k}
+    watched = ISOLATORS | canon | {k.split(".")[0] for k in modules}
     foreign, rebound = [], set()
     alias_import = {a: n for n in ast.walk(tree) if isinstance(n, (ast.Import, ast.ImportFrom)) for a in n.names}
     for n in ast.walk(tree):
@@ -244,13 +330,20 @@ def violations(source: str, name: str = "<sample>") -> "list[str]":
             local, site = n.name, n
         elif isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store):
             local, site = n.id, n
+        elif isinstance(n, (ast.Attribute, ast.Subscript)) and isinstance(n.ctx, ast.Store):
+            root = n
+            while isinstance(root, (ast.Attribute, ast.Subscript)):
+                root = root.value
+            if not isinstance(root, ast.Name):
+                continue
+            local, site = root.id, n
         elif isinstance(n, ast.arg):
             local, site = n.arg, n
         else:
             continue
         if local not in watched or site in canonical_sites:
             continue
-        if (isinstance(n, ast.FunctionDef) and library and name.endswith("hermetic_gateway.py")
+        if (isinstance(n, ast.FunctionDef) and source == HELPERS_DIR / "hermetic_gateway.py"
                 and n.name == "isolate_then_import"):
             continue
         foreign.append(alias_import.get(n, n))
@@ -276,7 +369,7 @@ def violations(source: str, name: str = "<sample>") -> "list[str]":
         if isolator_stmt(st):
             top.add(st.value)
             continue
-        if not _module_top(st, i):
+        if not _module_top(st, i, paths):
             break
         # The first _helpers import must be the isolator's own module: another could run before the snapshot.
         mods = [a.name for a in st.names] if isinstance(st, ast.Import) else (
@@ -648,6 +741,56 @@ class SelfTest(unittest.TestCase):
                              env=hermetic_env(), timeout=60)
         self.assertNotEqual(got.returncode, 0)
         self.assertIn("os.environ replaced", got.stderr)
+
+    def test_helper_files_are_recognised_by_resolved_path_not_spelling(self):
+        real = HELPERS_DIR / "hermetic_gateway.py"
+        source = real.read_text()
+        for name in ("tests\\_helpers\\hermetic_gateway.py", str(real), "tests/./_helpers/hermetic_gateway.py"):
+            with self.subTest(name=name):
+                self.assertEqual(violations(source, name), [])
+        elsewhere = violations(source, "packages/ag2-sparrow/tests/_helpers/hermetic_gateway.py")
+        self.assertIn("foreign-isolator", " ".join(elsewhere))
+
+    def test_the_dotted_canonical_form_counts_and_rebinding_it_does_not(self):
+        dotted = "import _helpers.hermetic_env\n_helpers.hermetic_env.isolate_os_environ()\n"
+        self.assertEqual(violations(dotted + GATEWAY_IMPORT), [])
+        for tail in ("_helpers = None\n", "_helpers.hermetic_env.isolate_os_environ = print\n",
+                     "import json as _helpers\n"):
+            with self.subTest(tail=tail):
+                self.assertIn("foreign-isolator", " ".join(violations(dotted + tail + GATEWAY_IMPORT)))
+
+    def test_prelude_imports_count_by_where_they_resolve_not_by_name(self):
+        isolate = CANON + "isolate_os_environ()\n" + GATEWAY_IMPORT
+        self.assertIn("misplaced-isolation", " ".join(violations(
+            CANON + "import _helpers.not_a_helper\nisolate_os_environ()\n" + GATEWAY_IMPORT)))
+        self.assertEqual(violations("import plistlib\n" + isolate), [])
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "plistlib.py").write_text("")
+            saved = sys.modules.pop("plistlib", None)
+            sys.path.insert(0, d)
+            _origin.cache_clear()
+            importlib.invalidate_caches()
+            try:
+                self.assertIn("misplaced-isolation", " ".join(violations("import plistlib\n" + isolate)))
+            finally:
+                sys.path.remove(d)
+                _origin.cache_clear()
+                if saved is not None:
+                    sys.modules["plistlib"] = saved
+
+    def test_a_sys_path_entry_is_a_literal_or_built_from_file(self):
+        head = "import os, sys, pathlib\nfrom pathlib import Path\n"
+        isolate = CANON + "isolate_os_environ()\n" + GATEWAY_IMPORT
+        for line in ('sys.path.insert(0, str(Path(os.environ["HOME"])))\n', "sys.path.insert(0, str(x.resolve()))\n",
+                     "sys.path.append(str(Path.home()))\n", "sys.path.insert(0, os.path.join(os.getcwd()))\n"):
+            with self.subTest(line=line):
+                self.assertIn("misplaced-isolation", " ".join(violations(head + line + isolate)))
+        for line in ("sys.path.insert(0, str(Path(__file__).resolve().parents[2]))\n",
+                     'sys.path.append(os.path.join(os.path.dirname(__file__), ".."))\n',
+                     'sys.path.insert(0, "tests")\n',
+                     'sys.path.insert(0, str(pathlib.Path(__file__).parent / "tests"))\n'):
+            with self.subTest(line=line):
+                self.assertEqual(violations(head + line + isolate), [])
 
     def test_isolating_under_a_started_environ_patch_fails_and_never_leaks(self):
         env = hermetic_env(GATEWAY_TOKEN=SYNTHETIC)
