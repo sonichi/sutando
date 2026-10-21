@@ -1176,8 +1176,7 @@ if ! launch_fswatch; then
   exit 1
 fi
 
-# One fswatch line. Shared by the readiness replay and the main loop so a line
-# read early is handled exactly as a line read late.
+# Shared by startup configuration replay and the live event loop.
 handle_event() {
   local path="$1" parent
   case "$path" in
@@ -1259,10 +1258,13 @@ if [ "$WATCHER_ROLE" = "session" ]; then
   if [ "$standby" != "no" ]; then
     echo "watch-tasks-stream: standby watcher still present after ${SUTANDO_STANDBY_STOP_TIMEOUT:-15}s; sweeping anyway" >&2
   fi
-  # Buffered events first, in fswatch's order, so a task sees the handler config
-  # delivered before it; the sweep then covers only what no event announced.
+  # Buffered task events belong to the sorted backlog, not arrival-order replay.
+  # Preserve config events; dispatch still reads the config at each decision.
   while IFS= read -r path; do
-    [ -n "$path" ] && handle_event "$path"
+    [ -n "$path" ] || continue
+    case "$path" in
+      "$HANDLER_CONFIG_PATH"|"$HANDLER_CONFIG_DIR") handle_event "$path" ;;
+    esac
   done <<< "$PRE_READY_EVENTS"
   startup_sweep
 fi

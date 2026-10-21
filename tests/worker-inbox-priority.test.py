@@ -174,6 +174,23 @@ class WorkerStartupTest(unittest.TestCase):
         return [Path(line.removeprefix("TASK_FILE: ")).stem
                 for line in log.read_text().splitlines() if line.startswith("TASK_FILE: ")]
 
+    def buffered_events_env(self, env):
+        """Inject part of the backlog before real fswatch supplies readiness."""
+        inbox = Path(env.get("SUTANDO_TASKS_DIR", self.ws / "tasks"))
+        entries = sorted(inbox.glob("*.txt"), key=lambda p: p.stat().st_mtime_ns, reverse=True)
+        paths = list(map(str, entries[::2]))
+        real_fswatch = shutil.which("fswatch", path=env["PATH"])
+        bindir = self.root / "buffered-events-bin"
+        bindir.mkdir()
+        wrapper = bindir / "fswatch"
+        wrapper.write_text(
+            f"#!{sys.executable}\nimport os, sys\n"
+            f"for path in {paths!r}:\n    print(path, flush=True)\n"
+            f"os.execv({real_fswatch!r}, [{real_fswatch!r}, *sys.argv[1:]])\n")
+        wrapper.chmod(0o755)
+        self.record("synthetic-pre-ready-events", paths=paths, real_fswatch=real_fswatch)
+        return {**env, "PATH": f"{bindir}:{env['PATH']}"}
+
     def sweep(self, label, env, expected, timeout=35):
         inbox = Path(env.get("SUTANDO_TASKS_DIR", self.ws / "tasks"))
         sentinel = Path(self.run_command([sys.executable, str(REPO / "src/util_paths.py"),
@@ -204,7 +221,10 @@ class WorkerStartupTest(unittest.TestCase):
     def test_worker_backlog_beyond_lookup_prefix_restarts_without_mutation(self):
         self.worker_backlog(extra=32, timeout=60)
 
-    def worker_backlog(self, extra=0, timeout=35):
+    def test_buffered_worker_events_join_priority_sweep_on_each_restart(self):
+        self.worker_backlog(buffered=True)
+
+    def worker_backlog(self, extra=0, timeout=35, buffered=False):
         env = self.register()
         ids = [self.submit(body, priority) for body, priority in (
             ("low one", "low"), ("normal one", "normal"), ("urgent ordinary", "urgent"),
@@ -237,6 +257,8 @@ class WorkerStartupTest(unittest.TestCase):
         sorted_names = self.sort(Path(env["SUTANDO_TASKS_DIR"]), env)
         self.assertEqual(sorted_names, [f"{tid}.txt" for tid in [*expected[:2], completed, *expected[2:]]])
         self.assertEqual(before, self.snapshot(), "sorting must not mutate records or accept deliveries")
+        if buffered:
+            env = self.buffered_events_env(env)
         for i in (1, 2):
             self.sweep(f"worker-{i}", env, expected, timeout)
             self.assertEqual(before, self.snapshot(), "startup must preserve the same pending records")
@@ -262,6 +284,8 @@ class WorkerStartupTest(unittest.TestCase):
         self.assertEqual(default.splitlines(), [f"{tid}.txt" for tid in expected])
         self.assertEqual(self.sort(self.ws / "tasks", self.env), default.splitlines())
         self.sweep("core", self.env, expected)
+        self.assertEqual(before, self.snapshot())
+        self.sweep("core-buffered", self.buffered_events_env(self.env), expected)
         self.assertEqual(before, self.snapshot())
 
     def test_missing_refused_and_timed_out_resolution_retains_records_and_retries(self):
