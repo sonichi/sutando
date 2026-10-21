@@ -17,6 +17,7 @@ from pathlib import Path
 from unittest import mock
 
 from _helpers.hermetic_env import hermetic_env
+from _helpers.process_group import popen_bound
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "src"))
@@ -94,8 +95,8 @@ class WorkerStartupTest(unittest.TestCase):
     def start(self, label, argv, env=None):
         log = self.root / f"{label}.log"
         with log.open("w") as output:
-            proc = subprocess.Popen(argv, env=env or self.env, cwd=REPO,
-                                    stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
+            proc = popen_bound(argv, env=env or self.env, cwd=REPO,
+                               stdout=output, stderr=subprocess.STDOUT)
         self.logs.append((label, log))
         self.addCleanup(self.stop, proc)
         self.record("start", argv=list(map(str, argv)), pid=proc.pid)
@@ -326,8 +327,8 @@ class WorkerStartupTest(unittest.TestCase):
         for name, count in dispatch_failures.items():
             entry = Path(env["SUTANDO_TASKS_DIR"]) / f"{ids[name]}.txt"
             self.assertEqual(log.read_text().count(f"file for {entry} (rc="), count, name)
-        # Priority probes may time out before the resolver starts; only dispatch
-        # retries are mandatory. The probes are silent in the watcher log.
+        # Real fswatch may deliver historical task events after the sweep;
+        # the shell resolver contracts separately pin each decision's exact count.
         expected_counts = {"missing-old": (1, 2), "missing-fresh": (3, 4), "refused": (3, 4),
                            "timeout": (3, 4), "retry": (3, 3), "urgent": (1, 2), "low": (1, 2)}
         for name, (least, most) in expected_counts.items():

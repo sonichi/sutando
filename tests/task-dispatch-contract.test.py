@@ -847,6 +847,58 @@ class MainDispatchTest(unittest.TestCase):
                                              "--resolve-inbox", self.tmp.name, RESOLVER_HELPER)
                 self.assertEqual((rc, out, err), (0, "normal.txt\nentry.txt\n", ""))
 
+    def test_priority_resolution_attempt_is_reused_once_with_its_error(self):
+        entry = _write(self.tasks_dir / "entry.txt", "")
+        cache = Path(self.tmp.name) / "attempts"
+        cache.mkdir()
+        for outcome in ("print(sys.argv[1])", "sys.exit(1)", "sys.exit(3)"):
+            with self.subTest(outcome=outcome):
+                resolver = self._resolver(outcome + "\n")
+                with mock.patch.dict(os.environ, SUTANDO_INBOX_RESOLVER=resolver):
+                    self.assertEqual(self._run("sort-by-priority", str(self.tasks_dir),
+                                              "--resolve-inbox", self.tmp.name, RESOLVER_HELPER,
+                                              "--resolution-cache", str(cache)), (0, "entry.txt\n", ""))
+                rc, out, err = self._run("reuse-inbox-resolution", str(cache), str(entry))
+                self.assertEqual(rc, 0 if outcome.startswith("print") else 3 if "(1)" in outcome else 4)
+                if rc == 0:
+                    self.assertEqual((out, err), (str(entry) + "\n", ""))
+                else:
+                    self.assertIn("rc=1" if rc == 3 else "rc=3", err)
+                    self.assertEqual(out, "")
+                self.assertEqual(self._run("reuse-inbox-resolution", str(cache), str(entry)), (5, "", ""))
+
+    def test_priority_resolution_is_invalidated_by_entry_or_payload_change(self):
+        entry = _write(self.tasks_dir / "entry.txt", "")
+        payload = _write(Path(self.tmp.name) / "payload.txt", "priority: urgent\ntask: x\n")
+        cache = Path(self.tmp.name) / "attempts"
+        cache.mkdir()
+        resolver = self._resolver(f"print({str(payload)!r})\n")
+        for changed in (entry, payload):
+            for mutation in ("replace", "write", "remove", "symlink"):
+                with self.subTest(changed=changed, mutation=mutation):
+                    for path in (entry, payload):
+                        if path.is_symlink():
+                            path.unlink()
+                    entry.write_text("")
+                    payload.write_text("priority: urgent\ntask: x\n")
+                    with mock.patch.dict(os.environ, SUTANDO_INBOX_RESOLVER=resolver):
+                        self.assertEqual(self._run("sort-by-priority", str(self.tasks_dir),
+                                                  "--resolve-inbox", self.tmp.name, RESOLVER_HELPER,
+                                                  "--resolution-cache", str(cache))[0], 0)
+                    if mutation == "replace":
+                        other = changed.with_suffix(".replacement")
+                        other.write_bytes(changed.read_bytes())
+                        other.replace(changed)
+                    elif mutation == "write":
+                        changed.write_text("changed\n")
+                    elif mutation == "remove":
+                        changed.unlink()
+                    else:
+                        other = changed.with_suffix(".original")
+                        changed.replace(other)
+                        changed.symlink_to(other)
+                    self.assertEqual(self._run("reuse-inbox-resolution", str(cache), str(entry)), (5, "", ""))
+
     def test_resolver_unavailable_keeps_every_entry(self):
         _write(self.tasks_dir / "entry.txt", "")
         with mock.patch.dict(os.environ, SUTANDO_INBOX_RESOLVER="/no/such/resolver"):
