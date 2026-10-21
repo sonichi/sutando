@@ -22,7 +22,7 @@ resolve_inbox_entry() {
 		echo "watch-tasks-stream: SUTANDO_INBOX_RESOLVER names no executable ($SUTANDO_INBOX_RESOLVER); refusing to dispatch $entry unresolved" >&2
 		return 3
 	fi
-	out_file="$(mktemp)"
+	out_file="$(mktemp -p "${TMPDIR:-/tmp}" "sutando-inbox-resolve.XXXXXX")" || return 3
 	# The assignment is APPENDED: $1 stays the entry, so a resolver written
 	# before this flag existed is unaffected, and a new one can require it.
 	run_bounded "${SUTANDO_INBOX_RESOLVER_TIMEOUT:-5}" -- \
@@ -49,3 +49,8 @@ resolve_inbox_entry() {
 	printf '%s\n' "$resolved"
 	return 0
 }
+
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+	WORKSPACE_DIR="${2:-}"
+	resolve_inbox_entry "$1"
+fi

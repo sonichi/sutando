@@ -805,7 +805,7 @@ task_announce() {
 # silently dropping the backlog; ordering degrades, dispatch never does.
 priority_sorted_tasks() {
   local out rc=0 had_files=0 f
-  out="$("$SUTANDO_PY_BIN" "$__REPO_ROOT/src/delivery/task_dispatch.py" sort-by-priority "$TASKS_DIR" 2>/dev/null)" || rc=$?
+  out="$("$SUTANDO_PY_BIN" "$__REPO_ROOT/src/delivery/task_dispatch.py" sort-by-priority "$TASKS_DIR" --resolve-inbox "$WORKSPACE_DIR" 2>/dev/null)" || rc=$?
   if [ -n "$out" ]; then
     printf '%s\n' "$out"
     return 0

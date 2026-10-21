@@ -55,6 +55,7 @@ answering about an archived body while reading an untouched live placeholder ins
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -396,7 +397,7 @@ def partial_paste_leftover(partial_dir: "Path | str", filename: str, incarnation
 _USAGE = (
     "usage: task_dispatch.py has-result <results_dir> <filename>\n"
     "       task_dispatch.py find-ready <results_dir> <filename>\n"
-    "       task_dispatch.py sort-by-priority <tasks_dir>   # every *.txt, no result/claim/delivery filtering\n"
+    "       task_dispatch.py sort-by-priority <tasks_dir> [--resolve-inbox WORKSPACE]   # every *.txt, no filtering\n"
     "       task_dispatch.py priority-tier <task_file>   # prints urgent|normal|low, the file's own header\n"
     "       task_dispatch.py pending-candidates <tasks_dir> <results_dir> [--claims-dir DIR] [--deliveries-dir DIR]\n"
     "       task_dispatch.py next-pending <tasks_dir> <results_dir> [--claims-dir DIR] [--deliveries-dir DIR]\n"
@@ -428,14 +429,34 @@ def _parse_dir_options(rest: list[str]) -> dict:
     return opts
 
 
+def _inbox_priority(entry: Path, workspace: str) -> str:
+    """Use the dispatch resolver's bounds and validation without admitting the entry."""
+    try:
+        resolved = subprocess.run(
+            ["bash", str(Path(__file__).resolve().parent.parent / "inbox-resolve.sh"),
+             str(entry), workspace],
+            capture_output=True, text=True, check=False,
+        )
+    except OSError:
+        return "normal"
+    if resolved.returncode:
+        return "normal"
+    return parse_priority_from_file(Path(resolved.stdout.removesuffix("\n")))
+
+
 def _main(argv: list[str]) -> int:
     # A pure sort, no eligibility filtering -- the caller still decides
     # whether a file is eligible; this only changes the offered order.
     if argv and argv[0] == "sort-by-priority":
-        if len(argv) != 2:
+        if len(argv) != 2 and not (len(argv) == 4 and argv[2] == "--resolve-inbox" and argv[3]):
             print(_USAGE, file=sys.stderr)
             return 2
-        names = [p.name for p in sort_tasks_by_priority(Path(argv[1]).glob("*.txt"))]
+        reader = parse_priority_from_file
+        if len(argv) == 4 and os.environ.get("SUTANDO_INBOX_RESOLVER"):
+            reader = lambda entry: _inbox_priority(entry, argv[3])
+        names = [p.name for p in sort_tasks_by_priority(
+            Path(argv[1]).glob("*.txt"), priority_reader=reader,
+        )]
         for name in names:
             print(name)
         return 0 if names else 1
