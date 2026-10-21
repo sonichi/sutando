@@ -56,7 +56,8 @@ class InflightAbandonment(unittest.TestCase):
     RUN_S = 20
     COMPLETION_TIMEOUT = 120
 
-    def _run(self, runtime: str, on_first: str) -> tuple[list[tuple[str, float]], str, float]:
+    def _run(self, runtime: str, on_first: str, completion_timeout: "int | None" = None
+             ) -> tuple[list[tuple[str, float]], str, float]:
         cfg = NOTIFIERS[runtime]
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
@@ -91,7 +92,7 @@ class InflightAbandonment(unittest.TestCase):
                "RESULTS_DIR": str(results), "TASKS_DIR": str(tasks), "WORKSPACE_DIR": str(root),
                "PAYLOAD_DIR": str(payload), "INFLIGHT_DIR": str(root / "inflight"),
                "TMUX_SOCKET": str(root / "sock"), "SESSION": "core", "POLL_INTERVAL": "0.1",
-               "COMPLETION_TIMEOUT": str(self.COMPLETION_TIMEOUT)}
+               "COMPLETION_TIMEOUT": str(completion_timeout or self.COMPLETION_TIMEOUT)}
         start = time.time()
         try:
             r = subprocess.run(["bash", "-c", harness], env=env, capture_output=True, text=True,
@@ -149,9 +150,15 @@ class InflightAbandonment(unittest.TestCase):
                 self.assertEqual(fn.count('"$DISPATCH_PY" head-abandoned'), 1)
                 self.assertNotIn("[ ! -e", fn, "the abandonment rule must not be re-derived in bash")
 
-    def test_codex_timeout_is_logged_to_the_notifier_log(self):
-        fn = _function_text("submit_task", NOTIFIERS["codex"]["script"].read_text())
-        self.assertIn('log_notifier "timed out waiting for result: $filename"', fn)
+    def test_a_timed_out_wait_is_logged_to_the_notifier_log(self):
+        # Payload stays present and no result arrives, so only the timeout can end the wait.
+        for runtime in NOTIFIERS:
+            with self.subTest(runtime=runtime):
+                rows, log, _ = self._run(runtime, '    :', completion_timeout=1)
+                self.assertEqual([n for n, _ in rows], ["task-first.txt"], self.stderr)
+                self.assertIn("timed out waiting for result: task-first.txt", log,
+                              f"{runtime} log:\n{log}")
+                self.assertNotIn("dropped", log)
 
 
 if __name__ == "__main__":
