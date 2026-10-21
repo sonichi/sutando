@@ -805,7 +805,9 @@ task_announce() {
 # silently dropping the backlog; ordering degrades, dispatch never does.
 priority_sorted_tasks() {
   local out rc=0 had_files=0 f
-  out="$("$SUTANDO_PY_BIN" "$__REPO_ROOT/src/delivery/task_dispatch.py" sort-by-priority "$TASKS_DIR" 2>/dev/null)" || rc=$?
+  out="$("$SUTANDO_PY_BIN" "$__REPO_ROOT/src/delivery/task_dispatch.py" sort-by-priority "$TASKS_DIR" \
+    --resolve-inbox "$WORKSPACE_DIR" "$__REPO_ROOT/src/inbox-resolve.sh" \
+    --resolution-cache "$PRIORITY_RESOLUTION_CACHE" 2>/dev/null)" || rc=$?
   if [ -n "$out" ]; then
     printf '%s\n' "$out"
     return 0
@@ -848,8 +850,19 @@ dispatch_task() {
   now="$(date +%s)"
   case "$mtime" in ''|*[!0-9]*) ;; *) age=$((now - mtime)) ;; esac
   attempt=0
-  until resolved="$(resolve_inbox_entry "$task_path")"; do
-    rc=$?
+  while :; do
+    rc=5
+    if [ "$attempt" -eq 0 ] && [ -n "${PRIORITY_RESOLUTION_CACHE:-}" ] \
+      && [ -f "$PRIORITY_RESOLUTION_CACHE/$(basename "$task_path")" ]; then
+      resolved="$("$SUTANDO_PY_BIN" "$__REPO_ROOT/src/delivery/task_dispatch.py" \
+        reuse-inbox-resolution "$PRIORITY_RESOLUTION_CACHE" "$task_path")"
+      rc=$?
+    fi
+    if [ "$rc" -eq 5 ]; then
+      resolved="$(resolve_inbox_entry "$task_path")"
+      rc=$?
+    fi
+    [ "$rc" -eq 0 ] && break
     attempt=$((attempt + 1))
     if [ "$rc" -eq 4 ] && [ "$age" -gt "$RESOLVE_RACE_WINDOW_S" ]; then
       echo "watch-tasks-stream: $task_path names no payload and is ${age}s old, past the ${RESOLVE_RACE_WINDOW_S}s race window; not dispatching (1 attempt)" >&2
@@ -1039,6 +1052,7 @@ cleanup() {
   fi
   settle_own_claims_on_shutdown
   if [ -n "${WATCH_RUNTIME_DIR:-}" ]; then
+    [ -z "${PRIORITY_RESOLUTION_CACHE:-}" ] || rm -rf "$PRIORITY_RESOLUTION_CACHE"
     rm -f "$WATCH_RUNTIME_DIR/events"
     rmdir "$WATCH_RUNTIME_DIR" 2>/dev/null || true
   fi
@@ -1072,9 +1086,13 @@ trap 'cleanup; exit 0' HUP INT TERM
 startup_sweep() {
   local fn
   reconcile_dead_claims
+  PRIORITY_RESOLUTION_CACHE="$WATCH_RUNTIME_DIR/priority-resolution"
+  mkdir -p "$PRIORITY_RESOLUTION_CACHE"
   while IFS= read -r fn; do
     dispatch_task "$TASKS_DIR/$fn"
   done < <(priority_sorted_tasks)
+  rm -rf "$PRIORITY_RESOLUTION_CACHE"
+  PRIORITY_RESOLUTION_CACHE=""
 }
 # A session watcher sweeps only once the standby has stopped (below); any other
 # role has no peer on its inbox and sweeps before it subscribes, as always.
@@ -1175,8 +1193,7 @@ if ! launch_fswatch; then
   exit 1
 fi
 
-# One fswatch line. Shared by the readiness replay and the main loop so a line
-# read early is handled exactly as a line read late.
+# Shared by startup configuration replay and the live event loop.
 handle_event() {
   local path="$1" parent
   case "$path" in
@@ -1258,10 +1275,13 @@ if [ "$WATCHER_ROLE" = "session" ]; then
   if [ "$standby" != "no" ]; then
     echo "watch-tasks-stream: standby watcher still present after ${SUTANDO_STANDBY_STOP_TIMEOUT:-15}s; sweeping anyway" >&2
   fi
-  # Buffered events first, in fswatch's order, so a task sees the handler config
-  # delivered before it; the sweep then covers only what no event announced.
+  # Buffered task events belong to the sorted backlog, not arrival-order replay.
+  # Preserve config events; dispatch still reads the config at each decision.
   while IFS= read -r path; do
-    [ -n "$path" ] && handle_event "$path"
+    [ -n "$path" ] || continue
+    case "$path" in
+      "$HANDLER_CONFIG_PATH"|"$HANDLER_CONFIG_DIR") handle_event "$path" ;;
+    esac
   done <<< "$PRE_READY_EVENTS"
   startup_sweep
 fi

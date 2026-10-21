@@ -968,6 +968,264 @@ class StepBranchTest(unittest.TestCase):
         self.assertEqual(self.seen, {"task-a"})
         self.assertEqual(self.fake.calls(), [])
 
+    def test_a_settled_id_with_settlement_debt_is_repaired_through_the_lifecycle_before_it_counts(self):
+        """step() asks the lifecycle (is_settled), never the ledger alone: a SETTLED claim whose id is in the ledger
+        but whose staged body was left is repaired before the task counts settled, and a repair whose read fails
+        parks the task (through the loop's boundary) instead of reporting it final."""
+        write_task(self.work, "task-a", "hi")
+        claims = self.ad.lc.claims
+        claims.save({"schema": 1, "task_id": "task-a", "attempt": 1, "created_at": 1.0, "phase": lc.SETTLED,
+                     "settled_at": 1.0})
+        claims.stage("task-a", b"staged body\n")
+        self.ad.lc.settled.add("task-a")
+        with contextlib.redirect_stderr(io.StringIO()), \
+                mock.patch.object(lc.ClaimStore, "unstage", side_effect=lc.StateIOError("cannot remove body")):
+            self.assertFalse(self.ad.contained("task-a.txt", self.ad.step, "task-a.txt", self.seen),
+                             "a repair that fails on a read parks the task")
+        self.assertEqual(self.seen, set())
+        self.assertGreater(self.ad.not_before["task-a"], self.ad.clock())
+        self.assertTrue((claims.dir("task-a") / "body").is_file())
+        self.ad.not_before.clear()
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertTrue(self.ad.step("task-a.txt", self.seen))
+        self.assertEqual((self.seen, (claims.dir("task-a") / "body").exists()), ({"task-a"}, False), "repaired, then final")
+        self.assertEqual(self.fake.calls(), [])
+
+    def test_a_local_settled_claim_is_read_never_repaired_by_the_cloud_step(self):
+        """claim_mode first: a local SETTLED claim (its id in the ledger, its staged body left for its own owner) is
+        counted settled from the ledger and never repaired here; its body stays."""
+        write_task(self.work, "task-l", "hi")
+        claims = self.ad.lc.claims
+        claims.save({"schema": 1, "task_id": "task-l", "attempt": 1, "created_at": 1.0, "phase": lc.SETTLED,
+                     "settled_at": 1.0, "claim_mode": lc.LOCAL, "generation": {"pid": 1, "start": "x"}})
+        claims.stage("task-l", b"the local owner's\n")
+        self.ad.lc.settled.add("task-l")
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertTrue(self.ad.step("task-l.txt", self.seen))
+        self.assertTrue((claims.dir("task-l") / "body").is_file(), "never repaired by the cloud adapter")
+        self.assertEqual(self.fake.calls(), [])
+
+    def test_serve_survives_an_io_error_in_the_steps_claim_read_and_delivers_once_it_recovers(self):
+        """The serve loop with step()'s own claim read failing once on I/O: the adapter stays up, the task is
+        parked, and once the read works again it is called and delivered exactly once."""
+        write_task(self.work, "task-a", "hi")
+        real_load, real_step, hits, stepping = lc.ClaimStore.load, sa.Adapter.step, [], []
+
+        def load_fails_once(store, task_id):
+            if task_id == "task-a" and stepping and not hits:        # in the serve loop, after startup recovery
+                hits.append(task_id)
+                raise lc.StateIOError("cannot read claim.json ([Errno 5] I/O error)")
+            return real_load(store, task_id)
+
+        def step(ad, name, seen):
+            stepping.append(name)
+            return real_step(ad, name, seen)
+        with mock.patch.object(lc.ClaimStore, "load", load_fails_once), mock.patch.object(sa.Adapter, "step", step):
+            ad, err = run_adapter(self.work, self.fake, once=1)
+        self.assertGreaterEqual(len(stepping), 2, "the loop went on after the parked step")
+        self.assertEqual(hits, ["task-a"])
+        self.assertIn("parked -> task-a", err)
+        self.assertEqual(len(self.fake.calls()), 1, "called once, after the read recovered")
+        self.assertTrue((self.work / "results" / "task-a.txt").exists(), "delivered")
+
+    def test_serve_survives_the_first_claim_read_failing_and_publishes_exactly_one_result(self):
+        """The reviewer's shape, with no guard on who reads: the very first ClaimStore.load() of the task fails
+        once on I/O. serve() stays alive, retries, makes exactly one provider call and publishes one result."""
+        write_task(self.work, "task-a", "hi")
+        real_load, hits = lc.ClaimStore.load, []
+
+        def first_load_fails(store, task_id):
+            if task_id == "task-a" and not hits:
+                hits.append(task_id)
+                raise lc.StateIOError("cannot read claim.json ([Errno 5] I/O error)")
+            return real_load(store, task_id)
+        with mock.patch.object(lc.ClaimStore, "load", first_load_fails):
+            ad, err = run_adapter(self.work, self.fake, once=1)
+        self.assertEqual(hits, ["task-a"])
+        self.assertEqual(len(self.fake.calls()), 1, "exactly one provider call")
+        self.assertEqual([p.name for p in (self.work / "results").iterdir() if p.name.startswith("task-a")],
+                         ["task-a.txt"], "exactly one result")
+
+    def test_serve_survives_repeated_io_errors_in_the_loops_own_claim_read_and_delivers_once_it_recovers(self):
+        """The loop reads a claim before any step (next_ready -> recovering -> _phase). That read failing on I/O
+        three times: serve() keeps running, the task is skipped while parked (no read meanwhile), and once the
+        read works it is called and delivered exactly once."""
+        write_task(self.work, "task-a", "hi")
+        real_load, real_recovering, hits, inside = lc.ClaimStore.load, sa.Adapter.recovering, [], []
+
+        def load(store, task_id):
+            if task_id == "task-a" and inside and len(hits) < 3:
+                hits.append(task_id)
+                raise lc.StateIOError("cannot read claim.json ([Errno 5] I/O error)")
+            return real_load(store, task_id)
+
+        def recovering(ad, name):
+            inside.append(1)
+            try:
+                return real_recovering(ad, name)
+            finally:
+                inside.pop()
+        with mock.patch.object(lc.ClaimStore, "load", load), mock.patch.object(sa.Adapter, "recovering", recovering):
+            ad, err = run_adapter(self.work, self.fake, once=1)
+        self.assertEqual(len(hits), 3, "the loop's read failed three times, each after a park")
+        self.assertEqual(err.count("parked -> task-a"), 3)
+        self.assertEqual(len(self.fake.calls()), 1, "called once, after the read recovered")
+        self.assertTrue((self.work / "results" / "task-a.txt").exists(), "delivered")
+
+    def test_the_loop_boundary_parks_a_read_failure_and_stops_on_a_write_failure(self):
+        """The serve loop's one containment (contained()) around a task's probe and step: a state read that
+        failed (StateIOError) parks that task; a durable write that failed (StateWriteError) and a refusal on the
+        state still stop the adapter. ClaimUnreadable keeps its own branch inside the step."""
+        write_task(self.work, "task-a", "hi")
+        with contextlib.redirect_stderr(io.StringIO()), \
+                mock.patch.object(lc.ClaimStore, "load", side_effect=lc.StateIOError("cannot read claim.json ([Errno 5])")):
+            self.assertFalse(self.ad.contained("task-a.txt", self.ad.step, "task-a.txt", self.seen))
+            self.ad.not_before.clear()
+            self.assertFalse(self.ad.contained("task-a.txt", self.ad.recovering, "task-a.txt"))
+        self.assertGreater(self.ad.not_before["task-a"], self.ad.clock())
+        self.assertEqual((self.seen, self.fake.calls()), (set(), []))
+        for stops in (lc.StateWriteError("cannot write claim.json ([Errno 28])"), lc.LedgerError("malformed record")):
+            with mock.patch.object(lc.ClaimStore, "load", side_effect=stops), self.assertRaises(type(stops)):
+                self.ad.contained("task-a.txt", self.ad.step, "task-a.txt", self.seen)
+        self.ad.not_before.clear()
+        with contextlib.redirect_stderr(io.StringIO()), \
+                mock.patch.object(self.ad.lc, "is_settled", side_effect=lc.LedgerIOError("cannot fsync the ledger")):
+            self.assertFalse(self.ad.contained("task-a.txt", self.ad.step, "task-a.txt", self.seen),
+                             "a ledger I/O failure in the settlement repair parks, at the boundary")
+        self.assertEqual((self.seen, self.fake.calls()), (set(), []))
+
+    def test_a_write_or_a_refusal_inside_the_settlement_repair_stops_the_adapter(self):
+        """is_settled() runs inside step() with no local catch: what its repair raises is classified by the boundary
+        alone. A real unstage failure (StateWriteError) and a corrupt ledger met by the repair's append
+        (LedgerError) escape the boundary, which stops the adapter with exit 2; neither is parked."""
+        for kind in ("unstage", "ledger"):
+            tmp = tempfile.TemporaryDirectory()
+            self.addCleanup(tmp.cleanup)
+            work = Path(tmp.name) / "work"
+            fake = Fake(tmp.name, [ok()])
+            write_task(work, "task-a", "hi")
+            clock = FakeClock()
+            ad = sa.Adapter(args_for(work, fake.path, once=1), clock=clock, sleep=clock.sleep, note=NOTE, environ=ENV)
+            ad.lc.claims.save({"schema": 1, "task_id": "task-a", "attempt": 1, "created_at": 1.0, "phase": lc.SETTLED,
+                               "settled_at": 1.0})
+            ad.lc.claims.stage("task-a", b"staged body\n")
+            ad.lc.settled.add("task-a")
+            real_unlink = os.unlink
+
+            def unlink(path, *a, **k):
+                if str(path).endswith("/body"):
+                    raise OSError(5, "Input/output error")
+                return real_unlink(path, *a, **k)
+            patch = mock.patch.object(lc.os, "unlink", unlink) if kind == "unstage" else contextlib.nullcontext()
+            if kind == "ledger":
+                ad.lc.settled.durable.discard("task-a")       # visible, not yet synced by this process: add() runs
+                Path(ad.lc.settled.path).write_text("not a task id\ntask-a\n")
+            with patch, contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(lc.StateError) as stopped:
+                    ad.contained("task-a.txt", ad.step, "task-a.txt", set())
+                self.assertIsInstance(stopped.exception, lc.StateWriteError if kind == "unstage" else lc.LedgerError, kind)
+                self.assertNotIn("task-a", ad.not_before, "not parked: %s" % kind)
+            # serve() has no catch of its own around contained(); serve_locked answers a StartupRefused with its code.
+            self.assertEqual(stopped.exception.code, 2, "the adapter stops with exit 2: %s" % kind)
+            self.assertEqual(fake.calls(), [])
+
+    def test_a_parked_task_is_not_read_again_until_its_park_ends(self):
+        """One read per park: while the task's park lasts, the loop's probe does not read its claim again."""
+        write_task(self.work, "task-a", "hi")
+        loads = []
+
+        def failing(store, task_id):
+            loads.append(task_id)
+            raise lc.StateIOError("cannot read claim.json ([Errno 5])")
+        with contextlib.redirect_stderr(io.StringIO()), mock.patch.object(lc.ClaimStore, "load", failing):
+            for _ in range(5):
+                self.assertFalse(self.ad.contained("task-a.txt", self.ad.recovering, "task-a.txt"))
+            self.assertEqual(loads, ["task-a"], "one read for the whole park")
+            self.ad.clock.t = self.ad.not_before["task-a"]
+            self.ad.contained("task-a.txt", self.ad.recovering, "task-a.txt")
+        self.assertEqual(loads, ["task-a", "task-a"], "read again once the park ended")
+
+    def test_every_state_read_of_a_serve_iteration_survives_one_fault(self):
+        """Property over the loop's own reads. A clean serve run records each ClaimStore read it makes after start-up
+        (N of them); then for k = 1..N a fresh run faults exactly read k once (StateIOError). Every read outside
+        the outcome record is parked and retried: serve() survives, makes exactly one provider call and publishes
+        exactly one result. A read inside the outcome record (after the call, part of that durable write) stops
+        the adapter with StateWriteError, and the restart's recovery answers the call: still one call, one result.
+        A read added to the loop later is enumerated and faulted the same way, with no change here."""
+        reads = ("load", "staged", "blob")
+
+        def run(fault_at, work=None, fake=None):
+            if work is None:
+                tmp = tempfile.TemporaryDirectory()
+                self.addCleanup(tmp.cleanup)
+                work = Path(tmp.name) / "work"
+                fake = Fake(tmp.name, [ok()])
+                write_task(work, "task-a", "hi")
+            seen, real = [], {r: getattr(lc.ClaimStore, r) for r in reads}
+            serving, fired, outcome = [], [], []
+
+            def wrap(name):
+                def read(store, *a):
+                    if serving:
+                        seen.append(name + ("@outcome" if outcome else ""))
+                        if len(seen) == fault_at:
+                            fired.append(seen[-1])
+                            raise lc.StateIOError("cannot read %s ([Errno 5] I/O error)" % name)
+                    return real[name](store, *a)
+                return read
+            real_recover, real_record = sa.Adapter.recover, lc.Lifecycle.record_outcome
+
+            def recover(ad):
+                real_recover(ad)
+                serving.append(1)                  # start-up refuses on a fault; the loop's reads come after
+
+            def record_outcome(life, *a, **k):
+                outcome.append(1)
+                try:
+                    return real_record(life, *a, **k)
+                finally:
+                    outcome.pop()
+            stopped = None
+            with contextlib.ExitStack() as stack:
+                for r in reads:
+                    stack.enter_context(mock.patch.object(lc.ClaimStore, r, wrap(r)))
+                stack.enter_context(mock.patch.object(sa.Adapter, "recover", recover))
+                stack.enter_context(mock.patch.object(lc.Lifecycle, "record_outcome", record_outcome))
+                clock = FakeClock()
+                real_sleep = clock.sleep
+
+                def bounded_sleep(secs):
+                    if clock.t - T0 > 3600:
+                        raise RuntimeError("no result within an hour of loop time")
+                    real_sleep(secs)
+                clock.sleep = bounded_sleep
+                try:
+                    run_adapter(work, fake, clock=clock, once=1)
+                except lc.StateWriteError as e:
+                    stopped = e
+            if stopped is not None:
+                run_adapter(work, fake, once=1)    # the restart: recovery answers the counted call
+            results = [p.name for p in (work / "results").iterdir() if p.name.startswith("task-a")]
+            return seen, fired, stopped is not None, len(fake.calls()), results
+        clean, _, _, calls, results = run(0)
+        self.assertEqual((calls, results), (1, ["task-a.txt"]))
+        n = len(clean)
+        failures, stops = [], []
+        for k in range(1, n + 1):
+            try:
+                _, fired, stopped, calls, results = run(k)
+            except Exception as e:                                  # noqa: BLE001 - the property reports any escape
+                failures.append("read %d (%s): serve() raised %s: %s" % (k, clean[k - 1], type(e).__name__, e))
+                continue
+            if stopped:
+                stops.append(clean[k - 1])
+            if stopped != clean[k - 1].endswith("@outcome") or (fired, calls, results) != ([clean[k - 1]], 1, ["task-a.txt"]):
+                failures.append("read %d (%s): fired %r, stopped %r, %d calls, results %r"
+                                % (k, clean[k - 1], fired, stopped, calls, results))
+        self.assertEqual(failures, [], "N = %d reads: %r" % (n, clean))
+        self.assertEqual(stops, [r for r in clean if r.endswith("@outcome")], "only the outcome record's reads stop")
+        self.assertTrue(stops, "the run reaches an outcome record, so the stop path is exercised")
+
     def test_a_claim_past_its_call_is_published_and_a_parked_publication_waits(self):
         write_task(self.work, "task-a", "hi")
         past = {"phase": "published", "task_id": "task-a"}

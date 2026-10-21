@@ -96,7 +96,64 @@ and never holds intake for the next one; the
 task is kept, an unconfirmed turn's confirmation is retried by the next tick or
 by the reply itself, and a reply told to call again; after a retried publish the staged answer is
 the one delivered, so a reply with a different text is refused and names it), and one after the commit
-answers hard. When the progress record cannot be written at all, the CLI raises
+answers hard. A publication that fails on I/O (an unwritable results dir) is
+that same pre-commit retry, never a soft refusal: the session is told to call
+again with the same text, and the turn's end retries it too; one whose rename
+landed but whose directory fsync or read-back failed answers retry naming that
+(the result is visible, its durability unknown), and the next publish settles
+on the result it finds. A park that
+settled but whose reply was lost (the lock's release failed and the claim
+could not be re-read) answers settled on the identical park again, naming the
+protocol failure only when that is what it delivered; nothing is published
+twice. A Mod that lost its offers inside one generation (a plugin reload, not
+a session restart) claims every listed task afresh, and a claim it already
+drove past its call is one it can never finish: at TURN_CONFIRMED with an
+accepted answer the lifecycle's one decision for such a turn (`close_turn`,
+the same one generation recovery takes) applies: a descriptor whose blob
+verifies is moved on by the claim save alone (`finish_verified`; the blob is
+final and never written again) and published, a blob missing or not matching its
+descriptor is answered as interrupted at once (the detail says which), never
+a substituted body; the interruption is one durable transition (a rename that
+lands leaves RESULT_STAGED, never an intermediate phase); at RESULT_STAGED or
+PUBLISHED the staged answer is published, and a claim a record from before
+left committed at OUTCOME_UNKNOWN is resumed to RESULT_STAGED and published
+(`resume_outcome`, the move recovery makes), never retired; a CALLING claim,
+or one confirmed with nothing accepted, waits for the next generation's
+recovery as before. Recovery runs once per `hold` start, so whatever that pass
+leaves publishable (a dead or unverifiable generation's verifying blob, a
+staged answer whose publication failed, a committed OUTCOME_UNKNOWN) is
+delivered by the new generation's live claim, once; its interruption stays
+recovery's. A claim whose result already exists settles the claim on that
+result and drops the task's in-flight mirror with its stuck mark in one
+write, so a delivered task is never left in flight for the stall detector.
+Settlement has one invariant: a SETTLED claim is complete when the
+settled-ids ledger holds its id and its staged body is gone. Every reader
+that can report a claim settled or final (claim, interrupt, publish, park,
+recovery) first runs the one repair-then-check, `reconcile_settled`; a repair
+that fails is a retry, never a final reply. Recovery selects SETTLED claims
+that are not complete (or are due for compaction), and claims answered
+without a call, which carry no generation, are reconciled and compacted too
+(`reconcile_unbound`). The ledger is append-only lines: each append is one
+write of the id and a newline under the ledger's own flock, after a repair
+that cuts a torn tail (an unterminated last line, the only shape a short
+append leaves); a torn append is cut and re-appended by the next repair, and
+two writers that loaded the ledger before either appended record an id once.
+A newline-terminated malformed record is corruption and fails closed. A hard
+reply (a rename that landed, its directory fsync failed) claims
+`outcome: settled` only over a complete settlement; otherwise the caller
+retries and the retry completes it. The cloud adapter's recovery and its
+"already settled" reader (`is_settled`) take the same repair-then-check, for
+cloud claims only (a local claim is read from the ledger, never repaired
+there). A ledger id counts only after a successful fsync of the ledger (and
+its directory) seen by the counting process: an id that is visible but whose
+sync failed is synced again before the staged body is removed, the claim is
+compacted, or anything reports settled; a sync that fails removes nothing and
+is a retry. Recovery skips a claim whose repair fails on I/O (one log line)
+and finishes it on the next pass, so one bad claim never stops a start.
+"Durable" is only the lines wholly within the bytes a successful fsync by
+this process covered: a line a repair re-reads later never counts until this
+process syncs it. The cloud adapter's step parks a task on an I/O error
+reading its claim, and retries it, instead of stopping. When the progress record cannot be written at all, the CLI raises
 an alarm in the adapter's config dir (outside `state/`): `verify` fails its
 `progress` row and the launcher raises the needs-attention card until a durable
 write clears it. A record whose fields have the wrong shape reads as unreadable (hard),
@@ -348,10 +405,17 @@ and writes no bridge. Every root records its agent in the supervisor record on
 the first session; a later install or launch for another agent refuses, naming
 both. `verify` fails its `bridge` row unless a fresh, connected gateway status
 in the bridge's state dir reports exactly `<root>/tasks`, `<root>/results` and
-the recorded agent, and names the fix. The bridge's `AGENT_CONNECT_STATE_DIR`
-must be the state dir install recorded (the parent of the HITL store in the
-config): `verify`'s bridge row reads the bridge's status there, and the bridge
-projects this adapter's cards from the store beside it.
+the recorded agent, and names the fix. Install records the bridge's state dir
+once, as `BRIDGE_STATE_DIR` in the config: the dir beside the root for the
+bridge it wires (the unit or declaration is written from that same value), or
+`--bridge-state-dir` for a bridge you run (default: Sparrow's state dir), and
+derives the HITL store from it. `verify`'s bridge row reads the bridge's
+status there, and the bridge projects this adapter's cards from the store
+beside it, so a bridge on another `AGENT_CONNECT_STATE_DIR` passes the row
+once install names that dir. A config from before the key reads the HITL
+store's parent, as install then derived it; `verify` then prints the store as
+an INFO line instead of checking a row against a value derived from itself,
+and names the reinstall that records the dir.
 
 **Process tree.** The service manager (`systemd --user`, or a launchd user
 agent) runs `run`, the launcher; `run` refuses unless
@@ -560,13 +624,24 @@ mtime delta.
   transition in v1.
 - Delivery is **at-most-once** per attempt: an attempt left `CALLING` by a dead
   generation is answered as interrupted, never resent; a turn confirmed with no
-  staged reply is answered as "turn confirmed, no result"; a re-run is the
+  staged reply is answered as "turn confirmed, no result", and one whose
+  committed result does not match its descriptor the same way (the detail
+  says so; the bytes are never delivered); a re-run is the
   asker's to send. Launcher crash plus adoption is no-duplicate.
 - **commit-unknown**: when the store's directory fsync fails after the
   acceptance's replace, the accepted record is visible with durability
   unknown; the accepter performs no effect and the click is consumed (never a
   chat task); the launcher re-fsyncs and re-saves the identical record before
   the one effect. A replace that never happened leaves the card pending.
+- Survive-and-adopt holds for the launcher's own death, the realistic crash:
+  the tmux server is not its child, so the session runs on and the next
+  launcher adopts it. On macOS the `run --launchd` forwarder is launchd's main
+  pid, and its death (witnessed with `SIGKILL`) is the other case: with
+  `AbandonProcessGroup` false launchd tears the process group down, the inner
+  launcher takes that `SIGTERM` as a manager stop (`/exit`, the session
+  stopped), and the respawn resumes the same conversation by id. Nothing is
+  lost (a settled task stays settled, a mid-turn one is re-driven by the
+  lifecycle's rules), but that is a stop and a resume, not an adoption.
 - `KillMode=process` on Linux: a `systemctl stop` while the launcher is
   already dead leaves the session for `uninstall`'s `/exit` → `kill-session`.
   systemd ordering is asserted from the unit and not witnessed; `verify` says

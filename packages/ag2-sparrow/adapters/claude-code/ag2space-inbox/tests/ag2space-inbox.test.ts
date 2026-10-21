@@ -13,6 +13,8 @@ const TASK = (id: string, tier = 'owner', extra = '') =>
 const FRAMED = (msg: string) => `The ag2space-inbox plugin sent a message:\n${msg}\n\nThis is how Claude Code surfaces ` +
   "a prompt a plugin submits between turns \u2014 it starts this turn in the user's place. Address the message above."
 
+const INTERRUPTED = '[AG2 Space] This attempt was interrupted before the session answered; send the request again if it is still wanted.'
+
 type Claim = { attempt: number; phase: string; token?: string; hash?: string; turnId?: string; body?: string; staged?: string
                 blobOk?: boolean }
 
@@ -30,6 +32,7 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
                                lockFailsOnce?: string[]; storeFailsOnce?: string[]; unreadableOnce?: string[];
                                committedHardOnce?: string[]; committedHardWhy?: string; stageLandsOnce?: boolean;
                                parkRefusedOnce?: boolean; authorizeLostOnce?: boolean; stageLinkFailsOnce?: boolean;
+                               lostTurnFsyncFails?: number;
                                parkAlwaysRefuses?: boolean; parkRefuses?: number; authorizeRetries?: number; stageThrows?: number } = {}) {
   const files: Record<string, string> = {}
   const submitted: string[] = []
@@ -57,7 +60,14 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
   let unstuckHardLeft = opts.unstuckHardFails ?? 0
   let unstuckThrowsLeft = opts.unstuckThrows ?? 0
   let stuckWriteFailsLeft = opts.stuckWriteFails ?? 0
-  const lockFails = new Set(opts.lockFailsOnce ?? [])
+  // A verb named twice fails twice: one failure the reply consumes, one the turn's end then meets.
+  const lockFails = new Map<string, number>()
+  for (const v of opts.lockFailsOnce ?? []) lockFails.set(v, (lockFails.get(v) ?? 0) + 1)
+  const lockFailsNow = (verb: string) => {
+    const n = lockFails.get(verb) ?? 0
+    if (n > 1) lockFails.set(verb, n - 1); else lockFails.delete(verb)
+    return n > 0
+  }
   const storeFails = new Set(opts.storeFailsOnce ?? [])
   const unreadable = new Set(opts.unreadableOnce ?? [])
   const committedHard = new Set(opts.committedHardOnce ?? [])
@@ -68,6 +78,7 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
   let authorizeLost = opts.authorizeLostOnce ?? false
   let stageLinkFails = opts.stageLinkFailsOnce ?? false
   let stageThrowsLeft = opts.stageThrows ?? 0
+  let lostTurnFsyncLeft = opts.lostTurnFsyncFails ?? 0
   let publishes = 0
   const committedHardWhy = opts.committedHardWhy ?? 'OSError: unlock I/O error'
   const clearFailsLeft: Record<string, string> = { ...(opts.clearFails ?? {}) }
@@ -130,7 +141,7 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
     const verb = argv[2]
     const task = argv[3]
     // As the CLI's claims-step boundary: an EIO before the step commits is a retry, nothing changed.
-    if (lockFails.delete(verb)) return out(1, { refused: 'the step did not commit ([Errno 5] claims lock I/O error); retried', retry: true })
+    if (lockFailsNow(verb)) return out(1, { refused: 'the step did not commit ([Errno 5] claims lock I/O error); retried', retry: true })
     if (verb === 'authorize' && committedHard.delete('authorize')) {
       // As the CLI: the authorization committed, then the lock's release or the rename's fsync failed.
       const c0 = claims[task]
@@ -189,6 +200,18 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
       }
       if (result(task) === 'LIVE_UNREADY') return out(1, { refused: `${task} is LIVE_UNREADY, not claimable yet; retried`, retry: true })
       const c = claims[task]
+      if (c && ((c.phase === 'TURN_CONFIRMED' && c.staged === undefined) || c.phase === 'RESULT_STAGED')) {
+        // As the CLI's lost-turn claim: interrupted in one durable transition to RESULT_STAGED, then published.
+        if (c.phase === 'TURN_CONFIRMED') {
+          c.phase = 'RESULT_STAGED'; c.body = INTERRUPTED
+          if (lostTurnFsyncLeft-- > 0) {
+            return out(3, { task_id: task, phase: 'RESULT_STAGED', hard: true,
+                            error: 'the step committed (claim.json was replaced, then its directory fsync failed)' })
+          }
+        }
+        c.phase = 'SETTLED'; files[`/out/${task}.txt`] = c.body!; publishes++
+        return out(1, { refused: `${task}: its staged answer is published now; only ABSENT may be submitted` })
+      }
       if (c && c.phase !== 'PREPARED') return out(1, { refused: `${task}: attempt ${c.attempt} is ${c.phase}` })
       // The CLI's admission (task_io.admission, pinned in Python): no tier is malformed; non-owners need the flag.
       const text = files[`/in/${task}.txt`] ?? ''
@@ -292,7 +315,7 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
     failProgress: (n: number) => { progressFailLeft = n },
     failAt: (verb: string) => { failVerb = verb },
     refuseUnstuck: (n: number) => { unstuckFailsLeft = n }, hardUnstuck: (n: number) => { unstuckHardLeft = n }, refusePark: () => { parkRefused = true },
-    lockOnce: (verb: string) => { lockFails.add(verb) }, setKey: (digest: string) => { keyNow = digest }, failStageLink: () => { stageLinkFails = true },
+    lockOnce: (verb: string) => { lockFails.set(verb, (lockFails.get(verb) ?? 0) + 1) }, setKey: (digest: string) => { keyNow = digest }, failStageLink: () => { stageLinkFails = true },
     // The fake CLI called directly, as the Mod calls it: the contract test's handle.
     cli: (argv: string[], stdin = '') => run(null, { argv: ['ag2-sparrow-claude-local', 'inbox', ...argv], init: { stdin } }) }
 }
@@ -1533,7 +1556,8 @@ test('a session change while an accepted answer is still owed delivers that answ
 })
 
 test('a staged answer whose publish fails at the turn\'s end is retried by publish alone, never parked', async ($, on) => {
-  const h = host(on, { lockFailsOnce: ['publish'] })
+  // Two failures: the reply consumes the first, so the turn-end publish itself is the one that fails.
+  const h = host(on, { lockFailsOnce: ['publish', 'publish'] })
   h.files['/in/task-rs.txt'] = TASK('task-rs')
   await arm($, h)
   await h.clock.advance(1000)
@@ -1541,9 +1565,12 @@ test('a staged answer whose publish fails at the turn\'s end is retried by publi
   const r = await $.tool.call({ tool: REPLY, task_id: 'task-rs', text: 'staged answer' })
   expect(String(r.text ?? r.result)).toContain('call ag2space_reply again')
   await $.turn.complete({ turnId: 't-rs', reason: 'completed', text: '' } as any)
+  expect(verbs(h).filter((v: string) => v === 'publish').length).toBe(2)   // the turn's end published, and failed
+  expect(h.files['/out/task-rs.txt']).toBe(undefined)
   for (let i = 0; i < 5; i++) await h.clock.advance(1000)
   expect(h.files['/out/task-rs.txt']).toBe('staged answer\n')
   expect(verbs(h).filter((v: string) => v === 'park')).toEqual([])
+  expect(verbs(h).filter((v: string) => v === 'publish').length).toBe(3)   // the scan's retry delivered it
   expect(h.publishes()).toBe(1)
 })
 
@@ -1685,6 +1712,26 @@ test('without a submission marker nothing is authorized or submitted, and the ta
   await h.clock.advance(1000)
   expect(h.submitted.length).toBe(1)
   expect(h.submitted[0]).toContain('[submission ')
+})
+
+test('a lost turn whose interruption landed before its directory fsync failed is published by the next claim, never retired', async ($, on) => {
+  const h = host(on, { lostTurnFsyncFails: 1 })
+  h.files['/in/task-lt.txt'] = TASK('task-lt')
+  h.claims['task-lt'] = { attempt: 1, phase: 'TURN_CONFIRMED', turnId: 't-gone' }   // this generation's, the Mod lost it
+  await arm($, h)
+  await h.clock.advance(500)                           // the arming scan only: the claim answers hard, the task is kept
+  expect(verbs(h).filter((v: string) => v === 'claim').length).toBe(1)
+  expect(h.claims['task-lt'].phase).toBe('RESULT_STAGED')
+  expect(h.files['/out/task-lt.txt']).toBe(undefined)
+  expect(h.logs.some((l: string) => l.includes('intake STOPPED'))).toBe(true)
+  await h.clock.advance(1000)                          // intake reopens; the next claim publishes the durable body
+  expect(verbs(h).filter((v: string) => v === 'claim').length).toBe(2)
+  expect(h.files['/out/task-lt.txt']).toBe(INTERRUPTED)
+  expect(h.claims['task-lt'].phase).toBe('SETTLED')
+  expect(h.publishes()).toBe(1)
+  await h.clock.advance(5000)
+  expect(verbs(h).filter((v: string) => v === 'claim').length).toBe(2)   // retired only once answered
+  expect(h.submitted.length).toBe(0)
 })
 
 // Every scenario in cli-contract.ts, which tests/test_claude_code_adapter.py runs against the real verbs: the fake

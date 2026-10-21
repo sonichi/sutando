@@ -110,9 +110,10 @@ def run_check(*, core_alive: bool, pid_text: str | None, argv: str | None = None
         make_workspace(Path(td), core_alive=core_alive, pid_text=pid_text)
         saved = (hc.WORKSPACE_DIR, hc._proc_argv, hc._watcher_trees,
                  hc._ps_snapshot, hc._pid_parent, hc._pid_instance_id,
-                 hc._pid_actor_id)
+                 hc._pid_actor_id, hc._proc_argv_vector)
         try:
             hc.WORKSPACE_DIR = Path(td)
+            hc._proc_argv_vector = lambda pid: None
             if argv is not None:
                 hc._proc_argv = lambda pid: argv
             hc._watcher_trees = lambda *a, **k: (trees or {})
@@ -126,7 +127,7 @@ def run_check(*, core_alive: bool, pid_text: str | None, argv: str | None = None
         finally:
             (hc.WORKSPACE_DIR, hc._proc_argv, hc._watcher_trees,
              hc._ps_snapshot, hc._pid_parent, hc._pid_instance_id,
-             hc._pid_actor_id) = saved
+             hc._pid_actor_id, hc._proc_argv_vector) = saved
 
 
 @contextlib.contextmanager
@@ -142,9 +143,10 @@ def supervised_watcher(*, pid: str = "7100", pid_text: str | None = None,
         ws = make_workspace(Path(td), core_alive=True, pid_text=pid_text)
         saved = (hc.WORKSPACE_DIR, hc._proc_argv, hc._watcher_trees,
                  hc._ps_snapshot, hc._pid_parent, hc._pid_instance_id,
-                 hc._pid_actor_id)
+                 hc._pid_actor_id, hc._proc_argv_vector)
         try:
             hc.WORKSPACE_DIR = ws
+            hc._proc_argv_vector = lambda p: None
             hc._proc_argv = lambda p: argv
             hc._watcher_trees = lambda *a, **k: {pid: {pid}}
             hc._ps_snapshot = lambda *a, **k: ""
@@ -155,7 +157,7 @@ def supervised_watcher(*, pid: str = "7100", pid_text: str | None = None,
         finally:
             (hc.WORKSPACE_DIR, hc._proc_argv, hc._watcher_trees,
              hc._ps_snapshot, hc._pid_parent, hc._pid_instance_id,
-             hc._pid_actor_id) = saved
+             hc._pid_actor_id, hc._proc_argv_vector) = saved
 
 
 def case_r_supervised_watcher_exposes_restamp_pid() -> list[str]:
@@ -837,6 +839,21 @@ def case_ab_ambiguous_flattened_argv_declines_rather_than_guesses():
     return fails
 
 
+def case_ac_fake_pid_fixtures_ignore_unrelated_real_processes():
+    original = hc._proc_argv_vector
+    def probe(pid):
+        return ["python3", "unrelated-test-process.py"]
+
+    try:
+        hc._proc_argv_vector = probe
+        fails = case_s_fix_restamps_and_recheck_is_ok()
+        if hc._proc_argv_vector is not probe:
+            fails.append("ac) fixture did not restore the process-vector probe")
+        return fails
+    finally:
+        hc._proc_argv_vector = original
+
+
 def main() -> int:
     cases = [
         ("a", case_a_no_core_is_ok),
@@ -876,6 +893,7 @@ def main() -> int:
         ("z", case_z_an_unreadable_watcher_identity_offers_no_repair_target),
         ("aa", case_aa_argv_classification_binds_to_the_executed_script),
         ("ab", case_ab_ambiguous_flattened_argv_declines_rather_than_guesses),
+        ("ac", case_ac_fake_pid_fixtures_ignore_unrelated_real_processes),
     ]
     all_failures = []
     for label, fn in cases:

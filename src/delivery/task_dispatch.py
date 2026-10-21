@@ -54,9 +54,13 @@ answering about an archived body while reading an untouched live placeholder ins
 """
 from __future__ import annotations
 
+import json
 import os
+import stat
+import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Iterator
 
@@ -396,7 +400,8 @@ def partial_paste_leftover(partial_dir: "Path | str", filename: str, incarnation
 _USAGE = (
     "usage: task_dispatch.py has-result <results_dir> <filename>\n"
     "       task_dispatch.py find-ready <results_dir> <filename>\n"
-    "       task_dispatch.py sort-by-priority <tasks_dir>   # every *.txt, no result/claim/delivery filtering\n"
+    "       task_dispatch.py sort-by-priority <tasks_dir> [--resolve-inbox WORKSPACE HELPER [--resolution-cache DIR]]\n"
+    "       task_dispatch.py reuse-inbox-resolution <cache_dir> <entry>   # exit 5 if changed or uncached\n"
     "       task_dispatch.py priority-tier <task_file>   # prints urgent|normal|low, the file's own header\n"
     "       task_dispatch.py pending-candidates <tasks_dir> <results_dir> [--claims-dir DIR] [--deliveries-dir DIR]\n"
     "       task_dispatch.py next-pending <tasks_dir> <results_dir> [--claims-dir DIR] [--deliveries-dir DIR]\n"
@@ -428,14 +433,98 @@ def _parse_dir_options(rest: list[str]) -> dict:
     return opts
 
 
+_INBOX_PRIORITY_LIMIT = 32
+_INBOX_PRIORITY_SECONDS = 10
+
+
+def _resolution_identity(path: Path):
+    try:
+        st = path.lstat()
+        if not stat.S_ISREG(st.st_mode):
+            return None
+        return [st.st_dev, st.st_ino, st.st_size, st.st_mode, st.st_mtime_ns, st.st_ctime_ns]
+    except OSError:
+        return None
+
+
+def _reuse_inbox_resolution(cache_dir: str, entry: str) -> int:
+    cache = Path(cache_dir) / Path(entry).name
+    try:
+        record = json.loads(cache.read_text())
+        cache.unlink()
+        if record["entry"] != _resolution_identity(Path(entry)) or record["entry"] is None:
+            return 5
+        if record["rc"] == 0:
+            if record["payload"] is None or record["payload"] != _resolution_identity(
+                    Path(record["stdout"].removesuffix("\n"))):
+                return 5
+        sys.stdout.write(record["stdout"])
+        sys.stderr.write(record["stderr"])
+        return record["rc"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return 5
+
+
+def _inbox_priority(entry: Path, workspace: str, helper: str, budget: int,
+                    cache_dir: "Path | None" = None) -> str:
+    """Use the dispatch resolver's bounds and validation without admitting the entry."""
+    identity = _resolution_identity(entry)
+    try:
+        resolved = subprocess.run(
+            ["bash", helper, str(entry), workspace, str(budget)],
+            capture_output=True, text=True, check=False,
+        )
+    except OSError:
+        return "normal"
+    if cache_dir is not None:
+        payload = Path(resolved.stdout.removesuffix("\n")) if resolved.returncode == 0 else None
+        record = {"entry": identity, "rc": resolved.returncode,
+                  "stdout": resolved.stdout, "stderr": resolved.stderr,
+                  "payload": _resolution_identity(payload) if payload is not None else None}
+        (cache_dir / entry.name).write_text(json.dumps(record))
+    if resolved.returncode:
+        return "normal"
+    return parse_priority_from_file(Path(resolved.stdout.removesuffix("\n")))
+
+
+def _inbox_priorities(entries: list[Path], workspace: str, helper: str,
+                      cache_dir: "Path | None" = None) -> dict[Path, str]:
+    """Resolve only the oldest prefix; unexamined entries retain normal/FIFO order."""
+    ordered = sort_tasks_by_priority(entries, priority_reader=lambda _: "normal")
+    deadline = time.monotonic() + _INBOX_PRIORITY_SECONDS
+    priorities = {}
+    for entry in ordered[:_INBOX_PRIORITY_LIMIT]:
+        # Reserve whole seconds for run_bounded; its TERM/KILL grace is at most
+        # one extra second plus polling overhead for the last lookup.
+        remaining = int(deadline - time.monotonic())
+        if remaining < 1:
+            break
+        priorities[entry] = _inbox_priority(entry, workspace, helper, remaining, cache_dir)
+    return priorities
+
+
 def _main(argv: list[str]) -> int:
+    if len(argv) == 3 and argv[0] == "reuse-inbox-resolution":
+        return _reuse_inbox_resolution(argv[1], argv[2])
     # A pure sort, no eligibility filtering -- the caller still decides
     # whether a file is eligible; this only changes the offered order.
     if argv and argv[0] == "sort-by-priority":
-        if len(argv) != 2:
+        cache_dir = None
+        if len(argv) == 7 and argv[5] == "--resolution-cache" and argv[6]:
+            cache_dir = Path(argv[6])
+            argv = argv[:5]
+        if len(argv) != 2 and not (len(argv) == 5 and argv[2] == "--resolve-inbox"
+                                  and argv[3] and argv[4]):
             print(_USAGE, file=sys.stderr)
             return 2
-        names = [p.name for p in sort_tasks_by_priority(Path(argv[1]).glob("*.txt"))]
+        reader = parse_priority_from_file
+        entries = list(Path(argv[1]).glob("*.txt"))
+        if len(argv) == 5 and os.environ.get("SUTANDO_INBOX_RESOLVER"):
+            priorities = _inbox_priorities(entries, argv[3], argv[4], cache_dir)
+            reader = lambda entry: priorities.get(entry, "normal")
+        names = [p.name for p in sort_tasks_by_priority(
+            entries, priority_reader=reader,
+        )]
         for name in names:
             print(name)
         return 0 if names else 1

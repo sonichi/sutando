@@ -114,8 +114,14 @@ def bridge_home(root) -> Path:
 
 
 def bridge_state(cfg: dict) -> Path:
-    """The state dir of the bridge that feeds this root: the HITL store's, by construction."""
-    return Path(cfg["HITL_STORE"]).parent.parent
+    """The state dir of the bridge that feeds this root, as install recorded it (BRIDGE_STATE_DIR: the
+    bridge's own beside the root, or --bridge-state-dir for a bridge you run). A config from before the
+    key names its HITL store's, as install then derived it; one naming neither, the dir beside the root."""
+    if cfg.get("BRIDGE_STATE_DIR"):
+        return Path(cfg["BRIDGE_STATE_DIR"])
+    if cfg.get("HITL_STORE"):
+        return Path(cfg["HITL_STORE"]).parent.parent
+    return bridge_home(cm.work_root(cfg)) / "state"
 
 
 def worker_name(segment: str) -> str:
@@ -128,10 +134,11 @@ def vault_key(segment: str) -> str:
     return "AG2_RELAY_TOKEN_" + worker_name(segment).upper().replace("-", "_")
 
 
-def bridge_env(root, agent_id: str, token_file: str = "") -> dict:
-    """What the agent's bridge runs with: exactly this root's tasks/ and results/, its own state beside it."""
+def bridge_env(root, agent_id: str, token_file: str = "", state=None) -> dict:
+    """What the agent's bridge runs with: exactly this root's tasks/ and results/, its own state beside it
+    (`state`: the dir the config records, so the unit, verify and the card store name one dir)."""
     env = {"AGENT_CONNECT_TASK_DIR": os.path.join(root, "tasks"), "AGENT_CONNECT_RESULT_DIR": os.path.join(root, "results"),
-           "AGENT_CONNECT_STATE_DIR": str(bridge_home(root) / "state"), "AGENT_MXID": agent_id}
+           "AGENT_CONNECT_STATE_DIR": str(state or bridge_home(root) / "state"), "AGENT_MXID": agent_id}
     if token_file:
         env["AG2_DEVICE_ENV"] = token_file
     return env
@@ -219,8 +226,8 @@ def wire_bridge(cfg: dict) -> str:
     """After the launcher's install: the agent's bridge pointed at this root, as its own unit or as a
     declaration the host's supervisor runs. '' or why not."""
     root, mode = cm.work_root(cfg), bridge_mode(cfg)
-    env = bridge_env(root, cfg["AGENT_ID"], cfg.get("TOKEN_ENV_FILE", ""))
-    (bridge_home(root) / "state").mkdir(parents=True, exist_ok=True)
+    env = bridge_env(root, cfg["AGENT_ID"], cfg.get("TOKEN_ENV_FILE", ""), bridge_state(cfg))
+    bridge_state(cfg).mkdir(parents=True, exist_ok=True)
     if mode != UNIT:
         path = bridge_home(root) / DECLARATION
         text, problem = owned_declaration(path)
@@ -348,17 +355,25 @@ def install(args) -> int:
         print(f"error: {problem}", file=sys.stderr)
         return EXIT_UNUSABLE
     root, mode, agent_id = where["root"], where["mode"], where["agent_id"]
+    if args.bridge_state_dir and mode != EXTERNAL:
+        print("error: --bridge-state-dir is for a bridge you run (an explicit root); this install's bridge keeps its "
+              f"state beside the root, {bridge_home(root) / 'state'}", file=sys.stderr)
+        return EXIT_UNUSABLE
     inbox_dir = Path(os.path.normpath(os.path.expanduser(args.inbox or _dirs.task_dir()))) \
         if mode == EXTERNAL and not args.work else Path(root) / "tasks"
     segment = Path(root).name
+    # The one record of the bridge's state dir: verify's bridge row reads its status there, and the
+    # card store the bridge projects from sits beside it; wire_bridge gives the bridge exactly this dir.
+    state = Path(args.bridge_state_dir).expanduser().resolve() if args.bridge_state_dir else \
+        _dirs.state_dir() if mode == EXTERNAL else bridge_home(root) / "state"
     values = {"CLAUDE": os.path.abspath(claude), "PLUGIN_DIR": str(plugin), "INBOX_DIR": str(inbox_dir),
               "RESULTS_DIR": str(Path(root) / "results"),
               "CLAUDE_CONFIG_DIR": str(Path(args.claude_config_dir).expanduser().resolve()) if args.claude_config_dir else "",
               "HMAC_KEY_FILE": key_file, "HMAC_STRICT": "1" if strict else hmac_policy.OPT_OUT if args.no_hmac_strict else "",
-              "PERMISSION_MODE": args.permission_mode, "SESSION_ID": "",
-              "HITL_STORE": str(hitl_store_root() if mode == EXTERNAL else card.store_root(bridge_home(root) / "state")),
+              "PERMISSION_MODE": args.permission_mode, "SESSION_ID": "", "HITL_STORE": str(card.store_root(state)),
               inbox.ALLOW_NON_OWNER: "1" if args.allow_non_owner else "", "AGENT_ID": agent_id, "BRIDGE": mode,
-              "TOKEN_ENV_FILE": where["token_file"], "TOKEN_VAULT_KEY": vault_key(segment) if mode not in (UNIT, EXTERNAL) else ""}
+              "TOKEN_ENV_FILE": where["token_file"], "TOKEN_VAULT_KEY": vault_key(segment) if mode not in (UNIT, EXTERNAL) else "",
+              "BRIDGE_STATE_DIR": str(state)}
 
     def revise(old: dict, values: dict) -> dict:
         """The session id: kept from the old config; minted when there is none; rotated by
@@ -519,10 +534,15 @@ def verify(_args) -> int:
     print("INFO non-owner tasks: " + ("submitted with the non-owner note (--allow-non-owner)"
                                       if cfg.get(inbox.ALLOW_NON_OWNER) == "1" else "refused (owner only)"))
     root, mode = cm.work_root(cfg), bridge_mode(cfg)
-    want = hitl_store_root() if mode == EXTERNAL else card.store_root(bridge_home(root) / "state")
-    cm.check(results, cfg.get("HITL_STORE") == str(want), "hitl store",
-             cfg.get("HITL_STORE") or "none" if cfg.get("HITL_STORE") != str(want)
-             else f"{cfg['HITL_STORE']} (the bridge's, beside its default store)")
+    if cfg.get("BRIDGE_STATE_DIR"):
+        want = card.store_root(bridge_state(cfg))
+        cm.check(results, cfg.get("HITL_STORE") == str(want), "hitl store",
+                 cfg.get("HITL_STORE") or "none" if cfg.get("HITL_STORE") != str(want)
+                 else f"{cfg['HITL_STORE']} (the bridge's, beside its default store under {bridge_state(cfg)})")
+    else:
+        # The store names the bridge's state dir itself here, so no row can check it against anything else.
+        print(f"INFO hitl store: {cfg.get('HITL_STORE')} (a config from before BRIDGE_STATE_DIR: the bridge's state dir "
+              f"is read as its parent; run {COMMAND} install to record it)")
     print(f"INFO agent: {cfg.get('AGENT_ID') or 'not recorded (an explicit root with no known agent id)'}")
     problem = bridge_problem(cfg)
     cm.check(results, not problem, "bridge", problem or f"a connected bridge feeds {root}/tasks and {root}/results")
@@ -653,6 +673,8 @@ def main(argv=None) -> int:
                    "result dir is <work>/results")
     p.add_argument("--token-env-file", help="the agent's 0600 env file with REMOTE_TASK_TOKEN (and AGENT_MXID) for "
                    "the bridge install runs (default: Sparrow's device env)")
+    p.add_argument("--bridge-state-dir", help="with an explicit root: the AGENT_CONNECT_STATE_DIR of the bridge you "
+                   "run, where verify reads its status and the card store sits (default: Sparrow's state dir)")
     p.add_argument("--claude-config-dir", help="CLAUDE_CONFIG_DIR holding the login the session uses (default: "
                    "the CLI's own)")
     p.add_argument("--hmac-key-file", help="the task-envelope key Sutando stamps with (AG2_HMAC_KEY_FILE)")

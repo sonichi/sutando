@@ -34,6 +34,10 @@ from __future__ import annotations
 
 import errno
 import hashlib
+try:
+    import fcntl
+except ImportError:                                     # no flock: one writer per ledger, as before
+    fcntl = None
 import importlib
 import json
 import os
@@ -131,12 +135,22 @@ class StateIOError(StateError):
     state says: a caller may retry the one, never the other."""
 
 
+class StateWriteError(StateIOError):
+    """A durable write to a claim or a publication that failed: a serving loop stops on it (exit 2) instead
+    of parking the task, which it does for a read that failed (a plain StateIOError)."""
+
+
 class LedgerIOError(LedgerError, StateIOError):
     pass
 
 
 class RenamedNotDurable(OSError):
     """write_durable after its rename: the new contents are in place, their durability unknown."""
+
+
+class PublishedNotDurable(StateIOError):
+    """A publication whose rename landed (the result is visible) but whose directory fsync or read-back
+    failed: a retry that finds the result settles on it; never "did not commit"."""
 
 
 class StateCommitted(StateError):
@@ -545,37 +559,76 @@ def _fsync_file(path):
 
 
 class SettledIds:
-    """Append-only, one validated id per newline-terminated record; never rewritten. On open an
-    unterminated suffix is truncated away; anything else wrong fails closed (LedgerError)."""
+    """Append-only, one validated id per newline-terminated record; never rewritten. A torn tail (an
+    unterminated suffix: what a short append leaves) is dropped under the ledger's flock, on open and
+    before every append; any malformed newline-terminated record fails closed (LedgerError). `ids` is
+    what the file shows (enough never to call an id again); `durable` only what a successful fsync of
+    the file and its directory, by this instance, covered: what a settlement may count."""
 
     def __init__(self, path, required=False):
         self.path = str(path)
+        synced = False
         try:
             with open(self.path, "rb") as f:
                 data = f.read()
+                try:
+                    os.fsync(f.fileno())                # what this instance read is durable only once this succeeds
+                    synced = True
+                except OSError:
+                    pass
         except FileNotFoundError:
             if required:
                 raise LedgerError("%s is missing" % self.path)
             data = b""
         except OSError as e:
             raise LedgerIOError("%s cannot be read (%s)" % (self.path, e))
-        self.ids, offset = set(), 0
-        records = data.split(b"\n")
-        for raw in records[:-1]:
+        self.ids, keep = self._parse(data)
+        read = set(self.ids)                            # only lines wholly within the bytes the fsync above covered
+        if keep < len(data):
+            try:
+                fd = os.open(self.path, os.O_RDWR | getattr(os, "O_CLOEXEC", 0))
+                try:
+                    self.ids = self._repair(fd)
+                finally:
+                    os.close(fd)
+            except OSError as e:
+                raise LedgerIOError("%s cannot be repaired (%s)" % (self.path, e))
+        self.durable = set()
+        if read and synced:
+            try:
+                fsync_dir(os.path.dirname(self.path))
+                self.durable = read                     # never what a repair re-read later: no fsync of ours covered it
+            except OSError:
+                pass                                    # visible, not yet durable: add() syncs before it counts
+
+    def _sync_file_and_dir(self):
+        _fsync_file(self.path)
+        fsync_dir(os.path.dirname(self.path))
+
+    def _parse(self, data):
+        """(ids, the byte length of the whole records kept): an unterminated tail is not kept."""
+        ids, offset = set(), 0
+        for raw in data.split(b"\n")[:-1]:
             try:
                 tid = raw.decode("utf-8")
             except UnicodeDecodeError:
                 tid = ""
             if not local_task_protocol.valid_task_id(tid):
                 raise LedgerError("%s has a malformed record at byte %d" % (self.path, offset))
-            self.ids.add(tid)
+            ids.add(tid)
             offset += len(raw) + 1
-        if records[-1]:
-            try:
-                os.truncate(self.path, offset)
-                _fsync_file(self.path)
-            except OSError as e:
-                raise LedgerIOError("%s cannot be repaired (%s)" % (self.path, e))
+        return ids, offset
+
+    def _repair(self, fd):
+        """Under the ledger's flock: the torn tail truncated away and the cut made durable; the ids held."""
+        if fcntl is not None:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        data = os.pread(fd, os.fstat(fd).st_size, 0)
+        ids, keep = self._parse(data)
+        if keep < len(data):
+            os.ftruncate(fd, keep)
+            _fsync_file(self.path)
+        return ids
 
     @staticmethod
     def create(path):
@@ -600,32 +653,36 @@ class SettledIds:
         return task_id in self.ids
 
     def add(self, task_id):
-        """Append, fsync, and only then remember. Any failure raises LedgerError."""
-        if task_id in self.ids:
+        """Append, fsync, and only then count it durable. Any failure raises LedgerError. Repair-read-check-append
+        is one critical section under the ledger's own flock, so instances loaded earlier never append an id twice
+        and never append after a torn tail. An id already visible but not yet durable is synced, never trusted."""
+        if task_id in self.durable:
             return
         if not local_task_protocol.valid_task_id(task_id):
             raise LedgerError("%r is not a task id; not appended to %s" % (task_id, self.path))
         data = (task_id + "\n").encode("utf-8")
         try:
-            created = not os.path.exists(self.path)
-            fd = os.open(self.path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_CLOEXEC", 0), 0o644)
+            fd = os.open(self.path, os.O_RDWR | os.O_APPEND | os.O_CREAT | getattr(os, "O_CLOEXEC", 0), 0o644)
             try:
-                while data:
-                    data = data[os.write(fd, data):]
-                os.fsync(fd)
+                if task_id not in self._repair(fd):
+                    # One write of the whole record; a short one is torn, cut by the next repair and re-appended.
+                    if os.write(fd, data) != len(data):
+                        raise OSError(errno.EIO, "a short write of a settled id")
+                    self.ids.add(task_id)
             finally:
                 os.close(fd)
-            if created:
-                fsync_dir(os.path.dirname(self.path))
+            self._sync_file_and_dir()
         except OSError as e:
             raise LedgerIOError("cannot append to %s (%s)" % (self.path, e))
         self.ids.add(task_id)
+        self.durable.add(task_id)
 
 
 # ── claims ───────────────────────────────────────────────────────────────────
 
 def _state_io(what, path, e):
-    return StateIOError("cannot %s %s (%s)" % (what, path, e))
+    kind = StateIOError if what in ("read", "list") else StateWriteError
+    return kind("cannot %s %s (%s)" % (what, path, e))
 
 
 class ClaimStore:
@@ -830,7 +887,22 @@ class Lifecycle:
         return True
 
     def mark_calling(self, task_id, attempt):
-        self._save(self.claims.load(task_id), phase=CALLING, attempt=attempt)
+        try:
+            rec = self.claims.load(task_id)
+        except StateIOError:
+            self.open_attempts.discard(task_id)         # CALLING was never written: the attempt may be prepared again
+            raise
+        self._save(rec, phase=CALLING, attempt=attempt)
+
+    def _outcome_claim(self, task_id):
+        """The claim an outcome is recorded on, after the provider was called: a read that fails here is part of
+        that durable write (StateWriteError), so a serving loop stops and recovery answers the call at restart."""
+        try:
+            return self.claims.load(task_id)
+        except StateWriteError:
+            raise
+        except StateIOError as e:
+            raise StateWriteError(e.message[len("refusing to serve: "):]) from e
 
     def authorize_call(self, task_id, attempt, *, text_hash="", expected_phase=PREPARED):
         """One PREPARED -> CALLING transition per attempt: the one-use submit token (a random nonce
@@ -958,13 +1030,13 @@ class Lifecycle:
         return self._verified(rec["task_id"], descriptor)
 
     def not_delivered(self, task_id, attempt, detail):
-        self._save(self.claims.load(task_id), phase=NOT_DELIVERED, outcome={"kind": "unsent", "detail": detail})
+        self._save(self._outcome_claim(task_id), phase=NOT_DELIVERED, outcome={"kind": "unsent", "detail": detail})
         self.journal.append(task_id, attempt, "unsent")
         self.open_attempts.discard(task_id)
 
     def record_outcome(self, task_id, kind, body, detail="", url=None):
         """kind: queued (a receipt), unknown (may have been queued) or final (no call counted)."""
-        rec = self.claims.load(task_id)
+        rec = self._outcome_claim(task_id)
         phase = {"queued": CONFIRMED, "unknown": OUTCOME_UNKNOWN}.get(kind, rec["phase"] if rec else PREPARED)
         self.claims.stage(task_id, body.encode("utf-8"))
         rec = self._save(rec, phase=phase, outcome={"kind": kind, "detail": detail, "url": url, "at": self.clock()})
@@ -983,12 +1055,63 @@ class Lifecycle:
         rec = self.claims.load(task_id) or {"schema": 1, "task_id": task_id, "attempt": 0, "created_at": self.clock()}
         self.log("settled without a result ->", task_id, reason)
         self._save(rec, phase=SETTLED, settled_at=self.clock(), reason=reason)
-        self.settled.add(task_id)
+        self.reconcile_settled(task_id)
 
     def _settle(self, rec):
         self._save(rec, phase=SETTLED, settled_at=self.clock())
-        self.settled.add(rec["task_id"])
-        self.claims.unstage(rec["task_id"])
+        self.reconcile_settled(rec["task_id"])
+
+    def reconcile_settled(self, task_id):
+        """The one repair-then-check every reader that can report a claim settled or final runs first: a
+        SETTLED claim's id appended to the settled ledger (idempotent) and its staged body removed, the steps
+        _settle takes after the save. settlement_complete afterwards (False for a claim not SETTLED); any
+        failure raises, as those steps do, so nothing reports final over an incomplete settlement."""
+        rec = self.claims.load(task_id)
+        if rec is None or rec["phase"] != SETTLED:
+            return False
+        if task_id not in self.settled:
+            self.log("re-recording a settled id ->", task_id)
+        # Always a durable ledger sync first (an id already visible included); only then is the body removed.
+        self.settled.add(task_id)
+        self.claims.unstage(task_id)
+        return self.settlement_complete(task_id)
+
+    def _reconcile_or_skip(self, task_id):
+        """Recovery's repair of one SETTLED claim: an I/O failure skips this claim (logged, left for the next
+        pass, never compacted meanwhile) instead of stopping the start. True when the settlement is complete."""
+        try:
+            return self.reconcile_settled(task_id)
+        except StateIOError as e:
+            self.log("settlement repair skipped, retried next pass ->", task_id, e)
+            return False
+
+    def settlement_complete(self, task_id):
+        """Whether a SETTLED claim's settlement is whole: its id in the ledger and no staged body left. What
+        every report of a settled or final claim requires; reconcile_settled is what makes it so."""
+        rec = self.claims.load(task_id)
+        return bool(rec and rec["phase"] == SETTLED and task_id in self.settled.durable
+                    and not os.path.lexists(self.claims.dir(task_id) / "body"))
+
+    def is_settled(self, task_id):
+        """Whether a reader may treat the id as final: in the ledger and, while its claim is still SETTLED on
+        disk, that settlement repaired and complete (reconcile_settled); a compacted claim is complete."""
+        if task_id not in self.settled:
+            return False
+        rec = self.claims.load(task_id)
+        if rec and rec["phase"] == SETTLED:
+            return self.reconcile_settled(task_id)
+        self.settled.add(task_id)                       # a compacted claim: its id synced before it counts
+        return True
+
+    def reconcile_unbound(self, now=None):
+        """The SETTLED claims no generation owns (answered without a call): each settlement completed, and
+        compacted once due, as generation recovery does for its own. Under claims.lock, by the caller."""
+        now = self.clock() if now is None else now
+        for task_id, rec in self._claims_readable().items():
+            if not rec or rec.get("generation") or rec.get("claim_mode") not in (None, LOCAL) or rec["phase"] != SETTLED:
+                continue
+            if self._reconcile_or_skip(task_id) and now - rec.get("settled_at", now) > COMPACT_AFTER:
+                self.claims.remove(task_id)
 
     def _holds_body(self, task_id, body):
         """Labels a settled publication won when some generation holds exactly our bytes."""
@@ -1002,10 +1125,68 @@ class Lifecycle:
     def read_final(self, final):
         return _read_strict(final)
 
-    def publish_and_settle(self, task_id):
+    def interrupt_turn(self, task_id, detail, now=None):
+        """A TURN_CONFIRMED local claim answered with its interrupted body in place of any result it
+        recorded: what recovery gives a dead generation's, and a live one whose Mod lost the accepted
+        text. staged (RESULT_STAGED, for publish_and_settle) | parked (not such a claim)."""
+        rec = self.claims.load(task_id)
+        if rec is None or rec.get("claim_mode") != LOCAL or rec["phase"] != TURN_CONFIRMED:
+            return "parked"
+        now = self.clock() if now is None else now
+        self.log("turn confirmed, no result; answered as interrupted ->", task_id)
+        self.claims.stage(task_id, rec["interrupted_body"].encode("utf-8"))
+        # One durable transition: a rename that lands leaves a publishable claim, never an intermediate phase.
+        self._save(rec, phase=RESULT_STAGED, staged=None, outcome={"kind": "unknown", "detail": detail, "at": now})
+        self.open_attempts.discard(task_id)
+        return "staged"
+
+    def resume_outcome(self, task_id):
+        """A local claim committed at OUTCOME_UNKNOWN (its body durable, the move to RESULT_STAGED not yet
+        saved) moved there now: what recovery does for it, and the live reclaim too, so a committed
+        intermediate state is always resumed and never retired. staged | parked (not such a claim)."""
+        rec = self.claims.load(task_id)
+        if rec is None or rec.get("claim_mode") != LOCAL or rec["phase"] != OUTCOME_UNKNOWN:
+            return "parked"
+        self._save(rec, phase=RESULT_STAGED)
+        return "staged"
+
+    def finish_verified(self, task_id):
+        """A TURN_CONFIRMED local claim whose recorded descriptor's blob verifies moved to RESULT_STAGED by
+        the claim save alone: the blob is final and is never written again. finished | parked (no such
+        claim, or no verifying blob). A save that fails raises, as every claim save does."""
+        rec = self.claims.load(task_id)
+        if rec is None or rec.get("claim_mode") != LOCAL or rec["phase"] != TURN_CONFIRMED:
+            return "parked"
+        descriptor = rec.get("staged")
+        if descriptor is None or self._verified(task_id, descriptor) is None:
+            return "parked"
+        # The blob shares claim.json's directory, so this save's directory fsync makes its link durable too.
+        self._save(rec, phase=RESULT_STAGED)
+        self.open_attempts.discard(task_id)
+        return "finished"
+
+    def close_turn(self, task_id, detail, now=None):
+        """The one decision for a TURN_CONFIRMED local claim nobody will stage again (a dead generation's,
+        or a live one whose Mod lost it): a descriptor whose blob verifies is the answer, moved on by
+        finish_verified with no blob write (finished); no descriptor, or a blob missing or not matching
+        it, is answered as interrupted (interrupted), never a substituted body; a claim that is not such
+        a turn is parked. Every outcome but parked leaves the claim RESULT_STAGED for publish_and_settle."""
+        rec = self.claims.load(task_id)
+        if rec is None or rec.get("claim_mode") != LOCAL or rec["phase"] != TURN_CONFIRMED:
+            return "parked"
+        descriptor = rec.get("staged")
+        if descriptor is not None and self._verified(task_id, descriptor) is not None:
+            return self.finish_verified(task_id)
+        if descriptor is not None and self.claims.blob(task_id, descriptor["blob"]) is not None:
+            self.log("a committed result does not match its descriptor; answered as interrupted ->", task_id)
+            detail = "%s (the committed result does not match its descriptor)" % detail
+        return "interrupted" if self.interrupt_turn(task_id, detail, now) == "staged" else "parked"
+
+    def publish_and_settle(self, task_id, *, io_raises=False):
         """settled | parked: settled only for a claim this call published and settled, or one already
         SETTLED (the publisher is idempotent there); any phase it cannot advance is parked.
-        Publication never replaces a result and never repeats a won rename."""
+        Publication never replaces a result and never repeats a won rename. An I/O failure of the
+        publication parks, or with `io_raises` is the StateIOError a retrying caller distinguishes."""
         rec = self.claims.load(task_id)
         if rec is None:
             return "parked"
@@ -1015,13 +1196,21 @@ class Lifecycle:
                     published = self._publish(rec)
             except OSError as e:
                 self.log("publication parked ->", task_id, e)
+                if io_raises and isinstance(e, RenamedNotDurable):
+                    raise PublishedNotDurable(str(e))
+                if io_raises:
+                    raise _state_io("publish", self.results / ("%s.txt" % task_id), e)
                 return "parked"
             if published is None:
                 return "parked"
             rec = self._save(rec, phase=PUBLISHED, published=published)
         if rec["phase"] == PUBLISHED:
             self._settle(rec)
-        return "settled" if rec["phase"] == SETTLED else "parked"
+        if rec["phase"] != SETTLED:
+            return "parked"
+        # Settled is reported only once the settlement is whole, also for a claim found already SETTLED.
+        self.reconcile_settled(task_id)
+        return "settled"
 
     def _publish(self, rec):
         task_id, attempt = rec["task_id"], rec["attempt"]
@@ -1062,11 +1251,15 @@ class Lifecycle:
             os.unlink(sibling)
             fsync_dir(self.results)
             return {"won": self._holds_body(task_id, body), "state": state, "at": self.clock()}
-        fsync_dir(self.results)
-        seen = self.read_final(final)
+        try:
+            fsync_dir(self.results)
+            seen = self.read_final(final)
+            state = LIVE_READY if seen is not None else self.classify(task_id)
+        except OSError as e:
+            raise RenamedNotDurable("%s landed, then %s" % (final, e))
         if seen is not None and seen != body:
             self.log("the published result differs from the stage ->", task_id)
-        return {"won": True, "state": LIVE_READY if seen is not None else self.classify(task_id), "at": self.clock()}
+        return {"won": True, "state": state, "at": self.clock()}
 
     def recover(self, now=None, *, generation=None, proof=None):
         """Settle what a dead predecessor left: run once, after the lock, before serving. Without a
@@ -1074,7 +1267,7 @@ class Lifecycle:
         touching the publisher, the ledger or any body. With `generation` {pid, start} and
         `proof=False` (that generation verified dead by the caller) it handles the local claims of
         exactly that generation: TURN_CONFIRMED with a verified blob publishes that body once, without
-        one answers "turn confirmed, no result", with a mismatched blob parks."""
+        one answers "turn confirmed, no result", with a mismatched blob answers as interrupted (close_turn)."""
         now = self.clock() if now is None else now
         if generation is not None:
             if proof is not False:
@@ -1085,9 +1278,8 @@ class Lifecycle:
             if rec and rec.get("claim_mode") == LOCAL:
                 self.log("foreign claim (local), left alone ->", task_id)
                 continue
-            if rec and rec["phase"] == SETTLED and task_id not in self.settled:
-                self.log("re-recording a settled id ->", task_id)
-                self.settled.add(task_id)
+            if rec and rec["phase"] == SETTLED:
+                self._reconcile_or_skip(task_id)
         self.settled.sync()                             # compaction below never runs ahead of durability
         for name in os.listdir(self.results):
             if name.startswith(".task-") and (".publish." in name):
@@ -1097,7 +1289,8 @@ class Lifecycle:
                 continue
             phase = rec["phase"]
             if phase == SETTLED:
-                if now - rec.get("settled_at", now) > COMPACT_AFTER:
+                # Compaction only after the settlement's own durable ledger sync: the id outlives the claim.
+                if self.settlement_complete(task_id) and now - rec.get("settled_at", now) > COMPACT_AFTER:
                     self.claims.remove(task_id)
                 continue
             task_path = self.inbox / ("%s.txt" % task_id)
@@ -1161,14 +1354,14 @@ class Lifecycle:
         recs = {t: r for t, r in self._claims_readable().items()
                 if r and r.get("claim_mode") == LOCAL and r.get("generation") == generation}
         for task_id, rec in recs.items():
-            if rec["phase"] == SETTLED and task_id not in self.settled:
-                self.log("re-recording a settled id ->", task_id)
-                self.settled.add(task_id)
+            if rec["phase"] == SETTLED:
+                self._reconcile_or_skip(task_id)
         self.settled.sync()
         for task_id, rec in recs.items():
             phase = rec["phase"]
             if phase == SETTLED:
-                if now - rec.get("settled_at", now) > COMPACT_AFTER:
+                # Compaction only after the settlement's own durable ledger sync: the id outlives the claim.
+                if self.settlement_complete(task_id) and now - rec.get("settled_at", now) > COMPACT_AFTER:
                     self.claims.remove(task_id)
                 continue
             self._sweep_temps(task_id, now)
@@ -1188,21 +1381,11 @@ class Lifecycle:
                                                                       "at": now})
                 rec = self._save(rec, phase=RESULT_STAGED)
             elif phase == TURN_CONFIRMED:
-                descriptor = rec.get("staged")
-                if descriptor is not None and self.claims.blob(task_id, descriptor["blob"]) is not None:
-                    if self._verified(task_id, descriptor) is None:
-                        self.log("a committed result does not match its descriptor; parked ->", task_id)
-                        continue
-                    rec = self._save(rec, phase=RESULT_STAGED)
-                else:
-                    self.log("turn confirmed, no result; answered as interrupted ->", task_id)
-                    self.claims.stage(task_id, rec["interrupted_body"].encode("utf-8"))
-                    rec = self._save(rec, phase=OUTCOME_UNKNOWN, staged=None,
-                                     outcome={"kind": "unknown", "detail": "turn confirmed, no result", "at": now})
-                    rec = self._save(rec, phase=RESULT_STAGED)
+                if self.close_turn(task_id, "turn confirmed, no result", now) == "parked":
+                    continue
             elif phase in (OUTCOME_UNKNOWN, RESULT_STAGED):
                 if phase != RESULT_STAGED:
-                    rec = self._save(rec, phase=RESULT_STAGED)
+                    self.resume_outcome(task_id)
             elif phase != PUBLISHED:
                 self.log("a phase this reader does not know, left alone ->", task_id, phase)
                 continue
