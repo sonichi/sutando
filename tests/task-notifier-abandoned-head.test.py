@@ -168,6 +168,15 @@ class ShippedQueueDropsAbandonedHead(unittest.TestCase):
         sentinel = root / "deliveries" / RECIPIENT / "task-gone.txt"
         sentinel.parent.mkdir(parents=True, exist_ok=True)
         sentinel.write_text("")
+        self._cache_pointer(root)
+
+    @staticmethod
+    def _cache_pointer(root: Path) -> bytes:
+        # The resolver-cached payload pointer the announcement left: a path whose target is now gone.
+        pointer = root / "payload" / "task-gone.txt"
+        data = str(root / "tasks" / "task-gone.txt").encode()
+        pointer.write_bytes(data)
+        return data
 
     def test_codex_drop_withdraws_the_hold_through_the_production_writer(self):
         script, wait_fn = NOTIFIERS["codex"]
@@ -183,14 +192,21 @@ class ShippedQueueDropsAbandonedHead(unittest.TestCase):
         self.assertEqual(list(workers.rglob("task-gone.*")), [], "no pending or done record survives")
         self.assertEqual([p.name for p in (root / "deliveries" / RECIPIENT).glob("task-gone*")], [],
                          "the sentinel is retired")
+        self.assertFalse((root / "payload" / "task-gone.txt").exists(),
+                         "a dropped head's cached payload pointer is removed with it")
 
     def test_codex_keeps_the_head_when_the_abandon_write_fails(self):
         script, wait_fn = NOTIFIERS["codex"]
-        submitted, queue = self._run(script, wait_fn, writer=Path("/nonexistent/pool_delivery.py"))
+        seeded = {}
+        submitted, queue = self._run(script, wait_fn, writer=Path("/nonexistent/pool_delivery.py"),
+                                     before=lambda root: seeded.setdefault("ptr", self._cache_pointer(root)))
         self.assertEqual(submitted, "", "nothing behind the head is typed while it is held")
         self.assertEqual(sorted(p.name for p in queue.iterdir()), ["task-gone.txt", "task-next.txt"])
         self.assertIn("keeping task-gone.txt at the queue head", self.stderr)
         self.assertNotIn("dropped task-gone.txt", self.stderr)
+        pointer = self.root / "payload" / "task-gone.txt"
+        self.assertTrue(pointer.exists(), "the held head keeps its cached payload pointer")
+        self.assertEqual(pointer.read_bytes(), seeded["ptr"])
 
     def test_both_notifiers_delegate_the_decision_to_task_dispatch(self):
         for runtime, (script, _) in NOTIFIERS.items():
