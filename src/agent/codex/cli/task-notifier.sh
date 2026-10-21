@@ -543,8 +543,12 @@ process_announced_queue() {
     wait_for_core_idle || exit 1
     # Checked after the idle wait so a file archived during that wait is never typed.
     if "$NOTIFIER_PY" "$DISPATCH_PY" head-abandoned "$RESULTS_DIR" "$filename" "$(task_payload "$filename")"; then
+      # No result was published, so the hold is withdrawn, never finished; a failed write keeps the head.
+      if ! mark_worker_stage "$filename" abandon; then
+        log_notifier "keeping $filename at the queue head: could not withdraw its worker hold; will retry on the next idle cycle"
+        return 0
+      fi
       log_notifier "dropped $filename from the queue: its task file is gone and no result was found"
-      mark_worker_stage "$filename" done
       rm -f "$queue_dir/$filename" "$PAYLOAD_DIR/$filename"
       continue
     fi

@@ -4,7 +4,8 @@
 The decision is task_dispatch.py's `head-abandoned`, the one owner both notifiers call.
 This pins the helper's contract, then runs each notifier's SHIPPED process_announced_queue,
 queue_head, has_result and task_payload with only the pane-facing calls stubbed: an archived
-head is dropped untyped and the task behind it is submitted.
+head is dropped untyped and the task behind it is submitted. The Codex worker-stage
+transition runs through the production writer (worker-pool's pool_delivery.py).
 Run: python3 tests/task-notifier-abandoned-head.test.py
 """
 from __future__ import annotations
@@ -23,6 +24,9 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 DISPATCH = REPO / "src" / "delivery" / "task_dispatch.py"
+WORKER_STAGE = REPO / "src" / "delivery" / "worker-stage.sh"
+POOL_DELIVERY = REPO / "skills" / "worker-pool" / "scripts" / "pool_delivery.py"
+RECIPIENT = "worker-3"
 NOTIFIERS = {
     "claude": (REPO / "src" / "agent" / "claude" / "cli" / "task-notifier.sh", "wait_for_core_healthy"),
     "codex": (REPO / "src" / "agent" / "codex" / "cli" / "task-notifier.sh", "wait_for_core_idle"),
@@ -86,7 +90,8 @@ class HeadAbandonedContract(unittest.TestCase):
 
 
 class ShippedQueueDropsAbandonedHead(unittest.TestCase):
-    def _run(self, script: Path, wait_fn: str) -> tuple[str, Path]:
+    def _run(self, script: Path, wait_fn: str, *, writer: "Path | None" = None,
+             before=None) -> tuple[str, Path]:
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         root = Path(tmp.name)
@@ -100,11 +105,15 @@ class ShippedQueueDropsAbandonedHead(unittest.TestCase):
         (queue / "task-next.txt").write_text("normal")
         submitted = root / "submitted.log"
         text = script.read_text()
-        fns = "\n".join(_function_text(n, text) for n in
-                        ("has_result", "task_payload", "queue_head", "process_announced_queue"))
+        names = ["has_result", "task_payload", "queue_head", "process_announced_queue"]
+        if writer is not None:
+            names.append("mark_worker_stage")
+        fns = "\n".join(_function_text(n, text) for n in names)
+        stage_impl = (f'source {shlex.quote(str(WORKER_STAGE))}\n' if writer is not None else
+                      f'mark_worker_stage() {{ echo "$1 $2" >> {shlex.quote(str(root / "stages.log"))}; }}\n')
         stubs = (
             f'{wait_fn}() {{ return 0; }}\n'
-            f'mark_worker_stage() {{ echo "$1 $2" >> {shlex.quote(str(root / "stages.log"))}; }}\n'
+            + stage_impl +
             'log_notifier() { printf "%s\\n" "$*" >&2; }\n'
             # The core answers whatever is typed into it, so a typed head would not block here.
             f'submit_task() {{ echo "$1" >> {shlex.quote(str(submitted))}; '
@@ -116,6 +125,11 @@ class ShippedQueueDropsAbandonedHead(unittest.TestCase):
                "NOTIFIER_PY": sys.executable, "DISPATCH_PY": str(DISPATCH),
                "RESULTS_DIR": str(results), "TASKS_DIR": str(tasks), "WORKSPACE_DIR": str(root),
                "PAYLOAD_DIR": str(payload), "INFLIGHT_DIR": str(root / "inflight")}
+        if writer is not None:
+            env.update(SUTANDO_INSTANCE_ID=RECIPIENT, WORKER_INSTANCE=RECIPIENT,
+                       SUTANDO_POOL_DELIVERY_SCRIPT=str(writer))
+        if before is not None:
+            before(root)
         # A prior delivery attempt left its in-flight marker before the head was archived.
         subprocess.run([sys.executable, str(DISPATCH), "inflight-mark", env["INFLIGHT_DIR"],
                         "task-gone.txt", "inc-1"], check=True, timeout=30)
@@ -134,18 +148,49 @@ class ShippedQueueDropsAbandonedHead(unittest.TestCase):
                 self.assertEqual(sorted(p.name for p in queue.iterdir()), [])
                 self.assertIn("dropped task-gone.txt from the queue", self.stderr)
 
-    def test_a_dropped_head_leaves_no_inflight_marker_and_codex_finishes_its_stage(self):
-        for runtime, (script, wait_fn) in NOTIFIERS.items():
-            with self.subTest(runtime=runtime):
-                self._run(script, wait_fn)
-                live = subprocess.run([sys.executable, str(DISPATCH), "inflight-live",
-                                       str(self.root / "inflight"), "task-gone.txt", "inc-1"],
-                                      timeout=30).returncode
-                if runtime == "claude":
-                    self.assertEqual(live, 1, "the dropped head's in-flight marker must be cleared")
-                else:
-                    stages = (self.root / "stages.log").read_text().splitlines()
-                    self.assertIn("task-gone.txt done", stages)
+    def test_claude_clears_a_dropped_heads_inflight_marker(self):
+        script, wait_fn = NOTIFIERS["claude"]
+        self._run(script, wait_fn)
+        live = subprocess.run([sys.executable, str(DISPATCH), "inflight-live",
+                               str(self.root / "inflight"), "task-gone.txt", "inc-1"],
+                              timeout=30).returncode
+        self.assertEqual(live, 1, "the dropped head's in-flight marker must be cleared")
+
+    @staticmethod
+    def _pool(root: Path, *args: str) -> str:
+        return subprocess.run([sys.executable, str(POOL_DELIVERY), "--workspace", str(root),
+                               "--recipient", RECIPIENT, *args],
+                              check=True, capture_output=True, text=True, timeout=30).stdout.strip()
+
+    def _held(self, root: Path) -> None:
+        # The worker took the head (pending record + sentinel) before it was archived.
+        self._pool(root, "mark-done", "--task-id", "task-gone", "--stage", "pending")
+        sentinel = root / "deliveries" / RECIPIENT / "task-gone.txt"
+        sentinel.parent.mkdir(parents=True, exist_ok=True)
+        sentinel.write_text("")
+
+    def test_codex_drop_withdraws_the_hold_through_the_production_writer(self):
+        script, wait_fn = NOTIFIERS["codex"]
+        submitted, queue = self._run(script, wait_fn, writer=POOL_DELIVERY, before=self._held)
+        root = self.root
+        self.assertEqual(submitted, "task-next.txt\n", self.stderr)
+        self.assertEqual(sorted(p.name for p in queue.iterdir()), [])
+        self.assertEqual(self._pool(root, "residue", "--task-id", "task-gone"), "clean",
+                         "an unpublished task must not read as finished")
+        workers = root / "state" / "workers" / RECIPIENT
+        self.assertFalse((workers / "done" / "task-gone.flag").exists(),
+                         "no completion flag without a published result")
+        self.assertEqual(list(workers.rglob("task-gone.*")), [], "no pending or done record survives")
+        self.assertEqual([p.name for p in (root / "deliveries" / RECIPIENT).glob("task-gone*")], [],
+                         "the sentinel is retired")
+
+    def test_codex_keeps_the_head_when_the_abandon_write_fails(self):
+        script, wait_fn = NOTIFIERS["codex"]
+        submitted, queue = self._run(script, wait_fn, writer=Path("/nonexistent/pool_delivery.py"))
+        self.assertEqual(submitted, "", "nothing behind the head is typed while it is held")
+        self.assertEqual(sorted(p.name for p in queue.iterdir()), ["task-gone.txt", "task-next.txt"])
+        self.assertIn("keeping task-gone.txt at the queue head", self.stderr)
+        self.assertNotIn("dropped task-gone.txt", self.stderr)
 
     def test_both_notifiers_delegate_the_decision_to_task_dispatch(self):
         for runtime, (script, _) in NOTIFIERS.items():
