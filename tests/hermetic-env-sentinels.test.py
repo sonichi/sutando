@@ -18,7 +18,6 @@ import subprocess
 import sys
 import sysconfig
 import tempfile
-import textwrap
 import types
 import unittest
 from pathlib import Path
@@ -87,23 +86,6 @@ def leaks(record: dict) -> "list[str]":
     return bad
 
 
-# The lines with which the two runtime_harness() callers build their environments.
-HARNESS_TASK_LIST = "isolate_os_environ(**runtime_harness()[1])\n"
-HARNESS_EXPIRY = ("        self.env = isolated_child_env()\n        environment_file, harness = runtime_harness()\n"
-                  "        if environment_file:\n            self.env.update(harness)\n")
-HARNESS_STUB = """import subprocess, sys
-sys.path.insert(0, %r)
-from _helpers.hermetic_env import isolate_os_environ, isolated_child_env, runtime_harness
-class T:
-    pass
-self = T()
-self.env = None
-%s
-env = self.env if self.env is not None else isolated_child_env()
-subprocess.run([sys.executable, "-c", "pass"], env=env, check=True, timeout=30)
-"""
-
-
 class Sentinels(unittest.TestCase):
     def check(self, target, expect_opens=True, values=True, extra=None):
         record, names, proc = audit(target, values=values, extra=extra)
@@ -154,27 +136,23 @@ class Sentinels(unittest.TestCase):
         self.check(["tests/channel-env-resolve.test.py"])
 
     def test_runtime_harness_callers_take_no_selector_or_telemetry_from_its_file(self):
-        # Each caller's own harness lines, run under the audit hook; a stub child dumps its env and exits.
-        callers = {"tests/runtime-cli-task-list-unfinished.test.py": ("", HARNESS_TASK_LIST),
-                   "tests/runtime-api-request-expiry.test.py": ("isolate_os_environ()\n", HARNESS_EXPIRY)}
+        # The real callers run unchanged up to their first child, which is recorded and never started.
         harness = Path(tempfile.mkdtemp(prefix="h-")).resolve()
+        marker = harness / "harness-bin"
         (harness / "environment.json").write_text(json.dumps(
-            {"PATH": os.environ["PATH"], "TMPDIR": str(harness), "REMOTE_TASK_TOKEN": f"{MARK}-harness-token",
-             "SUTANDO_TELEMETRY": "1"}))
-        for f, (prelude, lines) in callers.items():
+            {"PATH": f"{marker}{os.pathsep}{os.environ['PATH']}", "TMPDIR": str(harness),
+             "REMOTE_TASK_TOKEN": f"{MARK}-harness-token", "SUTANDO_TELEMETRY": "1"}))
+        outer = {"SUTANDO_RUNTIME_SOCKET": str(harness / "api.sock"), "TMPDIR": str(harness)}
+        for f in ("tests/runtime-cli-task-list-unfinished.test.py", "tests/runtime-api-request-expiry.test.py"):
             with self.subTest(f=f):
-                self.assertTrue(all(line in (REPO / f).read_text() for line in lines.split("\n") if line),
-                                "the caller no longer reads the harness this way: update the stub")
-                stub = harness / f"{Path(f).stem.replace('.', '_')}_stub.py"
-                stub.write_text(HARNESS_STUB % (str(REPO / "tests"), prelude + textwrap.dedent(lines)))
-                record, _, proc = audit([str(stub)], timeout=60,
-                                        extra={"SUTANDO_RUNTIME_SOCKET": str(harness / "api.sock")})
-                self.assertEqual(proc.returncode, 0, proc.stderr[-1500:])
-                self.assertTrue(record["child_envs"], "the stub spawned nothing")
+                record, _, proc = audit(["--first-child", f], timeout=60, extra=outer)
+                self.assertEqual(proc.returncode, 0, proc.stdout[-1500:] + proc.stderr[-1500:])
+                self.assertEqual(len(record["child_envs"]), 1, "the caller started no child")
+                child = record["child_envs"][0]
+                self.assertTrue(child.get("PATH", "").startswith(str(marker)),
+                                "the recorded child was not built from the harness file")
                 self.assertFalse(leaks(record), leaks(record))
-                envs = record["child_envs"] + [record["final_env"]]
-                self.assertEqual({e.get("SUTANDO_TELEMETRY") for e in envs}, {"0"})
-                self.assertTrue(all(e.get("PATH") == os.environ["PATH"] for e in record["child_envs"]))
+                self.assertEqual({e.get("SUTANDO_TELEMETRY") for e in (child, record["final_env"])}, {"0"})
 
     def test_a_suite_that_stops_all_patches_reads_no_outer_selector(self):
         self.check(["tests/core-restart-heartbeat-and-cron-hold.test.py"])

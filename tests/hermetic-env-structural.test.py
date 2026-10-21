@@ -203,9 +203,10 @@ class PathNames:
         if not isinstance(e, ast.Call) or e.keywords:
             return False
         f, args = e.func, e.args
+        # A zero-argument Path() or str() is the cwd or "": neither is built from __file__.
         if isinstance(f, ast.Name):
             known = f.id == "str" or f.id in self.cls or f.id in self.funcs
-            return known and all(self.ok(a) for a in args)
+            return known and bool(args) and all(self.ok(a) for a in args)
         if not isinstance(f, ast.Attribute):
             return False
         if f.attr in ("resolve", "absolute") and not args:
@@ -213,7 +214,7 @@ class PathNames:
         base = ast.unparse(f.value)
         known = ((f.attr in OS_PATH_FUNCS and base in {f"{o}.path" for o in self.os})
                  or (f.attr == "fspath" and base in self.os) or (f.attr == "Path" and base in self.pathlib))
-        return known and all(self.ok(a) for a in args)
+        return known and bool(args) and all(self.ok(a) for a in args)
 
 
 def _module_top(stmt, index: int, paths: PathNames) -> bool:
@@ -784,13 +785,18 @@ class SelfTest(unittest.TestCase):
         head = "import os, sys, pathlib\nfrom pathlib import Path\n"
         isolate = CANON + "isolate_os_environ()\n" + GATEWAY_IMPORT
         for line in ('sys.path.insert(0, str(Path(os.environ["HOME"])))\n', "sys.path.insert(0, str(x.resolve()))\n",
-                     "sys.path.append(str(Path.home()))\n", "sys.path.insert(0, os.path.join(os.getcwd()))\n"):
+                     "sys.path.append(str(Path.home()))\n", "sys.path.insert(0, os.path.join(os.getcwd()))\n",
+                     "sys.path.insert(0, str(Path()))\n", "sys.path.insert(0, str())\n",
+                     "sys.path.insert(0, str(pathlib.Path()))\n",
+                     "from pathlib import Path as P\nsys.path.insert(0, str(P()))\n"):
             with self.subTest(line=line):
                 self.assertIn("misplaced-isolation", " ".join(violations(head + line + isolate)))
         for line in ("sys.path.insert(0, str(Path(__file__).resolve().parents[2]))\n",
                      'sys.path.append(os.path.join(os.path.dirname(__file__), ".."))\n',
                      'sys.path.insert(0, "tests")\n',
-                     'sys.path.insert(0, str(pathlib.Path(__file__).parent / "tests"))\n'):
+                     'sys.path.insert(0, str(pathlib.Path(__file__).parent / "tests"))\n',
+                     "from pathlib import Path as P\nsys.path.insert(0, str(P(__file__).parent))\n",
+                     "import pathlib as pl\nsys.path.insert(0, str(pl.Path(__file__).parent))\n"):
             with self.subTest(line=line):
                 self.assertEqual(violations(head + line + isolate), [])
 

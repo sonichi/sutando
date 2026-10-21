@@ -2,9 +2,11 @@
 and this process's environment whenever a gateway, Hatch, room_ops, bee-actions or credential module
 is imported (the channel token reader and channel_env_resolve included).
 
-    python3 sentinel_audit.py <out.json> <file.py | -c CODE> [args...]
+    python3 sentinel_audit.py <out.json> [--first-child] <file.py | -c CODE> [args...]
 
-The record is written to <out.json> at exit, even when the target exits non-zero."""
+The record is written to <out.json> at exit, even when the target exits non-zero. With --first-child
+the target runs unchanged until it starts its first child, whose environment is recorded; the process
+then exits 0 before that child exists, so a target that waits on a live runtime stays bounded."""
 import json
 import os
 import re
@@ -12,6 +14,9 @@ import runpy
 import sys
 
 out_path, target, rest = sys.argv[1], sys.argv[2], sys.argv[3:]
+first_child = target == "--first-child"
+if first_child:
+    target, rest = rest[0], rest[1:]
 opens: "list[str]" = []
 child_envs: "list[dict]" = []
 import_envs: "list[dict]" = []
@@ -25,8 +30,12 @@ def _hook(event, args):
         opens.append(os.path.abspath(os.fsdecode(args[0])))
     elif event == "subprocess.Popen" and len(args) > 3:
         child_envs.append(dict(args[3] if args[3] is not None else os.environ))
+        if first_child:
+            os._exit(0)
     elif event in ("os.exec", "os.posix_spawn") and len(args) > 2:
         child_envs.append(dict(args[2] if args[2] is not None else os.environ))
+        if first_child:
+            os._exit(0)
     elif event == "import" and isinstance(args[0], str) and GATEWAY_MODULE.search(args[0]):
         import_envs.append(dict(os.environ))
 
