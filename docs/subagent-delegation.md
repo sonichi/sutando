@@ -55,7 +55,7 @@ choose a more expensive model.
 - **Either runtime, work that outlives one turn** — a worker from the worker pool, asked through
   `pool_ask.py`.
 
-The mechanism is subject to the same quota-tier gate as everything else in this doc (see below).
+The quota tier applies to these tools as it does to delegation generally: it gates the autonomous loop and is guidance for work the owner asked for (see above).
 
 ## When no delegation mechanism is available
 
