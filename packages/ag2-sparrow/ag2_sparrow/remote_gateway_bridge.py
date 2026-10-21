@@ -7680,8 +7680,8 @@ def main() -> None:
             if _advance_held_tasks(inflight):   # a retried ack, or a publish after a restart
                 wake_outbound()
             prev_ok = poll_grace_since
+            _RESP_META.last = None
             try:
-                _RESP_META.last = None
                 resp = _req("GET", f"/v1/tasks?wait={POLL_WAIT}{_POLL_PROOF}", timeout=POLL_WAIT + 10)
                 last_poll_ok = poll_grace_since = time.time()
                 # A completed poll remains evidence even if accepting its tasks fails.
@@ -7750,7 +7750,8 @@ def main() -> None:
         except _PollAnomaly as e:
             # Every anomaly is counted in its line; the log itself thins out a run of them.
             _log_backoff(("poll-anomaly",), f"{e} — backing off {backoff}s")
-            _emit_gateway_status(False, error="poll answered without a task list", backoff_s=backoff)
+            _emit_gateway_status(False, error="poll answered without a task list", backoff_s=backoff,
+                                 poll_ok_ts=last_poll_ok)
             time.sleep(backoff); backoff = min(backoff * 2, _POLL_BACKOFF_MAX_S)
         except _NETWORK_ERRORS as e:
             poll_failures += 1
