@@ -50,9 +50,10 @@ The rule in `CLAUDE.md` bans deferring and bans handing the work back, and the "
 better mechanism" escape does not fire when you have *none* rather than a worse one. Without a
 fourth branch that leaves only two moves, one of which is dishonest.
 
-Subagents are FULL-tier only under the proactive-loop quota gate
-(`skills/proactive-loop/SKILL.md`), so an unavailable mechanism is a **common** state, not an
-operator edge case — a LIGHT-tier session has no delegation available at all.
+Subagents are FULL-tier only under the autonomous loop's quota gate
+(`docs/proactive-loop-rationale.md`), so an unavailable mechanism is a **common** state there, not an
+operator edge case — a LIGHT-tier loop session has no delegation available at all. For work the
+owner asked for, the tier is guidance (see above), not a gate.
 
 **So: do the work inline in this session, and say plainly that it ran inline and why.**
 Inline-with-disclosure is the satisfying branch.
