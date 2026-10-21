@@ -962,6 +962,7 @@ process_announced_queue() {
     # Checked after the healthy wait so a file archived during that wait is never typed.
     if "$NOTIFIER_PY" "$DISPATCH_PY" head-abandoned "$RESULTS_DIR" "$filename" "$(task_payload "$filename")"; then
       log_notifier "dropped $filename from the queue: its task file is gone and no result was found"
+      "$NOTIFIER_PY" "$DISPATCH_PY" inflight-clear "$INFLIGHT_DIR" "$filename" || true
       rm -f "$queue_dir/$filename" "$PAYLOAD_DIR/$filename"
       continue
     fi

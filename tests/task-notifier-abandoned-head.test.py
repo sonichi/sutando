@@ -104,7 +104,7 @@ class ShippedQueueDropsAbandonedHead(unittest.TestCase):
                         ("has_result", "task_payload", "queue_head", "process_announced_queue"))
         stubs = (
             f'{wait_fn}() {{ return 0; }}\n'
-            'mark_worker_stage() { :; }\n'
+            f'mark_worker_stage() {{ echo "$1 $2" >> {shlex.quote(str(root / "stages.log"))}; }}\n'
             'log_notifier() { printf "%s\\n" "$*" >&2; }\n'
             # The core answers whatever is typed into it, so a typed head would not block here.
             f'submit_task() {{ echo "$1" >> {shlex.quote(str(submitted))}; '
@@ -116,9 +116,13 @@ class ShippedQueueDropsAbandonedHead(unittest.TestCase):
                "NOTIFIER_PY": sys.executable, "DISPATCH_PY": str(DISPATCH),
                "RESULTS_DIR": str(results), "TASKS_DIR": str(tasks), "WORKSPACE_DIR": str(root),
                "PAYLOAD_DIR": str(payload), "INFLIGHT_DIR": str(root / "inflight")}
+        # A prior delivery attempt left its in-flight marker before the head was archived.
+        subprocess.run([sys.executable, str(DISPATCH), "inflight-mark", env["INFLIGHT_DIR"],
+                        "task-gone.txt", "inc-1"], check=True, timeout=30)
         r = subprocess.run(["bash", "-c", harness], env=env, capture_output=True, text=True, timeout=60)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.stderr = r.stderr
+        self.root = root
         return (submitted.read_text() if submitted.exists() else ""), queue
 
     def test_both_notifiers_drop_an_archived_head_untyped_and_proceed(self):
@@ -129,6 +133,19 @@ class ShippedQueueDropsAbandonedHead(unittest.TestCase):
                                  f"only the live task may be typed; stderr:\n{self.stderr}")
                 self.assertEqual(sorted(p.name for p in queue.iterdir()), [])
                 self.assertIn("dropped task-gone.txt from the queue", self.stderr)
+
+    def test_a_dropped_head_leaves_no_inflight_marker_and_codex_finishes_its_stage(self):
+        for runtime, (script, wait_fn) in NOTIFIERS.items():
+            with self.subTest(runtime=runtime):
+                self._run(script, wait_fn)
+                live = subprocess.run([sys.executable, str(DISPATCH), "inflight-live",
+                                       str(self.root / "inflight"), "task-gone.txt", "inc-1"],
+                                      timeout=30).returncode
+                if runtime == "claude":
+                    self.assertEqual(live, 1, "the dropped head's in-flight marker must be cleared")
+                else:
+                    stages = (self.root / "stages.log").read_text().splitlines()
+                    self.assertIn("task-gone.txt done", stages)
 
     def test_both_notifiers_delegate_the_decision_to_task_dispatch(self):
         for runtime, (script, _) in NOTIFIERS.items():
