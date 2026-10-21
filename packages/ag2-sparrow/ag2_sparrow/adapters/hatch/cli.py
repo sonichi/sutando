@@ -30,6 +30,7 @@ from pathlib import Path
 
 from ... import _dirs, gateway_credential_io, gateway_credentials, gateway_instance, outbox, workspace_lock
 from ...result_markers import parse_markers
+from ...service_manager import _systemctl, _systemd_run, systemd_user_available  # noqa: F401
 from .task_fields import item_id, valid_mxid
 
 HOOK_ID = "ag2-sparrow-hatch"
@@ -62,7 +63,6 @@ SPARROW_COMMAND = "ag2-sparrow"
 SERVICE_NAME = "ag2-sparrow.service"
 # First line of every unit install writes: a unit without it is the owner's and is kept.
 SERVICE_MARKER = "# Written by ag2-sparrow-hatch install; re-run install to update it."
-SYSTEMD_TIMEOUT_S = 30
 
 
 def _shipped(name: str) -> str:
@@ -369,16 +369,6 @@ def device_env_path() -> Path:
     return _dirs.device_env_path()
 
 
-def _systemd_run(cmd: list) -> "subprocess.CompletedProcess | None":
-    """Run a systemctl/loginctl command; None when it could not run at all.
-    Never prompts: over SSH a polkit password prompt would hang until the timeout."""
-    try:
-        return subprocess.run([cmd[0], "--no-ask-password", *cmd[1:]], stdin=subprocess.DEVNULL,
-                              capture_output=True, text=True, timeout=SYSTEMD_TIMEOUT_S)
-    except (OSError, subprocess.SubprocessError):
-        return None
-
-
 def _ok(r) -> bool:
     return r is not None and r.returncode == 0
 
@@ -388,20 +378,6 @@ def _why(r) -> str:
         return "could not run"
     lines = (r.stderr or r.stdout or "").strip().splitlines()
     return lines[-1] if lines else f"exit {r.returncode}"
-
-
-def _systemctl(args: "tuple[str, ...]", *, locate: bool = False):
-    """The one place systemctl is named: run with `args`, a literal tuple at every call site,
-    or with locate=True only its path on PATH (None when absent)."""
-    if locate:
-        return shutil.which("systemctl")
-    return _systemd_run(["systemctl", *args])
-
-
-def systemd_user_available() -> bool:
-    """Whether `systemctl --user` reaches a running user manager."""
-    return _systemctl((), locate=True) is not None and \
-        _ok(_systemctl(("--user", "show-environment")))
 
 
 def render_service(exec_start: str, env: dict) -> str:

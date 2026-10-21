@@ -32,12 +32,20 @@ isolate_os_environ()
 PKG_ROOT = Path(__file__).resolve().parents[1]
 HATCH = PKG_ROOT / "ag2_sparrow" / "adapters" / "hatch"
 sys.path.insert(0, str(PKG_ROOT))
-from ag2_sparrow import gateway_credential_io, health_command as hc, outbox  # noqa: E402
+from ag2_sparrow import gateway_credential_io, health_command as hc, outbox, service_manager as sm  # noqa: E402
 from ag2_sparrow.adapters.hatch import cli as hatch_cli, keepalive, task_fields  # noqa: E402
 
 KEEPAWAKE_NOTE = "the agent keeps Sparrow running with %s keepalive keepawake from its scheduler"
 
-REAL_SYSTEMD_RUN = hatch_cli._systemd_run
+REAL_RUN = sm._run
+
+
+def systemd_seam(fake):
+    """`fake`, which reads argv without --no-ask-password, as the shared runner every command reaches."""
+    def run(cmd, timeout=sm.TIMEOUT_S):
+        assert cmd[1] == "--no-ask-password", cmd
+        return fake([cmd[0], *cmd[2:]])
+    return run
 REAL_ENSURE_SPARROW = keepalive.ensure_sparrow
 
 # The CLIs run in-process so repository coverage traces them.
@@ -156,7 +164,7 @@ class Base(unittest.TestCase):
         dirs.start()
         self.addCleanup(dirs.stop)
         # No test reaches the host's systemctl or loginctl.
-        systemd = mock.patch.object(hatch_cli, "_systemd_run", return_value=None)
+        systemd = mock.patch.object(sm, "_run", return_value=None)
         systemd.start()
         self.addCleanup(systemd.stop)
         # Nor the host's vault, which an install diff's masking reaches when nothing else holds a token.
@@ -1289,7 +1297,7 @@ class Service(Base):
         self.addCleanup(which.stop)
 
     def with_systemd(self, fake, *args, env=None):
-        with mock.patch.object(hatch_cli, "_systemd_run", side_effect=fake):
+        with mock.patch.object(sm, "_run", side_effect=systemd_seam(fake)):
             if env is None:
                 return self.cli(*args)
             base = py_env(self.home)
@@ -1460,8 +1468,8 @@ class InstallOrderTest(Service):
             seen.append((cmd, kw))
             self.assertEqual(cmd[1], "--no-ask-password", cmd)
             return fake([cmd[0], *cmd[2:]])
-        with mock.patch.object(hatch_cli, "_systemd_run", REAL_SYSTEMD_RUN), \
-                mock.patch.object(hatch_cli.subprocess, "run", side_effect=run):
+        with mock.patch.object(sm, "_run", REAL_RUN), \
+                mock.patch.object(sm.subprocess, "run", side_effect=run):
             r = self.cli("install", "--mxid", AGENT)
             self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
             self.cli("uninstall", "--service")
@@ -1471,7 +1479,7 @@ class InstallOrderTest(Service):
         for cmd, kw in seen:
             self.assertEqual(cmd[1], "--no-ask-password", cmd)
             self.assertIs(kw.get("stdin"), subprocess.DEVNULL, cmd)
-            self.assertEqual(kw.get("timeout"), hatch_cli.SYSTEMD_TIMEOUT_S, cmd)
+            self.assertEqual(kw.get("timeout"), sm.TIMEOUT_S, cmd)
 
     def test_a_token_file_others_can_read_or_another_user_owns_is_flagged(self):
         self.device_env.chmod(0o644)
@@ -1782,7 +1790,7 @@ class Keepalive(Base):
         path = self.home / ".config" / "systemd" / "user" / hatch_cli.SERVICE_NAME
         path.parent.mkdir(parents=True)
         path.write_text(hatch_cli.SERVICE_MARKER + "\n[Service]\n")
-        with mock.patch.object(hatch_cli, "_systemd_run", side_effect=fake), \
+        with mock.patch.object(sm, "_run", side_effect=systemd_seam(fake)), \
                 mock.patch.object(hatch_cli.shutil, "which", return_value="/usr/bin/systemctl"):
             r = self.cli("keepalive", "keepawake")
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
@@ -1954,7 +1962,7 @@ class Keepalive(Base):
         fake = FakeSystemd()
         executable(self.bin / hatch_cli.SPARROW_COMMAND, "#!/bin/sh\nexit 0\n")
         real_which = shutil.which
-        with mock.patch.object(hatch_cli, "_systemd_run", side_effect=fake), \
+        with mock.patch.object(sm, "_run", side_effect=systemd_seam(fake)), \
                 mock.patch.object(hatch_cli.shutil, "which", side_effect=lambda name, *a, **k:
                                   "/usr/bin/systemctl" if name == "systemctl"
                                   else real_which(name, *a, **k)):
@@ -2175,7 +2183,7 @@ class StartSparrow(Base):
                 return b"\0".join(a.encode() for a in self.old_argv) + b"\0"
             return real_proc(pid, name)
         stack = contextlib.ExitStack()
-        stack.enter_context(mock.patch.object(hatch_cli, "_systemd_run", side_effect=run))
+        stack.enter_context(mock.patch.object(sm, "_run", side_effect=systemd_seam(run)))
         stack.enter_context(mock.patch.object(
             hatch_cli.shutil, "which", side_effect=lambda n, *a, **k:
             "/usr/bin/systemctl" if n == "systemctl" else real_which(n)))
@@ -2420,7 +2428,7 @@ class StartSparrow(Base):
         real_which, stopped, spawned = shutil.which, [], []
         with mock.patch.object(hatch_cli.shutil, "which", side_effect=lambda name, *a, **k:
                                "/usr/bin/systemctl" if name == "systemctl" else real_which(name, *a, **k)), \
-                mock.patch.object(hatch_cli, "_systemd_run", side_effect=fake), \
+                mock.patch.object(sm, "_run", side_effect=systemd_seam(fake)), \
                 mock.patch.object(keepalive, "sparrow_env", return_value={"HOME": "x"}), \
                 mock.patch.object(keepalive, "_stop", side_effect=lambda pid: stopped.append(pid) or True), \
                 mock.patch.object(keepalive, "_spawn_sparrow",
@@ -2452,7 +2460,7 @@ class StartSparrow(Base):
         real_which, stopped, spawned = shutil.which, [], []
         with mock.patch.object(hatch_cli.shutil, "which", side_effect=lambda name, *a, **k:
                                "/usr/bin/systemctl" if name == "systemctl" else real_which(name, *a, **k)), \
-                mock.patch.object(hatch_cli, "_systemd_run", side_effect=systemd), \
+                mock.patch.object(sm, "_run", side_effect=systemd_seam(systemd)), \
                 mock.patch.object(keepalive, "sparrow_env", return_value={"HOME": "x"}), \
                 mock.patch.object(keepalive, "_stop", side_effect=lambda pid: stopped.append(pid) or True), \
                 mock.patch.object(keepalive, "_spawn_sparrow",
@@ -2488,7 +2496,7 @@ class StartSparrow(Base):
         real_which, stopped, spawned = shutil.which, [], []
         with mock.patch.object(hatch_cli.shutil, "which", side_effect=lambda name, *a, **k:
                                "/usr/bin/systemctl" if name == "systemctl" else real_which(name, *a, **k)), \
-                mock.patch.object(hatch_cli, "_systemd_run", side_effect=systemd), \
+                mock.patch.object(sm, "_run", side_effect=systemd_seam(systemd)), \
                 mock.patch.object(keepalive, "sparrow_env", return_value={"HOME": "x"}), \
                 mock.patch.object(keepalive, "_spawn_sparrow",
                                   side_effect=lambda cfg: spawned.append(cfg) or (True, "spawned")), \
@@ -2563,7 +2571,7 @@ class StartSparrow(Base):
             with self.subTest(args=args), \
                     mock.patch.object(hatch_cli.shutil, "which", side_effect=lambda name, *a, **k:
                                       "/usr/bin/systemctl" if name == "systemctl" else real_which(name, *a, **k)), \
-                    mock.patch.object(hatch_cli, "_systemd_run", side_effect=FakeSystemd(available=False)), \
+                    mock.patch.object(sm, "_run", side_effect=systemd_seam(FakeSystemd(available=False))), \
                     mock.patch.object(keepalive, "_spawn_sparrow",
                                       side_effect=lambda cfg: spawned.append(cfg) or (True, "spawned")), \
                     mock.patch.object(keepalive, "ensure_sparrow", REAL_ENSURE_SPARROW):
@@ -2614,7 +2622,7 @@ class StartSparrow(Base):
     def test_unit_props_accepts_only_a_positively_verified_state(self):
         def props(out):
             ran = subprocess.CompletedProcess([], 0, out, "")
-            with mock.patch.object(hatch_cli, "_systemd_run", return_value=ran):
+            with mock.patch.object(sm, "_run", return_value=ran):
                 return hatch_cli._unit_props()
         for name, out in self.malformed_answers():
             with self.subTest(answer=name):
@@ -2677,7 +2685,7 @@ class StartSparrow(Base):
                 return subprocess.CompletedProcess(cmd, 0, out, "") if cmd[1:3] == ["--user", "show"] else fake(cmd)
             with self.subTest(answer=name), mock.patch.dict(os.environ, py_env(self.home), clear=True), \
                     mock.patch.object(hatch_cli.shutil, "which", return_value="/usr/bin/systemctl"), \
-                    mock.patch.object(hatch_cli, "_systemd_run", side_effect=systemd):
+                    mock.patch.object(sm, "_run", side_effect=systemd_seam(systemd)):
                 ok, how = keepalive.restart_listener({})
             self.assertFalse(ok)
             self.assertIn("did not give a well-formed state; it was neither reset nor restarted", how)
@@ -2695,7 +2703,7 @@ class StartSparrow(Base):
             with self.subTest(sparrow=sparrow), \
                     mock.patch.object(hatch_cli.shutil, "which", side_effect=lambda name, *a, **k:
                                       "/usr/bin/systemctl" if name == "systemctl" else real_which(name, *a, **k)), \
-                    mock.patch.object(hatch_cli, "_systemd_run", side_effect=FakeSystemd(available=False)), \
+                    mock.patch.object(sm, "_run", side_effect=systemd_seam(FakeSystemd(available=False))), \
                     mock.patch.object(keepalive, "is_sparrow_pid", side_effect=lambda pid: checked.append(pid) or real_is(pid)), \
                     mock.patch.object(keepalive, "_spawn_sparrow",
                                       side_effect=lambda cfg: spawned.append(cfg) or (True, "spawned")), \
@@ -2726,13 +2734,14 @@ class ReachabilityProbe(Base):
         ran = subprocess.CompletedProcess([], 0, synthetic + "\n", synthetic + "\n")
         out = io.StringIO()
         with mock.patch.object(hatch_cli.shutil, "which", return_value="/usr/bin/systemctl"), \
-                mock.patch.object(hatch_cli, "_systemd_run", return_value=ran), \
+                mock.patch.object(sm, "_run", return_value=ran), \
                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
             got = hatch_cli.systemd_user_available()
         self.assertIs(got, True)
         self.assertEqual(out.getvalue(), "")
-        kept = {k: v for k, v in vars(hatch_cli).items() if not k.startswith("__")}
-        self.assertNotIn("synth-probe-output-5698", repr(kept))
+        for module in (hatch_cli, sm):
+            kept = {k: v for k, v in vars(module).items() if not k.startswith("__")}
+            self.assertNotIn("synth-probe-output-5698", repr(kept))
 
 
 class InstallMasking(Base):

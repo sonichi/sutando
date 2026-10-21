@@ -43,7 +43,7 @@ REPO = Path(__file__).resolve().parent.parent
 PKG = REPO / "packages" / "ag2-sparrow"
 sys.path.insert(0, str(PKG))
 sys.path.insert(0, str(REPO / "shared"))
-from ag2_sparrow import gateway_credential_io, gateway_credential_sources as owner, gateway_credentials as contract  # noqa: E402
+from ag2_sparrow import gateway_credential_io, gateway_credential_sources as owner, gateway_credentials as contract, service_manager  # noqa: E402
 from ag2_sparrow.adapters.hatch import cli as hatch_cli, keepalive as hatch_keepalive  # noqa: E402
 
 
@@ -622,7 +622,7 @@ class RealSinks(unittest.TestCase):
 
     def setUp(self):
         # No case reaches the host's systemctl unless it supplies a fake.
-        patcher = mock.patch.object(hatch_cli, "_systemd_run", return_value=None)
+        patcher = mock.patch.object(service_manager, "_run", return_value=None)
         patcher.start()
         self.addCleanup(patcher.stop)
         # Nor the host's vault: a Hatch diff that reaches the vault tier reads a fake one.
@@ -979,7 +979,7 @@ class RealSinks(unittest.TestCase):
         with mock.patch.dict(os.environ, env, clear=True), contextlib.redirect_stdout(out), \
                 contextlib.redirect_stderr(err), \
                 mock.patch.object(hatch_cli.shutil, "which", return_value="/usr/bin/systemctl"), \
-                mock.patch.object(hatch_cli, "_systemd_run", return_value=ok), \
+                mock.patch.object(service_manager, "_run", return_value=ok), \
                 mock.patch.object(hatch_cli, "_find_console_script", return_value="/opt/bin/ag2-sparrow"):
             hatch_cli.install_service(fx.root / "t", fx.root / "r", fx.root / "s", "", False)
         return out.getvalue() + err.getvalue()
@@ -1036,7 +1036,7 @@ class RealSinks(unittest.TestCase):
                 with mock.patch.dict(os.environ, env, clear=True), contextlib.redirect_stdout(out), \
                         contextlib.redirect_stderr(err), \
                         mock.patch.object(hatch_cli.shutil, "which", return_value="/usr/bin/systemctl"), \
-                        mock.patch.object(hatch_cli, "_systemd_run", return_value=ok), \
+                        mock.patch.object(service_manager, "_run", return_value=ok), \
                         mock.patch.object(hatch_cli, "find_reply_command", return_value="/r"), \
                         mock.patch.object(hatch_cli, "reply_command_problem", return_value=""), \
                         mock.patch.object(hatch_cli, "install_hook", return_value=True), \

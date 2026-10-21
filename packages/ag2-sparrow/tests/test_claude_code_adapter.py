@@ -246,7 +246,7 @@ class Measure(unittest.TestCase):
 
 # ── `ag2-sparrow-claude-local`: the installed local shape ─────────────
 
-from ag2_sparrow import _dirs, connect_common as cm, holder_lock, tmux_pane_keys, tmux_probe  # noqa: E402
+from ag2_sparrow import _dirs, connect_common as cm, holder_lock, service_manager as sm, tmux_pane_keys, tmux_probe  # noqa: E402
 from ag2_sparrow import claude_local_accepter as accepter, claude_local_card as card, claude_local_records as records  # noqa: E402
 
 from ag2_sparrow.adapters.claude_code import cli, detector, hmac_policy, hold as hold_mod, inbox, launcher, trust  # noqa: E402
@@ -403,7 +403,7 @@ def oplock_free():
 
 
 class Runner:
-    """A manager command table for connect_common._run: (program, verb) -> rc or (rc, out, err); None =
+    """A manager command table for service_manager._run: (program, verb) -> rc or (rc, out, err); None =
     could not run. With a root, a start verb runs a stand-in launcher (adapter `adapter`, install identity
     `install`) holding the root's lock, a stop verb ends it (after `stop_delay`), and the probes answer
     from the manager's own state unless the table says otherwise: `show` LoadState from the unit file or
@@ -536,7 +536,7 @@ class ConnectBase(unittest.TestCase):
             os.environ.pop(key, None)
         # No test reaches the host's systemctl, loginctl or launchctl; the bounds are 2 s and 1 s, not 30.
         self.calls = []
-        self.patches = [mock.patch.object(cm, "_run", side_effect=lambda cmd, timeout=30: self.calls.append(cmd)),
+        self.patches = [mock.patch.object(sm, "_run", side_effect=lambda cmd, timeout=30: self.calls.append(cmd)),
                         mock.patch.object(cm, "is_macos", return_value=False),
                         mock.patch.object(cm, "console_script", return_value=str(self.bin / cli.COMMAND)),
                         mock.patch.object(cm, "CONFIRM_TIMEOUT_S", 2.0), mock.patch.object(cm, "OP_WAIT_S", 1.0),
@@ -565,7 +565,7 @@ class ConnectBase(unittest.TestCase):
                          "--hmac-key-file", str(self.home / "task-hmac.key"), *extra)
 
     def install_with(self, runner, mac=False, *extra):
-        with mock.patch.object(cm, "_run", side_effect=runner), mock.patch.object(cm, "is_macos", return_value=mac):
+        with mock.patch.object(sm, "_run", side_effect=runner), mock.patch.object(cm, "is_macos", return_value=mac):
             return self.install(*extra)
 
     def values(self, **over):
@@ -917,7 +917,7 @@ class ConnectRoot(ConnectBase):
         self.assertIn("the inbox must be <work>/tasks", err)
         self.assertFalse(cli.config_path().exists())
         runner = self.runner()
-        with mock.patch.object(cm, "_run", side_effect=runner):
+        with mock.patch.object(sm, "_run", side_effect=runner):
             rc, _, err = self.main("install", "--plugin-dir", str(self.plugin), "--work", str(self.work))
         self.assertEqual(rc, 0, err)
         cfg = cli.read_config(cli.config_path())
@@ -931,7 +931,7 @@ class ConnectRoot(ConnectBase):
             odd = self.home / name
             (odd / "tasks").mkdir(parents=True)
             for flags in (("--work", str(odd)), ("--inbox", str(odd / "tasks"))):
-                with mock.patch.object(cm, "_run", side_effect=self.runner()) as run:
+                with mock.patch.object(sm, "_run", side_effect=self.runner()) as run:
                     rc, _, err = self.main("install", "--plugin-dir", str(self.plugin), *flags)
                 self.assertEqual((rc, "line break" in err), (2, True), (flags, err))
                 self.assertFalse(cli.config_path().exists(), "nothing written")
@@ -1091,7 +1091,7 @@ class ConnectSerialize(ConnectBase):
         self.runners[-1].stop_session()
         other = hold(None, script=OP_HOLDER)
         try:
-            with mock.patch.object(cm, "_run", side_effect=Runner({})):
+            with mock.patch.object(sm, "_run", side_effect=Runner({})):
                 rc, _, err = self.main("uninstall")
             self.assertEqual((rc, "operation is in progress" in err), (1, True))
             self.assertTrue(cli.config_path().exists())
@@ -1104,7 +1104,7 @@ class ConnectSerialize(ConnectBase):
         src = Path(launcher.__file__).read_text() + Path(cli.__file__).read_text().split("def run(")[1].split("\ndef ")[0]
         self.assertNotIn("operation_lock", src.split("def install(")[0] if "def install(" in src else src,
                          "neither the launcher nor run names the operation lock")
-        with mock.patch.object(cm, "_run", side_effect=self.runner({})):
+        with mock.patch.object(sm, "_run", side_effect=self.runner({})):
             self.assertEqual(self.main("uninstall")[0], 0)
         self.assertTrue(cm.oplock_path(L).exists(), "the mutex file is never unlinked")
 
@@ -1142,7 +1142,7 @@ class ConnectUninstall(ConnectBase):
         runner = self.runner()
         self.assertEqual(self.install_with(runner)[0], 0)
         runner.calls.clear()
-        with mock.patch.object(cm, "_run", side_effect=runner):
+        with mock.patch.object(sm, "_run", side_effect=runner):
             rc, out, err = self.main("uninstall")
         self.assertEqual(rc, 0, err)
         self.assertEqual(runner.verbs("systemctl"), ["show", "stop", "disable", "show", "daemon-reload", "show"])
@@ -1151,7 +1151,7 @@ class ConnectUninstall(ConnectBase):
         self.assertLess(out.index(f"removed: {cli.service_path()}"), out.index(f"removed: {cli.config_path()}"), "config last")
         self.assertEqual(self.relay.read_text(), f"REMOTE_TASK_TOKEN={TOKEN}\n", "Sparrow's token file is untouched")
         self.assertTrue((self.plugin / ".claude-plugin" / "plugin.json").exists())
-        with mock.patch.object(cm, "_run", side_effect=Runner()):
+        with mock.patch.object(sm, "_run", side_effect=Runner()):
             self.assertIn("nothing to remove", self.main("uninstall")[1])
 
     def test_a_partial_systemd_teardown_keeps_the_config_and_completes_on_retry(self):
@@ -1161,7 +1161,7 @@ class ConnectUninstall(ConnectBase):
                            ({("systemctl", "show"): SHOW("loaded", "inactive", "disabled")}, "still known to systemd (LoadState loaded)")):
             self.configure()
             cm._write(cli.service_path(), cm.render_service(L, "/x"), 0o644)
-            with mock.patch.object(cm, "_run", side_effect=self.runner(table)):
+            with mock.patch.object(sm, "_run", side_effect=self.runner(table)):
                 rc, _, err = self.main("uninstall")
             self.assertEqual(rc, 1, table)
             self.assertIn(why, err)
@@ -1169,39 +1169,39 @@ class ConnectUninstall(ConnectBase):
             self.assertTrue(cli.config_path().exists(), "the config stays, so the rerun knows the root")
             self.assertIn("kept so a rerun knows the work root", err)
             runner = self.runner()
-            with mock.patch.object(cm, "_run", side_effect=runner):
+            with mock.patch.object(sm, "_run", side_effect=runner):
                 rc, out, err = self.main("uninstall")
             self.assertEqual(rc, 0, err)
             self.assertEqual(runner.verbs("systemctl"), ["show", "daemon-reload", "show"], "the retry finishes from where it stopped")
             self.assertFalse(cli.config_path().exists())
         self.assertEqual(self.install_with(self.runner())[0], 0)
         self.runners[-1].stop_session()
-        with mock.patch.object(cm, "_run", side_effect=self.runner({("systemctl", "show"): SHOW("loaded", "inactive", "enabled")})):
+        with mock.patch.object(sm, "_run", side_effect=self.runner({("systemctl", "show"): SHOW("loaded", "inactive", "enabled")})):
             rc, _, err = self.main("uninstall")
         self.assertEqual((rc, "is still inactive and enabled after the stop" in err), (1, True))
         self.assertTrue(cli.service_path().exists() and cli.config_path().exists())
-        with mock.patch.object(cm, "_run", side_effect=self.runner()):
+        with mock.patch.object(sm, "_run", side_effect=self.runner()):
             self.assertEqual(self.main("uninstall")[0], 0)
 
     def test_a_registered_job_without_files_is_still_torn_down(self):
         self.configure()
         runner = self.runner(registered=True)
-        with mock.patch.object(cm, "_run", side_effect=runner):
+        with mock.patch.object(sm, "_run", side_effect=runner):
             rc, out, err = self.main("uninstall")
         self.assertEqual(rc, 0, err)
         self.assertEqual(runner.verbs("systemctl"), ["show", "stop", "disable", "show", "daemon-reload", "show"],
                          "the manager is probed and the job stopped, disabled, reloaded away")
         self.assertFalse(cli.config_path().exists())
-        with mock.patch.object(cm, "_run", side_effect=Runner()):
+        with mock.patch.object(sm, "_run", side_effect=Runner()):
             self.assertIn("nothing to remove", self.main("uninstall")[1])
         runner = self.runner(registered=True)
-        with mock.patch.object(cm, "_run", side_effect=runner):
+        with mock.patch.object(sm, "_run", side_effect=runner):
             rc, out, err = self.main("uninstall")
         self.assertEqual((rc, runner.verbs("systemctl")), (0, ["show", "stop", "disable", "show", "daemon-reload", "show"]),
                          "no files at all, a registered job: still torn down")
         self.assertNotIn("nothing to remove", out)
         mac = self.runner(registered=True)
-        with mock.patch.object(cm, "is_macos", return_value=True), mock.patch.object(cm, "_run", side_effect=mac):
+        with mock.patch.object(cm, "is_macos", return_value=True), mock.patch.object(sm, "_run", side_effect=mac):
             rc, out, _ = self.main("uninstall")
         self.assertEqual((rc, mac.calls), (0, [["launchctl", "print", SERVICE_TARGET], ["launchctl", "bootout", "--wait", SERVICE_TARGET],
                                                ["launchctl", "print", SERVICE_TARGET]]))
@@ -1209,7 +1209,7 @@ class ConnectUninstall(ConnectBase):
     def test_uninstall_waits_a_bounded_time_for_the_root_to_free_after_the_stop(self):
         runner = self.runner(stop_delay=0.6)
         self.assertEqual(self.install_with(runner)[0], 0)
-        with mock.patch.object(cm, "_run", side_effect=runner):
+        with mock.patch.object(sm, "_run", side_effect=runner):
             rc, _, err = self.main("uninstall")
         self.assertEqual(rc, 0, "the launcher reaps within the bound: " + err)
         self.assertFalse(cli.config_path().exists())
@@ -1218,7 +1218,7 @@ class ConnectUninstall(ConnectBase):
         runner = self.runner()
         self.assertEqual(self.install_with(runner, True)[0], 0)
         runner.calls.clear()
-        with mock.patch.object(cm, "_run", side_effect=runner), mock.patch.object(cm, "is_macos", return_value=True):
+        with mock.patch.object(sm, "_run", side_effect=runner), mock.patch.object(cm, "is_macos", return_value=True):
             rc, out, err = self.main("uninstall")
         self.assertEqual(rc, 0, err)
         self.assertEqual(runner.verbs("launchctl"), ["print", "bootout", "print"])
@@ -1231,13 +1231,13 @@ class ConnectUninstall(ConnectBase):
                       {("launchctl", "bootout"): None, ("launchctl", "print"): None}):
             self.assertEqual(self.install_with(self.runner(), True)[0], 0)
             self.runners[-1].stop_session()
-            with mock.patch.object(cm, "_run", side_effect=Runner(table)), mock.patch.object(cm, "is_macos", return_value=True):
+            with mock.patch.object(sm, "_run", side_effect=Runner(table)), mock.patch.object(cm, "is_macos", return_value=True):
                 rc, _, err = self.main("uninstall")
             self.assertEqual(rc, 1, table)
             self.assertTrue(plist.exists() and cli.config_path().exists(), "kept after an unconfirmed stop")
             self.assertIn(f"Manual recovery: 1. stop the job by hand: launchctl bootout --wait {SERVICE_TARGET}", err)
             self.assertIn(f"3. re-run {cli.COMMAND} uninstall", err)
-            with mock.patch.object(cm, "_run", side_effect=Runner({("launchctl", "bootout"): 3, ("launchctl", "print"): NOT_LOADED})), \
+            with mock.patch.object(sm, "_run", side_effect=Runner({("launchctl", "bootout"): 3, ("launchctl", "print"): NOT_LOADED})), \
                     mock.patch.object(cm, "is_macos", return_value=True):
                 self.assertEqual(self.main("uninstall")[0], 0, "bootout said no such process and print confirms it: absent")
 
@@ -1247,7 +1247,7 @@ class ConnectUninstall(ConnectBase):
         keeper = runner.session
         runner.session = None                                  # the stop verb reaches nobody: the holder stays
         try:
-            with mock.patch.object(cm, "_run", side_effect=Runner({})):
+            with mock.patch.object(sm, "_run", side_effect=Runner({})):
                 rc, _, err = self.main("uninstall")
             self.assertEqual(rc, 1)
             self.assertIn(f"{self.work} is held by launcher pid {keeper.pid}; ", err)
@@ -1258,7 +1258,7 @@ class ConnectUninstall(ConnectBase):
             self.assertTrue(cli.service_path().exists() and cli.config_path().exists())
         finally:
             unhold(keeper)
-        with mock.patch.object(cm, "_run", side_effect=Runner({})):
+        with mock.patch.object(sm, "_run", side_effect=Runner({})):
             self.assertEqual(self.main("uninstall")[0], 0, "re-run once the root is free")
         self.assertFalse(cli.config_path().exists())
 
@@ -1270,7 +1270,7 @@ class ConnectUninstall(ConnectBase):
         cm._write(cli.service_path(), cm.render_service(L, "/x"), 0o644)
         holder = hold(str(self.work), script=UNPUBLISHED)
         try:
-            with mock.patch.object(cm, "_run", side_effect=Runner({})):
+            with mock.patch.object(sm, "_run", side_effect=Runner({})):
                 rc, _, err = self.main("uninstall")
             self.assertEqual(rc, 1)
             self.assertIn("held by an unrecorded holder", err)
@@ -1285,23 +1285,23 @@ class ConnectUninstall(ConnectBase):
         self.runners[-1].stop_session()
         for table in ({("systemctl", "stop"): 0, ("systemctl", "show"): SHOW("loaded", "active", "enabled")},
                       {("systemctl", "stop"): None}):
-            with mock.patch.object(cm, "_run", side_effect=Runner(table)):
+            with mock.patch.object(sm, "_run", side_effect=Runner(table)):
                 rc, _, err = self.main("uninstall")
             self.assertEqual(rc, 1, table)
             self.assertIn("Manual recovery", err)
             self.assertTrue(cli.service_path().exists() and cli.config_path().exists())
         for table in ({("systemctl", "stop"): 1, ("systemctl", "show"): (1, "", "Failed to connect to bus\n")},
                       {("systemctl", "show"): None}):
-            with mock.patch.object(cm, "_run", side_effect=Runner(table)):
+            with mock.patch.object(sm, "_run", side_effect=Runner(table)):
                 rc, _, err = self.main("uninstall")
             self.assertEqual((rc, "state is unknown; nothing was removed" in err), (1, True), table)
             self.assertTrue(cli.service_path().exists() and cli.config_path().exists())
-        with mock.patch.object(cm, "_run", side_effect=self.runner()), mock.patch.object(cm, "lock_held", return_value="unknown"):
+        with mock.patch.object(sm, "_run", side_effect=self.runner()), mock.patch.object(cm, "lock_held", return_value="unknown"):
             rc, _, err = self.main("uninstall")
         self.assertEqual(rc, 1)
         self.assertIn("unknown (the lock of", err)
         self.assertTrue(cli.config_path().exists(), "a lock error keeps everything")
-        with mock.patch.object(cm, "_run", side_effect=self.runner({("systemctl", "stop"): 1})):
+        with mock.patch.object(sm, "_run", side_effect=self.runner({("systemctl", "stop"): 1})):
             self.assertEqual(self.main("uninstall")[0], 0, "stop failed but the unit is confirmed inactive and disabled")
 
     def test_files_install_did_not_write_are_kept_and_named(self):
@@ -1746,7 +1746,7 @@ class ConnectOwnership(ConnectBase):
             self.assertIn("is not parsable", err)
             self.assertFalse(other.exists())
             self.assertEqual(cfg.read_text(), bad, "preserved")
-            with mock.patch.object(cm, "_run", side_effect=self.runner()) as r:
+            with mock.patch.object(sm, "_run", side_effect=self.runner()) as r:
                 rc, _, err = self.main("uninstall")
             self.assertEqual(rc, 1)
             self.assertIn("is not parsable", err)
@@ -1779,8 +1779,8 @@ class ConnectBranches(ConnectBase):
                 mock.patch.object(cm.shutil, "which", return_value=None):
             self.assertEqual(cm.console_script(L), "")
             self.assertIn("was not found beside", cm.render_supervisor(L)[1])
-        self.assertTrue(cm._ok(cm._run(["true"])))
-        self.assertIsNone(cm._run([str(self.home / "no-such-program")]))
+        self.assertTrue(cm._ok(sm._run(["true"])))
+        self.assertIsNone(sm._run([str(self.home / "no-such-program")]))
         self.assertEqual(cm._why(None), "could not run")
         self.assertEqual(cm._why(subprocess.CompletedProcess([], 4, "", "")), "exit 4")
         self.assertEqual(cm._why(subprocess.CompletedProcess([], 1, "", "a\nlast line\n")), "last line")
@@ -1806,20 +1806,20 @@ class ConnectBranches(ConnectBase):
                           (SHOW("loaded", "inactive", "disabled"), "registered"), (SHOW("not-found", "inactive", "enabled"), "registered"),
                           (SHOW("loaded", "inactive", "enabled"), "registered"), ((1, "", "Failed to connect to bus\n"), "unknown"),
                           (SHOW("odd", "inactive", "disabled"), "unknown"), (None, "unknown")):
-            with mock.patch.object(cm, "_run", side_effect=Runner({("systemctl", "show"): got})) as r:
+            with mock.patch.object(sm, "_run", side_effect=Runner({("systemctl", "show"): got})) as r:
                 self.assertEqual(cm.unit_active(L), want, got)
-            self.assertEqual(r.side_effect.calls[0], ["systemctl", "--user", "--no-ask-password", "show", "-p",
+            self.assertEqual(r.side_effect.calls[0], ["systemctl", "--no-ask-password", "--user", "show", "-p",
                                                       "LoadState,ActiveState,UnitFileState", "--value", cli.SERVICE_NAME])
         for got, want in ((0, "active"), (NOT_LOADED, "absent"), ((113, "", "Bad request\n"), "unknown"), (None, "unknown")):
-            with mock.patch.object(cm, "_run", side_effect=Runner({("launchctl", "print"): got})) as r:
+            with mock.patch.object(sm, "_run", side_effect=Runner({("launchctl", "print"): got})) as r:
                 self.assertEqual(cm.agent_loaded(L), want, got)
             self.assertEqual(r.side_effect.calls[0], ["launchctl", "print", SERVICE_TARGET])
-        with mock.patch.object(cm, "_run", side_effect=Runner({("systemctl", "show"): None})):
+        with mock.patch.object(sm, "_run", side_effect=Runner({("systemctl", "show"): None})):
             self.assertEqual(cm.unit_load_state(L), "unknown")
         with mock.patch.object(cm, "is_macos", return_value=True), \
-                mock.patch.object(cm, "_run", side_effect=Runner({("launchctl", "print"): 0})):
+                mock.patch.object(sm, "_run", side_effect=Runner({("launchctl", "print"): 0})):
             self.assertEqual(cm.manager_state(L), "active")
-        with mock.patch.object(cm, "_run", side_effect=Runner({("loginctl", "enable-linger"): 1})), \
+        with mock.patch.object(sm, "_run", side_effect=Runner({("loginctl", "enable-linger"): 1})), \
                 contextlib.redirect_stdout(io.StringIO()) as out:
             cm.linger(L)
         self.assertIn("enable-linger owner failed", out.getvalue())
@@ -2021,7 +2021,7 @@ class ConnectVerify(ConnectBase):
         self.assertEqual(self.install_with(runner)[0], 0)
         (self.home / "task-hmac.key").write_text("ab" * 32)
         self.status()
-        with mock.patch.object(cm, "_run", side_effect=runner):
+        with mock.patch.object(sm, "_run", side_effect=runner):
             rc, out, _ = self.main("verify")
         self.assertEqual(rc, 0, out)
         self.assertEqual(set(self.checks(out).values()), {"PASS"}, out)
@@ -2141,7 +2141,7 @@ class AgentRootBase(ConnectBase):
         return BridgeFake(runner)
 
     def install_default(self, fake, *extra, mac=False):
-        with mock.patch.object(cm, "_run", side_effect=fake), mock.patch.object(cm, "is_macos", return_value=mac):
+        with mock.patch.object(sm, "_run", side_effect=fake), mock.patch.object(cm, "is_macos", return_value=mac):
             return self.main("install", "--plugin-dir", str(self.plugin), "--claude-config-dir", str(self.home / ".claude-sutando"),
                              "--hmac-key-file", str(self.home / "task-hmac.key"), *extra)
 
@@ -2200,7 +2200,7 @@ class ConnectAgentRoot(AgentRootBase):
         state = cli.bridge_home(self.root) / "state"
         self.status(state, agent_id=AGENT, tasks_dir=os.path.realpath(self.root / "tasks"),
                     results_dir=os.path.realpath(self.root / "results"))
-        with mock.patch.object(cm, "_run", side_effect=fake):
+        with mock.patch.object(sm, "_run", side_effect=fake):
             rc, out, _ = self.main("verify")
             checks = ConnectVerify.checks(None, out)
             self.assertEqual((checks["bridge"], checks["relay"], checks["hitl"]), ("PASS", "PASS", "PASS"), out)
@@ -2228,7 +2228,7 @@ class ConnectAgentRoot(AgentRootBase):
         fake = self.bridged()
         self.assertEqual(self.install_default(fake)[0], 0)
         fake.calls.clear()
-        with mock.patch.object(cm, "_run", side_effect=fake):
+        with mock.patch.object(sm, "_run", side_effect=fake):
             rc, out, err = self.main("uninstall")
         self.assertEqual(rc, 0, err)
         self.assertEqual(fake.verbs(), ["show", "stop", "disable", "show"])
@@ -2239,7 +2239,7 @@ class ConnectAgentRoot(AgentRootBase):
         fake = self.bridged()
         self.assertEqual(self.install_default(fake)[0], 0)
         cm.service_path(cli.BRIDGE).write_text("[Service]\nExecStart=/mine\n")
-        with mock.patch.object(cm, "_run", side_effect=fake):
+        with mock.patch.object(sm, "_run", side_effect=fake):
             rc, _, err = self.main("uninstall")
         self.assertEqual(rc, 1)
         self.assertIn("was not written by install", err)
@@ -2256,14 +2256,14 @@ class ConnectAgentRoot(AgentRootBase):
             self.assertIn(why, err)
             fake.table = {}
         fake.table = {"show": None}
-        with mock.patch.object(cm, "_run", side_effect=fake):
+        with mock.patch.object(sm, "_run", side_effect=fake):
             rc, _, err = self.main("uninstall")
         self.assertEqual((rc, "state is unknown" in err), (1, True))
         fake.table = {"stop": None}
-        with mock.patch.object(cm, "_run", side_effect=fake):
+        with mock.patch.object(sm, "_run", side_effect=fake):
             self.assertEqual(self.main("uninstall")[0], 1)
         fake.table = {}
-        with mock.patch.object(cm, "_run", side_effect=fake):
+        with mock.patch.object(sm, "_run", side_effect=fake):
             self.assertEqual(self.main("uninstall")[0], 0)
         with mock.patch.object(cm, "console_script",
                                side_effect=lambda shape: "" if shape is cli.BRIDGE else str(self.bin / shape.command)):
@@ -2305,7 +2305,7 @@ class ConnectAgentRoot(AgentRootBase):
         self.assertEqual(self.cfg()["ROOT"], str(bound), "bind first: the host's binding names its own token's agent")
         other = self.home / "second.env"
         other.write_text(f"REMOTE_TASK_TOKEN={TOKEN}\n")
-        with mock.patch.object(cm, "_run", side_effect=fake):
+        with mock.patch.object(sm, "_run", side_effect=fake):
             self.assertEqual(self.main("uninstall")[0], 0)
         rc, _, err = self.install_default(self.bridged(), "--token-env-file", str(other))
         self.assertEqual(rc, 2)
@@ -2362,7 +2362,7 @@ class ConnectAgentRoot(AgentRootBase):
         self.assertEqual(rc, 2)
         self.assertIn(f"--bridge-state-dir is for a bridge you run (an explicit root); this install's bridge keeps its "
                       f"state beside the root, {beside}", err)
-        with mock.patch.object(cm, "_run", side_effect=fake):
+        with mock.patch.object(sm, "_run", side_effect=fake):
             self.assertEqual(self.main("uninstall")[0], 0)
         other = self.home / "other-bridge" / "state"
         runner = self.runner()
@@ -2371,7 +2371,7 @@ class ConnectAgentRoot(AgentRootBase):
         self.assertEqual((self.cfg()["BRIDGE"], self.cfg()["BRIDGE_STATE_DIR"], self.cfg()["HITL_STORE"]),
                          ("external", str(other), str(card.store_root(other))))
         self.status(other, agent_id=AGENT)
-        with mock.patch.object(cm, "_run", side_effect=runner):
+        with mock.patch.object(sm, "_run", side_effect=runner):
             rc, out, _ = self.main("verify")
             checks = ConnectVerify.checks(None, out)
             self.assertEqual((checks["bridge"], checks["hitl"]), ("PASS", "PASS"), out)
@@ -2429,14 +2429,14 @@ class ConnectHostSupervised(AgentRootBase):
         for a, b in (("probe.agent_ag2.space", "probe-agent_ag2.space"), ("a_b", "a.b")):
             self.assertNotEqual(cli.worker_name(a), cli.worker_name(b), "two agents never share a worker name")
             self.assertNotEqual(cli.vault_key(a), cli.vault_key(b))
-        with mock.patch.object(cm, "_run", side_effect=fake):
+        with mock.patch.object(sm, "_run", side_effect=fake):
             out = self.main("verify")[1]
         self.assertIn(f"INFO relay token: the vault key {cli.vault_key(seg)}, read by sparrowd at start", out)
         self.assertIn(f"FAIL bridge: no bridge wrote a status under {self.root}.bridge/state", out)
         self.assertIn(f"sparrowd runs {self.decl()} on its next scan of the declarations: start it if it is not "
                       f"running (src/sparrowd.py)", out)
         self.assertNotIn("relay token:", [ln.split(" ", 1)[1][:12] for ln in out.splitlines() if ln.startswith(("PASS", "FAIL"))])
-        with mock.patch.object(cm, "_run", side_effect=fake):
+        with mock.patch.object(sm, "_run", side_effect=fake):
             rc, out, err = self.main("uninstall")
         self.assertEqual(rc, 0, err)
         self.assertIn(f"removed: {self.decl()}", out)
@@ -2452,11 +2452,11 @@ class ConnectHostSupervised(AgentRootBase):
             self.assertEqual(rc, 2, err)
             self.assertIn("was not written by install", err)
             self.assertEqual(self.decl().read_text(), text)
-            with mock.patch.object(cm, "_run", side_effect=fake):
+            with mock.patch.object(sm, "_run", side_effect=fake):
                 self.assertEqual(self.main("uninstall")[0], 1)
             self.assertTrue(cli.config_path().exists())
         self.decl().unlink()
-        with mock.patch.object(cm, "_run", side_effect=fake):
+        with mock.patch.object(sm, "_run", side_effect=fake):
             self.assertEqual(self.main("uninstall")[0], 0)
 
     def test_the_host_names_no_token_file_and_needs_the_id_from_the_environment(self):
@@ -2486,7 +2486,7 @@ class ConnectOccupancy(ConnectBase):
         self.configure()
         work = str(self.work)
         restarting = SHOWING(LoadState="loaded", ActiveState="activating", SubState="auto-restart", UnitFileState="enabled")
-        with mock.patch.object(cm, "_run", side_effect=Runner({("systemctl", "show"): restarting})):
+        with mock.patch.object(sm, "_run", side_effect=Runner({("systemctl", "show"): restarting})):
             out = self.main("verify")[1]
         self.assertIn(f"INFO session: {work} restarting (manager activating/auto-restart, lock free)", out)
         self.assertNotIn(f"INFO session: {work} free", out)
@@ -2494,35 +2494,35 @@ class ConnectOccupancy(ConnectBase):
         holder = hold(work, "claude-local")
         try:
             running = SHOWING(LoadState="loaded", ActiveState="active", SubState="running", UnitFileState="enabled")
-            with mock.patch.object(cm, "_run", side_effect=Runner({("systemctl", "show"): running})):
+            with mock.patch.object(sm, "_run", side_effect=Runner({("systemctl", "show"): running})):
                 out = self.main("verify")[1]
             self.assertIn(f"INFO session: {work} held by hold pid {holder.pid}, no live claude attached (manager active/running)", out)
-            with mock.patch.object(cm, "_run", side_effect=Runner({})):
+            with mock.patch.object(sm, "_run", side_effect=Runner({})):
                 self.assertIn(f"INFO session: {work} held by hold pid {holder.pid}, no live claude attached (manager absent)", self.main("verify")[1])
         finally:
             unhold(holder)
-        with mock.patch.object(cm, "_run", side_effect=Runner({})):
+        with mock.patch.object(sm, "_run", side_effect=Runner({})):
             self.assertIn(f"INFO session: {work} free (no job)", self.main("verify")[1])
         stopped = SHOWING(LoadState="loaded", ActiveState="inactive", SubState="dead", UnitFileState="disabled")
-        with mock.patch.object(cm, "_run", side_effect=Runner({("systemctl", "show"): stopped})):
+        with mock.patch.object(sm, "_run", side_effect=Runner({("systemctl", "show"): stopped})):
             self.assertIn(f"INFO session: {work} free (manager inactive/dead)", self.main("verify")[1])
-        with mock.patch.object(cm, "_run", side_effect=Runner({("systemctl", "show"): None})):
+        with mock.patch.object(sm, "_run", side_effect=Runner({("systemctl", "show"): None})):
             self.assertIn(f"INFO session: {work} free (manager unknown)", self.main("verify")[1])
         live = (0, "ai.ag2.sparrow.claude-local = {\n\tactive count = 1\n\tpid = 4242\n\tstate = running\n}\n", "")
         with mock.patch.object(cm, "is_macos", return_value=True):
-            with mock.patch.object(cm, "_run", side_effect=Runner({("launchctl", "print"): live})):
+            with mock.patch.object(sm, "_run", side_effect=Runner({("launchctl", "print"): live})):
                 out = self.main("verify")[1]
             self.assertIn(f"INFO session: {work} restarting (manager pid 4242, state running, lock free)", out)
             self.assertNotIn("KillMode", out)
             self.assertIn(f"INFO launchd respawns the launcher after {cm.THROTTLE_S} s; the session in its tmux pane is not in "
                           "the launcher's process group and survives a launcher death until the next launcher adopts it", out)
-            with mock.patch.object(cm, "_run", side_effect=Runner({("launchctl", "print"): (0, "\tstate = waiting\n", "")})):
+            with mock.patch.object(sm, "_run", side_effect=Runner({("launchctl", "print"): (0, "\tstate = waiting\n", "")})):
                 self.assertIn(f"INFO session: {work} restarting (manager state waiting, lock free)", self.main("verify")[1])
-            with mock.patch.object(cm, "_run", side_effect=Runner({("launchctl", "print"): NOT_LOADED})):
+            with mock.patch.object(sm, "_run", side_effect=Runner({("launchctl", "print"): NOT_LOADED})):
                 self.assertIn(f"INFO session: {work} free (no job)", self.main("verify")[1])
             holder = hold(work, "claude-local")
             try:
-                with mock.patch.object(cm, "_run", side_effect=Runner({("launchctl", "print"): live})):
+                with mock.patch.object(sm, "_run", side_effect=Runner({("launchctl", "print"): live})):
                     self.assertIn(f"INFO session: {work} held by hold pid {holder.pid}, no live claude attached (manager pid 4242, state running)",
                                   self.main("verify")[1])
             finally:
@@ -2531,12 +2531,12 @@ class ConnectOccupancy(ConnectBase):
     def test_manager_detail_reads_explicit_outputs_only(self):
         for got, want in (((0, "", ""), "loaded"), ((1, "", "odd\n"), "unknown"), (NOT_LOADED, "absent"), (None, "unknown")):
             with mock.patch.object(cm, "is_macos", return_value=True), \
-                    mock.patch.object(cm, "_run", side_effect=Runner({("launchctl", "print"): got})):
+                    mock.patch.object(sm, "_run", side_effect=Runner({("launchctl", "print"): got})):
                 self.assertEqual(cm.manager_detail(L), want, got)
         for got, want in ((None, "unknown"), ((1, "", "bus\n"), "unknown"), ((0, "\n\n", ""), "unknown"),
                           (SHOWING(LoadState="not-found", ActiveState="inactive", SubState="dead", UnitFileState="disabled"), "absent"),
                           (SHOWING(LoadState="loaded", ActiveState="failed", SubState="failed", UnitFileState="enabled"), "failed/failed")):
-            with mock.patch.object(cm, "_run", side_effect=Runner({("systemctl", "show"): got})):
+            with mock.patch.object(sm, "_run", side_effect=Runner({("systemctl", "show"): got})):
                 self.assertEqual(cm.manager_detail(L), want, got)
 
 
@@ -3088,7 +3088,7 @@ class InboxCli(ConnectBase):
     def test_a_resolving_interrupt_clears_the_durable_stuck_mark_whatever_the_mod_remembers(self):
         t = self.task("task-marked")
         self.assertEqual(self.verb("progress", "--stuck", t, "--stuck-detail", "parked before a restart")[0], 0)
-        with mock.patch.object(cm, "_run", side_effect=self.runner(root=False)):
+        with mock.patch.object(sm, "_run", side_effect=self.runner(root=False)):
             self.assertIn("FAIL unanswered", self.main("verify")[1])
             rc, out = self.verb("interrupt", t)
             self.assertEqual((rc, out["resolved"], out["answered"]), (0, True, True))
@@ -3107,7 +3107,7 @@ class InboxCli(ConnectBase):
         self.assertEqual(self.verb("progress", "--stuck", "task-gone", "--stuck-detail", "parked")[0], 0)
         self.assertIn("task-gone", records.load_plugin(self.root)["stuck"])
         (self.results / "task-gone.txt").write_text("published by another route\n")
-        with mock.patch.object(cm, "_run", side_effect=self.runner(root=False)):
+        with mock.patch.object(sm, "_run", side_effect=self.runner(root=False)):
             self.assertNotIn("unanswered", self.main("verify")[1])
         lc = launcher.Launcher(dict(cli.read_config(cli.config_path()), ROOT=self.root), cli.config_dir())
         with mock.patch.object(lc.tm, "capture", return_value="pane"):
@@ -3515,7 +3515,7 @@ class InboxCli(ConnectBase):
         with mock.patch.object(records, "write_progress", side_effect=records.RecordError("still broken")):
             self.assertEqual(self.verb("claim", t)[0], 3)
         self.assertEqual(records.read_progress_alarm(cli.config_dir())["since"], alarm["since"], "the first failure's time")
-        with mock.patch.object(cm, "_run", side_effect=self.runner(root=False)):
+        with mock.patch.object(sm, "_run", side_effect=self.runner(root=False)):
             out = self.main("verify")[1]
         self.assertIn("FAIL progress: progress record unwritable since", out)
         lc = launcher.Launcher(dict(cli.read_config(cli.config_path()), ROOT=self.root), cli.config_dir())
@@ -3526,12 +3526,12 @@ class InboxCli(ConnectBase):
         self.assertIn("still broken", obs["stall"]["checks"])
         self.assertEqual(self.verb("progress", "--intake", "open")[0], 0, "the first durable write")
         self.assertEqual(records.read_progress_alarm(cli.config_dir()), {})
-        with mock.patch.object(cm, "_run", side_effect=self.runner(root=False)):
+        with mock.patch.object(sm, "_run", side_effect=self.runner(root=False)):
             self.assertNotIn("FAIL progress", self.main("verify")[1])
         self.assertIsNone(detector.derive({}, "pane", records.load_plugin(self.root), 1.0)["stall"])
         records.progress_alarm_path(cli.config_dir()).write_text("[")
         self.assertEqual(records.read_progress_alarm(cli.config_dir())["since"], None, "an unreadable alarm stays raised")
-        with mock.patch.object(cm, "_run", side_effect=self.runner(root=False)):
+        with mock.patch.object(sm, "_run", side_effect=self.runner(root=False)):
             self.assertIn("since an unknown time", self.main("verify")[1])
         obs = detector.derive({}, "pane", {"progress_unwritable": {"since": None, "error": "x"}}, 5.0)
         self.assertEqual(obs["stall"]["since"], 5.0)
@@ -3550,7 +3550,7 @@ class InboxCli(ConnectBase):
         self.assertEqual((obs["stall"]["reason"], obs["stall"]["task"]), ("abnormal:task-unanswered", "task-s"))
         self.assertEqual(detector.derive(obs, "other pane", records.load_plugin(self.root), 2000.0)["stall"], obs["stall"],
                          "the same stall across ticks, so one card")
-        with mock.patch.object(cm, "_run", side_effect=self.runner(root=False)):
+        with mock.patch.object(sm, "_run", side_effect=self.runner(root=False)):
             out = self.main("verify")[1]
         self.assertIn("FAIL unanswered: tasks without an answer, retried with backoff: task-s since", out)
         self.assertIn("(still parked)", out)
@@ -4739,7 +4739,7 @@ class LauncherTmux(ConnectBase):
         real_free, real_stray = cm._await_free, cli.stop_stray
         with mock.patch.object(cm, "_await_free", lambda root, *a, **k: order.append("free") or real_free(root, *a, **k)), \
                 mock.patch.object(cli, "stop_stray", lambda cfg: order.append("stray") or real_stray(cfg)), \
-                mock.patch.object(cm, "_run", side_effect=self.runner(root=False)):
+                mock.patch.object(sm, "_run", side_effect=self.runner(root=False)):
             rc, out, err = self.main("uninstall")
         self.assertEqual(rc, 0, out + err)
         self.assertEqual(order[:2], ["stray", "free"], "the session stopped through the fence before the root must read free")
@@ -6088,13 +6088,13 @@ class StartupDialogAndRefusals(ConnectBase):
 
     def test_verify_fails_on_a_pane_waiting_at_a_dialog_and_reports_the_trust_record(self):
         runner = self.runner()
-        with mock.patch.object(cm, "_run", side_effect=runner):
+        with mock.patch.object(sm, "_run", side_effect=runner):
             rc, out, _ = self.main("verify")
         self.assertIn(f"INFO folder trust: {self.inbox} not recorded (the launcher records it before it creates the session)", out)
         self.assertNotIn("FAIL session", out)
         self.assertEqual(trust.record(self.cfg["CLAUDE_CONFIG_DIR"], str(self.inbox)), "")
         records.save_supervisor(str(self.work), dict(records.empty_supervisor(), generation=GEN))
-        with mock.patch.object(cm, "_run", side_effect=runner), \
+        with mock.patch.object(sm, "_run", side_effect=runner), \
                 mock.patch.object(launcher.Tmux, "has_session", return_value=True), \
                 mock.patch.object(launcher.Tmux, "capture", return_value=TRUST_PANE):
             rc, out, _ = self.main("verify")
@@ -6108,7 +6108,7 @@ class StartupDialogAndRefusals(ConnectBase):
                 self.assertIsNone(cli.pane_dialog(records.load_supervisor(str(self.work))))
         self.assertIsNone(cli.pane_dialog({}))
         Path(trust.config_file(self.cfg["CLAUDE_CONFIG_DIR"])).write_text("[1]")
-        with mock.patch.object(cm, "_run", side_effect=runner):
+        with mock.patch.object(sm, "_run", side_effect=runner):
             out = self.main("verify")[1]
         self.assertIn(f"INFO folder trust: {self.inbox} unreadable (it is not a JSON object)", out)
 
@@ -6138,7 +6138,7 @@ class StartupDialogAndRefusals(ConnectBase):
         self.relay.unlink()
         self.assertEqual(cm.kept_line(cli.LOCAL), "kept: the Claude login")
         cli.config_path().unlink()
-        with mock.patch.object(cm, "_run", side_effect=Runner()):
+        with mock.patch.object(sm, "_run", side_effect=Runner()):
             rc, out, _ = self.main("uninstall")
         self.assertEqual(rc, 0)
         self.assertIn("nothing to remove", out)

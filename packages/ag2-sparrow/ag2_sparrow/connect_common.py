@@ -34,7 +34,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import _dirs
+from . import _dirs, service_manager as _sm
 from .task_io import LockRefused, acquire_lock, install_id, lock_held, lock_holder, lock_path, release_lock
 
 EXIT_HELD = 75          # another session holds this work root: a supervisor must not relaunch over it
@@ -380,14 +380,6 @@ def render_supervisor(shape: Shape, env=None) -> "tuple[str, str]":
 
 # ── the manager: explicit outputs only ───────────────────────────────────────
 
-def _run(cmd: list, timeout: float = RUN_TIMEOUT_S) -> "subprocess.CompletedProcess | None":
-    """A manager command; None when it could not run or did not return in time. Never prompts."""
-    try:
-        return subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout)
-    except (OSError, subprocess.SubprocessError):
-        return None
-
-
 def _ok(r) -> bool:
     return r is not None and r.returncode == 0
 
@@ -407,14 +399,11 @@ def _launchd_target() -> str:
     return f"gui/{os.getuid()}"
 
 
-def _systemctl(*args, timeout: float = RUN_TIMEOUT_S) -> "subprocess.CompletedProcess | None":
-    return _run(["systemctl", "--user", "--no-ask-password", *args], timeout)
-
-
 def unit_state(shape: Shape) -> dict:
     """{load, active, enabled} from one `systemctl show --value` (its own words only); every field
     'unknown' when it cannot be read."""
-    r = _systemctl("show", "-p", "LoadState,ActiveState,UnitFileState", "--value", shape.service_name)
+    r = _sm._systemctl(("--user", "show", "-p", "LoadState,ActiveState,UnitFileState", "--value"),
+                       unit=shape.service_name)
     words = (r.stdout or "").split("\n") if r is not None and r.returncode == 0 else []
     words = [w.strip() for w in words] + ["", "", ""]
     load, active, enabled = words[0], words[1], words[2]
@@ -447,7 +436,7 @@ def launchd_service(shape: Shape) -> str:
 def agent_loaded(shape: Shape) -> str:
     """active | absent | unknown, from `launchctl print`'s exit and its documented not-found error only;
     a registered launchd job is a running one (KeepAlive)."""
-    r = _run(["launchctl", "print", launchd_service(shape)])
+    r = _sm._run(["launchctl", "print", launchd_service(shape)])
     if r is None:
         return "unknown"
     if r.returncode == 0:
@@ -465,7 +454,7 @@ def manager_detail(shape: Shape) -> str:
     `ActiveState/SubState` (`active/running`, `activating/auto-restart`); launchd's `pid = N` and
     `state = …` lines from `launchctl print`; 'absent' or 'unknown' from the same probes."""
     if is_macos():
-        r = _run(["launchctl", "print", launchd_service(shape)])
+        r = _sm._run(["launchctl", "print", launchd_service(shape)])
         if r is None:
             return "unknown"
         if r.returncode != 0:
@@ -473,7 +462,7 @@ def manager_detail(shape: Shape) -> str:
         found = dict(re.findall(r"^\s*(pid|state) = (\S+)", r.stdout or "", re.M))
         words = [f"{k} {found[k]}" for k in ("pid", "state") if k in found]
         return ", ".join(words) if words else "loaded"
-    r = _systemctl("show", "-p", "ActiveState,SubState", "--value", shape.service_name)
+    r = _sm._systemctl(("--user", "show", "-p", "ActiveState,SubState", "--value"), unit=shape.service_name)
     if r is None or r.returncode != 0:
         return "unknown"
     active, sub = ((r.stdout or "").split("\n") + ["", ""])[:2]
@@ -494,14 +483,17 @@ def start_supervisor(shape: Shape) -> str:
     path = supervisor_path(shape)
     if is_macos():
         log_path(shape).parent.mkdir(parents=True, exist_ok=True)
-        r = _run(["launchctl", "bootstrap", _launchd_target(), str(path)], shape.manager_timeout_s)
+        r = _sm._run(["launchctl", "bootstrap", _launchd_target(), str(path)], shape.manager_timeout_s)
         return "" if _ok(r) else f"launchctl bootstrap failed ({_why(r)})"
-    if not _ok(_systemctl("show-environment")):
+    if not _sm.systemd_user_available():
         return "systemctl --user is not available here"
-    for verb in (("daemon-reload",), ("enable", shape.service_name), ("restart", shape.service_name)):
-        r = _systemctl(*verb, timeout=shape.manager_timeout_s)
+    unit, bound = shape.service_name, shape.manager_timeout_s
+    for verb, run in (("daemon-reload", lambda: _sm._systemctl(("--user", "daemon-reload"), timeout=bound)),
+                      (f"enable {unit}", lambda: _sm._systemctl(("--user", "enable"), unit=unit, timeout=bound)),
+                      (f"restart {unit}", lambda: _sm._systemctl(("--user", "restart"), unit=unit, timeout=bound))):
+        r = run()
         if not _ok(r):
-            return f"systemctl --user {' '.join(verb)} failed ({_why(r)})"
+            return f"systemctl --user {verb} failed ({_why(r)})"
     return ""
 
 
@@ -510,7 +502,7 @@ def stop_supervisor(shape: Shape) -> str:
     systemd: stop + disable) and require its own word for it: '' once launchd reports it absent or
     systemd reports it inactive and disabled, else why not."""
     if is_macos():
-        r = _run(["launchctl", "bootout", "--wait", launchd_service(shape)], shape.manager_timeout_s)
+        r = _sm._run(["launchctl", "bootout", "--wait", launchd_service(shape)], shape.manager_timeout_s)
         if r is None:
             return f"the stop command for {job_name(shape)} could not run"
         state = manager_state(shape)
@@ -518,10 +510,10 @@ def stop_supervisor(shape: Shape) -> str:
             return ""
         return (f"{job_name(shape)} is still active after the stop ({_why(r)})" if state == "active" else
                 f"{job_name(shape)}'s state after the stop is unknown ({_why(r)})")
-    r = _systemctl("stop", shape.service_name, timeout=shape.manager_timeout_s)
+    r = _sm._systemctl(("--user", "stop"), unit=shape.service_name, timeout=shape.manager_timeout_s)
     if r is None:
         return f"the stop command for {job_name(shape)} could not run"
-    _systemctl("disable", shape.service_name)
+    _sm._systemctl(("--user", "disable"), unit=shape.service_name)
     st = unit_state(shape)
     if st["active"] == "inactive" and st["enabled"] == "disabled":
         return ""
@@ -535,7 +527,7 @@ def linger(shape: Shape) -> None:
         print(f"loaded: {shape.agent_label} (it stops at logout and starts again at your next login)")
         return
     user = os.environ.get("USER") or os.environ.get("LOGNAME") or ""
-    r = _run(["loginctl", "--no-ask-password", "enable-linger", user]) if user else None
+    r = _sm._run(["loginctl", "--no-ask-password", "enable-linger", user]) if user else None
     print(f"linger: enabled for {user}, so the session runs while you are logged out" if _ok(r) else
           f"NOTE: loginctl enable-linger {user or '$USER'} failed ({_why(r)}); the session stops at logout until "
           "an administrator runs it")
@@ -904,7 +896,7 @@ def _uninstall_locked(shape: Shape, before_free=None, token_file=None) -> int:
         sup.unlink()
         print(f"removed: {sup}")
     if not is_macos():
-        r = _systemctl("daemon-reload")
+        r = _sm._systemctl(("--user", "daemon-reload"))
         if not _ok(r):
             return _refuse(f"systemctl --user daemon-reload failed ({_why(r)}); {kept}; run uninstall again", recovery)
         if unit_load_state(shape) != "not-found":
