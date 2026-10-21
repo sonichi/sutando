@@ -20,6 +20,13 @@ fake `_req`. Run: python3 tests/gateway-owner-dm-must-be-private.test.py
 """
 from __future__ import annotations
 
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ(SUTANDO_TEST_MODE="1", AG2_DEVICE_ENV="", REMOTE_TASK_URL="http://127.0.0.1:9",
+                   REMOTE_TASK_TOKEN="t", REMOTE_PROACTIVE_ROOM="!team:example.org",
+                   AGENT_MXID="@agent:example.org")
+
 import importlib.util
 import json
 import os
@@ -74,10 +81,7 @@ class Gateway:
 
 def load(ws: Path, gw: Gateway):
     cfg = Path(tempfile.mkdtemp(prefix="gw-private-cfg-"))
-    os.environ.update({"SUTANDO_TEST_MODE": "1", "SUTANDO_WORKSPACE": str(ws),
-                       "CLAUDE_CONFIG_DIR": str(cfg), "AG2_DEVICE_ENV": "",
-                       "REMOTE_TASK_URL": "http://127.0.0.1:9", "REMOTE_TASK_TOKEN": "t",
-                       "REMOTE_PROACTIVE_ROOM": TEAM, "AGENT_MXID": AGENT})
+    os.environ.update({"SUTANDO_WORKSPACE": str(ws), "CLAUDE_CONFIG_DIR": str(cfg)})
     os.environ.pop("GATEWAY_INSTANCE", None)
     name = f"rgb_private_dm_{time.monotonic_ns()}"
     spec = importlib.util.spec_from_file_location(name, _SRC)
