@@ -34,6 +34,10 @@ from _helpers.credential_scope import CREDENTIAL_NAME
 
 # The only outer variables carried; none of them names a credential source.
 HOST_ALLOWLIST = ("PATH", "LANG", "TMPDIR")
+# The documented opt-in that lets node tests find jsdom: a path to modules, not a credential selector.
+MODULE_PATH_ALLOWLIST = ("NODE_PATH",)
+# All a runtime harness's environment.json may hand a test: where to find programs and modules.
+HARNESS_KEYS = ("PATH", "PYTHONPATH", "TMPDIR", "LANG")
 # Windows cannot start a process without these (SYSTEMROOT seeds its RNG); none names a credential.
 WINDOWS_ALLOWLIST = ("SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC", "PATHEXT", "TEMP", "TMP")
 # The suite runner's coverage controls, so a converted test and its children stay measured.
@@ -107,7 +111,7 @@ def hermetic_env(home: "Path | str | None" = None, **extra: str) -> "dict[str, s
     """The allowlisted host and test-control variables, a temp HOME, a fixed USER, telemetry off, then `extra`.
 
     Without `home`, an isolated process's own temp HOME is reused, so its children share it."""
-    allowed = HOST_ALLOWLIST + HARNESS_ALLOWLIST + (WINDOWS_ALLOWLIST if os.name == "nt" else ())
+    allowed = HOST_ALLOWLIST + MODULE_PATH_ALLOWLIST + HARNESS_ALLOWLIST + (WINDOWS_ALLOWLIST if os.name == "nt" else ())
     env = {k: v for k, v in os.environ.items() if k in allowed or k.startswith(HARNESS_PREFIX)
            or (_test_control(k) and not CREDENTIAL_NAME.search(k))}
     env["HOME"] = str(home) if home is not None else (_process_home or tempfile.mkdtemp(prefix="hermetic-home-"))
@@ -162,12 +166,16 @@ def isolate_os_environ(home: "Path | str | None" = None, **extra: str) -> "os._E
 
 
 def runtime_harness() -> "tuple[Path | None, dict[str, str]]":
-    """The environment.json a runtime harness writes beside SUTANDO_RUNTIME_SOCKET, and its variables;
-    (None, {}) without one. Stable across isolation, so it can be an isolator's argument and read later."""
+    """The environment.json a runtime harness writes beside SUTANDO_RUNTIME_SOCKET, and only its
+    HARNESS_KEYS; (None, {}) without one. Stable across isolation, so it can be an isolator's argument.
+    Nothing else in the file (a token, a telemetry switch) ever reaches a test's environment."""
     if not _HARNESS_SOCKET:
         return None, {}
     path = Path(_HARNESS_SOCKET).parent / "environment.json"
-    return (path, json.loads(path.read_text())) if path.is_file() else (None, {})
+    if not path.is_file():
+        return None, {}
+    data = json.loads(path.read_text())
+    return path, {k: str(data[k]) for k in HARNESS_KEYS if k in data}
 
 
 def isolated_child_env(**extra: str) -> "dict[str, str]":

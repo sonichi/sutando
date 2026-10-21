@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import sysconfig
@@ -61,10 +62,11 @@ def sentinels(root: Path, values: bool = True) -> "dict[str, str]":
 
 
 def audit(target: "list[str]", timeout: int = 600, values: bool = True,
-          home: "Path | None" = None) -> "tuple[dict, dict, subprocess.CompletedProcess]":
-    """Run `target` under the audit hook with the sentinels set; (record, sentinels, process)."""
+          home: "Path | None" = None, extra: "dict[str, str] | None" = None
+          ) -> "tuple[dict, dict, subprocess.CompletedProcess]":
+    """Run `target` under the audit hook with the sentinels (and `extra`) set; (record, sentinels, process)."""
     root = Path(tempfile.mkdtemp(prefix="hermetic-audit-")).resolve()
-    names = sentinels(root / MARK, values)
+    names = {**sentinels(root / MARK, values), **(extra or {})}
     out = root / "audit.json"
     proc = subprocess.run([sys.executable, str(AUDIT), str(out), *target], cwd=REPO,
                           env=hermetic_env(home or root / "home", **names), capture_output=True, text=True,
@@ -85,8 +87,8 @@ def leaks(record: dict) -> "list[str]":
 
 
 class Sentinels(unittest.TestCase):
-    def check(self, target, expect_opens=True, values=True):
-        record, names, proc = audit(target, values=values)
+    def check(self, target, expect_opens=True, values=True, extra=None):
+        record, names, proc = audit(target, values=values, extra=extra)
         if expect_opens:
             self.assertTrue(record["opens"], "the audit recorded no open: the hook never ran")
             self.assertTrue(record["import_envs"], "no gateway module was imported: the case ran nothing")
@@ -133,6 +135,21 @@ class Sentinels(unittest.TestCase):
     def test_channel_env_resolve_and_its_shell_children_read_no_outer_selector(self):
         self.check(["tests/channel-env-resolve.test.py"])
 
+    def test_runtime_harness_callers_take_no_selector_or_telemetry_from_its_file(self):
+        # A runtime harness's layout: its private root is the outer TMPDIR and holds environment.json.
+        harness = Path(tempfile.mkdtemp(prefix="h-")).resolve()
+        (harness / "environment.json").write_text(json.dumps(
+            {"PATH": os.environ["PATH"], "TMPDIR": str(harness), "REMOTE_TASK_TOKEN": f"{MARK}-harness-token",
+             "SUTANDO_TELEMETRY": "1"}))
+        for f in ("tests/runtime-cli-task-list-unfinished.test.py", "tests/runtime-api-request-expiry.test.py"):
+            with self.subTest(f=f):
+                outer = {"SUTANDO_RUNTIME_SOCKET": str(harness / "api.sock"), "TMPDIR": str(harness)}
+                record, _, _ = audit([f], extra=outer)
+                self.check([f], expect_opens=False, extra=outer)
+                envs = record["child_envs"] + [record["final_env"]]
+                self.assertTrue(record["child_envs"], "the case spawned nothing")
+                self.assertEqual({e.get("SUTANDO_TELEMETRY") for e in envs} - {None}, {"0"})
+
     def test_a_suite_that_stops_all_patches_reads_no_outer_selector(self):
         self.check(["tests/core-restart-heartbeat-and-cron-hold.test.py"])
 
@@ -149,6 +166,43 @@ class Isolator(unittest.TestCase):
                              env=hermetic_env(GATEWAY_TOKEN=f"{MARK}-gateway-token"))
         self.assertEqual(got.returncode, 0, got.stderr)
         self.assertEqual(got.stdout.strip(), "absent")
+
+    def test_the_harness_file_hands_over_paths_only(self):
+        harness = Path(tempfile.mkdtemp(prefix="h-")).resolve()
+        (harness / "environment.json").write_text(json.dumps(
+            {"PATH": "/harness/bin:" + os.environ["PATH"], "REMOTE_TASK_TOKEN": "synthetic-harness-token",
+             "SUTANDO_TELEMETRY": "1", "DO_NOT_TRACK": "0"}))
+        code = ("import os, subprocess, sys; sys.path.insert(0, %r)\n"
+                "from _helpers.hermetic_env import isolate_os_environ, isolated_child_env, runtime_harness\n"
+                "isolate_os_environ(**runtime_harness()[1])\n"
+                "env = isolated_child_env(**runtime_harness()[1])\n"
+                "subprocess.run([sys.executable, '-c', 'import json, os; print(json.dumps(dict(os.environ)))'], env=env)\n"
+                % str(REPO / "tests"))
+        got = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60,
+                             env=hermetic_env(SUTANDO_RUNTIME_SOCKET=str(harness / "api.sock")))
+        self.assertEqual(got.returncode, 0, got.stderr)
+        child = json.loads(got.stdout)
+        self.assertTrue(child["PATH"].startswith("/harness/bin:"), "the harness PATH is the positive control")
+        self.assertNotIn("REMOTE_TASK_TOKEN", child)
+        self.assertEqual((child["SUTANDO_TELEMETRY"], child["DO_NOT_TRACK"]), ("0", "1"))
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_the_node_path_opt_in_survives_isolation_so_the_jsdom_tests_run(self):
+        modules = Path(tempfile.mkdtemp(prefix="node-")).resolve() / "node_modules"
+        (modules / "jsdom").mkdir(parents=True)
+        (modules / "jsdom" / "index.js").write_text("module.exports = {};\n")
+        code = ("import importlib.util, sys; sys.path.insert(0, %r)\n"
+                "spec = importlib.util.spec_from_file_location('tutorial', %r)\n"
+                "mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)\n"
+                "import os; print(os.environ.get('NODE_PATH')); print(mod._jsdom_node() is not None)\n"
+                % (str(REPO / "tests"), str(REPO / "tests" / "tutorial-getting-started.test.py")))
+        env = hermetic_env()
+        env["NODE_PATH"] = str(modules)
+        # Outside the repo, so the repo's own node_modules cannot stand in for the opt-in.
+        got = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=120,
+                             env=env, cwd=modules.parent)
+        self.assertEqual(got.returncode, 0, got.stderr)
+        self.assertEqual(got.stdout.strip().splitlines()[-2:], [str(modules), "True"], got.stderr)
 
     def test_an_unreadable_patch_registry_refuses_isolation(self):
         code = ("import sys; sys.path.insert(0, %r)\n"

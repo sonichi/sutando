@@ -29,7 +29,9 @@ must build every environment with tests/_helpers/hermetic_env.py. Refused anywhe
               another import, a def or an assignment of that name certifies nothing
 
 Threat model: this gate and the helper catch ACCIDENTAL parent-environment leaks in test code.
-Deliberately adversarial code (monkeypatching the helper module itself, say) is out of scope.
+Deliberately adversarial code (monkeypatching the helper module itself, say) is out of scope, and
+so is a test that plants shadow stdlib or _helpers modules on a path it inserts: imports are resolved
+against this scanner's own sys.path, not the scanned file's.
 """
 from __future__ import annotations
 
