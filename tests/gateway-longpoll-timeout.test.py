@@ -182,6 +182,18 @@ class _StatusLoop(_Loop):
         return self
 
 
+def _round_error_once():
+    """`_receive_round` raising for the first round that serves a task, then the real one."""
+    real, raised = _GW._receive_round, []
+
+    def receive(tasks):
+        if tasks and not raised:
+            raised.append(True)
+            raise FileExistsError(17, "File exists")
+        return real(tasks)
+    return patch.object(_GW, "_receive_round", side_effect=receive)
+
+
 class GatewayStatusEvidenceTest(unittest.TestCase):
     EMPTY = {"tasks": []}
     TASK = {"id": "task-poll-evidence", "task": "synthetic task", "lease_id": "test-lease"}
@@ -250,10 +262,11 @@ class GatewayStatusEvidenceTest(unittest.TestCase):
             self.assertEqual(ack["status"]["last_ok_ts"], task_ok)
             self.assertEqual(_GW._load_pending_acks(), {})
 
-    def test_task_write_error_cannot_discard_the_completed_poll(self):
+    def test_round_error_cannot_discard_the_completed_poll(self):
+        # A task's own write error is isolated per task; this raise escapes the round.
         for prior_success in (False, True):
-            with self.subTest(prior_success=prior_success), _StatusLoop(_GW) as loop:
-                _GW.TASKS_DIR.write_text("not a directory")
+            with self.subTest(prior_success=prior_success), _StatusLoop(_GW) as loop, \
+                    _round_error_once():
                 prefix = [(1, self.EMPTY)] if prior_success else []
                 ok = 1_000_001 + int(prior_success)
                 loop.run(prefix + [(1, {"tasks": [self.TASK]}), self.timeout(),
@@ -270,8 +283,7 @@ class GatewayStatusEvidenceTest(unittest.TestCase):
                 self.assertFalse(_GW.PENDING_ACK_FILE.exists())
 
     def test_failed_status_write_is_retried_with_the_completed_poll_timestamp(self):
-        with _StatusLoop(_GW) as loop:
-            _GW.TASKS_DIR.write_text("not a directory")
+        with _StatusLoop(_GW) as loop, _round_error_once():
             replace = _GW.os.replace
             failed = []
 
