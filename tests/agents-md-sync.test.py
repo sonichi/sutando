@@ -92,6 +92,27 @@ finally:
 
 check("documented vault import works from a nested script", vault_import.returncode == 0)
 
+DOC = (REPO / "docs" / "subagent-delegation.md").read_text()
+check(
+    "anti-deferral wording stays in CLAUDE.md",
+    "not a licence to defer to a later session" in CLAUDE
+    and "Too large for your remaining context is the\nreason TO delegate" in CLAUDE,
+)
+check(
+    "heavy-work default takes the quota tier into account",
+    "with the quota tier in mind" in CLAUDE,
+)
+check(
+    "doc says the loop tiers gate the loop, not owner-requested work",
+    "gate the autonomous loop; for work the owner\n  asked for, the tier is guidance to weigh here, not a gate." in DOC,
+)
+check(
+    "heavy is defined once in the doc and CLAUDE.md points to it",
+    "single definition of \"heavy\"" in DOC
+    and "Heavy work (defined in `docs/subagent-delegation.md`)" in CLAUDE
+    and "defined in the doc" not in DOC,
+)
+
 if failures:
     if sync.returncode != 0:
         print(sync.stderr)

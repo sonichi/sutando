@@ -3671,14 +3671,13 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
 
 
 def _emit_gateway_status(connected: bool, *, error: str | None = None,
-                         backoff_s: int = 0) -> None:
+                         backoff_s: int = 0, poll_ok_ts: float | None = None) -> None:
     """Write `state/gateway-status.json` — the connection's own liveness, for a
     local supervisor to render connected-vs-reconnecting.
 
     Best-effort: a status-write failure MUST NOT disturb the poll loop, so all
-    errors are swallowed. `last_ok_ts` is preserved across reconnecting writes
-    (read back from the prior file) so a consumer can show "last connected N s
-    ago" while the link is down.
+    errors are swallowed. Only explicit poll-success evidence advances
+    `last_ok_ts`; other writes preserve the prior value from disk.
     """
     try:
         last_ok = None
@@ -3688,8 +3687,8 @@ def _emit_gateway_status(connected: bool, *, error: str | None = None,
         except (FileNotFoundError, ValueError, OSError):
             last_ok = None
         now = int(time.time())
-        if connected:
-            last_ok = now
+        if poll_ok_ts is not None:
+            last_ok = int(poll_ok_ts)
         payload = {
             "connected": bool(connected),
             "ts": now,
@@ -7465,7 +7464,8 @@ def main() -> None:
         _log(f"running unsupervised — output also logged to {_LOG_FILE}; "
              f"prefer launching through startup.sh for full diagnostics")
     backoff = 1
-    last_poll_ok = time.time()
+    poll_grace_since = time.time()
+    last_poll_ok: float | None = None
     poll_failures = 0  # consecutive network failures; the next good poll resets it
     _emit_gateway_status(False, error="starting — not yet connected")
     refresh_routing(force=True)  # the owner's DM comes from the gateway at connect, not from a pin
@@ -7492,18 +7492,20 @@ def main() -> None:
             _push_pool_advertisement()
             if _advance_held_tasks(inflight):   # a retried ack, or a publish after a restart
                 wake_outbound()
-            prev_ok = last_poll_ok
+            prev_ok = poll_grace_since
             try:
                 resp = _req("GET", f"/v1/tasks?wait={POLL_WAIT}{_POLL_PROOF}", timeout=POLL_WAIT + 10)
-                last_poll_ok = time.time()
+                last_poll_ok = poll_grace_since = time.time()
+                # A completed poll remains evidence even if accepting its tasks fails.
+                _emit_gateway_status(True, poll_ok_ts=last_poll_ok)
             except (TimeoutError, socket.timeout):
                 # Read timeout only (URLError takes the outage path below).
                 # socket.timeout only aliases TimeoutError on 3.10+, not 3.9.
-                if not _poll_timeout_is_empty(last_poll_ok, time.time()):
+                if not _poll_timeout_is_empty(poll_grace_since, time.time()):
                     raise
                 resp = {"tasks": []}
-            if poll_failures and last_poll_ok != prev_ok:  # a real answer, not the grace path
-                _log(f"poll recovered after {poll_failures} failures, {int(last_poll_ok - prev_ok)}s")
+            if poll_failures and poll_grace_since != prev_ok:  # a real answer, not the grace path
+                _log(f"poll recovered after {poll_failures} failures, {int(poll_grace_since - prev_ok)}s")
                 poll_failures = 0
             added = False
             pending_ack = []
@@ -7552,27 +7554,27 @@ def main() -> None:
             # raising, so a broker without the endpoints costs one deferred log.
             _push_pool_advertisement()
             backoff = 1  # healthy round-trip → reset backoff
-            _emit_gateway_status(True)
+            _emit_gateway_status(last_poll_ok is not None, poll_ok_ts=last_poll_ok)
         except urllib.error.HTTPError as e:
             if e.code in (401, 403):
                 if _recover_auth(e.code):
                     backoff = 1
                     continue
-                _emit_gateway_status(False, error=f"auth rejected HTTP {e.code}")
+                _emit_gateway_status(False, error=f"auth rejected HTTP {e.code}", poll_ok_ts=last_poll_ok)
                 sys.exit(f"FATAL: gateway auth rejected (HTTP {e.code}) — check REMOTE_TASK_TOKEN.")
             _log(f"poll HTTP {e.code} — backing off {backoff}s")
-            _emit_gateway_status(False, error=f"HTTP {e.code}", backoff_s=backoff)
+            _emit_gateway_status(False, error=f"HTTP {e.code}", backoff_s=backoff, poll_ok_ts=last_poll_ok)
             time.sleep(backoff); backoff = min(backoff * 2, _POLL_BACKOFF_MAX_S)
         except _NETWORK_ERRORS as e:
             poll_failures += 1
             _log(f"poll network error: {type(e).__name__}: {e} — {poll_failures} consecutive, "
-                 f"{int(time.time() - last_poll_ok)}s since last successful poll — "
+                 f"{int(time.time() - poll_grace_since)}s since last successful poll — "
                  f"backing off {backoff}s")
-            _emit_gateway_status(False, error=f"network: {e}", backoff_s=backoff)
+            _emit_gateway_status(False, error=f"network: {e}", backoff_s=backoff, poll_ok_ts=last_poll_ok)
             time.sleep(backoff); backoff = min(backoff * 2, _POLL_BACKOFF_MAX_S)
         except Exception as e:  # noqa: BLE001 — keep the loop alive
             _log(f"unexpected: {e} — backing off {backoff}s")
-            _emit_gateway_status(False, error=f"unexpected: {e}", backoff_s=backoff)
+            _emit_gateway_status(False, error=f"unexpected: {e}", backoff_s=backoff, poll_ok_ts=last_poll_ok)
             time.sleep(backoff); backoff = min(backoff * 2, _POLL_BACKOFF_MAX_S)
 
 

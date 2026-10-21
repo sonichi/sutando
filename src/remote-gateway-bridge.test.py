@@ -2702,15 +2702,21 @@ def main() -> int:
     # Wiring: the policy is only worth anything if the poll call site consults
     # it. Asserted against the loaded function, not a copy of the file.
     import inspect
+    import ast
     _loop = inspect.getsource(rtc.main)
-    _poll_call = _loop.split('"GET", f"/v1/tasks?wait=', 1)[-1][:400]
+    _poll_try = next(
+        node for node in ast.walk(ast.parse(_loop))
+        if isinstance(node, ast.Try)
+        and isinstance(node.body[0], ast.Assign)
+        and '"GET", f"/v1/tasks?wait=' in ast.get_source_segment(_loop, node.body[0])
+    )
+    _poll_call = ast.get_source_segment(_loop, _poll_try)
     check("_poll_timeout_is_empty" in _poll_call,
           "poll-timeout: the poll call site consults the policy")
     check("except (TimeoutError, socket.timeout)" in _poll_call,
           "poll-timeout: the catch is scoped to the poll, not the whole iteration")
     # 3.9 has no socket.timeout->TimeoutError alias; CI is 3.10+ where an
     # execution probe cannot go red, so pin the catch tuple itself via AST.
-    import ast
     _clause = _poll_call.split("except ", 1)[-1].split(":", 1)[0]
     _t = ast.parse(_clause, mode="eval").body
     _caught = {

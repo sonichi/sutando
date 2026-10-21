@@ -12,8 +12,13 @@ Extends the CLAUDE.md rule that "at background" / "in parallel" means SPAWN A SU
   message, file sent) → do it inline, now, before anything else. A header without a lane counts as long when the queue is
   busy. One long Write run inline held three quick tasks for five minutes.
 - A task splits into two or more independent workstreams where parallelism materially cuts latency.
-- Mechanical, long-running, or context-heavy work would consume the main session's context:
+- The work is **heavy**: sustained work that would hold this thread for more than a few minutes
+  (investigations, test runs, scans, long reviews), or that would consume the main session's context:
   repository scans, evidence collection, test monitoring, transcript summarization, bounded research.
+  This is the single definition of "heavy"; `CLAUDE.md` points here. Delegate it without being asked, taking the
+  quota tier into account: for example, delegate freely at FULL; when the budget is tight, run it inline and say so (see below).
+  The loop's quota tiers (`docs/proactive-loop-rationale.md`) gate the autonomous loop; for work the owner
+  asked for, the tier is guidance to weigh here, not a gate.
 - An independent second pass materially improves correctness: adversarial review, reproduction,
   cross-checking evidence.
 - Access-control policy requires sandboxed handling of a non-owner task.
@@ -21,6 +26,14 @@ Extends the CLAUDE.md rule that "at background" / "in parallel" means SPAWN A SU
 Do NOT delegate tightly coupled work, concurrent edits to the same files, irreversible actions, or
 tasks whose coordination overhead exceeds the benefit. Subagents never bypass quota, presenter/pause,
 or self-development gates.
+
+## Bounded scope and checkpoint
+
+A spawned worker gets a bounded brief: scope (one question or deliverable), the files it may touch,
+and what it must not do. It also gets a checkpoint: when it reports back. The main thread verifies
+the result before reporting it; a subagent's "done" is a claim, not evidence.
+
+If there is no capacity to spawn, see "When no delegation mechanism is available" below.
 
 ## Model selection — explicit on every spawn
 
@@ -50,9 +63,10 @@ The rule in `CLAUDE.md` bans deferring and bans handing the work back, and the "
 better mechanism" escape does not fire when you have *none* rather than a worse one. Without a
 fourth branch that leaves only two moves, one of which is dishonest.
 
-Subagents are FULL-tier only under the proactive-loop quota gate
-(`skills/proactive-loop/SKILL.md`), so an unavailable mechanism is a **common** state, not an
-operator edge case — a LIGHT-tier session has no delegation available at all.
+Subagents are FULL-tier only under the autonomous loop's quota gate
+(`docs/proactive-loop-rationale.md`), so an unavailable mechanism is a **common** state there, not an
+operator edge case — a LIGHT-tier loop session has no delegation available at all. For work the
+owner asked for, the tier is guidance (see above), not a gate.
 
 **So: do the work inline in this session, and say plainly that it ran inline and why.**
 Inline-with-disclosure is the satisfying branch. Say it in one line, with the constraint, e.g.

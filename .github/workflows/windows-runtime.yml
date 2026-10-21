@@ -11,6 +11,8 @@ on:
     - cron: '37 8 * * *'
   workflow_dispatch: {}
 
+# IMPORTANT: tests must never emit product telemetry; removing or weakening this makes CI test runs
+# count as real users on the admin DAU. Enforced by tests/telemetry-test-optout-guard.test.py.
 env:
   SUTANDO_TELEMETRY: "0"
 
