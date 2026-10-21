@@ -17,6 +17,8 @@ Extends the CLAUDE.md rule that "at background" / "in parallel" means SPAWN A SU
   repository scans, evidence collection, test monitoring, transcript summarization, bounded research.
   This is the single definition of "heavy"; `CLAUDE.md` points here. Delegate it without being asked, taking the
   quota tier into account: for example, delegate freely at FULL; when the budget is tight, run it inline and say so (see below).
+  The loop's quota tiers (`docs/proactive-loop-rationale.md`) gate the autonomous loop; for work the owner
+  asked for, the tier is guidance to weigh here, not a gate.
 - An independent second pass materially improves correctness: adversarial review, reproduction,
   cross-checking evidence.
 - Access-control policy requires sandboxed handling of a non-owner task.

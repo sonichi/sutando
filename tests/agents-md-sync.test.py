@@ -93,6 +93,10 @@ check(
     "with the quota tier in mind" in CLAUDE,
 )
 check(
+    "doc says the loop tiers gate the loop, not owner-requested work",
+    "gate the autonomous loop; for work the owner\n  asked for, the tier is guidance to weigh here, not a gate." in DOC,
+)
+check(
     "heavy is defined once in the doc and CLAUDE.md points to it",
     "single definition of \"heavy\"" in DOC
     and "Heavy work (defined in `docs/subagent-delegation.md`)" in CLAUDE
