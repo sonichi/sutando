@@ -16,8 +16,11 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from _helpers.hermetic_env import hermetic_env
+from _helpers.hermetic_env import hermetic_env, isolate_os_environ
 from _helpers.process_group import popen_bound
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "src"))
