@@ -26,7 +26,7 @@ import time
 import uuid
 from pathlib import Path
 
-from ... import _dirs, agent_identity, connect_common as cm, task_io
+from ... import _dirs, agent_identity, connect_common as cm, gateway_credential_sources as _sources, task_io
 from ...connect_common import EXIT_CHILD_HELD, EXIT_HELD, EXIT_UNUSABLE, _v  # noqa: F401
 from ... import claude_local_accepter as accepter, claude_local_card as card, claude_local_records as records
 from . import detector, hmac_policy, hold, inbox, launcher, trust
@@ -235,7 +235,7 @@ def wire_bridge(cfg: dict) -> str:
             return problem
         body = {"written_by": f"{COMMAND} install", "schema": 1, "host": mode, "name": worker_name(Path(root).name),
                 "module": "ag2_sparrow.remote_gateway_bridge", "env": env, "token_vault_key": cfg["TOKEN_VAULT_KEY"],
-                "token_env": "REMOTE_TASK_TOKEN"}
+                "token_env": _sources.token_env_name()}
         cm._write(path, json.dumps(body, indent=1, sort_keys=False) + "\n", 0o644)
         print(f"declared: {path} ({mode} runs it as worker {body['name']} on its next scan; the token is read from "
               f"the vault: vault set {cfg['TOKEN_VAULT_KEY']} <the agent's relay token>)")

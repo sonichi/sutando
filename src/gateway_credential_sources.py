@@ -31,6 +31,12 @@ MEDIA_TOKEN_KEY = "REMOTE_MEDIA_HS_TOKEN"
 CREDENTIAL_KEYS = TOKEN_KEYS + URL_KEYS + (MEDIA_TOKEN_KEY,)
 LEGACY_ALIASES = {"AG2_REMOTE_TOKEN": "REMOTE_TASK_TOKEN", "AG2_REMOTE_URL": "REMOTE_TASK_URL"}
 
+
+def token_env_name() -> str:
+    """The token's environment variable by name, for a record that says where the token goes; another
+    module may name it only through this call, never read the variable with it."""
+    return TOKEN_KEYS[0]
+
 # The precedence, stated once; the first source carrying a value wins (see discover() for each name:
 # "file" is the first listed .env file carrying a token, "token" the URL inside the winning one).
 SOURCES = (

@@ -1182,6 +1182,8 @@ class BoundedRead(unittest.TestCase):
 
 SOURCE_KEYS = set(owner.CREDENTIAL_KEYS) | {owner.TOKEN_FILE_KEY}
 KEY_TUPLES = {"TOKEN_KEYS", "URL_KEYS", "CREDENTIAL_KEYS", "TOKEN_FILE_KEY", "MEDIA_TOKEN_KEY"}
+# The owner's name-only route: called with no arguments, as a dict value or a keyword value, and nowhere else.
+NAME_ONLY = frozenset({"token_env_name"})
 # What names a credential file or store: a scope holding one of these and a read is credential I/O.
 CREDENTIAL_MARKERS = {"AG2_DEVICE_ENV", "CLAUDE_CONFIG_DIR", "TOKEN_FILE", "device_env_path",
                       "channel_env_paths", "env_files", "channel_token", "token_from_vault"}
@@ -1380,6 +1382,15 @@ def _probe_keeps(inner, parents) -> "list[str]":
     return why
 
 
+def _names_only(node, parents) -> bool:
+    """A NAME_ONLY use is a bare call whose result is a dict value or a keyword value, nothing else."""
+    call = parents.get(node)
+    if not (isinstance(call, ast.Call) and call.func is node and not call.args and not call.keywords):
+        return False
+    holder = parents.get(call)
+    return isinstance(holder, ast.keyword) or (isinstance(holder, ast.Dict) and any(v is call for v in holder.values))
+
+
 def credential_access(source: str, rel: str) -> "list[str]":
     """Every way `source` (module `rel`) touches a credential source on its own: a credential key
     or a piece of one as a string, the owner's key tuples, credential I/O outside IO_ALLOWED, and
@@ -1401,6 +1412,10 @@ def credential_access(source: str, rel: str) -> "list[str]":
         name = node.attr if isinstance(node, ast.Attribute) else node.id if isinstance(node, ast.Name) else None
         if name in KEY_TUPLES:
             out.append(f"{rel}:{node.lineno} owner key tuple {name}")
+        if name in NAME_ONLY and not _names_only(node, parents):
+            out.append(f"{rel}:{node.lineno} {name} used other than as a name in a record")
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name in NAME_ONLY:
+            out.append(f"{rel}:{node.lineno} a second definition of {node.name}")
     scopes = [("<module>", [n for n in tree.body if not isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))])]
     scopes += [(f.name, [f]) for f in ast.walk(tree) if isinstance(f, (ast.FunctionDef, ast.AsyncFunctionDef))]
     for name, nodes in scopes:
@@ -1483,6 +1498,19 @@ class Guard(unittest.TestCase):
             'discover(env, files, read_token_file=lambda p, r=_read_anything: r(p))',
             'def f():\n    subprocess.run(["systemctl", "--user", "show-environment"], capture_output=True)',
             'def _manager_env():\n    return _systemd_run(["systemctl", "--user", "show-environment"]).stdout',
+            'body = {"token_env": _sources.TOKEN_KEYS[0]}',
+            'from .gateway_credential_sources import TOKEN_KEYS\nbody = {"token_env": TOKEN_KEYS[0]}',
+            'body = {"token_env": "REMOTE_TASK_TOKEN"}',
+            'os.environ.get(_sources.token_env_name())',
+            'os.environ[_sources.token_env_name()]',
+            'os.getenv(token_env_name())',
+            'k = _sources.token_env_name()\nos.environ.get(k)',
+            'body = {"token_env": _sources.token_env_name}',
+            'name = _sources.token_env_name\nos.environ.get(name())',
+            'body = {_sources.token_env_name(): 1}',
+            'body = {"token_env": _sources.token_env_name(os.environ)}',
+            'body = {"token_env": os.environ.get(_sources.token_env_name())}',
+            'def token_env_name():\n    return "TOKEN"',
         ]
         for source in bypasses:
             self.assertTrue(credential_access(source, "probe.py"), source)
@@ -1493,6 +1521,14 @@ class Guard(unittest.TestCase):
         self.assertEqual(credential_access(allowed, "remote_gateway_bridge.py"), [])
         self.assertEqual(credential_access('"""Put REMOTE_TASK_TOKEN in the .env file."""\nx = 1\n', "probe.py"), [],
                          "a docstring naming a key is prose, not a read")
+        for named in ('body = {"token_env": _sources.token_env_name()}',
+                      'record(path, token_env=_sources.token_env_name())'):
+            self.assertEqual(credential_access(named, "probe.py"), [], "the owner's name-only route")
+
+    def test_the_name_only_route_is_the_owners_canonical_token_key(self):
+        self.assertEqual(owner.token_env_name(), owner.TOKEN_KEYS[0])
+        self.assertEqual(owner.token_env_name(), "REMOTE_TASK_TOKEN")
+        self.assertIn(owner.token_env_name(), SOURCE_KEYS)
 
     def test_the_reachability_probe_discards_what_show_environment_prints(self):
         rel, run = SYSTEMD_PROBE[0], '_systemctl(("--user", "show-environment"))'
