@@ -16,7 +16,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from _helpers.hermetic_env import hermetic_env, isolate_os_environ
+from _helpers.hermetic_env import hermetic_env, isolate_os_environ, runtime_harness
 from _helpers.process_group import popen_bound
 
 # Before anything below reads the environment: no outer credential selector survives.
@@ -36,7 +36,9 @@ WORKER = "1" * 32
 OTHER = "2" * 32
 DISPATCH = REPO / "src/delivery/task_dispatch.py"
 WATCHER = REPO / "src/watch-tasks-stream.sh"
-SUPPLIED = Path(os.environ.get("SUTANDO_RUNTIME_SOCKET", "/nonexistent/socket")).parent / "environment.json"
+# The harness file found before isolation, and only its path variables.
+HARNESS_FILE, HARNESS = runtime_harness()
+SUPPLIED = HARNESS_FILE or Path("/nonexistent/environment.json")
 
 
 class WorkerStartupTest(unittest.TestCase):
@@ -47,7 +49,7 @@ class WorkerStartupTest(unittest.TestCase):
         self.ws = self.root / "workspace"
         self.env = hermetic_env(home=self.root / "home")
         if SUPPLIED.is_file():
-            self.env.update(json.loads(SUPPLIED.read_text()))
+            self.env.update(HARNESS)
         self.env.update({
             "SUTANDO_TEST_MODE": "1", "SUTANDO_TELEMETRY": "0",
             "SUTANDO_WORKSPACE": str(self.ws), "SUTANDO_WORKSPACE_DIR": str(self.ws),
