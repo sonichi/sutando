@@ -16,12 +16,16 @@ CLAUDE = (REPO / "CLAUDE.md").read_text()
 AGENTS = (REPO / "AGENTS.md").read_text()
 
 failures = []
+passed = 0
 
 
 def check(name: str, condition: bool) -> None:
+    global passed
     print(("  ok  " if condition else "  FAIL ") + name)
     if not condition:
         failures.append(name)
+    else:
+        passed += 1
 
 
 sync = subprocess.run(
@@ -91,7 +95,7 @@ check(
 check(
     "heavy is defined once in the doc and CLAUDE.md points to it",
     "single definition of \"heavy\"" in DOC
-    and "Heavy work (defined in the doc)" in CLAUDE
+    and "Heavy work (defined in `docs/subagent-delegation.md`)" in CLAUDE
     and "defined in the doc" not in DOC,
 )
 
@@ -103,4 +107,4 @@ if failures:
     print(f"Results: {len(failures)} failed")
     raise SystemExit(1)
 
-print("Results: 8 passed")
+print(f"Results: {passed} passed")

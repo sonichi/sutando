@@ -31,8 +31,7 @@ A spawned worker gets a bounded brief: scope (one question or deliverable), the 
 and what it must not do. It also gets a checkpoint: when it reports back. The main thread verifies
 the result before reporting it; a subagent's "done" is a claim, not evidence.
 
-If there is no capacity to spawn (quota tier, queue), say that constraint instead of claiming
-delegation.
+If there is no capacity to spawn, see "When no delegation mechanism is available" below.
 
 ## Model selection — explicit on every spawn
 
