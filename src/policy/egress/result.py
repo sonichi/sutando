@@ -24,6 +24,7 @@ import fnmatch
 import hashlib
 import json
 import os
+import re
 import stat
 import sys
 import tempfile
@@ -86,6 +87,21 @@ TIER_UNREADABLE = "unreadable"
 
 class TeamResultLeakError(RuntimeError):
     """A Team result carried a delivery-control marker or a likely secret."""
+
+
+# An internal error carries this host's paths and state ids; it is the owner's to read, never a
+# guarded reader's. Paths are matched only under per-user and temp roots, never any `/x/y`.
+INTERNAL_ERROR_DETAIL = "internal error detail"
+_INTERNAL_ERROR_RE = re.compile(
+    r"\[Errno \d+\]"
+    r"|Traceback \(most recent call last\)"
+    r"|(?<![\w.~/-])(?:/(?:Users|home|private/(?:var|tmp)|var/folders)|~/Library)/[^\s'\"`]+")
+
+
+def carries_internal_error_detail(body) -> bool:
+    """True when the text a reader would see quotes a raw OS error, a traceback, or a local path.
+    Marker values are excluded: an admitted `[file:]` path is consumed by the transport, never shown."""
+    return bool(_INTERNAL_ERROR_RE.search(parse_markers(body or "").body or ""))
 
 
 def resolve_access_tier(task_file) -> str:
@@ -221,6 +237,8 @@ def scan_team_result(body: str, repo: Path, secret_filter=None,
     # Marker checks stay above this narrow scanner opt-out.
     if not scan_sensitive_data:
         return body
+    if carries_internal_error_detail(body):
+        raise TeamResultLeakError(INTERNAL_ERROR_DETAIL)
     filter_chat_secrets = secret_filter or load_team_result_scanner(repo)
     try:
         result = filter_chat_secrets(body)
