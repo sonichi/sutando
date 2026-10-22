@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import ast
 import contextlib
+import functools
 import importlib.util
 import io
 import json
@@ -1367,9 +1368,25 @@ def _systemd_findings(tree, parents, rel: str) -> "list[str]":
     return out
 
 
+def _memo(scan):
+    """Each scan is a pure function of (source, rel); tests repeat whole-package scans, so each module
+    is scanned once per run. Callers get a fresh list."""
+    cached = functools.lru_cache(maxsize=None)(lambda *args, **kw: tuple(scan(*args, **kw)))
+    return functools.wraps(scan)(lambda *args, **kw: list(cached(*args, **kw)))
+
+
+@_memo
 def systemd_findings(source: str, rel: str) -> "list[str]":
     tree = ast.parse(source)
     return _systemd_findings(tree, {c: n for n in ast.walk(tree) for c in ast.iter_child_nodes(n)}, rel)
+
+
+@functools.lru_cache(maxsize=None)
+def _named_defs(text: str) -> "tuple[tuple[str, bool], ...]":
+    """(name, at the top level) for every def and class in a module's text."""
+    tree = ast.parse(text)
+    return tuple((n.name, n in tree.body) for n in ast.walk(tree)
+                 if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)))
 
 
 def package_systemd_findings(root: Path) -> "list[str]":
@@ -1378,11 +1395,10 @@ def package_systemd_findings(root: Path) -> "list[str]":
     found, defs = [], {name: [] for name in sorted(SYSTEMD_RUNNERS)}
     for path in sorted(root.rglob("*.py")):
         rel, text = path.relative_to(root).as_posix(), path.read_text(encoding="utf-8")
-        tree = ast.parse(text)
         found += systemd_findings(text, rel)
-        for n in ast.walk(tree):
-            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and n.name in defs:
-                defs[n.name].append((rel, n in tree.body))
+        for name, top in _named_defs(text):
+            if name in defs:
+                defs[name].append((rel, top))
     found += [f"{name} is defined at {where}, not once at the top level of {SYSTEMCTL_HELPER[0]}"
               for name, where in defs.items() if where != [(SYSTEMCTL_HELPER[0], True)]]
     return found
@@ -1476,6 +1492,7 @@ def owner_alias(tree) -> "str | None":
     return alias if _binds(tree, alias) == 1 else None
 
 
+@_memo
 def owner_only_findings(source: str, rel: str, reader: bool = False) -> "list[str]":
     """Every name the owner keeps to itself that `source` names: a key tuple, a private name or the
     record's token key, as an identifier, an import, an attribute or a string (a getattr argument);
@@ -1514,12 +1531,13 @@ def _scope_nodes(root):
     return out
 
 
+@_memo
 def declaration_reads(source: str, rel: str) -> "list[str]":
     """Every call, in `source`, that takes a path to the declaration (as an argument or as the object of
     a method: open, read_text, a helper, str()) other than an owner call on the owner module's import.
-    A path is built from DECLARATION or a string folding to the file name, or comes from a name bound
-    from one, a module global bound from one, or a function or lambda that returns one; a path only
-    inside an f-string is a message."""
+    A path is built from DECLARATION or a string folding to the file name, or comes from a name, module
+    global, function or lambda that yields one. A message about the path (an f-string, a name bound from
+    one, a function returning only those) is exempt only as the argument itself; any other use is a path."""
     tree = ast.parse(source)
     alias, out = owner_alias(tree), []
     names = {m for m in DECLARATION_MARKERS if "." not in m}
@@ -1527,53 +1545,81 @@ def declaration_reads(source: str, rel: str) -> "list[str]":
     funcs = [f for f in ast.walk(tree) if isinstance(f, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))]
     module = [n for root in tree.body if not isinstance(root, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
               for n in _scope_nodes(root)]
-    producers = set()
+    producers, messages = set(), set()
 
-    def marked(expr, tainted):
+    def marked(expr, bound):
+        """Whether `expr` reaches the path at all: pure reachability, opaque only at an owner call."""
         stack = [expr]
         while stack:
             n = stack.pop()
             if any(m in (_constant(n) or "") for m in files):
                 return True
-            if isinstance(n, ast.JoinedStr) or _owner_call_node(n, alias):
-                continue  # a message, or what the owner returns: neither is the path
+            if _owner_call_node(n, alias):
+                continue  # what the owner returns is not the path
             word = n.id if isinstance(n, ast.Name) else n.attr if isinstance(n, ast.Attribute) else None
-            if word in names or word in producers or (isinstance(n, ast.Name) and n.id in tainted):
+            if word in names | producers | messages or (isinstance(n, ast.Name) and n.id in bound):
                 return True
             stack.extend(ast.iter_child_nodes(n))
         return False
 
+    def message(expr, said, bound):
+        """`expr` itself is a message or a truth value: an f-string, a name bound from one, a call to a
+        function whose every path-reaching return is one, a `not` or a comparison, or an `and`/`or`/`if`
+        whose path-reaching parts all are."""
+        word = getattr(getattr(expr, "func", None), "id", None) or getattr(getattr(expr, "func", None), "attr", None)
+        if isinstance(expr, ast.BoolOp):
+            return all(message(v, said, bound) for v in expr.values if marked(v, bound))
+        if isinstance(expr, ast.IfExp):
+            return all(message(v, said, bound) for v in (expr.body, expr.orelse) if marked(v, bound))
+        return isinstance(expr, (ast.JoinedStr, ast.Compare)) or (isinstance(expr, ast.Name) and expr.id in said) \
+            or (isinstance(expr, ast.UnaryOp) and isinstance(expr.op, ast.Not)) \
+            or (isinstance(expr, ast.Call) and word in messages - producers)
+
     def taint(inner, seed):
-        tainted = set(seed)
+        tainted, said = set(seed[0]), set(seed[1])
         for _ in range(4):
+            before = (len(tainted), len(said))
             for n in inner:
+                bound = tainted | said
                 if isinstance(n, (ast.Assign, ast.AnnAssign, ast.NamedExpr, ast.AugAssign)) and n.value is not None \
-                        and marked(n.value, tainted):
+                        and marked(n.value, bound):
                     targets = n.targets if isinstance(n, ast.Assign) else [n.target]
-                    tainted |= {t.id for tg in targets for t in ast.walk(tg) if isinstance(t, ast.Name)}
-                elif isinstance(n, ast.withitem) and n.optional_vars is not None and marked(n.context_expr, tainted):
+                    hit = {t.id for tg in targets for t in ast.walk(tg) if isinstance(t, ast.Name)}
+                    if message(n.value, said, bound) and not isinstance(n, ast.AugAssign):
+                        said |= hit - tainted
+                    else:
+                        tainted |= hit
+                        said -= hit
+                elif isinstance(n, ast.withitem) and n.optional_vars is not None and marked(n.context_expr, bound):
                     tainted |= {t.id for t in ast.walk(n.optional_vars) if isinstance(t, ast.Name)}
-                elif isinstance(n, (ast.For, ast.comprehension)) and marked(n.iter, tainted):
+                elif isinstance(n, (ast.For, ast.comprehension)) and marked(n.iter, bound):
                     tainted |= {t.id for t in ast.walk(n.target) if isinstance(t, ast.Name)}
-        return tainted
+            if (len(tainted), len(said)) == before:
+                break
+        return tainted, said
 
     scopes = []
-    for _ in range(4):  # producers and module globals, to a fixpoint
-        glob = taint(module, set())
+    for _ in range(4):  # producers, messages and module globals, to a fixpoint
+        known = (len(producers), len(messages))
+        glob = taint(module, (set(), set()))
         scopes = [(module, glob)]
         for f in funcs:
             inner = [n for c in ast.iter_child_nodes(f) for n in _scope_nodes(c)]
-            tainted = taint(inner, glob)
-            scopes.append((inner, tainted))
+            tainted, said = taint(inner, glob)
+            scopes.append((inner, (tainted, said)))
             returns = [f.body] if isinstance(f, ast.Lambda) else [n.value for n in inner if isinstance(n, ast.Return) and n.value]
-            if not isinstance(f, ast.Lambda) and any(marked(v, tainted) for v in returns):
-                producers.add(f.name)
-    for inner, tainted in scopes:
+            reached = [v for v in returns if marked(v, tainted | said)]
+            if not isinstance(f, ast.Lambda) and reached:
+                (messages if all(message(v, said, tainted | said) for v in reached) else producers).add(f.name)
+        if (len(producers), len(messages)) == known:
+            break
+    for inner, (tainted, said) in scopes:
         for n in inner:
             if not isinstance(n, ast.Call) or _owner_call_node(n, alias):
                 continue
             taken = n.args + [k.value for k in n.keywords] + ([n.func.value] if isinstance(n.func, ast.Attribute) else [])
-            if any(marked(a, tainted) for a in taken):
+            receiver = [n.func.value] if isinstance(n.func, ast.Attribute) else []
+            if any(marked(a, tainted | said) and (a in receiver or not message(a, said, tainted | said)) for a in taken):
                 out.append(f"{rel}:{n.lineno} hands the bridge declaration's path to {ast.unparse(n.func)}")
     return sorted(set(out))
 
@@ -1591,7 +1637,11 @@ return env
 READER_WRITES = {("bridge_environ", "env.update(decl['env'], REMOTE_PROACTIVE_ROOM='')"),
                  ("bridge_environ", "env.update(token_env)"),
                  ("main", "os.environ.clear()"), ("main", "os.environ.update(environ)")}
-MAPPING_WRITES = {"update", "setdefault", "__setitem__", "__delitem__", "pop", "popitem", "clear", "putenv", "unsetenv"}
+MAPPING_WRITES = {"update", "setdefault", "__setitem__", "__delitem__", "pop", "popitem", "clear", "putenv", "unsetenv",
+                  "__ior__", "__or__", "__ror__"}
+# Every reach of a process environment in the reader, by (function, the expression holding it).
+READER_ENVIRON_USES = {("bridge_environ", "os.environ if base is None else base"),
+                       ("main", "os.environ.clear"), ("main", "os.environ.update")}
 
 
 def token_injection_findings(source: str, rel: str) -> "list[str]":
@@ -1621,6 +1671,13 @@ def token_injection_findings(source: str, rel: str) -> "list[str]":
         elif isinstance(n, ast.Call) and getattr(n.func, "attr", None) in MAPPING_WRITES \
                 and (scope(n), ast.unparse(n)) not in READER_WRITES:
             out.append(f"{rel}:{n.lineno} a mapping write outside the pinned ones ({ast.unparse(n)})")
+        elif isinstance(n, ast.AugAssign) or (isinstance(n, ast.BinOp) and isinstance(n.op, ast.BitOr)):
+            out.append(f"{rel}:{n.lineno} an in-place or | merge ({ast.unparse(n)})")
+        elif isinstance(n, ast.Attribute) and n.attr == "environ" \
+                and (scope(n), ast.unparse(parents[n])) not in READER_ENVIRON_USES:
+            out.append(f"{rel}:{n.lineno} the process environment reached outside the pinned uses ({ast.unparse(parents[n])})")
+        elif (isinstance(n, ast.alias) and n.name == "environ") or _constant(n) == "environ":
+            out.append(f"{rel}:{getattr(n, 'lineno', '?')} the process environment named another way")
         elif isinstance(n, ast.Dict) and any(k is None and ast.unparse(v) != f"{alias}.bridge_declaration_fields()"
                                              for k, v in zip(n.keys, n.values)):
             out.append(f"{rel}:{n.lineno} a ** merge of something other than the owner's fields")
@@ -1632,6 +1689,7 @@ def token_injection_findings(source: str, rel: str) -> "list[str]":
     return out
 
 
+@_memo
 def credential_access(source: str, rel: str) -> "list[str]":
     """Every way `source` (module `rel`) touches a credential source on its own: a credential key
     or a piece of one as a string, the owner's key tuples, credential I/O outside IO_ALLOWED, and
@@ -1946,7 +2004,12 @@ class Guard(unittest.TestCase):
         ('    env.update(token_env)\n', '    env.update(token_env)\n    env.setdefault(next(iter(token_env)), token)\n'),
         ('    os.environ.update(environ)\n', '    os.environ.update(environ)\n    os.environ.update(**{next(iter(environ)): token})\n'),
         ('    environ = bridge_environ(decl, token)\n', '    environ = {**bridge_environ(decl, token), "X": token}\n'),
-        ('    os.environ.update(environ)\n', '    os.environ.update(environ)\n    os.putenv(name_of(decl), token)\n'))
+        ('    os.environ.update(environ)\n', '    os.environ.update(environ)\n    os.putenv(name_of(decl), token)\n'),
+        ('    os.environ.update(environ)\n', '    os.environ.update(environ)\n    os.environ |= {next(iter(environ)): token}\n'),
+        ('    os.environ.update(environ)\n', '    os.environ.update(environ)\n    e = os.environ\n    e |= {next(iter(environ)): token}\n'),
+        ('    os.environ.update(environ)\n', '    os.environ.update(environ)\n    os.environ.__ior__({next(iter(environ)): token})\n'),
+        ('    os.environ.update(environ)\n', '    os.environ.update(environ | {next(iter(environ)): token})\n'),
+        ('    os.environ.update(environ)\n', '    os.environ.update(environ)\n    del os.environ[next(iter(environ))]\n'))
 
     def test_the_reader_writes_no_environment_entry_itself(self):
         for rel, path in RECORD_READERS.items():
@@ -1974,6 +2037,23 @@ class Guard(unittest.TestCase):
                 head + "    w = _sources.write_bridge_declaration\n    w(path)\n",
                 head + "    def g(_sources):\n        _sources.write_bridge_declaration(path)\n"):
             self.assertTrue(credential_access(source, "adapters/claude_code/cli.py"), source)
+
+    def test_a_declaration_path_in_an_f_string_is_still_the_path_once_read(self):
+        rel = "adapters/claude_code/cli.py"
+        self.assertTrue(declaration_reads("def f():\n    open(DECLARATION).read()\n", rel), "the positive control")
+        for source in ('def f():\n    fh = open(f"{DECLARATION}")\n    fh.read()\n',
+                       'def f(root):\n    path = bridge_home(root) / DECLARATION\n    text = open(f"{path}").read()\n',
+                       'def f():\n    open(f"{DECLARATION}").read()\n',
+                       'def f(root):\n    name = f"{bridge_home(root) / DECLARATION}"\n    open(name).read()\n',
+                       'def where(root):\n    return f"{bridge_home(root) / DECLARATION}"\n'
+                       'def f(root):\n    open(where(root)).read()\n',
+                       'def f(root):\n    path = bridge_home(root) / DECLARATION\n    print(path or "none")\n'):
+            self.assertTrue(declaration_reads(source, rel), source)
+        for source in ('def f(root):\n    path = bridge_home(root) / DECLARATION\n    msg = f"see {path}"\n    print(msg)\n',
+                       'def f(root):\n    path = bridge_home(root) / DECLARATION\n    print(f"declared: {path}")\n',
+                       'def why(root):\n    return f"see {bridge_home(root) / DECLARATION}"\n'
+                       'def f(root, r):\n    problem = why(root)\n    check(r, not problem, "x", problem or "fine")\n'):
+            self.assertEqual(declaration_reads(source, rel), [], "the control: a message is handed on, never read")
 
     def test_a_declaration_path_from_a_helper_is_the_declaration(self):
         for source in (
