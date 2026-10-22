@@ -1206,6 +1206,9 @@ READS = {"open", "read_text", "read_bytes", "readlines"}
 # formatted into a message or handed to one of DECLARATION_OWNER_CALLS, and nothing else.
 DECLARATION_MARKERS = {"DECLARATION", "worker.json"}
 DECLARATION_OWNER_CALLS = {"write_bridge_declaration", "remove_bridge_declaration"}
+OWNER_MODULE = "gateway_credential_sources"
+# The owner's entry points: reachable only as `<alias>.<name>(...)` on the module's one import of it.
+OWNER_CALLS = frozenset(DECLARATION_OWNER_CALLS | {"bridge_declaration_fields", "bridge_token_environ"})
 # Owner calls whose callable arguments read credentials: (positional index, keyword names).
 OWNER_READERS = {"env_files": (1, ("read_text",)), "discover": (None, ("read_token_file", "vault_lookup"))}
 # Where credential I/O may happen: the adapters' edge, as (module, function).
@@ -1281,7 +1284,16 @@ PROBE_KEEPS = (ast.Global, ast.Nonlocal, ast.Assign, ast.AugAssign, ast.AnnAssig
 
 
 def _str(node) -> bool:
+    """A literal string node: the call-shape checks require one; detection reads _folded instead."""
     return isinstance(node, ast.Constant) and isinstance(node.value, str)
+
+
+def _folded(node, parents) -> "str | None":
+    """_constant(node), except where the parent folds whole (that parent is read instead)."""
+    parent = parents.get(node)
+    if isinstance(parent, (ast.BinOp, ast.JoinedStr, ast.FormattedValue)) and _constant(parent) is not None:
+        return None
+    return _constant(node)
 
 
 def _literal_list(node) -> bool:
@@ -1292,8 +1304,9 @@ def _callee(call) -> "str | None":
     return getattr(call.func, "id", None) or getattr(call.func, "attr", None)
 
 
-def _systemctl_literal(node) -> bool:
-    return _str(node) and os.path.basename(node.value.strip()) == "systemctl"
+def _systemctl_literal(node, parents) -> bool:
+    text = _folded(node, parents)
+    return text is not None and os.path.basename(text.strip()) == "systemctl"
 
 
 def _literal_args(call) -> bool:
@@ -1305,11 +1318,11 @@ def _literal_args(call) -> bool:
 
 
 def _systemd_findings(tree, parents, rel: str) -> "list[str]":
-    """Closed world, no constant evaluated and no dataflow: "systemctl" as a string literal anywhere
+    """Closed world, no dataflow: "systemctl" as a string (folded by _constant) anywhere
     but inside SYSTEMCTL_HELPER, the one top-level def of that name in its module; every use of a
     SYSTEMD_RUNNERS name a direct call by that name (the helper's with a literal tuple, _systemd_run's
     on a literal program), never imported under another name, rebound, redefined, or named in a
-    string; and show-environment in any string literal (template parts included) outside SYSTEMD_PROBE."""
+    string; and show-environment in any string (folded, template parts included) outside SYSTEMD_PROBE."""
     tops = [f for f in tree.body if isinstance(f, ast.FunctionDef) and f.name == SYSTEMCTL_HELPER[1]]
     canonical = {id(tops[0])} if rel == SYSTEMCTL_HELPER[0] and len(tops) == 1 else set()
     canonical |= {id(f) for f in tree.body if isinstance(f, ast.FunctionDef) and f.name == "_systemd_run"
@@ -1321,7 +1334,7 @@ def _systemd_findings(tree, parents, rel: str) -> "list[str]":
         while scope is not None and not isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef)):
             scope = parents.get(scope)
         where = f"{rel}:{getattr(n, 'lineno', getattr(parents.get(n), 'lineno', '?'))}"
-        if _str(n) and SHOW_ENV in n.value and (rel, getattr(scope, "name", None)) != SYSTEMD_PROBE:
+        if SHOW_ENV in (_folded(n, parents) or "") and (rel, getattr(scope, "name", None)) != SYSTEMD_PROBE:
             out.append(f"{where} {SHOW_ENV} outside the reachability probe")
         if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and n.name in SYSTEMD_RUNNERS \
                 and id(n) not in canonical:
@@ -1337,7 +1350,7 @@ def _systemd_findings(tree, parents, rel: str) -> "list[str]":
             out.append(f"{where} {sorted(w for w in SYSTEMD_RUNNERS if w in text)[0]} named in a string")
         if id(n) in helper:
             continue
-        if _systemctl_literal(n):
+        if _systemctl_literal(n, parents):
             out.append(f"{where} a systemctl literal outside {SYSTEMCTL_HELPER[1]}")
         word = getattr(n, "id", None) if isinstance(n, ast.Name) else getattr(n, "attr", None)
         if word not in SYSTEMD_RUNNERS or not isinstance(n, (ast.Name, ast.Attribute)):
@@ -1378,7 +1391,7 @@ def package_systemd_findings(root: Path) -> "list[str]":
 def _probe_keeps(inner, parents) -> "list[str]":
     """Why a scope that runs show-environment keeps its output: the run's result must be passed
     straight to _ok, a bool, and the scope may not read stdout/stderr, print, write or store."""
-    probe = [n for n in inner if _str(n) and SHOW_ENV in n.value]
+    probe = [n for n in inner if SHOW_ENV in (_folded(n, parents) or "")]
     if not probe:
         return []
     why = []
@@ -1414,14 +1427,62 @@ def _checked_nodes(tree, parents):
         if id(node) in docstrings or (isinstance(parent, (ast.BinOp, ast.JoinedStr, ast.FormattedValue))
                                       and _constant(parent) is not None):
             continue  # the folded parent is checked whole
-        yield node, _constant(node)
+        yield node, _folded(node, parents)
+
+
+def _binds(tree, name: str) -> int:
+    """How many places in the module bind `name`: assignment targets, parameters, imports, defs,
+    except-as, global or nonlocal declarations."""
+    count = 0
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Name) and n.id == name and not isinstance(n.ctx, ast.Load):
+            count += 1
+        elif isinstance(n, ast.arg) and n.arg == name:
+            count += 1
+        elif isinstance(n, ast.alias) and (n.asname or n.name.split(".")[0]) == name:
+            count += 1
+        elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and n.name == name:
+            count += 1
+        elif isinstance(n, ast.ExceptHandler) and n.name == name:
+            count += 1
+        elif isinstance(n, (ast.Global, ast.Nonlocal)) and name in n.names:
+            count += 1
+    return count
+
+
+def _owner_call_node(call, alias) -> bool:
+    """`call` is `<alias>.<declaration entry point>(...)` on the owner module's import."""
+    return alias is not None and isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute) \
+        and call.func.attr in DECLARATION_OWNER_CALLS and isinstance(call.func.value, ast.Name) \
+        and call.func.value.id == alias
+
+
+def _owner_call(node, parents, alias) -> bool:
+    """`node` is the function of a call `<alias>.<entry point>(...)` on the owner module's import."""
+    call = parents.get(node)
+    return alias is not None and isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) \
+        and node.value.id == alias and isinstance(call, ast.Call) and call.func is node
+
+
+def owner_alias(tree) -> "str | None":
+    """The name the module's one top-level import of the owner module binds, if it binds it once and
+    nothing rebinds it; None otherwise (then no call reaches the owner's entry points)."""
+    imports = [(n, a) for n in tree.body if isinstance(n, (ast.Import, ast.ImportFrom)) for a in n.names
+               if a.name.rsplit(".", 1)[-1] == OWNER_MODULE and a.asname
+               and (isinstance(n, ast.Import) or n.module in (None, "ag2_sparrow"))]
+    if len(imports) != 1:
+        return None
+    alias = imports[0][1].asname
+    return alias if _binds(tree, alias) == 1 else None
 
 
 def owner_only_findings(source: str, rel: str, reader: bool = False) -> "list[str]":
     """Every name the owner keeps to itself that `source` names: a key tuple, a private name or the
-    record's token key, as an identifier, an import, an attribute or a string (a getattr argument)."""
+    record's token key, as an identifier, an import, an attribute or a string (a getattr argument);
+    and an owner entry point reached other than as a direct call on the owner module's one import."""
     tree = ast.parse(source)
     parents = {c: n for n in ast.walk(tree) for c in ast.iter_child_nodes(n)}
+    alias = owner_alias(tree)
     out = []
     for node, text in _checked_nodes(tree, parents):
         name = node.attr if isinstance(node, ast.Attribute) else node.id if isinstance(node, ast.Name) else None
@@ -1435,65 +1496,139 @@ def owner_only_findings(source: str, rel: str, reader: bool = False) -> "list[st
             out.append(f"{rel}:{node.lineno} {name or text} named outside the owner")
         if not reader and (name in READER_ONLY or text in READER_ONLY):
             out.append(f"{rel}:{node.lineno} {name or text} named outside the declaration's reader")
+        if (name in OWNER_CALLS or text in OWNER_CALLS) and not _owner_call(node, parents, alias):
+            out.append(f"{rel}:{node.lineno} {name or text} reached other than as a call on the owner module")
         if text == RECORD_KEY:
             out.append(f"{rel}:{node.lineno} the record key {RECORD_KEY!r} named outside the owner")
     return out
 
 
-def declaration_reads(source: str, rel: str) -> "list[str]":
-    """Every call, in `source`, that takes a path built from the declaration's file name (as an argument
-    or as the object of a method: open, read_text, a helper, str()) other than the owner's
-    DECLARATION_OWNER_CALLS; a path inside an f-string is a message. Names bound from such a path count."""
-    tree = ast.parse(source)
-    out = []
-    defs = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
-    scopes = [[n for n in tree.body if not isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))]]
-    scopes += [[f] for f in ast.walk(tree) if isinstance(f, defs)]
-    for nodes in scopes:
-        inner = [n for root in nodes for n in ast.walk(root) if root is n or not isinstance(n, defs)]
-        tainted = set()
+def _scope_nodes(root):
+    """The nodes of one scope: `root` and what it holds, not the bodies of nested defs or classes."""
+    nested = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)
+    stack, out = [root], []
+    while stack:
+        n = stack.pop()
+        out.append(n)
+        stack.extend(c for c in ast.iter_child_nodes(n) if not isinstance(c, nested))
+    return out
 
-        def marked(expr):
-            return any((getattr(n, "id", None) or getattr(n, "attr", None)) in DECLARATION_MARKERS | tainted
-                       or (isinstance(n, ast.Constant) and isinstance(n.value, str)
-                           and any(m in n.value for m in DECLARATION_MARKERS if "." in m))
-                       for n in ast.walk(expr))
-        for _ in range(3):
+
+def declaration_reads(source: str, rel: str) -> "list[str]":
+    """Every call, in `source`, that takes a path to the declaration (as an argument or as the object of
+    a method: open, read_text, a helper, str()) other than an owner call on the owner module's import.
+    A path is built from DECLARATION or a string folding to the file name, or comes from a name bound
+    from one, a module global bound from one, or a function or lambda that returns one; a path only
+    inside an f-string is a message."""
+    tree = ast.parse(source)
+    alias, out = owner_alias(tree), []
+    names = {m for m in DECLARATION_MARKERS if "." not in m}
+    files = {m for m in DECLARATION_MARKERS if "." in m}
+    funcs = [f for f in ast.walk(tree) if isinstance(f, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))]
+    module = [n for root in tree.body if not isinstance(root, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+              for n in _scope_nodes(root)]
+    producers = set()
+
+    def marked(expr, tainted):
+        stack = [expr]
+        while stack:
+            n = stack.pop()
+            if any(m in (_constant(n) or "") for m in files):
+                return True
+            if isinstance(n, ast.JoinedStr) or _owner_call_node(n, alias):
+                continue  # a message, or what the owner returns: neither is the path
+            word = n.id if isinstance(n, ast.Name) else n.attr if isinstance(n, ast.Attribute) else None
+            if word in names or word in producers or (isinstance(n, ast.Name) and n.id in tainted):
+                return True
+            stack.extend(ast.iter_child_nodes(n))
+        return False
+
+    def taint(inner, seed):
+        tainted = set(seed)
+        for _ in range(4):
             for n in inner:
-                if isinstance(n, (ast.Assign, ast.AnnAssign, ast.NamedExpr)) and n.value is not None and marked(n.value):
+                if isinstance(n, (ast.Assign, ast.AnnAssign, ast.NamedExpr, ast.AugAssign)) and n.value is not None \
+                        and marked(n.value, tainted):
                     targets = n.targets if isinstance(n, ast.Assign) else [n.target]
                     tainted |= {t.id for tg in targets for t in ast.walk(tg) if isinstance(t, ast.Name)}
-                elif isinstance(n, ast.withitem) and n.optional_vars is not None and marked(n.context_expr):
+                elif isinstance(n, ast.withitem) and n.optional_vars is not None and marked(n.context_expr, tainted):
                     tainted |= {t.id for t in ast.walk(n.optional_vars) if isinstance(t, ast.Name)}
+                elif isinstance(n, (ast.For, ast.comprehension)) and marked(n.iter, tainted):
+                    tainted |= {t.id for t in ast.walk(n.target) if isinstance(t, ast.Name)}
+        return tainted
+
+    scopes = []
+    for _ in range(4):  # producers and module globals, to a fixpoint
+        glob = taint(module, set())
+        scopes = [(module, glob)]
+        for f in funcs:
+            inner = [n for c in ast.iter_child_nodes(f) for n in _scope_nodes(c)]
+            tainted = taint(inner, glob)
+            scopes.append((inner, tainted))
+            returns = [f.body] if isinstance(f, ast.Lambda) else [n.value for n in inner if isinstance(n, ast.Return) and n.value]
+            if not isinstance(f, ast.Lambda) and any(marked(v, tainted) for v in returns):
+                producers.add(f.name)
+    for inner, tainted in scopes:
         for n in inner:
-            if not isinstance(n, ast.Call) or getattr(n.func, "attr", None) in DECLARATION_OWNER_CALLS:
+            if not isinstance(n, ast.Call) or _owner_call_node(n, alias):
                 continue
             taken = n.args + [k.value for k in n.keywords] + ([n.func.value] if isinstance(n.func, ast.Attribute) else [])
-            if any(marked(a) and not isinstance(a, ast.JoinedStr) for a in taken):
+            if any(marked(a, tainted) for a in taken):
                 out.append(f"{rel}:{n.lineno} hands the bridge declaration's path to {ast.unparse(n.func)}")
     return sorted(set(out))
 
 
+# Closed world for the declaration's reader: bridge_environ is exactly this (its docstring aside), and
+# these are the module's only mapping writes. A change to either is a reviewed edit of this test.
+READER_ENVIRON = """
+token_env = _sources.bridge_token_environ(token)
+env = {k: v for k, v in (os.environ if base is None else base).items()
+       if k not in HOST_ONLY and k not in token_env}
+env.update(decl["env"], REMOTE_PROACTIVE_ROOM="")
+env.update(token_env)
+return env
+"""
+READER_WRITES = {("bridge_environ", "env.update(decl['env'], REMOTE_PROACTIVE_ROOM='')"),
+                 ("bridge_environ", "env.update(token_env)"),
+                 ("main", "os.environ.clear()"), ("main", "os.environ.update(environ)")}
+MAPPING_WRITES = {"update", "setdefault", "__setitem__", "__delitem__", "pop", "popitem", "clear", "putenv", "unsetenv"}
+
+
 def token_injection_findings(source: str, rel: str) -> "list[str]":
-    """The reader hands the bridge its token only through the owner: bridge_environ takes the mapping from
-    bridge_token_environ(...) and merges it whole, stores no item itself, and no string in the module is
-    one of the owner's token variable names (so no environment lookup of one by name)."""
+    """The reader hands the bridge its token only through the owner: bridge_environ is READER_ENVIRON,
+    the module's mapping writes are READER_WRITES, main's environment is bridge_environ's result, and
+    no string in the module is one of the owner's token variable names."""
     tree = ast.parse(source)
+    parents = {c: n for n in ast.walk(tree) for c in ast.iter_child_nodes(n)}
+    alias = owner_alias(tree)
     out = [f"{rel}:{n.lineno} names the token variable {_constant(n)!r}" for n in ast.walk(tree)
            if isinstance(_constant(n), str) and any(_constant(n) == k or (len(_constant(n)) >= 8 and _constant(n) in k)
                                                     for k in owner.TOKEN_KEYS)]
     fn = [f for f in tree.body if isinstance(f, ast.FunctionDef) and f.name == "bridge_environ"]
-    if len(fn) != 1:
-        return out + [f"{rel}: no single top-level bridge_environ"]
-    bound = {a.targets[0].id for a in ast.walk(fn[0]) if isinstance(a, ast.Assign) and len(a.targets) == 1
-             and isinstance(a.targets[0], ast.Name) and isinstance(a.value, ast.Call)
-             and ast.unparse(a.value.func) == "_sources.bridge_token_environ"}
-    merged = [c for c in ast.walk(fn[0]) if isinstance(c, ast.Call) and getattr(c.func, "attr", None) == "update"
-              and [ast.unparse(a) for a in c.args] in ([b] for b in bound) and not c.keywords]
-    if len(bound) != 1 or len(merged) != 1:
-        out.append(f"{rel}: bridge_environ does not merge bridge_token_environ(...) whole")
-    out += [f"{rel}:{n.lineno} bridge_environ stores an item itself" for n in ast.walk(fn[0])
-            if isinstance(n, ast.Subscript) and isinstance(n.ctx, ast.Store)]
+    body = fn[0].body if fn else []
+    if body and isinstance(body[0], ast.Expr) and isinstance(_constant(body[0].value), str):
+        body = body[1:]
+    if len(fn) != 1 or [ast.dump(n) for n in body] != [ast.dump(n) for n in ast.parse(READER_ENVIRON).body]:
+        out.append(f"{rel}: bridge_environ is not the pinned owner merge")
+
+    def scope(n):
+        while n is not None and not isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            n = parents.get(n)
+        return getattr(n, "name", "<module>")
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Subscript) and not isinstance(n.ctx, ast.Load):
+            out.append(f"{rel}:{n.lineno} a mapping item written directly ({ast.unparse(n)})")
+        elif isinstance(n, ast.Call) and getattr(n.func, "attr", None) in MAPPING_WRITES \
+                and (scope(n), ast.unparse(n)) not in READER_WRITES:
+            out.append(f"{rel}:{n.lineno} a mapping write outside the pinned ones ({ast.unparse(n)})")
+        elif isinstance(n, ast.Dict) and any(k is None and ast.unparse(v) != f"{alias}.bridge_declaration_fields()"
+                                             for k, v in zip(n.keys, n.values)):
+            out.append(f"{rel}:{n.lineno} a ** merge of something other than the owner's fields")
+    main = [f for f in tree.body if isinstance(f, ast.FunctionDef) and f.name == "main"]
+    binds = [n for f in main for n in ast.walk(f) if isinstance(n, ast.Name) and n.id == "environ"
+             and not isinstance(n.ctx, ast.Load)]
+    if len(binds) != 1 or ast.unparse(parents[binds[0]].value) != "bridge_environ(decl, token)":
+        out.append(f"{rel}: main's environment is not bridge_environ(decl, token) alone")
     return out
 
 
@@ -1517,8 +1652,8 @@ def credential_access(source: str, rel: str) -> "list[str]":
                 word = getattr(n, "id", None) or getattr(n, "attr", None)
                 if word in CREDENTIAL_MARKERS or word in tainted:
                     return True
-                if isinstance(n, ast.Constant) and isinstance(n.value, str) and (
-                        ".env" in n.value or n.value in CREDENTIAL_MARKERS):
+                text = _constant(n)
+                if text is not None and (".env" in text or text in CREDENTIAL_MARKERS):
                     return True
             return False
         tainted = set()
@@ -1621,6 +1756,11 @@ class Guard(unittest.TestCase):
             'body = {"token_env": _sources.token_env_name(os.environ)}',
             'body = {"token_env": os.environ.get(_sources.token_env_name())}',
             'def token_env_name():\n    return "TOKEN"',
+            'def f():\n    p = "relay" + ".en" + "v"\n    open(p).read()',
+            'def f():\n    open(f"relay{\'.env\'}").read()',
+            'def f():\n    subprocess.run(["system" + "ctl", "--user", "show-" + "environment"], capture_output=True).stdout',
+            'def f():\n    subprocess.run([f"{\'system\'}ctl", "--user", "show-environ" + "ment"]).stdout',
+            'def f():\n    subprocess.run(["{}ctl".format("system"), "status"])',
         ]
         for source in bypasses:
             self.assertTrue(credential_access(source, "probe.py"), source)
@@ -1632,6 +1772,7 @@ class Guard(unittest.TestCase):
         self.assertEqual(credential_access('"""Put REMOTE_TASK_TOKEN in the .env file."""\nx = 1\n', "probe.py"), [],
                          "a docstring naming a key is prose, not a read")
         self.assertEqual(credential_access(
+            'from ... import gateway_credential_sources as _sources\n'
             'def wire_bridge(cfg):\n    _sources.write_bridge_declaration(path, name=n, env=env)\n',
             "adapters/claude_code/cli.py"), [], "the owner builds the record; the adapter writes its text")
 
@@ -1697,7 +1838,7 @@ class Guard(unittest.TestCase):
         self.assertNotIn("owned_declaration", text)
 
     def test_a_read_of_the_declaration_path_outside_the_owner_is_flagged(self):
-        head = 'def f(root):\n    path = bridge_home(root) / DECLARATION\n'
+        head = 'from ... import gateway_credential_sources as _sources\ndef f(root):\n    path = bridge_home(root) / DECLARATION\n'
         for read in ('    text = path.read_text()\n', '    text, why = cm.file_text(path, "declaration")\n',
                      '    with open(path) as fh:\n        json.load(fh)\n', '    p2 = path\n    p2.read_bytes()\n',
                      '    json.load(open(bridge_home(root) / "worker.json"))\n', '    owned_declaration(path)\n',
@@ -1706,6 +1847,17 @@ class Guard(unittest.TestCase):
             self.assertTrue(credential_access(head + read, "adapters/claude_code/cli.py"), read)
         for fine in ('    print(f"declared: {path}")\n', '    _sources.write_bridge_declaration(path, written_by="x")\n'):
             self.assertEqual(declaration_reads(head + fine, "adapters/claude_code/cli.py"), [], fine)
+
+    def test_a_declaration_name_built_from_constants_is_the_declaration(self):
+        self.assertEqual(declaration_reads('def f(base, path):\n    open(os.path.join(base, "x.json")).read()\n', "a.py"), [],
+                         "the control: another file, beside a local named path, is not the declaration")
+        for built in ('"worker.json"', '"worker" + ".json"', '"work" + "er.json"', 'f"{\'worker\'}.json"',
+                      '"%s.json" % "worker"', '"{}.json".format("worker")'):
+            for source in (f'def f(base):\n    name = {built}\n    open(os.path.join(base, name)).read()\n',
+                           f'def f(base):\n    json.load(open(os.path.join(base, {built})))\n',
+                           f'def f(base):\n    other = {built}\n    where = os.path.join(base, other)\n    where.read_text()\n'):
+                self.assertTrue(declaration_reads(source, "adapters/claude_code/cli.py"), source)
+                self.assertTrue(credential_access(source, "adapters/claude_code/cli.py"), source)
 
     def test_the_owner_writes_the_record_install_wrote_before(self):
         env = {"AGENT_CONNECT_TASK_DIR": "/w/a/tasks", "AGENT_MXID": "@a:ag2.space"}
@@ -1786,6 +1938,59 @@ class Guard(unittest.TestCase):
                            ('    env.update(token_env)\n', '    env.update(token_env, X=os.environ.get("REMOTE_TASK_TOKEN"))\n')):
                 self.assertIn(mutant[0], text)
                 self.assertTrue(token_injection_findings(text.replace(mutant[0], mutant[1]), rel), mutant[1])
+
+    READER_SELF_WRITES = (
+        ('    env.update(token_env)\n', '    env.update(token_env)\n    env.update(REMOTE_TASK_TOKEN=token)\n'),
+        ('    env.update(token_env)\n', '    if False:\n        env.update(token_env)\n    env.update({k: token for k in token_env})\n'),
+        ('    env.update(token_env)\n', '    env.update(token_env)\n    env[suffix_key(decl)] = token\n'),
+        ('    env.update(token_env)\n', '    env.update(token_env)\n    env.setdefault(next(iter(token_env)), token)\n'),
+        ('    os.environ.update(environ)\n', '    os.environ.update(environ)\n    os.environ.update(**{next(iter(environ)): token})\n'),
+        ('    environ = bridge_environ(decl, token)\n', '    environ = {**bridge_environ(decl, token), "X": token}\n'),
+        ('    os.environ.update(environ)\n', '    os.environ.update(environ)\n    os.putenv(name_of(decl), token)\n'))
+
+    def test_the_reader_writes_no_environment_entry_itself(self):
+        for rel, path in RECORD_READERS.items():
+            text = path.read_text(encoding="utf-8")
+            self.assertEqual(token_injection_findings(text, rel), [])
+            for before, after in self.READER_SELF_WRITES:
+                self.assertIn(before, text)
+                self.assertTrue(token_injection_findings(text.replace(before, after, 1), rel), after)
+
+    def test_the_owner_entry_points_are_reached_only_on_the_owner_import(self):
+        imp = "from ... import gateway_credential_sources as _sources\n"
+        head = imp + "def f(root):\n    path = bridge_home(root) / DECLARATION\n"
+        self.assertEqual(credential_access(head + '    _sources.write_bridge_declaration(path, written_by="x")\n', "a.py"), [],
+                         "the control: the owner's import, called directly")
+        for source in (
+                head + "    class H:\n        def write_bridge_declaration(self, p):\n            return p.read_text()\n"
+                       "    H().write_bridge_declaration(path)\n",
+                head + "    write_bridge_declaration(path)\n",
+                imp + "def write_bridge_declaration(p):\n    return open(p).read()\n"
+                      "def f(root):\n    write_bridge_declaration(bridge_home(root) / DECLARATION)\n",
+                head + "    _sources = Spy()\n    _sources.write_bridge_declaration(path)\n",
+                imp + "import json as _sources\n" + head.split("\n", 1)[1] + "    _sources.remove_bridge_declaration(path)\n",
+                "import json as _sources\n" + head.split("\n", 1)[1] + "    _sources.write_bridge_declaration(path)\n",
+                head + '    getattr(_sources, "write_bridge_declaration")(path)\n',
+                head + "    w = _sources.write_bridge_declaration\n    w(path)\n",
+                head + "    def g(_sources):\n        _sources.write_bridge_declaration(path)\n"):
+            self.assertTrue(credential_access(source, "adapters/claude_code/cli.py"), source)
+
+    def test_a_declaration_path_from_a_helper_is_the_declaration(self):
+        for source in (
+                "def decl_path(root):\n    return bridge_home(root) / DECLARATION\n"
+                "def f(root):\n    p = decl_path(root)\n    if p.exists():\n        json.loads(p.read_text())\n",
+                "def decl_path(root):\n    p = bridge_home(root) / DECLARATION\n    return p\n"
+                "def outer(root):\n    return decl_path(root)\n"
+                "def f(root):\n    outer(root).read_text()\n",
+                "DECL = lambda root: bridge_home(root) / DECLARATION\ndef f(root):\n    DECL(root).read_text()\n",
+                "HOME_DECL = Path('~') / ('work' + 'er.json')\ndef f():\n    HOME_DECL.read_text()\n",
+                "class C:\n    def where(self, root):\n        return bridge_home(root) / DECLARATION\n"
+                "    def f(self, root):\n        self.where(root).read_text()\n",
+                "def f(root):\n    for p in [bridge_home(root) / DECLARATION]:\n        p.read_text()\n"):
+            self.assertTrue(declaration_reads(source, "adapters/claude_code/cli.py"), source)
+        self.assertEqual(declaration_reads('def msg(root):\n    return f"see {bridge_home(root) / DECLARATION}"\n'
+                                           'def f(root):\n    print(msg(root))\n', "a.py"), [],
+                         "the control: a function returning a message about the path is not a path")
 
     def test_the_name_only_route_is_the_owners_canonical_token_key(self):
         self.assertEqual(owner.token_env_name(), owner.TOKEN_KEYS[0])
