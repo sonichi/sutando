@@ -72,7 +72,7 @@ except ValueError as e:
     block = ""
     check("the recording block was extracted from the real gate", False, str(e))
 check("the recording block was extracted from the real gate",
-      "BOOT ABORTED" in block and "ask-owner.py" in block, f"got {len(block)} bytes")
+      "needs a login. Log in now?" in block and "ask-owner.py" in block, f"got {len(block)} bytes")
 
 # --- 1. delegation: the gate records only through ask-owner --------------------
 check("the gate records only via scripts/ask-owner.py (no file write, no second DM file)",
@@ -102,8 +102,9 @@ if block:
         # THE assertion: the shipped reader counts it.
         check("the gate's question is COUNTED by the shipped reader", len(after) == 1,
               f"{len(before)} -> {len(after)}")
-        check("...with the boot-abort title and the remedy in its body",
-              bool(after) and "BOOT ABORTED" in after[0]["title"]
+        check("...with the login question as its title and the remedy in its body",
+              bool(after) and "Startup stopped on TestHost" in after[0]["title"]
+              and "Log in now?" in after[0]["title"]
               and "run `claude login`" in after[0]["body"], json.dumps(after)[:300])
         check("...marked not yet in the room (no room is reachable from the fixture)",
               bool(after) and after[0]["in_room"] is False, json.dumps(after)[:300])

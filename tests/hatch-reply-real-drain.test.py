@@ -21,12 +21,13 @@ from unittest.mock import patch
 
 from _helpers.hermetic_env import hermetic_env  # noqa: E402
 
+from _helpers.hermetic_gateway import isolate_then_import  # noqa: E402
+_GW, _IMPORT_READS = isolate_then_import()
+
 REPO = Path(__file__).resolve().parents[1]
 PKG = REPO / 'packages' / 'ag2-sparrow'
 sys.path.insert(0, str(PKG))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _helpers.hermetic_gateway import isolate_then_import  # noqa: E402
-_GW, _IMPORT_READS = isolate_then_import()
 from ag2_sparrow import gateway_instance, outbox, remote_gateway_bridge as gw
 from ag2_sparrow.adapters.hatch import task_fields
 

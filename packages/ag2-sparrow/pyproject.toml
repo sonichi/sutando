@@ -40,6 +40,7 @@ ag2-sparrow = "ag2_sparrow.remote_gateway_bridge:main"
 # would change one of them.
 ag2-sparrow-outbox = "ag2_sparrow.outbox_cli:main"
 ag2-sparrow-hatch = "ag2_sparrow.adapters.hatch.cli:main"
+ag2-sparrow-claude-local = "ag2_sparrow.adapters.claude_code.cli:main"
 
 # Discovered, not listed: a hand-written list silently drops a new subpackage.
 [tool.setuptools.packages.find]
@@ -48,6 +49,8 @@ include = ["ag2_sparrow*"]
 
 # Non-Python files the Hatch adapter installs; they must ship in the wheel.
 [tool.setuptools.package-data]
+# the guarded pane-key send and its bounded wait, vendored from src/
+"ag2_sparrow" = ["*.sh"]
 "ag2_sparrow.adapters.hatch" = ["*.sh", "*.json"]
 "ag2_sparrow.adapters.claude_routine" = ["*.md"]
 "ag2_sparrow.adapters.claude_cloud_session" = ["*.md"]

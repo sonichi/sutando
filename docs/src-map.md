@@ -31,6 +31,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`auth_preflight.py`** — auth_preflight.py — probe whether a CLAUDE_CONFIG_DIR can boot the claude CLI authenticated (OK vs LOGIN_REQUIRED + exact remedy), before a restart terminates the session that could still fix it.
 - **`body_file.py`** — Bounded read of a CLI `--body-file` argument — the single owner of that policy.
 - **`bounded-wait.sh`** — Shared bounded child run.
+- **`bounded_file_read.py`** — Read a small regular file's text without ever blocking: the one reader for credential files.
 - **`browser-tools.ts`** — Browser & screen tools — Chrome tab control, scrolling, screenshots, and vision descriptions.
 - **`browser.mjs`** — Sutando browser automation — lightweight Playwright wrapper.
 - **`call-stats.py`** — Call statistics — summarize phone call activity over a time window.
@@ -48,6 +49,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`claude_config_dir.sh`** — Shared CLAUDE_CONFIG_DIR resolution for start-cli.sh and startup.sh.
 - **`claude_hooks_settings.py`** — Sutando-owned hook entries in a project-level Claude Code settings.json: install one idempotently and prune dead copies of the same hook.
 - **`cli_wedge.py`** — CLI progress detector for the core's tmux pane — advisory only.
+- **`cli_wedge_patterns.py`** — The abnormal-banner table of the CLI progress detector: text on a pane that says the CLI is parked (a login prompt, a provider limit, a compaction, an error it sits on), as data.
 - **`client-frame-hub.ts`** — Client-frame hub: optional voice plugins register handlers; the host offers them every client JSON frame it does not own.
 - **`cloud_auth.py`** — Sutando Cloud session: find the owner's sutk_ bearer and call the cloud API.
 - **`context-drop.sh`** — Sutando context drop — triggered by macOS hotkey via Automator Quick Action.
@@ -96,6 +98,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`file_lock.py`** — Cross-platform advisory file-lock primitives for shared runtime state.
 - **`fix-setup.sh`** — One-shot fix for Mac Mini after migration bundle setup
 - **`friction-detector.py`** — Proactive friction detector for Sutando.
+- **`gateway_credential_sources.py`** — Which AG2 Space gateway credential wins when sources disagree: the one owner of that precedence.
 - **`gateway_serving.py`** — Shared owner for the `gateway-status.json` sidecar verdict.
 - **`git_binary.py`** — Resolve a git executable that will actually run.
 - **`github-webhook.py`** — GitHub webhook bridge — receives GitHub events and writes task files.
@@ -167,7 +170,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`recording-state.ts`** — Shared recording state — used by both browser-tools.ts (describeScreenTool) and recording-tools.ts (scrollAndDescribeTool, screenRecordTool, etc.)
 - **`recording-tools.ts`** — Recording, video playback, and scroll-and-describe tools.
 - **`recovery_issues.py`** — Durable issue identities for recovery telemetry, independent of retry counts.
-- **`relay-agent.ts`** — Sutando's relay agent: the voice side's task manager between the voice model and the core, run as the bodhi subagent behind the `work` tool.
+- **`relay-agent.ts`** — Sutando's relay agent: the voice side's task manager between the voice model and the core, run as the bodhi subagent behind the NON_BLOCKING `work` tool: each call stays open until its task's result returns as that call's own response (WHEN_IDLE).
 - **`remote-gateway-bridge.py`** — remote-gateway-bridge.py — sutando loader for the canonical ag2-sparrow client.
 - **`remote-relay-bridge.py`** — remote-relay-bridge.py — DEPRECATED name; renamed to remote-gateway-bridge.py.
 - **`render_plist_template.py`** — Render a launchd plist: literal __TOKEN__ substitution, XML escaping, parse check.
@@ -200,6 +203,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`single_instance.py`** — Single-instance guard for long-running bridge daemons.
 - **`skill-manifest-config.sh`** — Generic, skill-agnostic: reads every installed skill's manifest.json "config" block (skills/MANIFEST.md's own convention, previously Node-only via inline-tools.ts) and prints "KEY=VALUE" for each key, NUL-terminated.
 - **`skill-setup-runner.ts`** — Shared runner for optional skills' setup() hooks.
+- **`skill_audience.py`** — Who a skill is for, and whether this install may link it: the one decision every installer calls.
 - **`skill_hooks.py`** — Discovery for skill-declared Claude Code hooks (`hooks` in a skill manifest).
 - **`skill_install.py`** — Atomic, fail-closed installs of skill directories into the core's skills dir.
 - **`skill_roots.py`** — Where installed skills live, and what their manifests declare — the one Python scan of the sanctioned roots: the engine's `<repo>/skills` and the owner's `<workspace>/skills`, the pair `skills/install.sh` links (the TS loader `loadSkillManifestTools` scans the same two).
@@ -209,6 +213,8 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`slack_owner.py`** — Slack owner-recipient resolution helpers.
 - **`slack_proactive_receipts.py`** — Durable idempotency receipts for Slack proactive-result delivery.
 - **`slack_result_delivery.py`** — Slack reply-leg delivery state, bound to the shared outbox (Slack strangler).
+- **`sparrow-claude-local.py`** — Sutando's entry for `ag2-sparrow-claude-local`: the package CLI with the workspace injected.
+- **`sparrow_agent_bridge.py`** — One agent's gateway bridge under sparrowd, from the declaration its claude-local install wrote.
 - **`sparrowd.py`** — sparrowd launcher — the adapter edge that names concrete workers.
 - **`startup-runtime.sh`** — Runtime/credential decisions shared by startup and behavior-level tests.
 - **`startup.sh`** — Sutando startup — starts available services + the selected core CLI.
@@ -219,6 +225,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`sutando_config.py`** — Canonical loader for `sutando.config.json` / `sutando.config.local.json`.
 - **`sutando_config.ts`** — Canonical loader for `sutando.config.json` / `sutando.config.local.json`.
 - **`sutando_platform.py`** — Cross-platform OS abstraction for Sutando Python services.
+- **`system_load.py`** — Sustained system load: one reading per health-check pass, a warning only when the last K passes all ran above a ratio of the core count, the top CPU users, and their cause.
 - **`task-bridge.ts`** — Voice → Claude Code session bridge.
 - **`task-delegation.ts`** — TaskDelegationService — step 4 of the interaction-planes refactor (issue #1947, built under the architecture names per design R3).
 - **`task-emit.sh`** — TASK_FILE emitters — sourceable so a test can invoke them in isolation.
@@ -237,7 +244,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`telegram-bridge.py`** — Telegram bridge for Sutando — polls bot messages, writes to tasks/, sends replies from results/.
 - **`telemetry.py`** — Anonymous, opt-out product telemetry for Sutando (PostHog).
 - **`tmp-paths.ts`** — Shared cross-platform temp-file paths used by both writers and readers.
-- **`tmux-pane-keys.sh`** — tmux-pane-keys.sh [--tmux BIN] -S SOCKET -t TARGET [--timeout SECS] -- <send-keys args...> Leaves pane mode and sends in one tmux step, bounded.
+- **`tmux-pane-keys.sh`** — tmux-pane-keys.sh [--tmux BIN] --python PY -S SOCKET -t TARGET [--timeout SECS] -- <send-keys args...> tmux-pane-keys.sh [--tmux BIN] --python PY -S SOCKET -t PANE [--timeout SECS] --fence PREDICATE ACTION Leaves pane mode and sends in one tmux step, bounded; or runs ACTION only while the format PREDICATE holds for PANE, else orphans the ticket (exit 1, nothing sent).
 - **`tmux-probe-cli.py`** — Tiny CLI over tmux_probe.has_session(), for callers (start-cli.sh's relay loop) that cannot import Python but must not duplicate its ABSENT_SIGNATURES.
 - **`tmux-status.ts`** — Tmux-pane status scraper.
 - **`tmux_pane_keys.py`** — Shared tmux pane-key argv and crash-safe send guard.

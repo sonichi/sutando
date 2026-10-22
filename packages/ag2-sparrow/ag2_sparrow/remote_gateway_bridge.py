@@ -305,7 +305,9 @@ from ._dirs import task_dir as _task_dir, result_dir as _result_dir, state_dir a
 from .chat_secret_filter import filter_chat_secrets, secret_handling_instruction
 from .task_archive import find_task_file
 from .local_task_protocol import find_archived_task
-from . import diagnostics, gateway_instance, local_task_protocol, routing_migrations
+from . import (agent_identity, diagnostics, gateway_credential_io, gateway_credential_sources,
+               gateway_credentials, gateway_instance, local_task_protocol, routing_migrations)
+from .bounded_file_read import read_regular, read_regular_text
 from .result_markers import parse_markers, render_skill_prelude
 from .result_markers import neutralize_markers
 from . import undelivered_quarantine
@@ -485,13 +487,8 @@ _EVENT_CHANNEL = None
 _warned_legacy = set()
 
 
-def _unquote_env(v):
-    """Whitespace and surrounding quotes off a credential value.
-
-    The ONE definition every reader uses, so the env tier cannot disagree with
-    the file tiers about a quoted `.env` line.
-    """
-    return v.strip().strip("'\"") if v else v
+# The credential sources' precedence and parsing have one owner; this module keeps only its I/O.
+_unquote_env = gateway_credential_sources.unquote
 
 
 def _env_compat(new, old):
@@ -507,164 +504,70 @@ def _env_compat(new, old):
 
 # One-token onboarding: REMOTE_TASK_TOKEN alone is enough. The onboarding
 # string may be the combined "https://<gateway>|<secret>" form (the URL travels
-_ENCODED_SEPARATOR_RE = re.compile(r"%7[Cc]")
-
-
-def _parse_onboarding_token(raw):
-    """Split the onboarding string into (url_from_token, secret).
-
-    NEVER mutates the token bytes — it only *splits* at the separator, so the
-    secret is returned verbatim (a bearer that itself contains "%7C" or "|" is
-    preserved intact; #2307 review). Disambiguation: only the combined form —
-    which begins with an http(s):// scheme — carries a separator to split on; a
-    bare secret is opaque and returned untouched even if it contains "%7C".
-
-    Handled at the single parse point, so every caller (startup.sh, direct env,
-    legacy AG2_REMOTE_TOKEN alias) is covered regardless of the onboarding writer.
-    """
-    if not raw.lower().startswith(("http://", "https://")):
-        return "", raw  # bare secret — opaque, never touched
-    i = raw.find("|")
-    if i != -1:
-        return raw[:i], raw[i + 1:]  # literal pipe wins; URL + secret verbatim
-    m = _ENCODED_SEPARATOR_RE.search(raw)
-    if m is None:
-        return "", raw  # scheme but no separator; the URL-less guard in main() speaks
-    return raw[:m.start()], raw[m.end():]  # URL + secret, both verbatim
+_parse_onboarding_token = gateway_credentials.parse_onboarding_token
 
 
 # Which channels/<dir>/ this instance reads (.env fallback + access.json).
 # Env-only — the .env file can't name its own directory. Default preserves the
-CHANNEL_DIR = os.environ.get("REMOTE_TASK_CHANNEL_DIR") or "ag2space"
+CHANNEL_DIR = gateway_credential_sources.channel_dir(os.environ)
+
+
+def _read_env_file(path: str):
+    """A credential file's (text, refusal reason): bounded_file_read.read_regular."""
+    return read_regular(path)
 
 
 def _channel_env_candidates():
-    """Readable channel-.env candidates in precedence order, as [(path, vals)].
-    A candidate lacking a key must not shadow a later one that carries it."""
-    candidates = [os.environ.get("AG2_DEVICE_ENV")]
-    _cfg = os.environ.get("CLAUDE_CONFIG_DIR")
-    if _cfg:
-        candidates.append(os.path.join(_cfg, "channels", CHANNEL_DIR, ".env"))
-    out = []
-    for path in candidates:
-        if not path:
-            continue
-        try:
-            with open(path, encoding="utf-8") as fh:
-                lines = fh.read().splitlines()
-        # Every candidate is read eagerly now, so one the old early-return never
-        # opened can be undecodable — and that is not an OSError.
-        except (OSError, UnicodeDecodeError):
-            continue
-        vals = {}
-        for ln in lines:
-            ln = ln.strip()
-            if not ln or ln.startswith("#") or "=" not in ln:
-                continue
-            key, _, val = ln.partition("=")
-            vals[key.strip()] = _unquote_env(val)
-        out.append((path, vals))
-    return out
+    """The readable channel .env files in precedence order, as [(path, vals)]
+    (gateway_credential_sources.env_files decides which and in what order)."""
+    return gateway_credential_sources.env_files(os.environ, _read_env_file)
 
 
 def _config_from_channel_env(key: str) -> str:
-    """First candidate CARRYING `key`, else "". Presence decides, not truth: an
-    explicit blank is a decision here exactly as it is in the environment."""
-    for _path, vals in _channel_env_candidates():
-        if key in vals:
-            return vals[key]
-    return ""
+    """First candidate CARRYING `key`, else "" (gateway_credential_sources.config_from_files)."""
+    return gateway_credential_sources.config_from_files(_channel_env_candidates(), key)
+
+
+def _announce_file_token(path: str, vals) -> None:
+    # Name the exact file: which .env supplied the token is load-bearing for diagnosis.
+    print(f"[remote-gateway-bridge] token not in env; loaded from {path}", file=sys.stderr, flush=True)
+    # The bridge derives its media marker tag from os.environ at import, so carry the file's.
+    _mm = vals.get("REMOTE_MEDIA_MARKER")
+    if _mm and not os.environ.get("REMOTE_MEDIA_MARKER"):
+        os.environ["REMOTE_MEDIA_MARKER"] = _mm
 
 
 def _token_from_ag2space_env():
-    """Fallback token source when the launcher didn't export it into the env.
+    """The file tier, for a launcher that did not export the token: (token, url, path) from the
+    first channel .env carrying one (gateway_credential_sources.token_from_files), or ("", "", "").
+    The desktop-spawned core is the case that matters: it reaches the bridge only through
+    AG2_DEVICE_ENV. The path is the durable source the auth-recovery path re-reads."""
+    tok, url, path, vals = gateway_credential_sources.token_from_files(_channel_env_candidates())
+    if tok:
+        _announce_file_token(path, vals)
+    return tok, url, path
 
-    `connect` writes the relay token to the channel .env, but not every launcher
-    gets it into the process environment. The desktop-spawned core is the case
-    that matters: its supervisor spawns the core (and the gateway window) with a
-    fixed env whitelist, and the window sources the .env only once at start — so
-    if connect writes the token after that (or the export step is skipped), the
-    bridge sees an empty token and never connects (every new desktop-only user
-    can reproduce this). Read the file directly so the bridge connects regardless
-    of who launched it, and so a bridge already looping when connect wrote the
-    token picks it up on its next start.
 
-    Returns (token, url). A combined url|secret token embeds the URL (split
-    downstream by _parse_onboarding_token), but a split-layout file (bare token +
-    separate REMOTE_TASK_URL) does not — so the file's REMOTE_TASK_URL is returned
-    alongside for the caller to feed into the URL chain. Returns ("", "") when no
-    candidate file holds a token.
+def _vault_lookup(vault_get=None):
+    """The vault read for the ag2space token, parity with the channel bridges: the shared
+    core `channel_token.token_from_vault`, total-failure-safe and never surfacing the value. The
+    package ships standalone, so the monorepo `src/` may be absent: then there is no vault tier
+    (None) rather than a crash at startup. `vault_get` is injectable for hermetic tests."""
+    return gateway_credential_io.vault_lookup(_monorepo_src("channel_token.py"), vault_get)
 
-    Candidates, in order:
-      1. AG2_DEVICE_ENV — the absolute path the desktop launcher (launch-sutando.sh)
-         lays into the gateway window, pointing straight at the file connect wrote;
-         the ONLY one that reaches the bridge in the desktop-spawned case.
-      2. $CLAUDE_CONFIG_DIR/channels/ag2space/.env — for non-desktop launchers that
-         do export CLAUDE_CONFIG_DIR into the bridge's environment.
-    We deliberately do NOT guess ~/.claude: a bare-home guess is the one path that
-    could silently pick up a token from an UNRELATED/old install and connect as the
-    WRONG identity (reinstall, account switch, leftover config). Both real launchers
-    are covered above; the bare-home guess only adds a footgun.
-    """
-    for path, vals in _channel_env_candidates():
-        # Truthiness here, presence in _config_from_channel_env: a blank secret is
-        # absence and must fall through to the legacy alias; a blank room is a choice.
-        tok = vals.get("REMOTE_TASK_TOKEN") or vals.get("AG2_REMOTE_TOKEN")
-        if tok:
-            # Name the exact file — which .env supplied the token is load-bearing
-            # for diagnosis (and for spotting a wrong-file bind).
-            print(f"[remote-gateway-bridge] token not in env; loaded from {path}",
-                  file=sys.stderr, flush=True)
-            # Carry the file's REMOTE_TASK_URL too. A combined url|secret token
-            # embeds the URL (parsed downstream), but a SPLIT layout (bare token +
-            url = vals.get("REMOTE_TASK_URL") or vals.get("AG2_REMOTE_URL") or ""
-            # Carry REMOTE_MEDIA_MARKER from the same file too. The bridge derives
-            # its marker tag from os.environ at import (MEDIA_MARKER_TAG below), and
-            _mm = vals.get("REMOTE_MEDIA_MARKER")
-            if _mm and not os.environ.get("REMOTE_MEDIA_MARKER"):
-                os.environ["REMOTE_MEDIA_MARKER"] = _mm
-            # Return the source file path too (main #2323): it is the durable token
-            # source the auth-recovery path re-reads on rejection. In the desktop-
-            return tok, url, path
-    return "", "", ""
+
+def _announce_vault_token() -> None:
+    # Name the source, never the value.
+    print("[remote-gateway-bridge] token not in env or .env; loaded from vault", file=sys.stderr, flush=True)
 
 
 def _token_from_vault_ag2space(vault_get=None):
-    """Vault tier for the ag2space onboarding token — parity with the channel
-    bridges (#2638).
-
-    Before this, sparrow resolved its token from the process env and the channel
-    `.env`, but NEVER the Keychain vault (`get_vault_key` occurrences in this
-    module: 0). So `vault set REMOTE_TASK_TOKEN <value>` stored the secret
-    correctly and changed nothing for ag2space — the operator spent the secret
-    and saw no effect, exactly the failure #2638 fixed for discord/slack/telegram
-    (@qingyun-air's 2026-08-04 bridge-parity finding). This closes that gap.
-
-    Reuses the shared core policy `channel_token.token_from_vault` rather than
-    copying it (the read is total-failure-safe and never surfaces the value).
-    sparrow ships standalone (`pyproject.toml`), so the monorepo `src/` may be
-    absent; when `channel_token` can't be located/imported we degrade to the
-    pre-#2638 behavior — no vault tier — rather than crash a bridge at startup.
-    Tries the current name, then the legacy `AG2_REMOTE_TOKEN` alias. Returns ''
-    on any failure. `vault_get` is injectable so the tier is testable hermetically
-    without touching a real Keychain.
-    """
-    try:
-        src = _monorepo_src("channel_token.py")
-        if not src:
-            return ""
-        if src not in sys.path:
-            sys.path.insert(0, src)
-        from channel_token import token_from_vault
-    except Exception:
-        return ""
-    tok = (token_from_vault("REMOTE_TASK_TOKEN", vault_get=vault_get)
-           or token_from_vault("AG2_REMOTE_TOKEN", vault_get=vault_get))
+    """The vault tier (gateway_credential_sources.token_from_vault): the current name, then the
+    legacy AG2_REMOTE_TOKEN alias; '' on any failure."""
+    lookup = _vault_lookup(vault_get)
+    tok = gateway_credential_sources.token_from_vault(lookup)[0] if lookup else ""
     if tok:
-        # Name the source — which layer supplied the token is load-bearing for
-        # diagnosis. Never print the value.
-        print("[remote-gateway-bridge] token not in env or .env; loaded from vault",
-              file=sys.stderr, flush=True)
+        _announce_vault_token()
     return tok
 
 
@@ -1303,6 +1206,9 @@ def _handle_hitl_action(task: dict):
     # click form, or a review decision); its form must not be re-derived.
     if task_id and _control_result_path(task_id).is_file():
         return "redelivered"
+    local = _handle_claude_local(task)
+    if local:
+        return local
     if not isinstance(task.get("hitl_action"), dict) and not task.get("reply_to_event"):
         return False
     owner = os.environ.get("SPARROW_HA_OWNER") or ""
@@ -1613,14 +1519,7 @@ _VAULT_INTERCEPT_FNS: "tuple | None" = None
 def _monorepo_src(marker: str) -> str:
     """The monorepo `src/` that holds `marker`, walking up from this file;
     '' when sparrow runs standalone (pyproject install, no monorepo around it)."""
-    cur = os.path.dirname(os.path.abspath(__file__))
-    while True:
-        if os.path.isfile(os.path.join(cur, "src", marker)):
-            return os.path.join(cur, "src")
-        parent = os.path.dirname(cur)
-        if parent == cur:
-            return ""
-        cur = parent
+    return gateway_credential_io.monorepo_src(marker, __file__)
 
 
 # `project()` assigns retry cadence to its caller and the worker drives this
@@ -1641,6 +1540,51 @@ def _hitl_backoff_reset() -> None:
     _HITL_BACKOFF["until"] = 0.0
 
 
+def _hitl_modules():
+    """(manager, projector, replies) modules: the wheel's own `ag2_sparrow.hitl` first, the monorepo
+    `src/hitl` only when the vendored copy is absent, so a standalone install has them."""
+    try:
+        from .hitl import manager, projector, replies
+        return manager, projector, replies
+    except ImportError:
+        src = _monorepo_src(os.path.join("hitl", "projector.py"))
+        if not src:
+            return None
+        if src not in sys.path:
+            sys.path.insert(0, src)
+        from hitl import manager, projector, replies
+        return manager, projector, replies
+
+
+def _claude_local_store_root() -> Path:
+    """The claude-local cards' own store root beside the default store: what an unmodified gateway
+    never reads, so old main neither projects nor accepts them."""
+    from .claude_local_card import store_root
+    return store_root(_STATE)
+
+
+def _project_claude_local(mods, room: str, log=print) -> list:
+    """Project the claude-local root's cards into the owner DM (the room filled on the
+    requirement under the store lock when the launcher could not know it)."""
+    manager_mod, projector, _ = mods
+    root = _claude_local_store_root()
+    if not root.is_dir():
+        return []
+    store = manager_mod.HitlStore(root)
+    manager = manager_mod.HitlManager(store, policy=None)
+    with store.locked():
+        for req in store.all():
+            if not req.room and not req.terminal:
+                req.room = room
+                sub = req.subject.get("claude-local") if isinstance(req.subject, dict) else None
+                if isinstance(sub, dict) and not sub.get("room"):
+                    sub["room"] = room
+                store.save(req, store.projection(req.id))
+    if not projector.pending_ids(manager):
+        return []
+    return projector.project(manager, lambda payload: _req("POST", "/v1/room", payload, timeout=20), room)
+
+
 def _project_hitl(log=print) -> int:
     """Push every un-projected HITL requirement out as a card, or 0 when
     `src/hitl` is absent (standalone sparrow) — same optional tier as the
@@ -1659,53 +1603,189 @@ def _project_hitl(log=print) -> int:
     if time.monotonic() < _HITL_BACKOFF["until"]:
         return 0
     try:
-        src = _monorepo_src(os.path.join("hitl", "projector.py"))
-        if not src:
+        mods = _hitl_modules()
+        if mods is None:
             return 0
-        if src not in sys.path:
-            sys.path.insert(0, src)
-        from hitl.manager import HitlManager, HitlStore, default_store
-        from hitl.projector import pending_ids, project
+        manager_mod, projector, _ = mods
+        HitlManager, HitlStore, default_store = manager_mod.HitlManager, manager_mod.HitlStore, manager_mod.default_store
+        pending_ids, project = projector.pending_ids, projector.project
     except Exception as e:  # noqa: BLE001 — an optional tier never breaks the pulse
         log(f"hitl: projector unavailable ({diagnostics.describe(e)}); cards will not be delivered")
         return 0
     workspace = _STATE.parent
     manager = HitlManager(HitlStore(default_store(workspace)))
-    if not pending_ids(manager):
-        _hitl_backoff_reset()  # idle is not failure; a new card must not wait out a backoff
-        return 0
+    done, failed, raised = [], False, None
+    # Each store gets its pass: a stuck card in one never holds back the other's.
     try:
-        done = project(manager, lambda payload: _req("POST", "/v1/room", payload, timeout=20),
-                       room)
-    except Exception:
-        _hitl_backoff_bump(log)  # a raising sender is a refusal too
-        raise
-    if not done:
-        _hitl_backoff_bump(log)
-        return 0
-    _hitl_backoff_reset()
+        if pending_ids(manager):
+            got = project(manager, lambda payload: _req("POST", "/v1/room", payload, timeout=20), room)
+            done, failed = list(got or []), not got
+    except Exception as e:  # noqa: BLE001 — re-raised below, after the claude-local pass
+        failed, raised = True, e
+    try:
+        done += _project_claude_local(mods, room, log)
+    except Exception as e:  # noqa: BLE001 — re-raised below
+        failed, raised = True, raised or e
     for req_id, event_id in done:
         log(f"hitl: projected {req_id} -> {event_id or 'no event id'}")
+    if failed:
+        _hitl_backoff_bump(log)  # a refusing or raising sender
+        if raised is not None:
+            raise raised
+        return len(done)
+    _hitl_backoff_reset()  # idle is not failure; a new card must not wait out a backoff
     return len(done)
 
 
 def _hitl_reply_handler(owner_mxid: str, log=print):
-    """Owner card-click handler for HITL cards, or None when `src/hitl` is not
-    around (standalone sparrow) — the chain then simply lacks it, like the vault tier."""
+    """Owner card-click handler for HITL cards, or None when neither the vendored `ag2_sparrow.hitl`
+    nor `src/hitl` is around — the chain then simply lacks it, like the vault tier."""
     try:
-        src = _monorepo_src(os.path.join("hitl", "replies.py"))
-        if not src:
+        mods = _hitl_modules()
+        if mods is None:
             return None
-        if src not in sys.path:
-            sys.path.insert(0, src)
-        from hitl.manager import HitlManager, HitlStore, default_store
-        from hitl.replies import HitlReplyHandler
+        manager_mod, _, replies = mods
         workspace = _STATE.parent
-        return HitlReplyHandler(HitlManager(HitlStore(default_store(workspace))), owner_mxid,
-                                workspace=workspace, log=log)
+        return replies.HitlReplyHandler(manager_mod.HitlManager(manager_mod.HitlStore(manager_mod.default_store(workspace))),
+                                        owner_mxid, workspace=workspace, log=log)
     except Exception as e:  # noqa: BLE001 — an optional handler must never break the chain
         log(f"hitl: reply handler unavailable ({diagnostics.describe(e)}); card clicks will not be applied")
         return None
+
+
+CLAUDE_LOCAL_ID_PREFIX = "hitl_cl_"
+REARM_PENDING = "applied:rearm-pending:"
+_EXIT_TEXT = "/exit"
+
+
+def _claude_local_accepter():
+    """The bridge-owned claude-local accepter; (None, why) when it cannot be imported."""
+    try:
+        from . import claude_local_accepter as accepter
+    except ImportError as e:  # part of this package; a missing piece is a packaging fault
+        return None, f"claude-local accepter unavailable ({e})"
+    return accepter, ""
+
+
+def _owner_dm_text(task: dict) -> bool:
+    """The owner's own top-level, unquoted, unforwarded, unrelayed message in the projected owner DM."""
+    owner = os.environ.get("SPARROW_HA_OWNER") or ""
+    uid = str(task.get("user_id") or "")
+    if not owner or uid != owner:
+        return False
+    if _tier_for(uid, _normalized_tier(task.get("access_tier"))) != "owner":
+        return False
+    room = str(task.get("channel_id") or "")
+    if not room or room != resolve_destination(OWNER_PRIVATE):
+        return False
+    if task.get("reply_to_event") or task.get("thread_root") or task.get("interaction_type") in ("forward", "forwarded"):
+        return False
+    text = str(task.get("task") or "")
+    stripped = text.strip()
+    return bool(stripped) and local_task_protocol.reply_action_text(text) == stripped and not stripped.startswith("[")
+
+
+def _handle_claude_local(task: dict):
+    """A click on a claude-local card (id namespaced hitl_cl_) or the owner's bare `/exit` in the owner
+    DM: both go to the adapter's one accepter; the outcome closes the task [no-send]. False = not ours."""
+    payload = task.get("hitl_action")
+    reply = None
+    if isinstance(payload, dict) and str(payload.get("hitl_id") or "").startswith(CLAUDE_LOCAL_ID_PREFIX):
+        accepter, problem = _claude_local_accepter()
+        if accepter is None:
+            return "rejected:" + problem
+        from .hitl.schema import ActionReply, MalformedActionError
+        try:
+            reply = ActionReply.from_wire(dict(payload, room=task.get("channel_id") or "", sender=task.get("user_id") or ""))
+        except MalformedActionError as e:
+            return f"rejected:{e}"
+    elif str(task.get("task") or "").strip() == _EXIT_TEXT and _owner_dm_text(task):
+        accepter, _ = _claude_local_accepter()
+        if accepter is None or not _claude_local_store_root().is_dir():
+            return False  # no claude-local card store here: the text stays a message
+        store = accepter.card.HitlStore(_claude_local_store_root())
+        reply = accepter.exit_text_reply(store, str(task.get("channel_id") or ""), str(task.get("user_id") or ""))
+        if reply == 0:
+            return False  # no open card: a bare /exit is an ordinary message
+        if isinstance(reply, int):
+            return f"rejected:{reply} stop cards are open; use the card's own button"
+    else:
+        return False
+    owner = os.environ.get("SPARROW_HA_OWNER") or ""
+    uid = str(task.get("user_id") or "")
+    owner_ok = bool(owner) and uid == owner and _tier_for(uid, _normalized_tier(task.get("access_tier"))) == "owner"
+    try:
+        out = accepter.accept(reply, state_dir=_STATE, owner_ok=owner_ok, log=_log)
+    except Exception as e:  # noqa: BLE001 — a broken click must not stall the poll loop
+        return f"rejected:{e}"
+    return out
+
+
+def _hitl_control_body(hitl_out) -> str:
+    """The control result closing a consumed click: a refusal or cancellation is the owner's to hear;
+    applied and commit-unknown (consumed, reconciled by the launcher) send nothing."""
+    out = str(hitl_out)
+    if out.startswith(REARM_PENDING):
+        return (f"Recorded: keep waiting. The new card could not be raised yet ({out[len(REARM_PENDING):]}); "
+                "the launcher completes it at its next reconcile.")
+    if out.startswith("rejected:"):
+        return f"That click did not apply: the card had already moved ({out[9:]}). Please use the current card."
+    if out.startswith("cancelled:"):
+        return f"Cancelled: {out[10:]}"
+    return "[no-send]"
+
+
+def _click_owner_problem(owner: str, actor: str, attested_tier) -> str:
+    """'' when a card click is the owner's, else why not. Fails closed: the actor must equal the configured
+    owner exactly; an attested tier, when present, must also be owner; the local tier cap always applies."""
+    if not owner:
+        return "no owner is configured, so no card click is the owner's"
+    if actor != owner:
+        return "only the owner may act on this card"
+    claimed = _normalized_tier(attested_tier) if attested_tier else "owner"
+    if _tier_for(actor, claimed) != "owner":
+        return "the click is not at owner tier"
+    return ""
+
+
+class _ClaudeLocalClicks:
+    """An event-channel click on a claude-local card, claimed ahead of the default store's handler so
+    it reaches the adapter's accepter and never the default store or taskify."""
+
+    def __init__(self, owner: str, log=print):
+        self.owner, self.log, self.last_path, self.last_outcome = owner, log, None, None
+
+    @staticmethod
+    def _payload(event: dict):
+        content = event.get("content") or {}
+        payload = content.get("space.ag2.hitl.action")
+        return payload if isinstance(payload, dict) else None
+
+    def claims(self, event: dict) -> bool:
+        payload = self._payload(event)
+        return (event.get("type") == "message.created" and payload is not None
+                and str(payload.get("hitl_id") or "").startswith(CLAUDE_LOCAL_ID_PREFIX))
+
+    def offer(self, event: dict) -> list:
+        eid = str(event.get("event_id") or "")
+        actor = str(event.get("actor_id") or "")
+        accepter, problem = _claude_local_accepter()
+        if accepter is None:
+            self.last_outcome = "rejected:" + problem
+        else:
+            from .hitl.schema import ActionReply, MalformedActionError
+            try:
+                reply = ActionReply.from_wire(dict(self._payload(event), room=str(event.get("room_id") or ""),
+                                                   sender=actor))
+                problem = _click_owner_problem(self.owner, actor, event.get("access_tier"))
+                self.last_outcome = (f"rejected:{problem}" if problem else
+                                     accepter.accept(reply, state_dir=_STATE, log=self.log, owner_ok=True))
+            except MalformedActionError as e:
+                self.last_outcome = f"rejected:{e}"
+            except Exception as e:  # noqa: BLE001 — a broken click must not stall the drain
+                self.last_outcome = f"rejected:{e}"
+        self.log(f"hitl: claude-local click {eid or '?'} by {actor or '?'}: {self.last_outcome}")
+        return [eid] if eid else []
 
 
 def _vault_intercept_fns():
@@ -1735,18 +1815,36 @@ def _local_redact_vault_set(text: str) -> str:
     return _grammar_redact(text, placeholder="[VAULT-SET-REDACTED: interceptor unavailable]")
 
 
-_RAW = _env_compat("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN") or ""
-_URL_FALLBACK = ""
-_TOKEN_FILE_FALLBACK = ""
-if not _RAW:
-    _RAW, _URL_FALLBACK, _TOKEN_FILE_FALLBACK = _token_from_ag2space_env()
-if not _RAW:
-    # Last resort: the Keychain vault — parity with the channel bridges (#2638).
-    # Without this, `vault set REMOTE_TASK_TOKEN` was a no-op for ag2space.
-    _RAW = _token_from_vault_ag2space()
-_URL_FROM_TOKEN, TOKEN = _parse_onboarding_token(_RAW)
-URL = (_env_compat("REMOTE_TASK_URL", "AG2_REMOTE_URL")
-       or _URL_FROM_TOKEN or _URL_FALLBACK).rstrip("/")
+def _read_text(path: str) -> str:
+    return read_regular_text(path) or ""
+
+
+class _SinkRegistry(gateway_credentials.SecretRegistry):
+    """Also withholds each value from the log and status sinks, which read diagnostics' registry."""
+
+    def register(self, value, min_len: int = 1) -> None:
+        super().register(value, min_len)
+        diagnostics.register_secret(value, min_len)
+
+
+# The process's credentials: every candidate registered, the winners chosen by the one owner's table.
+_SECRETS = _SinkRegistry()
+# The vault is located only if no earlier source holds a token.
+_FOUND = gateway_credential_sources.discover(
+    os.environ, _channel_env_candidates(), read_token_file=_read_env_file,
+    vault_lookup=lambda key: (_vault_lookup() or (lambda _k: ""))(key), registry=_SECRETS)
+for _note in _FOUND.notes + ((_FOUND.fatal,) if _FOUND.fatal else ()):
+    print(f"[remote-gateway-bridge] {_note}", file=sys.stderr, flush=True)
+for _old, _new in _FOUND.deprecated:
+    if _old not in _warned_legacy:
+        _warned_legacy.add(_old)
+        print(f"[remote-gateway-bridge] {_old} is deprecated — rename to {_new} in your .env",
+              file=sys.stderr, flush=True)
+if _FOUND.token_source == "file":
+    _announce_file_token(_FOUND.source_file, _FOUND.source_file_values)
+elif _FOUND.token_source == "vault":
+    _announce_vault_token()
+_RAW, TOKEN, URL = _FOUND.raw, _FOUND.token, _FOUND.url
 # Every credential this process holds is withheld from logs and status in any rendering.
 gateway_instance.register_gateway_secrets(URL)
 diagnostics.register_secret(TOKEN)
@@ -1770,6 +1868,9 @@ PROACTIVE_CLAIM_GATE: Callable[[Path], bool] | None = None
 # Host-injected post-claim room gate ((original path, room) -> bool), consulted
 # on the CLAIMED body of a `proactive-result-*` naming a room; None allows all.
 PROACTIVE_ROOM_GATE: Callable[[Path, str], bool] | None = None
+# Host-injected (old_room, replacement_room) -> None, owed once per upgrade of the owner
+# DM to a room this agent is not in; raising is a failure and is retried, bounded.
+OWNER_DM_UPGRADED_NOTIFY: Callable[[str, str], None] | None = None
 # Routing state belongs to the gateway (owner 2026-09-07): the agent row's owner_dm_room is read at
 # connect and on a slow cadence and kept while offline; the pinned room is bootstrap, never authority.
 _ROUTING: dict = {"owner_dm": "", "persisted": "", "identity": "", "gateway": "", "next": 0.0,
@@ -2045,7 +2146,7 @@ ACK_UNSUPPORTED_COOLDOWN = int(os.environ.get("REMOTE_ACK_RETRY_COOLDOWN") or "3
 _ack_disabled_until = 0.0   # 0 = enabled; else epoch until which acks are skipped
 # Auth-rejection recovery: when the gateway rejects the bearer (401/403 — the
 # key was revoked or expired), the historical behavior is an immediate FATAL
-TOKEN_FILE = os.environ.get("REMOTE_TASK_TOKEN_FILE") or _TOKEN_FILE_FALLBACK or ""
+TOKEN_FILE = _FOUND.token_file
 AUTH_RECHECK_INTERVAL = int(os.environ.get("REMOTE_AUTH_RECHECK_INTERVAL") or "30")
 # Registry-loss self-claim (backend #595): the code is device-visible only;
 # binding requires the owner's concierge approval. Disable: REMOTE_REENROLL=0.
@@ -2065,25 +2166,9 @@ def _provision_base() -> str:
 def _reenroll_identity() -> str:
     """Agent mxid: process env, then the channel .env file — the same fallback
     the token uses (desktop launchers don't export either) — then the durable
-    per-host identity enrolment wrote to state/auth/ag2space.json."""
-    for key in ("AGENT_MXID", "AGENT_ID"):
-        v = (os.environ.get(key) or "").strip()
-        if v:
-            return v
-    for key in ("AGENT_MXID", "AGENT_ID", "AG2SPACE_USER_ID"):
-        v = _config_from_channel_env(key).strip()
-        if v:
-            return v
-    # Re-read per call, like the channel-env candidates: an identity that
-    # appears mid-episode must take effect without a restart.
-    try:
-        rec = json.loads((_STATE / "auth" / "ag2space.json").read_text())
-        # Non-string values must read as unknown, not be coerced into a
-        # garbage identity that _reenroll_claim would POST on the cadence.
-        v = rec.get("agent_id")
-        return v.strip() if isinstance(v, str) else ""
-    except Exception:  # absent, unreadable, or malformed — identity unknown
-        return ""
+    per-host identity enrolment wrote to state/auth/ag2space.json. Re-read per
+    call, so an identity that appears mid-episode takes effect without a restart."""
+    return agent_identity.resolve(_STATE, _config_from_channel_env)
 
 
 def _reenroll_claim() -> None:
@@ -2461,24 +2546,7 @@ MEDIA_MARKER_TAG = re.sub(r"[^A-Za-z0-9_-]", "",
                           os.environ.get("REMOTE_MEDIA_MARKER") or "remote-media")
 MEDIA_MARKER_RE = re.compile(r"\[" + re.escape(MEDIA_MARKER_TAG) + r":([^\]]*)\]")
 
-# Untrusted room-ops metadata block: the gateway appends a free-text
-# `[room-ops metadata: …]` pointer to the operating card onto the message body.
-_ROOM_OPS_META_RE = re.compile(r"\s*\[room-ops metadata:[^\]]*\]", re.IGNORECASE)
-
-
-def _strip_room_ops_meta(body: str) -> "tuple[str, bool]":
-    """Remove any untrusted `[room-ops metadata: …]` block(s) from a task body.
-
-    Returns (cleaned_body, stripped) so the caller can log the quarantine. Runs
-    before _one_line so a block split across newlines is still caught."""
-    if not body or "room-ops metadata:" not in body.lower():
-        return body, False
-    cleaned = _ROOM_OPS_META_RE.sub("", body)
-    stripped = cleaned != body
-    # Return the cleaned body even when it is now empty: a metadata-ONLY body is
-    # pure injection with no legitimate task text, so it must degrade to an empty
-    return (cleaned.strip(), stripped)
-HS_MEDIA_TOKEN = os.environ.get("REMOTE_MEDIA_HS_TOKEN") or ""
+HS_MEDIA_TOKEN = _FOUND.media_token
 diagnostics.register_secret(HS_MEDIA_TOKEN)
 # The homeserver token is attached ONLY to media URLs on this exact origin
 # (scheme+host+port). Without it configured, Matrix media URLs are never
@@ -2611,8 +2679,35 @@ def _gateway_call():
         yield
 
 
-def _req(method: str, path: str, payload: dict | None = None, timeout: int = _REQ_TIMEOUT_S):
-    """One authenticated HTTP request. Returns parsed JSON (or {} for empty)."""
+# The last response's status and edge headers, per thread, for the poll's anomaly line.
+_RESP_META = threading.local()
+
+
+def _read_by(resp, deadline: float) -> bytes:
+    """The body, read in chunks against a wall-clock deadline: urllib's timeout bounds each
+    socket operation, so a body that drips in could otherwise run on past it."""
+    sock = getattr(getattr(getattr(resp, "fp", None), "raw", None), "_sock", None)
+    chunks = []
+    while True:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise TimeoutError("response body still arriving at its deadline")
+        if sock is not None:
+            sock.settimeout(left)
+        chunk = resp.read(4096)
+        if not chunk:
+            return b"".join(chunks)
+        chunks.append(chunk)
+
+
+def _req(method: str, path: str, payload: dict | None = None, timeout: int = _REQ_TIMEOUT_S,
+         deadline: "float | None" = None):
+    """One authenticated HTTP request. Returns parsed JSON (or {} for empty). With
+    `deadline` (time.monotonic()), the whole request must finish by then."""
+    if deadline is not None:
+        timeout = min(timeout, deadline - time.monotonic())
+        if timeout <= 0:
+            raise TimeoutError("request deadline already passed")
     with _gateway_call():
         data = json.dumps(payload).encode() if payload is not None else None
         req = urllib.request.Request(f"{URL}{path}", data=data, method=method)
@@ -2624,7 +2719,11 @@ def _req(method: str, path: str, payload: dict | None = None, timeout: int = _RE
         if data is not None:
             req.add_header("Content-Type", "application/json")
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read().decode().strip()
+            headers = getattr(resp, "headers", None) or {}
+            _RESP_META.last = {"status": getattr(resp, "status", None),
+                               "content_length": headers.get("Content-Length"),
+                               "cf_ray": headers.get("CF-Ray")}
+            raw = (resp.read() if deadline is None else _read_by(resp, deadline)).decode().strip()
             return json.loads(raw) if raw else {}
 
 
@@ -2638,59 +2737,19 @@ def _http_error_body(e) -> str:
 
 
 def _read_token_file(path: str) -> str:
-    """The onboarding string from a token file, or "" (missing / unreadable /
-    empty — the caller treats all three as no-rotation). Two accepted shapes:
-    a dotenv-style file carrying a REMOTE_TASK_TOKEN= line (legacy
-    AG2_REMOTE_TOKEN= honored, optional `export `, surrounding quotes
-    stripped), or the raw onboarding string alone on the first non-comment,
-    '='-free line."""
-    try:
-        text = Path(path).read_text(encoding="utf-8")
-    except OSError:
-        return ""
-    # Collect BOTH alias assignments across the WHOLE file, then apply the
-    # documented precedence REMOTE_TASK_TOKEN > AG2_REMOTE_TOKEN regardless of
-    found: dict = {}
-    for line in text.splitlines():
-        line = line.strip()
-        if line.startswith("export "):
-            line = line[len("export "):].lstrip()
-        for key in ("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN"):
-            if line.startswith(key + "="):
-                found[key] = _unquote_env(line[len(key) + 1:])
-    for key in ("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN"):
-        if found.get(key):
-            return found[key]
-    for line in text.splitlines():
-        line = line.strip()
-        if line and "=" not in line and not line.startswith("#"):
-            return line
-    return ""
+    """The onboarding string from a token file, or "" (missing, refused or empty: no rotation); a
+    refused file is named on stderr, path and reason only. token_file_token decides the shape."""
+    text, reason = read_regular(path)
+    if reason:
+        print(f"[remote-gateway-bridge] {gateway_credential_sources.refusal_note(path, reason)}; "
+              "no rotation", file=sys.stderr, flush=True)
+    return gateway_credential_sources.token_file_token(text or "")
 
 
 def _read_token_file_url(path: str) -> str:
-    """The REMOTE_TASK_URL (legacy AG2_REMOTE_URL) from a SPLIT-layout token
-    file, or "" if absent/unreadable. The combined `url|secret` form embeds the
-    URL (extracted by _parse_onboarding_token), but a split file (bare
-    REMOTE_TASK_TOKEN + a separate REMOTE_TASK_URL line) does not — and
-    _read_token_file discards that URL. The reload path needs it so a split file
-    rewritten by connect to a DIFFERENT gateway is caught by the same
-    cross-gateway guard the combined form already gets; otherwise a re-onboard
-    to a new gateway would hot-swap the new bearer onto the OLD running URL
-    (the exact credential-boundary split the guard exists to prevent)."""
-    try:
-        text = Path(path).read_text(encoding="utf-8")
-    except OSError:
-        return ""
-    found: dict = {}
-    for line in text.splitlines():
-        line = line.strip()
-        if line.startswith("export "):
-            line = line[len("export "):].lstrip()
-        for key in ("REMOTE_TASK_URL", "AG2_REMOTE_URL"):
-            if line.startswith(key + "="):
-                found[key] = _unquote_env(line[len(key) + 1:])
-    return found.get("REMOTE_TASK_URL") or found.get("AG2_REMOTE_URL") or ""
+    """The URL of a split-layout token file, or "": the reload path needs it so a split file
+    rewritten to a DIFFERENT gateway is caught by the cross-gateway guard."""
+    return gateway_credential_sources.token_file_url(_read_text(path))
 
 
 def _reload_rotated_token() -> bool:
@@ -2716,7 +2775,7 @@ def _reload_rotated_token() -> bool:
     # Route through the SAME parse used at import time (_parse_onboarding_token)
     # so a rotation written in the URL-encoded form (https://gw/relay%7C<secret>,
     url_from_token, secret = _parse_onboarding_token(raw)
-    diagnostics.register_secret(secret)  # read from a file: a credential whatever happens next
+    gateway_credential_sources.register(_SECRETS, [raw, secret])  # read from a file: a credential either way
     # The URL guard must cover BOTH layouts: the combined url|secret form
     # (url_from_token) AND the split form (bare secret + a separate
     file_url = (url_from_token or _read_token_file_url(TOKEN_FILE)).rstrip("/")
@@ -2884,12 +2943,28 @@ def _retry_pending_acks(inflight: "set[str]") -> None:
         _post_task_ack(tid, durable, leases.get(tid))
 
 
-def _post_task_ack(tid: str, durable: bool = False, lease_id: "str | None" = None) -> bool:
+ACK_DROP_RETRY_S = 0.5
+# Dropped acks are retried only while this long since the poll answered remains: well
+# inside the broker's 15 s delivery lease. Past it they are left to the pending-ack retry.
+ACK_RETRY_BUDGET_S = 10.0
+
+
+def _connection_dropped(e: BaseException) -> bool:
+    """The peer closed or reset the connection: the request may never have been read."""
+    reason = e.reason if isinstance(e, urllib.error.URLError) else e
+    return isinstance(reason, (ConnectionResetError, http.client.IncompleteRead))
+
+
+def _post_task_ack(tid: str, durable: bool = False, lease_id: "str | None" = None,
+                   dropped: "list | None" = None, deadline: "float | None" = None,
+                   retry_inline: bool = True) -> bool:
     """Tell the gateway a task made it safely into the local queue. `durable`
     says the task file, its media sidecar and the in-flight set are all fsync'd,
     which is the only thing that lets the relay call the task accepted.
     `lease_id` echoes the generation the task was served under; absent for a
-    broker that served none."""
+    broker that served none. With `dropped`, an ack lost to a dropped connection is
+    appended there for the caller to retry; without it, it is retried once inline unless
+    `retry_inline` is False. `deadline` (time.monotonic()) bounds the whole request."""
     global _ack_disabled_until
     # Validate the WIRE id (post-conversion): a named instance's LOCAL id may
     # legitimately exceed the 64-char wire bound (review P1 #1) — refusing on
@@ -2905,7 +2980,19 @@ def _post_task_ack(tid: str, durable: bool = False, lease_id: "str | None" = Non
             body["lease_id"] = lease_id
         if durable:
             body["durable"] = True
-        _req("POST", f"/v1/tasks/{safe_tid}/ack", body, timeout=10)
+        bound = {} if deadline is None else {"deadline": deadline}   # a healthy ack's call is unchanged
+        try:
+            _req("POST", f"/v1/tasks/{safe_tid}/ack", body, timeout=10, **bound)
+        except _NETWORK_ERRORS as e:
+            if not _connection_dropped(e) or (dropped is None and not retry_inline):
+                raise
+            if dropped is not None:
+                dropped.append((tid, durable, lease_id))
+                _log(f"task ack for {tid} lost to a dropped connection ({e}) — set aside for retry")
+                return False
+            # A dropped link loses the ack; one prompt retry lands it inside the delivery lease.
+            time.sleep(ACK_DROP_RETRY_S)
+            _req("POST", f"/v1/tasks/{safe_tid}/ack", body, timeout=10, **bound)
         _ack_disabled_until = 0.0  # success (or re-enablement) → clear any backoff
         _forget_pending_ack(tid, lease_id)
         return True
@@ -3605,14 +3692,13 @@ def _record_setup_hint(reply) -> None:
 
 
 def _emit_gateway_status(connected: bool, *, error: str | None = None,
-                         backoff_s: int = 0) -> None:
+                         backoff_s: int = 0, poll_ok_ts: float | None = None) -> None:
     """Write `state/gateway-status.json` — the connection's own liveness, for a
     local supervisor to render connected-vs-reconnecting.
 
     Best-effort: a status-write failure MUST NOT disturb the poll loop, so all
-    errors are swallowed. `last_ok_ts` is preserved across reconnecting writes
-    (read back from the prior file) so a consumer can show "last connected N s
-    ago" while the link is down.
+    errors are swallowed. Only explicit poll-success evidence advances
+    `last_ok_ts`; other writes preserve the prior value from disk.
     """
     try:
         last_ok = None
@@ -3622,8 +3708,8 @@ def _emit_gateway_status(connected: bool, *, error: str | None = None,
         except (FileNotFoundError, ValueError, OSError):
             last_ok = None
         now = int(time.time())
-        if connected:
-            last_ok = now
+        if poll_ok_ts is not None:
+            last_ok = int(poll_ok_ts)
         payload = {
             "connected": bool(connected),
             "ts": now,
@@ -3637,6 +3723,9 @@ def _emit_gateway_status(connected: bool, *, error: str | None = None,
             "gateway_binding": (gateway_instance.binding_digest(_reenroll_identity(), URL)
                                 or None) if connected else None,
             "launched_via": _LAUNCHED_VIA,
+            # Read by an adapter's verify: which inbox this bridge actually feeds.
+            "tasks_dir": os.path.realpath(TASKS_DIR),
+            "results_dir": os.path.realpath(RESULTS_DIR),
             "schema_version": 1,
             "runtime": {**RUNTIME_IDENTITY, "engine": _engine_desc(),
                         **_ENGINE_COUNTS},
@@ -4143,11 +4232,7 @@ def _write_task(task: dict, hold: bool = False) -> "tuple[str, bool] | None":
                 lines.append("collaborator: true")
                 if task.get("sensitive_data_filter") is False:
                     lines.append("sensitive_data_filter: false")
-            # Quarantine the untrusted `[room-ops metadata: …]` block BEFORE it
-            # reaches the agent as body content (owner directive 2026-07-16) —
-            _raw_task, _stripped_meta = _strip_room_ops_meta(str(task["task"]))
-            if _stripped_meta:
-                _log(f"stripped untrusted room-ops metadata from {tid} body")
+            _raw_task = str(task["task"])
             # Resolve an inbound media marker to a local file the core can read.
             _media_refs: list = []
             _fetched = _maybe_fetch_media(_raw_task, _media_refs)
@@ -4967,24 +5052,152 @@ def _relay_failed_sent(broker_id: str) -> bool:
     return False
 
 
-def _take_ack_first(task: dict, inflight: "set[str]") -> bool:
+_POLL_ANOMALIES = 0
+
+
+class _PollAnomaly(Exception):
+    """A 200 poll answer that carries no task list; the loop backs off as for any bad answer."""
+
+
+def _served_key(task: dict) -> str:
+    return _one_line(task.get("id"))[:128]
+
+
+def _poll_task_list(resp) -> list:
+    """The poll's served tasks. A 200 with no `tasks` list (an empty body, or other JSON) is
+    counted and raised: it can stand for a batch the broker served and the client never saw."""
+    global _POLL_ANOMALIES
+    tasks = resp.get("tasks") if isinstance(resp, dict) else None
+    if isinstance(tasks, list):
+        return tasks
+    _POLL_ANOMALIES += 1
+    meta = getattr(_RESP_META, "last", None) or {}
+    shape = "an empty body" if resp == {} else f"{type(resp).__name__} without a tasks list"
+    raise _PollAnomaly(
+        f"poll anomaly #{_POLL_ANOMALIES}: answered {shape} (status={meta.get('status')}, "
+        f"content-length={meta.get('content_length')}, cf-ray={meta.get('cf_ray')}) "
+        "— any task served in it is lost to this client until its lease expires")
+
+
+def _receive_round(tasks: list) -> "tuple[list, dict]":
+    """Log each served task at receipt, before any branching; returns the tasks to take and
+    their fates (None until the round settles one)."""
+    taken, fates = [], {}
+    for task in tasks:
+        if not isinstance(task, dict):
+            _log(f"served entry is a {type(task).__name__}, not a task — dropped")
+            continue
+        key = _served_key(task)
+        _log(f"served {key} lease={_one_line(_lease_id_of(task) or 'none')}"
+             + (" ack_first" if task.get("ack_first") is True else ""))
+        taken.append(task)
+        fates[key] = None
+    return taken, fates
+
+
+def _retry_dropped_acks(dropped: list, received_at: float, fates: dict) -> None:
+    """One more try for each ack lost to a dropped connection, inside ACK_RETRY_BUDGET_S of
+    the poll's answer; whatever the budget cannot cover stays with the pending-ack retry."""
+    for n, (tid, durable, lease) in enumerate(dropped):
+        left = received_at + ACK_RETRY_BUDGET_S - time.monotonic() - ACK_DROP_RETRY_S
+        if left < 1:
+            _log(f"{len(dropped) - n} dropped ack(s) left to the pending-ack retry: the "
+                 f"{ACK_RETRY_BUDGET_S:g}s retry budget is spent")
+            return
+        time.sleep(ACK_DROP_RETRY_S)
+        if _post_task_ack(tid, durable, lease, retry_inline=False,
+                          deadline=received_at + ACK_RETRY_BUDGET_S):
+            fates[_broker_tid(tid)] = "acked"
+
+
+def _settle_round(fates: dict) -> None:
+    """Every served task ends the round acked, staged, consumed or dropped with a reason."""
+    for key, fate in fates.items():
+        if fate is None:
+            _log(f"served {key} was not acked, staged, consumed or dropped this round "
+                 "— the broker re-serves it when its lease expires")
+
+
+def _isolated(task: dict, take, *args, fates: "dict | None" = None) -> bool:
+    """`take(*args)`, where a raise costs only this task: it is logged and left unacked for
+    the broker to re-serve, and the rest of its batch is still taken and acked."""
+    try:
+        return bool(take(*args))
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            raise                     # the loop's auth recovery owns a rejected bearer
+        why = f"HTTPError: {e}"
+    except Exception as e:  # noqa: BLE001 — one task must not withhold its batch's acks
+        why = f"{type(e).__name__}: {e}"
+    if fates is not None:
+        fates[_served_key(task)] = "dropped"
+    _log(f"task {_served_key(task)} not taken ({why}) — not acked; the broker re-serves it")
+    return False
+
+
+def _take_served_task(task: dict, inflight: "set[str]", pending_ack: list,
+                      fates: "dict | None" = None) -> bool:
+    """One served task that is not `ack_first`: consumed as a control, or queued and its
+    ack added to `pending_ack`. True when it newly entered the in-flight set."""
+    hitl_out = _handle_hitl_action(task)
+    if hitl_out:
+        body = _hitl_control_body(hitl_out)
+        _queue_review_control_result(task, body=body)
+        _retry_review_control_results()
+        _log(f"hitl: consumed card click {task.get('id')} from the task relay ({hitl_out})")
+        _set_fate(fates, task, "consumed")
+        return False
+    if _handle_review_decision(task):
+        _queue_review_control_result(task)
+        _retry_review_control_results()
+        _log(f"consumed private review decision {task.get('id')}")
+        _set_fate(fates, task, "consumed")
+        return False
+    written = _write_task(task)
+    if not written:
+        _set_fate(fates, task, "dropped")       # _write_task logged why
+        return False
+    tid, durable = written
+    pending_ack.append((tid, durable, _lease_id_of(task)))
+    fresh = tid not in inflight
+    inflight.add(tid)
+    return fresh
+
+
+def _set_fate(fates: "dict | None", task: dict, fate: str) -> None:
+    if fates is not None:
+        fates[_served_key(task)] = fate
+
+
+def _take_ack_first(task: dict, inflight: "set[str]", fates: "dict | None" = None,
+                    dropped: "list | None" = None) -> bool:
     """A task served with `ack_first`: staged, acked on its own and published only once
     the ack is accepted, so a withdrawn ask never reaches the core. True once published."""
     written = _write_task(task, hold=True)
     if written is None:
+        _set_fate(fates, task, "dropped")       # _write_task logged why
         return False
     tid, durable = written
     held = _load_held()
     if held is None:
+        _set_fate(fates, task, "dropped")       # _load_held logged why
         return False                            # nothing is acked while it cannot be read
     entry = held.get(tid)
     if not _held_entry_ok(tid, entry):
         # Already queued or handled here: acked as any redelivery is.
         lease = _lease_id_of(task)
-        if _track_durably(tid, inflight) and _record_pending_acks([(tid, durable, lease)]):
-            _post_task_ack(tid, durable, lease)
+        if (_track_durably(tid, inflight) and _record_pending_acks([(tid, durable, lease)])
+                and _post_task_ack(tid, durable, lease, dropped=dropped)):
+            _set_fate(fates, task, "acked")
         return False
-    return _advance_held(tid, entry, inflight)
+    published = _advance_held(tid, entry, inflight)
+    if published:
+        _set_fate(fates, task, "acked")
+    elif tid in (_load_held() or {}):
+        _set_fate(fates, task, "staged")
+    else:
+        _set_fate(fates, task, "dropped")       # _advance_held logged the refusal
+    return published
 
 
 def _fold_target(tid: str, wire: str, holder: "str | None") -> "str | None":
@@ -5446,6 +5659,102 @@ def _resolve_send_failure(claim, original, exc) -> str:
     return "stuck"
 
 
+def _upgrade_hold_file() -> Path:
+    return _STATE / f"owner-dm-upgraded{_INST_SUFFIX}.json"
+
+
+def _room_upgraded_to(err_body: str) -> "str | None":
+    """The replacement room a 400 body names when the send room was upgraded, else None."""
+    try:
+        d = json.loads(err_body)
+    except ValueError:
+        return None
+    if not isinstance(d, dict) or d.get("reason") != "room_upgraded":
+        return None
+    return str(d.get("replacement_room") or "")
+
+
+def _owner_dm_upgrade_held(room: str) -> bool:
+    """True while `room` (the current owner DM) is held as upgraded; a hold on another room is stale."""
+    f = _upgrade_hold_file()
+    try:
+        d = json.loads(f.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(d, dict) or not d:
+        return False
+    if not (room or "").strip():
+        return False  # no owner DM to compare: refuse rather than clear the hold
+    if d.get("room") == room:
+        return True
+    try:
+        _atomic_private_json(f, {})  # the owner DM was repointed: the hold no longer applies
+    except OSError:
+        pass
+    return False
+
+
+# (room, replacement) pairs whose owner notice was delivered: no duplicate even if the hold file is unwritable.
+_UPGRADE_NOTICES_SENT: "set[tuple[str, str]]" = set()
+
+
+def _read_upgrade_hold() -> dict:
+    try:
+        d = json.loads(_upgrade_hold_file().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(d, dict):
+        return {}
+    if d.get("room") and "notice" not in d:
+        d.update(notice="pending", notice_attempts=0)  # a pre-notice-state hold still owes its notice
+    return d
+
+
+def _hold_owner_dm_upgrade(room: str, replacement: str, noticed: "set | None" = None) -> None:
+    """Record the hold (later passes skip the room), then try the owner notice if still owed."""
+    d = _read_upgrade_hold()
+    if (d.get("room"), d.get("replacement")) != (room, replacement):
+        d = {"room": room, "replacement": replacement, "at": time.time(),
+             "notice": "pending", "notice_attempts": 0}
+        try:
+            _atomic_private_json(_upgrade_hold_file(), d)
+        except OSError as e:
+            _log(f"could not record owner-DM upgrade hold ({e})")
+        _log(f"owner DM {room} was upgraded to {replacement or '(unknown)'}, which this agent "
+             "has not joined — holding owner-DM nudges until the owner DM is repointed")
+    _notify_owner_dm_upgrade(d, noticed)
+
+
+def _notify_owner_dm_upgrade(d: dict, noticed: "set | None" = None) -> None:
+    """Deliver a pending owner notice; failures retry on later passes up to MAX_TRANSIENT_ATTEMPTS."""
+    room, replacement = str(d.get("room") or ""), str(d.get("replacement") or "")
+    if d.get("notice") != "pending" or (room, replacement) in _UPGRADE_NOTICES_SENT:
+        return
+    if noticed is not None:
+        if (room, replacement) in noticed:
+            return  # one attempt per (room, replacement) per drain pass, however many files it holds
+        noticed.add((room, replacement))
+    tried = int(d.get("notice_attempts") or 0) + 1
+    d["notice_attempts"] = tried
+    try:
+        if OWNER_DM_UPGRADED_NOTIFY is not None:
+            OWNER_DM_UPGRADED_NOTIFY(room, replacement)
+        # "delivered" means the ask-owner hook was spawned, not that the owner received the question.
+        d["notice"] = "delivered"
+        _UPGRADE_NOTICES_SENT.add((room, replacement))
+    except Exception as exc:  # noqa: BLE001
+        if tried >= MAX_TRANSIENT_ATTEMPTS:
+            d["notice"] = "gave_up"
+            _log(f"owner-DM upgrade notify GAVE UP after {tried} attempt(s) ({exc}) — the owner was "
+                 f"NOT told that {room} was upgraded to {replacement or '(unknown)'}")
+        else:
+            _log(f"owner-DM upgrade notify failed ({exc}) — will retry ({tried}/{MAX_TRANSIENT_ATTEMPTS})")
+    try:
+        _atomic_private_json(_upgrade_hold_file(), d)
+    except OSError as e:
+        _log(f"could not record owner-DM upgrade notice state ({e})")
+
+
 def _post_proactive() -> None:
     """Deliver `results/proactive-*.txt` to PROACTIVE_ROOM as room messages.
 
@@ -5460,6 +5769,7 @@ def _post_proactive() -> None:
     that belongs to another bridge (cross-bridge routing stays host policy); a
     PROACTIVE_ROOM_GATE re-judges the room the CLAIMED body names, since the
     peek may have read a body still being written."""
+    noticed: "set[tuple[str, str]]" = set()
     for f in sorted(RESULTS_DIR.glob("proactive-*.txt")):
         # PEEK before claiming: a file explicitly routed to a non-Matrix
         # destination ([channel: <discord/slack id>]) belongs to that bridge —
@@ -5478,6 +5788,9 @@ def _post_proactive() -> None:
         if route == "send" and peek_room is None and not proactive_room():
             _held(f"owner-directed {f.name}")
             continue
+        if route == "send" and peek_room is None and _owner_dm_upgrade_held(proactive_room()):
+            _notify_owner_dm_upgrade(_read_upgrade_hold(), noticed)
+            continue  # each claim would only cost another room_upgraded 400
         if PROACTIVE_CLAIM_GATE is not None:
             try:
                 if not PROACTIVE_CLAIM_GATE(f):
@@ -5598,6 +5911,15 @@ def _post_proactive() -> None:
                 except OSError:
                     pass
                 raise
+            replacement = _room_upgraded_to(_http_error_body(e)) if (
+                e.code == 400 and room_override is None) else None
+            if replacement is not None:
+                try:
+                    claim.rename(f)  # stays pending: not a failed attempt, the room moved
+                except OSError:
+                    pass
+                _hold_owner_dm_upgrade(dest_room, replacement, noticed)
+                continue
             outcome = _resolve_send_failure(claim, f, e)
             _log(f"proactive send failed for {f.name}: HTTP {e.code} — {outcome}")
             continue
@@ -7208,7 +7530,7 @@ def _maybe_start_event_channel() -> None:
             from .human_action import ActionStore, CardPoster, DecisionHandler, HandlerChain
             store = ActionStore(str(_STATE / "human-actions"))
             # HITL card clicks ride the same owner-only chain, ahead of taskify.
-            claimants = [DecisionHandler(store, ha_owner, log=_log)]
+            claimants = [DecisionHandler(store, ha_owner, log=_log), _ClaudeLocalClicks(ha_owner, log=_log)]
             hitl = _hitl_reply_handler(ha_owner, log=_log)
             if hitl is not None:
                 claimants.append(hitl)
@@ -7260,6 +7582,8 @@ def _poll_timeout_is_empty(last_ok: float, now: float,
 def main() -> None:
     # This process holds the gateway URL: nothing uncaught, in any thread, prints it raw.
     gateway_instance.install_scrubbing_excepthooks(lambda: URL)
+    if _FOUND.fatal:
+        sys.exit(f"FATAL: {_FOUND.fatal}")
     if not TOKEN:
         sys.exit("FATAL: set REMOTE_TASK_TOKEN (the onboarding string, or a bare secret with REMOTE_TASK_URL).")
     if not URL:
@@ -7298,7 +7622,8 @@ def main() -> None:
         _log(f"running unsupervised — output also logged to {_LOG_FILE}; "
              f"prefer launching through startup.sh for full diagnostics")
     backoff = 1
-    last_poll_ok = time.time()
+    poll_grace_since = time.time()
+    last_poll_ok: float | None = None
     poll_failures = 0  # consecutive network failures; the next good poll resets it
     _emit_gateway_status(False, error="starting — not yet connected")
     refresh_routing(force=True)  # the owner's DM comes from the gateway at connect, not from a pin
@@ -7325,58 +7650,52 @@ def main() -> None:
             _push_pool_advertisement()
             if _advance_held_tasks(inflight):   # a retried ack, or a publish after a restart
                 wake_outbound()
-            prev_ok = last_poll_ok
+            prev_ok = poll_grace_since
+            _RESP_META.last = None
             try:
                 resp = _req("GET", f"/v1/tasks?wait={POLL_WAIT}{_POLL_PROOF}", timeout=POLL_WAIT + 10)
-                last_poll_ok = time.time()
+                last_poll_ok = poll_grace_since = time.time()
+                # A completed poll remains evidence even if accepting its tasks fails.
+                _emit_gateway_status(True, poll_ok_ts=last_poll_ok)
             except (TimeoutError, socket.timeout):
                 # Read timeout only (URLError takes the outage path below).
                 # socket.timeout only aliases TimeoutError on 3.10+, not 3.9.
-                if not _poll_timeout_is_empty(last_poll_ok, time.time()):
+                if not _poll_timeout_is_empty(poll_grace_since, time.time()):
                     raise
+                _log(f"poll read timed out after {POLL_WAIT + 10}s inside the "
+                     f"{POLL_TIMEOUT_GRACE_S:g}s grace — treated as an empty poll")
                 resp = {"tasks": []}
-            if poll_failures and last_poll_ok != prev_ok:  # a real answer, not the grace path
-                _log(f"poll recovered after {poll_failures} failures, {int(last_poll_ok - prev_ok)}s")
+            received_at = time.monotonic()           # the dropped-ack retry budget runs from here
+            if poll_failures and poll_grace_since != prev_ok:  # a real answer, not the grace path
+                _log(f"poll recovered after {poll_failures} failures, {int(poll_grace_since - prev_ok)}s")
                 poll_failures = 0
             added = False
             pending_ack = []
-            tasks = resp.get("tasks", [])
+            tasks, fates = _receive_round(_poll_task_list(resp))
+            # Every task's first ack goes before any retry, so one bad link delays no sibling.
+            dropped: list = []
             # First and on its own, so a slow task ahead cannot hold it past its delivery lease.
             for task in tasks:
                 if task.get("ack_first") is True:
-                    added |= _take_ack_first(task, inflight)
+                    added |= _isolated(task, _take_ack_first, task, inflight, fates, dropped,
+                                       fates=fates)
             for task in tasks:
-                if task.get("ack_first") is True:
-                    continue
-                hitl_out = _handle_hitl_action(task)
-                if hitl_out:
-                    body = "[no-send]"
-                    if str(hitl_out).startswith("rejected:"):
-                        body = ("That click did not apply: the card had already moved "
-                                f"({str(hitl_out)[9:]}). Please use the current card.")
-                    _queue_review_control_result(task, body=body)
-                    _retry_review_control_results()
-                    _log(f"hitl: consumed card click {task.get('id')} from the task relay ({hitl_out})")
-                    continue
-                if _handle_review_decision(task):
-                    _queue_review_control_result(task)
-                    _retry_review_control_results()
-                    _log(f"consumed private review decision {task.get('id')}")
-                    continue
-                written = _write_task(task)
-                if written:
-                    tid, durable = written
-                    if tid not in inflight:
-                        inflight.add(tid)
-                        added = True
-                    pending_ack.append((tid, durable, _lease_id_of(task)))
+                if task.get("ack_first") is not True:
+                    added |= _isolated(task, _take_served_task, task, inflight, pending_ack,
+                                       fates, fates=fates)
             # Ack only after task file, in-flight set and ack ledger are durable;
             # any failure withholds every ack this round, redeliveries included.
             committed = _save_inflight(inflight) if pending_ack else True
             if pending_ack and committed:
                 committed = _record_pending_acks(pending_ack)
+            if pending_ack and not committed:
+                _log(f"acks withheld for {len(pending_ack)} task(s): the in-flight set or "
+                     "ack ledger did not commit")
             for tid, durable, lease in pending_ack if committed else ():
-                _post_task_ack(tid, durable, lease)
+                if _post_task_ack(tid, durable, lease, dropped=dropped):
+                    fates[_broker_tid(tid)] = "acked"
+            _retry_dropped_acks(dropped, received_at, fates)
+            _settle_round(fates)
             if added:
                 wake_outbound()          # a fresh task often precedes its ack round-trip
             abandoned_suspects = _reconcile_abandoned(inflight, abandoned_suspects)
@@ -7388,27 +7707,35 @@ def main() -> None:
             # raising, so a broker without the endpoints costs one deferred log.
             _push_pool_advertisement()
             backoff = 1  # healthy round-trip → reset backoff
-            _emit_gateway_status(True)
+            _emit_gateway_status(last_poll_ok is not None, poll_ok_ts=last_poll_ok)
         except urllib.error.HTTPError as e:
             if e.code in (401, 403):
                 if _recover_auth(e.code):
                     backoff = 1
                     continue
-                _emit_gateway_status(False, error=f"auth rejected HTTP {e.code}")
+                _emit_gateway_status(False, error=f"auth rejected HTTP {e.code}", poll_ok_ts=last_poll_ok)
                 sys.exit(f"FATAL: gateway auth rejected (HTTP {e.code}) — check REMOTE_TASK_TOKEN.")
             _log(f"poll HTTP {e.code} — backing off {backoff}s")
-            _emit_gateway_status(False, error=f"HTTP {e.code}", backoff_s=backoff)
+            _emit_gateway_status(False, error=f"HTTP {e.code}", backoff_s=backoff, poll_ok_ts=last_poll_ok)
+            time.sleep(backoff); backoff = min(backoff * 2, _POLL_BACKOFF_MAX_S)
+        except _PollAnomaly as e:
+            # Every anomaly is counted in its line; the log itself thins out a run of them.
+            _log_backoff(("poll-anomaly",), f"{e} — backing off {backoff}s")
+            _emit_gateway_status(False, error="poll answered without a task list", backoff_s=backoff,
+                                 poll_ok_ts=last_poll_ok)
             time.sleep(backoff); backoff = min(backoff * 2, _POLL_BACKOFF_MAX_S)
         except _NETWORK_ERRORS as e:
             poll_failures += 1
             _log(f"poll network error: {diagnostics.describe(e)} — {poll_failures} consecutive, "
-                 f"{int(time.time() - last_poll_ok)}s since last successful poll — "
+                 f"{int(time.time() - poll_grace_since)}s since last successful poll — "
                  f"backing off {backoff}s")
-            _emit_gateway_status(False, error=f"network: {diagnostics.describe(e)}", backoff_s=backoff)
+            _emit_gateway_status(False, error=f"network: {diagnostics.describe(e)}", backoff_s=backoff,
+                                 poll_ok_ts=last_poll_ok)
             time.sleep(backoff); backoff = min(backoff * 2, _POLL_BACKOFF_MAX_S)
         except Exception as e:  # noqa: BLE001 — keep the loop alive
             _log(f"unexpected: {diagnostics.describe(e)} — backing off {backoff}s")
-            _emit_gateway_status(False, error=f"unexpected: {diagnostics.describe(e)}", backoff_s=backoff)
+            _emit_gateway_status(False, error=f"unexpected: {diagnostics.describe(e)}", backoff_s=backoff,
+                                 poll_ok_ts=last_poll_ok)
             time.sleep(backoff); backoff = min(backoff * 2, _POLL_BACKOFF_MAX_S)
 
 

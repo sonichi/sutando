@@ -56,7 +56,7 @@ AFTER_BASELINE="$(printf '%s\n' "$CAP" | "$PY" "$REPO/src/delivery/pane_gate.py"
 if [ -n "$SKIPWORD" ] && [ "$PENDING" = "$SKIPWORD" ]; then echo "tmux-send-line: '$SKIPWORD' already queued at the prompt — not sent" >&2; exit 6; fi
 if [ -n "$REFUSE" ] && [ -n "$PENDING" ]; then echo "tmux-send-line: prompt carries pending text (${PENDING:0:60}) — not sent" >&2; exit 5; fi
 [ -n "$DRY" ] && { echo "dry-run: would send '$LINE' + Enter to $SESSION on $SOCK (pending: '${PENDING}')"; exit 0; }
-keys() { bash "$REPO/src/tmux-pane-keys.sh" --tmux "$TMUX" -S "$SOCK" -t "$SESSION" -- "$@"; local rc=$?
+keys() { bash "$REPO/src/tmux-pane-keys.sh" --tmux "$TMUX" --python "$PY" -S "$SOCK" -t "$SESSION" -- "$@"; local rc=$?
   [ "$rc" = 0 ] && return 0; echo "tmux-send-line: send-keys failed" >&2
   case "$rc" in 75|124|125) exit "$rc" ;; *) exit 1 ;; esac; }
 keys -l "$LINE"

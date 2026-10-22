@@ -107,7 +107,8 @@ def resume(workspace, repo, *, runner=None, spawn=None) -> dict:
         dead = [w for w, o in obs.items()
                 if w in stopped and o.session_alive is False and not o.paused]
         restarted = {w: recover(workspace, repo, w, runner=runner, spawn=spawn) for w in dead}
-        _reset_ladders(workspace, forget=restarted)
+        _reset_ladders(workspace, forget=[
+            w for w, out in restarted.items() if out["outcome"] != SUSPENDED])
     return {"was_suspended": was, "restarted": restarted}
 
 
@@ -218,6 +219,8 @@ def close_dead_runs(workspace, worker_id, closed: list | None = None) -> list:
 def recover(workspace, repo, worker_id, *, runner=None, spawn=None) -> dict:
     """Recover one worker. Never raises for an expected refusal: the caller is a
     timer with nobody watching, so every outcome is a value it can record."""
+    if suspension(workspace):
+        return {"worker_id": worker_id, "outcome": SUSPENDED}
     spawn = spawn or sw.spawn
     if sup.is_paused(workspace, worker_id):
         return {"worker_id": worker_id, "outcome": PAUSED}
@@ -246,6 +249,11 @@ def recover(workspace, repo, worker_id, *, runner=None, spawn=None) -> dict:
         if not sessions:
             return {"worker_id": worker_id, "outcome": NO_SESSION}
         session = sessions[-1]
+        if last.get("session_id"):
+            session = next((s for s in sessions if s.get("session_id") == last["session_id"]), None)
+            if session is None:
+                return {"worker_id": worker_id, "outcome": NO_SESSION,
+                        "why": f"recorded incarnation session {last['session_id']!r} is not in this worker's lineage"}
         kw = {"resume": session["session_id"], "runtime": "claude", "socket": socket,
               "cwd": (session.get("transcript") or {}).get("cwd") or str(repo)}
     if runner is not None:

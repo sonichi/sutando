@@ -26,6 +26,9 @@ import tempfile
 import time
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _helpers.process_group import kill_group, popen_bound, unbind  # noqa: E402
+
 REPO = Path(__file__).resolve().parent.parent
 FAILURES: list[str] = []
 
@@ -75,6 +78,8 @@ def stop(p):
         p.wait(timeout=5)
     except Exception:
         pass
+    kill_group(p.pid)
+    unbind(p.pid)
 
 
 def start_watcher(ws_spelling):
@@ -87,11 +92,11 @@ def start_watcher(ws_spelling):
     env["SUTANDO_RESULTS_DIR"] = str(ws_spelling / "results")
     # The held-set retry spacing must not be what makes (2) pass: far beyond the wait.
     env["SUTANDO_HELD_RETRY_INTERVAL"] = "600"
-    return subprocess.Popen(
+    return popen_bound(
         ["bash", "src/watch-tasks-stream.sh", str(ws_spelling / "tasks"),
          "--role", "standby", "--inbox", str(ws_spelling / "tasks")],
         cwd=str(REPO), env=env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-        text=True, start_new_session=True)
+        text=True)
 
 
 def write_task(ws, name, body="probe"):

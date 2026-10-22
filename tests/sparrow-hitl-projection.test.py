@@ -21,6 +21,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 REPO = Path(__file__).resolve().parent.parent
 # The bridge reads its credentials at import time; give it inert ones.
 os.environ.setdefault("REMOTE_TASK_TOKEN", "test-token")
@@ -131,14 +136,25 @@ class ProjectHitl(unittest.TestCase):
         self.assertEqual(self.calls, [])
 
     def test_an_absent_hitl_package_is_an_optional_tier_not_a_failure(self):
-        """Standalone sparrow has no monorepo `src/hitl`; the pulse must carry
+        """With neither the vendored `ag2_sparrow.hitl` nor the monorepo `src/hitl`, the pulse carries
         on without it rather than raising into the outbound worker."""
+        self._requirement()
+        saved = B._hitl_modules
+        B._hitl_modules = lambda: None
+        try:
+            self.assertEqual(B._project_hitl(log=lambda *a: None), 0)
+            self.assertEqual(self.calls, [])
+        finally:
+            B._hitl_modules = saved
+
+    def test_a_standalone_install_projects_through_the_vendored_hitl(self):
+        """No monorepo `src/hitl`, and the wheel's own copy still projects the card."""
         self._requirement()
         saved = B._monorepo_src
         B._monorepo_src = lambda marker: ""
         try:
-            self.assertEqual(B._project_hitl(log=lambda *a: None), 0)
-            self.assertEqual(self.calls, [])
+            self.assertEqual(B._project_hitl(log=lambda *a: None), 1)
+            self.assertEqual(len(self.calls), 1)
         finally:
             B._monorepo_src = saved
 

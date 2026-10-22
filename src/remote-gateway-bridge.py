@@ -338,10 +338,26 @@ def _ag2space_proactive_claim_gate(path: Path) -> bool:
         return False  # racing consumer already claimed it
 
 
+def _ag2space_owner_dm_upgraded(room: str, replacement: str) -> None:
+    """Ask the owner to re-invite the agent; detached, --unless-open dedupes the row; a failed launch raises."""
+    import subprocess
+    try:
+        subprocess.Popen(
+            [sys.executable, str(_REPO / "scripts" / "ask-owner.py"),
+             "Your DM with me was upgraded to a new room I'm not in. "
+             "Please invite me there and repoint my DM.", "--unless-open"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True)
+    except OSError as e:
+        _log(f"owner-DM upgrade: ask-owner did not start ({e})")  # noqa: F821
+        raise
+
+
 # Assigned AFTER the exec: the canonical module's own `PROACTIVE_CLAIM_GATE =
 # None` default runs inside it and would overwrite an earlier assignment.
 PROACTIVE_CLAIM_GATE = _ag2space_proactive_claim_gate
 PROACTIVE_ROOM_GATE = _ag2space_proactive_room_gate
+OWNER_DM_UPGRADED_NOTIFY = _ag2space_owner_dm_upgraded
 
 if _RUN_MAIN:  # pragma: no cover — script-entry tail; the subprocess suite drives it
     __name__ = "__main__"

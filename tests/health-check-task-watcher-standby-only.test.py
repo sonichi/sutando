@@ -15,6 +15,12 @@ runtime is the WATCHER's: a worker's roster row records its own (spawn_worker
 lets a Claude core host a Codex worker), and only a sentinel without a row falls
 back to the core's config.
 """
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import json
 import sys

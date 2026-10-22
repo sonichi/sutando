@@ -381,7 +381,7 @@
    ],
    "status": "canonical",
    "canonical_for": "workspace configuration and resolver APIs",
-   "last_verified": "2026-10-05"
+   "last_verified": "2026-10-19"
   },
   "docs/workspace-contract.md": {
    "title": "Workspace contract",
@@ -513,7 +513,7 @@
    ],
    "status": "canonical",
    "canonical_for": "how one inbox keeps exactly one announcer: the session watcher and the supervisor's standby, the tag and verdicts, readiness, the handoff contract",
-   "last_verified": "2026-09-22"
+   "last_verified": "2026-10-22"
   },
   "docs/learning-window.md": {
    "title": "Retained learning windows",

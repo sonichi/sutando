@@ -19,8 +19,11 @@ sys.path.insert(0, str(REPO / "src"))
 import tmux_pane_keys  # noqa: E402
 
 
+PY = ["--python", sys.executable]
+
+
 def run(*args, timeout=30):
-    return subprocess.run(["bash", str(HELPER), *args], capture_output=True, text=True, timeout=timeout)
+    return subprocess.run(["bash", str(HELPER), *PY, *args], capture_output=True, text=True, timeout=timeout)
 
 
 @unittest.skipUnless(shutil.which("tmux"), "tmux not installed")
@@ -180,7 +183,7 @@ class LateClaim(unittest.TestCase):
         shutil.rmtree(self.dir, ignore_errors=True)
 
     def send(self, text, timeout="5"):
-        return ["bash", str(HELPER), "-S", self.sock, "-t", "=t:0", "--timeout", timeout, "--", "-l", "--", text]
+        return ["bash", str(HELPER), *PY, "-S", self.sock, "-t", "=t:0", "--timeout", timeout, "--", "-l", "--", text]
 
     def test_a_killed_senders_queued_request_cannot_take_the_next_ticket(self):
         a = subprocess.Popen(self.send("STALE-A"), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -260,7 +263,7 @@ class HookedServer(unittest.TestCase):
         return subprocess.run(["tmux", "-S", self.sock, *args], capture_output=True, text=True, check=True).stdout.strip()
 
     def send(self, text):
-        return ["bash", str(HELPER), "-S", self.sock, "-t", "=t:0", "--", "-l", "--", text]
+        return ["bash", str(HELPER), *PY, "-S", self.sock, "-t", "=t:0", "--", "-l", "--", text]
 
     def test_a_hook_that_re_enters_copy_mode_withholds_the_send_and_reports_failure(self):
         self.tmux("set-hook", "-g", "after-copy-mode", "copy-mode -t t:0")
@@ -277,7 +280,7 @@ class HookedServer(unittest.TestCase):
         while Path(self.bytes).read_text() != "FIRST" and time.monotonic() < deadline:
             time.sleep(0.05)
         self.assertEqual(Path(self.bytes).read_text(), "FIRST")
-        subprocess.run(["pkill", "-KILL", "-f", f"tmux -S {self.sock} if-shell"])
+        subprocess.run(["pkill", "-KILL", "-f", f"tmux -u -S {self.sock} if-shell"])
         _out, err = p.communicate(timeout=20)
         self.assertEqual(p.returncode, tmux_pane_keys.UNCERTAIN, err)
         self.assertEqual(tmux_pane_keys.fence_status(self.sock), "uncertain")
@@ -305,7 +308,7 @@ class ServerEnvironment(unittest.TestCase):
         shutil.rmtree(self.dir, ignore_errors=True)
 
     def test_a_server_in_another_zone_and_locale_still_receives_the_keys(self):
-        r = subprocess.run(["bash", str(HELPER), "-S", self.sock, "-t", "=t:0", "--", "-l", "--", "TZ-MISMATCH"],
+        r = subprocess.run(["bash", str(HELPER), *PY, "-S", self.sock, "-t", "=t:0", "--", "-l", "--", "TZ-MISMATCH"],
                            capture_output=True, text=True, timeout=30,
                            env={**os.environ, "TZ": "America/Los_Angeles", "LC_ALL": "fr_FR.UTF-8"})
         time.sleep(0.3)
@@ -409,18 +412,18 @@ class Timeout(unittest.TestCase):
             sock = str(Path(d) / "s")
             ready = Path(d) / "ready"
             fake = Path(d) / "tmux"
-            claim = 'sh -c "$4"' if claimed else ":"
+            claim = 'sh -c "$5"' if claimed else ":"
             fake.write_text(f'''#!/bin/bash
-if [ "$3" = {phase} ] && [ ! -e '{ready}' ]; then
+if [ "$4" = {phase} ] && [ ! -e '{ready}' ]; then
   {claim}
   touch '{ready}'
   exec sleep 3
 fi
-[ "$3" = display-message ] && {{ echo 0; exit 0; }}
-[ "$3" = if-shell ] && sh -c "$4" && echo SENT
+[ "$4" = display-message ] && {{ echo 0; exit 0; }}
+[ "$4" = if-shell ] && sh -c "$5" && echo SENT
 ''')
             fake.chmod(0o755)
-            args = ["--tmux", str(fake), "-S", sock, "-t", "=t:0", "--timeout", "5", "--", "Enter"]
+            args = ["--tmux", str(fake), *PY, "-S", sock, "-t", "=t:0", "--timeout", "5", "--", "Enter"]
             p = subprocess.Popen(["bash", str(HELPER), *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             try:
                 deadline = time.monotonic() + 5
@@ -457,11 +460,11 @@ fi
             claimed = Path(d) / "claimed"
             fake = Path(d) / "tmux"
             fake.write_text(f'''#!/bin/bash
-[ "$3" = display-message ] && {{ echo 0; exit 0; }}
-[ "$3" = if-shell ] && {{ sh -c "$4"; touch '{claimed}'; sleep 1; }}
+[ "$4" = display-message ] && {{ echo 0; exit 0; }}
+[ "$4" = if-shell ] && {{ sh -c "$5"; touch '{claimed}'; sleep 1; }}
 ''')
             fake.chmod(0o755)
-            args = ["--tmux", str(fake), "-S", sock, "-t", "=t:0", "--", "Enter"]
+            args = ["--tmux", str(fake), *PY, "-S", sock, "-t", "=t:0", "--", "Enter"]
             first = subprocess.Popen(["bash", str(HELPER), *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             try:
                 deadline = time.monotonic() + 3
@@ -485,8 +488,8 @@ fi
             log = Path(d) / "calls"
             fake.write_text(f'''#!/bin/bash
 echo "$*" >> '{log}'
-[ "$3" = display-message ] && {{ echo 0; exit 0; }}
-[ "$3" = if-shell ] && {{ sh -c "$4"; exec sleep 30; }}
+[ "$4" = display-message ] && {{ echo 0; exit 0; }}
+[ "$4" = if-shell ] && {{ sh -c "$5"; exec sleep 30; }}
 ''')
             fake.chmod(0o755)
             r = run("--tmux", str(fake), "-S", sock, "-t", "=t:0", "--timeout", "1", "--", "Enter")
@@ -518,7 +521,7 @@ echo "$*" >> '{log}'
             r = run("--tmux", str(fake), "-S", str(Path(d) / "s"), "-t", "=c:0", "--", "Enter")
             self.assertEqual(r.returncode, 3)
             [call] = log.read_text().splitlines()
-            self.assertRegex(call, rf"^-S {re.escape(str(Path(d) / 's'))} if-shell mv '([^']+/ticket)' '\1\.claimed' && "
+            self.assertRegex(call, rf"^-u -S {re.escape(str(Path(d) / 's'))} if-shell mv '([^']+/ticket)' '\1\.claimed' && "
                                    r'case "\$\(LC_ALL=C TZ=UTC ps -o lstart=,stat= -p \d+ 2>/dev/null\)" in ')
             self.assertIn(" copy-mode -q -t '=c:0' ; if-shell -F -t '=c:0' '#{pane_in_mode}' ", call)
             self.assertTrue(call.endswith("""'send-keys -t '"'"'=c:0'"'"' '"'"'Enter'"'"''"""), call)
@@ -566,7 +569,7 @@ esac
         with tempfile.TemporaryDirectory() as d:
             fake = Path(d) / "tmux"
             log = Path(d) / "log"
-            fake.write_text(f'#!/bin/bash\necho "$3" >> {log}\n[ "$3" = if-shell ] && sh -c "$4" && echo SENT\n')
+            fake.write_text(f'#!/bin/bash\necho "$4" >> {log}\n[ "$4" = if-shell ] && sh -c "$5" && echo SENT\n')
             fake.chmod(0o755)
             r = run("--tmux", str(fake), "-S", str(Path(d) / "s"), "-t", "=c:0", "--", "Enter")
             self.assertEqual((r.returncode, r.stdout.strip()), (0, "SENT"), r.stderr)
@@ -574,7 +577,11 @@ esac
 
     def test_python_argv(self):
         self.assertEqual(tmux_pane_keys.argv("/s", "=c:0", "Escape", tmux="/bin/tmux"),
-                         ["bash", str(HELPER), "--tmux", "/bin/tmux", "-S", "/s", "-t", "=c:0", "--", "Escape"])
+                         ["bash", str(HELPER), "--tmux", "/bin/tmux", "--python", sys.executable, "-S", "/s", "-t", "=c:0",
+                          "--", "Escape"])
+        r = subprocess.run(["bash", str(HELPER), "-S", "/s", "-t", "=c:0", "--", "Escape"], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 2, "no interpreter, no guard: the script never resolves one itself")
+        self.assertIn("--python", r.stderr)
 
 
 class OneSender(unittest.TestCase):

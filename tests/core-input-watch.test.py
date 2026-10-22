@@ -73,6 +73,23 @@ _FABLE_LIMIT_UNFOCUSED = _FABLE_LIMIT.replace(
     "  ❯ Switch to Opus 5 and continue\n    Continue with Fable 5.1",
     "    Switch to Opus 5 and continue\n  ❯ Continue with Fable 5.1")
 assert _FABLE_LIMIT_UNFOCUSED != _FABLE_LIMIT
+# A worker seat's turn opened by a Monitor event and refused at the Fable weekly limit,
+# as the session transcript recorded it on 2026-09-28; the pane layout is reconstructed.
+_FABLE_REFUSED_MONITOR = (
+    "⏺ Monitor event: \"Streaming task watcher (worker 17c6c322 inbox)\"\n\n"
+    "⏺ You've reached your Fable limit. Run /usage-credits to continue or switch models with /model.\n\n"
+    "✻ Worked for 0s\n\n" + _IDLE)
+# A worker's pane on 2026-10-19: every refused turn, Monitor-event ones included, ends on the
+# refusal as its own ⎿ line; the subagent's error above it quotes the same text mid-line.
+_FABLE_AGENT_ERROR = ("⏺ Agent \"...\" failed: Agent terminated early due to an API error: You've reached your Fable\n"
+                      "limit. Run /usage-credits to continue or switch models with /model. "
+                      "(error type rate_limit, HTTP 429, ...)\n")
+_FABLE_REFUSAL_LINE = "  ⎿  You've reached your Fable limit. Run /usage-credits to continue or switch models with /model.\n"
+_FABLE_REFUSED_20261019 = (
+    _FABLE_AGENT_ERROR + _FABLE_REFUSAL_LINE + "\n"
+    "✻ Worked for 1s · done 4:32 PM\n\n"
+    "⏺ Monitor event: [Monitor expired after 30m ...]\n" + _FABLE_REFUSAL_LINE + "\n"
+    "✻ Crunched for 1s · done 4:47 PM\n\n" + _IDLE)
 # The core's terminal on 2026-09-07 (#4015): every /startup was refused in 0-1s and the CLI
 # went straight back to its idle footer, so no gate was ever on screen.
 _REFUSAL_LINE = ("You're out of usage credits. Run /usage-credits to keep using Fable 5.1 "
@@ -247,6 +264,95 @@ class TestClassify(unittest.TestCase):
         # ...while the real dialog, whose body wraps onto a second line, still qualifies.
         wrapped = _FABLE_LIMIT.replace("uses\n  usage credits", "uses\n  usage\n  credits")
         self.assertEqual(classify(wrapped)[0], "fable-limit")
+
+    def test_a_monitor_started_turn_refused_at_the_fable_limit_is_switched(self):
+        # A worker's turn opens on a Monitor event, not a `❯` line, and the CLI refuses it
+        # with one plain line and no dialog (worker seat 2026-09-28).
+        st, _d, prompt, kind = compose_state(_FABLE_REFUSED_MONITOR, "idle", True)
+        self.assertEqual((st, kind), ("blocked-known", "fable-limit-refused"))
+        self.assertIn("reached your Fable limit", prompt)
+        self.assertEqual(auto_answer("fable-limit-refused"), ("/model opus", "Enter"))
+
+    def test_the_2026_10_19_worker_pane_is_switched(self):
+        st, _d, prompt, kind = compose_state(_FABLE_REFUSED_20261019, "idle", True)
+        self.assertEqual((st, kind), ("blocked-known", "fable-limit-refused"))
+        self.assertTrue(prompt.startswith("You've reached your Fable limit"), prompt)
+        # The first refused turn alone, its own ⎿ line under the subagent's error, fires too.
+        first = _FABLE_AGENT_ERROR + _FABLE_REFUSAL_LINE + "\n✻ Worked for 1s · done 4:32 PM\n\n" + _IDLE
+        self.assertEqual(compose_state(first, "idle", True)[3], "fable-limit-refused")
+
+    def test_a_subagent_error_quoting_the_refusal_is_not_the_session_refused(self):
+        # The quote mid-line, whether its line goes on past `/model.` or stops there.
+        for agent in (_FABLE_AGENT_ERROR, _FABLE_AGENT_ERROR.replace(" (error type rate_limit, HTTP 429, ...)", "")):
+            pane = agent + "\n✻ Worked for 1s · done 4:32 PM\n\n" + _IDLE
+            self.assertIsNone(_mod.fable_refusal(pane), agent)
+            self.assertNotEqual(compose_state(pane, "idle", True)[3], "fable-limit-refused")
+
+    def test_continue_waits_for_the_switch_to_settle(self):
+        pending = {"key": ("continue", "Enter"), "at": 100.0}
+        # A picker or a still-running switch keeps it pending; idle-ready sends it once.
+        self.assertEqual(_mod.follow_up_step(pending, "blocked-human", 101.0, _IDLE), (None, pending))
+        self.assertEqual(_mod.follow_up_step(pending, "running", 101.0, _IDLE), (None, pending))
+        self.assertEqual(_mod.follow_up_step(pending, "idle-ready", 102.0, _IDLE), (("continue", "Enter"), None))
+        # Past the window it is dropped unsent, whatever the pane then reads.
+        self.assertEqual(_mod.follow_up_step(pending, "idle-ready", 100.0 + _mod.FOLLOW_UP_WINDOW_S + 1, _IDLE),
+                         (None, None))
+        self.assertEqual(_mod.follow_up_step(None, "idle-ready", 102.0, _IDLE), (None, None))
+
+    def test_a_retyped_switch_stays_in_its_episode_until_a_long_gap(self):
+        gap = _mod.TYPED_EPISODE_GAP_S
+        self.assertEqual(_mod.typed_episode(None, None, 100.0), 100.0)
+        self.assertEqual(_mod.typed_episode(100.0, 100.0, 100.0 + _mod.TYPED_ANSWER_COOLDOWN_S + 5), 100.0)
+        self.assertEqual(_mod.typed_episode(700.0, 100.0, 700.0 + gap), 100.0)
+        self.assertEqual(_mod.typed_episode(700.0, 100.0, 700.0 + gap + 1), 700.0 + gap + 1)
+
+    def test_a_draft_at_idle_ready_keeps_continue_unsent(self):
+        pending = {"key": ("continue", "Enter"), "at": 100.0}
+        draft = _IDLE.replace("❯ ", "❯ half-typed reply")
+        self.assertEqual(compose_state(draft, "idle", True)[0], "idle-ready")
+        self.assertEqual(_mod.follow_up_step(pending, "idle-ready", 102.0, draft), (None, pending))
+        # The draft outlasting the window drops it unsent; the draft is never submitted.
+        self.assertEqual(_mod.follow_up_step(pending, "idle-ready", 100.0 + _mod.FOLLOW_UP_WINDOW_S + 1, draft),
+                         (None, None))
+        self.assertEqual(_mod.follow_up_step(pending, "idle-ready", 103.0, _IDLE), (("continue", "Enter"), None))
+
+    def test_the_refusal_wrapped_over_two_lines_is_still_seen(self):
+        pane = _FABLE_REFUSED_MONITOR.replace(" or switch models", "\n  or switch models")
+        self.assertEqual(compose_state(pane, "idle", True)[3], "fable-limit-refused")
+
+    def test_a_tool_output_quoting_the_refusal_is_not_a_refusal(self):
+        pane = _FABLE_REFUSED_MONITOR.replace(
+            "⏺ You've reached", "⏺ Bash(grep -r Fable limit src/)\n  ⎿  You've reached")
+        self.assertNotEqual(compose_state(pane, "idle", True)[3], "fable-limit-refused")
+
+    def test_the_refusal_followed_by_later_output_is_not_current(self):
+        pane = _FABLE_REFUSED_MONITOR.replace(
+            "✻ Worked for 0s", "⏺ Done — PR opened.\n\n✻ Worked for 4m 12s")
+        self.assertNotEqual(compose_state(pane, "idle", True)[3], "fable-limit-refused")
+
+    def test_a_typed_draft_blocks_the_switch(self):
+        pane = _FABLE_REFUSED_MONITOR.replace("❯ \n", "❯ half-typed reply\n")
+        self.assertNotEqual(compose_state(pane, "idle", True)[3], "fable-limit-refused")
+
+    def test_send_keys_types_a_tuple_literally_and_enter_as_a_key(self):
+        from unittest.mock import patch
+        calls = []
+
+        class _R:
+            returncode = 0
+        orig_run, orig_sleep = _mod.subprocess.run, _mod.time.sleep
+        _mod.subprocess.run = lambda argv, **kw: calls.append(argv) or _R()
+        _mod.time.sleep = lambda s: None
+        try:
+            with patch.object(_mod.cli_wedge, "core_target", return_value="=seat:0"):
+                self.assertTrue(_mod.send_keys("/s", "seat", ("/model opus", "Enter", "continue", "Enter")))
+                self.assertTrue(_mod.send_keys("/s", "seat", "Enter"))
+        finally:
+            _mod.subprocess.run, _mod.time.sleep = orig_run, orig_sleep
+        argv = __import__("tmux_pane_keys").argv
+        self.assertEqual(calls, [argv("/s", "=seat:0", "-l", "/model opus"), argv("/s", "=seat:0", "Enter"),
+                                 argv("/s", "=seat:0", "-l", "continue"), argv("/s", "=seat:0", "Enter"),
+                                 argv("/s", "=seat:0", "Enter")])
 
     def test_fable_limit_and_session_limit_stay_distinct(self):
         # One is a switch the monitor may take; the other is a wait/spend decision.
@@ -1058,10 +1164,10 @@ class TestComposerText(unittest.TestCase):
 class TestAutoAnswer(unittest.TestCase):
     """M4 decision safety: only strictly-safe gates auto-answer; all else escalates."""
 
-    def test_allowlist_is_exactly_press_enter_and_fable_limit(self):
+    def test_allowlist_is_exactly_press_enter_and_the_fable_switches(self):
         self.assertEqual(auto_answer("press-enter"), "Enter")
         self.assertEqual(auto_answer("fable-limit"), "Enter")
-        self.assertEqual(set(_mod._AUTO_ANSWER), {"press-enter", "fable-limit"})
+        self.assertEqual(set(_mod._AUTO_ANSWER), {"press-enter", "fable-limit", "fable-limit-refused"})
 
     def test_login_never_auto_answered(self):
         self.assertIsNone(auto_answer("login"))
@@ -1237,11 +1343,86 @@ class TestMainAutoAnswerWiring(unittest.TestCase):
         self.assertEqual(len(sent), 1)
         self.assertNotIn("auto_answered", payload)
 
+    def test_a_refused_turn_types_only_the_switch_on_its_tick(self):
+        sent, payload = self._tick([], pane=_FABLE_REFUSED_MONITOR)
+        self.assertEqual(sent, [("/tmp/x.sock", "sutando-core", ("/model opus", "Enter"))])
+        self.assertEqual(payload["auto_answered"]["kind"], "fable-limit-refused")
+        self.assertEqual(payload["auto_answered"]["episode"], payload["auto_answered"]["at"])
+
     def test_no_auto_answer_flag_reports_only(self):
         sent, payload = self._tick(["--no-auto-answer"])
         self.assertEqual(sent, [])
         self.assertEqual(payload["kind"], "fable-limit")
         self.assertNotIn("auto_answered", payload)
+
+    def _ticks(self, panes, extra_args=()):
+        """Run main() across len(panes) real loop iterations (no --once): one
+        capture() result per tick, time.sleep stubbed to stop once every pane
+        has been consumed."""
+        import sys
+        import tempfile
+        from unittest.mock import patch
+
+        class _Stop(Exception):
+            pass
+
+        sent, calls = [], []
+        pane_iter = iter(panes)
+
+        def fake_capture(s, sess):
+            return next(pane_iter)
+
+        def fake_sleep(s):
+            calls.append(s)
+            if len(calls) >= len(panes):
+                raise _Stop
+
+        out = os.path.join(tempfile.mkdtemp(), "core-supervisor.json")
+
+        class _RH:
+            TMUX_SOCKET = SESSION = None
+
+            def derive(self):
+                return {"health": "unknown"}
+        argv = ["core-input-watch.py", "--socket", "/tmp/x.sock", "--out", out,
+                "--stable", "1", *extra_args]
+        # session_runtime's real tmux call polls time.sleep, which would spend fake_sleep's ticks.
+        with patch.object(_mod, "capture_styled", fake_capture), \
+                patch.object(_mod, "session_runtime", lambda *a: None), \
+                patch.object(_mod, "_load_runtime_health", lambda: _RH()), \
+                patch.object(_mod, "gateway_alive", lambda *a: True), \
+                patch.object(_mod, "_ensure_tmux_on_path", lambda: None), \
+                patch.object(_mod, "send_keys", lambda s, sess, k: sent.append((s, sess, k)) or True), \
+                patch.object(_mod.time, "sleep", fake_sleep), \
+                patch.object(sys, "argv", argv):
+            try:
+                main()
+            except _Stop:
+                pass
+        return sent
+
+    def test_a_pending_follow_up_fires_once_idle_clears(self):
+        # Tick 1 types the refused-turn switch and arms the follow-up; tick 2's
+        # plain idle pane (no refusal line) fires it instead of re-typing.
+        sent = self._ticks([_FABLE_REFUSED_MONITOR, _IDLE])
+        self.assertEqual(sent, [
+            ("/tmp/x.sock", "sutando-core", ("/model opus", "Enter")),
+            ("/tmp/x.sock", "sutando-core", ("continue", "Enter")),
+        ])
+
+    def test_a_draft_at_idle_ready_holds_the_follow_up_in_the_loop(self):
+        draft = _IDLE.replace("❯ ", "❯ half-typed reply")
+        sent = self._ticks([_FABLE_REFUSED_MONITOR, draft, draft])
+        self.assertEqual(sent, [("/tmp/x.sock", "sutando-core", ("/model opus", "Enter"))])
+
+    def test_a_second_refusal_within_the_cooldown_is_not_retyped(self):
+        # tick2 (idle) resets answered_prompt; tick3's recurring refusal must
+        # not be retyped inside TYPED_ANSWER_COOLDOWN_S.
+        sent = self._ticks([_FABLE_REFUSED_MONITOR, _IDLE, _FABLE_REFUSED_MONITOR])
+        self.assertEqual(sent, [
+            ("/tmp/x.sock", "sutando-core", ("/model opus", "Enter")),
+            ("/tmp/x.sock", "sutando-core", ("continue", "Enter")),
+        ])
 
 
 class TestSendKeys(unittest.TestCase):

@@ -14,6 +14,22 @@ HOOK = REPO / "tests" / "fixtures" / "browser-playwright-register.mjs"
 # Harness safety net, not an assertion: each deadline is asserted from in-Node
 # timestamps, so a slow runner must not read as a deadline leak.
 PROC_TIMEOUT = int(os.environ.get("SUTANDO_BROWSER_TEST_PROC_TIMEOUT", "30"))
+OUTPUT_TAIL_LINES = 60
+
+
+def _tail(text, lines=OUTPUT_TAIL_LINES):
+    return "\n".join((text or "").splitlines()[-lines:])
+
+
+def run_browser_checked(argv, *, cwd, env):
+    """Run browser.mjs; on a non-zero exit, fail with its stderr/stdout tail."""
+    result = subprocess.run(argv, cwd=cwd, env=env, capture_output=True, text=True)
+    if result.returncode != 0:
+        message = f"{argv[:2]} exited {result.returncode}\n--- stderr (tail) ---\n{_tail(result.stderr)}"
+        if (result.stdout or "").strip():
+            message += f"\n--- stdout (tail) ---\n{_tail(result.stdout)}"
+        raise AssertionError(message)
+    return result
 
 
 class PersistentBrowserTests(unittest.TestCase):
@@ -53,10 +69,7 @@ class PersistentBrowserTests(unittest.TestCase):
     def test_profile_override_is_reported_without_launching(self):
         with tempfile.TemporaryDirectory() as tmp:
             env = dict(os.environ, SUTANDO_BROWSER_PROFILE=tmp)
-            result = subprocess.run(
-                ["node", str(SCRIPT), "profile"], cwd=REPO, env=env,
-                capture_output=True, text=True, check=True,
-            )
+            result = run_browser_checked(["node", str(SCRIPT), "profile"], cwd=REPO, env=env)
             self.assertEqual(result.stdout.strip(), tmp)
 
     @unittest.skipUnless((REPO / "node_modules" / "playwright").exists(), "playwright dependency not installed")
@@ -64,13 +77,33 @@ class PersistentBrowserTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             profile = Path(tmp) / "profile"
             env = dict(os.environ, SUTANDO_BROWSER_PROFILE=str(profile))
-            result = subprocess.run(
+            result = run_browser_checked(
                 ["node", str(SCRIPT), "data:text/html,<body>persistent-ok</body>", "text"],
-                cwd=REPO, env=env, capture_output=True, text=True, check=True,
+                cwd=REPO, env=env,
             )
             self.assertIn("persistent-ok", result.stdout)
             self.assertTrue(profile.is_dir())
             self.assertTrue(any(profile.iterdir()))
+
+    def test_checked_run_failure_surfaces_browser_stderr(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            stub = Path(tmp) / "browser.mjs"
+            stub.write_text(
+                "for (let i = 0; i < 100; i++) console.error(`noise-${i}`);\n"
+                "console.error('stub: Chrome failed to launch');\n"
+                "console.log('stub-stdout-line');\n"
+                "process.exit(1);\n",
+                encoding="utf-8",
+            )
+            env = {"PATH": os.environ.get("PATH", ""), "HOME": tmp}
+            with self.assertRaises(AssertionError) as caught:
+                run_browser_checked(["node", str(stub), "text"], cwd=tmp, env=env)
+            message = str(caught.exception)
+            self.assertIn("exited 1", message)
+            self.assertIn("stub: Chrome failed to launch", message)
+            self.assertIn("stub-stdout-line", message)
+            self.assertIn("noise-99", message)
+            self.assertNotIn("noise-0", message.splitlines(), "stderr must be bounded to its tail")
 
     def test_error_closes_page_context_and_browser(self):
         with tempfile.TemporaryDirectory() as tmp:

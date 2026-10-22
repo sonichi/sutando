@@ -12,15 +12,49 @@ TARGET="$(bash "$CONFIG" claude-home-path skills)"
 # The owner's own skills live in <workspace>/skills/, the folder that survives an engine
 # update (the engine tree is replaced). A shipped skill wins a name collision.
 WS="$(bash "$CONFIG" workspace 2>/dev/null || true)"
+REPO="$(cd "$SKILLS_DIR/.." && pwd)"
+. "$REPO/scripts/python-binary.sh"
+PY="$(resolve_python "$REPO")"
+[ -n "$PY" ] || { echo "skills/install.sh: no runnable python3 to decide which skills are developer-only; linking nothing" >&2; exit 1; }
+
+# "<name>\t<reason>" per skill this install must not link (src/skill_audience.py owns the rule).
+excluded_in() {
+  local root="$1" dirs=()
+  for d in "$root"/*/; do [ -f "$d/SKILL.md" ] && dirs+=("${d%/}"); done
+  [ "${#dirs[@]}" -gt 0 ] || return 0
+  "$PY" "$REPO/src/skill_audience.py" excluded "${dirs[@]}"
+}
+REPO_EXCLUDED="$(excluded_in "$SKILLS_DIR")" || { echo "skills/install.sh: audience check failed; linking nothing" >&2; exit 1; }
+WS_EXCLUDED=""
+if [ -n "$WS" ] && [ -d "$WS/skills" ]; then
+  WS_EXCLUDED="$(excluded_in "$WS/skills")" || { echo "skills/install.sh: audience check failed; linking nothing" >&2; exit 1; }
+fi
+
+# Prints the reason when $2 names a skill in the excluded list $1, else nothing.
+excluded_reason() {
+  printf '%s\n' "$1" | awk -F'\t' -v n="$2" '$1 == n { print $2; exit }'
+}
+
+# An excluded skill is never linked; one already linked is left in place, with a note.
+skip_excluded() {
+  local reason="$1" target="$2" name="$3" label="$4"
+  if [ -L "$target/$name" ] || [ -e "$target/$name" ]; then
+    echo "  ⚠ $name ($label$reason; already installed, left in place — remove it yourself, or set skills.developer)"
+  else
+    echo "  - $name ($label$reason; not installed — set skills.developer to opt in)"
+  fi
+}
 
 link_skills() {
-  local TARGET="$1" skill_dir skill_name
+  local TARGET="$1" skill_dir skill_name reason
   mkdir -p "$TARGET"
 
   for skill_dir in "$SKILLS_DIR"/*/; do
     skill_name=$(basename "$skill_dir")
     [ "$skill_name" = "install.sh" ] && continue
     [ ! -f "$skill_dir/SKILL.md" ] && continue
+    reason="$(excluded_reason "$REPO_EXCLUDED" "$skill_name")"
+    if [ -n "$reason" ]; then skip_excluded "$reason" "$TARGET" "$skill_name" ""; continue; fi
 
     if [ -L "$TARGET/$skill_name" ] && [ ! -e "$TARGET/$skill_name" ]; then
       rm "$TARGET/$skill_name"
@@ -45,6 +79,8 @@ link_skills() {
         echo "  ⚠ $skill_name (workspace copy shadowed by the shipped skill of the same name — rename yours)"
         continue
       fi
+      reason="$(excluded_reason "$WS_EXCLUDED" "$skill_name")"
+      if [ -n "$reason" ]; then skip_excluded "$reason" "$TARGET" "$skill_name" "workspace skill, "; continue; fi
       if [ -L "$TARGET/$skill_name" ] && [ "$(readlink "$TARGET/$skill_name")" = "${skill_dir%/}" ]; then
         echo "  ↻ $skill_name (workspace skill, symlink exists)"
       elif [ -L "$TARGET/$skill_name" ] && [ ! -e "$TARGET/$skill_name" ]; then
