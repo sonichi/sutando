@@ -98,7 +98,7 @@ from delivery.readiness import read_ready_result  # noqa: E402
 from dedup_recovery import fresh_reask_id, plan_dedup_recovery, report_disposition  # noqa: E402
 from message_chunking import chunk_message  # noqa: E402  (Result Router S3 — shared fence-aware chunker)
 from policy.egress.unfurl import should_unfurl  # noqa: E402
-from policy.egress.result import guard_result_for_tier, resolve_access_tier as _resolve_task_tier  # noqa: E402
+from policy.egress.result import guard_result_for_tier, resolve_route_tier  # noqa: E402
 import local_task_protocol  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
 from util_paths import channel_access_path, claude_home_path, write_private_text  # noqa: E402
@@ -588,10 +588,7 @@ def _dedup_recover(task_id: str, holder_id, target) -> str:
 def _guard_reply(task_id: str, target, reply_text: str) -> str:
     """The body this reply leg may deliver: the shared guard's verdict for the asker's tier.
     A route without a tier re-reads it from the task file; no task file guards as guest."""
-    tier = (target or {}).get("access_tier") or "unknown"
-    if tier == "unknown":
-        task_file = find_task_file(TASKS_DIR, task_id) or local_task_protocol.find_archived_task(TASKS_DIR, task_id)
-        tier = _resolve_task_tier(task_file) if task_file else "guest"
+    tier = resolve_route_tier((target or {}).get("access_tier"), TASKS_DIR, task_id)
     safe, withheld = guard_result_for_tier(reply_text, tier, REPO,
                                            suppress_journal=(STATE_DIR, task_id))
     if withheld:

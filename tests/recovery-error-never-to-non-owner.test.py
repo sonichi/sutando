@@ -11,7 +11,8 @@ member's Slack DM. Pins the three properties the fix owns:
   2. the Slack reply leg runs the shared egress guard, so a non-owner reply
      carrying that error is withheld (src/slack-bridge.py), and a proactive
      owner notice never resolves to an unmapped allowlist member
-     (src/slack_owner.py);
+     (src/slack_owner.py); a route without a tier falls back through the one
+     shared resolver, `resolve_route_tier` (src/policy/egress/result.py);
   3. no local path or raw OS error survives into guarded user-facing text
      (src/policy/egress/result.py).
 """
@@ -231,6 +232,62 @@ class ErrorNoticeNeverRoutedToNonOwner(unittest.TestCase):
             {"allowFrom": ["UTEAM"], "tierMap": {}}))
         # A legacy file with no tierMap key keeps the grandfathered owner default.
         self.assertEqual(owner_mod.resolve_proactive_owner_id({"allowFrom": ["ULEGACY"]}), "ULEGACY")
+
+
+class RouteTierFallbackContract(unittest.TestCase):
+    """The one shared fallback for a route without a tier: task file (live, claimed,
+    archived), else guest. Every bridge's reply leg delegates to it."""
+
+    def _tasks(self, td):
+        tasks = Path(td) / "tasks"
+        (tasks / "archive" / "2026-10").mkdir(parents=True)
+        return tasks
+
+    def test_carried_tier_wins_without_reading_any_file(self):
+        with tempfile.TemporaryDirectory() as td:
+            self.assertEqual(egress.resolve_route_tier("team", self._tasks(td), TID), "team")
+
+    def test_unknown_tier_reads_live_claimed_and_archived_task_files(self):
+        with tempfile.TemporaryDirectory() as td:
+            tasks = self._tasks(td)
+            for where in (tasks / f"{TID}.txt", tasks / f"{TID}.txt.claimed-core",
+                          tasks / "archive" / f"{TID}.txt",
+                          tasks / "archive" / "2026-10" / f"{TID}.txt"):
+                where.write_text(f"id: {TID}\naccess_tier: team\ntask: hi\n")
+                for missing in ("unknown", None, ""):
+                    self.assertEqual(egress.resolve_route_tier(missing, tasks, TID), "team", where)
+                where.unlink()
+
+    def test_no_task_file_anywhere_guards_as_guest(self):
+        with tempfile.TemporaryDirectory() as td:
+            self.assertEqual(egress.resolve_route_tier("unknown", self._tasks(td), TID), "guest")
+
+    def test_archived_owner_task_is_owner(self):
+        with tempfile.TemporaryDirectory() as td:
+            tasks = self._tasks(td)
+            (tasks / "archive" / "2026-10" / f"{TID}.txt").write_text(
+                f"id: {TID}\naccess_tier: owner\ntask: hi\n")
+            self.assertEqual(egress.resolve_route_tier("unknown", tasks, TID), "owner")
+
+
+class SlackReplyLegDelegatesTheTierFallback(unittest.TestCase):
+    def test_guard_reply_uses_the_shared_resolver(self):
+        seen = []
+
+        def _spy(tier, tasks_dir, task_id):
+            seen.append((tier, tasks_dir, task_id))
+            return "team"
+
+        saved = sb.resolve_route_tier
+        sb.resolve_route_tier = _spy
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                sb.REPO, sb.TASKS_DIR, sb.STATE_DIR = Path(td), Path(td) / "tasks", Path(td) / "state"
+                safe = sb._guard_reply(TID, {"channel": "D0TEAM"}, ERROR_BODY)
+        finally:
+            sb.resolve_route_tier = saved
+        self.assertEqual(seen, [(None, Path(td) / "tasks", TID)])
+        self.assertNotIn("[Errno", safe, "the resolver's tier did not drive the guard")
 
 
 class NoLocalPathInUserFacingText(unittest.TestCase):

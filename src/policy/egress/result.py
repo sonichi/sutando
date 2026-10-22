@@ -37,11 +37,13 @@ from typing import NamedTuple
 # derives its classification from parse_markers rather than a parallel grammar.
 try:  # pragma: no cover - the packaged twin exercises the relative imports
     from .result_markers import parse_markers  # packaged sibling (ag2-sparrow)
-    from .local_task_protocol import canonical_access_tier, parse_task_headers
+    from .local_task_protocol import canonical_access_tier, find_archived_task, parse_task_headers
+    from .task_archive import find_task_file
     from .file_lock import lock_fd, unlock_fd
 except ImportError:
     from result_markers import parse_markers  # monorepo src/ on sys.path
-    from local_task_protocol import canonical_access_tier, parse_task_headers
+    from local_task_protocol import canonical_access_tier, find_archived_task, parse_task_headers
+    from task_archive import find_task_file
     from file_lock import lock_fd, unlock_fd
 
 TEAM_LEAK_RESULT = (
@@ -137,6 +139,15 @@ def resolve_access_tier(task_file) -> str:
         return "guest"
     tier = normed.pop()
     return tier if tier in {"owner", "team", "guest"} else "guest"
+
+
+def resolve_route_tier(tier, tasks_dir: Path, task_id: str) -> str:
+    """The tier a reply is guarded with: the route's own tier when it carries one,
+    else the task file's (live, claimed, or archived); no task file anywhere is guest."""
+    if tier and tier != "unknown":
+        return tier
+    task_file = find_task_file(tasks_dir, task_id) or find_archived_task(tasks_dir, task_id)
+    return resolve_access_tier(task_file) if task_file else "guest"
 
 
 def sensitive_data_filter_enabled(task_file, tier=None) -> bool:
