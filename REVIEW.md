@@ -102,8 +102,8 @@ and loads whichever repo it reviews.
    to tell "these are blockers" from "these are notes and I would merge it", so say which,
    and for anything short of ready, name the one thing that would change it.
    The verdict is a **recommendation, never a gate**: it does not substitute for the merge
-   conditions in `CONTRIBUTING.md` (mergeable head, green required CI + CLA, two recorded
-   approvals). *Grounded by:* a #2824 review that listed one clarity question and two minor
+   conditions in `CONTRIBUTING.md` (mergeable head, green required CI + CLA, the approvals
+   the `main` ruleset requires (currently one, including a code owner's)). *Grounded by:* a #2824 review that listed one clarity question and two minor
    notes and never said it was ready; the owner had to ask "do you recommend approval?".
 
 9. **A negative result is not evidence until the instrument is shown able to produce a
@@ -403,8 +403,10 @@ and loads whichever repo it reviews.
     opposite polarity: two-becomes-one on someone else's PR, no-decision-possible on your own.
     **And `reviewDecision` over *other* logins is a THRESHOLD, not a latest-verdict flag.** An
     active block reads `CHANGES_REQUESTED`; approvals below the repo's required count still read
-    `REVIEW_REQUIRED`; only a met requirement reads `APPROVED`. One approval is not an approved
-    PR. Measured on #3482 with the head unchanged throughout: `john-the-dev` APPROVED at
+    `REVIEW_REQUIRED`; only a met requirement reads `APPROVED`. An approval count below the live
+    ruleset's required count, or missing the required code-owner approval, is not an approved
+    PR. Historical example (that era's ruleset required more than one approval): measured on
+    #3482 with the head unchanged throughout: `john-the-dev` APPROVED at
     12:14:45Z and the field read `REVIEW_REQUIRED` at 12:16:58Z; `sonichi` APPROVED at 12:51:36Z
     and it read `APPROVED`.
     *Grounded by:* #3481 (2026-08-28) — approved without looking, twenty minutes after a
