@@ -141,7 +141,9 @@ resolve_claude_config_dir_and_seed() {
     export CLAUDE_CONFIG_DIR="$_ccd"
     echo "  ✓ CLAUDE_CONFIG_DIR=$_ccd"
     if [ -n "$PY" ] && "$PY" -c 'import sys' > /dev/null 2>&1; then
-      _ccd="$_ccd" _cwd="${SUTANDO_CLAUDE_WORKING_DIR:-}" _accept_bypass="${SUTANDO_ACCEPT_BYPASS_PERMISSIONS:-}" "$PY" - <<'PY' || echo "  ⚠ onboarding-seed skipped (non-fatal)"
+      # No override: claude starts in this checkout, which a git repo makes Claude Code ask
+      # about (2026-10-22: a PR checkout's core restarted into that prompt and sat there).
+      _ccd="$_ccd" _cwd="${SUTANDO_CLAUDE_WORKING_DIR:-$(cd "$REPO" && pwd -P)}" _accept_bypass="${SUTANDO_ACCEPT_BYPASS_PERMISSIONS:-}" "$PY" - <<'PY' || echo "  ⚠ onboarding-seed skipped (non-fatal)"
 import json, os
 ccd = os.environ["_ccd"]
 target = os.path.join(ccd, ".claude.json")
@@ -182,10 +184,11 @@ if (cfg.get("fullscreenUpsellSeenCount") or 0) < 3:
     cfg["fullscreenUpsellSeenCount"] = 3
     changed = True
     upsell_seeded = True
-# Trust-seed for the explicitly-configured working dir. Claude Code keys the
+# Trust-seed for the dir claude starts in. Claude Code keys the
 # folder-trust dialog on projects[<abs cwd>].hasTrustDialogAccepted; a fresh
-# scoped config lacks it for a custom cwd, so a detached session would hang on
-# the prompt. Only pre-trust the one dir the caller explicitly chose.
+# scoped config lacks it, so a detached session would hang on the prompt.
+# Only pre-trust the one dir the caller explicitly chose, or else the launcher's
+# own checkout (physical path, as getcwd() reports it).
 cwd = os.environ.get("_cwd") or ""
 trusted_dir = None
 if cwd:

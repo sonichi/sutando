@@ -536,6 +536,21 @@ check("derive: CONTROL /startup in the composer but nothing queued -> idle",
 check("derive: CONTROL a Claude draft does not hold its queue -> idle",
       _derive_blocked_case(f"❯ /startup\n{_FOOTER}", queued=1, runtime="claude")["health"] == "idle")
 check("severity_of: blocked is warn", rh.severity_of("blocked") == "warn")
+# 2026-10-22: Codex 0.160's first launch in a git checkout sat on this prompt for half an hour
+# while health said "Agent is online and idle".
+_CODEX_TRUST = ("  Folder access\n\n  /private/tmp/x/sutando-5764\n\n"
+                "  Trust this folder? Codex can read, edit, and run files here, subject to\n"
+                "  your permission settings. Your trust decision will be saved.\n\n"
+                "\u203a 1. Trust and continue\n  2. Quit\n\n  enter continue \u00b7 esc quit\n")
+d = _derive_blocked_case(_CODEX_TRUST, queued=0)
+check("derive: a Codex folder-trust prompt is blocked even with nothing queued",
+      d["health"] == "blocked" and "folder-trust prompt" in d["detail"] and "cannot take tasks" in d["detail"])
+d = _derive_blocked_case(_CODEX_TRUST, queued=2)
+check("derive: ...and with a queue, the detail names it",
+      d["health"] == "blocked" and "2 task(s) queued" in d["detail"] and "folder-trust" in d["detail"])
+check("derive: CONTROL a Codex picker the core's own turn raised is not person-only -> idle",
+      _derive_blocked_case("  Select Model and Effort\n\u203a 4. gpt-5.5 (current)\n", queued=0)["health"]
+      == "idle")
 check("derive: a session that cannot name its runtime is not judged -> idle",
       _derive_blocked_case(_REJECTED, queued=1, runtime="")["health"] == "idle")
 check("_queued_tasks: an unreadable workspace counts as no queue, never a crash",

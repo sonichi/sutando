@@ -265,6 +265,20 @@ if [ -n "${SUTANDO_CORE_MODEL:-}" ]; then
   CODEX_ARGS+=(-m "$SUTANDO_CORE_MODEL")
 fi
 
+# A git checkout's first Codex launch stops on "Trust this folder?", which a headless core
+# never answers; see src/codex_project_trust.py. Best effort: a failure leaves the prompt.
+ensure_codex_project_trust() {
+  local py out
+  py="$(heartbeat_python)"
+  [ -n "$py" ] || return 0
+  if out="$("$py" "$REPO/src/codex_project_trust.py" "${CODEX_HOME:-$HOME/.codex}" "$WORKING_DIR" "$REPO")"; then
+    [ "$out" = trusted ] && echo "  ✓ Codex project trust recorded for $WORKING_DIR"
+  else
+    echo "  ⚠ could not record Codex project trust; the core may wait on a trust prompt" >&2
+  fi
+  return 0
+}
+
 apply_tmux_defaults() {
   tmux_available || return 0
   tmux -S "$TMUX_SOCKET" start-server 2>/dev/null || true
@@ -575,6 +589,7 @@ if ! tmux_available; then
     echo "  ⚠ codex not found — not clearing the shutdown sentinel, no core can start." >&2
     exit 127
   fi
+  ensure_codex_project_trust
   stash_shutdown_sentinel
   clear_shutdown_sentinel
   # errexit would exit on the failed exec before the restore below is reached;
@@ -607,6 +622,7 @@ log_session_start() {
 # Creates the core session, waits for has-session within the configured budget
 # (new-session rc=0 only means tmux accepted it), then starts the helpers.
 start_core_session_and_helpers() {
+  ensure_codex_project_trust
   tmux -S "$TMUX_SOCKET" new-session -d -s "$SESSION" "${CORE_ENV_ARGS[@]}" codex "${CODEX_ARGS[@]}"
   for _ in $(seq 1 "$SESSION_UP_TRIES"); do
     session_exists "$SESSION" && break

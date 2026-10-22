@@ -51,6 +51,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`cli_wedge_patterns.py`** — The abnormal-banner table of the CLI progress detector: text on a pane that says the CLI is parked (a login prompt, a provider limit, a compaction, an error it sits on), as data.
 - **`client-frame-hub.ts`** — Client-frame hub: optional voice plugins register handlers; the host offers them every client JSON frame it does not own.
 - **`cloud_auth.py`** — Sutando Cloud session: find the owner's sutk_ bearer and call the cloud API.
+- **`codex_project_trust.py`** — Record the Codex core's own checkout as a trusted project before launch.
 - **`context-drop.sh`** — Sutando context drop — triggered by macOS hotkey via Automator Quick Action.
 - **`context_resume.py`** — Extract recent conversation turns from a Claude Code transcript (.jsonl).
 - **`conversation-log-store.ts`** — The voice session's conversation log (conversation.log + the sqlite mirror) as a bodhi ConversationHistoryStore, written like bodhi's own Markdown store: bodhi's history writer calls it asynchronously after each turn, it appends the spoken lines without blocking (fs/promises, sqlite in a worker) on its own serial queue, and a failed write is logged, never thrown.

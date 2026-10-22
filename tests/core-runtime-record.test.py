@@ -87,6 +87,15 @@ class WriterTests(unittest.TestCase):
             with self.subTest(args=args):
                 self.assertEqual(self.writer.argv_runtime(args), want)
 
+    def test_pane_walk_skips_malformed_rows_and_pane_ids(self):
+        ps = ("  PID  PPID ARGS\n10 1 /bin/zsh\n11 10\ngarbage\n"
+              "12 11 claude --name sutando-core\n")
+        def run(argv, **_):
+            out = "%3\n10\n" if argv[0] == "tmux" else ps
+            return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
+        with mock.patch.object(self.writer.subprocess, "run", side_effect=run):
+            self.assertEqual(self.writer.pane_runtimes("/s", "sutando-core"), {"claude"})
+
     def test_validation_and_failed_publish_preserve_prior_record(self):
         path = self.writer.publish(self.ws, "claude", 'a"b', 123)
         before = path.read_bytes()
