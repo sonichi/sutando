@@ -250,6 +250,24 @@ print(resolve_core_runtime(), end='')
 "
     ;;
 
+  desktop-runtime-select)
+    # Persist an explicit --runtime switch as the desktop's coreRuntime. Prints
+    # updated|unchanged|no-desktop; nonzero when the selection could not be written.
+    case "${2:-}" in
+      claude|codex) ;;
+      *) echo "sutando-config: desktop-runtime-select needs claude or codex" >&2; exit 2 ;;
+    esac
+    py -c "
+import sys
+sys.path.insert(0, '$REPO_ROOT')
+from src.sutando_config import persist_desktop_runtime_selection
+try:
+    print(persist_desktop_runtime_selection('$2'), end='')
+except (OSError, ValueError) as exc:
+    sys.exit(f'sutando-config: desktop runtime selection not written: {exc}')
+"
+    ;;
+
   core-config-dir-value)
     # v0.9 — print the resolved value (absolute path) of the matching
     # core_config_dirs entry. Selector semantics identical to

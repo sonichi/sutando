@@ -681,6 +681,49 @@ def _desktop_selected_runtime(repo_root: Optional[Path]) -> str:
     return selected.strip() if isinstance(selected, str) else ""
 
 
+def persist_desktop_runtime_selection(runtime: str, repo_root: Optional[Path] = None) -> str:
+    """Make an explicit outside-core switch the desktop's durable selection too.
+
+    Returns ``"unchanged"`` when it already says ``runtime`` and ``"updated"`` after
+    writing it; ``"no-desktop"`` when no desktop hosts this engine. Otherwise the
+    desktop keeps relaunching and probing for the old runtime while the new one
+    owns the session (2026-10-22: the app read a live Claude core as absent).
+
+    Same contract as the desktop's own writer (``core_runtime.rs``
+    ``update_runtime_json``): every other key survives, and the file is replaced
+    atomically, because readers treat a partial or unparseable file as "never
+    chosen". A file that exists but is not a JSON object is refused rather than
+    replaced, which would drop the desktop's other keys.
+    """
+    if runtime not in _SUPPORTED_CORE_RUNTIMES:
+        raise ValueError(f"unsupported core runtime: {runtime!r}")
+    path = desktop_runtime_selection_path(repo_root)
+    if path is None or not path.parent.is_dir():
+        return "no-desktop"
+    try:
+        body = json.loads(path.read_text())
+    except FileNotFoundError:
+        body = {}
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"cannot read {path}: {exc}") from exc
+    if not isinstance(body, dict):
+        raise ValueError(f"{path} is not a JSON object")
+    if body.get("coreRuntime") == runtime:
+        return "unchanged"
+    body["coreRuntime"] = runtime
+    tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+    try:
+        with open(tmp, "w") as f:
+            f.write(json.dumps(body, indent=2) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    return "updated"
+
+
 def resolve_core_runtime(repo_root: Optional[Path] = None) -> str:
     """Return the selected persistent core CLI runtime.
 

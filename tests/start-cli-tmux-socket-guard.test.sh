@@ -16,7 +16,16 @@ make_fixture() {
     printf '#!/bin/bash\necho "LAUNCHER %s $* tmux=$(command -v tmux)" >> "$TMUX_LOG"\n' "$rt" \
       > "$fix/src/agent/$rt/cli/start-cli.sh"
   done
-  printf '#!/bin/bash\n[ "$1" = workspace ] && echo "$TEST_WS"\n' > "$fix/scripts/sutando-config.sh"
+  cat > "$fix/scripts/sutando-config.sh" <<'EOF'
+#!/bin/bash
+case "$1" in
+  workspace) echo "$TEST_WS" ;;
+  desktop-runtime-select)
+    echo "SELECT $2" >> "$TMUX_LOG"
+    [ -n "${SELECT_FAILS:-}" ] && { echo "selection not written" >&2; exit 1; }
+    echo "${SELECT_RESULT:-updated}" ;;
+esac
+EOF
   cat > "$fix/bin/tmux" <<'EOF'
 #!/bin/bash
 echo "$*" >> "$TMUX_LOG"
@@ -105,5 +114,35 @@ launched "explicit foreign-checkout opt-in"
 OWN="$TD/app2/engine/sutando"; make_fixture "$OWN"; mkdir -p "$TD/app2/run"
 run "$OWN" "$OWN/bin:/usr/bin:/bin" "$TD/app2/run/tmux.sock"
 launched "the desktop's own engine checkout"
+if grep -q "SELECT claude" "$TD/log" && grep -q "desktop runtime selection is now claude" "$TD/err"; then
+  say PASS "an explicit --runtime on a desktop install becomes the desktop's selection"
+else
+  say FAIL "desktop selection: err=$(tr '\n' '|' < "$TD/err") log=$(tr '\n' '|' < "$TD/log")"
+fi
+run "$OWN" "$OWN/bin:/usr/bin:/bin" "$TD/app2/run/tmux.sock" SELECT_RESULT=unchanged
+if [ "$rc" = 0 ] && grep -q "LAUNCHER claude" "$TD/log" && ! grep -q "selection is now" "$TD/err"; then
+  say PASS "an unchanged desktop selection launches quietly"
+else
+  say FAIL "unchanged selection: rc=$rc err=$(tr '\n' '|' < "$TD/err") log=$(tr '\n' '|' < "$TD/log")"
+fi
+run "$OWN" "$OWN/bin:/usr/bin:/bin" "$TD/app2/run/tmux.sock" SELECT_FAILS=1
+if [ "$rc" = 1 ] && ! grep -q LAUNCHER "$TD/log" && ! grep -q kill-session "$TD/log" \
+   && grep -q "the desktop would still select another runtime" "$TD/err"; then
+  say PASS "an unwritable desktop selection refuses before any launcher or kill"
+else
+  say FAIL "unwritable selection: rc=$rc err=$(tr '\n' '|' < "$TD/err") log=$(tr '\n' '|' < "$TD/log")"
+fi
+run "$FIX" "$FIX/bin:/usr/bin:/bin" "$TD/sock" SERVER=same
+if [ "$rc" = 0 ] && ! grep -q SELECT "$TD/log"; then
+  say PASS "no desktop: the selection is left alone"
+else
+  say FAIL "no desktop: rc=$rc log=$(tr '\n' '|' < "$TD/log")"
+fi
+run "$FIX" "$FIX/bin:/usr/bin:/bin" "$TD/sock" SERVER=same SUTANDO_APP_SUPPORT="$TD/app2"
+if [ "$rc" = 0 ] && grep -q "SELECT claude" "$TD/log"; then
+  say PASS "an exported SUTANDO_APP_SUPPORT names the desktop for any checkout"
+else
+  say FAIL "exported app support: rc=$rc log=$(tr '\n' '|' < "$TD/log")"
+fi
 
 [ "$fails" = 0 ] && echo "all tmux socket guard checks pass" || { echo "$fails failed"; exit 1; }

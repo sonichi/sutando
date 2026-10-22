@@ -133,6 +133,25 @@ case "${1:-}" in
     ;;
 esac
 
+# An explicit --runtime on a desktop install is a switch: the desktop must select it too,
+# or it keeps relaunching and probing for the old CLI while the new one owns the session
+# (2026-10-22: a CLI switch to Claude left runtime.json on codex and the app stuck on
+# "core liveness unknown"). Refuse rather than launch into that split.
+if [ -n "$requested_runtime" ]; then
+  _app_support="${SUTANDO_APP_SUPPORT:-}"
+  if [ -z "$_app_support" ] && [ "$(basename "$(dirname "$REPO")")" = engine ]; then
+    _app_support="$(dirname "$(dirname "$REPO")")"
+  fi
+  if [ -n "$_app_support" ] && [ -d "$_app_support" ]; then
+    if ! _selected="$(bash "$REPO/scripts/sutando-config.sh" desktop-runtime-select "$runtime")"; then
+      echo "start-cli: refusing to launch $runtime: the desktop would still select another runtime." >&2
+      exit 1
+    fi
+    [ "$_selected" = updated ] && echo "start-cli: desktop runtime selection is now $runtime ($_app_support/runtime.json)." >&2
+  fi
+  unset _app_support _selected
+fi
+
 # The Codex notifier is runtime-specific. Always reap it before launching a
 # non-Codex core, including upgrades from sessions that predate runtime markers.
 if [ "$runtime" != "codex" ] && command -v tmux >/dev/null 2>&1; then
