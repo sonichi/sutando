@@ -19,7 +19,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from local_task_protocol import find_archived_task, find_result, valid_archive_lookup_id  # noqa: E402
+from delivery.task_dispatch import find_ready_result
+from local_task_protocol import find_archived_task, valid_archive_lookup_id  # noqa: E402
 from task_archive import find_task_file  # noqa: E402
 
 PENDING, CLAIMED, ANSWERED, ARCHIVED, MISSING = "pending", "claimed", "answered", "archived", "missing"
@@ -27,12 +28,12 @@ SETTLED = frozenset((ANSWERED, ARCHIVED))
 
 
 def task_disposition(workspace, task_id: str) -> str:
-    """The task's state, answered first: a result anywhere settles it whatever the task file says."""
+    """The task's state, answered first: a ready result anywhere settles it whatever the task file says."""
     if not valid_archive_lookup_id(task_id):
         raise ValueError("not a task id")
     root = Path(workspace)
     tasks, results = root / "tasks", root / "results"
-    if find_result(results, task_id) is not None:
+    if find_ready_result(results, task_id) is not None:
         return ANSWERED
     live = find_task_file(tasks, task_id)
     if live is not None:
