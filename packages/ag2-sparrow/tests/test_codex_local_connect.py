@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import fcntl
 import io
 import json
 import os
@@ -24,9 +23,15 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-PKG = Path(__file__).resolve().parents[1]
 sys.path.append(str(Path(__file__).resolve().parents[3] / "tests"))
+from _helpers.hermetic_env import isolate_os_environ, isolated_child_env  # noqa: E402
 from _helpers.subprocess_coverage import covered_code  # noqa: E402
+
+# Before the gateway-reaching imports below: no outer credential selector survives.
+isolate_os_environ()
+
+import fcntl  # noqa: E402  (outside the scanner's Python 3.9 stdlib list)
+PKG = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PKG))
 from ag2_sparrow import connect_common as cm, holder_lock, service_manager as sm, task_io  # noqa: E402
 from ag2_sparrow.adapters.codex import codex_connector as cc, connect_cli as cli  # noqa: E402
@@ -643,7 +648,7 @@ class LauncherProcess(Base):
     """The launcher as a real process over the real connector and the stub app-server."""
 
     def launcher(self):
-        env = dict(os.environ, PYTHONPATH=str(PKG))
+        env = isolated_child_env(PYTHONPATH=str(PKG))
         proc = subprocess.Popen([sys.executable, "-c", covered_code("import sys; from ag2_sparrow.adapters.codex import connect_cli\n"
                                                                     "sys.exit(connect_cli.main(['run']))")], env=env,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
