@@ -95,10 +95,10 @@ def refusal_note(path: str, reason: str) -> str:
 
 
 class EnvFiles(list):
-    """env_files' result: the readable files as (path, values), plus every credential-key value
-    each one assigns (a repeated key every time), the refused (path, reason) pairs, and `blocked`,
+    """env_files' result: the readable files as (path, values), plus every credential-key
+    (key, value) each one assigns (a repeated key every time), the refused (path, reason) pairs, and `blocked`,
     the message that stops the token tiers when the explicitly named AG2_DEVICE_ENV was refused."""
-    credential_values: "tuple[str, ...]" = ()
+    credential_pairs: "tuple[tuple[str, str], ...]" = ()
     refused: "tuple[tuple[str, str], ...]" = ()
     blocked: str = ""
 
@@ -114,14 +114,14 @@ def env_files(env: Mapping[str, str], read_text: "Callable[[str], object]") -> E
         text, reason = _read_result(read_text(path))
         if text is not None:
             out.append((path, parse_env_text(text)))
-            values += [v for k, v in parse_env_pairs(text) if k in CREDENTIAL_KEYS]
-            values += [v for _k, v in _assignment_pairs(text, CREDENTIAL_KEYS)]  # `export KEY=` too
+            values += [(k, v) for k, v in parse_env_pairs(text) if k in CREDENTIAL_KEYS]
+            values += _assignment_pairs(text, CREDENTIAL_KEYS)  # `export KEY=` too
         elif reason:
             refused.append((path, reason))
             if path == device:
                 out.blocked = (f"AG2_DEVICE_ENV names {path}, which was refused ({reason}); not falling "
                                "back to another credential source. Fix that file or unset AG2_DEVICE_ENV")
-    out.credential_values, out.refused = tuple(values), tuple(refused)
+    out.credential_pairs, out.refused = tuple(values), tuple(refused)
     return out
 
 
@@ -194,12 +194,16 @@ def token_file_token(text: str) -> str:
     return ""
 
 
-def token_file_values(text: str) -> "list[str]":
-    """Every value in a token file's text that is or could become its token or URL, not only the
-    winners: each assignment (a losing alias, an overwritten duplicate) and each raw line."""
-    raw = [line.strip() for line in text.splitlines()]
-    return ([v for _k, v in _assignment_pairs(text, TOKEN_KEYS + URL_KEYS)]
-            + [line for line in raw if line and "=" not in line and not line.startswith("#")])
+def token_file_pairs(text: str) -> "list[tuple[str, str]]":
+    """Every (key, value) in a token file's text that is or could become its token or URL, not
+    only the winners: each assignment (a losing alias, an overwritten duplicate), and the raw line
+    token_file_token reads once no assignment is left, keyed as a token. Beside an assignment that
+    line is only a candidate, so it counts when at least BARE_SECRET_MIN long."""
+    pairs = _assignment_pairs(text, TOKEN_KEYS + URL_KEYS)
+    raw = token_file_token("\n".join(line for line in text.splitlines() if "=" not in line))
+    if raw and (not _assignments(text, TOKEN_KEYS) or len(raw) >= contract.BARE_SECRET_MIN):
+        pairs.append((TOKEN_KEYS[0], raw))
+    return pairs
 
 
 def token_file_url(text: str) -> str:
@@ -239,6 +243,17 @@ def register(registry: "contract.SecretRegistry", values) -> None:
             registry.register(secret)
         elif value.lower().startswith(("http://", "https://")):
             registry.register_gateway_url(value)
+
+
+def register_pairs(registry: "contract.SecretRegistry", pairs) -> None:
+    """Register (key, value) candidates: a URL key's plain URL by its credential parts only, so its
+    redacted form stays renderable; every other value as register() does."""
+    for key, value in pairs:
+        if (key in URL_KEYS and value.lower().startswith(("http://", "https://"))
+                and not contract.parse_onboarding_token(value)[0]):
+            registry.register_gateway_url(value)
+        else:
+            register(registry, [value])
 
 
 @dataclass(frozen=True)
@@ -286,15 +301,15 @@ def discover(env: Mapping[str, str], files: "Sequence[EnvFile]" = (), *,
                      f"({token_file_reason}); token rotation cannot read it. Fix that file or unset "
                      "REMOTE_TASK_TOKEN_FILE")
     if registry is not None:
-        register(registry, [unquote(env.get(key) or "") for key in CREDENTIAL_KEYS])
-        register(registry, [values.get(key) or "" for _p, values in files for key in CREDENTIAL_KEYS])
-        register(registry, getattr(files, "credential_values", ()))
-        register(registry, token_file_values(token_file_text))
+        register_pairs(registry, [(key, unquote(env.get(key) or "")) for key in CREDENTIAL_KEYS])
+        register_pairs(registry, [(key, values.get(key) or "") for _p, values in files for key in CREDENTIAL_KEYS])
+        register_pairs(registry, getattr(files, "credential_pairs", ()))
+        register_pairs(registry, token_file_pairs(token_file_text))
         # A channel file's token file is the rotation file whenever that file wins: its values are candidates.
         for _path, values in files:
             named = values.get(TOKEN_FILE_KEY) or ""
             if named and named != token_file_env and read_token_file:
-                register(registry, token_file_values(_read_result(read_token_file(named))[0] or ""))
+                register_pairs(registry, token_file_pairs(_read_result(read_token_file(named))[0] or ""))
 
     found = {"raw": "", "token_key": "", "source": "none", "source_file": "", "source_vals": {},
              "file_url": ""}

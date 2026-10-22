@@ -541,6 +541,49 @@ class DiscoveryCases:
         self.o.register(registry, [URL_SHAPED_BEARER])
         self.assertTrue(registry.contains(f"x {URL_SHAPED_BEARER} y"))
 
+    def test_a_url_keys_plain_url_registers_by_its_parts_so_the_bare_gateway_renders(self):
+        tf = f"REMOTE_TASK_URL={GW}\nREMOTE_TASK_TOKEN={FILE_TOKEN}\n"
+        files = self.o.env_files({"AG2_DEVICE_ENV": "/dev"}, lambda p: f"REMOTE_TASK_URL={URL_SECRET_URL}\n")
+        registry = self.o.contract.SecretRegistry()
+        self.o.discover({"REMOTE_TASK_URL": GW, "AG2_DEVICE_ENV": "/dev", "REMOTE_TASK_TOKEN_FILE": "/t",
+                         "REMOTE_TASK_TOKEN": URL_SHAPED_BEARER},
+                        files, read_token_file=lambda p: tf, registry=registry)
+        for line in (f"poll ok, gateway {GW}", f"gateway {self.o.contract.redact_url(URL_SECRET_URL)}"):
+            self.assertEqual(registry.scrub(line), line, "a URL's redacted form is not a secret")
+        for secret in ("pass-word-2", "query-secret-3", "frag-secret-4", URL_SHAPED_BEARER, FILE_TOKEN):
+            self.assertTrue(registry.contains(f"x {secret} y"), secret)
+        whole = self.o.contract.SecretRegistry()
+        self.o.register_pairs(whole, [("REMOTE_TASK_URL", f"{GW}|{CHANNEL_TOKEN}"), ("REMOTE_TASK_URL", "bare-9911")])
+        for secret in (CHANNEL_TOKEN, "bare-9911"):
+            self.assertTrue(whole.contains(secret), "anything but a plain URL under a URL key is registered whole")
+
+    def test_a_token_files_raw_line_is_registered_whichever_env_names_the_file(self):
+        text = f"REMOTE_TASK_TOKEN={GW}|{FILE_TOKEN}\nraw-candidate-7781\n"
+        for env, files in (({"REMOTE_TASK_TOKEN_FILE": "/t"}, []),
+                           ({}, [("/chan", {"REMOTE_TASK_TOKEN_FILE": "/t"})])):
+            with self.subTest(env=env):
+                registry = self.o.contract.SecretRegistry()
+                self.o.discover(env, files, read_token_file=lambda p: text, registry=registry)
+                for secret in (FILE_TOKEN, "raw-candidate-7781"):
+                    self.assertTrue(registry.contains(f"x {secret} y"), secret)
+
+    def test_only_the_raw_line_that_could_become_the_token_is_registered(self):
+        text = (f"# rotated\nREMOTE_TASK_TOKEN={GW}|{FILE_TOKEN}\nset -a\nok\n")
+        registry = self.o.contract.SecretRegistry()
+        self.o.discover({}, [("/chan", {"REMOTE_TASK_TOKEN_FILE": "/t"})],
+                        read_token_file=lambda p: text, registry=registry)
+        self.assertTrue(registry.contains(FILE_TOKEN))
+        for line in ("poll ok -- backing off 4s", "set -a", "a broken token"):
+            self.assertEqual(registry.scrub(line), line, "a short line beside an assignment is no candidate")
+        later = self.o.contract.SecretRegistry()
+        self.o.discover({"REMOTE_TASK_TOKEN_FILE": "/t"}, read_token_file=lambda p: (
+            f"REMOTE_TASK_TOKEN={FILE_TOKEN}\nfirst-raw-line-1\nsecond-raw-line-2\n"), registry=later)
+        self.assertTrue(later.contains("first-raw-line-1"))
+        self.assertFalse(later.contains("second-raw-line-2"), "no later raw line is ever read as the token")
+        alone = self.o.contract.SecretRegistry()
+        self.o.discover({"REMOTE_TASK_TOKEN_FILE": "/t"}, read_token_file=lambda p: "# c\nok7\n", registry=alone)
+        self.assertTrue(alone.contains("x ok7 y"), "with no assignment the raw line is the token, at any length")
+
     def test_the_table_drives_the_choice(self):
         row = ROWS[0]  # env wins over every file, as tabled
         with tempfile.TemporaryDirectory() as td, \
