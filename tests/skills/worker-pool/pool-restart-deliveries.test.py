@@ -8,6 +8,7 @@ import json
 import os
 import signal
 import subprocess
+import sys
 import time
 import unittest
 from contextlib import redirect_stdout
@@ -24,6 +25,9 @@ def load_fixture():
 
 fixture = load_fixture()
 rem, REPO = fixture.rem, fixture.REPO
+sys.path.insert(0, str(REPO / "tests"))
+from _helpers.process_group import popen_bound
+
 pd, wi, sw = rem.pd, rem.wi, rem.sw
 import pool_router as router
 from result_publish import publish_text
@@ -80,8 +84,8 @@ class RestartDeliveries(unittest.TestCase):
         command = ["bash", str(REPO / "src/watch-tasks-stream.sh"),
                    "--role", "session", "--inbox", str(self.inbox)]
         with log.open("w") as stream:
-            proc = subprocess.Popen(command, cwd=REPO, env=self.env, stdin=subprocess.DEVNULL,
-                                    stdout=stream, stderr=subprocess.STDOUT, start_new_session=True)
+            proc = popen_bound(command, cwd=REPO, env=self.env, stdin=subprocess.DEVNULL,
+                               stdout=stream, stderr=subprocess.STDOUT)
         self.watchers.append(proc)
         sentinel = watcher_sentinel_path(self.ws / "state", instance=self.wid)
 
