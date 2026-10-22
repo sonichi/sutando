@@ -1182,8 +1182,10 @@ class BoundedRead(unittest.TestCase):
 
 SOURCE_KEYS = set(owner.CREDENTIAL_KEYS) | {owner.TOKEN_FILE_KEY}
 KEY_TUPLES = {"TOKEN_KEYS", "URL_KEYS", "CREDENTIAL_KEYS", "TOKEN_FILE_KEY", "MEDIA_TOKEN_KEY"}
-# The owner's name-only route: called with no arguments, as a dict value or a keyword value, and nowhere else.
+# The owner's name-only route: a no-argument call that is a value of a dict literal bound whole to one name,
+# only in a reviewed (module, function); a keyword or an inline dict can carry the name into a reader.
 NAME_ONLY = frozenset({"token_env_name"})
+NAME_ONLY_SITES = frozenset({("adapters/claude_code/cli.py", "wire_bridge")})
 # What names a credential file or store: a scope holding one of these and a read is credential I/O.
 CREDENTIAL_MARKERS = {"AG2_DEVICE_ENV", "CLAUDE_CONFIG_DIR", "TOKEN_FILE", "device_env_path",
                       "channel_env_paths", "env_files", "channel_token", "token_from_vault"}
@@ -1382,13 +1384,22 @@ def _probe_keeps(inner, parents) -> "list[str]":
     return why
 
 
-def _names_only(node, parents) -> bool:
-    """A NAME_ONLY use is a bare call whose result is a dict value or a keyword value, nothing else."""
+def _names_only(node, parents, rel) -> bool:
+    """A NAME_ONLY use is a bare call that is a value of a dict literal assigned whole to one name,
+    inside a function listed in NAME_ONLY_SITES for this module; nothing else."""
     call = parents.get(node)
     if not (isinstance(call, ast.Call) and call.func is node and not call.args and not call.keywords):
         return False
-    holder = parents.get(call)
-    return isinstance(holder, ast.keyword) or (isinstance(holder, ast.Dict) and any(v is call for v in holder.values))
+    record, bind = parents.get(call), None
+    if isinstance(record, ast.Dict) and any(v is call for v in record.values):
+        bind = parents.get(record)
+    if not (isinstance(bind, ast.Assign) and bind.value is record
+            and len(bind.targets) == 1 and isinstance(bind.targets[0], ast.Name)):
+        return False
+    scope = parents.get(bind)
+    while scope is not None and not isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        scope = parents.get(scope)
+    return scope is not None and (rel, scope.name) in NAME_ONLY_SITES
 
 
 def credential_access(source: str, rel: str) -> "list[str]":
@@ -1412,8 +1423,10 @@ def credential_access(source: str, rel: str) -> "list[str]":
         name = node.attr if isinstance(node, ast.Attribute) else node.id if isinstance(node, ast.Name) else None
         if name in KEY_TUPLES:
             out.append(f"{rel}:{node.lineno} owner key tuple {name}")
-        if name in NAME_ONLY and not _names_only(node, parents):
+        if name in NAME_ONLY and not _names_only(node, parents, rel):
             out.append(f"{rel}:{node.lineno} {name} used other than as a name in a record")
+        if isinstance(node, ast.alias) and node.name.rsplit(".", 1)[-1] in NAME_ONLY and node.asname:
+            out.append(f"{rel}:{node.lineno} {node.name} imported under another name")
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name in NAME_ONLY:
             out.append(f"{rel}:{node.lineno} a second definition of {node.name}")
     scopes = [("<module>", [n for n in tree.body if not isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))])]
@@ -1521,9 +1534,36 @@ class Guard(unittest.TestCase):
         self.assertEqual(credential_access(allowed, "remote_gateway_bridge.py"), [])
         self.assertEqual(credential_access('"""Put REMOTE_TASK_TOKEN in the .env file."""\nx = 1\n', "probe.py"), [],
                          "a docstring naming a key is prose, not a read")
-        for named in ('body = {"token_env": _sources.token_env_name()}',
-                      'record(path, token_env=_sources.token_env_name())'):
-            self.assertEqual(credential_access(named, "probe.py"), [], "the owner's name-only route")
+        site = "adapters/claude_code/cli.py"
+        for named in ('def wire_bridge(cfg):\n    body = {"token_env": _sources.token_env_name()}',
+                      'from .gateway_credential_sources import token_env_name\n'
+                      'def wire_bridge(cfg):\n    body = {"schema": 1, "token_env": token_env_name()}'):
+            self.assertEqual(credential_access(named, site), [], "the owner's name-only route")
+        for misplaced in ('def other(cfg):\n    body = {"token_env": _sources.token_env_name()}',
+                          'def wire_bridge(cfg):\n    os.getenv({"k": _sources.token_env_name()}["k"])',
+                          'def wire_bridge(cfg):\n    a = b = {"token_env": _sources.token_env_name()}'):
+            self.assertTrue(credential_access(misplaced, site), misplaced)
+
+    def assert_flagged(self, *sources):
+        for source in sources:
+            self.assertTrue(credential_access(source, "adapters/claude_code/cli.py"), source)
+            self.assertTrue(credential_access(source, "probe.py"), source)
+
+    def test_the_accessor_as_a_keyword_value_is_flagged(self):
+        self.assert_flagged('os.getenv(key=_sources.token_env_name())',
+                            'def wire_bridge(cfg):\n    return os.getenv(key=_sources.token_env_name())',
+                            'record(path, token_env=_sources.token_env_name())')
+
+    def test_the_accessor_as_a_value_of_a_dict_that_reads_is_flagged(self):
+        self.assert_flagged('os.environ.get({"token_env": _sources.token_env_name()}["token_env"])',
+                            'def wire_bridge(cfg):\n    return os.environ[{"k": _sources.token_env_name()}["k"]]',
+                            'body = {"token_env": _sources.token_env_name()}')
+
+    def test_the_accessor_under_an_alias_is_flagged(self):
+        self.assert_flagged('from .gateway_credential_sources import token_env_name as key_name\nos.getenv(key_name())',
+                            'from .gateway_credential_sources import token_env_name as key_name\n'
+                            'def wire_bridge(cfg):\n    body = {"token_env": key_name()}',
+                            'te = _sources.token_env_name\nos.getenv(te())')
 
     def test_the_name_only_route_is_the_owners_canonical_token_key(self):
         self.assertEqual(owner.token_env_name(), owner.TOKEN_KEYS[0])
