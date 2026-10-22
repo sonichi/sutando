@@ -345,9 +345,12 @@ and loads whichever repo it reviews.
     validated the same predicate over 35 PRs with no exceptions and stated it unscoped; all
     35 were `base=main`, so their population could not have exposed the base dependency at
     any sample size. This evidence predates the ruleset change from two approvals to one
-    plus code-owner review: at one, a single approval reads `APPROVED` on `main` only
-    if it comes from a code owner of every touched path (#5143 shows a collaborator's sole
-    APPROVE with `REVIEW_REQUIRED`, because the author is the path's code owner), so the base branch no longer separates the cases by count. The write-access
+    plus code-owner review. Now a PR reads `APPROVED` on `main` when it has the ruleset's
+    required count (currently one, or two when `require_extra_approval_for_unattributed_changes`
+    applies, e.g. an unattributed Copilot PR) and a code owner's approval for every touched
+    path (#5143 shows a collaborator's sole APPROVE with `REVIEW_REQUIRED`, because the author
+    is the path's code owner). For attributed PRs at one, the base branch no longer separates
+    the cases by count. The write-access
     half still holds, and the code-owner requirement still applies only on `main`.
 
 18. **A test that never ran cannot fail — verify the runner collected the expected new tests,
