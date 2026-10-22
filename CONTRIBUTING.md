@@ -211,7 +211,7 @@ The goal of this phase is to provide evidence the maintainer can verify quickly.
    The reviewer should not have to re-derive that your change works.
 2. Check the CLA status — CLA-Assistant runs on PR open and flags any commits whose author email isn't mapped to a CLA-signed GitHub account. **A failing CLA check blocks merge**, no matter how green everything else is. Fix with `git config user.email YOUR_GH_MAPPED_EMAIL && git commit --amend --reset-author --no-edit && git push --force-with-lease`. (`git log -1 --format='%ae'` to check what's there now.)
 
-   **`license/cla` FAILING and `license/cla` ABSENT are different problems with different fixes.** The remedy above is for a check that ran and said no. Sometimes the check never posts at all — and because it is a *required* context, "never posted" reads as pending forever and the PR sits at `BLOCKED` with every other check green and both approvals in place. It is easy to misread as a review problem. Tell them apart by asking for the commit statuses directly, since an absent context simply does not appear in the PR's check list:
+   **`license/cla` FAILING and `license/cla` ABSENT are different problems with different fixes.** The remedy above is for a check that ran and said no. Sometimes the check never posts at all — and because it is a *required* context, "never posted" reads as pending forever and the PR sits at `BLOCKED` with every other check green and the required approvals in place. It is easy to misread as a review problem. Tell them apart by asking for the commit statuses directly, since an absent context simply does not appear in the PR's check list:
 
    ```bash
    gh pr view <N> --json headRefOid --jq .headRefOid \

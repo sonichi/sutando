@@ -102,9 +102,9 @@ and loads whichever repo it reviews.
    to tell "these are blockers" from "these are notes and I would merge it", so say which,
    and for anything short of ready, name the one thing that would change it.
    The verdict is a **recommendation, never a gate**: it does not substitute for the merge
-   conditions in `CONTRIBUTING.md` (mergeable head, green required CI + CLA, the approvals
-   the `main` ruleset requires (currently one, including a code owner's)). *Grounded by:* a #2824 review that listed one clarity question and two minor
-   notes and never said it was ready; the owner had to ask "do you recommend approval?".
+   conditions in `CONTRIBUTING.md` (mergeable head, green required CI + CLA, and the approvals
+   the `main` ruleset requires). *Grounded by:* a #2824 review that listed one clarity
+   question and two minor notes and never said it was ready; the owner had to ask "do you recommend approval?".
 
 9. **A negative result is not evidence until the instrument is shown able to produce a
    positive.** Much of a PR's evidence is a *zero*: "no other call sites", "no conflicts",
@@ -345,8 +345,9 @@ and loads whichever repo it reviews.
     validated the same predicate over 35 PRs with no exceptions and stated it unscoped; all
     35 were `base=main`, so their population could not have exposed the base dependency at
     any sample size. This evidence predates the ruleset change from two approvals to one
-    plus code-owner review: at one, a single counting approval also reads `APPROVED` on
-    `main`, so the base branch no longer separates the cases by count. The write-access
+    plus code-owner review: at one, a single approval reads `APPROVED` on `main` only
+    if it comes from a code owner of every touched path (#5143 shows a collaborator's sole
+    APPROVE with `REVIEW_REQUIRED`, because the author is the path's code owner), so the base branch no longer separates the cases by count. The write-access
     half still holds, and the code-owner requirement still applies only on `main`.
 
 18. **A test that never ran cannot fail — verify the runner collected the expected new tests,
