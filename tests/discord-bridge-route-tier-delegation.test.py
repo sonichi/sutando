@@ -27,7 +27,10 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 WORKSPACE = Path(tempfile.mkdtemp(prefix="sutando-discord-route-tier-test-"))
 os.environ["SUTANDO_WORKSPACE"] = str(WORKSPACE)
-os.environ["CLAUDE_CONFIG_DIR"] = str(WORKSPACE / "claude-config")
+os.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp(prefix="ccd-discord-route-tier-")
+_cfg = Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "discord"
+_cfg.mkdir(parents=True, exist_ok=True)
+(_cfg / "access.json").write_text('{"allowFrom": []}')
 os.environ["SUTANDO_TEST_MODE"] = "1"
 os.environ["DISCORD_BOT_TOKEN"] = "test-token-not-real"
 
