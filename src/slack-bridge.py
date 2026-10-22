@@ -592,7 +592,7 @@ def _guard_reply(task_id: str, target, reply_text: str) -> str:
     if tier == "unknown":
         task_file = find_task_file(TASKS_DIR, task_id) or local_task_protocol.find_archived_task(TASKS_DIR, task_id)
         tier = _resolve_task_tier(task_file) if task_file else "guest"
-    safe, withheld = guard_result_for_tier(reply_text, tier, Path(__file__).resolve().parent.parent,
+    safe, withheld = guard_result_for_tier(reply_text, tier, REPO,
                                            suppress_journal=(STATE_DIR, task_id))
     if withheld:
         print(f"  [team-guard] withheld result for {task_id} (tier={tier}): {withheld}", flush=True)
