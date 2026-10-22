@@ -90,8 +90,7 @@ class TeamResultLeakError(RuntimeError):
 
 
 # An internal error carries this host's paths and state ids; it is the owner's to read, never a
-# guarded reader's. Paths are matched only under per-user and temp roots (POSIX and Windows),
-# never any `/x/y`.
+# guarded reader's. Paths match only under per-user and temp roots (POSIX, Windows), never `/x/y`.
 INTERNAL_ERROR_DETAIL = "internal error detail"
 _INTERNAL_ERROR_RE = re.compile(
     r"\[(?:Errno|WinError) \d+\]"
