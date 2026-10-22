@@ -194,6 +194,14 @@ def token_file_token(text: str) -> str:
     return ""
 
 
+def token_file_values(text: str) -> "list[str]":
+    """Every value in a token file's text that is or could become its token or URL, not only the
+    winners: each assignment (a losing alias, an overwritten duplicate) and each raw line."""
+    raw = [line.strip() for line in text.splitlines()]
+    return ([v for _k, v in _assignment_pairs(text, TOKEN_KEYS + URL_KEYS)]
+            + [line for line in raw if line and "=" not in line and not line.startswith("#")])
+
+
 def token_file_url(text: str) -> str:
     """The REMOTE_TASK_URL (legacy AG2_REMOTE_URL) of a split-layout token file's text, or ""."""
     return first(_assignments(text, URL_KEYS), URL_KEYS)[0]
@@ -281,9 +289,12 @@ def discover(env: Mapping[str, str], files: "Sequence[EnvFile]" = (), *,
         register(registry, [unquote(env.get(key) or "") for key in CREDENTIAL_KEYS])
         register(registry, [values.get(key) or "" for _p, values in files for key in CREDENTIAL_KEYS])
         register(registry, getattr(files, "credential_values", ()))
-        # Every assignment read, not only the winners: a losing alias or overwritten duplicate was read too.
-        register(registry, [v for _k, v in _assignment_pairs(token_file_text, TOKEN_KEYS + URL_KEYS)])
-        register(registry, [token_file_token(token_file_text), token_file_url(token_file_text)])
+        register(registry, token_file_values(token_file_text))
+        # A channel file's token file is the rotation file whenever that file wins: its values are candidates.
+        for _path, values in files:
+            named = values.get(TOKEN_FILE_KEY) or ""
+            if named and named != token_file_env and read_token_file:
+                register(registry, token_file_values(_read_result(read_token_file(named))[0] or ""))
 
     found = {"raw": "", "token_key": "", "source": "none", "source_file": "", "source_vals": {},
              "file_url": ""}

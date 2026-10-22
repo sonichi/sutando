@@ -1819,16 +1819,8 @@ def _read_text(path: str) -> str:
     return read_regular_text(path) or ""
 
 
-class _SinkRegistry(gateway_credentials.SecretRegistry):
-    """Also withholds each value from the log and status sinks, which read diagnostics' registry."""
-
-    def register(self, value, min_len: int = 1) -> None:
-        super().register(value, min_len)
-        diagnostics.register_secret(value, min_len)
-
-
 # The process's credentials: every candidate registered, the winners chosen by the one owner's table.
-_SECRETS = _SinkRegistry()
+_SECRETS = gateway_instance.SinkRegistry()
 # The vault is located only if no earlier source holds a token.
 _FOUND = gateway_credential_sources.discover(
     os.environ, _channel_env_candidates(), read_token_file=_read_env_file,
@@ -2988,7 +2980,7 @@ def _post_task_ack(tid: str, durable: bool = False, lease_id: "str | None" = Non
                 raise
             if dropped is not None:
                 dropped.append((tid, durable, lease_id))
-                _log(f"task ack for {tid} lost to a dropped connection ({e}) — set aside for retry")
+                _log(f"task ack for {tid} lost to a dropped connection ({diagnostics.describe(e)}) — set aside for retry")
                 return False
             # A dropped link loses the ack; one prompt retry lands it inside the delivery lease.
             time.sleep(ACK_DROP_RETRY_S)
@@ -5053,6 +5045,7 @@ def _relay_failed_sent(broker_id: str) -> bool:
 
 
 _POLL_ANOMALIES = 0
+_POLL_ANOMALY_LINE = ""  # the last anomaly's line: built from our own fields, logged by the loop
 
 
 class _PollAnomaly(Exception):
@@ -5066,17 +5059,18 @@ def _served_key(task: dict) -> str:
 def _poll_task_list(resp) -> list:
     """The poll's served tasks. A 200 with no `tasks` list (an empty body, or other JSON) is
     counted and raised: it can stand for a batch the broker served and the client never saw."""
-    global _POLL_ANOMALIES
+    global _POLL_ANOMALIES, _POLL_ANOMALY_LINE
     tasks = resp.get("tasks") if isinstance(resp, dict) else None
     if isinstance(tasks, list):
         return tasks
     _POLL_ANOMALIES += 1
     meta = getattr(_RESP_META, "last", None) or {}
     shape = "an empty body" if resp == {} else f"{type(resp).__name__} without a tasks list"
-    raise _PollAnomaly(
+    _POLL_ANOMALY_LINE = (
         f"poll anomaly #{_POLL_ANOMALIES}: answered {shape} (status={meta.get('status')}, "
         f"content-length={meta.get('content_length')}, cf-ray={meta.get('cf_ray')}) "
         "— any task served in it is lost to this client until its lease expires")
+    raise _PollAnomaly()
 
 
 def _receive_round(tasks: list) -> "tuple[list, dict]":
@@ -5126,9 +5120,9 @@ def _isolated(task: dict, take, *args, fates: "dict | None" = None) -> bool:
     except urllib.error.HTTPError as e:
         if e.code in (401, 403):
             raise                     # the loop's auth recovery owns a rejected bearer
-        why = f"HTTPError: {e}"
+        why = diagnostics.describe(e)
     except Exception as e:  # noqa: BLE001 — one task must not withhold its batch's acks
-        why = f"{type(e).__name__}: {e}"
+        why = diagnostics.describe(e)
     if fates is not None:
         fates[_served_key(task)] = "dropped"
     _log(f"task {_served_key(task)} not taken ({why}) — not acked; the broker re-serves it")
@@ -5671,7 +5665,10 @@ def _room_upgraded_to(err_body: str) -> "str | None":
         return None
     if not isinstance(d, dict) or d.get("reason") != "room_upgraded":
         return None
-    return str(d.get("replacement_room") or "")
+    room = d.get("replacement_room")
+    # A gateway value: kept only as a room id holding no registered secret.
+    ok = isinstance(room, str) and gateway_instance.MATRIX_ROOM_RE.fullmatch(room) and not diagnostics.contains_secret(room)
+    return room if ok else ""
 
 
 def _owner_dm_upgrade_held(room: str) -> bool:
@@ -5719,7 +5716,7 @@ def _hold_owner_dm_upgrade(room: str, replacement: str, noticed: "set | None" = 
         try:
             _atomic_private_json(_upgrade_hold_file(), d)
         except OSError as e:
-            _log(f"could not record owner-DM upgrade hold ({e})")
+            _log(f"could not record owner-DM upgrade hold ({diagnostics.describe(e)})")
         _log(f"owner DM {room} was upgraded to {replacement or '(unknown)'}, which this agent "
              "has not joined — holding owner-DM nudges until the owner DM is repointed")
     _notify_owner_dm_upgrade(d, noticed)
@@ -5745,14 +5742,14 @@ def _notify_owner_dm_upgrade(d: dict, noticed: "set | None" = None) -> None:
     except Exception as exc:  # noqa: BLE001
         if tried >= MAX_TRANSIENT_ATTEMPTS:
             d["notice"] = "gave_up"
-            _log(f"owner-DM upgrade notify GAVE UP after {tried} attempt(s) ({exc}) — the owner was "
+            _log(f"owner-DM upgrade notify GAVE UP after {tried} attempt(s) ({diagnostics.describe(exc)}) — the owner was "
                  f"NOT told that {room} was upgraded to {replacement or '(unknown)'}")
         else:
-            _log(f"owner-DM upgrade notify failed ({exc}) — will retry ({tried}/{MAX_TRANSIENT_ATTEMPTS})")
+            _log(f"owner-DM upgrade notify failed ({diagnostics.describe(exc)}) — will retry ({tried}/{MAX_TRANSIENT_ATTEMPTS})")
     try:
         _atomic_private_json(_upgrade_hold_file(), d)
     except OSError as e:
-        _log(f"could not record owner-DM upgrade notice state ({e})")
+        _log(f"could not record owner-DM upgrade notice state ({diagnostics.describe(e)})")
 
 
 def _post_proactive() -> None:
@@ -5911,8 +5908,10 @@ def _post_proactive() -> None:
                 except OSError:
                     pass
                 raise
-            replacement = _room_upgraded_to(_http_error_body(e)) if (
-                e.code == 400 and room_override is None) else None
+            replacement = None
+            if e.code == 400 and room_override is None:
+                err_body = _http_error_body(e)
+                replacement = _room_upgraded_to(err_body)
             if replacement is not None:
                 try:
                     claim.rename(f)  # stays pending: not a failed attempt, the room moved
@@ -7718,9 +7717,9 @@ def main() -> None:
             _log(f"poll HTTP {e.code} — backing off {backoff}s")
             _emit_gateway_status(False, error=f"HTTP {e.code}", backoff_s=backoff, poll_ok_ts=last_poll_ok)
             time.sleep(backoff); backoff = min(backoff * 2, _POLL_BACKOFF_MAX_S)
-        except _PollAnomaly as e:
+        except _PollAnomaly:
             # Every anomaly is counted in its line; the log itself thins out a run of them.
-            _log_backoff(("poll-anomaly",), f"{e} — backing off {backoff}s")
+            _log_backoff(("poll-anomaly",), f"{_POLL_ANOMALY_LINE} — backing off {backoff}s")
             _emit_gateway_status(False, error="poll answered without a task list", backoff_s=backoff,
                                  poll_ok_ts=last_poll_ok)
             time.sleep(backoff); backoff = min(backoff * 2, _POLL_BACKOFF_MAX_S)

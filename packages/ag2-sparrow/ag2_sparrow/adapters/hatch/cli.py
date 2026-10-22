@@ -29,7 +29,7 @@ import time
 from importlib import resources
 from pathlib import Path
 
-from ... import _dirs, diagnostics, gateway_credential_io, gateway_credentials, gateway_instance, outbox, workspace_lock
+from ... import _dirs, gateway_credential_io, gateway_credentials, gateway_instance, outbox, workspace_lock
 from ...result_markers import parse_markers
 from ...service_manager import _systemctl, _systemd_run, systemd_user_available  # noqa: F401
 from .task_fields import item_id, valid_mxid
@@ -1096,49 +1096,11 @@ def reply(args) -> int:
         time.sleep(0.25)
 
 
-_TOKEN_KEYS = ("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN")
-_URL_KEYS = ("REMOTE_TASK_URL", "AG2_REMOTE_URL")
-_TOKEN_FILE_MAX = 64 * 1024
-
-
-def _register_onboarding(raw: str) -> None:
-    url, secret = gateway_credentials.parse_onboarding_token(raw.strip().strip("'\""))
-    diagnostics.register_secret(secret)
-    gateway_instance.register_gateway_secrets(url)
-
-
-def _register_token_file(path: str) -> None:
-    """Every token-shaped line of a rotated token file, whichever one the bridge would pick."""
-    try:
-        with open(path, encoding="utf-8", errors="surrogateescape") as fh:
-            text = fh.read(_TOKEN_FILE_MAX)
-    except (OSError, ValueError):
-        return
-    for line in text.splitlines():
-        line = line.strip().removeprefix("export ").strip()
-        key, eq, value = line.partition("=")
-        if eq and key in _TOKEN_KEYS:
-            _register_onboarding(value)
-        elif not eq and line and not line.startswith("#"):
-            _register_onboarding(line)
-
-
 def _register_device_secrets() -> None:
-    """Register every credential this host could hand Sparrow, from the process env and the device
-    file each on its own: whichever one precedence picks, the others must still be withheld."""
-    try:
-        file_env = {k.strip().removeprefix("export ").strip(): v for k, v in read_config(device_env_path()).items()}
-    except (OSError, UnicodeDecodeError):
-        file_env = {}
-    for source in (os.environ, file_env):
-        for key in _TOKEN_KEYS:
-            _register_onboarding(str(source.get(key) or ""))
-        for key in _URL_KEYS:
-            gateway_instance.register_gateway_secrets(str(source.get(key) or "").strip().strip("'\""))
-        diagnostics.register_secret(str(source.get("REMOTE_MEDIA_HS_TOKEN") or "").strip().strip("'\""))
-        token_file = str(source.get("REMOTE_TASK_TOKEN_FILE") or "").strip().strip("'\"")
-        if token_file:
-            _register_token_file(token_file)
+    """Withhold every credential candidate this host could hand Sparrow (the process env and the
+    device file, each on its own): whichever one precedence picks, the others stay withheld."""
+    gateway_credential_io.register_candidates(
+        dict(os.environ, AG2_DEVICE_ENV=str(device_env_path())), gateway_instance.SinkRegistry())
 
 
 def wake_context(_args) -> int:

@@ -277,7 +277,7 @@ class GatewayStatusEvidenceTest(unittest.TestCase):
                 self.assertEqual([r["last_ok_ts"] for r in records], [ok] * 10)
                 self.assertEqual(loop.serving[1 + len(prefix):], [False, True] + [False] * 8)
                 self.assertIn("unexpected:", records[0]["error"])
-                self.assertTrue(any("File exists" in m for m in loop.logs))
+                self.assertTrue(any("FileExistsError" in m for m in loop.logs))
                 self.assertEqual(loop.clock.slept, [1, 1, 2, 4, 8, 16, 32, 60, 60])
                 self.assertEqual(loop.acks, [])
                 self.assertFalse(_GW.INFLIGHT_FILE.exists())
@@ -819,9 +819,9 @@ class SlowAckTest(unittest.TestCase):
         self.assertLessEqual(bad[1][1], self.gw.ACK_RETRY_BUDGET_S + 1e-6,
                              "the retry ends inside the budget")
         self.assertTrue(any(m.startswith("served task-bad was not acked") for m in loop.logs))
-        self.assertIn("task ack for task-bad lost to a dropped connection (Remote end closed "
-                      "connection without response) — set aside for retry", loop.logs)
-        self.assertFalse(any(m.startswith("task ack network error for task-bad: Remote end")
+        self.assertTrue(any(m.startswith("task ack for task-bad lost to a dropped connection (RemoteDisconnected ")
+                            and m.endswith(") — set aside for retry") for m in loop.logs), loop.logs)
+        self.assertFalse(any(m.startswith("task ack network error for task-bad: RemoteDisconnected")
                              for m in loop.logs), "pass 1 does not call a set-aside ack failed")
 
     def test_a_redelivered_ack_first_ack_that_drops_does_not_delay_its_siblings(self):

@@ -22,7 +22,7 @@ import urllib.parse
 from pathlib import Path
 from typing import Any, Callable
 
-from . import diagnostics, file_lock, task_io
+from . import diagnostics, file_lock, gateway_credentials, task_io
 
 INSTANCE_RE = re.compile(r"[A-Za-z0-9_-]{1,32}")
 
@@ -249,6 +249,18 @@ def register_gateway_secrets(url: str) -> None:
                   *(pair.partition("=")[2] for pair in re.split(r"[&;]", query))):
         diagnostics.register_secret(value, min_len=diagnostics.BARE_SECRET_MIN)
 
+
+
+class SinkRegistry(gateway_credentials.SecretRegistry):
+    """The credential owner's registry, whose values the log and status sinks withhold too: a URL by
+    its credential parts, as register_gateway_secrets does, so the bare gateway stays renderable."""
+
+    def register(self, value: Any, min_len: int = 1) -> None:
+        super().register(value, min_len)
+        if isinstance(value, str) and value.lower().startswith(("http://", "https://")):
+            register_gateway_secrets(value)
+        else:
+            diagnostics.register_secret(value, min_len)
 
 def redact_text(text: str, gateway_url: str) -> str:
     """Diagnostic text safe to log or persist: the full gateway URL replaced by its redacted

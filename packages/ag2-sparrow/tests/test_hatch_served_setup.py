@@ -1875,7 +1875,7 @@ class InstallDiff(unittest.TestCase):
         with mock.patch.dict(os.environ, {"REMOTE_TASK_TOKEN": "diff-bearer-42", "AG2_DEVICE_ENV": "/nonexistent"}):
             text = hatch_cli._diff(old, "[Service]\nExecStart=/y\n", Path("/unit"))
         self.assertNotIn("diff-bearer-42", text.casefold())
-        self.assertIn("Environment=REMOTE_TASK_TOKEN=<withheld>", text)
+        self.assertEqual(text.count("-Environment=<withheld>"), 2, text)
         self.assertIn("ExecStart=/x", text)
 
     def test_install_withholds_every_environment_assignment_and_url_credential_on_disk(self):
@@ -1897,11 +1897,10 @@ class InstallDiff(unittest.TestCase):
         for secret in ("RETIRED-SYNTHETIC-TOKEN-314159", "SYNTHETIC-URL-SECRET", "user:pass", "frag",
                        "cfg-user", "cfg-pass", "CFG-QUERY-SECRET", "exec-user", "exec-pass", "EXEC-SECRET"):
             self.assertNotIn(secret.casefold(), text.casefold(), secret)
-        self.assertIn("-Environment=SAFE=<withheld> REMOTE_TASK_TOKEN=<withheld>", text)
-        self.assertIn("-Environment=REMOTE_TASK_URL=<withheld>", text)
-        self.assertIn("-Environment=<withheld>", text)
+        # gateway_credentials.mask_env_assignments: an environment line whole, a credential shape whole.
+        self.assertEqual(text.count("-Environment=<withheld>"), 3, text)
         self.assertIn("-REMOTE_TASK_URL=<withheld>", text)
-        self.assertIn("-ExecStart=/x --gateway https://gw.example/relay", text)
+        self.assertIn("-ExecStart=<withheld>", text)
         self.assertIn("-Description=a safe neighbour", text)
 
 
