@@ -233,11 +233,11 @@ def wire_bridge(cfg: dict) -> str:
         text, problem = owned_declaration(path)
         if problem:
             return problem
-        body = {"written_by": f"{COMMAND} install", "schema": 1, "host": mode, "name": worker_name(Path(root).name),
-                "module": "ag2_sparrow.remote_gateway_bridge", "env": env, "token_vault_key": cfg["TOKEN_VAULT_KEY"],
-                "token_env": _sources.token_env_name()}
-        cm._write(path, json.dumps(body, indent=1, sort_keys=False) + "\n", 0o644)
-        print(f"declared: {path} ({mode} runs it as worker {body['name']} on its next scan; the token is read from "
+        name = worker_name(Path(root).name)
+        cm._write(path, _sources.bridge_declaration_text(
+            written_by=f"{COMMAND} install", host=mode, name=name, module="ag2_sparrow.remote_gateway_bridge",
+            env=env, token_vault_key=cfg["TOKEN_VAULT_KEY"]), 0o644)
+        print(f"declared: {path} ({mode} runs it as worker {name} on its next scan; the token is read from "
               f"the vault: vault set {cfg['TOKEN_VAULT_KEY']} <the agent's relay token>)")
         return ""
     sup = cm.supervisor_path(BRIDGE)

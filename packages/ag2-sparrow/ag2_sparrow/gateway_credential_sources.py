@@ -15,6 +15,7 @@ package by tools/sync_from_src.py.
 """
 from __future__ import annotations
 
+import json
 import os.path
 from dataclasses import dataclass, field
 from typing import Callable, Mapping, Optional, Sequence
@@ -36,6 +37,15 @@ def token_env_name() -> str:
     """The token's environment variable by name, for a record that says where the token goes; another
     module may name it only through this call, never read the variable with it."""
     return TOKEN_KEYS[0]
+
+
+def bridge_declaration_text(*, written_by: str, host: str, name: str, module: str, env: Mapping[str, str],
+                            token_vault_key: str) -> str:
+    """A host supervisor's bridge declaration, as the JSON text to write: the worker, its environment, the
+    vault key holding its token, and the token's environment variable by name, so no caller names it."""
+    record = {"written_by": written_by, "schema": 1, "host": host, "name": name, "module": module, "env": env,
+              "token_vault_key": token_vault_key, "token_env": token_env_name()}
+    return json.dumps(record, indent=1, sort_keys=False) + "\n"
 
 # The precedence, stated once; the first source carrying a value wins (see discover() for each name:
 # "file" is the first listed .env file carrying a token, "token" the URL inside the winning one).

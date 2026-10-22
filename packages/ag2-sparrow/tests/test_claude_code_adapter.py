@@ -2443,6 +2443,18 @@ class ConnectHostSupervised(AgentRootBase):
         self.assertFalse(self.decl().exists())
         self.assertIn("kept: the Claude login", out, "the token lives in the vault: no host token file is named")
 
+    def test_the_declaration_is_the_record_install_wrote_before_the_owner_built_it(self):
+        rc, out, err = self.install_default(self.bridged())
+        self.assertEqual(rc, 0, err)
+        seg = "probe.agent_ag2.space"
+        before = {"written_by": f"{cli.COMMAND} install", "schema": 1, "host": "sparrowd", "name": cli.worker_name(seg),
+                  "module": "ag2_sparrow.remote_gateway_bridge",
+                  "env": {"AGENT_CONNECT_TASK_DIR": f"{self.root}/tasks", "AGENT_CONNECT_RESULT_DIR": f"{self.root}/results",
+                          "AGENT_CONNECT_STATE_DIR": f"{self.root}.bridge/state", "AGENT_MXID": AGENT},
+                  "token_vault_key": cli.vault_key(seg), "token_env": "REMOTE_TASK_TOKEN"}
+        self.assertEqual(self.decl().read_text(), json.dumps(before, indent=1, sort_keys=False) + "\n")
+        self.assertIn(f"declared: {self.decl()} (sparrowd runs it as worker {cli.worker_name(seg)} on its next scan; ", out)
+
     def test_a_foreign_declaration_is_never_replaced_or_removed(self):
         self.decl().parent.mkdir(parents=True)
         fake = self.bridged()
