@@ -1188,6 +1188,9 @@ NAME_ONLY = frozenset({"token_env_name"})
 NAME_ONLY_SITES = frozenset({("adapters/claude_code/cli.py", "wire_bridge")})
 # The record's key for the name: no module may read it back out of a record.
 RECORD_KEY = "token_env"
+# The audited calls the record may be handed to whole, as their first positional argument.
+# A listed sink is trusted; auditing what it does with the record is a review-time job.
+RECORD_SINKS = frozenset({"json.dumps"})
 # What names a credential file or store: a scope holding one of these and a read is credential I/O.
 CREDENTIAL_MARKERS = {"AG2_DEVICE_ENV", "CLAUDE_CONFIG_DIR", "TOKEN_FILE", "device_env_path",
                       "channel_env_paths", "env_files", "channel_token", "token_from_vault"}
@@ -1413,17 +1416,16 @@ def _name_record(node, parents, rel):
 
 
 def _record_misuse(scope, name, target, keys) -> "list[str]":
-    """How the record bound to `name` in `scope` is used other than whole: passed as an argument,
-    returned, or read at a constant key that does not hold the name. Rebinding, aliasing, mutation,
-    iteration, unpacking and any other read are misuse."""
+    """Every use of the record bound to `name` in `scope` other than: the first positional argument
+    of a RECORD_SINKS call, a return, or a read at a constant key that does not hold the name."""
     parents = {c: n for n in ast.walk(scope) for c in ast.iter_child_nodes(n)}
     why = []
     for n in ast.walk(scope):
         if not (isinstance(n, ast.Name) and n.id == name) or n is target:
             continue
         up = parents.get(n)
-        whole = (isinstance(up, ast.Call) and n in up.args) or (isinstance(up, ast.Return) and up.value is n) \
-            or (isinstance(up, ast.keyword) and up.arg is not None)
+        whole = (isinstance(up, ast.Call) and up.args[:1] == [n] and ast.unparse(up.func) in RECORD_SINKS) \
+            or (isinstance(up, ast.Return) and up.value is n)
         field = isinstance(up, ast.Subscript) and up.value is n and isinstance(up.ctx, ast.Load) \
             and isinstance(_constant(up.slice), str) and _constant(up.slice) not in keys
         if not (isinstance(n.ctx, ast.Load) and (whole or field)):
@@ -1626,6 +1628,24 @@ class Guard(unittest.TestCase):
                      '    body.update(x=1)\n', '    del body["schema"]\n', '    for k in body:\n        pass\n',
                      '    return "x" in body\n', '    body |= {}\n'):
             self.assertTrue(credential_access(head + tail, "adapters/claude_code/cli.py"), tail)
+
+    RECORD_HEAD = 'def wire_bridge(cfg):\n    body = {"token_env": _sources.token_env_name(), "name": "w"}\n'
+    WHOLE_RECORD_BYPASSES = ('    return dict(body).popitem()[1]\n',
+                             '    d = {}\n    d.update(body)\n    return os.getenv(d.popitem()[1])\n',
+                             '    return os.getenv(list(body)[0] and dict(body).popitem()[1])\n',
+                             '    return {**body}.popitem()[1]\n',
+                             '    return os.getenv(**body)\n',
+                             '    return dict.update(cfg, body)\n',
+                             '    return tuple(body), set(body), copy.copy(body)\n',
+                             '    return json.dumps(indent=1, obj=body)\n',
+                             '    return json.dump(body, sys.stdout)\n')
+
+    def test_the_record_reaches_only_an_audited_sink(self):
+        for tail in self.WHOLE_RECORD_BYPASSES:
+            self.assertTrue(credential_access(self.RECORD_HEAD + tail, "adapters/claude_code/cli.py"), tail)
+        for tail in ('    return json.dumps(body, indent=1)\n', '    return body\n',
+                     '    print(f"worker {body[\'name\']}")\n'):
+            self.assertEqual(credential_access(self.RECORD_HEAD + tail, "adapters/claude_code/cli.py"), [], tail)
 
     def test_the_shipped_record_is_used_whole(self):
         shipped = (PKG / "ag2_sparrow" / "adapters" / "claude_code" / "cli.py").read_text(encoding="utf-8")
