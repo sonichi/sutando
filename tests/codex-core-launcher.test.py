@@ -67,6 +67,10 @@ if [ "${1:-}" = display-message ] && [ "${!#}" = '#{session_created}' ]; then
   echo 123
   exit 0
 fi
+if [ "${1:-}" = list-panes ]; then
+  echo "${FAKE_CORE_PANE_PID:-}"
+  exit 0
+fi
 [ "${1:-}" = new-session ] && : > "$TMUX_STATE.created"
 if [ "${1:-}" = has-session ]; then
   [ -e "$TMUX_STATE.created" ] && exit 0
@@ -99,6 +103,8 @@ exit 0
 class CodexCoreLauncherTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
+        self._fake_panes = []
+        self.pane_pid = None
         self.root = Path(self.tmp.name) / "repo"
         self.bin = Path(self.tmp.name) / "bin"
         self.log = Path(self.tmp.name) / "tmux.log"
@@ -263,6 +269,9 @@ exit 0
         return text if text is not None else ""
 
     def tearDown(self):
+        for proc in getattr(self, "_fake_panes", ()):
+            proc.kill()
+            proc.wait()
         # A backgrounded heartbeat stub may still be writing its pid/log: wait for it, then clean up.
         pid_file = Path(self.tmp.name) / "heartbeat.pid"
         deadline = time.monotonic() + 5
@@ -279,6 +288,18 @@ exit 0
 
     # Every fake tmux answers the notifier's window lookup: the core has one window, index 0.
     _CORE_WINDOW = 'for _a in "$@"; do [ "$_a" = list-windows ] && { echo 0; exit 0; }; done\n'
+
+    def fake_core_pane(self, program="codex"):
+        """Run a process whose command line is <program>; fake tmux reports it as the core pane."""
+        pane_dir = Path(self.tmp.name) / "pane"
+        pane_dir.mkdir(exist_ok=True)
+        exe = pane_dir / program
+        if not exe.exists():
+            exe.symlink_to(shutil.which("sleep"))
+        proc = subprocess.Popen([str(exe), "300"])
+        self._fake_panes.append(proc)
+        self.pane_pid = proc.pid
+        return proc.pid
 
     def _write_exe(self, name, body):
         path = self.bin / name
@@ -334,6 +355,9 @@ exit 0
         # A suite run from a core shell must not point the launcher at the live socket or session.
         env.pop("SUTANDO_TMUX_SOCKET", None)
         env.pop("SUTANDO_TMUX_SESSION", None)
+        env.pop("SUTANDO_APP_SUPPORT", None)
+        if self.pane_pid:
+            env["FAKE_CORE_PANE_PID"] = str(self.pane_pid)
         env.update({
             "PATH": f"{self.bin}:/usr/bin:/bin",
             "TMUX_LOG": str(self.log),
@@ -369,6 +393,7 @@ exit 0
         env.pop("SUTANDO_TMUX_SOCKET", None)
         env.pop("SUTANDO_TMUX_SESSION", None)
         env.pop("TMUX", None)   # inherited from a tmux host, it would route to the detached branch
+        env.pop("SUTANDO_APP_SUPPORT", None)
         env.update({
             "PATH": f"{self.bin}:/usr/bin:/bin",
             "TMUX_LOG": str(self.log),
@@ -607,6 +632,7 @@ if [ "${1:-}" = print ]; then [ -f "$LAUNCHCTL_STATE" ]; else exit 0; fi
         """The other polarity: with no instance id the same launch is the core's,
         and the records the worker test proves untouched are written."""
         self._write_exe("tmux", SESSION_UP_AFTER_CREATE_TMUX)
+        self.fake_core_pane("codex")
         result = self.run_launcher()
         self.assertEqual(result.returncode, 0, result.stderr)
         state = self.root / "workspace" / "state"

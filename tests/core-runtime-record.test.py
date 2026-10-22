@@ -3,9 +3,12 @@ import importlib.util
 import io
 import json
 import os
+import shutil
+import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -30,7 +33,11 @@ class WriterTests(unittest.TestCase):
         self.ws = Path(self.tmp.name)
 
     def test_cli_reports_publish_failure_without_replacing_last_record(self):
-        argv = ["core-runtime-record", str(self.ws), "claude", "sutando-core", "123"]
+        argv = ["core-runtime-record", str(self.ws), "claude", "sutando-core", "123",
+                "--socket", str(self.ws / "t.sock")]
+        confirmed = mock.patch.object(self.writer, "pane_runtimes", return_value={"claude"})
+        confirmed.start()
+        self.addCleanup(confirmed.stop)
         with mock.patch.object(sys, "argv", argv):
             self.writer.main()
         path = self.ws / "state/core-runtime.json"
@@ -46,6 +53,39 @@ class WriterTests(unittest.TestCase):
                 self.assertEqual(raised.exception.code, 1)
                 self.assertIn(f"core runtime record: {failure}", err.getvalue())
             self.assertEqual(path.read_bytes(), before)
+
+    def test_cli_refuses_a_record_the_panes_do_not_run(self):
+        path = self.writer.publish(self.ws, "claude", "sutando-core", 1)
+        before = path.read_bytes()
+        argv = ["core-runtime-record", str(self.ws), "codex", "sutando-core", "123",
+                "--socket", str(self.ws / "t.sock")]
+        for running in (set(), {"claude"}, {"claude", "codex"}):
+            with self.subTest(running=running), \
+                    mock.patch.object(sys, "argv", argv), \
+                    mock.patch.object(self.writer, "pane_runtimes", return_value=running), \
+                    mock.patch.object(sys, "stderr", new_callable=io.StringIO) as err:
+                with self.assertRaises(SystemExit) as raised:
+                    self.writer.main()
+                self.assertEqual(raised.exception.code, 3)
+                self.assertIn("record unchanged", err.getvalue())
+            self.assertEqual(path.read_bytes(), before)
+
+    def test_argv_classification(self):
+        cases = {
+            "claude --name sutando-core --plugin-dir /x": "claude",
+            "/Users/a/Library/Application Support/x/claude.exe --resume u": "claude",
+            "/bin/bash /tmp/a b/bin/claude --name sutando-core": "claude",
+            "node /Users/a/.npm-global/bin/codex -C /repo": "codex",
+            "/opt/homebrew/bin/codex -C /repo --search": "codex",
+            "/tmp/p q/codex 300": "codex",
+            "tmux -S /s new-session -d -s sutando-core claude --name sutando-core": None,
+            "python3 /repo/skills/schedule-crons/scripts/codex-scheduler.py tick": None,
+            "bash /repo/src/agent/codex/cli/task-notifier-supervisor.sh": None,
+            "/bin/zsh": None,
+        }
+        for args, want in cases.items():
+            with self.subTest(args=args):
+                self.assertEqual(self.writer.argv_runtime(args), want)
 
     def test_validation_and_failed_publish_preserve_prior_record(self):
         path = self.writer.publish(self.ws, "claude", 'a"b', 123)
@@ -90,6 +130,50 @@ class WriterTests(unittest.TestCase):
         self.assertEqual(errors, [])
 
 
+TMUX = shutil.which("tmux", path="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")
+
+
+@unittest.skipUnless(TMUX, "tmux not found")
+class PaneRuntimeTests(unittest.TestCase):
+    """Real tmux on a private socket; the panes run processes named like each CLI."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name)
+        self.sock = str(self.dir / "t.sock")
+        self.addCleanup(subprocess.run, [TMUX, "-S", self.sock, "kill-server"],
+                        capture_output=True)
+        self.writer = load("core_record_panes", REPO / "src/core_runtime_record.py")
+        for name in ("claude", "codex"):
+            (self.dir / name).symlink_to(shutil.which("sleep"))
+
+    def session(self, name, *command):
+        subprocess.run([TMUX, "-S", self.sock, "new-session", "-d", "-s", name, *command],
+                       check=True)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if self.writer.pane_runtimes(self.sock, name, tmux=TMUX):
+                return
+            time.sleep(0.05)
+
+    def test_each_pane_reports_its_nearest_cli(self):
+        self.session("core-claude", str(self.dir / "claude"), "300")
+        subprocess.run([TMUX, "-S", self.sock, "new-window", "-t", "=core-claude", "sleep", "300"],
+                       check=True)
+        self.assertEqual(self.writer.pane_runtimes(self.sock, "core-claude", tmux=TMUX),
+                         {"claude"})
+        # A core's own CLI subprocess sits below the core and does not change its runtime.
+        script = f'"{self.dir / "codex"}" 300 & exec "{self.dir / "claude"}" 300'
+        self.session("core-nested", "/bin/sh", "-c", script)
+        self.assertEqual(self.writer.pane_runtimes(self.sock, "core-nested", tmux=TMUX),
+                         {"claude"})
+        self.session("core-codex", str(self.dir / "codex"), "300")
+        self.assertEqual(self.writer.pane_runtimes(self.sock, "core-codex", tmux=TMUX),
+                         {"codex"})
+        self.assertEqual(self.writer.pane_runtimes(self.sock, "absent", tmux=TMUX), set())
+
+
 class LauncherRegressionTests(unittest.TestCase):
     def codex(self):
         module = load("codex_launcher_fixture", REPO / "tests/codex-core-launcher.test.py")
@@ -111,6 +195,7 @@ class LauncherRegressionTests(unittest.TestCase):
     def test_confirmed_codex_replaces_claude_and_reuse_keeps_session_start(self):
         case, module = self.codex()
         case._write_exe("tmux", module.SESSION_UP_AFTER_CREATE_TMUX)
+        case.fake_core_pane("codex")
         run = case.run_launcher()
         self.assertEqual(run.returncode, 0, run.stderr)
         path = case.root / "workspace/state/core-runtime.json"
@@ -121,12 +206,48 @@ case "${1:-}" in
   has-session) [ "${3:-}" = =sutando-core ] ;;
   show-environment) echo SUTANDO_CORE_RUNTIME=codex ;;
   display-message) echo 123 ;;
+  list-panes) echo "$FAKE_CORE_PANE_PID" ;;
   *) exit 0 ;;
 esac
 ''')
         run = case.run_launcher()
         self.assertEqual(run.returncode, 0, run.stderr)
         self.assertEqual(json.loads(path.read_text())["started_at"], 123)
+
+    def test_codex_launcher_over_a_claude_core_records_and_replaces_nothing(self):
+        """The session is marked codex, but its pane runs Claude: the codex launcher
+        must neither stamp codex over it nor log a start."""
+        case, _ = self.codex()
+        case._write_exe("tmux", '''#!/bin/bash
+printf '%s\\n' "$*" >> "$TMUX_LOG"
+[ "${1:-}" = -S ] && shift 2
+case "${1:-}" in
+  has-session) [ "${3:-}" = =sutando-core ] ;;
+  show-environment) echo SUTANDO_CORE_RUNTIME=codex ;;
+  display-message) echo 456 ;;
+  list-panes) echo "$FAKE_CORE_PANE_PID" ;;
+  *) exit 0 ;;
+esac
+''')
+        case.fake_core_pane("claude")
+        state = case.root / "workspace/state"
+        path = state / "core-runtime.json"
+        before = '{"runtime":"claude","session":"sutando-core","started_at":456}\n'
+        path.write_text(before)
+        run = case.run_launcher()
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertIn("sutando-core runs claude, not codex; record unchanged", run.stderr)
+        self.assertEqual(path.read_text(), before)
+        self.assertFalse((state / "session-starts.log").exists())
+        calls = case._tmux_calls()
+        self.assertNotIn("new-session -d -s sutando-core ", calls)
+        self.assertNotIn("kill-session -t =sutando-core\n", calls + "\n")
+
+    def test_failed_codex_create_logs_no_session_start(self):
+        case, _ = self.codex()
+        run = case.run_launcher(env_extra={"TMUX_SESSION_NEVER_UP": "1"})
+        self.assertNotEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertFalse((case.root / "workspace/state/session-starts.log").exists())
 
     def test_env_override_is_visible_and_explicit_runtime_wins(self):
         case, module = self.codex()

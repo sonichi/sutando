@@ -594,12 +594,15 @@ if ! command -v fswatch >/dev/null 2>&1; then
 fi
 
 apply_tmux_defaults
-if ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" && [ -n "$ws" ]; then
+# Appended only once the new session is confirmed, so a failed launch logs no start.
+log_session_start() {
+  local ws
+  ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" && [ -n "$ws" ] || return 0
   mkdir -p "$ws/state"
   printf '{"host":"%s","session_started_at":%s,"iso":"%s","source":"start-cli","runtime":"codex"}\n' \
     "$(hostname | sed 's/\..*//')" "$(date +%s)" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     >> "$ws/state/session-starts.log"
-fi
+}
 
 # Creates the core session, waits for has-session within the configured budget
 # (new-session rc=0 only means tmux accepted it), then starts the helpers.
@@ -610,6 +613,7 @@ start_core_session_and_helpers() {
     sleep 0.2
   done
   if session_exists "$SESSION"; then
+    log_session_start
     record_confirmed_core_runtime codex "$(heartbeat_python)"
     clear_shutdown_sentinel
   else

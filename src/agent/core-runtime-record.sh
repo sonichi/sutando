@@ -16,6 +16,7 @@ record_confirmed_core_runtime() {
       return 0
       ;;
   esac
+  # The writer itself confirms the panes run this runtime's CLI and says why when not.
   "$py" "$REPO/src/core_runtime_record.py" "$ws" "$runtime" "$SESSION" "$started" \
-    || echo "start-cli: could not record the confirmed core runtime" >&2
+    --socket "$TMUX_SOCKET" || true
 }
