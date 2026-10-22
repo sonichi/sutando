@@ -1332,6 +1332,7 @@ print("{}")
         token = "fake-relay-token-0123456789abcdef"
         for owner, kept in ((f"@{token}:ag2.space", False), (f"@{token[5:].upper()}:ag2.space", False),
                             ("@o x:ag2.space", False), ("@o:ag2.space\nX", False), ("o:ag2.space", False),
+                            (f"@alice:{token[5:]}", False), (f"@alice:{token[5:].upper()}.example", False),
                             ("@owner-1:ag2.space", True)):
             with self.subTest(owner=owner):
                 out = self.bridge("""
@@ -2020,11 +2021,17 @@ class OwnerAndForms(unittest.TestCase):
     def test_owner_mxid_admits_only_a_matrix_user_id_holding_no_secret(self):
         from ag2_sparrow import diagnostics
         diagnostics.register_secret("owner-unit-secret-5150")
-        for owner, kept in (("@owner-1:ag2.space", True), ("@o:ag2.space:8448", True), ("owner:ag2.space", False),
+        size = gateway_instance.ROOM_PIECE_MIN
+        for owner, kept in (("@owner-1:ag2.space", True), ("@o:ag2.space:8448", False), ("owner:ag2.space", False),
                             ("@o x:ag2.space", False), (None, False), ("@OWNER-UNIT-SECRET-5150:ag2.space", False),
-                            ("@unit-secret:ag2.space", False), ("@x:owner-unit-secret-5150", False)):
+                            ("@unit-secret:ag2.space", False), ("@x:owner-unit-secret-5150", False),
+                            ("@x:unit-secret-5150", False), ("@x:UNIT-SECRET-5150.example", False),
+                            ("@o:other.server", False), (f"@{'unit-secret'[:size]}:ag2.space", False),
+                            (f"@{'unit-secret'[:size - 1]}:ag2.space", True)):
             with self.subTest(owner=owner):
-                self.assertEqual(gateway_instance.owner_mxid(owner), owner if kept else "")
+                self.assertEqual(gateway_instance.owner_mxid(owner, "@agent:ag2.space"), owner if kept else "")
+        self.assertEqual(gateway_instance.owner_mxid("@o:AG2.space", "@agent:ag2.space"), "@o:AG2.space")
+        self.assertEqual(gateway_instance.owner_mxid("@o:ag2.space", ""), "")
 
     def test_forms_are_total_over_lone_surrogates(self):
         from ag2_sparrow import diagnostics

@@ -672,7 +672,7 @@ def _gateway_owner() -> str:
     owner = str((row or {}).get("owner") or "")
     hint = str((row or {}).get("owner_dm_room") or "")
     _GATEWAY_OWNER_DM_HINT = gateway_instance.owner_room(hint, identity)
-    return gateway_instance.owner_mxid(owner)
+    return gateway_instance.owner_mxid(owner, identity)
 
 
 def _owner_review_dm(owner: str) -> str:

@@ -227,11 +227,13 @@ def owner_room(room: Any, identity: str) -> str:
 MATRIX_USER_RE = re.compile(r"@([A-Za-z0-9._=/+-]{1,255}):([A-Za-z0-9.-]{1,255}(?::[0-9]{1,5})?)")
 
 
-def owner_mxid(owner: Any) -> str:
-    """`owner` when it is a Matrix user id that holds no registered secret and whose localpart, if
-    ROOM_PIECE_MIN characters or longer, is no piece of one; '' otherwise (owner_room's rule)."""
+def owner_mxid(owner: Any, identity: str) -> str:
+    """`owner` when it is a Matrix user id on the agent's own homeserver, holds no registered secret
+    and whose localpart, if ROOM_PIECE_MIN characters or longer, is no piece of one; '' otherwise
+    (owner_room's rule, so a server part is never a piece of a secret)."""
     m = MATRIX_USER_RE.fullmatch(owner) if isinstance(owner, str) else None
-    if m is None:
+    server = identity.partition(":")[2] if isinstance(identity, str) and identity.startswith("@") else ""
+    if m is None or not server or m.group(2).casefold() != server.casefold():
         return ""
     local = m.group(1)
     piece = len(local) >= ROOM_PIECE_MIN and diagnostics.holds_or_is_piece(local)
