@@ -33,17 +33,17 @@ for _p in (str(_SRC), str(_REPO / "packages" / "ag2-sparrow")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from ag2_sparrow import agent_identity  # noqa: E402
+from ag2_sparrow import agent_identity, gateway_credential_sources as _sources  # noqa: E402
 from ag2_sparrow.adapters.claude_code import cli as adapter  # noqa: E402
 
 WRITTEN_BY = f"{adapter.COMMAND} install"
 BRIDGE_MODULE = "ag2_sparrow.remote_gateway_bridge"
-TOKEN_ENV = "REMOTE_TASK_TOKEN"
 SUFFIX = ".bridge"
 # A declaration is a few hundred bytes; anything past this is not one and is never read into memory.
 MAX_DECLARATION_BYTES = 64 * 1024
-# Never inherited from sparrowd: the host's token files, its agent identity and its owner DM.
-HOST_ONLY = ("AG2_DEVICE_ENV", "REMOTE_TASK_TOKEN_FILE", TOKEN_ENV, "AGENT_MXID", "AGENT_ID", "AG2SPACE_USER_ID",
+# Never inherited from sparrowd: the host's token files, its agent identity and its owner DM (and its
+# token, under the names _sources.bridge_token_environ gives it).
+HOST_ONLY = ("AG2_DEVICE_ENV", "REMOTE_TASK_TOKEN_FILE", "AGENT_MXID", "AGENT_ID", "AG2SPACE_USER_ID",
              "GATEWAY_INSTANCE", "REMOTE_PROACTIVE_ROOM", "AGENT_CONNECT_TASK_DIR", "AGENT_CONNECT_RESULT_DIR",
              "AGENT_CONNECT_STATE_DIR")
 
@@ -108,8 +108,8 @@ def load(path: Path, agents: Path) -> "tuple[dict | None, str]":
         return None, f"{path}: AGENT_MXID {mxid!r} is not the agent the segment {segment} names"
     root = str(Path(agents).resolve() / segment)
     want = {"name": adapter.worker_name(segment), "token_vault_key": adapter.vault_key(segment),
-            "token_env": TOKEN_ENV, "module": BRIDGE_MODULE, "env": adapter.bridge_env(root, mxid)}
-    for key in ("name", "token_vault_key", "token_env", "module"):
+            **_sources.bridge_declaration_fields(), "module": BRIDGE_MODULE, "env": adapter.bridge_env(root, mxid)}
+    for key in [k for k in want if k != "env"]:
         if decl.get(key) != want[key]:
             return None, f"{path}: {key} {decl.get(key)!r} is not the derived {want[key]!r}"
     if sorted(env) != sorted(want["env"]):
@@ -127,9 +127,11 @@ def load(path: Path, agents: Path) -> "tuple[dict | None, str]":
 def bridge_environ(decl: dict, token: str, base=None) -> dict:
     """What the bridge runs under: sparrowd's environment minus the host-only variables, plus the derived
     env, an empty owner DM and the agent's token."""
-    env = {k: v for k, v in (os.environ if base is None else base).items() if k not in HOST_ONLY}
+    token_env = _sources.bridge_token_environ(token)
+    env = {k: v for k, v in (os.environ if base is None else base).items()
+           if k not in HOST_ONLY and k not in token_env}
     env.update(decl["env"], REMOTE_PROACTIVE_ROOM="")
-    env[TOKEN_ENV] = token
+    env.update(token_env)
     return env
 
 

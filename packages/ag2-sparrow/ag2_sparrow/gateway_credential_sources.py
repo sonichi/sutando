@@ -1,10 +1,12 @@
 """Which AG2 Space gateway credential wins when sources disagree: the one owner of that precedence.
 
 Every source is read by the caller, at its own I/O edge (the environment, the channel .env files it
-knows, a token file, a vault read), and handed in as plain values or a callable; this module opens
-nothing itself. SOURCES states the precedence once and discover() walks it. discover() registers
-every materialized candidate before it picks the winners, so a sink can withhold a discarded one,
-every assignment of a credential key included. A credential file that exists but is refused is
+knows, a token file, a vault read), and handed in as plain values or a callable; this module reads
+nothing itself. Its one write is a host supervisor's bridge declaration (write_bridge_declaration),
+the record that names the token's variable, so no adapter ever holds that record. SOURCES states
+the precedence once and discover() walks it. discover() registers every materialized candidate
+before it picks the winners, so a sink can withhold a discarded one, every assignment of a
+credential key included. A credential file that exists but is refused is
 named, never treated as absent in silence. Fail-closed covers the credential tiers only: a refused
 AG2_DEVICE_ENV stops the file and vault token tiers and a refused REMOTE_TASK_TOKEN_FILE stops
 rotation (Discovery.fatal either way), while general config such as REMOTE_PROACTIVE_ROOM still
@@ -15,8 +17,11 @@ package by tools/sync_from_src.py.
 """
 from __future__ import annotations
 
+import contextlib
 import json
+import os
 import os.path
+import tempfile
 from dataclasses import dataclass, field
 from typing import Callable, Mapping, Optional, Sequence
 
@@ -39,13 +44,45 @@ def token_env_name() -> str:
     return TOKEN_KEYS[0]
 
 
-def bridge_declaration_text(*, written_by: str, host: str, name: str, module: str, env: Mapping[str, str],
-                            token_vault_key: str) -> str:
-    """A host supervisor's bridge declaration, as the JSON text to write: the worker, its environment, the
-    vault key holding its token, and the token's environment variable by name, so no caller names it."""
+_RECORD_TOKEN_ENV = "token_env"
+
+
+def _bridge_declaration_text(*, written_by: str, host: str, name: str, module: str, env: Mapping[str, str],
+                             token_vault_key: str) -> str:
     record = {"written_by": written_by, "schema": 1, "host": host, "name": name, "module": module, "env": env,
-              "token_vault_key": token_vault_key, "token_env": token_env_name()}
+              "token_vault_key": token_vault_key, _RECORD_TOKEN_ENV: token_env_name()}
     return json.dumps(record, indent=1, sort_keys=False) + "\n"
+
+
+def write_bridge_declaration(path, *, written_by: str, host: str, name: str, module: str, env: Mapping[str, str],
+                             token_vault_key: str, mode: int = 0o644) -> None:
+    """Write a host supervisor's bridge declaration at `path` (tmp + os.replace, so no reader sees a torn
+    file): the worker, its environment, the vault key holding its token, and the token's variable by name.
+    The record never leaves this module, so no caller can read the variable's name out of it."""
+    text = _bridge_declaration_text(written_by=written_by, host=host, name=name, module=module, env=env,
+                                    token_vault_key=token_vault_key)
+    path = os.fspath(path)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=f".{os.path.basename(path)}.")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(tmp)
+        raise
+
+
+def bridge_declaration_fields() -> "dict[str, str]":
+    """The fields the owner fixes in every bridge declaration, for a supervisor that checks one it reads."""
+    return {_RECORD_TOKEN_ENV: token_env_name()}
+
+
+def bridge_token_environ(token: str) -> "dict[str, str]":
+    """The variables a declared bridge's token is handed to it under."""
+    return {token_env_name(): token}
 
 # The precedence, stated once; the first source carrying a value wins (see discover() for each name:
 # "file" is the first listed .env file carrying a token, "token" the URL inside the winning one).

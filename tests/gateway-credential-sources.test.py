@@ -25,6 +25,7 @@ import json
 import os
 import random
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -581,12 +582,16 @@ class DiscoveryCases:
         self.assertEqual(found.raw, "  pad-tok-1  ")
         self.assertTrue(registry.contains(f"Bearer {found.raw}."), "the value used is the value registered")
 
-    def test_the_owner_opens_nothing_itself(self):
+    def test_the_owner_reads_nothing_and_writes_only_the_declaration(self):
         tree = ast.parse(Path(self.o.__file__).read_text())
         calls = {ast.unparse(n.func) for n in ast.walk(tree) if isinstance(n, ast.Call)}
         for io_call in ("open", "os.environ.get", "os.getenv", "Path", "print"):
             self.assertNotIn(io_call, calls, io_call)
         self.assertNotIn("os.environ", ast.unparse(tree))
+        writes = {"os.fdopen", "tempfile.mkstemp", "os.replace", "os.makedirs", "os.chmod", "os.unlink"}
+        where = {f.name for f in ast.walk(tree) if isinstance(f, (ast.FunctionDef, ast.AsyncFunctionDef))
+                 for n in ast.walk(f) if isinstance(n, ast.Call) and ast.unparse(n.func) in writes}
+        self.assertEqual(where, {"write_bridge_declaration"})
 
 
 
@@ -1182,9 +1187,14 @@ class BoundedRead(unittest.TestCase):
 
 SOURCE_KEYS = set(owner.CREDENTIAL_KEYS) | {owner.TOKEN_FILE_KEY}
 KEY_TUPLES = {"TOKEN_KEYS", "URL_KEYS", "CREDENTIAL_KEYS", "TOKEN_FILE_KEY", "MEDIA_TOKEN_KEY"}
-# Only the owner builds the bridge record: outside it, the accessor and the record's key are never named.
-OWNER_ONLY = frozenset({"token_env_name"})
+# Only the owner builds, writes and reads the bridge record: outside it, its private names, its key
+# tuples and the record's token key are never named, as an identifier or as a string.
+OWNER_ONLY = frozenset({"token_env_name", "_bridge_declaration_text", "_RECORD_TOKEN_ENV"})
 RECORD_KEY = "token_env"
+# The owner's accessors for a supervisor that reads a declaration: only the one reader may name them.
+READER_ONLY = frozenset({"bridge_declaration_fields", "bridge_token_environ"})
+# Outside the package, the one module that reads a bridge declaration, held to the owner-only rule.
+RECORD_READERS = {"sparrow_agent_bridge.py": REPO / "src" / "sparrow_agent_bridge.py"}
 # What names a credential file or store: a scope holding one of these and a read is credential I/O.
 CREDENTIAL_MARKERS = {"AG2_DEVICE_ENV", "CLAUDE_CONFIG_DIR", "TOKEN_FILE", "device_env_path",
                       "channel_env_paths", "env_files", "channel_token", "token_from_vault"}
@@ -1383,35 +1393,56 @@ def _probe_keeps(inner, parents) -> "list[str]":
     return why
 
 
+def _docstrings(tree) -> "set[int]":
+    return {id(n.body[0].value) for n in ast.walk(tree)
+            if isinstance(n, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+            and n.body and isinstance(n.body[0], ast.Expr) and isinstance(n.body[0].value, ast.Constant)}
+
+
+def _checked_nodes(tree, parents):
+    """(node, its folded string or None) for every node not inside a docstring or a folded string."""
+    docstrings = _docstrings(tree)
+    for node in ast.walk(tree):
+        parent = parents.get(node)
+        if id(node) in docstrings or (isinstance(parent, (ast.BinOp, ast.JoinedStr, ast.FormattedValue))
+                                      and _constant(parent) is not None):
+            continue  # the folded parent is checked whole
+        yield node, _constant(node)
+
+
+def owner_only_findings(source: str, rel: str, reader: bool = False) -> "list[str]":
+    """Every name the owner keeps to itself that `source` names: a key tuple, a private name or the
+    record's token key, as an identifier, an import, an attribute or a string (a getattr argument)."""
+    tree = ast.parse(source)
+    parents = {c: n for n in ast.walk(tree) for c in ast.iter_child_nodes(n)}
+    out = []
+    for node, text in _checked_nodes(tree, parents):
+        name = node.attr if isinstance(node, ast.Attribute) else node.id if isinstance(node, ast.Name) else None
+        if isinstance(node, ast.alias):
+            name = node.name.rsplit(".", 1)[-1]
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            name = node.name
+        if name in KEY_TUPLES or text in KEY_TUPLES:
+            out.append(f"{rel}:{node.lineno} owner key tuple {name or text}")
+        if name in OWNER_ONLY or text in OWNER_ONLY:
+            out.append(f"{rel}:{node.lineno} {name or text} named outside the owner")
+        if not reader and (name in READER_ONLY or text in READER_ONLY):
+            out.append(f"{rel}:{node.lineno} {name or text} named outside the declaration's reader")
+        if text == RECORD_KEY:
+            out.append(f"{rel}:{node.lineno} the record key {RECORD_KEY!r} named outside the owner")
+    return out
+
+
 def credential_access(source: str, rel: str) -> "list[str]":
     """Every way `source` (module `rel`) touches a credential source on its own: a credential key
     or a piece of one as a string, the owner's key tuples, credential I/O outside IO_ALLOWED, and
     a function handed to the owner as a reader that is not in IO_ALLOWED."""
     tree = ast.parse(source)
     parents = {c: n for n in ast.walk(tree) for c in ast.iter_child_nodes(n)}
-    docstrings = {id(n.body[0].value) for n in ast.walk(tree)
-                  if isinstance(n, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
-                  and n.body and isinstance(n.body[0], ast.Expr) and isinstance(n.body[0].value, ast.Constant)}
-    out = []
-    for node in ast.walk(tree):
-        parent = parents.get(node)
-        if id(node) in docstrings or (isinstance(parent, (ast.BinOp, ast.JoinedStr, ast.FormattedValue))
-                                      and _constant(parent) is not None):
-            continue  # the folded parent is checked whole
-        text = _constant(node)
+    out = owner_only_findings(source, rel)
+    for node, text in _checked_nodes(tree, parents):
         if text is not None and any(text == k or (len(text) >= 8 and text in k) for k in SOURCE_KEYS):
             out.append(f"{rel}:{node.lineno} key {text!r}")
-        name = node.attr if isinstance(node, ast.Attribute) else node.id if isinstance(node, ast.Name) else None
-        if isinstance(node, ast.alias):
-            name = node.name.rsplit(".", 1)[-1]
-        if name in KEY_TUPLES:
-            out.append(f"{rel}:{node.lineno} owner key tuple {name}")
-        if name in OWNER_ONLY or text in OWNER_ONLY:
-            out.append(f"{rel}:{node.lineno} {name or text} named outside the owner")
-        if text == RECORD_KEY:
-            out.append(f"{rel}:{node.lineno} the record key {RECORD_KEY!r} named outside the owner")
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name in OWNER_ONLY:
-            out.append(f"{rel}:{node.lineno} a second definition of {node.name}")
     scopes = [("<module>", [n for n in tree.body if not isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))])]
     scopes += [(f.name, [f]) for f in ast.walk(tree) if isinstance(f, (ast.FunctionDef, ast.AsyncFunctionDef))]
     for name, nodes in scopes:
@@ -1537,7 +1568,7 @@ class Guard(unittest.TestCase):
         self.assertEqual(credential_access('"""Put REMOTE_TASK_TOKEN in the .env file."""\nx = 1\n', "probe.py"), [],
                          "a docstring naming a key is prose, not a read")
         self.assertEqual(credential_access(
-            'def wire_bridge(cfg):\n    cm._write(path, _sources.bridge_declaration_text(name=n, env=env), 0o644)\n',
+            'def wire_bridge(cfg):\n    _sources.write_bridge_declaration(path, name=n, env=env)\n',
             "adapters/claude_code/cli.py"), [], "the owner builds the record; the adapter writes its text")
 
     def assert_flagged(self, *sources):
@@ -1585,16 +1616,61 @@ class Guard(unittest.TestCase):
         words = {getattr(n, "id", None) or getattr(n, "attr", None) or getattr(n, "name", None) or _constant(n)
                  for n in ast.walk(ast.parse(shipped))}
         self.assertEqual(words & (OWNER_ONLY | KEY_TUPLES | {RECORD_KEY}), set())
-        self.assertIn("bridge_declaration_text", words, "the adapter writes the owner's record")
         self.assertEqual(credential_access(shipped, rel), [])
 
-    def test_the_owner_builds_the_record_install_wrote_before(self):
+    def test_the_adapter_hands_the_owner_a_path_and_holds_no_record(self):
+        tree = ast.parse((PKG / "ag2_sparrow" / "adapters" / "claude_code" / "cli.py").read_text(encoding="utf-8"))
+        parents = {c: n for n in ast.walk(tree) for c in ast.iter_child_nodes(n)}
+        uses = [n for n in ast.walk(tree) if isinstance(n, ast.Attribute) and ast.unparse(n.value) == "_sources"]
+        self.assertEqual([n.attr for n in uses], ["write_bridge_declaration"], "the owner's one entry point here")
+        call = parents[uses[0]]
+        self.assertTrue(isinstance(call, ast.Call) and isinstance(parents[call], ast.Expr), "its result is never held")
+        self.assertEqual([k.arg for k in call.keywords if k.arg is None], [], "no ** spread into the owner")
+
+    def test_the_owner_writes_the_record_install_wrote_before(self):
         env = {"AGENT_CONNECT_TASK_DIR": "/w/a/tasks", "AGENT_MXID": "@a:ag2.space"}
         before = {"written_by": "x install", "schema": 1, "host": "sparrowd", "name": "bridge-a", "module": "m.bridge",
                   "env": env, "token_vault_key": "AG2_RELAY_TOKEN_A", "token_env": "REMOTE_TASK_TOKEN"}
-        self.assertEqual(owner.bridge_declaration_text(written_by="x install", host="sparrowd", name="bridge-a",
-                                                       module="m.bridge", env=env, token_vault_key="AG2_RELAY_TOKEN_A"),
-                         json.dumps(before, indent=1, sort_keys=False) + "\n")
+        for label, o in OWNERS.items():
+            with self.subTest(label), tempfile.TemporaryDirectory() as d:
+                path = Path(d) / "a.bridge" / "worker.json"
+                self.assertIsNone(o.write_bridge_declaration(path, written_by="x install", host="sparrowd", name="bridge-a",
+                                                             module="m.bridge", env=env, token_vault_key="AG2_RELAY_TOKEN_A"))
+                self.assertEqual(path.read_text(encoding="utf-8"), json.dumps(before, indent=1, sort_keys=False) + "\n")
+                self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o644)
+                self.assertEqual(sorted(p.name for p in path.parent.iterdir()), ["worker.json"], "no temp file left")
+                self.assertEqual(o.bridge_declaration_fields(), {"token_env": "REMOTE_TASK_TOKEN"})
+                self.assertEqual(o.bridge_token_environ("t"), {"REMOTE_TASK_TOKEN": "t"})
+
+    def test_a_failed_write_leaves_no_declaration_and_no_temp_file(self):
+        for label, o in OWNERS.items():
+            with self.subTest(label), tempfile.TemporaryDirectory() as d:
+                path = Path(d) / "worker.json"
+                with mock.patch.object(o.os, "replace", side_effect=OSError("disk")), self.assertRaises(OSError):
+                    o.write_bridge_declaration(path, written_by="x", host="h", name="n", module="m", env={},
+                                               token_vault_key="k")
+                self.assertEqual(list(Path(d).iterdir()), [])
+
+    def test_a_string_or_getattr_reference_to_an_owner_private_name_is_flagged(self):
+        for source in ('getattr(_sources, "TOKEN_KEYS")[0]', 'k = "TOKEN_KEYS"', 'getattr(_sources, "TOKEN_" + "KEYS")',
+                       'getattr(_sources, "token_env_name")()', 'getattr(_sources, "_bridge_declaration_text")',
+                       'getattr(_sources, "_RECORD_TOKEN_ENV")', 'getattr(_sources, "CREDENTIAL_KEYS")',
+                       '_sources.bridge_token_environ("")', 'getattr(_sources, "bridge_declaration_fields")()',
+                       'from .gateway_credential_sources import bridge_token_environ'):
+            self.assert_flagged(source)
+        helper = "adapters/claude_code/probe_helper.py"
+        found = self.package_findings(extra={helper: 'import os\nos.getenv(getattr(_sources, "TOKEN_KEYS")[0])\n'})
+        self.assertEqual([f for f in found if f.startswith(helper + ":")], [f"{helper}:2 owner key tuple TOKEN_KEYS"])
+
+    def test_the_declarations_reader_names_only_the_owners_accessors(self):
+        for rel, path in RECORD_READERS.items():
+            text = path.read_text(encoding="utf-8")
+            self.assertEqual(owner_only_findings(text, rel, reader=True), [])
+            self.assertIn("bridge_declaration_fields", text)
+            for planted in ('\nX = "token_env"\n', "\nX = _sources.token_env_name()\n", '\nX = getattr(_sources, "TOKEN_KEYS")\n'):
+                self.assertTrue(owner_only_findings(text + planted, rel, reader=True), planted)
+            self.assertTrue(owner_only_findings("_sources.bridge_token_environ('')", "adapters/x.py"),
+                            "the reader's accessors stay the reader's")
 
     def test_the_name_only_route_is_the_owners_canonical_token_key(self):
         self.assertEqual(owner.token_env_name(), owner.TOKEN_KEYS[0])
