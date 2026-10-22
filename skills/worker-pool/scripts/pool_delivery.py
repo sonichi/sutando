@@ -39,7 +39,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
 
 from workspace_default import resolve_workspace  # noqa: E402
 
-from delivery.readiness import read_ready_result  # noqa: E402
+from delivery.task_dispatch import find_ready_result  # noqa: E402
 from pool_record import (RECIPIENT, DONE_STAGE, PENDING_STAGE,  # noqa: E402
                          RecipientAliasError, RecordState, read_record_state, record_path, require_own_dir,
                          require_recipient, workers_root)
@@ -360,6 +360,27 @@ def release(sentinel: Path) -> Path:
     return dst
 
 
+def reconcile_interrupted(workspace: Path, recipient: str) -> list[str]:
+    """Re-offer unfinished accepted work to its owner after confirmed session absence."""
+    ws = Path(workspace)
+    released = []
+    with arbitration(ws, recipient) as dfd:
+        for name in sorted(os.listdir(dfd)):
+            got = parse_sentinel(name)
+            if got is None or not got[1]:
+                continue
+            task_id = got[0]
+            if not stat.S_ISREG(os.stat(name, dir_fd=dfd, follow_symlinks=False).st_mode):
+                continue
+            if (is_done_flag(done_flag(ws, recipient, task_id))
+                    or find_ready_result(results_dir(ws), task_id) is not None
+                    or not payload_path(ws, task_id).is_file()):
+                continue
+            os.rename(name, task_id + PENDING_SUFFIX, src_dir_fd=dfd, dst_dir_fd=dfd)
+            released.append(task_id)
+    return released
+
+
 def residue(workspace: Path, recipient: str, task_id: str) -> str:
     """What a crash left behind, read without a journal.
 
@@ -368,7 +389,7 @@ def residue(workspace: Path, recipient: str, task_id: str) -> str:
     ws = Path(workspace)
     # The shared readiness contract, not existence: an empty or whitespace-only
     # file is a placeholder still being written, and must not suppress recovery.
-    has_result = read_ready_result(result_path(ws, task_id)) is not None
+    has_result = find_ready_result(results_dir(ws), task_id) is not None
     # Through the predicate, not is_file(): that FOLLOWS a symlink, and this
     # verdict is what `sweep` deletes on, so a planted link would retire real work.
     has_flag = is_done_flag(done_flag(ws, recipient, task_id))
@@ -422,7 +443,7 @@ def _nothing_can_re_queue(ws: Path, task_id: str) -> bool:
     queue: either the payload is gone, or a result the core can find remains."""
     if not payload_path(ws, task_id).is_file():
         return True
-    if read_ready_result(result_path(ws, task_id)) is not None:
+    if find_ready_result(results_dir(ws), task_id) is not None:
         return True
     return archived_payload(ws, task_id).is_file()
 
