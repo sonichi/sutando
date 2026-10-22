@@ -2,9 +2,9 @@
 
 Every source is read by the caller, at its own I/O edge (the environment, the channel .env files it
 knows, a token file, a vault read), and handed in as plain values or a callable; this module reads
-nothing itself. Its one write is a host supervisor's bridge declaration (write_bridge_declaration),
-the record that names the token's variable, so no adapter ever holds that record. SOURCES states
-the precedence once and discover() walks it. discover() registers every materialized candidate
+no credential itself. The one file it touches is a host supervisor's bridge declaration, the record
+that names the token's variable: it checks, writes and removes it, so no adapter holds its bytes.
+SOURCES states the precedence once and discover() walks it. discover() registers every materialized candidate
 before it picks the winners, so a sink can withhold a discarded one, every assignment of a
 credential key included. A credential file that exists but is refused is
 named, never treated as absent in silence. Fail-closed covers the credential tiers only: a refused
@@ -21,6 +21,7 @@ import contextlib
 import json
 import os
 import os.path
+import shlex
 import tempfile
 from dataclasses import dataclass, field
 from typing import Callable, Mapping, Optional, Sequence
@@ -54,14 +55,50 @@ def _bridge_declaration_text(*, written_by: str, host: str, name: str, module: s
     return json.dumps(record, indent=1, sort_keys=False) + "\n"
 
 
+def _declaration_owned(path: str, written_by: str) -> "tuple[bool, str]":
+    """(present, '') when nothing is at `path` or it is a declaration `written_by` wrote, else (False, why)."""
+    if os.path.isdir(path):
+        return False, f"{path} is a directory, not a declaration; remove it yourself"
+    if os.path.islink(path) and not os.path.exists(path):
+        return False, f"{path} is a dangling symlink; remove it by hand (rm {shlex.quote(path)})"
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            text = fh.read()
+    except FileNotFoundError:
+        return False, ""
+    except OSError as e:
+        return False, f"{path} unreadable ({e.strerror or e})"
+    try:
+        ours = json.loads(text).get("written_by") == written_by
+    except (ValueError, AttributeError):
+        ours = False
+    if not ours:
+        return False, f"{path} was not written by install; remove it by hand (rm {path}) if it is yours to remove"
+    return True, ""
+
+
+def remove_bridge_declaration(path, *, written_by: str) -> "tuple[bool, str]":
+    """Remove the bridge declaration at `path` if `written_by` wrote it: (removed, '') or (False, why);
+    nothing there is (False, ''). Its bytes never leave this module."""
+    path = os.fspath(path)
+    present, problem = _declaration_owned(path, written_by)
+    if present:
+        os.unlink(path)
+    return present, problem
+
+
 def write_bridge_declaration(path, *, written_by: str, host: str, name: str, module: str, env: Mapping[str, str],
-                             token_vault_key: str, mode: int = 0o644) -> None:
+                             token_vault_key: str, mode: int = 0o644) -> str:
     """Write a host supervisor's bridge declaration at `path` (tmp + os.replace, so no reader sees a torn
     file): the worker, its environment, the vault key holding its token, and the token's variable by name.
-    The record never leaves this module, so no caller can read the variable's name out of it."""
+    '' or why not; a file there that `written_by` did not write is left alone. The record and any
+    existing file's bytes never leave this module, so no caller can read the variable's name out of them."""
+    path = os.fspath(path)
+    _present, problem = _declaration_owned(path, written_by)
+    if problem:
+        return problem
     text = _bridge_declaration_text(written_by=written_by, host=host, name=name, module=module, env=env,
                                     token_vault_key=token_vault_key)
-    path = os.fspath(path)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=f".{os.path.basename(path)}.")
     try:
@@ -73,6 +110,7 @@ def write_bridge_declaration(path, *, written_by: str, host: str, name: str, mod
         with contextlib.suppress(FileNotFoundError):
             os.unlink(tmp)
         raise
+    return ""
 
 
 def bridge_declaration_fields() -> "dict[str, str]":

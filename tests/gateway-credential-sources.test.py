@@ -582,16 +582,19 @@ class DiscoveryCases:
         self.assertEqual(found.raw, "  pad-tok-1  ")
         self.assertTrue(registry.contains(f"Bearer {found.raw}."), "the value used is the value registered")
 
-    def test_the_owner_reads_nothing_and_writes_only_the_declaration(self):
+    def test_the_owner_touches_only_the_declaration(self):
         tree = ast.parse(Path(self.o.__file__).read_text())
         calls = {ast.unparse(n.func) for n in ast.walk(tree) if isinstance(n, ast.Call)}
-        for io_call in ("open", "os.environ.get", "os.getenv", "Path", "print"):
+        for io_call in ("os.environ.get", "os.getenv", "Path", "print"):
             self.assertNotIn(io_call, calls, io_call)
         self.assertNotIn("os.environ", ast.unparse(tree))
-        writes = {"os.fdopen", "tempfile.mkstemp", "os.replace", "os.makedirs", "os.chmod", "os.unlink"}
-        where = {f.name for f in ast.walk(tree) if isinstance(f, (ast.FunctionDef, ast.AsyncFunctionDef))
-                 for n in ast.walk(f) if isinstance(n, ast.Call) and ast.unparse(n.func) in writes}
-        self.assertEqual(where, {"write_bridge_declaration"})
+        def where(names):
+            return {f.name for f in ast.walk(tree) if isinstance(f, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    for n in ast.walk(f) if isinstance(n, ast.Call) and ast.unparse(n.func) in names}
+        self.assertEqual(where({"open"}), {"_declaration_owned"}, "the one read: the declaration's own check")
+        self.assertEqual(where({"os.fdopen", "tempfile.mkstemp", "os.replace", "os.makedirs", "os.chmod"}),
+                         {"write_bridge_declaration"})
+        self.assertEqual(where({"os.unlink"}), {"write_bridge_declaration", "remove_bridge_declaration"})
 
 
 
@@ -1199,6 +1202,10 @@ RECORD_READERS = {"sparrow_agent_bridge.py": REPO / "src" / "sparrow_agent_bridg
 CREDENTIAL_MARKERS = {"AG2_DEVICE_ENV", "CLAUDE_CONFIG_DIR", "TOKEN_FILE", "device_env_path",
                       "channel_env_paths", "env_files", "channel_token", "token_from_vault"}
 READS = {"open", "read_text", "read_bytes", "readlines"}
+# The bridge declaration's file: a path built from these is opaque outside the owner. It may be
+# formatted into a message or handed to one of DECLARATION_OWNER_CALLS, and nothing else.
+DECLARATION_MARKERS = {"DECLARATION", "worker.json"}
+DECLARATION_OWNER_CALLS = {"write_bridge_declaration", "remove_bridge_declaration"}
 # Owner calls whose callable arguments read credentials: (positional index, keyword names).
 OWNER_READERS = {"env_files": (1, ("read_text",)), "discover": (None, ("read_token_file", "vault_lookup"))}
 # Where credential I/O may happen: the adapters' edge, as (module, function).
@@ -1433,13 +1440,70 @@ def owner_only_findings(source: str, rel: str, reader: bool = False) -> "list[st
     return out
 
 
+def declaration_reads(source: str, rel: str) -> "list[str]":
+    """Every call, in `source`, that takes a path built from the declaration's file name (as an argument
+    or as the object of a method: open, read_text, a helper, str()) other than the owner's
+    DECLARATION_OWNER_CALLS; a path inside an f-string is a message. Names bound from such a path count."""
+    tree = ast.parse(source)
+    out = []
+    defs = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
+    scopes = [[n for n in tree.body if not isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))]]
+    scopes += [[f] for f in ast.walk(tree) if isinstance(f, defs)]
+    for nodes in scopes:
+        inner = [n for root in nodes for n in ast.walk(root) if root is n or not isinstance(n, defs)]
+        tainted = set()
+
+        def marked(expr):
+            return any((getattr(n, "id", None) or getattr(n, "attr", None)) in DECLARATION_MARKERS | tainted
+                       or (isinstance(n, ast.Constant) and isinstance(n.value, str)
+                           and any(m in n.value for m in DECLARATION_MARKERS if "." in m))
+                       for n in ast.walk(expr))
+        for _ in range(3):
+            for n in inner:
+                if isinstance(n, (ast.Assign, ast.AnnAssign, ast.NamedExpr)) and n.value is not None and marked(n.value):
+                    targets = n.targets if isinstance(n, ast.Assign) else [n.target]
+                    tainted |= {t.id for tg in targets for t in ast.walk(tg) if isinstance(t, ast.Name)}
+                elif isinstance(n, ast.withitem) and n.optional_vars is not None and marked(n.context_expr):
+                    tainted |= {t.id for t in ast.walk(n.optional_vars) if isinstance(t, ast.Name)}
+        for n in inner:
+            if not isinstance(n, ast.Call) or getattr(n.func, "attr", None) in DECLARATION_OWNER_CALLS:
+                continue
+            taken = n.args + [k.value for k in n.keywords] + ([n.func.value] if isinstance(n.func, ast.Attribute) else [])
+            if any(marked(a) and not isinstance(a, ast.JoinedStr) for a in taken):
+                out.append(f"{rel}:{n.lineno} hands the bridge declaration's path to {ast.unparse(n.func)}")
+    return sorted(set(out))
+
+
+def token_injection_findings(source: str, rel: str) -> "list[str]":
+    """The reader hands the bridge its token only through the owner: bridge_environ takes the mapping from
+    bridge_token_environ(...) and merges it whole, stores no item itself, and no string in the module is
+    one of the owner's token variable names (so no environment lookup of one by name)."""
+    tree = ast.parse(source)
+    out = [f"{rel}:{n.lineno} names the token variable {_constant(n)!r}" for n in ast.walk(tree)
+           if isinstance(_constant(n), str) and any(_constant(n) == k or (len(_constant(n)) >= 8 and _constant(n) in k)
+                                                    for k in owner.TOKEN_KEYS)]
+    fn = [f for f in tree.body if isinstance(f, ast.FunctionDef) and f.name == "bridge_environ"]
+    if len(fn) != 1:
+        return out + [f"{rel}: no single top-level bridge_environ"]
+    bound = {a.targets[0].id for a in ast.walk(fn[0]) if isinstance(a, ast.Assign) and len(a.targets) == 1
+             and isinstance(a.targets[0], ast.Name) and isinstance(a.value, ast.Call)
+             and ast.unparse(a.value.func) == "_sources.bridge_token_environ"}
+    merged = [c for c in ast.walk(fn[0]) if isinstance(c, ast.Call) and getattr(c.func, "attr", None) == "update"
+              and [ast.unparse(a) for a in c.args] in ([b] for b in bound) and not c.keywords]
+    if len(bound) != 1 or len(merged) != 1:
+        out.append(f"{rel}: bridge_environ does not merge bridge_token_environ(...) whole")
+    out += [f"{rel}:{n.lineno} bridge_environ stores an item itself" for n in ast.walk(fn[0])
+            if isinstance(n, ast.Subscript) and isinstance(n.ctx, ast.Store)]
+    return out
+
+
 def credential_access(source: str, rel: str) -> "list[str]":
     """Every way `source` (module `rel`) touches a credential source on its own: a credential key
     or a piece of one as a string, the owner's key tuples, credential I/O outside IO_ALLOWED, and
     a function handed to the owner as a reader that is not in IO_ALLOWED."""
     tree = ast.parse(source)
     parents = {c: n for n in ast.walk(tree) for c in ast.iter_child_nodes(n)}
-    out = owner_only_findings(source, rel)
+    out = owner_only_findings(source, rel) + declaration_reads(source, rel)
     for node, text in _checked_nodes(tree, parents):
         if text is not None and any(text == k or (len(text) >= 8 and text in k) for k in SOURCE_KEYS):
             out.append(f"{rel}:{node.lineno} key {text!r}")
@@ -1619,13 +1683,29 @@ class Guard(unittest.TestCase):
         self.assertEqual(credential_access(shipped, rel), [])
 
     def test_the_adapter_hands_the_owner_a_path_and_holds_no_record(self):
-        tree = ast.parse((PKG / "ag2_sparrow" / "adapters" / "claude_code" / "cli.py").read_text(encoding="utf-8"))
+        text = (PKG / "ag2_sparrow" / "adapters" / "claude_code" / "cli.py").read_text(encoding="utf-8")
+        tree = ast.parse(text)
         parents = {c: n for n in ast.walk(tree) for c in ast.iter_child_nodes(n)}
         uses = [n for n in ast.walk(tree) if isinstance(n, ast.Attribute) and ast.unparse(n.value) == "_sources"]
-        self.assertEqual([n.attr for n in uses], ["write_bridge_declaration"], "the owner's one entry point here")
-        call = parents[uses[0]]
-        self.assertTrue(isinstance(call, ast.Call) and isinstance(parents[call], ast.Expr), "its result is never held")
-        self.assertEqual([k.arg for k in call.keywords if k.arg is None], [], "no ** spread into the owner")
+        self.assertEqual(sorted(n.attr for n in uses), ["remove_bridge_declaration", "write_bridge_declaration"],
+                         "the owner checks, writes and removes the declaration; the adapter only names its path")
+        for use in uses:
+            call = parents[use]
+            self.assertTrue(isinstance(call, ast.Call) and call.func is use)
+            self.assertEqual([k.arg for k in call.keywords if k.arg is None], [], "no ** spread into the owner")
+        self.assertEqual(declaration_reads(text, "adapters/claude_code/cli.py"), [])
+        self.assertNotIn("owned_declaration", text)
+
+    def test_a_read_of_the_declaration_path_outside_the_owner_is_flagged(self):
+        head = 'def f(root):\n    path = bridge_home(root) / DECLARATION\n'
+        for read in ('    text = path.read_text()\n', '    text, why = cm.file_text(path, "declaration")\n',
+                     '    with open(path) as fh:\n        json.load(fh)\n', '    p2 = path\n    p2.read_bytes()\n',
+                     '    json.load(open(bridge_home(root) / "worker.json"))\n', '    owned_declaration(path)\n',
+                     '    s = str(path)\n', '    helper(where=path)\n', '    path.unlink()\n'):
+            self.assertTrue(declaration_reads(head + read, "adapters/claude_code/cli.py"), read)
+            self.assertTrue(credential_access(head + read, "adapters/claude_code/cli.py"), read)
+        for fine in ('    print(f"declared: {path}")\n', '    _sources.write_bridge_declaration(path, written_by="x")\n'):
+            self.assertEqual(declaration_reads(head + fine, "adapters/claude_code/cli.py"), [], fine)
 
     def test_the_owner_writes_the_record_install_wrote_before(self):
         env = {"AGENT_CONNECT_TASK_DIR": "/w/a/tasks", "AGENT_MXID": "@a:ag2.space"}
@@ -1634,13 +1714,42 @@ class Guard(unittest.TestCase):
         for label, o in OWNERS.items():
             with self.subTest(label), tempfile.TemporaryDirectory() as d:
                 path = Path(d) / "a.bridge" / "worker.json"
-                self.assertIsNone(o.write_bridge_declaration(path, written_by="x install", host="sparrowd", name="bridge-a",
+                self.assertEqual("", o.write_bridge_declaration(path, written_by="x install", host="sparrowd", name="bridge-a",
                                                              module="m.bridge", env=env, token_vault_key="AG2_RELAY_TOKEN_A"))
                 self.assertEqual(path.read_text(encoding="utf-8"), json.dumps(before, indent=1, sort_keys=False) + "\n")
                 self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o644)
                 self.assertEqual(sorted(p.name for p in path.parent.iterdir()), ["worker.json"], "no temp file left")
                 self.assertEqual(o.bridge_declaration_fields(), {"token_env": "REMOTE_TASK_TOKEN"})
                 self.assertEqual(o.bridge_token_environ("t"), {"REMOTE_TASK_TOKEN": "t"})
+
+    def test_the_owner_checks_and_removes_only_its_own_declaration(self):
+        args = dict(written_by="x install", host="h", name="n", module="m", env={}, token_vault_key="k")
+        for label, o in OWNERS.items():
+            with self.subTest(label), tempfile.TemporaryDirectory() as d:
+                path = Path(d) / "worker.json"
+                self.assertEqual(o.remove_bridge_declaration(path, written_by="x install"), (False, ""), "nothing there")
+                self.assertEqual(o.write_bridge_declaration(path, **args), "")
+                self.assertEqual(o.write_bridge_declaration(path, **args), "", "its own declaration is rewritten")
+                self.assertEqual(o.remove_bridge_declaration(path, written_by="x install"), (True, ""))
+                self.assertFalse(path.exists())
+                foreign = f"{path} was not written by install; remove it by hand (rm {path}) if it is yours to remove"
+                for text in ('{"written_by": "someone else"}', "not json", "[1]"):
+                    path.write_text(text)
+                    self.assertEqual(o.write_bridge_declaration(path, **args), foreign)
+                    self.assertEqual(o.remove_bridge_declaration(path, written_by="x install"), (False, foreign))
+                    self.assertEqual(path.read_text(), text, "a foreign file is left as it was")
+                path.unlink()
+                path.mkdir()
+                self.assertEqual(o.write_bridge_declaration(path, **args),
+                                 f"{path} is a directory, not a declaration; remove it yourself")
+                path.rmdir()
+                path.symlink_to(Path(d) / "gone")
+                self.assertEqual(o.remove_bridge_declaration(path, written_by="x install"),
+                                 (False, f"{path} is a dangling symlink; remove it by hand (rm {path})"))
+                path.unlink()
+                path.write_text('{"written_by": "x install"}')
+                with mock.patch.object(o, "open", side_effect=PermissionError(13, "Permission denied"), create=True):
+                    self.assertEqual(o.write_bridge_declaration(path, **args), f"{path} unreadable (Permission denied)")
 
     def test_a_failed_write_leaves_no_declaration_and_no_temp_file(self):
         for label, o in OWNERS.items():
@@ -1671,6 +1780,12 @@ class Guard(unittest.TestCase):
                 self.assertTrue(owner_only_findings(text + planted, rel, reader=True), planted)
             self.assertTrue(owner_only_findings("_sources.bridge_token_environ('')", "adapters/x.py"),
                             "the reader's accessors stay the reader's")
+            self.assertEqual(token_injection_findings(text, rel), [])
+            for mutant in (('    token_env = _sources.bridge_token_environ(token)\n', '    token_env = {"REMOTE_TASK_TOKEN": token}\n'),
+                           ('    env.update(token_env)\n', '    env.update(token_env)\n    env["AG2_REMOTE_" + "TOKEN"] = token\n'),
+                           ('    env.update(token_env)\n', '    env.update(token_env, X=os.environ.get("REMOTE_TASK_TOKEN"))\n')):
+                self.assertIn(mutant[0], text)
+                self.assertTrue(token_injection_findings(text.replace(mutant[0], mutant[1]), rel), mutant[1])
 
     def test_the_name_only_route_is_the_owners_canonical_token_key(self):
         self.assertEqual(owner.token_env_name(), owner.TOKEN_KEYS[0])

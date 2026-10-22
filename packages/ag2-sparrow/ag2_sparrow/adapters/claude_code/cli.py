@@ -208,20 +208,6 @@ def bridge_problem(cfg: dict, now=None) -> str:
     return ""
 
 
-def owned_declaration(path: Path) -> "tuple[str | None, str]":
-    """(text, '') for this install's declaration or nothing, else (None, why), as for the unit."""
-    text, problem = cm.file_text(path, "declaration")
-    if problem or text is None:
-        return None, problem
-    try:
-        ours = json.loads(text).get("written_by") == f"{COMMAND} install"
-    except (ValueError, AttributeError):
-        ours = False
-    if not ours:
-        return None, f"{path} was not written by install; remove it by hand (rm {path}) if it is yours to remove"
-    return text, ""
-
-
 def wire_bridge(cfg: dict) -> str:
     """After the launcher's install: the agent's bridge pointed at this root, as its own unit or as a
     declaration the host's supervisor runs. '' or why not."""
@@ -230,13 +216,12 @@ def wire_bridge(cfg: dict) -> str:
     bridge_state(cfg).mkdir(parents=True, exist_ok=True)
     if mode != UNIT:
         path = bridge_home(root) / DECLARATION
-        text, problem = owned_declaration(path)
-        if problem:
-            return problem
         name = worker_name(Path(root).name)
-        _sources.write_bridge_declaration(
+        problem = _sources.write_bridge_declaration(
             path, written_by=f"{COMMAND} install", host=mode, name=name, module="ag2_sparrow.remote_gateway_bridge",
             env=env, token_vault_key=cfg["TOKEN_VAULT_KEY"])
+        if problem:
+            return problem
         print(f"declared: {path} ({mode} runs it as worker {name} on its next scan; the token is read from "
               f"the vault: vault set {cfg['TOKEN_VAULT_KEY']} <the agent's relay token>)")
         return ""
@@ -271,11 +256,10 @@ def unwire_bridge(cfg: dict) -> str:
         return ""
     if mode != UNIT:
         path = bridge_home(root) / DECLARATION
-        text, problem = owned_declaration(path)
+        removed, problem = _sources.remove_bridge_declaration(path, written_by=f"{COMMAND} install")
         if problem:
             return problem
-        if text is not None:
-            path.unlink()
+        if removed:
             print(f"removed: {path}")
         return ""
     sup = cm.supervisor_path(BRIDGE)
