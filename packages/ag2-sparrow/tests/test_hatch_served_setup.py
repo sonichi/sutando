@@ -1888,6 +1888,12 @@ class InstallDiff(unittest.TestCase):
                         "Environment='BROKEN=\n"
                         "REMOTE_TASK_URL=https://cfg-user:cfg-pass@gw.example/relay?k=CFG-QUERY-SECRET\n"
                         "ExecStart=/x --gateway https://exec-user:exec-pass@gw.example/relay?k=EXEC-SECRET\n"
+                        # systemd ignores whitespace around `=` and joins a line ending in `\` to the next.
+                        "Environment = REMOTE_TASK_TOKEN=RETIRED-BBB-2222\n"
+                        "Environment =REMOTE_TASK_TOKEN=RETIRED-CCC-3333\n"
+                        'Environment="SAFE1=x" \\\n  "SAFE2=y" "REMOTE_TASK_TOKEN=RETIRED-DDD-4444"\n'
+                        "ExecStart=/usr/bin/env REMOTE_TASK_TOKEN=RETIRED-EEE-5555 /x/sparrow\n"
+                        "ExecStart=/x/sparrow --token RETIRED-FFF-6666\n"
                         "Description=a safe neighbour\n")
         out = io.StringIO()
         with mock.patch.dict(os.environ, {"AG2_DEVICE_ENV": str(home / "absent")}), \
@@ -1896,12 +1902,14 @@ class InstallDiff(unittest.TestCase):
                                                     refuse_drift=False, force=True))
         text = out.getvalue()
         for secret in ("RETIRED-SYNTHETIC-TOKEN-314159", "SYNTHETIC-URL-SECRET", "user:pass", "frag",
-                       "cfg-user", "cfg-pass", "CFG-QUERY-SECRET", "exec-user", "exec-pass", "EXEC-SECRET"):
+                       "cfg-user", "cfg-pass", "CFG-QUERY-SECRET", "exec-user", "exec-pass", "EXEC-SECRET",
+                       "RETIRED-BBB-2222", "RETIRED-CCC-3333", "RETIRED-DDD-4444", "RETIRED-EEE-5555",
+                       "RETIRED-FFF-6666", "SAFE2"):
             self.assertNotIn(secret.casefold(), text.casefold(), secret)
         # gateway_credentials.mask_env_assignments: an environment line whole, a credential shape whole.
-        self.assertEqual(text.count("-Environment=<withheld>"), 3, text)
+        self.assertEqual(text.count("-Environment=<withheld>"), 6, text)
         self.assertIn("-REMOTE_TASK_URL=<withheld>", text)
-        self.assertIn("-ExecStart=<withheld>", text)
+        self.assertEqual(text.count("-ExecStart=<withheld>"), 3, text)
         self.assertIn("-Description=a safe neighbour", text)
 
 
