@@ -217,15 +217,22 @@ class NoLocalPathInUserFacingText(unittest.TestCase):
         for body in (ERROR_BODY,
                      "Traceback (most recent call last):\n  File \"/home/u/x.py\"",
                      "see /private/tmp/claude-501/scratch/out.txt",
-                     "cache at /var/folders/ab/T/x"):
+                     "cache at /var/folders/ab/T/x",
+                     "[WinError 2] The system cannot find the file specified: "
+                     "'C:\\Users\\bob\\ws\\tasks\\t.txt'",
+                     "FileNotFoundError: No such file: /tmp/ws/tasks/task-1.txt",
+                     "spooled to /var/tmp/x",
+                     "open('/root/x') failed"):
             safe, reason = self._guard(body)
             self.assertEqual(reason, egress.INTERNAL_ERROR_DETAIL, body)
-            for marker in ("/Users/", "/home/", "/private/", "/var/folders/", "[Errno", "Traceback"):
+            for marker in ("/Users/", "/home/", "/private/", "/var/folders/", "[Errno", "Traceback",
+                           "[WinError", "C:\\Users", "/tmp/", "/root/"):
                 self.assertNotIn(marker, safe)
 
     def test_ordinary_text_and_urls_pass(self):
         for body in ("Here is the summary you asked for.",
-                     "Docs: https://example.com/Users/guide and src/app/home/page.tsx"):
+                     "Docs: https://example.com/Users/guide and src/app/home/page.tsx",
+                     "See https://example.com/tmp/notes and https://example.com/root/a"):
             self.assertEqual(self._guard(body), (body, None))
 
     def test_marker_value_is_not_prose(self):
