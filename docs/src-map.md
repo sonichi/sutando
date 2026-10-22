@@ -312,6 +312,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`start-cli.sh`** — Canonical persistent-core launcher.
 - **`stop-core.sh`** — src/agent/stop-core.sh — stop ONLY the core CLI tmux session (sonichi#2401).
 - **`task-event-handler-lookup.sh`** — Reads the task-event handler declared in a small JSON config file.
+- **`tmux-socket-guard.sh`** — Preconditions on the core's tmux socket, checked by the dispatcher before any launcher runs.
 
 ## `src/agent/agy/`
 

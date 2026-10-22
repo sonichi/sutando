@@ -272,11 +272,27 @@ bash src/agent/start-cli.sh --runtime codex --restart
 ```
 
 The leading `--runtime` flag wins over `SUTANDO_CORE_RUNTIME`, which otherwise
-wins over `core.runtime`. A runtime environment override may be inherited from
-an older launch or loaded from the launcher's environment file; changing config
-alone does not remove it. The dispatcher now names that override on stderr.
-Use the explicit flag for the intended runtime rather than treating config as
-proof of which CLI restarted. Restarts from inside the live core remain refused.
+wins over the AG2 Space desktop's selection, which wins over `core.runtime`. The
+desktop selection is `coreRuntime` in the desktop's `runtime.json`
+(`$SUTANDO_APP_SUPPORT/runtime.json`, or the directory above a bundled
+`engine/<checkout>`), so launchd jobs started without the desktop's environment
+resolve the same runtime as the desktop launcher. The desktop owns that file; the
+engine only reads it, so `--runtime` alone does not change what the desktop will
+relaunch. A runtime environment override may be inherited from an older launch or
+loaded from the launcher's environment file; changing config alone does not
+remove it. The dispatcher now names that override on stderr. Use the explicit
+flag for the intended runtime rather than treating config as proof of which CLI
+restarted. Restarts from inside the live core remain refused.
+
+Before any launcher runs, the dispatcher refuses (exit 3) when the `tmux` on PATH
+cannot query the server on the core's socket, reports a different version than
+that server, or is missing while the socket exists. When the host's declared
+client (`SUTANDO_TMUX_BIN`, which the desktop exports) does match the server, the
+dispatcher puts it first on PATH for the launch instead. Each of these cases would
+make a live core read as absent, or replace the server with an incompatible build. It
+also refuses to launch another checkout's core on a desktop install's socket
+(`<app-support>/run/tmux.sock`) unless `SUTANDO_ALLOW_FOREIGN_CORE_CHECKOUT=1`
+is set for that launch.
 
 ## Rollback
 
@@ -302,8 +318,11 @@ If tmux is unavailable, the launcher can still open Codex directly, but
 automatic file-bridge wakeups are disabled; install tmux for unattended use.
 
 Both CLI adapters publish `state/core-runtime.json` atomically only after their
-managed session is confirmed present, including reuse and successful Claude
-window healing. A failed launch leaves the last confirmed observation intact;
+managed session is confirmed present and its panes run that runtime's CLI,
+including reuse and successful Claude window healing. A launcher whose runtime
+does not match the pane's process leaves the record unchanged and says so on
+stderr; the Codex launcher also appends to `session-starts.log` only for a
+confirmed new session. A failed launch leaves the last confirmed observation intact;
 `started_at` is the tmux session creation time, not the time of an attach.
 The file is a launch observation, not a current liveness or task-delivery proof.
 Check the session stamp and actual process, then capture a real received-task →

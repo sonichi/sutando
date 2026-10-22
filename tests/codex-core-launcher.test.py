@@ -118,6 +118,7 @@ class CodexCoreLauncherTests(unittest.TestCase):
             "src/agent/codex/cli/codex-observer.mjs",
             "src/agent/start-cli.sh",
             "src/agent/restart-guard.sh",
+            "src/agent/tmux-socket-guard.sh",
             "src/agent/core-runtime-record.sh",
             "src/core_runtime_record.py",
             "src/result_publish.py",

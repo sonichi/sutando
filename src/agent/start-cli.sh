@@ -104,6 +104,8 @@ export SUTANDO_CORE_RUNTIME="$runtime"
 # restart; otherwise the selected launcher could attach to/reuse the wrong CLI.
 tmux_socket="${SUTANDO_TMUX_SOCKET:-/tmp/sutando-tmux.sock}"
 session="${SUTANDO_TMUX_SESSION:-sutando-core}"
+. "$REPO/src/agent/tmux-socket-guard.sh"
+sutando_tmux_socket_guard "$tmux_socket" "$REPO" || exit 3
 active_runtime=""
 if command -v tmux >/dev/null 2>&1 && tmux -S "$tmux_socket" has-session -t "=$session" 2>/dev/null; then
   active_runtime="$(tmux -S "$tmux_socket" show-environment -t "=$session" SUTANDO_CORE_RUNTIME 2>/dev/null | sed 's/^SUTANDO_CORE_RUNTIME=//' || true)"
