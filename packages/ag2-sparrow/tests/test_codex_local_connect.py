@@ -28,7 +28,7 @@ PKG = Path(__file__).resolve().parents[1]
 sys.path.append(str(Path(__file__).resolve().parents[3] / "tests"))
 from _helpers.subprocess_coverage import covered_code  # noqa: E402
 sys.path.insert(0, str(PKG))
-from ag2_sparrow import connect_common as cm, holder_lock, task_io  # noqa: E402
+from ag2_sparrow import connect_common as cm, holder_lock, service_manager as sm, task_io  # noqa: E402
 from ag2_sparrow.adapters.codex import codex_connector as cc, connect_cli as cli  # noqa: E402
 
 STUB = Path(cc.__file__).with_name("stub_app_server.py")
@@ -118,7 +118,7 @@ def unhold(p):
 
 
 class Runner:
-    """A manager command table for connect_common._run: (program, verb) -> rc or (rc, out, err); None =
+    """A manager command table for service_manager._run: (program, verb) -> rc or (rc, out, err); None =
     could not run. With a root, a start verb runs a stand-in launcher holding the root's lock, a stop
     verb ends it, and the probes answer from the manager's own state unless the table says otherwise."""
 
@@ -197,7 +197,7 @@ class Base(unittest.TestCase):
             os.environ.pop(key, None)
         # No test reaches the host's systemctl, loginctl or launchctl; the bounds are 2 s and 1 s, not 30.
         self.calls = []
-        self.patches = [mock.patch.object(cm, "_run", side_effect=lambda cmd, timeout=30: self.calls.append(cmd)),
+        self.patches = [mock.patch.object(sm, "_run", side_effect=lambda cmd, timeout=30: self.calls.append(cmd)),
                         mock.patch.object(cm, "is_macos", return_value=False),
                         mock.patch.object(cm, "console_script", return_value=str(self.bin / cli.COMMAND)),
                         mock.patch.object(cm, "CONFIRM_TIMEOUT_S", 2.0), mock.patch.object(cm, "OP_WAIT_S", 1.0)]
@@ -222,7 +222,7 @@ class Base(unittest.TestCase):
         return self.main("install", "--work", str(self.work), "--codex-home", str(self.codex_home), *extra)
 
     def install_with(self, runner, mac=False, *extra):
-        with mock.patch.object(cm, "_run", side_effect=runner), mock.patch.object(cm, "is_macos", return_value=mac):
+        with mock.patch.object(sm, "_run", side_effect=runner), mock.patch.object(cm, "is_macos", return_value=mac):
             return self.install(*extra)
 
     def configure(self, **over):
@@ -745,7 +745,7 @@ class VerifyUninstall(Base):
     def test_verify_every_part_and_the_broken_ones(self):
         runner = self.runner()
         self.assertEqual(self.install_with(runner)[0], 0)
-        with mock.patch.object(cm, "_run", side_effect=runner):
+        with mock.patch.object(sm, "_run", side_effect=runner):
             rc, out, _ = self.main("verify")
         self.assertEqual(rc, 0, out)
         self.assertEqual(set(self.checks(out)), {"config", "codex", "login", "inbox", "results", "relay token", "supervisor"})
@@ -789,12 +789,12 @@ class VerifyUninstall(Base):
         self.assertEqual(self.install_with(runner)[0], 0)
         unit = cm.service_path(L)
         for table in ({("systemctl", "stop"): 1}, {("systemctl", "stop"): None}):
-            with mock.patch.object(cm, "_run", side_effect=self.runner(table)):
+            with mock.patch.object(sm, "_run", side_effect=self.runner(table)):
                 rc, _, err = self.main("uninstall")
             self.assertEqual(rc, 1, table)
             self.assertIn("were kept so a rerun knows the work root", err)
             self.assertTrue(unit.exists() and cli.config_path().exists())
-        with mock.patch.object(cm, "_run", side_effect=runner):
+        with mock.patch.object(sm, "_run", side_effect=runner):
             rc, out, err = self.main("uninstall")
         self.assertEqual(rc, 0, err)
         self.assertFalse(unit.exists() or cli.config_path().exists())
@@ -806,10 +806,10 @@ class VerifyUninstall(Base):
         self.assertEqual(self.install_with(mac, True)[0], 0)
         plist = cm.plist_path(L)
         with mock.patch.object(cm, "is_macos", return_value=True):
-            with mock.patch.object(cm, "_run", side_effect=self.runner({("launchctl", "bootout"): 3, ("launchctl", "print"): 0})):
+            with mock.patch.object(sm, "_run", side_effect=self.runner({("launchctl", "bootout"): 3, ("launchctl", "print"): 0})):
                 self.assertEqual(self.main("uninstall")[0], 1)
             self.assertTrue(plist.exists())
-            with mock.patch.object(cm, "_run", side_effect=mac):
+            with mock.patch.object(sm, "_run", side_effect=mac):
                 self.assertEqual(self.main("uninstall")[0], 0)
             self.assertFalse(plist.exists())
         cfg = cli.config_path()
