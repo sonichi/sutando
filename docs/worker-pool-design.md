@@ -475,6 +475,19 @@ parses the headers with `local_task_protocol`, never by hand.
 
 A sentinel is empty, so an assignment carries no roster `version`; the router reports the version of the pass in its status output only.
 
+`create_worker.py` validates an existing roster through
+`pool_roster.validate_current_roster` before previewing or launching a worker.
+Normal and `--dry-run` creation refuse unreadable or malformed rosters and worker
+shapes rejected by that validator, reporting the reason before creating an
+identity, delivery inbox, session, watcher or recovery timer. An absent roster
+remains a valid starting point. This check neither repairs the roster nor adds
+validation beyond the existing validator's policy.
+
+Registration still performs its final checks under the roster lock. If the
+roster becomes invalid after preflight, creation reports the newly created
+worker's id and explains that it will receive nothing until the roster names
+it; the live worker and its records are retained.
+
 The broker's complete `display.worker_labels` map is applied atomically under
 the roster lock. `worker_label_config_version` tracks the last fully applied
 label snapshot independently of the general `config_version`, and
