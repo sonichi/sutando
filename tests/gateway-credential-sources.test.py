@@ -1183,9 +1183,11 @@ class BoundedRead(unittest.TestCase):
 SOURCE_KEYS = set(owner.CREDENTIAL_KEYS) | {owner.TOKEN_FILE_KEY}
 KEY_TUPLES = {"TOKEN_KEYS", "URL_KEYS", "CREDENTIAL_KEYS", "TOKEN_FILE_KEY", "MEDIA_TOKEN_KEY"}
 # The owner's name-only route: a no-argument call that is a value of a dict literal bound whole to one name,
-# only in a reviewed (module, function); a keyword or an inline dict can carry the name into a reader.
+# only in a reviewed module-level def; the record then travels whole (see _record_misuse).
 NAME_ONLY = frozenset({"token_env_name"})
 NAME_ONLY_SITES = frozenset({("adapters/claude_code/cli.py", "wire_bridge")})
+# The record's key for the name: no module may read it back out of a record.
+RECORD_KEY = "token_env"
 # What names a credential file or store: a scope holding one of these and a read is credential I/O.
 CREDENTIAL_MARKERS = {"AG2_DEVICE_ENV", "CLAUDE_CONFIG_DIR", "TOKEN_FILE", "device_env_path",
                       "channel_env_paths", "env_files", "channel_token", "token_from_vault"}
@@ -1384,22 +1386,49 @@ def _probe_keeps(inner, parents) -> "list[str]":
     return why
 
 
-def _names_only(node, parents, rel) -> bool:
-    """A NAME_ONLY use is a bare call that is a value of a dict literal assigned whole to one name,
-    inside a function listed in NAME_ONLY_SITES for this module; nothing else."""
+def _name_record(node, parents, rel):
+    """The (function, record name, keys holding the call) of a NAME_ONLY use that is a bare call valued
+    in a dict literal assigned whole to one name, directly in the one module-level def NAME_ONLY_SITES
+    lists for this module; None for any other use."""
     call = parents.get(node)
     if not (isinstance(call, ast.Call) and call.func is node and not call.args and not call.keywords):
-        return False
+        return None
     record, bind = parents.get(call), None
     if isinstance(record, ast.Dict) and any(v is call for v in record.values):
         bind = parents.get(record)
     if not (isinstance(bind, ast.Assign) and bind.value is record
             and len(bind.targets) == 1 and isinstance(bind.targets[0], ast.Name)):
-        return False
+        return None
     scope = parents.get(bind)
-    while scope is not None and not isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef)):
+    while scope is not None and not isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
         scope = parents.get(scope)
-    return scope is not None and (rel, scope.name) in NAME_ONLY_SITES
+    module = parents.get(scope)
+    if not (type(scope) is ast.FunctionDef and isinstance(module, ast.Module) and (rel, scope.name) in NAME_ONLY_SITES):
+        return None
+    if sum(1 for n in ast.walk(module) if getattr(n, "name", None) == scope.name
+           and isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))) != 1:
+        return None
+    keys = {_constant(k) for k, v in zip(record.keys, record.values) if v is call}
+    return scope, bind.targets[0].id, bind.targets[0], keys
+
+
+def _record_misuse(scope, name, target, keys) -> "list[str]":
+    """How the record bound to `name` in `scope` is used other than whole: passed as an argument,
+    returned, or read at a constant key that does not hold the name. Rebinding, aliasing, mutation,
+    iteration, unpacking and any other read are misuse."""
+    parents = {c: n for n in ast.walk(scope) for c in ast.iter_child_nodes(n)}
+    why = []
+    for n in ast.walk(scope):
+        if not (isinstance(n, ast.Name) and n.id == name) or n is target:
+            continue
+        up = parents.get(n)
+        whole = (isinstance(up, ast.Call) and n in up.args) or (isinstance(up, ast.Return) and up.value is n) \
+            or (isinstance(up, ast.keyword) and up.arg is not None)
+        field = isinstance(up, ast.Subscript) and up.value is n and isinstance(up.ctx, ast.Load) \
+            and isinstance(_constant(up.slice), str) and _constant(up.slice) not in keys
+        if not (isinstance(n.ctx, ast.Load) and (whole or field)):
+            why.append(f"{n.lineno} the record {name} used other than whole ({type(up).__name__})")
+    return why
 
 
 def credential_access(source: str, rel: str) -> "list[str]":
@@ -1423,8 +1452,14 @@ def credential_access(source: str, rel: str) -> "list[str]":
         name = node.attr if isinstance(node, ast.Attribute) else node.id if isinstance(node, ast.Name) else None
         if name in KEY_TUPLES:
             out.append(f"{rel}:{node.lineno} owner key tuple {name}")
-        if name in NAME_ONLY and not _names_only(node, parents, rel):
-            out.append(f"{rel}:{node.lineno} {name} used other than as a name in a record")
+        if name in NAME_ONLY:
+            site = _name_record(node, parents, rel)
+            if site is None:
+                out.append(f"{rel}:{node.lineno} {name} used other than as a name in a record")
+            else:
+                out += [f"{rel}:{why}" for why in _record_misuse(*site)]
+        if text == RECORD_KEY and not (isinstance(parent, ast.Dict) and node in parent.keys):
+            out.append(f"{rel}:{node.lineno} the record key {RECORD_KEY!r} read back")
         if isinstance(node, ast.alias) and node.name.rsplit(".", 1)[-1] in NAME_ONLY and node.asname:
             out.append(f"{rel}:{node.lineno} {node.name} imported under another name")
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name in NAME_ONLY:
@@ -1564,6 +1599,38 @@ class Guard(unittest.TestCase):
                             'from .gateway_credential_sources import token_env_name as key_name\n'
                             'def wire_bridge(cfg):\n    body = {"token_env": key_name()}',
                             'te = _sources.token_env_name\nos.getenv(te())')
+
+    def test_a_staged_read_of_the_record_is_flagged(self):
+        staged = '{fn}(cfg):\n    body = {{"token_env": _sources.token_env_name()}}\n    return {read}\n'
+        for fn in ("def wire_bridge", "def other"):
+            for read in ('os.getenv(body["token_env"])', 'os.environ.get(body["token_env"])',
+                         'os.environ[body["token_env"]]', 'os.getenv(body.get("token_env"))',
+                         'os.getenv(*body.values())', 'os.getenv(**body)', '[os.getenv(v) for v in body.values()]'):
+                source = staged.format(fn=fn, read=read)
+                self.assertTrue(credential_access(source, "adapters/claude_code/cli.py"), source)
+        self.assertTrue(credential_access('def f(d):\n    return os.getenv(d["token_env"])', "probe.py"),
+                        "a read of the record key in any module")
+
+    def test_only_the_module_level_wire_bridge_is_the_site(self):
+        record = '    body = {"token_env": _sources.token_env_name()}\n    return json.dumps(body)\n'
+        for source in ('def outer():\n    def wire_bridge(cfg):\n' + record.replace("\n    ", "\n        ").replace("    body", "        body", 1),
+                       'class C:\n    def wire_bridge(self, cfg):\n' + record.replace("    ", "        "),
+                       'async def wire_bridge(cfg):\n' + record,
+                       'def wire_bridge(cfg):\n' + record + 'def wire_bridge(cfg):\n    return ""\n'):
+            self.assertTrue(credential_access(source, "adapters/claude_code/cli.py"), source)
+        self.assertEqual(credential_access('def wire_bridge(cfg):\n' + record, "adapters/claude_code/cli.py"), [])
+
+    def test_an_alias_rebinding_or_mutation_of_the_record_is_flagged(self):
+        head = 'def wire_bridge(cfg):\n    body = {"token_env": _sources.token_env_name()}\n'
+        for tail in ('    b2 = body\n    return json.dumps(b2)', '    body = {}\n', '    body["x"] = 1\n',
+                     '    body.update(x=1)\n', '    del body["schema"]\n', '    for k in body:\n        pass\n',
+                     '    return "x" in body\n', '    body |= {}\n'):
+            self.assertTrue(credential_access(head + tail, "adapters/claude_code/cli.py"), tail)
+
+    def test_the_shipped_record_is_used_whole(self):
+        shipped = (PKG / "ag2_sparrow" / "adapters" / "claude_code" / "cli.py").read_text(encoding="utf-8")
+        self.assertIn("token_env_name()", shipped)
+        self.assertEqual(credential_access(shipped, "adapters/claude_code/cli.py"), [])
 
     def test_the_name_only_route_is_the_owners_canonical_token_key(self):
         self.assertEqual(owner.token_env_name(), owner.TOKEN_KEYS[0])
