@@ -1820,7 +1820,7 @@ def _read_text(path: str) -> str:
 
 
 # The process's credentials: every candidate registered, the winners chosen by the one owner's table.
-_SECRETS = gateway_instance.SinkRegistry()
+_SECRETS = diagnostics.REGISTRY  # the one registry every sink withholds from
 # The vault is located only if no earlier source holds a token.
 _FOUND = gateway_credential_sources.discover(
     os.environ, _channel_env_candidates(), read_token_file=_read_env_file,
@@ -1838,7 +1838,7 @@ elif _FOUND.token_source == "vault":
     _announce_vault_token()
 _RAW, TOKEN, URL = _FOUND.raw, _FOUND.token, _FOUND.url
 # Every credential this process holds is withheld from logs and status in any rendering.
-gateway_instance.register_gateway_secrets(URL)
+diagnostics.register_gateway_url(URL)
 diagnostics.register_secret(TOKEN)
 PROVIDER = os.environ.get("REMOTE_TASK_PROVIDER") or "remote"
 POLL_WAIT = int(os.environ.get("REMOTE_TASK_POLL_WAIT") or "25")
@@ -2586,7 +2586,7 @@ def _redact_url(value: str) -> str:
     so a gateway configured with `user:pass@` userinfo or a `?token=` query param
     must not land there in plaintext. Fails closed to a placeholder on any parse
     failure (never the raw value, never raise from a best-effort status write)."""
-    return gateway_instance.redact_url(value)
+    return gateway_credentials.redact_url(value)
 
 
 class _NeverFatalStream:
@@ -2632,7 +2632,7 @@ sys.stderr = _NeverFatalStream(sys.stderr)
 
 
 def _log(msg: str) -> None:
-    safe = diagnostics.scrub(gateway_instance.redact_text(msg, globals().get("URL") or ""))
+    safe = diagnostics.scrub(gateway_credentials.redact_text(msg, globals().get("URL") or ""))
     line = f"[remote-gateway-bridge] {safe}"
     print(line, flush=True)
     _append_log_file(line)
@@ -3673,7 +3673,7 @@ def _record_setup_hint(reply) -> None:
     if not hint:
         return
     payload = diagnostics.safe_status(dict(hint, ts=int(time.time())),
-                                      lambda text: gateway_instance.redact_text(text, URL))
+                                      lambda text: gateway_credentials.redact_text(text, URL))
     try:
         text = json.dumps(payload, sort_keys=True, allow_nan=False)
     except (TypeError, ValueError) as e:
@@ -3707,7 +3707,7 @@ def _emit_gateway_status(connected: bool, *, error: str | None = None,
             "ts": now,
             "last_ok_ts": last_ok,
             "backoff_s": int(backoff_s),
-            "error": _one_line(gateway_instance.redact_text(error, URL)) if error else None,
+            "error": _one_line(gateway_credentials.redact_text(error, URL)) if error else None,
             "gateway": _redact_url(URL),
             # Re-read on every write, so a lane switch or re-login shows at the next poll.
             "agent_id": (_reenroll_identity() or None) if connected else None,
@@ -3766,7 +3766,7 @@ def _emit_gateway_status(connected: bool, *, error: str | None = None,
         # Per-PID staging (sonichi/sutando#2222 follow-up): single-writer today,
         # but a shared temp name collides if a second sparrow instance ever runs;
         tmp = GATEWAY_STATUS_FILE.with_suffix(f".json.{os.getpid()}.tmp")
-        payload = diagnostics.safe_status(payload, lambda text: gateway_instance.redact_text(text, URL))
+        payload = diagnostics.safe_status(payload, lambda text: gateway_credentials.redact_text(text, URL))
         with open(tmp, "w") as f:
             json.dump(payload, f)
         os.replace(tmp, GATEWAY_STATUS_FILE)

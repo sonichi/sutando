@@ -11,8 +11,9 @@ Pins, through the real sinks:
     check, which is what decides for a detached Sparrow Hatch falls back to;
   - the real Hatch install diff, which withholds every environment line whole and decides nothing
     about credentials;
-  - a structural guard: no other package module reads a credential source, and the vendored and
-    generated copies match their canonical sources.
+  - a structural guard: no other package module reads a credential source or re-implements the
+    masking contract (one registry, in diagnostics), and the vendored and generated copies match
+    their canonical sources.
 Hermetic: temp HOME and files, a faked vault, no network, no real credential.
 """
 from __future__ import annotations
@@ -1505,6 +1506,65 @@ def credential_access(source: str, rel: str) -> "list[str]":
     return out
 
 
+# The masking contract has one implementation, the owner's. Elsewhere in the package a function by one of
+# its names may only delegate to it; no function may repeat one of its bodies under another name.
+_OWNER_TREE = ast.parse((REPO / "shared" / "ag2_gateway_credentials.py").read_text(encoding="utf-8"))
+_MASKING_START = next(n.lineno for n in _OWNER_TREE.body if isinstance(n, ast.Assign)
+                      and any(getattr(t, "id", "") == "WITHHELD" for t in n.targets))
+_REGISTRY_CLASS = next(n for n in _OWNER_TREE.body if isinstance(n, ast.ClassDef) and n.name == "SecretRegistry")
+MASKING_NAMES = ({n.name.lstrip("_") for n in _OWNER_TREE.body
+                  if isinstance(n, ast.FunctionDef) and n.lineno > _MASKING_START}
+                 | {n.name.lstrip("_") for n in _REGISTRY_CLASS.body if isinstance(n, ast.FunctionDef)
+                    and not n.name.startswith("__") and n.name not in ("register", "contains")})
+DELEGATES_TO = ("gateway_credentials", "REGISTRY", "contract")
+UNRELATED_NAMES = {("adapters/claude_code/hmac_policy.py", "describe")}  # an HMAC policy's mode line
+REGISTRY_HOLDER = "diagnostics.py"
+
+
+def _body(fn) -> list:
+    body = fn.body
+    if body and isinstance(body[0], ast.Expr) and isinstance(getattr(body[0], "value", None), ast.Constant) \
+            and isinstance(body[0].value.value, str):
+        body = body[1:]
+    return body
+
+
+def _dump(stmts) -> str:
+    return ast.dump(ast.Module(body=stmts, type_ignores=[]), annotate_fields=False)
+
+
+_OWNER_BODIES = {_dump(_body(f)) for f in ast.walk(_OWNER_TREE) if isinstance(f, ast.FunctionDef)
+                 and (len(_body(f)) > 1 or len(_dump(_body(f))) > 160)}
+
+
+def _delegates(fn) -> bool:
+    body = _body(fn)
+    if len(body) != 1 or not isinstance(body[0], ast.Return) or not isinstance(body[0].value, ast.Call):
+        return False
+    root = body[0].value.func
+    while isinstance(root, ast.Attribute):
+        root = root.value
+    return isinstance(body[0].value.func, ast.Attribute) and isinstance(root, ast.Name) and root.id in DELEGATES_TO
+
+
+def masking_copies(source: str, rel: str) -> "list[str]":
+    """Each place `source` (package path `rel`) re-implements the owner's masking contract."""
+    out = []
+    for n in ast.walk(ast.parse(source)):
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if n.name.lstrip("_") in MASKING_NAMES and (rel, n.name) not in UNRELATED_NAMES and not _delegates(n):
+                out.append(f"{rel}:{n.lineno}: {n.name} re-implements the owner's {n.name.lstrip('_')}")
+            elif _dump(_body(n)) in _OWNER_BODIES:
+                out.append(f"{rel}:{n.lineno}: {n.name} repeats an owner function's body")
+        elif isinstance(n, ast.ClassDef) and any(ast.unparse(b).endswith("SecretRegistry") for b in n.bases):
+            out.append(f"{rel}:{n.lineno}: {n.name} subclasses the owner's registry")
+    module_registries = [n for n in ast.parse(source).body if isinstance(n, (ast.Assign, ast.AnnAssign))
+                         and n.value is not None and "SecretRegistry(" in ast.unparse(n.value)]
+    if rel != REGISTRY_HOLDER:
+        out += [f"{rel}:{n.lineno}: a second process-wide registry" for n in module_registries]
+    return out
+
+
 class Guard(unittest.TestCase):
     OWNERS = {"gateway_credential_sources.py", "gateway_credentials.py"}
 
@@ -1515,6 +1575,34 @@ class Guard(unittest.TestCase):
                 rel = str(path.relative_to(PKG / "ag2_sparrow"))
                 found += credential_access(path.read_text(encoding="utf-8"), rel)
         self.assertEqual(found, [], "a credential source is touched outside the owner and the adapters' edge")
+
+    def test_the_package_has_one_masking_implementation(self):
+        found = []
+        for path in sorted((PKG / "ag2_sparrow").rglob("*.py")):
+            if path.name not in self.OWNERS:
+                rel = str(path.relative_to(PKG / "ag2_sparrow"))
+                found += masking_copies(path.read_text(encoding="utf-8"), rel)
+        self.assertEqual(found, [], "the masking contract is gateway_credentials'; call it, never copy it")
+
+    def test_the_masking_detector_catches_a_copy(self):
+        import inspect
+        renamed = inspect.getsource(contract._split_by_hand).replace("def _split_by_hand", "def _hand_split")
+        copies = ['def fold(text):\n    return str(text).casefold()\n',
+                  'def _views(text):\n    return {text}\n',
+                  'def describe(exc):\n    return type(exc).__name__\n',
+                  'def redact_text(text, url):\n    return gateway_credentials.redact_url(text) or text\n',
+                  'def scrub(text):\n    return "<withheld>" if "x" in text else text\n',
+                  renamed,
+                  'class SinkRegistry(gateway_credentials.SecretRegistry):\n    pass\n',
+                  '_SECRETS = gateway_credentials.SecretRegistry()\n']
+        for source in copies:
+            self.assertTrue(masking_copies(source, "probe.py"), source)
+        delegations = ('from . import gateway_credentials\nREGISTRY = gateway_credentials.SecretRegistry()\n'
+                       'def describe(exc):\n    """Doc."""\n    return gateway_credentials.describe(exc, REGISTRY)\n'
+                       'def scrub(text):\n    return REGISTRY.scrub(text)\n'
+                       'redact_url = gateway_credentials.redact_url\n')
+        self.assertEqual(masking_copies(delegations, REGISTRY_HOLDER), [])
+        self.assertTrue(masking_copies(delegations, "gateway_instance.py"), "one registry, in one module")
 
     def test_the_detector_catches_every_bypass(self):
         bypasses = [

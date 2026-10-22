@@ -24,7 +24,7 @@ isolate_os_environ()
 
 PKG_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PKG_ROOT))
-from ag2_sparrow import __version__ as PKG_VERSION, gateway_instance, setup_fetch  # noqa: E402
+from ag2_sparrow import __version__ as PKG_VERSION, gateway_credentials, gateway_instance, setup_fetch  # noqa: E402
 from ag2_sparrow.adapters.hatch import (  # noqa: E402
     cli as hatch_cli, keepalive, runtime_text)
 
@@ -923,10 +923,33 @@ print(json.dumps({"status": json.load(open(m.GATEWAY_STATUS_FILE))}))
         self.assertIn(diagnostics.WITHHELD_TEXT, logs)
         self.assertNotIn(token, logs)
         self.assertEqual(out["status"]["error"], diagnostics.WITHHELD_TEXT)
-        with mock.patch.object(diagnostics, "_SECRETS", {}):
+        with mock.patch.object(diagnostics, "REGISTRY", gateway_credentials.SecretRegistry()):
             diagnostics.register_secret(token)
             self.assertEqual(diagnostics.safe_status({"e": [f"x {token}"]}, lambda t: t),
                              {"e": [diagnostics.WITHHELD_TEXT]}, "safe_status runs the registry after the net")
+
+    def test_an_escaped_echo_of_the_token_is_withheld_from_the_log_and_the_status(self):
+        # Escaped as systemd and C render it; the sinks' registry must decode before matching.
+        token = "fake-relay-token-0123456789abcdef"
+        echoes = [token.replace("-", "\\x2d"), "\\x66" + token[1:], token.replace("-", "\\055")]
+        out = self.bridge("""
+import json, os
+from ag2_sparrow import remote_gateway_bridge as m
+echoes = json.loads(os.environ["ECHOES"])
+for echo in echoes:
+    m._log("gateway said x " + echo + " y")
+statuses = []
+for echo in echoes:
+    m._emit_gateway_status(False, error="reconnecting: " + echo)
+    statuses.append(json.load(open(m.GATEWAY_STATUS_FILE))["error"])
+print(json.dumps({"statuses": statuses}))
+""", ECHOES=json.dumps(echoes))
+        logs = (self.home / "logs" / "gateway-bridge.log").read_text()
+        for echo in echoes:
+            self.assertNotIn(echo, logs)
+        self.assertNotIn("gateway said", logs)
+        self.assertGreaterEqual(logs.count(gateway_credentials.WITHHELD_TEXT), len(echoes), logs)
+        self.assertEqual(out["statuses"], [gateway_credentials.WITHHELD_TEXT] * len(echoes))
 
     def test_a_failed_private_review_reports_only_the_exception_description(self):
         out = self.bridge("""
@@ -1988,7 +2011,7 @@ class Diagnostics(unittest.TestCase):
         self.assertEqual(self.d.code_field("reenroll_disabled"), "reenroll_disabled")
 
     def test_every_url_credential_piece_is_registered(self):
-        with mock.patch.object(self.d, "_SECRETS", {}):
+        with mock.patch.object(self.d, "REGISTRY", gateway_credentials.SecretRegistry()):
             gateway_instance.register_gateway_secrets(
                 "https://long-username-1:long-password-2@gw.example/relay?k=ab&t=long-query-3#long-fragment-4")
             for text in ("x long-password-2 y", "x long-fragment-4 y", "x long-username-1 y",
@@ -1997,7 +2020,7 @@ class Diagnostics(unittest.TestCase):
             self.assertEqual(self.d.scrub("x ab y"), "x ab y", "a short bare query value alone is not matched")
 
     def test_secret_matching_ignores_letter_case_everywhere(self):
-        with mock.patch.object(self.d, "_SECRETS", {}):
+        with mock.patch.object(self.d, "REGISTRY", gateway_credentials.SecretRegistry()):
             self.d.register_secret("MixedToken9")
             for text in ("mixedtoken9", "MIXEDTOKEN9", "mIXEDtOKEN9", "mixedtoken9".encode().hex() and "MixedToken9"):
                 self.assertEqual(self.d.scrub(text), self.d.WITHHELD_TEXT, text)
@@ -2042,9 +2065,8 @@ class OwnerAndForms(unittest.TestCase):
         self.assertEqual(gateway_instance.owner_mxid("@o:ag2.space", ""), "")
 
     def test_forms_are_total_over_lone_surrogates(self):
-        from ag2_sparrow import diagnostics
-        self.assertIn("%FF", diagnostics.forms("\udcff"))
-        self.assertIn("%ED%A0%80", diagnostics.forms("\ud800"))
+        self.assertIn("%FF", gateway_credentials.forms("\udcff"))
+        self.assertIn("%ED%A0%80", gateway_credentials.forms("\ud800"))
 
 
 class RedactUrl(unittest.TestCase):

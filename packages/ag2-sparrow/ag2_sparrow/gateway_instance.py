@@ -18,7 +18,6 @@ import sys
 import tempfile
 import threading
 import time
-import urllib.parse
 from pathlib import Path
 from typing import Any, Callable
 
@@ -52,58 +51,13 @@ def outbox_root(results_dir: Path, instance: str) -> Path:
     return Path(results_dir) / f".outbox{suffix(instance)}"
 
 
-REDACTED_URL = "<unparseable gateway URL>"
-
-
-def redact_url(value: str) -> str:
-    """Scheme, host, port and path of a gateway URL, as Sparrow persists and logs it: userinfo,
-    query and fragment dropped. Fails closed: REDACTED_URL when it does not parse as one."""
-    try:
-        p = urllib.parse.urlsplit(str(value))
-        if not p.scheme or not p.hostname:
-            return REDACTED_URL
-        host = f"[{p.hostname}]" if ":" in p.hostname else p.hostname
-        if p.port:
-            host = f"{host}:{p.port}"
-        return urllib.parse.urlunsplit((p.scheme, host, p.path, "", ""))
-    except Exception:  # noqa: BLE001 - redaction must never break status I/O
-        return REDACTED_URL
-
-
-_SCRUBBED_TYPES: "dict[type, type]" = {}
-
-
-def scrub_exception(exc: BaseException, gateway_url: str) -> BaseException:
-    """`exc`, raised by a call that received the gateway URL, as an exception of a subclass of
-    its own type (so every `except` and attribute read still works) whose text is only
-    `<type> contacting <redacted gateway>`, plus the HTTP status when it has one. Nothing the
-    original text held, in any encoding, can reach a log or a status file through it."""
-    base = type(exc)
-    safe = _SCRUBBED_TYPES.get(base)
-    if safe is None:
-        # The original is never reachable from it: no __context__ (set when raised in a handler).
-        safe = _SCRUBBED_TYPES[base] = type(base.__name__, (base,), {
-            "__str__": lambda self: self.__dict__.get("_scrubbed", base.__name__),
-            "__repr__": lambda self: f"{base.__name__}({self.__dict__.get('_scrubbed', '')!r})",
-            "__context__": property(lambda self: None, lambda self, value: None),
-            "__module__": base.__module__, "__qualname__": base.__qualname__})
-        diagnostics.SCRUBBED_TYPES.add(safe)
-    code = exc.__dict__.get("code")
-    text = f"{base.__name__} contacting {redact_url(gateway_url)}"
-    if isinstance(code, int):
-        text += f" (HTTP {code})"
-    out = safe.__new__(safe)
-    # Objects (an HTTPError's body and headers) and numbers stay; text and bytes never do.
-    out.__dict__.update({k: (text if isinstance(v, str) else b"" if isinstance(v, (bytes, bytearray))
-                             else scrub_exception(v, gateway_url) if isinstance(v, BaseException) else v)
-                         for k, v in exc.__dict__.items()})
-    if isinstance(exc, OSError):
-        out.errno = exc.errno
-    out.__dict__["_scrubbed"] = text
-    out.__dict__["_gateway"] = redact_url(gateway_url)
-    out.args = (text,)
-    out.__traceback__ = exc.__traceback__
-    return out
+# URL redaction and exception scrubbing are the credential owner's; these names are its, re-exported.
+REDACTED_URL = gateway_credentials.REDACTED_URL
+REDACTED_TEXT = gateway_credentials.REDACTED_TEXT
+redact_url = gateway_credentials.redact_url
+redact_text = gateway_credentials.redact_text
+scrub_exception = gateway_credentials.scrub_exception
+register_gateway_secrets = diagnostics.register_gateway_url
 
 
 @contextlib.contextmanager
@@ -155,129 +109,34 @@ def install_scrubbing_excepthooks(get_url: Callable[[], str]) -> None:
     sys.unraisablehook = unraisable_hook  # also what an exception in an atexit callback reaches
 
 
-REDACTED_TEXT = "<text withheld: it may contain the gateway URL>"
-
-
-def _split_by_hand(url: str) -> "tuple[str, str, str]":
-    before, _, fragment = url.partition("#")
-    _, _, query = before.partition("?")
-    userinfo = before.partition("://")[2].partition("/")[0].rpartition("@")[0]
-    return userinfo, query, fragment
-
-
-def _secret_parts(url: str) -> "list[str]":
-    """Each part of the URL that may carry a credential, with the delimiter the URL itself puts
-    before it, so a part of any length is matched where URL text renders it. Split by hand as
-    well as by urlsplit, which drops tab, CR and LF from the parts it returns."""
-    splits = [_split_by_hand(url)]
-    try:
-        p = urllib.parse.urlsplit(url)
-        splits.append((p.netloc.rpartition("@")[0], p.query, p.fragment))
-    except Exception:  # noqa: BLE001 - the hand split stands alone
-        pass
-    parts = []
-    for userinfo, query, fragment in splits:
-        if userinfo:
-            parts.append(userinfo + "@")
-            if ":" in userinfo:
-                parts.append(":" + userinfo.partition(":")[2] + "@")
-        if query:
-            parts.append("?" + query)
-            for pair in re.split(r"[&;]", query):
-                key, eq, value = pair.partition("=")
-                parts += [pair, "=" + value] if eq else ["?" + pair, "&" + pair, ";" + pair]
-        if fragment:
-            parts.append("#" + fragment)
-    return [p for p in dict.fromkeys(parts) if p not in ("=", "?", "&", ";", "#", "@", ":@")]
-
-
-def _url_form_re(form: str) -> "re.Pattern[str]":
-    """`form` with its scheme and host matched in any case, which a URL ignores there, and the
-    rest (userinfo, path, query: the bytes a credential is made of) exactly."""
-    scheme, sep, rest = form.partition("://")
-    if not sep:
-        return re.compile(re.escape(form))
-    authority, slash, tail = rest.partition("/")
-    userinfo, at, host = authority.rpartition("@")
-    return re.compile(f"(?i:{re.escape(scheme + sep)})" + re.escape(userinfo + at)
-                      + f"(?i:{re.escape(host)})" + re.escape(slash + tail))
-
-
 ROOM_PIECE_MIN = 6  # a shorter localpart is a "piece" of nearly any secret and reveals none
 MATRIX_ROOM_RE = re.compile(r"!([A-Za-z0-9._~=-]{1,255}):([A-Za-z0-9.-]{1,255}(?::[0-9]{1,5})?)")
-
-
-def owner_room(room: Any, identity: str) -> str:
-    """`room` when it is a Matrix room id on the agent's own homeserver (the server part of its
-    `@local:server` identity), holds no registered secret and whose localpart, if ROOM_PIECE_MIN
-    characters or longer, is no piece of one, in any case; '' otherwise. Room ids without a server part (room version 12) are refused. The one
-    check every writer and reader of the owner DM applies, so an echoed credential never
-    becomes a room."""
-    if not isinstance(room, str) or not isinstance(identity, str):
-        return ""
-    m = MATRIX_ROOM_RE.fullmatch(room)
-    server = identity.partition(":")[2] if identity.startswith("@") else ""
-    if m is None or not server or m.group(2).casefold() != server.casefold():
-        return ""
-    local = m.group(1)
-    piece = len(local) >= ROOM_PIECE_MIN and diagnostics.holds_or_is_piece(local)
-    return "" if diagnostics.contains_secret(room) or piece else room
-
-
 MATRIX_USER_RE = re.compile(r"@([A-Za-z0-9._=/+-]{1,255}):([A-Za-z0-9.-]{1,255}(?::[0-9]{1,5})?)")
 
 
-def owner_mxid(owner: Any, identity: str) -> str:
-    """`owner` when it is a Matrix user id on the agent's own homeserver, holds no registered secret
-    and whose localpart, if ROOM_PIECE_MIN characters or longer, is no piece of one; '' otherwise
-    (owner_room's rule, so a server part is never a piece of a secret)."""
-    m = MATRIX_USER_RE.fullmatch(owner) if isinstance(owner, str) else None
+def _own_server_id(value: Any, pattern: "re.Pattern[str]", identity: Any) -> str:
+    """`value` when `pattern` matches it whole, its server part is the agent's own (the server of
+    its `@local:server` identity), it holds no registered secret and its localpart, if
+    ROOM_PIECE_MIN characters or longer, is no piece of one, in any case; '' otherwise."""
+    m = pattern.fullmatch(value) if isinstance(value, str) else None
     server = identity.partition(":")[2] if isinstance(identity, str) and identity.startswith("@") else ""
     if m is None or not server or m.group(2).casefold() != server.casefold():
         return ""
     local = m.group(1)
     piece = len(local) >= ROOM_PIECE_MIN and diagnostics.holds_or_is_piece(local)
-    return "" if diagnostics.contains_secret(owner) or piece else owner
+    return "" if diagnostics.contains_secret(value) or piece else value
 
 
-def register_gateway_secrets(url: str) -> None:
-    """Add every credential part of the gateway URL to the process's secret registry: each
-    delimited part, and the bare userinfo, password and query values long enough to match alone."""
-    for part in _secret_parts(str(url or "")):
-        diagnostics.register_secret(part)
-    userinfo, query, fragment = _split_by_hand(str(url or ""))
-    username, _, password = userinfo.partition(":")
-    for value in (userinfo, username, password, fragment,
-                  *(pair.partition("=")[2] for pair in re.split(r"[&;]", query))):
-        diagnostics.register_secret(value, min_len=diagnostics.BARE_SECRET_MIN)
+def owner_room(room: Any, identity: str) -> str:
+    """`room` when it is a Matrix room id on the agent's own homeserver (see _own_server_id); room
+    ids without a server part (room version 12) are refused. The one check every writer and reader
+    of the owner DM applies, so an echoed credential never becomes a room."""
+    return _own_server_id(room, MATRIX_ROOM_RE, identity)
 
 
-
-class SinkRegistry(gateway_credentials.SecretRegistry):
-    """The credential owner's registry, whose values the log and status sinks withhold too: a URL by
-    its credential parts, as register_gateway_secrets does, so the bare gateway stays renderable."""
-
-    def register(self, value: Any, min_len: int = 1) -> None:
-        super().register(value, min_len)
-        if isinstance(value, str) and value.lower().startswith(("http://", "https://")):
-            register_gateway_secrets(value)
-        else:
-            diagnostics.register_secret(value, min_len)
-
-def redact_text(text: str, gateway_url: str) -> str:
-    """Diagnostic text safe to log or persist: the full gateway URL replaced by its redacted
-    form. Fails closed: REDACTED_TEXT when any credential-bearing part of the URL (userinfo,
-    query or one of its pairs or values, fragment) survives in any rendering of it."""
-    text, url = str(text), str(gateway_url or "")
-    if not url:
-        return text
-    for form in sorted(diagnostics.forms(url), key=len, reverse=True):
-        text = _url_form_re(form).sub(lambda _m: redact_url(url), text)
-    views = {diagnostics.fold(v) for v in (text, urllib.parse.unquote(text), urllib.parse.unquote_plus(text))}
-    for part in _secret_parts(url):
-        if any(diagnostics.fold(form) in view for form in diagnostics.forms(part) for view in views):
-            return REDACTED_TEXT
-    return text
+def owner_mxid(owner: Any, identity: str) -> str:
+    """`owner` when it is a Matrix user id on the agent's own homeserver, by owner_room's rule."""
+    return _own_server_id(owner, MATRIX_USER_RE, identity)
 
 
 KEY_GRACE_S = 5.0

@@ -29,7 +29,7 @@ import time
 from importlib import resources
 from pathlib import Path
 
-from ... import _dirs, gateway_credential_io, gateway_credentials, gateway_instance, outbox, workspace_lock
+from ... import _dirs, diagnostics, gateway_credential_io, gateway_credentials, gateway_instance, outbox, workspace_lock
 from ...result_markers import parse_markers
 from ...service_manager import _systemctl, _systemd_run, systemd_user_available  # noqa: F401
 from .task_fields import item_id, valid_mxid
@@ -1100,7 +1100,7 @@ def _register_device_secrets() -> None:
     """Withhold every credential candidate this host could hand Sparrow (the process env and the
     device file, each on its own): whichever one precedence picks, the others stay withheld."""
     gateway_credential_io.register_candidates(
-        dict(os.environ, AG2_DEVICE_ENV=str(device_env_path())), gateway_instance.SinkRegistry())
+        dict(os.environ, AG2_DEVICE_ENV=str(device_env_path())), diagnostics.REGISTRY)
 
 
 def wake_context(_args) -> int:
