@@ -123,16 +123,28 @@ class ArchivedTaskIsNotFatal(unittest.TestCase):
             (ws / "tasks/archive" / f"{TID}.txt").write_text("id: x\ntask: hi\n")
             self.assertEqual(td_mod.main([f"{TID}.txt", "--workspace", str(ws)]), 0)
             self.assertEqual(td_mod.main(["..", "--workspace", str(ws)]), 2)
+            fake = types.ModuleType("workspace_default")
+            fake.resolve_workspace = lambda migrate=True: ws
+            saved = sys.modules.get("workspace_default")
+            sys.modules["workspace_default"] = fake
+            try:
+                self.assertEqual(td_mod.main([TID]), 0)
+            finally:
+                if saved is None:
+                    sys.modules.pop("workspace_default", None)
+                else:
+                    sys.modules["workspace_default"] = saved
 
 
 class ErrorNoticeNeverRoutedToNonOwner(unittest.TestCase):
-    def _one_pass(self, td: str, tier: str):
+    def _one_pass(self, td: str, tier: str, route_without_tier: bool = False, task_file: bool = True):
         results, tasks = Path(td) / "results", Path(td) / "tasks"
         (results / "archive").mkdir(parents=True)
         (tasks / "archive").mkdir(parents=True)
         (Path(td) / "state").mkdir()
-        (tasks / f"{TID}.txt").write_text(
-            f"id: {TID}\nsource: slack\naccess_tier: {tier}\ntask: hi\n")
+        if task_file:
+            (tasks / f"{TID}.txt").write_text(
+                f"id: {TID}\nsource: slack\naccess_tier: {tier}\ntask: hi\n")
         (results / f"{TID}.txt").write_text(ERROR_BODY)
         calls: list[dict] = []
 
@@ -147,8 +159,10 @@ class ErrorNoticeNeverRoutedToNonOwner(unittest.TestCase):
         sb.app = types.SimpleNamespace(client=types.SimpleNamespace(chat_postMessage=_post))
         sb._atomic_write_pending_replies = lambda *a, **k: None
         sb.pending_replies.clear()
-        sb.pending_replies[TID] = {"channel": "D0TEAM", "thread_ts": None,
-                                   "submitted_at": sb.time.time(), "access_tier": tier}
+        route = {"channel": "D0TEAM", "thread_ts": None, "submitted_at": sb.time.time()}
+        if not route_without_tier:
+            route["access_tier"] = tier
+        sb.pending_replies[TID] = route
 
         def _sleep(_s):
             raise _Stop()
@@ -168,6 +182,16 @@ class ErrorNoticeNeverRoutedToNonOwner(unittest.TestCase):
             sent = " ".join(c.get("text", "") for c in calls)
             for marker in LOCAL_MARKERS:
                 self.assertNotIn(marker, sent, f"{marker!r} reached a non-owner DM")
+
+    def test_route_without_tier_rereads_the_task_file(self):
+        with tempfile.TemporaryDirectory() as td:
+            calls = self._one_pass(td, "team", route_without_tier=True)
+            self.assertNotIn("[Errno", " ".join(c.get("text", "") for c in calls))
+
+    def test_route_without_tier_or_task_file_guards_as_guest(self):
+        with tempfile.TemporaryDirectory() as td:
+            calls = self._one_pass(td, "owner", route_without_tier=True, task_file=False)
+            self.assertNotIn("[Errno", " ".join(c.get("text", "") for c in calls))
 
     def test_owner_reply_is_untouched(self):
         with tempfile.TemporaryDirectory() as td:
