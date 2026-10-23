@@ -566,7 +566,7 @@ class TestInterruptedReconciliation(Base):
 
     def snapshot(self):
         return {str(p.relative_to(self.root)): p.read_bytes() for p in self.root.rglob("*")
-                if p.is_file()}
+                if p.is_file() and not p.name.endswith(".lock")}
 
     def test_releases_both_accepted_names_but_preserves_pending_payloads_and_ownership(self):
         released = []
@@ -620,6 +620,109 @@ class TestInterruptedReconciliation(Base):
         pd.mark_done(self.root, "worker-1", tid, published=True)
         self.assertEqual(pd.prune_spent(self.root, "worker-1")["retired"], [tid])
 
+    def test_releases_exactly_died_mid_work_with_coexisting_sentinel_names(self):
+        suffixes = (".txt", ".accepted", ".claimed")
+        expected = []
+        preserved = {}
+        for mask in range(1, 8):
+            tid = f"task-coexist-{mask}"
+            self.ws.payload(tid)
+            folder = pd.deliveries_dir(self.root, "worker-1")
+            folder.mkdir(parents=True, exist_ok=True)
+            for bit, suffix in enumerate(suffixes):
+                if mask & (1 << bit):
+                    p = folder / (tid + suffix)
+                    p.write_text(suffix)
+                    preserved[p] = suffix
+            if pd.residue(self.root, "worker-1", tid) == "died-mid-work":
+                expected.append(tid)
+                source = folder / (tid + (".accepted" if mask & 2 else ".claimed"))
+                preserved[source.with_suffix(".txt")] = preserved.pop(source)
+        self.assertEqual(pd.reconcile_interrupted(self.root, "worker-1"), expected)
+        for path, body in preserved.items():
+            self.assertEqual(path.read_text(), body)
+        self.assertEqual(pd.reconcile_interrupted(self.root, "worker-1"), [])
+
+    def test_residue_and_recovery_use_the_same_classifier(self):
+        from unittest import mock
+        entry = self.deliver("task-classifier")
+        with mock.patch.object(pd, "classify_residue", return_value="pending"):
+            self.assertEqual(pd.residue(self.root, "worker-1", "task-classifier"), "pending")
+            self.assertEqual(pd.reconcile_interrupted(self.root, "worker-1"), [])
+        self.assertTrue(entry.is_file())
+
+    def test_conflicting_holders_fail_closed_without_changing_sentinels(self):
+        for suffix in (".txt", ".accepted", ".claimed"):
+            with self.subTest(suffix=suffix):
+                tid = "task-conflict-" + suffix[1:]
+                entry = self.deliver(tid)
+                other = self.ws.deliver("worker-2", tid)
+                if suffix != ".txt":
+                    other = other.rename(other.with_suffix(suffix))
+                with self.assertRaises(OSError):
+                    pd.reconcile_interrupted(self.root, "worker-1")
+                self.assertTrue(entry.is_file())
+                self.assertTrue(other.is_file())
+                self.assertFalse(entry.with_suffix(".txt").exists())
+                entry.unlink()
+                other.unlink()
+
+    def test_vanished_entries_are_skipped_before_classification_or_rename(self):
+        from unittest import mock
+        entry = self.deliver("task-vanished")
+        find_in = pd.find_in
+
+        def vanish(dfd, tid):
+            entry.unlink()
+            return find_in(dfd, tid)
+
+        with mock.patch.object(pd, "find_in", side_effect=vanish):
+            self.assertEqual(pd.reconcile_interrupted(self.root, "worker-1"), [])
+        entry = self.deliver("task-vanished")
+        rename = os.rename
+
+        def vanish_on_rename(*args, **kwargs):
+            entry.unlink()
+            return rename(*args, **kwargs)
+
+        with mock.patch.object(pd.os, "rename", side_effect=vanish_on_rename):
+            self.assertEqual(pd.reconcile_interrupted(self.root, "worker-1"), [])
+
+    def test_holder_checks_never_nest_folder_locks(self):
+        import contextlib
+        import pool_router
+        from unittest import mock
+        self.deliver("task-locks")
+        arbitration = pd.arbitration
+        task_arbitration = pool_router.task_arbitration
+        locked = []
+        tasks = []
+
+        @contextlib.contextmanager
+        def checked_task(ws, tid):
+            self.assertEqual(locked, [])
+            with task_arbitration(ws, tid):
+                tasks.append(tid)
+                try:
+                    yield
+                finally:
+                    tasks.pop()
+
+        @contextlib.contextmanager
+        def checked(ws, who, **kwargs):
+            self.assertEqual(locked, [])
+            self.assertEqual(tasks, ["task-locks"])
+            with arbitration(ws, who, **kwargs) as dfd:
+                locked.append(who)
+                try:
+                    yield dfd
+                finally:
+                    locked.pop()
+
+        with mock.patch.object(pd, "arbitration", side_effect=checked), \
+                mock.patch.object(pool_router, "task_arbitration", side_effect=checked_task):
+            self.assertEqual(pd.reconcile_interrupted(self.root, "worker-1"), ["task-locks"])
+
     def test_nonregular_entries_are_not_released(self):
         entry = self.deliver("task-target")
         folder = entry.parent
@@ -631,17 +734,27 @@ class TestInterruptedReconciliation(Base):
 
     def test_recipient_alias_is_refused_and_a_swap_cannot_redirect_the_transition(self):
         from unittest import mock
+        import pool_router
         entry = self.deliver("task-own")
         self.ws.payload("task-other")
         other = pd.accept(self.ws.deliver("worker-2", "task-other"))
         folder, moved = entry.parent, entry.parent.with_name("original")
         arb = pd.arbitration
+        committed = pool_router.committed_recipient
+        checked = []
 
         def swap():
             folder.rename(moved)
             folder.symlink_to(other.parent, target_is_directory=True)
 
-        with mock.patch.object(pd, "arbitration", side_effect=lambda ws, who: arb(ws, who, _after_lock=swap)):
+        def owner(ws, tid):
+            result = committed(ws, tid)
+            checked.append(tid)
+            return result
+
+        with mock.patch.object(pool_router, "committed_recipient", side_effect=owner), \
+                mock.patch.object(pd, "arbitration", side_effect=lambda ws, who, **kw:
+                                  arb(ws, who, _after_lock=swap if checked else None, **kw)):
             self.assertEqual(pd.reconcile_interrupted(self.root, "worker-1"), ["task-own"])
         self.assertTrue((moved / "task-own.txt").is_file())
         self.assertTrue(other.is_file())

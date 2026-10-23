@@ -252,6 +252,10 @@ Fixed order: result, then done-flag, then archive. Residue is then unambiguous â
 **result with no flag** means completed, never re-run; **an accepted sentinel with no result** means
 died mid-work, released to the same worker.
 
+Releasing interrupted work is at-least-once execution: a resumed conversation
+can repeat side effects performed before the interruption. A ready answer, live
+or archived, prevents release; completion of an earlier side effect alone does not.
+
 `finish` is the single completion path and refuses unless the caller holds the
 the acceptance, the first body line echoes `task: <id>`, and the body is non-empty. A refusal
 writes nothing. The echo exists because a worker holding two acceptances once wrote each

@@ -147,16 +147,29 @@ class DeliveryRecoveryControls(Base):
     def test_recovery_leaves_another_worker_and_another_workspace_unchanged(self):
         other = wi.create_worker(self.ws, runtime="claude", cwd=str(REPO))["worker_id"]
         sibling_ws = self.ws / "separate-workspace"
-        for ws, wid in ((self.ws, other), (sibling_ws, self.wid)):
-            rem.pd.payload_path(ws, self.tid).parent.mkdir(parents=True, exist_ok=True)
-            rem.pd.payload_path(ws, self.tid).write_text("task: keep the original payload\n")
-            self.router.deliver_one(ws, wid, self.tid)
-            rem.pd.accept(rem.pd.deliveries_dir(ws, wid) / f"{self.tid}.txt")
+        for ws, wid, tid in ((self.ws, other, "task-other"), (sibling_ws, self.wid, self.tid)):
+            rem.pd.payload_path(ws, tid).parent.mkdir(parents=True, exist_ok=True)
+            rem.pd.payload_path(ws, tid).write_text("task: keep the original payload\n")
+            self.router.deliver_one(ws, wid, tid)
+            rem.pd.accept(rem.pd.deliveries_dir(ws, wid) / f"{tid}.txt")
         roots = [rem.pd.deliveries_dir(self.ws, other), wi.worker_dir(self.ws, other), sibling_ws]
         before = [self.snapshot(p) for p in roots]
         self.assertEqual(self.recover()["outcome"], rem.RECOVERED)
         self.assertEqual([self.snapshot(p) for p in roots], before)
         self.assertEqual(rem.pd.find(self.ws, self.wid, self.tid).suffix, ".txt")
+
+    def test_conflicting_holders_fail_recovery_before_launch(self):
+        other = wi.create_worker(self.ws, runtime="claude", cwd=str(REPO))["worker_id"]
+        other_folder = rem.pd.deliveries_dir(self.ws, other)
+        other_folder.mkdir(parents=True, exist_ok=True)
+        twin = other_folder / f"{self.tid}.accepted"
+        twin.touch()
+        out = self.recover()
+        self.assertEqual(out["outcome"], rem.FAILED)
+        self.assertIn("refusing to choose", out["why"])
+        self.assertEqual(len(self.t.launches()), self.launched_before)
+        self.assertTrue(self.accepted.is_file())
+        self.assertTrue(twin.is_file())
 
     def test_reconciliation_io_failure_prevents_launch_and_retry_recovers(self):
         lock = Path(self.inbox) / rem.pd.LOCK_NAME
@@ -180,14 +193,19 @@ class DeliveryRecoveryControls(Base):
         rem.pd.payload_path(self.ws, tid).write_text("task: second payload\n")
         self.router.deliver_one(self.ws, self.wid, tid)
         accepted = rem.pd.accept(Path(self.inbox) / f"{tid}.txt")
-        collision = Path(self.inbox) / f"{tid}.txt"
-        collision.mkdir()
-        out = self.recover()
+        rename = os.rename
+
+        def fail_second(source, *args, **kwargs):
+            if source == accepted.name:
+                raise OSError("interrupted second transition")
+            return rename(source, *args, **kwargs)
+
+        with mock.patch.object(rem.pd.os, "rename", side_effect=fail_second):
+            out = self.recover()
         self.assertEqual(out["outcome"], rem.FAILED)
         self.assertEqual(len(self.t.launches()), self.launched_before)
         self.assertEqual(rem.pd.find(self.ws, self.wid, self.tid).suffix, ".txt")
         self.assertTrue(accepted.is_file())
-        collision.rmdir()
         self.assertEqual(self.recover()["outcome"], rem.RECOVERED)
         self.assertEqual([p.name for p in rem.pd.pending(self.ws, self.wid)],
                          [f"{self.tid}.txt", f"{tid}.txt"])

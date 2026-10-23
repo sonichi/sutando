@@ -32,6 +32,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 # helpers live in the core; repo root is parents[3] from this directory
@@ -362,23 +363,61 @@ def release(sentinel: Path) -> Path:
 
 def reconcile_interrupted(workspace: Path, recipient: str) -> list[str]:
     """Re-offer unfinished accepted work to its owner after confirmed session absence."""
+    import pool_router
+
     ws = Path(workspace)
     released = []
-    with arbitration(ws, recipient) as dfd:
-        for name in sorted(os.listdir(dfd)):
-            got = parse_sentinel(name)
-            if got is None or not got[1]:
-                continue
-            task_id = got[0]
-            if not stat.S_ISREG(os.stat(name, dir_fd=dfd, follow_symlinks=False).st_mode):
-                continue
-            if (is_done_flag(done_flag(ws, recipient, task_id))
-                    or find_ready_result(results_dir(ws), task_id) is not None
-                    or not payload_path(ws, task_id).is_file()):
-                continue
-            os.rename(name, task_id + PENDING_SUFFIX, src_dir_fd=dfd, dst_dir_fd=dfd)
-            released.append(task_id)
+    task_ids = sorted({parse_sentinel(p.name)[0] for p in accepted(ws, recipient)
+                       if is_regular_file(p)})
+    # Keep router assignments stable through the transition: task locks precede
+    # folder locks, and holders must finish before this folder is locked.
+    with contextlib.ExitStack() as locks:
+        for task_id in task_ids:
+            locks.enter_context(pool_router.task_arbitration(ws, task_id))
+        try:
+            owners = {task_id: pool_router.committed_recipient(ws, task_id)
+                      for task_id in task_ids}
+        except pool_router.RouterRefused as e:
+            raise OSError(str(e)) from e
+        with arbitration(ws, recipient) as dfd:
+            for task_id in task_ids:
+                if owners[task_id] != recipient:
+                    continue
+                name = find_in(dfd, task_id)
+                if _residue_state(ws, recipient, task_id, name) != "died-mid-work":
+                    continue
+                try:
+                    os.rename(name, task_id + PENDING_SUFFIX, src_dir_fd=dfd, dst_dir_fd=dfd)
+                except FileNotFoundError:
+                    continue
+                released.append(task_id)
     return released
+
+
+def classify_residue(has_flag: bool, has_result: bool, sentinel_name: Optional[str],
+                     payload: bool, archived: bool) -> str:
+    """Pure delivery classification shared by boot sweeps and dead-session recovery."""
+    # The flag is terminal on its own: the bridge drains the result file on
+    # delivery, so after a drain the flag is the only durable evidence left.
+    if has_flag:
+        return "finished"
+    if has_result:
+        return "completed"
+    if sentinel_name is None:
+        if payload and not archived:
+            return "undelivered"
+        return "clean"
+    if not payload:
+        return "stale-sentinel"
+    return "died-mid-work" if parse_sentinel(sentinel_name)[1] else "pending"
+
+
+def _residue_state(ws: Path, recipient: str, task_id: str, sentinel_name: Optional[str]) -> str:
+    return classify_residue(
+        is_done_flag(done_flag(ws, recipient, task_id)),
+        find_ready_result(results_dir(ws), task_id) is not None,
+        sentinel_name, payload_path(ws, task_id).is_file(),
+        archived_payload(ws, task_id).is_file())
 
 
 def residue(workspace: Path, recipient: str, task_id: str) -> str:
@@ -387,28 +426,8 @@ def residue(workspace: Path, recipient: str, task_id: str) -> str:
     One name per state, each mapped by `sweep` to exactly one action.
     """
     ws = Path(workspace)
-    # The shared readiness contract, not existence: an empty or whitespace-only
-    # file is a placeholder still being written, and must not suppress recovery.
-    has_result = find_ready_result(results_dir(ws), task_id) is not None
-    # Through the predicate, not is_file(): that FOLLOWS a symlink, and this
-    # verdict is what `sweep` deletes on, so a planted link would retire real work.
-    has_flag = is_done_flag(done_flag(ws, recipient, task_id))
     sentinel = find(ws, recipient, task_id)
-    payload = payload_path(ws, task_id).is_file()
-
-    # The flag is terminal on its own: the bridge drains the result file on
-    # delivery, so after a drain the flag is the only durable evidence left.
-    if has_flag:
-        return "finished"
-    if has_result:
-        return "completed"
-    if sentinel is None:
-        if payload and not archived_payload(ws, task_id).is_file():
-            return "undelivered"
-        return "clean"
-    if not payload:
-        return "stale-sentinel"
-    return "died-mid-work" if parse_sentinel(sentinel.name)[1] else "pending"
+    return _residue_state(ws, recipient, task_id, sentinel.name if sentinel else None)
 
 
 def prune_spent(workspace: Path, recipient: str) -> dict:
