@@ -1,4 +1,5 @@
 import { expect, mock, test } from 'claude-code/testing'
+import { CONTRACT, CONTRACT_NAMES } from './cli-contract'
 
 const WATCH = 'mcp__ag2space-inbox__ag2space_inbox_watch'
 const REPLY = 'mcp__ag2space-inbox__ag2space_reply'
@@ -12,22 +13,27 @@ const TASK = (id: string, tier = 'owner', extra = '') =>
 const FRAMED = (msg: string) => `The ag2space-inbox plugin sent a message:\n${msg}\n\nThis is how Claude Code surfaces ` +
   "a prompt a plugin submits between turns \u2014 it starts this turn in the user's place. Address the message above."
 
+const INTERRUPTED = '[AG2 Space] This attempt was interrupted before the session answered; send the request again if it is still wanted.'
+
 type Claim = { attempt: number; phase: string; token?: string; hash?: string; turnId?: string; body?: string; staged?: string
                 blobOk?: boolean }
 
-// An in-memory host: fs, process (the verifier's "<verdict> <tier> <collab>" line, the text hash, and
+// An in-memory host: fs, process (the verifier's "<verdict> <tier> <collab> <key digest>" line, the text hash, and
 // the inbox CLI's verbs over an in-memory claim store), clock, env, prompt sink, session id. Tier and
 // collaborator come from a plain read of the stdin text; the real rule is pinned to Sparrow's by
 // tests/test_claude_code_adapter.py, and the lifecycle verbs by the Python inbox tests.
 function host(on: any, opts: { verdict?: string; env?: Record<string, string>; rejectSubmits?: number; verifierFails?: boolean; markerFails?: number;
+                               strict?: boolean; lenient?: boolean; keyProblem?: string; policyFails?: number;
+                               keySwap?: { from: string; to: string; signedWith: string };
                                progressFails?: number; sessionIds?: string[]; cwdInode?: string; allowNonOwner?: boolean;
                                claimAs?: Record<string, unknown>; interruptParks?: number; interruptThrows?: number;
                                interruptSoft?: Record<string, string | number>; stuckAtStart?: Record<string, unknown>;
-                               unstuckFails?: number; clearFails?: Record<string, string>; stuckWriteFails?: number;
+                               unstuckFails?: number; unstuckHardFails?: number; unstuckThrows?: number; clearFails?: Record<string, string>; stuckWriteFails?: number;
                                lockFailsOnce?: string[]; storeFailsOnce?: string[]; unreadableOnce?: string[];
                                committedHardOnce?: string[]; committedHardWhy?: string; stageLandsOnce?: boolean;
                                parkRefusedOnce?: boolean; authorizeLostOnce?: boolean; stageLinkFailsOnce?: boolean;
-                               parkAlwaysRefuses?: boolean; stageThrows?: number } = {}) {
+                               lostTurnFsyncFails?: number;
+                               parkAlwaysRefuses?: boolean; parkRefuses?: number; authorizeRetries?: number; stageThrows?: number } = {}) {
   const files: Record<string, string> = {}
   const submitted: string[] = []
   const runs: string[][] = []
@@ -41,22 +47,38 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
   let failVerb = ''
   let marks = 0
   let markerFailLeft = opts.markerFails ?? 0
+  let policyFailLeft = opts.policyFails ?? 0
+  // The key file as a digest ('absent' when there is none); with keySwap it changes right after the first
+  // verifier read, so the policy's read sees another key than the verdict was made with.
+  let keyNow = opts.keySwap?.from ?? 'absent'
   let parksLeft = opts.interruptParks ?? 0
   let throwsLeft = opts.interruptThrows ?? 0
   const softLeft: Record<string, string | number> = { ...(opts.interruptSoft ?? {}) }
   // The plugin record's stuck marks: durable across Mod starts, returned by every progress reply.
   const stuck: Record<string, unknown> = { ...(opts.stuckAtStart ?? {}) }
   let unstuckFailsLeft = opts.unstuckFails ?? 0
+  let unstuckHardLeft = opts.unstuckHardFails ?? 0
+  let unstuckThrowsLeft = opts.unstuckThrows ?? 0
   let stuckWriteFailsLeft = opts.stuckWriteFails ?? 0
-  const lockFails = new Set(opts.lockFailsOnce ?? [])
+  // A verb named twice fails twice: one failure the reply consumes, one the turn's end then meets.
+  const lockFails = new Map<string, number>()
+  for (const v of opts.lockFailsOnce ?? []) lockFails.set(v, (lockFails.get(v) ?? 0) + 1)
+  const lockFailsNow = (verb: string) => {
+    const n = lockFails.get(verb) ?? 0
+    if (n > 1) lockFails.set(verb, n - 1); else lockFails.delete(verb)
+    return n > 0
+  }
   const storeFails = new Set(opts.storeFailsOnce ?? [])
   const unreadable = new Set(opts.unreadableOnce ?? [])
   const committedHard = new Set(opts.committedHardOnce ?? [])
   let stageLands = opts.stageLandsOnce ?? false
   let parkRefused = opts.parkRefusedOnce ?? false
+  let parkRefusesLeft = opts.parkRefuses ?? 0
+  let authorizeRetriesLeft = opts.authorizeRetries ?? 0
   let authorizeLost = opts.authorizeLostOnce ?? false
   let stageLinkFails = opts.stageLinkFailsOnce ?? false
   let stageThrowsLeft = opts.stageThrows ?? 0
+  let lostTurnFsyncLeft = opts.lostTurnFsyncFails ?? 0
   let publishes = 0
   const committedHardWhy = opts.committedHardWhy ?? 'OSError: unlock I/O error'
   const clearFailsLeft: Record<string, string> = { ...(opts.clearFails ?? {}) }
@@ -89,8 +111,11 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
     const b = files[`/out/${task}.txt`]
     return b === undefined ? 'ABSENT' : b.trim() && !b.includes('\uFFFD') ? 'LIVE_READY' : 'LIVE_UNREADY'
   }
+  // The lifecycle's resolved(): the claim SETTLED, or a terminal result (live and ready, or archived).
+  const resolvedTask = (task: string) => claims[task]?.phase === 'SETTLED' || result(task) === 'LIVE_READY' ||
+    `/out/archive/${task}.txt` in files
   const out = (exitCode: number, data: any) => ({ value: { exitCode, stdout: JSON.stringify(data) + '\n', stderr: '' } })
-  on('process.run', (_: any, e: any) => {
+  const run = (_: any, e: any) => {
     runs.push([...e.argv])
     const argv: string[] = e.argv
     if (argv[0] === 'python3' && argv[2].includes('hmac')) {
@@ -98,7 +123,10 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
       const text: string = e.init.stdin
       const tier = (text.match(/^access_tier: (\S+)/m)?.[1] ?? 'owner')
       const collab = text.includes('\ncollaborator: true\n') ? 'true' : 'false'
-      return { value: { exitCode: 0, stdout: `${opts.verdict ?? 'verified'} ${tier} ${collab}\n`, stderr: '' } }
+      const seen = keyNow, sw = opts.keySwap
+      if (sw) keyNow = sw.to
+      const verdict = !sw ? opts.verdict ?? 'verified' : seen === 'absent' ? 'unverifiable' : seen === sw.signedWith ? 'verified' : 'invalid'
+      return { value: { exitCode: 0, stdout: `${verdict} ${tier} ${collab} ${seen}\n`, stderr: '' } }
     }
     if (argv[0] === 'python3' && argv[2].includes('secrets')) {
       if (markerFailLeft-- > 0) return { value: { exitCode: 1, stdout: '', stderr: 'python3: not found' } }
@@ -108,11 +136,12 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
     if (argv[2] === 'interrupt') interruptAt.push(sidReads)
     if (argv[2] === 'stage' && stageThrowsLeft-- > 0) throw new Error('spawn failed')      // the CLI did not run
     if (argv[2] === 'interrupt' && throwsLeft-- > 0) throw new Error('spawn failed')
+    if (argv[2] === 'progress' && argv.includes('--unstuck') && unstuckThrowsLeft-- > 0) throw new Error('spawn failed')
     if (argv[0] !== 'ag2-sparrow-claude-local' || argv[1] !== 'inbox') return { value: { exitCode: 2, stdout: '', stderr: 'unknown' } }
     const verb = argv[2]
     const task = argv[3]
     // As the CLI's claims-step boundary: an EIO before the step commits is a retry, nothing changed.
-    if (lockFails.delete(verb)) return out(1, { refused: 'the step did not commit ([Errno 5] claims lock I/O error); retried', retry: true })
+    if (lockFailsNow(verb)) return out(1, { refused: 'the step did not commit ([Errno 5] claims lock I/O error); retried', retry: true })
     if (verb === 'authorize' && committedHard.delete('authorize')) {
       // As the CLI: the authorization committed, then the lock's release or the rename's fsync failed.
       const c0 = claims[task]
@@ -126,11 +155,15 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
     if (verb === 'progress') {
       if (progressFailLeft-- > 0) return out(3, { error: 'progress write failed: disk', hard: true })
       if (argv.includes('--unstuck') && unstuckFailsLeft-- > 0) return out(1, { refused: 'progress lock busy' })
+      // As the CLI: a RecordError on the progress write is exit 3, hard.
+      if (argv.includes('--unstuck') && unstuckHardLeft-- > 0) return out(3, { error: 'progress write failed: RecordError: EIO', hard: true })
       if (argv.includes('--stuck') && stuckWriteFailsLeft-- > 0) return out(3, { error: 'progress write failed: progress.lock: EIO', hard: true })
       progress.push(argv.slice(3))
       const add = argv.indexOf('--stuck'), del = argv.indexOf('--unstuck')
       if (add > 0) stuck[argv[add + 1]] = stuck[argv[add + 1]] ?? { since: 1 }
       if (del > 0) delete stuck[argv[del + 1]]
+      // As the CLI (unresolved_stuck): a write keeps only the marks of unresolved tasks.
+      if (add > 0 || del > 0) for (const k of Object.keys(stuck)) if (resolvedTask(k)) delete stuck[k]
       return out(0, { ok: true, stuck: { ...stuck } })
     }
     if (verb === 'check-inode') return argv[argv.indexOf('--expect') + 1] === (opts.cwdInode ?? '1:1') ? out(0, { inode: '1:1' }) : out(1, { refused: 'inode mismatch' })
@@ -139,6 +172,21 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
       const fail = progressFailLeft-- > 0 || failVerb === verb
       if (failVerb === verb) failVerb = ''
       return fail ? out(3, { ...data, hard: true, error: 'progress write failed: disk' }) : out(0, data)
+    }
+    if (verb === 'envelope') {
+      // As the CLI's hmac_policy.decide (pinned in Python): strict submits verified only, and nothing while the key
+      // file is missing or malformed; invalid is never submitted; an unreadable config is a retry.
+      if (policyFailLeft-- > 0) return out(1, { refused: 'the installed config is unreadable (EIO); retried', retry: true })
+      const verdict = argv[argv.indexOf('--verdict') + 1]
+      const at = argv.indexOf('--key-seen')
+      if (at > 0 && argv[at + 1] !== keyNow) {
+        return out(0, { verdict, mode: opts.strict ? 'strict' : opts.lenient ? 'lenient' : 'off', submit: false, retry: true,
+                        reason: 'the key file changed after this envelope was verified; verified again' })
+      }
+      const keyProblem = opts.keySwap ? (keyNow === 'absent' ? '/k/task-hmac.key missing' : '') : opts.keyProblem
+      const reason = verdict === 'invalid' ? 'envelope invalid' : !opts.strict ? '' : keyProblem ? `strict mode: ${keyProblem}`
+        : verdict !== 'verified' ? `strict mode: envelope ${verdict}` : ''
+      return out(0, { verdict, mode: opts.strict ? 'strict' : opts.lenient ? 'lenient' : 'off', submit: !reason, reason, retry: verdict !== 'invalid' && !!(opts.strict && keyProblem) })
     }
     if (verb === 'claim') {
       if (result(task) === 'LIVE_READY') {
@@ -152,6 +200,18 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
       }
       if (result(task) === 'LIVE_UNREADY') return out(1, { refused: `${task} is LIVE_UNREADY, not claimable yet; retried`, retry: true })
       const c = claims[task]
+      if (c && ((c.phase === 'TURN_CONFIRMED' && c.staged === undefined) || c.phase === 'RESULT_STAGED')) {
+        // As the CLI's lost-turn claim: interrupted in one durable transition to RESULT_STAGED, then published.
+        if (c.phase === 'TURN_CONFIRMED') {
+          c.phase = 'RESULT_STAGED'; c.body = INTERRUPTED
+          if (lostTurnFsyncLeft-- > 0) {
+            return out(3, { task_id: task, phase: 'RESULT_STAGED', hard: true,
+                            error: 'the step committed (claim.json was replaced, then its directory fsync failed)' })
+          }
+        }
+        c.phase = 'SETTLED'; files[`/out/${task}.txt`] = c.body!; publishes++
+        return out(1, { refused: `${task}: its staged answer is published now; only ABSENT may be submitted` })
+      }
       if (c && c.phase !== 'PREPARED') return out(1, { refused: `${task}: attempt ${c.attempt} is ${c.phase}` })
       // The CLI's admission (task_io.admission, pinned in Python): no tier is malformed; non-owners need the flag.
       const text = files[`/in/${task}.txt`] ?? ''
@@ -168,6 +228,7 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
     }
     const c = claims[task]
     if (verb === 'authorize') {
+      if (authorizeRetriesLeft-- > 0) return out(1, { refused: `${task}: not authorized yet (claims lock busy); retried`, retry: true })
       const reqHash = argv[argv.indexOf('--text-hash') + 1]
       // As the CLI: the same request again gets the same token back; any other text gets none.
       if (c && c.phase === 'CALLING' && c.attempt === Number(argv[4]) && c.hash === reqHash) return answer({ task_id: task, token: c.token })
@@ -229,27 +290,34 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
       return answer({ ...done, answered: true, interrupted: true })
     }
     if (verb === 'park') {
-      if (!c || c.phase !== 'TURN_CONFIRMED' || c.turnId !== argv[4]) return out(1, { refused: 'not this turn' })
-      if (parkRefused || opts.parkAlwaysRefuses) { parkRefused = false; return out(1, { refused: `${task}: publication parked` }) }
-      // As the CLI: a recorded descriptor with no verifying blob parks every time, until an identical stage.
-      if (c.staged !== undefined && !c.blobOk) return out(1, { refused: `${task}: publication parked` })
-      if (c.staged !== undefined) {         // an accepted answer: the CLI publishes it, never the protocol failure
+      // As the CLI: an accepted answer (its descriptor recorded) is published whatever the turn, never the failure.
+      const accepted = !!c && c.staged !== undefined && (c.phase === 'TURN_CONFIRMED' || c.phase === 'RESULT_STAGED')
+      if (!accepted && (!c || c.phase !== 'TURN_CONFIRMED' || c.turnId !== argv[4])) return out(1, { refused: 'not this turn' })
+      if (parkRefused || opts.parkAlwaysRefuses || parkRefusesLeft-- > 0) { parkRefused = false; return out(1, { refused: `${task}: publication parked` }) }
+      // A recorded descriptor with no verifying blob is retried every time, until an identical stage.
+      if (accepted && !c!.blobOk) return out(1, { refused: `${task}: the accepted answer's staging has not finished; retried`, retry: true })
+      if (accepted) {
         c.phase = 'SETTLED'; c.body = c.staged; files[`/out/${task}.txt`] = c.body; publishes++
         return out(0, { outcome: 'settled', parked: false })
       }
       c.phase = 'SETTLED'; c.body = `[AG2 Space] The session's turn ended without a reply (${argv[argv.indexOf('--detail') + 1]})`
       files[`/out/${task}.txt`] = c.body; publishes++
-      return out(0, { outcome: 'settled', parked: true })
+      return out(0, { outcome: 'settled', parked: argv[argv.indexOf('--detail') + 1] })
     }
     return out(2, { refused: 'unknown verb' })
-  })
+  }
+  on('process.run', run)
   on('prompt.submit', (_: any, e: any) => {
     if (rejectLeft-- > 0) throw new Error('session busy')
     submitted.push(e.text); return { text: e.text }
   })
   return { files, submitted, runs, claims, progress, clock, hash, interruptAt, logs, stuck, publishes: () => publishes, setSid: (sid: string) => { live.sid = sid },
     failProgress: (n: number) => { progressFailLeft = n },
-    failAt: (verb: string) => { failVerb = verb } }
+    failAt: (verb: string) => { failVerb = verb },
+    refuseUnstuck: (n: number) => { unstuckFailsLeft = n }, hardUnstuck: (n: number) => { unstuckHardLeft = n }, refusePark: () => { parkRefused = true },
+    lockOnce: (verb: string) => { lockFails.set(verb, (lockFails.get(verb) ?? 0) + 1) }, setKey: (digest: string) => { keyNow = digest }, failStageLink: () => { stageLinkFails = true },
+    // The fake CLI called directly, as the Mod calls it: the contract test's handle.
+    cli: (argv: string[], stdin = '') => run(null, { argv: ['ag2-sparrow-claude-local', 'inbox', ...argv], init: { stdin } }) }
 }
 
 async function arm($: any, h: any, args: Record<string, string> = { inbox_dir: '/in', results_dir: '/out' }) {
@@ -265,6 +333,7 @@ test('each new task-*.txt is claimed, authorized and submitted once, wrapped in 
   h.files['/in/notes.txt'] = 'not a task'
   const armed = await arm($, h)
   expect(String(armed.text ?? armed.result)).toContain('Watching /in')
+  expect(String(armed.text ?? armed.result)).toContain('mode off, decided per task by the CLI')
   await h.clock.advance(1000)
   expect(h.submitted.length).toBe(1)
   const msg = h.submitted[0]
@@ -273,7 +342,7 @@ test('each new task-*.txt is claimed, authorized and submitted once, wrapped in 
   expect(msg).not.toContain(NOTE_START)
   expect(h.claims['task-a1'].phase).toBe('CALLING')
   expect(h.claims['task-a1'].hash).toBe(h.hash(msg))
-  expect(verbs(h)).toEqual(['progress', 'claim', 'authorize'])
+  expect(verbs(h)).toEqual(['progress', 'envelope', 'envelope', 'claim', 'authorize'])
   await h.clock.advance(3000)
   expect(h.submitted.length).toBe(1)
   expect(msg.endsWith(`Reply only with the ag2space_reply tool (task_id task-a1); it publishes results/task-a1.txt for you, so do not write that file yourself. [submission ${'0'.repeat(15)}1]`)).toBe(true)
@@ -403,7 +472,7 @@ test('a verifier that cannot run submits nothing and is retried', async ($, on) 
   await h.clock.advance(3000)
   expect(h.submitted.length).toBe(0)
   expect(h.runs.filter(a => a[0] === 'python3' && a[2].includes('hmac')).length).toBe(4)
-  expect(verbs(h)).toEqual(['progress'], 'no claim before a verdict')
+  expect(verbs(h)).toEqual(['progress', 'envelope'], 'no claim before a verdict (the one envelope call is the arm line\'s mode read)')
 })
 
 test('a tampered envelope is dropped; strict mode drops unsigned too', async ($, on) => {
@@ -415,12 +484,209 @@ test('a tampered envelope is dropped; strict mode drops unsigned too', async ($,
   expect(h.claims['task-x']).toBe(undefined)
 })
 
-test('strict mode submits only verified envelopes', async ($, on) => {
-  const h = host(on, { verdict: 'unsigned', env: { AG2_RESULTS_DIR: '/out', AG2_HMAC_STRICT: '1' } })
+test('strict mode submits only verified envelopes: the CLI decides per task, the Mod reads no strictness itself', async ($, on) => {
+  const h = host(on, { verdict: 'unsigned', strict: true, env: { AG2_RESULTS_DIR: '/out', AG2_HMAC_STRICT: '' } })
   h.files['/in/task-y.txt'] = TASK('task-y')
-  await arm($, h)
+  const armed = await arm($, h)
   await h.clock.advance(2000)
   expect(h.submitted.length).toBe(0)
+  expect(verbs(h).filter(v => v === 'claim')).toEqual([])
+  expect(h.logs.some(l => l.includes('task-y strict mode: envelope unsigned; not submitted'))).toBe(true)
+  expect(String(armed.text ?? armed.result)).toContain('mode strict, decided per task by the CLI')
+  expect(h.runs.some(a => a[0] === 'ag2-sparrow-claude-local' && a[2] === 'envelope' && a[4] === 'unsigned')).toBe(true)
+})
+
+test('strict mode with the key file gone refuses with the one reason line, never lenient, and holds the task until the key lands', async ($, on) => {
+  const o = { verdict: 'verified', strict: true, keyProblem: '/k/task-hmac.key missing: strict mode submits nothing until it is back' }
+  const h = host(on, o)
+  h.files['/in/task-k1.txt'] = TASK('task-k1')
+  await arm($, h)
+  for (let i = 0; i < 8; i++) await h.clock.advance(1000)
+  expect(h.submitted.length).toBe(0)
+  expect(verbs(h).filter(v => v === 'claim')).toEqual([])
+  // Held with backoff (tries at ticks 0, 1, 3, 7), never retired: one reason line per new delay, not per tick.
+  expect(verbs(h).filter(v => v === 'envelope').length).toBe(5)   // 4 tries and the arm line's read
+  expect(h.logs.filter(l => l.includes('task-k1 held by the envelope policy (strict mode: /k/task-hmac.key missing')).length).toBe(4)
+  o.keyProblem = ''                                   // the key lands: the next try submits it once, no reinstall
+  for (let i = 0; i < 8; i++) await h.clock.advance(1000)
+  expect(h.submitted.length).toBe(1)
+  expect(h.submitted[0]).toContain('envelope verified')
+  expect(h.claims['task-k1'].phase).toBe('CALLING')
+})
+
+test('an envelope policy the CLI could not answer is held with backoff, then submitted once it answers, never retired', async ($, on) => {
+  const h = host(on, { policyFails: 3 })
+  h.files['/in/task-p1.txt'] = TASK('task-p1')
+  await arm($, h)
+  await h.clock.advance(1000)                         // tries at ticks 0 and 1 fail; the next is at tick 3
+  expect(h.submitted.length).toBe(0)
+  expect(verbs(h).filter(v => v === 'envelope').length).toBe(3)   // the arm line's read and two tries
+  expect(verbs(h).filter(v => v === 'claim')).toEqual([])
+  await h.clock.advance(2000)
+  expect(h.submitted.length).toBe(1)
+  expect(h.submitted[0]).toContain('envelope verified')
+})
+
+// A task held past the stuck bound (key missing) whose final outcome, once the key lands, is terminal: the
+// durable mark is cleared before it is retired, for a verdict the policy refuses and for a delivered answer.
+const heldThenKeyLands = async ($: any, on: any, o: any) => {
+  const h = host(on, o)
+  h.files['/in/task-h1.txt'] = TASK('task-h1')
+  await arm($, h)
+  for (let i = 0; i < 400; i++) await h.clock.advance(1000)
+  expect(h.submitted.length).toBe(0)
+  expect(h.stuck).toEqual({ 'task-h1': { since: 1 } })
+  o.keyProblem = ''
+  if (o.landsAs) o.verdict = o.landsAs                // the verifier reads the key that landed
+  for (let i = 0; i < 70; i++) await h.clock.advance(1000)
+  return h
+}
+
+test('a task held past the stuck bound, refused as unsigned once the key lands, leaves no stuck mark behind', async ($, on) => {
+  const h = await heldThenKeyLands($, on, { verdict: 'unsigned', strict: true, keyProblem: '/k/task-hmac.key missing: strict mode submits nothing until it is back' })
+  expect(h.submitted.length).toBe(0)
+  expect(h.stuck).toEqual({})
+  expect(h.progress.filter((p: string[]) => p[0] === '--unstuck')).toEqual([['--unstuck', 'task-h1']])
+  expect(h.logs.filter(l => l.includes('task-h1 strict mode: envelope unsigned; not submitted')).length).toBe(1)
+  await h.clock.advance(5000)
+  expect(h.progress.filter((p: string[]) => p[0] === '--unstuck').length).toBe(1)   // retired: tried no more
+})
+
+test('a task held past the stuck bound, found signed under another key (invalid) once the key lands, leaves no stuck mark behind', async ($, on) => {
+  const h = await heldThenKeyLands($, on, { verdict: 'unverifiable', landsAs: 'invalid', strict: true, keyProblem: '/k/task-hmac.key missing: strict mode submits nothing until it is back' })
+  expect(h.submitted.length).toBe(0)
+  expect(h.stuck).toEqual({})
+  expect(h.progress.filter((p: string[]) => p[0] === '--unstuck')).toEqual([['--unstuck', 'task-h1']])
+})
+
+test('a task held past the stuck bound, verified once the key lands, is submitted and delivered with no stuck mark behind', async ($, on) => {
+  const h = await heldThenKeyLands($, on, { verdict: 'verified', strict: true, keyProblem: '/k/task-hmac.key missing: strict mode submits nothing until it is back' })
+  expect(h.submitted.length).toBe(1)
+  expect(h.stuck).toEqual({})                          // the claim's write cleared it
+  await $.turn.start({ turnId: 't1', text: FRAMED(h.submitted[0]) })
+  const r = await $.tool.call({ tool: REPLY, task_id: 'task-h1', text: 'done' })
+  expect(String(r.text ?? r.result)).toContain('ublished')
+  expect(h.files['/out/task-h1.txt']).toContain('done')
+  expect(h.stuck).toEqual({})
+})
+
+test('a held task whose stuck mark cannot be cleared at its terminal refusal stays retryable, never retired over a live mark', async ($, on) => {
+  const o = { verdict: 'unsigned', strict: true, keyProblem: '/k/task-hmac.key missing: strict mode submits nothing until it is back', unstuckFails: 2 }
+  const h = await heldThenKeyLands($, on, o)
+  for (let i = 0; i < 150; i++) await h.clock.advance(1000)   // the hold's delay is at its 60-tick cap by now
+  expect(h.submitted.length).toBe(0)
+  expect(h.stuck).toEqual({})                          // the third clear landed
+  expect(h.runs.filter((a: string[]) => a[2] === 'progress' && a.includes('--unstuck')).length).toBe(3)
+  expect(h.progress.filter((p: string[]) => p[0] === '--unstuck').length).toBe(1)   // the fake records only the one that landed
+  expect(h.logs.filter(l => l.includes('task-h1 strict mode: envelope unsigned; its stuck mark could not be cleared')).length).toBe(2)
+})
+
+// A stuck mark recorded before this Mod started (a session restart or plugin reload during a long hold) is
+// in the durable record but not in this Mod's memory: a terminal refusal still clears it before retiring.
+for (const verdict of ['unsigned', 'invalid']) {
+  test(`a stuck mark from before the Mod started is cleared when the task is refused as ${verdict} on the first scan`, async ($, on) => {
+    const h = host(on, { verdict, strict: true, keyProblem: '', stuckAtStart: { 'task-h1': { since: 1 } } })
+    h.files['/in/task-h1.txt'] = TASK('task-h1')
+    await arm($, h)
+    for (let i = 0; i < 10; i++) await h.clock.advance(1000)
+    expect(h.submitted.length).toBe(0)
+    expect(h.logs.some(l => l.includes(`task-h1 ${verdict === 'invalid' ? 'envelope invalid' : 'strict mode: envelope unsigned'}; not submitted`))).toBe(true)
+    expect(h.stuck).toEqual({})
+    expect(h.progress.filter((p: string[]) => p[0] === '--unstuck')).toEqual([['--unstuck', 'task-h1']])
+  })
+}
+
+test('a stuck mark from before the Mod started whose clear fails keeps the task retryable until the clear lands', async ($, on) => {
+  const h = host(on, { verdict: 'unsigned', strict: true, keyProblem: '', stuckAtStart: { 'task-h1': { since: 1 } }, unstuckFails: 2 })
+  h.files['/in/task-h1.txt'] = TASK('task-h1')
+  await arm($, h)
+  for (let i = 0; i < 10; i++) await h.clock.advance(1000)
+  expect(h.submitted.length).toBe(0)
+  expect(h.stuck).toEqual({})
+  expect(h.runs.filter((a: string[]) => a[2] === 'progress' && a.includes('--unstuck')).length).toBe(3)
+})
+
+// Every terminal retirement goes through one clear of the durable mark; until it is confirmed the task stays
+// owned by the Mod and is retried with the per-task backoff, whatever the failure: refused, exit 3, not run.
+test('a stuck-mark clear that fails hard 45 times is retried with backoff until it lands, then the task is retired once', async ($, on) => {
+  const h = host(on, { verdict: 'unsigned', strict: true, keyProblem: '', stuckAtStart: { 'task-x': { since: 1 } }, unstuckHardFails: 45 })
+  h.files['/in/task-x.txt'] = TASK('task-x')
+  await arm($, h)
+  for (let i = 0; i < 2700; i++) await h.clock.advance(1000)
+  expect(h.stuck).toEqual({})
+  expect(h.runs.filter((a: string[]) => a[2] === 'progress' && a.includes('--unstuck')).length).toBe(46)
+  expect(h.logs.filter(l => l.includes('task-x strict mode: envelope unsigned; not submitted')).length).toBe(1)
+  expect(h.submitted.length).toBe(0)
+  for (let i = 0; i < 100; i++) await h.clock.advance(1000)
+  expect(h.runs.filter((a: string[]) => a[2] === 'progress' && a.includes('--unstuck')).length).toBe(46)   // retired: no more
+})
+
+test('a stuck-mark clear whose CLI does not run is retried until it lands', async ($, on) => {
+  const h = host(on, { verdict: 'unsigned', strict: true, keyProblem: '', stuckAtStart: { 'task-x': { since: 1 } }, unstuckThrows: 3 })
+  h.files['/in/task-x.txt'] = TASK('task-x')
+  await arm($, h)
+  for (let i = 0; i < 20; i++) await h.clock.advance(1000)
+  expect(h.stuck).toEqual({})
+  expect(h.runs.filter((a: string[]) => a[2] === 'progress' && a.includes('--unstuck')).length).toBe(4)
+})
+
+test('a header id that does not match the file stem clears the stem\'s stuck mark before the file is retired', async ($, on) => {
+  const h = host(on, { stuckAtStart: { 'task-x': { since: 1 } } })
+  h.files['/in/task-x.txt'] = TASK('task-other')
+  await arm($, h)
+  for (let i = 0; i < 5; i++) await h.clock.advance(1000)
+  expect(h.submitted.length).toBe(0)
+  expect(h.stuck).toEqual({})
+  expect(h.progress.filter((p: string[]) => p[0] === '--unstuck')).toEqual([['--unstuck', 'task-x']])
+  expect(h.logs.some(l => l.includes('task-x header id task-other does not match the file stem; not submitted'))).toBe(true)
+})
+
+test('a refused stuck-mark clear is backed off: bounded attempts and no re-verification per tick', async ($, on) => {
+  const h = host(on, { verdict: 'unsigned', strict: true, keyProblem: '', unstuckFails: 100000 })
+  h.files['/in/task-z.txt'] = TASK('task-z')
+  await arm($, h)
+  for (let i = 0; i < 600; i++) await h.clock.advance(1000)
+  // 1, 2, 4 ... 32 then every 60 ticks: 16 attempts in 600 ticks, one verifier run and one policy read.
+  expect(h.runs.filter((a: string[]) => a[2] === 'progress' && a.includes('--unstuck')).length).toBeLessThanOrEqual(16)
+  expect(h.runs.filter((a: string[]) => a[0] === 'python3' && a[2].includes('hmac')).length).toBe(1)
+  expect(verbs(h).filter(v => v === 'envelope').length).toBe(2)   // the arm line's and the task's
+  expect(h.submitted.length).toBe(0)
+})
+
+// The verifier and the policy each read the key; the verdict carries the digest of the key it was made with,
+// and a policy read that finds another key holds the task to be verified again, never retires it.
+test('a signed task whose key lands between the verifier\'s read and the policy\'s is held, verified again and submitted', async ($, on) => {
+  const K = 'a'.repeat(64)
+  const h = host(on, { strict: true, keySwap: { from: 'absent', to: K, signedWith: K } })
+  h.files['/in/task-r1.txt'] = TASK('task-r1')
+  await arm($, h)
+  for (let i = 0; i < 5; i++) await h.clock.advance(1000)
+  expect(h.submitted.length).toBe(1)
+  expect(h.submitted[0]).toContain('envelope verified')
+  const asked = h.runs.filter((a: string[]) => a[2] === 'envelope' && a.includes('--key-seen'))
+  expect(asked.map((a: string[]) => [a[4], a[6]])).toEqual([['unverifiable', 'absent'], ['verified', K]])
+  expect(h.logs.some(l => l.includes('not submitted'))).toBe(false)
+})
+
+test('a signed task whose key is rotated between the verifier\'s read and the policy\'s is held, verified again and submitted', async ($, on) => {
+  const K1 = 'a'.repeat(64), K2 = 'b'.repeat(64)
+  const h = host(on, { strict: true, keySwap: { from: K1, to: K2, signedWith: K2 } })
+  h.files['/in/task-r2.txt'] = TASK('task-r2')
+  await arm($, h)
+  for (let i = 0; i < 5; i++) await h.clock.advance(1000)
+  expect(h.submitted.length).toBe(1)
+  const asked = h.runs.filter((a: string[]) => a[2] === 'envelope' && a.includes('--key-seen'))
+  expect(asked.map((a: string[]) => [a[4], a[6]])).toEqual([['invalid', K1], ['verified', K2]])
+})
+
+test('an envelope policy that never answers is marked stuck after 300 ticks like any other retained task, never skipped silently', async ($, on) => {
+  const h = host(on, { policyFails: 1000 })
+  h.files['/in/task-p2.txt'] = TASK('task-p2')
+  await arm($, h)
+  for (let i = 0; i < 400; i++) await h.clock.advance(1000)
+  expect(h.submitted.length).toBe(0)
+  expect(verbs(h).filter(v => v === 'envelope').length).toBeGreaterThan(8)   // still tried past the 30-tick stale bound
+  expect(h.progress.find((p: string[]) => p[0] === '--stuck')).toEqual(['--stuck', 'task-p2', '--stuck-detail', 'envelope policy unanswered: the installed config is unreadable (EIO); retried'])
 })
 
 test('a claim the CLI refuses (claimed, archived, quarantined, unreadable) never resubmits', async ($, on) => {
@@ -531,7 +797,7 @@ test('the inode check: the held inbox arms and submits', async ($, on) => {
   await $.session.start({ surface: 'terminal', isInteractive: false, cwd: '/w' })
   await ok.clock.advance(1000)
   expect(ok.submitted.length).toBe(1)
-  expect(verbs(ok)).toEqual(['progress', 'check-inode', 'claim', 'authorize'])
+  expect(verbs(ok)).toEqual(['progress', 'check-inode', 'envelope', 'envelope', 'claim', 'authorize'])
 })
 
 test('the session-id witness: recorded at session.start; a changed id at turn.start stops intake', async ($, on) => {
@@ -1070,6 +1336,179 @@ test('an undeliverable ended turn backs off, is marked stuck, and never holds in
   expect(h.progress.find((p: string[]) => p[0] === '--stuck' && p[1] === 'task-p1')).toBeDefined()
 })
 
+test('a turn-end delivery that lands after the stuck bound keeps its mark owned until the clear is confirmed', async ($, on) => {
+  const h = host(on, { parkRefuses: 12, unstuckFails: 2 })
+  h.files['/in/task-p1.txt'] = TASK('task-p1')
+  await arm($, h)
+  await h.clock.advance(1000)
+  await $.turn.start({ text: h.submitted[0], turnId: 't-p1' })
+  await $.turn.complete({ turnId: 't-p1', reason: 'completed', text: '' } as any)
+  for (let i = 0; i < 900; i++) await h.clock.advance(1000)
+  expect(h.files['/out/task-p1.txt']).toContain('without a reply')
+  expect(h.progress.find((p: string[]) => p[0] === '--stuck' && p[1] === 'task-p1')).toBeDefined()
+  expect(h.stuck).toEqual({})                                          // the third clear landed
+  expect(h.runs.filter((a: string[]) => a[2] === 'progress' && a.includes('--unstuck') && a.includes('task-p1')).length).toBe(3)
+})
+
+// A mark acquired while the authorization was retried (past the stuck bound) is the offer's to clear: every way
+// an offer is released goes through the one mark clear, whoever wrote the mark.
+const authStuck = async ($: any, on: any, id: string) => {
+  const h = host(on, { authorizeRetries: 12 })
+  h.files[`/in/${id}.txt`] = TASK(id)
+  await arm($, h)
+  for (let i = 0; i < 700 && !h.submitted.length; i++) await h.clock.advance(1000)
+  expect(h.submitted.length).toBe(1)
+  expect(h.progress.find((p: string[]) => p[0] === '--stuck' && p[1] === id)).toBeDefined()
+  expect(h.stuck[id]).toBeDefined()
+  return h
+}
+
+test('a stuck mark from authorization retries is cleared when the offer is parked at an immediate turn end', async ($, on) => {
+  const h = await authStuck($, on, 'task-auth-stuck')
+  await $.turn.start({ text: FRAMED(h.submitted[0]), turnId: 't-a' })
+  await $.turn.complete({ turnId: 't-a', reason: 'completed', text: '' } as any)
+  expect(h.files['/out/task-auth-stuck.txt']).toContain('without a reply')
+  expect(h.stuck).toEqual({})
+})
+
+test('a stuck mark from authorization retries is cleared when the offer is published by a direct reply', async ($, on) => {
+  const h = await authStuck($, on, 'task-auth-reply')
+  await $.turn.start({ text: FRAMED(h.submitted[0]), turnId: 't-b' })
+  const r = await $.tool.call({ tool: REPLY, task_id: 'task-auth-reply', text: 'done' })
+  expect(String(r.text ?? r.result)).toContain('Published')
+  expect(h.stuck).toEqual({})
+})
+
+// Every offer-release path, each with a mark seeded after submission (whatever wrote it), and a clear that is
+// refused once: the mark is cleared through the backed-off clear, never left behind.
+// The unconfirmed turn is the exception: its claim stays CALLING with no answer, so its mark is kept.
+const RELEASES: Record<string, (args: { $: any; h: any; msg: string }) => Promise<void>> = {
+  'park at the turn end': async ({ $, msg }) => {
+    await $.turn.start({ text: FRAMED(msg), turnId: 't1' })
+    await $.turn.complete({ turnId: 't1', reason: 'completed', text: '' } as any)
+  },
+  'direct reply': async ({ $, msg }) => {
+    await $.turn.start({ text: FRAMED(msg), turnId: 't1' })
+    await $.tool.call({ tool: REPLY, task_id: 'task-s', text: 'ok' })
+  },
+  'accepted answer delivered at the turn end': async ({ $, h, msg }) => {
+    await $.turn.start({ text: FRAMED(msg), turnId: 't1' })
+    h.failStageLink()                                  // accepted, not staged yet: delivered at the turn end
+    const r = await $.tool.call({ tool: REPLY, task_id: 'task-s', text: 'ok' })
+    expect(String(r.text ?? r.result)).toContain('stage refused')
+    await $.turn.complete({ turnId: 't1', reason: 'completed', text: '' } as any)
+  },
+  'delivery retried by the scan': async ({ $, h, msg }) => {
+    await $.turn.start({ text: FRAMED(msg), turnId: 't1' })
+    h.refusePark()
+    await $.turn.complete({ turnId: 't1', reason: 'completed', text: '' } as any)
+    await h.clock.advance(3000)
+  },
+  'turn end after a late confirmation': async ({ $, h, msg }) => {
+    h.lockOnce('confirm')
+    await $.turn.start({ text: FRAMED(msg), turnId: 't1' })
+    await $.turn.complete({ turnId: 't1', reason: 'completed', text: '' } as any)
+    await h.clock.advance(1000)
+  },
+  'turn not confirmed': async ({ $, h, msg }) => {
+    h.claims['task-s'].token = 'another'
+    await $.turn.start({ text: FRAMED(msg), turnId: 't1' })
+  },
+}
+for (const [path, drive] of Object.entries(RELEASES)) {
+  test(`an offer released by ${path} clears the task's stuck mark, retried until confirmed (kept if unanswered)`, async ($, on) => {
+    const h = host(on)
+    h.files['/in/task-s.txt'] = TASK('task-s')
+    await arm($, h)
+    await h.clock.advance(1000)
+    expect(h.submitted.length).toBe(1)
+    h.stuck['task-s'] = { since: 1 }
+    h.refuseUnstuck(1)
+    await drive({ $, h, msg: h.submitted[0] })
+    for (let i = 0; i < 10; i++) await h.clock.advance(1000)
+    const keeps = path === 'turn not confirmed'
+    expect(h.files['/out/task-s.txt'] !== undefined).toBe(!keeps)
+    expect(h.stuck).toEqual(keeps ? { 'task-s': { since: 1 } } : {})
+    expect(h.runs.filter((a: string[]) => a[2] === 'progress' && a.includes('--unstuck') && a.includes('task-s')).length).toBe(keeps ? 0 : 2)
+  })
+}
+
+// The CLI refuses to claim a CALLING attempt as final (cli-contract.ts, "claim after an unconfirmed turn"), so the
+// Mod never asks it again while the claim is unanswered: it holds the offer and waits for a result.
+test('an unconfirmed turn keeps the task and its stuck mark, never re-claimed, until the next start answers it; then it is retired once', async ($, on) => {
+  const h = host(on)
+  h.files['/in/task-u.txt'] = TASK('task-u')
+  await arm($, h)
+  await h.clock.advance(1000)
+  h.stuck['task-u'] = { since: 1 }
+  h.claims['task-u'].token = 'another'                 // the confirmation is refused: the claim stays CALLING
+  await $.turn.start({ text: FRAMED(h.submitted[0]), turnId: 't-u' })
+  for (let i = 0; i < 20; i++) await h.clock.advance(1000)
+  expect(h.claims['task-u'].phase).toBe('CALLING')
+  expect(h.files['/out/task-u.txt']).toBe(undefined)
+  expect(h.stuck).toEqual({ 'task-u': { since: 1 } })  // the unanswered alarm stays visible
+  expect(verbs(h).filter(v => v === 'claim').length).toBe(1)   // held, never claimed again while unanswered
+  expect(h.runs.filter((a: string[]) => a.includes('--unstuck')).length).toBe(0)
+  // The next start answers the CALLING claim as interrupted (the generation's recovery): settled, result written.
+  h.claims['task-u'].phase = 'SETTLED'
+  h.files['/out/task-u.txt'] = '[AG2 Space] This attempt was interrupted before the session answered\n'
+  for (let i = 0; i < 70; i++) await h.clock.advance(1000)
+  expect(h.stuck).toEqual({})
+  expect(h.runs.filter((a: string[]) => a.includes('--unstuck') && a.includes('task-u')).length).toBe(1)
+  expect(verbs(h).filter(v => v === 'claim').length).toBe(1)   // never claimed again: the mark's reply decides
+  const claims = verbs(h).filter(v => v === 'claim').length
+  for (let i = 0; i < 70; i++) await h.clock.advance(1000)
+  expect(verbs(h).filter(v => v === 'claim').length).toBe(claims)   // retired: tried no more
+  expect(h.submitted.length).toBe(1)
+})
+
+test('an unconfirmed turn answered during its backoff and archived before the next try is still released, its mark cleared once', async ($, on) => {
+  const h = host(on)
+  h.files['/in/task-race.txt'] = TASK('task-race')
+  await arm($, h)
+  await h.clock.advance(1000)
+  h.stuck['task-race'] = { since: 1 }                 // marked while it was held (any writer)
+  h.claims['task-race'].token = 'another'
+  await $.turn.start({ text: FRAMED(h.submitted[0]), turnId: 't-r' })
+  await h.clock.advance(1000)
+  await h.clock.advance(1000)                          // two tries with no answer: backed off
+  expect(h.stuck['task-race']).toBeDefined()
+  // During the backoff the next start settles the claim and writes the answer; the gateway archives it at once.
+  h.claims['task-race'].phase = 'SETTLED'
+  h.files['/out/archive/task-race.txt'] = '[AG2 Space] This attempt was interrupted before the session answered\n'
+  expect(h.files['/out/task-race.txt']).toBe(undefined)
+  for (let i = 0; i < 10; i++) await h.clock.advance(1000)
+  expect(h.stuck).toEqual({})
+  expect(h.runs.filter((a: string[]) => a.includes('--unstuck') && a.includes('task-race')).length).toBe(1)
+  const r = await $.tool.call({ tool: REPLY, task_id: 'task-race', text: 'late' })
+  expect(String(r.text ?? r.result)).toContain('is not a task this session received')   // released
+  const n = h.runs.length
+  for (let i = 0; i < 70; i++) await h.clock.advance(1000)
+  expect(h.runs.slice(n).filter((a: string[]) => a.includes('task-race')).length).toBe(0)   // retired once
+})
+
+test('a release clear that fails hard inside the scan ends that scan: nothing else is claimed or authorized in the tick', async ($, on) => {
+  const h = host(on)
+  h.files['/in/task-s.txt'] = TASK('task-s')
+  await arm($, h)
+  await h.clock.advance(1000)
+  await $.turn.start({ text: FRAMED(h.submitted[0]), turnId: 't1' })
+  h.refusePark()
+  await $.turn.complete({ turnId: 't1', reason: 'completed', text: '' } as any)
+  h.files['/in/task-t.txt'] = TASK('task-t')
+  h.hardUnstuck(1)
+  const before = h.runs.length
+  await h.clock.advance(1000)                         // the scan's park lands; its release clear exits 3
+  const tick = h.runs.slice(before).filter((a: string[]) => a[1] === 'inbox').map((a: string[]) => a[2])
+  expect(h.files['/out/task-s.txt']).toContain('without a reply')
+  expect(tick).toContain('park')
+  expect(tick.includes('claim') || tick.includes('authorize')).toBe(false)
+  expect(h.logs.some(l => l.includes('intake STOPPED'))).toBe(true)
+  for (let i = 0; i < 10; i++) await h.clock.advance(1000)
+  expect(h.submitted.length).toBe(2)                  // intake reopened by a durable write: task-t goes through
+  expect(h.stuck).toEqual({})
+})
+
 test('a pending authorization is dropped when its inbox file goes: a returning file is claimed afresh', async ($, on) => {
   const h = host(on, { authorizeLostOnce: true })
   h.files['/in/task-gone.txt'] = TASK('task-gone')
@@ -1117,7 +1556,8 @@ test('a session change while an accepted answer is still owed delivers that answ
 })
 
 test('a staged answer whose publish fails at the turn\'s end is retried by publish alone, never parked', async ($, on) => {
-  const h = host(on, { lockFailsOnce: ['publish'] })
+  // Two failures: the reply consumes the first, so the turn-end publish itself is the one that fails.
+  const h = host(on, { lockFailsOnce: ['publish', 'publish'] })
   h.files['/in/task-rs.txt'] = TASK('task-rs')
   await arm($, h)
   await h.clock.advance(1000)
@@ -1125,19 +1565,24 @@ test('a staged answer whose publish fails at the turn\'s end is retried by publi
   const r = await $.tool.call({ tool: REPLY, task_id: 'task-rs', text: 'staged answer' })
   expect(String(r.text ?? r.result)).toContain('call ag2space_reply again')
   await $.turn.complete({ turnId: 't-rs', reason: 'completed', text: '' } as any)
+  expect(verbs(h).filter((v: string) => v === 'publish').length).toBe(2)   // the turn's end published, and failed
+  expect(h.files['/out/task-rs.txt']).toBe(undefined)
   for (let i = 0; i < 5; i++) await h.clock.advance(1000)
   expect(h.files['/out/task-rs.txt']).toBe('staged answer\n')
   expect(verbs(h).filter((v: string) => v === 'park')).toEqual([])
+  expect(verbs(h).filter((v: string) => v === 'publish').length).toBe(3)   // the scan's retry delivered it
   expect(h.publishes()).toBe(1)
 })
 
-test('thirty failed unstuck writes never age a retained task out: the next one lands (stopped-intake path)', async ($, on) => {
+test('thirty failed unstuck writes never age a retained task out: backed off, the next one lands (stopped-intake path)', async ($, on) => {
   const h = host(on, { unstuckFails: 30, stuckAtStart: { 'task-s30': { since: 1 } } })
   await arm($, h)
   h.setSid('sid-2')
   await h.clock.advance(1000)
   h.files['/in/task-s30.txt'] = TASK('task-s30')
   for (let i = 0; i < 40; i++) await h.clock.advance(1000)
+  expect(h.runs.filter((a: string[]) => a.includes('--unstuck') && a.includes('task-s30')).length).toBe(6)   // 1, 2, 4 ... backoff
+  for (let i = 0; i < 1600; i++) await h.clock.advance(1000)
   expect(h.progress).toContainEqual(['--unstuck', 'task-s30'])
   expect(h.stuck).toEqual({})
   expect(h.runs.filter((a: string[]) => a.includes('--unstuck') && a.includes('task-s30')).length).toBe(31)
@@ -1182,10 +1627,10 @@ test('a progress write that fails at session.start closes intake; a later durabl
   await arm($, h)                                   // the session.start write fails (closed); the arming scan's reopen fails
   await h.clock.advance(1000)                        // the tick's reopen attempt fails too: nothing claimed
   expect(h.submitted.length).toBe(0)
-  expect(verbs(h)).toEqual(['progress', 'progress', 'progress'], 'closed: each scan only retries the progress write')
+  expect(verbs(h)).toEqual(['progress', 'envelope', 'progress', 'progress'], 'closed: each scan only retries the progress write (the envelope call is the arm line)')
   await h.clock.advance(1000)                        // the retry is durable: reopened, then the claim proceeds
   expect(h.submitted.length).toBe(1)
-  expect(verbs(h).slice(3)).toEqual(['progress', 'claim', 'authorize'])
+  expect(verbs(h).slice(4)).toEqual(['progress', 'envelope', 'claim', 'authorize'])
 })
 
 test('a progress write that fails at claim, authorize, confirm, stage or publish closes intake until a durable write', async ($, on) => {
@@ -1267,4 +1712,82 @@ test('without a submission marker nothing is authorized or submitted, and the ta
   await h.clock.advance(1000)
   expect(h.submitted.length).toBe(1)
   expect(h.submitted[0]).toContain('[submission ')
+})
+
+test('a lost turn whose interruption landed before its directory fsync failed is published by the next claim, never retired', async ($, on) => {
+  const h = host(on, { lostTurnFsyncFails: 1 })
+  h.files['/in/task-lt.txt'] = TASK('task-lt')
+  h.claims['task-lt'] = { attempt: 1, phase: 'TURN_CONFIRMED', turnId: 't-gone' }   // this generation's, the Mod lost it
+  await arm($, h)
+  await h.clock.advance(500)                           // the arming scan only: the claim answers hard, the task is kept
+  expect(verbs(h).filter((v: string) => v === 'claim').length).toBe(1)
+  expect(h.claims['task-lt'].phase).toBe('RESULT_STAGED')
+  expect(h.files['/out/task-lt.txt']).toBe(undefined)
+  expect(h.logs.some((l: string) => l.includes('intake STOPPED'))).toBe(true)
+  await h.clock.advance(1000)                          // intake reopens; the next claim publishes the durable body
+  expect(verbs(h).filter((v: string) => v === 'claim').length).toBe(2)
+  expect(h.files['/out/task-lt.txt']).toBe(INTERRUPTED)
+  expect(h.claims['task-lt'].phase).toBe('SETTLED')
+  expect(h.publishes()).toBe(1)
+  await h.clock.advance(5000)
+  expect(verbs(h).filter((v: string) => v === 'claim').length).toBe(2)   // retired only once answered
+  expect(h.submitted.length).toBe(0)
+})
+
+// Every scenario in cli-contract.ts, which tests/test_claude_code_adapter.py runs against the real verbs: the fake
+// answers each step with the same shape (exit, refused, retry, fields, keys), so it cannot drift from the CLI.
+test('the fake CLI answers every contract scenario as the real verbs do', async ($, on) => {
+  const o: any = { allowNonOwner: false }
+  const h = host(on, o)
+  const diffs: string[] = []
+  const ran: string[] = []
+  for (const sc of CONTRACT as any[]) {
+    ran.push(sc.name)
+    // The Python side records the same choice in the config and puts the key file in the same state.
+    o.lenient = sc.hmac === 'lenient'
+    o.strict = sc.hmac === 'strict'
+    o.keyProblem = sc.key === 'missing' ? '/k/task-hmac.key missing: strict mode submits nothing until it is back' : ''
+    h.setKey(sc.key === 'present' ? 'ab'.repeat(32) : 'absent')
+    h.files[`/in/${sc.task}.txt`] = TASK(sc.task, sc.tier)
+    if (sc.result !== undefined) h.files[`/out/${sc.task}.txt`] = sc.result
+    if (sc.archived !== undefined) h.files[`/out/archive/${sc.task}.txt`] = sc.archived
+    const saved: Record<string, string> = {}
+    sc.steps.forEach((step: any, i: number) => {
+      const argv = step.argv.map((a: string) => a.startsWith('{') ? (saved[a.slice(1, -1)] ?? a) : a)
+      const r = h.cli(argv, step.stdin ?? '').value
+      const data = JSON.parse(String(r.stdout || '{}'))
+      if (step.save && data[step.save] !== undefined) saved[step.save] = String(data[step.save])
+      const got = { exit: r.exitCode, refused: 'refused' in data, retry: data.retry === true }
+      const bad = (['exit', 'refused', 'retry'] as const).filter(k => got[k] !== step.expect[k]).map(k => `${k} ${got[k]} != ${step.expect[k]}`)
+      for (const [k, v] of Object.entries(step.expect.fields ?? {})) if (data[k] !== v) bad.push(`${k} ${JSON.stringify(data[k])} != ${JSON.stringify(v)}`)
+      for (const k of step.expect.has ?? []) if (!(k in data)) bad.push(`no ${k}`)
+      const reason = String(data.reason ?? '')
+      if (step.expect.reason_prefix !== undefined && !reason.startsWith(step.expect.reason_prefix)) bad.push(`reason ${JSON.stringify(reason)}`)
+      if (step.expect.reason_suffix !== undefined && !reason.endsWith(step.expect.reason_suffix)) bad.push(`reason ${JSON.stringify(reason)}`)
+      for (const k of step.expect.marked ?? []) if (!(k in (data.stuck ?? {}))) bad.push(`${k} not marked`)
+      for (const k of step.expect.unmarked ?? []) if (k in (data.stuck ?? {})) bad.push(`${k} still marked`)
+      if (bad.length) diffs.push(`${sc.name}, step ${i} ${argv[0]}: ${bad.join('; ')}`)
+    })
+  }
+  expect(diffs).toEqual([])
+  expect(scenarioSetProblem(ran)).toBe('')                // the pinned scenario set
+})
+
+// '' when `ran` is exactly the pinned scenario set (cli-contract.ts CONTRACT_NAMES), else what differs.
+function scenarioSetProblem(ran: string[]): string {
+  const want = CONTRACT_NAMES as string[]
+  if (JSON.stringify(ran) === JSON.stringify(want)) return ''
+  const missing = want.filter(n => !ran.includes(n)), extra = ran.filter(n => !want.includes(n))
+  return missing.length || extra.length ? `missing ${JSON.stringify(missing)}; extra ${JSON.stringify(extra)}` : 'order differs'
+}
+
+test('the contract set pin fails on a dropped or an extra scenario', async () => {
+  const names = (CONTRACT as any[]).map(sc => sc.name)
+  expect(names.length).toBe(31)
+  expect(scenarioSetProblem(names)).toBe('')
+  for (const i of [0, 17, names.length - 1]) {
+    expect(scenarioSetProblem(names.filter((_, j) => j !== i))).toContain(`missing ${JSON.stringify([names[i]])}`)
+  }
+  expect(scenarioSetProblem([...names, 'a new scenario'])).toContain('extra ["a new scenario"]')
+  expect(scenarioSetProblem([...names].reverse())).toBe('order differs')
 })

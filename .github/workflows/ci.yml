@@ -5,7 +5,8 @@ on:
   push:
     branches: [main]
 
-# Tests must never emit product telemetry (no PostHog writes from CI).
+# IMPORTANT: tests must never emit product telemetry; removing or weakening this makes CI test runs
+# count as real users on the admin DAU. Enforced by tests/telemetry-test-optout-guard.test.py.
 env:
   SUTANDO_TELEMETRY: "0"
 
@@ -261,6 +262,7 @@ jobs:
           timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_hatch_adapter.py
           timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_claude_code_adapter.py
           timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_codex_connector.py
+          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_codex_local_connect.py
           timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_claude_routine_adapter.py
           timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_claude_cloud_session_adapter.py
           timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_adapter_relay_loop.py

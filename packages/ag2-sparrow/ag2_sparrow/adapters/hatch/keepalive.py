@@ -236,10 +236,17 @@ def _spawn_sparrow(cfg: dict) -> "tuple[bool, str]":
 
 def restart_listener(cfg: dict) -> "tuple[bool, str]":
     """Through the user service install wrote when there is one, else a detached Sparrow."""
-    if _service_managed():
+    owner = _unit_owner()
+    if owner == UNIT_UNREACHABLE:
+        return False, (f"{_cli.service_path()} is installed but systemctl --user did not answer; "
+                       "no detached Sparrow is started beside that service")
+    if owner == "ours":
         # A unit left failed by its start limit stays down until reset.
-        _cli._systemd_run(["systemctl", "--user", "reset-failed", _cli.SERVICE_NAME])
-        r = _cli._systemd_run(["systemctl", "--user", "restart", _cli.SERVICE_NAME])
+        if _cli._unit_props() is None:
+            return False, (f"systemctl --user show {_cli.SERVICE_NAME} did not give a well-formed state; "
+                           "it was neither reset nor restarted")
+        _cli._systemctl(("--user", "reset-failed", "ag2-sparrow.service"))
+        r = _cli._systemctl(("--user", "restart", "ag2-sparrow.service"))
         if _cli._ok(r):
             return True, f"systemctl --user restart {_cli.SERVICE_NAME}"
         return False, f"systemctl --user restart {_cli.SERVICE_NAME} failed ({_cli._why(r)})"
@@ -327,21 +334,22 @@ def replace_sparrow(cfg: dict, pid: int) -> "tuple[bool, str]":
                 f"{how}; the old Sparrow (pid {pid}) was stopped, so none is running now")
 
 
+UNIT_UNREACHABLE = "unreachable"
+
+
 def _unit_owner() -> "str | None":
-    """"ours" for the unit install wrote, "other" for a hand-made one, None for no unit
-    (or no systemd to run it)."""
+    """"ours" for the unit install wrote, "other" for a hand-made one, None for no unit (or no
+    systemctl), UNIT_UNREACHABLE for a unit whose user manager did not answer: not "no unit"."""
     unit = _cli.service_path()
-    if not unit.is_file() or not _cli.systemd_user_available():
+    if not unit.is_file() or _cli._systemctl((), locate=True) is None:
         return None
+    if not _cli.systemd_user_available():
+        return UNIT_UNREACHABLE
     text = unit.read_text(encoding="utf-8", errors="replace")
     return "ours" if text.startswith(_cli.SERVICE_MARKER) else "other"
 
 
-def _service_managed() -> bool:
-    return _unit_owner() == "ours"
-
-
-def _wall_from_monotonic_us(value: "str | None") -> "float | None":
+def _wall_from_monotonic_us(value: "int | str | None") -> "float | None":
     """A systemd *TimestampMonotonic property as wall-clock seconds; None when unset."""
     try:
         us = int(value or 0)
@@ -355,6 +363,25 @@ def _left_running(pid: int) -> None:
           "cannot be read as Sparrow's, so it was left running as it is")
 
 
+def _unit_state_unknown(cfg: dict, holder: "int | None", why: str) -> int:
+    """Install stops and starts nothing while the unit's state is unknown; 0 only when the lock
+    holder is proven to run Sparrow's command line, else 1 saying why."""
+    head = (f"{_cli.service_path()} is installed but {why}, so whether that service runs Sparrow is "
+            "unknown; install neither stops nor starts a Sparrow")
+    if holder is not None and is_sparrow_pid(holder):
+        print(f"NOTE sparrow: {head}. Sparrow (pid {holder}) was left as it is; run "
+              "ag2-sparrow-hatch verify once the user manager answers")
+        return 0
+    if holder is not None:
+        _left_running(holder)
+        print(f"error: Sparrow is not proven running: {head}, and pid {holder} holds Sparrow's lock but "
+              "is not proven to be Sparrow", file=sys.stderr)
+        return 1
+    print(f"error: Sparrow is not running: {head}. Start your user manager (systemctl --user) and "
+          f"run install again, or remove {_cli.service_path()} if it is left over", file=sys.stderr)
+    return 1
+
+
 def ensure_sparrow(cfg: dict, health: bool) -> int:
     """Leave a Sparrow running and connected: start one if none runs, replace one outside
     the installed service, or (with `health`) one that lacks REMOTE_HEALTH_COMMAND."""
@@ -362,14 +389,19 @@ def ensure_sparrow(cfg: dict, health: bool) -> int:
     started = time.time()
     holder = _cli.live_lock_holder(_cli._lock_record(state, instance))
     owner = _unit_owner()
+    if owner == UNIT_UNREACHABLE:
+        return _unit_state_unknown(cfg, holder, "systemctl --user did not answer")
     if owner == "other":
         print(f"NOTE sparrow: {_cli.service_path()} was not written by install, so install "
               "neither starts nor replaces the Sparrow it runs; run ag2-sparrow-hatch verify")
         return 0
     start, stopped, since = False, None, None
     if owner == "ours":
-        props = _cli._unit_props("ActiveState", "MainPID", "ExecMainStartTimestampMonotonic")
-        active = props.get("ActiveState") in ("active", "reloading")
+        props = _cli._unit_props()
+        if props is None:
+            return _unit_state_unknown(cfg, holder, f"systemctl --user show {_cli.SERVICE_NAME} did not "
+                                       "give a well-formed state")
+        active = props["ActiveState"] in ("active", "reloading")
         if active:
             # install_service may have just restarted the unit: only its new process counts.
             since = _wall_from_monotonic_us(props.get("ExecMainStartTimestampMonotonic")) \
@@ -382,7 +414,7 @@ def ensure_sparrow(cfg: dict, health: bool) -> int:
                       "line REMOTE_TASK_TOKEN=<token>, chmod 600 it, then run: systemctl --user "
                       f"start {_cli.SERVICE_NAME}", file=sys.stderr)
                 return 1
-            if holder is not None and str(holder) != props.get("MainPID"):
+            if holder is not None and holder != props["MainPID"]:
                 if not is_sparrow_pid(holder):
                     _left_running(holder)
                     print(f"error: {_cli.SERVICE_NAME} was not started while pid {holder} holds "

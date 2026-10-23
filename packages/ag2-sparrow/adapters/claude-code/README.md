@@ -96,7 +96,64 @@ and never holds intake for the next one; the
 task is kept, an unconfirmed turn's confirmation is retried by the next tick or
 by the reply itself, and a reply told to call again; after a retried publish the staged answer is
 the one delivered, so a reply with a different text is refused and names it), and one after the commit
-answers hard. When the progress record cannot be written at all, the CLI raises
+answers hard. A publication that fails on I/O (an unwritable results dir) is
+that same pre-commit retry, never a soft refusal: the session is told to call
+again with the same text, and the turn's end retries it too; one whose rename
+landed but whose directory fsync or read-back failed answers retry naming that
+(the result is visible, its durability unknown), and the next publish settles
+on the result it finds. A park that
+settled but whose reply was lost (the lock's release failed and the claim
+could not be re-read) answers settled on the identical park again, naming the
+protocol failure only when that is what it delivered; nothing is published
+twice. A Mod that lost its offers inside one generation (a plugin reload, not
+a session restart) claims every listed task afresh, and a claim it already
+drove past its call is one it can never finish: at TURN_CONFIRMED with an
+accepted answer the lifecycle's one decision for such a turn (`close_turn`,
+the same one generation recovery takes) applies: a descriptor whose blob
+verifies is moved on by the claim save alone (`finish_verified`; the blob is
+final and never written again) and published, a blob missing or not matching its
+descriptor is answered as interrupted at once (the detail says which), never
+a substituted body; the interruption is one durable transition (a rename that
+lands leaves RESULT_STAGED, never an intermediate phase); at RESULT_STAGED or
+PUBLISHED the staged answer is published, and a claim a record from before
+left committed at OUTCOME_UNKNOWN is resumed to RESULT_STAGED and published
+(`resume_outcome`, the move recovery makes), never retired; a CALLING claim,
+or one confirmed with nothing accepted, waits for the next generation's
+recovery as before. Recovery runs once per `hold` start, so whatever that pass
+leaves publishable (a dead or unverifiable generation's verifying blob, a
+staged answer whose publication failed, a committed OUTCOME_UNKNOWN) is
+delivered by the new generation's live claim, once; its interruption stays
+recovery's. A claim whose result already exists settles the claim on that
+result and drops the task's in-flight mirror with its stuck mark in one
+write, so a delivered task is never left in flight for the stall detector.
+Settlement has one invariant: a SETTLED claim is complete when the
+settled-ids ledger holds its id and its staged body is gone. Every reader
+that can report a claim settled or final (claim, interrupt, publish, park,
+recovery) first runs the one repair-then-check, `reconcile_settled`; a repair
+that fails is a retry, never a final reply. Recovery selects SETTLED claims
+that are not complete (or are due for compaction), and claims answered
+without a call, which carry no generation, are reconciled and compacted too
+(`reconcile_unbound`). The ledger is append-only lines: each append is one
+write of the id and a newline under the ledger's own flock, after a repair
+that cuts a torn tail (an unterminated last line, the only shape a short
+append leaves); a torn append is cut and re-appended by the next repair, and
+two writers that loaded the ledger before either appended record an id once.
+A newline-terminated malformed record is corruption and fails closed. A hard
+reply (a rename that landed, its directory fsync failed) claims
+`outcome: settled` only over a complete settlement; otherwise the caller
+retries and the retry completes it. The cloud adapter's recovery and its
+"already settled" reader (`is_settled`) take the same repair-then-check, for
+cloud claims only (a local claim is read from the ledger, never repaired
+there). A ledger id counts only after a successful fsync of the ledger (and
+its directory) seen by the counting process: an id that is visible but whose
+sync failed is synced again before the staged body is removed, the claim is
+compacted, or anything reports settled; a sync that fails removes nothing and
+is a retry. Recovery skips a claim whose repair fails on I/O (one log line)
+and finishes it on the next pass, so one bad claim never stops a start.
+"Durable" is only the lines wholly within the bytes a successful fsync by
+this process covered: a line a repair re-reads later never counts until this
+process syncs it. The cloud adapter's step parks a task on an I/O error
+reading its claim, and retries it, instead of stopping. When the progress record cannot be written at all, the CLI raises
 an alarm in the adapter's config dir (outside `state/`): `verify` fails its
 `progress` row and the launcher raises the needs-attention card until a durable
 write clears it. A record whose fields have the wrong shape reads as unreadable (hard),
@@ -109,8 +166,9 @@ The adapter lives beside the Python package on purpose, not inside it: it is a
 Claude Code plugin, not Python, so it ships with the repo and not in the wheel.
 
 Environment: `AG2_INBOX_DIR` and `AG2_RESULTS_DIR` (defaults for the tool
-arguments), `AG2_HMAC_KEY_FILE`, `AG2_HMAC_STRICT`, `AG2_INBOX_INODE`,
-`AG2_AUTOARM`, `AG2_SPARROW_CLI` (default `ag2-sparrow-claude-local`).
+arguments), `AG2_HMAC_KEY_FILE` (the verifier's key path; strictness is never
+in the environment, see the HMAC policy), `AG2_INBOX_INODE`, `AG2_AUTOARM`,
+`AG2_SPARROW_CLI` (default `ag2-sparrow-claude-local`).
 
 ## Envelope and trust
 
@@ -175,13 +233,90 @@ stamp without `id:`, every tier shape) and checks that an always-verified or
 always-owner mutant fails. Verdicts: `verified` / `unsigned` (no stamp) /
 `invalid` (stamp present, content changed) / `unverifiable` (no key, or a key
 that is not exactly 64 hex characters). `invalid` is never submitted.
-`install --hmac-key-file` is strict by default (`AG2_HMAC_STRICT=1`: only
-`verified` is submitted, and `install` refuses a key the verifier would not
-accept); `--no-hmac-strict` opts out to the soak mode, where `unsigned` and
-`unverifiable` are submitted with the verdict in the envelope line. `verify`
-prints the mode. When the
-verifier itself cannot run (no `python3`, a timeout, no output) nothing is
-submitted and a debug line says so; the file is retried next tick.
+The verdict is the mod's; whether the task is then submitted is the CLI's,
+decided per task by `ag2-sparrow-claude-local inbox envelope --verdict <v>`
+from one owner, `ag2_sparrow/adapters/claude_code/hmac_policy.py`, which
+`install`, `verify` and that verb all read and the mod never copies. The config
+records only the choice (`HMAC_KEY_FILE`, the key path; `HMAC_STRICT`, `1` for
+strict, `0` when `--no-hmac-strict` was given); strictness is derived at each
+read from that choice plus the key file as it is at that moment. The exact
+rule, closed by default:
+
+- `HMAC_STRICT=1` (a key path without `--no-hmac-strict`, the default with
+  `--hmac-key-file`; or `--hmac-strict`): strict, read before anything else.
+  Only `verified` is submitted; a task without a valid envelope is refused.
+  While the key file is missing, unreadable, not 64 hex characters, or no path
+  is recorded at all, every task is refused with that one reason line
+  (`strict mode: <path> missing: strict mode submits nothing until it is
+  back`), never read as "no HMAC": the mod holds such a task with the same
+  backoff and stuck mark as any other retried task, so it is submitted once
+  the key lands, without a reinstall or a session restart.
+- Key path recorded and `HMAC_STRICT=0` (the explicit `--no-hmac-strict`
+  record): lenient, whatever the key file holds. `unsigned` and `unverifiable`
+  are submitted with the verdict in the envelope line.
+- Key path recorded and `HMAC_STRICT` present but empty: lenient too; that is
+  the record an older install wrote for `--no-hmac-strict`, honoured as it
+  is, nothing to rerun. `verify` prints a `WARN hmac mode: legacy opt-out`
+  line so the lenient install is visible.
+- Key path recorded and `HMAC_STRICT` missing or any other value: strict, as
+  above. A missing line is no record.
+- No key path and `HMAC_STRICT` not `1`: off. Every task reads `unsigned` and
+  is submitted.
+- `invalid` is never submitted in any mode.
+- A config that is missing, unreadable, unparsable or short of a required key
+  is not a config that says off: the verb parks (retry) and the task is held.
+
+Two more things the rule rests on. The launcher still exports
+`AG2_HMAC_STRICT=1` into the session whenever the mode is strict, for a plugin
+older than the `envelope` verb, which read that bit itself; the current mod
+never reads it (pinned). And the verifier's key *path* (`AG2_HMAC_KEY_FILE`) is
+set in the session's environment at its creation, so a reinstall with another
+path takes a session restart; the key's presence and content at that path are
+read live, by the verifier and the policy alike. Those are two reads, so the
+verifier prints the sha256 of the key bytes it read (`absent` when none) and
+the mod passes it as `--key-seen`: when the policy's own read of the key file
+differs (the key landed or was rotated in between), the verdict is stale and
+the task is held to be verified again, never retired. A reinstall that changes
+the key path without a session restart therefore holds every task (the
+verifier still reads the old path, so unless both hold the same bytes each task reads as a changed key) and marks it
+stuck until the session restarts: it fails closed. The watch tool's arm
+line names the mode as the CLI reads it then.
+
+Any task the mod retires goes through one path that clears its durable stuck
+mark first, whether that mark was set by this mod or by one before a session
+restart or plugin reload (the clear is sent every time; clearing no mark is
+harmless): a verdict the policy refuses (`unsigned`, `invalid`), a header id
+that does not match the file stem (the stem's mark), a final claim or
+authorize refusal, an interrupted answer, and every release of a submitted
+task's offer (published by `ag2space_reply`, parked or delivered at a turn's
+end, or retried by the scan), so a mark written while the authorization was
+retried is the offer's to clear. An offer whose turn was not confirmed is the
+exception: its claim stays `CALLING` with no answer and the CLI refuses a second
+claim of it as final, so the mod keeps the offer and never claims it again.
+Instead it marks the task stuck on each backed-off try; the CLI's reply keeps
+only the marks of unresolved tasks (from the lifecycle: the claim settled, or a
+result live and ready, archived or quarantined), so once the next start answers
+it as interrupted, even if that answer is already archived, the mark is missing
+from the reply and the offer is released through the mark clear. Deferred
+(#5747): the held set lives in the mod's memory, so a fresh mod in a live
+session (a plugin reload without a session restart) claims such a task again,
+gets the CLI's final refusal for a `CALLING` attempt, and retires it, clearing
+its mark while it is still unanswered. Fix sketch: the mod persists its held
+set beside the stuck mark in the progress record and reads it back at arm.
+Until the CLI confirms the clear (a refusal, exit 3, or
+a CLI that did not run) the mod keeps the task, retries only the clear after
+1, 2, 4 ... ticks capped at 60, and marks it seen once the clear lands; no
+mark outlives its task.
+
+So `install --hmac-key-file <path>` records a path whose key is not there yet
+(it prints a warning and `verify` fails its `hmac key` part until the key
+appears); it still refuses a key file that exists but is not 64 hex characters,
+or `--hmac-strict` with no `--hmac-key-file`. A task refused for its verdict is
+retired with the reason in a debug line; one the CLI could not answer for (it
+did not run, or the installed config was unreadable) is held with backoff and
+the stuck mark, like one held for a missing key; one whose verifier itself
+cannot run (no `python3`, a timeout, no output) is retried next tick. `verify`
+prints the mode, read the same way.
 
 Sparrow itself never stamps: the stamper is a host-injected seam
 (`local_task_protocol.set_task_stamper`), and only Sutando's
@@ -247,8 +382,9 @@ environment only (the workspace's own binding is the core's agent), and
 install writes no job: it writes `<root>.bridge/worker.json`, a declaration
 naming the worker, the module, the same environment and the vault key the
 token is read from (`vault set AG2_RELAY_TOKEN_BRIDGE_… <token>`). sparrowd
-reads every marked `<workspace>/agents/*.bridge/worker.json` at its start
-(`src/sparrowd.py`) and runs each as a worker through `src/sparrow_agent_bridge.py`:
+reads every marked `<workspace>/agents/*.bridge/worker.json` at its start and
+on every scan after it (`src/sparrowd.py`, `--rescan-s`, 30 s by default) and
+runs each as a worker through `src/sparrow_agent_bridge.py`:
 the token from the vault into `REMOTE_TASK_TOKEN` (never on disk; no token, no
 bridge), the agent's own dirs and the workspace's task stamper injected, and
 the package bridge run in that process under sparrowd's environment minus the
@@ -259,10 +395,16 @@ vault key, the token variable and the exact env (the three dirs and
 that differs in any of them, adds any key, sits anywhere but directly under
 `<workspace>/agents`, is unmarked or malformed, or whose key the vault lacks
 is skipped with one reason line.
-Restart sparrowd (`src/sparrowd.py`) after install: it reads its workers only
-at start, and until then `verify` fails the bridge row and says so. Nothing in
-this repo starts sparrowd (`startup.sh` and `restart.sh` run the core bridge
-directly), so whatever runs it on the host must be restarted.
+A declaration written after sparrowd started is picked up on its next scan,
+one `uninstall` removed has its worker stopped, and one whose content changed
+has its worker restarted (once the old process has exited); a declaration file
+that exists but cannot be read keeps its worker as it is. Until the scan, `verify`
+fails the bridge row and says so. On a host whose gateway bridge the launchd
+job runs (`src/launchd/gateway-bridge-wrapper.sh`), that wrapper keeps
+`src/sparrowd.py --agent-bridges` alive beside the bridge: the same scanner and
+the same worker, supervising only the declarations, so no second sparrowd and
+no job per agent is needed there. Elsewhere, whatever runs sparrowd on the host
+must be running for the declaration to be served.
 
 An explicit root (`--work`, `--inbox`, or `AGENT_CONNECT_TASK_DIR`) is served
 by a bridge you run; install records its agent when the host's chain names one
@@ -270,10 +412,17 @@ and writes no bridge. Every root records its agent in the supervisor record on
 the first session; a later install or launch for another agent refuses, naming
 both. `verify` fails its `bridge` row unless a fresh, connected gateway status
 in the bridge's state dir reports exactly `<root>/tasks`, `<root>/results` and
-the recorded agent, and names the fix. The bridge's `AGENT_CONNECT_STATE_DIR`
-must be the state dir install recorded (the parent of the HITL store in the
-config): `verify`'s bridge row reads the bridge's status there, and the bridge
-projects this adapter's cards from the store beside it.
+the recorded agent, and names the fix. Install records the bridge's state dir
+once, as `BRIDGE_STATE_DIR` in the config: the dir beside the root for the
+bridge it wires (the unit or declaration is written from that same value), or
+`--bridge-state-dir` for a bridge you run (default: Sparrow's state dir), and
+derives the HITL store from it. `verify`'s bridge row reads the bridge's
+status there, and the bridge projects this adapter's cards from the store
+beside it, so a bridge on another `AGENT_CONNECT_STATE_DIR` passes the row
+once install names that dir. A config from before the key reads the HITL
+store's parent, as install then derived it; `verify` then prints the store as
+an INFO line instead of checking a row against a value derived from itself,
+and names the reinstall that records the dir.
 
 **Process tree.** The service manager (`systemd --user`, or a launchd user
 agent) runs `run`, the launcher; `run` refuses unless
@@ -411,8 +560,9 @@ every start.
 `verify` prints PASS/FAIL per part (config, claude, login, tmux, socket and
 its length, plugin, inbox, results, hmac key, the HITL store being the
 bridge's, the bridge feeding this root, the agent's token file and bridge unit
-when install runs the bridge, supervisor) and INFO lines: the agent, the HMAC mode (strict or
-not), whether non-owner tasks are refused or submitted, the manager's state, the
+when install runs the bridge, supervisor) and INFO lines: the agent, the HMAC mode (strict,
+not strict or off, as the policy reads the config and the key file at that moment), whether
+non-owner tasks are refused or submitted, the manager's state, the
 occupancy beside it (`held by hold pid N, its claude pid M`, `held by hold
 pid N, no live claude attached`, `restarting`, `unobserved`, never a bare
 `free` under a live job), the session id, whether the inbox's folder trust is
@@ -439,7 +589,28 @@ mtime delta.
   submission and a refused claim never submitted, once-only claims, one
   authorization per attempt, turn confirmation inside the CLI's frame, park on a turn without
   a reply, the inode refusal, the session-id witness, intake closing on a hard
-  progress failure).
+  progress failure). Its fake CLI is bound to `tests/cli-contract.ts`: each
+  scenario there is answered by the fake in the harness and by the real verbs in
+  the Python suite, and every step must have the same shape (exit code,
+  refused, retry, the named fields and keys). The scenario set is pinned by
+  name (`CONTRACT_NAMES`): each runner fails unless it ran exactly those. Covered: `claim` (absent,
+  not admitted, ready or unready result, prepared again, `CALLING`, after an
+  unconfirmed turn), `authorize` (twice, unclaimed, another text), `confirm`
+  (the authorized turn, a bad nonce), `stage` (another turn, this turn, another
+  body), `publish` (staged, nothing staged), `park` (another turn, the protocol
+  failure, a staged answer), `interrupt` (absent, again, unready, ready,
+  `CALLING`), `progress` (`--stuck`/`--unstuck`, the marks kept for an unresolved
+  task and dropped for a ready, archived or published one, session, intake and
+  generation writes), `envelope` with no key path (off), with the opt-out
+  (lenient) and strict (key present: only verified submitted; key file missing:
+  every task held with the one reason line; a verdict read with another key:
+  held), the fake's answer derived from the same config and key-file state, and
+  `check-inode` against another inode. Not covered: `check-inode` on the
+  matching inode, and the injected faults (claims-lock, store and
+  unreadable-claim failures, exit 3 mirror failures, a staged answer whose blob
+  is not in place, refused or failed `--unstuck` and `park`, a CLI that does not
+  run): those are failure modes the fake injects, pinned against the real verbs
+  separately in the Python suite.
 - `python3 packages/ag2-sparrow/tests/test_claude_code_adapter.py` (stdlib:
   `hold`, the inbox CLI, the detector, the launcher on a scratch tmux server
   under a short `/tmp` HOME, the card and the accepter, install, verify,
@@ -460,13 +631,24 @@ mtime delta.
   transition in v1.
 - Delivery is **at-most-once** per attempt: an attempt left `CALLING` by a dead
   generation is answered as interrupted, never resent; a turn confirmed with no
-  staged reply is answered as "turn confirmed, no result"; a re-run is the
+  staged reply is answered as "turn confirmed, no result", and one whose
+  committed result does not match its descriptor the same way (the detail
+  says so; the bytes are never delivered); a re-run is the
   asker's to send. Launcher crash plus adoption is no-duplicate.
 - **commit-unknown**: when the store's directory fsync fails after the
   acceptance's replace, the accepted record is visible with durability
   unknown; the accepter performs no effect and the click is consumed (never a
   chat task); the launcher re-fsyncs and re-saves the identical record before
   the one effect. A replace that never happened leaves the card pending.
+- Survive-and-adopt holds for the launcher's own death, the realistic crash:
+  the tmux server is not its child, so the session runs on and the next
+  launcher adopts it. On macOS the `run --launchd` forwarder is launchd's main
+  pid, and its death (witnessed with `SIGKILL`) is the other case: with
+  `AbandonProcessGroup` false launchd tears the process group down, the inner
+  launcher takes that `SIGTERM` as a manager stop (`/exit`, the session
+  stopped), and the respawn resumes the same conversation by id. Nothing is
+  lost (a settled task stays settled, a mid-turn one is re-driven by the
+  lifecycle's rules), but that is a stop and a resume, not an adoption.
 - `KillMode=process` on Linux: a `systemctl stop` while the launcher is
   already dead leaves the session for `uninstall`'s `/exit` → `kill-session`.
   systemd ordering is asserted from the unit and not witnessed; `verify` says

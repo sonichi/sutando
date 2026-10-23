@@ -30,7 +30,6 @@ The normative op→Action map is the backend contract
 | `react` / `unreact` | `room.action.execute` | `room.message.react` / `room.message.unreact` |
 | `send` (upload) | `room.action.execute` | `room.media.upload` |
 | `fetch` | `room.action.execute` | `room.media.link` (an expiring viewer link, not a local file) |
-| `doc get` / `put` / `rm` (retiring, no MCP twin) | `room.action.read` / `room.action.execute` | Room Commons instead: pages `room.commons.pages.create` / `room.commons.pages.read` / `room.commons.pages.append`, databases `room.commons.databases.*` |
 | `events emit` | `room.action.execute` | `room.event.send` |
 | state read / write | `room.action.read` / `room.action.execute` | `room.state.read` / `room.state.write` |
 
@@ -83,7 +82,6 @@ does the privileged Matrix ops + authoritative membership enforcement.
 | `react <room> <event>` | add an `m.reaction` (ack) | discord `add_reaction` (👀/✅) |
 | `unreact <room> <event>` | remove the agent's reaction | discord remove-on-reply |
 | `join <room>` | accept the agent's own pending invite | discord guild-join on invite |
-| `doc get\|put\|rm <room>` | **retiring** with the room vault it reads; use Room Commons pages and databases for durable room state | — |
 
 ```bash
 python3 skills/agent-room-ops/room_ops.py read   '!room:hs' --limit 20 --agent '@a:hs'
@@ -217,8 +215,6 @@ layer (its CLAUDE.md equivalent) at connect time.
   databases (`room.commons.databases.list` / `.query` / `.mutate`).
   Write documents there instead of pasting long content into chat; post the
   page's name + a 1-3 line summary in the room.
-- The room vault behind `doc get|put|rm` is being retired; don't start new
-  state there.
 
 **Acknowledgement & etiquette**
 - Don't manually react 🫡 for pickup — the platform shows each agent's

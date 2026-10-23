@@ -21,7 +21,7 @@
    ],
    "status": "active",
    "canonical_for": "per-channel tier rules: TOFU onboarding, allowFrom/tierMap, Discord contextNotFrom gate, AG2 Space collaborator opt-in, AG2 Space owner-mention tasks, ambient taskify provenance",
-   "last_verified": "2026-10-03"
+   "last_verified": "2026-10-21"
   },
   "docs/adr/0001-pointer-teacher-brain.md": {
    "title": "Pointer Teacher brain: accessibility-first, Gemini-vision fallback",
@@ -493,7 +493,7 @@
    ],
    "status": "draft",
    "canonical_for": "the v1 worker pool: durable worker identities and run history, zero-byte delivery sentinels under deliveries/<recipient>/ with the payload immutable in tasks/, the router as the core watcher's task-event handler over an owner-declared, core-compiled roster (unknown targets go to the core; liveness never routes), residue-based recovery, and the Phase 1 / Phase 2 split",
-   "last_verified": "2026-10-05"
+   "last_verified": "2026-10-22"
   },
   "docs/worker-pool-design-notes.md": {
    "title": "Worker pool \u2014 design notes",
@@ -513,7 +513,7 @@
    ],
    "status": "canonical",
    "canonical_for": "how one inbox keeps exactly one announcer: the session watcher and the supervisor's standby, the tag and verdicts, readiness, the handoff contract",
-   "last_verified": "2026-09-22"
+   "last_verified": "2026-10-22"
   },
   "docs/learning-window.md": {
    "title": "Retained learning windows",

@@ -15,9 +15,10 @@ Be concise and direct. Prefer action over explanation. Default to the smallest a
 **"at background" / "in parallel" means SPAWN A SUBAGENT** (Chi 2026-08-21) — not "keep this in
 mind", and not a licence to defer to a later session. Too large for your remaining context is the
 reason TO delegate, not to hand it back. If no mechanism is available, do it inline and say so —
-never report work as delegated when nothing was spawned. A voice task header's `lane: long` is the
+never report work as delegated when nothing was spawned. Heavy work (defined in `docs/subagent-delegation.md`) also goes to a
+subagent unasked, with the quota tier in mind (little or none when the budget is tight); if you keep it, run it inline and say so. A voice task header's `lane: long` is the
 same trigger, judged by the relay before the task reaches you: spawn the subagent as you read the task;
-`lane: quick` is done inline, now. Escapes, model choice, lanes and the do-not-delegate list:
+`lane: quick` is done inline, now. Escapes, model choice, lanes, per-runtime mechanism and the do-not-delegate list:
 `docs/subagent-delegation.md`.
 
 **Reply in the language your owner wrote in.** When you deliberately answer in English (a quoted
@@ -241,6 +242,7 @@ Tasks arrive from multiple channels via the same file bridge:
 - This session reads and executes them, writes results to `results/task-{ts}.txt`
 - Each bridge polls `results/` and sends the reply back to the originating channel
 - Proactive messages: write to `results/proactive-{ts}.txt` to speak to the user
+- Dates in a task are the owner's: "today", "yesterday", "this week" mean calendar days in the zone of the task's `local_time:` header (e.g. `America/Los_Angeles`), never UTC. Turn them into that zone's day boundaries before a query (`gh search … --merged-at`, log greps), and say the zone-local date in the reply. A UTC day drops the owner's evening (Pacific evenings are the next UTC day). When the task also names a calendar date that disagrees with its relative day, the relative day wins (the voice model's date can be a day off). Take a weekday from the date itself (`date -j -f %F 2026-10-19 +%A`), never from memory.
 
 ### Where replies go
 
@@ -274,7 +276,7 @@ room: 'I sent it to you in our DM.' Never move silently.
 
 **Per-channel pull namespace** (`results/<channel-key>.task-{id}.txt`, only for a pull-side consumer that didn't delegate the work; default stays `results/task-{id}.txt`): [`docs/claude-md-moved-detail.md`](docs/claude-md-moved-detail.md#per-channel-pull-namespace).
 
-**IMPORTANT:** On session start, ensure a task watcher is running. Use the `Monitor` tool to stream `bash src/watch-tasks-stream.sh --role session --inbox "$(bash scripts/sutando-config.sh workspace)/tasks"` (`$SUTANDO_TASKS_DIR` as the inbox when set; the tag is what lets the external standby supervisor see this watcher and stand down) — it never exits during normal operation and emits `TASK_FILE: <name>` per new task as a per-event notification, followed by `QUEUE: <n> pending after this` only when other tasks are waiting. When a notification arrives, Read the named file, process it, and write a result to `results/`. Pass `timeout_ms: 1800000` and re-arm on the expiry or early-exit notice (`Monitor` has no `persistent` option).
+**IMPORTANT:** On session start, ensure a task watcher is running. Use the `Monitor` tool to stream `bash src/watch-tasks-stream.sh --role session --inbox "$(bash scripts/sutando-config.sh workspace)/tasks"` (`$SUTANDO_TASKS_DIR` as the inbox when set; the tag is what lets the external standby supervisor see this watcher and stand down) — it never exits during normal operation and emits `TASK_FILE: <name>` per new task as a per-event notification, followed by `QUEUE: <n> pending after this` only when other tasks are waiting. When a notification arrives, Read the named file, process it, and write a result to `results/`. If the named file is gone, run `python3 src/task_disposition.py <name>` before anything else: `answered`, `archived` and `claimed` mean another path has it, so write nothing; only `missing` is an error, and it goes to your log, never as a result or into any conversation. Pass `timeout_ms: 1800000` and re-arm on the expiry or early-exit notice (`Monitor` has no `persistent` option).
 
 If the watcher stops, start it again the same way; a start on a watched inbox exits 0 by itself. See [`docs/task-watcher-hosting-modes.md`](docs/task-watcher-hosting-modes.md).
 

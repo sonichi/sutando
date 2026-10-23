@@ -9,6 +9,11 @@ afterwards, so an unredirected run writes fake key names into the real
 `<workspace>/state/secret-vault/keys.json`.
 """
 
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import os
 import sys

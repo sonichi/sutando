@@ -7,6 +7,11 @@ import types
 import unittest
 from pathlib import Path
 
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location('acceptance', ROOT/'tests/pr-decision-evidence.test.py')
 tests = importlib.util.module_from_spec(spec)

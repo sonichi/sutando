@@ -90,9 +90,49 @@ def violations(root):
     return sorted(set(found))
 
 
+# One owner, connect_common: no launcher-side adapter module runs these steps itself (the tmux launcher
+# reads the consumer and occupancy for its own generation classification, which is not the holder sequence).
+HOLDER_STEPS = ("task_io.acquire_lock(", "task_io.release_lock(", "task_io.attach_consumer(", "task_io.holder_record_bytes(",
+                "cm._run_until_end(")
+WORDS = ("task_io.holder_consumer(", "task_io.occupancy(")
+SHIM = ("def launchd_exit", "def run_launchd", "signal.signal(sig, forward)")
+OWNED_STEPS = {"adapters/claude_code/hold.py": HOLDER_STEPS + WORDS + SHIM,
+               "adapters/claude_code/cli.py": HOLDER_STEPS + WORDS + SHIM,
+               "adapters/claude_code/launcher.py": HOLDER_STEPS + SHIM,
+               "adapters/codex/connect_cli.py": HOLDER_STEPS + WORDS + SHIM}
+LAUNCHER_SIDE = tuple(OWNED_STEPS)
+DELEGATES = {"adapters/claude_code/hold.py": ("cm.hold_and_supervise(", "cm.supervise_child("),
+             "adapters/claude_code/cli.py": ("cm.holder_words(", "cm.occupancy_line(", "cm.run_child_argv("),
+             "adapters/codex/connect_cli.py": ("cm.hold_and_supervise(", "cm.supervise_child(", "cm.holder_words(",
+                                               "cm.occupancy_line(", "cm.run_launchd(", "cm.run_child_argv(")}
+
+
+def direct_imports(text, steps):
+    """Names a step's `task_io.` or `cm.` function is imported as directly, which the substring scan misses."""
+    owned = {step.split(".", 1)[1].rstrip("(") for step in steps if step.startswith(("task_io.", "cm."))}
+    return sorted(a.name for n in ast.walk(ast.parse(text)) if isinstance(n, ast.ImportFrom)
+                  and (n.module or "").split(".")[-1] in ("task_io", "connect_common")
+                  for a in n.names if a.name in owned)
+
+
 class BoundaryTest(unittest.TestCase):
     def test_the_package_has_no_crossings(self):
         self.assertEqual(violations(PKG_ROOT), [])
+
+    def test_the_launcher_side_adapters_delegate_the_holder_sequence_the_occupancy_words_and_the_shim(self):
+        for rel in LAUNCHER_SIDE:
+            text = (PKG_ROOT / PKG / rel).read_text(encoding="utf-8")
+            with self.subTest(module=rel):
+                self.assertEqual([step for step in OWNED_STEPS[rel] if step in text], [], "a copy of connect_common's policy")
+                self.assertEqual(direct_imports(text, OWNED_STEPS[rel]), [], "a step imported under another name")
+                for call in DELEGATES.get(rel, ()):
+                    self.assertIn(call, text, "the delegation")
+
+    def test_an_aliased_import_of_an_owned_step_is_caught(self):
+        steps = OWNED_STEPS["adapters/codex/connect_cli.py"]
+        self.assertEqual(direct_imports("from ...task_io import acquire_lock as take\n", steps), ["acquire_lock"])
+        self.assertEqual(direct_imports("from ..connect_common import _run_until_end\n", steps), ["_run_until_end"])
+        self.assertEqual(direct_imports("from ... import task_io\nfrom ...task_io import parse\n", steps), [])
 
     def test_the_scan_sees_every_module_and_resolves_relative_imports(self):
         seen = dict(modules(PKG_ROOT))

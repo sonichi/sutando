@@ -460,8 +460,8 @@ def structural() -> list:
     # An unknown tier must be re-derived from the durable task file: the
     # in-memory tier map is not restored on restart.
     window = bridge[max(0, call - 800):markers] if call > 0 else ""
-    if "_resolve_task_tier" not in window:
-        fails.append("an unknown tier must be resolved from the task file before guarding")
+    if "resolve_route_tier(" not in window:
+        fails.append("an unknown tier must be resolved by the shared resolve_route_tier before guarding")
 
     # One implementation: consumers import the policy, never restate it.
     for name, src, label in ((BRIDGE.name, bridge, "bridge"),):

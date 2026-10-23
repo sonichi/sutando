@@ -30,6 +30,8 @@ case "\${1:-}" in workspace) echo "$d/ws" ;; *) echo "$d/none.env" ;; esac
 EOS
   chmod +x "$d/scripts/sutando-config.sh"
   echo "import sys; sys.exit($code)" > "$d/src/remote-gateway-bridge.py"
+  # the agent-bridge supervisor the wrapper keeps beside the bridge (its own suite pins it)
+  printf 'import time\nwhile True: time.sleep(0.2)\n' > "$d/src/sparrowd.py"
   cp "$REPO/src/launchd/gateway-bridge-wrapper.sh" "$d/src/launchd/"; cp "$REPO/src/result_publish.py" "$d/src/"
   # the wrapper calls the literal `python3`; shim it to the resolved interpreter
   printf '#!/bin/bash\nexec "%s" "$@"\n' "$PY" > "$d/shims/python3"
@@ -90,6 +92,7 @@ EOS
   echo "AG2_REMOTE_TOKEN=first" > "$d/relay.env"
   # each child records the token it was launched with, then exits 0 (relaunch path)
   printf 'import os,sys\nopen("%s/seen.log","a").write(os.environ.get("REMOTE_TASK_TOKEN","<unset>")+"\\n")\nsys.exit(0)\n' "$d" > "$d/src/remote-gateway-bridge.py"
+  printf 'import time\nwhile True: time.sleep(0.2)\n' > "$d/src/sparrowd.py"
   cp "$REPO/src/launchd/gateway-bridge-wrapper.sh" "$d/src/launchd/"; cp "$REPO/src/result_publish.py" "$d/src/"
   printf '#!/bin/bash\nexec "%s" "$@"\n' "$PY" > "$d/shims/python3"; printf '#!/bin/bash\nexit 0\n' > "$d/shims/osascript"
   chmod +x "$d/shims/python3" "$d/shims/osascript"

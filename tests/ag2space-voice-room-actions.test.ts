@@ -482,6 +482,11 @@ describe('the tools as the voice model sees them', () => {
 
 	it('the rules name the tools', () => {
 		for (const name of ['find_room_actions', 'describe_room_action', 'run_room_action']) assert.ok(ROOM_ACTIONS_PROMPT_RULE.includes(name), name);
+		// 2026-10-16: asked for a .tex file, the voice model wrote a Doc page with write_page, then said a .tex file could not be
+		// made, without looking; the catalog has room.commons.latex.project.create.
+		assert.match(ROOM_ACTIONS_PROMPT_RULE, /a LaTeX or Typst project or file, compiling it, a database or a sheet/);
+		assert.match(ROOM_ACTIONS_PROMPT_RULE, /Never say something in AG2 Space cannot be done before find_room_actions was asked for it/);
+		assert.match(createFindActionsTool(fake(() => null).deps).description, /before ever saying that something in AG2 Space cannot be done/);
 		assert.match(ROOM_ACTIONS_TURN_CHECK_RULE, /^- none:/);
 	});
 });

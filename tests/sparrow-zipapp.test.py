@@ -12,6 +12,11 @@ import sys
 import tempfile
 import zipfile
 
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 REPO = pathlib.Path(__file__).resolve().parents[1]
 PKG_ROOT = REPO / "packages" / "ag2-sparrow"
 SRC = PKG_ROOT / "ag2_sparrow"

@@ -49,7 +49,7 @@ def check(cond: bool, msg: str) -> None:
 STATE = {"tasks_served": 0, "results": [], "acks": [], "heartbeats": [],
          "auth_seen": [], "force_401": False, "force_ack_404": False,
          "room_posts": [], "force_room_502": False, "force_room_empty_200": False,
-         "force_room_ok_only": False,
+         "force_room_ok_only": False, "force_room_400_body": None,
          "force_heartbeat_404": False, "force_media_redirect": False,
          "force_results_502_once": False, "force_results_503": False,
          # GET /v1/results/<id>/delivery: None = a pre-route broker (404)
@@ -134,6 +134,11 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_response(502); self.end_headers(); return
             n = int(self.headers.get("Content-Length") or 0)
             STATE["room_posts"].append(json.loads(self.rfile.read(n).decode()))
+            if STATE["force_room_400_body"] is not None:  # pragma: no cover - the server thread is outside the gate's trace
+                body = json.dumps(STATE["force_room_400_body"]).encode()
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers(); self.wfile.write(body); return
             if STATE["force_room_empty_200"]:
                 # Deployed-broker failure shape: room-send swallowed server-side,
                 # 200 with no event_id — must NOT count as delivered.
@@ -156,6 +161,280 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(200); self.end_headers()
         else:
             self.send_response(404); self.end_headers()
+
+
+def _test_owner_dm_room_upgraded(rtc) -> None:
+    """#5720: an owner DM upgraded to a room the agent is not in holds nudges and notifies once."""
+    check(getattr(rtc.OWNER_DM_UPGRADED_NOTIFY, "__name__", "") == "_ag2space_owner_dm_upgraded",
+          "sutando loader wires the owner-DM upgrade notify hook")
+    calls: list = []
+    real_hook = rtc.OWNER_DM_UPGRADED_NOTIFY
+    rtc.OWNER_DM_UPGRADED_NOTIFY = lambda old, new: calls.append((old, new))
+    undeliv = lambda stem: [p for p in rtc.UNDELIVERABLE_RESULTS_DIR.glob(f"{stem}*")]  # noqa: E731
+    upgraded = {"error": "room upgraded", "reason": "room_upgraded",
+                "replacement_room": "!new:example.org", "sender_joined_replacement": False}
+    try:
+        # (1) room_upgraded 400 twice: pending, never parked, owner notified once, second pass no POST.
+        up = rtc.RESULTS_DIR / "proactive-up1.txt"
+        up.write_text("upgrade nudge\n")
+        STATE["force_room_400_body"] = upgraded
+        n0 = len(STATE["room_posts"])
+        rtc._post_proactive()
+        rtc._post_proactive()
+        check(up.exists() and not undeliv("proactive-up1")
+              and "proactive-up1.txt" not in rtc._PROACTIVE_ATTEMPTS,
+              "room_upgraded 400 keeps the owner nudge pending, not parked or counted")
+        check(calls == [("!owner:example.org", "!new:example.org")],
+              "room_upgraded notifies the owner exactly once across passes")
+        check(len(STATE["room_posts"]) == n0 + 1,
+              "a held owner DM is not re-sent each pass")
+        rtc._hold_owner_dm_upgrade("!owner:example.org", "!new:example.org")
+        check(len(calls) == 1, "a repeat (room, replacement) hold does not notify again")
+        # A repointed owner DM clears the hold and the nudge delivers there.
+        STATE["force_room_400_body"] = None
+        rtc._ROUTING.update(owner_dm="!owner2:example.org")
+        rtc._post_proactive()
+        check(not up.exists() and STATE["room_posts"][-1]["room_id"] == "!owner2:example.org"
+              and not rtc._owner_dm_upgrade_held("!owner:example.org"),
+              "repointing the owner DM clears the hold and delivers")
+        rtc._ROUTING.update(owner_dm="!owner:example.org")
+        # (2) any other 400 still parks as before, with no notify.
+        other = rtc.RESULTS_DIR / "proactive-up2.txt"
+        other.write_text("bad nudge\n")
+        n_calls = len(calls)
+        STATE["force_room_400_body"] = {"reason": "bad_request"}
+        rtc._post_proactive()
+        check(not other.exists() and undeliv("proactive-up2") and len(calls) == n_calls,
+              "a non-upgrade 400 still parks the nudge")
+        # (3) a room-addressed nudge keeps today's behaviour: parked, no hold, no notify.
+        routed = rtc.RESULTS_DIR / "proactive-up3.txt"
+        routed.write_text("[channel: !other:example.org]\nroom nudge\n")
+        STATE["force_room_400_body"] = upgraded
+        rtc._post_proactive()
+        check(not routed.exists() and undeliv("proactive-up3") and len(calls) == n_calls
+              and not rtc._owner_dm_upgrade_held("!owner:example.org"),
+              "a room_upgraded 400 on a room-addressed nudge parks unchanged")
+    finally:
+        STATE["force_room_400_body"] = None
+        rtc.OWNER_DM_UPGRADED_NOTIFY = real_hook
+        rtc._upgrade_hold_file().unlink(missing_ok=True)
+
+
+def _test_owner_dm_upgrade_edges(rtc) -> None:
+    """Fail-open branches of the owner-DM upgrade hold and the ask-owner hook."""
+    import subprocess as _sp
+    check(rtc._room_upgraded_to("not json") is None, "a non-JSON 400 body is not an upgrade")
+    check(rtc._room_upgraded_to('{"reason": "room_upgraded"}') == "",
+          "an upgrade body without a replacement names an empty room")
+    logged: list = []
+    real_log, real_write, real_hook = rtc._log, rtc._atomic_private_json, rtc.OWNER_DM_UPGRADED_NOTIFY
+    real_rename, real_popen = Path.rename, _sp.Popen
+    hold = rtc._upgrade_hold_file()
+
+    def _no_write(*_a, **_k):
+        raise OSError("read-only state")
+
+    def _boom(*_a):
+        raise RuntimeError("notify broke")
+
+    try:
+        rtc._log = logged.append
+        hold.write_text(json.dumps({"room": "!a:example.org", "replacement": "!b:example.org"}))
+        rtc._atomic_private_json = _no_write
+        check(not rtc._owner_dm_upgrade_held("!other:example.org")
+              and json.loads(hold.read_text())["room"] == "!a:example.org",
+              "an unclearable stale hold is reported as not held")
+        rtc.OWNER_DM_UPGRADED_NOTIFY = _boom
+        rtc._hold_owner_dm_upgrade("!c:example.org", "")
+        check(any("could not record owner-DM upgrade hold" in m for m in logged)
+              and any("(unknown)" in m for m in logged)
+              and any("owner-DM upgrade notify failed" in m for m in logged),
+              "an unwritable hold and a failing notify are logged, not raised")
+        rtc._atomic_private_json = real_write
+        hold.unlink(missing_ok=True)
+        # The un-claim rename can lose a race; the upgrade is still held and notified.
+        calls: list = []
+        rtc.OWNER_DM_UPGRADED_NOTIFY = lambda old, new: calls.append((old, new))
+
+        def _rename(self, target):
+            if self.name.startswith("proactive-up4.sending"):
+                raise OSError("claim vanished")
+            return real_rename(self, target)
+
+        up = rtc.RESULTS_DIR / "proactive-up4.txt"
+        up.write_text("race nudge\n")
+        STATE["force_room_400_body"] = {"reason": "room_upgraded", "replacement_room": "!n:example.org"}
+        Path.rename = _rename
+        rtc._post_proactive()
+        Path.rename = real_rename
+        check(calls == [("!owner:example.org", "!n:example.org")]
+              and rtc._owner_dm_upgrade_held("!owner:example.org"),
+              "a failed un-claim rename still holds the owner DM and notifies")
+        for left in rtc.RESULTS_DIR.glob("proactive-up4*"):
+            left.unlink()
+        # The sutando hook launches ask-owner detached, and a failed launch is logged.
+        launched: list = []
+        _sp.Popen = lambda argv, **kw: launched.append((argv, kw))
+        real_hook("!owner:example.org", "!n:example.org")
+        check(len(launched) == 1 and launched[0][0][1].endswith("ask-owner.py")
+              and launched[0][0][-1] == "--unless-open"
+              and launched[0][1].get("start_new_session") is True,
+              "the owner-DM upgrade hook asks the owner via a detached ask-owner")
+
+        def _no_spawn(*_a, **_k):
+            raise OSError("no exec")
+
+        _sp.Popen = _no_spawn
+        raised = False
+        try:
+            real_hook("!owner:example.org", "!n:example.org")
+        except OSError:
+            raised = True
+        check(raised and any("ask-owner did not start" in m for m in logged),
+              "a failed ask-owner launch is logged and raised, so the bridge retries it")
+    finally:
+        Path.rename, _sp.Popen = real_rename, real_popen
+        STATE["force_room_400_body"] = None
+        rtc._log, rtc._atomic_private_json, rtc.OWNER_DM_UPGRADED_NOTIFY = real_log, real_write, real_hook
+        hold.unlink(missing_ok=True)
+
+
+def _test_owner_dm_upgrade_notice_retry(rtc) -> None:
+    """A failed owner notice is retried on a later pass, bounded, and never re-sent once delivered."""
+    attempts: list = []
+    fail = {"n": 1}
+    real_hook = rtc.OWNER_DM_UPGRADED_NOTIFY
+    real_max = rtc.MAX_TRANSIENT_ATTEMPTS
+
+    def _hook(old, new):
+        attempts.append((old, new))
+        if fail["n"] > 0:
+            fail["n"] -= 1
+            raise RuntimeError("ask-owner down")
+
+    upgraded = {"reason": "room_upgraded", "replacement_room": "!new:example.org"}
+    up = rtc.RESULTS_DIR / "proactive-upr1.txt"
+    try:
+        rtc.OWNER_DM_UPGRADED_NOTIFY = _hook
+        rtc._upgrade_hold_file().unlink(missing_ok=True)
+        getattr(rtc, "_UPGRADE_NOTICES_SENT", set()).clear()
+        up.write_text("retry nudge\n")
+        STATE["force_room_400_body"] = upgraded
+        n0 = len(STATE["room_posts"])
+        rtc._post_proactive()  # pass 1: 400, hold recorded, the notice fails
+        check(len(attempts) == 1 and rtc._owner_dm_upgrade_held("!owner:example.org"),
+              "pass 1 holds the owner DM and attempts the notice once")
+        rtc._post_proactive()  # pass 2: the hook recovered
+        check(len(attempts) == 2 and fail["n"] == 0,
+              "a notice that failed once is retried on the next pass")
+        check(len(STATE["room_posts"]) == n0 + 1 and up.exists(),
+              "the retry does not re-POST the held DM nudge")
+        rtc._post_proactive()
+        rtc._hold_owner_dm_upgrade("!owner:example.org", "!new:example.org")
+        check(len(attempts) == 2, "a delivered notice is never re-sent")
+        # Bound: a hook that never recovers is tried MAX times, then given up loudly.
+        rtc._upgrade_hold_file().unlink(missing_ok=True)
+        rtc._UPGRADE_NOTICES_SENT.clear()
+        attempts.clear()
+        fail["n"] = 99
+        rtc.MAX_TRANSIENT_ATTEMPTS = 3
+        logged: list = []
+        real_log = rtc._log
+        rtc._log = logged.append
+        try:
+            for _ in range(6):
+                rtc._post_proactive()
+        finally:
+            rtc._log = real_log
+        check(len(attempts) == 3, f"the notice retry is bounded (got {len(attempts)} attempts)")
+        check(any("GAVE UP" in m for m in logged), "exhausting the bound is logged loudly")
+        check(rtc._owner_dm_upgrade_held("!owner:example.org") and up.exists()
+              and len(STATE["room_posts"]) == n0 + 2,
+              "the hold still suppresses DM nudges after the notice gives up")
+    finally:
+        STATE["force_room_400_body"] = None
+        rtc.OWNER_DM_UPGRADED_NOTIFY = real_hook
+        rtc.MAX_TRANSIENT_ATTEMPTS = real_max
+        rtc._upgrade_hold_file().unlink(missing_ok=True)
+        getattr(rtc, "_UPGRADE_NOTICES_SENT", set()).clear()
+        up.unlink(missing_ok=True)
+
+
+def _test_owner_dm_upgrade_notice_once_per_pass(rtc) -> None:
+    """Two held owner-DM files in one pass spend one notice attempt, not one per file."""
+    attempts: list = []
+    real_hook = rtc.OWNER_DM_UPGRADED_NOTIFY
+    hold = rtc._upgrade_hold_file()
+    files = [rtc.RESULTS_DIR / f"proactive-upp{i}.txt" for i in (1, 2)]
+
+    def _fail(old, new):
+        attempts.append((old, new))
+        raise RuntimeError("ask-owner down")
+
+    try:
+        rtc.OWNER_DM_UPGRADED_NOTIFY = _fail
+        hold.unlink(missing_ok=True)
+        rtc._UPGRADE_NOTICES_SENT.clear()
+        for f in files:
+            f.write_text("pass nudge\n")
+        STATE["force_room_400_body"] = {"reason": "room_upgraded", "replacement_room": "!new:example.org"}
+        rtc._post_proactive()
+        check(len(attempts) == 1 and json.loads(hold.read_text()).get("notice_attempts") == 1,
+              f"one pass with two held files counts one notice attempt (got {len(attempts)})")
+        rtc._post_proactive()
+        check(len(attempts) == 2 and json.loads(hold.read_text()).get("notice_attempts") == 2,
+              f"the next pass adds exactly one more attempt (got {len(attempts)})")
+    finally:
+        STATE["force_room_400_body"] = None
+        rtc.OWNER_DM_UPGRADED_NOTIFY = real_hook
+        hold.unlink(missing_ok=True)
+        rtc._UPGRADE_NOTICES_SENT.clear()
+        for f in files:
+            f.unlink(missing_ok=True)
+
+
+def _test_owner_dm_upgrade_empty_room(rtc) -> None:
+    """An empty or whitespace room is refused and never clears a standing hold."""
+    hold = rtc._upgrade_hold_file()
+    body = {"room": "!owner:example.org", "replacement": "!new:example.org", "notice": "pending"}
+    try:
+        hold.write_text(json.dumps(body))
+        for room in ("", "   "):
+            check(not rtc._owner_dm_upgrade_held(room)
+                  and json.loads(hold.read_text()) == body,
+                  f"an empty room {room!r} is refused and leaves the hold in place")
+    finally:
+        hold.unlink(missing_ok=True)
+
+
+def _test_owner_dm_upgrade_legacy_hold(rtc) -> None:
+    """A hold written before notice state existed is retried as pending, without re-posting the nudge."""
+    attempts: list = []
+    real_hook = rtc.OWNER_DM_UPGRADED_NOTIFY
+    up = rtc.RESULTS_DIR / "proactive-upl1.txt"
+    hold = rtc._upgrade_hold_file()
+    try:
+        rtc.OWNER_DM_UPGRADED_NOTIFY = lambda old, new: attempts.append((old, new))
+        rtc._UPGRADE_NOTICES_SENT.clear()
+        hold.write_text(json.dumps({"room": "!owner:example.org",
+                                    "replacement": "!new:example.org", "at": 1.0}))
+        up.write_text("legacy nudge\n")
+        STATE["force_room_400_body"] = {"reason": "room_upgraded", "replacement_room": "!new:example.org"}
+        n0 = len(STATE["room_posts"])
+        rtc._post_proactive()
+        rtc._post_proactive()
+        check(attempts == [("!owner:example.org", "!new:example.org")],
+              f"a legacy hold with no notice state delivers exactly one notice (got {attempts})")
+        check(len(STATE["room_posts"]) == n0 and up.exists(),
+              "recovering a legacy hold's notice does not POST the held nudge")
+        check(json.loads(hold.read_text()).get("notice") == "delivered",
+              "the legacy hold is rewritten with its delivered notice state")
+    finally:
+        STATE["force_room_400_body"] = None
+        rtc.OWNER_DM_UPGRADED_NOTIFY = real_hook
+        hold.unlink(missing_ok=True)
+        rtc._UPGRADE_NOTICES_SENT.clear()
+        up.unlink(missing_ok=True)
 
 
 def main() -> int:
@@ -1315,6 +1594,12 @@ def main() -> int:
           "a failed POST records no receipt")
     rtc._post_proactive()
     _it3b = _ob._read_item(_rroot, "proactive-r3")
+    _test_owner_dm_room_upgraded(rtc)
+    _test_owner_dm_upgrade_edges(rtc)
+    _test_owner_dm_upgrade_notice_retry(rtc)
+    _test_owner_dm_upgrade_legacy_hold(rtc)
+    _test_owner_dm_upgrade_notice_once_per_pass(rtc)
+    _test_owner_dm_upgrade_empty_room(rtc)
     check(_it3b.get("status") == "DELIVERED"
           and _it3b.get("destination") == "!owner:example.org",
           "the successful retry records the receipt")
@@ -2417,15 +2702,21 @@ def main() -> int:
     # Wiring: the policy is only worth anything if the poll call site consults
     # it. Asserted against the loaded function, not a copy of the file.
     import inspect
+    import ast
     _loop = inspect.getsource(rtc.main)
-    _poll_call = _loop.split('"GET", f"/v1/tasks?wait=', 1)[-1][:400]
+    _poll_try = next(
+        node for node in ast.walk(ast.parse(_loop))
+        if isinstance(node, ast.Try)
+        and isinstance(node.body[0], ast.Assign)
+        and '"GET", f"/v1/tasks?wait=' in ast.get_source_segment(_loop, node.body[0])
+    )
+    _poll_call = ast.get_source_segment(_loop, _poll_try)
     check("_poll_timeout_is_empty" in _poll_call,
           "poll-timeout: the poll call site consults the policy")
     check("except (TimeoutError, socket.timeout)" in _poll_call,
           "poll-timeout: the catch is scoped to the poll, not the whole iteration")
     # 3.9 has no socket.timeout->TimeoutError alias; CI is 3.10+ where an
     # execution probe cannot go red, so pin the catch tuple itself via AST.
-    import ast
     _clause = _poll_call.split("except ", 1)[-1].split(":", 1)[0]
     _t = ast.parse(_clause, mode="eval").body
     _caught = {
