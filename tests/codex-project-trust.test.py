@@ -13,6 +13,7 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import codex_project_trust as cpt  # noqa: E402
+
 import toml_fallback  # noqa: E402
 from _helpers.old_python import pre_311_python  # noqa: E402
 
