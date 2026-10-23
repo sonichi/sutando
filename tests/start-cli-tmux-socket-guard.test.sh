@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# The dispatcher refuses to launch when its tmux cannot see the socket's server as it is, or when
-# the socket is a desktop install's and this checkout is not that install's engine. Stubs only.
+# The dispatcher refuses to launch when no tmux can reach the socket's server, or when the socket
+# is a desktop install's and this checkout is not that install's engine. Stubs only.
 set -u
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 TD="$(mktemp -d)"; trap 'rm -rf "$TD"' EXIT
@@ -47,7 +47,7 @@ EOF
   mkdir -p "$fix/appbin"
   cat > "$fix/appbin/tmux" <<'EOF'
 #!/bin/bash
-[ "${1:-}" = -V ] && { echo "tmux 3.8"; exit 0; }
+[ "${1:-}" = -V ] && { echo "tmux ${APP_CLIENT_VERSION:-3.8}"; exit 0; }
 case "$*" in *list-sessions*) echo "3.8" ;; esac
 exit 0
 EOF
@@ -85,7 +85,19 @@ launched() {  # <label>
 run "$FIX" "$FIX/bin:/usr/bin:/bin" "$TD/sock" SERVER=unreachable
 refused "client cannot talk to the server" "cannot query the tmux server"
 run "$FIX" "$FIX/bin:/usr/bin:/bin" "$TD/sock" SERVER=other
-refused "client and server versions differ" "is tmux 3.5a, but tmux 3.8 owns"
+if [ "$rc" = 0 ] && grep -q "LAUNCHER claude .*tmux=$FIX/bin/tmux" "$TD/log" \
+   && grep -q "warning: .*is tmux 3.5a, but tmux 3.8 owns" "$TD/err"; then
+  say PASS "versions differ but the client reaches the server: warns naming both, launches with it"
+else
+  say FAIL "reachable mismatch: rc=$rc err=$(tr '\n' '|' < "$TD/err") log=$(tr '\n' '|' < "$TD/log")"
+fi
+run "$FIX" "$FIX/bin:/usr/bin:/bin" "$TD/sock" SERVER=unreachable SUTANDO_TMUX_BIN="$FIX/appbin/tmux" APP_CLIENT_VERSION=3.7
+if [ "$rc" = 0 ] && grep -q "LAUNCHER claude .*tmux=$FIX/appbin/tmux" "$TD/log" \
+   && grep -q "warning: .*appbin/tmux is tmux 3.7, but tmux 3.8 owns" "$TD/err"; then
+  say PASS "PATH tmux cannot reach the server: the declared client that does goes first on PATH"
+else
+  say FAIL "declared reachable mismatch: rc=$rc err=$(tr '\n' '|' < "$TD/err") log=$(tr '\n' '|' < "$TD/log")"
+fi
 run "$FIX" "$FIX/bin:/usr/bin:/bin" "$TD/sock" SERVER=other SUTANDO_TMUX_BIN="$FIX/appbin/tmux"
 if [ "$rc" = 0 ] && grep -q "LAUNCHER claude .*tmux=$FIX/appbin/tmux" "$TD/log"; then
   say PASS "the host's declared client matches the server: launcher runs with it first on PATH"

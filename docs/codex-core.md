@@ -289,12 +289,14 @@ remove it. The dispatcher now names that override on stderr. Use the explicit
 flag for the intended runtime rather than treating config as proof of which CLI
 restarted. Restarts from inside the live core remain refused.
 
-Before any launcher runs, the dispatcher refuses (exit 3) when the `tmux` on PATH
-cannot query the server on the core's socket, reports a different version than
-that server, or is missing while the socket exists. When the host's declared
-client (`SUTANDO_TMUX_BIN`, which the desktop exports) does match the server, the
-dispatcher puts it first on PATH for the launch instead. Each of these cases would
-make a live core read as absent, or replace the server with an incompatible build. It
+Before any launcher runs, the dispatcher picks the tmux client for the launch:
+the `tmux` on PATH, then the host's declared client (`SUTANDO_TMUX_BIN`, which the
+desktop exports), preferring the first whose version matches the server on the
+core's socket. When neither matches but one still reaches the server, it warns on
+stderr naming both versions and launches with that client. The chosen client is
+put first on PATH for the launch. It refuses (exit 3) when no client can query the
+server, or when no tmux is on PATH while the socket exists: either would make a
+live core read as absent, or replace the server with an incompatible build. It
 also refuses to launch another checkout's core on a desktop install's socket
 (`<app-support>/run/tmux.sock`) unless `SUTANDO_ALLOW_FOREIGN_CORE_CHECKOUT=1`
 is set for that launch.
