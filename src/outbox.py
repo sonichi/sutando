@@ -530,16 +530,26 @@ def _malformed_claim(p: Path, item_id: str, d: dict) -> ClaimRecord:
 
 
 def _candidate_owner_pid(raw: object) -> Optional[int]:
-    """A pid that plausibly names the owner: any int, finite float or short string int()
-    turns into a pid within valid_pid's bounds. Only ever evidence AGAINST a takeover."""
+    """A pid that plausibly names the owner: any int, finite float or string int() turns
+    into a pid within valid_pid's bounds. Only ever evidence AGAINST a takeover."""
     if type(raw) is float and math.isfinite(raw):
         raw = int(raw)
-    elif type(raw) is str and len(raw) <= 32:
-        try:
-            raw = int(raw)
-        except ValueError:
-            return None
+    elif type(raw) is str:
+        return _int_string_pid(raw)
     return valid_pid(raw)
+
+
+def _int_string_pid(raw: str) -> Optional[int]:
+    """int()'s string grammar (whitespace, one '+', digit groups joined by '_'), read in
+    linear time: more than 10 significant digits is past PID_MAX at any length."""
+    text = raw.strip()
+    if text.startswith("+"):
+        text = text[1:]
+    groups = text.split("_")
+    if not all(g and g.isdecimal() for g in groups):
+        return None
+    digits = "".join(groups).lstrip("0") or "0"
+    return valid_pid(int(digits)) if len(digits) <= 10 else None
 
 
 _START_USEC_LIMIT = 2**63

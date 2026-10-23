@@ -220,6 +220,26 @@ class MalformedClaimBackend(unittest.TestCase):
                     self._rewrite_pid(render(pid), TTL)
                     self.assertEqual(b.recover().retired, [] if held else [ITEM])
 
+    def test_padded_live_pid_blocks_at_every_length(self):
+        pid = str(os.getpid())
+        for length in (1, 10, 32, 33, 64, 5000):
+            width = max(length, len(pid))
+            for kind, text in (("zero", pid.zfill(width)),
+                               ("space", pid.rjust((width + len(pid)) // 2).ljust(width))):
+                raw = json.dumps(text)
+                with self.subTest(kind=kind, length=len(text)):
+                    self.tearDown()
+                    self.setUp()
+                    self.assertEqual(self._drain_while_a_sends(raw, TTL + 1), 1)
+                    self.tearDown()
+                    self.setUp()
+                    b = DesignAClaimBackend(self.root, reclaim_ttl_s=TTL)
+                    self.assertTrue(b.publish(ITEM, b"hi"))
+                    self.assertIsNotNone(b.claim(ITEM, "A"))
+                    outbox.record_delivered(self.root, ITEM)
+                    self._rewrite_pid(raw, TTL * 100)
+                    self.assertEqual(b.recover().retired, [])
+
     def _terminal_malformed(self, age):
         b = DesignAClaimBackend(self.root, reclaim_ttl_s=TTL)
         self.assertTrue(b.publish(ITEM, b"hi"))

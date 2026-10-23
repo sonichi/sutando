@@ -891,6 +891,18 @@ PID_FORMS = [
 ]
 
 
+PAD_LENGTHS = (1, 10, 32, 33, 64, 5000)
+
+
+def padded_pids(pid, length):
+    """Zero- and whitespace-padded forms of `pid`, at `length` chars or the pid's own."""
+    text = str(pid)
+    width = max(length, len(text))
+    left = (width - len(text)) // 2
+    return [("zero-padded", text.zfill(width)),
+            ("space-padded", " " * left + text + " " * (width - len(text) - left))]
+
+
 def rewrite_claim_pid(p, raw_pid):
     """Keep the writer's record, put `raw_pid` in verbatim, and spoil claimed_at."""
     rec = json.loads(p.read_text(encoding="utf-8"),
@@ -928,19 +940,27 @@ def _c26():
                     if got != (want, want):
                         bad.append(f"{label} alive={alive} at {age}s: may/reclaim={got}, "
                                    f"want {want}")
-    # Every pid the pre-validation reader's int() accepted must still block, bool aside.
+    # Boundary sweep: a live pid padded to each length is still the live owner.
     candidate = need(m, "_candidate_owner_pid")
-    for label, render, plausible in PID_FORMS:
-        raw = json.loads(render(os.getpid()), parse_int=m._bounded_int)
-        try:
-            legacy = None if isinstance(raw, bool) else int(raw)
-        except (TypeError, ValueError, OverflowError):
-            legacy = None
-        legacy = m.valid_pid(legacy)
-        if legacy is not None and candidate(raw) != legacy:
-            bad.append(f"{label}: int() named pid {legacy}, candidate is {candidate(raw)}")
-        if (candidate(raw) is not None) != plausible:
-            bad.append(f"{label}: candidate {candidate(raw)}, table says plausible={plausible}")
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        for length in PAD_LENGTHS:
+            for kind, text in padded_pids(os.getpid(), length):
+                n += 1
+                if candidate(text) != os.getpid():
+                    bad.append(f"{kind} len={len(text)}: candidate {candidate(text)}")
+                item = f"pad-{n}"
+                assert acquire(root, item, "owner") is True
+                p = claim_path(root, item)
+                rewrite_claim_pid(p, json.dumps(text))
+                t = time.time() - (ttl + 1)
+                os.utime(p, (t, t))
+                if may(root, item, ttl) or reclaim(root, item, ttl, "thief"):
+                    bad.append(f"{kind} len={len(text)}: live owner reclaimed past the TTL")
+    for text, want in (("-5", None), ("+-5", None), ("1__2", None), ("_12", None),
+                       (" +0_0012 ", 12), ("0", None), ("9" * 11, None), ("0" * 40 + "7", 7)):
+        if candidate(text) != want:
+            bad.append(f"{text!r}: candidate {candidate(text)}, want {want}")
     assert not bad, "; ".join(bad)
 
 
