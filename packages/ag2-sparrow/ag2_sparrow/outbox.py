@@ -15,6 +15,12 @@ Two rules, both about not-knowing:
     ok-with-no-id may already have been delivered, so retrying duplicates
     rather than repairs.
 
+Malformed claims (a complete record with invalid fields) err toward never
+displacing a possibly-live owner: any pid the record plausibly names blocks a
+takeover while that pid reads ALIVE or UNKNOWN, whatever its age. The cost is
+that a corrupt record naming a live pid (e.g. "pid": true, which is pid 1) never
+ages out; remove it by hand by deleting its claim file under .claims/.
+
 Contracts: tests/sparrow-outbox-claim-protocol.test.py, tests/outbox-race-check.py
 """
 from __future__ import annotations
