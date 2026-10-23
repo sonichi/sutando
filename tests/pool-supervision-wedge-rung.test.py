@@ -341,6 +341,18 @@ check("observe reads the worker's pane and queue",
       (getattr(o, "pane", None), getattr(o, "work_outstanding", None)), (GATE, True))
 check("observe carries a raw frame id for the stuck test", bool(getattr(o, "pane_id", None)), True)
 
+
+def observed(frames):
+    """observe() over captured frames, each fed to the ladder: the real observer's id."""
+    return run([sup.observe(ws, 1000.0 + 300 * i, runner=Stub(f))[WID]
+                for i, f in enumerate(frames)])[0]
+
+
+check("observed: turns finishing under a stale banner are progress: no card",
+      observed([turn_done(i) for i in range(6)]), [N] * 6)
+check("observed: a held worker whose footer counters tick is still carded",
+      observed(HELD), [N, N, HUMAN, N])
+
 print(f"\n{'ALL PASS' if not fails else str(len(fails)) + ' FAILURE(S)'} — pool_supervision wedge rung")
 for f in fails:
     print("   ", f)
