@@ -483,7 +483,7 @@ def _read_claim_at(p: Path, item_id: str) -> Optional[ClaimRecord]:
     if not raw.strip():
         return ClaimRecord(item_id, "", -1, None, 0.0, state="UNKNOWN")
     try:
-        d = json.loads(raw)
+        d = json.loads(raw, parse_int=_bounded_int)
     except json.JSONDecodeError:
         return ClaimRecord(item_id, "", -1, None, 0.0, state="UNKNOWN")
     except (ValueError, OverflowError):
@@ -501,6 +501,15 @@ def _read_claim_at(p: Path, item_id: str) -> Optional[ClaimRecord]:
                        pid=pid,
                        start_usec=start_usec,
                        claimed_at=float(claimed_at))
+
+
+_OVERSIZE = object()
+
+
+def _bounded_int(text: str) -> object:
+    """An int no claim field could need decodes as a sentinel every validator rejects,
+    so one oversized value spoils only its own field, not the whole record."""
+    return int(text) if len(text.lstrip("-")) <= 20 else _OVERSIZE
 
 
 def _malformed_claim(p: Path, item_id: str, d: dict) -> ClaimRecord:

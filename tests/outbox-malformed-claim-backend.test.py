@@ -11,6 +11,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -20,7 +21,9 @@ if str(_PKG) not in sys.path:
     sys.path.insert(0, str(_PKG))
 
 from ag2_sparrow import outbox  # noqa: E402
-from ag2_sparrow.delivery_core import DesignAClaimBackend  # noqa: E402
+from ag2_sparrow.delivery_core import (  # noqa: E402
+    DeliveryCore, DeliveryOutcome, DeliveryReceipt, DesignAClaimBackend, DrainStatus,
+    ProviderCapabilities)
 
 _dead = subprocess.Popen([sys.executable, "-c", "pass"])
 _dead.wait()
@@ -61,6 +64,81 @@ class MalformedClaimBackend(unittest.TestCase):
         self.assertIsNotNone(b.claim(ITEM, "A"))
         self._rewrite(b, text='{"item_id": "room-evt-mal', age=outbox.SWAP_GRACE_S + 1)
         self.assertIsNotNone(b.claim(ITEM, "B"), "a torn claim must still age out")
+
+    def test_terminal_claim_with_oversize_int_keeps_identity_and_retires(self):
+        b = DesignAClaimBackend(self.root, reclaim_ttl_s=TTL)
+        self.assertTrue(b.publish(ITEM, b"hi"))
+        self.assertIsNotNone(b.claim(ITEM, "A"))
+        outbox.record_delivered(self.root, ITEM)
+        p = outbox._claim_path(self.root, ITEM)
+        rec = json.loads(p.read_text(encoding="utf-8"))
+        rec.update(pid=DEAD_PID, start_usec=123456789, claimed_at="@BIG@", extra="@BIG@")
+        p.write_text(json.dumps(rec).replace('"@BIG@"', "9" * 5001), encoding="utf-8")
+        t = time.time() - TTL
+        os.utime(p, (t, t))
+        got = outbox._read_claim_at(p, "")
+        self.assertEqual((got.state, got.malformed, got.item_id, got.drainer_id, got.pid,
+                          got.start_usec), ("UNKNOWN", True, ITEM, "A", DEAD_PID, 123456789))
+        self.assertEqual(b.recover().retired, [ITEM])
+        self.assertIsNone(outbox.read_delivery_claim(self.root, ITEM))
+
+    def _oversize_claimed_at(self, age):
+        """The live owner's own claim, valid pid and birth token, claimed_at oversized."""
+        p = outbox._claim_path(self.root, ITEM)
+        text = p.read_text(encoding="utf-8")
+        rec = json.loads(text, parse_int=lambda s: s if len(s) > 20 else int(s))
+        rec["claimed_at"] = "@BIG@"
+        p.write_text(json.dumps(rec).replace('"@BIG@"', "9" * 5001), encoding="utf-8")
+        t = time.time() - age
+        os.utime(p, (t, t))
+
+    def test_live_owner_oversize_claimed_at_never_reclaimed(self):
+        self.assertTrue(outbox.acquire_delivery_claim(self.root, ITEM, "A"))
+        for age in (TTL + 1, TTL * 100):
+            self._oversize_claimed_at(age)
+            self.assertFalse(outbox.reclaim_delivery_claim(self.root, ITEM, TTL, "B"),
+                             f"a live owner's claim was reclaimed at {age}s")
+            self.assertEqual(outbox.read_delivery_claim(self.root, ITEM).drainer_id, "A")
+
+    def test_live_owner_oversize_claimed_at_one_provider_call(self):
+        gate, entered, calls = threading.Event(), threading.Event(), []
+
+        class Blocking:
+            capabilities = ProviderCapabilities()
+
+            def __init__(self, block=True):
+                self.block = block
+
+            def deliver(self, item_id, payload, key):
+                calls.append(item_id)
+                if self.block:
+                    entered.set()
+                    gate.wait(10)
+                return DeliveryReceipt(outcome=DeliveryOutcome.CONFIRMED)
+
+            def reconcile(self, attempt):
+                return None
+
+        backend = DesignAClaimBackend(self.root, reclaim_ttl_s=TTL)
+        self.assertTrue(backend.publish(ITEM, b"hi"))
+        a = threading.Thread(target=DeliveryCore(backend, Blocking(), worker="A").deliver_one,
+                             args=(ITEM, b"hi"))
+        a.start()
+        try:
+            self.assertTrue(entered.wait(10), "drainer A never reached the provider")
+            results = []
+            for age in (TTL + 1, TTL * 100):
+                if outbox.read_delivery_claim(self.root, ITEM) is None:
+                    break                       # B already took and released it
+                self._oversize_claimed_at(age)
+                results.append(DeliveryCore(DesignAClaimBackend(self.root, reclaim_ttl_s=TTL),
+                                            Blocking(block=False), worker="B")
+                               .deliver_one(ITEM, b"hi").status)
+        finally:
+            gate.set()
+            a.join(10)
+        self.assertEqual(len(calls), 1, f"provider called {len(calls)} times")
+        self.assertEqual(results, [DrainStatus.NOT_CLAIMED] * 2)
 
     def _terminal_malformed(self, age):
         b = DesignAClaimBackend(self.root, reclaim_ttl_s=TTL)
