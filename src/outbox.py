@@ -19,7 +19,10 @@ Malformed claims (a complete record with invalid fields) err toward never
 displacing a possibly-live owner: any pid the record plausibly names blocks a
 takeover while that pid reads ALIVE or UNKNOWN, whatever its age. The cost is
 that a corrupt record naming a live pid (e.g. "pid": true, which is pid 1) never
-ages out; remove it by hand by deleting its claim file under .claims/.
+ages out. No safe manual remedy exists yet: a raw unlink bypasses the item lock and
+instance checks, so it can duplicate a live delivery or remove a successor's claim.
+Clearing one needs every drainer quiesced, no provider call in flight, any
+indeterminate outcome reconciled, then a locked administrative release.
 
 Contracts: tests/sparrow-outbox-claim-protocol.test.py, tests/outbox-race-check.py
 """
