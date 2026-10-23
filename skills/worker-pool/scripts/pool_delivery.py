@@ -52,6 +52,9 @@ ACCEPTED_SUFFIX = ".accepted"
 LEGACY_ACCEPTED_SUFFIX = ".claimed"
 # Not a sentinel: the regex below never matches it, so listings skip it.
 LOCK_NAME = ".lock"
+# A folder holding this file takes claims, not deliveries: the core's held-readers count
+# its sentinels, but the router never reads it as a recipient committed to the task.
+NON_EXCLUSIVE_MARKER = ".non-exclusive"
 
 # One suffix, substituted never appended: an accepted sentinel must not still
 # read as pending, or a reader re-takes its own in-flight work.

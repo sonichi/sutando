@@ -43,8 +43,8 @@ for _p in (str(_SRC), str(_REPO / "packages" / "ag2-sparrow")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from proactive_routing import (BRIDGE_CHANNELS, proactive_destination,  # noqa: E402
-                               should_claim_proactive)
+from proactive_routing import (BRIDGE_CHANNELS, body_target_channel,  # noqa: E402
+                               proactive_destination, should_claim_proactive)
 from workspace_default import resolve_workspace  # noqa: E402
 from util_paths import claude_home_path, shared_personal_path  # noqa: E402
 from voice_room_membership import (CHECK_DIR_NAME, VERDICT_TTL_S,  # noqa: E402
@@ -311,6 +311,13 @@ def _ag2space_proactive_claim_gate(path: Path) -> bool:
     # a destined file strands visibly rather than leak to the gateway room.
     if dest is not None:
         return dest == _CHANNEL
+    # A body addressed to a room outranks activity routing;
+    # the drain has already refused a room on another homeserver.
+    try:
+        if body_target_channel(path.read_text(encoding="utf-8", errors="ignore")) == _CHANNEL:
+            return True
+    except OSError:
+        return False  # racing consumer already claimed it
     state = WS / "state" / "last-owner-activity.json"
     if should_claim_proactive(state, _CHANNEL):
         return True
@@ -331,10 +338,26 @@ def _ag2space_proactive_claim_gate(path: Path) -> bool:
         return False  # racing consumer already claimed it
 
 
+def _ag2space_owner_dm_upgraded(room: str, replacement: str) -> None:
+    """Ask the owner to re-invite the agent; detached, --unless-open dedupes the row; a failed launch raises."""
+    import subprocess
+    try:
+        subprocess.Popen(
+            [sys.executable, str(_REPO / "scripts" / "ask-owner.py"),
+             "Your DM with me was upgraded to a new room I'm not in. "
+             "Please invite me there and repoint my DM.", "--unless-open"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True)
+    except OSError as e:
+        _log(f"owner-DM upgrade: ask-owner did not start ({e})")  # noqa: F821
+        raise
+
+
 # Assigned AFTER the exec: the canonical module's own `PROACTIVE_CLAIM_GATE =
 # None` default runs inside it and would overwrite an earlier assignment.
 PROACTIVE_CLAIM_GATE = _ag2space_proactive_claim_gate
 PROACTIVE_ROOM_GATE = _ag2space_proactive_room_gate
+OWNER_DM_UPGRADED_NOTIFY = _ag2space_owner_dm_upgraded
 
 if _RUN_MAIN:  # pragma: no cover — script-entry tail; the subprocess suite drives it
     __name__ = "__main__"

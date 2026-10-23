@@ -114,6 +114,46 @@ class OneAtATime(unittest.TestCase):
         self.assertTrue(out["empty"])
         self.assertEqual(0, out["items"])
 
+    def test_an_unreachable_room_is_said_to_be_unknown_never_an_empty_queue(self):
+        out = _probe("""
+        const html = renderQuestionQueue([], 0, 'adapter failed: <down>');
+        console.log(JSON.stringify({unknown: html.includes('Pending questions unknown — room unreachable'),
+                                    escaped: html.includes('&lt;down&gt;'),
+                                    empty: html.includes('No pending questions')}));
+        """)
+        self.assertTrue(out["unknown"])
+        self.assertTrue(out["escaped"])
+        self.assertFalse(out["empty"], "the outage must not read as no questions")
+
+    def test_a_held_row_during_an_outage_is_shown_beside_the_outage_never_as_the_whole_queue(self):
+        # With the room down the rows are only what is held locally: a bare "1 of 1"
+        # presents a partial queue as exhaustive, the same false confidence as a zero.
+        out = _probe("""
+        const rows = [{id: 'Q1', text: 'Held thing', detail: 'held', age_days: 1, refs: [], blocks: 0,
+                       recheck: null, in_room: false}];
+        const html = renderQuestionQueue(rows, 0, 'adapter failed: <room down>');
+        console.log(JSON.stringify({
+          unknown: html.includes('Pending questions unknown — room unreachable'),
+          escaped: html.includes('&lt;room down&gt;'),
+          partial: html.includes('showing 1 held locally; the remote queue is unknown'),
+          held: html.includes('Held thing'),
+          items: (html.match(/class="q-item"/g) || []).length,
+          position: html.includes('1 of 1 held locally'),
+          exhaustive: /1 of 1<\\/span>/.test(html),
+          banner: (html.match(/class="q-unknown"/g) || []).length,
+          reachable: renderQuestionQueue(rows, 0, null).includes('q-unknown')
+        }));
+        """)
+        self.assertTrue(out["unknown"], "the outage vanished behind the held row")
+        self.assertTrue(out["escaped"])
+        self.assertTrue(out["partial"])
+        self.assertTrue(out["held"], "the held row is still shown, so it can be answered")
+        self.assertEqual(1, out["items"])
+        self.assertTrue(out["position"])
+        self.assertFalse(out["exhaustive"], "'1 of 1' presented the local rows as the whole queue")
+        self.assertEqual(1, out["banner"])
+        self.assertFalse(out["reachable"], "no banner while the room is reachable")
+
 
 class Cursor(unittest.TestCase):
     def test_next_wraps_rather_than_running_off_the_end(self):

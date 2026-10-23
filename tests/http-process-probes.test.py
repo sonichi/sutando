@@ -80,6 +80,7 @@ class HttpProcessProbes(unittest.TestCase):
                 probe.assert_called_once_with("watch-tasks", timeout=3.0)
                 self.assertEqual(json.loads(body), {
                     "tasks": [], "watcher": bool(pids), "claude": False, "questions": [],
+                    "questions_unavailable": None,
                 })
                 handler.send_header.assert_any_call("Content-Type", "application/json")
                 handler.send_header.assert_any_call("Access-Control-Allow-Origin", "*")

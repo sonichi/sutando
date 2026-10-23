@@ -6,9 +6,10 @@ from .contract import (BackendCapabilities, ClaimBackend, ClaimToken,
                        CleanupReport, DeliveryOutcome, DeliveryProvider,
                        DeliveryReceipt, DrainReport, DrainResult, DrainStatus,
                        ProviderCapabilities, ProviderIndeterminate,
-                       ProviderRefused, RecoverReport)
+                       ProviderRefused, ProviderPermanentRefused, RecoverReport)
 from .core import DeliveryCore, RetryPolicy, idempotency_key
-from .backend_a import DesignAClaimBackend
+from .backend_a import (REFUSED_FOR_GOOD, DesignAClaimBackend, is_refused_for_good,
+                        refused_for_good)
 from .backend_c import DesignCClaimBackend  # noqa: F401
 
 __all__ = [
@@ -16,7 +17,7 @@ __all__ = [
     "DeliveryAttempt",
     "DeliveryOutcome", "DeliveryProvider", "DeliveryReceipt", "DrainReport",
     "DrainResult", "DrainStatus", "ProviderCapabilities",
-    "ProviderIndeterminate", "ProviderRefused", "RecoverReport",
+    "ProviderIndeterminate", "ProviderRefused", "ProviderPermanentRefused", "RecoverReport",
     "DeliveryCore", "RetryPolicy", "idempotency_key", "DesignAClaimBackend",
-    "DesignCClaimBackend",
+    "DesignCClaimBackend", "REFUSED_FOR_GOOD", "is_refused_for_good", "refused_for_good",
 ]

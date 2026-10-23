@@ -16,7 +16,9 @@ keywords = ["ag2", "agent", "relay", "gateway", "matrix", "delivery", "outbox", 
 classifiers = [
   "Programming Language :: Python :: 3",
   "License :: OSI Approved :: MIT License",
-  "Operating System :: OS Independent",
+  "Operating System :: POSIX",
+  "Operating System :: POSIX :: Linux",
+  "Operating System :: MacOS",
   "Intended Audience :: Developers",
 ]
 # Zero third-party runtime deps — the client is stdlib-only (urllib/json/...).
@@ -26,15 +28,33 @@ dependencies = []
 Homepage = "https://ag2.space"
 Source = "https://github.com/sonichi/sutando"
 
+[project.optional-dependencies]
+# Meta Hatch adapter (ag2_sparrow/adapters/hatch): stdlib-only, so the extra
+# only names the feature; `ag2-sparrow-hatch install` sets it up.
+hatch = []
+
 [project.scripts]
 ag2-sparrow = "ag2_sparrow.remote_gateway_bridge:main"
 # Separate entry, not a subcommand: remote_gateway_bridge.main() reads no
 # argv, so every current invocation starts the bridge and any dispatcher
 # would change one of them.
 ag2-sparrow-outbox = "ag2_sparrow.outbox_cli:main"
+ag2-sparrow-hatch = "ag2_sparrow.adapters.hatch.cli:main"
+ag2-sparrow-claude-local = "ag2_sparrow.adapters.claude_code.cli:main"
+ag2-sparrow-codex-local = "ag2_sparrow.adapters.codex.connect_cli:main"
 
-[tool.setuptools]
-packages = ["ag2_sparrow"]
+# Discovered, not listed: a hand-written list silently drops a new subpackage.
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["ag2_sparrow*"]
+
+# Non-Python files the Hatch adapter installs; they must ship in the wheel.
+[tool.setuptools.package-data]
+# the guarded pane-key send and its bounded wait, vendored from src/
+"ag2_sparrow" = ["*.sh"]
+"ag2_sparrow.adapters.hatch" = ["*.sh", "*.json"]
+"ag2_sparrow.adapters.claude_routine" = ["*.md"]
+"ag2_sparrow.adapters.claude_cloud_session" = ["*.md"]
 
 [tool.setuptools.dynamic]
 version = { attr = "ag2_sparrow.__version__" }

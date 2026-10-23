@@ -9,6 +9,11 @@ workspace symlink, ENGINE_UPDATE_PENDING.json in the updater's own shape.
 """
 from __future__ import annotations
 
+from _helpers.hermetic_env import isolate_os_environ, isolated_child_env
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import json
 import os
 import shutil
@@ -31,7 +36,7 @@ FIXTURE_IDENT = {
 
 
 def git(repo, *args, check=True):
-    env = dict(os.environ)
+    env = isolated_child_env()
     env.update(FIXTURE_IDENT)
     proc = subprocess.run(["git", "-C", str(repo)] + list(args),
                           capture_output=True, text=True, env=env)
@@ -41,6 +46,7 @@ def git(repo, *args, check=True):
 
 
 def run_script(name, *args, env=None):
+    env = env if env is not None else isolated_child_env()
     return subprocess.run([sys.executable, str(SCRIPTS / name)] + list(args),
                           capture_output=True, text=True, env=env)
 
@@ -345,7 +351,7 @@ class TestGitResolution(unittest.TestCase):
         self.assertTrue(self.real_git)
 
     def sanitized_env(self, **extra):
-        env = dict(os.environ)
+        env = isolated_child_env()
         env["PATH"] = ""
         env.pop("ENGINE_CONFLICT_GIT", None)
         env.update(extra)
@@ -442,7 +448,9 @@ class TestProposalDelivery(unittest.TestCase):
         self.msg = self.root / "proposal.txt"
         self.msg.write_text("merged_sha abc123\nsrc/app.txt: hand-merged\n")
         self.record = self.root / "gateway-record.json"
-        self.pq = self.root / "host dir" / "pending-questions.md"
+        self.ws = self.root / "work space"
+        (self.ws / "results").mkdir(parents=True)
+        self.outbox = self.ws / "state" / "pending-questions-outbox"
 
     def stub_room_ops(self, status=200, explode=False):
         d = self.root / "stub room-ops"
@@ -460,40 +468,44 @@ class TestProposalDelivery(unittest.TestCase):
         return d
 
     def deliver(self, *args, env_room=None):
-        env = dict(os.environ)
+        env = isolated_child_env()
         env["PATH"] = ""  # no osascript: notification tier degrades cleanly
+        env["SUTANDO_HOST_LABEL"] = "testhost"
         env.pop("ENGINE_CONFLICT_NOTIFY_ROOM", None)
+        env.pop("SUTANDO_INSTANCE_ID", None)
         if env_room is not None:
             env["ENGINE_CONFLICT_NOTIFY_ROOM"] = env_room
         return run_script("deliver.py", "--message-file", str(self.msg),
-                          "--pending-questions", str(self.pq), *args, env=env)
+                          "--workspace", str(self.ws), *args, env=env)
+
+    def held(self):
+        """The fallback's record: ask-owner's outbox entries (no room is reachable here)."""
+        return [json.loads(p.read_text()) for p in sorted(self.outbox.glob("*.json"))]
 
     def test_no_room_never_guesses_and_falls_back(self):
-        self.pq.parent.mkdir(parents=True)
-        self.pq.write_text("## Older question\nbody\n\n# Resolved\n## done q\n")
         d = self.deliver("--room-ops-dir", str(self.stub_room_ops()))
         self.assertEqual(d.returncode, 0, d.stdout + d.stderr)
         out = out_json(d)
         self.assertEqual(out["status"], "fallback")
         self.assertEqual(out["reason"], "no-room")
         self.assertFalse(self.record.exists(), "no configured room -> no post, ever")
-        text = self.pq.read_text()
-        self.assertIn("Engine update conflict", text)
-        self.assertLess(text.index("Engine update conflict"), text.index("# Resolved"),
-                        "new question must be inserted ABOVE the Resolved divider")
+        [held] = self.held()
+        self.assertIn("Engine update conflict", held["question"]["question"])
+        self.assertIn("merged_sha abc123", held["question"]["context"])
+        dms = list((self.ws / "results").glob("proactive-*.txt"))
+        self.assertEqual(len(dms), 1, "ask-owner queues the owner's DM once")
+        self.assertTrue(any("recorded:" in line for line in out["ask"]), out)
 
     def test_post_failure_always_reaches_the_fallback(self):
-        for kwargs, want_reason in (({"status": 500}, "http-500"),
-                                    ({"explode": True}, "post-failed")):
-            if self.pq.exists():
-                self.pq.unlink()
+        for n, (kwargs, want_reason) in enumerate((({"status": 500}, "http-500"),
+                                                   ({"explode": True}, "post-failed")), 1):
             d = self.deliver("--room", "!owner-room:stub.local",
                              "--room-ops-dir", str(self.stub_room_ops(**kwargs)))
             self.assertEqual(d.returncode, 0, d.stdout + d.stderr)
             out = out_json(d)
             self.assertEqual(out["status"], "fallback")
             self.assertIn(want_reason, out["reason"])
-            self.assertTrue(self.pq.is_file(), "failed send must still reach the owner")
+            self.assertEqual(len(self.held()), n, "failed send must still reach the owner")
 
     def test_declared_room_posts_via_gateway(self):
         d = self.deliver("--room-ops-dir", str(self.stub_room_ops(status=200)),
@@ -506,7 +518,7 @@ class TestProposalDelivery(unittest.TestCase):
         self.assertEqual(rec["payload"]["op"], "message")
         self.assertEqual(rec["payload"]["room_id"], "!owner-room:stub.local")
         self.assertIn("merged_sha abc123", rec["payload"]["body"])
-        self.assertFalse(self.pq.exists(), "successful post needs no fallback")
+        self.assertEqual(self.held(), [], "successful post needs no fallback")
 
 
 if __name__ == "__main__":

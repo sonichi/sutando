@@ -70,8 +70,8 @@ const ACTIVE_MARKER =
 	'That is a hallucination. Speak to the user instead.]';
 
 const MEETING_MARKER =
-	' [BASE MODE: meeting — listen and take notes silently. Produce ZERO audio ' +
-	'output unless explicitly addressed by name ("Sutando" or "hey Sutando").]';
+	' [BASE MODE: meeting — the meeting is being transcribed into notes and you ' +
+	'are not hearing it. Produce ZERO audio output.]';
 
 const PRESENTER_MARKER =
 	' [BASE MODE: presenter — PRESENTER MODE IS CURRENTLY ACTIVE. Apply the ' +

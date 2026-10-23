@@ -7,6 +7,12 @@ media route under the `[file:]` allowlist plus the screenshot dir. A
 
 Run: python3 tests/task-progress-step.test.py
 """
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import base64
 import contextlib
 import io
@@ -130,6 +136,26 @@ class StepTests(unittest.TestCase):
                 self.assertEqual(len(self.sent), 1, "the text line still lands")
                 self.assertIn("screenshot skipped", err)
                 self.assertIn(expect[name], err)
+
+    def test_a_local_or_unknown_writer_sends_no_step(self):
+        for source, channel in (("voice", "local-voice"), ("runtime-api", "runtime-api"),
+                                ("some-new-writer", "some-new-writer")):
+            rc, err = self._run("--message", "Step", "--screenshot", self.png,
+                                source=source, channel=channel)
+            self.assertEqual(rc, notify.NO_ROUTE_EXIT, source)
+            self.assertIn("no delivery path", err)
+        self.assertEqual(self.sent, [])
+
+    def test_step_routes_through_notifys_delivery_route(self):
+        # The verdict is notify's: a copied rule in step.py would ignore these patches.
+        with mock.patch.object(notify, "_delivery_route", lambda source, channel: None):
+            rc, err = self._run("--message", "Step")
+        self.assertEqual((rc, self.sent), (notify.NO_ROUTE_EXIT, []))
+        self.assertIn("no delivery path", err)
+        with mock.patch.object(notify, "_delivery_route", lambda source, channel: "gateway"):
+            rc, _ = self._run("--message", "Step", source="runtime-api", channel="runtime-api")
+        self.assertEqual(rc, 0)
+        self.assertEqual([s["payload"]["room_id"] for s in self.sent], ["runtime-api"])
 
     def test_long_message_is_refused_before_anything_is_sent(self):
         rc, err = self._run("--message", "x" * 300, "--screenshot", self.png)

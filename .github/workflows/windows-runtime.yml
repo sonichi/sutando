@@ -11,6 +11,8 @@ on:
     - cron: '37 8 * * *'
   workflow_dispatch: {}
 
+# IMPORTANT: tests must never emit product telemetry; removing or weakening this makes CI test runs
+# count as real users on the admin DAU. Enforced by tests/telemetry-test-optout-guard.test.py.
 env:
   SUTANDO_TELEMETRY: "0"
 
@@ -40,10 +42,8 @@ jobs:
         with:
           python-version: '3.11'
 
-      # bodhi-realtime-agent ships a prebuilt dist, but its git dependency
-      # postinstall uses POSIX `[ ... ]` syntax that cmd.exe cannot parse.
-      # Skipping lifecycle scripts is the Windows clean-install path; the next
-      # step fails closed if the required prebuilt package is absent.
+      # bodhi-realtime-agent ships a prebuilt dist from npm; lifecycle scripts stay
+      # skipped and the next step fails closed if that dist is absent.
       - name: Install dependencies (Windows)
         run: npm ci --ignore-scripts
 
@@ -227,6 +227,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { $failures += 'single-instance.test.py failed' }
           python tests/file-lock.test.py
           if ($LASTEXITCODE -ne 0) { $failures += 'file-lock.test.py failed' }
+          python tests/holder-lock.test.py
+          if ($LASTEXITCODE -ne 0) { $failures += 'holder-lock.test.py failed' }
           python tests/outbox-windows.test.py
           if ($LASTEXITCODE -ne 0) { $failures += 'outbox-windows.test.py failed' }
           python tests/proactive-recovery-process-probe.test.py

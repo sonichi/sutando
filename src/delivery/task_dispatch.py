@@ -25,11 +25,14 @@ CLI, for bash callers with only an interpreter path:
 
     task_dispatch.py has-result <results_dir> <filename>                 # exit 0/1
     task_dispatch.py find-ready <results_dir> <filename>                 # prints path, exit 0/1
+    task_dispatch.py head-abandoned <results_dir> <filename> <payload>  # exit 0 = drop the queue head
     task_dispatch.py pending-candidates <tasks_dir> <results_dir> [--claims-dir D]
     task_dispatch.py next-pending <tasks_dir> <results_dir> [--claims-dir D]
     task_dispatch.py inflight-mark <inflight_dir> <filename> <incarnation>
     task_dispatch.py inflight-live <inflight_dir> <filename> <incarnation>   # exit 0/1
     task_dispatch.py inflight-clear <inflight_dir> <filename>
+    task_dispatch.py partial-mark <partial_dir> <filename> <incarnation>   # composer text on stdin, optional
+    task_dispatch.py partial-leftover <partial_dir> <filename> <incarnation>   # prints text, exit 0/1
     task_dispatch.py announced-entry <tasks_dir> <announced> [--resolved <payload_dir>]  # prints key<TAB>payload, exit 0/1
 
 `announced-entry` is the one reading of a watcher's `TASK_FILE:` line: a bare name is a file in
@@ -41,15 +44,24 @@ filed under; the payload is what the prompt tells the session to read.
 `inflight-*` is the at-most-once record a notifier keeps between a confirmed submit and a
 ready result, keyed to the core incarnation, because terminal history is a lossy record.
 
+`partial-*` is the same at-most-once record, kept in its own directory, for a paste a
+notifier cut short -- plus (optionally) the exact composer text that attempt left behind,
+so a later attempt can prove a garbled, non-boundary leftover sitting in the composer is
+its OWN failed typing (safe to clear) rather than guess from character counts alone.
+
 `find-ready` exists because "does a ready result exist" and "read what it says" must resolve
 to the SAME file: a caller that re-derives the live path after `has-result` says yes can be
 answering about an archived body while reading an untouched live placeholder instead.
 """
 from __future__ import annotations
 
+import json
 import os
+import stat
+import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Iterator
 
@@ -65,6 +77,7 @@ __all__ = [
     "find_ready_result", "has_ready_result", "find_ready_result_for_filename", "ready_result_filenames",
     "pending_candidates", "next_pending_task",
     "mark_inflight", "inflight_is_live", "clear_inflight",
+    "mark_partial_paste", "partial_paste_leftover",
     "announced_entry",
 ]
 
@@ -123,6 +136,16 @@ def find_ready_result_for_filename(results_dir: "Path | str", filename: str, *,
     it can read THAT path's body instead of assuming the live one backs every ready result.
     """
     return find_ready_result(results_dir, _task_id_for_filename(filename), reader=reader)
+
+
+def head_abandoned(results_dir: "Path | str", filename: str, payload: "Path | str") -> bool:
+    """True iff a queued or submitted task can never resolve: no ready result and its payload is gone.
+
+    A task archived without a result findable here (never answered, or answered and its
+    result removed by another consumer) would otherwise hold a notifier's queue head, or
+    its in-flight wait, forever, blocking every task behind it.
+    """
+    return not Path(payload).exists() and not has_ready_result(results_dir, filename)
 
 
 def has_ready_result(results_dir: "Path | str", filename: str) -> bool:
@@ -239,13 +262,14 @@ def pending_candidates(
     step handed back.
     """
     claims = Path(claims_dir) if claims_dir else None
-    for task in sort_tasks_by_priority(Path(tasks_dir).glob("*.txt")):
-        if not task.is_file():
-            continue
+    tasks = [t for t in sort_tasks_by_priority(Path(tasks_dir).glob("*.txt"))
+             if t.is_file() and t.name and "/" not in t.name and ".." not in t.name]
+    # One listing per result layout for the whole queue; a per-task glob of the flat archive
+    # costs (tasks x archive size) and dominated every polling caller's CPU.
+    ready = ready_result_filenames(results_dir, [t.name for t in tasks])
+    for task in tasks:
         name = task.name
-        if not name or "/" in name or ".." in name:
-            continue
-        if has_ready_result(results_dir, name):
+        if name in ready:
             continue
         if claims is not None and (claims / name).is_file():
             continue
@@ -312,10 +336,14 @@ def inflight_is_live(inflight_dir: "Path | str", filename: str, incarnation: str
     turn with it) and is removed. An unreadable current incarnation ("") keeps
     any marker live: not knowing which core is running is not evidence the
     prompt was never submitted.
+
+    Liveness is judged on the FIRST line only. `mark_partial_paste` writes a
+    second line (the leftover composer text) after the same incarnation; a
+    plain `mark_inflight` record never has one, so this is backward compatible.
     """
     path = _inflight_path(inflight_dir, filename)
     try:
-        recorded = path.read_text().strip()
+        recorded = path.read_text().split("\n", 1)[0].strip()
     except FileNotFoundError:
         return False
     if not recorded:
@@ -334,10 +362,58 @@ def clear_inflight(inflight_dir: "Path | str", filename: str) -> None:
     _inflight_path(inflight_dir, filename).unlink(missing_ok=True)
 
 
+def mark_partial_paste(partial_dir: "Path | str", filename: str, incarnation: str, composer_text: str = "") -> None:
+    """Record a cut-short paste for `filename` under `incarnation`, same at-most-once
+    contract as `mark_inflight` (first line), plus the exact composer text the failed
+    attempt left behind, when the caller has it.
+
+    Without the text, a later attempt can only ever learn "something was cut short" --
+    never whether a non-boundary, garbled leftover sitting in the composer right now is
+    that same cut-short paste (safe to clear) or an unrelated human draft (never ours to
+    touch). Recording the text is what makes that distinction provable.
+    """
+    incarnation = incarnation.strip()
+    if not incarnation:
+        raise ValueError("a partial-paste marker needs the core incarnation; empty would read as live forever")
+    path = _inflight_path(partial_dir, filename)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(incarnation + "\n")
+            if composer_text:
+                fh.write(composer_text)
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+
+
+def partial_paste_leftover(partial_dir: "Path | str", filename: str, incarnation: str) -> "str | None":
+    """The composer text `mark_partial_paste` recorded for `filename`, if the marker is
+    still live for the CURRENT incarnation (same staleness rule as `inflight_is_live`)
+    AND carries text; None otherwise -- absent, stale, or written before this field
+    existed (a plain `mark_inflight`-style single-line record, which pre-dates this and
+    must not be misread as "an empty leftover", so the caller gets the same answer as a
+    missing marker: nothing provable to clear against).
+    """
+    if not inflight_is_live(partial_dir, filename, incarnation):
+        return None
+    path = _inflight_path(partial_dir, filename)
+    try:
+        raw = path.read_text()
+    except FileNotFoundError:
+        return None
+    _, _, rest = raw.partition("\n")
+    return rest or None
+
+
 _USAGE = (
     "usage: task_dispatch.py has-result <results_dir> <filename>\n"
     "       task_dispatch.py find-ready <results_dir> <filename>\n"
-    "       task_dispatch.py sort-by-priority <tasks_dir>   # every *.txt, no result/claim/delivery filtering\n"
+    "       task_dispatch.py head-abandoned <results_dir> <filename> <payload>   # exit 0 drop / 1 keep\n"
+    "       task_dispatch.py sort-by-priority <tasks_dir> [--resolve-inbox WORKSPACE HELPER [--resolution-cache DIR]]\n"
+    "       task_dispatch.py reuse-inbox-resolution <cache_dir> <entry>   # exit 5 if changed or uncached\n"
     "       task_dispatch.py priority-tier <task_file>   # prints urgent|normal|low, the file's own header\n"
     "       task_dispatch.py pending-candidates <tasks_dir> <results_dir> [--claims-dir DIR] [--deliveries-dir DIR]\n"
     "       task_dispatch.py next-pending <tasks_dir> <results_dir> [--claims-dir DIR] [--deliveries-dir DIR]\n"
@@ -346,7 +422,9 @@ _USAGE = (
     "       task_dispatch.py owned-by <deliveries_dir> <recipient>   # one id per line; exit 2 cannot decide\n"
     "       task_dispatch.py inflight-mark <inflight_dir> <filename> <incarnation>\n"
     "       task_dispatch.py inflight-live <inflight_dir> <filename> <incarnation>   # exit 0/1\n"
-    "       task_dispatch.py inflight-clear <inflight_dir> <filename>"
+    "       task_dispatch.py inflight-clear <inflight_dir> <filename>\n"
+    "       task_dispatch.py partial-mark <partial_dir> <filename> <incarnation>   # composer text on stdin, optional\n"
+    "       task_dispatch.py partial-leftover <partial_dir> <filename> <incarnation>   # prints text, exit 0/1"
 )
 
 
@@ -367,14 +445,98 @@ def _parse_dir_options(rest: list[str]) -> dict:
     return opts
 
 
+_INBOX_PRIORITY_LIMIT = 32
+_INBOX_PRIORITY_SECONDS = 10
+
+
+def _resolution_identity(path: Path):
+    try:
+        st = path.lstat()
+        if not stat.S_ISREG(st.st_mode):
+            return None
+        return [st.st_dev, st.st_ino, st.st_size, st.st_mode, st.st_mtime_ns, st.st_ctime_ns]
+    except OSError:
+        return None
+
+
+def _reuse_inbox_resolution(cache_dir: str, entry: str) -> int:
+    cache = Path(cache_dir) / Path(entry).name
+    try:
+        record = json.loads(cache.read_text())
+        cache.unlink()
+        if record["entry"] != _resolution_identity(Path(entry)) or record["entry"] is None:
+            return 5
+        if record["rc"] == 0:
+            if record["payload"] is None or record["payload"] != _resolution_identity(
+                    Path(record["stdout"].removesuffix("\n"))):
+                return 5
+        sys.stdout.write(record["stdout"])
+        sys.stderr.write(record["stderr"])
+        return record["rc"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return 5
+
+
+def _inbox_priority(entry: Path, workspace: str, helper: str, budget: int,
+                    cache_dir: "Path | None" = None) -> str:
+    """Use the dispatch resolver's bounds and validation without admitting the entry."""
+    identity = _resolution_identity(entry)
+    try:
+        resolved = subprocess.run(
+            ["bash", helper, str(entry), workspace, str(budget)],
+            capture_output=True, text=True, check=False,
+        )
+    except OSError:
+        return "normal"
+    if cache_dir is not None:
+        payload = Path(resolved.stdout.removesuffix("\n")) if resolved.returncode == 0 else None
+        record = {"entry": identity, "rc": resolved.returncode,
+                  "stdout": resolved.stdout, "stderr": resolved.stderr,
+                  "payload": _resolution_identity(payload) if payload is not None else None}
+        (cache_dir / entry.name).write_text(json.dumps(record))
+    if resolved.returncode:
+        return "normal"
+    return parse_priority_from_file(Path(resolved.stdout.removesuffix("\n")))
+
+
+def _inbox_priorities(entries: list[Path], workspace: str, helper: str,
+                      cache_dir: "Path | None" = None) -> dict[Path, str]:
+    """Resolve only the oldest prefix; unexamined entries retain normal/FIFO order."""
+    ordered = sort_tasks_by_priority(entries, priority_reader=lambda _: "normal")
+    deadline = time.monotonic() + _INBOX_PRIORITY_SECONDS
+    priorities = {}
+    for entry in ordered[:_INBOX_PRIORITY_LIMIT]:
+        # Reserve whole seconds for run_bounded; its TERM/KILL grace is at most
+        # one extra second plus polling overhead for the last lookup.
+        remaining = int(deadline - time.monotonic())
+        if remaining < 1:
+            break
+        priorities[entry] = _inbox_priority(entry, workspace, helper, remaining, cache_dir)
+    return priorities
+
+
 def _main(argv: list[str]) -> int:
+    if len(argv) == 3 and argv[0] == "reuse-inbox-resolution":
+        return _reuse_inbox_resolution(argv[1], argv[2])
     # A pure sort, no eligibility filtering -- the caller still decides
     # whether a file is eligible; this only changes the offered order.
     if argv and argv[0] == "sort-by-priority":
-        if len(argv) != 2:
+        cache_dir = None
+        if len(argv) == 7 and argv[5] == "--resolution-cache" and argv[6]:
+            cache_dir = Path(argv[6])
+            argv = argv[:5]
+        if len(argv) != 2 and not (len(argv) == 5 and argv[2] == "--resolve-inbox"
+                                  and argv[3] and argv[4]):
             print(_USAGE, file=sys.stderr)
             return 2
-        names = [p.name for p in sort_tasks_by_priority(Path(argv[1]).glob("*.txt"))]
+        reader = parse_priority_from_file
+        entries = list(Path(argv[1]).glob("*.txt"))
+        if len(argv) == 5 and os.environ.get("SUTANDO_INBOX_RESOLVER"):
+            priorities = _inbox_priorities(entries, argv[3], argv[4], cache_dir)
+            reader = lambda entry: priorities.get(entry, "normal")
+        names = [p.name for p in sort_tasks_by_priority(
+            entries, priority_reader=reader,
+        )]
         for name in names:
             print(name)
         return 0 if names else 1
@@ -393,6 +555,11 @@ def _main(argv: list[str]) -> int:
             print(_USAGE, file=sys.stderr)
             return 2
         return 0 if has_ready_result(first, second) else 1
+    if cmd == "head-abandoned":
+        if len(rest) != 1:
+            print(_USAGE, file=sys.stderr)
+            return 2
+        return 0 if head_abandoned(first, second, rest[0]) else 1
     if cmd == "find-ready":
         if rest:
             print(_USAGE, file=sys.stderr)
@@ -422,6 +589,26 @@ def _main(argv: list[str]) -> int:
             # Cannot decide is its own answer: 1 would read as "not in flight".
             print(f"task_dispatch.py: {cmd}: cannot read the marker ({exc})", file=sys.stderr)
             return 2
+    if cmd in ("partial-mark", "partial-leftover"):
+        if len(rest) != 1:
+            print(_USAGE, file=sys.stderr)
+            return 2
+        incarnation = rest[0]
+        try:
+            if cmd == "partial-mark":
+                mark_partial_paste(first, second, incarnation, sys.stdin.read())
+                return 0
+            text = partial_paste_leftover(first, second, incarnation)
+        except ValueError as exc:
+            print(f"task_dispatch.py: {exc}", file=sys.stderr)
+            return 2
+        except OSError as exc:
+            print(f"task_dispatch.py: {cmd}: cannot read the marker ({exc})", file=sys.stderr)
+            return 2
+        if text is None:
+            return 1
+        sys.stdout.write(text)
+        return 0
     if cmd == "owned-by":
         if rest:
             print(_USAGE, file=sys.stderr)

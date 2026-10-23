@@ -1,22 +1,21 @@
 #!/bin/bash
 # Sutando Gemini 3.1 rollout verification
 #
-# Runs after merging the full 3.1 compat stack:
-#   - bodhi fork #2 (sendAudio media→audio) — Susan
-#   - bodhi fork #3 (sendFile mimeType branching) — Chi
-#   - sutando #259 (duplicate tool declaration dedup + SDK bump) — Chi
+# Checks the Gemini 3.x prerequisites against the installed bodhi-realtime-agent
+# (npm, >= 0.4.0, which carries the text path and the media wire fixes upstream)
+# and sutando's own duplicate tool declaration dedup (#259).
 #
 # Then runs:
-#   1. npm install github:sonichi/bodhi_realtime_agent  (pulls new bodhi SHA)
-#   2. Verifies the installed bodhi dist contains all 3 fixes
+#   1. npm install  (installs the bodhi-realtime-agent version package.json pins)
+#   2. Verifies the installed bodhi matches the pin and sends the 3.x wire format
 #   3. Verifies sutando's tools deduplicate correctly
 #   4. Verifies .env is still pinned to 2.5 (so this run is safe to run even
 #      before the user is ready to flip 3.1 on)
 #   5. Prints the manual next-steps checklist
 #
 # Usage: bash src/verify-gemini-31.sh [--install]
-#   --install  run `npm install github:sonichi/bodhi_realtime_agent` first
-#              (only needed once after bodhi fork main advances)
+#   --install  run `npm install` first
+#              (only needed after the package.json pin moves)
 
 set -e
 
@@ -36,19 +35,21 @@ echo "========================================"
 
 if [ "${1:-}" = "--install" ]; then
   echo ""
-  echo "Pulling latest bodhi fork..."
-  npm install github:sonichi/bodhi_realtime_agent 2>&1 | tail -3
+  echo "Installing the pinned bodhi-realtime-agent..."
+  npm install 2>&1 | tail -3
 fi
 
-# 1. Bodhi dist — sendClientContent text path (PR #1)
+# 1. The installed bodhi is the version package.json pins (it routes 3.x text in sendContent()).
 echo ""
-echo "Bodhi fork PR #1 (sendClientContent → sendRealtimeInput text path):"
-if grep -q 'sendClientContent(turns, _turnComplete' node_modules/bodhi-realtime-agent/dist/index.js; then
-  # The narrowed method signature with _turnComplete (underscore-prefixed unused
-  # parameter) is a reliable marker for PR #1.
-  pass "sendClientContent narrowed to text-only routing to sendRealtimeInput"
+echo "bodhi-realtime-agent installed version:"
+PIN=$(node -p "require('./package.json').dependencies['bodhi-realtime-agent'] || ''" 2>/dev/null | sed 's/^[~^]//')
+INSTALLED=$(node -p "require('./node_modules/bodhi-realtime-agent/package.json').version" 2>/dev/null || true)
+if [ -z "$INSTALLED" ]; then
+  fail "bodhi-realtime-agent is not installed — run 'npm install' (or 'npm run build' for a bundled install)"
+elif [ "$INSTALLED" = "$PIN" ]; then
+  pass "installed $INSTALLED matches the package.json pin"
 else
-  fail "sendClientContent still uses the old shape — PR #1 not applied in this bodhi build"
+  fail "installed $INSTALLED but package.json pins $PIN — run 'npm install'"
 fi
 
 # 2. Bodhi dist — sendAudio audio key (PR #2)
@@ -56,11 +57,11 @@ fi
 # transport also has a sendAudio which uses `audio: base64Data` as a flat
 # wire field — that would false-positive a naive match.
 echo ""
-echo "Bodhi fork PR #2 (sendAudio media→audio):"
+echo "bodhi sendAudio wire format (media→audio):"
 GEMINI_SENDAUDIO=$(awk '
   /sendAudio\(base64Data\) {/ { capture=1; depth=0 }
   capture { print; if (/{/) depth++; if (/}/) { depth--; if (depth==0) exit } }
-' node_modules/bodhi-realtime-agent/dist/index.js | grep -A10 'this.session.sendRealtimeInput' || true)
+' node_modules/bodhi-realtime-agent/dist/index.js | grep -A10 'sendRealtimeInput' || true)
 if echo "$GEMINI_SENDAUDIO" | grep -q 'audio: { data'; then
   pass "sendAudio uses the audio key"
 elif echo "$GEMINI_SENDAUDIO" | grep -q 'media: { data'; then
@@ -72,7 +73,7 @@ fi
 # 3. Bodhi dist — sendFile branching (PR #3)
 # Same story — grep specifically for the Gemini transport's sendFile.
 echo ""
-echo "Bodhi fork PR #3 (sendFile mimeType branching):"
+echo "bodhi sendFile routing (mimeType branching):"
 GEMINI_SENDFILE=$(awk '
   /sendFile\(base64Data, mimeType\) {/ { capture=1; depth=0 }
   capture { print; if (/{/) depth++; if (/}/) { depth--; if (depth==0) exit } }
@@ -159,8 +160,8 @@ echo ""
 if [ "$FAIL" -gt 0 ]; then
   echo "NOT READY for 3.1 rollout. Resolve the failures above before unpinning .env."
   echo ""
-  echo "Most common fix: run 'npm install github:sonichi/bodhi_realtime_agent' to"
-  echo "pull the latest bodhi fork after PRs #2 and #3 merge there."
+  echo "Most common fix: run 'npm install' so node_modules matches the"
+  echo "bodhi-realtime-agent version pinned in package.json."
   exit 1
 fi
 

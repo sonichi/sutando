@@ -18,6 +18,10 @@ SCRIPT = ROOT / 'skills/report-feedback/report-feedback.py'
 spec = importlib.util.spec_from_file_location('rf_recovery', SCRIPT)
 rf = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(rf)
+VERSIONS = {
+    'sutando': {'version': 'test-sutando', 'commit': 'a' * 40},
+    'ag2space': {'version': 'test-ag2space', 'commit': 'b' * 40},
+}
 
 
 class RecoveryTests(unittest.TestCase):
@@ -30,8 +34,9 @@ class RecoveryTests(unittest.TestCase):
             mock.patch.object(rf, 'read_cloud_auth', return_value=('https://example.test', 'test')),
             mock.patch.object(rf, 'post_feedback', return_value=200),
             mock.patch.object(rf.time, 'time', return_value=10000),
+            mock.patch.object(rf, 'build_versions', return_value=VERSIONS),
         ]
-        self.workspace, self.auth, self.post, self.clock = [p.start() for p in self.patches]
+        self.workspace, self.auth, self.post, self.clock, self.versions = [p.start() for p in self.patches]
         for p in self.patches:
             self.addCleanup(p.stop)
 
@@ -76,6 +81,136 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(ctx['recovery']['release_reason'], 'no_recovery_within_one_hour')
         self.run_cli('--apply')
         self.assertEqual(self.post.call_count, 1)
+
+    def test_delayed_release_marks_original_observation_and_age(self):
+        observed, released = 1767225600, 1768608000
+        self.clock.return_value = observed
+        incident = self.queue()
+        original = rf.load_draft(self.ws, incident)
+        self.clock.return_value = released - 1
+        self.run_cli('--auto', '--title', 'bridge broken', '--body', 'later observation')
+        self.assertEqual(rf.list_drafts(self.ws), [original])
+        self.clock.return_value = released
+        self.run_cli('--apply')
+        self.run_cli('--apply')
+        self.post.assert_called_once()
+        payload = self.post.call_args.args[1]
+        self.assertTrue(payload['body'].startswith('bridge broken\n'))
+        self.assertIn('Original observation (UTC): 2026-01-01T00:00:00Z', payload['body'])
+        self.assertIn('Released (UTC): 2026-01-17T00:00:00Z', payload['body'])
+        self.assertIn('Elapsed hold duration: 16 days, 0:00:00', payload['body'])
+        self.assertIn('Historical report', payload['body'])
+        self.assertIn('at least 72 hours', payload['body'])
+        self.assertEqual(payload['context']['idempotency_key'], incident)
+        self.assertEqual(payload['context']['versions'], VERSIONS)
+        self.assertEqual(payload['context']['recovery'], {
+            **original['payload']['recovery'],
+            'released': released, 'release_reason': 'no_recovery_within_one_hour',
+            'observed_at': observed, 'held_seconds': 1382400, 'historical': True,
+        })
+        persisted = json.loads(rf.filed_receipt(self.ws, incident).read_text())
+        self.assertEqual(persisted['created'], observed)
+        self.assertEqual(persisted['payload']['body'], original['payload']['body'])
+        self.assertNotIn('observed_at', persisted['payload']['recovery'])
+
+    def test_historical_warning_at_72_hour_boundary(self):
+        observed = 1767225600
+        for seconds, release_text, duration, historical in (
+            (3600, '2026-01-01T01:00:00Z', '1:00:00', False),
+            (259199, '2026-01-03T23:59:59Z', '2 days, 23:59:59', False),
+            (259200, '2026-01-04T00:00:00Z', '3 days, 0:00:00', True),
+        ):
+            with self.subTest(seconds=seconds):
+                self.post.reset_mock()
+                self.clock.return_value = observed
+                self.queue(f'held for {seconds} seconds')
+                self.clock.return_value = observed + seconds
+                self.run_cli('--apply')
+                self.post.assert_called_once()
+                payload = self.post.call_args.args[1]
+                self.assertIn('Original observation (UTC): 2026-01-01T00:00:00Z', payload['body'])
+                self.assertIn(f'Released (UTC): {release_text}', payload['body'])
+                self.assertIn(f'Elapsed hold duration: {duration}', payload['body'])
+                self.assertEqual('Historical report' in payload['body'], historical)
+                self.assertEqual(payload['context']['recovery']['held_seconds'], seconds)
+                self.assertIs(payload['context']['recovery']['historical'], historical)
+        self.post.reset_mock()
+        self.clock.return_value = observed
+        incident = self.queue('signed out at release')
+        self.auth.return_value = (None, None)
+        self.clock.return_value = observed + 3600
+        self.run_cli('--apply')
+        self.post.assert_not_called()
+        self.assertEqual(rf.load_draft(self.ws, incident)['payload']['recovery']['released'], observed + 3600)
+        self.auth.return_value = ('https://example.test', 'test')
+        self.clock.return_value = observed + 16 * 86400
+        self.run_cli('--apply')
+        self.post.assert_called_once()
+        payload = self.post.call_args.args[1]
+        self.assertIn('Released (UTC): 2026-01-01T01:00:00Z', payload['body'])
+        self.assertIn('Elapsed hold duration: 1:00:00', payload['body'])
+        self.assertNotIn('Historical report', payload['body'])
+        self.assertEqual(payload['context']['recovery']['released'], observed + 3600)
+        self.assertEqual(payload['context']['recovery']['held_seconds'], 3600)
+        self.assertIs(payload['context']['recovery']['historical'], False)
+
+    def test_legacy_draft_age_is_unknown(self):
+        released = 1768608000
+        for created, observed_at, observation_text in (
+            (None, None, 'unknown'),
+            ('invalid timestamp', None, 'unknown'),
+            (released + 1, released + 1, '2026-01-17T00:00:01Z'),
+        ):
+            with self.subTest(created=created):
+                self.post.reset_mock()
+                self.clock.return_value = 1767225600
+                incident = self.queue(f'unknown age {created!r}')
+                rec = rf.load_draft(self.ws, incident)
+                if created is None:
+                    del rec['created']
+                else:
+                    rec['created'] = created
+                rf.save_draft(self.ws, rec)
+                self.clock.return_value = released
+                self.run_cli('--apply')
+                self.run_cli('--apply')
+                self.post.assert_called_once()
+                payload = self.post.call_args.args[1]
+                self.assertIn(f'Original observation (UTC): {observation_text}', payload['body'])
+                self.assertIn('Released (UTC): 2026-01-17T00:00:00Z', payload['body'])
+                self.assertIn('Elapsed hold duration: unknown', payload['body'])
+                self.assertNotIn('Historical report', payload['body'])
+                recovery = payload['context']['recovery']
+                self.assertEqual(recovery['observed_at'], observed_at)
+                self.assertIsNone(recovery['held_seconds'])
+                self.assertIsNone(recovery['historical'])
+                self.assertEqual(recovery['released'], released)
+                persisted = json.loads(rf.filed_receipt(self.ws, incident).read_text())
+                if created is None:
+                    self.assertNotIn('created', persisted)
+                else:
+                    self.assertEqual(persisted['created'], created)
+
+    def test_manual_submission_body_remains_unchanged(self):
+        versions_body = ('\n\n### Build versions\n'
+                         f'- Sutando: test-sutando (commit: {"a" * 40})\n'
+                         f'- AG2Space: test-ag2space (commit: {"b" * 40})')
+        for body in ('  Owner report.\nSecond line.  ', ''):
+            for ask in (False, True):
+                with self.subTest(body=body, ask=ask):
+                    self.post.reset_mock()
+                    self.clock.return_value = 1767225600
+                    title = f'manual {body!r} {ask}'
+                    self.run_cli('--title', title, '--body', body, *(['--ask'] if ask else []))
+                    if ask:
+                        self.post.assert_not_called()
+                        incident = rf.list_drafts(self.ws)[0]['id']
+                        self.clock.return_value = 1768608000
+                        self.run_cli('--decide', incident, 'file')
+                    self.post.assert_called_once()
+                    payload = self.post.call_args.args[1]
+                    self.assertEqual(payload['body'], (body.strip() or title) + versions_body)
+                    self.assertNotIn('recovery', payload['context'])
 
     def test_started_recovery_holds_beyond_deadline_then_success_suppresses(self):
         incident = self.queue()

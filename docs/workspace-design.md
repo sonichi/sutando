@@ -19,6 +19,8 @@ Through 2026-05-18 a workspace-vs-repo bug class surfaced ~28 sites across Pytho
 
 That's it. Two top-level spaces. Sync is configured per-sub-path inside Workspace, not by having a separate "synced" container.
 
+**One deliberate exception, for locks only.** `src/holder_lock.py` (and its bundled copy in `ag2-sparrow`) keeps its lock files in a host-local, per-uid, never-synced runtime directory: `<home of the effective uid>/.local/state/ag2-sparrow/locks/<hash of the work root directory's device and inode>/`. It is outside both spaces on purpose: a lock must resolve to one place for every launch context of a user and must never be synced or mirrored. It holds only `lock`, `holder` and `waiting.<pid>` files, and it is not a third state container for anything else.
+
 ## Quick decision: which space?
 
 When adding code that reads or writes a file, ask: **does it ship with every install (same on every clone)?**
@@ -70,7 +72,7 @@ Per-user runtime + content. Lives at `<repo>/workspace/` by default (post-M0). S
 | `notes/` | ✅ yes (default) | Persistent, user-authored | Long-form notes, research, daily logs |
 | `.claude-sutando/projects/<slug>/memory/` | ✅ yes (default) | Persistent, agent-authored | Auto-memory files written by `/remember` etc. |
 | `build_log.md` | ✅ yes (default) | Append-only | Session changelogs from proactive-loop |
-| `pending-questions.md` | ✅ yes (default) | Persistent | User-deferred questions |
+| `pending-questions.md` | ✅ yes (default) | Persistent | Legacy per-host file, read-only history; live questions are rows of the room database (`src/pending_questions_reader.py list`) |
 | `tasks/`, `results/` | ❌ no | Ephemeral | Per-tick task queue + replies (per-host runtime) |
 | `state/cores/<host>.alive` | ❌ no | Per-host heartbeat | Per-host structural state, not synced |
 | `state/auth/`, `state/cloud-auth.json`, `state/device.json` | ❌ no | Per-host durable | Install/identity state, per-host |

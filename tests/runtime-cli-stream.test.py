@@ -11,6 +11,11 @@ Run: python3 tests/runtime-cli-stream.test.py   (stdlib only)
 """
 from __future__ import annotations
 
+from _helpers.hermetic_env import isolate_os_environ, isolated_child_env
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import json
 import os
 import signal
@@ -30,7 +35,7 @@ PYBASE = [sys.executable]
 if os.environ.get("SUTANDO_TEST_SUBPROCESS_COVERAGE") == "1":
     PYBASE += ["-m", "coverage", "run", f"--rcfile={REPO / '.coveragerc'}"]
 
-ENV = {**os.environ,
+ENV = {**isolated_child_env(),
        "SUTANDO_RUN_DIR": str(Path(TMP) / "run"),
        "SUTANDO_RUNTIME_SOCKET": str(Path(TMP) / "rt.sock"),
        "SUTANDO_RUNTIME_DB": str(Path(TMP) / "runtime-state.sqlite"),

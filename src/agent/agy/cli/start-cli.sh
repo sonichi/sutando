@@ -34,6 +34,18 @@ EOF
 tmux_available() { command -v tmux >/dev/null 2>&1; }
 session_exists() { tmux_available && tmux -S "$TMUX_SOCKET" has-session -t "=$SESSION" 2>/dev/null; }
 
+# Task injection was removed, but an update leaves a running "<session>-watcher" from it;
+# retire it on every run, since the early return below skips everything else.
+retire_stale_watcher() {
+  local watcher="${SESSION}-watcher"
+  tmux -S "$TMUX_SOCKET" has-session -t "=$watcher" 2>/dev/null || return 0
+  if tmux -S "$TMUX_SOCKET" kill-session -t "=$watcher" 2>/dev/null; then
+    echo "Retired stale $watcher (task injection is no longer part of this launcher)."
+  elif tmux -S "$TMUX_SOCKET" has-session -t "=$watcher" 2>/dev/null; then
+    echo "  ⚠ could not retire stale $watcher on $TMUX_SOCKET" >&2
+  fi
+}
+
 attach_or_report_existing() {
   if [ -t 1 ] && [ -z "${TMUX:-}" ]; then
     echo "$SESSION already running — attaching (Ctrl-b d to detach)..."
@@ -95,6 +107,8 @@ if ! tmux_available; then
   echo "tmux not found — required for the persistent agy session." >&2
   exit 127
 fi
+
+retire_stale_watcher
 
 # Idempotency guard: a second invocation attaches (or reports) instead of
 # starting a duplicate session.

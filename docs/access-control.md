@@ -110,6 +110,26 @@ match. Review DMs, publication retries, and decision-result acknowledgements
 are durable and idempotent, so a retry neither spams the owner nor publishes the
 result twice.
 
+The same final scan (`policy/egress/result.guard_result_for_tier`) runs on every bridge's non-owner reply leg, Slack included. Besides markers and secrets it withholds a result that quotes internal error detail (a raw OS error, a traceback, or a local filesystem path): those belong in the owner's log, never in another person's conversation. On Slack a proactive owner notice resolves its recipient the way inbound tier resolution does, so an allowlisted member missing from `tierMap` is never treated as owner.
+
+### Owner-mention tasks
+
+With the room's per-agent **admit on owner mention** policy on, the broker also
+delivers a room message that @-mentions the agent's owner, not the agent, and
+marks it `owner_mentioned: "true"`. The gateway writes `owner_mentioned: true`
+above `task:` only for that exact string, so a body line cannot claim it; the
+tier still comes from the sender. It appends an owner-mention instruction after
+any tier block: do not reply in the room; if the owner has not already answered
+the message, DM him the message with a link and propose any next step through
+`scripts/ask-owner.py --task-file`. The delivery side enforces it on the
+result-file path: before the tier guard, both the live drain and the orphan
+sweep send an owner-mention result other than `[no-send]` / `[REPLIED]` /
+`[deduped:]` to the owner's DM (a `.to-ag2space` proactive file) and close the
+room's turn with `no_send` (rule:
+`policy/egress/result.owner_mention_result_refused_by_room`). The guard covers
+that path only: a core that posts directly through room_ops and then writes
+`[REPLIED]` is bound by the instruction alone.
+
 ## A non-owner asking to report a bug
 
 Filing a bug or feature report (`skills/report-feedback/`) is owner-tier: it files under the owner's

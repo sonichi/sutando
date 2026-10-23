@@ -36,6 +36,11 @@ import urllib.error
 from pathlib import Path
 from unittest.mock import patch
 
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 REPO = Path(__file__).resolve().parent.parent
 SCRIPT = REPO / "src" / "remote-gateway-bridge.py"
 
@@ -109,12 +114,12 @@ class DurableAck(unittest.TestCase):
             if written:
                 tid, durable = written
                 inflight.add(tid)
-                pending.append((tid, durable))
+                pending.append((tid, durable, mod._lease_id_of(task)))
         committed = mod._save_inflight(inflight) if pending else True
         if pending and committed:
             committed = mod._record_pending_acks(pending)
-        for tid, durable in pending if committed else ():
-            mod._post_task_ack(tid, durable)
+        for tid, durable, lease in pending if committed else ():
+            mod._post_task_ack(tid, durable, lease)
         return pending
 
     # -- 1. the durable-write sequence -------------------------------------- #
@@ -178,9 +183,9 @@ class DurableAck(unittest.TestCase):
         seen: list[bool] = []
         real = mod._post_task_ack
 
-        def ack(tid, durable=False):
+        def ack(tid, durable=False, lease_id=None):
             seen.append(mod.TASK_MEDIA_FILE.exists())
-            return real(tid, durable)
+            return real(tid, durable, lease_id)
 
         with patch.object(mod, "_post_task_ack", side_effect=ack):
             self._ack_round([self._task("task-old")])
@@ -204,9 +209,9 @@ class DurableAck(unittest.TestCase):
             synced.add(os.fstat(fd).st_ino)
             return real_fsync(fd)
 
-        def ack(tid, durable=False):
+        def ack(tid, durable=False, lease_id=None):
             at_ack.append(want <= synced)
-            return real_ack(tid, durable)
+            return real_ack(tid, durable, lease_id)
 
         class _Watch:
             def __enter__(_self):
@@ -431,6 +436,95 @@ class DurableAck(unittest.TestCase):
             fresh._retry_pending_acks({"task-restart"})
         self.assertEqual(calls[0][2], {"id": "task-restart", "durable": True})
 
+    def test_a_served_lease_generation_rides_the_ack_and_its_retry_after_a_restart(self):
+        """A task served with `lease_id` acks under that generation; a lease-less
+        task acks without the key. The ledger keeps the generation, so the retry
+        a fresh process posts after a restart names the serve it answers."""
+        mod = self.mod
+        leased = {**self._task("task-leased"), "lease_id": "gen-2"}
+        self._ack_round([leased, self._task("task-plain")])
+        self.assertEqual([c[2] for c in self._acks()],
+                         [{"id": "task-leased", "lease_id": "gen-2", "durable": True},
+                          {"id": "task-plain", "durable": True}])
+        with patch.object(mod, "_req", side_effect=urllib.error.URLError("down")):
+            self._ack_round([{**self._task("task-lost"), "lease_id": "gen-5"}])
+        fresh = _load(self.ws)
+        self.assertEqual(fresh._load_pending_acks(), {"task-lost": True})
+        self.assertEqual(fresh._load_pending_leases(), {"task-lost": "gen-5"})
+        calls: list = []
+        with patch.object(fresh, "_req", side_effect=lambda *a, **k: calls.append(a) or {}):
+            fresh._retry_pending_acks({"task-lost"})
+        self.assertEqual(calls[0][2], {"id": "task-lost", "lease_id": "gen-5", "durable": True})
+        self.assertEqual(fresh._load_pending_acks(), {})
+
+    def test_a_stale_generation_404_retires_the_record_and_logs_the_task(self):
+        """`404 {"reason": "stale lease generation"}`: the broker re-served the
+        task under a newer generation, so this ack is retired like any other
+        not-leased 404 — one log line names the task, no retry, no cooldown."""
+        mod = self.mod
+        with patch.object(mod, "_req", side_effect=urllib.error.URLError("down")):
+            self._ack_round([{**self._task("task-stale"), "lease_id": "gen-1"}])
+        self.assertEqual(mod._load_pending_leases(), {"task-stale": "gen-1"})
+        stale = _http(404, b'{"error":"not leased to you","reason":"stale lease generation"}')
+        logs: list[str] = []
+        with patch.object(mod, "_req", side_effect=stale), \
+             patch.object(mod, "_log", side_effect=lambda m, *a, **k: logs.append(str(m))):
+            mod._retry_pending_acks({"task-stale"})
+        self.assertEqual(mod._load_pending_acks(), {})
+        self.assertEqual(mod._ack_disabled_until, 0.0)
+        named = [l for l in logs if "task-stale" in l and "lease generation" in l]
+        self.assertEqual(len(named), 1, logs)
+        before = len(self.calls)
+        mod._retry_pending_acks({"task-stale"})
+        self.assertEqual(len(self.calls), before, "a retired ack is never re-posted")
+
+
+    def test_an_older_reader_takes_a_leased_ledger_entry_at_its_durability(self):
+        """A downgraded Sparrow reads every ledger value as `bool(v)`; a leased,
+        non-durable entry must still read False there, never a durable claim."""
+        mod = self.mod
+        self.assertTrue(mod._record_pending_acks([("task-nd", False, "gen-1"),
+                                                  ("task-d", True, "gen-2")]))
+        raw = json.loads(mod.PENDING_ACK_FILE.read_text())
+        older = {str(k): bool(v) for k, v in raw.items()}
+        self.assertEqual(older, {"task-nd": False, "task-d": True})
+        self.assertEqual(mod._load_pending_leases(), {"task-nd": "gen-1", "task-d": "gen-2"})
+
+    def test_a_late_stale_404_does_not_drop_the_newer_generations_record(self):
+        """A gen-1 retry answered `stale lease generation` after the task was
+        re-served and recorded under gen-2 keeps the gen-2 record for its ack."""
+        mod = self.mod
+        self.assertTrue(mod._record_pending_acks([("task-regen", True, "gen-1")]))
+        stale = _http(404, b'{"error":"not leased to you","reason":"stale lease generation"}')
+
+        def req(method, path, payload=None, timeout=35):
+            self.calls.append((method, path, payload))
+            mod._record_pending_acks([("task-regen", True, "gen-2")])
+            raise stale
+
+        with patch.object(mod, "_req", side_effect=req):
+            self.assertFalse(mod._post_task_ack("task-regen", True, "gen-1"))
+        self.assertEqual(mod._load_pending_acks(), {"task-regen": True})
+        self.assertEqual(mod._load_pending_leases(), {"task-regen": "gen-2"})
+        mod._retry_pending_acks({"task-regen"})
+        self.assertEqual(self._acks()[-1][2],
+                         {"id": "task-regen", "lease_id": "gen-2", "durable": True})
+        self.assertEqual(mod._load_pending_acks(), {})
+
+
+    def test_a_lease_file_that_did_not_commit_withholds_the_round(self):
+        """The ledger must never name a leased task whose generation is not on
+        disk; an unreadable lease file fails open to no generations."""
+        mod = self.mod
+        real = mod._durable_write
+        with patch.object(mod, "_durable_write",
+                          side_effect=lambda p, t: False if p == mod._ack_lease_file() else real(p, t)):
+            self.assertFalse(mod._record_pending_acks([("task-wl", True, "gen-1")]))
+        self.assertEqual(mod._load_pending_acks(), {})
+        self.assertTrue(mod._record_pending_acks([("task-wl", True, "gen-1")]))
+        mod._ack_lease_file().write_text("{not json")
+        self.assertEqual(mod._load_pending_leases(), {})
+        self.assertEqual(mod._load_pending_acks(), {"task-wl": True})
 
     # -- 5. the production ack round, driven through main() ------------------ #
 
@@ -491,6 +585,19 @@ class DurableAck(unittest.TestCase):
                          ack_raises=urllib.error.URLError("down"))
         self.assertEqual(mod._load_pending_acks(), {"task-main-lost": True},
                          "the ledger must be committed before the ack is posted")
+
+    def test_main_carries_the_served_lease_generation_to_the_ack_and_the_ledger(self):
+        """The production round echoes `lease_id` on the wire and records it for
+        the retry, so a restart still acks under the generation it was served."""
+        mod = self.mod
+        self._drive_main([{**self._task("task-main-gen"), "lease_id": "gen-3"}])
+        self.assertEqual(self._acks()[0][2],
+                         {"id": "task-main-gen", "lease_id": "gen-3", "durable": True})
+        self.calls.clear()
+        self._drive_main([{**self._task("task-main-gen-lost"), "lease_id": "gen-4"}],
+                         ack_raises=urllib.error.URLError("down"))
+        self.assertEqual(_load(self.ws)._load_pending_leases(),
+                         {"task-main-gen-lost": "gen-4"})
 
     def test_main_acks_an_unrepaired_redelivery_without_the_flag(self):
         mod = self.mod

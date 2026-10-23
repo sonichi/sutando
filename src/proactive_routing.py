@@ -33,26 +33,8 @@ import json
 import re
 from pathlib import Path
 
-# Channels whose bridges actually deliver `proactive-*.txt` files.
-# Other producers write `last-owner-activity.json` with channel values
-# like `"voice"` (voice agent registered an utterance) or
-# `"github-commits"` (auto-poll observed a new commit) — those are
-# activity-tracking signals, NOT message-delivery channels. When the
-# last activity was on a non-bridge channel, proactive messages must
-# still get delivered SOMEWHERE rather than stranded: Discord is the
-# default (the canonical first-channel install path).
-#
-# Per @rickchen007 PR #35 review: pre-fix, only `discord`/`telegram`
-# were treated as recognized — and an unrecognized value (`voice`,
-# `github-commits`, anything else) returned False for BOTH bridges,
-# silently stranding the proactive file in `results/` until the
-# next discord/telegram message restored a known activity channel.
-#
-# `ag2space` is the desktop gateway bridge (remote-gateway-bridge's
-# owner-DM drain); its owner-activity writer stamps that channel on
-# every owner message from the AG2 Space app.
-# slack included (P1-27): as a destination-only channel, an owner last active on
-# Slack lost untagged proactive files to discord's default, then to AG2 Space.
+# Bridges that deliver proactive files; any other activity channel (voice, github-commits)
+# still routes to a default bridge rather than stranding the file.
 BRIDGE_CHANNELS = frozenset({"discord", "telegram", "ag2space", "slack"})
 
 
@@ -102,9 +84,8 @@ def should_claim_proactive(state_file_path: Path, this_channel: str) -> bool:
     if last_channel in BRIDGE_CHANNELS:
         return last_channel == this_channel
 
-    # Non-bridge channel (voice / github-commits / etc.): the owner
-    # most recently interacted on a surface that doesn't deliver DMs.
-    # Default Discord rather than strand the proactive file.
+    # Non-bridge channel: the owner was last on a surface that delivers no DMs,
+    # so default to Discord rather than strand the file.
     return this_channel == "discord"
 
 
@@ -242,6 +223,22 @@ def body_claimable_by(body, this_channel: str) -> bool:
     """
     kind = body_target_channel(body)
     return kind is None or kind == this_channel
+
+
+def should_claim_proactive_peeked(name, body, state_file_path: Path,
+                                  this_channel: str) -> bool:
+    """Pre-claim decision for an activity-routed bridge, given the peeked body.
+
+    A body addressed to ANOTHER bridge is never claimed, whatever the tag or
+    activity routing says: a claim renames it out of the glob that bridge polls,
+    so claim-then-release every pass starves it (#5368). Otherwise the filename
+    tag / activity routing decides, and a body addressed to this bridge claims.
+    """
+    if not body_claimable_by(body, this_channel):
+        return False
+    if should_claim_proactive_file(name, state_file_path, this_channel):
+        return True
+    return body_target_channel(body) == this_channel
 
 
 def redirect_target_is_foreign(target, this_channel: str) -> bool:

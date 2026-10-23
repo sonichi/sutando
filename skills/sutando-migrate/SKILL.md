@@ -7,7 +7,7 @@ user-invocable: true
 # Sutando Migrate
 
 Guided workspace migration for existing users (M1 Part 2). Reach for this when:
-- The legacy-state-detected warning fires (health-check, init.sh, check-pending-questions)
+- The legacy-state-detected warning fires (health-check, init.sh)
 - A user has data at a pre-M0 location (`<repo>/{notes,state,results,...}/`, `~/.sutando/workspace/`, or a custom `$SUTANDO_WORKSPACE`-pointed path) and wants it folded into the M0 canonical `<repo>/workspace/`
 - Owner explicitly says "migrate workspace" or "run sutando-migrate"
 

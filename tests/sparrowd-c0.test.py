@@ -17,6 +17,11 @@ import threading
 import time
 from pathlib import Path
 
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "packages" / "ag2-sparrow"))
 
@@ -317,10 +322,12 @@ check(len(_specs) == 1 and _specs[0].name == "remote-gateway-bridge",
 check(Path(_specs[0].argv[1]).exists(),
       "the spec's target script exists at the resolved path")
 _calls = []
-_l.run = lambda specs, sd: (_calls.append((specs, sd)), 0)[1]
+_l.run = lambda specs, sd, **kw: (_calls.append((specs, sd, kw)), 0)[1]
 _l.external_supervisor = lambda marker: None  # guard has its own tests below
 check(_l.main() == 0 and _calls and str(_calls[0][1]).endswith("state/sparrowd"),
       "main() wires worker_specs into run with the workspace state dir")
+check(_calls and callable(_calls[0][2].get("rescan")) and _calls[0][2].get("rescan_s") == 30.0,
+      "main() hands run the declaration rescan (every 30s by default)")
 
 # adapter edge: forbidden set derives from the adapter's specs so the
 # guard grows with the worker list; static tokens have no spec-side source.

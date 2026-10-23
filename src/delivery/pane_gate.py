@@ -26,6 +26,7 @@ CLI:
     python3 src/delivery/pane_gate.py classify --runtime codex [--json] < capture.txt
     python3 src/delivery/pane_gate.py pending  --runtime codex < capture.txt
     python3 src/delivery/pane_gate.py composer-text --runtime claude < capture.txt
+    python3 src/delivery/pane_gate.py leftover --runtime codex < capture.txt   # exit 0 = clearable
     python3 src/delivery/pane_gate.py healthy --runtime claude < capture.txt   # exit 0 = accepts input
     python3 src/delivery/pane_gate.py deliver <session> <line> --runtime codex
         [--socket PATH] [--refuse-if-pending] [--skip-if-queued WORD] [--dry-run]
@@ -56,7 +57,12 @@ SEND_LINE = REPO / "scripts" / "tmux-send-line.sh"
 #: Non-blank lines a verdict reads — the same window core-input-watch.py reads.
 TAIL_LINES = 14
 
-_SGR = re.compile(r"\x1b\[[0-9;]*m")
+#: A CSI SGR run (colon or semicolon params, newer tmux emits both) or an OSC
+#: hyperlink (BEL- or ST-terminated) -- anything else is left as real content.
+_SGR = re.compile(r"\x1b\[[0-9:;]*m|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
+#: Public alias for strip-to-plain outside this module (core-input-watch.py's
+#: own derivation) -- one pattern, not a second copy that can drift.
+SGR_STRIP = _SGR
 # Dim (SGR 2) or the 256-colour GREYSCALE RAMP (232-255): styled runs are hint/ghost
 # text only. 200-231 are colour-cube entries, so real coloured input must not match.
 _GHOST = re.compile(
@@ -94,6 +100,23 @@ CLAUDE_GATE_SIGNATURES: List[Tuple[str, "re.Pattern[str]"]] = [
 AWAIT_HINT = re.compile(
     r"Esc to cancel|Enter to confirm|Enter to select|to navigate|Press Enter|Paste code|to accept"
     r"|Continuing automatically|❯\s*\d+\.", re.I)
+# The completed-turn line: "✻ Worked for 0s" / "✻ Cooked for 1s · done 12:32 PM". The spinner
+# reuses the glyph ("✻ Perambulating… (1m 46s · …)") and must not match.
+TURN_DONE = re.compile(
+    r"^\s*✻\s+[A-Za-z]+(?:\s+for\s+(?P<dur>\d+[hms](?:\s+\d+[hms])*))?(?:\s*·\s*done\b.*)?\s*$")
+# A turn's spinner ("✳ Moonwalking… (15s · …)") or completion line: transcript above, live dialog
+# below. Not "esc to interrupt": the busy footer carries it, under any live dialog.
+_SPINNER_ROW = re.compile(r"^\s*[·✢✳✶✻✽*]\s+[A-Za-z][\w-]*(?:…|\.\.\.)\s*\(")
+_TURN_ROW = re.compile(rf"{_SPINNER_ROW.pattern}|{TURN_DONE.pattern}")
+
+
+def live_tail(lines: List[str]) -> List[str]:
+    """`lines` below the last turn spinner / completion row, else all of them. Tool output
+    above that row may quote a dialog's caret or key hints; only a dialog below it is live."""
+    for i in range(len(lines) - 1, -1, -1):
+        if _TURN_ROW.search(_SGR.sub("", lines[i])):
+            return lines[i + 1:]
+    return lines
 
 
 @dataclass(frozen=True)
@@ -105,6 +128,10 @@ class RuntimeAdapter:
     await_hint: "re.Pattern[str]" = AWAIT_HINT
     alternate_glyphs: Tuple[str, ...] = ()
     idle_requires_prompt: bool = False
+    # Composer text only automation ever types: a dispatcher may clear exactly these.
+    automation_leftovers: Tuple[str, ...] = ()
+    # The runtime's dispatcher waits for idle-ready, so a draft holds every queued task.
+    pending_blocks_dispatch: bool = False
 
 
 CLAUDE = RuntimeAdapter(
@@ -123,6 +150,9 @@ CODEX = RuntimeAdapter(
     await_hint=re.compile(f"{AWAIT_HINT.pattern}|{CODEX_PICKER_ROW.pattern}", re.I),
     alternate_glyphs=("»",),
     idle_requires_prompt=True,
+    # Codex rejects Claude's /startup and leaves it in the composer.
+    automation_leftovers=("/startup",),
+    pending_blocks_dispatch=True,
 )
 ADAPTERS = {CLAUDE.name: CLAUDE, CODEX.name: CODEX}
 
@@ -314,6 +344,32 @@ def _tail_lines(capture: str) -> List[str]:
     return [ln for ln in capture.splitlines() if _SGR.sub("", ln).strip()][-TAIL_LINES:]
 
 
+def gate_evidence(tail: str, styled_tail: Optional[str] = None,
+                  adapter: RuntimeAdapter = CLAUDE) -> str:
+    """Exclude idle chrome, verified ghost suggestions and completed conditional recaps."""
+    rows = tail.splitlines()
+    line = prompt_line(styled_tail if styled_tail is not None else tail, adapter)
+    composer_i = next((i for i in range(len(rows) - 1, -1, -1)
+                       if _prompt_glyph(rows[i], adapter) is not None), None)
+    completed = (composer_i is not None and line is not None and not line.text.strip()
+                 and any(row.strip() == "Nothing needs you this round."
+                         for row in rows[:composer_i]))
+    kept = []
+    for i, row in enumerate(rows):
+        signatures = any(rx.search(row) for _, rx in adapter.gate_signatures)
+        if adapter.idle_ready.search(row) and not signatures:
+            continue
+        if i == composer_i and line and line.placeholder and not line.text.strip():
+            continue
+        # A marker alone cannot distinguish a live instruction from completed output.
+        if (completed and i < composer_i and not signatures
+                and re.fullmatch(r"\s*※ recap: if .+, press Enter there to send it\.\s*", row)
+                and len(list(adapter.await_hint.finditer(row))) == 1):
+            continue
+        kept.append(row)
+    return "\n".join(kept)
+
+
 def _gate(capture: str, tail: str, line: Optional[PromptLine], adapter: RuntimeAdapter) -> Optional[str]:
     """The gate kind holding the pane, or None. An empty composer at the bottom means no
     dialog owns the input -- UNLESS a gate has appeared BELOW that composer line since it
@@ -328,6 +384,7 @@ def _gate(capture: str, tail: str, line: Optional[PromptLine], adapter: RuntimeA
         footer_hits = list(adapter.idle_ready.finditer(tail))
         beyond_footer = tail[footer_hits[-1].end():] if footer_hits else ""
         newer = "\n".join(part for part in (following, beyond_footer) if part.strip())
+        newer = gate_evidence(newer, adapter=adapter)
         if not newer or not adapter.await_hint.search(newer):
             return None
         for kind, rx in adapter.gate_signatures:
@@ -336,12 +393,35 @@ def _gate(capture: str, tail: str, line: Optional[PromptLine], adapter: RuntimeA
         # An await hint we cannot name is an UNRECOGNISED dialog, not the absence of one.
         # Falling through to "no gate" let a stale empty composer vouch for a live dialog.
         return "unlisted"
+    tail = gate_evidence(tail, "\n".join(_tail_lines(capture)), adapter)
     if not adapter.await_hint.search(tail):
         return None
     for kind, rx in adapter.gate_signatures:
         if rx.search(tail):
             return kind
     return None
+
+
+def automation_leftover(capture: Optional[str], adapter: RuntimeAdapter, workspace=None,
+                        socket=None, session=None, verdict: Optional[Verdict] = None) -> Optional[str]:
+    """The composer's text when it is EXACTLY one of the runtime's automation leftovers and
+    nothing else, else None. Both parsers must agree: the prompt row alone misses a
+    multi-line draft whose first row happens to read the same, and the composer's frame must
+    be on screen so no row of it is hidden."""
+    if not adapter.automation_leftovers or capture is None:
+        return None
+    v = verdict or classify_pane(capture, adapter, workspace, socket, session)
+    if v.state != "pending" or v.pending not in adapter.automation_leftovers:
+        return None
+    if not composer_frame_visible(capture, adapter):
+        return None  # the box runs off the screen bottom: more text may sit below
+    return v.pending if composer_text(capture, adapter) == v.pending else None
+
+
+def blocks_dispatch(verdict: Verdict, adapter: RuntimeAdapter) -> bool:
+    """True when this pane holds every queued task: an abnormal frame on any runtime, or a
+    draft on a runtime whose dispatcher waits for idle-ready."""
+    return verdict.state == "abnormal" or (verdict.state == "pending" and adapter.pending_blocks_dispatch)
 
 
 # A working turn queues typed input (the Claude notifier delivers like the Monitor
@@ -391,7 +471,7 @@ def classify_pane(capture: Optional[str], adapter: RuntimeAdapter, workspace=Non
     line = prompt_line(capture, adapter)
     # _gate's after_prompt() must see the same capture line was found in, or
     # it computes "below" from a view that never contained that line at all.
-    gate = _gate(capture, tail, line, adapter)
+    gate = _gate(capture, "\n".join(_SGR.sub("", ln) for ln in live_tail(lines)), line, adapter)
     if gate:
         return Verdict("busy", gate)
     if abn and not _limit_is_stale(abn, workspace, socket, session, probe):
@@ -469,6 +549,11 @@ def main(argv: Optional[List[str]] = None) -> int:
             p.add_argument("--socket", default=os.environ.get("SUTANDO_TMUX_SOCKET"))
             p.add_argument("--session", default=None, help="the seat the record must vouch for")
             p.add_argument("--probe", action="store_true", help="refresh a stale record through the proxy first")
+    lo = sub.add_parser("leftover")
+    lo.add_argument("--runtime", required=True, choices=sorted(ADAPTERS))
+    lo.add_argument("--workspace", default=None, help="where state/quota-state.json lives")
+    lo.add_argument("--socket", default=os.environ.get("SUTANDO_TMUX_SOCKET"))
+    lo.add_argument("--session", default=None, help="the seat the record must vouch for")
     ct = sub.add_parser("composer-text")
     ct.add_argument("--runtime", required=True, choices=sorted(ADAPTERS))
     cf = sub.add_parser("composer-frame")
@@ -519,6 +604,14 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(f"pane_gate: {v.state} ({v.reason}) — not accepting input", file=sys.stderr)
             return EXIT_UNSAFE
         print(v.state)
+        return 0
+    if a.cmd == "leftover":
+        # Exit 0 + the text only when the composer holds an automation leftover and nothing
+        # else; any other content, or no prompt, exits 1 and must be left alone.
+        text = automation_leftover(_read_stdin(), adapter, a.workspace, a.socket, a.session)
+        if text is None:
+            return 1
+        print(text)
         return 0
     if a.cmd == "composer-text":
         # Same None/"" contract as "pending", via the frame-stripping parser

@@ -17,6 +17,11 @@ Run: python3 tests/health-check-unread-watcher.test.py  (exit 0/1)
 """
 from __future__ import annotations
 
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import contextlib
 import importlib.util
 import io

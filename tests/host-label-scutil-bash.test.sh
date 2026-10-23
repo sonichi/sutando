@@ -30,6 +30,9 @@ printf '%s\n' "${FAKE_HOSTNAME:-box.local}"
 EOF
 chmod +x "$BIN/scutil" "$BIN/hostname"
 export PATH="$BIN:$PATH"
+# _host() now resolves scutil by absolute path by default; point it at the
+# stub instead (SCUTIL_BIN override), same as hostname being found via PATH.
+export SCUTIL_BIN="$BIN/scutil"
 
 out="$(SUTANDO_HOST_LABEL=Pinned FAKE_LHN=ShouldNotWin _host)"
 check "env SUTANDO_HOST_LABEL wins (scutil not consulted)" "Pinned" "$out"

@@ -92,7 +92,8 @@ class TestHasSession(unittest.TestCase):
             seen["argv"], seen["timeout"] = argv, k.get("timeout")
             return _R(0)
         self.assertIs(self._with_run(fake, timeout=8, tmux="/x/tmux"), True)
-        self.assertEqual(seen["argv"], ["/x/tmux", "-S", "s.sock", "has-session", "-t", "=core"])
+        self.assertEqual(seen["argv"], ["/x/tmux", "-u", "-S", "s.sock", "has-session", "-t", "=core"],
+                         "-u: a client without a UTF-8 locale escapes a TAB in its output to _")
         self.assertEqual(seen["timeout"], 8)
 
     def test_an_already_exact_target_is_not_prefixed_twice(self):

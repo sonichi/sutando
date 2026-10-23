@@ -22,14 +22,11 @@ import os
 import time
 
 from .chat_secret_filter import filter_chat_secrets
+from .local_task_protocol import local_time_value
 
 MEANINGFUL_TYPES = frozenset({
     "message.created", "message.edited", "reaction.added",
     "member.joined", "member.left",
-    # artifact.updated (be#190, deployed 2026-07-24): vault/doc writes fan out
-    # as events — a doc change in an observed room is exactly the kind of
-    # ambient activity taskify should batch for the Core's attention.
-    "artifact.updated",
 })
 
 # Mirrors the bridge's in-band block (defense-in-depth, not a boundary — the
@@ -140,6 +137,7 @@ class TaskifyHandler:
         body = "\n".join([
             f"id: {task_id}",
             "timestamp: " + time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "local_time: " + local_time_value(),
             f"task: [taskify] {n} room events — review and act if needed "
             f"(promoted from {n} subscribed events in {room})",
             "source: events-promotion",

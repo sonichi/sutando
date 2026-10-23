@@ -134,6 +134,99 @@ A skill whose feature needs a **long-running loop** declares it here, and `sparr
 
 **Prefer the env override for the interpreter on a desktop install.** The engine tree is replaced on every update, so a value edited into the tracked `manifest.json` does not survive an upgrade; an export does.
 
+## Pending-questions store adapter (`pending_questions_store`)
+
+`"pending_questions_store": "scripts/<adapter>.py"` declares the script that IS the store of owner
+pending questions — its `room_store(workspace)` opens the room database, `gather`/`waiting`/`count`
+read it (read-only; `unavailable: True` and `done: None` when the room cannot be read, never a zero),
+`reconcile_pass` replays the local outbox and close records, `resolve` closes a row, `ask_owner`
+records a question and `remind(argv, workspace, resolved=None)` runs the reminder — `resolved` is optional:
+the core entry passes its one resolution of the adapter when `remind` accepts the keyword, and a
+two-arg `remind(argv, workspace)` still works. The field is in `schemas/skill-manifest.schema.json`
+(a relative `.py` path, no `..`), and `scripts/lint-skill.py` checks the script exists inside the skill. Core reaches it only through
+`src/pending_questions_reader.py`, which takes the adapter path its caller injects and names no
+skill; each edge (the thin entries, the reader CLI, agent-api, the dashboard, the briefing,
+friction-detector, obsidian-mirror) resolves that path with `src/skill_roots.py` —
+`declared("pending_questions_store", workspace)` scans that FIELD alone across both installed
+roots, `<repo>/skills` and `<workspace>/skills` (the pair `skills/install.sh` links; the script must
+resolve inside its skill), and refuses when more than one installed skill declares it, in one root
+or one per root — except the same skill name in both roots, where the shipped copy wins and the owner's is shadowed, the rule `skills/install.sh` applies; a `--store-adapter <path>` flag overrides the scan. The reminder
+(`pending_questions_remind.py`) reads an adapter through exactly these entry points: `reconcile_pass(workspace)`,
+its errors kept as notes, then `gather(workspace)` — a `gather` keyword is not part of the contract.
+With none declared there is no store: readers report `unavailable` with that reason (never a
+zero), a close is refused with it, and `scripts/ask-owner.py` does only what core can — it queues
+the owner's DM through the proactive path and keeps one generic record under
+`<workspace>/state/ask-owner/` (`src/local_record.py`), saying that nothing lists or closes it.
+The outbox, the ask-id grammar and every question schema are the declaring skill's.
+
+## Audience (`audience`)
+
+`"audience": "developer"` marks a skill for people developing Sutando, kept out of ordinary
+installs. Absent or `"user"` (the default) means every install.
+
+| Value | Linked by the installers |
+|---|---|
+| absent, `"user"` | always |
+| `"developer"` | only where sutando config sets `skills.developer` to `true` |
+| anything else, or an unreadable `manifest.json` | as `"developer"` |
+
+An unknown value fails closed: a typo in a developer skill must keep it away from users, not
+ship it to them. `scripts/lint-skill.py` rejects it, so a repo skill cannot merge with one.
+
+The opt-in is a host setting, not skill config, so the `CLI > env > manifest > config-file >
+state` precedence above does not apply: `skills.developer` is read from the merged
+`sutando.config.json` / `sutando.config.local.json` / `<workspace>/sutando.config.local.json`
+only, and only a JSON `true` opts in.
+
+```json
+{ "skills": { "developer": true } }
+```
+
+`src/skill_audience.py` owns the decision and every installer calls it: `skills/install.sh`
+(both roots, `<repo>/skills` and `<workspace>/skills`, into the Claude and Codex skills
+dirs), `skills/install.ps1`, and `health-check.py --fix` (`skill-symlinks`). A developer
+skill already linked on a host without the opt-in is left in place with a note; nothing deletes
+it. `skills/refresh-skill.sh` only refreshes links that already exist, so it needs no check.
+
+Runtime scans (`tools`, `hooks`, `claude_plugin`, `supervised_worker`,
+`pending_questions_store`, `documented_for_core`) read `<repo>/skills` directly, past the
+installers, so `scripts/lint-skill.py` refuses those fields on a developer-only skill.
+
+## Orphan reaper (`orphan_reaper`)
+
+`"orphan_reaper": "scripts/<reaper>.py"` declares the script that finds, and stops, orphaned test
+processes. Core reaches it only through `src/system_load.py`, which takes the path its caller
+injects and names no skill. `src/health-check.py` resolves it with `skill_roots.declared("orphan_reaper",
+roots=[claude_home_path("skills")])`: only a skill **installed** (linked there by `skills/install.sh`)
+counts, never the shipped copy in `<repo>/skills`; containment and the one-declarer rule are as for
+`pending_questions_store`. The contract health-check relies on:
+
+- no arguments: report only, exit 0, one `would stop <kind>=<id> pids=<pid,...> ...` line per target,
+  then a summary line carrying `mode=report ... candidates=<n>`;
+- no summary line means it did nothing (another run holds its lock, or it failed);
+- exit status 2 is a usage error and is never retried;
+- `--reap --spotlight`: stop the candidates, then the same summary with `mode=reap ... terminated=<n>
+  killed=<n> aborted=<n>`. A health-check pass without `--fix` never runs this. Every `health-check.py
+  --fix` run does, in the same run that warns, at most once per high-load episode (recorded in
+  health-check's state), when the warning's action is `reap-once`; a repeated `--fix` in the episode
+  stops nothing. The desktop app runs `--fix` every 30 minutes and at startup, so with the opt-in a
+  desktop host reaps automatically on that timer; the launchd fallback runs without `--fix`.
+
+With none installed, the `system-load` warning says its cause is unclassified. A warning ends its
+detail with `cause=<leftover-test-processes|other|unclassified> action=<reap-once|none>` and carries
+the same two keys in `--json`. `action=reap-once` means `--fix` **will** reap:
+the cause is leftover test processes, the reaper has not run this episode, and
+`SUTANDO_HEALTH_LOAD_REAP` is exactly `1`. `action=none` means `--fix` will not reap for any reason
+(another cause, already ran or failed this episode, or reaping off, which is the default); with
+`cause=leftover-test-processes` the core can still run the reaper by hand.
+
+## Claude plugin (`claude_plugin`)
+
+`"claude_plugin": "./plugin"` names a Claude Code plugin directory inside the skill. The Claude
+launchers (core and Claude pool workers) pass each enabled skill's directory as `--plugin-dir`.
+The path must resolve to a real directory inside the skill folder and the manifest must be
+`"enabled": true`; anything else is skipped with a note on stderr. Codex seats ignore it.
+
 ## Currently active manifest skills
 
 Run `grep -l '"enabled": true' skills/*/manifest.json "$SUTANDO_MEMORY_DIR/skills"/*/manifest.json` for the live list (legacy users may need `$SUTANDO_PRIVATE_DIR` in place of the new var).
@@ -197,6 +290,7 @@ backend swap, never a re-format.
 | `version` | yes | SemVer. MAJOR=breaking, MINOR=compat feature, PATCH=fix/eval |
 | `owner` | yes | who maintains it (handle / team / org) |
 | `stability` | yes | `stable` \| `experimental` \| `deprecated` |
+| `audience` | opt | `user` (default) \| `developer`; see [Audience](#audience-audience) |
 | `license` | rec | SPDX id (default: repo license) |
 | `description` | rec | one-line summary (code review + registry) |
 | `agent_compatibility` | opt | SemVer range of the agent runtime, e.g. `">=0.9 <2.0"` |

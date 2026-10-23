@@ -13,16 +13,16 @@ except ImportError:
 
 
 HEALTH_CAUSES = frozenset("""
-voice-agent voice-watchers voice-transport bodhi-dist cli-wedge secret-scanner
+voice-agent voice-watchers voice-transport bodhi-dist cli-wedge pane-key-fence secret-scanner
 node-runtime cron-runner session-crons memory-dir-override workspace-wiring
 context-read-budget workspace-root-tidy memory-dir-siblings carrier-set memory-index
-memory-sync onboarding-status host-subtrees per-host-config-backup sync-conflicts-unmerged
+memory-sync onboarding-status hitl-archive host-subtrees per-host-config-backup sync-conflicts-unmerged
 skills-driver-code-drift live-checkout-branch engine-revision-drift migrate-reader-contract
 tcc-documents-access quota-telemetry core-request-rejections core-quota quota-account-identity
 battery memory cron-schedule core-proactive-loop core-supervisor gateway-bridge runtime-identity
 daily-cron-punctuality live-tree-drift disk-space skill-symlinks task-queue pool-advertisement pool-suspended held-no-consumer
 orphaned-results stranded-destined-proactive proactive-quarantine stale-proactive-backlog
-task-watcher a-fallback-hits outbox-parked task-claims codex-task-notifier claude-task-notifier
+task-watcher a-fallback-hits outbox-parked withheld-reviews-readable task-claims codex-task-notifier claude-task-notifier
 codex-presence notes-split-brain
 vendored-resolver-env legacy-notes-divergence vault-manifest claude-hooks comm-sweep
 core-model-pin web-client memory-dir tailscale-funnel sutando-app telegram-bridge

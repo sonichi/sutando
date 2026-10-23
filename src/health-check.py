@@ -18,6 +18,8 @@ Checks:
   - Critical files (CLAUDE.md, build_log.md, ACTIVITY.md)
   - Memory system (MEMORY.md index, key memory files)
   - Notes directory
+  - Sustained system load against the core count, with its top CPU users
+    (src/system_load.py)
   - Extra per-host probes declared in
     <workspace>/hosts/<host-label>/health-checks-extra.json (opt-in; see
     check_user_defined). Each entry is {"name", "command"[, "timeout"]};
@@ -64,6 +66,7 @@ from git_binary import developer_tools_installed  # noqa: E402
 from channel_token import token_from_vault  # noqa: E402
 from util_paths import _host_label, actor_env_names, channel_access_path, claude_home_path, default_memory_dir, legacy_dotted_workspace, shared_personal_path, stated_default_identity, watcher_sentinel_path, watcher_sentinel_paths  # noqa: E402
 import slack_access  # noqa: E402
+import session_runtime  # noqa: E402
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
 from sutando_platform import (  # noqa: E402
     find_pids,
@@ -73,8 +76,14 @@ from sutando_platform import (  # noqa: E402
 )
 from workspace_layout import inspect_layout  # noqa: E402
 import cron_task_id  # noqa: E402
+from loop_completion import completion_path, read_completion  # noqa: E402
+from cron_loop_policy import (  # noqa: E402
+    _cron_field_values, _cron_can_never_fire, _entry_marked_parked, main_loop_problem, core_loop_is_parked,
+)
 from sutando_config import resolve_core_runtime, resolve_down_bridge_action  # noqa: E402
 import process_pins  # noqa: E402
+import pool_suspension  # noqa: E402
+import tmux_pane_keys  # noqa: E402
 import watcher_identity  # noqa: E402
 from cron_entry_digest import digest_map, drifted  # noqa: E402
 from cron_ownership import CORE as CRON_CORE, entry_owner  # noqa: E402
@@ -85,6 +94,8 @@ from gateway_serving import (  # noqa: E402
 )
 from task_archive import find_task_file  # noqa: E402
 from sutando_config import config_get  # noqa: E402
+import skill_roots  # noqa: E402
+import system_load  # noqa: E402
 # Workspace = runtime-state root (tasks/, results/, state/). REPO_DIR stays the
 # source-code root (src/, skills/, logs/, .env, build_log.md). Before PR #762's
 # resolver existed, every consumer hardcoded REPO_DIR / "tasks" — so when the
@@ -838,6 +849,21 @@ def check_cli_wedge() -> dict:
                           "observation_runs", "median_gap_s", "work_outstanding", "work_detail")}
     return check
 
+def check_pane_key_fence(socket: "str | None" = None) -> dict:
+    # This host's socket: the freshest synced heartbeat may belong to another machine.
+    sock = Path(socket or _local_core_socket() or os.environ.get("SUTANDO_TMUX_SOCKET", "/tmp/sutando-tmux.sock"))
+    sockets = {str(sock)} | {str(lock)[:-len(".pane-keys-lock")]
+                            for lock in sock.parent.glob("*.pane-keys-lock")}
+    states = {path: tmux_pane_keys.fence_status(path) for path in sockets}
+    fenced = sorted(path for path, state in states.items() if state == "uncertain")
+    if fenced:
+        return {"name": "pane-key-fence", "status": "fail", "detail": (
+            f"automated sends blocked on {', '.join(fenced)}; stop the old server and reconcile "
+            "delivery before explicit recovery (docs/codex-core.md)")}
+    return {"name": "pane-key-fence", "status": "ok",
+            "detail": "busy" if "busy" in states.values() else "clear"}
+
+
 def check_secret_scanner_mode() -> dict:
     """Report the secret scanner's DEGRADED mode as standing status.
 
@@ -1071,6 +1097,10 @@ def check_launchd(label: str) -> dict:
         return {"name": label, "status": "error", "detail": str(e)}
 
 
+# A core restart briefly removes .alive; a hold that outlives one is an outage, not a restart.
+CRON_HOLD_DOWN_AFTER_S = 300
+
+
 def check_cron_runner(
     workspace_dir: Optional[Path] = None,
     host_label: Optional[str] = None,
@@ -1082,11 +1112,14 @@ def check_cron_runner(
     workspace = Path(workspace_dir or WORKSPACE_DIR)
     host = host_label or _host_label()
     crons_file = workspace / "hosts" / host / "crons.json"
+    runtime = runtime or resolve_core_runtime(repo_root=REPO_DIR)
     name = "cron-runner"
     try:
         crons = json.loads(crons_file.read_text())
     except FileNotFoundError:
-        return {"name": name, "status": "ok", "detail": "no schedules configured"}
+        problem = main_loop_problem([], runtime)
+        return {"name": name, "status": "down" if problem else "ok",
+                "detail": problem or "no schedules configured"}
     except (OSError, json.JSONDecodeError) as exc:
         return {"name": name, "status": "fail", "detail": f"cannot read crons.json ({exc})"}
     if not isinstance(crons, list):
@@ -1112,6 +1145,9 @@ def check_cron_runner(
             "status": "down",
             "detail": f"{orphaned} configured schedule(s) have no durable Codex owner",
         }
+    problem = main_loop_problem(crons, runtime)
+    if problem:
+        return {"name": name, "status": "down", "detail": problem}
     if not launchd_count:
         return {"name": name, "status": "ok", "detail": "no launchd-owned schedules"}
 
@@ -1158,99 +1194,27 @@ def check_cron_runner(
             "status": "down",
             "detail": f"runner state is stale ({int(age)}s; expected <=180s)",
         }
+    # A runner that ticks on time can still emit nothing: it holds every prompt-backed fire
+    # while the core heartbeat is missing, and records that hold here.
+    try:
+        hold = json.loads((workspace / "state" / "cron-runner-hold.json").read_text())
+    except (OSError, ValueError):
+        hold = None
+    if isinstance(hold, dict) and isinstance(hold.get("since"), (int, float)):
+        held_for = max(0, int(float(time.time() if now is None else now) - hold["since"]))
+        names = ", ".join(str(n) for n in hold.get("held", [])) or "due schedules"
+        return {
+            "name": name,
+            "status": "down" if held_for >= CRON_HOLD_DOWN_AFTER_S else "warn",
+            "detail": (f"cron-runner has held {names} for {held_for}s and emitted no task: "
+                       f"{hold.get('reason', 'core heartbeat not fresh')}"),
+        }
     return {
         "name": name,
         "status": "ok",
         "detail": f"{launchd_count} durable schedule(s), state {int(age)}s old",
     }
 
-
-_MONTH_MAX_DAYS = {1: 31, 2: 29, 3: 31, 4: 30, 5: 31, 6: 30,
-                   7: 31, 8: 31, 9: 30, 10: 31, 11: 30, 12: 31}
-
-
-def _cron_field_values(field: str, lo: int, hi: int) -> "set[int] | None":
-    """Expand one numeric cron field to its value set, or None if not understood.
-
-    None means "do not reason about this expression" — every caller below treats
-    an unparseable field as schedulable, so a parser gap can never invent a
-    never-fires verdict.
-    """
-    out: "set[int]" = set()
-    for part in field.split(","):
-        part = part.strip()
-        if not part:
-            return None
-        step = 1
-        if "/" in part:
-            part, _, raw_step = part.partition("/")
-            if not raw_step.isdigit() or int(raw_step) < 1:
-                return None
-            step = int(raw_step)
-        if part in ("*", "?"):
-            start, end = lo, hi
-        elif "-" in part.lstrip("-"):
-            start_s, _, end_s = part.partition("-")
-            if not (start_s.isdigit() and end_s.isdigit()):
-                return None
-            start, end = int(start_s), int(end_s)
-        elif part.isdigit():
-            start = end = int(part)
-        else:
-            return None  # names (JAN/MON), L, W, # — not our business
-        if start > end or start < lo or end > hi:
-            return None
-        out.update(range(start, end + 1, step))
-    return out or None
-
-
-def _cron_can_never_fire(expr: str) -> bool:
-    """True only when a 5-field cron's day-of-month/month pair is impossible.
-
-    A deliberately-parked entry is the real case: this host carries
-    `wire-newsroom-nightly-DISABLED-...` at `0 0 31 2 *` — February 31st, which
-    is syntactically valid and can never occur. /schedule-crons cannot register
-    it, so it was counted as expected-but-missing and the session-crons guard
-    warned on every run, permanently. A guard that always warns is a guard
-    nobody reads, and this one exists to catch a SILENT failure (a peer
-    instance registered 2/18 with no error) — so a standing false positive
-    disables exactly the signal it was built to raise.
-
-    Deliberately conservative: day-of-week must be unrestricted, because cron
-    ORs day-of-month with day-of-week — `0 0 31 2 MON` still fires on Mondays.
-    Anything unparseable returns False (schedulable).
-    """
-    parts = expr.split()
-    if len(parts) != 5:
-        return False
-    _, _, dom_f, month_f, dow_f = parts
-    if dow_f.strip() not in ("*", "?"):
-        return False  # OR-semantics with day-of-week — it can still fire
-    doms = _cron_field_values(dom_f, 1, 31)
-    months = _cron_field_values(month_f, 1, 12)
-    if doms is None or months is None:
-        return False
-    return not any(d <= _MONTH_MAX_DAYS[m] for m in months for d in doms)
-
-
-def _entry_marked_parked(entry: dict) -> bool:
-    """True when the entry carries an explicit "deliberately disabled" signal.
-
-    An impossible date alone must NOT qualify. `0 0 31 2 *` is equally the
-    signature of a parked job and of an active typo — someone meaning "the 31st,
-    monthly" and writing February. Excluding on the date alone would let a
-    mistyped ACTIVE schedule vanish from `expected`, so CronCreate silently
-    omits it and this guard reports green forever: the precise silent-miss class
-    the check exists to surface.
-
-    Two accepted signals: an explicit `disabled: true` field, and the
-    established convention of DISABLED in the entry name (used by this host's
-    `wire-newsroom-nightly-DISABLED-2026-06-09-...`, which also records why).
-    """
-    if entry.get("disabled") is True:
-        return True
-    name = entry.get("name")
-    return isinstance(name, str) and "DISABLED" in name
 
 
 def check_session_cron_registration(
@@ -1570,6 +1534,7 @@ WORKSPACE_ROOT_ALLOWED = frozenset({
     "session-state.md",      # written by src/session-handoff.sh on compaction
     ".gitkeep",              # git placeholder, not state
     ".env",                  # sutando_config.resolve_dotenv's 2nd tier (#1871)
+    "sutando.config.local.json",  # sutando_config's workspace config layer
     # The two lock guards that legitimately sit at the ROOT, by name. Exempt
     # until they migrate to state/locks/ the way workspace_lock.py already
     # writes <workspace>/state/locks/<role>.lock.guard.
@@ -2041,11 +2006,16 @@ def _carrier_target_verdict(workspace: Path, rep: Path) -> str:
     # `-z` makes git read NUL-separated input, which is the only delimiter a
     # POSIX filename cannot contain.
     rels = "\0".join(str(t.relative_to(workspace)) for t in targets)
+    # stdin is a file, not `input=`: with macOS's pipe pool spent, poll() calls a full pipe writable,
+    # communicate() blocks in os.write while git blocks on stdout, and timeout= never fires.
     try:
-        proc = subprocess.run(
-            git_argv("-C", str(workspace), "check-ignore", "--no-index", "-v", "-z", "--stdin"),
-            input=rels, capture_output=True, text=True, timeout=60,
-        )
+        with tempfile.TemporaryFile() as stdin:
+            stdin.write(rels.encode("utf-8"))
+            stdin.seek(0)
+            proc = subprocess.run(
+                git_argv("-C", str(workspace), "check-ignore", "--no-index", "-v", "-z", "--stdin"),
+                stdin=stdin, capture_output=True, text=True, timeout=60,
+            )
     except (GitUnavailable, OSError, subprocess.SubprocessError):
         return "unmeasured"
     # `-v` names the RULE that decided each path, and that is the whole point:
@@ -2429,11 +2399,15 @@ def _index_growth_note(index: Path, effective_bytes: int,
             stamps.append((sha, int(at)))
         if not stamps:
             return _TREND_UNAVAILABLE
-        batch = subprocess.run(
-            git_argv("-C", str(repo), "cat-file", "--batch"),
-            input="".join(f"{sha}:./{rel}\n" for sha, _ in stamps).encode(),
-            capture_output=True, timeout=20,
-        )
+        # Defensive: this stdin (<= 12 short specs) is too small to deadlock, but it stays
+        # off `input=` like `_carrier_target_verdict`, whose larger stdin can.
+        with tempfile.TemporaryFile() as stdin:
+            stdin.write("".join(f"{sha}:./{rel}\n" for sha, _ in stamps).encode())
+            stdin.seek(0)
+            batch = subprocess.run(
+                git_argv("-C", str(repo), "cat-file", "--batch"),
+                stdin=stdin, capture_output=True, timeout=20,
+            )
         if batch.returncode != 0:
             return _TREND_UNAVAILABLE
         points: "list[tuple[int, int]]" = []
@@ -2897,6 +2871,40 @@ def check_onboarding_status() -> "dict | None":
         }
     return {"name": name, "status": "ok",
             "detail": f"all checklist rows satisfied ({_age_phrase(age_s)})"}
+
+
+#: A live HITL store this large means settled records stopped being archived;
+#: the gateway re-reads every live record each second.
+HITL_LIVE_WARN = 200
+
+
+def check_hitl_archive() -> "dict | None":
+    """Warn when the HITL archive step is failing or the live store regrew.
+
+    None when this host has no HITL store. Read-only; never raises.
+    """
+    name = "hitl-archive"
+    try:
+        from hitl.manager import ARCHIVE_STATUS_STALE_S, archive_health, default_store
+        h = archive_health(default_store(WORKSPACE_DIR))
+    except Exception as e:  # noqa: BLE001 — an optional tier never breaks the report
+        return {"name": name, "status": "warn", "detail": f"hitl store unreadable ({e})"}
+    if h is None:
+        return None
+    problems = []
+    if h["stale"]:
+        problems.append(f"archive status stale: not refreshed in over "
+                        f"{ARCHIVE_STATUS_STALE_S // 60} min (last reported "
+                        f"{h['failures']} failure(s)); is the gateway pulsing?")
+    elif h["failures"]:
+        problems.append(f"{h['failures']} settled record(s) failing to archive ({h['error']})")
+    if h["live"] > HITL_LIVE_WARN:
+        problems.append(f"{h['live']} live records (> {HITL_LIVE_WARN}); the gateway re-reads "
+                        f"each one every second")
+    if problems:
+        return {"name": name, "status": "warn", "detail": "; ".join(problems)}
+    state = "archive healthy" if h["reported"] else "no archive report yet"
+    return {"name": name, "status": "ok", "detail": f"{h['live']} live records, {state}"}
 
 
 def check_host_subtrees() -> dict:
@@ -5922,7 +5930,7 @@ def check_core_quota_exhausted(fresh_sec: int = 1800) -> dict:
 
     # Every limit window can page (7d_oi can be the one rejected while 5h/7d sit
     # low); overage is shown but never pages, it is purchase eligibility.
-    from quota_availability import limit_windows as _limit_windows, quota_windows as _quota_windows
+    from quota_availability import classify_limit_state, limit_windows as _limit_windows, quota_windows as _quota_windows
     windows = _quota_windows(headers)
     full = [w for w, (u, st) in _limit_windows(headers).items()
             if st == "rejected" or (u is not None and u >= 0.9)]
@@ -5936,6 +5944,11 @@ def check_core_quota_exhausted(fresh_sec: int = 1800) -> dict:
             "not paging. If THIS core were stuck, its own passes would stop and "
             "quota-telemetry would go stale."
         )
+        return check
+
+    if classify_limit_state(data) == "overage":
+        # A rejected window with extra usage allowed is served, not stuck.
+        check["detail"] = f"core serving on extra usage (status={status}, {_window_summary(windows)})"
         return check
 
     reset = _fmt_quota_reset(headers.get("anthropic-ratelimit-unified-5h-reset"))
@@ -6330,7 +6343,7 @@ def check_bodhi_dist() -> dict:
     exercised until a client connects — so existing probes silently let
     it through. This probe catches that case on every health tick.
 
-    Fix when this check fails: `npm install github:sonichi/bodhi_realtime_agent`
+    Fix when this check fails: `npm install` (installs the package.json pin)
     then `launchctl kickstart -k gui/$(id -u)/com.sutando.voice-agent`.
 
     Scans whichever artifact the voice-agent ACTUALLY loads, because that
@@ -6405,7 +6418,7 @@ def check_bodhi_dist() -> dict:
         check["status"] = "fail"
         check["detail"] = (
             f"bodhi dist stale: {'/'.join(stale)} still uses deprecated `media` key — "
-            "Gemini 3.1 rejects with 1007. Run `npm install github:sonichi/bodhi_realtime_agent`."
+            "Gemini 3.1 rejects with 1007. Run `npm install`."
         )
     return check
 
@@ -6582,31 +6595,11 @@ def check_memory() -> dict:
 # re-armed). Each check is a *consequence* signal that fires regardless of
 # which underlying mechanism died.
 
-def _state_in_use_age_h(state_dir: "Path") -> "float | None":
-    """Age of the OLDEST top-level file in state/, or None when unknowable.
-
-    Top level only: state/cores/ is synced across hosts, so a peer's file would
-    date a workspace this host created minutes ago.
-    """
-    try:
-        ages = [time.time() - p.stat().st_mtime
-                for p in state_dir.iterdir() if p.is_file()]
-    except OSError:
-        return None
-    return max(ages) / 3600 if ages else None
-
-
-def _stamper_age_h() -> "float | None":
-    """Hours since the marker-WRITING code was installed here, or None if it is
-    not installed at all.
-
-    A missing marker only indicts the loop once the code that writes it has been
-    present long enough for a pass to close. At merge that code is younger than
-    every existing workspace, so workspace age alone convicts every host.
-    """
+def _stamper_age_h() -> Optional[float]:
+    """Bound first-proof migration grace by installation of the explicit writer."""
     p = REPO_DIR / "scripts" / "core-status.sh"
     try:
-        if "last-loop-ok" not in p.read_text(encoding="utf-8", errors="replace"):
+        if "--loop-complete" not in p.read_text(encoding="utf-8", errors="replace"):
             return None
         return (time.time() - p.stat().st_mtime) / 3600
     except OSError:
@@ -6614,68 +6607,55 @@ def _stamper_age_h() -> "float | None":
 
 
 def check_cron_schedule() -> dict:
-    """Smoke detector for a session cron schedule that stopped firing.
-
-    CronCreate jobs expire 7 days after registration, and the mechanism that
-    would re-register them (/schedule-crons via /proactive-loop) is itself one of
-    the expiring crons, so nothing self-heals.
-
-    The signal is `state/last-loop-ok`, stamped by scripts/core-status.sh on
-    `idle`. Deliberately NOT core-status.json, which owner turns also refresh and
-    which would therefore stay fresh through any conversation — masking a dead
-    schedule exactly when someone is around to be misled.
-    """
+    """Detect absent or stale host-specific proof of a completed proactive pass."""
     name = "cron-schedule"
-    marker = Path(WORKSPACE_DIR) / "state" / "last-loop-ok"
+    workspace = Path(WORKSPACE_DIR)
+    host = _host_label()
+    try:
+        entries = json.loads((workspace / "hosts" / host / "crons.json").read_text())
+    except (OSError, ValueError):
+        entries = []
+    if isinstance(entries, list) and core_loop_is_parked(entries):
+        return {"name": name, "status": "ok", "detail": "core loop deliberately parked; completion not expected"}
 
     def _h(env_name: str, default: float) -> float:
         try:
-            return float(os.environ.get(env_name, str(default)))
+            value = float(os.environ.get(env_name, str(default)))
+            return value if 0 < value < float("inf") else default
         except ValueError:
             return default
 
     warn_h = _h("SUTANDO_CRON_STALE_WARN_H", 7.0)
-    fail_h = _h("SUTANDO_CRON_STALE_FAIL_H", 26.0)
-
-    try:
-        age_h = (time.time() - marker.stat().st_mtime) / 3600
-    except OSError:
-        # Absence has two opposite meanings: a genuinely fresh workspace, or a loop
-        # that NEVER STARTED — the deadlock above, which writes no marker at all.
-        in_use_h = _state_in_use_age_h(marker.parent)
-        stamper_h = _stamper_age_h()
-        if stamper_h is None:
-            # This build cannot stamp the marker, so its absence says nothing at all.
-            return {"name": name, "status": "ok",
-                    "detail": "no loop marker, and this build does not stamp one"}
-        if stamper_h <= warn_h:
-            # A writer younger than the warn band cannot have had a pass close since
-            # it arrived, so its absence is explained without indicting the loop.
-            return {"name": name, "status": "ok",
-                    "detail": (f"no loop marker yet, but the stamping code is only "
-                               f"{stamper_h:.1f}h old (<{warn_h:.0f}h) — no pass has had "
-                               f"time to close since it was installed")}
-        if in_use_h is not None and in_use_h > warn_h:
+    fail_h = max(warn_h, _h("SUTANDO_CRON_STALE_FAIL_H", 26.0))
+    completed_at = read_completion(workspace, host)
+    if completed_at is None:
+        if completion_path(workspace, host).exists():
             return {"name": name, "status": "warn",
-                    "detail": (f"no loop marker in the {stamper_h:.1f}h since the stamping code "
-                               f"was installed, and state/ has been written for {in_use_h:.1f}h "
-                               f"(>{warn_h:.0f}h) — a pass should have closed by now, so the loop "
-                               f"may never have STARTED. Check CronList against crons.json")}
-        # Nothing rules out "fresh", and a missing marker must never be louder
-        # than a stale one.
-        return {"name": name, "status": "ok",
-                "detail": "no loop marker yet (fresh install, or no pass closed since restore)"}
+                    "detail": f"invalid or unreadable loop completion record for {host}"}
+        stamper_h = _stamper_age_h()
+        if stamper_h is not None and 0 <= stamper_h <= warn_h:
+            return {"name": name, "status": "ok",
+                    "detail": (f"awaiting first loop completion for {host}; writer installed "
+                               f"{stamper_h:.1f}h ago (grace <= {warn_h:.0f}h)")}
+        return {"name": name, "status": "warn",
+                "detail": (f"no loop completion proof for {host}; the loop may never have STARTED. "
+                           "Check the configured driver and complete one proactive pass")}
 
+    age_h = (time.time() - completed_at) / 3600
+    if age_h < 0:
+        return {"name": name, "status": "warn",
+                "detail": f"loop completion for {host} is future-dated; cannot verify liveness"}
     if age_h > fail_h:
         return {"name": name, "status": "fail",
-                "detail": (f"no proactive-loop pass has closed in {age_h:.1f}h (>{fail_h:.0f}h) — the model "
-                           f"cron schedule is almost certainly dead. CronCreate jobs expire after 7d; "
-                           f"re-register from hosts/<host>/crons.json via /schedule-crons")}
+                "detail": (f"no proactive-loop pass has closed for {host} in {age_h:.1f}h "
+                           f"(>{fail_h:.0f}h). Check the configured driver; Claude CronCreate "
+                           "jobs expire after 7d")}
     if age_h > warn_h:
         return {"name": name, "status": "warn",
-                "detail": (f"no proactive-loop pass has closed in {age_h:.1f}h (>{warn_h:.0f}h). "
-                           f"Check CronList against crons.json")}
-    return {"name": name, "status": "ok", "detail": f"last loop pass closed {age_h:.1f}h ago"}
+                "detail": (f"no proactive-loop pass has closed for {host} in {age_h:.1f}h "
+                           f"(>{warn_h:.0f}h). Check the configured driver")}
+    return {"name": name, "status": "ok",
+            "detail": f"last loop pass for {host} closed {age_h:.1f}h ago"}
 
 
 def check_core_proactive_loop(threshold_sec: int = 600) -> dict:
@@ -7852,6 +7832,60 @@ def check_disk_space() -> dict:
     return {"name": name, "status": "ok", "detail": where}
 
 
+def installed_skills_dir() -> Path:
+    """Where skills/install.sh links installed skills; the repo's own skills/ is the shipped copy."""
+    return Path(claude_home_path("skills"))
+
+
+def check_system_load(workspace: Optional[Path] = None, **probes) -> dict:
+    """Sustained load against the core count (src/system_load.py). The cause classifier is the
+    script an installed (linked) skill declares for system_load.DECLARATION, resolved here and injected."""
+    ws = WORKSPACE_DIR if workspace is None else Path(workspace)
+    found, name = _installed_reaper()
+    return system_load.check(
+        ws / "state" / system_load.STATE_NAME,
+        ratio=system_load.setting(config_get(system_load.RATIO_KEY), system_load.DEFAULT_RATIO, float),
+        passes=system_load.setting(config_get(system_load.PASSES_KEY), system_load.DEFAULT_PASSES, int),
+        classifier=found.script, unavailable=found.reason, reaper_name=name,
+        reap_on=system_load.reap_enabled(config_get(system_load.REAP_KEY)), **probes)
+
+
+def _installed_reaper():
+    """(Declaration, declaring skill's name) for system_load.DECLARATION in the installed skills dir."""
+    roots = [installed_skills_dir()]
+    found = skill_roots.declared(system_load.DECLARATION, roots=roots)
+    name = next((n for n, p in skill_roots.declared_scripts(system_load.DECLARATION, roots) if p == found.script), None)
+    return found, name
+
+
+def apply_system_load_reap(checks: list, workspace: Optional[Path] = None, stream=None, **probes) -> Optional[dict]:
+    """--fix for `system-load`: when it warns with action reap-once, run the installed orphan reaper
+    once for this episode (system_load.reap_once) and rewrite the row to say what happened."""
+    row = next((c for c in checks if c.get("name") == system_load.NAME), None)
+    if not row or row.get("status") != "warn" or row.get("action") != system_load.ACTION_REAP:
+        return None
+    out = stream or sys.stdout
+
+    def log(line: str) -> None:
+        print(line, file=out, flush=True)
+
+    if not system_load.reap_enabled(config_get(system_load.REAP_KEY)):
+        log(f"system-load: not reaped: reaping is off ({system_load.REAP_KEY}=1 enables it)")
+        return {"action": "disabled"}
+    found, _ = _installed_reaper()
+    if found.script is None:
+        reason = found.reason or "no installed skill declares an orphan reaper"
+        log(f"system-load: not reaped: {reason}")
+        system_load.annotate(row, None, unreaped=reason)
+        return {"action": "no-reaper", "reason": reason}
+    ws = WORKSPACE_DIR if workspace is None else Path(workspace)
+    state_path = ws / "state" / system_load.STATE_NAME
+    result = system_load.reap_once(state_path, found.script, log=log, **probes)
+    if result["action"] != "busy":
+        system_load.annotate(row, system_load.read_state(state_path).get("episode"))
+    return result
+
+
 @functools.lru_cache(maxsize=1)
 def _ephemeral_roots() -> tuple:
     """Temp roots whose contents do not survive a sweep or reboot, asked of the
@@ -7942,8 +7976,13 @@ def check_skill_symlinks() -> dict:
     # -- harmless that time, which is exactly why it survived unnoticed.
     shadowed: list[str] = []   # real dir where a symlink belongs -> NOT auto-fixed
     misdirected: list[tuple[str, str]] = []  # resolves, but into a temp dir
+    from skill_audience import developer_opt_in, installable  # noqa: PLC0415
+    developer = developer_opt_in()
     for skill_dir in sorted(skills_src.iterdir()):
         if not skill_dir.is_dir():
+            continue
+        # skills/install.sh does not link these here, so --fix must not either.
+        if installable(skill_dir, developer).reason is not None:
             continue
         # Mirror skills/install.sh's filter: only dirs WITH a SKILL.md are
         # slash-invocable skills the installer links. Manifest-loaded and
@@ -8331,18 +8370,13 @@ def check_pool_suspended() -> dict:
     """A pool suspension never expires; only resuming the pool lifts it. One still present
     while a core runs means the host never resumed it, and no worker is being healed."""
     name = "pool-suspended"
-    path = WORKSPACE_DIR / "state" / "pool-suspended"
     try:
-        text = path.read_text(encoding="utf-8").strip()
-    except FileNotFoundError:
-        return {"name": name, "status": "ok", "detail": "pool not suspended"}
+        rec = pool_suspension.read(WORKSPACE_DIR)
     except OSError as e:
         return {"name": name, "status": "warn", "detail": f"pool-suspended unreadable: {e}"}
-    try:
-        rec = json.loads(text)
-    except ValueError:
-        rec = None
-    what = (f"{rec.get('reason')} since {rec.get('at')}" if isinstance(rec, dict) else text[:80])
+    if rec is None:
+        return {"name": name, "status": "ok", "detail": "pool not suspended"}
+    what = rec["reason"][:80] + (f" since {rec['at']}" if rec["at"] is not None else "")
     if not _any_core_alive():
         return {"name": name, "status": "ok", "detail": f"pool suspended ({what}) while no core runs"}
     return {"name": name, "status": "warn",
@@ -9739,6 +9773,28 @@ def check_a_fallback_hits(workspace_dir: Optional[Path] = None) -> dict:
 
 
 
+def check_withheld_reviews_readable(workspace_dir: Optional[Path] = None) -> dict:
+    """A withheld-review record the bridge cannot read as a record makes every owner Yes/No
+    in the DM answer "please reply again" until it is inspected or removed."""
+    name = "withheld-reviews-readable"
+    workspace = Path(workspace_dir or WORKSPACE_DIR)
+    try:
+        from policy.egress import result as guard  # noqa: PLC0415 - the bridge's own strict rule
+    except ImportError as exc:
+        return {"name": name, "status": "warn", "detail": f"cannot load the review guard ({exc})"}
+    base = workspace / "state" / guard.WITHHELD_RESULT_DIR
+    bad = []
+    for path, reason in guard.namespace_problems(base):
+        shown = path.relative_to(workspace) if path.is_relative_to(workspace) else path.name
+        bad.append(f"{shown} ({reason})")
+    if bad:
+        shown = ", ".join(bad[:4]) + (f" (+{len(bad) - 4} more)" if len(bad) > 4 else "")
+        return {"name": name, "status": "warn",
+                "detail": f"{len(bad)} withheld-review record(s) unreadable; owner replies get "
+                          f"'please reply again' until each is inspected or removed: {shown}"}
+    return {"name": name, "status": "ok", "detail": "every withheld-review record reads"}
+
+
 def check_outbox_parked(workspace_dir: Optional[Path] = None) -> dict:
     """A PARKED outbound item is a reply the owner never received, and nothing
     retries it: `outbox_cli`'s own header calls PARKED a durable terminal state
@@ -9763,7 +9819,7 @@ def check_outbox_parked(workspace_dir: Optional[Path] = None) -> dict:
     except ImportError as exc:
         return {"name": name, "status": "warn",
                 "detail": f"cannot read the outbox ({exc}) — parked replies unjudged"}
-    parked: list[tuple[str, str]] = []  # (root.name, item_id) -- roots differ, see below
+    parked: list[tuple[str, str, str]] = []  # (root.name, item_id, reason) -- roots differ, see below
     unreadable: list[str] = []
     for root in roots:
         # An unreadable ROOT reaches here too, and a raise would abort every
@@ -9777,20 +9833,31 @@ def check_outbox_parked(workspace_dir: Optional[Path] = None) -> dict:
             unreadable.append(f"{root.name} ({exc})")
             continue
         for d in outbox.list_items(root, status="PARKED"):
-            parked.append((root.name, str(d.get("item_id") or "?")))
+            parked.append((root.name, str(d.get("item_id") or "?"), str(d.get("reason") or "")))
     if unreadable:
         return {"name": name, "status": "warn",
                 "detail": "outbox root(s) unreadable, so parked replies are unjudged: "
                           + "; ".join(unreadable)}
     if parked:
         parked.sort()
-        shown = ", ".join(f"{item_id} (--root <ws>/results/{root_name})"
-                           for root_name, item_id in parked[:4])
-        more = f" (+{len(parked) - 4} more)" if len(parked) > 4 else ""
+
+        def listing(items):
+            shown = ", ".join(f"{item_id} (--root <ws>/results/{root_name})"
+                               for root_name, item_id, _reason in items[:4])
+            return shown + (f" (+{len(items) - 4} more)" if len(items) > 4 else "")
+        # An outcome-unknown park may have landed: a requeue sends again and can post twice.
+        unknown = [p for p in parked if p[2] == "outcome-unknown"]
+        undelivered = [p for p in parked if p[2] != "outcome-unknown"]
+        parts = []
+        if undelivered:
+            parts.append(f"{len(undelivered)} never delivered — nothing retries them: "
+                         f"{listing(undelivered)}")
+        if unknown:
+            parts.append(f"{len(unknown)} may have been delivered — do not requeue without "
+                         f"checking the room: {listing(unknown)}")
         return {"name": name, "status": "warn",
-                "detail": f"{len(parked)} reply/replies PARKED and never delivered — "
-                          f"nothing retries them: {shown}{more}. Recover with "
-                          f"`python3 src/outbox_cli.py --root <shown-above> requeue <id>` "
+                "detail": f"{len(parked)} reply/replies PARKED; " + "; ".join(parts) + ". "
+                          f"Recover with `python3 src/outbox_cli.py --root <shown-above> requeue <id>` "
                           f"(the root varies per item; a single hardcoded root under-reports)"}
     return {"name": name, "status": "ok",
             "detail": f"no parked replies across {len(roots)} outbox root(s)"}
@@ -10119,18 +10186,7 @@ def _local_codex_core_target(target: "dict | None" = None) -> "dict | None":
     exists = _run_tmux(socket_path, "has-session", "-t", f"={session}")
     if exists is None or exists.returncode != 0:
         return None
-    runtime = _run_tmux(
-        socket_path,
-        "show-environment",
-        "-t",
-        f"={session}",
-        "SUTANDO_CORE_RUNTIME",
-    )
-    if (
-        runtime is None
-        or runtime.returncode != 0
-        or runtime.stdout.strip() != "SUTANDO_CORE_RUNTIME=codex"
-    ):
+    if session_runtime.read(session, lambda *a: _run_tmux(socket_path, *a)) != "codex":
         return None
     return target
 
@@ -10499,10 +10555,9 @@ def fix_claude_task_notifier() -> str:
         return "not repaired — the live Claude core session could not be verified"
     # The shared launcher injects --restart when the session records another
     # runtime, and spawns a new core when the heartbeat's process is gone.
-    recorded = _run_tmux(target["socket"], "show-environment", "-t", f"={target['session']}", "SUTANDO_CORE_RUNTIME")
-    if recorded is None or recorded.returncode != 0 or recorded.stdout.strip() != "SUTANDO_CORE_RUNTIME=claude":
-        seen = (recorded.stdout.strip() if recorded is not None and recorded.returncode == 0 else "unreadable")
-        return f"not repaired — the live core records a different runtime ({seen})"
+    recorded = session_runtime.read(target["session"], lambda *a: _run_tmux(target["socket"], *a))
+    if recorded != "claude":
+        return f"not repaired — the live core records a different runtime ({recorded or 'unreadable'})"
     core_pid = heartbeat.get("pid")
     if not isinstance(core_pid, int) or isinstance(core_pid, bool) or not _process_alive(core_pid):
         return f"not repaired — the heartbeat's core process (pid {core_pid}) is not running"
@@ -11960,6 +12015,7 @@ def _runs_a_script(command: str) -> bool:
 _HOOK_FAMILY_INSTALLERS = {
     "personal-claude-compact-hint.sh": "scripts/install-personal-claude-hook.sh",
     "schedule-crons-session-hint.sh": "scripts/install-session-start-hook.sh",
+    "watcher-rearm-session-hint.sh": "scripts/install-watcher-rearm-hook.sh",
 }
 
 
@@ -11993,6 +12049,10 @@ def check_claude_hook_registration(
         failure that looks healthiest.
     """
     name = "claude-hooks"
+    # These hooks only fire inside a Claude core; under Codex there is nothing to register.
+    if _codex_runtime_selected():
+        return {"name": name, "status": "ok",
+                "detail": "not applicable — core runtime is codex; Claude hooks are not used"}
     repo = Path(repo_dir or REPO_DIR)
     installer = repo / "src" / "install-claude-hooks.sh"
     if not installer.is_file():
@@ -12430,15 +12490,9 @@ def _live_core_runtime(socket: str, sessions) -> "str | None":
     """
     seen = set()
     for sess in sessions:
-        res = _run_tmux(socket, "show-environment", "-t", f"={sess}",
-                        "SUTANDO_CORE_RUNTIME")
-        if res is None or res.returncode != 0:
-            continue
-        out = (res.stdout or "").strip()
-        if out.startswith("SUTANDO_CORE_RUNTIME="):
-            val = out.split("=", 1)[1].strip()
-            if val:
-                seen.add(val)
+        val = session_runtime.read(sess, lambda *a: _run_tmux(socket, *a))
+        if val:
+            seen.add(val)
     return seen.pop() if len(seen) == 1 else None
 
 
@@ -12941,6 +12995,7 @@ def run_all_checks() -> list[dict]:
     # Advisory CLI progress detector (pane static with work outstanding / retry
     # loop); reads the pane, never the process, and drives no recovery.
     checks.append(check_cli_wedge())
+    checks.append(check_pane_key_fence())
 
     # macOS TCC — must come before critical-file checks so if TCC is blocking
     # everything, the operator sees the root cause before the downstream failures.
@@ -13021,6 +13076,9 @@ def run_all_checks() -> list[dict]:
     checks.append(check_skills_driver_code_drift())
     checks.append(check_sync_conflicts_unmerged())
     checks.append(check_engine_revision_drift())
+    hitl_archive_check = check_hitl_archive()
+    if hitl_archive_check is not None:
+        checks.append(hitl_archive_check)
     onboarding_check = check_onboarding_status()
     if onboarding_check is not None:
         checks.append(onboarding_check)
@@ -13404,6 +13462,7 @@ def run_all_checks() -> list[dict]:
     checks.append(check_task_claim_age())
     checks.append(check_a_fallback_hits())
     checks.append(check_outbox_parked())
+    checks.append(check_withheld_reviews_readable())
     checks.append(check_codex_task_notifier())
     checks.append(check_claude_task_notifier())
     checks.append(check_codex_presence())
@@ -13413,6 +13472,7 @@ def run_all_checks() -> list[dict]:
     checks.append(check_runtime_identity())
     checks.append(check_live_tree_drift())
     checks.append(check_disk_space())
+    checks.append(check_system_load())
 
     # Last, and only when this host declares any: a user probe must never
     # delay or displace a built-in one.
@@ -14676,8 +14736,8 @@ def _default_cron_nudge(
             return False
         send = subprocess.run(
             # Exact name: a bare target prefix-matches the core's `-watcher` session once the core is gone.
-            [tmux_bin, "-S", sock, "send-keys", "-t", f"={session}:", "/schedule-crons", "Enter"],
-            env=env, capture_output=True, timeout=15,
+            tmux_pane_keys.argv(sock, f"={session}:", "/schedule-crons", "Enter", tmux=tmux_bin),
+            env=env, capture_output=True, timeout=tmux_pane_keys.TIMEOUT_S,
         )
         return send.returncode == 0
     except Exception:
@@ -14987,6 +15047,7 @@ def main():
         apply_skill_symlink_fixes(checks, stream=sys.stderr if as_json else sys.stdout)
         apply_task_watcher_sentinel_fix(checks, stream=sys.stderr if as_json else sys.stdout)
         apply_claude_hooks_fix(checks, stream=sys.stderr if as_json else sys.stdout)
+        apply_system_load_reap(checks, stream=sys.stderr if as_json else sys.stdout)
 
     # Optional: macOS notification surface for the launchd-supervised path
     # (com.sutando.health-check-fallback). Notifies on the INITIAL check set
