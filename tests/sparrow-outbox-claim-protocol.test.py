@@ -761,7 +761,7 @@ def _c23():
 
 
 # 24 --------------------------------------------------------------------------
-@contract("an out-of-range pid, birth token or claimed_at reads UNKNOWN and is never reclaimable")
+@contract("an out-of-range pid, birth token or claimed_at reads UNKNOWN, not pid reuse")
 def _c24():
     m = outbox()
     acquire = need(m, "acquire_delivery_claim")
@@ -783,6 +783,7 @@ def _c24():
         "start_usec=10**400, live pid": ("start_usec", 10**400),
         "start_usec=2**63, live pid": ("start_usec", 2**63),
         "start_usec=1.5, live pid": ("start_usec", 1.5),
+        "start_usec=0, live pid": ("start_usec", 0),
     }
     bad: list[str] = []
     with tempfile.TemporaryDirectory() as tmp:
@@ -808,16 +809,67 @@ def _c24():
         assert acquire(root, "item-edge", "d1") is True
         p = claim_path(root, "item-edge")
         rec = json.loads(p.read_text(encoding="utf-8"))
-        rec.update(start_usec=0, claimed_at=2**53)
+        rec.update(start_usec=1, claimed_at=2**53)
         p.write_text(json.dumps(rec), encoding="utf-8")
         got = read(root, "item-edge")
         assert got is not None and got.state == "HELD", f"edge values must read HELD, got {got}"
     # A record built in-process with an impossible token is not evidence of reuse.
     reused = need(m, "_pid_was_reused")
     ident = need(m, "process_identity")(os.getpid())
-    for bad in (-1, 10**400, 2**63):
+    for bad in (0, -1, 10**400, 2**63):
         rec = m.ClaimRecord("x", "d1", os.getpid(), bad, 0.0)
         assert reused(rec, ident) is False, f"start_usec={bad} counted as pid reuse"
+
+
+# 25 --------------------------------------------------------------------------
+@contract("a malformed claim ages by file mtime to the full TTL, under the liveness rules; torn still sweeps")
+def _c25():
+    m = outbox()
+    acquire = need(m, "acquire_delivery_claim")
+    reclaim = need(m, "reclaim_delivery_claim")
+    claim_path = need(m, "_claim_path")
+    grace = need(m, "SWAP_GRACE_S")
+    ttl = 300.0
+
+    def plant(root, item, patch=None, text=None):
+        assert acquire(root, item, "owner") is True
+        p = claim_path(root, item)
+        if text is None:
+            rec = json.loads(p.read_text(encoding="utf-8"))
+            rec.update(patch)
+            text = json.dumps(rec)
+        p.write_text(text, encoding="utf-8")
+        return p
+
+    def taken_at(root, item, p, age):
+        t = time.time() - age
+        os.utime(p, (t, t))
+        return reclaim(root, item, ttl, "thief")
+
+    bad: list[str] = []
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        # Live owner, pid unreadable: only the mtime TTL can release it.
+        p = plant(root, "unreadable-pid", {"pid": str(os.getpid()), "claimed_at": 10**400})
+        for age, want in ((grace + 1, False), (ttl - 1, False), (ttl, True)):
+            if taken_at(root, "unreadable-pid", p, age) is not want:
+                bad.append(f"unreadable pid at {age}s: want taken={want}")
+        # Live readable pid, impossible token: the live owner is never displaced.
+        p = plant(root, "live-bad-token", {"start_usec": -1})
+        for age in (grace + 1, ttl - 1, ttl * 100):
+            if taken_at(root, "live-bad-token", p, age):
+                bad.append(f"live owner, start_usec=-1, taken at {age}s")
+        # Dead readable pid, impossible token: released at the TTL, not before.
+        p = plant(root, "dead-bad-token", {"pid": DEAD_PID, "start_usec": -1})
+        for age, want in ((grace + 1, False), (ttl - 1, False), (ttl, True)):
+            if taken_at(root, "dead-bad-token", p, age) is not want:
+                bad.append(f"dead owner, start_usec=-1 at {age}s: want taken={want}")
+        # A torn write keeps its grace-period sweep.
+        p = plant(root, "torn", text='{"item_id": "torn", "pi')
+        for age, want in ((grace - 1, False), (grace + 1, True)):
+            if taken_at(root, "torn", p, age) is not want:
+                bad.append(f"torn at {age}s: want taken={want}")
+    assert not bad, "; ".join(bad)
 
 
 def main() -> int:

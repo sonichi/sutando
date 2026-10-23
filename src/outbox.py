@@ -255,7 +255,10 @@ class ClaimRecord:
     pid: int
     start_usec: Optional[int]
     claimed_at: float
-    state: str = "HELD"          # HELD | UNKNOWN (torn)
+    state: str = "HELD"          # HELD | UNKNOWN (torn or malformed)
+    # Malformed = a complete write with invalid fields; it ages by file mtime, never a sweep.
+    malformed: bool = False
+    file_mtime: Optional[float] = None
 
 
 def _claims_dir(root: Path) -> Path:
@@ -481,21 +484,38 @@ def _read_claim_at(p: Path, item_id: str) -> Optional[ClaimRecord]:
         return ClaimRecord(item_id, "", -1, None, 0.0, state="UNKNOWN")
     try:
         d = json.loads(raw)
+    except json.JSONDecodeError:
+        return ClaimRecord(item_id, "", -1, None, 0.0, state="UNKNOWN")
     except (ValueError, OverflowError):
-        return ClaimRecord(item_id, "", -1, None, 0.0, state="UNKNOWN")
+        d = None
+    # The writer emits one complete JSON object, so anything that decodes was finished:
+    # invalid fields are malformed, not torn, and must not take the torn-write sweep.
     if not isinstance(d, dict):
-        return ClaimRecord(item_id, "", -1, None, 0.0, state="UNKNOWN")
-    # Valid JSON carrying wrong types is still a claim we cannot read. Raising
-    # here would abort a drainer mid-scan; UNKNOWN keeps the item un-stealable.
+        return _malformed_claim(p, item_id, {})
     pid, start_usec, claimed_at = d.get("pid"), d.get("start_usec"), d.get("claimed_at")
     if not (valid_pid(pid) is not None and (start_usec is None or _valid_start_usec(start_usec))
             and _valid_claimed_at(claimed_at)):
-        return ClaimRecord(item_id, "", -1, None, 0.0, state="UNKNOWN")
+        return _malformed_claim(p, item_id, d)
     return ClaimRecord(item_id=str(d.get("item_id", item_id)),
                        drainer_id=str(d.get("drainer_id", "")),
                        pid=pid,
                        start_usec=start_usec,
                        claimed_at=float(claimed_at))
+
+
+def _malformed_claim(p: Path, item_id: str, d: dict) -> ClaimRecord:
+    """UNKNOWN, keeping whatever still parses: the item id for terminal retirement,
+    a valid pid and birth token for the liveness rules."""
+    raw_id, raw_drainer, raw_start = d.get("item_id"), d.get("drainer_id"), d.get("start_usec")
+    try:
+        mtime: Optional[float] = os.stat(str(p)).st_mtime
+    except OSError:
+        mtime = None
+    return ClaimRecord(item_id=raw_id if isinstance(raw_id, str) else item_id,
+                       drainer_id=raw_drainer if isinstance(raw_drainer, str) else "",
+                       pid=valid_pid(d.get("pid")) or -1,
+                       start_usec=raw_start if _valid_start_usec(raw_start) else None,
+                       claimed_at=0.0, state="UNKNOWN", malformed=True, file_mtime=mtime)
 
 
 _START_USEC_LIMIT = 2**63
@@ -510,7 +530,7 @@ def valid_pid(pid) -> Optional[int]:
 
 
 def _valid_start_usec(value: object) -> bool:
-    return type(value) is int and 0 <= value < _START_USEC_LIMIT
+    return type(value) is int and 0 < value < _START_USEC_LIMIT
 
 
 def _valid_claimed_at(value: object) -> bool:
@@ -534,13 +554,19 @@ def may_reclaim_delivery(root: Path, item_id: str, ttl_seconds: float) -> bool:
 
 
 def _record_is_reclaimable(rec: ClaimRecord, ttl_seconds: float) -> bool:
-    if rec.state == "UNKNOWN":
+    if rec.state == "UNKNOWN" and not rec.malformed:
         return False                      # torn: we do not know; do not steal
-    owner = process_identity(rec.pid)
-    if owner.state is OwnerState.UNKNOWN:
-        return False
-    if owner.state is OwnerState.ALIVE and not _pid_was_reused(rec, owner):
-        return False
+    if valid_pid(rec.pid) is not None:
+        owner = process_identity(rec.pid)
+        if owner.state is OwnerState.UNKNOWN:
+            return False
+        if owner.state is OwnerState.ALIVE and not _pid_was_reused(rec, owner):
+            return False
+    if rec.malformed:
+        # claimed_at is untrusted here; the filesystem's mtime is not.
+        if rec.file_mtime is None:
+            return False
+        return (time.time() - rec.file_mtime) >= max(ttl_seconds, SWAP_GRACE_S)
     return (time.time() - rec.claimed_at) >= ttl_seconds
 
 
@@ -588,7 +614,7 @@ def _reclaim_locked(root: Path, item_id: str, ttl_seconds: float,
     observed = read_delivery_claim(root, item_id)
     if observed is None:
         return _acquire_locked(root, item_id, drainer_id)
-    if observed.state == "UNKNOWN":
+    if observed.state == "UNKNOWN" and not observed.malformed:
         # A torn claim names no owner, so no age of it condemns a live writer —
         # but past the grace period its writer is gone and it would wedge forever.
         if not _sweep_if_abandoned(_claim_path(root, item_id)):
@@ -708,7 +734,8 @@ def _release_own_instance(p: Path, item_id: str, drainer_id: str) -> bool:
     """
     observed = _read_claim_at(p, item_id)
     # A torn claim has no readable owner, so nobody can prove they hold it.
-    if observed is None or observed.state == "UNKNOWN" or observed.drainer_id != drainer_id:
+    if observed is None or (observed.state == "UNKNOWN" and not observed.malformed) \
+            or observed.drainer_id != drainer_id:
         return False
     tomb = p.with_name(f"{p.name}.release-{_claim_stamp(observed)}")
     try:
