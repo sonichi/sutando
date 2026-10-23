@@ -6,6 +6,7 @@ Run: python3 tests/outbox-malformed-claim-backend.test.py
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import subprocess
@@ -15,6 +16,7 @@ import threading
 import time
 import unicodedata
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 _PKG = Path(__file__).resolve().parent.parent / "packages" / "ag2-sparrow"
@@ -43,10 +45,29 @@ PID_FORMS = [
     ("fractional float", lambda pid: f"{pid}.5", True),
     ("negative string", lambda pid: '"-1"', False),
     ("word string", lambda pid: '"abc"', False),
-    ("true", lambda pid: "true", False),
+    ("true", lambda pid: "true", True),
+    ("false", lambda pid: "false", False),
     ("oversized", lambda pid: "9" * 5001, False),
     ("2**31", lambda pid: str(2**31), False),
 ]
+
+
+@contextlib.contextmanager
+def owner_stand_in(module, states):
+    """Pids a test cannot own (1, PID_MAX) get a patched liveness probe: {pid: alive}."""
+    real = module.process_identity
+
+    def probe(pid):
+        if pid in states:
+            return module.ProcessIdentity(pid, module.OwnerState.ALIVE if states[pid]
+                                          else module.OwnerState.DEAD)
+        return real(pid)
+    with patch.object(module, "process_identity", probe):
+        yield
+
+
+def pid1_stand_in(module, alive):
+    return owner_stand_in(module, {1: alive})
 
 
 class MalformedClaimBackend(unittest.TestCase):
@@ -205,7 +226,7 @@ class MalformedClaimBackend(unittest.TestCase):
         for label, render, plausible in PID_FORMS:
             for alive, pid in ((True, os.getpid()), (False, DEAD_PID)):
                 held = plausible and alive
-                with self.subTest(form=label, alive=alive):
+                with self.subTest(form=label, alive=alive), pid1_stand_in(outbox, alive):
                     self.tearDown()
                     self.setUp()
                     self.assertEqual(self._drain_while_a_sends(render(pid), TTL + 1),
@@ -220,6 +241,32 @@ class MalformedClaimBackend(unittest.TestCase):
                     self.assertEqual(b.recover().retired, [])
                     self._rewrite_pid(render(pid), TTL)
                     self.assertEqual(b.recover().retired, [] if held else [ITEM])
+
+    def test_owner_identity_axis(self):
+        """Vary who owns the claim, not only how its pid is written."""
+        pid_max = 2**31 - 1
+        owners = [("own pid", os.getpid(), None, True), ("dead pid", DEAD_PID, None, False)]
+        for name, pid in (("pid 1", 1), ("PID_MAX", pid_max)):
+            owners += [(name, pid, True, True), (name, pid, False, False)]
+        forms = [f for f in PID_FORMS if f[0] in (
+            "int", "digit string", "integral float", "leading-zero string", "padded string")]
+        for name, pid, patched, alive in owners:
+            states = {} if patched is None else {pid: patched}
+            for label, render, _ in forms:
+                with self.subTest(owner=name, alive=alive, form=label), \
+                        owner_stand_in(outbox, states):
+                    self.tearDown()
+                    self.setUp()
+                    self.assertEqual(self._drain_while_a_sends(render(pid), TTL + 1),
+                                     1 if alive else 2)
+                    self.tearDown()
+                    self.setUp()
+                    b = DesignAClaimBackend(self.root, reclaim_ttl_s=TTL)
+                    self.assertTrue(b.publish(ITEM, b"hi"))
+                    self.assertIsNotNone(b.claim(ITEM, "A"))
+                    outbox.record_delivered(self.root, ITEM)
+                    self._rewrite_pid(render(pid), TTL)
+                    self.assertEqual(b.recover().retired, [] if alive else [ITEM])
 
     def test_padded_live_pid_blocks_at_every_length(self):
         pid = str(os.getpid())

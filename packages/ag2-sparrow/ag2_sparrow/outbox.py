@@ -531,9 +531,9 @@ def _malformed_claim(p: Path, item_id: str, d: dict) -> ClaimRecord:
 
 
 def _candidate_owner_pid(raw: object) -> Optional[int]:
-    """A pid that plausibly names the owner: any int, finite float or string int() turns
-    into a pid within valid_pid's bounds. Only ever evidence AGAINST a takeover."""
-    if type(raw) is float and math.isfinite(raw):
+    """valid_pid(int(raw)) for every JSON value the reader can see, None where int() raises.
+    Only ever evidence AGAINST a takeover; in a PID namespace pid 1 (true) is a drainer."""
+    if type(raw) is bool or (type(raw) is float and math.isfinite(raw)):
         raw = int(raw)
     elif type(raw) is str:
         return _int_string_pid(raw)

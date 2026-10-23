@@ -51,6 +51,7 @@ Run: python3 tests/sparrow-outbox-claim-protocol.test.py
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import subprocess
@@ -887,10 +888,29 @@ PID_FORMS = [
     ("fractional float", lambda pid: f"{pid}.5", True),
     ("negative string", lambda pid: '"-1"', False),
     ("word string", lambda pid: '"abc"', False),
-    ("true", lambda pid: "true", False),
+    ("true", lambda pid: "true", True),
+    ("false", lambda pid: "false", False),
     ("oversized", lambda pid: "9" * 5001, False),
     ("2**31", lambda pid: str(2**31), False),
 ]
+
+
+@contextlib.contextmanager
+def owner_stand_in(module, states):
+    """Pids a test cannot own (1, PID_MAX) get a patched liveness probe: {pid: alive}."""
+    real = module.process_identity
+
+    def probe(pid):
+        if pid in states:
+            return module.ProcessIdentity(pid, module.OwnerState.ALIVE if states[pid]
+                                          else module.OwnerState.DEAD)
+        return real(pid)
+    with patch.object(module, "process_identity", probe):
+        yield
+
+
+def pid1_stand_in(module, alive):
+    return owner_stand_in(module, {1: alive})
 
 
 PAD_LENGTHS = (1, 10, 32, 33, 64, 5000)
@@ -959,7 +979,8 @@ def _c26():
                     t = time.time() - age
                     os.utime(p, (t, t))
                     want = (not held) and age >= ttl
-                    got = (may(root, item, ttl), reclaim(root, item, ttl, "thief"))
+                    with pid1_stand_in(m, alive):
+                        got = (may(root, item, ttl), reclaim(root, item, ttl, "thief"))
                     if got != (want, want):
                         bad.append(f"{label} alive={alive} at {age}s: may/reclaim={got}, "
                                    f"want {want}")
@@ -1040,12 +1061,28 @@ def _int_oracle(m, text):
         return None
 
 
-@contract("the pid string reader agrees with int() for every code point as padding, separator or digit")
+@contract("the pid reader agrees with int() for every JSON value type, and every code point as padding, separator or digit")
 def _c28():
     m = outbox()
     read = need(m, "_int_string_pid")
     pid = str(os.getpid())
     bad: list[str] = []
+    # Domain oracle: one representative of every JSON value type the reader can see.
+    candidate = need(m, "_candidate_owner_pid")
+    pid_max, live = 2**31 - 1, os.getpid()
+    domain = [True, False, None, [], {}, [live], {"pid": live}, 0, 1, live, pid_max, pid_max + 1,
+              DEAD_PID, str(DEAD_PID), float(DEAD_PID), "1", 1.0, str(pid_max), f"0{pid_max}",
+              -1, 10**400, 0.0, -0.0, 1.0, 1.5, float(live), live + 0.9, float(pid_max),
+              float(pid_max + 1), 1e308, -1e308, float("inf"), float("-inf"), float("nan"),
+              "", "0", "1", str(live), f" +{live} ", "abc", "-5", "\u0660" * 10 + str(live),
+              m._OVERSIZE]
+    for value in domain:
+        try:
+            want = m.valid_pid(int(value))
+        except (TypeError, ValueError, OverflowError):
+            want = None
+        if candidate(value) != want:
+            bad.append(f"domain {value!r}: candidate {candidate(value)}, int() oracle {want}")
     for cp in range(sys.maxunicode + 1):
         c = chr(cp)
         for where, text in (("padding", c + pid + c), ("separator", pid[:1] + c + pid[1:]),
@@ -1069,6 +1106,49 @@ def _c28():
     assert scanned == whitespace, (
         f"int() strips {sorted(hex(ord(c)) for c in scanned ^ whitespace)} differently "
         f"from _INT_WHITESPACE")
+
+
+# 29 --------------------------------------------------------------------------
+@contract("a plausible but non-strict pid blocks a takeover and never proves pid reuse")
+def _c29():
+    m = outbox()
+    acquire = need(m, "acquire_delivery_claim")
+    may = need(m, "may_reclaim_delivery")
+    reclaim = need(m, "reclaim_delivery_claim")
+    release = need(m, "release_delivery_claim")
+    read = need(m, "read_delivery_claim")
+    claim_path = need(m, "_claim_path")
+    ttl = 300.0
+    bad: list[str] = []
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        for n, (label, raw_pid, strict) in enumerate((
+                ("leading-zero string", f'"0{os.getpid()}"', False),
+                ("padded string", f'" {os.getpid()} "', False),
+                ("strict int (control)", str(os.getpid()), True))):
+            for token_kind, shift in (("reused-looking token", 12345), ("dead-looking token", None)):
+                item = f"asym-{n}-{token_kind[:4]}"
+                assert acquire(root, item, "owner") is True
+                p = claim_path(root, item)
+                rec = json.loads(p.read_text(encoding="utf-8"))
+                rec.update(pid="@PID@", claimed_at="not-a-time",
+                           start_usec=1 if shift is None else rec["start_usec"] + shift)
+                p.write_text(json.dumps(rec).replace('"@PID@"', raw_pid), encoding="utf-8")
+                t = time.time() - ttl * 100
+                os.utime(p, (t, t))
+                got = read(root, item)
+                if strict:
+                    # The strict pid with a mismatched token is proven reuse: reclaimable.
+                    if not (may(root, item, ttl) and reclaim(root, item, ttl, "thief")):
+                        bad.append(f"{label}, {token_kind}: strict reuse proof was refused")
+                    continue
+                if got.pid != -1:
+                    bad.append(f"{label}: authorizing pid is {got.pid}, want -1 (not strict)")
+                if may(root, item, ttl) or reclaim(root, item, ttl, "thief"):
+                    bad.append(f"{label}, {token_kind}: taken as proven reuse of a live owner")
+                if release(root, item, "thief"):
+                    bad.append(f"{label}, {token_kind}: released by a drainer that is not its owner")
+    assert not bad, "; ".join(bad)
 
 
 def main() -> int:
