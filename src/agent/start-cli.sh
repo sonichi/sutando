@@ -99,6 +99,25 @@ fi
 
 export SUTANDO_CORE_RUNTIME="$runtime"
 
+# On a desktop install the core lives on the app's private socket, under its bundled tmux. A
+# terminal launch that names neither took the /tmp default and started a second core beside
+# the app's on a Homebrew tmux, both reading one inbox (2026-10-23, a core-suggested command).
+desktop_app_support="${SUTANDO_APP_SUPPORT:-}"
+if [ -z "$desktop_app_support" ] && [ "$(basename "$(dirname "$REPO")")" = engine ]; then
+  desktop_app_support="$(dirname "$(dirname "$REPO")")"
+fi
+[ -n "$desktop_app_support" ] && [ -d "$desktop_app_support" ] || desktop_app_support=""
+desktop_socket="${desktop_app_support:+$desktop_app_support/run/tmux.sock}"
+if [ -n "$desktop_app_support" ]; then
+  if [ -z "${SUTANDO_TMUX_SOCKET:-}" ]; then
+    export SUTANDO_TMUX_SOCKET="$desktop_socket"
+    echo "start-cli: desktop install: using its core socket $desktop_socket." >&2
+  fi
+  if [ -z "${SUTANDO_TMUX_BIN:-}" ] && [ -x "$desktop_app_support/engine/bin/tmux" ]; then
+    export SUTANDO_TMUX_BIN="$desktop_app_support/engine/bin/tmux"
+  fi
+fi
+
 # A config switch may find the other runtime still occupying the canonical
 # tmux session. Detect it before delegation and turn a normal start into a
 # restart; otherwise the selected launcher could attach to/reuse the wrong CLI.
@@ -136,20 +155,18 @@ esac
 # An explicit --runtime on a desktop install is a switch: the desktop must select it too,
 # or it keeps relaunching and probing for the old CLI while the new one owns the session
 # (2026-10-22: a CLI switch to Claude left runtime.json on codex and the app stuck on
-# "core liveness unknown"). Refuse rather than launch into that split.
-if [ -n "$requested_runtime" ]; then
-  _app_support="${SUTANDO_APP_SUPPORT:-}"
-  if [ -z "$_app_support" ] && [ "$(basename "$(dirname "$REPO")")" = engine ]; then
-    _app_support="$(dirname "$(dirname "$REPO")")"
+# "core liveness unknown"). Refuse rather than launch into that split. A core on another
+# socket is not the desktop's, so its switch leaves the desktop's selection alone.
+if [ -n "$requested_runtime" ] && [ -n "$desktop_app_support" ]; then
+  if [ "$tmux_socket" != "$desktop_socket" ]; then
+    echo "start-cli: $tmux_socket is not the desktop's core socket; its runtime selection is unchanged." >&2
+  elif ! _selected="$(bash "$REPO/scripts/sutando-config.sh" desktop-runtime-select "$runtime")"; then
+    echo "start-cli: refusing to launch $runtime: the desktop would still select another runtime." >&2
+    exit 1
+  else
+    [ "$_selected" = updated ] && echo "start-cli: desktop runtime selection is now $runtime ($desktop_app_support/runtime.json)." >&2
   fi
-  if [ -n "$_app_support" ] && [ -d "$_app_support" ]; then
-    if ! _selected="$(bash "$REPO/scripts/sutando-config.sh" desktop-runtime-select "$runtime")"; then
-      echo "start-cli: refusing to launch $runtime: the desktop would still select another runtime." >&2
-      exit 1
-    fi
-    [ "$_selected" = updated ] && echo "start-cli: desktop runtime selection is now $runtime ($_app_support/runtime.json)." >&2
-  fi
-  unset _app_support _selected
+  unset _selected
 fi
 
 # The Codex notifier is runtime-specific. Always reap it before launching a

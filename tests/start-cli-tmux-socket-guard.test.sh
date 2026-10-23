@@ -13,7 +13,7 @@ make_fixture() {
   cp "$REPO/src/agent/start-cli.sh" "$REPO/src/agent/restart-guard.sh" \
     "$REPO/src/agent/tmux-socket-guard.sh" "$fix/src/agent/"
   for rt in claude codex; do
-    printf '#!/bin/bash\necho "LAUNCHER %s $* tmux=$(command -v tmux)" >> "$TMUX_LOG"\n' "$rt" \
+    printf '#!/bin/bash\necho "LAUNCHER %s $* tmux=$(command -v tmux) sock=${SUTANDO_TMUX_SOCKET:-unset}" >> "$TMUX_LOG"\n' "$rt" \
       > "$fix/src/agent/$rt/cli/start-cli.sh"
   done
   cat > "$fix/scripts/sutando-config.sh" <<'EOF'
@@ -55,11 +55,13 @@ EOF
 
 FIX="$TD/repo"; make_fixture "$FIX"
 
-# run <fixture> <PATH> <socket> [env...]
+# run <fixture> <PATH> <socket|-> [env...]   ("-": no SUTANDO_TMUX_SOCKET, as from a terminal)
 run() {
   local fix="$1" path="$2" sock="$3"; shift 3
   : > "$TD/log"
-  env -i PATH="$path" HOME="$TD" TMUX_LOG="$TD/log" TEST_WS="$TD/ws" SUTANDO_TMUX_SOCKET="$sock" "$@" \
+  local sock_env=(SUTANDO_TMUX_SOCKET="$sock")
+  [ "$sock" = - ] && sock_env=()
+  env -i PATH="$path" HOME="$TD" TMUX_LOG="$TD/log" TEST_WS="$TD/ws" ${sock_env[@]+"${sock_env[@]}"} "$@" \
     /bin/bash "$fix/src/agent/start-cli.sh" --runtime claude > "$TD/out" 2> "$TD/err" < /dev/null
   rc=$?
 }
@@ -138,11 +140,41 @@ if [ "$rc" = 0 ] && ! grep -q SELECT "$TD/log"; then
 else
   say FAIL "no desktop: rc=$rc log=$(tr '\n' '|' < "$TD/log")"
 fi
-run "$FIX" "$FIX/bin:/usr/bin:/bin" "$TD/sock" SERVER=same SUTANDO_APP_SUPPORT="$TD/app2"
-if [ "$rc" = 0 ] && grep -q "SELECT claude" "$TD/log"; then
-  say PASS "an exported SUTANDO_APP_SUPPORT names the desktop for any checkout"
+# 2026-10-23: a core suggested `SUTANDO_APP_SUPPORT=<app> bash src/agent/start-cli.sh --runtime
+# codex --restart` from a PR checkout in a terminal; it took the /tmp socket and a second core.
+run "$FIX" "$FIX/bin:/usr/bin:/bin" - SUTANDO_APP_SUPPORT="$TD/app2"
+refused "a terminal switch from another checkout targets the desktop's socket and refuses" \
+  "belongs to the desktop engine"
+if ! grep -q SELECT "$TD/log"; then
+  say PASS "...and leaves the desktop's selection alone"
 else
-  say FAIL "exported app support: rc=$rc log=$(tr '\n' '|' < "$TD/log")"
+  say FAIL "refused launch wrote the selection: log=$(tr '\n' '|' < "$TD/log")"
+fi
+run "$FIX" "$FIX/bin:/usr/bin:/bin" - SUTANDO_APP_SUPPORT="$TD/app2" SUTANDO_ALLOW_FOREIGN_CORE_CHECKOUT=1
+if [ "$rc" = 0 ] && grep -q "LAUNCHER claude .*sock=$TD/app2/run/tmux.sock" "$TD/log" \
+   && grep -q "SELECT claude" "$TD/log"; then
+  say PASS "with the opt-in it launches on the desktop's socket and selects the runtime there"
+else
+  say FAIL "opt-in on desktop socket: rc=$rc log=$(tr '\n' '|' < "$TD/log")"
+fi
+mkdir -p "$TD/app2/engine/bin"; cp "$FIX/appbin/tmux" "$TD/app2/engine/bin/tmux"
+run "$OWN" "$OWN/bin:/usr/bin:/bin" - SERVER=other
+if [ "$rc" = 0 ] && grep -q "LAUNCHER claude .*tmux=$TD/app2/engine/bin/tmux sock=$TD/app2/run/tmux.sock" "$TD/log"; then
+  say PASS "the bundled engine from a terminal uses the desktop's socket and bundled tmux"
+else
+  say FAIL "bundled engine from a terminal: rc=$rc err=$(tr '\n' '|' < "$TD/err") log=$(tr '\n' '|' < "$TD/log")"
+fi
+run "$FIX" "$FIX/bin:/usr/bin:/bin" "$TD/sock" SERVER=same SUTANDO_APP_SUPPORT="$TD/app2"
+if [ "$rc" = 0 ] && ! grep -q SELECT "$TD/log" && grep -q "not the desktop's core socket" "$TD/err"; then
+  say PASS "a core on another socket switches without touching the desktop's selection"
+else
+  say FAIL "other socket: rc=$rc err=$(tr '\n' '|' < "$TD/err") log=$(tr '\n' '|' < "$TD/log")"
+fi
+run "$FIX" "$FIX/bin:/usr/bin:/bin" - SERVER=same
+if [ "$rc" = 0 ] && grep -q "LAUNCHER claude .*sock=unset" "$TD/log"; then
+  say PASS "no desktop: the socket is left to the launcher's own default"
+else
+  say FAIL "no desktop default: rc=$rc log=$(tr '\n' '|' < "$TD/log")"
 fi
 
 [ "$fails" = 0 ] && echo "all tmux socket guard checks pass" || { echo "$fails failed"; exit 1; }

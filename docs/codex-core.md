@@ -297,6 +297,14 @@ also refuses to launch another checkout's core on a desktop install's socket
 (`<app-support>/run/tmux.sock`) unless `SUTANDO_ALLOW_FOREIGN_CORE_CHECKOUT=1`
 is set for that launch.
 
+On a desktop install (`$SUTANDO_APP_SUPPORT` set, or the bundled engine), a
+launch that names no `SUTANDO_TMUX_SOCKET` uses the desktop's core socket, and
+the desktop's bundled tmux (`<app-support>/engine/bin/tmux`) as `SUTANDO_TMUX_BIN`
+when none is named. Without this, a terminal launch took `/tmp/sutando-tmux.sock`
+and started a second core beside the desktop's, both reading one task inbox. A
+switch aimed at any other socket is not the desktop's core, so it leaves the
+desktop's `coreRuntime` unchanged.
+
 ## Rollback
 
 Set `core.runtime` back to `claude` (or remove the local override) and run:
