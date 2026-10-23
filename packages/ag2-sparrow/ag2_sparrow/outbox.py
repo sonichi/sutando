@@ -29,6 +29,7 @@ import math
 import os
 import threading
 import time
+import unicodedata
 import uuid
 from dataclasses import dataclass
 from enum import Enum
@@ -539,16 +540,23 @@ def _candidate_owner_pid(raw: object) -> Optional[int]:
     return valid_pid(raw)
 
 
+# Exactly the characters int() strips: every c with int(c + "1" + c) == 1.
+_INT_WHITESPACE = frozenset(map(chr, (
+    *range(0x09, 0x0E), 0x20, 0x85, 0xA0, 0x1680, *range(0x20_00, 0x20_0B),
+    0x20_28, 0x20_29, 0x20_2F, 0x20_5F, 0x3000)))
+_INT_WHITESPACE_CHARS = "".join(sorted(_INT_WHITESPACE))
+
+
 def _int_string_pid(raw: str) -> Optional[int]:
     """int()'s string grammar (whitespace, one '+', digit groups joined by '_'), read in
     linear time: more than 10 significant digits is past PID_MAX at any length."""
-    text = raw.strip()
+    text = raw.strip(_INT_WHITESPACE_CHARS)
     if text.startswith("+"):
         text = text[1:]
     groups = text.split("_")
     if not all(g and g.isdecimal() for g in groups):
         return None
-    digits = "".join(groups).lstrip("0") or "0"
+    digits = "".join(str(unicodedata.decimal(c)) for g in groups for c in g).lstrip("0") or "0"
     return valid_pid(int(digits)) if len(digits) <= 10 else None
 
 

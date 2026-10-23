@@ -13,6 +13,7 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 import unittest
 from pathlib import Path
 
@@ -228,6 +229,28 @@ class MalformedClaimBackend(unittest.TestCase):
                                ("space", pid.rjust((width + len(pid)) // 2).ljust(width))):
                 raw = json.dumps(text)
                 with self.subTest(kind=kind, length=len(text)):
+                    self.tearDown()
+                    self.setUp()
+                    self.assertEqual(self._drain_while_a_sends(raw, TTL + 1), 1)
+                    self.tearDown()
+                    self.setUp()
+                    b = DesignAClaimBackend(self.root, reclaim_ttl_s=TTL)
+                    self.assertTrue(b.publish(ITEM, b"hi"))
+                    self.assertIsNotNone(b.claim(ITEM, "A"))
+                    outbox.record_delivered(self.root, ITEM)
+                    self._rewrite_pid(raw, TTL * 100)
+                    self.assertEqual(b.recover().retired, [])
+
+    def test_unicode_zero_padded_live_pid_blocks(self):
+        pid = str(os.getpid())
+        zeros = [chr(cp) for cp in range(sys.maxunicode + 1)
+                 if unicodedata.decimal(chr(cp), None) == 0]
+        for length in (33, 64):
+            for kind, pad in (("U+0660", "\u0660" * length),
+                              ("mixed-script", "".join(zeros[i % len(zeros)]
+                                                       for i in range(length)))):
+                raw = json.dumps(pad[:length - len(pid)] + pid)
+                with self.subTest(kind=kind, length=length):
                     self.tearDown()
                     self.setUp()
                     self.assertEqual(self._drain_while_a_sends(raw, TTL + 1), 1)

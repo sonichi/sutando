@@ -58,6 +58,8 @@ import sys
 import tempfile
 import threading
 import time
+import random
+import unicodedata
 from pathlib import Path
 from unittest.mock import mock_open, patch
 
@@ -892,6 +894,27 @@ PID_FORMS = [
 
 
 PAD_LENGTHS = (1, 10, 32, 33, 64, 5000)
+# Every character int() reads as a digit, by value; [0] is every script's zero.
+DIGITS_BY_VALUE = [[] for _ in range(10)]
+for _cp in range(sys.maxunicode + 1):
+    _d = unicodedata.decimal(chr(_cp), None)
+    if _d is not None:
+        DIGITS_BY_VALUE[_d].append(chr(_cp))
+DECIMAL_ZEROS = DIGITS_BY_VALUE[0]
+FUZZ_NOISE = [" ", "\t", "\u3000", "\x1c", "\x1f", "+", "-", "_", "a", "\u00b2"]
+
+
+def fuzz_pid_string(rng):
+    """Whitespace, an optional sign, a run of mixed-script zeros, then a mixed-script
+    digit run, with noise characters spliced in at random."""
+    parts = [rng.choice(["", " ", "\u3000", "\x1c"]), rng.choice(["", "", "+", "-"])]
+    parts += [rng.choice(DECIMAL_ZEROS) for _ in range(rng.randint(0, 40))]
+    for _ in range(rng.randint(0, 12)):
+        parts.append(rng.choice(DIGITS_BY_VALUE[rng.randint(0, 9)]))
+        if rng.random() < 0.08:
+            parts.append(rng.choice(FUZZ_NOISE))
+    parts.append(rng.choice(["", " ", "\n"]))
+    return "".join(parts)
 
 
 def padded_pids(pid, length):
@@ -961,6 +984,24 @@ def _c26():
                        (" +0_0012 ", 12), ("0", None), ("9" * 11, None), ("0" * 40 + "7", 7)):
         if candidate(text) != want:
             bad.append(f"{text!r}: candidate {candidate(text)}, want {want}")
+    # Any script's decimal zeros pad a pid exactly as ASCII '0' does.
+    pid = str(os.getpid())
+    mixed = "".join(DECIMAL_ZEROS[i % len(DECIMAL_ZEROS)] for i in range(64))
+    for label, text in [("ten U+0660", "\u0660" * 10 + pid)] + [
+            (f"mixed-script zeros len={n}", mixed[:n - len(pid)] + pid) for n in (33, 64)]:
+        if candidate(text) != os.getpid():
+            bad.append(f"{label}: candidate {candidate(text)}, int() reads {int(text)}")
+    # Seeded agreement with valid_pid(int()) over padded, mixed-script digit strings.
+    rng = random.Random(5830)
+    for _ in range(20000):
+        text = fuzz_pid_string(rng)
+        try:
+            want = need(m, "valid_pid")(int(text))
+        except ValueError:
+            want = None
+        if candidate(text) != want:
+            bad.append(f"fuzz {text!r}: candidate {candidate(text)}, int() gives {want}")
+            break
     assert not bad, "; ".join(bad)
 
 
@@ -989,6 +1030,45 @@ def _c27():
     gone = malformed(Path(tmp) / "vanished.claim", "x", {})
     assert gone.file_mtime is None and reclaimable(gone, 0.0) is False, (
         "a malformed claim with no readable mtime has no age, so it is never reclaimable")
+
+
+# 28 --------------------------------------------------------------------------
+def _int_oracle(m, text):
+    try:
+        return m.valid_pid(int(text))
+    except ValueError:
+        return None
+
+
+@contract("the pid string reader agrees with int() for every code point as padding, separator or digit")
+def _c28():
+    m = outbox()
+    read = need(m, "_int_string_pid")
+    pid = str(os.getpid())
+    bad: list[str] = []
+    for cp in range(sys.maxunicode + 1):
+        c = chr(cp)
+        for where, text in (("padding", c + pid + c), ("separator", pid[:1] + c + pid[1:]),
+                            ("leading digit", c + pid), ("trailing digit", pid + c),
+                            ("ten as padding", c * 10 + pid)):
+            got, want = read(text), _int_oracle(m, text)
+            if got != want:
+                bad.append(f"U+{cp:04X} as {where}: reader {got}, int() {want}")
+        if len(bad) > 10:
+            break
+    assert not bad, "; ".join(bad)
+    scanned = set()
+    for cp in range(sys.maxunicode + 1):
+        c = chr(cp)
+        try:
+            if int(c + "1" + c) == 1:
+                scanned.add(c)
+        except ValueError:
+            pass
+    whitespace = set(need(m, "_INT_WHITESPACE"))
+    assert scanned == whitespace, (
+        f"int() strips {sorted(hex(ord(c)) for c in scanned ^ whitespace)} differently "
+        f"from _INT_WHITESPACE")
 
 
 def main() -> int:
