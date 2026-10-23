@@ -30,6 +30,18 @@ _dead.wait()
 DEAD_PID = _dead.pid
 ITEM = "room-evt-malformed"
 TTL = 300.0
+# (label, raw JSON for the pid, plausibly names a process)
+PID_FORMS = [
+    ("int", lambda pid: str(pid), True),
+    ("digit string", lambda pid: f'"{pid}"', True),
+    ("integral float", lambda pid: f"{pid}.0", True),
+    ("leading-zero string", lambda pid: f'"0{pid}"', False),
+    ("negative string", lambda pid: '"-1"', False),
+    ("fractional float", lambda pid: f"{pid}.5", False),
+    ("true", lambda pid: "true", False),
+    ("oversized", lambda pid: "9" * 5001, False),
+    ("2**31", lambda pid: str(2**31), False),
+]
 
 
 class MalformedClaimBackend(unittest.TestCase):
@@ -139,6 +151,70 @@ class MalformedClaimBackend(unittest.TestCase):
             a.join(10)
         self.assertEqual(len(calls), 1, f"provider called {len(calls)} times")
         self.assertEqual(results, [DrainStatus.NOT_CLAIMED] * 2)
+
+    def _rewrite_pid(self, raw_pid, age):
+        p = outbox._claim_path(self.root, ITEM)
+        rec = json.loads(p.read_text(encoding="utf-8"),
+                         parse_int=lambda s: s if len(s) > 20 else int(s))
+        rec.update(pid="@PID@", claimed_at="not-a-time")
+        p.write_text(json.dumps(rec).replace('"@PID@"', raw_pid), encoding="utf-8")
+        t = time.time() - age
+        os.utime(p, (t, t))
+
+    def _drain_while_a_sends(self, raw_pid, age):
+        """A blocks inside the provider; B drains the rewritten claim. Provider calls."""
+        gate, entered, calls = threading.Event(), threading.Event(), []
+
+        class Provider:
+            capabilities = ProviderCapabilities()
+
+            def __init__(self, block):
+                self.block = block
+
+            def deliver(self, item_id, payload, key):
+                calls.append(item_id)
+                if self.block:
+                    entered.set()
+                    gate.wait(10)
+                return DeliveryReceipt(outcome=DeliveryOutcome.CONFIRMED)
+
+            def reconcile(self, attempt):
+                return None
+
+        backend = DesignAClaimBackend(self.root, reclaim_ttl_s=TTL)
+        self.assertTrue(backend.publish(ITEM, b"hi"))
+        a = threading.Thread(target=DeliveryCore(backend, Provider(True), worker="A")
+                             .deliver_one, args=(ITEM, b"hi"))
+        a.start()
+        try:
+            self.assertTrue(entered.wait(10), "drainer A never reached the provider")
+            self._rewrite_pid(raw_pid, age)
+            DeliveryCore(DesignAClaimBackend(self.root, reclaim_ttl_s=TTL), Provider(False),
+                         worker="B").deliver_one(ITEM, b"hi")
+        finally:
+            gate.set()
+            a.join(10)
+        return len(calls)
+
+    def test_pid_forms_block_or_release_by_plausibility(self):
+        for label, render, plausible in PID_FORMS:
+            for alive, pid in ((True, os.getpid()), (False, DEAD_PID)):
+                held = plausible and alive
+                with self.subTest(form=label, alive=alive):
+                    self.tearDown()
+                    self.setUp()
+                    self.assertEqual(self._drain_while_a_sends(render(pid), TTL + 1),
+                                     1 if held else 2)
+                    self.tearDown()
+                    self.setUp()
+                    b = DesignAClaimBackend(self.root, reclaim_ttl_s=TTL)
+                    self.assertTrue(b.publish(ITEM, b"hi"))
+                    self.assertIsNotNone(b.claim(ITEM, "A"))
+                    outbox.record_delivered(self.root, ITEM)
+                    self._rewrite_pid(render(pid), TTL - 1)
+                    self.assertEqual(b.recover().retired, [])
+                    self._rewrite_pid(render(pid), TTL)
+                    self.assertEqual(b.recover().retired, [] if held else [ITEM])
 
     def _terminal_malformed(self, age):
         b = DesignAClaimBackend(self.root, reclaim_ttl_s=TTL)

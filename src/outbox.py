@@ -259,6 +259,7 @@ class ClaimRecord:
     # Malformed = a complete write with invalid fields; it ages by file mtime, never a sweep.
     malformed: bool = False
     file_mtime: Optional[float] = None
+    candidate_pid: Optional[int] = None  # lenient: may refuse a takeover, never authorize one
 
 
 def _claims_dir(root: Path) -> Path:
@@ -524,7 +525,19 @@ def _malformed_claim(p: Path, item_id: str, d: dict) -> ClaimRecord:
                        drainer_id=raw_drainer if isinstance(raw_drainer, str) else "",
                        pid=valid_pid(d.get("pid")) or -1,
                        start_usec=raw_start if _valid_start_usec(raw_start) else None,
-                       claimed_at=0.0, state="UNKNOWN", malformed=True, file_mtime=mtime)
+                       claimed_at=0.0, state="UNKNOWN", malformed=True, file_mtime=mtime,
+                       candidate_pid=_candidate_owner_pid(d.get("pid")))
+
+
+def _candidate_owner_pid(raw: object) -> Optional[int]:
+    """A pid that plausibly names the owner: an int, an integral float, or a canonical
+    decimal string, within valid_pid's bounds. Only ever evidence AGAINST a takeover."""
+    if type(raw) is float and math.isfinite(raw) and raw.is_integer():
+        raw = int(raw)
+    elif (type(raw) is str and raw.isascii() and raw.isdigit()
+          and len(raw) <= 10 and not raw.startswith("0")):
+        raw = int(raw)
+    return valid_pid(raw)
 
 
 _START_USEC_LIMIT = 2**63
@@ -565,11 +578,14 @@ def may_reclaim_delivery(root: Path, item_id: str, ttl_seconds: float) -> bool:
 def _record_is_reclaimable(rec: ClaimRecord, ttl_seconds: float) -> bool:
     if rec.state == "UNKNOWN" and not rec.malformed:
         return False                      # torn: we do not know; do not steal
-    if valid_pid(rec.pid) is not None:
-        owner = process_identity(rec.pid)
+    # Refusing needs only a plausible owner; proving reuse needs the strict pid and token.
+    owner_pid = rec.candidate_pid if rec.malformed else rec.pid
+    if owner_pid is not None:
+        owner = process_identity(owner_pid)
         if owner.state is OwnerState.UNKNOWN:
             return False
-        if owner.state is OwnerState.ALIVE and not _pid_was_reused(rec, owner):
+        if owner.state is OwnerState.ALIVE and not (
+                valid_pid(rec.pid) is not None and _pid_was_reused(rec, owner)):
             return False
     if rec.malformed:
         # claimed_at is untrusted here; the filesystem's mtime is not.

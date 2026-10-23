@@ -849,8 +849,8 @@ def _c25():
     bad: list[str] = []
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
-        # Live owner, pid unreadable: only the mtime TTL can release it.
-        p = plant(root, "unreadable-pid", {"pid": str(os.getpid()), "claimed_at": 10**400})
+        # Live owner, pid not a plausible pid (leading zero): only the mtime TTL can release it.
+        p = plant(root, "unreadable-pid", {"pid": "0" + str(os.getpid()), "claimed_at": 10**400})
         for age, want in ((grace + 1, False), (ttl - 1, False), (ttl, True)):
             if taken_at(root, "unreadable-pid", p, age) is not want:
                 bad.append(f"unreadable pid at {age}s: want taken={want}")
@@ -870,6 +870,88 @@ def _c25():
             if taken_at(root, "torn", p, age) is not want:
                 bad.append(f"torn at {age}s: want taken={want}")
     assert not bad, "; ".join(bad)
+
+
+# 26 --------------------------------------------------------------------------
+# (label, raw JSON for the pid, plausibly names a process)
+PID_FORMS = [
+    ("int", lambda pid: str(pid), True),
+    ("digit string", lambda pid: f'"{pid}"', True),
+    ("integral float", lambda pid: f"{pid}.0", True),
+    ("leading-zero string", lambda pid: f'"0{pid}"', False),
+    ("negative string", lambda pid: '"-1"', False),
+    ("fractional float", lambda pid: f"{pid}.5", False),
+    ("true", lambda pid: "true", False),
+    ("oversized", lambda pid: "9" * 5001, False),
+    ("2**31", lambda pid: str(2**31), False),
+]
+
+
+def rewrite_claim_pid(p, raw_pid):
+    """Keep the writer's record, put `raw_pid` in verbatim, and spoil claimed_at."""
+    rec = json.loads(p.read_text(encoding="utf-8"),
+                     parse_int=lambda s: s if len(s) > 20 else int(s))
+    rec.update(pid="@PID@", claimed_at="not-a-time")
+    p.write_text(json.dumps(rec).replace('"@PID@"', raw_pid), encoding="utf-8")
+
+
+@contract("a plausible live owner pid in any form blocks a takeover; only a strict one authorizes")
+def _c26():
+    m = outbox()
+    acquire = need(m, "acquire_delivery_claim")
+    may = need(m, "may_reclaim_delivery")
+    reclaim = need(m, "reclaim_delivery_claim")
+    claim_path = need(m, "_claim_path")
+    ttl = 300.0
+    bad: list[str] = []
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        n = 0
+        for label, render, plausible in PID_FORMS:
+            for alive, pid in ((True, os.getpid()), (False, DEAD_PID)):
+                held = plausible and alive
+                ages = (ttl + 1, ttl * 100) if held else (ttl - 1, ttl)
+                for age in ages:
+                    n += 1
+                    item = f"pid-form-{n}"
+                    assert acquire(root, item, "owner") is True
+                    p = claim_path(root, item)
+                    rewrite_claim_pid(p, render(pid))
+                    t = time.time() - age
+                    os.utime(p, (t, t))
+                    want = (not held) and age >= ttl
+                    got = (may(root, item, ttl), reclaim(root, item, ttl, "thief"))
+                    if got != (want, want):
+                        bad.append(f"{label} alive={alive} at {age}s: may/reclaim={got}, "
+                                   f"want {want}")
+    assert not bad, "; ".join(bad)
+
+
+# 27 --------------------------------------------------------------------------
+@contract("torn vs malformed: decode errors sweep, other parse errors and a vanished file fail closed")
+def _c27():
+    m = outbox()
+    read_at = need(m, "_read_claim_at")
+    malformed = need(m, "_malformed_claim")
+    reclaimable = need(m, "_record_is_reclaimable")
+    with tempfile.TemporaryDirectory() as tmp:
+        p = Path(tmp) / "c.claim"
+        p.write_text('{"item_id": "x", "pi', encoding="utf-8")
+        torn = read_at(p, "x")
+        assert (torn.state, torn.malformed) == ("UNKNOWN", False), f"decode error is torn: {torn}"
+        p.write_text('{"item_id": "x", "pid": ' + "9" * 5001 + "}", encoding="utf-8")
+        big = read_at(p, "fallback")
+        assert (big.state, big.malformed, big.item_id, big.pid) == ("UNKNOWN", True, "x", -1), (
+            f"an oversized pid spoils only the pid: {big}")
+        for exc in (ValueError("digits"), OverflowError("range")):
+            with patch.object(m.json, "loads", side_effect=exc):
+                rec = read_at(p, "fallback")
+            assert (rec.state, rec.malformed, rec.item_id) == ("UNKNOWN", True, "fallback"), (
+                f"{type(exc).__name__} must read malformed with the caller's id: {rec}")
+            assert reclaimable(rec, 0.0) is False, "a fresh malformed claim is not reclaimable"
+    gone = malformed(Path(tmp) / "vanished.claim", "x", {})
+    assert gone.file_mtime is None and reclaimable(gone, 0.0) is False, (
+        "a malformed claim with no readable mtime has no age, so it is never reclaimable")
 
 
 def main() -> int:
