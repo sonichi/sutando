@@ -105,6 +105,21 @@ class CoreRuntimeConfigTests(unittest.TestCase):
             self.assertEqual(sutando_config.persist_desktop_runtime_selection("codex", self.repo), "updated")
         self.assertEqual(json.loads((app / "runtime.json").read_text()), {"coreRuntime": "codex"})
 
+    def test_persist_check_validates_without_writing(self):
+        app = self.repo / "app"
+        app.mkdir()
+        selection = app / "runtime.json"
+        selection.write_text(json.dumps({"coreRuntime": "claude"}))
+        with patch.dict(os.environ, {"SUTANDO_APP_SUPPORT": str(app)}):
+            self.assertEqual(sutando_config.persist_desktop_runtime_selection(
+                "codex", self.repo, check=True), "would-update")
+            self.assertEqual(sutando_config.persist_desktop_runtime_selection(
+                "claude", self.repo, check=True), "unchanged")
+            self.assertEqual(json.loads(selection.read_text()), {"coreRuntime": "claude"})
+            selection.write_text("{")
+            with self.assertRaises(ValueError):
+                sutando_config.persist_desktop_runtime_selection("codex", self.repo, check=True)
+
     def test_persist_without_a_desktop_writes_nothing(self):
         self.write({})
         self.assertEqual(sutando_config.persist_desktop_runtime_selection("codex", self.repo), "no-desktop")

@@ -277,11 +277,13 @@ desktop selection is `coreRuntime` in the desktop's `runtime.json`
 (`$SUTANDO_APP_SUPPORT/runtime.json`, or the directory above a bundled
 `engine/<checkout>`), so launchd jobs started without the desktop's environment
 resolve the same runtime as the desktop launcher. On a desktop install an explicit
-`--runtime` is a switch, so the dispatcher also writes it as the desktop's
-`coreRuntime` before launching (other keys kept, atomic replace, as the desktop's
-own writer does). Otherwise the desktop keeps relaunching and probing for the old
-CLI while the new one owns the session. If that selection cannot be written the
-dispatcher refuses (exit 1) without touching the core. A runtime environment override may be inherited from an older launch or
+`--runtime` is a switch, so it also becomes the desktop's `coreRuntime` (other keys
+kept, atomic replace, as the desktop's own writer does). Otherwise the desktop keeps
+relaunching and probing for the old CLI while the new one owns the session. The
+dispatcher checks that the selection can be written and refuses (exit 1) without
+touching the core when it cannot; the launcher writes it only once the new core is
+confirmed, alongside `state/core-runtime.json`, so a launch that exits early (Codex
+not installed or not signed in) leaves the desktop selecting the core still running. A runtime environment override may be inherited from an older launch or
 loaded from the launcher's environment file; changing config alone does not
 remove it. The dispatcher now names that override on stderr. Use the explicit
 flag for the intended runtime rather than treating config as proof of which CLI

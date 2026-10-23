@@ -152,21 +152,18 @@ case "${1:-}" in
     ;;
 esac
 
-# An explicit --runtime on a desktop install is a switch: the desktop must select it too,
-# or it keeps relaunching and probing for the old CLI while the new one owns the session
-# (2026-10-22: a CLI switch to Claude left runtime.json on codex and the app stuck on
-# "core liveness unknown"). Refuse rather than launch into that split. A core on another
-# socket is not the desktop's, so its switch leaves the desktop's selection alone.
+# An explicit --runtime on the desktop's socket is a switch the desktop must select too. Refuse
+# here if that selection is unwritable; the launcher writes it once the new core is confirmed.
+unset SUTANDO_DESKTOP_RUNTIME_SELECT
 if [ -n "$requested_runtime" ] && [ -n "$desktop_app_support" ]; then
   if [ "$tmux_socket" != "$desktop_socket" ]; then
     echo "start-cli: $tmux_socket is not the desktop's core socket; its runtime selection is unchanged." >&2
-  elif ! _selected="$(bash "$REPO/scripts/sutando-config.sh" desktop-runtime-select "$runtime")"; then
+  elif ! bash "$REPO/scripts/sutando-config.sh" desktop-runtime-select "$runtime" --check >/dev/null; then
     echo "start-cli: refusing to launch $runtime: the desktop would still select another runtime." >&2
     exit 1
   else
-    [ "$_selected" = updated ] && echo "start-cli: desktop runtime selection is now $runtime ($desktop_app_support/runtime.json)." >&2
+    export SUTANDO_DESKTOP_RUNTIME_SELECT="$runtime"
   fi
-  unset _selected
 fi
 
 # The Codex notifier is runtime-specific. Always reap it before launching a

@@ -681,13 +681,16 @@ def _desktop_selected_runtime(repo_root: Optional[Path]) -> str:
     return selected.strip() if isinstance(selected, str) else ""
 
 
-def persist_desktop_runtime_selection(runtime: str, repo_root: Optional[Path] = None) -> str:
+def persist_desktop_runtime_selection(runtime: str, repo_root: Optional[Path] = None,
+                                      check: bool = False) -> str:
     """Make an explicit outside-core switch the desktop's durable selection too.
 
     Returns ``"unchanged"`` when it already says ``runtime`` and ``"updated"`` after
     writing it; ``"no-desktop"`` when no desktop hosts this engine. Otherwise the
     desktop keeps relaunching and probing for the old runtime while the new one
     owns the session (2026-10-22: the app read a live Claude core as absent).
+    ``check`` runs every validation but writes nothing, returning ``"would-update"``
+    where it would have written; the launcher writes only once the new core is confirmed.
 
     Same contract as the desktop's own writer (``core_runtime.rs``
     ``update_runtime_json``): every other key survives, and the file is replaced
@@ -710,6 +713,8 @@ def persist_desktop_runtime_selection(runtime: str, repo_root: Optional[Path] = 
         raise ValueError(f"{path} is not a JSON object")
     if body.get("coreRuntime") == runtime:
         return "unchanged"
+    if check:
+        return "would-update"
     body["coreRuntime"] = runtime
     tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
     try:

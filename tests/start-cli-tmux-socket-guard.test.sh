@@ -11,18 +11,19 @@ make_fixture() {
   local fix="$1"
   mkdir -p "$fix/src/agent/claude/cli" "$fix/src/agent/codex/cli" "$fix/scripts" "$fix/bin"
   cp "$REPO/src/agent/start-cli.sh" "$REPO/src/agent/restart-guard.sh" \
-    "$REPO/src/agent/tmux-socket-guard.sh" "$fix/src/agent/"
-  for rt in claude codex; do
-    printf '#!/bin/bash\necho "LAUNCHER %s $* tmux=$(command -v tmux) sock=${SUTANDO_TMUX_SOCKET:-unset}" >> "$TMUX_LOG"\n' "$rt" \
-      > "$fix/src/agent/$rt/cli/start-cli.sh"
+    "$REPO/src/agent/tmux-socket-guard.sh" "$REPO/src/agent/core-runtime-record.sh" "$fix/src/agent/"
+  for rt in claude codex; do  # each stub confirms its core at once
+    printf '#!/bin/bash\necho "LAUNCHER %s $* tmux=$(command -v tmux) sock=${SUTANDO_TMUX_SOCKET:-unset}" >> "$TMUX_LOG"\nREPO=%q; . "$REPO/src/agent/core-runtime-record.sh"; persist_confirmed_desktop_selection %s\n' \
+      "$rt" "$fix" "$rt" > "$fix/src/agent/$rt/cli/start-cli.sh"
   done
   cat > "$fix/scripts/sutando-config.sh" <<'EOF'
 #!/bin/bash
 case "$1" in
   workspace) echo "$TEST_WS" ;;
   desktop-runtime-select)
-    echo "SELECT $2" >> "$TMUX_LOG"
+    echo "SELECT $2${3:+ $3}" >> "$TMUX_LOG"
     [ -n "${SELECT_FAILS:-}" ] && { echo "selection not written" >&2; exit 1; }
+    [ "${3:-}" = --check ] && { echo would-update; exit 0; }
     echo "${SELECT_RESULT:-updated}" ;;
 esac
 EOF
@@ -116,8 +117,10 @@ launched "explicit foreign-checkout opt-in"
 OWN="$TD/app2/engine/sutando"; make_fixture "$OWN"; mkdir -p "$TD/app2/run"
 run "$OWN" "$OWN/bin:/usr/bin:/bin" "$TD/app2/run/tmux.sock"
 launched "the desktop's own engine checkout"
-if grep -q "SELECT claude" "$TD/log" && grep -q "desktop runtime selection is now claude" "$TD/err"; then
-  say PASS "an explicit --runtime on a desktop install becomes the desktop's selection"
+if grep -q "SELECT claude --check" "$TD/log" && grep -qx "SELECT claude" "$TD/log" \
+   && [ "$(grep -n -m1 -x "SELECT claude" "$TD/log" | cut -d: -f1)" -gt "$(grep -n -m1 LAUNCHER "$TD/log" | cut -d: -f1)" ] \
+   && grep -q "desktop runtime selection is now claude" "$TD/err"; then
+  say PASS "an explicit --runtime on a desktop install becomes the desktop's selection once confirmed"
 else
   say FAIL "desktop selection: err=$(tr '\n' '|' < "$TD/err") log=$(tr '\n' '|' < "$TD/log")"
 fi
@@ -152,7 +155,7 @@ else
 fi
 run "$FIX" "$FIX/bin:/usr/bin:/bin" - SUTANDO_APP_SUPPORT="$TD/app2" SUTANDO_ALLOW_FOREIGN_CORE_CHECKOUT=1
 if [ "$rc" = 0 ] && grep -q "LAUNCHER claude .*sock=$TD/app2/run/tmux.sock" "$TD/log" \
-   && grep -q "SELECT claude" "$TD/log"; then
+   && grep -qx "SELECT claude" "$TD/log"; then
   say PASS "with the opt-in it launches on the desktop's socket and selects the runtime there"
 else
   say FAIL "opt-in on desktop socket: rc=$rc log=$(tr '\n' '|' < "$TD/log")"
