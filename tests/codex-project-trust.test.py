@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """The Codex launcher records its own checkout as trusted, and nothing else."""
 import importlib
+import io
 import os
 import subprocess
 import sys
@@ -112,6 +113,11 @@ class EnsureTrusted(unittest.TestCase):
         self.assertEqual((out.returncode, out.stdout.strip()), (0, "trusted"))
         out = self.cli(self.home, self.repo, self.repo)
         self.assertEqual((out.returncode, out.stdout.strip()), (0, "already-set"))
+
+    def test_main_reports_success(self):
+        with patch("sys.stdout", new_callable=io.StringIO) as out:
+            self.assertEqual(self.cpt.main([str(self.home), str(self.repo), str(self.repo)]), 0)
+        self.assertEqual(out.getvalue().strip(), "trusted")
 
     def test_an_inline_projects_table_is_refused_unchanged(self):
         """An inline table cannot gain a [projects."x"] section, so appending would break the file."""

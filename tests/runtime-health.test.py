@@ -22,6 +22,7 @@ import subprocess
 import tempfile
 import sys
 import time
+import types
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _spec = importlib.util.spec_from_file_location(
@@ -568,6 +569,14 @@ try:
           rh._pane_blocks_dispatch(tempfile.mkdtemp()) is None)
 finally:
     rh.cli_wedge.core_target = _ocw
+_opb = rh._pane_blocks_dispatch
+rh._pane_blocks_dispatch = lambda ws, queued=True: types.SimpleNamespace(state="wedged", reason="stalled")
+try:
+    d = _derive_blocked_case("", queued=1)
+    check("derive: any other holding verdict is named by its state and reason",
+          d["health"] == "blocked" and "wedged (stalled)" in d["detail"])
+finally:
+    rh._pane_blocks_dispatch = _opb
 
 print("\n" + ("PASS — runtime-health green" if fails == 0 else "FAIL — %d failing" % fails))
 sys.exit(fails)

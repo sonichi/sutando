@@ -54,6 +54,18 @@ class WriterTests(unittest.TestCase):
                 self.assertIn(f"core runtime record: {failure}", err.getvalue())
             self.assertEqual(path.read_bytes(), before)
 
+    def test_cli_reports_a_pane_it_cannot_inspect(self):
+        argv = ["core-runtime-record", str(self.ws), "claude", "sutando-core", "123",
+                "--socket", str(self.ws / "t.sock")]
+        with mock.patch.object(sys, "argv", argv), \
+                mock.patch.object(self.writer, "pane_runtimes", side_effect=OSError("no tmux")), \
+                mock.patch.object(sys, "stderr", new_callable=io.StringIO) as err:
+            with self.assertRaises(SystemExit) as raised:
+                self.writer.main()
+        self.assertEqual(raised.exception.code, 1)
+        self.assertIn("cannot inspect sutando-core: no tmux", err.getvalue())
+        self.assertFalse((self.ws / "state/core-runtime.json").exists())
+
     def test_cli_refuses_a_record_the_panes_do_not_run(self):
         path = self.writer.publish(self.ws, "claude", "sutando-core", 1)
         before = path.read_bytes()

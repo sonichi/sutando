@@ -120,6 +120,10 @@ class CoreRuntimeConfigTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 sutando_config.persist_desktop_runtime_selection("codex", self.repo, check=True)
 
+    def test_no_selection_path_outside_a_checkout(self):
+        with patch.object(sutando_config, "_find_repo_root", return_value=None):
+            self.assertIsNone(sutando_config.desktop_runtime_selection_path())
+
     def test_persist_without_a_desktop_writes_nothing(self):
         self.write({})
         self.assertEqual(sutando_config.persist_desktop_runtime_selection("codex", self.repo), "no-desktop")
