@@ -14,6 +14,7 @@ import pty
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _helpers.process_group import popen_bound  # noqa: E402
+from _helpers.old_python import pre_311_python  # noqa: E402
 
 REAL_REPO = Path(os.environ.get(
     "SUTANDO_TEST_REPO", Path(__file__).resolve().parents[1]
@@ -121,6 +122,8 @@ class CodexCoreLauncherTests(unittest.TestCase):
             "src/agent/tmux-socket-guard.sh",
             "src/agent/core-runtime-record.sh",
             "src/core_runtime_record.py",
+            "src/codex_project_trust.py",
+            "src/toml_fallback.py",
             "src/result_publish.py",
             "src/agent/task-event-handler-lookup.sh",
             "src/file_lock.py",
@@ -641,6 +644,35 @@ if [ "${1:-}" = print ]; then [ -f "$LAUNCHCTL_STATE" ]; else exit 0; fi
         self.assertEqual(runtime["session"], "sutando-core")
         self.assertEqual(len((state / "session-starts.log").read_text().splitlines()), 1)
         self.assertIn("new-session -d -s sutando-core", self._tmux_calls())
+
+    def _launch_in_a_git_checkout(self, python):
+        subprocess.run(["git", "init", "-q", str(self.root)], check=True)
+        self._write_exe("tmux", SESSION_UP_AFTER_CREATE_TMUX)
+        self.fake_core_pane("codex")
+        return self.run_launcher(env_extra={"SUTANDO_PY": python,
+                                            "SUTANDO_CODEX_WORKING_DIR": str(self.root)})
+
+    @unittest.skipUnless(pre_311_python(), "no Python < 3.11 found (set SUTANDO_TEST_OLD_PYTHON)")
+    def test_trust_is_recorded_by_a_launcher_on_python_older_than_311(self):
+        """3.9/3.10 have no tomllib; the real helper must still record the trust entry."""
+        result = self._launch_in_a_git_checkout(pre_311_python())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Codex project trust recorded", result.stdout)
+        self.assertNotIn("could not record Codex project trust", result.stderr)
+        config = (self.root / "codex-home" / "config.toml").read_text()
+        self.assertIn(f'[projects.{json.dumps(str(self.root.resolve()))}]\ntrust_level = "trusted"', config)
+
+    def test_a_failed_trust_write_warns_and_still_launches(self):
+        """Control for the test above: a helper that cannot run is reported, not silent."""
+        broken = self.bin / "broken-python"
+        broken.write_text("#!/bin/sh\n"
+                          'case "$1" in *codex_project_trust.py) exit 1;; esac\n'
+                          f'exec "{sys.executable}" "$@"\n')
+        broken.chmod(0o755)
+        result = self._launch_in_a_git_checkout(str(broken))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("could not record Codex project trust", result.stderr)
+        self.assertFalse((self.root / "codex-home" / "config.toml").exists())
 
     def test_reconciles_session_crons_before_codex_launch(self):
         workspace = self.root / "workspace"

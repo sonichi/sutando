@@ -252,6 +252,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`tmux-status.ts`** — Tmux-pane status scraper.
 - **`tmux_pane_keys.py`** — Shared tmux pane-key argv and crash-safe send guard.
 - **`tmux_probe.py`** — Tri-state tmux session probe shared by every core-liveness reader.
+- **`toml_fallback.py`** — A strict TOML reader for interpreters older than 3.11, which have no tomllib.
 - **`turn-start.sh`** — UserPromptSubmit hook: a new turn is starting, so re-arm the Stop reminder.
 - **`turn_ledger.py`** — The turn ledger — a record that the agent's turn produced an outbound message.
 - **`undelivered_quarantine.py`** — Naming and moves for `results/undelivered/` — the delivery quarantine.

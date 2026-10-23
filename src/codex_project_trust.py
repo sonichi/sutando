@@ -14,8 +14,15 @@ import json
 import os
 import subprocess
 import sys
-import tomllib
 from pathlib import Path
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python < 3.11: the launcher may resolve the system 3.9
+    try:
+        import tomli as tomllib
+    except ModuleNotFoundError:
+        import toml_fallback as tomllib
 
 
 def git_root(path):
