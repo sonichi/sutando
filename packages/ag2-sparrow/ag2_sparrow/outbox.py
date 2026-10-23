@@ -61,6 +61,10 @@ class ProcessIdentity:
     start_usec: Optional[int] = None
 
 
+# The largest pid any supported OS hands out; native probes narrow a pid to a C int.
+PID_MAX = 2**31 - 1
+
+
 _PROC_PIDTBSDINFO = 3
 _PROC_BSDINFO_SIZE = 136          # measured; verified against ctypes.sizeof below
 
@@ -477,24 +481,43 @@ def _read_claim_at(p: Path, item_id: str) -> Optional[ClaimRecord]:
         return ClaimRecord(item_id, "", -1, None, 0.0, state="UNKNOWN")
     try:
         d = json.loads(raw)
-    except json.JSONDecodeError:
+    except (ValueError, OverflowError):
         return ClaimRecord(item_id, "", -1, None, 0.0, state="UNKNOWN")
     if not isinstance(d, dict):
         return ClaimRecord(item_id, "", -1, None, 0.0, state="UNKNOWN")
     # Valid JSON carrying wrong types is still a claim we cannot read. Raising
     # here would abort a drainer mid-scan; UNKNOWN keeps the item un-stealable.
-    try:
-        pid = int(d.get("pid", -1))
-        claimed_at = float(d.get("claimed_at", 0.0))
-        raw_start = d.get("start_usec")
-        start_usec = None if raw_start is None else int(raw_start)
-    except (TypeError, ValueError):
+    pid, start_usec, claimed_at = d.get("pid"), d.get("start_usec"), d.get("claimed_at")
+    if not (valid_pid(pid) is not None and (start_usec is None or _valid_start_usec(start_usec))
+            and _valid_claimed_at(claimed_at)):
         return ClaimRecord(item_id, "", -1, None, 0.0, state="UNKNOWN")
     return ClaimRecord(item_id=str(d.get("item_id", item_id)),
                        drainer_id=str(d.get("drainer_id", "")),
                        pid=pid,
                        start_usec=start_usec,
-                       claimed_at=claimed_at)
+                       claimed_at=float(claimed_at))
+
+
+_START_USEC_LIMIT = 2**63
+_CLAIMED_AT_BOUND = 2**53
+
+
+def valid_pid(pid) -> Optional[int]:
+    """`pid` when it is an int (never a bool) with 0 < pid <= PID_MAX, else None."""
+    if isinstance(pid, bool) or not isinstance(pid, int) or not 0 < pid <= PID_MAX:
+        return None
+    return pid
+
+
+def _valid_start_usec(value: object) -> bool:
+    return type(value) is int and 0 <= value < _START_USEC_LIMIT
+
+
+def _valid_claimed_at(value: object) -> bool:
+    if type(value) is int:
+        return -_CLAIMED_AT_BOUND <= value <= _CLAIMED_AT_BOUND
+    return (type(value) is float and math.isfinite(value)
+            and -_CLAIMED_AT_BOUND <= value <= _CLAIMED_AT_BOUND)
 
 
 def may_reclaim_delivery(root: Path, item_id: str, ttl_seconds: float) -> bool:
@@ -528,8 +551,8 @@ def _pid_was_reused(rec: ClaimRecord, owner: ProcessIdentity) -> bool:
     liveness check returns early, and the TTL never gets a say — the item stalls
     forever rather than being redelivered.
     """
-    if rec.start_usec is None or owner.start_usec is None:
-        return False                      # cannot tell: treat as the same owner
+    if not (_valid_start_usec(rec.start_usec) and _valid_start_usec(owner.start_usec)):
+        return False                      # cannot tell: an invalid token proves nothing
     return rec.start_usec != owner.start_usec
 
 

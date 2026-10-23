@@ -760,6 +760,66 @@ def _c23():
         assert stripes, "fresh-process disk read of a valid fence must stripe"
 
 
+# 24 --------------------------------------------------------------------------
+@contract("an out-of-range pid, birth token or claimed_at reads UNKNOWN and is never reclaimable")
+def _c24():
+    m = outbox()
+    acquire = need(m, "acquire_delivery_claim")
+    read = need(m, "read_delivery_claim")
+    may = need(m, "may_reclaim_delivery")
+    claim_path = need(m, "_claim_path")
+    huge_pid = "9" * 5001                  # past CPython's int-parse digit limit
+    cases = {
+        "claimed_at=10**400": ("claimed_at", 10**400),
+        "claimed_at=-10**400": ("claimed_at", -10**400),
+        "claimed_at=1e400": ("claimed_at", "1e400"),
+        "claimed_at=true": ("claimed_at", True),
+        "pid=5001 digits": ("pid", huge_pid),
+        "pid=0": ("pid", 0),
+        "pid=2**31": ("pid", 2**31),
+        "pid=true": ("pid", True),
+        "pid=1.0": ("pid", 1.0),
+        "start_usec=-1, live pid": ("start_usec", -1),
+        "start_usec=10**400, live pid": ("start_usec", 10**400),
+        "start_usec=2**63, live pid": ("start_usec", 2**63),
+        "start_usec=1.5, live pid": ("start_usec", 1.5),
+    }
+    bad: list[str] = []
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        for n, (label, (field, value)) in enumerate(cases.items()):
+            item = f"item-bound-{n}"
+            assert acquire(root, item, "d1") is True
+            p = claim_path(root, item)
+            rec = json.loads(p.read_text(encoding="utf-8"))
+            rec[field] = "@RAW@"
+            raw = value if isinstance(value, str) else json.dumps(value)
+            p.write_text(json.dumps(rec).replace('"@RAW@"', raw), encoding="utf-8")
+            try:                                # each case reports, even after a raise
+                state = getattr(read(root, item), "state", None)
+                reclaim = may(root, item, 0.0)
+            except Exception as exc:  # noqa: BLE001 - a raise is this case's defect
+                bad.append(f"{label}: raised {type(exc).__name__}")
+                continue
+            if state != "UNKNOWN" or reclaim is not False:
+                bad.append(f"{label}: state={state} may_reclaim(0)={reclaim}")
+        assert not bad, "; ".join(bad)
+        # The bounds are inclusive where real values live: these still read HELD.
+        assert acquire(root, "item-edge", "d1") is True
+        p = claim_path(root, "item-edge")
+        rec = json.loads(p.read_text(encoding="utf-8"))
+        rec.update(start_usec=0, claimed_at=2**53)
+        p.write_text(json.dumps(rec), encoding="utf-8")
+        got = read(root, "item-edge")
+        assert got is not None and got.state == "HELD", f"edge values must read HELD, got {got}"
+    # A record built in-process with an impossible token is not evidence of reuse.
+    reused = need(m, "_pid_was_reused")
+    ident = need(m, "process_identity")(os.getpid())
+    for bad in (-1, 10**400, 2**63):
+        rec = m.ClaimRecord("x", "d1", os.getpid(), bad, 0.0)
+        assert reused(rec, ident) is False, f"start_usec={bad} counted as pid reuse"
+
+
 def main() -> int:
     print(f"  target: src/outbox.py  (repo {REPO.name})\n")
     total = len(PASSED) + len(FAILED) + len(NOT_IMPL) + len(ERRORED)
