@@ -849,8 +849,8 @@ def _c25():
     bad: list[str] = []
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
-        # Live owner, pid not a plausible pid (leading zero): only the mtime TTL can release it.
-        p = plant(root, "unreadable-pid", {"pid": "0" + str(os.getpid()), "claimed_at": 10**400})
+        # Live owner, pid not a plausible pid: only the mtime TTL can release it.
+        p = plant(root, "unreadable-pid", {"pid": "abc", "claimed_at": 10**400})
         for age, want in ((grace + 1, False), (ttl - 1, False), (ttl, True)):
             if taken_at(root, "unreadable-pid", p, age) is not want:
                 bad.append(f"unreadable pid at {age}s: want taken={want}")
@@ -878,9 +878,13 @@ PID_FORMS = [
     ("int", lambda pid: str(pid), True),
     ("digit string", lambda pid: f'"{pid}"', True),
     ("integral float", lambda pid: f"{pid}.0", True),
-    ("leading-zero string", lambda pid: f'"0{pid}"', False),
+    ("leading-zero string", lambda pid: f'"0{pid}"', True),
+    ("plus-sign string", lambda pid: f'"+{pid}"', True),
+    ("padded string", lambda pid: f'" {pid} "', True),
+    ("underscore string", lambda pid: f'"{str(pid)[:1]}_{str(pid)[1:]}"', True),
+    ("fractional float", lambda pid: f"{pid}.5", True),
     ("negative string", lambda pid: '"-1"', False),
-    ("fractional float", lambda pid: f"{pid}.5", False),
+    ("word string", lambda pid: '"abc"', False),
     ("true", lambda pid: "true", False),
     ("oversized", lambda pid: "9" * 5001, False),
     ("2**31", lambda pid: str(2**31), False),
@@ -924,6 +928,19 @@ def _c26():
                     if got != (want, want):
                         bad.append(f"{label} alive={alive} at {age}s: may/reclaim={got}, "
                                    f"want {want}")
+    # Every pid the pre-validation reader's int() accepted must still block, bool aside.
+    candidate = need(m, "_candidate_owner_pid")
+    for label, render, plausible in PID_FORMS:
+        raw = json.loads(render(os.getpid()), parse_int=m._bounded_int)
+        try:
+            legacy = None if isinstance(raw, bool) else int(raw)
+        except (TypeError, ValueError, OverflowError):
+            legacy = None
+        legacy = m.valid_pid(legacy)
+        if legacy is not None and candidate(raw) != legacy:
+            bad.append(f"{label}: int() named pid {legacy}, candidate is {candidate(raw)}")
+        if (candidate(raw) is not None) != plausible:
+            bad.append(f"{label}: candidate {candidate(raw)}, table says plausible={plausible}")
     assert not bad, "; ".join(bad)
 
 

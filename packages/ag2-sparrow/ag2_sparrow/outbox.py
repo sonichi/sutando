@@ -530,13 +530,15 @@ def _malformed_claim(p: Path, item_id: str, d: dict) -> ClaimRecord:
 
 
 def _candidate_owner_pid(raw: object) -> Optional[int]:
-    """A pid that plausibly names the owner: an int, an integral float, or a canonical
-    decimal string, within valid_pid's bounds. Only ever evidence AGAINST a takeover."""
-    if type(raw) is float and math.isfinite(raw) and raw.is_integer():
+    """A pid that plausibly names the owner: any int, finite float or short string int()
+    turns into a pid within valid_pid's bounds. Only ever evidence AGAINST a takeover."""
+    if type(raw) is float and math.isfinite(raw):
         raw = int(raw)
-    elif (type(raw) is str and raw.isascii() and raw.isdigit()
-          and len(raw) <= 10 and not raw.startswith("0")):
-        raw = int(raw)
+    elif type(raw) is str and len(raw) <= 32:
+        try:
+            raw = int(raw)
+        except ValueError:
+            return None
     return valid_pid(raw)
 
 
