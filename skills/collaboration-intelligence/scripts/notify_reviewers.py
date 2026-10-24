@@ -475,6 +475,8 @@ def command_for(target: dict, message: str) -> "list[str]":
 
 
 _PR_URL = re.compile("github[.]com/([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)/pull/([0-9]+)")
+# OWNER/NAME as GitHub spells them: one slash, no leading/trailing hyphen in the owner.
+_REPO_SLUG = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?/[A-Za-z0-9._-]+$")
 
 # `owner/repo#12` and a bare `#12`. Two digits minimum is a DELIBERATE trade, not
 # an oversight: `#7` is a real PR and passes silently, but `#1` is usually prose.
@@ -675,10 +677,15 @@ def main() -> int:
                          "in their recorded room — correctly addressed, wrong venue.")
     ap.add_argument("--repo", metavar="OWNER/NAME", default=None,
                     help="repo whose access to check when the message names no PR URL "
-                         "(a patch reviewed before it is a PR)")
+                         "(a patch reviewed before it is a PR); must be OWNER/NAME, and a "
+                         "probe GitHub cannot answer REFUSES rather than sends")
     ap.add_argument("--no-repo", dest="no_repo", metavar="REASON", default="",
                     help="deliberately send an ask that is about no repository")
     a = ap.parse_args()
+    if a.repo is not None and not _REPO_SLUG.fullmatch(a.repo):
+        print(f"REFUSED: --repo {a.repo!r} is not OWNER/NAME (one slash, GitHub-legal "
+              "segments) — a repo GitHub cannot find checks nobody.", file=sys.stderr)
+        return 7
     a.message = resolve_body(a.message, a.body_file)
     names = [n.strip() for n in a.reviewers.split(",") if n.strip()]
     targets, refusal_rc = resolve(names, load_roster())
@@ -711,6 +718,14 @@ def main() -> int:
                           f"required approvals", file=sys.stderr)
                     refusal_rc = max(refusal_rc, 7)
                     continue
+                if can is None and not refs:
+                    # A typed repo whose probe cannot answer may itself be wrong; a URL's
+                    # repo was read from a real PR, so only the flag refuses here.
+                    print(f"REFUSED: --repo {repo}: gate capability {why_cap} for "
+                          f"'{t['name']}' ({login}) — a probe that cannot answer checks "
+                          "nobody. Fix the repo name, or pass --no-repo '<reason>'.",
+                          file=sys.stderr)
+                    return 7
                 if can is None:
                     print(f"{t['name']}: gate capability {why_cap} on {repo} — "
                           f"sending, but this is not a confirmation it can approve",
