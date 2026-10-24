@@ -50,7 +50,9 @@ STUB = textwrap.dedent('''
                                       if sized else rest[:1]))
     def save():
         state.write_text(json.dumps(db))
-    if cmd in os.environ.get("STUB_FAIL", "").split(","):
+    fail_at = os.environ.get("STUB_FAIL_AT", "")  # "<cmd>:<n>": the n-th call of cmd fails
+    nth = fail_at and cmd == fail_at.split(":")[0] and sum(c[0] == cmd for c in db["calls"]) == int(fail_at.split(":")[1])
+    if cmd in os.environ.get("STUB_FAIL", "").split(",") or nth:
         save(); print("boom", file=sys.stderr); sys.exit(1)
     if cmd == "pages":
         listed = [{"id": None, "kind": "html", "title": "Main"}]
@@ -69,6 +71,12 @@ STUB = textwrap.dedent('''
         pass
     else:
         sys.exit(9)
+    edit = os.environ.get("STUB_EDIT_AFTER", "")  # "<cmd>:<n>:<append|inplace>": the owner edits right after that call
+    if edit and kind and cmd == edit.split(":")[0] and sum(c[0] == cmd for c in db["calls"]) == int(edit.split(":")[1]):
+        cur = db["pages"][kind]
+        db["pages"][kind] = (cur + "<p>OWNER NOTES</p>" if edit.endswith("append")
+                             else "<!--OWNER-->" + cur[12:] if cur else "<p>OWNER</p>")
+        db.setdefault("edits", []).append(db["pages"][kind])
     save()
 ''')
 
@@ -185,7 +193,8 @@ class RenderTest(unittest.TestCase):
         self.assertIn("start the call and pick your agent under &ldquo;Bring an agent?&rdquo;", by["calls"].how)
         self.assertIn("open the room menu (&#8942;), choose Notifications, and pick Mention &amp; Keywords",
                       by["activity"].how)
-        self.assertIn(("settings-integrations.jpg", "Settings \u2192 Apps \u2192 Integrations"), by["apps"].images)
+        self.assertIn(("settings-integrations", "settings-integrations.jpg", "Settings \u2192 Apps \u2192 Integrations"),
+                      by["apps"].images)
 
     def test_room_audience_says_your_agent(self):
         room = gs.render_page("Blue", "claude", "room")
@@ -202,7 +211,7 @@ class RenderTest(unittest.TestCase):
         for core in gs.CORES:
             text = re.sub(r"data:image/[^\"]+", "", gs.render_page("Blue", core)).lower()
             self.assertNotRegex(text, r"micro|\bmic\b|push to talk")
-        self.assertNotIn("02-microphone", " ".join(f for s in gs.SECTIONS for f, _ in s.images))
+        self.assertNotIn("02-microphone", " ".join(shot.file for s in gs.SECTIONS for shot in s.images))
 
     def test_codex_and_claude_code_are_not_offered_as_addable_agents(self):
         agents = [s for s in gs.SECTIONS if s.title == "Connect other agents"][0]
@@ -667,22 +676,23 @@ class AssetTest(unittest.TestCase):
         tp = gs.tour_page
         seen = {}
         for s in tp.sections_for("claude"):
-            for f, _ in s.images:
-                digest = hashlib.sha256((tp.ASSETS / f).read_bytes()).hexdigest()
-                self.assertNotIn(digest, seen, f"{s.id} reuses {seen.get(digest)}'s image {f}")
+            for shot in s.images:
+                digest = hashlib.sha256((tp.ASSETS / shot.file).read_bytes()).hexdigest()
+                self.assertNotIn(digest, seen, f"{s.id} reuses {seen.get(digest)}'s image {shot.file}")
                 seen[digest] = s.id
 
 
     def test_every_step_image_exists_and_is_small(self):
         tp = gs.tour_page
-        used = {f for s in tp.sections_for("claude") for f, _ in s.images}
+        used = {shot.file for s in tp.sections_for("claude") for shot in s.images}
         files = {p.name: p.stat().st_size for p in tp.ASSETS.glob("*.jpg")}
         self.assertEqual(used, set(files))
         self.assertTrue(all(size <= 60_000 for size in files.values()), files)
         self.assertLessEqual(sum(files.values()), 500_000)
         for s in tp.sections_for("claude"):
-            for f, alt in s.images:
-                self.assertTrue(alt.strip(), f)
+            for shot in s.images:
+                self.assertTrue(shot.alt.strip(), shot.file)
+                self.assertEqual(shot.asset, shot.file[:-4])  # today's asset names are the file stems
 
     def test_each_step_with_an_image_renders_it_inline(self):
         page = gs.render_page("Blue", "claude")
@@ -694,7 +704,7 @@ class AssetTest(unittest.TestCase):
             self.assertTrue([s for s in gs.SECTIONS if s.id == sid][0].images, sid)
 
     def test_rendered_page_size_is_bounded(self):
-        self.assertLess(len(gs.render_page("Blue", "claude").encode()), 400_000)
+        self.assertLessEqual(len(gs.render_page("Blue", "claude").encode()), 300_000)
 
 
 class EdgeTest(unittest.TestCase):
@@ -821,7 +831,8 @@ class MainTest(unittest.TestCase):
                                  "--agent-mxid", "@kai.agent:example.test")
         self.assertEqual(code, 0)
         self.assertEqual(json.loads(out), {"ok": True, "action": "created", "kind": "html-p1",
-                                           "summoned": True, "name": "Blue"})
+                                           "summoned": True, "name": "Blue", "list": "file",
+                                           "revision": gs.tour_page.FEATURES.revision, "media": []})
         with mock.patch.object(gs, "detect_core", return_value="codex"):
             code, out, _ = self.main("publish", "--room", self.ROOM, "--name", "Blue",
                                      "--room-commons", str(self.stub), "--agent-mxid", "@kai.agent:example.test")
@@ -857,9 +868,62 @@ class MainTest(unittest.TestCase):
     def test_publish_failure_exits_4(self):
         os.environ["STUB_FAIL"] = "pages"
         code, out, _ = self.main("publish", "--room", self.ROOM, "--name", "Blue", "--core", "codex",
-                                 "--room-commons", str(self.stub))
+                                 "--room-commons", str(self.stub), "--agent-mxid", "@kai.agent:example.test")
         self.assertEqual(code, 4)
         self.assertIn("pages failed", json.loads(out)["reason"])
+
+    def test_publish_refuses_without_an_agent_identity_and_resolves_one_from_the_device_file(self):
+        code, out, _ = self.main("publish", "--room", self.ROOM, "--name", "Blue", "--core", "codex",
+                                 "--room-commons", str(self.stub))
+        self.assertEqual(code, 4)
+        self.assertIn("no agent identity", json.loads(out)["reason"])
+        self.assertFalse((self.tmp / "room.json").exists())  # refused before any Commons call
+        device = self.tmp / "device.env"
+        device.write_text("AGENT_MXID=@kai.agent:example.test\n")  # the identity, no usable token
+        with mock.patch.dict(os.environ, {"AG2_DEVICE_ENV": str(device)}):
+            self.assertEqual(gs.agent_mxid(), "@kai.agent:example.test")
+            code, out, _ = self.main("publish", "--room", self.ROOM, "--name", "Blue", "--core", "codex",
+                                     "--room-commons", str(self.stub))
+        self.assertEqual((code, json.loads(out)["action"]), (0, "created"))
+        page = self.room_state()["pages"]["html-p1"]
+        self.assertEqual(gs.read_marker(page), ("@kai.agent:example.test", gs.tour_page.FEATURES.revision))
+        with mock.patch.dict(os.environ, {"AGENT_MXID": "@env.agent:example.test"}):
+            self.assertEqual(gs.agent_mxid(), "@env.agent:example.test")
+        channels = self.tmp / "claude" / "channels" / "ag2space"
+        channels.mkdir(parents=True)
+        (channels / ".env").write_text("AGENT_MXID=@file.agent:example.test\n")
+        self.assertEqual(gs.agent_mxid(), "@file.agent:example.test")
+
+    def test_the_identity_is_resolved_once_for_the_name_and_the_tag(self):
+        with mock.patch.object(gs, "agent_mxid", side_effect=["@alpha.agent:example.test", "@beta.agent:example.test"]) \
+                as resolver, mock.patch.object(gs, "_https_get", side_effect=OSError("offline")):
+            code, out, _ = self.main("publish", "--room", self.ROOM, "--name", "auto", "--core", "codex",
+                                     "--room-commons", str(self.stub))
+        self.assertEqual((code, json.loads(out)["action"], json.loads(out)["name"]), (0, "created", "Alpha"))
+        self.assertEqual(resolver.call_count, 1)
+        page = self.room_state()["pages"]["html-p1"]
+        self.assertIn("<h1>Getting started with Alpha</h1>", page)
+        self.assertEqual(gs.read_marker(page)[0], "@alpha.agent:example.test")
+
+    def test_a_malformed_identity_is_refused_before_any_commons_call(self):
+        def attempt(*extra, env=None):
+            with mock.patch.dict(os.environ, env or {}):
+                return self.main("publish", "--room", self.ROOM, "--name", "Blue", "--core", "codex",
+                                 "--room-commons", str(self.stub), *extra)
+        device = self.tmp / "device.env"
+        device.write_text("AGENT_MXID=kai.agent\n")
+        for case in (("--agent-mxid", "   "), ("--agent-mxid", "kai"), ("--agent-mxid", "!kai:example.test"),
+                     ("--agent-mxid", "@kai example.test"), ("--agent-mxid", "@kai:"),
+                     (("env",), {"AGENT_MXID": "not-an-mxid"}), (("env",), {"AGENT_MXID": " \t "}),
+                     (("env",), {"AG2_DEVICE_ENV": str(device)})):
+            extra, env = (case, None) if case[0] != ("env",) else ((), case[1])
+            code, out, _ = attempt(*extra, env=env)
+            self.assertEqual(code, 4, case)
+            self.assertIn("identity", json.loads(out)["reason"])
+            self.assertFalse((self.tmp / "room.json").exists(), case)
+        code, out, _ = attempt("--agent-mxid", "  @kai.agent:example.test\n")  # whitespace is cleaned, once
+        self.assertEqual((code, json.loads(out)["action"]), (0, "created"))
+        self.assertEqual(gs.read_marker(self.room_state()["pages"]["html-p1"])[0], "@kai.agent:example.test")
 
 
     # The setup app's saved inputs: <workspace>/state/onboarding/tutorial-inputs.json.
@@ -1125,14 +1189,17 @@ class PublishTest(unittest.TestCase):
 
     def test_first_run_creates_writes_and_summons(self):
         out = self.publish(owner="@chi:ag2.space")
-        self.assertEqual(out, {"ok": True, "action": "created", "kind": "html-p1", "summoned": True})
+        self.assertEqual(out, {"ok": True, "action": "created", "kind": "html-p1", "summoned": True,
+                               "revision": gs.tour_page.FEATURES.revision, "media": []})
         room = self.room()
         self.assertEqual(room["pages"], {"html-p1": self.page()})
         parts = gs.chunks(self.page())
         self.assertGreater(len(parts), 1)  # the page is over one write's limit
-        self.assertIn(gs.owner_marker(self.ME), parts[0])  # the create's own body carries ownership
+        # The create's own body carries ownership, and the list revision the page was built from.
+        self.assertEqual(gs.read_marker(parts[0]), (self.ME, gs.tour_page.FEATURES.revision))
+        self.assertTrue(gs.page_digest_ok(self.page()))  # the tag's digest covers the whole page
         self.assertEqual([c[0] for c in room["calls"]],
-                         ["pages", "create", "read", "append", "summon"])
+                         ["pages", "create", "read", "read", "append", "read", "summon"])
         appended = [c for c in room["calls"] if c[0] == "append"]
         self.assertTrue(all(c[2] <= gs.CHUNK_BYTES for c in appended))
         self.assertEqual(room["calls"][-1], ["summon", "html-p1", "@chi:ag2.space"])
@@ -1158,7 +1225,8 @@ class PublishTest(unittest.TestCase):
         before = len(self.room()["calls"])
         old, new = self.page(), self.page(core="claude")
         self.assertGreater(len(old.encode()), gs.CHUNK_BYTES)
-        out = self.publish(core="claude")
+        with mock.patch.object(gs, "one_call", return_value=False):  # above the one-call budget
+            out = self.publish(core="claude")
         self.assertEqual(out["action"], "updated")
         calls = self.room()["calls"][before:]
         self.assertEqual([c[0] for c in calls if c[0] == "replace"], ["replace"] * len(gs.chunks(old)))
@@ -1199,7 +1267,7 @@ class PublishTest(unittest.TestCase):
         self.assertEqual(entry["state"], "creating")
         out = self.publish(owner="@chi:ag2.space")
         # the landed page carries this agent's tag, so the rerun finishes it without a second create
-        self.assertEqual((out["action"], out["kind"], out["summoned"]), ("updated", "html-p1", True))
+        self.assertEqual((out["action"], out["kind"], out["summoned"]), ("resumed", "html-p1", True))
         self.assertEqual(self.door.ops, [entry["operation_id"]])
         self.assertEqual(self.room()["pages"], {"html-p1": self.page()})
 
@@ -1207,6 +1275,9 @@ class PublishTest(unittest.TestCase):
         self.door.fail = "after"
         with self.assertRaises(gs.PublishError):
             self.publish(name="Old")
+        out = self.publish(name="New")  # finishes the journalled "Old" page first; "New" waits
+        self.assertEqual((out["action"], out["kind"], out["name"]), ("resumed", "html-p1", "Old"))
+        self.assertEqual(self.room()["pages"], {"html-p1": self.page("Old")})
         out = self.publish(name="New")
         self.assertEqual((out["action"], out["kind"]), ("updated", "html-p1"))
         self.assertEqual(self.room()["pages"], {"html-p1": self.page("New")})
@@ -1262,7 +1333,7 @@ class PublishTest(unittest.TestCase):
                 self.publish()
         self.assertEqual(gs.load_marker(self.marker)[self.ROOM]["state"], "creating")
         out = self.publish()
-        self.assertEqual((out["action"], out["kind"]), ("updated", "html-p1"))
+        self.assertEqual((out["action"], out["kind"]), ("resumed", "html-p1"))  # finished from its journal
         self.assertEqual(list(self.room()["pages"]), ["html-p1"])
         self.assertEqual(self.room()["pages"]["html-p1"], self.page())
         self.assertEqual(len(self.door.ops), 1)
@@ -1279,7 +1350,7 @@ class PublishTest(unittest.TestCase):
             with self.assertRaisesRegex(gs.PublishError, "could not record html-p1"):
                 self.publish()
         out = self.publish(owner="@chi:ag2.space")
-        self.assertEqual((out["action"], out["kind"], out["summoned"]), ("unchanged", "html-p1", True))
+        self.assertEqual((out["action"], out["kind"], out["summoned"]), ("resumed", "html-p1", True))
         self.assertEqual(list(self.room()["pages"]), ["html-p1"])
 
     def test_lost_marker_recovers_the_page_by_its_ownership_marker(self):
@@ -1308,7 +1379,7 @@ class PublishTest(unittest.TestCase):
         self.assertEqual(gs.load_marker(self.marker)[self.ROOM]["state"], "pending")
         os.environ.pop("STUB_FAIL")
         out = self.publish(owner="@chi:ag2.space")
-        self.assertEqual((out["action"], out["kind"], out["summoned"]), ("updated", "html-p1", True))
+        self.assertEqual((out["action"], out["kind"], out["summoned"]), ("resumed", "html-p1", True))
         self.assertEqual(self.room()["pages"], {"html-p1": self.page()})
         self.assertEqual(len(self.door.ops), 1)
 
@@ -1387,7 +1458,7 @@ class CliTest(unittest.TestCase):
         self.assertEqual(json.loads(done.stdout)["reason"], "room-commons not installed")
 
     def test_bad_name_exits_2(self):
-        done = self.run_cli("publish", "--room", "!r:x", "--name", " ")
+        done = self.run_cli("render", "--name", " ")  # publish checks room-commons and the identity first
         self.assertEqual(done.returncode, 2)
 
 
