@@ -1846,6 +1846,15 @@ ON_TASK_CMD = os.environ.get("REMOTE_TASK_ON_TASK") or ""
 # A read timeout on the long poll is indistinguishable from the documented
 # `200 {"tasks": []}` hold-window expiry, so it is only an outage once no poll
 POLL_TIMEOUT_GRACE_S = 3 * (POLL_WAIT + 10)
+# Backoff alone caps at 60s and never gives up, so a relay that stays down
+# leaves a live process polling into the void. 0 disables the exit.
+POLL_STALL_EXIT_S = float(os.environ.get("REMOTE_TASK_POLL_STALL_EXIT_S") or "600")
+# Exiting only helps where something restarts us. startup-runtime.sh launches the
+# primary and every named lane as a bare `&`, so the owner must be declared here.
+POLL_STALL_RESTART_OWNER = (os.environ.get("SUTANDO_BRIDGE_RESTART_OWNER") or "").strip()
+# EX_UNAVAILABLE: the wrapper relaunches on it without an owner alert, so an outage
+# does not queue a "bridge restarted" message every stall period.
+POLL_STALL_EXIT_CODE = 69
 # Proactive-message drain: when REMOTE_PROACTIVE_ROOM names a room id, every
 # `results/proactive-*.txt` the agent writes is delivered to that room as a
 _PROACTIVE_ROOM_ENV = os.environ.get("REMOTE_PROACTIVE_ROOM")
@@ -7583,6 +7592,63 @@ def _poll_timeout_is_empty(last_ok: float, now: float,
     return (now - last_ok) <= grace
 
 
+def _poll_stalled(last_ok: float, now: float,
+                  limit: float = POLL_STALL_EXIT_S) -> bool:
+    """Whether the poll loop has gone `limit` seconds without a success."""
+    return limit > 0 and (now - last_ok) > limit
+
+
+_STALL_REPORTED_FOR: float | None = None
+
+
+def _stop_background_workers(outbound_thread, results_watcher) -> None:
+    """Stop and join the outbound worker, so a result POST in flight is not cut off
+    and then redelivered by the next process."""
+    _OUTBOUND_STOP.set(); _OUTBOUND_WAKE.set()
+    outbound_thread.join(timeout=OUTBOUND_SCAN_S * 3 + 5)
+    if results_watcher is not None:
+        results_watcher.join(timeout=5)
+
+
+def _abort_if_poll_stalled(anchor: float,
+                           before_exit: Callable[[], None] | None = None) -> None:
+    """Record a wedged-but-alive bridge, and exit only if something restarts us.
+
+    `anchor` is a `time.monotonic()` reading: wall time would count a sleeping Mac
+    as a stall. The exit is armed only when a restart owner is declared, since an
+    unsupervised lane that exits stays down; the status sidecar records it either way.
+    """
+    global _STALL_REPORTED_FOR
+    now = time.monotonic()
+    # Pass the limit explicitly: the parameter default binds at def time,
+    # so a reconfigured module global would otherwise never be read.
+    if not _poll_stalled(anchor, now, POLL_STALL_EXIT_S):
+        return
+    stalled_s = int(now - anchor)
+    if not POLL_STALL_RESTART_OWNER:
+        # Once per stall episode, not once per poll: the loop calls this on every
+        # iteration and the sidecar is a file write.
+        if _STALL_REPORTED_FOR != anchor:
+            _STALL_REPORTED_FOR = anchor
+            _emit_gateway_status(False, error=(
+                f"stalled: no successful poll in {stalled_s}s (limit "
+                f"{POLL_STALL_EXIT_S:g}s); retrying -- no restart owner declared, "
+                "so exiting would end this lane"))
+            _log(f"WARN: no successful poll in {stalled_s}s and no restart owner "
+                 "(SUTANDO_BRIDGE_RESTART_OWNER unset) -- continuing to retry")
+        return
+    _emit_gateway_status(False, error=f"stalled: no successful poll in {stalled_s}s")
+    # sys.exit's message reaches only stderr; the bridge log is where the backoff
+    # lines that preceded this live, so the stall must be stated there too.
+    _log(f"stalled: no successful poll in {stalled_s}s (limit {POLL_STALL_EXIT_S:g}s) "
+         f"while the process stayed alive -- exiting so {POLL_STALL_RESTART_OWNER} restarts it")
+    if before_exit is not None:
+        before_exit()
+    print(f"FATAL: no successful poll in {stalled_s}s (limit {POLL_STALL_EXIT_S:g}s) "
+          f"-- exiting so {POLL_STALL_RESTART_OWNER} restarts the bridge.", file=sys.stderr)
+    sys.exit(POLL_STALL_EXIT_CODE)
+
+
 def main() -> None:
     # This process holds the gateway URL: nothing uncaught, in any thread, prints it raw.
     gateway_instance.install_scrubbing_excepthooks(lambda: URL)
@@ -7629,6 +7695,7 @@ def main() -> None:
     poll_grace_since = time.time()
     last_poll_ok: float | None = None
     poll_failures = 0  # consecutive network failures; the next good poll resets it
+    stall_anchor = time.monotonic()  # excludes system sleep on macOS, unlike time.time()
     _emit_gateway_status(False, error="starting — not yet connected")
     refresh_routing(force=True)  # the owner's DM comes from the gateway at connect, not from a pin
     _maybe_start_event_channel()  # additive/opt-in/isolated — never blocks the task loop
@@ -7637,15 +7704,14 @@ def main() -> None:
     while True:
         _stamp_loop_progress()
         try:
+            _abort_if_poll_stalled(stall_anchor, lambda: _stop_background_workers(
+                _outbound_thread, _results_watcher))
             if _LOCK_LOST.is_set() or not _heartbeat_singleton():
                 # Lost the poller lock (reaped after being deemed stale). Stop
                 # polling immediately so we don't dual-poll the relay bearer with
                 _log("singleton: lost workspace poller lock (reaped after stale takeover) "
                      "— exiting to avoid dual-poll")
-                _OUTBOUND_STOP.set(); _OUTBOUND_WAKE.set()
-                _outbound_thread.join(timeout=OUTBOUND_SCAN_S * 3 + 5)
-                if _results_watcher is not None:
-                    _results_watcher.join(timeout=5)
+                _stop_background_workers(_outbound_thread, _results_watcher)
                 return
             _post_heartbeat(inflight)
             _retry_withheld_reviews()
@@ -7659,6 +7725,7 @@ def main() -> None:
             try:
                 resp = _req("GET", f"/v1/tasks?wait={POLL_WAIT}{_POLL_PROOF}", timeout=POLL_WAIT + 10)
                 last_poll_ok = poll_grace_since = time.time()
+                stall_anchor = time.monotonic()
                 # A completed poll remains evidence even if accepting its tasks fails.
                 _emit_gateway_status(True, poll_ok_ts=last_poll_ok)
             except (TimeoutError, socket.timeout):
@@ -7716,6 +7783,9 @@ def main() -> None:
             if e.code in (401, 403):
                 if _recover_auth(e.code):
                     backoff = 1
+                    # The wait was on a human, not a stall: resume with the same
+                    # fresh anchor a newly started bridge gets.
+                    stall_anchor = time.monotonic()
                     continue
                 _emit_gateway_status(False, error=f"auth rejected HTTP {e.code}", poll_ok_ts=last_poll_ok)
                 sys.exit(f"FATAL: gateway auth rejected (HTTP {e.code}) — check REMOTE_TASK_TOKEN.")
