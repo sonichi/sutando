@@ -553,11 +553,9 @@ def install_service(task_dir: Path, result_dir: Path, state_dir: Path, instance:
              "the token Sparrow uses")
     env = {"AG2_DEVICE_ENV": str(device_env), "AGENT_CONNECT_TASK_DIR": str(task_dir),
            "AGENT_CONNECT_RESULT_DIR": str(result_dir), "AGENT_CONNECT_STATE_DIR": str(state_dir)}
-    # A user unit inherits the manager's whole environment: the identity keys the bridge reads first
-    # are unset there, and only the validated saved MXID is set (Environment= beats the manager's).
-    if saved_mxid(mxid):
-        env["AGENT_MXID"] = saved_mxid(mxid)
-    else:
+    # The unit pins the identity to the saved MXID or none; the manager's identity keys are unset.
+    env.update(agent_identity.pinned_environ(saved_mxid(mxid)))
+    if not saved_mxid(mxid):
         print(NO_SAVED_MXID, file=sys.stderr)
     unset = tuple(k for k in agent_identity.ENV_KEYS if k not in env)
     if instance:

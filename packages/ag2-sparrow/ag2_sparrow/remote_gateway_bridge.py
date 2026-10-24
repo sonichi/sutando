@@ -2158,7 +2158,8 @@ def _provision_base() -> str:
 def _reenroll_identity() -> str:
     """Agent mxid: process env, then the channel .env file — the same fallback
     the token uses (desktop launchers don't export either) — then the durable
-    per-host identity enrolment wrote to state/auth/ag2space.json. Re-read per
+    per-host identity enrolment wrote to state/auth/ag2space.json; a launcher's
+    pin (agent_identity.PINNED_KEY) leaves only its AGENT_MXID. Re-read per
     call, so an identity that appears mid-episode takes effect without a restart."""
     return agent_identity.resolve(_STATE, _config_from_channel_env)
 
@@ -2177,7 +2178,11 @@ def _reenroll_claim() -> None:
     if not agent_id or not TOKEN:
         # No POST issued -> no cadence stamp. The instruction must match what
         # can actually work: file candidates are re-read every cycle, but the
-        if not agent_id:
+        if not agent_id and os.environ.get(agent_identity.PINNED_KEY):
+            _log("reenroll: this bridge's launcher pinned no agent identity, so "
+                 "no file or binding supplies one; save the agent's MXID with the "
+                 "launcher and RESTART it")
+        elif not agent_id:
             pointered = os.environ.get("AG2_DEVICE_ENV") \
                 or os.environ.get("CLAUDE_CONFIG_DIR")
             _log("reenroll: agent identity unknown — write "

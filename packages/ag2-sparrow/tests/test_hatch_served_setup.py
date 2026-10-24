@@ -1203,6 +1203,14 @@ print(json.dumps(json.loads(m.SETUP_HINT_FILE.read_text())))
         (self.state / runtime_text.CACHE_NAME).write_text(json.dumps(served(revision=41)))
         self.assertEqual(runtime_text.wake_context(runtime_text.current_cache(self.state), VALUES)[1],
                          "served revision 41")
+        cache = self.state / runtime_text.CACHE_NAME
+        with mock.patch.object(setup_fetch, "fetch_setup", side_effect=AssertionError("refetched")):
+            self.assertEqual(runtime_text.refresh_cache(self.state)["revision"], "41")
+        self.assertEqual(json.loads(cache.read_text())["revision"], "41", "the integer is written back as text")
+        self.assertEqual(cache.stat().st_mode & 0o777, 0o600)
+        mtime = cache.stat().st_mtime_ns
+        runtime_text.refresh_cache(self.state)
+        self.assertEqual(cache.stat().st_mtime_ns, mtime, "a cache already spelt as text is not rewritten")
         for odd in (True, 41.0, None, "rev 41"):
             with self.subTest(revision=odd):
                 self.assertEqual(runtime_text.setup_problem(served(revision=odd)), "no revision")

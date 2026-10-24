@@ -1050,7 +1050,8 @@ class RealSinks(unittest.TestCase):
                                "REMOTE_TASK_URL", str(fx.root / "t")):
                     self.assertNotIn(secret, shown, secret)
                 if kind == "retained":
-                    self.assertEqual(shown.count("Environment=<withheld>\n"), 5, "a line per old one, in context")
+                    self.assertEqual(shown.splitlines().count(" Environment=<withheld>"), 5,
+                                     "a line per old one, in context")
                     self.assertIn("+Description=ag2-sparrow (AG2 Space listener)\n", shown, "the rest is shown")
 
     def test_a_drop_in_is_never_read_and_its_lines_would_be_withheld(self):

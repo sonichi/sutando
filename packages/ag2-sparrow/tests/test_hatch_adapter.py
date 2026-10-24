@@ -146,6 +146,57 @@ def py_env(home):
     return hermetic_env(home, PYTHONPATH=str(PKG_ROOT))
 
 
+def assert_bridge_identity(test, final_env, state_dir, want):
+    """The bridge's own resolver under `final_env` reports `want` while every identity tier it reads
+    beyond the env holds a foreign id: each file alias in both candidates, and the durable binding."""
+    from ag2_sparrow import remote_gateway_bridge as gw
+    device = Path(final_env["AG2_DEVICE_ENV"])
+    channel = Path(final_env["CLAUDE_CONFIG_DIR"], "channels", "ag2space", ".env")
+    record = Path(state_dir) / "auth" / "ag2space.json"
+    for path in (device, channel, record):
+        path.parent.mkdir(parents=True, exist_ok=True)
+    device_text = device.read_text() if device.exists() else ""
+    unpinned = {k: v for k, v in final_env.items()
+                if k != agent_identity.PINNED_KEY and k not in agent_identity.ENV_KEYS}
+
+    def bridge(env):
+        with mock.patch.object(gw, "_STATE", Path(state_dir)), mock.patch.dict(os.environ, env, clear=True):
+            return gw._reenroll_identity()
+
+    tiers = [(f, k) for f in (device, channel) for k in agent_identity.FILE_KEYS] + [(record, "agent_id")]
+    try:
+        for tier in tiers + [None]:
+            device.write_text(device_text)
+            channel.unlink(missing_ok=True)
+            record.unlink(missing_ok=True)
+            for n, (path, key) in enumerate([tier] if tier else tiers):
+                if path == record:
+                    path.write_text(json.dumps({"agent_id": f"@foreign-{n}:ag2.space"}))
+                else:
+                    with path.open("a") as fh:
+                        fh.write(f"\n{key}=@foreign-{n}:ag2.space\n")
+            with test.subTest(tier=tier and (tier[0].name, tier[1]), want=want):
+                test.assertEqual(bridge(unpinned), "@foreign-0:ag2.space", "the planted tier is live unpinned")
+                test.assertEqual(bridge(final_env), want, "the launch decides the identity at every tier")
+    finally:
+        device.write_text(device_text)
+
+
+def unit_environment(unit, manager_env):
+    """The environment systemd gives the unit's process: the manager's, then Environment=, then
+    UnsetEnvironment= last."""
+    env = dict(manager_env)
+    for line in unit.splitlines():
+        if line.startswith("Environment="):
+            k, _, v = line[len("Environment="):].strip('"').partition("=")
+            env[k] = v
+    for line in unit.splitlines():
+        if line.startswith("UnsetEnvironment="):
+            for k in line[len("UnsetEnvironment="):].split():
+                env.pop(k, None)
+    return env
+
+
 class Base(unittest.TestCase):
     def setUp(self):
         self.home = Path(tempfile.mkdtemp())
@@ -1335,6 +1386,19 @@ class Service(Base):
                     self.assertNotIn(f"{key}={StartSparrow.CALLER}", unit, "the installer's own identity never reaches the unit")
                 self.assertNotIn("\nEnvironment=AGENT_ID", unit)
 
+    def test_the_units_final_environment_resolves_the_saved_identity_or_none_at_every_tier(self):
+        manager = {"HOME": str(self.home), "CLAUDE_CONFIG_DIR": str(self.home / "caller-claude"),
+                   agent_identity.PINNED_KEY: "", **{key: StartSparrow.CALLER for key in agent_identity.ENV_KEYS}}
+        for mxid, want in ((AGENT, AGENT), ("", "")):
+            with mock.patch.object(sm, "_run", side_effect=systemd_seam(FakeSystemd())), \
+                    mock.patch.dict(os.environ, {**py_env(self.home), "USER": "hatch",
+                                                 "PATH": f"{self.bin}:{os.environ['PATH']}"}, clear=True), \
+                    contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                hatch_cli.install_service(self.tasks, self.results, self.state, "", True, mxid=mxid)
+            final = unit_environment(self.unit.read_text(), manager)
+            self.assertEqual(final[agent_identity.PINNED_KEY], "1")
+            assert_bridge_identity(self, final, final["AGENT_CONNECT_STATE_DIR"], want)
+
     def test_the_unit_carries_the_saved_identity_never_the_installers_ambient_one(self):
         r = self.with_systemd(FakeSystemd(), "install", "--mxid", AGENT,
                               env={"USER": "hatch", **{key: StartSparrow.CALLER for key in agent_identity.ENV_KEYS}})
@@ -2028,6 +2092,33 @@ class Keepalive(Base):
                 self.assertEqual(hatch_cli.NO_SAVED_MXID in err.getvalue(), mxid is None or want == "unset unset",
                                  err.getvalue())
 
+    def test_a_started_sparrows_final_environment_resolves_the_saved_identity_or_none_at_every_tier(self):
+        self.installed()
+        stub = self.bin / "sparrow-env-stub"
+        executable(stub, f"#!{sys.executable}\nimport json, os\n"
+                         "json.dump(dict(os.environ), open(os.environ['SPARROW_SEEN'], 'w'))\n")
+        cfg = self.call(lambda c: c)
+        env = py_env(self.home)
+        env.update({key: f"@caller-{key.lower()}:ag2.space" for key in agent_identity.ENV_KEYS},
+                   CLAUDE_CONFIG_DIR=str(self.home / "caller-claude"))
+        for i, (mxid, want) in enumerate(((AGENT, AGENT), (None, ""))):
+            seen = self.home / f"sparrow-final-env-{i}"
+            env["SPARROW_SEEN"] = str(seen)
+            saved = {k: v for k, v in cfg.items() if k != "AGENT_MXID"}
+            if mxid:
+                saved["AGENT_MXID"] = mxid
+            with mock.patch.object(hatch_cli, "_find_console_script", return_value=str(stub)), \
+                    mock.patch.object(keepalive, "SPAWN_SETTLE_S", 0.3), \
+                    mock.patch.dict(os.environ, env, clear=True), contextlib.redirect_stderr(io.StringIO()):
+                ok, how = keepalive._spawn_sparrow(saved)
+            self.assertTrue(ok or "exited 0" in how, how)
+            deadline = time.monotonic() + 10
+            while not (seen.exists() and seen.stat().st_size) and time.monotonic() < deadline:
+                time.sleep(0.05)
+            final = json.loads(seen.read_text())
+            self.assertEqual(final["CLAUDE_CONFIG_DIR"], env["CLAUDE_CONFIG_DIR"], "channel config is kept")
+            assert_bridge_identity(self, final, final.get("AGENT_CONNECT_STATE_DIR") or self.home / "state", want)
+
     def test_the_service_unit_carries_the_health_command(self):
         self.installed()
         fake = FakeSystemd()
@@ -2559,11 +2650,11 @@ time.sleep(20)
                 pid_file.unlink()
         self.addCleanup(stop_bridge)
 
-        def run(*args):
+        def run(*args, **extra):
             env = py_env(self.home)
             env.update(PATH=f"{self.bin}:{os.environ['PATH']}", AGENT_CONNECT_TASK_DIR=str(self.tasks),
                        AGENT_CONNECT_RESULT_DIR=str(self.results), AGENT_CONNECT_STATE_DIR=str(self.state),
-                       **{key: self.CALLER for key in agent_identity.ENV_KEYS})
+                       **{key: self.CALLER for key in agent_identity.ENV_KEYS}, **extra)
             with mock.patch.object(keepalive, "ensure_sparrow", REAL_ENSURE_SPARROW), \
                     mock.patch.object(keepalive, "START_WAIT_S", 30.0), \
                     mock.patch.object(holder_lock, "_home", lambda: str(self.home)):
@@ -2588,11 +2679,25 @@ time.sleep(20)
             (self.state / name).unlink()
         config = self.home / ".config" / "ag2-sparrow-hatch" / "config"
         config.write_text(re.sub(r"^AGENT_MXID=.*\n", "", config.read_text(), flags=re.M))
-        r = run("keepalive", "keepawake")
+        # Every tier past the env carries the caller's identity too: the device file, the inherited
+        # channel .env and a durable binding.
+        aliases = "".join(f"{key}={self.CALLER}\n" for key in agent_identity.FILE_KEYS)
+        relay.write_text(relay.read_text() + aliases)
+        channel = self.home / "caller-claude" / "channels" / "ag2space" / ".env"
+        channel.parent.mkdir(parents=True)
+        channel.write_text(aliases)
+        (self.state / "auth").mkdir(exist_ok=True)
+        (self.state / "auth" / "ag2space.json").write_text(json.dumps({"agent_id": self.CALLER}))
+        r = run("keepalive", "keepawake", CLAUDE_CONFIG_DIR=str(self.home / "caller-claude"))
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn("listener was down; restarted:", r.stdout)
         self.assertIn(hatch_cli.NO_SAVED_MXID, r.stderr)
-        status = json.loads((self.state / "gateway-status.json").read_text())
+        status, deadline = {}, time.monotonic() + 30
+        while not status.get("connected") and time.monotonic() < deadline:
+            with contextlib.suppress(OSError, ValueError):
+                status = json.loads((self.state / "gateway-status.json").read_text())
+            time.sleep(0.1)
+        self.assertTrue(status.get("connected"), status)
         self.assertIsNone(status["agent_id"], "no saved identity: the bridge runs as nobody, not as the caller")
         self.assertIsNone(status["gateway_binding"], status)
         self.assertFalse((self.state / "owner-routing.json").exists())

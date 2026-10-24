@@ -134,10 +134,12 @@ def setup_problem(setup, gateway_url: str = "") -> str:
 def refresh_cache(state_dir: Path, instance: str = "") -> "dict | None":
     """Fetch the served setup unless the cache already holds the announced revision. A
     fetch that fails, or returns a setup that does not validate, writes nothing. Returns
-    current_cache afterwards."""
-    if current_cache(state_dir, instance) is not None \
-            and announced_revision(state_dir, instance) is not None:
-        return current_cache(state_dir, instance)
+    current_cache afterwards, and writes back a kept cache whose revision is spelt otherwise."""
+    current = current_cache(state_dir, instance)
+    if current is not None and announced_revision(state_dir, instance) is not None:
+        if load_cache(state_dir) != current:
+            _cli._write(cache_path(state_dir), json.dumps(current, sort_keys=True), 0o600)
+        return current
     fetched = setup_fetch.fetch_setup(kind="acp", vendor=VENDOR)
     gateway = reported_gateway(state_dir, instance)
     why = "no setup fetched" if fetched is None else setup_problem(fetched, gateway)

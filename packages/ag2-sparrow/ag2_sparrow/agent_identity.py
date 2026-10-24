@@ -3,8 +3,10 @@
 `resolve` is the bridge's identity chain, in its order: the process env (`AGENT_MXID`, `AGENT_ID`),
 then the channel .env files (`AGENT_MXID`, `AGENT_ID`, `AG2SPACE_USER_ID`), then the durable binding
 `<state>/auth/ag2space.json`'s `agent_id`. The gateway bridge and the installers read it here, so an
-install derives its root from exactly the identity the bridge will report. A .env file's lines
-are parsed by the credential owner, gateway_credential_sources. Stdlib only.
+install derives its root from exactly the identity the bridge will report. A launcher that has
+decided the identity sets `PINNED_KEY` (see `launch_environ`): the chain is then `AGENT_MXID` alone,
+so the bridge runs as the launcher's saved identity or as none, never one a file or binding supplies.
+A .env file's lines are parsed by the credential owner, gateway_credential_sources. Stdlib only.
 
 `root_segment` maps an id to one path segment, lowercase `[a-z0-9._-]`, no leading dot, at most
 `SEGMENT_MAX` bytes. A plain MXID `@local:server` whose parts are lowercase `[a-z0-9.-]` (first
@@ -24,6 +26,7 @@ from . import gateway_credential_sources as _sources
 
 ENV_KEYS = ("AGENT_MXID", "AGENT_ID")
 FILE_KEYS = ("AGENT_MXID", "AGENT_ID", "AG2SPACE_USER_ID")
+PINNED_KEY = "AG2_IDENTITY_PINNED"
 SEGMENT_MAX = 64
 DIGEST_HEX = 12
 _PLAIN = re.compile(r"@([a-z0-9][a-z0-9.-]*):([a-z0-9][a-z0-9.-]*)")
@@ -62,9 +65,24 @@ def enrolled(state_dir) -> str:
         return ""
 
 
+def pinned_environ(mxid: str) -> dict:
+    """The variables that pin a bridge's identity to `mxid`, or to none when `mxid` is ''."""
+    return {PINNED_KEY: "1", **({"AGENT_MXID": mxid} if mxid else {})}
+
+
+def launch_environ(base, mxid: str) -> dict:
+    """`base` with its identity variables replaced by `pinned_environ(mxid)`, for a launched bridge."""
+    env = {k: v for k, v in base.items() if k not in ENV_KEYS and k != PINNED_KEY}
+    env.update(pinned_environ(mxid))
+    return env
+
+
 def resolve(state_dir, channel_value, environ=None) -> str:
-    """The agent id by the bridge's chain; `channel_value(key)` reads the channel .env tier. '' = unknown."""
+    """The agent id by the bridge's chain; `channel_value(key)` reads the channel .env tier. '' = unknown.
+    A pinned environment answers from its own `AGENT_MXID` alone."""
     env = os.environ if environ is None else environ
+    if env.get(PINNED_KEY):
+        return (env.get("AGENT_MXID") or "").strip()
     for key in ENV_KEYS:
         v = (env.get(key) or "").strip()
         if v:

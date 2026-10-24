@@ -128,6 +128,57 @@ class BridgeReadsTheSameChain(unittest.TestCase):
                              (os.path.realpath(Path(d) / "tasks"), os.path.realpath(Path(d) / "results")))
 
 
+class PinnedLaunch(unittest.TestCase):
+    """A launcher's pin decides the bridge's identity at every tier: the saved MXID, or none."""
+    SAVED = "@saved:ag2.space"
+
+    def setUp(self):
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(d, ignore_errors=True))
+        self.state, self.device = d / "state", d / "device.env"
+        self.channel = d / "claude" / "channels" / "ag2space" / ".env"
+        self.record = self.state / "auth" / "ag2space.json"
+        self.channel.parent.mkdir(parents=True)
+        self.record.parent.mkdir(parents=True)
+        self.caller = {"AG2_DEVICE_ENV": str(self.device), "CLAUDE_CONFIG_DIR": str(d / "claude"),
+                       "AGENT_MXID": "@caller-mxid:ag2.space", "AGENT_ID": "@caller-id:ag2.space"}
+
+    def bridge(self, env):
+        with mock.patch.object(gw, "_STATE", self.state), mock.patch.dict(os.environ, env, clear=True):
+            return gw._reenroll_identity()
+
+    def plant(self, tiers):
+        for path in (self.device, self.channel, self.record):
+            path.unlink(missing_ok=True)
+        for n, (path, key) in enumerate(tiers):
+            value = f"@foreign-{n}:ag2.space"
+            if path == self.record:
+                path.write_text(json.dumps({"agent_id": value}))
+            else:
+                with path.open("a") as fh:
+                    fh.write(f"{key}={value}\n")
+        return "@foreign-0:ag2.space"
+
+    def test_every_file_alias_in_both_candidates_and_the_binding_yield_to_the_pin(self):
+        tiers = [(f, k) for f in (self.device, self.channel) for k in ai.FILE_KEYS] + [(self.record, "agent_id")]
+        unpinned = {k: v for k, v in self.caller.items() if k not in ai.ENV_KEYS}
+        for tier in tiers + [None]:
+            with self.subTest(tier=tier and (tier[0].name, tier[1])):
+                foreign = self.plant([tier] if tier else tiers)
+                self.assertEqual(self.bridge(unpinned), foreign, "the planted tier is live without a pin")
+                self.assertEqual(self.bridge(ai.launch_environ(self.caller, "")), "", "no saved MXID: no identity")
+                self.assertEqual(self.bridge(ai.launch_environ(self.caller, self.SAVED)), self.SAVED)
+
+    def test_a_pin_reads_agent_mxid_alone_and_replaces_every_identity_variable(self):
+        env = ai.launch_environ({**self.caller, ai.PINNED_KEY: ""}, "")
+        self.assertEqual(env, {"AG2_DEVICE_ENV": str(self.device), "CLAUDE_CONFIG_DIR": self.caller["CLAUDE_CONFIG_DIR"],
+                               ai.PINNED_KEY: "1"})
+        self.assertIn("AGENT_ID", self.caller, "the caller's mapping is not changed")
+        self.assertEqual(ai.launch_environ({}, self.SAVED), {ai.PINNED_KEY: "1", "AGENT_MXID": self.SAVED})
+        self.assertEqual(ai.pinned_environ(""), {ai.PINNED_KEY: "1"})
+        self.assertEqual(ai.resolve(None, {"AGENT_MXID": "@f:x"}.get, {ai.PINNED_KEY: "1", "AGENT_ID": "@a:x"}), "")
+
+
 class Dirs(unittest.TestCase):
     def tearDown(self):
         _dirs._injected = None

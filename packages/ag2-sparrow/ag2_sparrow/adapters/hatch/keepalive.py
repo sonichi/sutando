@@ -209,16 +209,11 @@ def _spawn_sparrow(cfg: dict) -> "tuple[bool, str]":
     exe = _cli._find_console_script(_cli.SPARROW_COMMAND)
     if not exe:
         return False, f"{_cli.SPARROW_COMMAND} not found beside {sys.executable} or on PATH"
-    env = dict(os.environ, AG2_DEVICE_ENV=str(_cli.device_env_path()),
-               REMOTE_HEALTH_COMMAND=health_command(_command(cfg)))
-    # The bridge resolves its identity from the process env first: only the saved one may be there.
-    for key in agent_identity.ENV_KEYS:
-        env.pop(key, None)
     mxid = _cli.saved_mxid(cfg.get("AGENT_MXID"))
-    if mxid:
-        env["AGENT_MXID"] = mxid
-    else:
+    if not mxid:
         print(_cli.NO_SAVED_MXID, file=sys.stderr)
+    env = agent_identity.launch_environ(os.environ, mxid)
+    env.update(AG2_DEVICE_ENV=str(_cli.device_env_path()), REMOTE_HEALTH_COMMAND=health_command(_command(cfg)))
     for key, var in (("TASK_DIR", "AGENT_CONNECT_TASK_DIR"),
                      ("RESULT_DIR", "AGENT_CONNECT_RESULT_DIR"),
                      ("STATE_DIR", "AGENT_CONNECT_STATE_DIR")):
