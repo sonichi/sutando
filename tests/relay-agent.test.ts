@@ -1036,7 +1036,7 @@ describe('every status answer comes from the one table', () => {
 		assert.match(describeVoiceTasks([row('PR 5329', 'started')]), /^Pending: 1 the core is still working on\./);
 		assert.match(describeVoiceTasks(rows), /1 ended with nothing to say \("cleared \[no-send\]"\)/);
 		const tool = src('voice-agent.ts').split("name: 'get_task_status'")[1].split('};')[0];
-		assert.ok(tool.includes('voiceTaskCounts(rows, voiceTaskResultText)') && tool.includes('pendingTasks: counts.pending') && !tool.includes('openTasks'), 'the tool reports the table\'s count, finished ones only with a readable result');
+		assert.ok(tool.includes('voiceTaskReport(rows, sending, voiceTaskResultText)') && tool.includes('pendingTasks: counts.pending') && tool.includes('description: report.description') && !tool.includes('openTasks'), 'the tool reports the table\'s count and requests still being sent, finished ones only with a readable result');
 	});
 
 	it('resultsNotYetTold lists a finished, unheard result with its text; spoken, empty and retired rows are left out', async () => {

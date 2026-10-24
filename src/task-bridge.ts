@@ -657,7 +657,9 @@ export function notPickedStillTrue(taskId: string): boolean {
  * what the user heard, and hand over whatever is still owed. Called while the session can speak.
  */
 export function reconcileVoiceTasks(deliver: RelayDeliver, isInFlight: (taskId: string) => boolean, now = Date.now()): void {
-	for (const [id, row] of voiceTaskStore.list()) {
+	for (const [id, listed] of voiceTaskStore.list()) {
+		// Read fresh: handing over a result earlier in this pass may have settled this task (they share the result).
+		const row = voiceTaskStore.get(id) ?? listed;
 		if (row.submittedAt === undefined || now - row.submittedAt > STATUS_WINDOW_MS) continue;
 		// A result still in results/ is the watcher's to deliver first.
 		// An offline DM copy still in results/ is on its way (a bridge takes it, or the drain speaks it on reconnect).
@@ -1303,6 +1305,8 @@ export const workTool: ToolDefinition = {
 		// default was producing unwanted DMs). Caller must explicitly pass
 		// dm_on_timeout: true on critical tasks where they want the fallback.
 		_pendingTasks.set(taskId, pendingEntry());
+		// No await from here to the return: the relay agent lists this request as being sent until the submit
+		// returns, so a status answer in between would count it twice (its row and its call).
 		voiceTaskStore.add(taskId, task, undefined, lane);
 		// Record owner activity for status-aware-pivot in proactive loop
 		writeOwnerActivity('voice', task);

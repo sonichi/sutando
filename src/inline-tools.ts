@@ -16,14 +16,13 @@
 
 import { execFileSync } from 'node:child_process';
 import { writeFileSync, unlinkSync, readdirSync, readFileSync, existsSync, statSync, mkdirSync } from 'node:fs';
-import { join, extname, dirname, delimiter } from 'node:path';
+import { join, dirname, delimiter } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { z } from 'zod';
 import { requirePython } from './python-binary.js';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
 import { resolveWorkspace, statusPath, statusReadPath } from './workspace_default.js';
-import { isMacOS, isWindows, activateWindowsApp, clipboardRead, clipboardWrite, macOSOnlyError, openWithDefault } from './platform.js';
-import { PLAYBACK_PATH } from './tmp-paths.js';
+import { isMacOS, isWindows, activateWindowsApp, clipboardRead, clipboardWrite, macOSOnlyError } from './platform.js';
 import { presenterModeActive } from './presenter-mode.js';
 import { buildVoiceTaskHeader, getVoiceSessionOrigin, _rememberTaskOrigin, voiceTaskState, latestOpenVoiceTask, findVoiceTask, noteVoiceTaskCancelled, voiceTaskStore, isVoiceSubmittedTask, voiceTaskRows, type VoiceTaskRow } from './task-bridge.js';
 
@@ -64,114 +63,9 @@ export { switchVoiceConfigTool } from './voice-config-switch.js';
 import { switchVoiceConfigTool } from './voice-config-switch.js';
 import { setActiveArtifactTool, queryActiveArtifactTool, clearActiveArtifactTool } from './artifact-cache-tools.js';
 
-// --- File-open tool (moved out of recording-tools — generic file open, optionally fullscreen) ---
-
-export const openFileTool: ToolDefinition = {
-	name: 'open_file',
-	description:
-		'Open a file with the OS default handler (macOS: `open`, Windows: ShellExecute). ALWAYS pass an absolute `path` (or one starting with $VAR / ~). ' +
-		'Use for: "open the file", "open that", "can you open it". ' +
-		'If the user says "open the log" or similar, ASK which log they mean (voice-agent, discord-bridge, etc.) — do NOT guess. ' +
-		'Known files: "diagnostic tracker" or "diagnostics" = /tmp/phone-diagnostics-tracker.html, ' +
-		'"voice diagnostics" = /tmp/voice-diagnostics-tracker.html, ' +
-		'"voice context" / "the voice context file" / "the active context" = $SUTANDO_MEMORY_DIR/voice-contexts/<active>.txt where <active> is the trimmed contents of $SUTANDO_MEMORY_DIR/voice-contexts/active (legacy users may have $SUTANDO_PRIVATE_DIR set instead — either expands). Pass it with the env-var expanded by you, or as $SUTANDO_MEMORY_DIR/voice-contexts/<active>.txt — both work. ' +
-		'Pass `app` when the user names a specific app ("open with Sublime Text", "open the SQLite db in TablePlus") OR when recent conversation makes the intended app clear (e.g. user just said "I\'ll review this in VS Code"). Without `app`, the OS picks the default handler for that file type — leave unset when the default is fine. NOTE: the `app` argument is macOS-only; on Windows the file always opens with its default handler. ' +
-		'Pass `fullscreen=true` if the user wants the file opened in fullscreen — macOS sends Cmd+Ctrl+F to whichever app the OS routed the file to. Windows-only ignores this flag.',
-	parameters: z.object({
-		path: z.string().describe('Absolute file path to open.'),
-		app: z.string().optional().describe('Optional app name (e.g. "Sublime Text", "VS Code", "TablePlus") to open the file with. If omitted, macOS uses its default handler for the file type. Set this when the user names an app explicitly OR recent conversation makes the intended app clear; otherwise leave unset.'),
-		fullscreen: z.boolean().optional().describe('If true, send Cmd+Ctrl+F to the default app right after opening — generic native-fullscreen toggle, works for any file type (video, PDF, image, web page).'),
-	}),
-	execution: 'inline',
-	async execute(args) {
-		const { path, app, fullscreen } = args as { path: string; app?: string; fullscreen?: boolean };
-		console.log(`${ts()} [OpenFile] called (path=${path || 'none'}, app=${app || 'default'}, fullscreen=${fullscreen || false})`);
-		try {
-			if (!path) return { error: 'No path provided. Pass an absolute file path. (For the most recent recording, call play_video — it auto-finds the file.)' };
-			// Expand $VAR / ${VAR} env-var references and ~ in the path so Sutando
-			// can pass paths like "$SUTANDO_MEMORY_DIR/voice-contexts/X.txt"
-			// without us hardcoding a fallback root. Track any unset variables so
-			// we can surface them as a clear diagnostic rather than letting the
-			// silently-empty substitution flow through to a generic "file not
-			// found" error below.
-			const unresolvedVars: string[] = [];
-			const filePath = expandHome(path)
-				.replace(/\$\{([A-Z_][A-Z0-9_]*)\}|\$([A-Z_][A-Z0-9_]*)/g, (_, a, b) => {
-					const name = a || b;
-					const val = process.env[name];
-					if (val === undefined) unresolvedVars.push(name);
-					return val || '';
-				});
-			if (unresolvedVars.length > 0) {
-				console.log(`${ts()} [OpenFile] path "${path}" has unset env var(s): ${unresolvedVars.join(', ')}`);
-				return { error: `Unresolved env var(s) in path: ${unresolvedVars.join(', ')}. Set them before calling open_file, or pass a fully-expanded absolute path.` };
-			}
-			if (!existsSync(filePath)) {
-				console.log(`${ts()} [OpenFile] path "${filePath}" does not exist`);
-				return { error: `File not found: ${filePath}. Do not invent paths — use the exact path returned by the tool that produced the file (e.g. record_screen_with_narration returns subtitled_path/narrated_path/recording_path). For the most recent recording without a known path, call play_video instead.` };
-			}
-			// execFileSync — no shell interpolation of caller-controlled filePath
-			// or caller-controlled app name (same CodeQL js/command-line-injection
-			// class as #27). Both are passed as separate argv entries, never spliced
-			// into a shell string.
-			//
-			// Resolution per issue #560:
-			//   1. Explicit `app` arg → `open -a <app> <path>` (macOS)
-			//   2. No `app` → `open <path>` (macOS LaunchServices picks default) / ShellExecute (Windows)
-			// Contextual inference (rule 2 from issue) is the model's job — Gemini
-			// reads the conversation and decides whether to pass `app`. The tool
-			// only honors what it's told.
-			if (isMacOS()) {
-				const openArgs = app ? ['-a', app, filePath] : [filePath];
-				execFileSync('open', openArgs, { timeout: 5_000 });
-			} else {
-				// Windows + Linux: app-specific open isn't portable; defer to default
-				// handler via ShellExecute / xdg-open. Surfaced in the tool description.
-				openWithDefault(filePath);
-			}
-			if (fullscreen && isMacOS()) {
-				// Brief delay so the just-opened app becomes frontmost before
-				// the keystroke lands. Cmd+Ctrl+F is the macOS native-fullscreen
-				// toggle — every app that supports fullscreen handles it (QT
-				// enters Present mode, Preview/Chrome/Pages all enter fullscreen).
-				// No app-specific logic — open_file is generic.
-				await new Promise(r => setTimeout(r, 1500));
-				try {
-					execFileSync('/usr/bin/osascript', ['-e', 'tell application "System Events" to keystroke "f" using {command down, control down}'], { timeout: 3_000 });
-					console.log(`${ts()} [OpenFile] fullscreen keystroke sent (Cmd+Ctrl+F)`);
-				} catch (err) {
-					console.log(`${ts()} [OpenFile] fullscreen keystroke failed (non-fatal): ${err}`);
-				}
-			}
-			const size = statSync(filePath).size;
-			console.log(`${ts()} [OpenFile] opened ${filePath} (${(size / 1024 / 1024).toFixed(1)}MB)`);
-			// If we just opened a video file, write the path to the playback-path
-			// marker so the existing video-control tools (pause_video / replay_video
-			// / etc.) work against the open_file-opened video. Without this, those
-			// tools fall back to findRecording() which only finds phone-call
-			// recordings — so any "pause" / "replay" cue after open_file returns
-			// "No video to play". This makes the existing tool surface QuickTime-
-			// aware, regardless of whether the video came from a phone-call
-			// recording or open_file.
-			const ext = extname(filePath).toLowerCase();
-			if (['.mp4', '.mov', '.webm', '.m4v'].includes(ext)) {
-				try {
-					const fs = await import('node:fs');
-					fs.writeFileSync(PLAYBACK_PATH, filePath);
-					console.log(`${ts()} [OpenFile] wrote playback-path for video-control tools`);
-				} catch {}
-			}
-			return {
-				status: 'opened',
-				path: filePath,
-				size_mb: +(size / 1024 / 1024).toFixed(1),
-				fullscreen: !!fullscreen,
-			};
-		} catch (err) {
-			return { error: `open_file failed: ${err instanceof Error ? err.message : err}` };
-		}
-	},
-};
+// --- File-open tool: its own module, so loading it loads no skill (tests/open-file-relative-path.test.ts) ---
+export { resolveOpenFilePath, openFileTool } from './open-file-tool.js';
+import { openFileTool } from './open-file-tool.js';
 
 // Zoom tools (summon, dismiss, join_zoom) are NOT imported here — they live in
 // the manifest-loaded skill `skills/zoom/` (manifest.json + tools.ts) and reach
@@ -680,10 +574,16 @@ export const cancelTaskTool: ToolDefinition = {
 
 			// list mode: the user's open voice tasks with where each stands now, no cancel
 			if (list) {
+				// A request still held, checked or being sent is pending too, as get_task_status counts it (17:13:24).
 				const open = voiceTaskRows().filter((r) => r.state === 'queued' || r.state === 'started');
-				console.log(`${ts()} [CancelTask] list: ${open.length} open`);
-				if (open.length === 0) return { status: 'nothing_pending', count: 0, tasks: [] };
-				return { status: 'pending_tasks', count: open.length, tasks: open.map((r) => ({ id: r.id, preview: r.text.slice(0, 60), state: r.state })) };
+				const sending = voiceTasksBeingSent();
+				console.log(`${ts()} [CancelTask] list: ${open.length} open, ${sending.length} being sent`);
+				if (open.length === 0 && sending.length === 0) return { status: 'nothing_pending', count: 0, tasks: [] };
+				const tasks = [
+					...open.map((r) => ({ id: r.id, preview: r.text.slice(0, 60), state: r.state as string })),
+					...sending.map((e) => ({ preview: e.task.slice(0, 60), state: 'being sent' })),
+				];
+				return { status: 'pending_tasks', count: tasks.length, tasks };
 			}
 
 			// Targeting: by exact id, by query, or the latest open voice task.
@@ -844,35 +744,66 @@ export function voiceTaskCounts(rows: VoiceTaskRow[], readText?: (id: string) =>
 	return { pending: working, working, doneNotHeard, unknown };
 }
 
+/** A request the relay agent accepted that has no row yet: held for the user, in the work check, or being submitted. */
+export interface VoiceTaskSending { task: string; stage: string }
+
+// The relay agent's in-flight list (RelayAgent.inFlightRequests), set by the voice agent once it exists.
+let tasksBeingSent: () => VoiceTaskSending[] = () => [];
+export function setVoiceTasksBeingSent(source: () => VoiceTaskSending[]): void { tasksBeingSent = source; }
+export function voiceTasksBeingSent(): VoiceTaskSending[] { return tasksBeingSent(); }
+
+/**
+ * The count and the sentence every status answer gives (get_task_status, get_core_status, /voice-tasks), so there
+ * is one number. A request still being sent is pending: it has no row until its submit returns (nbe2e 2026-10-21
+ * 17:13:24: "pending 0" while the video request was held for the user and then in the check).
+ */
+export function voiceTaskReport(rows: VoiceTaskRow[], sending: readonly VoiceTaskSending[] = [], readText?: (id: string) => string | null): {
+	counts: { pending: number; working: number; sending: number; doneNotHeard: number; unknown: number };
+	description: string;
+} {
+	const c = voiceTaskCounts(rows, readText);
+	const counts = { pending: c.working + sending.length, working: c.working, sending: sending.length, doneNotHeard: c.doneNotHeard, unknown: c.unknown };
+	return { counts, description: describeTasks(rows, sending, counts) };
+}
+
 /**
  * The relay agent's table as the user can see it live: `state/voice-task-status.json`, written by the
  * voice agent whenever it changes and served by the web client at /voice-tasks. Same rows, same counts
  * as get_task_status, so there is one number.
  */
-export function voiceTaskStatusSnapshot(rows: VoiceTaskRow[], now = Date.now()): {
-	at: number; pending: number; working: number; doneNotHeard: number;
+export function voiceTaskStatusSnapshot(rows: VoiceTaskRow[], now = Date.now(), sending: readonly VoiceTaskSending[] = []): {
+	at: number; pending: number; working: number; sending: number; doneNotHeard: number; unknown: number;
+	beingSent: VoiceTaskSending[];
 	tasks: Array<{ id: string; text: string; submittedAt: number; state: string; delivery: string | null; heard: boolean; retired: boolean; pending: boolean }>;
 } {
-	const c = voiceTaskCounts(rows);
+	const c = voiceTaskReport(rows, sending).counts;
 	const tasks = [...rows].sort((a, b) => b.submittedAt - a.submittedAt).map((r) => {
 		const heard = heardByUser(r);
 		const live = r.state !== 'cancelled' && !r.retired;
 		return { id: r.id, text: r.text, submittedAt: r.submittedAt, state: r.state, delivery: r.delivery ?? null, heard, retired: !!r.retired, pending: live && (r.state === 'queued' || r.state === 'started') };
 	});
-	return { at: now, ...c, tasks };
+	return { at: now, ...c, beingSent: sending.map((e) => ({ task: e.task, stage: e.stage })), tasks };
 }
 
-/** The user's voice tasks in one sentence for the model, grouped by where each stands now. */
-export function describeVoiceTasks(rows: VoiceTaskRow[]): string {
-	if (rows.length === 0) return 'The user has asked for no tasks by voice in the last few hours.';
+/** The user's voice tasks in one sentence for the model, grouped by where each stands now: voiceTaskReport's sentence. */
+export function describeVoiceTasks(rows: VoiceTaskRow[], sending: readonly VoiceTaskSending[] = []): string {
+	return voiceTaskReport(rows, sending).description;
+}
+
+function describeTasks(rows: VoiceTaskRow[], sending: readonly VoiceTaskSending[], c: ReturnType<typeof voiceTaskReport>['counts']): string {
+	// Nothing asked for only when nothing is being sent either: at 17:13:24 the table was empty and one request was held.
+	if (rows.length === 0 && sending.length === 0) return 'The user has asked for no tasks by voice in the last few hours.';
 	const group = (label: string, pick: (r: VoiceTaskRow) => boolean) => {
 		const hit = rows.filter(pick);
 		return hit.length ? `${hit.length} ${label} (${hit.map((r) => `"${r.text.slice(0, 40)}"`).join(', ')})` : '';
 	};
 	const heard = heardByUser;
-	const c = voiceTaskCounts(rows);
-	const headline = `Pending: ${c.pending} the core is still working on${c.doneNotHeard ? `; ${c.doneNotHeard} finished and not yet told to the user (say those first, they are not pending)` : ''}${c.unknown ? `; ${c.unknown} in an unknown state` : ''}. `;
+	const pending = c.sending
+		? `${c.pending} (${[c.working ? `${c.working} the core is still working on` : '', `${c.sending} being sent to the core`].filter(Boolean).join(', ')})`
+		: `${c.pending} the core is still working on`;
+	const headline = `Pending: ${pending}${c.doneNotHeard ? `; ${c.doneNotHeard} finished and not yet told to the user (say those first, they are not pending)` : ''}${c.unknown ? `; ${c.unknown} in an unknown state` : ''}. `;
 	const parts = [
+		sending.length ? `${sending.length} being sent to the core (${sending.map((e) => `"${e.task.slice(0, 40)}"`).join(', ')})` : '',
 		group('the core is working on', (r) => r.state === 'started' && !r.retired),
 		group('queued at the core', (r) => r.state === 'queued' && !r.retired),
 		group('cancelled', (r) => r.state === 'cancelled'),
@@ -906,7 +837,7 @@ export const getCoreStatusTool: ToolDefinition = {
 			// The user's own tasks come from the relay agent's table; the core's queue depth also counts
 			// other channels' tasks, cancel instructions and health checks, so it is not quoted to the user.
 			const rows = voiceTaskRows();
-			const queueNote = ` ${describeVoiceTasks(rows)}`;
+			const queueNote = ` ${voiceTaskReport(rows, voiceTasksBeingSent()).description}`;
 			const yourTasks = rows.map((r) => ({ id: r.id, task: r.text.slice(0, 60), state: r.state, heard: heardByUser(r) }));
 			if (!existsSync(corePath)) {
 				return { status: 'idle', yourTasks, description: 'Core agent is not currently running.' + queueNote };
