@@ -738,6 +738,17 @@ class AgentEndpoint(Base):
             self.assertEqual(out.getvalue(), f"WILL NOT START: {named}: unreadable (PermissionError)\n")
             self.assertEqual(err.getvalue(), "")
 
+    def test_preflight_with_nothing_declared_passes_silently(self):
+        agents = self.ws / "agents"
+        shutil.rmtree(agents, ignore_errors=True)
+        for setup in (lambda: None, lambda: agents.write_text("not a dir"),
+                      lambda: (agents.unlink(), (agents / "stray.bridge").mkdir(parents=True))):
+            setup()
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(bridge.main(["--preflight"], workspace=self.ws, get_key=vault()), 0)
+            self.assertEqual(out.getvalue(), "")
+
     def test_the_supervisor_and_the_owner_share_one_declaration_cap(self):
         self.assertEqual(bridge.MAX_DECLARATION_BYTES, _sources.MAX_DECLARATION_BYTES)
         self.assertEqual(_sources.MAX_DECLARATION_BYTES, 64 * 1024)
