@@ -1,7 +1,7 @@
 """Record the core and configured model at launch for agent profile cards.
 
-This is launch configuration, not a claim about per-turn model overrides.
-Missing model configuration is left unknown rather than guessing a model.
+This is launch configuration; the gateway prefers a later accepted switch
+(`state/model-switch.json`). Missing configuration is left unknown, never guessed.
 """
 from __future__ import annotations
 
@@ -11,6 +11,9 @@ from pathlib import Path
 import sys
 import time
 from typing import Optional
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from workspace_default import write_status  # noqa: E402
 
 
 def configured_model(runtime: str) -> Optional[str]:
@@ -41,20 +44,13 @@ def configured_model(runtime: str) -> Optional[str]:
         return None
 
 
-def record(workspace: Path, runtime: str, session: str) -> None:
-    target = workspace / "state" / "core-runtime.json"
-    target.parent.mkdir(parents=True, exist_ok=True)
-    staging = target.with_suffix(f".tmp.{os.getpid()}")
-    try:
-        staging.write_text(json.dumps({
-            "runtime": runtime,
-            "model": configured_model(runtime),
-            "session": session,
-            "started_at": int(time.time()),
-        }))
-        staging.replace(target)
-    finally:
-        staging.unlink(missing_ok=True)
+def record(workspace: Path, runtime: str, session: str) -> Path:
+    return write_status("core-runtime.json", {
+        "runtime": runtime,
+        "model": configured_model(runtime),
+        "session": session,
+        "started_at": int(time.time()),
+    }, workspace)
 
 
 if __name__ == "__main__":

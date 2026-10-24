@@ -58,6 +58,7 @@ from __future__ import annotations
 import atexit
 import glob
 import base64
+import calendar
 import contextlib
 import hashlib
 import http.client
@@ -3569,14 +3570,47 @@ def _reported_core_status(core_health: "dict | None" = None) -> tuple[str | None
     return status, step
 
 
+_MODEL_ALIASES = frozenset({"default", "opus", "sonnet", "haiku", "fable"})
+_MODEL_ID = re.compile(r"(?:claude|gpt|o[1-9]|codex|gemini)(?:-[a-z0-9.]+){0,8}")
+_MODEL_FAMILY = re.compile(r"claude|gpt|codex|gemini")
+
+
+def _public_model(value) -> str | None:
+    """A model string safe to publish: a plain id or CLI alias, else only its vendor
+    family. Bedrock/Vertex ids and proxy names can carry account, project or host names."""
+    value = _core_str(value)
+    if value is None:
+        return None
+    low = value.lower()
+    base = low[:-4] if low.endswith("[1m]") else low
+    if len(base) <= 64 and (base in _MODEL_ALIASES or _MODEL_ID.fullmatch(base)):
+        return low
+    family = _MODEL_FAMILY.search(low)
+    return family.group(0) if family else None
+
+
+def _switched_model(started_at) -> str | None:
+    """The model an accepted switch recorded after this core launched, if any."""
+    if type(started_at) is not int:
+        return None
+    try:
+        record = json.loads((_STATE / "model-switch.json").read_text())
+        if not isinstance(record, dict) or record.get("accepted") is not True:
+            return None
+        switched_at = calendar.timegm(time.strptime(record.get("ts"), "%Y-%m-%dT%H:%M:%SZ"))
+    except (OSError, ValueError, TypeError):
+        return None
+    return record.get("model") if switched_at >= started_at else None
+
+
 def _read_core_metadata() -> dict:
     """Optional launcher-authored metadata; malformed state never blocks polling."""
     try:
         data = json.loads((_STATE / "core-runtime.json").read_text())
         if not isinstance(data, dict):
             return {}
-        return {"core": _core_str(data.get("runtime")),
-                "model": _core_str(data.get("model"))}
+        model = _switched_model(data.get("started_at")) or data.get("model")
+        return {"core": _core_str(data.get("runtime")), "model": _public_model(model)}
     except (OSError, ValueError):
         return {}
 

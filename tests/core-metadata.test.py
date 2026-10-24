@@ -27,6 +27,8 @@ class CoreMetadataTest(unittest.TestCase):
             record = json.loads((root / 'state/core-runtime.json').read_text())
             self.assertEqual(record['runtime'], 'codex')
             self.assertEqual(record['model'], 'override')
+            self.assertEqual(record['session'], 'sutando-core')
+            self.assertFalse(list((root / 'state').glob('*.tmp')), 'staging file left behind')
             os.environ['SUTANDO_CORE_MODEL'] = ''
             (root / 'settings.json').write_text('[]')
             self.assertIsNone(metadata.configured_model('claude'))
