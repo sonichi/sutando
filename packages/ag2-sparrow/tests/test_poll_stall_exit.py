@@ -14,6 +14,12 @@ import sys
 import pathlib
 
 
+sys.path.append(str(pathlib.Path(__file__).resolve().parents[3] / "tests"))
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+isolate_os_environ()
+
+
 def _load(tmp):
     os.environ["AGENT_CONNECT_STATE_DIR"] = str(tmp)
     os.environ.setdefault("REMOTE_TASK_URL", "https://gw.example/relay")
