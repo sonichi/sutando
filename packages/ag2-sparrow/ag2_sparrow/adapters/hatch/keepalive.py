@@ -37,12 +37,16 @@ STALE_S = 2 * INTERVAL_MIN * 60
 NOT_RUNNING = "keepawake-not-running"
 HOOK_NOT_RUNNING, HOOK_STALE_S = "hook-not-running", 5 * 60
 TASK_NOT_PICKED_UP, TASK_PICKUP_S = "task-not-picked-up", 15 * 60
+UPGRADE_FAILED = "upgrade-failed"
 NO_HEALTH_COMMAND, UNKNOWN_ENV = "no-health-command", "unknown-env"
 REASON_HINTS = {
     HOOK_NOT_RUNNING: f"the hook has not run in the last {HOOK_STALE_S // 60} minutes; see "
                       "the hook run line above",
     TASK_NOT_PICKED_UP: f"an AG2 Space task has been open over {TASK_PICKUP_S // 60} minutes: "
                         "the hook is not waking a worker for it, or a worker handed it off",
+    UPGRADE_FAILED: "an automatic ag2-sparrow upgrade failed; its outcome and the version "
+                    "installed now are in hatch-upgrade.json and hatch-upgrade.log in the "
+                    "state dir",
 }
 RUN_TIMEOUT_S = 120
 GAP_MINUTES = 16
@@ -385,13 +389,83 @@ def _unit_state_unknown(cfg: dict, holder: "int | None", why: str) -> int:
     return 1
 
 
+def resolve_sparrow(cfg: dict) -> "tuple[str | None, int | None, bool]":
+    """(owner, holder, fresh): the unit's owner (_unit_owner), the pid in Sparrow's lock
+    record that is still alive, heartbeat fresh or not, and whether that heartbeat is
+    fresh. One reading for install, keepawake and the upgrader."""
+    record = _cli._lock_record(_state_dir(cfg), _instance(cfg))
+    pid = (record or {}).get("pid")
+    alive = (isinstance(pid, int) and not isinstance(pid, bool) and pid > 0
+             and not _cli.process_gone(pid))
+    holder = pid if alive else None
+    return _unit_owner(), holder, holder is not None and _cli.live_lock_holder(record) == holder
+
+
+def _wait_gone(pid: int) -> bool:
+    deadline = time.monotonic() + STOP_WAIT_S
+    while not _cli.process_gone(pid):
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.2)
+    return True
+
+
+def quiesce_sparrow(cfg: dict) -> "tuple[bool, str, str | None]":
+    """Stop the Sparrow this install owns and prove it gone: (quiet, how, manager), where
+    the manager ("unit" or "detached") is what starts it again. Refused, with nothing
+    touched and no manager: a hand-made unit, one whose user manager did not answer, and
+    a lock holder beside our unit not proven to be Sparrow. For our unit the unit is
+    stopped and its process, and any Sparrow outside it, must be gone; with no unit the
+    lock holder is stopped (SIGTERM, then wait), a stale heartbeat notwithstanding, but
+    only once proven to run Sparrow's command line: a reused pid is never signalled."""
+    owner, holder, _ = resolve_sparrow(cfg)
+    unit = _cli.service_path()
+    if owner == UNIT_UNREACHABLE:
+        return False, f"{unit} is installed but systemctl --user did not answer", None
+    if owner == "other":
+        return False, f"{unit} was not written by install, so its Sparrow is left alone", None
+    if owner == "ours":
+        props = _cli._unit_props()
+        if props is None:
+            return False, f"systemctl --user show {_cli.SERVICE_NAME} did not give a well-formed state", None
+        main_pid = props["MainPID"]
+        outside = holder if holder is not None and holder != main_pid else None
+        if outside is not None and not is_sparrow_pid(outside):
+            return False, (f"pid {outside} holds Sparrow's lock beside {_cli.SERVICE_NAME} but "
+                           "is not proven to be Sparrow"), None
+        r = _cli._systemctl(("--user", "stop", "ag2-sparrow.service"))
+        how = f"systemctl --user stop {_cli.SERVICE_NAME}"
+        if not _cli._ok(r):
+            return False, f"{how} failed ({_cli._why(r)})", "unit"
+        if main_pid and not _wait_gone(main_pid):
+            return False, f"{how}, but its Sparrow (pid {main_pid}) is still running", "unit"
+        if outside is not None:
+            if not _stop(outside):
+                return False, f"the Sparrow outside {_cli.SERVICE_NAME} (pid {outside}) did not stop", "unit"
+            how += f"; stopped the Sparrow outside it (pid {outside})"
+        manager = "unit"
+    elif holder is None:
+        how, manager = "Sparrow was not running", "detached"
+    elif not is_sparrow_pid(holder):
+        return False, (f"pid {holder} holds Sparrow's lock but is not proven to be Sparrow; "
+                       "nothing was signalled"), None
+    elif not _stop(holder):
+        return False, f"Sparrow (pid {holder}) did not stop", "detached"
+    else:
+        how, manager = f"stopped Sparrow (pid {holder})", "detached"
+    _, left, _ = resolve_sparrow(cfg)
+    if left is not None:
+        return False, f"{how}, but pid {left} still holds Sparrow's lock", manager
+    return True, how, manager
+
+
 def ensure_sparrow(cfg: dict, health: bool) -> int:
     """Leave a Sparrow running and connected: start one if none runs, replace one outside
     the installed service, or (with `health`) one that lacks REMOTE_HEALTH_COMMAND."""
     state, instance = _state_dir(cfg), _instance(cfg)
     started = time.time()
-    holder = _cli.live_lock_holder(_cli._lock_record(state, instance))
-    owner = _unit_owner()
+    owner, holder, fresh = resolve_sparrow(cfg)
+    holder = holder if fresh else None
     if owner == UNIT_UNREACHABLE:
         return _unit_state_unknown(cfg, holder, "systemctl --user did not answer")
     if owner == "other":
@@ -473,7 +547,37 @@ def _await_connected(state: Path, instance: str, since: "float | None") -> int:
 
 
 def keepawake(cfg: dict, log: Path, now: float | None = None) -> int:
+    from . import self_upgrade
     now = time.time() if now is None else now
+    settled, blocked = None, None
+    # Held across the probe and the restart, so an upgrade cannot start in between.
+    with self_upgrade.upgrade_lock(_state_dir(cfg)) as free:
+        if free:
+            # A dead upgrade is settled first: a restart must never run its unverified target.
+            settled, blocked = _settle_upgrade(cfg, now)
+        if free and not blocked:
+            up, restarted, rc, reason = _keep_listener(cfg, now)
+        else:
+            up, restarted, rc, reason = listener_up(cfg, now), 0, 0, None
+    if not free:
+        print("an upgrade is running; Sparrow is left as it is")
+    elif blocked:
+        rc, reason = 1, UPGRADE_FAILED
+        print(f"error: Sparrow is not restarted: {blocked}; run ag2-sparrow-hatch install to "
+              "put a verified version back", file=sys.stderr)
+    upgrade = _served_setup(cfg, settled) if free else "running"
+    line = f"{_utc(now)} keepawake listener={'up' if up else 'down'} restarted={restarted}" \
+        + (f" reason={reason}" if reason else "") + (f" upgrade={upgrade}" if upgrade else "")
+    log.parent.mkdir(parents=True, exist_ok=True)
+    with log.open("a", encoding="utf-8") as fh:
+        fh.write(line + "\n")
+    print(line)
+    return rc
+
+
+def _keep_listener(cfg: dict, now: float) -> "tuple[bool, int, int, str | None]":
+    """Restart Sparrow if it is down, or replace one without the health command:
+    (up, restarted, rc, reason)."""
     up, restarted, rc, reason = listener_up(cfg, now), 0, 0, None
     if not up:
         ok, how = restart_listener(cfg)
@@ -493,23 +597,31 @@ def keepawake(cfg: dict, log: Path, now: float | None = None) -> int:
             else:
                 print(f"the replace failed: {how}", file=sys.stderr)
                 rc = 1
-    _refresh_setup(cfg)
-    line = f"{_utc(now)} keepawake listener={'up' if up else 'down'} restarted={restarted}" \
-        + (f" reason={reason}" if reason else "")
-    log.parent.mkdir(parents=True, exist_ok=True)
-    with log.open("a", encoding="utf-8") as fh:
-        fh.write(line + "\n")
-    print(line)
-    return rc
+    return up, restarted, rc, reason
 
 
-def _refresh_setup(cfg: dict) -> None:
-    """Refresh the served setup cache; never fails the run."""
-    from . import runtime_text
+def _settle_upgrade(cfg: dict, now: float) -> "tuple[str | None, str | None]":
+    """Settle a dead upgrade attempt, with the upgrade lock held: (verdict, why Sparrow must
+    not be started). A settlement that raises blocks too; never fails the run."""
+    from . import self_upgrade
     try:
-        runtime_text.refresh_cache(_state_dir(cfg), _instance(cfg))
+        settled = self_upgrade.settle_attempt(cfg, _state_dir(cfg), now)
+    except Exception as e:  # noqa: BLE001 - keepawake's own job must still be logged
+        print(f"NOTE upgrade: {diagnostics.describe(e)}", file=sys.stderr)
+        return None, f"the upgrade attempt could not be settled ({type(e).__name__})"
+    return settled, self_upgrade.recovery_blocked(_state_dir(cfg))
+
+
+def _served_setup(cfg: dict, settled: "str | None" = None) -> "str | None":
+    """Refresh the served setup and decide on the upgrade it calls for; never fails the run.
+    `settled` is this run's verdict on a dead attempt, which is the line's decision."""
+    from . import runtime_text, self_upgrade
+    try:
+        setup = runtime_text.refresh_cache(_state_dir(cfg), _instance(cfg))
+        return settled or self_upgrade.maybe_start(cfg, setup)
     except Exception as e:  # noqa: BLE001 - keepawake's own job must still be logged
         print(f"NOTE served setup: {diagnostics.describe(e)}", file=sys.stderr)
+        return settled
 
 
 def last_keepawake(log: Path) -> float | None:
@@ -567,7 +679,7 @@ def oldest_open_task(cfg: dict) -> "float | None":
 def health_row(cfg: dict, log: Path, now: float | None = None) -> dict | None:
     """The core row for Sparrow's heartbeat; None while no keepawake task is installed.
     `alive` also counts the hook's activity marker."""
-    from . import runtime_text
+    from . import runtime_text, self_upgrade
     now = time.time() if now is None else now
     tasks = _found(cron_dir(cfg), TASK)
     if not tasks:
@@ -590,6 +702,9 @@ def health_row(cfg: dict, log: Path, now: float | None = None) -> dict | None:
     oldest = oldest_open_task(cfg)
     if oldest is not None and now - oldest > tune["stuck_task_age_s"]:
         problems.append((TASK_NOT_PICKED_UP, oldest + tune["stuck_task_age_s"]))
+    failed = self_upgrade.failed_since(_state_dir(cfg))
+    if failed is not None:
+        problems.append((UPGRADE_FAILED, failed))
     # Fresh but never run: no evidence either way yet.
     condition = "abnormal" if problems else "healthy" if ran is not None else "unknown"
     reason, since = problems[0] if problems else (None, None)
