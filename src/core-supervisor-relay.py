@@ -123,7 +123,7 @@ def _is_refused_limit(signal: dict) -> bool:
             and bool(_REFUSED_LIMIT.search(signal.get("prompt") or "")))
 
 
-_RESET_AT = re.compile(r"resets?\s+(?:at\s+)?(\d{1,2}(?::\d{2})?\s*[ap]m)", re.I)
+_RESET_AT = re.compile(r"resets?\s+(?:at\s+)?((?:[A-Z][a-z]{2}\s+\d{1,2}\s+at\s+)?\d{1,2}(?::\d{2})?\s*[ap]m)", re.I)
 
 
 def _limit_remedy(signal: dict) -> str:
@@ -243,7 +243,7 @@ def compose_message(signal: dict, surface: str = "") -> str:
     if kind == "turn-rejected":
         msg += (" — the core sits at its idle prompt but refuses every turn it is sent; each"
                 " ends in that line, so nothing queued for it runs")
-    if kind == "session-limit" or _is_refused_limit(signal):
+    if kind in ("session-limit", "usage-limit") or _is_refused_limit(signal):
         msg += _limit_remedy(signal)
     elif signal.get("kind") == "fable-limit-unfocused":
         msg += (" — Claude Code's Fable weekly-limit dialog is up but the focused option is"

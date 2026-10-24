@@ -278,6 +278,15 @@ class TestComposeMessage(unittest.TestCase):
         self.assertIn("when the limit window resets", m)
         self.assertNotIn("/login", m)
 
+    def test_usage_limit_banner_names_the_reset_date_not_login(self):
+        sig = {"state": "blocked-human", "detail": "awaiting user: usage-limit", "kind": "usage-limit",
+               "prompt": "⚠ Usage limit reached · limit resets Oct 13 at 11pm\n"
+                         "Continuing automatically at Oct 13 at 11pm · esc to cancel"}
+        self.assertTrue(should_escalate(sig, None)[0])
+        m = compose_message(sig)
+        self.assertIn("resumes on its own at Oct 13 at 11pm", m)
+        self.assertNotIn("/login", m)
+
     def test_turn_rejected_escalates(self):
         self.assertTrue(should_escalate(_REFUSED, None)[0])
 

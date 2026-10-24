@@ -49,7 +49,7 @@ GATEWAY_STALE_S = 180.0
 
 # Pane-derived claims a later completed model request disproves; every other reason stands.
 PANE_SUPERSEDABLE = frozenset({"needs-login", "login", "quota-limit", "out-of-credits", "session-limit",
-                               "api-error", "network-error"})
+                               "usage-limit", "api-error", "network-error"})
 
 # Observation phases with no model request in flight.
 RETRY_DISPROVING_PHASES = frozenset({"idle", "waiting", "failed"})

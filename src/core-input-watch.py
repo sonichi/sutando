@@ -120,14 +120,17 @@ def _load_runtime_health():
 # with the caret on its "Switch to <fallback> and continue" row.
 from delivery.pane_gate import (  # noqa: E402
     ADAPTERS, AWAIT_HINT, BORDER_LINE, CLAUDE, CLAUDE_GATE_SIGNATURES, CLAUDE_IDLE,
-    COMPOSER_PLACEHOLDER, FABLE_TEXT, SGR_STRIP as _ANSI_SGR, TURN_DONE,
+    COMPOSER_PLACEHOLDER, FABLE_TEXT, SGR_STRIP as _ANSI_SGR, TURN_DONE, TURN_SHORT,
     classify_pane as _pg_classify_pane, composer_text as _pg_composer_text, gate_evidence,
-    live_tail, prompt_line as _pg_prompt_line,
+    limit_banner, limit_baseline, limit_is_stale, live_tail, prompt_line as _pg_prompt_line,
+    refusal_line, strip_limit_banners,
 )
 
 _FABLE_TEXT = FABLE_TEXT
 #: Lines allowed between the nearest Fable text and the focused switch row (body may wrap).
 _FABLE_CARET_GAP = 3
+#: Lines allowed between "hit your session limit" and the "Continuing automatically" under it.
+_LIMIT_WAIT_GAP = 4
 
 # ---- ESCALATE-detection: interactive-prompt signatures. First match classifies.
 # Specific so the idle "❯ " prompt (ready for a task) is NEVER flagged. This is
@@ -141,21 +144,10 @@ _IDLE = CLAUDE_IDLE
 #: A pane-border/rule row (box-drawing chars only) -- never legitimate composer text.
 _BORDER_LINE = BORDER_LINE
 
-# A turn the CLI refuses outright is a FINISHED turn: the reason is its `⎿` result and the
-# pane returns to the idle footer, so no gate is on screen. Explicit list, extended by hand.
-_REFUSAL = re.compile(
-    r"out of usage credits|/usage-credits|hit your (?:session|usage|weekly) limit"
-    # A bare "not logged in" is a refusal only as the CLI's own line-start `⎿` row.
-    r"|^⎿?\s*(?:you(?:'re| are) )?not logged in\b", re.I)
-
-
-def _refusal_line(line: str) -> bool:
-    """A limit refusal, or the CLI's needs-login line (cli_wedge's one grammar)."""
-    return bool(_REFUSAL.search(line)) or cli_wedge.needs_login_line(line)
-
+_refusal_line = refusal_line
 
 _TURN_DONE = TURN_DONE
-_TURN_SHORT = re.compile(r"[01]s")
+_TURN_SHORT = TURN_SHORT
 _PROMPT_LINE = re.compile(r"^\s*❯")
 # The CLI's hint in an EMPTY composer (`❯ Try "refactor <filepath>"`); it vanishes
 # on the first typed character, so it is never a draft. Plain capture loses its dimming.
@@ -170,7 +162,7 @@ _TURN_WINDOW = 40
 # Gates that need a human (can't be auto-answered): login + any unrecognized
 # selection/permission. The rest (trust/bypass/press-enter) are known-safe.
 # session-limit is a spend/wait decision: never auto-answered, never a login.
-_HUMAN_GATES = {"login", "selection", "permission", "session-limit", "fable-limit-unfocused",
+_HUMAN_GATES = {"login", "selection", "permission", "session-limit", "usage-limit", "fable-limit-unfocused",
                 "turn-rejected", "unknown"}
 
 # --- M4 AUTO-ANSWER (Layer 2): the safe key per gate; `answer_step` in the loop sends it
@@ -248,6 +240,11 @@ def classify(pane: str, styled_pane: "str | None" = None):
             for m in [max(rx.finditer(tail), key=lambda m: m.start(), default=None)] if m]
     if hits:
         start, _, kind = max(hits, key=lambda h: (h[0], -h[1]))
+        # The wait line under "You've hit your session limit" is that screen's, not a new banner.
+        if kind == "usage-limit" and any(
+                k == "session-limit" and tail.count("\n", s, start) <= _LIMIT_WAIT_GAP
+                for s, _, k in hits):
+            kind = "session-limit"
         # A focused switch row is Enter-safe only right under the Fable text (title, body,
         # caret); a resolved Fable dialog higher up must not vouch for some other dialog's row.
         if kind == "fable-limit" and not any(
@@ -396,8 +393,34 @@ _BASE_TO_STATE = {
 }
 
 
+def owes_work(seat, workspace):
+    """Whether the core's own queue holds work: True, False, or None when the queue cannot be
+    read. A worker seat is False here: its queue is the pool's to read, so the pool's
+    supervisor is what pages a banner holding it."""
+    if seat:
+        return False
+    queued = core_gate_notice.queued_count(workspace)
+    return None if queued is None else queued > 0
+
+
+def limit_step(pane, baseline, workspace=None, socket=None, session=None, owes_work=True):
+    """(stale, baseline) for this poll's limit banner. The baseline is taken when a banner
+    first shows, and again when its text changes; the newest turn since then decides.
+    A banner holds nothing on a seat that owes no work (`owes_work` False). An unknown
+    queue (None) holds like an owed one: a count that could not be read is not zero."""
+    abn = limit_banner(pane or "")
+    if abn is None:
+        return False, None
+    current = limit_baseline(pane)
+    if baseline is None or baseline.banner != current.banner:
+        baseline = current
+    if owes_work is False:
+        return True, baseline
+    return limit_is_stale(abn, workspace, socket, session, capture=pane, baseline=baseline), baseline
+
+
 def compose_state(pane, base_health, gateway_alive, process=True, prev_pane=None, runtime=None,
-                   styled_pane: "str | None" = None):
+                  styled_pane: "str | None" = None, limit_stale=False):
     """Refine runtime-health's coarse `base_health` into a supervisor state.
 
     `base_health` ∈ {offline, needs_login, working, idle, unknown} comes from
@@ -411,7 +434,10 @@ def compose_state(pane, base_health, gateway_alive, process=True, prev_pane=None
     `runtime` is the runtime stamped on the core session (see `session_runtime`).
     `styled_pane` is the same capture taken WITH escapes, when the caller has one
     (see `classify()`); omitted it changes nothing else here.
+    `limit_stale` (from `limit_step`) drops a limit banner the seat has outrun.
     """
+    if limit_stale and pane:
+        pane = strip_limit_banners(pane)
     if base_health == "offline":
         return "crashed", _BASE_TO_STATE["offline"][1], None, None
     # An ACTIVE interactive gate in the pane is the finest signal — it distinguishes
@@ -937,6 +963,7 @@ def main():
     idle_ticks = 0
     login_since = None
     prev_pane = None
+    limit_baseline = None
     clock = (None, None, None)
     last_runtime = None  # a failed tmux read keeps the last runtime, not "claude"
     state_dir = os.path.dirname(os.path.abspath(a.out))
@@ -949,11 +976,13 @@ def main():
         base = rh.derive()  # shared: offline|needs_login|working|idle|unknown
         runtime = session_runtime(a.socket, a.session) or last_runtime
         last_runtime = runtime
+        limit_stale, limit_baseline = limit_step(pane, limit_baseline, workspace, a.socket, a.session,
+                                                 owes_work=owes_work(a.seat, workspace))
         state, detail, prompt, kind = compose_state(
             pane or "", base.get("health", "unknown"),
             gateway_alive(a.app_data, os.path.dirname(os.path.abspath(a.out))),
             process=(base.get("signals") or {}).get("process", True), prev_pane=prev_pane,
-            runtime=runtime, styled_pane=styled_pane)
+            runtime=runtime, styled_pane=styled_pane, limit_stale=limit_stale)
         prev_pane = pane
         clock = gate_clock(clock, state, prompt, time.time())
 
@@ -1023,7 +1052,7 @@ def main():
                 drive_escalations(hitl, a.session, prompt, state,
                                   lambda k: send_keys(a.socket, a.session, k))
                 # Only the core's own seat owns tasks/; a worker's queue lives elsewhere.
-                queued = 0 if a.seat else core_gate_notice.queued_count(workspace)
+                queued = 0 if a.seat else (core_gate_notice.queued_count(workspace) or 0)
                 req = escalate(hitl, state, detail, kind, prompt, a.session, seat=a.seat or None,
                                queued=queued, runtime=runtime)
                 if not a.seat:
