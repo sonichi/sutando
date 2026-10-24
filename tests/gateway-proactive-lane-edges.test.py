@@ -1,0 +1,183 @@
+#!/usr/bin/env python3
+"""The proactive lane's edges: the outbox writers it adds, the about-task grammar, and the
+drain's fail paths (an auth refusal, a hand-back that fails, an unreadable task, a stale claim).
+
+Run: python3 tests/gateway-proactive-lane-edges.test.py
+"""
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from _helpers.hermetic_gateway import isolate_then_import
+
+gb, _IMPORT_READS = isolate_then_import(env={"REMOTE_PROACTIVE_ROOM": ""})
+import dataclasses
+import json
+import tempfile
+import urllib.error
+
+from _helpers import proactive_lane as pl
+import outbox as src_outbox
+import proactive_dispatch_gate
+import proactive_routing
+import undelivered_quarantine
+from ag2_sparrow.delivery_core import (DeliveryCore, DesignAClaimBackend, DrainStatus,
+                                       ProviderCapabilities, ProviderPermanentRefused, RetryPolicy)
+from ag2_sparrow.delivery_core.provider_ag2space import AG2SpaceRoomMessageProvider
+
+ISO = pl.scratch("gw-proactive-edges-")
+check = pl.Checks()
+
+
+def outbox_writers() -> None:
+    root = Path(tempfile.mkdtemp(dir=ISO))
+    check(src_outbox.record_provider_ref(root, "absent", "$e") is False, "provider ref: a missing item is refused")
+    backend = DesignAClaimBackend(root)
+    backend.publish("i1", b'{"room_id": "!r:s", "body": "b"}')
+    src_outbox.clear_dispatching(root, "i1")
+    check("dispatching" not in src_outbox.read_item(root, "i1"), "clear with no mark writes nothing")
+    with src_outbox._item_lock(root, "i1"):
+        src_outbox.record_dispatching(root, "i1", "inc-1")
+    with src_outbox._item_lock(root, "i1"):
+        src_outbox.clear_dispatching(root, "i1")
+    check("dispatching" not in src_outbox.read_item(root, "i1"), "a mark is cleared")
+    check(src_outbox.record_provider_ref(root, "i1", "$e", destination="!r:s") is True,
+          "provider ref recorded with its room")
+    src_outbox.record_delivered(root, "i1", provider_ref="$e")
+    d = src_outbox.read_item(root, "i1")
+    check(d.get("status") == "DELIVERED" and d.get("provider_ref") == "$e" and d.get("destination") == "!r:s",
+          f"delivered keeps the ref and room ({d.get('provider_ref')}, {d.get('destination')})")
+    check(src_outbox.record_provider_ref(root, "i1", "$x") is False, "provider ref: a terminal item is refused")
+    backend.publish("i2", b'{"room_id": "!old:s", "body": "b"}')
+    src_outbox.park_item(root, "i2", "room-upgraded")
+    src_outbox.requeue_item_with_epoch(root, "i2", payload='{"room_id": "!new:s", "body": "b"}')
+    check(json.loads(src_outbox.read_item(root, "i2")["payload"])["room_id"] == "!new:s",
+          "a requeue may replace the payload of a send that never left")
+
+
+def grammar() -> None:
+    name = proactive_routing.about_task_filename("task-17", 5, "ag2space")
+    check(name == "proactive-about-task-17--5.to-ag2space.txt" and proactive_routing.about_task(name) == "task-17",
+          f"about-task name round-trips ({name})")
+    try:
+        proactive_routing.about_task_filename("not a task", 5)
+        check(False, "a bad task id is refused")
+    except ValueError:
+        check(True, "a bad task id is refused")
+    check(proactive_routing.about_task("proactive-1.txt") is None, "an ordinary name is about no task")
+    check(undelivered_quarantine.canonical_result(ISO, "proactive-1").name == "proactive-1.txt"
+          and undelivered_quarantine.canonical_result(ISO, "17").name == "task-17.txt",
+          "the quarantine names a proactive stem as itself and a bare id as a task")
+
+
+def gate_unreadable_task() -> None:
+    ws = Path(tempfile.mkdtemp(dir=ISO))
+    (ws / "tasks" / "task-unreadable.txt").mkdir(parents=True)
+    check(proactive_dispatch_gate.dispatch_veto("task-1", ws) is None, "an unreadable task file is skipped")
+
+
+def core_and_provider() -> None:
+    root = Path(tempfile.mkdtemp(dir=ISO))
+    backend = DesignAClaimBackend(root)
+    backend.publish("s1", b"{}")
+    token = backend.claim("s1", "w")
+    check(backend.mark_dispatching(dataclasses.replace(token, incarnation="stale")) is False,
+          "a stale token cannot mark a send")
+
+    class NoMark(DesignAClaimBackend):
+        def mark_dispatching(self, token):
+            return False
+
+    class Provider:
+        capabilities = ProviderCapabilities()
+        calls = 0
+
+        def deliver(self, *a):
+            Provider.calls += 1
+
+        def reconcile(self, attempt):
+            return None
+
+    nm = NoMark(Path(tempfile.mkdtemp(dir=ISO)))
+    nm.publish("s2", b"{}")
+    r = DeliveryCore(nm, Provider(), policy=RetryPolicy(park_interrupted_send=True)).deliver_one("s2", b"{}")
+    check(r.status is DrainStatus.NOT_CLAIMED and Provider.calls == 0, "a send that cannot be marked is not made")
+    sent = []
+    prov = AG2SpaceRoomMessageProvider(lambda *a: sent.append(a) or {"event_id": "$e"}, lambda *a: None)
+    try:
+        prov.deliver("t", b'{"room_id": "!r:s", "body": "b", "thread_root": "x"}', "k")
+        check(False, "a malformed thread root is refused")
+    except ProviderPermanentRefused:
+        check(sent == [], "a malformed thread root is refused before any send")
+    prov.deliver("t", b'{"room_id": "!r:s", "body": "b", "thread_root": "$T"}', "k")
+    check(sent == [("!r:s", "b", "k", "$T")], f"the thread root reaches the sender ({sent})")
+
+
+def bridge_edges() -> None:
+    saved = gb.RESULTS_DIR
+    gb.RESULTS_DIR = Path(tempfile.mkdtemp(dir=ISO))
+    try:
+        gb._delivery_core("proactive")
+        try:
+            gb._record_proactive_receipt("never-published", "$e")
+            check(False, "a receipt for no item raises")
+        except OSError:
+            check(True, "a receipt for no item raises")
+    finally:
+        gb.RESULTS_DIR = saved
+    check(gb._proactive_dispatch_veto("i", b"not json") is None, "an unreadable payload is not withdrawn")
+    lane = pl.Lane(gb, ISO)
+    saved_tasks, gb.TASKS_DIR = gb.TASKS_DIR, lane.tasks
+    try:
+        (lane.tasks / "task-1761300000007.txt").mkdir()
+        check(gb._about_task_headers("task-1761300000007") == {}, "an unreadable task file has no headers")
+        (lane.tasks / "task-1761300000008.txt").write_text("thread_root: $T\ntask: hi\n", encoding="utf-8")
+        check(gb._about_task_headers("task-1761300000008") == {"thread_root": "$T"},
+              "a task-last file is read by the strict parser only")
+    finally:
+        gb.TASKS_DIR = saved_tasks
+
+    def refuse(code):
+        def respond(payload):
+            raise urllib.error.HTTPError("https://gw.example/relay/v1/room", code, "err", {}, None)
+        return respond
+
+    lane = pl.Lane(gb, ISO, refuse(401))
+    lane.write("proactive-auth.txt", "nudge\n")
+    try:
+        lane.drain()
+        check(False, "an auth refusal reaches the poll loop")
+    except urllib.error.HTTPError as e:
+        check(e.code == 401 and lane.where("proactive-auth") == "pending",
+              f"an auth refusal reaches the poll loop and the file waits ({lane.where('proactive-auth')})")
+
+    lane = pl.Lane(gb, ISO, refuse(429))
+    lane.write("proactive-stuck.txt", "nudge\n")
+    real = Path.rename
+
+    def rename(self, target):
+        if ".sending." in self.name and Path(target).name == "proactive-stuck.txt":
+            raise OSError("hand-back refused")
+        return real(self, target)
+    Path.rename = rename
+    try:
+        lane.drain()
+    finally:
+        Path.rename = real
+    check(any("could not be handed back" in m for m in lane.logs), "a failed hand-back is logged loudly")
+
+
+def main() -> int:
+    outbox_writers()
+    grammar()
+    gate_unreadable_task()
+    core_and_provider()
+    bridge_edges()
+    return check.exit_code()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -30,6 +30,7 @@ class Lane:
             d.mkdir(parents=True, exist_ok=True)
         self.posts: list = []
         self.logs: list = []
+        self.owner_dm = OWNER_DM
         self.respond = respond or (lambda payload: {"ok": True, "event_id": f"$evt{len(self.posts)}"})
 
     def _req(self, method, path, payload=None, timeout=None):
@@ -50,9 +51,9 @@ class Lane:
                  getattr(gb, "PROACTIVE_DISPATCH_GATE", None))
         gb.RESULTS_DIR, gb.ARCHIVE_RESULTS_DIR = self.results, self.results / "archive"
         gb.UNDELIVERABLE_RESULTS_DIR, gb.TASKS_DIR = self.results / "undelivered", self.tasks
-        gb.PROACTIVE_ROOM, gb._req, gb.PROACTIVE_CLAIM_GATE = OWNER_DM, self._req, None
+        gb.PROACTIVE_ROOM, gb._req, gb.PROACTIVE_CLAIM_GATE = self.owner_dm, self._req, None
         gb._log, gb.PROACTIVE_DISPATCH_GATE = self.logs.append, gate
-        gb._ROUTING.update(owner_dm=OWNER_DM, loaded=True, next=gb.time.time() + 3600)
+        gb._ROUTING.update(owner_dm=self.owner_dm, loaded=True, next=gb.time.time() + 3600)
         try:
             gb._post_proactive()
         finally:

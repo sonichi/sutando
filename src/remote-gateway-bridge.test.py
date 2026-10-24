@@ -132,7 +132,7 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/v1/room":
             if STATE["force_room_502"]:
                 self.send_response(502); self.end_headers(); return
-            if STATE["force_room_429"]:
+            if STATE["force_room_429"]:  # pragma: no cover - the server thread is outside the gate's trace
                 self.send_response(429); self.end_headers(); return
             n = int(self.headers.get("Content-Length") or 0)
             STATE["room_posts"].append(json.loads(self.rfile.read(n).decode()))
@@ -1376,7 +1376,7 @@ def main() -> int:
     check(len(STATE["room_posts"]) == 1
           and {k: v for k, v in _first.items() if k != "dedupe_key"}
           == {"op": "message", "room_id": "!owner:example.org", "body": "nudge one"}
-          and str(_first.get("dedupe_key", "")).startswith("proactive-t1~")
+          and str(_first.get("dedupe_key", "")).startswith("proactive-t1#")
           and not (rtc.RESULTS_DIR / "proactive-t1.txt").exists()
           and any(x.name.startswith("proactive-t1-") for x in rtc.ARCHIVE_RESULTS_DIR.iterdir()),
           "proactive file delivered via /v1/room and archived")
@@ -1586,7 +1586,7 @@ def main() -> int:
     _rroot = rtc.RESULTS_DIR / ".outbox-ag2space-proactive"
     def _receipt(stem):
         return next((i for i in _ob.list_items(_rroot)
-                     if str(i.get("item_id", "")).startswith(f"{stem}~")), {})
+                     if i.get("item_id") == stem), {})
     (rtc.RESULTS_DIR / "proactive-r1.txt").write_text("receipt nudge\n")
     rtc._post_proactive()
     _it = _receipt("proactive-r1")

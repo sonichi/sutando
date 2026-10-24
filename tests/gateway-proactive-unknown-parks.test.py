@@ -10,12 +10,15 @@ recorded as landed), loses the confirmation, then restarts the process:
   c) a 5xx after the POST               -> the same
   d) the file put back in results/      -> still no second POST, parked again
   e) control: connection refused        -> never connected, so retried and delivered once
+  f) the logged requeue command, run as printed -> the same item is sent once more, then never again
 
 Run: python3 tests/gateway-proactive-unknown-parks.test.py
 """
 from __future__ import annotations
 
+import shlex
 import socket
+import subprocess
 import sys
 import time
 import urllib.error
@@ -26,6 +29,9 @@ from _helpers.hermetic_gateway import isolate_then_import  # noqa: E402
 
 gb, _IMPORT_READS = isolate_then_import(env={"REMOTE_PROACTIVE_ROOM": ""})
 from _helpers import proactive_lane as pl  # noqa: E402
+from _helpers.hermetic_env import isolated_child_env  # noqa: E402
+
+REPO = Path(__file__).resolve().parents[1]
 
 ISO = pl.scratch("gw-proactive-unknown-")
 check = pl.Checks()
@@ -68,7 +74,32 @@ def scenario(label: str, respond) -> None:
               "a) the park is logged with the operator's requeue command")
 
 
+def requeue_as_logged() -> None:
+    lane = pl.Lane(gb, ISO, lost(urllib.error.URLError(TimeoutError("timed out"))))
+    lane.write("proactive-9.txt", "status nine\n")
+    lane.drain()
+    line = next((m for m in lane.logs if "requeue" in m and "proactive-9" in m), "")
+    cmd = shlex.split(line.rsplit(": ", 1)[-1]) if "outbox_cli.py" in line else []
+    check(bool(cmd), f"f) the park logs a requeue command ({line[-160:]!r})")
+    if not cmd:
+        return
+    run = subprocess.run([sys.executable if c == "python3" else c for c in cmd],
+                         cwd=REPO, env=isolated_child_env(), capture_output=True, text=True, timeout=60)
+    check(run.returncode == 0, f"f) the command runs ({run.returncode}: {run.stderr[-200:]})")
+    lane.respond = lambda payload: {"ok": True, "event_id": "$resent"}
+    for _ in range(3):
+        lane.drain()
+    items = lane.items()
+    check(len(lane.posts) == 2 and len(items) == 1 and items[0].get("item_id") == "proactive-9"
+          and items[0].get("status") == "DELIVERED" and items[0].get("provider_ref") == "$resent",
+          f"f) the same item is re-driven exactly once ({len(lane.posts)} POSTs, "
+          f"{[(i.get('item_id'), i.get('status')) for i in items]})")
+    check(lane.where("proactive-9") == "archived" and not any((lane.results / "undelivered").glob("proactive-9*")),
+          f"f) its body leaves undelivered/ and is archived ({lane.where('proactive-9')})")
+
+
 def main() -> int:
+    requeue_as_logged()
     scenario("a) timeout", lost(urllib.error.URLError(TimeoutError("timed out"))))
     scenario("b) no event id", lambda payload: {"ok": True})
     scenario("c) HTTP 502", lost(http(502)))

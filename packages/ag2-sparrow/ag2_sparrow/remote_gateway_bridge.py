@@ -5574,12 +5574,6 @@ def _record_proactive_receipt(item_id: str, event_id: str) -> None:
         raise OSError(f"proactive receipt for {item_id} not recorded")
 
 
-def _proactive_item_id(stem: str, envelope: dict) -> str:
-    """One outbox item per file, body and destination: a change to any of them is another send."""
-    digest = hashlib.sha256(json.dumps(envelope, sort_keys=True).encode("utf-8")).hexdigest()
-    return f"{stem}~{digest[:16]}"
-
-
 def _about_task_headers(tid: str) -> dict:
     """The routing headers of the task a proactive message is about; {} when it cannot be read.
     The trusted scan applies only to a file this gateway wrote and declared task-mid."""
@@ -5924,15 +5918,15 @@ def _send_proactive(claim: Path, f: Path, envelope: dict, owner_dm: bool, notice
     """Hand one claimed proactive file to the outbox, which owns the claim, the send and its
     outcome, then move the file as that outcome says. An uncertain send is parked, not resent."""
     core = _delivery_core("proactive")
-    item_id = _proactive_item_id(f.stem, envelope)
+    item_id = f.stem  # stable across passes and the quarantine name; the room is re-resolved per pass
     payload = json.dumps(envelope, sort_keys=True).encode("utf-8")
     seen = _PROACTIVE_SEND.__dict__.setdefault("seen", {})
     seen.clear()
     core.backend.publish(item_id, payload)
     if (read_item(core.backend.root, item_id) or {}).get("reason") == _ROOM_UPGRADED:
-        # The gateway refused it for an upgraded room, so it never posted; the hold is gone now.
-        requeue_item_with_epoch(core.backend.root, item_id, reset_attempts=True,
-                                operator=core.worker, reason="the room is no longer held")
+        # Refused for an upgraded room, so it never posted: resent to the room resolved now.
+        requeue_item_with_epoch(core.backend.root, item_id, reset_attempts=True, operator=core.worker,
+                                reason="the room is no longer held", payload=payload.decode("utf-8"))
     result = core.deliver_one(item_id, payload)
     item = read_item(core.backend.root, item_id) or {}
     status, room = item.get("status"), envelope["room_id"]
@@ -5951,7 +5945,7 @@ def _send_proactive(claim: Path, f: Path, envelope: dict, owner_dm: bool, notice
         return
     replacement = seen.get("room_upgraded")
     if replacement is not None and status != "PARKED":
-        core.backend.park(item_id, _ROOM_UPGRADED)  # never posted; a repointed DM is a new item
+        core.backend.park(item_id, _ROOM_UPGRADED)  # never posted; resent once the DM is repointed
         if owner_dm:
             try:
                 claim.rename(f)  # stays pending: the room moved, the DM's repointing sends it

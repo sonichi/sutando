@@ -8,6 +8,9 @@ A child process drains one proactive file and is killed (os._exit) at one point:
   b) after-receipt: the event id was recorded, the process died before completing
      -> after the restart the item is delivered with that event id, nothing is sent again
 
+  c) before-receipt, and the owner DM changes before the restart
+     -> still the one parked item: no POST to the new DM, no second item left READY
+
 The claim of the dead child is honoured until its reclaim window ends: a drain inside the
 window leaves the file pending, never lost and never sent.
 
@@ -57,7 +60,7 @@ os._exit(0)
 """
 
 
-def scenario(stage: str, want_status: str, want_where: str) -> None:
+def scenario(stage: str, want_status: str, want_where: str, new_dm: "str | None" = None) -> None:
     lane = pl.Lane(gb, ISO)
     lane.write("proactive-1.txt", "status for the owner\n")
     posts = lane.ws / "child-posts"
@@ -67,6 +70,8 @@ def scenario(stage: str, want_status: str, want_where: str) -> None:
     check(rc.returncode == 9, f"{stage}: the child died mid-drain (exit {rc.returncode}) {rc.stderr[-300:]}")
     check(posts.exists() and posts.read_text() == "x", f"{stage}: the child posted once")
     lane.restart()
+    if new_dm:
+        stage, lane.owner_dm = f"{stage} + DM change", new_dm
     lane.drain()
     check(lane.posts == [] and lane.where("proactive-1") == "pending",
           f"{stage}: inside the dead claim's window nothing is sent and the file waits "
@@ -77,6 +82,7 @@ def scenario(stage: str, want_status: str, want_where: str) -> None:
     for _ in range(3):
         lane.drain()
     items = lane.items()
+    check(len(items) == 1, f"{stage}: one outbox item, none left READY ({[(i.get('item_id'), i.get('status')) for i in items]})")
     item = items[0] if len(items) == 1 else {}
     check(lane.posts == [], f"{stage}: no second POST after the restart ({len(lane.posts)})")
     check(item.get("status") == want_status, f"{stage}: the item is {want_status} ({item.get('status')}, {item.get('reason')})")
@@ -91,6 +97,7 @@ def scenario(stage: str, want_status: str, want_where: str) -> None:
 def main() -> int:
     scenario("before-receipt", "PARKED", "undelivered")
     scenario("after-receipt", "DELIVERED", "archived")
+    scenario("before-receipt", "PARKED", "undelivered", new_dm="!RepointedOwnerDm:ag2.space")
     return check.exit_code()
 
 

@@ -169,10 +169,15 @@ def place(src: Path, results_dir: Path, stem: str,
                     (quarantine_name(stem, n + i) for i in range(_PLACE_TRIES)), move)
 
 
+def _stem(item_id: str) -> str:
+    """A bare task id names `task-<id>`; a task or proactive stem names itself."""
+    item_id = str(item_id)
+    return item_id if item_id.startswith(("task-", "proactive-")) else f"task-{item_id}"
+
+
 def canonical_result(results_dir: Path, task_id: str) -> Path:
     """The drain's live name for one task's result."""
-    stem = f"task-{task_id}" if not str(task_id).startswith("task-") else str(task_id)
-    return Path(results_dir) / f"{stem}.txt"
+    return Path(results_dir) / f"{_stem(task_id)}.txt"
 
 
 def find_quarantined(results_dir: Path, task_id: str) -> list[Path]:
@@ -184,7 +189,7 @@ def find_quarantined(results_dir: Path, task_id: str) -> list[Path]:
     d = quarantine_dir(results_dir)
     if not d.is_dir():
         return []
-    stem = f"task-{task_id}" if not str(task_id).startswith("task-") else str(task_id)
+    stem = _stem(task_id)
     out = []
     for p in d.glob("*.txt"):
         m = _QUARANTINED.match(p.name)

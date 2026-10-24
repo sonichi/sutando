@@ -1134,7 +1134,8 @@ def requeue_item(root: Path, item_id: str, *, reset_attempts: bool = False,
 
 def requeue_item_with_epoch(root: Path, item_id: str, *, reset_attempts: bool = False,
                             operator: Optional[str] = None,
-                            reason: Optional[str] = None) -> "tuple[RequeueOutcome, Optional[int]]":
+                            reason: Optional[str] = None,
+                            payload: Optional[str] = None) -> "tuple[RequeueOutcome, Optional[int]]":
     """Operator recovery: PARKED -> QUEUED as ONE atomic transition.
 
     Refuses anything not PARKED, which is what makes it idempotent AND keeps it
@@ -1154,7 +1155,8 @@ def requeue_item_with_epoch(root: Path, item_id: str, *, reset_attempts: bool = 
 
     Returns the epoch written under the lock (None unless REQUEUED): a later
     read can see a peer's re-requeue, and a rollback keyed on it undoes theirs.
-    A requeue never changes the stored payload.
+    A requeue keeps the stored payload unless `payload` replaces it: only for a send that
+    provably never left, whose destination has moved since.
     """
     root = Path(root)
     with _item_lock(root, item_id):
@@ -1173,6 +1175,8 @@ def requeue_item_with_epoch(root: Path, item_id: str, *, reset_attempts: bool = 
         d["requeued_at"] = time.time()
         d["requeued_by"] = operator or "unknown"
         d["requeue_reason"] = reason or ""
+        if payload is not None:
+            d["payload"] = payload
         proof = source_proof(d)
         for field in ("proof_version", "source_ready_sha256", "source_payload_sha256"):
             d.pop(field, None)
