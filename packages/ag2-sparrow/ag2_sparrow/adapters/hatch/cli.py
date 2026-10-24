@@ -29,7 +29,7 @@ import time
 from importlib import resources
 from pathlib import Path
 
-from ... import _dirs, diagnostics, gateway_credential_io, gateway_credentials, gateway_instance, outbox, workspace_lock
+from ... import _dirs, agent_identity, diagnostics, gateway_credential_io, gateway_credentials, gateway_instance, outbox, workspace_lock
 from ...result_markers import parse_markers
 from ...service_manager import _systemctl, _systemd_run, systemd_user_available  # noqa: F401
 from .task_fields import item_id, valid_mxid
@@ -381,9 +381,13 @@ def _why(r) -> str:
     return lines[-1] if lines else f"exit {r.returncode}"
 
 
-def render_service(exec_start: str, env: dict) -> str:
+def render_service(exec_start: str, env: dict, unset: "tuple[str, ...]" = ()) -> str:
+    """`unset` names variables the user manager may pass that the unit must not: UnsetEnvironment=
+    is applied last, after Environment=, so a name set here is never also in `unset`."""
     rows = "".join(f'Environment="{k}={v}"\n' if " " in v else f"Environment={k}={v}\n"
                    for k, v in env.items())
+    if unset:
+        rows += f"UnsetEnvironment={' '.join(unset)}\n"
     return (f"{SERVICE_MARKER}\n[Unit]\nDescription=ag2-sparrow (AG2 Space listener)\n"
             "# A Sparrow that dies 5 times in 5 minutes (e.g. a rejected token) is left failed.\n"
             "StartLimitIntervalSec=300\nStartLimitBurst=5\n\n"
@@ -549,10 +553,13 @@ def install_service(task_dir: Path, result_dir: Path, state_dir: Path, instance:
              "the token Sparrow uses")
     env = {"AG2_DEVICE_ENV": str(device_env), "AGENT_CONNECT_TASK_DIR": str(task_dir),
            "AGENT_CONNECT_RESULT_DIR": str(result_dir), "AGENT_CONNECT_STATE_DIR": str(state_dir)}
+    # A user unit inherits the manager's whole environment: the identity keys the bridge reads first
+    # are unset there, and only the validated saved MXID is set (Environment= beats the manager's).
     if saved_mxid(mxid):
         env["AGENT_MXID"] = saved_mxid(mxid)
     else:
         print(NO_SAVED_MXID, file=sys.stderr)
+    unset = tuple(k for k in agent_identity.ENV_KEYS if k not in env)
     if instance:
         env["GATEWAY_INSTANCE"] = instance
     try:
@@ -563,7 +570,7 @@ def install_service(task_dir: Path, result_dir: Path, state_dir: Path, instance:
     except ValueError as e:
         note(f"{e}; no service was set up")
         return False
-    unit, text = service_path(), render_service(exec_start, env)
+    unit, text = service_path(), render_service(exec_start, env, unset)
     changed = True
     if unit.exists():
         old = unit.read_text(encoding="utf-8", errors="replace")

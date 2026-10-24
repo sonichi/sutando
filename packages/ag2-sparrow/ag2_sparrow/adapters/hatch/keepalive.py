@@ -26,7 +26,7 @@ import sys
 import time
 from pathlib import Path
 
-from ... import _dirs, diagnostics
+from ... import _dirs, agent_identity, diagnostics
 from . import cli as _cli, task_fields
 
 TASK, INTERVAL_MIN = "sparrow-keepawake", 15
@@ -211,6 +211,9 @@ def _spawn_sparrow(cfg: dict) -> "tuple[bool, str]":
         return False, f"{_cli.SPARROW_COMMAND} not found beside {sys.executable} or on PATH"
     env = dict(os.environ, AG2_DEVICE_ENV=str(_cli.device_env_path()),
                REMOTE_HEALTH_COMMAND=health_command(_command(cfg)))
+    # The bridge resolves its identity from the process env first: only the saved one may be there.
+    for key in agent_identity.ENV_KEYS:
+        env.pop(key, None)
     mxid = _cli.saved_mxid(cfg.get("AGENT_MXID"))
     if mxid:
         env["AGENT_MXID"] = mxid
@@ -658,6 +661,7 @@ def report(log: Path, gap_minutes: float = GAP_MINUTES) -> int:
 
 
 def main(args) -> int:
+    _cli._register_device_secrets()  # the cache's revision rule withholds this host's secrets
     cfg = _cli._installed_config()
     log = log_path(cfg, args.log)
     if args.action == "keepawake":

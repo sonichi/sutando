@@ -94,23 +94,37 @@ def _announcement_refused(state_dir: Path, instance: str = "") -> bool:
     return (_read_json(hint_path(state_dir, instance)) or {}).get("setup_revision_withheld") is True
 
 
+def cache_revision(cache: "dict | None", gateway_url: str = "") -> "str | None":
+    """The cached revision as revision_field spells it (an integer as its decimal text; a secret, a
+    piece of one, gateway URL text or a malformed value as None); every reader of a cache goes
+    through it, announcement or not. `gateway_url` is the redacted one Sparrow reports."""
+    return diagnostics.revision_field((cache or {}).get("revision"), gateway_url)
+
+
+def reported_gateway(state_dir: Path, instance: str = "") -> str:
+    """The redacted gateway URL from Sparrow's status file; '' when none."""
+    sfx = gateway_instance.suffix(instance)
+    return str((_read_json(Path(state_dir) / f"gateway-status{sfx}.json") or {}).get("gateway") or "")
+
+
 def current_cache(state_dir: Path, instance: str = "") -> "dict | None":
-    """The cache, unless Sparrow has since heard of another revision, or of one it refused: then
-    None, so the built-in text and defaults apply until a revision it keeps is fetched."""
+    """The cache, with its revision normalised, unless its revision does not normalise, or Sparrow
+    has since heard of another revision or of one it refused: then None, so the built-in text and
+    defaults apply until a revision it keeps is fetched."""
     cached, announced = load_cache(state_dir), announced_revision(state_dir, instance)
-    if cached is None or _announcement_refused(state_dir, instance) \
-            or (announced is not None
-                and diagnostics.revision_field(cached.get("revision")) != announced):
+    revision = cache_revision(cached, reported_gateway(state_dir, instance)) if cached is not None else None
+    if revision is None or _announcement_refused(state_dir, instance) \
+            or (announced is not None and revision != announced):
         return None
-    return cached
+    return {**cached, "revision": revision}
 
 
-def setup_problem(setup) -> str:
+def setup_problem(setup, gateway_url: str = "") -> str:
     """Why a fetched setup must not be cached; '' when it may."""
     if not isinstance(setup, dict):
         return "not an object"
     # The bridge keeps an announced revision only as revision_field spells it; so does the cache.
-    if diagnostics.revision_field(setup.get("revision")) is None:
+    if cache_revision(setup, gateway_url) is None:
         return "no revision"
     if "tunables" in setup and not isinstance(setup["tunables"], dict):
         return "tunables is not an object"
@@ -125,11 +139,12 @@ def refresh_cache(state_dir: Path, instance: str = "") -> "dict | None":
             and announced_revision(state_dir, instance) is not None:
         return current_cache(state_dir, instance)
     fetched = setup_fetch.fetch_setup(kind="acp", vendor=VENDOR)
-    why = "no setup fetched" if fetched is None else setup_problem(fetched)
+    gateway = reported_gateway(state_dir, instance)
+    why = "no setup fetched" if fetched is None else setup_problem(fetched, gateway)
     if why:
         print(f"NOTE served setup: not cached: {why}", file=sys.stderr)
     else:
-        cached = {**fetched, "revision": diagnostics.revision_field(fetched["revision"])}
+        cached = {**fetched, "revision": cache_revision(fetched, gateway)}
         _cli._write(cache_path(state_dir), json.dumps(cached, sort_keys=True), 0o600)
     return current_cache(state_dir, instance)
 

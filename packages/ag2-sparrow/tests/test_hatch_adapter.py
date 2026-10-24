@@ -32,7 +32,7 @@ isolate_os_environ()
 PKG_ROOT = Path(__file__).resolve().parents[1]
 HATCH = PKG_ROOT / "ag2_sparrow" / "adapters" / "hatch"
 sys.path.insert(0, str(PKG_ROOT))
-from ag2_sparrow import gateway_credential_io, health_command as hc, outbox, service_manager as sm, task_io  # noqa: E402
+from ag2_sparrow import agent_identity, gateway_credential_io, health_command as hc, holder_lock, outbox, service_manager as sm, task_io  # noqa: E402
 from ag2_sparrow.adapters.hatch import (  # noqa: E402
     cli as hatch_cli, keepalive, runtime_text, task_fields)
 
@@ -1311,7 +1311,8 @@ class Service(Base):
     def test_the_unit_gets_no_agent_mxid_when_none_was_saved_and_says_so(self):
         fake = FakeSystemd()
         env = py_env(self.home)
-        env.update(PATH=f"{self.bin}:{os.environ['PATH']}", USER="hatch")
+        env.update(PATH=f"{self.bin}:{os.environ['PATH']}", USER="hatch",
+                   **{key: StartSparrow.CALLER for key in agent_identity.ENV_KEYS})
         for mxid in ("", "not-an-mxid", " @spaced:ag2.space"):
             with self.subTest(mxid=mxid):
                 out, err = io.StringIO(), io.StringIO()
@@ -1323,10 +1324,28 @@ class Service(Base):
                 unit = self.unit.read_text()
                 if mxid.strip() and hatch_cli.valid_mxid(mxid.strip()):
                     self.assertIn(f"\nEnvironment=AGENT_MXID={mxid.strip()}\n", unit)
+                    self.assertIn("\nUnsetEnvironment=AGENT_ID\n", unit)
                     self.assertNotIn(hatch_cli.NO_SAVED_MXID, err.getvalue())
                 else:
-                    self.assertNotIn("AGENT_MXID", unit, "no identity is invented for the unit")
+                    self.assertNotIn("\nEnvironment=AGENT_MXID", unit, "no identity is invented for the unit")
+                    self.assertIn("\nUnsetEnvironment=AGENT_MXID AGENT_ID\n", unit,
+                                  "the manager's identity keys are unset, not merely left out")
                     self.assertEqual(err.getvalue().count(hatch_cli.NO_SAVED_MXID), 1, err.getvalue())
+                for key in agent_identity.ENV_KEYS:
+                    self.assertNotIn(f"{key}={StartSparrow.CALLER}", unit, "the installer's own identity never reaches the unit")
+                self.assertNotIn("\nEnvironment=AGENT_ID", unit)
+
+    def test_the_unit_carries_the_saved_identity_never_the_installers_ambient_one(self):
+        r = self.with_systemd(FakeSystemd(), "install", "--mxid", AGENT,
+                              env={"USER": "hatch", **{key: StartSparrow.CALLER for key in agent_identity.ENV_KEYS}})
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        unit = self.unit.read_text()
+        self.assertIn(f"\nEnvironment=AGENT_MXID={AGENT}\n", unit)
+        self.assertIn("\nUnsetEnvironment=AGENT_ID\n", unit, "the alias the manager may pass is unset")
+        self.assertNotIn(StartSparrow.CALLER, unit)
+        self.assertNotIn("\nEnvironment=AGENT_ID", unit)
+        # UnsetEnvironment= applies after Environment=, so the saved identity is never also unset.
+        self.assertNotRegex(unit, r"UnsetEnvironment=.*AGENT_MXID")
 
     def test_a_number_its_consumer_cannot_take_stops_reloads_and_starts_nothing(self):
         # The exact answer: an active unit, a 5,000-digit MainPID and a start timestamp.
@@ -1980,26 +1999,34 @@ class Keepalive(Base):
 
     def test_a_started_sparrow_runs_as_the_saved_agent_mxid_and_gets_no_default_without_one(self):
         self.installed()
-        seen = self.home / "sparrow-env"
         stub = self.bin / "sparrow-stub"
-        executable(stub, f'#!/bin/sh\necho "${{AGENT_MXID-unset}}" > {seen}\nsleep 1\n')
+        executable(stub, '#!/bin/sh\necho "${AGENT_MXID-unset} ${AGENT_ID-unset}" > "$SPARROW_SEEN"\n')
         cfg = self.call(lambda c: c)
         self.assertEqual(cfg["AGENT_MXID"], AGENT)
-        for mxid, want in ((AGENT, AGENT), (None, "unset"), ("not-an-mxid", "unset"), ("", "unset")):
+        # The runner's own identity, in every key the bridge's resolver reads before any file.
+        env = py_env(self.home)
+        env.update({key: f"@caller-{key.lower()}:ag2.space" for key in agent_identity.ENV_KEYS})
+        for i, (mxid, want) in enumerate(((AGENT, f"{AGENT} unset"), (None, "unset unset"),
+                                          ("not-an-mxid", "unset unset"), ("", "unset unset"))):
             with self.subTest(saved=mxid):
-                seen.unlink(missing_ok=True)
+                seen = self.home / f"sparrow-env-{i}"  # one file per child: a late writer cannot cross over
+                env["SPARROW_SEEN"] = str(seen)
                 saved = {k: v for k, v in cfg.items() if k != "AGENT_MXID"}
                 if mxid is not None:
                     saved["AGENT_MXID"] = mxid
                 err = io.StringIO()
                 with mock.patch.object(hatch_cli, "_find_console_script", return_value=str(stub)), \
                         mock.patch.object(keepalive, "SPAWN_SETTLE_S", 0.3), \
-                        mock.patch.dict(os.environ, {"HOME": str(self.home)}), \
+                        mock.patch.dict(os.environ, env, clear=True), \
                         contextlib.redirect_stderr(err):
                     ok, how = keepalive._spawn_sparrow(saved)
-                self.assertTrue(ok, how)
-                self.assertEqual(seen.read_text().strip(), want)
-                self.assertEqual(hatch_cli.NO_SAVED_MXID in err.getvalue(), want == "unset", err.getvalue())
+                self.assertTrue(ok or "exited 0" in how, how)  # a quick exit is the stub's own
+                deadline = time.monotonic() + 10
+                while not seen.exists() and time.monotonic() < deadline:
+                    time.sleep(0.05)
+                self.assertEqual(seen.read_text().strip(), want, "the child sees the saved identity or none, never the caller's")
+                self.assertEqual(hatch_cli.NO_SAVED_MXID in err.getvalue(), mxid is None or want == "unset unset",
+                                 err.getvalue())
 
     def test_the_service_unit_carries_the_health_command(self):
         self.installed()
@@ -2490,6 +2517,88 @@ class StartSparrow(Base):
                           ("start", "restart", "stop", "enable", "daemon-reload")], [])
         self.assertIsNone(old.poll())
         self.assertFalse(self.seen.exists())
+
+    # A stand-in Sparrow that is the real bridge: its identity comes through the bridge's own resolver,
+    # the owner-routing record and the status file through the bridge's writers; only the gateway is faked.
+    REAL_BRIDGE = """import json, os, pathlib, sys, time
+from unittest import mock
+from ag2_sparrow import holder_lock as _hl
+_hl._home = lambda: os.environ["HOME"]
+from ag2_sparrow import remote_gateway_bridge as m
+rows = {"agents": [{"id": "%(agent)s", "owner": "@owner:ag2.space", "owner_dm_room": "!dm:ag2.space"},
+                   {"id": "%(caller)s", "owner": "@owner:ag2.space", "owner_dm_room": "!caller-dm:ag2.space"}]}
+with mock.patch.object(m, "_req", return_value=rows):
+    m.refresh_routing(force=True)
+m._emit_gateway_status(True)
+pathlib.Path(os.environ["AGENT_CONNECT_STATE_DIR"], "real-bridge.pid").write_text(str(os.getpid()))
+time.sleep(20)
+"""
+    CALLER = "@caller:ag2.space"
+
+    def test_a_token_only_install_binds_the_launched_bridge_and_wake_context_resolves_the_owner_dm(self):
+        """The chain install promises: a clean install with nothing but the relay token on disk starts a
+        bridge that binds as the installed identity, and wake-context then names the owner's DM. The
+        runner's shell carries another agent's identity, which must reach neither the bridge nor the
+        prompt: with no saved identity the bridge binds as nobody."""
+        relay = self.home / ".config" / "ag2-sparrow" / "relay.env"
+        relay.parent.mkdir(parents=True, exist_ok=True)
+        relay.write_text("REMOTE_TASK_TOKEN=https://gw.example/relay?tenant=a|fake-relay-token-0123456789abcdef\n")
+        relay.chmod(0o600)
+        executable(self.bin / hatch_cli.SPARROW_COMMAND,
+                   f"#!{sys.executable}\n" + self.REAL_BRIDGE % {"agent": AGENT, "caller": self.CALLER})
+        pid_file = self.state / "real-bridge.pid"
+
+        def stop_bridge():
+            if pid_file.exists():
+                pid = int(pid_file.read_text())
+                with contextlib.suppress(ProcessLookupError):
+                    os.kill(pid, signal.SIGKILL)
+                deadline = time.monotonic() + 5
+                while not hatch_cli.process_gone(pid) and time.monotonic() < deadline:
+                    time.sleep(0.05)
+                pid_file.unlink()
+        self.addCleanup(stop_bridge)
+
+        def run(*args):
+            env = py_env(self.home)
+            env.update(PATH=f"{self.bin}:{os.environ['PATH']}", AGENT_CONNECT_TASK_DIR=str(self.tasks),
+                       AGENT_CONNECT_RESULT_DIR=str(self.results), AGENT_CONNECT_STATE_DIR=str(self.state),
+                       **{key: self.CALLER for key in agent_identity.ENV_KEYS})
+            with mock.patch.object(keepalive, "ensure_sparrow", REAL_ENSURE_SPARROW), \
+                    mock.patch.object(keepalive, "START_WAIT_S", 30.0), \
+                    mock.patch.object(holder_lock, "_home", lambda: str(self.home)):
+                return run_main(hatch_cli.main, args, env)
+
+        r = run("install", "--mxid", AGENT, "--no-service")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("started:", r.stdout)
+        status = json.loads((self.state / "gateway-status.json").read_text())
+        self.assertEqual(status["agent_id"], AGENT, status)
+        self.assertTrue(status.get("gateway_binding"), "the launched bridge binds as the installed identity")
+        wake = run("wake-context")
+        self.assertEqual(wake.returncode, 0, wake.stdout + wake.stderr)
+        self.assertIn("owner_dm_room: !dm:ag2.space", wake.stdout)
+        self.assertNotIn("caller", wake.stdout)
+        self.assertNotIn(hatch_cli.NO_SAVED_MXID, r.stdout + r.stderr)
+
+        # The same chain with no saved identity (a config from before install saved one): the keepawake
+        # run restarts the bridge, which binds as nobody, so the prompt names no owner DM at all.
+        stop_bridge()
+        for name in ("gateway-status.json", "owner-routing.json"):
+            (self.state / name).unlink()
+        config = self.home / ".config" / "ag2-sparrow-hatch" / "config"
+        config.write_text(re.sub(r"^AGENT_MXID=.*\n", "", config.read_text(), flags=re.M))
+        r = run("keepalive", "keepawake")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("listener was down; restarted:", r.stdout)
+        self.assertIn(hatch_cli.NO_SAVED_MXID, r.stderr)
+        status = json.loads((self.state / "gateway-status.json").read_text())
+        self.assertIsNone(status["agent_id"], "no saved identity: the bridge runs as nobody, not as the caller")
+        self.assertIsNone(status["gateway_binding"], status)
+        self.assertFalse((self.state / "owner-routing.json").exists())
+        wake = run("wake-context")
+        self.assertEqual(wake.returncode, 0, wake.stdout + wake.stderr)
+        self.assertNotIn("owner_dm_room:", wake.stdout)
 
     def test_no_service_never_replaces_a_service_sparrow_while_the_manager_does_not_answer(self):
         old = self.old_sparrow()

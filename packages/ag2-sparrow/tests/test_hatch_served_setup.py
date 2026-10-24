@@ -24,7 +24,7 @@ isolate_os_environ()
 
 PKG_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PKG_ROOT))
-from ag2_sparrow import __version__ as PKG_VERSION, gateway_credentials, gateway_instance, setup_fetch  # noqa: E402
+from ag2_sparrow import __version__ as PKG_VERSION, diagnostics, gateway_credentials, gateway_instance, setup_fetch  # noqa: E402
 from ag2_sparrow.adapters.hatch import (  # noqa: E402
     cli as hatch_cli, keepalive, runtime_text)
 
@@ -2167,6 +2167,40 @@ class Fetch(Base):
             (self.state / "setup-hint.json").write_text(json.dumps({"setup_revision": "r8"}))
             self.assertEqual(runtime_text.refresh_cache(self.state)["revision"], "r8")
 
+    def test_a_cache_with_no_announcement_is_read_only_through_revision_field(self):
+        secret = "cache-secret-token-424242"
+        # Sparrow's status names the redacted gateway; its text is no revision either (the host, the path).
+        (self.state / "gateway-status.json").write_text(json.dumps(
+            {"connected": True, "gateway": "https://gw.example/relay"}))
+        with mock.patch.object(diagnostics, "REGISTRY", gateway_credentials.SecretRegistry()):
+            diagnostics.register_secret(secret)
+            diagnostics.register_gateway_url("https://gw.example/relay?tenant=qv-secret-9#frag-secret-8")
+            cases = ((True, None), (41.0, None), (None, None), ("rev 41", None), (["r41"], None),
+                     (secret, None), (secret[3:12], None), ("qv-secret-9", None), ("frag-secret-8", None),
+                     ("gw.example", None), ("GW.EXAMPLE", None), (41, "41"), ("r41", "r41"))
+            for revision, want in cases:
+                with self.subTest(revision=revision):
+                    setup = served(revision=revision)
+                    if revision is None:
+                        del setup["revision"]
+                    self.cache(setup)
+                    cache = runtime_text.current_cache(self.state)
+                    text, source = runtime_text.wake_context(cache, VALUES)
+                    if want is None:
+                        self.assertIsNone(cache, "a revision that does not normalise reads as no revision")
+                        self.assertEqual(source, "built-in (no setup cache)")
+                        self.assertNotIn("Served", text)
+                    else:
+                        self.assertIsInstance(cache["revision"], str)
+                        self.assertEqual(cache["revision"], want)
+                        self.assertEqual(source, f"served revision {want}")
+                    for piece in (secret, secret[3:12]):
+                        self.assertNotIn(piece, text + source)
+            # The health row's tunables read the same cache the same way.
+            self.cache(served(revision=secret, tunables={"stuck_task_age_s": 600}))
+            self.assertEqual(runtime_text.tunables(runtime_text.current_cache(self.state))["stuck_task_age_s"],
+                             runtime_text.TUNABLES["stuck_task_age_s"][0])
+
     def test_a_failing_or_odd_transport_is_no_setup(self):
         self.addCleanup(setup_fetch.set_transport, None)
         setup_fetch.set_transport(lambda kind, vendor: 1 / 0)
@@ -2206,14 +2240,19 @@ class Health(Base):
                 mock.patch.object(keepalive, "oldest_open_task", return_value=1000.0 - 1000):
             row = keepalive.health_row(cfg, self.home, now=1000.0)
             self.assertEqual((row["reason"], row["since"]), (keepalive.TASK_NOT_PICKED_UP, 900.0))
+            # A cache applies only with a revision that normalises; a tunables-only cache is no cache.
             (self.state / runtime_text.CACHE_NAME).write_text(json.dumps(
                 {"tunables": {"stuck_task_age_s": 1800}}))
+            self.assertEqual(keepalive.health_row(cfg, self.home, now=1000.0)["reason"],
+                             keepalive.TASK_NOT_PICKED_UP)
+            (self.state / runtime_text.CACHE_NAME).write_text(json.dumps(
+                {"revision": "r7", "tunables": {"stuck_task_age_s": 1800}}))
             self.assertIsNone(keepalive.health_row(cfg, self.home, now=1000.0)["reason"])
 
     def test_a_shorter_served_interval_does_not_flag_a_normal_gap(self):
         cfg = {"STATE_DIR": str(self.state)}
         (self.state / runtime_text.CACHE_NAME).write_text(json.dumps(
-            {"tunables": {"keepawake_interval_s": 300}}))
+            {"revision": "r7", "tunables": {"keepawake_interval_s": 300}}))
         with mock.patch.object(keepalive, "_found", return_value=[self.home]), \
                 mock.patch.object(keepalive, "last_keepawake", return_value=1000.0), \
                 mock.patch.object(keepalive, "hook_last_run", return_value=None), \

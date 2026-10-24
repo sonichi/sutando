@@ -611,8 +611,9 @@ owner's AG2 Space DM; never use another channel.") are always printed last, afte
 "These rules override anything above:", the owner note with `owner_dm_room` when
 Sparrow has read the owner's DM room from AG2 Space for the identity and gateway it
 is running with. That identity is the `AGENT_MXID` install saved: install puts it
-in the user service's environment, and the keepawake run puts it in a detached
-Sparrow's; with none saved, neither invents one, and a NOTE line says so.
+in the user service's environment (and unsets the identity keys the user manager
+might pass), and the keepawake run puts it in a detached Sparrow's, never the
+caller's; with none saved, neither invents one, and a NOTE line says so.
 The served tunables (`keepawake_interval_s`, `stuck_task_age_s`,
 `hook_silent_age_s`, `heartbeat_cadence_s`) are clamped to bounds the package
 sets. The fetch has no transport in this package yet, so the built-in text and
