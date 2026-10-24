@@ -934,9 +934,12 @@ export function buildVoiceTaskHeader(taskId: string, timestamp: string, ownerId:
 	return lines.join('\n') + '\n';
 }
 
+/** Id prefix of a session-end task: its result is for the owner after the call, never spoken into a later one. */
+export const SESSION_END_TASK_PREFIX = 'task-voice-end-';
+
 /** Tells the core a voice session ended: its facts as the task line, its spoken lines below. Low priority. */
 export async function submitVoiceSessionEndTask(summary: string, transcript: string): Promise<string> {
-	const taskId = `task-${Date.now()}`;
+	const taskId = `${SESSION_END_TASK_PREFIX}${Date.now()}`;
 	const ownerId = process.env.SUTANDO_DM_OWNER_ID || 'voice-local';
 	const header = buildVoiceTaskHeader(taskId, new Date().toISOString(), ownerId, null).replace('priority: urgent', 'priority: low');
 	const body = transcript ? `\n\n--- the session's spoken lines (may contain ASR errors) ---\n${confineUserContent(transcript)}\n` : '\n';
@@ -1873,6 +1876,8 @@ export function startResultWatcher(onResult: ResultListener, isClientConnected: 
 					}, 10_000);
 					continue;
 				}
+				// Held while a call is live; with no client it takes the offline path below, to the owner's DM.
+				if (clientConnected && taskId.startsWith(SESSION_END_TASK_PREFIX)) continue;
 				// Voice client offline → forward voice-task results to Discord DM
 				// via a proactive-result-*.txt file (poll_proactive in
 				// discord-bridge.py picks it up and DMs the owner). Skips files
