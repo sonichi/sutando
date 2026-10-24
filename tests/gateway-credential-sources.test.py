@@ -2185,7 +2185,7 @@ class Guard(unittest.TestCase):
                     self.assertTrue(o.credentials_injected(child))
                     self.assertFalse(o.credentials_injected(host))
                     files = o.env_files(child, read_text)
-                    self.assertEqual((list(files), files.credential_values, files.refused, files.blocked, opened),
+                    self.assertEqual((list(files), files.credential_pairs, files.refused, files.blocked, opened),
                                      ([], (), (), "", []), "injected: no channel file is opened, nothing is read")
                     self.assertEqual(o.bridge_carried_config(child, read_text), {}, "the child resolves nothing itself")
                     registry = o.contract.SecretRegistry()
