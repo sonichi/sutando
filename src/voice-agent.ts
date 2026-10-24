@@ -42,9 +42,10 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { VOICE_TRANSCRIPT_PATH } from './tmp-paths.js';
 import { GeminiBatchSTTProvider, GeminiLiveTranscribeSTTProvider, VoiceSession } from 'bodhi-realtime-agent';
+import * as bodhi from 'bodhi-realtime-agent';
 import { attachMeetingDictation, createMeetingEntryGate, MEETING_ENTRY_SAY, restoreAfterFreshConnection } from './meeting-dictation.js';
 import { meetingHoldsModel } from './meeting-input-hold.js';
-import type { MainAgent, ToolDefinition } from 'bodhi-realtime-agent';
+import type { LLMTransport, MainAgent, ToolDefinition } from 'bodhi-realtime-agent';
 function assertMacOS() {
 	if (process.platform === 'win32') {
 		console.warn(
@@ -270,8 +271,17 @@ function acquirePidLock(): void {
 
 // Model configuration — override via .env for cost/quality tuning
 const VOICE_MODEL = process.env.VOICE_MODEL || 'gemini-2.5-flash';
-/** How long the model may stay silent after the user's turn before stall recovery starts (bodhi's default 5 s). */
-const VOICE_RESPONSE_WATCHDOG_MS = Math.max(2_000, Number(process.env.VOICE_RESPONSE_WATCHDOG_MS) || 5_000);
+/** Which model speaks. `gemini` (default): bodhi's built-in Gemini Live transport. `gpt-live`: OpenAI's
+ *  full-duplex GPT-Live (`gpt-live-1`) through bodhi's OpenAILiveTransport; it listens while it speaks and
+ *  hands tool use to a Responses backend (VOICE_GPT_LIVE_BACKEND, default gpt-5.6-luna). Needs OPENAI_API_KEY. */
+const VOICE_TRANSPORT: 'gemini' | 'gpt-live' = process.env.VOICE_TRANSPORT === 'gpt-live' ? 'gpt-live' : 'gemini';
+const VOICE_GPT_LIVE_BACKEND = process.env.VOICE_GPT_LIVE_BACKEND || 'gpt-5.6-luna';
+const VOICE_GPT_LIVE_VOICE = process.env.VOICE_GPT_LIVE_VOICE || 'marin';
+/** How long the model may stay silent after the user's turn before stall recovery starts (bodhi's default 5 s).
+ *  GPT-Live decides on its own whether to answer, so a silence watchdog would reconnect a healthy session: off. */
+const VOICE_RESPONSE_WATCHDOG_MS = VOICE_TRANSPORT === 'gpt-live'
+	? 0
+	: Math.max(2_000, Number(process.env.VOICE_RESPONSE_WATCHDOG_MS) || 5_000);
 /** When the model stalls, bodhi first re-sends the user's last utterance as a complete turn on the same connection;
  *  only if that fails does it reconnect. Off: VOICE_WATCHDOG_REPLAY=0. */
 const VOICE_WATCHDOG_REPLAY = process.env.VOICE_WATCHDOG_REPLAY !== '0';
@@ -663,6 +673,58 @@ const answeringTools = new Set([...personalVoiceSurface.answeringTools, 'cancel_
 // Injection seam for the tuned factories in voice-agent-config.ts: this
 // module owns the session-gate + mode state; the config module owns the
 // prompt strings (CLAUDE.md: prompts preserved exactly).
+/** GPT-Live keeps the conversation; every tool runs on the Responses backend. The Live prompt must say WHEN to
+ *  delegate, or the model answers from memory where it should have called a tool (bodhi docs/guide/gpt-live.md). */
+const GPT_LIVE_DELEGATION_POLICY = `
+
+# Delegation policy (GPT-Live)
+You speak; a backend with all of the tools above does the work. You cannot call tools yourself.
+Delegate to the backend when:
+- The user asks for anything a tool above does (work, tasks, status, notes, files, screen, apps, messages, lookups).
+- Answering depends on something you cannot know (time-sensitive facts, the user's data, task results).
+Do not delegate to the backend when:
+- Small talk, clarifying questions, repeating or rephrasing what was already said.
+Delegate before answering anything that depends on backend work; say one short line ("on it") while it runs
+and never guess the result.`;
+const withLiveDelegationPolicy = (instructions: string): string =>
+	VOICE_TRANSPORT === 'gpt-live' ? instructions + GPT_LIVE_DELEGATION_POLICY : instructions;
+
+type GptLiveTransport = LLMTransport & { onBackendText?: (text: string, delegationId?: string) => void };
+/** OpenAILiveTransport is in bodhi's GPT-Live branch (randombet/bodhi_realtime_agent#68), not yet in a release:
+ *  it is read from the installed bodhi at startup, so a release without it still builds and runs Gemini. */
+const OpenAILiveTransportCtor = (bodhi as unknown as { OpenAILiveTransport?: new (config: Record<string, unknown>) => GptLiveTransport }).OpenAILiveTransport;
+
+/** The GPT-Live transport for VOICE_TRANSPORT=gpt-live. Tools and the Live prompt are synced by VoiceSession at
+ *  construction; the backend gets the same instructions plus its own role line. */
+function buildGptLiveTransport(): LLMTransport {
+	const apiKey = process.env.OPENAI_API_KEY;
+	if (!apiKey) {
+		console.error(`${ts()} [Startup] VOICE_TRANSPORT=gpt-live needs OPENAI_API_KEY in .env`);
+		process.exit(1);
+	}
+	if (!OpenAILiveTransportCtor) {
+		console.error(`${ts()} [Startup] VOICE_TRANSPORT=gpt-live needs a bodhi-realtime-agent with OpenAILiveTransport (randombet/bodhi_realtime_agent#68); the installed one has none`);
+		process.exit(1);
+	}
+	const transport = new OpenAILiveTransportCtor({
+		apiKey,
+		voice: VOICE_GPT_LIVE_VOICE,
+		delegation: {
+			type: 'responses',
+			model: VOICE_GPT_LIVE_BACKEND,
+			instructions:
+				'You are the reasoning backend of a voice assistant: the voice model forwards the user\'s request, ' +
+				'you run the tools and reply with what it should say, in one or two short spoken sentences.\n\n' +
+				buildInstructions(_configCtx),
+			parallelToolCalls: false,
+		},
+		log: (m: string) => console.log(`${ts()} [GPT-Live] ${m}`),
+	});
+	transport.onBackendText = (text, delegationId) =>
+		console.log(`${ts()} [GPT-Live] backend text (${delegationId ?? 'no delegation'}): ${text.slice(0, 200)}`);
+	return transport;
+}
+
 const _configCtx: VoiceConfigContext = {
 	resolveCurrentMode,
 	isMeetingActive: () => meetingActive,
@@ -685,7 +747,7 @@ const mainAgent: MainAgent = {
 	// Tuned system-instruction factory moved verbatim to
 	// voice-agent-config.ts (step 5a-1). Per-session evaluation preserved:
 	// buildInstructions re-checks mode/meeting state on every call.
-	instructions: () => buildInstructions(_configCtx),
+	instructions: () => withLiveDelegationPolicy(buildInstructions(_configCtx)),
 	// endSession intentionally NOT in the tool list. After 14 commits
 	// trying to gate it against contamination false positives, the
 	// conclusion is: don't give Gemini a way to close the session
@@ -1065,6 +1127,10 @@ function whenSessionActive(s: VoiceSession): Promise<void> {
 	voiceTaskStore.onChange(() => voiceTaskStatus.changed());
 	voiceTaskStatus.changed();
 
+	// GPT-Live closes a session that gets no input audio for ~30 s (`session.closed` reason "expired", seen
+	// 2026-10-19 with no client attached), and bodhi cannot redial a transport without a resumption handle,
+	// so the voice stayed CLOSED. Until the transport redials lazily, the upstream is fed 20 ms of silence
+	// every 20 ms while no client is attached (the feed is set up below). Test scaffolding: it bills session seconds while idle.
 	const session = new VoiceSession({
 		sessionId: SESSION_ID,
 		userId: 'user',
@@ -1081,6 +1147,8 @@ function whenSessionActive(s: VoiceSession): Promise<void> {
 		host: HOST,
 		model: google(VOICE_MODEL),
 		geminiModel: VOICE_NATIVE_AUDIO_MODEL,
+		// GPT-Live replaces the built-in Gemini Live transport; geminiModel/speechConfig are then unused.
+		...(VOICE_TRANSPORT === 'gpt-live' ? { transport: buildGptLiveTransport() } : {}),
 		speechConfig: { voiceName: VOICE_NAME },
 		inputAudioTranscription: true,
 		whisperProvider: meetingTranscriber,
@@ -1102,6 +1170,9 @@ function whenSessionActive(s: VoiceSession): Promise<void> {
 			},
 			...(ACTIVE_SILENCE_TICKS > 0 ? { activeSilence: { requiredTicks: ACTIVE_SILENCE_TICKS } } : {}),
 		},
+		// upstreamRecovery needs the Gemini transport's recovery primitives (abortIncumbent, dial generations);
+		// GPT-Live has none, so that mode drops both and runs bodhi's default loss policy ('close').
+		...(VOICE_TRANSPORT === 'gpt-live' ? { upstreamLossPolicy: undefined, upstreamRecovery: undefined } : {}),
 		// Frames the core does not own are offered to optional skills' handlers.
 		onClientCommand: (message) => clientFrames.dispatch(message),
 		onClientConnected: () => callEnd.clientConnected(),
@@ -1326,6 +1397,15 @@ function whenSessionActive(s: VoiceSession): Promise<void> {
 	// Applied on next reconnect — restricts what Gemini sees after the next transport cycle.
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any
 	setSessionToolUpdater((tools) => (session as any).transport?.updateTools?.(tools), mainAgentTools);
+	if (VOICE_TRANSPORT === 'gpt-live') {
+		const silence20ms = Buffer.alloc(960).toString('base64'); // PCM16 mono 24 kHz
+		setInterval(() => {
+			if (session.clientConnected) return;
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			const transport = (session as any).transport;
+			if (transport?.isConnected) transport.sendAudio(silence20ms);
+		}, 20).unref();
+	}
 	startVisionControlServer();
 
 	// Wire voice-failure classifier: when the Gemini Live transport closes
@@ -1947,6 +2027,7 @@ function whenSessionActive(s: VoiceSession): Promise<void> {
 	console.log(`  Session ID:    ${SESSION_ID}`);
 	console.log(`  Models:`);
 	console.log(`    Voice LLM:       ${VOICE_MODEL}`);
+	if (VOICE_TRANSPORT === 'gpt-live') console.log(`    Voice transport: GPT-Live (gpt-live-1, backend ${VOICE_GPT_LIVE_BACKEND}, voice ${VOICE_GPT_LIVE_VOICE})`);
 	console.log(`    Native audio:    ${VOICE_NATIVE_AUDIO_MODEL} (googleSearch=${VOICE_GOOGLE_SEARCH})`);
 	console.log(`    Voice name:      ${VOICE_NAME}`);
 	console.log(`    STT:             native Gemini Live inputAudioTranscription`);
