@@ -111,7 +111,7 @@ class TestConfig(unittest.TestCase):
         self.assertEqual((d.server, d.cloud_origin, d.prefer_ipv4, d.source),
                          ("x.space", "https://c.x.space", False, "config"))
         self.assertFalse(ds.dotspace_for("ag2.space", fetch=ds.NO_FETCH, config=cfg).is_dotspace)
-        self.assertEqual(ds.trusted_cloud_hosts(cfg), frozenset({"c.x.space", ds.LEGACY_CLOUD_HOST}))
+        self.assertEqual(ds.trusted_cloud_hosts(cfg), frozenset({"c.x.space", "sutando.ag2.space", ds.LEGACY_CLOUD_HOST}))
         self.assertFalse(ds.dotspace_for("not-ag2.example", fetch=Fetcher(block(server="not-ag2.example",
                          gateway_url="https://gw.not-ag2.example", cloud_origin="", mcp_url="")), config=cfg).is_dotspace)
 
@@ -287,7 +287,7 @@ class TestPerServer(unittest.TestCase):
         self.assertEqual((b.link_via, b.cloud_origin, b.is_dotspace), ("s.space", "", True))
         opt_in = {"instances": [{"server": "s.space", "cloud_origin": "https://sutando.s.space"}]}
         self.assertEqual(ds.cloud_origin_for("s.space", fetch=ds.NO_FETCH, config=opt_in), "https://sutando.s.space")
-        self.assertEqual(ds.trusted_cloud_hosts(opt_in), frozenset({"sutando.s.space", ds.LEGACY_CLOUD_HOST}))
+        self.assertEqual(ds.trusted_cloud_hosts(opt_in), frozenset({"sutando.s.space", "sutando.ag2.space", ds.LEGACY_CLOUD_HOST}))
         self.assertEqual(ds.link_via_for("!r:ag2.space", fetch=ds.NO_FETCH), "ag2.space")
         self.assertEqual(ds.link_via_for("!r:s.space", fetch=ds.NO_FETCH), "s.space")
         self.assertEqual(ds.cloud_origin_for("@a:ag2.space", fetch=ds.NO_FETCH), "https://sutando.ag2.space")
@@ -443,6 +443,28 @@ class TestAg2SpaceInstallUnchanged(unittest.TestCase):
         cfg = {"instances": [{"server": "v6.space", "prefer_ipv4": False}, {"server": "v4.space"}]}
         self.assertFalse(ds.dotspace_for("v6.space", fetch=ds.NO_FETCH, config=cfg).prefer_ipv4)
         self.assertTrue(ds.dotspace_for("v4.space", fetch=ds.NO_FETCH, config=cfg).prefer_ipv4)
+
+
+class SharedCloudAgreement(unittest.TestCase):
+    """An instance that declares no Cloud uses the shared production Cloud, and the bearer
+    allowlist names that host: the fallback and the allowlist never disagree."""
+
+    MINIMAL = {"instances": [{"server": "s.space", "gateway_host": "chat.s.space"}]}
+
+    def test_only_s_space_registered_and_no_cloud_uses_the_shared_production_cloud(self):
+        env = {"AGENT_MXID": "@a:s.space"}
+        origin = ds.default_cloud_origin(env, config=self.MINIMAL)
+        self.assertEqual(origin, "https://sutando.ag2.space")
+        self.assertIn(ds.server_of_gateway_url(origin), ds.trusted_cloud_hosts(self.MINIMAL))
+        self.assertEqual(ds.cloud_origin_for("s.space", fetch=ds.NO_FETCH, config=self.MINIMAL), "")
+
+    def test_the_fallback_host_is_always_allowlisted(self):
+        for cfg in (self.MINIMAL, {"instances": []}, None,
+                    {"instances": [{"server": "s.space", "cloud_origin": "https://sutando.s.space"}]}):
+            for env in ({"AGENT_MXID": "@a:s.space"}, {"AGENT_MXID": "@a:ag2.space"}, {}):
+                origin = ds.default_cloud_origin(env, config=cfg)
+                self.assertTrue(origin, (cfg, env))
+                self.assertIn(ds.server_of_gateway_url(origin), ds.trusted_cloud_hosts(cfg), (cfg, env))
 
 
 if __name__ == "__main__":

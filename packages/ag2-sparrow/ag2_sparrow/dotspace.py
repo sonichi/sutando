@@ -398,8 +398,13 @@ def cloud_origin_for(server: str, *, fetch: Optional[Fetch] = None,
 
 def trusted_cloud_hosts(config: Optional[Mapping[str, Any]] = None) -> frozenset:
     """Hosts a Sutando Cloud bearer may be sent to: every CONFIGURED instance's cloud origin (a
-    well-known declaration never widens this) plus the retired production host."""
+    well-known declaration never widens this), the shared production Cloud that an instance with
+    no cloud of its own falls back to (so the fallback and this allowlist always agree), and the
+    retired production host."""
     hosts = {LEGACY_CLOUD_HOST}
+    shared = server_of_gateway_url(legacy_dotspace(config).cloud_origin)
+    if shared:
+        hosts.add(shared)
     for entry in _config_entries(config):
         host = server_of_gateway_url(_origin(entry.get("cloud_origin")))
         if host:
@@ -420,10 +425,13 @@ def default_link_via(env: Optional[Mapping[str, str]] = None) -> str:
     return link_via_for(current_server(env), fetch=NO_FETCH) or legacy_dotspace().link_via
 
 
-def default_cloud_origin(env: Optional[Mapping[str, str]] = None) -> str:
-    """Sutando Cloud for this install: its server's DotSpace's, else the legacy one's. Config and
-    token only (read at import by callers). Per install: several DotSpaces still reach one cloud."""
-    return cloud_origin_for(current_server(env), fetch=NO_FETCH) or legacy_dotspace().cloud_origin
+def default_cloud_origin(env: Optional[Mapping[str, str]] = None,
+                         config: Optional[Mapping[str, Any]] = None) -> str:
+    """Sutando Cloud for this install: its server's DotSpace's, else the shared production one
+    (an instance with no cloud of its own uses the shared Cloud; `trusted_cloud_hosts` lists it).
+    Config only, never a fetch (callers read this at import)."""
+    own = cloud_origin_for(current_server(env), fetch=NO_FETCH, config=config)
+    return own or legacy_dotspace(config).cloud_origin
 
 
 # ----------------------------------------------------------------- install
