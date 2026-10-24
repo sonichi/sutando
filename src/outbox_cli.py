@@ -108,7 +108,9 @@ def cmd_requeue(args) -> int:
             payload["resend_epoch"] = epoch_written
         results_dir = args.results_dir or Path(args.root).parent
         body_id = getattr(args, "body_id", None) or args.item_id
-        outcome, path = undelivered_quarantine.restore(results_dir, body_id)
+        sha = getattr(args, "body_sha256", None)
+        outcome, path = (undelivered_quarantine.restore(results_dir, body_id, body_sha256=sha) if sha
+                         else undelivered_quarantine.restore(results_dir, body_id))
         payload["body_id"] = body_id
         payload["body"] = outcome.value
         payload["body_path"] = str(path) if path else None
@@ -160,6 +162,9 @@ def build_parser() -> argparse.ArgumentParser:
                          "instance keys the record by the broker id and names "
                          "the body file by the instance-qualified local id, so "
                          "one id cannot address both.")
+    rq.add_argument("--body-sha256", dest="body_sha256",
+                    help="restore only the quarantined copy with exactly this content, when one "
+                         "name holds several parked bodies")
     rq.add_argument("--operator", help="recorded as who did it")
     rq.add_argument("--reason", help="recorded as why")
     rq.set_defaults(func=cmd_requeue)

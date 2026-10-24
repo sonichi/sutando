@@ -886,6 +886,11 @@ def clear_dispatching(root: Path, item_id: str) -> None:
         _write_item(Path(root), item_id, d)
 
 
+def dispatch_unsettled(d: dict) -> bool:
+    """A send that left without a completed outcome: a receipt recorded, or a mark still set."""
+    return bool(d.get("provider_ref")) or isinstance(d.get("dispatching"), dict)
+
+
 def record_provider_ref(root: Path, item_id: str, provider_ref: str,
                         destination: Optional[str] = None) -> bool:
     """The provider's proof that a send landed, and where, kept on the item before it is
@@ -995,6 +1000,7 @@ def retry_failed_locked(root: Path, item_id: str, now: float) -> None:
     retry["next_attempt_at"] = (min(now + delay, retry["deadline"])
                                 if now < retry["deadline"] else now + delay)
     d["attempts"] = int(d.get("attempts", 0)) + 1
+    d.pop("dispatching", None)  # a definite refusal: nothing is in doubt, in this same write
     if _retry_exhausted(retry, now):
         d.update(status="PARKED", reason="retry-window-exhausted")
     _write_item(root, item_id, d)
@@ -1003,6 +1009,7 @@ def retry_failed_locked(root: Path, item_id: str, now: float) -> None:
 def note_attempt(root: Path, item_id: str) -> int:
     d = _read_item(Path(root), item_id)
     d["attempts"] = int(d.get("attempts", 0)) + 1
+    d.pop("dispatching", None)
     _write_item(Path(root), item_id, d)
     return d["attempts"]
 
@@ -1174,6 +1181,7 @@ def requeue_item_with_epoch(root: Path, item_id: str, *, reset_attempts: bool = 
         if reset_attempts:
             d["attempts"] = 0
             d.pop("retry", None)
+        d.pop("dispatching", None)  # the operator's resend is deliberate
         d["requeued_at"] = time.time()
         d["requeued_by"] = operator or "unknown"
         d["requeue_reason"] = reason or ""

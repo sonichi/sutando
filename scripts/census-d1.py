@@ -109,7 +109,7 @@ ROWS: "list[tuple[str, dict[str, tuple[str, list[tuple[str, str]]]]]]" = [
                     [(DISCORD, r"import outbox_log")]),
         "ag2space": ("gateway `event_id` only, recorded as `provider_ref` on the "
                      "proactive outbox item before it is marked delivered",
-                     [(AG2, r"from .outbox import record_provider_ref"),
+                     [(AG2, r"from \.outbox import .*record_provider_ref"),
                       (AG2, r"PROACTIVE_TRUST_OK", "absent")]),
         "slack": ("none persisted for replies (failures printed); proactive "
                   "marked delivered in `slack_proactive_receipts`",

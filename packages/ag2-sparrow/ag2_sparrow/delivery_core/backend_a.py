@@ -112,7 +112,9 @@ class DesignAClaimBackend:
             elif rec is not None and not outbox.may_reclaim_delivery(
                     self.root, item_id, self.reclaim_ttl_s):
                 return None
-            if self.retry_schedule is not None and not outbox.retry_ready_locked(
+            # A recorded receipt or an interrupted send is settled first, never spent as a retry.
+            unsettled = outbox.dispatch_unsettled(outbox._read_item(self.root, item_id))
+            if self.retry_schedule is not None and not unsettled and not outbox.retry_ready_locked(
                     self.root, item_id, self.retry_schedule, self.clock()):
                 if recovered_torn:
                     outbox._release_locked(self.root, item_id, worker)

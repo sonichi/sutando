@@ -316,7 +316,7 @@ from .team_guardrail import ag2space_tier_lines, owner_mention_lines
 from . import team_result_guard
 from . import health_command
 from . import __version__ as _PACKAGE_VERSION
-from .outbox import record_provider_ref
+from .outbox import dispatch_unsettled, record_provider_ref
 from .outbox import RetrySchedule, delivered_body_differs, read_item, source_digest
 from .outbox import list_items, requeue_item_with_epoch, RequeueOutcome
 from .proactive_recovery import claim_owner_may_be_alive as _pid_alive
@@ -5559,6 +5559,15 @@ def _room_is_deliverable_here(room: str) -> bool:
 
 _EVENT_ID_RE = re.compile(r"\$\S+")
 _ROOM_UPGRADED = "room-upgraded"
+# (item, room) pairs already logged as held for a changed destination: one line each per process.
+_DESTINATION_HELD: "set[tuple[str, str]]" = set()
+
+
+def _payload_room(payload) -> "str | None":
+    try:
+        return json.loads(payload or "{}").get("room_id")
+    except (ValueError, AttributeError):
+        return None
 
 
 def _proactive_item_id(stem: str, body: str) -> str:
@@ -5567,10 +5576,10 @@ def _proactive_item_id(stem: str, body: str) -> str:
     return f"{stem}~{hashlib.sha256(body.encode('utf-8')).hexdigest()[:16]}"
 
 
-def _proactive_requeue_command(root, item_id: str) -> str:
-    """The operator's resend: requeue the item and restore its quarantined body by file stem."""
+def _proactive_requeue_command(root, item_id: str, body_sha256: str) -> str:
+    """The operator's resend: requeue the item and restore exactly its own quarantined body."""
     return shlex.join(["python3", "src/outbox_cli.py", "--root", str(root), "requeue", item_id,
-                       "--body-id", item_id.rsplit("~", 1)[0]])
+                       "--body-id", item_id.rsplit("~", 1)[0], "--body-sha256", body_sha256])
 
 
 def _proactive_outbox_root() -> Path:
@@ -5681,8 +5690,9 @@ def _retire_proactive(claim: Path, original: Path, dest_dir: Path) -> None:
     than unlink, since a duplicate on a later pass beats a lost message.
     """
     try:
-        dest_dir.mkdir(parents=True, exist_ok=True)
-        claim.rename(dest_dir / f"{original.stem}-{int(time.time())}.txt")
+        # Never over an earlier copy: two bodies under one name are two retired generations.
+        names = (undelivered_quarantine.quarantine_name(original.stem, time.time_ns() + i) for i in range(64))
+        undelivered_quarantine.place_as(claim, dest_dir, names)
     except OSError as e:
         _log(f"could not retire proactive {original.name} ({diagnostics.describe(e)}) — re-queueing")
         try:
@@ -5939,9 +5949,22 @@ def _send_proactive(claim: Path, f: Path, envelope: dict, owner_dm: bool, notice
         # Refused for an upgraded room, so it never posted: resent to the room resolved now.
         requeue_item_with_epoch(core.backend.root, item_id, reset_attempts=True, operator=core.worker,
                                 reason="the room is no longer held", payload=payload.decode("utf-8"))
+    stored = read_item(core.backend.root, item_id) or {}
+    stored_room = _payload_room(stored.get("payload"))
+    if (stored.get("status") not in core.backend.TERMINAL and stored_room != envelope["room_id"]
+            and not dispatch_unsettled(stored)):
+        try:
+            claim.rename(f)  # held, never re-routed: the stored destination is the item's
+        except OSError:
+            pass
+        if (item_id, envelope["room_id"]) not in _DESTINATION_HELD:
+            _DESTINATION_HELD.add((item_id, envelope["room_id"]))
+            _log(f"proactive {f.name} HELD: it was queued for {stored_room} and its destination now "
+                 f"resolves to {envelope['room_id']}; it is not re-routed and waits until they agree")
+        return
     result = core.deliver_one(item_id, payload)
     item = read_item(core.backend.root, item_id) or {}
-    status, room = item.get("status"), envelope["room_id"]
+    status, room = item.get("status"), stored_room or envelope["room_id"]
     if status == "DELIVERED":
         ARCHIVE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
         try:
@@ -5973,12 +5996,16 @@ def _send_proactive(claim: Path, f: Path, envelope: dict, owner_dm: bool, notice
             _retire_proactive(claim, f, ARCHIVE_RESULTS_DIR)
             _log(f"proactive {f.name} withdrawn before its send: {reason[len(WITHDRAWN) + 1:]} — not sent")
             return
+        try:
+            body_sha256 = hashlib.sha256(claim.read_bytes()).hexdigest()
+        except OSError:
+            body_sha256 = ""
         _retire_proactive(claim, f, UNDELIVERABLE_RESULTS_DIR)
         if reason == "outcome-unknown":
             _log(f"proactive {f.name} may have reached {room} but the send was not confirmed "
                  f"({result.detail or 'no outcome'}); PARKED to {UNDELIVERABLE_RESULTS_DIR.name}/, not "
                  f"sent again. Check the room first; to send it again (it may post twice): "
-                 f"{_proactive_requeue_command(core.backend.root, item_id)}")
+                 f"{_proactive_requeue_command(core.backend.root, item_id, body_sha256)}")
         else:
             _log(f"proactive {f.name} PARKED to {UNDELIVERABLE_RESULTS_DIR.name}/ ({reason}"
                  f"{': ' + result.detail if result.detail else ''}) — it will NOT be re-sent")

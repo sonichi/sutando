@@ -73,6 +73,33 @@ def grammar() -> None:
           "the quarantine names a proactive stem as itself and a bare id as a task")
 
 
+def restore_by_generation() -> None:
+    import hashlib
+    import outbox_cli
+    results = Path(tempfile.mkdtemp(dir=ISO))
+    q = results / "undelivered"
+    q.mkdir()
+    (q / "proactive-g-100.txt").write_text("A\n", encoding="utf-8")
+    (q / "proactive-g-200.txt").write_text("B\n", encoding="utf-8")
+    want = hashlib.sha256(b"A\n").hexdigest()
+    outcome, path = undelivered_quarantine.restore(results, "proactive-g", body_sha256=want)
+    check(outcome is undelivered_quarantine.RestoreOutcome.RESTORED and path.read_text() == "A\n",
+          "restore by digest installs that generation, not the newest")
+    check(undelivered_quarantine.restore(results, "proactive-g", body_sha256="0" * 64)[0]
+          is undelivered_quarantine.RestoreOutcome.NOTHING_QUARANTINED, "an unmatched digest restores nothing")
+    check(undelivered_quarantine._sha256_of(results / "absent") is None, "an unreadable copy has no digest")
+    check(src_outbox.dispatch_unsettled({"provider_ref": "$e"}) and src_outbox.dispatch_unsettled({"dispatching": {}})
+          and not src_outbox.dispatch_unsettled({}), "unsettled means a receipt or a mark")
+    root = results / ".outbox-x"
+    DesignAClaimBackend(root).publish("proactive-g~1", b"{}")
+    src_outbox.park_item(root, "proactive-g~1", "outcome-unknown")
+    (results / "proactive-g.txt").unlink()
+    rc = outbox_cli.main(["--root", str(root), "requeue", "proactive-g~1", "--body-id", "proactive-g",
+                          "--body-sha256", hashlib.sha256(b"B\n").hexdigest()])
+    check(rc == 0 and (results / "proactive-g.txt").read_text() == "B\n",
+          f"the CLI restores the generation its digest names ({rc})")
+
+
 def gate_unreadable_task() -> None:
     ws = Path(tempfile.mkdtemp(dir=ISO))
     (ws / "tasks" / "task-unreadable.txt").mkdir(parents=True)
@@ -174,6 +201,7 @@ def main() -> int:
     outbox_writers()
     grammar()
     gate_unreadable_task()
+    restore_by_generation()
     core_and_provider()
     bridge_edges()
     return check.exit_code()
