@@ -1196,7 +1196,7 @@ KEY_TUPLES = {"TOKEN_KEYS", "URL_KEYS", "CREDENTIAL_KEYS", "TOKEN_FILE_KEY", "ME
 OWNER_ONLY = frozenset({"token_env_name", "_bridge_declaration_text", "_RECORD_TOKEN_ENV"})
 RECORD_KEY = "token_env"
 # The owner's accessors for a supervisor that reads a declaration: only the one reader may name them.
-READER_ONLY = frozenset({"bridge_declaration_fields", "bridge_token_environ", "bridge_strip_keys"})
+READER_ONLY = frozenset({"bridge_declaration_fields", "bridge_token_environ", "bridge_strip_keys", "bridge_carried_config"})
 # Outside the package, the one module that reads a bridge declaration, held to the owner-only rule.
 RECORD_READERS = {"sparrow_agent_bridge.py": REPO / "src" / "sparrow_agent_bridge.py"}
 # What names a credential file or store: a scope holding one of these and a read is credential I/O.
@@ -1211,7 +1211,8 @@ OWNER_MODULE = "gateway_credential_sources"
 # The owner's entry points: reachable only as `<alias>.<name>(...)` on the module's one import of it.
 OWNER_CALLS = frozenset(DECLARATION_OWNER_CALLS | READER_ONLY)
 # Owner calls whose callable arguments read credentials: (positional index, keyword names).
-OWNER_READERS = {"env_files": (1, ("read_text",)), "discover": (None, ("read_token_file", "vault_lookup"))}
+OWNER_READERS = {"env_files": (1, ("read_text",)), "bridge_carried_config": (1, ("read_text",)),
+                 "discover": (None, ("read_token_file", "vault_lookup"))}
 # Where credential I/O may happen: the adapters' edge, as (module, function).
 # The shared systemd reachability probe discards what show-environment prints.
 IO_ALLOWED = {("remote_gateway_bridge.py", "_read_env_file"), ("remote_gateway_bridge.py", "_read_text"),
@@ -1629,13 +1630,15 @@ def declaration_reads(source: str, rel: str) -> "list[str]":
 READER_ENVIRON = """
 token_env = _sources.bridge_token_environ(token)
 strip = _sources.bridge_strip_keys()
-env = {k: v for k, v in (os.environ if base is None else base).items()
-       if k not in HOST_ONLY and k not in strip}
+host = os.environ if base is None else base
+env = {k: v for k, v in host.items() if k not in HOST_ONLY and k not in strip}
 env.update(decl["env"], REMOTE_PROACTIVE_ROOM="")
+env.update(_sources.bridge_carried_config(host, read_regular))
 env.update(token_env)
 return env
 """
 READER_WRITES = {("bridge_environ", "env.update(decl['env'], REMOTE_PROACTIVE_ROOM='')"),
+                 ("bridge_environ", "env.update(_sources.bridge_carried_config(host, read_regular))"),
                  ("bridge_environ", "env.update(token_env)"),
                  ("main", "os.environ.clear()"), ("main", "os.environ.update(environ)")}
 MAPPING_WRITES = {"update", "setdefault", "__setitem__", "__delitem__", "pop", "popitem", "clear", "putenv", "unsetenv",
@@ -1931,15 +1934,55 @@ class Guard(unittest.TestCase):
                 self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o644)
                 self.assertEqual(sorted(p.name for p in path.parent.iterdir()), ["worker.json"], "no temp file left")
                 self.assertEqual(o.bridge_declaration_fields(), {"token_env": "REMOTE_TASK_TOKEN"})
-                self.assertEqual(o.bridge_token_environ("t"), {"REMOTE_TASK_TOKEN": "t"})
+                self.assertEqual(o.bridge_token_environ("t"), {"REMOTE_TASK_TOKEN": "t", "GATEWAY_CREDENTIALS_INJECTED": "1"})
+                self.assertEqual(o.BRIDGE_CARRIED_CONFIG, ("REMOTE_PROACTIVE_TRUST_OK",), "the one carried host setting")
                 self.assertEqual(o.bridge_strip_keys(), ("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN", "GATEWAY_TOKEN",
                                                          "RELAY_TOKEN", "REMOTE_MEDIA_HS_TOKEN"),
                                  "every name a host's gateway token may sit under: each token key, each contract alias "
                                  "and the media token, each once")
                 self.assertEqual(set(o.bridge_strip_keys()),
                                  set(o.TOKEN_KEYS) | set(o.contract.TOKEN_ALIAS_PRECEDENCE) | {o.MEDIA_TOKEN_KEY})
-                self.assertTrue(set(o.bridge_token_environ("t")) <= set(o.bridge_strip_keys()),
+                self.assertTrue(set(o.bridge_token_environ("t")) - {o.INJECTED_KEY} <= set(o.bridge_strip_keys()),
                                 "the name the agent's token goes under is stripped of the host's first")
+
+    def test_a_declared_bridge_reads_no_credential_file_and_the_host_resolves_what_it_carries(self):
+        canary = "canary-host-file-token-0123456789"
+        with tempfile.TemporaryDirectory() as d:
+            cfg = Path(d) / "channels" / "ag2space"
+            cfg.mkdir(parents=True)
+            opened = []
+
+            def read_text(path):
+                opened.append(path)
+                return Path(path).read_text(encoding="utf-8")
+            host = {"CLAUDE_CONFIG_DIR": d, "REMOTE_TASK_TOKEN": "host-env-token"}
+            for label, o in OWNERS.items():
+                with self.subTest(label):
+                    opened.clear()
+                    (cfg / ".env").write_text(f"REMOTE_TASK_TOKEN={canary}\nREMOTE_PROACTIVE_TRUST_OK=1\n", encoding="utf-8")
+                    child = {**host, **o.bridge_token_environ("agent-token")}
+                    self.assertTrue(o.credentials_injected(child))
+                    self.assertFalse(o.credentials_injected(host))
+                    files = o.env_files(child, read_text)
+                    self.assertEqual((list(files), files.credential_values, files.refused, files.blocked, opened),
+                                     ([], (), (), "", []), "injected: no channel file is opened, nothing is read")
+                    self.assertEqual(o.bridge_carried_config(child, read_text), {}, "the child resolves nothing itself")
+                    registry = o.contract.SecretRegistry()
+                    found = o.discover(child, files, registry=registry)
+                    self.assertEqual((found.token, found.token_source), ("agent-token", "env"))
+                    self.assertFalse(registry.contains(canary), "the host's file token is never registered")
+                    self.assertEqual(opened, [])
+                    # The host (no mark) resolves the carried setting from its own file; env wins when set.
+                    self.assertEqual(o.bridge_carried_config(host, read_text), {"REMOTE_PROACTIVE_TRUST_OK": "1"})
+                    self.assertEqual(opened, [str(cfg / ".env")])
+                    self.assertEqual(o.bridge_carried_config({**host, "REMOTE_PROACTIVE_TRUST_OK": "0"}, read_text),
+                                     {"REMOTE_PROACTIVE_TRUST_OK": "0"})
+                    self.assertEqual(opened, [str(cfg / ".env")], "set in the environment: the file is not opened")
+                    (cfg / ".env").write_text(f"REMOTE_TASK_TOKEN={canary}\n", encoding="utf-8")
+                    self.assertEqual(o.bridge_carried_config(host, read_text), {}, "set nowhere: absent, not blank")
+                    self.assertEqual(o.bridge_carried_config({}, read_text), {}, "no pointer: nothing to read")
+                    for value in o.bridge_carried_config(host, read_text).values():
+                        self.assertNotIn(canary, value)
 
     def test_the_owner_checks_and_removes_only_its_own_declaration(self):
         args = dict(written_by="x install", host="h", name="n", module="m", env={}, token_vault_key="k")
@@ -1985,6 +2028,7 @@ class Guard(unittest.TestCase):
                        'getattr(_sources, "_RECORD_TOKEN_ENV")', 'getattr(_sources, "CREDENTIAL_KEYS")',
                        '_sources.bridge_token_environ("")', 'getattr(_sources, "bridge_declaration_fields")()',
                        '_sources.bridge_strip_keys()', 'getattr(_sources, "bridge_strip_keys")()',
+                       '_sources.bridge_carried_config({}, f)', 'getattr(_sources, "bridge_carried_config")',
                        'from .gateway_credential_sources import bridge_token_environ',
                        'from .gateway_credential_sources import bridge_strip_keys'):
             self.assert_flagged(source)
@@ -2006,6 +2050,10 @@ class Guard(unittest.TestCase):
                            ('    strip = _sources.bridge_strip_keys()\n', '    strip = token_env\n'),
                            ('    strip = _sources.bridge_strip_keys()\n', '    strip = HOST_ONLY + tuple(token_env)\n'),
                            ('    strip = _sources.bridge_strip_keys()\n', '    strip = _sources.bridge_strip_keys()[:1]\n'),
+                           ('    env.update(_sources.bridge_carried_config(host, read_regular))\n',
+                            '    env.update(REMOTE_PROACTIVE_TRUST_OK=host.get("REMOTE_PROACTIVE_TRUST_OK", ""))\n'),
+                           ('    env.update(_sources.bridge_carried_config(host, read_regular))\n', ''),
+                           ('    env.update(token_env)\n', '    env.update(token_env)\n    env.pop(next(k for k in token_env if k != "REMOTE_TASK_TOKEN"))\n'),
                            ('    env.update(token_env)\n', '    env.update(token_env)\n    env["AG2_REMOTE_" + "TOKEN"] = token\n'),
                            ('    env.update(token_env)\n', '    env.update(token_env, X=os.environ.get("REMOTE_TASK_TOKEN"))\n')):
                 self.assertIn(mutant[0], text)

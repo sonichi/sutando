@@ -341,7 +341,8 @@ class Wrapper(Base):
                         token=os.environ.get("REMOTE_TASK_TOKEN"), mxid=os.environ.get("AGENT_MXID"),
                         device=os.environ.get("AG2_DEVICE_ENV"), token_file=os.environ.get("REMOTE_TASK_TOKEN_FILE"),
                         room=os.environ.get("REMOTE_PROACTIVE_ROOM"), keep=os.environ.get("KEEP_ME"),
-                        extra=sorted(set(os.environ) - set(base) - set(bridge.HOST_ONLY)))
+                        extra=sorted(set(os.environ) - set(base) - set(bridge.HOST_ONLY)
+                                     - set(_sources.bridge_token_environ(""))))
         base = set(os.environ)
         asked = []
         rc = bridge.main([str(decl)], workspace=self.ws, get_key=lambda k: asked.append(k) or "tok-agent", run=fake_run)
@@ -396,7 +397,8 @@ class Wrapper(Base):
     def test_every_name_the_owner_strips_is_stripped_before_the_agents_token_is_set(self):
         host = {k: f"host-{i}" for i, k in enumerate(_sources.bridge_strip_keys())}
         built = bridge.bridge_environ({"env": {"AGENT_MXID": AGENT}}, "tok-agent", base={**host, "KEEP_ME": "1"})
-        self.assertEqual({k: v for k, v in built.items() if k in host}, _sources.bridge_token_environ("tok-agent"))
+        self.assertEqual({k: v for k, v in built.items() if k in host},
+                         {k: v for k, v in _sources.bridge_token_environ("tok-agent").items() if k in host})
         self.assertEqual(built["KEEP_ME"], "1")
 
     def test_no_token_means_no_bridge(self):
@@ -425,6 +427,93 @@ class Wrapper(Base):
                 mock.patch.dict(sys.modules, {"vault_intercept": fake_vault}):
             self.assertEqual(bridge.main([str(decl)], run=run), 0)
         run.assert_called_once()
+
+class HostCredentialFiles(Base):
+    """The shipped path, in this process: sparrowd's wrapper hands the bridge module an environment that keeps
+    the host's CLAUDE_CONFIG_DIR (for access.json) but the bridge opens no channel .env under it."""
+    CANARY = "canary-host-file-token-0123456789"
+    BRIDGE = "ag2_sparrow.remote_gateway_bridge"
+
+    def setUp(self):
+        super().setUp()
+        self.cfg = self.ws / "host-config"
+        channel = self.cfg / "channels" / "ag2space"
+        channel.mkdir(parents=True)
+        self.dotenv = channel / ".env"
+        self.dotenv.write_text(f"REMOTE_TASK_TOKEN={self.CANARY}\nREMOTE_PROACTIVE_TRUST_OK=1\n", encoding="utf-8")
+        self.access = channel / "access.json"
+        self.access.write_text(json.dumps({"@someone:ag2.space": "team"}), encoding="utf-8")
+        self.opens = []
+        import builtins
+        from ag2_sparrow import bounded_file_read
+
+        def recording(real):
+            def opener(path, *a, **k):
+                if isinstance(path, (str, os.PathLike)):
+                    self.opens.append(os.fspath(path))
+                return real(path, *a, **k)
+            return opener
+        # The bounded reader (the wrapper's bound name too) and open itself: every file touched is on the record.
+        for target, name in ((builtins, "open"), (bounded_file_read, "read_regular"), (bounded_file_read, "read_regular_text"),
+                             (bridge, "read_regular")):
+            real = getattr(target, name, bounded_file_read.read_regular)
+            patch = mock.patch.object(target, name, recording(real), create=True)
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.saved_module = sys.modules.pop(self.BRIDGE, None)
+        self.addCleanup(lambda: sys.modules.__setitem__(self.BRIDGE, self.saved_module) if self.saved_module
+                        else sys.modules.pop(self.BRIDGE, None))
+
+    def launch(self, host_env):
+        """Run the wrapper under `host_env` with the bridge module imported where the bridge would run: the
+        module, the environment it saw, every path opened by the child alone, and its stderr."""
+        decl = self.declare()
+        seen = {}
+        err = io.StringIO()
+
+        def child(module, run_name, alter_sys):
+            self.assertEqual(module, self.BRIDGE)
+            seen["parent_opens"] = list(self.opens)
+            del self.opens[:]
+            import importlib
+            seen["mod"] = importlib.import_module(self.BRIDGE)
+            seen["tier_map"] = seen["mod"]._load_tier_map()
+            seen["access_path"] = seen["mod"]._ag2space_access_path()
+            seen["env"] = dict(os.environ)
+            seen["child_opens"] = list(self.opens)
+        with mock.patch.dict(os.environ, host_env), contextlib.redirect_stderr(err):
+            rc = bridge.main([str(decl)], workspace=self.ws, get_key=lambda k: "tok-agent", run=child)
+        self.assertEqual(rc, 0)
+        seen["stderr"] = err.getvalue()
+        return seen
+
+    def test_the_bridge_child_never_opens_the_hosts_channel_env_and_keeps_access_json_and_the_trust_setting(self):
+        seen = self.launch({"CLAUDE_CONFIG_DIR": str(self.cfg), "REMOTE_TASK_TOKEN": "host-token"})
+        mod, env = seen["mod"], seen["env"]
+        self.assertNotIn(str(self.dotenv), seen["child_opens"], "the child opened the host's channel .env")
+        self.assertFalse(any(p.endswith(".env") for p in seen["child_opens"]), seen["child_opens"])
+        self.assertFalse(mod._SECRETS.contains(self.CANARY), "the host's file token is in the child's registry")
+        self.assertFalse(mod._SECRETS.holds_or_is_piece(self.CANARY))
+        self.assertNotIn(self.CANARY, env.values())
+        self.assertNotIn(self.CANARY, seen["stderr"])
+        self.assertNotIn("host-token", env.values())
+        self.assertEqual(mod.TOKEN, "tok-agent")
+        self.assertEqual(env.get("CLAUDE_CONFIG_DIR"), str(self.cfg), "the config root stays: access.json needs it")
+        self.assertEqual(seen["access_path"], str(self.access))
+        self.assertIn(str(self.access), seen["child_opens"], "the tier map is still read from the host's config root")
+        self.assertIs(mod.PROACTIVE_TRUST_OK, True, "the host's file setting reaches the child, carried by the wrapper")
+        self.assertEqual(env.get("REMOTE_PROACTIVE_TRUST_OK"), "1")
+        self.assertIn(str(self.dotenv), seen["parent_opens"], "the wrapper, as the host, is what read the file")
+        self.assertEqual(mod.PROACTIVE_ROOM, "")
+
+    def test_the_hosts_environment_setting_wins_and_the_child_still_opens_nothing(self):
+        seen = self.launch({"CLAUDE_CONFIG_DIR": str(self.cfg), "REMOTE_TASK_TOKEN": "host-token",
+                            "REMOTE_PROACTIVE_TRUST_OK": "0"})
+        self.assertEqual(seen["child_opens"], [p for p in seen["child_opens"] if not p.endswith(".env")])
+        self.assertIs(seen["mod"].PROACTIVE_TRUST_OK, False)
+        self.assertEqual(seen["parent_opens"], [p for p in seen["parent_opens"] if p != str(self.dotenv)],
+                         "set in the host's environment: not even the wrapper opens the file")
+        self.assertFalse(seen["mod"]._SECRETS.contains(self.CANARY))
 
 
 if __name__ == "__main__":

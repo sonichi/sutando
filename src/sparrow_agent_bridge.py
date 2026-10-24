@@ -14,8 +14,10 @@ is (`held`). An agents directory that cannot be listed or a home that cannot be 
 (nothing is known), never "nothing declared": a supervisor keeps what runs until the scan can be made
 again. Each declaration carries the digest of its bytes, so an edited one is a changed worker. Run as a script with
 a declaration path, it re-checks it, builds the bridge's environment (sparrowd's own, minus the host's
-token, identity and owner-DM variables, plus the derived env and the vault token, never on disk),
-injects the agent's dirs and the workspace's task stamper, and runs the package bridge in this process.
+tokens, identity and owner-DM variables, plus the derived env, the host config the owner lists for a
+bridge, resolved here where the host's files may be read, and the vault token, never on disk, marked as
+handed in so the bridge opens no credential file), injects the agent's dirs and the workspace's task
+stamper, and runs the package bridge in this process.
 """
 from __future__ import annotations
 
@@ -35,6 +37,7 @@ for _p in (str(_SRC), str(_REPO / "packages" / "ag2-sparrow")):
 
 from ag2_sparrow import agent_identity, gateway_credential_sources as _sources  # noqa: E402
 from ag2_sparrow.adapters.claude_code import cli as adapter  # noqa: E402
+from ag2_sparrow.bounded_file_read import read_regular  # noqa: E402
 
 WRITTEN_BY = f"{adapter.COMMAND} install"
 BRIDGE_MODULE = "ag2_sparrow.remote_gateway_bridge"
@@ -126,12 +129,14 @@ def load(path: Path, agents: Path) -> "tuple[dict | None, str]":
 
 def bridge_environ(decl: dict, token: str, base=None) -> dict:
     """What the bridge runs under: sparrowd's environment minus the host-only variables and every name the
-    owner lists for a host's gateway tokens, plus the derived env, an empty owner DM and the agent's token."""
+    owner lists for a host's gateway tokens, plus the derived env, an empty owner DM, the host config the
+    owner carries for a bridge (resolved here, from the host's files if need be) and the agent's token."""
     token_env = _sources.bridge_token_environ(token)
     strip = _sources.bridge_strip_keys()
-    env = {k: v for k, v in (os.environ if base is None else base).items()
-           if k not in HOST_ONLY and k not in strip}
+    host = os.environ if base is None else base
+    env = {k: v for k, v in host.items() if k not in HOST_ONLY and k not in strip}
     env.update(decl["env"], REMOTE_PROACTIVE_ROOM="")
+    env.update(_sources.bridge_carried_config(host, read_regular))
     env.update(token_env)
     return env
 

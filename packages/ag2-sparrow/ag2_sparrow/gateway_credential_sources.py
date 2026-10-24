@@ -118,9 +118,34 @@ def bridge_declaration_fields() -> "dict[str, str]":
     return {_RECORD_TOKEN_ENV: token_env_name()}
 
 
+# Set in a declared bridge's environment by the supervisor that hands it its token: the credential
+# file tiers are then closed, so the bridge never opens the host's channel .env (see env_files).
+INJECTED_KEY = "GATEWAY_CREDENTIALS_INJECTED"
+# The host config a supervisor resolves for a declared bridge and carries in as plain values, each
+# audited here: none is a credential, and the bridge reads no file to find them.
+BRIDGE_CARRIED_CONFIG = ("REMOTE_PROACTIVE_TRUST_OK",)
+
+
 def bridge_token_environ(token: str) -> "dict[str, str]":
-    """The variables a declared bridge's token is handed to it under."""
-    return {token_env_name(): token}
+    """The variables a declared bridge's token is handed to it under, with the mark that it was."""
+    return {token_env_name(): token, INJECTED_KEY: "1"}
+
+
+def credentials_injected(env: Mapping[str, str]) -> bool:
+    """Whether `env` is a declared bridge's: its token was handed in, so no credential file is read."""
+    return bool(env.get(INJECTED_KEY))
+
+
+def bridge_carried_config(env: Mapping[str, str], read_text: "Callable[[str], object]") -> "dict[str, str]":
+    """The BRIDGE_CARRIED_CONFIG values a host given `env` holds, from its environment first and else
+    from its channel .env files through `read_text`, for a supervisor to hand a declared bridge. A key
+    the host sets nowhere is absent. The files' credentials stay inside this call."""
+    carried = {k: env[k] for k in BRIDGE_CARRIED_CONFIG if k in env}
+    missing = [k for k in BRIDGE_CARRIED_CONFIG if k not in carried]
+    if missing:
+        files = env_files(env, read_text)
+        carried.update({k: config_from_files(files, k) for k in missing if any(k in vals for _p, vals in files)})
+    return carried
 
 
 def bridge_strip_keys() -> "tuple[str, ...]":
@@ -199,8 +224,11 @@ def env_files(env: Mapping[str, str], read_text: "Callable[[str], object]") -> E
     """The channel .env files a Sparrow given `env` reads, in order, through the caller's
     `read_text` (see _read_result). An absent file is skipped; a refused one is recorded and
     skipped, a refused AG2_DEVICE_ENV also setting `blocked`, which discover() applies to the
-    credential tiers only: later files still supply config. The bridge calls this."""
+    credential tiers only: later files still supply config. The bridge calls this. A declared bridge
+    (credentials_injected) reads none: its token was handed in, and the host's files are the host's."""
     out, values, refused = EnvFiles(), [], []
+    if credentials_injected(env):
+        return out
     device = env.get("AG2_DEVICE_ENV") or ""
     for path in channel_env_paths(env, channel_dir(env)):
         text, reason = _read_result(read_text(path))
