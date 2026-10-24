@@ -566,7 +566,10 @@ under a delivered name is a new send, while the room and thread, re-resolved on 
 are not part of the key. The room, thread and body stored when the item is first published
 are what is sent, as one `POST /v1/room` `op: message` with that item's `dedupe_key` (and
 `thread_root` when it posts in a thread). The logged `outbox_cli.py requeue <item> --body-id
-<stem>` restores the quarantined body under its file name, which maps back to the same item. The outbox owns the claim, the retry and the outcome; the drain only
+<stem> --body-sha256 <digest>` restores exactly that item's quarantined body (one name can
+hold several parked generations) under its file name, which maps back to the same item. A
+stored destination that no longer matches the resolved one (an owner DM that moved after a
+refusal) holds the file, logged once; it is never re-routed. The outbox owns the claim, the retry and the outcome; the drain only
 moves the file as the outcome says. The room send is neither idempotent nor reconcilable,
 so:
 
