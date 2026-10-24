@@ -28,12 +28,18 @@ attempt record is a journal: its phase (snapshot, quiesced, installing, installe
 restoring) is written before each step, so an attempt found dead (the lock free) is
 settled from it: nothing installed means crashed (Sparrow restarted if it was stopped), a
 namespace that differs from the snapshot or an interrupted restore is restored, and an
-interrupted restore resumes on the next run. A changed hook definition (install's
-REQUIRED hook: line) is never applied: the hook wakes the agent once with it."""
+interrupted restore resumes on the next run. While an attempt is held (recovery_blocked:
+restore-failed, a mutating phase, or a journal that exists but cannot be read) nothing
+starts Sparrow or an upgrade, and a failed version is never imported; the owner's install
+lifts a restore-failed hold (release_hold) only once every installed file verifies
+against its RECORD (verify_installed). A changed hook definition (install's REQUIRED
+hook: line) is never applied: the hook wakes the agent once with it."""
 from __future__ import annotations
 
 import argparse
+import base64
 import contextlib
+import csv
 import hashlib
 import importlib.metadata
 import json
@@ -415,6 +421,66 @@ def install_argv(cfg: dict) -> list:
     return argv
 
 
+def _metadata_version() -> str:
+    """The version the install record names, read without importing the package."""
+    dist = _distribution()
+    return (dist.version or "") if dist is not None else ""
+
+
+def verify_installed(dist) -> "list[str]":
+    """How the installed files differ from the sha256 their RECORD names: a recorded file
+    missing or changed, one recorded without a hash, or a file in a package-owned
+    directory (ag2_sparrow*) that RECORD does not list. Empty when every byte is known."""
+    why = unsupported_install(dist)
+    if why:
+        return [why]
+    problems, recorded = [], set()
+    # RECORD is parsed here: Distribution.files drops the rows whose file is missing.
+    for row in csv.reader((dist.read_text("RECORD") or "").splitlines()):
+        if not row or not row[0]:
+            continue
+        path = Path(os.path.normpath(dist.locate_file(row[0])))
+        mode, _, value = (row[1] if len(row) > 1 else "").partition("=")
+        recorded.add(path)
+        if not value:
+            if path.name != "RECORD" and "__pycache__" not in path.parts:
+                problems.append(f"unhashed {path}")
+        elif not path.is_file():
+            problems.append(f"missing {path}")
+        elif mode != "sha256" or base64.urlsafe_b64encode(bytes.fromhex(
+                _sha256(path))).rstrip(b"=").decode() != value:
+            problems.append(f"changed {path}")
+    site = Path(os.path.normpath(dist.locate_file("")))
+    for top in (site / n for n in _listing(site) if _OWN_RE.match(n)):
+        found = [top] if top.is_file() else top.rglob("*")
+        problems += [f"unrecorded {p}" for p in sorted(found) if p.is_file()
+                     and "__pycache__" not in p.parts and p not in recorded]
+    return problems
+
+
+def release_hold(state_dir: Path) -> "str | None":
+    """For the owner's install: lift a restore-failed hold once the installed files verify
+    against their RECORD (verify_installed). None when Sparrow may start, else why not."""
+    with upgrade_lock(state_dir) as free:
+        if not free:
+            return "an upgrade is running"
+        held = recovery_blocked(state_dir)
+        if held is None:
+            return None
+        attempted = load_state(state_dir)["attempted"] if "cannot be read" not in held else {}
+        if not any(t.get("phase") == "restore-failed" for t in attempted.values()):
+            return held
+        problems = verify_installed(_distribution())
+        if problems:
+            return (f"{held}, and the installed files do not verify ({'; '.join(problems[:3])}"
+                    f"{' ...' if len(problems) > 3 else ''}); reinstall ag2-sparrow with pip "
+                    "--force-reinstall, then run install again")
+        if clear_blocked(state_dir):
+            print("cleared: a failed self-upgrade's hold on restarting Sparrow (the installed "
+                  "files verify against their RECORD)")
+        return recovery_blocked(state_dir)
+
+
 def installed_version() -> str:
     """The version a fresh interpreter imports, which is what Sparrow will run."""
     r = _run([sys.executable, "-c", "import ag2_sparrow; print(ag2_sparrow.__version__)"], 60)
@@ -468,6 +534,10 @@ def maybe_start(cfg: dict, setup: "dict | None", installed: str = __version__,
         return settled
     if setup is None:
         return None
+    blocked = recovery_blocked(state_dir)
+    if blocked:
+        print(f"upgrade: recovery-blocked: {blocked}", file=sys.stderr)
+        return "recovery-blocked"
     decision, detail, hashes = _decide(cfg, setup, installed)
     if decision:
         print(f"upgrade: {decision}: {detail}", file=sys.stderr)
@@ -521,7 +591,10 @@ def settle_attempt(cfg: dict, state_dir: Path, now: float) -> "str | None":
             state["failed"] = {"target": target, "from": previous, "installed": current,
                                "why": why, "at": now}
             save_state(state_dir, state)
-            if phase == "quiesced":
+            held = recovery_blocked(state_dir) if phase == "quiesced" else None
+            if held:
+                print(f"error: Sparrow is not started: {held}", file=sys.stderr)
+            elif phase == "quiesced":
                 ok, how = start_sparrow(cfg, tried.get("manager"))
                 print(("started: " if ok else "error: Sparrow did not start: ") + how,
                       file=sys.stderr if not ok else sys.stdout)
@@ -609,7 +682,7 @@ def _rollback(cfg: dict, state_dir: Path, previous: str, target: str, why: str,
     unless the restore verified."""
     print(f"upgrade to {target} failed ({why}); restoring {previous}", file=sys.stderr)
     _phase(state_dir, target, "restoring")
-    problems = []
+    problems, verified = [], False
     quiet, how, stopped_by = stop_sparrow(cfg)
     manager = stopped_by or manager
     if not quiet:
@@ -621,6 +694,7 @@ def _rollback(cfg: dict, state_dir: Path, previous: str, target: str, why: str,
             # Unverified files are never started: Sparrow stays stopped for the owner.
             problems.append(f"restore: {e}; Sparrow is left stopped")
         else:
+            verified = True
             r = _run(install_argv(cfg), INSTALL_TIMEOUT_S)
             if r.returncode != 0:
                 problems.append(f"install: {_why(r)}")
@@ -630,7 +704,8 @@ def _rollback(cfg: dict, state_dir: Path, previous: str, target: str, why: str,
                 problems.append(f"start: {how}")
             elif _keepalive._await_connected(state_dir, _keepalive._instance(cfg), since) != 0:
                 problems.append("Sparrow did not reconnect")
-    installed = installed_version()
+    # Unverified files are never imported, not even to read their version.
+    installed = installed_version() if verified else _metadata_version()
     if installed != previous:
         problems.append(f"{installed or 'no version'} is installed, not {previous}")
     outcome = "restore-failed" if problems else "rolled-back"
@@ -655,6 +730,12 @@ def run_upgrade(cfg: dict, target: str, hashes: dict) -> str:
 
 
 def _upgrade_locked(cfg: dict, state_dir: Path, target: str, hashes: dict) -> str:
+    blocked = recovery_blocked(state_dir)
+    if blocked:
+        print(f"upgrade: skipped: {blocked}", file=sys.stderr)
+        with contextlib.suppress(JournalError):
+            _finish(state_dir, target, "recovery-blocked")
+        return "recovery-blocked"
     dist = _distribution()
     why = unsupported_install(dist)
     if why:

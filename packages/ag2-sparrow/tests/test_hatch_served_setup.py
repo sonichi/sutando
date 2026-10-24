@@ -3,7 +3,9 @@ served text with built-in fallback, the setup cache, clamped tunables, and the k
 self-upgrade. No network and no real pip: every subprocess the upgrade runs is faked. Run:
     python3 packages/ag2-sparrow/tests/test_hatch_served_setup.py
 """
+import base64
 import contextlib
+import hashlib
 import importlib.metadata
 import io
 import json
@@ -2298,7 +2300,13 @@ class FakeSite:
         if self.extras and version != "0.5.4":
             files += ["ag2_sparrow_newtop/sub/m.py", "sparrow_vendor/sub/m.py",
                       "../../bin/ag2-sparrow-newcmd", "../../bin/sprw-tool"]
-        (info / "RECORD").write_text("".join(f"{f},,\n" for f in files))
+        rows = []
+        for f in files:
+            path = Path(os.path.normpath(self.site / f))
+            digest = "" if f.endswith("/RECORD") else "sha256=" + base64.urlsafe_b64encode(
+                hashlib.sha256(path.read_bytes()).digest()).rstrip(b"=").decode()
+            rows.append(f"{f},{digest},\n")
+        (info / "RECORD").write_text("".join(rows))
 
     def version(self):
         text = (self.site / "ag2_sparrow" / "__init__.py").read_text()
@@ -2820,6 +2828,65 @@ class Upgrade(Base):
         self.assertIsNone(self_upgrade.failed_since(self.state))
         self.assertEqual(keepawake(5000.0)[1], 1, "no journal: nothing is pending")
 
+    def test_a_held_recovery_starts_no_upgrade_and_the_worker_refuses_one(self):
+        # Kewei's shape: A=0.6.0 failed its restore; the backend now serves B=0.7.0.
+        with mock.patch.object(self_upgrade, "restore", side_effect=OSError("disk full")):
+            self.connected.side_effect = [1]
+            self.assertEqual(self.run_upgrade(self.fake()), "restore-failed")
+        log, setup_b = self.home / "log", self.setup(target="0.7.0")
+        with mock.patch.object(keepalive, "listener_up", return_value=False), \
+                mock.patch.object(keepalive, "restart_listener", return_value=(True, "r")) as rl, \
+                mock.patch.object(runtime_text, "refresh_cache", return_value=setup_b), \
+                mock.patch.object(self_upgrade, "_spawn", return_value=True) as spawn, \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(keepalive.keepawake(self.cfg, log, now=5000.0), 1)
+        self.assertEqual((rl.call_count, spawn.call_count), (0, 0))
+        self.assertIn("reason=upgrade-failed upgrade=recovery-blocked", log.read_text())
+        self.assertNotIn("0.7.0", self_upgrade.load_state(self.state)["attempted"])
+        self.assertEqual(self.start(setup_b, installed="0.6.0")[0], "recovery-blocked")
+        self.events.clear()
+        fake = self.fake()
+        self.assertEqual(self.run_upgrade(fake, hashes={"w.whl": SHA_NEW}, target="0.7.0"),
+                         "recovery-blocked")
+        self.assertEqual((fake.calls, self.events), ([], []), "nothing snapshotted, stopped or run")
+        self.assertIn("left unverified files (restore-failed)", self.err)
+
+    def test_a_failed_restore_never_imports_the_unverified_package(self):
+        self.connected.side_effect = [1]
+        with mock.patch.object(self_upgrade, "restore", side_effect=OSError("disk full")), \
+                mock.patch.object(self_upgrade, "installed_version",
+                                  side_effect=lambda: (self.events.append("import"), "0.6.0")[1]):
+            self.assertEqual(self.run_upgrade(self.fake()), "restore-failed")
+        self.assertEqual(self.events[-2:], ["import", "stop"],
+                         "the target is imported once, while verified; never after the failure")
+        failed = self_upgrade.load_state(self.state)["failed"]
+        self.assertEqual(failed["installed"], "0.6.0", "read from the metadata, not by importing")
+        self.events.clear()
+        self.stop_ok = "rollback"
+        self.site.install("0.5.4")
+        self_upgrade.save_state(self.state, {"attempted": {}})
+        with mock.patch.object(self_upgrade, "installed_version",
+                               side_effect=lambda: (self.events.append("import"), "0.5.4")[1]):
+            self.assertEqual(self.run_upgrade(self.fake(fail={"pip-install"})), "restore-failed")
+        self.assertNotIn("import", self.events, "an unproven stop imports nothing either")
+
+    def test_the_installed_files_verify_only_when_every_recorded_hash_matches(self):
+        self.assertEqual(self_upgrade.verify_installed(self.site.distribution()), [])
+        init = self.site.site / "ag2_sparrow" / "__init__.py"
+        init.write_text('__version__ = "0.6.0"\n')
+        self.assertEqual(self_upgrade.verify_installed(self.site.distribution()),
+                         [f"changed {init}"])
+        self.site.install("0.5.4")
+        residue = self.site.site / "ag2_sparrow" / "new_in_target.py"
+        residue.write_text("x = 1\n")
+        self.assertEqual(self_upgrade.verify_installed(self.site.distribution()),
+                         [f"unrecorded {residue}"])
+        residue.unlink()
+        (self.site.bin / "ag2-sparrow-hatch").unlink()
+        self.assertEqual(self_upgrade.verify_installed(self.site.distribution()),
+                         [f"missing {self.site.bin / 'ag2-sparrow-hatch'}"])
+        self.assertIn("not installed", self_upgrade.verify_installed(None)[0])
+
     def test_keepawake_never_restarts_on_unverified_files_or_a_failed_settlement(self):
         # A dead mutating attempt with no snapshot: restore-failed, the listener stays down.
         self.start(self.setup(), now=1000.0)
@@ -2856,7 +2923,7 @@ class Upgrade(Base):
             self.assertEqual(self.run_upgrade(fake), "restore-failed")
         restore.assert_not_called()
         self.assertEqual(fake.of("install"), [])
-        self.assertEqual(self.events[self.events.index("pip-install"):], ["pip-install", "stop", "version"])
+        self.assertEqual(self.events[self.events.index("pip-install"):], ["pip-install", "stop"])
         problems = self_upgrade.load_state(self.state)["failed"]["problems"]
         self.assertTrue(problems[0].startswith("stop: ") and "nothing was restored" in problems[0])
 
@@ -2874,8 +2941,8 @@ class Upgrade(Base):
         self.assertEqual(len(problems), 1)
         self.assertRegex(problems[0], r"^restore: the files do not match the snapshot of 0\.5\.4: changed .*__init__\.py")
         after_stop = self.events[len(self.events) - self.events[::-1].index("stop") - 1:]
-        self.assertEqual(after_stop, ["stop", "version"],
-                         "no install re-run and no start on a mismatch: Sparrow stays stopped")
+        self.assertEqual(after_stop, ["stop"],
+                         "no install re-run, start or import on a mismatch: Sparrow stays stopped")
 
     def test_a_hand_made_or_unreachable_unit_is_never_upgraded_unattended(self):
         for owner, decision in (("other", "hand-made-service"),
@@ -2914,7 +2981,7 @@ class Upgrade(Base):
         with mock.patch.object(self_upgrade, "restore", side_effect=OSError("disk full")):
             self.assertEqual(self.run_upgrade(self.fake()), "restore-failed")
         self.assertEqual(self.events[self.events.index("install") + 1:],
-                         ["start", "version", "stop", "version"], "unverified files are never started")
+                         ["start", "version", "stop"], "unverified files are never started")
         state = self_upgrade.load_state(self.state)
         self.assertEqual(state["attempted"]["0.6.0"]["outcome"], "restore-failed")
         failed = state["failed"]

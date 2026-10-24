@@ -730,7 +730,12 @@ def _install(args) -> int:
     _install_file(config_path(), config, 0o600, refuse_drift=False, force=True)
     activity.parent.mkdir(parents=True, exist_ok=True)
     owner = keepalive._unit_owner() if args.no_service else None
-    left_stopped = False
+    left_stopped, held = False, None
+    if not args.no_start:
+        from . import self_upgrade
+        held = self_upgrade.release_hold(state_dir.resolve())
+        if held:
+            print(f"error: Sparrow is not started: {held}", file=sys.stderr)
     if owner == keepalive.UNIT_UNREACHABLE:
         print(f"skipped: the ag2-sparrow user service (--no-service); {service_path()} is "
               "installed but systemctl --user did not answer, so whether that service runs Sparrow "
@@ -746,17 +751,16 @@ def _install(args) -> int:
         left_stopped = install_service(task_dir.resolve(), result_dir.resolve(), state_dir.resolve(), instance,
                                        args.force,
                                        "" if args.no_keepalive else keepalive.health_command(reply_command),
-                                       reply_command, mxid=args.mxid, may_start=not args.no_start)
+                                       reply_command, mxid=args.mxid,
+                                       may_start=not (args.no_start or held))
     if args.no_keepalive:
         print("skipped: the keepalive task (--no-keepalive)")
     else:
         keepalive.install_tasks(read_config(config_path()), args.force)
-    if not args.no_start:
-        from . import self_upgrade
-        if self_upgrade.clear_blocked(state_dir.resolve()):
-            print("cleared: a failed self-upgrade's hold on restarting Sparrow (this install "
-                  "put the files in place)")
-    if left_stopped:
+    if held:
+        rc = 1
+        print("skipped: starting and checking Sparrow (a failed self-upgrade holds it stopped)")
+    elif left_stopped:
         rc = 1
         print("skipped: starting and checking Sparrow (the service was left stopped above)")
     elif args.no_start:

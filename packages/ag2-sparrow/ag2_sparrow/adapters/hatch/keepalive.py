@@ -585,7 +585,7 @@ def keepawake(cfg: dict, log: Path, now: float | None = None) -> int:
         rc, reason = 1, UPGRADE_FAILED
         print(f"error: Sparrow is not restarted: {blocked}; run ag2-sparrow-hatch install to "
               "put a verified version back", file=sys.stderr)
-    upgrade = _served_setup(cfg, settled) if free else "running"
+    upgrade = _served_setup(cfg, settled, blocked) if free else "running"
     line = f"{_utc(now)} keepawake listener={'up' if up else 'down'} restarted={restarted}" \
         + (f" reason={reason}" if reason else "") + (f" upgrade={upgrade}" if upgrade else "")
     log.parent.mkdir(parents=True, exist_ok=True)
@@ -634,12 +634,16 @@ def _settle_upgrade(cfg: dict, now: float) -> "tuple[str | None, str | None]":
     return settled, self_upgrade.recovery_blocked(_state_dir(cfg))
 
 
-def _served_setup(cfg: dict, settled: "str | None" = None) -> "str | None":
+def _served_setup(cfg: dict, settled: "str | None" = None,
+                  blocked: "str | None" = None) -> "str | None":
     """Refresh the served setup and decide on the upgrade it calls for; never fails the run.
-    `settled` is this run's verdict on a dead attempt, which is the line's decision."""
+    `settled` is this run's verdict on a dead attempt, which is the line's decision; while
+    `blocked` (a held recovery) no upgrade is started."""
     from . import runtime_text, self_upgrade
     try:
         setup = runtime_text.refresh_cache(_state_dir(cfg), _instance(cfg))
+        if blocked:
+            return settled or "recovery-blocked"
         return settled or self_upgrade.maybe_start(cfg, setup)
     except Exception as e:  # noqa: BLE001 - keepawake's own job must still be logged
         print(f"NOTE served setup: {diagnostics.describe(e)}", file=sys.stderr)

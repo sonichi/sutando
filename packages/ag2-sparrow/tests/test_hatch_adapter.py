@@ -1573,15 +1573,57 @@ class Service(Base):
             self.cli("install", "--mxid", AGENT)
             self.assertIs(svc.call_args.kwargs["may_start"], True)
 
-    def test_an_install_that_starts_clears_a_failed_upgrades_hold_and_no_start_does_not(self):
+    def test_an_install_that_starts_checks_a_failed_upgrades_hold_and_no_start_does_not(self):
         from ag2_sparrow.adapters.hatch import self_upgrade
-        with mock.patch.object(hatch_cli, "install_service"), \
-                mock.patch.object(self_upgrade, "clear_blocked", return_value=True) as clear:
+        with mock.patch.object(hatch_cli, "install_service") as svc, \
+                mock.patch.object(self_upgrade, "release_hold", return_value=None) as release:
             self.cli("install", "--mxid", AGENT, "--no-start")
-            clear.assert_not_called()
-            r = self.cli("install", "--mxid", AGENT)
-            clear.assert_called_once_with(self.state.resolve())
-        self.assertIn("cleared: a failed self-upgrade's hold", r.stdout)
+            release.assert_not_called()
+            self.cli("install", "--mxid", AGENT)
+            release.assert_called_once_with(self.state.resolve())
+            self.assertIs(svc.call_args.kwargs["may_start"], True)
+
+    def test_a_failed_recovery_hold_is_lifted_only_by_verified_files_and_before_any_start(self):
+        from ag2_sparrow.adapters.hatch import self_upgrade
+        journal = self.state / "hatch-upgrade.json"
+
+        def blocked():
+            self.state.mkdir(parents=True, exist_ok=True)
+            journal.write_text(json.dumps({"attempted": {"0.6.0": {
+                "from": "0.5.4", "outcome": "restore-failed", "phase": "restore-failed"}}}))
+
+        class Recording(FakeSystemd):
+            def __call__(me, cmd):
+                if cmd[0] == "systemctl" and "--now" in cmd:
+                    me.phase_at_start = json.loads(journal.read_text())["attempted"]["0.6.0"]["phase"]
+                return FakeSystemd.__call__(me, cmd)
+        for problems in (["changed /site/ag2_sparrow/__init__.py"], []):
+            blocked()
+            fake = Recording()
+            with mock.patch.object(self_upgrade, "verify_installed", return_value=problems,
+                                   create=True), \
+                    mock.patch.object(keepalive, "ensure_sparrow", return_value=0):
+                r = self.with_systemd(fake, "install", "--mxid", AGENT, env={"USER": "hatch"})
+            phase = json.loads(journal.read_text())["attempted"]["0.6.0"]["phase"]
+            started = [c for c in fake.calls if "--now" in c or "start" in c[1:2] or "restart" in c[1:2]]
+            if problems:
+                self.assertEqual((r.returncode, started, phase), (1, [], "restore-failed"),
+                                 r.stdout + r.stderr)
+                self.assertIn("the installed files do not verify", r.stdout + r.stderr)
+                self.assertNotIn("cleared:", r.stdout)
+            else:
+                self.assertEqual((r.returncode, phase, fake.phase_at_start), (0, "acknowledged",
+                                 "acknowledged"), r.stdout + r.stderr)
+                self.assertIn("cleared: a failed self-upgrade's hold", r.stdout)
+        # An unreadable journal is never cleared by an install; Sparrow is not started.
+        journal.write_text('{"attempted":')
+        fake = FakeSystemd()
+        with mock.patch.object(keepalive, "ensure_sparrow", return_value=0) as ensure:
+            r = self.with_systemd(fake, "install", "--mxid", AGENT, env={"USER": "hatch"})
+        self.assertEqual((r.returncode, [c for c in fake.calls if "--now" in c]), (1, []))
+        ensure.assert_not_called()
+        self.assertIn("cannot be read", r.stdout + r.stderr)
+        self.assertEqual(journal.read_text(), '{"attempted":')
 
     def test_rerun_is_idempotent(self):
         fake = FakeSystemd()
