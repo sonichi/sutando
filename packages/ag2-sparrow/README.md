@@ -614,10 +614,21 @@ is running with. That identity is the `AGENT_MXID` install saved: install puts i
 in the user service's environment (and unsets the identity keys the user manager
 might pass), and the keepawake run puts it in a detached Sparrow's, never the
 caller's; with none saved, neither invents one, and a NOTE line says so.
+
+Sparrow fetches the setup, since it holds the gateway bearer: when a heartbeat
+reply announces a `setup_revision` other than the one it holds, it GETs the
+broker's `/v1/setup` (the agent's own `agent.setup.steps` result; 10 s deadline)
+and, only once the whole result validates (`schema_version` 1, the announced
+revision, this agent, `text_schema_version` 1 with all four listener blocks or
+none), replaces `state/served-setup[.<instance>].json`. A failed or refused fetch
+writes nothing, keeps the last good copy, and is retried on a backoff that doubles
+from 60 s to an hour; an unchanged revision is never refetched. The keepawake run
+caches that copy as above.
+
 The served tunables (`keepawake_interval_s`, `stuck_task_age_s`,
 `hook_silent_age_s`, `heartbeat_cadence_s`) are clamped to bounds the package
-sets. The fetch has no transport in this package yet, so the built-in text and
-defaults apply until one is added.
+sets. Until a setup is fetched and cached, the built-in text and defaults
+apply.
 
 ### Not from the single-file downloads
 

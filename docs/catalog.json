@@ -257,7 +257,7 @@
    ],
    "status": "canonical",
    "canonical_for": "remote gateway wire protocol",
-   "last_verified": "2026-10-16"
+   "last_verified": "2026-10-24"
   },
   "docs/runtime-dependencies.md": {
    "title": "External runtime dependencies",
