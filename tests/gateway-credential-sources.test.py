@@ -1947,6 +1947,30 @@ class Guard(unittest.TestCase):
                 self.assertTrue(set(o.bridge_token_environ("t")) - {o.INJECTED_KEY} <= set(o.bridge_strip_keys()),
                                 "the name the agent's token goes under is stripped of the host's first")
 
+    def test_the_agents_gateway_rides_beside_a_bare_token_only_and_the_wake_child_acts_as_the_agent(self):
+        url, combined = "https://agent-gw.example/relay", "https://agent-gw.example/relay|s"
+        for label, o in OWNERS.items():
+            with self.subTest(label):
+                self.assertEqual(o.bridge_token_environ("s", url),
+                                 {"REMOTE_TASK_TOKEN": "s", o.INJECTED_KEY: "1", "REMOTE_TASK_URL": url})
+                self.assertEqual(o.bridge_token_environ(combined, "https://other/relay"),
+                                 {"REMOTE_TASK_TOKEN": combined, o.INJECTED_KEY: "1"}, "the token's own URL wins")
+                self.assertEqual((o.token_embeds_url(combined), o.token_embeds_url("s"), o.token_embeds_url("")),
+                                 (True, False, False))
+                self.assertEqual(o.gateway_url_problem(url), "")
+                self.assertEqual(o.gateway_url_problem("http://127.0.0.1:9/relay"), "")
+                for bad in ("", "ftp://x/relay", "https://", "x.example/relay", "https://x/relay|s", "https://x /r",
+                            "https://x/r\x7f"):
+                    self.assertTrue(o.gateway_url_problem(bad), bad)
+                host = {k: "host" for k in o.bridge_strip_keys()}
+                marked = dict(host, KEEP="1", **{o.INJECTED_KEY: "1"})
+                self.assertEqual(o.wake_environ(marked, "s", url),
+                                 {"KEEP": "1", o.INJECTED_KEY: "1", "REMOTE_TASK_TOKEN": "s", "REMOTE_TASK_URL": url})
+                self.assertEqual(o.wake_environ(marked, combined, ""),
+                                 {"KEEP": "1", o.INJECTED_KEY: "1", "REMOTE_TASK_TOKEN": combined})
+                self.assertEqual(o.wake_environ(marked, "", url), {"KEEP": "1", o.INJECTED_KEY: "1"})
+                self.assertEqual(o.wake_environ(dict(host, KEEP="1"), "s", url), dict(host, KEEP="1"), "unmarked: unchanged")
+
     def test_a_declared_bridge_reads_no_credential_file_and_the_host_resolves_what_it_carries(self):
         canary = "canary-host-file-token-0123456789"
         with tempfile.TemporaryDirectory() as d:

@@ -648,5 +648,24 @@ class AgentEndpoint(Base):
             self.assertIn(tail, out.getvalue())
             self.assertNotIn("tok-agent", out.getvalue())
 
+    def test_preflight_names_a_missing_token_and_an_unreadable_declaration_and_reads_the_real_vault_by_default(self):
+        decl = self.declare()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(bridge.main(["--preflight"], workspace=self.ws, get_key={}.__getitem__), 1)
+        self.assertIn("WILL NOT START: bridge-probe-agent-ag2-space-", out.getvalue())
+        self.assertIn(f"the vault has no {cli.vault_key(SEG)}", out.getvalue())
+        out = io.StringIO()
+        with mock.patch.object(bridge, "load", side_effect=bridge.DeclarationUnreadable(f"{decl}: unreadable (X)")), \
+                contextlib.redirect_stdout(out):
+            self.assertEqual(bridge.main(["--preflight"], workspace=self.ws, get_key=vault()), 1)
+        self.assertIn("WILL NOT START: ", out.getvalue())
+        self.assertIn("unreadable (X)", out.getvalue())
+        fake_vault = types.SimpleNamespace(get_vault_key=vault())
+        out = io.StringIO()
+        with mock.patch.dict(sys.modules, {"vault_intercept": fake_vault}), contextlib.redirect_stdout(out):
+            self.assertEqual(bridge.main(["--preflight"], workspace=self.ws), 0)
+        self.assertIn(f"from {cli.url_vault_key(SEG)}", out.getvalue())
+
 if __name__ == "__main__":
     unittest.main()
