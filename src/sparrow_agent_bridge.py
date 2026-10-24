@@ -42,8 +42,7 @@ from ag2_sparrow.bounded_file_read import read_regular  # noqa: E402
 WRITTEN_BY = f"{adapter.COMMAND} install"
 BRIDGE_MODULE = "ag2_sparrow.remote_gateway_bridge"
 SUFFIX = ".bridge"
-# A declaration is a few hundred bytes; anything past this is not one and is never read into memory.
-MAX_DECLARATION_BYTES = 64 * 1024
+MAX_DECLARATION_BYTES = _sources.MAX_DECLARATION_BYTES
 # Never inherited from sparrowd: the host's token files, its agent identity and its owner DM (and its
 # gateway tokens and endpoints, under every name _sources.bridge_strip_keys lists).
 HOST_ONLY = ("AG2_DEVICE_ENV", "REMOTE_TASK_TOKEN_FILE", "AGENT_MXID", "AGENT_ID", "AG2SPACE_USER_ID",
@@ -208,12 +207,18 @@ def preflight(workspace, get_key) -> int:
     """One line per declared agent bridge: whether it can start (its token in the vault, and its gateway in
     the token or under its URL key). 1 when any cannot. No value is printed."""
     agents, bad = Path(workspace) / "agents", []
-    homes = sorted(p for p in agents.iterdir() if p.name.endswith(SUFFIX)) if agents.is_dir() else []
+    try:
+        homes = sorted(p for p in agents.iterdir() if p.name.endswith(SUFFIX))
+    except (FileNotFoundError, NotADirectoryError):
+        homes = []
+    except OSError as e:
+        print(f"WILL NOT START: {agents}: unreadable ({type(e).__name__})")
+        return 1
     for home in homes:
         path = home / adapter.DECLARATION
-        if _stat(path) is None:
-            continue
         try:
+            if _stat(path) is None:
+                continue
             decl, why = load(path, agents)
         except ScanUnavailable as e:
             decl, why = None, str(e)
