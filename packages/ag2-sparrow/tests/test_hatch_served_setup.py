@@ -2367,13 +2367,40 @@ class Upgrade(Base):
         self.events.append("stop")
         ok = self.stop_ok
         self.stop_ok = False if self.stop_ok == "rollback" else self.stop_ok
-        return ok is not False, "stopped"
+        return ok is not False, "stopped", "detached"
 
-    def started(self, cfg):
+    def started(self, cfg, manager):
         self.events.append("start")
+        self.managers = getattr(self, "managers", []) + [manager]
         ok = self.start_ok
         self.start_ok = True if self.start_ok == "once" else self.start_ok
         return ok is True, "started"
+
+    def inventory(self):
+        """Every file of the fake install, hashed, read without the upgrader's own code."""
+        import hashlib
+        files = [p for p in self.site.site.rglob("*") if p.is_file() and "__pycache__" not in p.parts]
+        files += [p for p in self.site.bin.iterdir() if p.is_file()]
+        return {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in files}
+
+    def partial(self, dist_info_swap: bool):
+        """A pip that dies mid-install: target bytes over __init__, a target-only module
+        added, the old dist-info kept (and, with `dist_info_swap`, a half-written new one)."""
+        site = self.site
+
+        class Partial(FakeRun):
+            def __call__(me, argv, timeout):
+                if me.kind(argv) != "pip-install":
+                    return FakeRun.__call__(me, argv, timeout)
+                me.calls.append(("pip-install", list(argv), None))
+                me.events.append("pip-install")
+                (site.site / "ag2_sparrow" / "__init__.py").write_text('__version__ = "0.6.0"\n')
+                (site.site / "ag2_sparrow" / "new_in_target.py").write_text("x = 1\n")
+                if dist_info_swap:
+                    site.dist_info("0.6.0").mkdir()
+                    (site.dist_info("0.6.0") / "METADATA").write_text("Name: ag2-sparrow\nVersion: 0.6.0\n")
+                return subprocess.CompletedProcess(argv, 1, "", "pip died")
+        return Partial(site, events=self.events)
 
     def fake(self, **kw):
         return FakeRun(self.site, events=self.events, **kw)
@@ -2426,7 +2453,7 @@ class Upgrade(Base):
         item = task_fields.item_id(tid, "")
         delivered = []
 
-        def start_and_drain(cfg):
+        def start_and_drain(cfg, manager):
             self.events.append("start")
             for result in sorted(results.glob("task-*.txt")):
                 delivered.append((result.read_text(), list(self.events)))
@@ -2547,9 +2574,10 @@ class Upgrade(Base):
         with mock.patch.object(self_upgrade, "_run", self.fake()), \
                 contextlib.redirect_stdout(io.StringIO()):
             out, spawn = self.start(self.setup(), installed="0.6.0", now=1000.0 + 1801)
-        self.assertEqual(out, "0.6.0:crashed")
+        self.assertEqual(out, "0.6.0:rolled-back")
         spawn.assert_not_called()
         self.assertEqual(self.site.version(), "0.5.4", "the snapshot was restored")
+        self.assertEqual(self_upgrade.namespace_drift(self.state, "0.5.4"), [])
         state = self_upgrade.load_state(self.state)
         self.assertEqual(state["failed"]["installed"], "0.5.4")
         self.assertEqual(state["attempted"]["0.6.0"]["outcome"], "rolled-back")
@@ -2566,6 +2594,170 @@ class Upgrade(Base):
         self.assertEqual(self_upgrade.load_state(self.state)["attempted"]["0.6.0"]["outcome"],
                          "crashed")
         self.assertEqual(self.events, [])
+
+    def test_a_crash_after_the_stop_restarts_sparrow_through_its_manager_only(self):
+        self.start(self.setup(), now=1000.0)
+        self_upgrade.snapshot(self.state, "0.5.4", self.site.distribution())
+        self_upgrade._phase(self.state, "0.6.0", "quiesced", manager="unit")
+        with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(self_upgrade.maybe_start(self.cfg, None, "0.5.4", 1010.0),
+                             "0.6.0:crashed", "a journaled phase is settled as soon as the lock is free")
+        self.assertEqual((self.events, self.managers), (["start"], ["unit"]))
+        self.assertEqual(self.site.version(), "0.5.4")
+
+    def test_the_attempt_journal_names_each_phase_and_the_manager(self):
+        phases = []
+        real = self_upgrade._phase
+        with mock.patch.object(self_upgrade, "_phase",
+                               side_effect=lambda *a, **k: (phases.append(a[2]), real(*a, **k))[1]):
+            self.assertEqual(self.run_upgrade(self.fake()), "ok")
+        self.assertEqual(phases, ["snapshot", "quiesced", "installing", "installed"])
+        tried = self_upgrade.load_state(self.state)["attempted"]["0.6.0"]
+        self.assertEqual((tried["phase"], tried["manager"], tried["from"]), ("ok", "detached", "0.5.4"))
+
+    def test_a_partial_install_that_added_target_only_files_is_removed_exactly(self):
+        before = self.inventory()
+        self.assertEqual(self.run_upgrade(self.partial(dist_info_swap=False)), "rolled-back")
+        self.assertEqual(self.inventory(), before, "the namespace is the pre-upgrade snapshot again")
+        self.assertFalse((self.site.site / "ag2_sparrow" / "new_in_target.py").exists())
+        self.assertEqual(self_upgrade.load_state(self.state)["failed"]["problems"], [])
+
+    def test_a_partial_install_with_a_half_swapped_dist_info_is_removed_exactly(self):
+        before = self.inventory()
+        self.assertEqual(self.run_upgrade(self.partial(dist_info_swap=True)), "rolled-back")
+        self.assertEqual(self.inventory(), before)
+        self.assertFalse(self.site.dist_info("0.6.0").exists())
+        self.assertTrue((self.site.dist_info("0.5.4") / "RECORD").is_file())
+
+    def test_a_stale_attempt_that_left_target_residue_beside_old_metadata_is_restored(self):
+        # Kewei's shape: target bytes and a target-only module, old 0.5.4 metadata kept, so
+        # the version reads as the previous one and the stale RECORD cannot name the module.
+        before = self.inventory()
+        self.start(self.setup(), now=1000.0)
+        self_upgrade.snapshot(self.state, "0.5.4", self.site.distribution())
+        (self.site.site / "ag2_sparrow" / "__init__.py").write_text('__version__ = "0.6.0"\n')
+        (self.site.site / "ag2_sparrow" / "new_in_target.py").write_text("x = 1\n")
+        self.assertEqual(self.site.distribution().version, "0.5.4")
+        with mock.patch.object(self_upgrade, "_run", self.fake()), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            out = self_upgrade.maybe_start(self.cfg, None, "0.5.4", 1000.0 + 1801)
+        self.assertEqual(out, "0.6.0:rolled-back")
+        self.assertEqual(self.inventory(), before)
+        self.assertEqual(self.events, ["stop", "install", "start", "version"])
+        self.assertEqual(self_upgrade.load_state(self.state)["attempted"]["0.6.0"]["outcome"],
+                         "rolled-back")
+
+    def test_a_dead_attempt_in_a_mutating_phase_is_settled_at_once(self):
+        before = self.inventory()
+        self.start(self.setup(), now=1000.0)
+        self_upgrade.snapshot(self.state, "0.5.4", self.site.distribution())
+        self_upgrade._phase(self.state, "0.6.0", "installing", manager="detached")
+        self.site.install("0.6.0")
+        with mock.patch.object(self_upgrade, "_run", self.fake()), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(self_upgrade.maybe_start(self.cfg, None, "0.5.4", 1010.0),
+                             "0.6.0:rolled-back")
+        self.assertEqual(self.inventory(), before)
+
+    def test_an_interrupted_restore_resumes_on_the_next_run(self):
+        before = self.inventory()
+        self.start(self.setup(), now=1000.0)
+        self_upgrade.snapshot(self.state, "0.5.4", self.site.distribution())
+        self_upgrade._phase(self.state, "0.6.0", "installing", manager="detached")
+        self.site.install("0.6.0")
+        real, calls = self_upgrade.restore, []
+
+        def killed_once(state_dir, version):
+            calls.append(version)
+            if len(calls) == 1:
+                raise SystemExit(143)  # keepawake's timeout lands mid-restore
+            return real(state_dir, version)
+        with mock.patch.object(self_upgrade, "restore", side_effect=killed_once), \
+                mock.patch.object(self_upgrade, "_run", self.fake()), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                self_upgrade.maybe_start(self.cfg, None, "0.5.4", 1010.0)
+            tried = self_upgrade.load_state(self.state)["attempted"]["0.6.0"]
+            self.assertEqual(tried["phase"], "restoring")
+            self.assertNotIn(tried["outcome"], ("rolled-back", "crashed", "restore-failed"))
+            self.assertEqual(self.site.version(), "0.6.0", "the unverified target is still there")
+            self.assertEqual(self_upgrade.maybe_start(self.cfg, None, "0.5.4", 1020.0),
+                             "0.6.0:rolled-back")
+        self.assertEqual(calls, ["0.5.4", "0.5.4"])
+        self.assertEqual(self.inventory(), before)
+        self.assertEqual(self_upgrade.load_state(self.state)["attempted"]["0.6.0"]["phase"],
+                         "rolled-back")
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertIsNone(self_upgrade.maybe_start(self.cfg, None, "0.5.4", 9999.0))
+
+    def test_a_mutating_crash_with_no_snapshot_is_restore_failed_not_rolled_back(self):
+        self.start(self.setup(), now=1000.0)
+        self_upgrade._phase(self.state, "0.6.0", "installing")
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(self_upgrade.maybe_start(self.cfg, None, "0.5.4", 1010.0),
+                             "0.6.0:restore-failed")
+        self.assertIn("no snapshot", self_upgrade.load_state(self.state)["failed"]["problems"][0])
+        self.assertIsNotNone(self_upgrade.failed_since(self.state, "0.5.4"))
+
+    def test_keepawake_settles_a_dead_upgrade_before_it_restarts_the_listener(self):
+        # Kewei's state: a stale started attempt, the target's files in place, the listener down.
+        before = self.inventory()
+        self.start(self.setup(), now=1000.0)
+        self_upgrade.snapshot(self.state, "0.5.4", self.site.distribution())
+        self_upgrade._phase(self.state, "0.6.0", "installing", manager="detached")
+        self.site.install("0.6.0")
+        log = self.home / "log"
+
+        def restart(cfg):
+            self.events.append(("restart", self.site.version()))
+            return True, "r"
+        with mock.patch.object(keepalive, "listener_up", return_value=False), \
+                mock.patch.object(keepalive, "restart_listener", side_effect=restart), \
+                mock.patch.object(runtime_text, "refresh_cache", return_value=None), \
+                mock.patch.object(self_upgrade, "_run", self.fake()), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            keepalive.keepawake(self.cfg, log, now=1010.0)
+        self.assertEqual(self.events, ["stop", "install", "start", "version", ("restart", "0.5.4")],
+                         "the rollback settles first; the restart never runs the unverified target")
+        self.assertEqual(self.inventory(), before)
+        self.assertIn("listener=down restarted=1 upgrade=0.6.0:rolled-back", log.read_text())
+
+    def test_a_rollback_whose_stop_is_unproven_changes_no_file(self):
+        self.stop_ok = "rollback"
+        with mock.patch.object(self_upgrade, "restore") as restore:
+            fake = self.fake(fail={"pip-install"})
+            self.assertEqual(self.run_upgrade(fake), "restore-failed")
+        restore.assert_not_called()
+        self.assertEqual(fake.of("install"), [])
+        self.assertEqual(self.events[self.events.index("pip-install"):], ["pip-install", "stop", "version"])
+        problems = self_upgrade.load_state(self.state)["failed"]["problems"]
+        self.assertTrue(problems[0].startswith("stop: ") and "nothing was restored" in problems[0])
+
+    def test_a_restore_that_does_not_hash_equal_to_the_snapshot_is_restore_failed(self):
+        real = shutil.copy2
+
+        def corrupting(src, dst, **kw):  # a copy that lands, but not byte for byte
+            real(src, dst, **kw)
+            if Path(dst).name == "__init__.py":
+                Path(dst).write_text('__version__ = "0.5.4"  # bit flipped\n')
+        self.connected.side_effect = [1, 0]
+        with mock.patch.object(self_upgrade.shutil, "copy2", side_effect=corrupting):
+            self.assertEqual(self.run_upgrade(self.fake()), "restore-failed")
+        problems = self_upgrade.load_state(self.state)["failed"]["problems"]
+        self.assertEqual(len(problems), 1)
+        self.assertRegex(problems[0], r"^restore: the files do not match the snapshot of 0\.5\.4: changed .*__init__\.py")
+        after_stop = self.events[len(self.events) - self.events[::-1].index("stop") - 1:]
+        self.assertEqual(after_stop, ["stop", "start", "version"],
+                         "no install re-run on a mismatch; Sparrow is still started")
+
+    def test_a_hand_made_or_unreachable_unit_is_never_upgraded_unattended(self):
+        for owner, decision in (("other", "hand-made-service"),
+                                (keepalive.UNIT_UNREACHABLE, "unit-unreachable")):
+            with mock.patch.object(keepalive, "_unit_owner", return_value=owner):
+                out, spawn = self.start(self.setup())
+            self.assertEqual(out, decision)
+            spawn.assert_not_called()
+            self.assertIn(decision, self.err)
 
     def test_each_failed_step_restores_the_snapshot(self):
         for kw, why in (({"fail": {"pip-install"}}, "pip install"),
@@ -2710,31 +2902,20 @@ class Upgrade(Base):
         self.run_upgrade(self.fake(install_out="unchanged: hook ag2-sparrow-hatch\n"))
         self.assertFalse(self_upgrade.notice_path(self.state).exists())
 
-    def test_stop_and_start_go_through_the_unit_or_the_lock_holder(self):
-        stop, start = REAL_STOP, REAL_START
-        with mock.patch.object(keepalive, "_unit_owner", return_value="ours"), \
-                mock.patch.object(hatch_cli, "_systemctl",
-                                  return_value=subprocess.CompletedProcess([], 0, "", "")) as sd:
-            self.assertTrue(stop(self.cfg)[0])
-        self.assertEqual(sd.call_args.args[0][:2], ("--user", "stop"))
-        with mock.patch.object(keepalive, "_unit_owner", return_value=keepalive.UNIT_UNREACHABLE), \
-                mock.patch.object(hatch_cli, "_systemctl") as sd, \
-                mock.patch.object(keepalive, "_stop") as kill:
-            ok, how = stop(self.cfg)
-        self.assertFalse(ok)
-        self.assertIn("did not answer", how)
-        sd.assert_not_called()
-        kill.assert_not_called()
-        with mock.patch.object(keepalive, "_unit_owner", return_value=None), \
-                mock.patch.object(hatch_cli, "live_lock_holder", return_value=42), \
-                mock.patch.object(keepalive, "_stop", return_value=True) as kill:
-            self.assertEqual(stop(self.cfg), (True, "stopped Sparrow (pid 42)"))
-        kill.assert_called_once_with(42)
-        with mock.patch.object(keepalive, "_unit_owner", return_value=None), \
-                mock.patch.object(hatch_cli, "live_lock_holder", return_value=None):
-            self.assertEqual(stop(self.cfg), (True, "Sparrow was not running"))
-        with mock.patch.object(keepalive, "restart_listener", return_value=(True, "s")):
-            self.assertEqual(start(self.cfg), (True, "s"))
+    def test_stop_is_keepalive_quiescence_and_start_keeps_the_manager(self):
+        with mock.patch.object(keepalive, "quiesce_sparrow", return_value=(True, "q", "unit")) as q:
+            self.assertEqual(REAL_STOP(self.cfg), (True, "q", "unit"))
+        q.assert_called_once_with(self.cfg)
+        for manager, owner, started in (("unit", "ours", True), ("unit", None, False),
+                                        ("unit", "other", False), ("detached", None, True),
+                                        ("detached", "other", False), ("detached", "ours", False),
+                                        (None, None, False)):
+            with mock.patch.object(keepalive, "_unit_owner", return_value=owner), \
+                    mock.patch.object(keepalive, "restart_listener", return_value=(True, "s")) as rl:
+                ok, how = REAL_START(self.cfg, manager)
+            self.assertEqual((ok, rl.called), (started, started), (manager, owner))
+            if not started:
+                self.assertIn("not started", how)
 
     def test_the_real_distribution_lookup_reads_the_installed_package(self):
         with mock.patch.object(importlib.metadata, "distribution",
@@ -2851,6 +3032,139 @@ class Upgrade(Base):
         for bad in ("1.0; rm -rf /", "١.0", "1." + "0." * 40 + "1", "9" * 70,
                     "123456789." * 7 + "1"):
             self.assertIsNone(self_upgrade.parse_version(bad), bad)
+
+
+class Quiesce(Base):
+    """keepalive.quiesce_sparrow over every owner x holder state, with the processes faked:
+    `alive` pids answer kill -0, `stubborn` ones ignore SIGTERM and the unit stop, `lying`
+    ones report stopped and stay."""
+
+    def setUp(self):
+        super().setUp()
+        self.cfg = {"STATE_DIR": str(self.state)}
+        self.owner, self.record, self.fresh = None, None, True
+        self.alive, self.sparrow, self.stubborn, self.lying = set(), set(), set(), set()
+        self.props = {"ActiveState": "inactive", "MainPID": 0, "ExecMainStartTimestampMonotonic": 0}
+        self.calls = []
+
+        def systemctl(args, **kw):
+            self.calls.append(("systemctl",) + tuple(args))
+            if args[1:2] == ("stop",):
+                pid = self.props["MainPID"]
+                if pid not in self.stubborn:
+                    self.alive.discard(pid)
+                self.props = dict(self.props, ActiveState="inactive", MainPID=0)
+            return subprocess.CompletedProcess(list(args), 0, "", "")
+
+        def term(pid):
+            self.calls.append(("term", pid))
+            if pid in self.stubborn:
+                return False
+            if pid not in self.lying:
+                self.alive.discard(pid)
+            return True
+        patches = ((keepalive, "_unit_owner", lambda: self.owner),
+                   (hatch_cli, "_unit_props", lambda: dict(self.props)),
+                   (hatch_cli, "_lock_record", lambda s, i: self.record),
+                   (hatch_cli, "process_gone", lambda pid: pid not in self.alive),
+                   (hatch_cli, "live_lock_holder", lambda rec: (rec or {}).get("pid")
+                    if self.fresh and (rec or {}).get("pid") in self.alive else None),
+                   (keepalive, "is_sparrow_pid", lambda pid: pid in self.sparrow),
+                   (hatch_cli, "_systemctl", systemctl), (keepalive, "_stop", term),
+                   (keepalive, "STOP_WAIT_S", 0.3))
+        for target, name, value in patches:
+            p = mock.patch.object(target, name, value if name == "STOP_WAIT_S" else
+                                  mock.Mock(side_effect=value))
+            p.start()
+            self.addCleanup(p.stop)
+
+    def holder(self, pid, fresh=True, sparrow=True):
+        self.record, self.fresh = {"pid": pid, "host": "h"}, fresh
+        self.alive.add(pid)
+        if sparrow:
+            self.sparrow.add(pid)
+
+    def unit(self, main_pid):
+        self.owner = "ours"
+        if main_pid:
+            self.props = dict(self.props, ActiveState="active", MainPID=main_pid)
+            self.alive.add(main_pid)
+
+    def test_a_hand_made_unit_is_refused_with_nothing_signalled(self):
+        self.owner = "other"
+        self.holder(4242)
+        self.assertEqual(keepalive.quiesce_sparrow(self.cfg)[::2], (False, None))
+        self.assertIn("not written by install", keepalive.quiesce_sparrow(self.cfg)[1])
+        self.assertEqual((self.calls, self.alive), ([], {4242}))
+
+    def test_an_unreachable_manager_is_refused_with_nothing_signalled(self):
+        self.owner = keepalive.UNIT_UNREACHABLE
+        self.holder(4242)
+        quiet, how, manager = keepalive.quiesce_sparrow(self.cfg)
+        self.assertEqual((quiet, manager, self.calls), (False, None, []))
+        self.assertIn("did not answer", how)
+
+    def test_our_unit_is_stopped_and_its_process_proven_gone(self):
+        self.unit(500)
+        self.holder(500)
+        self.assertEqual(keepalive.quiesce_sparrow(self.cfg),
+                         (True, "systemctl --user stop ag2-sparrow.service", "unit"))
+        self.assertEqual(self.calls, [("systemctl", "--user", "stop", "ag2-sparrow.service")])
+        self.stubborn.add(501)
+        self.unit(501)
+        self.holder(501)
+        quiet, how, manager = keepalive.quiesce_sparrow(self.cfg)
+        self.assertEqual((quiet, manager), (False, "unit"))
+        self.assertIn("pid 501) is still running", how)
+
+    def test_an_inactive_unit_beside_an_external_holder_stops_the_holder_too(self):
+        self.unit(0)
+        self.holder(77)
+        quiet, how, manager = keepalive.quiesce_sparrow(self.cfg)
+        self.assertEqual((quiet, manager, self.alive), (True, "unit", set()))
+        self.assertIn("stopped the Sparrow outside it (pid 77)", how)
+        self.assertEqual(self.calls[-1], ("term", 77))
+
+    def test_an_external_holder_not_proven_sparrow_refuses_the_whole_stop(self):
+        self.unit(0)
+        self.holder(77, sparrow=False)
+        quiet, how, manager = keepalive.quiesce_sparrow(self.cfg)
+        self.assertEqual((quiet, manager, self.calls), (False, None, []))
+        self.assertIn("not proven to be Sparrow", how)
+
+    def test_a_live_holder_with_a_stale_heartbeat_is_still_stopped(self):
+        self.holder(99, fresh=False)
+        self.assertEqual(keepalive.resolve_sparrow(self.cfg), (None, 99, False))
+        self.assertEqual(keepalive.quiesce_sparrow(self.cfg),
+                         (True, "stopped Sparrow (pid 99)", "detached"))
+        self.assertEqual(self.calls, [("term", 99)])
+        self.record = None
+        self.assertEqual(keepalive.quiesce_sparrow(self.cfg),
+                         (True, "Sparrow was not running", "detached"))
+
+    def test_a_holder_that_ignores_sigterm_is_not_quiet(self):
+        self.stubborn.add(99)
+        self.holder(99)
+        quiet, how, manager = keepalive.quiesce_sparrow(self.cfg)
+        self.assertEqual((quiet, manager), (False, "detached"))
+        self.assertIn("did not stop", how)
+
+    def test_a_holder_still_in_the_lock_after_the_stop_is_not_quiet(self):
+        self.lying.add(99)
+        self.holder(99)
+        quiet, how, manager = keepalive.quiesce_sparrow(self.cfg)
+        self.assertEqual((quiet, manager), (False, "detached"))
+        self.assertIn("pid 99 still holds Sparrow's lock", how)
+
+    def test_ensure_sparrow_reads_the_same_resolution_fresh_only(self):
+        self.holder(99, fresh=False)
+        with mock.patch.object(keepalive, "resolve_sparrow", wraps=keepalive.resolve_sparrow) as r, \
+                mock.patch.object(keepalive, "listener_up", return_value=True), \
+                mock.patch.object(keepalive, "_await_connected", return_value=0), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(keepalive.ensure_sparrow(self.cfg, health=True), 0)
+        r.assert_called_once_with(self.cfg)
+        self.assertEqual(self.calls, [], "a stale holder is not replaced by install")
 
 
 class KeepawakeUpgrade(Base):
