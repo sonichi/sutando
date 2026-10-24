@@ -41,7 +41,7 @@ If no live tasks, emit "orphan-check: no live tasks, nothing to recover" and idl
 python3 skills/task-orphan-check/scripts/classify.py        # add --workspace DIR to override
 ```
 
-It prints one JSON object — `tasks[]` with `id`, `source`, `access_tier`, `channel_id`, `label` (the readable channel label step 3b uses), `age_s`, `import` (with `import_intent`; `import_task_id` — the `task_id` the current `status.json` carries, `null` when it has none; and for a bound or unbound run `import_phase` / `import_idle_s`), `verdict` (`done` / `worker-held` / `unknown` / `fresh` / `orphan` / `import-resume` / `import-stalled` / `import-unbound`; a `worker-held` row also carries `holder`, the recipient id) and a `reason` naming the marker, sentinel or age line it matched — plus `counts`. Read-only: it moves and writes nothing; step 3 acts on its verdicts. The rules it encodes are the ones below (pinned by `tests/task-orphan-check-classify.test.py`); if you change a rule, change the script and its test, then this prose.
+It prints one JSON object — `tasks[]` with `id`, `source`, `access_tier`, `channel_id`, `label` (the readable channel label step 3b uses), `age_s`, `import` (with `import_intent`; `import_task_id` — the `task_id` the current `status.json` carries, `null` when it has none; and for a bound or unbound run `import_phase` / `import_idle_s`), `verdict` (`done` / `held` / `worker-held` / `unknown` / `fresh` / `orphan` / `import-resume` / `import-stalled` / `import-unbound`; a `worker-held` row also carries `holder`, the recipient id) and a `reason` naming the marker, sentinel or age line it matched — plus `counts`. Read-only: it moves and writes nothing; step 3 acts on its verdicts. The rules it encodes are the ones below (pinned by `tests/task-orphan-check-classify.test.py`); if you change a rule, change the script and its test, then this prose.
 
 For each file in `tasks/`, let `<id>` be the value of the `id:` header line (e.g. `task-1779570142563`). The file is `tasks/<id>.txt`. Per-task paths below use `<id>` consistently — note `<id>` already includes the `task-` prefix; do NOT add it again.
 
@@ -87,6 +87,7 @@ For each file in `tasks/`, let `<id>` be the value of the `id:` header line (e.g
 4. **Classify outcome**:
    - **DONE** → archive the task file: `mv tasks/<id>.txt tasks/archive/<id>.txt`. Log: `done: completion marker found at <path>`.
    - **FRESH** → leave alone. Log: `fresh: arrived <N>s ago, watcher will handle`.
+   - **HELD** → leave alone; never archive, never list in step 3b's DM. It arrived while the core was paused for a provider limit (its id is in `held_tasks` of `state/core-limit-hold.json`, read through `src/core_limit_hold.py`), and the owner was told it waits; the watcher's sweep delivers it. Log: `held: arrived during a core-limit hold`.
    - **WORKER-HELD** → leave alone; never archive, never list in step 3b's DM (see step 2c). Log: `worker-held: sentinel held by <holder>`.
    - **UNKNOWN** → leave alone, but append it to the in-pass `unknown_holds` list so step 3b names it in the DM (see step 2c). Log: `unknown: deliveries/ unreadable (<error>)`.
    - **IMPORT-RESUME** → leave alone (see step 3a). Log: `import-resume: consented import already started (phase <p>)`.
@@ -200,6 +201,7 @@ orphan-check complete:
   total live tasks scanned: N
   archived as done (completion marker found): M
   left fresh for watcher: K
+  left for the core after a limit hold (held): H
   left for its worker (worker-held): W
   left in place, deliveries/ unreadable (unknown): X
   left for the watcher as a started import (import-resume): I
@@ -208,7 +210,7 @@ orphan-check complete:
   recovered as orphan (sentinel result written): J
 ```
 
-The summary lands in the conversation buffer so the agent's first turn (and operator) sees what happened. If `M+K+W+X+I+S+U+J ≠ N`, the script bailed mid-pass — log a warning and let the operator investigate.
+The summary lands in the conversation buffer so the agent's first turn (and operator) sees what happened. If `M+K+H+W+X+I+S+U+J ≠ N`, the script bailed mid-pass — log a warning and let the operator investigate.
 
 ## What this DOES NOT touch
 
@@ -257,10 +259,11 @@ That would lose tasks that legitimately arrived in the gap between previous sess
 
 ## Implementation note: classification is a script, recovery is prose
 
-Step 2 runs `scripts/classify.py` (read-only, stdlib + `src/local_task_protocol.py`; `tests/task-orphan-check-classify.test.py`). It exists because the rules stopped being "marker-or-not + age-vs-5min" the day the import exemption (step 3a) was needed, and a rule that only lives in prose is applied by whichever reading the agent makes that boot — the 2026-09-11 run reasoned its way to "would now classify … as an ORPHAN" about a task it had itself left unstarted. Steps 3–5 (the archive moves, the aggregated DM, the summary) stay agent-executed: they are small per pass (typically 0-3 live tasks) and each is a plain Bash/Write call over the classifier's verdicts.
+Step 2 runs `scripts/classify.py` (read-only, stdlib + `src/local_task_protocol.py` + `src/core_limit_hold.py`; `tests/task-orphan-check-classify.test.py`). It exists because the rules stopped being "marker-or-not + age-vs-5min" the day the import exemption (step 3a) was needed, and a rule that only lives in prose is applied by whichever reading the agent makes that boot — the 2026-09-11 run reasoned its way to "would now classify … as an ORPHAN" about a task it had itself left unstarted. Steps 3–5 (the archive moves, the aggregated DM, the summary) stay agent-executed: they are small per pass (typically 0-3 live tasks) and each is a plain Bash/Write call over the classifier's verdicts.
 
 ## Iteration log
 
+- v0.1.9 — 2026-10-17 — held tasks. On a resume after a core-limit hold, the owner's held message and their "switch to sonnet" reply classified `orphan` and were archived into "Orphan recovery — 2 stale tasks", although the pause notice promised they wait. New verdict **HELD**, right after the completion-marker check: the hold record lists the ids it took in (`held_tasks`), the classifier reads them via `core_limit_hold.held_task_ids` and leaves those tasks in tasks/. Pinned: hold → arrival → resume through the real `decide`, a result still wins, an unlisted task keeps the age rule.
 - v0.1.0 — 2026-05-23 — initial draft. Per Chi 2026-05-23 Discord exchange about #1049 redesign ("simply ask the agent to check when starting"). Designed to be invoked from `/startup` step 1 (PR #1072). Standalone-callable for manual recovery. Replaces the attempts-counter approach (#1049 + #1066's followup) with a startup-time classification using existing side-effect markers (#1048's `.sending` files + result-file presence). No bumper, no in-band writes, no self-trigger loop.
 - v0.1.1 — 2026-05-23 — qingyun-sutando review pass. **(1)** Fixed `<id>` ambiguity — `<id>` is the value of the `id:` header (already includes `task-` prefix); paths are `results/<id>.txt` NOT `results/task-<id>.txt` (the prior wording double-prefixed and would have misclassified every completed-but-unarchived task as ORPHAN → spurious recovery notes). **(2)** Age now derives from immutable header `timestamp:` / `task-<epoch-ms>` id, NOT file mtime (mtime resets on rsync / `git checkout` / `touch` / workspace sync, making old orphans look FRESH → re-fire). **(3)** Clarified `.sending` contract via new step 2b: `<id>.txt` (no suffix) = DONE, `<id>.txt.sending` = bridge mid-delivery (treat as DONE; bridge owns its own crash recovery via #1046/#1048's startup sweep). **(4)** Named the <5min residual hole explicitly under its own section, with prioritized coverage list (voice / phone / Telegram + generic API). **(5)** Noted "promote to scripts/orphan-check.py" trigger.
 - v0.1.2 — 2026-05-26 — tier-aware orphan recovery. Step 2.1 now parses `access_tier:` (default `owner` for legacy task files lacking the field). Step 3 rewritten as a decision table branching on `source` + `access_tier`: voice/phone → silent archive; team/other → `[no-send]` archive; owner discord/telegram/slack/chat → defer to new step 3b (consolidated proactive DM aggregating all owner-tier orphans this pass into ONE `proactive-orphan-recovery-<ts>.txt` instead of N per-channel sentinels). New step 3c bomb-guard collapses any future >5-deliveries-to-one-channel into a single summary post (no-op today; defense for future branch additions). Triggered by 2026-05-26 noise-bomb post-mortem (`feedback_orphan_check_tier_classify_before_sentinel`): v0.1.1 sentinel-blasted 22 stale tasks across #ep013 (13), #talk (4), voice channels (4), and DM (1) — wrong default for high-volume team-tier orphans whose threads had moved on, and wrong shape (N per-channel posts) for owner-tier ones. Sibling work on cross-fleet bridges (qingyun-sutando MacBook branch) adds defensive bot-user_id tier-filter so peer bots' stale tasks don't tier as `owner` via allowFrom inheritance — that's the upstream cause of the same skill running on a sibling fleet seeing 21/22 of one fleet's orphans as `owner` rather than `team`.

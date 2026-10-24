@@ -40,6 +40,7 @@ from tmux_probe import has_session as _tmux_has_session  # noqa: E402
 import cli_wedge  # noqa: E402 — owns the core pane target and its capture
 import session_runtime  # noqa: E402 — the one reading of a session's runtime stamp
 from worker_auth_state import signed_in_since  # noqa: E402 — the one "signed in again" reading
+import core_limit_hold  # noqa: E402 — the one decision that a provider limit holds the core
 
 SESSION = "sutando-core"
 TMUX_SOCKET = os.environ.get("SUTANDO_TMUX_SOCKET", "/tmp/sutando-tmux.sock")
@@ -107,6 +108,7 @@ _SEVERITY = {
     "blocked": "warn",
     "degraded": "warn",
     "needs_login": "escalate",
+    "paused": "warn",        # held for a provider limit; it resumes by itself
     "unknown": "critical",   # status-stale wedge
     "offline": "critical",   # process/session gone
 }
@@ -580,6 +582,13 @@ def _core_status(workspace):
     return data.get("status"), ts
 
 
+def _limit_hold(workspace):
+    try:
+        return core_limit_hold.active_hold(workspace)
+    except Exception:
+        return None  # a probe must degrade, never crash
+
+
 def _resolve_workspace(repo):
     rc, out = _run(["bash", os.path.join(repo, "scripts", "sutando-config.sh"), "workspace"])
     return out.strip() if rc == 0 and out.strip() else os.path.join(repo, "workspace")
@@ -671,6 +680,10 @@ def derive():
                     detail = f"{queued} task(s) queued but not dispatched — {what}"
             else:
                 health, detail = "unknown", "Agent is running (status unknown)"
+
+    hold = _limit_hold(workspace)
+    if hold:
+        health, authed, detail = "paused", None, core_limit_hold.status_line(hold)
 
     return {
         "health": health,

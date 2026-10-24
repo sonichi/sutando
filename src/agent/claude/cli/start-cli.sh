@@ -547,6 +547,21 @@ if [ -z "$RESTART_REQUESTED" ] && claude_named_process_running; then
   fi
 fi
 
+# Every launch below (heal, fresh boot, restart) passes this gate. A core refused for a
+# provider limit is held until the reset or a backoff; any other death launches as before.
+if [ -n "$PY" ] && [ -f "$REPO/src/core_limit_hold.py" ]; then
+  _hold_rc=0
+  _hold_line="$("$PY" "$REPO/src/core_limit_hold.py" gate --cwd "$(pwd -P)" --switch-entry "$REPO/scripts/switch-model.sh" 2>/dev/null)" || _hold_rc=$?
+  if [ "$_hold_rc" = 75 ]; then
+    echo "  ⏸ $SESSION not launched — ${_hold_line:-core paused: provider limit}" >&2
+    [ -n "$RESTART_REQUESTED" ] && log_restart_attempt "held: ${_hold_line:-provider limit}"
+    # No core window will exist, so a notifier left running would type into a sibling.
+    tmux -S "$TMUX_SOCKET" kill-session -t "=$WATCHER_SESSION" 2>/dev/null || true
+    release_orchestrator_lock
+    exit 75
+  fi
+fi
+
 if claude_named_tmux_session_exists; then
   # Session alive but the core claude is gone. The old behavior here was
   # kill-session — but the desktop runtime keeps SIBLING windows in this

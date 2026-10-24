@@ -757,5 +757,43 @@ class TestWorkerHeld(ClassifyBase):
         self.assertEqual(self.one()["verdict"], "orphan")
 
 
+class TestLimitHeld(ClassifyBase):
+    """A task that arrived while the core was paused for a provider limit waits for the core:
+    the hold record names it, the classifier reads that record and never archives it."""
+
+    def _hold_then_resume(self, arrived: str) -> None:
+        sys.path.insert(0, str(REPO / "src"))
+        import core_limit_hold as clh
+        now = NOW - 7200
+        rec = {"available": False, "last_checked": iso(now - 30),
+               "headers": {"anthropic-ratelimit-unified-status": "rejected",
+                           "anthropic-ratelimit-unified-7d-status": "rejected",
+                           "anthropic-ratelimit-unified-7d-reset": str(int(now + 600))},
+               "recent_rejections": [{"ts": iso(now - 30), "status": 429, "model": "claude-opus-5-5",
+                                      "snippet": "rate_limit_error usage limit"}]}
+        (self.ws.root / "state").mkdir(exist_ok=True)
+        self.assertFalse(clh.decide(self.ws.root, now, quota=rec).launch)
+        self.ws.task(f"{arrived}.txt", chat_task_text(arrived, now + 60))
+        self.assertFalse(clh.decide(self.ws.root, now + 120, quota=rec).launch)
+        self.assertTrue(clh.decide(self.ws.root, now + 600 + clh.RESET_GRACE_S + 1, quota=rec).launch)
+
+    def test_task_that_arrived_during_a_hold_is_held_not_orphan(self):
+        self._hold_then_resume("task-held-1")
+        row = self.one()
+        self.assertEqual(row["verdict"], "held", row)
+
+    def test_a_result_still_wins_over_held(self):
+        self._hold_then_resume("task-held-2")
+        (self.ws.root / "results" / "task-held-2.txt").write_text("answered\n")
+        self.assertEqual(self.one()["verdict"], "done")
+
+    def test_unlisted_task_keeps_the_age_rule(self):
+        (self.ws.root / "state").mkdir()
+        (self.ws.root / "state" / "core-limit-hold.json").write_text(
+            json.dumps({"status": "released", "held_tasks": ["task-other"]}))
+        self.ws.task("task-old.txt", chat_task_text("task-old", NOW - 3600))
+        self.assertEqual(self.one()["verdict"], "orphan")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)

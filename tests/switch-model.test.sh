@@ -183,4 +183,16 @@ for _ in $(seq 50); do grep -q held "$T/held" && break; sleep 0.1; done
 kill "$HOLDER" 2>/dev/null; wait "$HOLDER" 2>/dev/null
 [ "$rc" = 75 ] && [ ! -s "$T/out" ] && ! grep -q send-keys "$TMUX_LOG" && ok "50 the observer's Enter while another sender holds the lock returns 75, not TIMEOUT" || fail "50" "rc=$rc $(cat "$T/out")"
 
-echo; [ $fails -eq 0 ] && echo "switch-model: all 50 checks pass" || { echo "switch-model: $fails FAILED"; exit 1; }
+# --- --offline: the core is down, so its settings carry the model to the next launch
+printf '#!/bin/bash\n[ -n "${PGREP_CORE:-}" ] && exit 0; exit 1\n' > "$T/bin/pgrep"; chmod +x "$T/bin/pgrep"
+printf '{"permissions":{"allow":["Bash"]}}\n' > "$T/cfg/settings.json"; rm -f "$T/state/model-switch.json"
+rc=$(run sonnet --offline); R=$(python3 -c "import json;s=json.load(open('$T/cfg/settings.json'));r=json.load(open('$T/state/model-switch.json'));print(s['model'],s['permissions']['allow'][0],r['model'],r['accepted'])" 2>/dev/null)
+[ "$rc" = 0 ] && [ "$R" = "sonnet Bash sonnet False" ] && ! grep -q send-keys "$TMUX_LOG" && grep -q "next launch" "$T/out" \
+  && ok "51 --offline with no core writes the model into settings (other keys kept) and records it, nothing typed" || fail "51" "rc=$rc R=$R $(cat "$T/err")"
+printf '{"model":"opus"}\n' > "$T/cfg/settings.json"
+rc=$(PGREP_CORE=1 run haiku --offline); R=$(python3 -c "import json;print(json.load(open('$T/cfg/settings.json'))['model'])")
+[ "$rc" = 9 ] && [ "$R" = "opus" ] && ok "52 --offline is refused while a core runs (rc=9), settings untouched" || fail "52" "rc=$rc R=$R"
+printf 'not json' > "$T/cfg/settings.json"; rc=$(run haiku --offline)
+[ "$rc" = 1 ] && [ "$(cat "$T/cfg/settings.json")" = "not json" ] && ok "53 --offline never overwrites settings it cannot read" || fail "53" "rc=$rc"
+
+echo; [ $fails -eq 0 ] && echo "switch-model: all 53 checks pass" || { echo "switch-model: $fails FAILED"; exit 1; }
