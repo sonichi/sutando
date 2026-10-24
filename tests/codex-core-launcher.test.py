@@ -132,6 +132,7 @@ class CodexCoreLauncherTests(unittest.TestCase):
             "src/tasks-dir-resolve.sh",
             "src/watcher_identity.py",
             "src/workspace_default.py",
+            "src/core_metadata.py",
             "src/shutdown.py",
             "src/sutando_config.py",
             "scripts/sutando-config.sh",
@@ -594,6 +595,16 @@ if [ "${1:-}" = print ]; then [ -f "$LAUNCHCTL_STATE" ]; else exit 0; fi
         self.assertEqual(runtime["session"], "sutando-core")
         self.assertEqual(len((state / "session-starts.log").read_text().splitlines()), 1)
         self.assertIn("new-session -d -s sutando-core", self._tmux_calls())
+        self.assertEqual(runtime["runtime"], "codex")
+        self.assertIn("model", runtime)
+
+    def test_the_runtime_record_survives_a_failing_metadata_writer(self):
+        (self.root / "src/core_metadata.py").write_text("raise SystemExit(1)\n")
+        result = self.run_launcher()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        runtime = json.loads(
+            (self.root / "workspace" / "state" / "core-runtime.json").read_text())
+        self.assertEqual((runtime["runtime"], runtime["session"]), ("codex", "sutando-core"))
 
     def test_reconciles_session_crons_before_codex_launch(self):
         workspace = self.root / "workspace"
