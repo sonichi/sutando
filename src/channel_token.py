@@ -61,7 +61,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 # The credential owner's contract module lives in shared/; the owner itself is a sibling here.
-sys.path.append(str(Path(__file__).resolve().parent.parent / "shared"))
+sys.path.append(str(Path(__file__).resolve().parent.parent / "shared"))  # lint-workspace-resolution: allow-repo-root
 
 from gateway_credential_sources import credentials_injected  # noqa: E402
 
