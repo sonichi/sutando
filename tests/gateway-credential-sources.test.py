@@ -1196,7 +1196,7 @@ KEY_TUPLES = {"TOKEN_KEYS", "URL_KEYS", "CREDENTIAL_KEYS", "TOKEN_FILE_KEY", "ME
 OWNER_ONLY = frozenset({"token_env_name", "_bridge_declaration_text", "_RECORD_TOKEN_ENV"})
 RECORD_KEY = "token_env"
 # The owner's accessors for a supervisor that reads a declaration: only the one reader may name them.
-READER_ONLY = frozenset({"bridge_declaration_fields", "bridge_token_environ"})
+READER_ONLY = frozenset({"bridge_declaration_fields", "bridge_token_environ", "bridge_strip_keys"})
 # Outside the package, the one module that reads a bridge declaration, held to the owner-only rule.
 RECORD_READERS = {"sparrow_agent_bridge.py": REPO / "src" / "sparrow_agent_bridge.py"}
 # What names a credential file or store: a scope holding one of these and a read is credential I/O.
@@ -1209,7 +1209,7 @@ DECLARATION_MARKERS = {"DECLARATION", "worker.json"}
 DECLARATION_OWNER_CALLS = {"write_bridge_declaration", "remove_bridge_declaration"}
 OWNER_MODULE = "gateway_credential_sources"
 # The owner's entry points: reachable only as `<alias>.<name>(...)` on the module's one import of it.
-OWNER_CALLS = frozenset(DECLARATION_OWNER_CALLS | {"bridge_declaration_fields", "bridge_token_environ"})
+OWNER_CALLS = frozenset(DECLARATION_OWNER_CALLS | READER_ONLY)
 # Owner calls whose callable arguments read credentials: (positional index, keyword names).
 OWNER_READERS = {"env_files": (1, ("read_text",)), "discover": (None, ("read_token_file", "vault_lookup"))}
 # Where credential I/O may happen: the adapters' edge, as (module, function).
@@ -1628,8 +1628,9 @@ def declaration_reads(source: str, rel: str) -> "list[str]":
 # these are the module's only mapping writes. A change to either is a reviewed edit of this test.
 READER_ENVIRON = """
 token_env = _sources.bridge_token_environ(token)
+strip = _sources.bridge_strip_keys()
 env = {k: v for k, v in (os.environ if base is None else base).items()
-       if k not in HOST_ONLY and k not in token_env}
+       if k not in HOST_ONLY and k not in strip}
 env.update(decl["env"], REMOTE_PROACTIVE_ROOM="")
 env.update(token_env)
 return env
@@ -1931,6 +1932,11 @@ class Guard(unittest.TestCase):
                 self.assertEqual(sorted(p.name for p in path.parent.iterdir()), ["worker.json"], "no temp file left")
                 self.assertEqual(o.bridge_declaration_fields(), {"token_env": "REMOTE_TASK_TOKEN"})
                 self.assertEqual(o.bridge_token_environ("t"), {"REMOTE_TASK_TOKEN": "t"})
+                self.assertEqual(o.bridge_strip_keys(), ("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN", "REMOTE_MEDIA_HS_TOKEN"),
+                                 "every name a host's gateway token may sit under: each token key and the media token")
+                self.assertEqual(set(o.bridge_strip_keys()), set(o.TOKEN_KEYS) | {o.MEDIA_TOKEN_KEY})
+                self.assertTrue(set(o.bridge_token_environ("t")) <= set(o.bridge_strip_keys()),
+                                "the name the agent's token goes under is stripped of the host's first")
 
     def test_the_owner_checks_and_removes_only_its_own_declaration(self):
         args = dict(written_by="x install", host="h", name="n", module="m", env={}, token_vault_key="k")
@@ -1975,7 +1981,9 @@ class Guard(unittest.TestCase):
                        'getattr(_sources, "token_env_name")()', 'getattr(_sources, "_bridge_declaration_text")',
                        'getattr(_sources, "_RECORD_TOKEN_ENV")', 'getattr(_sources, "CREDENTIAL_KEYS")',
                        '_sources.bridge_token_environ("")', 'getattr(_sources, "bridge_declaration_fields")()',
-                       'from .gateway_credential_sources import bridge_token_environ'):
+                       '_sources.bridge_strip_keys()', 'getattr(_sources, "bridge_strip_keys")()',
+                       'from .gateway_credential_sources import bridge_token_environ',
+                       'from .gateway_credential_sources import bridge_strip_keys'):
             self.assert_flagged(source)
         helper = "adapters/claude_code/probe_helper.py"
         found = self.package_findings(extra={helper: 'import os\nos.getenv(getattr(_sources, "TOKEN_KEYS")[0])\n'})
@@ -1992,6 +2000,9 @@ class Guard(unittest.TestCase):
                             "the reader's accessors stay the reader's")
             self.assertEqual(token_injection_findings(text, rel), [])
             for mutant in (('    token_env = _sources.bridge_token_environ(token)\n', '    token_env = {"REMOTE_TASK_TOKEN": token}\n'),
+                           ('    strip = _sources.bridge_strip_keys()\n', '    strip = token_env\n'),
+                           ('    strip = _sources.bridge_strip_keys()\n', '    strip = HOST_ONLY + tuple(token_env)\n'),
+                           ('    strip = _sources.bridge_strip_keys()\n', '    strip = _sources.bridge_strip_keys()[:1]\n'),
                            ('    env.update(token_env)\n', '    env.update(token_env)\n    env["AG2_REMOTE_" + "TOKEN"] = token\n'),
                            ('    env.update(token_env)\n', '    env.update(token_env, X=os.environ.get("REMOTE_TASK_TOKEN"))\n')):
                 self.assertIn(mutant[0], text)

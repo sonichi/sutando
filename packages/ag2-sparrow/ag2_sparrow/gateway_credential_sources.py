@@ -122,6 +122,13 @@ def bridge_token_environ(token: str) -> "dict[str, str]":
     """The variables a declared bridge's token is handed to it under."""
     return {token_env_name(): token}
 
+
+def bridge_strip_keys() -> "tuple[str, ...]":
+    """Every variable a host's own gateway token may sit under, for a supervisor to drop from a declared
+    bridge's environment: each token name, its alias and the media token, so discover() finds none of
+    the host's in the bridge."""
+    return TOKEN_KEYS + (MEDIA_TOKEN_KEY,)
+
 # The precedence, stated once; the first source carrying a value wins (see discover() for each name:
 # "file" is the first listed .env file carrying a token, "token" the URL inside the winning one).
 SOURCES = (

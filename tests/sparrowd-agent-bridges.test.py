@@ -32,7 +32,7 @@ for _p in (str(REPO / "src"), str(REPO / "packages" / "ag2-sparrow")):
 
 import sparrow_agent_bridge as bridge  # noqa: E402
 
-from ag2_sparrow import _dirs, local_task_protocol  # noqa: E402
+from ag2_sparrow import _dirs, gateway_credential_sources as _sources, local_task_protocol  # noqa: E402
 from ag2_sparrow.adapters.claude_code import cli  # noqa: E402
 
 AGENT = "@probe.agent:ag2.space"
@@ -351,6 +351,42 @@ class Wrapper(Base):
                                 "task": root / "tasks", "result": root / "results", "state": Path(f"{root}.bridge/state"),
                                 "stamper": True, "token": "tok-agent", "mxid": AGENT, "device": None, "token_file": None,
                                 "room": "", "keep": "1", "extra": []})
+
+    # Synthetic host values, one under every name a host's gateway token may sit under.
+    HOST_TOKENS = {"REMOTE_TASK_TOKEN": "host-token", "AG2_REMOTE_TOKEN": "host-alias-token",
+                   "REMOTE_MEDIA_HS_TOKEN": "host-media-token"}
+
+    def built_environment(self) -> dict:
+        """The environment the bridge module runs under when sparrowd holds a token under every name."""
+        decl = self.declare()
+        seen = {}
+        with mock.patch.dict(os.environ, self.HOST_TOKENS):
+            rc = bridge.main([str(decl)], workspace=self.ws, get_key=lambda k: "tok-agent",
+                             run=lambda module, run_name, alter_sys: seen.update(os.environ))
+        self.assertEqual(rc, 0)
+        self.assertNotEqual(seen, {}, "the bridge ran")
+        return seen
+
+    def test_the_hosts_REMOTE_TASK_TOKEN_is_replaced_by_the_agents(self):
+        env = self.built_environment()
+        self.assertEqual(env.get("REMOTE_TASK_TOKEN"), "tok-agent")
+        self.assertNotIn("host-token", env.values())
+
+    def test_the_hosts_AG2_REMOTE_TOKEN_never_reaches_the_bridge(self):
+        env = self.built_environment()
+        self.assertNotIn("AG2_REMOTE_TOKEN", env)
+        self.assertNotIn("host-alias-token", env.values())
+
+    def test_the_hosts_REMOTE_MEDIA_HS_TOKEN_never_reaches_the_bridge(self):
+        env = self.built_environment()
+        self.assertNotIn("REMOTE_MEDIA_HS_TOKEN", env)
+        self.assertNotIn("host-media-token", env.values())
+
+    def test_every_name_the_owner_strips_is_stripped_before_the_agents_token_is_set(self):
+        host = {k: f"host-{i}" for i, k in enumerate(_sources.bridge_strip_keys())}
+        built = bridge.bridge_environ({"env": {"AGENT_MXID": AGENT}}, "tok-agent", base={**host, "KEEP_ME": "1"})
+        self.assertEqual({k: v for k, v in built.items() if k in host}, _sources.bridge_token_environ("tok-agent"))
+        self.assertEqual(built["KEEP_ME"], "1")
 
     def test_no_token_means_no_bridge(self):
         decl = self.declare()
