@@ -649,6 +649,21 @@ class AgentEndpoint(Base):
                     self.assertIn("WILL NOT START: ", out.getvalue())
                     self.assertNotIn("tok-agent", err + out.getvalue())
 
+    def test_a_gateway_with_userinfo_a_query_or_a_fragment_is_refused_in_both_forms(self):
+        for bad in ("https://u:pw-zq9@agent-gw.example/relay", "https://agent-gw.example/relay?k=zq9",
+                    "https://agent-gw.example/relay#zq9"):
+            for get_key in (vault(url=bad), vault(token=f"{bad}|tok-agent", url=None)):
+                with self.subTest(bad=bad):
+                    rc, seen, err = self.started(get_key)
+                    self.assertEqual((rc, seen), (1, {}))
+                    self.assertIn("carries userinfo, a query or a fragment", err)
+                    out = io.StringIO()
+                    with contextlib.redirect_stdout(out):
+                        self.assertEqual(bridge.main(["--preflight"], workspace=self.ws, get_key=get_key), 1)
+                    self.assertIn("WILL NOT START: ", out.getvalue())
+                    self.assertNotIn("zq9", err + out.getvalue())
+                    self.assertNotIn("tok-agent", err + out.getvalue())
+
     def test_a_token_with_no_secret_is_refused_by_the_wrapper_and_the_preflight(self):
         get_key = vault(token=f"{AGENT_URL}|")
         rc, seen, err = self.started(get_key)
@@ -705,6 +720,38 @@ class AgentEndpoint(Base):
         with mock.patch.dict(sys.modules, {"vault_intercept": fake_vault}), contextlib.redirect_stdout(out):
             self.assertEqual(bridge.main(["--preflight"], workspace=self.ws), 0)
         self.assertIn(f"from {cli.url_vault_key(SEG)}", out.getvalue())
+
+    def test_preflight_reports_an_unlistable_agents_dir_or_home_in_one_line(self):
+        decl = self.declare()
+        if os.geteuid() == 0:
+            self.skipTest("root reads any directory")
+        for target in (self.ws / "agents", decl.parent):
+            mode = target.stat().st_mode
+            os.chmod(target, 0)
+            out, err = io.StringIO(), io.StringIO()
+            try:
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                    self.assertEqual(bridge.main(["--preflight"], workspace=self.ws, get_key=vault()), 1)
+            finally:
+                os.chmod(target, mode)
+            named = decl if target == decl.parent else target
+            self.assertEqual(out.getvalue(), f"WILL NOT START: {named}: unreadable (PermissionError)\n")
+            self.assertEqual(err.getvalue(), "")
+
+    def test_preflight_with_nothing_declared_passes_silently(self):
+        agents = self.ws / "agents"
+        shutil.rmtree(agents, ignore_errors=True)
+        for setup in (lambda: None, lambda: agents.write_text("not a dir"),
+                      lambda: (agents.unlink(), (agents / "stray.bridge").mkdir(parents=True))):
+            setup()
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(bridge.main(["--preflight"], workspace=self.ws, get_key=vault()), 0)
+            self.assertEqual(out.getvalue(), "")
+
+    def test_the_supervisor_and_the_owner_share_one_declaration_cap(self):
+        self.assertEqual(bridge.MAX_DECLARATION_BYTES, _sources.MAX_DECLARATION_BYTES)
+        self.assertEqual(_sources.MAX_DECLARATION_BYTES, 64 * 1024)
 
 if __name__ == "__main__":
     unittest.main()

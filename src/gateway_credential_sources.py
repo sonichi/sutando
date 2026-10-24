@@ -47,6 +47,8 @@ def token_env_name() -> str:
 
 
 _RECORD_TOKEN_ENV = "token_env"
+# A declaration is a few hundred bytes; every reader refuses one past this without reading it.
+MAX_DECLARATION_BYTES = 64 * 1024
 
 
 def _bridge_declaration_text(*, written_by: str, host: str, name: str, module: str, env: Mapping[str, str],
@@ -57,20 +59,25 @@ def _bridge_declaration_text(*, written_by: str, host: str, name: str, module: s
 
 
 def _declaration_owned(path: str, written_by: str) -> "tuple[bool, str]":
-    """(present, '') when nothing is at `path` or it is a declaration `written_by` wrote, else (False, why)."""
+    """(present, '') when nothing is at `path` or it is a declaration `written_by` wrote, else (False, why).
+    A file over MAX_DECLARATION_BYTES is not one: refused and left untouched, never read past the cap."""
     if os.path.isdir(path):
         return False, f"{path} is a directory, not a declaration; remove it yourself"
     if os.path.islink(path) and not os.path.exists(path):
         return False, f"{path} is a dangling symlink; remove it by hand (rm {shlex.quote(path)})"
     try:
-        with open(path, encoding="utf-8", errors="replace") as fh:
-            text = fh.read()
+        with open(path, "rb") as fh:
+            size = os.fstat(fh.fileno()).st_size
+            data = fh.read(MAX_DECLARATION_BYTES + 1) if size <= MAX_DECLARATION_BYTES else b""
     except FileNotFoundError:
         return False, ""
     except OSError as e:
         return False, f"{path} unreadable ({e.strerror or e})"
+    if size > MAX_DECLARATION_BYTES or len(data) > MAX_DECLARATION_BYTES:
+        return False, (f"{path} is over the {MAX_DECLARATION_BYTES}-byte cap for a declaration; "
+                       f"remove it by hand (rm {shlex.quote(path)}) if it is yours to remove")
     try:
-        ours = json.loads(text).get("written_by") == written_by
+        ours = json.loads(data.decode("utf-8", errors="replace")).get("written_by") == written_by
     except (ValueError, AttributeError):
         ours = False
     if not ours:
@@ -161,7 +168,7 @@ def token_url_shaped(token: str) -> bool:
 
 def gateway_url_problem(url: str) -> str:
     """'' for a usable gateway URL (http or https with a parsed host and a valid port, no '|', no whitespace
-    or control characters), else why not, without the value."""
+    or control characters, no userinfo, query or fragment), else why not, without the value."""
     if not url or any(c.isspace() or ord(c) < 0x20 or ord(c) == 0x7F for c in url) or "|" in url:
         return "is not a gateway URL (empty, or holds whitespace, a control character or '|')"
     try:
@@ -171,6 +178,9 @@ def gateway_url_problem(url: str) -> str:
         return "is not a URL with a valid host and port"
     if parts.scheme.lower() not in ("http", "https") or not host:
         return "is not an http(s) URL with a host"
+    # Checked on the raw text too: urlsplit drops an empty '?' or '#', and a credential may ride either.
+    if "@" in parts.netloc or "?" in url or "#" in url:
+        return "carries userinfo, a query or a fragment; a gateway URL is scheme, host, port and path only"
     return ""
 
 
