@@ -145,6 +145,22 @@ class Refresher(unittest.TestCase):
         self.clock.now += setup_fetch.BACKOFF_MIN_S
         self.assertEqual(r.maybe_refresh("r1", AGENT), "failed", "not counted as held")
 
+    def test_a_writer_that_raises_never_reaches_the_heartbeat_and_keeps_the_last_good_copy(self):
+        self.answers = [result("r1")]
+        self.refresher().maybe_refresh("r1", AGENT)
+        good = self.served()
+        token = "bearer-secret-0123456789"
+
+        def boom(path, text):
+            raise OSError(28, "disk full " + token)
+        r = self.refresher(write_fn=boom)
+        self.answers = [result("r2")]
+        self.assertEqual(r.maybe_refresh("r2", AGENT), "failed")
+        self.assertEqual(self.served(), good)
+        self.assertIn("retry in 60s", self.logs[-1])
+        self.assertEqual(r.maybe_refresh("r2", AGENT), "backoff")
+        self.assertNotIn(token, "\n".join(self.logs))
+
     def test_the_backoff_is_capped(self):
         r = self.refresher()
         self.answers = [OSError("down")] * 20
@@ -247,6 +263,27 @@ print(json.dumps({"calls": calls, "served": json.loads(m.setup_fetch.served_path
                          "fetched for r1 once, then for r2; bounded by a deadline")
         self.assertEqual(out["served"], result("r1"), "the refused r2 left r1 in place")
         self.assertIn("refused (not an object)", logs)
+        self.assertNotIn("fake-relay-token", logs)
+
+
+    def test_an_unreadable_identity_still_fetches_and_never_breaks_the_heartbeat(self):
+        script = """
+import json
+from unittest import mock
+from ag2_sparrow import remote_gateway_bridge as m
+def req(method, path, payload=None, timeout=0, deadline=None):
+    return {"ok": True, "setup_revision": "r1"} if path == "/v1/heartbeat" else served
+def unread():
+    raise RuntimeError("identity file holds " + m.TOKEN)
+served = %s
+with mock.patch.object(m, "_req", req), mock.patch.object(m, "_reenroll_identity", unread):
+    beat = m._post_heartbeat(set(), force=True)
+print(json.dumps({"beat": beat, "served": json.loads(m.setup_fetch.served_path(m._STATE).read_text())}))
+""" % repr(result("r1", agent_mxid="@someone-else:ag2.space"))
+        out, logs = self.run_bridge(script)
+        self.assertIs(out["beat"], True, "the heartbeat still reports success")
+        self.assertEqual(out["served"]["revision"], "r1", "fetched with the agent check skipped")
+        self.assertIn("served setup: identity unread", logs)
         self.assertNotIn("fake-relay-token", logs)
 
 
