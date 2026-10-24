@@ -44,6 +44,8 @@ export interface DurableChannelOptions {
 	/** A result returned through its call and not said by then is nudged once (a notice), then handed over again. */
 	returnNudgeMs?: number;
 	returnReleaseMs?: number;
+	/** A release due mid-turn waits for the turn's end, at most this long (a turn held open by a blocking call). */
+	returnReleaseTurnWaitMs?: number;
 	/** The `work` subagent, which owns the result queue. */
 	relay: RelayAgent;
 	/** Puts text to the model as live input once it is not speaking. Used for a result when system notices
@@ -57,6 +59,7 @@ let pacerHeld: () => string[] = () => [];
 export const heldByPacer = (): string[] => pacerHeld();
 export const RETURN_NUDGE_MS = 15_000;
 export const RETURN_RELEASE_MS = 60_000;
+export const RETURN_RELEASE_TURN_WAIT_MS = 30_000;
 
 const EVIDENCE_STOP = new Set(['about', 'after', 'again', 'already', 'also', 'because', 'before', 'being', 'could', 'every', 'first', 'found', 'from', 'have', 'here', 'into', 'just', 'last', 'more', 'most', 'other', 'over', 'ready', 'result', 'results', 'said', 'should', 'since', 'some', 'than', 'that', 'their', 'them', 'then', 'there', 'these', 'they', 'this', 'those', 'through', 'under', 'until', 'very', 'were', 'what', 'when', 'where', 'which', 'while', 'will', 'with', 'would', 'your', 'task', 'done', 'request', 'user']);
 export interface ResultEvidence { numbers: string[]; words: string[] }
@@ -262,7 +265,7 @@ export function wireDurableChannels(session: VoiceSession, opts: DurableChannelO
 	const interruptedTurns = new Set<string>();
 	// Results returned through open calls: a spoken turn counts as the result only when its words carry the result's
 	// content; unsaid after returnNudgeMs it is nudged, after returnReleaseMs (or a reconnect) handed over again.
-	type Returned = { ids: string[]; at: number; evidence: ReturnType<typeof resultEvidence>; request: string; nudged: boolean; nudge: ReturnType<typeof setTimeout>; release: ReturnType<typeof setTimeout> };
+	type Returned = { ids: string[]; at: number; evidence: ReturnType<typeof resultEvidence>; request: string; nudged: boolean; nudgeAfterTurn?: boolean; releaseAfterTurn?: boolean; nudge: ReturnType<typeof setTimeout>; release: ReturnType<typeof setTimeout> };
 	const returnedUnheard: Returned[] = [];
 	const dropReturned = (r: Returned) => { clearTimeout(r.nudge); clearTimeout(r.release); const i = returnedUnheard.indexOf(r); if (i >= 0) returnedUnheard.splice(i, 1); };
 	const turnWords = (): string | null => {
@@ -273,27 +276,40 @@ export function wireDurableChannels(session: VoiceSession, opts: DurableChannelO
 	};
 	let modelTurnStartedAt = 0;
 	let modelSpokeInTurn = false;
-	session.eventBus.subscribe('turn.start', () => { modelTurnStartedAt = Date.now(); modelSpokeInTurn = false; });
+	/** The model is in a turn: a nudge due now waits for its end (the turn may be saying that very result). A cut-off
+	 * turn needs nothing more: bodhi publishes turn.interrupted and then turn.end for it. */
+	let modelInTurn = false;
+	session.eventBus.subscribe('turn.start', () => { modelTurnStartedAt = Date.now(); modelSpokeInTurn = false; modelInTurn = true; });
 	// A fresh dial abandons the old connection's calls and whatever the model held unsaid: a result returned to a
 	// call, or handed to the pacer, is handed over again. A resume keeps the calls and the context, so RECONNECTING
 	// alone changes nothing here.
 	session.eventBus.subscribe('session.reconnectBoundary', () => {
 		if (!noticesSuspect && opts.injectLive) console.log(`${ts()} [RelayAgent] connection replaced: results with no open call go as live input until the model speaks`);
 		noticesSuspect = true;
+		modelInTurn = false;
 		for (const r of returnedUnheard.splice(0)) { clearTimeout(r.nudge); clearTimeout(r.release); for (const id of r.ids) voiceTaskStore.unsetHandedOver(id); }
 		for (const id of pacer.held()) voiceTaskStore.unsetHandedOver(id);
 	});
 	session.eventBus.subscribe('response.first_audio', () => { modelSpokeInTurn = true; });
+	// What came due during the turn, for a result the turn did not say. A release hands the result itself over, so
+	// it goes before the nudge, which then has nothing left to nudge.
+	const afterTurn = () => {
+		for (const r of returnedUnheard.filter((x) => x.releaseAfterTurn)) releaseReturned(r);
+		for (const r of returnedUnheard.filter((x) => x.nudgeAfterTurn)) sendNudge(r);
+	};
 	session.eventBus.subscribe('turn.end', () => {
-		if (!modelSpokeInTurn) return;
+		modelInTurn = false;
+		if (!modelSpokeInTurn) { afterTurn(); return; }
 		modelSpokeInTurn = false;
 		// The model completed a spoken turn on the new connection: its notifications flow again.
 		if (noticesSuspect && (session.sessionManager as { state?: string }).state !== 'RECONNECTING') noticesSuspect = false;
 		const words = turnWords();
 		for (const r of [...returnedUnheard]) {
-			if (r.at > modelTurnStartedAt) continue;
 			// Nothing distinctive to look for (the result only restates the request): the turn after the nudge counts.
 			const noEvidence = !r.evidence.numbers.length && !r.evidence.words.length;
+			// A turn begun before the result came back may still say it (the turn that called the tool goes on), but
+			// only its words can show that it did.
+			if (r.at > modelTurnStartedAt && (noEvidence || words === null || !turnSaysResult(words, r.evidence))) continue;
 			if (words !== null && (noEvidence ? !r.nudged : !turnSaysResult(words, r.evidence))) {
 				console.log(`${ts()} [RelayAgent] ${r.ids[0]}: the model spoke, but not the result; still waiting for it`);
 				continue;
@@ -301,6 +317,7 @@ export function wireDurableChannels(session: VoiceSession, opts: DurableChannelO
 			for (const id of r.ids) voiceTaskStore.set(id, 'spoken');
 			dropReturned(r);
 		}
+		afterTurn();
 	});
 	session.eventBus.subscribe('turn.start', () => pacer.onTurnStart());
 	session.eventBus.subscribe('response.first_audio', () => pacer.onModelAudio());
@@ -404,6 +421,31 @@ export function wireDurableChannels(session: VoiceSession, opts: DurableChannelO
 			}).catch(err => console.error(`${ts()} [CartesiaTTS] ${err.message}`));
 		}
 	};
+	// A nudge tells the model the user has not heard the result: sent while a turn may be saying it, the model says it
+	// again, so a nudge due mid-turn waits for the turn's end (and the turn's words) first.
+	function sendNudge(r: Returned): void {
+		if (!returnedUnheard.includes(r) || !canSpeak() || r.nudged) return;
+		if (modelInTurn) { r.nudgeAfterTurn = true; return; }
+		r.nudgeAfterTurn = false;
+		r.nudged = true;
+		const text = framedSystem(`The result for the request "${r.request}" came back through its work call but you have not told the user yet. Tell them now, in one or two sentences.`);
+		console.log(`${ts()} [RelayAgent] ${r.ids[0]}: returned ${Math.round((Date.now() - r.at) / 1000)} s ago and not said; nudging`);
+		if (noticesSuspect && opts.injectLive) opts.injectLive(text); else session.tryPublishSystemNotification(text);
+	}
+	// Handed over mid-turn, the result would land on top of the turn (which may be saying it): it waits for the
+	// turn's end, but not past returnReleaseTurnWaitMs, so a turn that stays open never keeps it from the user.
+	function releaseReturned(r: Returned, waited = false): void {
+		if (!returnedUnheard.includes(r)) return;
+		if (modelInTurn && !waited) {
+			r.releaseAfterTurn = true;
+			r.release = setTimeout(() => releaseReturned(r, true), opts.returnReleaseTurnWaitMs ?? RETURN_RELEASE_TURN_WAIT_MS);
+			r.release.unref?.();
+			return;
+		}
+		console.log(`${ts()} [RelayAgent] ${r.ids[0]}: still not said after the nudge; handing it over again`);
+		dropReturned(r);
+		for (const id of r.ids) voiceTaskStore.unsetHandedOver(id);
+	}
 	const deliver = (item: ResultItem) => {
 		// Corrected, or already said: end its call, say nothing.
 		if (moot(item)) {
@@ -425,19 +467,8 @@ export function wireDurableChannels(session: VoiceSession, opts: DurableChannelO
 				const request = (now.requests?.[0] ?? voiceTaskStore.get(item.taskId)?.text ?? item.taskId).replace(/"/g, "'").slice(0, 120);
 				const r: Returned = {
 					ids: ids(now), at: Date.now(), evidence: resultEvidence(now.text, [request, ...(now.requests ?? [])].join(' ')), request, nudged: false,
-					nudge: setTimeout(() => {
-						if (!returnedUnheard.includes(r) || !canSpeak()) return;
-						r.nudged = true;
-						const text = framedSystem(`The result for the request "${request}" came back through its work call but you have not told the user yet. Tell them now, in one or two sentences.`);
-						console.log(`${ts()} [RelayAgent] ${r.ids[0]}: returned ${Math.round((Date.now() - r.at) / 1000)} s ago and not said; nudging`);
-						if (noticesSuspect && opts.injectLive) opts.injectLive(text); else session.tryPublishSystemNotification(text);
-					}, opts.returnNudgeMs ?? RETURN_NUDGE_MS),
-					release: setTimeout(() => {
-						if (!returnedUnheard.includes(r)) return;
-						console.log(`${ts()} [RelayAgent] ${r.ids[0]}: still not said after the nudge; handing it over again`);
-						dropReturned(r);
-						for (const id of r.ids) voiceTaskStore.unsetHandedOver(id);
-					}, opts.returnReleaseMs ?? RETURN_RELEASE_MS),
+					nudge: setTimeout(() => sendNudge(r), opts.returnNudgeMs ?? RETURN_NUDGE_MS),
+					release: setTimeout(() => releaseReturned(r), opts.returnReleaseMs ?? RETURN_RELEASE_MS),
 				};
 				r.nudge.unref?.(); r.release.unref?.();
 				returnedUnheard.push(r);

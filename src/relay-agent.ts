@@ -84,8 +84,11 @@ export function createVoiceTaskStore(now: () => number = Date.now) {
 			// A confirmed delivery is never downgraded by a later, weaker one.
 			const deliver = (row: VoiceTaskRecord) => (row.delivery === 'spoken' && delivery !== 'spoken' ? null : { ...row, delivery });
 			update(taskId, deliver);
-			// The tasks answered in this one's result reached the user with it, whichever way it went.
-			for (const [id, row] of [...tasks.entries()]) if (row.answeredBy === taskId) update(id, deliver);
+			// One result answers this task and every task answered in it (or in the result this task was answered in):
+			// whichever of them it reached the user through, it reached the user for all of them.
+			const source = tasks.get(taskId)?.answeredBy ?? taskId;
+			if (source !== taskId) update(source, deliver);
+			for (const [id, row] of [...tasks.entries()]) if (id !== taskId && row.answeredBy === source) update(id, deliver);
 		},
 		/** A hand-over the session lost before it was spoken: reconcile hands it over again. */
 		unsetHandedOver(taskId: string): void {
@@ -750,8 +753,9 @@ export class RelayAgent<O = unknown> implements PersistentSubagentInstance {
 				// The same request is already with the core. This call waits for that task's result instead,
 				// unless another call already does; either way the user is told it is on its way.
 				this.deps.log?.(`[RelayAgent] ${verdict.of}: asked again; not sent twice`);
-				this.deps.notice?.(framedSystem(DUPLICATE_WAITS));
+				// Answered at once: the answer is the acknowledgement (a notice as well was said a second time).
 				if (this.waiting.has(verdict.of)) return framedSystem(DUPLICATE_WAITS);
+				this.deps.notice?.(framedSystem(DUPLICATE_WAITS));
 				if (this.boundaries !== boundary) return framedSystem(ENDED.continuing); // the connection was replaced meanwhile
 				return new Promise<string>((resolve, reject) => {
 					this.waiting.set(verdict.of, { resolve, reject });

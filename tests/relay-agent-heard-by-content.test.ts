@@ -23,6 +23,9 @@ const tick = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const until = async (done: () => boolean, ms = 10_000) => { for (let w = 0; w < ms / 100 && !done(); w++) await tick(100); };
 
 const notices: string[] = [];
+/** Notices about one task (its request or its result): a test counts only its own, so one that fails leaves no
+ * nudge or hand-over that makes a later test fail too (they share one session). */
+const about = (s: string) => notices.filter((n) => n.includes(s)).length;
 const items: Array<{ role: string; content: string }> = [];
 const handlers: Record<string, Array<(e?: unknown) => void>> = {};
 const session = {
@@ -39,7 +42,7 @@ let submitted: Record<string, unknown> = {};
 const relay = new RelayAgent({ submit: async () => submitted, store: voiceTaskStore });
 setVoiceTaskEndedListener((taskId, why) => { relay.endCall(taskId, why); });
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-wireDurableChannels(session as any, { relay, notReadyRetriesMs: [10, 10], reconcileMs: 300, handoffConfirmMs: 200, returnNudgeMs: 400, returnReleaseMs: 1_500 });
+wireDurableChannels(session as any, { relay, notReadyRetriesMs: [10, 10], reconcileMs: 300, handoffConfirmMs: 200, returnNudgeMs: 400, returnReleaseMs: 1_500, returnReleaseTurnWaitMs: 2_500 });
 
 let seq = 0;
 function voiceTask(text: string): string {
@@ -77,8 +80,97 @@ describe('a returned result is heard only when the model says it', () => {
 		assert.equal(voiceTaskStore.get(id)?.delivery, 'spoken');
 	});
 
+	it('a nudge due while the model is mid-turn waits for the turn: none when that turn says the result', async () => {
+		// 2026-10-20 18:14:09: the nudge for the Use Case 03 summary went in while the model was saying it; it said it again.
+		const id = voiceTask('watch the Use Case 03 video and summarize it');
+		submitted = { status: 'pending', taskId: id, queuedAhead: 0, watcherOnline: true };
+		const call = relay.invoke('Execute tool: work', { task: 'watch the Use Case 03 video and summarize it' });
+		await tick(0);
+		writeFileSync(join(TMP, 'results', `${id}.txt`), 'The Use Case 03 video is a 38-second demo: a person and an agent edit one page; the agent formats the notes as a list and adds the missing video link.');
+		await Promise.race([call, tick(5_000)]);
+		session.emit('turn.start');
+		session.emit('response.first_audio');
+		await tick(600); // past the nudge time, the model still speaking
+		assert.equal(about('Use Case 03'), 0, 'no nudge into a turn in progress');
+		items.push({ role: 'assistant', content: 'The Use Case three video shows a person and an agent collaborating on a document to format a list and add a video link.' });
+		session.emit('turn.end', { turnId: 'tu1' });
+		assert.equal(voiceTaskStore.get(id)?.delivery, 'spoken');
+		await tick(100);
+		assert.equal(about('Use Case 03'), 0, 'and none after it: the turn said it');
+	});
+
+	it('a nudge due mid-turn goes as soon as a turn ends without the result', async () => {
+		const id = voiceTask('summarize the launch plan');
+		submitted = { status: 'pending', taskId: id, queuedAhead: 0, watcherOnline: true };
+		const call = relay.invoke('Execute tool: work', { task: 'summarize the launch plan' });
+		await tick(0);
+		writeFileSync(join(TMP, 'results', `${id}.txt`), 'The launch plan has four phases; the beta opens on November 12.');
+		await Promise.race([call, tick(5_000)]);
+		session.emit('turn.start');
+		session.emit('response.first_audio');
+		await tick(600);
+		assert.equal(about('launch plan'), 0);
+		items.push({ role: 'assistant', content: 'Sure, here is a joke about skeletons.' });
+		session.emit('turn.end', { turnId: 'tu2' });
+		assert.equal(about('summarize the launch plan'), 1, 'nudged once the turn ended');
+		modelSays('The launch plan has four phases and the beta opens on November 12.', 'tu3');
+		assert.equal(voiceTaskStore.get(id)?.delivery, 'spoken');
+	});
+
+	it('a result returned while the model is mid-turn counts when that turn says it: no nudge after it', async () => {
+		// The turn that calls the tool goes on and says the answer once it is back; on a turn longer than the
+		// nudge time, the nudge held for its end would have it said a second time.
+		const id = voiceTask('when is the design review');
+		submitted = { status: 'pending', taskId: id, queuedAhead: 0, watcherOnline: true };
+		session.emit('turn.start');
+		await tick(5);
+		const call = relay.invoke('Execute tool: work', { task: 'when is the design review' });
+		await tick(0);
+		writeFileSync(join(TMP, 'results', `${id}.txt`), 'The design review is on Thursday afternoon in the Juniper room.');
+		await Promise.race([call, tick(5_000)]);
+		session.emit('response.first_audio');
+		await tick(600);
+		items.push({ role: 'assistant', content: 'The design review is Thursday afternoon, in the Juniper room.' });
+		session.emit('turn.end', { turnId: 'tu-mid' });
+		assert.equal(voiceTaskStore.get(id)?.delivery, 'spoken', 'the turn said it');
+		await tick(100);
+		assert.equal(about('design review'), 0, 'no nudge');
+	});
+
+	it('a result returned mid-turn is not heard by a turn that says something else', async () => {
+		const id = voiceTask('what is the wifi password');
+		submitted = { status: 'pending', taskId: id, queuedAhead: 0, watcherOnline: true };
+		session.emit('turn.start');
+		await tick(5);
+		const call = relay.invoke('Execute tool: work', { task: 'what is the wifi password' });
+		await tick(0);
+		writeFileSync(join(TMP, 'results', `${id}.txt`), 'The guest wifi password is marigold-harbor.');
+		await Promise.race([call, tick(5_000)]);
+		session.emit('response.first_audio');
+		items.push({ role: 'assistant', content: 'Let me look that up for you.' });
+		session.emit('turn.end', { turnId: 'tu-mid2' });
+		assert.equal(voiceTaskStore.get(id)?.delivery, 'injected');
+		modelSays('The guest wifi password is marigold-harbor.', 'tu-mid3');
+		assert.equal(voiceTaskStore.get(id)?.delivery, 'spoken');
+	});
+
+	it('a nudge due during a turn with no speech (a tool call only) goes when that turn ends', async () => {
+		const id = voiceTask('list the open milestones');
+		submitted = { status: 'pending', taskId: id, queuedAhead: 0, watcherOnline: true };
+		const call = relay.invoke('Execute tool: work', { task: 'list the open milestones' });
+		await tick(0);
+		writeFileSync(join(TMP, 'results', `${id}.txt`), 'Two milestones are open: Beta on November 12 and GA on December 3.');
+		await Promise.race([call, tick(5_000)]);
+		session.emit('turn.start');
+		await tick(600);
+		assert.equal(about('list the open milestones'), 0, 'no nudge into a turn in progress');
+		session.emit('turn.end', { turnId: 'tu-silent' });
+		assert.equal(about('list the open milestones'), 1, 'nudged as the silent turn ended, not one turn later');
+		modelSays('Two milestones are open: Beta on November 12 and GA on December 3.', 'tu-s2');
+		assert.equal(voiceTaskStore.get(id)?.delivery, 'spoken');
+	});
+
 	it('a turn that carries a number from the result counts at once, with no nudge', async () => {
-		const before = notices.length;
 		const id = voiceTask('check PR 5617');
 		submitted = { status: 'pending', taskId: id, queuedAhead: 0, watcherOnline: true };
 		const call = relay.invoke('Execute tool: work', { task: 'check PR 5617' });
@@ -88,7 +180,44 @@ describe('a returned result is heard only when the model says it', () => {
 		modelSays('Pull request 5617 was merged on Saturday.', 't4');
 		assert.equal(voiceTaskStore.get(id)?.delivery, 'spoken');
 		await tick(600);
-		assert.equal(notices.length, before, 'no nudge for a result that was said');
+		assert.equal(about('5617'), 0, 'no nudge for a result that was said');
+	});
+
+	it('a release due while the model is mid-turn waits for the turn to end', async () => {
+		// Handed over into a turn, the result lands on top of whatever the model is saying.
+		const id = voiceTask('how many seats are left on the flight');
+		submitted = { status: 'pending', taskId: id, queuedAhead: 0, watcherOnline: true };
+		const call = relay.invoke('Execute tool: work', { task: 'how many seats are left on the flight' });
+		await tick(0);
+		writeFileSync(join(TMP, 'results', `${id}.txt`), 'There are 17 seats left on flight UA 857.');
+		await Promise.race([call, tick(5_000)]);
+		await until(() => about('how many seats are left') > 0, 3_000);
+		assert.equal(about('how many seats are left'), 1, 'nudged');
+		session.emit('turn.start');
+		session.emit('response.first_audio');
+		await tick(2_000); // past the release time, the model still speaking
+		assert.equal(about('17 seats left'), 0, 'not handed over into the turn');
+		items.push({ role: 'assistant', content: 'Anything else I can help with?' });
+		session.emit('turn.end', { turnId: 'tu-rel' });
+		await until(() => about('17 seats left') > 0, 3_000);
+		assert.equal(about('17 seats left'), 1, 'handed over again once the turn ended');
+		modelSays('There are 17 seats left on flight UA 857.', 'tu-rel2');
+	});
+
+	it('a turn that stays open does not hold the release for good', async () => {
+		const id = voiceTask('which room is the offsite in');
+		submitted = { status: 'pending', taskId: id, queuedAhead: 0, watcherOnline: true };
+		const call = relay.invoke('Execute tool: work', { task: 'which room is the offsite in' });
+		await tick(0);
+		writeFileSync(join(TMP, 'results', `${id}.txt`), 'The offsite is in the Larkspur room on the fourth floor.');
+		await Promise.race([call, tick(5_000)]);
+		session.emit('turn.start'); // a turn held open, for example by a blocking call
+		await tick(3_000);
+		assert.equal(about('Larkspur'), 0, 'still waiting for the turn');
+		await until(() => about('Larkspur') > 0, 3_000);
+		assert.equal(about('Larkspur'), 1, 'handed over once the wait ran out, the turn still open');
+		session.emit('turn.end', { turnId: 'tu-open' });
+		modelSays('The offsite is in the Larkspur room on the fourth floor.', 'tu-open2');
 	});
 
 	it('still unsaid after the release time: handed over again by the reconcile loop', async () => {
