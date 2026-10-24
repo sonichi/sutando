@@ -651,6 +651,26 @@ class DiscoveryCases:
 
 
 
+class _Spy:
+    """A file handle that records the size of each read."""
+
+    def __init__(self, fh, reads):
+        self._fh, self._reads = fh, reads
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self._fh.close()
+
+    def fileno(self):
+        return self._fh.fileno()
+
+    def read(self, n=-1):
+        self._reads.append(n)
+        return self._fh.read(n)
+
+
 class PackageDiscovery(DiscoveryCases, unittest.TestCase):
     o = OWNERS["package"]
 
@@ -817,6 +837,25 @@ class RealSinks(unittest.TestCase):
             reload_err = err.split("--reload--", 1)[1]
             self.assertIn(f"credential file {fx.token_file} was refused (not UTF-8)", reload_err)
             self.assertNotIn(FILE_TOKEN, reload_err, "path and reason, never content")
+
+    def test_a_malformed_rotated_gateway_url_is_logged_as_the_placeholder(self):
+        with tempfile.TemporaryDirectory() as td:
+            fx = Fixture(Path(td), ROWS[0])
+            fx.token_file.write_text(f"REMOTE_TASK_TOKEN={ENV_TOKEN}\n")
+            fx.env["REMOTE_TASK_TOKEN_FILE"] = str(fx.token_file)
+            path = json.dumps(str(fx.token_file))
+            script = BRIDGE.replace("print(json.dumps({", (
+                "import contextlib, io, pathlib\n"
+                f"pathlib.Path({path}).write_text("
+                f"'REMOTE_TASK_TOKEN={FILE_TOKEN}\\nREMOTE_TASK_URL=http://[::1?token=zq9rot\\n')\n"
+                "logged = io.StringIO()\n"
+                "with contextlib.redirect_stdout(logged), contextlib.redirect_stderr(logged):\n"
+                "    reloaded = m._reload_rotated_token()\n"
+                'print(json.dumps({"reloaded": reloaded, "logged": logged.getvalue(), '))
+            out, _err = self.bridge(fx, script)
+            self.assertFalse(out["reloaded"], "a URL change is never a rotation")
+            self.assertIn(f"DIFFERENT gateway ({owner.contract.REDACTED_URL})", out["logged"])
+            self.assertNotIn("zq9rot", out["logged"], "an unparseable URL fails closed, never the raw input")
 
     def hatch_diff(self, fx, installed: str, name: str = "ag2-sparrow.service",
                    ours: str = "[Service]\nExecStart=/y\n") -> str:
@@ -2106,7 +2145,14 @@ class Guard(unittest.TestCase):
                                  [True, True, True, True, False, False, False], "no secret on either side of '|'")
                 self.assertEqual(o.gateway_url_problem(url), "")
                 self.assertEqual(o.gateway_url_problem("http://127.0.0.1:9/relay"), "")
-                self.assertEqual(o.gateway_url_problem("https://user:pass@gw.example:8443/relay?q=1#f"), "")
+                self.assertEqual(o.gateway_url_problem("https://gw.example:8443/relay"), "")
+                for credential_shaped in ("https://user:pass@gw.example:8443/relay", "https://user@gw.example/relay",
+                                          "https://@gw.example/relay", "https://gw.example/relay?q=1",
+                                          "https://gw.example/relay?", "https://gw.example/relay#f",
+                                          "https://gw.example/relay#"):
+                    problem = o.gateway_url_problem(credential_shaped)
+                    self.assertIn("userinfo, a query or a fragment", problem, credential_shaped)
+                    self.assertNotIn("gw.example", problem, "why, never the value")
                 for bad in ("", "ftp://x/relay", "https://", "x.example/relay", "https://x/relay|s", "https://x /r",
                             "https://x/r\x7f", "https://?missing-host", "https://#missing-host", "https://:443/relay",
                             "https://user@/relay", "https://gw.example:notaport/relay", "https://gw.example:99999/r"):
@@ -2139,7 +2185,7 @@ class Guard(unittest.TestCase):
                     self.assertTrue(o.credentials_injected(child))
                     self.assertFalse(o.credentials_injected(host))
                     files = o.env_files(child, read_text)
-                    self.assertEqual((list(files), files.credential_values, files.refused, files.blocked, opened),
+                    self.assertEqual((list(files), files.credential_pairs, files.refused, files.blocked, opened),
                                      ([], (), (), "", []), "injected: no channel file is opened, nothing is read")
                     self.assertEqual(o.bridge_carried_config(child, read_text), {}, "the child resolves nothing itself")
                     registry = o.contract.SecretRegistry()
@@ -2187,6 +2233,34 @@ class Guard(unittest.TestCase):
                 path.write_text('{"written_by": "x install"}')
                 with mock.patch.object(o, "open", side_effect=PermissionError(13, "Permission denied"), create=True):
                     self.assertEqual(o.write_bridge_declaration(path, **args), f"{path} unreadable (Permission denied)")
+
+    def test_a_declaration_past_the_cap_is_refused_unread_and_left_untouched(self):
+        args = dict(written_by="x install", host="h", name="n", module="m", env={}, token_vault_key="k")
+        for label, o in OWNERS.items():
+            with self.subTest(label), tempfile.TemporaryDirectory() as d:
+                path = Path(d) / "worker.json"
+                body = '{"written_by": "x install", "pad": "'
+                at_cap = body + "a" * (o.MAX_DECLARATION_BYTES - len(body) - 2) + '"}'
+                self.assertEqual(len(at_cap), o.MAX_DECLARATION_BYTES)
+                path.write_text(at_cap)
+                self.assertEqual(o.remove_bridge_declaration(path, written_by="x install"), (True, ""), "at the cap: ours")
+                over = at_cap[:-2] + 'a"}'
+                path.write_text(over)
+                refused = (f"{path} is over the {o.MAX_DECLARATION_BYTES}-byte cap for a declaration; "
+                           f"remove it by hand (rm {path}) if it is yours to remove")
+                self.assertEqual(o.write_bridge_declaration(path, **args), refused)
+                self.assertEqual(o.remove_bridge_declaration(path, written_by="x install"), (False, refused))
+                self.assertEqual(path.read_text(), over, "left as it was")
+                reads, real_open = [], open
+                with mock.patch.object(o, "open", side_effect=lambda *a, **k: _Spy(real_open(*a, **k), reads),
+                                       create=True):
+                    o.remove_bridge_declaration(path, written_by="x install")
+                self.assertEqual(reads, [], "an oversized file is never read")
+                path.write_text(at_cap)
+                with mock.patch.object(o, "open", side_effect=lambda *a, **k: _Spy(real_open(*a, **k), reads),
+                                       create=True):
+                    o.remove_bridge_declaration(path, written_by="x install")
+                self.assertEqual(reads, [o.MAX_DECLARATION_BYTES + 1], "a read is bounded at the cap")
 
     def test_a_failed_write_leaves_no_declaration_and_no_temp_file(self):
         for label, o in OWNERS.items():
