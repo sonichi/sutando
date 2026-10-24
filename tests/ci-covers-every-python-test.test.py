@@ -88,15 +88,32 @@ def _dquote_join(parts: list[str]) -> str:
     `_yaml_dquote_unescape` (round 32, kewei-red-ag2space: unconditional
     `" ".join` let `\\<space>` decode the join's own inserted space back into
     a real one, silently matching real YAML by accident on this input and
-    diverging on any other)."""
-    out = parts[0]
-    for part in parts[1:]:
-        trailing = len(out) - len(out.rstrip("\\"))
-        if trailing % 2 == 1:
-            out = out[:-1] + part
+    diverging on any other). A BLANK physical part folds to a newline, not a
+    space -- one `\\n` per consecutive blank (round 33, kewei-red-ag2space:
+    a blank line between two commands is real YAML line-break semantics;
+    joining it with a space instead glued two Bash statements into one,
+    crediting a script as the first command's argument when it never
+    receives it, and orphaning it in the reverse direction)."""
+    out, blanks = None, 0
+    for part in parts:
+        if part == "":
+            blanks += 1
+            continue
+        if out is None:
+            out = "\n" * blanks
         else:
-            out = out + " " + part
-    return out
+            trailing = len(out) - len(out.rstrip("\\"))
+            if trailing % 2 == 1:
+                # round 37 (#4391): an escaped break consumes its `\` even when
+                # blank physical lines follow -- the two folds are independent.
+                out = out[:-1] + "\n" * blanks
+            elif blanks:
+                out += "\n" * blanks
+            else:
+                out += " "
+        blanks = 0
+        out += part
+    return (out or "") + "\n" * blanks
 
 
 def _quote_close_split(value: str, q: str) -> "tuple[bool, str]":
@@ -368,6 +385,43 @@ class TestRunBodiesAreScannedAsAProgram(unittest.TestCase):
               '          packages/x/test_real.py"\n')
         self.assertEqual(_named_in(wf), {"packages/x/test_real.py"})
 
+    def test_blank_continuation_line_folds_to_a_newline_not_a_space(self):
+        """kewei-red-ag2space round 33: a BLANK physical line inside a
+        double-quoted scalar is real YAML line-break semantics (confirmed
+        against PyYAML: decodes to 'python3\\npackages/...'), so Bash runs
+        `python3` with no args on one line and the bare path fails on the
+        next. Joining it with a space instead glues them into one command,
+        crediting the path as python3's argument though it never receives
+        it -- the false green kewei's exact repro demonstrates."""
+        wf = 'steps:\n  - run: "python3\n\n          packages/x/test_dead.py"\n'
+        self.assertEqual(_named_in(wf), set())
+
+    def test_blank_continuation_line_the_reverse_direction_still_names_it(self):
+        """The mirror false-NEGATIVE: a python3 invocation that DOES run,
+        separated from a preceding inert command by a blank line, must
+        still be named -- the old space-join buried it as an argument."""
+        wf = 'steps:\n  - run: "echo inert\n\n          python3 packages/x/test_real.py"\n'
+        self.assertEqual(_named_in(wf), {"packages/x/test_real.py"})
+
+    def test_an_escaped_break_still_consumes_its_backslash_before_a_blank_run(self):
+        """#4391 round 37 (kewei's Codex automation): an escaped double-quoted
+        break followed by a blank physical line used to skip the trailing-`\\`
+        consumption entirely (the `elif blanks:` branch never checked it),
+        leaving the backslash in the joined string -- confirmed against
+        PyYAML, which decodes this to 'python3\\npackages/...' (backslash
+        gone, one newline from the blank run). Bash then runs `python3` with
+        no args on its own line and the bare path names nothing."""
+        bs = chr(92)
+        wf = f'steps:\n  - run: "python3 {bs}\n\n          packages/x/test_dead.py"\n'
+        self.assertEqual(_named_in(wf), set())
+
+    def test_an_escaped_break_before_a_blank_run_the_reverse_direction_still_names_it(self):
+        """Mirror of the case above: the invocation that DOES run must still
+        be named once the backslash is correctly consumed."""
+        bs = chr(92)
+        wf = f'steps:\n  - run: "echo inert {bs}\n\n          python3 packages/x/test_real.py"\n'
+        self.assertEqual(_named_in(wf), {"packages/x/test_real.py"})
+
 
 class OptionContractThroughTheConsumerPath(unittest.TestCase):
     """keweichen's round-6 ask: pin the option contract through
@@ -477,6 +531,32 @@ class OptionContractThroughTheConsumerPath(unittest.TestCase):
         self.assertEqual(
             orphans_in({"packages/x/test_dead.py"}, set(), _named_in(wf)),
             ["packages/x/test_dead.py"])
+
+    def test_a_redirect_ahead_of_set_options_does_not_false_green_a_dead_test(self):
+        """liususan091219 (review at 996506045): `set >| /dev/null -o pipefail`
+        handed `/dev/null` to `set` as a positional and lost pipefail, so the
+        dead test below was credited -- fail-open, pinned through the consumer."""
+        for redirect in (">| /dev/null", "&>/dev/null", "&> /dev/null", "<<< x", "2>&1"):
+            wf = ("steps:\n  - run: |\n"
+                  f"      set {redirect} -o pipefail\n"
+                  "      false | true && python3 packages/x/test_dead.py\n")
+            self.assertEqual(_named_in(wf), set(), redirect)
+            self.assertEqual(
+                orphans_in({"packages/x/test_dead.py"}, set(), _named_in(wf)),
+                ["packages/x/test_dead.py"], redirect)
+
+    def test_an_empty_or_expandable_here_string_does_not_false_green_a_dead_test(self):
+        """qingyun-wu's core, round 3: `set <<<"" -o pipefail` was read as an
+        aborted command (empty file target), losing pipefail and crediting
+        the dead test; a here-string's word is data and never fails to open."""
+        for redirect in ('<<<""', '<<<"$E"', '<<< ""'):
+            wf = ("steps:\n  - run: |\n"
+                  f"      set {redirect} -o pipefail\n"
+                  "      false | true && python3 packages/x/test_dead.py\n")
+            self.assertEqual(_named_in(wf), set(), redirect)
+            self.assertEqual(
+                orphans_in({"packages/x/test_dead.py"}, set(), _named_in(wf)),
+                ["packages/x/test_dead.py"], redirect)
 
     def test_a_leading_o_cluster_form_does_not_false_orphan_through_the_consumer_path(self):
         """keweichen round 12: `set -oe pipefail` (o first, not last)."""
@@ -1060,6 +1140,35 @@ class OptionContractThroughTheConsumerPath(unittest.TestCase):
             orphans_in({"packages/x/test_if.py", "packages/x/test_elif.py",
                         "packages/x/test_else.py"}, set(), _named_in(wf)),
             ["packages/x/test_else.py"])
+
+
+class LeadingRedirectsThroughTheConsumerPath(unittest.TestCase):
+    """liususan091219's review at 79f961daa, pinned through _named_in() ->
+    orphans_in(): a two-character redirect operator ahead of the command
+    (`2>> log`, `>| f`, `2>&1`) left the real test uncredited -- a false
+    orphan, the safe direction, but one this suite manufactured."""
+
+    def test_a_two_character_leading_redirect_does_not_false_orphan_a_real_test(self):
+        # Block scalars: a plain `>|`/`&>` would be a YAML fold/anchor indicator.
+        for prefix in ("2>> log", ">| /dev/null", "2>&1", "2>&1 >out", "&>/dev/null"):
+            wf = f"steps:\n  - run: |\n      {prefix} python3 packages/x/test_real.py\n"
+            self.assertEqual(_named_in(wf), {"packages/x/test_real.py"}, prefix)
+            self.assertEqual(
+                orphans_in({"packages/x/test_real.py"}, set(), _named_in(wf)), [], prefix)
+
+    def test_a_trailing_duplicating_redirect_still_credits(self):
+        """Positive control: `2>&1` after an already-credited call."""
+        wf = "steps:\n  - run: python3 packages/x/test_real.py 2>&1\n"
+        self.assertEqual(_named_in(wf), {"packages/x/test_real.py"})
+
+    def test_a_test_named_only_as_a_redirect_target_stays_an_orphan(self):
+        """The dangerous direction: `>packages/x/test_dead.py` writes the
+        file, never runs it."""
+        wf = "steps:\n  - run: python3 -V 2>&1 >packages/x/test_dead.py\n"
+        self.assertEqual(_named_in(wf), set())
+        self.assertEqual(
+            orphans_in({"packages/x/test_dead.py"}, set(), _named_in(wf)),
+            ["packages/x/test_dead.py"])
 
 
 if __name__ == "__main__":
