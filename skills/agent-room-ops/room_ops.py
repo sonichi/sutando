@@ -145,6 +145,17 @@ def _dispatch_events(a):
     return _events.pull(cursor=a.cursor, wait=a.wait)  # pull
 
 
+# Writes whose room argument sits next to a free-form positional, so a swap posts nowhere.
+_ROOM_FIRST_WRITES = ("say", "mention", "send", "react", "unreact")
+
+
+def _room_arg_problem(room_id):
+    """A room argument must be a room id or alias; anything else is a swapped argument."""
+    if isinstance(room_id, str) and room_id[:1] in ("!", "#") and not any(c.isspace() for c in room_id):
+        return None
+    return f"room argument is not a room id (!...) or alias (#...): {str(room_id)[:60]!r}; check the argument order"
+
+
 def _main(argv):
     import argparse
     ap = argparse.ArgumentParser(prog="room_ops", description="Agent room-participation ops (gateway-only, gated).")
@@ -288,6 +299,9 @@ def _main(argv):
         print(json.dumps({"ok": True, "commands": sorted(sub.choices), "say": say_flags,
                           "say_extra_content_checked": True}, indent=2))
         return 0
+    if a.cmd in _ROOM_FIRST_WRITES and (problem := _room_arg_problem(a.room_id)):
+        print(json.dumps({"ok": False, "room_id": a.room_id, "reason": problem}, indent=2))
+        return 1
     if a.cmd == "read":
         res = _read.read_room(a.room_id, a.agent_mxid, a.limit, before=a.before,
                               oldest_first=a.oldest_first)
