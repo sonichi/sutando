@@ -23,6 +23,7 @@ import os
 import os.path
 import shlex
 import tempfile
+import urllib.parse
 from dataclasses import dataclass, field
 from typing import Callable, Mapping, Optional, Sequence
 
@@ -136,9 +137,14 @@ def bridge_token_environ(token: str, url: str = "") -> "dict[str, str]":
     return out
 
 
+def token_gateway(token: str) -> str:
+    """The gateway URL a combined onboarding token carries, '' for any other token."""
+    return contract.parse_onboarding_token(token or "")[0]
+
+
 def token_embeds_url(token: str) -> bool:
     """Whether `token` is the combined onboarding form, carrying its gateway URL."""
-    return bool(contract.parse_onboarding_token(token or "")[0])
+    return bool(token_gateway(token))
 
 
 def token_secret_empty(token: str) -> bool:
@@ -146,19 +152,24 @@ def token_secret_empty(token: str) -> bool:
     return not contract.parse_onboarding_token(token or "")[1].strip()
 
 
-def token_malformed(token: str) -> bool:
-    """Whether `token` starts with a URL scheme yet carries no url|secret separator: a broken combined
-    token (a separator lost or still encoded), not a bare secret."""
+def token_url_shaped(token: str) -> bool:
+    """Whether `token` starts with a URL scheme yet carries no url|secret separator. The contract reads it
+    as an opaque bare secret; it may also be a combined token that lost its '|', which only a missing
+    gateway makes worth saying. Never a reason to refuse a token whose gateway is known."""
     return (token or "").lower().startswith(("http://", "https://")) and not token_embeds_url(token)
 
 
 def gateway_url_problem(url: str) -> str:
-    """'' for a usable gateway URL (http or https, a host, no '|', no whitespace or control characters),
-    else why not, without the value."""
+    """'' for a usable gateway URL (http or https with a parsed host and a valid port, no '|', no whitespace
+    or control characters), else why not, without the value."""
     if not url or any(c.isspace() or ord(c) < 0x20 or ord(c) == 0x7F for c in url) or "|" in url:
         return "is not a gateway URL (empty, or holds whitespace, a control character or '|')"
-    scheme, sep, rest = url.partition("://")
-    if not sep or scheme.lower() not in ("http", "https") or not rest.split("/", 1)[0]:
+    try:
+        parts = urllib.parse.urlsplit(url)
+        host, _port = parts.hostname, parts.port
+    except ValueError:
+        return "is not a URL with a valid host and port"
+    if parts.scheme.lower() not in ("http", "https") or not host:
         return "is not an http(s) URL with a host"
     return ""
 

@@ -2739,8 +2739,8 @@ def _reload_rotated_token() -> bool:
     # (url_from_token) AND the split form (bare secret + a separate
     file_url = (url_from_token or _read_token_file_url(TOKEN_FILE)).rstrip("/")
     if file_url and file_url != URL:
-        _log(f"token file names a DIFFERENT gateway ({file_url}) "
-             f"than the running one ({URL}) — a URL change is not hot-swappable; "
+        _log(f"token file names a DIFFERENT gateway ({_redact_url(file_url)}) "
+             f"than the running one ({_redact_url(URL)}) — a URL change is not hot-swappable; "
              "restart the bridge to move gateways")
         return False
     if not secret or secret == TOKEN:
@@ -7513,11 +7513,12 @@ def main() -> None:
     if not TOKEN:
         sys.exit("FATAL: set REMOTE_TASK_TOKEN (the onboarding string, or a bare secret with REMOTE_TASK_URL).")
     if not URL and gateway_credential_sources.credentials_injected(os.environ) \
-            and gateway_credential_sources.token_malformed(_RAW):
-        sys.exit("FATAL: this declared bridge's vault token starts with a gateway URL but carries no url|secret "
-                 "separator (a malformed combined token, e.g. an encoded or lost '|'). Store it again under its "
-                 "AG2_RELAY_TOKEN_<worker> vault key as 'https://<gateway>|<secret>'; "
-                 "`python3 src/sparrow_agent_bridge.py --preflight` names the key.")
+            and gateway_credential_sources.token_url_shaped(_RAW):
+        sys.exit("FATAL: no gateway URL for this declared bridge — its vault token starts with a URL scheme but "
+                 "has no url|secret separator. If it is a combined token that lost its '|', store it again under "
+                 "its AG2_RELAY_TOKEN_<worker> vault key as 'https://<gateway>|<secret>'; if it is an opaque "
+                 "bearer, store the agent's gateway URL under its AG2_RELAY_URL_<worker> key; "
+                 "`python3 src/sparrow_agent_bridge.py --preflight` names both keys.")
     if not URL and gateway_credential_sources.credentials_injected(os.environ):
         # A declared bridge's environment URLs are stripped: only the owner's vault entries can supply it.
         sys.exit("FATAL: no gateway URL for this declared bridge — its vault token is a bare secret. Store the "
@@ -7528,7 +7529,7 @@ def main() -> None:
         # A token that starts with a URL scheme but yielded no URL means the
         # url|secret separator was swallowed (e.g. a %7C survived decoding, or a
         _hint = (" — the token carries a gateway URL but the url|secret separator "
-                 "looks missing/corrupted" if gateway_credential_sources.token_malformed(_RAW) else "")
+                 "looks missing/corrupted" if gateway_credential_sources.token_url_shaped(_RAW) else "")
         sys.exit("FATAL: no gateway URL — set REMOTE_TASK_URL, or use the combined "
                  f"'https://<gateway>|<secret>' onboarding token{_hint}.")
     _resolve_host_label()
@@ -7551,7 +7552,7 @@ def main() -> None:
     except Exception as e:  # noqa: BLE001 — a parked result left behind waits for the next start
         _log(f"relay result reclaim failed ({type(e).__name__}: {e}) — continuing")
     abandoned_suspects: set[str] = set()
-    _log(f"starting — gateway={URL} provider={PROVIDER} tasks={TASKS_DIR} "
+    _log(f"starting — gateway={_redact_url(URL)} provider={PROVIDER} tasks={TASKS_DIR} "
          f"(restored {len(inflight)} in-flight)")
     # Always name where the diagnostics live: after an incident this line is the
     # trailhead (a bare-launched bridge under default dirs writes status to

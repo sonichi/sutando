@@ -177,21 +177,25 @@ def declarations(workspace: Path, vault_keys, held=None) -> "tuple[list, list]":
 
 def endpoint(decl: dict, token: str, get_key) -> "tuple[str, str]":
     """(the agent's gateway URL for a bare-secret token, '') or ('', why the bridge cannot start). A
-    combined token carries its own URL: ('', ''). Only the owner-written vault key is read, never the host's
-    environment or the declaration, which the agent's own session could write."""
+    combined token carries its own URL, checked here: ('', ''). Any other token, a URL-shaped opaque bearer
+    included, takes its URL from the owner-written vault key only, never the host's environment or the
+    declaration, which the agent's own session could write."""
     key, token_key = decl["url_vault_key"], decl["token_vault_key"]
     if _sources.token_secret_empty(token):
         return "", (f"the token under {token_key} carries no secret: store the agent's relay token there "
                     f"(https://<gateway>|<secret>, or a bare secret with {key})")
     if _sources.token_embeds_url(token):
-        return "", ""
-    if _sources.token_malformed(token):
-        return "", (f"the token under {token_key} starts with a gateway URL but carries no url|secret separator "
-                    f"(a malformed combined token): store it again as https://<gateway>|<secret> under {token_key}")
+        problem = _sources.gateway_url_problem(_sources.token_gateway(token))
+        return ("", f"the gateway inside the token under {token_key} {problem}") if problem else ("", "")
     try:
         url = (get_key(key) or "").strip()
     except KeyError:
         url = ""
+    if not url and _sources.token_url_shaped(token):
+        return "", (f"the token under {token_key} has no gateway: it starts with a URL scheme but has no "
+                    f"url|secret separator. If it is a combined token that lost its '|', store it again as "
+                    f"https://<gateway>|<secret> under {token_key}; if it is an opaque bearer, run "
+                    f"`vault set {key} <the agent's gateway URL>`")
     if not url:
         return "", (f"the token under {token_key} is a bare secret and the vault has no {key}: run "
                     f"`vault set {key} <the agent's gateway URL>`, or store the combined "

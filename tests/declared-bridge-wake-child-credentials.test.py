@@ -180,7 +180,7 @@ class WakeChild(unittest.TestCase):
         self.assertIn("--preflight", str(cm.exception.code))
         self.assertNotIn("set REMOTE_TASK_URL", str(cm.exception.code))
 
-    def test_a_declared_bridge_with_a_malformed_combined_token_says_so(self):
+    def test_a_declared_bridge_with_a_url_shaped_token_and_no_gateway_names_both_remedies(self):
         env = dict(AGENT_CONNECT_TASK_DIR=str(self.tmp / "tasks"), AGENT_CONNECT_RESULT_DIR=str(self.tmp / "results"),
                    AGENT_CONNECT_STATE_DIR=str(self.tmp / "state"),
                    **_sources.bridge_token_environ(f"{AGENT_URL}-{AGENT_SECRET}"))
@@ -188,9 +188,32 @@ class WakeChild(unittest.TestCase):
             mod = importlib.import_module(BRIDGE)
             with self.assertRaises(SystemExit) as cm:
                 mod.main()
-        self.assertIn("a malformed combined token", str(cm.exception.code))
-        self.assertNotIn("bare secret", str(cm.exception.code))
+        self.assertIn("If it is a combined token that lost its '|'", str(cm.exception.code))
+        self.assertIn("if it is an opaque bearer, store the agent's gateway URL under its AG2_RELAY_URL_<worker>",
+                      str(cm.exception.code))
         self.assertNotIn(AGENT_SECRET, str(cm.exception.code))
+
+    def test_the_startup_log_redacts_a_vault_gateway_url(self):
+        secret_url = "https://url-user-5815:url-pass-5815@127.0.0.1:9/relay?api_key=query-secret-5815#frag-secret-5815"
+        state = self.tmp / "state"
+        env = dict(AGENT_CONNECT_TASK_DIR=str(self.tmp / "tasks"), AGENT_CONNECT_RESULT_DIR=str(self.tmp / "results"),
+                   AGENT_CONNECT_STATE_DIR=str(state), **_sources.bridge_token_environ(AGENT_SECRET, secret_url))
+
+        class Stop(Exception):
+            pass
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, env):
+            mod = importlib.import_module(BRIDGE)
+            self.assertEqual(mod.URL, secret_url, "the split form's vault URL is the bridge's endpoint")
+            with mock.patch.object(mod, "_acquire_singleton", return_value=True), \
+                    mock.patch.object(mod, "_start_lock_heartbeat"), \
+                    mock.patch.object(mod, "refresh_routing", side_effect=Stop), contextlib.redirect_stderr(err), \
+                    self.assertRaises(Stop):
+                mod.main()
+        logged = err.getvalue() + "".join(p.read_text(errors="replace") for p in self.tmp.rglob("*.log"))
+        self.assertIn("starting — gateway=https://127.0.0.1:9/relay ", logged)
+        for piece in ("url-user-5815", "url-pass-5815", "query-secret-5815", "frag-secret-5815"):
+            self.assertNotIn(piece, logged)
 
     def test_the_hosts_own_bridge_hints_at_a_lost_separator_only_for_a_malformed_combined_token(self):
         dirs = dict(AGENT_CONNECT_TASK_DIR=str(self.tmp / "tasks"), AGENT_CONNECT_RESULT_DIR=str(self.tmp / "results"),

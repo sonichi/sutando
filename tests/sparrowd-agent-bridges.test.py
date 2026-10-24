@@ -621,14 +621,33 @@ class AgentEndpoint(Base):
             self.assertNotEqual(seen.get("url"), "https://session-chosen.example/relay")
             self.assertNotIn("session-chosen", repr(bridge.load(decl, self.ws / "agents")[0]))
 
-    def test_a_malformed_combined_token_is_named_as_malformed_not_as_a_bare_secret(self):
+    URL_SHAPED_BEARER = "https://opaque.example/bearer-GGGG7777"
+
+    def test_a_url_shaped_opaque_bearer_takes_its_gateway_from_the_url_key(self):
+        rc, seen, _ = self.started(vault(token=self.URL_SHAPED_BEARER))
+        self.assertEqual((rc, seen), (0, {"url": AGENT_URL, "token": self.URL_SHAPED_BEARER}))
+
+    def test_a_url_shaped_token_with_no_url_key_names_both_remedies(self):
         asked = []
-        rc, seen, err = self.started(vault(token="https://agent-gw.example/relay-tok-agent", asked=asked))
+        rc, seen, err = self.started(vault(token=self.URL_SHAPED_BEARER, url=None, asked=asked))
         self.assertEqual((rc, seen), (1, {}))
-        self.assertIn("a malformed combined token", err)
-        self.assertNotIn("bare secret", err)
-        self.assertNotIn("tok-agent", err)
-        self.assertEqual(asked, [cli.vault_key(SEG)], "its URL key is not read in place of the broken token")
+        self.assertIn("If it is a combined token that lost its '|'", err)
+        self.assertIn(f"if it is an opaque bearer, run `vault set {cli.url_vault_key(SEG)}", err)
+        self.assertNotIn("GGGG7777", err)
+        self.assertEqual(asked, [cli.vault_key(SEG), cli.url_vault_key(SEG)])
+
+    def test_a_hostless_gateway_is_refused_in_both_forms_by_the_wrapper_and_the_preflight(self):
+        for bad in ("https://?missing-host", "https://#missing-host", "https://:443/relay"):
+            for get_key in (vault(url=bad), vault(token=f"{bad}|tok-agent", url=None)):
+                with self.subTest(bad=bad):
+                    rc, seen, err = self.started(get_key)
+                    self.assertEqual((rc, seen), (1, {}))
+                    self.assertIn("is not an http(s) URL with a host", err)
+                    out = io.StringIO()
+                    with contextlib.redirect_stdout(out):
+                        self.assertEqual(bridge.main(["--preflight"], workspace=self.ws, get_key=get_key), 1)
+                    self.assertIn("WILL NOT START: ", out.getvalue())
+                    self.assertNotIn("tok-agent", err + out.getvalue())
 
     def test_a_token_with_no_secret_is_refused_by_the_wrapper_and_the_preflight(self):
         get_key = vault(token=f"{AGENT_URL}|")

@@ -1957,16 +1957,20 @@ class Guard(unittest.TestCase):
                                  {"REMOTE_TASK_TOKEN": combined, o.INJECTED_KEY: "1"}, "the token's own URL wins")
                 self.assertEqual((o.token_embeds_url(combined), o.token_embeds_url("s"), o.token_embeds_url("")),
                                  (True, False, False))
-                self.assertEqual([o.token_malformed(t) for t in ("https://gw.example/relay-s", "HTTP://gw/relay",
-                                                                 combined, "https://gw/relay%7Cs", "s", "")],
-                                 [True, True, False, False, False, False], "a scheme with no separator is malformed")
+                self.assertEqual([o.token_url_shaped(t) for t in (URL_SHAPED_BEARER, "HTTP://gw/relay",
+                                                                  combined, "https://gw/relay%7Cs", "s", "")],
+                                 [True, True, False, False, False, False], "a scheme with no separator is URL-shaped")
+                self.assertEqual((o.token_gateway(combined), o.token_gateway(URL_SHAPED_BEARER), o.token_gateway("s")),
+                                 (url, "", ""))
                 self.assertEqual([o.token_secret_empty(t) for t in ("https://gw/relay|", "https://gw/relay| ", "", "  ",
                                                                     combined, "s", "httpfoo")],
                                  [True, True, True, True, False, False, False], "no secret on either side of '|'")
                 self.assertEqual(o.gateway_url_problem(url), "")
                 self.assertEqual(o.gateway_url_problem("http://127.0.0.1:9/relay"), "")
+                self.assertEqual(o.gateway_url_problem("https://user:pass@gw.example:8443/relay?q=1#f"), "")
                 for bad in ("", "ftp://x/relay", "https://", "x.example/relay", "https://x/relay|s", "https://x /r",
-                            "https://x/r\x7f"):
+                            "https://x/r\x7f", "https://?missing-host", "https://#missing-host", "https://:443/relay",
+                            "https://user@/relay", "https://gw.example:notaport/relay", "https://gw.example:99999/r"):
                     self.assertTrue(o.gateway_url_problem(bad), bad)
                 host = {k: "host" for k in o.bridge_strip_keys()}
                 marked = dict(host, KEEP="1", **{o.INJECTED_KEY: "1"})
