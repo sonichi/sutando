@@ -413,7 +413,7 @@ def maybe_start(cfg: dict, setup: "dict | None", installed: str = __version__,
     state_dir = _keepalive._state_dir(cfg)
     # Before any decision: an interrupted upgrade must be settled even if its target is current.
     with upgrade_lock(state_dir) as held:
-        settled = reconcile(cfg, state_dir, now) if held else None
+        settled = settle_attempt(cfg, state_dir, now) if held else None
     if settled:
         return settled
     if setup is None:
@@ -445,7 +445,7 @@ def maybe_start(cfg: dict, setup: "dict | None", installed: str = __version__,
     return f"{target}:started"
 
 
-def reconcile(cfg: dict, state_dir: Path, now: float) -> "str | None":
+def settle_attempt(cfg: dict, state_dir: Path, now: float) -> "str | None":
     """Settle a dead attempt, with the upgrade lock held by the caller (so no worker runs):
     one still "started" after STALE_START_S with no phase, or one in any phase, which only
     a lock holder writes. Nothing installed and the namespace equal to the snapshot means

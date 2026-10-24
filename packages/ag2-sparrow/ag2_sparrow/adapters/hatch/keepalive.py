@@ -594,7 +594,7 @@ def _settle_upgrade(cfg: dict, now: float) -> "str | None":
     """Settle a dead upgrade attempt, with the upgrade lock held; never fails the run."""
     from . import self_upgrade
     try:
-        return self_upgrade.reconcile(cfg, _state_dir(cfg), now)
+        return self_upgrade.settle_attempt(cfg, _state_dir(cfg), now)
     except Exception as e:  # noqa: BLE001 - keepawake's own job must still be logged
         print(f"NOTE upgrade: {diagnostics.describe(e)}", file=sys.stderr)
         return None
