@@ -20,7 +20,13 @@ import tempfile
 import urllib.error
 
 from _helpers import proactive_lane as pl
-import outbox as src_outbox
+import importlib.util
+
+# By file path: a flat `import outbox` resolves to the package's vendored copy, not src's.
+_SPEC = importlib.util.spec_from_file_location("src_outbox_under_test", Path(__file__).resolve().parents[1] / "src" / "outbox.py")
+src_outbox = importlib.util.module_from_spec(_SPEC)
+sys.modules[_SPEC.name] = src_outbox
+_SPEC.loader.exec_module(src_outbox)
 import proactive_dispatch_gate
 import proactive_routing
 import undelivered_quarantine
@@ -195,6 +201,31 @@ def bridge_edges() -> None:
     finally:
         Path.rename = real
     check(any("could not be handed back" in m for m in lane.logs), "a failed hand-back is logged loudly")
+    check(gb._payload_room("not json") is None, "an unreadable stored payload names no room")
+
+    lane = pl.Lane(gb, ISO, refuse(429))
+    lane.write("proactive-moved.txt", "nudge\n")
+    lane.drain()
+    lane.owner_dm = "!Moved:ag2.space"
+    Path.rename = lambda self, target: (_ for _ in ()).throw(OSError("no")) \
+        if ".sending." in self.name and Path(target).name == "proactive-moved.txt" else real(self, target)
+    try:
+        lane.drain()
+    finally:
+        Path.rename = real
+    check(lane.posts and len(lane.posts) == 1, "a held file whose hand-back fails is still not sent")
+
+    lane = pl.Lane(gb, ISO, lambda payload: {"ok": True})
+    lane.write("proactive-unread.txt", "nudge\n")
+    real_bytes = Path.read_bytes
+    Path.read_bytes = lambda self: (_ for _ in ()).throw(OSError("no")) if ".sending." in self.name \
+        else real_bytes(self)
+    try:
+        lane.drain()
+    finally:
+        Path.read_bytes = real_bytes
+    check(lane.where("proactive-unread") == "undelivered" and any("--body-sha256 ''" in m for m in lane.logs),
+          "a parked body that cannot be read still parks, with an empty digest")
 
 
 def main() -> int:
