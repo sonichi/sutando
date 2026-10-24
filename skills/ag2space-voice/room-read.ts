@@ -318,11 +318,19 @@ export type ReadRoomResult =
 	/** not_found carries every room the agent can read, so the model can say the right name next. */
 	| { ok: false; error: string; candidates?: string[]; rooms?: string[] };
 
-/** A spoken name against the index; a miss refreshes it once (the room may be newly joined) before giving up. */
-async function resolveRoom(query: string, index: RoomIndex): Promise<RoomResolution & { rooms?: string[] }> {
+/** A spoken name against the index; a miss refreshes it once (the room may be newly joined) before giving up.
+ *  A refresh refused for a missing or rejected credential is that error, not a miss: the owner must reconnect. */
+async function resolveRoom(query: string, index: RoomIndex): Promise<{ ok: true; room: RoomRef } | { ok: false; error: string; candidates?: string[]; rooms?: string[] }> {
 	const first = pickRoom(query, index.rooms());
 	if (first.ok || first.error === 'ambiguous') return first;
-	const fresh = await index.refresh().catch(() => index.rooms());
+	let fresh: RoomRef[];
+	try {
+		fresh = await index.refresh();
+	} catch (err) {
+		const failure = mcpFailure(err instanceof Error ? err.message : String(err));
+		if (failure === 'no_credential' || failure === 'credential_refused') return { ok: false, error: failure };
+		fresh = index.rooms();
+	}
 	const again = pickRoom(query, fresh);
 	return again.ok ? again : { ...again, rooms: fresh.map(r => r.name) };
 }
@@ -339,10 +347,21 @@ export async function targetRoom(name: string | undefined, deps: ReadRoomDeps): 
 	return resolveRoom(query, deps.index);
 }
 
+/**
+ * A thrown MCP call as an answer the model can say. The proxy names a missing credential and a
+ * refused one in its error text; those need the owner to reconnect, so they are not "unavailable".
+ */
+export function mcpFailure(why: string): 'timeout' | 'no_credential' | 'credential_refused' | 'unavailable' {
+	if (/timed out/.test(why)) return 'timeout';
+	if (/no registry bearer/.test(why)) return 'no_credential';
+	if (/\bAGENT_CREDENTIAL_[A-Z_]+\b|authentication failed after re-mint/.test(why)) return 'credential_refused';
+	return 'unavailable';
+}
+
 /** Where an action runs: a room, or (null) the account — the agent's own inbox, rooms and profile. */
 const actionTarget = (room: RoomRef | null) => room ? { room_id: room.room_id } : { target_kind: 'account' };
 
-/** One action that reads: a thrown error is "timeout" or "unavailable"; an error answer is its code. */
+/** One action that reads: a thrown error is classified by mcpFailure; an error answer is its code. */
 export async function roomRead(client: McpClient, room: RoomRef | null, action: string, args: Record<string, unknown>, deps: Pick<ReadRoomDeps, 'log'>, timeoutMs?: number, revision?: string): Promise<{ ok: true; result: Record<string, unknown> } | { ok: false; error: string }> {
 	try {
 		const res = await client.callTool('room.action.read', { ...actionTarget(room), action, arguments: args, ...(revision ? { expected_action_revision: revision } : {}) }, timeoutMs);
@@ -352,7 +371,7 @@ export async function roomRead(client: McpClient, room: RoomRef | null, action: 
 	} catch (err) {
 		const why = err instanceof Error ? err.message : String(err);
 		deps.log?.(`[RoomRead] ${action} failed: ${why}`);
-		return { ok: false, error: /timed out/.test(why) ? 'timeout' : 'unavailable' };
+		return { ok: false, error: mcpFailure(why) };
 	}
 }
 
@@ -548,6 +567,9 @@ export async function roomExecute(client: McpClient, room: RoomRef | null, actio
 		const why = err instanceof Error ? err.message : String(err);
 		deps.log?.(`[RoomRead] ${action} failed: ${why}`);
 		if (/is not running|failed to start/.test(why)) return { ok: false, error: 'unavailable' };
+		// A missing or refused credential fails before dispatch, so nothing ran: say reconnect.
+		const failure = mcpFailure(why);
+		if (failure === 'no_credential' || failure === 'credential_refused') return { ok: false, error: failure };
 		return { ok: false, error: OUTCOME_UNKNOWN, operation_id };
 	}
 }
@@ -953,7 +975,7 @@ export function createListRoomsTool(deps: { index: RoomIndex; log?: (m: string) 
 		name: 'list_rooms',
 		description:
 			'List the AG2 Space rooms you can read, right now. Call it when the user asks which rooms you are in or can read, ' +
-			'or when a room they name is not in the ROOMS line and may be newly joined. Returns {ok:true, rooms:[names]}; "unavailable" when the list cannot be fetched.',
+			'or when a room they name is not in the ROOMS line and may be newly joined. Returns {ok:true, rooms:[names]}; "unavailable" when the list cannot be fetched; "no_credential" or "credential_refused" when the connection needs reconnecting.',
 		parameters: z.object({}),
 		execution: 'inline',
 		timeout: ROOM_INDEX_COLD_TIMEOUT_MS + 1000,
@@ -963,15 +985,17 @@ export function createListRoomsTool(deps: { index: RoomIndex; log?: (m: string) 
 				deps.log?.(`[RoomRead] list_rooms: ${rooms.length} rooms`);
 				return { ok: true, rooms };
 			} catch (err) {
-				deps.log?.(`[RoomRead] list_rooms failed: ${err instanceof Error ? err.message : String(err)}`);
-				return { ok: false, error: 'unavailable', rooms: deps.index.rooms().map(r => r.name) };
+				const why = err instanceof Error ? err.message : String(err);
+				deps.log?.(`[RoomRead] list_rooms failed: ${why}`);
+				const kind = mcpFailure(why);
+				return { ok: false, error: kind === 'timeout' ? 'unavailable' : kind, rooms: deps.index.rooms().map(r => r.name) };
 			}
 		},
 	};
 }
 
 /** The prompt rule that goes with the tool; present only when the tool is declared. */
-export const ROOM_READ_PROMPT_RULE = '- ROOM MESSAGES: a question about an AG2 Space room is answered from the room, every time, never from memory or an earlier answer — what a room holds and who can read it change, so an earlier answer or task result about a room is never the answer now. "What\'s new in <room>", "did <person> reply there" → read_room. "What was said about <PR/topic/person> in <room>", "what was the review of <PR> there", anything that may be earlier than the latest messages → search_room, then read_room with `around` for the discussion. What a message in a room means, or why someone said it, is answered from that message: read_room with `around` for its full text, then explain. A room\'s documents, pages, notes, plans or tables ("is there a doc about X in <room>", "what does the design page say") → search_commons, then read_page for a whole page. A note the user wants written into a room\'s Commons ("write this down in <room>", "add to the design page: …") → say back the exact title, text and room, and call write_page only after a clear yes; a comment or 留言 on a page → add_comment the same way, never an appended line; something to say or post in a room\'s chat ("tell <room> that …", "reply to <person>: …") → send_message the same way, @-mentioning someone only when the user asked to. After the yes, the call comes in that same turn. Never submit work to read, search or explain a room or its documents, or to write a note, a comment or a message into one; submit work only when the room\'s messages do not hold the answer and the user wants it looked up elsewhere. Pass the room name as it appears in the ROOMS line, not as it was heard; a "not_found" lists the rooms — pick the one meant and call again.';
+export const ROOM_READ_PROMPT_RULE = '- ROOM MESSAGES: a question about an AG2 Space room is answered from the room, every time, never from memory or an earlier answer — what a room holds and who can read it change, so an earlier answer or task result about a room is never the answer now. "What\'s new in <room>", "did <person> reply there" → read_room. "What was said about <PR/topic/person> in <room>", "what was the review of <PR> there", anything that may be earlier than the latest messages → search_room, then read_room with `around` for the discussion. What a message in a room means, or why someone said it, is answered from that message: read_room with `around` for its full text, then explain. A room\'s documents, pages, notes, plans or tables ("is there a doc about X in <room>", "what does the design page say") → search_commons, then read_page for a whole page. A note the user wants written into a room\'s Commons ("write this down in <room>", "add to the design page: …") → say back the exact title, text and room, and call write_page only after a clear yes; a comment or 留言 on a page → add_comment the same way, never an appended line; something to say or post in a room\'s chat ("tell <room> that …", "reply to <person>: …") → send_message the same way, @-mentioning someone only when the user asked to. After the yes, the call comes in that same turn. Never submit work to read, search or explain a room or its documents, or to write a note, a comment or a message into one; submit work only when the room\'s messages do not hold the answer and the user wants it looked up elsewhere. Pass the room name as it appears in the ROOMS line, not as it was heard; a "not_found" lists the rooms — pick the one meant and call again. A "no_credential" or "credential_refused" from any room tool means your AG2 Space connection needs the owner to reconnect it (re-run Connect in the AG2 Space app): say exactly that, not that the room is unavailable.';
 
 /** What the relay agent\'s turn check is told: a room question is the voice model\'s own, never a task for the core. */
 export const ROOM_TURN_CHECK_RULE = '- none: a question about an AG2 Space room\'s messages or documents — what is new there, who replied, what someone said there about a PR, topic or person, what a message there means, whether the room has a doc, page, note or table about something and what it says — is answered by the assistant itself, which reads and searches the room. It is never work, even when it names a PR. A note, comment or message the user wants written into a room — into its documents ("write this down in <room>", "add to the page", "comment on the doc", 留言) or its chat ("tell <room> that …", "reply to <person> in <room>") — is also the assistant\'s own (it asks for the text if it is missing, reads it back, then writes it): none, even while the text is still missing — never ask. Only another action (review a PR, merge, change code or settings, anything outside the room) is work.';
