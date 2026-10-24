@@ -394,22 +394,27 @@ _BASE_TO_STATE = {
 
 
 def owes_work(seat, workspace):
-    """Whether this seat has queued work: the core's own queue, else None. A worker's queue
-    is the pool's to read, so the pool's supervisor is what pages a banner holding it."""
-    return None if seat else core_gate_notice.queued_count(workspace) > 0
+    """Whether the core's own queue holds work: True, False, or None when the queue cannot be
+    read. A worker seat is False here: its queue is the pool's to read, so the pool's
+    supervisor is what pages a banner holding it."""
+    if seat:
+        return False
+    queued = core_gate_notice.queued_count(workspace)
+    return None if queued is None else queued > 0
 
 
 def limit_step(pane, baseline, workspace=None, socket=None, session=None, owes_work=True):
     """(stale, baseline) for this poll's limit banner. The baseline is taken when a banner
     first shows, and again when its text changes; the newest turn since then decides.
-    A banner holds nothing on a seat that owes no work (`owes_work` False or unknown)."""
+    A banner holds nothing on a seat that owes no work (`owes_work` False). An unknown
+    queue (None) holds like an owed one: a count that could not be read is not zero."""
     abn = limit_banner(pane or "")
     if abn is None:
         return False, None
     current = limit_baseline(pane)
     if baseline is None or baseline.banner != current.banner:
         baseline = current
-    if owes_work is not True:
+    if owes_work is False:
         return True, baseline
     return limit_is_stale(abn, workspace, socket, session, capture=pane, baseline=baseline), baseline
 
@@ -1047,7 +1052,7 @@ def main():
                 drive_escalations(hitl, a.session, prompt, state,
                                   lambda k: send_keys(a.socket, a.session, k))
                 # Only the core's own seat owns tasks/; a worker's queue lives elsewhere.
-                queued = 0 if a.seat else core_gate_notice.queued_count(workspace)
+                queued = 0 if a.seat else (core_gate_notice.queued_count(workspace) or 0)
                 req = escalate(hitl, state, detail, kind, prompt, a.session, seat=a.seat or None,
                                queued=queued, runtime=runtime)
                 if not a.seat:

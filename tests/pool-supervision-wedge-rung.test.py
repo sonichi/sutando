@@ -247,8 +247,10 @@ def frame_obs(text):
 
 
 def turn_done(i):
-    return framed(f"\u25cf Sent a cross-session message ({i}).\n"
-                  f"\u273b Worked for {i + 2}s \u00b7 done 2:{10 + i:02d} PM\n")
+    """The pane after turn i finished: every earlier turn is still on screen above it."""
+    return framed("".join(f"\u25cf Sent a cross-session message ({k}).\n"
+                          f"\u273b Worked for {k + 2}s \u00b7 done 2:{10 + k:02d} PM\n"
+                          for k in range(i + 1)))
 
 
 def thinking(i):
@@ -352,6 +354,30 @@ check("observed: turns finishing under a stale banner are progress: no card",
       observed([turn_done(i) for i in range(6)]), [N] * 6)
 check("observed: a held worker whose footer counters tick is still carded",
       observed(HELD), [N, N, HUMAN, N])
+
+# The same worker when what ticks is ABOVE the composer: the done line's monitor count, or
+# the status glyph the CLI cycles. Nothing finished, so the wait is one frame, not a swing.
+
+
+def held_above(monitors, glyph="\u273b"):
+    return framed(f"\u25cf Picked up the next delivery.\n{glyph} Worked for 4m 12s \u00b7 done 1:36 PM"
+                  f" \u00b7 {monitors} monitor still running\n")
+
+
+TICKING = [held_above(1), held_above(2), held_above(3), held_above(2)]
+CYCLING = [held_above(1, g) for g in "\u273b\u2736\u2733\u273b"]
+ADVANCING = [framed(f"\u25cf {w}.\n\u273b Worked for 4m 12s \u00b7 done 1:36 PM\n")
+             for w in ("Read the inbox", "Drafted the reply", "Sent the reply", "Archived the task")]
+check("a held worker whose only change above the composer is a counter is still carded",
+      run([frame_obs(f) for f in TICKING])[0], [N, N, HUMAN, N])
+check("a held worker whose only change above the composer is the status glyph is still carded",
+      run([frame_obs(f) for f in CYCLING])[0], [N, N, HUMAN, N])
+check("a worker whose turn text advances under the banner is not carded",
+      run([frame_obs(f) for f in ADVANCING])[0], [N] * 4)
+check("observed: a held worker whose counter above the composer ticks is still carded",
+      observed(TICKING), [N, N, HUMAN, N])
+check("observed: a worker whose turn text advances under the banner is not carded",
+      observed(ADVANCING), [N] * 4)
 
 print(f"\n{'ALL PASS' if not fails else str(len(fails)) + ' FAILURE(S)'} — pool_supervision wedge rung")
 for f in fails:

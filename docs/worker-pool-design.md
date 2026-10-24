@@ -314,7 +314,9 @@ session meets the same network error, rate limit, API error or retry, and loses 
 turn in flight. With the same sustain and stale line, once per episode:
 
 - a gate or a limit escalates, as a gate always has, only while the frame stays
-  unchanged across ticks with clocks and spinners normalised away. A limit banner the
+  unchanged across ticks with clocks, spinners, status glyphs and bare counts ("1
+  monitor still running") normalised away: on a held pane those tick without a turn
+  finishing, and a turn that finishes changes more than a number. A limit banner the
   CLI leaves painted after a re-login sits under a session that keeps working: a turn
   running above it reads as working, and a frame that moves clears the episode. The
   seat's own input watcher does not page that banner, since it cannot read the

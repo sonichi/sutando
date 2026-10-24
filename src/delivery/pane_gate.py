@@ -47,7 +47,8 @@ from typing import Callable, List, Optional, Tuple
 _SRC = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_SRC))
 from cli_wedge import (PROVIDER_LIMIT_PATTERNS, FrameAbnormal, capture_pane,  # noqa: E402
-                       core_target, frame_abnormal, frame_working, needs_login_line, state_id)
+                       core_target, frame_abnormal, frame_working, needs_login_line, normalize,
+                       state_id)
 from quota_availability import provider_allows_now  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
 
@@ -478,11 +479,21 @@ def _below_composer(capture: str) -> List[str]:
     return lines[last + 1:]
 
 
+# What still moves on a waiting pane's finished turns: a status glyph the CLI cycles and a
+# bare count ("1 monitor still running"). cli_wedge keeps counts for its frozen-turn test.
+_STATUS_GLYPH = re.compile(r"^(\s*)[✻✶✳✢✽✺✹✷✸✦✧∗]\s+", re.MULTILINE)
+_COUNT = re.compile(r"\d+")
+
+
 def progress_id(capture: str) -> str:
-    """Identity of the work on screen: the rows above the composer, clocks and spinners
-    normalised away. Status rows under it (footer counters, a limit banner) are not work."""
+    """Identity of the work on screen: the rows above the composer, with clocks, durations,
+    spinners, status glyphs and bare counts normalised away. Status rows under it (footer
+    counters, a limit banner) are not work. Compared across ticks of a waiting pane, whose
+    rows above the composer are finished turns: text that advances is progress, a counter
+    that ticks is not."""
     lines = (capture or "").splitlines()
-    return state_id("\n".join(lines[:len(lines) - len(_below_composer(capture))]))
+    above = normalize("\n".join(lines[:len(lines) - len(_below_composer(capture))]))
+    return state_id(_COUNT.sub("#", _STATUS_GLYPH.sub(r"\1<glyph> ", above)))
 
 
 def _limit_row(ln: str) -> bool:
