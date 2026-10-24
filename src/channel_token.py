@@ -42,9 +42,11 @@ a lie about the code beside it. (Original distinction caught by @Sutando-Pro.)
      environment carries the mark `gateway_credential_sources` owns
      (`credentials_injected`), the file and vault readers below answer '' without
      opening anything: that process was handed its own token, and the host's
-     `.env` files and vault are the host's. Its wake child inherits the mark, so
-     room ops and `scripts/channel-env.sh` there fail closed instead of reloading
-     the host's credential.
+     `.env` files and vault are the host's. Its wake child inherits the mark and
+     acts as the agent: it carries the agent's own token in its environment
+     (`gateway_credential_sources.wake_environ`), which the env tier still reads,
+     so room ops there resolves exactly that token and never the host's; with no
+     env token it fails closed, and `scripts/channel-env.sh` names no file.
 
 `resolve_channel_token()` also serves the GATE, which asks a question
 precedence cannot affect: *does a usable token exist at all?* If more than

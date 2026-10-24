@@ -148,6 +148,22 @@ def bridge_carried_config(env: Mapping[str, str], read_text: "Callable[[str], ob
     return carried
 
 
+def wake_environ(child: Mapping[str, str], raw: str, url: str) -> "dict[str, str]":
+    """The environment a bridge's wake command runs under, from `child` (the bridge's own minus every
+    relay credential). In a declared bridge (the mark) the command acts as the agent: every gateway token
+    and URL alias is dropped and the agent's own token as the bridge holds it (`raw`) and its gateway URL
+    are set, so a reader resolves exactly those and never the host's. Unmarked, `child` is unchanged."""
+    if not credentials_injected(child):
+        return dict(child)
+    names = set(bridge_strip_keys()) | set(contract.URL_ALIAS_PRECEDENCE) | set(URL_KEYS)
+    out = {k: v for k, v in child.items() if k not in names}
+    if raw:
+        out[token_env_name()] = raw
+        if url:
+            out[URL_KEYS[0]] = url
+    return out
+
+
 def bridge_strip_keys() -> "tuple[str, ...]":
     """Every variable a host's own gateway token may sit under, for a supervisor to drop from a declared
     bridge's environment: each token name, every alias the contract ranks (a child of the bridge resolving

@@ -4063,7 +4063,8 @@ def _fire_on_task(tid: str, path: Path, text: "str | None" = None) -> None:
             text = path.read_text(encoding="utf-8")
         data = text.encode("utf-8")
         argv = shlex.split(ON_TASK_CMD) + [str(path)]
-        env = {**_on_task_env(), **_on_task_header_env(text),
+        # A declared bridge's wake command acts as the agent: the owner sets its token, never the host's.
+        env = {**gateway_credential_sources.wake_environ(_on_task_env(), _RAW, URL), **_on_task_header_env(text),
                "SPARROW_TASK_ID": tid, "SPARROW_TASK_FILE": str(path)}
         proc = subprocess.Popen(argv, env=env, stdin=subprocess.PIPE,
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
