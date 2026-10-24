@@ -397,11 +397,11 @@ def _suspended(rec):
     return {"reason": rec["reason"], "at": rec["at"]} if rec else None
 
 
-def _stopped_by_suspension(row: dict, rec) -> dict:
+def _stopped_by_suspension(row: dict, since) -> dict:
     """A worker the suspension took down is not alive, whatever its files last said:
     a quit kills the tmux server before any seat can record its own end."""
     return {**row, "alive": False, "motion": UNKNOWN, "condition": UNKNOWN,
-            "reason": "suspended", "since": rec["at"]}
+            "reason": "suspended", "since": since}
 
 
 def _session(path):
@@ -475,7 +475,19 @@ def snapshot(workspace=None, *, agent: str = "all", view: str = "summary", now=N
             current = sources["supervisor"] if started is not None else None
             row = _verdict({"id": wid, "role": "worker", "label": label, "session": _session(seat),
                             "alive": _alive(sources["watcher_beat"], current)}, sources)
-            agents.append((_stopped_by_suspension(row, suspension) if wid in stopped else row, sources))
+            try:
+                paused, unreadable = pool_suspension.paused_at(ws, wid), False
+            except OSError:
+                paused, unreadable = None, True
+            if wid in stopped:
+                row = _stopped_by_suspension(row, suspension["at"])
+            # The owner's pause is the reason a dead worker is down; a live one still reports.
+            elif paused is not None and row["alive"] is not True:
+                row = _stopped_by_suspension(row, paused)
+            # Whether the owner paused it cannot be told, so it is neither outage nor choice.
+            elif unreadable and row["alive"] is not True:
+                row = {**row, "motion": UNKNOWN, "condition": UNKNOWN, "reason": None, "since": None}
+            agents.append((row, sources))
 
     conditions = {a["condition"] for a, _ in agents}
     overall = ("attention" if ABNORMAL in conditions else

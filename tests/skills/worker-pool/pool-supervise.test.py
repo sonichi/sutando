@@ -12,6 +12,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -148,6 +149,32 @@ class Observing(Base):
         (wi.worker_dir(self.ws, wid) / sup.PAUSED_MARKER).touch()
         make_worker(self.ws, "another")          # register_worker recompiles the roster
         self.assertTrue(sup.is_paused(self.ws, wid))
+
+    def test_an_unreadable_pause_marker_counts_as_paused_and_supervision_goes_on(self):
+        a, b = make_worker(self.ws, "a"), make_worker(self.ws, "b")
+        real = sup.pool_suspension.paused_at
+
+        def paused_at(ws, wid):
+            if wid == a:
+                raise PermissionError(13, "Permission denied")
+            return real(ws, wid)
+        err = io.StringIO()
+        with patch.object(sup.pool_suspension, "paused_at", side_effect=paused_at), \
+                contextlib.redirect_stderr(err):
+            obs = sup.observe(self.ws, 100.0, runner=Tmux())
+        self.assertEqual((obs[a].paused, obs[b].paused), (True, False))
+        self.assertIn(a, err.getvalue())
+        self.assertIn("unreadable", err.getvalue())
+
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root reads through chmod 000")
+    def test_a_marker_behind_a_permission_error_is_paused(self):
+        wid = make_worker(self.ws)
+        wdir = wi.worker_dir(self.ws, wid)
+        (wdir / sup.PAUSED_MARKER).touch()
+        wdir.chmod(0)
+        self.addCleanup(wdir.chmod, 0o755)
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertTrue(sup.is_paused(self.ws, wid))
 
     def test_a_delivery_time_check_observes_only_its_recipient(self):
         a, _b = make_worker(self.ws, "a"), make_worker(self.ws, "b")
