@@ -624,20 +624,26 @@ run starts one detached upgrade per target and logs its decision on its line
 (`upgrade=off`, `current`, `no-hashes`, `hand-made-service`, `0.6.0:started`, ...).
 The upgrade runs under `STATE_DIR/upgrade.lock`, which keepawake also holds while
 it checks and restarts Sparrow, and re-reads the installed version first. It
-copies the whole package namespace, hashed, to `STATE_DIR/rollback/<version>/`
-(its RECORD's top-level names, every `ag2_sparrow*` name, and the full listing of
-site-packages and of the scripts directory, so whatever a target adds is removed), stops Sparrow through the
+downloads the pinned wheel and reads from that wheel's own RECORD and entry points
+exactly which paths the target installs, then copies the package namespace, hashed,
+to `STATE_DIR/rollback/<version>/`: every file the old RECORD lists, everything in
+an `ag2_sparrow*` entry of site-packages, and whatever already sits at a path the
+target will write. Ownership is that old RECORD plus the target inventory, never a
+name that merely appeared later, so a foreign file another installer adds meanwhile
+is neither removed nor counted. It stops Sparrow through the
 manager that owns it and proves it gone (a hand-made unit or a lock holder not
 proven to be Sparrow is never touched, and nothing is installed unless the stop
 is proven), runs
-`pip install --no-deps --only-binary=:all: --require-hashes` pinned to every
-sha256 in `target_sha256`, requires `pip check` to run and report no new problem
+`pip install --no-deps --only-binary=:all: --require-hashes --no-index` from the
+downloaded wheel, pinned to every sha256 in `target_sha256`, requires `pip check` to run and report no new problem
 naming ag2-sparrow, re-runs `install --no-start` (which never starts the service),
 starts Sparrow through the same manager, and checks it imports the target and
 reconnects. A reply posted while Sparrow is stopped waits in the results dir and
 is delivered once it starts. A failure restores the snapshot with no index and no
-network: every namespace path it does not list is removed and the files must hash
-equal to it; the outcome is `rolled-back` only when that held and the previous
+network: every file of the package's it does not list is removed (with its bytecode
+and any directory the target created), the copies are put back, and the files must
+hash equal to it; a file in an `ag2_sparrow*` directory that is nobody's known
+file is kept and fails the check; the outcome is `rolled-back` only when that held and the previous
 version runs connected again, else `restore-failed`, and the health row reports
 `upgrade-failed` either way. After `restore-failed` the files are unverified, so
 Sparrow is left stopped and the hook wakes the agent once with a notice. While an

@@ -18,6 +18,7 @@ import tempfile
 import threading
 import time
 import unittest
+import zipfile
 from pathlib import Path
 from unittest import mock
 
@@ -2255,6 +2256,7 @@ class FakeSite:
     def __init__(self, root: Path, version="0.5.4", direct_url=False, extras=False):
         self.root, self.site, self.bin = root, root / "lib" / "site", root / "bin"
         self.extras = extras  # the target adds a top-level package and a console script
+        self.target_adds = {}  # more site-relative files every target version records
         self.install(version)
         if direct_url:
             (self.dist_info(version) / "direct_url.json").write_text('{"url": "file:///src"}')
@@ -2273,40 +2275,55 @@ class FakeSite:
         if dist:
             shutil.rmtree(dist._path, ignore_errors=True)
 
+    def files(self, version):
+        """{path relative to the site dir ("../../bin/x" for a script): text} of `version`."""
+        files = {"ag2_sparrow/__init__.py": f'__version__ = "{version}"\n',
+                 f"ag2_sparrow-{version}.dist-info/METADATA":
+                     f"Metadata-Version: 2.1\nName: ag2-sparrow\nVersion: {version}\n",
+                 "../../bin/ag2-sparrow-hatch": f"#!/bin/sh\n# {version}\n"}
+        if version != "0.5.4":
+            files["ag2_sparrow/new_in_target.py"] = "x = 1\n"
+            files.update(self.target_adds)
+        if self.extras and version != "0.5.4":
+            files.update({"ag2_sparrow_newtop/sub/m.py": "y = 2\n", "sparrow_vendor/sub/m.py": "y = 2\n",
+                          "../../bin/ag2-sparrow-newcmd": "#!/bin/sh\n# new\n",
+                          "../../bin/sprw-tool": "#!/bin/sh\n# new\n"})
+        return files
+
     def install(self, version):
         self.remove()
-        pkg, info = self.site / "ag2_sparrow", self.dist_info(version)
-        pkg.mkdir(parents=True, exist_ok=True)
+        info = self.dist_info(version)
         info.mkdir(parents=True)
         self.bin.mkdir(parents=True, exist_ok=True)
-        (pkg / "__init__.py").write_text(f'__version__ = "{version}"\n')
-        (pkg / "__pycache__").mkdir(exist_ok=True)
-        (pkg / "__pycache__" / "x.pyc").write_bytes(b"pyc")
-        if version != "0.5.4":
-            (pkg / "new_in_target.py").write_text("x = 1\n")
-        if self.extras and version != "0.5.4":
-            for top in ("ag2_sparrow_newtop", "sparrow_vendor"):
-                (self.site / top / "sub").mkdir(parents=True, exist_ok=True)
-                (self.site / top / "sub" / "m.py").write_text("y = 2\n")
-            (self.bin / "ag2-sparrow-newcmd").write_text("#!/bin/sh\n# new\n")
-            (self.bin / "sprw-tool").write_text("#!/bin/sh\n# new\n")
-        (self.bin / "ag2-sparrow-hatch").write_text(f"#!/bin/sh\n# {version}\n")
-        (info / "METADATA").write_text(f"Metadata-Version: 2.1\nName: ag2-sparrow\nVersion: {version}\n")
-        files = ["ag2_sparrow/__init__.py", "ag2_sparrow/__pycache__/x.pyc",
-                 f"ag2_sparrow-{version}.dist-info/METADATA",
-                 f"ag2_sparrow-{version}.dist-info/RECORD", "../../bin/ag2-sparrow-hatch"]
-        if version != "0.5.4":
-            files.append("ag2_sparrow/new_in_target.py")
-        if self.extras and version != "0.5.4":
-            files += ["ag2_sparrow_newtop/sub/m.py", "sparrow_vendor/sub/m.py",
-                      "../../bin/ag2-sparrow-newcmd", "../../bin/sprw-tool"]
+        (self.site / "ag2_sparrow" / "__pycache__").mkdir(parents=True, exist_ok=True)
+        (self.site / "ag2_sparrow" / "__pycache__" / "x.pyc").write_bytes(b"pyc")
+        files = self.files(version)
+        for rel, text in files.items():
+            path = Path(os.path.normpath(self.site / rel))
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text)
         rows = []
-        for f in files:
+        for f in [*files, "ag2_sparrow/__pycache__/x.pyc", f"ag2_sparrow-{version}.dist-info/RECORD"]:
             path = Path(os.path.normpath(self.site / f))
             digest = "" if f.endswith("/RECORD") else "sha256=" + base64.urlsafe_b64encode(
                 hashlib.sha256(path.read_bytes()).digest()).rstrip(b"=").decode()
             rows.append(f"{f},{digest},\n")
         (info / "RECORD").write_text("".join(rows))
+
+    def wheel(self, version, dest: Path) -> Path:
+        """The wheel pip would download for `version`: its scripts under .data/scripts."""
+        dest.mkdir(parents=True, exist_ok=True)
+        path = dest / f"ag2_sparrow-{version}-py3-none-any.whl"
+        names = {(f"ag2_sparrow-{version}.data/scripts/{rel[len('../../bin/'):]}"
+                  if rel.startswith("../../bin/") else rel): text
+                 for rel, text in self.files(version).items()}
+        names[f"ag2_sparrow-{version}.dist-info/WHEEL"] = "Wheel-Version: 1.0\n"
+        with zipfile.ZipFile(path, "w") as zf:
+            for name, text in names.items():
+                zf.writestr(name, text)
+            zf.writestr(f"ag2_sparrow-{version}.dist-info/RECORD",
+                        "".join(f"{n},,\n" for n in [*names, f"ag2_sparrow-{version}.dist-info/RECORD"]))
+        return path
 
     def version(self):
         text = (self.site / "ag2_sparrow" / "__init__.py").read_text()
@@ -2328,6 +2345,8 @@ class FakeRun:
             return "pip-install"
         if argv[1:4] == ["-m", "pip", "check"]:
             return "pip-check"
+        if argv[1:4] == ["-m", "pip", "download"]:
+            return "pip-download"
         if argv[1] == "-c":
             return "version"
         return argv[1]
@@ -2340,6 +2359,8 @@ class FakeRun:
         if kind in self.fail or kind in self.fail_first:
             self.fail_first.discard(kind)
             return subprocess.CompletedProcess(argv, 1, "", "network is unreachable")
+        if kind == "pip-download":
+            self.site.wheel(req.split("==")[1].split()[0], Path(argv[argv.index("-d") + 1]))
         if kind == "pip-install":
             self.site.install(req.split("==")[1].split()[0])
         if kind == "pip-check":
@@ -2401,6 +2422,15 @@ class Upgrade(Base):
         files += [p for p in self.site.bin.iterdir() if p.is_file()]
         return {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in files}
 
+    def snap(self, target="0.6.0"):
+        """The snapshot a worker takes before `target`, with that wheel's inventory."""
+        wheels = self.home / "fixture-wheels"
+        shutil.rmtree(wheels, ignore_errors=True)
+        self.site.wheel(target, wheels)
+        owned = self_upgrade.wheel_inventory(
+            wheels, target, self_upgrade._record_scope(self.site.distribution()))
+        return self_upgrade.snapshot(self.state, "0.5.4", self.site.distribution(), owned)
+
     def partial(self, dist_info_swap: bool):
         """A pip that dies mid-install: target bytes over __init__, a target-only module
         added, the old dist-info kept (and, with `dist_info_swap`, a half-written new one)."""
@@ -2448,8 +2478,8 @@ class Upgrade(Base):
     def test_the_order_is_snapshot_stop_install_start_verify(self):
         fake = self.fake()
         self.assertEqual(self.run_upgrade(fake), "ok")
-        self.assertEqual(self.events, ["pip-check", "stop", "pip-install", "pip-check",
-                                       "install", "start", "version"])
+        self.assertEqual(self.events, ["pip-download", "pip-check", "stop", "pip-install",
+                                       "pip-check", "install", "start", "version"])
         self.assertTrue((self.state / "rollback" / "0.5.4" / "manifest.json").is_file())
         self.assertEqual(self.site.version(), "0.6.0")
         install = fake.of("install")[0][0]
@@ -2533,8 +2563,8 @@ class Upgrade(Base):
         fake = self.fake(check={2: "ag2-sparrow 0.6.0 has requirement x>=2, but you have x 1.\n"})
         self.assertEqual(self.run_upgrade(fake), "rolled-back")
         self.assertEqual(self.site.version(), "0.5.4")
-        self.assertEqual(self.events, ["pip-check", "stop", "pip-install", "pip-check",
-                                       "stop", "install", "start", "version"])
+        self.assertEqual(self.events, ["pip-download", "pip-check", "stop", "pip-install",
+                                       "pip-check", "stop", "install", "start", "version"])
 
     def test_other_or_existing_pip_check_problems_do_not_roll_back(self):
         old = "ag2-sparrow 0.5.4 has requirement y, which is not installed.\n"
@@ -2547,7 +2577,7 @@ class Upgrade(Base):
     def test_a_pip_check_that_cannot_run_is_a_failure(self):
         fake = self.fake(check={1: 127})
         self.assertEqual(self.run_upgrade(fake), "no-pip-check")
-        self.assertEqual((fake.of("pip-install"), self.events), ([], ["pip-check"]))
+        self.assertEqual((fake.of("pip-install"), self.events), ([], ["pip-download", "pip-check"]))
         for rc in (127, 2):
             self.site.install("0.5.4")
             self_upgrade.save_state(self.state, {"attempted": {}})
@@ -2586,7 +2616,7 @@ class Upgrade(Base):
 
     def test_an_interrupted_upgrade_is_settled_before_the_current_check(self):
         self.start(self.setup(), now=1000.0)
-        self_upgrade.snapshot(self.state, "0.5.4", self.site.distribution())
+        self.snap()
         self.site.install("0.6.0")
         self.assertEqual(self.start(self.setup(), installed="0.6.0", now=1600.0)[0], "current")
         with mock.patch.object(self_upgrade, "_run", self.fake()), \
@@ -2605,7 +2635,7 @@ class Upgrade(Base):
 
     def test_a_crash_with_nothing_changed_is_marked_without_a_restore(self):
         self.start(self.setup(), now=1000.0)
-        self_upgrade.snapshot(self.state, "0.5.4", self.site.distribution())
+        self.snap()
         with contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(self_upgrade.maybe_start(self.cfg, None, "0.5.4", 2900.0),
                              "0.6.0:crashed")
@@ -2615,7 +2645,7 @@ class Upgrade(Base):
 
     def test_a_crash_after_the_stop_restarts_sparrow_through_its_manager_only(self):
         self.start(self.setup(), now=1000.0)
-        self_upgrade.snapshot(self.state, "0.5.4", self.site.distribution())
+        self.snap()
         self_upgrade._phase(self.state, "0.6.0", "quiesced", manager="unit")
         with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(self_upgrade.maybe_start(self.cfg, None, "0.5.4", 1010.0),
@@ -2669,7 +2699,7 @@ class Upgrade(Base):
         self_upgrade.save_state(self.state, {"attempted": {}})
         self.connected.side_effect, self.connected.return_value = None, 0
         self.start(self.setup(), now=1000.0)
-        self_upgrade.snapshot(self.state, "0.5.4", self.site.distribution())
+        self.snap()
         self.site.install("0.6.0")
         with mock.patch.object(self_upgrade, "_run", self.fake()), \
                 contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
@@ -2677,12 +2707,100 @@ class Upgrade(Base):
                              "0.6.0:rolled-back")
         self.assertEqual(self.inventory(), before)
 
+    def test_a_target_file_nested_in_a_foreign_directory_is_rolled_back(self):
+        # Kewei's shape: shared_vendor/ existed before and is no RECORD root of 0.5.4.
+        shared = self.site.site / "shared_vendor"
+        shared.mkdir()
+        (shared / "foreign.py").write_text("f = 1\n")
+        self.site.target_adds = {"shared_vendor/sparrow_target.py": "t = 1\n"}
+        before = self.inventory()
+        self.connected.side_effect = [1, 0]  # the target never reconnects
+        self.assertEqual(self.run_upgrade(self.fake()), "rolled-back")
+        self.assertFalse((shared / "sparrow_target.py").exists(), "the target's own file is removed")
+        self.assertEqual((shared / "foreign.py").read_text(), "f = 1\n")
+        self.assertEqual(self.inventory(), before)
+        self.assertEqual(self_upgrade.namespace_drift(self.state, "0.5.4"), [])
+        # Left behind, it is drift: a restore that cannot remove it never certifies.
+        (shared / "sparrow_target.py").write_text("t = 1\n")
+        self.assertEqual(self_upgrade.namespace_drift(self.state, "0.5.4"),
+                         [f"added {shared / 'sparrow_target.py'}"])
+
+    def test_a_foreign_addition_after_the_snapshot_is_neither_deleted_nor_counted(self):
+        added = [self.site.site / "foreign_added_later" / "keep.py",
+                 self.site.bin / "foreign-tool-added-later"]
+        fake = self.fake()
+
+        def another_installer(argv, timeout):
+            out = FakeRun.__call__(fake, argv, timeout)
+            if FakeRun.kind(argv) == "pip-install":
+                for path in added:
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text("not sparrow's\n")
+            return out
+        self.connected.side_effect = [1, 0]
+        self.assertEqual(self.run_upgrade(another_installer), "rolled-back")
+        for path in added:
+            self.assertEqual(path.read_text(), "not sparrow's\n", path)
+        self.assertEqual(self.site.version(), "0.5.4")
+        self.assertFalse((self.site.site / "ag2_sparrow" / "new_in_target.py").exists())
+        self.assertEqual(self_upgrade.namespace_drift(self.state, "0.5.4"), [])
+
+    def test_an_unknown_file_in_the_package_directory_is_kept_and_never_certified(self):
+        stray = self.site.site / "ag2_sparrow" / "hand_added.py"
+        fake = self.fake()
+
+        def hand_edit(argv, timeout):
+            out = FakeRun.__call__(fake, argv, timeout)
+            if FakeRun.kind(argv) == "pip-install":
+                stray.write_text("mine\n")
+            return out
+        self.connected.side_effect = [1, 0]
+        self.assertEqual(self.run_upgrade(hand_edit), "restore-failed")
+        self.assertEqual(stray.read_text(), "mine\n")
+        problems = self_upgrade.load_state(self.state)["failed"]["problems"]
+        self.assertIn(f"unknown {stray}", problems[0])
+        self.assertIn(f"unrecorded {stray}", self_upgrade.verify_installed(self.site.distribution()))
+
+    def test_the_target_inventory_is_read_from_its_wheel_before_anything_changes(self):
+        self.site.extras = True
+        fake = self.fake()
+        self.assertEqual(self.run_upgrade(fake), "ok")
+        self.assertEqual(self.events[:3], ["pip-download", "pip-check", "stop"])
+        argv, req = fake.of("pip-download")[0]
+        for flag in ("--no-deps", "--require-hashes", "--only-binary=:all:"):
+            self.assertIn(flag, argv)
+        self.assertEqual(req, f"ag2-sparrow==0.6.0 --hash=sha256:{SHA_NEW}\n")
+        install, _ = fake.of("pip-install")[0]
+        self.assertIn("--no-index", install)
+        self.assertEqual(install[install.index("--find-links") + 1], argv[argv.index("-d") + 1])
+        owned = json.loads((self.state / "rollback" / "0.5.4" / "manifest.json").read_text())["owned"]
+        site, bin_ = str(self.site.site), str(self.site.bin)
+        for want in (f"{site}/ag2_sparrow/new_in_target.py", f"{site}/sparrow_vendor/sub/m.py",
+                     f"{bin_}/sprw-tool", f"{bin_}/ag2-sparrow-hatch"):
+            self.assertIn(want, owned)
+        self.assertIn(f"{site}/ag2_sparrow-0.6.0.dist-info", owned)
+        # A wheel that installs outside site-packages and the scripts dir is never installed.
+        self.site.install("0.5.4")
+        self_upgrade.save_state(self.state, {"attempted": {}})
+        self.site.target_adds = {"ag2_sparrow-0.6.0.data/headers/x.h": "h"}
+        self.events.clear()
+        fake = self.fake()
+        self.assertEqual(self.run_upgrade(fake), "no-inventory")
+        self.assertEqual((fake.of("pip-install"), "stop" in self.events), ([], False))
+        # A download that fails changes nothing either.
+        self.site.target_adds = {}
+        self_upgrade.save_state(self.state, {"attempted": {}})
+        self.events.clear()
+        fake = self.fake(fail={"pip-download"})
+        self.assertEqual(self.run_upgrade(fake), "no-download")
+        self.assertEqual(self.events, ["pip-download"])
+
     def test_a_stale_attempt_that_left_target_residue_beside_old_metadata_is_restored(self):
         # Kewei's shape: target bytes and a target-only module, old 0.5.4 metadata kept, so
         # the version reads as the previous one and the stale RECORD cannot name the module.
         before = self.inventory()
         self.start(self.setup(), now=1000.0)
-        self_upgrade.snapshot(self.state, "0.5.4", self.site.distribution())
+        self.snap()
         (self.site.site / "ag2_sparrow" / "__init__.py").write_text('__version__ = "0.6.0"\n')
         (self.site.site / "ag2_sparrow" / "new_in_target.py").write_text("x = 1\n")
         self.assertEqual(self.site.distribution().version, "0.5.4")
@@ -2698,7 +2816,7 @@ class Upgrade(Base):
     def test_a_dead_attempt_in_a_mutating_phase_is_settled_at_once(self):
         before = self.inventory()
         self.start(self.setup(), now=1000.0)
-        self_upgrade.snapshot(self.state, "0.5.4", self.site.distribution())
+        self.snap()
         self_upgrade._phase(self.state, "0.6.0", "installing", manager="detached")
         self.site.install("0.6.0")
         with mock.patch.object(self_upgrade, "_run", self.fake()), \
@@ -2710,7 +2828,7 @@ class Upgrade(Base):
     def test_an_interrupted_restore_resumes_on_the_next_run(self):
         before = self.inventory()
         self.start(self.setup(), now=1000.0)
-        self_upgrade.snapshot(self.state, "0.5.4", self.site.distribution())
+        self.snap()
         self_upgrade._phase(self.state, "0.6.0", "installing", manager="detached")
         self.site.install("0.6.0")
         real, calls = self_upgrade.restore, []
@@ -2751,7 +2869,7 @@ class Upgrade(Base):
         # Kewei's state: a stale started attempt, the target's files in place, the listener down.
         before = self.inventory()
         self.start(self.setup(), now=1000.0)
-        self_upgrade.snapshot(self.state, "0.5.4", self.site.distribution())
+        self.snap()
         self_upgrade._phase(self.state, "0.6.0", "installing", manager="detached")
         self.site.install("0.6.0")
         log = self.home / "log"
@@ -3015,7 +3133,7 @@ class Upgrade(Base):
         with mock.patch.object(self_upgrade, "snapshot", side_effect=OSError("full")):
             fake = self.fake()
             self.assertEqual(self.run_upgrade(fake), "no-snapshot")
-        self.assertEqual(fake.calls, [])
+        self.assertEqual([c[0] for c in fake.calls], ["pip-download"], "a download changes no file")
         self.assertNotIn("stop", self.events)
 
     def test_a_snapshot_of_another_version_is_not_restored(self):
