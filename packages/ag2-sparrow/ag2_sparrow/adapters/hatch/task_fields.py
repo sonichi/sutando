@@ -11,7 +11,7 @@ import re
 import sys
 from pathlib import Path
 
-from ... import gateway_instance, local_task_protocol
+from ... import gateway_instance, local_task_protocol, task_hold
 from ...task_io import attested_headers
 
 SNIPPET_MAX = 500
@@ -114,6 +114,9 @@ def task_fields(task_file: Path, result_dir: Path, instance: "str | None" = "") 
         item["reply_context"] = {"sender": reply["sender"][:SNIPPET_MAX],
                                  "body": reply["body"][:REPLY_CONTEXT_MAX],
                                  "label": label[:REPLY_CONTEXT_MAX] if label else None}
+    # A parked item is flagged on every wake, so a fresh worker session never answers it.
+    if task_hold.read(result_dir, tid) is not None:
+        item["held"] = True
     return item
 
 

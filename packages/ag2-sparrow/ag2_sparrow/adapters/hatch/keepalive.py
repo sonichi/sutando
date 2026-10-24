@@ -11,7 +11,9 @@ environment) and sends the row on its heartbeat. The row is healthy while the la
 keepawake line is under two intervals old, unknown while a task that has not run yet
 is that young, else abnormal (`keepawake-not-running`). A fresh keepawake line does not
 mask the hook: the row is also abnormal when the hook has not run in HOOK_STALE_S
-(`hook-not-running`) or a task has waited over TASK_PICKUP_S (`task-not-picked-up`).
+(`hook-not-running`), a task has waited over TASK_PICKUP_S (`task-not-picked-up`), or a held
+task's room line is still queued or parked after HELD_LINE_DELIVER_S (`task-held-line-undelivered`)
+or left the queue with no receipt (`task-held-line-unconfirmed`).
 `keepalive report` lists the log's gaps, and reads the lines of the earlier
 watchdog-and-probe pair too."""
 from __future__ import annotations
@@ -26,7 +28,8 @@ import sys
 import time
 from pathlib import Path
 
-from ... import _dirs
+from ... import _dirs, task_hold
+from ...persisted_number import bounded_number
 from . import cli as _cli, task_fields
 
 TASK, INTERVAL_MIN = "sparrow-keepawake", 15
@@ -37,12 +40,27 @@ STALE_S = 2 * INTERVAL_MIN * 60
 NOT_RUNNING = "keepawake-not-running"
 HOOK_NOT_RUNNING, HOOK_STALE_S = "hook-not-running", 5 * 60
 TASK_NOT_PICKED_UP, TASK_PICKUP_S = "task-not-picked-up", 15 * 60
+# A healthy row's reason while a task waits on a deliberate hold, never a problem.
+TASK_HELD = "task-held-for-owner"
+# A hold whose room line the drain has not delivered this long is reported, never acted on: the
+# line is still queued, being sent or parked (undelivered), or gone with no receipt (unconfirmed).
+TASK_HELD_UNDELIVERED, HELD_LINE_DELIVER_S = "task-held-line-undelivered", 10 * 60
+TASK_HELD_UNCONFIRMED = "task-held-line-unconfirmed"
 NO_HEALTH_COMMAND, UNKNOWN_ENV = "no-health-command", "unknown-env"
 REASON_HINTS = {
     HOOK_NOT_RUNNING: f"the hook has not run in the last {HOOK_STALE_S // 60} minutes; see "
                       "the hook run line above",
     TASK_NOT_PICKED_UP: f"an AG2 Space task has been open over {TASK_PICKUP_S // 60} minutes: "
-                        "the hook is not waking a worker for it, or a worker handed it off",
+                        "the hook is not waking a worker for it, or a worker handed it off "
+                        "without running hold",
+    TASK_HELD: "a worker parked an AG2 Space task for your go (ag2-sparrow-hatch hold)",
+    TASK_HELD_UNDELIVERED: f"a task was held over {HELD_LINE_DELIVER_S // 60} minutes ago and its "
+                           "room notice is still queued, being sent, or was parked after failed "
+                           "sends, so the asker may have heard nothing: check Sparrow's proactive "
+                           "drain and the room",
+    TASK_HELD_UNCONFIRMED: f"a task was held over {HELD_LINE_DELIVER_S // 60} minutes ago and its "
+                           "room notice left the queue, but its delivery can't be confirmed (no "
+                           "receipt): check the room and Sparrow's log",
 }
 RUN_TIMEOUT_S = 120
 GAP_MINUTES = 16
@@ -456,7 +474,7 @@ def _await_connected(state: Path, instance: str, since: "float | None") -> int:
     while True:
         code, detail = _cli.check_sparrow(state, instance=instance)
         try:
-            ts = float(json.loads(path.read_text(encoding="utf-8"))["ts"])
+            ts = bounded_number(json.loads(path.read_text(encoding="utf-8"))["ts"], 0, 1e11)
         except (OSError, ValueError, KeyError, TypeError):
             ts = None
         if code == _cli.SPARROW_OK and (since is None or (ts is not None and ts >= int(since))):
@@ -492,11 +510,19 @@ def keepawake(cfg: dict, log: Path, now: float | None = None) -> int:
                 rc = 1
     line = f"{_utc(now)} keepawake listener={'up' if up else 'down'} restarted={restarted}" \
         + (f" reason={reason}" if reason else "")
-    log.parent.mkdir(parents=True, exist_ok=True)
-    with log.open("a", encoding="utf-8") as fh:
-        fh.write(line + "\n")
-    print(line)
+    _log_line(log, line)
     return rc
+
+
+def _log_line(log: Path, line: str) -> None:
+    """Append to the keepalive log, best effort: a log that cannot be written goes to stderr."""
+    try:
+        log.parent.mkdir(parents=True, exist_ok=True)
+        with log.open("a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+    except OSError as e:
+        print(f"keepalive log not written ({e})", file=sys.stderr)
+    print(line)
 
 
 def last_keepawake(log: Path) -> float | None:
@@ -534,21 +560,33 @@ def hook_last_run(cfg: dict) -> "float | None":
     return run[0] if run is not None else _mtime(_cli.installed_marker_path())
 
 
-def oldest_open_task(cfg: dict) -> "float | None":
-    """mtime of the oldest task of any instance with no result, the agent's own excepted."""
+def open_tasks(cfg: dict, now: float) -> "tuple[float | None, float | None, dict]":
+    """(mtime of the oldest open task nobody holds, earliest deliberate hold, {outcome: earliest
+    hold} for holds whose room line is 'undelivered' or 'unconfirmed') across every instance,
+    the agent's own tasks excepted."""
     agent = (cfg.get("AGENT_MXID") or "").lower()
+    result_dir = Path(cfg.get("RESULT_DIR") or _dirs.result_dir())
     try:
         items = task_fields.list_open_tasks(Path(cfg.get("TASK_DIR") or _dirs.task_dir()),
-                                            Path(cfg.get("RESULT_DIR") or _dirs.result_dir()),
-                                            instance=None)
+                                            result_dir, instance=None)
     except OSError:
-        return None
+        return None, None, {}
+    oldest = held = None
+    stuck: dict = {}
     for item in items:
-        if (item.get("sender") or "").lower() != agent:
-            ts = _mtime(Path(item["task_file"]))
-            if ts is not None:
-                return ts
-    return None
+        if (item.get("sender") or "").lower() == agent:
+            continue
+        mark = task_hold.read(result_dir, item["task_id"])
+        ts = _mtime(Path(item["task_file"]))
+        # A task whose answer the outbox already has is a failed cleanup, never a hold.
+        if mark is not None and not _cli.task_settled(result_dir, item["task_id"]):
+            held = min(t for t in (held, mark["since"]) if t is not None)
+            outcome = _cli.hold_line_outcome(result_dir, item["task_id"])
+            if outcome != "delivered":
+                stuck[outcome] = min(t for t in (stuck.get(outcome), mark["since"]) if t is not None)
+        elif oldest is None and ts is not None:
+            oldest = ts
+    return oldest, held, stuck
 
 
 def health_row(cfg: dict, log: Path, now: float | None = None) -> dict | None:
@@ -569,12 +607,17 @@ def health_row(cfg: dict, log: Path, now: float | None = None) -> dict | None:
     hook = hook_last_run(cfg)
     if hook is not None and not _within(now, hook, HOOK_STALE_S):
         problems.append((HOOK_NOT_RUNNING, hook + HOOK_STALE_S))
-    oldest = oldest_open_task(cfg)
+    oldest, held, stuck = open_tasks(cfg, now)
     if oldest is not None and now - oldest > TASK_PICKUP_S:
         problems.append((TASK_NOT_PICKED_UP, oldest + TASK_PICKUP_S))
+    for outcome, reason in (("undelivered", TASK_HELD_UNDELIVERED), ("unconfirmed", TASK_HELD_UNCONFIRMED)):
+        since = stuck.get(outcome)
+        if since is not None and now - since > HELD_LINE_DELIVER_S:
+            problems.append((reason, since + HELD_LINE_DELIVER_S))
     # Fresh but never run: no evidence either way yet.
     condition = "abnormal" if problems else "healthy" if ran is not None else "unknown"
-    reason, since = problems[0] if problems else (None, None)
+    reason, since = (problems[0] if problems else (TASK_HELD, held) if held is not None
+                     else (None, None))
     return {"alive": alive, "motion": "unknown", "condition": condition,
             "reason": reason, "since": since}
 

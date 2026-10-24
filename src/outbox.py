@@ -61,6 +61,10 @@ class ProcessIdentity:
     start_usec: Optional[int] = None
 
 
+# The largest pid any supported OS hands out; native probes narrow a pid to a C int.
+PID_MAX = 2**31 - 1
+
+
 _PROC_PIDTBSDINFO = 3
 _PROC_BSDINFO_SIZE = 136          # measured; verified against ctypes.sizeof below
 
@@ -495,6 +499,13 @@ def _read_claim_at(p: Path, item_id: str) -> Optional[ClaimRecord]:
                        pid=pid,
                        start_usec=start_usec,
                        claimed_at=claimed_at)
+
+
+def valid_pid(pid) -> Optional[int]:
+    """`pid` when it is an int (never a bool) with 0 < pid <= PID_MAX, else None."""
+    if isinstance(pid, bool) or not isinstance(pid, int) or not 0 < pid <= PID_MAX:
+        return None
+    return pid
 
 
 def may_reclaim_delivery(root: Path, item_id: str, ttl_seconds: float) -> bool:

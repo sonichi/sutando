@@ -96,8 +96,13 @@ class TestSparrowDelegation(unittest.TestCase):
     def test_sparrow_parks_to_the_repo_wide_quarantine(self):
         # results/undelivered/ is what health-check's probe scans; an archive/
         # subdir is a park with no reader (review blocker, 2026-08-16).
-        self.assertIn('UNDELIVERABLE_RESULTS_DIR = RESULTS_DIR / "undelivered"',
+        # The bridge takes the directory from the shared destination owner, which Hatch's
+        # hold-line reader uses too, and that owner names the repo-wide quarantine.
+        self.assertIn("UNDELIVERABLE_RESULTS_DIR = RESULTS_DIR / _delivery_destination.UNDELIVERED_DIR",
                       SPARROW)
+        destination = (REPO / "packages" / "ag2-sparrow" / "ag2_sparrow"
+                       / "delivery_destination.py").read_text()
+        self.assertIn('UNDELIVERED_DIR = "undelivered"', destination)
 
 
 class TestReleaseClaimActuallyReturnsTheBody(unittest.TestCase):

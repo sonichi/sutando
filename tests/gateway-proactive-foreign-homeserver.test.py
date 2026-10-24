@@ -153,6 +153,16 @@ def main() -> int:
     check(names(tmp) == ["proactive-1.txt"],
           f"e) post-claim foreign server: handed back as .txt, not parked: {names(tmp)}")
 
+    # f) each drain pass publishes the identity it judged rooms by, for Hatch to read
+    from ag2_sparrow import agent_identity
+    has_lane = hasattr(agent_identity, "published_lane_record")
+    check(has_lane, "f) the drain publishes its lane identity")
+    if has_lane:
+        for who in (LOCAL_AGENT, PROD_AGENT):
+            lane(who, fresh(), [])
+            rec = agent_identity.published_lane_record(gb._STATE, gb.GATEWAY_INSTANCE) or {}
+            check(rec.get("agent_id") == who, f"f) lane record names {who}")
+
     # the predicate itself — guarded, so a tree WITHOUT the fix reports the
     # behavioural failures above instead of aborting here on the missing symbol
     has_predicate = hasattr(gb, "_room_is_deliverable_here") and hasattr(gb, "_own_homeserver")

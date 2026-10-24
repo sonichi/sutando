@@ -287,12 +287,12 @@ class GatewayStatusEvidenceTest(unittest.TestCase):
             replace = _GW.os.replace
             failed = []
 
-            def fail_once(src, dst):
+            def fail_once(src, dst, *a, **k):
                 if dst == _GW.GATEWAY_STATUS_FILE and not failed:
                     if json.loads(src.read_text())["last_ok_ts"] is not None:
                         failed.append(True)
                         raise OSError("status unavailable")
-                replace(src, dst)
+                replace(src, dst, *a, **k)
 
             with patch.object(_GW.os, "replace", side_effect=fail_once):
                 loop.run([(1, {"tasks": [self.TASK]}), self.timeout(),

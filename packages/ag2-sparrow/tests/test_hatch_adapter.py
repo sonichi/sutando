@@ -32,7 +32,8 @@ isolate_os_environ()
 PKG_ROOT = Path(__file__).resolve().parents[1]
 HATCH = PKG_ROOT / "ag2_sparrow" / "adapters" / "hatch"
 sys.path.insert(0, str(PKG_ROOT))
-from ag2_sparrow import gateway_credential_io, health_command as hc, outbox, service_manager as sm  # noqa: E402
+from ag2_sparrow import gateway_credential_io, health_command as hc, outbox, service_manager as sm, task_hold, delivery_destination  # noqa: E402
+from ag2_sparrow.result_markers import parse_markers  # noqa: E402
 from ag2_sparrow.adapters.hatch import cli as hatch_cli, keepalive, task_fields  # noqa: E402
 
 KEEPAWAKE_NOTE = "the agent keeps Sparrow running with %s keepalive keepawake from its scheduler"
@@ -315,7 +316,42 @@ class HookScript(Base):
         self.assertEqual((m["task_id"], m["rewake"], m["wakes"]), ("task-1784700000001", True, 1))
         self.assertIn("rewake: true", p["worker_note"])
         self.assertIn("repeat its HANDOFF block", p["worker_note"])
+        self.assertIn("hold <its result_file>` once", p["worker_note"])
         self.assertEqual(self.stored()["woken"]["task-1784700000001"]["n"], 2)
+
+    def test_a_held_item_is_rewoken_as_held_and_never_answered(self):
+        self.add_task("task-1784700000001", "$held", mtime=1000)
+        self.add_task("task-1784700000002", "$open", mtime=2000)
+        self.run_script()
+        self.assertNotIn("held: true", self.payload()["worker_note"])
+        # The worker parked the first item with `hold` after its first wake.
+        task_hold.place(self.results, "task-1784700000001")
+        st = self.stored()
+        for tid in ("task-1784700000001", "task-1784700000002"):
+            st["woken"][tid]["at"] -= 1800000
+        self.state.write_text(json.dumps(st))
+        self.reset()
+        self.run_script()
+        p = self.payload()
+        held, open_ = p["matches"]
+        self.assertEqual((held["task_id"], held["rewake"], held["held"]),
+                         ("task-1784700000001", True, True))
+        self.assertEqual((open_["task_id"], open_["rewake"]), ("task-1784700000002", True))
+        self.assertNotIn("held", open_, "an unheld item is unchanged")
+        note = p["worker_note"]
+        self.assertIn("Items with held: true already wait for your owner's go: never answer one", note)
+        self.assertIn("repeat only its HANDOFF block", note)
+        self.assertIn("If one is held (held: true), waits on the main session", note)
+        # Released (answered through `reply`), the item is woken for as before, unflagged.
+        task_hold.release(self.results, "task-1784700000001")
+        st = self.stored()
+        st["woken"]["task-1784700000001"]["at"] -= 1800000
+        self.state.write_text(json.dumps(st))
+        self.reset()
+        self.run_script()
+        (m,) = self.payload()["matches"]
+        self.assertNotIn("held", m)
+        self.assertNotIn("held: true already wait", self.payload()["worker_note"])
 
     def test_rewakes_stop_at_the_cap(self):
         self.add_task("task-1784700000001", "$reply")
@@ -721,6 +757,17 @@ class TaskFields(Base):
         self.assertEqual((item["event_id"], item["thread_root"], item["sender"], item["sender_name"],
                           item["access_tier"], item["collaborator"]),
                          ("$m", "$t", "@bob:ag2.space", "Bob", "owner", False))
+
+    def test_a_held_task_carries_held_and_an_unheld_one_does_not(self):
+        self.add_task("task-1784700000001", "$held", mtime=1000)
+        self.add_task("task-1784700000002", "$open", mtime=2000)
+        task_hold.place(self.results, "task-1784700000001")
+        held, open_ = task_fields.list_open_tasks(self.tasks, self.results)
+        self.assertEqual((held["task_id"], held["held"]), ("task-1784700000001", True))
+        self.assertNotIn("held", open_)
+        # A marker that is not a whole, well-formed hold is no hold.
+        (self.results / task_hold.HOLD_DIR / "task-1784700000002.json").write_text("{")
+        self.assertNotIn("held", task_fields.list_open_tasks(self.tasks, self.results)[1])
 
     def test_snippet_skips_the_matrix_reply_fallback(self):
         # As the gateway folds it: quoted lines, the blank separator, then the reply.
@@ -1169,6 +1216,28 @@ class Cli(Base):
         self.assertEqual(code, hatch_cli.SPARROW_DOWN)
         code, detail = hatch_cli.check_sparrow(self.state, now=1010, instance="blue")
         self.assertEqual(code, hatch_cli.SPARROW_OK, detail)
+
+    def test_a_status_dated_in_the_future_or_stale_reads_down(self):
+        self.state.mkdir()
+        status = self.state / "gateway-status.json"
+        now = 1_800_000_000
+        skew = hatch_cli.SPARROW_STATUS_FUTURE_SKEW_S
+        for ts, want in ((1e11, hatch_cli.SPARROW_DOWN), (now + 60, hatch_cli.SPARROW_DOWN),
+                         (now + skew + 0.000001, hatch_cli.SPARROW_DOWN),
+                         (now + skew + 0.5, hatch_cli.SPARROW_DOWN), (now + skew, hatch_cli.SPARROW_OK),
+                         (now - 181, hatch_cli.SPARROW_DOWN), (now + 2, hatch_cli.SPARROW_OK),
+                         (now - 10, hatch_cli.SPARROW_OK)):
+            with self.subTest(age=now - ts):
+                status.write_text(json.dumps({"connected": True, "ts": ts}))
+                self.assertEqual(hatch_cli.check_sparrow(self.state, now=now, instance="")[0], want)
+
+    def test_an_unrepresentable_status_ts_reads_down_without_crashing(self):
+        self.state.mkdir()
+        for raw in ("1" + "0" * 400, "-1" + "0" * 400, "NaN", "Infinity", "true", '"1000"'):
+            with self.subTest(ts=raw[:8]):
+                (self.state / "gateway-status.json").write_text('{"connected": true, "ts": %s}' % raw)
+                code, detail = hatch_cli.check_sparrow(self.state, now=1010, instance="")
+                self.assertEqual(code, hatch_cli.SPARROW_DOWN, detail)
 
     def test_install_records_the_reply_command_by_absolute_path(self):
         r = self.cli("install", "--mxid", AGENT)
@@ -1951,6 +2020,226 @@ class Keepalive(Base):
         self.assertEqual(hc.validate(row), (row, None))
         self.assertIn("health=abnormal (task-not-picked-up); an AG2 Space task has been open "
                       "over 15 minutes", self.cli("verify").stdout)
+
+    def test_a_deliberately_held_task_reports_held_not_stuck(self):
+        self.installed()
+        self.keepawake_at(time.time() - 60)
+        self.hook_ran()
+        old = time.time() - 20 * 60
+        tid = "task-1784700000005"
+        self.add_task(tid, "$held", mtime=old)
+        task_hold.place(self.results, tid, task_hold.OWNER_GO, now=old + 30)
+        outbox.record_delivered(self.results / delivery_destination.RECEIPT_DIR, f"proactive-hold-{tid}")
+        row = self.health()
+        self.assertEqual((row["condition"], row["reason"]), ("healthy", keepalive.TASK_HELD))
+        self.assertAlmostEqual(row["since"], old + 30, delta=1)
+        self.assertEqual(hc.validate(row), (row, None))
+        # Kill control: the same task without its marker is the stuck one.
+        task_hold.release(self.results, tid)
+        self.assertEqual(self.health()["reason"], keepalive.TASK_NOT_PICKED_UP)
+
+    def test_a_hold_whose_room_line_never_delivers_reports_stuck(self):
+        self.installed()
+        self.keepawake_at(time.time() - 60)
+        self.hook_ran()
+        tid = "task-1784700000005"
+        self.add_task(tid, "$held", mtime=time.time() - 30 * 60)
+        bound = 10 * 60
+        since = time.time() - bound - 60
+        task_hold.place(self.results, tid, task_hold.OWNER_GO, now=since)
+        (self.results / f"proactive-hold-{tid}.txt").write_text("[channel: !room:ag2.space]\nheld\n")
+        row = self.health()
+        self.assertEqual((row["condition"], row["reason"]), ("abnormal", "task-held-line-undelivered"))
+        self.assertAlmostEqual(row["since"], since + bound, delta=1)
+        self.assertEqual(hc.validate(row), (row, None))
+        self.assertEqual((keepalive.TASK_HELD_UNDELIVERED, keepalive.HELD_LINE_DELIVER_S),
+                         ("task-held-line-undelivered", bound))
+        self.assertIn(keepalive.TASK_HELD_UNDELIVERED, keepalive.REASON_HINTS)
+        # Controls: a delivered line is a healthy hold, and so is a young undelivered one.
+        outbox.record_delivered(self.results / delivery_destination.RECEIPT_DIR, f"proactive-hold-{tid}")
+        self.assertEqual((self.health()["condition"], self.health()["reason"]), ("healthy", keepalive.TASK_HELD))
+        task_hold.release(self.results, tid)
+        shutil.rmtree(self.results / delivery_destination.RECEIPT_DIR)
+        task_hold.place(self.results, tid, task_hold.OWNER_GO, now=time.time() - 60)
+        self.assertEqual(self.health()["reason"], keepalive.TASK_HELD)
+
+    def test_a_held_line_gone_without_a_receipt_is_unconfirmed_not_undelivered(self):
+        self.installed()
+        self.keepawake_at(time.time() - 60)
+        self.hook_ran()
+        tid = "task-1784700000005"
+        self.add_task(tid, "$held", mtime=time.time() - 30 * 60)
+        since = time.time() - keepalive.HELD_LINE_DELIVER_S - 60
+        task_hold.place(self.results, tid, task_hold.OWNER_GO, now=since)
+        stem = f"proactive-hold-{tid}"
+        (self.results / "archive").mkdir()
+        (self.results / "archive" / f"{stem}-1784700000.txt").write_text("held\n")  # posted; receipt failed
+        row = self.health()
+        self.assertEqual((row["condition"], row["reason"]), ("abnormal", "task-held-line-unconfirmed"))
+        self.assertEqual(hatch_cli.hold_line_outcome(self.results, tid), "unconfirmed")
+        self.assertIn("can't be confirmed", keepalive.REASON_HINTS[keepalive.TASK_HELD_UNCONFIRMED])
+        self.assertNotIn("heard nothing", keepalive.REASON_HINTS[keepalive.TASK_HELD_UNCONFIRMED])
+        self.assertEqual(hc.validate(row), (row, None))
+        # The drain's own states: parked unsent and still claimed are undelivered; a receipt is delivered.
+        parked = self.results / delivery_destination.UNDELIVERED_DIR
+        parked.mkdir()
+        (parked / f"{stem}.txt").write_text("held\n")  # the failure resolver keeps the queued name
+        self.assertEqual(hatch_cli.hold_line_outcome(self.results, tid), "undelivered")
+        shutil.rmtree(parked)
+        claim = self.results / f"{stem}.sending.4242"
+        claim.write_text("held\n")
+        self.assertEqual(hatch_cli.hold_line_outcome(self.results, tid), "undelivered")
+        claim.unlink()
+        outbox.record_delivered(self.results / delivery_destination.RECEIPT_DIR, stem)
+        self.assertEqual(hatch_cli.hold_line_outcome(self.results, tid), "delivered")
+
+    def test_a_confirmed_send_whose_receipt_write_fails_is_unconfirmed(self):
+        from ag2_sparrow import remote_gateway_bridge as gb
+        if os.geteuid() == 0:
+            self.skipTest("root ignores the permission bits this relies on")
+        self.installed()
+        self.keepawake_at(time.time() - 60)
+        self.hook_ran()
+        tid = "task-1784700000005"
+        self.add_task(tid, "$held", mtime=time.time() - 30 * 60)
+        task_hold.place(self.results, tid, task_hold.OWNER_GO,
+                        now=time.time() - keepalive.HELD_LINE_DELIVER_S - 60)
+        notice = self.results / f"proactive-hold-{tid}.txt"
+        notice.write_text(f"[channel: !room:ag2.space]\n@bob:ag2.space {hatch_cli.HOLD_NOTICE}\n")
+        receipts = self.results / delivery_destination.RECEIPT_DIR
+        receipts.mkdir()
+        receipts.chmod(0o500)
+        self.addCleanup(receipts.chmod, 0o700)
+        posts = []
+
+        def req(method, path, payload=None, timeout=None):
+            if method == "POST":
+                posts.append(payload)
+            return {"ok": True, "event_id": "$evt"}
+        with mock.patch.object(gb, "RESULTS_DIR", self.results), \
+                mock.patch.object(gb, "ARCHIVE_RESULTS_DIR", self.results / "archive"), \
+                mock.patch.object(gb, "UNDELIVERABLE_RESULTS_DIR", self.results / "undelivered"), \
+                mock.patch.object(gb, "PROACTIVE_ROOM", ""), mock.patch.object(gb, "_req", req), \
+                mock.patch.object(gb, "PROACTIVE_CLAIM_GATE", None), mock.patch.object(gb, "_log"), \
+                mock.patch.object(gb, "_STATE", self.home / "state"), \
+                mock.patch.dict(gb._ROUTING, {"owner_dm": "", "loaded": True, "next": time.time() + 3600}), \
+                mock.patch.dict(os.environ, {"AGENT_MXID": AGENT}):
+            gb._post_proactive()
+        self.assertEqual(len(posts), 1, "the drain posted the line once")
+        self.assertFalse(notice.exists(), "and moved it out of the queue")
+        row = self.health()
+        self.assertEqual((row["condition"], row["reason"]), ("abnormal", "task-held-line-unconfirmed"),
+                         "a missing receipt is not proof the asker heard nothing")
+
+    def stale_hold(self, tid):
+        self.add_task(tid, "$held", mtime=time.time() - 30 * 60)
+        task_hold.place(self.results, tid, task_hold.OWNER_GO,
+                        now=time.time() - keepalive.HELD_LINE_DELIVER_S - 60)
+        return self.results / f"proactive-hold-{tid}.txt"
+
+    def test_keepawake_never_touches_a_hold(self):
+        self.installed()
+        tid = "task-1784700000005"
+        notice = self.stale_hold(tid)
+        notice.write_text("[channel: !room:ag2.space]\nheld\n")
+        mark = task_hold.read(self.results, tid)
+        with mock.patch.object(keepalive, "restart_listener", return_value=(False, "test")):
+            self.cli("keepalive", "keepawake")
+        self.assertEqual(task_hold.read(self.results, tid), mark, "the hold is reported, never released")
+        self.assertTrue(notice.exists(), "and its queued line is left to the drain")
+        self.assertEqual(self.health()["reason"], keepalive.TASK_HELD_UNDELIVERED)
+
+    def test_a_parked_line_is_matched_by_its_exact_name_only(self):
+        short, long = "task-1784700000005", "task-1784700000005-1792760000"
+        for tid in (short, long):
+            self.stale_hold(tid)
+        parked = self.results / delivery_destination.UNDELIVERED_DIR
+        parked.mkdir()
+        (parked / f"proactive-hold-{long}.txt").write_text("held\n")  # the long id's own park
+        self.assertEqual(hatch_cli.hold_line_outcome(self.results, long), "undelivered")
+        self.assertEqual(hatch_cli.hold_line_outcome(self.results, short), "unconfirmed",
+                         "another task's park is no evidence about this one")
+
+    def test_an_unwritable_log_never_stops_the_listener_check(self):
+        self.installed()
+        self.log.parent.mkdir(parents=True, exist_ok=True)
+        self.log.unlink(missing_ok=True)
+        self.log.mkdir()  # any write to it fails
+        with mock.patch.object(keepalive, "listener_up", return_value=False), \
+                mock.patch.object(keepalive, "restart_listener", return_value=(True, "test")) as restart:
+            r = self.cli("keepalive", "keepawake")
+        restart.assert_called_once()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("keepalive log not written", r.stderr)
+
+    def test_a_far_future_or_unrepresentable_hold_time_is_no_hold(self):
+        self.installed()
+        self.keepawake_at(time.time() - 60)
+        self.hook_ran()
+        tid = "task-1784700000005"
+        self.add_task(tid, "$held", mtime=time.time() - 20 * 60)
+        task_hold.place(self.results, tid)
+        marker = self.results / task_hold.HOLD_DIR / f"{tid}.json"
+        good = json.loads(marker.read_text())
+        for since in (time.time() + 3600, 10**400, -10**400):
+            with self.subTest(since=str(since)[:12]):
+                marker.write_text(json.dumps({**good, "since": since}))
+                row = self.health()
+                self.assertEqual((row["condition"], row["reason"]), ("abnormal", keepalive.TASK_NOT_PICKED_UP))
+                self.assertIsNone(task_hold.read(self.results, tid))
+                self.assertEqual(keepalive.open_tasks({"RESULT_DIR": str(self.results),
+                                                       "TASK_DIR": str(self.tasks)}, time.time())[1], None)
+
+    def test_a_hold_never_masks_a_stuck_task_beside_it(self):
+        self.installed()
+        self.keepawake_at(time.time() - 60)
+        self.hook_ran()
+        old = time.time() - 20 * 60
+        self.add_task("task-1784700000005", "$held", mtime=old - 60)
+        task_hold.place(self.results, "task-1784700000005")
+        self.add_task("task-1784700000006", "$stuck", mtime=old)
+        row = self.health()
+        self.assertEqual((row["condition"], row["reason"]), ("abnormal", keepalive.TASK_NOT_PICKED_UP))
+        self.assertAlmostEqual(row["since"], old + keepalive.TASK_PICKUP_S, delta=1)
+
+    def test_a_marker_that_is_not_a_whole_well_formed_hold_still_reads_stuck(self):
+        self.installed()
+        self.keepawake_at(time.time() - 60)
+        self.hook_ran()
+        tid = "task-1784700000005"
+        self.add_task(tid, "$held", mtime=time.time() - 20 * 60)
+        task_hold.place(self.results, tid)
+        self.assertEqual(self.health()["reason"], keepalive.TASK_HELD, "control: a whole hold")
+        marker = self.results / task_hold.HOLD_DIR / f"{tid}.json"
+        for torn in ("", "{", '{"reason": "owner-go"}',
+                     '{"reason": "owner-go", "state": "held", "since": NaN, "token": "t"}',
+                     '{"reason": "owner-go", "state": "held", "since": Infinity, "token": "t"}',
+                     '{"reason": "owner-go", "since": 1e300, "token": "t"}'):
+            marker.write_text(torn)
+            row = self.health()
+            self.assertEqual(row["reason"], keepalive.TASK_NOT_PICKED_UP, repr(torn))
+            self.assertEqual(hc.validate(row), (row, None), repr(torn))
+        task_hold.release(self.results, tid)
+        task_hold.place(self.results, tid)
+        if os.geteuid() != 0:
+            marker.chmod(0)
+            self.addCleanup(marker.chmod, 0o600)
+            self.assertEqual(self.health()["reason"], keepalive.TASK_NOT_PICKED_UP, "chmod 000")
+
+    def test_a_hold_on_a_task_the_outbox_already_answered_reads_stuck(self):
+        self.installed()
+        self.keepawake_at(time.time() - 60)
+        self.hook_ran()
+        tid = "task-1784700000005"
+        self.add_task(tid, "$held", mtime=time.time() - 20 * 60)
+        task_hold.place(self.results, tid)
+        self.assertEqual(self.health()["reason"], keepalive.TASK_HELD, "control")
+        outbox.record_delivered(self.results / ".outbox", tid)  # delivered, archive failed
+        self.assertEqual(self.health()["reason"], keepalive.TASK_NOT_PICKED_UP)
+
+    def test_an_unlistable_task_dir_reports_neither_held_nor_stuck(self):
+        with mock.patch.object(task_fields, "list_open_tasks", side_effect=OSError("gone")):
+            self.assertEqual(keepalive.open_tasks({}, time.time()), (None, None, {}))
 
     def test_the_health_command_survives_a_path_with_a_space(self):
         command = keepalive.health_command("/opt/my tools/ag2-sparrow-hatch")
@@ -3238,6 +3527,1299 @@ class ReplyWithoutAnswering(Base):
         r = self.reply(str(result), "--body", "@chi:ag2.space yes", "--wait", "0")
         self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED, r.stderr)
         self.assertEqual(result.read_text(), "@chi:ag2.space yes")
+
+class Hold(Base):
+    """`hold`: a parked item gets one room line and a hold marker; its result slot stays open."""
+    TID = "task-1784700000001"
+
+    def setUp(self):
+        super().setUp()
+        self.result_file = self.results / f"{self.TID}.txt"
+        self.notice = self.results / f"proactive-hold-{self.TID}.txt"
+        self.mxid = AGENT
+        self.lane_record = True  # the drain has published its lane, as self.mxid
+
+    def env(self):
+        env = py_env(self.home)
+        env.update(AGENT_CONNECT_RESULT_DIR=str(self.results), AGENT_CONNECT_TASK_DIR=str(self.tasks),
+                   AGENT_CONNECT_STATE_DIR=str(self.home / "state"))
+        auth = self.home / "state" / "auth"
+        auth.mkdir(parents=True, exist_ok=True)
+        (auth / "ag2space.json").write_text(json.dumps({"agent_id": self.mxid}))
+        if self.lane_record:
+            (auth / "lane-identity.json").write_text(json.dumps(
+                {"agent_id": self.mxid, "instance": "", "pid": os.getpid(), "ts": time.time()}))
+        return env
+
+    def hold(self, *args, cfg=None, env=None):
+        with mock.patch.object(hatch_cli, "_installed_config", return_value=cfg or {}):
+            return run_main(hatch_cli.main, ["hold", *args], {**self.env(), **(env or {})})
+
+    def line(self):
+        """The body hold queues for the default task."""
+        return f"[channel: !room:ag2.space]\n@bob:ag2.space {hatch_cli.HOLD_NOTICE}\n"
+
+    def delivered_without_receipt(self):
+        """The drain posted the line and archived it, but its best-effort receipt failed."""
+        self.notice.unlink()
+
+    def room_task(self, room):
+        text = task_text(self.TID, "$ev1", "@bob:ag2.space").replace("!room:ag2.space", room)
+        self.add_task(self.TID, "$ev1", text=text)
+
+    def test_one_room_line_and_a_marker_once(self):
+        self.add_task(self.TID, "$ev1")
+        r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_POSTED, r.stderr)
+        body = self.notice.read_text()
+        parsed = parse_markers(body, skip_after_channel=True)
+        self.assertEqual([(a.kind, a.value) for a in parsed.actions],
+                         [("redirect", "!room:ag2.space")])
+        self.assertEqual(parsed.body.strip(), f"@bob:ag2.space {hatch_cli.HOLD_NOTICE}")
+        self.assertEqual(task_hold.read(self.results, self.TID)["reason"], task_hold.OWNER_GO)
+        self.assertFalse(self.result_file.exists(), "the real answer still owns the result slot")
+        outbox.record_delivered(self.results / delivery_destination.RECEIPT_DIR, self.notice.stem)
+        self.notice.unlink()  # the drain delivered, recorded its receipt and archived it
+        r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_POSTED, r.stderr)
+        self.assertIn("already held", r.stdout)
+        self.assertFalse(self.notice.exists(), "a second hold never posts again")
+
+    def test_a_threaded_message_gets_the_line_in_its_thread(self):
+        self.add_task(self.TID, "$ev1", thread_root="$root")
+        self.assertEqual(self.hold(str(self.result_file)).returncode, hatch_cli.REPLY_POSTED)
+        kinds = [(a.kind, a.value) for a in parse_markers(self.notice.read_text()).actions]
+        self.assertIn(("thread", "$root"), kinds)
+
+    def test_an_answered_item_is_not_held(self):
+        self.add_task(self.TID, "$ev1")
+        self.result_file.write_text("done\n")
+        r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_NOT_POSTED)
+        self.assertIsNone(task_hold.read(self.results, self.TID))
+        self.assertFalse(self.notice.exists())
+
+    def test_an_item_the_outbox_already_settled_is_not_held(self):
+        self.add_task(self.TID, "$ev1")
+        outbox.record_delivered(self.results / ".outbox", self.TID)
+        r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_NOT_POSTED)
+        self.assertFalse(self.notice.exists())
+        self.assertIsNone(task_hold.read(self.results, self.TID))
+
+    def test_a_result_file_outside_the_payload_is_refused(self):
+        self.add_task(self.TID, "$ev1")
+        r = self.hold(str(self.home / "elsewhere" / f"{self.TID}.txt"))
+        self.assertEqual(r.returncode, 2)
+        self.assertIsNone(task_hold.read(self.results, self.TID))
+
+    def test_a_room_the_drain_would_not_deliver_to_is_refused(self):
+        for room in ("!missing-server", "#alias:ag2.space", "C0123", "!foreign:other.space"):
+            with self.subTest(room=room):
+                self.room_task(room)
+                r = self.hold(str(self.result_file))
+                self.assertEqual(r.returncode, 2, r.stdout)
+                self.assertIsNone(task_hold.read(self.results, self.TID))
+                self.assertFalse(self.notice.exists())
+
+    def test_the_homeserver_check_is_the_drains_own(self):
+        self.room_task("!foreign:other.space")
+        self.mxid = "@watch-agent:other.space"
+        self.assertEqual(self.hold(str(self.result_file)).returncode, hatch_cli.REPLY_POSTED)
+
+    def test_an_unknown_identity_records_no_hold(self):
+        self.room_task("!foreign:other.space")
+        self.mxid = ""
+        r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED, r.stdout)
+        self.assertIn("can't confirm the room is deliverable", r.stderr)
+        self.assertFalse(self.notice.exists())
+        self.assertIsNone(task_hold.read(self.results, self.TID))
+
+    def test_the_published_lane_wins_over_snapshot_and_environment(self):
+        self.add_task(self.TID, "$ev1")
+        self.mxid = "@watch-agent:other.space"  # what the drain published
+        with mock.patch.object(keepalive, "sparrow_env", side_effect=AssertionError("read")):
+            r = self.hold(str(self.result_file), cfg={"AGENT_MXID": AGENT},
+                          env={"AGENT_MXID": AGENT, "AGENT_ID": AGENT})
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertFalse(self.notice.exists())
+
+    def test_hold_never_reads_another_process_environment(self):
+        self.add_task(self.TID, "$ev1")
+        with mock.patch.object(hatch_cli, "live_lock_holder", return_value=4242), \
+                mock.patch.object(keepalive, "sparrow_env", side_effect=AssertionError("read")):
+            r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_POSTED, r.stderr)
+
+    def test_a_notice_loser_never_installs_a_hold_on_an_unqueued_line(self):
+        self.add_task(self.TID, "$ev1")
+        with mock.patch.object(task_hold, "mark_notice", return_value=None):
+            r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED)
+        self.assertIn("not proven queued", r.stderr)
+        self.assertIsNone(task_hold.read(self.results, self.TID))
+
+    def test_the_owner_failing_after_a_loser_checked_leaves_no_hold(self):
+        self.add_task(self.TID, "$ev1")
+        owner = task_hold.mark_notice(self.results, self.TID)  # caller A, mid-queue
+        r = self.hold(str(self.result_file))  # caller B finds A's record, no line yet
+        self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED)
+        task_hold.clear_notice(self.results, self.TID, owner)  # A's queue write failed
+        self.assertIsNone(task_hold.read(self.results, self.TID))
+        self.assertEqual(self.hold(str(self.result_file)).returncode, hatch_cli.REPLY_POSTED)
+        self.assertTrue(self.notice.exists(), "the retry queues the line A never queued")
+
+    def test_a_publish_that_wrote_nothing_installs_no_hold(self):
+        self.add_task(self.TID, "$ev1")
+        with mock.patch.object(hatch_cli, "_publish_once", return_value=False):
+            r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED)
+        self.assertIsNone(task_hold.read(self.results, self.TID))
+
+    def test_a_line_delivered_without_a_receipt_is_never_queued_again(self):
+        self.add_task(self.TID, "$ev1")
+        with mock.patch.object(task_hold, "place", side_effect=OSError("disk")):
+            self.assertEqual(self.hold(str(self.result_file)).returncode, hatch_cli.REPLY_UNCONFIRMED)
+        self.delivered_without_receipt()
+        r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED)
+        self.assertIn("nothing proves it was delivered", r.stderr)
+        self.assertFalse(self.notice.exists(), "never queued twice")
+        self.assertIsNone(task_hold.read(self.results, self.TID))
+
+    def test_an_unreadable_receipt_fails_closed(self):
+        self.add_task(self.TID, "$ev1")
+        receipts = self.results / delivery_destination.RECEIPT_DIR
+        outbox.record_delivered(receipts, self.notice.stem)
+        for item in receipts.rglob("*.json"):
+            item.write_text("{")
+        r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED)
+        self.assertFalse(self.notice.exists())
+        with mock.patch.object(outbox, "read_item", side_effect=OSError("io")):
+            self.assertEqual(hatch_cli._line_state(self.results, self.TID, self.line()), "unknown")
+
+    def test_a_line_that_failed_to_queue_is_queued_by_the_retry(self):
+        self.add_task(self.TID, "$ev1")
+        with mock.patch.object(hatch_cli, "_publish_once", side_effect=OSError("disk")):
+            self.assertEqual(self.hold(str(self.result_file)).returncode, hatch_cli.REPLY_UNCONFIRMED)
+        self.assertFalse(self.notice.exists())
+        self.assertEqual(self.hold(str(self.result_file)).returncode, hatch_cli.REPLY_POSTED)
+        self.assertTrue(self.notice.exists())
+
+    def test_a_line_the_drain_already_delivered_is_never_queued_again(self):
+        self.add_task(self.TID, "$ev1")
+        outbox.record_delivered(self.results / delivery_destination.RECEIPT_DIR, self.notice.stem,
+                                provider="ag2space-proactive", destination="!room:ag2.space")
+        r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_POSTED, r.stderr)
+        self.assertFalse(self.notice.exists())
+        self.assertIsNotNone(task_hold.read(self.results, self.TID))
+
+    def test_a_line_being_sent_is_not_queued_again(self):
+        self.add_task(self.TID, "$ev1")
+        task_hold.mark_notice(self.results, self.TID)
+        claimed = self.results / f"{self.notice.stem}.sending.4242"
+        claimed.write_text(self.line())
+        self.assertEqual(self.hold(str(self.result_file)).returncode, hatch_cli.REPLY_POSTED)
+        self.assertFalse(self.notice.exists())
+
+    def test_a_pre_existing_empty_line_file_is_not_queued(self):
+        self.add_task(self.TID, "$ev1")
+        self.notice.write_text("")  # an empty proactive-hold-<tid>.txt the drain never sends
+        r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED, r.stdout)
+        self.assertIsNone(task_hold.read(self.results, self.TID))
+        self.assertEqual(hatch_cli._line_state(self.results, self.TID, self.line()), "unknown")
+
+    def test_an_empty_or_foreign_queued_file_is_no_proof(self):
+        for content in ("", "   \n", "something else\n"):
+            with self.subTest(content=content):
+                self.add_task(self.TID, "$ev1")
+                task_hold.mark_notice(self.results, self.TID)
+                self.notice.write_text(content)
+                r = self.hold(str(self.result_file))
+                self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED, r.stdout)
+                self.assertIsNone(task_hold.read(self.results, self.TID))
+                shutil.rmtree(self.results / task_hold.HOLD_DIR)
+                self.notice.unlink()
+
+    def test_a_temp_cleanup_error_after_the_link_still_holds(self):
+        self.add_task(self.TID, "$ev1")
+        real = os.unlink
+
+        def temp_unlink_fails(path, *a, **k):
+            if str(path).startswith(".") and str(path).endswith(".tmp"):
+                raise PermissionError("cleanup")
+            return real(path, *a, **k)
+        with mock.patch.object(task_hold.os, "unlink", side_effect=temp_unlink_fails):
+            r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_POSTED, r.stderr)
+        self.assertIsNotNone(task_hold.read(self.results, self.TID))
+
+    def test_no_published_lane_records_no_hold_even_with_enrollment(self):
+        # Enrollment names the room's server and AGENT_MXID agrees: neither is consulted.
+        for lane in (None, "{", '{"agent_id": 7}', '{"agent_id": ""}'):
+            with self.subTest(lane=lane):
+                self.add_task(self.TID, "$ev1")
+                env = self.env()
+                record = self.home / "state" / "auth" / "lane-identity.json"
+                if lane is None:
+                    record.unlink()
+                else:
+                    record.write_text(lane)
+                with mock.patch.object(hatch_cli, "_installed_config", return_value={}):
+                    r = run_main(hatch_cli.main, ["hold", str(self.result_file)],
+                                 {**env, "AGENT_MXID": AGENT})
+                self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED, r.stdout)
+                self.assertIn("can't confirm the room is deliverable yet", r.stderr)
+                self.assertFalse(self.notice.exists())
+                self.assertIsNone(task_hold.read(self.results, self.TID))
+
+    def test_a_drain_claim_between_listing_and_reading_still_confirms(self):
+        self.add_task(self.TID, "$ev1")
+        real = hatch_cli.result_ready.read_ready_result
+        claimed = []
+
+        def drain_claims_first(path):
+            if Path(path) == self.notice and not claimed:  # listed, then renamed by the drain
+                claimed.append(self.notice.with_suffix(".sending.4242"))
+                os.rename(self.notice, claimed[0])
+            return real(path)
+        with mock.patch.object(hatch_cli.result_ready, "read_ready_result",
+                               side_effect=drain_claims_first):
+            r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_POSTED, r.stderr)
+        self.assertTrue(claimed and claimed[0].exists(), "the line moved to the drain's claim")
+        self.assertIsNotNone(task_hold.read(self.results, self.TID))
+
+    def test_a_claim_handed_back_mid_read_is_found_on_the_rescan(self):
+        self.add_task(self.TID, "$ev1")
+        task_hold.mark_notice(self.results, self.TID)
+        claim = self.notice.with_suffix(".sending.4242")
+        claim.write_text(self.line())
+        real = hatch_cli.result_ready.read_ready_result
+
+        def drain_hands_back(path):
+            if Path(path) == claim and claim.exists():  # the drain hands an unready claim back
+                os.rename(claim, self.notice)
+            return real(path)
+        with mock.patch.object(hatch_cli.result_ready, "read_ready_result",
+                               side_effect=drain_hands_back):
+            self.assertEqual(hatch_cli._line_state(self.results, self.TID, self.line()), "queued")
+
+    def test_only_a_claim_the_drain_makes_counts_as_queued(self):
+        self.add_task(self.TID, "$ev1")
+        task_hold.mark_notice(self.results, self.TID)
+        stray = self.results / f"{self.notice.stem}.sending.x"
+        stray.write_text(self.line())
+        self.assertEqual(hatch_cli._line_state(self.results, self.TID, self.line()), "unknown")
+        r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED, r.stdout)
+        self.assertIsNone(task_hold.read(self.results, self.TID))
+        self.assertEqual(delivery_destination.claim_pid(stray.name), None)
+        self.assertEqual(delivery_destination.claim_pid(
+            delivery_destination.claim_path(self.notice, 4242).name), 4242)
+
+    def test_a_leading_zero_claim_is_neither_queued_nor_live(self):
+        from ag2_sparrow import remote_gateway_bridge as gb
+        self.add_task(self.TID, "$ev1")
+        task_hold.mark_notice(self.results, self.TID)
+        stray = self.results / f"{self.notice.stem}.sending.0{os.getpid()}"
+        stray.write_text(self.line())
+        self.assertEqual(hatch_cli._line_state(self.results, self.TID, self.line()), "unknown")
+        r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED, r.stdout)
+        self.assertIsNone(task_hold.read(self.results, self.TID))
+        with mock.patch.object(gb, "RESULTS_DIR", self.results), mock.patch.object(gb, "_log"), \
+                mock.patch.object(gb, "_pid_alive", wraps=gb._pid_alive) as alive:
+            gb._recover_orphan_proactive()
+        self.assertNotIn(mock.call(os.getpid()), alive.call_args_list,
+                         "recovery never defers a name the drain does not write as a live claim")
+        for suffix in ("0", f"0{os.getpid()}", f"+{os.getpid()}", f" {os.getpid()}", f"{os.getpid()} ", ""):
+            with self.subTest(suffix=suffix):
+                self.assertIsNone(delivery_destination.claim_pid(f"{self.notice.stem}.sending.{suffix}"))
+
+    def test_a_drain_identity_that_differs_from_enrollment_decides_the_room(self):
+        from ag2_sparrow import remote_gateway_bridge as gb
+        self.add_task(self.TID, "$ev1")  # room !room:ag2.space; enrolled as @watch-agent:ag2.space
+        self.lane_record = False  # the drain below publishes it
+        state = self.home / "state"
+        with mock.patch.object(gb, "_STATE", state), \
+                mock.patch.dict(os.environ, {"AGENT_MXID": "@watch-agent:other.space"}):
+            drain_accepts = gb._room_is_deliverable_here("!room:ag2.space")
+        self.assertFalse(drain_accepts, "the live drain refuses the room")
+        r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertFalse(self.notice.exists())
+        self.assertIsNone(task_hold.read(self.results, self.TID))
+
+    def test_a_drain_identity_matching_the_room_still_holds(self):
+        from ag2_sparrow import remote_gateway_bridge as gb
+        self.add_task(self.TID, "$ev1")
+        self.mxid = "@watch-agent:other.space"  # a stale enrollment the live lane overrides
+        self.lane_record = False  # the drain below publishes it
+        with mock.patch.object(gb, "_STATE", self.home / "state"), \
+                mock.patch.dict(os.environ, {"AGENT_MXID": AGENT}):
+            self.assertTrue(gb._room_is_deliverable_here("!room:ag2.space"))
+        r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_POSTED, r.stdout + r.stderr)
+
+    def test_an_adjacent_infix_claim_is_not_this_notices_claim(self):
+        self.add_task(self.TID, "$ev1")
+        task_hold.mark_notice(self.results, self.TID)
+        for infix in ("x", "5"):  # `<stem>.sending.5.sending.<pid>` parses a canonical pid too
+            with self.subTest(infix=infix):
+                fake = self.results / f"{self.notice.stem}.sending.{infix}.sending.{os.getpid()}"
+                fake.write_text(self.line())
+                self.assertEqual(hatch_cli._line_state(self.results, self.TID, self.line()), "unknown")
+                r = self.hold(str(self.result_file))
+                self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED, r.stdout)
+                self.assertIsNone(task_hold.read(self.results, self.TID))
+                base = delivery_destination.claim_base(fake.name)
+                self.assertEqual(base, f"{self.notice.stem}.sending.{infix}")
+                self.assertEqual(delivery_destination.claim_path(
+                    self.results / f"{base}.txt", os.getpid()), fake, "the base is exactly claim_path's")
+                fake.unlink()
+        self.assertEqual(delivery_destination.claim_base(
+            delivery_destination.claim_path(self.notice, 4242).name), self.notice.stem)
+
+    def test_recovery_returns_an_adjacent_infix_claim_to_its_own_name(self):
+        from ag2_sparrow import remote_gateway_bridge as gb
+        for infix in ("x", "5"):
+            live = self.results / f"proactive-b{infix}.sending.{infix}.sending.{os.getpid()}"
+            dead = self.results / f"proactive-a{infix}.sending.{infix}.sending.4242"
+            live.write_text("x")
+            dead.write_text("x")
+        with mock.patch.object(gb, "RESULTS_DIR", self.results), mock.patch.object(gb, "_log"), \
+                mock.patch.object(gb, "_pid_alive", side_effect=lambda pid: pid == os.getpid()):
+            gb._recover_orphan_proactive()
+        for infix in ("x", "5"):
+            with self.subTest(infix=infix):
+                self.assertTrue((self.results / f"proactive-b{infix}.sending.{infix}.sending.{os.getpid()}")
+                                .exists(), "a live pid's claim is left alone")
+                self.assertFalse((self.results / f"proactive-a{infix}.txt").exists(),
+                                 "never a shorter, wrong name")
+                self.assertTrue((self.results / f"proactive-a{infix}.sending.{infix}.txt").exists(),
+                                "a dead claim goes back to the name the drain claimed it from")
+
+    def test_a_pid_past_the_native_range_is_no_claim(self):
+        self.add_task(self.TID, "$ev1")
+        task_hold.mark_notice(self.results, self.TID)
+        for pid in (os.getpid() + 2**32, 2**31):
+            with self.subTest(pid=pid):
+                alias = self.results / f"{self.notice.stem}.sending.{pid}"
+                alias.write_text(self.line())
+                self.assertIsNone(delivery_destination.claim_pid(alias.name))
+                self.assertEqual(hatch_cli._line_state(self.results, self.TID, self.line()), "unknown")
+                r = self.hold(str(self.result_file))
+                self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED, r.stdout)
+                self.assertIsNone(task_hold.read(self.results, self.TID))
+                alias.unlink()
+        self.assertEqual(delivery_destination.claim_pid(f"x.sending.{2**31 - 1}"), 2**31 - 1)
+
+    def test_an_out_of_domain_lane_pid_fails_closed_without_crashing(self):
+        self.lane_record = False
+        for pid in (os.getpid() + 2**32, 2**31):
+            with self.subTest(pid=pid):
+                self.add_task(self.TID, "$ev1")
+                auth = self.home / "state" / "auth"
+                auth.mkdir(parents=True, exist_ok=True)
+                (auth / "lane-identity.json").write_text(
+                    json.dumps({"agent_id": AGENT, "instance": "", "pid": pid, "ts": time.time()}))
+                r = self.hold(str(self.result_file))
+                self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED, r.stdout + r.stderr)
+                self.assertFalse(self.notice.exists())
+                self.assertIsNone(task_hold.read(self.results, self.TID))
+
+    def test_an_unrepresentable_lane_ts_fails_closed_without_crashing(self):
+        from ag2_sparrow import agent_identity
+        self.lane_record = False
+        for ts in (10**400, -10**400):
+            with self.subTest(sign=ts > 0):
+                self.add_task(self.TID, "$ev1")
+                auth = self.home / "state" / "auth"
+                auth.mkdir(parents=True, exist_ok=True)
+                (auth / "lane-identity.json").write_text(
+                    json.dumps({"agent_id": AGENT, "instance": "", "pid": os.getpid(), "ts": ts}))
+                self.assertIsNone(agent_identity.published_lane_record(self.home / "state", ""))
+                r = self.hold(str(self.result_file))
+                self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED, r.stdout + r.stderr)
+                self.assertFalse(self.notice.exists())
+                self.assertIsNone(task_hold.read(self.results, self.TID))
+
+    def test_a_dead_drains_stale_lane_records_no_hold(self):
+        self.add_task(self.TID, "$ev1")  # the live drain is on other.space and refuses this room
+        self.lane_record = False
+        dead = subprocess.Popen([sys.executable, "-c", "pass"])
+        dead.wait()
+        auth = self.home / "state" / "auth"
+        auth.mkdir(parents=True, exist_ok=True)
+        (auth / "lane-identity.json").write_text(json.dumps({"agent_id": AGENT, "instance": "", "pid": dead.pid, "ts": time.time()}))
+        r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED, r.stdout + r.stderr)
+        self.assertFalse(self.notice.exists())
+        self.assertIsNone(task_hold.read(self.results, self.TID))
+
+    def test_a_failed_lane_publish_records_no_hold_on_stale_enrollment(self):
+        from ag2_sparrow import agent_identity, remote_gateway_bridge as gb
+        self.add_task(self.TID, "$ev1")  # enrolled as @watch-agent:ag2.space, the room's server
+        self.lane_record = False
+        writer = getattr(agent_identity, "publish_lane", None)
+        with mock.patch.object(gb, "_STATE", self.home / "state"), mock.patch.object(gb, "_log"), \
+                mock.patch.object(agent_identity, "publish_lane", side_effect=OSError("disk"), create=True), \
+                mock.patch.dict(os.environ, {"AGENT_MXID": "@watch-agent:other.space"}):
+            self.assertFalse(gb._room_is_deliverable_here("!room:ag2.space"))
+        self.assertIsNotNone(writer)
+        r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED, r.stdout + r.stderr)
+        self.assertFalse(self.notice.exists())
+        self.assertIsNone(task_hold.read(self.results, self.TID))
+
+    def test_a_failed_marker_reports_not_confirmed_and_a_retry_does_not_requeue(self):
+        self.add_task(self.TID, "$ev1")
+        with mock.patch.object(task_hold, "place", side_effect=OSError("disk")):
+            r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED)
+        self.assertIn("still reads task-not-picked-up", r.stderr)
+        self.assertIsNone(task_hold.read(self.results, self.TID))
+        queued = self.notice.read_text()
+        with mock.patch.object(hatch_cli, "_publish_once") as publish:
+            r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_POSTED, r.stderr)
+        publish.assert_not_called()
+        self.assertEqual(self.notice.read_text(), queued)
+        self.assertIsNotNone(task_hold.read(self.results, self.TID))
+
+    def test_an_unreadable_marker_in_the_way_is_not_confirmed(self):
+        self.add_task(self.TID, "$ev1")
+        (self.results / task_hold.HOLD_DIR).mkdir()
+        (self.results / task_hold.HOLD_DIR / f"{self.TID}.json").write_text("{")
+        r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED)
+        self.assertIn("unreadable hold marker", r.stderr)
+
+    def test_a_concurrent_hold_that_placed_first_is_already_held(self):
+        self.add_task(self.TID, "$ev1")
+        real = task_hold.place
+
+        def racer(*a, **k):
+            real(*a, **k)
+            return real(*a, **k)
+        with mock.patch.object(task_hold, "place", side_effect=racer):
+            r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_POSTED, r.stderr)
+        self.assertIn("already held", r.stdout)
+
+    def test_a_symlinked_hold_dir_is_refused(self):
+        self.add_task(self.TID, "$ev1")
+        outside = self.home / "outside"
+        outside.mkdir()
+        (self.results / task_hold.HOLD_DIR).symlink_to(outside)
+        r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, 2)
+        self.assertEqual(list(outside.iterdir()), [])
+
+    def test_the_answer_withdraws_the_line_and_ends_the_hold(self):
+        self.add_task(self.TID, "$ev1")
+        self.assertEqual(self.hold(str(self.result_file)).returncode, hatch_cli.REPLY_POSTED)
+        with mock.patch.object(outbox, "_activity_completed", return_value=None):
+            r = run_main(hatch_cli.main, ["reply", str(self.result_file), "--no-send"], self.env())
+        self.assertEqual(r.returncode, hatch_cli.REPLY_POSTED, r.stderr)
+        self.assertFalse(self.notice.exists(), "a hold line never follows the answer")
+        self.assertIsNone(task_hold.read(self.results, self.TID), "the answer ends the hold")
+
+    def test_an_answer_still_posts_when_the_hold_dir_is_refused(self):
+        self.add_task(self.TID, "$ev1")
+        outside = self.home / "outside"
+        outside.mkdir()
+        (self.results / task_hold.HOLD_DIR).symlink_to(outside)
+        with mock.patch.object(outbox, "_activity_completed", return_value=None):
+            r = run_main(hatch_cli.main, ["reply", str(self.result_file), "--no-send"], self.env())
+        self.assertEqual(r.returncode, hatch_cli.REPLY_POSTED, r.stderr)
+
+    def test_a_failed_hold_release_never_fails_a_posted_reply(self):
+        self.add_task(self.TID, "$ev1")
+        self.assertEqual(self.hold(str(self.result_file)).returncode, hatch_cli.REPLY_POSTED)
+        sent = []
+
+        def sparrow():  # the drain sends the reply and records the delivery
+            deadline = time.monotonic() + 10
+            while not self.result_file.exists() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            sent.append(self.result_file.read_text())
+            outbox.record_delivered(self.results / ".outbox", self.TID)
+            self.result_file.unlink()
+        t = threading.Thread(target=sparrow)
+        t.start()
+        self.addCleanup(t.join)
+        with mock.patch.object(outbox, "_activity_completed", return_value=None), \
+                mock.patch.object(task_hold, "release", side_effect=OSError("io")):
+            r = run_main(hatch_cli.main, ["reply", str(self.result_file), "--body",
+                                          "@bob:ag2.space done", "--wait", "10"], self.env())
+        self.assertEqual(r.returncode, hatch_cli.REPLY_POSTED, r.stderr)
+        self.assertIn("posted:", r.stdout)
+        self.assertEqual(sent, ["@bob:ag2.space done"])
+        self.assertIn("could not release the hold", r.stderr)
+
+    def test_a_failed_hold_release_never_fails_a_closed_reply(self):
+        self.add_task(self.TID, "$ev1")
+        self.assertEqual(self.hold(str(self.result_file)).returncode, hatch_cli.REPLY_POSTED)
+        with mock.patch.object(outbox, "_activity_completed", return_value=None), \
+                mock.patch.object(task_hold, "release", side_effect=OSError("io")):
+            r = run_main(hatch_cli.main, ["reply", str(self.result_file), "--no-send"], self.env())
+        self.assertEqual(r.returncode, hatch_cli.REPLY_POSTED, r.stderr)
+        self.assertEqual(self.result_file.read_text(), "[no-send]\n")
+
+    def test_a_failed_release_after_an_answer_mid_hold_is_not_fatal(self):
+        self.add_task(self.TID, "$ev1")
+        with mock.patch.object(hatch_cli, "task_settled", side_effect=[False, True]), \
+                mock.patch.object(task_hold, "release", side_effect=OSError("io")):
+            r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_NOT_POSTED)
+        self.assertFalse(self.notice.exists())
+
+    def test_an_answer_landing_mid_hold_withdraws_the_notice(self):
+        self.add_task(self.TID, "$ev1")
+        with mock.patch.object(hatch_cli, "task_settled", side_effect=[False, True]):
+            r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_NOT_POSTED)
+        self.assertIn("answered meanwhile", r.stderr)
+        self.assertFalse(self.notice.exists())
+        self.assertIsNone(task_hold.read(self.results, self.TID))
+
+
+class TaskHold(unittest.TestCase):
+    """The generic hold record: confined to the literal hold dir, whole or not a hold."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root)
+        self.results = self.root / "results"
+        self.results.mkdir()
+        self.dir = self.results / task_hold.HOLD_DIR
+
+    def test_close_errors_after_the_link_never_undo_a_published_marker(self):
+        real_close, real_link = os.close, os.link
+        linked = []
+
+        def link(*a, **k):
+            real_link(*a, **k)
+            linked.append(True)
+
+        def close_fails_after_link(fd):
+            real_close(fd)
+            if linked:
+                raise OSError("close")
+        with mock.patch.object(task_hold.os, "link", side_effect=link), \
+                mock.patch.object(task_hold.os, "close", side_effect=close_fails_after_link):
+            token = task_hold.place(self.results, "task-1784700000001")
+        self.assertIsNotNone(token)
+        self.assertEqual(task_hold.read(self.results, "task-1784700000001")["token"], token)
+
+    def test_ids_that_could_leave_the_hold_dir_are_refused(self):
+        bad = ("../escaped", "task-../../escaped", "../../task-1", "/tmp/task-1", "task-a/b",
+               "task-a\\b", "task-1\x00", "", "task-blue~../x", "task-~1", "task-..", None)
+        for tid in bad:
+            with self.subTest(tid=tid):
+                with self.assertRaises(ValueError):
+                    task_hold.place(self.results, tid)
+                with self.assertRaises(ValueError):
+                    task_hold.release(self.results, tid)
+                self.assertIsNone(task_hold.read(self.results, tid))
+        self.assertEqual(list(self.root.rglob("*.json")), [])
+
+    def test_a_symlinked_hold_dir_is_never_written_read_or_pruned_through(self):
+        outside = self.root / "outside"
+        outside.mkdir()
+        victim = outside / "task-1784700000002.json"
+        victim.write_text('{"reason": "owner-go", "since": 1, "token": "t"}')
+        self.dir.symlink_to(outside)
+        with self.assertRaises(ValueError):
+            task_hold.place(self.results, "task-1784700000001")
+        self.assertIsNone(task_hold.read(self.results, "task-1784700000002"))
+        with self.assertRaises(ValueError):
+            task_hold.prune(self.results, self.root)
+        self.assertEqual(sorted(p.name for p in outside.iterdir()), [victim.name])
+
+    def test_a_file_in_place_of_the_hold_dir_is_refused(self):
+        self.dir.write_text("")
+        with self.assertRaises(ValueError):
+            task_hold.place(self.results, "task-1784700000001")
+
+    def test_marker_symlinks_inside_or_outside_are_not_holds(self):
+        outside = self.root / "outside.json"
+        outside.write_text('{"reason": "owner-go", "since": 1, "token": "t"}')
+        self.assertIsNotNone(task_hold.place(self.results, "task-1784700000002", now=1))
+        (self.dir / "task-1784700000001.json").symlink_to(self.dir / "task-1784700000002.json")
+        (self.dir / "task-1784700000003.json").symlink_to(outside)
+        for tid in ("task-1784700000001", "task-1784700000003"):
+            self.assertIsNone(task_hold.read(self.results, tid), tid)
+            self.assertIsNone(task_hold.place(self.results, tid), "never written through")
+        self.assertTrue(task_hold.release(self.results, "task-1784700000001"))
+        self.assertIsNotNone(task_hold.read(self.results, "task-1784700000002"),
+                             "releasing an alias never removes its target")
+        self.assertTrue(outside.exists())
+
+    def test_a_named_instance_id_is_a_task_id(self):
+        token = task_hold.place(self.results, "task-blue~task-1784700000004", now=5)
+        self.assertEqual(task_hold.read(self.results, "task-blue~task-1784700000004"),
+                         {"reason": task_hold.OWNER_GO, "since": 5, "token": token})
+
+    def test_only_a_whole_well_formed_marker_is_a_hold(self):
+        tid = "task-1784700000001"
+        self.assertIsNotNone(task_hold.place(self.results, tid, now=5))
+        self.assertIsNone(task_hold.place(self.results, tid), "one marker")
+        path = self.dir / f"{tid}.json"
+        for torn in ("", "{", "[]", "\xff", '{"reason": "owner-go", "since": 1}',
+                     '{"reason": "owner-go", "since": true, "token": "t"}',
+                     '{"reason": "owner-go", "state": "held", "since": NaN, "token": "t"}',
+                     '{"reason": "owner-go", "since": -Infinity, "token": "t"}',
+                     '{"reason": "owner-go", "since": 1e300, "token": "t"}',
+                     '{"reason": "Bad Reason", "since": 1, "token": "t"}', "x" * 5000):
+            path.write_bytes(torn.encode("utf-8", "surrogateescape") if torn != "\xff"
+                             else b"\xff")
+            self.assertIsNone(task_hold.read(self.results, tid), repr(torn[:40]))
+        path.unlink()
+        path.mkdir()
+        self.assertIsNone(task_hold.read(self.results, tid), "a directory is not a marker")
+        path.rmdir()
+        if os.geteuid() != 0:
+            task_hold.place(self.results, tid)
+            path.chmod(0)
+            self.addCleanup(path.chmod, 0o600)
+            self.assertIsNone(task_hold.read(self.results, tid), "chmod 000")
+
+    def test_non_finite_or_unbounded_since_is_refused_on_write(self):
+        for since in (float("nan"), float("inf"), -1, 1e300):
+            with self.assertRaises(ValueError):
+                task_hold.place(self.results, "task-1784700000001", now=since)
+
+    def test_release_with_a_token_removes_only_that_hold(self):
+        tid = "task-1784700000001"
+        old = task_hold.place(self.results, tid)
+        task_hold.release(self.results, tid)
+        new = task_hold.place(self.results, tid)
+        self.assertFalse(task_hold.release(self.results, tid, old), "never erases a newer hold")
+        self.assertEqual(task_hold.read(self.results, tid)["token"], new)
+        self.assertTrue(task_hold.release(self.results, tid, new))
+        self.assertFalse(task_hold.release(self.results, tid))
+
+    def test_a_failed_write_leaves_no_marker_and_no_temp(self):
+        tid = "task-1784700000001"
+        with mock.patch.object(task_hold.os, "fsync", side_effect=OSError("disk")):
+            with self.assertRaises(OSError):
+                task_hold.place(self.results, tid)
+        self.assertIsNone(task_hold.read(self.results, tid))
+        self.assertEqual(list(self.dir.iterdir()), [])
+
+    def test_an_unreadable_marker_file_is_not_a_hold(self):
+        task_hold.place(self.results, "task-1784700000001")
+        with mock.patch.object(task_hold.os, "read", side_effect=OSError("io")):
+            self.assertIsNone(task_hold.read(self.results, "task-1784700000001"))
+
+    def test_a_temp_that_was_never_created_leaves_nothing(self):
+        real = os.open
+
+        def refuse_temp(path, *a, **k):
+            if str(path).startswith("."):
+                raise PermissionError("no")
+            return real(path, *a, **k)
+        with mock.patch.object(task_hold.os, "open", side_effect=refuse_temp):
+            with self.assertRaises(PermissionError):
+                task_hold.place(self.results, "task-1784700000001")
+        self.assertEqual(list(self.dir.iterdir()), [])
+
+    def successor_during(self, tid, call):
+        """Patch os.`call` so that, on its first use by release, another thread retires the
+        old hold and places its own, given a moment to finish before release goes on."""
+        real = getattr(os, call)
+        new, threads = [], []
+
+        def successor():
+            task_hold.release(self.results, tid)
+            new.append(task_hold.place(self.results, tid))
+
+        def hooked(*a, **k):
+            if not threads:
+                threads.append(threading.Thread(target=successor))
+                threads[0].start()
+                threads[0].join(0.5)
+            return real(*a, **k)
+        return mock.patch.object(task_hold.os, call, side_effect=hooked), new, threads
+
+    def test_an_old_token_never_erases_a_successor_placed_mid_release(self):
+        tid = "task-1784700000001"
+        old = task_hold.place(self.results, tid)
+        patch, new, threads = self.successor_during(tid, "read")
+        with patch:
+            task_hold.release(self.results, tid, old)
+        threads[0].join()
+        self.assertEqual((task_hold.read(self.results, tid) or {}).get("token"), new[0])
+        self.assertEqual(sorted(n for n in os.listdir(self.dir) if n != task_hold.LOCK_NAME),
+                         [f"{tid}.json"], "nothing hidden")
+
+    def test_a_successor_between_the_check_and_the_unlink_survives(self):
+        tid = "task-1784700000001"
+        old = task_hold.place(self.results, tid)
+        patch, new, threads = self.successor_during(tid, "unlink")
+        with patch:
+            task_hold.release(self.results, tid, old)
+        threads[0].join()
+        self.assertIsNotNone(new[0])
+        self.assertEqual((task_hold.read(self.results, tid) or {}).get("token"), new[0],
+                         "the old token's release removed only the old hold")
+
+    def test_a_symlinked_lock_file_is_refused(self):
+        self.dir.mkdir()
+        (self.dir / task_hold.LOCK_NAME).symlink_to(self.root / "elsewhere")
+        with self.assertRaises(OSError):
+            task_hold.place(self.results, "task-1784700000001")
+        self.assertFalse((self.root / "elsewhere").exists())
+
+    def test_a_stale_releaser_dying_mid_release_hides_nothing(self):
+        tid = "task-1784700000001"
+        token = task_hold.place(self.results, tid)
+        with mock.patch.object(task_hold.os, "unlink", side_effect=RuntimeError("crash")):
+            self.assertFalse(task_hold.release(self.results, tid, "an-old-token"),
+                             "a stale token stops before touching the name")
+            with self.assertRaises(RuntimeError):
+                task_hold.release(self.results, tid, token)
+        self.assertEqual(task_hold.read(self.results, tid)["token"], token,
+                         "still visible under its own name")
+        self.assertEqual(sorted(n for n in os.listdir(self.dir) if n != task_hold.LOCK_NAME),
+                         [f"{tid}.json"])
+
+    def test_a_tokened_release_of_an_unreadable_or_foreign_marker_removes_nothing(self):
+        tid = "task-1784700000001"
+        path = self.dir / f"{tid}.json"
+        task_hold.place(self.results, tid)
+        for body in (b"{", b"[]"):
+            path.write_bytes(body)
+            self.assertFalse(task_hold.release(self.results, tid, "t"))
+            self.assertTrue(path.exists())
+        with mock.patch.object(task_hold.os, "read", side_effect=OSError("io")):
+            self.assertFalse(task_hold.release(self.results, tid, "t"))
+        path.unlink()
+        path.symlink_to(self.root)
+        self.assertFalse(task_hold.release(self.results, tid, "t"))
+        self.assertTrue(path.is_symlink())
+
+    def test_a_failed_dir_fsync_after_the_link_still_reports_the_published_marker(self):
+        real = os.fsync
+        calls = []
+
+        def dir_fsync_fails(fd):
+            calls.append(fd)
+            if len(calls) > 1:
+                raise OSError("dir fsync")
+            return real(fd)
+        with mock.patch.object(task_hold.os, "fsync", side_effect=dir_fsync_fails):
+            token = task_hold.place(self.results, "task-1784700000001")
+        self.assertIsNotNone(token)
+        self.assertEqual(task_hold.read(self.results, "task-1784700000001")["token"], token)
+
+    def test_a_mismatched_token_leaves_the_marker(self):
+        tid = "task-1784700000001"
+        token = task_hold.place(self.results, tid)
+        self.assertFalse(task_hold.release(self.results, tid, "not-the-token"))
+        self.assertEqual(task_hold.read(self.results, tid)["token"], token)
+        self.assertEqual(sorted(os.listdir(self.dir)), [task_hold.LOCK_NAME, f"{tid}.json"])
+
+    def test_a_vanished_hold_dir_never_writes_into_the_cwd(self):
+        cwd = self.root / "cwd"
+        cwd.mkdir()
+        self.addCleanup(os.chdir, os.getcwd())
+        os.chdir(cwd)
+        with mock.patch.object(task_hold, "_open_dir", return_value=None):
+            with self.assertRaises(FileNotFoundError):
+                task_hold.place(self.results, "task-1784700000001")
+            with self.assertRaises(FileNotFoundError):
+                task_hold.mark_notice(self.results, "task-1784700000001")
+        self.assertEqual(list(cwd.iterdir()), [])
+
+    def test_a_short_write_still_writes_the_whole_marker(self):
+        real = os.write
+        with mock.patch.object(task_hold.os, "write", side_effect=lambda fd, b: real(fd, bytes(b[:8]))):
+            token = task_hold.place(self.results, "task-1784700000001", now=5)
+        self.assertEqual(task_hold.read(self.results, "task-1784700000001"),
+                         {"reason": "owner-go", "since": 5, "token": token})
+
+    def test_the_notice_record_is_once_and_confined(self):
+        tid = "task-1784700000001"
+        self.assertFalse(task_hold.notice_marked(self.results, tid))
+        owner = task_hold.mark_notice(self.results, tid)
+        self.assertIsNotNone(owner)
+        self.assertIsNone(task_hold.mark_notice(self.results, tid))
+        self.assertTrue(task_hold.notice_marked(self.results, tid))
+        task_hold.clear_notice(self.results, tid, "someone-else")
+        self.assertTrue(task_hold.notice_marked(self.results, tid), "only its owner clears it")
+        task_hold.clear_notice(self.results, tid, owner)
+        task_hold.clear_notice(self.results, tid, owner)
+        self.assertFalse(task_hold.notice_marked(self.results, tid))
+        with mock.patch.object(task_hold.os, "stat", side_effect=PermissionError("no")):
+            self.assertTrue(task_hold.notice_marked(self.results, tid), "unreadable counts as queued")
+        shutil.rmtree(self.dir)
+        self.dir.symlink_to(self.root)
+        self.assertTrue(task_hold.notice_marked(self.results, tid), "a refused dir counts as queued")
+
+    def test_a_temp_cleanup_error_after_the_link_is_success_and_closes_the_dir(self):
+        real_unlink, real_close = os.unlink, os.close
+        closed = []
+
+        def temp_unlink_fails(path, *a, **k):
+            if str(path).endswith(".tmp"):
+                raise PermissionError("cleanup")
+            return real_unlink(path, *a, **k)
+
+        def tracking_close(fd):
+            closed.append(fd)
+            return real_close(fd)
+        real_held, opened = task_hold._held_dir, []
+
+        def tracking_held(*a, **k):
+            opened.append(real_held(*a, **k))
+            return opened[-1]
+        with mock.patch.object(task_hold.os, "unlink", side_effect=temp_unlink_fails), \
+                mock.patch.object(task_hold.os, "close", side_effect=tracking_close), \
+                mock.patch.object(task_hold, "_held_dir", side_effect=tracking_held):
+            token = task_hold.place(self.results, "task-1784700000001")
+        self.assertIsNotNone(token)
+        self.assertEqual(task_hold.read(self.results, "task-1784700000001")["token"], token)
+        self.assertIn(opened[0], closed, "the dir fd is closed")
+
+    def test_a_dir_swapped_while_opened_is_refused(self):
+        self.dir.mkdir()
+        with mock.patch.object(task_hold.os, "fstat",
+                               side_effect=lambda fd: os.stat_result((0,) * 10)):
+            with self.assertRaises(ValueError):
+                task_hold.place(self.results, "task-1784700000001")
+
+    def test_bad_reasons_are_refused(self):
+        with self.assertRaises(ValueError):
+            task_hold.place(self.results, "task-1784700000001", reason="Owner Go")
+
+    def test_prune_keeps_open_tasks_and_ignores_foreign_names(self):
+        tasks = self.root / "tasks"
+        tasks.mkdir()
+        (tasks / "task-1784700000001.txt").write_text("x")
+        task_hold.place(self.results, "task-1784700000001")
+        task_hold.place(self.results, "task-1784700000002")
+        stray = self.dir / "notes.json"
+        stray.write_text("{}")
+        with mock.patch.object(task_hold.os, "unlink", side_effect=FileNotFoundError):
+            task_hold.prune(self.results, tasks)  # a racing prune already removed it
+        task_hold.prune(self.results, tasks)
+        self.assertIsNotNone(task_hold.read(self.results, "task-1784700000001"))
+        self.assertIsNone(task_hold.read(self.results, "task-1784700000002"))
+        self.assertTrue(stray.exists())
+        task_hold.prune(self.root / "absent", tasks)
+        self.assertFalse(task_hold.release(self.root / "absent", "task-1784700000001"))
+
+class DeliveryDestination(unittest.TestCase):
+    """One owner for where the drain posts: the drain and `hold` both delegate here."""
+
+    def test_drain_room_applies_route_and_homeserver(self):
+        cases = {"[channel: !r:ag2.space]\nhi": "!r:ag2.space",
+                 "[channel: !r:other.space]\nhi": None, "[channel: !nohost]\nhi": None,
+                 "[channel: C0123]\nhi": None, "[channel: !r:ag2.space]\n[no-send]": None,
+                 "plain": None}
+        for body, want in cases.items():
+            self.assertEqual(delivery_destination.drain_room(body, "ag2.space"), want, body)
+        self.assertEqual(delivery_destination.drain_room("[channel: !r:other.space]\nhi", ""),
+                         "!r:other.space", "identity unknown: posted, as the drain does")
+        self.assertEqual(delivery_destination.homeserver_of("@a:ag2.space:8448"), "ag2.space:8448")
+        self.assertEqual(delivery_destination.homeserver_of("a"), "")
+        self.assertFalse(delivery_destination.deliverable_here("!nohost", "ag2.space"))
+
+    def test_the_drain_receipt_is_where_hold_looks(self):
+        from ag2_sparrow import remote_gateway_bridge as gb
+        results = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, results)
+        with mock.patch.object(gb, "RESULTS_DIR", results):
+            gb._record_proactive_receipt("proactive-hold-task-1784700000001", "!r:ag2.space")
+        self.assertEqual(hatch_cli._line_state(results, "task-1784700000001", "x"), "delivered")
+
+    def test_the_drain_claims_and_recovers_by_this_grammar(self):
+        from ag2_sparrow import remote_gateway_bridge as gb
+        results = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, results)
+        (results / "proactive-a.sending.x").write_text("x")
+        (results / "proactive-b.sending.4242").write_text("x")
+        with mock.patch.object(gb, "RESULTS_DIR", results), \
+                mock.patch.object(gb, "_pid_alive", return_value=False), \
+                mock.patch.object(gb, "_log"), \
+                mock.patch.object(delivery_destination, "claim_pid",
+                                  wraps=delivery_destination.claim_pid) as grammar:
+            gb._recover_orphan_proactive()
+        self.assertTrue(grammar.called)
+        self.assertTrue((results / "proactive-a.sending.x").exists(), "never a drain claim")
+        self.assertTrue((results / "proactive-b.txt").exists(), "a dead pid's claim recovers")
+
+    def lane_state(self):
+        state = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, state)
+        return state
+
+    def test_hold_reads_only_the_published_lane(self):
+        state = self.lane_state()
+        cfg = {"STATE_DIR": str(state)}
+        self.assertEqual(hatch_cli._lane_homeserver(cfg, ""), "")
+        (state / "auth").mkdir()
+        (state / "auth" / "ag2space.json").write_text('{"agent_id": "@e:enrolled.space"}')
+        self.assertEqual(hatch_cli._lane_homeserver(cfg, ""), "", "no enrollment fallback")
+        lane = state / "auth" / "lane-identity.json"
+        lane.write_text(json.dumps({"agent_id": "@l:lane.space", "instance": "", "pid": os.getpid(), "ts": time.time()}))
+        self.assertEqual(hatch_cli._lane_homeserver(cfg, ""), "lane.space")
+
+    def test_one_bounded_number_reader_for_persisted_values(self):
+        from ag2_sparrow.persisted_number import bounded_number
+        for value, want in ((5, 5.0), (5.5, 5.5), (-10, -10.0), (11, None), (10**400, None),
+                            (-10**400, None), (float("inf"), None), (float("nan"), None),
+                            (True, None), ("5", None), (None, None)):
+            with self.subTest(value=str(value)[:12]):
+                self.assertEqual(bounded_number(value, -10, 10), want)
+
+    def test_every_pid_predicate_rejects_the_same_out_of_domain_values(self):
+        from ag2_sparrow import agent_identity, outbox
+        state = self.lane_state()
+        (state / "auth").mkdir()
+        for pid in (2**31, os.getpid() + 2**32, -1, True):
+            with self.subTest(pid=pid):
+                self.assertTrue(hatch_cli.process_gone(pid), "Hatch: no live owner")
+                if not isinstance(pid, bool):
+                    self.assertIsNone(delivery_destination.claim_pid(f"proactive-a.sending.{pid}"))
+                (state / "auth" / "lane-identity.json").write_text(
+                    json.dumps({"agent_id": "@a:ag2.space", "instance": "", "pid": pid, "ts": time.time()}))
+                self.assertIsNone(agent_identity.published_lane_record(state, ""))
+                self.assertIsNone(outbox.valid_pid(pid))
+        self.assertEqual(outbox.valid_pid(outbox.PID_MAX), outbox.PID_MAX)
+
+    def test_a_lane_record_past_the_freshness_bound_is_no_lane(self):
+        state = self.lane_state()
+        (state / "auth").mkdir()
+        lane, now = state / "auth" / "lane-identity.json", time.time()
+        for ts, server in ((now - 29, "ag2.space"), (now - 31, ""), (now + 60, ""),
+                           (float("inf"), ""), (float("nan"), ""), (float("-inf"), "")):
+            with self.subTest(age=now - ts):
+                lane.write_text(json.dumps({"agent_id": "@a:ag2.space", "instance": "",
+                                            "pid": os.getpid(), "ts": ts}))
+                self.assertEqual(hatch_cli._lane_homeserver({"STATE_DIR": str(state)}, ""), server)
+
+    def test_a_drain_that_cannot_write_lets_its_lane_go_stale(self):
+        from ag2_sparrow import agent_identity, remote_gateway_bridge as gb
+        if os.geteuid() == 0:
+            self.skipTest("root ignores the permission bits this relies on")
+        state = self.lane_state()
+        agent_identity.publish_lane(state, "", "@old:ag2.space")  # this process's old lane
+        auth, record = state / "auth", state / "auth" / "lane-identity.json"
+        record.chmod(0o400)
+        auth.chmod(0o500)
+        self.addCleanup(record.chmod, 0o600)
+        self.addCleanup(auth.chmod, 0o700)
+        with mock.patch.object(gb, "_STATE", state), mock.patch.object(gb, "_log"), \
+                mock.patch.dict(os.environ, {"AGENT_MXID": "@new:other.space"}):
+            self.assertFalse(gb._room_is_deliverable_here("!room:ag2.space"))
+        self.assertEqual(json.loads(record.read_text())["agent_id"], "@old:ag2.space", "nothing could change it")
+        later = time.time() + 31
+        with mock.patch.object(agent_identity.time, "time", return_value=later):
+            self.assertEqual(hatch_cli._lane_homeserver({"STATE_DIR": str(state)}, ""), "",
+                             "the unrefreshed record has gone stale")
+
+    def test_the_drain_refreshes_its_lane_as_a_heartbeat(self):
+        from ag2_sparrow import agent_identity, remote_gateway_bridge as gb
+        state = self.lane_state()
+        with mock.patch.object(gb, "_STATE", state), mock.patch.dict(os.environ, {"AGENT_MXID": "@a:ag2.space"}):
+            gb._lane_identity()
+            first = json.loads((state / "auth" / "lane-identity.json").read_text())["ts"]
+            gb._lane_identity()
+            self.assertEqual(json.loads((state / "auth" / "lane-identity.json").read_text())["ts"], first,
+                             "no rewrite while it is fresh")
+            with mock.patch.object(agent_identity.time, "time", return_value=first + 11):
+                gb._lane_identity()
+        self.assertEqual(json.loads((state / "auth" / "lane-identity.json").read_text())["ts"], first + 11)
+
+    def test_auth_removed_after_its_mkdir_never_reaches_the_cwd(self):
+        from ag2_sparrow import agent_identity
+        for always in (False, True):
+            with self.subTest(always=always):
+                state, cwd = self.lane_state(), self.lane_state()
+                auth = state / "auth"
+                real, removed, busy = os.lstat, [], []
+
+                def lstat(path, *a, **k):
+                    if not busy and os.fspath(path) == os.fspath(auth) and (always or not removed):
+                        removed.append(True)
+                        busy.append(True)
+                        try:
+                            shutil.rmtree(auth, ignore_errors=True)
+                        finally:
+                            busy.clear()
+                    return real(path, *a, **k)
+                here = os.getcwd()
+                os.chdir(cwd)
+                try:
+                    with mock.patch("os.lstat", side_effect=lstat):
+                        if always:
+                            with self.assertRaises(OSError):
+                                agent_identity.publish_lane(state, "", "@a:ag2.space")
+                        else:
+                            agent_identity.publish_lane(state, "", "@a:ag2.space")
+                finally:
+                    os.chdir(here)
+                self.assertEqual(sorted(p.name for p in cwd.iterdir()), [], "nothing written to the CWD")
+                self.assertTrue(removed)
+                if not always:
+                    self.assertEqual(agent_identity.published_lane_record(state, "")["agent_id"], "@a:ag2.space")
+        self.assertRaises(ValueError, delivery_destination.claim_path, Path("p.txt"), 2**31)
+        self.assertRaises(ValueError, delivery_destination.claim_path, Path("p.txt"), True)
+
+    def test_a_stale_dead_or_foreign_lane_record_is_no_lane(self):
+        state = self.lane_state()
+        cfg = {"STATE_DIR": str(state)}
+        (state / "auth").mkdir()
+        lane = state / "auth" / "lane-identity.json"
+        dead = subprocess.Popen([sys.executable, "-c", "pass"])
+        dead.wait()
+        for rec in ({"agent_id": "@old:ag2.space", "instance": "", "pid": dead.pid, "ts": time.time()},
+                    {"agent_id": "@old:ag2.space", "instance": "dev", "pid": os.getpid(), "ts": time.time()},
+                    {"agent_id": "@old:ag2.space", "pid": os.getpid(), "ts": time.time()},
+                    {"agent_id": "@old:ag2.space", "instance": "", "pid": True, "ts": time.time()}):
+            with self.subTest(rec=rec):
+                lane.write_text(json.dumps(rec))
+                self.assertEqual(hatch_cli._lane_homeserver(cfg, ""), "")
+        lane.write_text(json.dumps({"agent_id": "@l:ag2.space", "instance": "", "pid": os.getpid(), "ts": time.time()}))
+        with mock.patch.object(hatch_cli, "_lock_record", return_value={"pid": 4242}), \
+                mock.patch.object(hatch_cli, "live_lock_holder", return_value=4242):
+            self.assertEqual(hatch_cli._lane_homeserver(cfg, ""), "", "the lock names another live drain")
+        with mock.patch.object(hatch_cli, "_lock_record", return_value={"pid": os.getpid()}), \
+                mock.patch.object(hatch_cli, "live_lock_holder", return_value=os.getpid()):
+            self.assertEqual(hatch_cli._lane_homeserver(cfg, ""), "ag2.space")
+
+    def test_two_instances_sharing_state_keep_their_own_lanes(self):
+        from ag2_sparrow import agent_identity, remote_gateway_bridge as gb
+        state = self.lane_state()
+        for inst, mxid in (("blue", "@blue:blue.space"), ("green", "@green:green.space"),
+                           ("blue", "@blue:blue.space")):
+            with mock.patch.object(gb, "_STATE", state), mock.patch.object(gb, "GATEWAY_INSTANCE", inst), \
+                    mock.patch.dict(os.environ, {"AGENT_MXID": mxid}):
+                gb._room_is_deliverable_here("!r:blue.space")
+        for inst, server in (("blue", "blue.space"), ("green", "green.space"), ("", "")):
+            with self.subTest(instance=inst):
+                self.assertEqual(hatch_cli._lane_homeserver({"STATE_DIR": str(state)}, inst), server)
+        self.assertEqual(sorted(p.name for p in (state / "auth").iterdir() if p.suffix == ".json"),
+                         ["lane-identity.blue.json", "lane-identity.green.json"])
+
+    def test_concurrent_publishes_leave_one_whole_record(self):
+        from ag2_sparrow import agent_identity
+        state = self.lane_state()
+        ids = [f"@a{i}:lane.space" for i in range(8)]
+        seen, stop = [], threading.Event()
+
+        def read():
+            while not stop.is_set():
+                path = state / "auth" / "lane-identity.json"
+                if path.exists():
+                    seen.append(agent_identity.published_lane_record(state, ""))
+
+        reader = threading.Thread(target=read)
+        reader.start()
+        writers = [threading.Thread(target=lambda m=m: [agent_identity.publish_lane(state, "", m)
+                                                         for _ in range(25)]) for m in ids]
+        for t in writers:
+            t.start()
+        for t in writers:
+            t.join()
+        stop.set()
+        reader.join()
+        self.assertNotIn(None, seen, "a reader never sees a partial record")
+        self.assertIn(agent_identity.published_lane_record(state, "")["agent_id"], ids)
+        self.assertEqual(sorted(p.name for p in (state / "auth").iterdir()),
+                         ["lane-identity.json", "lane-identity.lock"])
+
+    def test_the_drain_publishes_on_a_pass_with_no_proactive_file_and_at_start(self):
+        import inspect
+        from ag2_sparrow import agent_identity, remote_gateway_bridge as gb
+        state, results = self.lane_state(), self.lane_state()
+        with mock.patch.object(gb, "_STATE", state), mock.patch.object(gb, "RESULTS_DIR", results), \
+                mock.patch.dict(os.environ, {"AGENT_MXID": "@a:lane.space"}):
+            gb._post_proactive()
+        self.assertEqual(agent_identity.published_lane_record(state, "")["agent_id"], "@a:lane.space")
+        main = inspect.getsource(gb.main)
+        self.assertLess(main.index("_lane_identity()"), main.index("_start_outbound_worker("),
+                        "published at drain start, before the first pass")
+        self.assertIn("atexit.register(_retract_own_lane)", main, "retracted at clean exit")
+
+    def test_the_published_lane_record_never_holds_a_token(self):
+        from ag2_sparrow import agent_identity, remote_gateway_bridge as gb
+        state = self.lane_state()
+        secret = "lane-secret-token-ZZZZ9999"
+        with mock.patch.object(gb, "_STATE", state), mock.patch.object(gb, "TOKEN", secret), \
+                mock.patch.dict(os.environ, {"AGENT_MXID": "@a:lane.space", "REMOTE_TASK_TOKEN": secret}):
+            gb._room_is_deliverable_here("!r:lane.space")
+        raw = (state / "auth" / "lane-identity.json").read_text()
+        self.assertNotIn(secret, raw)
+        rec = json.loads(raw)
+        self.assertEqual(set(rec), {"agent_id", "instance", "pid", "ts"})
+        self.assertEqual((rec["agent_id"], rec["instance"], rec["pid"]), ("@a:lane.space", "", os.getpid()))
+        self.assertEqual(hatch_cli._lane_homeserver({"STATE_DIR": str(state)}, ""), "lane.space")
+        self.assertEqual(sorted(p.name for p in (state / "auth").iterdir()),
+                         ["lane-identity.json", "lane-identity.lock"])
+
+    @staticmethod
+    def failing_first_replace():
+        real, calls = os.replace, []
+
+        def replace(*a, **k):
+            calls.append(a)
+            if len(calls) == 1:
+                raise OSError("disk")
+            return real(*a, **k)
+        return replace
+
+    @staticmethod
+    def refusing_record_unlink(name="lane-identity.json"):
+        real = os.unlink
+
+        def unlink(path, *a, **k):
+            if os.path.basename(os.fspath(path)) == name:
+                raise PermissionError("unlink")
+            return real(path, *a, **k)
+        return unlink
+
+    def test_a_failed_publish_or_a_clean_exit_retracts_the_record(self):
+        from ag2_sparrow import agent_identity, remote_gateway_bridge as gb
+        state = self.lane_state()
+        agent_identity.publish_lane(state, "", "@old:other.space")
+        with mock.patch.object(gb, "_STATE", state), mock.patch.object(gb, "_log"), \
+                mock.patch("os.replace", side_effect=self.failing_first_replace()), \
+                mock.patch.dict(os.environ, {"AGENT_MXID": "@new:ag2.space"}):
+            gb._room_is_deliverable_here("!r:ag2.space")
+        self.assertIsNone(agent_identity.published_lane_record(state, ""), "readers fail closed")
+        own = agent_identity.publish_lane(state, "", "@a:ag2.space")
+        agent_identity.retract_lane(state, "", os.getpid() + 1)
+        self.assertIsNotNone(agent_identity.published_lane_record(state, ""), "only its publisher retracts it")
+        agent_identity.retract_lane(state, "", own["pid"], own["ts"] + 1)
+        self.assertIsNotNone(agent_identity.published_lane_record(state, ""), "nor a later record of its pid")
+        agent_identity.retract_lane(state, "", own["pid"], own["ts"])
+        self.assertIsNone(agent_identity.published_lane_record(state, ""))
+
+    def test_a_failed_publish_and_a_failed_unlink_read_as_missing(self):
+        from ag2_sparrow import agent_identity, remote_gateway_bridge as gb
+        state = self.lane_state()
+        agent_identity.publish_lane(state, "", "@old:ag2.space")  # this process's old lane
+        with mock.patch.object(gb, "_STATE", state), mock.patch.object(gb, "_log"), \
+                mock.patch("os.replace", side_effect=self.failing_first_replace()), \
+                mock.patch("os.unlink", side_effect=self.refusing_record_unlink()), \
+                mock.patch.dict(os.environ, {"AGENT_MXID": "@new:other.space"}):
+            drain_accepts = gb._room_is_deliverable_here("!room:ag2.space")
+        self.assertFalse(drain_accepts)
+        self.assertEqual(hatch_cli._lane_homeserver({"STATE_DIR": str(state)}, ""), "",
+                         "the predicates agree: Hatch has no lane either")
+
+    def test_a_failed_publish_whose_tombstone_also_fails_empties_the_record(self):
+        from ag2_sparrow import agent_identity
+        state = self.lane_state()
+        agent_identity.publish_lane(state, "", "@old:ag2.space")
+        with mock.patch("os.replace", side_effect=OSError("disk")), \
+                mock.patch("os.unlink", side_effect=self.refusing_record_unlink()), \
+                self.assertRaises(OSError):
+            agent_identity.publish_lane(state, "", "@new:other.space")
+        self.assertIsNone(agent_identity.published_lane_record(state, ""))
+        self.assertEqual((state / "auth" / "lane-identity.json").read_bytes(), b"")
+
+    def interleave(self, first, successor):
+        """Run `first` until it is about to unlink or replace the record, run `successor`, then let
+        `first` finish; the record must be the successor's."""
+        from ag2_sparrow import agent_identity
+        real_unlink, real_replace = os.unlink, os.replace
+        paused, go, holder = threading.Event(), threading.Event(), {}
+
+        def pause(path):
+            if threading.current_thread() is holder.get("t") and \
+                    os.path.basename(os.fspath(path)) == "lane-identity.json":
+                paused.set()
+                go.wait(5)
+                return True
+            return False
+
+        def unlink(path, *a, **k):
+            pause(path)
+            return real_unlink(path, *a, **k)
+
+        def replace(src, dst, *a, **k):
+            if pause(dst):
+                raise OSError("disk")
+            return real_replace(src, dst, *a, **k)
+        with mock.patch("os.unlink", side_effect=unlink), mock.patch("os.replace", side_effect=replace):
+            t = holder["t"] = threading.Thread(target=first)
+            t.start()
+            self.assertTrue(paused.wait(5))
+            succ = threading.Thread(target=successor)
+            succ.start()
+            succ.join(0.5)  # finishes only when nothing serializes it behind `first`
+            go.set()
+            t.join(5)
+            succ.join(5)
+        return agent_identity
+
+    def test_a_successor_published_during_a_stale_retract_survives(self):
+        from ag2_sparrow import agent_identity
+        state = self.lane_state()
+        agent_identity.publish_lane(state, "", "@old:ag2.space")
+        paused, go, holder = threading.Event(), threading.Event(), {}
+
+        def after_read(real):
+            def read(*a, **k):
+                rec = real(*a, **k)
+                if threading.current_thread() is holder.get("t"):  # the retract's ownership read
+                    paused.set()
+                    go.wait(5)
+                return rec
+            return read
+        patches = [mock.patch.object(agent_identity, name, side_effect=after_read(getattr(agent_identity, name)))
+                   for name in ("_read_at", "published_lane_record") if hasattr(agent_identity, name)]
+        with contextlib.ExitStack() as stack:
+            for p in patches:
+                stack.enter_context(p)
+            t = holder["t"] = threading.Thread(target=agent_identity.retract_lane, args=(state, "", os.getpid()))
+            t.start()
+            self.assertTrue(paused.wait(5))
+            succ = threading.Thread(target=agent_identity.publish_lane, args=(state, "", "@new:other.space"))
+            succ.start()
+            succ.join(0.5)  # finishes only when nothing serializes it behind the retract
+            go.set()
+            t.join(5)
+            succ.join(5)
+        self.assertEqual((agent_identity.published_lane_record(state, "") or {}).get("agent_id"),
+                         "@new:other.space")
+
+    def test_a_successor_published_during_a_failed_publish_survives(self):
+        from ag2_sparrow import agent_identity, remote_gateway_bridge as gb
+        state = self.lane_state()
+        agent_identity.publish_lane(state, "", "@old:ag2.space")
+        with mock.patch.object(gb, "_STATE", state), mock.patch.object(gb, "_log"), \
+                mock.patch.dict(os.environ, {"AGENT_MXID": "@mid:ag2.space"}):
+            self.interleave(gb._lane_identity,
+                            lambda: agent_identity.publish_lane(state, "", "@new:other.space"))
+        self.assertEqual((agent_identity.published_lane_record(state, "") or {}).get("agent_id"),
+                         "@new:other.space")
+
+    def test_the_drain_delegates_to_it(self):
+        from ag2_sparrow import remote_gateway_bridge as gb
+        state = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, state)
+        with mock.patch.object(delivery_destination, "deliverable_here", return_value=False) as d, \
+                mock.patch.object(gb, "_STATE", state), \
+                mock.patch.object(gb, "_reenroll_identity", return_value="@a:ag2.space"):
+            self.assertFalse(gb._room_is_deliverable_here("!r:ag2.space"))
+        d.assert_called_once_with("!r:ag2.space", "ag2.space")
+        with mock.patch.object(delivery_destination, "route", return_value=("x", None, "")) as r:
+            self.assertEqual(gb._proactive_route("b"), ("x", None, ""))
+        r.assert_called_once_with("b", skip_after_channel=gb.DELIVERY_SKIP_AFTER_CHANNEL)
+        self.assertIs(gb._MATRIX_ROOM_RE, delivery_destination.MATRIX_ROOM_RE)
+
 
 if __name__ == "__main__":
     unittest.main()

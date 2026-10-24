@@ -313,6 +313,7 @@ from .proactive_routing import proactive_filename
 from .team_guardrail import ag2space_tier_lines, owner_mention_lines
 from . import team_result_guard
 from . import health_command
+from . import delivery_destination as _delivery_destination
 from .outbox import DeliveryOutcome, record_delivered
 from .outbox import RetrySchedule, delivered_body_differs, read_item, source_digest
 from .outbox import list_items, requeue_item_with_epoch, RequeueOutcome
@@ -365,7 +366,7 @@ except ImportError:  # pragma: no cover - flat src/ import path
 
 # Terminal resting place for proactive nudges that can never be delivered.
 # results/undelivered/ is the repo-wide quarantine convention — health-check's
-UNDELIVERABLE_RESULTS_DIR = RESULTS_DIR / "undelivered"
+UNDELIVERABLE_RESULTS_DIR = RESULTS_DIR / _delivery_destination.UNDELIVERED_DIR
 # Named-instance support (multi-gateway): one core may run SEVERAL bridge
 # processes, each pointed at a different gateway (e.g. prod + dev homeservers)
 _INSTANCE_RE = gateway_instance.INSTANCE_RE
@@ -5419,40 +5420,12 @@ def _gate_failed(name: str, exc: Exception) -> None:
 # matter how often they are retried; they are dead-lettered instead of looping.
 _PROACTIVE_MAX_BODY_B = 48 * 1024
 
-# Destination FORMAT validation is this bridge's own job ("the bridge
-# validates the id format for its platform when applying" — result_markers).
-_MATRIX_ROOM_RE = re.compile(r"^![^\s:]+:\S+$")
+_MATRIX_ROOM_RE = _delivery_destination.MATRIX_ROOM_RE
 
 
 def _proactive_route(body: str) -> "tuple[str, str | None, str]":
-    """('send', room_or_None, stripped-body) | ('foreign', None, '') |
-    ('drop', None, '').
-
-    Marker grammar comes SOLELY from parse_markers() (no private parser —
-    CLAUDE.md result-marker contract); this function only applies the actions
-    this transport supports:
-      * skip markers   → 'drop' (archive silently, deliver nothing)
-      * [dm-only]      → parse_markers already suppressed any redirect, so the
-                         body falls through to the default (owner) room
-      * [channel: !r:s]→ 'send' to that room, marker stripped
-      * [channel: C…/digits] → 'foreign' — that bridge owns the file (review
-                         blocker: claiming it here would leak the raw body)
-      * attach markers → stripped by the parser; uploads are unsupported on
-                         the room-message op, so the actions are ignored
-      * [thread: $root]→ stripped here; the send reads it via
-                         _proactive_thread_root and posts in that thread
-      * bare [thread]  → task results only; stripped and ignored here
-    """
-    parsed = parse_markers(body, skip_after_channel=DELIVERY_SKIP_AFTER_CHANNEL)
-    if any(a.kind == "skip" for a in parsed.actions):
-        return ("drop", None, "")
-    redirect = next((a for a in parsed.actions if a.kind == "redirect"), None)
-    if redirect is not None:
-        dest = redirect.value
-        if _MATRIX_ROOM_RE.match(dest):
-            return ("send", dest, parsed.body)
-        return ("foreign", None, "")
-    return ("send", None, parsed.body)
+    """The drain's routing of a proactive body; the policy is delivery_destination's."""
+    return _delivery_destination.route(body, skip_after_channel=DELIVERY_SKIP_AFTER_CHANNEL)
 
 
 def _proactive_thread_root(body: str, name: str = "") -> "str | None":
@@ -5476,24 +5449,44 @@ def _proactive_thread_root(body: str, name: str = "") -> "str | None":
     return None
 
 
+def _lane_identity() -> str:
+    """The identity the deliverability predicate uses, republished whenever this instance's lane
+    record does not say it or is due a heartbeat, so Hatch judges rooms by it without reading the
+    credential env. A drain that cannot write lets the record go stale, and Hatch then refuses."""
+    identity = _reenroll_identity()
+    if not agent_identity.LANE_SUPPORTED:
+        return identity
+    rec = agent_identity.published_lane_record(_STATE, GATEWAY_INSTANCE) or {}
+    if rec.get("pid") != os.getpid() or rec.get("agent_id") != identity.strip() \
+            or time.time() - rec.get("ts", 0) >= agent_identity.LANE_REFRESH_S:
+        try:
+            _LANE_OWNED.update(agent_identity.publish_lane(_STATE, GATEWAY_INSTANCE, identity))
+            _LANE_OWNED["failing"] = False
+        except OSError as e:  # publish_lane has already tried to invalidate the old record
+            if not _LANE_OWNED.get("failing"):
+                _log(f"lane identity record not written ({e}); Hatch holds fail closed once the "
+                     f"record is {agent_identity.LANE_FRESH_S:g}s old")
+            _LANE_OWNED["failing"] = True
+    return identity
+
+
+_LANE_OWNED: dict = {}
+
+
+def _retract_own_lane() -> None:
+    """At clean exit: invalidate the lane record only if it is still the one this process wrote."""
+    if "pid" in _LANE_OWNED:
+        agent_identity.retract_lane(_STATE, GATEWAY_INSTANCE, _LANE_OWNED["pid"], _LANE_OWNED["ts"])
+
+
 def _own_homeserver() -> str:
-    """The server this lane's agent lives on, from its enrolled identity;
+    """The server this lane's agent lives on, from its live identity;
     "" when the identity is unknown (then nothing below can discriminate)."""
-    mxid = _reenroll_identity()
-    # FIRST colon: the server part may itself carry a port or an IPv6 bracket.
-    return mxid.split(":", 1)[1] if mxid.startswith("@") and ":" in mxid else ""
+    return _delivery_destination.homeserver_of(_lane_identity())
 
 
 def _room_is_deliverable_here(room: str) -> bool:
-    """A gateway posts only to rooms on its own homeserver. Another lane's room
-    must be left for that lane: claiming it here fails at the gateway and the
-    retry budget then parks deliverable work as undeliverable."""
-    own = _own_homeserver()
-    if not own:
-        return True  # identity unknown: today's behaviour, deliberately
-    if ":" not in room:
-        return False  # names no server: deliverable nowhere, strands visibly
-    return room.split(":", 1)[1] == own
+    return _delivery_destination.deliverable_here(room, _own_homeserver())
 
 
 def _record_proactive_receipt(item_id: str, room: str) -> None:
@@ -5501,7 +5494,7 @@ def _record_proactive_receipt(item_id: str, room: str) -> None:
     room rotates; this outlives it. Fail-open: a receipt write must never
     unwind a delivery that already happened."""
     try:
-        record_delivered(RESULTS_DIR / ".outbox-ag2space-proactive", item_id,
+        record_delivered(RESULTS_DIR / _delivery_destination.RECEIPT_DIR, item_id,
                          provider="ag2space-proactive", destination=room)
     except Exception as e:  # noqa: BLE001 — receipt is best-effort by design
         _log(f"proactive receipt write failed for {item_id}: {e} "
@@ -5519,11 +5512,9 @@ def _recover_orphan_proactive() -> None:
     for f in list(RESULTS_DIR.glob("proactive-*.sending.*")) \
             + list(RESULTS_DIR.glob("proactive-*.sending")):
         name = f.name
-        owner = name.rsplit(".sending.", 1)
-        if len(owner) == 2:  # pid-scoped claim
-            try:
-                pid = int(owner[1])
-            except ValueError:
+        if _delivery_destination.CLAIM_INFIX in name:  # pid-scoped claim
+            pid = _delivery_destination.claim_pid(name)
+            if pid is None:
                 continue  # not ours to interpret
             if _pid_alive(pid):
                 continue  # live worker's in-flight claim (incl. our own
@@ -5534,7 +5525,9 @@ def _recover_orphan_proactive() -> None:
                     continue
             except OSError:
                 continue
-        target = f.with_name(name.split(".sending")[0] + ".txt")
+        base = (_delivery_destination.claim_base(name) if _delivery_destination.CLAIM_INFIX in name
+                else name[:-len(".sending")])
+        target = f.with_name(base + ".txt")
         if target.exists():
             continue  # collision — leave for an operator, never clobber
         try:
@@ -5697,6 +5690,7 @@ def _post_proactive() -> None:
     PROACTIVE_ROOM_GATE re-judges the room the CLAIMED body names, since the
     peek may have read a body still being written."""
     noticed: "set[tuple[str, str]]" = set()
+    _lane_identity()  # published each pass, before any file needs it
     for f in sorted(RESULTS_DIR.glob("proactive-*.txt")):
         # PEEK before claiming: a file explicitly routed to a non-Matrix
         # destination ([channel: <discord/slack id>]) belongs to that bridge —
@@ -5729,7 +5723,7 @@ def _post_proactive() -> None:
                     continue
         # pid-scoped claim: recovery can tell a live worker's in-flight claim
         # from a dead one's (review blocker: bare .sending was stealable).
-        claim = f.with_suffix(f".sending.{os.getpid()}")
+        claim = _delivery_destination.claim_path(f, os.getpid())
         try:
             f.rename(claim)  # atomic claim; loser of a race just misses
         except OSError:
@@ -6746,9 +6740,11 @@ def _owner_mention_dm_name(tid: str) -> str:
 
 def _owner_mention_dm_queued(tid: str) -> bool:
     """A copy already handed to the proactive leg (pending, claimed, sent or parked)."""
-    stem = glob.escape(_owner_mention_dm_name(tid))
-    return ((RESULTS_DIR / f"{_owner_mention_dm_name(tid)}.txt").exists()
-            or any(RESULTS_DIR.glob(f"{stem}.sending*"))
+    name = _owner_mention_dm_name(tid)
+    stem = glob.escape(name)
+    return ((RESULTS_DIR / f"{name}.txt").exists() or (RESULTS_DIR / f"{name}.sending").exists()
+            or any(_delivery_destination.claim_base(p.name) == name
+                   for p in RESULTS_DIR.glob(f"{stem}.sending.*"))
             or any(ARCHIVE_RESULTS_DIR.glob(f"{stem}-*.txt"))
             or any(UNDELIVERABLE_RESULTS_DIR.glob(f"{stem}-*.txt")))
 
@@ -7524,6 +7520,8 @@ def main() -> None:
         # supervising wrapper not to relaunch; a plain exit would loop it.
         sys.exit(75)
     _start_lock_heartbeat()
+    _lane_identity()  # published at start, so Hatch's fail-closed window is only startup
+    atexit.register(_retract_own_lane)
     inflight: set[str] = _load_inflight()
     _recover_orphan_proactive()
     for sweep in (_retire_delivered_marks, _sweep_held_dir):
