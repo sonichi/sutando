@@ -621,6 +621,15 @@ class AgentEndpoint(Base):
             self.assertNotEqual(seen.get("url"), "https://session-chosen.example/relay")
             self.assertNotIn("session-chosen", repr(bridge.load(decl, self.ws / "agents")[0]))
 
+    def test_a_malformed_combined_token_is_named_as_malformed_not_as_a_bare_secret(self):
+        asked = []
+        rc, seen, err = self.started(vault(token="https://agent-gw.example/relay-tok-agent", asked=asked))
+        self.assertEqual((rc, seen), (1, {}))
+        self.assertIn("a malformed combined token", err)
+        self.assertNotIn("bare secret", err)
+        self.assertNotIn("tok-agent", err)
+        self.assertEqual(asked, [cli.vault_key(SEG)], "its URL key is not read in place of the broken token")
+
     def test_an_unusable_vault_url_is_refused_by_name(self):
         for bad in ("ftp://gw.example/relay", "https://gw.example/relay|x", "https:// gw", "gw.example", "https://"):
             with self.subTest(bad=bad):

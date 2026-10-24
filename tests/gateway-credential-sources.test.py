@@ -1957,6 +1957,9 @@ class Guard(unittest.TestCase):
                                  {"REMOTE_TASK_TOKEN": combined, o.INJECTED_KEY: "1"}, "the token's own URL wins")
                 self.assertEqual((o.token_embeds_url(combined), o.token_embeds_url("s"), o.token_embeds_url("")),
                                  (True, False, False))
+                self.assertEqual([o.token_malformed(t) for t in ("https://gw.example/relay-s", "HTTP://gw/relay",
+                                                                 combined, "https://gw/relay%7Cs", "s", "")],
+                                 [True, True, False, False, False, False], "a scheme with no separator is malformed")
                 self.assertEqual(o.gateway_url_problem(url), "")
                 self.assertEqual(o.gateway_url_problem("http://127.0.0.1:9/relay"), "")
                 for bad in ("", "ftp://x/relay", "https://", "x.example/relay", "https://x/relay|s", "https://x /r",

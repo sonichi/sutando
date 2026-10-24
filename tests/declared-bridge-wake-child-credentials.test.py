@@ -180,6 +180,18 @@ class WakeChild(unittest.TestCase):
         self.assertIn("--preflight", str(cm.exception.code))
         self.assertNotIn("set REMOTE_TASK_URL", str(cm.exception.code))
 
+    def test_a_declared_bridge_with_a_malformed_combined_token_says_so(self):
+        env = dict(AGENT_CONNECT_TASK_DIR=str(self.tmp / "tasks"), AGENT_CONNECT_RESULT_DIR=str(self.tmp / "results"),
+                   AGENT_CONNECT_STATE_DIR=str(self.tmp / "state"),
+                   **_sources.bridge_token_environ(f"{AGENT_URL}-{AGENT_SECRET}"))
+        with mock.patch.dict(os.environ, env):
+            mod = importlib.import_module(BRIDGE)
+            with self.assertRaises(SystemExit) as cm:
+                mod.main()
+        self.assertIn("a malformed combined token", str(cm.exception.code))
+        self.assertNotIn("bare secret", str(cm.exception.code))
+        self.assertNotIn(AGENT_SECRET, str(cm.exception.code))
+
     def test_control_the_hosts_own_bridge_wake_child_does_reload_it(self):
         # Unmarked, as the host's own bridge runs: the same sentinel sees the reload.
         env = dict(self.host, AGENT_CONNECT_TASK_DIR=str(self.tmp / "tasks"), WAKE_OUT=str(self.out),

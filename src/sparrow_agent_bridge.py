@@ -182,6 +182,9 @@ def endpoint(decl: dict, token: str, get_key) -> "tuple[str, str]":
     if _sources.token_embeds_url(token):
         return "", ""
     key, token_key = decl["url_vault_key"], decl["token_vault_key"]
+    if _sources.token_malformed(token):
+        return "", (f"the token under {token_key} starts with a gateway URL but carries no url|secret separator "
+                    f"(a malformed combined token): store it again as https://<gateway>|<secret> under {token_key}")
     try:
         url = (get_key(key) or "").strip()
     except KeyError:

@@ -141,6 +141,12 @@ def token_embeds_url(token: str) -> bool:
     return bool(contract.parse_onboarding_token(token or "")[0])
 
 
+def token_malformed(token: str) -> bool:
+    """Whether `token` starts with a URL scheme yet carries no url|secret separator: a broken combined
+    token (a separator lost or still encoded), not a bare secret."""
+    return (token or "").lower().startswith(("http://", "https://")) and not token_embeds_url(token)
+
+
 def gateway_url_problem(url: str) -> str:
     """'' for a usable gateway URL (http or https, a host, no '|', no whitespace or control characters),
     else why not, without the value."""
