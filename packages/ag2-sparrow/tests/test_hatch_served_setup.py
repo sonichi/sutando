@@ -5,6 +5,7 @@ self-upgrade. No network and no real pip: every subprocess the upgrade runs is f
 """
 import base64
 import contextlib
+import errno
 import hashlib
 import importlib.metadata
 import io
@@ -3052,6 +3053,34 @@ class Upgrade(Base):
             path.write_text(json.dumps({"attempted": {"0.6.0": attempt}}))
             self.assertIsNone(self_upgrade.recovery_blocked(self.state), attempt)
 
+    def test_a_journal_state_the_writer_cannot_reach_holds_restarts(self):
+        path = self_upgrade.state_path(self.state)
+        self.state.mkdir(parents=True, exist_ok=True)
+        base = {"at": 1.0, "from": "0.5.4"}
+        bad = [{}, {"failed": {}}, {"attempted": {}, "failed": 3}, {"attempted": {}, "extra": 1}]
+        for outcome, phase in (("restore-failed", None), ("restore-failed", "ok"),
+                               ("restore-failed", "rolled-back"), ("restore-failed", "installing"),
+                               ("ok", None), ("ok", "restore-failed"), ("rolled-back", "ok"),
+                               ("crashed", None), ("started", "ok"), ("started", "acknowledged"),
+                               ("stop-failed", "quiesced"), ("ok", "acknowledged")):
+            tried = dict(base, outcome=outcome, **({} if phase is None else {"phase": phase}))
+            bad.append({"attempted": {"0.6.0": tried}})
+        for journal in bad:
+            path.write_text(json.dumps(journal))
+            self.assertIn("cannot be read", self_upgrade.recovery_blocked(self.state) or "", journal)
+            self.assertEqual(self.keepawake_restarts(), (1, 0), journal)
+        good = [("started", None), ("started", "snapshot"), ("started", "quiesced"),
+                ("crashed", "crashed"), ("rolled-back", "rolled-back"), ("ok", "ok"),
+                ("restore-failed", "acknowledged"), ("stop-failed", "stop-failed")]
+        for outcome, phase in good:
+            tried = dict(base, outcome=outcome, **({} if phase is None else {"phase": phase}))
+            path.write_text(json.dumps({"attempted": {"0.6.0": tried}}))
+            self.assertIsNone(self_upgrade.recovery_blocked(self.state), (outcome, phase))
+        for phase in ("restore-failed", "installing", "installed", "restoring"):
+            outcome = "restore-failed" if phase == "restore-failed" else "started"
+            path.write_text(json.dumps({"attempted": {"0.6.0": dict(base, outcome=outcome, phase=phase)}}))
+            self.assertIn("left unverified files", self_upgrade.recovery_blocked(self.state))
+
     def test_keepawake_never_restarts_on_unverified_files_or_a_failed_settlement(self):
         # A dead mutating attempt with no snapshot: restore-failed, the listener stays down.
         self.start(self.setup(), now=1000.0)
@@ -3436,8 +3465,7 @@ class Quiesce(Base):
                     if self.fresh and (rec or {}).get("pid") in self.alive else None),
                    (keepalive, "is_sparrow_pid", lambda pid: pid in self.sparrow),
                    (keepalive, "process_start", self.read_start),
-                   (keepalive, "_pidfd_open", lambda pid: (pid, self.starts.get(pid))
-                    if self.pidfd else None),
+                   (keepalive, "_pidfd_open", self.open_pidfd),
                    (hatch_cli, "_systemctl", systemctl), (keepalive, "_stop", term),
                    (keepalive, "STOP_WAIT_S", 0.3))
         self.starts, self.swap, self.pidfd = {}, {}, True
@@ -3446,6 +3474,13 @@ class Quiesce(Base):
                                   mock.Mock(side_effect=value), create=True)
             p.start()
             self.addCleanup(p.stop)
+
+    def open_pidfd(self, pid):
+        """A handle on the process that has `pid` now; None with no pidfd (macOS), or the
+        OSError `self.pidfd` names (an unexpected open failure on Linux)."""
+        if isinstance(self.pidfd, OSError):
+            raise self.pidfd
+        return (pid, self.starts.get(pid)) if self.pidfd else None
 
     def read_start(self, pid):
         """The start time read now; a pending `swap` replaces the process right after."""
@@ -3582,7 +3617,7 @@ class Quiesce(Base):
             self.props = real
             self.assertNotIn(("term", 77, "boot:999"), self.calls, f"pidfd={pidfd}")
             self.assertFalse(quiet, f"pidfd={pidfd}")
-            self.assertIn("is not proven to be the process that wrote", how)
+            self.assertIn("was not signalled", how)
             self.owner = None
 
     def test_the_holder_is_signalled_through_a_handle_opened_before_its_proof(self):
@@ -3595,18 +3630,30 @@ class Quiesce(Base):
             self.assertTrue(keepalive.quiesce_sparrow(self.cfg)[0])
         self.assertEqual(order[:2], ["open", "proof"])
         self.assertEqual(self.calls, [("term", 4242)])
-        # With no pidfd (macOS), the proof is read again right before the bare signal.
-        order.clear()
-        self.calls.clear()
-        self.holder(4243)
-        real_term = keepalive._stop.side_effect
-        with mock.patch.object(keepalive, "_pidfd_open", return_value=None), \
-                mock.patch.object(keepalive, "process_start",
-                                  side_effect=lambda pid: order.append("proof") or "boot:100"), \
-                mock.patch.object(keepalive, "_stop", side_effect=lambda pid, handle=None: (
-                    order.append(("signal", handle)), real_term(pid, handle))[1]):
-            self.assertTrue(keepalive.quiesce_sparrow(self.cfg)[0])
-        self.assertEqual(order, ["proof", ("signal", None)])
+
+    def test_with_no_stable_handle_nothing_is_signalled_and_the_stop_fails(self):
+        # Kewei's seam: the final proof passes and the pid becomes boot:999 right after.
+        for pidfd in (False, OSError(errno.EMFILE, "Too many open files"),
+                      OSError(errno.EPERM, "Operation not permitted")):
+            for unit in (False, True):
+                self.calls.clear()
+                self.owner, self.props = None, dict(self.props, ActiveState="inactive", MainPID=0)
+                if unit:
+                    self.unit(0)
+                self.pidfd = pidfd
+                self.holder(4242)
+                self.swap[4242] = "boot:999"
+                quiet, how, manager = keepalive.quiesce_sparrow(self.cfg)
+                signals = [c for c in self.calls if c[0] in ("term", "stale-handle")]
+                self.assertEqual((quiet, signals), (False, []), (pidfd, unit))
+                self.assertIn("no stable process handle", how, (pidfd, unit))
+                self.assertEqual(manager, "unit" if unit else None, (pidfd, unit))
+                self.assertIn(4242, self.alive)
+                self.swap.clear()
+        # The upgrade's stop: refused with no manager, so it ends stop-failed, nothing started.
+        self.owner, self.pidfd = None, False
+        self.holder(4242)
+        self.assertEqual(REAL_STOP(self.cfg)[::2], (False, None))
 
     def test_a_holder_that_ignores_sigterm_is_not_quiet(self):
         self.stubborn.add(99)
@@ -3642,8 +3689,8 @@ class RealHolder(unittest.TestCase):
                               "-m", "ag2_sparrow"])
         self.addCleanup(lambda: (p.poll() is None and p.kill(), p.wait()))
         deadline = time.monotonic() + 10
-        while workspace_lock.proc_start(p.pid) is None and time.monotonic() < deadline:
-            time.sleep(0.05)
+        while not keepalive.is_sparrow_pid(p.pid) and time.monotonic() < deadline:
+            time.sleep(0.05)  # until exec: a forked child still shows the parent's argv
         return p
 
     @unittest.skipUnless(sys.platform in ("linux", "darwin"), "no start-time source")
@@ -3658,8 +3705,15 @@ class RealHolder(unittest.TestCase):
                 contextlib.redirect_stderr(io.StringIO()):
             stopped, why = keepalive.stop_proven({"pid": p.pid, "proc_start": start + "0"}, p.pid)
             self.assertEqual(stopped, False)
-            self.assertIn("is not proven", why)
             self.assertIsNone(p.poll(), "a mismatched start time is never signalled")
+            if not hasattr(os, "pidfd_open"):  # macOS: no handle, so never signalled
+                self.assertIn("no stable process handle", why)
+                stopped, why = keepalive.stop_proven({"pid": p.pid, "proc_start": start}, p.pid)
+                self.assertEqual(stopped, False)
+                self.assertIn("no stable process handle", why)
+                self.assertIsNone(p.poll())
+                return
+            self.assertIn("is not proven", why)
             # Reaped as it exits, as a detached Sparrow's own parent would.
             threading.Thread(target=p.wait, daemon=True).start()
             self.assertEqual(keepalive.stop_proven({"pid": p.pid, "proc_start": start}, p.pid),

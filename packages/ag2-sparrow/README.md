@@ -633,9 +633,12 @@ name that merely appeared later, so a foreign file another installer adds meanwh
 is neither removed nor counted. It stops Sparrow through the
 manager that owns it and proves it gone (a hand-made unit is never touched; a lock
 holder is signalled only when it runs Sparrow's command line and has the start time
-its lock record names, read from /proc on Linux or sysctl on macOS, and on Linux the
-signal goes through a pidfd opened before that check, so it reaches that process or
-none; nothing is installed unless the stop is proven), runs
+its lock record names, read from /proc on Linux or sysctl on macOS, and the signal
+goes through a pidfd opened before that check, so it reaches that process or none.
+Where no pidfd can be had (macOS, or a pidfd_open that fails) nothing is signalled,
+so a detached macOS install's self-upgrade ends `stop-failed` and Sparrow keeps
+running the old version until it is stopped by hand; nothing is installed unless the
+stop is proven), runs
 `pip install --no-deps --only-binary=:all: --require-hashes --no-index` from the
 downloaded wheel, pinned to every sha256 in `target_sha256`, requires `pip check` to run and report no new problem
 naming ag2-sparrow, re-runs `install --no-start` (which never starts the service),
@@ -650,8 +653,9 @@ version runs connected again, else `restore-failed`, and the health row reports
 `upgrade-failed` either way. After `restore-failed` the files are unverified, so
 Sparrow is left stopped and the hook wakes the agent once with a notice. While an
 attempt is held this way (or left in a mutating phase, or the journal
-`hatch-upgrade.json` exists but cannot be read, including an attempt record missing
-a known outcome, a numeric time or a known phase) nothing starts Sparrow or another
+`hatch-upgrade.json` exists but is not one the writer can leave: unparseable, without
+its `attempted` map, or with an attempt whose outcome and phase are not a pair the
+writer produces, or that lacks a numeric time) nothing starts Sparrow or another
 upgrade: keepawake, the upgrade decision and the upgrade worker all refuse without
 writing to the journal, so a refusal never replaces the phase that holds, and the
 failed version is never imported, not even to read its version. The owner's

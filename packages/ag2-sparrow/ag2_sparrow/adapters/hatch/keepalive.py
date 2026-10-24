@@ -295,17 +295,12 @@ def sparrow_env(pid: int) -> "dict[str, str] | None":
 
 
 def _pidfd_open(pid: int) -> "int | None":
-    """A pidfd naming the process that has `pid` now; None where there is none (macOS, an
-    old kernel). ProcessLookupError when no process has it."""
+    """A pidfd naming the process that has `pid` now; None where the platform has none
+    (macOS). ProcessLookupError when no process has it; any other failure raises."""
     opener = getattr(os, "pidfd_open", None)
     if opener is None or not hasattr(signal, "pidfd_send_signal"):
         return None
-    try:
-        return opener(pid)
-    except ProcessLookupError:
-        raise
-    except OSError:
-        return None
+    return opener(pid)
 
 
 def _stop(pid: int, handle: "int | None" = None) -> bool:
@@ -447,14 +442,20 @@ def unproven_holder(record: "dict | None", pid: int) -> "str | None":
 
 
 def stop_proven(record: "dict | None", pid: int) -> "tuple[bool, str | None]":
-    """SIGTERM the lock holder `pid` and wait: (stopped, why it was not proven). The proof
-    (unproven_holder) is read after a pidfd is opened and the signal goes through that
-    pidfd, so it reaches the proven process or none. Without a pidfd (macOS) the proof is
-    read immediately before the bare signal."""
+    """SIGTERM the lock holder `pid` and wait: (stopped, why it was not signalled). The
+    proof (unproven_holder) is read after a pidfd is opened and the signal goes through
+    that pidfd, so it reaches the proven process or none. With no pidfd (macOS, or one
+    that could not be opened) nothing is signalled: a bare pid is never trusted."""
     try:
         handle = _pidfd_open(pid)
     except ProcessLookupError:
         return True, None
+    except OSError as e:
+        return False, (f"no stable process handle for pid {pid} (pidfd_open: "
+                       f"{diagnostics.describe(e)})")
+    if handle is None:
+        return False, (f"no stable process handle for pid {pid} on this platform (no pidfd); "
+                       "stop Sparrow by hand to upgrade")
     try:
         why = unproven_holder(record, pid)
         return (False, why) if why else (_stop(pid, handle), None)
@@ -506,7 +507,7 @@ def quiesce_sparrow(cfg: dict) -> "tuple[bool, str, str | None]":
         if outside is not None:
             stopped, unproven = stop_proven(record, outside)
             if unproven:
-                return False, f"{how}; {unproven}, so it was not signalled", "unit"
+                return False, f"{how}; {unproven}; it was not signalled", "unit"
             if not stopped:
                 return False, f"the Sparrow outside {_cli.SERVICE_NAME} (pid {outside}) did not stop", "unit"
             how += f"; stopped the Sparrow outside it (pid {outside})"
