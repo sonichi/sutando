@@ -46,6 +46,21 @@ def load_sparrowd():
     return mod
 
 
+def recording_bridge_environ(seen: dict):
+    """Patch the wrapper's environment builder to keep what it returns in seen["env"]: what the bridge runs under."""
+    real = bridge.bridge_environ
+
+    def spy(*args, **kwargs):
+        seen["env"] = real(*args, **kwargs)
+        return seen["env"]
+    return mock.patch.object(bridge, "bridge_environ", spy)
+
+
+def runs_under(env: dict) -> bool:
+    """Whether os.environ, read key by key, is exactly `env`."""
+    return set(os.environ) == set(env) and all(os.environ.get(k) == v for k, v in env.items())
+
+
 class Base(unittest.TestCase):
     def setUp(self):
         self.ws = Path(tempfile.mkdtemp()).resolve()
@@ -362,12 +377,12 @@ class Wrapper(Base):
         """The environment the bridge module runs under when sparrowd holds a token under every name."""
         decl = self.declare()
         seen = {}
-        with mock.patch.dict(os.environ, self.HOST_TOKENS):
+        with mock.patch.dict(os.environ, self.HOST_TOKENS), recording_bridge_environ(seen):
             rc = bridge.main([str(decl)], workspace=self.ws, get_key=lambda k: "tok-agent",
-                             run=lambda module, run_name, alter_sys: seen.update(os.environ))
+                             run=lambda module, run_name, alter_sys: seen.update(applied=runs_under(seen["env"])))
         self.assertEqual(rc, 0)
-        self.assertNotEqual(seen, {}, "the bridge ran")
-        return seen
+        self.assertIs(seen.get("applied"), True, "the bridge ran under exactly the built environment")
+        return seen["env"]
 
     def test_the_hosts_REMOTE_TASK_TOKEN_is_replaced_by_the_agents(self):
         env = self.built_environment()
@@ -479,11 +494,12 @@ class HostCredentialFiles(Base):
             seen["mod"] = importlib.import_module(self.BRIDGE)
             seen["tier_map"] = seen["mod"]._load_tier_map()
             seen["access_path"] = seen["mod"]._ag2space_access_path()
-            seen["env"] = dict(os.environ)
+            seen["applied"] = runs_under(seen["env"])
             seen["child_opens"] = list(self.opens)
-        with mock.patch.dict(os.environ, host_env), contextlib.redirect_stderr(err):
+        with mock.patch.dict(os.environ, host_env), contextlib.redirect_stderr(err), recording_bridge_environ(seen):
             rc = bridge.main([str(decl)], workspace=self.ws, get_key=lambda k: "tok-agent", run=child)
         self.assertEqual(rc, 0)
+        self.assertIs(seen.get("applied"), True, "the bridge ran under exactly the built environment")
         seen["stderr"] = err.getvalue()
         return seen
 
