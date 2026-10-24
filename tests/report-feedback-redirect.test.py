@@ -173,6 +173,16 @@ class TestTrustedHosts(unittest.TestCase):
         self.assertIn("sutando.ag2.ai", rf.TRUSTED_API_HOSTS)
         self.assertIn("sutando.ag2.space", rf.TRUSTED_API_HOSTS)
 
+    def test_dev_cloud_host_is_trusted(self):
+        self.assertIn("dev-sutando.ag2.space", rf.TRUSTED_API_HOSTS)
+        rf.cloud_auth.check_trusted_base("https://dev-sutando.ag2.space")
+
+    def test_lookalike_hosts_are_refused(self):
+        for base in ("https://evil-sutando.ag2.space", "http://dev-sutando.ag2.space",
+                     "https://dev-sutando.ag2.space.evil.com"):
+            with self.assertRaises(Exception, msg=base):
+                rf.cloud_auth.check_trusted_base(base)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

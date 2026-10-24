@@ -50,8 +50,9 @@ from typing import Any, Callable, Iterator
 from station_stamp import read_station_stamp
 
 # Hosts the bearer may be sent to. Anything else aborts rather than forwarding
-# the owner's token.
-TRUSTED_API_HOSTS = frozenset({"sutando.ag2.ai", "sutando.ag2.space"})
+# the owner's token. dev-sutando is the dev cloud: dev cloud Sutando pods are
+# handed an apiBase there by core-api.
+TRUSTED_API_HOSTS = frozenset({"sutando.ag2.ai", "sutando.ag2.space", "dev-sutando.ag2.space"})
 
 DEFAULT_CLOUD_ORIGIN = "https://sutando.ag2.space"
 # sutando.ag2.ai 307s to .space and clients drop Authorization across the
