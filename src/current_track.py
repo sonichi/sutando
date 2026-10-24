@@ -163,15 +163,38 @@ def _orientation(entries):
 
     None is a real answer: `2026-09-06` against `2026-09-06T08:00:00Z` says nothing
     about their order, and guessing archives whichever live entry the guess misses.
+
+    Every ADJACENT pair casts one vote for its local direction; a clear majority
+    decides. One entry recorded out of order -- a correction appended where it
+    landed rather than where its own heading date would place it -- must not flip
+    the call for an otherwise-consistent file: the file this was found on has
+    exactly that shape, and the single first-found-pair reading it used to produce
+    called the whole file newest-first, archiving the entry actually appended last.
+
+    The whole-span endpoint comparison is deliberately NOT counted as an extra
+    vote: entries[0] already appears in the first adjacent pair, so also voting
+    the endpoint pair double-weights whatever direction entries[0] points --
+    exactly what let a single outlier at position 0 (issue #4222: a PINNED entry
+    stamped newer than all history) win a tie against the real historical trend
+    unless that trend had 3+ agreeing adjacent pairs of its own. Dropping the
+    endpoint vote removes that structural double-count.
+
+    An exact tie falls back to the first decisive adjacent pair in file order --
+    the historical tiebreak, kept so a genuinely balanced file still resolves by
+    its earliest strong signal rather than a coin flip. A sample with only one or
+    two real history entries behind a skewed first entry is still genuinely
+    ambiguous either way at that point -- indistinguishable, from stamps alone,
+    from a file that is validly newest-first with just as few entries. That
+    residual case needs a bigger sample to resolve, not a smarter tiebreak.
     """
     keys = [k for k in (_stamp_key(e.splitlines()[0]) for e in entries) if k]
     if len(keys) < 2:
         return None
-    for a, b in ((keys[0], keys[-1]), *zip(keys, keys[1:])):
-        c = _cmp_stamps(a, b)
-        if c:
-            return c > 0
-    return None
+    votes = [c for c in (_cmp_stamps(a, b) for a, b in zip(keys, keys[1:])) if c]
+    if not votes:
+        return None
+    pos, neg = votes.count(1), votes.count(-1)
+    return (pos > neg) if pos != neg else (votes[0] > 0)
 
 
 def plan(text: str, keep_bytes: int, pin=PIN_DEFAULT) -> RotateResult:
