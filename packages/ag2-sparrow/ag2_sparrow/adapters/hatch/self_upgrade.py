@@ -200,9 +200,18 @@ def _sha256(path: Path) -> str:
     return h.hexdigest()
 
 
-def _record_scope(dist) -> "tuple[Path, list[str], list[str], list[str]]":
-    """(site, roots, extra, bins): the site dir, the top-level names RECORD puts in it, the
-    recorded files outside it (console scripts) and the directories holding those."""
+def _listing(directory: Path) -> "list[str]":
+    try:
+        return sorted(p.name for p in Path(directory).iterdir())
+    except OSError:
+        return []
+
+
+def _record_scope(dist) -> dict:
+    """The scope an install can touch, read before anything changes: the site dir and its
+    top-level names RECORD puts there (`roots`), the recorded files outside it (`extra`,
+    the console scripts) and their directories (`bins`), and the complete listing of the
+    site dir and of each bin dir, so whatever a target adds shows up as added."""
     site = Path(os.path.normpath(dist.locate_file("")))
     roots, extra = set(), []
     for path in _installed_paths(dist):
@@ -211,30 +220,44 @@ def _record_scope(dist) -> "tuple[Path, list[str], list[str], list[str]]":
         except (ValueError, IndexError):
             extra.append(str(path))
     bins = sorted({str(Path(p).parent) for p in extra})
-    return site, sorted(roots), sorted(set(extra)), bins
+    return {"site": str(site), "roots": sorted(roots), "extra": sorted(set(extra)), "bins": bins,
+            "listing": _listing(site), "bin_listing": {b: _listing(b) for b in bins}}
 
 
-def namespace(site: Path, roots: list, extra: list, bins: "list | None" = None) -> "dict[str, str]":
-    """{path: sha256} of every file now under the package namespace: `roots` and every
-    top-level name in `site` that is ag2-sparrow's (any ag2_sparrow* package or
-    ag2_sparrow-*.dist-info, whatever version), the `extra` files, and every ag2-sparrow*
-    script in `bins`; so a top-level package or script the target introduced is covered.
-    No __pycache__."""
+def _owned_tops(scope: dict) -> "list[Path]":
+    """Top-level entries of the site dir that are the package's: its RECORD roots, any
+    ag2_sparrow* name, and any name absent from the pre-mutation listing."""
+    site, listing = Path(scope["site"]), scope.get("listing")
+    roots = set(scope["roots"])
+    tops = []
+    for child in _listing(site):
+        new = listing is not None and child not in listing
+        if child in roots or _OWN_RE.match(child) or new:
+            tops.append(site / child)
+    return tops
+
+
+def _owned_scripts(scope: dict) -> "list[Path]":
+    """The recorded scripts, any ag2-sparrow* script, and any file a bin dir did not hold
+    before the mutation."""
+    scripts = set(map(Path, scope["extra"]))
+    for directory in map(Path, scope.get("bins") or []):
+        before = (scope.get("bin_listing") or {}).get(str(directory))
+        for name in _listing(directory):
+            if _OWN_RE.match(name) or (before is not None and name not in before):
+                scripts.add(directory / name)
+    return sorted(scripts)
+
+
+def namespace(scope: dict) -> "dict[str, str]":
+    """{path: sha256} of every file now in `scope` (see _record_scope); no __pycache__."""
     found = {}
-    site = Path(site)
-    if site.is_dir():
-        for child in sorted(site.iterdir()):
-            if child.name not in roots and not _OWN_RE.match(child.name):
-                continue
-            files = [child] if child.is_file() else sorted(
-                p for p in child.rglob("*") if p.is_file() and "__pycache__" not in p.parts)
-            for path in files:
-                found[str(path)] = _sha256(path)
-    scripts = set(map(Path, extra))
-    for directory in map(Path, bins or []):
-        if directory.is_dir():
-            scripts.update(p for p in directory.iterdir() if _OWN_RE.match(p.name))
-    for path in sorted(scripts):
+    for top in _owned_tops(scope):
+        files = [top] if top.is_file() else sorted(
+            p for p in top.rglob("*") if p.is_file() and "__pycache__" not in p.parts)
+        for path in files:
+            found[str(path)] = _sha256(path)
+    for path in _owned_scripts(scope):
         if path.is_file():
             found[str(path)] = _sha256(path)
     return found
@@ -246,18 +269,17 @@ def snapshot(state_dir: Path, version: str, dist) -> Path:
     tmp = dest.with_name(f".{version}.{os.getpid()}")
     shutil.rmtree(tmp, ignore_errors=True)
     (tmp / "files").mkdir(parents=True)
-    site, roots, extra, bins = _record_scope(dist)
-    if not roots and not extra:
+    scope = _record_scope(dist)
+    if not scope["roots"] and not scope["extra"]:
         raise ValueError("the install recorded no files")
     entries = []
-    for i, (path, digest) in enumerate(sorted(namespace(site, roots, extra, bins).items())):
+    for i, (path, digest) in enumerate(sorted(namespace(scope).items())):
         name = f"{i:05d}"
         shutil.copy2(path, tmp / "files" / name)
         entries.append({"path": path, "copy": name, "sha256": digest})
     if not entries:
         raise ValueError("the install's files are missing")
-    manifest = {"version": version, "site": str(site), "roots": roots, "extra": extra,
-                "bins": bins, "files": entries}
+    manifest = dict(scope, version=version, files=entries)
     (tmp / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
     shutil.rmtree(dest, ignore_errors=True)
     os.replace(tmp, dest)
@@ -280,8 +302,12 @@ def namespace_drift(state_dir: Path, version: str) -> "list[str] | None":
     except (OSError, ValueError):
         return None
     want = {e["path"]: e["sha256"] for e in manifest["files"]}
-    have = namespace(manifest["site"], manifest["roots"], manifest["extra"], manifest.get("bins"))
-    return sorted([f"added {p}" for p in have.keys() - want.keys()]
+    have = namespace(manifest)
+    listing = manifest.get("listing")
+    tops = [f"added {t}" for t in _owned_tops(manifest)
+            if listing is not None and t.name not in listing and not any(
+                Path(p).is_relative_to(t) for p in have)]  # an added, now empty, directory
+    return sorted(tops + [f"added {p}" for p in have.keys() - want.keys()]
                   + [f"missing {p}" for p in want.keys() - have.keys()]
                   + [f"changed {p}" for p in want.keys() & have.keys() if want[p] != have[p]])
 
@@ -291,10 +317,9 @@ def restore(state_dir: Path, version: str) -> None:
     copy its files in, and require the namespace to hash equal to it. RECORD, which a
     failed install may have left stale or half-swapped, is never consulted."""
     snap, manifest = _manifest(state_dir, version)
-    site, roots, extra = manifest["site"], manifest["roots"], manifest["extra"]
     want = {e["path"]: e for e in manifest["files"]}
     emptied = set()
-    for path in map(Path, namespace(site, roots, extra, manifest.get("bins"))):
+    for path in map(Path, namespace(manifest)):
         if str(path) not in want:
             path.unlink()
             emptied.add(path.parent)
@@ -302,10 +327,13 @@ def restore(state_dir: Path, version: str) -> None:
         target = Path(entry["path"])
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(snap / "files" / entry["copy"], target)
-    for cache in sorted(Path(site).glob("*/**/__pycache__"), reverse=True):
-        top = cache.parts[len(Path(site).parts)]
-        if top in roots or _OWN_RE.match(top):
-            shutil.rmtree(cache, ignore_errors=True)  # the failed version's bytecode
+    for top in _owned_tops(manifest):
+        if top.is_dir():
+            for cache in sorted(top.rglob("__pycache__"), reverse=True):
+                shutil.rmtree(cache, ignore_errors=True)  # the failed version's bytecode
+        listing = manifest.get("listing")
+        if listing is not None and top.name not in listing:
+            shutil.rmtree(top, ignore_errors=True) if top.is_dir() else top.unlink(missing_ok=True)
     for directory in sorted(emptied, key=lambda d: len(d.parts), reverse=True):
         with contextlib.suppress(OSError):
             directory.rmdir()  # only a directory the failed version left empty
@@ -508,6 +536,33 @@ def _finish(state_dir: Path, target: str, outcome: str, **extra) -> None:
     state["attempted"].setdefault(target, {}).update(outcome=outcome, phase=outcome)
     state.update(extra)
     save_state(state_dir, state)
+    if outcome == "restore-failed":
+        _cli._write(notice_path(state_dir),
+                    f"ag2-sparrow's upgrade to {target} failed and the rollback did not verify; "
+                    "Sparrow is left stopped and keepawake will not restart it until the owner "
+                    "runs ag2-sparrow-hatch install (see the hatch-upgrade.json journal).\n", 0o600)
+
+
+def recovery_blocked(state_dir: Path) -> "str | None":
+    """Why Sparrow must not be started: an attempt whose files are unverified, in a
+    mutating phase or restore-failed; None when every attempt is settled or cleared."""
+    for target, tried in load_state(state_dir)["attempted"].items():
+        phase = tried.get("phase") if isinstance(tried, dict) else None
+        if phase in MUTATING_PHASES or phase == "restore-failed":
+            return f"the upgrade to {target} left unverified files ({phase})"
+    return None
+
+
+def clear_blocked(state_dir: Path) -> bool:
+    """The owner's install acknowledges a failed recovery: its hold on restarts is lifted
+    (the attempt stays recorded, so the target is not retried). Whether anything changed."""
+    state, changed = load_state(state_dir), False
+    for tried in state["attempted"].values():
+        if isinstance(tried, dict) and tried.get("phase") == "restore-failed":
+            tried["phase"], changed = "acknowledged", True
+    if changed:
+        save_state(state_dir, state)
+    return changed
 
 
 def stop_sparrow(cfg: dict) -> "tuple[bool, str, str | None]":
@@ -530,7 +585,8 @@ def _rollback(cfg: dict, state_dir: Path, previous: str, target: str, why: str,
               manager: "str | None" = None) -> str:
     """Restore `previous` and check it: "rolled-back" only when the namespace hashes equal
     to its snapshot, install re-ran and Sparrow runs it connected, else "restore-failed"
-    with what is installed. No file changes unless Sparrow is proven stopped."""
+    with what is installed. No file changes unless Sparrow is proven stopped, and no start
+    unless the restore verified."""
     print(f"upgrade to {target} failed ({why}); restoring {previous}", file=sys.stderr)
     _phase(state_dir, target, "restoring")
     problems = []
@@ -542,17 +598,18 @@ def _rollback(cfg: dict, state_dir: Path, previous: str, target: str, why: str,
         try:
             restore(state_dir, previous)
         except (OSError, ValueError) as e:
-            problems.append(f"restore: {e}")
+            # Unverified files are never started: Sparrow stays stopped for the owner.
+            problems.append(f"restore: {e}; Sparrow is left stopped")
         else:
             r = _run(install_argv(cfg), INSTALL_TIMEOUT_S)
             if r.returncode != 0:
                 problems.append(f"install: {_why(r)}")
-        since = time.time()
-        started, how = start_sparrow(cfg, manager)
-        if not started:
-            problems.append(f"start: {how}")
-        elif _keepalive._await_connected(state_dir, _keepalive._instance(cfg), since) != 0:
-            problems.append("Sparrow did not reconnect")
+            since = time.time()
+            started, how = start_sparrow(cfg, manager)
+            if not started:
+                problems.append(f"start: {how}")
+            elif _keepalive._await_connected(state_dir, _keepalive._instance(cfg), since) != 0:
+                problems.append("Sparrow did not reconnect")
     installed = installed_version()
     if installed != previous:
         problems.append(f"{installed or 'no version'} is installed, not {previous}")

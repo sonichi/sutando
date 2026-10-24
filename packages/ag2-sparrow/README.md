@@ -625,8 +625,8 @@ run starts one detached upgrade per target and logs its decision on its line
 The upgrade runs under `STATE_DIR/upgrade.lock`, which keepawake also holds while
 it checks and restarts Sparrow, and re-reads the installed version first. It
 copies the whole package namespace, hashed, to `STATE_DIR/rollback/<version>/`
-(every `ag2_sparrow*` top-level name in site-packages and every `ag2-sparrow*`
-console script, so what a target adds is covered too), stops Sparrow through the
+(its RECORD's top-level names, every `ag2_sparrow*` name, and the full listing of
+site-packages and of the scripts directory, so whatever a target adds is removed), stops Sparrow through the
 manager that owns it and proves it gone (a hand-made unit or a lock holder not
 proven to be Sparrow is never touched, and nothing is installed unless the stop
 is proven), runs
@@ -639,10 +639,12 @@ is delivered once it starts. A failure restores the snapshot with no index and n
 network: every namespace path it does not list is removed and the files must hash
 equal to it; the outcome is `rolled-back` only when that held and the previous
 version runs connected again, else `restore-failed`, and the health row reports
-`upgrade-failed` either way. The attempt record journals each phase, so a dead
-attempt is settled before keepawake probes or restarts anything: nothing installed
-means `crashed`, files that differ from the snapshot are restored, and an
-interrupted restore resumes on the next run. Editable and URL installs are never
+`upgrade-failed` either way. After `restore-failed` the files are unverified, so
+Sparrow is left stopped, the hook wakes the agent once with a notice, and keepawake
+does not restart it until the owner runs `ag2-sparrow-hatch install`. The attempt
+record journals each phase, so a dead attempt is settled before keepawake probes
+or restarts anything: nothing installed means `crashed`, files that differ from
+the snapshot are restored, and an interrupted restore resumes on the next run. Editable and URL installs are never
 upgraded. A changed hook definition is not applied: the hook wakes the agent once
 with install's `REQUIRED hook:` line. `AUTO_UPGRADE=0` in the install config turns
 self-upgrade off; install keeps it.

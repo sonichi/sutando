@@ -751,6 +751,11 @@ def _install(args) -> int:
         print("skipped: the keepalive task (--no-keepalive)")
     else:
         keepalive.install_tasks(read_config(config_path()), args.force)
+    if not args.no_start:
+        from . import self_upgrade
+        if self_upgrade.clear_blocked(state_dir.resolve()):
+            print("cleared: a failed self-upgrade's hold on restarting Sparrow (this install "
+                  "put the files in place)")
     if left_stopped:
         rc = 1
         print("skipped: starting and checking Sparrow (the service was left stopped above)")

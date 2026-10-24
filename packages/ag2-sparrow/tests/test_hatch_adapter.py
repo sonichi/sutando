@@ -1573,6 +1573,16 @@ class Service(Base):
             self.cli("install", "--mxid", AGENT)
             self.assertIs(svc.call_args.kwargs["may_start"], True)
 
+    def test_an_install_that_starts_clears_a_failed_upgrades_hold_and_no_start_does_not(self):
+        from ag2_sparrow.adapters.hatch import self_upgrade
+        with mock.patch.object(hatch_cli, "install_service"), \
+                mock.patch.object(self_upgrade, "clear_blocked", return_value=True) as clear:
+            self.cli("install", "--mxid", AGENT, "--no-start")
+            clear.assert_not_called()
+            r = self.cli("install", "--mxid", AGENT)
+            clear.assert_called_once_with(self.state.resolve())
+        self.assertIn("cleared: a failed self-upgrade's hold", r.stdout)
+
     def test_rerun_is_idempotent(self):
         fake = FakeSystemd()
         self.with_systemd(fake, "install", "--mxid", AGENT, env={"USER": "hatch"})
