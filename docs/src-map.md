@@ -158,6 +158,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`presenter-mode.ts`** — Provider-neutral presenter-mode sentinel policy — TS twin of src/presenter_mode.py (#2501).
 - **`presenter_mode.py`** — Provider-neutral presenter-mode sentinel policy.
 - **`proactive_claim_fence.py`** — Proactive claim lifecycle on the outbox ClaimBackend seam.
+- **`proactive_dispatch_gate.py`** — Whether a proactive message about a task may still be sent, asked right before the send.
 - **`proactive_recovery.py`** — Restart recovery for proactively delivered result files.
 - **`proactive_routing.py`** — Channel routing for proactive owner-notification messages.
 - **`process_pins.py`** — Process-side restart pins: which running pids must NOT be restarted, and why.

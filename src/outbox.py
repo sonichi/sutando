@@ -848,8 +848,10 @@ def _write_item(root: Path, item_id: str, data: dict) -> None:
 
 
 def record_delivered(root: Path, item_id: str, *, provider: Optional[str] = None,
-                     destination: Optional[str] = None) -> None:
-    """Mark an item delivered and persist WHERE it went.
+                     destination: Optional[str] = None,
+                     provider_ref: Optional[str] = None) -> None:
+    """Mark an item delivered and persist WHERE it went and the provider's own reference
+    to it (a room message's event id).
 
     The log line naming provider/destination rotates; a receipt that omits them
     cannot answer "delivered to where" after that. Absent values are not stored,
@@ -862,8 +864,44 @@ def record_delivered(root: Path, item_id: str, *, provider: Optional[str] = None
         d["provider"] = provider
     if destination:
         d["destination"] = destination
+    if provider_ref:
+        d["provider_ref"] = provider_ref
+    d.pop("dispatching", None)
     _write_item(Path(root), item_id, d)
     _activity_completed(item_id)
+
+
+def record_dispatching(root: Path, item_id: str, incarnation: str) -> None:
+    """Under the item lock and its claim: a send is about to leave. A later claim that
+    still finds it knows that send may have landed and was never settled."""
+    d = _read_item(Path(root), item_id)
+    d["dispatching"] = {"incarnation": incarnation, "at": time.time()}
+    _write_item(Path(root), item_id, d)
+
+
+def clear_dispatching(root: Path, item_id: str) -> None:
+    """Under the item lock: the dispatch has an outcome, so nothing is left in doubt."""
+    d = _read_item(Path(root), item_id)
+    if d.pop("dispatching", None) is not None:
+        _write_item(Path(root), item_id, d)
+
+
+def record_provider_ref(root: Path, item_id: str, provider_ref: str,
+                        destination: Optional[str] = None) -> bool:
+    """The provider's proof that a send landed, and where, kept on the item before it is
+    completed, so a crash after the send settles it as delivered instead of sending it again.
+    False when the item is missing or already terminal."""
+    with _item_lock(Path(root), item_id):
+        if not _item_path(Path(root), item_id).exists():
+            return False
+        d = _read_item(Path(root), item_id)
+        if d.get("status") in ("DELIVERED", "PARKED"):
+            return False
+        d["provider_ref"] = provider_ref
+        if destination:
+            d["destination"] = destination
+        _write_item(Path(root), item_id, d)
+        return True
 
 
 def _activity_completed(item_id: str) -> None:

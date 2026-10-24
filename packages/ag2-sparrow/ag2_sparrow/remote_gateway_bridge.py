@@ -311,19 +311,18 @@ from .bounded_file_read import read_regular, read_regular_text
 from .result_markers import parse_markers, render_skill_prelude
 from .result_markers import neutralize_markers
 from . import undelivered_quarantine
-from .proactive_routing import proactive_filename
+from .proactive_routing import about_task, proactive_filename
 from .team_guardrail import ag2space_tier_lines, owner_mention_lines
 from . import team_result_guard
 from . import health_command
 from . import __version__ as _PACKAGE_VERSION
-from .outbox import DeliveryOutcome, record_delivered
+from .outbox import record_provider_ref
 from .outbox import RetrySchedule, delivered_body_differs, read_item, source_digest
 from .outbox import list_items, requeue_item_with_epoch, RequeueOutcome
 from .proactive_recovery import claim_owner_may_be_alive as _pid_alive
-from .outbox_adapter import classify_response
-from .send_failure_policy import MAX_TRANSIENT_ATTEMPTS, resolve_failed_send
-from .delivery_core import (DeliveryCore, DesignAClaimBackend, DrainStatus,
-                            RetryPolicy)
+from .send_failure_policy import MAX_TRANSIENT_ATTEMPTS
+from .delivery_core import (WITHDRAWN, DeliveryCore, DesignAClaimBackend, DrainStatus,
+                            ProviderRefused, RetryPolicy)
 from .delivery_core import DeliveryOutcome as CoreDeliveryOutcome
 from .delivery_core import is_refused_for_good
 from .delivery_core.provider_ag2space import AG2SpaceRoomMessageProvider, room_response_refused
@@ -355,16 +354,9 @@ _WITHHELD_DM_CACHE = _STATE / "withheld-review-dm.json"
 _WITHHELD_CONTROL_DIR = _STATE / "withheld-review-control-results"
 _GATEWAY_OWNER_DM_HINT = ""
 ARCHIVE_RESULTS_DIR = RESULTS_DIR / "archive"
-# Transient-failure count per polled `.txt` name; _resolve_send_failure bounds
-# retries at MAX_TRANSIENT_ATTEMPTS then parks. In-memory: resets on restart.
-_PROACTIVE_ATTEMPTS: "dict[str, int]" = {}
 # tids THIS process redelivered. Not a file: the collaborator path has full
 # workspace write, so any sidecar it can create is provenance it can forge.
 _REDELIVERED: "set[str]" = set()
-try:  # pragma: no cover - exercised by whichever context imports it
-    from .send_failure_policy import UnconfirmedDelivery as _UnconfirmedDelivery
-except ImportError:  # pragma: no cover - flat src/ import path
-    from send_failure_policy import UnconfirmedDelivery as _UnconfirmedDelivery
 
 # Terminal resting place for proactive nudges that can never be delivered.
 # results/undelivered/ is the repo-wide quarantine convention — health-check's
@@ -938,10 +930,11 @@ def _stale_review_write(path: Path, step: str) -> None:
 _DEFINITE_PUBLISH_FAILURES = ("permanent-refusal", "max-attempts", "retry-window-exhausted")
 
 
-def _post_room_message(room: str, body: str, dedupe_key: str) -> dict:
+def _post_room_message(room: str, body: str, dedupe_key: str, thread_root: "str | None" = None) -> dict:
     """The room-message send for an outbox provider: one /v1/room message POST."""
     return _req("POST", "/v1/room", {"op": "message", "room_id": room, "body": body,
-                                     "dedupe_key": dedupe_key}, timeout=20)
+                                     "dedupe_key": dedupe_key,
+                                     **({"thread_root": thread_root} if thread_root else {})}, timeout=20)
 
 
 def _record_release_receipt(item_id: str, event_id: str) -> None:
@@ -1863,6 +1856,9 @@ PROACTIVE_ROOM_GATE: Callable[[Path, str], bool] | None = None
 # Host-injected (old_room, replacement_room) -> None, owed once per upgrade of the owner
 # DM to a room this agent is not in; raising is a failure and is retried, bounded.
 OWNER_DM_UPGRADED_NOTIFY: Callable[[str, str], None] | None = None
+# Host-injected task_id -> veto reason or None, asked right before a message about that task
+# is sent; None (standalone default) checks only the task's own result.
+PROACTIVE_DISPATCH_GATE: Callable[[str], "str | None"] | None = None
 # Routing state belongs to the gateway (owner 2026-09-07): the agent row's owner_dm_room is read at
 # connect and on a slow cadence and kept while offline; the pinned room is bootstrap, never authority.
 _ROUTING: dict = {"owner_dm": "", "persisted": "", "identity": "", "gateway": "", "next": 0.0,
@@ -1991,14 +1987,6 @@ def _engine_desc() -> str:
         return "DeliveryCore(unbuilt)"
     return (f"DeliveryCore({type(c.backend).__name__}"
             f"->{type(c.provider).__name__})")
-# Opt-in compat for brokers whose /v1/room answers {"ok": true} with no
-# event_id: trust the bare ok as delivered (at-least-once beats never).
-_PROACTIVE_TRUST_OK_ENV = os.environ.get("REMOTE_PROACTIVE_TRUST_OK")
-PROACTIVE_TRUST_OK = (
-    _PROACTIVE_TRUST_OK_ENV
-    if _PROACTIVE_TRUST_OK_ENV is not None
-    else _config_from_channel_env("REMOTE_PROACTIVE_TRUST_OK")
-) == "1"
 # The ONE auth-header dict shared with long-lived consumers (event channel,
 # card poster). They must hold this dict BY REFERENCE (no copy) so a token
 _AUTH_HEADERS = {"Authorization": f"Bearer {TOKEN}"}
@@ -5569,16 +5557,75 @@ def _room_is_deliverable_here(room: str) -> bool:
     return room.split(":", 1)[1] == own
 
 
-def _record_proactive_receipt(item_id: str, room: str) -> None:
-    """Durable "delivered where" for the proactive leg. The log line naming the
-    room rotates; this outlives it. Fail-open: a receipt write must never
-    unwind a delivery that already happened."""
+_EVENT_ID_RE = re.compile(r"\$\S+")
+_ROOM_UPGRADED = "room-upgraded"
+
+
+def _proactive_outbox_root() -> Path:
+    return RESULTS_DIR / ".outbox-ag2space-proactive"
+
+
+def _record_proactive_receipt(item_id: str, event_id: str) -> None:
+    """The event id a proactive send returned, kept on its outbox item before the outbox
+    is told it was delivered; raises when it cannot be kept."""
+    root = _proactive_outbox_root()
+    room = json.loads((read_item(root, item_id) or {}).get("payload") or "{}").get("room_id")
+    if not record_provider_ref(root, item_id, event_id, destination=room):
+        raise OSError(f"proactive receipt for {item_id} not recorded")
+
+
+def _proactive_item_id(stem: str, envelope: dict) -> str:
+    """One outbox item per file, body and destination: a change to any of them is another send."""
+    digest = hashlib.sha256(json.dumps(envelope, sort_keys=True).encode("utf-8")).hexdigest()
+    return f"{stem}~{digest[:16]}"
+
+
+def _about_task_headers(tid: str) -> dict:
+    """The routing headers of the task a proactive message is about; {} when it cannot be read.
+    The trusted scan applies only to a file this gateway wrote and declared task-mid."""
+    path = find_archived_task(TASKS_DIR, tid)
+    if path is None:
+        return {}
     try:
-        record_delivered(RESULTS_DIR / ".outbox-ag2space-proactive", item_id,
-                         provider="ag2space-proactive", destination=room)
-    except Exception as e:  # noqa: BLE001 — receipt is best-effort by design
-        _log(f"proactive receipt write failed for {item_id}: {diagnostics.describe(e)} "
-             "(delivery unaffected)")
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return {}
+    strict = local_task_protocol.parse_task_headers(text).headers
+    if strict.get("task_layout") == "mid":
+        return local_task_protocol.parse_task_headers_trusted(text).headers
+    return strict
+
+
+def _task_thread_root(headers: dict, room: str) -> "str | None":
+    """The thread a message about a task goes in: an ask inside a thread keeps that thread's
+    root; a top-level ask is rooted at its own message. None outside the task's own room."""
+    task_room = headers.get("source_room_id") or headers.get("channel_id")
+    if not room or task_room != room:
+        return None
+    if headers.get("thread_root"):
+        root = headers["thread_root"]
+        return root if _EVENT_ID_RE.fullmatch(root) else None
+    source = headers.get("source_message_id") or ""
+    return source if _EVENT_ID_RE.fullmatch(source) else None
+
+
+def _proactive_dispatch_veto(item_id: str, payload: bytes) -> "str | None":
+    """Asked by the outbox right before the send: a message about a task that has been
+    answered, has ended, waits on the owner or is being cancelled is withdrawn."""
+    try:
+        tid = json.loads(payload.decode("utf-8")).get("task_id")
+    except (UnicodeDecodeError, ValueError, AttributeError):
+        return None
+    if not tid:
+        return None
+    if (RESULTS_DIR / f"{tid}.txt").exists() or _delivered_copy_exists(tid):
+        return "the task has been answered"
+    if PROACTIVE_DISPATCH_GATE is None:
+        return None
+    try:
+        return PROACTIVE_DISPATCH_GATE(tid)
+    except Exception as exc:  # noqa: BLE001 - an unchecked task is never messaged
+        return f"the task could not be checked ({diagnostics.describe(exc)})"
 
 
 def _recover_orphan_proactive() -> None:
@@ -5636,27 +5683,6 @@ def _retire_proactive(claim: Path, original: Path, dest_dir: Path) -> None:
             claim.rename(original)
         except OSError:
             pass
-
-
-def _resolve_send_failure(claim, original, exc) -> str:
-    """Bounded retry: decision AND file moves are the shared policy's
-    (send_failure_policy.resolve_failed_send). This binder passes sparrow's
-    pid-scoped claim's real body path — with_suffix() cannot derive it — and
-    the park directory, then renders the bridge's log phrase. Single sends
-    can't partially deliver, so `progressed` stays False here.
-
-    Returns the phrase for the caller's log line.
-    """
-    tried = _PROACTIVE_ATTEMPTS.get(original.name, 0)
-    outcome = resolve_failed_send(
-        claim, exc, _PROACTIVE_ATTEMPTS,
-        body=original, undelivered_dir=UNDELIVERABLE_RESULTS_DIR)
-    if outcome == "retried":
-        return f"will retry ({tried + 1}/{MAX_TRANSIENT_ATTEMPTS})"
-    if outcome == "parked":
-        return (f"PARKED to {UNDELIVERABLE_RESULTS_DIR.name}/ after {tried + 1} "
-                "send attempt(s) — it will NOT be re-sent")
-    return "stuck"
 
 
 def _upgrade_hold_file() -> Path:
@@ -5885,62 +5911,102 @@ def _post_proactive() -> None:
             continue
         dest_room = resolve_destination(CURRENT_ROOM, room_id=room_override) if room_override else resolve_destination(OWNER_PRIVATE)
         thread_root = _proactive_thread_root(claimed_text, f.name)
-        try:
-            resp = _req("POST", "/v1/room",
-                        {"op": "message",
-                         "room_id": dest_room,
-                         "body": body,
-                         **({"thread_root": thread_root} if thread_root else {})},
-                        timeout=15)
-            # A bare 200 is NOT proof of delivery: the gateway can swallow a
-            # room-send failure server-side (bad room id, kicked agent,
-            receipt = classify_response(200, resp, id_keys=("event_id",))
-            delivered = receipt.outcome is DeliveryOutcome.CONFIRMED or (
-                PROACTIVE_TRUST_OK and isinstance(resp, dict) and resp.get("ok") is True
-            )
-            if not delivered:
-                # Accepted but unconfirmed. It may ALSO have been delivered, so
-                # the retry must be bounded — an unbounded one duplicates.
-                outcome = _resolve_send_failure(
-                    claim, f, _UnconfirmedDelivery("no event_id in response"))
-                _log(f"proactive send for {f.name} got no delivery signal "
-                     f"(a {type(resp).__name__} answer with no event_id) — {outcome}; check "
-                     "REMOTE_PROACTIVE_ROOM and the agent's room membership")
-                continue
-        except urllib.error.HTTPError as e:
-            if e.code in (401, 403):
-                try:
-                    claim.rename(f)  # un-claim before auth handling takes over
-                except OSError:
-                    pass
-                raise
-            replacement = None
-            if e.code == 400 and room_override is None:
-                err_body = _http_error_body(e)
-                replacement = _room_upgraded_to(err_body)
-            if replacement is not None:
-                try:
-                    claim.rename(f)  # stays pending: not a failed attempt, the room moved
-                except OSError:
-                    pass
-                _hold_owner_dm_upgrade(dest_room, replacement, noticed)
-                continue
-            outcome = _resolve_send_failure(claim, f, e)
-            _log(f"proactive send failed for {f.name}: HTTP {e.code} — {outcome}")
-            continue
-        except (urllib.error.URLError, TimeoutError) as e:
-            outcome = _resolve_send_failure(claim, f, e)
-            _log(f"proactive send network error for {f.name}: {diagnostics.describe(e)} — {outcome}")
-            continue
-        _record_proactive_receipt(f.stem, dest_room)
+        about = about_task(f.name)
+        if about:
+            thread_root = _task_thread_root(_about_task_headers(about), dest_room) or thread_root
+        envelope = {"room_id": dest_room, "body": body,
+                    **({"thread_root": thread_root} if thread_root else {}),
+                    **({"task_id": about} if about else {})}
+        _send_proactive(claim, f, envelope, room_override is None, noticed)
+
+
+def _send_proactive(claim: Path, f: Path, envelope: dict, owner_dm: bool, noticed: set) -> None:
+    """Hand one claimed proactive file to the outbox, which owns the claim, the send and its
+    outcome, then move the file as that outcome says. An uncertain send is parked, not resent."""
+    core = _delivery_core("proactive")
+    item_id = _proactive_item_id(f.stem, envelope)
+    payload = json.dumps(envelope, sort_keys=True).encode("utf-8")
+    seen = _PROACTIVE_SEND.__dict__.setdefault("seen", {})
+    seen.clear()
+    core.backend.publish(item_id, payload)
+    if (read_item(core.backend.root, item_id) or {}).get("reason") == _ROOM_UPGRADED:
+        # The gateway refused it for an upgraded room, so it never posted; the hold is gone now.
+        requeue_item_with_epoch(core.backend.root, item_id, reset_attempts=True,
+                                operator=core.worker, reason="the room is no longer held")
+    result = core.deliver_one(item_id, payload)
+    item = read_item(core.backend.root, item_id) or {}
+    status, room = item.get("status"), envelope["room_id"]
+    if status == "DELIVERED":
         ARCHIVE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
         try:
             claim.rename(ARCHIVE_RESULTS_DIR / f"{f.stem}-{int(time.time())}.txt")
         except OSError:
             claim.unlink(missing_ok=True)
-        _PROACTIVE_ATTEMPTS.pop(f.name, None)
-        _ENGINE_COUNTS["legacy_sends"] += 1
-        _log(f"delivered proactive {f.name} to {dest_room}")
+        if result.status is DrainStatus.ATTEMPTED and result.detail != "settled by a recorded receipt":
+            _ENGINE_COUNTS["core_confirmed"] += 1
+            _log(f"delivered proactive {f.name} to {room} ({item.get('provider_ref')})")
+        else:
+            _log(f"proactive {f.name} was already delivered to {room} "
+                 f"({item.get('provider_ref') or 'receipt recorded'}) — archived, not sent again")
+        return
+    replacement = seen.get("room_upgraded")
+    if replacement is not None and status != "PARKED":
+        core.backend.park(item_id, _ROOM_UPGRADED)  # never posted; a repointed DM is a new item
+        if owner_dm:
+            try:
+                claim.rename(f)  # stays pending: the room moved, the DM's repointing sends it
+            except OSError:
+                pass
+            _hold_owner_dm_upgrade(room, replacement, noticed)
+            return
+        status, item = "PARKED", read_item(core.backend.root, item_id) or {}
+    if status == "PARKED":
+        reason = str(item.get("reason") or "")
+        if reason.startswith(f"{WITHDRAWN}:"):
+            # Nothing is owed: archived like a skip marker; the outbox item says it was not sent.
+            _retire_proactive(claim, f, ARCHIVE_RESULTS_DIR)
+            _log(f"proactive {f.name} withdrawn before its send: {reason[len(WITHDRAWN) + 1:]} — not sent")
+            return
+        _retire_proactive(claim, f, UNDELIVERABLE_RESULTS_DIR)
+        if reason == "outcome-unknown":
+            _log(f"proactive {f.name} may have reached {room} but the send was not confirmed "
+                 f"({result.detail or 'no outcome'}); PARKED to {UNDELIVERABLE_RESULTS_DIR.name}/, not "
+                 f"sent again. Check the room first; to send it again (it may post twice): "
+                 f"{_requeue_command(core.backend.root, item_id)}")
+        else:
+            _log(f"proactive {f.name} PARKED to {UNDELIVERABLE_RESULTS_DIR.name}/ ({reason}"
+                 f"{': ' + result.detail if result.detail else ''}) — it will NOT be re-sent")
+        return
+    try:
+        claim.rename(f)  # still owed: the outbox's retry schedule decides when it is tried again
+    except OSError as e:
+        _log(f"CRITICAL: proactive {claim.name} could not be handed back ({diagnostics.describe(e)})")
+    if result.status is DrainStatus.ATTEMPTED:
+        _log(f"proactive send for {f.name} was not delivered ({result.detail}) — will retry")
+    if "auth" in seen:
+        raise seen["auth"]
+
+
+# Per thread, what the proactive sender saw that the drain acts on once the outbox has
+# settled the send: an auth refusal to re-raise, and the room a 400 says replaced the target.
+_PROACTIVE_SEND = threading.local()
+
+
+def _post_proactive_message(room: str, body: str, dedupe_key: str, thread_root: "str | None" = None) -> dict:
+    """The proactive lane's sender: one room message POST, read for the two refusals the drain
+    handles itself. Both are definite non-deliveries, so neither is ever parked as uncertain."""
+    try:
+        return _post_room_message(room, body, dedupe_key, thread_root)
+    except urllib.error.HTTPError as e:
+        seen = _PROACTIVE_SEND.__dict__.setdefault("seen", {})
+        if e.code in (401, 403):
+            seen["auth"] = e
+        elif e.code == 400:
+            replacement = _room_upgraded_to(_http_error_body(e))
+            if replacement is not None:
+                seen["room_upgraded"] = replacement
+                raise ProviderRefused(f"room {room} was upgraded") from e
+        raise
 
 
 def _load_inflight() -> set[str]:
@@ -6073,6 +6139,10 @@ _DELIVERY_CORE: "DeliveryCore | None" = None
 _WITHHELD_OUTBOX: "DeliveryCore | None" = None
 
 
+# Proactive messages: at most one send each, an uncertain one parked for the operator.
+_PROACTIVE_CORE: "DeliveryCore | None" = None
+
+
 # The results outbox again, under the relay rule: a relay ask's result.
 _RELAY_CORE: "DeliveryCore | None" = None
 
@@ -6136,18 +6206,23 @@ def _failed_in_place_of(stored: str) -> "str | None":
 def _delivery_core(lane: str = "result") -> DeliveryCore:
     """The one construction site of a delivery outbox: gateway results over idempotent
     result POSTs (`relay`: the same outbox under the relay rule), or an owner-released
-    withheld result over an at-most-once room send."""
-    global _DELIVERY_CORE, _WITHHELD_OUTBOX, _RELAY_CORE
-    withheld, relay = lane == "withheld", lane == "relay"
+    withheld result or a proactive message over an at-most-once room send."""
+    global _DELIVERY_CORE, _WITHHELD_OUTBOX, _RELAY_CORE, _PROACTIVE_CORE
+    withheld, relay, proactive = lane == "withheld", lane == "relay", lane == "proactive"
     root = (RESULTS_DIR / f".outbox-withheld-review{_INST_SUFFIX}" if withheld
+            else _proactive_outbox_root() if proactive
             else gateway_instance.outbox_root(RESULTS_DIR, GATEWAY_INSTANCE))
-    current = _WITHHELD_OUTBOX if withheld else _RELAY_CORE if relay else _DELIVERY_CORE
+    current = (_WITHHELD_OUTBOX if withheld else _RELAY_CORE if relay
+               else _PROACTIVE_CORE if proactive else _DELIVERY_CORE)
     if current is None or current.backend.root != root:
         # Late-bound senders, so token rotation and a test's _req double reach them mid-process.
         # A relay result's room send is the broker's, with its own dead letter: its accept is
         # final here, or a send the broker dead-letters would be retried with no ceiling.
         provider = (AG2SpaceRoomMessageProvider(lambda *a: _post_room_message(*a),
                                                 lambda *a: _record_release_receipt(*a)) if withheld
+                    else AG2SpaceRoomMessageProvider(lambda *a: _post_proactive_message(*a),
+                                                     lambda *a: _record_proactive_receipt(*a))
+                    if proactive
                     else AG2SpaceResultProvider(lambda *a, **k: _req(*a, **k), read_back=not relay))
         current = DeliveryCore(
             DesignAClaimBackend(root, retry_schedule=_RELAY_RETRY if relay else RetrySchedule(),
@@ -6155,12 +6230,17 @@ def _delivery_core(lane: str = "result") -> DeliveryCore:
                                 replace_refused=_failed_in_place_of if relay else None),
             provider,
             policy=RetryPolicy(max_attempts=MAX_TRANSIENT_ATTEMPTS,
-                               defer_idempotent_resend=not withheld),
-            worker="withheld-review-publication" if withheld else "gateway-result-drain")
+                               defer_idempotent_resend=not (withheld or proactive),
+                               park_interrupted_send=proactive),
+            worker=("withheld-review-publication" if withheld else "gateway-proactive-drain"
+                    if proactive else "gateway-result-drain"),
+            revalidate=(lambda *a: _proactive_dispatch_veto(*a)) if proactive else None)
         if withheld:
             _WITHHELD_OUTBOX = current
         elif relay:
             _RELAY_CORE = current
+        elif proactive:
+            _PROACTIVE_CORE = current
         else:
             _DELIVERY_CORE = current
     return current

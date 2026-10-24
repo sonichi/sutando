@@ -503,9 +503,9 @@ HTTP 401/403 (while polling recovers authentication), 408, 425, 429, 5xx and
 transport failures are retryable. Other 4xx responses,
 malformed envelopes and explicit decline envelopes are permanent refusals and
 park on the first attempt. This policy applies to the gateway **task-result**
-leg only; proactive room sends and other providers keep their existing retry
-policy. Providers without an idempotent-send or reconciliation capability still
-park an ambiguous outcome rather than retrying it automatically.
+leg only; proactive room sends follow "Proactive room sends" below. Providers
+without an idempotent-send or reconciliation capability still park an ambiguous
+outcome rather than retrying it automatically.
 
 The outbox item stores its start, absolute deadline, next eligible time and
 failure count atomically under the delivery claim lock. A restart retains these
@@ -557,6 +557,35 @@ Existing parked records and historical quarantined replies are **not** migrated
 or replayed automatically, except a relay ask's result an older bridge parked
 (below). Live nonterminal records without a schedule acquire one on their next
 claim.
+
+### Proactive room sends
+
+Each `results/proactive-*.txt` is one outbox item (`results/.outbox-ag2space-proactive/`),
+keyed by its file name and a digest of its room, thread and body, and sent as one
+`POST /v1/room` `op: message` with that item's `dedupe_key` (and `thread_root` when it
+posts in a thread). The outbox owns the claim, the retry and the outcome; the drain only
+moves the file as the outcome says. The room send is neither idempotent nor reconcilable,
+so:
+
+- **Only a Matrix event id confirms.** It is recorded on the item (`provider_ref`) before
+  the item is marked delivered; the file is then archived. A bare `{"ok": true}` never
+  confirms, and there is no setting that trusts it.
+- **An uncertain send is parked, never resent.** A timeout, a 5xx, an accept with no event
+  id, or a process that died after the send began leaves the item `PARKED`
+  (`outcome-unknown`) and moves the file to `results/undelivered/`. The log names the
+  `outbox_cli.py requeue` command; check the room first, since a requeue may post twice.
+  A process that died after the event id was recorded settles the item as delivered.
+- **A definite refusal is retried** on the outbox's schedule (the same window and backoff
+  as task results, counted on the item, so a restart keeps the count): 401/403, 408, 425,
+  429, and a connection that was refused or a host that did not resolve. Another 4xx parks
+  at once. A 400 naming an upgraded owner DM holds the file until the DM is repointed.
+- **A message about a task** is named `proactive-about-<task id>--<ts>.txt`
+  (`proactive_routing.about_task_filename`). In the task's own room it posts in the task's
+  thread: an ask already in a thread keeps that thread's root, a top-level ask is rooted at
+  its source message. Right before its send it is checked again: an answered, ended or
+  cancelled task, or one waiting on the owner, withdraws it (archived, item parked
+  `withdrawn:<reason>`, nothing posted). The task's result is checked by the bridge; the
+  rest by the host's `PROACTIVE_DISPATCH_GATE` (Sutando: `src/proactive_dispatch_gate.py`).
 
 ### A relay ask's result (no ceiling)
 

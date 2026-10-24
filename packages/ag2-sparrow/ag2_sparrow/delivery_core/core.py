@@ -8,25 +8,37 @@ Retry policy (normative):
   then act on the resolved outcome) or idempotent-send (safe re-send;
   still-ambiguous after the re-send completes as a retryable attempt —
   the license makes every later re-send exactly as safe as this one);
-- absent such a license, ambiguous is never auto-relabeled NOT_DELIVERED.
+- absent such a license, ambiguous is never auto-relabeled NOT_DELIVERED;
+  under `park_interrupted_send` a send is also marked before it leaves: a later
+  claim that finds the mark with no recorded receipt parks it OUTCOME_UNKNOWN
+  instead of sending again, and one that finds a receipt settles it CONFIRMED;
+- an optional `revalidate` hook is asked right before the send; a reason
+  withdraws the item (parked, never sent).
 
 Delivered evidence is written only AFTER the send returns (evidence is
 risk control, not proof — invariant 8)."""
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Callable, Optional
 
 from .contract import (ClaimBackend, DeliveryAttempt, DeliveryOutcome, DeliveryProvider,
                        DrainResult, DrainStatus, ProviderIndeterminate,
                        ProviderRefused, ProviderPermanentRefused, RecoverReport)
 
 
+# The park reason's prefix for an item `revalidate` withdrew before its send.
+WITHDRAWN = "withdrawn"
+
+
 @dataclass(frozen=True)
 class RetryPolicy:
     """Attempt ceiling for default backends; timed backends enforce an elapsed window.
-    Deferred resends require the provider's idempotent-send capability."""
+    Deferred resends require the provider's idempotent-send capability. A send a crash
+    interrupted is parked, not resent, under `park_interrupted_send` (unlicensed providers)."""
     max_attempts: int = 3
     defer_idempotent_resend: bool = False
+    park_interrupted_send: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.max_attempts, int) or self.max_attempts < 1:
@@ -58,11 +70,27 @@ def _read_receipt(receipt):
 class DeliveryCore:
     def __init__(self, backend: ClaimBackend, provider: DeliveryProvider,
                  policy: RetryPolicy | None = None,
-                 worker: str = "delivery-core"):
+                 worker: str = "delivery-core",
+                 revalidate: Optional[Callable[[str, bytes], Optional[str]]] = None):
         self.backend = backend
         self.provider = provider
         self.policy = policy or RetryPolicy()
         self.worker = worker
+        self.revalidate = revalidate
+
+    def _complete(self, token, outcome, destination=None, ref=None, **extra) -> None:
+        if ref and getattr(self.backend, "persists_provider_ref", False):
+            extra["provider_ref"] = ref
+        self.backend.complete(token, outcome, park_at_attempts=self.policy.max_attempts,
+                              provider=type(self.provider).__name__,
+                              destination=destination, **extra)
+
+    def _guards_dispatch(self) -> bool:
+        """Unlicensed resends need a durable mark of every send, from a backend that keeps one."""
+        caps = self.provider.capabilities
+        return (self.policy.park_interrupted_send
+                and not caps.reconcile_capable and not caps.idempotent_send
+                and callable(getattr(self.backend, "mark_dispatching", None)))
 
     def _attempt(self, item_id: str, payload: bytes,
                  key: str) -> tuple:
@@ -115,6 +143,25 @@ class DeliveryCore:
         if callable(stored_payload):
             payload = stored_payload(token)
         key = idempotency_key(item_id, _resend_epoch(self.backend, item_id))
+        guarded = self._guards_dispatch()
+        if guarded:
+            receipt_ref, interrupted = self.backend.prior_dispatch(token)
+            if receipt_ref:
+                self._complete(token, DeliveryOutcome.CONFIRMED, ref=receipt_ref)
+                return DrainResult(status=DrainStatus.ATTEMPTED, outcome=DeliveryOutcome.CONFIRMED,
+                                   provider_ref=receipt_ref, detail="settled by a recorded receipt")
+            if interrupted:
+                self._complete(token, DeliveryOutcome.OUTCOME_UNKNOWN)
+                return DrainResult(status=DrainStatus.ATTEMPTED,
+                                   outcome=DeliveryOutcome.OUTCOME_UNKNOWN,
+                                   detail="an earlier send was interrupted before its outcome")
+        veto = self.revalidate(item_id, payload) if self.revalidate is not None else None
+        if veto:
+            self._complete(token, DeliveryOutcome.NOT_DELIVERED,
+                           terminal_reason=f"{WITHDRAWN}:{veto}")
+            return DrainResult(status=DrainStatus.WITHDRAWN, detail=veto)
+        if guarded and not self.backend.mark_dispatching(token):
+            return DrainResult(status=DrainStatus.NOT_CLAIMED)
         outcome, destination, ref, permanent, detail = self._attempt(item_id, payload, key)
         if outcome is DeliveryOutcome.OUTCOME_UNKNOWN:
             caps = self.provider.capabilities
@@ -135,10 +182,7 @@ class DeliveryCore:
         # The ceiling rides WITH the completion: parking after the claim
         # is released lets a successor confirm in the gap.
         terminal = {"terminal_reason": "permanent-refusal"} if permanent else {}
-        self.backend.complete(token, outcome,
-                              park_at_attempts=self.policy.max_attempts,
-                              provider=type(self.provider).__name__,
-                              destination=destination, **terminal)
+        self._complete(token, outcome, destination=destination, ref=ref, **terminal)
         return DrainResult(status=DrainStatus.ATTEMPTED, outcome=outcome,
                            provider_ref=ref, detail=detail)
 
