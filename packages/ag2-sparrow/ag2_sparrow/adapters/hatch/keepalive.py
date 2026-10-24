@@ -211,6 +211,11 @@ def _spawn_sparrow(cfg: dict) -> "tuple[bool, str]":
         return False, f"{_cli.SPARROW_COMMAND} not found beside {sys.executable} or on PATH"
     env = dict(os.environ, AG2_DEVICE_ENV=str(_cli.device_env_path()),
                REMOTE_HEALTH_COMMAND=health_command(_command(cfg)))
+    mxid = _cli.saved_mxid(cfg.get("AGENT_MXID"))
+    if mxid:
+        env["AGENT_MXID"] = mxid
+    else:
+        print(_cli.NO_SAVED_MXID, file=sys.stderr)
     for key, var in (("TASK_DIR", "AGENT_CONNECT_TASK_DIR"),
                      ("RESULT_DIR", "AGENT_CONNECT_RESULT_DIR"),
                      ("STATE_DIR", "AGENT_CONNECT_STATE_DIR")):

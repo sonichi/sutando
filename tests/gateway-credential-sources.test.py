@@ -182,6 +182,13 @@ class PureContractCases:
         self.assertEqual(self.c.code_field("reenroll_disabled", registry), "reenroll_disabled")
         self.assertIsNone(self.c.code_field("has space", registry))
         self.assertIsNone(self.c.code_field("query-secret-3", None, URL_SECRET_URL))
+        # A setup revision has one spelling on both sides: an integer is its decimal text, then code_field.
+        self.assertEqual(self.c.revision_field(41, registry), "41")
+        self.assertEqual(self.c.revision_field("r41", registry), "r41")
+        self.assertIsNone(self.c.revision_field(7, registry), "a digit of the secret is a piece of it")
+        for value in (True, False, 41.0, None, "has space", "bearer-secret-value-77", "secret-value-77"):
+            self.assertIsNone(self.c.revision_field(value, registry), value)
+        self.assertIsNone(self.c.revision_field("query-secret-3", None, URL_SECRET_URL))
 
     def test_url_parts_are_registered_and_redacted(self):
         registry = self.c.SecretRegistry()

@@ -46,6 +46,10 @@ def version_field(value: Any) -> "str | None":
     return gateway_credentials.version_field(value, REGISTRY)
 
 
+def revision_field(value: Any, gateway_url: str = "") -> "str | None":
+    return gateway_credentials.revision_field(value, REGISTRY, gateway_url)
+
+
 def describe(exc: BaseException) -> str:
     return gateway_credentials.describe(exc, REGISTRY)
 

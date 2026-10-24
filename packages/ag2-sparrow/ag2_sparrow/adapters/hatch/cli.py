@@ -507,8 +507,20 @@ def keepawake_note(reply_command: str, keepalive_on: bool = True) -> str:
     return f"the agent keeps Sparrow running with {cmd} from its scheduler"
 
 
+NO_SAVED_MXID = ("NOTE sparrow: the install config holds no AGENT_MXID, so this Sparrow runs with no "
+                 "agent identity and cannot resolve the owner's DM; run ag2-sparrow-hatch install "
+                 "--mxid <mxid>")
+
+
+def saved_mxid(value) -> str:
+    """The AGENT_MXID install saved, '' when absent or not an MXID: Sparrow gets no default."""
+    mxid = (value or "").strip() if isinstance(value, str) else ""
+    return mxid if valid_mxid(mxid) else ""
+
+
 def install_service(task_dir: Path, result_dir: Path, state_dir: Path, instance: str,
-                    force: bool, health_command: str = "", reply_command: str = "") -> bool:
+                    force: bool, health_command: str = "", reply_command: str = "",
+                    mxid: str = "") -> bool:
     """Write, enable and start the ag2-sparrow user service. Each problem prints a NOTE saying
     what was not done and how to finish by hand; True only when this install stopped the service
     and left it stopped, which fails the install."""
@@ -537,6 +549,10 @@ def install_service(task_dir: Path, result_dir: Path, state_dir: Path, instance:
              "the token Sparrow uses")
     env = {"AG2_DEVICE_ENV": str(device_env), "AGENT_CONNECT_TASK_DIR": str(task_dir),
            "AGENT_CONNECT_RESULT_DIR": str(result_dir), "AGENT_CONNECT_STATE_DIR": str(state_dir)}
+    if saved_mxid(mxid):
+        env["AGENT_MXID"] = saved_mxid(mxid)
+    else:
+        print(NO_SAVED_MXID, file=sys.stderr)
     if instance:
         env["GATEWAY_INSTANCE"] = instance
     try:
@@ -714,7 +730,7 @@ def _install(args) -> int:
         left_stopped = install_service(task_dir.resolve(), result_dir.resolve(), state_dir.resolve(), instance,
                                        args.force,
                                        "" if args.no_keepalive else keepalive.health_command(reply_command),
-                                       reply_command)
+                                       reply_command, mxid=args.mxid)
     if args.no_keepalive:
         print("skipped: the keepalive task (--no-keepalive)")
     else:

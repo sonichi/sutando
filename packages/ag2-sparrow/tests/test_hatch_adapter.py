@@ -1308,6 +1308,26 @@ class Service(Base):
                         AGENT_CONNECT_STATE_DIR=str(self.state), **env)
             return run_main(hatch_cli.main, args, base)
 
+    def test_the_unit_gets_no_agent_mxid_when_none_was_saved_and_says_so(self):
+        fake = FakeSystemd()
+        env = py_env(self.home)
+        env.update(PATH=f"{self.bin}:{os.environ['PATH']}", USER="hatch")
+        for mxid in ("", "not-an-mxid", " @spaced:ag2.space"):
+            with self.subTest(mxid=mxid):
+                out, err = io.StringIO(), io.StringIO()
+                with mock.patch.object(sm, "_run", side_effect=systemd_seam(fake)), \
+                        mock.patch.dict(os.environ, env, clear=True), \
+                        contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                    hatch_cli.install_service(self.tasks, self.results, self.state, "", True, mxid=mxid)
+                self.assertTrue(self.unit.is_file(), out.getvalue() + err.getvalue())
+                unit = self.unit.read_text()
+                if mxid.strip() and hatch_cli.valid_mxid(mxid.strip()):
+                    self.assertIn(f"\nEnvironment=AGENT_MXID={mxid.strip()}\n", unit)
+                    self.assertNotIn(hatch_cli.NO_SAVED_MXID, err.getvalue())
+                else:
+                    self.assertNotIn("AGENT_MXID", unit, "no identity is invented for the unit")
+                    self.assertEqual(err.getvalue().count(hatch_cli.NO_SAVED_MXID), 1, err.getvalue())
+
     def test_a_number_its_consumer_cannot_take_stops_reloads_and_starts_nothing(self):
         # The exact answer: an active unit, a 5,000-digit MainPID and a start timestamp.
         for name, change in [("5000-digit pid", {"MainPID": "7" * 5000})] + list(StartSparrow.OVERSIZED.items()):
@@ -1958,6 +1978,29 @@ class Keepalive(Base):
         self.assertEqual(shlex.split(command),
                          ["/opt/my tools/ag2-sparrow-hatch", "keepalive", "health"])
 
+    def test_a_started_sparrow_runs_as_the_saved_agent_mxid_and_gets_no_default_without_one(self):
+        self.installed()
+        seen = self.home / "sparrow-env"
+        stub = self.bin / "sparrow-stub"
+        executable(stub, f'#!/bin/sh\necho "${{AGENT_MXID-unset}}" > {seen}\nsleep 1\n')
+        cfg = self.call(lambda c: c)
+        self.assertEqual(cfg["AGENT_MXID"], AGENT)
+        for mxid, want in ((AGENT, AGENT), (None, "unset"), ("not-an-mxid", "unset"), ("", "unset")):
+            with self.subTest(saved=mxid):
+                seen.unlink(missing_ok=True)
+                saved = {k: v for k, v in cfg.items() if k != "AGENT_MXID"}
+                if mxid is not None:
+                    saved["AGENT_MXID"] = mxid
+                err = io.StringIO()
+                with mock.patch.object(hatch_cli, "_find_console_script", return_value=str(stub)), \
+                        mock.patch.object(keepalive, "SPAWN_SETTLE_S", 0.3), \
+                        mock.patch.dict(os.environ, {"HOME": str(self.home)}), \
+                        contextlib.redirect_stderr(err):
+                    ok, how = keepalive._spawn_sparrow(saved)
+                self.assertTrue(ok, how)
+                self.assertEqual(seen.read_text().strip(), want)
+                self.assertEqual(hatch_cli.NO_SAVED_MXID in err.getvalue(), want == "unset", err.getvalue())
+
     def test_the_service_unit_carries_the_health_command(self):
         self.installed()
         fake = FakeSystemd()
@@ -1973,6 +2016,9 @@ class Keepalive(Base):
             self.assertIn(f'\nEnvironment="REMOTE_HEALTH_COMMAND={self.reply_stub} keepalive '
                           'health"\n', unit)
             self.assertIn(f"\nEnvironment=AGENT_CONNECT_TASK_DIR={self.tasks.resolve()}\n", unit)
+            self.assertIn(f"\nEnvironment=AGENT_MXID={AGENT}\n", unit,
+                          "the service's Sparrow runs as the identity install saved")
+            self.assertNotIn(hatch_cli.NO_SAVED_MXID, r.stdout + r.stderr)
             self.cli("install", "--mxid", AGENT, "--no-keepalive")
             unit = (self.home / ".config" / "systemd" / "user" / hatch_cli.SERVICE_NAME).read_text()
             self.assertNotIn("REMOTE_HEALTH_COMMAND", unit)

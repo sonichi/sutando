@@ -16,7 +16,7 @@ import sys
 from importlib import resources
 from pathlib import Path
 
-from ... import gateway_instance, setup_fetch, task_io
+from ... import diagnostics, gateway_instance, setup_fetch, task_io
 from . import cli as _cli
 
 TEXT_SCHEMA_VERSION = 1
@@ -99,7 +99,8 @@ def current_cache(state_dir: Path, instance: str = "") -> "dict | None":
     None, so the built-in text and defaults apply until a revision it keeps is fetched."""
     cached, announced = load_cache(state_dir), announced_revision(state_dir, instance)
     if cached is None or _announcement_refused(state_dir, instance) \
-            or (announced is not None and cached.get("revision") != announced):
+            or (announced is not None
+                and diagnostics.revision_field(cached.get("revision")) != announced):
         return None
     return cached
 
@@ -108,9 +109,8 @@ def setup_problem(setup) -> str:
     """Why a fetched setup must not be cached; '' when it may."""
     if not isinstance(setup, dict):
         return "not an object"
-    revision = setup.get("revision")
-    if isinstance(revision, bool) or not isinstance(revision, (str, int)) \
-            or not str(revision).strip():
+    # The bridge keeps an announced revision only as revision_field spells it; so does the cache.
+    if diagnostics.revision_field(setup.get("revision")) is None:
         return "no revision"
     if "tunables" in setup and not isinstance(setup["tunables"], dict):
         return "tunables is not an object"
@@ -129,7 +129,8 @@ def refresh_cache(state_dir: Path, instance: str = "") -> "dict | None":
     if why:
         print(f"NOTE served setup: not cached: {why}", file=sys.stderr)
     else:
-        _cli._write(cache_path(state_dir), json.dumps(fetched, sort_keys=True), 0o600)
+        cached = {**fetched, "revision": diagnostics.revision_field(fetched["revision"])}
+        _cli._write(cache_path(state_dir), json.dumps(cached, sort_keys=True), 0o600)
     return current_cache(state_dir, instance)
 
 

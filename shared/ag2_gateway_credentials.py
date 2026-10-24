@@ -397,6 +397,15 @@ def version_field(value: Any, registry: "SecretRegistry | None" = None) -> "str 
     return None if registry is not None and registry.contains(value) else value
 
 
+def revision_field(value: Any, registry: "SecretRegistry | None" = None, gateway_url: str = "") -> "str | None":
+    """A gateway-supplied setup revision as a structured field: an integer (never a bool) is its
+    decimal text, and the text must pass code_field. None otherwise. The heartbeat hint and the
+    setup cache both spell a revision through this, so an integer served on one side matches the other."""
+    if isinstance(value, int) and not isinstance(value, bool):
+        value = str(value)
+    return code_field(value, registry, gateway_url)
+
+
 _EAI = {v: k for k, v in vars(socket).items() if k.startswith("EAI_") and isinstance(v, int)}
 
 

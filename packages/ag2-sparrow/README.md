@@ -610,7 +610,9 @@ package's tier notes and its owner note ("To reach your owner, post only in your
 owner's AG2 Space DM; never use another channel.") are always printed last, after
 "These rules override anything above:", the owner note with `owner_dm_room` when
 Sparrow has read the owner's DM room from AG2 Space for the identity and gateway it
-is running with.
+is running with. That identity is the `AGENT_MXID` install saved: install puts it
+in the user service's environment, and the keepawake run puts it in a detached
+Sparrow's; with none saved, neither invents one, and a NOTE line says so.
 The served tunables (`keepawake_interval_s`, `stuck_task_age_s`,
 `hook_silent_age_s`, `heartbeat_cadence_s`) are clamped to bounds the package
 sets. The fetch has no transport in this package yet, so the built-in text and

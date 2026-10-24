@@ -3663,8 +3663,8 @@ def _record_setup_hint(reply) -> None:
     best-effort, like the heartbeat itself."""
     if not isinstance(reply, dict):
         return
-    # Gateway values: the revision only as a code_field token, the versions only as PEP 440.
-    hint = {k: (diagnostics.code_field(reply.get(k), URL) if k == "setup_revision"
+    # Gateway values: the revision only as a revision_field token, the versions only as PEP 440.
+    hint = {k: (diagnostics.revision_field(reply.get(k), URL) if k == "setup_revision"
                 else diagnostics.version_field(reply.get(k))) for k in SETUP_HINT_FIELDS if k in reply}
     if "setup_revision" in hint and hint["setup_revision"] is None:
         # A refused announcement still retires the cache it replaces: no revision is never "any".

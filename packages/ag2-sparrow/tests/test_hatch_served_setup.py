@@ -1174,12 +1174,48 @@ print(json.dumps(hints))
 import json
 from unittest import mock
 from ag2_sparrow import remote_gateway_bridge as m
-with mock.patch.object(m.diagnostics, "code_field", lambda v, u="": v), \\
+with mock.patch.object(m.diagnostics, "revision_field", lambda v, u="": v), \\
         mock.patch.object(m, "_req", return_value={"setup_revision": "r " + m.TOKEN.upper()}):
     m._post_heartbeat(set(), force=True)
 print(json.dumps({"hint": m.SETUP_HINT_FILE.read_text()}))
 """)
         self.assertNotIn("FAKE-RELAY-TOKEN", bypass["hint"])
+
+    def test_an_integer_setup_revision_round_trips_from_the_heartbeat_to_the_served_text(self):
+        hint = self.bridge("""
+import json
+from unittest import mock
+from ag2_sparrow import remote_gateway_bridge as m
+with mock.patch.object(m, "_req", return_value={"setup_revision": 41}):
+    m._post_heartbeat(set(), force=True)
+print(json.dumps(json.loads(m.SETUP_HINT_FILE.read_text())))
+""")
+        self.assertEqual(hint.get("setup_revision"), "41", hint)
+        self.assertNotIn("setup_revision_withheld", hint)
+        self.assertIsNone(runtime_text.current_cache(self.state), "nothing cached yet")
+        with mock.patch.object(setup_fetch, "fetch_setup", return_value=served(revision=41)):
+            self.assertEqual(runtime_text.refresh_cache(self.state)["revision"], "41")
+        self.assertEqual(runtime_text.load_cache(self.state)["revision"], "41", "cached as text")
+        text, source = runtime_text.wake_context(runtime_text.current_cache(self.state), VALUES)
+        self.assertEqual(source, "served revision 41")
+        self.assertIn("Served prompt for " + AGENT, text)
+        # A cache an older build wrote with the integer still matches the announcement.
+        (self.state / runtime_text.CACHE_NAME).write_text(json.dumps(served(revision=41)))
+        self.assertEqual(runtime_text.wake_context(runtime_text.current_cache(self.state), VALUES)[1],
+                         "served revision 41")
+        for odd in (True, 41.0, None, "rev 41"):
+            with self.subTest(revision=odd):
+                self.assertEqual(runtime_text.setup_problem(served(revision=odd)), "no revision")
+        withheld = self.bridge("""
+import json
+from unittest import mock
+from ag2_sparrow import remote_gateway_bridge as m
+with mock.patch.object(m, "_req", return_value={"setup_revision": True}):
+    m._post_heartbeat(set(), force=True)
+print(json.dumps(json.loads(m.SETUP_HINT_FILE.read_text())))
+""")
+        self.assertNotIn("setup_revision", withheld)
+        self.assertIs(withheld.get("setup_revision_withheld"), True, withheld)
 
     def test_an_echoed_bearer_as_the_owner_dm_reaches_neither_the_routing_files_nor_the_prompt(self):
         token = "fake-relay-token-0123456789abcdef"
