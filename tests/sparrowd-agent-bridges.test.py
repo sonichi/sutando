@@ -428,6 +428,12 @@ class Wrapper(Base):
         self.assertEqual(built["REMOTE_PROACTIVE_TRUST_OK"], "1")
         self.assertEqual(built["KEEP_ME"], "1")
 
+    def test_no_host_gateway_url_reaches_the_bridge_under_any_name(self):
+        host = {"REMOTE_TASK_URL": "https://host/1", "AG2_REMOTE_URL": "https://host/2", "GATEWAY_URL": "https://host/3",
+                "RELAY_URL": "https://host/4", "KEEP_ME": "1"}
+        built = bridge.bridge_environ({"env": {"AGENT_MXID": AGENT}}, "https://agent/relay|s", base=host)
+        self.assertEqual({k for k in host if k in built}, {"KEEP_ME"}, "the endpoint comes only from the agent's token")
+
     def test_no_token_means_no_bridge(self):
         decl = self.declare()
         run = mock.Mock()

@@ -152,11 +152,11 @@ def wake_environ(child: Mapping[str, str], raw: str, url: str) -> "dict[str, str
     """The environment a bridge's wake command runs under, from `child` (the bridge's own minus every
     relay credential). In a declared bridge (the mark) the command acts as the agent: every gateway token
     and URL alias is dropped and the agent's own token as the bridge holds it (`raw`) and its gateway URL
-    are set, so a reader resolves exactly those and never the host's. Unmarked, `child` is unchanged."""
+    (`url`, which in a declared bridge only the agent's token can supply: bridge_strip_keys) are set, so a
+    reader resolves exactly those and never the host's. Unmarked, `child` is unchanged."""
     if not credentials_injected(child):
         return dict(child)
-    names = set(bridge_strip_keys()) | set(contract.URL_ALIAS_PRECEDENCE) | set(URL_KEYS)
-    out = {k: v for k, v in child.items() if k not in names}
+    out = {k: v for k, v in child.items() if k not in bridge_strip_keys()}
     if raw:
         out[token_env_name()] = raw
         if url:
@@ -165,10 +165,13 @@ def wake_environ(child: Mapping[str, str], raw: str, url: str) -> "dict[str, str
 
 
 def bridge_strip_keys() -> "tuple[str, ...]":
-    """Every variable a host's own gateway token may sit under, for a supervisor to drop from a declared
-    bridge's environment: each token name, every alias the contract ranks (a child of the bridge resolving
-    GATEWAY_TOKEN or RELAY_TOKEN first would act as the host) and the media token."""
-    return tuple(dict.fromkeys(TOKEN_KEYS + tuple(contract.TOKEN_ALIAS_PRECEDENCE) + (MEDIA_TOKEN_KEY,)))
+    """Every variable a host's own gateway token or endpoint may sit under, for a supervisor to drop from a
+    declared bridge's environment: each token name, every alias the contract ranks (a child of the bridge
+    resolving GATEWAY_TOKEN or RELAY_TOKEN first would act as the host), the media token, and each URL name
+    and alias (discover() ranks an environment URL above the token's own, which would send the agent's
+    bearer to the host's gateway). The bridge's endpoint is then the one inside the agent's token."""
+    return tuple(dict.fromkeys(TOKEN_KEYS + tuple(contract.TOKEN_ALIAS_PRECEDENCE) + (MEDIA_TOKEN_KEY,)
+                               + URL_KEYS + tuple(contract.URL_ALIAS_PRECEDENCE)))
 
 # The precedence, stated once; the first source carrying a value wins (see discover() for each name:
 # "file" is the first listed .env file carrying a token, "token" the URL inside the winning one).

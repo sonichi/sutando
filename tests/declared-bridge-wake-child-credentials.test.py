@@ -95,7 +95,7 @@ class WakeChild(unittest.TestCase):
         script.write_text(WAKE, encoding="utf-8")
         self.host = {"CLAUDE_CONFIG_DIR": str(self.cfg), "WAKE_CFG": str(self.cfg), "WAKE_REPO": str(REPO),
                      "WAKE_OUT": str(self.out), "WAKE_CANARY": HOST_CANARY, "WAKE_HOST_URL": HOST_URL,
-                     "WAKE_AGENT_BEARER_SHA256": hashlib.sha256(f"Bearer {AGENT_SECRET}".encode()).hexdigest(), "WAKE_AGENT_URL": AGENT_URL, "GATEWAY_URL": HOST_URL,
+                     "WAKE_AGENT_BEARER_SHA256": hashlib.sha256(f"Bearer {AGENT_SECRET}".encode()).hexdigest(), "WAKE_AGENT_URL": AGENT_URL,
                      "REMOTE_TASK_ON_TASK": f"{shlex.quote(sys.executable)} {shlex.quote(str(script))}"}
         saved = (sys.modules.pop(BRIDGE, None), local_task_protocol._TASK_STAMPER, _dirs._injected)
         self.addCleanup(self.restore, saved)
@@ -125,35 +125,50 @@ class WakeChild(unittest.TestCase):
         got = mod._write_task(task)
         self.assertIsNotNone(got)
         deadline = time.time() + 30
-        while time.time() < deadline and not (self.out / "wake.json").exists():
+        out = Path(os.environ["WAKE_OUT"])
+        while time.time() < deadline and not (out / "wake.json").exists():
             time.sleep(0.05)
         time.sleep(0.2)
-        return json.loads((self.out / "wake.json").read_text())
+        return json.loads((out / "wake.json").read_text())
 
-    def test_the_declared_bridges_wake_child_reads_the_room_as_the_agent_never_as_the_host(self):
+    # Every name a host's gateway URL may sit under, the two the bridge's discovery reads first among them.
+    HOST_URL_NAMES = ("REMOTE_TASK_URL", "AG2_REMOTE_URL", "GATEWAY_URL", "RELAY_URL")
+
+    def run_declared(self, name):
+        """The real chain under a host URL inherited as `name`: (the bridge's own URL, the wake child's record)."""
+        self.ws, out = self.tmp / f"ws-{name}", self.tmp / f"out-{name}"
+        out.mkdir()
         decl = self.declare()
         seen = {}
 
         def child(module, run_name, alter_sys):
             self.assertEqual(module, BRIDGE)
             seen["wake"] = self.queue_one_task()
-        with mock.patch.dict(os.environ, self.host):
+            seen["bridge_url"] = sys.modules[BRIDGE].URL
+        with mock.patch.dict(os.environ, dict(self.host, WAKE_OUT=str(out), **{name: HOST_URL})):
             rc = bridge.main([str(decl)], workspace=self.ws, get_key=lambda k: AGENT_TOKEN, run=child)
+        sys.modules.pop(BRIDGE, None)
         self.assertEqual(rc, 0)
-        wake = seen["wake"]
-        self.assertTrue(wake["marked"], "the wake child inherits the mark")
-        self.assertTrue(wake["config_dir_kept"], "the config root stays, for access.json")
-        self.assertFalse(wake["host_token_loaded"], "room ops reloaded the host's token from its channel .env")
-        self.assertFalse(wake["host_url_loaded"], "room ops reloaded the host's gateway URL")
-        self.assertTrue(wake["agent_token"], "room ops in the wake child resolves exactly the agent's token")
-        self.assertTrue(wake["agent_url"], "and the agent's gateway, not an inherited GATEWAY_URL")
-        self.assertEqual(wake["opened"], [], "the wake child opened a file under the host's config root")
-        self.assertNotEqual(wake["channel_env_rc"], 0)
-        self.assertFalse(wake["channel_env_named_a_file"], "channel-env.sh handed the wake child a credential file")
+        return seen["bridge_url"], seen["wake"]
+
+    def test_the_declared_bridges_wake_child_reads_the_room_as_the_agent_never_as_the_host(self):
+        for name in self.HOST_URL_NAMES:
+            with self.subTest(host_url_under=name):
+                bridge_url, wake = self.run_declared(name)
+                self.assertEqual(bridge_url, AGENT_URL, "the bridge's endpoint is the agent token's, not the host's")
+                self.assertTrue(wake["marked"], "the wake child inherits the mark")
+                self.assertTrue(wake["config_dir_kept"], "the config root stays, for access.json")
+                self.assertFalse(wake["host_token_loaded"], "room ops reloaded the host's token from its channel .env")
+                self.assertFalse(wake["host_url_loaded"], "room ops resolved the host's gateway URL")
+                self.assertTrue(wake["agent_token"], "room ops in the wake child resolves exactly the agent's token")
+                self.assertTrue(wake["agent_url"], "and the agent's gateway")
+                self.assertEqual(wake["opened"], [], "the wake child opened a file under the host's config root")
+                self.assertNotEqual(wake["channel_env_rc"], 0)
+                self.assertFalse(wake["channel_env_named_a_file"], "channel-env.sh handed the wake child a credential file")
 
     def test_control_the_hosts_own_bridge_wake_child_does_reload_it(self):
         # Unmarked, as the host's own bridge runs: the same sentinel sees the reload.
-        env = dict(self.host, AGENT_CONNECT_TASK_DIR=str(self.tmp / "tasks"),
+        env = dict(self.host, AGENT_CONNECT_TASK_DIR=str(self.tmp / "tasks"), WAKE_OUT=str(self.out),
                    AGENT_CONNECT_RESULT_DIR=str(self.tmp / "results"), AGENT_CONNECT_STATE_DIR=str(self.tmp / "state"),
                    REMOTE_TASK_TOKEN=AGENT_TOKEN)
         with mock.patch.dict(os.environ, env):

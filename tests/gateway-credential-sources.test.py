@@ -1937,11 +1937,13 @@ class Guard(unittest.TestCase):
                 self.assertEqual(o.bridge_token_environ("t"), {"REMOTE_TASK_TOKEN": "t", "GATEWAY_CREDENTIALS_INJECTED": "1"})
                 self.assertEqual(o.BRIDGE_CARRIED_CONFIG, ("REMOTE_PROACTIVE_TRUST_OK",), "the one carried host setting")
                 self.assertEqual(o.bridge_strip_keys(), ("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN", "GATEWAY_TOKEN",
-                                                         "RELAY_TOKEN", "REMOTE_MEDIA_HS_TOKEN"),
-                                 "every name a host's gateway token may sit under: each token key, each contract alias "
-                                 "and the media token, each once")
+                                                         "RELAY_TOKEN", "REMOTE_MEDIA_HS_TOKEN", "REMOTE_TASK_URL",
+                                                         "AG2_REMOTE_URL", "GATEWAY_URL", "RELAY_URL"),
+                                 "every name a host's gateway token or endpoint may sit under: each token key, each "
+                                 "contract alias, the media token and each URL name and alias, each once")
                 self.assertEqual(set(o.bridge_strip_keys()),
-                                 set(o.TOKEN_KEYS) | set(o.contract.TOKEN_ALIAS_PRECEDENCE) | {o.MEDIA_TOKEN_KEY})
+                                 set(o.TOKEN_KEYS) | set(o.contract.TOKEN_ALIAS_PRECEDENCE) | {o.MEDIA_TOKEN_KEY}
+                                 | set(o.URL_KEYS) | set(o.contract.URL_ALIAS_PRECEDENCE))
                 self.assertTrue(set(o.bridge_token_environ("t")) - {o.INJECTED_KEY} <= set(o.bridge_strip_keys()),
                                 "the name the agent's token goes under is stripped of the host's first")
 

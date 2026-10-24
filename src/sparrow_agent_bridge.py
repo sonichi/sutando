@@ -45,7 +45,7 @@ SUFFIX = ".bridge"
 # A declaration is a few hundred bytes; anything past this is not one and is never read into memory.
 MAX_DECLARATION_BYTES = 64 * 1024
 # Never inherited from sparrowd: the host's token files, its agent identity and its owner DM (and its
-# gateway tokens, under every name _sources.bridge_strip_keys lists).
+# gateway tokens and endpoints, under every name _sources.bridge_strip_keys lists).
 HOST_ONLY = ("AG2_DEVICE_ENV", "REMOTE_TASK_TOKEN_FILE", "AGENT_MXID", "AGENT_ID", "AG2SPACE_USER_ID",
              "GATEWAY_INSTANCE", "REMOTE_PROACTIVE_ROOM", "AGENT_CONNECT_TASK_DIR", "AGENT_CONNECT_RESULT_DIR",
              "AGENT_CONNECT_STATE_DIR")
@@ -129,7 +129,7 @@ def load(path: Path, agents: Path) -> "tuple[dict | None, str]":
 
 def bridge_environ(decl: dict, token: str, base=None) -> dict:
     """What the bridge runs under: sparrowd's environment minus the host-only variables, every name the
-    owner lists for a host's gateway tokens and every key it carries, plus the derived env, an empty owner
+    owner lists for a host's gateway tokens and endpoints and every key it carries, plus the derived env, an empty owner
     DM, the owner's carried config (resolved here, from the host's files if need be) and the agent's token."""
     token_env = _sources.bridge_token_environ(token)
     # The carried keys come only from the owner's result below, never from the generic base.
