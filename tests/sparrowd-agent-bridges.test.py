@@ -354,6 +354,7 @@ class Wrapper(Base):
 
     # Synthetic host values, one under every name a host's gateway token may sit under.
     HOST_TOKENS = {"REMOTE_TASK_TOKEN": "host-token", "AG2_REMOTE_TOKEN": "host-alias-token",
+                   "GATEWAY_TOKEN": "host-gateway-token", "RELAY_TOKEN": "host-relay-token",
                    "REMOTE_MEDIA_HS_TOKEN": "host-media-token"}
 
     def built_environment(self) -> dict:
@@ -376,6 +377,16 @@ class Wrapper(Base):
         env = self.built_environment()
         self.assertNotIn("AG2_REMOTE_TOKEN", env)
         self.assertNotIn("host-alias-token", env.values())
+
+    def test_the_hosts_GATEWAY_TOKEN_never_reaches_the_bridge(self):
+        env = self.built_environment()
+        self.assertNotIn("GATEWAY_TOKEN", env)
+        self.assertNotIn("host-gateway-token", env.values())
+
+    def test_the_hosts_RELAY_TOKEN_never_reaches_the_bridge(self):
+        env = self.built_environment()
+        self.assertNotIn("RELAY_TOKEN", env)
+        self.assertNotIn("host-relay-token", env.values())
 
     def test_the_hosts_REMOTE_MEDIA_HS_TOKEN_never_reaches_the_bridge(self):
         env = self.built_environment()

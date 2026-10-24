@@ -1932,9 +1932,12 @@ class Guard(unittest.TestCase):
                 self.assertEqual(sorted(p.name for p in path.parent.iterdir()), ["worker.json"], "no temp file left")
                 self.assertEqual(o.bridge_declaration_fields(), {"token_env": "REMOTE_TASK_TOKEN"})
                 self.assertEqual(o.bridge_token_environ("t"), {"REMOTE_TASK_TOKEN": "t"})
-                self.assertEqual(o.bridge_strip_keys(), ("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN", "REMOTE_MEDIA_HS_TOKEN"),
-                                 "every name a host's gateway token may sit under: each token key and the media token")
-                self.assertEqual(set(o.bridge_strip_keys()), set(o.TOKEN_KEYS) | {o.MEDIA_TOKEN_KEY})
+                self.assertEqual(o.bridge_strip_keys(), ("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN", "GATEWAY_TOKEN",
+                                                         "RELAY_TOKEN", "REMOTE_MEDIA_HS_TOKEN"),
+                                 "every name a host's gateway token may sit under: each token key, each contract alias "
+                                 "and the media token, each once")
+                self.assertEqual(set(o.bridge_strip_keys()),
+                                 set(o.TOKEN_KEYS) | set(o.contract.TOKEN_ALIAS_PRECEDENCE) | {o.MEDIA_TOKEN_KEY})
                 self.assertTrue(set(o.bridge_token_environ("t")) <= set(o.bridge_strip_keys()),
                                 "the name the agent's token goes under is stripped of the host's first")
 
