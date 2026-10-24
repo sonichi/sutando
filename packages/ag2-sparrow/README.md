@@ -624,9 +624,12 @@ run starts one detached upgrade per target and logs its decision on its line
 (`upgrade=off`, `current`, `no-hashes`, `hand-made-service`, `0.6.0:started`, ...).
 The upgrade runs under `STATE_DIR/upgrade.lock`, which keepawake also holds while
 it checks and restarts Sparrow, and re-reads the installed version first. It
-copies the whole package namespace, hashed, to `STATE_DIR/rollback/<version>/`,
-stops Sparrow through the manager that owns it and proves it gone (a hand-made
-unit is never touched, and nothing is installed unless the stop is proven), runs
+copies the whole package namespace, hashed, to `STATE_DIR/rollback/<version>/`
+(every `ag2_sparrow*` top-level name in site-packages and every `ag2-sparrow*`
+console script, so what a target adds is covered too), stops Sparrow through the
+manager that owns it and proves it gone (a hand-made unit or a lock holder not
+proven to be Sparrow is never touched, and nothing is installed unless the stop
+is proven), runs
 `pip install --no-deps --only-binary=:all: --require-hashes` pinned to every
 sha256 in `target_sha256`, requires `pip check` to run and report no new problem
 naming ag2-sparrow, re-runs `install --no-start` (which never starts the service),

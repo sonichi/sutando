@@ -2250,8 +2250,9 @@ class Tunables(unittest.TestCase):
 class FakeSite:
     """A site-packages holding one pip-installed ag2-sparrow, with a console script."""
 
-    def __init__(self, root: Path, version="0.5.4", direct_url=False):
+    def __init__(self, root: Path, version="0.5.4", direct_url=False, extras=False):
         self.root, self.site, self.bin = root, root / "lib" / "site", root / "bin"
+        self.extras = extras  # the target adds a top-level package and a console script
         self.install(version)
         if direct_url:
             (self.dist_info(version) / "direct_url.json").write_text('{"url": "file:///src"}')
@@ -2281,6 +2282,10 @@ class FakeSite:
         (pkg / "__pycache__" / "x.pyc").write_bytes(b"pyc")
         if version != "0.5.4":
             (pkg / "new_in_target.py").write_text("x = 1\n")
+        if self.extras and version != "0.5.4":
+            (self.site / "ag2_sparrow_newtop").mkdir(exist_ok=True)
+            (self.site / "ag2_sparrow_newtop" / "m.py").write_text("y = 2\n")
+            (self.bin / "ag2-sparrow-newcmd").write_text("#!/bin/sh\n# new\n")
         (self.bin / "ag2-sparrow-hatch").write_text(f"#!/bin/sh\n# {version}\n")
         (info / "METADATA").write_text(f"Metadata-Version: 2.1\nName: ag2-sparrow\nVersion: {version}\n")
         files = ["ag2_sparrow/__init__.py", "ag2_sparrow/__pycache__/x.pyc",
@@ -2288,6 +2293,8 @@ class FakeSite:
                  f"ag2_sparrow-{version}.dist-info/RECORD", "../../bin/ag2-sparrow-hatch"]
         if version != "0.5.4":
             files.append("ag2_sparrow/new_in_target.py")
+        if self.extras and version != "0.5.4":
+            files += ["ag2_sparrow_newtop/m.py", "../../bin/ag2-sparrow-newcmd"]
         (info / "RECORD").write_text("".join(f"{f},,\n" for f in files))
 
     def version(self):
@@ -2628,6 +2635,27 @@ class Upgrade(Base):
         self.assertEqual(self.inventory(), before)
         self.assertFalse(self.site.dist_info("0.6.0").exists())
         self.assertTrue((self.site.dist_info("0.5.4") / "RECORD").is_file())
+
+    def test_a_target_that_adds_a_top_level_package_and_a_script_is_rolled_back_whole(self):
+        self.site.extras = True
+        before = self.inventory()
+        self.connected.side_effect = [1, 0]  # the target starts but never reconnects
+        self.assertEqual(self.run_upgrade(self.fake()), "rolled-back")
+        self.assertEqual(self.inventory(), before)
+        self.assertFalse((self.site.site / "ag2_sparrow_newtop").exists())
+        self.assertFalse((self.site.bin / "ag2-sparrow-newcmd").exists())
+        self.assertEqual(self_upgrade.load_state(self.state)["failed"]["problems"], [])
+        # A stale attempt that left them behind is restored the same way.
+        self_upgrade.save_state(self.state, {"attempted": {}})
+        self.connected.side_effect, self.connected.return_value = None, 0
+        self.start(self.setup(), now=1000.0)
+        self_upgrade.snapshot(self.state, "0.5.4", self.site.distribution())
+        self.site.install("0.6.0")
+        with mock.patch.object(self_upgrade, "_run", self.fake()), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(self_upgrade.maybe_start(self.cfg, None, "0.5.4", 1000.0 + 1801),
+                             "0.6.0:rolled-back")
+        self.assertEqual(self.inventory(), before)
 
     def test_a_stale_attempt_that_left_target_residue_beside_old_metadata_is_restored(self):
         # Kewei's shape: target bytes and a target-only module, old 0.5.4 metadata kept, so
@@ -3133,7 +3161,7 @@ class Quiesce(Base):
         self.assertIn("not proven to be Sparrow", how)
 
     def test_a_live_holder_with_a_stale_heartbeat_is_still_stopped(self):
-        self.holder(99, fresh=False)
+        self.holder(99, fresh=False, sparrow=True)
         self.assertEqual(keepalive.resolve_sparrow(self.cfg), (None, 99, False))
         self.assertEqual(keepalive.quiesce_sparrow(self.cfg),
                          (True, "stopped Sparrow (pid 99)", "detached"))
@@ -3141,6 +3169,16 @@ class Quiesce(Base):
         self.record = None
         self.assertEqual(keepalive.quiesce_sparrow(self.cfg),
                          (True, "Sparrow was not running", "detached"))
+
+    def test_a_lock_holder_not_proven_sparrow_is_never_signalled_with_no_unit(self):
+        for fresh in (False, True):
+            self.calls.clear()
+            self.holder(4242, fresh=fresh, sparrow=False)
+            quiet, how, manager = keepalive.quiesce_sparrow(self.cfg)
+            self.assertEqual((quiet, manager, self.calls, 4242 in self.alive),
+                             (False, None, [], True), f"fresh={fresh}")
+            self.assertIn("not proven to be Sparrow", how)
+            self.assertIn("nothing was signalled", how)
 
     def test_a_holder_that_ignores_sigterm_is_not_quiet(self):
         self.stubborn.add(99)
