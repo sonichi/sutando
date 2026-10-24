@@ -47,12 +47,12 @@ def _cloud_fallback() -> str:
     return default_cloud_origin()
 
 
-CLOUD_FALLBACK = _cloud_fallback()
 MAX_EVENTS = 100  # server cap per report
 
 
 def _manifest_default(
     key: str = CLOUD_ENV_NAME, manifest_path: Path = MANIFEST_PATH
+
 ) -> "str | None":
     """Read a declared config default out of this skill's manifest.
 
@@ -104,6 +104,9 @@ def _normalize_origin(origin: str) -> str:
         return origin
     return normalize_base(origin)
 
+
+# After every helper it may call: a standalone install must import, never NameError.
+CLOUD_FALLBACK = _cloud_fallback()
 
 CLOUD = resolve_cloud_origin()
 

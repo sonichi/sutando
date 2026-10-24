@@ -191,10 +191,11 @@ class TestWellKnown(unittest.TestCase):
         cfg = {"instances": [{"server": "new.space", "cloud_origin": "https://c.new.space"}]}
         d = ds.dotspace_for("new.space", fetch=Fetcher(exc=TimeoutError()), config=cfg)
         self.assertEqual((d.source, d.cloud_origin), ("config", "https://c.new.space"))
-        env = {"REMOTE_TASK_TOKEN": "https://gw.example|secret"}
-        d = ds.dotspace_for("gw.example", fetch=Fetcher("{}"), config=NONE, env=env)
+        own = "https://gw.example"
+        d = ds.dotspace_for("gw.example", fetch=Fetcher("{}"), config=NONE, own_gateway=own)
         self.assertEqual((d.source, d.operator, d.prefer_ipv4, d.gateway_host), ("token", "ag2", True, "gw.example"))
-        self.assertFalse(ds.dotspace_for("other.example", fetch=Fetcher("{}"), config=NONE, env=env).is_dotspace)
+        self.assertFalse(ds.dotspace_for("other.example", fetch=Fetcher("{}"), config=NONE, own_gateway=own).is_dotspace)
+        self.assertFalse(ds.dotspace_for("gw.example", fetch=Fetcher("{}"), config=NONE).is_dotspace)
 
     def test_registered_lookup_without_fetch_costs_nothing_and_results_are_cached(self):
         f = Fetcher(block())
@@ -300,13 +301,13 @@ class TestPerServer(unittest.TestCase):
         self.assertEqual(links.room_link("!r:s.space", via=""), "https://matrix.to/#/!r:s.space")
         self.assertEqual(links.room_link("!r:s.space", via="x.y"), "https://matrix.to/#/!r:s.space?via=x.y")
 
-    def test_current_server_reads_identity_then_token_then_url(self):
-        self.assertEqual(ds.current_server({"AGENT_MXID": "@a:s.space", "REMOTE_TASK_TOKEN": "https://chat.ag2.space|s"}),
+    def test_current_server_reads_identity_then_the_callers_gateway_never_token_variables(self):
+        self.assertEqual(ds.current_server({"AGENT_MXID": "@a:s.space"}, own_gateway="https://chat.ag2.space"),
                          "s.space")
         self.assertEqual(ds.current_server({"AG2SPACE_USER_ID": "@a:dev.s.space"}), "dev.s.space")
-        self.assertEqual(ds.current_server({"REMOTE_TASK_TOKEN": "https://chat.s.space|s"}), "chat.s.space")
-        self.assertEqual(ds.current_server({"REMOTE_TASK_URL": "https://dev-chat.ag2.space"}), "dev-chat.ag2.space")
-        self.assertEqual(ds.current_server({"REMOTE_TASK_TOKEN": "bare-secret"}), "")
+        self.assertEqual(ds.current_server({}, own_gateway="https://chat.s.space"), "chat.s.space")
+        self.assertEqual(ds.current_server({"REMOTE_TASK_TOKEN": "https://chat.s.space|s"}), "")
+        self.assertEqual(ds.current_server({"REMOTE_TASK_URL": "https://dev-chat.ag2.space"}), "")
         self.assertEqual(ds.current_server({}), "")
 
     def test_install_defaults_follow_the_install_server(self):

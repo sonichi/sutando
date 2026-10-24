@@ -44,9 +44,9 @@ who operates it. Whether a server IS a DotSpace is therefore decided by the regi
      bounded (`WELL_KNOWN_TIMEOUT_S`), and any failure falls through. Only an explicit
      per-server `dotspace_for(server)` fetches; the install-wide defaults and every hot path
      pass `fetch=NO_FETCH` and never touch the network.
-  3. the gateway this process was onboarded to (REMOTE_TASK_TOKEN's embedded URL): the bridge
-     talks to no other host, so that host is a DotSpace gateway by construction
-     (`source="token"`).
+  3. the gateway this process was onboarded to, when the caller passes it (`own_gateway=`, the
+     URL the credential owner resolved): the bridge talks to no other host, so that host is a
+     DotSpace gateway by construction (`source="token"`). The resolver reads no token variable.
   4. nothing: a plain Matrix server is not a DotSpace (operator "", source "none"): no cloud,
      link via itself.
 
@@ -92,8 +92,6 @@ DEFAULT_INSTANCES: Tuple[Dict[str, str], ...] = (
 )
 
 MXID_ENV_KEYS = ("AGENT_MXID", "AG2SPACE_USER_ID")
-TOKEN_ENV_KEYS = ("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN")
-URL_ENV_KEYS = ("REMOTE_TASK_URL", "AG2_REMOTE_URL")
 
 Fetch = Callable[[str, float], Optional[str]]
 
@@ -347,7 +345,7 @@ def _matches(entry: Mapping[str, Any], host: str) -> bool:
 
 def dotspace_for(server_or_host: str, *, fetch: Optional[Fetch] = None,
                config: Optional[Mapping[str, Any]] = None,
-               env: Optional[Mapping[str, str]] = None) -> DotSpace:
+               own_gateway: str = "") -> DotSpace:
     """The DotSpace of a homeserver name, gateway host, sigil id or URL, by the order in the
     module docstring; a plain server comes back with operator "" and source "none". `fetch=None`
     is the real well-known fetch; pass `NO_FETCH` on a hot path. `config` is the `core.dotspace`
@@ -374,7 +372,7 @@ def dotspace_for(server_or_host: str, *, fetch: Optional[Fetch] = None,
         return DotSpace(server=block["server"], gateway_host=block["gateway_host"],
                         link_via=block["server"], mcp_url=block["mcp_url"],
                         source="well-known-unverified")
-    gateway = server_of_gateway_url(_own_gateway_url(os.environ if env is None else env))
+    gateway = server_of_gateway_url(own_gateway)
     if gateway and host == gateway:
         return DotSpace(server=host, operator=OPERATOR_AG2, gateway_host=host, link_via=host,
                       prefer_ipv4=True, source="token")
@@ -430,27 +428,17 @@ def default_cloud_origin(env: Optional[Mapping[str, str]] = None) -> str:
 
 # ----------------------------------------------------------------- install
 
-def _own_gateway_url(env: Mapping[str, str]) -> str:
-    for key in TOKEN_ENV_KEYS:
-        url = gateway_url_of_token(env.get(key, ""))
-        if url:
-            return url
-    for key in URL_ENV_KEYS:
-        if (env.get(key) or "").strip():
-            return env[key].strip()
-    return ""
 
-
-def current_server(env: Optional[Mapping[str, str]] = None) -> str:
+def current_server(env: Optional[Mapping[str, str]] = None, own_gateway: str = "") -> str:
     """This process's homeserver: the server of AGENT_MXID / AG2SPACE_USER_ID, else the host of
-    the gateway URL REMOTE_TASK_TOKEN embeds (or REMOTE_TASK_URL names), else "". One process
-    serves one connection; an install on several passes the server to `dotspace_for` itself."""
+    `own_gateway` (the gateway URL the credential owner resolved, passed by the caller), else "".
+    One process serves one connection; an install on several passes the server itself."""
     env = os.environ if env is None else env
     for key in MXID_ENV_KEYS:
         server = server_of_mxid(env.get(key, ""))
         if server:
             return server
-    return server_of_gateway_url(_own_gateway_url(env))
+    return server_of_gateway_url(own_gateway)
 
 
 if __name__ == "__main__":  # pragma: no cover — `python3 dotspace.py <server|host>`
