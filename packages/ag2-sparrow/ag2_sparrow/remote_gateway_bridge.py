@@ -5561,6 +5561,18 @@ _EVENT_ID_RE = re.compile(r"\$\S+")
 _ROOM_UPGRADED = "room-upgraded"
 
 
+def _proactive_item_id(stem: str, body: str) -> str:
+    """One item per file name and body: a new body under a delivered name is a new send. The
+    room and thread are left out, since they are re-resolved on every pass."""
+    return f"{stem}~{hashlib.sha256(body.encode('utf-8')).hexdigest()[:16]}"
+
+
+def _proactive_requeue_command(root, item_id: str) -> str:
+    """The operator's resend: requeue the item and restore its quarantined body by file stem."""
+    return shlex.join(["python3", "src/outbox_cli.py", "--root", str(root), "requeue", item_id,
+                       "--body-id", item_id.rsplit("~", 1)[0]])
+
+
 def _proactive_outbox_root() -> Path:
     return RESULTS_DIR / ".outbox-ag2space-proactive"
 
@@ -5918,7 +5930,7 @@ def _send_proactive(claim: Path, f: Path, envelope: dict, owner_dm: bool, notice
     """Hand one claimed proactive file to the outbox, which owns the claim, the send and its
     outcome, then move the file as that outcome says. An uncertain send is parked, not resent."""
     core = _delivery_core("proactive")
-    item_id = f.stem  # stable across passes and the quarantine name; the room is re-resolved per pass
+    item_id = _proactive_item_id(f.stem, envelope["body"])
     payload = json.dumps(envelope, sort_keys=True).encode("utf-8")
     seen = _PROACTIVE_SEND.__dict__.setdefault("seen", {})
     seen.clear()
@@ -5966,7 +5978,7 @@ def _send_proactive(claim: Path, f: Path, envelope: dict, owner_dm: bool, notice
             _log(f"proactive {f.name} may have reached {room} but the send was not confirmed "
                  f"({result.detail or 'no outcome'}); PARKED to {UNDELIVERABLE_RESULTS_DIR.name}/, not "
                  f"sent again. Check the room first; to send it again (it may post twice): "
-                 f"{_requeue_command(core.backend.root, item_id)}")
+                 f"{_proactive_requeue_command(core.backend.root, item_id)}")
         else:
             _log(f"proactive {f.name} PARKED to {UNDELIVERABLE_RESULTS_DIR.name}/ ({reason}"
                  f"{': ' + result.detail if result.detail else ''}) — it will NOT be re-sent")

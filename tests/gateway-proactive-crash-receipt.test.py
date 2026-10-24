@@ -122,7 +122,7 @@ def crash_while_settling() -> None:
     finally:
         vendored.park_item = real_park
     root = lane.results / ".outbox-ag2space-proactive"
-    claim_file = vendored._claim_path(root, "proactive-5")
+    claim_file = vendored._claim_path(root, gb._proactive_item_id("proactive-5", "status five"))
     dead = subprocess.Popen([sys.executable, "-c", "pass"])
     dead.wait()
     if claim_file.exists():

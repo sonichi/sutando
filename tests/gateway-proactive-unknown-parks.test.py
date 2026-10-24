@@ -11,6 +11,7 @@ recorded as landed), loses the confirmation, then restarts the process:
   d) the file put back in results/      -> still no second POST, parked again
   e) control: connection refused        -> never connected, so retried and delivered once
   f) the logged requeue command, run as printed -> the same item is sent once more, then never again
+  g) a new body under a delivered file name      -> sent; the same body again is not
 
 Run: python3 tests/gateway-proactive-unknown-parks.test.py
 """
@@ -97,7 +98,7 @@ def requeue_as_logged() -> None:
     for _ in range(3):
         lane.drain()
     items = lane.items()
-    check(len(lane.posts) == 2 and len(items) == 1 and items[0].get("item_id") == "proactive-9"
+    check(len(lane.posts) == 2 and len(items) == 1 and str(items[0].get("item_id")).startswith("proactive-9~")
           and items[0].get("status") == "DELIVERED" and items[0].get("provider_ref") == "$resent",
           f"f) the same item is re-driven exactly once ({len(lane.posts)} POSTs, "
           f"{[(i.get('item_id'), i.get('status')) for i in items]})")
@@ -105,7 +106,22 @@ def requeue_as_logged() -> None:
           f"f) its body leaves undelivered/ and is archived ({lane.where('proactive-9')})")
 
 
+def stem_reuse() -> None:
+    lane = pl.Lane(gb, ISO)
+    lane.write("proactive-7.txt", "first body\n")
+    lane.drain()
+    lane.write("proactive-7.txt", "second body\n")
+    lane.drain()
+    check([p.get("body") for p in lane.posts] == ["first body", "second body"],
+          f"g) a new body under a delivered name is sent ({[p.get('body') for p in lane.posts]})")
+    lane.write("proactive-7.txt", "second body\n")
+    lane.drain()
+    check(len(lane.posts) == 2 and lane.where("proactive-7") == "archived",
+          f"g) the same body again is archived, not resent ({len(lane.posts)} POSTs)")
+
+
 def main() -> int:
+    stem_reuse()
     requeue_as_logged()
     scenario("a) timeout", lost(urllib.error.URLError(TimeoutError("timed out"))))
     scenario("b) no event id", lambda payload: {"ok": True})

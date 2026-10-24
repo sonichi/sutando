@@ -561,10 +561,12 @@ claim.
 ### Proactive room sends
 
 Each `results/proactive-*.txt` is one outbox item (`results/.outbox-ag2space-proactive/`),
-keyed by its file stem (the same id the undelivered quarantine and `outbox_cli.py requeue`
-use). The room, thread and body stored when the item is first published are what is sent,
-as one `POST /v1/room` `op: message` with that item's `dedupe_key` (and `thread_root` when
-it posts in a thread); a room re-resolved on a later pass never makes it a second item. The outbox owns the claim, the retry and the outcome; the drain only
+keyed by its file stem plus a SHA-256 prefix of its body (`<stem>~<16 hex>`): a new body
+under a delivered name is a new send, while the room and thread, re-resolved on every pass,
+are not part of the key. The room, thread and body stored when the item is first published
+are what is sent, as one `POST /v1/room` `op: message` with that item's `dedupe_key` (and
+`thread_root` when it posts in a thread). The logged `outbox_cli.py requeue <item> --body-id
+<stem>` restores the quarantined body under its file name, which maps back to the same item. The outbox owns the claim, the retry and the outcome; the drain only
 moves the file as the outcome says. The room send is neither idempotent nor reconcilable,
 so:
 
