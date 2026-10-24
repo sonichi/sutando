@@ -549,16 +549,22 @@ def _await_connected(state: Path, instance: str, since: "float | None") -> int:
 def keepawake(cfg: dict, log: Path, now: float | None = None) -> int:
     from . import self_upgrade
     now = time.time() if now is None else now
-    settled = None
+    settled, blocked = None, None
     # Held across the probe and the restart, so an upgrade cannot start in between.
     with self_upgrade.upgrade_lock(_state_dir(cfg)) as free:
         if free:
             # A dead upgrade is settled first: a restart must never run its unverified target.
-            settled = _settle_upgrade(cfg, now)
-        up, restarted, rc, reason = _keep_listener(cfg, now) if free else (
-            listener_up(cfg, now), 0, 0, None)
+            settled, blocked = _settle_upgrade(cfg, now)
+        if free and not blocked:
+            up, restarted, rc, reason = _keep_listener(cfg, now)
+        else:
+            up, restarted, rc, reason = listener_up(cfg, now), 0, 0, None
     if not free:
         print("an upgrade is running; Sparrow is left as it is")
+    elif blocked:
+        rc, reason = 1, UPGRADE_FAILED
+        print(f"error: Sparrow is not restarted: {blocked}; run ag2-sparrow-hatch install to "
+              "put a verified version back", file=sys.stderr)
     upgrade = _served_setup(cfg, settled) if free else "running"
     line = f"{_utc(now)} keepawake listener={'up' if up else 'down'} restarted={restarted}" \
         + (f" reason={reason}" if reason else "") + (f" upgrade={upgrade}" if upgrade else "")
@@ -594,14 +600,16 @@ def _keep_listener(cfg: dict, now: float) -> "tuple[bool, int, int, str | None]"
     return up, restarted, rc, reason
 
 
-def _settle_upgrade(cfg: dict, now: float) -> "str | None":
-    """Settle a dead upgrade attempt, with the upgrade lock held; never fails the run."""
+def _settle_upgrade(cfg: dict, now: float) -> "tuple[str | None, str | None]":
+    """Settle a dead upgrade attempt, with the upgrade lock held: (verdict, why Sparrow must
+    not be started). A settlement that raises blocks too; never fails the run."""
     from . import self_upgrade
     try:
-        return self_upgrade.settle_attempt(cfg, _state_dir(cfg), now)
+        settled = self_upgrade.settle_attempt(cfg, _state_dir(cfg), now)
     except Exception as e:  # noqa: BLE001 - keepawake's own job must still be logged
         print(f"NOTE upgrade: {diagnostics.describe(e)}", file=sys.stderr)
-        return None
+        return None, f"the upgrade attempt could not be settled ({type(e).__name__})"
+    return settled, self_upgrade.recovery_blocked(_state_dir(cfg))
 
 
 def _served_setup(cfg: dict, settled: "str | None" = None) -> "str | None":

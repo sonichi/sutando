@@ -2283,9 +2283,11 @@ class FakeSite:
         if version != "0.5.4":
             (pkg / "new_in_target.py").write_text("x = 1\n")
         if self.extras and version != "0.5.4":
-            (self.site / "ag2_sparrow_newtop").mkdir(exist_ok=True)
-            (self.site / "ag2_sparrow_newtop" / "m.py").write_text("y = 2\n")
+            for top in ("ag2_sparrow_newtop", "sparrow_vendor"):
+                (self.site / top / "sub").mkdir(parents=True, exist_ok=True)
+                (self.site / top / "sub" / "m.py").write_text("y = 2\n")
             (self.bin / "ag2-sparrow-newcmd").write_text("#!/bin/sh\n# new\n")
+            (self.bin / "sprw-tool").write_text("#!/bin/sh\n# new\n")
         (self.bin / "ag2-sparrow-hatch").write_text(f"#!/bin/sh\n# {version}\n")
         (info / "METADATA").write_text(f"Metadata-Version: 2.1\nName: ag2-sparrow\nVersion: {version}\n")
         files = ["ag2_sparrow/__init__.py", "ag2_sparrow/__pycache__/x.pyc",
@@ -2294,7 +2296,8 @@ class FakeSite:
         if version != "0.5.4":
             files.append("ag2_sparrow/new_in_target.py")
         if self.extras and version != "0.5.4":
-            files += ["ag2_sparrow_newtop/m.py", "../../bin/ag2-sparrow-newcmd"]
+            files += ["ag2_sparrow_newtop/sub/m.py", "sparrow_vendor/sub/m.py",
+                      "../../bin/ag2-sparrow-newcmd", "../../bin/sprw-tool"]
         (info / "RECORD").write_text("".join(f"{f},,\n" for f in files))
 
     def version(self):
@@ -2638,12 +2641,21 @@ class Upgrade(Base):
 
     def test_a_target_that_adds_a_top_level_package_and_a_script_is_rolled_back_whole(self):
         self.site.extras = True
-        before = self.inventory()
         self.connected.side_effect = [1, 0]  # the target starts but never reconnects
+        (self.site.site / "other_pkg").mkdir()  # a foreign package already there stays
+        (self.site.site / "other_pkg" / "__init__.py").write_text("")
+        before = self.inventory()
         self.assertEqual(self.run_upgrade(self.fake()), "rolled-back")
         self.assertEqual(self.inventory(), before)
-        self.assertFalse((self.site.site / "ag2_sparrow_newtop").exists())
-        self.assertFalse((self.site.bin / "ag2-sparrow-newcmd").exists())
+        for top in ("ag2_sparrow_newtop", "sparrow_vendor"):
+            self.assertFalse((self.site.site / top).exists(), top)
+        for script in ("ag2-sparrow-newcmd", "sprw-tool"):
+            self.assertFalse((self.site.bin / script).exists(), script)
+        self.assertTrue((self.site.site / "other_pkg" / "__init__.py").is_file())
+        self.assertEqual(sorted(p.name for p in self.site.site.iterdir()),
+                         json.loads((self.state / "rollback" / "0.5.4" / "manifest.json")
+                                    .read_text())["listing"],
+                         "the site listing equals the snapshot's")
         self.assertEqual(self_upgrade.load_state(self.state)["failed"]["problems"], [])
         # A stale attempt that left them behind is restored the same way.
         self_upgrade.save_state(self.state, {"attempted": {}})
@@ -2750,6 +2762,65 @@ class Upgrade(Base):
         self.assertEqual(self.inventory(), before)
         self.assertIn("listener=down restarted=1 upgrade=0.6.0:rolled-back", log.read_text())
 
+    def test_a_failed_restore_holds_keepawake_restarts_until_the_owner_installs(self):
+        self.connected.side_effect = [1]  # the target never reconnects; nothing is started after
+        with mock.patch.object(self_upgrade, "restore", side_effect=OSError("disk full")):
+            self.assertEqual(self.run_upgrade(self.fake()), "restore-failed")
+        log = self.home / "log"
+
+        def keepawake(now):
+            with mock.patch.object(keepalive, "listener_up", return_value=False), \
+                    mock.patch.object(keepalive, "restart_listener", return_value=(True, "r")) as rl, \
+                    mock.patch.object(runtime_text, "refresh_cache", return_value=None), \
+                    contextlib.redirect_stdout(io.StringIO()), \
+                    contextlib.redirect_stderr(io.StringIO()) as err:
+                rc = keepalive.keepawake(self.cfg, log, now=now)
+            return rc, rl.call_count, log.read_text().splitlines()[-1], err.getvalue()
+        rc, restarts, line, err = keepawake(5000.0)
+        self.assertEqual((rc, restarts), (1, 0))
+        self.assertIn("listener=down restarted=0 reason=upgrade-failed", line)
+        self.assertIn("left unverified files (restore-failed)", err)
+        self.assertEqual(keepawake(5900.0)[1], 0, "the hold lasts across ticks")
+        self.assertTrue(self_upgrade.clear_blocked(self.state))
+        self.assertFalse(self_upgrade.clear_blocked(self.state))
+        rc, restarts, line, _ = keepawake(6800.0)
+        self.assertEqual((rc, restarts), (0, 1))
+        self.assertIn("restarted=1", line)
+        self.assertNotIn("reason=upgrade-failed", line)
+        tried = self_upgrade.load_state(self.state)["attempted"]["0.6.0"]
+        self.assertEqual((tried["outcome"], tried["phase"]), ("restore-failed", "acknowledged"))
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(self.start(self.setup())[0], "0.6.0:attempted", "never retried")
+
+    def test_keepawake_never_restarts_on_unverified_files_or_a_failed_settlement(self):
+        # A dead mutating attempt with no snapshot: restore-failed, the listener stays down.
+        self.start(self.setup(), now=1000.0)
+        self_upgrade._phase(self.state, "0.6.0", "installing", manager="detached")
+        self.site.install("0.6.0")
+        log = self.home / "log"
+        with mock.patch.object(keepalive, "listener_up", return_value=False), \
+                mock.patch.object(keepalive, "restart_listener", return_value=(True, "r")) as rl, \
+                mock.patch.object(runtime_text, "refresh_cache", return_value=None), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(keepalive.keepawake(self.cfg, log, now=1010.0), 1)
+        rl.assert_not_called()
+        self.assertIn("listener=down restarted=0 reason=upgrade-failed upgrade=0.6.0:restore-failed",
+                      log.read_text())
+        self.assertEqual(self.site.version(), "0.6.0", "nothing was started or changed")
+        # A settlement that raises blocks the restart as well, and is retried next tick.
+        self_upgrade.save_state(self.state, {"attempted": {"0.6.0": {
+            "at": 1000.0, "from": "0.5.4", "outcome": "started", "phase": "installing"}}})
+        with mock.patch.object(self_upgrade, "settle_attempt", side_effect=OSError("journal")), \
+                mock.patch.object(keepalive, "listener_up", return_value=False), \
+                mock.patch.object(keepalive, "restart_listener", return_value=(True, "r")) as rl, \
+                mock.patch.object(runtime_text, "refresh_cache", return_value=None), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(keepalive.keepawake(self.cfg, log, now=1020.0), 1)
+        rl.assert_not_called()
+        self.assertIn("restarted=0 reason=upgrade-failed", log.read_text().splitlines()[-1])
+        self.assertEqual(self_upgrade.load_state(self.state)["attempted"]["0.6.0"]["phase"],
+                         "installing", "still to be settled")
+
     def test_a_rollback_whose_stop_is_unproven_changes_no_file(self):
         self.stop_ok = "rollback"
         with mock.patch.object(self_upgrade, "restore") as restore:
@@ -2775,8 +2846,8 @@ class Upgrade(Base):
         self.assertEqual(len(problems), 1)
         self.assertRegex(problems[0], r"^restore: the files do not match the snapshot of 0\.5\.4: changed .*__init__\.py")
         after_stop = self.events[len(self.events) - self.events[::-1].index("stop") - 1:]
-        self.assertEqual(after_stop, ["stop", "start", "version"],
-                         "no install re-run on a mismatch; Sparrow is still started")
+        self.assertEqual(after_stop, ["stop", "version"],
+                         "no install re-run and no start on a mismatch: Sparrow stays stopped")
 
     def test_a_hand_made_or_unreachable_unit_is_never_upgraded_unattended(self):
         for owner, decision in (("other", "hand-made-service"),
@@ -2814,12 +2885,14 @@ class Upgrade(Base):
         self.connected.side_effect = [1, 0]
         with mock.patch.object(self_upgrade, "restore", side_effect=OSError("disk full")):
             self.assertEqual(self.run_upgrade(self.fake()), "restore-failed")
-        self.assertIn("start", self.events[-2:])
+        self.assertEqual(self.events[self.events.index("install") + 1:],
+                         ["start", "version", "stop", "version"], "unverified files are never started")
         state = self_upgrade.load_state(self.state)
         self.assertEqual(state["attempted"]["0.6.0"]["outcome"], "restore-failed")
         failed = state["failed"]
         self.assertEqual((failed["outcome"], failed["installed"]), ("restore-failed", "0.6.0"))
-        self.assertIn("restore: disk full", failed["problems"])
+        self.assertIn("restore: disk full; Sparrow is left stopped", failed["problems"])
+        self.assertIn("left stopped", self_upgrade.notice_path(self.state).read_text())
         self.assertIsNotNone(self_upgrade.failed_since(self.state, "0.6.0"))
 
     def test_each_failed_recovery_step_is_restore_failed_never_rolled_back(self):
