@@ -160,7 +160,7 @@ def _is_discord_channel_id(value: str) -> bool:
 from result_markers import parse_markers, has_skip_action  # noqa: E402
 import mention_gate  # noqa: E402  — owner @-mention ingestion gate (skills/mention-gate)
 from policy.guardrail import engage_rulebook, DISCORD_PROVENANCE  # noqa: E402
-from policy.egress.result import guard_result_for_tier, resolve_access_tier as _resolve_task_tier  # noqa: E402
+from policy.egress.result import guard_result_for_tier, resolve_route_tier  # noqa: E402
 
 from delivery.readiness import read_ready_result  # noqa: E402
 from result_publish import publish_text  # noqa: E402
@@ -4988,10 +4988,7 @@ async def poll_results():
                 # skipped the cleanup block at the bottom of this loop.
                 # Non-owner results are scanned before ANY marker below. The tier
                 # map dies on restart, so unknown is re-read from the task file.
-                _guard_tier = _task_tier
-                if _guard_tier == "unknown":
-                    _guard_tf = find_task_file(TASKS_DIR, task_id)
-                    _guard_tier = _resolve_task_tier(_guard_tf) if _guard_tf else "guest"
+                _guard_tier = resolve_route_tier(_task_tier, TASKS_DIR, task_id)
                 # A Discord channel is a human surface: the suppression is journaled
                 # under STATE_DIR and closed silently rather than posted as prose.
                 try:

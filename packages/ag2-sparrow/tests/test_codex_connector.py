@@ -38,10 +38,10 @@ REPO_ROOT = PKG_ROOT.parents[1]
 REAL_SERVER_ARGV = cc.server_argv
 
 
-def covered_server_argv(server):
+def covered_server_argv(server, codex="codex"):
     """Under the coverage gate the stub child is traced too; its fragment lands in the
     cwd, where the gate's `coverage combine` picks it up."""
-    argv = REAL_SERVER_ARGV(server)
+    argv = REAL_SERVER_ARGV(server, codex)
     if server == "stub" and os.environ.get("SUTANDO_TEST_SUBPROCESS_COVERAGE") == "1":
         return [sys.executable, "-m", "coverage", "run", "--rcfile=%s" % (REPO_ROOT / ".coveragerc")] + argv[1:]
     return argv
@@ -650,6 +650,9 @@ class EdgePathTest(unittest.TestCase):
     def test_child_env_falls_back_without_path(self):
         with mock.patch.dict(cc.os.environ, {}, clear=True):
             self.assertEqual(cc.child_env(), {"PATH": "/usr/bin:/bin", "HOME": ""})
+        with mock.patch.dict(cc.os.environ, {"CODEX_HOME": "/h/.codex-agent", "OPENAI_API_KEY": "no"}, clear=True):
+            self.assertEqual(cc.child_env(), {"PATH": "/usr/bin:/bin", "HOME": "", "CODEX_HOME": "/h/.codex-agent"},
+                             "the login's home passes through when the launcher names one; nothing else does")
 
     def test_work_is_required_without_push(self):
         with self.assertRaises(SystemExit):
@@ -666,7 +669,8 @@ class PushTest(unittest.TestCase):
                 calls.append((argv, kw))
                 return mock.Mock(returncode=0, stdout="Queued message m for thread t.\n", stderr="")
 
-            rc = cc.push("t", str(p), run=fake_run)
+            with mock.patch.dict(cc.os.environ, {"PATH": "/bin", "HOME": "/h"}, clear=True):   # no ambient CODEX_HOME
+                rc = cc.push("t", str(p), run=fake_run)
         self.assertEqual(rc, 0)
         argv, kw = calls[0]
         self.assertEqual(argv[:5], ["codex", "queue", "--thread", "t", "--message"])
@@ -691,6 +695,29 @@ class PushTest(unittest.TestCase):
                                    return_value=mock.Mock(returncode=3, stdout="", stderr="Error: no rollout\n")):
                 rc = cc.main(["--push", "thread-x", str(p)])
         self.assertEqual(rc, 3)
+
+
+class TurnCwdTest(unittest.TestCase):
+    def test_every_turn_carries_its_own_cwd_the_owners_from_the_root_the_non_owners_from_scratch(self):
+        """turn/start names the turn's working directory (the 0.160.1 override): a thread resumed after the
+        root moved would otherwise keep the old pathname for every later turn."""
+        with tempfile.TemporaryDirectory() as d:
+            calls = []
+
+            class Rpc:
+                def request(self, method, params, timeout=None):
+                    calls.append((method, dict(params)))
+                    return {"turn": {"id": "t1"}}
+            args = cc.build_parser().parse_args(["--work", d, "--server", "stub"])
+            args.cwd = None
+            c = cc.Connector(lambda: None, args)
+            c.rpc, c.thread_id, c.scratch_cwd = Rpc(), "th", "/scratch"
+            with mock.patch.object(c, "wait_turn", return_value=("completed", "ok", None)), \
+                    mock.patch.object(cc.os, "getcwd", return_value="/now/here"):
+                c.run_turn("hi", None, c.turn_cwd(True))
+                c.run_turn("hi", "m", c.turn_cwd(False))
+        self.assertEqual([(m, p.get("cwd"), p.get("model")) for m, p in calls],
+                         [("turn/start", "/now/here", None), ("turn/start", "/scratch", "m")])
 
 
 class HeldRootRefusalTest(unittest.TestCase):

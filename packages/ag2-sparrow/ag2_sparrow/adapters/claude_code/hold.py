@@ -145,17 +145,14 @@ def main(args, popen=subprocess.Popen, environ=None) -> int:
 
 
 def _held(root, cfg, session_id, nonce, env, popen, state) -> int:
-    try:
-        owner = task_io.acquire_lock(root, LOCAL.name, retry_s=cm.ACQUIRE_RETRY_S)
-    except task_io.LockRefused as e:
-        print(e.line, file=sys.stderr)
-        return cm.EXIT_HELD if e.code == 3 else cm.EXIT_UNUSABLE
-    try:
-        if cm._is_link("tasks", owner.root_fd):
-            return _refuse("tasks/ under the held root is a symlink, not a directory")
+    """connect_common's holder sequence with this shape's steps: prepare the root and fchdir into
+    `tasks` under the held fd, spawn the gated shim, write its go byte once attached, reap it otherwise."""
+    pipe = {}
+
+    def prepare(owner, root):
         problem = inbox.prepare_root(root)
         if problem:
-            return _refuse(problem)
+            return None, problem
         recovered = inbox.recover_dead_generation(root)
         if recovered:
             print("hold: recovered %d claim(s) of the dead generation" % recovered, file=sys.stderr)
@@ -164,51 +161,31 @@ def _held(root, cfg, session_id, nonce, env, popen, state) -> int:
         except OSError as e:
             what = "tasks/ under the held root is a symlink, not a directory" if cm._is_link("tasks", owner.root_fd) \
                 else "no tasks/ under the held root %s (%s)" % (root, e.strerror or e)
-            return _refuse(what)
+            return None, what
         try:
             st = os.fstat(inbox_fd)
             os.fchdir(inbox_fd)
         finally:
             os.close(inbox_fd)
-        inode = "%d:%d" % (st.st_dev, st.st_ino)
-        if state["sig"] is not None:
-            print("hold: stopped before the session started", file=sys.stderr)
-            return 128 + state["sig"]
-        expected = task_io.holder_record_bytes(owner)
-        try:
-            child, go_w = spawn_shim(claude_argv(cfg, session_id), child_env(env, inode), popen)
-        except OSError as e:
-            return _refuse("the session could not be spawned (%s)" % (e.strerror or e))
-        start = task_io.start_time(child.pid)
-        try:
-            if start is None:
-                raise task_io.LockRefused(2, "the shim's start time is unreadable")
-            task_io.attach_consumer(owner, expected, child.pid, start)
-            while True:
-                try:
-                    if os.write(go_w, GO) != 1:
-                        raise OSError("short write")
-                    break
-                except InterruptedError:
-                    continue
-            os.close(go_w)
-        except (OSError, task_io.LockRefused, Exception) as e:   # holder_lock.LockError arrives as Exception here
-            reap(child, go_w)
-            return _refuse("no consumer: %s" % e)
-        return _supervise(child, state)
-    finally:
-        if not task_io.release_lock(owner):
-            print("hold: the session may still be alive; the root stays held by it and this flock until exit",
-                  file=sys.stderr)
+        return "%d:%d" % (st.st_dev, st.st_ino), ""
+
+    def spawn(inode):
+        child, pipe["go_w"] = spawn_shim(claude_argv(cfg, session_id), child_env(env, inode), popen)
+        return child
+
+    def started(child):
+        while True:
+            try:
+                if os.write(pipe["go_w"], GO) != 1:
+                    raise OSError("short write")
+                break
+            except InterruptedError:
+                continue
+        os.close(pipe["go_w"])
+    return cm.hold_and_supervise(LOCAL, root, state, prepare, spawn, lambda child: _supervise(child, state),
+                                 lambda child: reap(child, pipe["go_w"]), "hold", "session", "shim", started)
 
 
 def _supervise(child, state) -> int:
     """Wait for the direct child; a recorded stop terminates it, bounded, then kills; its exit code."""
-    state["child"] = child
-    rc = cm._run_until_end(child, None, state)
-    if rc is None:
-        print("hold: the session did not die within the bound; the manager's to clean", file=sys.stderr)
-        return 128 + state["sig"]
-    if state["sig"] is not None:
-        return 128 + state["sig"]
-    return rc
+    return cm.supervise_child(child, state, "hold", "session")

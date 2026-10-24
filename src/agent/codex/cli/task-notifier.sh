@@ -413,8 +413,14 @@ submit_task() {
         clear_workstream_context
         return 0
       fi
+      # A payload removed with no findable result can never be answered; the queue head drop releases it.
+      if "$NOTIFIER_PY" "$DISPATCH_PY" head-abandoned "$RESULTS_DIR" "$filename" "$(task_payload "$filename")"; then
+        SUBMIT_ABANDONED=1
+        clear_workstream_context
+        return 0
+      fi
       if [ $(( $(date +%s) - started )) -ge "$COMPLETION_TIMEOUT" ]; then
-        echo "task-notifier: timed out waiting for result: $filename" >&2
+        log_notifier "timed out waiting for result: $filename"
         clear_workstream_context
         return 0
       fi
@@ -552,12 +558,14 @@ process_announced_queue() {
       rm -f "$queue_dir/$filename" "$PAYLOAD_DIR/$filename"
       continue
     fi
+    SUBMIT_ABANDONED=0
     submit_task "$filename" 1
     if has_result "$filename"; then
       mark_worker_stage "$filename" done
       rm -f "$queue_dir/$filename" "$PAYLOAD_DIR/$filename"
       continue
     fi
+    [ "$SUBMIT_ABANDONED" = 1 ] && continue
     return 0
   done
 }

@@ -271,6 +271,7 @@ def recover(workspace, repo, worker_id, *, runner=None, spawn=None) -> dict:
     closed: list = []
     try:
         close_dead_runs(workspace, worker_id, closed)
+        pd.reconcile_interrupted(workspace, worker_id)
         out = spawn(workspace, repo, **kw)
     except (sw.SpawnRefused, sw.SpawnRetained, OSError) as e:
         return {"worker_id": worker_id, "outcome": FAILED, "why": str(e),

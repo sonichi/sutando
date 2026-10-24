@@ -1109,7 +1109,13 @@ export const workTool: ToolDefinition = {
 		'research, writing, translation, file changes, system queries, explanations, analysis. ' +
 		'This is how Sutando thinks and acts. Results are spoken back when ready.',
 	parameters: z.object({
-		task: z.string().describe('Full description of the task to perform'),
+		task: z
+			.string()
+			.describe(
+				'Full description of the task to perform. Keep dates as the user said them ("today", "yesterday", ' +
+				'"the day before yesterday", "this week"), never with a calendar date added: your date can be a day off, ' +
+				'and the core turns them into dates in the owner\'s time zone.'
+			),
 		replaces: z
 			.string()
 			.optional()
