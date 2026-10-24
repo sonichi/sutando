@@ -134,6 +134,11 @@ def vault_key(segment: str) -> str:
     return "AG2_RELAY_TOKEN_" + worker_name(segment).upper().replace("-", "_")
 
 
+def url_vault_key(segment: str) -> str:
+    """Where the owner stores the agent's gateway URL for a token that is a bare secret."""
+    return "AG2_RELAY_URL_" + worker_name(segment).upper().replace("-", "_")
+
+
 def bridge_env(root, agent_id: str, token_file: str = "", state=None) -> dict:
     """What the agent's bridge runs with: exactly this root's tasks/ and results/, its own state beside it
     (`state`: the dir the config records, so the unit, verify and the card store name one dir)."""
@@ -224,6 +229,8 @@ def wire_bridge(cfg: dict) -> str:
             return problem
         print(f"declared: {path} ({mode} runs it as worker {name} on its next scan; the token is read from "
               f"the vault: vault set {cfg['TOKEN_VAULT_KEY']} <the agent's relay token>)")
+        print(f"if that token is a bare secret, not https://<gateway>|<secret>, also: vault set "
+              f"{url_vault_key(Path(root).name)} <the agent's gateway URL>")
         return ""
     sup = cm.supervisor_path(BRIDGE)
     text, problem = cm.owned_text(sup, cm.supervisor_marker(BRIDGE), "supervisor file")

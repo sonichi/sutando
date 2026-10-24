@@ -2425,6 +2425,8 @@ class ConnectHostSupervised(AgentRootBase):
         self.assertEqual((self.cfg()["BRIDGE"], self.cfg()["TOKEN_VAULT_KEY"], self.cfg()["TOKEN_ENV_FILE"]),
                          ("sparrowd", cli.vault_key(seg), ""))
         self.assertIn(f"vault set {cli.vault_key(seg)} <the agent's relay token>", out)
+        self.assertIn(f"if that token is a bare secret, not https://<gateway>|<secret>, also: vault set "
+                      f"{cli.url_vault_key(seg)} <the agent's gateway URL>", out)
         self.assertNotIn(TOKEN, self.decl().read_text())
         for a, b in (("probe.agent_ag2.space", "probe-agent_ag2.space"), ("a_b", "a.b")):
             self.assertNotEqual(cli.worker_name(a), cli.worker_name(b), "two agents never share a worker name")

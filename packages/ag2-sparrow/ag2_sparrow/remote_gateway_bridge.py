@@ -7512,6 +7512,12 @@ def main() -> None:
         sys.exit(f"FATAL: {_FOUND.fatal}")
     if not TOKEN:
         sys.exit("FATAL: set REMOTE_TASK_TOKEN (the onboarding string, or a bare secret with REMOTE_TASK_URL).")
+    if not URL and gateway_credential_sources.credentials_injected(os.environ):
+        # A declared bridge's environment URLs are stripped: only the owner's vault entries can supply it.
+        sys.exit("FATAL: no gateway URL for this declared bridge — its vault token is a bare secret. Store the "
+                 "agent's gateway URL under its AG2_RELAY_URL_<worker> vault key, or the combined "
+                 "'https://<gateway>|<secret>' token under its AG2_RELAY_TOKEN_<worker> key; "
+                 "`python3 src/sparrow_agent_bridge.py --preflight` names both keys.")
     if not URL:
         # A token that starts with a URL scheme but yielded no URL means the
         # url|secret separator was swallowed (e.g. a %7C survived decoding, or a

@@ -381,14 +381,23 @@ host supervisor through `_dirs.set_dirs()`, so the root is
 environment only (the workspace's own binding is the core's agent), and
 install writes no job: it writes `<root>.bridge/worker.json`, a declaration
 naming the worker, the module, the same environment and the vault key the
-token is read from (`vault set AG2_RELAY_TOKEN_BRIDGE_… <token>`). sparrowd
+token is read from (`vault set AG2_RELAY_TOKEN_BRIDGE_… <token>`). Store the
+combined `https://<gateway>|<secret>` relay token there, or a bare secret plus
+the agent's gateway URL under the matching URL key
+(`vault set AG2_RELAY_URL_BRIDGE_… <the agent's gateway URL>`, which install
+prints): a declared bridge never takes its endpoint from the host's environment
+(`REMOTE_TASK_URL`, `AG2_REMOTE_URL`, `GATEWAY_URL` and `RELAY_URL` are stripped)
+or from the declaration, and a URL inside the token wins over the URL key. A
+bare secret with no URL key does not start; `python3 src/sparrow_agent_bridge.py
+--preflight` lists every declared agent and, for one that will not start, the
+one `vault set` that fixes it. sparrowd
 reads every marked `<workspace>/agents/*.bridge/worker.json` at its start and
 on every scan after it (`src/sparrowd.py`, `--rescan-s`, 30 s by default) and
 runs each as a worker through `src/sparrow_agent_bridge.py`:
 the token from the vault into `REMOTE_TASK_TOKEN` (never on disk; no token, no
 bridge), the agent's own dirs and the workspace's task stamper injected, and
 the package bridge run in that process under sparrowd's environment minus the
-host's token, identity and owner-DM variables. The declaration is data the
+host's tokens, gateway URLs, identity and owner-DM variables. The declaration is data the
 agent's own session could write, so it chooses nothing: the worker name, the
 vault key, the token variable and the exact env (the three dirs and
 `AGENT_MXID`) are derived from its directory's segment, and a declaration

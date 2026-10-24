@@ -38,6 +38,15 @@ lower-precedence candidate.
 
 > **Legacy / bootstrap shortcut:** the bridge also accepts a *combined* token of the form `REMOTE_TASK_TOKEN="https://relay.example.com|<secret>"` (URL and secret joined by `|`), which it splits at startup. This exists only so a one-shot onboarding string can carry both halves. If you use it, **quote it in `.env`** — an unquoted `|` is a shell pipe when the file is sourced. Prefer the split form for anything persistent.
 
+> **A declared agent bridge under sparrowd** (a claude-local install on a host
+> whose supervisor is sparrowd) reads neither variable from the environment: it
+> strips every host token and gateway URL name, so the agent's token never meets
+> the host's endpoint. Its token comes from the vault key `AG2_RELAY_TOKEN_<worker>`,
+> and its URL from inside that token (the combined form) or, for a bare secret,
+> from `AG2_RELAY_URL_<worker>`. A URL inside the token wins.
+> `python3 src/sparrow_agent_bridge.py --preflight` lists each declared agent and
+> the one `vault set` that fixes one that will not start.
+
 Older installs using `AG2_REMOTE_URL` / `AG2_REMOTE_TOKEN` remain supported by
 both the bridge launcher and the core-independent health-alert sender during
 the compatibility window.

@@ -124,14 +124,15 @@ def load(path: Path, agents: Path) -> "tuple[dict | None, str]":
         same = False
     if not same:
         return None, f"{path}: env is not the canonical one for {segment}"
-    return dict(want, digest=hashlib.sha256(raw).hexdigest()), ""
+    return dict(want, url_vault_key=adapter.url_vault_key(segment), digest=hashlib.sha256(raw).hexdigest()), ""
 
 
-def bridge_environ(decl: dict, token: str, base=None) -> dict:
+def bridge_environ(decl: dict, token: str, base=None, url: str = "") -> dict:
     """What the bridge runs under: sparrowd's environment minus the host-only variables, every name the
     owner lists for a host's gateway tokens and endpoints and every key it carries, plus the derived env, an empty owner
-    DM, the owner's carried config (resolved here, from the host's files if need be) and the agent's token."""
-    token_env = _sources.bridge_token_environ(token)
+    DM, the owner's carried config (resolved here, from the host's files if need be) and the agent's token
+    (with `url`, the agent's own gateway from endpoint(), when the token embeds none)."""
+    token_env = _sources.bridge_token_environ(token, url)
     # The carried keys come only from the owner's result below, never from the generic base.
     strip = _sources.bridge_strip_keys() + _sources.BRIDGE_CARRIED_CONFIG
     host = os.environ if base is None else base
@@ -174,14 +175,68 @@ def declarations(workspace: Path, vault_keys, held=None) -> "tuple[list, list]":
     return found, skipped
 
 
+def endpoint(decl: dict, token: str, get_key) -> "tuple[str, str]":
+    """(the agent's gateway URL for a bare-secret token, '') or ('', why the bridge cannot start). A
+    combined token carries its own URL: ('', ''). Only the owner-written vault key is read, never the host's
+    environment or the declaration, which the agent's own session could write."""
+    if _sources.token_embeds_url(token):
+        return "", ""
+    key, token_key = decl["url_vault_key"], decl["token_vault_key"]
+    try:
+        url = (get_key(key) or "").strip()
+    except KeyError:
+        url = ""
+    if not url:
+        return "", (f"the token under {token_key} is a bare secret and the vault has no {key}: run "
+                    f"`vault set {key} <the agent's gateway URL>`, or store the combined "
+                    f"https://<gateway>|<secret> token under {token_key}")
+    problem = _sources.gateway_url_problem(url)
+    return ("", f"{key} {problem}") if problem else (url, "")
+
+
+def preflight(workspace, get_key) -> int:
+    """One line per declared agent bridge: whether it can start (its token in the vault, and its gateway in
+    the token or under its URL key). 1 when any cannot. No value is printed."""
+    agents, bad = Path(workspace) / "agents", []
+    homes = sorted(p for p in agents.iterdir() if p.name.endswith(SUFFIX)) if agents.is_dir() else []
+    for home in homes:
+        path = home / adapter.DECLARATION
+        if _stat(path) is None:
+            continue
+        try:
+            decl, why = load(path, agents)
+        except ScanUnavailable as e:
+            decl, why = None, str(e)
+        if decl is not None:
+            try:
+                token = get_key(decl["token_vault_key"])
+            except KeyError:
+                token, why = None, f"the vault has no {decl['token_vault_key']}"
+            if token is not None:
+                url, why = endpoint(decl, token, get_key)
+                if not why:
+                    where = "its token" if not url else decl["url_vault_key"]
+                    print(f"ok: {decl['name']} (gateway from {where})")
+                    continue
+            why = f"{decl['name']}: {why}"
+        bad.append(why)
+        print(f"WILL NOT START: {why}")
+    return 1 if bad else 0
+
+
 def main(argv=None, workspace=None, get_key=None, run=runpy.run_module) -> int:
     args = sys.argv[1:] if argv is None else argv
     if len(args) != 1:
-        print("usage: sparrow_agent_bridge.py <workspace>/agents/<agent>.bridge/worker.json", file=sys.stderr)
+        print("usage: sparrow_agent_bridge.py <workspace>/agents/<agent>.bridge/worker.json | --preflight",
+              file=sys.stderr)
         return 2
     if workspace is None:
         from workspace_default import resolve_workspace
         workspace = resolve_workspace()
+    if get_key is None and args[0] == "--preflight":
+        from vault_intercept import get_vault_key as get_key
+    if args[0] == "--preflight":
+        return preflight(workspace, get_key)
     try:
         decl, why = load(Path(args[0]), Path(workspace) / "agents")
     except ScanUnavailable as e:
@@ -196,7 +251,11 @@ def main(argv=None, workspace=None, get_key=None, run=runpy.run_module) -> int:
     except KeyError:
         print(f"sparrow-agent-bridge: not starting: the vault has no {decl['token_vault_key']}", file=sys.stderr)
         return 1
-    environ = bridge_environ(decl, token)
+    url, problem = endpoint(decl, token, get_key)
+    if problem:
+        print(f"sparrow-agent-bridge: not starting: {problem}", file=sys.stderr)
+        return 1
+    environ = bridge_environ(decl, token, url=url)
     os.environ.clear()
     os.environ.update(environ)
     from ag2_sparrow._dirs import set_dirs

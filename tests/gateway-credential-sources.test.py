@@ -1628,7 +1628,7 @@ def declaration_reads(source: str, rel: str) -> "list[str]":
 # Closed world for the declaration's reader: bridge_environ is exactly this (its docstring aside), and
 # these are the module's only mapping writes. A change to either is a reviewed edit of this test.
 READER_ENVIRON = """
-token_env = _sources.bridge_token_environ(token)
+token_env = _sources.bridge_token_environ(token, url)
 strip = _sources.bridge_strip_keys() + _sources.BRIDGE_CARRIED_CONFIG
 host = os.environ if base is None else base
 env = {k: v for k, v in host.items() if k not in HOST_ONLY and k not in strip}
@@ -1688,8 +1688,8 @@ def token_injection_findings(source: str, rel: str) -> "list[str]":
     main = [f for f in tree.body if isinstance(f, ast.FunctionDef) and f.name == "main"]
     binds = [n for f in main for n in ast.walk(f) if isinstance(n, ast.Name) and n.id == "environ"
              and not isinstance(n.ctx, ast.Load)]
-    if len(binds) != 1 or ast.unparse(parents[binds[0]].value) != "bridge_environ(decl, token)":
-        out.append(f"{rel}: main's environment is not bridge_environ(decl, token) alone")
+    if len(binds) != 1 or ast.unparse(parents[binds[0]].value) != "bridge_environ(decl, token, url=url)":
+        out.append(f"{rel}: main's environment is not bridge_environ(decl, token, url=url) alone")
     return out
 
 
@@ -2048,7 +2048,7 @@ class Guard(unittest.TestCase):
             self.assertTrue(owner_only_findings("_sources.bridge_token_environ('')", "adapters/x.py"),
                             "the reader's accessors stay the reader's")
             self.assertEqual(token_injection_findings(text, rel), [])
-            for mutant in (('    token_env = _sources.bridge_token_environ(token)\n', '    token_env = {"REMOTE_TASK_TOKEN": token}\n'),
+            for mutant in (('    token_env = _sources.bridge_token_environ(token, url)\n', '    token_env = {"REMOTE_TASK_TOKEN": token}\n'),
                            ('    strip = _sources.bridge_strip_keys() + _sources.BRIDGE_CARRIED_CONFIG\n', '    strip = token_env + _sources.BRIDGE_CARRIED_CONFIG\n'),
                            ('    strip = _sources.bridge_strip_keys() + _sources.BRIDGE_CARRIED_CONFIG\n', '    strip = HOST_ONLY + tuple(token_env)\n'),
                            ('    strip = _sources.bridge_strip_keys() + _sources.BRIDGE_CARRIED_CONFIG\n', '    strip = _sources.bridge_strip_keys()[:1] + _sources.BRIDGE_CARRIED_CONFIG\n'),
@@ -2068,7 +2068,7 @@ class Guard(unittest.TestCase):
         ('    env.update(token_env)\n', '    env.update(token_env)\n    env[suffix_key(decl)] = token\n'),
         ('    env.update(token_env)\n', '    env.update(token_env)\n    env.setdefault(next(iter(token_env)), token)\n'),
         ('    os.environ.update(environ)\n', '    os.environ.update(environ)\n    os.environ.update(**{next(iter(environ)): token})\n'),
-        ('    environ = bridge_environ(decl, token)\n', '    environ = {**bridge_environ(decl, token), "X": token}\n'),
+        ('    environ = bridge_environ(decl, token, url=url)\n', '    environ = {**bridge_environ(decl, token, url=url), "X": token}\n'),
         ('    os.environ.update(environ)\n', '    os.environ.update(environ)\n    os.putenv(name_of(decl), token)\n'),
         ('    os.environ.update(environ)\n', '    os.environ.update(environ)\n    os.environ |= {next(iter(environ)): token}\n'),
         ('    os.environ.update(environ)\n', '    os.environ.update(environ)\n    e = os.environ\n    e |= {next(iter(environ)): token}\n'),

@@ -126,9 +126,30 @@ INJECTED_KEY = "GATEWAY_CREDENTIALS_INJECTED"
 BRIDGE_CARRIED_CONFIG = ("REMOTE_PROACTIVE_TRUST_OK",)
 
 
-def bridge_token_environ(token: str) -> "dict[str, str]":
-    """The variables a declared bridge's token is handed to it under, with the mark that it was."""
-    return {token_env_name(): token, INJECTED_KEY: "1"}
+def bridge_token_environ(token: str, url: str = "") -> "dict[str, str]":
+    """The variables a declared bridge's token is handed to it under, with the mark that it was, and the
+    agent's own gateway `url` beside a token that embeds none (a URL inside the token wins). The supervisor
+    reads `url` from where the owner stored it, never from the host's environment or the declaration."""
+    out = {token_env_name(): token, INJECTED_KEY: "1"}
+    if url and not token_embeds_url(token):
+        out[URL_KEYS[0]] = url
+    return out
+
+
+def token_embeds_url(token: str) -> bool:
+    """Whether `token` is the combined onboarding form, carrying its gateway URL."""
+    return bool(contract.parse_onboarding_token(token or "")[0])
+
+
+def gateway_url_problem(url: str) -> str:
+    """'' for a usable gateway URL (http or https, a host, no '|', no whitespace or control characters),
+    else why not, without the value."""
+    if not url or any(c.isspace() or ord(c) < 0x20 or ord(c) == 0x7F for c in url) or "|" in url:
+        return "is not a gateway URL (empty, or holds whitespace, a control character or '|')"
+    scheme, sep, rest = url.partition("://")
+    if not sep or scheme.lower() not in ("http", "https") or not rest.split("/", 1)[0]:
+        return "is not an http(s) URL with a host"
+    return ""
 
 
 def credentials_injected(env: Mapping[str, str]) -> bool:

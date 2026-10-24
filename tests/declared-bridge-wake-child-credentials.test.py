@@ -134,9 +134,10 @@ class WakeChild(unittest.TestCase):
     # Every name a host's gateway URL may sit under, the two the bridge's discovery reads first among them.
     HOST_URL_NAMES = ("REMOTE_TASK_URL", "AG2_REMOTE_URL", "GATEWAY_URL", "RELAY_URL")
 
-    def run_declared(self, name):
-        """The real chain under a host URL inherited as `name`: (the bridge's own URL, the wake child's record)."""
-        self.ws, out = self.tmp / f"ws-{name}", self.tmp / f"out-{name}"
+    def run_declared(self, name, split=False):
+        """The real chain under a host URL inherited as `name`: (the bridge's own URL, the wake child's record).
+        `split`: the vault holds a bare secret and, under the agent's URL key, its gateway."""
+        self.ws, out = self.tmp / f"ws-{name}-{split}", self.tmp / f"out-{name}-{split}"
         out.mkdir()
         decl = self.declare()
         seen = {}
@@ -146,15 +147,17 @@ class WakeChild(unittest.TestCase):
             seen["wake"] = self.queue_one_task()
             seen["bridge_url"] = sys.modules[BRIDGE].URL
         with mock.patch.dict(os.environ, dict(self.host, WAKE_OUT=str(out), **{name: HOST_URL})):
-            rc = bridge.main([str(decl)], workspace=self.ws, get_key=lambda k: AGENT_TOKEN, run=child)
+            vault = {cli.vault_key(SEG): AGENT_SECRET, cli.url_vault_key(SEG): AGENT_URL} if split else \
+                {cli.vault_key(SEG): AGENT_TOKEN}
+            rc = bridge.main([str(decl)], workspace=self.ws, get_key=vault.__getitem__, run=child)
         sys.modules.pop(BRIDGE, None)
         self.assertEqual(rc, 0)
         return seen["bridge_url"], seen["wake"]
 
     def test_the_declared_bridges_wake_child_reads_the_room_as_the_agent_never_as_the_host(self):
-        for name in self.HOST_URL_NAMES:
-            with self.subTest(host_url_under=name):
-                bridge_url, wake = self.run_declared(name)
+        for name, split in [(n, s) for n in self.HOST_URL_NAMES for s in (False, True)]:
+            with self.subTest(host_url_under=name, split_form=split):
+                bridge_url, wake = self.run_declared(name, split)
                 self.assertEqual(bridge_url, AGENT_URL, "the bridge's endpoint is the agent token's, not the host's")
                 self.assertTrue(wake["marked"], "the wake child inherits the mark")
                 self.assertTrue(wake["config_dir_kept"], "the config root stays, for access.json")
@@ -165,6 +168,17 @@ class WakeChild(unittest.TestCase):
                 self.assertEqual(wake["opened"], [], "the wake child opened a file under the host's config root")
                 self.assertNotEqual(wake["channel_env_rc"], 0)
                 self.assertFalse(wake["channel_env_named_a_file"], "channel-env.sh handed the wake child a credential file")
+
+    def test_a_declared_bridge_without_a_gateway_names_the_vault_keys_not_the_stripped_variable(self):
+        env = dict(AGENT_CONNECT_TASK_DIR=str(self.tmp / "tasks"), AGENT_CONNECT_RESULT_DIR=str(self.tmp / "results"),
+                   AGENT_CONNECT_STATE_DIR=str(self.tmp / "state"), **_sources.bridge_token_environ(AGENT_SECRET))
+        with mock.patch.dict(os.environ, env):
+            mod = importlib.import_module(BRIDGE)
+            with self.assertRaises(SystemExit) as cm:
+                mod.main()
+        self.assertIn("AG2_RELAY_URL_<worker>", str(cm.exception.code))
+        self.assertIn("--preflight", str(cm.exception.code))
+        self.assertNotIn("set REMOTE_TASK_URL", str(cm.exception.code))
 
     def test_control_the_hosts_own_bridge_wake_child_does_reload_it(self):
         # Unmarked, as the host's own bridge runs: the same sentinel sees the reload.

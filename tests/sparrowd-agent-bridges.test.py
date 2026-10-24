@@ -37,6 +37,18 @@ from ag2_sparrow.adapters.claude_code import cli  # noqa: E402
 
 AGENT = "@probe.agent:ag2.space"
 SEG = "probe.agent_ag2.space"
+AGENT_URL = "https://agent-gw.example/relay"
+
+
+def vault(token="tok-agent", url=AGENT_URL, asked=None):
+    """A get_key over the agent's two vault entries: its token, and its gateway URL when `url` is set."""
+    store = {cli.vault_key(SEG): token, **({cli.url_vault_key(SEG): url} if url is not None else {})}
+
+    def get(key):
+        if asked is not None:
+            asked.append(key)
+        return store[key]
+    return get
 
 
 def load_sparrowd():
@@ -356,17 +368,18 @@ class Wrapper(Base):
                         token=os.environ.get("REMOTE_TASK_TOKEN"), mxid=os.environ.get("AGENT_MXID"),
                         device=os.environ.get("AG2_DEVICE_ENV"), token_file=os.environ.get("REMOTE_TASK_TOKEN_FILE"),
                         room=os.environ.get("REMOTE_PROACTIVE_ROOM"), keep=os.environ.get("KEEP_ME"),
+                        url=os.environ.get("REMOTE_TASK_URL"),
                         extra=sorted(set(os.environ) - set(base) - set(bridge.HOST_ONLY)
-                                     - set(_sources.bridge_token_environ(""))))
+                                     - set(_sources.bridge_token_environ("", AGENT_URL))))
         base = set(os.environ)
         asked = []
-        rc = bridge.main([str(decl)], workspace=self.ws, get_key=lambda k: asked.append(k) or "tok-agent", run=fake_run)
+        rc = bridge.main([str(decl)], workspace=self.ws, get_key=vault(asked=asked), run=fake_run)
         self.assertEqual(rc, 0)
-        self.assertEqual(asked, [cli.vault_key(SEG)])
+        self.assertEqual(asked, [cli.vault_key(SEG), cli.url_vault_key(SEG)])
         self.assertEqual(seen, {"module": "ag2_sparrow.remote_gateway_bridge", "run_name": "__main__",
                                 "task": root / "tasks", "result": root / "results", "state": Path(f"{root}.bridge/state"),
                                 "stamper": True, "token": "tok-agent", "mxid": AGENT, "device": None, "token_file": None,
-                                "room": "", "keep": "1", "extra": []})
+                                "room": "", "keep": "1", "url": AGENT_URL, "extra": []})
 
     # Synthetic host values, one under every name a host's gateway token may sit under.
     HOST_TOKENS = {"REMOTE_TASK_TOKEN": "host-token", "AG2_REMOTE_TOKEN": "host-alias-token",
@@ -378,7 +391,7 @@ class Wrapper(Base):
         decl = self.declare()
         seen = {}
         with mock.patch.dict(os.environ, self.HOST_TOKENS), recording_bridge_environ(seen):
-            rc = bridge.main([str(decl)], workspace=self.ws, get_key=lambda k: "tok-agent",
+            rc = bridge.main([str(decl)], workspace=self.ws, get_key=vault(),
                              run=lambda module, run_name, alter_sys: seen.update(applied=runs_under(seen["env"])))
         self.assertEqual(rc, 0)
         self.assertIs(seen.get("applied"), True, "the bridge ran under exactly the built environment")
@@ -455,7 +468,7 @@ class Wrapper(Base):
             self.assertEqual(bridge.main([str(self.ws / "none.json")], workspace=self.ws, run=run), 2)
         run.assert_not_called()
         decl = self.declare()
-        fake_vault = types.SimpleNamespace(get_vault_key=lambda k: "tok")
+        fake_vault = types.SimpleNamespace(get_vault_key=lambda k: f"{AGENT_URL}|tok")
         with mock.patch("workspace_default.resolve_workspace", return_value=self.ws), \
                 mock.patch.dict(sys.modules, {"vault_intercept": fake_vault}):
             self.assertEqual(bridge.main([str(decl)], run=run), 0)
@@ -515,7 +528,7 @@ class HostCredentialFiles(Base):
             seen["applied"] = runs_under(seen["env"])
             seen["child_opens"] = list(self.opens)
         with mock.patch.dict(os.environ, host_env), contextlib.redirect_stderr(err), recording_bridge_environ(seen):
-            rc = bridge.main([str(decl)], workspace=self.ws, get_key=lambda k: "tok-agent", run=child)
+            rc = bridge.main([str(decl)], workspace=self.ws, get_key=vault(), run=child)
         self.assertEqual(rc, 0)
         self.assertIs(seen.get("applied"), True, "the bridge ran under exactly the built environment")
         seen["stderr"] = err.getvalue()
@@ -549,6 +562,91 @@ class HostCredentialFiles(Base):
                          "set in the host's environment: not even the wrapper opens the file")
         self.assertFalse(seen["mod"]._SECRETS.contains(self.CANARY))
 
+
+
+class AgentEndpoint(Base):
+    """The agent's gateway: inside a combined token, else only from the owner's AG2_RELAY_URL_<worker> vault key;
+    never from the host's environment or from the declaration, which the agent's own session could write."""
+
+    def setUp(self):
+        super().setUp()
+        env = mock.patch.dict(os.environ, {})
+        env.start()
+        self.addCleanup(env.stop)
+        saved = (_dirs._injected, local_task_protocol._TASK_STAMPER)
+        self.addCleanup(lambda: (setattr(_dirs, "_injected", saved[0]),
+                                 setattr(local_task_protocol, "_TASK_STAMPER", saved[1])))
+
+    def started(self, get_key, base=None):
+        decl = self.declare()
+        seen, err = {}, io.StringIO()
+        with mock.patch.dict(os.environ, base or {}), contextlib.redirect_stderr(err):
+            rc = bridge.main([str(decl)], workspace=self.ws, get_key=get_key,
+                             run=lambda module, run_name, alter_sys: seen.update(
+                                 url=os.environ.get("REMOTE_TASK_URL"), token=os.environ.get("REMOTE_TASK_TOKEN")))
+        return rc, seen, err.getvalue()
+
+    def test_the_split_form_takes_its_gateway_from_the_owners_vault_key(self):
+        rc, seen, _ = self.started(vault())
+        self.assertEqual((rc, seen), (0, {"url": AGENT_URL, "token": "tok-agent"}))
+
+    def test_the_split_form_without_a_vault_url_fails_with_the_one_command_that_fixes_it(self):
+        rc, seen, err = self.started(vault(url=None))
+        self.assertEqual((rc, seen), (1, {}))
+        self.assertIn(f"`vault set {cli.url_vault_key(SEG)} <the agent's gateway URL>`", err)
+        self.assertNotIn("tok-agent", err)
+
+    def test_a_combined_token_ignores_the_vault_url(self):
+        asked = []
+        rc, seen, _ = self.started(vault(token=f"{AGENT_URL}|tok-agent", url="https://other-gw.example/relay", asked=asked))
+        self.assertEqual((rc, seen), (0, {"url": None, "token": f"{AGENT_URL}|tok-agent"}))
+        self.assertEqual(asked, [cli.vault_key(SEG)], "the URL key is not even read")
+
+    def test_a_host_url_never_reaches_the_bridge(self):
+        host = {k: "https://host-gw.example/relay" for k in ("REMOTE_TASK_URL", "AG2_REMOTE_URL", "GATEWAY_URL", "RELAY_URL")}
+        for get_key, want in ((vault(), AGENT_URL), (vault(token=f"{AGENT_URL}|tok-agent"), None)):
+            with self.subTest(want=want):
+                rc, seen, _ = self.started(get_key, base=host)
+                self.assertEqual((rc, seen["url"]), (0, want))
+
+    def test_a_url_written_into_the_declaration_is_never_used(self):
+        decl = self.declare()
+        self.edit(decl, gateway_url="https://session-chosen.example/relay", url="https://session-chosen.example/relay")
+        for get_key, want_rc in ((vault(url=None), 1), (vault(), 0)):
+            seen, err = {}, io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc = bridge.main([str(decl)], workspace=self.ws, get_key=get_key,
+                                 run=lambda module, run_name, alter_sys: seen.update(url=os.environ.get("REMOTE_TASK_URL")))
+            self.assertEqual(rc, want_rc, err.getvalue())
+            self.assertNotEqual(seen.get("url"), "https://session-chosen.example/relay")
+            self.assertNotIn("session-chosen", repr(bridge.load(decl, self.ws / "agents")[0]))
+
+    def test_an_unusable_vault_url_is_refused_by_name(self):
+        for bad in ("ftp://gw.example/relay", "https://gw.example/relay|x", "https:// gw", "gw.example", "https://"):
+            with self.subTest(bad=bad):
+                rc, seen, err = self.started(vault(url=bad))
+                self.assertEqual((rc, seen), (1, {}))
+                self.assertIn(cli.url_vault_key(SEG), err)
+
+    def test_the_owner_sets_the_url_only_beside_a_bare_token(self):
+        self.assertEqual(_sources.bridge_token_environ("s", AGENT_URL),
+                         {"REMOTE_TASK_TOKEN": "s", "GATEWAY_CREDENTIALS_INJECTED": "1", "REMOTE_TASK_URL": AGENT_URL})
+        self.assertNotIn("REMOTE_TASK_URL", _sources.bridge_token_environ(f"{AGENT_URL}|s", "https://other/relay"))
+        self.assertNotIn("REMOTE_TASK_URL", _sources.bridge_token_environ("s"))
+
+    def test_preflight_names_each_install_that_will_not_start(self):
+        self.declare()
+        cases = ((vault(token=f"{AGENT_URL}|tok-agent", url=None), 0, "ok: bridge-probe-agent-ag2-space-", "from its token"),
+                 (vault(), 0, "ok: bridge-probe-agent-ag2-space-", f"from {cli.url_vault_key(SEG)}"),
+                 (vault(url=None), 1, "WILL NOT START: bridge-probe-agent-ag2-space-", f"vault set {cli.url_vault_key(SEG)}"))
+        for get_key, want_rc, head, tail in cases:
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = bridge.main(["--preflight"], workspace=self.ws, get_key=get_key)
+            self.assertEqual(rc, want_rc, out.getvalue())
+            self.assertIn(head, out.getvalue())
+            self.assertIn(tail, out.getvalue())
+            self.assertNotIn("tok-agent", out.getvalue())
 
 if __name__ == "__main__":
     unittest.main()
