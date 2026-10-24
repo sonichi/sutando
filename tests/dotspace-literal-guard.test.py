@@ -132,14 +132,15 @@ def scan_repo(repo: Path = REPO):
 
 
 class TestScannerKnownAnswer(unittest.TestCase):
+    # Nine hits across every form plus five near-misses; EXPECTED below is the answer key.
     FIXTURE = [
-        "origin = 'https://sutando.ag2.space'",         # 1  sutando.ag2.space
-        "gw = 'chat.ag2.space'; dev = 'dev.ag2.space'",  # 2  chat.ag2.space, dev.ag2.space
-        "via = 'ag2.space'",                            # 1  bare
-        "room = '!r:ag2.space' or '@u:dev.ag2.space'",  # 2  bare (after a colon), dev.ag2.space
-        "cloud = 'https://dev-sutando.s.space/'",       # 1  dev-sutando.s.space
-        "servers = ['s.space', 'dev.s.space']",         # 2  bare s.space, dev.s.space
-        "not_hits = ['ag2space', 'address.space', 'ag2.spaces', 'xs.space', 'ag2-space']",  # 0
+        "origin = 'https://sutando.ag2.space'",
+        "gw = 'chat.ag2.space'; dev = 'dev.ag2.space'",
+        "via = 'ag2.space'",
+        "room = '!r:ag2.space' or '@u:dev.ag2.space'",
+        "cloud = 'https://dev-sutando.s.space/'",
+        "servers = ['s.space', 'dev.s.space']",
+        "not_hits = ['ag2space', 'address.space', 'ag2.spaces', 'xs.space', 'ag2-space']",
         "",
     ]
     EXPECTED = [

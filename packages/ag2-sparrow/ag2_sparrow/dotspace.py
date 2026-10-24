@@ -59,8 +59,8 @@ OPERATOR_AG2 = "ag2"
 WELL_KNOWN_KEY = "space.ag2.dotspace"
 WELL_KNOWN_PATH = "/.well-known/matrix/client"
 WELL_KNOWN_TIMEOUT_S = 1.5
-WELL_KNOWN_TTL_S = 3600.0          # a declaration found
-WELL_KNOWN_NEGATIVE_TTL_S = 900.0  # none found, or the fetch failed
+WELL_KNOWN_TTL_S = 3600.0
+WELL_KNOWN_NEGATIVE_TTL_S = 900.0
 # The instance installs ran against before this resolver existed: the fallback whenever the
 # install's own server is unknown.
 LEGACY_SERVER = "ag2.space"

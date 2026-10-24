@@ -4,17 +4,17 @@ token, none), and that an ag2.space install still gets today's literals from eve
 
 Run: python3 tests/dotspace.test.py
 """
+import importlib
+import json
+import sys
+import unittest
+from pathlib import Path
+from unittest import mock
+
 from _helpers.hermetic_env import isolate_os_environ
 
-# Before anything reads the environment: no outer identity or credential selector survives.
+# Before dotspace reads the environment: no outer identity or credential selector survives.
 isolate_os_environ()
-
-import importlib  # noqa: E402
-import json  # noqa: E402
-import sys  # noqa: E402
-import unittest  # noqa: E402
-from pathlib import Path  # noqa: E402
-from unittest import mock  # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
