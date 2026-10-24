@@ -688,7 +688,7 @@ def _owner_review_dm(owner: str) -> str:
         "op": "create", "invite": [owner], "is_direct": True,
         "name": "Private result reviews",
         "topic": "Owner-only review of results withheld from shared rooms.",
-    }, timeout=20)
+    }, timeout=_ROOM_POST_TIMEOUT_S)
     room = gateway_instance.owner_room((answer or {}).get("room_id"), _reenroll_identity())
     if not room:
         raise RuntimeError("gateway did not return a private review room")
@@ -772,7 +772,7 @@ def _route_withheld_review(path: Path) -> bool:
             # Non-AG2 clients ignore it and retain the typed Yes/No fallback.
             payload["extra_content"] = {
                 "space.ag2.a2ui": _review_buttons(str(record["review_id"]))}
-        answer = _req("POST", "/v1/room", payload, timeout=20)
+        answer = _req("POST", "/v1/room", payload, timeout=_ROOM_POST_TIMEOUT_S)
         if not isinstance(answer, dict) or not answer.get("ok"):
             raise RuntimeError(f"private review DM part {index}/{len(messages)} was not accepted")
     record.update({"status": "awaiting_owner", "owner": owner, "dm_room_id": room,
@@ -941,7 +941,7 @@ _DEFINITE_PUBLISH_FAILURES = ("permanent-refusal", "max-attempts", "retry-window
 def _post_room_message(room: str, body: str, dedupe_key: str) -> dict:
     """The room-message send for an outbox provider: one /v1/room message POST."""
     return _req("POST", "/v1/room", {"op": "message", "room_id": room, "body": body,
-                                     "dedupe_key": dedupe_key}, timeout=20)
+                                     "dedupe_key": dedupe_key}, timeout=_ROOM_POST_TIMEOUT_S)
 
 
 def _record_release_receipt(item_id: str, event_id: str) -> None:
@@ -1137,7 +1137,7 @@ def _edit_review_card(record: dict) -> "dict | None":
     answer = _req("POST", "/v1/room", {
         "op": "edit", "room_id": room, "event_id": event_id,
         "body": _resolved_review_body(record),
-    }, timeout=20)
+    }, timeout=_ROOM_POST_TIMEOUT_S)
     if (not isinstance(answer, dict) or room_response_refused(answer)
             or not (answer.get("ok") or answer.get("event_id"))):
         return None
@@ -1582,7 +1582,7 @@ def _project_claude_local(mods, room: str, log=print) -> list:
                 store.save(req, store.projection(req.id))
     if not projector.pending_ids(manager):
         return []
-    return projector.project(manager, lambda payload: _req("POST", "/v1/room", payload, timeout=20), room)
+    return projector.project(manager, lambda payload: _req("POST", "/v1/room", payload, timeout=_ROOM_POST_TIMEOUT_S), room)
 
 
 def _project_hitl(log=print) -> int:
@@ -1618,7 +1618,7 @@ def _project_hitl(log=print) -> int:
     # Each store gets its pass: a stuck card in one never holds back the other's.
     try:
         if pending_ids(manager):
-            got = project(manager, lambda payload: _req("POST", "/v1/room", payload, timeout=20), room)
+            got = project(manager, lambda payload: _req("POST", "/v1/room", payload, timeout=_ROOM_POST_TIMEOUT_S), room)
             done, failed = list(got or []), not got
     except Exception as e:  # noqa: BLE001 — re-raised below, after the claude-local pass
         failed, raised = True, e
@@ -2670,6 +2670,14 @@ def _append_log_file(line: str) -> None:
 
 
 _REQ_TIMEOUT_S = 35
+_ROOM_POST_TIMEOUT_S = 20
+_PROACTIVE_POST_TIMEOUT_S = 15
+_UPLOAD_TIMEOUT_S = 60
+_ACK_TIMEOUT_S = 10
+# The longest single request the outbound worker can be waiting on; a stop that
+# returns sooner can kill an accepted send whose response is still on the way.
+_OUTBOUND_SEND_TIMEOUT_S = max(_REQ_TIMEOUT_S, _ROOM_POST_TIMEOUT_S,
+                               _PROACTIVE_POST_TIMEOUT_S, _UPLOAD_TIMEOUT_S, _ACK_TIMEOUT_S)
 
 # urllib wraps only the send in URLError; a socket closed after it raises http.client's
 # errors bare (RemoteDisconnected is a ConnectionResetError), and those are outages too.
@@ -2988,7 +2996,7 @@ def _post_task_ack(tid: str, durable: bool = False, lease_id: "str | None" = Non
             body["durable"] = True
         bound = {} if deadline is None else {"deadline": deadline}   # a healthy ack's call is unchanged
         try:
-            _req("POST", f"/v1/tasks/{safe_tid}/ack", body, timeout=10, **bound)
+            _req("POST", f"/v1/tasks/{safe_tid}/ack", body, timeout=_ACK_TIMEOUT_S, **bound)
         except _NETWORK_ERRORS as e:
             if not _connection_dropped(e) or (dropped is None and not retry_inline):
                 raise
@@ -2998,7 +3006,7 @@ def _post_task_ack(tid: str, durable: bool = False, lease_id: "str | None" = Non
                 return False
             # A dropped link loses the ack; one prompt retry lands it inside the delivery lease.
             time.sleep(ACK_DROP_RETRY_S)
-            _req("POST", f"/v1/tasks/{safe_tid}/ack", body, timeout=10, **bound)
+            _req("POST", f"/v1/tasks/{safe_tid}/ack", body, timeout=_ACK_TIMEOUT_S, **bound)
         _ack_disabled_until = 0.0  # success (or re-enablement) → clear any backoff
         _forget_pending_ack(tid, lease_id)
         return True
@@ -3055,7 +3063,7 @@ def _post_ack_first(tid: str, lease_id: "str | None") -> str:
     if lease_id:
         body["lease_id"] = lease_id
     try:
-        _req("POST", f"/v1/tasks/{urllib.parse.quote(wire_tid, safe='')}/ack", body, timeout=10)
+        _req("POST", f"/v1/tasks/{urllib.parse.quote(wire_tid, safe='')}/ack", body, timeout=_ACK_TIMEOUT_S)
         return "accepted"
     except urllib.error.HTTPError as e:
         reason = _http_error_body(e).lower() if e.code == 404 else ""
@@ -3076,7 +3084,7 @@ def _ack_first_state(tid: str) -> "str | None":
     or None when it cannot be read."""
     wire_tid = _broker_tid(tid)
     try:
-        doc = _req("GET", f"/v1/tasks/{urllib.parse.quote(wire_tid, safe='')}/status", timeout=10)
+        doc = _req("GET", f"/v1/tasks/{urllib.parse.quote(wire_tid, safe='')}/status", timeout=_ACK_TIMEOUT_S)
     except (OSError, ValueError, http.client.HTTPException) as e:
         _log_backoff((tid, "ack-status"), f"ack_first task {tid}: status unreadable "
                      f"({diagnostics.describe(e)}) — kept staged")
@@ -5275,7 +5283,7 @@ def _upload_attachment(room: str, path_str: str) -> tuple[bool, str]:
     safe_room = urllib.parse.quote(room, safe="")
     try:
         _req("POST", f"/v1/rooms/{safe_room}/media",
-             {"filename": name, "content_b64": content_b64}, timeout=60)
+             {"filename": name, "content_b64": content_b64}, timeout=_UPLOAD_TIMEOUT_S)
     except urllib.error.HTTPError as e:
         return False, f"HTTP {e.code}"
     except (urllib.error.URLError, TimeoutError) as e:
@@ -5298,7 +5306,7 @@ def _upload_task_attachment(wire_id: str, ordinal: int, path_str: str) -> "tuple
     try:
         _req("POST", f"/v1/tasks/{safe_tid}/media",
              {"ordinal": ordinal, "filename": name, "content_b64": content_b64},
-             timeout=60)
+             timeout=_UPLOAD_TIMEOUT_S)
     except urllib.error.HTTPError as e:
         if e.code == 409:
             return "note", "content conflicts with the recorded upload"
@@ -5900,7 +5908,7 @@ def _post_proactive() -> None:
                          "room_id": dest_room,
                          "body": body,
                          **({"thread_root": thread_root} if thread_root else {})},
-                        timeout=15)
+                        timeout=_PROACTIVE_POST_TIMEOUT_S)
             # A bare 200 is NOT proof of delivery: the gateway can swallow a
             # room-send failure server-side (bad room id, kicked agent,
             receipt = classify_response(200, resp, id_keys=("event_id",))
@@ -7600,31 +7608,45 @@ def _poll_stalled(last_ok: float, now: float,
 
 
 _STALL_REPORTED_FOR: float | None = None
+# Set once the stall exit has stopped the outbound worker: from then on the loop
+# only waits for that stop, because a resumed poll would run with no outbound worker.
+_STALL_EXIT_PENDING = False
 
 
-def _stop_background_workers(outbound_thread, results_watcher) -> None:
-    """Stop and join the outbound worker, so a result POST in flight is not cut off
-    and then redelivered by the next process."""
+def _worker_stop_budget_s() -> float:
+    """One join's wait: a full in-flight request plus the worker's scan slack."""
+    return _OUTBOUND_SEND_TIMEOUT_S + OUTBOUND_SCAN_S * 3 + 5
+
+
+def _stop_background_workers(outbound_thread, results_watcher) -> bool:
+    """Stop and join the outbound worker; True only once it has actually stopped.
+
+    Exiting while it is mid-send strands its claim, and the next process resends it.
+    The results watcher is only a wake-up doorbell, so its join is best-effort.
+    """
     _OUTBOUND_STOP.set(); _OUTBOUND_WAKE.set()
-    outbound_thread.join(timeout=OUTBOUND_SCAN_S * 3 + 5)
+    outbound_thread.join(timeout=_worker_stop_budget_s())
     if results_watcher is not None:
         results_watcher.join(timeout=5)
+    return not outbound_thread.is_alive()
 
 
 def _abort_if_poll_stalled(anchor: float,
-                           before_exit: Callable[[], None] | None = None) -> None:
+                           before_exit: Callable[[], bool] | None = None) -> bool:
     """Record a wedged-but-alive bridge, and exit only if something restarts us.
 
     `anchor` is a `time.monotonic()` reading: wall time would count a sleeping Mac
     as a stall. The exit is armed only when a restart owner is declared, since an
     unsupervised lane that exits stays down; the status sidecar records it either way.
+    `before_exit` stops the workers and reports whether they stopped; until they
+    have, this returns True and the caller must skip the beat rather than poll.
     """
-    global _STALL_REPORTED_FOR
+    global _STALL_REPORTED_FOR, _STALL_EXIT_PENDING
     now = time.monotonic()
     # Pass the limit explicitly: the parameter default binds at def time,
     # so a reconfigured module global would otherwise never be read.
-    if not _poll_stalled(anchor, now, POLL_STALL_EXIT_S):
-        return
+    if not _STALL_EXIT_PENDING and not _poll_stalled(anchor, now, POLL_STALL_EXIT_S):
+        return False
     stalled_s = int(now - anchor)
     if not POLL_STALL_RESTART_OWNER:
         # Once per stall episode, not once per poll: the loop calls this on every
@@ -7637,14 +7659,18 @@ def _abort_if_poll_stalled(anchor: float,
                 "so exiting would end this lane"))
             _log(f"WARN: no successful poll in {stalled_s}s and no restart owner "
                  "(SUTANDO_BRIDGE_RESTART_OWNER unset) -- continuing to retry")
-        return
-    _emit_gateway_status(False, error=f"stalled: no successful poll in {stalled_s}s")
-    # sys.exit's message reaches only stderr; the bridge log is where the backoff
-    # lines that preceded this live, so the stall must be stated there too.
-    _log(f"stalled: no successful poll in {stalled_s}s (limit {POLL_STALL_EXIT_S:g}s) "
-         f"while the process stayed alive -- exiting so {POLL_STALL_RESTART_OWNER} restarts it")
-    if before_exit is not None:
-        before_exit()
+        return False
+    if not _STALL_EXIT_PENDING:
+        _STALL_EXIT_PENDING = True
+        _emit_gateway_status(False, error=f"stalled: no successful poll in {stalled_s}s")
+        # sys.exit's message reaches only stderr; the bridge log is where the backoff
+        # lines that preceded this live, so the stall must be stated there too.
+        _log(f"stalled: no successful poll in {stalled_s}s (limit {POLL_STALL_EXIT_S:g}s) "
+             f"while the process stayed alive -- exiting so {POLL_STALL_RESTART_OWNER} restarts it")
+    if before_exit is not None and not before_exit():
+        _log("stall exit held: the outbound worker is still finishing a send -- "
+             "waiting for it to stop before exiting, without polling")
+        return True
     print(f"FATAL: no successful poll in {stalled_s}s (limit {POLL_STALL_EXIT_S:g}s) "
           f"-- exiting so {POLL_STALL_RESTART_OWNER} restarts the bridge.", file=sys.stderr)
     sys.exit(POLL_STALL_EXIT_CODE)
@@ -7718,14 +7744,21 @@ def main() -> None:
     while True:
         _stamp_loop_progress()
         try:
-            _abort_if_poll_stalled(stall_anchor, lambda: _stop_background_workers(
-                _outbound_thread, _results_watcher))
+            if _abort_if_poll_stalled(stall_anchor, lambda: _stop_background_workers(
+                    _outbound_thread, _results_watcher)):
+                continue
             if _LOCK_LOST.is_set() or not _heartbeat_singleton():
                 # Lost the poller lock (reaped after being deemed stale). Stop
                 # polling immediately so we don't dual-poll the relay bearer with
                 _log("singleton: lost workspace poller lock (reaped after stale takeover) "
                      "— exiting to avoid dual-poll")
-                _stop_background_workers(_outbound_thread, _results_watcher)
+                if not _stop_background_workers(_outbound_thread, _results_watcher):
+                    # The successor recovers a dead pid's claim and resends it, so a
+                    # send in flight must finish here first; the next pass re-joins.
+                    _log("singleton: outbound worker still finishing a send — "
+                         "waiting for it to stop before exiting")
+                    _LOCK_LOST.set()  # the next pass must come back here, never poll
+                    continue
                 return
             _post_heartbeat(inflight)
             _retry_withheld_reviews()

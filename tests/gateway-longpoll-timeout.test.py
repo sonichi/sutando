@@ -139,7 +139,9 @@ class _StatusLoop(_Loop):
                      "_retry_withheld_reviews", "_push_pool_advertisement", "_advance_held_tasks"):
             self.stack.enter_context(patch.object(gw, name, return_value=None))
         self.stack.enter_context(patch.object(gw, "_start_results_watcher", return_value=None))
-        self.stack.enter_context(patch.object(gw, "_start_outbound_worker", return_value=Mock()))
+        # A stopped worker: the loop exits only once the worker reports it is gone.
+        idle_worker = Mock(**{"is_alive.return_value": False})
+        self.stack.enter_context(patch.object(gw, "_start_outbound_worker", return_value=idle_worker))
         gw._heartbeat_singleton = self._next_iteration
         self.acks = []
         return self

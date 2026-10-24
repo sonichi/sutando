@@ -66,11 +66,19 @@ class _Clock:
 
 
 class _Worker:
-    def __init__(self):
+    """Stays alive for its first `busy_joins` joins, like a worker mid-send."""
+
+    def __init__(self, busy_joins=0):
         self.joined = False
+        self.joins = 0
+        self.busy_joins = busy_joins
 
     def join(self, timeout=None):
         self.joined = True
+        self.joins += 1
+
+    def is_alive(self):
+        return self.joins <= self.busy_joins
 
 
 class _Loop:
@@ -83,14 +91,14 @@ class _Loop:
               "_post_task_ack", "_post_ready_results", "_post_proactive",
               "_reconcile_abandoned", "_emit_gateway_status", "_save_inflight", "_log",
               "_recover_auth", "POLL_STALL_EXIT_S", "POLL_STALL_RESTART_OWNER",
-              "_STALL_REPORTED_FOR", "_resolve_host_label", "_start_lock_heartbeat",
+              "_STALL_REPORTED_FOR", "_STALL_EXIT_PENDING", "_resolve_host_label", "_start_lock_heartbeat",
               "_retire_delivered_marks", "_sweep_held_dir", "_reclaim_parked_relay_results",
               "_keep_relay_results_in_flight", "refresh_routing", "_start_results_watcher",
               "_start_outbound_worker", "_retry_withheld_reviews", "_push_pool_advertisement",
               "_advance_held_tasks", "_reconcile_orphan_results", "_receive_round")
 
     def __init__(self, gw, *, polls, alive, limit=100.0, owner="launchd",
-                 recover_auth=None):
+                 recover_auth=None, busy_joins=0):
         self.gw, self.limit, self.owner = gw, limit, owner
         self.polls = list(polls)          # per poll: a callable(clock) -> resp, or an exception
         self._alive = list(alive)
@@ -98,12 +106,14 @@ class _Loop:
         self.clock = _Clock()
         self.status: list[tuple] = []
         self.logs: list[str] = []
-        self.outbound = _Worker()
+        self.outbound = _Worker(busy_joins)
+        self.poll_count = 0
         self._saved: dict = {}
 
     def _poll(self, method, path, payload=None, **kw):
         if not path.startswith("/v1/tasks?wait="):
             return {}
+        self.poll_count += 1
         step = self.polls.pop(0) if self.polls else {"tasks": []}
         if callable(step):
             step = step(self.clock)
@@ -120,6 +130,7 @@ class _Loop:
         gw.POLL_STALL_EXIT_S = self.limit
         gw.POLL_STALL_RESTART_OWNER = self.owner
         gw._STALL_REPORTED_FOR = None
+        gw._STALL_EXIT_PENDING = False
         gw._acquire_singleton = lambda *a, **k: True
         gw._load_inflight = lambda *a, **k: set()
         gw._heartbeat_singleton = lambda *a, **k: self._alive.pop(0) if self._alive else False
@@ -149,6 +160,7 @@ class _Loop:
             setattr(self.gw, n, v)
         self.gw._OUTBOUND_STOP.clear()
         self.gw._OUTBOUND_WAKE.clear()
+        self.gw._LOCK_LOST.clear()
         return False
 
     def run(self):
@@ -268,6 +280,47 @@ class PollStallLoopTest(unittest.TestCase):
         self.assertEqual(self._stall_logs(loop), [])
         self.assertTrue(any("no restart owner" in m for m in loop.logs), loop.logs)
 
+
+    # ── a send still in flight when the stall trips ──────────────────────
+    def test_a_busy_worker_holds_the_exit_and_polling_never_resumes(self):
+        polled_at_stop = []
+
+        def dead(clock):
+            clock.advance(40.0)
+            return urllib.error.URLError("no route")
+
+        def ok(clock):
+            clock.advance(1.0)
+            return {"tasks": []}
+        # The relay is back by the time the stop is requested; it must not matter.
+        with _Loop(self.gw, polls=[dead] * 3 + [ok] * 10, alive=[True] * 20, limit=100.0,
+                   busy_joins=2) as loop:
+            orig = self.gw._stop_background_workers
+
+            def stop(*a):
+                polled_at_stop.append(loop.poll_count)
+                return orig(*a)
+            self.gw._stop_background_workers = stop
+            try:
+                exc = loop.run()
+            finally:
+                self.gw._stop_background_workers = orig
+        self.assertIsNotNone(exc, "the held exit must still happen once the worker stops")
+        self.assertEqual(exc.code, self.gw.POLL_STALL_EXIT_CODE)
+        self.assertEqual(loop.outbound.joins, 3, "one join per held pass, then the exit")
+        self.assertEqual(len(set(polled_at_stop)), 1,
+                         f"polled between stop attempts: {polled_at_stop}")
+        self.assertEqual(sum("stall exit held" in m for m in loop.logs), 2, loop.logs)
+        self.assertEqual(len(self._stall_logs(loop)), 1)
+
+    def test_a_lost_lock_waits_for_a_busy_worker_before_returning(self):
+        with _Loop(self.gw, polls=[], alive=[True, False, True, True, True],
+                   busy_joins=1) as loop:
+            self.assertIsNone(loop.run())
+            polls = loop.poll_count
+        self.assertEqual(loop.outbound.joins, 2, "returned with the worker still sending")
+        self.assertEqual(polls, 1, "polled again after losing the lock")
+        self.assertTrue(any("still finishing a send" in m for m in loop.logs), loop.logs)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

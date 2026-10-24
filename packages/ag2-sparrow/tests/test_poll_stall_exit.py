@@ -58,7 +58,7 @@ def test_abort_exits_nonzero_and_records_the_stall():
         err = io.StringIO()
         try:
             with contextlib.redirect_stderr(err):
-                m._abort_if_poll_stalled(time.monotonic() - 60, lambda: stopped.append(1))
+                m._abort_if_poll_stalled(time.monotonic() - 60, lambda: stopped.append(1) or True)
         except SystemExit as e:
             assert e.code == m.POLL_STALL_EXIT_CODE != 0, e.code
             assert "no successful poll" in err.getvalue()
@@ -173,6 +173,47 @@ def test_wall_clock_jumps_do_not_count_as_a_stall():
             os.environ.pop("SUTANDO_BRIDGE_RESTART_OWNER", None)
 
 
+def test_a_worker_still_sending_holds_the_exit_until_it_stops():
+    """Exiting while the outbound worker is mid-send strands its claim, and the
+    next process resends it. The stall is held, never abandoned: once the stop is
+    requested it is retried even if the poll anchor has since gone fresh."""
+    with tempfile.TemporaryDirectory() as d:
+        os.environ["SUTANDO_BRIDGE_RESTART_OWNER"] = "launchd"
+        try:
+            m = _load(pathlib.Path(d))
+            m.POLL_STALL_EXIT_S = 10
+            stops = [False, False, True]
+            calls = []
+
+            def stop():
+                calls.append(1)
+                return stops.pop(0)
+
+            assert m._abort_if_poll_stalled(time.monotonic() - 60, stop) is True
+            assert m._STALL_EXIT_PENDING is True
+            # A fresh anchor must not cancel a requested stop.
+            assert m._abort_if_poll_stalled(time.monotonic(), stop) is True
+            try:
+                with contextlib.redirect_stderr(io.StringIO()):
+                    m._abort_if_poll_stalled(time.monotonic(), stop)
+            except SystemExit as e:
+                assert e.code == m.POLL_STALL_EXIT_CODE
+            else:
+                raise AssertionError("the exit must follow once the worker has stopped")
+            assert len(calls) == 3, calls
+        finally:
+            os.environ.pop("SUTANDO_BRIDGE_RESTART_OWNER", None)
+
+
+def test_the_join_budget_outlasts_every_outbound_request_timeout():
+    with tempfile.TemporaryDirectory() as d:
+        m = _load(pathlib.Path(d))
+        longest = max(m._REQ_TIMEOUT_S, m._ROOM_POST_TIMEOUT_S, m._PROACTIVE_POST_TIMEOUT_S,
+                      m._UPLOAD_TIMEOUT_S, m._ACK_TIMEOUT_S)
+        assert m._OUTBOUND_SEND_TIMEOUT_S == longest
+        assert m._worker_stop_budget_s() > longest
+
+
 if __name__ == "__main__":
     test_stalled_only_past_the_limit()
     print("PASS test_stalled_only_past_the_limit")
@@ -190,4 +231,8 @@ if __name__ == "__main__":
     print("PASS test_the_unsupervised_stall_is_recorded_once_per_episode")
     test_wall_clock_jumps_do_not_count_as_a_stall()
     print("PASS test_wall_clock_jumps_do_not_count_as_a_stall")
+    test_a_worker_still_sending_holds_the_exit_until_it_stops()
+    print("PASS test_a_worker_still_sending_holds_the_exit_until_it_stops")
+    test_the_join_budget_outlasts_every_outbound_request_timeout()
+    print("PASS test_the_join_budget_outlasts_every_outbound_request_timeout")
     print("ALL PASS")
