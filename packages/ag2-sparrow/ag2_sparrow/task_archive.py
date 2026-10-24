@@ -120,9 +120,13 @@ def find_task_file(tasks_dir: Path, task_id: str) -> Path | None:
 # other raises ModuleNotFoundError and takes its caller down with it.
 
 
-def _move_without_clobbering(src: Path, dest: Path) -> Path:
+def _move_without_clobbering(src: Path, dest: Path, *, src_dir_fd: "int | None" = None,
+                             dst_dir_fd: "int | None" = None) -> Path:
     """Move src to dest, or to dest.N if taken. Returns where it landed.
-    link()+unlink(): rename()/move() REPLACE on POSIX — data loss on a repeat."""
+    link()+unlink(): rename()/move() REPLACE on POSIX — data loss on a repeat.
+    With directory handles, src/dest are names inside them and no path is re-resolved."""
+    if src_dir_fd is not None or dst_dir_fd is not None:
+        return _move_relative(src, dest, src_dir_fd, dst_dir_fd)
     import os
     import shutil
     base, candidate, n = dest, dest, 0
@@ -157,6 +161,179 @@ def _move_without_clobbering(src: Path, dest: Path) -> Path:
             break
     src.unlink()
     return candidate
+
+
+def _move_relative(src: Path, dest: Path, src_dir_fd: "int | None", dst_dir_fd: "int | None") -> Path:
+    """The handle form of `_move_without_clobbering`: same policy, every call
+    relative to the directories, unlink of the (private) source by name in its handle."""
+    import os
+    import shutil
+    import stat as _stat
+    import uuid
+    base, candidate, n = dest, dest, 0
+    while True:
+        try:
+            os.link(str(src), str(candidate), src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+            break
+        except FileExistsError:
+            n += 1
+            candidate = base.with_name(f"{base.name}.{n}")
+        except OSError:
+            tmp = base.with_name(f".{base.name}.{uuid.uuid4().hex[:12]}.part")
+            fd_in = os.open(str(src), os.O_RDONLY, dir_fd=src_dir_fd)
+            try:
+                fd_out = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600,
+                                 dir_fd=dst_dir_fd)
+            except BaseException:
+                os.close(fd_in)
+                raise
+            try:
+                with os.fdopen(fd_out, "wb") as out, os.fdopen(fd_in, "rb") as inp:
+                    shutil.copyfileobj(inp, out)
+                    out.flush()
+                    st = os.fstat(inp.fileno())
+                    os.fchmod(out.fileno(), _stat.S_IMODE(st.st_mode))
+                    os.utime(out.fileno(), ns=(st.st_atime_ns, st.st_mtime_ns))
+                    os.fsync(out.fileno())
+                while True:
+                    try:
+                        os.link(str(tmp), str(candidate), src_dir_fd=dst_dir_fd, dst_dir_fd=dst_dir_fd)
+                        break
+                    except FileExistsError:
+                        n += 1
+                        candidate = base.with_name(f"{base.name}.{n}")
+            finally:
+                os.unlink(str(tmp), dir_fd=dst_dir_fd)
+            break
+    os.unlink(str(src), dir_fd=src_dir_fd)
+    if dst_dir_fd is not None:
+        _fsync_dir(dst_dir_fd)
+    if src_dir_fd is not None:
+        _fsync_dir(src_dir_fd)
+    return candidate
+
+
+# The one owner of collision naming, callable from outside the archive path too.
+move_without_clobbering = _move_without_clobbering
+
+
+def _checkpoint(point: str, name: str) -> None:
+    """A named injection point for tests (`before_give_back`); a no-op in production."""
+
+
+def _fsync_dir(fd: int) -> None:
+    """A rename or link is durable only once its directory is: without this, power
+    loss after the call can strand a claim the journal already names."""
+    import os
+    if os.name != "nt":
+        os.fsync(fd)
+
+
+def find_landed(dest: str, generation: str, *, dst_dir_fd: int) -> "str | None":
+    """The name among `dest`, `dest.1`, `dest.2`, ... (the `.N` sequence
+    `move_without_clobbering` mints) that holds `generation`, or None. A link
+    keeps the inode, so a placement whose record was lost is found by identity."""
+    import os
+    n = 0
+    while True:
+        candidate = dest if n == 0 else f"{dest}.{n}"
+        try:
+            st = os.lstat(candidate, dir_fd=dst_dir_fd)
+        except FileNotFoundError:
+            return None
+        if file_generation(st) == generation:
+            return candidate
+        n += 1
+
+
+def file_generation(st) -> str:
+    """The identity of a file's bytes: device, inode, size, mtime_ns. A rewrite
+    under the same name is a new generation; that is how the watcher tells a
+    re-emitted task from a replaced one."""
+    return f"{st.st_dev}:{st.st_ino}:{st.st_size}:{st.st_mtime_ns}"
+
+
+class GenerationChanged(Exception):
+    """What held the name was not the planned generation. It is back under its
+    name, live (`kept_as` None), or kept under its private claim name when the
+    name had been taken again meanwhile (`kept_as` that name)."""
+
+    def __init__(self, name: str, why: str, kept_as: "str | None" = None):
+        super().__init__(f"{name}: {why}")
+        self.name, self.why, self.kept_as = name, why, kept_as
+
+
+def _give_back(claim: str, name: str, why: str, dir_fd: int) -> GenerationChanged:
+    """Link the claim back to its name without replacing whatever holds it now;
+    the claim is private, so unlinking it by name is safe. Returns the error to raise."""
+    import os
+    _checkpoint("before_give_back", name)
+    try:
+        os.link(claim, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+    except FileExistsError:
+        return GenerationChanged(name, why, kept_as=claim)
+    os.unlink(claim, dir_fd=dir_fd)
+    _fsync_dir(dir_fd)
+    return GenerationChanged(name, why)
+
+
+def claim_name(name: str) -> str:
+    """A fresh private claim name for `name`: a caller that journals its moves
+    records this BEFORE `claim_generation` renames to it, so a crash in between
+    leaves a claim recovery can attribute."""
+    import os
+    import secrets
+    return f"{name}.claim-{os.getpid()}-{secrets.token_hex(5)}"
+
+
+def claim_generation(name: str, *, src_dir_fd: int, claim: "str | None" = None) -> str:
+    """Take `name` (a bare name inside `src_dir_fd`) by one atomic rename into a
+    private claim beside it, same directory, same filesystem — never a copy.
+    Returns the claim name (`claim` when given, else a fresh `claim_name`);
+    FileNotFoundError when the name is gone. The claim holds whatever occupied
+    the name at that instant: judge it with `place_claim`."""
+    import os
+    claim = claim or claim_name(name)
+    os.rename(name, claim, src_dir_fd=src_dir_fd, dst_dir_fd=src_dir_fd)
+    _fsync_dir(src_dir_fd)
+    return claim
+
+
+def place_claim(claim: str, name: str, generation: str, dest: str, *, src_dir_fd: int,
+                dst_dir_fd: int) -> Path:
+    """Judge the claim through its own descriptor against `generation`
+    (`file_generation`) and, only on a match, place it at `dest` (or `dest.N`)
+    inside `dst_dir_fd` by `move_without_clobbering` through the two handles;
+    returns the landed name. A mismatch (or a failed placing move) gives the
+    claim back to `name` without replacing — link, then unlink the private
+    claim — and raises GenerationChanged; when `name` was retaken meanwhile the
+    claim stays put as the quarantine, named in the error's `kept_as`. No path
+    is re-resolved and no live name is ever unlinked."""
+    import os
+    try:
+        fd = os.open(claim, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=src_dir_fd)
+    except OSError as exc:
+        raise _give_back(claim, name, f"cannot be opened as a regular file ({exc})", src_dir_fd) from None
+    try:
+        if file_generation(os.fstat(fd)) != generation:
+            raise _give_back(claim, name, "changed since it was planned", src_dir_fd)
+        try:
+            return move_without_clobbering(Path(claim), Path(dest), src_dir_fd=src_dir_fd,
+                                           dst_dir_fd=dst_dir_fd)
+        except OSError as exc:
+            raise _give_back(claim, name, f"the archive move failed ({exc})", src_dir_fd) from exc
+    finally:
+        os.close(fd)
+
+
+def move_generation(name: str, generation: str, dest: str, *, src_dir_fd: int,
+                    dst_dir_fd: int) -> Path:
+    """`claim_generation` then `place_claim` in one call: move exactly the planned
+    generation of `name` to `dest` (or `dest.N`), never unlinking a live name.
+    A caller that must survive a crash between the two persists the claim name
+    in between and calls them separately."""
+    claim = claim_generation(name, src_dir_fd=src_dir_fd)
+    return place_claim(claim, name, generation, dest, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
 
 
 def archive_month(when: float | None = None) -> str:

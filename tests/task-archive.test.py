@@ -537,5 +537,147 @@ class TrailingTxtIsTerminal(unittest.TestCase):
         self.assertEqual(found, d / f"{tid}.txt")
         self.assertEqual(task_id_from_filename(found.name), tid)
 
+
+class TestMoveGeneration(unittest.TestCase):
+    """`move_generation`: claim by rename, verify through the descriptor, place
+    through the directory handles with `.N` no-clobber; never unlink a live name."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.src = Path(self.tmp.name) / "tasks"
+        self.dst = self.src / "archive"
+        self.dst.mkdir(parents=True)
+        self.sfd = os.open(self.src, os.O_RDONLY)
+        self.dfd = os.open(self.dst, os.O_RDONLY)
+        self.addCleanup(os.close, self.sfd)
+        self.addCleanup(os.close, self.dfd)
+
+    def _file(self, name: str, text: str) -> Path:
+        p = self.src / name
+        p.write_text(text)
+        return p
+
+    def _gen(self, p: Path) -> str:
+        return _task_archive.file_generation(os.lstat(p))
+
+    def _replace(self, p: Path, text: str) -> None:
+        tmp = p.with_name(".new")
+        tmp.write_text(text)
+        os.replace(tmp, p)
+
+    def move(self, name: str, gen: str) -> Path:
+        return _task_archive.move_generation(name, gen, name, src_dir_fd=self.sfd, dst_dir_fd=self.dfd)
+
+    def test_the_planned_generation_lands_under_its_name(self):
+        p = self._file("task-a.txt", "A")
+        landed = self.move("task-a.txt", self._gen(p))
+        self.assertEqual(landed, Path("task-a.txt"))
+        self.assertEqual((self.dst / "task-a.txt").read_text(), "A")
+        self.assertEqual(sorted(x.name for x in self.src.iterdir()), ["archive"], "no claim left")
+
+    def test_a_taken_archive_name_gets_the_n_tail_never_overwritten(self):
+        p = self._file("task-a.txt", "A")
+        (self.dst / "task-a.txt").write_text("earlier")
+        landed = self.move("task-a.txt", self._gen(p))
+        self.assertEqual(landed, Path("task-a.txt.1"))
+        self.assertEqual((self.dst / "task-a.txt").read_text(), "earlier")
+        self.assertEqual((self.dst / "task-a.txt.1").read_text(), "A")
+
+    def test_a_replaced_file_is_given_back_live_and_nothing_is_placed(self):
+        p = self._file("task-a.txt", "old")
+        gen = self._gen(p)
+        self._replace(p, "new")
+        with self.assertRaises(_task_archive.GenerationChanged) as cm:
+            self.move("task-a.txt", gen)
+        self.assertIsNone(cm.exception.kept_as)
+        self.assertIn("changed since it was planned", str(cm.exception))
+        self.assertEqual(p.read_text(), "new")
+        self.assertEqual(sorted(x.name for x in self.src.iterdir()), ["archive", "task-a.txt"])
+        self.assertEqual(sorted(self.dst.iterdir()), [])
+
+    def test_a_name_retaken_during_the_give_back_keeps_the_claim(self):
+        p = self._file("task-a.txt", "old")
+        gen = self._gen(p)
+        self._replace(p, "new")
+        real_link = os.link
+
+        def retaken(src, dst, **kw):
+            if str(src).startswith("task-a.txt.claim-") and str(dst) == "task-a.txt":
+                self._file("task-a.txt", "newer still")
+            return real_link(src, dst, **kw)
+
+        with mock.patch("os.link", side_effect=retaken):
+            with self.assertRaises(_task_archive.GenerationChanged) as cm:
+                self.move("task-a.txt", gen)
+        self.assertTrue(cm.exception.kept_as.startswith("task-a.txt.claim-"))
+        self.assertEqual((self.src / cm.exception.kept_as).read_text(), "new")
+        self.assertEqual(p.read_text(), "newer still")
+        self.assertEqual(sorted(self.dst.iterdir()), [])
+
+    def test_a_caller_supplied_claim_name_is_used_verbatim(self):
+        self._file("task-a.txt", "A")
+        name = _task_archive.claim_name("task-a.txt")
+        self.assertTrue(name.startswith("task-a.txt.claim-"))
+        self.assertNotEqual(name, _task_archive.claim_name("task-a.txt"), "fresh per call")
+        got = _task_archive.claim_generation("task-a.txt", src_dir_fd=self.sfd, claim=name)
+        self.assertEqual(got, name)
+        self.assertEqual(sorted(x.name for x in self.src.iterdir()), ["archive", name])
+
+    def test_find_landed_walks_the_n_sequence_this_module_mints(self):
+        p = self._file("task-a.txt", "A")
+        gen = self._gen(p)
+        (self.dst / "task-a.txt").write_text("earlier")
+        (self.dst / "task-a.txt.1").write_text("earlier still")
+        landed = self.move("task-a.txt", gen)
+        self.assertEqual(landed, Path("task-a.txt.2"))
+        self.assertEqual(_task_archive.find_landed("task-a.txt", gen, dst_dir_fd=self.dfd), "task-a.txt.2")
+        self.assertIsNone(_task_archive.find_landed("task-a.txt", "0:0:0:0", dst_dir_fd=self.dfd))
+        self.assertIsNone(_task_archive.find_landed("task-b.txt", gen, dst_dir_fd=self.dfd))
+
+    def test_a_gone_name_raises_file_not_found(self):
+        with self.assertRaises(FileNotFoundError):
+            self.move("task-a.txt", "1:1:1:1")
+
+    def test_a_failed_placing_move_gives_the_claim_back(self):
+        p = self._file("task-a.txt", "A")
+        with mock.patch.object(_task_archive, "move_without_clobbering",
+                               side_effect=PermissionError(1, "EPERM")):
+            with self.assertRaises(_task_archive.GenerationChanged) as cm:
+                self.move("task-a.txt", self._gen(p))
+        self.assertIn("the archive move failed", cm.exception.why)
+        self.assertEqual(p.read_text(), "A")
+        self.assertEqual(sorted(x.name for x in self.src.iterdir()), ["archive", "task-a.txt"])
+
+    def test_the_placing_step_is_move_without_clobbering_through_the_handles(self):
+        p = self._file("task-a.txt", "A")
+        with mock.patch.object(_task_archive, "move_without_clobbering",
+                               wraps=_task_archive.move_without_clobbering) as m:
+            self.move("task-a.txt", self._gen(p))
+        self.assertEqual(m.call_count, 1)
+        self.assertTrue(str(m.call_args.args[0]).startswith("task-a.txt.claim-"))
+        self.assertEqual(m.call_args.kwargs, {"src_dir_fd": self.sfd, "dst_dir_fd": self.dfd})
+
+    def test_move_without_clobbering_through_handles_never_resolves_a_path(self):
+        self._file("task-a.txt", "A")
+        (self.dst / "task-a.txt").write_text("earlier")
+        with mock.patch.object(_task_archive.Path, "resolve", side_effect=AssertionError("resolved")):
+            landed = _task_archive.move_without_clobbering(Path("task-a.txt"), Path("task-a.txt"),
+                                                            src_dir_fd=self.sfd, dst_dir_fd=self.dfd)
+        self.assertEqual(landed, Path("task-a.txt.1"))
+        self.assertEqual((self.dst / "task-a.txt.1").read_text(), "A")
+        self.assertFalse((self.src / "task-a.txt").exists())
+
+    def test_move_without_clobbering_cross_device_through_handles(self):
+        p = self._file("task-a.txt", "A")
+        os.utime(p, ns=(1_000_000_000_000_000_000, 1_000_000_000_000_000_000))
+        with exdev_from(Path("task-a.txt")):
+            landed = _task_archive.move_without_clobbering(Path("task-a.txt"), Path("task-a.txt"),
+                                                            src_dir_fd=self.sfd, dst_dir_fd=self.dfd)
+        self.assertEqual(landed, Path("task-a.txt"))
+        self.assertEqual((self.dst / "task-a.txt").read_text(), "A")
+        self.assertEqual((self.dst / "task-a.txt").stat().st_mtime_ns, 1_000_000_000_000_000_000)
+        self.assertEqual([x.name for x in self.dst.iterdir()], ["task-a.txt"], "no .part left")
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

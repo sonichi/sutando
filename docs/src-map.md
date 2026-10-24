@@ -238,6 +238,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`task_lifecycle.py`** — Task execution lifecycle for an adapter that serves one work dir and calls a provider per task.
 - **`task_priority.py`** — Task priority taxonomy + readers.
 - **`task_queue.py`** — The pending task queue, in one place: which task files are waiting, in the order the core will take them, and where a given task stands in that order.
+- **`task_transition.py`** — One owner of a live task's archive-then-report transition: claim exactly the planned file generation, place it without clobbering, then publish a notice naming where it landed — journaled stage by stage, so a crash at any point is recovered once.
 - **`task_workstreams.py`** — Durable inferred-workstream index and archive-backed task history.
 - **`tasks-dir-resolve.sh`** — Shared TASKS_DIR resolution — sourceable so watch-tasks-stream.sh and task-notifier-supervisor.sh can never resolve a different inbox for the same instance.
 - **`team_guardrail.py`** — Alias of `policy.guardrail` (phase-1a restructure); one transition window.

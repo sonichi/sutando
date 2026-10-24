@@ -59,10 +59,20 @@ def is_staged_for(name: str, target_name: str) -> bool:
             and all(c in "0123456789abcdef" for c in token))
 
 
-def publish_staged(tmp: str | Path, path: str | Path) -> Path:
-    """Rename a staged file onto `path` and fsync the directory, so the name survives a crash."""
+def publish_staged(tmp: str | Path, path: str | Path, *, exclusive: bool = False) -> Path:
+    """Rename a staged file onto `path` and fsync the directory, so the name survives a crash.
+
+    `exclusive=True` commits by link, so an existing `path` raises FileExistsError with the
+    staged file removed and nothing replaced: for a name the caller mints per publish.
+    """
     target = Path(path)
-    os.replace(tmp, target)
+    if exclusive:
+        try:
+            os.link(tmp, target)
+        finally:
+            Path(tmp).unlink(missing_ok=True)
+    else:
+        os.replace(tmp, target)
     if os.name != "nt":
         dfd = os.open(target.parent, os.O_RDONLY)
         try:
@@ -72,11 +82,12 @@ def publish_staged(tmp: str | Path, path: str | Path) -> Path:
     return target
 
 
-def publish_text(path: str | Path, text: str, mode: int = 0o666) -> Path:
-    """Publish `text` at `path` whole: a reader sees the name absent or complete, never a prefix."""
+def publish_text(path: str | Path, text: str, mode: int = 0o666, *, exclusive: bool = False) -> Path:
+    """Publish `text` at `path` whole: a reader sees the name absent or complete, never a prefix.
+    `exclusive=True` refuses an existing `path` (FileExistsError) instead of replacing it."""
     tmp = stage_text(path, text, mode)
     try:
-        return publish_staged(tmp, path)
+        return publish_staged(tmp, path, exclusive=exclusive)
     except BaseException:
         tmp.unlink(missing_ok=True)
         raise

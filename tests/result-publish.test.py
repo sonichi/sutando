@@ -376,5 +376,41 @@ class DelegationTest(unittest.TestCase):
                 self.assertIn(line.split()[1].split(".")[0], ("os", "secrets", "sys", "pathlib"), line)
 
 
+
+class TestExclusiveMode(unittest.TestCase):
+    """`exclusive=True` commits by link: a taken name is refused with nothing replaced
+    and no staging left, so a caller minting per-publish names has one publisher."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name)
+
+    def test_a_free_name_is_published_whole(self):
+        out = result_publish.publish_text(self.dir / "proactive-x.txt", BODY, exclusive=True)
+        self.assertEqual(out.read_text(), BODY)
+        self.assertEqual([p.name for p in self.dir.iterdir()], ["proactive-x.txt"])
+
+    def test_a_taken_name_is_refused_with_nothing_replaced(self):
+        target = self.dir / "proactive-x.txt"
+        target.write_text("first\n")
+        with self.assertRaises(FileExistsError):
+            result_publish.publish_text(target, BODY, exclusive=True)
+        self.assertEqual(target.read_text(), "first\n")
+        self.assertEqual([p.name for p in self.dir.iterdir()], ["proactive-x.txt"], "no staging left")
+
+    def test_default_mode_still_replaces(self):
+        target = self.dir / "task-1.txt"
+        target.write_text("first\n")
+        result_publish.publish_text(target, BODY)
+        self.assertEqual(target.read_text(), BODY)
+
+    def test_vendored_copy_has_the_same_mode(self):
+        vendored = _load_vendored()
+        target = self.dir / "proactive-y.txt"
+        vendored.publish_text(target, BODY, exclusive=True)
+        with self.assertRaises(FileExistsError):
+            vendored.publish_text(target, BODY, exclusive=True)
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
