@@ -225,6 +225,22 @@ Write-Host ""
 Write-Host "Installing Sutando skills..."
 & pwsh -NoProfile -File (Join-Path $REPO 'skills\install.ps1')
 
+# --- Durable schedules ------------------------------------------------------
+
+function Install-WindowsSchedules($repo) {
+    $reconciler = Join-Path $repo 'skills\schedule-crons\scripts\reconcile_launchd.py'
+    if (-not (Test-Path -LiteralPath $reconciler)) {
+        Write-Warning 'schedule-crons is not installed; durable schedules are unavailable.'
+        return
+    }
+    try {
+        & (Join-Path $repo 'src\install-cron-runner-task.ps1') -ReconcileScript $reconciler
+    } catch {
+        Write-Warning "Durable schedules are unavailable: $_"
+    }
+}
+Install-WindowsSchedules $REPO
+
 # --- Core services -----------------------------------------------------------
 
 # 1. Voice agent (port 9900)
