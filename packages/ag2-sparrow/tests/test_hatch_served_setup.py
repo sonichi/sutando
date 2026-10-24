@@ -3199,16 +3199,22 @@ class Quiesce(Base):
                    (hatch_cli, "live_lock_holder", lambda rec: (rec or {}).get("pid")
                     if self.fresh and (rec or {}).get("pid") in self.alive else None),
                    (keepalive, "is_sparrow_pid", lambda pid: pid in self.sparrow),
+                   (keepalive, "process_start", lambda pid: self.starts.get(pid)),
                    (hatch_cli, "_systemctl", systemctl), (keepalive, "_stop", term),
                    (keepalive, "STOP_WAIT_S", 0.3))
+        self.starts = {}
         for target, name, value in patches:
             p = mock.patch.object(target, name, value if name == "STOP_WAIT_S" else
-                                  mock.Mock(side_effect=value))
+                                  mock.Mock(side_effect=value), create=True)
             p.start()
             self.addCleanup(p.stop)
 
-    def holder(self, pid, fresh=True, sparrow=True):
+    def holder(self, pid, fresh=True, sparrow=True, start="boot:100", recorded="same"):
+        recorded = start if recorded == "same" else recorded
         self.record, self.fresh = {"pid": pid, "host": "h"}, fresh
+        if recorded is not None:
+            self.record["proc_start"] = recorded
+        self.starts[pid] = start
         self.alive.add(pid)
         if sparrow:
             self.sparrow.add(pid)
@@ -3280,6 +3286,26 @@ class Quiesce(Base):
                              (False, None, [], True), f"fresh={fresh}")
             self.assertIn("not proven to be Sparrow", how)
             self.assertIn("nothing was signalled", how)
+
+    def test_a_reused_pid_running_another_sparrow_is_never_signalled(self):
+        # The record's pid now runs a different Sparrow: same argv class, later start time.
+        for recorded, why in (("boot:100", "started at boot:999"),
+                              (None, "carries no process start time")):
+            for unit in (False, True):
+                self.calls.clear()
+                self.owner, self.props = None, dict(self.props, ActiveState="inactive", MainPID=0)
+                if unit:
+                    self.unit(0)
+                self.holder(4242, start="boot:999", recorded=recorded)
+                quiet, how, manager = keepalive.quiesce_sparrow(self.cfg)
+                self.assertEqual((quiet, manager, self.calls, 4242 in self.alive),
+                                 (False, None, [], True), (recorded, unit))
+                self.assertIn("is not proven to be the process that wrote", how)
+                self.assertIn(why, how)
+        self.starts[4242] = None  # the start time cannot be read: never proven either
+        self.record["proc_start"] = "boot:100"
+        self.assertEqual(keepalive.quiesce_sparrow(self.cfg)[::2], (False, None))
+        self.assertEqual(self.calls, [])
 
     def test_a_holder_that_ignores_sigterm_is_not_quiet(self):
         self.stubborn.add(99)

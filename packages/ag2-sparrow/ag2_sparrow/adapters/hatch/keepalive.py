@@ -26,7 +26,7 @@ import sys
 import time
 from pathlib import Path
 
-from ... import _dirs, agent_identity, diagnostics
+from ... import _dirs, agent_identity, diagnostics, workspace_lock
 from . import cli as _cli, task_fields
 
 TASK, INTERVAL_MIN = "sparrow-keepawake", 15
@@ -401,6 +401,25 @@ def resolve_sparrow(cfg: dict) -> "tuple[str | None, int | None, bool]":
     return _unit_owner(), holder, holder is not None and _cli.live_lock_holder(record) == holder
 
 
+def process_start(pid: int) -> "str | None":
+    return workspace_lock.proc_start(pid)
+
+
+def unproven_holder(record: "dict | None", pid: int) -> "str | None":
+    """Why `pid` is not proven to be the Sparrow that wrote lock `record`; None when it
+    runs Sparrow's command line and has the start time the record names."""
+    if not is_sparrow_pid(pid):
+        return f"pid {pid} holds Sparrow's lock but is not proven to be Sparrow"
+    recorded, now = (record or {}).get("proc_start"), process_start(pid)
+    if not isinstance(recorded, str) or not recorded:
+        why = "the lock record carries no process start time"
+    elif now != recorded:
+        why = f"it started at {now or 'an unreadable time'}, the record names {recorded}"
+    else:
+        return None
+    return f"pid {pid} is not proven to be the process that wrote Sparrow's lock: {why}"
+
+
 def _wait_gone(pid: int) -> bool:
     deadline = time.monotonic() + STOP_WAIT_S
     while not _cli.process_gone(pid):
@@ -417,8 +436,10 @@ def quiesce_sparrow(cfg: dict) -> "tuple[bool, str, str | None]":
     a lock holder beside our unit not proven to be Sparrow. For our unit the unit is
     stopped and its process, and any Sparrow outside it, must be gone; with no unit the
     lock holder is stopped (SIGTERM, then wait), a stale heartbeat notwithstanding, but
-    only once proven to run Sparrow's command line: a reused pid is never signalled."""
+    only once proven to be the process that wrote the lock (unproven_holder: Sparrow's
+    command line and the start time the record names), so a reused pid is never signalled."""
     owner, holder, _ = resolve_sparrow(cfg)
+    record = _cli._lock_record(_state_dir(cfg), _instance(cfg))
     unit = _cli.service_path()
     if owner == UNIT_UNREACHABLE:
         return False, f"{unit} is installed but systemctl --user did not answer", None
@@ -430,9 +451,9 @@ def quiesce_sparrow(cfg: dict) -> "tuple[bool, str, str | None]":
             return False, f"systemctl --user show {_cli.SERVICE_NAME} did not give a well-formed state", None
         main_pid = props["MainPID"]
         outside = holder if holder is not None and holder != main_pid else None
-        if outside is not None and not is_sparrow_pid(outside):
-            return False, (f"pid {outside} holds Sparrow's lock beside {_cli.SERVICE_NAME} but "
-                           "is not proven to be Sparrow"), None
+        unproven = unproven_holder(record, outside) if outside is not None else None
+        if unproven:
+            return False, f"{unproven}, beside {_cli.SERVICE_NAME}; nothing was signalled", None
         r = _cli._systemctl(("--user", "stop", "ag2-sparrow.service"))
         how = f"systemctl --user stop {_cli.SERVICE_NAME}"
         if not _cli._ok(r):
@@ -446,9 +467,8 @@ def quiesce_sparrow(cfg: dict) -> "tuple[bool, str, str | None]":
         manager = "unit"
     elif holder is None:
         how, manager = "Sparrow was not running", "detached"
-    elif not is_sparrow_pid(holder):
-        return False, (f"pid {holder} holds Sparrow's lock but is not proven to be Sparrow; "
-                       "nothing was signalled"), None
+    elif unproven_holder(record, holder):
+        return False, f"{unproven_holder(record, holder)}; nothing was signalled", None
     elif not _stop(holder):
         return False, f"Sparrow (pid {holder}) did not stop", "detached"
     else:

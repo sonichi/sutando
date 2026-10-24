@@ -27,11 +27,15 @@ holder recorded on THIS host whose pid no longer exists cannot be polling, so it
 is reaped at once instead of blocking a successor for the whole stale window.
 A holder on another host is judged by heartbeat alone, and a holder that called
 `retain()` (it exits on purpose while still owning the role) ages out normally.
-Residual risk: no process start time is recorded, so a dead holder whose pid was
-already reused reads as alive and falls back to the heartbeat rule.
+Residual risk: the pid rule here ignores the process start time, so a dead holder
+whose pid was already reused reads as alive and falls back to the heartbeat rule.
+Where /proc exists the record also carries `proc_start` (boot id + start ticks,
+`proc_start()`), so a caller about to signal the holder can prove the pid is still
+the process that wrote the record.
 
 Lock file: `<workspace>/state/locks/<role>.lock`
-  {"role","pid","host","workspace","acquired_at","heartbeat_at","schema_version":1}
+  {"role","pid","host","workspace","acquired_at","heartbeat_at","schema_version":1,
+   "proc_start" (only where /proc exists)}
 
 The lock is per-`(workspace, role)`: the file lives under the workspace (so it
 is inherently workspace-scoped — the contended resource is the relay/task bus
@@ -154,9 +158,23 @@ def _read(path: Path) -> dict | None:
         return None  # corrupt → treat as absent/reapable
 
 
+def proc_start(pid: int, proc: Path = Path("/proc")) -> str | None:
+    """`<boot id>:<start ticks>` of `pid`, which no later process with that pid shares;
+    None where it cannot be read (no /proc, or the process is gone)."""
+    try:
+        boot = (proc / "sys" / "kernel" / "random" / "boot_id").read_text().strip()
+        stat = (proc / str(pid) / "stat").read_bytes()
+    except (OSError, ValueError):
+        return None
+    fields = stat[stat.rfind(b")") + 1:].split()
+    # starttime is field 22 of stat(5); fields here start at field 3 (state).
+    ticks = fields[19].decode() if len(fields) > 19 and fields[19].isdigit() else ""
+    return f"{boot}:{ticks}" if boot and ticks else None
+
+
 def _payload(role: str, workspace: Path) -> dict:
     now = _now()
-    return {
+    data = {
         "role": role,
         "pid": os.getpid(),
         "host": _host_label(),
@@ -165,6 +183,10 @@ def _payload(role: str, workspace: Path) -> dict:
         "heartbeat_at": now,
         "schema_version": SCHEMA_VERSION,
     }
+    start = proc_start(os.getpid())
+    if start:
+        data["proc_start"] = start
+    return data
 
 
 def _is_fresh(holder: dict, stale_seconds: int) -> bool:
