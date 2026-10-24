@@ -2792,6 +2792,34 @@ class Upgrade(Base):
         with contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(self.start(self.setup())[0], "0.6.0:attempted", "never retried")
 
+    def test_an_unreadable_journal_holds_restarts_and_only_an_absent_one_means_none(self):
+        log, path = self.home / "log", self_upgrade.state_path(self.state)
+
+        def keepawake(now):
+            with mock.patch.object(keepalive, "listener_up", return_value=False), \
+                    mock.patch.object(keepalive, "restart_listener", return_value=(True, "r")) as rl, \
+                    mock.patch.object(runtime_text, "refresh_cache", return_value=self.setup()), \
+                    mock.patch.object(self_upgrade, "_spawn", return_value=True) as spawn, \
+                    contextlib.redirect_stdout(io.StringIO()), \
+                    contextlib.redirect_stderr(io.StringIO()) as err:
+                rc = keepalive.keepawake(self.cfg, log, now=now)
+            return rc, rl.call_count, spawn.call_count, log.read_text().splitlines()[-1], err.getvalue()
+        self.state.mkdir(parents=True, exist_ok=True)
+        for text in ('{"attempted":', "[]", '{"attempted": []}', '{"attempted": {"0.6.0": 1}}',
+                     b"\xff\xfe".decode("latin-1")):
+            path.write_text(text, encoding="latin-1")
+            rc, restarts, spawns, line, err = keepawake(5000.0)
+            self.assertEqual((rc, restarts, spawns), (1, 0, 0), text)
+            self.assertIn("reason=upgrade-failed", line, text)
+            self.assertIn(f"the upgrade journal {path} cannot be read", err, text)
+            self.assertIn("cannot be read", self_upgrade.recovery_blocked(self.state), text)
+            self.assertIsNotNone(self_upgrade.failed_since(self.state), text)
+            self.assertEqual(path.read_text(encoding="latin-1"), text, "kept for the owner to repair")
+        path.unlink()
+        self.assertIsNone(self_upgrade.recovery_blocked(self.state))
+        self.assertIsNone(self_upgrade.failed_since(self.state))
+        self.assertEqual(keepawake(5000.0)[1], 1, "no journal: nothing is pending")
+
     def test_keepawake_never_restarts_on_unverified_files_or_a_failed_settlement(self):
         # A dead mutating attempt with no snapshot: restore-failed, the listener stays down.
         self.start(self.setup(), now=1000.0)

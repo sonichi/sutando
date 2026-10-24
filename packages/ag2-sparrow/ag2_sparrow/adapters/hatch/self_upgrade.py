@@ -95,14 +95,23 @@ def notice_path(state_dir: Path) -> Path:
     return Path(state_dir) / NOTICE_NAME
 
 
+class JournalError(ValueError):
+    """The journal exists but cannot be read as one; nothing may assume no attempt is pending."""
+
+
 def load_state(state_dir: Path) -> dict:
+    """The attempt journal; empty only when the file is absent, else JournalError."""
+    path = state_path(state_dir)
     try:
-        state = json.loads(state_path(state_dir).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        state = {}
-    state = state if isinstance(state, dict) else {}
-    if not isinstance(state.get("attempted"), dict):
-        state["attempted"] = {}
+        state = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {"attempted": {}}
+    except (OSError, ValueError) as e:
+        raise JournalError(f"the upgrade journal {path} cannot be read ({type(e).__name__})") from None
+    attempted = state.get("attempted", {}) if isinstance(state, dict) else None
+    if not isinstance(attempted, dict) or not all(isinstance(t, dict) for t in attempted.values()):
+        raise JournalError(f"the upgrade journal {path} cannot be read (not a journal)")
+    state["attempted"] = attempted
     return state
 
 
@@ -111,8 +120,14 @@ def save_state(state_dir: Path, state: dict) -> None:
 
 
 def failed_since(state_dir: Path, installed: str = __version__) -> "float | None":
-    """When the failed upgrade to or from this version failed; None when none did."""
-    failed = load_state(state_dir).get("failed")
+    """When the failed upgrade to or from this version failed; None when none did. An
+    unreadable journal counts as failed, since its last write."""
+    try:
+        failed = load_state(state_dir).get("failed")
+    except JournalError:
+        with contextlib.suppress(OSError):
+            return state_path(state_dir).stat().st_mtime
+        return time.time()
     if isinstance(failed, dict) and installed in (failed.get("from"), failed.get("target")):
         at = failed.get("at")
         return float(at) if isinstance(at, (int, float)) else time.time()
@@ -545,9 +560,14 @@ def _finish(state_dir: Path, target: str, outcome: str, **extra) -> None:
 
 def recovery_blocked(state_dir: Path) -> "str | None":
     """Why Sparrow must not be started: an attempt whose files are unverified, in a
-    mutating phase or restore-failed; None when every attempt is settled or cleared."""
-    for target, tried in load_state(state_dir)["attempted"].items():
-        phase = tried.get("phase") if isinstance(tried, dict) else None
+    mutating phase or restore-failed, or a journal that cannot be read; None when every
+    attempt is settled or cleared, or there is no journal."""
+    try:
+        attempted = load_state(state_dir)["attempted"]
+    except JournalError as e:
+        return f"{e}; repair it, or remove it once the installed files are verified"
+    for target, tried in attempted.items():
+        phase = tried.get("phase")
         if phase in MUTATING_PHASES or phase == "restore-failed":
             return f"the upgrade to {target} left unverified files ({phase})"
     return None
