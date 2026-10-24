@@ -475,6 +475,8 @@ def command_for(target: dict, message: str) -> "list[str]":
 
 
 _PR_URL = re.compile("github[.]com/([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)/pull/([0-9]+)")
+# OWNER/NAME as GitHub spells them: one slash, no leading/trailing hyphen in the owner.
+_REPO_SLUG = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?/[A-Za-z0-9._-]+$")
 
 # `owner/repo#12` and a bare `#12`. Two digits minimum is a DELIBERATE trade, not
 # an oversight: `#7` is a real PR and passes silently, but `#1` is usually prose.
@@ -673,7 +675,17 @@ def main() -> int:
                     help="room the conversation is actually in. When given, a reviewer whose "
                          "Stand is not a member THERE is REFUSED rather than silently notified "
                          "in their recorded room — correctly addressed, wrong venue.")
+    ap.add_argument("--repo", metavar="OWNER/NAME", default=None,
+                    help="repo whose access to check when the message names no PR URL "
+                         "(a patch reviewed before it is a PR); must be OWNER/NAME, and a "
+                         "probe GitHub cannot answer REFUSES rather than sends")
+    ap.add_argument("--no-repo", dest="no_repo", metavar="REASON", default="",
+                    help="deliberately send an ask that is about no repository")
     a = ap.parse_args()
+    if a.repo is not None and not _REPO_SLUG.fullmatch(a.repo):
+        print(f"REFUSED: --repo {a.repo!r} is not OWNER/NAME (one slash, GitHub-legal "
+              "segments) — a repo GitHub cannot find checks nobody.", file=sys.stderr)
+        return 7
     a.message = resolve_body(a.message, a.body_file)
     names = [n.strip() for n in a.reviewers.split(",") if n.strip()]
     targets, refusal_rc = resolve(names, load_roster())
@@ -683,15 +695,13 @@ def main() -> int:
     # ask the repo named in the message rather than trusting a cached tier.
     if a.kind == "ask" and targets:
         refs = _PR_URL.findall(a.message or "")
-        if not refs:
-            # Every other refusal path here prints; the one case that cannot be
-            # checked must not be the one case that is silent.
+        repo = refs[0][0] if refs else a.repo
+        if not repo:
             print("gate capability NOT CHECKED: the message names no "
                   "github.com/<owner>/<repo>/pull/<n> URL, so there is no repo to "
                   "ask about — an unchecked send is not a checked one",
                   file=sys.stderr)
-        if refs:
-            repo = refs[0][0]
+        if repo:
             roster_now = load_roster()
             kept = []
             for t in targets:
@@ -708,6 +718,15 @@ def main() -> int:
                           f"required approvals", file=sys.stderr)
                     refusal_rc = max(refusal_rc, 7)
                     continue
+                if can is None and not refs:
+                    # A typed repo whose probe cannot answer may itself be wrong; a URL's
+                    # repo was read from a real PR, so only the flag refuses here.
+                    print(f"REFUSED: --repo {repo}: gate capability {why_cap} for "
+                          f"'{t['name']}' ({login}) — a probe that cannot answer checks "
+                          "nobody. Fix the repo name, or drop --repo and pass "
+                          "--no-repo '<reason>'.",
+                          file=sys.stderr)
+                    return 7
                 if can is None:
                     print(f"{t['name']}: gate capability {why_cap} on {repo} — "
                           f"sending, but this is not a confirmation it can approve",
@@ -721,6 +740,12 @@ def main() -> int:
                   "only full github.com/<owner>/<repo>/pull/<n> URLs, so pr-unattended would "
                   "read the PR as never asked. Refused reference(s), and the form that works: "
                   + "; ".join(f"{tok} -> {fix}" for tok, fix in loose), file=sys.stderr)
+            return 7
+        # A patch shared before it is a PR still lives in a repo the reviewer may not see.
+        if not _PR_URL.findall(a.message or "") and not a.repo and not a.no_repo:
+            print("REFUSED: pass --repo OWNER/NAME so each reviewer's access is checked, "
+                  "or --no-repo '<reason>' if this ask concerns no repository.",
+                  file=sys.stderr)
             return 7
     # Gates judge only who a send would reach: a target dropped after them
     # could be the one code owner, leaving the rest asked without one.
