@@ -1163,11 +1163,16 @@ fi
 FSWATCH_READER_OPEN=""
 FSWATCH_STARTED_AT=0
 launch_fswatch() {
+  # FSEvents is silent for a path the process has no TCC grant for; poll_monitor
+  # is not, and reports the watched DIRECTORY instead of the file (handled below).
+  local mon=()
+  [ -n "${SUTANDO_FSWATCH_MONITOR:-}" ] && mon=(-m "$SUTANDO_FSWATCH_MONITOR")
   fswatch \
     -l 0.5 \
     --event Created \
     --event Renamed \
     --event Updated \
+    ${mon[@]+"${mon[@]}"} \
     "${fswatch_paths[@]}" > "$WATCH_RUNTIME_DIR/events" 2>/dev/null &
   FSWATCH_PID=$!
   FSWATCH_STARTED_AT="$(date +%s)"
@@ -1236,6 +1241,10 @@ handle_event() {
       [ -n "$CURRENT_HANDLER" ] && [ -x "$CURRENT_HANDLER" ] && prepare_handler_state
       redispatch_held_tasks
       ;;
+    "$TASKS_DIR_ABS"|"$TASKS_DIR")
+      startup_sweep
+      redispatch_held_tasks
+      ;;
     *.txt)
       parent="$(dirname "$path")"
       if [ "$parent" = "$TASKS_DIR_ABS" ] && [ -f "$path" ]; then
@@ -1249,12 +1258,13 @@ handle_event() {
 # Readiness is a real round-trip: a probe this watcher writes into its own inbox
 # must come back through fswatch. Its name matches no admission pattern.
 PRE_READY_EVENTS=""
-if [ "$WATCHER_ROLE" = "session" ]; then
-  READY_DEADLINE=$(( $(date +%s) + ${SUTANDO_WATCHER_READY_TIMEOUT:-10} ))
+probe_ready() {
+  local deadline probe_n path
+  deadline=$(( $(date +%s) + ${SUTANDO_WATCHER_READY_TIMEOUT:-10} ))
   probe_n=0
   : > "$TASKS_DIR/.ready-$$-$probe_n"
   ready=0
-  while [ "$(date +%s)" -lt "$READY_DEADLINE" ]; do
+  while [ "$(date +%s)" -lt "$deadline" ]; do
     if ! IFS= read -r -t 1 path <&3; then
       kill -0 "$FSWATCH_PID" 2>/dev/null || break
       # A probe written before fswatch subscribed raises nothing: write a fresh one.
@@ -1263,13 +1273,24 @@ if [ "$WATCHER_ROLE" = "session" ]; then
       continue
     fi
     case "$path" in
-      */.ready-$$-*|.ready-$$-*) ready=1; break ;;
+      */.ready-$$-*|.ready-$$-*|"$TASKS_DIR_ABS"|"$TASKS_DIR") ready=1; break ;;
       *) PRE_READY_EVENTS="$PRE_READY_EVENTS$path
 " ;;
     esac
   done
   rm -f "$TASKS_DIR"/.ready-$$-*
-  if [ "$ready" -ne 1 ]; then
+  [ "$ready" -eq 1 ]
+}
+if [ "$WATCHER_ROLE" = "session" ]; then
+  # FSEvents returns nothing for a path this process has no TCC grant for, and
+  # says so no louder than silence: fall back to polling rather than refuse.
+  if ! probe_ready && [ -z "${SUTANDO_FSWATCH_MONITOR:-}" ]; then
+    echo "watch-tasks-stream: the default monitor raised no event for $TASKS_DIR_ABS; retrying with poll_monitor" >&2
+    SUTANDO_FSWATCH_MONITOR=poll_monitor
+    kill "$FSWATCH_PID" 2>/dev/null
+    launch_fswatch && probe_ready
+  fi
+  if [ "${ready:-0}" -ne 1 ]; then
     echo "watch-tasks-stream: no event came back from the inbox within ${SUTANDO_WATCHER_READY_TIMEOUT:-10}s; no sentinel written and no standby touched" >&2
     exit 1
   fi
