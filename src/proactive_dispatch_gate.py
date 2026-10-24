@@ -10,11 +10,12 @@ from pathlib import Path
 from typing import Optional
 
 from activity_bus import TERMINAL, ActivityStore, cancel_target
+from workspace_default import resolve_workspace
 
 
-def dispatch_veto(workspace: Path, task_id: str) -> Optional[str]:
-    """The reason `task_id` must not be messaged now, or None."""
-    ws = Path(workspace)
+def dispatch_veto(task_id: str, workspace: Optional[Path] = None) -> Optional[str]:
+    """The reason `task_id` must not be messaged now, or None; the workspace defaults to the resolved one."""
+    ws = Path(workspace) if workspace is not None else resolve_workspace()
     phase = ActivityStore(ws).load(task_id).phase
     if phase in TERMINAL:
         return f"the task is {phase.lower()}"

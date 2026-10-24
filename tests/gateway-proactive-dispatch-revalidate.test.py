@@ -55,7 +55,7 @@ def scenario(label: str, land, gate=None, want_post: bool = False) -> None:
     lane = pl.Lane(gb, ISO)
     lane.write(f"proactive-about-{TID}--1761300000500.txt", "received, being worked on\n")
     if gate is None:
-        gate = functools.partial(proactive_dispatch_gate.dispatch_veto, lane.ws)
+        gate = functools.partial(proactive_dispatch_gate.dispatch_veto, workspace=lane.ws)
     backend = lane.backend()
     if backend is not None and land is not None:
         real = backend.claim
@@ -95,7 +95,7 @@ def main() -> int:
     scenario("d) completed", land_phase("COMPLETED"))
     scenario("e) gate raises", lambda lane: None, gate=broken)
     scenario("f) control", None, want_post=True)
-    check(proactive_dispatch_gate.dispatch_veto(ISO / "nowhere", TID) is None,
+    check(proactive_dispatch_gate.dispatch_veto(TID, ISO / "nowhere") is None,
           "the gate lets an untracked task's message go")
     return check.exit_code()
 

@@ -356,7 +356,7 @@ def _ag2space_owner_dm_upgraded(room: str, replacement: str) -> None:
 def _ag2space_proactive_dispatch_gate(task_id: str):
     """Right before a message about a task is sent: why it must not be, or None."""
     from proactive_dispatch_gate import dispatch_veto
-    return dispatch_veto(WS, task_id)
+    return dispatch_veto(task_id, WS)
 
 
 # Assigned AFTER the exec: the canonical module's own `PROACTIVE_CLAIM_GATE =
