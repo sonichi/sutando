@@ -19,11 +19,11 @@ import unittest
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-ROOTS = ("src", "skills", "packages/ag2-sparrow/ag2_sparrow")
-SUFFIXES = (".py", ".ts", ".json")
-# One pattern for every host form: the label before `.space` must itself be `ag2` or `s`, so
-# `address.space` is not a hit while `sutando.ag2.space` and `dev-chat.s.space` are.
-LITERAL = re.compile(r"(?<![A-Za-z0-9-])(?:[A-Za-z0-9-]+\.)*(?:ag2|s)\.space(?![A-Za-z0-9-])")
+ROOTS = ("src", "skills", "packages/ag2-sparrow/ag2_sparrow", "scripts")
+SUFFIXES = (".py", ".ts", ".json", ".sh", ".mjs", ".plist")
+# One pattern for every host form, any case, dots plain or regex-escaped: the label before
+# `.space` must itself be `ag2` or `s`, so `address.space` is no hit while `dev-chat.s.space` is.
+LITERAL = re.compile(r"(?<![A-Za-z0-9-])(?:[A-Za-z0-9-]+\\?\.)*(?:ag2|s)\\?\.space(?![A-Za-z0-9-])", re.I)
 
 # path -> None (every line allowed: the resolver and its bundled copy) or the fragments a line
 # must contain. Add a fragment only for prose a person reads, never for a value code acts on.
@@ -34,6 +34,7 @@ ALLOW: dict[str, "tuple[str, ...] | None"] = {
     "skills/task-progress/scripts/notify.py": ("(e.g. dev.ag2.space)",),
     "skills/skill-usage-report/manifest.json": ('"AG2_CLOUD_ORIGIN": "https://sutando.ag2.space"',),
     "packages/ag2-sparrow/ag2_sparrow/adapters/hatch/cli.py": ("@my-agent:ag2.space", "@your-agent:ag2.space"),
+    "packages/ag2-sparrow/ag2_sparrow/adapters/hatch/ag2-sparrow-hatch.sh": ("@your-agent:ag2.space",),
 }
 
 TEST_FILE = re.compile(r"(^test_.*\.py$)|(_test\.py$)|(\.test\.(py|ts)$)")
@@ -84,11 +85,41 @@ def code_lines_ts(source: str) -> list[str]:
     return out
 
 
+def code_lines_sh(source: str) -> list[str]:
+    return ["" if line.lstrip().startswith("#") else line for line in source.splitlines()]
+
+
+def code_lines_xml(source: str) -> list[str]:
+    """Lines with `<!-- ... -->` spans blanked, across lines."""
+    out, in_comment = [], False
+    for line in source.splitlines():
+        kept, i = [], 0
+        while i < len(line):
+            if in_comment:
+                j = line.find("-->", i)
+                if j == -1:
+                    break
+                i, in_comment = j + 3, False
+            else:
+                j = line.find("<!--", i)
+                if j == -1:
+                    kept.append(line[i:])
+                    break
+                kept.append(line[i:j])
+                i, in_comment = j + 4, True
+        out.append("".join(kept))
+    return out
+
+
 def code_lines(rel: str, source: str) -> list[str]:
     if rel.endswith(".py"):
         return code_lines_py(source)
-    if rel.endswith(".ts"):
+    if rel.endswith((".ts", ".mjs")):
         return code_lines_ts(source)
+    if rel.endswith(".sh"):
+        return code_lines_sh(source)
+    if rel.endswith(".plist"):
+        return code_lines_xml(source)
     return source.splitlines()
 
 
@@ -142,16 +173,18 @@ class TestScannerKnownAnswer(unittest.TestCase):
         "servers = ['s.space', 'dev.s.space']",
         "not_hits = ['ag2space', 'address.space', 'ag2.spaces', 'xs.space', 'ag2-space']",
         "",
+        "upper = 'https://Sutando.AG2.Space'",
+        r"pattern = re.compile(r'@[a-z]+:ag2\.space$')",
     ]
     EXPECTED = [
         (1, "sutando.ag2.space"), (2, "chat.ag2.space"), (2, "dev.ag2.space"), (3, "ag2.space"),
         (4, "ag2.space"), (4, "dev.ag2.space"), (5, "dev-sutando.s.space"), (6, "s.space"),
-        (6, "dev.s.space"),
+        (6, "dev.s.space"), (9, "Sutando.AG2.Space"), (10, r"ag2\.space"),
     ]
 
     def test_every_form_counted_exactly_once(self):
         self.assertEqual(scan_lines(self.FIXTURE), self.EXPECTED)
-        self.assertEqual(len(scan_lines(self.FIXTURE)), 9)
+        self.assertEqual(len(scan_lines(self.FIXTURE)), 11)
 
     def test_comments_and_docstrings_do_not_count_in_python(self):
         src = ('"""Module doc names ag2.space and chat.s.space."""\n'
@@ -163,6 +196,12 @@ class TestScannerKnownAnswer(unittest.TestCase):
     def test_ts_comment_lines_do_not_count(self):
         src = "// ag2.space\nconst a = 'https://sutando.ag2.space';\n * s.space\n"
         self.assertEqual(scan_lines(code_lines_ts(src)), [(2, "sutando.ag2.space")])
+
+    def test_shell_and_plist_comments_do_not_count(self):
+        sh = "# the ag2.space bridge\nVIA=ag2.space  # dev.ag2.space\n"
+        self.assertEqual(scan_lines(code_lines_sh(sh)), [(2, "ag2.space"), (2, "dev.ag2.space")])
+        plist = "<!-- ag2.space job\n chat.ag2.space -->\n<string>s.space</string><!-- x.s.space -->\n"
+        self.assertEqual(scan_lines(code_lines_xml(plist)), [(3, "s.space")])
 
     def test_test_paths_are_skipped(self):
         for rel in ("src/tests/x.py", "skills/a/test_room_ops.py", "src/foo_test.py", "src/a.test.ts",

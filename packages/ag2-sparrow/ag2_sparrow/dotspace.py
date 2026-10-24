@@ -27,11 +27,17 @@ probe).
               "link_via": "s.space",                    # matrix.to `?via=`; defaults to server
               "prefer_ipv4": true}}                     # the gateway publishes AAAA; see bridge
 
-     Fetched from the host asked about only (a gateway host serves the same document, with
-     `server` naming its homeserver). `server`, when present, must be that host or a parent
-     domain of it; any other claim is ignored. No server publishes this block yet: the fetch is
-     injectable, cached and bounded (`WELL_KNOWN_TIMEOUT_S`), and any failure falls through.
-     Callers on a hot path pass `fetch=NO_FETCH` and skip the network entirely.
+     Fetched from the host asked about only, over TLS, following no redirect, so the document
+     is attributed to that host alone (a gateway host serves the same document, with `server`
+     naming its homeserver). `server`, when present, must be that host or its parent domain,
+     one label up and itself dotted (`attacker.space` cannot claim `space`); `gateway_url`,
+     `link_via`, `cloud_origin` and `mcp_url` must sit at or under that server; any other block
+     is refused. `operator` is self-asserted: a declaration proves what the host says of itself,
+     so the hosts a Sutando Cloud bearer may be sent to come from config alone (source 1). No
+     server publishes this block yet: the fetch is injectable, cached and bounded
+     (`WELL_KNOWN_TIMEOUT_S`), and any failure falls through. Only an explicit per-server
+     `dotspace_for(server)` fetches; the install-wide defaults and every hot path pass
+     `fetch=NO_FETCH` and never touch the network.
   3. the gateway this process was onboarded to (REMOTE_TASK_TOKEN's embedded URL): the bridge
      talks to no other host, so that host is a DotSpace gateway by construction
      (`source="token"`).
@@ -44,12 +50,14 @@ built-in default alone.
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
 import sys
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
@@ -156,9 +164,9 @@ def _host_only(server: str) -> str:
 
 _cache: Dict[str, Tuple[float, Optional[Dict[str, Any]]]] = {}
 _cache_lock = threading.Lock()
-# One fetch in flight per process: a nested or parallel lookup (urllib resolves hosts through
-# the bridge's patched getaddrinfo) falls through to config instead of fetching again.
+# One fetch in flight per process; a parallel caller waits for it and reads the cached answer.
 _fetch_slot = threading.Lock()
+_fetching = threading.local()
 
 
 def reset_cache() -> None:
@@ -171,17 +179,39 @@ def NO_FETCH(url: str, timeout: float) -> Optional[str]:
     return None
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """A declaration is attributed to the host asked, never to one it redirects to."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(req.full_url, code, "redirect refused", headers, fp)
+
+
+def _gateway_call(url: str):
+    """The package's URL-scrubbing context for every call that takes a URL; a no-op where the
+    package is absent (the src tree, skills)."""
+    try:
+        from . import gateway_instance  # type: ignore
+    except ImportError:
+        try:
+            import gateway_instance  # type: ignore
+        except ImportError:
+            return contextlib.nullcontext()
+    return gateway_instance.gateway_call(url)
+
+
 def default_fetch(url: str, timeout: float) -> Optional[str]:
-    req = urllib.request.Request(url, headers={"Accept": "application/json"})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        if resp.status != 200:
-            return None
-        return resp.read(64 * 1024).decode("utf-8", "replace")
+    with _gateway_call(url):
+        req = urllib.request.Request(url, headers={"Accept": "application/json"})
+        opener = urllib.request.build_opener(_NoRedirect())
+        with opener.open(req, timeout=timeout) as resp:
+            if resp.status != 200:
+                return None
+            return resp.read(64 * 1024).decode("utf-8", "replace")
 
 
 def parse_well_known(text: Optional[str], fetched_host: str) -> Optional[Dict[str, Any]]:
     """The AG2 block of a well-known document, normalised, or None when absent, malformed, not
-    AG2's, or claiming a server that is neither `fetched_host` nor a parent domain of it."""
+    AG2's, claiming a server `fetched_host` may not speak for, or naming hosts outside it."""
     if not text:
         return None
     try:
@@ -192,17 +222,36 @@ def parse_well_known(text: Optional[str], fetched_host: str) -> Optional[Dict[st
     if not isinstance(block, dict) or block.get("operator") != OPERATOR_AG2:
         return None
     server = _host_only(str(block.get("server") or fetched_host))
-    if not server or not (fetched_host == server or fetched_host.endswith("." + server)):
+    if not server or not _may_speak_for(fetched_host, server):
         return None
     gateway_host = server_of_gateway_url(str(block.get("gateway_url") or ""))
+    cloud_origin = _origin(block.get("cloud_origin"))
+    mcp_url = str(block.get("mcp_url") or "").strip()
+    link_via = _host_only(str(block.get("link_via") or "")) or server
+    for host in (gateway_host, link_via, server_of_gateway_url(cloud_origin), server_of_gateway_url(mcp_url)):
+        if host and not _under(host, server):
+            return None
     return {
         "server": server,
         "gateway_host": gateway_host,
-        "cloud_origin": _origin(block.get("cloud_origin")),
-        "mcp_url": str(block.get("mcp_url") or "").strip(),
-        "link_via": _host_only(str(block.get("link_via") or "")) or server,
+        "cloud_origin": cloud_origin,
+        "mcp_url": mcp_url,
+        "link_via": link_via,
         "prefer_ipv4": bool(block.get("prefer_ipv4", True)),
     }
+
+
+def _under(host: str, server: str) -> bool:
+    return host == server or host.endswith("." + server)
+
+
+def _may_speak_for(fetched_host: str, server: str) -> bool:
+    """A host declares itself, or its parent domain when that parent is dotted and the host is
+    exactly one label below it (`chat.s.space` for `s.space`; never `attacker.space` for `space`)."""
+    if fetched_host == server:
+        return True
+    return "." in server and fetched_host.endswith("." + server) \
+        and "." not in fetched_host[: -len(server) - 1]
 
 
 def _origin(value: Any) -> str:
@@ -216,19 +265,24 @@ def _well_known(host: str, fetch: Fetch) -> Optional[Dict[str, Any]]:
         hit = _cache.get(host)
         if hit and hit[0] > now:
             return hit[1]
-    if fetch is NO_FETCH or not _fetch_slot.acquire(blocking=False):
-        return None
-    try:
+    if fetch is NO_FETCH or getattr(_fetching, "active", False):
+        return None  # a lookup made by the fetch itself (DNS hook) never fetches again
+    with _fetch_slot:
+        with _cache_lock:
+            hit = _cache.get(host)
+            if hit and hit[0] > time.monotonic():
+                return hit[1]
+        _fetching.active = True
         try:
             text = fetch("https://" + host + WELL_KNOWN_PATH, WELL_KNOWN_TIMEOUT_S)
         except Exception:  # noqa: BLE001 — any failure is "no declaration", next source
             text = None
+        finally:
+            _fetching.active = False
         block = parse_well_known(text, host)
-    finally:
-        _fetch_slot.release()
-    ttl = WELL_KNOWN_TTL_S if block else WELL_KNOWN_NEGATIVE_TTL_S
-    with _cache_lock:
-        _cache[host] = (time.monotonic() + ttl, block)
+        ttl = WELL_KNOWN_TTL_S if block else WELL_KNOWN_NEGATIVE_TTL_S
+        with _cache_lock:
+            _cache[host] = (time.monotonic() + ttl, block)
     return block
 
 
@@ -352,9 +406,9 @@ def default_link_via(env: Optional[Mapping[str, str]] = None) -> str:
 
 
 def default_cloud_origin(env: Optional[Mapping[str, str]] = None) -> str:
-    """Sutando Cloud for this install: its server's DotSpace's, else the legacy one's.
-    Per install, not per connection: an install on several DotSpaces reaches one cloud."""
-    return cloud_origin_for(current_server(env)) or legacy_dotspace().cloud_origin
+    """Sutando Cloud for this install: its server's DotSpace's, else the legacy one's. Config and
+    token only (read at import by callers). Per install: several DotSpaces still reach one cloud."""
+    return cloud_origin_for(current_server(env), fetch=NO_FETCH) or legacy_dotspace().cloud_origin
 
 
 # ----------------------------------------------------------------- install

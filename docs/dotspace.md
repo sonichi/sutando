@@ -58,12 +58,19 @@ process's environment; a multi-DotSpace install passes the server explicitly.
       "prefer_ipv4": true}}
    ```
 
-   `operator` must be `ag2`. `server` is optional (default: the host fetched) and must be that
-   host or a parent domain of it; a gateway host serves the same document with `server` naming
-   its homeserver. The fetch is bounded (1.5 s), cached (1 h found, 15 min not found), one in
-   flight per process, and any failure falls through to the next source. Hot paths (the
-   bridge's DNS hook, link building) pass `fetch=NO_FETCH` and never touch the network. No
-   server publishes this block yet.
+   `operator` must be `ag2`, and it is self-asserted: a declaration proves what a host says of
+   itself, which is why Sutando Cloud bearers go only to hosts config names. `server` is
+   optional (default: the host fetched) and must be that host or its parent domain, one label
+   up and itself dotted (`chat.s.space` may claim `s.space`; `attacker.space` cannot claim
+   `space`); `gateway_url`, `link_via`, `cloud_origin` and `mcp_url` must sit at or under that
+   server, or the whole block is refused. A gateway host serves the same document with `server`
+   naming its homeserver. The fetch is over TLS, follows no redirect (the document is
+   attributed to the host asked, never to one it points at), is bounded (1.5 s), cached (1 h
+   found, 15 min not found) and single-flight per process (a concurrent caller waits and reads
+   the same answer); any failure falls through to the next source. Only an explicit per-server
+   `dotspace_for(server)` fetches: the install-wide defaults read at import time by
+   `cloud_auth`, `runtime-health` and `report-usage`, the bridge's DNS hook and link building
+   all pass `fetch=NO_FETCH` and never touch the network. No server publishes this block yet.
 
 3. **Token** — the gateway this process was onboarded to (the URL embedded in
    `REMOTE_TASK_TOKEN`, or `REMOTE_TASK_URL`) is a DotSpace gateway by construction: the bridge
@@ -75,7 +82,8 @@ process's environment; a multi-DotSpace install passes the server explicitly.
 ## Adding a sibling
 
 A new DotSpace is one config entry, or a well-known block on the new homeserver; never a
-release. The ag2-sparrow package bundles `dotspace.py` verbatim (`tools/sync_from_src.py`);
+release. Until it is in config, only per-server lookups see a well-known-only instance; the
+install-wide defaults (Sutando Cloud) need the config entry. The ag2-sparrow package bundles `dotspace.py` verbatim (`tools/sync_from_src.py`);
 there the config loader is absent, so the built-in list, well-known and the token decide.
 
 ## Not covered here

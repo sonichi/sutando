@@ -36,11 +36,14 @@ MANIFEST_PATH = Path(__file__).resolve().parents[1] / "manifest.json"
 
 def _cloud_fallback() -> str:
     """Last resort when the manifest's `config` default is unreadable: this install's DotSpace's
-    cloud (core's dotspace). If the two disagree, the manifest wins."""
+    cloud (core's dotspace); without core, the manifest value, else "" (the report is skipped)."""
     src = Path(os.path.realpath(__file__)).parents[3] / "src"
     if str(src) not in sys.path:
         sys.path.insert(0, str(src))
-    from dotspace import default_cloud_origin  # type: ignore
+    try:
+        from dotspace import default_cloud_origin  # type: ignore
+    except ImportError:
+        return _manifest_default() or ""
     return default_cloud_origin()
 
 
@@ -292,6 +295,9 @@ def _report(ws: Path, log: Path, pending: Path) -> int:
 
 
 def main() -> int:
+    if not CLOUD:
+        print("skill-usage-report: no cloud origin known (manifest unreadable, core absent); skipping")
+        return 0
     root = repo_root()
     sys.path.insert(0, str(root / "src"))
     try:

@@ -25,6 +25,7 @@ def _offline(url, timeout):
     raise OSError("tests never fetch a well-known document; inject a fetch")
 
 
+_REAL_FETCH = ds.default_fetch
 ds.default_fetch = _offline  # the default path must stay hermetic here
 
 NONE = {"instances": []}  # a config that knows no DotSpace: well-known and token decide
@@ -35,6 +36,14 @@ def block(**over):
          "cloud_origin": "https://sutando.new.space/", "mcp_url": "https://mcp.new.space/mcp"}
     b.update(over)
     return json.dumps({"m.homeserver": {"base_url": "https://new.space"}, ds.WELL_KNOWN_KEY: b})
+
+
+def _load(name, rel):
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(name, REPO / rel)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
 class Fetcher:
@@ -182,6 +191,68 @@ class TestWellKnown(unittest.TestCase):
         self.assertEqual(ds.parse_well_known(block(server="new.space"), "chat.new.space")["server"], "new.space")
         self.assertIsNone(ds.parse_well_known("[]", "new.space"))
         self.assertIsNone(ds.parse_well_known(json.dumps({ds.WELL_KNOWN_KEY: "str"}), "new.space"))
+        # A parent claim: dotted, and the fetched host exactly one label below it.
+        self.assertIsNone(ds.parse_well_known(block(server="space", gateway_url="", cloud_origin="", mcp_url=""),
+                                              "attacker.space"))
+        self.assertIsNone(ds.parse_well_known(block(server="new.space"), "a.b.new.space"))
+        self.assertIsNotNone(ds.parse_well_known(block(server="new.space"), "b.new.space"))
+
+    def test_block_hosts_must_sit_under_the_claimed_server(self):
+        ok = ds.parse_well_known(block(), "new.space")
+        self.assertEqual((ok["gateway_host"], ok["cloud_origin"]), ("chat.new.space", "https://sutando.new.space"))
+        for field, value in [("gateway_url", "https://chat.other.space"), ("link_via", "other.space"),
+                             ("cloud_origin", "https://sutando.ag2.space"), ("mcp_url", "https://mcp.evil.example/x")]:
+            self.assertIsNone(ds.parse_well_known(block(**{field: value}), "new.space"), field)
+        self.assertIsNotNone(ds.parse_well_known(block(cloud_origin="", mcp_url=""), "new.space"))
+
+    def test_fetch_refuses_redirects_and_runs_inside_the_gateway_context(self):
+        import urllib.error
+        h = ds._NoRedirect()
+        with self.assertRaises(urllib.error.HTTPError) as cm:
+            h.redirect_request(mock.Mock(full_url="https://new.space/.well-known/matrix/client"), None, 302,
+                               "Found", {}, "https://elsewhere.example/")
+        cm.exception.close()
+        seen = []
+
+        class Opener:
+            def open(self, req, timeout):
+                seen.append((req.full_url, timeout))
+                raise OSError("offline")
+        with mock.patch.object(ds.urllib.request, "build_opener", return_value=Opener()):
+            with self.assertRaises(OSError):
+                _REAL_FETCH("https://new.space/.well-known/matrix/client", 1.5)
+        self.assertEqual(seen, [("https://new.space/.well-known/matrix/client", 1.5)])
+        self.assertIsNotNone(ds._gateway_call("https://x").__enter__)
+
+    def test_concurrent_callers_share_one_fetch_and_one_answer(self):
+        import threading
+        started, release = threading.Event(), threading.Event()
+        calls = []
+
+        def slow(url, timeout):
+            calls.append(url)
+            started.set()
+            release.wait(5)
+            return block()
+        results = []
+        t1 = threading.Thread(target=lambda: results.append(ds.dotspace_for("new.space", fetch=slow, config=NONE)))
+        t1.start()
+        self.assertTrue(started.wait(5))
+        t2 = threading.Thread(target=lambda: results.append(ds.dotspace_for("new.space", fetch=slow, config=NONE)))
+        t2.start()
+        release.set()
+        t1.join(5); t2.join(5)
+        self.assertEqual(len(calls), 1, "the second caller waited for the first fetch")
+        self.assertEqual([r.source for r in results], ["well-known", "well-known"])
+
+    def test_a_lookup_made_during_a_fetch_never_fetches(self):
+        inner = []
+
+        def reentrant(url, timeout):
+            inner.append(ds.dotspace_for("new.space", fetch=Fetcher(block()), config=NONE).source)
+            return block()
+        self.assertEqual(ds.dotspace_for("new.space", fetch=reentrant, config=NONE).source, "well-known")
+        self.assertEqual(inner, ["none"])
 
 
 class TestPerServer(unittest.TestCase):
@@ -222,6 +293,16 @@ class TestPerServer(unittest.TestCase):
         self.assertEqual(ds.default_link_via({}), "ag2.space")
         self.assertEqual(ds.default_cloud_origin({"AGENT_MXID": "@a:matrix.org"}), "https://sutando.ag2.space")
 
+    def test_install_defaults_never_fetch(self):
+        f = Fetcher(block())
+        with mock.patch.object(ds, "default_fetch", f):
+            ds.reset_cache()
+            ds.default_cloud_origin({"AGENT_MXID": "@a:new.space"})
+            ds.default_link_via({"AGENT_MXID": "@a:new.space"})
+            import ag2space_links as links
+            links.room_link("!r:new.space")
+        self.assertEqual(f.calls, [])
+
 
 class TestAg2SpaceInstallUnchanged(unittest.TestCase):
     """An ag2.space install sees exactly the literals it saw before the resolver."""
@@ -242,6 +323,10 @@ class TestAg2SpaceInstallUnchanged(unittest.TestCase):
                              {"sutando.ag2.ai", "sutando.ag2.space"})
             self.assertEqual(cloud_auth.normalize_base("https://sutando.ag2.ai"), "https://sutando.ag2.space")
             self.assertEqual(cloud_auth.RETIRED_CLOUD_ORIGINS, ("https://sutando.ag2.ai",))
+            self.assertEqual(_load("rh_ds", "src/runtime-health.py")._STATION_GATEWAY_HOST, "sutando.ag2.space")
+            ru = _load("report_usage_ds", "skills/skill-usage-report/scripts/report-usage.py")
+            self.assertEqual(ru.CLOUD_FALLBACK, "https://sutando.ag2.space")
+            self.assertEqual(ru.CLOUD, "https://sutando.ag2.space")
         with mock.patch.dict("os.environ", {}, clear=True):
             self.assertEqual(links.DEFAULT_VIA, "ag2.space", "no identity at all: the legacy via")
 
@@ -257,7 +342,7 @@ class TestAg2SpaceInstallUnchanged(unittest.TestCase):
 
     def test_bridge_ipv4_preference_asks_the_resolver_offline(self):
         src = (REPO / "packages/ag2-sparrow/ag2_sparrow/remote_gateway_bridge.py").read_text()
-        self.assertIn("_is_dotspace(str(host), fetch=_NO_FETCH)", src)
+        self.assertIn("_prefer_v4_for(host)", src)
         self.assertNotIn('"ag2.space" in str(host)', src)
         self.assertTrue(ds.is_dotspace("chat.ag2.space", fetch=ds.NO_FETCH))
         self.assertTrue(ds.is_dotspace("chat.s.space", fetch=ds.NO_FETCH))
@@ -272,6 +357,38 @@ class TestAg2SpaceInstallUnchanged(unittest.TestCase):
         self.assertEqual(cn.deep_link("!r:ag2.space"), "https://matrix.to/#/!r:ag2.space?via=ag2.space")
         self.assertEqual(cn.deep_link("!r:ag2.space", via=""), "https://matrix.to/#/!r:ag2.space")
         self.assertIn("?via=s.space", cn.format_ping("c", "s", "!r:s.space"))
+
+    def test_cron_notify_via_flag_defaults_to_the_linked_rooms_server(self):
+        import contextlib
+        import io
+        import tempfile
+        cn = _load("cron_notify_cli_ds", "skills/schedule-crons/cron-notify.py")
+        with tempfile.TemporaryDirectory() as td:
+            base = ["--cron", "c", "--summary", "broke", "--kind", "error", "--room", "!dest:ag2.space",
+                    "--state-file", str(Path(td) / "s.json"), "--dry-run"]
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(cn.main(base + ["--link-room", "!detail:s.space", "--event-id", "$e"]), 0)
+            self.assertIn("https://matrix.to/#/!detail:s.space/$e?via=s.space", out.getvalue())
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(cn.main(base), 0)
+            self.assertIn("!dest:ag2.space?via=ag2.space", out.getvalue())
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(cn.main(base + ["--via", ""]), 0)
+            self.assertIn("!dest:ag2.space\n", out.getvalue() + "\n")
+            self.assertNotIn("?via=", out.getvalue())
+
+    def test_bridge_prefers_v4_only_for_a_dotspace_asking_for_it(self):
+        src = (REPO / "packages/ag2-sparrow/ag2_sparrow/remote_gateway_bridge.py").read_text()
+        self.assertIn("_prefer_v4_for(host)", src)
+        self.assertIn("_dotspace_for(name, fetch=_NO_FETCH)", src)
+        self.assertIn("d.operator and d.prefer_ipv4", src)
+        self.assertIn('host.decode("ascii", "replace") if isinstance(host, bytes)', src)
+        cfg = {"instances": [{"server": "v6.space", "prefer_ipv4": False}, {"server": "v4.space"}]}
+        self.assertFalse(ds.dotspace_for("v6.space", fetch=ds.NO_FETCH, config=cfg).prefer_ipv4)
+        self.assertTrue(ds.dotspace_for("v4.space", fetch=ds.NO_FETCH, config=cfg).prefer_ipv4)
 
 
 if __name__ == "__main__":
