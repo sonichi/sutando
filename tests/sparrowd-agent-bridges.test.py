@@ -416,6 +416,18 @@ class Wrapper(Base):
                          {k: v for k, v in _sources.bridge_token_environ("tok-agent").items() if k in host})
         self.assertEqual(built["KEEP_ME"], "1")
 
+    def test_the_carried_config_comes_only_from_the_owner(self):
+        decl = {"env": {"AGENT_MXID": AGENT}}
+        host = {"REMOTE_PROACTIVE_TRUST_OK": "raw-unreviewed", "KEEP_ME": "1"}
+        with mock.patch.object(_sources, "bridge_carried_config", lambda env, read: {}):
+            built = bridge.bridge_environ(decl, "tok-agent", base=host)
+        for key in _sources.BRIDGE_CARRIED_CONFIG:
+            self.assertNotIn(key, built, "a host value bypassed the owner's empty answer")
+        with mock.patch.object(_sources, "bridge_carried_config", lambda env, read: {"REMOTE_PROACTIVE_TRUST_OK": "1"}):
+            built = bridge.bridge_environ(decl, "tok-agent", base=host)
+        self.assertEqual(built["REMOTE_PROACTIVE_TRUST_OK"], "1")
+        self.assertEqual(built["KEEP_ME"], "1")
+
     def test_no_token_means_no_bridge(self):
         decl = self.declare()
         run = mock.Mock()

@@ -1629,7 +1629,7 @@ def declaration_reads(source: str, rel: str) -> "list[str]":
 # these are the module's only mapping writes. A change to either is a reviewed edit of this test.
 READER_ENVIRON = """
 token_env = _sources.bridge_token_environ(token)
-strip = _sources.bridge_strip_keys()
+strip = _sources.bridge_strip_keys() + _sources.BRIDGE_CARRIED_CONFIG
 host = os.environ if base is None else base
 env = {k: v for k, v in host.items() if k not in HOST_ONLY and k not in strip}
 env.update(decl["env"], REMOTE_PROACTIVE_ROOM="")
@@ -2047,9 +2047,10 @@ class Guard(unittest.TestCase):
                             "the reader's accessors stay the reader's")
             self.assertEqual(token_injection_findings(text, rel), [])
             for mutant in (('    token_env = _sources.bridge_token_environ(token)\n', '    token_env = {"REMOTE_TASK_TOKEN": token}\n'),
-                           ('    strip = _sources.bridge_strip_keys()\n', '    strip = token_env\n'),
-                           ('    strip = _sources.bridge_strip_keys()\n', '    strip = HOST_ONLY + tuple(token_env)\n'),
-                           ('    strip = _sources.bridge_strip_keys()\n', '    strip = _sources.bridge_strip_keys()[:1]\n'),
+                           ('    strip = _sources.bridge_strip_keys() + _sources.BRIDGE_CARRIED_CONFIG\n', '    strip = token_env + _sources.BRIDGE_CARRIED_CONFIG\n'),
+                           ('    strip = _sources.bridge_strip_keys() + _sources.BRIDGE_CARRIED_CONFIG\n', '    strip = HOST_ONLY + tuple(token_env)\n'),
+                           ('    strip = _sources.bridge_strip_keys() + _sources.BRIDGE_CARRIED_CONFIG\n', '    strip = _sources.bridge_strip_keys()[:1] + _sources.BRIDGE_CARRIED_CONFIG\n'),
+                           ('    strip = _sources.bridge_strip_keys() + _sources.BRIDGE_CARRIED_CONFIG\n', '    strip = _sources.bridge_strip_keys()\n'),
                            ('    env.update(_sources.bridge_carried_config(host, read_regular))\n',
                             '    env.update(REMOTE_PROACTIVE_TRUST_OK=host.get("REMOTE_PROACTIVE_TRUST_OK", ""))\n'),
                            ('    env.update(_sources.bridge_carried_config(host, read_regular))\n', ''),

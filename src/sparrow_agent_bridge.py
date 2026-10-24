@@ -128,11 +128,12 @@ def load(path: Path, agents: Path) -> "tuple[dict | None, str]":
 
 
 def bridge_environ(decl: dict, token: str, base=None) -> dict:
-    """What the bridge runs under: sparrowd's environment minus the host-only variables and every name the
-    owner lists for a host's gateway tokens, plus the derived env, an empty owner DM, the host config the
-    owner carries for a bridge (resolved here, from the host's files if need be) and the agent's token."""
+    """What the bridge runs under: sparrowd's environment minus the host-only variables, every name the
+    owner lists for a host's gateway tokens and every key it carries, plus the derived env, an empty owner
+    DM, the owner's carried config (resolved here, from the host's files if need be) and the agent's token."""
     token_env = _sources.bridge_token_environ(token)
-    strip = _sources.bridge_strip_keys()
+    # The carried keys come only from the owner's result below, never from the generic base.
+    strip = _sources.bridge_strip_keys() + _sources.BRIDGE_CARRIED_CONFIG
     host = os.environ if base is None else base
     env = {k: v for k, v in host.items() if k not in HOST_ONLY and k not in strip}
     env.update(decl["env"], REMOTE_PROACTIVE_ROOM="")
