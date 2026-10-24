@@ -160,7 +160,6 @@ class DesignAClaimBackend:
                 outbox.record_delivered(self.root, item_id, provider=provider,
                                         destination=destination, provider_ref=provider_ref)
                 return outbox._release_locked(self.root, item_id, token.worker)
-            outbox.clear_dispatching(self.root, item_id)
             if outcome is DeliveryOutcome.OUTCOME_UNKNOWN:
                 outbox.park_item(self.root, item_id, "outcome-unknown")
             elif terminal_reason and (self.replace_refused is None
@@ -175,6 +174,8 @@ class DesignAClaimBackend:
                     attempts = outbox.note_attempt(self.root, item_id)
                     if park_at_attempts is not None and attempts >= park_at_attempts:
                         outbox.park_item(self.root, item_id, "max-attempts")
+            # After the transition: a crash before it keeps the mark, which parks rather than resends.
+            outbox.clear_dispatching(self.root, item_id)
             return outbox._release_locked(self.root, item_id, token.worker)
 
     def mark_dispatching(self, token: ClaimToken) -> bool:

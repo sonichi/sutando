@@ -78,6 +78,11 @@ def requeue_as_logged() -> None:
     lane = pl.Lane(gb, ISO, lost(urllib.error.URLError(TimeoutError("timed out"))))
     lane.write("proactive-9.txt", "status nine\n")
     lane.drain()
+    lane.respond = lambda payload: {"ok": True, "event_id": "$resent"}
+    for _ in range(3):
+        lane.drain()
+    check(len(lane.posts) == 1 and lane.where("proactive-9") == "undelivered",
+          f"f) without an operator requeue nothing is restored or resent ({len(lane.posts)}, {lane.where('proactive-9')})")
     line = next((m for m in lane.logs if "requeue" in m and "proactive-9" in m), "")
     cmd = shlex.split(line.rsplit(": ", 1)[-1]) if "outbox_cli.py" in line else []
     check(bool(cmd), f"f) the park logs a requeue command ({line[-160:]!r})")
@@ -86,7 +91,9 @@ def requeue_as_logged() -> None:
     run = subprocess.run([sys.executable if c == "python3" else c for c in cmd],
                          cwd=REPO, env=isolated_child_env(), capture_output=True, text=True, timeout=60)
     check(run.returncode == 0, f"f) the command runs ({run.returncode}: {run.stderr[-200:]})")
-    lane.respond = lambda payload: {"ok": True, "event_id": "$resent"}
+    restored = lane.results / "proactive-9.txt"
+    check(restored.exists() and restored.read_text(encoding="utf-8") == "status nine\n",
+          f"f) the command restores the body under its original name ({run.stdout[-200:]})")
     for _ in range(3):
         lane.drain()
     items = lane.items()

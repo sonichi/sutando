@@ -8,6 +8,8 @@ The task file is the gateway's own (task-mid, its routing fields below `task:`):
   c) sent to another room        -> top level: a root belongs to its own room
   d) a malformed thread_root     -> top level, never re-rooted at the message inside the thread
   e) every send carries a dedupe key, and the receipt keeps room, thread and event id
+  f) no task file, or a task-last file          -> no root from the task: nothing unverified is trusted
+  g) the ask's thread is in another room         -> top level, even with a source message id
 
 Run: python3 tests/gateway-proactive-outbox-thread.test.py
 """
@@ -69,6 +71,32 @@ def main() -> int:
     _, p = send("task-1761300000004", "not-an-event", f"[channel: {pl.ROOM}]\nreceived\n")
     check(p and "thread_root" not in p,
           f"d) a malformed root posts top level, not at the message ({p.get('thread_root')!r})")
+    lane = pl.Lane(gb, ISO, lambda payload: {"ok": True, "event_id": "$P"})
+    lane.write("proactive-about-task-1761300000005--1761300000500.txt", f"[channel: {pl.ROOM}]\nreceived\n")
+    lane.drain()
+    p = lane.posts[0] if lane.posts else {}
+    check(p and "thread_root" not in p, f"f) a task with no file gets no root ({p.get('thread_root')!r})")
+
+    lane = pl.Lane(gb, ISO, lambda payload: {"ok": True, "event_id": "$P"})
+    (lane.tasks / "task-1761300000006.txt").write_text(
+        f"id: task-1761300000006\nchannel_id: {pl.ROOM}\ntask: hi\nsource_message_id: {MSG}\n"
+        f"thread_root: {ROOT}\n", encoding="utf-8")
+    lane.write("proactive-about-task-1761300000006--1761300000500.txt", f"[channel: {pl.ROOM}]\nreceived\n")
+    lane.drain()
+    p = lane.posts[0] if lane.posts else {}
+    check(p and "thread_root" not in p,
+          f"f) fields below task: in a task-last file are body, never a root ({p.get('thread_root')!r})")
+
+    lane = pl.Lane(gb, ISO, lambda payload: {"ok": True, "event_id": "$P"})
+    (lane.tasks / "task-1761300000009.txt").write_text(
+        "\n".join(["id: task-1761300000009", "source: ag2space", f"channel_id: {pl.ROOM}", "task_layout: mid",
+                   "task: hi", f"thread_root: {ROOT}", "source_room_id: !ElsewhereRoom:ag2.space",
+                   f"source_message_id: {MSG}"]) + "\n", encoding="utf-8")
+    lane.write("proactive-about-task-1761300000009--1761300000500.txt", f"[channel: {pl.ROOM}]\nreceived\n")
+    lane.drain()
+    p = lane.posts[0] if lane.posts else {}
+    check(p and "thread_root" not in p,
+          f"g) a thread in another room is not followed, nor replaced by the message id ({p.get('thread_root')!r})")
     return check.exit_code()
 
 

@@ -11,6 +11,9 @@ A child process drains one proactive file and is killed (os._exit) at one point:
   c) before-receipt, and the owner DM changes before the restart
      -> still the one parked item: no POST to the new DM, no second item left READY
 
+  d) the process dies between the writes that settle an uncertain send
+     -> the dispatch mark survives, so the restart parks it; nothing is sent again
+
 The claim of the dead child is honoured until its reclaim window ends: a drain inside the
 window leaves the file pending, never lost and never sent.
 
@@ -18,6 +21,7 @@ Run: python3 tests/gateway-proactive-crash-receipt.test.py
 """
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -94,7 +98,52 @@ def scenario(stage: str, want_status: str, want_where: str, new_dm: "str | None"
         check(item.get("reason") == "outcome-unknown", f"{stage}: parked outcome-unknown ({item.get('reason')})")
 
 
+class Crash(BaseException):
+    pass
+
+
+def crash_while_settling() -> None:
+    from ag2_sparrow import outbox as vendored
+    import urllib.error
+
+    def lost(payload):
+        raise urllib.error.URLError(TimeoutError("timed out"))
+    lane = pl.Lane(gb, ISO, lost)
+    lane.write("proactive-5.txt", "status five\n")
+    real_park = vendored.park_item
+
+    def park_then_die(*a, **k):
+        raise Crash()
+    vendored.park_item = park_then_die
+    try:
+        lane.drain()
+    except Crash:
+        pass
+    finally:
+        vendored.park_item = real_park
+    root = lane.results / ".outbox-ag2space-proactive"
+    claim_file = vendored._claim_path(root, "proactive-5")
+    dead = subprocess.Popen([sys.executable, "-c", "pass"])
+    dead.wait()
+    if claim_file.exists():
+        data = json.loads(claim_file.read_text())
+        claim_file.write_text(json.dumps({**data, "pid": dead.pid, "start_usec": None,
+                                          "claimed_at": data["claimed_at"] - 3600}))
+    for c in lane.results.glob("proactive-5.sending.*"):
+        c.rename(lane.results / "proactive-5.txt")
+    lane.restart()
+    lane.respond = lambda payload: {"ok": True, "event_id": "$again"}
+    for _ in range(3):
+        lane.drain()
+    items = lane.items()
+    item = items[0] if len(items) == 1 else {}
+    check(len(lane.posts) == 1, f"d) crash while settling: no second POST ({len(lane.posts)})")
+    check(item.get("status") == "PARKED" and item.get("reason") == "outcome-unknown",
+          f"d) crash while settling: parked outcome-unknown ({item.get('status')}, {item.get('reason')})")
+
+
 def main() -> int:
+    crash_while_settling()
     scenario("before-receipt", "PARKED", "undelivered")
     scenario("after-receipt", "DELIVERED", "archived")
     scenario("before-receipt", "PARKED", "undelivered", new_dm="!RepointedOwnerDm:ag2.space")

@@ -1008,9 +1008,11 @@ def note_attempt(root: Path, item_id: str) -> int:
 
 
 def park_item(root: Path, item_id: str, reason: str = "") -> None:
+    """One write: a parked item carries no dispatch mark, so no crash can leave it unmarked and live."""
     d = _read_item(Path(root), item_id)
     d["status"] = "PARKED"
     d["reason"] = reason
+    d.pop("dispatching", None)
     _write_item(Path(root), item_id, d)
 
 
