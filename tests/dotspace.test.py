@@ -112,6 +112,8 @@ class TestConfig(unittest.TestCase):
                          ("x.space", "https://c.x.space", False, "config"))
         self.assertFalse(ds.dotspace_for("ag2.space", fetch=ds.NO_FETCH, config=cfg).is_dotspace)
         self.assertEqual(ds.trusted_cloud_hosts(cfg), frozenset({"c.x.space", ds.LEGACY_CLOUD_HOST}))
+        self.assertFalse(ds.dotspace_for("not-ag2.example", fetch=Fetcher(block(server="not-ag2.example",
+                         gateway_url="https://gw.not-ag2.example", cloud_origin="", mcp_url="")), config=cfg).is_dotspace)
 
     def test_loaded_config_section_is_read_through_the_canonical_loader(self):
         import sutando_config
@@ -136,19 +138,38 @@ class TestWellKnown(unittest.TestCase):
     def setUp(self):
         ds.reset_cache()
 
-    def test_declaration_present(self):
+    def test_declaration_alone_never_makes_a_dotspace(self):
+        """HTTPS proves control of a domain, not AG2 operation: an unregistered server with an
+        `operator: ag2` block is discovered, not trusted."""
         f = Fetcher(block())
         d = ds.dotspace_for("new.space", fetch=f, config=NONE)
         self.assertEqual(f.calls, [("https://new.space/.well-known/matrix/client", ds.WELL_KNOWN_TIMEOUT_S)])
         self.assertEqual((d.server, d.operator, d.gateway_host, d.link_via, d.cloud_origin,
                           d.mcp_url, d.prefer_ipv4, d.source),
-                         ("new.space", "ag2", "chat.new.space", "new.space", "https://sutando.new.space",
-                          "https://mcp.new.space/mcp", True, "well-known"))
+                         ("new.space", "", "chat.new.space", "new.space", "", "https://mcp.new.space/mcp",
+                          False, "well-known-unverified"))
+        self.assertFalse(d.is_dotspace)
+        self.assertEqual(ds.cloud_origin_for("new.space", fetch=f, config=NONE), "")
+
+    def test_registered_server_gains_capabilities_from_its_block(self):
+        cfg = {"instances": [{"server": "new.space", "prefer_ipv4": False}]}
+        ds.reset_cache()
+        d = ds.dotspace_for("new.space", fetch=Fetcher(block(link_via="via.new.space")), config=cfg)
+        self.assertEqual((d.operator, d.source, d.gateway_host, d.mcp_url, d.link_via, d.prefer_ipv4, d.cloud_origin),
+                         ("ag2", "config", "chat.new.space", "https://mcp.new.space/mcp", "via.new.space", False, ""),
+                         "block fills gateway/mcp/link_via; config's prefer_ipv4 and the absent cloud_origin stand")
+        ds.reset_cache()
+        full = {"instances": [{"server": "new.space", "gateway_host": "gw.new.space", "link_via": "new.space"}]}
+        d = ds.dotspace_for("new.space", fetch=Fetcher(block()), config=full)
+        self.assertEqual((d.gateway_host, d.link_via, d.mcp_url), ("gw.new.space", "new.space", "https://mcp.new.space/mcp"))
+        ds.reset_cache()
+        d = ds.dotspace_for("new.space", fetch=Fetcher(block(server="other.space")), config=cfg)
+        self.assertEqual(d.gateway_host, "", "a block for another server fills nothing")
 
     def test_gateway_host_serving_the_block_names_its_server(self):
         d = ds.dotspace_for("chat.new.space", fetch=Fetcher(block(server="new.space", link_via="new.space")),
                             config=NONE)
-        self.assertEqual((d.server, d.link_via, d.source), ("new.space", "new.space", "well-known"))
+        self.assertEqual((d.server, d.link_via, d.source), ("new.space", "new.space", "well-known-unverified"))
 
     def test_absent_malformed_foreign_and_failing_fall_through(self):
         cases = {
@@ -175,14 +196,14 @@ class TestWellKnown(unittest.TestCase):
         self.assertEqual((d.source, d.operator, d.prefer_ipv4, d.gateway_host), ("token", "ag2", True, "gw.example"))
         self.assertFalse(ds.dotspace_for("other.example", fetch=Fetcher("{}"), config=NONE, env=env).is_dotspace)
 
-    def test_config_wins_without_a_fetch_and_results_are_cached(self):
+    def test_registered_lookup_without_fetch_costs_nothing_and_results_are_cached(self):
         f = Fetcher(block())
-        ds.dotspace_for("ag2.space", fetch=f)
-        self.assertEqual(f.calls, [], "a configured instance costs no network round trip")
+        self.assertEqual(ds.dotspace_for("ag2.space", fetch=ds.NO_FETCH).source, "config")
+        self.assertEqual(f.calls, [])
         ds.dotspace_for("new.space", fetch=f, config=NONE)
         ds.dotspace_for("new.space", fetch=f, config=NONE)
         self.assertEqual(len(f.calls), 1, "one fetch per host, then the cache answers")
-        self.assertEqual(ds.dotspace_for("new.space", fetch=ds.NO_FETCH, config=NONE).source, "well-known")
+        self.assertEqual(ds.dotspace_for("new.space", fetch=ds.NO_FETCH, config=NONE).source, "well-known-unverified")
         ds.reset_cache()
         self.assertEqual(ds.dotspace_for("new.space", fetch=ds.NO_FETCH, config=NONE).source, "none")
 
@@ -243,7 +264,7 @@ class TestWellKnown(unittest.TestCase):
         release.set()
         t1.join(5); t2.join(5)
         self.assertEqual(len(calls), 1, "the second caller waited for the first fetch")
-        self.assertEqual([r.source for r in results], ["well-known", "well-known"])
+        self.assertEqual([r.source for r in results], ["well-known-unverified"] * 2)
 
     def test_a_lookup_made_during_a_fetch_never_fetches(self):
         inner = []
@@ -251,7 +272,7 @@ class TestWellKnown(unittest.TestCase):
         def reentrant(url, timeout):
             inner.append(ds.dotspace_for("new.space", fetch=Fetcher(block()), config=NONE).source)
             return block()
-        self.assertEqual(ds.dotspace_for("new.space", fetch=reentrant, config=NONE).source, "well-known")
+        self.assertEqual(ds.dotspace_for("new.space", fetch=reentrant, config=NONE).source, "well-known-unverified")
         self.assertEqual(inner, ["none"])
 
 
@@ -262,11 +283,16 @@ class TestPerServer(unittest.TestCase):
         a = ds.dotspace_for("ag2.space", fetch=ds.NO_FETCH)
         b = ds.dotspace_for("s.space", fetch=ds.NO_FETCH)
         self.assertEqual((a.link_via, a.cloud_origin), ("ag2.space", "https://sutando.ag2.space"))
-        self.assertEqual((b.link_via, b.cloud_origin), ("s.space", "https://sutando.s.space"))
+        self.assertEqual((b.link_via, b.cloud_origin, b.is_dotspace), ("s.space", "", True))
+        opt_in = {"instances": [{"server": "s.space", "cloud_origin": "https://sutando.s.space"}]}
+        self.assertEqual(ds.cloud_origin_for("s.space", fetch=ds.NO_FETCH, config=opt_in), "https://sutando.s.space")
+        self.assertEqual(ds.trusted_cloud_hosts(opt_in), frozenset({"sutando.s.space", ds.LEGACY_CLOUD_HOST}))
         self.assertEqual(ds.link_via_for("!r:ag2.space", fetch=ds.NO_FETCH), "ag2.space")
         self.assertEqual(ds.link_via_for("!r:s.space", fetch=ds.NO_FETCH), "s.space")
         self.assertEqual(ds.cloud_origin_for("@a:ag2.space", fetch=ds.NO_FETCH), "https://sutando.ag2.space")
-        self.assertEqual(ds.cloud_origin_for("@a:s.space", fetch=ds.NO_FETCH), "https://sutando.s.space")
+        self.assertEqual(ds.cloud_origin_for("@a:s.space", fetch=ds.NO_FETCH), "")
+        self.assertEqual(ds.trusted_cloud_hosts(),
+                         frozenset({"sutando.ag2.space", "dev-sutando.ag2.space", ds.LEGACY_CLOUD_HOST}))
         import ag2space_links as links
         self.assertEqual(links.room_link("!r:ag2.space"), "https://matrix.to/#/!r:ag2.space?via=ag2.space")
         self.assertEqual(links.room_link("!r:s.space", "$e"), "https://matrix.to/#/!r:s.space/$e?via=s.space")
@@ -284,10 +310,12 @@ class TestPerServer(unittest.TestCase):
         self.assertEqual(ds.current_server({}), "")
 
     def test_install_defaults_follow_the_install_server(self):
-        self.assertEqual(ds.default_cloud_origin({"AGENT_MXID": "@a:s.space"}), "https://sutando.s.space")
+        # Cloud is undecided for s.space (no cloud_origin): the production origin, as today.
+        self.assertEqual(ds.default_cloud_origin({"AGENT_MXID": "@a:s.space"}), "https://sutando.ag2.space")
         self.assertEqual(ds.default_link_via({"AGENT_MXID": "@a:s.space"}), "s.space")
         self.assertEqual(ds.default_cloud_origin({"REMOTE_TASK_TOKEN": "https://chat.s.space|x"}),
-                         "https://sutando.s.space")
+                         "https://sutando.ag2.space")
+        self.assertEqual(ds.default_cloud_origin({"AGENT_MXID": "@a:dev.ag2.space"}), "https://dev-sutando.ag2.space")
         # An unknown install falls back to the legacy instance, never to "".
         self.assertEqual(ds.default_cloud_origin({}), "https://sutando.ag2.space")
         self.assertEqual(ds.default_link_via({}), "ag2.space")
@@ -335,10 +363,35 @@ class TestAg2SpaceInstallUnchanged(unittest.TestCase):
             import ag2space_links as links
             self.assertEqual(links.DEFAULT_VIA, "s.space")
             cloud_auth = importlib.reload(importlib.import_module("cloud_auth"))
-            self.assertEqual(cloud_auth.DEFAULT_CLOUD_ORIGIN, "https://sutando.s.space")
-            self.assertIn("sutando.s.space", cloud_auth.TRUSTED_API_HOSTS)
+            self.assertEqual(cloud_auth.DEFAULT_CLOUD_ORIGIN, "https://sutando.ag2.space",
+                             "no per-instance Cloud for s.space: the production origin, as today")
+            self.assertNotIn("sutando.s.space", cloud_auth.TRUSTED_API_HOSTS)
             self.assertIn("sutando.ag2.space", cloud_auth.TRUSTED_API_HOSTS)
         importlib.reload(importlib.import_module("cloud_auth"))
+
+    def test_credentials_stay_bound_to_their_origin_on_every_instance(self):
+        """A production credential (retired-origin or bare pre-scoping key) is never paired with
+        another instance's Cloud, and the retired origin never normalises to one."""
+        import cloud_auth
+        prod, retired = "https://sutando.ag2.space", "https://sutando.ag2.ai"
+        store = {cloud_auth.origin_vault_key(retired): "sutk_retired", "AG2_CLOUD_TOKEN": "sutk_bare"}
+        cases = [({"AGENT_MXID": "@a:s.space"}, "https://sutando.s.space"),
+                 ({"AGENT_MXID": "@a:dev.ag2.space"}, "https://dev-sutando.ag2.space")]
+        for env, other in cases:
+            with mock.patch.dict("os.environ", {**env, "AG2_CLOUD_ORIGIN": other}, clear=True):
+                ca = importlib.reload(cloud_auth)
+                self.assertEqual(ca.PRODUCTION_CLOUD_ORIGIN, prod)
+                self.assertEqual(ca.normalize_base(retired), prod, env)
+                self.assertNotEqual(ca.normalize_base(retired), other)
+                found = list(ca.keychain_candidates(store.get))
+                self.assertEqual(found, [(prod, "sutk_bare")], env)
+                self.assertNotIn(other, [o for o, _ in found])
+                scoped = {**store, ca.origin_vault_key(other): "sutk_other"}
+                self.assertEqual(list(ca.keychain_candidates(scoped.get)), [(other, "sutk_other"), (prod, "sutk_bare")])
+        with mock.patch.dict("os.environ", {"AGENT_MXID": "@a:ag2.space"}, clear=True):
+            ca = importlib.reload(cloud_auth)
+            self.assertEqual(list(ca.keychain_candidates(store.get)), [(prod, "sutk_retired"), (prod, "sutk_bare")])
+        importlib.reload(cloud_auth)
 
     def test_bridge_ipv4_preference_asks_the_resolver_offline(self):
         src = (REPO / "packages/ag2-sparrow/ag2_sparrow/remote_gateway_bridge.py").read_text()

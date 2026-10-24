@@ -8,14 +8,18 @@ host, an mxid's server) and asks `dotspace_for(...)`. `current_server()` is the 
 convenience for the few places that are per install today (Sutando Cloud auth, the Station
 probe).
 
-".space" is a public TLD, so a suffix proves nothing. A DotSpace is resolved, in order, from
+".space" is a public TLD, so a suffix proves nothing, and HTTPS proves control of a domain, not
+who operates it. Whether a server IS a DotSpace is therefore decided by the registry alone:
 
   1. the config section `core.dotspace.instances` (sutando.config.json), a list of
-     {server, gateway_host, cloud_origin, link_via?, prefer_ipv4?}. `DEFAULT_INSTANCES`
-     applies when the section is absent, so today's installs behave as before. The owner's
-     config outranks a remote declaration, and a known instance costs no network round trip.
+     {server, gateway_host, cloud_origin?, link_via?, prefer_ipv4?}. `DEFAULT_INSTANCES`
+     applies when the section is absent, so today's installs behave as before. A registered
+     server costs no network round trip. `cloud_origin` is set only where that instance has
+     its own Sutando Cloud (today ag2.space and dev.ag2.space); whether Cloud is per DotSpace
+     or shared is undecided, so the other defaults carry none and callers fall back to the
+     production origin.
   2. the homeserver's own declaration, `https://<host>/.well-known/matrix/client`, in an AG2
-     block under the key `space.ag2.dotspace`::
+     block under the key `space.ag2.dotspace`, is CAPABILITY DISCOVERY, never classification::
 
          {"m.homeserver": {"base_url": "https://s.space"},
           "space.ag2.dotspace": {
@@ -32,12 +36,14 @@ probe).
      naming its homeserver). `server`, when present, must be that host or its parent domain,
      one label up and itself dotted (`attacker.space` cannot claim `space`); `gateway_url`,
      `link_via`, `cloud_origin` and `mcp_url` must sit at or under that server; any other block
-     is refused. `operator` is self-asserted: a declaration proves what the host says of itself,
-     so the hosts a Sutando Cloud bearer may be sent to come from config alone (source 1). No
-     server publishes this block yet: the fetch is injectable, cached and bounded
-     (`WELL_KNOWN_TIMEOUT_S`), and any failure falls through. Only an explicit per-server
-     `dotspace_for(server)` fetches; the install-wide defaults and every hot path pass
-     `fetch=NO_FETCH` and never touch the network.
+     is refused. For a REGISTERED server the block fills what config left unset (gateway_host,
+     mcp_url, link_via, prefer_ipv4); cloud_origin never comes from it, so the hosts a bearer
+     may be sent to are config's alone. For an unregistered server it yields operator "" and
+     source "well-known-unverified": the discovered gateway_host and mcp_url, no AG2
+     behaviour. No server publishes this block yet: the fetch is injectable, cached and
+     bounded (`WELL_KNOWN_TIMEOUT_S`), and any failure falls through. Only an explicit
+     per-server `dotspace_for(server)` fetches; the install-wide defaults and every hot path
+     pass `fetch=NO_FETCH` and never touch the network.
   3. the gateway this process was onboarded to (REMOTE_TASK_TOKEN's embedded URL): the bridge
      talks to no other host, so that host is a DotSpace gateway by construction
      (`source="token"`).
@@ -81,10 +87,8 @@ DEFAULT_INSTANCES: Tuple[Dict[str, str], ...] = (
      "cloud_origin": "https://sutando.ag2.space"},
     {"server": "dev.ag2.space", "gateway_host": "dev-chat.ag2.space",
      "cloud_origin": "https://dev-sutando.ag2.space"},
-    {"server": "s.space", "gateway_host": "chat.s.space",
-     "cloud_origin": "https://sutando.s.space"},
-    {"server": "dev.s.space", "gateway_host": "dev-chat.s.space",
-     "cloud_origin": "https://dev-sutando.s.space"},
+    {"server": "s.space", "gateway_host": "chat.s.space"},
+    {"server": "dev.s.space", "gateway_host": "dev-chat.s.space"},
 )
 
 MXID_ENV_KEYS = ("AGENT_MXID", "AG2SPACE_USER_ID")
@@ -345,21 +349,31 @@ def dotspace_for(server_or_host: str, *, fetch: Optional[Fetch] = None,
                config: Optional[Mapping[str, Any]] = None,
                env: Optional[Mapping[str, str]] = None) -> DotSpace:
     """The DotSpace of a homeserver name, gateway host, sigil id or URL, by the order in the
-    module docstring; a plain server comes back with operator "" and source "none". `fetch=None` is the real well-known fetch; pass `NO_FETCH` on a hot path.
-    `config` is the `core.dotspace` section; None reads the loaded config."""
+    module docstring; a plain server comes back with operator "" and source "none". `fetch=None`
+    is the real well-known fetch; pass `NO_FETCH` on a hot path. `config` is the `core.dotspace`
+    section; None reads the loaded config."""
     raw = (server_or_host or "").strip()
     if raw.lower().startswith(("http://", "https://")):
         raw = server_of_gateway_url(raw)
     host = _host_only(server_of_matrix_id(raw) or raw)
     if not host:
         return DotSpace(server="")
+    fetch = default_fetch if fetch is None else fetch
     # The most specific server wins: `chat.dev.s.space` is dev.s.space's gateway, not s.space's.
     matched = [e for e in _config_entries(config) if _matches(e, host)]
     if matched:
-        return _entry_dotspace(max(matched, key=lambda e: len(str(e.get("server")))), "config")
-    block = _well_known(host, default_fetch if fetch is None else fetch)
+        entry = dict(max(matched, key=lambda e: len(str(e.get("server")))))
+        block = _well_known(host, fetch)
+        if block and block["server"] == _host_only(str(entry["server"])):
+            for key in ("gateway_host", "mcp_url", "link_via", "prefer_ipv4"):
+                if key not in entry or entry[key] in ("", None):
+                    entry[key] = block[key]  # discovery fills what the registry left unset
+        return _entry_dotspace(entry, "config")
+    block = _well_known(host, fetch)
     if block and _matches(block, host):
-        return _entry_dotspace(block, "well-known")
+        return DotSpace(server=block["server"], gateway_host=block["gateway_host"],
+                        link_via=block["server"], mcp_url=block["mcp_url"],
+                        source="well-known-unverified")
     gateway = server_of_gateway_url(_own_gateway_url(os.environ if env is None else env))
     if gateway and host == gateway:
         return DotSpace(server=host, operator=OPERATOR_AG2, gateway_host=host, link_via=host,
@@ -367,18 +381,21 @@ def dotspace_for(server_or_host: str, *, fetch: Optional[Fetch] = None,
     return DotSpace(server=host, link_via=host)
 
 
-def is_dotspace(server_or_host: str, *, fetch: Optional[Fetch] = None) -> bool:
-    return dotspace_for(server_or_host, fetch=fetch).is_dotspace
+def is_dotspace(server_or_host: str, *, fetch: Optional[Fetch] = None,
+                config: Optional[Mapping[str, Any]] = None) -> bool:
+    return dotspace_for(server_or_host, fetch=fetch, config=config).is_dotspace
 
 
-def link_via_for(matrix_id_or_server: str, *, fetch: Optional[Fetch] = None) -> str:
+def link_via_for(matrix_id_or_server: str, *, fetch: Optional[Fetch] = None,
+                 config: Optional[Mapping[str, Any]] = None) -> str:
     """The matrix.to `?via=` server for a room id, mxid or server name; "" when it names none."""
-    fam = dotspace_for(matrix_id_or_server, fetch=fetch)
-    return fam.link_via or fam.server
+    d = dotspace_for(matrix_id_or_server, fetch=fetch, config=config)
+    return d.link_via or d.server
 
 
-def cloud_origin_for(server: str, *, fetch: Optional[Fetch] = None) -> str:
-    return dotspace_for(server, fetch=fetch).cloud_origin
+def cloud_origin_for(server: str, *, fetch: Optional[Fetch] = None,
+                     config: Optional[Mapping[str, Any]] = None) -> str:
+    return dotspace_for(server, fetch=fetch, config=config).cloud_origin
 
 
 def trusted_cloud_hosts(config: Optional[Mapping[str, Any]] = None) -> frozenset:

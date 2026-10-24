@@ -56,6 +56,9 @@ TRUSTED_API_HOSTS = dotspace.trusted_cloud_hosts()
 
 # This install's DotSpace's cloud; per install, not per connection (see docs/dotspace.md).
 DEFAULT_CLOUD_ORIGIN = dotspace.default_cloud_origin()
+# The production Cloud the retired origin moved to. A retired-origin credential belongs HERE,
+# whatever instance this install is on; it is never re-paired with another origin.
+PRODUCTION_CLOUD_ORIGIN = dotspace.legacy_dotspace().cloud_origin
 # sutando.ag2.ai 307s to .space and clients drop Authorization across the
 # cross-origin redirect, so a bearer sent there reads back as a bogus 401.
 RETIRED_CLOUD_ORIGINS = ("https://sutando.ag2.ai",)
@@ -67,12 +70,13 @@ REQUEST_TIMEOUT_S = 30
 
 
 def normalize_base(base: str) -> str:
-    """A retired production origin IS the current one — never send a bearer to
-    it (the 307 to the new host drops Authorization → a misleading 401)."""
+    """A retired production origin IS the production one — never send a bearer to
+    it (the 307 to the new host drops Authorization → a misleading 401); empty
+    is this install's default."""
     base = (base or "").strip().rstrip("/")
-    if base in RETIRED_CLOUD_ORIGINS or not base:
-        return DEFAULT_CLOUD_ORIGIN
-    return base
+    if base in RETIRED_CLOUD_ORIGINS:
+        return PRODUCTION_CLOUD_ORIGIN
+    return base or DEFAULT_CLOUD_ORIGIN
 
 
 def fnv1a64(s: str) -> int:
@@ -119,16 +123,16 @@ def keychain_candidates(get: Callable[[str], str | None] | None = None, *,
     origin = resolve_cloud_origin()
     if signed_out_is_terminal and get(origin_vault_key(origin)) == SIGNED_OUT_SENTINEL:
         return
-    candidates = [origin]
-    if origin == DEFAULT_CLOUD_ORIGIN:
-        candidates.extend(RETIRED_CLOUD_ORIGINS)
-    keys = [origin_vault_key(o) for o in candidates]
-    # Pre-origin-scoping installs stored a bare, unscoped key.
-    keys.append("AG2_CLOUD_TOKEN")
-    for key in keys:
+    # (origin the credential belongs to, key it is stored under): a token is only ever paired
+    # with the origin it was stored for; the retired and the bare pre-scoping key are production's.
+    pairs = [(origin, origin_vault_key(origin))]
+    if origin == PRODUCTION_CLOUD_ORIGIN:
+        pairs.extend((PRODUCTION_CLOUD_ORIGIN, origin_vault_key(o)) for o in RETIRED_CLOUD_ORIGINS)
+    pairs.append((PRODUCTION_CLOUD_ORIGIN, "AG2_CLOUD_TOKEN"))
+    for bound_to, key in pairs:
         tok = get(key)
         if tok and tok != SIGNED_OUT_SENTINEL:
-            yield origin, tok
+            yield bound_to, tok
 
 
 def read_keychain_auth(get: Callable[[str], str | None] | None = None, *,

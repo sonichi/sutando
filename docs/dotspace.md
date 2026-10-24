@@ -20,30 +20,44 @@ of the server its identity (`AGENT_MXID` / `AG2SPACE_USER_ID`) or onboarding tok
 ag2.space's. `current_server()` never raises and never picks between bridges: it reads one
 process's environment; a multi-DotSpace install passes the server explicitly.
 
+## Trust model
+
+".space" is a public TLD, and HTTPS proves control of a domain, not who operates it. So whether a
+server **is** a DotSpace is decided by the registry alone (source 1 below). A well-known
+declaration is capability discovery for a server the registry already trusts; on its own it
+never admits a server, and nothing in it ever adds a host a Sutando Cloud bearer may be sent to.
+
+Future path, not implemented: an AG2-signed declaration (the well-known block signed by an AG2
+key that ships in config) could admit a server without a registry entry; until then a new
+instance is a config entry.
+
 ## Sources, in order
 
-1. **Config** — `core.dotspace.instances` in `sutando.config.json` /
+1. **Config (the registry)** — `core.dotspace.instances` in `sutando.config.json` /
    `sutando.config.local.json`:
 
    ```json
    {"core": {"dotspace": {"instances": [
      {"server": "ag2.space", "gateway_host": "chat.ag2.space",
       "cloud_origin": "https://sutando.ag2.space"},
-     {"server": "s.space", "gateway_host": "chat.s.space",
-      "cloud_origin": "https://sutando.s.space"}
+     {"server": "s.space", "gateway_host": "chat.s.space"}
    ]}}}
    ```
 
-   Optional per entry: `link_via` (default: server), `prefer_ipv4` (default: true). When the
-   section is absent the built-in list applies (ag2.space, dev.ag2.space, s.space, dev.s.space
-   with their `chat.` / `dev-chat.` gateways and `sutando.` / `dev-sutando.` clouds), so
-   today's installs behave as before. The most specific server wins (`chat.dev.s.space` is
-   dev.s.space's gateway). The owner's config outranks a remote declaration, and a configured
-   instance costs no network round trip. Sutando Cloud bearers are sent only to configured
-   instances' cloud hosts (plus the retired `sutando.ag2.ai`); a well-known declaration never
-   widens that set.
+   Optional per entry: `cloud_origin`, `link_via` (default: server), `prefer_ipv4` (default:
+   true). When the section is absent the built-in list applies — ag2.space, dev.ag2.space,
+   s.space, dev.s.space with their `chat.` / `dev-chat.` gateways; `cloud_origin` only on
+   ag2.space (`https://sutando.ag2.space`) and dev.ag2.space (`https://dev-sutando.ag2.space`)
+   — so today's installs behave as before. The most specific server wins (`chat.dev.s.space`
+   is dev.s.space's gateway). A registered instance costs no network round trip.
 
-2. **Well-known** — the homeserver's own declaration at
+   **Sutando Cloud is undecided** (per DotSpace or shared), so the s.space defaults carry no
+   `cloud_origin`: `cloud_origin_for("s.space")` is `""` and callers fall back to the
+   production origin exactly as today. An operator opts an instance into its own Cloud by
+   setting `cloud_origin` on its entry; `trusted_cloud_hosts()` is then those configured hosts
+   plus the retired `sutando.ag2.ai`, nothing else.
+
+2. **Well-known (capability discovery)** — the homeserver's declaration at
    `https://<host>/.well-known/matrix/client`, in a block under `space.ag2.dotspace`:
 
    ```json
@@ -52,23 +66,24 @@ process's environment; a multi-DotSpace install passes the server explicitly.
       "operator": "ag2",
       "server": "s.space",
       "gateway_url": "https://chat.s.space",
-      "cloud_origin": "https://sutando.s.space",
       "mcp_url": "https://mcp.s.space/mcp",
       "link_via": "s.space",
       "prefer_ipv4": true}}
    ```
 
-   `operator` must be `ag2`, and it is self-asserted: a declaration proves what a host says of
-   itself, which is why Sutando Cloud bearers go only to hosts config names. `server` is
+   `operator` must read `ag2` for the block to parse, and it is self-asserted. `server` is
    optional (default: the host fetched) and must be that host or its parent domain, one label
    up and itself dotted (`chat.s.space` may claim `s.space`; `attacker.space` cannot claim
    `space`); `gateway_url`, `link_via`, `cloud_origin` and `mcp_url` must sit at or under that
-   server, or the whole block is refused. A gateway host serves the same document with `server`
-   naming its homeserver. The fetch is over TLS, follows no redirect (the document is
-   attributed to the host asked, never to one it points at), is bounded (1.5 s), cached (1 h
-   found, 15 min not found) and single-flight per process (a concurrent caller waits and reads
-   the same answer); any failure falls through to the next source. Only an explicit per-server
-   `dotspace_for(server)` fetches: the install-wide defaults read at import time by
+   server, or the whole block is refused. For a **registered** server the block fills what
+   config left unset: `gateway_host`, `mcp_url`, `link_via`, `prefer_ipv4` — never
+   `cloud_origin`. For an **unregistered** server it yields operator `""`, source
+   `well-known-unverified`, the discovered `gateway_host` and `mcp_url`, and no AG2 behaviour
+   (no IPv4 preference, no cloud, links via itself). The fetch is over TLS, follows no redirect
+   (the document is attributed to the host asked, never to one it points at), is bounded
+   (1.5 s), cached (1 h found, 15 min not found) and single-flight per process (a concurrent
+   caller waits and reads the same answer); any failure falls through. Only an explicit
+   per-server `dotspace_for(server)` fetches: the install-wide defaults read at import time by
    `cloud_auth`, `runtime-health` and `report-usage`, the bridge's DNS hook and link building
    all pass `fetch=NO_FETCH` and never touch the network. No server publishes this block yet.
 
@@ -79,11 +94,18 @@ process's environment; a multi-DotSpace install passes the server explicitly.
 4. **None** — a plain Matrix server is not a DotSpace: operator `""`, source `"none"`, no cloud,
    `prefer_ipv4` false, links via itself.
 
+## Credentials stay bound to their origin
+
+`src/cloud_auth.py` pairs a stored Sutando Cloud token only with the origin it was stored for.
+The retired production origin (`sutando.ag2.ai`) and the bare pre-scoping Keychain key are
+production credentials: they normalise to and pair with `https://sutando.ag2.space` on every
+install, never with the current instance's Cloud. An s.space or dev.ag2.space install therefore
+never sends a production bearer to `sutando.s.space` or `dev-sutando.ag2.space`.
+
 ## Adding a sibling
 
-A new DotSpace is one config entry, or a well-known block on the new homeserver; never a
-release. Until it is in config, only per-server lookups see a well-known-only instance; the
-install-wide defaults (Sutando Cloud) need the config entry. The ag2-sparrow package bundles `dotspace.py` verbatim (`tools/sync_from_src.py`);
+A new DotSpace is one config entry; never a release. Its well-known block then fills the
+capabilities the entry leaves out. A block without an entry is discovery only (see Trust model). The ag2-sparrow package bundles `dotspace.py` verbatim (`tools/sync_from_src.py`);
 there the config loader is absent, so the built-in list, well-known and the token decide.
 
 ## Not covered here
