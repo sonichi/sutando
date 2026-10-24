@@ -52,6 +52,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`cli_wedge_patterns.py`** — The abnormal-banner table of the CLI progress detector: text on a pane that says the CLI is parked (a login prompt, a provider limit, a compaction, an error it sits on), as data.
 - **`client-frame-hub.ts`** — Client-frame hub: optional voice plugins register handlers; the host offers them every client JSON frame it does not own.
 - **`cloud_auth.py`** — Sutando Cloud session: find the owner's sutk_ bearer and call the cloud API.
+- **`codex_project_trust.py`** — Record the Codex core's own checkout as a trusted project before launch.
 - **`context-drop.sh`** — Sutando context drop — triggered by macOS hotkey via Automator Quick Action.
 - **`context_resume.py`** — Extract recent conversation turns from a Claude Code transcript (.jsonl).
 - **`conversation-log-store.ts`** — The voice session's conversation log (conversation.log + the sqlite mirror) as a bodhi ConversationHistoryStore, written like bodhi's own Markdown store: bodhi's history writer calls it asynchronously after each turn, it appends the spoken lines without blocking (fs/promises, sqlite in a worker) on its own serial queue, and a failed write is logged, never thrown.
@@ -64,6 +65,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`core_heartbeat.py`** — Per-host heartbeat for sutando-core sessions.
 - **`core_lineage.py`** — Which conversation this host's core is having, and which it had before.
 - **`core_restart_intent.py`** — core_restart_intent.py — the owner's easy-restart intent file (sonichi#2401).
+- **`core_runtime_record.py`** — Atomic publication of a confirmed core launch observation shared by CLI adapters.
 - **`crash-only.ts`** — crash-only.ts — voice-agent fatal-path helpers (design 1d; impl plan WS1 Steps 1–2, amendments R1/R2).
 - **`credential-resolver.ts`** — Credential resolver — capability, not key (G8, desktop-parity plan).
 - **`credential_resolver.py`** — Credential resolver — capability, not key (G8, desktop-parity plan).
@@ -250,6 +252,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`tmux-status.ts`** — Tmux-pane status scraper.
 - **`tmux_pane_keys.py`** — Shared tmux pane-key argv and crash-safe send guard.
 - **`tmux_probe.py`** — Tri-state tmux session probe shared by every core-liveness reader.
+- **`toml_fallback.py`** — A strict TOML reader for interpreters older than 3.11, which have no tomllib.
 - **`turn-start.sh`** — UserPromptSubmit hook: a new turn is starting, so re-arm the Stop reminder.
 - **`turn_ledger.py`** — The turn ledger — a record that the agent's turn produced an outbound message.
 - **`undelivered_quarantine.py`** — Naming and moves for `results/undelivered/` — the delivery quarantine.
@@ -307,12 +310,14 @@ One entry per agent-facing module. 5 without a usable header comment.
 
 ## `src/agent/`
 
+- **`core-runtime-record.sh`** — Called only after the adapter confirms its named core is present.
 - **`graceful-restart.sh`** — Graceful core-restart orchestrator.
 - **`restart-guard.sh`** — Shared policy for both runtime launchers: a `--restart` issued from inside the core session kill-sessions the very agent running the command.
 - **`restart-prep.sh`** — Graceful-restart Phase-1 prep; see notes/graceful-restart-design.md.
 - **`start-cli.sh`** — Canonical persistent-core launcher.
 - **`stop-core.sh`** — src/agent/stop-core.sh — stop ONLY the core CLI tmux session (sonichi#2401).
 - **`task-event-handler-lookup.sh`** — Reads the task-event handler declared in a small JSON config file.
+- **`tmux-socket-guard.sh`** — Preconditions on the core's tmux socket, checked by the dispatcher before any launcher runs.
 
 ## `src/agent/agy/`
 

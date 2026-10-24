@@ -89,7 +89,8 @@ CLAUDE_GATE_SIGNATURES: List[Tuple[str, "re.Pattern[str]"]] = [
     ("fable-limit", re.compile(r"❯\s*Switch to .{1,80}? and continue", re.I)),
     ("fable-limit-unfocused", FABLE_TEXT),
     ("session-limit", re.compile(r"hit your (?:session|usage|weekly) limit", re.I)),
-    ("folder-trust", re.compile(r"trust the files in this folder|Do you trust", re.I)),
+    # Codex 0.160 asks "Trust this folder?"; Claude Code, "Do you trust the files in this folder?".
+    ("folder-trust", re.compile(r"trust the files in this folder|Do you trust|Trust this folder\?", re.I)),
     ("bypass-permissions", re.compile(r"Bypass Permissions mode|Yes, I accept", re.I)),
     ("login", re.compile(r"Select login method|Paste code here|Browser didn'?t open", re.I)),
     ("press-enter", re.compile(r"Press Enter to continue", re.I)),
@@ -416,6 +417,16 @@ def automation_leftover(capture: Optional[str], adapter: RuntimeAdapter, workspa
     if not composer_frame_visible(capture, adapter):
         return None  # the box runs off the screen bottom: more text may sit below
     return v.pending if composer_text(capture, adapter) == v.pending else None
+
+
+# Dialogs only a person clears; a headless core shown one stays there, queued work or not.
+# Approvals and pickers are absent: the core's own turn raises and answers those.
+PERSON_ONLY_GATES = ("folder-trust", "bypass-permissions", "login")
+
+
+def waits_for_a_person(verdict: Verdict) -> bool:
+    """True when the pane is held by a dialog that no automation will answer."""
+    return verdict.state == "busy" and verdict.reason in PERSON_ONLY_GATES
 
 
 def blocks_dispatch(verdict: Verdict, adapter: RuntimeAdapter) -> bool:

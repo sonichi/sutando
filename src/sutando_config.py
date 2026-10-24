@@ -651,15 +651,98 @@ def resolve_dotenv(repo_root: Optional[Path] = None,
     return primary
 
 
+def desktop_runtime_selection_path(repo_root: Optional[Path] = None) -> Optional[Path]:
+    """The AG2 Space desktop's ``runtime.json``, when this engine is hosted by one.
+
+    The desktop owns that file. Its directory is ``$SUTANDO_APP_SUPPORT``, which the
+    desktop exports to engine processes, or the parent of the bundled engine tree
+    (``<app-support>/engine/<checkout>``) for jobs started without that environment.
+    """
+    app_support = os.environ.get("SUTANDO_APP_SUPPORT", "").strip()
+    if app_support:
+        return Path(app_support) / "runtime.json"
+    root = repo_root or _find_repo_root()
+    if root is None:
+        return None
+    root = Path(root).resolve()
+    if root.parent.name != "engine":
+        return None
+    return root.parent.parent / "runtime.json"
+
+
+def _desktop_selected_runtime(repo_root: Optional[Path]) -> str:
+    path = desktop_runtime_selection_path(repo_root)
+    if path is None:
+        return ""
+    try:
+        selected = json.loads(path.read_text()).get("coreRuntime")
+    except (OSError, ValueError, AttributeError):
+        return ""
+    return selected.strip() if isinstance(selected, str) else ""
+
+
+def persist_desktop_runtime_selection(runtime: str, repo_root: Optional[Path] = None,
+                                      check: bool = False) -> str:
+    """Make an explicit outside-core switch the desktop's durable selection too.
+
+    Returns ``"unchanged"`` when it already says ``runtime`` and ``"updated"`` after
+    writing it; ``"no-desktop"`` when no desktop hosts this engine. Otherwise the
+    desktop keeps relaunching and probing for the old runtime while the new one
+    owns the session (2026-10-22: the app read a live Claude core as absent).
+    ``check`` runs every validation but writes nothing, returning ``"would-update"``
+    where it would have written; the launcher writes only once the new core is confirmed.
+
+    Same contract as the desktop's own writer (``core_runtime.rs``
+    ``update_runtime_json``): every other key survives, and the file is replaced
+    atomically, because readers treat a partial or unparseable file as "never
+    chosen". A file that exists but is not a JSON object is refused rather than
+    replaced, which would drop the desktop's other keys.
+    """
+    if runtime not in _SUPPORTED_CORE_RUNTIMES:
+        raise ValueError(f"unsupported core runtime: {runtime!r}")
+    path = desktop_runtime_selection_path(repo_root)
+    if path is None or not path.parent.is_dir():
+        return "no-desktop"
+    try:
+        body = json.loads(path.read_text())
+    except FileNotFoundError:
+        body = {}
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"cannot read {path}: {exc}") from exc
+    if not isinstance(body, dict):
+        raise ValueError(f"{path} is not a JSON object")
+    if body.get("coreRuntime") == runtime:
+        return "unchanged"
+    if check:
+        return "would-update"
+    body["coreRuntime"] = runtime
+    tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+    try:
+        with open(tmp, "w") as f:
+            f.write(json.dumps(body, indent=2) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    return "updated"
+
+
 def resolve_core_runtime(repo_root: Optional[Path] = None) -> str:
     """Return the selected persistent core CLI runtime.
 
-    ``SUTANDO_CORE_RUNTIME`` is an invocation-scoped launcher override.
-    Otherwise ``core.runtime`` is read from merged config. Claude remains the
-    default so upgrading does not change existing installations.
+    ``SUTANDO_CORE_RUNTIME`` is an invocation-scoped launcher override. Next is
+    the desktop's durable selection (``desktop_runtime_selection_path``), so
+    background jobs agree with the desktop launcher; a missing, unreadable or
+    unsupported selection is ignored. Then ``core.runtime`` from merged config.
+    Claude remains the default so upgrading does not change existing installations.
     """
     core = load_config(repo_root).get("core") or {}
     configured = str(core.get("runtime") or "claude").strip()
+    desktop = _desktop_selected_runtime(repo_root)
+    if desktop in _SUPPORTED_CORE_RUNTIMES:
+        configured = desktop
     runtime = os.environ.get("SUTANDO_CORE_RUNTIME", "").strip() or configured
     if runtime not in _SUPPORTED_CORE_RUNTIMES:
         supported = ", ".join(sorted(_SUPPORTED_CORE_RUNTIMES))

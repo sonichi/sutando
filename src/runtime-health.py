@@ -524,9 +524,10 @@ def _queued_tasks(workspace):
         return 0
 
 
-def _pane_blocks_dispatch(workspace):
-    """The pane gate's verdict when it holds queued tasks, else None. The adapter is the
-    session's own runtime; a session that cannot name it is not judged."""
+def _pane_blocks_dispatch(workspace, queued=True):
+    """The pane gate's verdict when it holds queued tasks, or (queued or not) when a dialog
+    only a person can answer holds it; else None. The adapter is the session's own
+    runtime; a session that cannot name it is not judged."""
     try:
         from delivery import pane_gate
         sock = _tmux_socket()
@@ -537,7 +538,9 @@ def _pane_blocks_dispatch(workspace):
             return None
         verdict = pane_gate.classify_pane(cli_wedge.capture_pane(sock, target, escapes=True),
                                           adapter, workspace, sock, SESSION)
-        return verdict if pane_gate.blocks_dispatch(verdict, adapter) else None
+        if pane_gate.waits_for_a_person(verdict):
+            return verdict
+        return verdict if queued and pane_gate.blocks_dispatch(verdict, adapter) else None
     except Exception:  # noqa: BLE001 — best-effort: an unreadable pane keeps the prior verdict
         return None
 
@@ -663,12 +666,19 @@ def derive():
                 health, detail = "idle", "Agent is online and idle"
                 # core-status is a self-report; queued work the pane is holding is not idle.
                 queued = _queued_tasks(workspace)
-                held = _pane_blocks_dispatch(workspace) if queued else None
+                # Checked with nothing queued too: a trust or login dialog at startup holds
+                # the next task as surely as the current one (2026-10-22: hours of "idle").
+                held = _pane_blocks_dispatch(workspace, queued=bool(queued))
                 if held is not None:
-                    what = (f"unsent text in the composer: {held.pending!r}"
-                            if held.state == "pending" else f"{held.state} ({held.reason})")
+                    if held.state == "pending":
+                        what = f"unsent text in the composer: {held.pending!r}"
+                    elif held.state == "busy":
+                        what = f"the core is waiting on a {held.reason} prompt only a person can answer"
+                    else:
+                        what = f"{held.state} ({held.reason})"
                     health = "blocked"
-                    detail = f"{queued} task(s) queued but not dispatched — {what}"
+                    detail = (f"{queued} task(s) queued but not dispatched — {what}" if queued
+                              else f"Agent cannot take tasks — {what}")
             else:
                 health, detail = "unknown", "Agent is running (status unknown)"
 
