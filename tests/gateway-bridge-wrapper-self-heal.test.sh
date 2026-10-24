@@ -6,6 +6,7 @@
 #   exit-0 child  -> restarted   (the 2026-09-25 outage: a clean exit sat down for 27 min)
 #   exit-1 child  -> restarted
 #   exit-75 child -> NOT restarted, wrapper ends (the bridge's own stand-down)
+#   exit-69 child -> restarted with no alert (the bridge's poll-stall exit: an outage)
 #   deliberate window -> restart happens but no alert / no proactive result file
 #   no token      -> wrapper exits 0 at once (no child); startup-runtime's idle-job
 #                    kickstart owns that case, and a live idle PID would read as running
@@ -52,6 +53,7 @@ EOS
   alerts=$(ls "$d/ws/results"/proactive-gateway-bridge-restarted-* 2>/dev/null | wc -l | tr -d ' ')
   alive=$(cat "$d/alive.txt")
   idle=$(grep -c "nothing to run; exiting cleanly" "$d/o.log")
+  restarts=$(( restarts + $(grep -c "poll stall (rc 69); relaunching" "$d/o.log") ))
   echo "$restarts $alerts $alive $idle"
   rm -rf "$d"
 }
@@ -59,12 +61,14 @@ EOS
 read -r r0 a0 alive0 _ <<<"$(run_case 0)"
 read -r r1 a1 _ _ <<<"$(run_case 1)"
 read -r r75 _ alive75 _ <<<"$(run_case 75)"
+read -r r69 a69 _ _ <<<"$(run_case 69)"
 read -r rd ad _ _ <<<"$(run_case 0 deliberate)"
 read -r rn _ aliven idlen <<<"$(run_case 0 "" notoken)"
 
 echo "exit-0  child -> $r0 restart(s), $a0 alert file(s)   (want >0 restarts: the outage case)"
 echo "exit-1  child -> $r1 restart(s)                       (want >0)"
 echo "exit-75 child -> $r75 restart(s), wrapper alive=$alive75 (want 0 and 0: stand-down)"
+echo "exit-69 child -> $r69 restart(s), $a69 alert file(s)   (want >0 restarts, 0 alerts: a stall exit)"
 echo "deliberate    -> $rd restart(s), $ad alert file(s)    (want >0 restarts, 0 alerts)"
 echo "no token      -> $rn restart(s), wrapper alive=$aliven  (want 0 restarts, alive=0: exits 0 at once, no child)"
 
@@ -73,6 +77,8 @@ echo "no token      -> $rn restart(s), wrapper alive=$aliven  (want 0 restarts, 
 [ "$r1" -gt 0 ] || { echo "FAIL: a crashed bridge was NOT relaunched"; fail=1; }
 [ "$r75" -eq 0 ] || { echo "FAIL: a declared stand-down (rc 75) was respawned"; fail=1; }
 [ "$alive75" -eq 0 ] || { echo "FAIL: wrapper stayed alive after a stand-down"; fail=1; }
+[ "$r69" -gt 0 ] || { echo "FAIL: a poll-stall exit (rc 69) was NOT relaunched"; fail=1; }
+[ "$a69" -eq 0 ] || { echo "FAIL: a poll-stall exit queued an owner alert on every relaunch"; fail=1; }
 [ "$rd" -gt 0 ] || { echo "FAIL: deliberate window suppressed the RESTART, not just the alert"; fail=1; }
 [ "$ad" -eq 0 ] || { echo "FAIL: a restart inside the deliberate window still alerted"; fail=1; }
 [ "$rn" -eq 0 ] || { echo "FAIL: launched the bridge with no token"; fail=1; }
