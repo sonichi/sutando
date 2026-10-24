@@ -57,7 +57,8 @@ class Base(unittest.TestCase):
                     "runtime": kw.get("runtime") or "claude",
                     "cwd": kw.get("cwd") or str(repo),
                     "delivery_dir": str(Path(workspace) / "deliveries" / wid),
-                    "tmux": {"socket": "/tmp/s.sock", "session_name": f"w-{wid}"}}
+                    "tmux": {"socket": kw.get("socket") or "/tmp/s.sock",
+                             "session_name": f"w-{wid}"}}
 
         self._real_spawn, sw.spawn = sw.spawn, fake_spawn
         self.addCleanup(lambda: setattr(sw, "spawn", self._real_spawn))
@@ -271,6 +272,34 @@ class TestJsonOutput(Base):
         self.assertEqual(got["worker_id"], self.spawned[0])
         self.assertEqual(got["room"], ROOM)
         self.assertEqual(got["roster_version"], pr.load_roster(self.ws)["version"])
+
+    def test_json_coordinates_are_raw_not_shell_formatted(self):
+        socket = "/tmp/worker's $literal socket"
+        out = io.StringIO()
+        with mock.patch.object(sw, "attach_command", side_effect=AssertionError("human output only")), \
+                contextlib.redirect_stdout(out):
+            self.assertEqual(self.run_cli("--json", "--socket", socket), 0)
+        self.assertEqual(json.loads(out.getvalue())["tmux"], {
+            "socket": socket, "session_name": "w-" + self.spawned[0]})
+
+
+class TestAttachReport(Base):
+    def test_report_delegates_raw_coordinates_to_the_shared_formatter(self):
+        socket = "/tmp/worker's $literal socket"
+        out = io.StringIO()
+        with mock.patch.object(sw, "attach_command", return_value="formatted attach") as fmt, \
+                contextlib.redirect_stdout(out):
+            self.assertEqual(self.run_cli("--socket", socket), 0)
+        fmt.assert_called_once_with(socket, "w-" + self.spawned[0])
+        self.assertIn("  session   formatted attach\n", out.getvalue())
+
+    def test_partial_report_does_not_offer_placeholder_commands(self):
+        for tmux in ({}, {"socket": "/tmp/server"}, {"session_name": "worker"}):
+            with self.subTest(tmux=tmux), mock.patch.object(sw, "attach_command") as fmt:
+                report = cw.report({"worker_id": "a" * 32, "tmux": tmux},
+                                   {"version": 1, "workers": {}}, None, [])
+            fmt.assert_not_called()
+            self.assertIn("  session   unknown\n", report)
 
 
 class TestUnrosteredRecordsAreReportedNotAdopted(Base):
