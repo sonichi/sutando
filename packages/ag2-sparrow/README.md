@@ -621,22 +621,28 @@ defaults apply until one is added.
 
 When the served `target_version` is above the installed version, the keepawake
 run starts one detached upgrade per target and logs its decision on its line
-(`upgrade=off`, `current`, `no-hashes`, `0.6.0:started`, ...). The upgrade runs under
-`STATE_DIR/upgrade.lock`, which keepawake also holds while it checks and restarts
-Sparrow, and re-reads the installed version first. It copies the installed files
-to `STATE_DIR/rollback/<version>/`, stops Sparrow (SIGTERM, then waits), runs `pip
-install --no-deps --only-binary=:all: --require-hashes` pinned to every sha256 in
-`target_sha256`, requires `pip check` to run and report no new problem naming
-ag2-sparrow, re-runs `install --no-start` (which never starts the service), starts
-Sparrow, and checks it imports the target and reconnects. A reply posted while
-Sparrow is stopped waits in the results dir and is delivered once it starts. A
-failure restores the copied files, with no index and no network; the outcome is
-`rolled-back` only when the previous version runs connected again, else
-`restore-failed`, and the health row reports `upgrade-failed` either way. An
-attempt still marked started after 30 minutes counts as crashed and is restored
-first. Editable and URL installs are never upgraded. A changed hook definition is
-not applied: the hook wakes the agent once with install's `REQUIRED hook:` line.
-`AUTO_UPGRADE=0` in the install config turns self-upgrade off; install keeps it.
+(`upgrade=off`, `current`, `no-hashes`, `hand-made-service`, `0.6.0:started`, ...).
+The upgrade runs under `STATE_DIR/upgrade.lock`, which keepawake also holds while
+it checks and restarts Sparrow, and re-reads the installed version first. It
+copies the whole package namespace, hashed, to `STATE_DIR/rollback/<version>/`,
+stops Sparrow through the manager that owns it and proves it gone (a hand-made
+unit is never touched, and nothing is installed unless the stop is proven), runs
+`pip install --no-deps --only-binary=:all: --require-hashes` pinned to every
+sha256 in `target_sha256`, requires `pip check` to run and report no new problem
+naming ag2-sparrow, re-runs `install --no-start` (which never starts the service),
+starts Sparrow through the same manager, and checks it imports the target and
+reconnects. A reply posted while Sparrow is stopped waits in the results dir and
+is delivered once it starts. A failure restores the snapshot with no index and no
+network: every namespace path it does not list is removed and the files must hash
+equal to it; the outcome is `rolled-back` only when that held and the previous
+version runs connected again, else `restore-failed`, and the health row reports
+`upgrade-failed` either way. The attempt record journals each phase, so a dead
+attempt is settled before keepawake probes or restarts anything: nothing installed
+means `crashed`, files that differ from the snapshot are restored, and an
+interrupted restore resumes on the next run. Editable and URL installs are never
+upgraded. A changed hook definition is not applied: the hook wakes the agent once
+with install's `REQUIRED hook:` line. `AUTO_UPGRADE=0` in the install config turns
+self-upgrade off; install keeps it.
 
 ### Not from the single-file downloads
 
