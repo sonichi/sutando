@@ -648,8 +648,10 @@ version runs connected again, else `restore-failed`, and the health row reports
 `upgrade-failed` either way. After `restore-failed` the files are unverified, so
 Sparrow is left stopped and the hook wakes the agent once with a notice. While an
 attempt is held this way (or left in a mutating phase, or the journal
-`hatch-upgrade.json` exists but cannot be read) nothing starts Sparrow or another
-upgrade: keepawake, the upgrade decision and the upgrade worker all refuse, and the
+`hatch-upgrade.json` exists but cannot be read, including an attempt record missing
+a known outcome, a numeric time or a known phase) nothing starts Sparrow or another
+upgrade: keepawake, the upgrade decision and the upgrade worker all refuse without
+writing to the journal, so a refusal never replaces the phase that holds, and the
 failed version is never imported, not even to read its version. The owner's
 `ag2-sparrow-hatch install` lifts a `restore-failed` hold only once every installed
 file hashes equal to its RECORD and no unrecorded file sits in an `ag2_sparrow*`

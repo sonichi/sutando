@@ -74,6 +74,10 @@ UPGRADE_FAILED = _keepalive.UPGRADE_FAILED
 STALE_START_S = 30 * 60
 # Phases written under the lock; a dead attempt in one of these may have changed files.
 MUTATING_PHASES = ("installing", "installed", "restoring")
+OUTCOMES = frozenset(("started", "crashed", "rolled-back", "restore-failed", "ok", "not-started",
+                      "unsupported-install", "not-above-installed", "no-download",
+                      "no-inventory", "no-snapshot", "no-pip-check", "stop-failed"))
+PHASES = OUTCOMES | {"snapshot", "quiesced", "acknowledged", *MUTATING_PHASES}
 PIP_TIMEOUT_S = 600
 INSTALL_TIMEOUT_S = 300
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
@@ -123,10 +127,22 @@ def load_state(state_dir: Path) -> dict:
     except (OSError, ValueError) as e:
         raise JournalError(f"the upgrade journal {path} cannot be read ({type(e).__name__})") from None
     attempted = state.get("attempted", {}) if isinstance(state, dict) else None
-    if not isinstance(attempted, dict) or not all(isinstance(t, dict) for t in attempted.values()):
+    if not isinstance(attempted, dict) or not all(map(_well_formed, attempted.values())):
         raise JournalError(f"the upgrade journal {path} cannot be read (not a journal)")
     state["attempted"] = attempted
     return state
+
+
+def _well_formed(tried) -> bool:
+    """An attempt record as the writer leaves it: a known outcome, a numeric `at`, and a
+    known phase and string `from` when present."""
+    if not isinstance(tried, dict):
+        return False
+    at, phase, previous = tried.get("at"), tried.get("phase"), tried.get("from")
+    return (tried.get("outcome") in OUTCOMES
+            and isinstance(at, (int, float)) and not isinstance(at, bool)
+            and (phase is None or phase in PHASES)
+            and (previous is None or isinstance(previous, str)))
 
 
 def save_state(state_dir: Path, state: dict) -> None:
@@ -709,6 +725,15 @@ def settle_attempt(cfg: dict, state_dir: Path, now: float) -> "str | None":
     return None
 
 
+def _attempt(state_dir: Path, target: str) -> None:
+    """Give a worker run that maybe_start did not record a complete attempt record."""
+    state = load_state(state_dir)
+    if target not in state["attempted"]:
+        state["attempted"][target] = {"at": time.time(), "from": _metadata_version(),
+                                      "outcome": "started"}
+        save_state(state_dir, state)
+
+
 def _phase(state_dir: Path, target: str, phase: str, **fields) -> None:
     """Journal the step about to run, so a dead attempt is settled from where it got to."""
     state = load_state(state_dir)
@@ -832,10 +857,10 @@ def run_upgrade(cfg: dict, target: str, hashes: dict) -> str:
 def _upgrade_locked(cfg: dict, state_dir: Path, target: str, hashes: dict) -> str:
     blocked = recovery_blocked(state_dir)
     if blocked:
+        # Read-only: the journal entry that holds must survive the refusal unchanged.
         print(f"upgrade: skipped: {blocked}", file=sys.stderr)
-        with contextlib.suppress(JournalError):
-            _finish(state_dir, target, "recovery-blocked")
         return "recovery-blocked"
+    _attempt(state_dir, target)
     dist = _distribution()
     why = unsupported_install(dist)
     if why:

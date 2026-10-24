@@ -3005,6 +3005,51 @@ class Upgrade(Base):
                          [f"missing {self.site.bin / 'ag2-sparrow-hatch'}"])
         self.assertIn("not installed", self_upgrade.verify_installed(None)[0])
 
+    def keepawake_restarts(self, now=5000.0):
+        with mock.patch.object(keepalive, "listener_up", return_value=False), \
+                mock.patch.object(keepalive, "restart_listener", return_value=(True, "r")) as rl, \
+                mock.patch.object(runtime_text, "refresh_cache", return_value=None), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            rc = keepalive.keepawake(self.cfg, self.home / "log", now=now)
+        return rc, rl.call_count
+
+    def test_a_same_target_refusal_leaves_the_hold_exactly_as_it_was(self):
+        # Kewei's shape: the worker refused names the very target whose attempt holds.
+        with mock.patch.object(self_upgrade, "restore", side_effect=OSError("disk full")):
+            self.connected.side_effect = [1]
+            self.assertEqual(self.run_upgrade(self.fake()), "restore-failed")
+        path = self_upgrade.state_path(self.state)
+        holds = [path.read_text()]
+        for phase in ("installing", "installed", "restoring"):
+            state = json.loads(holds[0])
+            state["attempted"]["0.6.0"].update(phase=phase, outcome="started")
+            holds.append(json.dumps(state))
+        for journal in holds:
+            path.write_text(journal)
+            self.events.clear()
+            fake = self.fake()
+            self.assertEqual(self.run_upgrade(fake), "recovery-blocked")
+            self.assertEqual((fake.calls, self.events), ([], []))
+            self.assertEqual(path.read_text(), journal, "a refusal writes nothing")
+            self.assertIsNotNone(self_upgrade.recovery_blocked(self.state))
+            self.assertEqual(self.keepawake_restarts(), (1, 0))
+
+    def test_an_attempt_record_the_writer_cannot_produce_holds_restarts(self):
+        path = self_upgrade.state_path(self.state)
+        self.state.mkdir(parents=True, exist_ok=True)
+        for attempt in ({}, {"outcome": "started", "at": "bad"}, {"outcome": "started"},
+                        {"outcome": "started", "at": 1.0, "phase": "made-up"},
+                        {"outcome": "made-up", "at": 1.0}, {"outcome": "ok", "at": 1.0, "from": 5},
+                        {"outcome": "started", "at": True}):
+            path.write_text(json.dumps({"attempted": {"0.6.0": attempt}}))
+            self.assertIn("cannot be read", self_upgrade.recovery_blocked(self.state) or "", attempt)
+            self.assertIsNotNone(self_upgrade.failed_since(self.state), attempt)
+            self.assertEqual(self.keepawake_restarts(), (1, 0), attempt)
+        for attempt in ({"outcome": "started", "at": 1.0, "from": "0.5.4"},
+                        {"outcome": "ok", "at": 1.0, "phase": "ok", "from": "0.5.4"}):
+            path.write_text(json.dumps({"attempted": {"0.6.0": attempt}}))
+            self.assertIsNone(self_upgrade.recovery_blocked(self.state), attempt)
+
     def test_keepawake_never_restarts_on_unverified_files_or_a_failed_settlement(self):
         # A dead mutating attempt with no snapshot: restore-failed, the listener stays down.
         self.start(self.setup(), now=1000.0)
