@@ -74,10 +74,10 @@ UPGRADE_FAILED = _keepalive.UPGRADE_FAILED
 STALE_START_S = 30 * 60
 # Phases written under the lock; a dead attempt in one of these may have changed files.
 MUTATING_PHASES = ("installing", "installed", "restoring")
-OUTCOMES = frozenset(("started", "crashed", "rolled-back", "restore-failed", "ok", "not-started",
+WORKING_PHASES = ("snapshot", "quiesced", *MUTATING_PHASES)
+TERMINAL = frozenset(("crashed", "rolled-back", "restore-failed", "ok", "not-started",
                       "unsupported-install", "not-above-installed", "no-download",
                       "no-inventory", "no-snapshot", "no-pip-check", "stop-failed"))
-PHASES = OUTCOMES | {"snapshot", "quiesced", "acknowledged", *MUTATING_PHASES}
 PIP_TIMEOUT_S = 600
 INSTALL_TIMEOUT_S = 300
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
@@ -126,22 +126,42 @@ def load_state(state_dir: Path) -> dict:
         return {"attempted": {}}
     except (OSError, ValueError) as e:
         raise JournalError(f"the upgrade journal {path} cannot be read ({type(e).__name__})") from None
-    attempted = state.get("attempted", {}) if isinstance(state, dict) else None
-    if not isinstance(attempted, dict) or not all(map(_well_formed, attempted.values())):
+    if not _well_formed_journal(state):
         raise JournalError(f"the upgrade journal {path} cannot be read (not a journal)")
-    state["attempted"] = attempted
     return state
 
 
+def _legal(outcome, phase) -> bool:
+    """Whether the writer can leave an attempt at (outcome, phase): started with no phase
+    or a working phase, a terminal outcome as its own phase, or an acknowledged
+    restore-failed (clear_blocked)."""
+    if outcome == "started":
+        return phase is None or phase in WORKING_PHASES
+    if outcome == "restore-failed" and phase == "acknowledged":
+        return True
+    return outcome in TERMINAL and phase == outcome
+
+
+def _well_formed_journal(state) -> bool:
+    """The journal as save_state writes it: an `attempted` map of well-formed attempts,
+    optional `failed` and `installed` maps, and nothing else."""
+    if not isinstance(state, dict) or not isinstance(state.get("attempted"), dict):
+        return False
+    if set(state) - {"attempted", "failed", "installed"}:
+        return False
+    if any(not isinstance(state[k], dict) for k in ("failed", "installed") if k in state):
+        return False
+    return all(_well_formed(t) for t in state["attempted"].values())
+
+
 def _well_formed(tried) -> bool:
-    """An attempt record as the writer leaves it: a known outcome, a numeric `at`, and a
-    known phase and string `from` when present."""
+    """An attempt record the writer can leave: a legal (outcome, phase), a numeric `at`,
+    and a string `from` when present."""
     if not isinstance(tried, dict):
         return False
-    at, phase, previous = tried.get("at"), tried.get("phase"), tried.get("from")
-    return (tried.get("outcome") in OUTCOMES
+    at, previous = tried.get("at"), tried.get("from")
+    return (_legal(tried.get("outcome"), tried.get("phase"))
             and isinstance(at, (int, float)) and not isinstance(at, bool)
-            and (phase is None or phase in PHASES)
             and (previous is None or isinstance(previous, str)))
 
 
@@ -726,9 +746,10 @@ def settle_attempt(cfg: dict, state_dir: Path, now: float) -> "str | None":
 
 
 def _attempt(state_dir: Path, target: str) -> None:
-    """Give a worker run that maybe_start did not record a complete attempt record."""
+    """Give a worker run a started record: maybe_start's, or a fresh one in place of none
+    or of a settled attempt (a hold never reaches here: the worker refused it)."""
     state = load_state(state_dir)
-    if target not in state["attempted"]:
+    if state["attempted"].get(target, {}).get("outcome") != "started":
         state["attempted"][target] = {"at": time.time(), "from": _metadata_version(),
                                       "outcome": "started"}
         save_state(state_dir, state)
@@ -763,6 +784,8 @@ def recovery_blocked(state_dir: Path) -> "str | None":
         return f"{e}; repair it, or remove it once the installed files are verified"
     for target, tried in attempted.items():
         phase = tried.get("phase")
+        if tried.get("outcome") == "restore-failed" and phase != "acknowledged":
+            phase = "restore-failed"
         if phase in MUTATING_PHASES or phase == "restore-failed":
             return f"the upgrade to {target} left unverified files ({phase})"
     return None
