@@ -47,13 +47,15 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
+import dotspace
 from station_stamp import read_station_stamp
 
-# Hosts the bearer may be sent to. Anything else aborts rather than forwarding
-# the owner's token.
-TRUSTED_API_HOSTS = frozenset({"sutando.ag2.ai", "sutando.ag2.space"})
+# Hosts the bearer may be sent to (every configured DotSpace's cloud, plus the retired host).
+# Anything else aborts rather than forwarding the owner's token.
+TRUSTED_API_HOSTS = dotspace.trusted_cloud_hosts()
 
-DEFAULT_CLOUD_ORIGIN = "https://sutando.ag2.space"
+# This install's DotSpace's cloud; per install, not per connection (see docs/dotspace.md).
+DEFAULT_CLOUD_ORIGIN = dotspace.default_cloud_origin()
 # sutando.ag2.ai 307s to .space and clients drop Authorization across the
 # cross-origin redirect, so a bearer sent there reads back as a bogus 401.
 RETIRED_CLOUD_ORIGINS = ("https://sutando.ag2.ai",)

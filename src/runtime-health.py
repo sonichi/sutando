@@ -38,6 +38,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from tmux_probe import has_session as _tmux_has_session  # noqa: E402
 import cli_wedge  # noqa: E402 — owns the core pane target and its capture
+import dotspace  # noqa: E402 — which cloud this install's DotSpace runs
 import session_runtime  # noqa: E402 — the one reading of a session's runtime stamp
 from worker_auth_state import signed_in_since  # noqa: E402 — the one "signed in again" reading
 
@@ -275,12 +276,13 @@ def _gateway_running():
 
 # The AG2 Space desktop app runs its own engine runtime under
 # `space.ag2.app/engine`, and that engine is what serves the Station connector
-# gateway (sutando.ag2.space). Station connectors are therefore available only
+# gateway (the DotSpace's cloud origin). Station connectors are therefore available only
 # while AG2 Space is running; when it is not, Station calls fail with a bare
 # ENOTFOUND. Surfacing this lets any reader (health-check, dashboard, the agent)
 # attribute a Station failure to "AG2 Space not running" rather than guess.
 _AG2SPACE_APP_MARKER = "AG2 Space.app/Contents/MacOS"
-_STATION_GATEWAY_HOST = "sutando.ag2.space"
+_STATION_GATEWAY_HOST = dotspace.server_of_gateway_url(
+    dotspace.default_cloud_origin())
 
 
 def _ag2space_app_running():

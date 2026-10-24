@@ -19,7 +19,7 @@ EquipPanel / assignments API use).
 
 Cloud origin is declared in this skill's manifest.json `config` block (the
 config-only manifest convention in skills/MANIFEST.md) and resolved as
-`$AG2_CLOUD_ORIGIN override > manifest default > CLOUD_FALLBACK`.
+`$AG2_CLOUD_ORIGIN override > manifest default > this install's DotSpace cloud`.
 """
 
 import json
@@ -32,11 +32,19 @@ from pathlib import Path
 
 CLOUD_ENV_NAME = "AG2_CLOUD_ORIGIN"
 MANIFEST_PATH = Path(__file__).resolve().parents[1] / "manifest.json"
-# Last-resort only. The manifest's `config` block is the declared source of
-# truth for this default (skills/MANIFEST.md); this constant exists so an
-# unreadable/corrupt manifest degrades to the historical value instead of
-# crashing a cron-invoked reporter. If the two ever disagree, the manifest wins.
-CLOUD_FALLBACK = "https://sutando.ag2.space"
+
+
+def _cloud_fallback() -> str:
+    """Last resort when the manifest's `config` default is unreadable: this install's DotSpace's
+    cloud (core's dotspace). If the two disagree, the manifest wins."""
+    src = Path(os.path.realpath(__file__)).parents[3] / "src"
+    if str(src) not in sys.path:
+        sys.path.insert(0, str(src))
+    from dotspace import default_cloud_origin  # type: ignore
+    return default_cloud_origin()
+
+
+CLOUD_FALLBACK = _cloud_fallback()
 MAX_EVENTS = 100  # server cap per report
 
 
@@ -66,7 +74,7 @@ def resolve_cloud_origin(
 ) -> str:
     """Resolve the cloud origin per the skill-config precedence.
 
-    env override > manifest `config` default > CLOUD_FALLBACK.
+    env override > manifest `config` default > this install's DotSpace cloud.
 
     An env var set to the empty string is treated as UNSET rather than as an
     override to "" — an empty origin would build a garbage URL, and the shell
