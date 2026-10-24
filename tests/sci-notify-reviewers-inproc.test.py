@@ -638,6 +638,8 @@ class AskWithoutPrUrlMustNameItsRepo(unittest.TestCase):
                                   caps={"a": (None, "unverified (gh rc=1)")})
         self.assertEqual(rc, 7)
         self.assertIn("REFUSED: --repo o/private: gate capability unverified (gh rc=1)", err)
+        # --no-repo alongside --repo still probes and refuses; the advice must say so.
+        self.assertIn("drop --repo and pass --no-repo", err)
         self.assertEqual(self.sent, [], "an unchecked send is not a checked one")
 
     def test_a_valid_repo_flag_with_a_confirmed_probe_sends(self):

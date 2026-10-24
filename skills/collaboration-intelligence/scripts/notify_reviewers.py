@@ -723,7 +723,8 @@ def main() -> int:
                     # repo was read from a real PR, so only the flag refuses here.
                     print(f"REFUSED: --repo {repo}: gate capability {why_cap} for "
                           f"'{t['name']}' ({login}) — a probe that cannot answer checks "
-                          "nobody. Fix the repo name, or pass --no-repo '<reason>'.",
+                          "nobody. Fix the repo name, or drop --repo and pass "
+                          "--no-repo '<reason>'.",
                           file=sys.stderr)
                     return 7
                 if can is None:
