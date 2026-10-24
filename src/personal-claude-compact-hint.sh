@@ -10,7 +10,7 @@
 # rules and re-makes mistakes the file explicitly documents.
 #
 # This hook closes the gap: registered under the SessionStart "compact"
-# matcher (see scripts/install-personal-claude-hook.sh), it emits the
+# matcher (see build-core-settings.mjs OWNED_HOOKS), it emits the
 # resolved PERSONAL_CLAUDE.md as additionalContext so the rules re-enter
 # the fresh post-compaction window. Startup/resume are NOT matched — the
 # session-start Read (CLAUDE.md "Personal overrides") already covers them.

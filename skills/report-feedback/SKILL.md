@@ -50,8 +50,8 @@ python3 skills/report-feedback/report-feedback.py --decide <draft-id> file|file_
   death in between cannot lose the turn); that task carries the header `hitl_click: true` and the card
   label as its body — it is a click
   already recorded, not an instruction: answer `[no-send]`, do not file by hand, and let the turn end —
-  and the skill's `Stop` hook (`manifest.json` → `hooks/apply-clicks.py`, registered by
-  `bash src/install-claude-hooks.sh` like every skill hook) runs `apply_clicks()` as that turn ends.
+  and the skill's `Stop` hook (`manifest.json` → `hooks/apply-clicks.py`, registered in the
+  core's launch settings like every skill hook) runs `apply_clicks()` as that turn ends.
   `--apply` is the same routine by hand. It also registers any parked draft whose card was never created
   (a store write that failed at ask time exits 3 and keeps the draft).
 - Filing is exactly-once by markers: before the post the draft becomes `<id>.posting`; a 2xx renames it

@@ -63,10 +63,33 @@ claude_named_pids() {
   # `read -r pid _` tolerates procps -a's "pid cmdline" output too.
   pgrep -ax claude 2>/dev/null | while read -r pid _; do
     args="$(ps -p "$pid" -o args= 2>/dev/null || true)"
-    case "$args" in
-      *"--name $SESSION"*|*"--name=$SESSION"*) echo "$pid" ;;
+    [ -n "$args" ] && claude_argv_names_session "$args" && echo "$pid"
+  done
+  return 0
+}
+
+# Exact `--name $SESSION` (never `$SESSION-2`), read by the shared owner src/claude_argv.py;
+# a host with no Python (a fresh Mac) gets the owner's rule in bash: the first `--name`
+# before a bare `--` decides, nothing after `--` counts, a missing value names nothing.
+claude_argv_names_session() {
+  local args="$1" rc expect="" name="" found="" w
+  [ -n "${SESSION:-}" ] || return 1
+  if [ -n "${PY:-}" ]; then
+    "$PY" "$REPO/src/claude_argv.py" names-session "$args" "$SESSION" 2>/dev/null
+    rc=$?
+    [ "$rc" -le 1 ] && return "$rc"
+  fi
+  set -f
+  for w in $args; do
+    if [ -n "$expect" ]; then name="$w"; found=1; break; fi
+    case "$w" in
+      --) break ;;
+      --name) expect=1 ;;
+      --name=*) name="${w#--name=}"; found=1; break ;;
     esac
   done
+  set +f
+  [ -n "$found" ] && [ "$name" = "$SESSION" ]
 }
 
 claude_named_process_running() {
@@ -79,11 +102,13 @@ claude_private_socket_in_use() {
   [ -n "${SUTANDO_TMUX_SOCKET:-}" ]
 }
 
-# claude_named_pids restricted to processes running inside a pane of the tmux
-# server on $TMUX_SOCKET (the pane pid itself or one of its descendants).
+# claude_named_pids restricted to processes running inside a pane of session $SESSION on
+# $TMUX_SOCKET (the pane pid itself or one of its descendants). Session-scoped on purpose:
+# a same-name claude under another session's pane on the same socket is not this core.
+# The health probe's `_pid_outside_session_pane` applies the same invocation and walk.
 claude_named_pids_on_socket() {
   local panes pid p depth
-  panes="$(tmux -S "$TMUX_SOCKET" list-panes -a -F '#{pane_pid}' 2>/dev/null)" || return 0
+  panes="$(tmux -S "$TMUX_SOCKET" list-panes -s -t "=$SESSION" -F '#{pane_pid}' 2>/dev/null)" || return 0
   [ -n "$panes" ] || return 0
   for pid in $(claude_named_pids); do
     p="$pid"; depth=0
@@ -250,6 +275,8 @@ PY
 #    it, so a PreToolUse `deny` short-circuits the call instead of hanging.
 #  * obs collector hooks — added to the SAME JSON only when an export
 #    endpoint is set ($SUTANDO_OBS_ENDPOINT).
+#  * Sutando's own lifecycle hooks and the skill-declared ones — here and
+#    nowhere else, so only a session this launcher starts runs them.
 # Built by node helpers, not shell string interpolation (a $REPO with a space
 # or a `"` broke hand-rolled interpolation in the past). Reads REPO. Sets
 # SETTINGS_ARGS and exports SUTANDO_OBS_ENDPOINT.
@@ -272,13 +299,63 @@ resolve_claude_settings_args() {
       echo "obs hooks: settings build failed — capture disabled this session" >&2
     fi
   fi
-  CLAUDE_SETTINGS_JSON="$(node "$REPO/src/agent/claude/cli/build-core-settings.mjs" "$REPO/hooks/skip-ask-user-question.py" "$OBS_JSON" "$REPO/hooks/skill-usage-telemetry.py" "$REPO/hooks/gmail-write-guard.py" "$REPO/hooks/gdocs-write-guard.py" "$REPO/hooks/native-pim-guard.py")"
+  SKILL_HOOKS_JSON=""
+  if [ -n "${PY:-}" ]; then
+    SKILL_HOOKS_JSON="$("$PY" "$REPO/src/skill_hooks.py" "$REPO" 2>/dev/null)" \
+      || { SKILL_HOOKS_JSON=""; echo "session hooks: skill hook discovery failed — skill hooks NOT registered this session" >&2; }
+  else
+    echo "session hooks: no runnable python — skill hooks NOT registered this session" >&2
+  fi
+  CLAUDE_SETTINGS_JSON="$(node "$REPO/src/agent/claude/cli/build-core-settings.mjs" "$REPO/hooks/skip-ask-user-question.py" "$OBS_JSON" "$REPO/hooks/skill-usage-telemetry.py" "$REPO/hooks/gmail-write-guard.py" "$REPO/hooks/gdocs-write-guard.py" "$REPO/hooks/native-pim-guard.py" --owned-hooks "$REPO" --skill-hooks "$SKILL_HOOKS_JSON")" \
+    || CLAUDE_SETTINGS_JSON=""
   if [ -n "$CLAUDE_SETTINGS_JSON" ]; then
+    apply_claude_transcript_retention
     SETTINGS_ARGS=(--settings "$CLAUDE_SETTINGS_JSON")
-    echo "session hooks: AskUserQuestion guard registered (PreToolUse deny — a headless session can't answer it)"
+    echo "session hooks: AskUserQuestion guard + Sutando lifecycle and skill hooks registered for this session only"
   else
     echo "session hooks: settings build failed — AskUserQuestion guard NOT registered this session" >&2
   fi
+}
+
+# --settings outranks the user and project files, so a retention set in either is honoured by
+# dropping ours; otherwise it is seeded into the config dir that `claude -p` children inherit.
+apply_claude_transcript_retention() {
+  [ -n "${PY:-}" ] || return 0
+  local out
+  out="$(_settings_json="$CLAUDE_SETTINGS_JSON" "$PY" - "${CLAUDE_CONFIG_DIR:-}" "${SUTANDO_CLAUDE_WORKING_DIR:-$REPO}" <<'PY'
+import json, os, stat, sys, tempfile
+payload = json.loads(os.environ["_settings_json"])
+ccd, cwd = sys.argv[1], sys.argv[2]
+user = os.path.join(ccd, "settings.json") if ccd else ""
+files = [f for f in (user, os.path.join(cwd, ".claude", "settings.json"),
+                     os.path.join(cwd, ".claude", "settings.local.json")) if f]
+def load(p):
+    try:
+        d = json.load(open(p))
+    except FileNotFoundError:
+        return {}
+    except Exception:
+        return None
+    return d if isinstance(d, dict) else None
+loaded = {f: load(f) for f in files}
+own = next((f for f, d in loaded.items() if d and "cleanupPeriodDays" in d), None)
+if own:
+    payload.pop("cleanupPeriodDays", None)
+    print(f"  ✓ transcript retention: {own} sets cleanupPeriodDays; the launch settings defer to it", file=sys.stderr)
+elif user and loaded.get(user) is not None and payload.get("cleanupPeriodDays"):
+    st = dict(loaded[user], cleanupPeriodDays=payload["cleanupPeriodDays"])
+    os.makedirs(ccd, exist_ok=True)
+    mode = stat.S_IMODE(os.stat(user).st_mode) if os.path.exists(user) else 0o600
+    fd, tmp = tempfile.mkstemp(dir=ccd, prefix=".settings.json.")
+    with os.fdopen(fd, "w") as f:
+        json.dump(st, f, indent=2)
+    os.chmod(tmp, mode)
+    os.replace(tmp, user)
+    print(f"  ✓ transcript-retention seed: cleanupPeriodDays={payload['cleanupPeriodDays']} in {user}", file=sys.stderr)
+print(json.dumps(payload))
+PY
+)" && [ -n "$out" ] && CLAUDE_SETTINGS_JSON="$out" \
+    || echo "session hooks: transcript-retention step skipped (non-fatal)" >&2
 }
 
 # Claude Code's native OTel token+cost metrics. Hooks give obs EVENTS but no
@@ -381,11 +458,104 @@ forward_skill_manifest_config() {
   unset _mc_seen _mcrec
 }
 
-# Registers the post-compaction SessionStart hooks: PERSONAL_CLAUDE.md re-inject
-# and the task-watcher re-arm hint. Idempotent.
-install_claude_personal_hook() {
-  bash "$REPO/scripts/install-personal-claude-hook.sh" || echo "session-launch: personal-claude hook install failed (rc=$?) — hook may be absent" >&2
-  bash "$REPO/scripts/install-watcher-rearm-hook.sh" || echo "session-launch: watcher re-arm hook install failed (rc=$?) — hook may be absent" >&2
+# Core launch only, once no core is live: the settings-file copies are the running core's
+# only hooks until a launch whose --settings carries all of them replaces it.
+sweep_legacy_claude_hooks_for_launch() {
+  if [ "${SETTINGS_ARGS[0]:-}" != --settings ] || [ -z "${PY:-}" ]; then
+    echo "session-launch: no launch settings — legacy hook entries kept, this core runs them instead" >&2
+    return 0
+  fi
+  if ! printf '%s' "${SETTINGS_ARGS[1]}" | "$PY" "$REPO/src/claude_hooks_settings.py" launch-check --repo "$REPO"; then
+    echo "session-launch: launch settings lack a Sutando hook — legacy hook entries kept" >&2
+    return 0
+  fi
+  bash "$REPO/src/install-claude-hooks.sh" || echo "session-launch: legacy hook sweep failed (rc=$?) — old copies may still fire" >&2
+}
+
+# The one live `claude --name $SESSION` in a pane of that session on $TMUX_SOCKET: the only
+# process the sweep may count as the replacement, on the default socket too.
+live_core_pid() {
+  claude_named_pids_on_socket | head -n 1
+}
+
+# Every launch past the attach/adopt exits drops the previous core's record first: a
+# launch that ends with no settings must not leave the old record to vouch for the new core.
+retire_core_launch_record() {
+  local ws; ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" && [ -n "$ws" ] || return 0
+  rm -f "$ws/state/core-launch-settings.json"
+}
+
+# Once the new core is proven live: sweep the copies it replaced, then record what it runs.
+# A same-name core left running outside this socket still depends on the copies, so they
+# stay and the record says so (health then refuses to sweep them). Arguments: the proven
+# pid (default: the one live on this socket) and the launch mode, `tmux` or `bare`.
+settle_core_launch_hooks() {
+  local pid="${1:-}" launch="${2:-tmux}"
+  [ -n "$pid" ] || pid="$(live_core_pid)"
+  if [ -z "$pid" ]; then
+    echo "session-launch: no claude --name $SESSION in a pane of that session on $TMUX_SOCKET — legacy hook entries kept, no launch record" >&2
+    retire_core_launch_record
+    return 0
+  fi
+  if [ -n "${OUTSIDE_CORE_LIVE:-}" ]; then
+    echo "session-launch: a same-name core is live outside $TMUX_SOCKET — legacy hook entries kept, it still runs them" >&2
+  else
+    sweep_legacy_claude_hooks_for_launch
+  fi
+  record_core_launch_settings "$pid" "$launch"
+}
+
+# A launch with no tmux `exec`s claude in this very shell, so the core keeps this pid: the
+# proof it is up is pid $1's argv naming $SESSION for 10 consecutive samples (2s), the
+# bare-launch counterpart of the tmux sites' liveness poll. A helper, double-forked so it
+# is launchd's child and never claude's zombie, waits up to ~12s for that and settles
+# then; a failed exec (still bash), a death inside the window or no proof settles nothing.
+settle_bare_core_launch_hooks_after_exec() {
+  local pid="$1"
+  [ -n "${PY:-}" ] || return 0
+  ( (
+    set +e
+    seen=0
+    for _ in $(seq 1 60); do
+      sleep 0.2
+      args="$(ps -p "$pid" -o args= 2>/dev/null)"
+      [ -n "$args" ] || exit 0
+      if "$PY" "$REPO/src/claude_argv.py" names-session "$args" "$SESSION"; then
+        seen=$((seen + 1))
+        [ "$seen" -ge 10 ] && { settle_core_launch_hooks "$pid" bare; exit 0; }
+      elif [ "$seen" -gt 0 ]; then
+        exit 0
+      fi
+    done
+  ) & ) > /dev/null 2>&1
+}
+
+# The record the health probe reads for what the live core was launched with, bound to that
+# process (pid + start time + launch mode). No settings, or no live pid, retires any record instead.
+record_core_launch_settings() {
+  local pid="${1:-}" launch="${2:-tmux}" ws start
+  ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" && [ -n "$ws" ] || return 0
+  if [ "${SETTINGS_ARGS[0]:-}" != --settings ] || [ -z "${PY:-}" ] || [ -z "$pid" ]; then
+    rm -f "$ws/state/core-launch-settings.json"
+    return 0
+  fi
+  # LC_ALL=C: the health probe compares this text with a C-locale ps; a localized %c never matches.
+  start="$(LC_ALL=C ps -o lstart= -p "$pid" 2>/dev/null | sed 's/^ *//; s/ *$//')"
+  _settings_json="${SETTINGS_ARGS[1]}" _repo="$REPO" _pid="$pid" _start="$start" _session="$SESSION" \
+    _socket="$TMUX_SOCKET" _launch="$launch" _outside="${OUTSIDE_CORE_LIVE:-}" "$PY" - "$ws/state/core-launch-settings.json" <<'PY' \
+    || echo "session-launch: core launch-settings record not written (non-fatal)" >&2
+import json, os, sys, tempfile, time
+path = sys.argv[1]
+os.makedirs(os.path.dirname(path), exist_ok=True)
+rec = {"ts": int(time.time()), "repo": os.environ["_repo"], "pid": int(os.environ["_pid"]),
+       "start": os.environ["_start"], "session": os.environ["_session"], "socket": os.environ["_socket"],
+       "launch": os.environ["_launch"], "other_core_live": bool(os.environ["_outside"]),
+       "settings": json.loads(os.environ["_settings_json"])}
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".core-launch-settings.")
+with os.fdopen(fd, "w") as f:
+    json.dump(rec, f)
+os.replace(tmp, path)
+PY
 }
 
 # Creates a new tmux session running claude with the fully-assembled args, then

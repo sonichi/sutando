@@ -1,0 +1,4 @@
+{
+  "desktop_archive_cp": "cp \"$TRANSCRIPT_PATH\" \"$HOME/Desktop/sutando-conversations/$(date +%Y-%m-%dT%H-%M-%S).jsonl\"",
+  "watcher_kill_stop": "PID_FILE=\"${SUTANDO_WORKSPACE:-$HOME/.sutando/workspace}/state/watch-tasks-stream.pid\"; if [ -f \"$PID_FILE\" ]; then PID=$(cat \"$PID_FILE\" 2>/dev/null); [ -n \"$PID\" ] && kill \"$PID\" 2>/dev/null; rm -f \"$PID_FILE\"; fi; exit 0"
+}

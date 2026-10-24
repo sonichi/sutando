@@ -126,6 +126,8 @@ def _run_real_script(tmp, *args, mutate=None):
     (tmp / "src" / "quota_availability.py").write_text(
         (REPO / "src" / "quota_availability.py").read_text()
     )
+    # The authority reads the core's --name through this stdlib-only sibling; the mirror carries it.
+    (tmp / "src" / "claude_argv.py").write_text((REPO / "src" / "claude_argv.py").read_text())
     (tmp / "src" / "workspace_default.py").write_text(
         "from pathlib import Path\n"
         "def status_read_path(name):\n"

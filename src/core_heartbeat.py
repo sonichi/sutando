@@ -67,6 +67,7 @@ from workspace_default import resolve_workspace  # noqa: E402
 from tmux_probe import classify as _classify_session_probe  # noqa: E402
 import core_lineage  # noqa: E402
 import session_runtime  # noqa: E402
+from claude_argv import names_session as _argv_names_session_shared  # noqa: E402
 
 WORKSPACE = resolve_workspace()
 
@@ -249,14 +250,7 @@ def _argv_names_session(args: str, sess: str) -> bool:
     class of bug this module exists to remove. Compare the whole token instead:
     the next token after a bare `--name`, or the value after `--name=`.
     """
-    toks = args.split()
-    for i, tok in enumerate(toks):
-        if tok == "--name":
-            if i + 1 < len(toks) and toks[i + 1] == sess:
-                return True
-        elif tok.startswith("--name=") and tok[len("--name="):] == sess:
-            return True
-    return False
+    return _argv_names_session_shared(args, sess)
 
 
 # The last has-session tri-state core_pid() observed. run_forever() resets it

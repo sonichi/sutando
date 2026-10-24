@@ -2,14 +2,7 @@
 # Shared resolver for a Claude Code hook's transcript path. Source, don't exec.
 #
 # Claude Code passes transcript_path via stdin JSON ONLY — there is no
-# $TRANSCRIPT_PATH env var. Two hooks need that fact (session-handoff.sh and
-# archive-transcript.sh), and each carried its own copy of the parse until
-# #4001; the next change to hook-payload parsing would have landed on one
-# reader and missed the other silently.
-#
-# This owns RESOLUTION only. Each caller keeps its own policy for an empty
-# result — session-handoff falls through to --latest, archive-transcript exits
-# loud — so behaviour is unchanged by centralising the parse.
+# $TRANSCRIPT_PATH env var. This owns resolution; the caller decides what an empty result means.
 #
 #   resolve_hook_transcript_path "$explicit"   # echoes the path, possibly empty
 #

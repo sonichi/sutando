@@ -27,6 +27,7 @@ from typing import Any, Callable, Optional
 from urllib.parse import urlparse
 
 from workspace_default import status_read_path
+from claude_argv import names_session as _argv_names_session
 
 PROXY_PORT = 7846
 PROXY_SCHEME = "http"
@@ -308,13 +309,7 @@ def seat_env_base_url(socket_path: Optional[str], session: str,
         return SeatEnv(False, None)
 
     def _names_this_session(argv: str) -> bool:
-        toks = argv.split()
-        for i, t in enumerate(toks):
-            if t == "--name" and i + 1 < len(toks) and toks[i + 1] == session:
-                return True
-            if t == f"--name={session}":
-                return True
-        return False
+        return _argv_names_session(argv, session)
 
     matches = []
     for pid in pids:
