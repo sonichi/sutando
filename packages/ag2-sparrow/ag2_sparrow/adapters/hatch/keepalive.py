@@ -276,9 +276,12 @@ def is_sparrow_argv(argv: "list[str]") -> bool:
 
 
 def is_sparrow_pid(pid: int) -> bool:
-    """Whether `pid` runs a Sparrow command line; False when that cannot be read."""
+    """Whether `pid` runs a Sparrow command line (/proc, or sysctl on macOS); False when
+    that cannot be read."""
     cmd = _proc(pid, "cmdline")
-    return is_sparrow_argv([a.decode(errors="replace") for a in (cmd or b"").split(b"\0") if a])
+    if cmd is None:
+        return is_sparrow_argv(workspace_lock.proc_argv(pid) or [])
+    return is_sparrow_argv([a.decode(errors="replace") for a in cmd.split(b"\0") if a])
 
 
 def sparrow_env(pid: int) -> "dict[str, str] | None":
@@ -291,10 +294,28 @@ def sparrow_env(pid: int) -> "dict[str, str] | None":
     return {k.decode(errors="replace"): v.decode(errors="replace") for k, v in pairs}
 
 
-def _stop(pid: int) -> bool:
-    """SIGTERM to `pid`, then wait for it to exit; never a SIGKILL."""
+def _pidfd_open(pid: int) -> "int | None":
+    """A pidfd naming the process that has `pid` now; None where there is none (macOS, an
+    old kernel). ProcessLookupError when no process has it."""
+    opener = getattr(os, "pidfd_open", None)
+    if opener is None or not hasattr(signal, "pidfd_send_signal"):
+        return None
     try:
-        os.kill(pid, signal.SIGTERM)
+        return opener(pid)
+    except ProcessLookupError:
+        raise
+    except OSError:
+        return None
+
+
+def _stop(pid: int, handle: "int | None" = None) -> bool:
+    """SIGTERM to `pid` (through the pidfd `handle` when given), then wait for it to exit;
+    never a SIGKILL."""
+    try:
+        if handle is None:
+            os.kill(pid, signal.SIGTERM)
+        else:
+            signal.pidfd_send_signal(handle, signal.SIGTERM)
     except ProcessLookupError:
         return True
     except OSError as e:
@@ -302,6 +323,11 @@ def _stop(pid: int) -> bool:
         return False
     deadline = time.monotonic() + STOP_WAIT_S
     while time.monotonic() < deadline:
+        if handle is not None:
+            import select
+            if select.select([handle], [], [], max(0.0, deadline - time.monotonic()))[0]:
+                return True  # the pidfd turns readable when its process exits
+            continue
         if _cli.process_gone(pid):
             return True
         time.sleep(0.2)
@@ -420,6 +446,23 @@ def unproven_holder(record: "dict | None", pid: int) -> "str | None":
     return f"pid {pid} is not proven to be the process that wrote Sparrow's lock: {why}"
 
 
+def stop_proven(record: "dict | None", pid: int) -> "tuple[bool, str | None]":
+    """SIGTERM the lock holder `pid` and wait: (stopped, why it was not proven). The proof
+    (unproven_holder) is read after a pidfd is opened and the signal goes through that
+    pidfd, so it reaches the proven process or none. Without a pidfd (macOS) the proof is
+    read immediately before the bare signal."""
+    try:
+        handle = _pidfd_open(pid)
+    except ProcessLookupError:
+        return True, None
+    try:
+        why = unproven_holder(record, pid)
+        return (False, why) if why else (_stop(pid, handle), None)
+    finally:
+        if isinstance(handle, int):
+            os.close(handle)
+
+
 def _wait_gone(pid: int) -> bool:
     deadline = time.monotonic() + STOP_WAIT_S
     while not _cli.process_gone(pid):
@@ -436,8 +479,8 @@ def quiesce_sparrow(cfg: dict) -> "tuple[bool, str, str | None]":
     a lock holder beside our unit not proven to be Sparrow. For our unit the unit is
     stopped and its process, and any Sparrow outside it, must be gone; with no unit the
     lock holder is stopped (SIGTERM, then wait), a stale heartbeat notwithstanding, but
-    only once proven to be the process that wrote the lock (unproven_holder: Sparrow's
-    command line and the start time the record names), so a reused pid is never signalled."""
+    only once proven to be the process that wrote the lock (stop_proven: Sparrow's command
+    line and the start time the record names, bound to the signal by a pidfd)."""
     owner, holder, _ = resolve_sparrow(cfg)
     record = _cli._lock_record(_state_dir(cfg), _instance(cfg))
     unit = _cli.service_path()
@@ -461,17 +504,21 @@ def quiesce_sparrow(cfg: dict) -> "tuple[bool, str, str | None]":
         if main_pid and not _wait_gone(main_pid):
             return False, f"{how}, but its Sparrow (pid {main_pid}) is still running", "unit"
         if outside is not None:
-            if not _stop(outside):
+            stopped, unproven = stop_proven(record, outside)
+            if unproven:
+                return False, f"{how}; {unproven}, so it was not signalled", "unit"
+            if not stopped:
                 return False, f"the Sparrow outside {_cli.SERVICE_NAME} (pid {outside}) did not stop", "unit"
             how += f"; stopped the Sparrow outside it (pid {outside})"
         manager = "unit"
     elif holder is None:
         how, manager = "Sparrow was not running", "detached"
-    elif unproven_holder(record, holder):
-        return False, f"{unproven_holder(record, holder)}; nothing was signalled", None
-    elif not _stop(holder):
-        return False, f"Sparrow (pid {holder}) did not stop", "detached"
     else:
+        stopped, unproven = stop_proven(record, holder)
+        if unproven:
+            return False, f"{unproven}; nothing was signalled", None
+        if not stopped:
+            return False, f"Sparrow (pid {holder}) did not stop", "detached"
         how, manager = f"stopped Sparrow (pid {holder})", "detached"
     _, left, _ = resolve_sparrow(cfg)
     if left is not None:

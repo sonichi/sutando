@@ -12,6 +12,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -31,7 +32,8 @@ isolate_os_environ()
 PKG_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PKG_ROOT))
 from ag2_sparrow import (  # noqa: E402
-    __version__ as PKG_VERSION, diagnostics, gateway_credentials, gateway_instance, outbox, setup_fetch)
+    __version__ as PKG_VERSION, diagnostics, gateway_credentials, gateway_instance, outbox, setup_fetch,
+    workspace_lock)
 from ag2_sparrow.adapters.hatch import (  # noqa: E402
     cli as hatch_cli, keepalive, runtime_text, self_upgrade, task_fields)
 
@@ -3415,8 +3417,12 @@ class Quiesce(Base):
                 self.props = dict(self.props, ActiveState="inactive", MainPID=0)
             return subprocess.CompletedProcess(list(args), 0, "", "")
 
-        def term(pid):
-            self.calls.append(("term", pid))
+        def term(pid, handle=None):
+            if handle is not None and handle != (pid, self.starts.get(pid)):
+                self.calls.append(("stale-handle", pid))  # pidfd_send_signal: ESRCH
+                return True
+            self.calls.append(("term", pid) if self.starts.get(pid) in (None, "boot:100")
+                              else ("term", pid, self.starts[pid]))
             if pid in self.stubborn:
                 return False
             if pid not in self.lying:
@@ -3429,15 +3435,24 @@ class Quiesce(Base):
                    (hatch_cli, "live_lock_holder", lambda rec: (rec or {}).get("pid")
                     if self.fresh and (rec or {}).get("pid") in self.alive else None),
                    (keepalive, "is_sparrow_pid", lambda pid: pid in self.sparrow),
-                   (keepalive, "process_start", lambda pid: self.starts.get(pid)),
+                   (keepalive, "process_start", self.read_start),
+                   (keepalive, "_pidfd_open", lambda pid: (pid, self.starts.get(pid))
+                    if self.pidfd else None),
                    (hatch_cli, "_systemctl", systemctl), (keepalive, "_stop", term),
                    (keepalive, "STOP_WAIT_S", 0.3))
-        self.starts = {}
+        self.starts, self.swap, self.pidfd = {}, {}, True
         for target, name, value in patches:
             p = mock.patch.object(target, name, value if name == "STOP_WAIT_S" else
                                   mock.Mock(side_effect=value), create=True)
             p.start()
             self.addCleanup(p.stop)
+
+    def read_start(self, pid):
+        """The start time read now; a pending `swap` replaces the process right after."""
+        now = self.starts.get(pid)
+        if pid in self.swap:
+            self.starts[pid] = self.swap.pop(pid)
+        return now
 
     def holder(self, pid, fresh=True, sparrow=True, start="boot:100", recorded="same"):
         recorded = start if recorded == "same" else recorded
@@ -3537,6 +3552,62 @@ class Quiesce(Base):
         self.assertEqual(keepalive.quiesce_sparrow(self.cfg)[::2], (False, None))
         self.assertEqual(self.calls, [])
 
+    def test_a_pid_reused_between_the_proof_and_the_signal_is_never_signalled(self):
+        # Kewei's seam: the proof passes, then pid 4242 becomes another process; the
+        # pidfd opened before the proof still names the old one.
+        self.holder(4242)
+        self.swap[4242] = "boot:999"
+        quiet, how, manager = keepalive.quiesce_sparrow(self.cfg)
+        self.assertEqual((quiet, self.calls), (False, [("stale-handle", 4242)]))
+        self.assertIn("pid 4242 still holds Sparrow's lock", how)
+        # Beside our unit, the swap lands during systemctl stop: proven again at the signal.
+        for pidfd in (True, False):
+            self.calls.clear()
+            self.pidfd = pidfd
+            self.unit(0)
+            self.holder(77)
+            real = self.props
+
+            def stop_then_swap(*_a):
+                self.starts[77] = "boot:999"
+            self.calls.append(("unit",))
+            with mock.patch.object(keepalive, "_wait_gone", side_effect=lambda pid: True):
+                hatch_cli._systemctl.side_effect, orig = (
+                    lambda args, **kw: (stop_then_swap(), subprocess.CompletedProcess(
+                        list(args), 0, "", ""))[1]), hatch_cli._systemctl.side_effect
+                try:
+                    quiet, how, manager = keepalive.quiesce_sparrow(self.cfg)
+                finally:
+                    hatch_cli._systemctl.side_effect = orig
+            self.props = real
+            self.assertNotIn(("term", 77, "boot:999"), self.calls, f"pidfd={pidfd}")
+            self.assertFalse(quiet, f"pidfd={pidfd}")
+            self.assertIn("is not proven to be the process that wrote", how)
+            self.owner = None
+
+    def test_the_holder_is_signalled_through_a_handle_opened_before_its_proof(self):
+        order = []
+        self.holder(4242)
+        with mock.patch.object(keepalive, "_pidfd_open",
+                               side_effect=lambda pid: order.append("open") or (pid, "boot:100")), \
+                mock.patch.object(keepalive, "process_start",
+                                  side_effect=lambda pid: order.append("proof") or "boot:100"):
+            self.assertTrue(keepalive.quiesce_sparrow(self.cfg)[0])
+        self.assertEqual(order[:2], ["open", "proof"])
+        self.assertEqual(self.calls, [("term", 4242)])
+        # With no pidfd (macOS), the proof is read again right before the bare signal.
+        order.clear()
+        self.calls.clear()
+        self.holder(4243)
+        real_term = keepalive._stop.side_effect
+        with mock.patch.object(keepalive, "_pidfd_open", return_value=None), \
+                mock.patch.object(keepalive, "process_start",
+                                  side_effect=lambda pid: order.append("proof") or "boot:100"), \
+                mock.patch.object(keepalive, "_stop", side_effect=lambda pid, handle=None: (
+                    order.append(("signal", handle)), real_term(pid, handle))[1]):
+            self.assertTrue(keepalive.quiesce_sparrow(self.cfg)[0])
+        self.assertEqual(order, ["proof", ("signal", None)])
+
     def test_a_holder_that_ignores_sigterm_is_not_quiet(self):
         self.stubborn.add(99)
         self.holder(99)
@@ -3560,6 +3631,40 @@ class Quiesce(Base):
             self.assertEqual(keepalive.ensure_sparrow(self.cfg, health=True), 0)
         r.assert_called_once_with(self.cfg)
         self.assertEqual(self.calls, [], "a stale holder is not replaced by install")
+
+
+class RealHolder(unittest.TestCase):
+    """stop_proven against a real child: the platform's start-time source (/proc, or
+    sysctl on macOS) and its signal path (a pidfd where Linux has one)."""
+
+    def child(self):
+        p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)",
+                              "-m", "ag2_sparrow"])
+        self.addCleanup(lambda: (p.poll() is None and p.kill(), p.wait()))
+        deadline = time.monotonic() + 10
+        while workspace_lock.proc_start(p.pid) is None and time.monotonic() < deadline:
+            time.sleep(0.05)
+        return p
+
+    @unittest.skipUnless(sys.platform in ("linux", "darwin"), "no start-time source")
+    def test_a_real_holder_is_stopped_only_with_its_own_start_time(self):
+        p = self.child()
+        start = workspace_lock.proc_start(p.pid)
+        self.assertIsNotNone(start)
+        self.assertNotEqual(start, workspace_lock.proc_start(os.getpid()))
+        if sys.platform == "darwin":
+            self.assertTrue(keepalive.is_sparrow_pid(p.pid), "argv read through sysctl")
+        with mock.patch.object(keepalive, "is_sparrow_pid", return_value=True), \
+                contextlib.redirect_stderr(io.StringIO()):
+            stopped, why = keepalive.stop_proven({"pid": p.pid, "proc_start": start + "0"}, p.pid)
+            self.assertEqual(stopped, False)
+            self.assertIn("is not proven", why)
+            self.assertIsNone(p.poll(), "a mismatched start time is never signalled")
+            # Reaped as it exits, as a detached Sparrow's own parent would.
+            threading.Thread(target=p.wait, daemon=True).start()
+            self.assertEqual(keepalive.stop_proven({"pid": p.pid, "proc_start": start}, p.pid),
+                             (True, None))
+        self.assertEqual(p.wait(5), -signal.SIGTERM)
 
 
 class KeepawakeUpgrade(Base):

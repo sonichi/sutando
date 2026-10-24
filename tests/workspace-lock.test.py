@@ -94,6 +94,8 @@ class LockTest(unittest.TestCase):
         self.assertIsNone(self.mod.proc_start(78, proc), "a gone process has none")
         self.assertIsNone(self.mod.proc_start(77, self.ws / "absent"))
         start = self.mod.proc_start(os.getpid())
+        if sys.platform in ("linux", "darwin"):
+            self.assertIsNotNone(start, "macOS reads it through sysctl")
         self.mod.acquire("gw", self.ws)
         data = json.loads(self._lock_path().read_text())
         self.assertEqual(data.get("proc_start"), start)

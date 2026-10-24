@@ -631,9 +631,11 @@ an `ag2_sparrow*` entry of site-packages, and whatever already sits at a path th
 target will write. Ownership is that old RECORD plus the target inventory, never a
 name that merely appeared later, so a foreign file another installer adds meanwhile
 is neither removed nor counted. It stops Sparrow through the
-manager that owns it and proves it gone (a hand-made unit or a lock holder not
-proven to be Sparrow is never touched, and nothing is installed unless the stop
-is proven), runs
+manager that owns it and proves it gone (a hand-made unit is never touched; a lock
+holder is signalled only when it runs Sparrow's command line and has the start time
+its lock record names, read from /proc on Linux or sysctl on macOS, and on Linux the
+signal goes through a pidfd opened before that check, so it reaches that process or
+none; nothing is installed unless the stop is proven), runs
 `pip install --no-deps --only-binary=:all: --require-hashes --no-index` from the
 downloaded wheel, pinned to every sha256 in `target_sha256`, requires `pip check` to run and report no new problem
 naming ag2-sparrow, re-runs `install --no-start` (which never starts the service),
