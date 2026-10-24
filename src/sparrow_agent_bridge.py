@@ -179,9 +179,12 @@ def endpoint(decl: dict, token: str, get_key) -> "tuple[str, str]":
     """(the agent's gateway URL for a bare-secret token, '') or ('', why the bridge cannot start). A
     combined token carries its own URL: ('', ''). Only the owner-written vault key is read, never the host's
     environment or the declaration, which the agent's own session could write."""
+    key, token_key = decl["url_vault_key"], decl["token_vault_key"]
+    if _sources.token_secret_empty(token):
+        return "", (f"the token under {token_key} carries no secret: store the agent's relay token there "
+                    f"(https://<gateway>|<secret>, or a bare secret with {key})")
     if _sources.token_embeds_url(token):
         return "", ""
-    key, token_key = decl["url_vault_key"], decl["token_vault_key"]
     if _sources.token_malformed(token):
         return "", (f"the token under {token_key} starts with a gateway URL but carries no url|secret separator "
                     f"(a malformed combined token): store it again as https://<gateway>|<secret> under {token_key}")

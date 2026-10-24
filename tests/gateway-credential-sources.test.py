@@ -1960,6 +1960,9 @@ class Guard(unittest.TestCase):
                 self.assertEqual([o.token_malformed(t) for t in ("https://gw.example/relay-s", "HTTP://gw/relay",
                                                                  combined, "https://gw/relay%7Cs", "s", "")],
                                  [True, True, False, False, False, False], "a scheme with no separator is malformed")
+                self.assertEqual([o.token_secret_empty(t) for t in ("https://gw/relay|", "https://gw/relay| ", "", "  ",
+                                                                    combined, "s", "httpfoo")],
+                                 [True, True, True, True, False, False, False], "no secret on either side of '|'")
                 self.assertEqual(o.gateway_url_problem(url), "")
                 self.assertEqual(o.gateway_url_problem("http://127.0.0.1:9/relay"), "")
                 for bad in ("", "ftp://x/relay", "https://", "x.example/relay", "https://x/relay|s", "https://x /r",

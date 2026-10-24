@@ -7528,7 +7528,7 @@ def main() -> None:
         # A token that starts with a URL scheme but yielded no URL means the
         # url|secret separator was swallowed (e.g. a %7C survived decoding, or a
         _hint = (" — the token carries a gateway URL but the url|secret separator "
-                 "looks missing/corrupted" if TOKEN[:4].lower() == "http" else "")
+                 "looks missing/corrupted" if gateway_credential_sources.token_malformed(_RAW) else "")
         sys.exit("FATAL: no gateway URL — set REMOTE_TASK_URL, or use the combined "
                  f"'https://<gateway>|<secret>' onboarding token{_hint}.")
     _resolve_host_label()

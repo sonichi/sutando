@@ -630,6 +630,17 @@ class AgentEndpoint(Base):
         self.assertNotIn("tok-agent", err)
         self.assertEqual(asked, [cli.vault_key(SEG)], "its URL key is not read in place of the broken token")
 
+    def test_a_token_with_no_secret_is_refused_by_the_wrapper_and_the_preflight(self):
+        get_key = vault(token=f"{AGENT_URL}|")
+        rc, seen, err = self.started(get_key)
+        self.assertEqual((rc, seen), (1, {}))
+        self.assertIn(f"the token under {cli.vault_key(SEG)} carries no secret", err)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(bridge.main(["--preflight"], workspace=self.ws, get_key=get_key), 1)
+        self.assertIn("WILL NOT START: bridge-probe-agent-ag2-space-", out.getvalue())
+        self.assertIn("carries no secret", out.getvalue())
+
     def test_an_unusable_vault_url_is_refused_by_name(self):
         for bad in ("ftp://gw.example/relay", "https://gw.example/relay|x", "https:// gw", "gw.example", "https://"):
             with self.subTest(bad=bad):

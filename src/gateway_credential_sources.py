@@ -141,6 +141,11 @@ def token_embeds_url(token: str) -> bool:
     return bool(contract.parse_onboarding_token(token or "")[0])
 
 
+def token_secret_empty(token: str) -> bool:
+    """Whether `token` carries no secret, bare or after its url|secret separator (e.g. 'https://gw|')."""
+    return not contract.parse_onboarding_token(token or "")[1].strip()
+
+
 def token_malformed(token: str) -> bool:
     """Whether `token` starts with a URL scheme yet carries no url|secret separator: a broken combined
     token (a separator lost or still encoded), not a bare secret."""

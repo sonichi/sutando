@@ -192,6 +192,19 @@ class WakeChild(unittest.TestCase):
         self.assertNotIn("bare secret", str(cm.exception.code))
         self.assertNotIn(AGENT_SECRET, str(cm.exception.code))
 
+    def test_the_hosts_own_bridge_hints_at_a_lost_separator_only_for_a_malformed_combined_token(self):
+        dirs = dict(AGENT_CONNECT_TASK_DIR=str(self.tmp / "tasks"), AGENT_CONNECT_RESULT_DIR=str(self.tmp / "results"),
+                    AGENT_CONNECT_STATE_DIR=str(self.tmp / "state"))
+        for token, hinted in ((f"{AGENT_URL}-{AGENT_SECRET}", True), (f"httpfoo-{AGENT_SECRET}", False)):
+            with self.subTest(hinted=hinted), mock.patch.dict(os.environ, dict(dirs, REMOTE_TASK_TOKEN=token)):
+                sys.modules.pop(BRIDGE, None)
+                mod = importlib.import_module(BRIDGE)
+                with self.assertRaises(SystemExit) as cm:
+                    mod.main()
+            self.assertIn("FATAL: no gateway URL", str(cm.exception.code))
+            self.assertEqual("separator looks missing" in str(cm.exception.code), hinted, str(cm.exception.code))
+            self.assertNotIn(AGENT_SECRET, str(cm.exception.code))
+
     def test_control_the_hosts_own_bridge_wake_child_does_reload_it(self):
         # Unmarked, as the host's own bridge runs: the same sentinel sees the reload.
         env = dict(self.host, AGENT_CONNECT_TASK_DIR=str(self.tmp / "tasks"), WAKE_OUT=str(self.out),
