@@ -68,7 +68,6 @@ _VERSION_RE = re.compile(
     r"(?:\.post([0-9]{1,9}))?(?:\.dev([0-9]{1,9}))?")
 _PRE = {"a": 0, "b": 1, "rc": 2}
 _OWN_RE = re.compile(r"ag2[-_.]sparrow", re.I)
-_INFO_RE = re.compile(r"ag2[-_.]sparrow-[^/]+\.(dist|egg)-info", re.I)
 
 
 def parse_version(text) -> "tuple | None":
@@ -201,9 +200,9 @@ def _sha256(path: Path) -> str:
     return h.hexdigest()
 
 
-def _record_scope(dist) -> "tuple[Path, list[str], list[str]]":
-    """(site, roots, extra): the site dir, the top-level names RECORD puts in it, and the
-    recorded files outside it (console scripts)."""
+def _record_scope(dist) -> "tuple[Path, list[str], list[str], list[str]]":
+    """(site, roots, extra, bins): the site dir, the top-level names RECORD puts in it, the
+    recorded files outside it (console scripts) and the directories holding those."""
     site = Path(os.path.normpath(dist.locate_file("")))
     roots, extra = set(), []
     for path in _installed_paths(dist):
@@ -211,24 +210,31 @@ def _record_scope(dist) -> "tuple[Path, list[str], list[str]]":
             roots.add(path.relative_to(site).parts[0])
         except (ValueError, IndexError):
             extra.append(str(path))
-    return site, sorted(roots), sorted(set(extra))
+    bins = sorted({str(Path(p).parent) for p in extra})
+    return site, sorted(roots), sorted(set(extra)), bins
 
 
-def namespace(site: Path, roots: list, extra: list) -> "dict[str, str]":
-    """{path: sha256} of every file now under the package namespace: `roots` and any
-    ag2_sparrow-*.dist-info in `site` (whatever version), plus the `extra` files; no
-    __pycache__."""
+def namespace(site: Path, roots: list, extra: list, bins: "list | None" = None) -> "dict[str, str]":
+    """{path: sha256} of every file now under the package namespace: `roots` and every
+    top-level name in `site` that is ag2-sparrow's (any ag2_sparrow* package or
+    ag2_sparrow-*.dist-info, whatever version), the `extra` files, and every ag2-sparrow*
+    script in `bins`; so a top-level package or script the target introduced is covered.
+    No __pycache__."""
     found = {}
     site = Path(site)
     if site.is_dir():
         for child in sorted(site.iterdir()):
-            if child.name not in roots and not _INFO_RE.fullmatch(child.name):
+            if child.name not in roots and not _OWN_RE.match(child.name):
                 continue
             files = [child] if child.is_file() else sorted(
                 p for p in child.rglob("*") if p.is_file() and "__pycache__" not in p.parts)
             for path in files:
                 found[str(path)] = _sha256(path)
-    for path in map(Path, extra):
+    scripts = set(map(Path, extra))
+    for directory in map(Path, bins or []):
+        if directory.is_dir():
+            scripts.update(p for p in directory.iterdir() if _OWN_RE.match(p.name))
+    for path in sorted(scripts):
         if path.is_file():
             found[str(path)] = _sha256(path)
     return found
@@ -240,18 +246,18 @@ def snapshot(state_dir: Path, version: str, dist) -> Path:
     tmp = dest.with_name(f".{version}.{os.getpid()}")
     shutil.rmtree(tmp, ignore_errors=True)
     (tmp / "files").mkdir(parents=True)
-    site, roots, extra = _record_scope(dist)
+    site, roots, extra, bins = _record_scope(dist)
     if not roots and not extra:
         raise ValueError("the install recorded no files")
     entries = []
-    for i, (path, digest) in enumerate(sorted(namespace(site, roots, extra).items())):
+    for i, (path, digest) in enumerate(sorted(namespace(site, roots, extra, bins).items())):
         name = f"{i:05d}"
         shutil.copy2(path, tmp / "files" / name)
         entries.append({"path": path, "copy": name, "sha256": digest})
     if not entries:
         raise ValueError("the install's files are missing")
     manifest = {"version": version, "site": str(site), "roots": roots, "extra": extra,
-                "files": entries}
+                "bins": bins, "files": entries}
     (tmp / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
     shutil.rmtree(dest, ignore_errors=True)
     os.replace(tmp, dest)
@@ -274,7 +280,7 @@ def namespace_drift(state_dir: Path, version: str) -> "list[str] | None":
     except (OSError, ValueError):
         return None
     want = {e["path"]: e["sha256"] for e in manifest["files"]}
-    have = namespace(manifest["site"], manifest["roots"], manifest["extra"])
+    have = namespace(manifest["site"], manifest["roots"], manifest["extra"], manifest.get("bins"))
     return sorted([f"added {p}" for p in have.keys() - want.keys()]
                   + [f"missing {p}" for p in want.keys() - have.keys()]
                   + [f"changed {p}" for p in want.keys() & have.keys() if want[p] != have[p]])
@@ -288,7 +294,7 @@ def restore(state_dir: Path, version: str) -> None:
     site, roots, extra = manifest["site"], manifest["roots"], manifest["extra"]
     want = {e["path"]: e for e in manifest["files"]}
     emptied = set()
-    for path in map(Path, namespace(site, roots, extra)):
+    for path in map(Path, namespace(site, roots, extra, manifest.get("bins"))):
         if str(path) not in want:
             path.unlink()
             emptied.add(path.parent)
@@ -297,7 +303,8 @@ def restore(state_dir: Path, version: str) -> None:
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(snap / "files" / entry["copy"], target)
     for cache in sorted(Path(site).glob("*/**/__pycache__"), reverse=True):
-        if cache.parts[len(Path(site).parts)] in roots:
+        top = cache.parts[len(Path(site).parts)]
+        if top in roots or _OWN_RE.match(top):
             shutil.rmtree(cache, ignore_errors=True)  # the failed version's bytecode
     for directory in sorted(emptied, key=lambda d: len(d.parts), reverse=True):
         with contextlib.suppress(OSError):
@@ -458,7 +465,7 @@ def settle_attempt(cfg: dict, state_dir: Path, now: float) -> "str | None":
         at, phase = tried.get("at"), tried.get("phase")
         stale = (tried.get("outcome") == "started" and isinstance(at, (int, float))
                  and (phase is not None or now - at > STALE_START_S))
-        if not (stale or phase == "restoring"):
+        if not stale:
             continue
         previous, dist = str(tried.get("from") or ""), _distribution()
         current = dist.version if dist is not None else ""

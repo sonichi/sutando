@@ -416,7 +416,8 @@ def quiesce_sparrow(cfg: dict) -> "tuple[bool, str, str | None]":
     touched and no manager: a hand-made unit, one whose user manager did not answer, and
     a lock holder beside our unit not proven to be Sparrow. For our unit the unit is
     stopped and its process, and any Sparrow outside it, must be gone; with no unit the
-    lock holder is stopped (SIGTERM, then wait), a stale heartbeat notwithstanding."""
+    lock holder is stopped (SIGTERM, then wait), a stale heartbeat notwithstanding, but
+    only once proven to run Sparrow's command line: a reused pid is never signalled."""
     owner, holder, _ = resolve_sparrow(cfg)
     unit = _cli.service_path()
     if owner == UNIT_UNREACHABLE:
@@ -445,6 +446,9 @@ def quiesce_sparrow(cfg: dict) -> "tuple[bool, str, str | None]":
         manager = "unit"
     elif holder is None:
         how, manager = "Sparrow was not running", "detached"
+    elif not is_sparrow_pid(holder):
+        return False, (f"pid {holder} holds Sparrow's lock but is not proven to be Sparrow; "
+                       "nothing was signalled"), None
     elif not _stop(holder):
         return False, f"Sparrow (pid {holder}) did not stop", "detached"
     else:
