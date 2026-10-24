@@ -133,6 +133,42 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(ds.dotspace_for("", fetch=ds.NO_FETCH).server, "")
         self.assertEqual(ds.dotspace_for("[::1]:8448", fetch=ds.NO_FETCH).server, "::1")
 
+    def test_a_plain_server_links_via_itself_with_its_port(self):
+        d = ds.dotspace_for("!r:localhost:8448", fetch=ds.NO_FETCH)
+        self.assertEqual((d.server, d.link_via, d.source), ("localhost", "localhost:8448", "none"))
+        self.assertEqual(ds.link_via_for("!r:localhost:8448", fetch=ds.NO_FETCH), "localhost:8448")
+        self.assertEqual(ds.dotspace_for("[::1]:8448", fetch=ds.NO_FETCH).link_via, "[::1]:8448")
+        self.assertEqual(ds.dotspace_for("Matrix.ORG.", fetch=ds.NO_FETCH).link_via, "matrix.org")
+        import ag2space_links as links
+        self.assertEqual(links.room_link("!r:localhost:8448"), "https://matrix.to/#/!r:localhost:8448?via=localhost:8448")
+
+    def test_prefer_ipv4_is_parsed_strictly(self):
+        for value, want in [(True, True), (False, False), ("true", True), ("False", False), (" TRUE ", True),
+                            ("yes", True), ("0", True), (0, True), (1, True), (None, True), ([], True)]:
+            cfg = {"instances": [{"server": "p.space", "prefer_ipv4": value}]}
+            self.assertEqual(ds.dotspace_for("p.space", fetch=ds.NO_FETCH, config=cfg).prefer_ipv4, want, repr(value))
+        self.assertTrue(ds.dotspace_for("p.space", fetch=ds.NO_FETCH, config={"instances": [{"server": "p.space"}]}).prefer_ipv4)
+        for value, want in [(False, False), ("false", False), ("maybe", True), (0, True)]:
+            self.assertEqual(ds.parse_well_known(block(prefer_ipv4=value), "new.space")["prefer_ipv4"], want, repr(value))
+
+    def test_a_name_that_could_carry_a_path_userinfo_or_space_is_no_server(self):
+        """Nothing is fetched for it and it never reaches a `?via=`: a room id is attacker-chosen."""
+        import ag2space_links as links
+        for bad in ("!a:127.0.0.1/admin?x=", "!a:evil.com@169.254.169.254", "!a:evil.com#frag",
+                    "!a:two words", "chat.ag2.space/x", "@u:ag2.space/../y"):
+            f = Fetcher(block())
+            ds.reset_cache()
+            d = ds.dotspace_for(bad, fetch=f, config=NONE)
+            self.assertEqual(f.calls, [], bad)
+            self.assertEqual(d, ds.DotSpace(server=""), bad)
+            self.assertFalse(ds.is_dotspace(bad, fetch=f), bad)
+            self.assertEqual(ds.link_via_for(bad, fetch=f), "", bad)
+            self.assertEqual(f.calls, [], bad)
+            if bad.startswith(("!", "@")):
+                self.assertEqual(links.room_link(bad), f"https://matrix.to/#/{bad}", bad)
+        self.assertEqual(ds.dotspace_for("https://evil.com@169.254.169.254/", fetch=ds.NO_FETCH).server,
+                         "169.254.169.254", "a URL's userinfo is parsed off, not a host")
+
 
 class TestWellKnown(unittest.TestCase):
     def setUp(self):
@@ -341,7 +377,8 @@ class TestAg2SpaceInstallUnchanged(unittest.TestCase):
         with mock.patch.dict("os.environ", env, clear=True):
             self.assertEqual(ds.current_server(), "ag2.space")
             self.assertEqual(ds.default_cloud_origin(), "https://sutando.ag2.space")
-            self.assertTrue({"sutando.ag2.ai", "sutando.ag2.space"} <= ds.trusted_cloud_hosts())
+            self.assertEqual(ds.trusted_cloud_hosts(),
+                             frozenset({"sutando.ag2.ai", "sutando.ag2.space", "dev-sutando.ag2.space"}))
             import ag2space_links as links
             self.assertEqual(links.DEFAULT_VIA, "ag2.space")
             self.assertEqual(links.room_link("!r:ag2.space"), "https://matrix.to/#/!r:ag2.space?via=ag2.space")
@@ -443,6 +480,20 @@ class TestAg2SpaceInstallUnchanged(unittest.TestCase):
         cfg = {"instances": [{"server": "v6.space", "prefer_ipv4": False}, {"server": "v4.space"}]}
         self.assertFalse(ds.dotspace_for("v6.space", fetch=ds.NO_FETCH, config=cfg).prefer_ipv4)
         self.assertTrue(ds.dotspace_for("v4.space", fetch=ds.NO_FETCH, config=cfg).prefer_ipv4)
+        # The shipped hook itself: v4 first for a DotSpace host asking for it, untouched otherwise.
+        import socket
+        sys.path.insert(0, str(REPO / "packages" / "ag2-sparrow"))
+        from ag2_sparrow import remote_gateway_bridge as rgb
+        self.addCleanup(setattr, socket, "getaddrinfo", rgb._getaddrinfo_prefer_v4._ag2_orig_getaddrinfo)
+        self.assertTrue(rgb._prefer_v4_for("chat.ag2.space"))
+        self.assertTrue(rgb._prefer_v4_for(b"chat.s.space"))
+        self.assertFalse(rgb._prefer_v4_for("api.anthropic.com"))
+        v6 = (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("::1", 443, 0, 0))
+        v4 = (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 443))
+        with mock.patch.object(rgb, "_resolve_bounded", return_value=[v6, v4]), \
+                mock.patch.object(rgb, "_PREFER_V4", True):
+            self.assertEqual(rgb._getaddrinfo_prefer_v4("chat.ag2.space", 443), [v4])
+            self.assertEqual(rgb._getaddrinfo_prefer_v4("api.anthropic.com", 443), [v6, v4])
 
 
 class SharedCloudAgreement(unittest.TestCase):
@@ -450,6 +501,22 @@ class SharedCloudAgreement(unittest.TestCase):
     allowlist names that host: the fallback and the allowlist never disagree."""
 
     MINIMAL = {"instances": [{"server": "s.space", "gateway_host": "chat.s.space"}]}
+    # The legacy server registered, Cloud unset: the instances list must not empty the fallback.
+    LEGACY_NO_CLOUD = {"instances": [{"server": "ag2.space", "gateway_host": "chat.ag2.space"}]}
+
+    def test_the_shared_production_cloud_is_a_constant_not_an_instances_entry(self):
+        self.assertEqual(ds.PRODUCTION_CLOUD_ORIGIN, "https://sutando.ag2.space")
+        self.assertEqual(ds.legacy_dotspace(self.LEGACY_NO_CLOUD).cloud_origin, "")
+        for env in ({"AGENT_MXID": "@a:ag2.space"}, {"AGENT_MXID": "@a:s.space"}, {}):
+            self.assertEqual(ds.default_cloud_origin(env, config=self.LEGACY_NO_CLOUD), ds.PRODUCTION_CLOUD_ORIGIN, env)
+        self.assertEqual(ds.trusted_cloud_hosts(self.LEGACY_NO_CLOUD), frozenset({"sutando.ag2.space", ds.LEGACY_CLOUD_HOST}))
+        self.assertIn("sutando.ag2.space", ds.trusted_cloud_hosts({"instances": []}))
+        # A legacy entry with its own Cloud still wins the fallback, and both hosts are allowlisted.
+        moved = {"instances": [{"server": "ag2.space", "cloud_origin": "https://cloud.ag2.space"}]}
+        self.assertEqual(ds.default_cloud_origin({"AGENT_MXID": "@a:s.space"}, config=moved), "https://cloud.ag2.space")
+        self.assertEqual(ds.trusted_cloud_hosts(moved), frozenset({"cloud.ag2.space", "sutando.ag2.space", ds.LEGACY_CLOUD_HOST}))
+        import cloud_auth
+        self.assertIs(cloud_auth.PRODUCTION_CLOUD_ORIGIN, ds.PRODUCTION_CLOUD_ORIGIN)
 
     def test_only_s_space_registered_and_no_cloud_uses_the_shared_production_cloud(self):
         env = {"AGENT_MXID": "@a:s.space"}
@@ -460,11 +527,114 @@ class SharedCloudAgreement(unittest.TestCase):
 
     def test_the_fallback_host_is_always_allowlisted(self):
         for cfg in (self.MINIMAL, {"instances": []}, None,
-                    {"instances": [{"server": "s.space", "cloud_origin": "https://sutando.s.space"}]}):
+                    {"instances": [{"server": "s.space", "cloud_origin": "https://sutando.s.space"}]},
+                    {"instances": [{"server": "ag2.space", "gateway_host": "chat.ag2.space"}]}):
             for env in ({"AGENT_MXID": "@a:s.space"}, {"AGENT_MXID": "@a:ag2.space"}, {}):
                 origin = ds.default_cloud_origin(env, config=cfg)
                 self.assertTrue(origin, (cfg, env))
                 self.assertIn(ds.server_of_gateway_url(origin), ds.trusted_cloud_hosts(cfg), (cfg, env))
+
+
+class TestFetchAndHelpers(unittest.TestCase):
+    """The real fetch and the helpers the hot paths bypass: each branch runs at least once."""
+
+    def setUp(self):
+        ds.reset_cache()
+
+    def test_url_parsing_failures_and_the_no_fetch_stub(self):
+        self.assertEqual(ds.server_of_gateway_url("https://[::1"), "", "urlsplit's ValueError reads as no host")
+        self.assertIsNone(ds.NO_FETCH("https://new.space/.well-known/matrix/client", 1.5))
+
+    def test_the_fetch_runs_inside_the_packages_gateway_context_when_present(self):
+        import contextlib
+        import types
+        seen = []
+        fake = types.ModuleType("gateway_instance")
+
+        @contextlib.contextmanager
+        def gateway_call(url):
+            seen.append(url)
+            yield
+        fake.gateway_call = gateway_call
+        with mock.patch.dict(sys.modules, {"gateway_instance": fake}):
+            with ds._gateway_call("https://x.example/w"):
+                pass
+        self.assertEqual(seen, ["https://x.example/w"])
+
+    def test_an_absent_config_loader_means_the_built_in_default(self):
+        with mock.patch.dict(sys.modules, {"sutando_config": None}):
+            self.assertIsNone(ds._loaded_section())
+            self.assertTrue(ds.dotspace_for("ag2.space", fetch=ds.NO_FETCH).is_dotspace)
+
+    def test_a_waiter_on_the_fetch_slot_reads_the_answer_the_fetch_cached(self):
+        import threading
+        import time
+        real, entering, results = threading.Lock(), threading.Event(), []
+
+        class Slot:
+            def __enter__(self):
+                entering.set()
+                return real.__enter__()
+
+            def __exit__(self, *exc):
+                return real.__exit__(*exc)
+        f = Fetcher(block())
+        with mock.patch.object(ds, "_fetch_slot", Slot()):
+            real.acquire()  # a fetch for new.space is in flight
+            t = threading.Thread(target=lambda: results.append(ds.dotspace_for("new.space", fetch=f, config=NONE)))
+            t.start()
+            self.assertTrue(entering.wait(5), "the waiter missed the cache and reached the slot")
+            with ds._cache_lock:  # the in-flight fetch lands its answer, then releases the slot
+                ds._cache["new.space"] = (time.monotonic() + 60, ds.parse_well_known(block(), "new.space"))
+            real.release()
+            t.join(5)
+        self.assertEqual(f.calls, [], "the waiter never fetched again")
+        self.assertEqual([r.source for r in results], ["well-known-unverified"])
+
+    def test_default_fetch_reads_200_drops_other_statuses_and_refuses_a_redirect(self):
+        """Against a real local server, so dropping `_NoRedirect()` would fail here: the 302's
+        target is never requested and the redirecting answer is no document."""
+        import http.server
+        import threading
+        import urllib.error
+        requested = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                requested.append(self.path)
+                if self.path == "/redirect":
+                    self.send_response(302)
+                    self.send_header("Location", "/target")
+                    self.end_headers()
+                elif self.path == "/empty":
+                    self.send_response(204)
+                    self.end_headers()
+                else:
+                    body = block().encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+
+            def log_message(self, *a):
+                pass
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            base = f"http://127.0.0.1:{srv.server_address[1]}"
+            text = _REAL_FETCH(base + "/.well-known/matrix/client", 5)
+            self.assertEqual(ds.parse_well_known(text, "new.space")["server"], "new.space")
+            self.assertIsNone(_REAL_FETCH(base + "/empty", 5))
+            with self.assertRaises(urllib.error.HTTPError) as cm:
+                _REAL_FETCH(base + "/redirect", 5)
+            cm.exception.close()
+            self.assertEqual(cm.exception.code, 302)
+        finally:
+            srv.shutdown()
+            srv.server_close()
+        self.assertEqual(requested, ["/.well-known/matrix/client", "/empty", "/redirect"])
+        self.assertNotIn("/target", requested)
 
 
 if __name__ == "__main__":

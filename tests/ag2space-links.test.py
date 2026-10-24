@@ -61,6 +61,30 @@ class TestShapes(unittest.TestCase):
                 links.surface_link(origin, room, "database")
 
 
+class TestModuleSurface(unittest.TestCase):
+    def test_default_via_is_resolved_on_each_read_and_other_names_are_absent(self):
+        with mock.patch.object(links.dotspace, "default_link_via", return_value="v.test") as dlv:
+            self.assertEqual(links.DEFAULT_VIA, "v.test")
+            self.assertEqual(links.DEFAULT_VIA, "v.test")
+        self.assertEqual(dlv.call_count, 2)
+        with self.assertRaises(AttributeError):
+            links.NO_SUCH_NAME
+
+    def test_imported_by_file_path_without_src_on_the_path_it_finds_its_sibling_resolver(self):
+        src = (REPO / "src").resolve()
+        saved_path, saved_mod = sys.path[:], sys.modules.pop("dotspace", None)
+        try:
+            sys.path[:] = [p for p in sys.path if Path(p or ".").resolve() != src]
+            mod = _load("ag2space_links_by_path", "src/ag2space_links.py")
+            self.assertEqual(Path(mod.dotspace.__file__).resolve(), src / "dotspace.py")
+            self.assertEqual(mod.room_link("!r:s.space"), "https://matrix.to/#/!r:s.space?via=s.space")
+        finally:
+            sys.path[:] = saved_path
+            sys.modules.pop("dotspace", None)
+            if saved_mod is not None:
+                sys.modules["dotspace"] = saved_mod
+
+
 class TestCallersDelegate(unittest.TestCase):
     def test_cron_notify_deep_link_is_room_link(self):
         with mock.patch.object(cron, "room_link", return_value="L") as rl:

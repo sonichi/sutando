@@ -13,6 +13,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parent.parent
 SCRIPT = REPO / "skills" / "skill-usage-report" / "scripts" / "report-usage.py"
@@ -61,6 +62,39 @@ class StandaloneImport(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         out = json.loads(r.stdout.strip().splitlines()[-1])
         self.assertEqual(out["fallback"], "")
+
+
+def _load_without_core(path=SCRIPT, env=None):
+    """The script imported in THIS process with core's resolver unimportable, as a standalone
+    install sees it; the caller restores sys.modules."""
+    import importlib.util
+    with mock.patch.dict(sys.modules, {"dotspace": None}), \
+            mock.patch.dict(os.environ, env or {}, clear=False):
+        for k in [k for k in os.environ if k.startswith("AG2_CLOUD") and k not in (env or {})]:
+            del os.environ[k]
+        spec = importlib.util.spec_from_file_location("report_usage_standalone", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+    return mod
+
+
+class StandaloneImportInProcess(unittest.TestCase):
+    """The same contract measured in-process: the manifest fallback branch and the skip."""
+
+    def test_without_core_the_fallback_is_the_manifest_default(self):
+        mod = _load_without_core()
+        declared = json.loads(MANIFEST.read_text())["config"]["AG2_CLOUD_ORIGIN"]
+        self.assertEqual((mod.CLOUD_FALLBACK, mod.CLOUD), (declared, declared))
+        self.assertEqual(mod._cloud_fallback(), declared)
+
+    def test_main_skips_cleanly_when_no_cloud_origin_is_known(self):
+        import contextlib
+        import io
+        mod = _load_without_core()
+        out = io.StringIO()
+        with mock.patch.object(mod, "CLOUD", ""), contextlib.redirect_stdout(out):
+            self.assertEqual(mod.main(), 0)
+        self.assertIn("no cloud origin known", out.getvalue())
 
 
 if __name__ == "__main__":

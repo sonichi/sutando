@@ -14,10 +14,12 @@ who operates it. Whether a server IS a DotSpace is therefore decided by the regi
   1. the config section `core.dotspace.instances` (sutando.config.json), a list of
      {server, gateway_host, cloud_origin?, link_via?, prefer_ipv4?}. `DEFAULT_INSTANCES`
      applies when the section is absent, so today's installs behave as before. A registered
-     server costs no network round trip. `cloud_origin` is set only where that instance has
-     its own Sutando Cloud (today ag2.space and dev.ag2.space); whether Cloud is per DotSpace
-     or shared is undecided, so the other defaults carry none and callers fall back to the
-     production origin.
+     server is trusted without any round trip; an explicit `dotspace_for(server)` with the
+     real fetch still reads its well-known, only to fill the fields config left unset.
+     `cloud_origin` is set only where that instance has its own Sutando Cloud (today
+     ag2.space and dev.ag2.space); whether Cloud is per DotSpace or shared is undecided, so
+     the other defaults carry none and callers fall back to the shared production Cloud,
+     `PRODUCTION_CLOUD_ORIGIN`, which no instances list can empty.
   2. the homeserver's own declaration, `https://<host>/.well-known/matrix/client`, in an AG2
      block under the key `space.ag2.dotspace`, is CAPABILITY DISCOVERY, never classification::
 
@@ -36,9 +38,9 @@ who operates it. Whether a server IS a DotSpace is therefore decided by the regi
      naming its homeserver). `server`, when present, must be that host or its parent domain,
      one label up and itself dotted (`attacker.space` cannot claim `space`); `gateway_url`,
      `link_via`, `cloud_origin` and `mcp_url` must sit at or under that server; any other block
-     is refused. For a REGISTERED server the block fills what config left unset (gateway_host,
-     mcp_url, link_via, prefer_ipv4); cloud_origin never comes from it, so the hosts a bearer
-     may be sent to are config's alone. For an unregistered server it yields operator "" and
+     is refused. For a REGISTERED server the block only fills what config left unset
+     (gateway_host, mcp_url, link_via, prefer_ipv4); cloud_origin never comes from it, so the
+     hosts a bearer may be sent to are config's alone. For an unregistered server it yields operator "" and
      source "well-known-unverified": the discovered gateway_host and mcp_url, no AG2
      behaviour. No server publishes this block yet: the fetch is injectable, cached and
      bounded (`WELL_KNOWN_TIMEOUT_S`), and any failure falls through. Only an explicit
@@ -48,7 +50,8 @@ who operates it. Whether a server IS a DotSpace is therefore decided by the regi
      URL the credential owner resolved): the bridge talks to no other host, so that host is a
      DotSpace gateway by construction (`source="token"`). The resolver reads no token variable.
   4. nothing: a plain Matrix server is not a DotSpace (operator "", source "none"): no cloud,
-     link via itself.
+     link via itself (port included). A name carrying `/`, `?`, `#`, `@` or whitespace is no
+     server at all: nothing is fetched for it and it never reaches a URL.
 
 Standard library only: skills import it without the rest of core, and the ag2-sparrow package
 bundles it verbatim (tools/sync_from_src.py), where the config loader is absent and 2. is the
@@ -79,12 +82,17 @@ WELL_KNOWN_NEGATIVE_TTL_S = 900.0
 # install's own server is unknown.
 LEGACY_SERVER = "ag2.space"
 LEGACY_CLOUD_HOST = "sutando.ag2.ai"
+# The shared production Sutando Cloud: the fallback of every instance without a Cloud of its
+# own and the home of every pre-scoping credential. A constant, so no instances list empties it.
+PRODUCTION_CLOUD_ORIGIN = "https://sutando.ag2.space"
 CONFIG_SECTION = "dotspace"
 CONFIG_LIST = "instances"
+# A host name that could carry a path, query, fragment, userinfo or whitespace into a URL.
+_UNSAFE_HOST = re.compile(r"[/?#@\s]")
 
 DEFAULT_INSTANCES: Tuple[Dict[str, str], ...] = (
     {"server": "ag2.space", "gateway_host": "chat.ag2.space",
-     "cloud_origin": "https://sutando.ag2.space"},
+     "cloud_origin": PRODUCTION_CLOUD_ORIGIN},
     {"server": "dev.ag2.space", "gateway_host": "dev-chat.ag2.space",
      "cloud_origin": "https://dev-sutando.ag2.space"},
     {"server": "s.space", "gateway_host": "chat.s.space"},
@@ -160,6 +168,15 @@ def _host_only(server: str) -> str:
     if s.count(":") == 1:
         s = s.split(":", 1)[0]
     return s
+
+
+def _bool(value: Any, default: bool) -> bool:
+    """A real boolean, or the strings "true"/"false" in any case; anything else is `default`."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value.strip().lower() in ("true", "false"):
+        return value.strip().lower() == "true"
+    return default
 
 
 # ------------------------------------------------------------- well-known
@@ -239,7 +256,7 @@ def parse_well_known(text: Optional[str], fetched_host: str) -> Optional[Dict[st
         "cloud_origin": cloud_origin,
         "mcp_url": mcp_url,
         "link_via": link_via,
-        "prefer_ipv4": bool(block.get("prefer_ipv4", True)),
+        "prefer_ipv4": _bool(block.get("prefer_ipv4"), True),
     }
 
 
@@ -330,7 +347,7 @@ def _entry_dotspace(entry: Mapping[str, Any], source: str) -> DotSpace:
         link_via=_host_only(str(entry.get("link_via") or "")) or server,
         cloud_origin=_origin(entry.get("cloud_origin")),
         mcp_url=str(entry.get("mcp_url") or "").strip(),
-        prefer_ipv4=bool(entry.get("prefer_ipv4", True)),
+        prefer_ipv4=_bool(entry.get("prefer_ipv4"), True),
         source=source,
     )
 
@@ -353,9 +370,10 @@ def dotspace_for(server_or_host: str, *, fetch: Optional[Fetch] = None,
     raw = (server_or_host or "").strip()
     if raw.lower().startswith(("http://", "https://")):
         raw = server_of_gateway_url(raw)
-    host = _host_only(server_of_matrix_id(raw) or raw)
-    if not host:
-        return DotSpace(server="")
+    name = (server_of_matrix_id(raw) or raw).strip().lower().rstrip(".")
+    host = _host_only(name)
+    if not host or _UNSAFE_HOST.search(name):
+        return DotSpace(server="")  # no server: nothing to fetch, nothing to put in a URL
     fetch = default_fetch if fetch is None else fetch
     # The most specific server wins: `chat.dev.s.space` is dev.s.space's gateway, not s.space's.
     matched = [e for e in _config_entries(config) if _matches(e, host)]
@@ -376,7 +394,7 @@ def dotspace_for(server_or_host: str, *, fetch: Optional[Fetch] = None,
     if gateway and host == gateway:
         return DotSpace(server=host, operator=OPERATOR_AG2, gateway_host=host, link_via=host,
                       prefer_ipv4=True, source="token")
-    return DotSpace(server=host, link_via=host)
+    return DotSpace(server=host, link_via=name)  # a plain server links via itself, port kept
 
 
 def is_dotspace(server_or_host: str, *, fetch: Optional[Fetch] = None,
@@ -399,9 +417,10 @@ def cloud_origin_for(server: str, *, fetch: Optional[Fetch] = None,
 def trusted_cloud_hosts(config: Optional[Mapping[str, Any]] = None) -> frozenset:
     """Hosts a Sutando Cloud bearer may be sent to: every CONFIGURED instance's cloud origin (a
     well-known declaration never widens this), the shared production Cloud that an instance with
-    no cloud of its own falls back to (so the fallback and this allowlist always agree), and the
-    retired production host."""
-    hosts = {LEGACY_CLOUD_HOST}
+    no cloud of its own falls back to (`PRODUCTION_CLOUD_ORIGIN`, and the legacy entry's when
+    config gives it one, so the fallback and this allowlist always agree), and the retired
+    production host."""
+    hosts = {LEGACY_CLOUD_HOST, server_of_gateway_url(PRODUCTION_CLOUD_ORIGIN)}
     shared = server_of_gateway_url(legacy_dotspace(config).cloud_origin)
     if shared:
         hosts.add(shared)
@@ -427,11 +446,11 @@ def default_link_via(env: Optional[Mapping[str, str]] = None) -> str:
 
 def default_cloud_origin(env: Optional[Mapping[str, str]] = None,
                          config: Optional[Mapping[str, Any]] = None) -> str:
-    """Sutando Cloud for this install: its server's DotSpace's, else the shared production one
-    (an instance with no cloud of its own uses the shared Cloud; `trusted_cloud_hosts` lists it).
-    Config only, never a fetch (callers read this at import)."""
+    """Sutando Cloud for this install: its server's DotSpace's, else the legacy entry's, else
+    `PRODUCTION_CLOUD_ORIGIN` (an instance with no cloud of its own uses the shared Cloud;
+    `trusted_cloud_hosts` lists it). Config only, never a fetch (callers read this at import)."""
     own = cloud_origin_for(current_server(env), fetch=NO_FETCH, config=config)
-    return own or legacy_dotspace(config).cloud_origin
+    return own or legacy_dotspace(config).cloud_origin or PRODUCTION_CLOUD_ORIGIN
 
 
 # ----------------------------------------------------------------- install
