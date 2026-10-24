@@ -141,36 +141,44 @@ int main(int argc, char **argv) {
         except PermissionError:
             return False  # the pid was reaped and reused by another user's process
 
+    reap_seconds = WAIT_SECONDS
+
     def stop_server(self):
-        # Teardown timing alone never fails the test; the kill-server below runs regardless.
+        # Teardown timing alone never fails the test; whatever it could not reap is recorded instead.
+        record = {"server_pid": self.server.pid, "timeouts": []}
         try:
             panes = self.tmux("list-panes", "-a", "-F", "#{pane_pid}")
             self.pids.update(int(p) for p in panes.stdout.split() if p.isdigit())
         except subprocess.TimeoutExpired:
-            pass
+            record["timeouts"].append("list-panes")
         for pid in self.pids:
             try:
                 os.kill(pid, signal.SIGTERM)
             except (ProcessLookupError, PermissionError):
                 pass
-        self.poll_until(lambda: all(not self.alive(pid) for pid in self.pids))
-        for _ in range(3):
+        record["panes_absent"] = self.poll_until(
+            lambda: all(not self.alive(pid) for pid in self.pids), self.reap_seconds)
+        for attempt in range(3):
             try:
                 self.tmux("kill-server")
             except subprocess.TimeoutExpired:
-                pass
+                record["timeouts"].append(f"kill-server-{attempt}")
             try:
-                self.server.wait(timeout=WAIT_SECONDS / 3)
+                self.server.wait(timeout=self.reap_seconds / 3)
                 break
             except subprocess.TimeoutExpired:
-                continue
+                record["timeouts"].append(f"server-wait-{attempt}")
         else:
             self.server.kill()
-            self.server.wait(timeout=WAIT_SECONDS)
-        self.assertIsNotNone(self.server.returncode)
-        (self.diagnostics / "restart-cleanup.json").write_text(json.dumps({
-            "server_pid": self.server.pid, "server_reaped": True,
-            "pane_pids": sorted(self.pids), "panes_absent": all(not self.alive(p) for p in self.pids)}))
+            try:
+                self.server.wait(timeout=self.reap_seconds)
+            except subprocess.TimeoutExpired:
+                record["timeouts"].append("server-wait-after-kill")
+        record["server_reaped"] = self.server.returncode is not None
+        record["pane_pids"] = sorted(self.pids)
+        record["surviving_pane_pids"] = sorted(p for p in self.pids if self.alive(p))
+        (self.diagnostics / "restart-cleanup.json").write_text(json.dumps(record, indent=2))
+        return record
 
     def call_main(self, module, args, log_name):
         out, err = io.StringIO(), io.StringIO()
@@ -217,7 +225,8 @@ int main(int argc, char **argv) {
         name = wi.tmux_session_name(wid)
         before = self.observe(name, a, a_dir)
         os.kill(before["pid"], signal.SIGTERM)
-        self.wait_for(lambda: not self.alive(before["pid"]))
+        gone = self.poll_until(lambda: not self.alive(before["pid"]))
+        self.assertTrue(gone, f"pane pid {before['pid']} survived SIGTERM for {WAIT_SECONDS} s")
         self.wait_for(lambda: sw.session_state(name, str(self.socket)) == "absent")
         runs = wi.incarnations(self.ws, wid)
         with mock.patch.dict(os.environ, {"SUTANDO_TMUX_SOCKET": str(self.root / "wrong.sock")}):
@@ -239,6 +248,31 @@ int main(int argc, char **argv) {
         (self.diagnostics / "restart-continuity.json").write_text(json.dumps({
             "synthetic_endpoint": True, "socket": str(self.socket), "worker_id": wid,
             "before": before, "after": after, "result": restarted, "already_running": again}, indent=2))
+
+
+class StopServerFaultInjection(unittest.TestCase):
+    """A final-reap TimeoutExpired is recorded with the surviving pane pids, never raised."""
+
+    def test_a_final_wait_timeout_is_recorded_not_raised(self):
+        case = RestartSessionContinuity("test_explicit_resume_then_restart_keeps_a_and_its_recorded_folder")
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        server = mock.Mock(pid=4242, returncode=None)
+        server.wait.side_effect = subprocess.TimeoutExpired("tmux", 0)
+        case.server, case.diagnostics, case.pids, case.reap_seconds = server, Path(td.name), {4243}, 0.01
+        with mock.patch.object(case, "tmux", side_effect=subprocess.TimeoutExpired("tmux", 0)), \
+                mock.patch.object(case, "alive", return_value=True), \
+                mock.patch.object(os, "kill") as kill:
+            record = case.stop_server()
+        kill.assert_called_once_with(4243, signal.SIGTERM)
+        server.kill.assert_called_once()
+        self.assertEqual(server.wait.call_count, 4)
+        self.assertEqual(record["timeouts"], ["list-panes", "kill-server-0", "server-wait-0",
+                                              "kill-server-1", "server-wait-1", "kill-server-2",
+                                              "server-wait-2", "server-wait-after-kill"])
+        self.assertEqual((record["panes_absent"], record["server_reaped"]), (False, False))
+        self.assertEqual(record["surviving_pane_pids"], [4243])
+        self.assertEqual(json.loads((Path(td.name) / "restart-cleanup.json").read_text()), record)
 
 
 class Restart(unittest.TestCase):
