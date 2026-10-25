@@ -199,7 +199,7 @@ def connections_http(method: str, path: str, body: dict, query: Optional[dict] =
     parts = [x for x in path[len(CONNECTIONS_PREFIX):].split("/") if x]
     try:
         if method == "GET" and not parts:
-            rows = _connections.list_connections(ws)
+            rows = _connections.list_connections(ws, vault=vault)
             return 200, {"connections": [_connections.status_for(r, ws) for r in rows]}
         if method == "POST" and not parts:
             token = body.get("token")
