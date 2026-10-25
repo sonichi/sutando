@@ -1,6 +1,6 @@
 """Where sparrowd's control socket lives — the one function every server and client calls.
 
-The natural path is `<state dir>/sparrowd.sock`. A Unix socket path is capped by `sun_path`
+The natural path is `<state dir>/sparrowd.sock`, the state dir resolved. A Unix socket path is capped by `sun_path`
 (104 bytes on macOS, 108 on Linux, counting the terminator), so a long workspace path cannot
 bind there. Such a state dir gets a short, deterministic, per-instance path instead:
 `/tmp/ag2-sparrow-<uid>/<hash of the state dir>.sock`, inside a 0700 directory this user owns.
@@ -33,9 +33,8 @@ def short_dir(uid: Optional[int] = None, root: Optional[str] = None) -> Path:
     return Path(root or SHORT_ROOT) / f"ag2-sparrow-{os.getuid() if uid is None else uid}"
 
 
-def _short_name(state_dir) -> str:
-    key = os.path.realpath(os.fspath(state_dir)).encode("utf-8", "surrogateescape")
-    return hashlib.sha256(key).hexdigest()[:16] + ".sock"
+def _short_name(resolved: Path) -> str:
+    return hashlib.sha256(os.fsencode(str(resolved))).hexdigest()[:16] + ".sock"
 
 
 def ensure_private_dir(path: Path, uid: Optional[int] = None, create: bool = True) -> None:
@@ -64,11 +63,13 @@ def control_socket_path(state_dir, *, create: bool = False, uid: Optional[int] =
                         root: Optional[str] = None) -> Path:
     """The control socket for `state_dir`. A short path's directory is always owner-checked;
     with `create` (the server) it is made 0700 first, a client only reads."""
-    natural = Path(state_dir) / SOCKET_NAME
+    # One resolved spelling decides both the fit and the hash, so every caller agrees.
+    resolved = Path(os.path.realpath(os.fspath(state_dir)))
+    natural = resolved / SOCKET_NAME
     if fits(natural):
         return natural
     directory = short_dir(uid, root)
-    path = directory / _short_name(state_dir)
+    path = directory / _short_name(resolved)
     if not fits(path):
         raise ControlSocketPathError(f"no control socket path fits {SUN_PATH_MAX} bytes under {directory}")
     ensure_private_dir(directory, uid, create)

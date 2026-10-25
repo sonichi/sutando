@@ -133,9 +133,22 @@ class LongWorkspace(Base):
 
     def test_a_path_that_fits_keeps_the_natural_location(self):
         state = self.td / "s"
-        self.assertEqual(cs.control_socket_path(state, create=True), state / cs.SOCKET_NAME)
+        self.assertEqual(cs.control_socket_path(state, create=True), Path(os.path.realpath(state)) / cs.SOCKET_NAME)
         self.assertFalse((self.root / f"ag2-sparrow-{os.getuid()}").exists(), "no short dir made")
 
+
+    def test_every_spelling_of_one_state_dir_gets_one_socket(self):
+        state = self.long_state()
+        link = self.td / "l"
+        link.symlink_to(state)
+        self.assertEqual(cs.control_socket_path(link), cs.control_socket_path(state))
+        short = self.td / "fits"
+        short.mkdir()
+        # A short alias of a long dir must not pick the natural path the long spelling cannot bind.
+        alias = self.td / "z"
+        alias.symlink_to(state)
+        self.assertNotEqual(cs.control_socket_path(alias).parent, alias)
+        self.assertEqual(cs.control_socket_path(short / ".." / "fits"), cs.control_socket_path(short))
 
     def test_a_client_of_a_missing_short_dir_gets_the_path_without_creating_it(self):
         state = self.long_state()
