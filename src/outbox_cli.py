@@ -60,7 +60,8 @@ def _emit(obj, as_json: bool, where=None) -> None:
                   f"attempts={rec.get('attempts',0)} "
                   f"epoch={rec.get('resend_epoch',0)} "
                   f"{rec.get('item_id','?')}"
-                  + (f"  reason={rec['reason']}" if rec.get("reason") else ""))
+                  + (f"  reason={rec['reason']}" if rec.get("reason") else "")
+                  + (f"  file={rec['file']}" if rec.get("file") else ""))
         return
     for k in sorted(obj):
         print(f"{k}: {obj[k]}")
@@ -90,7 +91,8 @@ def cmd_requeue(args) -> int:
     """Exit 0 only when this call performed the transition; 3 = nothing to do;
     4 = the body could not be restored on this host (the record is left as
     the requeue made it; the body stays listed in undelivered/); 5 = refused before
-    anything changed: a malformed --body-sha256, or none while several bodies are parked.
+    anything changed: a malformed --body-sha256, or none while several bodies are parked;
+    6 = the item record cannot be parsed: nothing changed and no body was restored.
 
     A distinct code matters for the idempotent re-run: "already queued" is not
     a failure, and a script must be able to tell it from "I recovered it".
@@ -116,6 +118,13 @@ def cmd_requeue(args) -> int:
         operator=args.operator or _default_operator(),
         reason=args.reason, operator_release=True)
     payload = {"item_id": args.item_id, "result": result.value}
+    if result is outbox.RequeueOutcome.UNREADABLE:
+        # A restored body would be refused by the drain, so it stays quarantined.
+        payload["error"] = ("the item record cannot be parsed, so it cannot be requeued and its body "
+                            "was not restored; check the room first (it may have posted), then see "
+                            "'Unreadable item records' in docs/remote-gateway-protocol.md")
+        _emit(payload, args.json)
+        return 6
     # NOT_PARKED too, not just REQUEUED: the two halves commit separately, so
     # gating the restore on the transition strands the body on every retry.
     restored = False

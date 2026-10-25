@@ -7,7 +7,9 @@ Run: python3 tests/outbox-unreadable-item-fail-closed.test.py
 """
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
 import json
 import sys
 import tempfile
@@ -148,16 +150,58 @@ def the_read_contract(mod, name: str) -> None:
         check(mod.item_status(root, ITEM) == "PARKED", f"{name}: its public status is PARKED ({garbage!r})")
         check(mod.record_dispatching(root, ITEM, "inc") is False,
               f"{name}: no dispatch mark is written over it ({garbage!r})")
-        check(mod.requeue_item_with_epoch(root, ITEM)[0] is mod.RequeueOutcome.NOT_PARKED,
-              f"{name}: an operator requeue refuses it ({garbage!r})")
+        check(mod.requeue_item_with_epoch(root, ITEM)[0] is mod.RequeueOutcome.UNREADABLE,
+              f"{name}: an operator requeue refuses it as unreadable ({garbage!r})")
         check(mod.park_unclaimed(root, ITEM, "destination-changed") is False,
               f"{name}: it is not re-parked as a live item ({garbage!r})")
     mod.park_item(root, ITEM, "outcome-unknown")
-    check(mod.requeue_item_with_epoch(root, ITEM)[0] is mod.RequeueOutcome.NOT_PARKED,
+    check(mod.requeue_item_with_epoch(root, ITEM)[0] is mod.RequeueOutcome.UNREADABLE,
           f"{name}: once parked over, it still cannot be requeued without a payload")
 
 
+def the_operator_surface(mod, cli, name: str) -> None:
+    """requeue refuses an unreadable record with its own exit code and leaves the body
+    quarantined; list shows it by file name instead of skipping it or raising."""
+    import undelivered_quarantine as uq
+    for garbage in GARBAGE:
+        results = Path(tempfile.mkdtemp(prefix="outbox-unreadable-")) / "results"
+        results.mkdir()
+        root = results / ".outbox-test"
+        mod._write_item(root, ITEM, {"item_id": ITEM, "status": "READY", "payload": "{}"})
+        mod.park_item(root, ITEM, "outcome-unknown")
+        live = results / "proactive-x.txt"
+        live.write_text("the reply", encoding="utf-8")
+        uq.place(live, results, "proactive-x", when=1700000000)
+        corrupt(root, garbage=garbage)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = cli.main(["--root", str(root), "--json", "requeue", ITEM, "--body-id", "proactive-x"])
+        check(code == 6 and json.loads(out.getvalue()).get("result") == "unreadable",
+              f"{name}: requeue of an unreadable record exits 6, 'unreadable' ({garbage!r}: {code})")
+        check(not live.exists() and len(uq.find_quarantined(results, "proactive-x")) == 1,
+              f"{name}: and its quarantined body is not restored ({garbage!r})")
+        try:
+            listed = mod.list_items(root)
+            parked = mod.list_items(root, "PARKED")
+        except Exception as exc:  # noqa: BLE001
+            check(False, f"{name}: list does not raise on {garbage!r} ({type(exc).__name__})")
+            continue
+        file_name = mod._item_path(root, ITEM).name
+        check(len(listed) == 1 and listed[0].get("reason") == mod.UNREADABLE_ITEM
+              and listed[0].get("file") == file_name and "item_id" not in listed[0] and parked == listed,
+              f"{name}: list surfaces it as PARKED unreadable-item by file name ({garbage!r}: {listed})")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            cli.main(["--root", str(root), "list"])
+        check("reason=unreadable-item" in out.getvalue() and f"file={file_name}" in out.getvalue(),
+              f"{name}: the plain listing names it and its file ({garbage!r})")
+
+
 def main() -> int:
+    import outbox_cli as src_cli
+    from ag2_sparrow import outbox_cli as pkg_cli
+    the_operator_surface(src_cli.outbox, src_cli, "src cli")
+    the_operator_surface(outbox, pkg_cli, "vendored cli")
     the_read_contract(src_outbox, "src")
     the_read_contract(outbox, "vendored")
     corrupted_mid_drain()

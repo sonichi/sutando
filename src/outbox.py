@@ -1160,7 +1160,9 @@ def delivered_body_differs(root: Path, item_id: str, ready_body: Optional[str]) 
 
 
 def list_items(root: Path, status: Optional[str] = None) -> list[dict]:
-    """Every item record, newest id order, optionally filtered by status."""
+    """Every item record, newest id order, optionally filtered by status. A record that
+    cannot be read or parsed is listed as PARKED `unreadable-item` by its file name; its
+    item id cannot be recovered from that name, so it carries none."""
     d = _items_dir(Path(root))
     if not d.is_dir():
         return []
@@ -1168,20 +1170,24 @@ def list_items(root: Path, status: Optional[str] = None) -> list[dict]:
     for p in sorted(d.glob("*.json")):
         try:
             rec = json.loads(p.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            continue
+        except (OSError, ValueError):
+            rec = None
+        if not isinstance(rec, dict):
+            rec = {"status": "PARKED", "reason": UNREADABLE_ITEM, "unreadable": True, "file": p.name}
         if status is None or rec.get("status") == status:
             out.append(rec)
     return out
 
 
 class RequeueOutcome(str, Enum):
-    """Only REQUEUED means this call moved the item; the other two touched
-    nothing, which is what makes a repeated requeue safe to script."""
+    """Only REQUEUED means this call moved the item; the others touched
+    nothing, which is what makes a repeated requeue safe to script. UNREADABLE:
+    the record exists but cannot be parsed, so there is no payload to requeue."""
 
     REQUEUED = "requeued"
     NOT_PARKED = "not-parked"
     ABSENT = "absent"
+    UNREADABLE = "unreadable"
 
 
 def requeue_item(root: Path, item_id: str, *, reset_attempts: bool = False,
@@ -1226,7 +1232,9 @@ def requeue_item_with_epoch(root: Path, item_id: str, *, reset_attempts: bool = 
         if not _item_path(root, item_id).exists():
             return RequeueOutcome.ABSENT, None
         d = _read_item(root, item_id)
-        if d.get("status") != "PARKED" or d.get("unreadable"):
+        if d.get("unreadable"):
+            return RequeueOutcome.UNREADABLE, None
+        if d.get("status") != "PARKED":
             return RequeueOutcome.NOT_PARKED, None
         _release_locked(root, item_id, force=True)
         d["resend_epoch"] = int(d.get("resend_epoch", 0) or 0) + 1

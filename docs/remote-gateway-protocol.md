@@ -618,6 +618,14 @@ so:
   (`outcome-unknown`) and moves the file to `results/undelivered/`. The log names the
   `outbox_cli.py requeue` command; check the room first, since a requeue may post twice.
   A process that died after the event id was recorded settles the item as delivered.
+- **Unreadable item records.** An item record that exists but cannot be parsed is never
+  read as a new item. It reads `PARKED` (`unreadable-item`) with its send in doubt, so no
+  drain sends it. `outbox_cli.py --root <root> list` shows it by its file name
+  (`file=<name>.json`, no item id). `requeue` refuses it with exit 6 and leaves its body in
+  `results/undelivered/`. To release it: check the room first, since it may already have
+  posted. Then move the record file out of `<root>/.items/` (keep it for diagnosis), and
+  move its body from `results/undelivered/` back to `results/<stem>.txt`. The next pass
+  publishes it as a new item and sends it once.
 - **A definite refusal is retried** on the outbox's schedule (the same window and backoff
   as task results, counted on the item, so a restart keeps the count): 401/403, 408, 425,
   429, and a connection that was refused or a host that did not resolve. Another 4xx parks
