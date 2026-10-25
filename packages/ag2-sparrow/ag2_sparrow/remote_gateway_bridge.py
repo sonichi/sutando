@@ -679,15 +679,30 @@ def _gateway_owner() -> str:
     return gateway_instance.owner_mxid(owner, identity)
 
 
+def _owner_dm_is_private(room: str, owner: str) -> "bool | None":
+    """Whether only the agent and its owner are in `room`; None when the gateway cannot say."""
+    agent = _reenroll_identity()
+    if not (room and owner and agent):
+        return None
+    try:
+        answer = _req("POST", "/v1/room", {"op": "members", "room_id": room}, timeout=10)
+    except Exception:  # noqa: BLE001 - unreadable is undecided, never private
+        return None
+    if not isinstance(answer, dict) or answer.get("error") or not isinstance(answer.get("members"), list):
+        return None
+    members = {r.get("user_id") for r in answer["members"] if isinstance(r, dict)}
+    return bool(members) and members <= {agent, owner}
+
+
 def _owner_review_dm(owner: str) -> str:
-    if _GATEWAY_OWNER_DM_HINT:
+    if _GATEWAY_OWNER_DM_HINT and _owner_dm_is_private(_GATEWAY_OWNER_DM_HINT, owner) is True:
         _atomic_private_json(_WITHHELD_DM_CACHE,
-                             {"owner": owner, "room_id": _GATEWAY_OWNER_DM_HINT})
+                             {"owner": owner, "room_id": _GATEWAY_OWNER_DM_HINT, "private": True})
         return _GATEWAY_OWNER_DM_HINT
     cached = _read_private_json(_WITHHELD_DM_CACHE) or {}
     room = gateway_instance.owner_room(cached.get("room_id"), _reenroll_identity())
-    if cached.get("owner") == owner and room:
-        return room
+    if cached.get("owner") == owner and room and cached.get("private") is True:
+        return room  # an unmarked cache predates the membership check and may name a shared room
     answer = _req("POST", "/v1/room", {
         "op": "create", "invite": [owner], "is_direct": True,
         "name": "Private result reviews",
@@ -696,7 +711,7 @@ def _owner_review_dm(owner: str) -> str:
     room = gateway_instance.owner_room((answer or {}).get("room_id"), _reenroll_identity())
     if not room:
         raise RuntimeError("gateway did not return a private review room")
-    _atomic_private_json(_WITHHELD_DM_CACHE, {"owner": owner, "room_id": room})
+    _atomic_private_json(_WITHHELD_DM_CACHE, {"owner": owner, "room_id": room, "private": True})
     return room
 
 
@@ -1874,8 +1889,8 @@ PROACTIVE_DISPATCH_GATE: Callable[[str], "str | None"] | None = None
 PROACTIVE_ROUTE_GATE: Callable[[str, str, "str | None"], "str | None"] | None = None
 # Routing state belongs to the gateway (owner 2026-09-07): the agent row's owner_dm_room is read at
 # connect and on a slow cadence and kept while offline; the pinned room is bootstrap, never authority.
-_ROUTING: dict = {"owner_dm": "", "persisted": "", "identity": "", "gateway": "", "next": 0.0,
-                  "held_logged": 0.0}
+_ROUTING: dict = {"owner_dm": "", "persisted": "", "persisted_private": False, "identity": "",
+                  "gateway": "", "next": 0.0, "held_logged": 0.0}
 ROUTING_REFRESH_S = 300.0
 ROUTING_RETRY_S = 30.0
 OWNER_PRIVATE = "owner_private"
@@ -1888,14 +1903,17 @@ def _routing_file() -> Path:
     return _STATE / f"owner-routing{_INST_SUFFIX}.json"
 
 
-def _routing_record(identity: str, gateway_url: str, owner_dm: str) -> "dict | None":
+def _routing_record(identity: str, gateway_url: str, owner_dm: str, *,
+                    private: bool = False) -> "dict | None":
     """The owner-routing record as persisted: the redacted URL and the keyed binding of the full
-    one, never the full URL. None when no binding can be made, so nothing unbound is written."""
+    one, never the full URL. None when no binding can be made, so nothing unbound is written.
+    `private` only for a room whose membership was checked; a migrated legacy record is not."""
     binding = gateway_instance.binding_digest(identity, gateway_url, create=True)
     if not binding:
         return None
-    return {"identity": identity, "gateway": _redact_url(gateway_url), "binding": binding,
-            "owner_dm": gateway_instance.owner_room(owner_dm, identity)}
+    record = {"identity": identity, "gateway": _redact_url(gateway_url), "binding": binding,
+              "owner_dm": gateway_instance.owner_room(owner_dm, identity)}
+    return {**record, "private": True} if private else record
 
 
 def _migrate_routing() -> "routing_migrations.Result":
@@ -1914,7 +1932,8 @@ def _load_routing() -> None:
     if not _ROUTING["identity"] and not _ROUTING["gateway"]:
         _ROUTING["identity"], _ROUTING["gateway"] = current  # a reading set before any binding adopts this one
     elif (_ROUTING["identity"], _ROUTING["gateway"]) != current:  # re-enrolled: the old reading is not ours
-        _ROUTING.update(owner_dm="", persisted="", identity=current[0], gateway=current[1])
+        _ROUTING.update(owner_dm="", persisted="", persisted_private=False,
+                        identity=current[0], gateway=current[1])
     try:
         d = json.loads(_routing_file().read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -1923,16 +1942,26 @@ def _load_routing() -> None:
     bound = isinstance(d, dict) and d.get("identity") == current[0] and bool(d.get("binding")) \
         and hmac.compare_digest(str(d["binding"]).encode("utf-8"),
                                 gateway_instance.binding_digest(current[0], URL).encode("utf-8"))
-    disk = gateway_instance.owner_room(d.get("owner_dm"), current[0]) if bound else ""
+    on_disk = gateway_instance.owner_room(d.get("owner_dm"), current[0]) if bound else ""
+    # unchecked or since found shared: never adopted, and left unequal so the writer overwrites it
+    disk = on_disk if d.get("private") is True and on_disk != _ROUTING.get("shared") else ""
     # A reading that came from disk follows the disk; one the writer has not committed yet stays.
-    if not _ROUTING["owner_dm"] or _ROUTING["owner_dm"] == _ROUTING["persisted"]:
+    if not _ROUTING["owner_dm"] or not _uncommitted():
         _ROUTING["owner_dm"] = disk
-    _ROUTING["persisted"] = disk
+    _ROUTING["persisted"] = on_disk
+    _ROUTING["persisted_private"] = d.get("private") is True
+
+
+def _uncommitted() -> bool:
+    """The reading differs from the record, or names a room the record has not marked private."""
+    return _ROUTING["owner_dm"] != _ROUTING["persisted"] or (
+        bool(_ROUTING["owner_dm"]) and not _ROUTING["persisted_private"])
 
 
 def refresh_routing(force: bool = False) -> None:
     """Pull the agent's routing state from the gateway. A failed refresh books a short retry, not the
-    window; an answer without a DM (no row, no field) keeps the last reading, which lives on disk."""
+    window; an answer without a DM (no row, no field) keeps the last reading, which lives on disk.
+    A room is the owner DM only while its members are the agent and its owner; a shared room clears it."""
     reenrolled = bool(_ROUTING["identity"] or _ROUTING["gateway"]) and (
         (_reenroll_identity(), URL) != (_ROUTING["identity"], _ROUTING["gateway"]))
     _load_routing()
@@ -1941,18 +1970,30 @@ def refresh_routing(force: bool = False) -> None:
     if not force and now < _ROUTING["next"]:
         return
     try:
-        _gateway_owner()
+        owner = _gateway_owner()
     except Exception:  # noqa: BLE001 - offline: the last known owner DM stands
         _ROUTING["next"] = now + ROUTING_RETRY_S
         return
-    if _GATEWAY_OWNER_DM_HINT:
-        _ROUTING["owner_dm"] = _GATEWAY_OWNER_DM_HINT
-    if _ROUTING["owner_dm"] and _ROUTING["owner_dm"] != _ROUTING["persisted"]:  # until durably published
-        record = _routing_record(_reenroll_identity(), URL, _ROUTING["owner_dm"])
+    candidate = _GATEWAY_OWNER_DM_HINT or _ROUTING["owner_dm"]
+    private = _owner_dm_is_private(candidate, owner) if candidate else None
+    if private is False:
+        if now - _ROUTING.get("shared_logged", 0.0) >= ROUTING_REFRESH_S:
+            _ROUTING["shared_logged"] = now
+            _log(f"owner_dm_room {candidate} has members besides the agent and its owner: not an owner DM")
+        _ROUTING["owner_dm"], _ROUTING["shared"] = "", candidate
+    elif private is True:
+        _ROUTING["owner_dm"] = candidate
+        if _ROUTING.get("shared") == candidate:
+            _ROUTING["shared"] = ""
+    elif candidate != _ROUTING["owner_dm"]:  # undecided: a new room is not adopted, the checked one stands
+        _ROUTING["next"] = now + ROUTING_RETRY_S
+        return
+    if _uncommitted():  # until durably published, a cleared reading too
+        record = _routing_record(_reenroll_identity(), URL, _ROUTING["owner_dm"], private=True)
         if record is None or not _durable_write(_routing_file(), json.dumps(record)):
             _ROUTING["next"] = now + ROUTING_RETRY_S  # in memory it holds; the write is retried soon
             return
-        _ROUTING["persisted"] = _ROUTING["owner_dm"]
+        _ROUTING["persisted"], _ROUTING["persisted_private"] = _ROUTING["owner_dm"], True
     _ROUTING["next"] = now + (ROUTING_REFRESH_S if _ROUTING["owner_dm"] else ROUTING_RETRY_S)
 
 
@@ -5962,6 +6003,13 @@ def _post_proactive() -> None:
                 _hand_back(claim, f)
                 continue
             _GATE_FAILED_LOGGED.discard(f.name)
+        if route == "send" and room_override and f.name.startswith(_OWNER_MENTION_PREFIX):
+            # Its room was the owner DM when queued; send to the owner DM read now, or hold.
+            room_override = resolve_destination(OWNER_PRIVATE)
+            if not room_override:
+                _held(f"owner-mention result {f.name}")
+                _hand_back(claim, f)
+                continue
         if route == "drop":
             # Skip marker ([no-send]/[REPLIED]/[deduped:]) — the protocol says
             # archive silently, deliver nothing. Nothing was delivered, so on
@@ -7014,6 +7062,9 @@ def _owner_mention_refused(tid: str, body: str) -> "bool | None":
 
 def _owner_mention_dm_name(tid: str) -> str:
     return proactive_filename(f"owner-mention-{tid}", "ag2space")[:-len(".txt")]
+
+
+_OWNER_MENTION_PREFIX = "proactive-owner-mention-"
 
 
 def _owner_mention_dm_queued(tid: str) -> bool:

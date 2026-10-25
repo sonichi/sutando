@@ -113,6 +113,8 @@ def fake_req(method, path, payload=None, timeout=35):
         n = len(calls)
     if (method, path) == ("GET", "/v1/agents"):
         return {"agents": [{"id": "@agent:example", "owner": OWNER, "owner_dm_room": DM}]}
+    if path == "/v1/room" and payload.get("op") == "members":
+        return {"members": [{"user_id": "@agent:example"}, {"user_id": OWNER}]}
     if path == "/v1/room" and payload.get("op") == "message":
         return {"ok": True, "event_id": f"$event-{n}"}
     if path == "/v1/room" and payload.get("op") == "edit":
