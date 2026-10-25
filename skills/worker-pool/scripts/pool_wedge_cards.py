@@ -159,7 +159,7 @@ def raise_card(workspace, worker_id, which, *, runner=subprocess.run, routed=pro
             kind="core-blocked", runtime=runtime, device=device, subject=subject,
             title=f"{seat} · usage limit",
             message=(f"{seat} (tmux session {session}) owes work and has hit its usage limit. "
-                     + tui_gate.limit_unblock(session)),
+                     + tui_gate.limit_unblock(session, runtime)),
             guard=tui_gate.limit_guard(session), actions=[_jump(session)])
     elif which == ps.CARD_HUMAN:
         req = HumanRequirement(

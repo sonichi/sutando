@@ -54,11 +54,15 @@ def limit_card_holds(req: HumanRequirement, pane: Optional[str], runtime: Option
     return limit_standing(pane, runtime, outrun)
 
 
-def limit_unblock(session: Optional[str] = None) -> str:
-    """How the owner lifts a usage limit, for the card body."""
+def limit_unblock(session: Optional[str] = None, runtime: Optional[str] = None) -> str:
+    """How the owner lifts a usage limit, for the card body; the steps are the runtime's own."""
     where = f"open its terminal (tmux session {session})" if session else "open its terminal"
-    return (f"To unblock it, {where} and run /usage-credits to use extra credits, "
-            "or /login to switch to another account.")
+    if runtime == "codex":
+        return (f"It continues when the limit resets. To unblock it sooner, {where} and run "
+                "`codex login` to switch to another account.")
+    return (f"It continues when the limit resets. To unblock it sooner, {where} and run "
+            "/usage-credits to use extra credits, /login to switch to another account, "
+            "or /model to switch to a model with usage left.")
 
 
 def option_blocks(prompt: Optional[str]) -> List[Tuple[int, List[str], Optional[int]]]:

@@ -691,7 +691,7 @@ DRIVE_SETTLE_S = 15.0
 from prompt_excerpt import prompt_excerpt  # noqa: E402  (shared with core-supervisor-relay)
 
 
-def escalation_message(state, detail, kind, prompt, session=None):
+def escalation_message(state, detail, kind, prompt, session=None, runtime=None):
     """The card body. The core is blocked, so this is the only thing that will
     reach the owner until they act."""
     head = ("I am blocked and cannot continue without you."
@@ -707,7 +707,7 @@ def escalation_message(state, detail, kind, prompt, session=None):
         lines += ["", "What the terminal is showing:"] + [f"  {ln}" for ln in excerpt]
     if is_usage_limit(kind, prompt):
         from hitl.tui_gate import limit_unblock
-        lines += ["", limit_unblock(session)]
+        lines += ["", limit_unblock(session, runtime)]
     else:
         lines += ["", "Open the Runtime panel (or the core's terminal) and answer it. "
                       "Nothing else I do can clear this one."]
@@ -758,7 +758,7 @@ def escalate(manager, state, detail, kind, prompt, session, seat=None, queued=0,
         from hitl import tui_gate
         limit = is_usage_limit(kind, prompt)
         req = tui_gate.requirement_for(state, kind, prompt, session, detail,
-                                       escalation_message(state, detail, kind, prompt, session),
+                                       escalation_message(state, detail, kind, prompt, session, runtime),
                                        runtime=runtime,
                                        episode=tui_gate.LIMIT_EPISODE if limit else None)
         if queued:

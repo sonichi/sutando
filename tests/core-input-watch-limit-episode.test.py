@@ -44,8 +44,11 @@ from hitl.schema import STATUS_RESOLVED  # noqa: E402
 
 SESSION = "sutando-worker-1"
 SEAT = "worker comm"
-UNBLOCK = ("To unblock it, open its terminal (tmux session sutando-worker-1) and run "
-           "/usage-credits to use extra credits, or /login to switch to another account.")
+UNBLOCK = ("It continues when the limit resets. To unblock it sooner, open its terminal (tmux session "
+           "sutando-worker-1) and run /usage-credits to use extra credits, /login to switch to another "
+           "account, or /model to switch to a model with usage left.")
+CODEX_UNBLOCK = ("It continues when the limit resets. To unblock it sooner, open its terminal (tmux session "
+                 "sutando-worker-1) and run `codex login` to switch to another account.")
 _FOOTER = ("────────\n❯ \n────────\n"
            "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents")
 
@@ -217,6 +220,17 @@ class UnblockGuidance(unittest.TestCase):
                              "You've hit your usage limit", SESSION, seat=SEAT)
             self.assertIn(UNBLOCK, req.message)
 
+    def test_a_codex_seat_gets_codex_steps(self):
+        body = M.escalation_message("blocked-human", "d", "turn-rejected",
+                                    "You've hit your usage limit", SESSION, runtime="codex")
+        self.assertEqual(body.splitlines()[-1], CODEX_UNBLOCK)
+        self.assertNotIn("/usage-credits", body)
+        with tempfile.TemporaryDirectory() as td:
+            m = HitlManager(HitlStore(pathlib.Path(td)))
+            req = M.escalate(m, "blocked-human", "d", "turn-rejected",
+                             "You've hit your usage limit", SESSION, seat=SEAT, runtime="codex")
+            self.assertIn(CODEX_UNBLOCK, req.message)
+
     def test_other_gates_keep_their_wording(self):
         body = M.escalation_message("blocked-human", "d", "turn-rejected", "not logged in", SESSION)
         self.assertNotIn("/usage-credits", body)
@@ -278,7 +292,7 @@ class PoolAndMonitorShareOneCard(_PoolSeat):
         m, name = self.m, POOL_SESSION
         pool_card = self._pool_card()
         self.assertEqual(pool_card.guard, tui_gate.limit_guard(name))
-        self.assertIn("/usage-credits to use extra credits, or /login to switch to another account",
+        self.assertIn("/usage-credits to use extra credits, /login to switch to another account",
                       pool_card.message)
         self.assertIn(f"tmux session {name}", pool_card.message)
         watched = M.escalate(m, "blocked-human", "d", "session-limit", _MENU, name,
