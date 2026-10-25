@@ -5993,6 +5993,7 @@ def _post_proactive() -> None:
                 # Hand back under its own name: the claim gate holds it from here.
                 _hand_back(claim, f)
                 continue
+            _GATE_FAILED_LOGGED.discard(f.name)
         if route == "send" and room_override and f.name.startswith(_OWNER_MENTION_PREFIX):
             # Its room was the owner DM when queued; send to the owner DM read now, or hold.
             room_override = resolve_destination(OWNER_PRIVATE)
@@ -6000,7 +6001,6 @@ def _post_proactive() -> None:
                 _held(f"owner-mention result {f.name}")
                 _hand_back(claim, f)
                 continue
-            _GATE_FAILED_LOGGED.discard(f.name)
         if route == "drop":
             # Skip marker ([no-send]/[REPLIED]/[deduped:]) — the protocol says
             # archive silently, deliver nothing. Nothing was delivered, so on

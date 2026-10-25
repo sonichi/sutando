@@ -206,7 +206,7 @@ def main() -> int:
 
     ws = workspace(); gw = Gateway(DM); mod = load(ws, gw)
     om = "proactive-owner-mention-om2.to-ag2space.txt"
-    (ws / "results" / om).write_text(f"[channel: !old-dm:example.org]\nAlice asked about the deck\n", encoding="utf-8")
+    (ws / "results" / om).write_text("[channel: !old-dm:example.org]\nAlice asked about the deck\n", encoding="utf-8")
     mod._post_proactive()
     check(not (ws / "results" / om).exists() and [p["room_id"] for p in gw.posts] == [DM],
           f"m) an owner-mention DM goes to the owner DM read at send time, not the room baked in: {gw.posts}")
