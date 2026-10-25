@@ -114,12 +114,13 @@ def _strict_url(value: Any, *, endpoint: bool = False) -> Optional[str]:
     """An http(s) URL whose host is a server name, with no userinfo and no backslash (parsers
     disagree on `\\`); `endpoint` also demands https and no query or fragment, since the value is
     dialled, not displayed. "" when absent, None when present and not that."""
-    v = str(value or "").strip()
+    v = str(value or "")  # unstripped: str.strip() would hide U+2028 or U+0085 at the edges
     if not v:
         return ""
     schemes = ("https://",) if endpoint else ("http://", "https://")
     # urlsplit deletes tab, CR and LF before parsing, so they are refused on the raw string.
-    if "\\" in v or any(ord(c) <= 0x20 or ord(c) == 0x7F for c in v) or not v.lower().startswith(schemes):
+    if "\\" in v or not v.isascii() or any(ord(c) <= 0x20 or ord(c) == 0x7F for c in v) \
+            or not v.lower().startswith(schemes):
         return None
     try:
         parts = urllib.parse.urlsplit(v)
@@ -128,9 +129,15 @@ def _strict_url(value: Any, *, endpoint: bool = False) -> Optional[str]:
     netloc = parts.netloc.lower()
     if parts.username is not None or parts.password is not None or not is_server_name(netloc):
         return None
-    if endpoint and (parts.query or parts.fragment):
+    if endpoint and ("?" in v or "#" in v):
         return None
     return v
+
+
+def _via(value: Any) -> str:
+    """A declared `link_via`, port kept, when it is a server name; "" otherwise."""
+    v = str(value or "").lower().rstrip(".")
+    return v if v and is_server_name(v) else ""
 
 
 def _never_fetched(host: str) -> bool:
@@ -140,7 +147,10 @@ def _never_fetched(host: str) -> bool:
         ipaddress.ip_address(host)
         return True
     except ValueError:
-        return "." not in host
+        pass
+    last = host.rsplit(".", 1)[-1]
+    # 127.1, 0x7f.1 and 127.0.0.01 are addresses to the resolver library, never a domain.
+    return "." not in host or last.isdigit() or (last.startswith("0x") and len(last) > 2)
 
 DEFAULT_INSTANCES: Tuple[Dict[str, str], ...] = (
     {"server": "ag2.space", "gateway_host": "chat.ag2.space",
@@ -409,7 +419,7 @@ def _entry_dotspace(entry: Mapping[str, Any], source: str) -> DotSpace:
         server=server,
         operator=OPERATOR_AG2,
         gateway_host=_host_only(str(entry.get("gateway_host") or "")),
-        link_via=_host_only(str(entry.get("link_via") or "")) or server,
+        link_via=_via(entry.get("link_via")) or server,
         cloud_origin=_origin(entry.get("cloud_origin")),
         mcp_url=str(entry.get("mcp_url") or "").strip(),
         prefer_ipv4=_bool(entry.get("prefer_ipv4"), True),
@@ -455,7 +465,7 @@ def dotspace_for(server_or_host: str, *, fetch: Optional[Fetch] = None,
     # co.uk) counts for a registered server alone, and a registered parent matched above.
     if block and block["server"] == host:
         return DotSpace(server=block["server"], gateway_host=block["gateway_host"],
-                        link_via=block["server"], mcp_url=block["mcp_url"],
+                        link_via=block["link_via"], mcp_url=block["mcp_url"],
                         source="well-known-unverified")
     gateway = server_of_gateway_url(own_gateway)
     if gateway and host == gateway:

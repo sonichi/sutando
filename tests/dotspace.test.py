@@ -218,6 +218,28 @@ class TestConfig(unittest.TestCase):
         self.assertIsNone(ds.parse_well_known(block(cloud_origin="http://sutando.new.space"), "new.space"),
                           "the Cloud origin is dialled with a bearer: https only")
 
+    def test_a_declared_via_port_survives_every_resolution_path(self):
+        cfg = {"instances": [{"server": "x.space", "link_via": "via.x.space:8448"}]}
+        ds.reset_cache()
+        self.assertEqual(ds.link_via_for("!r:x.space", fetch=ds.NO_FETCH, config=cfg), "via.x.space:8448")
+        ds.reset_cache()
+        self.assertEqual(ds.dotspace_for("x.space", fetch=ds.NO_FETCH, config={"instances": [{"server": "x.space", "link_via": "bad&via"}]}).link_via,
+                         "x.space", "a config via that is not a server name falls back to the server")
+        ds.reset_cache()
+        d = ds.dotspace_for("new.space", fetch=Fetcher(block(server="new.space", link_via="via.new.space:8448")), config=NONE)
+        self.assertEqual((d.source, d.link_via), ("well-known-unverified", "via.new.space:8448"))
+
+    def test_shorthand_ipv4_and_hex_labels_are_never_fetched(self):
+        for name in ("127.1", "0x7f.1", "127.0.0.01", "10.1", "!r:0x7f000001", "1.2.3"):
+            f = Fetcher(block())
+            ds.reset_cache()
+            ds.dotspace_for(name, fetch=f, config=NONE)
+            self.assertEqual(f.calls, [], name)
+        for field, value in [("mcp_url", "https://mcp.new.space/mcp?"), ("mcp_url", "https://mcp.new.space/mcp#"),
+                             ("gateway_url", "https://chat.new.space/re\u00a0lay"), ("mcp_url", "https://mcp.new.space/\u2028"),
+                             ("cloud_origin", "https://sutando.new.space/\x85")]:
+            self.assertIsNone(ds.parse_well_known(block(**{field: value}), "new.space"), (field, value))
+
     def test_ip_literals_and_single_labels_are_never_fetched(self):
         for name in ("[::1]:8448", "127.0.0.1", "localhost:8448", "!r:10.0.0.1", "@u:[fe80::1]"):
             f = Fetcher(block())
