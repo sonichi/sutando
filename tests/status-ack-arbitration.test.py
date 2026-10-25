@@ -8,6 +8,7 @@ the runner's run_once(), whose line goes through the gateway's real proactive ou
   b) after (a): the core's second notify is progress and goes out; the real answer is untouched
   c) notify first: one POST from notify; the runner, past the deadline, publishes nothing
   d) neither the gateway bridge nor the result path reads the ack claim
+  e) a claimed/assigned rename of the task keys the claim on the canonical id, either sender first
   CONTROL: a runner that ignores the shared claim makes (c) two POSTs; so does a notify
            that takes no claim in (a), so the one-POST check bites
 
@@ -113,6 +114,42 @@ def main() -> int:
     bridge = (REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" / "remote_gateway_bridge.py").read_text()
     check("ack_claim" not in bridge and "ack-claims" not in bridge,
           "d) the gateway (results and proactive drains) never reads the ack claim")
+
+    for suffix in (".claimed-core-2", ".assigned-worker1"):
+        for order in ("runner first", "notify first"):
+            rid = "task-1761300000010"
+            lane5 = pl.Lane(gb, ISO)
+            p5 = sa.task(lane5.ws, rid, thread_root=sa.ROOT_EVT)
+            tf5 = p5.rename(p5.with_name(f"{rid}{suffix}.txt"))
+            del NOTIFY_POSTS[:]
+            if order == "runner first":
+                runner_pass(lane5, sa.T0 + 130)
+                lane5.drain()
+                run_notify(tf5, "On it.")
+            else:
+                run_notify(tf5, "On it.")
+                runner_pass(lane5, sa.T0 + 130)
+                lane5.drain()
+            total = len(lane5.posts) + len(NOTIFY_POSTS)
+            check(total == 1 and ack_claim.state(lane5.ws, f"ack:{rid}:initial") != "none",
+                  f"e) {suffix} {order}: one POST in all, on the canonical key ({total})")
+            check(ack_claim.state(lane5.ws, f"ack:{rid}{suffix}:initial") == "none",
+                  f"e) {suffix} {order}: no key is minted from the renamed file's stem")
+    saved_arb, notify._ACK_ARBITRATION = notify._ACK_ARBITRATION, (
+        notify._ACK_ARBITRATION[0], notify._ACK_ARBITRATION[1], lambda path: Path(path).stem)
+    try:
+        rid = "task-1761300000011"
+        lane6 = pl.Lane(gb, ISO)
+        p6 = sa.task(lane6.ws, rid)
+        tf6 = p6.rename(p6.with_name(f"{rid}.claimed-core-2.txt"))
+        del NOTIFY_POSTS[:]
+        runner_pass(lane6, sa.T0 + 130)
+        lane6.drain()
+        run_notify(tf6, "On it.")
+        both6 = len(lane6.posts) + len(NOTIFY_POSTS)
+    finally:
+        notify._ACK_ARBITRATION = saved_arb
+    check(both6 == 2, f"CONTROL: a notify keyed by the file stem speaks after the runner ({both6} POSTs)")
 
     saved, notify._ACK_ARBITRATION = notify._ACK_ARBITRATION, None
     try:

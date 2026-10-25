@@ -359,12 +359,19 @@ def _ag2space_proactive_dispatch_gate(task_id: str):
     return dispatch_veto(task_id, WS)
 
 
+def _ag2space_proactive_route_gate(task_id: str, room: str, thread_root):
+    """Right before a message about a task is sent: why its room and thread are not the task's own, or None."""
+    from proactive_dispatch_gate import route_veto
+    return route_veto(task_id, room, thread_root, WS)
+
+
 # Assigned AFTER the exec: the canonical module's own `PROACTIVE_CLAIM_GATE =
 # None` default runs inside it and would overwrite an earlier assignment.
 PROACTIVE_CLAIM_GATE = _ag2space_proactive_claim_gate
 PROACTIVE_ROOM_GATE = _ag2space_proactive_room_gate
 OWNER_DM_UPGRADED_NOTIFY = _ag2space_owner_dm_upgraded
 PROACTIVE_DISPATCH_GATE = _ag2space_proactive_dispatch_gate
+PROACTIVE_ROUTE_GATE = _ag2space_proactive_route_gate
 
 if _RUN_MAIN:  # pragma: no cover — script-entry tail; the subprocess suite drives it
     __name__ = "__main__"

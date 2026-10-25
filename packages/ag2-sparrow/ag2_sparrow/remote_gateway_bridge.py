@@ -1859,6 +1859,7 @@ OWNER_DM_UPGRADED_NOTIFY: Callable[[str, str], None] | None = None
 # Host-injected task_id -> veto reason or None, asked right before a message about that task
 # is sent; None (standalone default) checks only the task's own result.
 PROACTIVE_DISPATCH_GATE: Callable[[str], "str | None"] | None = None
+PROACTIVE_ROUTE_GATE: Callable[[str, str, "str | None"], "str | None"] | None = None
 # Routing state belongs to the gateway (owner 2026-09-07): the agent row's owner_dm_room is read at
 # connect and on a slow cadence and kept while offline; the pinned room is bootstrap, never authority.
 _ROUTING: dict = {"owner_dm": "", "persisted": "", "identity": "", "gateway": "", "next": 0.0,
@@ -5656,17 +5657,19 @@ def _proactive_dispatch_veto(item_id: str, payload: bytes) -> "str | None":
     """Asked by the outbox right before the send: a message about a task that has been
     answered, has ended, waits on the owner or is being cancelled is withdrawn."""
     try:
-        tid = json.loads(payload.decode("utf-8")).get("task_id")
+        env = json.loads(payload.decode("utf-8"))
+        tid = env.get("task_id")
     except (UnicodeDecodeError, ValueError, AttributeError):
         return None
     if not tid:
         return None
     if (RESULTS_DIR / f"{tid}.txt").exists() or _delivered_copy_exists(tid):
         return "the task has been answered"
-    if PROACTIVE_DISPATCH_GATE is None:
-        return None
     try:
-        return PROACTIVE_DISPATCH_GATE(tid)
+        veto = PROACTIVE_DISPATCH_GATE(tid) if PROACTIVE_DISPATCH_GATE is not None else None
+        if veto is None and PROACTIVE_ROUTE_GATE is not None:
+            veto = PROACTIVE_ROUTE_GATE(tid, env.get("room_id"), env.get("thread_root"))
+        return veto
     except Exception as exc:  # noqa: BLE001 - an unchecked task is never messaged
         return f"the task could not be checked ({diagnostics.describe(exc)})"
 

@@ -464,7 +464,8 @@ def _load_ack_arbitration():
         sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
         import ack_claim  # type: ignore
         from status_ack_policy import ack_key  # type: ignore
-        return ack_claim, ack_key
+        from task_archive import task_id_for  # type: ignore
+        return ack_claim, ack_key, task_id_for
     except Exception:
         return None
 
@@ -478,11 +479,13 @@ def _initial_ack_gate(task_file: "str | None") -> "tuple[bool, tuple | None]":
     and must win `ack:<task>:initial`; every later notify is progress and is never arbitrated."""
     if not task_file or _ACK_ARBITRATION is None:
         return True, None
-    ack_claim, ack_key = _ACK_ARBITRATION
+    ack_claim, ack_key, task_id_for = _ACK_ARBITRATION
     path = Path(task_file).resolve()
     if path.parent.name != "tasks":
         return True, None
-    ws, tid = path.parent.parent, path.stem
+    ws, tid = path.parent.parent, task_id_for(path)
+    if not tid:
+        return True, None
     try:
         if not ack_claim.claim(ws, f"progress:{tid}:first-notify", ACK_HOLDER):
             return True, None

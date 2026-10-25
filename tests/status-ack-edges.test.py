@@ -145,7 +145,7 @@ def main() -> int:
     lane = fresh()
     tf = lane.tasks / f"{TID}.txt"
     argv = ["notify.py", "--task-file", str(tf), "--message", "On it."]
-    with patched(notify, "_ACK_ARBITRATION", (Raising, notify._ACK_ARBITRATION[1])), patched(sys, "argv", argv):
+    with patched(notify, "_ACK_ARBITRATION", (Raising, *notify._ACK_ARBITRATION[1:])), patched(sys, "argv", argv):
         rc = notify.main()
     check(rc == 0 and len(posts) == 1, f"h) a raising claim store never blocks the send (rc {rc}, {len(posts)})")
 
@@ -155,7 +155,7 @@ def main() -> int:
 
     lane = fresh()
     argv = ["notify.py", "--task-file", str(lane.tasks / f"{TID}.txt"), "--message", "On it."]
-    with patched(notify, "_ACK_ARBITRATION", (SettleFails, notify._ACK_ARBITRATION[1])), patched(sys, "argv", argv):
+    with patched(notify, "_ACK_ARBITRATION", (SettleFails, *notify._ACK_ARBITRATION[1:])), patched(sys, "argv", argv):
         rc = notify.main()
     check(rc == 0 and len(posts) == 2, f"h) a failed settle after a good send keeps rc 0 (rc {rc})")
 

@@ -192,15 +192,20 @@ def reconcile(ws: Path) -> list:
         key, status, reason = rec["key"], item.get("status"), str(item.get("reason") or "")
         ref = item.get("provider_ref")
         if status == "DELIVERED" and isinstance(ref, str) and ref.startswith("$"):
-            ack_claim.update(ws, key, HOLDER, "confirmed", provider_ref=ref, room=item.get("destination"))
-            settled.append((key, "confirmed"))
+            if ack_claim.update(ws, key, HOLDER, "confirmed", gen=rec.get("gen"), provider_ref=ref,
+                                room=item.get("destination")):
+                settled.append((key, "confirmed"))
         elif status == "PARKED" and reason.startswith("withdrawn:"):
-            ack_claim.release(ws, key, HOLDER)
-            settled.append((key, "released"))
+            if ack_claim.release(ws, key, HOLDER, gen=rec.get("gen")):
+                settled.append((key, "released"))
         elif status == "PARKED":
-            ack_claim.update(ws, key, HOLDER, "unknown", reason=reason)
-            settled.append((key, "unknown"))
+            if ack_claim.update(ws, key, HOLDER, "unknown", gen=rec.get("gen"), reason=reason):
+                settled.append((key, "unknown"))
     return settled
+
+
+def _gen(claimed) -> Optional[str]:
+    return claimed if isinstance(claimed, str) else None
 
 
 def _stamp_ms(now: float) -> int:
@@ -223,12 +228,13 @@ def watch_inbox(ws: Path, snap: dict, cfg: Settings, now: float) -> Optional[str
     if now - outage["since"] < cfg.watcher_down_after_s:
         return None
     key = _alert_key(outage)
-    if not ack_claim.claim(ws, key, HOLDER, now=now):
+    gen = ack_claim.claim(ws, key, HOLDER, now=now)
+    if not gen:
         return None
     waiting = sum(1 for t in snap.get("tasks") or [] if t.get("unclaimed_age_s") is not None)
     name = proactive_routing.proactive_filename(_stamp_ms(now))
     publish_text(ws / "results" / name, OWNER_ALERT.format(n=waiting) + "\n")
-    ack_claim.update(ws, key, HOLDER, via=name)
+    ack_claim.update(ws, key, HOLDER, gen=_gen(gen), via=name)
     return name
 
 
@@ -309,24 +315,25 @@ def run_once(ws: Path, cfg: Settings, now: Optional[float] = None, holders=None,
         if decision.action != policy.SPEAK:
             report.skipped[tid] = decision.reason
             continue
-        if not ack_claim.claim(ws, decision.key, HOLDER, now=now, template=decision.template):
+        gen = ack_claim.claim(ws, decision.key, HOLDER, now=now, template=decision.template)
+        if not gen:
             report.skipped[tid] = "another sender holds the initial ack"
             continue
         if before_publish is not None:
             before_publish(tid)
         veto = recheck(ws, tid)
         if veto is not None:
-            ack_claim.release(ws, decision.key, HOLDER)
+            ack_claim.release(ws, decision.key, HOLDER, gen=_gen(gen))
             report.withdrawn[tid] = veto
             continue
         body = routed_body(decision)
         if body is None:
-            ack_claim.release(ws, decision.key, HOLDER)
+            ack_claim.release(ws, decision.key, HOLDER, gen=_gen(gen))
             report.withdrawn[tid] = "the verified thread could not be carried"
             continue
         name = proactive_routing.about_task_filename(tid, _stamp_ms(now), channel="ag2space")
         publish_text(ws / "results" / name, body)
-        ack_claim.update(ws, decision.key, HOLDER, via=name)
+        ack_claim.update(ws, decision.key, HOLDER, gen=_gen(gen), via=name)
         report.spoken.append(tid)
     return report
 

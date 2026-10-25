@@ -6,6 +6,7 @@
   c) only the holder may update or release; another holder is refused and nothing changes
   d) an unreadable or foreign-shaped record reads as held ("unknown"), never as free
   e) a malformed key is refused, never turned into a path
+  f) release/update bound to a claim generation never touch a successor created after a release
   CONTROL: a check-then-replace writer lets both racers win, so (a)/(b) can fail
 
 Run: python3 tests/ack-claim.test.py
@@ -102,6 +103,22 @@ def main() -> int:
     ack_claim.claim(ws, "ack:task-1761300000005:initial", "mine")
     held = [r["key"] for r in ack_claim.held_by(ws, "mine")]
     check(held == ["ack:task-1761300000005:initial"], f"d) held_by skips unreadable records ({held})")
+
+    k6 = "ack:task-1761300000006:initial"
+    g1 = ack_claim.claim(ws, k6, "runner")
+    check(isinstance(g1, str) and ack_claim.release(ws, k6, "runner", gen=g1), "f) a claim carries its generation")
+    g2 = ack_claim.claim(ws, k6, "runner")
+    check(isinstance(g2, str) and g2 != g1, "f) the republished claim is a new generation")
+    check(not ack_claim.release(ws, k6, "runner", gen=g1) and ack_claim.state(ws, k6) == "claimed",
+          "f) a stale release of the old generation leaves the successor")
+    check(not ack_claim.update(ws, k6, "runner", "confirmed", gen=g1) and ack_claim.state(ws, k6) == "claimed",
+          "f) a stale update of the old generation leaves the successor")
+    check(ack_claim.update(ws, k6, "runner", "confirmed", gen=g2) and ack_claim.state(ws, k6) == "confirmed",
+          "f) the current generation updates")
+    ack_claim.release(ws, k6, "runner")
+    g3 = ack_claim.claim(ws, k6, "runner")
+    check(ack_claim.release(ws, k6, "runner") and ack_claim.state(ws, k6) == "none" and g3,
+          "CONTROL: without a generation, the holder name alone deletes the successor")
 
     # CONTROL: interleave two check-then-replace writers by hand: both pass the check.
     k4 = "ack:task-1761300000004:initial"
