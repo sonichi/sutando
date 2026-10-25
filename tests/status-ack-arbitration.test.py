@@ -9,6 +9,8 @@ the runner's run_once(), whose line goes through the gateway's real proactive ou
   c) notify first: one POST from notify; the runner, past the deadline, publishes nothing
   d) neither the gateway bridge nor the result path reads the ack claim
   e) a claimed/assigned rename of the task keys the claim on the canonical id, either sender first
+  f) a pool worker's notify from its deliveries/<seat>/ sentinel arbitrates on the canonical key
+  g) a --task-file outside tasks/ (or not a sentinel under deliveries/) is never arbitrated
   CONTROL: a runner that ignores the shared claim makes (c) two POSTs; so does a notify
            that takes no claim in (a), so the one-POST check bites
 
@@ -135,6 +137,45 @@ def main() -> int:
                   f"e) {suffix} {order}: one POST in all, on the canonical key ({total})")
             check(ack_claim.state(lane5.ws, f"ack:{rid}{suffix}:initial") == "none",
                   f"e) {suffix} {order}: no key is minted from the renamed file's stem")
+    for order in ("notify first", "runner first"):
+        rid = "task-1761300000020"
+        lane7 = pl.Lane(gb, ISO)
+        sa.task(lane7.ws, rid, thread_root=sa.ROOT_EVT)
+        seat = lane7.ws / "deliveries" / "worker1"
+        seat.mkdir(parents=True, exist_ok=True)
+        sentinel = seat / f"{rid}.accepted"
+        sentinel.touch()
+        del NOTIFY_POSTS[:]
+        if order == "runner first":
+            runner_pass(lane7, sa.T0 + 130)
+            lane7.drain()
+            run_notify(sentinel, "On it.")
+        else:
+            rc7 = run_notify(sentinel, "On it.")
+            held7 = ack_claim.read(lane7.ws, f"ack:{rid}:initial") or {}
+            check(rc7 == 0 and len(NOTIFY_POSTS) == 1 and NOTIFY_POSTS[0].get("thread_root") == sa.ROOT_EVT
+                  and held7.get("holder") == "task-progress",
+                  f"f) the worker's first notify posts in the thread and holds the claim (rc {rc7}, {held7})")
+            r7 = runner_pass(lane7, sa.T0 + 130)
+            lane7.drain()
+            check(not r7.spoken and sa.proactive_files(lane7.ws) == [],
+                  f"f) the runner stays silent for the worker-held task ({r7.skipped.get(rid)!r})")
+        total = len(lane7.posts) + len(NOTIFY_POSTS)
+        check(total == 1, f"f) deliveries sentinel, {order}: one POST in all ({total})")
+
+    lane8 = pl.Lane(gb, ISO)
+    rid = "task-1761300000021"
+    body8 = sa.task(lane8.ws, rid).read_text(encoding="utf-8")
+    seat8 = lane8.ws / "deliveries" / "worker1"
+    seat8.mkdir(parents=True, exist_ok=True)
+    for other in (lane8.ws / "notes" / f"{rid}.txt", seat8 / "notes.txt"):
+        other.parent.mkdir(parents=True, exist_ok=True)
+        other.write_text(body8, encoding="utf-8")
+        del NOTIFY_POSTS[:]
+        rc8 = run_notify(other, "On it.")
+        check(rc8 == 0 and len(NOTIFY_POSTS) == 1 and ack_claim.state(lane8.ws, f"ack:{rid}:initial") == "none",
+              f"g) {other.parent.name}/{other.name}: sent, no claim taken (rc {rc8}, {len(NOTIFY_POSTS)} POSTs)")
+
     saved_arb, notify._ACK_ARBITRATION = notify._ACK_ARBITRATION, (
         notify._ACK_ARBITRATION[0], notify._ACK_ARBITRATION[1], lambda path: Path(path).stem)
     try:

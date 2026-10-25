@@ -474,14 +474,34 @@ _ACK_ARBITRATION = _load_ack_arbitration()
 ACK_HOLDER = "task-progress"
 
 
+_POOL_SCRIPTS = Path(__file__).resolve().parents[3] / "skills" / "worker-pool" / "scripts"
+
+
+def _task_payload(task_file: str) -> "Path | None":
+    """The `<ws>/tasks/` file a --task-file stands for: itself, or the payload a worker's
+    `deliveries/<seat>/` sentinel names (resolved by the optional worker-pool skill). Else None."""
+    path = Path(task_file).resolve()
+    if path.parent.name == "tasks":
+        return path
+    if path.parent.parent.name != "deliveries" or not (_POOL_SCRIPTS / "resolve_inbox_entry.py").is_file():
+        return None
+    try:
+        if str(_POOL_SCRIPTS) not in sys.path:
+            sys.path.insert(0, str(_POOL_SCRIPTS))
+        import resolve_inbox_entry  # type: ignore
+        return Path(resolve_inbox_entry.resolve(str(path), os.environ.get("SUTANDO_WORKSPACE_DIR") or None))
+    except Exception:
+        return None
+
+
 def _initial_ack_gate(task_file: "str | None") -> "tuple[bool, tuple | None]":
     """(may send, (workspace, key) this call now holds). A task's first notify is its initial ack
     and must win `ack:<task>:initial`; every later notify is progress and is never arbitrated."""
     if not task_file or _ACK_ARBITRATION is None:
         return True, None
     ack_claim, ack_key, task_id_for = _ACK_ARBITRATION
-    path = Path(task_file).resolve()
-    if path.parent.name != "tasks":
+    path = _task_payload(task_file)
+    if path is None:
         return True, None
     ws, tid = path.parent.parent, task_id_for(path)
     if not tid:
@@ -573,7 +593,8 @@ def main() -> int:
             print("[task-progress] --extra-content must be a JSON object", file=sys.stderr)
             return 1
 
-    derived = _derive_from_task_file(args.task_file) if args.task_file else {}
+    payload = _task_payload(args.task_file) if args.task_file else None
+    derived = _derive_from_task_file(str(payload or args.task_file)) if args.task_file else {}
 
     # An explicit flag wins even when empty: --thread-root '' opts out of the file's thread.
     def _pick(explicit, fallback):
