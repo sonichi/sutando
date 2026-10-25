@@ -251,6 +251,17 @@ def observe(ws: Path, row: dict, inbox: str, alerted: bool):
         cancel_requested=cancel_pending(ws, tid, own_file), owner_alerted=alerted), None
 
 
+def routed_body(decision) -> Optional[str]:
+    """The ack's file body with the verified room and thread root as leading markers, or None when
+    the markers do not parse back to exactly them; an ack is never sent unthreaded."""
+    dest = decision.destination
+    body = f"[channel: {dest.room}]\n[thread: {dest.thread_root}]\n{decision.text}\n"
+    actions = [(a.kind, a.value) for a in parse_markers(body).actions]
+    if sorted(actions) != sorted([("redirect", dest.room), ("thread", dest.thread_root)]):
+        return None
+    return body
+
+
 def recheck(ws: Path, tid: str) -> Optional[str]:
     """Why an ack decided a moment ago must not be published now, or None."""
     state = result_state(ws, tid)
@@ -308,8 +319,13 @@ def run_once(ws: Path, cfg: Settings, now: Optional[float] = None, holders=None,
             ack_claim.release(ws, decision.key, HOLDER)
             report.withdrawn[tid] = veto
             continue
+        body = routed_body(decision)
+        if body is None:
+            ack_claim.release(ws, decision.key, HOLDER)
+            report.withdrawn[tid] = "the verified thread could not be carried"
+            continue
         name = proactive_routing.about_task_filename(tid, _stamp_ms(now), channel="ag2space")
-        publish_text(ws / "results" / name, f"[channel: {decision.destination.room}]\n{decision.text}\n")
+        publish_text(ws / "results" / name, body)
         ack_claim.update(ws, decision.key, HOLDER, via=name)
         report.spoken.append(tid)
     return report
