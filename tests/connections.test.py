@@ -368,15 +368,18 @@ class RemoveConnection(Base):
         self.assertFalse(C.launch_record_path("beta-example", self.ws).exists())
         self.assertTrue(C.launch_record_path("alpha-example", self.ws).exists())
         self.assertTrue(self.rows()[0]["primary"])
+        self.assertEqual(sum(r["primary"] for r in self.rows()), 1)
 
-    def test_primary_needs_force_and_hands_primary_on(self):
+    def test_primary_needs_force_and_no_row_inherits_the_flag(self):
         self.add()
         self.add(TOKEN_B, fetch=agents("@s:beta.example"))
         with self.assertRaises(C.PrimaryProtected):
             C.remove_connection("alpha-example", workspace=self.ws, vault=self.vault)
         self.assertEqual(len(self.rows()), 2)
         C.remove_connection("alpha-example", force=True, workspace=self.ws, vault=self.vault)
-        self.assertEqual([(r["instance"], r["primary"]) for r in self.rows()], [("beta-example", True)])
+        self.assertEqual([(r["instance"], r["primary"]) for r in self.rows()], [("beta-example", False)])
+        row, _ = self.add()
+        self.assertTrue(row["primary"], "an install with no primary gives it to the next row saved")
 
     def test_unknown_instance(self):
         with self.assertRaises(C.UnknownConnection):
@@ -418,6 +421,17 @@ class ImportFromEnv(Base):
         self.add(TOKEN_B, fetch=unreachable)
         self.assertEqual(C.import_from_env({"AG2_REMOTE_TOKEN_DEV": TOKEN_B}, workspace=self.ws, vault=self.vault), [])
 
+    def test_named_env_tokens_never_become_primary_or_inherit_the_room(self):
+        created = C.import_from_env({"AG2_REMOTE_TOKEN_DEV": TOKEN_B}, workspace=self.ws, vault=self.vault)
+        self.assertEqual([(r["instance"], r["primary"]) for r in created], [("dev", False)])
+        entry = C.plan_entry("dev", {}, workspace=self.ws)
+        env = C.launch_env(entry, {"REMOTE_PROACTIVE_ROOM": "!parent:example"}, vault=self.vault)
+        self.assertEqual(env["REMOTE_PROACTIVE_ROOM"], "")
+        later = C.import_from_env({"REMOTE_TASK_TOKEN": TOKEN_A}, workspace=self.ws, vault=self.vault)
+        self.assertEqual([(r["instance"], r["primary"]) for r in later], [("", True)])
+        row, _ = self.add("https://gamma.example|g", fetch=unreachable)
+        self.assertFalse(row["primary"], "a saved row never displaces the primary")
+
     def test_import_uses_the_resolver_and_collapses_endpoints(self):
         created = C.import_from_env({"AG2_REMOTE_TOKEN_CHAT": "https://chat.s.space|a",
                                      "AG2_REMOTE_TOKEN_MATRIX": "https://matrix.s.space|b"},
@@ -454,7 +468,8 @@ class Record(Base):
             (json.dumps({"schema_version": 2, "connections": []}), "schema_version"),
             (json.dumps({"schema_version": 1, "connections": {}}), "not a list"),
             (json.dumps({"schema_version": 1, "connections": [{"server": "a"}]}), "lacks"),
-            (json.dumps({"schema_version": 1, "connections": [row(primary=False)]}), "exactly one"),
+            (json.dumps({"schema_version": 1, "connections": [row(), row(server="b", instance="y", token_ref="U")]}),
+             "more than one primary"),
             (json.dumps({"schema_version": 1, "connections": [row(), row(server="b", token_ref="U")]}),
              "duplicate instance"),
             (json.dumps({"schema_version": 1, "connections": [row(added_by="nobody")]}), "added_by"),

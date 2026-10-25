@@ -42,7 +42,12 @@ LOOP="$(awk '/# Named gateways \(multi-gateway\)/,/^    fi$/' "$REPO/src/startup
 
 run_loop() {  # $1 = extra env assignments (string), evaluated before the block
   ENV_DUMP="$TMP/env-dump"; : > "$ENV_DUMP"; rm -rf "$TMP/ws"; mkdir -p "$TMP/ws" "$TMP/logs"
-  ( eval "$1"
+  # The host's own gateway credentials must not shape the test; a parent proactive room
+  # is always present, so a secondary that inherits it is caught in every case.
+  ( unset REMOTE_TASK_TOKEN AG2_REMOTE_TOKEN REMOTE_TASK_URL REMOTE_TASK_TOKEN_FILE
+    for _v in $(env | grep -o '^AG2_REMOTE_TOKEN_[A-Za-z0-9_]*' || true); do unset "$_v"; done
+    export REMOTE_PROACTIVE_ROOM='!parent:example'
+    eval "$1"
     export ENV_DUMP PATH="$TMP/bin:$PATH" FAKE_KEYCHAIN="$TMP/keychain" SUTANDO_TEST_MODE=1 \
       SUTANDO_WORKSPACE="$TMP/ws" CLAUDE_CONFIG_DIR="$TMP/cc" SUTANDO_SUPPRESS_CCD_FALLBACK_BANNER=1
     PY="$PY"; REPO="$FAKE"; LOGS_DIR="$TMP/logs"
@@ -59,6 +64,9 @@ echo "$OUT" | grep -q '^REMOTE_TASK_CHANNEL_DIR=dev-ag2space$' \
 echo "$OUT" | grep -q '^GATEWAY_INSTANCE=dev$' \
   || { echo "FAIL: dev instance did not get GATEWAY_INSTANCE=dev"; echo "$OUT"; exit 1; }
 echo "  ok  dev instance defaults to dev-ag2space"
+echo "$OUT" | grep -q '^REMOTE_PROACTIVE_ROOM=$' \
+  || { echo "FAIL: dev instance inherited the parent's proactive room"; echo "$OUT"; exit 1; }
+echo "  ok  a named instance never inherits the parent's proactive room"
 grep -q 'tok-dev' "$TMP/loop-out" && { echo "FAIL: the token reached the launcher's output"; exit 1; }
 echo "  ok  the token never reaches the launcher's output"
 

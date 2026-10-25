@@ -139,7 +139,8 @@ class CliTests(unittest.TestCase):
         self.assertFalse((self.keychain / "AG2_REMOTE_TOKEN_127_0_0_2").exists())
         self.assertTrue((self.keychain / "AG2_REMOTE_TOKEN_127_0_0_1").exists())
         rows = json.loads(self.run_cli("list", "--json").stdout)
-        self.assertEqual([(r["instance"], r["primary"]) for r in rows], [("127-0-0-1", True)])
+        self.assertEqual([(r["instance"], r["primary"]) for r in rows], [("127-0-0-1", False)],
+                         "no row inherits the primary flag")
 
     def test_import_env_then_launch_plan(self):
         extra = {"REMOTE_TASK_TOKEN": TOKEN_A, "AG2_REMOTE_TOKEN_DEV": TOKEN_B}

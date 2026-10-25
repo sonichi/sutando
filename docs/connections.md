@@ -14,7 +14,7 @@ startup (`src/startup-runtime.sh`) all call that module and never touch the file
 | `instance` | The bridge instance slug (`s-space`): `GATEWAY_INSTANCE`, the suffix on `state/gateway-status.<instance>.json`, the `task-<instance>~<broker-id>` id prefix, the `channels/<instance>-ag2space/` config dir. `""` only for the legacy unsuffixed bridge imported from `REMOTE_TASK_TOKEN`. |
 | `gateway_url` | Stored exactly as the relay issued it inside the `url|secret` token. Never rewritten: an endpoint rename never touches stored rows. |
 | `token_ref` | The vault key the secret lives under (`AG2_REMOTE_TOKEN_<INST>`; `REMOTE_TASK_TOKEN` for the legacy row). The secret itself is never in this file. |
-| `primary` | Exactly one row. Proactive nudges and the owner-DM defaults stay with the primary; a secondary bridge launches with no `REMOTE_PROACTIVE_ROOM`. |
+| `primary` | At most one row. Proactive nudges and the owner-DM defaults stay with the primary; every other bridge launches with `REMOTE_PROACTIVE_ROOM` set empty, whatever the parent environment holds. |
 | `added_by` | `login`, `owner`, `ui` or `env`. |
 | `added_at` | ISO 8601 UTC. |
 | `verified` | Whether the server came from the gateway's own answer (below) rather than from the gateway hostname. |
@@ -59,7 +59,12 @@ lock is the backstop, not the policy). One homeserver's endpoints (`chat.` and
 `matrix.`) are one connection, whichever of them a token names. A verified preview, or a
 `reconnect` that learns the identity, **re-keys** a provisional (`gateway`/`resolver`)
 row to the identity's server in place: one row, one bridge, the instance slug and vault
-key unchanged. A row keyed by identity is never demoted. Adding **never changes which row is primary** except that the very
+key unchanged. A row keyed by identity is never demoted.
+
+A saved row is primary only when the install has no primary yet. `import-env` gives the
+flag only to the `REMOTE_TASK_TOKEN` row (the legacy unsuffixed bridge), never to a
+named `AG2_REMOTE_TOKEN_<INST>`; removing the primary leaves none until `set_primary`
+or the next saved row. Adding **never changes which row is primary** except that the very
 first row saved becomes primary. `set_primary(instance)` is the one way to move it,
 and moving it is what moves proactive and owner-DM routing at the next launch.
 
@@ -79,7 +84,7 @@ under `state/connections-launch/<instance>.json`:
 `reconnect(instance)` stops the one bridge holding that instance's singleton lock and
 launches it again; the other connections keep running. `remove_connection(instance)`
 drops the row, its vault key and its launch record, and nothing else; the primary needs
-`force`, and the primary flag then passes to the first remaining row.
+`force`, and no remaining row inherits the flag.
 
 ## Startup
 

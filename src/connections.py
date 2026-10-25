@@ -366,8 +366,8 @@ def _validate(payload: object) -> list:
         values = [r[key] for r in rows]
         if len(set(values)) != len(values):
             raise SchemaError(f"connections.json: duplicate {key}")
-    if rows and sum(1 for r in rows if r["primary"]) != 1:
-        raise SchemaError("connections.json: exactly one row must be primary")
+    if sum(1 for r in rows if r["primary"]) > 1:
+        raise SchemaError("connections.json: more than one primary row")
     return rows
 
 
@@ -456,8 +456,9 @@ def add_connection(token: str, *, added_by: str, expected_server: str, instance:
 
     Returns (row, created). A server or gateway host that already has a row returns that row,
     re-keyed to the identity's server when the row was provisional and this preview is
-    verified, and touches the vault never. The first row ever saved is the primary; later
-    rows never are. The secret goes to the vault under the row's token_ref before the row exists.
+    verified, and touches the vault never. The row is primary only when the install has no
+    primary yet (the first row ever saved); later rows never are. The secret goes to the vault
+    under the row's token_ref before the row exists.
     """
     if added_by not in ADDED_BY:
         raise ConnectionsError(f"added_by must be one of {', '.join(ADDED_BY)}")
@@ -484,7 +485,8 @@ def add_connection(token: str, *, added_by: str, expected_server: str, instance:
             _vault_store(vault, ref, token.strip())
             stored = True
             row = _row(server=server, instance=inst, gateway_url=str(seen["gateway_url"]), token_ref=ref,
-                       primary=not rows, added_by=added_by, verified=bool(seen.get("verified")),
+                       primary=not any(r["primary"] for r in rows), added_by=added_by,
+                       verified=bool(seen.get("verified")),
                        server_source=str(seen.get("server_source") or "gateway"),
                        agent_mxid=seen.get("agent_mxid"))
             rows.append(row)
@@ -541,7 +543,7 @@ def set_primary(instance: str, *, workspace: Optional[Path] = None) -> dict:
 def remove_connection(instance: str, *, force: bool = False, workspace: Optional[Path] = None,
                       vault=None) -> dict:
     """Drop the row, its vault key and its launch record; the primary only under `force`.
-    Other rows and their bridges are untouched."""
+    Other rows and their bridges are untouched; no row inherits the primary flag."""
     vault = _vault(vault)
     with _transaction(workspace) as rows:
         row = _find(rows, instance)
@@ -549,8 +551,6 @@ def remove_connection(instance: str, *, force: bool = False, workspace: Optional
             raise PrimaryProtected("refusing to remove the primary connection without force")
         _vault_delete(vault, row["token_ref"])
         rows.remove(row)
-        if row["primary"] and rows:
-            rows[0]["primary"] = True
     try:
         launch_record_path(instance, workspace).unlink()
     except FileNotFoundError:
@@ -572,9 +572,11 @@ def import_from_env(environ: Optional[Mapping[str, str]] = None, *,
                     workspace: Optional[Path] = None, vault=None, resolver=None) -> list:
     """Create a row once for REMOTE_TASK_TOKEN and each AG2_REMOTE_TOKEN_<INST>; existing rows stay.
 
-    Env rows are unverified: the resolver's server when it knows the host, else the host. The
-    secret is copied into the vault under the row's token_ref unless the vault already holds
-    one. Returns the rows created.
+    Env rows are unverified: the resolver's server when it knows the host, else the host. Only
+    the REMOTE_TASK_TOKEN row (the legacy unsuffixed bridge) can become primary, and only when
+    the install has none; a named env token never does, so no secondary ever inherits the
+    proactive room. The secret is copied into the vault under the row's token_ref unless the
+    vault already holds one. Returns the rows created.
     """
     environ = os.environ if environ is None else environ
     candidates = []
@@ -599,8 +601,8 @@ def import_from_env(environ: Optional[Mapping[str, str]] = None, *,
             if not _vault_get(vault, ref):
                 _vault_store(vault, ref, token)
             row = _row(server=server, instance=inst, gateway_url=gateway_url_of(token), token_ref=ref,
-                       primary=not rows, added_by="env", verified=False,
-                       server_source="resolver" if resolved else "gateway")
+                       primary=(inst == "" and not any(r["primary"] for r in rows)), added_by="env",
+                       verified=False, server_source="resolver" if resolved else "gateway")
             rows.append(row)
             created.append(dict(row))
     return created
