@@ -8,7 +8,7 @@ fails=0
 say() { echo "$1  $2"; [ "$1" = FAIL ] && fails=$((fails+1)); return 0; }
 
 FIX="$TD/repo"; mkdir -p "$FIX/src/agent/claude/cli" "$FIX/src/agent/codex/cli" "$FIX/scripts" "$FIX/bin"
-cp "$REPO/src/agent/start-cli.sh" "$REPO/src/agent/restart-guard.sh" "$FIX/src/agent/"
+cp "$REPO/src/agent/start-cli.sh" "$REPO/src/agent/restart-guard.sh" "$REPO/src/agent/tmux-socket-guard.sh" "$FIX/src/agent/"
 for rt in claude codex; do
   printf '#!/bin/bash\necho "LAUNCHER %s $*" >> "$TMUX_LOG"\n' "$rt" > "$FIX/src/agent/$rt/cli/start-cli.sh"
 done

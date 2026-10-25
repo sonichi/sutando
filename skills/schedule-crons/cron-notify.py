@@ -32,7 +32,7 @@ from pathlib import Path
 _SRC = str(Path(__file__).resolve().parents[2] / "src")
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
-from ag2space_links import DEFAULT_VIA, room_link  # noqa: E402
+from ag2space_links import room_link  # noqa: E402
 
 # Update kinds a cron can emit. Only a subset is worth pulling the owner's attention
 # to their active channel; routine "nothing changed" ticks stay silent (in-room only).
@@ -86,13 +86,14 @@ def is_attention_worthy(kind: str, summary: str = "") -> bool:
     return False          # every clause is an empty signal → downgrade
 
 
-def deep_link(room_id: str, event_id: str = "", via: str = DEFAULT_VIA) -> str:
-    """The room (or event) link the app opens in place: core's `ag2space_links.room_link`."""
+def deep_link(room_id: str, event_id: str = "", via: "str | None" = None) -> str:
+    """The room (or event) link the app opens in place: core's `ag2space_links.room_link`;
+    `via` None is the linked room's own server (`!x:server`)."""
     return room_link(room_id, event_id, via)
 
 
 def format_ping(cron: str, summary: str, room_id: str, event_id: str = "",
-                via: str = DEFAULT_VIA, max_summary: int = 140) -> str:
+                via: "str | None" = None, max_summary: int = 140) -> str:
     """One-line ping for the owner's active channel: `⏰ <cron>: <summary> → <deep-link>`.
 
     Summary is collapsed to a single line and truncated (the full detail lives in the
@@ -351,7 +352,8 @@ def main(argv=None):
              "— e.g. cron-room detail linked into the owner's active channel.",
     )
     ap.add_argument("--event-id", default="", help="cron-room event to deep-link to")
-    ap.add_argument("--via", default="ag2.space")
+    ap.add_argument("--via", default=None,
+                    help="matrix.to via server (default: the linked room's own server)")
     ap.add_argument("--state-file", default="",
                     help="JSON rate-limit state (cron→last-ping epoch). Default: "
                          "<workspace>/state/cron-notify-cooldown.json — omitting it "

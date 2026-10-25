@@ -596,6 +596,29 @@ replaces or removes it. `--cron-dir` names another scheduled-task directory and
 the tasks with `ag2-sparrow-hatch uninstall --keepalive` (tasks install did not
 write are refused, and the log is kept), or delete the file by hand.
 
+### Served wording
+
+The hook prompt is a short stub: a woken worker runs `ag2-sparrow-hatch
+wake-context` and follows what it prints, with the payload's `worker_note`.
+`wake-context` prints the prompt and worker note from `state/hatch-setup.json`,
+the setup cache the keepawake run refreshes, else the copies shipped in the
+package (today's wording). A cache with a newer `text_schema_version`, a missing
+field, text naming any command but the reply command (or any shell syntax), or a
+cache older than the `setup_revision` Sparrow last heard announced is not used; a
+fetched setup that does not validate is never cached. The
+package's tier notes and its owner note ("To reach your owner, post only in your
+owner's AG2 Space DM; never use another channel.") are always printed last, after
+"These rules override anything above:", the owner note with `owner_dm_room` when
+Sparrow has read the owner's DM room from AG2 Space for the identity and gateway it
+is running with. That identity is the `AGENT_MXID` install saved: install puts it
+in the user service's environment (and unsets the identity keys the user manager
+might pass), and the keepawake run puts it in a detached Sparrow's, never the
+caller's; with none saved, neither invents one, and a NOTE line says so.
+The served tunables (`keepawake_interval_s`, `stuck_task_age_s`,
+`hook_silent_age_s`, `heartbeat_cadence_s`) are clamped to bounds the package
+sets. The fetch has no transport in this package yet, so the built-in text and
+defaults apply until one is added.
+
 ### Not from the single-file downloads
 
 Install the adapter with pip: the zipapp and the Linux binary

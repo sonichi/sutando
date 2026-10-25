@@ -21,6 +21,7 @@ import json
 import os
 import time
 
+from . import diagnostics
 from .chat_secret_filter import filter_chat_secrets
 from .local_task_protocol import local_time_value
 
@@ -96,7 +97,7 @@ class TaskifyHandler:
             self.last_path = self._promote(room)
         except Exception as e:  # noqa: BLE001 — isolated; retried on re-drain
             self._log(f"event-consumer: promotion failed for {room} "
-                      f"(kept for retry): {e}")
+                      f"(kept for retry): {diagnostics.describe(e)}")
             return []
         settled = list(self._seen.get(room) or ())
         self._batch[room] = []

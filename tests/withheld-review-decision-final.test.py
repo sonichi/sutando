@@ -1669,7 +1669,7 @@ except Exception as exc:  # noqa: BLE001
     raised = exc
 finally:
     guard.claim_withheld_decision = real_claim
-check(raised is None and handled is True and any("could not be processed (boom)" in line for line in logs)
+check(raised is None and handled is True and any("could not be processed (RuntimeError at " in line and "boom" not in line for line in logs)
       and "please reply again" in json.loads(bridge._control_result_path("claim-raises").read_text())["body"],
       f"a raising claim is answered, never escapes the beat: {raised!r}")
 

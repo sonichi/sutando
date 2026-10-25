@@ -11,20 +11,23 @@ Pins, through the real sinks:
     check, which is what decides for a detached Sparrow Hatch falls back to;
   - the real Hatch install diff, which withholds every environment line whole and decides nothing
     about credentials;
-  - a structural guard: no other package module reads a credential source, and the vendored and
-    generated copies match their canonical sources.
+  - a structural guard: no other package module reads a credential source or re-implements the
+    masking contract (one registry, in diagnostics), and the vendored and generated copies match
+    their canonical sources.
 Hermetic: temp HOME and files, a faked vault, no network, no real credential.
 """
 from __future__ import annotations
 
 import ast
 import contextlib
+import functools
 import importlib.util
 import io
 import json
 import os
 import random
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -181,6 +184,13 @@ class PureContractCases:
         self.assertEqual(self.c.code_field("reenroll_disabled", registry), "reenroll_disabled")
         self.assertIsNone(self.c.code_field("has space", registry))
         self.assertIsNone(self.c.code_field("query-secret-3", None, URL_SECRET_URL))
+        # A setup revision has one spelling on both sides: an integer is its decimal text, then code_field.
+        self.assertEqual(self.c.revision_field(41, registry), "41")
+        self.assertEqual(self.c.revision_field("r41", registry), "r41")
+        self.assertIsNone(self.c.revision_field(7, registry), "a digit of the secret is a piece of it")
+        for value in (True, False, 41.0, None, "has space", "bearer-secret-value-77", "secret-value-77"):
+            self.assertIsNone(self.c.revision_field(value, registry), value)
+        self.assertIsNone(self.c.revision_field("query-secret-3", None, URL_SECRET_URL))
 
     def test_url_parts_are_registered_and_redacted(self):
         registry = self.c.SecretRegistry()
@@ -541,6 +551,49 @@ class DiscoveryCases:
         self.o.register(registry, [URL_SHAPED_BEARER])
         self.assertTrue(registry.contains(f"x {URL_SHAPED_BEARER} y"))
 
+    def test_a_url_keys_plain_url_registers_by_its_parts_so_the_bare_gateway_renders(self):
+        tf = f"REMOTE_TASK_URL={GW}\nREMOTE_TASK_TOKEN={FILE_TOKEN}\n"
+        files = self.o.env_files({"AG2_DEVICE_ENV": "/dev"}, lambda p: f"REMOTE_TASK_URL={URL_SECRET_URL}\n")
+        registry = self.o.contract.SecretRegistry()
+        self.o.discover({"REMOTE_TASK_URL": GW, "AG2_DEVICE_ENV": "/dev", "REMOTE_TASK_TOKEN_FILE": "/t",
+                         "REMOTE_TASK_TOKEN": URL_SHAPED_BEARER},
+                        files, read_token_file=lambda p: tf, registry=registry)
+        for line in (f"poll ok, gateway {GW}", f"gateway {self.o.contract.redact_url(URL_SECRET_URL)}"):
+            self.assertEqual(registry.scrub(line), line, "a URL's redacted form is not a secret")
+        for secret in ("pass-word-2", "query-secret-3", "frag-secret-4", URL_SHAPED_BEARER, FILE_TOKEN):
+            self.assertTrue(registry.contains(f"x {secret} y"), secret)
+        whole = self.o.contract.SecretRegistry()
+        self.o.register_pairs(whole, [("REMOTE_TASK_URL", f"{GW}|{CHANNEL_TOKEN}"), ("REMOTE_TASK_URL", "bare-9911")])
+        for secret in (CHANNEL_TOKEN, "bare-9911"):
+            self.assertTrue(whole.contains(secret), "anything but a plain URL under a URL key is registered whole")
+
+    def test_a_token_files_raw_line_is_registered_whichever_env_names_the_file(self):
+        text = f"REMOTE_TASK_TOKEN={GW}|{FILE_TOKEN}\nraw-candidate-7781\n"
+        for env, files in (({"REMOTE_TASK_TOKEN_FILE": "/t"}, []),
+                           ({}, [("/chan", {"REMOTE_TASK_TOKEN_FILE": "/t"})])):
+            with self.subTest(env=env):
+                registry = self.o.contract.SecretRegistry()
+                self.o.discover(env, files, read_token_file=lambda p: text, registry=registry)
+                for secret in (FILE_TOKEN, "raw-candidate-7781"):
+                    self.assertTrue(registry.contains(f"x {secret} y"), secret)
+
+    def test_only_the_raw_line_that_could_become_the_token_is_registered(self):
+        text = (f"# rotated\nREMOTE_TASK_TOKEN={GW}|{FILE_TOKEN}\nset -a\nok\n")
+        registry = self.o.contract.SecretRegistry()
+        self.o.discover({}, [("/chan", {"REMOTE_TASK_TOKEN_FILE": "/t"})],
+                        read_token_file=lambda p: text, registry=registry)
+        self.assertTrue(registry.contains(FILE_TOKEN))
+        for line in ("poll ok -- backing off 4s", "set -a", "a broken token"):
+            self.assertEqual(registry.scrub(line), line, "a short line beside an assignment is no candidate")
+        later = self.o.contract.SecretRegistry()
+        self.o.discover({"REMOTE_TASK_TOKEN_FILE": "/t"}, read_token_file=lambda p: (
+            f"REMOTE_TASK_TOKEN={FILE_TOKEN}\nfirst-raw-line-1\nsecond-raw-line-2\n"), registry=later)
+        self.assertTrue(later.contains("first-raw-line-1"))
+        self.assertFalse(later.contains("second-raw-line-2"), "no later raw line is ever read as the token")
+        alone = self.o.contract.SecretRegistry()
+        self.o.discover({"REMOTE_TASK_TOKEN_FILE": "/t"}, read_token_file=lambda p: "# c\nok7\n", registry=alone)
+        self.assertTrue(alone.contains("x ok7 y"), "with no assignment the raw line is the token, at any length")
+
     def test_the_table_drives_the_choice(self):
         row = ROWS[0]  # env wins over every file, as tabled
         with tempfile.TemporaryDirectory() as td, \
@@ -581,14 +634,41 @@ class DiscoveryCases:
         self.assertEqual(found.raw, "  pad-tok-1  ")
         self.assertTrue(registry.contains(f"Bearer {found.raw}."), "the value used is the value registered")
 
-    def test_the_owner_opens_nothing_itself(self):
+    def test_the_owner_touches_only_the_declaration(self):
         tree = ast.parse(Path(self.o.__file__).read_text())
         calls = {ast.unparse(n.func) for n in ast.walk(tree) if isinstance(n, ast.Call)}
-        for io_call in ("open", "os.environ.get", "os.getenv", "Path", "print"):
+        for io_call in ("os.environ.get", "os.getenv", "Path", "print"):
             self.assertNotIn(io_call, calls, io_call)
         self.assertNotIn("os.environ", ast.unparse(tree))
+        def where(names):
+            return {f.name for f in ast.walk(tree) if isinstance(f, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    for n in ast.walk(f) if isinstance(n, ast.Call) and ast.unparse(n.func) in names}
+        self.assertEqual(where({"open"}), {"_declaration_owned"}, "the one read: the declaration's own check")
+        self.assertEqual(where({"os.fdopen", "tempfile.mkstemp", "os.replace", "os.makedirs", "os.chmod"}),
+                         {"write_bridge_declaration"})
+        self.assertEqual(where({"os.unlink"}), {"write_bridge_declaration", "remove_bridge_declaration"})
 
 
+
+
+class _Spy:
+    """A file handle that records the size of each read."""
+
+    def __init__(self, fh, reads):
+        self._fh, self._reads = fh, reads
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self._fh.close()
+
+    def fileno(self):
+        return self._fh.fileno()
+
+    def read(self, n=-1):
+        self._reads.append(n)
+        return self._fh.read(n)
 
 
 class PackageDiscovery(DiscoveryCases, unittest.TestCase):
@@ -757,6 +837,25 @@ class RealSinks(unittest.TestCase):
             reload_err = err.split("--reload--", 1)[1]
             self.assertIn(f"credential file {fx.token_file} was refused (not UTF-8)", reload_err)
             self.assertNotIn(FILE_TOKEN, reload_err, "path and reason, never content")
+
+    def test_a_malformed_rotated_gateway_url_is_logged_as_the_placeholder(self):
+        with tempfile.TemporaryDirectory() as td:
+            fx = Fixture(Path(td), ROWS[0])
+            fx.token_file.write_text(f"REMOTE_TASK_TOKEN={ENV_TOKEN}\n")
+            fx.env["REMOTE_TASK_TOKEN_FILE"] = str(fx.token_file)
+            path = json.dumps(str(fx.token_file))
+            script = BRIDGE.replace("print(json.dumps({", (
+                "import contextlib, io, pathlib\n"
+                f"pathlib.Path({path}).write_text("
+                f"'REMOTE_TASK_TOKEN={FILE_TOKEN}\\nREMOTE_TASK_URL=http://[::1?token=zq9rot\\n')\n"
+                "logged = io.StringIO()\n"
+                "with contextlib.redirect_stdout(logged), contextlib.redirect_stderr(logged):\n"
+                "    reloaded = m._reload_rotated_token()\n"
+                'print(json.dumps({"reloaded": reloaded, "logged": logged.getvalue(), '))
+            out, _err = self.bridge(fx, script)
+            self.assertFalse(out["reloaded"], "a URL change is never a rotation")
+            self.assertIn(f"DIFFERENT gateway ({owner.contract.REDACTED_URL})", out["logged"])
+            self.assertNotIn("zq9rot", out["logged"], "an unparseable URL fails closed, never the raw input")
 
     def hatch_diff(self, fx, installed: str, name: str = "ag2-sparrow.service",
                    ours: str = "[Service]\nExecStart=/y\n") -> str:
@@ -999,7 +1098,8 @@ class RealSinks(unittest.TestCase):
                                "REMOTE_TASK_URL", str(fx.root / "t")):
                     self.assertNotIn(secret, shown, secret)
                 if kind == "retained":
-                    self.assertEqual(shown.count("Environment=<withheld>\n"), 5, "a line per old one, in context")
+                    self.assertEqual(shown.splitlines().count(" Environment=<withheld>"), 5,
+                                     "a line per old one, in context")
                     self.assertIn("+Description=ag2-sparrow (AG2 Space listener)\n", shown, "the rest is shown")
 
     def test_a_drop_in_is_never_read_and_its_lines_would_be_withheld(self):
@@ -1182,14 +1282,28 @@ class BoundedRead(unittest.TestCase):
 
 SOURCE_KEYS = set(owner.CREDENTIAL_KEYS) | {owner.TOKEN_FILE_KEY}
 KEY_TUPLES = {"TOKEN_KEYS", "URL_KEYS", "CREDENTIAL_KEYS", "TOKEN_FILE_KEY", "MEDIA_TOKEN_KEY"}
-# The owner's name-only route: called with no arguments, as a dict value or a keyword value, and nowhere else.
-NAME_ONLY = frozenset({"token_env_name"})
+# Only the owner builds, writes and reads the bridge record: outside it, its private names, its key
+# tuples and the record's token key are never named, as an identifier or as a string.
+OWNER_ONLY = frozenset({"token_env_name", "_bridge_declaration_text", "_RECORD_TOKEN_ENV"})
+RECORD_KEY = "token_env"
+# The owner's accessors for a supervisor that reads a declaration: only the one reader may name them.
+READER_ONLY = frozenset({"bridge_declaration_fields", "bridge_token_environ", "bridge_strip_keys", "bridge_carried_config"})
+# Outside the package, the one module that reads a bridge declaration, held to the owner-only rule.
+RECORD_READERS = {"sparrow_agent_bridge.py": REPO / "src" / "sparrow_agent_bridge.py"}
 # What names a credential file or store: a scope holding one of these and a read is credential I/O.
 CREDENTIAL_MARKERS = {"AG2_DEVICE_ENV", "CLAUDE_CONFIG_DIR", "TOKEN_FILE", "device_env_path",
                       "channel_env_paths", "env_files", "channel_token", "token_from_vault"}
 READS = {"open", "read_text", "read_bytes", "readlines"}
+# The bridge declaration's file: a path built from these is opaque outside the owner. It may be
+# formatted into a message or handed to one of DECLARATION_OWNER_CALLS, and nothing else.
+DECLARATION_MARKERS = {"DECLARATION", "worker.json"}
+DECLARATION_OWNER_CALLS = {"write_bridge_declaration", "remove_bridge_declaration"}
+OWNER_MODULE = "gateway_credential_sources"
+# The owner's entry points: reachable only as `<alias>.<name>(...)` on the module's one import of it.
+OWNER_CALLS = frozenset(DECLARATION_OWNER_CALLS | READER_ONLY)
 # Owner calls whose callable arguments read credentials: (positional index, keyword names).
-OWNER_READERS = {"env_files": (1, ("read_text",)), "discover": (None, ("read_token_file", "vault_lookup"))}
+OWNER_READERS = {"env_files": (1, ("read_text",)), "bridge_carried_config": (1, ("read_text",)),
+                 "discover": (None, ("read_token_file", "vault_lookup"))}
 # Where credential I/O may happen: the adapters' edge, as (module, function).
 # The shared systemd reachability probe discards what show-environment prints.
 IO_ALLOWED = {("remote_gateway_bridge.py", "_read_env_file"), ("remote_gateway_bridge.py", "_read_text"),
@@ -1263,7 +1377,16 @@ PROBE_KEEPS = (ast.Global, ast.Nonlocal, ast.Assign, ast.AugAssign, ast.AnnAssig
 
 
 def _str(node) -> bool:
+    """A literal string node: the call-shape checks require one; detection reads _folded instead."""
     return isinstance(node, ast.Constant) and isinstance(node.value, str)
+
+
+def _folded(node, parents) -> "str | None":
+    """_constant(node), except where the parent folds whole (that parent is read instead)."""
+    parent = parents.get(node)
+    if isinstance(parent, (ast.BinOp, ast.JoinedStr, ast.FormattedValue)) and _constant(parent) is not None:
+        return None
+    return _constant(node)
 
 
 def _literal_list(node) -> bool:
@@ -1274,8 +1397,9 @@ def _callee(call) -> "str | None":
     return getattr(call.func, "id", None) or getattr(call.func, "attr", None)
 
 
-def _systemctl_literal(node) -> bool:
-    return _str(node) and os.path.basename(node.value.strip()) == "systemctl"
+def _systemctl_literal(node, parents) -> bool:
+    text = _folded(node, parents)
+    return text is not None and os.path.basename(text.strip()) == "systemctl"
 
 
 def _literal_args(call) -> bool:
@@ -1287,11 +1411,11 @@ def _literal_args(call) -> bool:
 
 
 def _systemd_findings(tree, parents, rel: str) -> "list[str]":
-    """Closed world, no constant evaluated and no dataflow: "systemctl" as a string literal anywhere
+    """Closed world, no dataflow: "systemctl" as a string (folded by _constant) anywhere
     but inside SYSTEMCTL_HELPER, the one top-level def of that name in its module; every use of a
     SYSTEMD_RUNNERS name a direct call by that name (the helper's with a literal tuple, _systemd_run's
     on a literal program), never imported under another name, rebound, redefined, or named in a
-    string; and show-environment in any string literal (template parts included) outside SYSTEMD_PROBE."""
+    string; and show-environment in any string (folded, template parts included) outside SYSTEMD_PROBE."""
     tops = [f for f in tree.body if isinstance(f, ast.FunctionDef) and f.name == SYSTEMCTL_HELPER[1]]
     canonical = {id(tops[0])} if rel == SYSTEMCTL_HELPER[0] and len(tops) == 1 else set()
     canonical |= {id(f) for f in tree.body if isinstance(f, ast.FunctionDef) and f.name == "_systemd_run"
@@ -1303,7 +1427,7 @@ def _systemd_findings(tree, parents, rel: str) -> "list[str]":
         while scope is not None and not isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef)):
             scope = parents.get(scope)
         where = f"{rel}:{getattr(n, 'lineno', getattr(parents.get(n), 'lineno', '?'))}"
-        if _str(n) and SHOW_ENV in n.value and (rel, getattr(scope, "name", None)) != SYSTEMD_PROBE:
+        if SHOW_ENV in (_folded(n, parents) or "") and (rel, getattr(scope, "name", None)) != SYSTEMD_PROBE:
             out.append(f"{where} {SHOW_ENV} outside the reachability probe")
         if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and n.name in SYSTEMD_RUNNERS \
                 and id(n) not in canonical:
@@ -1319,7 +1443,7 @@ def _systemd_findings(tree, parents, rel: str) -> "list[str]":
             out.append(f"{where} {sorted(w for w in SYSTEMD_RUNNERS if w in text)[0]} named in a string")
         if id(n) in helper:
             continue
-        if _systemctl_literal(n):
+        if _systemctl_literal(n, parents):
             out.append(f"{where} a systemctl literal outside {SYSTEMCTL_HELPER[1]}")
         word = getattr(n, "id", None) if isinstance(n, ast.Name) else getattr(n, "attr", None)
         if word not in SYSTEMD_RUNNERS or not isinstance(n, (ast.Name, ast.Attribute)):
@@ -1336,9 +1460,25 @@ def _systemd_findings(tree, parents, rel: str) -> "list[str]":
     return out
 
 
+def _memo(scan):
+    """Each scan is a pure function of (source, rel); tests repeat whole-package scans, so each module
+    is scanned once per run. Callers get a fresh list."""
+    cached = functools.lru_cache(maxsize=None)(lambda *args, **kw: tuple(scan(*args, **kw)))
+    return functools.wraps(scan)(lambda *args, **kw: list(cached(*args, **kw)))
+
+
+@_memo
 def systemd_findings(source: str, rel: str) -> "list[str]":
     tree = ast.parse(source)
     return _systemd_findings(tree, {c: n for n in ast.walk(tree) for c in ast.iter_child_nodes(n)}, rel)
+
+
+@functools.lru_cache(maxsize=None)
+def _named_defs(text: str) -> "tuple[tuple[str, bool], ...]":
+    """(name, at the top level) for every def and class in a module's text."""
+    tree = ast.parse(text)
+    return tuple((n.name, n in tree.body) for n in ast.walk(tree)
+                 if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)))
 
 
 def package_systemd_findings(root: Path) -> "list[str]":
@@ -1347,11 +1487,10 @@ def package_systemd_findings(root: Path) -> "list[str]":
     found, defs = [], {name: [] for name in sorted(SYSTEMD_RUNNERS)}
     for path in sorted(root.rglob("*.py")):
         rel, text = path.relative_to(root).as_posix(), path.read_text(encoding="utf-8")
-        tree = ast.parse(text)
         found += systemd_findings(text, rel)
-        for n in ast.walk(tree):
-            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and n.name in defs:
-                defs[n.name].append((rel, n in tree.body))
+        for name, top in _named_defs(text):
+            if name in defs:
+                defs[name].append((rel, top))
     found += [f"{name} is defined at {where}, not once at the top level of {SYSTEMCTL_HELPER[0]}"
               for name, where in defs.items() if where != [(SYSTEMCTL_HELPER[0], True)]]
     return found
@@ -1360,7 +1499,7 @@ def package_systemd_findings(root: Path) -> "list[str]":
 def _probe_keeps(inner, parents) -> "list[str]":
     """Why a scope that runs show-environment keeps its output: the run's result must be passed
     straight to _ok, a bool, and the scope may not read stdout/stderr, print, write or store."""
-    probe = [n for n in inner if _str(n) and SHOW_ENV in n.value]
+    probe = [n for n in inner if SHOW_ENV in (_folded(n, parents) or "")]
     if not probe:
         return []
     why = []
@@ -1382,40 +1521,280 @@ def _probe_keeps(inner, parents) -> "list[str]":
     return why
 
 
-def _names_only(node, parents) -> bool:
-    """A NAME_ONLY use is a bare call whose result is a dict value or a keyword value, nothing else."""
+def _docstrings(tree) -> "set[int]":
+    return {id(n.body[0].value) for n in ast.walk(tree)
+            if isinstance(n, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+            and n.body and isinstance(n.body[0], ast.Expr) and isinstance(n.body[0].value, ast.Constant)}
+
+
+def _checked_nodes(tree, parents):
+    """(node, its folded string or None) for every node not inside a docstring or a folded string."""
+    docstrings = _docstrings(tree)
+    for node in ast.walk(tree):
+        parent = parents.get(node)
+        if id(node) in docstrings or (isinstance(parent, (ast.BinOp, ast.JoinedStr, ast.FormattedValue))
+                                      and _constant(parent) is not None):
+            continue  # the folded parent is checked whole
+        yield node, _folded(node, parents)
+
+
+def _binds(tree, name: str) -> int:
+    """How many places in the module bind `name`: assignment targets, parameters, imports, defs,
+    except-as, global or nonlocal declarations."""
+    count = 0
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Name) and n.id == name and not isinstance(n.ctx, ast.Load):
+            count += 1
+        elif isinstance(n, ast.arg) and n.arg == name:
+            count += 1
+        elif isinstance(n, ast.alias) and (n.asname or n.name.split(".")[0]) == name:
+            count += 1
+        elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and n.name == name:
+            count += 1
+        elif isinstance(n, ast.ExceptHandler) and n.name == name:
+            count += 1
+        elif isinstance(n, (ast.Global, ast.Nonlocal)) and name in n.names:
+            count += 1
+    return count
+
+
+def _owner_call_node(call, alias) -> bool:
+    """`call` is `<alias>.<declaration entry point>(...)` on the owner module's import."""
+    return alias is not None and isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute) \
+        and call.func.attr in DECLARATION_OWNER_CALLS and isinstance(call.func.value, ast.Name) \
+        and call.func.value.id == alias
+
+
+def _owner_call(node, parents, alias) -> bool:
+    """`node` is the function of a call `<alias>.<entry point>(...)` on the owner module's import."""
     call = parents.get(node)
-    if not (isinstance(call, ast.Call) and call.func is node and not call.args and not call.keywords):
+    return alias is not None and isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) \
+        and node.value.id == alias and isinstance(call, ast.Call) and call.func is node
+
+
+def owner_alias(tree) -> "str | None":
+    """The name the module's one top-level import of the owner module binds, if it binds it once and
+    nothing rebinds it; None otherwise (then no call reaches the owner's entry points)."""
+    imports = [(n, a) for n in tree.body if isinstance(n, (ast.Import, ast.ImportFrom)) for a in n.names
+               if a.name.rsplit(".", 1)[-1] == OWNER_MODULE and a.asname
+               and (isinstance(n, ast.Import) or n.module in (None, "ag2_sparrow"))]
+    if len(imports) != 1:
+        return None
+    alias = imports[0][1].asname
+    return alias if _binds(tree, alias) == 1 else None
+
+
+@_memo
+def owner_only_findings(source: str, rel: str, reader: bool = False) -> "list[str]":
+    """Every name the owner keeps to itself that `source` names: a key tuple, a private name or the
+    record's token key, as an identifier, an import, an attribute or a string (a getattr argument);
+    and an owner entry point reached other than as a direct call on the owner module's one import."""
+    tree = ast.parse(source)
+    parents = {c: n for n in ast.walk(tree) for c in ast.iter_child_nodes(n)}
+    alias = owner_alias(tree)
+    out = []
+    for node, text in _checked_nodes(tree, parents):
+        name = node.attr if isinstance(node, ast.Attribute) else node.id if isinstance(node, ast.Name) else None
+        if isinstance(node, ast.alias):
+            name = node.name.rsplit(".", 1)[-1]
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            name = node.name
+        if name in KEY_TUPLES or text in KEY_TUPLES:
+            out.append(f"{rel}:{node.lineno} owner key tuple {name or text}")
+        if name in OWNER_ONLY or text in OWNER_ONLY:
+            out.append(f"{rel}:{node.lineno} {name or text} named outside the owner")
+        if not reader and (name in READER_ONLY or text in READER_ONLY):
+            out.append(f"{rel}:{node.lineno} {name or text} named outside the declaration's reader")
+        if (name in OWNER_CALLS or text in OWNER_CALLS) and not _owner_call(node, parents, alias):
+            out.append(f"{rel}:{node.lineno} {name or text} reached other than as a call on the owner module")
+        if text == RECORD_KEY:
+            out.append(f"{rel}:{node.lineno} the record key {RECORD_KEY!r} named outside the owner")
+    return out
+
+
+def _scope_nodes(root):
+    """The nodes of one scope: `root` and what it holds, not the bodies of nested defs or classes."""
+    nested = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)
+    stack, out = [root], []
+    while stack:
+        n = stack.pop()
+        out.append(n)
+        stack.extend(c for c in ast.iter_child_nodes(n) if not isinstance(c, nested))
+    return out
+
+
+@_memo
+def declaration_reads(source: str, rel: str) -> "list[str]":
+    """Every call, in `source`, that takes a path to the declaration (as an argument or as the object of
+    a method: open, read_text, a helper, str()) other than an owner call on the owner module's import.
+    A path is built from DECLARATION or a string folding to the file name, or comes from a name, module
+    global, function or lambda that yields one. A message about the path (an f-string, a name bound from
+    one, a function returning only those) is exempt only as the argument itself; any other use is a path."""
+    tree = ast.parse(source)
+    alias, out = owner_alias(tree), []
+    names = {m for m in DECLARATION_MARKERS if "." not in m}
+    files = {m for m in DECLARATION_MARKERS if "." in m}
+    funcs = [f for f in ast.walk(tree) if isinstance(f, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))]
+    module = [n for root in tree.body if not isinstance(root, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+              for n in _scope_nodes(root)]
+    producers, messages = set(), set()
+
+    def marked(expr, bound):
+        """Whether `expr` reaches the path at all: pure reachability, opaque only at an owner call."""
+        stack = [expr]
+        while stack:
+            n = stack.pop()
+            if any(m in (_constant(n) or "") for m in files):
+                return True
+            if _owner_call_node(n, alias):
+                continue  # what the owner returns is not the path
+            word = n.id if isinstance(n, ast.Name) else n.attr if isinstance(n, ast.Attribute) else None
+            if word in names | producers | messages or (isinstance(n, ast.Name) and n.id in bound):
+                return True
+            stack.extend(ast.iter_child_nodes(n))
         return False
-    holder = parents.get(call)
-    return isinstance(holder, ast.keyword) or (isinstance(holder, ast.Dict) and any(v is call for v in holder.values))
+
+    def message(expr, said, bound):
+        """`expr` itself is a message or a truth value: an f-string, a name bound from one, a call to a
+        function whose every path-reaching return is one, a `not` or a comparison, or an `and`/`or`/`if`
+        whose path-reaching parts all are."""
+        word = getattr(getattr(expr, "func", None), "id", None) or getattr(getattr(expr, "func", None), "attr", None)
+        if isinstance(expr, ast.BoolOp):
+            return all(message(v, said, bound) for v in expr.values if marked(v, bound))
+        if isinstance(expr, ast.IfExp):
+            return all(message(v, said, bound) for v in (expr.body, expr.orelse) if marked(v, bound))
+        return isinstance(expr, (ast.JoinedStr, ast.Compare)) or (isinstance(expr, ast.Name) and expr.id in said) \
+            or (isinstance(expr, ast.UnaryOp) and isinstance(expr.op, ast.Not)) \
+            or (isinstance(expr, ast.Call) and word in messages - producers)
+
+    def taint(inner, seed):
+        tainted, said = set(seed[0]), set(seed[1])
+        for _ in range(4):
+            before = (len(tainted), len(said))
+            for n in inner:
+                bound = tainted | said
+                if isinstance(n, (ast.Assign, ast.AnnAssign, ast.NamedExpr, ast.AugAssign)) and n.value is not None \
+                        and marked(n.value, bound):
+                    targets = n.targets if isinstance(n, ast.Assign) else [n.target]
+                    hit = {t.id for tg in targets for t in ast.walk(tg) if isinstance(t, ast.Name)}
+                    if message(n.value, said, bound) and not isinstance(n, ast.AugAssign):
+                        said |= hit - tainted
+                    else:
+                        tainted |= hit
+                        said -= hit
+                elif isinstance(n, ast.withitem) and n.optional_vars is not None and marked(n.context_expr, bound):
+                    tainted |= {t.id for t in ast.walk(n.optional_vars) if isinstance(t, ast.Name)}
+                elif isinstance(n, (ast.For, ast.comprehension)) and marked(n.iter, bound):
+                    tainted |= {t.id for t in ast.walk(n.target) if isinstance(t, ast.Name)}
+            if (len(tainted), len(said)) == before:
+                break
+        return tainted, said
+
+    scopes = []
+    for _ in range(4):  # producers, messages and module globals, to a fixpoint
+        known = (len(producers), len(messages))
+        glob = taint(module, (set(), set()))
+        scopes = [(module, glob)]
+        for f in funcs:
+            inner = [n for c in ast.iter_child_nodes(f) for n in _scope_nodes(c)]
+            tainted, said = taint(inner, glob)
+            scopes.append((inner, (tainted, said)))
+            returns = [f.body] if isinstance(f, ast.Lambda) else [n.value for n in inner if isinstance(n, ast.Return) and n.value]
+            reached = [v for v in returns if marked(v, tainted | said)]
+            if not isinstance(f, ast.Lambda) and reached:
+                (messages if all(message(v, said, tainted | said) for v in reached) else producers).add(f.name)
+        if (len(producers), len(messages)) == known:
+            break
+    for inner, (tainted, said) in scopes:
+        for n in inner:
+            if not isinstance(n, ast.Call) or _owner_call_node(n, alias):
+                continue
+            taken = n.args + [k.value for k in n.keywords] + ([n.func.value] if isinstance(n.func, ast.Attribute) else [])
+            receiver = [n.func.value] if isinstance(n.func, ast.Attribute) else []
+            if any(marked(a, tainted | said) and (a in receiver or not message(a, said, tainted | said)) for a in taken):
+                out.append(f"{rel}:{n.lineno} hands the bridge declaration's path to {ast.unparse(n.func)}")
+    return sorted(set(out))
 
 
+# Closed world for the declaration's reader: bridge_environ is exactly this (its docstring aside), and
+# these are the module's only mapping writes. A change to either is a reviewed edit of this test.
+READER_ENVIRON = """
+token_env = _sources.bridge_token_environ(token, url)
+strip = _sources.bridge_strip_keys() + _sources.BRIDGE_CARRIED_CONFIG
+host = os.environ if base is None else base
+env = {k: v for k, v in host.items() if k not in HOST_ONLY and k not in strip}
+env.update(decl["env"], REMOTE_PROACTIVE_ROOM="")
+env.update(_sources.bridge_carried_config(host, read_regular))
+env.update(token_env)
+return env
+"""
+READER_WRITES = {("bridge_environ", "env.update(decl['env'], REMOTE_PROACTIVE_ROOM='')"),
+                 ("bridge_environ", "env.update(_sources.bridge_carried_config(host, read_regular))"),
+                 ("bridge_environ", "env.update(token_env)"),
+                 ("main", "os.environ.clear()"), ("main", "os.environ.update(environ)")}
+MAPPING_WRITES = {"update", "setdefault", "__setitem__", "__delitem__", "pop", "popitem", "clear", "putenv", "unsetenv",
+                  "__ior__", "__or__", "__ror__"}
+# Every reach of a process environment in the reader, by (function, the expression holding it).
+READER_ENVIRON_USES = {("bridge_environ", "os.environ if base is None else base"),
+                       ("main", "os.environ.clear"), ("main", "os.environ.update")}
+
+
+def token_injection_findings(source: str, rel: str) -> "list[str]":
+    """The reader hands the bridge its token only through the owner: bridge_environ is READER_ENVIRON,
+    the module's mapping writes are READER_WRITES, main's environment is bridge_environ's result, and
+    no string in the module is one of the owner's token variable names."""
+    tree = ast.parse(source)
+    parents = {c: n for n in ast.walk(tree) for c in ast.iter_child_nodes(n)}
+    alias = owner_alias(tree)
+    out = [f"{rel}:{n.lineno} names the token variable {_constant(n)!r}" for n in ast.walk(tree)
+           if isinstance(_constant(n), str) and any(_constant(n) == k or (len(_constant(n)) >= 8 and _constant(n) in k)
+                                                    for k in owner.TOKEN_KEYS)]
+    fn = [f for f in tree.body if isinstance(f, ast.FunctionDef) and f.name == "bridge_environ"]
+    body = fn[0].body if fn else []
+    if body and isinstance(body[0], ast.Expr) and isinstance(_constant(body[0].value), str):
+        body = body[1:]
+    if len(fn) != 1 or [ast.dump(n) for n in body] != [ast.dump(n) for n in ast.parse(READER_ENVIRON).body]:
+        out.append(f"{rel}: bridge_environ is not the pinned owner merge")
+
+    def scope(n):
+        while n is not None and not isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            n = parents.get(n)
+        return getattr(n, "name", "<module>")
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Subscript) and not isinstance(n.ctx, ast.Load):
+            out.append(f"{rel}:{n.lineno} a mapping item written directly ({ast.unparse(n)})")
+        elif isinstance(n, ast.Call) and getattr(n.func, "attr", None) in MAPPING_WRITES \
+                and (scope(n), ast.unparse(n)) not in READER_WRITES:
+            out.append(f"{rel}:{n.lineno} a mapping write outside the pinned ones ({ast.unparse(n)})")
+        elif isinstance(n, ast.AugAssign) or (isinstance(n, ast.BinOp) and isinstance(n.op, ast.BitOr)):
+            out.append(f"{rel}:{n.lineno} an in-place or | merge ({ast.unparse(n)})")
+        elif isinstance(n, ast.Attribute) and n.attr == "environ" \
+                and (scope(n), ast.unparse(parents[n])) not in READER_ENVIRON_USES:
+            out.append(f"{rel}:{n.lineno} the process environment reached outside the pinned uses ({ast.unparse(parents[n])})")
+        elif (isinstance(n, ast.alias) and n.name == "environ") or _constant(n) == "environ":
+            out.append(f"{rel}:{getattr(n, 'lineno', '?')} the process environment named another way")
+        elif isinstance(n, ast.Dict) and any(k is None and ast.unparse(v) != f"{alias}.bridge_declaration_fields()"
+                                             for k, v in zip(n.keys, n.values)):
+            out.append(f"{rel}:{n.lineno} a ** merge of something other than the owner's fields")
+    main = [f for f in tree.body if isinstance(f, ast.FunctionDef) and f.name == "main"]
+    binds = [n for f in main for n in ast.walk(f) if isinstance(n, ast.Name) and n.id == "environ"
+             and not isinstance(n.ctx, ast.Load)]
+    if len(binds) != 1 or ast.unparse(parents[binds[0]].value) != "bridge_environ(decl, token, url=url)":
+        out.append(f"{rel}: main's environment is not bridge_environ(decl, token, url=url) alone")
+    return out
+
+
+@_memo
 def credential_access(source: str, rel: str) -> "list[str]":
     """Every way `source` (module `rel`) touches a credential source on its own: a credential key
     or a piece of one as a string, the owner's key tuples, credential I/O outside IO_ALLOWED, and
     a function handed to the owner as a reader that is not in IO_ALLOWED."""
     tree = ast.parse(source)
     parents = {c: n for n in ast.walk(tree) for c in ast.iter_child_nodes(n)}
-    docstrings = {id(n.body[0].value) for n in ast.walk(tree)
-                  if isinstance(n, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
-                  and n.body and isinstance(n.body[0], ast.Expr) and isinstance(n.body[0].value, ast.Constant)}
-    out = []
-    for node in ast.walk(tree):
-        parent = parents.get(node)
-        if id(node) in docstrings or (isinstance(parent, (ast.BinOp, ast.JoinedStr, ast.FormattedValue))
-                                      and _constant(parent) is not None):
-            continue  # the folded parent is checked whole
-        text = _constant(node)
+    out = owner_only_findings(source, rel) + declaration_reads(source, rel)
+    for node, text in _checked_nodes(tree, parents):
         if text is not None and any(text == k or (len(text) >= 8 and text in k) for k in SOURCE_KEYS):
             out.append(f"{rel}:{node.lineno} key {text!r}")
-        name = node.attr if isinstance(node, ast.Attribute) else node.id if isinstance(node, ast.Name) else None
-        if name in KEY_TUPLES:
-            out.append(f"{rel}:{node.lineno} owner key tuple {name}")
-        if name in NAME_ONLY and not _names_only(node, parents):
-            out.append(f"{rel}:{node.lineno} {name} used other than as a name in a record")
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name in NAME_ONLY:
-            out.append(f"{rel}:{node.lineno} a second definition of {node.name}")
     scopes = [("<module>", [n for n in tree.body if not isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))])]
     scopes += [(f.name, [f]) for f in ast.walk(tree) if isinstance(f, (ast.FunctionDef, ast.AsyncFunctionDef))]
     for name, nodes in scopes:
@@ -1426,8 +1805,8 @@ def credential_access(source: str, rel: str) -> "list[str]":
                 word = getattr(n, "id", None) or getattr(n, "attr", None)
                 if word in CREDENTIAL_MARKERS or word in tainted:
                     return True
-                if isinstance(n, ast.Constant) and isinstance(n.value, str) and (
-                        ".env" in n.value or n.value in CREDENTIAL_MARKERS):
+                text = _constant(n)
+                if text is not None and (".env" in text or text in CREDENTIAL_MARKERS):
                     return True
             return False
         tainted = set()
@@ -1462,16 +1841,122 @@ def credential_access(source: str, rel: str) -> "list[str]":
     return out
 
 
+# The masking contract has one implementation, the owner's. Elsewhere in the package a function by one of
+# its names may only delegate to it; no function may repeat one of its bodies under another name.
+_OWNER_TREE = ast.parse((REPO / "shared" / "ag2_gateway_credentials.py").read_text(encoding="utf-8"))
+_MASKING_START = next(n.lineno for n in _OWNER_TREE.body if isinstance(n, ast.Assign)
+                      and any(getattr(t, "id", "") == "WITHHELD" for t in n.targets))
+_REGISTRY_CLASS = next(n for n in _OWNER_TREE.body if isinstance(n, ast.ClassDef) and n.name == "SecretRegistry")
+MASKING_NAMES = ({n.name.lstrip("_") for n in _OWNER_TREE.body
+                  if isinstance(n, ast.FunctionDef) and n.lineno > _MASKING_START}
+                 | {n.name.lstrip("_") for n in _REGISTRY_CLASS.body if isinstance(n, ast.FunctionDef)
+                    and not n.name.startswith("__") and n.name not in ("register", "contains")})
+DELEGATES_TO = ("gateway_credentials", "REGISTRY", "contract")
+UNRELATED_NAMES = {("adapters/claude_code/hmac_policy.py", "describe")}  # an HMAC policy's mode line
+REGISTRY_HOLDER = "diagnostics.py"
+
+
+def _body(fn) -> list:
+    body = fn.body
+    if body and isinstance(body[0], ast.Expr) and isinstance(getattr(body[0], "value", None), ast.Constant) \
+            and isinstance(body[0].value.value, str):
+        body = body[1:]
+    return body
+
+
+def _dump(stmts) -> str:
+    return ast.dump(ast.Module(body=stmts, type_ignores=[]), annotate_fields=False)
+
+
+_OWNER_BODIES = {_dump(_body(f)) for f in ast.walk(_OWNER_TREE) if isinstance(f, ast.FunctionDef)
+                 and (len(_body(f)) > 1 or len(_dump(_body(f))) > 160)}
+
+
+def _delegates(fn) -> bool:
+    body = _body(fn)
+    if len(body) != 1 or not isinstance(body[0], ast.Return) or not isinstance(body[0].value, ast.Call):
+        return False
+    root = body[0].value.func
+    while isinstance(root, ast.Attribute):
+        root = root.value
+    return isinstance(body[0].value.func, ast.Attribute) and isinstance(root, ast.Name) and root.id in DELEGATES_TO
+
+
+def masking_copies(source: str, rel: str) -> "list[str]":
+    """Each place `source` (package path `rel`) re-implements the owner's masking contract."""
+    out = []
+    for n in ast.walk(ast.parse(source)):
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if n.name.lstrip("_") in MASKING_NAMES and (rel, n.name) not in UNRELATED_NAMES and not _delegates(n):
+                out.append(f"{rel}:{n.lineno}: {n.name} re-implements the owner's {n.name.lstrip('_')}")
+            elif _dump(_body(n)) in _OWNER_BODIES:
+                out.append(f"{rel}:{n.lineno}: {n.name} repeats an owner function's body")
+        elif isinstance(n, ast.ClassDef) and any(ast.unparse(b).endswith("SecretRegistry") for b in n.bases):
+            out.append(f"{rel}:{n.lineno}: {n.name} subclasses the owner's registry")
+    module_registries = [n for n in ast.parse(source).body if isinstance(n, (ast.Assign, ast.AnnAssign))
+                         and n.value is not None and "SecretRegistry(" in ast.unparse(n.value)]
+    if rel != REGISTRY_HOLDER:
+        out += [f"{rel}:{n.lineno}: a second process-wide registry" for n in module_registries]
+    return out
+
+
 class Guard(unittest.TestCase):
-    OWNERS = {"gateway_credential_sources.py", "gateway_credentials.py"}
+    # The scan's only exclusions: the two owner modules, by exact path under the package.
+    OWNERS = frozenset({"gateway_credential_sources.py", "gateway_credentials.py"})
+
+    def package_findings(self, replace=None, extra=None):
+        """The scan over every package module, with `replace` editing one's text and `extra` adding modules."""
+        root, found = PKG / "ag2_sparrow", []
+        modules = {p.relative_to(root).as_posix(): p.read_text(encoding="utf-8") for p in sorted(root.rglob("*.py"))}
+        for rel, text in {**modules, **(extra or {})}.items():
+            if rel not in self.OWNERS:
+                found += credential_access((replace or {}).get(rel, lambda t: t)(text), rel)
+        return found
 
     def test_no_other_package_module_touches_a_credential_source(self):
+        self.assertEqual(self.package_findings(), [], "a credential source is touched outside the owner and the adapters' edge")
+
+    def test_the_exclusions_are_exactly_the_owner_modules(self):
+        self.assertEqual({p for p in self.OWNERS if (PKG / "ag2_sparrow" / p).is_file()}, self.OWNERS, "no stale exclusion")
+        twin = "adapters/claude_code/gateway_credential_sources.py"
+        found = self.package_findings(extra={twin: "x = _sources.token_env_name()\n"})
+        self.assertEqual([f for f in found if f.startswith(twin + ":")],
+                         [f"{twin}:1 token_env_name named outside the owner"], "a same-named module elsewhere is scanned")
+
+    def test_the_package_scan_fires_on_one_reference_in_the_adapter(self):
+        rel = "adapters/claude_code/cli.py"
+        for planted in ("\n_N = _sources.token_env_name()\n", "\n_N = _sources.TOKEN_KEYS[0]\n",
+                        '\n_N = {"token_env": None}\n'):
+            found = self.package_findings({rel: lambda t, planted=planted: t + planted})
+            self.assertTrue(found and all(f.startswith(rel + ":") for f in found), (planted, found))
+
+    def test_the_package_has_one_masking_implementation(self):
         found = []
         for path in sorted((PKG / "ag2_sparrow").rglob("*.py")):
             if path.name not in self.OWNERS:
                 rel = str(path.relative_to(PKG / "ag2_sparrow"))
-                found += credential_access(path.read_text(encoding="utf-8"), rel)
-        self.assertEqual(found, [], "a credential source is touched outside the owner and the adapters' edge")
+                found += masking_copies(path.read_text(encoding="utf-8"), rel)
+        self.assertEqual(found, [], "the masking contract is gateway_credentials'; call it, never copy it")
+
+    def test_the_masking_detector_catches_a_copy(self):
+        import inspect
+        renamed = inspect.getsource(contract._split_by_hand).replace("def _split_by_hand", "def _hand_split")
+        copies = ['def fold(text):\n    return str(text).casefold()\n',
+                  'def _views(text):\n    return {text}\n',
+                  'def describe(exc):\n    return type(exc).__name__\n',
+                  'def redact_text(text, url):\n    return gateway_credentials.redact_url(text) or text\n',
+                  'def scrub(text):\n    return "<withheld>" if "x" in text else text\n',
+                  renamed,
+                  'class SinkRegistry(gateway_credentials.SecretRegistry):\n    pass\n',
+                  '_SECRETS = gateway_credentials.SecretRegistry()\n']
+        for source in copies:
+            self.assertTrue(masking_copies(source, "probe.py"), source)
+        delegations = ('from . import gateway_credentials\nREGISTRY = gateway_credentials.SecretRegistry()\n'
+                       'def describe(exc):\n    """Doc."""\n    return gateway_credentials.describe(exc, REGISTRY)\n'
+                       'def scrub(text):\n    return REGISTRY.scrub(text)\n'
+                       'redact_url = gateway_credentials.redact_url\n')
+        self.assertEqual(masking_copies(delegations, REGISTRY_HOLDER), [])
+        self.assertTrue(masking_copies(delegations, "gateway_instance.py"), "one registry, in one module")
 
     def test_the_detector_catches_every_bypass(self):
         bypasses = [
@@ -1511,6 +1996,11 @@ class Guard(unittest.TestCase):
             'body = {"token_env": _sources.token_env_name(os.environ)}',
             'body = {"token_env": os.environ.get(_sources.token_env_name())}',
             'def token_env_name():\n    return "TOKEN"',
+            'def f():\n    p = "relay" + ".en" + "v"\n    open(p).read()',
+            'def f():\n    open(f"relay{\'.env\'}").read()',
+            'def f():\n    subprocess.run(["system" + "ctl", "--user", "show-" + "environment"], capture_output=True).stdout',
+            'def f():\n    subprocess.run([f"{\'system\'}ctl", "--user", "show-environ" + "ment"]).stdout',
+            'def f():\n    subprocess.run(["{}ctl".format("system"), "status"])',
         ]
         for source in bypasses:
             self.assertTrue(credential_access(source, "probe.py"), source)
@@ -1521,9 +2011,378 @@ class Guard(unittest.TestCase):
         self.assertEqual(credential_access(allowed, "remote_gateway_bridge.py"), [])
         self.assertEqual(credential_access('"""Put REMOTE_TASK_TOKEN in the .env file."""\nx = 1\n', "probe.py"), [],
                          "a docstring naming a key is prose, not a read")
-        for named in ('body = {"token_env": _sources.token_env_name()}',
-                      'record(path, token_env=_sources.token_env_name())'):
-            self.assertEqual(credential_access(named, "probe.py"), [], "the owner's name-only route")
+        self.assertEqual(credential_access(
+            'from ... import gateway_credential_sources as _sources\n'
+            'def wire_bridge(cfg):\n    _sources.write_bridge_declaration(path, name=n, env=env)\n',
+            "adapters/claude_code/cli.py"), [], "the owner builds the record; the adapter writes its text")
+
+    def assert_flagged(self, *sources):
+        for source in sources:
+            self.assertTrue(credential_access(source, "adapters/claude_code/cli.py"), source)
+            self.assertTrue(credential_access(source, "probe.py"), source)
+
+    def test_the_accessor_as_a_keyword_value_is_flagged(self):
+        self.assert_flagged('os.getenv(key=_sources.token_env_name())',
+                            'def wire_bridge(cfg):\n    return os.getenv(key=_sources.token_env_name())',
+                            'record(path, token_env=_sources.token_env_name())')
+
+    def test_the_accessor_as_a_value_of_a_dict_that_reads_is_flagged(self):
+        self.assert_flagged('os.environ.get({"token_env": _sources.token_env_name()}["token_env"])',
+                            'def wire_bridge(cfg):\n    return os.environ[{"k": _sources.token_env_name()}["k"]]',
+                            'body = {"token_env": _sources.token_env_name()}')
+
+    def test_the_accessor_under_an_alias_is_flagged(self):
+        self.assert_flagged('from .gateway_credential_sources import token_env_name as key_name\nos.getenv(key_name())',
+                            'from .gateway_credential_sources import token_env_name as key_name\n'
+                            'def wire_bridge(cfg):\n    body = {"token_env": key_name()}',
+                            'te = _sources.token_env_name\nos.getenv(te())')
+
+    def test_every_record_use_from_review_is_flagged_outside_the_owner(self):
+        record = 'def wire_bridge(cfg):\n    body = {"token_env": _sources.token_env_name(), "name": "w"}\n'
+        uses = ('    return json.dumps(body)\n', '    return os.getenv(body["token_env"])\n',
+                '    return dict(body).popitem()[1]\n', '    d = {}\n    d.update(body)\n', '    return list(body)\n',
+                '    return {**body}\n', '    return os.getenv(**body)\n', '    b2 = body\n')
+        for use in uses:
+            self.assert_flagged(record + use)
+        for scope in ('def outer():\n    def wire_bridge(cfg):\n        return {"token_env": _sources.token_env_name()}\n',
+                      'class C:\n    def wire_bridge(self):\n        return {"token_env": _sources.token_env_name()}\n',
+                      'async def wire_bridge(cfg):\n    return {"token_env": _sources.token_env_name()}\n'):
+            self.assert_flagged(scope)
+        for name in ('from .gateway_credential_sources import token_env_name\n',
+                     'from .gateway_credential_sources import TOKEN_KEYS\n',
+                     'import json as j\nj.dumps(getattr(_sources, "token_env_name")())\n',
+                     'def f(d):\n    return os.getenv(d["token_env"])\n',
+                     'def f(d):\n    return os.getenv(d.get("token_" + "env"))\n'):
+            self.assert_flagged(name)
+
+    def test_the_cli_names_neither_the_accessor_nor_the_record_key(self):
+        rel = "adapters/claude_code/cli.py"
+        shipped = (PKG / "ag2_sparrow" / rel).read_text(encoding="utf-8")
+        words = {getattr(n, "id", None) or getattr(n, "attr", None) or getattr(n, "name", None) or _constant(n)
+                 for n in ast.walk(ast.parse(shipped))}
+        self.assertEqual(words & (OWNER_ONLY | KEY_TUPLES | {RECORD_KEY}), set())
+        self.assertEqual(credential_access(shipped, rel), [])
+
+    def test_the_adapter_hands_the_owner_a_path_and_holds_no_record(self):
+        text = (PKG / "ag2_sparrow" / "adapters" / "claude_code" / "cli.py").read_text(encoding="utf-8")
+        tree = ast.parse(text)
+        parents = {c: n for n in ast.walk(tree) for c in ast.iter_child_nodes(n)}
+        uses = [n for n in ast.walk(tree) if isinstance(n, ast.Attribute) and ast.unparse(n.value) == "_sources"]
+        self.assertEqual(sorted(n.attr for n in uses), ["remove_bridge_declaration", "write_bridge_declaration"],
+                         "the owner checks, writes and removes the declaration; the adapter only names its path")
+        for use in uses:
+            call = parents[use]
+            self.assertTrue(isinstance(call, ast.Call) and call.func is use)
+            self.assertEqual([k.arg for k in call.keywords if k.arg is None], [], "no ** spread into the owner")
+        self.assertEqual(declaration_reads(text, "adapters/claude_code/cli.py"), [])
+        self.assertNotIn("owned_declaration", text)
+
+    def test_a_read_of_the_declaration_path_outside_the_owner_is_flagged(self):
+        head = 'from ... import gateway_credential_sources as _sources\ndef f(root):\n    path = bridge_home(root) / DECLARATION\n'
+        for read in ('    text = path.read_text()\n', '    text, why = cm.file_text(path, "declaration")\n',
+                     '    with open(path) as fh:\n        json.load(fh)\n', '    p2 = path\n    p2.read_bytes()\n',
+                     '    json.load(open(bridge_home(root) / "worker.json"))\n', '    owned_declaration(path)\n',
+                     '    s = str(path)\n', '    helper(where=path)\n', '    path.unlink()\n'):
+            self.assertTrue(declaration_reads(head + read, "adapters/claude_code/cli.py"), read)
+            self.assertTrue(credential_access(head + read, "adapters/claude_code/cli.py"), read)
+        for fine in ('    print(f"declared: {path}")\n', '    _sources.write_bridge_declaration(path, written_by="x")\n'):
+            self.assertEqual(declaration_reads(head + fine, "adapters/claude_code/cli.py"), [], fine)
+
+    def test_a_declaration_name_built_from_constants_is_the_declaration(self):
+        self.assertEqual(declaration_reads('def f(base, path):\n    open(os.path.join(base, "x.json")).read()\n', "a.py"), [],
+                         "the control: another file, beside a local named path, is not the declaration")
+        for built in ('"worker.json"', '"worker" + ".json"', '"work" + "er.json"', 'f"{\'worker\'}.json"',
+                      '"%s.json" % "worker"', '"{}.json".format("worker")'):
+            for source in (f'def f(base):\n    name = {built}\n    open(os.path.join(base, name)).read()\n',
+                           f'def f(base):\n    json.load(open(os.path.join(base, {built})))\n',
+                           f'def f(base):\n    other = {built}\n    where = os.path.join(base, other)\n    where.read_text()\n'):
+                self.assertTrue(declaration_reads(source, "adapters/claude_code/cli.py"), source)
+                self.assertTrue(credential_access(source, "adapters/claude_code/cli.py"), source)
+
+    def test_the_owner_writes_the_record_install_wrote_before(self):
+        env = {"AGENT_CONNECT_TASK_DIR": "/w/a/tasks", "AGENT_MXID": "@a:ag2.space"}
+        before = {"written_by": "x install", "schema": 1, "host": "sparrowd", "name": "bridge-a", "module": "m.bridge",
+                  "env": env, "token_vault_key": "AG2_RELAY_TOKEN_A", "token_env": "REMOTE_TASK_TOKEN"}
+        for label, o in OWNERS.items():
+            with self.subTest(label), tempfile.TemporaryDirectory() as d:
+                path = Path(d) / "a.bridge" / "worker.json"
+                self.assertEqual("", o.write_bridge_declaration(path, written_by="x install", host="sparrowd", name="bridge-a",
+                                                             module="m.bridge", env=env, token_vault_key="AG2_RELAY_TOKEN_A"))
+                self.assertEqual(path.read_text(encoding="utf-8"), json.dumps(before, indent=1, sort_keys=False) + "\n")
+                self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o644)
+                self.assertEqual(sorted(p.name for p in path.parent.iterdir()), ["worker.json"], "no temp file left")
+                self.assertEqual(o.bridge_declaration_fields(), {"token_env": "REMOTE_TASK_TOKEN"})
+                self.assertEqual(o.bridge_token_environ("t"), {"REMOTE_TASK_TOKEN": "t", "GATEWAY_CREDENTIALS_INJECTED": "1"})
+                self.assertEqual(o.BRIDGE_CARRIED_CONFIG, ("REMOTE_PROACTIVE_TRUST_OK",), "the one carried host setting")
+                self.assertEqual(o.bridge_strip_keys(), ("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN", "GATEWAY_TOKEN",
+                                                         "RELAY_TOKEN", "REMOTE_MEDIA_HS_TOKEN", "REMOTE_TASK_URL",
+                                                         "AG2_REMOTE_URL", "GATEWAY_URL", "RELAY_URL"),
+                                 "every name a host's gateway token or endpoint may sit under: each token key, each "
+                                 "contract alias, the media token and each URL name and alias, each once")
+                self.assertEqual(set(o.bridge_strip_keys()),
+                                 set(o.TOKEN_KEYS) | set(o.contract.TOKEN_ALIAS_PRECEDENCE) | {o.MEDIA_TOKEN_KEY}
+                                 | set(o.URL_KEYS) | set(o.contract.URL_ALIAS_PRECEDENCE))
+                self.assertTrue(set(o.bridge_token_environ("t")) - {o.INJECTED_KEY} <= set(o.bridge_strip_keys()),
+                                "the name the agent's token goes under is stripped of the host's first")
+
+    def test_the_agents_gateway_rides_beside_a_bare_token_only_and_the_wake_child_acts_as_the_agent(self):
+        url, combined = "https://agent-gw.example/relay", "https://agent-gw.example/relay|s"
+        for label, o in OWNERS.items():
+            with self.subTest(label):
+                self.assertEqual(o.bridge_token_environ("s", url),
+                                 {"REMOTE_TASK_TOKEN": "s", o.INJECTED_KEY: "1", "REMOTE_TASK_URL": url})
+                self.assertEqual(o.bridge_token_environ(combined, "https://other/relay"),
+                                 {"REMOTE_TASK_TOKEN": combined, o.INJECTED_KEY: "1"}, "the token's own URL wins")
+                self.assertEqual((o.token_embeds_url(combined), o.token_embeds_url("s"), o.token_embeds_url("")),
+                                 (True, False, False))
+                self.assertEqual([o.token_url_shaped(t) for t in (URL_SHAPED_BEARER, "HTTP://gw/relay",
+                                                                  combined, "https://gw/relay%7Cs", "s", "")],
+                                 [True, True, False, False, False, False], "a scheme with no separator is URL-shaped")
+                self.assertEqual((o.token_gateway(combined), o.token_gateway(URL_SHAPED_BEARER), o.token_gateway("s")),
+                                 (url, "", ""))
+                self.assertEqual([o.token_secret_empty(t) for t in ("https://gw/relay|", "https://gw/relay| ", "", "  ",
+                                                                    combined, "s", "httpfoo")],
+                                 [True, True, True, True, False, False, False], "no secret on either side of '|'")
+                self.assertEqual(o.gateway_url_problem(url), "")
+                self.assertEqual(o.gateway_url_problem("http://127.0.0.1:9/relay"), "")
+                self.assertEqual(o.gateway_url_problem("https://gw.example:8443/relay"), "")
+                for credential_shaped in ("https://user:pass@gw.example:8443/relay", "https://user@gw.example/relay",
+                                          "https://@gw.example/relay", "https://gw.example/relay?q=1",
+                                          "https://gw.example/relay?", "https://gw.example/relay#f",
+                                          "https://gw.example/relay#"):
+                    problem = o.gateway_url_problem(credential_shaped)
+                    self.assertIn("userinfo, a query or a fragment", problem, credential_shaped)
+                    self.assertNotIn("gw.example", problem, "why, never the value")
+                for bad in ("", "ftp://x/relay", "https://", "x.example/relay", "https://x/relay|s", "https://x /r",
+                            "https://x/r\x7f", "https://?missing-host", "https://#missing-host", "https://:443/relay",
+                            "https://user@/relay", "https://gw.example:notaport/relay", "https://gw.example:99999/r"):
+                    self.assertTrue(o.gateway_url_problem(bad), bad)
+                host = {k: "host" for k in o.bridge_strip_keys()}
+                marked = dict(host, KEEP="1", **{o.INJECTED_KEY: "1"})
+                self.assertEqual(o.wake_environ(marked, "s", url),
+                                 {"KEEP": "1", o.INJECTED_KEY: "1", "REMOTE_TASK_TOKEN": "s", "REMOTE_TASK_URL": url})
+                self.assertEqual(o.wake_environ(marked, combined, ""),
+                                 {"KEEP": "1", o.INJECTED_KEY: "1", "REMOTE_TASK_TOKEN": combined})
+                self.assertEqual(o.wake_environ(marked, "", url), {"KEEP": "1", o.INJECTED_KEY: "1"})
+                self.assertEqual(o.wake_environ(dict(host, KEEP="1"), "s", url), dict(host, KEEP="1"), "unmarked: unchanged")
+
+    def test_a_declared_bridge_reads_no_credential_file_and_the_host_resolves_what_it_carries(self):
+        canary = "canary-host-file-token-0123456789"
+        with tempfile.TemporaryDirectory() as d:
+            cfg = Path(d) / "channels" / "ag2space"
+            cfg.mkdir(parents=True)
+            opened = []
+
+            def read_text(path):
+                opened.append(path)
+                return Path(path).read_text(encoding="utf-8")
+            host = {"CLAUDE_CONFIG_DIR": d, "REMOTE_TASK_TOKEN": "host-env-token"}
+            for label, o in OWNERS.items():
+                with self.subTest(label):
+                    opened.clear()
+                    (cfg / ".env").write_text(f"REMOTE_TASK_TOKEN={canary}\nREMOTE_PROACTIVE_TRUST_OK=1\n", encoding="utf-8")
+                    child = {**host, **o.bridge_token_environ("agent-token")}
+                    self.assertTrue(o.credentials_injected(child))
+                    self.assertFalse(o.credentials_injected(host))
+                    files = o.env_files(child, read_text)
+                    self.assertEqual((list(files), files.credential_pairs, files.refused, files.blocked, opened),
+                                     ([], (), (), "", []), "injected: no channel file is opened, nothing is read")
+                    self.assertEqual(o.bridge_carried_config(child, read_text), {}, "the child resolves nothing itself")
+                    registry = o.contract.SecretRegistry()
+                    found = o.discover(child, files, registry=registry)
+                    self.assertEqual((found.token, found.token_source), ("agent-token", "env"))
+                    self.assertFalse(registry.contains(canary), "the host's file token is never registered")
+                    self.assertEqual(opened, [])
+                    # The host (no mark) resolves the carried setting from its own file; env wins when set.
+                    self.assertEqual(o.bridge_carried_config(host, read_text), {"REMOTE_PROACTIVE_TRUST_OK": "1"})
+                    self.assertEqual(opened, [str(cfg / ".env")])
+                    self.assertEqual(o.bridge_carried_config({**host, "REMOTE_PROACTIVE_TRUST_OK": "0"}, read_text),
+                                     {"REMOTE_PROACTIVE_TRUST_OK": "0"})
+                    self.assertEqual(opened, [str(cfg / ".env")], "set in the environment: the file is not opened")
+                    (cfg / ".env").write_text(f"REMOTE_TASK_TOKEN={canary}\n", encoding="utf-8")
+                    self.assertEqual(o.bridge_carried_config(host, read_text), {}, "set nowhere: absent, not blank")
+                    self.assertEqual(o.bridge_carried_config({}, read_text), {}, "no pointer: nothing to read")
+                    for value in o.bridge_carried_config(host, read_text).values():
+                        self.assertNotIn(canary, value)
+
+    def test_the_owner_checks_and_removes_only_its_own_declaration(self):
+        args = dict(written_by="x install", host="h", name="n", module="m", env={}, token_vault_key="k")
+        for label, o in OWNERS.items():
+            with self.subTest(label), tempfile.TemporaryDirectory() as d:
+                path = Path(d) / "worker.json"
+                self.assertEqual(o.remove_bridge_declaration(path, written_by="x install"), (False, ""), "nothing there")
+                self.assertEqual(o.write_bridge_declaration(path, **args), "")
+                self.assertEqual(o.write_bridge_declaration(path, **args), "", "its own declaration is rewritten")
+                self.assertEqual(o.remove_bridge_declaration(path, written_by="x install"), (True, ""))
+                self.assertFalse(path.exists())
+                foreign = f"{path} was not written by install; remove it by hand (rm {path}) if it is yours to remove"
+                for text in ('{"written_by": "someone else"}', "not json", "[1]"):
+                    path.write_text(text)
+                    self.assertEqual(o.write_bridge_declaration(path, **args), foreign)
+                    self.assertEqual(o.remove_bridge_declaration(path, written_by="x install"), (False, foreign))
+                    self.assertEqual(path.read_text(), text, "a foreign file is left as it was")
+                path.unlink()
+                path.mkdir()
+                self.assertEqual(o.write_bridge_declaration(path, **args),
+                                 f"{path} is a directory, not a declaration; remove it yourself")
+                path.rmdir()
+                path.symlink_to(Path(d) / "gone")
+                self.assertEqual(o.remove_bridge_declaration(path, written_by="x install"),
+                                 (False, f"{path} is a dangling symlink; remove it by hand (rm {path})"))
+                path.unlink()
+                path.write_text('{"written_by": "x install"}')
+                with mock.patch.object(o, "open", side_effect=PermissionError(13, "Permission denied"), create=True):
+                    self.assertEqual(o.write_bridge_declaration(path, **args), f"{path} unreadable (Permission denied)")
+
+    def test_a_declaration_past_the_cap_is_refused_unread_and_left_untouched(self):
+        args = dict(written_by="x install", host="h", name="n", module="m", env={}, token_vault_key="k")
+        for label, o in OWNERS.items():
+            with self.subTest(label), tempfile.TemporaryDirectory() as d:
+                path = Path(d) / "worker.json"
+                body = '{"written_by": "x install", "pad": "'
+                at_cap = body + "a" * (o.MAX_DECLARATION_BYTES - len(body) - 2) + '"}'
+                self.assertEqual(len(at_cap), o.MAX_DECLARATION_BYTES)
+                path.write_text(at_cap)
+                self.assertEqual(o.remove_bridge_declaration(path, written_by="x install"), (True, ""), "at the cap: ours")
+                over = at_cap[:-2] + 'a"}'
+                path.write_text(over)
+                refused = (f"{path} is over the {o.MAX_DECLARATION_BYTES}-byte cap for a declaration; "
+                           f"remove it by hand (rm {path}) if it is yours to remove")
+                self.assertEqual(o.write_bridge_declaration(path, **args), refused)
+                self.assertEqual(o.remove_bridge_declaration(path, written_by="x install"), (False, refused))
+                self.assertEqual(path.read_text(), over, "left as it was")
+                reads, real_open = [], open
+                with mock.patch.object(o, "open", side_effect=lambda *a, **k: _Spy(real_open(*a, **k), reads),
+                                       create=True):
+                    o.remove_bridge_declaration(path, written_by="x install")
+                self.assertEqual(reads, [], "an oversized file is never read")
+                path.write_text(at_cap)
+                with mock.patch.object(o, "open", side_effect=lambda *a, **k: _Spy(real_open(*a, **k), reads),
+                                       create=True):
+                    o.remove_bridge_declaration(path, written_by="x install")
+                self.assertEqual(reads, [o.MAX_DECLARATION_BYTES + 1], "a read is bounded at the cap")
+
+    def test_a_failed_write_leaves_no_declaration_and_no_temp_file(self):
+        for label, o in OWNERS.items():
+            with self.subTest(label), tempfile.TemporaryDirectory() as d:
+                path = Path(d) / "worker.json"
+                with mock.patch.object(o.os, "replace", side_effect=OSError("disk")), self.assertRaises(OSError):
+                    o.write_bridge_declaration(path, written_by="x", host="h", name="n", module="m", env={},
+                                               token_vault_key="k")
+                self.assertEqual(list(Path(d).iterdir()), [])
+
+    def test_a_string_or_getattr_reference_to_an_owner_private_name_is_flagged(self):
+        for source in ('getattr(_sources, "TOKEN_KEYS")[0]', 'k = "TOKEN_KEYS"', 'getattr(_sources, "TOKEN_" + "KEYS")',
+                       'getattr(_sources, "token_env_name")()', 'getattr(_sources, "_bridge_declaration_text")',
+                       'getattr(_sources, "_RECORD_TOKEN_ENV")', 'getattr(_sources, "CREDENTIAL_KEYS")',
+                       '_sources.bridge_token_environ("")', 'getattr(_sources, "bridge_declaration_fields")()',
+                       '_sources.bridge_strip_keys()', 'getattr(_sources, "bridge_strip_keys")()',
+                       '_sources.bridge_carried_config({}, f)', 'getattr(_sources, "bridge_carried_config")',
+                       'from .gateway_credential_sources import bridge_token_environ',
+                       'from .gateway_credential_sources import bridge_strip_keys'):
+            self.assert_flagged(source)
+        helper = "adapters/claude_code/probe_helper.py"
+        found = self.package_findings(extra={helper: 'import os\nos.getenv(getattr(_sources, "TOKEN_KEYS")[0])\n'})
+        self.assertEqual([f for f in found if f.startswith(helper + ":")], [f"{helper}:2 owner key tuple TOKEN_KEYS"])
+
+    def test_the_declarations_reader_names_only_the_owners_accessors(self):
+        for rel, path in RECORD_READERS.items():
+            text = path.read_text(encoding="utf-8")
+            self.assertEqual(owner_only_findings(text, rel, reader=True), [])
+            self.assertIn("bridge_declaration_fields", text)
+            for planted in ('\nX = "token_env"\n', "\nX = _sources.token_env_name()\n", '\nX = getattr(_sources, "TOKEN_KEYS")\n'):
+                self.assertTrue(owner_only_findings(text + planted, rel, reader=True), planted)
+            self.assertTrue(owner_only_findings("_sources.bridge_token_environ('')", "adapters/x.py"),
+                            "the reader's accessors stay the reader's")
+            self.assertEqual(token_injection_findings(text, rel), [])
+            for mutant in (('    token_env = _sources.bridge_token_environ(token, url)\n', '    token_env = {"REMOTE_TASK_TOKEN": token}\n'),
+                           ('    strip = _sources.bridge_strip_keys() + _sources.BRIDGE_CARRIED_CONFIG\n', '    strip = token_env + _sources.BRIDGE_CARRIED_CONFIG\n'),
+                           ('    strip = _sources.bridge_strip_keys() + _sources.BRIDGE_CARRIED_CONFIG\n', '    strip = HOST_ONLY + tuple(token_env)\n'),
+                           ('    strip = _sources.bridge_strip_keys() + _sources.BRIDGE_CARRIED_CONFIG\n', '    strip = _sources.bridge_strip_keys()[:1] + _sources.BRIDGE_CARRIED_CONFIG\n'),
+                           ('    strip = _sources.bridge_strip_keys() + _sources.BRIDGE_CARRIED_CONFIG\n', '    strip = _sources.bridge_strip_keys()\n'),
+                           ('    env.update(_sources.bridge_carried_config(host, read_regular))\n',
+                            '    env.update(REMOTE_PROACTIVE_TRUST_OK=host.get("REMOTE_PROACTIVE_TRUST_OK", ""))\n'),
+                           ('    env.update(_sources.bridge_carried_config(host, read_regular))\n', ''),
+                           ('    env.update(token_env)\n', '    env.update(token_env)\n    env.pop(next(k for k in token_env if k != "REMOTE_TASK_TOKEN"))\n'),
+                           ('    env.update(token_env)\n', '    env.update(token_env)\n    env["AG2_REMOTE_" + "TOKEN"] = token\n'),
+                           ('    env.update(token_env)\n', '    env.update(token_env, X=os.environ.get("REMOTE_TASK_TOKEN"))\n')):
+                self.assertIn(mutant[0], text)
+                self.assertTrue(token_injection_findings(text.replace(mutant[0], mutant[1]), rel), mutant[1])
+
+    READER_SELF_WRITES = (
+        ('    env.update(token_env)\n', '    env.update(token_env)\n    env.update(REMOTE_TASK_TOKEN=token)\n'),
+        ('    env.update(token_env)\n', '    if False:\n        env.update(token_env)\n    env.update({k: token for k in token_env})\n'),
+        ('    env.update(token_env)\n', '    env.update(token_env)\n    env[suffix_key(decl)] = token\n'),
+        ('    env.update(token_env)\n', '    env.update(token_env)\n    env.setdefault(next(iter(token_env)), token)\n'),
+        ('    os.environ.update(environ)\n', '    os.environ.update(environ)\n    os.environ.update(**{next(iter(environ)): token})\n'),
+        ('    environ = bridge_environ(decl, token, url=url)\n', '    environ = {**bridge_environ(decl, token, url=url), "X": token}\n'),
+        ('    os.environ.update(environ)\n', '    os.environ.update(environ)\n    os.putenv(name_of(decl), token)\n'),
+        ('    os.environ.update(environ)\n', '    os.environ.update(environ)\n    os.environ |= {next(iter(environ)): token}\n'),
+        ('    os.environ.update(environ)\n', '    os.environ.update(environ)\n    e = os.environ\n    e |= {next(iter(environ)): token}\n'),
+        ('    os.environ.update(environ)\n', '    os.environ.update(environ)\n    os.environ.__ior__({next(iter(environ)): token})\n'),
+        ('    os.environ.update(environ)\n', '    os.environ.update(environ | {next(iter(environ)): token})\n'),
+        ('    os.environ.update(environ)\n', '    os.environ.update(environ)\n    del os.environ[next(iter(environ))]\n'))
+
+    def test_the_reader_writes_no_environment_entry_itself(self):
+        for rel, path in RECORD_READERS.items():
+            text = path.read_text(encoding="utf-8")
+            self.assertEqual(token_injection_findings(text, rel), [])
+            for before, after in self.READER_SELF_WRITES:
+                self.assertIn(before, text)
+                self.assertTrue(token_injection_findings(text.replace(before, after, 1), rel), after)
+
+    def test_the_owner_entry_points_are_reached_only_on_the_owner_import(self):
+        imp = "from ... import gateway_credential_sources as _sources\n"
+        head = imp + "def f(root):\n    path = bridge_home(root) / DECLARATION\n"
+        self.assertEqual(credential_access(head + '    _sources.write_bridge_declaration(path, written_by="x")\n', "a.py"), [],
+                         "the control: the owner's import, called directly")
+        for source in (
+                head + "    class H:\n        def write_bridge_declaration(self, p):\n            return p.read_text()\n"
+                       "    H().write_bridge_declaration(path)\n",
+                head + "    write_bridge_declaration(path)\n",
+                imp + "def write_bridge_declaration(p):\n    return open(p).read()\n"
+                      "def f(root):\n    write_bridge_declaration(bridge_home(root) / DECLARATION)\n",
+                head + "    _sources = Spy()\n    _sources.write_bridge_declaration(path)\n",
+                imp + "import json as _sources\n" + head.split("\n", 1)[1] + "    _sources.remove_bridge_declaration(path)\n",
+                "import json as _sources\n" + head.split("\n", 1)[1] + "    _sources.write_bridge_declaration(path)\n",
+                head + '    getattr(_sources, "write_bridge_declaration")(path)\n',
+                head + "    w = _sources.write_bridge_declaration\n    w(path)\n",
+                head + "    def g(_sources):\n        _sources.write_bridge_declaration(path)\n"):
+            self.assertTrue(credential_access(source, "adapters/claude_code/cli.py"), source)
+
+    def test_a_declaration_path_in_an_f_string_is_still_the_path_once_read(self):
+        rel = "adapters/claude_code/cli.py"
+        self.assertTrue(declaration_reads("def f():\n    open(DECLARATION).read()\n", rel), "the positive control")
+        for source in ('def f():\n    fh = open(f"{DECLARATION}")\n    fh.read()\n',
+                       'def f(root):\n    path = bridge_home(root) / DECLARATION\n    text = open(f"{path}").read()\n',
+                       'def f():\n    open(f"{DECLARATION}").read()\n',
+                       'def f(root):\n    name = f"{bridge_home(root) / DECLARATION}"\n    open(name).read()\n',
+                       'def where(root):\n    return f"{bridge_home(root) / DECLARATION}"\n'
+                       'def f(root):\n    open(where(root)).read()\n',
+                       'def f(root):\n    path = bridge_home(root) / DECLARATION\n    print(path or "none")\n'):
+            self.assertTrue(declaration_reads(source, rel), source)
+        for source in ('def f(root):\n    path = bridge_home(root) / DECLARATION\n    msg = f"see {path}"\n    print(msg)\n',
+                       'def f(root):\n    path = bridge_home(root) / DECLARATION\n    print(f"declared: {path}")\n',
+                       'def why(root):\n    return f"see {bridge_home(root) / DECLARATION}"\n'
+                       'def f(root, r):\n    problem = why(root)\n    check(r, not problem, "x", problem or "fine")\n'):
+            self.assertEqual(declaration_reads(source, rel), [], "the control: a message is handed on, never read")
+
+    def test_a_declaration_path_from_a_helper_is_the_declaration(self):
+        for source in (
+                "def decl_path(root):\n    return bridge_home(root) / DECLARATION\n"
+                "def f(root):\n    p = decl_path(root)\n    if p.exists():\n        json.loads(p.read_text())\n",
+                "def decl_path(root):\n    p = bridge_home(root) / DECLARATION\n    return p\n"
+                "def outer(root):\n    return decl_path(root)\n"
+                "def f(root):\n    outer(root).read_text()\n",
+                "DECL = lambda root: bridge_home(root) / DECLARATION\ndef f(root):\n    DECL(root).read_text()\n",
+                "HOME_DECL = Path('~') / ('work' + 'er.json')\ndef f():\n    HOME_DECL.read_text()\n",
+                "class C:\n    def where(self, root):\n        return bridge_home(root) / DECLARATION\n"
+                "    def f(self, root):\n        self.where(root).read_text()\n",
+                "def f(root):\n    for p in [bridge_home(root) / DECLARATION]:\n        p.read_text()\n"):
+            self.assertTrue(declaration_reads(source, "adapters/claude_code/cli.py"), source)
+        self.assertEqual(declaration_reads('def msg(root):\n    return f"see {bridge_home(root) / DECLARATION}"\n'
+                                           'def f(root):\n    print(msg(root))\n', "a.py"), [],
+                         "the control: a function returning a message about the path is not a path")
 
     def test_the_name_only_route_is_the_owners_canonical_token_key(self):
         self.assertEqual(owner.token_env_name(), owner.TOKEN_KEYS[0])

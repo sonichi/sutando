@@ -265,19 +265,56 @@ python3 skills/proactive-loop/scripts/codex-auto-reset-timer.py status \
 check for one startup. The runtime launcher still performs its own defensive
 authentication check before replacing the core session.
 
-For a one-command trial without changing config, use the invocation-scoped
-override:
+For a one-command trial or an explicit switch, run this **outside the core**:
 
 ```bash
-SUTANDO_CORE_RUNTIME=codex bash src/agent/start-cli.sh --restart
+bash src/agent/start-cli.sh --runtime codex --restart
 ```
+
+The leading `--runtime` flag wins over `SUTANDO_CORE_RUNTIME`, which otherwise
+wins over the AG2 Space desktop's selection, which wins over `core.runtime`. The
+desktop selection is `coreRuntime` in the desktop's `runtime.json`
+(`$SUTANDO_APP_SUPPORT/runtime.json`, or the directory above a bundled
+`engine/<checkout>`), so launchd jobs started without the desktop's environment
+resolve the same runtime as the desktop launcher. On a desktop install an explicit
+`--runtime` is a switch, so it also becomes the desktop's `coreRuntime` (other keys
+kept, atomic replace, as the desktop's own writer does). Otherwise the desktop keeps
+relaunching and probing for the old CLI while the new one owns the session. The
+dispatcher checks that the selection can be written and refuses (exit 1) without
+touching the core when it cannot; the launcher writes it only once the new core is
+confirmed, alongside `state/core-runtime.json`, so a launch that exits early (Codex
+not installed or not signed in) leaves the desktop selecting the core still running. A runtime environment override may be inherited from an older launch or
+loaded from the launcher's environment file; changing config alone does not
+remove it. The dispatcher now names that override on stderr. Use the explicit
+flag for the intended runtime rather than treating config as proof of which CLI
+restarted. Restarts from inside the live core remain refused.
+
+Before any launcher runs, the dispatcher picks the tmux client for the launch:
+the `tmux` on PATH, then the host's declared client (`SUTANDO_TMUX_BIN`, which the
+desktop exports), preferring the first whose version matches the server on the
+core's socket. When neither matches but one still reaches the server, it warns on
+stderr naming both versions and launches with that client. The chosen client is
+put first on PATH for the launch. It refuses (exit 3) when no client can query the
+server, or when no tmux is on PATH while the socket exists: either would make a
+live core read as absent, or replace the server with an incompatible build. It
+also refuses to launch another checkout's core on a desktop install's socket
+(`<app-support>/run/tmux.sock`) unless `SUTANDO_ALLOW_FOREIGN_CORE_CHECKOUT=1`
+is set for that launch.
+
+On a desktop install (`$SUTANDO_APP_SUPPORT` set, or the bundled engine), a
+launch that names no `SUTANDO_TMUX_SOCKET` uses the desktop's core socket, and
+the desktop's bundled tmux (`<app-support>/engine/bin/tmux`) as `SUTANDO_TMUX_BIN`
+when none is named. Without this, a terminal launch took `/tmp/sutando-tmux.sock`
+and started a second core beside the desktop's, both reading one task inbox. A
+switch aimed at any other socket is not the desktop's core, so it leaves the
+desktop's `coreRuntime` unchanged.
 
 ## Rollback
 
 Set `core.runtime` back to `claude` (or remove the local override) and run:
 
 ```bash
-bash src/agent/start-cli.sh --restart
+bash src/agent/start-cli.sh --runtime claude --restart
 ```
 
 Task and result files are runtime-neutral, so queued work survives the switch.
@@ -294,3 +331,14 @@ tmux -S /tmp/sutando-tmux.sock capture-pane -p -t sutando-core
 
 If tmux is unavailable, the launcher can still open Codex directly, but
 automatic file-bridge wakeups are disabled; install tmux for unattended use.
+
+Both CLI adapters publish `state/core-runtime.json` atomically only after their
+managed session is confirmed present and its panes run that runtime's CLI,
+including reuse and successful Claude window healing. A launcher whose runtime
+does not match the pane's process leaves the record unchanged and says so on
+stderr; the Codex launcher also appends to `session-starts.log` only for a
+confirmed new session. A failed launch leaves the last confirmed observation intact;
+`started_at` is the tmux session creation time, not the time of an attach.
+The file is a launch observation, not a current liveness or task-delivery proof.
+Check the session stamp and actual process, then capture a real received-task →
+delivered-reply round trip after an authorized outside-core restart.

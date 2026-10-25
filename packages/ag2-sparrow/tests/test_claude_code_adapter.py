@@ -2425,6 +2425,8 @@ class ConnectHostSupervised(AgentRootBase):
         self.assertEqual((self.cfg()["BRIDGE"], self.cfg()["TOKEN_VAULT_KEY"], self.cfg()["TOKEN_ENV_FILE"]),
                          ("sparrowd", cli.vault_key(seg), ""))
         self.assertIn(f"vault set {cli.vault_key(seg)} <the agent's relay token>", out)
+        self.assertIn(f"if that token is a bare secret, not https://<gateway>|<secret>, also: vault set "
+                      f"{cli.url_vault_key(seg)} <the agent's gateway URL>", out)
         self.assertNotIn(TOKEN, self.decl().read_text())
         for a, b in (("probe.agent_ag2.space", "probe-agent_ag2.space"), ("a_b", "a.b")):
             self.assertNotEqual(cli.worker_name(a), cli.worker_name(b), "two agents never share a worker name")
@@ -2442,6 +2444,18 @@ class ConnectHostSupervised(AgentRootBase):
         self.assertIn(f"removed: {self.decl()}", out)
         self.assertFalse(self.decl().exists())
         self.assertIn("kept: the Claude login", out, "the token lives in the vault: no host token file is named")
+
+    def test_the_declaration_is_the_record_install_wrote_before_the_owner_built_it(self):
+        rc, out, err = self.install_default(self.bridged())
+        self.assertEqual(rc, 0, err)
+        seg = "probe.agent_ag2.space"
+        before = {"written_by": f"{cli.COMMAND} install", "schema": 1, "host": "sparrowd", "name": cli.worker_name(seg),
+                  "module": "ag2_sparrow.remote_gateway_bridge",
+                  "env": {"AGENT_CONNECT_TASK_DIR": f"{self.root}/tasks", "AGENT_CONNECT_RESULT_DIR": f"{self.root}/results",
+                          "AGENT_CONNECT_STATE_DIR": f"{self.root}.bridge/state", "AGENT_MXID": AGENT},
+                  "token_vault_key": cli.vault_key(seg), "token_env": "REMOTE_TASK_TOKEN"}
+        self.assertEqual(self.decl().read_text(), json.dumps(before, indent=1, sort_keys=False) + "\n")
+        self.assertIn(f"declared: {self.decl()} (sparrowd runs it as worker {cli.worker_name(seg)} on its next scan; ", out)
 
     def test_a_foreign_declaration_is_never_replaced_or_removed(self):
         self.decl().parent.mkdir(parents=True)

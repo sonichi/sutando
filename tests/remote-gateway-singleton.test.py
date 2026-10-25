@@ -297,7 +297,7 @@ class SingletonGlueTest(unittest.TestCase):
             rgb._release_singleton()
         finally:
             rgb._join_push_thread, rgb._ws_retain = orig_join, orig_retain
-        failed = [l for l in lines if "singleton: retain failed (locks dir unwritable)" in l]
+        failed = [l for l in lines if "singleton: retain failed (OSError at " in l and "unwritable" not in l]
         self.assertEqual(len(failed), 1, lines)
         self.assertEqual(json.loads(self._lockfile().read_text())["pid"], os.getpid())
 

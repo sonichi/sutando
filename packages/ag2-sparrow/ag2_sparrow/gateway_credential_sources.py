@@ -1,10 +1,12 @@
 """Which AG2 Space gateway credential wins when sources disagree: the one owner of that precedence.
 
 Every source is read by the caller, at its own I/O edge (the environment, the channel .env files it
-knows, a token file, a vault read), and handed in as plain values or a callable; this module opens
-nothing itself. SOURCES states the precedence once and discover() walks it. discover() registers
-every materialized candidate before it picks the winners, so a sink can withhold a discarded one,
-every assignment of a credential key included. A credential file that exists but is refused is
+knows, a token file, a vault read), and handed in as plain values or a callable; this module reads
+no credential itself. The one file it touches is a host supervisor's bridge declaration, the record
+that names the token's variable: it checks, writes and removes it, so no adapter holds its bytes.
+SOURCES states the precedence once and discover() walks it. discover() registers every materialized candidate
+before it picks the winners, so a sink can withhold a discarded one, every assignment of a
+credential key included. A credential file that exists but is refused is
 named, never treated as absent in silence. Fail-closed covers the credential tiers only: a refused
 AG2_DEVICE_ENV stops the file and vault token tiers and a refused REMOTE_TASK_TOKEN_FILE stops
 rotation (Discovery.fatal either way), while general config such as REMOTE_PROACTIVE_ROOM still
@@ -15,7 +17,13 @@ package by tools/sync_from_src.py.
 """
 from __future__ import annotations
 
+import contextlib
+import json
+import os
 import os.path
+import shlex
+import tempfile
+import urllib.parse
 from dataclasses import dataclass, field
 from typing import Callable, Mapping, Optional, Sequence
 
@@ -36,6 +44,187 @@ def token_env_name() -> str:
     """The token's environment variable by name, for a record that says where the token goes; another
     module may name it only through this call, never read the variable with it."""
     return TOKEN_KEYS[0]
+
+
+_RECORD_TOKEN_ENV = "token_env"
+# A declaration is a few hundred bytes; every reader refuses one past this without reading it.
+MAX_DECLARATION_BYTES = 64 * 1024
+
+
+def _bridge_declaration_text(*, written_by: str, host: str, name: str, module: str, env: Mapping[str, str],
+                             token_vault_key: str) -> str:
+    record = {"written_by": written_by, "schema": 1, "host": host, "name": name, "module": module, "env": env,
+              "token_vault_key": token_vault_key, _RECORD_TOKEN_ENV: token_env_name()}
+    return json.dumps(record, indent=1, sort_keys=False) + "\n"
+
+
+def _declaration_owned(path: str, written_by: str) -> "tuple[bool, str]":
+    """(present, '') when nothing is at `path` or it is a declaration `written_by` wrote, else (False, why).
+    A file over MAX_DECLARATION_BYTES is not one: refused and left untouched, never read past the cap."""
+    if os.path.isdir(path):
+        return False, f"{path} is a directory, not a declaration; remove it yourself"
+    if os.path.islink(path) and not os.path.exists(path):
+        return False, f"{path} is a dangling symlink; remove it by hand (rm {shlex.quote(path)})"
+    try:
+        with open(path, "rb") as fh:
+            size = os.fstat(fh.fileno()).st_size
+            data = fh.read(MAX_DECLARATION_BYTES + 1) if size <= MAX_DECLARATION_BYTES else b""
+    except FileNotFoundError:
+        return False, ""
+    except OSError as e:
+        return False, f"{path} unreadable ({e.strerror or e})"
+    if size > MAX_DECLARATION_BYTES or len(data) > MAX_DECLARATION_BYTES:
+        return False, (f"{path} is over the {MAX_DECLARATION_BYTES}-byte cap for a declaration; "
+                       f"remove it by hand (rm {shlex.quote(path)}) if it is yours to remove")
+    try:
+        ours = json.loads(data.decode("utf-8", errors="replace")).get("written_by") == written_by
+    except (ValueError, AttributeError):
+        ours = False
+    if not ours:
+        return False, f"{path} was not written by install; remove it by hand (rm {path}) if it is yours to remove"
+    return True, ""
+
+
+def remove_bridge_declaration(path, *, written_by: str) -> "tuple[bool, str]":
+    """Remove the bridge declaration at `path` if `written_by` wrote it: (removed, '') or (False, why);
+    nothing there is (False, ''). Its bytes never leave this module."""
+    path = os.fspath(path)
+    present, problem = _declaration_owned(path, written_by)
+    if present:
+        os.unlink(path)
+    return present, problem
+
+
+def write_bridge_declaration(path, *, written_by: str, host: str, name: str, module: str, env: Mapping[str, str],
+                             token_vault_key: str, mode: int = 0o644) -> str:
+    """Write a host supervisor's bridge declaration at `path` (tmp + os.replace, so no reader sees a torn
+    file): the worker, its environment, the vault key holding its token, and the token's variable by name.
+    '' or why not; a file there that `written_by` did not write is left alone. The record and any
+    existing file's bytes never leave this module, so no caller can read the variable's name out of them."""
+    path = os.fspath(path)
+    _present, problem = _declaration_owned(path, written_by)
+    if problem:
+        return problem
+    text = _bridge_declaration_text(written_by=written_by, host=host, name=name, module=module, env=env,
+                                    token_vault_key=token_vault_key)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=f".{os.path.basename(path)}.")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(tmp)
+        raise
+    return ""
+
+
+def bridge_declaration_fields() -> "dict[str, str]":
+    """The fields the owner fixes in every bridge declaration, for a supervisor that checks one it reads."""
+    return {_RECORD_TOKEN_ENV: token_env_name()}
+
+
+# Set in a declared bridge's environment by the supervisor that hands it its token: the credential
+# file tiers are then closed, so the bridge never opens the host's channel .env (see env_files).
+INJECTED_KEY = "GATEWAY_CREDENTIALS_INJECTED"
+# The host config a supervisor resolves for a declared bridge and carries in as plain values, each
+# audited here: none is a credential, and the bridge reads no file to find them.
+BRIDGE_CARRIED_CONFIG = ("REMOTE_PROACTIVE_TRUST_OK",)
+
+
+def bridge_token_environ(token: str, url: str = "") -> "dict[str, str]":
+    """The variables a declared bridge's token is handed to it under, with the mark that it was, and the
+    agent's own gateway `url` beside a token that embeds none (a URL inside the token wins). The supervisor
+    reads `url` from where the owner stored it, never from the host's environment or the declaration."""
+    out = {token_env_name(): token, INJECTED_KEY: "1"}
+    if url and not token_embeds_url(token):
+        out[URL_KEYS[0]] = url
+    return out
+
+
+def token_gateway(token: str) -> str:
+    """The gateway URL a combined onboarding token carries, '' for any other token."""
+    return contract.parse_onboarding_token(token or "")[0]
+
+
+def token_embeds_url(token: str) -> bool:
+    """Whether `token` is the combined onboarding form, carrying its gateway URL."""
+    return bool(token_gateway(token))
+
+
+def token_secret_empty(token: str) -> bool:
+    """Whether `token` carries no secret, bare or after its url|secret separator (e.g. 'https://gw|')."""
+    return not contract.parse_onboarding_token(token or "")[1].strip()
+
+
+def token_url_shaped(token: str) -> bool:
+    """Whether `token` starts with a URL scheme yet carries no url|secret separator. The contract reads it
+    as an opaque bare secret; it may also be a combined token that lost its '|', which only a missing
+    gateway makes worth saying. Never a reason to refuse a token whose gateway is known."""
+    return (token or "").lower().startswith(("http://", "https://")) and not token_embeds_url(token)
+
+
+def gateway_url_problem(url: str) -> str:
+    """'' for a usable gateway URL (http or https with a parsed host and a valid port, no '|', no whitespace
+    or control characters, no userinfo, query or fragment), else why not, without the value."""
+    if not url or any(c.isspace() or ord(c) < 0x20 or ord(c) == 0x7F for c in url) or "|" in url:
+        return "is not a gateway URL (empty, or holds whitespace, a control character or '|')"
+    try:
+        parts = urllib.parse.urlsplit(url)
+        host, _port = parts.hostname, parts.port
+    except ValueError:
+        return "is not a URL with a valid host and port"
+    if parts.scheme.lower() not in ("http", "https") or not host:
+        return "is not an http(s) URL with a host"
+    # Checked on the raw text too: urlsplit drops an empty '?' or '#', and a credential may ride either.
+    if "@" in parts.netloc or "?" in url or "#" in url:
+        return "carries userinfo, a query or a fragment; a gateway URL is scheme, host, port and path only"
+    return ""
+
+
+def credentials_injected(env: Mapping[str, str]) -> bool:
+    """Whether `env` is a declared bridge's: its token was handed in, so no credential file is read."""
+    return bool(env.get(INJECTED_KEY))
+
+
+def bridge_carried_config(env: Mapping[str, str], read_text: "Callable[[str], object]") -> "dict[str, str]":
+    """The BRIDGE_CARRIED_CONFIG values a host given `env` holds, from its environment first and else
+    from its channel .env files through `read_text`, for a supervisor to hand a declared bridge. A key
+    the host sets nowhere is absent. The files' credentials stay inside this call."""
+    carried = {k: env[k] for k in BRIDGE_CARRIED_CONFIG if k in env}
+    missing = [k for k in BRIDGE_CARRIED_CONFIG if k not in carried]
+    if missing:
+        files = env_files(env, read_text)
+        carried.update({k: config_from_files(files, k) for k in missing if any(k in vals for _p, vals in files)})
+    return carried
+
+
+def wake_environ(child: Mapping[str, str], raw: str, url: str) -> "dict[str, str]":
+    """The environment a bridge's wake command runs under, from `child` (the bridge's own minus every
+    relay credential). In a declared bridge (the mark) the command acts as the agent: every gateway token
+    and URL alias is dropped and the agent's own token as the bridge holds it (`raw`) and its gateway URL
+    (`url`, which in a declared bridge only the agent's token can supply: bridge_strip_keys) are set, so a
+    reader resolves exactly those and never the host's. Unmarked, `child` is unchanged."""
+    if not credentials_injected(child):
+        return dict(child)
+    out = {k: v for k, v in child.items() if k not in bridge_strip_keys()}
+    if raw:
+        out[token_env_name()] = raw
+        if url:
+            out[URL_KEYS[0]] = url
+    return out
+
+
+def bridge_strip_keys() -> "tuple[str, ...]":
+    """Every variable a host's own gateway token or endpoint may sit under, for a supervisor to drop from a
+    declared bridge's environment: each token name, every alias the contract ranks (a child of the bridge
+    resolving GATEWAY_TOKEN or RELAY_TOKEN first would act as the host), the media token, and each URL name
+    and alias (discover() ranks an environment URL above the token's own, which would send the agent's
+    bearer to the host's gateway). The bridge's endpoint is then the one inside the agent's token."""
+    return tuple(dict.fromkeys(TOKEN_KEYS + tuple(contract.TOKEN_ALIAS_PRECEDENCE) + (MEDIA_TOKEN_KEY,)
+                               + URL_KEYS + tuple(contract.URL_ALIAS_PRECEDENCE)))
 
 # The precedence, stated once; the first source carrying a value wins (see discover() for each name:
 # "file" is the first listed .env file carrying a token, "token" the URL inside the winning one).
@@ -95,10 +284,10 @@ def refusal_note(path: str, reason: str) -> str:
 
 
 class EnvFiles(list):
-    """env_files' result: the readable files as (path, values), plus every credential-key value
-    each one assigns (a repeated key every time), the refused (path, reason) pairs, and `blocked`,
+    """env_files' result: the readable files as (path, values), plus every credential-key
+    (key, value) each one assigns (a repeated key every time), the refused (path, reason) pairs, and `blocked`,
     the message that stops the token tiers when the explicitly named AG2_DEVICE_ENV was refused."""
-    credential_values: "tuple[str, ...]" = ()
+    credential_pairs: "tuple[tuple[str, str], ...]" = ()
     refused: "tuple[tuple[str, str], ...]" = ()
     blocked: str = ""
 
@@ -107,21 +296,24 @@ def env_files(env: Mapping[str, str], read_text: "Callable[[str], object]") -> E
     """The channel .env files a Sparrow given `env` reads, in order, through the caller's
     `read_text` (see _read_result). An absent file is skipped; a refused one is recorded and
     skipped, a refused AG2_DEVICE_ENV also setting `blocked`, which discover() applies to the
-    credential tiers only: later files still supply config. The bridge calls this."""
+    credential tiers only: later files still supply config. The bridge calls this. A declared bridge
+    (credentials_injected) reads none: its token was handed in, and the host's files are the host's."""
     out, values, refused = EnvFiles(), [], []
+    if credentials_injected(env):
+        return out
     device = env.get("AG2_DEVICE_ENV") or ""
     for path in channel_env_paths(env, channel_dir(env)):
         text, reason = _read_result(read_text(path))
         if text is not None:
             out.append((path, parse_env_text(text)))
-            values += [v for k, v in parse_env_pairs(text) if k in CREDENTIAL_KEYS]
-            values += [v for _k, v in _assignment_pairs(text, CREDENTIAL_KEYS)]  # `export KEY=` too
+            values += [(k, v) for k, v in parse_env_pairs(text) if k in CREDENTIAL_KEYS]
+            values += _assignment_pairs(text, CREDENTIAL_KEYS)  # `export KEY=` too
         elif reason:
             refused.append((path, reason))
             if path == device:
                 out.blocked = (f"AG2_DEVICE_ENV names {path}, which was refused ({reason}); not falling "
                                "back to another credential source. Fix that file or unset AG2_DEVICE_ENV")
-    out.credential_values, out.refused = tuple(values), tuple(refused)
+    out.credential_pairs, out.refused = tuple(values), tuple(refused)
     return out
 
 
@@ -194,6 +386,18 @@ def token_file_token(text: str) -> str:
     return ""
 
 
+def token_file_pairs(text: str) -> "list[tuple[str, str]]":
+    """Every (key, value) in a token file's text that is or could become its token or URL, not
+    only the winners: each assignment (a losing alias, an overwritten duplicate), and the raw line
+    token_file_token reads once no assignment is left, keyed as a token. Beside an assignment that
+    line is only a candidate, so it counts when at least BARE_SECRET_MIN long."""
+    pairs = _assignment_pairs(text, TOKEN_KEYS + URL_KEYS)
+    raw = token_file_token("\n".join(line for line in text.splitlines() if "=" not in line))
+    if raw and (not _assignments(text, TOKEN_KEYS) or len(raw) >= contract.BARE_SECRET_MIN):
+        pairs.append((TOKEN_KEYS[0], raw))
+    return pairs
+
+
 def token_file_url(text: str) -> str:
     """The REMOTE_TASK_URL (legacy AG2_REMOTE_URL) of a split-layout token file's text, or ""."""
     return first(_assignments(text, URL_KEYS), URL_KEYS)[0]
@@ -231,6 +435,17 @@ def register(registry: "contract.SecretRegistry", values) -> None:
             registry.register(secret)
         elif value.lower().startswith(("http://", "https://")):
             registry.register_gateway_url(value)
+
+
+def register_pairs(registry: "contract.SecretRegistry", pairs) -> None:
+    """Register (key, value) candidates: a URL key's plain URL by its credential parts only, so its
+    redacted form stays renderable; every other value as register() does."""
+    for key, value in pairs:
+        if (key in URL_KEYS and value.lower().startswith(("http://", "https://"))
+                and not contract.parse_onboarding_token(value)[0]):
+            registry.register_gateway_url(value)
+        else:
+            register(registry, [value])
 
 
 @dataclass(frozen=True)
@@ -278,12 +493,15 @@ def discover(env: Mapping[str, str], files: "Sequence[EnvFile]" = (), *,
                      f"({token_file_reason}); token rotation cannot read it. Fix that file or unset "
                      "REMOTE_TASK_TOKEN_FILE")
     if registry is not None:
-        register(registry, [unquote(env.get(key) or "") for key in CREDENTIAL_KEYS])
-        register(registry, [values.get(key) or "" for _p, values in files for key in CREDENTIAL_KEYS])
-        register(registry, getattr(files, "credential_values", ()))
-        # Every assignment read, not only the winners: a losing alias or overwritten duplicate was read too.
-        register(registry, [v for _k, v in _assignment_pairs(token_file_text, TOKEN_KEYS + URL_KEYS)])
-        register(registry, [token_file_token(token_file_text), token_file_url(token_file_text)])
+        register_pairs(registry, [(key, unquote(env.get(key) or "")) for key in CREDENTIAL_KEYS])
+        register_pairs(registry, [(key, values.get(key) or "") for _p, values in files for key in CREDENTIAL_KEYS])
+        register_pairs(registry, getattr(files, "credential_pairs", ()))
+        register_pairs(registry, token_file_pairs(token_file_text))
+        # A channel file's token file is the rotation file whenever that file wins: its values are candidates.
+        for _path, values in files:
+            named = values.get(TOKEN_FILE_KEY) or ""
+            if named and named != token_file_env and read_token_file:
+                register_pairs(registry, token_file_pairs(_read_result(read_token_file(named))[0] or ""))
 
     found = {"raw": "", "token_key": "", "source": "none", "source_file": "", "source_vals": {},
              "file_url": ""}

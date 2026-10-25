@@ -2,6 +2,7 @@
 """Long-poll timeout grace preserves retry timing without inventing poll evidence."""
 from __future__ import annotations
 
+import re
 import sys
 import json
 import tempfile
@@ -276,7 +277,7 @@ class GatewayStatusEvidenceTest(unittest.TestCase):
                 self.assertEqual([r["last_ok_ts"] for r in records], [ok] * 10)
                 self.assertEqual(loop.serving[1 + len(prefix):], [False, True] + [False] * 8)
                 self.assertIn("unexpected:", records[0]["error"])
-                self.assertTrue(any("File exists" in m for m in loop.logs))
+                self.assertTrue(any("FileExistsError" in m for m in loop.logs))
                 self.assertEqual(loop.clock.slept, [1, 1, 2, 4, 8, 16, 32, 60, 60])
                 self.assertEqual(loop.acks, [])
                 self.assertFalse(_GW.INFLIGHT_FILE.exists())
@@ -447,7 +448,8 @@ class AckFirstInTheLoopTest(unittest.TestCase):
                 patch.object(self.gw, "_retire_delivered_marks", new=_retire_delivered_marks), \
                 patch.object(self.gw, "_sweep_held_dir", new=lambda: self.calls.append("swept")):
             loop.run()
-        self.assertIn("_retire_delivered_marks failed (RuntimeError: marks) — continuing", loop.logs)
+        self.assertTrue(any(re.fullmatch(r"_retire_delivered_marks failed \(RuntimeError at [\w.-]+:\d+\) — continuing", ln)
+                            for ln in loop.logs), loop.logs)
         self.assertEqual(self.calls, ["swept"], "one sweep's failure skipped the next")
         self.assertEqual(len(loop.polls), 1)
 
@@ -817,9 +819,9 @@ class SlowAckTest(unittest.TestCase):
         self.assertLessEqual(bad[1][1], self.gw.ACK_RETRY_BUDGET_S + 1e-6,
                              "the retry ends inside the budget")
         self.assertTrue(any(m.startswith("served task-bad was not acked") for m in loop.logs))
-        self.assertIn("task ack for task-bad lost to a dropped connection (Remote end closed "
-                      "connection without response) — set aside for retry", loop.logs)
-        self.assertFalse(any(m.startswith("task ack network error for task-bad: Remote end")
+        self.assertTrue(any(m.startswith("task ack for task-bad lost to a dropped connection (RemoteDisconnected ")
+                            and m.endswith(") — set aside for retry") for m in loop.logs), loop.logs)
+        self.assertFalse(any(m.startswith("task ack network error for task-bad: RemoteDisconnected")
                              for m in loop.logs), "pass 1 does not call a set-aside ack failed")
 
     def test_a_redelivered_ack_first_ack_that_drops_does_not_delay_its_siblings(self):
@@ -922,7 +924,8 @@ class RelayResultsInTheLoopTest(unittest.TestCase):
         with _Loop(self.gw) as loop, \
                 patch.object(self.gw, "_reclaim_parked_relay_results", new=_reclaim_parked_relay_results):
             loop.run()
-        self.assertIn("relay result reclaim failed (RuntimeError: outbox) — continuing", loop.logs)
+        self.assertTrue(any(re.fullmatch(r"relay result reclaim failed \(RuntimeError at [\w.-]+:\d+\) — continuing", ln)
+                            for ln in loop.logs), loop.logs)
         self.assertEqual(len(loop.polls), 1)
 
     def test_a_relay_result_landing_outside_the_in_flight_set_wakes_the_outbound_worker(self):
@@ -964,7 +967,7 @@ class DroppedConnectionTest(unittest.TestCase):
     def _assert_network_path(self, loop, cls):
         logs = " ".join(loop.logs)
         self.assertEqual(loop.clock.slept, [1], "backs off like any outage")
-        self.assertIn(f"poll network error: {cls}:", logs, "names the exception class")
+        self.assertIn(f"poll network error: {cls}", logs, "names the exception class, never its text")
         self.assertIn("1 consecutive, 1s since last successful poll", logs)
         self.assertNotIn("unexpected", logs, "a dropped connection is not a crash")
         self.assertTrue(any(c is False and "network" in str(k.get("error", ""))

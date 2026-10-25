@@ -21,8 +21,9 @@ def _load(tmp):
     os.environ.setdefault("REMOTE_TASK_URL", "https://gw.example/relay")
     os.environ.setdefault("REMOTE_TASK_TOKEN", "dummy-secret")
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
-    mod = importlib.import_module("ag2_sparrow.remote_gateway_bridge")
-    return importlib.reload(mod)
+    mod = importlib.reload(importlib.import_module("ag2_sparrow.remote_gateway_bridge"))
+    mod.gateway_instance.binding_key_path = lambda: pathlib.Path(tmp, "binding.key")  # never the real one
+    return mod
 
 def test_connected_then_reconnecting_preserves_last_ok():
     with tempfile.TemporaryDirectory() as d:
@@ -112,8 +113,8 @@ def test_redact_url_strips_userinfo_and_query():
             == "https://gw.example:8443/relay"
         # clean URL is unchanged
         assert m._redact_url("https://gw.example/relay") == "https://gw.example/relay"
-        # a bare non-URL string falls through untouched (never raises)
-        assert m._redact_url("not-a-url") == "not-a-url"
+        # a string that is not a URL fails closed to a placeholder (never raises)
+        assert m._redact_url("not-a-url?token=SEKRIT") == m.gateway_instance.REDACTED_URL
         print("PASS test_redact_url_strips_userinfo_and_query")
 
 def test_emitted_gateway_field_carries_no_secret():
