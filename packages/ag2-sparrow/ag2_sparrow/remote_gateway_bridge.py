@@ -5562,6 +5562,13 @@ _DELIVERED_INFIX = ".delivered-"
 
 
 def _log_dead_claim_released(rec) -> None:
+    if getattr(rec, "malformed", False):
+        # A malformed record has no trustworthy stamp; its file's mtime is the age it has.
+        mtime = getattr(rec, "file_mtime", None)
+        age = f"{int(time.time() - mtime)}s since written" if mtime else "age unknown"
+        _log(f"proactive outbox item {rec.item_id}: released a malformed claim naming dead pid "
+             f"{getattr(rec, 'candidate_pid', None) or rec.pid} ({age}) to park it")
+        return
     if rec.pid is None or rec.pid < 0:
         _log(f"proactive outbox item {rec.item_id}: swept a torn claim past its grace period to park it")
         return
@@ -6002,7 +6009,8 @@ def _send_proactive(claim: Path, f: Path, envelope: dict, owner_dm: bool, notice
                 claim.rename(f.with_name(f".{f.stem}{_DELIVERED_INFIX}{time.time_ns()}"))
             except OSError as e2:
                 _log(f"delivered proactive {f.name} could not be hidden either ({diagnostics.describe(e2)}); "
-                     f"it stays as {claim}, never put back under its live name")
+                     f"it stays as {claim}; if a restart's orphan recovery returns it to its live "
+                     f"name, its DELIVERED outbox item stops any resend")
         if result.status is DrainStatus.ATTEMPTED and result.detail != "settled by a recorded receipt":
             _ENGINE_COUNTS["core_confirmed"] += 1
             _log(f"delivered proactive {f.name} to {room} ({item.get('provider_ref')})")

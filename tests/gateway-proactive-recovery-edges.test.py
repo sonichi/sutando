@@ -22,6 +22,9 @@
  14. A refused while a newer B was written, then a second drain  -> A's claim survives, B sent once
  15. a torn claim past its grace, then a moved DM                -> swept, parked, usable release;
      a fresh torn claim is still refused
+ 16. a malformed claim naming a dead pid                         -> parked, logged with its file's age;
+     one naming a live owner is refused
+ 17. a delivered file kept claimed, then orphan-recovered live   -> archived by its DELIVERED item, not resent
 
 Run: python3 tests/gateway-proactive-recovery-edges.test.py
 """
@@ -542,6 +545,66 @@ def torn_claim_then_moved_dm() -> None:
                   f"15. {label} claim (a writer may be live): refused, nothing sent ({item.get('status')})")
 
 
+def malformed_and_unknown_claims() -> None:
+    import os as _os
+    dead = subprocess.Popen([sys.executable, "-c", "pass"])
+    dead.wait()
+    for label, pid, want_parked in (("dead", dead.pid, True), ("live", _os.getpid(), False)):
+        lane = pl.Lane(gb, ISO, refused)
+        stem = f"proactive-16{label[0]}"
+        lane.write(f"{stem}.txt", "sixteen\n")
+        lane.drain()
+        item_id = gb._proactive_item_id(stem, "sixteen")
+        cp = vendored._claim_path(lane.results / ".outbox-ag2space-proactive", item_id)
+        cp.parent.mkdir(parents=True, exist_ok=True)
+        cp.write_text(json.dumps({"item_id": item_id, "drainer_id": "x", "pid": pid, "claimed_at": "not-a-time"}))
+        old = gb.time.time() - 3600
+        _os.utime(cp, (old, old))
+        lane.owner_dm = f"!Moved{stem}:ag2.space"
+        n = len(lane.posts)
+        for _ in range(2):
+            lane.drain()
+        item = vendored.read_item(lane.results / ".outbox-ag2space-proactive", item_id) or {}
+        if want_parked:
+            line = next((m for m in lane.logs if item_id in m and "claim" in m and "park it" in m), "")
+            age = [int(w[1:].rstrip("s")) for w in line.split() if w.startswith("(") and w.endswith("s")]
+            check(item.get("reason") == "destination-changed" and len(lane.posts) == n
+                  and "malformed claim" in line and str(pid) in line and age and 3500 <= age[0] <= 3700,
+                  f"16. a malformed claim naming a dead pid parks, logged with its file's age ({line[-120:]!r})")
+        else:
+            check(item.get("status") != "PARKED" and len(lane.posts) == n and lane.where(stem) == "pending",
+                  f"16. a malformed claim naming a live owner is refused ({item.get('status')})")
+
+
+def recovered_delivered_claim_not_resent() -> None:
+    lane = pl.Lane(gb, ISO)
+    lane.write("proactive-17.txt", "seventeen\n")
+    real = Path.rename
+
+    def rename(self, target):
+        if ".sending." in self.name and (Path(target).parent.name == "archive"
+                                         or Path(target).name.startswith(".proactive-17")):
+            raise OSError("read-only")
+        return real(self, target)
+    Path.rename = rename
+    try:
+        lane.drain()
+    finally:
+        Path.rename = real
+    dead = subprocess.Popen([sys.executable, "-c", "pass"])
+    dead.wait()
+    for c in lane.results.glob("proactive-17.sending.*"):
+        rest = c.name.split(".sending.", 1)[1].split(".", 1)
+        c.rename(c.with_name(f"proactive-17.sending.{dead.pid}.{rest[1] if len(rest) > 1 else '0'}"))
+    lane.restart()
+    recovered = lane.where("proactive-17")
+    for _ in range(2):
+        lane.drain()
+    check(recovered == "pending" and len(lane.posts) == 1 and lane.where("proactive-17") == "archived",
+          f"17. a delivered file orphan recovery returns to its live name is archived, not resent "
+          f"({recovered} -> {lane.where('proactive-17')}, {len(lane.posts)} POSTs)")
+
+
 def upgrade_park_refused() -> None:
     upgraded = {"reason": "room_upgraded", "replacement_room": "!Up:ag2.space"}
 
@@ -597,6 +660,8 @@ def main() -> int:
     upgrade_park_refused()
     retained_claim_survives_next_drain()
     torn_claim_then_moved_dm()
+    malformed_and_unknown_claims()
+    recovered_delivered_claim_not_resent()
     restore_refuses_empty_digest()
     unreadable_first_generation()
     two_generations()

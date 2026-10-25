@@ -579,7 +579,9 @@ records none. Parking takes the item's lock and refuses an item that is delivere
 receipt or a dispatch mark, or is held by a live claim (a dead owner's claim past its reclaim
 window is released first). A delivered file that cannot be archived is renamed to a hidden
 `.<stem>.delivered-<ts>` that no bridge globs, and a later pass moves it into `archive/`; it
-is never unlinked and never put back under its live name. Every handback to a live name uses a
+is never unlinked and never put back under its live name. If even the hidden rename fails it
+stays claimed; a restart's orphan recovery may then return it to its live name, where its
+DELIVERED item is archived without a resend. Every handback to a live name uses a
 no-replace rename, so a newer file a producer wrote there is never overwritten.
 
 The file is still claimed by rename (`.sending.<pid>`, recovered by `_recover_orphan_proactive`
