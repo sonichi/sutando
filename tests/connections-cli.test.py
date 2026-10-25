@@ -4,7 +4,8 @@
 The CLI is a dispatch layer: each verb calls one src/connections.py unit and prints.
 The vault path is the real `vault_intercept`, pointed at a stub Keychain on PATH, so
 the documented programmatic path is exercised without touching the host's Keychain.
-Tokens name a closed local port, so the preview probe fails fast and unverified.
+Tokens name reserved `.example` hosts, so the preview probe fails (no such host) and the
+rows are unverified, gateway-sourced.
 No output may carry a secret.
 
 Run: python3 tests/connections-cli.test.py
@@ -25,8 +26,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 CLI = ROOT / "scripts" / "connections.py"
 
-TOKEN_A = "http://127.0.0.1:9/alpha|secret-alpha"
-TOKEN_B = "http://127.0.0.2:9/beta|secret-beta"
+TOKEN_A = "https://alpha.example/relay|secret-alpha"
+TOKEN_B = "https://beta.example/relay|secret-beta"
 
 FAKE_SECURITY = r"""#!/usr/bin/env bash
 # Stub Keychain: items are files under $FAKE_KEYCHAIN named by service.
@@ -85,61 +86,67 @@ class CliTests(unittest.TestCase):
     def test_add_previews_then_asks(self):
         proc = self.run_cli("add", TOKEN_A, stdin="n\n")
         self.assertEqual(proc.returncode, 1, proc.stderr)
-        self.assertIn("server:    127.0.0.1  (unverified: from the gateway host)", proc.stdout)
-        self.assertIn("gateway:   http://127.0.0.1:9/alpha", proc.stdout)
+        self.assertIn("server:    alpha.example  (unverified: from the gateway host)", proc.stdout)
+        self.assertIn("gateway:   https://alpha.example/relay", proc.stdout)
         self.assertIn("not saved", proc.stdout)
         self.assert_no_secret(proc)
         self.assertEqual(self.run_cli("list").stdout.strip(), "no connections")
 
         proc = self.run_cli("add", TOKEN_A, stdin="y\n")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("added 127-0-0-1 for 127.0.0.1 (token in vault as AG2_REMOTE_TOKEN_127_0_0_1) — primary",
+        self.assertIn("added alpha-example for alpha.example (token in vault as AG2_REMOTE_TOKEN_ALPHA_EXAMPLE) — primary",
                       proc.stdout)
-        self.assertEqual((self.keychain / "AG2_REMOTE_TOKEN_127_0_0_1").read_text(), TOKEN_A)
+        self.assertEqual((self.keychain / "AG2_REMOTE_TOKEN_ALPHA_EXAMPLE").read_text(), TOKEN_A)
         manifest = json.loads((self.ws / "state" / "secret-vault" / "keys.json").read_text())
-        self.assertIn("AG2_REMOTE_TOKEN_127_0_0_1", manifest)
+        self.assertIn("AG2_REMOTE_TOKEN_ALPHA_EXAMPLE", manifest)
+
+    def test_a_token_aimed_at_an_address_is_refused_before_any_probe(self):
+        proc = self.run_cli("add", "http://127.0.0.1:9/relay|s", "--yes", "--expected-server", "127.0.0.1")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("invalid_gateway", proc.stderr)
+        self.assertEqual(self.run_cli("list").stdout.strip(), "no connections")
 
     def test_yes_needs_the_expected_server_and_checks_it(self):
         proc = self.run_cli("add", TOKEN_A, "--yes")
         self.assertEqual(proc.returncode, 2)
         proc = self.run_cli("add", TOKEN_A, "--yes", "--expected-server", "somewhere.else")
         self.assertEqual(proc.returncode, 1)
-        self.assertIn("127.0.0.1", proc.stderr)
+        self.assertIn("alpha.example", proc.stderr)
         self.assert_no_secret(proc)
         self.assertEqual(sorted(self.keychain.iterdir()), [])
-        proc = self.run_cli("add", "-", "--yes", "--expected-server", "127.0.0.1", "--added-by", "login",
+        proc = self.run_cli("add", "-", "--yes", "--expected-server", "alpha.example", "--added-by", "login",
                             stdin=TOKEN_A + "\n")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        proc = self.run_cli("add", TOKEN_A, "--yes", "--expected-server", "127.0.0.1")
+        proc = self.run_cli("add", TOKEN_A, "--yes", "--expected-server", "alpha.example")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("already present:", proc.stdout)
 
     def test_list_set_primary_remove(self):
-        self.run_cli("add", TOKEN_A, "--yes", "--expected-server", "127.0.0.1")
-        self.run_cli("add", TOKEN_B, "--yes", "--expected-server", "127.0.0.2")
+        self.run_cli("add", TOKEN_A, "--yes", "--expected-server", "alpha.example")
+        self.run_cli("add", TOKEN_B, "--yes", "--expected-server", "beta.example")
         proc = self.run_cli("list")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("127-0-0-1", proc.stdout)
+        self.assertIn("alpha-example", proc.stdout)
         self.assertIn("pending", proc.stdout)
         self.assert_no_secret(proc)
         rows = json.loads(self.run_cli("list", "--json").stdout)
-        self.assertEqual([(r["instance"], r["primary"], r["state"]) for r in rows],
-                         [("127-0-0-1", True, "pending"), ("127-0-0-2", False, "pending")])
+        self.assertEqual([(r["instance"], r["primary"], r["state"], r["server_source"]) for r in rows],
+                         [("alpha-example", True, "pending", "gateway"), ("beta-example", False, "pending", "gateway")])
 
-        proc = self.run_cli("set-primary", "127-0-0-2")
+        proc = self.run_cli("set-primary", "beta-example")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         rows = json.loads(self.run_cli("list", "--json").stdout)
         self.assertEqual([r["primary"] for r in rows], [False, True])
 
-        proc = self.run_cli("remove", "127-0-0-2")
+        proc = self.run_cli("remove", "beta-example")
         self.assertEqual(proc.returncode, 1)
         self.assertIn("without force", proc.stderr)
-        proc = self.run_cli("remove", "127-0-0-2", "--force")
+        proc = self.run_cli("remove", "beta-example", "--force")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertFalse((self.keychain / "AG2_REMOTE_TOKEN_127_0_0_2").exists())
-        self.assertTrue((self.keychain / "AG2_REMOTE_TOKEN_127_0_0_1").exists())
+        self.assertFalse((self.keychain / "AG2_REMOTE_TOKEN_BETA_EXAMPLE").exists())
+        self.assertTrue((self.keychain / "AG2_REMOTE_TOKEN_ALPHA_EXAMPLE").exists())
         rows = json.loads(self.run_cli("list", "--json").stdout)
-        self.assertEqual([(r["instance"], r["primary"]) for r in rows], [("127-0-0-1", False)],
+        self.assertEqual([(r["instance"], r["primary"]) for r in rows], [("alpha-example", False)],
                          "no row inherits the primary flag")
 
     def test_import_env_then_launch_plan(self):
@@ -151,11 +158,39 @@ class CliTests(unittest.TestCase):
         self.assert_no_secret(proc)
         self.assertEqual(self.run_cli("import-env", env_extra=extra).stdout.strip(), "nothing to import")
 
-        proc = self.run_cli("launch-plan", env_extra={"AG2_REMOTE_TOKEN_QA": "http://127.0.0.3:9/|q"})
+        proc = self.run_cli("launch-plan", env_extra={"AG2_REMOTE_TOKEN_QA": "https://qa.example/|q"})
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stdout.splitlines(),
                          ["dev\tAG2_REMOTE_TOKEN_DEV\tdev-ag2space\t0", "qa\tAG2_REMOTE_TOKEN_QA\tqa-ag2space\t0"])
         self.assert_no_secret(proc)
+        proc = self.run_cli("remove", "dev")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        proc = self.run_cli("import-env", env_extra=extra)
+        self.assertIn("AG2_REMOTE_TOKEN_DEV: connection removed earlier; unset the variable", proc.stdout)
+        self.assertNotIn("imported dev", proc.stdout)
+
+    def test_a_corrupt_record_fails_the_plan_loudly_and_env_only_launch_still_works(self):
+        (self.ws / "state").mkdir(parents=True, exist_ok=True)
+        (self.ws / "state" / "connections.json").write_text('{"schema_version": 1, "connections": [{"tru')
+        proc = self.run_cli("launch-plan")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("not valid JSON", proc.stderr)
+        self.assertEqual(proc.stdout, "")
+        box = Path(self.tmp.name)
+        repo = box / "repo"
+        (repo / "src").mkdir(parents=True)
+        (repo / "src" / "remote-gateway-bridge.py").write_text(
+            "import os, pathlib\npathlib.Path(os.environ['FAKE_OUT']).write_text(os.environ['GATEWAY_INSTANCE'])\n")
+        out = box / "env-only.txt"
+        proc = self.run_cli("launch", "dev", "--repo", str(repo), "--logs-dir", str(box / "logs"), "--env-only",
+                            env_extra={"AG2_REMOTE_TOKEN_DEV": TOKEN_B, "FAKE_OUT": str(out)})
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        for _ in range(50):
+            if out.exists():
+                break
+            import time
+            time.sleep(0.1)
+        self.assertEqual(out.read_text(), "dev")
 
     def test_launch_and_reconnect_run_the_bridge_entry_point(self):
         box = Path(self.tmp.name)
@@ -166,29 +201,29 @@ class CliTests(unittest.TestCase):
             "pathlib.Path(os.environ['FAKE_OUT']).write_text(os.environ['GATEWAY_INSTANCE'] + ' ' "
             "+ os.environ['REMOTE_TASK_CHANNEL_DIR'] + ' ' + repr(os.environ['REMOTE_PROACTIVE_ROOM']))\n")
         out = box / "launched.txt"
-        self.run_cli("add", TOKEN_B, "--yes", "--expected-server", "127.0.0.2")
-        proc = self.run_cli("launch", "127-0-0-2", "--repo", str(repo), "--logs-dir", str(box / "logs"),
+        self.run_cli("add", TOKEN_B, "--yes", "--expected-server", "beta.example")
+        proc = self.run_cli("launch", "beta-example", "--repo", str(repo), "--logs-dir", str(box / "logs"),
                             env_extra={"FAKE_OUT": str(out), "REMOTE_PROACTIVE_ROOM": "!room:x"})
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("launched 127-0-0-2 (pid ", proc.stdout)
+        self.assertIn("launched beta-example (pid ", proc.stdout)
         for _ in range(50):
             if out.exists():
                 break
             import time
             time.sleep(0.1)
-        self.assertEqual(out.read_text(), "127-0-0-2 127-0-0-2-ag2space '!room:x'", "the primary keeps the room")
-        record = json.loads((self.ws / "state" / "connections-launch" / "127-0-0-2.json").read_text())
+        self.assertEqual(out.read_text(), "beta-example beta-example-ag2space '!room:x'", "the primary keeps the room")
+        record = json.loads((self.ws / "state" / "connections-launch" / "beta-example.json").read_text())
         self.assertTrue(record["ok"])
-        proc = self.run_cli("reconnect", "127-0-0-2", "--repo", str(repo), "--logs-dir", str(box / "logs"))
+        proc = self.run_cli("reconnect", "beta-example", "--repo", str(repo), "--logs-dir", str(box / "logs"))
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("reconnected 127-0-0-2", proc.stdout)
+        self.assertIn("reconnected beta-example", proc.stdout)
         proc = self.run_cli("launch", "nope", "--repo", str(repo), "--logs-dir", str(box / "logs"))
         self.assertEqual(proc.returncode, 1)
         self.assertIn("no connection", proc.stderr)
 
     def test_vault_failure_is_named_and_writes_no_row(self):
-        (self.keychain / "AG2_REMOTE_TOKEN_127_0_0_1").mkdir()  # a directory makes the stub's write fail
-        proc = self.run_cli("add", TOKEN_A, "--yes", "--expected-server", "127.0.0.1")
+        (self.keychain / "AG2_REMOTE_TOKEN_ALPHA_EXAMPLE").mkdir()  # a directory makes the stub's write fail
+        proc = self.run_cli("add", TOKEN_A, "--yes", "--expected-server", "alpha.example")
         self.assertEqual(proc.returncode, 1)
         self.assertIn("secret vault", proc.stderr)
         self.assert_no_secret(proc)

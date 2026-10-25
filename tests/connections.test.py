@@ -33,7 +33,11 @@ import connections as C  # noqa: E402
 import dotspace  # noqa: E402
 
 # Tests resolve offline: the real resolver with no well-known fetch and this registry.
-REGISTRY = {"instances": [{"server": "s.space", "gateway_host": "chat.s.space"}]}
+REGISTRY = {"instances": [{"server": "s.space", "gateway_host": "chat.s.space"},
+                          {"server": "ag2.space", "gateway_host": "chat.ag2.space"},
+                          {"server": "alpha.example", "gateway_host": "chat.alpha.example"},
+                          {"server": "beta.example", "gateway_host": "relay.beta.example"}]}
+UNREGISTERED = "https://gw.unregistered.example|secret-u"
 
 
 def offline_resolver(host):
@@ -144,12 +148,29 @@ class Preview(unittest.TestCase):
                              "agent_mxid": "@sutando:alpha.example", "verified": True,
                              "authenticated": True, "error": None})
 
-    def test_ambiguous_or_empty_fleet_falls_back_to_the_gateway_host(self):
+    def test_ambiguous_or_empty_fleet_leaves_the_registered_server_unverified(self):
         p = C.preview_connection(TOKEN_A, fetch=agents("@a:alpha.example", "@b:alpha.example"))
-        self.assertEqual((p["server"], p["verified"], p["authenticated"], p["agent_mxid"]),
-                         ("chat.alpha.example", False, True, None))
+        self.assertEqual((p["server"], p["server_source"], p["verified"], p["authenticated"], p["agent_mxid"]),
+                         ("alpha.example", "resolver", False, True, None))
         p = C.preview_connection(TOKEN_A, fetch=lambda u, t: {"agents": []})
-        self.assertEqual((p["server"], p["verified"]), ("chat.alpha.example", False))
+        self.assertEqual((p["server"], p["verified"]), ("alpha.example", False))
+
+    def test_a_listing_cannot_establish_an_identity_for_an_unregistered_gateway(self):
+        p = C.preview_connection("https://evil.example/relay|s", fetch=agents("@sutando:ag2.space"))
+        self.assertEqual((p["server"], p["server_source"], p["verified"], p["agent_mxid"], p["authenticated"]),
+                         ("evil.example", "gateway", False, None, True))
+
+    def test_probe_refuses_addresses_loopback_private_and_single_label_hosts(self):
+        for host in ("127.0.0.1:9", "10.0.0.1", "192.168.1.1", "[::1]:8", "localhost", "intranet", "127.1",
+                     "0x7f.1", "169.254.1.1"):
+            with self.assertRaises(C.InvalidToken, msg=host) as cm:
+                C.preview_connection(f"http://{host}/relay|s", fetch=lambda u, t: self.fail(f"probed {host}"))
+            self.assertEqual(str(cm.exception), "invalid_gateway")
+        self.assertTrue(C.gateway_host_ok("chat.s.space"))
+        self.assertFalse(C.gateway_host_ok(""))
+        with unittest.mock.patch.dict(sys.modules, {"dotspace": None}):
+            self.assertTrue(C.gateway_host_ok("chat.s.space"))
+            self.assertFalse(C.gateway_host_ok("bad_host.example"))
 
     def test_auth_rejection_and_outage_are_named_without_the_secret(self):
         p = C.preview_connection(TOKEN_A, fetch=http_error(401))
@@ -176,16 +197,17 @@ class Preview(unittest.TestCase):
 
     def test_404_is_not_a_gateway(self):
         p = C.preview_connection(TOKEN_A, fetch=http_error(404))
-        self.assertEqual((p["authenticated"], p["error"], p["server_source"]), (None, "not_a_gateway", "gateway"))
+        self.assertEqual((p["authenticated"], p["error"], p["server_source"]), (None, "not_a_gateway", "resolver"))
 
     def test_resolver_names_the_server_of_a_gateway_host(self):
         for token in ("https://chat.s.space/relay|s1", "https://matrix.s.space/relay|s2"):
             p = C.preview_connection(token, fetch=unreachable)
             self.assertEqual((p["server"], p["server_source"], p["verified"]), ("s.space", "resolver", False), token)
-        p = C.preview_connection(TOKEN_A, fetch=unreachable)
-        self.assertEqual((p["server"], p["server_source"]), ("chat.alpha.example", "gateway"))
+        p = C.preview_connection(UNREGISTERED, fetch=unreachable)
+        self.assertEqual((p["server"], p["server_source"]), ("gw.unregistered.example", "gateway"))
         p = C.preview_connection("https://chat.s.space|s", fetch=agents("@bot:other.example"))
-        self.assertEqual((p["server"], p["server_source"]), ("other.example", "identity"), "identity beats the resolver")
+        self.assertEqual((p["server"], p["server_source"], p["verified"], p["agent_mxid"]),
+                         ("s.space", "resolver", False, None), "a listing that disagrees with the registry confirms nothing")
 
     def test_resolver_is_optional_and_may_fail(self):
         self.assertEqual(C.resolve_server("chat.s.space", resolver=lambda h: None), "")
@@ -214,14 +236,16 @@ class Preview(unittest.TestCase):
             def log_message(self, *a):
                 pass
         srv = http.server.HTTPServer(("127.0.0.1", 0), Redirecting)
-        t = threading.Thread(target=srv.handle_request)
+        srv.timeout = 5
+        t = threading.Thread(target=srv.handle_request, daemon=True)
         t.start()
         try:
-            p = C.preview_connection(f"http://127.0.0.1:{srv.server_address[1]}|s", resolver=lambda h: None)
+            with self.assertRaises(urllib.error.HTTPError) as cm:
+                C._fetch_agents(f"http://127.0.0.1:{srv.server_address[1]}", "http://x|s")
         finally:
             t.join(5)
             srv.server_close()
-        self.assertEqual((p["authenticated"], p["error"]), (None, "http_302"))
+        self.assertEqual(cm.exception.code, 302)
 
 
 class AddConnection(Base):
@@ -244,9 +268,49 @@ class AddConnection(Base):
         self.assertEqual(oct(C.record_path(self.ws).stat().st_mode & 0o777), "0o600")
 
     def test_unverified_add_records_the_host_and_verified_false(self):
-        row, _ = self.add(fetch=unreachable)
+        row, _ = self.add(UNREGISTERED, fetch=unreachable)
         self.assertEqual((row["server"], row["verified"], row.get("agent_mxid"), row["server_source"]),
-                         ("chat.alpha.example", False, None, "gateway"))
+                         ("gw.unregistered.example", False, None, "gateway"))
+        row, _ = self.add(fetch=unreachable)
+        self.assertEqual((row["server"], row["verified"], row["server_source"]), ("alpha.example", False, "resolver"))
+
+    def test_spoofed_identity_never_shadows_the_real_connection(self):
+        evil, created = self.add("https://evil.example/relay|evil-secret", fetch=agents("@sutando:ag2.space"))
+        self.assertTrue(created)
+        self.assertEqual((evil["server"], evil["server_source"], evil["verified"]), ("evil.example", "gateway", False))
+        real, created = self.add("https://chat.ag2.space/relay|real-secret", fetch=agents("@sutando:ag2.space"))
+        self.assertTrue(created, "the real token is stored, not swallowed by the provisional row")
+        self.assertEqual((real["server"], real["server_source"], real["verified"]), ("ag2.space", "identity", True))
+        self.assertEqual(self.vault.store[real["token_ref"]], "https://chat.ag2.space/relay|real-secret")
+        self.assertEqual([r["server"] for r in self.rows()], ["evil.example", "ag2.space"])
+
+    def test_a_provisional_row_matches_only_its_own_gateway_host(self):
+        first, _ = self.add(UNREGISTERED, fetch=unreachable)
+        other, created = self.add("https://other.unregistered.example|s", fetch=unreachable)
+        self.assertTrue(created)
+        self.assertNotEqual(other["instance"], first["instance"])
+        again, created = self.add("https://gw.unregistered.example/v2|s2", fetch=unreachable)
+        self.assertFalse(created)
+        self.assertEqual(again["instance"], first["instance"])
+
+    def test_a_rejected_token_is_never_stored(self):
+        with self.assertRaises(C.TokenRejected):
+            self.add(fetch=http_error(401))
+        self.assertEqual((self.rows(), self.vault.store), ([], {}))
+        row, created = self.add(fetch=unreachable)
+        self.assertTrue(created, "an unreachable gateway is stored as a pending, unverified row")
+        self.assertFalse(row["verified"])
+        self.assertEqual(C.status_for(row, self.ws)["state"], "pending")
+
+    def test_instance_must_be_a_string_and_a_foreign_vault_key_is_never_overwritten(self):
+        for bad in (["x"], 5):
+            with self.assertRaises(C.ConnectionsError):
+                self.add(instance=bad)
+        self.vault.store["AG2_REMOTE_TOKEN_ALPHA_EXAMPLE"] = "someone-else's secret"
+        with self.assertRaises(C.VaultKeyInUse):
+            self.add()
+        self.assertEqual(self.vault.store["AG2_REMOTE_TOKEN_ALPHA_EXAMPLE"], "someone-else's secret")
+        self.assertEqual(self.rows(), [])
 
     def test_two_endpoint_tokens_of_one_homeserver_make_one_row(self):
         first, created = self.add("https://chat.s.space/relay|s1", fetch=unreachable)
@@ -266,7 +330,7 @@ class AddConnection(Base):
 
     def test_verified_add_rekeys_a_provisional_row_in_place(self):
         first, _ = self.add(fetch=unreachable)
-        self.assertEqual((first["server"], first["server_source"]), ("chat.alpha.example", "gateway"))
+        self.assertEqual((first["server"], first["server_source"]), ("alpha.example", "resolver"))
         again, created = self.add("https://chat.alpha.example|rotated", fetch=agents("@sutando:alpha.example"))
         self.assertFalse(created)
         self.assertEqual((again["server"], again["server_source"], again["verified"], again["agent_mxid"]),
@@ -324,7 +388,7 @@ class AddConnection(Base):
             def __getattr__(self, name):
                 raise AttributeError(name)
         with self.assertRaises(C.VaultUnavailable):
-            C.add_connection(TOKEN_A, added_by="owner", expected_server="chat.alpha.example",
+            C.add_connection(TOKEN_A, added_by="owner", expected_server="alpha.example",
                              fetch=unreachable, workspace=self.ws, vault=Broken())
 
     def test_instance_collision_and_bad_inputs(self):
@@ -358,6 +422,38 @@ class Primary(Base):
 
 
 class RemoveConnection(Base):
+    def test_remove_stops_the_bridge_holding_the_lock(self):
+        self.add(TOKEN_B, fetch=agents("@s:beta.example"))
+        locks = self.ws / "state" / "locks"
+        locks.mkdir(parents=True)
+        lock = locks / "gateway-bridge.beta-example.lock"
+        lock.write_text("777\n")
+        fd = os.open(str(lock), os.O_RDWR)
+        from file_lock import lock_fd, unlock_fd
+        lock_fd(fd)
+        killed = []
+
+        def kill(pid, sig):
+            killed.append(pid)
+            unlock_fd(fd)
+        try:
+            gone = C.remove_connection("beta-example", force=True, workspace=self.ws, vault=self.vault, kill=kill)
+        finally:
+            os.close(fd)
+        self.assertEqual((killed, gone["stopped_pid"]), ([777], 777))
+
+    def test_removed_env_row_is_not_imported_again(self):
+        env = {"AG2_REMOTE_TOKEN_DEV": TOKEN_B}
+        C.import_from_env(env, workspace=self.ws, vault=self.vault)
+        C.remove_connection("dev", workspace=self.ws, vault=self.vault)
+        self.assertEqual(C.removed_env_refs(self.ws), ["AG2_REMOTE_TOKEN_DEV"])
+        self.assertEqual(C.import_from_env(env, workspace=self.ws, vault=self.vault), [])
+        self.assertEqual(self.rows(), [])
+        self.assertEqual(C.launch_plan(env, workspace=self.ws), [], "a removed env token is not relaunched either")
+        row, _ = self.add(TOKEN_B, fetch=unreachable, instance="dev")
+        self.assertEqual(row["token_ref"], "AG2_REMOTE_TOKEN_DEV")
+        self.assertEqual(C.removed_env_refs(self.ws), [], "an explicit add clears the tombstone")
+
     def test_remove_drops_row_vault_key_and_launch_record_only_for_that_instance(self):
         self.add()
         self.add(TOKEN_B, fetch=agents("@s:beta.example"))
@@ -405,7 +501,7 @@ class ImportFromEnv(Base):
                           for r in created],
                          [("", "REMOTE_TASK_TOKEN", True, "env", False),
                           ("dev", "AG2_REMOTE_TOKEN_DEV", False, "env", False)])
-        self.assertEqual(created[1]["server"], "relay.beta.example")
+        self.assertEqual((created[1]["server"], created[1]["server_source"]), ("beta.example", "resolver"))
         self.assertEqual(self.vault.store, {"REMOTE_TASK_TOKEN": TOKEN_A, "AG2_REMOTE_TOKEN_DEV": TOKEN_B})
         self.assertEqual(C.import_from_env(self.ENV, workspace=self.ws, vault=self.vault), [])
         self.assertEqual(len(self.rows()), 2)
@@ -477,6 +573,7 @@ class Record(Base):
             (json.dumps({"schema_version": 1, "connections": [row(added_by="nobody")]}), "added_by"),
             (json.dumps({"schema_version": 1, "connections": [row(verified="yes")]}), "verified"),
             (json.dumps({"schema_version": 1, "connections": [row(server_source="guess")]}), "server_source"),
+            (json.dumps({"schema_version": 1, "connections": [], "removed_env": "x"}), "removed_env"),
         ]
         for text, needle in cases:
             path.write_text(text)
@@ -666,20 +763,38 @@ class Launching(Base):
 
     def test_reconnect_learns_the_identity_and_rekeys(self):
         row, _ = self.add(TOKEN_B, fetch=unreachable)
-        self.assertEqual(row["server_source"], "gateway")
-        record = C.reconnect("relay-beta-example", repo=self.repo, logs_dir=self.logs, environ={},
+        self.assertEqual(row["server_source"], "resolver")
+        record = C.reconnect("beta-example", repo=self.repo, logs_dir=self.logs, environ={},
                              workspace=self.ws, vault=self.vault, spawn=self.spawn, kill=lambda *a: None,
                              fetch=agents("@sutando:beta.example"))
         self.assertEqual(record["pid"], 4242)
         after = self.rows()[0]
         self.assertEqual((after["server"], after["server_source"], after["instance"], after["agent_mxid"]),
-                         ("beta.example", "identity", "relay-beta-example", "@sutando:beta.example"))
-        self.assertEqual(self.spawned[0][1]["GATEWAY_INSTANCE"], "relay-beta-example")
+                         ("beta.example", "identity", "beta-example", "@sutando:beta.example"))
+        self.assertEqual(self.spawned[0][1]["GATEWAY_INSTANCE"], "beta-example")
         # A probe that fails leaves the row as it was and still launches.
-        C.reconnect("relay-beta-example", repo=self.repo, logs_dir=self.logs, environ={}, workspace=self.ws,
+        C.reconnect("beta-example", repo=self.repo, logs_dir=self.logs, environ={}, workspace=self.ws,
                     vault=self.vault, spawn=self.spawn, kill=lambda *a: None, fetch=unreachable)
         self.assertEqual(self.rows()[0]["server_source"], "identity")
         self.assertEqual(len(self.spawned), 2)
+
+    def test_unreadable_record_fails_the_plan_loudly_and_env_only_still_launches(self):
+        C.record_path(self.ws).parent.mkdir(parents=True)
+        C.record_path(self.ws).write_text('{"schema_version": 1, "connections": [{"tru')
+        with self.assertRaises(C.SchemaError) as cm:
+            C.launch_plan({"AG2_REMOTE_TOKEN_DEV": TOKEN_B}, workspace=self.ws)
+        self.assertIn("not valid JSON", str(cm.exception))
+        with self.assertRaises(C.SchemaError):
+            C.launch("dev", repo=self.repo, logs_dir=self.logs, environ={"AG2_REMOTE_TOKEN_DEV": TOKEN_B},
+                     workspace=self.ws, vault=self.vault, spawn=self.spawn)
+        record = C.launch("dev", repo=self.repo, logs_dir=self.logs, environ={"AG2_REMOTE_TOKEN_DEV": TOKEN_B},
+                          workspace=self.ws, vault=self.vault, spawn=self.spawn, env_only=True)
+        self.assertEqual(record["pid"], 4242)
+        env = self.spawned[0][1]
+        self.assertEqual((env["GATEWAY_INSTANCE"], env["REMOTE_TASK_TOKEN"], env["REMOTE_PROACTIVE_ROOM"]),
+                         ("dev", TOKEN_B, ""))
+        with self.assertRaises(C.UnknownConnection):
+            C.plan_entry("nope", {"AG2_REMOTE_TOKEN_DEV": TOKEN_B}, workspace=self.ws, env_only=True)
 
     def test_reconnect_without_a_running_bridge_just_launches(self):
         self.add(TOKEN_B, fetch=agents("@s:beta.example"))
@@ -727,15 +842,17 @@ class Edges(Base):
                 pass
         seen = {}
         srv = http.server.HTTPServer(("127.0.0.1", 0), Agents)
-        t = threading.Thread(target=srv.handle_request)
+        srv.timeout = 5
+        t = threading.Thread(target=srv.handle_request, daemon=True)
         t.start()
         try:
-            p = C.preview_connection(f"http://127.0.0.1:{srv.server_address[1]}/relay|the-secret")
+            answer = C._fetch_agents(f"http://127.0.0.1:{srv.server_address[1]}/relay",
+                                     f"http://127.0.0.1:{srv.server_address[1]}/relay|the-secret")
         finally:
             t.join(5)
             srv.server_close()
         self.assertEqual(seen, {"auth": "Bearer the-secret", "path": "/relay/v1/agents"})
-        self.assertEqual((p["server"], p["server_source"], p["verified"]), ("probe.example", "identity", True))
+        self.assertEqual(answer, {"agents": [{"id": "@bot:probe.example"}]})
 
     def test_vault_binding_uses_the_secret_vault_module(self):
         calls = []
@@ -854,7 +971,7 @@ class Edges(Base):
         record = C.reconnect(row["instance"], repo=self.ws, logs_dir=self.ws / "logs", environ={},
                              workspace=self.ws, vault=self.vault, spawn=lambda a, e, l: 5, kill=lambda *a: None)
         self.assertEqual(record["pid"], 5)
-        self.assertEqual(self.rows()[0]["server_source"], "gateway")
+        self.assertEqual(self.rows()[0]["server_source"], "resolver")
 
 
 if __name__ == "__main__":

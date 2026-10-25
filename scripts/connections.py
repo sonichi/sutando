@@ -8,7 +8,9 @@
   set-primary INSTANCE         move proactive/owner-DM defaults to this connection
   remove INSTANCE [--force]    drop the row and its vault key; the primary needs --force
   reconnect INSTANCE --repo DIR --logs-dir DIR   stop and relaunch that one bridge
-  launch INSTANCE --repo DIR --logs-dir DIR      start one bridge from the launch plan
+  launch INSTANCE --repo DIR --logs-dir DIR [--env-only]
+                               start one bridge from the launch plan (--env-only: from the
+                               AG2_REMOTE_TOKEN_<INST> variable alone, when the record is unreadable)
   import-env                   rows once for REMOTE_TASK_TOKEN and each AG2_REMOTE_TOKEN_<INST>
   launch-plan                  one 'instance<TAB>token_ref<TAB>channel_dir<TAB>primary' line per bridge
 
@@ -94,7 +96,8 @@ def cmd_remove(args) -> int:
 
 
 def cmd_launch(args) -> int:
-    record = connections.launch(args.instance, repo=args.repo, logs_dir=args.logs_dir, workspace=args.workspace)
+    record = connections.launch(args.instance, repo=args.repo, logs_dir=args.logs_dir, workspace=args.workspace,
+                                env_only=args.env_only)
     print(f"launched {args.instance} (pid {record['pid']})")
     return 0
 
@@ -110,6 +113,9 @@ def cmd_import_env(args) -> int:
     created = connections.import_from_env(os.environ, workspace=args.workspace)
     for row in created:
         print(f"imported {row['instance'] or '(legacy)'} from {row['token_ref']}")
+    for ref in connections.removed_env_refs(args.workspace):
+        if os.environ.get(ref, "").strip():
+            print(f"{ref}: connection removed earlier; unset the variable")
     if not created:
         print("nothing to import")
     return 0
@@ -143,7 +149,8 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("set-primary"); s.add_argument("instance"); s.set_defaults(fn=cmd_set_primary)
     s = sub.add_parser("remove"); s.add_argument("instance"); s.add_argument("--force", action="store_true")
     s.set_defaults(fn=cmd_remove)
-    s = sub.add_parser("launch"); _launch_args(s); s.set_defaults(fn=cmd_launch)
+    s = sub.add_parser("launch"); _launch_args(s); s.add_argument("--env-only", action="store_true")
+    s.set_defaults(fn=cmd_launch)
     s = sub.add_parser("reconnect"); _launch_args(s); s.set_defaults(fn=cmd_reconnect)
     sub.add_parser("import-env").set_defaults(fn=cmd_import_env)
     sub.add_parser("launch-plan").set_defaults(fn=cmd_launch_plan)

@@ -27,7 +27,8 @@ case "$script" in
     echo "connections $*" >> "$FAKE_OUT/calls"
     case "$1" in
       import-env) [ "${FAKE_IMPORT_FAIL:-0}" = 1 ] && { echo "vault down" >&2; exit 1; }; exit 0;;
-      launch-plan) cat "$FAKE_PLAN";;
+      launch-plan) [ "${FAKE_PLAN_FAIL:-0}" = 1 ] && { echo "connections: connections.json: not valid JSON" >&2; exit 1; }
+                   cat "$FAKE_PLAN";;
       launch) [ "$2" = notoken ] && { echo "connections: no token under AG2_REMOTE_TOKEN_NOTOKEN" >&2; exit 1; }
               printf 'REMOTE_TASK_TOKEN=%s\n' "${REMOTE_TASK_TOKEN-<unset>}" > "$FAKE_OUT/$2.env";;
     esac;;
@@ -72,6 +73,16 @@ out="$(run_lanes FAKE_IMPORT_FAIL=1)"
 sleep 1
 case "$out" in *"import-env failed"*) ok "import failure is reported";; *) bad "no import-failure line: $out";; esac
 [ -f "$OUT/dev.env" ] && ok "dev bridge still launched" || bad "dev bridge missing after import failure"
+
+echo "== an unreadable record is said out loud and the environment's tokens still launch =="
+rm -f "$OUT"/*.env "$OUT/calls"
+out="$(run_lanes FAKE_PLAN_FAIL=1)"
+sleep 1
+case "$out" in *"⚠ connections launch-plan failed"*) ok "the plan failure is reported, not read as an empty plan";; *) bad "no plan-failure line: $out";; esac
+grep -q "^connections launch dev .* --env-only$" "$OUT/calls" && ok "the environment's dev token launches with --env-only" \
+  || bad "no env-only launch: $(cat "$OUT/calls")"
+[ "$(grep -c '^connections launch ' "$OUT/calls")" = 1 ] && ok "only the environment's instances launch in the fallback" \
+  || bad "fallback launched: $(grep '^connections launch ' "$OUT/calls")"
 
 echo "== the old per-env-var launch loop is gone =="
 envloop="$(awk '/for _gw_var in /{f=1} f{print} f&&/^[[:space:]]*done[[:space:]]*$/{exit}' "$REPO_UNDER_TEST/src/startup-runtime.sh")"

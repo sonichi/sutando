@@ -22,11 +22,11 @@ and refuse a record over `MAX_BYTES` or off-schema on read. `status_for` joins a
 read-only with the bridge's own `state/gateway-status[.<instance>].json` and the launch
 record `launch` leaves, into one `state`: pending, connected, disconnected or failed.
 
-A row's `server_source` says where its server came from: `identity` (the gateway named
-one agent), `resolver` (`dotspace.dotspace_for` on the gateway host, when that module is
-present) or `gateway` (the host itself, provisional). Two tokens for one homeserver's
-endpoints collapse onto one row: adding matches on server or gateway host, and a later
-identity re-keys a provisional row in place, instance slug kept.
+A row's `server_source` says where its server came from: `identity` (the resolver's
+registered DotSpace for the gateway host, confirmed by the gateway's own agent listing),
+`resolver` (the registered DotSpace alone) or `gateway` (the host itself, provisional). Two
+tokens for one registered homeserver's endpoints collapse onto one row; a provisional row
+matches only its own gateway host, and a later identity re-keys it in place, slug kept.
 """
 from __future__ import annotations
 
@@ -37,6 +37,7 @@ import signal
 import subprocess
 import sys
 import hashlib
+import ipaddress
 import tempfile
 import time
 import urllib.error
@@ -108,6 +109,14 @@ class NoToken(ConnectionsError):
 
 class LaunchFailed(ConnectionsError):
     pass
+
+
+class VaultKeyInUse(ConnectionsError):
+    """The vault already holds a secret under this key and no row owns it."""
+
+
+class TokenRejected(ConnectionsError):
+    """The gateway refused the token on the preview; nothing to store."""
 
 
 # ── token → server ───────────────────────────────────────────────────────────
@@ -225,17 +234,46 @@ def resolve_server(host: str, resolver=None) -> str:
     return server
 
 
+def gateway_host_ok(host: str) -> bool:
+    """Whether a gateway host may be probed at all: a multi-label server name, never an IP
+    literal, loopback, link-local or private address, by the resolver's own rules."""
+    if not host or "." not in host:
+        return False
+    try:
+        ipaddress.ip_address(host)
+        return False
+    except ValueError:
+        pass
+    last = host.rsplit(".", 1)[-1]
+    if last.isdigit() or (last.startswith("0x") and len(last) > 2):
+        return False
+    try:
+        import dotspace  # type: ignore
+        return bool(dotspace.is_server_name(host)) and not dotspace._never_fetched(host)
+    except Exception:  # noqa: BLE001 - without the resolver the local rules above decide
+        return re.fullmatch(r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+", host) is not None
+
+
 def preview_connection(token: str, *, fetch: Optional[Callable[[str, str], dict]] = None,
                        resolver=None) -> dict:
     """What saving this token would record, without saving: the gateway URL as issued, the
-    server and where it came from (`server_source`), the agent mxid when the gateway names
-    exactly one agent (then `verified`), and whether the token authenticated (`authenticated`
-    None when the gateway gave no verdict)."""
+    server and where it came from (`server_source`), and whether the token authenticated
+    (`authenticated` None when the gateway gave no verdict).
+
+    The gateway's agent listing can CONFIRM an identity, never establish one: `verified` is
+    true only when the listing names one agent whose server is the DotSpace the resolver
+    registers for the gateway host. An unregistered host stays the server itself, whatever the
+    listing claims. A host that is an address, loopback, private or single-label is refused
+    before any probe."""
     url = gateway_url_of(token)
     if not url:
         raise InvalidToken("token carries no gateway URL (expected 'https://<gateway>|<secret>')")
     host = server_of_token(token)
-    out = {"gateway_url": url, "gateway_host": host, "server": host, "server_source": "gateway",
+    if not gateway_host_ok(host):
+        raise InvalidToken("invalid_gateway")
+    registered = resolve_server(host, resolver)
+    out = {"gateway_url": url, "gateway_host": host, "server": registered or host,
+           "server_source": "resolver" if registered else "gateway",
            "agent_mxid": None, "verified": False, "authenticated": None, "error": None}
     fetch = _fetch_agents if fetch is None else fetch
     try:
@@ -244,21 +282,16 @@ def preview_connection(token: str, *, fetch: Optional[Callable[[str, str], dict]
         out["authenticated"] = False if e.code in (401, 403) else None
         out["error"] = {401: "auth_rejected", 403: "auth_rejected", 404: "not_a_gateway"}.get(
             e.code, f"http_{e.code}")
-        answer = None
+        return out
     except Exception as e:  # noqa: BLE001 - the probe is best-effort; the reason is named, the URL is not
         out["error"] = f"unreachable ({type(e).__name__})"
-        answer = None
-    if answer is not None:
-        out["authenticated"] = True
-        agents = answer.get("agents") if isinstance(answer, dict) else None
-        ids = [a.get("id") for a in agents if isinstance(a, dict) and isinstance(a.get("id"), str)] \
-            if isinstance(agents, list) else []
-        if len(ids) == 1 and server_of_mxid(ids[0]):
-            out.update(agent_mxid=ids[0], server=server_of_mxid(ids[0]), server_source="identity", verified=True)
-            return out
-    resolved = resolve_server(host, resolver)
-    if resolved:
-        out.update(server=resolved, server_source="resolver")
+        return out
+    out["authenticated"] = True
+    agents = answer.get("agents") if isinstance(answer, dict) else None
+    ids = [a.get("id") for a in agents if isinstance(a, dict) and isinstance(a.get("id"), str)] \
+        if isinstance(agents, list) else []
+    if registered and len(ids) == 1 and server_of_mxid(ids[0]) == registered:
+        out.update(agent_mxid=ids[0], server_source="identity", verified=True)
     return out
 
 
@@ -353,7 +386,11 @@ def _validate_row(row: object, index: int) -> dict:
     return row
 
 
-def _validate(payload: object) -> list:
+REMOVED_KEY = "removed_env"
+
+
+def _validate(payload: object) -> dict:
+    """{"rows": [...], "removed_env": [...]} from a record, or SchemaError naming the defect."""
     if not isinstance(payload, dict) or payload.get("schema_version") != SCHEMA_VERSION:
         raise SchemaError(f"connections.json: expected schema_version {SCHEMA_VERSION}")
     rows = payload.get("connections")
@@ -368,14 +405,17 @@ def _validate(payload: object) -> list:
             raise SchemaError(f"connections.json: duplicate {key}")
     if sum(1 for r in rows if r["primary"]) > 1:
         raise SchemaError("connections.json: more than one primary row")
-    return rows
+    removed = payload.get(REMOVED_KEY, [])
+    if not isinstance(removed, list) or not all(isinstance(x, str) for x in removed):
+        raise SchemaError(f"connections.json: '{REMOVED_KEY}' is not a list of names")
+    return {"rows": rows, REMOVED_KEY: sorted(set(removed))}
 
 
-def _read(path: Path) -> list:
+def _read_record(path: Path) -> dict:
     try:
         size = path.stat().st_size
     except FileNotFoundError:
-        return []
+        return {"rows": [], REMOVED_KEY: []}
     if size > MAX_BYTES:
         raise SchemaError(f"connections.json: {size} bytes exceeds the {MAX_BYTES}-byte bound")
     try:
@@ -383,6 +423,10 @@ def _read(path: Path) -> list:
     except ValueError as e:
         raise SchemaError(f"connections.json: not valid JSON ({e})") from None
     return _validate(payload)
+
+
+def _read(path: Path) -> list:
+    return _read_record(path)["rows"]
 
 
 def _atomic_json(path: Path, payload: dict) -> None:
@@ -405,19 +449,21 @@ def _atomic_json(path: Path, payload: dict) -> None:
             pass
 
 
-def _write(path: Path, rows: list) -> None:
-    _validate({"schema_version": SCHEMA_VERSION, "connections": rows})
-    _atomic_json(path, {"schema_version": SCHEMA_VERSION, "connections": rows})
+def _write(path: Path, record: dict) -> None:
+    payload = {"schema_version": SCHEMA_VERSION, "connections": record["rows"],
+               REMOVED_KEY: sorted(set(record[REMOVED_KEY]))}
+    _validate(payload)
+    _atomic_json(path, payload)
 
 
 @contextmanager
-def _transaction(workspace: Optional[Path]) -> Iterator[list]:
-    """Read-mutate-publish under the record's lock; the yielded list is what gets written."""
+def _transaction(workspace: Optional[Path]) -> Iterator[dict]:
+    """Read-mutate-publish under the record's lock; the yielded record is what gets written."""
     path = record_path(workspace)
     with locked_file(_lock_path(workspace), create_mode=0o600):
-        rows = _read(path)
-        yield rows
-        _write(path, rows)
+        record = _read_record(path)
+        yield record
+        _write(path, record)
 
 
 def _now() -> str:
@@ -449,25 +495,34 @@ def list_connections(workspace: Optional[Path] = None) -> list:
     return _read(record_path(workspace))
 
 
+def removed_env_refs(workspace: Optional[Path] = None) -> list:
+    """Env token names whose rows were removed; import_from_env leaves them alone."""
+    return _read_record(record_path(workspace))[REMOVED_KEY]
+
+
 def add_connection(token: str, *, added_by: str, expected_server: str, instance: Optional[str] = None,
                    preview: Optional[dict] = None, fetch: Optional[Callable[[str, str], dict]] = None,
                    resolver=None, workspace: Optional[Path] = None, vault=None) -> "tuple[dict, bool]":
     """Save the token as a row once its gateway still answers to `expected_server`.
 
-    Returns (row, created). A server or gateway host that already has a row returns that row,
+    Returns (row, created). The same connection (see `_same_connection`) returns its row,
     re-keyed to the identity's server when the row was provisional and this preview is
     verified, and touches the vault never. The row is primary only when the install has no
     primary yet (the first row ever saved); later rows never are. The secret goes to the vault
-    under the row's token_ref before the row exists.
+    under the row's token_ref before the row exists; a vault key no row owns is never overwritten.
     """
     if added_by not in ADDED_BY:
         raise ConnectionsError(f"added_by must be one of {', '.join(ADDED_BY)}")
+    if instance is not None and not isinstance(instance, str):
+        raise ConnectionsError("instance must be a string")
     seen = preview if preview is not None else preview_connection(token, fetch=fetch, resolver=resolver)
     server = str(seen.get("server") or "")
     if not server:
         raise InvalidToken("token carries no gateway URL (expected 'https://<gateway>|<secret>')")
-    if (expected_server or "").strip().lower() != server:
-        raise ConnectionMismatch(server, expected_server or "")
+    if not isinstance(expected_server, str) or expected_server.strip().lower() != server:
+        raise ConnectionMismatch(server, expected_server if isinstance(expected_server, str) else "")
+    if seen.get("authenticated") is False:
+        raise TokenRejected("the gateway rejected this token; nothing stored")
     inst = instance if instance is not None else instance_for(server)
     if not INSTANCE_RE.match(inst):
         raise ConnectionsError(f"instance {inst!r} is not a slug of [A-Za-z0-9_-]{{1,32}}")
@@ -475,13 +530,16 @@ def add_connection(token: str, *, added_by: str, expected_server: str, instance:
     vault = _vault(vault)
     stored = False
     try:
-        with _transaction(workspace) as rows:
-            existing = _same_connection(rows, server, str(seen.get("gateway_host") or ""))
+        with _transaction(workspace) as rec:
+            rows = rec["rows"]
+            existing = _same_connection(rows, seen)
             if existing is not None:
                 _rekey(existing, seen)
                 return dict(existing), False
             if any(r["instance"] == inst or r["token_ref"] == ref for r in rows):
                 raise ConnectionsError(f"instance {inst!r} is taken by another server; pass another instance")
+            if _vault_get(vault, ref):
+                raise VaultKeyInUse(f"vault key {ref} already holds a secret that no connection owns")
             _vault_store(vault, ref, token.strip())
             stored = True
             row = _row(server=server, instance=inst, gateway_url=str(seen["gateway_url"]), token_ref=ref,
@@ -490,6 +548,7 @@ def add_connection(token: str, *, added_by: str, expected_server: str, instance:
                        server_source=str(seen.get("server_source") or "gateway"),
                        agent_mxid=seen.get("agent_mxid"))
             rows.append(row)
+            rec[REMOVED_KEY] = [x for x in rec[REMOVED_KEY] if x != ref]
     except Exception:
         if stored:
             # A secret without a row would be unreachable; take it back out.
@@ -501,14 +560,17 @@ def add_connection(token: str, *, added_by: str, expected_server: str, instance:
     return dict(row), True
 
 
-def _same_connection(rows: list, server: str, gateway_host: str) -> Optional[dict]:
-    """The row for this server, else the row whose gateway shares the host: one homeserver's
-    endpoints are one connection."""
+def _same_connection(rows: list, seen: Mapping[str, object]) -> Optional[dict]:
+    """The row this preview belongs to. A row whose server the registry or an identity vouches
+    for matches on server; a provisional (gateway-sourced) row matches only on its own gateway
+    host, so it can never stand in for a real connection elsewhere."""
+    server = str(seen.get("server") or "")
+    host = str(seen.get("gateway_host") or "")
     for r in rows:
-        if r["server"] == server:
+        if r["server_source"] != "gateway" and r["server"] == server:
             return r
     for r in rows:
-        if gateway_host and host_of_url(r["gateway_url"]) == gateway_host:
+        if host and host_of_url(r["gateway_url"]) == host:
             return r
     return None
 
@@ -525,37 +587,44 @@ def _rekey(row: dict, seen: Mapping[str, object]) -> bool:
 
 def learn_identity(instance: str, preview: Mapping[str, object], *, workspace: Optional[Path] = None) -> dict:
     """Re-key `instance` from a verified preview of its own token (see `_rekey`); the row either way."""
-    with _transaction(workspace) as rows:
-        row = _find(rows, instance)
+    with _transaction(workspace) as rec:
+        row = _find(rec["rows"], instance)
         _rekey(row, preview)
     return dict(row)
 
 
 def set_primary(instance: str, *, workspace: Optional[Path] = None) -> dict:
     """Make `instance` the primary; proactive and owner-DM defaults follow it at the next launch."""
-    with _transaction(workspace) as rows:
-        row = _find(rows, instance)
-        for r in rows:
+    with _transaction(workspace) as rec:
+        row = _find(rec["rows"], instance)
+        for r in rec["rows"]:
             r["primary"] = r is row
     return dict(row)
 
 
 def remove_connection(instance: str, *, force: bool = False, workspace: Optional[Path] = None,
-                      vault=None) -> dict:
-    """Drop the row, its vault key and its launch record; the primary only under `force`.
-    Other rows and their bridges are untouched; no row inherits the primary flag."""
+                      vault=None, kill=None) -> dict:
+    """Stop the bridge, then drop the row, its vault key and its launch record; the primary only
+    under `force`. Other rows and their bridges are untouched; no row inherits the primary flag.
+    An env-imported row is remembered so import_from_env does not bring it back."""
     vault = _vault(vault)
-    with _transaction(workspace) as rows:
+    with _transaction(workspace) as rec:
+        rows = rec["rows"]
         row = _find(rows, instance)
         if row["primary"] and not force:
             raise PrimaryProtected("refusing to remove the primary connection without force")
+        stopped = stop_bridge(instance, workspace=workspace, kill=kill) if instance else 0
         _vault_delete(vault, row["token_ref"])
         rows.remove(row)
+        if row["added_by"] == "env":
+            rec[REMOVED_KEY] = sorted(set(rec[REMOVED_KEY]) | {row["token_ref"]})
     try:
         launch_record_path(instance, workspace).unlink()
     except FileNotFoundError:
         pass
-    return dict(row)
+    out = dict(row)
+    out["stopped_pid"] = stopped
+    return out
 
 
 def env_token_vars(environ: Mapping[str, str]) -> list:
@@ -575,8 +644,9 @@ def import_from_env(environ: Optional[Mapping[str, str]] = None, *,
     Env rows are unverified: the resolver's server when it knows the host, else the host. Only
     the REMOTE_TASK_TOKEN row (the legacy unsuffixed bridge) can become primary, and only when
     the install has none; a named env token never does, so no secondary ever inherits the
-    proactive room. The secret is copied into the vault under the row's token_ref unless the
-    vault already holds one. Returns the rows created.
+    proactive room. A name whose row was removed is skipped until the variable is unset. The
+    secret is copied into the vault under the row's token_ref unless the vault already holds
+    one. Returns the rows created.
     """
     environ = os.environ if environ is None else environ
     candidates = []
@@ -590,17 +660,20 @@ def import_from_env(environ: Optional[Mapping[str, str]] = None, *,
         return []
     vault = _vault(vault)
     created = []
-    with _transaction(workspace) as rows:
+    with _transaction(workspace) as rec:
+        rows = rec["rows"]
         for inst, ref, token in candidates:
+            if ref in rec[REMOVED_KEY]:
+                continue
             host = server_of_token(token)
             resolved = resolve_server(host, resolver)
-            server = resolved or host
+            seen = {"server": resolved or host, "gateway_host": host}
             if any(r["instance"] == inst or r["token_ref"] == ref for r in rows) \
-                    or _same_connection(rows, server, host) is not None:
+                    or _same_connection(rows, seen) is not None:
                 continue
             if not _vault_get(vault, ref):
                 _vault_store(vault, ref, token)
-            row = _row(server=server, instance=inst, gateway_url=gateway_url_of(token), token_ref=ref,
+            row = _row(server=seen["server"], instance=inst, gateway_url=gateway_url_of(token), token_ref=ref,
                        primary=(inst == "" and not any(r["primary"] for r in rows)), added_by="env",
                        verified=False, server_source="resolver" if resolved else "gateway")
             rows.append(row)
@@ -661,12 +734,14 @@ def launch_plan(environ: Optional[Mapping[str, str]] = None, *,
                 workspace: Optional[Path] = None) -> list:
     """One entry per bridge the plan launches: every row with an instance (the legacy
     unsuffixed bridge is the primary launch path's), then any AG2_REMOTE_TOKEN_<INST>
-    still without a row (an import the vault refused)."""
+    still without a row (an import the vault refused) unless its row was removed.
+    An unreadable record raises, so a caller never mistakes it for an empty plan."""
     environ = os.environ if environ is None else environ
-    rows = list_connections(workspace)
+    record = _read_record(record_path(workspace))
+    rows = record["rows"]
     plan = []
     seen_inst = {r["instance"] for r in rows}
-    seen_ref = {r["token_ref"] for r in rows}
+    seen_ref = {r["token_ref"] for r in rows} | set(record[REMOVED_KEY])
     for r in rows:
         if not r["instance"]:
             continue
@@ -681,7 +756,16 @@ def launch_plan(environ: Optional[Mapping[str, str]] = None, *,
 
 
 def plan_entry(instance: str, environ: Optional[Mapping[str, str]] = None, *,
-               workspace: Optional[Path] = None) -> dict:
+               workspace: Optional[Path] = None, env_only: bool = False) -> dict:
+    """The plan entry for `instance`; with `env_only`, built from AG2_REMOTE_TOKEN_<INST> alone
+    (the fallback when the record cannot be read), never primary."""
+    environ = os.environ if environ is None else environ
+    if env_only:
+        for inst, var in env_token_vars(environ):
+            if inst == instance:
+                return {"instance": inst, "token_ref": var, "channel_dir": channel_dir_for(inst, environ),
+                        "primary": False}
+        raise UnknownConnection(f"no AG2_REMOTE_TOKEN variable names {instance!r}")
     for entry in launch_plan(environ, workspace=workspace):
         if entry["instance"] == instance:
             return entry
@@ -737,11 +821,12 @@ def _spawn(argv: list, env: dict, log_path: Path) -> int:
 
 
 def launch(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Mapping[str, str]] = None,
-           workspace: Optional[Path] = None, vault=None, spawn=None, python: Optional[str] = None) -> dict:
+           workspace: Optional[Path] = None, vault=None, spawn=None, python: Optional[str] = None,
+           env_only: bool = False) -> dict:
     """Start the bridge for one plan entry and leave a launch record; the bridge's own
     singleton lock turns a duplicate into a clean stand-down."""
     environ = os.environ if environ is None else environ
-    entry = plan_entry(instance, environ, workspace=workspace)
+    entry = plan_entry(instance, environ, workspace=workspace, env_only=env_only)
     try:
         env = launch_env(entry, environ, vault=vault)
     except NoToken as e:

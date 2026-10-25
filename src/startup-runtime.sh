@@ -557,15 +557,23 @@ start_gateway_lanes() {
       "$PY" "$REPO/scripts/connections.py" import-env > /dev/null 2>> "$LOGS_DIR/remote-gateway-bridge.log" \
         || echo "  ⚠ connections import-env failed — launching secondaries from the environment"
       # One launch per plan line; the token, env shape and launch record are the module's.
+      # An unreadable record is said out loud and the environment's tokens launch on their own.
+      _gw_launch_flag=""
+      if ! _gw_plan="$("$PY" "$REPO/scripts/connections.py" launch-plan 2>> "$LOGS_DIR/remote-gateway-bridge.log")"; then
+        echo "  ⚠ connections launch-plan failed (see remote-gateway-bridge.log) — launching from the environment"
+        _gw_launch_flag="--env-only"
+        _gw_plan="$(env | grep -o '^AG2_REMOTE_TOKEN_[A-Za-z0-9_][A-Za-z0-9_]*' \
+          | sed 's/^AG2_REMOTE_TOKEN_//' | tr '[:upper:]' '[:lower:]')"
+      fi
       while IFS="$(printf '\t')" read -r _gw_inst _gw_rest; do
         [ -n "$_gw_inst" ] || continue
-        if "$PY" "$REPO/scripts/connections.py" launch "$_gw_inst" --repo "$REPO" --logs-dir "$LOGS_DIR" \
+        if "$PY" "$REPO/scripts/connections.py" launch "$_gw_inst" --repo "$REPO" --logs-dir "$LOGS_DIR" $_gw_launch_flag \
              >> "$LOGS_DIR/remote-gateway-bridge.log" 2>&1; then
           echo "  ✓ gateway bridge ($_gw_inst — self-defers if already running)"
         else
           echo "  ⊘ gateway bridge ($_gw_inst) not launched — see remote-gateway-bridge.log"
         fi
-      done < <("$PY" "$REPO/scripts/connections.py" launch-plan 2>> "$LOGS_DIR/remote-gateway-bridge.log")
+      done <<< "$_gw_plan"
     else
       # Without python3 the plan cannot be read; name every instance the environment declares.
       for _gw_var in $(env | grep -o '^AG2_REMOTE_TOKEN_[A-Za-z0-9_][A-Za-z0-9_]*' || true); do

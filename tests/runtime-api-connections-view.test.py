@@ -33,8 +33,12 @@ TOKEN_A = "https://chat.alpha.example|secret-alpha"
 TOKEN_B = "https://relay.beta.example|secret-beta"
 
 import connections  # noqa: E402
+import dotspace  # noqa: E402
 
-connections.DEFAULT_RESOLVER = lambda host: None  # offline: no well-known fetch from a test
+# Offline: the real resolver with no well-known fetch and a registry naming both test servers.
+REGISTRY = {"instances": [{"server": "alpha.example", "gateway_host": "chat.alpha.example"},
+                          {"server": "beta.example", "gateway_host": "relay.beta.example"}]}
+connections.DEFAULT_RESOLVER = lambda host: dotspace.dotspace_for(host, fetch=dotspace.NO_FETCH, config=REGISTRY)
 
 
 class FakeVault:
@@ -119,12 +123,12 @@ class ViewTests(unittest.TestCase):
 
     def test_confirm_against_a_moved_identity_is_a_conflict(self):
         preview = self.call("connection.add", token=TOKEN_A)["preview"]
-        self.gateway.agents["https://chat.alpha.example"] = ["@sutando:other.example"]
+        self.assertEqual((preview["server"], preview["verified"]), ("alpha.example", True))
         with self.assertRaises(ProtocolError) as cm:
-            self.call("connection.add", token=TOKEN_A, confirm=True, expected_server=preview["server"])
+            self.call("connection.add", token=TOKEN_A, confirm=True, expected_server="chat.alpha.example")
         self.assertEqual(cm.exception.code, CONFLICT)
         self.assertTrue(str(cm.exception).startswith("mismatch"))
-        self.assertIn("other.example", str(cm.exception))
+        self.assertIn("alpha.example", str(cm.exception))
         self.assertNotIn("secret-alpha", str(cm.exception))
         self.assertEqual(self.call("connection.list"), {"connections": []})
         self.assertEqual(self.vault.store, {})
