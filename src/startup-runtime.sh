@@ -538,7 +538,13 @@ start_gateway_lanes() {
     # the redirect below); the bridge stamps launched_via into gateway-status
     # and skips its own bare-launch file log. See remote_gateway_bridge._log.
     if [ -n "$PY" ]; then
-      SUTANDO_SUPERVISED=1 "$PY" "$REPO/src/remote-gateway-bridge.py" >> "$LOGS_DIR/remote-gateway-bridge.log" 2>&1 &
+      # Once a named row holds the primary, the legacy bridge is a secondary: it must not
+      # inherit the proactive room, or two bridges post nudges.
+      _gw_legacy_room="${REMOTE_PROACTIVE_ROOM-}"
+      if _gw_primary="$("$PY" "$REPO/scripts/connections.py" primary 2>/dev/null)" && [ -n "$_gw_primary" ]; then
+        _gw_legacy_room=""
+      fi
+      SUTANDO_SUPERVISED=1 REMOTE_PROACTIVE_ROOM="$_gw_legacy_room" "$PY" "$REPO/src/remote-gateway-bridge.py" >> "$LOGS_DIR/remote-gateway-bridge.log" 2>&1 &
       echo "  ✓ gateway bridge (self-defers if already running)"
     else
       echo "  ⊘ gateway bridge skipped — no runnable python3"

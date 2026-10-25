@@ -31,8 +31,9 @@ case "$script" in
                    cat "$FAKE_PLAN";;
       launch) [ "$2" = notoken ] && { echo "connections: no token under AG2_REMOTE_TOKEN_NOTOKEN" >&2; exit 1; }
               printf 'REMOTE_TASK_TOKEN=%s\n' "${REMOTE_TASK_TOKEN-<unset>}" > "$FAKE_OUT/$2.env";;
+      primary) [ -n "${FAKE_PRIMARY+x}" ] || exit 2; printf '%s\n' "$FAKE_PRIMARY";;
     esac;;
-  */remote-gateway-bridge.py) printf 'GATEWAY_INSTANCE=%s\n' "${GATEWAY_INSTANCE-<unset>}" > "$FAKE_OUT/primary.env";;
+  */remote-gateway-bridge.py) printf 'GATEWAY_INSTANCE=%s\nREMOTE_PROACTIVE_ROOM=%s\n' "${GATEWAY_INSTANCE-<unset>}" "${REMOTE_PROACTIVE_ROOM-<unset>}" > "$FAKE_OUT/primary.env";;
 esac
 EOF
 chmod +x "$BOX/py" "$REPO/scripts/sutando-config.sh"
@@ -42,7 +43,7 @@ printf 'dev\tAG2_REMOTE_TOKEN_DEV\tdev-ag2space\t0\ns-space\tAG2_REMOTE_TOKEN_S_
 run_lanes() {
   env -i PATH="$PATH" HOME="$BOX" REPO="$REPO" PY="$BOX/py" LOGS_DIR="$LOGS_DIR" \
       FAKE_PLAN="$BOX/plan" FAKE_OUT="$OUT" \
-      REMOTE_TASK_TOKEN="https://gw.primary.example|primary-secret" \
+      REMOTE_TASK_TOKEN="https://gw.primary.example|primary-secret" REMOTE_PROACTIVE_ROOM="!owner:prod.example" \
       AG2_REMOTE_TOKEN_DEV="https://gw.dev.example|env-secret" "$@" \
       bash -c '. "$REPO/src/startup-runtime.sh" >/dev/null 2>&1; start_gateway_lanes; wait' 2>&1
 }
@@ -51,7 +52,8 @@ echo "== import-env runs first, then one launch per plan line =="
 out="$(run_lanes)"
 sleep 1
 calls="$(cat "$OUT/calls" 2>/dev/null)"
-case "$calls" in "connections import-env"*) ok "import-env is the first connections call";; *) bad "calls: $calls";; esac
+[ "$(grep -n '^connections import-env$' "$OUT/calls" | cut -d: -f1)" -lt "$(grep -n '^connections launch-plan$' "$OUT/calls" | cut -d: -f1)" ] 2>/dev/null \
+  && ok "import-env precedes launch-plan" || bad "calls: $calls"
 grep -q "^connections launch-plan$" "$OUT/calls" && ok "launch-plan asked once" || bad "no launch-plan call"
 [ "$(grep -c "^connections launch " "$OUT/calls")" = 3 ] && ok "one launch per plan line" || bad "launch calls: $(grep -c '^connections launch ' "$OUT/calls")"
 grep -q "^connections launch dev --repo $REPO --logs-dir $LOGS_DIR$" "$OUT/calls" && ok "launch gets the instance, repo and logs dir" \
@@ -66,6 +68,16 @@ case "$out" in *"primary-secret"*|*"env-secret"*|*"AG2_REMOTE_TOKEN_NOTOKEN"*) b
 grep -q "no token under AG2_REMOTE_TOKEN_NOTOKEN" "$LOGS_DIR/remote-gateway-bridge.log" && ok "the refusal is in the bridge log" || bad "refusal not logged"
 [ -f "$OUT/primary.env" ] && [ "$(sed -n 's/^GATEWAY_INSTANCE=//p' "$OUT/primary.env")" = "<unset>" ] \
   && ok "the primary launch path is untouched" || bad "primary launch changed: $(cat "$OUT/primary.env" 2>/dev/null)"
+[ "$(sed -n 's/^REMOTE_PROACTIVE_ROOM=//p' "$OUT/primary.env")" = "!owner:prod.example" ] \
+  && ok "with the legacy row primary, the legacy bridge keeps its proactive room" || bad "legacy room: $(cat "$OUT/primary.env")"
+
+echo "== once a named row is primary, the legacy bridge is launched without the proactive room =="
+out="$(run_lanes FAKE_PRIMARY=s-space)"
+[ "$(sed -n 's/^REMOTE_PROACTIVE_ROOM=//p' "$OUT/primary.env")" = "" ] \
+  && ok "a named primary leaves the legacy bridge with an empty proactive room" || bad "legacy room with named primary: $(cat "$OUT/primary.env")"
+out="$(run_lanes FAKE_PRIMARY=)"
+[ "$(sed -n 's/^REMOTE_PROACTIVE_ROOM=//p' "$OUT/primary.env")" = "!owner:prod.example" ] \
+  && ok "an explicit legacy primary keeps the room" || bad "legacy room with legacy primary: $(cat "$OUT/primary.env")"
 
 echo "== a failed import-env still launches from the plan, and says so =="
 rm -f "$OUT"/*.env "$OUT/calls"

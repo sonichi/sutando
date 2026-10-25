@@ -13,6 +13,7 @@
                                AG2_REMOTE_TOKEN_<INST> variable alone, when the record is unreadable)
   import-env                   rows once for REMOTE_TASK_TOKEN and each AG2_REMOTE_TOKEN_<INST>
   launch-plan                  one 'instance<TAB>token_ref<TAB>channel_dir<TAB>primary' line per bridge
+  primary                      the primary row's instance ('' = the legacy bridge); exit 2 when none
 
 Each verb parses, calls one unit and prints; policy lives in the module.
 """
@@ -121,6 +122,15 @@ def cmd_import_env(args) -> int:
     return 0
 
 
+def cmd_primary(args) -> int:
+    """Print the primary row's instance ('' for the legacy bridge); exit 2 when none is primary."""
+    inst = connections.primary_instance(args.workspace)
+    if inst is None:
+        return 2
+    print(inst)
+    return 0
+
+
 def cmd_launch_plan(args) -> int:
     for e in connections.launch_plan(os.environ, workspace=args.workspace):
         print(f"{e['instance']}\t{e['token_ref']}\t{e['channel_dir']}\t{1 if e['primary'] else 0}")
@@ -154,6 +164,7 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("reconnect"); _launch_args(s); s.set_defaults(fn=cmd_reconnect)
     sub.add_parser("import-env").set_defaults(fn=cmd_import_env)
     sub.add_parser("launch-plan").set_defaults(fn=cmd_launch_plan)
+    sub.add_parser("primary").set_defaults(fn=cmd_primary)
     return p
 
 

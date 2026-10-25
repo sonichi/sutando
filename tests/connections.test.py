@@ -446,6 +446,18 @@ class Primary(Base):
         with self.assertRaises(C.UnknownConnection):
             C.set_primary("nope", workspace=self.ws)
 
+    def test_primary_instance_names_the_row_the_legacy_launch_defers_to(self):
+        """None with no record or no primary row; '' when the legacy row is primary; the slug of a
+        named primary, which is what makes the legacy bridge launch without the proactive room."""
+        self.assertIsNone(C.primary_instance(self.ws))
+        self.add()
+        self.assertEqual(C.primary_instance(self.ws), "alpha-fixture-net")
+        self.add(TOKEN_B, fetch=agents("@s:beta-fixture.net"))
+        C.set_primary("beta-fixture-net", workspace=self.ws)
+        self.assertEqual(C.primary_instance(self.ws), "beta-fixture-net")
+        C.remove_connection("beta-fixture-net", force=True, workspace=self.ws, vault=self.vault, kill=lambda *a, **k: None)
+        self.assertIsNone(C.primary_instance(self.ws), "no row inherits the primary flag")
+
     def test_primary_in_the_plan_keeps_the_proactive_room(self):
         self.add()
         self.add(TOKEN_B, fetch=agents("@s:beta-fixture.net"))

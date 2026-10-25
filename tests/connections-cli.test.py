@@ -133,10 +133,12 @@ class CliTests(unittest.TestCase):
         self.assertEqual([(r["instance"], r["primary"], r["state"], r["server_source"]) for r in rows],
                          [("alpha-fixture-net", True, "pending", "gateway"), ("beta-fixture-net", False, "pending", "gateway")])
 
+        self.assertEqual(self.run_cli("primary").stdout.strip(), "alpha-fixture-net")
         proc = self.run_cli("set-primary", "beta-fixture-net")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         rows = json.loads(self.run_cli("list", "--json").stdout)
         self.assertEqual([r["primary"] for r in rows], [False, True])
+        self.assertEqual(self.run_cli("primary").stdout.strip(), "beta-fixture-net")
 
         proc = self.run_cli("remove", "beta-fixture-net")
         self.assertEqual(proc.returncode, 1)
@@ -148,6 +150,8 @@ class CliTests(unittest.TestCase):
         rows = json.loads(self.run_cli("list", "--json").stdout)
         self.assertEqual([(r["instance"], r["primary"]) for r in rows], [("alpha-fixture-net", False)],
                          "no row inherits the primary flag")
+        proc = self.run_cli("primary")
+        self.assertEqual((proc.returncode, proc.stdout), (2, ""), "no primary: exit 2, nothing printed")
 
     def test_import_env_then_launch_plan(self):
         extra = {"REMOTE_TASK_TOKEN": TOKEN_A, "AG2_REMOTE_TOKEN_DEV": TOKEN_B}

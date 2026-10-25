@@ -199,8 +199,8 @@ def _public_address(ip: str) -> bool:
         addr = ipaddress.ip_address(ip.split("%", 1)[0])
     except ValueError:
         return False
-    # is_global refuses shared address space (100.64/10, a tailnet range) and, on current
-    # Python, 6to4; older interpreters need the embedded IPv4 of 6to4 and Teredo checked too.
+    # is_global refuses shared address space (100.64/10, a tailnet range); the IPv4 embedded in
+    # a 6to4 or Teredo address is checked on every interpreter (3.9 passes 2002::/16 as global).
     embedded = [addr, getattr(addr, "ipv4_mapped", None), getattr(addr, "sixtofour", None)]
     embedded.extend(getattr(addr, "teredo", None) or ())
     for a in embedded:
@@ -675,6 +675,16 @@ def learn_identity(instance: str, preview: Mapping[str, object], *, workspace: O
         row = _find(rec["rows"], instance)
         _rekey(row, preview)
     return dict(row)
+
+
+def primary_instance(workspace: Optional[Path] = None) -> Optional[str]:
+    """The instance slug of the primary row ("" for the legacy unsuffixed bridge); None when no
+    row is primary. The legacy launch reads it to drop the proactive room from its environment
+    once a named row holds the primary, so only one bridge posts nudges."""
+    for row in list_connections(workspace):
+        if row.get("primary"):
+            return str(row.get("instance") or "")
+    return None
 
 
 def set_primary(instance: str, *, workspace: Optional[Path] = None) -> dict:
