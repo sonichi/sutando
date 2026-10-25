@@ -1319,7 +1319,7 @@ from ag2_sparrow import remote_gateway_bridge as m
 reply = {"ok": True, "setup_revision": "r7", "min_version": "0.5.0", "target_version": "9.9"}
 with mock.patch.object(m, "_req", return_value=reply) as req:
     m._post_heartbeat(set(), force=True)
-print(json.dumps({"sent": req.call_args.args[2],
+print(json.dumps({"sent": req.call_args_list[0].args[2],
                   "hint": json.loads(m.SETUP_HINT_FILE.read_text())}))
 """
 

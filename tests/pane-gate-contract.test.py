@@ -1433,5 +1433,45 @@ class AStaleLimitBannerYieldsToTheProxyRecord(unittest.TestCase):
             v = pg.classify_pane(self.PANE, pg.CLAUDE, None, self.socket, self.session)
         self.assertEqual(v.reason, "quota-limit")
 
+
+class AUsageLimitBannerTheSeatHasOutrun(unittest.TestCase):
+    """The CLI's "Usage limit reached · … / Continuing automatically at …" banner is its own
+    gate kind, and a turn that finishes after it was first seen makes it stale."""
+
+    PANE = ("✻ Churned for 27s · done 1:55 PM\n"
+            "──────── seat-1 ─\n❯ \n────────\n"
+            "  ⚠ Usage limit reached · limit resets Oct 13 at 11pm\n"
+            "    Continuing automatically at Oct 13 at 11pm · esc to cancel\n"
+            "  ⏵⏵ bypass permissions on · 1 monitor · ← for agents\n")
+    LATER = PANE.replace("done 1:55 PM\n", "done 1:55 PM\n✻ Brewed for 22s · done 1:58 PM\n")
+
+    def test_the_banner_is_a_named_gate_not_unlisted(self):
+        v = pg.classify_pane(self.PANE, pg.CLAUDE, "/nonexistent-ws")
+        self.assertEqual((v.state, v.reason), ("busy", "usage-limit"))
+
+    def test_a_banner_only_pane_reads_as_main_did(self):
+        # Not a cli_wedge banner: an idle pane under it is not held for the notifier.
+        pane = ("──────── seat-1 ─\n❯ \n────────\n"
+                "  ⚠ Usage limit reached · limit resets Oct 13 at 11pm\n"
+                "  ⏵⏵ bypass permissions on · 1 monitor · ← for agents\n")
+        v = pg.classify_pane(pane, pg.CLAUDE, "/nonexistent-ws")
+        self.assertEqual(v.state, "idle-ready")
+        self.assertFalse(pg.blocks_dispatch(v, pg.CLAUDE))
+        self.assertIsNone(pg.frame_abnormal(pane))
+
+    def test_the_full_banner_still_refuses_input(self):
+        v = pg.classify_pane(self.PANE, pg.CLAUDE, "/nonexistent-ws")
+        self.assertFalse(pg.accepts_input(v))
+
+    def test_a_turn_finished_after_first_sight_makes_it_stale(self):
+        abn = pg.limit_banner(self.LATER)
+        self.assertEqual(abn.kind, "provider-limit")
+        base = pg.limit_baseline(self.PANE)
+        self.assertTrue(pg.limit_is_stale(abn, "/nonexistent-ws", None, None,
+                                          capture=self.LATER, baseline=base))
+        self.assertFalse(pg.limit_is_stale(abn, "/nonexistent-ws", None, None,
+                                           capture=self.PANE, baseline=base))
+        self.assertFalse(pg.limit_is_stale(abn, "/nonexistent-ws", None, None))
+
 if __name__ == "__main__":
     unittest.main()

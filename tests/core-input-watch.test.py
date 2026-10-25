@@ -22,6 +22,7 @@ import importlib.util
 import json
 import os
 import unittest
+from pathlib import Path as _Path
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _SRC = os.path.join(_HERE, "..", "src", "core-input-watch.py")
@@ -1632,6 +1633,257 @@ class TestMainOnce(unittest.TestCase):
             _mod.capture_styled, _mod._load_runtime_health = orig_cap, orig_load
         # stable=2, first tick → prompt seen once (< 2) → debounced to running.
         self.assertEqual(sig["state"], "running")
+
+
+# A worker pane captured live 2026-10-11 (worker-a): a stale usage-limit banner under
+# the composer while turns kept finishing, with the CLI's optional feedback survey above it.
+_SURVEY = ("● How is Claude doing this session? (optional)\n"
+           "  1: Bad    2: Fine   3: Good   0: Dismiss\n"
+           "                                        ✔ Update installed · Restart to update\n")
+_WORKER_FOOTER = ("──────── seat-1 ─\n❯ \n────────\n")
+_LIMIT_BANNER = ("  ⚠ Usage limit reached · limit resets Oct 13 at 11pm\n"
+                 "    Continuing automatically at Oct 13 at 11pm · esc to cancel\n")
+_BYPASS_FOOTER = "  ⏵⏵ bypass permissions on · 1 monitor · ← for agents · ↓ to manage"
+_EARLIER_TURN = ("⏺ The task watcher on my inbox hit its 30-minute limit, so I restarted it.\n"
+                 "✻ Churned for 27s · done 1:55 PM · 1 monitor still running\n")
+_LATER_TURN = ("⏺ Monitor(Streaming task watcher (worker-a inbox))\n"
+               "  ⎿  Monitor started · task task-a · timeout 1800s\n"
+               "✻ Brewed for 22s · done 1:58 PM · 1 monitor still running\n")
+_LIVE_BEFORE = _EARLIER_TURN + _SURVEY + _WORKER_FOOTER + _LIMIT_BANNER + _BYPASS_FOOTER
+_LIVE_PANE = _EARLIER_TURN + _LATER_TURN + _SURVEY + _WORKER_FOOTER + _LIMIT_BANNER + _BYPASS_FOOTER
+
+
+class TestStaleLimitBanner(unittest.TestCase):
+    """A usage-limit banner the seat has outrun (a turn finished after it was first seen)
+    is not a block; one with no later turn is a session-limit gate, never `unknown`."""
+
+    def _compose(self, pane, before):
+        stale, baseline = _mod.limit_step(before, None, "/nonexistent-ws")
+        self.assertFalse(stale)
+        stale, _ = _mod.limit_step(pane, baseline, "/nonexistent-ws")
+        return compose_state(pane, "idle", True, limit_stale=stale)
+
+    def test_live_pane_with_turns_finishing_under_the_banner_is_not_blocked(self):
+        state = self._compose(_LIVE_PANE, _LIVE_BEFORE)
+        self.assertEqual(state[0], "idle-ready")
+
+    def test_banner_with_no_later_turn_escalates_as_a_usage_limit(self):
+        state = self._compose(_LIVE_BEFORE, _LIVE_BEFORE)
+        self.assertEqual(state[:2], ("blocked-human", "awaiting user: usage-limit"))
+        self.assertEqual(state[3], "usage-limit")
+        self.assertIsNone(auto_answer("usage-limit"))
+
+    def test_first_sight_of_the_banner_is_never_stale(self):
+        stale, _ = _mod.limit_step(_LIVE_PANE, None, "/nonexistent-ws")
+        self.assertFalse(stale)
+        self.assertEqual(compose_state(_LIVE_PANE, "idle", True)[3], "usage-limit")
+
+    def test_the_wait_line_alone_is_a_usage_limit_never_unknown(self):
+        pane = _WORKER_FOOTER + "    Continuing automatically at 11pm · esc to cancel\n" + _BYPASS_FOOTER
+        self.assertEqual(classify(pane)[0], "usage-limit")
+
+    def test_the_wait_line_under_hit_your_session_limit_stays_session_limit(self):
+        self.assertEqual(classify(_SESSION_LIMIT)[0], "session-limit")
+
+    def test_a_refused_turn_under_the_banner_is_no_evidence(self):
+        refused = "❯ /startup\n  ⎿  You've hit your usage limit\n✻ Cooked for 1s · done 2:01 PM\n"
+        pane = _EARLIER_TURN + refused + _SURVEY + _WORKER_FOOTER + _LIMIT_BANNER + _BYPASS_FOOTER
+        stale, _ = _mod.limit_step(pane, _mod.limit_baseline(_LIVE_BEFORE), "/nonexistent-ws")
+        self.assertFalse(stale)
+
+    def test_a_refused_turn_of_two_seconds_or_more_is_no_evidence(self):
+        for line in ("  ⎿  You've hit your usage limit · resets Oct 13 at 11pm",
+                     "  ⎿  You're out of usage credits. Run /usage-credits to keep going."):
+            refused = f"❯ /startup\n{line}\n✻ Cooked for 2s · done 2:01 PM\n"
+            pane = _EARLIER_TURN + refused + _SURVEY + _WORKER_FOOTER + _LIMIT_BANNER + _BYPASS_FOOTER
+            stale, _ = _mod.limit_step(pane, _mod.limit_baseline(_LIVE_BEFORE), "/nonexistent-ws")
+            self.assertFalse(stale, line)
+            self.assertEqual(compose_state(pane, "idle", True, limit_stale=stale)[3], "usage-limit")
+
+    def test_a_refusal_in_an_earlier_turn_does_not_discount_a_later_one(self):
+        pane = ("❯ /startup\n  ⎿  You've hit your usage limit\n✻ Cooked for 2s · done 1:57 PM\n"
+                + _LATER_TURN + _SURVEY + _WORKER_FOOTER + _LIMIT_BANNER + _BYPASS_FOOTER)
+        stale, _ = _mod.limit_step(pane, _mod.limit_baseline(_LIVE_BEFORE), "/nonexistent-ws")
+        self.assertTrue(stale)
+
+    def _polls(self, panes):
+        """Drive limit_step + compose_state over successive captures, as the loop does."""
+        baseline, out = None, []
+        for pane in panes:
+            stale, baseline = _mod.limit_step(pane, baseline, "/nonexistent-ws")
+            st = compose_state(pane, "idle", True, limit_stale=stale)
+            out.append((st[0], st[3]))
+        return out
+
+    def test_a_refused_turn_after_the_stale_verdict_turns_it_off(self):
+        refused = "❯ /startup\n  ⎿  You've hit your usage limit\n✻ Cooked for 2s · done 2:05 PM\n"
+        third = _EARLIER_TURN + _LATER_TURN + refused + _SURVEY + _WORKER_FOOTER + _LIMIT_BANNER + _BYPASS_FOOTER
+        self.assertEqual(self._polls([_LIVE_BEFORE, _LIVE_PANE, third]),
+                         [("blocked-human", "usage-limit"), ("idle-ready", None),
+                          ("blocked-human", "usage-limit")])
+
+    def test_a_new_banner_after_the_stale_verdict_turns_it_off(self):
+        third = _LIVE_PANE.replace("Oct 13", "Oct 20")
+        self.assertEqual(self._polls([_LIVE_BEFORE, _LIVE_PANE, third]),
+                         [("blocked-human", "usage-limit"), ("idle-ready", None),
+                          ("blocked-human", "usage-limit")])
+
+    def test_a_turn_that_runs_after_a_refusal_makes_it_stale_again(self):
+        refused = "❯ /startup\n  ⎿  You've hit your usage limit\n✻ Cooked for 2s · done 2:05 PM\n"
+        ran = "⏺ Done.\n✻ Worked for 9s · done 2:30 PM\n"
+        body = _EARLIER_TURN + _LATER_TURN + refused
+        tail = _SURVEY + _WORKER_FOOTER + _LIMIT_BANNER + _BYPASS_FOOTER
+        self.assertEqual(self._polls([_LIVE_BEFORE, body + tail, body + ran + tail])[1:],
+                         [("blocked-human", "usage-limit"), ("idle-ready", None)])
+
+    def test_stripping_a_stale_banner_keeps_refusals_inside_turns(self):
+        refusal = "  ⎿  You've hit your usage limit"
+        stripped = _mod.strip_limit_banners(f"❯ /startup\n{refusal}\n✻ Cooked for 2s · done 2:05 PM\n"
+                                            + _WORKER_FOOTER + _LIMIT_BANNER + _BYPASS_FOOTER)
+        self.assertIn(refusal, stripped)
+        self.assertNotIn("Usage limit reached", stripped)
+        self.assertNotIn("Continuing automatically", stripped)
+
+    def test_a_changed_suffix_on_the_same_turn_is_not_a_new_turn(self):
+        pane = _LIVE_BEFORE.replace("1 monitor still running", "2 monitors still running")
+        stale, _ = _mod.limit_step(pane, _mod.limit_baseline(_LIVE_BEFORE), "/nonexistent-ws")
+        self.assertFalse(stale)
+
+    def test_stale_banner_never_hides_a_real_prompt_below_the_survey(self):
+        pane = (_EARLIER_TURN + _LATER_TURN + _SURVEY + _WORKER_FOOTER
+                + "  Do you want to proceed?\n  Allow this action\n  Esc to cancel\n"
+                + _LIMIT_BANNER + _BYPASS_FOOTER)
+        stale, _ = _mod.limit_step(pane, _mod.limit_baseline(_LIVE_BEFORE), "/nonexistent-ws")
+        self.assertTrue(stale)
+        self.assertEqual(compose_state(pane, "idle", True, limit_stale=stale)[:2],
+                         ("blocked-human", "awaiting user: permission"))
+
+    def test_the_room_notice_reads_a_usage_limit(self):
+        import core_gate_notice
+        self.assertEqual(core_gate_notice.reason("blocked-human", "usage-limit"), "it hit a usage limit")
+
+    def test_survey_alone_is_unchanged(self):
+        self.assertIsNone(classify(_EARLIER_TURN + _SURVEY + _WORKER_FOOTER + _BYPASS_FOOTER))
+
+    def test_survey_with_a_real_permission_prompt_below_still_escalates(self):
+        pane = _SURVEY + "  Do you want to proceed?\n  Allow this action\n  Esc to cancel\n" + _BYPASS_FOOTER
+        self.assertEqual(classify(pane)[0], "permission")
+
+    def test_non_limit_abnormal_lines_are_never_stripped(self):
+        pane = "Paste code here if prompted >\n" + _LIMIT_BANNER
+        self.assertIn("Paste code here", _mod.strip_limit_banners(pane))
+
+
+# Three false pages on worker seats, owner-marked false: a stale limit banner under an idle or
+# working composer, with nothing on screen waiting for an answer.
+_STALE_BANNER = ("  ⚠ Usage limit reached · continuing automatically at 2am · esc to cancel\n"
+                 "  ⚠ /usage-credits to continue now\n")
+_RULE = "────────────────────────────────────────\n"
+_SEAT_FOOTER = "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents"
+_ALERT_WORKING = ("● Sent the reviewer a cross-session message.\n"
+                  "✻ Thinking… (12s · esc to interrupt)\n" + _RULE + "❯ \n" + _RULE
+                  + _STALE_BANNER + _SEAT_FOOTER)
+_ALERT_WAITING_PROSE = ("● Waiting on the reviewer's approval; nothing is needed from the owner.\n"
+                        "  the witness with the owner's relay-pause call waits on that approval;"
+                        " the inbox watcher is armed.\n" + _RULE + "❯ \n" + _RULE
+                        + _STALE_BANNER + _SEAT_FOOTER)
+_ALERT_DONE = ("● room-destination change that's already shipped.\n"
+               "✻ Worked for 2m 27s · done 2:23 PM · 1 monitor still running\n"
+               "  ✔ Update installed · Restart to update\n" + _RULE + "❯ \n" + _RULE
+               + _STALE_BANNER + _SEAT_FOOTER)
+_REFUSED_LIMIT_TURN = ("❯ check the inbox\n  ⎿  You've hit your session limit · resets 2am\n"
+                       "✻ Worked for 0s\n" + _RULE + "❯ \n" + _RULE + _SEAT_FOOTER)
+_LIMIT_MENU = ("  ⎿  You've hit your weekly limit · resets Sep 27 at 2am\n"
+               "  What do you want to do?\n  ❯ 1. Stop and wait for limit to reset\n"
+               "    2. Switch to extra usage\n  Enter to confirm · Esc to cancel\n")
+_PERMISSION = ("● I need to run a command.\n  Bash command\n    rm -rf build\n"
+               "  Do you want to proceed?\n  ❯ 1. Yes\n    2. No\n  Esc to cancel\n")
+
+
+class TestStaleBannerOnASeatDoesNotPage(unittest.TestCase):
+    """A seat watcher pages a gate only on a prompt on screen; a limit banner holding a
+    worker's queued work is the pool supervisor's to page, since only it reads that queue."""
+
+    def _seat(self, panes, owes=False):
+        baseline, out = None, []
+        for pane in panes:
+            stale, baseline = _mod.limit_step(pane, baseline, "/nonexistent-ws", owes_work=owes)
+            st = compose_state(pane, "idle", True, limit_stale=stale, styled_pane=pane)
+            out.append(st[0])
+        return out
+
+    def test_the_three_false_pages_read_as_not_blocked_on_a_seat(self):
+        for name, pane in (("working", _ALERT_WORKING), ("waiting prose", _ALERT_WAITING_PROSE),
+                           ("finished turn", _ALERT_DONE)):
+            with self.subTest(alert=name):
+                self.assertNotIn("blocked-human", self._seat([pane] * 3))
+
+    def test_the_prose_alone_was_never_the_trigger(self):
+        pane = _ALERT_WAITING_PROSE.replace(_STALE_BANNER, "")
+        self.assertEqual(compose_state(pane, "idle", True)[0], "idle-ready")
+
+    def test_control_the_core_with_queued_work_still_pages_a_banner_nothing_outran(self):
+        self.assertEqual(self._seat([_ALERT_DONE] * 3, owes=True), ["blocked-human"] * 3)
+
+    def test_controls_a_real_prompt_pages_on_a_seat(self):
+        for name, pane, kind in (("refused limit turn", _REFUSED_LIMIT_TURN, "turn-rejected"),
+                                 ("limit menu", _LIMIT_MENU, "selection"),
+                                 ("permission dialog", _PERMISSION, "selection"),
+                                 ("permission under a stale banner",
+                                  _PERMISSION + _STALE_BANNER + _SEAT_FOOTER, "selection")):
+            with self.subTest(control=name):
+                stale, _ = _mod.limit_step(pane, None, "/nonexistent-ws", owes_work=False)
+                st = compose_state(pane, "idle", True, limit_stale=stale)
+                self.assertEqual((st[0], st[3]), ("blocked-human", kind))
+
+    def test_an_unforeseen_dialog_still_pages_under_a_stale_banner(self):
+        pane = ("  Overwrite the existing config file?\n  (Enter to confirm · Esc to cancel)\n"
+                + _STALE_BANNER + _SEAT_FOOTER)
+        stale, _ = _mod.limit_step(pane, None, "/nonexistent-ws", owes_work=False)
+        self.assertEqual(compose_state(pane, "idle", True, limit_stale=stale)[0], "blocked-human")
+        self.assertEqual(compose_state(pane.replace(_STALE_BANNER, ""), "idle", True)[:2],
+                         ("blocked-human", "awaiting user: unknown"))
+
+    def test_owes_work_is_the_cores_queue_and_never_a_worker_seats(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            ws = _Path(td)
+            self.assertIs(_mod.owes_work("worker-seat", ws), False)
+            self.assertIs(_mod.owes_work("", ws), False)
+            (ws / "tasks").mkdir()
+            (ws / "tasks" / "task-1.txt").write_text("task: x\n")
+            self.assertIs(_mod.owes_work("", ws), True)
+            self.assertIs(_mod.owes_work("worker-seat", ws), False)
+
+    @unittest.skipIf(os.geteuid() == 0, "root reads a mode-000 directory")
+    def test_an_unreadable_queue_keeps_the_limit_block_and_an_empty_one_strips_it(self):
+        """A count that could not be read is unknown, not zero: the banner holds on the core
+        seat exactly as with work owed, and only a readable empty queue lets it go."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            ws = _Path(td)
+            tasks = ws / "tasks"
+            tasks.mkdir()
+            tasks.chmod(0)
+            try:
+                owes = _mod.owes_work("", ws)
+                self.assertIsNone(owes)
+                stale, baseline = _mod.limit_step(_ALERT_DONE, None, ws, owes_work=owes)
+                self.assertFalse(stale)
+                st = compose_state(_ALERT_DONE, "idle", True, limit_stale=stale, styled_pane=_ALERT_DONE)
+                self.assertEqual((st[0], st[3]), ("blocked-human", "usage-limit"))
+                # Unknown holds like owed, no harder: a turn that ran since still outruns it.
+                stale, _ = _mod.limit_step(_LIVE_PANE, _mod.limit_step(_LIVE_BEFORE, None, ws, owes_work=owes)[1],
+                                           ws, owes_work=owes)
+                self.assertTrue(stale)
+            finally:
+                tasks.chmod(0o700)
+            owes = _mod.owes_work("", ws)
+            self.assertIs(owes, False)
+            stale, _ = _mod.limit_step(_ALERT_DONE, None, ws, owes_work=owes)
+            self.assertTrue(stale)
+            st = compose_state(_ALERT_DONE, "idle", True, limit_stale=stale, styled_pane=_ALERT_DONE)
+            self.assertEqual(st[0], "idle-ready")
 
 
 if __name__ == "__main__":
