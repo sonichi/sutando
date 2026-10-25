@@ -24,6 +24,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _helpers.hermetic_env import isolated_child_env  # noqa: E402
 from _helpers.hermetic_gateway import isolate_then_import  # noqa: E402
 
 gb, _IMPORT_READS = isolate_then_import(env={"REMOTE_PROACTIVE_ROOM": ""})
@@ -100,7 +101,7 @@ def main() -> int:
     (ws / "tasks").mkdir(parents=True)
     sa.task(ws, TID)
     before = tree(ws)
-    env = {k: v for k, v in os.environ.items() if not k.startswith("STATUS_ACK_")}
+    env = {k: v for k, v in isolated_child_env().items() if not k.startswith("STATUS_ACK_")}
     proc = subprocess.Popen([sys.executable, str(SKILL / "scripts" / "status_ack_worker.py"), "--workspace", str(ws)],
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
     try:
