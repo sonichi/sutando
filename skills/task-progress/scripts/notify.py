@@ -458,6 +458,42 @@ def _load_progress_route():
 _delivery_route, _no_route_message, NO_ROUTE_EXIT = _load_progress_route()
 
 
+def _load_ack_arbitration():
+    """The shared ack claim and its key owner, or None: without them nothing is arbitrated."""
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
+        import ack_claim  # type: ignore
+        from status_ack_policy import ack_key  # type: ignore
+        return ack_claim, ack_key
+    except Exception:
+        return None
+
+
+_ACK_ARBITRATION = _load_ack_arbitration()
+ACK_HOLDER = "task-progress"
+
+
+def _initial_ack_gate(task_file: "str | None") -> "tuple[bool, tuple | None]":
+    """(may send, (workspace, key) this call now holds). A task's first notify is its initial ack
+    and must win `ack:<task>:initial`; every later notify is progress and is never arbitrated."""
+    if not task_file or _ACK_ARBITRATION is None:
+        return True, None
+    ack_claim, ack_key = _ACK_ARBITRATION
+    path = Path(task_file).resolve()
+    if path.parent.name != "tasks":
+        return True, None
+    ws, tid = path.parent.parent, path.stem
+    try:
+        if not ack_claim.claim(ws, f"progress:{tid}:first-notify", ACK_HOLDER):
+            return True, None
+        key = ack_key(tid)
+        if ack_claim.claim(ws, key, ACK_HOLDER, via="notify"):
+            return True, (ws, key)
+    except (OSError, ValueError):
+        return True, None
+    return False, None
+
+
 def _derive_from_task_file(path: str) -> dict:
     """source/channel_id/chat_id/thread_root/reply_to/thread_ts from a task file's headers.
     {} (with a stderr note) when the file is unreadable: explicit flags still apply."""
@@ -572,6 +608,12 @@ def main() -> int:
         )
         return 1
 
+    may_send, held = _initial_ack_gate(args.task_file)
+    if not may_send:
+        print("[task-progress] this task's initial acknowledgement was already sent by another "
+              "sender; not sent again", file=sys.stderr)
+        return 0
+
     if source == "slack":
         ok = send_slack(channel, message, thread_ts=thread_ts)
     elif source == "discord":
@@ -586,6 +628,12 @@ def main() -> int:
         ok = send_remote_gateway(source, channel, message, thread_root=thread_root,
                                  reply_to=reply_to, extra=extra)
 
+    if held is not None:
+        # A failed send may still have landed, so the claim is kept as unknown, never released.
+        try:
+            _ACK_ARBITRATION[0].update(held[0], held[1], ACK_HOLDER, "confirmed" if ok else "unknown")
+        except (OSError, ValueError):
+            pass
     return 0 if ok else 1
 
 

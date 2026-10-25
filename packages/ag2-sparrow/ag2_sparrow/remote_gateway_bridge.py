@@ -311,7 +311,7 @@ from .bounded_file_read import read_regular, read_regular_text
 from .result_markers import parse_markers, render_skill_prelude
 from .result_markers import neutralize_markers
 from . import undelivered_quarantine
-from .proactive_routing import about_task, proactive_filename
+from .proactive_routing import PROACTIVE_OUTBOX_DIRNAME, about_task, proactive_filename, proactive_item_id
 from .team_guardrail import ag2space_tier_lines, owner_mention_lines
 from . import team_result_guard
 from . import health_command
@@ -5601,9 +5601,7 @@ def _payload_room(payload) -> "str | None":
 
 
 def _proactive_item_id(stem: str, body: str) -> str:
-    """One item per file name and body: a new body under a delivered name is a new send. The
-    room and thread are left out, since they are re-resolved on every pass."""
-    return f"{stem}~{hashlib.sha256(body.encode('utf-8')).hexdigest()[:16]}"
+    return proactive_item_id(stem, body)
 
 
 def _proactive_requeue_command(root, item_id: str, body_sha256: str) -> str:
@@ -5613,7 +5611,7 @@ def _proactive_requeue_command(root, item_id: str, body_sha256: str) -> str:
 
 
 def _proactive_outbox_root() -> Path:
-    return RESULTS_DIR / ".outbox-ag2space-proactive"
+    return RESULTS_DIR / PROACTIVE_OUTBOX_DIRNAME
 
 
 def _record_proactive_receipt(item_id: str, event_id: str) -> None:

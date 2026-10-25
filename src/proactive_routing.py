@@ -29,6 +29,7 @@ duplicate to every configured bridge.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from pathlib import Path
@@ -119,6 +120,16 @@ def about_task_filename(task_id: str, ts, channel: "str | None" = None) -> str:
     if about_task(name) != task_id:
         raise ValueError(f"not a task id and timestamp: {task_id!r}, {ts!r}")
     return name
+
+
+#: The gateway's proactive outbox, under results/: its items are the delivery receipts.
+PROACTIVE_OUTBOX_DIRNAME = ".outbox-ag2space-proactive"
+
+
+def proactive_item_id(stem: str, body: str) -> str:
+    """One outbox item per file name and body: a new body under a delivered name is a new send.
+    The room and thread are left out, since they are re-resolved on every pass."""
+    return f"{stem}~{hashlib.sha256(body.encode('utf-8')).hexdigest()[:16]}"
 
 
 def about_task(name) -> "str | None":

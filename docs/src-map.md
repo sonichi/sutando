@@ -16,6 +16,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 
 - **`access_store.py`** — Single writer contract for Discord access.json.
 - **`accessibility_probe.sh`** — Unbounded, this probe blocks forever on a session with nobody to answer the AppleScript prompt, and startup never reaches the services after it.
+- **`ack_claim.py`** — First-writer-wins claims on an acknowledgement key, shared by every sender of that ack.
 - **`activity_bus.py`** — ActivityCard is the UI projection of a durable TaskRun state machine; runtime instrumentation only enriches that state machine with observations.
 - **`activity_policy.py`** — Access tier → capabilities → audience policy → projection.
 - **`activity_rows.py`** — The agent-activity row writer: one JSON row per line at <workspace>/state/agent-activity.jsonl, the live window the desktop renders, its per-day archive, the per-task index that keeps a summary exact after rotation, and the summary left at done.
