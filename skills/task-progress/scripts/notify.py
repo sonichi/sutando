@@ -464,7 +464,7 @@ def _load_ack_arbitration():
         sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
         import ack_claim  # type: ignore
         from status_ack_policy import ack_key  # type: ignore
-        from task_archive import task_id_for  # type: ignore
+        from task_archive import task_id_for
         return ack_claim, ack_key, task_id_for
     except Exception:
         return None
