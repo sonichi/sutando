@@ -14,7 +14,7 @@ PY="$(require_python "$REPO" "run the gateway wrapper primary-room test")" || ex
 # $2 = where the room comes from: "env" or "dotenv"
 # Prints the REMOTE_PROACTIVE_ROOM the stub bridge saw, or "<missing>".
 run_case() {
-  local primary="$1" via="$2" d room_env="" dotenv_room=""
+  local primary="$1" via="$2" d room_env=""
   d=$(mktemp -d); mkdir -p "$d/src/launchd" "$d/scripts" "$d/ws/state/channel-bridge-supervisor" "$d/ws/results" "$d/shims"
   if [ "$via" = dotenv ]; then
     printf 'REMOTE_PROACTIVE_ROOM=!owner:prod.example\n' > "$d/channel.env"
@@ -46,7 +46,7 @@ while True: time.sleep(0.2)" > "$d/src/sparrowd.py"
   printf '#!/bin/bash\nexec "%s" "$@"\n' "$PY" > "$d/shims/python3"
   printf '#!/bin/bash\nexit 0\n' > "$d/shims/osascript"
   chmod +x "$d/shims/python3" "$d/shims/osascript"
-  ( cd "$d"; env -u AG2_REMOTE_TOKEN -u REMOTE_PROACTIVE_ROOM PATH="$d/shims:$PATH" REMOTE_TASK_TOKEN=t \
+  ( cd "$d" || exit 1; env -u AG2_REMOTE_TOKEN -u REMOTE_PROACTIVE_ROOM PATH="$d/shims:$PATH" REMOTE_TASK_TOKEN=t \
       ${room_env:+REMOTE_PROACTIVE_ROOM="$room_env"} SUTANDO_GATEWAY_BRIDGE_RESTART_DELAY=1 \
       bash src/launchd/gateway-bridge-wrapper.sh > o.log 2>&1 & p=$!
     for _ in $(seq 1 50); do [ -f seen.txt ] && break; sleep 0.2; done
