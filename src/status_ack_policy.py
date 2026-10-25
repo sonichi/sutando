@@ -28,7 +28,7 @@ SPEAK, WAIT, SUPPRESS = "speak", "wait", "suppress"
 
 #: The only lines this policy can emit. Each states an observed fact; none estimates time or progress.
 TEMPLATES: Mapping[str, str] = {
-    "claimed": "Received. This is being worked on.",
+    "handed_off": "Received and handed off for handling. No answer yet.",
     "queued": "Received. Not picked up yet; it is in the queue.",
     "inbox_down": "Received. Not picked up yet: the core is not reading its inbox right now.",
     "inbox_down_owner_told": ("Received. Not picked up yet: the core is not reading its inbox right now. "
@@ -83,11 +83,12 @@ def _id_epoch(task_id: str) -> Optional[float]:
     return _plausible(int(raw) / 1000.0 if len(raw) == 13 else float(raw))
 
 
-def intake_at(task_id: str, headers: Mapping[str, str], *observed: Optional[float]) -> Optional[float]:
-    """The earliest credible intake time: the `timestamp` header, the id's epoch and any observed
-    stamps (file mtime, first-seen). Taking the minimum means a later read can never move it later."""
+def intake_at(task_id: str, headers: Mapping[str, str], first_seen: Optional[float] = None) -> Optional[float]:
+    """The earliest immutable intake anchor: the `timestamp` header, the id's epoch, or a first-seen
+    stamp the caller has persisted. None when there is none; a file mtime is never an anchor."""
     stamps = [_header_epoch(headers.get("timestamp")), _id_epoch(task_id)]
-    stamps += [_plausible(float(s)) for s in observed if isinstance(s, (int, float)) and not isinstance(s, bool)]
+    if isinstance(first_seen, (int, float)) and not isinstance(first_seen, bool):
+        stamps.append(_plausible(float(first_seen)))
     stamps = [s for s in stamps if s is not None]
     return min(stamps) if stamps else None
 
@@ -151,7 +152,7 @@ def destination(headers: Mapping[str, str]) -> Tuple[Optional[Destination], str]
 @dataclass(frozen=True)
 class TaskObservation:
     """What the caller saw for one task. `started_at` / `last_activity_at` mirror the activity
-    snapshot and are deliberately not used for the deadline."""
+    snapshot and are deliberately not used for the deadline or the wording."""
     task_id: str
     headers: Mapping[str, str]
     intake_at: Optional[float]
@@ -210,15 +211,15 @@ def decide(obs: TaskObservation, now: float, deadlines: Optional[Mapping[str, fl
     if dest is None:
         return no(f"unverified destination: {why}")
     if obs.intake_at is None:
-        return no("no intake time")
+        return no("intake time unknown")
     due = obs.intake_at + deadline_for(obs.headers, deadlines)
     if now < due:
         return Decision(WAIT, "before the first-ack deadline", key, due_at=due, destination=dest)
 
-    claimed = obs.phase == "RUNNING" or obs.worker_holder is not None
-    watcher_down = obs.inbox == "standby_only" and not claimed
-    if claimed:
-        template = "claimed"
+    handed_off = obs.phase == "RUNNING" or obs.worker_holder is not None
+    watcher_down = obs.inbox == "standby_only" and not handed_off
+    if handed_off:
+        template = "handed_off"
     elif watcher_down:
         template = "inbox_down_owner_told" if obs.owner_alerted else "inbox_down"
     elif obs.inbox == "session" and obs.phase in _UNCLAIMED_PHASES:

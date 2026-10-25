@@ -110,6 +110,74 @@ with tempfile.TemporaryDirectory() as d:
     check(t["claimed"] and t["holder"] == "worker-2" and snap["oldest_unclaimed_task"] is None,
           "a task a worker holds is claimed, as in text mode it is not the core's")
 
+# --- A claimed or assigned file is looked up under its canonical id ---------------------------------
+CANON = "task-1792000000000"
+
+
+def renamed(root, name, *, intake_ago=600, declare=True, **kw):
+    task(root, CANON, intake_ago=intake_ago, **kw)
+    src = root / "tasks" / f"{CANON}.txt"
+    if not declare:
+        src.write_text(src.read_text().replace(f"id: {CANON}\n", ""))
+    src.rename(root / "tasks" / name)
+
+
+for name in (f"{CANON}.claimed-core-2.txt", f"{CANON}.assigned-inst-a.txt"):
+    for declare in (True, False):
+        how = f"{name.split('.')[1]}, id {'declared' if declare else 'from the filename'}"
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            renamed(root, name, declare=declare, phase="RUNNING")
+            snap = uat.snapshot(root, 120, now=NOW, holders=SESSION)
+            t = snap["tasks"][0]
+            check(t["task_id"] == CANON and t["phase"] == "RUNNING" and t["claimed"]
+                  and snap["oldest_unclaimed_task"] is None,
+                  f"{how}: RUNNING activity stored under the canonical id is found; not oldest-unclaimed")
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            renamed(root, name, declare=declare, result="the reply\n")
+            snap = uat.snapshot(root, 0, now=NOW, holders=SESSION)
+            t = snap["tasks"][0]
+            check(t["answered"] and not t["unanswered"] and snap["unanswered_count"] == 0
+                  and snap["oldest_unclaimed_task"] is None,
+                  f"{how}: a result under the canonical id answers it")
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            renamed(root, name, declare=declare)
+            seen, real = [], uat._holder
+            uat._holder = lambda ws, tid: (seen.append(tid), "worker-2" if tid == CANON else None)[1]
+            try:
+                snap = uat.snapshot(root, 120, now=NOW, holders=SESSION)
+            finally:
+                uat._holder = real
+            check(seen == [CANON] and snap["tasks"][0]["claimed"] and snap["oldest_unclaimed_task"] is None,
+                  f"{how}: the worker lookup uses the canonical id")
+
+with tempfile.TemporaryDirectory() as d:
+    root = Path(d)
+    renamed(root, f"{CANON}.claimed-core-2.txt", phase="RUNNING")
+    stem = Path(f"{CANON}.claimed-core-2.txt").stem
+    check(uat._phase(root, stem) is None and uat._phase(root, CANON) == "RUNNING",
+          "CONTROL: a Path.stem lookup misses the RUNNING activity the canonical id finds")
+
+# --- A slug id with no timestamp has no immutable intake ---------------------------------------------
+with tempfile.TemporaryDirectory() as d:
+    root = Path(d)
+    (root / "tasks").mkdir(); (root / "results").mkdir()
+    f = root / "tasks" / "task-plain.txt"
+    f.write_text("id: task-plain\nsource: ag2space\ntask: hello\n")
+    os.utime(f, (NOW - 900, NOW - 900))
+    before = uat.snapshot(root, 120, now=NOW, holders=SESSION)
+    os.utime(f, (NOW, NOW))  # rewritten: the mtime is now
+    after = uat.snapshot(root, 120, now=NOW, holders=SESSION)
+    for label, snap in (("before a rewrite", before), ("after a rewrite", after)):
+        t = snap["tasks"][0]
+        check(t.get("intake_known") is False and t["age_s"] is None and t["unclaimed_age_s"] is None
+              and snap.get("unclaimed_intake_unknown") == ["task-plain"],
+              f"slug id, no timestamp, {label}: intake is reported unknown, never fresh")
+    check(after["tasks"][0]["mtime_age_s"] == 0.0,
+          "CONTROL: an mtime anchor would have reset the same task's age to 0 on rewrite")
+
 # --- Who holds the inbox ---------------------------------------------------------------------------
 with tempfile.TemporaryDirectory() as d:
     root = Path(d)
@@ -187,6 +255,30 @@ finally:
         sys.modules.pop("status_ack_policy", None)
     else:
         sys.modules["status_ack_policy"] = _saved
+
+# An empty queue must not hide a broken grammar owner: exit 2, never a healthy-looking 0.
+_ds = uat.dedup_soundness
+_saved_markers, _had = _ds._MARKERS, "result_markers" in sys.modules
+_saved_rm = sys.modules.get("result_markers")
+_ds._MARKERS = None
+sys.modules["result_markers"] = None
+try:
+    with tempfile.TemporaryDirectory() as d:
+        (Path(d) / "tasks").mkdir()
+        rc, out = run_main(["--workspace", d, "--json"])
+        check(rc == 2 and "result_markers" in json.loads(out)["error"],
+              "--json on an EMPTY queue exits 2 when result_markers.py is unimportable")
+finally:
+    if _had:
+        sys.modules["result_markers"] = _saved_rm
+    else:
+        sys.modules.pop("result_markers", None)
+    _ds._MARKERS = _saved_markers
+with tempfile.TemporaryDirectory() as d:
+    (Path(d) / "tasks").mkdir()
+    rc, out = run_main(["--workspace", d, "--json"])
+    check(rc == 0 and json.loads(out)["unanswered_count"] == 0,
+          "CONTROL: the same empty queue exits 0 once the grammar owner is importable again")
 
 print(f"\nunanswered-tasks-json: {PASS} passed, {FAIL} failed")
 sys.exit(1 if FAIL else 0)
