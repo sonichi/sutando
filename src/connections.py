@@ -203,7 +203,8 @@ def _public_address(ip: str) -> bool:
     # site-local forms that the named predicates alone let through.
     for a in (addr, getattr(addr, "ipv4_mapped", None)):
         if a is not None and (not a.is_global or a.is_loopback or a.is_private or a.is_link_local
-                              or a.is_multicast or a.is_reserved or a.is_unspecified):
+                              or a.is_multicast or a.is_reserved or a.is_unspecified
+                              or getattr(a, "is_site_local", False)):
             return False
     return True
 
