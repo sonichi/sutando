@@ -9,11 +9,13 @@ there, including the daily morning briefing and the email-triage digest (#4259).
   b) registry names the 2-member DM      -> briefing delivered there (positive control)
   c) the adopted DM gains a third member -> reading dropped, persisted file cleared
   d) membership unreadable for a new DM  -> not adopted: held
-  e) a persisted reading not marked private (pre-fix file) is not loaded
+  e) a persisted reading not marked private (pre-fix file, legacy or bound) is not loaded
   f) a withheld-result review never goes to a shared room the registry names
   g) the membership read raises (gateway unreachable) -> undecided: held
   h) a review-DM cache written before the check is not reused (shared or unreadable hint)
   i) a review-DM cache marked private is reused when the hint is unreadable (positive control)
+  j) the cleared reading cannot be written -> the shared room is not re-adopted from disk
+  k) an unmarked record naming a room found shared is overwritten, so no other reader trusts it
 
 Loads src/remote-gateway-bridge.py in-process with an isolated workspace and a
 fake `_req`. Run: python3 tests/gateway-owner-dm-must-be-private.test.py
@@ -24,7 +26,7 @@ from _helpers.hermetic_env import isolate_os_environ
 
 # Before anything reads the environment: no outer credential selector survives.
 isolate_os_environ(SUTANDO_TEST_MODE="1", AG2_DEVICE_ENV="", REMOTE_TASK_URL="http://127.0.0.1:9",
-                   REMOTE_TASK_TOKEN="t", REMOTE_PROACTIVE_ROOM="!team:example.org",
+                   REMOTE_TASK_TOKEN="Zq9xWv7Yu3", REMOTE_PROACTIVE_ROOM="!team:example.org",
                    AGENT_MXID="@agent:example.org")
 
 import importlib.util
@@ -138,6 +140,14 @@ def main() -> int:
     mod._ROUTING.update(loaded=False, owner_dm="", persisted="")
     mod._load_routing()
     check(mod._ROUTING["owner_dm"] == "", f"e) a persisted reading not marked private is not loaded: {mod._ROUTING['owner_dm']!r}")
+    mod._routing_file().write_text(json.dumps(mod._routing_record(AGENT, mod.URL, TEAM)))
+    mod._ROUTING.update(owner_dm="", persisted="")
+    mod._load_routing()
+    check(mod._ROUTING["owner_dm"] == "",
+          f"e) a bound reading not marked private is not loaded: {mod._ROUTING['owner_dm']!r}")
+    mod._routing_file().write_text(json.dumps(mod._routing_record(AGENT, mod.URL, DM, private=True)))
+    mod._load_routing()
+    check(mod._ROUTING["owner_dm"] == DM, "e) a bound reading marked private is loaded (positive control)")
 
     ws = workspace(); gw = Gateway(TEAM); mod = load(ws, gw)
     mod._gateway_owner()
@@ -166,6 +176,23 @@ def main() -> int:
     mod._WITHHELD_DM_CACHE.write_text(json.dumps({"owner": OWNER, "room_id": "!kept:example.org", "private": True}))
     mod._gateway_owner()
     check(mod._owner_review_dm(OWNER) == "!kept:example.org", "i) a cache marked private is reused")
+
+    ws = workspace(); gw = Gateway(DM); mod = load(ws, gw)
+    drain(mod, ws, "proactive-morning-6.txt")
+    gw.members[DM].append("@intruder:example.org")
+    mod._ROUTING["next"] = 0.0
+    mod._durable_write = lambda *_a, **_k: False
+    queued = drain(mod, ws, "proactive-morning-7.txt")
+    queued_again = drain(mod, ws, "proactive-morning-8.txt")
+    check(queued and queued_again and len(gw.posts) == 1 and mod.proactive_room() == "",
+          f"j) an unwritable cleared reading holds; the shared room is not re-read from disk: posts={len(gw.posts)}")
+
+    ws = workspace(); gw = Gateway(TEAM); mod = load(ws, gw)
+    mod._routing_file().write_text(json.dumps(mod._routing_record(AGENT, mod.URL, TEAM)))
+    queued = drain(mod, ws, "proactive-morning-9.txt")
+    record = json.loads(mod._routing_file().read_text())
+    check(queued and gw.posts == [] and record.get("owner_dm") == "" and record.get("private") is True,
+          f"k) an unmarked record naming the shared room is overwritten with no reading: {record}")
 
     print(f"\n{'FAIL' if FAILS else 'PASS'}: {len(FAILS)} failure(s)")
     return 1 if FAILS else 0

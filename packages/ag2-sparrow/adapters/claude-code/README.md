@@ -381,23 +381,39 @@ host supervisor through `_dirs.set_dirs()`, so the root is
 environment only (the workspace's own binding is the core's agent), and
 install writes no job: it writes `<root>.bridge/worker.json`, a declaration
 naming the worker, the module, the same environment and the vault key the
-token is read from (`vault set AG2_RELAY_TOKEN_BRIDGE_… <token>`). sparrowd
-reads every marked `<workspace>/agents/*.bridge/worker.json` at its start
-(`src/sparrowd.py`) and runs each as a worker through `src/sparrow_agent_bridge.py`:
+token is read from (`vault set AG2_RELAY_TOKEN_BRIDGE_… <token>`). Store the
+combined `https://<gateway>|<secret>` relay token there, or a bare secret plus
+the agent's gateway URL under the matching URL key
+(`vault set AG2_RELAY_URL_BRIDGE_… <the agent's gateway URL>`, which install
+prints): a declared bridge never takes its endpoint from the host's environment
+(`REMOTE_TASK_URL`, `AG2_REMOTE_URL`, `GATEWAY_URL` and `RELAY_URL` are stripped)
+or from the declaration, and a URL inside the token wins over the URL key. A
+bare secret with no URL key does not start; `python3 src/sparrow_agent_bridge.py
+--preflight` lists every declared agent and, for one that will not start, the
+one `vault set` that fixes it. sparrowd
+reads every marked `<workspace>/agents/*.bridge/worker.json` at its start and
+on every scan after it (`src/sparrowd.py`, `--rescan-s`, 30 s by default) and
+runs each as a worker through `src/sparrow_agent_bridge.py`:
 the token from the vault into `REMOTE_TASK_TOKEN` (never on disk; no token, no
 bridge), the agent's own dirs and the workspace's task stamper injected, and
 the package bridge run in that process under sparrowd's environment minus the
-host's token, identity and owner-DM variables. The declaration is data the
+host's tokens, gateway URLs, identity and owner-DM variables. The declaration is data the
 agent's own session could write, so it chooses nothing: the worker name, the
 vault key, the token variable and the exact env (the three dirs and
 `AGENT_MXID`) are derived from its directory's segment, and a declaration
 that differs in any of them, adds any key, sits anywhere but directly under
 `<workspace>/agents`, is unmarked or malformed, or whose key the vault lacks
 is skipped with one reason line.
-Restart sparrowd (`src/sparrowd.py`) after install: it reads its workers only
-at start, and until then `verify` fails the bridge row and says so. Nothing in
-this repo starts sparrowd (`startup.sh` and `restart.sh` run the core bridge
-directly), so whatever runs it on the host must be restarted.
+A declaration written after sparrowd started is picked up on its next scan,
+one `uninstall` removed has its worker stopped, and one whose content changed
+has its worker restarted (once the old process has exited); a declaration file
+that exists but cannot be read keeps its worker as it is. Until the scan, `verify`
+fails the bridge row and says so. On a host whose gateway bridge the launchd
+job runs (`src/launchd/gateway-bridge-wrapper.sh`), that wrapper keeps
+`src/sparrowd.py --agent-bridges` alive beside the bridge: the same scanner and
+the same worker, supervising only the declarations, so no second sparrowd and
+no job per agent is needed there. Elsewhere, whatever runs sparrowd on the host
+must be running for the declaration to be served.
 
 An explicit root (`--work`, `--inbox`, or `AGENT_CONNECT_TASK_DIR`) is served
 by a bridge you run; install records its agent when the host's chain names one

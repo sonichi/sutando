@@ -2,7 +2,7 @@
 """Regenerate the package modules from the canonical sutando src/ (single source).
 
 Everything in MAP below is bundled verbatim from sonichi/sutando `src/`, which is
-canonical for those modules — currently 36 of them, including outbox.py and its
+canonical for those modules — currently 39 of them, including outbox.py and its
 transport seam outbox_adapter.py. Only the modules NOT in MAP are package-canonical
 and intentionally diverge from src (remote_gateway_bridge, _dirs, send_allowlist:
 dir-interface, no workspace-resolution).
@@ -44,6 +44,13 @@ MAP = {
     "src/file_lock.py": "file_lock.py",
     # one-process exclusion per work root (flock + holder record); builds on file_lock
     "src/holder_lock.py": "holder_lock.py",
+    # where the gateway credentials come from and which source wins; parsing and masking are
+    # the generated gateway_credentials contract it imports
+    "src/gateway_credential_sources.py": "gateway_credential_sources.py",
+    # the non-blocking, bounded reader every adapter uses for a credential file
+    "src/bounded_file_read.py": "bounded_file_read.py",
+    # which homeservers are DotSpaces; the bridge's IPv4 preference asks it per gateway host
+    "src/dotspace.py": "dotspace.py",
     "src/workspace_lock.py": "workspace_lock.py",
     "src/chat_secret_filter.py": "chat_secret_filter.py",
     "src/policy/egress/result.py": "team_result_guard.py",

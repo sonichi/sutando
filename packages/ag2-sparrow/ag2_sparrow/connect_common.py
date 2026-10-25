@@ -34,8 +34,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import _dirs
-from .task_io import LockRefused, acquire_lock, install_id, lock_held, lock_holder, lock_path, release_lock
+from . import _dirs, service_manager as _sm, task_io
+from .task_io import LockRefused, acquire_lock, install_id, lock_held, lock_holder, lock_path, release_lock  # noqa: F401
 
 EXIT_HELD = 75          # another session holds this work root: a supervisor must not relaunch over it
 EXIT_UNUSABLE = 2
@@ -50,6 +50,9 @@ POLL_S = 0.2
 STOP_TIMEOUT_S = 30     # the manager's own SIGTERM-to-SIGKILL bound: past the launcher's grace + reap bound
 THROTTLE_S = 30         # launchd's respawn delay: behind a normal SIGTERM shutdown of the old session
 
+# A hand launcher (debug-run) publishes its holder record under this label: the managed launcher is the
+# shape's own name, and install confirms only that one, never a hand holder that won the root first.
+DEBUG_SUFFIX = ".debug"
 # Set by the unit and the plist in the launcher's environment; `run` refuses without it, so a hand
 # start never takes the root inside the manager's teardown window. A guard, not a security boundary.
 MANAGED_VAR = "AG2_SPARROW_MANAGED"
@@ -380,14 +383,6 @@ def render_supervisor(shape: Shape, env=None) -> "tuple[str, str]":
 
 # ── the manager: explicit outputs only ───────────────────────────────────────
 
-def _run(cmd: list, timeout: float = RUN_TIMEOUT_S) -> "subprocess.CompletedProcess | None":
-    """A manager command; None when it could not run or did not return in time. Never prompts."""
-    try:
-        return subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout)
-    except (OSError, subprocess.SubprocessError):
-        return None
-
-
 def _ok(r) -> bool:
     return r is not None and r.returncode == 0
 
@@ -407,14 +402,11 @@ def _launchd_target() -> str:
     return f"gui/{os.getuid()}"
 
 
-def _systemctl(*args, timeout: float = RUN_TIMEOUT_S) -> "subprocess.CompletedProcess | None":
-    return _run(["systemctl", "--user", "--no-ask-password", *args], timeout)
-
-
 def unit_state(shape: Shape) -> dict:
     """{load, active, enabled} from one `systemctl show --value` (its own words only); every field
     'unknown' when it cannot be read."""
-    r = _systemctl("show", "-p", "LoadState,ActiveState,UnitFileState", "--value", shape.service_name)
+    r = _sm._systemctl(("--user", "show", "-p", "LoadState,ActiveState,UnitFileState", "--value"),
+                       unit=shape.service_name)
     words = (r.stdout or "").split("\n") if r is not None and r.returncode == 0 else []
     words = [w.strip() for w in words] + ["", "", ""]
     load, active, enabled = words[0], words[1], words[2]
@@ -447,7 +439,7 @@ def launchd_service(shape: Shape) -> str:
 def agent_loaded(shape: Shape) -> str:
     """active | absent | unknown, from `launchctl print`'s exit and its documented not-found error only;
     a registered launchd job is a running one (KeepAlive)."""
-    r = _run(["launchctl", "print", launchd_service(shape)])
+    r = _sm._run(["launchctl", "print", launchd_service(shape)])
     if r is None:
         return "unknown"
     if r.returncode == 0:
@@ -465,7 +457,7 @@ def manager_detail(shape: Shape) -> str:
     `ActiveState/SubState` (`active/running`, `activating/auto-restart`); launchd's `pid = N` and
     `state = …` lines from `launchctl print`; 'absent' or 'unknown' from the same probes."""
     if is_macos():
-        r = _run(["launchctl", "print", launchd_service(shape)])
+        r = _sm._run(["launchctl", "print", launchd_service(shape)])
         if r is None:
             return "unknown"
         if r.returncode != 0:
@@ -473,7 +465,7 @@ def manager_detail(shape: Shape) -> str:
         found = dict(re.findall(r"^\s*(pid|state) = (\S+)", r.stdout or "", re.M))
         words = [f"{k} {found[k]}" for k in ("pid", "state") if k in found]
         return ", ".join(words) if words else "loaded"
-    r = _systemctl("show", "-p", "ActiveState,SubState", "--value", shape.service_name)
+    r = _sm._systemctl(("--user", "show", "-p", "ActiveState,SubState", "--value"), unit=shape.service_name)
     if r is None or r.returncode != 0:
         return "unknown"
     active, sub = ((r.stdout or "").split("\n") + ["", ""])[:2]
@@ -494,14 +486,17 @@ def start_supervisor(shape: Shape) -> str:
     path = supervisor_path(shape)
     if is_macos():
         log_path(shape).parent.mkdir(parents=True, exist_ok=True)
-        r = _run(["launchctl", "bootstrap", _launchd_target(), str(path)], shape.manager_timeout_s)
+        r = _sm._run(["launchctl", "bootstrap", _launchd_target(), str(path)], shape.manager_timeout_s)
         return "" if _ok(r) else f"launchctl bootstrap failed ({_why(r)})"
-    if not _ok(_systemctl("show-environment")):
+    if not _sm.systemd_user_available():
         return "systemctl --user is not available here"
-    for verb in (("daemon-reload",), ("enable", shape.service_name), ("restart", shape.service_name)):
-        r = _systemctl(*verb, timeout=shape.manager_timeout_s)
+    unit, bound = shape.service_name, shape.manager_timeout_s
+    for verb, run in (("daemon-reload", lambda: _sm._systemctl(("--user", "daemon-reload"), timeout=bound)),
+                      (f"enable {unit}", lambda: _sm._systemctl(("--user", "enable"), unit=unit, timeout=bound)),
+                      (f"restart {unit}", lambda: _sm._systemctl(("--user", "restart"), unit=unit, timeout=bound))):
+        r = run()
         if not _ok(r):
-            return f"systemctl --user {' '.join(verb)} failed ({_why(r)})"
+            return f"systemctl --user {verb} failed ({_why(r)})"
     return ""
 
 
@@ -510,7 +505,7 @@ def stop_supervisor(shape: Shape) -> str:
     systemd: stop + disable) and require its own word for it: '' once launchd reports it absent or
     systemd reports it inactive and disabled, else why not."""
     if is_macos():
-        r = _run(["launchctl", "bootout", "--wait", launchd_service(shape)], shape.manager_timeout_s)
+        r = _sm._run(["launchctl", "bootout", "--wait", launchd_service(shape)], shape.manager_timeout_s)
         if r is None:
             return f"the stop command for {job_name(shape)} could not run"
         state = manager_state(shape)
@@ -518,10 +513,10 @@ def stop_supervisor(shape: Shape) -> str:
             return ""
         return (f"{job_name(shape)} is still active after the stop ({_why(r)})" if state == "active" else
                 f"{job_name(shape)}'s state after the stop is unknown ({_why(r)})")
-    r = _systemctl("stop", shape.service_name, timeout=shape.manager_timeout_s)
+    r = _sm._systemctl(("--user", "stop"), unit=shape.service_name, timeout=shape.manager_timeout_s)
     if r is None:
         return f"the stop command for {job_name(shape)} could not run"
-    _systemctl("disable", shape.service_name)
+    _sm._systemctl(("--user", "disable"), unit=shape.service_name)
     st = unit_state(shape)
     if st["active"] == "inactive" and st["enabled"] == "disabled":
         return ""
@@ -535,7 +530,7 @@ def linger(shape: Shape) -> None:
         print(f"loaded: {shape.agent_label} (it stops at logout and starts again at your next login)")
         return
     user = os.environ.get("USER") or os.environ.get("LOGNAME") or ""
-    r = _run(["loginctl", "--no-ask-password", "enable-linger", user]) if user else None
+    r = _sm._run(["loginctl", "--no-ask-password", "enable-linger", user]) if user else None
     print(f"linger: enabled for {user}, so the session runs while you are logged out" if _ok(r) else
           f"NOTE: loginctl enable-linger {user or '$USER'} failed ({_why(r)}); the session stops at logout until "
           "an administrator runs it")
@@ -593,10 +588,27 @@ def holder_line(root: str) -> str:
     return f"held by launcher pid {rec['pid']}" if rec.get("live") else "held by an unrecorded holder"
 
 
-def occupancy_line(shape: Shape, root: str) -> str:
+def holder_words(root: str, labels: tuple, _rec=None) -> str:
+    """Who holds the root in the shape's nouns, `labels` = (holder, consumer): the holder and, once
+    attached, its live consumer, as verify and install's closing line both say it."""
+    holder, consumer_noun = labels
+    rec, consumer = task_io.lock_holder(root), task_io.holder_consumer(root)
+    return f"{holder} pid {rec.get('owner_pid')}" + (f", its {consumer_noun} pid {consumer['pid']}"
+                                                     if consumer and consumer.get("live") else f", no live {consumer_noun} attached")
+
+
+def occupancy_line(shape: Shape, root: str, labels=None) -> str:
     """The lock beside the manager's state: a free lock under a live or respawning job is 'restarting
     (manager …, lock free)', never 'free'; held is 'held by launcher pid N (manager …)'; absent and free
-    is 'free (no job)'; a stopped or unprobeable job with a free lock says so as 'free (manager …)'."""
+    is 'free (no job)'; a stopped or unprobeable job with a free lock says so as 'free (manager …)'.
+    With `labels` (holder, consumer) the shared tri-state is read first: held names the holder and,
+    once attached, the consumer whose liveness fences the root; unobserved never reads free."""
+    if labels is not None:
+        occ, manager = task_io.occupancy(root), manager_detail(shape)
+        if occ == "held":
+            return f"held by {holder_words(root, labels)} (manager {manager})"
+        if occ == "unobserved":
+            return f"unobserved (the root's holder or consumer cannot be verified; manager {manager})"
     lock, manager = holder_line(root), manager_detail(shape)
     if lock != "free":
         return f"{lock} (manager {manager})"
@@ -807,6 +819,130 @@ def _run_until_end(child, pidfd, state: dict) -> "int | None":
                     return None
 
 
+def debug_adapter(shape: Shape) -> str:
+    return shape.name + DEBUG_SUFFIX
+
+
+def hold_and_supervise(shape: Shape, root: str, state: dict, prepare, spawn, supervise, reap, label: str, noun: str,
+                       child_noun: str = "", started=None, adapter: str = "", acquired=None) -> int:
+    """The holder's one sequence, in `label`'s words: take the root as `adapter` (the shape's name unless a
+    hand launcher says otherwise; another holder is EXIT_HELD, any other refusal EXIT_UNUSABLE), then
+    `acquired()` (a hand launcher releases its operation lock there, the check-then-acquire done),
+    refuse a `tasks` symlink, `prepare(owner, root) -> (ctx, problem)` (it may raise LockRefused), stop
+    before start as 128+signal, read the record, `spawn(ctx) -> child` (OSError is the refusal), attach
+    the child as the consumer by its pid and start time, `started(child)` once attached, then
+    `supervise(child) -> int`; any failure between spawn and attach is `reap(child)` and "no consumer".
+    The lock is released with the holder; a release refused for a live consumer is said in one line.
+    Every `task_io` step is looked up at call time."""
+    child_noun = child_noun or noun
+
+    def refuse(line: str) -> int:
+        print(f"{label}: refusing to start: {line}", file=sys.stderr)
+        return EXIT_UNUSABLE
+    try:
+        owner = task_io.acquire_lock(root, adapter or shape.name, retry_s=ACQUIRE_RETRY_S)
+    except LockRefused as e:
+        if acquired is not None:
+            acquired()
+        print(e.line, file=sys.stderr)
+        return EXIT_HELD if e.code == 3 else EXIT_UNUSABLE
+    if acquired is not None:
+        acquired()
+    try:
+        if _is_link("tasks", owner.root_fd):
+            return refuse("tasks/ under the held root is a symlink, not a directory")
+        try:
+            ctx, problem = prepare(owner, root)
+        except LockRefused as e:
+            print(e.line, file=sys.stderr)
+            return EXIT_HELD if e.code == 3 else EXIT_UNUSABLE
+        if problem:
+            return refuse(problem)
+        if state["sig"] is not None:
+            print(f"{label}: stopped before the {noun} started", file=sys.stderr)
+            return 128 + state["sig"]
+        expected = task_io.holder_record_bytes(owner)
+        try:
+            child = spawn(ctx)
+        except OSError as e:
+            return refuse(f"the {noun} could not be spawned ({e.strerror or e})")
+        try:
+            start = task_io.start_time(child.pid)
+            if start is None:
+                raise LockRefused(2, f"the {child_noun}'s start time is unreadable")
+            task_io.attach_consumer(owner, expected, child.pid, start)
+            if started is not None:
+                started(child)
+        except Exception as e:     # holder_lock.LockError arrives as Exception here
+            reap(child)
+            return refuse(f"no consumer: {e}")
+        return supervise(child)
+    finally:
+        if not task_io.release_lock(owner):
+            print(f"{label}: the {noun} may still be alive; the root stays held by it and this flock until exit",
+                  file=sys.stderr)
+
+
+def supervise_child(child, state: dict, label: str, noun: str) -> int:
+    """Wait for the direct child; a recorded stop terminates it, bounded, then kills; its exit code."""
+    state["child"] = child
+    rc = _run_until_end(child, None, state)
+    if rc is None:
+        print(f"{label}: the {noun} did not die within the bound; the manager's to clean", file=sys.stderr)
+        return 128 + state["sig"]
+    if state["sig"] is not None:
+        return 128 + state["sig"]
+    return rc
+
+
+def kill_and_reap(child) -> None:
+    """A child that may never be attached: kill, then reap within the bound."""
+    try:
+        child.kill()
+    except OSError:
+        pass
+    try:
+        child.wait(timeout=REAP_BOUND_S)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+# ── the launchd entry shim ───────────────────────────────────────────────────
+
+def launchd_exit(rc: int) -> int:
+    """The entry shim's table: logical 75 is terminal (exit 0, launchd stops respawning); every other
+    return, and any signal death, is non-zero so launchd respawns after the throttle."""
+    if rc == EXIT_HELD:
+        return 0
+    if rc <= 0:
+        return 1
+    return rc
+
+
+def run_launchd(child_argv: list, popen=subprocess.Popen) -> int:
+    """`run --launchd`: the launcher as a child, the stop signals forwarded, its outcome mapped."""
+    child = popen(child_argv)
+    forwarded = []
+
+    def forward(signum, frame):
+        if child.poll() is None:
+            child.send_signal(signum)
+            forwarded.append(signum)
+    previous = {sig: signal.signal(sig, forward) for sig in (signal.SIGTERM, signal.SIGINT)}
+    try:
+        rc = child.wait()
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+    return launchd_exit(rc)
+
+
+def run_child_argv(shape: Shape, module: str) -> list:
+    """The launcher the shim runs: the console script with `run`, else this interpreter on `module`."""
+    script = console_script(shape)
+    return [script, "run"] if script else [sys.executable, "-c", f"from {module} import main; raise SystemExit(main(['run']))"]
+
+
 # ── verify and uninstall ─────────────────────────────────────────────────────
 
 def check(results: list, ok: bool, name: str, detail: str) -> None:
@@ -904,7 +1040,7 @@ def _uninstall_locked(shape: Shape, before_free=None, token_file=None) -> int:
         sup.unlink()
         print(f"removed: {sup}")
     if not is_macos():
-        r = _systemctl("daemon-reload")
+        r = _sm._systemctl(("--user", "daemon-reload"))
         if not _ok(r):
             return _refuse(f"systemctl --user daemon-reload failed ({_why(r)}); {kept}; run uninstall again", recovery)
         if unit_load_state(shape) != "not-found":

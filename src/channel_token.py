@@ -38,6 +38,16 @@ keeps its own order and appends `token_from_vault()` as the last tier only.
 Declaring one policy while a bridge follows another would make this docstring
 a lie about the code beside it. (Original distinction caught by @Sutando-Pro.)
 
+  3. **A declared bridge's process tree reads no host credential.** When the
+     environment carries the mark `gateway_credential_sources` owns
+     (`credentials_injected`), the file and vault readers below answer '' without
+     opening anything: that process was handed its own token, and the host's
+     `.env` files and vault are the host's. Its wake child inherits the mark and
+     acts as the agent: it carries the agent's own token in its environment
+     (`gateway_credential_sources.wake_environ`), which the env tier still reads,
+     so room ops there resolves exactly that token and never the host's; with no
+     env token it fails closed, and `scripts/channel-env.sh` names no file.
+
 `resolve_channel_token()` also serves the GATE, which asks a question
 precedence cannot affect: *does a usable token exist at all?* If more than
 one layer holds a value, existence is true regardless of which is preferred.
@@ -52,6 +62,10 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+# The credential owner's contract module lives in shared/; the owner itself is a sibling here.
+sys.path.append(str(Path(__file__).resolve().parent.parent / "shared"))  # lint-workspace-resolution: allow-repo-root
+
+from gateway_credential_sources import credentials_injected  # noqa: E402
 
 # Both spellings the gateway contract accepts (docs/remote-gateway-protocol.md);
 # AG2_REMOTE_TOKEN is the legacy alias still present on older installs.
@@ -104,7 +118,10 @@ def _clean_for(var: str, value: object) -> str:
 
 
 def token_from_env_file(var: str, env_file: Path) -> str:
-    """Read `var` from a `KEY=VALUE` file. '' when absent, empty, or unreadable."""
+    """Read `var` from a `KEY=VALUE` file. '' when absent, empty, or unreadable, and
+    in a process tree whose credentials were handed in (see 3. above)."""
+    if credentials_injected(os.environ):
+        return ""
     try:
         text = env_file.read_text()
     except OSError:
@@ -126,7 +143,10 @@ def token_from_vault(var: str, vault_get=None) -> str:
     keyring, or an import error must degrade to "no answer" rather than crash a
     bridge at startup. The caller decides what an absent token means; this
     function never decides for it, and never surfaces the value in an exception.
+    '' without a lookup in a process tree whose credentials were handed in (see 3. above).
     """
+    if credentials_injected(os.environ):
+        return ""
     if vault_get is None:
         try:
             from vault_intercept import get_vault_key as vault_get  # type: ignore

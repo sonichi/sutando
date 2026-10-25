@@ -38,6 +38,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from tmux_probe import has_session as _tmux_has_session  # noqa: E402
 import cli_wedge  # noqa: E402 — owns the core pane target and its capture
+import dotspace  # noqa: E402 — which cloud this install's DotSpace runs
 import session_runtime  # noqa: E402 — the one reading of a session's runtime stamp
 from worker_auth_state import signed_in_since  # noqa: E402 — the one "signed in again" reading
 
@@ -275,12 +276,13 @@ def _gateway_running():
 
 # The AG2 Space desktop app runs its own engine runtime under
 # `space.ag2.app/engine`, and that engine is what serves the Station connector
-# gateway (sutando.ag2.space). Station connectors are therefore available only
+# gateway (the DotSpace's cloud origin). Station connectors are therefore available only
 # while AG2 Space is running; when it is not, Station calls fail with a bare
 # ENOTFOUND. Surfacing this lets any reader (health-check, dashboard, the agent)
 # attribute a Station failure to "AG2 Space not running" rather than guess.
 _AG2SPACE_APP_MARKER = "AG2 Space.app/Contents/MacOS"
-_STATION_GATEWAY_HOST = "sutando.ag2.space"
+_STATION_GATEWAY_HOST = dotspace.server_of_gateway_url(
+    dotspace.default_cloud_origin())
 
 
 def _ag2space_app_running():
@@ -524,9 +526,10 @@ def _queued_tasks(workspace):
         return 0
 
 
-def _pane_blocks_dispatch(workspace):
-    """The pane gate's verdict when it holds queued tasks, else None. The adapter is the
-    session's own runtime; a session that cannot name it is not judged."""
+def _pane_blocks_dispatch(workspace, queued=True):
+    """The pane gate's verdict when it holds queued tasks, or (queued or not) when a dialog
+    only a person can answer holds it; else None. The adapter is the session's own
+    runtime; a session that cannot name it is not judged."""
     try:
         from delivery import pane_gate
         sock = _tmux_socket()
@@ -537,7 +540,9 @@ def _pane_blocks_dispatch(workspace):
             return None
         verdict = pane_gate.classify_pane(cli_wedge.capture_pane(sock, target, escapes=True),
                                           adapter, workspace, sock, SESSION)
-        return verdict if pane_gate.blocks_dispatch(verdict, adapter) else None
+        if pane_gate.waits_for_a_person(verdict):
+            return verdict
+        return verdict if queued and pane_gate.blocks_dispatch(verdict, adapter) else None
     except Exception:  # noqa: BLE001 — best-effort: an unreadable pane keeps the prior verdict
         return None
 
@@ -663,12 +668,19 @@ def derive():
                 health, detail = "idle", "Agent is online and idle"
                 # core-status is a self-report; queued work the pane is holding is not idle.
                 queued = _queued_tasks(workspace)
-                held = _pane_blocks_dispatch(workspace) if queued else None
+                # Checked with nothing queued too: a trust or login dialog at startup holds
+                # the next task as surely as the current one (2026-10-22: hours of "idle").
+                held = _pane_blocks_dispatch(workspace, queued=bool(queued))
                 if held is not None:
-                    what = (f"unsent text in the composer: {held.pending!r}"
-                            if held.state == "pending" else f"{held.state} ({held.reason})")
+                    if held.state == "pending":
+                        what = f"unsent text in the composer: {held.pending!r}"
+                    elif held.state == "busy":
+                        what = f"the core is waiting on a {held.reason} prompt only a person can answer"
+                    else:
+                        what = f"{held.state} ({held.reason})"
                     health = "blocked"
-                    detail = f"{queued} task(s) queued but not dispatched — {what}"
+                    detail = (f"{queued} task(s) queued but not dispatched — {what}" if queued
+                              else f"Agent cannot take tasks — {what}")
             else:
                 health, detail = "unknown", "Agent is running (status unknown)"
 

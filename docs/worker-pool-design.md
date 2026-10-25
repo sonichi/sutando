@@ -252,6 +252,10 @@ Fixed order: result, then done-flag, then archive. Residue is then unambiguous â
 **result with no flag** means completed, never re-run; **an accepted sentinel with no result** means
 died mid-work, released to the same worker.
 
+Releasing interrupted work is at-least-once execution: a resumed conversation
+can repeat side effects performed before the interruption. A ready answer, live
+or archived, prevents release; completion of an earlier side effect alone does not.
+
 `finish` is the single completion path and refuses unless the caller holds the
 the acceptance, the first body line echoes `task: <id>`, and the body is non-empty. A refusal
 writes nothing. The echo exists because a worker holding two acceptances once wrote each
@@ -309,7 +313,19 @@ owes work would read as stuck; a running Claude turn's timer keeps it changing.
 session meets the same network error, rate limit, API error or retry, and loses the
 turn in flight. With the same sustain and stale line, once per episode:
 
-- a gate or a limit escalates, as a gate always has;
+- a gate or a limit escalates, as a gate always has, only while the frame stays
+  unchanged across ticks with clocks, spinners, status glyphs and bare counts ("1
+  monitor still running") normalised away: on a held pane those tick without a turn
+  finishing, and a turn that finishes changes more than a number. Bare digits are
+  normalised out of the frame id, so two successive finished turns whose text differs
+  only by a number ("Delivered item 41", then "Delivered item 42") compare equal in
+  the wait rung. On a real pane turns accumulate, so this only bites a pane that
+  redraws a single line in place, and it fails toward one extra card on a progressing
+  worker, never toward a hidden block. A limit banner the
+  CLI leaves painted after a re-login sits under a session that keeps working: a turn
+  running above it reads as working, and a frame that moves clears the episode. The
+  seat's own input watcher does not page that banner, since it cannot read the
+  worker's queue; a refused limit turn, the limit menu or any dialog still pages there;
 - abnormal text raises a card that quotes the banner line and names the cause. On a
   seat routed through the credential proxy, a retry, API or network cause offers the
   proxy restart (`launchctl kickstart -k gui/$(id -u)/com.sutando.credential-proxy`,
@@ -474,6 +490,19 @@ parses the headers with `local_task_protocol`, never by hand.
 ```
 
 A sentinel is empty, so an assignment carries no roster `version`; the router reports the version of the pass in its status output only.
+
+`create_worker.py` validates an existing roster through
+`pool_roster.validate_current_roster` before previewing or launching a worker.
+Normal and `--dry-run` creation refuse unreadable or malformed rosters and worker
+shapes rejected by that validator, reporting the reason before creating an
+identity, delivery inbox, session, watcher or recovery timer. An absent roster
+remains a valid starting point. This check neither repairs the roster nor adds
+validation beyond the existing validator's policy.
+
+Registration still performs its final checks under the roster lock. If the
+roster becomes invalid after preflight, creation reports the newly created
+worker's id and explains that it will receive nothing until the roster names
+it; the live worker and its records are retained.
 
 The broker's complete `display.worker_labels` map is applied atomically under
 the roster lock. `worker_label_config_version` tracks the last fully applied

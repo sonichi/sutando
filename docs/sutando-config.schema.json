@@ -30,6 +30,28 @@
           "minimum": 1,
           "default": 10,
           "description": "Commits behind origin/<expected_branch> before health-check's live-checkout-branch probe warns that the checkout is stale. Being ON the right branch is only half of being current \u2014 a checkout can sit on main and still run weeks-old code. Deliberately not 1: main moves several times a day, so warning on any delta trains the reader to ignore the probe. Invalid values (non-integer, zero, negative) fall back to 10 rather than crashing the health check or warning on a current checkout. No env-var override."
+        },
+        "dotspace": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "The DotSpaces (agent-native Matrix homeservers AG2 operates) this install may connect to. Omit the block to keep the built-in list (ag2.space, dev.ag2.space, s.space, dev.s.space); see docs/dotspace.md.",
+          "properties": {
+            "instances": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["server"],
+                "properties": {
+                  "server": {"type": "string", "minLength": 1, "description": "The homeserver name (the part of an mxid after the first colon)."},
+                  "gateway_host": {"type": "string", "description": "The sparrow gateway / relay host, e.g. chat.ag2.space."},
+                  "cloud_origin": {"type": "string", "description": "This instance's Sutando Cloud origin, e.g. https://sutando.ag2.space; empty when it has none."},
+                  "link_via": {"type": "string", "description": "matrix.to ?via= server; defaults to server."},
+                  "prefer_ipv4": {"type": "boolean", "default": true}
+                }
+              }
+            }
+          }
         }
       }
     },

@@ -26,7 +26,7 @@ import sys
 import time
 from pathlib import Path
 
-from ... import _dirs
+from ... import _dirs, agent_identity, diagnostics
 from . import cli as _cli, task_fields
 
 TASK, INTERVAL_MIN = "sparrow-keepawake", 15
@@ -209,8 +209,11 @@ def _spawn_sparrow(cfg: dict) -> "tuple[bool, str]":
     exe = _cli._find_console_script(_cli.SPARROW_COMMAND)
     if not exe:
         return False, f"{_cli.SPARROW_COMMAND} not found beside {sys.executable} or on PATH"
-    env = dict(os.environ, AG2_DEVICE_ENV=str(_cli.device_env_path()),
-               REMOTE_HEALTH_COMMAND=health_command(_command(cfg)))
+    mxid = _cli.saved_mxid(cfg.get("AGENT_MXID"))
+    if not mxid:
+        print(_cli.NO_SAVED_MXID, file=sys.stderr)
+    env = agent_identity.launch_environ(os.environ, mxid)
+    env.update(AG2_DEVICE_ENV=str(_cli.device_env_path()), REMOTE_HEALTH_COMMAND=health_command(_command(cfg)))
     for key, var in (("TASK_DIR", "AGENT_CONNECT_TASK_DIR"),
                      ("RESULT_DIR", "AGENT_CONNECT_RESULT_DIR"),
                      ("STATE_DIR", "AGENT_CONNECT_STATE_DIR")):
@@ -236,10 +239,17 @@ def _spawn_sparrow(cfg: dict) -> "tuple[bool, str]":
 
 def restart_listener(cfg: dict) -> "tuple[bool, str]":
     """Through the user service install wrote when there is one, else a detached Sparrow."""
-    if _service_managed():
+    owner = _unit_owner()
+    if owner == UNIT_UNREACHABLE:
+        return False, (f"{_cli.service_path()} is installed but systemctl --user did not answer; "
+                       "no detached Sparrow is started beside that service")
+    if owner == "ours":
         # A unit left failed by its start limit stays down until reset.
-        _cli._systemd_run(["systemctl", "--user", "reset-failed", _cli.SERVICE_NAME])
-        r = _cli._systemd_run(["systemctl", "--user", "restart", _cli.SERVICE_NAME])
+        if _cli._unit_props() is None:
+            return False, (f"systemctl --user show {_cli.SERVICE_NAME} did not give a well-formed state; "
+                           "it was neither reset nor restarted")
+        _cli._systemctl(("--user", "reset-failed", "ag2-sparrow.service"))
+        r = _cli._systemctl(("--user", "restart", "ag2-sparrow.service"))
         if _cli._ok(r):
             return True, f"systemctl --user restart {_cli.SERVICE_NAME}"
         return False, f"systemctl --user restart {_cli.SERVICE_NAME} failed ({_cli._why(r)})"
@@ -284,7 +294,7 @@ def _stop(pid: int) -> bool:
     except ProcessLookupError:
         return True
     except OSError as e:
-        print(f"error: cannot stop Sparrow (pid {pid}): {e}", file=sys.stderr)
+        print(f"error: cannot stop Sparrow (pid {pid}): {diagnostics.describe(e)}", file=sys.stderr)
         return False
     deadline = time.monotonic() + STOP_WAIT_S
     while time.monotonic() < deadline:
@@ -327,21 +337,22 @@ def replace_sparrow(cfg: dict, pid: int) -> "tuple[bool, str]":
                 f"{how}; the old Sparrow (pid {pid}) was stopped, so none is running now")
 
 
+UNIT_UNREACHABLE = "unreachable"
+
+
 def _unit_owner() -> "str | None":
-    """"ours" for the unit install wrote, "other" for a hand-made one, None for no unit
-    (or no systemd to run it)."""
+    """"ours" for the unit install wrote, "other" for a hand-made one, None for no unit (or no
+    systemctl), UNIT_UNREACHABLE for a unit whose user manager did not answer: not "no unit"."""
     unit = _cli.service_path()
-    if not unit.is_file() or not _cli.systemd_user_available():
+    if not unit.is_file() or _cli._systemctl((), locate=True) is None:
         return None
+    if not _cli.systemd_user_available():
+        return UNIT_UNREACHABLE
     text = unit.read_text(encoding="utf-8", errors="replace")
     return "ours" if text.startswith(_cli.SERVICE_MARKER) else "other"
 
 
-def _service_managed() -> bool:
-    return _unit_owner() == "ours"
-
-
-def _wall_from_monotonic_us(value: "str | None") -> "float | None":
+def _wall_from_monotonic_us(value: "int | str | None") -> "float | None":
     """A systemd *TimestampMonotonic property as wall-clock seconds; None when unset."""
     try:
         us = int(value or 0)
@@ -355,6 +366,25 @@ def _left_running(pid: int) -> None:
           "cannot be read as Sparrow's, so it was left running as it is")
 
 
+def _unit_state_unknown(cfg: dict, holder: "int | None", why: str) -> int:
+    """Install stops and starts nothing while the unit's state is unknown; 0 only when the lock
+    holder is proven to run Sparrow's command line, else 1 saying why."""
+    head = (f"{_cli.service_path()} is installed but {why}, so whether that service runs Sparrow is "
+            "unknown; install neither stops nor starts a Sparrow")
+    if holder is not None and is_sparrow_pid(holder):
+        print(f"NOTE sparrow: {head}. Sparrow (pid {holder}) was left as it is; run "
+              "ag2-sparrow-hatch verify once the user manager answers")
+        return 0
+    if holder is not None:
+        _left_running(holder)
+        print(f"error: Sparrow is not proven running: {head}, and pid {holder} holds Sparrow's lock but "
+              "is not proven to be Sparrow", file=sys.stderr)
+        return 1
+    print(f"error: Sparrow is not running: {head}. Start your user manager (systemctl --user) and "
+          f"run install again, or remove {_cli.service_path()} if it is left over", file=sys.stderr)
+    return 1
+
+
 def ensure_sparrow(cfg: dict, health: bool) -> int:
     """Leave a Sparrow running and connected: start one if none runs, replace one outside
     the installed service, or (with `health`) one that lacks REMOTE_HEALTH_COMMAND."""
@@ -362,14 +392,19 @@ def ensure_sparrow(cfg: dict, health: bool) -> int:
     started = time.time()
     holder = _cli.live_lock_holder(_cli._lock_record(state, instance))
     owner = _unit_owner()
+    if owner == UNIT_UNREACHABLE:
+        return _unit_state_unknown(cfg, holder, "systemctl --user did not answer")
     if owner == "other":
         print(f"NOTE sparrow: {_cli.service_path()} was not written by install, so install "
               "neither starts nor replaces the Sparrow it runs; run ag2-sparrow-hatch verify")
         return 0
     start, stopped, since = False, None, None
     if owner == "ours":
-        props = _cli._unit_props("ActiveState", "MainPID", "ExecMainStartTimestampMonotonic")
-        active = props.get("ActiveState") in ("active", "reloading")
+        props = _cli._unit_props()
+        if props is None:
+            return _unit_state_unknown(cfg, holder, f"systemctl --user show {_cli.SERVICE_NAME} did not "
+                                       "give a well-formed state")
+        active = props["ActiveState"] in ("active", "reloading")
         if active:
             # install_service may have just restarted the unit: only its new process counts.
             since = _wall_from_monotonic_us(props.get("ExecMainStartTimestampMonotonic")) \
@@ -382,7 +417,7 @@ def ensure_sparrow(cfg: dict, health: bool) -> int:
                       "line REMOTE_TASK_TOKEN=<token>, chmod 600 it, then run: systemctl --user "
                       f"start {_cli.SERVICE_NAME}", file=sys.stderr)
                 return 1
-            if holder is not None and str(holder) != props.get("MainPID"):
+            if holder is not None and holder != props["MainPID"]:
                 if not is_sparrow_pid(holder):
                     _left_running(holder)
                     print(f"error: {_cli.SERVICE_NAME} was not started while pid {holder} holds "
@@ -458,6 +493,7 @@ def keepawake(cfg: dict, log: Path, now: float | None = None) -> int:
             else:
                 print(f"the replace failed: {how}", file=sys.stderr)
                 rc = 1
+    _refresh_setup(cfg)
     line = f"{_utc(now)} keepawake listener={'up' if up else 'down'} restarted={restarted}" \
         + (f" reason={reason}" if reason else "")
     log.parent.mkdir(parents=True, exist_ok=True)
@@ -465,6 +501,15 @@ def keepawake(cfg: dict, log: Path, now: float | None = None) -> int:
         fh.write(line + "\n")
     print(line)
     return rc
+
+
+def _refresh_setup(cfg: dict) -> None:
+    """Refresh the served setup cache; never fails the run."""
+    from . import runtime_text
+    try:
+        runtime_text.refresh_cache(_state_dir(cfg), _instance(cfg))
+    except Exception as e:  # noqa: BLE001 - keepawake's own job must still be logged
+        print(f"NOTE served setup: {diagnostics.describe(e)}", file=sys.stderr)
 
 
 def last_keepawake(log: Path) -> float | None:
@@ -522,24 +567,29 @@ def oldest_open_task(cfg: dict) -> "float | None":
 def health_row(cfg: dict, log: Path, now: float | None = None) -> dict | None:
     """The core row for Sparrow's heartbeat; None while no keepawake task is installed.
     `alive` also counts the hook's activity marker."""
+    from . import runtime_text
     now = time.time() if now is None else now
     tasks = _found(cron_dir(cfg), TASK)
     if not tasks:
         return None
+    tune = runtime_text.tunables(runtime_text.current_cache(_state_dir(cfg), _instance(cfg)))
+    # The installed task runs every INTERVAL_MIN, so a shorter served interval cannot tighten it.
+    stale_s = 2 * max(tune["keepawake_interval_s"], INTERVAL_MIN * 60)
+    hook_stale_s = tune["hook_silent_age_s"]
     ran = last_keepawake(log)
     # Install leaves an unchanged task's mtime alone, so a task that never ran ages from it.
     last = ran if ran is not None else max(
         (m for m in map(_mtime, tasks) if m is not None), default=now)
-    fresh = _within(now, last)
+    fresh = _within(now, last, stale_s)
     alive = True if (fresh and ran is not None) or _within(now, _mtime(_activity_file(cfg))) \
         else None
-    problems = [] if fresh else [(NOT_RUNNING, last + STALE_S)]
+    problems = [] if fresh else [(NOT_RUNNING, last + stale_s)]
     hook = hook_last_run(cfg)
-    if hook is not None and not _within(now, hook, HOOK_STALE_S):
-        problems.append((HOOK_NOT_RUNNING, hook + HOOK_STALE_S))
+    if hook is not None and not _within(now, hook, hook_stale_s):
+        problems.append((HOOK_NOT_RUNNING, hook + hook_stale_s))
     oldest = oldest_open_task(cfg)
-    if oldest is not None and now - oldest > TASK_PICKUP_S:
-        problems.append((TASK_NOT_PICKED_UP, oldest + TASK_PICKUP_S))
+    if oldest is not None and now - oldest > tune["stuck_task_age_s"]:
+        problems.append((TASK_NOT_PICKED_UP, oldest + tune["stuck_task_age_s"]))
     # Fresh but never run: no evidence either way yet.
     condition = "abnormal" if problems else "healthy" if ran is not None else "unknown"
     reason, since = problems[0] if problems else (None, None)
@@ -567,7 +617,7 @@ def report(log: Path, gap_minutes: float = GAP_MINUTES) -> int:
     try:
         lines = log.read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError as e:
-        print(f"error: cannot read {log}: {e}", file=sys.stderr)
+        print(f"error: cannot read {log}: {diagnostics.describe(e)}", file=sys.stderr)
         return 1
     rows, unreadable = [], 0
     for line in lines:
@@ -606,6 +656,7 @@ def report(log: Path, gap_minutes: float = GAP_MINUTES) -> int:
 
 
 def main(args) -> int:
+    _cli._register_device_secrets()  # the cache's revision rule withholds this host's secrets
     cfg = _cli._installed_config()
     log = log_path(cfg, args.log)
     if args.action == "keepawake":

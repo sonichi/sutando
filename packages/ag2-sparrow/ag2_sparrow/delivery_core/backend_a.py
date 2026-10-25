@@ -35,6 +35,7 @@ class DesignAClaimBackend:
     (declared) as the administrative-destruction mechanism."""
 
     persists_receipt_metadata = True   # record_delivered() stores both
+    persists_provider_ref = True       # ...and the provider's reference (an event id)
     records_source_digest = True       # publish(source_ready_sha256=) persists the source
 
     capabilities = BackendCapabilities(supports_force_release=True)
@@ -111,7 +112,9 @@ class DesignAClaimBackend:
             elif rec is not None and not outbox.may_reclaim_delivery(
                     self.root, item_id, self.reclaim_ttl_s):
                 return None
-            if self.retry_schedule is not None and not outbox.retry_ready_locked(
+            # A recorded receipt or an interrupted send is settled first, never spent as a retry.
+            unsettled = outbox.dispatch_unsettled(outbox._read_item(self.root, item_id))
+            if self.retry_schedule is not None and not unsettled and not outbox.retry_ready_locked(
                     self.root, item_id, self.retry_schedule, self.clock()):
                 if recovered_torn:
                     outbox._release_locked(self.root, item_id, worker)
@@ -145,7 +148,8 @@ class DesignAClaimBackend:
                  park_at_attempts: Optional[int] = None,
                  provider: Optional[str] = None,
                  destination: Optional[str] = None,
-                 terminal_reason: Optional[str] = None) -> bool:
+                 terminal_reason: Optional[str] = None,
+                 provider_ref: Optional[str] = None) -> bool:
         item_id = token.item_id
         # Validate -> transition -> retire, all under the item lock: a stale
         # incarnation must not mutate or park its successor's item.
@@ -155,9 +159,10 @@ class DesignAClaimBackend:
                     self._incarnation_of(item_id) != token.incarnation:
                 return False
             if outcome is DeliveryOutcome.CONFIRMED:
-                outbox.record_delivered(self.root, item_id,
-                                        provider=provider, destination=destination)
-            elif outcome is DeliveryOutcome.OUTCOME_UNKNOWN:
+                outbox.record_delivered(self.root, item_id, provider=provider,
+                                        destination=destination, provider_ref=provider_ref)
+                return outbox._release_locked(self.root, item_id, token.worker)
+            if outcome is DeliveryOutcome.OUTCOME_UNKNOWN:
                 outbox.park_item(self.root, item_id, "outcome-unknown")
             elif terminal_reason and (self.replace_refused is None
                                       or not self._replace_refused_locked(item_id)):
@@ -171,7 +176,33 @@ class DesignAClaimBackend:
                     attempts = outbox.note_attempt(self.root, item_id)
                     if park_at_attempts is not None and attempts >= park_at_attempts:
                         outbox.park_item(self.root, item_id, "max-attempts")
+            # After the transition: a crash before it keeps the mark, which parks rather than resends.
+            outbox.clear_dispatching(self.root, item_id)
             return outbox._release_locked(self.root, item_id, token.worker)
+
+    def park_unclaimed(self, item_id: str, reason: str, on_release=None) -> bool:
+        """Park a live item no claimant holds; refused (False) once it settled or is claimed."""
+        return outbox.park_unclaimed(self.root, item_id, reason, self.reclaim_ttl_s, on_release)
+
+    def mark_dispatching(self, token: ClaimToken) -> bool:
+        """Record that this incarnation is about to send; False (and nothing written) when
+        the token no longer owns the claim."""
+        with outbox._item_lock(self.root, token.item_id):
+            if self._incarnation_of(token.item_id) != token.incarnation:
+                return False
+            outbox.record_dispatching(self.root, token.item_id, token.incarnation)
+            return True
+
+    def prior_dispatch(self, token: ClaimToken) -> "tuple[Optional[str], bool]":
+        """(receipt, interrupted) an earlier incarnation left on the claimed item: the
+        provider reference it recorded after a send landed, and whether it began a send
+        that has no outcome."""
+        with outbox._item_lock(self.root, token.item_id):
+            d = outbox._read_item(self.root, token.item_id)
+        ref = d.get("provider_ref")
+        mark = d.get("dispatching")
+        interrupted = isinstance(mark, dict) and mark.get("incarnation") != token.incarnation
+        return (ref if isinstance(ref, str) and ref else None), interrupted
 
     def _replace_refused_locked(self, item_id: str) -> bool:
         """Under the item lock and the claim: the replacement becomes the stored payload, once.

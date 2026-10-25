@@ -80,17 +80,17 @@ SPARROW = (REPO / "packages" / "ag2-sparrow" / "ag2_sparrow"
 
 
 class TestSparrowDelegation(unittest.TestCase):
-    """The gateway bridge's failure resolver is a binder, not a third copy."""
+    """The gateway bridge's proactive send keeps no retry of its own: the outbox decides."""
 
     def test_sparrow_delegates_the_transition(self):
-        self.assertIn("resolve_failed_send", SPARROW)
-        body = SPARROW.split("def _resolve_send_failure", 1)[1]
+        self.assertNotIn("def _resolve_send_failure", SPARROW)
+        body = SPARROW.split("def _send_proactive", 1)[1]
         body = body.split("\ndef ", 1)[0]
-        # The binder passes its pid-scoped body and park dir; it must not carry
-        # its own requeue or park move — that is how a third copy starts.
-        self.assertIn("resolve_failed_send(", body)
-        self.assertNotIn("os.link", body)
-        self.assertNotIn(".rename(", body)
+        # The outbox owns the claim, the retry and the outcome; the drain moves the file
+        # as the outcome says and keeps no attempt count, which is how a third copy starts.
+        self.assertIn("core.deliver_one(", body)
+        self.assertNotIn("MAX_TRANSIENT_ATTEMPTS", body)
+        self.assertNotIn("resolve_failed_send", body)
         self.assertNotIn("should_retry", body)
 
     def test_sparrow_parks_to_the_repo_wide_quarantine(self):

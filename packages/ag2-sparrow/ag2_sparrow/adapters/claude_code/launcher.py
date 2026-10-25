@@ -574,29 +574,5 @@ class Launcher:
             rec = self.record()
 
 
-def launchd_exit(rc: int) -> int:
-    """The entry shim's table: logical 75 is terminal (exit 0, launchd stops respawning); every other
-    return, and any signal death, is non-zero so launchd respawns after the throttle."""
-    if rc == cm.EXIT_HELD:
-        return 0
-    if rc <= 0:
-        return 1
-    return rc
-
-
-def run_launchd(child_argv: list, popen=subprocess.Popen) -> int:
-    """`run --launchd`: the launcher as a child, the stop signals forwarded, its outcome mapped."""
-    child = popen(child_argv)
-    forwarded = []
-
-    def forward(signum, frame):
-        if child.poll() is None:
-            child.send_signal(signum)
-            forwarded.append(signum)
-    previous = {sig: signal.signal(sig, forward) for sig in (signal.SIGTERM, signal.SIGINT)}
-    try:
-        rc = child.wait()
-    finally:
-        for sig, handler in previous.items():
-            signal.signal(sig, handler)
-    return launchd_exit(rc)
+# The launchd entry shim and its exit table are connect_common's, shared with every shape.
+launchd_exit, run_launchd = cm.launchd_exit, cm.run_launchd

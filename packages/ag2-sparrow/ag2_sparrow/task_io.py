@@ -111,6 +111,15 @@ def record_done(path, task_id):
     write_atomic(path, "\n".join(ids[-DONE_KEEP:]) + "\n")
 
 
+def user_home():
+    """The effective uid's passwd home as holder_lock resolves it (never the environment); None
+    when there is none."""
+    try:
+        return holder_lock._home()
+    except holder_lock.LockError:
+        return None
+
+
 def pid_alive(pid):
     try:
         os.kill(pid, 0)

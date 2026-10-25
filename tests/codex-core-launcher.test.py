@@ -14,6 +14,7 @@ import pty
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _helpers.process_group import popen_bound  # noqa: E402
+from _helpers.old_python import pre_311_python  # noqa: E402
 
 REAL_REPO = Path(os.environ.get(
     "SUTANDO_TEST_REPO", Path(__file__).resolve().parents[1]
@@ -63,6 +64,14 @@ def _read_when_nonempty(path, deadline):
 SESSION_UP_AFTER_CREATE_TMUX = '''#!/bin/bash
 printf '%s\n' "$*" >> "$TMUX_LOG"
 [ "${1:-}" = -S ] && shift 2
+if [ "${1:-}" = display-message ] && [ "${!#}" = '#{session_created}' ]; then
+  echo 123
+  exit 0
+fi
+if [ "${1:-}" = list-panes ]; then
+  echo "${FAKE_CORE_PANE_PID:-}"
+  exit 0
+fi
 [ "${1:-}" = new-session ] && : > "$TMUX_STATE.created"
 if [ "${1:-}" = has-session ]; then
   [ -e "$TMUX_STATE.created" ] && exit 0
@@ -75,6 +84,10 @@ exit 0
 SESSION_UP_THIRD_POLL_TMUX = '''#!/bin/bash
 printf '%s\n' "$*" >> "$TMUX_LOG"
 [ "${1:-}" = -S ] && shift 2
+if [ "${1:-}" = display-message ] && [ "${!#}" = '#{session_created}' ]; then
+  echo 123
+  exit 0
+fi
 [ "${1:-}" = new-session ] && : > "$TMUX_STATE.created"
 if [ "${1:-}" = has-session ]; then
   [ -e "$TMUX_STATE.created" ] || exit 1
@@ -91,6 +104,8 @@ exit 0
 class CodexCoreLauncherTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
+        self._fake_panes = []
+        self.pane_pid = None
         self.root = Path(self.tmp.name) / "repo"
         self.bin = Path(self.tmp.name) / "bin"
         self.log = Path(self.tmp.name) / "tmux.log"
@@ -104,6 +119,12 @@ class CodexCoreLauncherTests(unittest.TestCase):
             "src/agent/codex/cli/codex-observer.mjs",
             "src/agent/start-cli.sh",
             "src/agent/restart-guard.sh",
+            "src/agent/tmux-socket-guard.sh",
+            "src/agent/core-runtime-record.sh",
+            "src/core_runtime_record.py",
+            "src/codex_project_trust.py",
+            "src/toml_fallback.py",
+            "src/result_publish.py",
             "src/agent/task-event-handler-lookup.sh",
             "src/file_lock.py",
             # cli_wedge imports sutando_platform; without it every classify
@@ -204,7 +225,15 @@ exit 0
         self._write_exe("tmux", '''#!/bin/bash
 printf '%s\\n' "$*" >> "$TMUX_LOG"
 [ "${1:-}" = -S ] && shift 2
+if [ "${1:-}" = display-message ] && [ "${!#}" = '#{session_created}' ]; then
+  echo 123
+  exit 0
+fi
+if [ "${1:-}" = new-session ] && [ "${4:-}" = sutando-core ]; then
+  [ "${TMUX_SESSION_NEVER_UP:-}" = 1 ] || touch "$TMUX_STATE.created"
+fi
 if [ "${1:-}" = has-session ]; then
+  if [ "${3:-}" = =sutando-core ] && [ -f "$TMUX_STATE.created" ]; then exit 0; fi
   if [ -n "${TMUX_ACTIVE_RUNTIME:-}" ] && [ ! -f "$TMUX_STATE" ] && [ "${3:-}" = =sutando-core ]; then exit 0; fi
   if [ "${TMUX_WATCHER_EXISTS:-}" = 1 ] && [ "${3:-}" = =sutando-core-watcher ]; then exit 0; fi
   exit 1
@@ -244,6 +273,9 @@ exit 0
         return text if text is not None else ""
 
     def tearDown(self):
+        for proc in getattr(self, "_fake_panes", ()):
+            proc.kill()
+            proc.wait()
         # A backgrounded heartbeat stub may still be writing its pid/log: wait for it, then clean up.
         pid_file = Path(self.tmp.name) / "heartbeat.pid"
         deadline = time.monotonic() + 5
@@ -260,6 +292,18 @@ exit 0
 
     # Every fake tmux answers the notifier's window lookup: the core has one window, index 0.
     _CORE_WINDOW = 'for _a in "$@"; do [ "$_a" = list-windows ] && { echo 0; exit 0; }; done\n'
+
+    def fake_core_pane(self, program="codex"):
+        """Run a process whose command line is <program>; fake tmux reports it as the core pane."""
+        pane_dir = Path(self.tmp.name) / "pane"
+        pane_dir.mkdir(exist_ok=True)
+        exe = pane_dir / program
+        if not exe.exists():
+            exe.symlink_to(shutil.which("sleep"))
+        proc = subprocess.Popen([str(exe), "300"])
+        self._fake_panes.append(proc)
+        self.pane_pid = proc.pid
+        return proc.pid
 
     def _write_exe(self, name, body):
         path = self.bin / name
@@ -315,6 +359,9 @@ exit 0
         # A suite run from a core shell must not point the launcher at the live socket or session.
         env.pop("SUTANDO_TMUX_SOCKET", None)
         env.pop("SUTANDO_TMUX_SESSION", None)
+        env.pop("SUTANDO_APP_SUPPORT", None)
+        if self.pane_pid:
+            env["FAKE_CORE_PANE_PID"] = str(self.pane_pid)
         env.update({
             "PATH": f"{self.bin}:/usr/bin:/bin",
             "TMUX_LOG": str(self.log),
@@ -350,6 +397,7 @@ exit 0
         env.pop("SUTANDO_TMUX_SOCKET", None)
         env.pop("SUTANDO_TMUX_SESSION", None)
         env.pop("TMUX", None)   # inherited from a tmux host, it would route to the detached branch
+        env.pop("SUTANDO_APP_SUPPORT", None)
         env.update({
             "PATH": f"{self.bin}:/usr/bin:/bin",
             "TMUX_LOG": str(self.log),
@@ -587,6 +635,8 @@ if [ "${1:-}" = print ]; then [ -f "$LAUNCHCTL_STATE" ]; else exit 0; fi
     def test_a_core_launch_still_writes_its_runtime_record(self):
         """The other polarity: with no instance id the same launch is the core's,
         and the records the worker test proves untouched are written."""
+        self._write_exe("tmux", SESSION_UP_AFTER_CREATE_TMUX)
+        self.fake_core_pane("codex")
         result = self.run_launcher()
         self.assertEqual(result.returncode, 0, result.stderr)
         state = self.root / "workspace" / "state"
@@ -594,6 +644,35 @@ if [ "${1:-}" = print ]; then [ -f "$LAUNCHCTL_STATE" ]; else exit 0; fi
         self.assertEqual(runtime["session"], "sutando-core")
         self.assertEqual(len((state / "session-starts.log").read_text().splitlines()), 1)
         self.assertIn("new-session -d -s sutando-core", self._tmux_calls())
+
+    def _launch_in_a_git_checkout(self, python):
+        subprocess.run(["git", "init", "-q", str(self.root)], check=True)
+        self._write_exe("tmux", SESSION_UP_AFTER_CREATE_TMUX)
+        self.fake_core_pane("codex")
+        return self.run_launcher(env_extra={"SUTANDO_PY": python,
+                                            "SUTANDO_CODEX_WORKING_DIR": str(self.root)})
+
+    @unittest.skipUnless(pre_311_python(), "no Python < 3.11 found (set SUTANDO_TEST_OLD_PYTHON)")
+    def test_trust_is_recorded_by_a_launcher_on_python_older_than_311(self):
+        """3.9/3.10 have no tomllib; the real helper must still record the trust entry."""
+        result = self._launch_in_a_git_checkout(pre_311_python())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Codex project trust recorded", result.stdout)
+        self.assertNotIn("could not record Codex project trust", result.stderr)
+        config = (self.root / "codex-home" / "config.toml").read_text()
+        self.assertIn(f'[projects.{json.dumps(str(self.root.resolve()))}]\ntrust_level = "trusted"', config)
+
+    def test_a_failed_trust_write_warns_and_still_launches(self):
+        """Control for the test above: a helper that cannot run is reported, not silent."""
+        broken = self.bin / "broken-python"
+        broken.write_text("#!/bin/sh\n"
+                          'case "$1" in *codex_project_trust.py) exit 1;; esac\n'
+                          f'exec "{sys.executable}" "$@"\n')
+        broken.chmod(0o755)
+        result = self._launch_in_a_git_checkout(str(broken))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("could not record Codex project trust", result.stderr)
+        self.assertFalse((self.root / "codex-home" / "config.toml").exists())
 
     def test_reconciles_session_crons_before_codex_launch(self):
         workspace = self.root / "workspace"
@@ -2308,8 +2387,9 @@ exit 0
         """When the session never appears the warning names the applied budget: a
         raw 0.9 is one poll and "~0.2s", so raw and effective differ cheaply."""
         sentinel = self._seed_sentinel()
-        result = self.run_launcher(env_extra={"SUTANDO_CORE_SESSION_WAIT_S": "0.9"})
-        self.assertEqual(result.returncode, 0, result.stderr)
+        result = self.run_launcher(env_extra={"SUTANDO_CORE_SESSION_WAIT_S": "0.9",
+                                              "TMUX_SESSION_NEVER_UP": "1"})
+        self.assertNotEqual(result.returncode, 0, result.stderr)
         self.assertIn("did not come up within ~0.2s", result.stderr)
         self.assertNotIn("0.9s", result.stderr)
         self.assertTrue(sentinel.exists(), "a session that never came up must leave the shutdown sentinel in place")
@@ -2334,7 +2414,8 @@ exit 0
         """Control: if the timeout warning printed the raw value again, the
         timeout test would fail on this very output."""
         self._mutate_launcher('within ~${SESSION_UP_LABEL}', 'within ~${SESSION_UP_WAIT_S}s')
-        result = self.run_launcher(env_extra={"SUTANDO_CORE_SESSION_WAIT_S": "0.9"})
+        result = self.run_launcher(env_extra={"SUTANDO_CORE_SESSION_WAIT_S": "0.9",
+                                              "TMUX_SESSION_NEVER_UP": "1"})
         self.assertIn("did not come up within ~0.9s", result.stderr)
         self.assertNotIn("within ~0.2s", result.stderr)
 

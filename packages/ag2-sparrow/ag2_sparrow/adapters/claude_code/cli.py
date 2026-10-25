@@ -26,7 +26,7 @@ import time
 import uuid
 from pathlib import Path
 
-from ... import _dirs, agent_identity, connect_common as cm, task_io
+from ... import _dirs, agent_identity, connect_common as cm, gateway_credential_sources as _sources, task_io
 from ...connect_common import EXIT_CHILD_HELD, EXIT_HELD, EXIT_UNUSABLE, _v  # noqa: F401
 from ... import claude_local_accepter as accepter, claude_local_card as card, claude_local_records as records
 from . import detector, hmac_policy, hold, inbox, launcher, trust
@@ -134,6 +134,11 @@ def vault_key(segment: str) -> str:
     return "AG2_RELAY_TOKEN_" + worker_name(segment).upper().replace("-", "_")
 
 
+def url_vault_key(segment: str) -> str:
+    """Where the owner stores the agent's gateway URL for a token that is a bare secret."""
+    return "AG2_RELAY_URL_" + worker_name(segment).upper().replace("-", "_")
+
+
 def bridge_env(root, agent_id: str, token_file: str = "", state=None) -> dict:
     """What the agent's bridge runs with: exactly this root's tasks/ and results/, its own state beside it
     (`state`: the dir the config records, so the unit, verify and the card store name one dir)."""
@@ -181,8 +186,8 @@ def bridge_fix(cfg: dict) -> str:
     if mode == UNIT:
         return f"see {cm.launcher_log(BRIDGE)}, or run {COMMAND} install again"
     if mode != EXTERNAL:
-        return (f"{mode} reads its workers only at start: restart it after install (src/sparrowd.py) so it "
-                f"runs {bridge_home(root) / DECLARATION}, with the token in the vault under {cfg.get('TOKEN_VAULT_KEY')}")
+        return (f"{mode} runs {bridge_home(root) / DECLARATION} on its next scan of the declarations: start it if it "
+                f"is not running (src/sparrowd.py), with the token in the vault under {cfg.get('TOKEN_VAULT_KEY')}")
     return (f"start the bridge with AGENT_CONNECT_TASK_DIR={root}/tasks AGENT_CONNECT_RESULT_DIR={root}/results "
             f"AGENT_CONNECT_STATE_DIR={bridge_state(cfg)}")
 
@@ -208,20 +213,6 @@ def bridge_problem(cfg: dict, now=None) -> str:
     return ""
 
 
-def owned_declaration(path: Path) -> "tuple[str | None, str]":
-    """(text, '') for this install's declaration or nothing, else (None, why), as for the unit."""
-    text, problem = cm.file_text(path, "declaration")
-    if problem or text is None:
-        return None, problem
-    try:
-        ours = json.loads(text).get("written_by") == f"{COMMAND} install"
-    except (ValueError, AttributeError):
-        ours = False
-    if not ours:
-        return None, f"{path} was not written by install; remove it by hand (rm {path}) if it is yours to remove"
-    return text, ""
-
-
 def wire_bridge(cfg: dict) -> str:
     """After the launcher's install: the agent's bridge pointed at this root, as its own unit or as a
     declaration the host's supervisor runs. '' or why not."""
@@ -230,15 +221,16 @@ def wire_bridge(cfg: dict) -> str:
     bridge_state(cfg).mkdir(parents=True, exist_ok=True)
     if mode != UNIT:
         path = bridge_home(root) / DECLARATION
-        text, problem = owned_declaration(path)
+        name = worker_name(Path(root).name)
+        problem = _sources.write_bridge_declaration(
+            path, written_by=f"{COMMAND} install", host=mode, name=name, module="ag2_sparrow.remote_gateway_bridge",
+            env=env, token_vault_key=cfg["TOKEN_VAULT_KEY"])
         if problem:
             return problem
-        body = {"written_by": f"{COMMAND} install", "schema": 1, "host": mode, "name": worker_name(Path(root).name),
-                "module": "ag2_sparrow.remote_gateway_bridge", "env": env, "token_vault_key": cfg["TOKEN_VAULT_KEY"],
-                "token_env": "REMOTE_TASK_TOKEN"}
-        cm._write(path, json.dumps(body, indent=1, sort_keys=False) + "\n", 0o644)
-        print(f"declared: {path} ({mode} runs it as worker {body['name']} once restarted; the token is read from "
+        print(f"declared: {path} ({mode} runs it as worker {name} on its next scan; the token is read from "
               f"the vault: vault set {cfg['TOKEN_VAULT_KEY']} <the agent's relay token>)")
+        print(f"if that token is a bare secret, not https://<gateway>|<secret>, also: vault set "
+              f"{url_vault_key(Path(root).name)} <the agent's gateway URL>")
         return ""
     sup = cm.supervisor_path(BRIDGE)
     text, problem = cm.owned_text(sup, cm.supervisor_marker(BRIDGE), "supervisor file")
@@ -271,11 +263,10 @@ def unwire_bridge(cfg: dict) -> str:
         return ""
     if mode != UNIT:
         path = bridge_home(root) / DECLARATION
-        text, problem = owned_declaration(path)
+        removed, problem = _sources.remove_bridge_declaration(path, written_by=f"{COMMAND} install")
         if problem:
             return problem
-        if text is not None:
-            path.unlink()
+        if removed:
             print(f"removed: {path}")
         return ""
     sup = cm.supervisor_path(BRIDGE)
@@ -418,10 +409,7 @@ def run(args, popen=subprocess.Popen) -> int:
         print(f"error: {problem}", file=sys.stderr)
         return EXIT_UNUSABLE
     if args.launchd:
-        script = cm.console_script(LOCAL)
-        child = [script, "run"] if script else [sys.executable, "-c", "from ag2_sparrow.adapters.claude_code.cli import main; "
-                                                                         "raise SystemExit(main(['run']))"]
-        return launcher.run_launchd(child, popen)
+        return launcher.run_launchd(cm.run_child_argv(LOCAL, __name__), popen)
     cfg, problem = load_config()
     if problem:
         print(f"error: {problem}", file=sys.stderr)
@@ -447,23 +435,17 @@ def auth_problem(cfg: dict, run_=subprocess.run) -> str:
     return ""
 
 
+LABELS = ("hold", "claude")     # the holder and its consumer, in verify's and install's words
+
+
 def holder_words(root: str, _rec=None) -> str:
     """Who holds the root, as verify and install both say it: hold and, once attached, its claude."""
-    rec, consumer = task_io.lock_holder(root), task_io.holder_consumer(root)
-    return f"hold pid {rec.get('owner_pid')}" + (f", its claude pid {consumer['pid']}" if consumer and consumer.get("live")
-                                                 else ", no live claude attached")
+    return cm.holder_words(root, LABELS)
 
 
 def occupancy_line(root: str) -> str:
-    """The shared tri-state beside the manager's state: held names the lock's holder (hold) and, once
-    attached, the claude whose liveness fences the root; unobserved never reads free."""
-    occ = task_io.occupancy(root)
-    manager = cm.manager_detail(LOCAL)
-    if occ == "held":
-        return f"held by {holder_words(root)} (manager {manager})"
-    if occ == "unobserved":
-        return f"unobserved (the root's holder or consumer cannot be verified; manager {manager})"
-    return cm.occupancy_line(LOCAL, root)
+    """The shared tri-state beside the manager's state, in this shape's nouns."""
+    return cm.occupancy_line(LOCAL, root, LABELS)
 
 
 def trust_line(cfg: dict, root: str) -> str:

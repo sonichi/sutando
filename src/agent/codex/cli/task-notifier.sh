@@ -413,8 +413,14 @@ submit_task() {
         clear_workstream_context
         return 0
       fi
+      # A payload removed with no findable result can never be answered; the queue head drop releases it.
+      if "$NOTIFIER_PY" "$DISPATCH_PY" head-abandoned "$RESULTS_DIR" "$filename" "$(task_payload "$filename")"; then
+        SUBMIT_ABANDONED=1
+        clear_workstream_context
+        return 0
+      fi
       if [ $(( $(date +%s) - started )) -ge "$COMPLETION_TIMEOUT" ]; then
-        echo "task-notifier: timed out waiting for result: $filename" >&2
+        log_notifier "timed out waiting for result: $filename"
         clear_workstream_context
         return 0
       fi
@@ -541,12 +547,25 @@ process_announced_queue() {
       continue
     fi
     wait_for_core_idle || exit 1
+    # Checked after the idle wait so a file archived during that wait is never typed.
+    if "$NOTIFIER_PY" "$DISPATCH_PY" head-abandoned "$RESULTS_DIR" "$filename" "$(task_payload "$filename")"; then
+      # No result was published, so the hold is withdrawn, never finished; a failed write keeps the head.
+      if ! mark_worker_stage "$filename" abandon; then
+        log_notifier "keeping $filename at the queue head: could not withdraw its worker hold; will retry on the next idle cycle"
+        return 0
+      fi
+      log_notifier "dropped $filename from the queue: its task file is gone and no result was found"
+      rm -f "$queue_dir/$filename" "$PAYLOAD_DIR/$filename"
+      continue
+    fi
+    SUBMIT_ABANDONED=0
     submit_task "$filename" 1
     if has_result "$filename"; then
       mark_worker_stage "$filename" done
       rm -f "$queue_dir/$filename" "$PAYLOAD_DIR/$filename"
       continue
     fi
+    [ "$SUBMIT_ABANDONED" = 1 ] && continue
     return 0
   done
 }

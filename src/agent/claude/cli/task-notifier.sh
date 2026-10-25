@@ -825,6 +825,11 @@ submit_task_grown() {
   started="$(date +%s)"
   while ! has_result "$filename"; do
     tmux -S "$TMUX_SOCKET" has-session -t "=$SESSION" 2>/dev/null || return 0
+    # A payload removed with no findable result can never be answered; the queue head drop releases it.
+    if "$NOTIFIER_PY" "$DISPATCH_PY" head-abandoned "$RESULTS_DIR" "$filename" "$(task_payload "$filename")"; then
+      SUBMIT_ABANDONED=1
+      return 0
+    fi
     if [ $(( $(date +%s) - started )) -ge "$COMPLETION_TIMEOUT" ]; then
       log_notifier "timed out waiting for result: $filename"
       return 0
@@ -959,11 +964,20 @@ process_announced_queue() {
       tmux -S "$TMUX_SOCKET" has-session -t "=$SESSION" 2>/dev/null || exit 1
       return 0
     fi
+    # Checked after the healthy wait so a file archived during that wait is never typed.
+    if "$NOTIFIER_PY" "$DISPATCH_PY" head-abandoned "$RESULTS_DIR" "$filename" "$(task_payload "$filename")"; then
+      log_notifier "dropped $filename from the queue: its task file is gone and no result was found"
+      "$NOTIFIER_PY" "$DISPATCH_PY" inflight-clear "$INFLIGHT_DIR" "$filename" || true
+      rm -f "$queue_dir/$filename" "$PAYLOAD_DIR/$filename"
+      continue
+    fi
+    SUBMIT_ABANDONED=0
     submit_task "$filename"
     if has_result "$filename"; then
       rm -f "$queue_dir/$filename" "$PAYLOAD_DIR/$filename"
       continue
     fi
+    [ "$SUBMIT_ABANDONED" = 1 ] && continue
     return 0
   done
 }

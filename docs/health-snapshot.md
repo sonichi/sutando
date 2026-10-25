@@ -193,7 +193,7 @@ value gains `"superseded_by": "observation"`. Two rules:
 
 - A completed model request disproves an earlier claim. When the record has `last_success_at`, a
   `supervisor` or `cli_wedge` opinion is dropped if it is abnormal, its reason is one of
-  `needs-login`, `login`, `quota-limit`, `out-of-credits`, `session-limit`, `api-error`,
+  `needs-login`, `login`, `quota-limit`, `out-of-credits`, `session-limit`, `usage-limit`, `api-error`,
   `network-error`, and its claim time (`since`, else the source's mtime) is older than
   `last_success_at`.
 - A `cli_wedge` `retry-loop` needs a model request in flight, so it is dropped when the record's
@@ -236,7 +236,7 @@ an empty `observation` source.
 | `offline` | beat | no beat for 90 s: the session is gone or its beat writer stopped |
 | `suspended` | `state/pool-suspended` | the app quit took this worker down; condition stays `unknown` and it never alerts |
 | `needs-login` | supervisor, cli_wedge | the CLI is at a sign-in prompt or refused a turn for lack of a login |
-| `login`, `permission`, `selection`, `turn-rejected`, `session-limit`, … | supervisor | a prompt that needs a person (the gate kind) |
+| `login`, `permission`, `selection`, `turn-rejected`, `session-limit`, `usage-limit`, … | supervisor | a prompt that needs a person (the gate kind) |
 | `awaiting-input` | supervisor, cli_wedge | waiting for a person, kind unrecognised |
 | `hung` | supervisor | the session is there but the self-report stopped advancing, and the pane shows neither the idle footer nor a turn in flight that changed since the last poll |
 | `crashed` | supervisor | the supervisor found no session |

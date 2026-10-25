@@ -91,7 +91,6 @@ def lane(identity: str, tmp: Path, posts: list, fail_post: bool = False):
 
 
 def fresh() -> Path:
-    gb._PROACTIVE_ATTEMPTS.clear()   # one retry budget per scenario, like one live process
     tmp = Path(tempfile.mkdtemp(prefix="gw-foreign-hs-"))
     (tmp / "archive").mkdir()
     (tmp / "proactive-1.txt").write_text(BODY, encoding="utf-8")

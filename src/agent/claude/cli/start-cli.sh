@@ -31,6 +31,7 @@ unset _self_dir
 cd "$REPO"
 # Shared with the codex launcher: one owner for the in-session restart policy.
 . "$REPO/src/agent/restart-guard.sh"
+. "$REPO/src/agent/core-runtime-record.sh"
 # Named check before sourcing: an unexplained "No such file or directory" from
 # a bare `.` here reads as a broken launcher, not a fixture/checkout missing
 # this file's own sibling — a real trap for a scratch-repo test fixture.
@@ -506,6 +507,7 @@ ensure_core_monitor() {
 # runs under it. Re-running the script is idempotent: we attach/no-op instead
 # of spawning a second core (→ duplicate task consumers).
 if claude_named_session_running; then
+  record_confirmed_core_runtime claude "$PY"
   apply_claude_tmux_defaults
   ensure_core_monitor   # re-ensure the supervisor monitor on every attach/re-run
   ensure_core_heartbeat
@@ -585,6 +587,7 @@ if claude_named_tmux_session_exists; then
     sleep 0.2
   done
   if claude_named_session_running; then
+    record_confirmed_core_runtime claude "$PY"
     clear_shutdown_sentinel
     CORE_WINDOW="$healed_idx"
     ensure_task_notifier
@@ -677,6 +680,7 @@ if [ -t 1 ]; then
     [ -n "$RESTART_REQUESTED" ] && log_restart_attempt "FAILED: core did not come up within ~5s"
     exit 1
   fi
+  record_confirmed_core_runtime claude "$PY"
   clear_shutdown_sentinel
   [ -n "$RESTART_REQUESTED" ] && log_restart_attempt "success: core live"
   ensure_task_notifier   # the supervisor needs the core session to exist first
@@ -694,6 +698,7 @@ else
   fi
   # Verified live above, so this is the first point at which clearing the
   # intentional-stop gate cannot open intake with nothing serving.
+  record_confirmed_core_runtime claude "$PY"
   clear_shutdown_sentinel
   [ -n "$RESTART_REQUESTED" ] && log_restart_attempt "success: core live"
   ensure_core_monitor   # canonical session now exists — start the supervisor monitor
