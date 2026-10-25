@@ -106,9 +106,11 @@ def main() -> int:
     check(r.settled == [] and ack_claim.state(lane.ws, f"ack:{TID}:initial") == "claimed",
           f"f) no outbox item yet -> still claimed ({r.settled})")
 
-    sleeps = []
+    sleeps, real_sleep = [], mod.time.sleep
 
     def stop(seconds):
+        if seconds != 15.0:
+            return real_sleep(seconds)
         sleeps.append(seconds)
         if len(sleeps) >= 2:
             raise KeyboardInterrupt
