@@ -17,6 +17,9 @@ The third code exists because 1 and "cannot decide" must not share one: an
 unreadable deliveries/ says nothing about who holds a task, and reporting that
 as 1 is indistinguishable from "the core owes a reply" to the caller that
 chains `unanswered-tasks.py && core-status.sh idle`.
+
+`--json` prints the same verdict as one object, with per-task claim lag and the inbox's
+holders, for a caller that must tell "busy" from "not reading its inbox". Exit codes match.
 """
 from __future__ import annotations
 
@@ -102,12 +105,86 @@ def unanswered(workspace: Path, min_age_sec: float, now: float | None = None) ->
     return out
 
 
+_CLAIMED_PHASES = frozenset({"RUNNING", "WAITING", "COMPLETED", "FAILED", "CANCELLED"})
+
+
+def _phase(workspace: Path, task_id: str) -> str | None:
+    """The activity snapshot's phase, or None when there is no readable snapshot."""
+    import json
+    try:
+        d = json.loads((workspace / "state" / "activity" / f"{task_id}.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    phase = d.get("phase") if isinstance(d, dict) else None
+    return phase if isinstance(phase, str) else None
+
+
+def _inbox_view(inbox: Path, holders=None) -> dict:
+    """Who holds the inbox, classified by status_ack_policy.inbox_state so probe and policy agree."""
+    import status_ack_policy
+    if holders is None:
+        import watcher_identity
+        holders = watcher_identity.inbox_holders(str(inbox))
+    observed, pairs, undecided = holders.observed, list(holders.holders), holders.undecided
+    state = status_ack_policy.inbox_state(observed, [role for _, role in pairs], undecided)
+    return {"path": str(inbox), "observed": observed, "undecided": undecided, "state": state,
+            "holders": [{"pid": pid, "role": role} for pid, role in pairs],
+            "standby_only": None if state == "unknown" else state == "standby_only"}
+
+
+def snapshot(workspace: Path, min_age_sec: float, now: float | None = None,
+             inbox: Path | None = None, holders=None) -> dict:
+    """The machine-readable probe: per task, and overall, how long the oldest unclaimed task
+    has waited (from its immutable intake time) and whether only a standby holds the inbox."""
+    import status_ack_policy
+    from local_task_protocol import parse_task_headers_lenient
+    now = time.time() if now is None else now
+    rows = unanswered(workspace, min_age_sec, now=now)
+    flagged = {task_id: reason for task_id, _, reason in rows}
+    tasks, results = workspace / "tasks", workspace / "results"
+    out = []
+    for f in sorted(tasks.glob("task-*.txt")) if tasks.is_dir() else []:
+        mtime = f.stat().st_mtime
+        headers = parse_task_headers_lenient(f.read_text(errors="replace")).headers
+        intake = status_ack_policy.intake_at(f.stem, headers, mtime)
+        phase, holder = _phase(workspace, f.stem), _holder(workspace, f.stem)
+        answered = _unanswered_reason(results, f.stem, tasks) is None
+        claimed = holder is not None or phase in _CLAIMED_PHASES
+        age = None if intake is None else max(0.0, now - intake)
+        out.append({"task_id": f.stem, "intake_at": intake, "age_s": age, "mtime_age_s": now - mtime,
+                    "phase": phase, "holder": holder, "answered": answered, "claimed": claimed,
+                    "unclaimed_age_s": age if not (claimed or answered) else None,
+                    "unanswered": flagged.get(f.stem)})
+    waiting = [t for t in out if t["unclaimed_age_s"] is not None]
+    oldest = max(waiting, key=lambda t: t["unclaimed_age_s"]) if waiting else None
+    view = _inbox_view(inbox or tasks, holders)
+    return {"now": now, "min_age_sec": min_age_sec, "tasks": out, "unanswered_count": len(rows),
+            "oldest_unclaimed_age_s": oldest["unclaimed_age_s"] if oldest else None,
+            "oldest_unclaimed_task": oldest["task_id"] if oldest else None,
+            "inbox": view, "standby_only": view["standby_only"]}
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--workspace", required=True)
     ap.add_argument("--min-age-sec", type=float, default=120.0,
                     help="ignore tasks younger than this (default 120)")
+    ap.add_argument("--json", action="store_true",
+                    help="print one JSON object (per-task and overall claim lag, inbox holders); same exit codes")
+    ap.add_argument("--inbox", default=None, help="with --json: the watched inbox (default <workspace>/tasks)")
     a = ap.parse_args()
+    if a.json:
+        import json
+        try:
+            snap = snapshot(Path(a.workspace), a.min_age_sec, inbox=Path(a.inbox) if a.inbox else None)
+        except ImportError as exc:
+            print(json.dumps({"error": f"cannot import the probe's policy owner ({exc})"}))
+            return 2
+        except OSError as exc:
+            print(json.dumps({"error": f"cannot read deliveries/ ({exc})"}))
+            return 2
+        print(json.dumps(snap, sort_keys=True))
+        return 1 if snap["unanswered_count"] else 0
     try:
         rows = unanswered(Path(a.workspace), a.min_age_sec)
     except OSError as exc:
