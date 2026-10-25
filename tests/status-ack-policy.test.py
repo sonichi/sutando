@@ -109,6 +109,13 @@ check(P.intake_at("task-chat-x", {}) is None, "intake: no stamp at all is None, 
 check(slug_without_anchor_is_unknown(P.intake_at), "intake: a slug id with no timestamp and no first-seen is unknown")
 check(not slug_without_anchor_is_unknown(intake_from_mtime),
       "CONTROL: intake: an mtime fallback would report a rewritten slug task as fresh")
+check(P.intake_at("task-dd3a13e1514613581a", {}) is None and P.intake_at("task-2084056842a242eec2", {}) is None,
+      "intake: a digit run inside a hex id is not an epoch")
+check(P._id_epoch("task-1792000000000") == 1792000000.0 and P._id_epoch("task-chat-1792000000000") == 1792000000.0
+      and P._id_epoch("task-newsradar-1792000000") == 1792000000.0
+      and P._id_epoch("task-1792000000000-abc123def456") == 1792000000.0
+      and P._id_epoch("task-1792000000000.claimed-core-1") == 1792000000.0,
+      "intake: genuine minted epoch ids still parse")
 check(slug_with_first_seen(P.intake_at), "intake: a persisted first-seen anchors a slug id")
 check(P.decide(obs(intake_at=None), T0 + 10_000).action == P.SUPPRESS,
       "intake: an unknown intake suppresses instead of guessing")

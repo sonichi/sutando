@@ -47,7 +47,8 @@ _TERMINAL_PHASES = frozenset({"COMPLETED", "FAILED", "CANCELLED"})
 
 _ROOM_ID = re.compile(r"^![^\s:]+:\S+\Z")
 _EVENT_ID = re.compile(r"^\$\S+\Z")
-_ID_EPOCH = re.compile(r"(?<![0-9])([0-9]{13}|[0-9]{10})(?![0-9])")
+# Minted ids are task-<ms>, task-chat-<ms>, task-<slug>-<ms>; a digit run inside a hex id is not a stamp.
+_ID_EPOCH = re.compile(r"\Atask-(?:[a-z]+-)*([0-9]{13}|[0-9]{10})(?=[-.]|\Z)")
 _EPOCH_MIN, _EPOCH_MAX = 1_500_000_000.0, 4_100_000_000.0
 
 
@@ -76,7 +77,7 @@ def _header_epoch(value: Optional[str]) -> Optional[float]:
 
 
 def _id_epoch(task_id: str) -> Optional[float]:
-    m = _ID_EPOCH.search(task_id or "")
+    m = _ID_EPOCH.match(task_id or "")
     if not m:
         return None
     raw = m.group(1)
