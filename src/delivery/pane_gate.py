@@ -51,6 +51,7 @@ from cli_wedge import (PROVIDER_LIMIT_PATTERNS, FrameAbnormal, capture_pane,  # 
                        state_id)
 from quota_availability import provider_allows_now  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
+from worker_auth_state import signed_in_since  # noqa: E402
 
 REPO = _SRC.parent
 SEND_LINE = REPO / "scripts" / "tmux-send-line.sh"
@@ -94,10 +95,12 @@ TURN_DONE = re.compile(
 TURN_SHORT = re.compile(r"[01]s")
 # A turn the CLI refuses outright is a FINISHED turn: the reason is its `⎿` result and the
 # pane returns to the idle footer, so no gate is on screen. Explicit list, extended by hand.
+LIMIT_REFUSAL = re.compile(
+    r"out of usage credits|/usage-credits|hit your (?:session|usage|weekly) limit", re.I)
 REFUSAL = re.compile(
-    r"out of usage credits|/usage-credits|hit your (?:session|usage|weekly) limit"
+    LIMIT_REFUSAL.pattern
     # A bare "not logged in" is a refusal only as the CLI's own line-start `⎿` row.
-    r"|^⎿?\s*(?:you(?:'re| are) )?not logged in\b", re.I)
+    + r"|^⎿?\s*(?:you(?:'re| are) )?not logged in\b", re.I)
 
 
 def refusal_line(line: str) -> bool:
@@ -117,6 +120,62 @@ CLAUDE_GATE_SIGNATURES: List[Tuple[str, "re.Pattern[str]"]] = [
     ("selection", re.compile(r"(❯\s*\d+\.|\bSelect\b).*", re.S)),
     ("permission", re.compile(r"Do you want to (proceed|allow)|Allow this action|permission to", re.I)),
 ]
+# The gate kinds above that are a usage limit (the wait banner, the limit menu).
+LIMIT_GATES = frozenset({"session-limit", "usage-limit"})
+
+
+def limit_line(line: str) -> bool:
+    """One line of the limit's own words: the wait banner, the menu title or a refusal."""
+    return bool(LIMIT_WAIT.search(line) or LIMIT_REFUSAL.search(line))
+
+
+def limit_standing(pane: Optional[str], runtime: Optional[str] = None, outrun: bool = False) -> bool:
+    """A limit line is on the pane and no turn did work after it. A delivery the limit
+    refuses repaints the pane without ending the episode; only work or no limit text does.
+    `outrun`: the caller judged the banner under the composer stale, so it is not evidence."""
+    if not (pane and pane.strip()):
+        return True  # no evidence either way: the episode stands
+    lines = (strip_limit_banners(pane) if outrun else pane).splitlines()
+    last = max((i for i, ln in enumerate(lines) if limit_line(ln)), default=None)
+    return last is not None and not signed_in_since("\n".join(lines[last + 1:]), runtime)
+
+
+_NUMBERED_ROW = re.compile(r"^\s*(?:❯\s*)?\d+\.\s")
+_CARET_ROW = re.compile(r"^\s*❯\s*\d+\.\s")
+
+
+def _dialog_names_limit(text: str) -> bool:
+    """The live numbered dialog's own text, back to the turn above it, names a limit."""
+    lines = (text or "").splitlines()
+    rows = [i for i, ln in enumerate(lines) if _CARET_ROW.match(ln)] or \
+        [i for i, ln in enumerate(lines) if _NUMBERED_ROW.match(ln)]
+    if not rows:
+        return False
+    start = rows[-1]
+    while start > 0 and _NUMBERED_ROW.match(lines[start - 1]):
+        start -= 1
+    for line in reversed(lines[:start]):
+        core = line.strip()
+        if not core:
+            continue
+        if core[0] in "✻⎿●⏺" or (core.startswith("❯") and core.lstrip("❯").strip()):
+            return False  # the turn above the dialog: its words are not the dialog's
+        if limit_line(core):
+            return True
+    return False
+
+
+def is_usage_limit(kind: Optional[str], text: Optional[str]) -> bool:
+    """`kind` (a gate signature, or turn-rejected) on `text` waits on a usage limit: the
+    wait banner, the limit menu (classified `selection`, its caret row being lowest) or a
+    turn refused for a limit."""
+    if kind in LIMIT_GATES:
+        return True
+    if kind == "turn-rejected":
+        return bool(LIMIT_REFUSAL.search(text or ""))
+    return kind in ("selection", "unknown") and _dialog_names_limit(text or "")
+
+
 # A dialog that holds the input shows how to answer it: a caret on a numbered row or a key hint.
 AWAIT_HINT = re.compile(
     r"Esc to cancel|Enter to confirm|Enter to select|to navigate|Press Enter|Paste code|to accept"
@@ -566,6 +625,23 @@ def limit_is_stale(abn, workspace, socket, session, probe=False, capture=None, b
         return provider_allows_now(ws, socket, session, probe=probe)
     except Exception:  # noqa: BLE001 -- an unreadable record is not permission
         return False
+
+
+def limit_step(pane, baseline, workspace=None, socket=None, session=None, owes_work=True):
+    """(stale, baseline) for this poll's limit banner. The baseline is taken when a banner
+    first shows, and again when its text changes; the newest turn since then decides.
+    A banner holds nothing on a seat that owes no work (`owes_work` False). An unknown
+    queue (None) holds like an owed one: a count that could not be read is not zero.
+    The seat monitor and the pool sweep both judge staleness here."""
+    abn = limit_banner(pane or "")
+    if abn is None:
+        return False, None
+    current = limit_baseline(pane)
+    if baseline is None or baseline.banner != current.banner:
+        baseline = current
+    if owes_work is False:
+        return True, baseline
+    return limit_is_stale(abn, workspace, socket, session, capture=pane, baseline=baseline), baseline
 
 
 def classify_pane(capture: Optional[str], adapter: RuntimeAdapter, workspace=None,

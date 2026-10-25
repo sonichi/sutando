@@ -433,7 +433,7 @@ def apply(workspace, repo, decisions: dict, *, runner=None, spawn=None) -> dict:
             "escalations": sorted(w for w, d in decisions.items() if d == ps.ESCALATE)}
 
 
-def main(argv=None) -> int:
+def main(argv=None, *, runner=None) -> int:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--workspace", required=True)
     p.add_argument("--repo", required=True)
@@ -466,7 +466,7 @@ def main(argv=None) -> int:
         print(json.dumps({"suspended": suspend(a.workspace, a.suspend)}))
         return 0
     with pool_lock(a.workspace):
-        return _sweep(a)
+        return _sweep(a, runner)
 
 
 def _repair_human_cards(workspace, tick) -> None:
@@ -495,7 +495,7 @@ def _repair_human_cards(workspace, tick) -> None:
             tick["decisions"][w] = ps.CARD_HUMAN
 
 
-def _sweep(a) -> int:
+def _sweep(a, runner=None) -> int:
     try:
         resumed = resume(a.workspace, a.repo) if a.resume else None
         held = suspension(a.workspace)
@@ -536,7 +536,8 @@ def _sweep(a) -> int:
                  if o.get("session_alive") is True and w not in tick.get("wedged", [])}
         now_asks = {w: ps.WEDGE_CARDS.get(k) for w, k in tick.get("wedge_kinds", {}).items()}
         acted["cards_closed"] = wc.resolve_cleared(
-            a.workspace, clear, wedges=now_asks, observations=tick["observations"], recovered=recovered)
+            a.workspace, clear, wedges=now_asks, observations=tick["observations"], recovered=recovered,
+            runner=runner)
     print(json.dumps({"decisions": tick["decisions"], "auth_expired": tick["auth_expired"],
                       **acted}, indent=2, sort_keys=True))
     outcomes = list(acted["recoveries"].values()) + list(((resumed or {}).get("restarted") or {}).values())

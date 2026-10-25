@@ -540,25 +540,29 @@ class TestRunCycleAndCli(unittest.TestCase):
         msg = run_cycle(_LOGIN, "", macos=False)
         self.assertIsNotNone(msg)
 
-    def test_run_cycle_dispatches_to_both_surfaces(self):
-        # Verify the dispatch call-sites (macOS + channel) fire without invoking the
-        # real external I/O — the adapters themselves are best-effort side effects.
+    def _dispatch(self, channel_ok):
         calls = []
         orig_m, orig_c = _mod._macos_notify, _mod._channel_notify
-        _mod._macos_notify = lambda m: calls.append(("macos", m))
-        _mod._channel_notify = lambda m, s, c, **kw: calls.append(("chan", s, c, kw))
+        _mod._macos_notify = lambda m: calls.append(("macos", m)) or True
+        _mod._channel_notify = lambda m, s, c, **kw: calls.append(("chan", s, c, kw)) or channel_ok
         try:
             with tempfile.TemporaryDirectory() as td:
                 run_cycle(_LOGIN, os.path.join(td, "s.state"),
                           macos=True, source="discord", channel="123")
         finally:
             _mod._macos_notify, _mod._channel_notify = orig_m, orig_c
-        kinds = [c[0] for c in calls]
-        self.assertIn("macos", kinds)
-        self.assertIn("chan", kinds)
-        tag = next(c for c in calls if c[0] == "chan")[3]["extra"][_mod.ALERT_FIELD]
+        return calls
+
+    def test_a_landed_channel_send_pops_no_macos_notification(self):
+        # The app notifies for the DM message itself; a second pop-up cannot open it.
+        calls = self._dispatch(channel_ok=True)
+        self.assertEqual([c[0] for c in calls], ["chan"])
+        tag = calls[0][3]["extra"][_mod.ALERT_FIELD]
         self.assertEqual(tag["agent"], f"core@{_mod._core_host_label()}")
         self.assertEqual(tag["state"], _LOGIN.get("state"))
+
+    def test_a_failed_channel_send_falls_back_to_macos(self):
+        self.assertEqual([c[0] for c in self._dispatch(channel_ok=False)], ["chan", "macos"])
 
     def test_failed_channel_send_does_not_debounce(self):
         # #2101 review (High): when a channel is selected but its send FAILS, the

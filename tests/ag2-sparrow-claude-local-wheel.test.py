@@ -99,6 +99,8 @@ class InstalledWheel(unittest.TestCase):
             self.skipTest("tmux is not installed")
         self.tmp = Path(tempfile.mkdtemp(prefix="clw", dir="/tmp"))
         self.addCleanup(shutil.rmtree, self.tmp, True)
+        if not (PKG / "build").exists():  # pip wheel leaves build/lib in the source tree
+            self.addCleanup(shutil.rmtree, PKG / "build", True)
 
     def run_ok(self, argv, **kw):
         r = subprocess.run(argv, capture_output=True, text=True, **kw)
