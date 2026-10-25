@@ -105,5 +105,14 @@ class TestCallersDelegate(unittest.TestCase):
         self.assertEqual([p for p in out if p != "src/ag2space_links.py"], [])
 
 
+class TestExplicitVia(unittest.TestCase):
+    def test_an_explicit_via_that_is_not_a_server_name_is_dropped(self):
+        import ag2space_links as links
+        self.assertEqual(links.room_link("!r:ag2.space", via="a&via=evil.example"), "https://matrix.to/#/!r:ag2.space")
+        self.assertEqual(links.room_link("!r:ag2.space", via="evil.example/x"), "https://matrix.to/#/!r:ag2.space")
+        self.assertEqual(links.room_link("!r:ag2.space", via="s.space"), "https://matrix.to/#/!r:ag2.space?via=s.space")
+        self.assertEqual(links.room_link("!r:ag2.space", via="localhost:8448"), "https://matrix.to/#/!r:ag2.space?via=localhost:8448")
+
+
 if __name__ == "__main__":
     unittest.main()

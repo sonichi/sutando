@@ -182,6 +182,30 @@ class TestConfig(unittest.TestCase):
             d = ds.dotspace_for(good, fetch=ds.NO_FETCH, config=NONE)
             self.assertEqual(d.link_via or d.server, via, good)
 
+    def test_port_range_and_ipv6_literal_are_checked(self):
+        for bad in ("!a:ag2.space:65536", "!a:ag2.space:0", "!a:[:::]", "!a:[1.2.3.4]", "!a:[::1]:70000"):
+            ds.reset_cache()
+            self.assertEqual(ds.dotspace_for(bad, fetch=ds.NO_FETCH, config=NONE), ds.DotSpace(server=""), bad)
+        self.assertTrue(ds.is_server_name("[::ffff:1.2.3.4]:8448"))
+        self.assertTrue(ds.is_server_name("ag2.space:65535"))
+        self.assertFalse(ds.is_server_name(""))
+
+    def test_well_known_values_pass_the_same_allowlist_or_the_block_is_refused(self):
+        """A registered operator's block must not smuggle a query, a second host or a userinfo
+        trick into `?via=`, the relay URL, the Cloud origin or the MCP URL."""
+        for field, value in [("link_via", "evil&x=1.new.space"), ("link_via", "a via.new.space"),
+                             ("gateway_url", "https://g&h.new.space"), ("gateway_url", "https://u@chat.new.space"),
+                             ("mcp_url", "https://evil.com\\@m.new.space/mcp"), ("mcp_url", "ftp://mcp.new.space/x"),
+                             ("cloud_origin", "https://u:p@sutando.new.space"), ("cloud_origin", "https://sutando.new.space:0")]:
+            self.assertIsNone(ds.parse_well_known(block(**{field: value}), "new.space"), (field, value))
+        ok = ds.parse_well_known(block(link_via="chat.new.space:8448", gateway_url="https://chat.new.space:8448/relay"), "new.space")
+        self.assertEqual((ok["link_via"], ok["gateway_host"]), ("chat.new.space", "chat.new.space"))
+        # Through the registered path: the refused block fills nothing, the config entry stands.
+        cfg = {"instances": [{"server": "reg.space"}]}
+        ds.reset_cache()
+        d = ds.dotspace_for("chat.reg.space", fetch=Fetcher(block(server="reg.space", link_via="evil&x=1.reg.space")), config=cfg)
+        self.assertEqual((d.source, d.link_via, d.gateway_host), ("config", "reg.space", ""))
+
     def test_an_unregistered_parent_claim_is_refused(self):
         """x.co.uk's well-known may not declare co.uk; the same claim stands once co.uk is registered."""
         claim = block(server="co.uk", gateway_url="https://chat.co.uk", cloud_origin="", mcp_url="")

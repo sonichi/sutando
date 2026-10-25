@@ -60,6 +60,7 @@ built-in default alone.
 from __future__ import annotations
 
 import contextlib
+import ipaddress
 import json
 import os
 import re
@@ -90,7 +91,41 @@ CONFIG_LIST = "instances"
 # A Matrix server name and nothing else (DNS labels or an IPv6 literal, an optional port): what a
 # URL could read as a path, query, fragment, userinfo, scheme, escape or whitespace never matches.
 _SERVER_NAME = re.compile(r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*"
-                          r"|\[[0-9a-f:.]+\])(?::[0-9]{1,5})?")
+                          r"|\[(?P<v6>[0-9a-f:.]+)\])(?::(?P<port>[0-9]{1,5}))?")
+
+
+def is_server_name(name: str) -> bool:
+    """`name` is exactly a Matrix server name: the allowlist above, a port in 1..65535 and, in
+    brackets, an address that parses as IPv6."""
+    m = _SERVER_NAME.fullmatch(name or "")
+    if not m:
+        return False
+    if m.group("port") is not None and not 1 <= int(m.group("port")) <= 65535:
+        return False
+    if m.group("v6") is not None:
+        try:
+            ipaddress.IPv6Address(m.group("v6"))
+        except ValueError:
+            return False
+    return True
+
+
+def _strict_url(value: Any) -> Optional[str]:
+    """An http(s) URL whose host is a server name, with no userinfo and no backslash (parsers
+    disagree on `\\`); "" when absent, None when present and not that."""
+    v = str(value or "").strip()
+    if not v:
+        return ""
+    if "\\" in v or not v.lower().startswith(("http://", "https://")):
+        return None
+    try:
+        parts = urllib.parse.urlsplit(v)
+    except ValueError:
+        return None
+    netloc = parts.netloc.lower()
+    if parts.username is not None or parts.password is not None or not is_server_name(netloc):
+        return None
+    return v
 
 DEFAULT_INSTANCES: Tuple[Dict[str, str], ...] = (
     {"server": "ag2.space", "gateway_host": "chat.ag2.space",
@@ -245,10 +280,15 @@ def parse_well_known(text: Optional[str], fetched_host: str) -> Optional[Dict[st
     server = _host_only(str(block.get("server") or fetched_host))
     if not server or not _may_speak_for(fetched_host, server):
         return None
-    gateway_host = server_of_gateway_url(str(block.get("gateway_url") or ""))
-    cloud_origin = _origin(block.get("cloud_origin"))
-    mcp_url = str(block.get("mcp_url") or "").strip()
-    link_via = _host_only(str(block.get("link_via") or "")) or server
+    # Every value is validated as strictly as a typed name, or the whole block is refused: these
+    # strings reach `?via=`, the relay URL and a Cloud origin on another DotSpace's say-so.
+    gateway_url, cloud_url, mcp_url = (_strict_url(block.get(k)) for k in ("gateway_url", "cloud_origin", "mcp_url"))
+    via_raw = str(block.get("link_via") or "").strip().lower().rstrip(".")
+    if None in (gateway_url, cloud_url, mcp_url) or (via_raw and not is_server_name(via_raw)):
+        return None
+    gateway_host = server_of_gateway_url(gateway_url)
+    cloud_origin = _origin(cloud_url)
+    link_via = _host_only(via_raw) or server
     for host in (gateway_host, link_via, server_of_gateway_url(cloud_origin), server_of_gateway_url(mcp_url)):
         if host and not _under(host, server):
             return None
@@ -374,7 +414,7 @@ def dotspace_for(server_or_host: str, *, fetch: Optional[Fetch] = None,
         raw = server_of_gateway_url(raw)
     name = (server_of_matrix_id(raw) or raw).strip().lower().rstrip(".")
     host = _host_only(name)
-    if not host or not _SERVER_NAME.fullmatch(name):
+    if not host or not is_server_name(name):
         return DotSpace(server="")  # no server: nothing to fetch, nothing to put in a URL
     fetch = default_fetch if fetch is None else fetch
     # The most specific server wins: `chat.dev.s.space` is dev.s.space's gateway, not s.space's.
