@@ -135,32 +135,39 @@ def _inbox_view(inbox: Path, holders=None) -> dict:
 def snapshot(workspace: Path, min_age_sec: float, now: float | None = None,
              inbox: Path | None = None, holders=None) -> dict:
     """The machine-readable probe: per task, and overall, how long the oldest unclaimed task
-    has waited (from its immutable intake time) and whether only a standby holds the inbox."""
+    has waited (from its immutable intake anchor) and whether only a standby holds the inbox."""
     import status_ack_policy
-    from local_task_protocol import parse_task_headers_lenient
+    from local_task_protocol import parse_task_headers_lenient, valid_archive_lookup_id
+    from task_archive import task_id_for
     now = time.time() if now is None else now
-    rows = unanswered(workspace, min_age_sec, now=now)
-    flagged = {task_id: reason for task_id, _, reason in rows}
     tasks, results = workspace / "tasks", workspace / "results"
     out = []
     for f in sorted(tasks.glob("task-*.txt")) if tasks.is_dir() else []:
+        task_id = task_id_for(f, accept=valid_archive_lookup_id)
+        if task_id is None:
+            continue
         mtime = f.stat().st_mtime
         headers = parse_task_headers_lenient(f.read_text(errors="replace")).headers
-        intake = status_ack_policy.intake_at(f.stem, headers, mtime)
-        phase, holder = _phase(workspace, f.stem), _holder(workspace, f.stem)
-        answered = _unanswered_reason(results, f.stem, tasks) is None
+        intake = status_ack_policy.intake_at(task_id, headers)
+        phase, holder = _phase(workspace, task_id), _holder(workspace, task_id)
+        reason = _unanswered_reason(results, task_id, tasks)
         claimed = holder is not None or phase in _CLAIMED_PHASES
         age = None if intake is None else max(0.0, now - intake)
-        out.append({"task_id": f.stem, "intake_at": intake, "age_s": age, "mtime_age_s": now - mtime,
-                    "phase": phase, "holder": holder, "answered": answered, "claimed": claimed,
-                    "unclaimed_age_s": age if not (claimed or answered) else None,
-                    "unanswered": flagged.get(f.stem)})
+        pending = not (claimed or reason is None)
+        flagged = reason if holder is None and now - mtime >= min_age_sec else None
+        out.append({"task_id": task_id, "file": f.name, "intake_at": intake, "intake_known": intake is not None,
+                    "age_s": age, "mtime_age_s": now - mtime, "phase": phase, "holder": holder,
+                    "answered": reason is None, "claimed": claimed,
+                    "unclaimed_age_s": age if pending else None, "unanswered": flagged})
     waiting = [t for t in out if t["unclaimed_age_s"] is not None]
+    unknown = [t["task_id"] for t in out if not t["intake_known"] and not (t["claimed"] or t["answered"])]
     oldest = max(waiting, key=lambda t: t["unclaimed_age_s"]) if waiting else None
     view = _inbox_view(inbox or tasks, holders)
-    return {"now": now, "min_age_sec": min_age_sec, "tasks": out, "unanswered_count": len(rows),
+    return {"now": now, "min_age_sec": min_age_sec, "tasks": out,
+            "unanswered_count": sum(1 for t in out if t["unanswered"]),
             "oldest_unclaimed_age_s": oldest["unclaimed_age_s"] if oldest else None,
             "oldest_unclaimed_task": oldest["task_id"] if oldest else None,
+            "unclaimed_intake_unknown": unknown,
             "inbox": view, "standby_only": view["standby_only"]}
 
 

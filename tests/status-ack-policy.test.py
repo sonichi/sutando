@@ -78,15 +78,27 @@ holds("deadline: one uninterrupted call acks at the deadline", ten_minute_call, 
 
 def intake_never_later(intake_fn):
     tid = "task-1792000000000"
-    first = intake_fn(tid, {}, T0 + 3)
-    later = intake_fn(tid, {}, T0 + 3, T0 + 400)  # a rewrite bumped mtime; first-seen is later still
-    forged = intake_fn(tid, {"timestamp": "2026-12-31T00:00:00Z"}, T0 + 3)
+    first = intake_fn(tid, {})
+    later = intake_fn(tid, {}, T0 + 400)  # a first-seen recorded after intake
+    forged = intake_fn(tid, {"timestamp": "2026-12-31T00:00:00Z"})
     return first == later == forged == T0
 
 
-def intake_latest(tid, headers_, *observed):
-    stamps = [s for s in (P._header_epoch(headers_.get("timestamp")), P._id_epoch(tid), *observed) if s]
+def intake_latest(tid, headers_, first_seen=None):
+    stamps = [s for s in (P._header_epoch(headers_.get("timestamp")), P._id_epoch(tid), first_seen) if s]
     return max(stamps)
+
+
+def intake_from_mtime(tid, headers_, first_seen=None, mtime=T0 + 900):
+    return P.intake_at(tid, headers_, first_seen) or mtime
+
+
+def slug_without_anchor_is_unknown(intake_fn):
+    return intake_fn("task-plain", {}) is None
+
+
+def slug_with_first_seen(intake_fn):
+    return intake_fn("task-plain", {}, T0 + 5) == T0 + 5
 
 
 check(intake_never_later(P.intake_at), "intake: a later read or a later header never moves intake later")
@@ -94,6 +106,10 @@ check(not intake_never_later(intake_latest), "CONTROL: intake: a newest-stamp an
 check(P.intake_at("task-chat-x", {"timestamp": "2026-10-24T10:00:00Z"}) == 1792836000.0,
       "intake: the UTC `timestamp` header is read when the id carries no epoch")
 check(P.intake_at("task-chat-x", {}) is None, "intake: no stamp at all is None, never 'now'")
+check(slug_without_anchor_is_unknown(P.intake_at), "intake: a slug id with no timestamp and no first-seen is unknown")
+check(not slug_without_anchor_is_unknown(intake_from_mtime),
+      "CONTROL: intake: an mtime fallback would report a rewritten slug task as fresh")
+check(slug_with_first_seen(P.intake_at), "intake: a persisted first-seen anchors a slug id")
 check(P.decide(obs(intake_at=None), T0 + 10_000).action == P.SUPPRESS,
       "intake: an unknown intake suppresses instead of guessing")
 
@@ -133,12 +149,12 @@ check(P.decide(obs(), T0 + 1).due_at == T0 + NORMAL, "timers: a WAIT names when 
 # --- Claimed but still running -------------------------------------------------------------------
 def claimed_running_long(decide):
     r = decide(obs(phase="RUNNING", started_at=T0 + 1, last_activity_at=T0 + 900), T0 + 900)
-    return r.action == P.SPEAK and r.template == "claimed"
+    return r.action == P.SPEAK and r.template == "handed_off"
 
 
 def delegated_to_worker(decide):
     r = decide(obs(phase=None, worker_holder="worker-2"), T0 + NORMAL)
-    return r.action == P.SPEAK and r.template == "claimed"
+    return r.action == P.SPEAK and r.template == "handed_off"
 
 
 def claim_means_covered(o, now, deadlines=None):
@@ -147,9 +163,28 @@ def claim_means_covered(o, now, deadlines=None):
     return P.decide(o, now, deadlines)
 
 
-holds("claimed_running_long: claimed, running, unanswered past the deadline acks", claimed_running_long,
+holds("claimed_running_long: handed off, running, unanswered past the deadline acks", claimed_running_long,
       claim_means_covered)
 holds("claimed: a task a worker holds is covered too", delegated_to_worker, claim_means_covered)
+
+def handoff_wording_ignores_activity(decide):
+    # RUNNING is hand-off, not engagement: fresh activity must not change the claim or the deadline.
+    quiet = decide(obs(phase="RUNNING"), T0 + NORMAL)
+    busy = decide(obs(phase="RUNNING", last_activity_at=T0 + NORMAL - 1), T0 + NORMAL)
+    return quiet.text == busy.text and quiet.due_at == busy.due_at == T0 + NORMAL
+
+
+def engagement_wording(o, now, deadlines=None):
+    r = P.decide(o, now, deadlines)
+    if r.action == P.SPEAK and o.last_activity_at:
+        return dataclasses.replace(r, text="Received. This is being worked on.")
+    return r
+
+
+holds("hand-off: the RUNNING line is the same with or without fresh activity", handoff_wording_ignores_activity,
+      engagement_wording)
+check(not any(w in P.TEMPLATES.get("handed_off", "worked on").lower() for w in ("worked on", "working", "progress")) and "handed_off" in P.TEMPLATES,
+      "hand-off: the line never claims the work is under way")
 
 # --- Thread routing: the task's own verified room and thread, never a fallback -------------------
 def in_thread_keeps_root(decide):
@@ -286,7 +321,7 @@ check(not any(ch.isdigit() for t in P.TEMPLATES.values() for ch in t)
 r = P.decide(obs(phase=None, inbox="standby_only"), T0 + NORMAL)
 check(r.watcher_down and r.template == "inbox_down", "watcher down: only a standby holds the inbox -> says so")
 r = P.decide(obs(phase="RUNNING", inbox="standby_only"), T0 + NORMAL)
-check(not r.watcher_down and r.template == "claimed",
+check(not r.watcher_down and r.template == "handed_off",
       "watcher down: a task already claimed is not reported as unread")
 check(P.inbox_state(True, ["standby"]) == "standby_only", "inbox: a tagged standby alone is standby_only")
 check(P.inbox_state(True, ["untagged"]) == "standby_only", "inbox: the untagged external standby counts too")
