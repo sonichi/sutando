@@ -27,6 +27,8 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
 
+from workspace_default import status_read_path
+
 LOCAL_API_TOKEN_NAME = "agent-api.token"
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 # A wildcard bind names no host, so the legitimate Host set cannot be derived
@@ -98,7 +100,7 @@ def local_api_token(workspace: Path, configured: str = "") -> str:
     when set, else the per-install secret under state/, minted once."""
     if configured:
         return configured
-    path = Path(workspace) / "state" / LOCAL_API_TOKEN_NAME
+    path = status_read_path(LOCAL_API_TOKEN_NAME, Path(workspace))
     try:
         value = path.read_text(encoding="utf-8").strip()
         if value:
