@@ -40,6 +40,7 @@ sys.path.insert(0, str(_REPO / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import ack_claim
+import ack_overlap
 import local_record
 import proactive_routing
 import status_ack_policy as policy
@@ -161,27 +162,6 @@ def cancel_pending(ws: Path, tid: str, own_file: str) -> bool:
     return False
 
 
-def card_shown(ws: Path, tid: str) -> bool:
-    """True when the activity bus has projected (or still owes) a row for the task: its card is up.
-    An activity snapshot that exists but cannot be read counts as a card."""
-    path = ws / "state" / "activity" / f"{tid}.json"
-    try:
-        d = json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return False
-    except (OSError, ValueError):
-        return True
-    if not isinstance(d, dict):
-        return True
-    emitted = d.get("emitted")
-    return bool(d.get("pending")) or not isinstance(emitted, int) or emitted > 0 or d.get("phase") not in (None, "RECEIVED")
-
-
-def progress_shown(ws: Path, tid: str) -> bool:
-    """True once task-progress has taken the task's first-notify marker: a progress notice went out."""
-    return ack_claim.state(ws, f"progress:{tid}:first-notify") != "none"
-
-
 def _outage_path(ws: Path) -> Path:
     return ws / "state" / "status-ack" / "watcher-outage.json"
 
@@ -289,7 +269,7 @@ def observe(ws: Path, row: dict, inbox: str, alerted: bool, now: Optional[float]
         worker_holder=row.get("holder"), inbox=inbox,
         cancel_instruction=cancel_target(text) is not None,
         cancel_requested=cancel_pending(ws, tid, own_file), owner_alerted=alerted,
-        card=card_shown(ws, tid), progress_notice=progress_shown(ws, tid)), None
+        card=ack_overlap.card_shown(ws, tid), progress_notice=ack_overlap.progress_shown(ws, tid)), None
 
 
 def routed_body(decision) -> Optional[str]:
@@ -308,10 +288,9 @@ def recheck(ws: Path, tid: str) -> Optional[str]:
     state = result_state(ws, tid)
     if state != "none":
         return f"result state is now {state}"
-    if card_shown(ws, tid):
-        return "an activity card now shows the task"
-    if progress_shown(ws, tid):
-        return "a progress notice went out"
+    overlap = ack_overlap.overlap_veto(ws, tid)
+    if overlap is not None:
+        return overlap
     try:
         veto = dispatch_veto(tid, ws)
     except Exception as exc:  # noqa: BLE001 - an unchecked task is never messaged
@@ -354,7 +333,8 @@ def run_once(ws: Path, cfg: Settings, now: Optional[float] = None, holders=None,
         if decision.action != policy.SPEAK:
             report.skipped[tid] = decision.reason
             continue
-        gen = ack_claim.claim(ws, decision.key, HOLDER, now=now, template=decision.template, pid=os.getpid())
+        name = proactive_routing.about_task_filename(tid, _stamp_ms(now), channel="ag2space")
+        gen = ack_claim.claim(ws, decision.key, HOLDER, now=now, template=decision.template, pid=os.getpid(), via=name)
         if not gen:
             report.skipped[tid] = "another sender holds the initial ack"
             continue
@@ -370,9 +350,7 @@ def run_once(ws: Path, cfg: Settings, now: Optional[float] = None, holders=None,
             ack_claim.release(ws, decision.key, HOLDER, gen=_gen(gen))
             report.withdrawn[tid] = "the verified thread could not be carried"
             continue
-        name = proactive_routing.about_task_filename(tid, _stamp_ms(now), channel="ag2space")
         publish_text(ws / "results" / name, body)
-        ack_claim.update(ws, decision.key, HOLDER, gen=_gen(gen), via=name)
         report.spoken.append(tid)
     return report
 
@@ -390,8 +368,8 @@ def _pid_alive(pid) -> bool:
 
 
 def recover(ws: Path) -> list:
-    """Startup: a claim this runner took but never published, from a process that is gone, may
-    have published anyway; it becomes unknown, never released or re-announced. Others stay."""
+    """Startup: a claim this runner holds that names no published file, from a process that is
+    gone, may have published anyway; it becomes unknown, never released or re-announced."""
     settled = []
     for rec in ack_claim.held_by(ws, HOLDER, "claimed"):
         if rec.get("via") or (rec.get("pid") != os.getpid() and _pid_alive(rec.get("pid"))):

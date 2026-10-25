@@ -132,6 +132,8 @@ def main() -> int:
                 "alert:outage-1000:watcher-down", "alert:outage-2000:watcher-down"):
         ack_claim.claim(ws, key, "status-ack", now=old)
     ack_claim.update(ws, "ack:task-1761300000008:initial", "status-ack", "unknown")
+    import os
+    os.utime(ack_claim.claims_dir(ws) / "ack+task-1761300000008+initial.lock", (old, old))
     ack_claim.claim(ws, "note:task-1761300000008:other", "someone", now=old)
     (ack_claim.claims_dir(ws) / "ack+task-1761300000007+initial.json").write_text("{oops")
     (ack_claim.claims_dir(ws) / "ack+task-1761300000006+initial.json").write_text(
@@ -141,14 +143,15 @@ def main() -> int:
     gone = sorted(mod.prune(ws, now)["claims"])
     left = sorted(p.name for p in ack_claim.claims_dir(ws).iterdir())
     check(gone == ["ack:task-1761300000008:initial", "alert:outage-1000:watcher-down",
-                   "progress:task-1761300000008:first-notify"],
+                   "lock:ack+task-1761300000008+initial", "progress:task-1761300000008:first-notify"],
           f"e) archived task's and ended outage's claims pruned ({gone})")
-    check(not any(("task-1761300000008" in n and not n.startswith("note")) or "outage-1000" in n for n in left)
+    check(not any(n.endswith(".json") and (("task-1761300000008" in n and not n.startswith("note")) or "outage-1000" in n)
+                  for n in left) and "ack+task-1761300000008+initial.lock" not in left
           and ack_claim.state(ws, "ack:task-1761300000009:initial") == "claimed"
           and ack_claim.state(ws, "alert:outage-2000:watcher-down") == "claimed"
           and ack_claim.state(ws, "note:task-1761300000008:other") == "claimed"
           and "ack+task-1761300000007+initial.json" in left and "ack+task-1761300000006+initial.json" in left,
-          f"e) record and lock both go; queued task, current outage, foreign, unreadable and undated stay ({left})")
+          f"e) the records go, and an old orphaned lock; queued task, current outage, foreign, unreadable and undated stay ({left})")
     check(mod.prune(ws, old + 60)["claims"] == [], "e) nothing is pruned before retention")
     return check.exit_code()
 

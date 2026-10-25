@@ -1356,8 +1356,10 @@ def main() -> int:
           "sutando loader wires the ag2space proactive claim gate")
     check(getattr(rtc.PROACTIVE_DISPATCH_GATE, "__name__", "") == "_ag2space_proactive_dispatch_gate"
           and "left the queue" in str(rtc.PROACTIVE_DISPATCH_GATE("task-1761300000000"))
-          and getattr(rtc.PROACTIVE_ROUTE_GATE, "__name__", "") == "_ag2space_proactive_route_gate",
-          "sutando loader wires the dispatch and route gates; a task not in the queue is withdrawn")
+          and getattr(rtc.PROACTIVE_ROUTE_GATE, "__name__", "") == "_ag2space_proactive_route_gate"
+          and getattr(rtc.PROACTIVE_ACK_GATE, "__name__", "") == "_ag2space_proactive_ack_gate"
+          and rtc.PROACTIVE_ACK_GATE("task-1761300000000", "proactive-x~0") is None,
+          "sutando loader wires the dispatch, ack and route gates; a task not in the queue is withdrawn")
     _activity = rtc.WS / "state" / "last-owner-activity.json"
     _activity.parent.mkdir(parents=True, exist_ok=True)
     _activity.write_text(json.dumps(

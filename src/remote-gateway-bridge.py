@@ -359,6 +359,12 @@ def _ag2space_proactive_dispatch_gate(task_id: str):
     return dispatch_veto(task_id, WS)
 
 
+def _ag2space_proactive_ack_gate(task_id: str, item_id: str):
+    """Right before a task's initial ack is sent: why the card or a progress notice now covers it, or None."""
+    from proactive_dispatch_gate import initial_ack_veto
+    return initial_ack_veto(task_id, item_id, WS)
+
+
 def _ag2space_proactive_route_gate(task_id: str, room: str, thread_root):
     """Right before a message about a task is sent: why its room and thread are not the task's own, or None."""
     from proactive_dispatch_gate import route_veto
@@ -371,6 +377,7 @@ PROACTIVE_CLAIM_GATE = _ag2space_proactive_claim_gate
 PROACTIVE_ROOM_GATE = _ag2space_proactive_room_gate
 OWNER_DM_UPGRADED_NOTIFY = _ag2space_owner_dm_upgraded
 PROACTIVE_DISPATCH_GATE = _ag2space_proactive_dispatch_gate
+PROACTIVE_ACK_GATE = _ag2space_proactive_ack_gate
 PROACTIVE_ROUTE_GATE = _ag2space_proactive_route_gate
 
 if _RUN_MAIN:  # pragma: no cover — script-entry tail; the subprocess suite drives it

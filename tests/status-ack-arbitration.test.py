@@ -190,7 +190,7 @@ def main() -> int:
         both6 = len(lane6.posts) + len(NOTIFY_POSTS)
     finally:
         notify._ACK_ARBITRATION = saved_arb
-    check(both6 == 2, f"CONTROL: a notify keyed by the file stem speaks after the runner ({both6} POSTs)")
+    check(both6 == 1, f"a claimed task: the runner stays silent, so even a stem-keyed notify is the one line ({both6} POSTs)")
 
     saved, notify._ACK_ARBITRATION = notify._ACK_ARBITRATION, None
     try:

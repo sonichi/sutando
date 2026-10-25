@@ -2,11 +2,12 @@
 """The status ack carries the verified room and thread root to the provider, even when the task
 exists only as a renamed live file the gateway's archive lookup cannot find.
 
-  a) only task-<ms>.claimed-core-2.txt present, top-level ask -> POST rooted at its message
-  b) only task-<ms>.claimed-core-2.txt present, in-thread ask -> POST keeps the thread root
+  a) only task-<ms>.claimed-core-2.txt present (a session picked it up) -> no ack, no POST
+  b) only task-<ms>.claimed-core-2.txt present, in-thread ask -> the same
   c) only an .assigned-<inst> file present -> the same
   d) an unrecoverable thread (markers do not round-trip) publishes nothing and releases the claim
-  e) a published file edited after publication (thread or room) -> zero POSTs; untouched -> one
+  e) a published file edited after publication: an edited room -> zero POSTs; an edited thread or none ->
+     one POST, always to the verified room and thread
   f) a stale reconcile snapshot never releases or settles a successor claim of the same holder
   CONTROL: with a plain [channel:]-only body the gateway cannot recover the thread for such a file
 
@@ -44,18 +45,14 @@ def renamed_only(lane, suffix, **kw):
 
 def main() -> int:
     for suffix, label in ((".claimed-core-2", "claimed"), (".assigned-worker1", "assigned")):
-        for root, want, shape in ((None, sa.MSG_EVT, "top-level"), (sa.ROOT_EVT, sa.ROOT_EVT, "in-thread")):
+        for root, _want, shape in ((None, sa.MSG_EVT, "top-level"), (sa.ROOT_EVT, sa.ROOT_EVT, "in-thread")):
             lane = pl.Lane(gb, ISO)
             renamed_only(lane, suffix, thread_root=root)
             check(not (lane.tasks / f"{TID}.txt").exists(), f"a) only the {label} file exists")
             r = mod.run_once(lane.ws, sa.on(mod), now=NOW, holders=sa.SESSION)
             lane.drain()
-            check(r.spoken == [TID], f"a) {label} {shape}: the ack is published ({r.spoken}, {r.skipped})")
-            check(len(lane.posts) == 1 and lane.posts[0].get("thread_root") == want
-                  and lane.posts[0]["room_id"] == sa.ROOM,
-                  f"a) {label} {shape}: the POST carries thread_root {want} in the task room ({lane.posts})")
-            check("[thread" not in lane.posts[0]["body"] and "[channel" not in lane.posts[0]["body"],
-                  "a) the markers are stripped from the posted body")
+            check(r.spoken == [] and lane.posts == [] and "picked" in str(r.withdrawn.get(TID, "")),
+                  f"a) {label} {shape}: picked up, so no ack ({r.spoken}, {r.withdrawn}, {lane.posts})")
 
     ctl = pl.Lane(gb, ISO)
     renamed_only(ctl, ".claimed-core-2", thread_root=sa.ROOT_EVT)
@@ -65,7 +62,7 @@ def main() -> int:
           f"CONTROL: without the thread marker the same file is posted unthreaded ({ctl.posts})")
 
     lane = pl.Lane(gb, ISO)
-    renamed_only(lane, ".claimed-core-2", thread_root=sa.ROOT_EVT)
+    sa.task(lane.ws, TID, thread_root=sa.ROOT_EVT)
     real = mod.parse_markers
     mod.parse_markers = lambda body, **k: real("[channel: " + sa.ROOM + "]\n" + "text\n", **k)
     try:
@@ -85,17 +82,19 @@ def main() -> int:
                        ("the room", lambda t: t.replace(sa.ROOM, "!OtherRoomXyZ:ag2.space")),
                        ("nothing (control)", lambda t: t)):
         lane = pl.Lane(gb, ISO)
-        renamed_only(lane, ".claimed-core-2")
+        sa.task(lane.ws, TID)
         r = mod.run_once(lane.ws, sa.on(mod), now=NOW, holders=sa.SESSION)
         (pub,) = sorted(lane.results.glob("proactive-*.txt"))
         pub.write_text(edit(pub.read_text(encoding="utf-8")), encoding="utf-8")
         lane.drain(**gated(lane))
-        want = 1 if what.startswith("nothing") else 0
-        check(r.spoken == [TID] and len(lane.posts) == want,
-              f"e) after publication edits {what}: {len(lane.posts)} POST(s), want {want} ({lane.logs[-1:]})")
+        want = 0 if what == "the room" else 1
+        check(r.spoken == [TID] and len(lane.posts) == want
+              and all(p.get("thread_root") == sa.MSG_EVT and p["room_id"] == sa.ROOM for p in lane.posts),
+              f"e) after publication edits {what}: {len(lane.posts)} POST(s), only to the verified room and "
+              f"thread ({lane.posts}, {lane.logs[-1:]})")
 
     lane = pl.Lane(gb, ISO)
-    renamed_only(lane, ".claimed-core-2")
+    sa.task(lane.ws, TID)
     mod.run_once(lane.ws, sa.on(mod), now=NOW, holders=sa.SESSION)
     stale = ack_claim.held_by(lane.ws, mod.HOLDER, "claimed")
     ack_claim.release(lane.ws, f"ack:{TID}:initial", mod.HOLDER, gen=stale[0]["gen"])

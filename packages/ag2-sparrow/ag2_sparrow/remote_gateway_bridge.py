@@ -1871,6 +1871,8 @@ OWNER_DM_UPGRADED_NOTIFY: Callable[[str, str], None] | None = None
 # Host-injected task_id -> veto reason or None, asked right before a message about that task
 # is sent; None (standalone default) checks only the task's own result.
 PROACTIVE_DISPATCH_GATE: Callable[[str], "str | None"] | None = None
+# Host-injected (task_id, item_id) -> veto reason or None, asked for the same message with its item id.
+PROACTIVE_ACK_GATE: Callable[[str, str], "str | None"] | None = None
 PROACTIVE_ROUTE_GATE: Callable[[str, str, "str | None"], "str | None"] | None = None
 # Routing state belongs to the gateway (owner 2026-09-07): the agent row's owner_dm_room is read at
 # connect and on a slow cadence and kept while offline; the pinned room is bootstrap, never authority.
@@ -5701,6 +5703,8 @@ def _proactive_dispatch_veto(item_id: str, payload: bytes) -> "str | None":
         return "the task has been answered"
     try:
         veto = PROACTIVE_DISPATCH_GATE(tid) if PROACTIVE_DISPATCH_GATE is not None else None
+        if veto is None and PROACTIVE_ACK_GATE is not None:
+            veto = PROACTIVE_ACK_GATE(tid, item_id)
         if veto is None and PROACTIVE_ROUTE_GATE is not None:
             veto = PROACTIVE_ROUTE_GATE(tid, env.get("room_id"), env.get("thread_root"))
         return veto

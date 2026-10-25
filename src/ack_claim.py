@@ -15,6 +15,7 @@ from __future__ import annotations
 import contextlib
 import fcntl
 import json
+import os
 import re
 import secrets
 import sys
@@ -57,17 +58,48 @@ def claim(workspace: Path, key: str, holder: str, now: Optional[float] = None, *
     return gen
 
 
+#: Never unlinked: shared around opening and acquiring a key lock, exclusive while removing one.
+DIR_LOCK = ".dir.lock"
+#: A test seam called after a key lock is opened and before it is acquired.
+_after_open = None
+
+
 @contextlib.contextmanager
-def _locked(workspace: Path, key: str):
-    """Serialises the read-check-write of update/release on one key across processes."""
-    d = claims_dir(workspace)
-    d.mkdir(parents=True, exist_ok=True)
-    with open(d / f"{_name(key)}.lock", "a") as fh:
-        fcntl.flock(fh, fcntl.LOCK_EX)
+def _dir_lock(d: Path, mode: int):
+    with open(d / DIR_LOCK, "a") as fh:
+        fcntl.flock(fh, mode)
         try:
             yield
         finally:
             fcntl.flock(fh, fcntl.LOCK_UN)
+
+
+@contextlib.contextmanager
+def _locked(workspace: Path, key: str):
+    """Serialises the read-check-write of update/release on one key across processes. The key
+    lock is opened and acquired under the shared directory lock, so cleanup never unlinks it
+    in between; the path must still name the acquired inode, else it is opened again."""
+    d = claims_dir(workspace)
+    d.mkdir(parents=True, exist_ok=True)
+    path = d / f"{_name(key)}.lock"
+    while True:
+        with _dir_lock(d, fcntl.LOCK_SH):
+            fh = open(path, "a")
+            if _after_open is not None:
+                _after_open(key)
+            fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            same = os.fstat(fh.fileno()).st_ino == os.stat(path).st_ino
+        except FileNotFoundError:
+            same = False
+        if same:
+            break
+        fh.close()
+    try:
+        yield
+    finally:
+        fcntl.flock(fh, fcntl.LOCK_UN)
+        fh.close()
 
 
 def _mine(d, key: str, holder: str, gen) -> bool:
@@ -139,8 +171,8 @@ def held_by(workspace: Path, holder: str, state_filter: Optional[str] = None) ->
 
 
 def prune(workspace: Path, keep, now: float, retention_s: float) -> list:
-    """Remove each record past `retention_s` that `keep(record)` does not keep, with its lock file.
-    An unreadable record is never removed; the caller's `keep` decides what is still live."""
+    """Remove each record past `retention_s` that `keep(record)` does not keep, then the orphaned
+    key locks. An unreadable record is never removed; the caller's `keep` decides what is live."""
     d = claims_dir(workspace)
     removed = []
     for p in sorted(d.glob("*.json")) if d.is_dir() else []:
@@ -156,6 +188,33 @@ def prune(workspace: Path, keep, now: float, retention_s: float) -> list:
             continue
         with _locked(workspace, key):
             p.unlink(missing_ok=True)
-            (d / f"{p.stem}.lock").unlink(missing_ok=True)
         removed.append(key)
+    return removed + prune_orphan_locks(workspace, now, retention_s)
+
+
+def prune_orphan_locks(workspace: Path, now: float, retention_s: float) -> list:
+    """Remove each key lock whose record is gone, untouched for `retention_s`, and that nobody
+    holds: under the exclusive directory lock, so no publisher is between opening and acquiring it."""
+    d = claims_dir(workspace)
+    if not d.is_dir():
+        return []
+    removed = []
+    with _dir_lock(d, fcntl.LOCK_EX):
+        for lock in sorted(d.glob("*.lock")):
+            if lock.name == DIR_LOCK or (d / f"{lock.stem}.json").exists():
+                continue
+            try:
+                if now - lock.stat().st_mtime < retention_s:
+                    continue
+                fh = open(lock, "a")
+            except OSError:
+                continue
+            with fh:
+                try:
+                    fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except OSError:
+                    continue
+                if os.fstat(fh.fileno()).st_ino == os.stat(lock).st_ino:
+                    lock.unlink()
+                    removed.append(f"lock:{lock.stem}")
     return removed
