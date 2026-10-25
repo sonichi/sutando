@@ -170,6 +170,14 @@ _ATTEMPT_VARIANTS = {
 }
 
 
+# Past the gate in _upgrade_locked that parses the installed version (a snapshot needs it),
+# so `from` is a version; earlier outcomes and a stale phase-less crash may keep any text.
+_PARSED_ORIGIN = frozenset(
+    {("started", p) for p in ("snapshot", "quiesced", "installing", "installed", "restoring")}
+    | {(o, o) for o in ("ok", "rolled-back", "restore-failed", "no-pip-check", "stop-failed")}
+    | {("restore-failed", "acknowledged")})
+
+
 def _well_formed_journal(state, latest: float) -> bool:
     return _journal_fault(state, latest) is None
 
@@ -188,7 +196,9 @@ def _journal_fault(state, latest: float) -> "str | None":
         return "an attempt no writer leaves"
     for k, t in state["attempted"].items():
         origin = parse_version(t["from"])
-        if t["outcome"] == "ok" and (origin is None or not origin < parse_version(k)):
+        if (t["outcome"], t.get("phase")) in _PARSED_ORIGIN and origin is None:
+            return "an attempt past the version gate whose origin is not a version"
+        if t["outcome"] == "ok" and not origin < parse_version(k):
             return "a success that is not above the version it came from"
     if "failed" in state:
         failed = state["failed"]

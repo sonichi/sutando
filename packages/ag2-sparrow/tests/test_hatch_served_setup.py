@@ -3750,6 +3750,59 @@ class Upgrade(Base):
                 {"attempted": {bad: dict(base, outcome="crashed", phase="crashed")}}),
                 f"target {bad!r}")
 
+    BAD_ORIGINS = ("not-a-version", "", "1." * 40 + "1", "1.0+local")
+
+    def test_an_attempt_past_the_version_gate_needs_a_version_origin(self):
+        installed = {"version": "0.7.0", "at": 2.0, "sha256": {"w.whl": SHA_NEW}, "after": ["0.6.0"]}
+        success = {"at": 1.0, "from": "0.6.0", "outcome": "ok", "phase": "ok", "manager": "unit"}
+        variants = {"started/snapshot": dict(outcome="started", phase="snapshot"),
+                    "started/quiesced": dict(outcome="started", phase="quiesced", manager="unit"),
+                    "started/installing": dict(outcome="started", phase="installing",
+                                               manager="unit"),
+                    "started/installed": dict(outcome="started", phase="installed",
+                                              manager="unit"),
+                    "started/restoring": dict(outcome="started", phase="restoring",
+                                              manager="unit"),
+                    "no-pip-check": dict(outcome="no-pip-check", phase="no-pip-check"),
+                    "stop-failed": dict(outcome="stop-failed", phase="stop-failed"),
+                    "rolled-back": dict(outcome="rolled-back", phase="rolled-back"),
+                    "restore-failed": dict(outcome="restore-failed", phase="restore-failed"),
+                    "acknowledged": dict(outcome="restore-failed", phase="acknowledged"),
+                    "ok": dict(outcome="ok", phase="ok", manager="unit")}
+        for label, fields in variants.items():
+            for bad in self.BAD_ORIGINS:
+                # A historical attempt still named by installed.after, beside a later success.
+                journal = {"attempted": {"0.6.0": dict(fields, at=1.0, **{"from": bad}),
+                                         "0.7.0": success}, "installed": installed}
+                if fields["outcome"] == "ok":
+                    journal["attempted"]["0.7.0"] = dict(success, **{"from": "0.6.0"})
+                    journal["installed"] = dict(installed, version="0.7.0")
+                self.assert_held_everywhere(json.dumps(journal, sort_keys=True),
+                                            f"{label} from {bad[:12]!r}")
+
+    def test_an_origin_before_the_version_gate_may_be_any_text(self):
+        for outcome in ("not-started", "unsupported-install", "not-above-installed",
+                        "no-download", "no-inventory", "no-snapshot", "crashed"):
+            for bad in self.BAD_ORIGINS + ("0.5.4",):
+                tried = {"at": 1.0, "from": bad, "outcome": outcome, "phase": outcome}
+                journal = {"attempted": {"0.6.0": tried}}
+                if outcome == "crashed":
+                    journal["failed"] = {"target": "0.6.0", "from": bad, "installed": "",
+                                         "why": "w", "at": 2.0}
+                self.state_path_text(json.dumps(journal))
+                self_upgrade.load_state(self.state)
+                self.assertIsNone(self_upgrade.recovery_blocked(self.state), (outcome, bad))
+        for bad in self.BAD_ORIGINS:
+            self.state_path_text(json.dumps(
+                {"attempted": {"0.6.0": {"at": time.time(), "from": bad, "outcome": "started"}}}))
+            self_upgrade.load_state(self.state)
+        # A rollback that is not upward is legitimate: a writer proved it, so it still loads.
+        rolled = {"at": 1.0, "from": "0.7.0", "outcome": "rolled-back", "phase": "rolled-back"}
+        self.state_path_text(json.dumps({"attempted": {"0.6.0": rolled}, "failed": {
+            "target": "0.6.0", "from": "0.7.0", "installed": "0.7.0", "why": "w", "at": 2.0,
+            "outcome": "rolled-back", "problems": []}}))
+        self_upgrade.load_state(self.state)
+
     def test_a_direct_rerun_keeps_a_quiesced_record_valid(self):
         self_upgrade._attempt(self.state, "0.6.0")
         self_upgrade._phase(self.state, "0.6.0", "quiesced", manager="detached")
