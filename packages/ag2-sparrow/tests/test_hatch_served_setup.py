@@ -3145,6 +3145,56 @@ class Upgrade(Base):
                          ("restore-failed", "no-download"))
         self.assertIsNone(self_upgrade.recovery_blocked(self.state))
 
+    def assert_held_everywhere(self, text, label):
+        path = self_upgrade.state_path(self.state)
+        self.state.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+        self.assertIn("cannot be read", self_upgrade.recovery_blocked(self.state) or "", label)
+        self.assertEqual(self.keepawake_restarts(), (1, 0), label)
+        with mock.patch.object(self_upgrade, "verify_installed", return_value=[]):
+            self.assertIn("cannot be read", self_upgrade.release_hold(self.state) or "", label)
+        self.assertEqual(path.read_text(), text, label)
+        self.assertEqual(self.keepawake_restarts(6000.0), (1, 0), label)
+
+    def test_a_newer_attempt_whose_writer_replaces_the_summary_holds_restarts(self):
+        with mock.patch.object(self_upgrade, "restore", side_effect=OSError("disk full")):
+            self.connected.side_effect = [1]
+            self.assertEqual(self.run_upgrade(self.fake()), "restore-failed")
+        failed = self_upgrade.load_state(self.state)
+        later = failed["failed"]["at"] + 10
+        for outcome, phase in (("ok", "ok"), ("rolled-back", "rolled-back"),
+                               ("crashed", "crashed"), ("restore-failed", "acknowledged"),
+                               ("restore-failed", "restore-failed"), ("not-started", "not-started")):
+            state = json.loads(json.dumps(failed))
+            state["attempted"]["0.6.0"] = {"at": later, "from": "0.5.4", "outcome": outcome,
+                                           "phase": phase}
+            self.assert_held_everywhere(json.dumps(state), (outcome, phase))
+        installed = {"attempted": {"0.6.0": {"at": 5.0, "from": "0.5.4", "outcome": "ok",
+                                             "phase": "ok"}},
+                     "installed": {"version": "0.6.0", "at": 2.0}}
+        self.assert_held_everywhere(json.dumps(installed), "ok newer than installed")
+        for outcome in sorted(self_upgrade.KEEPS_FAILED):
+            state = json.loads(json.dumps(failed))
+            state["attempted"]["0.6.0"] = dict({"at": later, "from": "0.5.4", "outcome": outcome},
+                                               **({} if outcome == "started" else {"phase": outcome}))
+            self_upgrade.save_state(self.state, state)
+            self.assertIsNone(self_upgrade.recovery_blocked(self.state), outcome)
+
+    def test_a_non_finite_time_holds_restarts(self):
+        started = {"from": "0.5.4", "outcome": "started"}
+        crashed = {"at": 1.0, "from": "0.5.4", "outcome": "crashed", "phase": "crashed"}
+        for at in (float("nan"), float("inf"), float("-inf"), 10 ** 400):
+            self.assert_held_everywhere(
+                json.dumps({"attempted": {"0.6.0": dict(started, at=at)}}), ("attempt", at))
+            self.assert_held_everywhere(json.dumps(
+                {"attempted": {"0.6.0": crashed},
+                 "failed": {"target": "0.6.0", "from": "0.5.4", "at": at}}), ("failed", at))
+            self.assert_held_everywhere(json.dumps(
+                {"attempted": {"0.6.0": dict(crashed, outcome="ok", phase="ok")},
+                 "installed": {"version": "0.6.0", "at": at}}), ("installed", at))
+        self.assert_held_everywhere('{"attempted": {"0.6.0": {"from": "0.5.4", '
+                                    '"outcome": "started", "at": 1e999}}}', "1e999")
+
     def test_keepawake_never_restarts_on_unverified_files_or_a_failed_settlement(self):
         # A dead mutating attempt with no snapshot: restore-failed, the listener stays down.
         self.start(self.setup(), now=1000.0)

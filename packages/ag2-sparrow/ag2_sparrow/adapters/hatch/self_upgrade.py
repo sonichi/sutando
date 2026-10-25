@@ -48,6 +48,7 @@ import glob
 import hashlib
 import importlib.metadata
 import json
+import math
 import os
 import re
 import shutil
@@ -75,10 +76,15 @@ STALE_START_S = 30 * 60
 # Phases written under the lock; a dead attempt in one of these may have changed files.
 MUTATING_PHASES = ("installing", "installed", "restoring")
 SUMMARY_OUTCOMES = ("crashed", "rolled-back", "restore-failed")
+# A direct rerun ending in one of these keeps an older failure summary; others replace it.
+KEEPS_FAILED = frozenset(("started", "unsupported-install", "not-above-installed", "no-download",
+                          "no-inventory", "no-snapshot", "no-pip-check", "stop-failed"))
 WORKING_PHASES = ("snapshot", "quiesced", *MUTATING_PHASES)
 TERMINAL = frozenset(("crashed", "rolled-back", "restore-failed", "ok", "not-started",
                       "unsupported-install", "not-above-installed", "no-download",
                       "no-inventory", "no-snapshot", "no-pip-check", "stop-failed"))
+# Only a success rewrites `installed`, and maybe_start never reruns a target it recorded.
+KEEPS_INSTALLED = TERMINAL - {"ok", "not-started"} | {"started"}
 PIP_TIMEOUT_S = 600
 INSTALL_TIMEOUT_S = 300
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
@@ -155,31 +161,44 @@ def _well_formed_journal(state) -> bool:
     failed = state.get("failed", {})
     outcome = failed.get("outcome", "crashed") if isinstance(failed, dict) else None
     return (("failed" not in state or (outcome in SUMMARY_OUTCOMES
-                                       and _summarises(state["attempted"], failed, "target", outcome)))
+                                       and _summarises(state["attempted"], failed, "target", outcome,
+                                                       KEEPS_FAILED)))
             and ("installed" not in state
-                 or _summarises(state["attempted"], state["installed"], "version", "ok")))
+                 or _summarises(state["attempted"], state["installed"], "version", "ok",
+                                KEEPS_INSTALLED)))
 
 
-def _summarises(attempted: dict, summary, key: str, outcome: str) -> bool:
+def _summarises(attempted: dict, summary, key: str, outcome: str, kept_by) -> bool:
     """Whether a failed/installed summary names an attempt saved with it: in its outcome
-    when that attempt is not newer than the summary, else a later direct rerun's record."""
+    when that attempt is not newer than the summary, else a later rerun ending in `kept_by`."""
     if not isinstance(summary, dict) or not isinstance(summary.get(key), str):
         return False
-    tried, at = attempted.get(summary[key]), summary.get("at")
-    if tried is None or not isinstance(at, (int, float)) or isinstance(at, bool):
+    tried = attempted.get(summary[key])
+    if tried is None or not _finite(summary.get("at")):
         return False
-    return tried["at"] > at or tried["outcome"] == outcome
+    if tried["at"] > summary["at"]:
+        return tried["outcome"] in kept_by
+    return tried["outcome"] == outcome
+
+
+def _finite(at) -> bool:
+    """A time arithmetic can use: NaN, ±inf and ints past a float's range are not one."""
+    if not isinstance(at, (int, float)) or isinstance(at, bool):
+        return False
+    try:
+        return math.isfinite(float(at))
+    except OverflowError:
+        return False
 
 
 def _well_formed(tried) -> bool:
-    """An attempt record the writer can leave: a legal (outcome, phase), a numeric `at`,
+    """An attempt record the writer can leave: a legal (outcome, phase), a finite `at`,
     and a string `from` when present."""
     if not isinstance(tried, dict):
         return False
     at, previous = tried.get("at"), tried.get("from")
     return (_legal(tried.get("outcome"), tried.get("phase"))
-            and isinstance(at, (int, float)) and not isinstance(at, bool)
-            and (previous is None or isinstance(previous, str)))
+            and _finite(at) and (previous is None or isinstance(previous, str)))
 
 
 def save_state(state_dir: Path, state: dict) -> None:
