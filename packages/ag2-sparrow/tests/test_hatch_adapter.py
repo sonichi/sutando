@@ -1590,7 +1590,9 @@ class Service(Base):
         def blocked():
             self.state.mkdir(parents=True, exist_ok=True)
             journal.write_text(json.dumps({"attempted": {"0.6.0": {
-                "at": 1.0, "from": "0.5.4", "outcome": "restore-failed", "phase": "restore-failed"}}}))
+                "at": 1.0, "from": "0.5.4", "outcome": "restore-failed", "phase": "restore-failed"}},
+                "failed": {"target": "0.6.0", "from": "0.5.4", "installed": "0.6.0", "why": "w",
+                           "at": 1.0, "outcome": "restore-failed", "problems": ["p"]}}))
 
         class Recording(FakeSystemd):
             def __call__(me, cmd):

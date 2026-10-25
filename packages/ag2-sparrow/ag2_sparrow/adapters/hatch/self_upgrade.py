@@ -75,6 +75,8 @@ STALE_START_S = 30 * 60
 # Phases written under the lock; a dead attempt in one of these may have changed files.
 MUTATING_PHASES = ("installing", "installed", "restoring")
 SUMMARY_OUTCOMES = ("rolled-back", "restore-failed")
+# An attempt left in one of these was saved with a `failed` summary of it, in the same write.
+RECOVERY_OUTCOMES = ("crashed",) + SUMMARY_OUTCOMES
 MANAGERS = ("unit", "detached")
 # A direct rerun ending in one of these keeps an older failure summary; others replace it.
 # None of them is a summary outcome, so a summary's own attempt is told from a rerun clocklessly.
@@ -171,7 +173,8 @@ _ATTEMPT_VARIANTS = {
 def _well_formed_journal(state, latest: float) -> bool:
     """The journal as save_state writes it: an `attempted` map of well-formed attempts,
     optional `failed` and `installed` summaries of attempts in it, and nothing else; no
-    time in it later than `latest`."""
+    time in it later than `latest`. A recovery attempt keeps its summary until a success
+    that names it drops it, which no restore-failed attempt still holding allows."""
     if not isinstance(state, dict) or not isinstance(state.get("attempted"), dict):
         return False
     if set(state) - {"attempted", "failed", "installed"}:
@@ -188,14 +191,35 @@ def _well_formed_journal(state, latest: float) -> bool:
         outcome = failed.get("outcome", "crashed")
         if not _summarises(state["attempted"], failed["target"], outcome, KEEPS_FAILED):
             return False
+        # Both are the attempt's `previous`, saved together; only a rerun's attempt may differ.
+        tried = state["attempted"][failed["target"]]
+        if tried["outcome"] == outcome and tried["from"] != failed["from"]:
+            return False
     if "installed" not in state and any(t["outcome"] == "ok" for t in state["attempted"].values()):
         return False
     if "installed" in state:
         installed = state["installed"]
-        if not (_typed(installed, _INSTALLED, ("version", "at", "sha256"), latest)
-                and _summarises(state["attempted"], installed["version"], "ok", KEEPS_INSTALLED)):
+        if not (_typed(installed, _INSTALLED, ("version", "at", "sha256", "after"), latest)
+                and _summarises(state["attempted"], installed["version"], "ok", KEEPS_INSTALLED)
+                and _followed(state["attempted"], installed["version"], installed["after"])):
+            return False
+    if "failed" not in state:
+        attempted = state["attempted"]
+        recovered = {k for k, t in attempted.items() if t["outcome"] in RECOVERY_OUTCOMES}
+        if any(attempted[k].get("phase") == "restore-failed" for k in recovered):
+            return False
+        # Only a success drops the summary, and it names every recovery it came after.
+        if recovered and not recovered <= set(state.get("installed", {}).get("after", ())):
             return False
     return True
+
+
+def _followed(attempted: dict, version: str, after: list) -> bool:
+    """`after` as the success saves it: sorted, of other targets, each then a recovery
+    and since rerun at most to an outcome that keeps the success's summary."""
+    return (after == sorted(set(after)) and version not in after
+            and all(attempted.get(k, {}).get("outcome") in RECOVERY_OUTCOMES + tuple(KEEPS_FAILED)
+                    for k in after))
 
 
 def _failed_variant(failed: dict) -> bool:
@@ -240,7 +264,7 @@ _ATTEMPT = {"at": _plausible, "from": _text, "outcome": _text, "phase": _text, "
             "manager": lambda v, latest: v in MANAGERS}
 _FAILED = {"target": _text, "from": _text, "installed": _text, "why": _text, "at": _plausible,
            "outcome": _text, "problems": _texts}
-_INSTALLED = {"version": _text, "at": _plausible,
+_INSTALLED = {"version": _text, "at": _plausible, "after": _texts,
               "sha256": lambda v, latest: valid_hashes(v) is not None}
 
 
@@ -1059,7 +1083,9 @@ def _upgrade_locked(cfg: dict, state_dir: Path, target: str, hashes: dict) -> st
         return rollback("Sparrow did not reconnect")
     state = load_state(state_dir)
     state.pop("failed", None)
-    state["installed"] = {"version": target, "sha256": hashes, "at": time.time()}
+    after = sorted(k for k, t in state["attempted"].items()
+                   if k != target and t.get("outcome") in RECOVERY_OUTCOMES)
+    state["installed"] = {"version": target, "sha256": hashes, "at": time.time(), "after": after}
     state["attempted"].setdefault(target, {}).update(outcome="ok", phase="ok")
     if hook:
         state["attempted"][target]["hook"] = hook

@@ -659,7 +659,9 @@ writer produces, or a field its writer never saves or saves as another JSON type
 duplicate member name, or a time no writer could stamp (not a
 number, below zero, or more than `CLOCK_SKEW_S` ahead of the clock), or a `failed` or
 `installed` summary naming no attempt or one in an outcome whose writer would have
-replaced the summary) nothing starts Sparrow or another
+replaced the summary, or a `failed` summary whose `from` differs from that of the
+attempt it was saved with, or a crashed, rolled-back or restore-failed attempt with no
+`failed` summary and no later success whose `installed.after` names it) nothing starts Sparrow or another
 upgrade: keepawake, the upgrade decision and the upgrade worker all refuse without
 writing to the journal, so a refusal never replaces the phase that holds, and the
 failed version is never imported, not even to read its version. The owner's
