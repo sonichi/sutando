@@ -264,6 +264,42 @@ print("== DELETE elsewhere ==")
 s, b, _ = req("DELETE", "/task")
 check("DELETE outside connections is 404", s == 404, f"{s} {b}")
 
+print("== in-process handler branches ==")
+
+
+class FakeRFile:
+    def __init__(self, body):
+        self.body = body
+
+    def read(self, n=-1):
+        return self.body
+
+
+def handler(method, path, headers, body=b""):
+    h = api.Handler.__new__(api.Handler)
+    h.path, h.headers, h.rfile, h.out = path, headers, FakeRFile(body), []
+    h.send_json = lambda status, data: h.out.append((status, data))
+    h.send_response = lambda status: h.out.append((status, None))
+    h.send_header = lambda *a: None
+    h.end_headers = lambda: None
+    h.client_address = ("127.0.0.1", 1)
+    h._connections_route(method)
+    return h.out[0]
+check("a bad Content-Length is 400",
+      handler("POST", "/api/v1/connections", {"Content-Length": "nope"})[0] == 400)
+check("an oversized body is 413",
+      handler("POST", "/api/v1/connections", {"Content-Length": str(api.CONNECTIONS_BODY_CAP + 1)})[0] == 413)
+check("a JSON body that is not an object is 400",
+      handler("POST", "/api/v1/connections", {"Content-Length": "2"}, b"[]") == (400, {"error": "body must be a JSON object"}))
+check("an unparseable Origin is refused",
+      handler("POST", "/api/v1/connections", {"Content-Length": "0", "Origin": "http://[bad"})[0] == 403)
+check("_loopback_origin accepts no Origin and loopback hosts only",
+      api._loopback_origin("") and api._loopback_origin("http://localhost:1") and not api._loopback_origin("https://x.example"))
+(WS / "state" / "connections.json").write_text("{broken")
+status, body = _real("GET", "/api/v1/connections", {}, {}, workspace=WS)
+check("a broken record is 500 with the schema error", status == 500 and "connections.json" in body["error"], (status, body))
+(WS / "state" / "connections.json").unlink()
+
 server.server_close()
 print()
 if failures:

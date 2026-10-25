@@ -10,7 +10,7 @@ The vault, the gateway probe and the process spawn are fakes handed in.
 
 Run: python3 tests/connections.test.py
 """
-from _helpers.hermetic_env import isolate_os_environ
+from _helpers.hermetic_env import isolate_os_environ, isolated_child_env
 
 # Before anything reads the environment: no outer credential selector survives.
 isolate_os_environ(SUTANDO_SUPPRESS_CCD_FALLBACK_BANNER="1")
@@ -20,7 +20,9 @@ import os
 import sys
 import tempfile
 import threading
+import time
 import unittest
+import unittest.mock
 import urllib.error
 from pathlib import Path
 
@@ -685,6 +687,174 @@ class Launching(Base):
                              workspace=self.ws, vault=self.vault, spawn=self.spawn,
                              kill=lambda *a: self.fail("nothing to kill"))
         self.assertEqual(record["stopped_pid"], 0)
+
+
+class Edges(Base):
+    """The defensive branches: malformed URLs, the real vault binding, the real spawn, the
+    rollback after a refused write, the lock-holder reads and the resolver import."""
+
+    def test_malformed_urls_have_no_host(self):
+        self.assertEqual(C.server_of_token("https://[bad|secret"), "")
+        self.assertEqual(C.host_of_url("https://[bad"), "")
+        self.assertEqual(C.resolve_server("", resolver=lambda h: self.fail("never asked")), "")
+
+    def test_default_resolver_import_paths(self):
+        saved = C.DEFAULT_RESOLVER
+        try:
+            C.DEFAULT_RESOLVER = None
+            self.assertIs(C._default_resolver(), __import__("dotspace").dotspace_for)
+            C.DEFAULT_RESOLVER = None
+            with unittest.mock.patch.dict(sys.modules, {"dotspace": None}):
+                self.assertIsNone(C._default_resolver())
+                self.assertEqual(C.resolve_server("chat.s.space"), "")
+        finally:
+            C.DEFAULT_RESOLVER = saved
+
+    def test_probe_success_path_over_http(self):
+        import http.server
+        import threading
+
+        class Agents(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                seen["auth"] = self.headers.get("Authorization")
+                seen["path"] = self.path
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"agents": [{"id": "@bot:probe.example"}]}).encode())
+
+            def log_message(self, *a):
+                pass
+        seen = {}
+        srv = http.server.HTTPServer(("127.0.0.1", 0), Agents)
+        t = threading.Thread(target=srv.handle_request)
+        t.start()
+        try:
+            p = C.preview_connection(f"http://127.0.0.1:{srv.server_address[1]}/relay|the-secret")
+        finally:
+            t.join(5)
+            srv.server_close()
+        self.assertEqual(seen, {"auth": "Bearer the-secret", "path": "/relay/v1/agents"})
+        self.assertEqual((p["server"], p["server_source"], p["verified"]), ("probe.example", "identity", True))
+
+    def test_vault_binding_uses_the_secret_vault_module(self):
+        calls = []
+
+        class Stub:
+            def get_vault_key(self, k):
+                calls.append(("get", k)); return "v"
+
+            def set_vault_key(self, k, v):
+                calls.append(("set", k))
+
+            def delete_vault_key(self, k):
+                calls.append(("delete", k))
+        with unittest.mock.patch.dict(sys.modules, {"vault_intercept": Stub()}):
+            v = C._vault(None)
+            v.set("K", "v"); self.assertEqual(v.get("K"), "v"); v.delete("K")
+        self.assertEqual(calls, [("set", "K"), ("get", "K"), ("delete", "K")])
+        with unittest.mock.patch.dict(sys.modules, {"vault_intercept": None}):
+            with self.assertRaises(C.VaultUnavailable):
+                C._vault(None)
+
+    def test_default_workspace_comes_from_the_resolver(self):
+        os.environ["SUTANDO_TEST_MODE"] = "1"
+        os.environ["SUTANDO_WORKSPACE"] = str(self.ws)
+        try:
+            self.assertEqual(C.record_path(None), self.ws.resolve() / "state" / C.STATE_NAME)
+            self.assertEqual(C.list_connections(), [])
+        finally:
+            del os.environ["SUTANDO_TEST_MODE"], os.environ["SUTANDO_WORKSPACE"]
+
+    def test_remaining_schema_branches(self):
+        row = {"server": "a", "instance": "x", "gateway_url": "", "token_ref": "T", "primary": True,
+               "added_by": "env", "added_at": "", "verified": False, "server_source": "gateway"}
+        for payload, needle in (
+            ({"schema_version": 1, "connections": ["nope"]}, "not an object"),
+            ({"schema_version": 1, "connections": [dict(row, server=3)]}, "not a string"),
+            ({"schema_version": 1, "connections": [dict(row, instance="bad slug!")]}, "not a slug"),
+            ({"schema_version": 1, "connections": [dict(row, agent_mxid=7)]}, "agent_mxid"),
+            ({"schema_version": 1, "connections": [dict(row, instance=f"i{i}", token_ref=f"T{i}", server=f"s{i}",
+                                                       primary=False) for i in range(C.MAX_ROWS + 1)]}, "more than"),
+        ):
+            with self.assertRaises(C.SchemaError) as cm:
+                C._validate(payload)
+            self.assertIn(needle, str(cm.exception))
+
+    def test_add_without_a_server_in_the_preview_is_refused(self):
+        with self.assertRaises(C.InvalidToken):
+            C.add_connection(TOKEN_A, added_by="ui", expected_server="x", preview={"server": ""},
+                             workspace=self.ws, vault=self.vault)
+
+    def test_oversized_write_is_refused_and_the_vault_rolled_back(self):
+        preview = C.preview_connection(TOKEN_A, fetch=unreachable)
+        preview["agent_mxid"] = "@x:" + "y" * (C.MAX_BYTES + 10)
+        with self.assertRaises(C.SchemaError):
+            C.add_connection(TOKEN_A, added_by="ui", expected_server=preview["server"], preview=preview,
+                             workspace=self.ws, vault=self.vault)
+        self.assertEqual(self.vault.store, {}, "the stored secret was taken back out")
+        self.assertEqual(self.rows(), [])
+        self.vault.fail_delete = True
+        with self.assertRaises(C.SchemaError):
+            C.add_connection(TOKEN_A, added_by="ui", expected_server=preview["server"], preview=preview,
+                             workspace=self.ws, vault=self.vault)
+
+    def test_token_file_override_and_missing_channel_home(self):
+        entry = {"instance": "dev", "channel_dir": "dev-ag2space"}
+        self.assertEqual(C._token_file(entry, {"REMOTE_TASK_TOKEN_FILE_DEV": str(self.ws / "nope.env")}), "")
+        (self.ws / "dev.env").write_text("")
+        self.assertEqual(C._token_file(entry, {"REMOTE_TASK_TOKEN_FILE_DEV": str(self.ws / "dev.env")}),
+                         str(self.ws / "dev.env"))
+        with unittest.mock.patch.dict(sys.modules, {"util_paths": None}):
+            self.assertEqual(C._token_file(entry, {}), "")
+
+    def test_real_spawn_detaches_and_logs(self):
+        log = self.ws / "logs" / "bridge.log"
+        pid = C._spawn([sys.executable, "-c", "print('hello from the bridge')"], isolated_child_env(), log)
+        self.assertGreater(pid, 0)
+        for _ in range(50):
+            try:
+                os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                pass
+            if log.exists() and "hello" in log.read_text():
+                break
+            time.sleep(0.1)
+        self.assertIn("hello from the bridge", log.read_text())
+
+    def test_lock_holder_reads(self):
+        locks = self.ws / "state" / "locks"
+        locks.mkdir(parents=True)
+        lock = locks / "gateway-bridge.dev.lock"
+        lock.write_text("not-a-pid\n")
+        from file_lock import lock_fd, unlock_fd
+        fd = os.open(str(lock), os.O_RDWR)
+        lock_fd(fd)
+        try:
+            self.assertEqual(C.bridge_pid("dev", self.ws), 0, "garbage in the lock reads as no bridge")
+            lock.write_text("4242\n")
+            self.assertEqual(C.bridge_pid("dev", self.ws), 4242)
+            released = []
+
+            def kill(pid, sig):
+                def later():
+                    time.sleep(0.3)
+                    unlock_fd(fd)
+                    released.append(pid)
+                threading.Thread(target=later).start()
+            self.assertEqual(C.stop_bridge("dev", workspace=self.ws, kill=kill), 4242)
+        finally:
+            os.close(fd)
+        self.assertEqual(released, [4242])
+        self.assertEqual(C.stop_bridge("dev", workspace=self.ws, kill=lambda *a: self.fail("nothing to kill")), 0)
+
+    def test_reconnect_tolerates_an_unusable_stored_token(self):
+        row, _ = self.add(TOKEN_B, fetch=unreachable)
+        self.vault.store[row["token_ref"]] = "opaque-bearer"
+        record = C.reconnect(row["instance"], repo=self.ws, logs_dir=self.ws / "logs", environ={},
+                             workspace=self.ws, vault=self.vault, spawn=lambda a, e, l: 5, kill=lambda *a: None)
+        self.assertEqual(record["pid"], 5)
+        self.assertEqual(self.rows()[0]["server_source"], "gateway")
 
 
 if __name__ == "__main__":

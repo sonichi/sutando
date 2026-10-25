@@ -195,5 +195,54 @@ class CliTests(unittest.TestCase):
         self.assertEqual(self.run_cli("list").stdout.strip(), "no connections")
 
 
+class InProcess(unittest.TestCase):
+    """main() driven directly, with the domain module faked, for the branches a subprocess cannot show."""
+
+    def setUp(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("connections_cli", CLI)
+        self.cli = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.cli)
+
+    def run_main(self, argv, **fakes):
+        import contextlib
+        import io
+        out, err = io.StringIO(), io.StringIO()
+        saved = {k: getattr(self.cli.connections, k) for k in fakes}
+        for k, v in fakes.items():
+            setattr(self.cli.connections, k, v)
+        try:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                rc = self.cli.main(argv)
+        finally:
+            for k, v in saved.items():
+                setattr(self.cli.connections, k, v)
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_domain_errors_exit_one_with_the_message(self):
+        def boom(*a, **k):
+            raise self.cli.connections.UnknownConnection("no connection 'x'")
+        rc, out, err = self.run_main(["remove", "x"], remove_connection=boom)
+        self.assertEqual((rc, out), (1, ""))
+        self.assertIn("connections: no connection 'x'", err)
+
+    def test_yes_without_expected_server_exits_two(self):
+        rc, out, err = self.run_main(["add", TOKEN_A, "--yes"], preview_connection=lambda t: {"server": "s"})
+        self.assertEqual(rc, 2)
+        self.assertIn("--expected-server", err)
+
+    def test_list_and_plan_print_rows_without_secrets(self):
+        row = {"instance": "dev", "server": "s.space", "primary": True, "added_by": "ui", "token_ref": "AG2_REMOTE_TOKEN_DEV",
+               "verified": True, "server_source": "identity"}
+        rc, out, _ = self.run_main(["list"], list_connections=lambda ws: [row],
+                                   status_for=lambda r, ws: dict(r, status={"last_ok_ts": 5}, state="connected", reason=None))
+        self.assertEqual(rc, 0)
+        self.assertIn("connected", out)
+        self.assertIn("AG2_REMOTE_TOKEN_DEV", out)
+        rc, out, _ = self.run_main(["launch-plan"], launch_plan=lambda env, workspace=None: [
+            {"instance": "dev", "token_ref": "AG2_REMOTE_TOKEN_DEV", "channel_dir": "dev-ag2space", "primary": True}])
+        self.assertEqual(out, "dev\tAG2_REMOTE_TOKEN_DEV\tdev-ag2space\t1\n")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)
