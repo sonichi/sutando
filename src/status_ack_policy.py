@@ -1,5 +1,8 @@
 """Whether to send one task's initial status acknowledgement, what it says, and where it goes.
 
+Scope: only a task no session has picked up and that shows no activity card or progress notice.
+A picked-up task is the card's and the progress notifier's to report, so this layer stays silent.
+
 Pure and dependency-light: the caller observes the task (headers, activity phase, result state,
 inbox holders, ack-claim state) and this module only decides. It never reads the clock, a file
 or the process table, so every requirement is checkable from a fixture. The deadline is fixed
@@ -28,7 +31,6 @@ SPEAK, WAIT, SUPPRESS = "speak", "wait", "suppress"
 
 #: The only lines this policy can emit. Each states an observed fact; none estimates time or progress.
 TEMPLATES: Mapping[str, str] = {
-    "handed_off": "Received and handed off for handling. No answer yet.",
     "queued": "Received. Not picked up yet; it is in the queue.",
     "inbox_down": "Received. Not picked up yet: the core is not reading its inbox right now.",
     "inbox_down_owner_told": ("Received. Not picked up yet: the core is not reading its inbox right now. "
@@ -165,6 +167,8 @@ class TaskObservation:
     cancel_instruction: bool = False
     cancel_requested: bool = False
     owner_alerted: bool = False
+    card: bool = False
+    progress_notice: bool = False
     started_at: Optional[float] = None
     last_activity_at: Optional[float] = None
 
@@ -208,6 +212,12 @@ def decide(obs: TaskObservation, now: float, deadlines: Optional[Mapping[str, fl
         return no(f"unrecognised ack state {obs.ack!r}")
     if obs.ack != "none":
         return no(f"initial ack already {obs.ack}")
+    if obs.phase == "RUNNING" or obs.worker_holder is not None:
+        return no("picked up: the card and the progress notifier report it")
+    if obs.card:
+        return no("an activity card already shows this task")
+    if obs.progress_notice:
+        return no("a progress notice already went out")
     dest, why = destination(obs.headers)
     if dest is None:
         return no(f"unverified destination: {why}")
@@ -217,11 +227,8 @@ def decide(obs: TaskObservation, now: float, deadlines: Optional[Mapping[str, fl
     if now < due:
         return Decision(WAIT, "before the first-ack deadline", key, due_at=due, destination=dest)
 
-    handed_off = obs.phase == "RUNNING" or obs.worker_holder is not None
-    watcher_down = obs.inbox == "standby_only" and not handed_off
-    if handed_off:
-        template = "handed_off"
-    elif watcher_down:
+    watcher_down = obs.inbox == "standby_only"
+    if watcher_down:
         template = "inbox_down_owner_told" if obs.owner_alerted else "inbox_down"
     elif obs.inbox == "session" and obs.phase in _UNCLAIMED_PHASES:
         template = "queued"

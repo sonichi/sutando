@@ -7,7 +7,8 @@ when nothing was sent. A record that exists but cannot be read counts as held: t
 worse than none. States: claimed (sending, outcome not yet known), confirmed (delivery
 evidence recorded), unknown (the send may have landed). Each claim carries a `gen`; a caller that
 passes it back to update/release changes only that claim, never a successor created after a release
-under the same holder name. Contract: tests/ack-claim.test.py.
+under the same holder name. `prune()` drops only records its caller no longer keeps.
+Contract: tests/ack-claim.test.py.
 """
 from __future__ import annotations
 
@@ -135,3 +136,26 @@ def held_by(workspace: Path, holder: str, state_filter: Optional[str] = None) ->
                 and (state_filter is None or rec.get("state") == state_filter)):
             out.append(rec)
     return out
+
+
+def prune(workspace: Path, keep, now: float, retention_s: float) -> list:
+    """Remove each record past `retention_s` that `keep(record)` does not keep, with its lock file.
+    An unreadable record is never removed; the caller's `keep` decides what is still live."""
+    d = claims_dir(workspace)
+    removed = []
+    for p in sorted(d.glob("*.json")) if d.is_dir() else []:
+        try:
+            rec = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        key = rec.get("key") if isinstance(rec, dict) else None
+        if not isinstance(key, str) or not _KEY.match(key) or rec.get("id") != p.stem:
+            continue
+        age = now - rec["claimed_at"] if isinstance(rec.get("claimed_at"), (int, float)) else None
+        if age is None or age < retention_s or keep(rec):
+            continue
+        with _locked(workspace, key):
+            p.unlink(missing_ok=True)
+            (d / f"{p.stem}.lock").unlink(missing_ok=True)
+        removed.append(key)
+    return removed
