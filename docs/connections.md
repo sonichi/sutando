@@ -126,9 +126,10 @@ variable alone. The legacy unsuffixed bridge keeps its own launch path.
 The bridge environment (`GATEWAY_INSTANCE`, `REMOTE_TASK_TOKEN` from the env var of
 the same name or the vault, empty `REMOTE_TASK_URL`, `REMOTE_TASK_CHANNEL_DIR`,
 `REMOTE_PROACTIVE_ROOM` only for the primary, `SUTANDO_SUPERVISED=1`) is composed in
-`connections.launch_env`, nowhere else. The legacy unsuffixed bridge keeps its launch path but
-asks `connections.py primary` first: once a named row holds the primary it launches with
-`REMOTE_PROACTIVE_ROOM` empty, so exactly one bridge posts nudges.
+`connections.launch_env`, nowhere else. The legacy unsuffixed bridge keeps both of its launch
+paths (the launchd wrapper, and the bare launch when no job is installed); each asks
+`connections.py primary` before every launch, and once a named row holds the primary launches
+with `REMOTE_PROACTIVE_ROOM` empty, so exactly one bridge posts nudges.
 
 ## Surfaces
 

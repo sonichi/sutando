@@ -40,6 +40,7 @@ fi
 # dropping an environment-provided one.
 _ENV_REMOTE_TASK_TOKEN="${REMOTE_TASK_TOKEN:-}"; _ENV_AG2_REMOTE_TOKEN="${AG2_REMOTE_TOKEN:-}"
 _ENV_REMOTE_TASK_TIER="${REMOTE_TASK_TIER:-}"; _ENV_AG2_REMOTE_TIER="${AG2_REMOTE_TIER:-}"
+_ENV_REMOTE_PROACTIVE_ROOM="${REMOTE_PROACTIVE_ROOM:-}"
 if _RELAY_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels/ag2space/.env 2>/dev/null)"; then
     [ -f "$_RELAY_ENV" ] && { set -a; . "$_RELAY_ENV"; set +a; }
 fi
@@ -165,6 +166,7 @@ while [ "$STOPPING" = 0 ]; do
   # environment-provided values, re-read the .env, redo the legacy mapping.
   REMOTE_TASK_TOKEN="$_ENV_REMOTE_TASK_TOKEN"; AG2_REMOTE_TOKEN="$_ENV_AG2_REMOTE_TOKEN"
   REMOTE_TASK_TIER="$_ENV_REMOTE_TASK_TIER"; AG2_REMOTE_TIER="$_ENV_AG2_REMOTE_TIER"
+  REMOTE_PROACTIVE_ROOM="$_ENV_REMOTE_PROACTIVE_ROOM"
   [ -n "${_RELAY_ENV:-}" ] && [ -f "$_RELAY_ENV" ] && { set -a; . "$_RELAY_ENV"; set +a; }
   REMOTE_TASK_TOKEN="${REMOTE_TASK_TOKEN:-${AG2_REMOTE_TOKEN:-}}"
   REMOTE_TASK_TIER="${REMOTE_TASK_TIER:-${AG2_REMOTE_TIER:-owner}}"
@@ -176,7 +178,13 @@ while [ "$STOPPING" = 0 ]; do
     exit 0
   fi
   tend_agents_supervisor
-  python3 "$REPO/src/remote-gateway-bridge.py" &
+  # Once a named row holds the primary this legacy bridge is a secondary: it must not
+  # inherit the proactive room, or two bridges post nudges.
+  _LEGACY_ROOM="${REMOTE_PROACTIVE_ROOM:-}"
+  if _PRIMARY="$(python3 "$REPO/scripts/connections.py" primary 2>/dev/null)" && [ -n "$_PRIMARY" ]; then
+    _LEGACY_ROOM=""
+  fi
+  REMOTE_PROACTIVE_ROOM="$_LEGACY_ROOM" python3 "$REPO/src/remote-gateway-bridge.py" &
   CHILD_PID=$!
   # Poll rather than `wait`: /bin/bash has no `wait -n`, and the agent-bridge
   # supervisor must be tended while the bridge runs.
