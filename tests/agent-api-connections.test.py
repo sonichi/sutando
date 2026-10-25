@@ -199,7 +199,13 @@ s, b, h = req("GET", "/api/v1/connections", headers={"Origin": "http://localhost
 check("a loopback Origin with the bearer is echoed", s == 200 and h.get("Access-Control-Allow-Origin") == "http://localhost:5173", h)
 check("Vary: Origin accompanies the echo", h.get("Vary") == "Origin", h)
 s, b, h = req("GET", "/api/v1/connections", headers={"Origin": "http://localhost:5173"}, auth=False)
-check("the 401 to a loopback Origin still has no grant", s == 401 and "Access-Control-Allow-Origin" not in h, h)
+check("the 401 to a loopback Origin is echoed too, so a webview can read it and drop a stale bearer",
+      s == 401 and h.get("Access-Control-Allow-Origin") == "http://localhost:5173" and h.get("Vary") == "Origin", (s, h))
+for origin in ("tauri://localhost", "http://tauri.localhost"):
+    s, b, h = req("GET", "/api/v1/connections", headers={"Origin": origin}, auth="Bearer wrong")
+    check(f"a wrong bearer from the desktop webview {origin} is a readable 401", s == 401 and h.get("Access-Control-Allow-Origin") == origin, (s, h))
+s, b, h = req("GET", "/api/v1/connections", headers={"Origin": "https://evil-fixture.net"}, auth=False)
+check("a refusal to a non-loopback Origin still grants nothing", s == 403 and "Access-Control-Allow-Origin" not in h, (s, h))
 s, b, h = req("OPTIONS", "/api/v1/connections", headers={"Origin": "http://localhost:5173"}, auth=False)
 check("preflight from loopback is 204 echoing the Origin", s == 204 and h.get("Access-Control-Allow-Origin") == "http://localhost:5173", (s, h))
 check("preflight allows DELETE and the bearer header",

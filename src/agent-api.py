@@ -1022,11 +1022,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
 
     def _send_connections(self, status: int, payload: "dict | None", granted: bool = False) -> None:
-        """JSON (or an empty body); a cross-origin grant only for the loopback Origin whose
-        request passed the whole gate, never a wildcard and never on a refusal."""
+        """JSON (or an empty body); the cross-origin grant echoes a loopback Origin only, never a
+        wildcard, on refusals too: without it a webview reads a 401 as a network failure and can
+        never drop a stale bearer. A non-loopback Origin gets no grant at any status."""
         self.send_response(status)
         origin = self.headers.get("Origin", "")
-        if granted and origin and local_api_gate.loopback_origin(origin):
+        if origin and local_api_gate.loopback_origin(origin):
             self.send_header("Access-Control-Allow-Origin", origin)
             self.send_header("Vary", "Origin")
         self.send_header("Cache-Control", "no-store")
