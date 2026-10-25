@@ -7,6 +7,8 @@ through `ag2_sparrow.control_socket.control_socket_path`, the only place a socke
 Run: python3 tests/sparrowd-control-socket-path.test.py"""
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import re
@@ -16,6 +18,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -75,7 +78,8 @@ class Base(unittest.TestCase):
             " backoff_initial_s=0.2))\n")
         proc = subprocess.Popen([sys.executable, str(runner)], env=hermetic_env(),
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        self.addCleanup(lambda: proc.poll() is None and proc.kill())
+        self.addCleanup(proc.stdout.close)
+        self.addCleanup(lambda: proc.poll() is None and (proc.kill(), proc.wait()))
         return proc
 
 
@@ -131,6 +135,58 @@ class LongWorkspace(Base):
         state = self.td / "s"
         self.assertEqual(cs.control_socket_path(state, create=True), state / cs.SOCKET_NAME)
         self.assertFalse((self.root / f"ag2-sparrow-{os.getuid()}").exists(), "no short dir made")
+
+
+    def test_a_client_of_a_missing_short_dir_gets_the_path_without_creating_it(self):
+        state = self.long_state()
+        self.assertEqual(cs.control_socket_path(state).parent, cs.short_dir())
+        self.assertFalse(cs.short_dir().exists())
+
+    def test_a_root_too_long_for_any_socket_is_a_clear_error(self):
+        with self.assertRaisesRegex(cs.ControlSocketPathError, "no control socket path fits"):
+            cs.control_socket_path(self.long_state(), root=str(self.td / ("y" * 120)))
+
+
+class InProcessRun(Base):
+    """The daemon's fallback legs, in-process so the entry path is measured."""
+
+    def run_until_sigterm(self, state, **patches):
+        from ag2_sparrow import sparrowd
+        handlers = {}
+
+        def fire():
+            if wait_for(lambda: signal.SIGTERM in handlers, 5):
+                handlers[signal.SIGTERM](signal.SIGTERM, None)
+        killer = threading.Thread(target=fire, daemon=True)
+        killer.start()
+        out = io.StringIO()
+        # The handler run() installs is called directly: no real signal can outlive the test.
+        with contextlib.redirect_stdout(out), contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(sparrowd.signal, "signal",
+                                                  side_effect=lambda s, h: handlers.__setitem__(s, h)))
+            for name, fn in patches.items():
+                stack.enter_context(mock.patch.object(sparrowd.ControlServer, name, fn))
+            rc = sparrowd.run([], state, rescan=lambda: [], rescan_s=0.05)
+        killer.join(5)
+        return rc, out.getvalue()
+
+    def test_an_untrusted_short_dir_is_logged_once_and_run_keeps_going(self):
+        state = self.long_state()
+        cs.short_dir().write_text("not a dir")
+        rc, out = self.run_until_sigterm(state)
+        self.assertEqual(rc, 0)
+        self.assertEqual(out.count("control socket unavailable"), 1, out)
+        self.assertIn("shutdown requested", out)
+
+    def test_a_bind_failure_closes_the_half_made_server_and_run_keeps_going(self):
+        state = self.long_state()
+        closed = []
+
+        def boom(self):
+            raise OSError("bind refused")
+        rc, out = self.run_until_sigterm(state, start=boom, close=lambda self: closed.append(1))
+        self.assertEqual((rc, closed), (0, [1]), out)
+        self.assertEqual(out.count("control socket unavailable (bind refused)"), 1, out)
 
 
 class ForeignDirectory(Base):

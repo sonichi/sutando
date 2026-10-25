@@ -42,17 +42,14 @@ def ensure_private_dir(path: Path, uid: Optional[int] = None, create: bool = Tru
     """Create `path` 0700 (with `create`), or accept it only when it is a real directory owned by
     `uid`. Without `create` a missing directory passes: there is nothing there to connect to."""
     uid = os.getuid() if uid is None else uid
+    if not create and not os.path.lexists(path):
+        return
     try:
         if create:
             os.mkdir(path, 0o700)
     except FileExistsError:
         pass
-    try:
-        st = os.lstat(path)
-    except FileNotFoundError:
-        if create:
-            raise
-        return
+    st = os.lstat(path)
     if not stat.S_ISDIR(st.st_mode):
         raise ControlSocketPathError(f"{path} is not a directory; refusing to put a control socket there")
     if st.st_uid != uid:
