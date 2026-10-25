@@ -576,15 +576,18 @@ def _find(rows: list, instance: str) -> dict:
 def list_connections(workspace: Optional[Path] = None, *, vault=None) -> list:
     """Every row, validated; [] when no record exists.
 
-    An empty record first takes what `import_from_env` finds, so a token the connect flow wrote
-    after the engine started shows up on the next list. An import that fails is logged and the
-    list still answers; a record that fails validation raises as before."""
-    rows = _read(record_path(workspace))
-    if rows:
+    An uninitialized record (no file yet) first takes what `import_from_env` finds, so a token the
+    connect flow wrote after the engine started shows up on the next list. A record that exists
+    but is empty is left alone: its rows were removed on purpose, and a lingering token must not
+    bring them back. An import that fails is logged and the list still answers; a record that
+    fails validation raises as before."""
+    path = record_path(workspace)
+    rows = _read(path)
+    if rows or path.exists():
         return rows
     try:
         if import_from_env(workspace=workspace, vault=vault):
-            rows = _read(record_path(workspace))
+            rows = _read(path)
     except Exception as e:  # noqa: BLE001 - the list answers even when nothing could be imported
         logging.getLogger(__name__).warning("connections: import on an empty record failed (%s)", type(e).__name__)
     return rows

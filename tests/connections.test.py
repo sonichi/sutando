@@ -664,6 +664,15 @@ class ImportFromChannelFile(ChannelFileBase):
 
 
 class ListSelfHeals(ChannelFileBase):
+    def test_an_explicitly_emptied_record_is_not_refilled_from_the_file(self):
+        self.write_relay_env(f"REMOTE_TASK_TOKEN={TOKEN_A}")
+        self.assertEqual(len(C.list_connections(self.ws, vault=self.vault)), 1)
+        C.remove_connection("", force=True, workspace=self.ws, vault=self.vault)
+        self.assertTrue(C.record_path(self.ws).exists(), "removal leaves an initialized, empty record")
+        self.assertEqual(C.list_connections(self.ws, vault=self.vault), [],
+                         "a removed row must not come back while its token still sits in the file")
+        self.assertEqual(C.list_connections(self.ws, vault=self.vault), [], "and stays gone on the next list")
+
     def test_an_empty_record_imports_the_file_token_and_persists_it(self):
         self.write_relay_env(f"REMOTE_TASK_TOKEN={TOKEN_A}")
         rows = C.list_connections(self.ws, vault=self.vault)
