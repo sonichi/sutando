@@ -1473,5 +1473,21 @@ class AUsageLimitBannerTheSeatHasOutrun(unittest.TestCase):
                                            capture=self.PANE, baseline=base))
         self.assertFalse(pg.limit_is_stale(abn, "/nonexistent-ws", None, None))
 
+class SharedLimitStepUnknownQueueHolds(unittest.TestCase):
+    """limit_step: only a queue read as empty (False) outruns a banner; unknown holds."""
+
+    PANE = ("\u276f task-1\n\u23bf You've hit your usage limit \u00b7 resets 3pm\n"
+            "\u273b Cooked for 1s\n\n\u2500\u2500\u2500\u2500\n\u276f \n\u2500\u2500\u2500\u2500\n"
+            "  Usage limit reached \u00b7 resets 3pm\n")
+
+    def step(self, owes):
+        return pg.limit_step(self.PANE, None, "/nonexistent-ws", owes_work=owes)[0]
+
+    def test_empty_queue_outruns_but_unknown_and_owed_hold(self):
+        self.assertTrue(self.step(False))
+        self.assertFalse(self.step(None))
+        self.assertFalse(self.step(True))
+
+
 if __name__ == "__main__":
     unittest.main()
