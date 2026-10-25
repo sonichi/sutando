@@ -567,9 +567,17 @@ are not part of the key. The room, thread and body stored when the item is first
 are what is sent, as one `POST /v1/room` `op: message` with that item's `dedupe_key` (and
 `thread_root` when it posts in a thread). The logged `outbox_cli.py requeue <item> --body-id
 <stem> --body-sha256 <digest>` restores exactly that item's quarantined body (one name can
-hold several parked generations) under its file name, which maps back to the same item. A
-stored destination that no longer matches the resolved one (an owner DM that moved after a
-refusal) holds the file, logged once; it is never re-routed. The outbox owns the claim, the retry and the outcome; the drain only
+hold several parked generations) under its file name, which maps back to the same item; the
+CLI refuses an empty digest, and a missing one while several bodies are parked, before it
+changes anything. When the body cannot be read at park time, no runnable command is printed.
+A stored destination that no longer matches the resolved one (an owner DM that moved after a
+refusal) parks the item `destination-changed` and moves the file to `results/undelivered/`;
+it is never re-routed, and the logged release sends it to its stored room.
+
+The file is still claimed by rename (`.sending.<pid>`, recovered by `_recover_orphan_proactive`
+when its owner dies): that is what keeps the other bridges polling `results/proactive-*.txt`
+off it. It does not decide delivery; the outbox item's claim and dispatch mark do, so a file
+recovered back to `.txt` maps to the same item and is never sent twice. The outbox owns the claim, the retry and the outcome; the drain only
 moves the file as the outcome says. The room send is neither idempotent nor reconcilable,
 so:
 

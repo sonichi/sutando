@@ -181,7 +181,7 @@ def canonical_result(results_dir: Path, task_id: str) -> Path:
     return Path(results_dir) / f"{_stem(task_id)}.txt"
 
 
-def _sha256_of(path: Path) -> Optional[str]:
+def sha256_of(path: Path) -> Optional[str]:
     try:
         return hashlib.sha256(Path(path).read_bytes()).hexdigest()
     except OSError:
@@ -228,7 +228,7 @@ def restore(results_dir: Path, task_id: str,
     """
     found = find_quarantined(results_dir, task_id)
     if body_sha256:
-        found = [p for p in found if _sha256_of(p) == body_sha256]  # one generation, never another
+        found = [p for p in found if sha256_of(p) == body_sha256]  # one generation, never another
     if not found:
         return RestoreOutcome.NOTHING_QUARANTINED, None
     target = canonical_result(results_dir, task_id)

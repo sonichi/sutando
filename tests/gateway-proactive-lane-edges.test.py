@@ -93,7 +93,7 @@ def restore_by_generation() -> None:
           "restore by digest installs that generation, not the newest")
     check(undelivered_quarantine.restore(results, "proactive-g", body_sha256="0" * 64)[0]
           is undelivered_quarantine.RestoreOutcome.NOTHING_QUARANTINED, "an unmatched digest restores nothing")
-    check(undelivered_quarantine._sha256_of(results / "absent") is None, "an unreadable copy has no digest")
+    check(undelivered_quarantine.sha256_of(results / "absent") is None, "an unreadable copy has no digest")
     check(src_outbox.dispatch_unsettled({"provider_ref": "$e"}) and src_outbox.dispatch_unsettled({"dispatching": {}})
           and not src_outbox.dispatch_unsettled({}), "unsettled means a receipt or a mark")
     root = results / ".outbox-x"
@@ -224,8 +224,8 @@ def bridge_edges() -> None:
         lane.drain()
     finally:
         Path.read_bytes = real_bytes
-    check(lane.where("proactive-unread") == "undelivered" and any("--body-sha256 ''" in m for m in lane.logs),
-          "a parked body that cannot be read still parks, with an empty digest")
+    check(lane.where("proactive-unread") == "undelivered" and any("NO recovery command" in m for m in lane.logs),
+          "a parked body that cannot be read still parks, with no runnable command")
 
 
 def main() -> int:

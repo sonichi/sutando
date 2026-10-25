@@ -6,8 +6,10 @@
   2. a restart past the retry deadline     -> a recorded receipt settles DELIVERED, an
      interrupted send parks outcome-unknown; neither is spent as an exhausted retry
   3. a crash right after the final refusal  -> the operator's requeue sends it (no stale mark)
-  4. the owner DM changes after a refusal   -> the item is held, never re-routed, and goes to
-     its own room once they agree again
+  4. the owner DM changes after a refusal   -> the item is held (parked), never re-routed, and
+     the logged operator release sends it to its own stored room, once
+  5. A's body cannot be read when it parks, then B parks under the same name -> A gets no
+     runnable command; an empty digest, or none at all, is refused before any change
 
 Run: python3 tests/gateway-proactive-recovery-edges.test.py
 """
@@ -182,17 +184,62 @@ def dm_changes_after_refusal() -> None:
     n = len(lane.posts)
     lane.drain()
     lane.drain()
-    check(len(lane.posts) == n and lane.where("proactive-4") == "pending",
-          f"4. held after the DM moved, not re-routed ({len(lane.posts) - n} POSTs, {lane.where('proactive-4')})")
+    item_id = gb._proactive_item_id("proactive-4", "four")
+    item = vendored.read_item(lane.results / ".outbox-ag2space-proactive", item_id) or {}
+    check(len(lane.posts) == n and lane.where("proactive-4") == "undelivered"
+          and item.get("reason") == "destination-changed",
+          f"4. held after the DM moved: not re-routed, parked, not re-claimed each pass "
+          f"({len(lane.posts) - n} POSTs, {lane.where('proactive-4')}, {item.get('reason')})")
     check(any("HELD" in m and pl.OWNER_DM in m and "!NewOwnerDm:ag2.space" in m for m in lane.logs),
           "4. the hold names the stored and the new room")
-    lane.owner_dm = pl.OWNER_DM
+    run = run_logged(lane, "proactive-4", 0)
+    check(run is not None and run.returncode == 0, f"4. the logged release runs ({run and run.stdout[-160:]})")
     lane.drain()
     check(len(lane.posts) == n + 1 and lane.posts[-1].get("room_id") == pl.OWNER_DM,
-          f"4. once they agree it goes to its own room ({lane.posts[-1].get('room_id') if lane.posts else None})")
+          f"4. the operator's release sends it to its own stored room, once "
+          f"({len(lane.posts) - n}, {lane.posts[-1].get('room_id') if lane.posts else None})")
+
+
+def unreadable_first_generation() -> None:
+    lane = pl.Lane(gb, ISO, timeout)
+    lane.write("proactive-5.txt", "body A\n")
+    real_bytes = Path.read_bytes
+    Path.read_bytes = lambda self: (_ for _ in ()).throw(OSError("unreadable")) \
+        if ".sending." in self.name else real_bytes(self)
+    try:
+        lane.drain()
+    finally:
+        Path.read_bytes = real_bytes
+    lane.write("proactive-5.txt", "body B\n")
+    lane.drain()
+    root = lane.results / ".outbox-ag2space-proactive"
+    a_id = gb._proactive_item_id("proactive-5", "body A")
+    a_lines = [m for m in lane.logs if a_id in m or ("proactive-5" in m and "NO recovery" in m)]
+    check(a_lines and not any("outbox_cli.py" in m for m in a_lines) and any("NO recovery command" in m for m in a_lines),
+          f"5. A's park prints no runnable command ({[m[-120:] for m in a_lines]})")
+    cmd = ["python3", "src/outbox_cli.py", "--root", str(root), "requeue", a_id,
+           "--body-id", "proactive-5", "--body-sha256", ""]
+    run = subprocess.run([sys.executable] + cmd[1:], cwd=REPO, env=isolated_child_env(),
+                         capture_output=True, text=True, timeout=60)
+    item = vendored.read_item(root, a_id) or {}
+    check(run.returncode != 0 and item.get("status") == "PARKED" and not (lane.results / "proactive-5.txt").exists(),
+          f"5. an empty digest is refused before any change (exit {run.returncode}, {item.get('status')})")
+    run = subprocess.run([sys.executable] + cmd[1:-2], cwd=REPO, env=isolated_child_env(),
+                         capture_output=True, text=True, timeout=60)
+    item = vendored.read_item(root, a_id) or {}
+    check(run.returncode != 0 and item.get("status") == "PARKED" and not (lane.results / "proactive-5.txt").exists(),
+          f"5. no digest while two bodies are parked is refused too (exit {run.returncode}, {item.get('status')})")
+    lane.respond = lambda payload: {"ok": True, "event_id": "$B"}
+    n = len(lane.posts)
+    for _ in range(2):
+        lane.drain()
+    left = sorted(p.read_text() for p in (lane.results / "undelivered").glob("proactive-5-*.txt"))
+    check(len(lane.posts) == n and "body B\n" in left,
+          f"5. B is not restored or sent in A's place ({len(lane.posts) - n} POSTs, parked {left})")
 
 
 def main() -> int:
+    unreadable_first_generation()
     two_generations()
     past_the_deadline(with_receipt=True)
     past_the_deadline(with_receipt=False)

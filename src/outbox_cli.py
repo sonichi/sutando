@@ -16,6 +16,7 @@ import argparse
 import getpass
 import json
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Optional
@@ -82,14 +83,33 @@ def cmd_inspect(args) -> int:
     return 0
 
 
+_SHA256_RE = re.compile(r"[0-9a-f]{64}")
+
+
 def cmd_requeue(args) -> int:
     """Exit 0 only when this call performed the transition; 3 = nothing to do;
     4 = the body could not be restored on this host (the record is left as
-    the requeue made it; the body stays listed in undelivered/).
+    the requeue made it; the body stays listed in undelivered/); 5 = refused before
+    anything changed: a malformed --body-sha256, or none while several bodies are parked.
 
     A distinct code matters for the idempotent re-run: "already queued" is not
     a failure, and a script must be able to tell it from "I recovered it".
     """
+    sha = getattr(args, "body_sha256", None)
+    if sha is not None and not _SHA256_RE.fullmatch(sha):
+        # Refused before any state change: an empty or partial digest would restore any copy.
+        _emit({"item_id": args.item_id, "result": "refused",
+               "error": "--body-sha256 must be a 64-character hex digest"}, args.json)
+        return 5
+    if sha is None:
+        copies = undelivered_quarantine.find_quarantined(
+            args.results_dir or Path(args.root).parent, getattr(args, "body_id", None) or args.item_id)
+        if len(copies) > 1:
+            # Several parked generations: which one is this item's is the operator's call, not "newest".
+            _emit({"item_id": args.item_id, "result": "refused",
+                   "error": "several quarantined bodies share this name; pass --body-sha256 for one",
+                   "candidates": {str(p): undelivered_quarantine.sha256_of(p) for p in copies}}, args.json)
+            return 5
     result, epoch_written = outbox.requeue_item_with_epoch(
         args.root, args.item_id,
         reset_attempts=args.reset_attempts,
@@ -108,7 +128,6 @@ def cmd_requeue(args) -> int:
             payload["resend_epoch"] = epoch_written
         results_dir = args.results_dir or Path(args.root).parent
         body_id = getattr(args, "body_id", None) or args.item_id
-        sha = getattr(args, "body_sha256", None)
         outcome, path = (undelivered_quarantine.restore(results_dir, body_id, body_sha256=sha) if sha
                          else undelivered_quarantine.restore(results_dir, body_id))
         payload["body_id"] = body_id

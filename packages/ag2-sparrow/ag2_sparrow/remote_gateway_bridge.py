@@ -5559,8 +5559,7 @@ def _room_is_deliverable_here(room: str) -> bool:
 
 _EVENT_ID_RE = re.compile(r"\$\S+")
 _ROOM_UPGRADED = "room-upgraded"
-# (item, room) pairs already logged as held for a changed destination: one line each per process.
-_DESTINATION_HELD: "set[tuple[str, str]]" = set()
+_DESTINATION_CHANGED = "destination-changed"
 
 
 def _payload_room(payload) -> "str | None":
@@ -5951,16 +5950,20 @@ def _send_proactive(claim: Path, f: Path, envelope: dict, owner_dm: bool, notice
                                 reason="the room is no longer held", payload=payload.decode("utf-8"))
     stored = read_item(core.backend.root, item_id) or {}
     stored_room = _payload_room(stored.get("payload"))
-    if (stored.get("status") not in core.backend.TERMINAL and stored_room != envelope["room_id"]
+    if (stored.get("status") == "READY" and stored_room != envelope["room_id"]
             and not dispatch_unsettled(stored)):
+        # Held for the operator, never re-routed: a requeue (QUEUED) sends it to its stored room.
+        core.backend.park(item_id, _DESTINATION_CHANGED)
         try:
-            claim.rename(f)  # held, never re-routed: the stored destination is the item's
+            body_sha256 = hashlib.sha256(claim.read_bytes()).hexdigest()
         except OSError:
-            pass
-        if (item_id, envelope["room_id"]) not in _DESTINATION_HELD:
-            _DESTINATION_HELD.add((item_id, envelope["room_id"]))
-            _log(f"proactive {f.name} HELD: it was queued for {stored_room} and its destination now "
-                 f"resolves to {envelope['room_id']}; it is not re-routed and waits until they agree")
+            body_sha256 = ""
+        _retire_proactive(claim, f, UNDELIVERABLE_RESULTS_DIR)
+        release = (f"to send it to {stored_room}: "
+                   f"{_proactive_requeue_command(core.backend.root, item_id, body_sha256)}" if body_sha256
+                   else "NO release command: its body could not be read to pin its parked copy")
+        _log(f"proactive {f.name} HELD in {UNDELIVERABLE_RESULTS_DIR.name}/: it was queued for {stored_room} "
+             f"and its destination now resolves to {envelope['room_id']}; it is not re-routed. {release}")
         return
     result = core.deliver_one(item_id, payload)
     item = read_item(core.backend.root, item_id) or {}
@@ -6002,10 +6005,14 @@ def _send_proactive(claim: Path, f: Path, envelope: dict, owner_dm: bool, notice
             body_sha256 = ""
         _retire_proactive(claim, f, UNDELIVERABLE_RESULTS_DIR)
         if reason == "outcome-unknown":
+            # No digest, no command: an unfiltered restore can install another generation's body.
+            how = (f"to send it again (it may post twice): "
+                   f"{_proactive_requeue_command(core.backend.root, item_id, body_sha256)}" if body_sha256
+                   else f"NO recovery command: its body could not be read to pin which parked copy "
+                        f"is its own; requeue {item_id} by hand with --body-sha256 of that copy")
             _log(f"proactive {f.name} may have reached {room} but the send was not confirmed "
                  f"({result.detail or 'no outcome'}); PARKED to {UNDELIVERABLE_RESULTS_DIR.name}/, not "
-                 f"sent again. Check the room first; to send it again (it may post twice): "
-                 f"{_proactive_requeue_command(core.backend.root, item_id, body_sha256)}")
+                 f"sent again. Check the room first; {how}")
         else:
             _log(f"proactive {f.name} PARKED to {UNDELIVERABLE_RESULTS_DIR.name}/ ({reason}"
                  f"{': ' + result.detail if result.detail else ''}) — it will NOT be re-sent")
