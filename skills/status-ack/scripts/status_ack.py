@@ -43,6 +43,7 @@ import ack_claim
 import ack_overlap
 import local_record
 import proactive_routing
+import skill_config
 import status_ack_policy as policy
 from activity_bus import cancel_target
 from outbox import list_items
@@ -61,7 +62,6 @@ CFG_DEADLINE = {"urgent": "STATUS_ACK_FIRST_ACK_DEADLINE_URGENT_S",
                 "low": "STATUS_ACK_FIRST_ACK_DEADLINE_LOW_S"}
 CFG_POLL = "STATUS_ACK_POLL_S"
 CFG_WATCHER_DOWN = "STATUS_ACK_WATCHER_DOWN_AFTER_S"
-_TRUE = ("1", "true", "yes", "on")
 #: Sources with no attested Matrix room and event: never acknowledged here.
 NON_MATRIX_SOURCES = frozenset({"discord", "telegram", "slack", "voice", "phone", "whatsapp", "imessage"})
 #: How often the hosted loop prunes first-seen and ack-claim records of tasks that left the queue.
@@ -71,23 +71,12 @@ OWNER_ALERT = ("The core is not reading its task inbox: only the standby watcher
 
 
 def manifest_config(manifest: Optional[Path] = None) -> dict:
-    try:
-        data = json.loads((manifest or SKILL_DIR / "manifest.json").read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
-    cfg = data.get("config") if isinstance(data, dict) else None
-    return cfg if isinstance(cfg, dict) else {}
+    return skill_config.manifest_config(manifest or SKILL_DIR / "manifest.json")
 
 
 def config_value(key: str, cli=None, environ=None, manifest_cfg=None) -> str:
     """CLI > env > manifest config; an empty value counts as unset."""
-    if cli is not None and str(cli).strip():
-        return str(cli).strip()
-    env = os.environ if environ is None else environ
-    if str(env.get(key) or "").strip():
-        return str(env[key]).strip()
-    cfg = manifest_config() if manifest_cfg is None else manifest_cfg
-    return str(cfg.get(key) or "").strip()
+    return skill_config.config_value(key, SKILL_DIR / "manifest.json", cli, environ, manifest_cfg)
 
 
 def _positive(raw: str, default: float) -> float:
@@ -109,7 +98,7 @@ class Settings:
 def settings(enabled=None, environ=None, manifest_cfg=None) -> Settings:
     get = lambda k, c=None: config_value(k, c, environ, manifest_cfg)  # noqa: E731
     deadlines = {p: _positive(get(k), policy.DEFAULT_FIRST_ACK_DEADLINE_S[p]) for p, k in CFG_DEADLINE.items()}
-    return Settings(enabled=get(CFG_ENABLED, enabled).lower() in _TRUE, deadlines=deadlines,
+    return Settings(enabled=get(CFG_ENABLED, enabled).lower() in skill_config.TRUE, deadlines=deadlines,
                     poll_s=_positive(get(CFG_POLL), 15.0), watcher_down_after_s=_positive(get(CFG_WATCHER_DOWN), 120.0))
 
 

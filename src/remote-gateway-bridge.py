@@ -374,6 +374,20 @@ def _ag2space_proactive_ack_gate(task_id: str, item_id: str):
     return initial_ack_veto(task_id, item_id, WS, _ag2space_worker_holder)
 
 
+_STATUS_ACK_MANIFEST = _REPO / "skills" / "status-ack" / "manifest.json"
+
+
+def _status_ack_gate(environ=None):
+    """The initial-ack dispatch gate only while status-ack is enabled; off, or unreadable, it is
+    not installed, so no status-ack code runs on any proactive send."""
+    try:
+        from skill_config import enabled
+        on = enabled("STATUS_ACK_ENABLED", _STATUS_ACK_MANIFEST, environ)
+    except Exception:  # noqa: BLE001 - a switch that cannot be read is off
+        return None
+    return _ag2space_proactive_ack_gate if on else None
+
+
 def _ag2space_proactive_route_gate(task_id: str, room: str, thread_root):
     """Right before a message about a task is sent: why its room and thread are not the task's own, or None."""
     from proactive_dispatch_gate import route_veto
@@ -386,7 +400,7 @@ PROACTIVE_CLAIM_GATE = _ag2space_proactive_claim_gate
 PROACTIVE_ROOM_GATE = _ag2space_proactive_room_gate
 OWNER_DM_UPGRADED_NOTIFY = _ag2space_owner_dm_upgraded
 PROACTIVE_DISPATCH_GATE = _ag2space_proactive_dispatch_gate
-PROACTIVE_ACK_GATE = _ag2space_proactive_ack_gate
+PROACTIVE_ACK_GATE = _status_ack_gate()
 PROACTIVE_ROUTE_GATE = _ag2space_proactive_route_gate
 
 if _RUN_MAIN:  # pragma: no cover — script-entry tail; the subprocess suite drives it

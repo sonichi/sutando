@@ -31,6 +31,10 @@ from _helpers.hermetic_gateway import isolate_then_import  # noqa: E402
 
 gb, _IMPORT_READS = isolate_then_import(env={"REMOTE_PROACTIVE_ROOM": ""})
 from _helpers import proactive_lane as pl  # noqa: E402
+
+import os  # noqa: E402
+
+os.environ["STATUS_ACK_ENABLED"] = "1"  # these cases are the feature switched on
 from _helpers import status_ack_env as sa  # noqa: E402
 
 import ack_claim  # noqa: E402

@@ -517,18 +517,29 @@ def _initial_ack_gate(task_file: "str | None") -> "tuple[bool, tuple | None]":
     return False, None
 
 
-def _record_sent(task_file: "str | None") -> None:
-    """Mark that a progress notice for the task was actually sent: `progress:<task>:sent`, the
-    only evidence another sender reads as a progress notice. Fail-open: a send is never undone."""
-    if not task_file or _ACK_ARBITRATION is None:
-        return
-    ack_claim, _, task_id_for = _ACK_ARBITRATION
+_STATUS_ACK_MANIFEST = Path(__file__).resolve().parents[2] / "status-ack" / "manifest.json"
+
+
+def _status_ack_on() -> bool:
     try:
+        from skill_config import enabled  # type: ignore
+        return enabled("STATUS_ACK_ENABLED", _STATUS_ACK_MANIFEST)
+    except Exception:
+        return False
+
+
+def _record_sent(task_file: "str | None") -> None:
+    """While status-ack is on, mark that a progress notice for the task was actually sent
+    (`progress:<task>:sent`). Best-effort after a send: nothing here can fail the notify."""
+    try:
+        if not task_file or _ACK_ARBITRATION is None or not _status_ack_on():
+            return
+        ack_claim, _, task_id_for = _ACK_ARBITRATION
         path = _task_payload(task_file)
         tid = task_id_for(path) if path is not None else None
         if tid:
             ack_claim.claim(path.parent.parent, f"progress:{tid}:sent", ACK_HOLDER)
-    except (OSError, ValueError):
+    except Exception:
         pass
 
 

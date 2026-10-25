@@ -1362,14 +1362,26 @@ def main() -> int:
     check(getattr(rtc.PROACTIVE_DISPATCH_GATE, "__name__", "") == "_ag2space_proactive_dispatch_gate"
           and "left the queue" in str(rtc.PROACTIVE_DISPATCH_GATE("task-1761300000000"))
           and getattr(rtc.PROACTIVE_ROUTE_GATE, "__name__", "") == "_ag2space_proactive_route_gate"
-          and getattr(rtc.PROACTIVE_ACK_GATE, "__name__", "") == "_ag2space_proactive_ack_gate"
-          and rtc.PROACTIVE_ACK_GATE("task-1761300000000", "proactive-x~0") is None,
-          "sutando loader wires the dispatch, ack and route gates; a task not in the queue is withdrawn")
+          and rtc.PROACTIVE_ACK_GATE is None,
+          "sutando loader wires the dispatch and route gates, and no ack gate while status-ack is off")
+    _on = rtc._status_ack_gate({"STATUS_ACK_ENABLED": "1"})
+    _saved_sc = sys.modules.get("skill_config")
+    sys.modules["skill_config"] = None
+    try:
+        _broken = rtc._status_ack_gate({"STATUS_ACK_ENABLED": "1"})
+    finally:
+        if _saved_sc is None:
+            sys.modules.pop("skill_config", None)
+        else:
+            sys.modules["skill_config"] = _saved_sc
+    check(_on is rtc._ag2space_proactive_ack_gate and _on("task-1761300000000", "proactive-x~0") is None
+          and rtc._status_ack_gate({"STATUS_ACK_ENABLED": "0"}) is None and _broken is None,
+          "the ack gate is installed only when status-ack is on; an unreadable switch installs none")
     import proactive_dispatch_gate as _pdg
     _seen, _real_veto = [], _pdg.initial_ack_veto
     _pdg.initial_ack_veto = lambda *a, **k: _seen.append(a) or None
     try:
-        rtc.PROACTIVE_ACK_GATE("task-1761300000000", "proactive-x~0")
+        _on("task-1761300000000", "proactive-x~0")
     finally:
         _pdg.initial_ack_veto = _real_veto
     _hws = Path(tempfile.mkdtemp(prefix="ack-gate-holder-"))

@@ -13,10 +13,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional
 
-import ack_claim
-import ack_overlap
 from activity_bus import TERMINAL, ActivityStore, cancel_target
-from status_ack_policy import ack_key, destination
+from status_ack_policy import destination
 from task_archive import find_task_file
 from task_envelope import attested_task_headers, verify_text
 from workspace_default import resolve_workspace
@@ -45,6 +43,9 @@ def dispatch_veto(task_id: str, workspace: Optional[Path] = None) -> Optional[st
 def initial_ack_veto(task_id: str, item_id: str, workspace: Optional[Path] = None, holder=None) -> Optional[str]:
     """For the outbox item the task's initial-ack claim names (its `via` file), why it would now
     duplicate the card or a progress notice; None for every other message about the task."""
+    import ack_claim
+    import ack_overlap
+    from status_ack_policy import ack_key
     ws = Path(workspace) if workspace is not None else resolve_workspace()
     rec = ack_claim.read(ws, ack_key(task_id))
     via = rec.get("via") if rec else None
