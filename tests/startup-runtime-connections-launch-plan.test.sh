@@ -79,6 +79,23 @@ out="$(run_lanes FAKE_PRIMARY=)"
 [ "$(sed -n 's/^REMOTE_PROACTIVE_ROOM=//p' "$OUT/primary.env")" = "!owner:prod.example" ] \
   && ok "an explicit legacy primary keeps the room" || bad "legacy room with legacy primary: $(cat "$OUT/primary.env")"
 
+echo "== a room absent from the shell (the desktop's device env holds it) stays UNSET, never empty =="
+run_lanes_noroom() {
+  env -i PATH="$PATH" HOME="$BOX" REPO="$REPO" PY="$BOX/py" LOGS_DIR="$LOGS_DIR" \
+      FAKE_PLAN="$BOX/plan" FAKE_OUT="$OUT" \
+      REMOTE_TASK_TOKEN="https://gw.primary.example|primary-secret" "$@" \
+      bash -c '. "$REPO/src/startup-runtime.sh" >/dev/null 2>&1; start_gateway_lanes; wait' 2>&1
+}
+out="$(run_lanes_noroom)"
+[ "$(sed -n 's/^REMOTE_PROACTIVE_ROOM=//p' "$OUT/primary.env")" = "<unset>" ] \
+  && ok "no record: the legacy bridge is launched with the room unset" || bad "unset room became: $(cat "$OUT/primary.env")"
+out="$(run_lanes_noroom FAKE_PRIMARY=)"
+[ "$(sed -n 's/^REMOTE_PROACTIVE_ROOM=//p' "$OUT/primary.env")" = "<unset>" ] \
+  && ok "legacy primary: still unset" || bad "unset room with legacy primary became: $(cat "$OUT/primary.env")"
+out="$(run_lanes_noroom FAKE_PRIMARY=s-space)"
+[ "$(sed -n 's/^REMOTE_PROACTIVE_ROOM=//p' "$OUT/primary.env")" = "" ] \
+  && ok "named primary: set empty even when the shell had none" || bad "named primary, no shell room: $(cat "$OUT/primary.env")"
+
 echo "== a failed import-env still launches from the plan, and says so =="
 rm -f "$OUT"/*.env "$OUT/calls"
 out="$(run_lanes FAKE_IMPORT_FAIL=1)"

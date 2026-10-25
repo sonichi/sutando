@@ -539,12 +539,13 @@ start_gateway_lanes() {
     # and skips its own bare-launch file log. See remote_gateway_bridge._log.
     if [ -n "$PY" ]; then
       # Once a named row holds the primary, the legacy bridge is a secondary: it must not
-      # inherit the proactive room, or two bridges post nudges.
-      _gw_legacy_room="${REMOTE_PROACTIVE_ROOM-}"
+      # inherit the proactive room, or two bridges post nudges. Otherwise the variable passes
+      # through as is, unset included: the bridge reads the device env only when unset.
       if _gw_primary="$("$PY" "$REPO/scripts/connections.py" primary 2>/dev/null)" && [ -n "$_gw_primary" ]; then
-        _gw_legacy_room=""
+        SUTANDO_SUPERVISED=1 REMOTE_PROACTIVE_ROOM="" "$PY" "$REPO/src/remote-gateway-bridge.py" >> "$LOGS_DIR/remote-gateway-bridge.log" 2>&1 &
+      else
+        SUTANDO_SUPERVISED=1 "$PY" "$REPO/src/remote-gateway-bridge.py" >> "$LOGS_DIR/remote-gateway-bridge.log" 2>&1 &
       fi
-      SUTANDO_SUPERVISED=1 REMOTE_PROACTIVE_ROOM="$_gw_legacy_room" "$PY" "$REPO/src/remote-gateway-bridge.py" >> "$LOGS_DIR/remote-gateway-bridge.log" 2>&1 &
       echo "  ✓ gateway bridge (self-defers if already running)"
     else
       echo "  ⊘ gateway bridge skipped — no runnable python3"

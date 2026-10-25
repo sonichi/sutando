@@ -11,16 +11,18 @@ fail=0
 PY="$(require_python "$REPO" "run the gateway wrapper primary-room test")" || exit 1
 
 # $1 = what `connections.py primary` answers: "none" (exit 2), "" (legacy row primary) or a slug
-# $2 = where the room comes from: "env" or "dotenv"
+# $2 = where the room comes from: "env", "dotenv", or "device" (only in the desktop's device env,
+#      which the wrapper never sources: the child must see the variable UNSET, not empty, so the
+#      bridge still reads it from there)
 # Prints the REMOTE_PROACTIVE_ROOM the stub bridge saw, or "<missing>".
 run_case() {
   local primary="$1" via="$2" d room_env=""
   d=$(mktemp -d); mkdir -p "$d/src/launchd" "$d/scripts" "$d/ws/state/channel-bridge-supervisor" "$d/ws/results" "$d/shims"
-  if [ "$via" = dotenv ]; then
-    printf 'REMOTE_PROACTIVE_ROOM=!owner:prod.example\n' > "$d/channel.env"
-  else
-    room_env="!owner:prod.example"
-  fi
+  case "$via" in
+    dotenv) printf 'REMOTE_PROACTIVE_ROOM=!owner:prod.example\n' > "$d/channel.env";;
+    env) room_env="!owner:prod.example";;
+    device) printf 'REMOTE_PROACTIVE_ROOM=!owner:prod.example\n' > "$d/device.env";;
+  esac
   cat > "$d/scripts/sutando-config.sh" <<EOS
 #!/bin/bash
 case "\${1:-}" in workspace) echo "$d/ws" ;; *) echo "$d/channel.env" ;; esac
@@ -63,4 +65,7 @@ check "legacy row primary, room from env: keeps the room"                 "$(run
 check "named row primary, room from env: launched with the room empty"    "$(run_case s-space env)" ""
 check "named row primary, room from the channel .env: also empty"         "$(run_case s-space dotenv)" ""
 check "no record, room from the channel .env: keeps the room"             "$(run_case none dotenv)" "!owner:prod.example"
+check "no record, room only in the device env: left UNSET for the bridge" "$(run_case none device)" "<missing>"
+check "legacy row primary, room only in the device env: left UNSET"       "$(run_case "" device)"   "<missing>"
+check "named row primary, room only in the device env: set empty"         "$(run_case s-space device)" ""
 exit $fail

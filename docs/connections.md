@@ -129,7 +129,9 @@ the same name or the vault, empty `REMOTE_TASK_URL`, `REMOTE_TASK_CHANNEL_DIR`,
 `connections.launch_env`, nowhere else. The legacy unsuffixed bridge keeps both of its launch
 paths (the launchd wrapper, and the bare launch when no job is installed); each asks
 `connections.py primary` before every launch, and once a named row holds the primary launches
-with `REMOTE_PROACTIVE_ROOM` empty, so exactly one bridge posts nudges.
+with `REMOTE_PROACTIVE_ROOM` empty, so exactly one bridge posts nudges. Otherwise the variable
+passes through untouched, unset included: the bridge reads the desktop's device env only when it
+is unset, so an exported empty value would silence nudges on a plain install.
 
 ## Surfaces
 
