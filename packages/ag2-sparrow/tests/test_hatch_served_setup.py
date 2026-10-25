@@ -3081,6 +3081,70 @@ class Upgrade(Base):
             path.write_text(json.dumps({"attempted": {"0.6.0": dict(base, outcome=outcome, phase=phase)}}))
             self.assertIn("left unverified files", self_upgrade.recovery_blocked(self.state))
 
+    ORPHAN_RESTORE_FAILED = {"attempted": {}, "failed": {
+        "target": "0.6.0", "from": "0.5.4", "installed": "0.6.0", "why": "restore failed",
+        "at": 1.0, "outcome": "restore-failed", "problems": ["changed package bytes"]}}
+
+    def test_an_orphan_restore_failed_summary_holds_keepawake_and_release_hold(self):
+        path, log = self_upgrade.state_path(self.state), self.home / "log"
+        self.state.mkdir(parents=True, exist_ok=True)
+        text = json.dumps(self.ORPHAN_RESTORE_FAILED)
+        path.write_text(text)
+        with self.assertRaises(self_upgrade.JournalError):
+            self_upgrade.load_state(self.state)
+        self.assertIn("cannot be read", self_upgrade.recovery_blocked(self.state) or "")
+        self.assertEqual(self.keepawake_restarts(), (1, 0))
+        self.assertIn("listener=down restarted=0 reason=upgrade-failed", log.read_text())
+        with mock.patch.object(self_upgrade, "verify_installed", return_value=[]):
+            held = self_upgrade.release_hold(self.state)
+        self.assertIn("cannot be read", held or "")
+        self.assertEqual(path.read_text(), text, "the hold is not cleared or rewritten")
+        self.assertIn("cannot be read", self_upgrade.recovery_blocked(self.state) or "")
+        self.assertEqual(self.keepawake_restarts(6000.0), (1, 0))
+
+    def test_a_summary_with_no_matching_attempt_holds_restarts(self):
+        path = self_upgrade.state_path(self.state)
+        self.state.mkdir(parents=True, exist_ok=True)
+        tried = {"from": "0.5.4", "at": 1.0}
+        summary = {"target": "0.6.0", "from": "0.5.4", "at": 2.0}
+        bad = [{"attempted": {"0.7.0": dict(tried, outcome="crashed", phase="crashed")},
+                "failed": summary},
+               {"attempted": {"0.6.0": dict(tried, outcome="crashed", phase="crashed")},
+                "failed": dict(summary, outcome="restore-failed")},
+               {"attempted": {"0.6.0": dict(tried, outcome="started", phase="quiesced")},
+                "failed": dict(summary, outcome="rolled-back")},
+               {"attempted": {"0.6.0": dict(tried, outcome="ok", phase="ok")},
+                "failed": dict(summary, outcome="ok")},
+               {"attempted": {"0.6.0": dict(tried, outcome="crashed", phase="crashed")},
+                "failed": dict(summary, target=["0.6.0"])},
+               {"attempted": {"0.6.0": dict(tried, outcome="crashed", phase="crashed")},
+                "failed": dict(summary, at="2")},
+               {"attempted": {}, "installed": {"version": "0.6.0", "at": 2.0}},
+               {"attempted": {"0.6.0": dict(tried, outcome="restore-failed", phase="acknowledged")},
+                "installed": {"version": "0.6.0", "at": 2.0}},
+               {"attempted": {"0.6.0": dict(tried, outcome="ok", phase="ok")},
+                "installed": {"version": "0.6.0"}}]
+        for journal in bad:
+            path.write_text(json.dumps(journal))
+            self.assertIn("cannot be read", self_upgrade.recovery_blocked(self.state) or "", journal)
+            self.assertEqual(self.keepawake_restarts(), (1, 0), journal)
+
+    def test_a_failure_summary_survives_an_acknowledged_direct_rerun(self):
+        with mock.patch.object(self_upgrade, "restore", side_effect=OSError("disk full")):
+            self.connected.side_effect = [1]
+            self.assertEqual(self.run_upgrade(self.fake()), "restore-failed")
+        state = self_upgrade.load_state(self.state)
+        self.assertEqual(state["failed"]["outcome"], "restore-failed")
+        self.assertIsNotNone(self_upgrade.recovery_blocked(self.state))
+        self.assertTrue(self_upgrade.clear_blocked(self.state))
+        self.assertIsNone(self_upgrade.recovery_blocked(self.state), "acknowledged")
+        self_upgrade._attempt(self.state, "0.6.0")
+        self_upgrade._finish(self.state, "0.6.0", "no-download")
+        state = self_upgrade.load_state(self.state)
+        self.assertEqual((state["failed"]["outcome"], state["attempted"]["0.6.0"]["outcome"]),
+                         ("restore-failed", "no-download"))
+        self.assertIsNone(self_upgrade.recovery_blocked(self.state))
+
     def test_keepawake_never_restarts_on_unverified_files_or_a_failed_settlement(self):
         # A dead mutating attempt with no snapshot: restore-failed, the listener stays down.
         self.start(self.setup(), now=1000.0)
@@ -3758,8 +3822,9 @@ class Health(Base):
         log.write_text(f"{keepalive._utc(1000)} keepawake listener=up restarted=0\n")
         row = keepalive.health_row(cfg, log, now=1010)
         self.assertNotEqual(row["reason"], self_upgrade.UPGRADE_FAILED)
-        self_upgrade.save_state(self.state, {"attempted": {}, "failed": {
-            "target": "9.9", "from": PKG_VERSION, "at": 1005}})
+        self_upgrade.save_state(self.state, {"attempted": {"9.9": {
+            "at": 1000, "from": PKG_VERSION, "outcome": "rolled-back", "phase": "rolled-back"}},
+            "failed": {"target": "9.9", "from": PKG_VERSION, "at": 1005, "outcome": "rolled-back"}})
         row = keepalive.health_row(cfg, log, now=1010)
         self.assertEqual((row["condition"], row["reason"], row["since"]),
                          ("abnormal", self_upgrade.UPGRADE_FAILED, 1005.0))

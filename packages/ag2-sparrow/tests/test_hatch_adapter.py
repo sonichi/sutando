@@ -2161,8 +2161,9 @@ class Keepalive(Base):
         self.sparrow_status()
         self.keepawake_at(time.time() - 60)
         self.hook_ran(age_s=5)
-        (self.state / "hatch-upgrade.json").write_text(json.dumps({"attempted": {}, "failed": {
-            "target": "9.9", "from": __version__, "at": time.time() - 30}}))
+        (self.state / "hatch-upgrade.json").write_text(json.dumps({"attempted": {"9.9": {
+            "at": time.time() - 60, "from": __version__, "outcome": "crashed", "phase": "crashed"}},
+            "failed": {"target": "9.9", "from": __version__, "at": time.time() - 30}}))
         row = self.health()
         self.assertEqual((row["condition"], row["reason"]), ("abnormal", "upgrade-failed"))
         self.assertEqual(hc.validate(row), (row, None))

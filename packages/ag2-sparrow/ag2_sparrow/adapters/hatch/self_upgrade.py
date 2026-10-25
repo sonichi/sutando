@@ -74,6 +74,7 @@ UPGRADE_FAILED = _keepalive.UPGRADE_FAILED
 STALE_START_S = 30 * 60
 # Phases written under the lock; a dead attempt in one of these may have changed files.
 MUTATING_PHASES = ("installing", "installed", "restoring")
+SUMMARY_OUTCOMES = ("crashed", "rolled-back", "restore-failed")
 WORKING_PHASES = ("snapshot", "quiesced", *MUTATING_PHASES)
 TERMINAL = frozenset(("crashed", "rolled-back", "restore-failed", "ok", "not-started",
                       "unsupported-install", "not-above-installed", "no-download",
@@ -144,14 +145,30 @@ def _legal(outcome, phase) -> bool:
 
 def _well_formed_journal(state) -> bool:
     """The journal as save_state writes it: an `attempted` map of well-formed attempts,
-    optional `failed` and `installed` maps, and nothing else."""
+    optional `failed` and `installed` summaries of attempts in it, and nothing else."""
     if not isinstance(state, dict) or not isinstance(state.get("attempted"), dict):
         return False
     if set(state) - {"attempted", "failed", "installed"}:
         return False
-    if any(not isinstance(state[k], dict) for k in ("failed", "installed") if k in state):
+    if not all(_well_formed(t) for t in state["attempted"].values()):
         return False
-    return all(_well_formed(t) for t in state["attempted"].values())
+    failed = state.get("failed", {})
+    outcome = failed.get("outcome", "crashed") if isinstance(failed, dict) else None
+    return (("failed" not in state or (outcome in SUMMARY_OUTCOMES
+                                       and _summarises(state["attempted"], failed, "target", outcome)))
+            and ("installed" not in state
+                 or _summarises(state["attempted"], state["installed"], "version", "ok")))
+
+
+def _summarises(attempted: dict, summary, key: str, outcome: str) -> bool:
+    """Whether a failed/installed summary names an attempt saved with it: in its outcome
+    when that attempt is not newer than the summary, else a later direct rerun's record."""
+    if not isinstance(summary, dict) or not isinstance(summary.get(key), str):
+        return False
+    tried, at = attempted.get(summary[key]), summary.get("at")
+    if tried is None or not isinstance(at, (int, float)) or isinstance(at, bool):
+        return False
+    return tried["at"] > at or tried["outcome"] == outcome
 
 
 def _well_formed(tried) -> bool:
