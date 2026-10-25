@@ -77,10 +77,11 @@ withdrew, what it skipped and why, and which claims it settled.
 
 - **One runner per workspace.** The loop holds `state/status-ack/runner.lock`; a second runner
   runs no pass while the first holds it.
-- **Startup recovery.** On its first pass, a claim this runner took but never stamped with its
-  published file, from a process that is gone, becomes `unknown`: it may have been published, so
-  it is never released and never re-announced. A claim a live process holds is left alone.
-  Confirmed and unknown claims are never touched.
+- **Startup recovery.** On its first pass, a claim this runner holds from a process that is gone,
+  whose file was never published (not in `results/`, not claimed by the gateway, not in
+  `results/archive/`, no outbox receipt), becomes `unknown`: it is never released and never
+  re-announced. A claim whose file was published is left for the receipt to settle; a claim a
+  live process holds is left alone. Confirmed and unknown claims are never touched.
 - **First-seen.** A task without an intake stamp is anchored at its first sighting, recorded
   create-only in `state/status-ack/first-seen/`, so a restart neither restarts its deadline nor
   loses it. Tasks that arrived while the runner was down get at most one line each.

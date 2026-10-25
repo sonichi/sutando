@@ -4,10 +4,12 @@ an uncertain send. Each restart is a fresh runner module running `serve()`; asse
 fake room endpoint of the gateway's real proactive drain.
 
   a) a task acked (confirmed) before the restart stays acked: no second line
-  b) a claim the previous runner took but never published becomes unknown, never released;
-     the task gets no line      CONTROL: releasing it instead would announce the task again
-  c) published but the claim was not yet stamped with its file (a crash between the two): the
-     one line goes out and the claim turns unknown, so it is never sent a second time
+  b) a claim the previous runner took, naming its file, that was never published becomes unknown,
+     never released; the task gets no line; a runner that crashes between the claim and the
+     publish leaves exactly that shape      CONTROL: releasing it instead would announce the task
+  c) a claim whose file was published before the crash is left for reconcile: the one line goes
+     out, it is confirmed, and it is never sent a second time; a claim whose file is only in
+     results/archive/ (delivered, no outbox receipt) is left too
   d) an unknown claim is left as it is and never re-announced
   e) a claim held by a live publisher (another process) is left untouched
   f) tasks that arrived while the runner was down get at most one line each
@@ -49,8 +51,12 @@ def restart(lane, start, n=4, mod=None):
     return reports
 
 
+VIA = f"proactive-about-{TID}--{int((DUE - 60) * 1000)}.to-ag2space.txt"
+
+
 def dead_claim(ws, **fields):
-    return ack_claim.claim(ws, KEY, "status-ack", now=DUE - 60, pid=DEAD_PID, **fields)
+    """The runner's real claim shape: its file named in `via`, the claiming pid gone."""
+    return ack_claim.claim(ws, KEY, "status-ack", now=DUE - 60, pid=DEAD_PID, via=VIA, **fields)
 
 
 def main() -> int:
@@ -69,6 +75,26 @@ def main() -> int:
           f"b) a dead runner's unpublished claim turns unknown; no line ({ack_claim.read(lane.ws, KEY)})")
     check(reports[0].get("recovered") == [(KEY, "unknown")], f"b) the first pass reports it ({reports[0].get('recovered')})")
 
+    lane = pl.Lane(gb, ISO)
+    sa.task(lane.ws, TID)
+    mod = sa.runner()
+
+    def crash(path, body):
+        raise KeyboardInterrupt("the runner died between claim and publish")
+
+    mod.publish_text = crash
+    try:
+        mod.run_once(lane.ws, sa.on(mod), now=DUE, holders=sa.SESSION)
+    except KeyboardInterrupt:
+        pass
+    rec = ack_claim.read(lane.ws, KEY) or {}
+    ack_claim.update(lane.ws, KEY, "status-ack", gen=rec.get("gen"), pid=DEAD_PID)
+    shape = (rec.get("state"), bool(rec.get("via")), sa.proactive_files(lane.ws))
+    reports = restart(lane, DUE + 15, n=4)
+    check(shape == ("claimed", True, []) and ack_claim.state(lane.ws, KEY) == "unknown" and lane.posts == []
+          and reports[0].get("recovered") == [(KEY, "unknown")],
+          f"b) a crash between claim and publish: unknown after restart, no line ({shape}, {ack_claim.read(lane.ws, KEY)})")
+
     ctl = pl.Lane(gb, ISO)
     sa.task(ctl.ws, TID)
     dead_claim(ctl.ws)
@@ -83,11 +109,20 @@ def main() -> int:
     mod.run_once(lane.ws, sa.on(mod), now=DUE, holders=sa.SESSION)
     rec = ack_claim.read(lane.ws, KEY)
     ack_claim.update(lane.ws, KEY, "status-ack", gen=rec["gen"], pid=DEAD_PID)
-    stripped = {k: v for k, v in ack_claim.read(lane.ws, KEY).items() if k != "via"}
-    ack_claim.local_record.write_text_whole(ack_claim._path(lane.ws, KEY), json.dumps(stripped))
-    restart(lane, DUE + 15, n=6)
-    check(len(sa.room_posts(lane)) == 1 and ack_claim.state(lane.ws, KEY) == "unknown",
-          f"c) published before the crash: one line, then unknown, never again ({len(lane.posts)})")
+    reports = restart(lane, DUE + 15, n=6)
+    check(len(sa.room_posts(lane)) == 1 and ack_claim.state(lane.ws, KEY) == "confirmed"
+          and reports[0].get("recovered") == [],
+          f"c) published before the crash: left for reconcile, one line, confirmed ({len(lane.posts)}, "
+          f"{ack_claim.state(lane.ws, KEY)})")
+
+    for label, archived in (("archive/<via>", VIA), ("archive/<stem>-<ts>.txt", VIA[:-4] + "-1761309950.txt")):
+        lane = pl.Lane(gb, ISO)
+        sa.task(lane.ws, TID)
+        dead_claim(lane.ws)
+        (lane.results / "archive" / archived).write_text("Received. Not picked up yet.\n", encoding="utf-8")
+        reports = restart(lane, DUE, n=2)
+        check(ack_claim.state(lane.ws, KEY) == "claimed" and reports[0].get("recovered") == [] and lane.posts == [],
+              f"c) delivered, only in {label}: left as it is, no line ({ack_claim.state(lane.ws, KEY)})")
 
     lane = pl.Lane(gb, ISO)
     sa.task(lane.ws, TID)

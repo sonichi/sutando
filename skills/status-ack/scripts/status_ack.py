@@ -367,12 +367,25 @@ def _pid_alive(pid) -> bool:
     return True
 
 
+def _published(ws: Path, via) -> bool:
+    """True when the claim's file is in results/, claimed by the gateway, archived after delivery
+    (`archive/<via>` or the bridge's `archive/<stem>-<ts>.txt`), or has an outbox receipt."""
+    if not isinstance(via, str) or not via:
+        return False
+    results, stem = ws / "results", Path(via).stem
+    archive = results / "archive"
+    return ((results / via).exists() or any(results.glob(f"{stem}.sending*"))
+            or (archive / via).exists() or any(archive.glob(f"{stem}-[0-9]*.txt"))
+            or _receipt(ws, via) is not None)
+
+
 def recover(ws: Path) -> list:
-    """Startup: a claim this runner holds that names no published file, from a process that is
-    gone, may have published anyway; it becomes unknown, never released or re-announced."""
+    """Startup: a claim this runner holds whose file was never published (or that names none),
+    from a process that is gone, becomes unknown: it is never released or re-announced. A claim
+    whose file is published is left for reconcile(); a live process's claim is left alone."""
     settled = []
     for rec in ack_claim.held_by(ws, HOLDER, "claimed"):
-        if rec.get("via") or (rec.get("pid") != os.getpid() and _pid_alive(rec.get("pid"))):
+        if (rec.get("pid") != os.getpid() and _pid_alive(rec.get("pid"))) or _published(ws, rec.get("via")):
             continue
         if ack_claim.update(ws, rec["key"], HOLDER, "unknown", gen=rec.get("gen"),
                             reason="the runner stopped between claim and publish"):
