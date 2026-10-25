@@ -1804,7 +1804,7 @@ class TestStaleBannerOnASeatDoesNotPage(unittest.TestCase):
     """A seat watcher pages a gate only on a prompt on screen; a limit banner holding a
     worker's queued work is the pool supervisor's to page, since only it reads that queue."""
 
-    def _seat(self, panes, owes=None):
+    def _seat(self, panes, owes=False):
         baseline, out = None, []
         for pane in panes:
             stale, baseline = _mod.limit_step(pane, baseline, "/nonexistent-ws", owes_work=owes)
@@ -1832,28 +1832,58 @@ class TestStaleBannerOnASeatDoesNotPage(unittest.TestCase):
                                  ("permission under a stale banner",
                                   _PERMISSION + _STALE_BANNER + _SEAT_FOOTER, "selection")):
             with self.subTest(control=name):
-                stale, _ = _mod.limit_step(pane, None, "/nonexistent-ws", owes_work=None)
+                stale, _ = _mod.limit_step(pane, None, "/nonexistent-ws", owes_work=False)
                 st = compose_state(pane, "idle", True, limit_stale=stale)
                 self.assertEqual((st[0], st[3]), ("blocked-human", kind))
 
     def test_an_unforeseen_dialog_still_pages_under_a_stale_banner(self):
         pane = ("  Overwrite the existing config file?\n  (Enter to confirm · Esc to cancel)\n"
                 + _STALE_BANNER + _SEAT_FOOTER)
-        stale, _ = _mod.limit_step(pane, None, "/nonexistent-ws", owes_work=None)
+        stale, _ = _mod.limit_step(pane, None, "/nonexistent-ws", owes_work=False)
         self.assertEqual(compose_state(pane, "idle", True, limit_stale=stale)[0], "blocked-human")
         self.assertEqual(compose_state(pane.replace(_STALE_BANNER, ""), "idle", True)[:2],
                          ("blocked-human", "awaiting user: unknown"))
 
-    def test_owes_work_is_the_cores_queue_and_unknown_on_a_worker_seat(self):
+    def test_owes_work_is_the_cores_queue_and_never_a_worker_seats(self):
         import tempfile
         with tempfile.TemporaryDirectory() as td:
             ws = _Path(td)
-            self.assertIsNone(_mod.owes_work("worker-seat", ws))
+            self.assertIs(_mod.owes_work("worker-seat", ws), False)
             self.assertIs(_mod.owes_work("", ws), False)
             (ws / "tasks").mkdir()
             (ws / "tasks" / "task-1.txt").write_text("task: x\n")
             self.assertIs(_mod.owes_work("", ws), True)
-            self.assertIsNone(_mod.owes_work("worker-seat", ws))
+            self.assertIs(_mod.owes_work("worker-seat", ws), False)
+
+    @unittest.skipIf(os.geteuid() == 0, "root reads a mode-000 directory")
+    def test_an_unreadable_queue_keeps_the_limit_block_and_an_empty_one_strips_it(self):
+        """A count that could not be read is unknown, not zero: the banner holds on the core
+        seat exactly as with work owed, and only a readable empty queue lets it go."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            ws = _Path(td)
+            tasks = ws / "tasks"
+            tasks.mkdir()
+            tasks.chmod(0)
+            try:
+                owes = _mod.owes_work("", ws)
+                self.assertIsNone(owes)
+                stale, baseline = _mod.limit_step(_ALERT_DONE, None, ws, owes_work=owes)
+                self.assertFalse(stale)
+                st = compose_state(_ALERT_DONE, "idle", True, limit_stale=stale, styled_pane=_ALERT_DONE)
+                self.assertEqual((st[0], st[3]), ("blocked-human", "usage-limit"))
+                # Unknown holds like owed, no harder: a turn that ran since still outruns it.
+                stale, _ = _mod.limit_step(_LIVE_PANE, _mod.limit_step(_LIVE_BEFORE, None, ws, owes_work=owes)[1],
+                                           ws, owes_work=owes)
+                self.assertTrue(stale)
+            finally:
+                tasks.chmod(0o700)
+            owes = _mod.owes_work("", ws)
+            self.assertIs(owes, False)
+            stale, _ = _mod.limit_step(_ALERT_DONE, None, ws, owes_work=owes)
+            self.assertTrue(stale)
+            st = compose_state(_ALERT_DONE, "idle", True, limit_stale=stale, styled_pane=_ALERT_DONE)
+            self.assertEqual(st[0], "idle-ready")
 
 
 if __name__ == "__main__":

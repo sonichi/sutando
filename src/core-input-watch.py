@@ -394,9 +394,13 @@ _BASE_TO_STATE = {
 
 
 def owes_work(seat, workspace):
-    """Whether this seat has queued work: the core's own queue, else None. A worker's queue
-    is the pool's to read, so the pool's supervisor is what pages a banner holding it."""
-    return None if seat else core_gate_notice.queued_count(workspace) > 0
+    """Whether the core's own queue holds work: True, False, or None when the queue cannot be
+    read. A worker seat is False here: its queue is the pool's to read, so the pool's
+    supervisor is what pages a banner holding it."""
+    if seat:
+        return False
+    queued = core_gate_notice.queued_count(workspace)
+    return None if queued is None else queued > 0
 
 
 def compose_state(pane, base_health, gateway_alive, process=True, prev_pane=None, runtime=None,
@@ -1045,7 +1049,7 @@ def main():
                 drive_escalations(hitl, a.session, prompt, state,
                                   lambda k: send_keys(a.socket, a.session, k))
                 # Only the core's own seat owns tasks/; a worker's queue lives elsewhere.
-                queued = 0 if a.seat else core_gate_notice.queued_count(workspace)
+                queued = 0 if a.seat else (core_gate_notice.queued_count(workspace) or 0)
                 req = escalate(hitl, state, detail, kind, prompt, a.session, seat=a.seat or None,
                                queued=queued, runtime=runtime)
                 if not a.seat:
