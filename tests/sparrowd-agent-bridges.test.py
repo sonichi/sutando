@@ -548,8 +548,8 @@ class HostCredentialFiles(Base):
         self.assertEqual(env.get("CLAUDE_CONFIG_DIR"), str(self.cfg), "the config root stays: access.json needs it")
         self.assertEqual(seen["access_path"], str(self.access))
         self.assertIn(str(self.access), seen["child_opens"], "the tier map is still read from the host's config root")
-        self.assertIs(mod.PROACTIVE_TRUST_OK, True, "the host's file setting reaches the child, carried by the wrapper")
-        self.assertEqual(env.get("REMOTE_PROACTIVE_TRUST_OK"), "1")
+        self.assertEqual(env.get("REMOTE_PROACTIVE_TRUST_OK"), "1",
+                         "the host's file setting reaches the child, carried by the wrapper")
         self.assertIn(str(self.dotenv), seen["parent_opens"], "the wrapper, as the host, is what read the file")
         self.assertEqual(mod.PROACTIVE_ROOM, "")
 
@@ -557,7 +557,7 @@ class HostCredentialFiles(Base):
         seen = self.launch({"CLAUDE_CONFIG_DIR": str(self.cfg), "REMOTE_TASK_TOKEN": "host-token",
                             "REMOTE_PROACTIVE_TRUST_OK": "0"})
         self.assertEqual(seen["child_opens"], [p for p in seen["child_opens"] if not p.endswith(".env")])
-        self.assertIs(seen["mod"].PROACTIVE_TRUST_OK, False)
+        self.assertEqual(seen["env"].get("REMOTE_PROACTIVE_TRUST_OK"), "0")
         self.assertEqual(seen["parent_opens"], [p for p in seen["parent_opens"] if p != str(self.dotenv)],
                          "set in the host's environment: not even the wrapper opens the file")
         self.assertFalse(seen["mod"]._SECRETS.contains(self.CANARY))

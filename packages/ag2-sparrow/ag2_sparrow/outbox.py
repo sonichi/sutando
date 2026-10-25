@@ -44,7 +44,7 @@ from dataclasses import dataclass
 from enum import Enum
 from functools import lru_cache
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 try:
     from .file_lock import lock_fd
@@ -848,8 +848,10 @@ def _write_item(root: Path, item_id: str, data: dict) -> None:
 
 
 def record_delivered(root: Path, item_id: str, *, provider: Optional[str] = None,
-                     destination: Optional[str] = None) -> None:
-    """Mark an item delivered and persist WHERE it went.
+                     destination: Optional[str] = None,
+                     provider_ref: Optional[str] = None) -> None:
+    """Mark an item delivered and persist WHERE it went and the provider's own reference
+    to it (a room message's event id).
 
     The log line naming provider/destination rotates; a receipt that omits them
     cannot answer "delivered to where" after that. Absent values are not stored,
@@ -862,8 +864,84 @@ def record_delivered(root: Path, item_id: str, *, provider: Optional[str] = None
         d["provider"] = provider
     if destination:
         d["destination"] = destination
+    if provider_ref:
+        d["provider_ref"] = provider_ref
+    d.pop("dispatching", None)
     _write_item(Path(root), item_id, d)
     _activity_completed(item_id)
+
+
+def record_dispatching(root: Path, item_id: str, incarnation: str) -> None:
+    """Under the item lock and its claim: a send is about to leave. A later claim that
+    still finds it knows that send may have landed and was never settled."""
+    d = _read_item(Path(root), item_id)
+    d["dispatching"] = {"incarnation": incarnation, "at": time.time()}
+    _write_item(Path(root), item_id, d)
+
+
+def clear_dispatching(root: Path, item_id: str) -> None:
+    """Under the item lock: the dispatch has an outcome, so nothing is left in doubt."""
+    d = _read_item(Path(root), item_id)
+    if d.pop("dispatching", None) is not None:
+        _write_item(Path(root), item_id, d)
+
+
+def released_by_operator(d: dict) -> bool:
+    """A person released this item for exactly its stored payload, destination included."""
+    mark = d.get("operator_release")
+    return isinstance(mark, str) and mark == hashlib.sha256(
+        (d.get("payload") or "").encode("utf-8")).hexdigest()
+
+
+def park_unclaimed(root: Path, item_id: str, reason: str, reclaim_ttl_s: float = 300.0,
+                   on_release: "Optional[Callable[[ClaimRecord], None]]" = None) -> bool:
+    """Park an item no one holds, under its lock, only while it is still live and unsettled:
+    never over DELIVERED, a receipt, a dispatch mark or a live claim. A claim a reclaim may
+    take (a dead owner past `reclaim_ttl_s`, a torn one past its grace) goes first. False when it changed."""
+    with _item_lock(Path(root), item_id):
+        if not _item_path(Path(root), item_id).exists():
+            return False
+        d = _read_item(Path(root), item_id)
+        if d.get("status") in ("DELIVERED", "PARKED") or dispatch_unsettled(d):
+            return False
+        rec = read_delivery_claim(Path(root), item_id)
+        if rec is not None:
+            if rec.state == "UNKNOWN" and not rec.malformed:
+                # Torn: the same grace-period sweep the claim route uses, never a younger one.
+                if not _sweep_if_abandoned(_claim_path(Path(root), item_id)):
+                    return False
+            elif not _record_is_reclaimable(rec, reclaim_ttl_s):
+                return False
+            else:
+                _release_locked(Path(root), item_id, rec.drainer_id, force=True)
+            if on_release is not None:
+                on_release(rec)
+        d.update(status="PARKED", reason=reason)
+        _write_item(Path(root), item_id, d)
+        return True
+
+
+def dispatch_unsettled(d: dict) -> bool:
+    """A send that left without a completed outcome: a receipt recorded, or a mark still set."""
+    return bool(d.get("provider_ref")) or isinstance(d.get("dispatching"), dict)
+
+
+def record_provider_ref(root: Path, item_id: str, provider_ref: str,
+                        destination: Optional[str] = None) -> bool:
+    """The provider's proof that a send landed, and where, kept on the item before it is
+    completed, so a crash after the send settles it as delivered instead of sending it again.
+    False when the item is missing or already terminal."""
+    with _item_lock(Path(root), item_id):
+        if not _item_path(Path(root), item_id).exists():
+            return False
+        d = _read_item(Path(root), item_id)
+        if d.get("status") in ("DELIVERED", "PARKED"):
+            return False
+        d["provider_ref"] = provider_ref
+        if destination:
+            d["destination"] = destination
+        _write_item(Path(root), item_id, d)
+        return True
 
 
 def _activity_completed(item_id: str) -> None:
@@ -957,6 +1035,7 @@ def retry_failed_locked(root: Path, item_id: str, now: float) -> None:
     retry["next_attempt_at"] = (min(now + delay, retry["deadline"])
                                 if now < retry["deadline"] else now + delay)
     d["attempts"] = int(d.get("attempts", 0)) + 1
+    d.pop("dispatching", None)  # a definite refusal: nothing is in doubt, in this same write
     if _retry_exhausted(retry, now):
         d.update(status="PARKED", reason="retry-window-exhausted")
     _write_item(root, item_id, d)
@@ -965,14 +1044,17 @@ def retry_failed_locked(root: Path, item_id: str, now: float) -> None:
 def note_attempt(root: Path, item_id: str) -> int:
     d = _read_item(Path(root), item_id)
     d["attempts"] = int(d.get("attempts", 0)) + 1
+    d.pop("dispatching", None)
     _write_item(Path(root), item_id, d)
     return d["attempts"]
 
 
 def park_item(root: Path, item_id: str, reason: str = "") -> None:
+    """One write: a parked item carries no dispatch mark, so no crash can leave it unmarked and live."""
     d = _read_item(Path(root), item_id)
     d["status"] = "PARKED"
     d["reason"] = reason
+    d.pop("dispatching", None)
     _write_item(Path(root), item_id, d)
 
 
@@ -1096,7 +1178,9 @@ def requeue_item(root: Path, item_id: str, *, reset_attempts: bool = False,
 
 def requeue_item_with_epoch(root: Path, item_id: str, *, reset_attempts: bool = False,
                             operator: Optional[str] = None,
-                            reason: Optional[str] = None) -> "tuple[RequeueOutcome, Optional[int]]":
+                            reason: Optional[str] = None,
+                            payload: Optional[str] = None,
+                            operator_release: bool = False) -> "tuple[RequeueOutcome, Optional[int]]":
     """Operator recovery: PARKED -> QUEUED as ONE atomic transition.
 
     Refuses anything not PARKED, which is what makes it idempotent AND keeps it
@@ -1116,7 +1200,9 @@ def requeue_item_with_epoch(root: Path, item_id: str, *, reset_attempts: bool = 
 
     Returns the epoch written under the lock (None unless REQUEUED): a later
     read can see a peer's re-requeue, and a rollback keyed on it undoes theirs.
-    A requeue never changes the stored payload.
+    A requeue keeps the stored payload unless `payload` replaces it: only for a send that
+    provably never left, whose destination has moved since. `operator_release` records that a
+    person released exactly the stored payload (see released_by_operator); automation never sets it.
     """
     root = Path(root)
     with _item_lock(root, item_id):
@@ -1132,9 +1218,15 @@ def requeue_item_with_epoch(root: Path, item_id: str, *, reset_attempts: bool = 
         if reset_attempts:
             d["attempts"] = 0
             d.pop("retry", None)
+        d.pop("dispatching", None)  # the operator's resend is deliberate
         d["requeued_at"] = time.time()
         d["requeued_by"] = operator or "unknown"
         d["requeue_reason"] = reason or ""
+        if payload is not None:
+            d["payload"] = payload
+        d.pop("operator_release", None)
+        if operator_release:
+            d["operator_release"] = hashlib.sha256((d.get("payload") or "").encode("utf-8")).hexdigest()
         proof = source_proof(d)
         for field in ("proof_version", "source_ready_sha256", "source_payload_sha256"):
             d.pop(field, None)

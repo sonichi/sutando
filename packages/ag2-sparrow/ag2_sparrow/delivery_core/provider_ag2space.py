@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import socket
 from collections import OrderedDict
 import time
 import urllib.error
@@ -172,13 +173,20 @@ def room_response_refused(resp) -> bool:
                                            or resp.get("errcode"))
 
 
+def _never_connected(exc: BaseException) -> bool:
+    """A failure urllib can only raise before the request was written: no connection was made."""
+    reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+    return isinstance(reason, (ConnectionRefusedError, socket.gaierror))
+
+
 class AG2SpaceRoomMessageProvider:
-    """Sends one message to an AG2 Space room through the injected room sender. Only a Matrix
-    event id proves delivery, and it is durably recorded before the send counts as delivered."""
+    """Sends one message to an AG2 Space room, optionally inside a thread (`thread_root`), through
+    the injected room sender. Only a Matrix event id proves delivery, and it is durably recorded
+    before the send counts as delivered."""
 
     capabilities = ProviderCapabilities(reconcile_capable=False, idempotent_send=False)
 
-    def __init__(self, send: Callable[[str, str, str], dict],
+    def __init__(self, send: Callable[..., dict],
                  record_receipt: Callable[[str, str], None]):
         self._send = send
         self._record_receipt = record_receipt
@@ -188,10 +196,15 @@ class AG2SpaceRoomMessageProvider:
         try:
             message = json.loads(payload.decode("utf-8"))
             room, body = message["room_id"], message["body"]
-        except (UnicodeDecodeError, ValueError, KeyError, TypeError) as e:
+            thread_root = message.get("thread_root")
+        except (UnicodeDecodeError, ValueError, KeyError, TypeError, AttributeError) as e:
             raise ProviderPermanentRefused(f"malformed room message for {item_id}: {e}") from e
+        if thread_root is not None and not (isinstance(thread_root, str) and thread_root.startswith("$")
+                                            and len(thread_root.strip()) > 1):
+            raise ProviderPermanentRefused(f"malformed thread root for {item_id}")
         try:
-            resp = self._send(room, body, idempotency_key)
+            resp = (self._send(room, body, idempotency_key, thread_root) if thread_root
+                    else self._send(room, body, idempotency_key))
         except urllib.error.HTTPError as e:
             if 500 <= e.code <= 599:
                 raise ProviderIndeterminate(f"gateway error for {item_id}: HTTP {e.code}") from e
@@ -199,6 +212,8 @@ class AG2SpaceRoomMessageProvider:
                 raise ProviderRefused(f"gateway refused {item_id} for now: HTTP {e.code}") from e
             raise ProviderPermanentRefused(f"gateway refused {item_id}: HTTP {e.code}") from e
         except (urllib.error.URLError, TimeoutError, OSError) as e:
+            if _never_connected(e):
+                raise ProviderRefused(f"gateway unreachable for {item_id}: {e}") from e
             raise ProviderIndeterminate(f"transport failure for {item_id}: {e}") from e
         if room_response_refused(resp):
             raise ProviderPermanentRefused(f"gateway declined {item_id}: {str(resp)[:200]}")

@@ -353,11 +353,18 @@ def _ag2space_owner_dm_upgraded(room: str, replacement: str) -> None:
         raise
 
 
+def _ag2space_proactive_dispatch_gate(task_id: str):
+    """Right before a message about a task is sent: why it must not be, or None."""
+    from proactive_dispatch_gate import dispatch_veto
+    return dispatch_veto(task_id, WS)
+
+
 # Assigned AFTER the exec: the canonical module's own `PROACTIVE_CLAIM_GATE =
 # None` default runs inside it and would overwrite an earlier assignment.
 PROACTIVE_CLAIM_GATE = _ag2space_proactive_claim_gate
 PROACTIVE_ROOM_GATE = _ag2space_proactive_room_gate
 OWNER_DM_UPGRADED_NOTIFY = _ag2space_owner_dm_upgraded
+PROACTIVE_DISPATCH_GATE = _ag2space_proactive_dispatch_gate
 
 if _RUN_MAIN:  # pragma: no cover — script-entry tail; the subprocess suite drives it
     __name__ = "__main__"

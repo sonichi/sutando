@@ -48,7 +48,7 @@ def check(cond: bool, msg: str) -> None:
 # ── mock gateway ────────────────────────────────────────────────────────────
 STATE = {"tasks_served": 0, "results": [], "acks": [], "heartbeats": [],
          "auth_seen": [], "force_401": False, "force_ack_404": False,
-         "room_posts": [], "force_room_502": False, "force_room_empty_200": False,
+         "room_posts": [], "force_room_502": False, "force_room_429": False, "force_room_empty_200": False,
          "force_room_ok_only": False, "force_room_400_body": None,
          "force_heartbeat_404": False, "force_media_redirect": False,
          "force_results_502_once": False, "force_results_503": False,
@@ -132,6 +132,8 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/v1/room":
             if STATE["force_room_502"]:
                 self.send_response(502); self.end_headers(); return
+            if STATE["force_room_429"]:  # pragma: no cover - the server thread is outside the gate's trace
+                self.send_response(429); self.end_headers(); return
             n = int(self.headers.get("Content-Length") or 0)
             STATE["room_posts"].append(json.loads(self.rfile.read(n).decode()))
             if STATE["force_room_400_body"] is not None:  # pragma: no cover - the server thread is outside the gate's trace
@@ -181,9 +183,8 @@ def _test_owner_dm_room_upgraded(rtc) -> None:
         n0 = len(STATE["room_posts"])
         rtc._post_proactive()
         rtc._post_proactive()
-        check(up.exists() and not undeliv("proactive-up1")
-              and "proactive-up1.txt" not in rtc._PROACTIVE_ATTEMPTS,
-              "room_upgraded 400 keeps the owner nudge pending, not parked or counted")
+        check(up.exists() and not undeliv("proactive-up1"),
+              "room_upgraded 400 keeps the owner nudge pending, not parked")
         check(calls == [("!owner:example.org", "!new:example.org")],
               "room_upgraded notifies the owner exactly once across passes")
         check(len(STATE["room_posts"]) == n0 + 1,
@@ -1353,6 +1354,9 @@ def main() -> int:
     # routing behavior gets its dedicated section after them.
     check(rtc.PROACTIVE_CLAIM_GATE is not None,
           "sutando loader wires the ag2space proactive claim gate")
+    check(getattr(rtc.PROACTIVE_DISPATCH_GATE, "__name__", "") == "_ag2space_proactive_dispatch_gate"
+          and rtc.PROACTIVE_DISPATCH_GATE("task-1761300000000") is None,
+          "sutando loader wires the dispatch gate; an untracked task's message may go")
     _activity = rtc.WS / "state" / "last-owner-activity.json"
     _activity.parent.mkdir(parents=True, exist_ok=True)
     _activity.write_text(json.dumps(
@@ -1368,35 +1372,43 @@ def main() -> int:
     rtc.PROACTIVE_ROOM = "!owner:example.org"
     rtc._ROUTING.update(owner_dm="!owner:example.org", loaded=True, next=time.time() + 3600)
     rtc._post_proactive()
+    _first = STATE["room_posts"][0] if STATE["room_posts"] else {}
     check(len(STATE["room_posts"]) == 1
-          and STATE["room_posts"][0] == {"op": "message", "room_id": "!owner:example.org",
-                                          "body": "nudge one"}
+          and {k: v for k, v in _first.items() if k != "dedupe_key"}
+          == {"op": "message", "room_id": "!owner:example.org", "body": "nudge one"}
+          and str(_first.get("dedupe_key", "")).startswith("proactive-t1~")
           and not (rtc.RESULTS_DIR / "proactive-t1.txt").exists()
           and any(x.name.startswith("proactive-t1-") for x in rtc.ARCHIVE_RESULTS_DIR.iterdir()),
           "proactive file delivered via /v1/room and archived")
-    # Failed POST → claim restored to .txt for retry; nothing archived.
+    # A definite refusal (429) → claim restored to .txt; the outbox retries it once its
+    # backoff is due, and nothing is archived meanwhile.
+    _lane = rtc._delivery_core("proactive").backend
     (rtc.RESULTS_DIR / "proactive-t2.txt").write_text("nudge two")
-    STATE["force_room_502"] = True
+    STATE["force_room_429"] = True
     rtc._post_proactive()
-    STATE["force_room_502"] = False
+    STATE["force_room_429"] = False
     check((rtc.RESULTS_DIR / "proactive-t2.txt").exists()
           and len(STATE["room_posts"]) == 1,
-          "failed proactive POST restores the file for retry")
+          "a refused proactive POST restores the file for retry")
+    _lane.clock = lambda: time.time() + 60
     rtc._post_proactive()
+    _lane.clock = time.time
     check(len(STATE["room_posts"]) == 2 and not (rtc.RESULTS_DIR / "proactive-t2.txt").exists(),
-          "retry after failure delivers")
-    # 200 WITHOUT a delivery signal (server swallowed the room send) → the
-    # file is restored for retry, NOT archived — a bare 200 never proves
-    # delivery (review P1: bad room / kicked agent / power-level denial).
-    (rtc.RESULTS_DIR / "proactive-t2b.txt").write_text("nudge 2b")
-    STATE["force_room_empty_200"] = True
-    rtc._post_proactive()
-    STATE["force_room_empty_200"] = False
-    check((rtc.RESULTS_DIR / "proactive-t2b.txt").exists(),
-          "200 without event_id restores the file (no false archive)")
-    rtc._post_proactive()
-    check(not (rtc.RESULTS_DIR / "proactive-t2b.txt").exists(),
-          "retry with a real delivery signal archives")
+          "retry after a refusal delivers")
+    # A 502 or a 200 WITHOUT a delivery signal may have posted: parked to undelivered/, never
+    # resent (the room send is not idempotent), and never archived as delivered.
+    for _stem, _flag in (("proactive-t2a", "force_room_502"), ("proactive-t2b", "force_room_empty_200")):
+        (rtc.RESULTS_DIR / f"{_stem}.txt").write_text(f"nudge {_stem}")
+        STATE[_flag] = True
+        rtc._post_proactive()
+        STATE[_flag] = False
+        _n = len(STATE["room_posts"])
+        rtc._post_proactive()
+        check(not (rtc.RESULTS_DIR / f"{_stem}.txt").exists()
+              and any(x.name.startswith(_stem) for x in rtc.UNDELIVERABLE_RESULTS_DIR.glob("*.txt"))
+              and not any(x.name.startswith(_stem) for x in rtc.ARCHIVE_RESULTS_DIR.glob("*.txt"))
+              and len(STATE["room_posts"]) == _n,
+              f"{_flag}: an unconfirmed send is parked, not resent and not archived")
 
     # Empty file → no POST, and NEVER destroyed. A freshly-written empty file
     # is indistinguishable from a writer mid-flush, so it is re-queued rather
@@ -1404,14 +1416,14 @@ def main() -> int:
     # loses the body when the writer's flush lands after the claim).
     (rtc.RESULTS_DIR / "proactive-t3.txt").write_text("  \n")
     rtc._post_proactive()
-    check(len(STATE["room_posts"]) == 4 and (rtc.RESULTS_DIR / "proactive-t3.txt").exists(),
+    check(len(STATE["room_posts"]) == 3 and (rtc.RESULTS_DIR / "proactive-t3.txt").exists(),
           "empty proactive file is re-queued, not sent and not destroyed")
 
     # The body the writer was still flushing wins: once it lands, the SAME file
     # delivers normally. This is the regression for the data-loss race.
     (rtc.RESULTS_DIR / "proactive-t3.txt").write_text("the late-flushed body")
     rtc._post_proactive()
-    check(len(STATE["room_posts"]) == 5
+    check(len(STATE["room_posts"]) == 4
           and STATE["room_posts"][-1]["body"] == "the late-flushed body"
           and not (rtc.RESULTS_DIR / "proactive-t3.txt").exists(),
           "a body flushed after the empty peek is delivered, never lost")
@@ -1572,30 +1584,37 @@ def main() -> int:
     import importlib as _il
     _ob = _il.import_module("ag2_sparrow.outbox")
     _rroot = rtc.RESULTS_DIR / ".outbox-ag2space-proactive"
+    def _receipt(stem):
+        return next((i for i in _ob.list_items(_rroot)
+                     if str(i.get("item_id", "")).startswith(f"{stem}~")), {})
     (rtc.RESULTS_DIR / "proactive-r1.txt").write_text("receipt nudge\n")
     rtc._post_proactive()
-    _it = _ob._read_item(_rroot, "proactive-r1")
+    _it = _receipt("proactive-r1")
     check(_it.get("status") == "DELIVERED"
-          and _it.get("provider") == "ag2space-proactive"
-          and _it.get("destination") == "!owner:example.org",
-          "delivered default-room nudge records a durable receipt with the room")
+          and _it.get("provider") == "AG2SpaceRoomMessageProvider"
+          and _it.get("destination") == "!owner:example.org"
+          and str(_it.get("provider_ref", "")).startswith("$evt-"),
+          "delivered default-room nudge records a durable receipt with the room and event id")
     (rtc.RESULTS_DIR / "proactive-r2.txt").write_text(
         "[channel: !other:example.org]\nrouted receipt nudge\n")
     rtc._post_proactive()
-    _it2 = _ob._read_item(_rroot, "proactive-r2")
+    _it2 = _receipt("proactive-r2")
     check(_it2.get("destination") == "!other:example.org",
           "a routed nudge's receipt records the OVERRIDE room, not the default")
     # A failed POST must record NOTHING — a receipt is proof of delivery,
     # never of an attempt.
     (rtc.RESULTS_DIR / "proactive-r3.txt").write_text("failing nudge\n")
-    STATE["force_room_502"] = True
+    STATE["force_room_429"] = True
     rtc._post_proactive()
-    STATE["force_room_502"] = False
-    _it3 = _ob._read_item(_rroot, "proactive-r3")
-    check(_it3.get("status") != "DELIVERED" and "destination" not in _it3,
+    STATE["force_room_429"] = False
+    _it3 = _receipt("proactive-r3")
+    check(_it3.get("status") != "DELIVERED" and "destination" not in _it3
+          and "provider_ref" not in _it3,
           "a failed POST records no receipt")
+    _lane.clock = lambda: time.time() + 60
     rtc._post_proactive()
-    _it3b = _ob._read_item(_rroot, "proactive-r3")
+    _lane.clock = time.time
+    _it3b = _receipt("proactive-r3")
     _test_owner_dm_room_upgraded(rtc)
     _test_owner_dm_upgrade_edges(rtc)
     _test_owner_dm_upgrade_notice_retry(rtc)
@@ -1887,52 +1906,27 @@ def main() -> int:
     else:
         os.environ["CLAUDE_CONFIG_DIR"] = _saved_cfg
 
-    # 3.7 broker-compat delivery signal (REMOTE_PROACTIVE_TRUST_OK).
-    # Default OFF: a bare {"ok": true} (no event_id) is NOT delivery — the
-    # file restores for retry, same as the empty-200 case above.
+    # 3.7 a bare {"ok": true} (no event_id) is never delivery: there is no opt-in that
+    # trusts it. It may have posted, so it is parked once and never sent again.
+    check(not hasattr(rtc, "PROACTIVE_TRUST_OK"), "no trust-ok setting reaches the proactive drain")
     bare_ok = rtc.RESULTS_DIR / "proactive-t15.txt"
     bare_ok.write_text("bare-ok nudge\n")
-    # Pin the default off: the module import may have read a real channel .env
-    # where the operator opted in to trust-ok.
-    rtc.PROACTIVE_TRUST_OK = False
     STATE["force_room_ok_only"] = True
-    rtc._post_proactive()
-    check(bare_ok.exists(),
-          "default: bare {ok:true} without event_id restores for retry")
-    # Opt-in ON: the same response is trusted as delivered-at-least-once —
-    # claimed, posted once more, archived, retries stop.
-    rtc.PROACTIVE_TRUST_OK = True
-    rtc._post_proactive()
-    STATE["force_room_ok_only"] = False
-    rtc.PROACTIVE_TRUST_OK = False
-    check(not bare_ok.exists()
-          and any(p.name.startswith("proactive-t15")
-                  for p in rtc.ARCHIVE_RESULTS_DIR.glob("*.txt")),
-          "PROACTIVE_TRUST_OK=1: bare {ok:true} archives (opt-in at-least-once)")
-
-    # Retry CEILING: a file whose sends never confirm parks to undeliverable/
-    # instead of looping forever.
-    (rtc.RESULTS_DIR / "proactive-t2c.txt").write_text("nudge 2c")
-    STATE["force_room_empty_200"] = True
     _posts_before = len(STATE["room_posts"])
-    for _ in range(rtc.MAX_TRANSIENT_ATTEMPTS + 3):     # more passes than the cap
+    for _ in range(rtc.MAX_TRANSIENT_ATTEMPTS + 3):     # more passes than any cap
         rtc._post_proactive()
-    STATE["force_room_empty_200"] = False
+    STATE["force_room_ok_only"] = False
     _undeliv = rtc.UNDELIVERABLE_RESULTS_DIR
-    # should_retry(exc, tried) counts RETRIES: the initial attempt plus
-    # MAX_TRANSIENT_ATTEMPTS retries = cap+1 posts total, then park.
-    check(len(STATE["room_posts"]) - _posts_before == rtc.MAX_TRANSIENT_ATTEMPTS + 1,
-          f"unconfirmed proactive sends stop at initial+{rtc.MAX_TRANSIENT_ATTEMPTS} "
-          f"retries, not one per pass forever")
-    check(not (rtc.RESULTS_DIR / "proactive-t2c.txt").exists()
-          and _undeliv.exists()
-          and any(x.name.startswith("proactive-t2c") for x in _undeliv.iterdir()),
-          "past the cap the file parks to undeliverable/, recoverable by hand")
-    # A later success must start from a FRESH count (ledger cleared on park).
+    check(len(STATE["room_posts"]) - _posts_before == 1
+          and not bare_ok.exists()
+          and any(x.name.startswith("proactive-t15") for x in _undeliv.iterdir())
+          and not any(p.name.startswith("proactive-t15") for p in rtc.ARCHIVE_RESULTS_DIR.glob("*.txt")),
+          "a bare {ok:true} is posted once, parked to undeliverable/, never archived")
+    # A later send is unaffected by the parked one.
     (rtc.RESULTS_DIR / "proactive-t2d.txt").write_text("nudge 2d")
     rtc._post_proactive()
     check(not (rtc.RESULTS_DIR / "proactive-t2d.txt").exists(),
-          "post-park deliveries are unaffected by the exhausted file's count")
+          "post-park deliveries are unaffected by the parked file")
 
     # Orphan claim recovery (crash between claim and delivery) — pid-scoped:
     # a DEAD owner's claim recovers; a LIVE worker's claim is never stolen

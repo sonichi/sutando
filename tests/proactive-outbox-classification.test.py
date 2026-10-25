@@ -6,9 +6,8 @@ The second half is the problem: with the flag on, a bare `{"ok": true}` counts a
 delivered and the item is archived, so a send that may never have arrived is
 recorded as one that did. There is no later signal that would correct it.
 
-Routing the same response through classify_response yields CONFIRMED only on an
-identifier; a 2xx without one is OUTCOME_UNKNOWN, which the existing
-send_failure_policy path already handles with a bounded retry.
+The send now goes through the outbox's room-message provider, which confirms only on
+a Matrix event id; a 2xx without one is OUTCOME_UNKNOWN, parked and never resent.
 
 Run: python3 tests/proactive-outbox-classification.test.py
 """
@@ -60,25 +59,21 @@ def main() -> int:
           r2.outcome is DeliveryOutcome.CONFIRMED and r2.receipt_id == "$e",
           f"got {r2.outcome} / {r2.receipt_id!r}")
 
-    # 3 — the decision in the bridge must not read the trust flag
+    # 3 — the bridge has no trust flag, and its proactive send is the outbox provider's
     src = (REPO / "packages/ag2-sparrow/ag2_sparrow/remote_gateway_bridge.py").read_text(encoding="utf-8")
-    m = re.search(r"receipt = classify_response\(.*?\n\s*delivered = (.*)", src)
-    check("the bridge derives `delivered` from the receipt",
-          bool(m) and "CONFIRMED" in m.group(1),
-          "delivered is no longer computed from the outbox receipt")
-    # The receipt reports what the response proves; the flag chooses what to do
-    # when it proves nothing. Separate clauses, never folded.
-    check("the trust opt-in survives as its own clause",
-          "PROACTIVE_TRUST_OK and isinstance(resp, dict)" in src,
-          "the at-least-once opt-in was removed; that is a documented, tested "
-          "feature, not a fallback")
+    check("the bridge reads no trust-ok setting",
+          "PROACTIVE_TRUST_OK" not in src,
+          "a bare ok can again be trusted as delivered")
+    provider = (REPO / "packages/ag2-sparrow/ag2_sparrow/delivery_core/provider_ag2space.py").read_text(encoding="utf-8")
+    check("the room-message provider pins the accepted identifier to event_id",
+          'id_keys=("event_id",)' in provider,
+          "the provider takes the default key set, so ts/id/message_id would "
+          "confirm a proactive send")
+    check("the proactive lane is built on the room-message provider",
+          "AG2SpaceRoomMessageProvider(lambda *a: _post_proactive_message(*a)" in src,
+          "the proactive send no longer goes through the outbox provider")
 
-    # 4 — the bridge passes a literal 200, so status-first cannot help: this
-    # gateway reports failure inside a 200 body. Only the key set can.
-    check("the bridge pins the accepted identifier to event_id",
-          'id_keys=("event_id",)' in src,
-          "the call site takes the default key set, so ts/id/message_id now "
-          "confirm a proactive send that the pre-outbox path retried")
+    # 4 — the gateway reports failure inside a 200 body. Only the key set can tell.
     for shape in ({"ok": True, "ts": "170099"},
                   {"errcode": "M_LIMIT_EXCEEDED", "id": "req-9"},
                   {"ok": False, "message_id": "m1"}):
