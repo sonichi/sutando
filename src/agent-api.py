@@ -1021,7 +1021,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
         self.end_headers()
 
-    def _send_connections(self, status: int, payload: "dict | None", granted: bool = False) -> None:
+    def _send_connections(self, status: int, payload: "dict | None") -> None:
         """JSON (or an empty body); the cross-origin grant echoes a loopback Origin only, never a
         wildcard, on refusals too: without it a webview reads a 401 as a network failure and can
         never drop a stale bearer. A non-loopback Origin gets no grant at any status."""
@@ -1073,7 +1073,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         from urllib.parse import parse_qs
         status, payload = connections_http(method, parsed.path, body, parse_qs(parsed.query))
-        self._send_connections(status, payload, granted=True)
+        self._send_connections(status, payload)
 
     def do_DELETE(self):
         if urlparse(self.path).path.startswith(CONNECTIONS_PREFIX):
