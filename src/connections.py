@@ -199,9 +199,11 @@ def _public_address(ip: str) -> bool:
         addr = ipaddress.ip_address(ip.split("%", 1)[0])
     except ValueError:
         return False
-    # is_global also refuses shared address space (100.64/10, a tailnet range), 6to4 and
-    # site-local forms that the named predicates alone let through.
-    for a in (addr, getattr(addr, "ipv4_mapped", None)):
+    # is_global refuses shared address space (100.64/10, a tailnet range) and, on current
+    # Python, 6to4; older interpreters need the embedded IPv4 of 6to4 and Teredo checked too.
+    embedded = [addr, getattr(addr, "ipv4_mapped", None), getattr(addr, "sixtofour", None)]
+    embedded.extend(getattr(addr, "teredo", None) or ())
+    for a in embedded:
         if a is not None and (not a.is_global or a.is_loopback or a.is_private or a.is_link_local
                               or a.is_multicast or a.is_reserved or a.is_unspecified
                               or getattr(a, "is_site_local", False)):
@@ -262,7 +264,8 @@ def _fetch_agents(gateway_url: str, token: str, address: str, *, connect=None) -
     conn.sock = sock  # the transport is the pinned one; connect() is never reached
     try:
         conn.request("GET", parts.path.rstrip("/") + "/v1/agents", headers={
-            "Host": parts.netloc, "Authorization": f"Bearer {secret_of(token)}",
+            "Host": f"{parts.hostname}:{port}" if parts.port else parts.hostname,
+            "Authorization": f"Bearer {secret_of(token)}",
             "Accept": "application/json", "User-Agent": "sutando-gateway-client/1.0"})
         resp = conn.getresponse()
         body = resp.read()

@@ -206,7 +206,9 @@ class Preview(unittest.TestCase):
         calls = []
         def fetch(url, token, address):
             calls.append(address); return {"agents": []}
-        for ips in (("100.64.0.1",), ("::ffff:100.64.0.1",), ("2002:c000:0204::1",), ("fec0::1",)):
+        for ips in (("100.64.0.1",), ("::ffff:100.64.0.1",), ("2002:c000:0204::1",), ("fec0::1",),
+                    ("2002:0a00:0005::1",), ("2002:7f00:1::1",), ("2002:c0a8:0101::1",), ("2002:6440:0001::1",),
+                    ("2001:0:4136:e378:8000:63bf:f5ff:fffa",)):
             with self.assertRaises(C.InvalidToken, msg=ips) as cm:
                 C.preview_connection("https://chat.alpha-fixture.net/relay|s", fetch=fetch,
                                      getaddrinfo=resolving_to(*ips))
