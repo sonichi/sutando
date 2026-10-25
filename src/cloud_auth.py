@@ -47,13 +47,18 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
+import dotspace
 from station_stamp import read_station_stamp
 
-# Hosts the bearer may be sent to. Anything else aborts rather than forwarding
-# the owner's token.
-TRUSTED_API_HOSTS = frozenset({"sutando.ag2.ai", "sutando.ag2.space"})
+# Hosts the bearer may be sent to (every configured DotSpace's cloud, plus the retired host).
+# Anything else aborts rather than forwarding the owner's token.
+TRUSTED_API_HOSTS = dotspace.trusted_cloud_hosts()
 
-DEFAULT_CLOUD_ORIGIN = "https://sutando.ag2.space"
+# This install's DotSpace's cloud; per install, not per connection (see docs/dotspace.md).
+DEFAULT_CLOUD_ORIGIN = dotspace.default_cloud_origin()
+# The shared production Cloud. A retired-origin, bare-key or base-less stored credential belongs
+# HERE, whatever instance this install is on; it is never re-paired with another origin.
+PRODUCTION_CLOUD_ORIGIN = dotspace.PRODUCTION_CLOUD_ORIGIN
 # sutando.ag2.ai 307s to .space and clients drop Authorization across the
 # cross-origin redirect, so a bearer sent there reads back as a bogus 401.
 RETIRED_CLOUD_ORIGINS = ("https://sutando.ag2.ai",)
@@ -65,12 +70,20 @@ REQUEST_TIMEOUT_S = 30
 
 
 def normalize_base(base: str) -> str:
-    """A retired production origin IS the current one — never send a bearer to
-    it (the 307 to the new host drops Authorization → a misleading 401)."""
+    """A retired production origin IS the production one — never send a bearer to
+    it (the 307 to the new host drops Authorization → a misleading 401); empty
+    is this install's default, for a NEW session (a stored one: `credential_base`)."""
     base = (base or "").strip().rstrip("/")
-    if base in RETIRED_CLOUD_ORIGINS or not base:
-        return DEFAULT_CLOUD_ORIGIN
-    return base
+    if base in RETIRED_CLOUD_ORIGINS:
+        return PRODUCTION_CLOUD_ORIGIN
+    return base or DEFAULT_CLOUD_ORIGIN
+
+
+def credential_base(base: str) -> str:
+    """The origin a STORED credential belongs to: the one it names, normalised; none named
+    (a pre-scoping cloud-auth.json, a metering env without endpoint) is production's, never
+    this install's — a production bearer is never re-paired with another instance's Cloud."""
+    return normalize_base(base) if (base or "").strip() else PRODUCTION_CLOUD_ORIGIN
 
 
 def fnv1a64(s: str) -> int:
@@ -117,16 +130,16 @@ def keychain_candidates(get: Callable[[str], str | None] | None = None, *,
     origin = resolve_cloud_origin()
     if signed_out_is_terminal and get(origin_vault_key(origin)) == SIGNED_OUT_SENTINEL:
         return
-    candidates = [origin]
-    if origin == DEFAULT_CLOUD_ORIGIN:
-        candidates.extend(RETIRED_CLOUD_ORIGINS)
-    keys = [origin_vault_key(o) for o in candidates]
-    # Pre-origin-scoping installs stored a bare, unscoped key.
-    keys.append("AG2_CLOUD_TOKEN")
-    for key in keys:
+    # (origin the credential belongs to, key it is stored under): a token is only ever paired
+    # with the origin it was stored for; the retired and the bare pre-scoping key are production's.
+    pairs = [(origin, origin_vault_key(origin))]
+    if origin == PRODUCTION_CLOUD_ORIGIN:
+        pairs.extend((PRODUCTION_CLOUD_ORIGIN, origin_vault_key(o)) for o in RETIRED_CLOUD_ORIGINS)
+    pairs.append((PRODUCTION_CLOUD_ORIGIN, "AG2_CLOUD_TOKEN"))
+    for bound_to, key in pairs:
         tok = get(key)
         if tok and tok != SIGNED_OUT_SENTINEL:
-            yield origin, tok
+            yield bound_to, tok
 
 
 def read_keychain_auth(get: Callable[[str], str | None] | None = None, *,
@@ -211,7 +224,7 @@ def _file_candidates(ws: Path) -> Iterator[tuple[str, str]]:
             if p.exists():
                 d = json.loads(p.read_text())
                 if d.get("token"):  # signed in == has token (matches desktop)
-                    yield normalize_base(d.get("apiBase") or ""), d["token"]
+                    yield credential_base(d.get("apiBase") or ""), d["token"]
         except Exception:
             continue
 
@@ -261,7 +274,7 @@ def read_cloud_auth(ws: Path, keychain_auth: Callable[[], tuple] | None = None,
     unknown = False
     for base, tok in _candidates(ws, keychain_auth, keychain_get):
         # Keyed like the id cache: one token on an unusable base must still be tried on its real one.
-        key = (normalize_base(base or DEFAULT_CLOUD_ORIGIN), tok)
+        key = (credential_base(base), tok)
         if key in tried:
             continue
         tried.add(key)
@@ -303,7 +316,7 @@ def _metering_env_auth():
             tok = auth.split(" ", 1)[1] if auth.lower().startswith("bearer ") else auth
             base = os.environ.get("SUTANDO_METERING_ENDPOINT", "").replace("/api/usage/v2", "")
             if tok:
-                return normalize_base(base), tok
+                return credential_base(base), tok
         except Exception:
             pass
     return None, None

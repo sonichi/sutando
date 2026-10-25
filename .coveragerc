@@ -38,6 +38,7 @@ omit =
     packages/ag2-sparrow/ag2_sparrow/result_ready.py
     packages/ag2-sparrow/ag2_sparrow/result_disposal.py
     packages/ag2-sparrow/ag2_sparrow/dedup_recovery.py
+    packages/ag2-sparrow/ag2_sparrow/dotspace.py
     packages/ag2-sparrow/ag2_sparrow/file_lock.py
     packages/ag2-sparrow/ag2_sparrow/workspace_lock.py
     packages/ag2-sparrow/ag2_sparrow/chat_secret_filter.py

@@ -107,10 +107,10 @@ ROWS: "list[tuple[str, dict[str, tuple[str, list[tuple[str, str]]]]]]" = [
         "discord": ("`DeliveryReceipt` (CONFIRMED carries the provider "
                     "message id) + append-only `outbox_log`",
                     [(DISCORD, r"import outbox_log")]),
-        "ag2space": ("gateway `event_id` when present; bare `ok` trusted as "
-                     "delivered; `record_delivered` via the vendored outbox",
-                     [(AG2, r"from .outbox import DeliveryOutcome, "
-                            r"record_delivered")]),
+        "ag2space": ("gateway `event_id` only, recorded as `provider_ref` on the "
+                     "proactive outbox item before it is marked delivered",
+                     [(AG2, r"from \.outbox import .*record_provider_ref"),
+                      (AG2, r"PROACTIVE_TRUST_OK", "absent")]),
         "slack": ("none persisted for replies (failures printed); proactive "
                   "marked delivered in `slack_proactive_receipts`",
                   [(SLACK, r"mark_delivered as mark_proactive_delivered"),
@@ -153,9 +153,10 @@ ROWS: "list[tuple[str, dict[str, tuple[str, list[tuple[str, str]]]]]]" = [
         "discord": ("in-memory attempt counter on the marker leg; the "
                     "proactive leg already rides the outbox-backed fence",
                     [(DISCORD, r"from proactive_claim_fence import ProactiveClaimFence")]),
-        "ag2space": ("closest to canon: vendored outbox `classify_response` "
-                     "three-state + `record_delivered`",
-                     [(AG2, r"from .outbox_adapter import classify_response")]),
+        "ag2space": ("none: the proactive leg rides a DeliveryCore lane over the "
+                     "room-message provider; uncertain sends park",
+                     [(AG2, r"AG2SpaceRoomMessageProvider\(lambda \*a: _post_proactive_message"),
+                      (AG2, r"_PROACTIVE_ATTEMPTS", "absent")]),
         "slack": ("private `slack_proactive_receipts` + bare poll-loop retry",
                   [(SLACK, r"from slack_proactive_receipts import")]),
     }),

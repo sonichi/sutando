@@ -51,6 +51,8 @@ class DrainStatus(str, Enum):
     NOT_CLAIMED = "not_claimed"
     TERMINAL = "terminal"
     ATTEMPTED = "attempted"
+    # The claim's revalidation refused the send: parked, no provider call.
+    WITHDRAWN = "withdrawn"
 
 
 @dataclass(frozen=True)
