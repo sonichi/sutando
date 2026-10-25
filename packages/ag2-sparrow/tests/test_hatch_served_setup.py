@@ -3780,8 +3780,58 @@ class Upgrade(Base):
                 self.assert_held_everywhere(json.dumps(journal, sort_keys=True),
                                             f"{label} from {bad[:12]!r}")
 
+    FORWARD = {"started/snapshot": dict(outcome="started", phase="snapshot"),
+               "started/quiesced": dict(outcome="started", phase="quiesced", manager="unit"),
+               "started/installing": dict(outcome="started", phase="installing", manager="unit"),
+               "started/installed": dict(outcome="started", phase="installed", manager="unit"),
+               "no-pip-check": dict(outcome="no-pip-check", phase="no-pip-check"),
+               "stop-failed": dict(outcome="stop-failed", phase="stop-failed"),
+               "not-started": dict(outcome="not-started", phase="not-started")}
+    CRASH = {"target": "0.6.0", "installed": "0.5.4", "why": "w", "at": 2.0}
+
+    def forward_journal(self, label, origin):
+        fields = dict(self.FORWARD.get(label) or {"outcome": "crashed", "phase": "crashed",
+                                                  "manager": "unit"}, at=1.0, **{"from": origin})
+        journal = {"attempted": {"0.6.0": fields}}
+        if label == "crashed with a manager":
+            journal["failed"] = dict(self.CRASH, **{"from": origin})
+        return journal
+
+    def test_a_forward_only_attempt_needs_an_origin_below_its_target(self):
+        labels = list(self.FORWARD) + ["crashed with a manager"]
+        for label in labels:
+            for bad in self.BAD_ORIGINS + ("0.6.0", "0.9.0", "0.6.0.post1"):
+                self.assert_held_everywhere(json.dumps(self.forward_journal(label, bad)),
+                                            f"{label} from {bad[:12]!r}")
+            # Positive: the origin a writer proves (below the target) still loads.
+            self.state_path_text(json.dumps(self.forward_journal(label, "0.5.4")))
+            self_upgrade.load_state(self.state)
+
+    def test_a_rollback_may_start_above_its_target_but_not_from_text(self):
+        for outcome, phase, extra in (("rolled-back", "rolled-back", {"outcome": "rolled-back",
+                                                                    "problems": []}),
+                                      ("restore-failed", "restore-failed",
+                                       {"outcome": "restore-failed", "problems": ["p"]})):
+            tried = {"at": 1.0, "from": "0.9.0", "outcome": outcome, "phase": phase}
+            summary = dict(self.CRASH, installed="0.9.0", **dict(extra, **{"from": "0.9.0"}))
+            self.state_path_text(json.dumps({"attempted": {"0.6.0": tried}, "failed": summary}))
+            self_upgrade.load_state(self.state)
+
+    def test_a_retained_restore_failed_summary_needs_a_version_origin(self):
+        # A rerun that ends in a KEEPS_FAILED outcome keeps the summary of the earlier attempt.
+        for kept in ("no-download", "unsupported-install"):
+            attempt = {"at": 1.0, "from": "0.5.4", "outcome": kept, "phase": kept}
+            for bad in self.BAD_ORIGINS:
+                summary = dict(self.CRASH, outcome="restore-failed", problems=["p"],
+                               **{"from": bad})
+                self.assert_held_everywhere(json.dumps(
+                    {"attempted": {"0.6.0": attempt}, "failed": summary}), f"{kept} {bad[:12]!r}")
+            good = dict(self.CRASH, outcome="restore-failed", problems=["p"], **{"from": "0.5.4"})
+            self.state_path_text(json.dumps({"attempted": {"0.6.0": attempt}, "failed": good}))
+            self_upgrade.load_state(self.state)
+
     def test_an_origin_before_the_version_gate_may_be_any_text(self):
-        for outcome in ("not-started", "unsupported-install", "not-above-installed",
+        for outcome in ("unsupported-install", "not-above-installed",
                         "no-download", "no-inventory", "no-snapshot", "crashed"):
             for bad in self.BAD_ORIGINS + ("0.5.4",):
                 tried = {"at": 1.0, "from": bad, "outcome": outcome, "phase": outcome}

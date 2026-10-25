@@ -170,12 +170,14 @@ _ATTEMPT_VARIANTS = {
 }
 
 
-# Past the gate in _upgrade_locked that parses the installed version (a snapshot needs it),
-# so `from` is a version; earlier outcomes and a stale phase-less crash may keep any text.
+# Past the gate in _upgrade_locked that parses the installed version and checks it is below
+# the target (a snapshot needs it), `from` is a version; a rollback may start from any version.
+_BELOW_TARGET = frozenset(
+    {("started", p) for p in ("snapshot", "quiesced", "installing", "installed")}
+    | {(o, o) for o in ("ok", "no-pip-check", "stop-failed", "not-started")})
 _PARSED_ORIGIN = frozenset(
-    {("started", p) for p in ("snapshot", "quiesced", "installing", "installed", "restoring")}
-    | {(o, o) for o in ("ok", "rolled-back", "restore-failed", "no-pip-check", "stop-failed")}
-    | {("restore-failed", "acknowledged")})
+    {("started", "restoring"), ("restore-failed", "acknowledged")}
+    | {(o, o) for o in ("rolled-back", "restore-failed")})
 
 
 def _well_formed_journal(state, latest: float) -> bool:
@@ -195,11 +197,13 @@ def _journal_fault(state, latest: float) -> "str | None":
                for k, t in state["attempted"].items()):
         return "an attempt no writer leaves"
     for k, t in state["attempted"].items():
-        origin = parse_version(t["from"])
-        if (t["outcome"], t.get("phase")) in _PARSED_ORIGIN and origin is None:
+        origin, variant = parse_version(t["from"]), (t["outcome"], t.get("phase"))
+        if variant == ("crashed", "crashed") and "manager" in t:
+            variant = ("started", "quiesced")  # only a quiesced attempt settles with its manager
+        if (variant in _BELOW_TARGET or variant in _PARSED_ORIGIN) and origin is None:
             return "an attempt past the version gate whose origin is not a version"
-        if t["outcome"] == "ok" and not origin < parse_version(k):
-            return "a success that is not above the version it came from"
+        if variant in _BELOW_TARGET and not origin < parse_version(k):
+            return "an attempt past the version gate whose origin is not below its target"
     if "failed" in state:
         failed = state["failed"]
         if not _typed(failed, _FAILED, ("target", "from", "installed", "why", "at"), latest):
@@ -279,8 +283,10 @@ def _failed_variant(failed: dict) -> bool:
 
 def _failed_consistent(failed: dict) -> bool:
     """_rollback appends a problem unless the previous version is what is installed."""
-    return failed.get("outcome") != "rolled-back" or (
-        failed["installed"] == failed["from"] and parse_version(failed["from"]) is not None)
+    if failed.get("outcome") not in ("rolled-back", "restore-failed"):
+        return True  # a crash summary keeps the text of its attempt's origin
+    return parse_version(failed["from"]) is not None and (
+        failed.get("outcome") != "rolled-back" or failed["installed"] == failed["from"])
 
 
 def _summarises(attempted: dict, target: str, outcome: str, kept_by) -> bool:
