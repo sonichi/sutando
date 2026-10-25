@@ -187,7 +187,8 @@ def _journal_fault(state, latest: float) -> "str | None":
                for k, t in state["attempted"].items()):
         return "an attempt no writer leaves"
     for k, t in state["attempted"].items():
-        if t["outcome"] == "ok" and not (parse_version(t["from"]) or ()) < parse_version(k):
+        origin = parse_version(t["from"])
+        if t["outcome"] == "ok" and (origin is None or not origin < parse_version(k)):
             return "a success that is not above the version it came from"
     if "failed" in state:
         failed = state["failed"]
@@ -268,7 +269,8 @@ def _failed_variant(failed: dict) -> bool:
 
 def _failed_consistent(failed: dict) -> bool:
     """_rollback appends a problem unless the previous version is what is installed."""
-    return failed.get("outcome") != "rolled-back" or failed["installed"] == failed["from"]
+    return failed.get("outcome") != "rolled-back" or (
+        failed["installed"] == failed["from"] and parse_version(failed["from"]) is not None)
 
 
 def _summarises(attempted: dict, target: str, outcome: str, kept_by) -> bool:

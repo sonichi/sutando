@@ -3732,6 +3732,24 @@ class Upgrade(Base):
             {"attempted": {"0.6.0": dict(ok, **{"from": "0.7.0"})}, "installed": installed}),
             "a success below the version it came from")
 
+    def test_an_unparseable_version_is_a_fault_not_a_low_value(self):
+        base = {"at": 1.0, "from": "0.5.4"}
+        installed = {"version": "0.6.0", "at": 2.0, "sha256": {"w.whl": SHA_NEW}, "after": []}
+        rolled = dict(base, outcome="rolled-back", phase="rolled-back")
+        failed = {"target": "0.6.0", "from": "0.5.4", "installed": "0.5.4", "why": "w",
+                  "at": 2.0, "outcome": "rolled-back", "problems": []}
+        for bad in ("not-a-version", "", "1.0+local", "v1", "0.5.4 "):
+            ok = dict(base, outcome="ok", phase="ok", manager="unit", **{"from": bad})
+            self.assert_held_everywhere(json.dumps({"attempted": {"0.6.0": ok},
+                                                    "installed": installed}), f"ok from {bad!r}")
+            self.assert_held_everywhere(json.dumps(
+                {"attempted": {"0.6.0": dict(rolled, **{"from": bad})},
+                 "failed": dict(failed, **{"from": bad, "installed": bad})}),
+                f"rolled-back from {bad!r}")
+            self.assert_held_everywhere(json.dumps(
+                {"attempted": {bad: dict(base, outcome="crashed", phase="crashed")}}),
+                f"target {bad!r}")
+
     def test_a_direct_rerun_keeps_a_quiesced_record_valid(self):
         self_upgrade._attempt(self.state, "0.6.0")
         self_upgrade._phase(self.state, "0.6.0", "quiesced", manager="detached")
