@@ -18,7 +18,7 @@ startup (`src/startup-runtime.sh`) all call that module and never touch the file
 | `added_by` | `login`, `owner`, `ui` or `env`. |
 | `added_at` | ISO 8601 UTC. |
 | `verified` | Whether the server came from the gateway's own answer (below) rather than from the gateway hostname. |
-| `server_source` | Where `server` came from: `identity` (the authenticated agent listing), `resolver` (`src/dotspace.py`'s `dotspace_for(gateway_host)`), or `gateway` (the host itself, provisional). |
+| `server_source` | Where `server` came from: `identity` (the DotSpace the resolver registers for the gateway host, confirmed by the gateway's own agent listing), `resolver` (the registered DotSpace alone), or `gateway` (the host itself, provisional). |
 | `agent_mxid` | The agent's identity at that server, when the gateway named it. |
 
 The record is validated on every read (schema, bounds, one primary, unique instance /
@@ -39,25 +39,37 @@ grants the new gateway nothing beyond what its own token already carries.
 Adding is two-step and does not care where the code came from (pasted into the UI,
 typed at the CLI, handed over by a browser flow, present in the environment):
 
-1. **Preview.** `preview_connection(token)` performs the bridge's own authenticated
-   probe (`GET /v1/agents` under the token's bearer, following no redirect) against the
-   gateway embedded in the token. When the gateway names exactly one agent, the server
-   is that mxid's server (`server_source: identity`, `verified: true`). Otherwise the
-   DotSpace resolver is asked about the gateway host (`resolver`), and failing that the
-   host itself stands in (`gateway`), both `verified: false` so the UI can label the row
-   provisional. `error` names a refusal: `auth_rejected` (401/403), `not_a_gateway`
-   (404), `http_<code>`, or `unreachable (...)`. Nothing is saved.
+1. **Preview.** `preview_connection(token)` first checks the gateway host: it must be a
+   multi-label server name, never an IP literal, loopback, link-local or private address
+   or a single label (the resolver's own `is_server_name` and never-fetched rules);
+   anything else is refused as `invalid_gateway` before any probe, so the token cannot
+   be used to scan the machine. It then asks the DotSpace resolver which server the host
+   is registered for (`dotspace_for(gateway_host)`, source config or well-known) and runs
+   the bridge's own authenticated probe (`GET /v1/agents` under the token's bearer,
+   following no redirect). **A listing can confirm an identity, never establish one:**
+   `verified: true` (`server_source: identity`) only when the gateway names exactly one
+   agent whose server is the registered server. A registered host whose listing disagrees
+   or is missing stays `resolver`; an unregistered host is the server itself (`gateway`)
+   whatever the listing claims. `error` names a refusal: `auth_rejected` (401/403),
+   `not_a_gateway` (404), `http_<code>`, or `unreachable (...)`. Nothing is saved.
 2. **Confirm.** `add_connection(token, expected_server=<what the preview showed>)`
    runs the preview again and saves only if the identity still matches; a changed
-   answer is a `ConnectionMismatch` (the runtime API answers `CONFLICT`, the CLI exits
-   1). The secret goes to the vault under `token_ref` first; if the vault refuses, the
-   add fails closed and nothing is written.
+   answer is a `ConnectionMismatch` (the runtime API answers `CONFLICT`, HTTP 409
+   `mismatch`, the CLI exits 1). A token the gateway rejected on the probe is never
+   stored (`TokenRejected`, 409 `token_rejected`); an unreachable gateway is stored as
+   a pending, unverified row. The secret goes to the vault under `token_ref` first; a
+   vault key that already holds a secret no row owns is never overwritten
+   (`VaultKeyInUse`, 409 `vault_key_in_use`), and if the vault refuses, the add fails
+   closed and nothing is written.
 
-Adding is **idempotent per connection**: a token whose server, or whose gateway host,
-already has a row returns that row and starts no second bridge (the bridge's singleton
-lock is the backstop, not the policy). One homeserver's endpoints (`chat.` and
-`matrix.`) are one connection, whichever of them a token names. A verified preview, or a
-`reconnect` that learns the identity, **re-keys** a provisional (`gateway`/`resolver`)
+Adding is **idempotent per connection** and starts no second bridge (the bridge's
+singleton lock is the backstop, not the policy). A row whose server the registry or an
+identity vouches for (`resolver`/`identity`) matches a token for the same server, so one
+registered homeserver's endpoints (`chat.` and `matrix.`) are one connection. A
+provisional (`gateway`) row matches only a token for its own gateway host, so it can
+never stand in for a real connection elsewhere: a gateway at another host claiming
+someone else's identity gets its own provisional row and the real token is still stored.
+A verified preview, or a `reconnect` that learns the identity, **re-keys** a provisional
 row to the identity's server in place: one row, one bridge, the instance slug and vault
 key unchanged. A row keyed by identity is never demoted.
 
@@ -83,8 +95,12 @@ under `state/connections-launch/<instance>.json`:
 
 `reconnect(instance)` stops the one bridge holding that instance's singleton lock and
 launches it again; the other connections keep running. `remove_connection(instance)`
-drops the row, its vault key and its launch record, and nothing else; the primary needs
-`force`, and no remaining row inherits the flag.
+stops that bridge the same way, then drops the row, its vault key and its launch record,
+and nothing else; the primary needs `force`, and no remaining row inherits the flag. A
+removed env-imported row is remembered in the record's `removed_env` list, so
+`import-env` does not bring it back while the variable is still set (it says
+"connection removed earlier; unset the variable"); an explicit add of that key clears
+the tombstone.
 
 ## Startup
 
@@ -94,8 +110,10 @@ environment (copying the secret into the vault unless one is already there; neve
 overwriting a row), then launches one bridge per `launch-plan` line through
 `scripts/connections.py launch <instance>`. The plan lists every row with an instance
 plus any env token the import could not record, so an unavailable vault degrades to
-the previous behaviour instead of losing a gateway. The legacy unsuffixed bridge keeps
-its own launch path.
+the previous behaviour instead of losing a gateway. An unreadable record never reads
+as "no secondaries": `launch-plan` exits non-zero naming the parse error, startup prints
+a ⚠ line and launches each `AG2_REMOTE_TOKEN_<INST>` with `launch --env-only`, from the
+variable alone. The legacy unsuffixed bridge keeps its own launch path.
 
 The bridge environment (`GATEWAY_INSTANCE`, `REMOTE_TASK_TOKEN` from the env var of
 the same name or the vault, empty `REMOTE_TASK_URL`, `REMOTE_TASK_CHANNEL_DIR`,
@@ -117,11 +135,29 @@ the same name or the vault, empty `REMOTE_TASK_URL`, `REMOTE_TASK_CHANNEL_DIR`,
   | `POST /api/v1/connections/<instance>/primary` | `{}` | 200 `{"connection": row}` |
   | `POST /api/v1/connections/<instance>/reconnect` | `{}` | 202 `{"launch": record}` |
 
-  Mutating routes are gated like `POST /task`: the bearer when `SUTANDO_API_TOKEN` is
-  configured, otherwise the loopback bind alone; on top, a request carrying a
-  non-loopback `Origin` is refused with 403, so a page from another origin cannot mutate
-  even where the bearer is unset. The preflight allows `GET, POST, DELETE, OPTIONS` and
-  `Content-Type, Authorization`.
+### Authorization for the HTTP routes
+
+  Every connections route, GET included, is behind one gate (`src/local_api_gate.py`,
+  the same module the dashboard's mutation gate lives in), checked in this order:
+
+  1. **Host** must name loopback (`127.0.0.1`, `localhost`, `[::1]`) on the service's
+     bound port — a DNS-rebinding page puts another name here — else 403.
+  2. **Origin** must be absent (a local tool, a same-origin proxy) or loopback, else 403.
+  3. **Bearer** `Authorization: Bearer <token>` must match, always: `SUTANDO_API_TOKEN`
+     when the operator configured one, else the per-install secret the service mints
+     once into `<workspace>/state/agent-api.token` (0600, atomic). No bearer is 401 on
+     all six routes, with no `SUTANDO_API_TOKEN` set as much as with one.
+
+  Responses carry `Access-Control-Allow-Origin` only for a loopback Origin whose request
+  passed the whole gate (echoed, with `Vary: Origin`), never `*`, and never on a
+  refusal; the preflight grants a loopback Origin `GET, POST, DELETE, OPTIONS` and
+  `Content-Type, Authorization` and grants nothing else. `check_auth` (the `POST /task`
+  gate, which is open when `SUTANDO_API_TOKEN` is unset) is **not** enough here: a
+  reconnected bridge runs tasks at the local tier cap, which defaults to owner, so a
+  page that could add or reconnect a connection would run owner-tier tasks under an
+  attacker's token. The web client must present the bearer; the desktop shell reads
+  `state/agent-api.token` and supplies it, and until that ships the UI shows "needs
+  the desktop update" instead of calling these routes.
 
 `instance_for` keeps a slug within the bridge's 32-character limit by appending a short
 digest to a long server name, so two long names never share a slug.

@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
 """E2E test for the connections routes on agent-api — a REAL HTTP server on an
 ephemeral port, the module's workspace patched to a temp dir, the vault, the
-gateway probe and the bridge spawn replaced by fakes.
+gateway probe, the resolver and the bridge spawn replaced by fakes.
 
-Contract: GET /api/v1/connections lists rows joined with status (server_source
-included, never a secret); POST previews, then creates on confirm (201 / 200
-existing / 409 mismatch / 400 / 503 vault); DELETE <instance> is 204 or 409
-primary; POST <instance>/primary is 200; POST <instance>/reconnect is 202.
-Mutations are gated like POST /task (bearer when SUTANDO_API_TOKEN is set) and
-refuse a non-loopback Origin; the preflight allows DELETE and Content-Type.
+Contract: every /api/v1/connections route, GET included, needs the local API
+bearer (SUTANDO_API_TOKEN, else state/agent-api.token), a loopback Host on the
+bound port and an absent or loopback Origin; refusals are 401/403 and never
+carry a wildcard CORS grant. With the bearer: GET lists rows joined with status
+(server_source included, never a secret); POST previews, then creates on
+confirm (201 / 200 existing / 409 mismatch, token_rejected, vault_key_in_use /
+400 / 503 vault); DELETE <instance> is 204 or 409 primary; POST
+<instance>/primary is 200; POST <instance>/reconnect is 202.
 
 Run: python3 tests/agent-api-connections.test.py
 """
+import http.client
 import http.server
 import importlib.util
 import json
@@ -32,6 +35,7 @@ os.environ["SUTANDO_TEST_MODE"] = "1"
 os.environ["SUTANDO_WORKSPACE"] = _WS
 os.environ.setdefault("SUTANDO_TELEMETRY", "0")
 os.environ["SUTANDO_SUPPRESS_CCD_FALLBACK_BANNER"] = "1"
+os.environ.pop("SUTANDO_API_TOKEN", None)
 
 
 def _load(name: str, path: Path):
@@ -44,6 +48,7 @@ def _load(name: str, path: Path):
 
 api = _load("agent_api", REPO / "src" / "agent-api.py")
 import connections as C  # noqa: E402
+import dotspace  # noqa: E402
 
 WS = Path(_WS)
 assert api.WORKSPACE_DIR == WS.resolve(), api.WORKSPACE_DIR
@@ -51,6 +56,9 @@ api.API_TOKEN = ""
 
 TOKEN_A = "https://chat.alpha.example|secret-alpha"
 TOKEN_B = "https://relay.beta.example|secret-beta"
+REGISTRY = {"instances": [{"server": "alpha.example", "gateway_host": "chat.alpha.example"},
+                          {"server": "beta.example", "gateway_host": "relay.beta.example"}]}
+C.DEFAULT_RESOLVER = lambda host: dotspace.dotspace_for(host, fetch=dotspace.NO_FETCH, config=REGISTRY)
 
 
 class FakeVault:
@@ -72,6 +80,8 @@ SPAWNED = []
 
 
 def fetch(url, token):
+    if url == "https://rejecting.example":
+        raise urllib.error.HTTPError(url, 401, "nope", {}, None)
     return {"agents": [{"id": i} for i in GATEWAY.get(url, [])]}
 
 
@@ -84,11 +94,12 @@ def spawn(argv, env, log_path):
 _real = api.connections_http
 api.connections_http = lambda method, path, body, query=None: _real(
     method, path, body, query, vault=FakeVault(), fetch=fetch, spawn=spawn, kill=lambda *a: None)
-C.DEFAULT_RESOLVER = lambda host: None
 
 server = http.server.HTTPServer(("127.0.0.1", 0), api.Handler)
 server.timeout = 0.5
-BASE = f"http://127.0.0.1:{server.server_address[1]}"
+PORT = server.server_address[1]
+BASE = f"http://127.0.0.1:{PORT}"
+BEARER = api.connections_bearer()
 failures = []
 
 
@@ -98,50 +109,105 @@ def check(name, cond, detail=""):
         failures.append(name)
 
 
-def req(method, path, body=None, headers=None):
-    data = json.dumps(body).encode() if body is not None else None
-    r = urllib.request.Request(BASE + path, data=data, method=method, headers=headers or {})
-    if data is not None:
-        r.add_header("Content-Type", "application/json")
+def serve_while(fn):
     out = {}
 
     def go():
-        try:
-            with urllib.request.urlopen(r, timeout=5) as resp:
-                out["status"], out["headers"], raw = resp.status, dict(resp.headers), resp.read()
-        except urllib.error.HTTPError as e:
-            out["status"], out["headers"], raw = e.code, dict(e.headers), e.read()
-        except Exception as e:  # noqa: BLE001 - a reset is a finding, not a crash
-            out["status"], out["headers"], raw = None, {}, json.dumps({"transport_error": str(e)}).encode()
-        out["body"] = json.loads(raw) if raw else None
+        out["value"] = fn()
     t = threading.Thread(target=go)
     t.start()
     while t.is_alive():
         server.handle_request()
     t.join()
-    return out["status"], out["body"], out["headers"]
+    return out["value"]
+
+
+def req(method, path, body=None, headers=None, auth=True, host=None):
+    """Raw request: (status, parsed body or None, headers). `host` overrides the Host header."""
+    def go():
+        conn = http.client.HTTPConnection("127.0.0.1", PORT, timeout=5)
+        hdrs = {"Host": host or f"127.0.0.1:{PORT}"}
+        if auth:
+            hdrs["Authorization"] = f"Bearer {BEARER}" if auth is True else auth
+        hdrs.update(headers or {})
+        data = None
+        if body is not None:
+            data = body if isinstance(body, bytes) else json.dumps(body).encode()
+            hdrs["Content-Type"] = "application/json"
+        conn.request(method, path, body=data, headers=hdrs)
+        resp = conn.getresponse()
+        raw = resp.read()
+        conn.close()
+        parsed = json.loads(raw) if raw else None
+        return resp.status, parsed, dict(resp.getheaders())
+    return serve_while(go)
 
 
 def no_secret(body):
     return "secret-alpha" not in json.dumps(body) and "secret-beta" not in json.dumps(body)
 
 
-print("== CORS preflight ==")
-s, _, h = req("OPTIONS", "/api/v1/connections")
-check("preflight is 200", s == 200)
-methods = h.get("Access-Control-Allow-Methods", "")
-check("preflight allows DELETE", "DELETE" in methods, methods)
-check("preflight keeps Content-Type", "Content-Type" in h.get("Access-Control-Allow-Headers", ""))
+print("== the per-install bearer ==")
+token_path = WS / "state" / api.local_api_gate.LOCAL_API_TOKEN_NAME
+check("the bearer was minted into state/agent-api.token", token_path.read_text().strip() == BEARER and len(BEARER) >= 32)
+check("the token file is 0600", oct(token_path.stat().st_mode & 0o777) == "0o600")
+check("minting is idempotent", api.connections_bearer() == BEARER)
 
-print("== empty list ==")
+print("== fail closed without the bearer (the security review's repros) ==")
+for method, path, body in (("GET", "/api/v1/connections", None),
+                           ("POST", "/api/v1/connections", {"token": TOKEN_A}),
+                           ("POST", "/api/v1/connections", {"token": TOKEN_A, "confirm": True, "expected_server": "alpha.example"}),
+                           ("DELETE", "/api/v1/connections/x?force=1", None),
+                           ("POST", "/api/v1/connections/x/primary", {}),
+                           ("POST", "/api/v1/connections/x/reconnect", {})):
+    s, b, h = req(method, path, body, auth=False)
+    check(f"{method} {path} without a bearer is 401", s == 401, f"{s} {b}")
+    check(f"{method} {path} refusal carries no wildcard CORS grant", "Access-Control-Allow-Origin" not in h, h)
+    s, b, _ = req(method, path, body, auth="Bearer wrong")
+    check(f"{method} {path} with a wrong bearer is 401", s == 401, f"{s} {b}")
+for origin in ("http://localhost:3000", "http://127.0.0.1:1", "http://x.localhost"):
+    s, b, _ = req("POST", "/api/v1/connections", {"token": TOKEN_A, "confirm": True, "expected_server": "alpha.example"},
+                  headers={"Origin": origin}, auth=False)
+    check(f"confirm from loopback Origin {origin} without a bearer is 401", s == 401, f"{s} {b}")
+for origin in ("https://evil.example", "null"):
+    s, b, _ = req("POST", "/api/v1/connections", {"token": TOKEN_A, "confirm": True, "expected_server": "alpha.example"},
+                  headers={"Origin": origin}, auth=False)
+    check(f"confirm from Origin {origin} without a bearer is refused (403)", s == 403, f"{s} {b}")
+s, b, _ = req("GET", "/api/v1/connections", host="evil.example")
+check("a forged Host (DNS rebinding) is 403 even with the bearer", s == 403, f"{s} {b}")
+s, b, _ = req("GET", "/api/v1/connections", host=f"127.0.0.1:{PORT + 1}")
+check("a loopback Host on another port is 403", s == 403, f"{s} {b}")
+s, b, _ = req("GET", "/api/v1/connections", host="localhost")
+check("a loopback Host without a port passes the host check", s == 200, f"{s} {b}")
+for origin in ("https://evil.example", "null", "http://localhost.evil.example"):
+    s, b, h = req("POST", "/api/v1/connections", {"token": TOKEN_A}, headers={"Origin": origin})
+    check(f"a non-loopback Origin {origin} is 403 even with the bearer", s == 403, f"{s} {b}")
+    check(f"no CORS grant is echoed to {origin}", "Access-Control-Allow-Origin" not in h, h)
+check("nothing was stored by the refused requests", (FakeVault.store, SPAWNED) == ({}, []))
 s, b, _ = req("GET", "/api/v1/connections")
-check("GET is 200 with an empty list", (s, b) == (200, {"connections": []}), f"{s} {b}")
+check("nothing was stored by the refused requests (record)", b == {"connections": []}, b)
+
+print("== CORS: echo the loopback Origin only, never * ==")
+s, b, h = req("GET", "/api/v1/connections", headers={"Origin": "http://localhost:5173"})
+check("a loopback Origin with the bearer is echoed", s == 200 and h.get("Access-Control-Allow-Origin") == "http://localhost:5173", h)
+check("Vary: Origin accompanies the echo", h.get("Vary") == "Origin", h)
+s, b, h = req("GET", "/api/v1/connections", headers={"Origin": "http://localhost:5173"}, auth=False)
+check("the 401 to a loopback Origin still has no grant", s == 401 and "Access-Control-Allow-Origin" not in h, h)
+s, b, h = req("OPTIONS", "/api/v1/connections", headers={"Origin": "http://localhost:5173"}, auth=False)
+check("preflight from loopback is 204 echoing the Origin", s == 204 and h.get("Access-Control-Allow-Origin") == "http://localhost:5173", (s, h))
+check("preflight allows DELETE and the bearer header",
+      "DELETE" in h.get("Access-Control-Allow-Methods", "") and "Authorization" in h.get("Access-Control-Allow-Headers", ""), h)
+s, b, h = req("OPTIONS", "/api/v1/connections", headers={"Origin": "https://evil.example"}, auth=False)
+check("preflight from elsewhere grants nothing", s == 204 and "Access-Control-Allow-Origin" not in h, h)
+s, b, h = req("OPTIONS", "/ping", headers={"Origin": "https://evil.example"}, auth=False)
+check("other routes keep their own preflight", s == 200, s)
 
 print("== preview, then confirm ==")
 s, b, _ = req("POST", "/api/v1/connections", {"token": TOKEN_A})
 check("preview is 200", s == 200, f"{s} {b}")
 p = (b or {}).get("preview") or {}
-check("preview names the identity server", p.get("server") == "alpha.example" and p.get("server_source") == "identity", p)
+check("preview names the registered, identity-confirmed server",
+      (p.get("server"), p.get("server_source"), p.get("verified")) == ("alpha.example", "identity", True), p)
 check("preview carries no secret", no_secret(b))
 s, b, _ = req("GET", "/api/v1/connections")
 check("a preview saves nothing", b == {"connections": []})
@@ -163,15 +229,33 @@ check("the row carries the vault key name, not the secret",
 check("the secret went to the vault", FakeVault.store.get("AG2_REMOTE_TOKEN_ALPHA_EXAMPLE") == TOKEN_A)
 s, b, _ = req("POST", "/api/v1/connections", {"token": "https://chat.alpha.example|rotated", "confirm": True,
                                               "expected_server": "alpha.example"})
-check("an existing server is 200 created:false", s == 200 and (b or {}).get("created") is False, f"{s} {b}")
+check("an existing connection is 200 created:false", s == 200 and (b or {}).get("created") is False, f"{s} {b}")
 s, b, _ = req("POST", "/api/v1/connections", {"token": TOKEN_B, "confirm": True, "expected_server": "beta.example"})
 check("a second server is 201 and not primary", s == 201 and not b["connection"]["primary"], f"{s} {b}")
+
+print("== refusals the review asked for ==")
+s, b, _ = req("POST", "/api/v1/connections", {"token": "https://rejecting.example|bad", "confirm": True,
+                                              "expected_server": "rejecting.example"})
+check("a token the gateway rejects is 409 token_rejected", (s, b) == (409, {"error": "token_rejected"}), f"{s} {b}")
+FakeVault.store["AG2_REMOTE_TOKEN_GW_UNREGISTERED_EXAMPLE"] = "foreign"
+s, b, _ = req("POST", "/api/v1/connections", {"token": "https://gw.unregistered.example|u", "confirm": True,
+                                              "expected_server": "gw.unregistered.example"})
+check("a vault key no row owns is 409 vault_key_in_use", (s, b) == (409, {"error": "vault_key_in_use"}), f"{s} {b}")
+check("the foreign key is untouched", FakeVault.store["AG2_REMOTE_TOKEN_GW_UNREGISTERED_EXAMPLE"] == "foreign")
+del FakeVault.store["AG2_REMOTE_TOKEN_GW_UNREGISTERED_EXAMPLE"]
+for host in ("127.0.0.1:9", "10.0.0.1", "localhost", "intranet"):
+    s, b, _ = req("POST", "/api/v1/connections", {"token": f"http://{host}/relay|s"})
+    check(f"a token aimed at {host} is 400 invalid_gateway, unprobed", (s, b) == (400, {"error": "invalid_gateway"}), f"{s} {b}")
+for inst in (["x"], 5):
+    s, b, _ = req("POST", "/api/v1/connections", {"token": TOKEN_B, "confirm": True, "expected_server": "beta.example",
+                                                  "instance": inst})
+    check(f"instance {inst!r} is 400, not a crash", s == 400 and "error" in (b or {}), f"{s} {b}")
 
 print("== list with status ==")
 (WS / "state" / "gateway-status.alpha-example.json").write_text(json.dumps({"connected": True, "last_ok_ts": 7}))
 s, b, _ = req("GET", "/api/v1/connections")
 rows = (b or {}).get("connections") or []
-check("GET lists both rows joined with status",
+check("GET lists both rows joined with status and server_source",
       [(r["instance"], r["state"], r["server_source"]) for r in rows]
       == [("alpha-example", "connected", "identity"), ("beta-example", "pending", "identity")], rows)
 check("GET leaks no secret", no_secret(b))
@@ -185,25 +269,8 @@ s, b, _ = req("POST", "/api/v1/connections/nope/primary", {})
 check("unknown instance is 404", s == 404, f"{s} {b}")
 s, b, _ = req("POST", "/api/v1/connections/alpha-example/unknown", {})
 check("unknown sub-route is 404", s == 404, f"{s} {b}")
-r = urllib.request.Request(BASE + "/api/v1/connections", data=b"{not json", method="POST",
-                           headers={"Content-Type": "application/json"})
-t = threading.Thread(target=lambda: (lambda: None)())
-try:
-    def go_raw():
-        try:
-            urllib.request.urlopen(r, timeout=5)
-            raw_status.append(200)
-        except urllib.error.HTTPError as e:
-            raw_status.append(e.code)
-    raw_status = []
-    t = threading.Thread(target=go_raw)
-    t.start()
-    while t.is_alive():
-        server.handle_request()
-    t.join()
-    check("invalid JSON is 400", raw_status == [400], raw_status)
-finally:
-    pass
+s, b, _ = req("POST", "/api/v1/connections", b"{not json")
+check("invalid JSON is 400", s == 400, f"{s} {b}")
 
 print("== primary, reconnect, delete ==")
 s, b, _ = req("POST", "/api/v1/connections/beta-example/primary", {})
@@ -215,7 +282,7 @@ check("reconnect is 202 with a launch record", s == 202 and b["launch"]["ok"] is
 check("reconnect spawned exactly that bridge", SPAWNED == ["alpha-example"], SPAWNED)
 s, b, _ = req("DELETE", "/api/v1/connections/beta-example")
 check("deleting the primary is 409 primary", (s, b) == (409, {"error": "primary"}), f"{s} {b}")
-s, b, _ = req("DELETE", "/api/v1/connections/alpha-example")
+s, b, h = req("DELETE", "/api/v1/connections/alpha-example")
 check("delete is 204 with no body", s == 204 and b is None, f"{s} {b}")
 check("the vault key went with the row", "AG2_REMOTE_TOKEN_ALPHA_EXAMPLE" not in FakeVault.store)
 s, b, _ = req("GET", "/api/v1/connections")
@@ -236,28 +303,12 @@ check("a refusing vault is 503 vault_unavailable", (s, b) == (503, {"error": "va
 api.connections_http = lambda method, path, body, query=None: _real(
     method, path, body, query, vault=FakeVault(), fetch=fetch, spawn=spawn)
 
-print("== origin gate ==")
-for origin in ("https://evil.example", "null", "http://localhost.evil.example"):
-    s, b, _ = req("POST", "/api/v1/connections", {"token": TOKEN_A}, headers={"Origin": origin})
-    check(f"a mutation from Origin {origin} is 403", s == 403, f"{s} {b}")
-    s, b, _ = req("DELETE", "/api/v1/connections/x", headers={"Origin": origin})
-    check(f"a DELETE from Origin {origin} is 403", s == 403, f"{s} {b}")
-for origin in ("http://localhost:5173", "http://127.0.0.1:7843", "app://x.localhost"):
-    s, b, _ = req("POST", "/api/v1/connections", {"token": TOKEN_A}, headers={"Origin": origin})
-    check(f"a mutation from loopback Origin {origin} passes the gate", s == 200, f"{s} {b}")
-s, b, _ = req("GET", "/api/v1/connections", headers={"Origin": "https://evil.example"})
-check("GET is not origin-gated (rows carry no secret)", s == 200, f"{s} {b}")
-
-print("== bearer gate, like POST /task ==")
-api.API_TOKEN = "test-token-123"
+print("== SUTANDO_API_TOKEN, when set, is the bearer ==")
+api.API_TOKEN = "operator-token"
 s, b, _ = req("GET", "/api/v1/connections")
-check("GET without the bearer is 401", s == 401, f"{s} {b}")
-s, b, _ = req("POST", "/api/v1/connections", {"token": TOKEN_A})
-check("POST without the bearer is 401", s == 401, f"{s} {b}")
-s, b, _ = req("DELETE", "/api/v1/connections/x", headers={"Authorization": "Bearer wrong"})
-check("DELETE with a wrong bearer is 401", s == 401, f"{s} {b}")
-s, b, _ = req("GET", "/api/v1/connections", headers={"Authorization": "Bearer test-token-123"})
-check("the right bearer reads", s == 200, f"{s} {b}")
+check("the minted token stops working once the operator set one", s == 401, f"{s} {b}")
+s, b, _ = req("GET", "/api/v1/connections", auth="Bearer operator-token")
+check("the operator's token reads", s == 200, f"{s} {b}")
 api.API_TOKEN = ""
 
 print("== DELETE elsewhere ==")
@@ -278,23 +329,28 @@ class FakeRFile:
 def handler(method, path, headers, body=b""):
     h = api.Handler.__new__(api.Handler)
     h.path, h.headers, h.rfile, h.out = path, headers, FakeRFile(body), []
-    h.send_json = lambda status, data: h.out.append((status, data))
-    h.send_response = lambda status: h.out.append((status, None))
+    h.send_response = lambda status: h.out.append(status)
     h.send_header = lambda *a: None
     h.end_headers = lambda: None
+    h.wfile = type("W", (), {"write": lambda self_, data: h.out.append(json.loads(data))})()
+    h.server = server
     h.client_address = ("127.0.0.1", 1)
     h._connections_route(method)
-    return h.out[0]
+    return h.out[0], (h.out[1] if len(h.out) > 1 else None)
+AUTH = {"Host": f"127.0.0.1:{PORT}", "Authorization": f"Bearer {BEARER}"}
 check("a bad Content-Length is 400",
-      handler("POST", "/api/v1/connections", {"Content-Length": "nope"})[0] == 400)
+      handler("POST", "/api/v1/connections", dict(AUTH, **{"Content-Length": "nope"}))[0] == 400)
 check("an oversized body is 413",
-      handler("POST", "/api/v1/connections", {"Content-Length": str(api.CONNECTIONS_BODY_CAP + 1)})[0] == 413)
+      handler("POST", "/api/v1/connections", dict(AUTH, **{"Content-Length": str(api.CONNECTIONS_BODY_CAP + 1)}))[0] == 413)
 check("a JSON body that is not an object is 400",
-      handler("POST", "/api/v1/connections", {"Content-Length": "2"}, b"[]") == (400, {"error": "body must be a JSON object"}))
+      handler("POST", "/api/v1/connections", dict(AUTH, **{"Content-Length": "2"}), b"[]") == (400, {"error": "body must be a JSON object"}))
 check("an unparseable Origin is refused",
-      handler("POST", "/api/v1/connections", {"Content-Length": "0", "Origin": "http://[bad"})[0] == 403)
-check("_loopback_origin accepts no Origin and loopback hosts only",
-      api._loopback_origin("") and api._loopback_origin("http://localhost:1") and not api._loopback_origin("https://x.example"))
+      handler("POST", "/api/v1/connections", dict(AUTH, **{"Content-Length": "0", "Origin": "http://[bad"}))[0] == 403)
+h = api.Handler.__new__(api.Handler)
+h.server = object()
+check("a handler without a bound port still gates on host and bearer",
+      api.local_api_gate.bearer_request_allowed(None, "127.0.0.1", f"Bearer {BEARER}", expected_token=BEARER, bound_port=None)
+      == (200, None))
 (WS / "state" / "connections.json").write_text("{broken")
 status, body = _real("GET", "/api/v1/connections", {}, {}, workspace=WS)
 check("a broken record is 500 with the schema error", status == 500 and "connections.json" in body["error"], (status, body))

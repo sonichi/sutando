@@ -119,6 +119,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from git_binary import git_argv  # noqa: E402
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
 import connections as _connections  # noqa: E402
+import local_api_gate  # noqa: E402
 from sutando_config import config_get  # noqa: E402
 from sutando_platform import probe_pids  # noqa: E402
 import local_task_protocol  # noqa: E402
@@ -174,20 +175,13 @@ def _emit_task_processed(content: str) -> None:
 API_TOKEN = os.environ.get("SUTANDO_API_TOKEN", "")
 
 # Connections over HTTP: the web client's transport to src/connections.py (docs/connections.md).
+# Every route, GET included, needs the local API bearer; the gate is local_api_gate's.
 CONNECTIONS_PREFIX = "/api/v1/connections"
 CONNECTIONS_BODY_CAP = 16384
-_LOOPBACK_HOSTS = ("localhost", "127.0.0.1", "::1")
 
 
-def _loopback_origin(origin: str) -> bool:
-    """A missing Origin is a same-origin proxy or a local tool; a present one must name loopback."""
-    if not origin:
-        return True
-    try:
-        host = (urlparse(origin).hostname or "").lower()
-    except ValueError:
-        return False
-    return host in _LOOPBACK_HOSTS or host.endswith(".localhost")
+def connections_bearer() -> str:
+    return local_api_gate.local_api_token(WORKSPACE_DIR, API_TOKEN)
 
 
 def connections_http(method: str, path: str, body: dict, query: Optional[dict] = None, *,
@@ -226,6 +220,10 @@ def connections_http(method: str, path: str, body: dict, query: Optional[dict] =
                     instance=body.get("instance"), preview=preview, workspace=ws, vault=vault)
             except _connections.ConnectionMismatch as e:
                 return 409, {"error": "mismatch", "server_from_token": e.derived, "expected_server": e.claimed}
+            except _connections.TokenRejected:
+                return 409, {"error": "token_rejected"}
+            except _connections.VaultKeyInUse:
+                return 409, {"error": "vault_key_in_use"}
             return (201 if created else 200), {"created": created,
                                                "connection": _connections.status_for(row, ws)}
         if len(parts) == 1 and method == "DELETE":
@@ -245,6 +243,8 @@ def connections_http(method: str, path: str, body: dict, query: Optional[dict] =
         return 404, {"error": "not found"}
     except _connections.VaultUnavailable:
         return 503, {"error": "vault_unavailable"}
+    except _connections.InvalidToken as e:
+        return 400, {"error": "invalid_gateway" if "invalid_gateway" in str(e) else str(e)}
     except _connections.UnknownConnection as e:
         return 404, {"error": str(e)}
     except _connections.SchemaError as e:
@@ -1003,49 +1003,75 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return False
 
     def do_OPTIONS(self):
+        if urlparse(self.path).path.startswith(CONNECTIONS_PREFIX):
+            # No wildcard grant here: a loopback page may preflight, nothing else gets a header.
+            self.send_response(204)
+            origin = self.headers.get("Origin", "")
+            if origin and local_api_gate.loopback_origin(origin):
+                self.send_header("Access-Control-Allow-Origin", origin)
+                self.send_header("Vary", "Origin")
+                self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+                self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+            self.end_headers()
+            return
         self.send_response(200)
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
         self.end_headers()
 
+    def _send_connections(self, status: int, payload: "dict | None", granted: bool = False) -> None:
+        """JSON (or an empty body); a cross-origin grant only for the loopback Origin whose
+        request passed the whole gate, never a wildcard and never on a refusal."""
+        self.send_response(status)
+        origin = self.headers.get("Origin", "")
+        if granted and origin and local_api_gate.loopback_origin(origin):
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
+        self.send_header("Cache-Control", "no-store")
+        if payload is not None:
+            self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        if payload is not None:
+            self.wfile.write(json.dumps(payload).encode())
+
     def _connections_route(self, method: str) -> None:
-        """Gate like POST /task (bearer when configured), refuse cross-origin mutation, dispatch.
-        The body is consumed before any refusal so the status reaches the client, not a reset."""
+        """Consume the body, then the shared gate (loopback Host on this port, loopback or
+        absent Origin, the local API bearer, always), then dispatch."""
         parsed = urlparse(self.path)
         body: dict = {}
         if method != "GET":
             try:
                 length = int(self.headers.get("Content-Length", 0) or 0)
             except (TypeError, ValueError):
-                self.send_json(400, {"error": "invalid Content-Length"})
+                self._send_connections(400, {"error": "invalid Content-Length"})
                 return
             if length < 0 or length > CONNECTIONS_BODY_CAP:
-                self.send_json(413, {"error": "request too large"})
+                self._send_connections(413, {"error": "request too large"})
                 return
             raw = self.rfile.read(length) if length else b""
             if raw.strip():
                 try:
                     body = json.loads(raw)
                 except ValueError:
-                    self.send_json(400, {"error": "invalid JSON"})
+                    self._send_connections(400, {"error": "invalid JSON"})
                     return
                 if not isinstance(body, dict):
-                    self.send_json(400, {"error": "body must be a JSON object"})
+                    self._send_connections(400, {"error": "body must be a JSON object"})
                     return
-        if not self.check_auth():
-            return
-        if method != "GET" and not _loopback_origin(self.headers.get("Origin", "")):
-            self.send_json(403, {"error": "cross-origin mutation refused"})
+        try:
+            bound_port = int(self.server.server_address[1])
+        except (AttributeError, TypeError, ValueError, IndexError):
+            bound_port = None
+        status, why = local_api_gate.bearer_request_allowed(
+            self.headers.get("Origin"), self.headers.get("Host", ""), self.headers.get("Authorization", ""),
+            expected_token=connections_bearer(), bound_port=bound_port)
+        if why:
+            self._send_connections(status, {"error": why})
             return
         from urllib.parse import parse_qs
         status, payload = connections_http(method, parsed.path, body, parse_qs(parsed.query))
-        if payload is None:
-            self.send_response(status)
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers()
-            return
-        self.send_json(status, payload)
+        self._send_connections(status, payload, granted=True)
 
     def do_DELETE(self):
         if urlparse(self.path).path.startswith(CONNECTIONS_PREFIX):
@@ -1850,6 +1876,7 @@ if __name__ == "__main__":
     # lsof guard, so nothing restarted it (2026-07-04 incident; same fix as
     # dashboard, #1709).
     server = http.server.ThreadingHTTPServer((bind, PORT), Handler)
+    connections_bearer()  # the desktop shell reads state/agent-api.token; mint it before the first client
     workstream_maintenance_stop = threading.Event()
     workstream_maintenance = threading.Thread(
         target=task_workstreams.run_classifier_maintenance,

@@ -125,6 +125,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`install-health-check-launchd.sh`** — Install / uninstall the launchd-supervised health-check FALLBACK job.
 - **`install-sutando-app-launchd.sh`** — Install / uninstall / check the launchd-supervised Sutando.app job.
 - **`live-agent-runtime.ts`** — LiveAgentRuntime — step 5a-2 of the interaction-planes refactor.
+- **`local_api_gate.py`** — The one gate for the loopback HTTP services' privileged routes.
 - **`local_record.py`** — Local JSON records: one object per file under a directory, each written whole in one rename and read back only when its file name is a safe single path segment that the record itself names.
 - **`local_task_protocol.py`** — Local Task Protocol — read-side reference implementation.
 - **`local_time.ts`** — The owner's wall clock for the `local_time:` task header; mirrors local_task_protocol.local_time_value (ISO-8601 with offset, then the IANA zone).
