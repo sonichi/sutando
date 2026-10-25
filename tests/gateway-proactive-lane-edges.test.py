@@ -174,6 +174,7 @@ def restore_by_generation() -> None:
 def gate_unreadable_task() -> None:
     ws = Path(tempfile.mkdtemp(dir=ISO))
     (ws / "tasks" / "task-unreadable.txt").mkdir(parents=True)
+    (ws / "tasks" / "task-1.txt").write_text("id: task-1\ntask: hi\n", encoding="utf-8")
     check(proactive_dispatch_gate.dispatch_veto("task-1", ws) is None, "an unreadable task file is skipped")
 
 

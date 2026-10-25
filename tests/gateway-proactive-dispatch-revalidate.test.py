@@ -10,6 +10,7 @@ one change before the send, through the host's dispatch gate:
   d) the task ends (COMPLETED)      -> no POST, withdrawn
   e) a gate that raises             -> no POST: an unchecked task is never messaged
   f) control: nothing lands         -> posted once
+  g) the task is archived/removed after publication -> no POST, withdrawn
 
 Run: python3 tests/gateway-proactive-dispatch-revalidate.test.py
 """
@@ -51,8 +52,14 @@ def land_phase(phase):
     return land
 
 
+def land_archived(lane):
+    for f in lane.tasks.glob("task-*"):
+        f.unlink()
+
+
 def scenario(label: str, land, gate=None, want_post: bool = False) -> None:
     lane = pl.Lane(gb, ISO)
+    (lane.tasks / f"{TID}.claimed-core-2.txt").write_text(f"id: {TID}\ntask: hi\n", encoding="utf-8")
     lane.write(f"proactive-about-{TID}--1761300000500.txt", "received, being worked on\n")
     if gate is None:
         gate = functools.partial(proactive_dispatch_gate.dispatch_veto, workspace=lane.ws)
@@ -95,8 +102,9 @@ def main() -> int:
     scenario("d) completed", land_phase("COMPLETED"))
     scenario("e) gate raises", lambda lane: None, gate=broken)
     scenario("f) control", None, want_post=True)
-    check(proactive_dispatch_gate.dispatch_veto(TID, ISO / "nowhere") is None,
-          "the gate lets an untracked task's message go")
+    scenario("g) archived after publication", land_archived)
+    check("left the queue" in str(proactive_dispatch_gate.dispatch_veto(TID, ISO / "nowhere")),
+          "the gate withdraws a message about a task that is not in the queue")
     return check.exit_code()
 
 

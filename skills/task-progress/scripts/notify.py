@@ -458,6 +458,65 @@ def _load_progress_route():
 _delivery_route, _no_route_message, NO_ROUTE_EXIT = _load_progress_route()
 
 
+def _load_ack_arbitration():
+    """The shared ack claim and its key owner, or None: without them nothing is arbitrated."""
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
+        import ack_claim  # type: ignore
+        from status_ack_policy import ack_key  # type: ignore
+        from task_archive import task_id_for
+        return ack_claim, ack_key, task_id_for
+    except Exception:
+        return None
+
+
+_ACK_ARBITRATION = _load_ack_arbitration()
+ACK_HOLDER = "task-progress"
+
+
+_POOL_SCRIPTS = Path(__file__).resolve().parents[3] / "skills" / "worker-pool" / "scripts"
+
+
+def _task_payload(task_file: str) -> "Path | None":
+    """The `<ws>/tasks/` file a --task-file stands for: itself, or the payload a worker's
+    `deliveries/<seat>/` sentinel names (resolved by the optional worker-pool skill). Else None."""
+    path = Path(task_file).resolve()
+    if path.parent.name == "tasks":
+        return path
+    if path.parent.parent.name != "deliveries" or not (_POOL_SCRIPTS / "resolve_inbox_entry.py").is_file():
+        return None
+    try:
+        if str(_POOL_SCRIPTS) not in sys.path:
+            sys.path.insert(0, str(_POOL_SCRIPTS))
+        import resolve_inbox_entry  # type: ignore
+        return Path(resolve_inbox_entry.resolve(str(path)))
+    except Exception:
+        return None
+
+
+def _initial_ack_gate(task_file: "str | None") -> "tuple[bool, tuple | None]":
+    """(may send, (workspace, key) this call now holds). A task's first notify is its initial ack
+    and must win `ack:<task>:initial`; every later notify is progress and is never arbitrated."""
+    if not task_file or _ACK_ARBITRATION is None:
+        return True, None
+    ack_claim, ack_key, task_id_for = _ACK_ARBITRATION
+    path = _task_payload(task_file)
+    if path is None:
+        return True, None
+    ws, tid = path.parent.parent, task_id_for(path)
+    if not tid:
+        return True, None
+    try:
+        if not ack_claim.claim(ws, f"progress:{tid}:first-notify", ACK_HOLDER):
+            return True, None
+        key = ack_key(tid)
+        if ack_claim.claim(ws, key, ACK_HOLDER, via="notify"):
+            return True, (ws, key)
+    except (OSError, ValueError):
+        return True, None
+    return False, None
+
+
 def _derive_from_task_file(path: str) -> dict:
     """source/channel_id/chat_id/thread_root/reply_to/thread_ts from a task file's headers.
     {} (with a stderr note) when the file is unreadable: explicit flags still apply."""
@@ -534,7 +593,8 @@ def main() -> int:
             print("[task-progress] --extra-content must be a JSON object", file=sys.stderr)
             return 1
 
-    derived = _derive_from_task_file(args.task_file) if args.task_file else {}
+    payload = _task_payload(args.task_file) if args.task_file else None
+    derived = _derive_from_task_file(str(payload or args.task_file)) if args.task_file else {}
 
     # An explicit flag wins even when empty: --thread-root '' opts out of the file's thread.
     def _pick(explicit, fallback):
@@ -572,6 +632,12 @@ def main() -> int:
         )
         return 1
 
+    may_send, held = _initial_ack_gate(args.task_file)
+    if not may_send:
+        print("[task-progress] this task's initial acknowledgement was already sent by another "
+              "sender; not sent again", file=sys.stderr)
+        return 0
+
     if source == "slack":
         ok = send_slack(channel, message, thread_ts=thread_ts)
     elif source == "discord":
@@ -586,6 +652,12 @@ def main() -> int:
         ok = send_remote_gateway(source, channel, message, thread_root=thread_root,
                                  reply_to=reply_to, extra=extra)
 
+    if held is not None:
+        # A failed send may still have landed, so the claim is kept as unknown, never released.
+        try:
+            _ACK_ARBITRATION[0].update(held[0], held[1], ACK_HOLDER, "confirmed" if ok else "unknown")
+        except (OSError, ValueError):
+            pass
     return 0 if ok else 1
 
 

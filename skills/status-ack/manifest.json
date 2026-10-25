@@ -1,0 +1,21 @@
+{
+  "name": "status-ack",
+  "enabled": false,
+  "access_tier": "owner",
+  "version": "0.1.0",
+  "owner": "github:sonichi/sutando",
+  "license": "MIT",
+  "stability": "experimental",
+  "description": "Live-agent runner for #5853: one factual initial status line, threaded on the task's own message through the gateway's proactive outbox, for an attested AG2 Space task the core has not answered by its first-ack deadline; one owner-DM alert per standby-only watcher outage. Shares ack:<task>:initial with task-progress notify. Off unless STATUS_ACK_ENABLED is true; manifest present to DECLARE config per this convention.",
+  "provenance": {
+    "source_repo": "https://github.com/sonichi/sutando"
+  },
+  "config": {
+    "STATUS_ACK_ENABLED": "0",
+    "STATUS_ACK_FIRST_ACK_DEADLINE_URGENT_S": "30",
+    "STATUS_ACK_FIRST_ACK_DEADLINE_NORMAL_S": "120",
+    "STATUS_ACK_FIRST_ACK_DEADLINE_LOW_S": "600",
+    "STATUS_ACK_POLL_S": "15",
+    "STATUS_ACK_WATCHER_DOWN_AFTER_S": "120"
+  }
+}
