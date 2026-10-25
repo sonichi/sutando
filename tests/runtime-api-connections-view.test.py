@@ -32,6 +32,10 @@ from protocol import ProtocolError  # noqa: E402
 TOKEN_A = "https://chat.alpha.example|secret-alpha"
 TOKEN_B = "https://relay.beta.example|secret-beta"
 
+import connections  # noqa: E402
+
+connections.DEFAULT_RESOLVER = lambda host: None  # offline: no well-known fetch from a test
+
 
 class FakeVault:
     def __init__(self):
@@ -99,8 +103,10 @@ class ViewTests(unittest.TestCase):
                         added_by="ui")
         self.assertTrue(out["created"])
         row = out["connection"]
-        self.assertEqual((row["server"], row["instance"], row["token_ref"], row["primary"], row["state"]),
-                         ("alpha.example", "alpha-example", "AG2_REMOTE_TOKEN_ALPHA_EXAMPLE", True, "pending"))
+        self.assertEqual((row["server"], row["instance"], row["token_ref"], row["primary"], row["state"],
+                          row["server_source"]),
+                         ("alpha.example", "alpha-example", "AG2_REMOTE_TOKEN_ALPHA_EXAMPLE", True, "pending",
+                          "identity"))
         self.assertNotIn("secret-alpha", json.dumps(out))
         self.assertEqual(self.vault.store[row["token_ref"]], TOKEN_A)
 

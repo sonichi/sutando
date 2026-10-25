@@ -22,8 +22,11 @@ and refuse a record over `MAX_BYTES` or off-schema on read. `status_for` joins a
 read-only with the bridge's own `state/gateway-status[.<instance>].json` and the launch
 record `launch` leaves, into one `state`: pending, connected, disconnected or failed.
 
-Without a verified identity the server is the host of the embedded gateway URL; the
-homeserver-family resolver takes this over once it lands on main.
+A row's `server_source` says where its server came from: `identity` (the gateway named
+one agent), `resolver` (`dotspace.dotspace_for` on the gateway host, when that module is
+present) or `gateway` (the host itself, provisional). Two tokens for one homeserver's
+endpoints collapse onto one row: adding matches on server or gateway host, and a later
+identity re-keys a provisional row in place, instance slug kept.
 """
 from __future__ import annotations
 
@@ -33,6 +36,7 @@ import re
 import signal
 import subprocess
 import sys
+import hashlib
 import tempfile
 import time
 import urllib.error
@@ -57,11 +61,13 @@ PRIMARY_TOKEN_REF = "REMOTE_TASK_TOKEN"
 INSTANCE_TOKEN_PREFIX = "AG2_REMOTE_TOKEN_"
 ADDED_BY = ("login", "owner", "ui", "env")
 STATES = ("pending", "connected", "disconnected", "failed")
+SERVER_SOURCES = ("identity", "resolver", "gateway")
 # The bridge's own GATEWAY_INSTANCE charset; a row that fails it could never launch.
 INSTANCE_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
 _ENV_VAR_RE = re.compile(r"^AG2_REMOTE_TOKEN_([A-Za-z0-9_]+)$")
 _MXID_RE = re.compile(r"^@[^:]+:([A-Za-z0-9.-]+)(?::\d+)?$")
-_REQUIRED = ("server", "instance", "gateway_url", "token_ref", "primary", "added_by", "added_at", "verified")
+_REQUIRED = ("server", "instance", "gateway_url", "token_ref", "primary", "added_by", "added_at", "verified",
+             "server_source")
 PROBE_TIMEOUT_S = 15
 STOP_TIMEOUT_S = 8
 
@@ -139,9 +145,19 @@ def server_of_mxid(mxid: str) -> str:
 
 
 def instance_for(server: str) -> str:
-    """The default instance slug for a server: its name with dots as dashes."""
+    """The default instance slug for a server: its name with dots as dashes; a name too long
+    for the slug keeps a prefix plus a digest, so two long servers never share a slug."""
     slug = re.sub(r"[^a-z0-9_-]", "-", server.lower().replace(".", "-")).strip("-")
-    return slug[:32]
+    if len(slug) <= 32:
+        return slug
+    return slug[:24].rstrip("-") + "-" + hashlib.sha256(server.lower().encode()).hexdigest()[:7]
+
+
+def host_of_url(url: str) -> str:
+    try:
+        return (urllib.parse.urlsplit(url or "").hostname or "").lower()
+    except ValueError:
+        return ""
 
 
 def token_ref_for(instance: str) -> str:
@@ -166,37 +182,83 @@ def _fetch_agents(gateway_url: str, token: str) -> dict:
     req.add_header("Authorization", f"Bearer {secret_of(token)}")
     req.add_header("Accept", "application/json")
     req.add_header("User-Agent", "sutando-gateway-client/1.0")
-    with urllib.request.urlopen(req, timeout=PROBE_TIMEOUT_S) as resp:
+    opener = urllib.request.build_opener(_NoRedirect())
+    with opener.open(req, timeout=PROBE_TIMEOUT_S) as resp:
         return json.loads(resp.read().decode("utf-8") or "{}")
 
 
-def preview_connection(token: str, *, fetch: Optional[Callable[[str, str], dict]] = None) -> dict:
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """An answer is attributed to the host asked, never to one it redirects to."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(req.full_url, code, "redirect refused", headers, fp)
+
+
+# The resolver used when a caller passes none: `dotspace.dotspace_for` once that module imports.
+DEFAULT_RESOLVER: Optional[Callable[[str], object]] = None
+
+
+def _default_resolver():
+    global DEFAULT_RESOLVER
+    if DEFAULT_RESOLVER is None:
+        try:
+            import dotspace  # type: ignore
+            DEFAULT_RESOLVER = dotspace.dotspace_for
+        except Exception:  # noqa: BLE001 - the resolver is optional
+            return None
+    return DEFAULT_RESOLVER
+
+
+def resolve_server(host: str, resolver=None) -> str:
+    """The homeserver the resolver knows `host` to serve, '' when none is present or it only
+    echoes the host. The resolver is `dotspace.dotspace_for`; injectable for tests."""
+    resolver = _default_resolver() if resolver is None else resolver
+    if resolver is None or not host:
+        return ""
+    try:
+        found = resolver(host)
+    except Exception:  # noqa: BLE001 - a resolver failure leaves the host provisional
+        return ""
+    server = str(getattr(found, "server", "") or "").lower()
+    if not server or getattr(found, "source", "none") == "none":
+        return ""
+    return server
+
+
+def preview_connection(token: str, *, fetch: Optional[Callable[[str, str], dict]] = None,
+                       resolver=None) -> dict:
     """What saving this token would record, without saving: the gateway URL as issued, the
-    server, the agent mxid when the gateway names exactly one agent (then `verified`), and
-    whether the token authenticated (`authenticated` None when the gateway was unreachable)."""
+    server and where it came from (`server_source`), the agent mxid when the gateway names
+    exactly one agent (then `verified`), and whether the token authenticated (`authenticated`
+    None when the gateway gave no verdict)."""
     url = gateway_url_of(token)
     if not url:
         raise InvalidToken("token carries no gateway URL (expected 'https://<gateway>|<secret>')")
-    out = {"gateway_url": url, "server": server_of_token(token), "agent_mxid": None,
-           "verified": False, "authenticated": None, "error": None}
+    host = server_of_token(token)
+    out = {"gateway_url": url, "gateway_host": host, "server": host, "server_source": "gateway",
+           "agent_mxid": None, "verified": False, "authenticated": None, "error": None}
     fetch = _fetch_agents if fetch is None else fetch
     try:
         answer = fetch(url, token)
     except urllib.error.HTTPError as e:
         out["authenticated"] = False if e.code in (401, 403) else None
-        out["error"] = "auth_rejected" if e.code in (401, 403) else f"http_{e.code}"
-        return out
+        out["error"] = {401: "auth_rejected", 403: "auth_rejected", 404: "not_a_gateway"}.get(
+            e.code, f"http_{e.code}")
+        answer = None
     except Exception as e:  # noqa: BLE001 - the probe is best-effort; the reason is named, the URL is not
         out["error"] = f"unreachable ({type(e).__name__})"
-        return out
-    out["authenticated"] = True
-    agents = answer.get("agents") if isinstance(answer, dict) else None
-    ids = [a.get("id") for a in agents if isinstance(a, dict) and isinstance(a.get("id"), str)] \
-        if isinstance(agents, list) else []
-    if len(ids) == 1 and server_of_mxid(ids[0]):
-        out["agent_mxid"] = ids[0]
-        out["server"] = server_of_mxid(ids[0])
-        out["verified"] = True
+        answer = None
+    if answer is not None:
+        out["authenticated"] = True
+        agents = answer.get("agents") if isinstance(answer, dict) else None
+        ids = [a.get("id") for a in agents if isinstance(a, dict) and isinstance(a.get("id"), str)] \
+            if isinstance(agents, list) else []
+        if len(ids) == 1 and server_of_mxid(ids[0]):
+            out.update(agent_mxid=ids[0], server=server_of_mxid(ids[0]), server_source="identity", verified=True)
+            return out
+    resolved = resolve_server(host, resolver)
+    if resolved:
+        out.update(server=resolved, server_source="resolver")
     return out
 
 
@@ -286,6 +348,8 @@ def _validate_row(row: object, index: int) -> dict:
         raise SchemaError(f"connections.json: row {index} added_by {row['added_by']!r} unknown")
     if row.get("agent_mxid") is not None and not isinstance(row["agent_mxid"], str):
         raise SchemaError(f"connections.json: row {index} agent_mxid is not a string")
+    if row["server_source"] not in SERVER_SOURCES:
+        raise SchemaError(f"connections.json: row {index} server_source {row['server_source']!r} unknown")
     return row
 
 
@@ -361,10 +425,11 @@ def _now() -> str:
 
 
 def _row(*, server: str, instance: str, gateway_url: str, token_ref: str, primary: bool,
-         added_by: str, verified: bool, agent_mxid: Optional[str] = None) -> dict:
+         added_by: str, verified: bool, server_source: str = "gateway",
+         agent_mxid: Optional[str] = None) -> dict:
     row = {"server": server, "instance": instance, "gateway_url": gateway_url,
            "token_ref": token_ref, "primary": primary, "added_by": added_by, "added_at": _now(),
-           "verified": verified}
+           "verified": verified, "server_source": server_source}
     if agent_mxid:
         row["agent_mxid"] = agent_mxid
     return row
@@ -386,16 +451,17 @@ def list_connections(workspace: Optional[Path] = None) -> list:
 
 def add_connection(token: str, *, added_by: str, expected_server: str, instance: Optional[str] = None,
                    preview: Optional[dict] = None, fetch: Optional[Callable[[str, str], dict]] = None,
-                   workspace: Optional[Path] = None, vault=None) -> "tuple[dict, bool]":
+                   resolver=None, workspace: Optional[Path] = None, vault=None) -> "tuple[dict, bool]":
     """Save the token as a row once its gateway still answers to `expected_server`.
 
-    Returns (row, created). A server that already has a row returns that row unchanged and
-    touches neither vault nor record. The first row ever saved is the primary; later rows
-    never are. The secret goes to the vault under the row's token_ref before the row exists.
+    Returns (row, created). A server or gateway host that already has a row returns that row,
+    re-keyed to the identity's server when the row was provisional and this preview is
+    verified, and touches the vault never. The first row ever saved is the primary; later
+    rows never are. The secret goes to the vault under the row's token_ref before the row exists.
     """
     if added_by not in ADDED_BY:
         raise ConnectionsError(f"added_by must be one of {', '.join(ADDED_BY)}")
-    seen = preview if preview is not None else preview_connection(token, fetch=fetch)
+    seen = preview if preview is not None else preview_connection(token, fetch=fetch, resolver=resolver)
     server = str(seen.get("server") or "")
     if not server:
         raise InvalidToken("token carries no gateway URL (expected 'https://<gateway>|<secret>')")
@@ -409,8 +475,9 @@ def add_connection(token: str, *, added_by: str, expected_server: str, instance:
     stored = False
     try:
         with _transaction(workspace) as rows:
-            existing = next((r for r in rows if r["server"] == server), None)
+            existing = _same_connection(rows, server, str(seen.get("gateway_host") or ""))
             if existing is not None:
+                _rekey(existing, seen)
                 return dict(existing), False
             if any(r["instance"] == inst or r["token_ref"] == ref for r in rows):
                 raise ConnectionsError(f"instance {inst!r} is taken by another server; pass another instance")
@@ -418,6 +485,7 @@ def add_connection(token: str, *, added_by: str, expected_server: str, instance:
             stored = True
             row = _row(server=server, instance=inst, gateway_url=str(seen["gateway_url"]), token_ref=ref,
                        primary=not rows, added_by=added_by, verified=bool(seen.get("verified")),
+                       server_source=str(seen.get("server_source") or "gateway"),
                        agent_mxid=seen.get("agent_mxid"))
             rows.append(row)
     except Exception:
@@ -429,6 +497,36 @@ def add_connection(token: str, *, added_by: str, expected_server: str, instance:
                 pass
         raise
     return dict(row), True
+
+
+def _same_connection(rows: list, server: str, gateway_host: str) -> Optional[dict]:
+    """The row for this server, else the row whose gateway shares the host: one homeserver's
+    endpoints are one connection."""
+    for r in rows:
+        if r["server"] == server:
+            return r
+    for r in rows:
+        if gateway_host and host_of_url(r["gateway_url"]) == gateway_host:
+            return r
+    return None
+
+
+def _rekey(row: dict, seen: Mapping[str, object]) -> bool:
+    """A verified identity replaces a provisional server in place; the instance slug stays."""
+    if row["server_source"] == "identity" or not seen.get("verified"):
+        return False
+    row.update(server=str(seen["server"]), server_source="identity", verified=True)
+    if seen.get("agent_mxid"):
+        row["agent_mxid"] = seen["agent_mxid"]
+    return True
+
+
+def learn_identity(instance: str, preview: Mapping[str, object], *, workspace: Optional[Path] = None) -> dict:
+    """Re-key `instance` from a verified preview of its own token (see `_rekey`); the row either way."""
+    with _transaction(workspace) as rows:
+        row = _find(rows, instance)
+        _rekey(row, preview)
+    return dict(row)
 
 
 def set_primary(instance: str, *, workspace: Optional[Path] = None) -> dict:
@@ -471,11 +569,12 @@ def env_token_vars(environ: Mapping[str, str]) -> list:
 
 
 def import_from_env(environ: Optional[Mapping[str, str]] = None, *,
-                    workspace: Optional[Path] = None, vault=None) -> list:
+                    workspace: Optional[Path] = None, vault=None, resolver=None) -> list:
     """Create a row once for REMOTE_TASK_TOKEN and each AG2_REMOTE_TOKEN_<INST>; existing rows stay.
 
-    Env rows are unverified (server = gateway host). The secret is copied into the vault under
-    the row's token_ref unless the vault already holds one. Returns the rows created.
+    Env rows are unverified: the resolver's server when it knows the host, else the host. The
+    secret is copied into the vault under the row's token_ref unless the vault already holds
+    one. Returns the rows created.
     """
     environ = os.environ if environ is None else environ
     candidates = []
@@ -490,18 +589,20 @@ def import_from_env(environ: Optional[Mapping[str, str]] = None, *,
     vault = _vault(vault)
     created = []
     with _transaction(workspace) as rows:
-        taken = {(r["instance"], r["token_ref"], r["server"]) for r in rows}
         for inst, ref, token in candidates:
-            server = server_of_token(token)
-            if any(inst == i or ref == t or server == s for i, t, s in taken):
+            host = server_of_token(token)
+            resolved = resolve_server(host, resolver)
+            server = resolved or host
+            if any(r["instance"] == inst or r["token_ref"] == ref for r in rows) \
+                    or _same_connection(rows, server, host) is not None:
                 continue
             if not _vault_get(vault, ref):
                 _vault_store(vault, ref, token)
             row = _row(server=server, instance=inst, gateway_url=gateway_url_of(token), token_ref=ref,
-                       primary=not rows, added_by="env", verified=False)
+                       primary=not rows, added_by="env", verified=False,
+                       server_source="resolver" if resolved else "gateway")
             rows.append(row)
             created.append(dict(row))
-            taken.add((inst, ref, server))
     return created
 
 
@@ -687,9 +788,20 @@ def stop_bridge(instance: str, *, workspace: Optional[Path] = None, kill=None,
 
 def reconnect(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Mapping[str, str]] = None,
               workspace: Optional[Path] = None, vault=None, spawn=None, kill=None,
-              python: Optional[str] = None) -> dict:
-    """Relaunch exactly this one bridge: stop the running one, then `launch`."""
+              python: Optional[str] = None, fetch=None) -> dict:
+    """Relaunch exactly this one bridge: stop the running one, learn the identity its token
+    answers to now (a provisional row is re-keyed), then `launch`."""
     stopped = stop_bridge(instance, workspace=workspace, kill=kill)
+    environ = os.environ if environ is None else environ
+    rows = {r["instance"]: r for r in list_connections(workspace)}
+    if instance in rows:
+        ref = rows[instance]["token_ref"]
+        token = (environ.get(ref) or "").strip() or _vault_get(_vault(vault), ref)
+        if token:
+            try:
+                learn_identity(instance, preview_connection(token, fetch=fetch), workspace=workspace)
+            except ConnectionsError:
+                pass
     record = launch(instance, repo=repo, logs_dir=logs_dir, environ=environ, workspace=workspace,
                     vault=vault, spawn=spawn, python=python)
     record["stopped_pid"] = stopped

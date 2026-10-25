@@ -22,7 +22,8 @@ import os
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+REPO = Path(__file__).resolve().parent.parent  # lint-workspace-resolution: allow-repo-root
+sys.path.insert(0, str(REPO / "src"))
 
 import connections  # noqa: E402
 
