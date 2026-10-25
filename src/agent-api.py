@@ -118,6 +118,7 @@ REPO_DIR = Path(__file__).parent.parent
 sys.path.insert(0, str(Path(__file__).parent))
 from git_binary import git_argv  # noqa: E402
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
+import connections as _connections  # noqa: E402
 from sutando_config import config_get  # noqa: E402
 from sutando_platform import probe_pids  # noqa: E402
 import local_task_protocol  # noqa: E402
@@ -171,6 +172,85 @@ def _emit_task_processed(content: str) -> None:
 
 # Simple token auth — set SUTANDO_API_TOKEN in .env for remote access security
 API_TOKEN = os.environ.get("SUTANDO_API_TOKEN", "")
+
+# Connections over HTTP: the web client's transport to src/connections.py (docs/connections.md).
+CONNECTIONS_PREFIX = "/api/v1/connections"
+CONNECTIONS_BODY_CAP = 16384
+_LOOPBACK_HOSTS = ("localhost", "127.0.0.1", "::1")
+
+
+def _loopback_origin(origin: str) -> bool:
+    """A missing Origin is a same-origin proxy or a local tool; a present one must name loopback."""
+    if not origin:
+        return True
+    try:
+        host = (urlparse(origin).hostname or "").lower()
+    except ValueError:
+        return False
+    return host in _LOOPBACK_HOSTS or host.endswith(".localhost")
+
+
+def connections_http(method: str, path: str, body: dict, query: Optional[dict] = None, *,
+                     workspace: Optional[Path] = None, repo: Optional[Path] = None,
+                     logs_dir: Optional[Path] = None, vault=None, fetch=None, spawn=None,
+                     kill=None) -> "tuple[int, Optional[dict]]":
+    """(status, payload) for one request under CONNECTIONS_PREFIX; payload None = empty body.
+    The HTTP shape of the connections domain: GET lists, POST previews or (confirm) creates,
+    DELETE removes, POST <instance>/primary moves the primary, POST <instance>/reconnect
+    relaunches. Dispatch only; every rule lives in src/connections.py."""
+    ws = Path(workspace) if workspace is not None else WORKSPACE_DIR
+    repo = Path(repo) if repo is not None else REPO_DIR
+    logs_dir = Path(logs_dir) if logs_dir is not None else ws / "logs"
+    query = query or {}
+    parts = [x for x in path[len(CONNECTIONS_PREFIX):].split("/") if x]
+    try:
+        if method == "GET" and not parts:
+            rows = _connections.list_connections(ws)
+            return 200, {"connections": [_connections.status_for(r, ws) for r in rows]}
+        if method == "POST" and not parts:
+            token = body.get("token")
+            if not isinstance(token, str) or not token.strip():
+                return 400, {"error": "missing required field: token"}
+            confirm = body.get("confirm", False)
+            if not isinstance(confirm, bool):
+                return 400, {"error": "confirm must be a boolean"}
+            preview = _connections.preview_connection(token, fetch=fetch)
+            if not confirm:
+                return 200, {"preview": preview}
+            expected = body.get("expected_server")
+            if not isinstance(expected, str) or not expected.strip():
+                return 400, {"error": "confirm needs expected_server (the server the preview showed)"}
+            try:
+                row, created = _connections.add_connection(
+                    token, added_by=str(body.get("added_by", "ui")), expected_server=expected,
+                    instance=body.get("instance"), preview=preview, workspace=ws, vault=vault)
+            except _connections.ConnectionMismatch as e:
+                return 409, {"error": "mismatch", "server_from_token": e.derived, "expected_server": e.claimed}
+            return (201 if created else 200), {"created": created,
+                                               "connection": _connections.status_for(row, ws)}
+        if len(parts) == 1 and method == "DELETE":
+            force = str((query.get("force") or [""])[0]).lower() in ("1", "true", "yes")
+            try:
+                _connections.remove_connection(parts[0], force=force, workspace=ws, vault=vault)
+            except _connections.PrimaryProtected:
+                return 409, {"error": "primary"}
+            return 204, None
+        if len(parts) == 2 and method == "POST" and parts[1] == "primary":
+            row = _connections.set_primary(parts[0], workspace=ws)
+            return 200, {"connection": _connections.status_for(row, ws)}
+        if len(parts) == 2 and method == "POST" and parts[1] == "reconnect":
+            record = _connections.reconnect(parts[0], repo=repo, logs_dir=logs_dir, workspace=ws,
+                                            vault=vault, spawn=spawn, kill=kill, fetch=fetch)
+            return 202, {"launch": record}
+        return 404, {"error": "not found"}
+    except _connections.VaultUnavailable:
+        return 503, {"error": "vault_unavailable"}
+    except _connections.UnknownConnection as e:
+        return 404, {"error": str(e)}
+    except _connections.SchemaError as e:
+        return 500, {"error": str(e)}
+    except _connections.ConnectionsError as e:
+        return 400, {"error": str(e)}
 
 RESULT_DIR = WORKSPACE_DIR / "results"
 TASK_DIR.mkdir(parents=True, exist_ok=True)
@@ -925,14 +1005,60 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_OPTIONS(self):
         self.send_response(200)
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
         self.end_headers()
+
+    def _connections_route(self, method: str) -> None:
+        """Gate like POST /task (bearer when configured), refuse cross-origin mutation, dispatch.
+        The body is consumed before any refusal so the status reaches the client, not a reset."""
+        parsed = urlparse(self.path)
+        body: dict = {}
+        if method != "GET":
+            try:
+                length = int(self.headers.get("Content-Length", 0) or 0)
+            except (TypeError, ValueError):
+                self.send_json(400, {"error": "invalid Content-Length"})
+                return
+            if length < 0 or length > CONNECTIONS_BODY_CAP:
+                self.send_json(413, {"error": "request too large"})
+                return
+            raw = self.rfile.read(length) if length else b""
+            if raw.strip():
+                try:
+                    body = json.loads(raw)
+                except ValueError:
+                    self.send_json(400, {"error": "invalid JSON"})
+                    return
+                if not isinstance(body, dict):
+                    self.send_json(400, {"error": "body must be a JSON object"})
+                    return
+        if not self.check_auth():
+            return
+        if method != "GET" and not _loopback_origin(self.headers.get("Origin", "")):
+            self.send_json(403, {"error": "cross-origin mutation refused"})
+            return
+        from urllib.parse import parse_qs
+        status, payload = connections_http(method, parsed.path, body, parse_qs(parsed.query))
+        if payload is None:
+            self.send_response(status)
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            return
+        self.send_json(status, payload)
+
+    def do_DELETE(self):
+        if urlparse(self.path).path.startswith(CONNECTIONS_PREFIX):
+            self._connections_route("DELETE")
+            return
+        self.send_json(404, {"error": "not found"})
 
     def do_GET(self):
         path = urlparse(self.path).path
         if path == "/ping":
             self.send_json(200, {"pong": True})
+        elif path.startswith(CONNECTIONS_PREFIX):
+            self._connections_route("GET")
         elif path == "/core-status":
             # Read loop status file for web UI
             status_file = status_read_path("core-status.json", WORKSPACE_DIR)
@@ -1299,6 +1425,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.handle_twilio_transcription(form_data)
             else:
                 self.send_json(404, {"error": "not found"})
+            return
+
+        if path.startswith(CONNECTIONS_PREFIX):
+            self._connections_route("POST")
             return
 
         if path == "/voice/toggle":

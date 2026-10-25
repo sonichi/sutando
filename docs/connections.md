@@ -18,6 +18,7 @@ startup (`src/startup-runtime.sh`) all call that module and never touch the file
 | `added_by` | `login`, `owner`, `ui` or `env`. |
 | `added_at` | ISO 8601 UTC. |
 | `verified` | Whether the server came from the gateway's own answer (below) rather than from the gateway hostname. |
+| `server_source` | Where `server` came from: `identity` (the authenticated agent listing), `resolver` (`src/dotspace.py`'s `dotspace_for(gateway_host)`), or `gateway` (the host itself, provisional). |
 | `agent_mxid` | The agent's identity at that server, when the gateway named it. |
 
 The record is validated on every read (schema, bounds, one primary, unique instance /
@@ -39,19 +40,26 @@ Adding is two-step and does not care where the code came from (pasted into the U
 typed at the CLI, handed over by a browser flow, present in the environment):
 
 1. **Preview.** `preview_connection(token)` performs the bridge's own authenticated
-   probe (`GET /v1/agents` under the token's bearer) against the gateway embedded in
-   the token. When the gateway names exactly one agent, the server is that mxid's
-   server and the preview is `verified`. Otherwise the server falls back to the
-   gateway hostname with `verified: false`, so the UI can say so. Nothing is saved.
+   probe (`GET /v1/agents` under the token's bearer, following no redirect) against the
+   gateway embedded in the token. When the gateway names exactly one agent, the server
+   is that mxid's server (`server_source: identity`, `verified: true`). Otherwise the
+   DotSpace resolver is asked about the gateway host (`resolver`), and failing that the
+   host itself stands in (`gateway`), both `verified: false` so the UI can label the row
+   provisional. `error` names a refusal: `auth_rejected` (401/403), `not_a_gateway`
+   (404), `http_<code>`, or `unreachable (...)`. Nothing is saved.
 2. **Confirm.** `add_connection(token, expected_server=<what the preview showed>)`
    runs the preview again and saves only if the identity still matches; a changed
    answer is a `ConnectionMismatch` (the runtime API answers `CONFLICT`, the CLI exits
    1). The secret goes to the vault under `token_ref` first; if the vault refuses, the
    add fails closed and nothing is written.
 
-Adding is **idempotent per server**: a server that already has a row returns that
-row unchanged and starts no second bridge (the bridge's singleton lock is the backstop,
-not the policy). Adding **never changes which row is primary** except that the very
+Adding is **idempotent per connection**: a token whose server, or whose gateway host,
+already has a row returns that row and starts no second bridge (the bridge's singleton
+lock is the backstop, not the policy). One homeserver's endpoints (`chat.` and
+`matrix.`) are one connection, whichever of them a token names. A verified preview, or a
+`reconnect` that learns the identity, **re-keys** a provisional (`gateway`/`resolver`)
+row to the identity's server in place: one row, one bridge, the instance slug and vault
+key unchanged. A row keyed by identity is never demoted. Adding **never changes which row is primary** except that the very
 first row saved becomes primary. `set_primary(instance)` is the one way to move it,
 and moving it is what moves proactive and owner-DM routing at the next launch.
 
@@ -92,7 +100,23 @@ the same name or the vault, empty `REMOTE_TASK_URL`, `REMOTE_TASK_CHANNEL_DIR`,
 ## Surfaces
 
 - CLI: `scripts/connections.py list | add | set-primary | remove | reconnect | launch | import-env | launch-plan`.
-- Runtime API: `connection.list`, `connection.add` (`{token}` previews; `{token, confirm: true, expected_server}` saves), `connection.remove`, `connection.set_primary`, `connection.reconnect`. These are the daemon-native form of the HTTP resource (GET / POST / DELETE / POST `<instance>/primary` / POST `<instance>/reconnect`).
+- Runtime API (Unix socket, JSON-RPC): `connection.list`, `connection.add` (`{token}` previews; `{token, confirm: true, expected_server}` saves), `connection.remove`, `connection.set_primary`, `connection.reconnect`.
+- HTTP (`src/agent-api.py` on `127.0.0.1:7843`, the web client's transport; routes dispatch to the same units):
 
-Until the homeserver-family resolver lands, an unverified row's server is the gateway
-hostname; the resolver will then derive the server family for those rows.
+  | Route | Body | Answer |
+  |---|---|---|
+  | `GET /api/v1/connections` | — | 200 `{"connections": [rows joined with status, state, server_source; no secrets]}` |
+  | `POST /api/v1/connections` | `{"token", "confirm": false}` | 200 `{"preview": {...}}` |
+  | `POST /api/v1/connections` | `{"token", "confirm": true, "expected_server", "added_by": "ui"}` | 201 `{"created": true, "connection": row}`; 200 `{"created": false, ...}` for an existing row; 409 `{"error": "mismatch", "server_from_token", "expected_server"}`; 400 `{"error": ...}`; 503 `{"error": "vault_unavailable"}` |
+  | `DELETE /api/v1/connections/<instance>[?force=1]` | — | 204; 409 `{"error": "primary"}`; 404 |
+  | `POST /api/v1/connections/<instance>/primary` | `{}` | 200 `{"connection": row}` |
+  | `POST /api/v1/connections/<instance>/reconnect` | `{}` | 202 `{"launch": record}` |
+
+  Mutating routes are gated like `POST /task`: the bearer when `SUTANDO_API_TOKEN` is
+  configured, otherwise the loopback bind alone; on top, a request carrying a
+  non-loopback `Origin` is refused with 403, so a page from another origin cannot mutate
+  even where the bearer is unset. The preflight allows `GET, POST, DELETE, OPTIONS` and
+  `Content-Type, Authorization`.
+
+`instance_for` keeps a slug within the bridge's 32-character limit by appending a short
+digest to a long server name, so two long names never share a slug.
