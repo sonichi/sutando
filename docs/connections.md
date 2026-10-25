@@ -121,7 +121,8 @@ overwriting a row), then launches one bridge per `launch-plan` line through
 (the one `scripts/channel-env.sh` resolves; `REMOTE_TASK_TOKEN` or the legacy
 `AG2_REMOTE_TOKEN`, environment first when both exist): a desktop install signs in after
 the engine started, so the connect flow reaches the file but never this process's
-environment. `list` runs that import once whenever the record has no rows, so the panel
+environment. `list` runs that import once when the record has never been written (an initialized record
+that is empty stays empty: its rows were removed on purpose), so the panel
 shows the connection on its next refresh without an engine restart; an import that fails
 is logged and the list still answers. The plan lists every row with an instance
 plus any env token the import could not record, so an unavailable vault degrades to
