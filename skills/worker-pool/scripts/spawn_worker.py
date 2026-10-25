@@ -15,7 +15,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import shlex
 import shutil
 import subprocess
 import sys
@@ -52,6 +51,20 @@ def inherited_env(drop=()) -> dict:
 
 
 DEFAULT_SOCKET = "/tmp/sutando-tmux.sock"
+
+
+def attach_argv(socket, session_name) -> list[str]:
+    """Attach to exactly this session, never a session sharing its prefix."""
+    return ["tmux", "-S", str(socket), "attach-session", "-t", f"={session_name}"]
+
+
+def attach_command(socket, session_name) -> str:
+    """A copyable Bash/Zsh command targeting exactly this worker session."""
+    # shlex.quote leaves '=' bare, but Zsh expands a word starting with '='.
+    return " ".join(
+        "'" + str(arg).replace("'", "'\"'\"'") + "'"
+        for arg in attach_argv(socket, session_name)
+    )
 
 
 def default_socket() -> str:
@@ -402,7 +415,7 @@ def spawn(workspace, repo, *, runtime=None, cwd: str = "",
                 f"the runtime launcher failed ({why}), and tmux session {name!r} "
                 f"{fate}, so worker {rec['worker_id']} was KEPT with its records "
                 f"and inbox {p['delivery_dir']}. Attach with "
-                f"`tmux -S {socket} attach -t {name}` to finish or stop it, then "
+                f"`{attach_command(socket, name)}` to finish or stop it, then "
                 f"remove the worker if it is not wanted.",
                 worker_id=rec["worker_id"], delivery_dir=str(p["delivery_dir"]),
                 tmux_session=name, tmux_socket=str(socket))

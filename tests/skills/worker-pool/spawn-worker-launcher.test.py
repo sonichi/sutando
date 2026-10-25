@@ -375,6 +375,22 @@ class TestRuntimeStartFailure(Base):
         finally:
             wi.new_worker_id = orig
 
+    def test_retained_guidance_uses_shared_formatter_without_changing_coordinates(self):
+        socket = "/tmp/worker's $literal socket"
+        wid = "8" * 32
+        with mock.patch.object(wi, "new_worker_id", return_value=wid), \
+                mock.patch.object(sw, "attach_command", return_value="formatted attach") as fmt:
+            with self.assertRaises(sw.SpawnRetained) as caught:
+                sw.spawn(self.ws, REPO, socket=socket, runner=FakeTmuxSlowStart(),
+                         require_sentinel=False)
+        name = wi.tmux_session_name(wid)
+        fmt.assert_called_once_with(socket, name)
+        self.assertIn("Attach with `formatted attach`", str(caught.exception))
+        self.assertEqual(caught.exception.tmux_socket, socket)
+        self.assertEqual(caught.exception.tmux_session, name)
+        self.assertEqual(caught.exception.worker_id, wid)
+        self.assertEqual(caught.exception.delivery_dir, str(self.ws / "deliveries" / wid))
+
 
     def test_an_unanswerable_tmux_probe_keeps_the_worker(self):
         """F2: unknown is not absent. With the session's state unknown after a
