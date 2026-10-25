@@ -3170,7 +3170,7 @@ class Upgrade(Base):
         attempt = {"at": 1, "from": "0.5.4", "outcome": "started"}
         crashed = dict(attempt, outcome="crashed", phase="crashed")
         ok = dict(attempt, outcome="ok", phase="ok")
-        failed = {"target": "0.6.0", "from": "0.5.4", "at": 2}
+        failed = {"target": "0.6.0", "from": "0.5.4", "installed": "0.5.4", "why": "w", "at": 2}
         installed = {"version": "0.6.0", "at": 2, "sha256": {"w.whl": SHA_NEW}}
         texts, times = [[], {}, 1, None, True], ["1", [], {}, None, True]
         journals = [{"attempted": {"0.6.0": []}}, {"attempted": {"0.6.0": "started"}},
@@ -3194,11 +3194,60 @@ class Upgrade(Base):
                          for v in values]
         for journal in journals:
             self.assert_held_everywhere(json.dumps(journal), journal)
-        for journal in ({"attempted": {"0.6.0": dict(attempt, manager=None, hook="h")}},
-                        {"attempted": {"0.6.0": crashed}, "failed": dict(failed, problems=["p"])},
+        for journal in ({"attempted": {"0.6.0": dict(attempt, phase="quiesced", manager=None)}},
+                        {"attempted": {"0.6.0": dict(ok, hook="h", manager="m")}},
+                        {"attempted": {"0.6.0": dict(crashed, outcome="rolled-back", phase="rolled-back")},
+                         "failed": dict(failed, outcome="rolled-back", problems=["p"])},
+                        {"attempted": {"0.6.0": crashed}, "failed": failed},
                         {"attempted": {"0.6.0": ok}, "installed": installed}):
             self.state_path_text(json.dumps(journal))
             self.assertIsNone(self_upgrade.recovery_blocked(self.state), journal)
+
+    def test_a_record_no_writer_can_leave_holds_restarts(self):
+        attempt = {"at": time.time(), "from": "0.5.4", "outcome": "started"}
+        crashed = dict(attempt, outcome="crashed", phase="crashed")
+        ok = dict(attempt, outcome="ok", phase="ok")
+        failed = {"target": "0.6.0", "from": "0.5.4", "installed": "0.5.4", "why": "w", "at": 2}
+        installed = {"version": "0.6.0", "at": 2, "sha256": {"w.whl": SHA_NEW}}
+        no_from = {k: v for k, v in attempt.items() if k != "from"}
+        journals = [{"attempted": {"0.6.0": no_from}},
+                    {"attempted": {"0.6.0": dict(no_from, outcome="crashed", phase="crashed")}},
+                    {"attempted": {"not a version": attempt}},
+                    {"attempted": {"": attempt}},
+                    {"attempted": {"0.6.0": dict(attempt, hook="h")}},
+                    {"attempted": {"0.6.0": dict(crashed, hook="h")}},
+                    {"attempted": {"0.6.0": attempt, "0.7.0": no_from}},
+                    {"attempted": {"0.6.0": dict(attempt, manager=None)}},
+                    {"attempted": {"0.6.0": dict(attempt, phase="snapshot", manager="m")}},
+                    {"attempted": {"0.6.0": dict(crashed, phase="no-snapshot", manager="m")}}]
+        for field in ("from", "installed", "why"):
+            journals.append({"attempted": {"0.6.0": crashed},
+                             "failed": {k: v for k, v in failed.items() if k != field}})
+        journals += [{"attempted": {"0.6.0": crashed}, "failed": dict(failed, outcome="crashed")},
+                     {"attempted": {"0.6.0": crashed}, "failed": dict(failed, problems=[])},
+                     {"attempted": {"0.6.0": ok},
+                      "installed": {"version": "0.6.0", "at": 2}}]
+        for journal in journals:
+            self.assert_held_everywhere(json.dumps(journal), journal)
+
+    def test_nesting_deeper_than_the_decoder_holds_restarts(self):
+        # 10 ** 6 passes the decoder's bound on every supported CPython, 10 ** 4 on older ones.
+        for depth in (10 ** 4, 10 ** 6):
+            self.check_deep("[" * depth + "]" * depth)
+
+    def check_deep(self, deep):
+        for text in ('{"attempted": {"0.6.0": {"at": 1, "from": "0.5.4", "outcome": %s}}}' % deep,
+                     '{"attempted": %s}' % deep, deep, '{"failed": %s, "attempted": {}}' % deep):
+            self.assert_held_everywhere(text, text[:30])
+
+    def test_any_validator_failure_is_a_journal_error(self):
+        self.state_path_text('{"attempted": {}}')
+        with mock.patch.object(self_upgrade, "_well_formed_journal",
+                               side_effect=RuntimeError("boom")):
+            with self.assertRaises(self_upgrade.JournalError):
+                self_upgrade.load_state(self.state)
+            self.assertIn("cannot be read", self_upgrade.recovery_blocked(self.state) or "")
+            self.assertIsNotNone(self_upgrade.failed_since(self.state))
 
     def test_a_newer_attempt_whose_writer_replaces_the_summary_holds_restarts(self):
         with mock.patch.object(self_upgrade, "restore", side_effect=OSError("disk full")):
@@ -3996,7 +4045,8 @@ class Health(Base):
         self.assertNotEqual(row["reason"], self_upgrade.UPGRADE_FAILED)
         self_upgrade.save_state(self.state, {"attempted": {"9.9": {
             "at": 1000, "from": PKG_VERSION, "outcome": "rolled-back", "phase": "rolled-back"}},
-            "failed": {"target": "9.9", "from": PKG_VERSION, "at": 1005, "outcome": "rolled-back"}})
+            "failed": {"target": "9.9", "from": PKG_VERSION, "installed": PKG_VERSION, "why": "w",
+                       "at": 1005, "outcome": "rolled-back", "problems": []}})
         row = keepalive.health_row(cfg, log, now=1010)
         self.assertEqual((row["condition"], row["reason"], row["since"]),
                          ("abnormal", self_upgrade.UPGRADE_FAILED, 1005.0))

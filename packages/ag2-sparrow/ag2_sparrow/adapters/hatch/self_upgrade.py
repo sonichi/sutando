@@ -75,6 +75,9 @@ STALE_START_S = 30 * 60
 # Phases written under the lock; a dead attempt in one of these may have changed files.
 MUTATING_PHASES = ("installing", "installed", "restoring")
 SUMMARY_OUTCOMES = ("crashed", "rolled-back", "restore-failed")
+# Phases from which a record can carry the `manager` that the quiesced phase saves.
+MANAGER_PHASES = frozenset(("quiesced", *MUTATING_PHASES, "ok", "crashed", "rolled-back",
+                            "restore-failed", "acknowledged"))
 # A direct rerun ending in one of these keeps an older failure summary; others replace it.
 # None of them is a summary outcome, so a summary's own attempt is told from a rerun clocklessly.
 KEEPS_FAILED = frozenset(("started", "unsupported-install", "not-above-installed", "no-download",
@@ -133,12 +136,11 @@ def load_state(state_dir: Path) -> dict:
         state = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=_unique_members)
     except FileNotFoundError:
         return {"attempted": {}}
-    except (OSError, ValueError) as e:
+    except (OSError, ValueError, RecursionError) as e:
         raise JournalError(f"the upgrade journal {path} cannot be read ({type(e).__name__})") from None
     try:
         well_formed = _well_formed_journal(state, time.time() + CLOCK_SKEW_S)
-    except (TypeError, ValueError, KeyError, AttributeError, OverflowError):
-        # The validator is total; this only keeps a gap in it a hold rather than a crash.
+    except Exception:  # noqa: BLE001 - a validator failure of any kind is a hold, never a crash
         well_formed = False
     if not well_formed:
         raise JournalError(f"the upgrade journal {path} cannot be read (not a journal)")
@@ -172,11 +174,14 @@ def _well_formed_journal(state, latest: float) -> bool:
         return False
     if set(state) - {"attempted", "failed", "installed"}:
         return False
-    if not all(_well_formed(t, latest) for t in state["attempted"].values()):
+    if not all(parse_version(k) is not None and _well_formed(t, latest)
+               for k, t in state["attempted"].items()):
         return False
     if "failed" in state:
         failed = state["failed"]
-        if not _typed(failed, _FAILED, ("target", "at"), latest):
+        if not _typed(failed, _FAILED, ("target", "from", "installed", "why", "at"), latest):
+            return False
+        if ("outcome" in failed) != ("problems" in failed):
             return False
         outcome = failed.get("outcome", "crashed")
         if outcome not in SUMMARY_OUTCOMES or not _summarises(state["attempted"], failed["target"],
@@ -184,7 +189,7 @@ def _well_formed_journal(state, latest: float) -> bool:
             return False
     if "installed" in state:
         installed = state["installed"]
-        if not (_typed(installed, _INSTALLED, ("version", "at"), latest)
+        if not (_typed(installed, _INSTALLED, ("version", "at", "sha256"), latest)
                 and _summarises(state["attempted"], installed["version"], "ok", KEEPS_INSTALLED)):
             return False
     return True
@@ -235,8 +240,13 @@ def _typed(record, fields: dict, required, latest: float) -> bool:
 def _well_formed(tried, latest: float) -> bool:
     """An attempt record the writer can leave: its fields typed as the writer saves them,
     then a legal (outcome, phase)."""
-    return (_typed(tried, _ATTEMPT, ("at", "outcome"), latest)
-            and _legal(tried["outcome"], tried.get("phase")))
+    if not (_typed(tried, _ATTEMPT, ("at", "from", "outcome"), latest)
+            and _legal(tried["outcome"], tried.get("phase"))):
+        return False
+    # hook is saved only with a successful install; manager only once the phase quiesced.
+    if "hook" in tried and tried["outcome"] != "ok":
+        return False
+    return "manager" not in tried or tried.get("phase") in MANAGER_PHASES
 
 
 def save_state(state_dir: Path, state: dict) -> None:
