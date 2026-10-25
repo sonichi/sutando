@@ -3407,6 +3407,20 @@ class Upgrade(Base):
                 for version, histories, ends in (("0.5.4", [[ok()]] + [[f] for f in failed], endings),
                                                  ("0.5.5", [[f] for f in failed], keeping))
                 for before in ((), (ok(), owner_installs("0.5.4"))) for history in histories]
+        runs += [
+            # Histories of three or more attempts, and reruns after a rollback and a success.
+            (ok(), [ok("0.7.0", fail={"pip-download"}), ok("0.7.0", fail={"pip-install"}),
+                    then(ok("0.7.0"), ok("0.8.0")), then(owner_installs("0.5.4"), ok()),
+                    then(owner_installs("0.5.4"), ok(fail={"pip-install"}))]),
+            (then(ok(), ok("0.7.0")), [ok("0.8.0"), ok("0.8.0", fail={"pip-install"}),
+                                       then(owner_installs("0.5.4"), ok()),
+                                       then(owner_installs("0.5.4"), ok(), ok("0.8.0"))]),
+            (ok(fail={"pip-install"}), [ok(), ok("0.7.0"), then(ok("0.7.0"), ok("0.8.0")),
+                                        then(ok("0.7.0"), owner_installs("0.5.4"), ok()),
+                                        then(ok(), owner_installs("0.5.4"), ok("0.7.0"))]),
+            (then(ok(fail={"pip-install"}), ok("0.7.0")),
+             [ok("0.8.0"), then(owner_installs("0.5.4"), ok()),
+              then(owner_installs("0.5.4"), ok(fail={"pip-install"}))])]
         runs += [(lambda: None, endings),
                  (stale, [dead("snapshot", target="0.7.0"), ok("0.7.0"),
                           then(ok("0.7.0"), ok("0.7.0")),
@@ -3493,6 +3507,74 @@ class Upgrade(Base):
                 accepted.add(shape)
         self.assertEqual(sorted(accepted - written, key=repr), [], "accepted, but no writer saves it")
         self.assertEqual(sorted(written - accepted, key=repr), [], "a writer saves it, but rejected")
+
+    @staticmethod
+    def full_record(state):
+        """Every field of a journal, exact, but for the clock and the free text."""
+        def scrub(v, key=None):
+            if key in ("at", "why"):
+                return 0
+            if key == "sha256":
+                return "h"
+            if isinstance(v, dict):
+                return {k: scrub(x, k) for k, x in v.items()}
+            return v
+        return json.dumps(scrub(state), sort_keys=True)
+
+    def mutants(self, state):
+        """Each journal one exact field away from `state` in a field its own record decides:
+        what a rolled-back summary says is installed, and the version a success names."""
+        out, versions = [], ["0.5.4", "0.6.0", "0.7.0", "0.8.0", "9.9.9"]
+
+        def edit(part, field, value):
+            m = json.loads(json.dumps(state))
+            m[part][field] = value
+            out.append(m)
+        if state.get("failed", {}).get("outcome") == "rolled-back":
+            for v in versions:
+                edit("failed", "installed", v)
+        if "installed" in state:
+            for v in versions:
+                edit("installed", "version", v)
+        return out
+
+    def test_the_accepted_set_is_the_writers_by_full_record(self):
+        saved, latest = self.writer_saves(), time.time() + self_upgrade.CLOCK_SKEW_S
+        written = {self.full_record(s) for s in saved}
+        self.assertTrue(any(len(s["attempted"]) >= 3 for s in saved), "no history of 3 attempts")
+        self.assertTrue(any(len(s.get("installed", {}).get("after", [])) >= 2 for s in saved))
+        self.assertTrue(any({t["outcome"] for t in s["attempted"].values()} >=
+                            {"ok", "no-download"} for s in saved), "no success, then a failure")
+        self.assertTrue(any(s.get("failed", {}).get("outcome") == "rolled-back"
+                            and len(s["attempted"]) >= 2 for s in saved), "no rerun after rollback")
+        loose = {}
+        for state in saved:
+            for m in self.mutants(state):
+                key = self.full_record(m)
+                if key not in written and self_upgrade._journal_fault(m, latest) is None:
+                    loose[key] = m
+        self.assertEqual(sorted(loose), [], "accepted, but no production writer saves it")
+
+    def test_the_one_target_projection_misses_a_mutant_the_full_record_catches(self):
+        failed_rb = [s for s in self.writer_saves() if len(s["attempted"]) == 1
+                     and s.get("failed", {}).get("outcome") == "rolled-back"]
+        self.assertTrue(failed_rb)
+        state = failed_rb[0]
+        mutant = json.loads(json.dumps(state))
+        mutant["failed"]["installed"] = "9.9.9"
+        self.assertEqual(self.journal_shape(mutant), self.journal_shape(state))
+        self.assertNotEqual(self.full_record(mutant), self.full_record(state))
+        latest = time.time() + self_upgrade.CLOCK_SKEW_S
+        self.assertIsNotNone(self_upgrade._journal_fault(mutant, latest))
+        written = {self.full_record(s) for s in self.writer_saves()}
+        self.assertNotIn(self.full_record(mutant), written)
+        # Without the cross-field rule the validator accepts it; the full comparison finds it.
+        with mock.patch.object(self_upgrade, "_failed_consistent", return_value=True):
+            self.assertIsNone(self_upgrade._journal_fault(mutant, latest))
+            loose = [m for st in self.writer_saves() for m in self.mutants(st)
+                     if self.full_record(m) not in written
+                     and self_upgrade._journal_fault(m, latest) is None]
+        self.assertTrue(loose, "the full-record comparison missed the mutant")
 
     def test_a_journal_one_step_from_a_writers_holds_everywhere(self):
         written = {self.journal_shape(s) for s in self.writer_saves() if len(s["attempted"]) == 1}
