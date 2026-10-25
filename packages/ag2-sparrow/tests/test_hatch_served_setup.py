@@ -301,7 +301,8 @@ from unittest import mock
 from ag2_sparrow import remote_gateway_bridge as m
 row = {"agents": [{"id": m._reenroll_identity(), "owner": "@owner:ag2.space",
                    "owner_dm_room": "!dm:ag2.space"}]}
-with mock.patch.object(m, "_req", return_value=row):
+dm = {"members": [{"user_id": m._reenroll_identity()}, {"user_id": "@owner:ag2.space"}]}
+with mock.patch.object(m, "_req", side_effect=lambda _m, path, *a, **k: dm if path == "/v1/room" else row):
     m.refresh_routing(force=True)
 m._emit_gateway_status(True)
 routing, status = m._routing_file().read_text(), m.GATEWAY_STATUS_FILE.read_text()
@@ -346,8 +347,8 @@ print(json.dumps({"routing": json.loads(routing), "status": json.loads(status),
         self.assertEqual(out["status"]["gateway_binding"], digest)
         self.assertNotIn("tenant", out["raw"], "nothing from the URL's query is persisted")
         self.assertNotIn("fake-relay-token", out["raw"])
-        self.assertEqual(out["reloaded"], "!dm:ag2.space !old:ag2.space -",
-                         "its own record and a legacy one reload; a foreign binding does not")
+        self.assertEqual(out["reloaded"], "!dm:ag2.space - -",
+                         "its own checked record reloads; an unchecked legacy one and a foreign binding do not")
         self.assertEqual(runtime_text.owner_dm_room(self.state, "", AGENT), "!dm:ag2.space")
 
     COLD = """
@@ -465,7 +466,7 @@ print(json.dumps(seen))
         self.assertIn("tenant", out[0]["disk"], "a read error is unknown, never migrated")
         self.assertEqual(out[0]["dm"], "")
         self.assertNotIn("tenant", out[1]["disk"])
-        self.assertEqual(out[1]["dm"], "!dm:ag2.space", "the rewritten record is read again from disk")
+        self.assertEqual(out[1]["dm"], "", "the rewritten record is unchecked for membership: no reading")
 
     def test_a_failed_read_back_after_a_committed_rewrite_still_yields_the_owner_dm(self):
         (self.state / "owner-routing.json").write_text(json.dumps(
@@ -487,8 +488,8 @@ for _ in range(3):
 print(json.dumps(seen))
 """, AGENT_MXID=AGENT)
         self.assertNotIn("tenant", (self.state / "owner-routing.json").read_text())
-        self.assertEqual([row["dm"] for row in out], ["!dm:ag2.space"] * 3,
-                         "the reading comes from the disk record whatever the migration reported")
+        self.assertEqual([row["dm"] for row in out], [""] * 3,
+                         "a migrated legacy record is unchecked for membership, whatever the migration reported")
 
     def test_the_vendored_disposal_lines_through_the_bridge_log_hold_no_secret(self):
         token = "fake-relay-token-0123456789abcdef"
@@ -542,7 +543,7 @@ from ag2_sparrow import remote_gateway_bridge as m
 seen = []
 for dm, identity in (("!a:ag2.space", m._reenroll_identity()), ("!b:ag2.space", m._reenroll_identity()),
                      ("!c:ag2.space", "@someone-else:ag2.space")):
-    record = m._routing_record(identity, m.URL, dm)
+    record = m._routing_record(identity, m.URL, dm, private=True)
     m._routing_file().write_text(json.dumps(record))
     m._load_routing()
     seen.append([m._ROUTING["owner_dm"], m._ROUTING["persisted"]])

@@ -2766,7 +2766,8 @@ _hl._home = lambda: os.environ["HOME"]
 from ag2_sparrow import remote_gateway_bridge as m
 rows = {"agents": [{"id": "%(agent)s", "owner": "@owner:ag2.space", "owner_dm_room": "!dm:ag2.space"},
                    {"id": "%(caller)s", "owner": "@owner:ag2.space", "owner_dm_room": "!caller-dm:ag2.space"}]}
-with mock.patch.object(m, "_req", return_value=rows):
+dm = {"members": [{"user_id": "%(agent)s"}, {"user_id": "@owner:ag2.space"}]}
+with mock.patch.object(m, "_req", side_effect=lambda _m, path, *a, **k: dm if path == "/v1/room" else rows):
     m.refresh_routing(force=True)
 m._emit_gateway_status(True)
 pathlib.Path(os.environ["AGENT_CONNECT_STATE_DIR"], "real-bridge.pid").write_text(str(os.getpid()))
