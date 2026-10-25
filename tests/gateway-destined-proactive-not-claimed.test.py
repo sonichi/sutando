@@ -26,6 +26,11 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from _helpers.hermetic_env import hermetic_env, isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 REPO = Path(__file__).resolve().parent.parent
 
 failures: list[str] = []
@@ -100,7 +105,7 @@ sdir.mkdir(parents=True)
 (rdir / "proactive-100.txt").write_text("undestined control body")
 (rdir / "proactive-101.to-discord.txt").write_text("discord destined body")
 
-env = dict(os.environ)
+env = hermetic_env()
 env.update({"SUTANDO_TEST_MODE": "1", "SUTANDO_WORKSPACE": tmp,
             "REMOTE_TASK_URL": f"http://127.0.0.1:{port}",
             "REMOTE_TASK_TOKEN": "testtoken",

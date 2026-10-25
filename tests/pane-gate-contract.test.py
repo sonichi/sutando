@@ -58,6 +58,23 @@ def state(text, runtime):
     return pg.classify_pane(text, pg.ADAPTERS[runtime]).state
 
 
+class PersonOnlyGates(unittest.TestCase):
+    CODEX_TRUST = ("  Trust this folder? Codex can read, edit, and run files here.\n"
+                   "\u203a 1. Trust and continue\n  2. Quit\n\n  enter continue \u00b7 esc quit\n")
+
+    def test_codex_folder_trust_wording_is_folder_trust(self):
+        v = pg.classify_pane(self.CODEX_TRUST, pg.CODEX)
+        self.assertEqual((v.state, v.reason), ("busy", "folder-trust"))
+        self.assertTrue(pg.waits_for_a_person(v))
+
+    def test_only_person_only_dialogs_wait_for_a_person(self):
+        for kind, _, dialog in BROAD_SIGNATURES:
+            v = pg.classify_pane(dialog, pg.CLAUDE)
+            self.assertEqual(pg.waits_for_a_person(v), kind in pg.PERSON_ONLY_GATES, kind)
+        self.assertFalse(pg.waits_for_a_person(pg.classify_pane(CODEX_PICKER, pg.CODEX)))
+        self.assertFalse(pg.waits_for_a_person(pg.classify_pane(CLAUDE_IDLE, pg.CLAUDE)))
+
+
 class GateEvidence(unittest.TestCase):
     def test_completed_recap_requires_completion_context(self):
         recap = "※ recap: if you typed X, press Enter there to send it."

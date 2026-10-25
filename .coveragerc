@@ -38,6 +38,7 @@ omit =
     packages/ag2-sparrow/ag2_sparrow/result_ready.py
     packages/ag2-sparrow/ag2_sparrow/result_disposal.py
     packages/ag2-sparrow/ag2_sparrow/dedup_recovery.py
+    packages/ag2-sparrow/ag2_sparrow/dotspace.py
     packages/ag2-sparrow/ag2_sparrow/file_lock.py
     packages/ag2-sparrow/ag2_sparrow/workspace_lock.py
     packages/ag2-sparrow/ag2_sparrow/chat_secret_filter.py
@@ -51,6 +52,20 @@ omit =
     packages/ag2-sparrow/ag2_sparrow/proactive_routing.py
     packages/ag2-sparrow/ag2_sparrow/undelivered_quarantine.py
     packages/ag2-sparrow/ag2_sparrow/outbox_cli.py
+    packages/ag2-sparrow/ag2_sparrow/holder_lock.py
+    packages/ag2-sparrow/ag2_sparrow/task_priority.py
+    packages/ag2-sparrow/ag2_sparrow/task_lifecycle.py
+    packages/ag2-sparrow/ag2_sparrow/pool_record.py
+    packages/ag2-sparrow/ag2_sparrow/cli_wedge_patterns.py
+    packages/ag2-sparrow/ag2_sparrow/tmux_probe.py
+    packages/ag2-sparrow/ag2_sparrow/tmux_pane_keys.py
+    packages/ag2-sparrow/ag2_sparrow/hitl/__init__.py
+    packages/ag2-sparrow/ag2_sparrow/hitl/schema.py
+    packages/ag2-sparrow/ag2_sparrow/hitl/host.py
+    packages/ag2-sparrow/ag2_sparrow/hitl/manager.py
+    packages/ag2-sparrow/ag2_sparrow/hitl/projector.py
+    packages/ag2-sparrow/ag2_sparrow/hitl/renotify.py
+    packages/ag2-sparrow/ag2_sparrow/hitl/replies.py
     */node_modules/*
     */.venv/*
     */venv/*

@@ -37,6 +37,7 @@ import time
 import urllib.request
 import uuid
 
+from . import diagnostics, gateway_instance
 from .file_lock import lock_fd, unlock_fd
 
 _KEYCAP = {f"{i}️⃣": i for i in range(1, 10)}  # 1️⃣..9️⃣ → 1..9
@@ -269,15 +270,16 @@ class CardPoster:
                 continue
             body = json.dumps({"op": "message", "room_id": self._room,
                                "body": self._render(rec)}).encode()
-            req = urllib.request.Request(
-                self._url + "/v1/room", data=body,
-                headers={**self._headers, "Content-Type": "application/json"},
-                method="POST")
             try:
-                with urllib.request.urlopen(req, timeout=15) as resp:
-                    reply = json.loads(resp.read().decode() or "{}")
+                with gateway_instance.gateway_call(self._url):
+                    req = urllib.request.Request(
+                        self._url + "/v1/room", data=body,
+                        headers={**self._headers, "Content-Type": "application/json"},
+                        method="POST")
+                    with urllib.request.urlopen(req, timeout=15) as resp:
+                        reply = json.loads(resp.read().decode() or "{}")
             except Exception as e:  # noqa: BLE001 — best-effort, retry next sweep
-                self._log(f"human-action: card post failed (will retry): {e}")
+                self._log(f"human-action: card post failed (will retry): {diagnostics.describe(e)}")
                 continue
             event_id = reply.get("event_id") or (reply.get("result") or {}).get("event_id")
             # Record the card on the CURRENT record under the shared transition

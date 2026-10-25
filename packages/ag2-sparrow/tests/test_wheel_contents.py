@@ -16,11 +16,20 @@ import tempfile
 import venv
 import zipfile
 
+sys.path.append(str(pathlib.Path(__file__).resolve().parents[3] / "tests"))
+from _helpers.hermetic_env import hermetic_env, isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 PKG_ROOT = pathlib.Path(__file__).resolve().parents[1]
 SRC = PKG_ROOT / "ag2_sparrow"
 # Non-Python files the code reads at run time (package-data in pyproject.toml).
-DATA_FILES = ("ag2_sparrow/adapters/hatch/ag2-sparrow-hatch.sh",
+DATA_FILES = ("ag2_sparrow/tmux-pane-keys.sh",
+              "ag2_sparrow/bounded-wait.sh",
+              "ag2_sparrow/adapters/hatch/ag2-sparrow-hatch.sh",
               "ag2_sparrow/adapters/hatch/hook-definition.json",
+              "ag2_sparrow/adapters/hatch/builtin-runtime-text.json",
               "ag2_sparrow/adapters/claude_routine/routine-prompt.md",
               "ag2_sparrow/adapters/claude_routine/README.md",
               "ag2_sparrow/adapters/claude_cloud_session/session-prompt.md",
@@ -73,11 +82,8 @@ def main():
         print(f"PASS wheel+sdist ship all {len(expected)} packages: {', '.join(expected)}")
 
         _run([py, "-m", "pip", "install", "--quiet", "--no-deps", "--no-index", str(whl)])
-        env = {k: v for k, v in os.environ.items()
-               if not k.startswith(("REMOTE_TASK_", "AG2_", "SUTANDO_"))
-               and k != "CLAUDE_CONFIG_DIR"}  # names a channel .env holding a live token
-        env["AGENT_CONNECT_STATE_DIR"] = str(d / "state")
-        env["PYTHONPATH"] = ""
+        (d / "import-home").mkdir()
+        env = hermetic_env(d / "import-home", AGENT_CONNECT_STATE_DIR=str(d / "state"), PYTHONPATH="")
         # Run from the temp dir so the source tree cannot shadow the installed copy.
         _run([py, "-c", "import ag2_sparrow.remote_gateway_bridge, ag2_sparrow.outbox_cli, ag2_sparrow.holder_lock"],
              cwd=d, env=env)
@@ -109,6 +115,10 @@ def main():
         r = subprocess.run([*named, "reply", "--help"],
                            capture_output=True, text=True, cwd=d, env=ienv, timeout=60)
         assert r.returncode == 0 and "result_file" in r.stdout, f"{r.stdout}\n{r.stderr}"
+        r = subprocess.run([*named, "wake-context"],
+                           capture_output=True, text=True, cwd=d, env=ienv, timeout=60)
+        assert r.returncode == 0 and "Follow the worker_note exactly" in r.stdout, \
+            f"{r.stdout}\n{r.stderr}"
         print(f"PASS installed hook prompt names the reply command by absolute path: {named.pop()}")
 
 if __name__ == "__main__":

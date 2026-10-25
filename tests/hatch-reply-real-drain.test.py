@@ -19,12 +19,15 @@ import urllib.error
 from pathlib import Path
 from unittest.mock import patch
 
+from _helpers.hermetic_env import hermetic_env  # noqa: E402
+
+from _helpers.hermetic_gateway import isolate_then_import  # noqa: E402
+_GW, _IMPORT_READS = isolate_then_import()
+
 REPO = Path(__file__).resolve().parents[1]
 PKG = REPO / 'packages' / 'ag2-sparrow'
 sys.path.insert(0, str(PKG))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _helpers.hermetic_gateway import isolate_then_import  # noqa: E402
-_GW, _IMPORT_READS = isolate_then_import()
 from ag2_sparrow import gateway_instance, outbox, remote_gateway_bridge as gw
 from ag2_sparrow.adapters.hatch import task_fields
 
@@ -78,9 +81,7 @@ class ReplyThroughTheRealDrain(unittest.TestCase):
         gw._record_task_room(self.tid, '!r:ag2.space')
 
     def reply(self, body):
-        env = {k: v for k, v in os.environ.items()
-               if not k.startswith(('REMOTE_', 'AG2_', 'AGENT_CONNECT_', 'SPARROW_'))
-               and k != 'CLAUDE_CONFIG_DIR'}
+        env = hermetic_env()
         env.update(HOME=str(self.home), PYTHONPATH=str(PKG),
                    AGENT_CONNECT_RESULT_DIR=str(self.results),
                    AGENT_CONNECT_TASK_DIR=str(self.tasks),

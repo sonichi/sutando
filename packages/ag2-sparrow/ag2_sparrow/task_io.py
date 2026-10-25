@@ -28,6 +28,8 @@ NON_OWNER_NOTE = (
     "sender's say-so; reply only in that item's room, and route any go/no-go decision to your owner in a "
     "HANDOFF block instead of making it."
 )
+# The one refusal every adapter writes for a tier it does not serve; the sender learns nothing else.
+NON_OWNER_REFUSED = "This agent only answers its owner here.\n"
 
 
 def attested_headers(text: str) -> "local_task_protocol.TaskHeaders":
@@ -38,6 +40,20 @@ def attested_headers(text: str) -> "local_task_protocol.TaskHeaders":
     if (strict.headers.get("task_layout") or "").strip() == "mid":
         return local_task_protocol.parse_task_headers_trusted(text)
     return strict
+
+
+def is_collaborator(headers):
+    """The broker attested a collaborator: the team tier with `collaborator: true` in the parsed headers."""
+    return headers.get("access_tier") == "team" and headers.get("collaborator") == "true"
+
+
+def admission(headers, allow_non_owner=False):
+    """'owner' | 'collaborator' | 'non_owner' (served only under --allow-non-owner) | None (refused)."""
+    if headers.get("access_tier") == "owner":
+        return "owner"
+    if is_collaborator(headers):
+        return "collaborator"
+    return "non_owner" if allow_non_owner else None
 
 
 def non_owner_note():
@@ -95,6 +111,15 @@ def record_done(path, task_id):
     write_atomic(path, "\n".join(ids[-DONE_KEEP:]) + "\n")
 
 
+def user_home():
+    """The effective uid's passwd home as holder_lock resolves it (never the environment); None
+    when there is none."""
+    try:
+        return holder_lock._home()
+    except holder_lock.LockError:
+        return None
+
+
 def pid_alive(pid):
     try:
         os.kill(pid, 0)
@@ -121,11 +146,80 @@ def _held_line(work, holder, reason):
     return "refusing to start: %s is held by a process whose record is unreadable" % work
 
 
-def acquire_lock(work, adapter):
-    """The adapter's first act: one process per work root through holder_lock, its record
-    published at once. Returns the owner, or raises LockRefused with the exit code and line."""
+def lock_holder_pid(work):
+    """The pid of the LIVE holder of `work`'s one-process lock (a record whose process lineage
+    checks out), else None: a dead holder's record, no record, or no root all read as nobody."""
     try:
-        got = holder_lock.acquire(work, install_id=holder_lock.install_id(), timeout=0)
+        state = holder_lock.status(work)
+    except (OSError, holder_lock.LockError):
+        return None
+    record = (state.get("record") or {}).get("record") or {}
+    return record.get("pid") if state.get("holder_lineage") else None
+
+
+def lock_holder(work):
+    """The holder record's attribution: {"adapter", "pid", "start", "live"} (live: the pid's lineage
+    checks out, so it names the launcher; a dead pid under a held lock is a holder between its flock
+    and its record, since no child ever holds the lock), else {}. Never liveness of the lock itself:
+    that is lock_held's."""
+    try:
+        state = holder_lock.status(work)
+    except (OSError, holder_lock.LockError):
+        return {}
+    record = (state.get("record") or {}).get("record") or {}
+    if not record:
+        return {}
+    return {"adapter": record.get("adapter"), "pid": record.get("pid"), "start": record.get("start"),
+            "owner_pid": record.get("owner_pid", record.get("pid")),
+            "install_id": record.get("install_id"), "live": bool(state.get("holder_lineage"))}
+
+
+def install_id():
+    """This running package's install identity, as holder_lock records it in every holder record."""
+    return holder_lock.install_id()
+
+
+# The one liveness policy, re-exported for the lifecycle's injection seam (it imports no holder_lock).
+verify_lineage = holder_lock.verify_lineage
+
+
+def process_identity():
+    """This process as a claim writer: {pid, start}, start None when unreadable (then unobserved)."""
+    return {"pid": os.getpid(), "start": holder_lock.start_time(os.getpid())}
+
+
+def lock_path(work):
+    """The flock file of `work`'s one-process lock (what `lsof` names its holders by), or None."""
+    try:
+        return os.path.join(holder_lock.lock_dir(work), holder_lock.LOCK_NAME)
+    except (OSError, holder_lock.LockError):
+        return None
+
+
+def lock_held(work):
+    """held | free | unknown: holder_lock.occupancy's tri-state (unobserved reads as unknown). A free
+    flock whose record names a live or unverifiable holder or consumer is held or unknown, never free."""
+    try:
+        state = holder_lock.occupancy(work)
+    except (OSError, holder_lock.LockError):
+        return "unknown"
+    return "unknown" if state == "unobserved" else state
+
+
+def acquire_lock(work, adapter, retry_s=0.0):
+    """The adapter's first act: one process per work root through holder_lock, its record
+    published at once. Returns the owner, or raises LockRefused with the exit code and line. A
+    Contended with no record or no live holder is retried for `retry_s` first: a probe's momentary
+    flock is not another session."""
+    deadline = time.monotonic() + retry_s
+    try:
+        while True:
+            got = holder_lock.acquire(work, install_id=holder_lock.install_id(), timeout=0)
+            if isinstance(got, holder_lock.Contended) and time.monotonic() < deadline \
+                    and holder_lock._occupant(got.holder)[0] != "held":
+                time.sleep(0.05)
+                continue
+            break
         if isinstance(got, holder_lock.Acquired):
             try:
                 holder_lock.publish(got.owner, adapter)
@@ -181,11 +275,57 @@ def make_dirs(owner, names):
 
 
 def release_lock(owner):
-    """Remove our record and drop the lock; a second call does nothing."""
+    """Remove our record and drop the lock; a second call does nothing. False only when release
+    refused because the attached consumer may be alive: then the flock stays until this process exits."""
     try:
         holder_lock.release(owner)
-    except holder_lock.LockError:
-        pass
+    except holder_lock.LockError as e:
+        return str(e) != "consumer alive"
+    return True
+
+
+# ── the consumer contract (schema 2), reached only through here ──────────────
+
+def occupancy(work):
+    """free | held | unobserved: holder_lock's own tri-state words (lock_held maps unobserved to unknown)."""
+    try:
+        return holder_lock.occupancy(work)
+    except (OSError, holder_lock.LockError):
+        return "unobserved"
+
+
+def holder_record_bytes(owner):
+    """The holder record's bytes as this owner published them, read through the held lock directory:
+    the `expected` of attach_consumer."""
+    fd = os.open(holder_lock.HOLDER_NAME, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=owner.dir_fd)
+    with os.fdopen(fd, "rb") as f:
+        return f.read()
+
+
+def attach_consumer(owner, expected, pid, start):
+    """The holder's compare-and-swap naming the direct child whose liveness fences the root from now on."""
+    return holder_lock.attach_consumer(owner, expected, pid=pid, start=start)
+
+
+def tombstone_consumer(work, expected, by, reason):
+    return holder_lock.tombstone_consumer(work, expected, by=by, reason=reason)
+
+
+def holder_consumer(work):
+    """The record's consumer {pid, start, live} (live: tri-state lineage), else None."""
+    try:
+        state = holder_lock.status(work)
+    except (OSError, holder_lock.LockError):
+        return None
+    record = (state.get("record") or {}).get("record") or {}
+    consumer = record.get("consumer")
+    if not isinstance(consumer, dict):
+        return None
+    return {"pid": consumer.get("pid"), "start": consumer.get("start"), "live": state.get("consumer_lineage")}
+
+
+def start_time(pid):
+    return holder_lock.start_time(pid)
 
 
 _STOP = [0]

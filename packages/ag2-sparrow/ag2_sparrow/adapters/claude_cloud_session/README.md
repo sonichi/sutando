@@ -59,8 +59,8 @@ adapter checks nothing about it beyond the single-process lock. The binary enfor
   transaction: create and fsync the empty ledger, create and fsync `claims/`, write `state/format`
   (`cloud-session/1`) last by temp + fsync + rename, then fsync `state/`, `$CLOUD_WORK` and its
   parent; an interrupted init completes on the next start. With the marker, `state/` may hold only
-  `format`, `claims/`, `settled-ids`, `rate.jsonl` and `done`, and the ledger and `claims/` must
-  exist; anything else refuses naming it.
+  `format`, `claims/`, `settled-ids`, `rate.jsonl`, `done` and `collaborator-turns.json` (a plain
+  file when present), and the ledger and `claims/` must exist; anything else refuses naming it.
 - **Probe.** Rename and hard link must work in `results/` and `state/`, else exit 2.
 
 ## Setup (once)
@@ -113,9 +113,44 @@ DM."; with no `owner_dm`, such an answer becomes "I can't answer that here." in 
 else. The whole text is at most 65,536 characters; only the body is cut, ending in
 `[truncated]`. A task with no room is not queued.
 
-**Non-owner tiers are refused by default**, with the routine adapter's plain line ("This agent only
-answers its owner here."): the session holds the owner's connector and there is no narrower scope.
-`--allow-non-owner` queues them anyway, bounded only by the note and the standing instructions.
+**Who is served.** Admission is the shared `task_io.admission` gate over the attested headers: the owner,
+an attested collaborator (Team), nobody else. A non-owner without collaborator access (Guest, and any
+collaborator claim the broker did not attest) is refused with the routine adapter's plain line ("This agent
+only answers its owner here.") unless `--allow-non-owner` is passed, which queues such tasks into this
+session anyway — the owner's history and connector, bounded only by the note and the standing
+instructions. An attested collaborator (the broker's `collaborator: true` on the team tier, from the parsed
+headers, never the message text) never enters this session: with `--allow-collaborator` it is served on
+an isolated local turn; without it, it gets the same refusal line. `--allow-non-owner` does not imply
+`--allow-collaborator`. The owner path is unchanged.
+
+**The isolated collaborator turn** is `<--claude> -p --safe-mode --restricted --strict-mcp-config
+--no-session-persistence --tools Read,Grep,Glob --output-format json` with the routine adapter's payload on
+stdin (one lead line naming the situation, then the note, `collaborator=true`; not this session's reminder,
+no `channel_kind`, no `owner_dm`), in a fresh empty temp directory removed afterwards, with the same
+five-variable environment as above, bounded by `--collaborator-timeout` (default 60 s; `--timeout` is the
+`--cloud` call's alone). What it can reach: the CLI's login and
+the three read tools over an empty directory. What it cannot: this session (no `--cloud`, no session id, no
+`--resume`, and the turn itself is never saved, so nothing can resume it), its history and connector, Bash
+or code-running tools, the web, MCP servers, CLAUDE.md, hooks, skills, settings, or the work dir. The JSON
+`result` string becomes the task's result as **inert text**: every result-delivery marker the shared parser
+knows (`[no-send]`, `[REPLIED]`, `[deduped:]`, `[channel:]`, `[thread:]`, `[thread]`, `[reply:]`,
+`[dm-only]`, `[file:]`/`[send:]`/`[attach:]`) is quoted in the parser's own form (`[ no-send]`) before
+publication and checked by the parser again, so the gateway executes nothing from it and posts it once in
+the originating room. Any failure (non-zero exit, no `result`, timeout, no temp dir, missing CLI) gets "This
+message could not be sent to the cloud agent right now." — one try, no retry. The turn runs inside the same
+claim/journal/ledger lifecycle as a queued turn, recorded as a `final` outcome, so it is never counted
+against the owner provider's limiter or `--min-gap-seconds`; the turn still costs the owner's Claude plan.
+One exception, which fails safe: a crash mid-turn leaves a `CALLING` claim, and the restart records it as
+`unknown` in the journal like any interrupted call, so that one attempt does count toward the owner lane's
+cap and gap, and its staged `NON_OWNER_FAILED` body is published without a second turn. Its own cap is
+`--max-collaborator-per-hour` (1 or more, default 10, `state/collaborator-turns.json`, part of this
+adapter's state contract), and its own gate: a collaborator waits only on that cap, never on the session's
+cap, hold or gap, and an owner task never waits on the collaborator cap. A task that has waited longer than
+`--collaborator-max-age` (default 1800 s; 0 turns the cut-off off) gets the generic line instead of a turn,
+so a burst is not answered hours late. The wait counts since the task was first seen in a pending scan, or
+its file time if earlier; a restart does not reset it. The line goes out at once: a stale task takes the
+ungated lane and never waits on the collaborator cap, and no claim is prepared for it. The adapter log shows
+`collaborator turn ->` instead of `queue ->`.
 
 ## Results
 
@@ -155,8 +190,9 @@ SETTLED`. `CALLING` is durable before the CLI runs. The exact rendered result bo
 - **Recovery** (on start, after the lock): `PREPARED`/`NOT_DELIVERED` are retried only when the task
   file exists and the classifier says `ABSENT`, settled when the task was removed or a terminal result
   exists, parked otherwise; `CALLING` becomes `OUTCOME_UNKNOWN`, is counted at the restart time and
-  answered "may or may not have reached (interrupted)" unless a result exists, never resent; later
-  phases finish publishing.
+  answered with its staged interrupted body — "may or may not have reached (interrupted)" for an owner
+  turn, `NON_OWNER_FAILED` for a collaborator or any other non-owner — unless a result exists, never
+  resent; later phases finish publishing.
 - **Settled ids.** `state/settled-ids` is append-only, one validated id per newline-terminated record.
   Order, under the lock: the claim is written `SETTLED` (its directory fsynced), then the id is
   appended in full and the ledger fsynced, and only then does the in-memory set change. A settled id

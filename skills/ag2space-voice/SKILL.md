@@ -47,6 +47,12 @@ top of that. Remove the directory and the engine boots, types and tests unchange
   still re-checks the original room's membership and honors `[dm-only]`.
 - **Prompt**: a `ROOM:` context line while docked, and one system notice per actual
   room change.
+- **`current_room`** — "which room are you in?" is answered from the binding at the
+  moment it is asked, never from what the model remembers: the notice comes once per
+  change, can be missed (a reconnect, a busy session) and can be outweighed by an
+  earlier room still in context. It sits with `navigate_ui` in `voiceSurface()`, under
+  the same condition, with its WHERE YOU ARE prompt rule and a turn-check rule. It is
+  listed as an answering tool, so the turn never also goes to the core.
 - **`navigate.ts` / `navigate-protocol.ts`** — the `navigate_ui` tool ("let's talk in my
   DM", "take me to GTM in Investors", "go home"). It is contributed through
   `voiceSurface()`, so it is on the web voice session only, never the phone tool table,

@@ -108,6 +108,25 @@ def proactive_filename(ts, channel: "str | None" = None) -> str:
     return f"proactive-{ts}.to-{channel}.txt"
 
 
+# A message about one task names it: proactive-about-<task id>--<ts>[.to-<channel>].txt. The
+# gateway threads it in that task's conversation and re-checks the task before it is sent.
+_ABOUT_TASK_RE = re.compile(r"\Aproactive-about-(task-[A-Za-z0-9._-]+)--(\d+)(?:\.to-[a-z0-9_-]+)?\.txt\Z")
+
+
+def about_task_filename(task_id: str, ts, channel: "str | None" = None) -> str:
+    """Typed constructor for a proactive message about `task_id`; the reader is about_task()."""
+    name = proactive_filename(ts, channel).replace("proactive-", f"proactive-about-{task_id}--", 1)
+    if about_task(name) != task_id:
+        raise ValueError(f"not a task id and timestamp: {task_id!r}, {ts!r}")
+    return name
+
+
+def about_task(name) -> "str | None":
+    """The task a proactive message is about, or None for any other proactive name."""
+    m = _ABOUT_TASK_RE.match(Path(name).name)
+    return m.group(1) if m else None
+
+
 def proactive_destination(name) -> "str | None":
     """The declared destination, or None for legacy/undestined names. An
     unrecognized tag still reads as a destination: a file aimed at a channel

@@ -22,6 +22,11 @@ import unittest
 import unittest.mock
 from pathlib import Path
 
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "src"))
 sys.path.insert(0, str(REPO / "packages" / "ag2-sparrow"))
@@ -1170,7 +1175,7 @@ class BridgeDelegates(unittest.TestCase):
               "_write_owner_activity", "refresh_routing", "_durable_write", "_write_task",
               "_append_log_file", "_archive_task_file", "_archive_resolved_review",
               "_retry_review_control_results", "_post_proactive", "_recover_orphan_proactive",
-              "_retire_proactive", "_drop_staged"}
+              "_retire_proactive", "_send_proactive", "_drop_staged"}
 
     def movers(self):
         out = {}

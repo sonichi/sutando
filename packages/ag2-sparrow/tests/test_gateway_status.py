@@ -8,14 +8,22 @@ import tempfile
 import importlib
 import sys
 import pathlib
+from unittest.mock import patch
+
+sys.path.append(str(pathlib.Path(__file__).resolve().parents[3] / "tests"))
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
 
 def _load(tmp):
     os.environ["AGENT_CONNECT_STATE_DIR"] = str(tmp)
     os.environ.setdefault("REMOTE_TASK_URL", "https://gw.example/relay")
     os.environ.setdefault("REMOTE_TASK_TOKEN", "dummy-secret")
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
-    mod = importlib.import_module("ag2_sparrow.remote_gateway_bridge")
-    return importlib.reload(mod)
+    mod = importlib.reload(importlib.import_module("ag2_sparrow.remote_gateway_bridge"))
+    mod.gateway_instance.binding_key_path = lambda: pathlib.Path(tmp, "binding.key")  # never the real one
+    return mod
 
 def test_connected_then_reconnecting_preserves_last_ok():
     with tempfile.TemporaryDirectory() as d:
@@ -23,10 +31,10 @@ def test_connected_then_reconnecting_preserves_last_ok():
         m = _load(tmp)
         f = m.GATEWAY_STATUS_FILE
         # connected
-        m._emit_gateway_status(True)
+        m._emit_gateway_status(True, poll_ok_ts=1000)
         rec = json.loads(f.read_text())
         assert rec["connected"] is True
-        assert isinstance(rec["last_ok_ts"], int) and rec["last_ok_ts"] > 0
+        assert rec["last_ok_ts"] == 1000
         assert rec["schema_version"] == 1 and rec["error"] is None
         ok_ts = rec["last_ok_ts"]
         # reconnecting — last_ok_ts must be PRESERVED, connected flips false
@@ -37,15 +45,64 @@ def test_connected_then_reconnecting_preserves_last_ok():
         assert rec2["backoff_s"] == 4
         assert "network" in rec2["error"]
         # no temp file left behind (atomic replace)
-        assert not (f.with_suffix(".json.tmp")).exists()
+        assert not list(tmp.glob("gateway-status.json.*.tmp"))
         print("PASS test_connected_then_reconnecting_preserves_last_ok")
+
+def test_connected_without_a_poll_preserves_absent_evidence():
+    with tempfile.TemporaryDirectory() as d:
+        m = _load(pathlib.Path(d))
+        for connected in (False, True, False):
+            m._emit_gateway_status(connected)
+            rec = json.loads(m.GATEWAY_STATUS_FILE.read_text())
+            assert rec["last_ok_ts"] is None
+            assert rec["connected"] is connected
+        print("PASS test_connected_without_a_poll_preserves_absent_evidence")
+
+def test_only_explicit_poll_evidence_advances_last_ok():
+    with tempfile.TemporaryDirectory() as d:
+        m = _load(pathlib.Path(d))
+        with patch.object(m.time, "time", return_value=1000):
+            m._emit_gateway_status(True, poll_ok_ts=900.75)
+        for connected in (True, False, True):
+            with patch.object(m.time, "time", return_value=1100):
+                m._emit_gateway_status(connected)
+            rec = json.loads(m.GATEWAY_STATUS_FILE.read_text())
+            assert rec["ts"] == 1100
+            assert rec["last_ok_ts"] == 900
+        with patch.object(m.time, "time", return_value=1200):
+            m._emit_gateway_status(False, error="task processing failed", poll_ok_ts=1150.5)
+        rec = json.loads(m.GATEWAY_STATUS_FILE.read_text())
+        assert rec["ts"] == 1200 and rec["last_ok_ts"] == 1150
+        assert rec["connected"] is False
+        print("PASS test_only_explicit_poll_evidence_advances_last_ok")
+
+def test_status_is_atomically_replaced():
+    with tempfile.TemporaryDirectory() as d:
+        m = _load(pathlib.Path(d))
+        m._emit_gateway_status(False)
+        replace = m.os.replace
+        observed = []
+
+        def inspect_replace(src, dst):
+            assert json.loads(dst.read_text())["last_ok_ts"] is None
+            assert json.loads(src.read_text())["last_ok_ts"] == 1000
+            observed.append(dst)
+            replace(src, dst)
+
+        with patch.object(m.os, "replace", side_effect=inspect_replace):
+            m._emit_gateway_status(True, poll_ok_ts=1000)
+        assert observed == [m.GATEWAY_STATUS_FILE]
+        assert json.loads(m.GATEWAY_STATUS_FILE.read_text())["last_ok_ts"] == 1000
+        print("PASS test_status_is_atomically_replaced")
 
 def test_status_write_never_raises(monkeypatch=None):
     with tempfile.TemporaryDirectory() as d:
         m = _load(pathlib.Path(d))
         # point at an unwritable path → helper must swallow, not raise
-        m.GATEWAY_STATUS_FILE = pathlib.Path("/proc/nonexistent/dir/gw.json")
-        m._emit_gateway_status(True)  # should not raise
+        blocked = pathlib.Path(d) / "not-a-directory"
+        blocked.write_text("blocked")
+        m.GATEWAY_STATUS_FILE = blocked / "gw.json"
+        m._emit_gateway_status(True, poll_ok_ts=1000)  # should not raise
         print("PASS test_status_write_never_raises")
 
 def test_redact_url_strips_userinfo_and_query():
@@ -56,8 +113,8 @@ def test_redact_url_strips_userinfo_and_query():
             == "https://gw.example:8443/relay"
         # clean URL is unchanged
         assert m._redact_url("https://gw.example/relay") == "https://gw.example/relay"
-        # a bare non-URL string falls through untouched (never raises)
-        assert m._redact_url("not-a-url") == "not-a-url"
+        # a string that is not a URL fails closed to a placeholder (never raises)
+        assert m._redact_url("not-a-url?token=SEKRIT") == m.gateway_instance.REDACTED_URL
         print("PASS test_redact_url_strips_userinfo_and_query")
 
 def test_emitted_gateway_field_carries_no_secret():
@@ -75,6 +132,9 @@ def test_emitted_gateway_field_carries_no_secret():
 
 if __name__ == "__main__":
     test_connected_then_reconnecting_preserves_last_ok()
+    test_connected_without_a_poll_preserves_absent_evidence()
+    test_only_explicit_poll_evidence_advances_last_ok()
+    test_status_is_atomically_replaced()
     test_status_write_never_raises()
     test_redact_url_strips_userinfo_and_query()
     test_emitted_gateway_field_carries_no_secret()

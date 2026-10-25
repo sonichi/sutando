@@ -13,6 +13,11 @@ from __future__ import annotations
 import importlib.util
 import io
 import json
+import os
+import shlex
+import shutil
+import signal
+import subprocess
 import sys
 import tempfile
 import threading
@@ -37,6 +42,203 @@ def _load(name):
 rem = _load("pool_remedy")
 ps = rem.ps
 WID, OTHER = "a" * 32, "b" * 32
+# A loaded CI runner can take well past 10 s to reap a pane or drop a session.
+WAIT_SECONDS = 60
+
+
+class RestartSessionContinuity(unittest.TestCase):
+    """Real launcher/tmux boundary with a synthetic endpoint, not a model conversation."""
+
+    def setUp(self):
+        for tool in ("tmux", "cc"):
+            if not shutil.which(tool):
+                self.skipTest(f"{tool} is required for the real launcher regression")
+        tmp = tempfile.TemporaryDirectory(prefix="restart-")
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name).resolve()
+        self.ws, self.socket = self.root / "workspace", self.root / "tmux.sock"
+        self.ws.mkdir()
+        self.endpoint = self.root / "bin"
+        self.endpoint.mkdir()
+        runtime_root = Path(os.environ.get("SUTANDO_RUNTIME_SOCKET", str(self.root / "api.sock"))).parent
+        self.diagnostics = runtime_root / "diagnostics" if (runtime_root / "diagnostics").is_dir() else self.root
+        source = runtime_root / "runtime-endpoint.c"
+        if not source.is_file():
+            source = self.root / "synthetic-runtime.c"
+            source.write_text("""
+#include <signal.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+static volatile sig_atomic_t done;
+static void stop(int sig) { (void)sig; done = 1; }
+int main(int argc, char **argv) {
+    if (argc == 2 && !strcmp(argv[1], "--version")) {
+        puts("synthetic runtime endpoint; no model"); return 0;
+    }
+    signal(SIGTERM, stop); signal(SIGINT, stop); signal(SIGHUP, stop);
+    puts("synthetic endpoint ready; no conversation or authentication");
+    fflush(stdout);
+    while (!done) sleep(1);
+    return 0;
+}
+""")
+        subprocess.run(["cc", str(source), "-o", str(self.endpoint / "claude")],
+                       check=True, capture_output=True, text=True, timeout=30)
+        env = {"PATH": str(self.endpoint) + os.pathsep + os.environ["PATH"],
+               "SUTANDO_TEST_MODE": "1", "SUTANDO_TELEMETRY": "0",
+               "SUTANDO_WORKSPACE": str(self.ws), "SUTANDO_WORKSPACE_DIR": str(self.ws),
+               "SUTANDO_DEFAULT_WORKSPACE": str(self.ws),
+               "SUTANDO_RESULTS_DIR": str(self.ws / "results"),
+               "SUTANDO_RUNTIME_STATE": str(self.ws / "state"),
+               "CLAUDE_CONFIG_DIR": str(self.root / "claude-config"),
+               "SUTANDO_TMUX_SOCKET": str(self.socket),
+               "SUTANDO_NOTIFIER_GRACE_PERIOD": "300", "SUTANDO_NOTIFIER_ROLE_POLL": "1"}
+        patcher = mock.patch.dict(os.environ, env)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        for target, name, value in ((rem.sw, "ensure_remedy_timer", {"installed": False}),
+                                    (rem, "ensure_input_watch", {"outcome": "test-suppressed"})):
+            patcher = mock.patch.object(target, name, return_value=value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.server_log = open(self.diagnostics / "restart-tmux.log", "w+")
+        self.addCleanup(self.server_log.close)
+        self.server = subprocess.Popen(["tmux", "-D", "-f", "/dev/null", "-S", str(self.socket)],
+                                       cwd=REPO, env=dict(os.environ), stdin=subprocess.DEVNULL,
+                                       stdout=self.server_log, stderr=subprocess.STDOUT)
+        self.pids = set()
+        self.addCleanup(self.stop_server)
+        self.wait_for(lambda: self.socket.exists() or self.server.poll() is not None)
+        self.assertIsNone(self.server.poll(), "foreground tmux exited before socket readiness")
+        self.assertEqual(self.tmux("show-options", "-g", "exit-empty").returncode, 0)
+        keeper = self.tmux("new-session", "-d", "-s", "test-keeper", str(self.endpoint / "claude"))
+        self.assertEqual(keeper.returncode, 0, keeper.stderr)
+
+    @staticmethod
+    def poll_until(predicate, seconds=WAIT_SECONDS):
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            if predicate():
+                return True
+            time.sleep(0.05)
+        return predicate()
+
+    def wait_for(self, predicate, seconds=WAIT_SECONDS):
+        if not self.poll_until(predicate, seconds):
+            self.fail(f"timed out after {seconds} s waiting for disposable runtime state")
+
+    def tmux(self, *args, timeout=30):
+        return subprocess.run(["tmux", "-S", str(self.socket), *args], env=dict(os.environ),
+                              capture_output=True, text=True, timeout=timeout)
+
+    def alive(self, pid):
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return False  # the pid was reaped and reused by another user's process
+
+    def stop_server(self):
+        # Teardown timing alone never fails the test; the kill-server below runs regardless.
+        try:
+            panes = self.tmux("list-panes", "-a", "-F", "#{pane_pid}")
+            self.pids.update(int(p) for p in panes.stdout.split() if p.isdigit())
+        except subprocess.TimeoutExpired:
+            pass
+        for pid in self.pids:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                pass
+        self.poll_until(lambda: all(not self.alive(pid) for pid in self.pids))
+        for _ in range(3):
+            try:
+                self.tmux("kill-server")
+            except subprocess.TimeoutExpired:
+                pass
+            try:
+                self.server.wait(timeout=WAIT_SECONDS / 3)
+                break
+            except subprocess.TimeoutExpired:
+                continue
+        else:
+            self.server.kill()
+            self.server.wait(timeout=WAIT_SECONDS)
+        self.assertIsNotNone(self.server.returncode)
+        (self.diagnostics / "restart-cleanup.json").write_text(json.dumps({
+            "server_pid": self.server.pid, "server_reaped": True,
+            "pane_pids": sorted(self.pids), "panes_absent": all(not self.alive(p) for p in self.pids)}))
+
+    def call_main(self, module, args, log_name):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), mock.patch("sys.stderr", err):
+            rc = module.main(["--workspace", str(self.ws), "--repo", str(REPO), *args])
+        (self.diagnostics / log_name).write_text(out.getvalue() + err.getvalue())
+        self.assertEqual(rc, 0, err.getvalue() or out.getvalue())
+        return json.loads(out.getvalue())
+
+    def observe(self, name, session, folder):
+        pane = self.tmux("list-panes", "-t", "=" + name, "-F", "#{pane_pid}\t#{pane_current_path}\t#{pane_id}")
+        self.assertEqual(pane.returncode, 0, pane.stderr)
+        pid, cwd, pane_id = pane.stdout.strip().split("\t")
+        self.pids.add(int(pid))
+        proc = subprocess.run(["ps", "-p", pid, "-o", "args="], env=dict(os.environ),
+                              capture_output=True, text=True, timeout=10)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        args = shlex.split(proc.stdout)
+        self.assertEqual(Path(args[0]).name, "claude")
+        self.assertEqual(args[args.index("--resume") + 1], session)
+        self.assertNotIn("--session-id", args)
+        self.assertEqual(Path(cwd).resolve(), folder)
+        capture = self.tmux("capture-pane", "-p", "-t", pane_id)
+        self.assertEqual(capture.returncode, 0, capture.stderr)
+        self.assertIn("synthetic endpoint ready", capture.stdout)
+        return {"pid": int(pid), "argv": args, "cwd": cwd}
+
+    def test_explicit_resume_then_restart_keeps_a_and_its_recorded_folder(self):
+        wi, sw = rem.wi, rem.sw
+        a_dir, b_dir = self.root / "project-a", self.root / "project-b"
+        a_dir.mkdir()
+        b_dir.mkdir()
+        first = wi.create_worker(self.ws, runtime="claude", cwd=str(a_dir),
+                                 tmux_socket=str(self.socket))
+        wid, a = first["worker_id"], first["runtime_session_id"]
+        wi.end_incarnation(self.ws, wid, first["incarnation_id"], "exited")
+        wi.record_session(self.ws, wid, "later-session-b", runtime="claude",
+                          relation=wi.RELATION_NEW, cwd=str(b_dir))
+        sw.pr.register_worker(self.ws, wid, "alpha", room="test-room", runtime="claude")
+        lineage, roster = wi.sessions(self.ws, wid), sw.pr.load_roster(self.ws)
+        spawned = self.call_main(sw, ["--resume", a, "--socket", str(self.socket)], "restart-spawn.json")
+        self.assertEqual(spawned["worker_id"], wid)
+        self.assertEqual(spawned["label"], "alpha")
+        name = wi.tmux_session_name(wid)
+        before = self.observe(name, a, a_dir)
+        os.kill(before["pid"], signal.SIGTERM)
+        self.wait_for(lambda: not self.alive(before["pid"]))
+        self.wait_for(lambda: sw.session_state(name, str(self.socket)) == "absent")
+        runs = wi.incarnations(self.ws, wid)
+        with mock.patch.dict(os.environ, {"SUTANDO_TMUX_SOCKET": str(self.root / "wrong.sock")}):
+            restarted = self.call_main(rem, ["--restart", wid], "restart-result.json")
+        self.assertEqual(restarted["result"], "restarted")
+        self.assertEqual(restarted["detail"]["session_id"], a)
+        after = self.observe(name, a, a_dir)
+        self.assertNotEqual(after["pid"], before["pid"])
+        now = wi.incarnations(self.ws, wid)
+        self.assertEqual(len(now), len(runs) + 1)
+        self.assertEqual(now[-1]["session_id"], a)
+        self.assertEqual(now[-1]["tmux"]["socket"], str(self.socket))
+        self.assertEqual(wi.sessions(self.ws, wid), lineage)
+        self.assertEqual(sw.pr.load_roster(self.ws), roster)
+        again = self.call_main(rem, ["--restart", wid], "restart-live.json")
+        self.assertEqual(again["result"], "already-running")
+        self.assertEqual(wi.incarnations(self.ws, wid), now)
+        self.assertEqual(self.observe(name, a, a_dir)["pid"], after["pid"])
+        (self.diagnostics / "restart-continuity.json").write_text(json.dumps({
+            "synthetic_endpoint": True, "socket": str(self.socket), "worker_id": wid,
+            "before": before, "after": after, "result": restarted, "already_running": again}, indent=2))
 
 
 class Restart(unittest.TestCase):

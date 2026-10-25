@@ -19,6 +19,11 @@ import time
 import unittest
 from pathlib import Path
 
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 REPO = Path(__file__).resolve().parent.parent
 
 # Point the bridge's dirs at a temp tree + pin the host label BEFORE importing,
@@ -292,7 +297,7 @@ class SingletonGlueTest(unittest.TestCase):
             rgb._release_singleton()
         finally:
             rgb._join_push_thread, rgb._ws_retain = orig_join, orig_retain
-        failed = [l for l in lines if "singleton: retain failed (locks dir unwritable)" in l]
+        failed = [l for l in lines if "singleton: retain failed (OSError at " in l and "unwritable" not in l]
         self.assertEqual(len(failed), 1, lines)
         self.assertEqual(json.loads(self._lockfile().read_text())["pid"], os.getpid())
 

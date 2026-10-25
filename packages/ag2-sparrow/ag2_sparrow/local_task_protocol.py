@@ -178,6 +178,8 @@ KNOWN_HEADER_KEYS = (
     # them, and the guard defangs forged body copies of the same names.
     "thread_ts", "reply_thread_ts", "reply_to_event", "reply_to_me", "reply_to_sender",
     "addressed_to", "callSid", "caller",
+    # The relay's judgement of a voice task: quick or long; the core dispatches on it.
+    "lane",
     # Thread membership, distinct from the reply target above; the room is
     # carried because a relation only resolves inside its own room.
     "thread_root", "source_room_id",
@@ -723,10 +725,9 @@ def index_result_candidates(results_dir: Path, task_ids) -> dict[str, list[Path]
                 if not name.endswith(".txt"):
                     continue
                 stem = name[:-4]
-                if stem in wanted:
-                    if e.is_file():
-                        out[stem].append(directory / name)
-                    continue
+                # One file can be one id's exact result AND another queued id's epoch re-archive.
+                if stem in wanted and e.is_file():
+                    out[stem].append(directory / name)
                 if epoch_forms:
                     cut = stem.rfind("-")
                     if cut > 0 and stem[:cut] in wanted and _EPOCH_SUFFIX_RE.match(stem[cut + 1:]) and e.is_file():

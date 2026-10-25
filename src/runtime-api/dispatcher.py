@@ -84,6 +84,7 @@ EXECUTORS = {
 # real credentials, so an ungated socket client must never reach the gateway
 # (review P1: omitting approvalRequestId silently skipped the gate).
 GOVERNED_ACTIONS = frozenset({"message.send"})
+MIRRORED_REQUEST_TYPES = frozenset({"approval", "elicitation", "human_action"})
 
 
 def _fingerprint(params: dict, *, include_task: bool = True) -> str:
@@ -153,7 +154,7 @@ class RuntimeDispatcher:
         approval by design."""
         n = relinked = 0
         for rec in self.store.pending():
-            if rec["requestType"] in ("approval", "elicitation", "human_action"):
+            if rec["requestType"] in MIRRORED_REQUEST_TYPES:
                 self._ha_of[rec["requestId"]] = ha_action_id(rec["requestId"])
                 relinked += 1
             elif rec["requestType"] == "capability":
@@ -173,6 +174,7 @@ class RuntimeDispatcher:
                                      "needs a new approval)"},
                     resolved_by="daemon-recovery")
                 n += 1
+        self._reconcile_expired()
         if relinked or n:
             _log(f"recovered {relinked} pending request(s)"
                  + (f", failed {n} interrupted capability execution(s)" if n else ""))
@@ -307,7 +309,10 @@ class RuntimeDispatcher:
                 return self.tasks.submit(params["task"],
                                          priority=params.get("priority") or "normal")
             if method == "task.list":
-                return self.tasks.list_tasks()
+                unfinished_only = params.get("unfinishedOnly", False)
+                if not isinstance(unfinished_only, bool):
+                    raise ProtocolError(-32602, "unfinishedOnly must be a boolean")
+                return self.tasks.list_tasks(unfinished_only=unfinished_only)
             if method == "task.list_results":
                 return self.tasks.list_results()
             if method == "task.get_result":
@@ -569,7 +574,12 @@ class RuntimeDispatcher:
         rec = self._require(params)
         self.store.transition(rec["requestId"], "cancelled",
                               resolved_by=self.actor_id)
-        return self._public(self.store.get(rec["requestId"]))
+        rec = self.store.get(rec["requestId"])
+        if rec["status"] == "cancelled" and rec["requestType"] in MIRRORED_REQUEST_TYPES:
+            # A previous mirror write may have failed, even before a restart.
+            self.ha.cancel(self._ha_of.get(rec["requestId"])
+                           or ha_action_id(rec["requestId"]))
+        return self._public(rec)
 
     def _require(self, params: dict) -> dict:
         rid = params.get("requestId")
@@ -590,6 +600,10 @@ class RuntimeDispatcher:
     # ── resolution mapping (ha decision → runtime terminal state) ──────────
     def _settle(self, request_id: str) -> None:
         rec = self.store.get(request_id)
+        if (rec and rec["status"] == "expired"
+                and rec["requestType"] in MIRRORED_REQUEST_TYPES):
+            self.ha.expire(request_id)
+            return
         if not rec or rec["status"] != "pending":
             return
         aid = self._ha_of.get(request_id)
@@ -631,9 +645,17 @@ class RuntimeDispatcher:
                                   result={"answer": answer},
                                   resolved_by=resolved_by)
 
+    def _reconcile_expired(self) -> None:
+        for rec in self.store.expired(MIRRORED_REQUEST_TYPES):
+            try:
+                self._settle(rec["requestId"])
+            except Exception as e:  # A failed mirror remains eligible on the next pass.
+                _log(f"requirement expiry error for {rec['requestId']} (isolated): {e}")
+
     async def resolver_loop(self) -> None:
         while True:
             try:
+                self._reconcile_expired()
                 for rec in self.store.pending():
                     self._settle(rec["requestId"])
             except Exception as e:  # noqa: BLE001 — resolver must never die

@@ -18,6 +18,12 @@ publish's commit is the rename of the record into place: if fsyncing the directo
 the record is published but its durability is uncertain, so publish returns Published(durable=False)
 and logs a warning. Every entry point checks the platform before touching the filesystem.
 
+The record is schema 2: its top-level pid/start name the process whose liveness fences the root (the
+owner until attach_consumer, the attached consumer after), owner_pid/owner_start the holder itself.
+attach_consumer and tombstone_consumer are compare-and-swaps on the record's bytes; occupancy is the
+one tri-state reader (free | held | unobserved) with the sticky rule: a live or unverifiable holder
+or consumer is never free. A schema-1 record keeps its meaning.
+
 Threat model: this module defends against other processes, other owners, and stale or copied Owner
 objects. It does not defend against code in the owning process that closes, dup2s or reopens this
 module's descriptors. One cheap check covers the lock itself: publish and release first try a
@@ -54,14 +60,20 @@ try:
 except ImportError:  # pragma: no cover - Windows
     pwd = None
 
-SCHEMA = 1
+SCHEMA = 2
 MAX_STR_BYTES = 512
 LOCK_NAME = "lock"
 HOLDER_NAME = "holder"
 WAITING_PREFIX = "waiting."
 LEGACY_PIDFILE = os.path.join("state", "connector.pid")
 LEGACY_FRESH_S = 30
-RECORD_FIELDS = ("schema", "adapter", "pid", "start", "host", "install_id", "lock", "acquired_at")
+RECORD_FIELDS_V1 = ("schema", "adapter", "pid", "start", "host", "install_id", "lock", "acquired_at")
+# Schema 2: top-level pid/start name the process whose liveness fences the root (the owner until
+# attach_consumer, the consumer after); owner_pid/owner_start stay the holder's own identity.
+RECORD_FIELDS = RECORD_FIELDS_V1 + ("owner_pid", "owner_start", "consumer", "tombstone")
+CONSUMER_FIELDS = ("pid", "start")
+TOMBSTONE_FIELDS = ("at", "by", "reason")
+TOMBSTONE_RECHECK_S = 1.0
 NETWORK_FS = frozenset(("nfs", "nfs4", "cifs", "smbfs", "smb2", "smb3", "afpfs", "webdav", "davfs",
                         "sshfs", "9p", "ceph", "glusterfs", "lustre", "ncpfs", "fuse", "fuseblk"))
 UNSUPPORTED = "unsupported platform: holder_lock is POSIX-only"
@@ -243,6 +255,16 @@ def start_time(pid: int) -> Optional[str]:
         return None
 
 
+def parent_pid(pid: int) -> Optional[int]:
+    """The parent pid of a running process, read with ps; None if unseen."""
+    try:
+        out = subprocess.run(["ps", "-o", "ppid=", "-p", str(int(pid))], capture_output=True, text=True,
+                             env={"PATH": "/bin:/usr/bin", "LC_ALL": "C"}, timeout=10).stdout.strip()
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    return int(out) if out.isdigit() else None
+
+
 def _pid_alive(pid: int) -> Optional[bool]:
     try:
         os.kill(pid, 0)
@@ -324,15 +346,17 @@ def _int(value) -> bool:
 
 
 def _record_problem(rec) -> Optional[str]:
-    """Why `rec` is not a valid schema-1 holder record, or None."""
+    """Why `rec` is not a valid schema-1 or schema-2 holder record, or None."""
     if not isinstance(rec, dict):
         return "the record is not a JSON object"
-    if not _int(rec.get("schema")) or rec.get("schema") != SCHEMA:
-        return "unsupported schema %r" % (rec.get("schema"),)
-    missing = [f for f in RECORD_FIELDS if f not in rec]
+    schema = rec.get("schema")
+    if not _int(schema) or schema not in (1, SCHEMA):
+        return "unsupported schema %r" % (schema,)
+    fields = RECORD_FIELDS_V1 if schema == 1 else RECORD_FIELDS
+    missing = [f for f in fields if f not in rec]
     if missing:
         return "missing fields %s" % missing
-    unknown = set(rec) - set(RECORD_FIELDS)
+    unknown = set(rec) - set(fields)
     if unknown:
         return "unknown fields %s" % sorted(unknown)
     if not (_int(rec["pid"]) and rec["pid"] > 0):
@@ -345,7 +369,34 @@ def _record_problem(rec) -> Optional[str]:
             return "%s is not a non-empty string of at most 512 bytes" % name
     if not (isinstance(rec["acquired_at"], float) and math.isfinite(rec["acquired_at"])):
         return "acquired_at is not a finite float"
+    if schema == 1:
+        return None
+    if not (_int(rec["owner_pid"]) and rec["owner_pid"] > 0):
+        return "owner_pid is not a positive int"
+    if not _short_str(rec["owner_start"]):
+        return "owner_start is not a non-empty string of at most 512 bytes"
+    consumer, tombstone = rec["consumer"], rec["tombstone"]
+    if consumer is not None and not (isinstance(consumer, dict) and tuple(sorted(consumer)) == CONSUMER_FIELDS
+                                     and _int(consumer["pid"]) and consumer["pid"] > 0
+                                     and _short_str(consumer["start"])):
+        return "consumer is not null or {pid: positive int, start: str}"
+    if tombstone is not None and not (isinstance(tombstone, dict) and tuple(sorted(tombstone)) == TOMBSTONE_FIELDS
+                                      and _short_str(tombstone["by"]) and _short_str(tombstone["reason"])
+                                      and isinstance(tombstone["at"], float) and math.isfinite(tombstone["at"])):
+        return "tombstone is not null or {by: str, at: float, reason: str}"
     return None
+
+
+def holder_identity(rec: dict) -> tuple:
+    """(pid, start) of the record's holder: its own identity, whichever process fences the root."""
+    if rec.get("schema") == SCHEMA:
+        return rec["owner_pid"], rec["owner_start"]
+    return rec["pid"], rec["start"]
+
+
+def consumer_of(rec: dict) -> Optional[dict]:
+    """The attached consumer of a schema-2 record, or None."""
+    return rec.get("consumer") if rec.get("schema") == SCHEMA else None
 
 
 def _classify(raw: bytes) -> Prior:
@@ -409,16 +460,42 @@ def _pids_in(raw: bytes):
     return []
 
 
+def _occupant(prior: Prior):
+    """(state, reason) of what a prior names: free (nobody live), held (a live process) or
+    unobserved (a process that cannot be verified). A live or unverifiable consumer counts like the
+    holder: the sticky rule, so a root with a surviving consumer is never free."""
+    if isinstance(prior, Valid):
+        rec = prior.record
+        pid, start = holder_identity(rec)
+        seen = verify_lineage(pid, start, rec["host"])
+        if seen is True:
+            return "held", "live holder"
+        if seen is None:
+            return "unobserved", "unobserved"
+        consumer = consumer_of(rec)
+        if consumer is not None:
+            seen = verify_lineage(consumer["pid"], consumer["start"], rec["host"])
+            if seen is True:
+                return "held", "live consumer"
+            if seen is None:
+                return "unobserved", "unobserved consumer"
+        return "free", None
+    if isinstance(prior, Invalid):
+        state = "free"
+        for pid, start in _pids_in(prior.raw_bytes):
+            seen = verify_lineage(pid, start)
+            if seen is True:
+                return "held", "invalid record naming a live or unobserved pid"
+            if seen is None:
+                state = "unobserved"
+        if state != "free":
+            return state, "invalid record naming a live or unobserved pid"
+    return "free", None
+
+
 def _prior_refusal(prior: Prior) -> Optional[str]:
     """The Held reason a prior gives, or None when it names no live or unobserved process."""
-    if isinstance(prior, Valid):
-        seen = verify_lineage(prior.record["pid"], prior.record["start"], prior.record["host"])
-        return "live holder" if seen is True else "unobserved" if seen is None else None
-    if isinstance(prior, Invalid):
-        for pid, start in _pids_in(prior.raw_bytes):
-            if verify_lineage(pid, start) is not False:
-                return "invalid record naming a live or unobserved pid"
-    return None
+    return _occupant(prior)[1]
 
 
 def _legacy_finding(root: str, root_fd: Optional[int] = None):
@@ -842,7 +919,11 @@ def _write_record(owner: Owner, rec: dict) -> bool:
     """Write the record; the rename is the commit. True when the directory fsync after it also
     succeeded; LockError when anything before the rename failed: no record is published, though a
     temp whose cleanup also failed may remain; each later publish tries to remove it (logged if not)."""
-    dfd = owner.dir_fd
+    return _write_record_at(owner.dir_fd, owner.lock_id, owner.directory, rec)
+
+
+def _write_record_at(dfd: int, lock_id, directory: str, rec: dict) -> bool:
+    """The one record writer, through an open lock-directory fd: scan, temp, write, fsync, rename."""
     try:
         names = os.listdir(dfd)
     except OSError as e:
@@ -853,7 +934,7 @@ def _write_record(owner: Owner, rec: dict) -> bool:
                 os.unlink(name, dir_fd=dfd)
             except OSError as e:
                 _LOG.warning("a leftover holder temp %s could not be removed (%s); it stays", name, e)
-    tmp = ".%s.%d-%d.tmp" % (HOLDER_NAME, owner.lock_id[0], owner.lock_id[1])
+    tmp = ".%s.%d-%d.tmp" % (HOLDER_NAME, lock_id[0], lock_id[1])
     data = json.dumps(rec, sort_keys=True, ensure_ascii=True).encode("ascii")
     try:
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | _NOFOLLOW | _CLOEXEC, 0o600, dir_fd=dfd)
@@ -874,9 +955,29 @@ def _write_record(owner: Owner, rec: dict) -> bool:
         os.fsync(dfd)
     except OSError as e:
         _LOG.warning("holder record published in %s, but its directory fsync failed (%s): durability "
-                     "is uncertain", owner.directory, e)
+                     "is uncertain", directory, e)
         return False
     return True
+
+
+def _raw_record(dfd: int) -> Optional[bytes]:
+    """The record's bytes through an open lock-directory fd; None when there is none."""
+    try:
+        fd = os.open(HOLDER_NAME, os.O_RDONLY | _NOFOLLOW | _CLOEXEC, dir_fd=dfd)
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        raise LockError("cannot read the holder record: %s" % e)
+    with os.fdopen(fd, "rb") as f:
+        return f.read()
+
+
+def _copy(rec: dict) -> dict:
+    out = dict(rec, lock=dict(rec["lock"]))
+    for name in ("consumer", "tombstone"):
+        if isinstance(out.get(name), dict):
+            out[name] = dict(out[name])
+    return out
 
 
 def publish(owner: Owner, adapter: str) -> Published:
@@ -892,30 +993,143 @@ def publish(owner: Owner, adapter: str) -> Published:
         _lock_still_held(owner)
         rec = {"schema": SCHEMA, "adapter": adapter, "pid": owner.pid, "start": owner.start, "host": _host(),
                "install_id": owner.install_id, "lock": {"dev": owner.lock_id[0], "ino": owner.lock_id[1]},
-               "acquired_at": float(owner.acquired_at)}
+               "acquired_at": float(owner.acquired_at), "owner_pid": owner.pid, "owner_start": owner.start,
+               "consumer": None, "tombstone": None}
         problem = _record_problem(rec)
         if problem:
             raise LockError("invalid record: %s" % problem)
         durable = _write_record(owner, rec)
         owner.published = True
-        return Published(dict(rec, lock=dict(rec["lock"])), durable=durable)
+        return Published(_copy(rec), durable=durable)
+
+
+def _own_record(owner: Owner, raw: Optional[bytes]) -> dict:
+    """The schema-2 record this owner published, parsed from `raw`; LockError when it is not."""
+    prior = _classify(raw) if raw is not None else Missing()
+    if not isinstance(prior, Valid) or prior.record["schema"] != SCHEMA \
+            or holder_identity(prior.record) != (owner.pid, owner.start) \
+            or (prior.record["lock"]["dev"], prior.record["lock"]["ino"]) != tuple(owner.lock_id):
+        raise LockError("not this owner's record")
+    return prior.record
+
+
+def attach_consumer(owner: Owner, expected: bytes, *, pid: int, start: str) -> Published:
+    """Compare-and-swap by the holder: while the record's bytes still equal `expected` and `pid` is
+    this owner's live child (ps ppid, and the start given), write the consumer and move the top-level
+    pid/start to it, so its liveness fences the root from here on.
+    Under the module guard and the §1.8 lock check; a record that changed is LockError("record
+    changed"), nothing written."""
+    _check_owner(owner)
+    with _guarded:
+        _held_fds(owner)
+        if not owner.published:
+            raise LockError("not published")
+        if not (_same_at(owner.fd, owner.dir_fd, LOCK_NAME) and _dir_unchanged(owner.directory, owner.dir_fd)):
+            raise LockError("replaced")
+        _lock_still_held(owner)
+        raw = _raw_record(owner.dir_fd)
+        if raw != expected:
+            raise LockError("record changed")
+        rec = _own_record(owner, raw)
+        if rec["consumer"] is not None:
+            raise LockError("consumer attached")
+        if parent_pid(pid) != owner.pid or verify_lineage(pid, start) is not True:
+            raise LockError("not the holder's live child")
+        rec = dict(rec, pid=pid, start=start, consumer={"pid": pid, "start": start})
+        problem = _record_problem(rec)
+        if problem:
+            raise LockError("invalid record: %s" % problem)
+        durable = _write_record(owner, rec)
+        return Published(_copy(rec), durable=durable)
+
+
+def _proven_dead(rec: dict) -> bool:
+    """Both the holder and the consumer verify False, twice, TOMBSTONE_RECHECK_S apart."""
+    consumer = rec["consumer"]
+    for i in range(2):
+        if i:
+            time.sleep(TOMBSTONE_RECHECK_S)
+        if verify_lineage(rec["owner_pid"], rec["owner_start"], rec["host"]) is not False:
+            return False
+        if verify_lineage(consumer["pid"], consumer["start"], rec["host"]) is not False:
+            return False
+    return True
+
+
+def tombstone_consumer(work_root, expected: bytes, *, by: str, reason: str) -> Published:
+    """Compare-and-swap by a launcher that proved the pair gone: under the lock directory's flock,
+    while the record's bytes still equal `expected` and its holder and consumer both verify dead
+    twice, write consumer null and the tombstone, and fence the root by the dead holder again. The
+    record is never removed; a held flock, a changed record or a live or unobserved process is a
+    LockError with nothing written."""
+    _platform()
+    directory = lock_dir(work_root)
+    dfd = os.open(directory, _DIR_FLAGS)
+    try:
+        try:
+            fd = os.open(LOCK_NAME, os.O_RDWR | _NOFOLLOW | _CLOEXEC, dir_fd=dfd)
+        except OSError as e:
+            raise LockError("no lock to take: %s" % e)
+        try:
+            if not file_lock.try_lock_fd(fd):
+                raise LockError("held")
+            try:
+                raw = _raw_record(dfd)
+                if raw != expected:
+                    raise LockError("record changed")
+                prior = _classify(raw) if raw is not None else Missing()
+                if not isinstance(prior, Valid) or prior.record["schema"] != SCHEMA:
+                    raise LockError("not a schema-%d record" % SCHEMA)
+                rec = prior.record
+                if rec["consumer"] is None:
+                    raise LockError("no consumer")
+                if not _proven_dead(rec):
+                    raise LockError("not proven dead")
+                if not (_same_at(fd, dfd, LOCK_NAME) and _dir_unchanged(directory, dfd)):
+                    raise LockError("replaced")
+                if _raw_record(dfd) != expected:
+                    raise LockError("record changed")
+                st = os.fstat(fd)
+                rec = dict(rec, pid=rec["owner_pid"], start=rec["owner_start"], consumer=None,
+                           tombstone={"by": by, "at": time.time(), "reason": reason})
+                problem = _record_problem(rec)
+                if problem:
+                    raise LockError("invalid record: %s" % problem)
+                durable = _write_record_at(dfd, (st.st_dev, st.st_ino), directory, rec)
+                return Published(_copy(rec), durable=durable)
+            finally:
+                file_lock.unlock_fd(fd)
+        finally:
+            os.close(fd)
+    finally:
+        os.close(dfd)
 
 
 def release(owner: Owner) -> Released:
     """Under the module guard: validate the handle, remove the record only if it names this owner,
-    unlock and close (the root fd last), and only then mark released. Owner pid only."""
+    unlock and close (the root fd last), and only then mark released. Owner pid only. A record whose
+    attached consumer verifies alive or unobserved is LockError("consumer alive") with nothing
+    removed, unlocked or closed: the owner keeps the flock until it exits, and the record keeps
+    fencing the root by the consumer after that."""
     global _OWNER
     _check_owner(owner)
     with _guarded:
         _held_fds(owner)
         if _same_at(owner.fd, owner.dir_fd, LOCK_NAME):
             _lock_still_held(owner)
+            try:
+                prior = _read_prior(owner.dir_fd)
+            except (OSError, UnicodeError, ValueError):
+                prior = None
+            consumer = consumer_of(prior.record) if isinstance(prior, Valid) else None
+            if consumer is not None and holder_identity(prior.record) == (owner.pid, owner.start) \
+                    and verify_lineage(consumer["pid"], consumer["start"], prior.record["host"]) is not False:
+                raise LockError("consumer alive")
         removed = False
         try:
             if _same_at(owner.fd, owner.dir_fd, LOCK_NAME):
                 prior = _read_prior(owner.dir_fd)
-                if isinstance(prior, Valid) and prior.record["pid"] == owner.pid \
-                        and prior.record["start"] == owner.start \
+                if isinstance(prior, Valid) and holder_identity(prior.record) == (owner.pid, owner.start) \
                         and (prior.record["lock"]["dev"], prior.record["lock"]["ino"]) == tuple(owner.lock_id):
                     os.unlink(HOLDER_NAME, dir_fd=owner.dir_fd)
                     removed = True
@@ -937,6 +1151,43 @@ def release(owner: Owner) -> Released:
 
 # ── status ───────────────────────────────────────────────────────────────────
 
+def occupancy(work_root) -> str:
+    """free | held | unobserved: the one tri-state reader every free-root check uses. The flock is
+    probed non-blocking and released at once; a free flock is still `held` or `unobserved` while
+    the record names a live or unverifiable holder or consumer (the sticky rule), and free only
+    when nobody it names can be alive. A root with no lock dir is free; what cannot be read is
+    unobserved. Read-only."""
+    _platform()
+    try:
+        directory = lock_dir(work_root)
+    except FileNotFoundError:
+        return "free"
+    except OSError:
+        return "unobserved"
+    try:
+        fd = os.open(os.path.join(directory, LOCK_NAME), os.O_RDONLY | _CLOEXEC)
+    except FileNotFoundError:
+        return "free"
+    except OSError:
+        return "unobserved"
+    try:
+        try:
+            if not file_lock.try_lock_fd(fd):
+                return "held"
+            file_lock.unlock_fd(fd)
+        except OSError:
+            return "unobserved"
+    finally:
+        os.close(fd)
+    try:
+        prior = _read_prior(directory)
+    except OSError:
+        return "unobserved"
+    except (UnicodeError, ValueError) as e:
+        prior = Invalid("not a valid record (%s)" % e.__class__.__name__, b"")
+    return _occupant(prior)[0]
+
+
 def _waiter_live(directory: str, pid: int) -> bool:
     try:
         with open(os.path.join(directory, "%s%d" % (WAITING_PREFIX, pid)), encoding="utf-8") as f:
@@ -953,10 +1204,10 @@ def status(work_root) -> dict:
     try:
         directory = lock_dir(root)
     except FileNotFoundError:
-        return {"lock_dir": None, "record": {"kind": "missing"}, "holder_lineage": None, "waiters": [],
-                "stale_waiters": [], "legacy": None, "warnings": []}
-    out = {"lock_dir": directory, "record": None, "holder_lineage": None, "waiters": [], "stale_waiters": [],
-           "legacy": None, "warnings": []}
+        return {"lock_dir": None, "record": {"kind": "missing"}, "holder_lineage": None, "consumer_lineage": None,
+                "waiters": [], "stale_waiters": [], "legacy": None, "warnings": []}
+    out = {"lock_dir": directory, "record": None, "holder_lineage": None, "consumer_lineage": None, "waiters": [],
+           "stale_waiters": [], "legacy": None, "warnings": []}
     try:
         prior = _read_prior(directory)
     except OSError as e:
@@ -968,7 +1219,11 @@ def status(work_root) -> dict:
         out["record"] = {"kind": "invalid", "reason": prior.reason}
     elif isinstance(prior, Valid):
         out["record"] = {"kind": "valid", "record": prior.record}
-        out["holder_lineage"] = verify_lineage(prior.record["pid"], prior.record["start"], prior.record["host"])
+        pid, start = holder_identity(prior.record)
+        out["holder_lineage"] = verify_lineage(pid, start, prior.record["host"])
+        consumer = consumer_of(prior.record)
+        if consumer is not None:
+            out["consumer_lineage"] = verify_lineage(consumer["pid"], consumer["start"], prior.record["host"])
     owner = _OWNER
     if owner is not None and not owner.released and owner.pid == os.getpid() and owner.directory == directory:
         out["root_unchanged"] = _root_unchanged(owner.path or owner.root, owner.root, owner.root_fd)

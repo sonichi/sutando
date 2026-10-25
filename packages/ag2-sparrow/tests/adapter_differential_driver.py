@@ -212,9 +212,11 @@ def codex(work, calls, extra=()):
     log, tee = work.parent / (work.name + ".rpc"), work.parent / (work.name + ".tee.py")
     tee.write_text(TEE)
     stub = os.path.join(os.path.dirname(cc.__file__), "stub_app_server.py")
-    cc.server_argv = lambda server: [sys.executable, str(tee), str(log), stub]
+    cc.server_argv = lambda server, codex="codex": [sys.executable, str(tee), str(log), stub]
     with contextlib.redirect_stderr(io.StringIO()):
-        rc = cc.main(["--server", "stub", "--work", str(work), "--poll", "0.01", *extra])
+        # --allow-non-owner restores the pre-gate serving set, so the recording still compares every
+        # served path byte for byte; the gate itself is pinned in test_codex_connector.
+        rc = cc.main(["--server", "stub", "--work", str(work), "--poll", "0.01", "--allow-non-owner", *extra])
     if log.exists():
         calls += [{"method": m["method"], "params": m.get("params")}
                   for m in map(json.loads, log.read_text().splitlines()) if m.get("method")]

@@ -8,10 +8,12 @@ daemon, or the stub in this directory. Each `tasks/task-*.txt` becomes one
 `results/task-<id>.txt`. `--push` instead hands the wrapped text to `codex queue`,
 which delivers into a thread owned by a running interactive TUI. Stdlib only.
 
-Tier policy, from the attested headers: an owner task runs on a durable thread kept
-per channel_id (state/threads/<key>) with the configured sandbox; any other tier
-runs on its own ephemeral thread, read-only, with the Hatch adapter's NON_OWNER_NOTE
-in the prompt, and is refused by --push. The tier is never taken from message text.
+Tier policy, from the attested headers (task_io.admission): an owner task runs on a
+durable thread kept per channel_id (state/threads/<key>) with the configured sandbox;
+an attested collaborator, or any non-owner under --allow-non-owner, runs on its own
+ephemeral thread, read-only, with the shared NON_OWNER_NOTE in the prompt, and is
+refused by --push; every other non-owner gets NON_OWNER_REFUSED as its result. The
+tier is never taken from message text.
 """
 import argparse
 import hashlib
@@ -27,15 +29,19 @@ import time
 import uuid
 
 from ...relay_loop import count_arg
-from ...task_io import (DONE_KEEP, NON_OWNER_NOTE, LockRefused, acquire_lock, attested_headers,  # noqa: F401
-                        exit_on_sigterm, load_done, make_dirs, non_owner_note, parse_task, pid_alive,
-                        exit_code, record_done, release_lock, root_path, stop_requested, write_atomic)
+from ...task_io import (DONE_KEEP, NON_OWNER_NOTE, NON_OWNER_REFUSED, LockRefused, acquire_lock,  # noqa: F401
+                        admission, attested_headers, exit_on_sigterm, holder_consumer, load_done, make_dirs,
+                        non_owner_note, parse_task, pid_alive, exit_code, record_done, release_lock, root_path,
+                        start_time, stop_requested, write_atomic)
 
 CLIENT = {"name": "ag2-sparrow-codex", "version": "0.1.0"}
 APPROVAL_REQUESTS = ("item/commandExecution/requestApproval", "item/fileChange/requestApproval",
                      "item/permissions/requestApproval", "execCommandApproval", "applyPatchApproval")
 NON_OWNER_SANDBOX = "read-only"
 NO_REPLY = "[no reply] Codex completed the turn without a message."
+# --held: the launcher that spawned this process holds the work root and attaches it as the consumer
+# whose liveness fences the root; the connector waits this long for that record, then refuses.
+HELD_WAIT_S = 30.0
 
 
 def log(*a):
@@ -43,7 +49,10 @@ def log(*a):
 
 
 def child_env():
-    return {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": os.environ.get("HOME", "")}
+    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": os.environ.get("HOME", "")}
+    if os.environ.get("CODEX_HOME"):
+        env["CODEX_HOME"] = os.environ["CODEX_HOME"]      # the login's home, when the launcher names one
+    return env
 
 
 def channel_key(channel_id):
@@ -182,8 +191,14 @@ class Connector:
         else:
             self.rpc.respond(rid, {})
 
+    def turn_cwd(self, owner):
+        """The working directory of a turn, decided per turn: the owner's configured one, else the held
+        root's current pathname (a resumed thread keeps its own cwd otherwise, so a root renamed after
+        the thread opened would leave later turns at the old pathname); a non-owner's scratch dir."""
+        return (self.args.cwd or os.getcwd()) if owner else self.scratch_cwd
+
     def thread_params(self, owner):
-        p = {"cwd": self.args.cwd if owner else self.scratch_cwd, "approvalPolicy": "never",
+        p = {"cwd": self.turn_cwd(owner), "approvalPolicy": "never",
              "sandbox": self.args.sandbox if owner else NON_OWNER_SANDBOX}
         if self.args.model:
             p["model"] = self.args.model
@@ -303,13 +318,17 @@ class Connector:
             elif meth == "error":
                 log("error notification", json.dumps(p)[:300])
 
-    def run_turn(self, prompt, model=None):
+    def run_turn(self, prompt, model=None, cwd=None):
         """Submit one turn and block until it is over. A turn past --turn-timeout is
         interrupted; if it still does not complete within the grace, the server is
-        replaced, so the next task never shares the thread with a live turn."""
+        replaced, so the next task never shares the thread with a live turn. `cwd` is
+        the turn's working directory (the 0.160.1 turn/start override), never the
+        thread's remembered one."""
         params = {"threadId": self.thread_id, "input": [{"type": "text", "text": prompt}]}
         if model:
             params["model"] = model
+        if cwd:
+            params["cwd"] = cwd
         res = self.rpc.request("turn/start", params)
         turn_id = res["turn"]["id"]
         done = self.wait_turn(turn_id, self.args.turn_timeout)
@@ -338,7 +357,7 @@ class Connector:
         for attempt in (1, 2):
             self.open_for(headers)
             self.last_thread = self.thread_id
-            status, text, err = self.run_turn(prompt, self.args.model)
+            status, text, err = self.run_turn(prompt, self.args.model, self.turn_cwd(owner))
             if status == "server-exited":
                 self.restart_server()
                 if owner and attempt == 1:
@@ -397,6 +416,13 @@ class Connector:
             t_mtime = os.stat(path).st_mtime
             t_seen = time.time()
             headers, message, operator_lines = parse_task(path)
+            if admission(headers, self.args.allow_non_owner) is None:
+                log("refused (non-owner, --allow-non-owner not set) ->", task_id, headers["access_tier"])
+                write_atomic(os.path.join(self.args.results, name), NON_OWNER_REFUSED)
+                record_done(done_path, task_id)
+                done += 1
+                idle_since = time.time()
+                continue
             prompt = wrap_untrusted(task_id, headers, message, operator_lines, self.note)
             log("turn ->", task_id, headers["access_tier"], repr(message[:60]))
             t_sent = time.time()
@@ -420,10 +446,11 @@ class Connector:
             idle_since = time.time()
 
 
-def server_argv(server):
+def server_argv(server, codex="codex"):
+    """`codex` is the executable as configured: an exact path runs that program, whatever PATH holds."""
     here = os.path.dirname(os.path.abspath(__file__))
-    return {"stdio": ["codex", "app-server", "--listen", "stdio://"],
-            "proxy": ["codex", "app-server", "proxy"],
+    return {"stdio": [codex, "app-server", "--listen", "stdio://"],
+            "proxy": [codex, "app-server", "proxy"],
             "stub": [sys.executable, os.path.join(here, "stub_app_server.py")]}[server]
 
 
@@ -448,10 +475,24 @@ def build_parser():
     ap.add_argument("--server", choices=["stdio", "proxy", "stub"], default="stdio",
                     help="stdio: own codex app-server; proxy: shared daemon via `codex app-server proxy`; stub: local fake")
     ap.add_argument("--work", help="dir holding tasks/ results/ state/ (required unless --push)")
+    ap.add_argument("--held", action="store_true",
+                    help="the work root's lock is held by the launcher that spawned this process and attaches it as "
+                         "the consumer; take no lock, refuse unless that record names this process (needs --root-fd)")
+    ap.add_argument("--root-fd", type=int, default=None,
+                    help="with --held: the held work root's directory descriptor the launcher passed; this process "
+                         "fchdirs into it and reads tasks/, results/ and state/ relative to it, so a renamed or "
+                         "replaced pathname never reaches it")
     ap.add_argument("--cwd", default=None, help="thread cwd (default: --work)")
+    ap.add_argument("--codex", default="codex", help="the codex executable the app-server is started from (default: "
+                                                     "codex on PATH; a launcher passes the exact path it checked)")
     ap.add_argument("--model", default=None)
     ap.add_argument("--sandbox", default=NON_OWNER_SANDBOX, choices=["read-only", "workspace-write", "danger-full-access"],
                     help="sandbox for OWNER threads; every other tier is always read-only")
+    ap.add_argument("--allow-non-owner", action="store_true",
+                    help="serve tasks from non-owner senders without collaborator access too (guests, and any "
+                         "collaborator claim the broker did not attest), each on its own ephemeral read-only "
+                         "thread. Off by default: they are refused with a plain line. An attested collaborator "
+                         "never needs it: it always gets that ephemeral read-only thread.")
     ap.add_argument("--thread-id", default=None, metavar="CHANNEL_ID=THREAD",
                     help="resume THREAD for exactly this owner channel when it has no saved thread yet")
     ap.add_argument("--ephemeral", action="store_true", help="owner threads too: do not persist to the Codex home")
@@ -478,6 +519,10 @@ def main(argv=None):
     cwd_given = args.cwd
     args.work = os.path.abspath(args.work)
     exit_on_sigterm()
+    if args.held:
+        if args.root_fd is None:
+            build_parser().error("--held needs --root-fd, the launcher's descriptor of the held root")
+        return serve_held(args, cwd_given)
     try:
         owner = acquire_lock(args.work, "codex")
     except LockRefused as e:
@@ -498,8 +543,42 @@ def main(argv=None):
         release_lock(owner)
 
 
+def serve_held(args, cwd_given):
+    """Under a launcher: no lock of our own, the dirs the holder made, and a start only once the
+    holder's record names this process as the consumer (a hand start with --held is refused). The
+    process lives inside the held inode (fchdir on --root-fd) and names tasks/, results/ and state/
+    relative to it: the pathname the launcher saw may be renamed or replaced, this inode cannot."""
+    try:
+        os.fchdir(args.root_fd)
+    except OSError as e:
+        sys.stderr.write("refusing to start: --root-fd %d is not the held root's directory (%s)\n" % (args.root_fd, e))
+        return 2
+    args.work = "."     # the held inode, wherever its pathname goes
+    deadline = time.monotonic() + HELD_WAIT_S
+    while True:
+        consumer = holder_consumer(args.work)
+        if consumer and consumer.get("pid") == os.getpid():
+            # The record must name this incarnation (pid and start) and verify it alive: a stale record
+            # naming a reused pid, or one whose lineage cannot be read, serves nothing.
+            if consumer.get("live") is True and consumer.get("start") == start_time(os.getpid()):
+                break
+            why = ("a start time that is not this process's" if consumer.get("start") != start_time(os.getpid())
+                   else "liveness unknown" if consumer.get("live") is None else "liveness false")
+            sys.stderr.write("refusing to start: --held, but the holder of %s names this pid with %s, not verified\n"
+                             % (os.getcwd(), why))
+            return 2
+        if stop_requested() or time.monotonic() >= deadline:
+            sys.stderr.write("refusing to start: --held, but no holder of %s attached this process\n" % os.getcwd())
+            return 2
+        time.sleep(0.05)
+    args.inbox, args.results, args.state = "tasks", "results", "state"
+    # The owner thread's cwd is a pathname by protocol: None here means the inode's current one, per turn.
+    args.cwd = os.path.abspath(cwd_given) if cwd_given else None
+    return exit_code(serve_locked(args))
+
+
 def serve_locked(args):
-    argv_srv = server_argv(args.server)
+    argv_srv = server_argv(args.server, args.codex)
     stderr_path = os.path.join(args.state, "app-server-%s.stderr" % args.server)
 
     def factory():

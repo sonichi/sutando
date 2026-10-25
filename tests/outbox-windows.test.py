@@ -12,6 +12,11 @@ import time
 import unittest
 from unittest.mock import Mock, patch
 
+from _helpers.hermetic_env import hermetic_env, isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "src"))
 import outbox as ob
@@ -60,9 +65,7 @@ class WindowsOutbox(unittest.TestCase):
             ("D", "import runpy; runpy.run_path('src/remote-gateway-bridge.py', run_name='gateway_import_test')", None),
         ]
         with tempfile.TemporaryDirectory() as tmp:
-            env = {key: value for key, value in os.environ.items()
-                   if key.upper() != "PYTHONPATH"
-                   and not key.upper().startswith(("REMOTE_", "AG2_", "AGENT_CONNECT_"))}
+            env = hermetic_env()
             env.update(SUTANDO_TEST_MODE="1", SUTANDO_WORKSPACE=tmp, PYTHONUTF8="1",
                        CLAUDE_CONFIG_DIR=str(Path(tmp) / "config"), USERPROFILE=tmp,
                        REMOTE_TASK_TOKEN="a3-import-test", REMOTE_TASK_URL="https://example.invalid")

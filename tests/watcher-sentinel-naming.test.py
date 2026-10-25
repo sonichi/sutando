@@ -14,6 +14,12 @@ registry already share. An earlier revision of this file keyed on an invented
 with each other and disagreed with production, which is why "the two agree" is
 no longer an assertion here.
 """
+
+from _helpers.hermetic_env import isolate_os_environ, isolated_child_env
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import json
 import os
@@ -32,7 +38,7 @@ SHELL = ROOT / "src" / "watcher_sentinel.sh"
 
 
 def _sh(fn: str, *args: str, env: "dict | None" = None) -> str:
-    e = {**os.environ, **(env or {})}
+    e = {**isolated_child_env(), **(env or {})}
     e.pop("SUTANDO_INSTANCE", None) if env is None else None
     out = subprocess.run(
         ["bash", "-c", f'source "{SHELL}"; {fn} ' + " ".join(f'"{a}"' for a in args)],

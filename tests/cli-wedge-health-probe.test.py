@@ -2,6 +2,12 @@
 """health-check's cli-wedge probe: absent socket / unreadable pane are readings
 of nothing (ok), a static pane with work outstanding warns, a retry loop warns,
 and idle never does. The tmux and heartbeat seams are replaced with fakes."""
+
+from _helpers.hermetic_env import isolate_os_environ, isolated_child_env
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import json
 import os
@@ -86,7 +92,7 @@ class CliWedgeProbe(unittest.TestCase):
         else:
             self.tmux = script
         hc._resolve_tmux_bin = lambda *a, **k: str(self.tmux)
-        hc._resolve_launch_env = lambda: dict(os.environ)
+        hc._resolve_launch_env = lambda: isolated_child_env()
 
     def write_alive(self, label, socket, session):
         import time as _time

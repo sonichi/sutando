@@ -31,6 +31,11 @@ import unittest
 import urllib.error
 from unittest import mock
 
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 SKILL = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                      "skills", "agent-room-ops")
 sys.path.insert(0, SKILL)

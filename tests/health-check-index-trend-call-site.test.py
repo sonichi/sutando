@@ -12,6 +12,12 @@ with no git history (a supported single-machine configuration, where every path
 in the helper yields the marker), and pins both directions: present on the
 near-limit warn, absent from the clean ok.
 """
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import os
 import sys

@@ -10,6 +10,12 @@ fail-closed branch under an injected resolver.
 
 Run: python3 tests/discord-reader-merge.test.py
 """
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import json
 import os

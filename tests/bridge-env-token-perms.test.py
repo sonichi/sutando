@@ -34,6 +34,11 @@ Exit code: 0 on pass / skip, 1 on fail.
 
 from __future__ import annotations
 
+from _helpers.hermetic_env import isolate_os_environ, isolated_child_env
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import os
 import stat
@@ -153,7 +158,7 @@ def _run_case(
     non-chmod-able but readable token file no longer crashes the bridge at
     startup. In that mode the file stays 0644 (chmod never applied)."""
     fails: list[str] = []
-    saved_env = dict(os.environ)
+    saved_env = isolated_child_env()
     saved_modules = {
         k: sys.modules.get(k)
         for k in ("discord", "slack_bolt", "slack_bolt.adapter", "slack_bolt.adapter.socket_mode")

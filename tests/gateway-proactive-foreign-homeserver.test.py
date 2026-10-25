@@ -29,6 +29,11 @@ import tempfile
 import urllib.error
 from pathlib import Path
 
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "packages" / "ag2-sparrow"))
 _ISOLATED = tempfile.mkdtemp(prefix="gw-foreign-hs-cc-")
@@ -86,7 +91,6 @@ def lane(identity: str, tmp: Path, posts: list, fail_post: bool = False):
 
 
 def fresh() -> Path:
-    gb._PROACTIVE_ATTEMPTS.clear()   # one retry budget per scenario, like one live process
     tmp = Path(tempfile.mkdtemp(prefix="gw-foreign-hs-"))
     (tmp / "archive").mkdir()
     (tmp / "proactive-1.txt").write_text(BODY, encoding="utf-8")

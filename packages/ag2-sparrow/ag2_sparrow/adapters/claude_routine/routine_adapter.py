@@ -15,15 +15,18 @@ import json
 import os
 import re
 import socket
+import subprocess
 import sys
 import time
 import urllib.error
 import urllib.request
 
-from ...task_io import (LockRefused, acquire_lock, exit_code, exit_on_sigterm, make_dirs, non_owner_note, release_lock,
-                        root_path, stoppable_sleep, write_atomic)
-from ...relay_loop import (HOUR, NO_ROOM, NON_OWNER_REFUSED, TEXT_MAX, Outcome, RateLimiter,  # noqa: F401
-                          RelayLoop, build_payload, count_arg, log, result_body)
+from ...collaborator_turn import child_env, run_collaborator_turn
+from ...task_io import (LockRefused, acquire_lock, exit_code, exit_on_sigterm, is_collaborator, make_dirs,
+                        non_owner_note, release_lock, root_path, stoppable_sleep, write_atomic)
+from ...relay_loop import (HOUR, NO_ROOM, NON_OWNER_FAILED, NON_OWNER_REFUSED, TEXT_MAX, Outcome,  # noqa: F401
+                          RateLimiter, RelayLoop, build_payload, count_arg, log, nonnegative_float, positive_arg,
+                          positive_float, result_body)
 
 API_BASE = "https://api.anthropic.com"
 API_VERSION = "2023-06-01"
@@ -87,9 +90,11 @@ def fire(endpoint, token, text, timeout=30.0, opener=urllib.request.urlopen):
 
 
 class Adapter(RelayLoop):
-    def __init__(self, args, token, opener=urllib.request.urlopen, clock=time.time, sleep=stoppable_sleep, note=None):
+    def __init__(self, args, token, opener=urllib.request.urlopen, clock=time.time, sleep=stoppable_sleep, note=None,
+                 environ=None, run=subprocess.run):
         self.init_loop(args, "fires.json", clock, sleep)
-        self.token, self.opener = token, opener
+        self.token, self.opener, self.run = token, opener, run
+        self.env = child_env(environ)
         self.note = note if note is not None else non_owner_note()
         self.endpoint = "%s/v1/claude_code/routines/%s/fire" % (args.api_base.rstrip("/"), args.trigger_id)
         self.hold_path = os.path.join(args.state, "hold.json")
@@ -116,6 +121,8 @@ class Adapter(RelayLoop):
             log("no room ->", task_id)
             self.finish(name, NO_ROOM, seen)
             return True
+        if is_collaborator(headers):
+            return self.collaborator_turn(name, text, seen)
         log("fire ->", task_id, headers.get("access_tier"), "chars", len(text))
         out = fire(self.endpoint, self.token, text, self.args.timeout, self.opener)
         if out.kind == "rate_limited":
@@ -133,6 +140,19 @@ class Adapter(RelayLoop):
         self.finish(name, result_body(out, self.args.result_mode, headers.get("access_tier") == "owner"), seen)
         return True
 
+    def collaborator_turn(self, name, text, seen):
+        """An isolated local turn, never the routine: its reply is the result, else the plain failure line.
+        Its cap is next_ready's gate, so a turn that reaches here only has to be counted."""
+        task_id = name[:-4]
+        if self.too_old(name):
+            log("collaborator task waited too long ->", task_id)
+            return self.finish(name, NON_OWNER_FAILED, seen)
+        self.collab_limiter.record()
+        log("collaborator turn ->", task_id)
+        turn = run_collaborator_turn(self.args.claude, text, self.env, self.args.collaborator_timeout, run=self.run)
+        log("result <-", task_id, turn.kind, turn.detail)
+        return self.finish(name, turn.text if turn.kind == "ok" else NON_OWNER_FAILED, seen)
+
 
 def build_parser():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -144,17 +164,36 @@ def build_parser():
     ap.add_argument("--allow-insecure-api-base", action="store_true", help="accept a non-https --api-base (tests only)")
     ap.add_argument("--result-mode", choices=["no-send", "echo"], default="no-send")
     ap.add_argument("--allow-non-owner", action="store_true",
-                    help="fire non-owner tasks too, at the same routine and connector scope as the "
-                         "owner. Off by default: this routine holds the owner's AG2 Space connector, "
-                         "and a non-owner tier is bounded only by the prompt's note otherwise.")
+                    help="fire tasks from non-owner senders without collaborator access too (guests, and any "
+                         "collaborator claim the broker did not attest), at the same routine and connector "
+                         "scope as the owner. Off by default: this routine holds the owner's AG2 Space "
+                         "connector, and such a sender is bounded only by the prompt's note otherwise. An "
+                         "attested collaborator is not covered by it: see --allow-collaborator.")
+    ap.add_argument("--allow-collaborator", action="store_true",
+                    help="serve attested collaborators (Team) on an isolated local turn: a fresh `claude -p` "
+                         "with the three read tools in an empty directory, no session, no connector, no "
+                         "history, and never saved (--no-session-persistence); off by default, so they are "
+                         "refused with the same plain line")
+    ap.add_argument("--claude", default="claude",
+                    help="the claude executable for collaborator turns (default: claude on PATH)")
     ap.add_argument("--max-per-hour", type=int, default=25,
                     help="local fire cap, 1-%d (the routine's own cap)" % ROUTINE_CAP_PER_HOUR)
+    ap.add_argument("--max-collaborator-per-hour", type=positive_arg, default=10,
+                    help="isolated collaborator turns in a sliding hour, 1 or more; their own gate, so they never "
+                         "count against --max-per-hour and a fire hold never delays them")
     ap.add_argument("--max-retries", type=int, default=2,
                     help="retries per task for failures that prove the fire was not sent; anything ambiguous is never retried")
     ap.add_argument("--max-rate-limited", type=int, default=5, help="429s per task before it gets a failure result")
     ap.add_argument("--backoff", type=float, default=2.0, help="first retry delay, doubled per retry")
     ap.add_argument("--backoff-max", type=float, default=60.0)
     ap.add_argument("--timeout", type=float, default=30.0, help="HTTP timeout per fire")
+    ap.add_argument("--collaborator-timeout", type=positive_float, default=30.0,
+                    help="seconds per collaborator turn, more than 0. The turn runs inside the one serve loop, so "
+                         "raising this delays any owner fire that arrives meanwhile by up to that much")
+    ap.add_argument("--collaborator-max-age", type=nonnegative_float, default=1800.0,
+                    help="a collaborator task that waited longer than this many seconds gets the plain failure line "
+                         "at once instead of a turn, counted since the task was first seen in a pending scan, or "
+                         "its file time if earlier; a restart does not reset it. 0 turns the cut-off off")
     ap.add_argument("--once", type=count_arg, default=0, help="exit after N tasks")
     ap.add_argument("--idle-exit", type=float, default=0, help="exit after S idle seconds")
     ap.add_argument("--poll", type=float, default=1.0)
@@ -187,7 +226,7 @@ def main(argv=None, environ=None, opener=urllib.request.urlopen):
         args.inbox = os.path.join(args.work, "tasks")
         args.results = os.path.join(args.work, "results")
         args.state = os.path.join(args.work, "state")
-        Adapter(args, token, opener).serve()
+        Adapter(args, token, opener, environ=environ).serve()
     except LockRefused as e:
         sys.stderr.write(e.line + "\n")
         return e.code

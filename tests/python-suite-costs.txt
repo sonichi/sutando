@@ -39,8 +39,6 @@
 0 tests/agent-endpoint-resolver.test.py
 1 tests/agent-health-report.test.py
 0 tests/agent-room-ops-authz.test.py
-0 tests/agent-room-ops-context-rename.test.py
-0 tests/agent-room-ops-doc-404-legibility.test.py
 1 tests/agent-room-ops-mention-room-fallback.test.py
 3 tests/agent-room-ops-read-redaction.test.py
 0 tests/agent_api_task_guard.test.py

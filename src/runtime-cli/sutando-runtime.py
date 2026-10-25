@@ -855,7 +855,9 @@ def main(argv=None) -> int:
     iop.add_argument("--instance", default=None)
 
     tsk = sub.add_parser("task").add_subparsers(dest="cmd", required=True)
-    tsk.add_parser("list")
+    tlist = tsk.add_parser("list")
+    tlist.add_argument("--unfinished", action="store_true",
+                       help="exclude done tasks before the 200-task limit")
     tsk.add_parser("results")  # list all available results (newest first)
     tw = tsk.add_parser("watch")   # PUSH mode: stream results live as they land
     tw.add_argument("--activity", action="store_true",
@@ -1002,7 +1004,8 @@ def main(argv=None) -> int:
                 return _chat(activity=args.activity, verbose=args.verbose,
                              full=args.full)
             if args.cmd == "list":
-                result = _rpc("task.list", {}, timeout=15)
+                params = {"unfinishedOnly": True} if args.unfinished else {}
+                result = _rpc("task.list", params, timeout=15)
             elif args.cmd == "results":
                 result = _rpc("task.list_results", {}, timeout=15)
             elif args.cmd == "submit":

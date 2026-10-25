@@ -21,6 +21,11 @@ import tempfile
 import threading
 import urllib.error
 
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 REPO = pathlib.Path(__file__).resolve().parent.parent
 REAL_HOME = pathlib.Path(os.path.expanduser("~")).resolve()
 root = pathlib.Path(tempfile.mkdtemp()).resolve()
@@ -1664,7 +1669,7 @@ except Exception as exc:  # noqa: BLE001
     raised = exc
 finally:
     guard.claim_withheld_decision = real_claim
-check(raised is None and handled is True and any("could not be processed (boom)" in line for line in logs)
+check(raised is None and handled is True and any("could not be processed (RuntimeError at " in line and "boom" not in line for line in logs)
       and "please reply again" in json.loads(bridge._control_result_path("claim-raises").read_text())["body"],
       f"a raising claim is answered, never escapes the beat: {raised!r}")
 

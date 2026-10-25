@@ -15,6 +15,11 @@ import urllib.error
 from pathlib import Path
 from unittest.mock import patch
 
+from _helpers.hermetic_env import hermetic_env, isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / 'packages' / 'ag2-sparrow'))
 from ag2_sparrow import outbox, remote_gateway_bridge as gw, undelivered_quarantine
@@ -615,7 +620,7 @@ for _ in range(3):
     gw._post_ready_results(inflight)
 print('pending:', sorted(inflight))
 """
-        env = {k: v for k, v in os.environ.items() if not k.startswith('SUTANDO_')}
+        env = hermetic_env()
         env['PYTHONPATH'] = str(REPO / 'packages' / 'ag2-sparrow')
         url = f'http://127.0.0.1:{server.server_port}'
         self.server.available_at += 120

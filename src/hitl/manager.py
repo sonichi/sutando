@@ -22,8 +22,10 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from file_lock import lock_fd, unlock_fd
-from workspace_default import resolve_workspace
+try:
+    from ..file_lock import lock_fd, unlock_fd   # the vendored package layout
+except ImportError:
+    from file_lock import lock_fd, unlock_fd     # the repo's src/ on sys.path
 
 from . import renotify
 from .schema import (
@@ -104,9 +106,12 @@ def archive_health(store_root: Path, now: Optional[float] = None) -> Optional[Di
 
 def default_store(workspace: Optional[Path] = None) -> Path:
     """Where every hitl component on a host keeps requirements: the hook driver
-    writes here, the supervisor projects from here. One store, one card."""
-    ws = Path(workspace) if workspace is not None else resolve_workspace()
-    return ws / "state" / "hitl" / "requirements"
+    writes here, the supervisor projects from here. One store, one card. With no
+    workspace the repo's resolver is imported here, so a vendored copy never needs it."""
+    if workspace is None:
+        from workspace_default import resolve_workspace
+        workspace = resolve_workspace()
+    return Path(workspace) / "state" / "hitl" / "requirements"
 
 
 class HitlStore:
@@ -162,6 +167,12 @@ class HitlStore:
         finally:
             if os.path.exists(tmp):
                 os.unlink(tmp)
+        # The replace is visible before it is durable; the directory fsync makes it so, or says it could not.
+        dfd = os.open(str(self.root), os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
 
     def _load_raw(self, req_id: str) -> Dict:
         if not self.valid_id(req_id):
@@ -285,12 +296,15 @@ class HitlManager:
     def get(self, req_id: str) -> Optional[HumanRequirement]:
         return self.store.load(req_id)
 
-    def apply_action(self, reply: ActionReply) -> Action:
-        """Validate the two-layer stale gate; on pass, mark in_progress.
+    def apply_action(self, reply: ActionReply, patch=None) -> Action:
+        """Validate the three-layer stale gate; on pass, mark in_progress.
 
         Returns the matched Action for the caller (driver) to execute.
         Raises StaleRequirementError / MalformedActionError otherwise —
-        a stale click must never reach the runtime.
+        a stale click must never reach the runtime. `patch(req)`, when given,
+        runs after the reload and before the one save, so what it sets on the
+        requirement lands in the same write as the acceptance; it is pure and
+        merge-preserving and touches nothing else.
         """
         with self.store.locked():
             req = self.store.load(reply.hitl_id)
@@ -303,6 +317,8 @@ class HitlManager:
             if reply.answer is not None:
                 req.answer = reply.answer
             req.transition(STATUS_IN_PROGRESS)
+            if patch is not None:
+                patch(req)
             self.store.save(req)
             return action
 
