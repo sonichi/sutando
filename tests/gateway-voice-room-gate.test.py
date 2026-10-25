@@ -294,7 +294,17 @@ class DrainRoomGateTests(_LoaderFixture):
             elif handback_fails and Path(dest).name == target.name:
                 raise PermissionError(1, "Operation not permitted", str(dest))
             return real_rename(path, dest)
-        return mock.patch.object(Path, "rename", rename)
+        stack = contextlib.ExitStack()
+        stack.enter_context(mock.patch.object(Path, "rename", rename))
+        if handback_fails:  # the drain hands a claim back through the no-replace rename
+            real_noreplace = self.mod.undelivered_quarantine.rename_noreplace
+
+            def noreplace(src, dst, *a, **k):
+                if Path(dst).name == target.name:
+                    raise PermissionError(1, "Operation not permitted", str(dst))
+                return real_noreplace(src, dst, *a, **k)
+            stack.enter_context(mock.patch.object(self.mod.undelivered_quarantine, "rename_noreplace", noreplace))
+        return stack
 
     def test_partial_peek_complete_claim_forged_room_is_never_delivered(self):
         partial = self._result("proactive-result-task-20-20.to-ag2space.txt", "[channel: !forged:ex")

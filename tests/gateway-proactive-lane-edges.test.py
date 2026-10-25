@@ -97,6 +97,38 @@ def held_while_claimed() -> None:
           "a moved destination while another drainer holds the item: nothing sent, file handed back")
 
 
+def handback_and_reaper() -> None:
+    d = Path(tempfile.mkdtemp(dir=ISO))
+    claim, live = d / "proactive-hb.sending.1", d / "proactive-hb.txt"
+    claim.write_text("old\n")
+    live.write_text("newer\n")
+    logs, saved = [], gb._log
+    gb._log = logs.append
+    try:
+        gb._hand_back(claim, live)
+    finally:
+        gb._log = saved
+    check(live.read_text() == "newer\n" and claim.exists() and any("held by a newer file" in m for m in logs),
+          "a handback never replaces a newer live file; the claim is kept and said")
+    saved_dirs = gb.RESULTS_DIR, gb.ARCHIVE_RESULTS_DIR
+    gb.RESULTS_DIR, gb.ARCHIVE_RESULTS_DIR = d, d / "archive"
+    (d / ".proactive-r.delivered-notanumber").write_text("x")
+    (d / ".proactive-r.delivered-5").write_text("kept\n")
+    real = gb.undelivered_quarantine.place_as
+    gb.undelivered_quarantine.place_as = lambda *a, **k: (_ for _ in ()).throw(OSError("archive down"))
+    try:
+        gb._reap_hidden_delivered()
+        still = (d / ".proactive-r.delivered-5").exists()
+    finally:
+        gb.undelivered_quarantine.place_as = real
+    gb._reap_hidden_delivered()
+    gb.RESULTS_DIR, gb.ARCHIVE_RESULTS_DIR = saved_dirs
+    check(still and not (d / ".proactive-r.delivered-5").exists()
+          and (d / "archive" / "proactive-r-5.txt").read_text() == "kept\n"
+          and (d / ".proactive-r.delivered-notanumber").exists(),
+          "a hidden delivered file waits out an archive failure, then is archived; a foreign name is left")
+
+
 def grammar() -> None:
     name = proactive_routing.about_task_filename("task-17", 5, "ag2space")
     check(name == "proactive-about-task-17--5.to-ag2space.txt" and proactive_routing.about_task(name) == "task-17",
@@ -223,16 +255,17 @@ def bridge_edges() -> None:
     lane = pl.Lane(gb, ISO, refuse(429))
     lane.write("proactive-stuck.txt", "nudge\n")
     real = Path.rename
+    real_noreplace = gb.undelivered_quarantine.rename_noreplace
 
-    def rename(self, target):
-        if ".sending." in self.name and Path(target).name == "proactive-stuck.txt":
+    def noreplace(src, dst, *a, **k):
+        if Path(dst).name == "proactive-stuck.txt":
             raise OSError("hand-back refused")
-        return real(self, target)
-    Path.rename = rename
+        return real_noreplace(src, dst, *a, **k)
+    gb.undelivered_quarantine.rename_noreplace = noreplace
     try:
         lane.drain()
     finally:
-        Path.rename = real
+        gb.undelivered_quarantine.rename_noreplace = real_noreplace
     check(any("could not be handed back" in m for m in lane.logs), "a failed hand-back is logged loudly")
     check(gb._payload_room("not json") is None, "an unreadable stored payload names no room")
 
@@ -266,6 +299,7 @@ def main() -> int:
     grammar()
     gate_unreadable_task()
     guarded_park_and_release()
+    handback_and_reaper()
     held_while_claimed()
     restore_by_generation()
     core_and_provider()

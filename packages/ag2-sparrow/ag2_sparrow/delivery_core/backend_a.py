@@ -182,7 +182,7 @@ class DesignAClaimBackend:
 
     def park_unclaimed(self, item_id: str, reason: str) -> bool:
         """Park a live item no claimant holds; refused (False) once it settled or is claimed."""
-        return outbox.park_unclaimed(self.root, item_id, reason)
+        return outbox.park_unclaimed(self.root, item_id, reason, self.reclaim_ttl_s)
 
     def mark_dispatching(self, token: ClaimToken) -> bool:
         """Record that this incarnation is about to send; False (and nothing written) when

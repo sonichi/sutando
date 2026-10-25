@@ -893,16 +893,21 @@ def released_by_operator(d: dict) -> bool:
         (d.get("payload") or "").encode("utf-8")).hexdigest()
 
 
-def park_unclaimed(root: Path, item_id: str, reason: str) -> bool:
+def park_unclaimed(root: Path, item_id: str, reason: str, reclaim_ttl_s: float = 300.0) -> bool:
     """Park an item no one holds, under its lock, only while it is still live and unsettled:
-    never over DELIVERED, a receipt, a dispatch mark or a claim. False when it changed."""
+    never over DELIVERED, a receipt, a dispatch mark or a live claim. A claim a reclaim may
+    take (a dead owner past `reclaim_ttl_s`) is released first. False when it changed."""
     with _item_lock(Path(root), item_id):
         if not _item_path(Path(root), item_id).exists():
             return False
         d = _read_item(Path(root), item_id)
-        if (d.get("status") in ("DELIVERED", "PARKED") or dispatch_unsettled(d)
-                or read_delivery_claim(Path(root), item_id) is not None):
+        if d.get("status") in ("DELIVERED", "PARKED") or dispatch_unsettled(d):
             return False
+        rec = read_delivery_claim(Path(root), item_id)
+        if rec is not None:
+            if not _record_is_reclaimable(rec, reclaim_ttl_s):
+                return False
+            _release_locked(Path(root), item_id, rec.drainer_id, force=True)
         d.update(status="PARKED", reason=reason)
         _write_item(Path(root), item_id, d)
         return True

@@ -576,8 +576,11 @@ it is never re-routed, and the logged release sends it to its stored room. The g
 to every dispatch except one a person released: the CLI's requeue records the release bound
 to the stored payload (`operator_release`), and an automatic requeue (a room-upgrade resend)
 records none. Parking takes the item's lock and refuses an item that is delivered, holds a
-receipt or a dispatch mark, or is claimed. A delivered file that cannot be archived is kept
-and archived on a later pass, never unlinked.
+receipt or a dispatch mark, or is held by a live claim (a dead owner's claim past its reclaim
+window is released first). A delivered file that cannot be archived is renamed to a hidden
+`.<stem>.delivered-<ts>` that no bridge globs, and a later pass moves it into `archive/`; it
+is never unlinked and never put back under its live name. Every handback to a live name uses a
+no-replace rename, so a newer file a producer wrote there is never overwritten.
 
 The file is still claimed by rename (`.sending.<pid>`, recovered by `_recover_orphan_proactive`
 when its owner dies): that is what keeps the other bridges polling `results/proactive-*.txt`

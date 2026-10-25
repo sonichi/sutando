@@ -5558,6 +5558,22 @@ def _room_is_deliverable_here(room: str) -> bool:
 
 
 _EVENT_ID_RE = re.compile(r"\$\S+")
+_DELIVERED_INFIX = ".delivered-"
+
+
+def _reap_hidden_delivered() -> None:
+    """Each pass: a delivered proactive file kept hidden moves into archive/ once it can."""
+    for h in RESULTS_DIR.glob(f".proactive-*{_DELIVERED_INFIX}*"):
+        stem, _, stamp = h.name[1:].rpartition(_DELIVERED_INFIX)
+        if not stamp.isdigit():
+            continue
+        try:
+            undelivered_quarantine.place_as(h, ARCHIVE_RESULTS_DIR,
+                                            (undelivered_quarantine.quarantine_name(stem, int(stamp) + i)
+                                             for i in range(64)))
+        except OSError as e:
+            _log_backoff(("proactive-hidden-delivered", h.name),
+                         f"delivered proactive {h.name} still not archived ({diagnostics.describe(e)})")
 _ROOM_UPGRADED = "room-upgraded"
 _DESTINATION_CHANGED = "destination-changed"
 
@@ -5678,15 +5694,29 @@ def _recover_orphan_proactive() -> None:
             pass
 
 
+def _hand_back(claim: Path, original: Path) -> None:
+    """Return a claim to its live name, never over a newer file a producer wrote there; on a
+    collision (or no no-replace rename) the claim keeps its name and the operator is told."""
+    try:
+        undelivered_quarantine.rename_noreplace(claim, original)
+    except FileExistsError:
+        _log_backoff(("proactive-handback", claim.name),
+                     f"proactive {claim.name} not handed back: {original.name} is held by a newer file "
+                     f"(or no no-replace rename here); it is kept as {claim.name} for the operator")
+    except OSError as e:
+        _log_backoff(("proactive-handback", claim.name),
+                     f"proactive {claim.name} could not be handed back ({diagnostics.describe(e)})")
+
+
 def _retire_proactive(claim: Path, original: Path, dest_dir: Path) -> bool:
     """Retire a claimed nudge that was NOT delivered, without destroying it.
 
-    Used by the terminal non-delivery paths (settled-empty, dead-lettered).
-    Deliberately not shared with the delivered path: there the content already
-    reached the owner, so unlinking on an archive failure is harmless, whereas
-    handing the claim back would re-send a duplicate. Here nothing was
-    delivered, so the fallback is the opposite — hand it back as `.txt` rather
-    than unlink, since a duplicate on a later pass beats a lost message.
+    Used by the terminal non-delivery paths (withdrawn, parked, dead-lettered). Not
+    shared with the delivered path: a delivered file that cannot be archived goes to a
+    hidden `.<stem>.delivered-<ts>` no bridge globs (a live name would let another bridge
+    post it again), reaped into archive/ by _reap_hidden_delivered. Here nothing was
+    delivered, so the fallback is the opposite: hand it back as `.txt` rather than unlink;
+    its outbox item stays terminal, so it is never resent from here.
     """
     try:
         # Never over an earlier copy: two bodies under one name are two retired generations.
@@ -5695,10 +5725,7 @@ def _retire_proactive(claim: Path, original: Path, dest_dir: Path) -> bool:
         return True
     except OSError as e:
         _log(f"could not retire proactive {original.name} ({diagnostics.describe(e)}) — re-queueing")
-        try:
-            claim.rename(original)
-        except OSError:
-            pass
+        _hand_back(claim, original)
         return False
 
 
@@ -5816,6 +5843,7 @@ def _post_proactive() -> None:
     PROACTIVE_ROOM_GATE re-judges the room the CLAIMED body names, since the
     peek may have read a body still being written."""
     noticed: "set[tuple[str, str]]" = set()
+    _reap_hidden_delivered()
     for f in sorted(RESULTS_DIR.glob("proactive-*.txt")):
         # PEEK before claiming: a file explicitly routed to a non-Matrix
         # destination ([channel: <discord/slack id>]) belongs to that bridge —
@@ -5862,12 +5890,7 @@ def _post_proactive() -> None:
                 _EMPTY_LOGGED.add(f.name)
                 _log(f"proactive {f.name} not ready (empty, unreadable or still "
                      f"being written) — handing back for a later pass")
-            try:
-                claim.rename(f)
-            except OSError as restore_exc:
-                _log(f"CRITICAL: proactive {claim.name} was not ready AND restore "
-                     f"to {f.name} failed ({diagnostics.describe(restore_exc)}) — owner nudge stranded "
-                     f"under live pid until restart")
+            _hand_back(claim, f)
             continue
         route, room_override, routed_body = _proactive_route(claimed_text)
         if route == "foreign" or (
@@ -5876,10 +5899,7 @@ def _post_proactive() -> None:
                 route == "send" and room_override is None and (GATEWAY_INSTANCE or not proactive_room())):
             # Hand back rather than eat: a foreign target seen only post-claim, or one that vanished
             # and left an unaddressed body this instance may not own or cannot place.
-            try:
-                claim.rename(f)
-            except OSError:
-                pass
+            _hand_back(claim, f)
             continue
         if PROACTIVE_ROOM_GATE is not None and route == "send" and _room_bound_result(f.name, room_override):
             try:
@@ -5889,10 +5909,7 @@ def _post_proactive() -> None:
                 allowed = False
             if not allowed:
                 # Hand back under its own name: the claim gate holds it from here.
-                try:
-                    claim.rename(f)
-                except OSError:
-                    pass
+                _hand_back(claim, f)
                 continue
             _GATE_FAILED_LOGGED.discard(f.name)
         if route == "drop":
@@ -5910,10 +5927,7 @@ def _post_proactive() -> None:
                 _log(f"proactive {f.name} claimed empty — producer has not "
                      f"flushed yet; handing back (never dead-lettered, a late "
                      f"flush must still deliver)")
-            try:
-                claim.rename(f)
-            except OSError:
-                pass
+            _hand_back(claim, f)
             continue
         # Non-empty now — drop any prior empty observation so a file that merely
         # flushed late can log again if it is ever re-observed empty.
@@ -5958,10 +5972,10 @@ def _send_proactive(claim: Path, f: Path, envelope: dict, owner_dm: bool, notice
         if not core.backend.park_unclaimed(item_id, _DESTINATION_CHANGED):
             again = read_item(core.backend.root, item_id) or {}
             if again.get("status") not in core.backend.TERMINAL and not dispatch_unsettled(again):
-                try:
-                    claim.rename(f)  # another drainer holds it: nothing is sent from here
-                except OSError:
-                    pass
+                _hand_back(claim, f)  # another drainer holds it: nothing is sent from here
+                _log_backoff(("proactive-held-claimed", item_id),
+                             f"proactive {f.name} not sent: its destination moved from {stored_room} to "
+                             f"{envelope['room_id']} and another drainer holds it; handed back")
                 return
         else:
             _log(f"proactive {f.name} HELD: it was queued for {stored_room} and its destination now "
@@ -5974,10 +5988,10 @@ def _send_proactive(claim: Path, f: Path, envelope: dict, owner_dm: bool, notice
         try:
             claim.rename(ARCHIVE_RESULTS_DIR / f"{f.stem}-{int(time.time())}.txt")
         except OSError as e:
-            # Never unlinked: handed back, the DELIVERED item archives it on a later pass.
-            _log(f"delivered proactive {f.name} could not be archived ({diagnostics.describe(e)}); kept")
+            # Hidden, never live and never unlinked: no bridge globs it; a later pass archives it.
+            _log(f"delivered proactive {f.name} could not be archived ({diagnostics.describe(e)}); kept hidden")
             try:
-                claim.rename(f)
+                claim.rename(f.with_name(f".{f.stem}{_DELIVERED_INFIX}{time.time_ns()}"))
             except OSError:
                 pass
         if result.status is DrainStatus.ATTEMPTED and result.detail != "settled by a recorded receipt":
@@ -5989,12 +6003,13 @@ def _send_proactive(claim: Path, f: Path, envelope: dict, owner_dm: bool, notice
         return
     replacement = seen.get("room_upgraded")
     if replacement is not None and status != "PARKED":
-        core.backend.park_unclaimed(item_id, _ROOM_UPGRADED)  # never posted; resent once the DM is repointed
+        if not core.backend.park_unclaimed(item_id, _ROOM_UPGRADED):  # never posted; resent once repointed
+            _hand_back(claim, f)
+            _log(f"proactive {f.name}: {room} was upgraded, but its item changed meanwhile "
+                 f"({(read_item(core.backend.root, item_id) or {}).get('status')}); handed back, not held")
+            return
         if owner_dm:
-            try:
-                claim.rename(f)  # stays pending: the room moved, the DM's repointing sends it
-            except OSError:
-                pass
+            _hand_back(claim, f)  # stays pending: the room moved, the DM's repointing sends it
             _hold_owner_dm_upgrade(room, replacement, noticed)
             return
         status, item = "PARKED", read_item(core.backend.root, item_id) or {}
@@ -6027,10 +6042,7 @@ def _send_proactive(claim: Path, f: Path, envelope: dict, owner_dm: bool, notice
             _log(f"proactive {f.name} PARKED to {UNDELIVERABLE_RESULTS_DIR.name}/ ({reason}"
                  f"{': ' + result.detail if result.detail else ''}) — it will NOT be re-sent")
         return
-    try:
-        claim.rename(f)  # still owed: the outbox's retry schedule decides when it is tried again
-    except OSError as e:
-        _log(f"CRITICAL: proactive {claim.name} could not be handed back ({diagnostics.describe(e)})")
+    _hand_back(claim, f)  # still owed: the outbox's retry schedule decides when it is tried again
     if result.status is DrainStatus.ATTEMPTED:
         _log(f"proactive send for {f.name} was not delivered ({result.detail}) — will retry")
     if "auth" in seen:
