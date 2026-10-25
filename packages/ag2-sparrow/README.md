@@ -596,7 +596,7 @@ replaces or removes it. `--cron-dir` names another scheduled-task directory and
 the tasks with `ag2-sparrow-hatch uninstall --keepalive` (tasks install did not
 write are refused, and the log is kept), or delete the file by hand.
 
-### Served wording
+### Served wording and self-upgrade
 
 The hook prompt is a short stub: a woken worker runs `ag2-sparrow-hatch
 wake-context` and follows what it prints, with the payload's `worker_note`.
@@ -629,6 +629,64 @@ The served tunables (`keepawake_interval_s`, `stuck_task_age_s`,
 `hook_silent_age_s`, `heartbeat_cadence_s`) are clamped to bounds the package
 sets. Until a setup is fetched and cached, the built-in text and defaults
 apply.
+
+When the served `target_version` is above the installed version, the keepawake
+run starts one detached upgrade per target and logs its decision on its line
+(`upgrade=off`, `current`, `no-hashes`, `hand-made-service`, `0.6.0:started`, ...).
+The upgrade runs under `STATE_DIR/upgrade.lock`, which keepawake also holds while
+it checks and restarts Sparrow, and re-reads the installed version first. It
+downloads the pinned wheel and reads from that wheel's own RECORD and entry points
+exactly which paths the target installs, then copies the package namespace, hashed,
+to `STATE_DIR/rollback/<version>/`: every file the old RECORD lists, everything in
+an `ag2_sparrow*` entry of site-packages, and whatever already sits at a path the
+target will write. Ownership is that old RECORD plus the target inventory, never a
+name that merely appeared later, so a foreign file another installer adds meanwhile
+is neither removed nor counted. It stops Sparrow through the
+manager that owns it and proves it gone (a hand-made unit is never touched; a lock
+holder is signalled only when it runs Sparrow's command line and has the start time
+its lock record names, read from /proc on Linux or sysctl on macOS, and the signal
+goes through a pidfd opened before that check, so it reaches that process or none.
+Where no pidfd can be had (macOS, or a pidfd_open that fails) nothing is signalled,
+so a detached macOS install's self-upgrade ends `stop-failed` and Sparrow keeps
+running the old version until it is stopped by hand; nothing is installed unless the
+stop is proven), runs
+`pip install --no-deps --only-binary=:all: --require-hashes --no-index` from the
+downloaded wheel, pinned to every sha256 in `target_sha256`, requires `pip check` to run and report no new problem
+naming ag2-sparrow, re-runs `install --no-start` (which never starts the service),
+starts Sparrow through the same manager, and checks it imports the target and
+reconnects. A reply posted while Sparrow is stopped waits in the results dir and
+is delivered once it starts. A failure restores the snapshot with no index and no
+network: every file of the package's it does not list is removed (with its bytecode
+and any directory the target created), the copies are put back, and the files must
+hash equal to it; a file in an `ag2_sparrow*` directory that is nobody's known
+file is kept and fails the check; the outcome is `rolled-back` only when that held and the previous
+version runs connected again, else `restore-failed`, and the health row reports
+`upgrade-failed` either way. After `restore-failed` the files are unverified, so
+Sparrow is left stopped and the hook wakes the agent once with a notice. While an
+attempt is held this way (or left in a mutating phase, or the journal
+`hatch-upgrade.json` exists but is not one the writer can leave: unparseable, without
+its `attempted` map, or with an attempt whose outcome and phase are not a pair the
+writer produces, or a field its writer never saves or saves as another JSON type, or a
+duplicate member name, or a time no writer could stamp (not a
+number, below zero, or more than `CLOCK_SKEW_S` ahead of the clock), or a `failed` or
+`installed` summary naming no attempt or one in an outcome whose writer would have
+replaced the summary, or a `failed` summary whose `from` differs from that of the
+attempt it was saved with, or a crashed, rolled-back or restore-failed attempt with no
+`failed` summary and no later success whose `installed.after` (every attempt recorded before
+that success) names it, or a success outside another success's `after`) nothing starts Sparrow or another
+upgrade: keepawake, the upgrade decision and the upgrade worker all refuse without
+writing to the journal, so a refusal never replaces the phase that holds, and the
+failed version is never imported, not even to read its version. The owner's
+`ag2-sparrow-hatch install` lifts a `restore-failed` hold only once every installed
+file hashes equal to its RECORD and no unrecorded file sits in an `ag2_sparrow*`
+directory (reinstall with `pip install --force-reinstall ag2-sparrow==<version>`
+first if it says they do not), and before it starts anything. The attempt
+record journals each phase, so a dead attempt is settled before keepawake probes
+or restarts anything: nothing installed means `crashed`, files that differ from
+the snapshot are restored, and an interrupted restore resumes on the next run. Editable and URL installs are never
+upgraded. A changed hook definition is not applied: the hook wakes the agent once
+with install's `REQUIRED hook:` line. `AUTO_UPGRADE=0` in the install config turns
+self-upgrade off; install keeps it.
 
 ### Not from the single-file downloads
 

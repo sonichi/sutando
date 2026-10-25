@@ -26,7 +26,7 @@ import sys
 import time
 from pathlib import Path
 
-from ... import _dirs, agent_identity, diagnostics
+from ... import _dirs, agent_identity, diagnostics, workspace_lock
 from . import cli as _cli, task_fields
 
 TASK, INTERVAL_MIN = "sparrow-keepawake", 15
@@ -37,12 +37,16 @@ STALE_S = 2 * INTERVAL_MIN * 60
 NOT_RUNNING = "keepawake-not-running"
 HOOK_NOT_RUNNING, HOOK_STALE_S = "hook-not-running", 5 * 60
 TASK_NOT_PICKED_UP, TASK_PICKUP_S = "task-not-picked-up", 15 * 60
+UPGRADE_FAILED = "upgrade-failed"
 NO_HEALTH_COMMAND, UNKNOWN_ENV = "no-health-command", "unknown-env"
 REASON_HINTS = {
     HOOK_NOT_RUNNING: f"the hook has not run in the last {HOOK_STALE_S // 60} minutes; see "
                       "the hook run line above",
     TASK_NOT_PICKED_UP: f"an AG2 Space task has been open over {TASK_PICKUP_S // 60} minutes: "
                         "the hook is not waking a worker for it, or a worker handed it off",
+    UPGRADE_FAILED: "an automatic ag2-sparrow upgrade failed; its outcome and the version "
+                    "installed now are in hatch-upgrade.json and hatch-upgrade.log in the "
+                    "state dir",
 }
 RUN_TIMEOUT_S = 120
 GAP_MINUTES = 16
@@ -272,9 +276,12 @@ def is_sparrow_argv(argv: "list[str]") -> bool:
 
 
 def is_sparrow_pid(pid: int) -> bool:
-    """Whether `pid` runs a Sparrow command line; False when that cannot be read."""
+    """Whether `pid` runs a Sparrow command line (/proc, or sysctl on macOS); False when
+    that cannot be read."""
     cmd = _proc(pid, "cmdline")
-    return is_sparrow_argv([a.decode(errors="replace") for a in (cmd or b"").split(b"\0") if a])
+    if cmd is None:
+        return is_sparrow_argv(workspace_lock.proc_argv(pid) or [])
+    return is_sparrow_argv([a.decode(errors="replace") for a in cmd.split(b"\0") if a])
 
 
 def sparrow_env(pid: int) -> "dict[str, str] | None":
@@ -287,10 +294,23 @@ def sparrow_env(pid: int) -> "dict[str, str] | None":
     return {k.decode(errors="replace"): v.decode(errors="replace") for k, v in pairs}
 
 
-def _stop(pid: int) -> bool:
-    """SIGTERM to `pid`, then wait for it to exit; never a SIGKILL."""
+def _pidfd_open(pid: int) -> "int | None":
+    """A pidfd naming the process that has `pid` now; None where the platform has none
+    (macOS). ProcessLookupError when no process has it; any other failure raises."""
+    opener = getattr(os, "pidfd_open", None)
+    if opener is None or not hasattr(signal, "pidfd_send_signal"):
+        return None
+    return opener(pid)
+
+
+def _stop(pid: int, handle: "int | None" = None) -> bool:
+    """SIGTERM to `pid` (through the pidfd `handle` when given), then wait for it to exit;
+    never a SIGKILL."""
     try:
-        os.kill(pid, signal.SIGTERM)
+        if handle is None:
+            os.kill(pid, signal.SIGTERM)
+        else:
+            signal.pidfd_send_signal(handle, signal.SIGTERM)
     except ProcessLookupError:
         return True
     except OSError as e:
@@ -298,6 +318,11 @@ def _stop(pid: int) -> bool:
         return False
     deadline = time.monotonic() + STOP_WAIT_S
     while time.monotonic() < deadline:
+        if handle is not None:
+            import select
+            if select.select([handle], [], [], max(0.0, deadline - time.monotonic()))[0]:
+                return True  # the pidfd turns readable when its process exits
+            continue
         if _cli.process_gone(pid):
             return True
         time.sleep(0.2)
@@ -385,13 +410,130 @@ def _unit_state_unknown(cfg: dict, holder: "int | None", why: str) -> int:
     return 1
 
 
+def resolve_sparrow(cfg: dict) -> "tuple[str | None, int | None, bool]":
+    """(owner, holder, fresh): the unit's owner (_unit_owner), the pid in Sparrow's lock
+    record that is still alive, heartbeat fresh or not, and whether that heartbeat is
+    fresh. One reading for install, keepawake and the upgrader."""
+    record = _cli._lock_record(_state_dir(cfg), _instance(cfg))
+    pid = (record or {}).get("pid")
+    alive = (isinstance(pid, int) and not isinstance(pid, bool) and pid > 0
+             and not _cli.process_gone(pid))
+    holder = pid if alive else None
+    return _unit_owner(), holder, holder is not None and _cli.live_lock_holder(record) == holder
+
+
+def process_start(pid: int) -> "str | None":
+    return workspace_lock.proc_start(pid)
+
+
+def unproven_holder(record: "dict | None", pid: int) -> "str | None":
+    """Why `pid` is not proven to be the Sparrow that wrote lock `record`; None when it
+    runs Sparrow's command line and has the start time the record names."""
+    if not is_sparrow_pid(pid):
+        return f"pid {pid} holds Sparrow's lock but is not proven to be Sparrow"
+    recorded, now = (record or {}).get("proc_start"), process_start(pid)
+    if not isinstance(recorded, str) or not recorded:
+        why = "the lock record carries no process start time"
+    elif now != recorded:
+        why = f"it started at {now or 'an unreadable time'}, the record names {recorded}"
+    else:
+        return None
+    return f"pid {pid} is not proven to be the process that wrote Sparrow's lock: {why}"
+
+
+def stop_proven(record: "dict | None", pid: int) -> "tuple[bool, str | None]":
+    """SIGTERM the lock holder `pid` and wait: (stopped, why it was not signalled). The
+    proof (unproven_holder) is read after a pidfd is opened and the signal goes through
+    that pidfd, so it reaches the proven process or none. With no pidfd (macOS, or one
+    that could not be opened) nothing is signalled: a bare pid is never trusted."""
+    try:
+        handle = _pidfd_open(pid)
+    except ProcessLookupError:
+        return True, None
+    except OSError as e:
+        return False, (f"no stable process handle for pid {pid} (pidfd_open: "
+                       f"{diagnostics.describe(e)})")
+    if handle is None:
+        return False, (f"no stable process handle for pid {pid} on this platform (no pidfd); "
+                       "stop Sparrow by hand to upgrade")
+    try:
+        why = unproven_holder(record, pid)
+        return (False, why) if why else (_stop(pid, handle), None)
+    finally:
+        if isinstance(handle, int):
+            os.close(handle)
+
+
+def _wait_gone(pid: int) -> bool:
+    deadline = time.monotonic() + STOP_WAIT_S
+    while not _cli.process_gone(pid):
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.2)
+    return True
+
+
+def quiesce_sparrow(cfg: dict) -> "tuple[bool, str, str | None]":
+    """Stop the Sparrow this install owns and prove it gone: (quiet, how, manager), where
+    the manager ("unit" or "detached") is what starts it again. Refused, with nothing
+    touched and no manager: a hand-made unit, one whose user manager did not answer, and
+    a lock holder beside our unit not proven to be Sparrow. For our unit the unit is
+    stopped and its process, and any Sparrow outside it, must be gone; with no unit the
+    lock holder is stopped (SIGTERM, then wait), a stale heartbeat notwithstanding, but
+    only once proven to be the process that wrote the lock (stop_proven: Sparrow's command
+    line and the start time the record names, bound to the signal by a pidfd)."""
+    owner, holder, _ = resolve_sparrow(cfg)
+    record = _cli._lock_record(_state_dir(cfg), _instance(cfg))
+    unit = _cli.service_path()
+    if owner == UNIT_UNREACHABLE:
+        return False, f"{unit} is installed but systemctl --user did not answer", None
+    if owner == "other":
+        return False, f"{unit} was not written by install, so its Sparrow is left alone", None
+    if owner == "ours":
+        props = _cli._unit_props()
+        if props is None:
+            return False, f"systemctl --user show {_cli.SERVICE_NAME} did not give a well-formed state", None
+        main_pid = props["MainPID"]
+        outside = holder if holder is not None and holder != main_pid else None
+        unproven = unproven_holder(record, outside) if outside is not None else None
+        if unproven:
+            return False, f"{unproven}, beside {_cli.SERVICE_NAME}; nothing was signalled", None
+        r = _cli._systemctl(("--user", "stop", "ag2-sparrow.service"))
+        how = f"systemctl --user stop {_cli.SERVICE_NAME}"
+        if not _cli._ok(r):
+            return False, f"{how} failed ({_cli._why(r)})", "unit"
+        if main_pid and not _wait_gone(main_pid):
+            return False, f"{how}, but its Sparrow (pid {main_pid}) is still running", "unit"
+        if outside is not None:
+            stopped, unproven = stop_proven(record, outside)
+            if unproven:
+                return False, f"{how}; {unproven}; it was not signalled", "unit"
+            if not stopped:
+                return False, f"the Sparrow outside {_cli.SERVICE_NAME} (pid {outside}) did not stop", "unit"
+            how += f"; stopped the Sparrow outside it (pid {outside})"
+        manager = "unit"
+    elif holder is None:
+        how, manager = "Sparrow was not running", "detached"
+    else:
+        stopped, unproven = stop_proven(record, holder)
+        if unproven:
+            return False, f"{unproven}; nothing was signalled", None
+        if not stopped:
+            return False, f"Sparrow (pid {holder}) did not stop", "detached"
+        how, manager = f"stopped Sparrow (pid {holder})", "detached"
+    _, left, _ = resolve_sparrow(cfg)
+    if left is not None:
+        return False, f"{how}, but pid {left} still holds Sparrow's lock", manager
+    return True, how, manager
+
+
 def ensure_sparrow(cfg: dict, health: bool) -> int:
     """Leave a Sparrow running and connected: start one if none runs, replace one outside
     the installed service, or (with `health`) one that lacks REMOTE_HEALTH_COMMAND."""
     state, instance = _state_dir(cfg), _instance(cfg)
     started = time.time()
-    holder = _cli.live_lock_holder(_cli._lock_record(state, instance))
-    owner = _unit_owner()
+    owner, holder, fresh = resolve_sparrow(cfg)
+    holder = holder if fresh else None
     if owner == UNIT_UNREACHABLE:
         return _unit_state_unknown(cfg, holder, "systemctl --user did not answer")
     if owner == "other":
@@ -473,7 +615,37 @@ def _await_connected(state: Path, instance: str, since: "float | None") -> int:
 
 
 def keepawake(cfg: dict, log: Path, now: float | None = None) -> int:
+    from . import self_upgrade
     now = time.time() if now is None else now
+    settled, blocked = None, None
+    # Held across the probe and the restart, so an upgrade cannot start in between.
+    with self_upgrade.upgrade_lock(_state_dir(cfg)) as free:
+        if free:
+            # A dead upgrade is settled first: a restart must never run its unverified target.
+            settled, blocked = _settle_upgrade(cfg, now)
+        if free and not blocked:
+            up, restarted, rc, reason = _keep_listener(cfg, now)
+        else:
+            up, restarted, rc, reason = listener_up(cfg, now), 0, 0, None
+    if not free:
+        print("an upgrade is running; Sparrow is left as it is")
+    elif blocked:
+        rc, reason = 1, UPGRADE_FAILED
+        print(f"error: Sparrow is not restarted: {blocked}; run ag2-sparrow-hatch install to "
+              "put a verified version back", file=sys.stderr)
+    upgrade = _served_setup(cfg, settled, blocked) if free else "running"
+    line = f"{_utc(now)} keepawake listener={'up' if up else 'down'} restarted={restarted}" \
+        + (f" reason={reason}" if reason else "") + (f" upgrade={upgrade}" if upgrade else "")
+    log.parent.mkdir(parents=True, exist_ok=True)
+    with log.open("a", encoding="utf-8") as fh:
+        fh.write(line + "\n")
+    print(line)
+    return rc
+
+
+def _keep_listener(cfg: dict, now: float) -> "tuple[bool, int, int, str | None]":
+    """Restart Sparrow if it is down, or replace one without the health command:
+    (up, restarted, rc, reason)."""
     up, restarted, rc, reason = listener_up(cfg, now), 0, 0, None
     if not up:
         ok, how = restart_listener(cfg)
@@ -493,23 +665,37 @@ def keepawake(cfg: dict, log: Path, now: float | None = None) -> int:
             else:
                 print(f"the replace failed: {how}", file=sys.stderr)
                 rc = 1
-    _refresh_setup(cfg)
-    line = f"{_utc(now)} keepawake listener={'up' if up else 'down'} restarted={restarted}" \
-        + (f" reason={reason}" if reason else "")
-    log.parent.mkdir(parents=True, exist_ok=True)
-    with log.open("a", encoding="utf-8") as fh:
-        fh.write(line + "\n")
-    print(line)
-    return rc
+    return up, restarted, rc, reason
 
 
-def _refresh_setup(cfg: dict) -> None:
-    """Refresh the served setup cache; never fails the run."""
-    from . import runtime_text
+def _settle_upgrade(cfg: dict, now: float) -> "tuple[str | None, str | None]":
+    """Settle a dead upgrade attempt, with the upgrade lock held: (verdict, why Sparrow must
+    not be started). A settlement that raises blocks too; never fails the run."""
+    from . import self_upgrade
     try:
-        runtime_text.refresh_cache(_state_dir(cfg), _instance(cfg))
+        settled = self_upgrade.settle_attempt(cfg, _state_dir(cfg), now)
+    except self_upgrade.JournalError:
+        return None, self_upgrade.recovery_blocked(_state_dir(cfg))
+    except Exception as e:  # noqa: BLE001 - keepawake's own job must still be logged
+        print(f"NOTE upgrade: {diagnostics.describe(e)}", file=sys.stderr)
+        return None, f"the upgrade attempt could not be settled ({type(e).__name__})"
+    return settled, self_upgrade.recovery_blocked(_state_dir(cfg))
+
+
+def _served_setup(cfg: dict, settled: "str | None" = None,
+                  blocked: "str | None" = None) -> "str | None":
+    """Refresh the served setup and decide on the upgrade it calls for; never fails the run.
+    `settled` is this run's verdict on a dead attempt, which is the line's decision; while
+    `blocked` (a held recovery) no upgrade is started."""
+    from . import runtime_text, self_upgrade
+    try:
+        setup = runtime_text.refresh_cache(_state_dir(cfg), _instance(cfg))
+        if blocked:
+            return settled or "recovery-blocked"
+        return settled or self_upgrade.maybe_start(cfg, setup)
     except Exception as e:  # noqa: BLE001 - keepawake's own job must still be logged
         print(f"NOTE served setup: {diagnostics.describe(e)}", file=sys.stderr)
+        return settled
 
 
 def last_keepawake(log: Path) -> float | None:
@@ -567,7 +753,7 @@ def oldest_open_task(cfg: dict) -> "float | None":
 def health_row(cfg: dict, log: Path, now: float | None = None) -> dict | None:
     """The core row for Sparrow's heartbeat; None while no keepawake task is installed.
     `alive` also counts the hook's activity marker."""
-    from . import runtime_text
+    from . import runtime_text, self_upgrade
     now = time.time() if now is None else now
     tasks = _found(cron_dir(cfg), TASK)
     if not tasks:
@@ -590,6 +776,9 @@ def health_row(cfg: dict, log: Path, now: float | None = None) -> dict | None:
     oldest = oldest_open_task(cfg)
     if oldest is not None and now - oldest > tune["stuck_task_age_s"]:
         problems.append((TASK_NOT_PICKED_UP, oldest + tune["stuck_task_age_s"]))
+    failed = self_upgrade.failed_since(_state_dir(cfg))
+    if failed is not None:
+        problems.append((UPGRADE_FAILED, failed))
     # Fresh but never run: no evidence either way yet.
     condition = "abnormal" if problems else "healthy" if ran is not None else "unknown"
     reason, since = problems[0] if problems else (None, None)
