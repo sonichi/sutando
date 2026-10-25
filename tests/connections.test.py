@@ -653,6 +653,15 @@ class ImportFromChannelFile(ChannelFileBase):
         with unittest.mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.ws / "nowhere")}):
             self.assertEqual(C.primary_token_from_channel_file({}), "")
 
+    def test_a_resolver_error_is_no_token_and_the_import_still_answers(self):
+        self.write_relay_env(f"REMOTE_TASK_TOKEN={TOKEN_A}")
+        import channel_credentials
+        with unittest.mock.patch.object(channel_credentials, "channel_credentials",
+                                        side_effect=PermissionError("channels dir unreadable")):
+            self.assertEqual(C.primary_token_from_channel_file({}), "")
+            self.assertEqual(C.import_from_env({}, workspace=self.ws, vault=self.vault), [])
+        self.assertFalse(C.record_path(self.ws).exists())
+
 
 class ListSelfHeals(ChannelFileBase):
     def test_an_empty_record_imports_the_file_token_and_persists_it(self):
