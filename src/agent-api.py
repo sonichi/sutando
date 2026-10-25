@@ -1317,9 +1317,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         """Check API token if configured. Returns True if authorized."""
         if not API_TOKEN:
             return True  # No token = no auth required (local use)
-        import hmac as _hmac
-        token = self.headers.get("Authorization", "").replace("Bearer ", "")
-        if _hmac.compare_digest(token, API_TOKEN):
+        if local_api_gate.bearer_matches(self.headers.get("Authorization", ""), API_TOKEN):
             return True
         self.send_json(401, {"error": "unauthorized"})
         return False
