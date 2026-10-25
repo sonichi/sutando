@@ -187,7 +187,7 @@ def connections_bearer() -> str:
 def connections_http(method: str, path: str, body: dict, query: Optional[dict] = None, *,
                      workspace: Optional[Path] = None, repo: Optional[Path] = None,
                      logs_dir: Optional[Path] = None, vault=None, fetch=None, spawn=None,
-                     kill=None) -> "tuple[int, Optional[dict]]":
+                     kill=None, getaddrinfo=None) -> "tuple[int, Optional[dict]]":
     """(status, payload) for one request under CONNECTIONS_PREFIX; payload None = empty body.
     The HTTP shape of the connections domain: GET lists, POST previews or (confirm) creates,
     DELETE removes, POST <instance>/primary moves the primary, POST <instance>/reconnect
@@ -208,7 +208,7 @@ def connections_http(method: str, path: str, body: dict, query: Optional[dict] =
             confirm = body.get("confirm", False)
             if not isinstance(confirm, bool):
                 return 400, {"error": "confirm must be a boolean"}
-            preview = _connections.preview_connection(token, fetch=fetch)
+            preview = _connections.preview_connection(token, fetch=fetch, getaddrinfo=getaddrinfo)
             if not confirm:
                 return 200, {"preview": preview}
             expected = body.get("expected_server")
@@ -238,7 +238,8 @@ def connections_http(method: str, path: str, body: dict, query: Optional[dict] =
             return 200, {"connection": _connections.status_for(row, ws)}
         if len(parts) == 2 and method == "POST" and parts[1] == "reconnect":
             record = _connections.reconnect(parts[0], repo=repo, logs_dir=logs_dir, workspace=ws,
-                                            vault=vault, spawn=spawn, kill=kill, fetch=fetch)
+                                            vault=vault, spawn=spawn, kill=kill, fetch=fetch,
+                                            getaddrinfo=getaddrinfo)
             return 202, {"launch": record}
         return 404, {"error": "not found"}
     except _connections.VaultUnavailable:

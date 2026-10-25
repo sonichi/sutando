@@ -39,14 +39,22 @@ grants the new gateway nothing beyond what its own token already carries.
 Adding is two-step and does not care where the code came from (pasted into the UI,
 typed at the CLI, handed over by a browser flow, present in the environment):
 
-1. **Preview.** `preview_connection(token)` first checks the gateway host: it must be a
-   multi-label server name, never an IP literal, loopback, link-local or private address
-   or a single label (the resolver's own `is_server_name` and never-fetched rules);
-   anything else is refused as `invalid_gateway` before any probe, so the token cannot
-   be used to scan the machine. It then asks the DotSpace resolver which server the host
-   is registered for (`dotspace_for(gateway_host)`, source config or well-known) and runs
-   the bridge's own authenticated probe (`GET /v1/agents` under the token's bearer,
-   following no redirect). **A listing can confirm an identity, never establish one:**
+1. **Preview.** `preview_connection(token)` first checks the gateway URL and host: the
+   URL must be `https`, and the host a multi-label server name under none of the reserved
+   suffixes (`.localhost .local .internal .test .example .invalid .onion .home.arpa`),
+   never an IP literal or a single label (the resolver's own `is_server_name` and
+   never-fetched rules). It then resolves the name **once** and refuses it if any answer
+   is loopback, private, link-local, multicast, reserved, unspecified or an IPv4-mapped
+   form of those. Any of these is `invalid_gateway` before a single packet, so a token
+   cannot aim the probe at the operator's own machine or network; a name that does not
+   resolve is `unreachable (resolution)`, also unprobed. The probe itself is **pinned**
+   to the vetted address (TCP to that IP, SNI and `Host` carrying the original name), so
+   a DNS re-answer between the check and the connect cannot swap the target. It then
+   asks the DotSpace resolver which server the host is registered for
+   (`dotspace_for(gateway_host)`, source config or well-known) and runs the bridge's own
+   authenticated probe (`GET /v1/agents` under the token's bearer, following no redirect).
+   The same guard runs on confirm (which previews again server-side) and on `reconnect`'s
+   identity learn. **A listing can confirm an identity, never establish one:**
    `verified: true` (`server_source: identity`) only when the gateway names exactly one
    agent whose server is the registered server. A registered host whose listing disagrees
    or is missing stays `resolver`; an unregistered host is the server itself (`gateway`)

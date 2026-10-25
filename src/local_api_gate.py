@@ -124,10 +124,13 @@ def local_api_token(workspace: Path, configured: str = "") -> str:
 
 
 def bearer_matches(authorization: str, expected: str) -> bool:
+    """Constant-time compare on bytes, so a header outside ASCII is a plain mismatch."""
     presented = (authorization or "").strip()
     if presented.lower().startswith("bearer "):
         presented = presented[7:].strip()
-    return bool(expected) and bool(presented) and hmac.compare_digest(presented, expected)
+    if not expected or not presented:
+        return False
+    return hmac.compare_digest(presented.encode("utf-8", "replace"), expected.encode("utf-8", "replace"))
 
 
 def bearer_request_allowed(origin, host, authorization, *, expected_token: str,

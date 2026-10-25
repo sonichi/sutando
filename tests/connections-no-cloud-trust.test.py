@@ -24,6 +24,8 @@ sys.path.insert(0, str(ROOT / "src"))
 
 import connections as C  # noqa: E402
 
+C.DEFAULT_GETADDRINFO = lambda host, port, **kw: [(2, 1, 6, "", ("93.184.216.34", port))]
+
 SOURCE = ROOT / "src" / "connections.py"
 FORBIDDEN_MODULES = {"cloud_auth", "credential_resolver", "trusted_cloud_hosts"}
 FORBIDDEN_TEXT = ("cloud-auth", "cloud_auth", "trusted_cloud_hosts", "state/auth", "apiBase")
@@ -68,13 +70,13 @@ class NoCloudTrust(unittest.TestCase):
             sentinel.write_text("{}")
             before = sentinel.stat().st_mtime_ns
             vault = FakeVault()
-            C.import_from_env({"REMOTE_TASK_TOKEN": "https://a.example|s"}, workspace=ws, vault=vault)
-            C.add_connection("https://b.example|t", added_by="ui", expected_server="b.example",
-                             fetch=lambda u, t: {}, workspace=ws, vault=vault)
-            C.set_primary("b-example", workspace=ws)
-            C.launch("b-example", repo=ws, logs_dir=ws / "logs", environ={}, workspace=ws, vault=vault,
+            C.import_from_env({"REMOTE_TASK_TOKEN": "https://a-fixture.net|s"}, workspace=ws, vault=vault)
+            C.add_connection("https://b-fixture.net|t", added_by="ui", expected_server="b-fixture.net",
+                             fetch=lambda *a: {}, workspace=ws, vault=vault)
+            C.set_primary("b-fixture-net", workspace=ws)
+            C.launch("b-fixture-net", repo=ws, logs_dir=ws / "logs", environ={}, workspace=ws, vault=vault,
                      spawn=lambda argv, env, log: 1)
-            C.remove_connection("b-example", force=True, workspace=ws, vault=vault)
+            C.remove_connection("b-fixture-net", force=True, workspace=ws, vault=vault)
             written = sorted(str(p.relative_to(ws)) for p in ws.rglob("*") if p.is_file()
                              and p != sentinel)
             for rel in written:

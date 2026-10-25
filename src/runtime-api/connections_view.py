@@ -30,11 +30,12 @@ CONFLICT = -32009
 
 class ConnectionsView:
     def __init__(self, workspace: str | Path, repo: str | Path, logs_dir: str | Path,
-                 vault=None, fetch=None, spawn=None, kill=None):
+                 vault=None, fetch=None, spawn=None, kill=None, getaddrinfo=None):
         self.workspace = Path(workspace)
         self.repo = Path(repo)
         self.logs_dir = Path(logs_dir)
         self.vault, self.fetch, self.spawn, self.kill = vault, fetch, spawn, kill
+        self.getaddrinfo = getaddrinfo
 
     def _instance(self, params: dict) -> str:
         instance = params.get("instance")
@@ -61,7 +62,7 @@ class ConnectionsView:
         if not isinstance(confirm, bool):
             raise ProtocolError(-32602, "confirm must be a boolean")
         try:
-            preview = connections.preview_connection(token, fetch=self.fetch)
+            preview = connections.preview_connection(token, fetch=self.fetch, getaddrinfo=self.getaddrinfo)
             if not confirm:
                 return {"preview": preview}
             expected = params.get("expected_server")
@@ -103,7 +104,8 @@ class ConnectionsView:
         try:
             record = connections.reconnect(instance, repo=self.repo, logs_dir=self.logs_dir,
                                            workspace=self.workspace, vault=self.vault,
-                                           spawn=self.spawn, kill=self.kill)
+                                           spawn=self.spawn, kill=self.kill, fetch=self.fetch,
+                                           getaddrinfo=self.getaddrinfo)
         except connections.ConnectionsError as e:
             raise ProtocolError(-32602, str(e))
         return {"launch": record}

@@ -37,7 +37,10 @@ import signal
 import subprocess
 import sys
 import hashlib
+import http.client
 import ipaddress
+import socket
+import ssl
 import tempfile
 import time
 import urllib.error
@@ -71,6 +74,10 @@ _REQUIRED = ("server", "instance", "gateway_url", "token_ref", "primary", "added
              "server_source")
 PROBE_TIMEOUT_S = 15
 STOP_TIMEOUT_S = 8
+# Names that never belong to a public homeserver; a probe there would scan the operator's own network.
+RESERVED_SUFFIXES = (".localhost", ".local", ".internal", ".test", ".example", ".invalid", ".onion", ".home.arpa")
+# The host's own resolver unless a test injects one.
+DEFAULT_GETADDRINFO: Optional[Callable] = None
 
 
 class ConnectionsError(Exception):
@@ -185,22 +192,67 @@ def channel_dir_for(instance: str, environ: Optional[Mapping[str, str]] = None) 
 
 # ── preview: who is this token, according to its gateway ─────────────────────
 
-def _fetch_agents(gateway_url: str, token: str) -> dict:
-    """The gateway's own `GET /v1/agents` under the token's bearer; the bridge's auth probe."""
-    req = urllib.request.Request(gateway_url.rstrip("/") + "/v1/agents", method="GET")
-    req.add_header("Authorization", f"Bearer {secret_of(token)}")
-    req.add_header("Accept", "application/json")
-    req.add_header("User-Agent", "sutando-gateway-client/1.0")
-    opener = urllib.request.build_opener(_NoRedirect())
-    with opener.open(req, timeout=PROBE_TIMEOUT_S) as resp:
-        return json.loads(resp.read().decode("utf-8") or "{}")
+def _public_address(ip: str) -> bool:
+    """Whether `ip` may be a homeserver's: not loopback, private, link-local, multicast, reserved
+    or unspecified, in its own form or as the IPv4 an IPv6 address maps."""
+    try:
+        addr = ipaddress.ip_address(ip.split("%", 1)[0])
+    except ValueError:
+        return False
+    for a in (addr, getattr(addr, "ipv4_mapped", None)):
+        if a is not None and (a.is_loopback or a.is_private or a.is_link_local or a.is_multicast
+                              or a.is_reserved or a.is_unspecified):
+            return False
+    return True
 
 
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    """An answer is attributed to the host asked, never to one it redirects to."""
+def vetted_address(host: str, port: int, getaddrinfo=None) -> Optional[str]:
+    """Resolve `host` once; the first address when every answer is public, '' when any is not,
+    None when the name does not resolve. The caller pins the connection to the address it got."""
+    getaddrinfo = getaddrinfo or DEFAULT_GETADDRINFO or socket.getaddrinfo
+    try:
+        infos = getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except (OSError, ValueError):
+        return None
+    addresses = [str(info[4][0]) for info in infos if info and info[4]]
+    if not addresses:
+        return None
+    if not all(_public_address(ip) for ip in addresses):
+        return ""
+    return addresses[0]
 
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        raise urllib.error.HTTPError(req.full_url, code, "redirect refused", headers, fp)
+
+def _connect(address: str, port: int, host: str, timeout: float):
+    """TLS to the vetted address with the name for SNI and the certificate check."""
+    sock = socket.create_connection((address, port), timeout=timeout)
+    try:
+        return ssl.create_default_context().wrap_socket(sock, server_hostname=host)
+    except Exception:
+        sock.close()
+        raise
+
+
+def _fetch_agents(gateway_url: str, token: str, address: str, *, connect=None) -> dict:
+    """The gateway's own `GET /v1/agents` under the token's bearer, over a connection pinned to
+    the vetted `address` with the URL's host as SNI and Host. Anything but 200 raises HTTPError
+    with that status: a redirect is never followed."""
+    parts = urllib.parse.urlsplit(gateway_url)
+    host = parts.hostname or ""
+    port = parts.port or 443
+    sock = (connect or _connect)(address, port, host, PROBE_TIMEOUT_S)
+    conn = http.client.HTTPConnection(host, port, timeout=PROBE_TIMEOUT_S)
+    conn.sock = sock  # the transport is the pinned one; connect() is never reached
+    try:
+        conn.request("GET", parts.path.rstrip("/") + "/v1/agents", headers={
+            "Host": parts.netloc, "Authorization": f"Bearer {secret_of(token)}",
+            "Accept": "application/json", "User-Agent": "sutando-gateway-client/1.0"})
+        resp = conn.getresponse()
+        body = resp.read()
+    finally:
+        conn.close()
+    if resp.status != 200:
+        raise urllib.error.HTTPError(gateway_url, resp.status, resp.reason, resp.headers, None)
+    return json.loads(body.decode("utf-8") or "{}")
 
 
 # The resolver used when a caller passes none: `dotspace.dotspace_for` once that module imports.
@@ -235,9 +287,9 @@ def resolve_server(host: str, resolver=None) -> str:
 
 
 def gateway_host_ok(host: str) -> bool:
-    """Whether a gateway host may be probed at all: a multi-label server name, never an IP
-    literal, loopback, link-local or private address, by the resolver's own rules."""
-    if not host or "." not in host:
+    """Whether a gateway host may be probed at all: a multi-label server name under no reserved
+    suffix, never an IP literal, by the resolver's own rules; the addresses are vetted after."""
+    if not host or "." not in host or host.endswith(RESERVED_SUFFIXES):
         return False
     try:
         ipaddress.ip_address(host)
@@ -254,8 +306,8 @@ def gateway_host_ok(host: str) -> bool:
         return re.fullmatch(r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+", host) is not None
 
 
-def preview_connection(token: str, *, fetch: Optional[Callable[[str, str], dict]] = None,
-                       resolver=None) -> dict:
+def preview_connection(token: str, *, fetch: Optional[Callable] = None, resolver=None,
+                       getaddrinfo=None) -> dict:
     """What saving this token would record, without saving: the gateway URL as issued, the
     server and where it came from (`server_source`), and whether the token authenticated
     (`authenticated` None when the gateway gave no verdict).
@@ -263,21 +315,29 @@ def preview_connection(token: str, *, fetch: Optional[Callable[[str, str], dict]
     The gateway's agent listing can CONFIRM an identity, never establish one: `verified` is
     true only when the listing names one agent whose server is the DotSpace the resolver
     registers for the gateway host. An unregistered host stays the server itself, whatever the
-    listing claims. A host that is an address, loopback, private or single-label is refused
-    before any probe."""
+    listing claims. The gateway URL must be https and its host a public server name: an http
+    URL, an address, a reserved or single-label name, or a name resolving to any non-public
+    address is refused as invalid_gateway before any probe; the probe is pinned to the vetted
+    address."""
     url = gateway_url_of(token)
     if not url:
         raise InvalidToken("token carries no gateway URL (expected 'https://<gateway>|<secret>')")
     host = server_of_token(token)
-    if not gateway_host_ok(host):
+    if not url.lower().startswith("https://") or not gateway_host_ok(host):
         raise InvalidToken("invalid_gateway")
     registered = resolve_server(host, resolver)
     out = {"gateway_url": url, "gateway_host": host, "server": registered or host,
            "server_source": "resolver" if registered else "gateway",
            "agent_mxid": None, "verified": False, "authenticated": None, "error": None}
+    address = vetted_address(host, urllib.parse.urlsplit(url).port or 443, getaddrinfo)
+    if address == "":
+        raise InvalidToken("invalid_gateway")
+    if address is None:
+        out["error"] = "unreachable (resolution)"
+        return out
     fetch = _fetch_agents if fetch is None else fetch
     try:
-        answer = fetch(url, token)
+        answer = fetch(url, token, address)
     except urllib.error.HTTPError as e:
         out["authenticated"] = False if e.code in (401, 403) else None
         out["error"] = {401: "auth_rejected", 403: "auth_rejected", 404: "not_a_gateway"}.get(
@@ -501,8 +561,9 @@ def removed_env_refs(workspace: Optional[Path] = None) -> list:
 
 
 def add_connection(token: str, *, added_by: str, expected_server: str, instance: Optional[str] = None,
-                   preview: Optional[dict] = None, fetch: Optional[Callable[[str, str], dict]] = None,
-                   resolver=None, workspace: Optional[Path] = None, vault=None) -> "tuple[dict, bool]":
+                   preview: Optional[dict] = None, fetch: Optional[Callable] = None,
+                   resolver=None, getaddrinfo=None, workspace: Optional[Path] = None,
+                   vault=None) -> "tuple[dict, bool]":
     """Save the token as a row once its gateway still answers to `expected_server`.
 
     Returns (row, created). The same connection (see `_same_connection`) returns its row,
@@ -515,7 +576,8 @@ def add_connection(token: str, *, added_by: str, expected_server: str, instance:
         raise ConnectionsError(f"added_by must be one of {', '.join(ADDED_BY)}")
     if instance is not None and not isinstance(instance, str):
         raise ConnectionsError("instance must be a string")
-    seen = preview if preview is not None else preview_connection(token, fetch=fetch, resolver=resolver)
+    seen = preview if preview is not None else preview_connection(token, fetch=fetch, resolver=resolver,
+                                                                  getaddrinfo=getaddrinfo)
     server = str(seen.get("server") or "")
     if not server:
         raise InvalidToken("token carries no gateway URL (expected 'https://<gateway>|<secret>')")
@@ -875,7 +937,7 @@ def stop_bridge(instance: str, *, workspace: Optional[Path] = None, kill=None,
 
 def reconnect(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Mapping[str, str]] = None,
               workspace: Optional[Path] = None, vault=None, spawn=None, kill=None,
-              python: Optional[str] = None, fetch=None) -> dict:
+              python: Optional[str] = None, fetch=None, getaddrinfo=None) -> dict:
     """Relaunch exactly this one bridge: stop the running one, learn the identity its token
     answers to now (a provisional row is re-keyed), then `launch`."""
     stopped = stop_bridge(instance, workspace=workspace, kill=kill)
@@ -886,7 +948,8 @@ def reconnect(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Ma
         token = (environ.get(ref) or "").strip() or _vault_get(_vault(vault), ref)
         if token:
             try:
-                learn_identity(instance, preview_connection(token, fetch=fetch), workspace=workspace)
+                learn_identity(instance, preview_connection(token, fetch=fetch, getaddrinfo=getaddrinfo),
+                               workspace=workspace)
             except ConnectionsError:
                 pass
     record = launch(instance, repo=repo, logs_dir=logs_dir, environ=environ, workspace=workspace,

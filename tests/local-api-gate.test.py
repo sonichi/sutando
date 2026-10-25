@@ -58,6 +58,10 @@ class Token(unittest.TestCase):
         self.assertFalse(G.bearer_matches("", "abc"))
         self.assertFalse(G.bearer_matches("Bearer ", "abc"))
         self.assertFalse(G.bearer_matches("Bearer x", ""), "an empty expectation never matches")
+        self.assertFalse(G.bearer_matches("Bearer caf\u00e9", "cafe"), "a non-ASCII header is a mismatch, not an error")
+        self.assertTrue(G.bearer_matches("Bearer caf\u00e9", "caf\u00e9"))
+        self.assertEqual(G.bearer_request_allowed(None, "127.0.0.1", "Bearer caf\u00e9", expected_token="t",
+                                                  bound_port=None), (401, "unauthorized"))
 
 
 class Gate(unittest.TestCase):
