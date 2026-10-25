@@ -206,6 +206,18 @@ class TestConfig(unittest.TestCase):
             self.assertIsNone(ds.parse_well_known(block(mcp_url=value), "new.space"), value)
         self.assertIsNotNone(ds.parse_well_known(block(gateway_url="http://chat.new.space/relay?x=1"), "new.space"))
 
+    def test_control_characters_are_refused_before_the_url_is_parsed(self):
+        """urlsplit silently drops tab, CR and LF; a value that needs that to parse is refused as
+        written, and nothing with a control character or a space is ever stored."""
+        for field, value in [("mcp_url", "https://m.ne\tw.space/mcp"), ("mcp_url", "https://mcp.new.space/mcp\r\nHost: evil.com"),
+                             ("cloud_origin", "https://sut\nando.new.space"), ("gateway_url", "https://chat.new.space/re lay"),
+                             ("gateway_url", "https://chat.new.space/\x00"), ("mcp_url", "https://mcp.new.space/\x7f")]:
+            self.assertIsNone(ds.parse_well_known(block(**{field: value}), "new.space"), (field, value))
+        ok = ds.parse_well_known(block(cloud_origin="https://Sutando.new.space/api/"), "new.space")
+        self.assertEqual(ok["cloud_origin"], "https://sutando.new.space", "an origin is scheme and host only")
+        self.assertIsNone(ds.parse_well_known(block(cloud_origin="http://sutando.new.space"), "new.space"),
+                          "the Cloud origin is dialled with a bearer: https only")
+
     def test_ip_literals_and_single_labels_are_never_fetched(self):
         for name in ("[::1]:8448", "127.0.0.1", "localhost:8448", "!r:10.0.0.1", "@u:[fe80::1]"):
             f = Fetcher(block())

@@ -118,7 +118,8 @@ def _strict_url(value: Any, *, endpoint: bool = False) -> Optional[str]:
     if not v:
         return ""
     schemes = ("https://",) if endpoint else ("http://", "https://")
-    if "\\" in v or not v.lower().startswith(schemes):
+    # urlsplit deletes tab, CR and LF before parsing, so they are refused on the raw string.
+    if "\\" in v or any(ord(c) <= 0x20 or ord(c) == 0x7F for c in v) or not v.lower().startswith(schemes):
         return None
     try:
         parts = urllib.parse.urlsplit(v)
@@ -296,8 +297,8 @@ def parse_well_known(text: Optional[str], fetched_host: str) -> Optional[Dict[st
         return None
     # Every value is validated as strictly as a typed name, or the whole block is refused: these
     # strings reach `?via=`, the relay URL and a Cloud origin on another DotSpace's say-so.
-    gateway_url, cloud_url = (_strict_url(block.get(k)) for k in ("gateway_url", "cloud_origin"))
-    mcp_url = _strict_url(block.get("mcp_url"), endpoint=True)
+    gateway_url = _strict_url(block.get("gateway_url"))
+    cloud_url, mcp_url = (_strict_url(block.get(k), endpoint=True) for k in ("cloud_origin", "mcp_url"))
     via_raw = str(block.get("link_via") or "").strip().lower().rstrip(".")
     if None in (gateway_url, cloud_url, mcp_url) or (via_raw and not is_server_name(via_raw)):
         return None
@@ -331,8 +332,15 @@ def _may_speak_for(fetched_host: str, server: str) -> bool:
 
 
 def _origin(value: Any) -> str:
-    v = str(value or "").strip().rstrip("/")
-    return v if v.lower().startswith(("http://", "https://")) else ""
+    """`scheme://host[:port]` of an http(s) URL, nothing after the host; "" otherwise."""
+    v = str(value or "").strip()
+    if not v.lower().startswith(("http://", "https://")):
+        return ""
+    try:
+        parts = urllib.parse.urlsplit(v)
+    except ValueError:
+        return ""
+    return f"{parts.scheme.lower()}://{parts.netloc.lower()}" if parts.netloc else ""
 
 
 def _well_known(host: str, fetch: Fetch) -> Optional[Dict[str, Any]]:
