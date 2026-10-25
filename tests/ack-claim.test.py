@@ -93,6 +93,16 @@ def main() -> int:
             refused = True
         check(refused, f"e) malformed key {bad!r} refused")
 
+    try:
+        ack_claim.update(ws, k2, "x", "delivered")
+        refused = False
+    except ValueError:
+        refused = True
+    check(refused, "e) an unknown state is refused")
+    ack_claim.claim(ws, "ack:task-1761300000005:initial", "mine")
+    held = [r["key"] for r in ack_claim.held_by(ws, "mine")]
+    check(held == ["ack:task-1761300000005:initial"], f"d) held_by skips unreadable records ({held})")
+
     # CONTROL: interleave two check-then-replace writers by hand: both pass the check.
     k4 = "ack:task-1761300000004:initial"
     a = replace_writer(ws, k4, "a")
