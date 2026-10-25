@@ -21,6 +21,8 @@ Full spec: docs/remote-gateway-protocol.md
                "capabilities": ["voice-outcome-v1"], "dm_only": false}  → 200 on accepted
   POST {REMOTE_TASK_URL}/v1/heartbeat
        → body {"client": "...", "inflight": N, ...}  → 200 on accepted
+  GET  {REMOTE_TASK_URL}/v1/setup
+       → 200 the agent's own agent.setup.steps result (when a heartbeat announces a new revision)
 
 Each task object uses the same schema Sutando's other bridges write, so this
 client just serializes it to `tasks/task-<id>.txt` and the core handles it like
@@ -315,7 +317,8 @@ from .chat_secret_filter import filter_chat_secrets, secret_handling_instruction
 from .task_archive import find_task_file
 from .local_task_protocol import find_archived_task
 from . import (agent_identity, diagnostics, gateway_credential_io, gateway_credential_sources,
-               gateway_credentials, gateway_instance, local_task_protocol, routing_migrations)
+               gateway_credentials, gateway_instance, local_task_protocol, routing_migrations,
+               setup_fetch)
 from .bounded_file_read import read_regular, read_regular_text
 from .result_markers import parse_markers, render_skill_prelude
 from .result_markers import neutralize_markers
@@ -3643,6 +3646,7 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
         reply = _req("POST", "/v1/heartbeat", payload, timeout=10)
         _heartbeat_retry_at, _heartbeat_backoff = 0.0, 0.0
         _record_setup_hint(reply)
+        _refresh_served_setup(reply)
         return True
     except urllib.error.HTTPError as e:
         if e.code in (404, 405):
@@ -3683,6 +3687,27 @@ def _record_setup_hint(reply) -> None:
         return
     if not _durable_write(SETUP_HINT_FILE, text):
         _log("setup hint not recorded")
+
+
+_SETUP_REFRESHER: "setup_fetch.Refresher | None" = None
+
+
+def _refresh_served_setup(reply) -> None:
+    """Fetch the served setup when the reply announces a revision Sparrow does not hold; never
+    raises, and a failed fetch keeps the last good copy (setup_fetch.Refresher)."""
+    global _SETUP_REFRESHER
+    if not isinstance(reply, dict):
+        return
+    if _SETUP_REFRESHER is None:
+        _SETUP_REFRESHER = setup_fetch.Refresher(
+            lambda path, t: _req("GET", path, timeout=t, deadline=time.monotonic() + t),
+            _durable_write, _STATE, GATEWAY_INSTANCE, log=_log, gateway_url=URL)
+    try:
+        agent = _reenroll_identity()
+    except Exception as e:  # noqa: BLE001 - an unread identity only skips the agent_mxid check
+        _log(f"served setup: identity unread ({diagnostics.describe(e)})")
+        agent = ""
+    _SETUP_REFRESHER.maybe_refresh(diagnostics.revision_field(reply.get("setup_revision"), URL), agent)
 
 
 def _emit_gateway_status(connected: bool, *, error: str | None = None,

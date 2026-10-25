@@ -272,6 +272,7 @@ jobs:
           timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_cloud_session_contract.py
           timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_cloud_session_interlock.py
           timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_adapter_differential.py
+          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_setup_fetch.py
           timeout -k 5 120 python3 packages/ag2-sparrow/tools/test_no_drift.py
           timeout -k 5 300 python3 packages/ag2-sparrow/tests/test_wheel_contents.py
           timeout -k 5 120 python3 skills/agent-room-ops/test_room_ops.py

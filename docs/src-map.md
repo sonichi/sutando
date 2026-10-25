@@ -223,6 +223,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`startup-runtime.sh`** — Runtime/credential decisions shared by startup and behavior-level tests.
 - **`startup.sh`** — Sutando startup — starts available services + the selected core CLI.
 - **`station_stamp.py`** — The desktop's station stamp: what the running core's sutando-station server was started with.
+- **`status_ack_policy.py`** — Whether to send one task's initial status acknowledgement, what it says, and where it goes.
 - **`stop.sh`** — Stop all Sutando services (shortcut for restart.sh --stop-only)
 - **`stop_hook_repeat.py`** — The Stop hook's same-queue repeat counter, per runtime instance.
 - **`stop_hook_unwatched.py`** — The Stop hook's consecutive-unwatched-turn-end counter, per runtime instance.

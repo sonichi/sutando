@@ -140,7 +140,7 @@ def refresh_cache(state_dir: Path, instance: str = "") -> "dict | None":
         if load_cache(state_dir) != current:
             _cli._write(cache_path(state_dir), json.dumps(current, sort_keys=True), 0o600)
         return current
-    fetched = setup_fetch.fetch_setup(kind="acp", vendor=VENDOR)
+    fetched = setup_fetch.fetch_setup(kind="acp", vendor=VENDOR, state_dir=state_dir, instance=instance)
     gateway = reported_gateway(state_dir, instance)
     why = "no setup fetched" if fetched is None else setup_problem(fetched, gateway)
     if why:

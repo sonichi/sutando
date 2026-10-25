@@ -367,6 +367,25 @@ the broker times freshness by when it received the heartbeat. A change in the ro
 sends the heartbeat at once, without waiting for the interval. A gateway with no
 Sutando checkout around it sends neither field.
 
+### `GET /v1/setup` *(optional)*
+
+The agent's own `agent.setup.steps` result (served text, tunables, package pin), for the
+bearer's agent. The heartbeat reply's `setup_revision` announces which revision applies; the
+gateway fetches only when that differs from the copy it holds, with a 10 s deadline.
+
+```
+success: 200 {"schema_version": 1, "agent_mxid": "<mxid>", "revision": "<rev>",
+              "kind": "acp", "vendor": "<vendor>", "text_schema_version": 1 | null,
+              "runtime_text": {...} | null, "tunables": {...} | null,
+              "package": {...} | null, ...}
+```
+
+The gateway keeps the result in `state/served-setup[.<instance>].json` only when the whole
+of it validates: `schema_version` 1, the announced revision, its own agent, and
+`text_schema_version` 1 with all four listener blocks, or all four `null`. Anything else, an
+HTTP error, or a timeout writes nothing, keeps the last good copy, and is retried after 60 s,
+doubling to at most an hour; a newly announced revision is tried at once.
+
 ### `POST /v1/workers` *(optional)*
 
 The worker pool this gateway fronts, pushed when the local advertisement's
@@ -771,7 +790,7 @@ not promise downstream Matrix delivery.
 
 A minimal relay needs only: an authenticated queue behind `GET /v1/tasks`
 (long-poll or return-immediately), an `ack` sink, a `results` sink, and a
-heartbeat sink. The four endpoints above are the entire contract — anything that
+heartbeat sink. Those four endpoints are the entire required contract — anything that
 implements them can drive Sutando.
 
 
