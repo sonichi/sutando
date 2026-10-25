@@ -9,7 +9,6 @@ import errno
 import hashlib
 import importlib.metadata
 import io
-import itertools
 import json
 import os
 import re
@@ -3412,7 +3411,7 @@ class Upgrade(Base):
                  (stale, [dead("snapshot", target="0.7.0"), ok("0.7.0"),
                           then(ok("0.7.0"), ok("0.7.0")),
                           then(ok("0.7.0"), owner_installs("0.5.4"), ok("0.7.0"))]),
-                 (then(restore_fails, ack), [ok("0.7.0")])]
+                 (then(restore_fails, ack), [ok("0.7.0")]), (ok(), [ok("0.7.0")])]
         kept = self.home / "history"
         with mock.patch.object(self_upgrade, "save_state", side_effect=spy), \
                 mock.patch.object(self_upgrade, "time", clock), \
@@ -3486,8 +3485,9 @@ class Upgrade(Base):
         summaries = [None] + [(k, same) for k in self.RECOVERY_SUMMARY for same in (True, False)]
         latest = time.time() + self_upgrade.CLOCK_SKEW_S
         accepted = set()
-        for shape in itertools.product(names, [None] + names, (False, True), (False, True),
-                                       summaries, (False, True)):
+        flags = (False, True)
+        for shape in ((o, p, m, h, f, i) for o in names for p in [None] + names for m in flags
+                      for h in flags for f in summaries for i in flags):
             if self_upgrade._well_formed_journal(self.shaped_journal(shape), latest):
                 accepted.add(shape)
         self.assertEqual(sorted(accepted - written, key=repr), [], "accepted, but no writer saves it")
@@ -3528,7 +3528,8 @@ class Upgrade(Base):
             "a managerless acknowledged": ({"0.6.0": acked[:2] + (False,)}, "0.6.0", None, None),
             "a failure, then a success": ({"0.6.0": acked, "0.7.0": ok}, None, "0.7.0", ["0.6.0"]),
             "a failure, a success, then its direct rerun":
-                ({"0.6.0": crashed, "0.7.0": rerun}, None, "0.7.0", ["0.6.0"])}
+                ({"0.6.0": crashed, "0.7.0": rerun}, None, "0.7.0", ["0.6.0"]),
+            "two successes in sequence": ({"0.6.0": ok, "0.7.0": ok}, None, "0.7.0", ["0.6.0"])}
         for label, want in written.items():
             found = [s for s in saved if outcomes(s) == want]
             self.assertTrue(found, f"no production writer saves {label}")
@@ -3543,30 +3544,35 @@ class Upgrade(Base):
             "a terminal with neither its summary nor a success":
                 {"attempted": {"0.6.0": dict(tried, outcome="restore-failed", phase="acknowledged")}},
             "two terminals and no summary": {"attempted": {"0.6.0": crash, "0.7.0": crash}},
-            "a success from before the terminal":
-                {"attempted": {"0.6.0": crash, "0.7.0": success}, "installed": installed},
+            "a success that time, key order and version call later, outside the lineage": {
+                "attempted": {"0.6.0": crash, "0.7.0": dict(success, at=5.0)},
+                "installed": dict(installed, at=9.0)},
             "a success keyed by the terminal": {"attempted": {"0.6.0": crash, "0.7.0": success},
                                                 "installed": dict(installed, version="0.6.0")},
-            "a success naming itself": {
-                "attempted": {"0.6.0": crash, "0.7.0": no_download},
-                "installed": dict(installed, after=["0.6.0", "0.7.0"])},
+            "a success naming itself": {"attempted": {"0.6.0": crash, "0.7.0": success},
+                                        "installed": dict(installed, after=["0.6.0", "0.7.0"])},
             "a success without what it came after": {
                 "attempted": {"0.7.0": success},
                 "installed": {k: v for k, v in installed.items() if k != "after"}},
-            "a success naming no attempt": {"attempted": {"0.7.0": success},
-                                            "installed": dict(installed, after=["0.6.0"])},
-            "a success naming a later success": {
-                "attempted": {"0.6.0": success, "0.7.0": success},
-                "installed": dict(installed, after=["0.6.0"])},
-            "a held restore-failed after the success": {
+            "a success naming a missing attempt": {"attempted": {"0.7.0": success},
+                                                   "installed": dict(installed, after=["0.6.0"])},
+            "a second success outside the lineage": {
+                "attempted": {"0.6.0": success, "0.7.0": success}, "installed": installed},
+            "a lineage listed twice": {
+                "attempted": {"0.6.0": crash, "0.7.0": success},
+                "installed": dict(installed, after=["0.6.0", "0.6.0"])},
+            "a held restore-failed before the success": {
                 "attempted": {"0.6.0": dict(tried, outcome="restore-failed", phase="restore-failed"),
                               "0.7.0": success}, "installed": dict(installed, after=["0.6.0"])},
             "the same version with no provenance": {
-                "attempted": {"0.6.0": crash, "0.7.0": no_download},
-                "installed": installed},
+                "attempted": {"0.6.0": crash, "0.7.0": no_download}, "installed": installed},
+            "a success that crashed on rerun, beside an earlier one": {
+                "attempted": {"0.6.0": crash, "0.7.0": success, "0.8.0": crash},
+                "installed": dict(installed, version="0.8.0", after=["0.6.0", "0.7.0"])},
             "a matched summary with the wrong from": {
                 "attempted": {"0.6.0": crash, "0.7.0": crash},
                 "failed": dict(summary, **{"from": "9.9.9"})}}
+        self.assertEqual(len(unreachable), 13)
         for label, journal in unreachable.items():
             self.assert_held_everywhere(json.dumps(journal), label)
 

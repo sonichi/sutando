@@ -208,18 +208,17 @@ def _well_formed_journal(state, latest: float) -> bool:
         recovered = {k for k, t in attempted.items() if t["outcome"] in RECOVERY_OUTCOMES}
         if any(attempted[k].get("phase") == "restore-failed" for k in recovered):
             return False
-        # Only a success drops the summary, and it names every recovery it came after.
+        # Only a success drops the summary, and it names every attempt it came after.
         if recovered and not recovered <= set(state.get("installed", {}).get("after", ())):
             return False
     return True
 
 
 def _followed(attempted: dict, version: str, after: list) -> bool:
-    """`after` as the success saves it: sorted, of other targets, each then a recovery
-    and since rerun at most to an outcome that keeps the success's summary."""
-    return (after == sorted(set(after)) and version not in after
-            and all(attempted.get(k, {}).get("outcome") in RECOVERY_OUTCOMES + tuple(KEEPS_FAILED)
-                    for k in after))
+    """`after` as the success saves it: every other attempt then recorded, sorted. Any other
+    success outside it came later, and would have replaced this summary."""
+    return (after == sorted(set(after)) and version not in after and set(after) <= set(attempted)
+            and all(k in after for k, t in attempted.items() if t["outcome"] == "ok" and k != version))
 
 
 def _failed_variant(failed: dict) -> bool:
@@ -1083,8 +1082,7 @@ def _upgrade_locked(cfg: dict, state_dir: Path, target: str, hashes: dict) -> st
         return rollback("Sparrow did not reconnect")
     state = load_state(state_dir)
     state.pop("failed", None)
-    after = sorted(k for k, t in state["attempted"].items()
-                   if k != target and t.get("outcome") in RECOVERY_OUTCOMES)
+    after = sorted(k for k in state["attempted"] if k != target)
     state["installed"] = {"version": target, "sha256": hashes, "at": time.time(), "after": after}
     state["attempted"].setdefault(target, {}).update(outcome="ok", phase="ok")
     if hook:
