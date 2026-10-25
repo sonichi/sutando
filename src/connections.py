@@ -199,11 +199,28 @@ def _public_address(ip: str) -> bool:
         addr = ipaddress.ip_address(ip.split("%", 1)[0])
     except ValueError:
         return False
+    # is_global also refuses shared address space (100.64/10, a tailnet range), 6to4 and
+    # site-local forms that the named predicates alone let through.
     for a in (addr, getattr(addr, "ipv4_mapped", None)):
-        if a is not None and (a.is_loopback or a.is_private or a.is_link_local or a.is_multicast
-                              or a.is_reserved or a.is_unspecified):
+        if a is not None and (not a.is_global or a.is_loopback or a.is_private or a.is_link_local
+                              or a.is_multicast or a.is_reserved or a.is_unspecified):
             return False
     return True
+
+
+def _gateway_port(url: str) -> Optional[int]:
+    """The gateway URL's port (443 when absent); None when the URL carries userinfo, a port
+    outside 1..65535, or a port that is not a number, all of which refuse the token."""
+    try:
+        parts = urllib.parse.urlsplit(url)
+        if parts.username is not None or parts.password is not None or "@" in parts.netloc:
+            return None
+        port = parts.port
+    except ValueError:
+        return None
+    if port is None:
+        return 443
+    return port if 1 <= port <= 65535 else None
 
 
 def vetted_address(host: str, port: int, getaddrinfo=None) -> Optional[str]:
@@ -323,13 +340,14 @@ def preview_connection(token: str, *, fetch: Optional[Callable] = None, resolver
     if not url:
         raise InvalidToken("token carries no gateway URL (expected 'https://<gateway>|<secret>')")
     host = server_of_token(token)
-    if not url.lower().startswith("https://") or not gateway_host_ok(host):
+    port = _gateway_port(url)
+    if not url.lower().startswith("https://") or port is None or not gateway_host_ok(host):
         raise InvalidToken("invalid_gateway")
     registered = resolve_server(host, resolver)
     out = {"gateway_url": url, "gateway_host": host, "server": registered or host,
            "server_source": "resolver" if registered else "gateway",
            "agent_mxid": None, "verified": False, "authenticated": None, "error": None}
-    address = vetted_address(host, urllib.parse.urlsplit(url).port or 443, getaddrinfo)
+    address = vetted_address(host, port, getaddrinfo)
     if address == "":
         raise InvalidToken("invalid_gateway")
     if address is None:

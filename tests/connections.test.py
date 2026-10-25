@@ -196,6 +196,34 @@ class Preview(unittest.TestCase):
                                      getaddrinfo=lambda *a, **k: self.fail(f"resolved {host}"))
             self.assertEqual(str(cm.exception), "invalid_gateway")
 
+    def test_shared_and_special_ranges_and_bad_urls_are_refused_before_any_probe(self):
+        """CGNAT 100.64/10 (a tailnet range), 6to4, site-local and their mapped forms are not
+        global; a bad port or userinfo in the URL refuses the token before resolution."""
+        def resolving_to(*ips):
+            def getaddrinfo(host, port, **kw):
+                return [(2, 1, 6, "", (ip, port)) for ip in ips]
+            return getaddrinfo
+        calls = []
+        def fetch(url, token, address):
+            calls.append(address); return {"agents": []}
+        for ips in (("100.64.0.1",), ("::ffff:100.64.0.1",), ("2002:c000:0204::1",), ("fec0::1",)):
+            with self.assertRaises(C.InvalidToken, msg=ips) as cm:
+                C.preview_connection("https://chat.alpha-fixture.net/relay|s", fetch=fetch,
+                                     getaddrinfo=resolving_to(*ips))
+            self.assertEqual(str(cm.exception), "invalid_gateway")
+        resolved = []
+        def getaddrinfo(host, port, **kw):
+            resolved.append((host, port)); return [(2, 1, 6, "", ("93.184.216.34", port))]
+        for url in ("https://chat.alpha-fixture.net:99999/relay", "https://chat.alpha-fixture.net:abc/relay",
+                    "https://chat.alpha-fixture.net:0/relay", "https://u:p@chat.alpha-fixture.net/relay",
+                    "https://u@chat.alpha-fixture.net/relay"):
+            with self.assertRaises(C.InvalidToken, msg=url) as cm:
+                C.preview_connection(url + "|s", fetch=fetch, getaddrinfo=getaddrinfo)
+            self.assertEqual(str(cm.exception), "invalid_gateway")
+        self.assertEqual((resolved, calls), ([], []), "nothing resolved or probed for a refused URL")
+        C.preview_connection("https://chat.alpha-fixture.net:8448/relay|s", fetch=fetch, getaddrinfo=getaddrinfo)
+        self.assertEqual(resolved, [("chat.alpha-fixture.net", 8448)])
+
     def test_probe_resolves_once_and_refuses_any_non_public_answer(self):
         def resolving_to(*ips):
             def getaddrinfo(host, port, **kw):
