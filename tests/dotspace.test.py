@@ -169,6 +169,34 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(ds.dotspace_for("https://evil.com@169.254.169.254/", fetch=ds.NO_FETCH).server,
                          "169.254.169.254", "a URL's userinfo is parsed off, not a host")
 
+    def test_only_server_name_characters_pass(self):
+        """An allowlist, not a denylist: `& ; " % _` and a scheme never reach a fetch or a `?via=`."""
+        for bad in ("!a:evil.com&x=1", "!a:evil.com;x", '!a:ev"il.com', "!a:evil.com%2fadmin",
+                    "!a:ag2_space", "!a:-ag2.space", "!a:ag2.space:", "!a:ag2.space:99999x", "!a:[::1"):
+            f = Fetcher(block())
+            ds.reset_cache()
+            self.assertEqual(ds.dotspace_for(bad, fetch=f, config=NONE), ds.DotSpace(server=""), bad)
+            self.assertEqual(f.calls, [], bad)
+        for good, via in (("localhost:8448", "localhost:8448"), ("[::1]:8448", "[::1]:8448"),
+                          ("127.0.0.1", "127.0.0.1"), ("a-b.example", "a-b.example")):
+            d = ds.dotspace_for(good, fetch=ds.NO_FETCH, config=NONE)
+            self.assertEqual(d.link_via or d.server, via, good)
+
+    def test_an_unregistered_parent_claim_is_refused(self):
+        """x.co.uk's well-known may not declare co.uk; the same claim stands once co.uk is registered."""
+        claim = block(server="co.uk", gateway_url="https://chat.co.uk", cloud_origin="", mcp_url="")
+        f = Fetcher(claim)
+        ds.reset_cache()
+        d = ds.dotspace_for("x.co.uk", fetch=f, config=NONE)
+        self.assertEqual(len(f.calls), 1)
+        self.assertEqual((d.server, d.source, d.gateway_host), ("x.co.uk", "none", ""))
+        ds.reset_cache()
+        d = ds.dotspace_for("x.co.uk", fetch=Fetcher(claim), config={"instances": [{"server": "co.uk"}]})
+        self.assertEqual((d.server, d.source, d.gateway_host), ("co.uk", "config", "chat.co.uk"))
+        ds.reset_cache()
+        own = ds.dotspace_for("new.space", fetch=Fetcher(block(server="new.space")), config=NONE)
+        self.assertEqual(own.source, "well-known-unverified", "a host declaring itself still counts")
+
 
 class TestWellKnown(unittest.TestCase):
     def setUp(self):
@@ -202,10 +230,18 @@ class TestWellKnown(unittest.TestCase):
         d = ds.dotspace_for("new.space", fetch=Fetcher(block(server="other.space")), config=cfg)
         self.assertEqual(d.gateway_host, "", "a block for another server fills nothing")
 
-    def test_gateway_host_serving_the_block_names_its_server(self):
-        d = ds.dotspace_for("chat.new.space", fetch=Fetcher(block(server="new.space", link_via="new.space")),
-                            config=NONE)
-        self.assertEqual((d.server, d.link_via, d.source), ("new.space", "new.space", "well-known-unverified"))
+    def test_an_unregistered_gateway_host_may_not_name_its_server(self):
+        """The same shape as x.co.uk claiming co.uk: unregistered, the host is a plain server; once
+        the server is registered the gateway host resolves to it, and a token for it still does."""
+        claim = block(server="new.space", link_via="new.space")
+        d = ds.dotspace_for("chat.new.space", fetch=Fetcher(claim), config=NONE)
+        self.assertEqual((d.server, d.link_via, d.source), ("chat.new.space", "chat.new.space", "none"))
+        ds.reset_cache()
+        d = ds.dotspace_for("chat.new.space", fetch=Fetcher(claim), config={"instances": [{"server": "new.space"}]})
+        self.assertEqual((d.server, d.gateway_host, d.source), ("new.space", "chat.new.space", "config"))
+        ds.reset_cache()
+        d = ds.dotspace_for("chat.new.space", fetch=Fetcher(claim), config=NONE, own_gateway="https://chat.new.space")
+        self.assertEqual((d.server, d.source), ("chat.new.space", "token"))
 
     def test_absent_malformed_foreign_and_failing_fall_through(self):
         cases = {

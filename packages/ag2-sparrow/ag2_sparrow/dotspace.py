@@ -87,8 +87,10 @@ LEGACY_CLOUD_HOST = "sutando.ag2.ai"
 PRODUCTION_CLOUD_ORIGIN = "https://sutando.ag2.space"
 CONFIG_SECTION = "dotspace"
 CONFIG_LIST = "instances"
-# A host name that could carry a path, query, fragment, userinfo or whitespace into a URL.
-_UNSAFE_HOST = re.compile(r"[/?#@\s]")
+# A Matrix server name and nothing else (DNS labels or an IPv6 literal, an optional port): what a
+# URL could read as a path, query, fragment, userinfo, scheme, escape or whitespace never matches.
+_SERVER_NAME = re.compile(r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*"
+                          r"|\[[0-9a-f:.]+\])(?::[0-9]{1,5})?")
 
 DEFAULT_INSTANCES: Tuple[Dict[str, str], ...] = (
     {"server": "ag2.space", "gateway_host": "chat.ag2.space",
@@ -372,7 +374,7 @@ def dotspace_for(server_or_host: str, *, fetch: Optional[Fetch] = None,
         raw = server_of_gateway_url(raw)
     name = (server_of_matrix_id(raw) or raw).strip().lower().rstrip(".")
     host = _host_only(name)
-    if not host or _UNSAFE_HOST.search(name):
+    if not host or not _SERVER_NAME.fullmatch(name):
         return DotSpace(server="")  # no server: nothing to fetch, nothing to put in a URL
     fetch = default_fetch if fetch is None else fetch
     # The most specific server wins: `chat.dev.s.space` is dev.s.space's gateway, not s.space's.
@@ -386,7 +388,9 @@ def dotspace_for(server_or_host: str, *, fetch: Optional[Fetch] = None,
                     entry[key] = block[key]  # discovery fills what the registry left unset
         return _entry_dotspace(entry, "config")
     block = _well_known(host, fetch)
-    if block and _matches(block, host):
+    # Unregistered: only a declaration for the fetched host itself; a parent claim (x.co.uk for
+    # co.uk) counts for a registered server alone, and a registered parent matched above.
+    if block and block["server"] == host:
         return DotSpace(server=block["server"], gateway_host=block["gateway_host"],
                         link_via=block["server"], mcp_url=block["mcp_url"],
                         source="well-known-unverified")

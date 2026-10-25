@@ -78,8 +78,9 @@ instance is a config entry.
    `operator` must read `ag2` for the block to parse, and it is self-asserted. `server` is
    optional (default: the host fetched) and must be that host or its parent domain, one label
    up and itself dotted (`chat.s.space` may claim `s.space`; `attacker.space` cannot claim
-   `space`); `gateway_url`, `link_via`, `cloud_origin` and `mcp_url` must sit at or under that
-   server, or the whole block is refused. For a **registered** server the block fills what
+   `space`), and a parent claim counts only for a **registered** server (`x.co.uk` cannot
+   declare `co.uk`; an unregistered host may declare itself alone); `gateway_url`, `link_via`,
+   `cloud_origin` and `mcp_url` must sit at or under that server, or the whole block is refused. For a **registered** server the block fills what
    config left unset: `gateway_host`, `mcp_url`, `link_via`, `prefer_ipv4` — never
    `cloud_origin`. For an **unregistered** server it yields operator `""`, source
    `well-known-unverified`, the discovered `gateway_host` and `mcp_url`, and no AG2 behaviour
