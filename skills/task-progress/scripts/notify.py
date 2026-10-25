@@ -489,7 +489,7 @@ def _task_payload(task_file: str) -> "Path | None":
         if str(_POOL_SCRIPTS) not in sys.path:
             sys.path.insert(0, str(_POOL_SCRIPTS))
         import resolve_inbox_entry  # type: ignore
-        return Path(resolve_inbox_entry.resolve(str(path), os.environ.get("SUTANDO_WORKSPACE_DIR") or None))
+        return Path(resolve_inbox_entry.resolve(str(path)))
     except Exception:
         return None
 
