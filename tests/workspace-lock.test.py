@@ -83,6 +83,27 @@ class LockTest(unittest.TestCase):
         self.assertEqual(data["role"], "gw")
         self.assertEqual(data["host"], HOST)
 
+    def test_the_record_names_the_holders_start_time_where_proc_exists(self):
+        proc = self.ws / "proc"
+        (proc / "sys" / "kernel" / "random").mkdir(parents=True)
+        (proc / "sys" / "kernel" / "random" / "boot_id").write_text("b-1\n")
+        (proc / "77").mkdir()
+        rest = " ".join(["S"] + ["0"] * 18 + ["12345", "0"])
+        (proc / "77" / "stat").write_bytes(f"77 (a) b) {rest}".encode())
+        self.assertEqual(self.mod.proc_start(77, proc), "b-1:12345")
+        self.assertIsNone(self.mod.proc_start(78, proc), "a gone process has none")
+        self.assertIsNone(self.mod.proc_start(77, self.ws / "absent"))
+        start = self.mod.proc_start(os.getpid())
+        if sys.platform in ("linux", "darwin"):
+            self.assertIsNotNone(start, "macOS reads it through sysctl")
+        self.mod.acquire("gw", self.ws)
+        data = json.loads(self._lock_path().read_text())
+        self.assertEqual(data.get("proc_start"), start)
+        if start is None:
+            self.assertNotIn("proc_start", data)
+        self.mod.heartbeat("gw", self.ws)
+        self.assertEqual(json.loads(self._lock_path().read_text()).get("proc_start"), start)
+
     def test_acquire_idempotent(self):
         self.assertEqual(self.mod.acquire("gw", self.ws).status, "acquired")
         self.assertEqual(self.mod.acquire("gw", self.ws).status, "acquired")

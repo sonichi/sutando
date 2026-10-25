@@ -295,12 +295,15 @@ def install_hook(mxid: str, reply_command: str, force: bool) -> bool:
 
 def render_config(mxid: str, task_dir: Path, result_dir: Path, activity_file: Path,
                   python: str, state_dir: Path, gateway_instance: str = "",
-                  reply_command: str = "", cron_dir: str = "", keepalive_log: str = "") -> str:
+                  reply_command: str = "", cron_dir: str = "", keepalive_log: str = "",
+                  auto_upgrade: str = "") -> str:
     rows = (("AGENT_MXID", mxid), ("TASK_DIR", str(task_dir)), ("RESULT_DIR", str(result_dir)),
             ("ACTIVITY_FILE", str(activity_file)), ("SPARROW_PYTHON", python),
             ("STATE_DIR", str(state_dir)), ("GATEWAY_INSTANCE", gateway_instance),
             ("REPLY_COMMAND", reply_command), ("CRON_DIR", cron_dir),
             ("KEEPALIVE_LOG", keepalive_log))
+    # Written only when set, so an owner's AUTO_UPGRADE=0 survives a re-install.
+    rows += (("AUTO_UPGRADE", auto_upgrade),) if auto_upgrade else ()
     return "".join(f"{k}={shlex.quote(v)}\n" for k, v in rows)
 
 
@@ -524,10 +527,10 @@ def saved_mxid(value) -> str:
 
 def install_service(task_dir: Path, result_dir: Path, state_dir: Path, instance: str,
                     force: bool, health_command: str = "", reply_command: str = "",
-                    mxid: str = "") -> bool:
-    """Write, enable and start the ag2-sparrow user service. Each problem prints a NOTE saying
-    what was not done and how to finish by hand; True only when this install stopped the service
-    and left it stopped, which fails the install."""
+                    mxid: str = "", may_start: bool = True) -> bool:
+    """Write, enable and (unless not `may_start`) start the ag2-sparrow user service. Each
+    problem prints a NOTE saying what was not done and how to finish by hand; True only when this
+    install stopped the service and left it stopped, which fails the install."""
     def note(text: str) -> None:
         print(f"NOTE service: {text}")
 
@@ -592,7 +595,9 @@ def install_service(task_dir: Path, result_dir: Path, state_dir: Path, instance:
         r = _systemctl(("--user", "stop", "ag2-sparrow.service"))
         stopped = _ok(r)
         print(f"stopped: {SERVICE_NAME} before installing" if stopped else
-              f"NOTE service: stop failed ({_why(r)}); it is restarted after the install instead")
+              f"NOTE service: stop failed ({_why(r)}); "
+              + ("it is restarted after the install instead" if may_start else
+                 "it keeps running the old unit (--no-start)"))
     if changed:
         _write(unit, text, 0o644)
         print(f"installed: {unit}")
@@ -619,7 +624,7 @@ def install_service(task_dir: Path, result_dir: Path, state_dir: Path, instance:
     # failed/activating/deactivating: the unit's own Sparrow crashed or is restarting.
     outside = not stopped and state == "inactive" and _outside_sparrow(state_dir, instance, main_pid, ran)
     has_token = device_env.is_file()
-    start = has_token and not outside
+    start = may_start and has_token and not outside
     if start and state == "failed":
         _systemctl(("--user", "reset-failed", "ag2-sparrow.service"))
     r = _systemctl(("--user", "enable", "--now", "ag2-sparrow.service")) if start else \
@@ -628,7 +633,10 @@ def install_service(task_dir: Path, result_dir: Path, state_dir: Path, instance:
         note(f"systemctl --user enable {SERVICE_NAME} failed ({_why(r)}); fix that and run "
              f"systemctl --user enable --now {SERVICE_NAME}")
         return False
-    if active and changed:
+    if active and changed and not may_start:
+        note(f"the unit changed but was not restarted (--no-start); run systemctl --user "
+             f"restart {SERVICE_NAME} to run it")
+    elif active and changed:
         r = _systemctl(("--user", "restart", "ag2-sparrow.service"))
         print(f"restarted: {SERVICE_NAME} with the new unit" if _ok(r) else
               f"NOTE service: restart failed ({_why(r)}); run systemctl --user restart "
@@ -641,6 +649,8 @@ def install_service(task_dir: Path, result_dir: Path, state_dir: Path, instance:
         note(f"{device_env} is missing, so the service was not started. Put your relay token "
              f"in it as one line REMOTE_TASK_TOKEN=<token>, chmod 600 it, then run: "
              f"systemctl --user start {SERVICE_NAME}")
+    elif not may_start and not active:
+        note(f"not started (--no-start); run systemctl --user start {SERVICE_NAME}")
     user = os.environ.get("USER") or os.environ.get("LOGNAME") or ""
     if hasattr(os, "geteuid") and os.geteuid() == 0:
         print("linger: skipped (running as root)")
@@ -715,11 +725,17 @@ def _install(args) -> int:
                      if args.keepalive_log else "")
     config = render_config(args.mxid, task_dir.resolve(), result_dir.resolve(),
                            activity, sys.executable, state_dir.resolve(), instance,
-                           reply_command, cron, keepalive_log)
+                           reply_command, cron, keepalive_log,
+                           _installed_config().get("AUTO_UPGRADE", ""))
     _install_file(config_path(), config, 0o600, refuse_drift=False, force=True)
     activity.parent.mkdir(parents=True, exist_ok=True)
     owner = keepalive._unit_owner() if args.no_service else None
-    left_stopped = False
+    left_stopped, held = False, None
+    if not args.no_start:
+        from . import self_upgrade
+        held = self_upgrade.release_hold(state_dir.resolve())
+        if held:
+            print(f"error: Sparrow is not started: {held}", file=sys.stderr)
     if owner == keepalive.UNIT_UNREACHABLE:
         print(f"skipped: the ag2-sparrow user service (--no-service); {service_path()} is "
               "installed but systemctl --user did not answer, so whether that service runs Sparrow "
@@ -735,12 +751,16 @@ def _install(args) -> int:
         left_stopped = install_service(task_dir.resolve(), result_dir.resolve(), state_dir.resolve(), instance,
                                        args.force,
                                        "" if args.no_keepalive else keepalive.health_command(reply_command),
-                                       reply_command, mxid=args.mxid)
+                                       reply_command, mxid=args.mxid,
+                                       may_start=not (args.no_start or held))
     if args.no_keepalive:
         print("skipped: the keepalive task (--no-keepalive)")
     else:
         keepalive.install_tasks(read_config(config_path()), args.force)
-    if left_stopped:
+    if held:
+        rc = 1
+        print("skipped: starting and checking Sparrow (a failed self-upgrade holds it stopped)")
+    elif left_stopped:
         rc = 1
         print("skipped: starting and checking Sparrow (the service was left stopped above)")
     elif args.no_start:

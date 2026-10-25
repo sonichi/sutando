@@ -123,7 +123,20 @@ if [[ "$capped" != "[]" ]]; then
 fi
 
 n="$(printf '%s' "$result" | jq '.matches | length')"
-if [[ "$n" -eq 0 ]]; then
+# Written by the keepawake's self-upgrade; the agent is woken once with it.
+NOTICE_FILE="$SPARROW_STATE_DIR/hatch-wake-notice"
+notice=""
+if [[ "$n" -eq 0 && -s "$NOTICE_FILE" ]]; then
+  notice="$(head -c 2048 "$NOTICE_FILE" 2>/dev/null)" || notice=""
+fi
+if [[ -n "$notice" ]]; then
+  log "ag2-sparrow-hatch notice" "$(jq -cn --arg n "$notice" '{notice: $n}')"
+  reason="ag2-sparrow notice: report it to your owner, post nothing"
+  payload="$(jq -cn --arg n "$notice" --arg marker "$ACTIVITY_FILE" '{heartbeat: true,
+    matches: [], total: 0, notice: $n,
+    worker_note: ("Touch " + $marker + ". " + $n + " Report this to your owner in your run "
+                  + "report and change nothing yourself; then exit; post nothing.")}')"
+elif [[ "$n" -eq 0 ]]; then
   activity_ms=0
   if [[ -f "$ACTIVITY_FILE" ]]; then
     activity_ms=$(( $(stat -c %Y "$ACTIVITY_FILE" 2>/dev/null || stat -f %m "$ACTIVITY_FILE" 2>/dev/null || echo 0) * 1000 ))
@@ -182,5 +195,8 @@ rc=0
 ( wake "$reason" "$payload" ) || rc=$?
 if [[ "$rc" -eq 0 ]]; then
   commit_state "$now_ms"
+  if [[ -n "$notice" && "$DRY_RUN" != "1" && "$(head -c 2048 "$NOTICE_FILE" 2>/dev/null)" == "$notice" ]]; then
+    rm -f "$NOTICE_FILE"
+  fi
 fi
 exit "$rc"

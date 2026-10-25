@@ -135,6 +135,8 @@ class CodexCoreLauncherTests(unittest.TestCase):
             "src/delivery/__init__.py",
             "src/delivery/worker-stage.sh",
             "src/delivery/pane_gate.py",
+            # pane_gate reads whether a sign-in followed the last limit banner.
+            "src/worker_auth_state.py",
             # pane_gate consults the proxy's quota record through this authority.
             "src/quota_availability.py",
             "src/delivery/readiness.py",
@@ -1115,6 +1117,13 @@ exit 0
         watcher_pid = int(watcher_pid_file.read_text())
         with self.assertRaises(ProcessLookupError):
             os.kill(watcher_pid, 0)
+
+    def test_the_fixture_gate_imports_cleanly(self):
+        # A module missing from the copied tree reads every pane UNREADABLE and stalls the notifier.
+        gate = self.root / "src/delivery/pane_gate.py"
+        r = subprocess.run([sys.executable, str(gate), "classify", "--runtime", "codex", "--probe"],
+                           input="\u203a \n\u2190 for agents\n", capture_output=True, text=True, timeout=30)
+        self.assertEqual((r.returncode, r.stdout.strip()), (0, "idle-ready"), r.stderr)
 
     def test_notifier_submits_literal_safe_prompt(self):
         # The one-event mode tests the adapter without starting fswatch.

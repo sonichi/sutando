@@ -313,7 +313,19 @@ owes work would read as stuck; a running Claude turn's timer keeps it changing.
 session meets the same network error, rate limit, API error or retry, and loses the
 turn in flight. With the same sustain and stale line, once per episode:
 
-- a gate or a limit escalates, as a gate always has;
+- a gate or a limit escalates, as a gate always has, only while the frame stays
+  unchanged across ticks with clocks, spinners, status glyphs and bare counts ("1
+  monitor still running") normalised away: on a held pane those tick without a turn
+  finishing, and a turn that finishes changes more than a number. Bare digits are
+  normalised out of the frame id, so two successive finished turns whose text differs
+  only by a number ("Delivered item 41", then "Delivered item 42") compare equal in
+  the wait rung. On a real pane turns accumulate, so this only bites a pane that
+  redraws a single line in place, and it fails toward one extra card on a progressing
+  worker, never toward a hidden block. A limit banner the
+  CLI leaves painted after a re-login sits under a session that keeps working: a turn
+  running above it reads as working, and a frame that moves clears the episode. The
+  seat's own input watcher does not page that banner, since it cannot read the
+  worker's queue; a refused limit turn, the limit menu or any dialog still pages there;
 - abnormal text raises a card that quotes the banner line and names the cause. On a
   seat routed through the credential proxy, a retry, API or network cause offers the
   proxy restart (`launchctl kickstart -k gui/$(id -u)/com.sutando.credential-proxy`,

@@ -13992,7 +13992,7 @@ def notify_gateway_for_failures(
     checks: list[dict],
     state_file: Optional[Path] = None,
     sender=None,
-) -> None:
+) -> bool:
     """DM the owner on ag2.space (the gateway) when health checks fail — the
     remote-visible surface the owner actually watches, and one that does NOT
     depend on the core agent being alive (posts straight to the gateway
@@ -14004,10 +14004,12 @@ def notify_gateway_for_failures(
     Slack surfaces never suppress each other, and dedup is recorded only on a
     SUCCESSFUL send so a transient gateway blip doesn't silence the alert.
     `sender` is injected by tests to avoid real network calls.
+
+    True when this failure set is in the owner's DM (sent now, or already sent for it).
     """
     failures = _slack_failures(checks)
     if not failures:
-        return
+        return False
 
     if state_file is None:
         state_file = WORKSPACE_DIR / "state" / "health-last-gateway.json"
@@ -14020,7 +14022,7 @@ def notify_gateway_for_failures(
     history = _load_alert_history(state_file)
 
     if history.get(_LAST_HASH_KEY) == hash_key:
-        return
+        return True
 
     lines = [f"• {c['name']}: {c['status']} ({c['detail']})" for c in failures[:5]]
     extra = f"\n…(+{len(failures) - 5} more)" if len(failures) > 5 else ""
@@ -14029,7 +14031,7 @@ def notify_gateway_for_failures(
     send = sender or _default_gateway_sender
     if not send(text):
         # Send failed — don't record dedup, so the next tick retries.
-        return
+        return False
 
     history[hash_key] = now_ms
     history[_LAST_HASH_KEY] = hash_key
@@ -14039,6 +14041,7 @@ def notify_gateway_for_failures(
         state_file.write_text(json.dumps(history))
     except Exception:
         pass
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -15031,13 +15034,17 @@ def main():
         apply_claude_hooks_fix(checks, stream=sys.stderr if as_json else sys.stdout)
         apply_system_load_reap(checks, stream=sys.stderr if as_json else sys.stdout)
 
+    # Optional: the owner's ag2.space DM via the gateway, core-independent. It runs first,
+    # so --notify-on-fail falls back to macOS only for a set this DM did not deliver.
+    gateway_ok = notify_gateway_for_failures(checks) if do_notify_gateway else False
+
     # Optional: macOS notification surface for the launchd-supervised path
     # (com.sutando.health-check-fallback). Notifies on the INITIAL check set
     # — the launchd fallback wants the user-visible alert immediately, even
     # if --fix would resolve some issues. Independent dedup state from
     # emit-task — the two surfaces are deliberately decoupled so neither
     # can suppress the other.
-    if do_notify:
+    if do_notify and not gateway_ok:  # the app already pops one for a landed gateway DM
         notify_for_failures(checks)
 
     # Optional: remote Slack DM surface. Unlike --notify-on-fail (local
@@ -15047,13 +15054,6 @@ def main():
     # the launchd-supervised fallback invocation so outages self-report.
     if do_notify_slack:
         notify_slack_for_failures(checks)
-
-    # Optional: remote ag2.space (gateway) DM surface — the channel the owner
-    # actually watches. Same core-independent guarantee as --notify-slack, via
-    # the gateway op:message endpoint. Intended for the launchd fallback so an
-    # over-quota / wedged core self-reports where the owner will see it.
-    if do_notify_gateway:
-        notify_gateway_for_failures(checks)
 
     # Optional: auto-recover a wedged core (alive-but-stuck) by restarting it.
     # Independent of the checks list — keys off the queue-drain + heartbeat

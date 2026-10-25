@@ -420,7 +420,7 @@ class Lock(unittest.TestCase):
     def test_the_sweep_holds_the_same_lock_for_its_whole_act_and_save(self):
         seen = []
 
-        def sweep(a):
+        def sweep(a, runner=None):
             with self.assertRaises(rem.PoolBusy):
                 with rem.pool_lock(self.ws, timeout=0.1):
                     pass

@@ -118,6 +118,8 @@ REPO_DIR = Path(__file__).parent.parent
 sys.path.insert(0, str(Path(__file__).parent))
 from git_binary import git_argv  # noqa: E402
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
+import connections as _connections  # noqa: E402
+import local_api_gate  # noqa: E402
 from sutando_config import config_get  # noqa: E402
 from sutando_platform import probe_pids  # noqa: E402
 import local_task_protocol  # noqa: E402
@@ -171,6 +173,85 @@ def _emit_task_processed(content: str) -> None:
 
 # Simple token auth — set SUTANDO_API_TOKEN in .env for remote access security
 API_TOKEN = os.environ.get("SUTANDO_API_TOKEN", "")
+
+# Connections over HTTP: the web client's transport to src/connections.py (docs/connections.md).
+# Every route, GET included, needs the local API bearer; the gate is local_api_gate's.
+CONNECTIONS_PREFIX = "/api/v1/connections"
+CONNECTIONS_BODY_CAP = 16384
+
+
+def connections_bearer() -> str:
+    return local_api_gate.local_api_token(WORKSPACE_DIR, API_TOKEN)
+
+
+def connections_http(method: str, path: str, body: dict, query: Optional[dict] = None, *,
+                     workspace: Optional[Path] = None, repo: Optional[Path] = None,
+                     logs_dir: Optional[Path] = None, vault=None, fetch=None, spawn=None,
+                     kill=None, getaddrinfo=None) -> "tuple[int, Optional[dict]]":
+    """(status, payload) for one request under CONNECTIONS_PREFIX; payload None = empty body.
+    The HTTP shape of the connections domain: GET lists, POST previews or (confirm) creates,
+    DELETE removes, POST <instance>/primary moves the primary, POST <instance>/reconnect
+    relaunches. Dispatch only; every rule lives in src/connections.py."""
+    ws = Path(workspace) if workspace is not None else WORKSPACE_DIR
+    repo = Path(repo) if repo is not None else REPO_DIR
+    logs_dir = Path(logs_dir) if logs_dir is not None else ws / "logs"
+    query = query or {}
+    parts = [x for x in path[len(CONNECTIONS_PREFIX):].split("/") if x]
+    try:
+        if method == "GET" and not parts:
+            rows = _connections.list_connections(ws)
+            return 200, {"connections": [_connections.status_for(r, ws) for r in rows]}
+        if method == "POST" and not parts:
+            token = body.get("token")
+            if not isinstance(token, str) or not token.strip():
+                return 400, {"error": "missing required field: token"}
+            confirm = body.get("confirm", False)
+            if not isinstance(confirm, bool):
+                return 400, {"error": "confirm must be a boolean"}
+            preview = _connections.preview_connection(token, fetch=fetch, getaddrinfo=getaddrinfo)
+            if not confirm:
+                return 200, {"preview": preview}
+            expected = body.get("expected_server")
+            if not isinstance(expected, str) or not expected.strip():
+                return 400, {"error": "confirm needs expected_server (the server the preview showed)"}
+            try:
+                row, created = _connections.add_connection(
+                    token, added_by=str(body.get("added_by", "ui")), expected_server=expected,
+                    instance=body.get("instance"), preview=preview, workspace=ws, vault=vault)
+            except _connections.ConnectionMismatch as e:
+                return 409, {"error": "mismatch", "server_from_token": e.derived, "expected_server": e.claimed}
+            except _connections.TokenRejected:
+                return 409, {"error": "token_rejected"}
+            except _connections.VaultKeyInUse:
+                return 409, {"error": "vault_key_in_use"}
+            return (201 if created else 200), {"created": created,
+                                               "connection": _connections.status_for(row, ws)}
+        if len(parts) == 1 and method == "DELETE":
+            force = str((query.get("force") or [""])[0]).lower() in ("1", "true", "yes")
+            try:
+                _connections.remove_connection(parts[0], force=force, workspace=ws, vault=vault)
+            except _connections.PrimaryProtected:
+                return 409, {"error": "primary"}
+            return 204, None
+        if len(parts) == 2 and method == "POST" and parts[1] == "primary":
+            row = _connections.set_primary(parts[0], workspace=ws)
+            return 200, {"connection": _connections.status_for(row, ws)}
+        if len(parts) == 2 and method == "POST" and parts[1] == "reconnect":
+            record = _connections.reconnect(parts[0], repo=repo, logs_dir=logs_dir, workspace=ws,
+                                            vault=vault, spawn=spawn, kill=kill, fetch=fetch,
+                                            getaddrinfo=getaddrinfo)
+            return 202, {"launch": record}
+        return 404, {"error": "not found"}
+    except _connections.VaultUnavailable:
+        return 503, {"error": "vault_unavailable"}
+    except _connections.InvalidToken as e:
+        return 400, {"error": "invalid_gateway" if "invalid_gateway" in str(e) else str(e)}
+    except _connections.UnknownConnection as e:
+        return 404, {"error": str(e)}
+    except _connections.SchemaError as e:
+        return 500, {"error": str(e)}
+    except _connections.ConnectionsError as e:
+        return 400, {"error": str(e)}
 
 RESULT_DIR = WORKSPACE_DIR / "results"
 TASK_DIR.mkdir(parents=True, exist_ok=True)
@@ -902,37 +983,98 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def check_private_history_auth(self) -> bool:
         """Fail closed for browsers and non-loopback clients without a token."""
-        import hmac as _hmac
-
-        if API_TOKEN:
-            token = self.headers.get("Authorization", "").replace("Bearer ", "")
-            if _hmac.compare_digest(token, API_TOKEN):
-                return True
-            self.send_private_json(401, {"error": "unauthorized"})
+        status, why = local_api_gate.private_history_request_allowed(
+            self.client_address[0], self.headers.get("Origin"), self.headers.get("Authorization", ""),
+            configured_token=API_TOKEN)
+        if status != 200:
+            self.send_private_json(status, {"error": why})
             return False
-        try:
-            loopback = ipaddress.ip_address(self.client_address[0]).is_loopback
-        except ValueError:
-            loopback = False
-        # The same-origin web-client proxy and local CLI callers send no
-        # Origin. A browser page always does for cross-origin fetches, so this
-        # also blocks hostile sites from reading localhost history.
-        if loopback and not self.headers.get("Origin"):
-            return True
-        self.send_private_json(403, {"error": "task history requires a local proxy or API token"})
-        return False
+        return True
 
     def do_OPTIONS(self):
+        if urlparse(self.path).path.startswith(CONNECTIONS_PREFIX):
+            # No wildcard grant here: a loopback page may preflight, nothing else gets a header.
+            self.send_response(204)
+            origin = self.headers.get("Origin", "")
+            if origin and local_api_gate.loopback_origin(origin):
+                self.send_header("Access-Control-Allow-Origin", origin)
+                self.send_header("Vary", "Origin")
+                self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+                self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+            self.end_headers()
+            return
         self.send_response(200)
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
         self.end_headers()
+
+    def _send_connections(self, status: int, payload: "dict | None") -> None:
+        """JSON (or an empty body); the cross-origin grant echoes a loopback Origin only, never a
+        wildcard, on refusals too: without it a webview reads a 401 as a network failure and can
+        never drop a stale bearer. A non-loopback Origin gets no grant at any status."""
+        self.send_response(status)
+        origin = self.headers.get("Origin", "")
+        if origin and local_api_gate.loopback_origin(origin):
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
+        self.send_header("Cache-Control", "no-store")
+        if payload is not None:
+            self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        if payload is not None:
+            self.wfile.write(json.dumps(payload).encode())
+
+    def _connections_route(self, method: str) -> None:
+        """Consume the body, then the shared gate (loopback Host on this port, loopback or
+        absent Origin, the local API bearer, always), then dispatch."""
+        parsed = urlparse(self.path)
+        body: dict = {}
+        if method != "GET":
+            try:
+                length = int(self.headers.get("Content-Length", 0) or 0)
+            except (TypeError, ValueError):
+                self._send_connections(400, {"error": "invalid Content-Length"})
+                return
+            if length < 0 or length > CONNECTIONS_BODY_CAP:
+                self._send_connections(413, {"error": "request too large"})
+                return
+            raw = self.rfile.read(length) if length else b""
+            if raw.strip():
+                try:
+                    body = json.loads(raw)
+                except ValueError:
+                    self._send_connections(400, {"error": "invalid JSON"})
+                    return
+                if not isinstance(body, dict):
+                    self._send_connections(400, {"error": "body must be a JSON object"})
+                    return
+        try:
+            bound_port = int(self.server.server_address[1])
+        except (AttributeError, TypeError, ValueError, IndexError):
+            bound_port = None
+        status, why = local_api_gate.bearer_request_allowed(
+            self.headers.get("Origin"), self.headers.get("Host", ""), self.headers.get("Authorization", ""),
+            expected_token=connections_bearer(), bound_port=bound_port)
+        if why:
+            self._send_connections(status, {"error": why})
+            return
+        from urllib.parse import parse_qs
+        status, payload = connections_http(method, parsed.path, body, parse_qs(parsed.query))
+        self._send_connections(status, payload)
+
+    def do_DELETE(self):
+        if urlparse(self.path).path.startswith(CONNECTIONS_PREFIX):
+            self._connections_route("DELETE")
+            return
+        self.send_json(404, {"error": "not found"})
 
     def do_GET(self):
         path = urlparse(self.path).path
         if path == "/ping":
             self.send_json(200, {"pong": True})
+        elif path.startswith(CONNECTIONS_PREFIX):
+            self._connections_route("GET")
         elif path == "/core-status":
             # Read loop status file for web UI
             status_file = status_read_path("core-status.json", WORKSPACE_DIR)
@@ -1299,6 +1441,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.handle_twilio_transcription(form_data)
             else:
                 self.send_json(404, {"error": "not found"})
+            return
+
+        if path.startswith(CONNECTIONS_PREFIX):
+            self._connections_route("POST")
             return
 
         if path == "/voice/toggle":
@@ -1720,6 +1866,7 @@ if __name__ == "__main__":
     # lsof guard, so nothing restarted it (2026-07-04 incident; same fix as
     # dashboard, #1709).
     server = http.server.ThreadingHTTPServer((bind, PORT), Handler)
+    connections_bearer()  # the desktop shell reads state/agent-api.token; mint it before the first client
     workstream_maintenance_stop = threading.Event()
     workstream_maintenance = threading.Thread(
         target=task_workstreams.run_classifier_maintenance,

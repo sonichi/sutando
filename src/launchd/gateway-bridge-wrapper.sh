@@ -176,7 +176,14 @@ while [ "$STOPPING" = 0 ]; do
     exit 0
   fi
   tend_agents_supervisor
-  python3 "$REPO/src/remote-gateway-bridge.py" &
+  # Once a named row holds the primary this legacy bridge is a secondary: it must not
+  # inherit the proactive room, or two bridges post nudges. Otherwise the variable is
+  # passed through as is, unset included: the bridge reads the device env only when unset.
+  if _PRIMARY="$(python3 "$REPO/scripts/connections.py" primary 2>/dev/null)" && [ -n "$_PRIMARY" ]; then
+    REMOTE_PROACTIVE_ROOM="" python3 "$REPO/src/remote-gateway-bridge.py" &
+  else
+    python3 "$REPO/src/remote-gateway-bridge.py" &
+  fi
   CHILD_PID=$!
   # Poll rather than `wait`: /bin/bash has no `wait -n`, and the agent-bridge
   # supervisor must be tended while the bridge runs.

@@ -559,6 +559,29 @@ class HookScript(Base):
         self.assertEqual((m["task_id"], m["event_id"]), ("task-blue~task-1784700000001", "$blue"))
         self.assertEqual(m["result_file"], str(self.results / "task-blue~task-1784700000001.txt"))
 
+    def test_an_upgrade_notice_wakes_the_agent_once(self):
+        notice = self.sparrow_state / "hatch-wake-notice"
+        notice.write_text("ag2-sparrow upgraded itself; REQUIRED hook: /h/def.json\n")
+        r = self.run_script(ACTIVITY_FILE=str(self.home / "marker"))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        p = self.payload()
+        self.assertEqual(p["notice"], "ag2-sparrow upgraded itself; REQUIRED hook: /h/def.json")
+        self.assertIn("REQUIRED hook: /h/def.json Report this to your owner", p["worker_note"])
+        self.assertIn("change nothing yourself", p["worker_note"])
+        self.assertFalse(notice.exists())
+        self.reset()
+        self.state.write_text(json.dumps({"seen_ids": [], "last_wake_ms": 1}))
+        self.run_script(ACTIVITY_FILE=str(self.home / "absent"))
+        self.assertNotIn("notice", self.payload())
+
+    def test_a_task_wake_leaves_the_notice_for_a_quiet_poll(self):
+        notice = self.sparrow_state / "hatch-wake-notice"
+        notice.write_text("hook changed\n")
+        self.add_task("task-1784700000001", "$reply")
+        self.run_script()
+        self.assertNotIn("notice", self.payload())
+        self.assertTrue(notice.exists())
+
     def test_heartbeat_with_sparrow_running_carries_no_sparrow_field(self):
         self.state.write_text(json.dumps({"seen_ids": [], "last_wake_ms": 1}))
         self.run_script(ACTIVITY_FILE=str(self.home / "absent"))
@@ -1222,6 +1245,14 @@ class Cli(Base):
         code, detail = hatch_cli.check_sparrow(self.state, now=1010, instance="blue")
         self.assertEqual(code, hatch_cli.SPARROW_OK, detail)
 
+    def test_install_keeps_auto_upgrade_off(self):
+        self.assertEqual(self.cli("install", "--mxid", AGENT).returncode, 0)
+        cfg = self.home / ".config" / "ag2-sparrow-hatch" / "config"
+        self.assertNotIn("AUTO_UPGRADE", cfg.read_text())
+        cfg.write_text(cfg.read_text() + "AUTO_UPGRADE=0\n")
+        self.assertEqual(self.cli("install", "--mxid", AGENT).returncode, 0)
+        self.assertEqual(hatch_cli.read_config(cfg)["AUTO_UPGRADE"], "0")
+
     def test_install_records_the_reply_command_by_absolute_path(self):
         r = self.cli("install", "--mxid", AGENT)
         self.assertEqual(r.returncode, 0, r.stderr)
@@ -1495,6 +1526,106 @@ class Service(Base):
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertFalse(self.unit.exists())
         self.assertIn("contains ' ' (whitespace, a quote, a backslash, $ or ;)", r.stdout)
+
+    def test_no_start_never_starts_or_restarts_the_service(self):
+        fake = FakeSystemd()
+        r = self.with_systemd(fake, "install", "--mxid", AGENT, "--no-start",
+                              env={"USER": "hatch"})
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(fake.ran("enable"), [["--user", "enable", "ag2-sparrow.service"]])
+        self.assertEqual((fake.state, fake.ran("restart"), fake.ran("start")),
+                         ("inactive", [], []))
+        self.assertIn("not started (--no-start)", r.stdout)
+        # A changed unit: the live service is stopped for the write and left stopped.
+        self.unit.write_text(self.unit.read_text() + "# changed\n")
+        fake.state = "active"
+        fake.calls.clear()
+        r = self.with_systemd(fake, "install", "--mxid", AGENT, "--no-start",
+                              env={"USER": "hatch"})
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(len(fake.ran("stop")), 1)
+        self.assertEqual((fake.state, fake.ran("restart"), fake.ran("start")),
+                         ("inactive", [], []))
+        self.assertIn(f"stopped: {hatch_cli.SERVICE_NAME} before installing", r.stdout)
+        self.assertIn("not started (--no-start)", r.stdout)
+
+        # When that stop fails the old unit keeps running, and --no-start vetoes the restart.
+        class StopFails(FakeSystemd):
+            def __call__(self, cmd):
+                if cmd[0] == "systemctl" and cmd[2] == "stop":
+                    self.calls.append(cmd[1:])
+                    return subprocess.CompletedProcess(cmd, 1, "", "Job failed")
+                return super().__call__(cmd)
+        fake = StopFails(state="active", enabled=True)
+        self.unit.write_text(self.unit.read_text() + "# changed again\n")
+        r = self.with_systemd(fake, "install", "--mxid", AGENT, "--no-start",
+                              env={"USER": "hatch"})
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual((fake.state, fake.ran("restart"), fake.ran("start")),
+                         ("active", [], []))
+        self.assertIn("it keeps running the old unit (--no-start)", r.stdout)
+        self.assertIn("the unit changed but was not restarted (--no-start)", r.stdout)
+
+    def test_install_hands_no_start_to_the_service_step(self):
+        with mock.patch.object(hatch_cli, "install_service") as svc:
+            self.cli("install", "--mxid", AGENT, "--no-start")
+            self.assertIs(svc.call_args.kwargs["may_start"], False)
+            self.cli("install", "--mxid", AGENT)
+            self.assertIs(svc.call_args.kwargs["may_start"], True)
+
+    def test_an_install_that_starts_checks_a_failed_upgrades_hold_and_no_start_does_not(self):
+        from ag2_sparrow.adapters.hatch import self_upgrade
+        with mock.patch.object(hatch_cli, "install_service") as svc, \
+                mock.patch.object(self_upgrade, "release_hold", return_value=None) as release:
+            self.cli("install", "--mxid", AGENT, "--no-start")
+            release.assert_not_called()
+            self.cli("install", "--mxid", AGENT)
+            release.assert_called_once_with(self.state.resolve())
+            self.assertIs(svc.call_args.kwargs["may_start"], True)
+
+    def test_a_failed_recovery_hold_is_lifted_only_by_verified_files_and_before_any_start(self):
+        from ag2_sparrow.adapters.hatch import self_upgrade
+        journal = self.state / "hatch-upgrade.json"
+
+        def blocked():
+            self.state.mkdir(parents=True, exist_ok=True)
+            journal.write_text(json.dumps({"attempted": {"0.6.0": {
+                "at": 1.0, "from": "0.5.4", "outcome": "restore-failed", "phase": "restore-failed"}},
+                "failed": {"target": "0.6.0", "from": "0.5.4", "installed": "0.6.0", "why": "w",
+                           "at": 1.0, "outcome": "restore-failed", "problems": ["p"]}}))
+
+        class Recording(FakeSystemd):
+            def __call__(me, cmd):
+                if cmd[0] == "systemctl" and "--now" in cmd:
+                    me.phase_at_start = json.loads(journal.read_text())["attempted"]["0.6.0"]["phase"]
+                return FakeSystemd.__call__(me, cmd)
+        for problems in (["changed /site/ag2_sparrow/__init__.py"], []):
+            blocked()
+            fake = Recording()
+            with mock.patch.object(self_upgrade, "verify_installed", return_value=problems,
+                                   create=True), \
+                    mock.patch.object(keepalive, "ensure_sparrow", return_value=0):
+                r = self.with_systemd(fake, "install", "--mxid", AGENT, env={"USER": "hatch"})
+            phase = json.loads(journal.read_text())["attempted"]["0.6.0"]["phase"]
+            started = [c for c in fake.calls if "--now" in c or "start" in c[1:2] or "restart" in c[1:2]]
+            if problems:
+                self.assertEqual((r.returncode, started, phase), (1, [], "restore-failed"),
+                                 r.stdout + r.stderr)
+                self.assertIn("the installed files do not verify", r.stdout + r.stderr)
+                self.assertNotIn("cleared:", r.stdout)
+            else:
+                self.assertEqual((r.returncode, phase, fake.phase_at_start), (0, "acknowledged",
+                                 "acknowledged"), r.stdout + r.stderr)
+                self.assertIn("cleared: a failed self-upgrade's hold", r.stdout)
+        # An unreadable journal is never cleared by an install; Sparrow is not started.
+        journal.write_text('{"attempted":')
+        fake = FakeSystemd()
+        with mock.patch.object(keepalive, "ensure_sparrow", return_value=0) as ensure:
+            r = self.with_systemd(fake, "install", "--mxid", AGENT, env={"USER": "hatch"})
+        self.assertEqual((r.returncode, [c for c in fake.calls if "--now" in c]), (1, []))
+        ensure.assert_not_called()
+        self.assertIn("cannot be read", r.stdout + r.stderr)
+        self.assertEqual(journal.read_text(), '{"attempted":')
 
     def test_rerun_is_idempotent(self):
         fake = FakeSystemd()
@@ -2025,6 +2156,23 @@ class Keepalive(Base):
         self.hook_ran(age_s=hatch_cli.HOOK_VERIFY_MAX_AGE_S + 30)
         self.assertEqual(self.health()["condition"], "healthy")
         self.assertIn("FAIL hook run: hook not running: last run", self.cli("verify").stdout)
+
+    def test_a_failed_upgrade_is_abnormal_and_verify_names_it(self):
+        from ag2_sparrow import __version__
+        self.installed()
+        self.sparrow_status()
+        self.keepawake_at(time.time() - 60)
+        self.hook_ran(age_s=5)
+        (self.state / "hatch-upgrade.json").write_text(json.dumps({"attempted": {"9.9": {
+            "at": time.time() - 60, "from": __version__, "outcome": "crashed", "phase": "crashed"}},
+            "failed": {"target": "9.9", "from": __version__, "at": time.time() - 30}}))
+        row = self.health()
+        self.assertEqual((row["condition"], row["reason"]), ("abnormal", "upgrade-failed"))
+        self.assertEqual(hc.validate(row), (row, None))
+        r = self.cli("verify")
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("health=abnormal (upgrade-failed); an automatic ag2-sparrow upgrade failed",
+                      r.stdout)
 
     def test_a_hook_that_never_ran_ages_from_install(self):
         self.installed()

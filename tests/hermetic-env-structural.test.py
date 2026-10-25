@@ -277,16 +277,26 @@ def _copy_rule(n, imp: Imports) -> bool:
     return False
 
 
-def violations(source: str, name: str = "<sample>") -> "list[str]":
-    """Each inheritance site in one file's source, as 'name:line: rule'."""
+@functools.lru_cache(maxsize=None)
+def _in_scope(source: str) -> "bool | None":
+    """Whether the code, not its comments or docstrings, names a gateway reference; None if unparseable."""
     if not REFERENCE.search(source):
-        return []
+        return False
     try:
         tree = ast.parse(source)
     except SyntaxError:
+        return None
+    return bool(REFERENCE.search(code_text(tree)))
+
+
+def violations(source: str, name: str = "<sample>") -> "list[str]":
+    """Each inheritance site in one file's source, as 'name:line: rule'."""
+    scope = _in_scope(source)
+    if scope is None:
         return [f"{name}:0: unparseable"]
-    if not REFERENCE.search(code_text(ast.parse(source))):
+    if not scope:
         return []
+    tree = ast.parse(source)
     imp = Imports(tree)
     source = _source_path(name)
     library = HELPERS_DIR in source.parents
@@ -825,6 +835,11 @@ class SelfTest(unittest.TestCase):
                 leaked = SYNTHETIC in got.stdout
                 self.assertEqual(leaked, name != "isolated", got.stdout)
                 self.assertEqual(violations(sample) == [], not leaked, violations(sample))
+
+    def test_an_unparseable_file_naming_a_gateway_module_is_reported_each_time(self):
+        broken = "import remote_gateway_bridge\ndef (:\n"
+        self.assertEqual(violations(broken, "x.py"), ["x.py:0: unparseable"])
+        self.assertEqual(violations(broken, "x.py"), ["x.py:0: unparseable"])
 
     def test_a_mention_only_in_a_comment_or_docstring_is_out_of_scope(self):
         body = "import os, subprocess\nenv = os.environ.copy()\nsubprocess.run(['x'])\n"

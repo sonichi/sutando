@@ -27,11 +27,15 @@ holder recorded on THIS host whose pid no longer exists cannot be polling, so it
 is reaped at once instead of blocking a successor for the whole stale window.
 A holder on another host is judged by heartbeat alone, and a holder that called
 `retain()` (it exits on purpose while still owning the role) ages out normally.
-Residual risk: no process start time is recorded, so a dead holder whose pid was
-already reused reads as alive and falls back to the heartbeat rule.
+Residual risk: the pid rule here ignores the process start time, so a dead holder
+whose pid was already reused reads as alive and falls back to the heartbeat rule.
+The record also carries `proc_start` (boot id + start time, `proc_start()`: /proc on
+Linux, sysctl on macOS), so a caller about to signal the holder can prove the pid is
+still the process that wrote the record.
 
 Lock file: `<workspace>/state/locks/<role>.lock`
-  {"role","pid","host","workspace","acquired_at","heartbeat_at","schema_version":1}
+  {"role","pid","host","workspace","acquired_at","heartbeat_at","schema_version":1,
+   "proc_start" (where the start time can be read)}
 
 The lock is per-`(workspace, role)`: the file lives under the workspace (so it
 is inherently workspace-scoped — the contended resource is the relay/task bus
@@ -65,6 +69,7 @@ import contextlib
 import json
 import os
 import socket
+import struct
 import sys
 import time
 from pathlib import Path
@@ -154,9 +159,66 @@ def _read(path: Path) -> dict | None:
         return None  # corrupt → treat as absent/reapable
 
 
+def _darwin_sysctl(mib: list) -> bytes | None:
+    """The raw value of sysctl `mib` on macOS; None when it cannot be read or is empty."""
+    import ctypes
+    import ctypes.util
+    try:
+        libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+        arr, size = (ctypes.c_int * len(mib))(*mib), ctypes.c_size_t(0)
+        if libc.sysctl(arr, len(mib), None, ctypes.byref(size), None, 0) != 0 or not size.value:
+            return None
+        buf = ctypes.create_string_buffer(size.value)
+        if libc.sysctl(arr, len(mib), buf, ctypes.byref(size), None, 0) != 0:
+            return None
+        return buf.raw[:size.value] or None
+    except (OSError, AttributeError, TypeError):
+        return None
+
+
+# CTL_KERN, then KERN_PROC/KERN_PROC_PID, KERN_BOOTTIME and KERN_PROCARGS2 (<sys/sysctl.h>).
+_KERN, _KERN_PROC_PID, _KERN_BOOTTIME, _KERN_PROCARGS2 = 1, (14, 1), 21, 49
+
+
+def proc_argv(pid: int) -> list[str] | None:
+    """The argv of `pid` on macOS (KERN_PROCARGS2); None elsewhere or when unreadable."""
+    if sys.platform != "darwin":
+        return None
+    raw = _darwin_sysctl([_KERN, _KERN_PROCARGS2, pid])
+    if raw is None or len(raw) < 4:
+        return None
+    argc = int.from_bytes(raw[:4], sys.byteorder)
+    _exe, _, rest = raw[4:].partition(b"\0")
+    args = rest.lstrip(b"\0").split(b"\0")
+    return [a.decode(errors="replace") for a in args[:argc]] if 0 < argc <= len(args) else None
+
+
+def proc_start(pid: int, proc: Path = Path("/proc")) -> str | None:
+    """`<boot id>:<start time>` of `pid`, which no later process with that pid shares:
+    /proc's start ticks, or on macOS kinfo_proc's p_starttime; None where it cannot be
+    read (or the process is gone)."""
+    if sys.platform == "darwin" and not proc.is_dir():
+        boot = _darwin_sysctl([_KERN, _KERN_BOOTTIME])
+        info = _darwin_sysctl([_KERN, *_KERN_PROC_PID, pid])
+        if boot is None or info is None or len(boot) < 12 or len(info) < 12:
+            return None
+        # struct timeval {time_t; suseconds_t} opens both kern.boottime and kinfo_proc.
+        (bsec, busec), (sec, usec) = (struct.unpack_from("=qi", b) for b in (boot, info))
+        return f"darwin-{bsec}.{busec:06d}:{sec}.{usec:06d}" if sec > 0 else None
+    try:
+        boot = (proc / "sys" / "kernel" / "random" / "boot_id").read_text().strip()
+        stat = (proc / str(pid) / "stat").read_bytes()
+    except (OSError, ValueError):
+        return None
+    fields = stat[stat.rfind(b")") + 1:].split()
+    # starttime is field 22 of stat(5); fields here start at field 3 (state).
+    ticks = fields[19].decode() if len(fields) > 19 and fields[19].isdigit() else ""
+    return f"{boot}:{ticks}" if boot and ticks else None
+
+
 def _payload(role: str, workspace: Path) -> dict:
     now = _now()
-    return {
+    data = {
         "role": role,
         "pid": os.getpid(),
         "host": _host_label(),
@@ -165,6 +227,10 @@ def _payload(role: str, workspace: Path) -> dict:
         "heartbeat_at": now,
         "schema_version": SCHEMA_VERSION,
     }
+    start = proc_start(os.getpid())
+    if start:
+        data["proc_start"] = start
+    return data
 
 
 def _is_fresh(holder: dict, stale_seconds: int) -> bool:

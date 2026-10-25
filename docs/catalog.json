@@ -56,7 +56,7 @@
    "last_verified": "2026-08-24"
   },
   "docs/benchmark-reports/2026-08-24-3a73e03.md": {
-   "title": "Sutando comprehensive benchmark \u2014 2026-08-24",
+   "title": "Sutando comprehensive benchmark — 2026-08-24",
    "audience": [
     "users",
     "operators",
@@ -79,7 +79,7 @@
    "last_verified": "2026-09-18"
   },
   "docs/census/d1-identity-census.md": {
-   "title": "D1 identity/state census \u2014 Discord / AG2 Space / Slack",
+   "title": "D1 identity/state census — Discord / AG2 Space / Slack",
    "audience": [
     "contributors",
     "maintainers"
@@ -126,6 +126,16 @@
    "status": "active",
    "canonical_for": "self-healing install use-case example",
    "last_verified": null
+  },
+  "docs/connections.md": {
+   "title": "Connections: one install, several homeservers",
+   "audience": [
+    "operators",
+    "contributors"
+   ],
+   "status": "active",
+   "canonical_for": "the state/connections.json record, preview-then-confirm add, primary and state semantics, and the startup launch plan for multi-gateway bridges",
+   "last_verified": "2026-10-24"
   },
   "docs/delivery-protocol.md": {
    "title": "The file delivery protocol as a formal state machine",
@@ -272,7 +282,7 @@
    "last_verified": "2026-09-18"
   },
   "docs/runtime/claude-hook-contract-v1.md": {
-   "title": "Claude Code Hook Contract \u2014 v1",
+   "title": "Claude Code Hook Contract — v1",
    "audience": [
     "contributors",
     "maintainers"
@@ -292,7 +302,7 @@
    "last_verified": null
   },
   "docs/sparrow-delivery-identity.md": {
-   "title": "Sparrow delivery identity \u2014 frozen definitions (B, slice 1)",
+   "title": "Sparrow delivery identity — frozen definitions (B, slice 1)",
    "audience": [
     "contributors",
     "maintainers"
@@ -302,7 +312,7 @@
    "last_verified": "2026-08-22"
   },
   "docs/sparrow-v1-contract.md": {
-   "title": "ag2-sparrow v1 \u2014 the frozen delivery contract",
+   "title": "ag2-sparrow v1 — the frozen delivery contract",
    "audience": [
     "contributors",
     "maintainers"
@@ -446,7 +456,7 @@
    "last_verified": "2026-08-27"
   },
   "docs/graceful-shutdown.md": {
-   "title": "Graceful shutdown \u2014 sentinel paths",
+   "title": "Graceful shutdown — sentinel paths",
    "audience": [
     "contributors",
     "maintainers"
@@ -466,7 +476,7 @@
    "last_verified": "2026-08-25"
   },
   "docs/proactive-loop-rationale.md": {
-   "title": "Proactive loop \u2014 rationale and measurements",
+   "title": "Proactive loop — rationale and measurements",
    "audience": [
     "contributors",
     "maintainers"
@@ -486,17 +496,17 @@
    "last_verified": "2026-09-15"
   },
   "docs/worker-pool-design.md": {
-   "title": "Worker pool \u2014 design (v1)",
+   "title": "Worker pool — design (v1)",
    "audience": [
     "contributors",
     "maintainers"
    ],
    "status": "draft",
    "canonical_for": "the v1 worker pool: durable worker identities and run history, zero-byte delivery sentinels under deliveries/<recipient>/ with the payload immutable in tasks/, the router as the core watcher's task-event handler over an owner-declared, core-compiled roster (unknown targets go to the core; liveness never routes), residue-based recovery, and the Phase 1 / Phase 2 split",
-   "last_verified": "2026-10-22"
+   "last_verified": "2026-10-23"
   },
   "docs/worker-pool-design-notes.md": {
-   "title": "Worker pool \u2014 design notes",
+   "title": "Worker pool — design notes",
    "audience": [
     "contributors",
     "maintainers"
@@ -506,7 +516,7 @@
    "last_verified": "2026-09-08"
   },
   "docs/task-watcher-hosting-modes.md": {
-   "title": "Task watcher hosting modes \u2014 session watcher, standby, supervisor",
+   "title": "Task watcher hosting modes — session watcher, standby, supervisor",
    "audience": [
     "contributors",
     "maintainers"
@@ -556,6 +566,16 @@
    "status": "active",
    "canonical_for": "optional PR evidence receipts and governed status publication",
    "last_verified": "2026-10-07"
+  },
+  "docs/dotspace.md": {
+   "title": "DotSpace homeservers",
+   "audience": [
+    "contributors",
+    "maintainers"
+   ],
+   "status": "canonical",
+   "canonical_for": "DotSpace resolution: which homeservers are AG2-operated, the well-known block and the core.dotspace config",
+   "last_verified": "2026-10-24"
   }
  }
 }
