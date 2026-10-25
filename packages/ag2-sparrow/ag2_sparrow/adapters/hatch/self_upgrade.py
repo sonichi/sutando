@@ -48,7 +48,6 @@ import glob
 import hashlib
 import importlib.metadata
 import json
-import math
 import os
 import re
 import shutil
@@ -77,6 +76,7 @@ STALE_START_S = 30 * 60
 MUTATING_PHASES = ("installing", "installed", "restoring")
 SUMMARY_OUTCOMES = ("crashed", "rolled-back", "restore-failed")
 # A direct rerun ending in one of these keeps an older failure summary; others replace it.
+# None of them is a summary outcome, so a summary's own attempt is told from a rerun clocklessly.
 KEEPS_FAILED = frozenset(("started", "unsupported-install", "not-above-installed", "no-download",
                           "no-inventory", "no-snapshot", "no-pip-check", "stop-failed"))
 WORKING_PHASES = ("snapshot", "quiesced", *MUTATING_PHASES)
@@ -85,6 +85,8 @@ TERMINAL = frozenset(("crashed", "rolled-back", "restore-failed", "ok", "not-sta
                       "no-inventory", "no-snapshot", "no-pip-check", "stop-failed"))
 # Only a success rewrites `installed`, and maybe_start never reruns a target it recorded.
 KEEPS_INSTALLED = TERMINAL - {"ok", "not-started"} | {"started"}
+# How far ahead of this clock a journal time may be; later, a started attempt would not age.
+CLOCK_SKEW_S = 300
 PIP_TIMEOUT_S = 600
 INSTALL_TIMEOUT_S = 300
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
@@ -128,14 +130,22 @@ def load_state(state_dir: Path) -> dict:
     """The attempt journal; empty only when the file is absent, else JournalError."""
     path = state_path(state_dir)
     try:
-        state = json.loads(path.read_text(encoding="utf-8"))
+        state = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=_unique_members)
     except FileNotFoundError:
         return {"attempted": {}}
     except (OSError, ValueError) as e:
         raise JournalError(f"the upgrade journal {path} cannot be read ({type(e).__name__})") from None
-    if not _well_formed_journal(state):
+    if not _well_formed_journal(state, time.time() + CLOCK_SKEW_S):
         raise JournalError(f"the upgrade journal {path} cannot be read (not a journal)")
     return state
+
+
+def _unique_members(pairs) -> dict:
+    """json's last-wins merge would hide an earlier member from the validator."""
+    names = [name for name, _ in pairs]
+    if len(set(names)) != len(names):
+        raise ValueError("a duplicate member name")
+    return dict(pairs)
 
 
 def _legal(outcome, phase) -> bool:
@@ -149,56 +159,56 @@ def _legal(outcome, phase) -> bool:
     return outcome in TERMINAL and phase == outcome
 
 
-def _well_formed_journal(state) -> bool:
+def _well_formed_journal(state, latest: float) -> bool:
     """The journal as save_state writes it: an `attempted` map of well-formed attempts,
-    optional `failed` and `installed` summaries of attempts in it, and nothing else."""
+    optional `failed` and `installed` summaries of attempts in it, and nothing else; no
+    time in it later than `latest`."""
     if not isinstance(state, dict) or not isinstance(state.get("attempted"), dict):
         return False
     if set(state) - {"attempted", "failed", "installed"}:
         return False
-    if not all(_well_formed(t) for t in state["attempted"].values()):
+    if not all(_well_formed(t, latest) for t in state["attempted"].values()):
         return False
     failed = state.get("failed", {})
     outcome = failed.get("outcome", "crashed") if isinstance(failed, dict) else None
-    return (("failed" not in state or (outcome in SUMMARY_OUTCOMES
-                                       and _summarises(state["attempted"], failed, "target", outcome,
-                                                       KEEPS_FAILED)))
+    return (("failed" not in state
+             or (outcome in SUMMARY_OUTCOMES
+                 and _summarises(state["attempted"], failed, "target", outcome, KEEPS_FAILED,
+                                 latest)))
             and ("installed" not in state
                  or _summarises(state["attempted"], state["installed"], "version", "ok",
-                                KEEPS_INSTALLED)))
+                                KEEPS_INSTALLED, latest)))
 
 
-def _summarises(attempted: dict, summary, key: str, outcome: str, kept_by) -> bool:
-    """Whether a failed/installed summary names an attempt saved with it: in its outcome
-    when that attempt is not newer than the summary, else a later rerun ending in `kept_by`."""
+def _summarises(attempted: dict, summary, key: str, outcome: str, kept_by, latest: float) -> bool:
+    """Whether a failed/installed summary names an attempt it was saved with, so in its
+    `outcome`, or one a later rerun replaced with an outcome in `kept_by` (disjoint from it)."""
     if not isinstance(summary, dict) or not isinstance(summary.get(key), str):
         return False
     tried = attempted.get(summary[key])
-    if tried is None or not _finite(summary.get("at")):
-        return False
-    if tried["at"] > summary["at"]:
-        return tried["outcome"] in kept_by
-    return tried["outcome"] == outcome
+    return (tried is not None and _plausible(summary.get("at"), latest)
+            and (tried["outcome"] == outcome or tried["outcome"] in kept_by))
 
 
-def _finite(at) -> bool:
-    """A time arithmetic can use: NaN, ±inf and ints past a float's range are not one."""
+def _plausible(at, latest: float) -> bool:
+    """A time a writer could have stamped: a number from 0 to `latest`, so never NaN,
+    infinite, past a float's range or so far ahead that a started attempt never ages."""
     if not isinstance(at, (int, float)) or isinstance(at, bool):
         return False
     try:
-        return math.isfinite(float(at))
+        return 0 <= float(at) <= latest
     except OverflowError:
         return False
 
 
-def _well_formed(tried) -> bool:
-    """An attempt record the writer can leave: a legal (outcome, phase), a finite `at`,
+def _well_formed(tried, latest: float) -> bool:
+    """An attempt record the writer can leave: a legal (outcome, phase), a plausible `at`,
     and a string `from` when present."""
     if not isinstance(tried, dict):
         return False
     at, previous = tried.get("at"), tried.get("from")
     return (_legal(tried.get("outcome"), tried.get("phase"))
-            and _finite(at) and (previous is None or isinstance(previous, str)))
+            and _plausible(at, latest) and (previous is None or isinstance(previous, str)))
 
 
 def save_state(state_dir: Path, state: dict) -> None:
@@ -723,12 +733,16 @@ def maybe_start(cfg: dict, setup: "dict | None", installed: str = __version__,
                   file=sys.stderr)
             return f"{target}:attempted"
         # Recorded before the start, so a crash mid-upgrade is never retried for this target.
-        state["attempted"][target] = {"at": now, "from": installed, "outcome": "started"}
+        record = {"at": now, "from": installed, "outcome": "started"}
+        state["attempted"][target] = dict(record)
         save_state(state_dir, state)
     argv = [sys.executable, "-m", "ag2_sparrow.adapters.hatch.self_upgrade", target,
             json.dumps(hashes, sort_keys=True)]
     if not _spawn(argv, state_dir / LOG_NAME):
-        _finish(state_dir, target, "not-started")
+        # Under the writer lock, and only over the record written above: else it ages to crashed.
+        with upgrade_lock(state_dir) as held:
+            if held and load_state(state_dir)["attempted"].get(target) == record:
+                _finish(state_dir, target, "not-started")
         return f"{target}:not-started"
     print(f"upgrade: started {installed} -> {target}", file=sys.stderr)
     return f"{target}:started"

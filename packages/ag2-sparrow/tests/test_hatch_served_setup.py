@@ -3111,7 +3111,7 @@ class Upgrade(Base):
                 "failed": summary},
                {"attempted": {"0.6.0": dict(tried, outcome="crashed", phase="crashed")},
                 "failed": dict(summary, outcome="restore-failed")},
-               {"attempted": {"0.6.0": dict(tried, outcome="started", phase="quiesced")},
+               {"attempted": {"0.6.0": dict(tried, outcome="ok", phase="ok")},
                 "failed": dict(summary, outcome="rolled-back")},
                {"attempted": {"0.6.0": dict(tried, outcome="ok", phase="ok")},
                 "failed": dict(summary, outcome="ok")},
@@ -3120,7 +3120,7 @@ class Upgrade(Base):
                {"attempted": {"0.6.0": dict(tried, outcome="crashed", phase="crashed")},
                 "failed": dict(summary, at="2")},
                {"attempted": {}, "installed": {"version": "0.6.0", "at": 2.0}},
-               {"attempted": {"0.6.0": dict(tried, outcome="restore-failed", phase="acknowledged")},
+               {"attempted": {"0.6.0": dict(tried, outcome="not-started", phase="not-started")},
                 "installed": {"version": "0.6.0", "at": 2.0}},
                {"attempted": {"0.6.0": dict(tried, outcome="ok", phase="ok")},
                 "installed": {"version": "0.6.0"}}]
@@ -3163,16 +3163,15 @@ class Upgrade(Base):
         failed = self_upgrade.load_state(self.state)
         later = failed["failed"]["at"] + 10
         for outcome, phase in (("ok", "ok"), ("rolled-back", "rolled-back"),
-                               ("crashed", "crashed"), ("restore-failed", "acknowledged"),
-                               ("restore-failed", "restore-failed"), ("not-started", "not-started")):
+                               ("crashed", "crashed"), ("not-started", "not-started")):
             state = json.loads(json.dumps(failed))
             state["attempted"]["0.6.0"] = {"at": later, "from": "0.5.4", "outcome": outcome,
                                            "phase": phase}
             self.assert_held_everywhere(json.dumps(state), (outcome, phase))
-        installed = {"attempted": {"0.6.0": {"at": 5.0, "from": "0.5.4", "outcome": "ok",
-                                             "phase": "ok"}},
+        installed = {"attempted": {"0.6.0": {"at": 5.0, "from": "0.5.4", "outcome": "not-started",
+                                             "phase": "not-started"}},
                      "installed": {"version": "0.6.0", "at": 2.0}}
-        self.assert_held_everywhere(json.dumps(installed), "ok newer than installed")
+        self.assert_held_everywhere(json.dumps(installed), "not-started beside installed")
         for outcome in sorted(self_upgrade.KEEPS_FAILED):
             state = json.loads(json.dumps(failed))
             state["attempted"]["0.6.0"] = dict({"at": later, "from": "0.5.4", "outcome": outcome},
@@ -3194,6 +3193,85 @@ class Upgrade(Base):
                  "installed": {"version": "0.6.0", "at": at}}), ("installed", at))
         self.assert_held_everywhere('{"attempted": {"0.6.0": {"from": "0.5.4", '
                                     '"outcome": "started", "at": 1e999}}}', "1e999")
+
+    def test_a_time_no_writer_could_stamp_holds_restarts(self):
+        latest = time.time() + getattr(self_upgrade, "CLOCK_SKEW_S", 300)
+        started = '{"attempted": {"0.6.0": {"from": "0.5.4", "outcome": "started", "at": %s}}}'
+        crashed = '{"at": 1.0, "from": "0.5.4", "outcome": "crashed", "phase": "crashed"}'
+        for at in ("1e308", str(10 ** 308), repr(latest + 3600), "-1"):
+            self.assert_held_everywhere(started % at, ("attempt", at))
+            self.assert_held_everywhere('{"attempted": {"0.6.0": %s}, "failed": {"target": '
+                                        '"0.6.0", "from": "0.5.4", "at": %s}}' % (crashed, at),
+                                        ("failed", at))
+            self.assert_held_everywhere('{"attempted": {"0.6.0": %s}, "installed": {"version": '
+                                        '"0.6.0", "at": %s}}' % (crashed, at), ("installed", at))
+        self.state_path_text(started % repr(time.time() + 60))
+        self.assertIsNone(self_upgrade.recovery_blocked(self.state), "within the skew")
+
+    def state_path_text(self, text):
+        self.state.mkdir(parents=True, exist_ok=True)
+        self_upgrade.state_path(self.state).write_text(text)
+
+    def test_a_rerun_after_the_clock_stepped_back_keeps_the_summary(self):
+        with mock.patch.object(self_upgrade, "restore", side_effect=OSError("disk full")):
+            self.connected.side_effect = [1]
+            self.assertEqual(self.run_upgrade(self.fake()), "restore-failed")
+        self.assertTrue(self_upgrade.clear_blocked(self.state))
+        acknowledged = self_upgrade.state_path(self.state).read_text()
+        at = self_upgrade.load_state(self.state)["failed"]["at"]
+        for stamp in (at, at - 0.5, at - 60):
+            self_upgrade.state_path(self.state).write_text(acknowledged)
+            with mock.patch.object(self_upgrade.time, "time", return_value=stamp):
+                self_upgrade._attempt(self.state, "0.6.0")
+                self_upgrade._finish(self.state, "0.6.0", "no-download")
+            state = self_upgrade.load_state(self.state)
+            self.assertEqual((state["failed"]["outcome"], state["attempted"]["0.6.0"]["at"]),
+                             ("restore-failed", stamp))
+            self.assertIsNone(self_upgrade.recovery_blocked(self.state), stamp)
+            self.assertEqual(self.keepawake_restarts(), (0, 1), stamp)
+
+    def test_a_duplicate_member_name_holds_restarts(self):
+        held = '"outcome": "restore-failed", "phase": "restore-failed"'
+        for text in (
+                '{"attempted": {"0.6.0": {"at": 1, "from": "0.5.4", %s, "phase": "acknowledged"}}}'
+                % held,
+                '{"attempted": {"0.6.0": {"at": 1, "from": "0.5.4", %s}, "0.6.0": {"at": 1, '
+                '"from": "0.5.4", "outcome": "ok", "phase": "ok"}}}' % held,
+                '{"attempted": {"0.6.0": {"at": 1, "from": "0.5.4", %s}}, "attempted": {}}' % held):
+            self.assert_held_everywhere(text, text)
+
+    def test_a_failed_spawn_never_overwrites_a_record_written_under_the_lock(self):
+        # Another writer runs, under the lock, between the spawn failure's journal read and write.
+        later = {"at": 2000.0, "from": "0.5.4", "outcome": "started", "phase": "snapshot"}
+        real_load, spawned, wrote = self_upgrade.load_state, [], []
+
+        def other_writer():
+            with self_upgrade.upgrade_lock(self.state) as held:
+                if held:
+                    state = real_load(self.state)
+                    state["attempted"]["0.7.0"] = dict(later)
+                    self_upgrade.save_state(self.state, state)
+                wrote.append(held)
+
+        def load(state_dir):
+            state = real_load(state_dir)
+            if spawned and not wrote:
+                t = threading.Thread(target=other_writer)
+                t.start()
+                t.join()
+            return state
+        with mock.patch.object(self_upgrade, "_spawn", side_effect=lambda *a: spawned.append(1)), \
+                mock.patch.object(self_upgrade, "load_state", side_effect=load), \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(self_upgrade.maybe_start(self.cfg, self.setup(), "0.5.4", 1000.0),
+                             "0.6.0:not-started")
+        self.assertEqual(len(wrote), 1, "the other writer ran inside the spawn failure's write")
+        if not wrote[0]:
+            other_writer()
+        state = self_upgrade.load_state(self.state)
+        self.assertEqual(state["attempted"].get("0.7.0"), later, "the locked write survives")
+        self.assertEqual(state["attempted"]["0.6.0"]["outcome"], "not-started")
+        self.assertIsNone(self_upgrade.recovery_blocked(self.state))
 
     def test_keepawake_never_restarts_on_unverified_files_or_a_failed_settlement(self):
         # A dead mutating attempt with no snapshot: restore-failed, the listener stays down.

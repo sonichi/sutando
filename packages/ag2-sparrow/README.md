@@ -655,9 +655,10 @@ Sparrow is left stopped and the hook wakes the agent once with a notice. While a
 attempt is held this way (or left in a mutating phase, or the journal
 `hatch-upgrade.json` exists but is not one the writer can leave: unparseable, without
 its `attempted` map, or with an attempt whose outcome and phase are not a pair the
-writer produces, or that lacks a finite time, or a `failed` or `installed` summary
-naming no attempt, an attempt at or before it in another outcome, or a newer attempt
-whose writer would have replaced it) nothing starts Sparrow or another
+writer produces, or a duplicate member name, or a time no writer could stamp (not a
+number, below zero, or more than `CLOCK_SKEW_S` ahead of the clock), or a `failed` or
+`installed` summary naming no attempt or one in an outcome whose writer would have
+replaced the summary) nothing starts Sparrow or another
 upgrade: keepawake, the upgrade decision and the upgrade worker all refuse without
 writing to the journal, so a refusal never replaces the phase that holds, and the
 failed version is never imported, not even to read its version. The owner's
