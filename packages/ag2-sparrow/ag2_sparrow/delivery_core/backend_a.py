@@ -180,6 +180,10 @@ class DesignAClaimBackend:
             outbox.clear_dispatching(self.root, item_id)
             return outbox._release_locked(self.root, item_id, token.worker)
 
+    def park_unclaimed(self, item_id: str, reason: str) -> bool:
+        """Park a live item no claimant holds; refused (False) once it settled or is claimed."""
+        return outbox.park_unclaimed(self.root, item_id, reason)
+
     def mark_dispatching(self, token: ClaimToken) -> bool:
         """Record that this incarnation is about to send; False (and nothing written) when
         the token no longer owns the claim."""

@@ -886,6 +886,28 @@ def clear_dispatching(root: Path, item_id: str) -> None:
         _write_item(Path(root), item_id, d)
 
 
+def released_by_operator(d: dict) -> bool:
+    """A person released this item for exactly its stored payload, destination included."""
+    mark = d.get("operator_release")
+    return isinstance(mark, str) and mark == hashlib.sha256(
+        (d.get("payload") or "").encode("utf-8")).hexdigest()
+
+
+def park_unclaimed(root: Path, item_id: str, reason: str) -> bool:
+    """Park an item no one holds, under its lock, only while it is still live and unsettled:
+    never over DELIVERED, a receipt, a dispatch mark or a claim. False when it changed."""
+    with _item_lock(Path(root), item_id):
+        if not _item_path(Path(root), item_id).exists():
+            return False
+        d = _read_item(Path(root), item_id)
+        if (d.get("status") in ("DELIVERED", "PARKED") or dispatch_unsettled(d)
+                or read_delivery_claim(Path(root), item_id) is not None):
+            return False
+        d.update(status="PARKED", reason=reason)
+        _write_item(Path(root), item_id, d)
+        return True
+
+
 def dispatch_unsettled(d: dict) -> bool:
     """A send that left without a completed outcome: a receipt recorded, or a mark still set."""
     return bool(d.get("provider_ref")) or isinstance(d.get("dispatching"), dict)
@@ -1144,7 +1166,8 @@ def requeue_item(root: Path, item_id: str, *, reset_attempts: bool = False,
 def requeue_item_with_epoch(root: Path, item_id: str, *, reset_attempts: bool = False,
                             operator: Optional[str] = None,
                             reason: Optional[str] = None,
-                            payload: Optional[str] = None) -> "tuple[RequeueOutcome, Optional[int]]":
+                            payload: Optional[str] = None,
+                            operator_release: bool = False) -> "tuple[RequeueOutcome, Optional[int]]":
     """Operator recovery: PARKED -> QUEUED as ONE atomic transition.
 
     Refuses anything not PARKED, which is what makes it idempotent AND keeps it
@@ -1165,7 +1188,8 @@ def requeue_item_with_epoch(root: Path, item_id: str, *, reset_attempts: bool = 
     Returns the epoch written under the lock (None unless REQUEUED): a later
     read can see a peer's re-requeue, and a rollback keyed on it undoes theirs.
     A requeue keeps the stored payload unless `payload` replaces it: only for a send that
-    provably never left, whose destination has moved since.
+    provably never left, whose destination has moved since. `operator_release` records that a
+    person released exactly the stored payload (see released_by_operator); automation never sets it.
     """
     root = Path(root)
     with _item_lock(root, item_id):
@@ -1187,6 +1211,9 @@ def requeue_item_with_epoch(root: Path, item_id: str, *, reset_attempts: bool = 
         d["requeue_reason"] = reason or ""
         if payload is not None:
             d["payload"] = payload
+        d.pop("operator_release", None)
+        if operator_release:
+            d["operator_release"] = hashlib.sha256((d.get("payload") or "").encode("utf-8")).hexdigest()
         proof = source_proof(d)
         for field in ("proof_version", "source_ready_sha256", "source_payload_sha256"):
             d.pop(field, None)

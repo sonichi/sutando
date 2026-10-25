@@ -316,7 +316,7 @@ from .team_guardrail import ag2space_tier_lines, owner_mention_lines
 from . import team_result_guard
 from . import health_command
 from . import __version__ as _PACKAGE_VERSION
-from .outbox import dispatch_unsettled, record_provider_ref
+from .outbox import dispatch_unsettled, record_provider_ref, released_by_operator
 from .outbox import RetrySchedule, delivered_body_differs, read_item, source_digest
 from .outbox import list_items, requeue_item_with_epoch, RequeueOutcome
 from .proactive_recovery import claim_owner_may_be_alive as _pid_alive
@@ -5678,7 +5678,7 @@ def _recover_orphan_proactive() -> None:
             pass
 
 
-def _retire_proactive(claim: Path, original: Path, dest_dir: Path) -> None:
+def _retire_proactive(claim: Path, original: Path, dest_dir: Path) -> bool:
     """Retire a claimed nudge that was NOT delivered, without destroying it.
 
     Used by the terminal non-delivery paths (settled-empty, dead-lettered).
@@ -5692,12 +5692,14 @@ def _retire_proactive(claim: Path, original: Path, dest_dir: Path) -> None:
         # Never over an earlier copy: two bodies under one name are two retired generations.
         names = (undelivered_quarantine.quarantine_name(original.stem, time.time_ns() + i) for i in range(64))
         undelivered_quarantine.place_as(claim, dest_dir, names)
+        return True
     except OSError as e:
         _log(f"could not retire proactive {original.name} ({diagnostics.describe(e)}) — re-queueing")
         try:
             claim.rename(original)
         except OSError:
             pass
+        return False
 
 
 def _upgrade_hold_file() -> Path:
@@ -5950,21 +5952,20 @@ def _send_proactive(claim: Path, f: Path, envelope: dict, owner_dm: bool, notice
                                 reason="the room is no longer held", payload=payload.decode("utf-8"))
     stored = read_item(core.backend.root, item_id) or {}
     stored_room = _payload_room(stored.get("payload"))
-    if (stored.get("status") == "READY" and stored_room != envelope["room_id"]
-            and not dispatch_unsettled(stored)):
-        # Held for the operator, never re-routed: a requeue (QUEUED) sends it to its stored room.
-        core.backend.park(item_id, _DESTINATION_CHANGED)
-        try:
-            body_sha256 = hashlib.sha256(claim.read_bytes()).hexdigest()
-        except OSError:
-            body_sha256 = ""
-        _retire_proactive(claim, f, UNDELIVERABLE_RESULTS_DIR)
-        release = (f"to send it to {stored_room}: "
-                   f"{_proactive_requeue_command(core.backend.root, item_id, body_sha256)}" if body_sha256
-                   else "NO release command: its body could not be read to pin its parked copy")
-        _log(f"proactive {f.name} HELD in {UNDELIVERABLE_RESULTS_DIR.name}/: it was queued for {stored_room} "
-             f"and its destination now resolves to {envelope['room_id']}; it is not re-routed. {release}")
-        return
+    if (stored.get("status") in ("READY", "QUEUED") and stored_room != envelope["room_id"]
+            and not dispatch_unsettled(stored) and not released_by_operator(stored)):
+        # Held, never re-routed; only a person's release of this stored room sends it there.
+        if not core.backend.park_unclaimed(item_id, _DESTINATION_CHANGED):
+            again = read_item(core.backend.root, item_id) or {}
+            if again.get("status") not in core.backend.TERMINAL and not dispatch_unsettled(again):
+                try:
+                    claim.rename(f)  # another drainer holds it: nothing is sent from here
+                except OSError:
+                    pass
+                return
+        else:
+            _log(f"proactive {f.name} HELD: it was queued for {stored_room} and its destination now "
+                 f"resolves to {envelope['room_id']}; it is not re-routed")
     result = core.deliver_one(item_id, payload)
     item = read_item(core.backend.root, item_id) or {}
     status, room = item.get("status"), stored_room or envelope["room_id"]
@@ -5972,8 +5973,13 @@ def _send_proactive(claim: Path, f: Path, envelope: dict, owner_dm: bool, notice
         ARCHIVE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
         try:
             claim.rename(ARCHIVE_RESULTS_DIR / f"{f.stem}-{int(time.time())}.txt")
-        except OSError:
-            claim.unlink(missing_ok=True)
+        except OSError as e:
+            # Never unlinked: handed back, the DELIVERED item archives it on a later pass.
+            _log(f"delivered proactive {f.name} could not be archived ({diagnostics.describe(e)}); kept")
+            try:
+                claim.rename(f)
+            except OSError:
+                pass
         if result.status is DrainStatus.ATTEMPTED and result.detail != "settled by a recorded receipt":
             _ENGINE_COUNTS["core_confirmed"] += 1
             _log(f"delivered proactive {f.name} to {room} ({item.get('provider_ref')})")
@@ -5983,7 +5989,7 @@ def _send_proactive(claim: Path, f: Path, envelope: dict, owner_dm: bool, notice
         return
     replacement = seen.get("room_upgraded")
     if replacement is not None and status != "PARKED":
-        core.backend.park(item_id, _ROOM_UPGRADED)  # never posted; resent once the DM is repointed
+        core.backend.park_unclaimed(item_id, _ROOM_UPGRADED)  # never posted; resent once the DM is repointed
         if owner_dm:
             try:
                 claim.rename(f)  # stays pending: the room moved, the DM's repointing sends it
@@ -6003,16 +6009,20 @@ def _send_proactive(claim: Path, f: Path, envelope: dict, owner_dm: bool, notice
             body_sha256 = hashlib.sha256(claim.read_bytes()).hexdigest()
         except OSError:
             body_sha256 = ""
-        _retire_proactive(claim, f, UNDELIVERABLE_RESULTS_DIR)
+        retired = _retire_proactive(claim, f, UNDELIVERABLE_RESULTS_DIR)
+        # No digest, no command: an unfiltered restore can install another generation's body.
+        how = (f"{_proactive_requeue_command(core.backend.root, item_id, body_sha256)}" if body_sha256
+               else f"NO recovery command: its body could not be read to pin which parked copy "
+                    f"is its own; requeue {item_id} by hand with --body-sha256 of that copy")
+        where = (f"PARKED to {UNDELIVERABLE_RESULTS_DIR.name}/" if retired
+                 else "PARKED, but its file could not be moved and stays pending")
         if reason == "outcome-unknown":
-            # No digest, no command: an unfiltered restore can install another generation's body.
-            how = (f"to send it again (it may post twice): "
-                   f"{_proactive_requeue_command(core.backend.root, item_id, body_sha256)}" if body_sha256
-                   else f"NO recovery command: its body could not be read to pin which parked copy "
-                        f"is its own; requeue {item_id} by hand with --body-sha256 of that copy")
             _log(f"proactive {f.name} may have reached {room} but the send was not confirmed "
-                 f"({result.detail or 'no outcome'}); PARKED to {UNDELIVERABLE_RESULTS_DIR.name}/, not "
-                 f"sent again. Check the room first; {how}")
+                 f"({result.detail or 'no outcome'}); {where}, not sent again. Check the room first; "
+                 f"to send it again (it may post twice): {how}")
+        elif reason == _DESTINATION_CHANGED:
+            _log(f"proactive {f.name} held for {room}, its stored room ({where}); not re-routed. "
+                 f"To send it to {room}: {how}")
         else:
             _log(f"proactive {f.name} PARKED to {UNDELIVERABLE_RESULTS_DIR.name}/ ({reason}"
                  f"{': ' + result.detail if result.detail else ''}) — it will NOT be re-sent")

@@ -64,6 +64,39 @@ def outbox_writers() -> None:
           "a requeue may replace the payload of a send that never left")
 
 
+def guarded_park_and_release() -> None:
+    root = Path(tempfile.mkdtemp(dir=ISO))
+    check(src_outbox.park_unclaimed(root, "absent", "x") is False, "park: a missing item is refused")
+    backend = DesignAClaimBackend(root)
+    backend.publish("p1", b'{"room_id": "!a:s"}')
+    src_outbox.acquire_delivery_claim(root, "p1", "someone")
+    check(src_outbox.park_unclaimed(root, "p1", "x") is False, "park: a claimed item is refused")
+    src_outbox.release_delivery_claim(root, "p1", "someone")
+    check(src_outbox.park_unclaimed(root, "p1", "x") is True, "park: a live unclaimed item parks")
+    check(src_outbox.park_unclaimed(root, "p1", "y") is False, "park: an already parked item is refused")
+    src_outbox.requeue_item_with_epoch(root, "p1", operator="t", operator_release=True)
+    d = src_outbox.read_item(root, "p1")
+    check(src_outbox.released_by_operator(d), "an operator requeue releases exactly the stored payload")
+    check(not src_outbox.released_by_operator({**d, "payload": '{"room_id": "!b:s"}'}),
+          "a release does not cover another payload")
+
+
+def held_while_claimed() -> None:
+    def refuse(payload):
+        raise urllib.error.HTTPError("https://gw.example/relay/v1/room", 429, "slow", {}, None)
+    lane = pl.Lane(gb, ISO, refuse)
+    lane.write("proactive-claimed.txt", "nudge\n")
+    lane.drain()
+    from ag2_sparrow import outbox as vendored
+    item_id = gb._proactive_item_id("proactive-claimed", "nudge")
+    vendored.acquire_delivery_claim(lane.results / ".outbox-ag2space-proactive", item_id, "other-drainer")
+    lane.owner_dm = "!Elsewhere:ag2.space"
+    n = len(lane.posts)
+    lane.drain()
+    check(len(lane.posts) == n and lane.where("proactive-claimed") == "pending",
+          "a moved destination while another drainer holds the item: nothing sent, file handed back")
+
+
 def grammar() -> None:
     name = proactive_routing.about_task_filename("task-17", 5, "ag2space")
     check(name == "proactive-about-task-17--5.to-ag2space.txt" and proactive_routing.about_task(name) == "task-17",
@@ -232,6 +265,8 @@ def main() -> int:
     outbox_writers()
     grammar()
     gate_unreadable_task()
+    guarded_park_and_release()
+    held_while_claimed()
     restore_by_generation()
     core_and_provider()
     bridge_edges()

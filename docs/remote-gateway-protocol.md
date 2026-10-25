@@ -572,7 +572,12 @@ CLI refuses an empty digest, and a missing one while several bodies are parked, 
 changes anything. When the body cannot be read at park time, no runnable command is printed.
 A stored destination that no longer matches the resolved one (an owner DM that moved after a
 refusal) parks the item `destination-changed` and moves the file to `results/undelivered/`;
-it is never re-routed, and the logged release sends it to its stored room.
+it is never re-routed, and the logged release sends it to its stored room. The guard applies
+to every dispatch except one a person released: the CLI's requeue records the release bound
+to the stored payload (`operator_release`), and an automatic requeue (a room-upgrade resend)
+records none. Parking takes the item's lock and refuses an item that is delivered, holds a
+receipt or a dispatch mark, or is claimed. A delivered file that cannot be archived is kept
+and archived on a later pass, never unlinked.
 
 The file is still claimed by rename (`.sending.<pid>`, recovered by `_recover_orphan_proactive`
 when its owner dies): that is what keeps the other bridges polling `results/proactive-*.txt`

@@ -226,6 +226,8 @@ def restore(results_dir: Path, task_id: str,
     to go is the one the user should get), and the body never loses its last
     name: nothing a producer can retake is unlinked.
     """
+    if body_sha256 is not None and not re.fullmatch(r"[0-9a-f]{64}", body_sha256):
+        raise ValueError("body_sha256 must be a 64-character hex digest; an empty one would match any copy")
     found = find_quarantined(results_dir, task_id)
     if body_sha256:
         found = [p for p in found if sha256_of(p) == body_sha256]  # one generation, never another

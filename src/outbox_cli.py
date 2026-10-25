@@ -114,7 +114,7 @@ def cmd_requeue(args) -> int:
         args.root, args.item_id,
         reset_attempts=args.reset_attempts,
         operator=args.operator or _default_operator(),
-        reason=args.reason)
+        reason=args.reason, operator_release=True)
     payload = {"item_id": args.item_id, "result": result.value}
     # NOT_PARKED too, not just REQUEUED: the two halves commit separately, so
     # gating the restore on the transition strands the body on every retry.

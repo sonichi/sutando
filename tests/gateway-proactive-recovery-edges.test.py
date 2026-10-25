@@ -9,7 +9,12 @@
   4. the owner DM changes after a refusal   -> the item is held (parked), never re-routed, and
      the logged operator release sends it to its own stored room, once
   5. A's body cannot be read when it parks, then B parks under the same name -> A gets no
-     runnable command; an empty digest, or none at all, is refused before any change
+     runnable command; an empty digest, or none at all, is refused (exit 5) before any change
+  6. room-upgraded -> DM B (automatic requeue) -> 429 -> DM C  -> nothing is sent to B
+  7. a drainer parks for a moved DM while another delivers     -> DELIVERED and its receipt survive
+  8. the move to undelivered/ fails while holding               -> the next pass logs the release
+  9. a delivered file that cannot be archived                   -> kept, archived later, never resent
+ 10. restore() itself refuses an empty digest                   -> ValueError, nothing moved
 
 Run: python3 tests/gateway-proactive-recovery-edges.test.py
 """
@@ -30,6 +35,7 @@ import urllib.error
 from _helpers import proactive_lane as pl
 from _helpers.hermetic_env import isolated_child_env
 from ag2_sparrow import outbox as vendored
+from ag2_sparrow import undelivered_quarantine
 
 REPO = Path(__file__).resolve().parents[1]
 ISO = pl.scratch("gw-proactive-recovery-")
@@ -222,13 +228,16 @@ def unreadable_first_generation() -> None:
     run = subprocess.run([sys.executable] + cmd[1:], cwd=REPO, env=isolated_child_env(),
                          capture_output=True, text=True, timeout=60)
     item = vendored.read_item(root, a_id) or {}
-    check(run.returncode != 0 and item.get("status") == "PARKED" and not (lane.results / "proactive-5.txt").exists(),
-          f"5. an empty digest is refused before any change (exit {run.returncode}, {item.get('status')})")
+    check(run.returncode == 5 and item.get("status") == "PARKED" and not (lane.results / "proactive-5.txt").exists(),
+          f"5. an empty digest is refused with exit 5 before any change (exit {run.returncode}, {item.get('status')})")
     run = subprocess.run([sys.executable] + cmd[1:-2], cwd=REPO, env=isolated_child_env(),
                          capture_output=True, text=True, timeout=60)
     item = vendored.read_item(root, a_id) or {}
-    check(run.returncode != 0 and item.get("status") == "PARKED" and not (lane.results / "proactive-5.txt").exists(),
-          f"5. no digest while two bodies are parked is refused too (exit {run.returncode}, {item.get('status')})")
+    digests = [undelivered_quarantine.sha256_of(q) for q in (lane.results / "undelivered").glob("proactive-5-*.txt")]
+    check(run.returncode == 5 and item.get("status") == "PARKED" and not (lane.results / "proactive-5.txt").exists()
+          and len(digests) == 2 and all(d and d in run.stdout for d in digests),
+          f"5. no digest while two bodies are parked: exit 5, nothing changed, both digests listed "
+          f"(exit {run.returncode}, {item.get('status')}, {run.stdout[-200:]!r})")
     lane.respond = lambda payload: {"ok": True, "event_id": "$B"}
     n = len(lane.posts)
     for _ in range(2):
@@ -238,7 +247,154 @@ def unreadable_first_generation() -> None:
           f"5. B is not restored or sent in A's place ({len(lane.posts) - n} POSTs, parked {left})")
 
 
+def automatic_requeue_is_not_a_release() -> None:
+    upgraded = {"reason": "room_upgraded", "replacement_room": "!Replacement:ag2.space"}
+    calls = {"n": 0}
+
+    def respond(payload):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise urllib.error.HTTPError("https://gw.example/relay/v1/room", 400, "upgraded", {},
+                                         __import__("io").BytesIO(json.dumps(upgraded).encode()))
+        if calls["n"] == 2:
+            raise urllib.error.HTTPError("https://gw.example/relay/v1/room", 429, "slow", {}, None)
+        return {"ok": True, "event_id": "$sent"}
+    lane = pl.Lane(gb, ISO, respond)
+    saved_hook, gb.OWNER_DM_UPGRADED_NOTIFY = gb.OWNER_DM_UPGRADED_NOTIFY, lambda *a: None
+    saved_state, gb._STATE = gb._STATE, lane.ws / "state"
+    try:
+        lane.write("proactive-6.txt", "six\n")
+        lane.drain()
+        lane.owner_dm = "!DmB:ag2.space"
+        lane.drain()
+        lane.owner_dm = "!DmC:ag2.space"
+        backend = lane.backend()
+        backend.clock = lambda: gb.time.time() + 120
+        lane.drain()
+        lane.drain()
+    finally:
+        gb.OWNER_DM_UPGRADED_NOTIFY, gb._STATE = saved_hook, saved_state
+    to_b = [q for q in lane.posts if q.get("room_id") == "!DmB:ag2.space"]
+    check(len(to_b) == 1 and lane.posts[-1].get("room_id") == "!DmB:ag2.space" and calls["n"] == 2,
+          f"6. after the automatic requeue to B and a 429, nothing more goes to B once the DM is C "
+          f"({[q.get('room_id') for q in lane.posts]})")
+
+
+def park_races_a_delivery() -> None:
+    lane = pl.Lane(gb, ISO, refused)
+    lane.write("proactive-7.txt", "seven\n")
+    lane.drain()
+    item_id = gb._proactive_item_id("proactive-7", "seven")
+    root = lane.results / ".outbox-ag2space-proactive"
+    backend = lane.backend()
+    backend.clock = lambda: gb.time.time() + 120
+    lane.respond = lambda payload: {"ok": True, "event_id": "$won"}
+    real = gb._payload_room
+    fired = []
+
+    def other_drainer_delivers(payload):
+        room = real(payload)
+        if not fired:
+            fired.append(True)
+            core = gb._delivery_core("proactive")
+            saved = gb.RESULTS_DIR, gb._req
+            gb.RESULTS_DIR, gb._req = lane.results, lane._req
+            try:
+                core.deliver_one(item_id, vendored.read_item(root, item_id)["payload"].encode())
+            finally:
+                gb.RESULTS_DIR, gb._req = saved
+        return room
+    lane.owner_dm = "!MovedDm:ag2.space"
+    before = len(lane.posts)
+    gb._payload_room = other_drainer_delivers
+    try:
+        lane.drain()
+    finally:
+        gb._payload_room = real
+    item = vendored.read_item(root, item_id) or {}
+    check(item.get("status") == "DELIVERED" and item.get("provider_ref") == "$won",
+          f"7. the stale park did not erase the delivery ({item.get('status')}, {item.get('reason')}, {item.get('provider_ref')})")
+    vendored.requeue_item_with_epoch(root, item_id, operator="test", operator_release=True) \
+        if "operator_release" in vendored.requeue_item_with_epoch.__code__.co_varnames \
+        else vendored.requeue_item_with_epoch(root, item_id, operator="test")
+    lane.write("proactive-7.txt", "seven\n")
+    lane.owner_dm = pl.OWNER_DM
+    lane.drain()
+    check(len(lane.posts) - before == 1,
+          f"7. one POST, by the valid claimant; a later release cannot duplicate it ({len(lane.posts) - before})")
+
+
+def hold_move_fails() -> None:
+    lane = pl.Lane(gb, ISO, refused)
+    lane.write("proactive-8.txt", "eight\n")
+    lane.drain()
+    lane.owner_dm = "!MovedDm8:ag2.space"
+    backend = lane.backend()
+    backend.clock = lambda: gb.time.time() + 120
+    real = gb.undelivered_quarantine.place_as
+    failed = []
+
+    def fail_once(*a, **k):
+        if not failed:
+            failed.append(True)
+            raise OSError("disk full")
+        return real(*a, **k)
+    gb.undelivered_quarantine.place_as = fail_once
+    try:
+        lane.drain()
+        n = len(lane.logs)
+        lane.drain()
+    finally:
+        gb.undelivered_quarantine.place_as = real
+    later = lane.logs[n:]
+    check(lane.where("proactive-8") == "undelivered" and any("outbox_cli.py" in m and "requeue" in m for m in later),
+          f"8. after a failed move the next pass parks it and logs the release ({lane.where('proactive-8')}, "
+          f"{[m[-100:] for m in later]})")
+
+
+def delivered_archive_fails() -> None:
+    lane = pl.Lane(gb, ISO)
+    lane.write("proactive-9d.txt", "nine\n")
+    real = Path.rename
+    failed = []
+
+    def rename(self, target):
+        if ".sending." in self.name and Path(target).parent.name == "archive" and not failed:
+            failed.append(True)
+            raise OSError("archive unavailable")
+        return real(self, target)
+    Path.rename = rename
+    try:
+        lane.drain()
+    finally:
+        Path.rename = real
+    kept = lane.where("proactive-9d")
+    lane.drain()
+    check(kept == "pending" and lane.where("proactive-9d") == "archived" and len(lane.posts) == 1,
+          f"9. a delivered file that could not be archived is kept, archived next pass, not resent "
+          f"({kept} -> {lane.where('proactive-9d')}, {len(lane.posts)} POSTs)")
+
+
+def restore_refuses_empty_digest() -> None:
+    results = pl.scratch("restore-empty-")
+    (results / "undelivered").mkdir()
+    (results / "undelivered" / "proactive-x-1.txt").write_text("x\n")
+    try:
+        out = undelivered_quarantine.restore(results, "proactive-x", body_sha256="")
+        refused_it = False
+    except ValueError:
+        out, refused_it = None, True
+    check(refused_it and (results / "undelivered" / "proactive-x-1.txt").exists()
+          and not (results / "proactive-x.txt").exists(),
+          f"10. restore() refuses an empty digest itself and moves nothing ({out})")
+
+
 def main() -> int:
+    automatic_requeue_is_not_a_release()
+    park_races_a_delivery()
+    hold_move_fails()
+    delivered_archive_fails()
+    restore_refuses_empty_digest()
     unreadable_first_generation()
     two_generations()
     past_the_deadline(with_receipt=True)
