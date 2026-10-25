@@ -1360,6 +1360,19 @@ def main() -> int:
           and getattr(rtc.PROACTIVE_ACK_GATE, "__name__", "") == "_ag2space_proactive_ack_gate"
           and rtc.PROACTIVE_ACK_GATE("task-1761300000000", "proactive-x~0") is None,
           "sutando loader wires the dispatch, ack and route gates; a task not in the queue is withdrawn")
+    import proactive_dispatch_gate as _pdg
+    _seen, _real_veto = [], _pdg.initial_ack_veto
+    _pdg.initial_ack_veto = lambda *a, **k: _seen.append(a) or None
+    try:
+        rtc.PROACTIVE_ACK_GATE("task-1761300000000", "proactive-x~0")
+    finally:
+        _pdg.initial_ack_veto = _real_veto
+    _hws = Path(tempfile.mkdtemp(prefix="ack-gate-holder-"))
+    (_hws / "deliveries" / "worker1").mkdir(parents=True)
+    (_hws / "deliveries" / "worker1" / "task-1761300000000.accepted").write_text("")
+    check(_seen and _seen[0][3] is rtc._ag2space_worker_holder
+          and rtc._ag2space_worker_holder(_hws, "task-1761300000000") == "worker1",
+          "the ack gate is given the worker-holder lookup, which reads a delivery sentinel")
     _activity = rtc.WS / "state" / "last-owner-activity.json"
     _activity.parent.mkdir(parents=True, exist_ok=True)
     _activity.write_text(json.dumps(

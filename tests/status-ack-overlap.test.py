@@ -5,7 +5,7 @@ Each case runs the real runner pass and the gateway's real proactive drain; the 
 the fake room endpoint.
   a) a task whose card shows "queued" gets no line          CONTROL: the same task with no card does
   b) a task a session picked up (card RUNNING) gets no line
-  c) a task with a progress notice (task-progress's first-notify marker) gets no line
+  c) a task with a sent progress notice (task-progress's sent marker) gets no line
   d) a card that appears between the decision and the publish withdraws the line and frees the claim
   e) watcher down with a queued card: the owner DM still goes out, the room gets no line
   f) an activity snapshot that cannot be read counts as a card
@@ -57,7 +57,7 @@ def main() -> int:
 
     lane = pl.Lane(gb, ISO)
     sa.task(lane.ws, TID)
-    ack_claim.claim(lane.ws, f"progress:{TID}:first-notify", "task-progress")
+    ack_claim.claim(lane.ws, f"progress:{TID}:sent", "task-progress")
     r = mod.run_once(lane.ws, sa.on(mod), now=DUE, holders=sa.SESSION)
     lane.drain()
     check(sa.room_posts(lane) == [] and "progress" in r.skipped.get(TID, ""),

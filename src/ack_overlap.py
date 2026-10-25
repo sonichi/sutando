@@ -1,15 +1,16 @@
 """Whether a task's initial status ack would duplicate what the room already sees about it.
 
 One predicate, asked by the status-ack runner before it publishes and by the gateway's
-dispatch gate right before an initial ack is sent: a task a session has picked up, one whose
-activity card is up, or one that has a progress notice gets no "not picked up" line.
+dispatch gate right before an initial ack is sent: a task a session or worker has picked up,
+one whose activity card is up, or one with a sent progress notice gets no "not picked up" line.
+The worker-holder lookup is injected by the caller, so this module names no skill.
 """
 from __future__ import annotations
 
 import json
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import ack_claim  # noqa: E402
@@ -40,8 +41,9 @@ def card_shown(ws: Optional[Path], task_id: str) -> bool:
 
 
 def progress_shown(ws: Optional[Path], task_id: str) -> bool:
-    """True once task-progress has taken the task's first-notify marker: a progress notice went out."""
-    return ack_claim.state(_ws(ws), f"progress:{task_id}:first-notify") != "none"
+    """True once task-progress recorded a sent notice (`progress:<task>:sent`). Its first-notify
+    marker is only bookkeeping: a notify that lost the initial ack sent nothing."""
+    return ack_claim.state(_ws(ws), f"progress:{task_id}:sent") != "none"
 
 
 def picked_up(ws: Optional[Path], task_id: str) -> bool:
@@ -50,11 +52,18 @@ def picked_up(ws: Optional[Path], task_id: str) -> bool:
     return path is not None and path.name != f"{task_id}.txt"
 
 
-def overlap_veto(ws: Optional[Path], task_id: str) -> Optional[str]:
+def overlap_veto(ws: Optional[Path], task_id: str, holder: Optional[Callable] = None) -> Optional[str]:
     """Why an initial ack for the task would duplicate the card or the progress notifier, or None.
-    The workspace defaults to the resolved one."""
+    `holder(ws, task_id)` is the caller-injected worker-holder lookup; one that raises vetoes."""
     if picked_up(ws, task_id):
         return "a session picked the task up"
+    if holder is not None:
+        try:
+            held = holder(_ws(ws), task_id)
+        except Exception as exc:  # noqa: BLE001 - an unreadable holder state is never read as unheld
+            return f"the worker holder could not be read ({type(exc).__name__})"
+        if held is not None:
+            return f"a worker holds the task ({held})"
     if card_shown(ws, task_id):
         return "an activity card shows the task"
     if progress_shown(ws, task_id):

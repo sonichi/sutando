@@ -14,7 +14,7 @@ and is made from observed facts only.
 
 It speaks only for a task **no session has picked up** (no RUNNING phase, no worker holding it)
 that shows **no activity card** (no row projected or owed in `state/activity/<task>.json`) and
-**no progress notice** (task-progress's `progress:<task>:first-notify` marker). The predicate is
+**no sent progress notice** (task-progress records `progress:<task>:sent` after a send; its first-notify marker is bookkeeping only). The predicate is
 `src/ack_overlap.py`. The gateway asks it again just before it sends the ack, for that ack's own
 outbox item only, so a pickup after publication withdraws the line and nothing else. Anything else is
 the card's and the progress notifier's to report, so this runner stays silent. A task a session

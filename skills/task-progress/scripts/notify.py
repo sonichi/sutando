@@ -517,6 +517,21 @@ def _initial_ack_gate(task_file: "str | None") -> "tuple[bool, tuple | None]":
     return False, None
 
 
+def _record_sent(task_file: "str | None") -> None:
+    """Mark that a progress notice for the task was actually sent: `progress:<task>:sent`, the
+    only evidence another sender reads as a progress notice. Fail-open: a send is never undone."""
+    if not task_file or _ACK_ARBITRATION is None:
+        return
+    ack_claim, _, task_id_for = _ACK_ARBITRATION
+    try:
+        path = _task_payload(task_file)
+        tid = task_id_for(path) if path is not None else None
+        if tid:
+            ack_claim.claim(path.parent.parent, f"progress:{tid}:sent", ACK_HOLDER)
+    except (OSError, ValueError):
+        pass
+
+
 def _derive_from_task_file(path: str) -> dict:
     """source/channel_id/chat_id/thread_root/reply_to/thread_ts from a task file's headers.
     {} (with a stderr note) when the file is unreadable: explicit flags still apply."""
@@ -652,6 +667,8 @@ def main() -> int:
         ok = send_remote_gateway(source, channel, message, thread_root=thread_root,
                                  reply_to=reply_to, extra=extra)
 
+    if ok:
+        _record_sent(args.task_file)
     if held is not None:
         # A failed send may still have landed, so the claim is kept as unknown, never released.
         try:

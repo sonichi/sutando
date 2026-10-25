@@ -9,6 +9,11 @@ host's real dispatch, ack and route gates. Assertions are at the fake room endpo
   b) an activity card appears -> no POST       c) a progress notice goes out -> no POST
   d) the ack gate is ack-specific: after pickup, a later progress line about the same task is
      still delivered while the ack is withdrawn
+  e) the core's first notify loses the runner-held initial ack and sends nothing: its first-notify
+     bookkeeping is not a progress notice, so exactly one initial line is delivered; a later
+     notify that does send makes the pending ack redundant, so only the notice is posted
+  f) a worker acquires (pending sentinel) or accepts the delivery while the task file stays bare
+     -> no POST; a deliveries/ that cannot be read -> no POST
   CONTROL: nothing changes before the drain -> the ack is delivered
 
 Run: python3 tests/status-ack-dispatch-overlap.test.py
@@ -16,6 +21,8 @@ Run: python3 tests/status-ack-dispatch-overlap.test.py
 from __future__ import annotations
 
 import functools
+import importlib.util
+import inspect
 import sys
 from pathlib import Path
 
@@ -39,10 +46,25 @@ KEY = f"ack:{TID}:initial"
 DUE = sa.T0 + 10_000
 
 
+def _module(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    m = importlib.util.module_from_spec(spec)
+    sys.modules[name] = m
+    spec.loader.exec_module(m)
+    return m
+
+
+PROBE = _module("unanswered_tasks_for_dispatch", sa.REPO / "scripts" / "unanswered-tasks.py")
+notify = _module("notify_for_dispatch", sa.REPO / "skills" / "task-progress" / "scripts" / "notify.py")
+NOTIFY_POSTS: list = []
+notify._post = lambda url, payload, headers, timeout=10: NOTIFY_POSTS.append(dict(payload)) or True
+
+
 def drain(lane):
     ack = getattr(gate, "initial_ack_veto", None)
+    kw = {"holder": PROBE._holder} if ack and "holder" in inspect.signature(ack).parameters else {}
     lane.drain(gate=functools.partial(gate.dispatch_veto, workspace=lane.ws),
-               ack_gate=functools.partial(ack, workspace=lane.ws) if ack else None,
+               ack_gate=functools.partial(ack, workspace=lane.ws, **kw) if ack else None,
                route_gate=functools.partial(gate.route_veto, workspace=lane.ws))
 
 
@@ -56,7 +78,7 @@ def card(lane):
 
 
 def progress(lane):
-    ack_claim.claim(lane.ws, f"progress:{TID}:first-notify", "task-progress")
+    ack_claim.claim(lane.ws, f"progress:{TID}:sent", "task-progress")
 
 
 def published_then(change):
@@ -94,6 +116,54 @@ def main() -> int:
     bodies = [p.get("body") for p in sa.room_posts(lane)]
     check(bodies == ["Still on it: reading the logs."],
           f"d) a progress line after pickup is delivered; only the ack is withdrawn ({bodies})")
+
+    lane = pl.Lane(gb, ISO)
+    tf = sa.task(lane.ws, TID)
+    mod.run_once(lane.ws, sa.on(mod), now=DUE, holders=sa.SESSION)
+    del NOTIFY_POSTS[:]
+    saved = sys.argv
+    sys.argv = ["notify.py", "--task-file", str(tf), "--message", "On it."]
+    try:
+        rc = notify.main()
+    finally:
+        sys.argv = saved
+    drain(lane)
+    for t in (DUE + 15, DUE + 30):
+        mod.run_once(lane.ws, sa.on(mod), now=t, holders=sa.SESSION)
+        drain(lane)
+    initial = len(sa.room_posts(lane)) + len(NOTIFY_POSTS)
+    check(rc == 0 and NOTIFY_POSTS == [] and len(sa.room_posts(lane)) == 1,
+          f"e) notify loses the initial ack: exactly one initial line is delivered ({initial}: "
+          f"{len(sa.room_posts(lane))} runner, {len(NOTIFY_POSTS)} notify)")
+
+    lane = pl.Lane(gb, ISO)
+    tf = sa.task(lane.ws, TID)
+    mod.run_once(lane.ws, sa.on(mod), now=DUE, holders=sa.SESSION)
+    del NOTIFY_POSTS[:]
+    for msg in ("On it.", "Still on it: reading the logs."):
+        sys.argv = ["notify.py", "--task-file", str(tf), "--message", msg]
+        try:
+            notify.main()
+        finally:
+            sys.argv = saved
+    drain(lane)
+    check(sa.room_posts(lane) == [] and [n.get("body") for n in NOTIFY_POSTS] == ["Still on it: reading the logs."], f"e) a sent progress notice withdraws the pending ack ({lane.posts}, {NOTIFY_POSTS})")
+
+    def sentinel(suffix):
+        def land(lane):
+            seat = lane.ws / "deliveries" / "worker1"
+            seat.mkdir(parents=True, exist_ok=True)
+            (seat / f"{TID}{suffix}").write_text("", encoding="utf-8")
+        return land
+
+    def unreadable(lane):
+        (lane.ws / "deliveries").write_text("not a directory", encoding="utf-8")
+
+    for label, change in (("acquires the delivery", sentinel(".txt")), ("accepts it", sentinel(".accepted")),
+                          ("deliveries/ unreadable", unreadable)):
+        lane = published_then(change)
+        check(lane.posts == [] and (lane.tasks / f"{TID}.txt").exists(),
+              f"f) a worker {label} with the task file still bare -> no POST ({lane.posts})")
     return check.exit_code()
 
 

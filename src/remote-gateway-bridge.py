@@ -359,10 +359,19 @@ def _ag2space_proactive_dispatch_gate(task_id: str):
     return dispatch_veto(task_id, WS)
 
 
+def _ag2space_worker_holder(workspace, task_id: str):
+    """The worker holding the task, through the unanswered-tasks probe's delegation to worker-pool."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("unanswered_tasks_probe", _REPO / "scripts" / "unanswered-tasks.py")
+    probe = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(probe)
+    return probe._holder(workspace, task_id)
+
+
 def _ag2space_proactive_ack_gate(task_id: str, item_id: str):
-    """Right before a task's initial ack is sent: why the card or a progress notice now covers it, or None."""
+    """Right before a task's initial ack is sent: why a pickup, the card or a progress notice now covers it, or None."""
     from proactive_dispatch_gate import initial_ack_veto
-    return initial_ack_veto(task_id, item_id, WS)
+    return initial_ack_veto(task_id, item_id, WS, _ag2space_worker_holder)
 
 
 def _ag2space_proactive_route_gate(task_id: str, room: str, thread_root):

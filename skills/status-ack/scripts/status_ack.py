@@ -113,10 +113,16 @@ def settings(enabled=None, environ=None, manifest_cfg=None) -> Settings:
                     poll_s=_positive(get(CFG_POLL), 15.0), watcher_down_after_s=_positive(get(CFG_WATCHER_DOWN), 120.0))
 
 
+_PROBE = []
+
+
 def _load_probe():
+    if _PROBE:
+        return _PROBE[0]
     spec = importlib.util.spec_from_file_location("unanswered_tasks_probe", _REPO / "scripts" / "unanswered-tasks.py")
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
+    _PROBE.append(mod)
     return mod
 
 
@@ -283,12 +289,17 @@ def routed_body(decision) -> Optional[str]:
     return body
 
 
+def worker_holder(ws: Path, tid: str):
+    """The probe's own worker-holder lookup (it delegates to worker-pool); raising means unreadable."""
+    return _load_probe()._holder(ws, tid)
+
+
 def recheck(ws: Path, tid: str) -> Optional[str]:
     """Why an ack decided a moment ago must not be published now, or None."""
     state = result_state(ws, tid)
     if state != "none":
         return f"result state is now {state}"
-    overlap = ack_overlap.overlap_veto(ws, tid)
+    overlap = ack_overlap.overlap_veto(ws, tid, worker_holder)
     if overlap is not None:
         return overlap
     try:

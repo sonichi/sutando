@@ -42,7 +42,7 @@ def dispatch_veto(task_id: str, workspace: Optional[Path] = None) -> Optional[st
     return None
 
 
-def initial_ack_veto(task_id: str, item_id: str, workspace: Optional[Path] = None) -> Optional[str]:
+def initial_ack_veto(task_id: str, item_id: str, workspace: Optional[Path] = None, holder=None) -> Optional[str]:
     """For the outbox item the task's initial-ack claim names (its `via` file), why it would now
     duplicate the card or a progress notice; None for every other message about the task."""
     ws = Path(workspace) if workspace is not None else resolve_workspace()
@@ -50,7 +50,7 @@ def initial_ack_veto(task_id: str, item_id: str, workspace: Optional[Path] = Non
     via = rec.get("via") if rec else None
     if not isinstance(via, str) or not via or not str(item_id).startswith(f"{Path(via).stem}~"):
         return None
-    veto = ack_overlap.overlap_veto(ws, task_id)
+    veto = ack_overlap.overlap_veto(ws, task_id, holder)
     return f"initial ack withdrawn: {veto}" if veto else None
 
 
