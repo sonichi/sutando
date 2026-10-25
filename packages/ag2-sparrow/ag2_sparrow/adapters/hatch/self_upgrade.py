@@ -74,15 +74,12 @@ UPGRADE_FAILED = _keepalive.UPGRADE_FAILED
 STALE_START_S = 30 * 60
 # Phases written under the lock; a dead attempt in one of these may have changed files.
 MUTATING_PHASES = ("installing", "installed", "restoring")
-SUMMARY_OUTCOMES = ("crashed", "rolled-back", "restore-failed")
-# Phases from which a record can carry the `manager` that the quiesced phase saves.
-MANAGER_PHASES = frozenset(("quiesced", *MUTATING_PHASES, "ok", "crashed", "rolled-back",
-                            "restore-failed", "acknowledged"))
+SUMMARY_OUTCOMES = ("rolled-back", "restore-failed")
+MANAGERS = ("unit", "detached")
 # A direct rerun ending in one of these keeps an older failure summary; others replace it.
 # None of them is a summary outcome, so a summary's own attempt is told from a rerun clocklessly.
 KEEPS_FAILED = frozenset(("started", "unsupported-install", "not-above-installed", "no-download",
                           "no-inventory", "no-snapshot", "no-pip-check", "stop-failed"))
-WORKING_PHASES = ("snapshot", "quiesced", *MUTATING_PHASES)
 TERMINAL = frozenset(("crashed", "rolled-back", "restore-failed", "ok", "not-started",
                       "unsupported-install", "not-above-installed", "no-download",
                       "no-inventory", "no-snapshot", "no-pip-check", "stop-failed"))
@@ -155,15 +152,20 @@ def _unique_members(pairs) -> dict:
     return dict(pairs)
 
 
-def _legal(outcome, phase) -> bool:
-    """Whether the writer can leave an attempt at (outcome, phase): started with no phase
-    or a working phase, a terminal outcome as its own phase, or an acknowledged
-    restore-failed (clear_blocked)."""
-    if outcome == "started":
-        return phase is None or phase in WORKING_PHASES
-    if outcome == "restore-failed" and phase == "acknowledged":
-        return True
-    return outcome in TERMINAL and phase == outcome
+# Every (outcome, phase) a writer leaves, with the manager it carries: _phase "quiesced" saves it,
+# a restore may start from an attempt that never quiesced. `hook` is saved only with "ok".
+NO, YES, MAYBE = "no manager", "a manager", "a manager or none"
+_ATTEMPT_VARIANTS = {
+    ("started", None): NO, ("started", "snapshot"): NO,
+    ("started", "quiesced"): YES, ("started", "installing"): YES, ("started", "installed"): YES,
+    ("started", "restoring"): MAYBE,
+    ("ok", "ok"): YES,
+    ("crashed", "crashed"): MAYBE, ("rolled-back", "rolled-back"): MAYBE,
+    ("restore-failed", "restore-failed"): MAYBE, ("restore-failed", "acknowledged"): MAYBE,
+    **{(o, o): NO for o in ("not-started", "unsupported-install", "not-above-installed",
+                            "no-download", "no-inventory", "no-snapshot", "no-pip-check",
+                            "stop-failed")},
+}
 
 
 def _well_formed_journal(state, latest: float) -> bool:
@@ -181,18 +183,30 @@ def _well_formed_journal(state, latest: float) -> bool:
         failed = state["failed"]
         if not _typed(failed, _FAILED, ("target", "from", "installed", "why", "at"), latest):
             return False
-        if ("outcome" in failed) != ("problems" in failed):
+        if not _failed_variant(failed):
             return False
         outcome = failed.get("outcome", "crashed")
-        if outcome not in SUMMARY_OUTCOMES or not _summarises(state["attempted"], failed["target"],
-                                                               outcome, KEEPS_FAILED):
+        if not _summarises(state["attempted"], failed["target"], outcome, KEEPS_FAILED):
             return False
+    if "installed" not in state and any(t["outcome"] == "ok" for t in state["attempted"].values()):
+        return False
     if "installed" in state:
         installed = state["installed"]
         if not (_typed(installed, _INSTALLED, ("version", "at", "sha256"), latest)
                 and _summarises(state["attempted"], installed["version"], "ok", KEEPS_INSTALLED)):
             return False
     return True
+
+
+def _failed_variant(failed: dict) -> bool:
+    """The failed summaries the writers save: a crash (no outcome, no problems), a verified
+    rollback (rolled-back, no problems) or a failed one (restore-failed, with problems)."""
+    if "outcome" not in failed:
+        return "problems" not in failed
+    problems = failed.get("problems")
+    if failed["outcome"] == "rolled-back":
+        return problems == []
+    return failed["outcome"] == "restore-failed" and isinstance(problems, list) and bool(problems)
 
 
 def _summarises(attempted: dict, target: str, outcome: str, kept_by) -> bool:
@@ -223,7 +237,7 @@ def _texts(value, latest) -> bool:
 
 # Every field each record's writer can save, with the type it saves it as.
 _ATTEMPT = {"at": _plausible, "from": _text, "outcome": _text, "phase": _text, "hook": _text,
-            "manager": lambda v, latest: v is None or isinstance(v, str)}
+            "manager": lambda v, latest: v in MANAGERS}
 _FAILED = {"target": _text, "from": _text, "installed": _text, "why": _text, "at": _plausible,
            "outcome": _text, "problems": _texts}
 _INSTALLED = {"version": _text, "at": _plausible,
@@ -239,14 +253,13 @@ def _typed(record, fields: dict, required, latest: float) -> bool:
 
 def _well_formed(tried, latest: float) -> bool:
     """An attempt record the writer can leave: its fields typed as the writer saves them,
-    then a legal (outcome, phase)."""
-    if not (_typed(tried, _ATTEMPT, ("at", "from", "outcome"), latest)
-            and _legal(tried["outcome"], tried.get("phase"))):
+    at an (outcome, phase) variant that allows the manager and hook it carries."""
+    if not _typed(tried, _ATTEMPT, ("at", "from", "outcome"), latest):
         return False
-    # hook is saved only with a successful install; manager only once the phase quiesced.
-    if "hook" in tried and tried["outcome"] != "ok":
+    rule = _ATTEMPT_VARIANTS.get((tried["outcome"], tried.get("phase")))
+    if rule is None or ("hook" in tried and tried["outcome"] != "ok"):
         return False
-    return "manager" not in tried or tried.get("phase") in MANAGER_PHASES
+    return ("manager" in tried) == (rule == YES) or (rule == MAYBE)
 
 
 def save_state(state_dir: Path, state: dict) -> None:

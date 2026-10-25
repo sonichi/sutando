@@ -2861,7 +2861,7 @@ class Upgrade(Base):
 
     def test_a_mutating_crash_with_no_snapshot_is_restore_failed_not_rolled_back(self):
         self.start(self.setup(), now=1000.0)
-        self_upgrade._phase(self.state, "0.6.0", "installing")
+        self_upgrade._phase(self.state, "0.6.0", "installing", manager="detached")
         with contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(self_upgrade.maybe_start(self.cfg, None, "0.5.4", 1010.0),
                              "0.6.0:restore-failed")
@@ -3049,7 +3049,7 @@ class Upgrade(Base):
             self.assertIsNotNone(self_upgrade.failed_since(self.state), attempt)
             self.assertEqual(self.keepawake_restarts(), (1, 0), attempt)
         for attempt in ({"outcome": "started", "at": 1.0, "from": "0.5.4"},
-                        {"outcome": "ok", "at": 1.0, "phase": "ok", "from": "0.5.4"}):
+                        {"outcome": "crashed", "at": 1.0, "phase": "crashed", "from": "0.5.4"}):
             path.write_text(json.dumps({"attempted": {"0.6.0": attempt}}))
             self.assertIsNone(self_upgrade.recovery_blocked(self.state), attempt)
 
@@ -3069,17 +3069,27 @@ class Upgrade(Base):
             path.write_text(json.dumps(journal))
             self.assertIn("cannot be read", self_upgrade.recovery_blocked(self.state) or "", journal)
             self.assertEqual(self.keepawake_restarts(), (1, 0), journal)
-        good = [("started", None), ("started", "snapshot"), ("started", "quiesced"),
-                ("crashed", "crashed"), ("rolled-back", "rolled-back"), ("ok", "ok"),
-                ("restore-failed", "acknowledged"), ("stop-failed", "stop-failed")]
-        for outcome, phase in good:
-            tried = dict(base, outcome=outcome, **({} if phase is None else {"phase": phase}))
-            path.write_text(json.dumps({"attempted": {"0.6.0": tried}}))
-            self.assertIsNone(self_upgrade.recovery_blocked(self.state), (outcome, phase))
-        for phase in ("restore-failed", "installing", "installed", "restoring"):
-            outcome = "restore-failed" if phase == "restore-failed" else "started"
-            path.write_text(json.dumps({"attempted": {"0.6.0": dict(base, outcome=outcome, phase=phase)}}))
-            self.assertIn("left unverified files", self_upgrade.recovery_blocked(self.state))
+        for outcome, phase in self_upgrade._ATTEMPT_VARIANTS:
+            path.write_text(json.dumps(self.writer_journal(outcome, phase)))
+            blocked = self_upgrade.recovery_blocked(self.state)
+            if phase in ("installing", "installed", "restoring", "restore-failed"):
+                self.assertIn("left unverified files", blocked, (outcome, phase))
+            else:
+                self.assertIsNone(blocked, (outcome, phase))
+
+    def writer_journal(self, outcome, phase, **fields):
+        """The journal a writer leaves with one attempt at (outcome, phase): the manager from
+        quiescence on, and the installed summary a success saves with it."""
+        tried = {"at": 1.0, "from": "0.5.4", "outcome": outcome}
+        if phase is not None:
+            tried["phase"] = phase
+        if self_upgrade._ATTEMPT_VARIANTS[(outcome, phase)] == self_upgrade.YES:
+            tried["manager"] = "unit"
+        tried.update(fields)
+        journal = {"attempted": {"0.6.0": tried}}
+        if outcome == "ok":
+            journal["installed"] = {"version": "0.6.0", "at": 2.0, "sha256": {"w.whl": SHA_NEW}}
+        return journal
 
     ORPHAN_RESTORE_FAILED = {"attempted": {}, "failed": {
         "target": "0.6.0", "from": "0.5.4", "installed": "0.6.0", "why": "restore failed",
@@ -3111,9 +3121,9 @@ class Upgrade(Base):
                 "failed": summary},
                {"attempted": {"0.6.0": dict(tried, outcome="crashed", phase="crashed")},
                 "failed": dict(summary, outcome="restore-failed")},
-               {"attempted": {"0.6.0": dict(tried, outcome="ok", phase="ok")},
+               {"attempted": {"0.6.0": dict(tried, outcome="ok", phase="ok", manager="unit")},
                 "failed": dict(summary, outcome="rolled-back")},
-               {"attempted": {"0.6.0": dict(tried, outcome="ok", phase="ok")},
+               {"attempted": {"0.6.0": dict(tried, outcome="ok", phase="ok", manager="unit")},
                 "failed": dict(summary, outcome="ok")},
                {"attempted": {"0.6.0": dict(tried, outcome="crashed", phase="crashed")},
                 "failed": dict(summary, target=["0.6.0"])},
@@ -3122,7 +3132,7 @@ class Upgrade(Base):
                {"attempted": {}, "installed": {"version": "0.6.0", "at": 2.0}},
                {"attempted": {"0.6.0": dict(tried, outcome="not-started", phase="not-started")},
                 "installed": {"version": "0.6.0", "at": 2.0}},
-               {"attempted": {"0.6.0": dict(tried, outcome="ok", phase="ok")},
+               {"attempted": {"0.6.0": dict(tried, outcome="ok", phase="ok", manager="unit")},
                 "installed": {"version": "0.6.0"}}]
         for journal in bad:
             path.write_text(json.dumps(journal))
@@ -3169,7 +3179,8 @@ class Upgrade(Base):
     def test_a_field_of_a_type_no_writer_saves_holds_restarts(self):
         attempt = {"at": 1, "from": "0.5.4", "outcome": "started"}
         crashed = dict(attempt, outcome="crashed", phase="crashed")
-        ok = dict(attempt, outcome="ok", phase="ok")
+        ok = dict(attempt, outcome="ok", phase="ok", manager="unit")
+        quiesced = dict(attempt, phase="quiesced", manager="unit")
         failed = {"target": "0.6.0", "from": "0.5.4", "installed": "0.5.4", "why": "w", "at": 2}
         installed = {"version": "0.6.0", "at": 2, "sha256": {"w.whl": SHA_NEW}}
         texts, times = [[], {}, 1, None, True], ["1", [], {}, None, True]
@@ -3179,9 +3190,10 @@ class Upgrade(Base):
                     {"attempted": {"0.6.0": crashed}, "failed": []},
                     {"attempted": {"0.6.0": ok}, "installed": dict(installed, extra=1)},
                     {"attempted": {"0.6.0": ok}, "installed": []}]
-        for field, values in (("outcome", texts), ("at", times), ("from", texts), ("hook", texts),
-                              ("manager", [[], {}, 1, True])):
-            journals += [{"attempted": {"0.6.0": dict(attempt, **{field: v})}} for v in values]
+        for field, values, base in (("outcome", texts, attempt), ("at", times, attempt),
+                                    ("from", texts, attempt), ("hook", texts, ok),
+                                    ("manager", [[], {}, 1, True, None, "m"], quiesced)):
+            journals += [{"attempted": {"0.6.0": dict(base, **{field: v})}} for v in values]
         journals += [{"attempted": {"0.6.0": dict(crashed, phase=v)}} for v in texts]
         for field, values in (("target", texts), ("outcome", texts), ("at", times),
                               ("from", texts), ("installed", texts), ("why", texts),
@@ -3194,10 +3206,13 @@ class Upgrade(Base):
                          for v in values]
         for journal in journals:
             self.assert_held_everywhere(json.dumps(journal), journal)
-        for journal in ({"attempted": {"0.6.0": dict(attempt, phase="quiesced", manager=None)}},
-                        {"attempted": {"0.6.0": dict(ok, hook="h", manager="m")}},
+        for journal in ({"attempted": {"0.6.0": quiesced}},
+                        {"attempted": {"0.6.0": dict(ok, hook="h")}, "installed": installed},
                         {"attempted": {"0.6.0": dict(crashed, outcome="rolled-back", phase="rolled-back")},
-                         "failed": dict(failed, outcome="rolled-back", problems=["p"])},
+                         "failed": dict(failed, outcome="rolled-back", problems=[])},
+                        {"attempted": {"0.6.0": dict(crashed, outcome="restore-failed",
+                                                     phase="acknowledged", manager="detached")},
+                         "failed": dict(failed, outcome="restore-failed", problems=["p"])},
                         {"attempted": {"0.6.0": crashed}, "failed": failed},
                         {"attempted": {"0.6.0": ok}, "installed": installed}):
             self.state_path_text(json.dumps(journal))
@@ -3206,7 +3221,7 @@ class Upgrade(Base):
     def test_a_record_no_writer_can_leave_holds_restarts(self):
         attempt = {"at": time.time(), "from": "0.5.4", "outcome": "started"}
         crashed = dict(attempt, outcome="crashed", phase="crashed")
-        ok = dict(attempt, outcome="ok", phase="ok")
+        ok = dict(attempt, outcome="ok", phase="ok", manager="unit")
         failed = {"target": "0.6.0", "from": "0.5.4", "installed": "0.5.4", "why": "w", "at": 2}
         installed = {"version": "0.6.0", "at": 2, "sha256": {"w.whl": SHA_NEW}}
         no_from = {k: v for k, v in attempt.items() if k != "from"}
@@ -3229,6 +3244,109 @@ class Upgrade(Base):
                       "installed": {"version": "0.6.0", "at": 2}}]
         for journal in journals:
             self.assert_held_everywhere(json.dumps(journal), journal)
+
+    def test_a_writer_variant_with_the_wrong_manager_summary_or_outcome_holds_restarts(self):
+        # Kewei's shapes: each is a record no writer leaves; none may reach a generic restart.
+        base = {"at": 1.0, "from": "0.5.4"}
+        installed = {"version": "0.6.0", "at": 2.0, "sha256": {"w.whl": SHA_NEW}}
+        failed = {"target": "0.6.0", "from": "0.5.4", "installed": "0.5.4", "why": "w", "at": 2.0}
+        journals = []
+        for outcome, phase in (("started", "quiesced"), ("started", "installing"),
+                               ("started", "installed"), ("ok", "ok")):
+            tried = dict(base, outcome=outcome, phase=phase)
+            extra = {"installed": installed} if outcome == "ok" else {}
+            journals += [{"attempted": {"0.6.0": tried}, **extra}]
+            journals += [{"attempted": {"0.6.0": dict(tried, manager=m)}, **extra}
+                         for m in (None, "bogus", "m", "", "Unit", ["unit"])]
+        journals += [{"attempted": {"0.6.0": dict(base, outcome="started", phase=phase,
+                                                  manager="unit")}}
+                     for phase in ("snapshot", None)]
+        journals += [{"attempted": {"0.6.0": dict(base, outcome="ok", phase="ok",
+                                                  manager="unit")}},
+                     {"attempted": {"0.6.0": dict(base, outcome="ok", phase="ok", manager="unit")},
+                      "installed": dict(installed, sha256={})},
+                     {"attempted": {"0.6.0": dict(base, outcome="rolled-back", phase="rolled-back",
+                                                  manager="m")},
+                      "failed": dict(failed, outcome="rolled-back", problems=[])},
+                     {"attempted": {"0.6.0": dict(base, outcome="rolled-back", phase="rolled-back")},
+                      "failed": dict(failed, outcome="rolled-back", problems=["p"])},
+                     {"attempted": {"0.6.0": dict(base, outcome="restore-failed",
+                                                  phase="restore-failed")},
+                      "failed": dict(failed, outcome="restore-failed", problems=[])},
+                     {"attempted": {"0.6.0": dict(base, outcome="crashed", phase="crashed")},
+                      "failed": dict(failed, outcome="crashed", problems=["p"])},
+                     {"attempted": {"0.6.0": dict(base, outcome="stop-failed",
+                                                  phase="stop-failed", manager="unit")}}]
+        for journal in journals:
+            if journal["attempted"]["0.6.0"].get("manager") in ("unit", "detached") and \
+                    journal["attempted"]["0.6.0"]["phase"] in ("quiesced", "installing",
+                                                               "installed") and \
+                    "installed" not in journal and "failed" not in journal:
+                continue  # the writer's own variant, kept out of the rejected set
+            self.assert_held_everywhere(json.dumps(journal), journal)
+
+    def test_every_journal_the_real_writers_save_is_one_variant(self):
+        saved = []
+        real = self_upgrade.save_state
+
+        def spy(state_dir, state):
+            saved.append(json.loads(json.dumps(state)))
+            real(state_dir, state)
+
+        def reset():
+            shutil.rmtree(self.state, ignore_errors=True)
+            self.site.install("0.5.4")
+            self.stop_ok = self.start_ok = True
+            self.connected.side_effect = None
+
+        def restore_fails():
+            self.connected.side_effect = [1]
+            with mock.patch.object(self_upgrade, "restore", side_effect=OSError("disk full")):
+                self.run_upgrade(self.fake())
+
+        hook = "REQUIRED hook: /h/hook-definition.json (update hook ag2-sparrow-hatch to it)"
+        scenarios = [
+            lambda: self.run_upgrade(self.fake()),
+            lambda: self.run_upgrade(self.fake(install_out=f"installed: x\n{hook}\n")),
+            lambda: self.run_upgrade(self.fake(fail={"pip-install"})),
+            lambda: self.run_upgrade(self.fake(fail={"pip-download"})),
+            lambda: self.run_upgrade(self.fake(check={1: 127})),
+            lambda: self.run_upgrade(self.fake(check={2: "ag2-sparrow 0.6.0 has requirement x>=2, "
+                                                          "but you have x 1.\n"})),
+            restore_fails,
+            lambda: (restore_fails(), self_upgrade.clear_blocked(self.state)),
+            lambda: (setattr(self, "stop_ok", False), self.run_upgrade(self.fake())),
+            lambda: self.start(self.setup(), now=1000.0),
+            lambda: (self.start(self.setup(), now=1000.0),
+                     self.start(self.setup(), now=1000.0 + 1801)),
+        ]
+        for phase in ("snapshot", "quiesced", "installing", "installed", "restoring"):
+            def dead(phase=phase):
+                self.start(self.setup(), now=1000.0)
+                self.snap()
+                fields = {} if phase == "snapshot" else {"manager": "detached"}
+                self_upgrade._phase(self.state, "0.6.0", phase, **fields)
+                self_upgrade.maybe_start(self.cfg, None, "0.5.4", 1010.0)
+            scenarios.append(dead)
+        with mock.patch.object(self_upgrade, "save_state", side_effect=spy):
+            for scenario in scenarios:
+                reset()
+                with contextlib.redirect_stderr(io.StringIO()), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    scenario()
+        latest = time.time() + self_upgrade.CLOCK_SKEW_S
+        seen = set()
+        for state in saved:
+            self.assertTrue(self_upgrade._well_formed_journal(state, latest), state)
+            for tried in state["attempted"].values():
+                seen.add((tried["outcome"], tried.get("phase"), "manager" in tried))
+        for variant in (("ok", "ok", True), ("rolled-back", "rolled-back", True),
+                        ("restore-failed", "restore-failed", True),
+                        ("restore-failed", "acknowledged", True), ("crashed", "crashed", False),
+                        ("crashed", "crashed", True), ("stop-failed", "stop-failed", False),
+                        ("no-download", "no-download", False), ("started", "quiesced", True),
+                        ("started", "restoring", True), ("started", None, False)):
+            self.assertIn(variant, seen)
 
     def test_nesting_deeper_than_the_decoder_holds_restarts(self):
         # 10 ** 6 passes the decoder's bound on every supported CPython, 10 ** 4 on older ones.
@@ -3282,7 +3400,7 @@ class Upgrade(Base):
                 {"attempted": {"0.6.0": crashed},
                  "failed": {"target": "0.6.0", "from": "0.5.4", "at": at}}), ("failed", at))
             self.assert_held_everywhere(json.dumps(
-                {"attempted": {"0.6.0": dict(crashed, outcome="ok", phase="ok")},
+                {"attempted": {"0.6.0": dict(crashed, outcome="ok", phase="ok", manager="unit")},
                  "installed": {"version": "0.6.0", "at": at}}), ("installed", at))
         self.assert_held_everywhere('{"attempted": {"0.6.0": {"from": "0.5.4", '
                                     '"outcome": "started", "at": 1e999}}}', "1e999")
@@ -3383,7 +3501,8 @@ class Upgrade(Base):
         self.assertEqual(self.site.version(), "0.6.0", "nothing was started or changed")
         # A settlement that raises blocks the restart as well, and is retried next tick.
         self_upgrade.save_state(self.state, {"attempted": {"0.6.0": {
-            "at": 1000.0, "from": "0.5.4", "outcome": "started", "phase": "installing"}}})
+            "at": 1000.0, "from": "0.5.4", "outcome": "started", "phase": "installing",
+            "manager": "detached"}}})
         with mock.patch.object(self_upgrade, "settle_attempt", side_effect=OSError("journal")), \
                 mock.patch.object(keepalive, "listener_up", return_value=False), \
                 mock.patch.object(keepalive, "restart_listener", return_value=(True, "r")) as rl, \
