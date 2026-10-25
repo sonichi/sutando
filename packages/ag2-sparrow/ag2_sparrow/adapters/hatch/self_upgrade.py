@@ -135,7 +135,12 @@ def load_state(state_dir: Path) -> dict:
         return {"attempted": {}}
     except (OSError, ValueError) as e:
         raise JournalError(f"the upgrade journal {path} cannot be read ({type(e).__name__})") from None
-    if not _well_formed_journal(state, time.time() + CLOCK_SKEW_S):
+    try:
+        well_formed = _well_formed_journal(state, time.time() + CLOCK_SKEW_S)
+    except (TypeError, ValueError, KeyError, AttributeError, OverflowError):
+        # The validator is total; this only keeps a gap in it a hold rather than a crash.
+        well_formed = False
+    if not well_formed:
         raise JournalError(f"the upgrade journal {path} cannot be read (not a journal)")
     return state
 
@@ -169,25 +174,27 @@ def _well_formed_journal(state, latest: float) -> bool:
         return False
     if not all(_well_formed(t, latest) for t in state["attempted"].values()):
         return False
-    failed = state.get("failed", {})
-    outcome = failed.get("outcome", "crashed") if isinstance(failed, dict) else None
-    return (("failed" not in state
-             or (outcome in SUMMARY_OUTCOMES
-                 and _summarises(state["attempted"], failed, "target", outcome, KEEPS_FAILED,
-                                 latest)))
-            and ("installed" not in state
-                 or _summarises(state["attempted"], state["installed"], "version", "ok",
-                                KEEPS_INSTALLED, latest)))
+    if "failed" in state:
+        failed = state["failed"]
+        if not _typed(failed, _FAILED, ("target", "at"), latest):
+            return False
+        outcome = failed.get("outcome", "crashed")
+        if outcome not in SUMMARY_OUTCOMES or not _summarises(state["attempted"], failed["target"],
+                                                               outcome, KEEPS_FAILED):
+            return False
+    if "installed" in state:
+        installed = state["installed"]
+        if not (_typed(installed, _INSTALLED, ("version", "at"), latest)
+                and _summarises(state["attempted"], installed["version"], "ok", KEEPS_INSTALLED)):
+            return False
+    return True
 
 
-def _summarises(attempted: dict, summary, key: str, outcome: str, kept_by, latest: float) -> bool:
-    """Whether a failed/installed summary names an attempt it was saved with, so in its
-    `outcome`, or one a later rerun replaced with an outcome in `kept_by` (disjoint from it)."""
-    if not isinstance(summary, dict) or not isinstance(summary.get(key), str):
-        return False
-    tried = attempted.get(summary[key])
-    return (tried is not None and _plausible(summary.get("at"), latest)
-            and (tried["outcome"] == outcome or tried["outcome"] in kept_by))
+def _summarises(attempted: dict, target: str, outcome: str, kept_by) -> bool:
+    """Whether a summary names an attempt it was saved with, so in its `outcome`, or one a
+    later rerun replaced with an outcome in `kept_by` (disjoint from it)."""
+    tried = attempted.get(target)
+    return tried is not None and (tried["outcome"] == outcome or tried["outcome"] in kept_by)
 
 
 def _plausible(at, latest: float) -> bool:
@@ -201,14 +208,35 @@ def _plausible(at, latest: float) -> bool:
         return False
 
 
+def _text(value, latest) -> bool:
+    return isinstance(value, str)
+
+
+def _texts(value, latest) -> bool:
+    return isinstance(value, list) and all(isinstance(v, str) for v in value)
+
+
+# Every field each record's writer can save, with the type it saves it as.
+_ATTEMPT = {"at": _plausible, "from": _text, "outcome": _text, "phase": _text, "hook": _text,
+            "manager": lambda v, latest: v is None or isinstance(v, str)}
+_FAILED = {"target": _text, "from": _text, "installed": _text, "why": _text, "at": _plausible,
+           "outcome": _text, "problems": _texts}
+_INSTALLED = {"version": _text, "at": _plausible,
+              "sha256": lambda v, latest: valid_hashes(v) is not None}
+
+
+def _typed(record, fields: dict, required, latest: float) -> bool:
+    """A dict of only these fields, the required ones present, each of its writer's type."""
+    return (isinstance(record, dict) and set(record) <= set(fields)
+            and all(k in record for k in required)
+            and all(fields[k](v, latest) for k, v in record.items()))
+
+
 def _well_formed(tried, latest: float) -> bool:
-    """An attempt record the writer can leave: a legal (outcome, phase), a plausible `at`,
-    and a string `from` when present."""
-    if not isinstance(tried, dict):
-        return False
-    at, previous = tried.get("at"), tried.get("from")
-    return (_legal(tried.get("outcome"), tried.get("phase"))
-            and _plausible(at, latest) and (previous is None or isinstance(previous, str)))
+    """An attempt record the writer can leave: its fields typed as the writer saves them,
+    then a legal (outcome, phase)."""
+    return (_typed(tried, _ATTEMPT, ("at", "outcome"), latest)
+            and _legal(tried["outcome"], tried.get("phase")))
 
 
 def save_state(state_dir: Path, state: dict) -> None:

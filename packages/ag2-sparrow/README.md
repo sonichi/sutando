@@ -655,7 +655,8 @@ Sparrow is left stopped and the hook wakes the agent once with a notice. While a
 attempt is held this way (or left in a mutating phase, or the journal
 `hatch-upgrade.json` exists but is not one the writer can leave: unparseable, without
 its `attempted` map, or with an attempt whose outcome and phase are not a pair the
-writer produces, or a duplicate member name, or a time no writer could stamp (not a
+writer produces, or a field its writer never saves or saves as another JSON type, or a
+duplicate member name, or a time no writer could stamp (not a
 number, below zero, or more than `CLOCK_SKEW_S` ahead of the clock), or a `failed` or
 `installed` summary naming no attempt or one in an outcome whose writer would have
 replaced the summary) nothing starts Sparrow or another

@@ -3149,12 +3149,56 @@ class Upgrade(Base):
         path = self_upgrade.state_path(self.state)
         self.state.mkdir(parents=True, exist_ok=True)
         path.write_text(text)
+        with self.assertRaises(self_upgrade.JournalError, msg=label):
+            self_upgrade.load_state(self.state)
         self.assertIn("cannot be read", self_upgrade.recovery_blocked(self.state) or "", label)
+        self.assertIsNotNone(self_upgrade.failed_since(self.state), label)
         self.assertEqual(self.keepawake_restarts(), (1, 0), label)
+        with mock.patch.object(keepalive, "_found", return_value=[self.home]), \
+                mock.patch.object(keepalive, "last_keepawake", return_value=5000.0), \
+                mock.patch.object(keepalive, "hook_last_run", return_value=None), \
+                mock.patch.object(keepalive, "oldest_open_task", return_value=None):
+            row = keepalive.health_row(self.cfg, self.home / "log", now=5000.0)
+        self.assertEqual((row["condition"], row["reason"]),
+                         ("abnormal", self_upgrade.UPGRADE_FAILED), label)
         with mock.patch.object(self_upgrade, "verify_installed", return_value=[]):
             self.assertIn("cannot be read", self_upgrade.release_hold(self.state) or "", label)
         self.assertEqual(path.read_text(), text, label)
         self.assertEqual(self.keepawake_restarts(6000.0), (1, 0), label)
+
+    def test_a_field_of_a_type_no_writer_saves_holds_restarts(self):
+        attempt = {"at": 1, "from": "0.5.4", "outcome": "started"}
+        crashed = dict(attempt, outcome="crashed", phase="crashed")
+        ok = dict(attempt, outcome="ok", phase="ok")
+        failed = {"target": "0.6.0", "from": "0.5.4", "at": 2}
+        installed = {"version": "0.6.0", "at": 2, "sha256": {"w.whl": SHA_NEW}}
+        texts, times = [[], {}, 1, None, True], ["1", [], {}, None, True]
+        journals = [{"attempted": {"0.6.0": []}}, {"attempted": {"0.6.0": "started"}},
+                    {"attempted": {"0.6.0": dict(attempt, extra=1)}},
+                    {"attempted": {"0.6.0": crashed}, "failed": dict(failed, extra=1)},
+                    {"attempted": {"0.6.0": crashed}, "failed": []},
+                    {"attempted": {"0.6.0": ok}, "installed": dict(installed, extra=1)},
+                    {"attempted": {"0.6.0": ok}, "installed": []}]
+        for field, values in (("outcome", texts), ("at", times), ("from", texts), ("hook", texts),
+                              ("manager", [[], {}, 1, True])):
+            journals += [{"attempted": {"0.6.0": dict(attempt, **{field: v})}} for v in values]
+        journals += [{"attempted": {"0.6.0": dict(crashed, phase=v)}} for v in texts]
+        for field, values in (("target", texts), ("outcome", texts), ("at", times),
+                              ("from", texts), ("installed", texts), ("why", texts),
+                              ("problems", ["p", {}, 1, None, True, [1], [[]]])):
+            journals += [{"attempted": {"0.6.0": crashed}, "failed": dict(failed, **{field: v})}
+                         for v in values]
+        for field, values in (("version", texts), ("at", times),
+                              ("sha256", texts + ["x", {}, {"w.whl": 1}])):
+            journals += [{"attempted": {"0.6.0": ok}, "installed": dict(installed, **{field: v})}
+                         for v in values]
+        for journal in journals:
+            self.assert_held_everywhere(json.dumps(journal), journal)
+        for journal in ({"attempted": {"0.6.0": dict(attempt, manager=None, hook="h")}},
+                        {"attempted": {"0.6.0": crashed}, "failed": dict(failed, problems=["p"])},
+                        {"attempted": {"0.6.0": ok}, "installed": installed}):
+            self.state_path_text(json.dumps(journal))
+            self.assertIsNone(self_upgrade.recovery_blocked(self.state), journal)
 
     def test_a_newer_attempt_whose_writer_replaces_the_summary_holds_restarts(self):
         with mock.patch.object(self_upgrade, "restore", side_effect=OSError("disk full")):
