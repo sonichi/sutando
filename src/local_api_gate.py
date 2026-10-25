@@ -14,12 +14,16 @@ front of a loopback port. The rules live here once:
     shell reads that file and presents it as a bearer.
   * `bearer_request_allowed` — the agent API's connections gate: loopback Host on the bound
     port, loopback or absent Origin, and the bearer above, always; no bearer is 401.
+  * `private_history_request_allowed` — the agent API's owner-history gate: with a configured
+    `SUTANDO_API_TOKEN` the bearer must match (else 401); without one, only a loopback client
+    sending no Origin may read (else 403), so a browser page never reaches localhost history.
 
 A route that does not go through this module has no gate.
 """
 from __future__ import annotations
 
 import hmac
+import ipaddress
 import os
 import secrets
 import tempfile
@@ -148,3 +152,20 @@ def bearer_request_allowed(origin, host, authorization, *, expected_token: str,
     if not bearer_matches(authorization or "", expected_token):
         return 401, "unauthorized"
     return 200, None
+
+
+def private_history_request_allowed(client_ip: str, origin: Optional[str], authorization: str, *,
+                                    configured_token: str) -> "tuple[int, Optional[str]]":
+    """(status, reason) for an owner-history route: a configured token must be presented as a
+    bearer (else 401); with none, only a loopback client sending no Origin passes (else 403)."""
+    if configured_token:
+        if bearer_matches(authorization or "", configured_token):
+            return 200, None
+        return 401, "unauthorized"
+    try:
+        loopback = ipaddress.ip_address(client_ip).is_loopback
+    except ValueError:
+        loopback = False
+    if loopback and not origin:
+        return 200, None
+    return 403, "task history requires a local proxy or API token"

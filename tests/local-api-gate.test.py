@@ -99,6 +99,34 @@ class Gate(unittest.TestCase):
         self.assertFalse(G.loopback_origin("http://localhost.evil.example"))
 
 
+class PrivateHistoryGate(unittest.TestCase):
+    REFUSED = (403, "task history requires a local proxy or API token")
+
+    def allowed(self, ip="127.0.0.1", origin=None, auth="", token=""):
+        return G.private_history_request_allowed(ip, origin, auth, configured_token=token)
+
+    def test_configured_token_decides_alone(self):
+        self.assertEqual(self.allowed(auth="Bearer t", token="t"), (200, None))
+        self.assertEqual(self.allowed(ip="203.0.113.9", origin="https://evil.example", auth="Bearer t", token="t"),
+                         (200, None), "with a token the client address and Origin do not matter")
+        self.assertEqual(self.allowed(auth="Bearer wrong", token="t"), (401, "unauthorized"))
+        self.assertEqual(self.allowed(auth="", token="t"), (401, "unauthorized"), "no header is 401, never 403")
+        self.assertEqual(self.allowed(auth="Bearer café", token="t"), (401, "unauthorized"),
+                         "a non-ASCII header is a mismatch, not an error")
+
+    def test_without_a_token_only_a_silent_loopback_client_passes(self):
+        self.assertEqual(self.allowed(), (200, None))
+        self.assertEqual(self.allowed(ip="::1"), (200, None))
+        self.assertEqual(self.allowed(origin=""), (200, None), "an empty Origin counts as absent")
+        self.assertEqual(self.allowed(origin="http://127.0.0.1:5173"), self.REFUSED,
+                         "any Origin, loopback included, is a browser page")
+        self.assertEqual(self.allowed(ip="203.0.113.9"), self.REFUSED)
+        self.assertEqual(self.allowed(ip="not-an-ip"), self.REFUSED)
+        self.assertEqual(self.allowed(ip=""), self.REFUSED)
+        self.assertEqual(self.allowed(ip="203.0.113.9", auth="Bearer anything"), self.REFUSED,
+                         "a bearer buys nothing when no token is configured")
+
+
 class DashboardDelegation(unittest.TestCase):
     def test_dashboard_uses_this_gate(self):
         spec = importlib.util.spec_from_file_location("dashboard_under_test", ROOT / "src" / "dashboard.py")

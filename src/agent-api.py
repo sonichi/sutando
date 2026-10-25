@@ -983,25 +983,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def check_private_history_auth(self) -> bool:
         """Fail closed for browsers and non-loopback clients without a token."""
-        import hmac as _hmac
-
-        if API_TOKEN:
-            token = self.headers.get("Authorization", "").replace("Bearer ", "")
-            if _hmac.compare_digest(token, API_TOKEN):
-                return True
-            self.send_private_json(401, {"error": "unauthorized"})
+        status, why = local_api_gate.private_history_request_allowed(
+            self.client_address[0], self.headers.get("Origin"), self.headers.get("Authorization", ""),
+            configured_token=API_TOKEN)
+        if status != 200:
+            self.send_private_json(status, {"error": why})
             return False
-        try:
-            loopback = ipaddress.ip_address(self.client_address[0]).is_loopback
-        except ValueError:
-            loopback = False
-        # The same-origin web-client proxy and local CLI callers send no
-        # Origin. A browser page always does for cross-origin fetches, so this
-        # also blocks hostile sites from reading localhost history.
-        if loopback and not self.headers.get("Origin"):
-            return True
-        self.send_private_json(403, {"error": "task history requires a local proxy or API token"})
-        return False
+        return True
 
     def do_OPTIONS(self):
         if urlparse(self.path).path.startswith(CONNECTIONS_PREFIX):
