@@ -28,9 +28,8 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-# Before anything reads the environment: no outer credential selector (a channel env file an
-# empty list would import from) survives. Must be set BEFORE agent-api.py is imported: its
-# WORKSPACE_DIR is read at import.
+# Isolated before agent-api.py is imported (its WORKSPACE_DIR is read at import), so no outer
+# channel env file can be imported into the temp record by an empty list.
 _WS = tempfile.mkdtemp(prefix="agent-api-connections-")
 isolate_os_environ(SUTANDO_TEST_MODE="1", SUTANDO_WORKSPACE=_WS, SUTANDO_TELEMETRY="0",
                    SUTANDO_SUPPRESS_CCD_FALLBACK_BANNER="1")
