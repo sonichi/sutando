@@ -18,6 +18,8 @@ there, including the daily morning briefing and the email-triage digest (#4259).
   k) an unmarked record naming a room found shared is overwritten, so no other reader trusts it
   l) an owner-mention DM queued before its room went shared is held, not posted there
   m) an owner-mention DM goes to the owner DM read at send time (positive control)
+  n) a pre-fix bound record naming the real DM, unmarked -> confirmed, marked private, delivered;
+     the written record is stable (no further write on the next drain); one whose room went shared is cleared
 
 Loads src/remote-gateway-bridge.py in-process with an isolated workspace and a
 fake `_req`. Run: python3 tests/gateway-owner-dm-must-be-private.test.py
@@ -210,6 +212,37 @@ def main() -> int:
     mod._post_proactive()
     check(not (ws / "results" / om).exists() and [p["room_id"] for p in gw.posts] == [DM],
           f"m) an owner-mention DM goes to the owner DM read at send time, not the room baked in: {gw.posts}")
+
+    ws = workspace(); gw = Gateway(DM); mod = load(ws, gw)
+    mod._routing_file().write_text(json.dumps(mod._routing_record(AGENT, mod.URL, DM)))
+    drain(mod, ws, "proactive-morning-10.txt")
+    om = "proactive-owner-mention-om3.to-ag2space.txt"
+    (ws / "results" / om).write_text(f"[channel: {DM}]\nAlice asked about the deck\n", encoding="utf-8")
+    mod._post_proactive()
+    record = json.loads(mod._routing_file().read_text())
+    rooms = [p["room_id"] for p in gw.posts]
+    left = sorted(f.name for f in (ws / "results").iterdir() if f.name.startswith("proactive-"))
+    check(rooms == [DM, DM] and not left,
+          f"n) an unmarked record naming the real DM: both items delivered once to it: {rooms} left={left}")
+    check(record.get("owner_dm") and record.get("private") is True,
+          f"n) the confirmed record is rewritten marked private: {record}")
+    before = (mod._routing_file().read_bytes(), mod._routing_file().stat().st_mtime_ns)
+    writes: list = []
+    real_write = mod._durable_write
+    mod._durable_write = lambda *a, **k: writes.append(a) or real_write(*a, **k)
+    mod._ROUTING["next"] = 0.0
+    queued = drain(mod, ws, "proactive-morning-11.txt")
+    after = (mod._routing_file().read_bytes(), mod._routing_file().stat().st_mtime_ns)
+    check(not queued and len(gw.posts) == 3 and gw.posts[-1]["room_id"] == DM and not writes and after == before,
+          f"n) the next drain delivers with no further write: writes={len(writes)} unchanged={after == before}")
+
+    ws = workspace(); gw = Gateway(DM); mod = load(ws, gw)
+    mod._routing_file().write_text(json.dumps(mod._routing_record(AGENT, mod.URL, DM)))
+    gw.members[DM].append("@intruder:example.org")
+    queued = drain(mod, ws, "proactive-morning-12.txt")
+    record = json.loads(mod._routing_file().read_text())
+    check(queued and gw.posts == [] and record.get("owner_dm") == "" and record.get("private") is True,
+          f"n) an unmarked record whose room is found shared is cleared, never marked private: {record}")
 
     print(f"\n{'FAIL' if FAILS else 'PASS'}: {len(FAILS)} failure(s)")
     return 1 if FAILS else 0

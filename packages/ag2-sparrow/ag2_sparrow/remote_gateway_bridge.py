@@ -1888,8 +1888,8 @@ OWNER_DM_UPGRADED_NOTIFY: Callable[[str, str], None] | None = None
 PROACTIVE_DISPATCH_GATE: Callable[[str], "str | None"] | None = None
 # Routing state belongs to the gateway (owner 2026-09-07): the agent row's owner_dm_room is read at
 # connect and on a slow cadence and kept while offline; the pinned room is bootstrap, never authority.
-_ROUTING: dict = {"owner_dm": "", "persisted": "", "identity": "", "gateway": "", "next": 0.0,
-                  "held_logged": 0.0}
+_ROUTING: dict = {"owner_dm": "", "persisted": "", "persisted_private": False, "identity": "",
+                  "gateway": "", "next": 0.0, "held_logged": 0.0}
 ROUTING_REFRESH_S = 300.0
 ROUTING_RETRY_S = 30.0
 OWNER_PRIVATE = "owner_private"
@@ -1931,7 +1931,8 @@ def _load_routing() -> None:
     if not _ROUTING["identity"] and not _ROUTING["gateway"]:
         _ROUTING["identity"], _ROUTING["gateway"] = current  # a reading set before any binding adopts this one
     elif (_ROUTING["identity"], _ROUTING["gateway"]) != current:  # re-enrolled: the old reading is not ours
-        _ROUTING.update(owner_dm="", persisted="", identity=current[0], gateway=current[1])
+        _ROUTING.update(owner_dm="", persisted="", persisted_private=False,
+                        identity=current[0], gateway=current[1])
     try:
         d = json.loads(_routing_file().read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -1944,9 +1945,16 @@ def _load_routing() -> None:
     # unchecked or since found shared: never adopted, and left unequal so the writer overwrites it
     disk = on_disk if d.get("private") is True and on_disk != _ROUTING.get("shared") else ""
     # A reading that came from disk follows the disk; one the writer has not committed yet stays.
-    if not _ROUTING["owner_dm"] or _ROUTING["owner_dm"] == _ROUTING["persisted"]:
+    if not _ROUTING["owner_dm"] or not _uncommitted():
         _ROUTING["owner_dm"] = disk
     _ROUTING["persisted"] = on_disk
+    _ROUTING["persisted_private"] = d.get("private") is True
+
+
+def _uncommitted() -> bool:
+    """The reading differs from the record, or names a room the record has not marked private."""
+    return _ROUTING["owner_dm"] != _ROUTING["persisted"] or (
+        bool(_ROUTING["owner_dm"]) and not _ROUTING["persisted_private"])
 
 
 def refresh_routing(force: bool = False) -> None:
@@ -1979,12 +1987,12 @@ def refresh_routing(force: bool = False) -> None:
     elif candidate != _ROUTING["owner_dm"]:  # undecided: a new room is not adopted, the checked one stands
         _ROUTING["next"] = now + ROUTING_RETRY_S
         return
-    if _ROUTING["owner_dm"] != _ROUTING["persisted"]:  # until durably published, a cleared reading too
+    if _uncommitted():  # until durably published, a cleared reading too
         record = _routing_record(_reenroll_identity(), URL, _ROUTING["owner_dm"], private=True)
         if record is None or not _durable_write(_routing_file(), json.dumps(record)):
             _ROUTING["next"] = now + ROUTING_RETRY_S  # in memory it holds; the write is retried soon
             return
-        _ROUTING["persisted"] = _ROUTING["owner_dm"]
+        _ROUTING["persisted"], _ROUTING["persisted_private"] = _ROUTING["owner_dm"], True
     _ROUTING["next"] = now + (ROUTING_REFRESH_S if _ROUTING["owner_dm"] else ROUTING_RETRY_S)
 
 
