@@ -256,5 +256,29 @@ finally:
     else:
         sys.modules["status_ack_policy"] = _saved
 
+# An empty queue must not hide a broken grammar owner: exit 2, never a healthy-looking 0.
+_ds = uat.dedup_soundness
+_saved_markers, _had = _ds._MARKERS, "result_markers" in sys.modules
+_saved_rm = sys.modules.get("result_markers")
+_ds._MARKERS = None
+sys.modules["result_markers"] = None
+try:
+    with tempfile.TemporaryDirectory() as d:
+        (Path(d) / "tasks").mkdir()
+        rc, out = run_main(["--workspace", d, "--json"])
+        check(rc == 2 and "result_markers" in json.loads(out)["error"],
+              "--json on an EMPTY queue exits 2 when result_markers.py is unimportable")
+finally:
+    if _had:
+        sys.modules["result_markers"] = _saved_rm
+    else:
+        sys.modules.pop("result_markers", None)
+    _ds._MARKERS = _saved_markers
+with tempfile.TemporaryDirectory() as d:
+    (Path(d) / "tasks").mkdir()
+    rc, out = run_main(["--workspace", d, "--json"])
+    check(rc == 0 and json.loads(out)["unanswered_count"] == 0,
+          "CONTROL: the same empty queue exits 0 once the grammar owner is importable again")
+
 print(f"\nunanswered-tasks-json: {PASS} passed, {FAIL} failed")
 sys.exit(1 if FAIL else 0)

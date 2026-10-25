@@ -139,6 +139,7 @@ def snapshot(workspace: Path, min_age_sec: float, now: float | None = None,
     import status_ack_policy
     from local_task_protocol import parse_task_headers_lenient, valid_archive_lookup_id
     from task_archive import task_id_for
+    _markers()  # as in text mode: a broken grammar owner must not read as an empty queue
     now = time.time() if now is None else now
     tasks, results = workspace / "tasks", workspace / "results"
     out = []
@@ -186,6 +187,11 @@ def main() -> int:
             snap = snapshot(Path(a.workspace), a.min_age_sec, inbox=Path(a.inbox) if a.inbox else None)
         except ImportError as exc:
             print(json.dumps({"error": f"cannot import the probe's policy owner ({exc})"}))
+            return 2
+        except SystemExit as exc:
+            if exc.code != 2:
+                raise
+            print(json.dumps({"error": "cannot import src/result_markers.py; refusing to answer"}))
             return 2
         except OSError as exc:
             print(json.dumps({"error": f"cannot read deliveries/ ({exc})"}))
