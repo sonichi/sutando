@@ -55,6 +55,7 @@ Machine-readable ownership and lifecycle metadata lives in
 
 ## Reference
 
+- [Connections: one install, several homeservers](connections.md)
 - [Host CLI bindings](host-cli-bindings.md)
 - [Remote gateway protocol](remote-gateway-protocol.md)
 - [Slack bridge](slack-bridge.md)
