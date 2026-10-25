@@ -3470,9 +3470,10 @@ class Upgrade(Base):
         journal = {"attempted": {"0.6.0": tried}}
         if failed:
             kind, same = failed
-            journal["failed"] = dict({"target": "0.6.0", "from": "0.5.4" if same else "9.9.9",
-                                      "installed": "0.5.4", "why": "w", "at": 2.0},
-                                     **self.RECOVERY_SUMMARY[kind])
+            origin = "0.5.4" if same else "9.9.9"
+            journal["failed"] = dict({"target": "0.6.0", "from": origin,
+                                      "installed": origin if kind == "rolled-back" else "0.5.4",
+                                      "why": "w", "at": 2.0}, **self.RECOVERY_SUMMARY[kind])
         if installed:
             journal["installed"] = {"version": "0.6.0", "at": 2.0, "sha256": {"w.whl": SHA_NEW}, "after": []}
         return journal
@@ -3623,6 +3624,45 @@ class Upgrade(Base):
         self.assertEqual(self_upgrade.success_lineage(rerun, "0.8.0"),
                          (["0.8.0", "0.8.0"], "an equal reference"))
         self.assert_held_everywhere(json.dumps(rerun), "the reference moved onto a terminal")
+
+    def test_a_reused_version_key_is_not_an_earlier_success_descendant(self):
+        new7 = {"ag2_sparrow-0.7.0-py3-none-any.whl": SHA_NEW}
+        self.assertEqual(self.run_upgrade(self.fake(fail={"pip-install"})), "rolled-back")
+        self.assertEqual(self.run_upgrade(self.fake(), new7, "0.7.0"), "ok")
+        self.assertEqual(self_upgrade.load_state(self.state)["installed"]["after"], ["0.6.0"])
+        self.site.install("0.5.4")  # the owner downgrades
+        self.assertEqual(self.run_upgrade(self.fake(fail={"pip-install"})), "rolled-back")
+        state = self_upgrade.load_state(self.state)
+        self.assertEqual(state["installed"]["after"], [], "the old edge named the old attempt")
+        del state["failed"]
+        self.assert_held_everywhere(json.dumps(state, sort_keys=True), "a reused version key")
+
+    def test_a_record_no_writer_can_leave_across_its_fields_holds_restarts(self):
+        base = {"at": 1.0, "from": "0.5.4"}
+        failed = {"target": "0.6.0", "from": "0.5.4", "installed": "9.9.9", "why": "w",
+                  "at": 2.0, "outcome": "rolled-back", "problems": []}
+        installed = {"version": "0.6.0", "at": 2.0, "sha256": {"w.whl": SHA_NEW}, "after": []}
+        ok = dict(base, outcome="ok", phase="ok", manager="unit")
+        rolled = dict(base, outcome="rolled-back", phase="rolled-back")
+        self.assert_held_everywhere(json.dumps({"attempted": {"0.6.0": rolled}, "failed": failed}),
+                                    "rolled back to a version that is not the previous one")
+        self.assert_held_everywhere(json.dumps(
+            {"attempted": {"0.6.0": dict(ok, **{"from": "0.7.0"})}, "installed": installed}),
+            "a success below the version it came from")
+
+    def test_a_direct_rerun_keeps_a_quiesced_record_valid(self):
+        self_upgrade._attempt(self.state, "0.6.0")
+        self_upgrade._phase(self.state, "0.6.0", "quiesced", manager="detached")
+        self.assertEqual(self.run_upgrade(self.fake(fail={"pip-download"})), "no-download")
+        self.assertEqual(self_upgrade.load_state(self.state)["attempted"]["0.6.0"]["outcome"],
+                         "no-download")
+
+    def test_a_direct_rerun_of_a_quiesced_attempt_never_writes_snapshot_with_a_manager(self):
+        self_upgrade._attempt(self.state, "0.6.0")
+        self_upgrade._phase(self.state, "0.6.0", "quiesced", manager="detached")
+        self_upgrade._phase(self.state, "0.6.0", "snapshot", **{"from": "0.5.4"})
+        tried = self_upgrade.load_state(self.state)["attempted"]["0.6.0"]
+        self.assertEqual((tried["phase"], "manager" in tried), ("snapshot", False))
 
     def test_nesting_deeper_than_the_decoder_holds_restarts(self):
         # 10 ** 6 passes the decoder's bound on every supported CPython, 10 ** 4 on older ones.

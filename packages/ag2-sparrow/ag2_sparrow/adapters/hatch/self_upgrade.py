@@ -186,12 +186,17 @@ def _journal_fault(state, latest: float) -> "str | None":
     if not all(parse_version(k) is not None and _well_formed(t, latest)
                for k, t in state["attempted"].items()):
         return "an attempt no writer leaves"
+    for k, t in state["attempted"].items():
+        if t["outcome"] == "ok" and not (parse_version(t["from"]) or ()) < parse_version(k):
+            return "a success that is not above the version it came from"
     if "failed" in state:
         failed = state["failed"]
         if not _typed(failed, _FAILED, ("target", "from", "installed", "why", "at"), latest):
             return "a failed summary of the wrong shape"
         if not _failed_variant(failed):
             return "a failed summary of no writer's variant"
+        if not _failed_consistent(failed):
+            return "a rolled-back summary whose installed version is not its from"
         outcome = failed.get("outcome", "crashed")
         if not _summarises(state["attempted"], failed["target"], outcome, KEEPS_FAILED):
             return "a failed summary of no attempt it was saved with"
@@ -259,6 +264,11 @@ def _failed_variant(failed: dict) -> bool:
     if failed["outcome"] == "rolled-back":
         return problems == []
     return failed["outcome"] == "restore-failed" and isinstance(problems, list) and bool(problems)
+
+
+def _failed_consistent(failed: dict) -> bool:
+    """_rollback appends a problem unless the previous version is what is installed."""
+    return failed.get("outcome") != "rolled-back" or failed["installed"] == failed["from"]
 
 
 def _summarises(attempted: dict, target: str, outcome: str, kept_by) -> bool:
@@ -905,19 +915,29 @@ def _attempt(state_dir: Path, target: str) -> None:
     if state["attempted"].get(target, {}).get("outcome") != "started":
         state["attempted"][target] = {"at": time.time(), "from": _metadata_version(),
                                       "outcome": "started"}
+        # A new generation of this key: an earlier success no longer provably came after it.
+        installed = state.get("installed")
+        if installed and target in installed["after"]:
+            installed["after"] = [k for k in installed["after"] if k != target]
         save_state(state_dir, state)
 
 
 def _phase(state_dir: Path, target: str, phase: str, **fields) -> None:
     """Journal the step about to run, so a dead attempt is settled from where it got to."""
     state = load_state(state_dir)
-    state["attempted"].setdefault(target, {}).update(phase=phase, **fields)
+    tried = state["attempted"].setdefault(target, {})
+    if phase == "snapshot":
+        tried.pop("manager", None)  # a rerun of a quiesced record has not stopped Sparrow itself
+    tried.update(phase=phase, **fields)
     save_state(state_dir, state)
 
 
 def _finish(state_dir: Path, target: str, outcome: str, **extra) -> None:
     state = load_state(state_dir)
-    state["attempted"].setdefault(target, {}).update(outcome=outcome, phase=outcome)
+    tried = state["attempted"].setdefault(target, {})
+    if _ATTEMPT_VARIANTS.get((outcome, outcome)) == NO:
+        tried.pop("manager", None)  # a rerun over a quiesced record never stopped Sparrow itself
+    tried.update(outcome=outcome, phase=outcome)
     state.update(extra)
     save_state(state_dir, state)
     if outcome == "restore-failed":
