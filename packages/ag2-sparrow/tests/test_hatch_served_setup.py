@@ -3540,41 +3540,89 @@ class Upgrade(Base):
         no_download = dict(tried, outcome="no-download", phase="no-download")
         installed = {"version": "0.7.0", "at": 2.0, "sha256": {"w.whl": SHA_NEW}, "after": []}
         summary = {"target": "0.7.0", "from": "0.5.4", "installed": "0.5.4", "why": "w", "at": 2.0}
-        unreachable = {
-            "a terminal with neither its summary nor a success":
-                {"attempted": {"0.6.0": dict(tried, outcome="restore-failed", phase="acknowledged")}},
-            "two terminals and no summary": {"attempted": {"0.6.0": crash, "0.7.0": crash}},
-            "a success that time, key order and version call later, outside the lineage": {
-                "attempted": {"0.6.0": crash, "0.7.0": dict(success, at=5.0)},
-                "installed": dict(installed, at=9.0)},
-            "a success keyed by the terminal": {"attempted": {"0.6.0": crash, "0.7.0": success},
-                                                "installed": dict(installed, version="0.6.0")},
-            "a success naming itself": {"attempted": {"0.6.0": crash, "0.7.0": success},
-                                        "installed": dict(installed, after=["0.6.0", "0.7.0"])},
-            "a success without what it came after": {
-                "attempted": {"0.7.0": success},
-                "installed": {k: v for k, v in installed.items() if k != "after"}},
-            "a success naming a missing attempt": {"attempted": {"0.7.0": success},
-                                                   "installed": dict(installed, after=["0.6.0"])},
-            "a second success outside the lineage": {
-                "attempted": {"0.6.0": success, "0.7.0": success}, "installed": installed},
-            "a lineage listed twice": {
-                "attempted": {"0.6.0": crash, "0.7.0": success},
-                "installed": dict(installed, after=["0.6.0", "0.6.0"])},
-            "a held restore-failed before the success": {
-                "attempted": {"0.6.0": dict(tried, outcome="restore-failed", phase="restore-failed"),
-                              "0.7.0": success}, "installed": dict(installed, after=["0.6.0"])},
-            "the same version with no provenance": {
-                "attempted": {"0.6.0": crash, "0.7.0": no_download}, "installed": installed},
-            "a success that crashed on rerun, beside an earlier one": {
-                "attempted": {"0.6.0": crash, "0.7.0": success, "0.8.0": crash},
-                "installed": dict(installed, version="0.8.0", after=["0.6.0", "0.7.0"])},
-            "a matched summary with the wrong from": {
-                "attempted": {"0.6.0": crash, "0.7.0": crash},
-                "failed": dict(summary, **{"from": "9.9.9"})}}
-        self.assertEqual(len(unreachable), 13)
-        for label, journal in unreachable.items():
-            self.assert_held_everywhere(json.dumps(journal), label)
+        held = dict(tried, outcome="restore-failed", phase="restore-failed")
+        recovery = "a recovery of {} without its summary, and {}"
+        # label: (journal, the record the lineage starts from, its chain, its fault, the journal's)
+        rows = {
+            "a terminal with neither its summary nor a success": (
+                {"attempted": {"0.6.0": dict(held, phase="acknowledged")}},
+                "0.6.0", ["0.6.0"], "no success", recovery.format("0.6.0", "no success")),
+            "two terminals and no summary": (
+                {"attempted": {"0.6.0": crash, "0.7.0": crash}},
+                "0.6.0", ["0.6.0"], "no success", recovery.format("0.6.0", "no success")),
+            "a success that time, key order and version call later, outside the lineage": (
+                {"attempted": {"0.6.0": crash, "0.7.0": dict(success, at=5.0)},
+                 "installed": dict(installed, at=9.0)},
+                "0.6.0", ["0.6.0", "0.7.0"], "a success outside its lineage",
+                recovery.format("0.6.0", "a success outside its lineage")),
+            "a success that is the terminal": (
+                {"attempted": {"0.6.0": crash}, "installed": dict(installed, version="0.6.0")},
+                "0.6.0", ["0.6.0", "0.6.0"], "an equal reference",
+                recovery.format("0.6.0", "an equal reference")),
+            "a success naming itself": (
+                {"attempted": {"0.6.0": crash, "0.7.0": success},
+                 "installed": dict(installed, after=["0.6.0", "0.7.0"])},
+                "0.6.0", ["0.6.0", "0.7.0"], "a cycle", "an installed summary with a cycle"),
+            "a success naming a missing attempt": (
+                {"attempted": {"0.7.0": success}, "installed": dict(installed, after=["0.6.0"])},
+                None, ["0.7.0", "0.6.0"], "a missing link",
+                "an installed summary with a missing link"),
+            "a second success outside the lineage": (
+                {"attempted": {"0.6.0": success, "0.7.0": success}, "installed": installed},
+                None, ["0.7.0", "0.6.0"], "a fork", "an installed summary with a fork"),
+            "a lineage listed twice": (
+                {"attempted": {"0.6.0": crash, "0.7.0": success},
+                 "installed": dict(installed, after=["0.6.0", "0.6.0"])},
+                None, ["0.7.0"], "a lineage not as its writer saves it",
+                "an installed summary with a lineage not as its writer saves it"),
+            "the same version with no provenance": (
+                {"attempted": {"0.6.0": crash, "0.7.0": no_download}, "installed": installed},
+                "0.6.0", ["0.6.0", "0.7.0"], "a success outside its lineage",
+                recovery.format("0.6.0", "a success outside its lineage")),
+            "a success that crashed on rerun, beside an earlier one": (
+                {"attempted": {"0.6.0": crash, "0.7.0": success, "0.8.0": crash},
+                 "installed": dict(installed, version="0.8.0", after=["0.6.0", "0.7.0"])},
+                "0.8.0", ["0.8.0", "0.8.0"], "an equal reference",
+                recovery.format("0.8.0", "an equal reference")),
+            "a held restore-failed before the success": (
+                {"attempted": {"0.6.0": held, "0.7.0": success},
+                 "installed": dict(installed, after=["0.6.0"])},
+                "0.6.0", ["0.6.0", "0.7.0"], None, "a held restore-failed without its summary"),
+            "a success without what it came after": (
+                {"attempted": {"0.7.0": success},
+                 "installed": {k: v for k, v in installed.items() if k != "after"}},
+                None, None, None, "an installed summary of no success"),
+            "a matched summary with the wrong from": (
+                {"attempted": {"0.6.0": crash, "0.7.0": crash},
+                 "failed": dict(summary, **{"from": "9.9.9"})},
+                None, None, None, "a failed summary whose from is not its attempt's")}
+        self.assertEqual(len(rows), 13)
+        for label, (journal, start, chain, fault, why) in rows.items():
+            with self.subTest(label):
+                if chain is not None:
+                    self.assertEqual(self_upgrade.success_lineage(journal, start), (chain, fault))
+                self.assertEqual(self_upgrade._journal_fault(journal, latest), why)
+                self.assert_held_everywhere(json.dumps(journal), label)
+
+    def test_an_invalidated_reference_never_falls_through_to_another_success(self):
+        saved = self.writer_saves()
+        found = [s for s in saved if set(s["attempted"]) == {"0.6.0", "0.7.0"}
+                 and s["attempted"]["0.6.0"]["outcome"] == "crashed"
+                 and s["attempted"]["0.7.0"]["outcome"] == "ok" and "failed" not in s]
+        self.assertTrue(found, "no production writer saves a crash, then a success")
+        journal = found[-1]
+        self.assertEqual(self_upgrade.success_lineage(journal, "0.6.0"), (["0.6.0", "0.7.0"], None))
+        broken = json.loads(json.dumps(journal))
+        broken["installed"]["after"] = []
+        self.assertEqual(self_upgrade.success_lineage(broken, "0.6.0"),
+                         (["0.6.0", "0.7.0"], "a success outside its lineage"))
+        self.assert_held_everywhere(json.dumps(broken), "the reference dropped")
+        rerun = json.loads(json.dumps(journal))
+        rerun["attempted"]["0.8.0"] = dict(journal["attempted"]["0.6.0"])
+        rerun["installed"] = dict(journal["installed"], version="0.8.0", after=["0.6.0", "0.7.0"])
+        self.assertEqual(self_upgrade.success_lineage(rerun, "0.8.0"),
+                         (["0.8.0", "0.8.0"], "an equal reference"))
+        self.assert_held_everywhere(json.dumps(rerun), "the reference moved onto a terminal")
 
     def test_nesting_deeper_than_the_decoder_holds_restarts(self):
         # 10 ** 6 passes the decoder's bound on every supported CPython, 10 ** 4 on older ones.

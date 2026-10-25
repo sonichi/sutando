@@ -171,54 +171,83 @@ _ATTEMPT_VARIANTS = {
 
 
 def _well_formed_journal(state, latest: float) -> bool:
-    """The journal as save_state writes it: an `attempted` map of well-formed attempts,
-    optional `failed` and `installed` summaries of attempts in it, and nothing else; no
-    time in it later than `latest`. A recovery attempt keeps its summary until a success
-    that names it drops it, which no restore-failed attempt still holding allows."""
+    return _journal_fault(state, latest) is None
+
+
+def _journal_fault(state, latest: float) -> "str | None":
+    """Why the journal is not one save_state writes, or None: an `attempted` map of
+    well-formed attempts, optional `failed` and `installed` summaries of attempts in it, and
+    nothing else; no time in it later than `latest`. A recovery attempt keeps its summary
+    until a success descending from it drops it, which no held restore-failed allows."""
     if not isinstance(state, dict) or not isinstance(state.get("attempted"), dict):
-        return False
+        return "no attempted map"
     if set(state) - {"attempted", "failed", "installed"}:
-        return False
+        return "an unknown member"
     if not all(parse_version(k) is not None and _well_formed(t, latest)
                for k, t in state["attempted"].items()):
-        return False
+        return "an attempt no writer leaves"
     if "failed" in state:
         failed = state["failed"]
         if not _typed(failed, _FAILED, ("target", "from", "installed", "why", "at"), latest):
-            return False
+            return "a failed summary of the wrong shape"
         if not _failed_variant(failed):
-            return False
+            return "a failed summary of no writer's variant"
         outcome = failed.get("outcome", "crashed")
         if not _summarises(state["attempted"], failed["target"], outcome, KEEPS_FAILED):
-            return False
+            return "a failed summary of no attempt it was saved with"
         # Both are the attempt's `previous`, saved together; only a rerun's attempt may differ.
         tried = state["attempted"][failed["target"]]
         if tried["outcome"] == outcome and tried["from"] != failed["from"]:
-            return False
+            return "a failed summary whose from is not its attempt's"
     if "installed" not in state and any(t["outcome"] == "ok" for t in state["attempted"].values()):
-        return False
+        return "a success without its installed summary"
     if "installed" in state:
         installed = state["installed"]
         if not (_typed(installed, _INSTALLED, ("version", "at", "sha256", "after"), latest)
-                and _summarises(state["attempted"], installed["version"], "ok", KEEPS_INSTALLED)
-                and _followed(state["attempted"], installed["version"], installed["after"])):
-            return False
+                and _summarises(state["attempted"], installed["version"], "ok", KEEPS_INSTALLED)):
+            return "an installed summary of no success"
+        fault = success_lineage(state)[1]
+        if fault:
+            return f"an installed summary with {fault}"
     if "failed" not in state:
         attempted = state["attempted"]
-        recovered = {k for k, t in attempted.items() if t["outcome"] in RECOVERY_OUTCOMES}
+        recovered = sorted(k for k, t in attempted.items() if t["outcome"] in RECOVERY_OUTCOMES)
         if any(attempted[k].get("phase") == "restore-failed" for k in recovered):
-            return False
-        # Only a success drops the summary, and it names every attempt it came after.
-        if recovered and not recovered <= set(state.get("installed", {}).get("after", ())):
-            return False
-    return True
+            return "a held restore-failed without its summary"
+        for target in recovered:
+            fault = success_lineage(state, target)[1]
+            if fault:
+                return f"a recovery of {target} without its summary, and {fault}"
+    return None
 
 
-def _followed(attempted: dict, version: str, after: list) -> bool:
-    """`after` as the success saves it: every other attempt then recorded, sorted. Any other
-    success outside it came later, and would have replaced this summary."""
-    return (after == sorted(set(after)) and version not in after and set(after) <= set(attempted)
-            and all(k in after for k, t in attempted.items() if t["outcome"] == "ok" and k != version))
+def success_lineage(state: dict, terminal: "str | None" = None) -> "tuple[list, str | None]":
+    """The chain from `terminal` to the installed success through the edge that success
+    saved, `after` (every attempt recorded before it), and the fault that breaks it, None
+    only when the success strictly descends from `terminal` with no other success beside it.
+    Times, key order and versions are never read."""
+    chain = [] if terminal is None else [terminal]
+    installed = state.get("installed")
+    if installed is None:
+        return chain, "no success"
+    version, after, attempted = installed["version"], installed["after"], state["attempted"]
+    chain.append(version)
+    if after != sorted(set(after)):
+        return chain, "a lineage not as its writer saves it"
+    if version == terminal:
+        return chain, "an equal reference"
+    if version in after:
+        return chain, "a cycle"
+    missing = [k for k in after if k not in attempted]
+    if missing:
+        return chain + missing, "a missing link"
+    forks = [k for k, t in attempted.items() if t["outcome"] == "ok" and k != version
+             and k not in after]
+    if forks:
+        return chain + forks, "a fork"
+    if terminal is not None and terminal not in after:
+        return chain, "a success outside its lineage"
+    return chain, None
 
 
 def _failed_variant(failed: dict) -> bool:
