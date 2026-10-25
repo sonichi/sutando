@@ -44,7 +44,7 @@ from dataclasses import dataclass
 from enum import Enum
 from functools import lru_cache
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 try:
     from .file_lock import lock_fd
@@ -893,10 +893,11 @@ def released_by_operator(d: dict) -> bool:
         (d.get("payload") or "").encode("utf-8")).hexdigest()
 
 
-def park_unclaimed(root: Path, item_id: str, reason: str, reclaim_ttl_s: float = 300.0) -> bool:
+def park_unclaimed(root: Path, item_id: str, reason: str, reclaim_ttl_s: float = 300.0,
+                   on_release: "Optional[Callable[[ClaimRecord], None]]" = None) -> bool:
     """Park an item no one holds, under its lock, only while it is still live and unsettled:
     never over DELIVERED, a receipt, a dispatch mark or a live claim. A claim a reclaim may
-    take (a dead owner past `reclaim_ttl_s`) is released first. False when it changed."""
+    take (a dead owner past `reclaim_ttl_s`, a torn one past its grace) goes first. False when it changed."""
     with _item_lock(Path(root), item_id):
         if not _item_path(Path(root), item_id).exists():
             return False
@@ -905,9 +906,16 @@ def park_unclaimed(root: Path, item_id: str, reason: str, reclaim_ttl_s: float =
             return False
         rec = read_delivery_claim(Path(root), item_id)
         if rec is not None:
-            if not _record_is_reclaimable(rec, reclaim_ttl_s):
+            if rec.state == "UNKNOWN" and not rec.malformed:
+                # Torn: the same grace-period sweep the claim route uses, never a younger one.
+                if not _sweep_if_abandoned(_claim_path(Path(root), item_id)):
+                    return False
+            elif not _record_is_reclaimable(rec, reclaim_ttl_s):
                 return False
-            _release_locked(Path(root), item_id, rec.drainer_id, force=True)
+            else:
+                _release_locked(Path(root), item_id, rec.drainer_id, force=True)
+            if on_release is not None:
+                on_release(rec)
         d.update(status="PARKED", reason=reason)
         _write_item(Path(root), item_id, d)
         return True

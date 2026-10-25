@@ -5561,6 +5561,14 @@ _EVENT_ID_RE = re.compile(r"\$\S+")
 _DELIVERED_INFIX = ".delivered-"
 
 
+def _log_dead_claim_released(rec) -> None:
+    if rec.pid is None or rec.pid < 0:
+        _log(f"proactive outbox item {rec.item_id}: swept a torn claim past its grace period to park it")
+        return
+    _log(f"proactive outbox item {rec.item_id}: released the expired claim of dead drainer pid {rec.pid} "
+         f"({int(time.time() - rec.claimed_at)}s old) to park it")
+
+
 def _reap_hidden_delivered() -> None:
     """Each pass: a delivered proactive file kept hidden moves into archive/ once it can."""
     for h in RESULTS_DIR.glob(f".proactive-*{_DELIVERED_INFIX}*"):
@@ -5670,9 +5678,9 @@ def _recover_orphan_proactive() -> None:
             + list(RESULTS_DIR.glob("proactive-*.sending")):
         name = f.name
         owner = name.rsplit(".sending.", 1)
-        if len(owner) == 2:  # pid-scoped claim
+        if len(owner) == 2:  # pid-scoped claim: .sending.<pid>, or .sending.<pid>.<ns>
             try:
-                pid = int(owner[1])
+                pid = int(owner[1].split(".", 1)[0])
             except ValueError:
                 continue  # not ours to interpret
             if _pid_alive(pid):
@@ -5876,7 +5884,7 @@ def _post_proactive() -> None:
                     continue
         # pid-scoped claim: recovery can tell a live worker's in-flight claim
         # from a dead one's (review blocker: bare .sending was stealable).
-        claim = f.with_suffix(f".sending.{os.getpid()}")
+        claim = f.with_suffix(f".sending.{os.getpid()}.{time.time_ns()}")  # unique: a retained claim is never replaced
         try:
             f.rename(claim)  # atomic claim; loser of a race just misses
         except OSError:
@@ -5969,7 +5977,7 @@ def _send_proactive(claim: Path, f: Path, envelope: dict, owner_dm: bool, notice
     if (stored.get("status") in ("READY", "QUEUED") and stored_room != envelope["room_id"]
             and not dispatch_unsettled(stored) and not released_by_operator(stored)):
         # Held, never re-routed; only a person's release of this stored room sends it there.
-        if not core.backend.park_unclaimed(item_id, _DESTINATION_CHANGED):
+        if not core.backend.park_unclaimed(item_id, _DESTINATION_CHANGED, on_release=_log_dead_claim_released):
             again = read_item(core.backend.root, item_id) or {}
             if again.get("status") not in core.backend.TERMINAL and not dispatch_unsettled(again):
                 _hand_back(claim, f)  # another drainer holds it: nothing is sent from here
@@ -5992,8 +6000,9 @@ def _send_proactive(claim: Path, f: Path, envelope: dict, owner_dm: bool, notice
             _log(f"delivered proactive {f.name} could not be archived ({diagnostics.describe(e)}); kept hidden")
             try:
                 claim.rename(f.with_name(f".{f.stem}{_DELIVERED_INFIX}{time.time_ns()}"))
-            except OSError:
-                pass
+            except OSError as e2:
+                _log(f"delivered proactive {f.name} could not be hidden either ({diagnostics.describe(e2)}); "
+                     f"it stays as {claim}, never put back under its live name")
         if result.status is DrainStatus.ATTEMPTED and result.detail != "settled by a recorded receipt":
             _ENGINE_COUNTS["core_confirmed"] += 1
             _log(f"delivered proactive {f.name} to {room} ({item.get('provider_ref')})")
@@ -6003,7 +6012,7 @@ def _send_proactive(claim: Path, f: Path, envelope: dict, owner_dm: bool, notice
         return
     replacement = seen.get("room_upgraded")
     if replacement is not None and status != "PARKED":
-        if not core.backend.park_unclaimed(item_id, _ROOM_UPGRADED):  # never posted; resent once repointed
+        if not core.backend.park_unclaimed(item_id, _ROOM_UPGRADED, on_release=_log_dead_claim_released):
             _hand_back(claim, f)
             _log(f"proactive {f.name}: {room} was upgraded, but its item changed meanwhile "
                  f"({(read_item(core.backend.root, item_id) or {}).get('status')}); handed back, not held")

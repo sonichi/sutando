@@ -335,8 +335,10 @@ class DrainRoomGateTests(_LoaderFixture):
         with self._completing_rename(partial, f"[channel: {FORGED_ROOM}]\nforged room body", handback_fails=True):
             self.mod._post_proactive()
         self.assertEqual(self.gw.posts, [])
-        self.assertEqual(self._names(), [f"proactive-result-task-26-26.to-ag2space.sending.{os.getpid()}"],
-                         "left under its claim for orphan recovery, not delivered and not eaten")
+        names = self._names()
+        self.assertEqual(len(names), 1, names)
+        self.assertTrue(names[0].startswith(f"proactive-result-task-26-26.to-ag2space.sending.{os.getpid()}."),
+                        "left under its own claim for orphan recovery, not delivered and not eaten")
 
     def test_verified_room_is_delivered_and_a_stale_failure_mark_is_dropped(self):
         ok = self._result("proactive-result-task-22-22.to-ag2space.txt", f"[channel: {OK_ROOM}]\nverified room body")

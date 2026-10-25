@@ -19,6 +19,9 @@
  12. a dead drainer's expired claim, then a moved DM             -> parked with a usable release;
      a live owner's claim is still refused, and the handback is logged
  13. a refused room-upgrade park                                 -> handed back, never held as parked
+ 14. A refused while a newer B was written, then a second drain  -> A's claim survives, B sent once
+ 15. a torn claim past its grace, then a moved DM                -> swept, parked, usable release;
+     a fresh torn claim is still refused
 
 Run: python3 tests/gateway-proactive-recovery-edges.test.py
 """
@@ -390,6 +393,28 @@ def delivered_archive_fails() -> None:
           f"archived, never resent (live {live}, hidden {hidden}, {lane.where('proactive-9d')}, {len(lane.posts)} POSTs)")
 
 
+def delivered_cannot_be_hidden() -> None:
+    lane = pl.Lane(gb, ISO)
+    lane.write("proactive-9h.txt", "nine h\n")
+    real = Path.rename
+
+    def rename(self, target):
+        if ".sending." in self.name and (Path(target).parent.name == "archive"
+                                         or Path(target).name.startswith(".proactive-9h")):
+            raise OSError("read-only")
+        return real(self, target)
+    Path.rename = rename
+    try:
+        lane.drain()
+    finally:
+        Path.rename = real
+    claims = list(lane.results.glob("proactive-9h.sending.*"))
+    check(len(claims) == 1 and not (lane.results / "proactive-9h.txt").exists()
+          and any("could not be hidden either" in m and claims[0].name in m for m in lane.logs),
+          f"9b. archive and hide both fail: the delivered file stays claimed, logged with its path, "
+          f"never live ({[q.name for q in lane.results.glob('proactive-9h*')]})")
+
+
 def newer_body_survives_archive_failure() -> None:
     lane = pl.Lane(gb, ISO)
     lane.write("proactive-10.txt", "body A\n")
@@ -430,9 +455,11 @@ def dead_claim_then_moved_dm() -> None:
     lane.owner_dm = "!MovedDm12:ag2.space"
     lane.respond = lambda payload: {"ok": True, "event_id": "$12"}
     n = len(lane.posts)
-    lane.drain()
-    lane.drain()
+    for _ in range(3):
+        lane.drain()
     item = vendored.read_item(root, item_id) or {}
+    check(any("released the expired claim of dead drainer pid" in m and item_id in m and "s old" in m
+              for m in lane.logs), "12. the dead drainer's released claim is logged with item, pid and age")
     check(len(lane.posts) == n and item.get("status") == "PARKED" and item.get("reason") == "destination-changed"
           and lane.where("proactive-12") == "undelivered",
           f"12. a dead drainer's expired claim with a moved DM: parked destination-changed, no POST "
@@ -457,6 +484,62 @@ def dead_claim_then_moved_dm() -> None:
     check(len(lane.posts) == n and item.get("status") != "PARKED" and lane.where("proactive-13") == "pending"
           and any("another drainer holds it" in m for m in lane.logs),
           f"12. a live owner's claim is still refused, and the handback is logged ({item.get('status')})")
+
+
+def retained_claim_survives_next_drain() -> None:
+    lane = pl.Lane(gb, ISO)
+    calls = {"n": 0}
+
+    def respond(payload):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            (lane.results / "proactive-14r.txt").write_text("body B\n", encoding="utf-8")
+            raise urllib.error.HTTPError("https://gw.example/relay/v1/room", 429, "slow", {}, None)
+        return {"ok": True, "event_id": f"$e{calls['n']}"}
+    lane.respond = respond
+    lane.write("proactive-14r.txt", "body A\n")
+    lane.drain()
+    lane.drain()
+    retained = [q.read_text() for q in lane.results.glob("proactive-14r.sending.*")]
+    sent = [q.get("body") for q in lane.posts]
+    check(retained == ["body A\n"] and sent == ["body A", "body B"],
+          f"14. a retained claim A survives the next drain, which sends the newer B once "
+          f"(retained {retained}, sent {sent})")
+
+
+def torn_claim_then_moved_dm() -> None:
+    import os as _os
+    for label, age, want_parked in (("old torn", 3600, True), ("fresh torn", 0, False)):
+        lane = pl.Lane(gb, ISO, refused)
+        stem = f"proactive-15{'o' if want_parked else 'f'}"
+        lane.write(f"{stem}.txt", "fifteen\n")
+        lane.drain()
+        item_id = gb._proactive_item_id(stem, "fifteen")
+        root = lane.results / ".outbox-ag2space-proactive"
+        cp = vendored._claim_path(root, item_id)
+        cp.parent.mkdir(parents=True, exist_ok=True)
+        cp.write_text("")
+        old = gb.time.time() - age
+        _os.utime(cp, (old, old))
+        lane.owner_dm = f"!Moved{stem}:ag2.space"
+        lane.respond = lambda payload: {"ok": True, "event_id": "$15"}
+        n = len(lane.posts)
+        for _ in range(3):
+            lane.drain()
+        item = vendored.read_item(root, item_id) or {}
+        if want_parked:
+            check(len(lane.posts) == n and item.get("reason") == "destination-changed"
+                  and lane.where(stem) == "undelivered" and any("swept a torn claim" in m for m in lane.logs),
+                  f"15. {label} claim + moved DM: swept, parked, no POST ({item.get('status')}, {lane.where(stem)})")
+            run = run_logged(lane, stem, 0)
+            lane.backend().clock = lambda: gb.time.time() + 120
+            lane.drain()
+            check(run is not None and run.returncode == 0 and len(lane.posts) == n + 1
+                  and lane.posts[-1].get("room_id") == pl.OWNER_DM,
+                  f"15. {label}: the logged release sends it once to its stored room")
+        else:
+            check(len(lane.posts) == n and item.get("status") != "PARKED" and lane.where(stem) == "pending",
+                  f"15. {label} claim (a writer may be live): refused, nothing sent ({item.get('status')})")
 
 
 def upgrade_park_refused() -> None:
@@ -508,9 +591,12 @@ def main() -> int:
     park_races_a_delivery()
     hold_move_fails()
     delivered_archive_fails()
+    delivered_cannot_be_hidden()
     newer_body_survives_archive_failure()
     dead_claim_then_moved_dm()
     upgrade_park_refused()
+    retained_claim_survives_next_drain()
+    torn_claim_then_moved_dm()
     restore_refuses_empty_digest()
     unreadable_first_generation()
     two_generations()
