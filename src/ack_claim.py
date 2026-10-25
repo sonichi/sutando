@@ -18,13 +18,14 @@ from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import local_record  # noqa: E402
+from workspace_default import resolve_workspace  # noqa: E402
 
 STATES = ("claimed", "confirmed", "unknown")
 _KEY = re.compile(r"\A[a-z][a-z-]*:[A-Za-z0-9._-]{1,160}:[a-z][a-z-]*\Z")
 
 
-def claims_dir(workspace: Path) -> Path:
-    return Path(workspace) / "state" / "ack-claims"
+def claims_dir(workspace: Optional[Path] = None) -> Path:
+    return Path(workspace or resolve_workspace(migrate=False)) / "state" / "ack-claims"
 
 
 def _name(key: str) -> str:
