@@ -41,6 +41,7 @@ from outbox import list_items
 from proactive_dispatch_gate import dispatch_veto
 from result_markers import has_skip_action, parse_markers
 from result_publish import publish_text
+from task_archive import find_task_file
 from task_envelope import attested_task_headers, verify_text
 
 HOLDER = "status-ack"
@@ -132,7 +133,7 @@ def attested_headers(text: str, ws: Path) -> Optional[dict]:
 def result_state(ws: Path, tid: str, probe_answered: bool = False) -> str:
     """none / answered / no-send / sending / archived, read from results/ and tasks/ now."""
     results = ws / "results"
-    if not (ws / "tasks" / f"{tid}.txt").exists():
+    if find_task_file(ws / "tasks", tid) is None:
         return "archived"
     body = _read(results / f"{tid}.txt")
     if body is not None:
@@ -142,9 +143,9 @@ def result_state(ws: Path, tid: str, probe_answered: bool = False) -> str:
     return "answered" if probe_answered else "none"
 
 
-def cancel_pending(ws: Path, tid: str) -> bool:
+def cancel_pending(ws: Path, tid: str, own_file: str) -> bool:
     for f in sorted((ws / "tasks").glob("task-*.txt")):
-        if f.stem != tid and cancel_target(_read(f)) == tid:
+        if f.name != own_file and cancel_target(_read(f)) == tid:
             return True
     return False
 
@@ -233,8 +234,8 @@ def watch_inbox(ws: Path, snap: dict, cfg: Settings, now: float) -> Optional[str
 
 def observe(ws: Path, row: dict, inbox: str, alerted: bool):
     """(TaskObservation, None) or (None, why this task is not considered at all)."""
-    tid = row["task_id"]
-    text = _read(ws / "tasks" / f"{tid}.txt")
+    tid, own_file = row["task_id"], row.get("file") or f"{row['task_id']}.txt"
+    text = _read(ws / "tasks" / own_file)
     if text is None:
         return None, "the task left the queue"
     headers = attested_headers(text, ws)
@@ -247,7 +248,7 @@ def observe(ws: Path, row: dict, inbox: str, alerted: bool):
         result=result_state(ws, tid, bool(row.get("answered"))), ack=ack_claim.state(ws, policy.ack_key(tid)),
         worker_holder=row.get("holder"), inbox=inbox,
         cancel_instruction=cancel_target(text) is not None,
-        cancel_requested=cancel_pending(ws, tid), owner_alerted=alerted), None
+        cancel_requested=cancel_pending(ws, tid, own_file), owner_alerted=alerted), None
 
 
 def recheck(ws: Path, tid: str) -> Optional[str]:
