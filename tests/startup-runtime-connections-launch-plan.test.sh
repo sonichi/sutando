@@ -73,9 +73,10 @@ sleep 1
 case "$out" in *"import-env failed"*) ok "import failure is reported";; *) bad "no import-failure line: $out";; esac
 [ -f "$OUT/dev.env" ] && ok "dev bridge still launched" || bad "dev bridge missing after import failure"
 
-echo "== the old per-env-var loop is gone =="
-grep -q "for _gw_var in \$(env | grep -o '^AG2_REMOTE_TOKEN_" "$REPO_UNDER_TEST/src/startup-runtime.sh" \
-  && bad "startup-runtime.sh still iterates env vars itself" || ok "startup-runtime.sh loops over the launch plan only"
+echo "== the old per-env-var launch loop is gone =="
+envloop="$(awk '/for _gw_var in /{f=1} f{print} f&&/^[[:space:]]*done[[:space:]]*$/{exit}' "$REPO_UNDER_TEST/src/startup-runtime.sh")"
+printf '%s' "$envloop" | grep -q 'remote-gateway-bridge.py' \
+  && bad "startup-runtime.sh still launches bridges from env vars itself" || ok "the env-var loop only names skipped instances"
 grep -q 'GATEWAY_INSTANCE="\$_gw_inst"' "$REPO_UNDER_TEST/src/startup-runtime.sh" \
   && bad "startup-runtime.sh still composes the bridge env" || ok "the bridge env shape lives in src/connections.py"
 

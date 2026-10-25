@@ -566,8 +566,11 @@ start_gateway_lanes() {
           echo "  ⊘ gateway bridge ($_gw_inst) not launched — see remote-gateway-bridge.log"
         fi
       done < <("$PY" "$REPO/scripts/connections.py" launch-plan 2>> "$LOGS_DIR/remote-gateway-bridge.log")
-    elif env | grep -q '^AG2_REMOTE_TOKEN_'; then
-      echo "  ⊘ secondary gateway bridges skipped — no runnable python3"
+    else
+      # Without python3 the plan cannot be read; name every instance the environment declares.
+      for _gw_var in $(env | grep -o '^AG2_REMOTE_TOKEN_[A-Za-z0-9_][A-Za-z0-9_]*' || true); do
+        echo "  ⊘ gateway bridge ($(printf '%s' "${_gw_var#AG2_REMOTE_TOKEN_}" | tr '[:upper:]' '[:lower:]')) skipped — no runnable python3"
+      done
     fi
   fi
 }
