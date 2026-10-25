@@ -832,11 +832,22 @@ def _item_path(root: Path, item_id: str) -> Path:
     return _items_dir(root) / f"{_safe_key(item_id)}.json"
 
 
+UNREADABLE_ITEM = "unreadable-item"
+
+
 def _read_item(root: Path, item_id: str) -> dict:
+    """The stored record, or a fresh one only when no record exists. A record that exists
+    but cannot be parsed reads as parked with a send in doubt, so it is never sent again."""
     try:
-        return json.loads(_item_path(root, item_id).read_text(encoding="utf-8"))
-    except (FileNotFoundError, json.JSONDecodeError):
+        d = json.loads(_item_path(root, item_id).read_text(encoding="utf-8"))
+    except FileNotFoundError:
         return {"item_id": item_id, "attempts": 0, "status": "QUEUED", "reason": None}
+    except ValueError:
+        d = None
+    if isinstance(d, dict):
+        return d
+    return {"item_id": item_id, "attempts": 0, "status": "PARKED", "reason": UNREADABLE_ITEM,
+            "unreadable": True, "dispatching": {"incarnation": None, "at": None}}
 
 
 def _write_item(root: Path, item_id: str, data: dict) -> None:
@@ -871,12 +882,16 @@ def record_delivered(root: Path, item_id: str, *, provider: Optional[str] = None
     _activity_completed(item_id)
 
 
-def record_dispatching(root: Path, item_id: str, incarnation: str) -> None:
+def record_dispatching(root: Path, item_id: str, incarnation: str) -> bool:
     """Under the item lock and its claim: a send is about to leave. A later claim that
-    still finds it knows that send may have landed and was never settled."""
+    still finds it knows that send may have landed and was never settled. False, and
+    nothing written, when the record could not be parsed."""
     d = _read_item(Path(root), item_id)
+    if d.get("unreadable"):
+        return False
     d["dispatching"] = {"incarnation": incarnation, "at": time.time()}
     _write_item(Path(root), item_id, d)
+    return True
 
 
 def clear_dispatching(root: Path, item_id: str) -> None:
@@ -957,7 +972,8 @@ def _activity_completed(item_id: str) -> None:
 
 def item_status(root: Path, item_id: str) -> Optional[str]:
     """Public read of an item's lifecycle status (READY/CLAIMED/DELIVERED/
-    PARKED...); None when no record exists or the record is unreadable."""
+    PARKED...); None when no record exists or it cannot be opened. A record
+    that cannot be parsed reads PARKED."""
     try:
         if not _item_path(Path(root), item_id).exists():
             return None
@@ -1183,7 +1199,8 @@ def requeue_item_with_epoch(root: Path, item_id: str, *, reset_attempts: bool = 
                             operator_release: bool = False) -> "tuple[RequeueOutcome, Optional[int]]":
     """Operator recovery: PARKED -> QUEUED as ONE atomic transition.
 
-    Refuses anything not PARKED, which is what makes it idempotent AND keeps it
+    Refuses anything not PARKED, and a record that could not be parsed (it has no
+    payload to send). That is what makes it idempotent AND keeps it
     from creating a second delivery: a live claim only exists on an item that is
     not parked, so this can never destroy one. The force-release below therefore
     clears a residue of the parked attempt, never a peer's in-flight work.
@@ -1209,7 +1226,7 @@ def requeue_item_with_epoch(root: Path, item_id: str, *, reset_attempts: bool = 
         if not _item_path(root, item_id).exists():
             return RequeueOutcome.ABSENT, None
         d = _read_item(root, item_id)
-        if d.get("status") != "PARKED":
+        if d.get("status") != "PARKED" or d.get("unreadable"):
             return RequeueOutcome.NOT_PARKED, None
         _release_locked(root, item_id, force=True)
         d["resend_epoch"] = int(d.get("resend_epoch", 0) or 0) + 1

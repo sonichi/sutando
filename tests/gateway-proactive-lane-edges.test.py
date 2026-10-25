@@ -270,6 +270,16 @@ def bridge_edges() -> None:
     check(gb._payload_room("not json") is None, "an unreadable stored payload names no room")
 
     lane = pl.Lane(gb, ISO, refuse(429))
+    lane.write("proactive-torn.txt", "nudge\n")
+    lane.drain()
+    [torn] = lane.items()
+    src_outbox._item_path(lane.results / ".outbox-ag2space-proactive", torn["item_id"]).write_text('{"payl')
+    lane.drain()
+    check(len(lane.posts) == 1 and lane.where("proactive-torn") == "undelivered",
+          f"an item record corrupt before the pass is parked, not sent again ({len(lane.posts)} POSTs, "
+          f"{lane.where('proactive-torn')})")
+
+    lane = pl.Lane(gb, ISO, refuse(429))
     lane.write("proactive-moved.txt", "nudge\n")
     lane.drain()
     lane.owner_dm = "!Moved:ag2.space"

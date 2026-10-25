@@ -186,12 +186,11 @@ class DesignAClaimBackend:
 
     def mark_dispatching(self, token: ClaimToken) -> bool:
         """Record that this incarnation is about to send; False (and nothing written) when
-        the token no longer owns the claim."""
+        the token no longer owns the claim or the item record cannot be parsed."""
         with outbox._item_lock(self.root, token.item_id):
             if self._incarnation_of(token.item_id) != token.incarnation:
                 return False
-            outbox.record_dispatching(self.root, token.item_id, token.incarnation)
-            return True
+            return outbox.record_dispatching(self.root, token.item_id, token.incarnation)
 
     def prior_dispatch(self, token: ClaimToken) -> "tuple[Optional[str], bool]":
         """(receipt, interrupted) an earlier incarnation left on the claimed item: the
