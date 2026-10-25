@@ -16,6 +16,8 @@ there, including the daily morning briefing and the email-triage digest (#4259).
   i) a review-DM cache marked private is reused when the hint is unreadable (positive control)
   j) the cleared reading cannot be written -> the shared room is not re-adopted from disk
   k) an unmarked record naming a room found shared is overwritten, so no other reader trusts it
+  l) an owner-mention DM queued before its room went shared is held, not posted there
+  m) an owner-mention DM goes to the owner DM read at send time (positive control)
 
 Loads src/remote-gateway-bridge.py in-process with an isolated workspace and a
 fake `_req`. Run: python3 tests/gateway-owner-dm-must-be-private.test.py
@@ -193,6 +195,21 @@ def main() -> int:
     record = json.loads(mod._routing_file().read_text())
     check(queued and gw.posts == [] and record.get("owner_dm") == "" and record.get("private") is True,
           f"k) an unmarked record naming the shared room is overwritten with no reading: {record}")
+
+    ws = workspace(); gw = Gateway(DM); mod = load(ws, gw)
+    om = "proactive-owner-mention-om1.to-ag2space.txt"
+    (ws / "results" / om).write_text(f"[channel: {DM}]\nAlice asked about the deck\n", encoding="utf-8")
+    gw.members[DM].append("@intruder:example.org")
+    mod._post_proactive()
+    check((ws / "results" / om).exists() and gw.posts == [],
+          f"l) an owner-mention DM queued for a room that has since gone shared is held: posts={gw.posts}")
+
+    ws = workspace(); gw = Gateway(DM); mod = load(ws, gw)
+    om = "proactive-owner-mention-om2.to-ag2space.txt"
+    (ws / "results" / om).write_text(f"[channel: !old-dm:example.org]\nAlice asked about the deck\n", encoding="utf-8")
+    mod._post_proactive()
+    check(not (ws / "results" / om).exists() and [p["room_id"] for p in gw.posts] == [DM],
+          f"m) an owner-mention DM goes to the owner DM read at send time, not the room baked in: {gw.posts}")
 
     print(f"\n{'FAIL' if FAILS else 'PASS'}: {len(FAILS)} failure(s)")
     return 1 if FAILS else 0

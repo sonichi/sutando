@@ -5993,6 +5993,13 @@ def _post_proactive() -> None:
                 # Hand back under its own name: the claim gate holds it from here.
                 _hand_back(claim, f)
                 continue
+        if route == "send" and room_override and f.name.startswith(_OWNER_MENTION_PREFIX):
+            # Its room was the owner DM when queued; send to the owner DM read now, or hold.
+            room_override = resolve_destination(OWNER_PRIVATE)
+            if not room_override:
+                _held(f"owner-mention result {f.name}")
+                _hand_back(claim, f)
+                continue
             _GATE_FAILED_LOGGED.discard(f.name)
         if route == "drop":
             # Skip marker ([no-send]/[REPLIED]/[deduped:]) — the protocol says
@@ -7046,6 +7053,9 @@ def _owner_mention_refused(tid: str, body: str) -> "bool | None":
 
 def _owner_mention_dm_name(tid: str) -> str:
     return proactive_filename(f"owner-mention-{tid}", "ag2space")[:-len(".txt")]
+
+
+_OWNER_MENTION_PREFIX = "proactive-owner-mention-"
 
 
 def _owner_mention_dm_queued(tid: str) -> bool:
