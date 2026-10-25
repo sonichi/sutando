@@ -44,8 +44,8 @@ def __getattr__(name: str):
 def room_link(room_id: str, event_id: str = "", via: Optional[str] = None) -> str:
     """`https://matrix.to/#/<room>[/<event>][?via=<server>]`; `via` None takes the room's
     server's DotSpace (`default_via`), empty `via` drops the query."""
-    via = default_via(room_id) if via is None else via
-    if via and not dotspace.is_server_name(via.strip().lower()):
+    via = default_via(room_id) if via is None else via.strip().lower()
+    if via and not dotspace.is_server_name(via):
         via = ""  # an explicit via that is not a server name never reaches the query
     frag = f"{room_id}/{event_id}" if event_id else room_id
     return f"{MATRIX_TO}{frag}?via={via}" if via else f"{MATRIX_TO}{frag}"

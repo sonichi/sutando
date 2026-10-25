@@ -112,6 +112,8 @@ class TestExplicitVia(unittest.TestCase):
         self.assertEqual(links.room_link("!r:ag2.space", via="evil.example/x"), "https://matrix.to/#/!r:ag2.space")
         self.assertEqual(links.room_link("!r:ag2.space", via="s.space"), "https://matrix.to/#/!r:ag2.space?via=s.space")
         self.assertEqual(links.room_link("!r:ag2.space", via="localhost:8448"), "https://matrix.to/#/!r:ag2.space?via=localhost:8448")
+        self.assertEqual(links.room_link("!r:ag2.space", via=" S.Space "), "https://matrix.to/#/!r:ag2.space?via=s.space",
+                         "the normalised via is what goes out")
 
 
 if __name__ == "__main__":

@@ -199,7 +199,22 @@ class TestConfig(unittest.TestCase):
                              ("cloud_origin", "https://u:p@sutando.new.space"), ("cloud_origin", "https://sutando.new.space:0")]:
             self.assertIsNone(ds.parse_well_known(block(**{field: value}), "new.space"), (field, value))
         ok = ds.parse_well_known(block(link_via="chat.new.space:8448", gateway_url="https://chat.new.space:8448/relay"), "new.space")
-        self.assertEqual((ok["link_via"], ok["gateway_host"]), ("chat.new.space", "chat.new.space"))
+        self.assertEqual((ok["link_via"], ok["gateway_host"]), ("chat.new.space:8448", "chat.new.space"),
+                         "a declared via port stays, as a typed server's does")
+        # mcp_url is dialled: https only, no query or fragment; the display-only fields keep http.
+        for value in ("http://mcp.new.space/mcp", "https://mcp.new.space/mcp?x=1", "https://mcp.new.space/mcp#f"):
+            self.assertIsNone(ds.parse_well_known(block(mcp_url=value), "new.space"), value)
+        self.assertIsNotNone(ds.parse_well_known(block(gateway_url="http://chat.new.space/relay?x=1"), "new.space"))
+
+    def test_ip_literals_and_single_labels_are_never_fetched(self):
+        for name in ("[::1]:8448", "127.0.0.1", "localhost:8448", "!r:10.0.0.1", "@u:[fe80::1]"):
+            f = Fetcher(block())
+            ds.reset_cache()
+            d = ds.dotspace_for(name, fetch=f, config=NONE)
+            self.assertEqual(f.calls, [], name)
+            self.assertEqual(d.source, "none", name)
+        for bad in ("!a:ag2.space:08448", "!a:ag2.space:0"):
+            self.assertEqual(ds.dotspace_for(bad, fetch=ds.NO_FETCH, config=NONE), ds.DotSpace(server=""), bad)
         # Through the registered path: the refused block fills nothing, the config entry stands.
         cfg = {"instances": [{"server": "reg.space"}]}
         ds.reset_cache()

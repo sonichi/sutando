@@ -80,7 +80,7 @@ instance is a config entry.
    up and itself dotted (`chat.s.space` may claim `s.space`; `attacker.space` cannot claim
    `space`), and a parent claim counts only for a **registered** server (`x.co.uk` cannot
    declare `co.uk`; an unregistered host may declare itself alone); `gateway_url`, `link_via`,
-   `cloud_origin` and `mcp_url` must sit at or under that server, or the whole block is refused. For a **registered** server the block fills what
+   `cloud_origin` and `mcp_url` must sit at or under that server, or the whole block is refused. Every value is validated as strictly as a typed name: `link_via` is a server name (a declared port stays), the URL fields are http(s) with a server-name host, no userinfo and no backslash, and `mcp_url` is https with no query or fragment. An IP literal or a single-label name is never fetched. For a **registered** server the block fills what
    config left unset: `gateway_host`, `mcp_url`, `link_via`, `prefer_ipv4` — never
    `cloud_origin`. For an **unregistered** server it yields operator `""`, source
    `well-known-unverified`, the discovered `gateway_host` and `mcp_url`, and no AG2 behaviour

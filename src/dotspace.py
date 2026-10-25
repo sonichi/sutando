@@ -91,7 +91,7 @@ CONFIG_LIST = "instances"
 # A Matrix server name and nothing else (DNS labels or an IPv6 literal, an optional port): what a
 # URL could read as a path, query, fragment, userinfo, scheme, escape or whitespace never matches.
 _SERVER_NAME = re.compile(r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*"
-                          r"|\[(?P<v6>[0-9a-f:.]+)\])(?::(?P<port>[0-9]{1,5}))?")
+                          r"|\[(?P<v6>[0-9a-f:.]+)\])(?::(?P<port>[1-9][0-9]{0,4}))?")
 
 
 def is_server_name(name: str) -> bool:
@@ -110,13 +110,15 @@ def is_server_name(name: str) -> bool:
     return True
 
 
-def _strict_url(value: Any) -> Optional[str]:
+def _strict_url(value: Any, *, endpoint: bool = False) -> Optional[str]:
     """An http(s) URL whose host is a server name, with no userinfo and no backslash (parsers
-    disagree on `\\`); "" when absent, None when present and not that."""
+    disagree on `\\`); `endpoint` also demands https and no query or fragment, since the value is
+    dialled, not displayed. "" when absent, None when present and not that."""
     v = str(value or "").strip()
     if not v:
         return ""
-    if "\\" in v or not v.lower().startswith(("http://", "https://")):
+    schemes = ("https://",) if endpoint else ("http://", "https://")
+    if "\\" in v or not v.lower().startswith(schemes):
         return None
     try:
         parts = urllib.parse.urlsplit(v)
@@ -125,7 +127,19 @@ def _strict_url(value: Any) -> Optional[str]:
     netloc = parts.netloc.lower()
     if parts.username is not None or parts.password is not None or not is_server_name(netloc):
         return None
+    if endpoint and (parts.query or parts.fragment):
+        return None
     return v
+
+
+def _never_fetched(host: str) -> bool:
+    """An IP literal or a single-label name serves no operator's declaration: no fetch, so a
+    room id can never aim the resolver at an address."""
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        return "." not in host
 
 DEFAULT_INSTANCES: Tuple[Dict[str, str], ...] = (
     {"server": "ag2.space", "gateway_host": "chat.ag2.space",
@@ -282,14 +296,15 @@ def parse_well_known(text: Optional[str], fetched_host: str) -> Optional[Dict[st
         return None
     # Every value is validated as strictly as a typed name, or the whole block is refused: these
     # strings reach `?via=`, the relay URL and a Cloud origin on another DotSpace's say-so.
-    gateway_url, cloud_url, mcp_url = (_strict_url(block.get(k)) for k in ("gateway_url", "cloud_origin", "mcp_url"))
+    gateway_url, cloud_url = (_strict_url(block.get(k)) for k in ("gateway_url", "cloud_origin"))
+    mcp_url = _strict_url(block.get("mcp_url"), endpoint=True)
     via_raw = str(block.get("link_via") or "").strip().lower().rstrip(".")
     if None in (gateway_url, cloud_url, mcp_url) or (via_raw and not is_server_name(via_raw)):
         return None
     gateway_host = server_of_gateway_url(gateway_url)
     cloud_origin = _origin(cloud_url)
-    link_via = _host_only(via_raw) or server
-    for host in (gateway_host, link_via, server_of_gateway_url(cloud_origin), server_of_gateway_url(mcp_url)):
+    link_via = via_raw or server  # a declared port stays, as it does for a typed server
+    for host in (gateway_host, _host_only(link_via), server_of_gateway_url(cloud_origin), server_of_gateway_url(mcp_url)):
         if host and not _under(host, server):
             return None
     return {
@@ -326,7 +341,7 @@ def _well_known(host: str, fetch: Fetch) -> Optional[Dict[str, Any]]:
         hit = _cache.get(host)
         if hit and hit[0] > now:
             return hit[1]
-    if fetch is NO_FETCH or getattr(_fetching, "active", False):
+    if fetch is NO_FETCH or getattr(_fetching, "active", False) or _never_fetched(host):
         return None  # a lookup made by the fetch itself (DNS hook) never fetches again
     with _fetch_slot:
         with _cache_lock:
