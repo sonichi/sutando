@@ -31,12 +31,21 @@ lower-precedence candidate.
 | `REMOTE_TASK_POLL_WAIT` | no | `25` | Long-poll seconds requested per `/v1/tasks` call. |
 | `REMOTE_TASK_ON_TASK` | no | — | Wake command run once per newly queued task file. Split with `shlex` and run without a shell, the file path appended as the last argument; `SPARROW_TASK_ID` and `SPARROW_TASK_FILE` are set and every relay credential is removed from its environment. Sparrow does not wait for it, kill it, or retry it; a non-zero exit or a start failure is logged once. |
 | `REMOTE_TASK_TIER` | no | `owner` | Local access tier stamped on every inbound task; `owner` for the personal-agent model, set `team`/`guest` for a shared gateway (see Security); `other` is accepted as the legacy spelling of `guest`. |
-| `REMOTE_PROACTIVE_ROOM` *(.env too)* | no | — | The SYSTEM destination only. Owner-directed `results/proactive-*.txt` nudges and runtime prompt cards go to the gateway's `owner_dm_room` for this agent (`GET /v1/agents`), a reading kept identity-bound on disk (`state/owner-routing.json`) across restarts and outages and never replaced by an answer without one; with no reading yet they are HELD (file left in place, retried every 30 s, logged), never sent here. Unset → read from this instance's `channels/<dir>/.env`. A file naming its own room (`[channel: !room]`) never needs it; the drain runs whether or not it is set. |
+| `REMOTE_PROACTIVE_ROOM` *(.env too)* | no | — | The SYSTEM destination only. Owner-directed `results/proactive-*.txt` nudges and runtime prompt cards go to the gateway's `owner_dm_room` for this agent (`GET /v1/agents`), a reading kept identity-bound on disk (`state/owner-routing.json`) across restarts and outages and never replaced by an answer without one. A room is adopted as the owner DM only when `/v1/room` `{"op": "members"}` lists no one but the agent and its owner, re-checked on every refresh; a room with anyone else clears the reading, and an unreadable member list never adopts a new room. Only a record marked `"private": true` is loaded; one saved before this check, including a migrated legacy record, is not. With no reading they are HELD (file left in place, retried every 30 s, logged), never sent here. Unset → read from this instance's `channels/<dir>/.env`. A file naming its own room (`[channel: !room]`) never needs it; the drain runs whether or not it is set. |
 | `REMOTE_ALERT_ROOM` | no | none (gateway alert disabled) | Explicit owner-only room id for core-independent health alerts sent by the launchd fallback. Never inferred from last activity because that room may be shared. |
 
 **Use the split form** (`REMOTE_TASK_URL` + `REMOTE_TASK_TOKEN`) — it's the recommended way to configure the bridge.
 
 > **Legacy / bootstrap shortcut:** the bridge also accepts a *combined* token of the form `REMOTE_TASK_TOKEN="https://relay.example.com|<secret>"` (URL and secret joined by `|`), which it splits at startup. This exists only so a one-shot onboarding string can carry both halves. If you use it, **quote it in `.env`** — an unquoted `|` is a shell pipe when the file is sourced. Prefer the split form for anything persistent.
+
+> **A declared agent bridge under sparrowd** (a claude-local install on a host
+> whose supervisor is sparrowd) reads neither variable from the environment: it
+> strips every host token and gateway URL name, so the agent's token never meets
+> the host's endpoint. Its token comes from the vault key `AG2_RELAY_TOKEN_<worker>`,
+> and its URL from inside that token (the combined form) or, for a bare secret,
+> from `AG2_RELAY_URL_<worker>`. A URL inside the token wins.
+> `python3 src/sparrow_agent_bridge.py --preflight` lists each declared agent and
+> the one `vault set` that fixes one that will not start.
 
 Older installs using `AG2_REMOTE_URL` / `AG2_REMOTE_TOKEN` remain supported by
 both the bridge launcher and the core-independent health-alert sender during
@@ -74,6 +83,15 @@ A task object **must** carry a unique `"id"`. Recognized string fields
 and written into the local task file the core consumes. For AG2 Space, the
 broker also supplies its room-policy `access_tier` attestation.
 
+Owner replies to runtime action cards are interpreted before local task-file
+newline confinement. The action text excludes a well-formed broker reply-context
+envelope and the leading quote lines of a legacy Matrix rich-reply fallback
+(`> `, `>\t`, and a bare `>` blank line).
+Only the remaining answer is matched; quoted-only or already-folded quotes do
+not become approvals. The same parser handles private-result review decisions.
+Owner identity, the target card and its current revision/guard remain required;
+an unthreaded Yes does not approve an arbitrary pending prompt.
+
 A worker-picker button may be sent as `"picker_command"` (`add` | `pin` |
 `unpin`) plus optional `"picker_args"` — a JSON object, either inline or
 already serialized as a string; the bridge writes it as JSON either way. Both
@@ -91,6 +109,98 @@ older brokers, bridges, and Sutando installations. An optional task handler may
 use the header with `source: ag2space` and `channel_id` to select a durable
 room-specific provider session.
 
+**`capabilities` (the poll's proof).** Every poll carries
+`&capabilities=voice-outcome-v1`, the voice-outcome contract the heartbeat also
+declares (below). One agent's credential may be used by more than one bridge, so
+an AG2 Space broker serves a voice relay ask only to a poll that names the
+contract itself, and serves a poll without it the tasks behind that ask; a relay
+that predates the parameter ignores it.
+
+**`ack_first` (acknowledging first).** An AG2 Space broker marks a voice relay ask
+it serves with `"ack_first": true`, at most one per response. The bridge handles
+a task served with that exact boolean before the rest of the response, on its
+own, and publishes it to the core only once its ack is accepted:
+
+1. It writes the task file into `tasks/.ack-first[.<instance>]/`, where neither
+   the core (which reads `tasks/*.txt`) nor a task-file lookup looks, fsyncs that
+   directory and `tasks/`, and commits a manifest entry. If any of these does not
+   commit, nothing is staged and nothing is acked, so the broker serves the task
+   again. Every later step resumes from the entry.
+2. Before the ack it commits the task's `ack_first` mark, then the in-flight set.
+   Until both commit, the task stays staged and unacked.
+3. It acks the task with `durable: true` and the served `lease_id`, and decides:
+   - `200` (also `"duplicate": true` for a repeat): accepted;
+   - `404` with `"reason": "stale lease generation"`: refused. A newer serve holds
+     the lease, and an acknowledged ask is never served again, so this serve was
+     never accepted;
+   - `404 {"error": "not leased …"}` without that reason, or any other answer:
+     the bridge asks `GET /v1/tasks/<id>/status`. `withdrawn`, `dead` or
+     `result_ready` (the ask ended, or was answered elsewhere) is refused;
+     `acknowledged` after the plain `404` is accepted (no lease is left, so no
+     other serve can hold that acknowledgement); anything else, an unreadable
+     status, or `acknowledged` after an ambiguous answer keeps the task staged,
+     and the ack is retried before every poll. Only the ack itself can say whose
+     acknowledgement it is, so an ambiguous answer never publishes on the state.
+4. Accepted: the acceptance is recorded in the entry, then the staged file is
+   published to the core (a rename into `tasks/`), then both directories are
+   fsync'd, and only then is the entry removed, so a power loss cannot bring the
+   staged name back without the entry that says it was published. An acceptance
+   that cannot be recorded keeps the task staged and unpublished; the next pass
+   acks again. Before the publish, the `access_tier` the staged file froze is
+   resolved again under the local policy in force now; if access has dropped, or
+   the file cannot be read or parsed or names no known tier, nothing is
+   published: the task stays staged and accepted, is reported under
+   `ack_first_unresolved` (below), and is checked again on every pass. The ask is
+   already acknowledged, so a definite drop that still holds ten minutes after the
+   task was staged ends it rather than leave it waiting with no outcome: the
+   decision is recorded in the entry, the relay `failed` result is sent for its
+   broker id with no ceiling (see "A relay ask's result"), then the staged file,
+   the in-flight id and the entry go, and the mark last, each step resumed after a
+   crash. It is never published; a cap restored before then publishes it as
+   usual. An envelope that cannot be proven is never ended this way: it stays
+   withheld and checked.
+   Refused: the decision is recorded in the entry first, then the staged file,
+   the mark and the in-flight entry go, and the entry goes last, so a crash in
+   between finishes the discard on the next pass. The task never reaches the core.
+
+The manifest is `state/remote-task-ack-first-manifest[.<instance>].json`, keyed by
+the local id; each entry names the broker id, the `lease_id`, the staged and
+destination file names, a SHA-256 digest of the task file, and whether the ack
+was accepted or refused. The bridge resumes each entry before every poll, so also
+at start: a staged file whose acceptance is not recorded is acked again and
+decided as above; one whose acceptance is recorded is published without a new ack.
+A staged file that is gone was consumed by its publish: a task file with the same
+digest, a claimed or archived copy, or a result for the task proves it, and the
+entry is cleared without publishing again. The same proof beside an accepted
+entry's staged file (a power loss kept the publish and brought the staged name
+back) drops the staged copy instead of publishing it a second time. With neither, the entry is kept, the
+bridge logs an error once, and it reports the entry under `ack_first_unresolved`
+in `state/gateway-status[.<instance>].json` (the bridge's status file for a local
+supervisor) for as long as it stays, together with any malformed entry and any
+task still staged ten minutes after it was staged (an ack, mark, in-flight or
+publish step that keeps failing). Such a task keeps being retried; the report
+goes once it resolves. At start,
+before the first poll, it also removes each file in its staging directory that no
+entry names (a crash before the entry, inside a discard, or before a newer serve's
+entry replaced an older one). A task served again before its ack replaces its
+entry, so only the newest serve's lease is acked.
+
+**The `ack_first` mark.** `state/remote-task-ack-first[.<instance>].json` maps the
+broker id of each task served with `ack_first` to the local id it is published
+under. It is a file of its own because an older bridge prunes the media sidecar
+when it settles a task, and the mark must survive a restart: it decides whether
+an honoured fold sends `consolidated_into` (see `POST /v1/results`), gives the
+task's result the relay rule's delivery with no ceiling, and lets an updated
+bridge reclaim at start a result an older bridge parked (see "A relay ask's
+result" under "Delivery + idempotency"). A mark is
+removed once the broker has accepted that task's result and the result is
+archived; at start when the outbox shows that result delivered and no result of
+the task, or of a re-ask answering it, is still live (while the dedup alias
+ledger cannot be read, no mark is retired at start); or when its ack is refused,
+since such a task never reached the core and can never produce a result. An
+older bridge never reads or writes the file. A task served without `ack_first`
+is unchanged.
+
 ### `POST /v1/tasks/<id>/ack`
 
 Claim/acknowledge a task so the server stops redelivering it.
@@ -104,10 +214,11 @@ delivery should treat ack as "stop redelivering"; the client is idempotent and
 will not re-queue a task it already claimed or archived.
 
 `durable: true` is sent only once the task file, its media sidecar and the
-in-flight set are all fsync'd, so the task survives a crash of this host. When a
-fresh queue write, its media sidecar, the in-flight set or the pending-ack
-ledger does not commit, the client withholds the ack entirely rather than
-claiming a task it could still lose. The flag is merely absent — a plain ack the
+in-flight set are all fsync'd (for an `ack_first` task, the staged file and its
+directory, its manifest entry and its mark too), so the task survives a crash of
+this host. When a fresh queue write, its media sidecar, the in-flight set or the
+pending-ack ledger does not commit, the client withholds the ack entirely rather
+than claiming a task it could still lose. The flag is merely absent — a plain ack the
 server should treat as "stop redelivering" and nothing more — when a redelivered
 task is already queued and its durability could not be repaired. Acks that do
 not confirm are persisted and retried; a per-task `404 {"error": "not leased …"}`
@@ -117,15 +228,52 @@ When the served task carries a `lease_id` (the broker's lease generation, fresh
 on every serve), the ack echoes it — also on a retry after a restart, since the
 pending-ack ledger keeps it — and a `404 {"reason": "stale lease generation"}`
 retires that ack the same way; a task served without one is acked without the key.
+An `ack_first` task is not in the pending-ack ledger: its manifest entry is its
+retry record, because an accepted ack must also publish it, and its `404` is
+decided with the task's status rather than retired (see `GET /v1/tasks`).
 
 ### `POST /v1/results`
 
 Return a task's result.
 
 ```
-body: { "id": "task-123", "body": "<result text>" }
-body: { "id": "task-123", "body": "<result text>", "thread": "ask" }   // optional
+body: { "id": "task-123", "body": "<result text>",
+        "capabilities": ["voice-outcome-v1"], "dm_only": false }
+body: { ..., "thread": "ask" }                                  // optional
+body: { "id": "ask-…", "body": "", "consolidated_into": "ask-…",
+        "capabilities": ["voice-outcome-v1"], "dm_only": false }  // an honoured fold
+body: { "id": "ask-…", "body": "", "status": "failed",
+        "capabilities": ["voice-outcome-v1"], "dm_only": false }  // a relay ask's refused result
 ```
+
+**The voice-outcome contract (`capabilities`, `dm_only`).** Every result carries
+`"capabilities": ["voice-outcome-v1"]` and an explicit boolean `dm_only`: `true`
+when the body carries `[dm-only]` anywhere (a standalone marker line is stripped
+from `body`; an inline mention stays in it), `false` otherwise, a skip and a fold
+included. An AG2 Space broker reads the two only for a voice relay ask, and treats
+such an ask's result without them as private: an older bridge strips the marker
+line and sends no `dm_only`, so its private answers still reach only the owner.
+Both are part of the payload the outbox stores, so a retry, also after a restart,
+resends them; a payload an older bridge stored carries neither. Every existing key
+keeps its value, and a broker that predates the contract reads only the keys it
+names, so it ignores both.
+
+**`consolidated_into` (an honoured fold).** When the core folds a task whose
+`ack_first` mark is kept (see `GET /v1/tasks`), or a re-ask answering one, into
+another task (`[deduped: <holder>]`) and the dedup planner honours the fold, its
+result closes with `consolidated_into`: the holder's **broker** id, resolved as a
+result's own id is (the dedup alias first, then the instance prefix stripped), so
+a named instance sends `ask-…`, never `task-<instance>~ask-…` or a re-ask's
+`task-<hash>`. It carries an empty `body` and no `no_send`: the broker records the
+ask as merged into the holder and posts nothing for it. The mark is on disk, so a
+fold answered after a restart sends it too. While the alias ledger cannot be read,
+or the marks cannot be read for a voice ask, the result waits for a later pass; a
+holder that is not a task of this gateway is never named. Every other task, typed
+and Signal tasks included, closes an honoured fold with the bare
+`[deduped: <holder>]` and `no_send` as before, because the broker already acts on
+`consolidated_into` for any task. A fold the planner re-asks or reports is
+unchanged: the re-ask's answer goes under the original id, and the report is a
+warning posted as the answer.
 
 **`thread` (optional).** Defined by the broker in
 [ag2-space/ag2space-backend#2138](https://github.com/ag2-space/ag2space-backend/pull/2138).
@@ -162,9 +310,17 @@ body: {
   "provider": "<REMOTE_TASK_PROVIDER>",
   "tier": "<REMOTE_TASK_TIER>",
   "inflight": <int>,            // tasks currently claimed but not yet resulted
-  "capabilities": ["task-ack", "heartbeat", "result-skip-markers", "core-status", "team-collaborator"]
+  "capabilities": ["task-ack", "heartbeat", "result-skip-markers", "core-status",
+                   "team-collaborator", "voice-outcome-v1"]
 }
 ```
+
+`voice-outcome-v1` declares the voice-outcome contract: the poll's proof and
+acknowledging an `ack_first` task before publishing it under `GET /v1/tasks`, and
+`dm_only` and `consolidated_into` under `POST /v1/results`. An AG2 Space broker
+keeps the declaration to decide whether a new call may use the voice relay; the
+poll and every result carry the contract again, because a Mac can be downgraded
+after the declaration was read.
 
 `status` and `step` come from the core's
 `state/core-status.json`, with the health-check overlay described under
@@ -210,6 +366,25 @@ from [`GET /health`](health-snapshot.md) and the `worker_health.v1` capability:
 the broker times freshness by when it received the heartbeat. A change in the row
 sends the heartbeat at once, without waiting for the interval. A gateway with no
 Sutando checkout around it sends neither field.
+
+### `GET /v1/setup` *(optional)*
+
+The agent's own `agent.setup.steps` result (served text, tunables, package pin), for the
+bearer's agent. The heartbeat reply's `setup_revision` announces which revision applies; the
+gateway fetches only when that differs from the copy it holds, with a 10 s deadline.
+
+```
+success: 200 {"schema_version": 1, "agent_mxid": "<mxid>", "revision": "<rev>",
+              "kind": "acp", "vendor": "<vendor>", "text_schema_version": 1 | null,
+              "runtime_text": {...} | null, "tunables": {...} | null,
+              "package": {...} | null, ...}
+```
+
+The gateway keeps the result in `state/served-setup[.<instance>].json` only when the whole
+of it validates: `schema_version` 1, the announced revision, its own agent, and
+`text_schema_version` 1 with all four listener blocks, or all four `null`. Anything else, an
+HTTP error, or a timeout writes nothing, keeps the last good copy, and is retried after 60 s,
+doubling to at most an hour; a newly announced revision is tried at once.
 
 ### `POST /v1/workers` *(optional)*
 
@@ -347,9 +522,9 @@ HTTP 401/403 (while polling recovers authentication), 408, 425, 429, 5xx and
 transport failures are retryable. Other 4xx responses,
 malformed envelopes and explicit decline envelopes are permanent refusals and
 park on the first attempt. This policy applies to the gateway **task-result**
-leg only; proactive room sends and other providers keep their existing retry
-policy. Providers without an idempotent-send or reconciliation capability still
-park an ambiguous outcome rather than retrying it automatically.
+leg only; proactive room sends follow "Proactive room sends" below. Providers
+without an idempotent-send or reconciliation capability still park an ambiguous
+outcome rather than retrying it automatically.
 
 The outbox item stores its start, absolute deadline, next eligible time and
 failure count atomically under the delivery claim lock. A restart retains these
@@ -398,8 +573,156 @@ Without it, an expired window stays expired. The operator action increments the
 outbox resend epoch, but the gateway envelope retains the same broker result ID.
 Inspect whether a reply was already manually sent before recovering it.
 Existing parked records and historical quarantined replies are **not** migrated
-or replayed automatically. Live nonterminal records without a schedule acquire
-one on their next claim.
+or replayed automatically, except a relay ask's result an older bridge parked
+(below). Live nonterminal records without a schedule acquire one on their next
+claim.
+
+### Proactive room sends
+
+Each `results/proactive-*.txt` is one outbox item (`results/.outbox-ag2space-proactive/`),
+keyed by its file stem plus a SHA-256 prefix of its body (`<stem>~<16 hex>`): a new body
+under a delivered name is a new send, while the room and thread, re-resolved on every pass,
+are not part of the key. The room, thread and body stored when the item is first published
+are what is sent, as one `POST /v1/room` `op: message` with that item's `dedupe_key` (and
+`thread_root` when it posts in a thread). The logged `outbox_cli.py requeue <item> --body-id
+<stem> --body-sha256 <digest>` restores exactly that item's quarantined body (one name can
+hold several parked generations) under its file name, which maps back to the same item; the
+CLI refuses an empty digest, and a missing one while several bodies are parked, before it
+changes anything. When the body cannot be read at park time, no runnable command is printed.
+A stored destination that no longer matches the resolved one (an owner DM that moved after a
+refusal) parks the item `destination-changed` and moves the file to `results/undelivered/`;
+it is never re-routed, and the logged release sends it to its stored room. The guard applies
+to every dispatch except one a person released: the CLI's requeue records the release bound
+to the stored payload (`operator_release`), and an automatic requeue (a room-upgrade resend)
+records none. Parking takes the item's lock and refuses an item that is delivered, holds a
+receipt or a dispatch mark, or is held by a live claim (a dead owner's claim past its reclaim
+window is released first). A delivered file that cannot be archived is renamed to a hidden
+`.<stem>.delivered-<ts>` that no bridge globs, and a later pass moves it into `archive/`; it
+is never unlinked and never put back under its live name. If even the hidden rename fails it
+stays claimed; a restart's orphan recovery may then return it to its live name, where its
+DELIVERED item is archived without a resend. Every handback to a live name uses a
+no-replace rename, so a newer file a producer wrote there is never overwritten.
+
+The file is still claimed by rename (`.sending.<pid>`, recovered by `_recover_orphan_proactive`
+when its owner dies): that is what keeps the other bridges polling `results/proactive-*.txt`
+off it. It does not decide delivery; the outbox item's claim and dispatch mark do, so a file
+recovered back to `.txt` maps to the same item and is never sent twice. The outbox owns the claim, the retry and the outcome; the drain only
+moves the file as the outcome says. The room send is neither idempotent nor reconcilable,
+so:
+
+- **Only a Matrix event id confirms.** It is recorded on the item (`provider_ref`) before
+  the item is marked delivered; the file is then archived. A bare `{"ok": true}` never
+  confirms, and there is no setting that trusts it.
+- **An uncertain send is parked, never resent.** A timeout, a 5xx, an accept with no event
+  id, or a process that died after the send began leaves the item `PARKED`
+  (`outcome-unknown`) and moves the file to `results/undelivered/`. The log names the
+  `outbox_cli.py requeue` command; check the room first, since a requeue may post twice.
+  A process that died after the event id was recorded settles the item as delivered.
+- **Unreadable item records.** An item record that exists but cannot be parsed is never
+  read as a new item. It reads `PARKED` (`unreadable-item`) with its send in doubt, so no
+  drain sends it. `outbox_cli.py --root <root> list` shows it by its file name
+  (`file=<name>.json`, no item id). `requeue` refuses it with exit 6 and leaves its body in
+  `results/undelivered/`. To release it: check the room first, since it may already have
+  posted. Then move the record file out of `<root>/.items/` (keep it for diagnosis), and
+  move its body from `results/undelivered/` back to `results/<stem>.txt`. The next pass
+  publishes it as a new item and sends it once.
+- **A definite refusal is retried** on the outbox's schedule (the same window and backoff
+  as task results, counted on the item, so a restart keeps the count): 401/403, 408, 425,
+  429, and a connection that was refused or a host that did not resolve. Another 4xx parks
+  at once. A 400 naming an upgraded owner DM holds the file until the DM is repointed.
+- **A message about a task** is named `proactive-about-<task id>--<ts>.txt`
+  (`proactive_routing.about_task_filename`). In the task's own room it posts in the task's
+  thread: an ask already in a thread keeps that thread's root, a top-level ask is rooted at
+  its source message. Right before its send it is checked again: an answered, ended or
+  cancelled task, or one waiting on the owner, withdraws it (archived, item parked
+  `withdrawn:<reason>`, nothing posted). The task's result is checked by the bridge; the
+  rest by the host's `PROACTIVE_DISPATCH_GATE` (Sutando: `src/proactive_dispatch_gate.py`).
+
+### A relay ask's result (no ceiling)
+
+A result posted under the id of a task whose `ack_first` mark is kept (see
+`GET /v1/tasks`), a re-ask's answer included, has no window and no attempt cap:
+it is retried, durably across restarts, under the same id and payload, until the
+broker accepts it, or refuses for good both the answer and the `failed` sent in
+its place (below). The accept is final for it: the broker posts a relay ask's
+outcome to the room itself, with its own dead letter, so the bridge never reads
+`GET /v1/results/<id>/delivery` for a relay result. Every other result keeps
+that read.
+
+- A 401 or 403 is retried while the poll loop recovers the credential, as above,
+  for as long as that takes.
+- A 408, 425, 429, a 5xx or a transport failure keeps the same result, retried
+  under its id with the same backoff (2 s doubling to 30 s).
+- A definite refusal of the payload (any other 4xx, or a decline envelope) swaps
+  in a minimal `failed` result for the same task (the `failed` body above), once.
+  It is stored in place of the refused payload, which the record keeps as
+  `refused_payload`, under a new resend epoch, so it has an idempotency key of its
+  own. It is retried the same way, so the broker ends the ask and posts "couldn't
+  finish". Once it is accepted the live result is archived as usual.
+- If the broker refuses that `failed` for good too (it no longer knows the task,
+  say), no retry can change it, and the result ends. The item is parked as
+  `refused-for-good:<reason>`, the refusal's terminal reason kept after the prefix
+  (the delivery core's is `permanent-refusal`; a bare `refused-for-good` an
+  earlier build wrote reads the same). The result is quarantined to
+  `results/undelivered/` with the outbox's requeue command, as any park is, and
+  the task is settled: archived, its id out of the in-flight set on disk, and its
+  mark retired last, logged once as an `ERROR`. A crash between those steps leaves
+  the mark, so the next start finishes the end in the same order. Neither the
+  drain, the pass that puts results back in flight, nor the reclaim at start
+  revives it. A refused payload that names no task, so that no `failed` can be
+  built, ends the same way at once.
+- A park the rule could not prevent, such as the 10-minute window an older bridge
+  started before the Mac updated, is requeued with its retry state reset when the
+  drain meets it, rather than quarantined.
+
+The outbox requires a finite window, so the relay rule's is a century. Its waiting
+is logged on a backoff (the 1st, 2nd, 4th, 8th ... time in a process, with the
+count), not on every 1-second drain pass. A relay result the broker has still not
+accepted ten minutes into its retry run is also reported under
+`relay_results_retrying` in `state/gateway-status[.<instance>].json`, as `count`
+and the oldest one's age in seconds, `oldest_age_s`. The age is measured from the
+outbox record's `retry.started_at`, so it starts again after a requeue or a
+reclaim at start, which drop the retry state. The result keeps being retried, and
+the field is absent while none is, and also while the marks file cannot be read
+(logged on its own backoff), so its absence does not prove nothing is retrying.
+While the marks cannot be read, only a
+result that may answer a relay ask waits: a voice task under an `ask-…` id (the
+lane's `ask_sutando` ids). The session-end task (`voice-end-…`) and every other
+result go on. Every result without a kept mark keeps the bounded policy above,
+unchanged.
+
+A relay ask's result is never the orphan sweep's. Its id can leave the in-flight
+set before the result lands (the task dropped as abandoned, or the ledger lost),
+and on the primary lane the sweep never reads an `ask-…` name at all. So at start,
+and on every poll pass before the sweep, each live result a kept mark names (a
+re-ask's answer included) is put back in flight, and the drain posts it under the
+relay rule. The sweep itself, before any of its rules, puts back in flight any such
+result it meets, and leaves a voice task's result alone while the marks or the
+alias ledger cannot be read. It never relabels one or quarantines it as too old.
+
+**Reclaimed at start after a downgrade.** An older bridge parks a relay ask's
+result after its 10-minute window and moves the body to `results/undelivered/`.
+On the primary lane, where the local id is the `ask-…` broker id, it never settles
+the task, because its quarantine lookup adds `task-` to an id without it; on a
+named instance, or for a re-ask on either lane, a restart settles it (the task is
+archived, its id leaves the in-flight set and its alias is forgotten). The older
+bridge never reads or writes the mark, so the mark survives. When an updated
+bridge starts, before its first drain, for each outbox item a mark names that is
+`PARKED`, with no live result at the local id's name:
+
+1. it requeues the item with its retry state reset, under the relay rule;
+2. it puts the local id the mark names back in the in-flight set, if it left;
+3. only then does it move the newest copy in `results/undelivered/` filed under
+   that local id, or under its re-ask's id, to `results/<local id>.txt`, never
+   over a file and never under the re-ask's id, whose alias may be gone.
+
+The drain then sends the item's stored payload under the same id. That payload is
+the older bridge's: it carries no contract, so the broker treats the answer as
+private. The orphan sweep never handles it, since its id is in flight. A reclaim
+cut short is finished at the next start (the item's requeue reason records it). A
+copy set aside on purpose for a person (an unattributed worker's reply, or a
+second reply after a delivery) has no parked item and stays for the operator, as
+does an answer whose Mac is never updated again.
 
 ### Duplicates waiting for a holder's answer
 
@@ -475,7 +798,7 @@ not promise downstream Matrix delivery.
 
 A minimal relay needs only: an authenticated queue behind `GET /v1/tasks`
 (long-poll or return-immediately), an `ack` sink, a `results` sink, and a
-heartbeat sink. The four endpoints above are the entire contract — anything that
+heartbeat sink. Those four endpoints are the entire required contract — anything that
 implements them can drive Sutando.
 
 

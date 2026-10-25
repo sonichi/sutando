@@ -10,6 +10,12 @@ import tempfile
 import time
 from pathlib import Path
 
+sys.path.append(str(Path(__file__).resolve().parents[3] / "tests"))
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from ag2_sparrow import human_action as ha                     # noqa: E402
 from ag2_sparrow.event_consumer import EventConsumer, TaskifyHandler  # noqa: E402

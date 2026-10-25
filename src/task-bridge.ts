@@ -15,6 +15,7 @@ import { tmpdir } from 'node:os';
 import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
 import { renderItems } from './voice-conversation-summary.js';
+import type { WorkLane } from './work-request-check.js';
 import { resolveWorkspace } from './workspace_default.js';
 import { tryStampText } from './task_envelope.js';
 import { localTimeValue } from './local_time.js';
@@ -106,6 +107,7 @@ const _HEADER_KEYS = [
 	'schedule_name', 'schedule_slot',
 	'content_modalities', 'media_form', 'attachments', 'platform_card',
 	'instance_id', 'collaborator', 'requested_worker', 'wire_source', 'picker_command', 'picker_args', 'hitl_click', 'owner_mentioned', 'task_layout', 'local_time',
+	'lane',
 ];
 const _HEADER_RE = new RegExp(`^(?:${_HEADER_KEYS.join('|')})\\s*:`, 'i');
 const _FENCE_RE = /^={3,}/;
@@ -456,7 +458,7 @@ const DEFAULT_TASK_TIMEOUT_MS = 60 * 60 * 1000; // 1 hour default
 // from submission (user feedback P1-4: a 10-minute task timed out in the queue
 // behind other work, the agent said it "ran out of time", and the task file
 // was archived out from under the core).
-type PendingTask = { submittedAt: number; timeoutMs: number; dmOnTimeout: boolean; taskText: string; startedAt?: number };
+type PendingTask = { submittedAt: number; timeoutMs: number; dmOnTimeout: boolean; taskText: string; startedAt?: number; lane?: WorkLane };
 const _pendingTasks = new Map<string, PendingTask>();
 /** Test-only: the pending map, to seed and inspect around _sweepTimeouts. */
 export const _pendingTasksForTest = _pendingTasks;
@@ -559,14 +561,14 @@ export function voiceTaskState(taskId: string): VoiceTaskState {
 }
 
 /** Voice tasks still awaiting a result, latest first: this process's pending ones plus the table's (after a restart). */
-function _openVoiceTasks(): Array<{ id: string; text: string; submittedAt: number }> {
-	const open = new Map<string, { id: string; text: string; submittedAt: number }>();
+function _openVoiceTasks(): Array<{ id: string; text: string; submittedAt: number; lane?: WorkLane }> {
+	const open = new Map<string, { id: string; text: string; submittedAt: number; lane?: WorkLane }>();
 	for (const [id, row] of voiceTaskStore.list()) {
 		if (row.submittedAt === undefined || row.cancelRequested) continue;
 		const state = voiceTaskState(id);
-		if (state === 'queued' || state === 'started') open.set(id, { id, text: row.text ?? '', submittedAt: row.submittedAt });
+		if (state === 'queued' || state === 'started') open.set(id, { id, text: row.text ?? '', submittedAt: row.submittedAt, lane: row.lane });
 	}
-	for (const [id, p] of _pendingTasks) open.set(id, { id, text: p.taskText, submittedAt: p.submittedAt });
+	for (const [id, p] of _pendingTasks) open.set(id, { id, text: p.taskText, submittedAt: p.submittedAt, lane: p.lane });
 	return [...open.values()].filter((t) => !_cancelledVoiceTasks.has(t.id)).sort((a, b) => b.submittedAt - a.submittedAt);
 }
 
@@ -604,6 +606,14 @@ export interface VoiceTaskRow {
 	delivery?: 'spoken' | 'injected' | 'dm';
 	/** Ended with nothing to hear: nothing is pending for the user. */
 	retired?: boolean;
+}
+
+/** A finished voice task's result text, for a status answer that can say it at once; null when none is on disk. */
+export function voiceTaskResultText(taskId: string): string | null {
+	const row = voiceTaskStore.get(taskId);
+	const source = row?.answeredBy ?? taskId;
+	const text = _hasResult(source) ? _readResultText(source) : null;
+	return text ? stripVoiceControlLines(text).trim() : null;
 }
 
 /** The relay agent's view for status answers: voice tasks from the last few hours, oldest first. */
@@ -680,8 +690,11 @@ export function reconcileVoiceTasks(deliver: RelayDeliver, isInFlight: (taskId: 
 
 /** How many of the user's other voice tasks are still open ahead of `taskId`. */
 export function voiceTasksAhead(taskId: string): number {
-	const self = voiceTaskStore.get(taskId)?.submittedAt ?? Date.now();
-	return _openVoiceTasks().filter((t) => t.id !== taskId && t.submittedAt <= self).length;
+	const me = voiceTaskStore.get(taskId);
+	const self = me?.submittedAt ?? _pendingTasks.get(taskId)?.submittedAt ?? Date.now();
+	// A quick task waits only behind quick ones: the core does it at once, apart from the long work it has.
+	const quick = (me?.lane ?? _pendingTasks.get(taskId)?.lane) === 'quick';
+	return _openVoiceTasks().filter((t) => t.id !== taskId && t.submittedAt <= self && (t.lane === 'quick') === quick).length;
 }
 
 /** A task the voice agent submitted: only these may be reported as cancelled outright. */
@@ -898,7 +911,7 @@ export function _forwardOfflineThenArchive(
 
 /** Every header line of a voice task above `task:`; one writer for the work and cancel tools. An
  *  origin-bound task stays `source: voice`, takes the target as `channel_id`, and adds the adapter's keys. */
-export function buildVoiceTaskHeader(taskId: string, timestamp: string, ownerId: string, origin: VoiceSessionOrigin | null): string {
+export function buildVoiceTaskHeader(taskId: string, timestamp: string, ownerId: string, origin: VoiceSessionOrigin | null, lane?: WorkLane): string {
 	const lines = [
 		`id: ${taskId}`,
 		`timestamp: ${timestamp}`,
@@ -914,6 +927,9 @@ export function buildVoiceTaskHeader(taskId: string, timestamp: string, ownerId:
 		if (!_HEADER_KEYS.includes(key) || typeof value !== 'string') continue;
 		lines.push(`${key}: ${value.replace(/[\r\n]+/g, ' ')}`);
 	}
+	// The relay's check judged it quick (one lookup, command or short generation) or long (building, writing,
+	// research): the core does a quick one at once and gives a long one to a subagent, so neither waits on the other.
+	if (lane) lines.push(`lane: ${lane}`);
 	lines.push(`user_id: ${ownerId}`, 'access_tier: owner', 'priority: urgent');
 	return lines.join('\n') + '\n';
 }
@@ -1071,7 +1087,8 @@ export function queuedAheadInstruction(queuedAhead: number): string {
 }
 
 /** What the model is told when `work` has queued the task; the result follows when the core finishes. */
-export const WORK_PENDING_MESSAGE = 'Task has been queued and is being processed. The result will be spoken when ready. Do NOT tell the user the task is done — say you are working on it.';
+/** Said instead of the plain acknowledgement for an out-of-the-ordinary submission (a queue position). */
+export const WORK_SUBMITTED_MESSAGE = 'The task is with the core; this work call returns its result when it is done. Do NOT tell the user the task is done.';
 
 /** What a `work` call carries from the moment it was made: where it was asked, and the words around it. */
 export type WorkOrigin = { origin: VoiceSessionOrigin | null; turns: VoiceTurnsBinding; recentAtAsk: string };
@@ -1092,7 +1109,13 @@ export const workTool: ToolDefinition = {
 		'research, writing, translation, file changes, system queries, explanations, analysis. ' +
 		'This is how Sutando thinks and acts. Results are spoken back when ready.',
 	parameters: z.object({
-		task: z.string().describe('Full description of the task to perform'),
+		task: z
+			.string()
+			.describe(
+				'Full description of the task to perform. Keep dates as the user said them ("today", "yesterday", ' +
+				'"the day before yesterday", "this week"), never with a calendar date added: your date can be a day off, ' +
+				'and the core turns them into dates in the owner\'s time zone.'
+			),
 		replaces: z
 			.string()
 			.optional()
@@ -1120,9 +1143,10 @@ export const workTool: ToolDefinition = {
 				'a timeout DM that shouldn\'t have gone through.'
 			),
 	}),
-	// Runs as the relay agent subagent: the model hears the pending message now, the result when the core finishes.
+	// NON_BLOCKING with no pendingMessage: the call stays open and the result returns under its own id
+	// (WHEN_IDLE). A pendingMessage would answer the call at once and close it.
 	execution: 'background',
-	pendingMessage: WORK_PENDING_MESSAGE,
+	behavior: 'NON_BLOCKING',
 	async execute(args) {
 		const { task, timeout_minutes, dm_on_timeout } = args as {
 			task: string;
@@ -1222,7 +1246,8 @@ export const workTool: ToolDefinition = {
 		}
 		// Reserved before the first await: an identical call during the spoken-turn wait
 		// must meet this entry in the dedup check above, not write a second task file.
-		const pendingEntry = () => ({ submittedAt: Date.now(), timeoutMs, dmOnTimeout: dm_on_timeout === true, taskText: task });
+		const lane: WorkLane | undefined = (args as { lane?: unknown }).lane === 'quick' ? 'quick' : (args as { lane?: unknown }).lane === 'long' ? 'long' : undefined;
+		const pendingEntry = () => ({ submittedAt: Date.now(), timeoutMs, dmOnTimeout: dm_on_timeout === true, taskText: task, lane });
 		_pendingTasks.set(taskId, pendingEntry());
 		try {
 			const timestamp = new Date().toISOString();
@@ -1266,7 +1291,7 @@ export const workTool: ToolDefinition = {
 			const originGuidance = origin?.contextLine ? `\n${origin.contextLine.replace(/[\r\n]+/g, ' ')}` : '';
 			_rememberTaskOrigin(taskId, origin);
 			const content =
-				buildVoiceTaskHeader(taskId, timestamp, ownerId, origin) +
+				buildVoiceTaskHeader(taskId, timestamp, ownerId, origin, lane) +
 				`task: ${confineUserContent(task)}${originGuidance}${spokenBlock}${contextBlock}\n`;
 			await _delegation.submitTask(taskId, content);
 		} catch (err) {
@@ -1278,10 +1303,10 @@ export const workTool: ToolDefinition = {
 		// default was producing unwanted DMs). Caller must explicitly pass
 		// dm_on_timeout: true on critical tasks where they want the fallback.
 		_pendingTasks.set(taskId, pendingEntry());
-		voiceTaskStore.add(taskId, task);
+		voiceTaskStore.add(taskId, task, undefined, lane);
 		// Record owner activity for status-aware-pivot in proactive loop
 		writeOwnerActivity('voice', task);
-		console.log(`${ts()} [TaskBridge] Task ${taskId}: ${task.slice(0, 100)}`);
+		console.log(`${ts()} [TaskBridge] Task ${taskId}${lane ? ` (${lane})` : ''}: ${task.slice(0, 100)}`);
 		_sendTaskStatus?.(taskId, 'working', task.slice(0, 60));
 		// The user's own voice tasks still open ahead of this one, from the relay agent's table.
 		const queuedAhead = voiceTasksAhead(taskId);
@@ -1290,7 +1315,7 @@ export const workTool: ToolDefinition = {
 			taskId,
 			queuedAhead,
 			watcherOnline,
-			message: (watcherOnline ? WORK_PENDING_MESSAGE
+			message: (watcherOnline ? WORK_SUBMITTED_MESSAGE
 				: 'Task has been saved. The processing engine will pick it up on its next pass (within a few minutes). Tell the user the task is queued and will be handled shortly.')
 				+ queuedAheadInstruction(queuedAhead),
 		};
@@ -1675,11 +1700,10 @@ export function _sweepTimeouts(onResult: (msg: string) => void, now: number = Da
 			if (dmOnTimeout) {
 				try {
 					const proactiveTs = Math.floor(Date.now() / 1000);
-					const proactivePath = join(RESULT_DIR, `proactive-timeout-${taskId}-${proactiveTs}.txt`);
 					const dmBody = taskSnippet
 						? `⏱ Task '${taskSnippet}' timed out after ${minutes}m. The processing engine may need to be restarted, or the task may need a longer timeout via timeout_minutes.`
 						: `⏱ Task ${taskId} timed out after ${minutes}m.`;
-					writeFileSync(proactivePath, dmBody);
+					publishResultFile(`proactive-timeout-${taskId}-${proactiveTs}.txt`, dmBody);
 					console.log(`${ts()} [TaskBridge] Wrote DM-on-timeout proactive file for ${taskId}`);
 				} catch (e) {
 					console.error(`${ts()} [TaskBridge] Failed to emit DM-on-timeout for ${taskId}:`, e);

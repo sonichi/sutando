@@ -18,6 +18,8 @@ Checks:
   - Critical files (CLAUDE.md, build_log.md, ACTIVITY.md)
   - Memory system (MEMORY.md index, key memory files)
   - Notes directory
+  - Sustained system load against the core count, with its top CPU users
+    (src/system_load.py)
   - Extra per-host probes declared in
     <workspace>/hosts/<host-label>/health-checks-extra.json (opt-in; see
     check_user_defined). Each entry is {"name", "command"[, "timeout"]};
@@ -81,6 +83,7 @@ from cron_loop_policy import (  # noqa: E402
 from sutando_config import resolve_core_runtime, resolve_down_bridge_action  # noqa: E402
 import process_pins  # noqa: E402
 import pool_suspension  # noqa: E402
+import tmux_pane_keys  # noqa: E402
 import watcher_identity  # noqa: E402
 from cron_entry_digest import digest_map, drifted  # noqa: E402
 from cron_ownership import CORE as CRON_CORE, entry_owner  # noqa: E402
@@ -91,6 +94,8 @@ from gateway_serving import (  # noqa: E402
 )
 from task_archive import find_task_file  # noqa: E402
 from sutando_config import config_get  # noqa: E402
+import skill_roots  # noqa: E402
+import system_load  # noqa: E402
 # Workspace = runtime-state root (tasks/, results/, state/). REPO_DIR stays the
 # source-code root (src/, skills/, logs/, .env, build_log.md). Before PR #762's
 # resolver existed, every consumer hardcoded REPO_DIR / "tasks" — so when the
@@ -843,6 +848,21 @@ def check_cli_wedge() -> dict:
                           "matched_patterns", "current_patterns", "consecutive_pattern_samples",
                           "observation_runs", "median_gap_s", "work_outstanding", "work_detail")}
     return check
+
+def check_pane_key_fence(socket: "str | None" = None) -> dict:
+    # This host's socket: the freshest synced heartbeat may belong to another machine.
+    sock = Path(socket or _local_core_socket() or os.environ.get("SUTANDO_TMUX_SOCKET", "/tmp/sutando-tmux.sock"))
+    sockets = {str(sock)} | {str(lock)[:-len(".pane-keys-lock")]
+                            for lock in sock.parent.glob("*.pane-keys-lock")}
+    states = {path: tmux_pane_keys.fence_status(path) for path in sockets}
+    fenced = sorted(path for path, state in states.items() if state == "uncertain")
+    if fenced:
+        return {"name": "pane-key-fence", "status": "fail", "detail": (
+            f"automated sends blocked on {', '.join(fenced)}; stop the old server and reconcile "
+            "delivery before explicit recovery (docs/codex-core.md)")}
+    return {"name": "pane-key-fence", "status": "ok",
+            "detail": "busy" if "busy" in states.values() else "clear"}
+
 
 def check_secret_scanner_mode() -> dict:
     """Report the secret scanner's DEGRADED mode as standing status.
@@ -1986,11 +2006,16 @@ def _carrier_target_verdict(workspace: Path, rep: Path) -> str:
     # `-z` makes git read NUL-separated input, which is the only delimiter a
     # POSIX filename cannot contain.
     rels = "\0".join(str(t.relative_to(workspace)) for t in targets)
+    # stdin is a file, not `input=`: with macOS's pipe pool spent, poll() calls a full pipe writable,
+    # communicate() blocks in os.write while git blocks on stdout, and timeout= never fires.
     try:
-        proc = subprocess.run(
-            git_argv("-C", str(workspace), "check-ignore", "--no-index", "-v", "-z", "--stdin"),
-            input=rels, capture_output=True, text=True, timeout=60,
-        )
+        with tempfile.TemporaryFile() as stdin:
+            stdin.write(rels.encode("utf-8"))
+            stdin.seek(0)
+            proc = subprocess.run(
+                git_argv("-C", str(workspace), "check-ignore", "--no-index", "-v", "-z", "--stdin"),
+                stdin=stdin, capture_output=True, text=True, timeout=60,
+            )
     except (GitUnavailable, OSError, subprocess.SubprocessError):
         return "unmeasured"
     # `-v` names the RULE that decided each path, and that is the whole point:
@@ -2374,11 +2399,15 @@ def _index_growth_note(index: Path, effective_bytes: int,
             stamps.append((sha, int(at)))
         if not stamps:
             return _TREND_UNAVAILABLE
-        batch = subprocess.run(
-            git_argv("-C", str(repo), "cat-file", "--batch"),
-            input="".join(f"{sha}:./{rel}\n" for sha, _ in stamps).encode(),
-            capture_output=True, timeout=20,
-        )
+        # Defensive: this stdin (<= 12 short specs) is too small to deadlock, but it stays
+        # off `input=` like `_carrier_target_verdict`, whose larger stdin can.
+        with tempfile.TemporaryFile() as stdin:
+            stdin.write("".join(f"{sha}:./{rel}\n" for sha, _ in stamps).encode())
+            stdin.seek(0)
+            batch = subprocess.run(
+                git_argv("-C", str(repo), "cat-file", "--batch"),
+                stdin=stdin, capture_output=True, timeout=20,
+            )
         if batch.returncode != 0:
             return _TREND_UNAVAILABLE
         points: "list[tuple[int, int]]" = []
@@ -5239,26 +5268,8 @@ LAUNCH_RECORD_SKEW_SEC = 5
 
 
 def _runtime_may_skip_proxy() -> bool:
-    """True when this core's runtime is not expected to produce Anthropic quota headers.
-
-    Read from `state/core-runtime.json`. Today the **Codex launcher is its only writer**
-    (`src/agent/codex/cli/start-cli.sh` writes it unconditionally once the workspace
-    resolves), so its ABSENCE positively excludes Codex rather than merely being
-    unknown — which is why absence is treated as proxy-routed instead of silencing the
-    check everywhere. An unreadable or malformed file cannot rule Codex out, so it is
-    treated as non-proxy and stays silent: a corrupted status file must not manufacture
-    a health warning.
-
-    A marker left by a PREVIOUS core is ignored. Today only the Codex launcher writes
-    this file and nothing resets it, so after a Codex -> Claude switch a stale
-    `{"runtime": "codex"}` sits there describing a core that is no longer running
-    (#2406 documents exactly that happening live on 2026-07-30). Trusting it would
-    silence this check on a host that IS proxy-routed — the mirror of the false
-    positive this function was added to fix. So a marker whose `started_at` predates
-    the running core's own start is treated as absent, i.e. proxy-routed.
-
-    When #2406 lands a Claude-side writer, tighten this to positive identification of
-    a proxy-routed runtime instead of inferring it from absence.
+    """Interpret the last confirmed launch record, excluding observations older than the live core.
+    Missing records retain the legacy proxy expectation; malformed records fail silent.
     """
     path = status_read_path("core-runtime.json", WORKSPACE_DIR)
     try:
@@ -7803,6 +7814,60 @@ def check_disk_space() -> dict:
     return {"name": name, "status": "ok", "detail": where}
 
 
+def installed_skills_dir() -> Path:
+    """Where skills/install.sh links installed skills; the repo's own skills/ is the shipped copy."""
+    return Path(claude_home_path("skills"))
+
+
+def check_system_load(workspace: Optional[Path] = None, **probes) -> dict:
+    """Sustained load against the core count (src/system_load.py). The cause classifier is the
+    script an installed (linked) skill declares for system_load.DECLARATION, resolved here and injected."""
+    ws = WORKSPACE_DIR if workspace is None else Path(workspace)
+    found, name = _installed_reaper()
+    return system_load.check(
+        ws / "state" / system_load.STATE_NAME,
+        ratio=system_load.setting(config_get(system_load.RATIO_KEY), system_load.DEFAULT_RATIO, float),
+        passes=system_load.setting(config_get(system_load.PASSES_KEY), system_load.DEFAULT_PASSES, int),
+        classifier=found.script, unavailable=found.reason, reaper_name=name,
+        reap_on=system_load.reap_enabled(config_get(system_load.REAP_KEY)), **probes)
+
+
+def _installed_reaper():
+    """(Declaration, declaring skill's name) for system_load.DECLARATION in the installed skills dir."""
+    roots = [installed_skills_dir()]
+    found = skill_roots.declared(system_load.DECLARATION, roots=roots)
+    name = next((n for n, p in skill_roots.declared_scripts(system_load.DECLARATION, roots) if p == found.script), None)
+    return found, name
+
+
+def apply_system_load_reap(checks: list, workspace: Optional[Path] = None, stream=None, **probes) -> Optional[dict]:
+    """--fix for `system-load`: when it warns with action reap-once, run the installed orphan reaper
+    once for this episode (system_load.reap_once) and rewrite the row to say what happened."""
+    row = next((c for c in checks if c.get("name") == system_load.NAME), None)
+    if not row or row.get("status") != "warn" or row.get("action") != system_load.ACTION_REAP:
+        return None
+    out = stream or sys.stdout
+
+    def log(line: str) -> None:
+        print(line, file=out, flush=True)
+
+    if not system_load.reap_enabled(config_get(system_load.REAP_KEY)):
+        log(f"system-load: not reaped: reaping is off ({system_load.REAP_KEY}=1 enables it)")
+        return {"action": "disabled"}
+    found, _ = _installed_reaper()
+    if found.script is None:
+        reason = found.reason or "no installed skill declares an orphan reaper"
+        log(f"system-load: not reaped: {reason}")
+        system_load.annotate(row, None, unreaped=reason)
+        return {"action": "no-reaper", "reason": reason}
+    ws = WORKSPACE_DIR if workspace is None else Path(workspace)
+    state_path = ws / "state" / system_load.STATE_NAME
+    result = system_load.reap_once(state_path, found.script, log=log, **probes)
+    if result["action"] != "busy":
+        system_load.annotate(row, system_load.read_state(state_path).get("episode"))
+    return result
+
+
 @functools.lru_cache(maxsize=1)
 def _ephemeral_roots() -> tuple:
     """Temp roots whose contents do not survive a sweep or reboot, asked of the
@@ -7893,8 +7958,13 @@ def check_skill_symlinks() -> dict:
     # -- harmless that time, which is exactly why it survived unnoticed.
     shadowed: list[str] = []   # real dir where a symlink belongs -> NOT auto-fixed
     misdirected: list[tuple[str, str]] = []  # resolves, but into a temp dir
+    from skill_audience import developer_opt_in, installable  # noqa: PLC0415
+    developer = developer_opt_in()
     for skill_dir in sorted(skills_src.iterdir()):
         if not skill_dir.is_dir():
+            continue
+        # skills/install.sh does not link these here, so --fix must not either.
+        if installable(skill_dir, developer).reason is not None:
             continue
         # Mirror skills/install.sh's filter: only dirs WITH a SKILL.md are
         # slash-invocable skills the installer links. Manifest-loaded and
@@ -12907,6 +12977,7 @@ def run_all_checks() -> list[dict]:
     # Advisory CLI progress detector (pane static with work outstanding / retry
     # loop); reads the pane, never the process, and drives no recovery.
     checks.append(check_cli_wedge())
+    checks.append(check_pane_key_fence())
 
     # macOS TCC — must come before critical-file checks so if TCC is blocking
     # everything, the operator sees the root cause before the downstream failures.
@@ -13383,6 +13454,7 @@ def run_all_checks() -> list[dict]:
     checks.append(check_runtime_identity())
     checks.append(check_live_tree_drift())
     checks.append(check_disk_space())
+    checks.append(check_system_load())
 
     # Last, and only when this host declares any: a user probe must never
     # delay or displace a built-in one.
@@ -13920,7 +13992,7 @@ def notify_gateway_for_failures(
     checks: list[dict],
     state_file: Optional[Path] = None,
     sender=None,
-) -> None:
+) -> bool:
     """DM the owner on ag2.space (the gateway) when health checks fail — the
     remote-visible surface the owner actually watches, and one that does NOT
     depend on the core agent being alive (posts straight to the gateway
@@ -13932,10 +14004,12 @@ def notify_gateway_for_failures(
     Slack surfaces never suppress each other, and dedup is recorded only on a
     SUCCESSFUL send so a transient gateway blip doesn't silence the alert.
     `sender` is injected by tests to avoid real network calls.
+
+    True when this failure set is in the owner's DM (sent now, or already sent for it).
     """
     failures = _slack_failures(checks)
     if not failures:
-        return
+        return False
 
     if state_file is None:
         state_file = WORKSPACE_DIR / "state" / "health-last-gateway.json"
@@ -13948,7 +14022,7 @@ def notify_gateway_for_failures(
     history = _load_alert_history(state_file)
 
     if history.get(_LAST_HASH_KEY) == hash_key:
-        return
+        return True
 
     lines = [f"• {c['name']}: {c['status']} ({c['detail']})" for c in failures[:5]]
     extra = f"\n…(+{len(failures) - 5} more)" if len(failures) > 5 else ""
@@ -13957,7 +14031,7 @@ def notify_gateway_for_failures(
     send = sender or _default_gateway_sender
     if not send(text):
         # Send failed — don't record dedup, so the next tick retries.
-        return
+        return False
 
     history[hash_key] = now_ms
     history[_LAST_HASH_KEY] = hash_key
@@ -13967,6 +14041,7 @@ def notify_gateway_for_failures(
         state_file.write_text(json.dumps(history))
     except Exception:
         pass
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -14646,8 +14721,8 @@ def _default_cron_nudge(
             return False
         send = subprocess.run(
             # Exact name: a bare target prefix-matches the core's `-watcher` session once the core is gone.
-            [tmux_bin, "-S", sock, "send-keys", "-t", f"={session}:", "/schedule-crons", "Enter"],
-            env=env, capture_output=True, timeout=15,
+            tmux_pane_keys.argv(sock, f"={session}:", "/schedule-crons", "Enter", tmux=tmux_bin),
+            env=env, capture_output=True, timeout=tmux_pane_keys.TIMEOUT_S,
         )
         return send.returncode == 0
     except Exception:
@@ -14957,6 +15032,11 @@ def main():
         apply_skill_symlink_fixes(checks, stream=sys.stderr if as_json else sys.stdout)
         apply_task_watcher_sentinel_fix(checks, stream=sys.stderr if as_json else sys.stdout)
         apply_claude_hooks_fix(checks, stream=sys.stderr if as_json else sys.stdout)
+        apply_system_load_reap(checks, stream=sys.stderr if as_json else sys.stdout)
+
+    # Optional: the owner's ag2.space DM via the gateway, core-independent. It runs first,
+    # so --notify-on-fail falls back to macOS only for a set this DM did not deliver.
+    gateway_ok = notify_gateway_for_failures(checks) if do_notify_gateway else False
 
     # Optional: macOS notification surface for the launchd-supervised path
     # (com.sutando.health-check-fallback). Notifies on the INITIAL check set
@@ -14964,7 +15044,7 @@ def main():
     # if --fix would resolve some issues. Independent dedup state from
     # emit-task — the two surfaces are deliberately decoupled so neither
     # can suppress the other.
-    if do_notify:
+    if do_notify and not gateway_ok:  # the app already pops one for a landed gateway DM
         notify_for_failures(checks)
 
     # Optional: remote Slack DM surface. Unlike --notify-on-fail (local
@@ -14974,13 +15054,6 @@ def main():
     # the launchd-supervised fallback invocation so outages self-report.
     if do_notify_slack:
         notify_slack_for_failures(checks)
-
-    # Optional: remote ag2.space (gateway) DM surface — the channel the owner
-    # actually watches. Same core-independent guarantee as --notify-slack, via
-    # the gateway op:message endpoint. Intended for the launchd fallback so an
-    # over-quota / wedged core self-reports where the owner will see it.
-    if do_notify_gateway:
-        notify_gateway_for_failures(checks)
 
     # Optional: auto-recover a wedged core (alive-but-stuck) by restarting it.
     # Independent of the checks list — keys off the queue-drain + heartbeat

@@ -3,7 +3,7 @@
 
   getting_started.py render --name NAME|auto [--core claude|codex|unknown|auto]   -> the page's HTML
   getting_started.py plan --room ROOM                   -> {"action": "create"|"update", "kind": ...}
-  getting_started.py publish --room ROOM --name NAME|auto [--owner MXID] [--core ...] [--summon]
+  getting_started.py publish [--room ROOM] [--name NAME|auto] [--owner MXID] [--core ...] [--summon]
       [--room-commons PATH]
       -> {"ok": true, "action": "created"|"updated"|"unchanged", "kind": "html-<id>", "summoned": bool,
           "name": the name used}
@@ -25,6 +25,11 @@ whatever it finds. With no entry, a listed "Getting started" page is reused only
 carries this agent's ownership marker; more than one such page, or no agent id to check with,
 stops the run. The page holds the agent's name and fixed text only; nothing read from the
 owner's accounts goes on it.
+
+Inputs the setup app saved: <workspace>/state/onboarding/tutorial-inputs.json (`room`, `owner`,
+`agent_mxid`, `roles`) fills what the command line leaves out, so `publish` alone works in the owner's
+DM. `owner` and `roles` apply only in that file's own room; a missing, unreadable or malformed file,
+or a field of the wrong shape, is ignored. `--name` defaults to auto.
 
 Exit codes: 0 done, 2 bad arguments, 3 the room-commons skill is not installed, 4 a room-commons
 call failed or ownership was unclear (the marker keeps what is known, so the next run resumes).
@@ -70,6 +75,9 @@ CHUNK_BYTES = 120_000
 USER_AGENT = "sutando-tutorial/1"
 FALLBACK_NAME = "Sutando"
 MXID = re.compile(r"^@([^:\s]+):([A-Za-z0-9.\-]+(?::\d+)?)$")
+ROOM_ID = re.compile(r"^![A-Za-z0-9._=/+\-]+:[A-Za-z0-9.\-]+(?::\d+)?$")
+ID_MAX = 255
+ROLES_MAX = 500
 
 
 class PublishError(RuntimeError):
@@ -220,6 +228,45 @@ def load_prompts(path: Optional[Path]) -> Dict[str, str]:
         return clean_prompts(json.loads(path.read_text(encoding="utf-8")))
     except (OSError, ValueError):
         return {}
+
+
+def inputs_path(workspace: Path) -> Path:
+    return workspace / "state" / "onboarding" / "tutorial-inputs.json"
+
+
+def load_inputs(path: Path) -> Dict[str, str]:
+    """The well-formed fields of the setup app's tutorial inputs: `room`, `owner`, `agent_mxid`,
+    `roles`. {} when the file is missing or unreadable; a field of the wrong shape is left out."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    out: Dict[str, str] = {}
+    for key, shape in (("room", ROOM_ID), ("owner", MXID), ("agent_mxid", MXID)):
+        value = data.get(key)
+        if isinstance(value, str) and len(value) <= ID_MAX and shape.fullmatch(value):
+            out[key] = value
+    roles = data.get("roles")
+    if isinstance(roles, list) and all(isinstance(r, str) for r in roles):
+        roles = ", ".join(r.strip() for r in roles if r.strip())
+    if isinstance(roles, str) and roles.strip() and len(roles) <= ROLES_MAX and "\n" not in roles:
+        out["roles"] = roles.strip()
+    return out
+
+
+def with_inputs(args: argparse.Namespace, inputs: Mapping[str, str]) -> argparse.Namespace:
+    """`args` with what the command line left out taken from `inputs`. The owner and roles belong
+    to the inputs' own room, so they apply only when publishing there."""
+    room = args.room or inputs.get("room")
+    same_room = bool(room) and room == inputs.get("room")
+    return argparse.Namespace(**{
+        **vars(args), "room": room,
+        "owner": args.owner or (inputs.get("owner") if same_room else None),
+        "roles": args.roles or (inputs.get("roles", "") if same_room else ""),
+        "agent_mxid": args.agent_mxid or inputs.get("agent_mxid"),
+    })
 
 
 def content_hash(text: str) -> str:
@@ -486,9 +533,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     p = sub.add_parser("plan", help="what publish would do in this room, from the marker alone")
     p.add_argument("--room", required=True)
     u = sub.add_parser("publish", help="create the page in this room, or refresh the one already there")
-    u.add_argument("--room", required=True, help="the owner's DM room id")
-    u.add_argument("--name", required=True,
-                   help="the agent's own name; auto: its Matrix profile name, else its mxid's localpart")
+    u.add_argument("--room", help="the owner's DM room id (default: the setup app's saved inputs)")
+    u.add_argument("--name", default="auto",
+                   help="the agent's own name; auto (default): its Matrix profile name, else its mxid's "
+                        "localpart")
     u.add_argument("--agent-mxid", help="with --name auto: this agent's mxid")
     u.add_argument("--owner", help="the owner's mxid; summoned to the page when it is created")
     u.add_argument("--core", choices=CORES + ("auto",), default="auto",
@@ -501,6 +549,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     u.add_argument("--room-commons", type=Path, default=None,
                    help="path to room_commons.py (default: beside this skill, else the installed skill)")
     args = ap.parse_args(argv)
+    if args.command == "publish":
+        args = with_inputs(args, load_inputs(inputs_path(_workspace())))
+        if not args.room:
+            print("getting_started: no --room, and no saved tutorial inputs name one", file=sys.stderr)
+            return 2
 
     try:
         if args.command == "plan":

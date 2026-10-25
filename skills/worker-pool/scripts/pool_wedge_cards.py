@@ -36,6 +36,7 @@ def _sibling(name):
 sup = _sibling("pool_supervise")
 ps, cw = sup.ps, sup.cw
 import quota_availability as qa  # noqa: E402  (src/ is on the path via pool_delivery)
+import tmux_pane_keys  # noqa: E402
 
 SOURCE = "pool-wedge"
 ESCAPE_ACTION = "send_escape"
@@ -97,6 +98,29 @@ def proxy_routed(socket, session) -> bool | None:
     return qa.points_at_credential_proxy(env.base_url) if env.observed else None
 
 
+def at_limit(text, pane, runtime, *, workspace=None, socket=None, session=None) -> bool:
+    """The pane waits on a usage limit (banner, limit menu), not on some other gate."""
+    if pane == ps.PANE_LIMIT:
+        return True
+    adapter = sup.pane_gate.ADAPTERS.get(runtime, sup.pane_gate.CLAUDE)
+    verdict = sup.pane_gate.classify_pane(text, adapter, workspace, socket, session)
+    return verdict.state == "busy" and sup.pane_gate.is_usage_limit(verdict.reason, text)
+
+
+def limit_holds(workspace, req, worker_id, runner=None, owes_work=None) -> bool:
+    """The seat monitor's episode-end rule, read off this worker's pane now. `owes_work`:
+    the observed queue; the pool keeps no banner baseline, so each read is a first sight."""
+    from hitl import tui_gate
+    if not tui_gate.limit_card(req):
+        return False  # skip the pane read; the rule itself is limit_card_holds
+    socket, session = sup._open_tmux(workspace, worker_id)
+    text = capture(socket, session, runner or subprocess.run) if socket else None
+    outrun = False
+    if text is not None:
+        outrun, _ = sup.pane_gate.limit_step(text, None, workspace, socket, session, owes_work=owes_work)
+    return tui_gate.limit_card_holds(req, text, worker_runtime(workspace, worker_id), outrun)
+
+
 def _jump(session):
     from hitl.schema import Action
     return Action(id="open_terminal", kind="open_terminal", label=f"Open terminal ({session})")
@@ -126,6 +150,18 @@ def raise_card(workspace, worker_id, which, *, runner=subprocess.run, routed=pro
     if which == ps.CARD_HUMAN:
         if pane not in (ps.PANE_GATE, ps.PANE_LIMIT):
             return {"worker_id": worker_id, "outcome": "cleared", "pane": pane}
+    if which == ps.CARD_HUMAN and at_limit(text, pane, runtime, workspace=workspace,
+                                           socket=socket, session=session):
+        from hitl import tui_gate
+        # The seat monitor's card for this limit shares the guard, so one card serves both.
+        subject.update(episode=tui_gate.LIMIT_EPISODE, remind=False)
+        req = HumanRequirement(
+            kind="core-blocked", runtime=runtime, device=device, subject=subject,
+            title=f"{seat} · usage limit",
+            message=(f"{seat} (tmux session {session}) owes work and has hit its usage limit. "
+                     + tui_gate.limit_unblock(session, runtime)),
+            guard=tui_gate.limit_guard(session), actions=[_jump(session)])
+    elif which == ps.CARD_HUMAN:
         req = HumanRequirement(
             kind="core-blocked", runtime=runtime, device=device, subject=subject,
             title=f"{seat} · needs your decision",
@@ -212,8 +248,8 @@ def drive_escapes(workspace, *, runner=subprocess.run, manager=None) -> dict:
             out[r.id] = "refused"
             continue
         try:
-            sent = runner(["tmux", "-S", str(socket), "send-keys", "-t", f"={session}:0", "Escape"],
-                          capture_output=True, text=True, timeout=8).returncode == 0
+            sent = runner(tmux_pane_keys.argv(socket, f"={session}:0", "Escape"),
+                          capture_output=True, text=True, timeout=tmux_pane_keys.TIMEOUT_S).returncode == 0
         except (OSError, subprocess.TimeoutExpired):
             sent = False
         _note(manager, r.id, escape_sent=sent)
@@ -222,11 +258,13 @@ def drive_escapes(workspace, *, runner=subprocess.run, manager=None) -> dict:
     return out
 
 
-def resolve_cleared(workspace, worker_ids, *, manager=None, wedges=None, observations=None, recovered=None) -> list:
+def resolve_cleared(workspace, worker_ids, *, manager=None, wedges=None, observations=None, recovered=None,
+                    runner=None) -> list:
     """Close the pending cards of seats that are no longer wedged, and of seats still
     wedged whose card is not the one their pane asks for now (`wedges`: worker ->
     that card). Pressed proxy cause cards require positive recovery evidence
-    (`recovered`, defaulting to `worker_ids`); Escape stays with `drive_escapes`."""
+    (`recovered`, defaulting to `worker_ids`); Escape stays with `drive_escapes`.
+    A usage-limit card stays while `limit_holds`: an unwedged seat may still be limited."""
     from hitl.schema import STATUS_IN_PROGRESS
     manager = manager or manager_for(workspace)
     wedges = wedges or {}
@@ -251,7 +289,9 @@ def resolve_cleared(workspace, worker_ids, *, manager=None, wedges=None, observa
                          and subj.get("wedge") == ps.CARD_CAUSE
                          and r.chosen_action == PROXY_ACTION)
         if (subj.get("source") == SOURCE and stale
-                and (r.status != STATUS_IN_PROGRESS or cleared_proxy)):
+                and (r.status != STATUS_IN_PROGRESS or cleared_proxy)
+                and not limit_holds(workspace, r, w, runner,
+                                    ((observations or {}).get(w) or {}).get("work_outstanding"))):
             manager.resolve(r.id)
             closed.append(r.id)
     return closed

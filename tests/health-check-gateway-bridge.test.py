@@ -28,6 +28,11 @@ import tempfile
 import unittest.mock
 from pathlib import Path
 
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 REPO = Path(__file__).resolve().parent.parent
 
 spec = importlib.util.spec_from_file_location("health_check", REPO / "src" / "health-check.py")

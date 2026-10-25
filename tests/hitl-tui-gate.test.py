@@ -81,7 +81,7 @@ class TestRequirement(unittest.TestCase):
         for gate, state in (("login", "blocked-human"), (None, "logged-out")):
             r = req(gate, LOGIN if gate else None, state=state)
             self.assertEqual(r.kind, "auth")
-            self.assertEqual(r.title, "Claude needs to be reconnected")
+            self.assertEqual(r.title, "Claude needs you to sign in again")
             self.assertEqual([a.kind for a in r.actions], ["authenticate", "open_terminal"])
             self.assertIsNone(G.keys_for(clicked(r, "authenticate"), LOGIN if gate else None, state))
 

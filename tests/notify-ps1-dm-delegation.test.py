@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
 """Execute Windows notification delegation with all external effects stubbed."""
+
+from _helpers.hermetic_env import isolate_os_environ, isolated_child_env
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import os
 from pathlib import Path
 import shutil
@@ -54,7 +60,7 @@ function Add-Type {
 & (Join-Path $env:TEST_REPO 'src/notify.ps1') -Message $env:TEST_MESSAGE
 ''')
             message = '--help "quotes" $vars `literal` 雪\nsecond line\r\n'
-            env = dict(os.environ, TEST_REPO=str(repo), TEST_PYTHON=sys.executable,
+            env = isolated_child_env(TEST_REPO=str(repo), TEST_PYTHON=sys.executable,
                        TEST_INTERPRETER=interpreter, TEST_MESSAGE=message, HOME=str(repo), USERPROFILE=str(repo))
             result = subprocess.run([PWSH, "-NoProfile", "-File", str(wrapper)],
                                     env=env, capture_output=True, text=True, timeout=30)

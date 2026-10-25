@@ -17,6 +17,7 @@ export type FailureCategory =
 	| 'quota_exceeded'      // Free-tier RPM/RPD cap with no billing on the project
 	| 'credits_depleted'    // Paid-tier prepayment balance hit zero
 	| 'auth_invalid'        // Key revoked, expired, or malformed
+	| 'token_expired'       // Ephemeral token (auth_tokens/…) expired, used up, or past its session-start window
 	| 'model_not_found'     // Configured model name no longer valid
 	| 'rate_limit'          // Transient 429 — bodhi will retry, no user action
 	| 'transient'           // Normal close (1000) or other expected closures
@@ -58,6 +59,15 @@ const PATTERNS: Array<{
 		retryable: false,
 		userMessage: 'Voice is offline — Gemini API key is invalid or revoked. Update GEMINI_API_KEY in .env.',
 		userActionUrl: 'https://aistudio.google.com/apikey',
+	},
+	{
+		// Dead ephemeral-token close reasons (1011): expired, uses spent, past the start window.
+		// Every redial presents the same token, so only a newly issued token helps.
+		rx: /\btoken has expired\b|\btoken has been used too many times\b|\bnew_session_expire_time deadline exceeded\b/i,
+		category: 'token_expired',
+		retryable: false,
+		userMessage: 'Voice is offline — its Gemini ephemeral token has expired or been used up. Voice needs a newly issued token.',
+		userActionUrl: 'https://ai.google.dev/gemini-api/docs/ephemeral-tokens',
 	},
 	{
 		// Real Gemini API errors put the full model path between "model" and
@@ -161,6 +171,9 @@ export interface ProtocolFailure {
  */
 const PROTOCOL_MAP: Partial<Record<FailureCategory, { reason: string; category: ProtocolFailureCategory }>> = {
 	auth_invalid: { reason: 'auth-invalid', category: 'auth' },
+	// Additive reason code: consumers key on `category`, and a host that issues tokens keys on this
+	// reason to issue a new one instead of asking for a different key.
+	token_expired: { reason: 'credential-expired', category: 'auth' },
 	quota_exceeded: { reason: 'quota-exceeded', category: 'quota' },
 	credits_depleted: { reason: 'credits-depleted', category: 'quota' },
 	model_not_found: { reason: 'model-not-found', category: 'other' },

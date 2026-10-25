@@ -13,6 +13,7 @@ unset _self_dir
 cd "$REPO"
 # Shared with the claude launcher: one owner for the in-session restart policy.
 . "$REPO/src/agent/restart-guard.sh"
+. "$REPO/src/agent/core-runtime-record.sh"
 
 # This entry point only launches the canonical core. A Codex pool worker uses
 # the pool's runtime launcher instead.
@@ -238,6 +239,8 @@ WORKING_DIR="$(cd "$WORKING_DIR" && pwd -P)"
 CORE_ENV_ARGS=(-e SUTANDO_CORE_SESSION=1 -e SUTANDO_CORE_RUNTIME=codex)
 [ -n "${SUTANDO_DEFAULT_WORKSPACE:-}" ] && CORE_ENV_ARGS+=(-e "SUTANDO_DEFAULT_WORKSPACE=$SUTANDO_DEFAULT_WORKSPACE")
 [ -n "${CODEX_HOME:-}" ] && CORE_ENV_ARGS+=(-e "CODEX_HOME=$CODEX_HOME")
+# Skills read channel state (ag2space access.json) under it; tmux's server env can predate it.
+[ -n "${CLAUDE_CONFIG_DIR:-}" ] && CORE_ENV_ARGS+=(-e "CLAUDE_CONFIG_DIR=$CLAUDE_CONFIG_DIR")
 # tmux's server environment can predate the product-mode override, so forward
 # the self-development policy explicitly into the persistent core session.
 if [ "${SUTANDO_SELF_DEVELOPMENT_ENABLED+x}" = x ]; then
@@ -261,6 +264,20 @@ CODEX_ARGS=(
 if [ -n "${SUTANDO_CORE_MODEL:-}" ]; then
   CODEX_ARGS+=(-m "$SUTANDO_CORE_MODEL")
 fi
+
+# A git checkout's first Codex launch stops on "Trust this folder?", which a headless core
+# never answers; see src/codex_project_trust.py. Best effort: a failure leaves the prompt.
+ensure_codex_project_trust() {
+  local py out
+  py="$(heartbeat_python)"
+  [ -n "$py" ] || return 0
+  if out="$("$py" "$REPO/src/codex_project_trust.py" "${CODEX_HOME:-$HOME/.codex}" "$WORKING_DIR" "$REPO")"; then
+    [ "$out" = trusted ] && echo "  ✓ Codex project trust recorded for $WORKING_DIR"
+  else
+    echo "  ⚠ could not record Codex project trust; the core may wait on a trust prompt" >&2
+  fi
+  return 0
+}
 
 apply_tmux_defaults() {
   tmux_available || return 0
@@ -500,6 +517,7 @@ elif session_exists "$SESSION" && [ "$(session_runtime)" != "codex" ]; then
 fi
 
 if session_exists "$SESSION"; then
+  record_confirmed_core_runtime codex "$(heartbeat_python)"
   apply_tmux_defaults
   ensure_task_notifier
   ensure_codex_observer
@@ -571,6 +589,7 @@ if ! tmux_available; then
     echo "  ⚠ codex not found — not clearing the shutdown sentinel, no core can start." >&2
     exit 127
   fi
+  ensure_codex_project_trust
   stash_shutdown_sentinel
   clear_shutdown_sentinel
   # errexit would exit on the failed exec before the restore below is reached;
@@ -590,26 +609,32 @@ if ! command -v fswatch >/dev/null 2>&1; then
 fi
 
 apply_tmux_defaults
-if ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" && [ -n "$ws" ]; then
+# Appended only once the new session is confirmed, so a failed launch logs no start.
+log_session_start() {
+  local ws
+  ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" && [ -n "$ws" ] || return 0
   mkdir -p "$ws/state"
-  printf '{"runtime":"codex","session":"%s","started_at":%s}\n' "$SESSION" "$(date +%s)" > "$ws/state/core-runtime.json"
   printf '{"host":"%s","session_started_at":%s,"iso":"%s","source":"start-cli","runtime":"codex"}\n' \
     "$(hostname | sed 's/\..*//')" "$(date +%s)" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     >> "$ws/state/session-starts.log"
-fi
+}
 
 # Creates the core session, waits for has-session within the configured budget
 # (new-session rc=0 only means tmux accepted it), then starts the helpers.
 start_core_session_and_helpers() {
+  ensure_codex_project_trust
   tmux -S "$TMUX_SOCKET" new-session -d -s "$SESSION" "${CORE_ENV_ARGS[@]}" codex "${CODEX_ARGS[@]}"
   for _ in $(seq 1 "$SESSION_UP_TRIES"); do
     session_exists "$SESSION" && break
     sleep 0.2
   done
   if session_exists "$SESSION"; then
+    log_session_start
+    record_confirmed_core_runtime codex "$(heartbeat_python)"
     clear_shutdown_sentinel
   else
     echo "  ⚠ $SESSION did not come up within ~${SESSION_UP_LABEL} — sentinel NOT cleared, no core is serving." >&2
+    return 1
   fi
   ensure_task_notifier
   ensure_codex_observer

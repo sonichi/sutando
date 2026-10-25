@@ -24,6 +24,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
 from task_archive import find_task_file  # noqa: E402
+from result_publish import publish_text  # noqa: E402
 from cron_loop_policy import is_core_main_loop, main_loop_problem  # noqa: E402
 from loop_completion import write_completion  # noqa: E402
 from local_task_protocol import serialize_task_last  # noqa: E402
@@ -163,7 +164,11 @@ def cron_matches(expression: str, local_dt: datetime) -> bool:
 
 
 def load_jobs(config_path: Path, *, include_main_loop: bool = False) -> list[dict[str, Any]]:
-    raw = json.loads(config_path.read_text())
+    try:
+        text = config_path.read_text()
+    except FileNotFoundError:
+        return []  # A fresh install has no crons.json yet: nothing is configured.
+    raw = json.loads(text)
     if not isinstance(raw, list):
         raise ValueError("crons.json must contain a JSON array")
     jobs: list[dict[str, Any]] = []
@@ -310,7 +315,7 @@ def _task_is_active(workspace: Path, task_ids: list[str]) -> bool:
 def _alert(workspace: Path, job_name: str, message: str, now: datetime) -> Path:
     stamp = int(now.timestamp())
     path = workspace / "results" / f"proactive-schedule-alert-{safe_name(job_name)}-{stamp}.txt"
-    atomic_text(path, f"Schedule alert — {job_name}: {message}\n")
+    publish_text(path, f"Schedule alert — {job_name}: {message}\n")
     return path
 
 
@@ -506,7 +511,7 @@ def install(
     *,
     write_only: bool = False,
     include_main_loop: bool | None = None,
-) -> Path:
+) -> Path | None:
     config_path = workspace / "hosts" / host_label / "crons.json"
     jobs = load_jobs(
         config_path,
@@ -515,7 +520,8 @@ def install(
         ),
     )
     if not jobs:
-        raise ValueError("no crons.json entries opt in with execution=codex-task")
+        # The launcher reconciles on every start; an empty schedule is valid, not a failure.
+        return None
     logs = workspace / "logs"
     logs.mkdir(parents=True, exist_ok=True)
     plist_path = Path.home() / "Library" / "LaunchAgents" / f"{LABEL}.plist"
@@ -597,7 +603,8 @@ def main() -> int:
             print(json.dumps(report, indent=2, sort_keys=True))
             return code
         else:
-            print(install(workspace, host_label, repo, write_only=args.write_only))
+            path = install(workspace, host_label, repo, write_only=args.write_only)
+            print(path or "codex-scheduler: no crons.json entries opt in with execution=codex-task; nothing to install")
     except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError) as exc:
         print(f"codex-scheduler: {exc}", file=sys.stderr)
         return 1

@@ -3,6 +3,11 @@
 and the room-commons calls publish makes, against a stub room_commons.py that keeps a fake room."""
 from __future__ import annotations
 
+from _helpers.hermetic_env import isolate_os_environ, isolated_child_env
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import contextlib
 import hashlib
 import io
@@ -442,7 +447,7 @@ def _jsdom_node():
     if not node:
         return None
     probe = subprocess.run([node, "-e", "require('jsdom')"], capture_output=True, text=True)
-    return (node, dict(os.environ)) if probe.returncode == 0 else None
+    return (node, isolated_child_env()) if probe.returncode == 0 else None
 
 
 class PageBehaviourTest(unittest.TestCase):
@@ -766,7 +771,7 @@ class MainTest(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self.stub = self.tmp / "room_commons.py"
         self.stub.write_text(STUB)
-        env = {k: v for k, v in os.environ.items()
+        env = {k: v for k, v in isolated_child_env().items()
                if not k.startswith(("SUTANDO_", "AG2", "REMOTE_TASK", "AGENT_", "ROOM_C", "MATRIX_"))
                and k not in ("CLAUDE_CONFIG_DIR", "CLAUDE_HOME")}
         env.update({"CLAUDE_CONFIG_DIR": str(self.tmp / "claude"), "STUB_STATE": str(self.tmp / "room.json"),
@@ -855,6 +860,74 @@ class MainTest(unittest.TestCase):
                                  "--room-commons", str(self.stub))
         self.assertEqual(code, 4)
         self.assertIn("pages failed", json.loads(out)["reason"])
+
+
+    # The setup app's saved inputs: <workspace>/state/onboarding/tutorial-inputs.json.
+    def save_inputs(self, data):
+        path = gs.inputs_path(self.tmp / "ws")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(data if isinstance(data, str) else json.dumps(data))
+
+    def room_state(self):
+        return json.loads((self.tmp / "room.json").read_text())
+
+    def test_publish_alone_takes_room_owner_and_roles_from_the_inputs_file(self):
+        self.save_inputs({"room": self.ROOM, "owner": "@owner:example.test",
+                          "agent_mxid": "@kai.agent:example.test", "roles": "I picked: Founder, Sales."})
+        with mock.patch.object(gs, "detect_core", return_value="codex"), \
+                mock.patch.object(gs, "_https_get", side_effect=OSError("offline")):
+            code, out, _ = self.main("publish", "--room-commons", str(self.stub))
+        self.assertEqual(code, 0)
+        result = json.loads(out)
+        self.assertEqual((result["action"], result["summoned"], result["name"]), ("created", True, "Kai"))
+        self.assertIn(["summon", result["kind"], "@owner:example.test"], self.room_state()["calls"])
+        self.assertIn("Picked for: Founder, Sales", self.room_state()["pages"][result["kind"]])
+
+    def test_command_line_overrides_the_inputs_file(self):
+        self.save_inputs({"room": self.ROOM, "owner": "@owner:example.test", "roles": "Founder"})
+        code, out, _ = self.main("publish", "--name", "Blue", "--core", "codex", "--owner", "@other:example.test",
+                                 "--roles", "Sales", "--room-commons", str(self.stub),
+                                 "--agent-mxid", "@kai.agent:example.test")
+        self.assertEqual(code, 0)
+        page = self.room_state()["pages"][json.loads(out)["kind"]]
+        self.assertIn("Picked for: Sales", page)
+        self.assertNotIn("Founder", page.split("Picked for:", 1)[1][:80])
+
+    def test_owner_and_roles_stay_in_the_inputs_room(self):
+        self.save_inputs({"room": self.ROOM, "owner": "@owner:example.test", "roles": "Founder"})
+        code, out, _ = self.main("publish", "--room", "!elsewhere:example.test", "--name", "Blue",
+                                 "--core", "codex", "--room-commons", str(self.stub),
+                                 "--agent-mxid", "@kai.agent:example.test")
+        self.assertEqual(code, 0)
+        result = json.loads(out)
+        self.assertFalse(result["summoned"])
+        self.assertNotIn("Picked for:", self.room_state()["pages"][result["kind"]])
+
+    def test_no_room_anywhere_exits_2(self):
+        for data in (None, "{not json", "[]", {"room": "dm"}, {"room": "!x:example.test\n"}):
+            if data is not None:
+                self.save_inputs(data)
+            code, out, err = self.main("publish", "--room-commons", str(self.stub))
+            self.assertEqual((code, out), (2, ""), data)
+            self.assertIn("no --room", err)
+
+    def test_garbled_inputs_keep_the_flag_only_behaviour(self):
+        self.save_inputs("{garbled")
+        code, out, _ = self.main("publish", "--room", self.ROOM, "--name", "Blue", "--core", "codex",
+                                 "--room-commons", str(self.stub), "--agent-mxid", "@kai.agent:example.test")
+        self.assertEqual((code, json.loads(out)["action"], json.loads(out)["summoned"]), (0, "created", False))
+
+    def test_load_inputs_keeps_only_well_formed_fields(self):
+        path = self.tmp / "inputs.json"
+        path.write_text(json.dumps({"room": self.ROOM, "owner": "owner@example.test",
+                                    "agent_mxid": "@kai.agent:example.test", "roles": ["Founder", " Sales "],
+                                    "extra": "ignored"}))
+        self.assertEqual(gs.load_inputs(path), {"room": self.ROOM, "agent_mxid": "@kai.agent:example.test",
+                                                "roles": "Founder, Sales"})
+        path.write_text(json.dumps({"room": 7, "owner": "@o:example.test\n", "roles": "a\nb",
+                                    "agent_mxid": "@" + "a" * 300 + ":example.test"}))
+        self.assertEqual(gs.load_inputs(path), {})
+        self.assertEqual(gs.load_inputs(self.tmp / "absent.json"), {})
 
 
 class PersonalTest(unittest.TestCase):
@@ -1300,7 +1373,7 @@ class CliTest(unittest.TestCase):
             self.assertEqual(done.stdout, gs.render_page("Sutando", core))
 
     def test_detect_core_reads_the_engine_resolver(self):
-        env = dict(os.environ, SUTANDO_CORE_RUNTIME="codex")
+        env = isolated_child_env(SUTANDO_CORE_RUNTIME="codex")
         done = subprocess.run([sys.executable, "-c",
                                "import importlib.util as u;s=u.spec_from_file_location('g',%r);"
                                "m=u.module_from_spec(s);s.loader.exec_module(m);print(m.detect_core())"

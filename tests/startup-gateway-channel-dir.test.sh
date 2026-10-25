@@ -1,41 +1,74 @@
 #!/usr/bin/env bash
-# Wiring test for the REAL launcher (#2701 review P1, bassil): the named
-# secondary-gateway loop (start_gateway_lanes() in src/startup-runtime.sh,
-# called from both startup.sh and scripts/restart-gateway-lanes.sh) must
-# thread REMOTE_TASK_CHANNEL_DIR per instance, or a dev bridge inherits
-# prod's channels/ag2space/ config.
-# Runs the actual loop body with a stub python that records its environment.
+# Wiring test for the REAL launcher: the named-gateway block of start_gateway_lanes()
+# (src/startup-runtime.sh, called from startup.sh and scripts/restart-gateway-lanes.sh)
+# must hand each bridge instance its own REMOTE_TASK_CHANNEL_DIR, its own token file,
+# an empty REMOTE_TASK_URL and no REMOTE_PROACTIVE_ROOM, or a dev bridge inherits
+# prod's channels/ag2space/ config. Runs the extracted block with the real python3 and
+# the real scripts/connections.py against a stub bridge that records its environment;
+# the Keychain is a stub on PATH and the workspace a temp dir.
 set -euo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+PY="$(command -v python3)"
 
-# Stub interpreter: dump the env we care about, exit (no real bridge).
-cat > "$TMP/py-stub" <<'STUB'
-#!/usr/bin/env bash
-env | grep -E '^(REMOTE_TASK_CHANNEL_DIR|REMOTE_TASK_TOKEN_FILE|REMOTE_TASK_URL|GATEWAY_INSTANCE|REMOTE_TASK_TOKEN)=' \
-  >> "$ENV_DUMP"
+# A stand-in repo: the real CLI (its sys.path resolves through the symlink) beside a
+# stub bridge that dumps the env it was launched with. `--repo` names this directory.
+FAKE="$TMP/repo"; mkdir -p "$FAKE/scripts" "$FAKE/src" "$TMP/ws" "$TMP/cc" "$TMP/bin" "$TMP/keychain"
+ln -s "$REPO/scripts/connections.py" "$FAKE/scripts/connections.py"
+cat > "$FAKE/src/remote-gateway-bridge.py" <<'STUB'
+import os
+with open(os.environ["ENV_DUMP"], "a") as f:
+    for k in ("REMOTE_TASK_CHANNEL_DIR", "REMOTE_TASK_TOKEN_FILE", "REMOTE_TASK_URL", "GATEWAY_INSTANCE",
+              "REMOTE_TASK_TOKEN", "REMOTE_PROACTIVE_ROOM"):
+        f.write(f"{k}={os.environ.get(k, '<unset>')}\n")
 STUB
-chmod +x "$TMP/py-stub"
+# Stub Keychain so import-env's vault copy never reaches the host's.
+cat > "$TMP/bin/security" <<'SEC'
+#!/usr/bin/env bash
+verb="$1"; shift; key=""; value=""
+while [ $# -gt 0 ]; do case "$1" in -s) key="$2"; shift 2;; -w) [ "$verb" = add-generic-password ] && { value="$2"; shift 2; } || shift;; *) shift;; esac; done
+case "$verb" in
+  add-generic-password) printf '%s' "$value" > "$FAKE_KEYCHAIN/$key";;
+  find-generic-password) [ -f "$FAKE_KEYCHAIN/$key" ] && cat "$FAKE_KEYCHAIN/$key" || exit 44;;
+  delete-generic-password) rm -f "$FAKE_KEYCHAIN/$key";;
+esac
+SEC
+chmod +x "$TMP/bin/security"
 
-# Extract the named-gateway loop from the real start_gateway_lanes() (single
-# source: the test fails if the loop moves or the marker comment is renamed).
-LOOP="$(awk '/# Named secondary gateways \(multi-gateway\)/,/^    done$/' "$REPO/src/startup-runtime.sh")"
-[ -n "$LOOP" ] || { echo "FAIL: named-gateway loop not found in startup-runtime.sh"; exit 1; }
+# Extract the named-gateway block from the real start_gateway_lanes() (single source:
+# the test fails if the block moves or the marker comment is renamed).
+LOOP="$(awk '/# Named gateways \(multi-gateway\)/,/^    fi$/' "$REPO/src/startup-runtime.sh")"
+[ -n "$LOOP" ] || { echo "FAIL: named-gateway block not found in startup-runtime.sh"; exit 1; }
 
-run_loop() {  # $1 = extra env assignments (string), evaluated before the loop
-  ENV_DUMP="$TMP/env-dump"; : > "$ENV_DUMP"; export ENV_DUMP
-  ( eval "$1"
-    PY="$TMP/py-stub"; REPO="$REPO"; LOGS_DIR="$TMP"
-    eval "$LOOP"
-    wait ) >/dev/null 2>&1
+run_loop() {  # $1 = extra env assignments (string), evaluated before the block
+  ENV_DUMP="$TMP/env-dump"; : > "$ENV_DUMP"; rm -rf "$TMP/ws"; mkdir -p "$TMP/ws" "$TMP/logs"
+  # The host's own gateway credentials must not shape the test; a parent proactive room
+  # is always present, so a secondary that inherits it is caught in every case.
+  ( unset REMOTE_TASK_TOKEN AG2_REMOTE_TOKEN REMOTE_TASK_URL REMOTE_TASK_TOKEN_FILE
+    for _v in $(env | grep -o '^AG2_REMOTE_TOKEN_[A-Za-z0-9_]*' || true); do unset "$_v"; done
+    export REMOTE_PROACTIVE_ROOM='!parent:example'
+    eval "$1"
+    export ENV_DUMP PATH="$TMP/bin:$PATH" FAKE_KEYCHAIN="$TMP/keychain" SUTANDO_TEST_MODE=1 \
+      SUTANDO_WORKSPACE="$TMP/ws" CLAUDE_CONFIG_DIR="$TMP/cc" SUTANDO_SUPPRESS_CCD_FALLBACK_BANNER=1
+    PY="$PY"; REPO="$FAKE"; LOGS_DIR="$TMP/logs"
+    eval "$LOOP" ) > "$TMP/loop-out" 2>&1
+  # The bridge is launched detached; give the stub a moment to write.
+  for _ in $(seq 1 50); do grep -q '^GATEWAY_INSTANCE=' "$ENV_DUMP" 2>/dev/null && break; sleep 0.1; done
   cat "$ENV_DUMP"
 }
 
 # Case 1: default convention — instance "dev" gets channels/dev-ag2space/.
 OUT="$(run_loop 'export AG2_REMOTE_TOKEN_DEV=tok-dev')"
 echo "$OUT" | grep -q '^REMOTE_TASK_CHANNEL_DIR=dev-ag2space$' \
-  || { echo "FAIL: dev instance did not get REMOTE_TASK_CHANNEL_DIR=dev-ag2space"; echo "$OUT"; exit 1; }
+  || { echo "FAIL: dev instance did not get REMOTE_TASK_CHANNEL_DIR=dev-ag2space"; echo "$OUT"; cat "$TMP/loop-out"; exit 1; }
+echo "$OUT" | grep -q '^GATEWAY_INSTANCE=dev$' \
+  || { echo "FAIL: dev instance did not get GATEWAY_INSTANCE=dev"; echo "$OUT"; exit 1; }
 echo "  ok  dev instance defaults to dev-ag2space"
+echo "$OUT" | grep -q '^REMOTE_PROACTIVE_ROOM=$' \
+  || { echo "FAIL: dev instance inherited the parent's proactive room"; echo "$OUT"; exit 1; }
+echo "  ok  a named instance never inherits the parent's proactive room"
+grep -q 'tok-dev' "$TMP/loop-out" && { echo "FAIL: the token reached the launcher's output"; exit 1; }
+echo "  ok  the token never reaches the launcher's output"
 
 # Case 2: operator override wins.
 OUT="$(run_loop 'export AG2_REMOTE_TOKEN_DEV=tok-dev REMOTE_TASK_CHANNEL_DIR_DEV=dev.ag2.space')"
@@ -48,12 +81,25 @@ echo "$OUT" | grep -q '^REMOTE_TASK_CHANNEL_DIR=ag2space$' \
   && { echo "FAIL: instance leaked prod channel dir"; exit 1; }
 echo "  ok  prod channel dir never inherited"
 
-# Case 4: named gateways must not inherit the primary gateway URL or token file.
+# Case 4: named gateways must not inherit the primary gateway URL, token file or proactive room.
 : > "$TMP/dev.env"
-OUT="$(run_loop 'export AG2_REMOTE_TOKEN_DEV=https://dev.example/relay\|tok-dev REMOTE_TASK_URL=https://prod.example/relay REMOTE_TASK_TOKEN_FILE=/tmp/prod.env REMOTE_TASK_TOKEN_FILE_DEV="$TMP/dev.env"')"
+OUT="$(run_loop 'export AG2_REMOTE_TOKEN_DEV=https://dev.example/relay\|tok-dev REMOTE_TASK_URL=https://prod.example/relay REMOTE_TASK_TOKEN_FILE=/tmp/prod.env REMOTE_TASK_TOKEN_FILE_DEV="$TMP/dev.env" REMOTE_PROACTIVE_ROOM="!owner:prod.example"')"
 echo "$OUT" | grep -q '^REMOTE_TASK_URL=$' \
   || { echo "FAIL: dev instance inherited primary REMOTE_TASK_URL"; echo "$OUT"; exit 1; }
 echo "$OUT" | grep -q "^REMOTE_TASK_TOKEN_FILE=$TMP/dev.env$" \
   || { echo "FAIL: dev instance did not get its own token file"; echo "$OUT"; exit 1; }
-echo "  ok  primary URL and token file never inherited"
+echo "$OUT" | grep -q '^REMOTE_PROACTIVE_ROOM=$' \
+  || { echo "FAIL: dev instance inherited the primary's proactive room"; echo "$OUT"; exit 1; }
+echo "$OUT" | grep -q '^REMOTE_TASK_TOKEN=https://dev.example/relay|tok-dev$' \
+  || { echo "FAIL: dev instance did not get its own token"; echo "$OUT"; exit 1; }
+echo "  ok  primary URL, token file and proactive room never inherited"
+
+# Case 5: the row import recorded the connection and the launch, without the secret.
+grep -q '"instance": "dev"' "$TMP/ws/state/connections.json" \
+  || { echo "FAIL: import-env did not record the dev row"; cat "$TMP/ws/state/connections.json" 2>/dev/null; exit 1; }
+grep -q 'tok-dev' "$TMP/ws/state/connections.json" && { echo "FAIL: the secret is in connections.json"; exit 1; }
+[ -f "$TMP/keychain/AG2_REMOTE_TOKEN_DEV" ] || { echo "FAIL: the secret was not copied into the vault"; exit 1; }
+grep -q '"ok": true' "$TMP/ws/state/connections-launch/dev.json" \
+  || { echo "FAIL: no launch record for dev"; exit 1; }
+echo "  ok  the row, the vault copy and the launch record are where the module puts them"
 echo "PASS — launcher threads REMOTE_TASK_CHANNEL_DIR per instance"

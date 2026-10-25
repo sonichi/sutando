@@ -297,7 +297,7 @@ class TestQueuedTasksHearWhy(unittest.TestCase):
     def test_an_unreadable_queue_is_no_count_and_no_notice(self):
         _task(self.ws, 1)
         with patch.object(core_gate_notice.task_queue, "pending_files", side_effect=PermissionError("denied")):
-            self.assertEqual(core_gate_notice.queued_count(self.ws), 0)
+            self.assertIsNone(core_gate_notice.queued_count(self.ws))
             req = M.escalate(self.mgr, "blocked-human", "d", "selection", PICKER, SESSION)
             self.assertEqual(core_gate_notice.notice_queued(self.mgr, req, self.ws, "blocked-human", "selection"), [])
         self.assertEqual(_rows(self.ws), [])

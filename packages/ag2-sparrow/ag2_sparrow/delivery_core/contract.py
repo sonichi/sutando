@@ -51,12 +51,17 @@ class DrainStatus(str, Enum):
     NOT_CLAIMED = "not_claimed"
     TERMINAL = "terminal"
     ATTEMPTED = "attempted"
+    # The claim's revalidation refused the send: parked, no provider call.
+    WITHDRAWN = "withdrawn"
 
 
 @dataclass(frozen=True)
 class DrainResult:
     status: DrainStatus
     outcome: Optional[DeliveryOutcome] = None   # set iff status is ATTEMPTED
+    # The deciding call's own account: the receipt's provider_ref (how the
+    # provider vouched for it) and its detail, or the refusal's message.
+    provider_ref: Optional[str] = None
     detail: str = ""
 
     def __post_init__(self):

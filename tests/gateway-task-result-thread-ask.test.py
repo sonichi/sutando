@@ -33,6 +33,11 @@ import urllib.error
 from urllib.parse import quote
 from pathlib import Path
 
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 REPO = Path(__file__).resolve().parent.parent
 _SRC = REPO / "src" / "remote-gateway-bridge.py"
 AGENT = "@agent:example.org"
@@ -127,13 +132,15 @@ def main() -> int:
           f"a) no event id is ever named, got keys {sorted(p)}")
     check(left == set() and h.archived("tt-a"), "a) archived, out of flight")
 
-    # b) no marker: byte-identical to today's payload
+    # b) no marker: no thread key, and otherwise the payload every result carries
+    # (each rides the voice-outcome contract: docs/remote-gateway-protocol.md)
     h = Harness()
     h.run("tt-b", "all green\n")
     p = h.results[0] if h.results else {}
     check("thread" not in p, f"b) no thread key, got {p}")
-    check(json.dumps(p) == json.dumps({"id": "tt-b", "body": "all green"}),
-          f"b) payload byte-identical to today, got {json.dumps(p)}")
+    check(json.dumps(p) == json.dumps({"id": "tt-b", "body": "all green",
+                                       "capabilities": ["voice-outcome-v1"], "dm_only": False}),
+          f"b) payload byte-identical to an unthreaded result's, got {json.dumps(p)}")
 
     # c) the guard runs first: a team result with the marker and a secret is withheld
     h = Harness()

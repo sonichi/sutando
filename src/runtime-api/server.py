@@ -63,6 +63,7 @@ from tasks_view import TasksView  # noqa: E402
 from runtime_view import RuntimeView  # noqa: E402
 
 from schedules_view import SchedulesView  # noqa: E402
+from connections_view import ConnectionsView  # noqa: E402
 
 import instance_registry  # noqa: E402
 from capability_registry import (EphemeralCapabilityRegistry,  # noqa: E402
@@ -161,6 +162,10 @@ class RuntimeServer:
             schedules_view=(SchedulesView(Path(state_dir).parent / "hosts"
                                           / host_label / "crons.json")
                             if state_dir and host_label else None),
+            # state_dir is <workspace>/state; the record and bridge logs sit beside it.
+            connections_view=(ConnectionsView(Path(state_dir).parent, _HERE.parent.parent,
+                                              Path(state_dir).parent / "logs")
+                              if state_dir else None),
             capability_registry=capability_registry)
 
     def _register_instance(self) -> None:

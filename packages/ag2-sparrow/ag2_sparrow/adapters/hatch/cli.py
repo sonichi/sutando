@@ -1,10 +1,14 @@
-"""`ag2-sparrow-hatch install|uninstall|verify|sparrow|reply`: set up, check and answer through the Hatch hook.
+"""`ag2-sparrow-hatch install|uninstall|verify|sparrow|reply|keepalive|wake-context`: set up, check and answer through the Hatch hook.
 
-install writes the hook script to ~/hooks/scripts/, the hook definition to
-~/hooks/definitions/ and the config the script reads, and where systemd runs a user
-manager, the ag2-sparrow user service that restarts Sparrow; verify checks that setup;
+install writes the hook script to ~/hooks/scripts/ (a registered hook's script is never
+rewritten: a changed one goes beside it), stages the hook definition for the agent's hooks
+tool (~/hooks/definitions/ is the tool's own), writes the config the script reads, where systemd runs a user
+manager the ag2-sparrow user service that restarts Sparrow, and the keepalive's
+install record, then leaves Sparrow running and connected; verify checks that setup;
 sparrow checks only that Sparrow is running (the hook's heartbeat runs it); reply
-writes a worker's answer to its result_file and waits until Sparrow has sent it."""
+writes a worker's answer to its result_file and waits until Sparrow has sent it;
+keepalive runs the scheduled task, prints Sparrow's health row, and reports on its log;
+wake-context prints the text a woken worker follows (served by the backend, else built in)."""
 from __future__ import annotations
 
 import argparse
@@ -16,22 +20,28 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import sysconfig
 import tempfile
 import time
-import unicodedata
 from importlib import resources
 from pathlib import Path
 
-from ... import _dirs, gateway_instance, outbox, workspace_lock
+from ... import _dirs, agent_identity, diagnostics, gateway_credential_io, gateway_credentials, gateway_instance, outbox, workspace_lock
 from ...result_markers import parse_markers
-from .task_fields import (item_id, list_open_tasks, message_body, message_text, snippet,
-                          valid_mxid)
+from ...service_manager import _systemctl, _systemd_run, systemd_user_available  # noqa: F401
+from .task_fields import item_id, valid_mxid
 
 HOOK_ID = "ag2-sparrow-hatch"
 SCRIPT_NAME = f"{HOOK_ID}.sh"
+# The hook script rewrites this every run: "<epoch seconds> <sha256 of the script>".
+HOOK_RUN_FILE = "hatch-hook-last-run"
+HOOK_VERIFY_MAX_AGE_S = 120
+# Hatch lists a definition missing any of these as invalid and never runs it.
+HOOK_REQUIRED_KEYS = ("id", "version", "poll_interval_secs", "prompt", "script_path",
+                      "script_timeout_secs")
 HEARTBEAT_INTERVAL_S = 300
 # Sparrow rewrites its status file every poll round (long poll or backoff, each
 # at most about a minute), so an older file means it is not running.
@@ -54,15 +64,6 @@ SPARROW_COMMAND = "ag2-sparrow"
 SERVICE_NAME = "ag2-sparrow.service"
 # First line of every unit install writes: a unit without it is the owner's and is kept.
 SERVICE_MARKER = "# Written by ag2-sparrow-hatch install; re-run install to update it."
-SYSTEMD_TIMEOUT_S = 30
-# --answering must quote this many consecutive words of the message (all of a shorter one);
-# in scripts written without spaces each character is a token, and this many count as the words.
-ANSWERING_MIN_WORDS, ANSWERING_MIN_CHARS = 3, 4
-_MENTION = re.compile(r"@\S+")
-_UNSPACED = ("\u0e00-\u0eff\u1000-\u109f\u1780-\u17ff\u3040-\u30ff\u31f0-\u31ff"
-             "\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uff66-\uff9f\U00020000-\U0003ffff")
-_UNSPACED_CHAR = re.compile(f"[{_UNSPACED}]")
-_TOKEN = re.compile(rf"[{_UNSPACED}]|(?:(?![{_UNSPACED}])\w)+")
 
 
 def _shipped(name: str) -> str:
@@ -87,9 +88,27 @@ def config_path() -> Path:
 
 
 def installed_marker_path() -> Path:
-    """sha256 of the hook script install last wrote, so an upgrade can tell its own
-    earlier copy from a local edit."""
+    """sha256 of each hook script install wrote, one per line, so an upgrade can tell its
+    own earlier copy from a local edit; its mtime is when install last wrote a script."""
     return config_path().with_name("installed-script.sha256")
+
+
+def staged_definition_path() -> Path:
+    """Where install puts a changed hook definition for the agent's hooks tool."""
+    return config_path().with_name("hook-definition.json")
+
+
+def hook_run_path(state_dir: Path) -> Path:
+    return state_dir / HOOK_RUN_FILE
+
+
+def hook_last_run(state_dir: Path) -> "tuple[float, str] | None":
+    """(when, script sha256) of the hook's last run, or None when it has not written one."""
+    try:
+        parts = hook_run_path(state_dir).read_text(encoding="utf-8").split()
+        return float(parts[0]), (parts[1] if len(parts) > 1 else "")
+    except (OSError, ValueError, IndexError):
+        return None
 
 
 def _sha256(text: str) -> str:
@@ -98,15 +117,47 @@ def _sha256(text: str) -> str:
 
 def _ours() -> frozenset:
     try:
-        recorded = installed_marker_path().read_text(encoding="utf-8").strip()
+        recorded = installed_marker_path().read_text(encoding="utf-8").split()
     except OSError:
-        recorded = ""
-    return RELEASED_SCRIPT_SHA256 | ({recorded} if recorded else set())
+        recorded = []
+    return RELEASED_SCRIPT_SHA256 | set(recorded)
+
+
+def _record_script(sha: str) -> None:
+    try:
+        recorded = installed_marker_path().read_text(encoding="utf-8").split()
+    except OSError:
+        recorded = []
+    _write(installed_marker_path(), "".join(f"{s}\n" for s in
+                                            [r for r in recorded if r != sha] + [sha]), 0o644)
+
+
+# One install's masking registry, seeded on its first diff so each credential source is read once.
+_INSTALL_MASK: dict = {}
+
+
+def _masking_registry() -> "gateway_credentials.SecretRegistry":
+    """A registry holding every credential candidate the environment Sparrow gets leads to: this
+    one with AG2_DEVICE_ENV as the unit and a detached Sparrow receive it (masking only)."""
+    registry = _INSTALL_MASK.get("registry")
+    if registry is None:
+        registry = gateway_credentials.SecretRegistry()
+        gateway_credential_io.register_candidates(
+            dict(os.environ, AG2_DEVICE_ENV=str(device_env_path())), registry)
+        if _INSTALL_MASK.get("open"):
+            _INSTALL_MASK["registry"] = registry
+    return registry
 
 
 def _diff(old: str, new: str, path: Path) -> str:
-    return "".join(difflib.unified_diff(old.splitlines(True), new.splitlines(True),
-                                        f"{path} (installed)", f"{path} (ag2-sparrow)"))
+    """The diff of an installed file against ours, as gateway_credentials.mask_env_assignments
+    shows it: no environment line's content, no credential shape, and no value registered from
+    either text or from any credential candidate (masking only; the bridge decides)."""
+    registry = _masking_registry()
+    gateway_credentials.register_assignments(registry, old, new)
+    old, new = (gateway_credentials.mask_env_assignments(t, registry) for t in (old, new))
+    lines = gateway_credentials.physical_lines
+    return "".join(difflib.unified_diff(lines(old), lines(new), f"{path} (installed)", f"{path} (ag2-sparrow)"))
 
 
 def _write(path: Path, text: str, mode: int) -> None:
@@ -129,7 +180,9 @@ def _install_file(path: Path, text: str, mode: int, *, refuse_drift: bool, force
     if path.exists():
         old = path.read_text(encoding="utf-8", errors="replace")
         if old == text:
-            os.chmod(path, mode)
+            # Not even a chmod when the mode is right: Hatch stops a hook whose files change.
+            if stat.S_IMODE(path.stat().st_mode) != mode:
+                os.chmod(path, mode)
             print(f"unchanged: {path}")
             return True
         if _sha256(old) in ours:
@@ -147,13 +200,110 @@ def _install_file(path: Path, text: str, mode: int, *, refuse_drift: bool, force
     return True
 
 
+def definition_path() -> Path:
+    return definitions_dir() / f"{HOOK_ID}.json"
+
+
+def render_definition(mxid: str, reply_command: str, script_path: str) -> str:
+    d = json.loads(_shipped("hook-definition.json").replace("<AGENT_MXID>", mxid)
+                   .replace(REPLY_PLACEHOLDER, reply_command))
+    d["script_path"] = script_path
+    return json.dumps(d, indent=2, ensure_ascii=False) + "\n"
+
+
+def registered_definition() -> "dict | None":
+    try:
+        d = json.loads(definition_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return d if isinstance(d, dict) else None
+
+
+def definition_matches(registered: dict, want: dict) -> bool:
+    """Whether every field install sets has its value; the hooks tool may add others."""
+    return all(registered.get(k) == v for k, v in want.items())
+
+
+def _script_path(path: Path) -> str:
+    return f"~/hooks/scripts/{path.name}"
+
+
+def _stage_definition(want: str) -> Path:
+    staged = staged_definition_path()
+    try:
+        same = staged.read_text(encoding="utf-8") == want
+    except OSError:
+        same = False
+    if not same:
+        _write(staged, want, 0o644)
+    print(f"{'unchanged' if same else 'staged'}: {staged}")
+    return staged
+
+
+def install_hook(mxid: str, reply_command: str, force: bool) -> bool:
+    """Stage the hook definition for the agent's hooks tool (REQUIRED hook:); never write
+    ~/hooks/definitions, which the hooks tool owns. False = refused."""
+    shipped = _shipped(SCRIPT_NAME)
+    sha = _sha256(shipped)
+    canonical, def_path = scripts_dir() / SCRIPT_NAME, definition_path()
+    registered = registered_definition()
+    if registered is None:
+        fresh = not (canonical.is_file()
+                     and canonical.read_text(encoding="utf-8", errors="replace") == shipped)
+        if not _install_file(canonical, shipped, 0o755, refuse_drift=True, force=force,
+                             ours=_ours()):
+            return False
+        if fresh:
+            _record_script(sha)
+        want = render_definition(mxid, reply_command, _script_path(canonical))
+        staged = _stage_definition(want)
+        print(f"REQUIRED hook: {staged} (register it through your hooks tool)")
+        print(want, end="")
+        return True
+    script_path = str(registered.get("script_path") or _script_path(canonical))
+    current = Path(os.path.expanduser(script_path))
+    try:
+        old = current.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        old = None
+    if old != shipped:
+        if old is not None and _sha256(old) not in _ours():
+            print(f"DIFF: {current} differs from the ag2-sparrow copy:")
+            print(_diff(old, shipped, current), end="")
+            if not force:
+                print(f"REFUSED: {current} was modified locally; keep it, or re-run with "
+                      "--force to stage the copy above for your hooks tool", file=sys.stderr)
+                return False
+        # A new file beside the running hook's script, which stays as it is.
+        target = scripts_dir() / f"{HOOK_ID}.{sha[:12]}.sh"
+        if target.is_file() and target.read_text(encoding="utf-8", errors="replace") == shipped:
+            print(f"unchanged: {target}")
+        else:
+            _write(target, shipped, 0o755)
+            print(f"installed: {target} (the running hook's {current} was left as it is)")
+            _record_script(sha)
+        script_path = _script_path(target)
+    want = render_definition(mxid, reply_command, script_path)
+    if definition_matches(registered, json.loads(want)):
+        print(f"unchanged: hook {HOOK_ID} ({current} and {def_path}; install did not touch them)")
+        return True
+    staged = _stage_definition(want)
+    print(f"REQUIRED hook: {staged} (update hook {HOOK_ID} to it through your hooks tool)")
+    print(want, end="")
+    return True
+
+
 def render_config(mxid: str, task_dir: Path, result_dir: Path, activity_file: Path,
                   python: str, state_dir: Path, gateway_instance: str = "",
-                  reply_command: str = "") -> str:
+                  reply_command: str = "", cron_dir: str = "", keepalive_log: str = "",
+                  auto_upgrade: str = "") -> str:
     rows = (("AGENT_MXID", mxid), ("TASK_DIR", str(task_dir)), ("RESULT_DIR", str(result_dir)),
             ("ACTIVITY_FILE", str(activity_file)), ("SPARROW_PYTHON", python),
             ("STATE_DIR", str(state_dir)), ("GATEWAY_INSTANCE", gateway_instance),
-            ("REPLY_COMMAND", reply_command))
+            ("REPLY_COMMAND", reply_command), ("CRON_DIR", cron_dir),
+            ("KEEPALIVE_LOG", keepalive_log))
+    # Written only when set, so an owner's AUTO_UPGRADE=0 survives a re-install.
+    rows += (("AUTO_UPGRADE", auto_upgrade),) if auto_upgrade else ()
     return "".join(f"{k}={shlex.quote(v)}\n" for k, v in rows)
 
 
@@ -219,19 +369,8 @@ def service_path() -> Path:
 
 
 def device_env_path() -> Path:
-    """The .env file holding REMOTE_TASK_TOKEN that Sparrow reads at startup."""
-    env = os.environ.get("AG2_DEVICE_ENV")
-    return Path(env).expanduser() if env else _home() / ".config" / "ag2-sparrow" / "relay.env"
-
-
-def _systemd_run(cmd: list) -> "subprocess.CompletedProcess | None":
-    """Run a systemctl/loginctl command; None when it could not run at all.
-    Never prompts: over SSH a polkit password prompt would hang until the timeout."""
-    try:
-        return subprocess.run([cmd[0], "--no-ask-password", *cmd[1:]], stdin=subprocess.DEVNULL,
-                              capture_output=True, text=True, timeout=SYSTEMD_TIMEOUT_S)
-    except (OSError, subprocess.SubprocessError):
-        return None
+    """The .env file holding REMOTE_TASK_TOKEN that Sparrow reads at startup (the shared owner's)."""
+    return _dirs.device_env_path()
 
 
 def _ok(r) -> bool:
@@ -245,14 +384,13 @@ def _why(r) -> str:
     return lines[-1] if lines else f"exit {r.returncode}"
 
 
-def systemd_user_available() -> bool:
-    """Whether `systemctl --user` reaches a running user manager."""
-    return shutil.which("systemctl") is not None and \
-        _ok(_systemd_run(["systemctl", "--user", "show-environment"]))
-
-
-def render_service(exec_start: str, env: dict) -> str:
-    rows = "".join(f"Environment={k}={v}\n" for k, v in env.items())
+def render_service(exec_start: str, env: dict, unset: "tuple[str, ...]" = ()) -> str:
+    """`unset` names variables the user manager may pass that the unit must not: UnsetEnvironment=
+    is applied last, after Environment=, so a name set here is never also in `unset`."""
+    rows = "".join(f'Environment="{k}={v}"\n' if " " in v else f"Environment={k}={v}\n"
+                   for k, v in env.items())
+    if unset:
+        rows += f"UnsetEnvironment={' '.join(unset)}\n"
     return (f"{SERVICE_MARKER}\n[Unit]\nDescription=ag2-sparrow (AG2 Space listener)\n"
             "# A Sparrow that dies 5 times in 5 minutes (e.g. a rejected token) is left failed.\n"
             "StartLimitIntervalSec=300\nStartLimitBurst=5\n\n"
@@ -275,54 +413,136 @@ def _unit_value(value: str) -> str:
     return value.replace("%", "%%")
 
 
-def _unit_props(*names: str) -> dict:
-    r = _systemd_run(["systemctl", "--user", "show", SERVICE_NAME,
-                      *(f"--property={n}" for n in names)])
-    if not _ok(r):
-        return {}
-    return dict(line.split("=", 1) for line in r.stdout.splitlines() if "=" in line)
+# Every ActiveState systemd documents; anything else is an unknown state.
+UNIT_STATES = frozenset(("active", "reloading", "inactive", "failed", "activating", "deactivating",
+                         "maintenance", "refreshing"))
+_UNIT_PROPS = ("ActiveState", "MainPID", "ExecMainStartTimestampMonotonic")
+_ASCII_DIGITS = re.compile(r"[0-9]+")
+# (most digits, largest value): no pid exceeds Linux PID_MAX_LIMIT, a timestamp is a u64 of microseconds.
+_UNIT_NUMBERS = {"MainPID": (10, 4194304), "ExecMainStartTimestampMonotonic": (20, 2 ** 64 - 1)}
 
 
-def _outside_sparrow(state_dir: Path, instance: str, main_pid: int, ran: bool) -> bool:
-    """Whether a Sparrow this service does not own polls the workspace now."""
+def _unit_props() -> "dict | None":
+    """ActiveState (a documented state), MainPID and ExecMainStartTimestampMonotonic (ints in
+    _UNIT_NUMBERS bounds), each exactly once and fully parsed here. Anything else is None."""
+    r = _systemctl(("--user", "show", "ag2-sparrow.service", "--property=ActiveState",
+                    "--property=MainPID", "--property=ExecMainStartTimestampMonotonic"))
+    try:
+        return _parse_unit_props(r.stdout) if _ok(r) else None
+    except Exception:  # noqa: BLE001 - any surprise in the answer is an unknown state
+        return None
+
+
+def _parse_unit_props(stdout: str) -> "dict | None":
+    if not isinstance(stdout, str):
+        return None
+    props = {}
+    for line in stdout.split("\n"):
+        if not line:
+            continue
+        key, eq, value = line.partition("=")
+        if not eq or key in props or key not in _UNIT_PROPS:
+            return None
+        props[key] = value
+    if set(props) != set(_UNIT_PROPS) or props["ActiveState"] not in UNIT_STATES:
+        return None
+    for name, (digits, largest) in _UNIT_NUMBERS.items():
+        text = props[name]
+        if len(text) > digits or not _ASCII_DIGITS.fullmatch(text) or int(text) > largest:
+            return None
+        props[name] = int(text)
+    return props
+
+
+def _lock_record(state_dir: Path, instance: str) -> "dict | None":
+    """This host's Sparrow single-instance lock record, or None when there is none to read."""
     lock = state_dir.parent / "state" / "locks" / \
         f"gateway-bridge{gateway_instance.suffix(instance)}.lock"
     try:
         holder = json.loads(lock.read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        holder = None
-    if isinstance(holder, dict) and holder.get("host") == workspace_lock._host_label():
-        pid = holder.get("pid")
-        if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0 or pid == main_pid:
-            return False
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return False  # its holder crashed; the fresh status file is a corpse
-        except OSError:
-            pass
-        return workspace_lock._is_fresh(holder, workspace_lock.DEFAULT_STALE_SECONDS)
+        return None
+    ok = isinstance(holder, dict) and holder.get("host") == workspace_lock._host_label()
+    return holder if ok else None
+
+
+def _proc_stat(pid: int) -> bytes:
+    try:
+        return Path(f"/proc/{pid}/stat").read_bytes()
+    except OSError:
+        return b""
+
+
+def process_gone(pid: int) -> bool:
+    """Whether `pid` has exited, a zombie included; False when that cannot be told."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False
+    stat = _proc_stat(pid)
+    return stat[stat.rfind(b")") + 1:].split()[:1] == [b"Z"]
+
+
+def live_lock_holder(holder: "dict | None") -> "int | None":
+    """The pid of a live Sparrow holding `holder` with a fresh heartbeat, else None."""
+    pid = (holder or {}).get("pid")
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return None
+    if process_gone(pid):
+        return None  # its holder crashed; the fresh status file is a corpse
+    return pid if workspace_lock._is_fresh(holder, workspace_lock.DEFAULT_STALE_SECONDS) else None
+
+
+def _outside_sparrow(state_dir: Path, instance: str, main_pid: int, ran: bool) -> bool:
+    """Whether a Sparrow this service does not own polls the workspace now."""
+    holder = _lock_record(state_dir, instance)
+    if holder is not None:
+        pid = live_lock_holder(holder)
+        return pid is not None and pid != main_pid
     # No lock to read: a fresh status file is another Sparrow's only if this unit never ran.
     code, _ = check_sparrow(state_dir, instance=instance)
     return code != SPARROW_DOWN and not ran
 
 
+def keepawake_note(reply_command: str, keepalive_on: bool = True) -> str:
+    """Who keeps Sparrow running when no user service does."""
+    if not keepalive_on:
+        return "with no keepalive task, nothing restarts Sparrow after a crash or reboot"
+    cmd = shlex.join([reply_command or REPLY_COMMAND, "keepalive", "keepawake"])
+    return f"the agent keeps Sparrow running with {cmd} from its scheduler"
+
+
+NO_SAVED_MXID = ("NOTE sparrow: the install config holds no AGENT_MXID, so this Sparrow runs with no "
+                 "agent identity and cannot resolve the owner's DM; run ag2-sparrow-hatch install "
+                 "--mxid <mxid>")
+
+
+def saved_mxid(value) -> str:
+    """The AGENT_MXID install saved, '' when absent or not an MXID: Sparrow gets no default."""
+    mxid = (value or "").strip() if isinstance(value, str) else ""
+    return mxid if valid_mxid(mxid) else ""
+
+
 def install_service(task_dir: Path, result_dir: Path, state_dir: Path, instance: str,
-                    force: bool) -> None:
-    """Write, enable and start the ag2-sparrow user service. Never fails the install:
-    each problem prints a NOTE saying what was not done and how to finish by hand."""
+                    force: bool, health_command: str = "", reply_command: str = "",
+                    mxid: str = "", may_start: bool = True) -> bool:
+    """Write, enable and (unless not `may_start`) start the ag2-sparrow user service. Each
+    problem prints a NOTE saying what was not done and how to finish by hand; True only when this
+    install stopped the service and left it stopped, which fails the install."""
     def note(text: str) -> None:
         print(f"NOTE service: {text}")
 
     if not systemd_user_available():
-        note("systemctl --user is not available here, so no service was set up and nothing "
-             "restarts Sparrow after a crash or reboot; keep ag2-sparrow running another way")
-        return
+        note("systemctl --user is not available here, so no service was set up; "
+             + keepawake_note(reply_command, bool(health_command)))
+        return False
     exec_start = _find_console_script(SPARROW_COMMAND)
     if not exec_start:
         note(f"{SPARROW_COMMAND} was not found beside {sys.executable} or on PATH; no service "
              "was set up. Reinstall ag2-sparrow for this Python and run install again")
-        return
+        return False
     device_env = device_env_path()
     try:
         st = device_env.stat()
@@ -336,15 +556,22 @@ def install_service(task_dir: Path, result_dir: Path, state_dir: Path, instance:
              "the token Sparrow uses")
     env = {"AG2_DEVICE_ENV": str(device_env), "AGENT_CONNECT_TASK_DIR": str(task_dir),
            "AGENT_CONNECT_RESULT_DIR": str(result_dir), "AGENT_CONNECT_STATE_DIR": str(state_dir)}
+    # The unit pins the identity to the saved MXID or none; the manager's identity keys are unset.
+    env.update(agent_identity.pinned_environ(saved_mxid(mxid)))
+    if not saved_mxid(mxid):
+        print(NO_SAVED_MXID, file=sys.stderr)
+    unset = tuple(k for k in agent_identity.ENV_KEYS if k not in env)
     if instance:
         env["GATEWAY_INSTANCE"] = instance
     try:
         exec_start = _unit_value(exec_start)
         env = {k: _unit_value(v) for k, v in env.items()}
+        if health_command:
+            env["REMOTE_HEALTH_COMMAND"] = " ".join(map(_unit_value, shlex.split(health_command)))
     except ValueError as e:
         note(f"{e}; no service was set up")
-        return
-    unit, text = service_path(), render_service(exec_start, env)
+        return False
+    unit, text = service_path(), render_service(exec_start, env, unset)
     changed = True
     if unit.exists():
         old = unit.read_text(encoding="utf-8", errors="replace")
@@ -356,58 +583,83 @@ def install_service(task_dir: Path, result_dir: Path, state_dir: Path, instance:
             print(_diff(old, text, unit), end="")
             note(f"{unit} was not written by install, so it was kept; re-run with --force to "
                  "replace it with the unit above")
-            return
+            return False
+    stopped = False
+    before = _unit_props() if changed else {}
+    if before is None:
+        note(f"systemctl --user show {SERVICE_NAME} did not give a well-formed state, so nothing was "
+             "stopped, written, reloaded or enabled; run ag2-sparrow-hatch install again once the "
+             "user manager answers")
+        return False
+    if before.get("ActiveState") in ("active", "reloading"):
+        r = _systemctl(("--user", "stop", "ag2-sparrow.service"))
+        stopped = _ok(r)
+        print(f"stopped: {SERVICE_NAME} before installing" if stopped else
+              f"NOTE service: stop failed ({_why(r)}); "
+              + ("it is restarted after the install instead" if may_start else
+                 "it keeps running the old unit (--no-start)"))
     if changed:
         _write(unit, text, 0o644)
         print(f"installed: {unit}")
-        r = _systemd_run(["systemctl", "--user", "daemon-reload"])
+        r = _systemctl(("--user", "daemon-reload"))
         if not _ok(r):
             note(f"systemctl --user daemon-reload failed ({_why(r)}); run it, then "
                  f"systemctl --user enable --now {SERVICE_NAME}")
-            return
-    props = _unit_props("ActiveState", "MainPID", "ExecMainStartTimestampMonotonic")
-    state = props.get("ActiveState", "inactive")
+            return False
+    props = _unit_props()
+    if props is None and stopped:
+        print(f"error: service: this install stopped {SERVICE_NAME} and did not start it again, because "
+              f"systemctl --user show {SERVICE_NAME} then did not give a well-formed state; it stays "
+              f"stopped until you run: systemctl --user start {SERVICE_NAME}", file=sys.stderr)
+        return True
+    if props is None:
+        note(f"systemctl --user show {SERVICE_NAME} did not give a well-formed state, so whether it runs "
+             "is unknown; it was neither enabled, started nor restarted; run ag2-sparrow-hatch install "
+             "again once the user manager answers")
+        return False
+    state = props["ActiveState"]
     active = state in ("active", "reloading")
-    try:
-        main_pid = int(props.get("MainPID") or 0)
-    except ValueError:
-        main_pid = 0
-    ran = props.get("ExecMainStartTimestampMonotonic", "0") not in ("", "0")
+    main_pid = props["MainPID"]
+    ran = props["ExecMainStartTimestampMonotonic"] != 0
     # failed/activating/deactivating: the unit's own Sparrow crashed or is restarting.
-    outside = state == "inactive" and _outside_sparrow(state_dir, instance, main_pid, ran)
+    outside = not stopped and state == "inactive" and _outside_sparrow(state_dir, instance, main_pid, ran)
     has_token = device_env.is_file()
-    start = has_token and not outside
+    start = may_start and has_token and not outside
     if start and state == "failed":
-        _systemd_run(["systemctl", "--user", "reset-failed", SERVICE_NAME])
-    r = _systemd_run(["systemctl", "--user", "enable", *(["--now"] if start else []),
-                      SERVICE_NAME])
+        _systemctl(("--user", "reset-failed", "ag2-sparrow.service"))
+    r = _systemctl(("--user", "enable", "--now", "ag2-sparrow.service")) if start else \
+        _systemctl(("--user", "enable", "ag2-sparrow.service"))
     if not _ok(r):
         note(f"systemctl --user enable {SERVICE_NAME} failed ({_why(r)}); fix that and run "
              f"systemctl --user enable --now {SERVICE_NAME}")
-        return
-    if active and changed:
-        r = _systemd_run(["systemctl", "--user", "restart", SERVICE_NAME])
+        return False
+    if active and changed and not may_start:
+        note(f"the unit changed but was not restarted (--no-start); run systemctl --user "
+             f"restart {SERVICE_NAME} to run it")
+    elif active and changed:
+        r = _systemctl(("--user", "restart", "ag2-sparrow.service"))
         print(f"restarted: {SERVICE_NAME} with the new unit" if _ok(r) else
               f"NOTE service: restart failed ({_why(r)}); run systemctl --user restart "
               f"{SERVICE_NAME}")
     print(f"enabled: {SERVICE_NAME}" + (" (running)" if start or active else " (not started)"))
     if outside:
         note("Sparrow is already running outside systemd, so the service was enabled but not "
-             "started, and the running Sparrow was left alone. To switch over, stop that "
-             f"ag2-sparrow process, then run: systemctl --user start {SERVICE_NAME}")
+             "started yet; install replaces that Sparrow with the service below")
     elif not has_token:
         note(f"{device_env} is missing, so the service was not started. Put your relay token "
              f"in it as one line REMOTE_TASK_TOKEN=<token>, chmod 600 it, then run: "
              f"systemctl --user start {SERVICE_NAME}")
+    elif not may_start and not active:
+        note(f"not started (--no-start); run systemctl --user start {SERVICE_NAME}")
     user = os.environ.get("USER") or os.environ.get("LOGNAME") or ""
     if hasattr(os, "geteuid") and os.geteuid() == 0:
         print("linger: skipped (running as root)")
-        return
+        return False
     r = _systemd_run(["loginctl", "show-user", user, "--property=Linger", "--value"]) \
         if user else None
     if _ok(r) and r.stdout.strip() == "yes":
         print(f"linger: already on for {user}")
-        return
+        return False
     r = _systemd_run(["loginctl", "enable-linger", user]) if user else None
     if _ok(r):
         print(f"linger: enabled for {user}, so Sparrow runs while you are logged out")
@@ -415,26 +667,37 @@ def install_service(task_dir: Path, result_dir: Path, state_dir: Path, instance:
         note(f"loginctl enable-linger {user or '$USER'} failed ({_why(r)}), so Sparrow stops "
              "when you log out and starts again at your next login. Ask an administrator to "
              f"run: loginctl enable-linger {user or '$USER'}")
+    return False
 
 
-def service_status() -> "tuple[bool | None, str]":
+def service_status(reply_command: str = "") -> "tuple[bool | None, str]":
     """(True, detail) installed and enabled; (False, detail) installed but not enabled;
     (None, detail) when there is nothing to judge (no systemd, or no unit)."""
     unit = service_path()
     if not systemd_user_available():
-        return None, "systemctl --user is not available; nothing restarts Sparrow by itself"
+        return None, f"systemctl --user is not available; {keepawake_note(reply_command)}"
     if not unit.is_file():
-        return None, (f"{unit} not installed; nothing restarts Sparrow after a crash or reboot. "
-                      "Run ag2-sparrow-hatch install to set it up")
-    enabled = _systemd_run(["systemctl", "--user", "is-enabled", SERVICE_NAME])
+        return None, (f"{unit} not installed; {keepawake_note(reply_command)}. Run "
+                      "ag2-sparrow-hatch install to set the service up")
+    enabled = _systemctl(("--user", "is-enabled", "ag2-sparrow.service"))
     if not _ok(enabled):
         return False, (f"{unit} installed but not enabled; run systemctl --user enable --now "
                        f"{SERVICE_NAME}")
-    active = _ok(_systemd_run(["systemctl", "--user", "is-active", "--quiet", SERVICE_NAME]))
+    active = _ok(_systemctl(("--user", "is-active", "--quiet", "ag2-sparrow.service")))
     return True, f"{unit} installed and enabled ({'active' if active else 'not active'})"
 
 
 def install(args) -> int:
+    _INSTALL_MASK.clear()
+    _INSTALL_MASK["open"] = True
+    try:
+        return _install(args)
+    finally:
+        _INSTALL_MASK.clear()
+
+
+def _install(args) -> int:
+    from . import keepalive
     reply_command = find_reply_command()
     problem = reply_command_problem(reply_command)
     if problem:
@@ -454,30 +717,58 @@ def install(args) -> int:
     result_dir = Path(args.result_dir) if args.result_dir else _dirs.result_dir()
     state_dir = Path(args.state_dir) if args.state_dir else _dirs.state_dir()
     activity = Path(args.activity_file) if args.activity_file else _home() / ".muse" / "last_active"
-    script = scripts_dir() / SCRIPT_NAME
-    shipped = _shipped(SCRIPT_NAME)
-    if not _install_file(script, shipped, 0o755, refuse_drift=True, force=args.force,
-                         ours=_ours()):
+    if not install_hook(args.mxid, reply_command, args.force):
         return 1
-    _write(installed_marker_path(), _sha256(shipped) + "\n", 0o644)
-    definition = (_shipped("hook-definition.json").replace("<AGENT_MXID>", args.mxid)
-                  .replace(REPLY_PLACEHOLDER, reply_command))
-    _install_file(definitions_dir() / f"{HOOK_ID}.json", definition, 0o644,
-                  refuse_drift=False, force=True)
+    # Empty = resolved under the home directory when the keepalive runs.
+    cron = str(Path(args.cron_dir).expanduser().resolve()) if args.cron_dir else ""
+    keepalive_log = (str(Path(args.keepalive_log).expanduser().resolve())
+                     if args.keepalive_log else "")
     config = render_config(args.mxid, task_dir.resolve(), result_dir.resolve(),
                            activity, sys.executable, state_dir.resolve(), instance,
-                           reply_command)
+                           reply_command, cron, keepalive_log,
+                           _installed_config().get("AUTO_UPGRADE", ""))
     _install_file(config_path(), config, 0o600, refuse_drift=False, force=True)
     activity.parent.mkdir(parents=True, exist_ok=True)
-    if args.no_service:
-        print("skipped: the ag2-sparrow user service (--no-service); nothing restarts Sparrow "
-              "after a crash or reboot unless you keep it running another way")
+    owner = keepalive._unit_owner() if args.no_service else None
+    left_stopped, held = False, None
+    if not args.no_start:
+        from . import self_upgrade
+        held = self_upgrade.release_hold(state_dir.resolve())
+        if held:
+            print(f"error: Sparrow is not started: {held}", file=sys.stderr)
+    if owner == keepalive.UNIT_UNREACHABLE:
+        print(f"skipped: the ag2-sparrow user service (--no-service); {service_path()} is "
+              "installed but systemctl --user did not answer, so whether that service runs Sparrow "
+              "is unknown; no Sparrow is stopped and no detached one is started beside it")
+    elif owner is not None:
+        print(f"skipped: the ag2-sparrow user service (--no-service); {service_path()} "
+              "is already installed, so that service runs Sparrow and its environment is the live "
+              "identity; no detached Sparrow is started beside it")
+    elif args.no_service:
+        print("skipped: the ag2-sparrow user service (--no-service); "
+              + keepawake_note(reply_command, not args.no_keepalive))
     else:
-        install_service(task_dir.resolve(), result_dir.resolve(), state_dir.resolve(), instance,
-                        args.force)
-    print(f"\nNext: register the hook with hooks.add using {definitions_dir() / f'{HOOK_ID}.json'}, "
-          "test it with hooks.dry_run, start it with hooks.enable, then run: ag2-sparrow-hatch verify")
-    return 0
+        left_stopped = install_service(task_dir.resolve(), result_dir.resolve(), state_dir.resolve(), instance,
+                                       args.force,
+                                       "" if args.no_keepalive else keepalive.health_command(reply_command),
+                                       reply_command, mxid=args.mxid,
+                                       may_start=not (args.no_start or held))
+    if args.no_keepalive:
+        print("skipped: the keepalive task (--no-keepalive)")
+    else:
+        keepalive.install_tasks(read_config(config_path()), args.force)
+    if held:
+        rc = 1
+        print("skipped: starting and checking Sparrow (a failed self-upgrade holds it stopped)")
+    elif left_stopped:
+        rc = 1
+        print("skipped: starting and checking Sparrow (the service was left stopped above)")
+    elif args.no_start:
+        rc = 0
+        print("skipped: starting and checking Sparrow (--no-start)")
+    else:
+        rc = keepalive.ensure_sparrow(read_config(config_path()), not args.no_keepalive)
+    return rc
 
 
 def _check(results: list, ok: bool, name: str, detail: str) -> None:
@@ -485,9 +776,10 @@ def _check(results: list, ok: bool, name: str, detail: str) -> None:
     print(f"{'PASS' if ok else 'FAIL'} {name}: {detail}")
 
 
-RESTART_HINT = ("restart it: systemctl --user reset-failed ag2-sparrow; systemctl --user "
-                "restart ag2-sparrow under the user service install sets up, else start "
-                "ag2-sparrow again as at install")
+def restart_hint() -> str:
+    """keepawake restarts Sparrow with REMOTE_HEALTH_COMMAND; a bare ag2-sparrow lacks it."""
+    command = _installed_config().get("REPLY_COMMAND") or find_reply_command() or REPLY_COMMAND
+    return f"restart it: run {shlex.join([command, 'keepalive', 'keepawake'])}"
 
 
 def sparrow_status_path(state_dir: Path, instance: str | None = None) -> Path:
@@ -507,11 +799,11 @@ def check_sparrow(state_dir: Path, now: float | None = None,
         ts = float(status["ts"])
     except (OSError, ValueError, KeyError, TypeError) as e:
         return SPARROW_DOWN, (f"{path} unreadable ({type(e).__name__}); Sparrow has not run with "
-                       f"this state dir; {RESTART_HINT}")
+                       f"this state dir; {restart_hint()}")
     age = int((time.time() if now is None else now) - ts)
     if age > SPARROW_STATUS_MAX_AGE_S:
         return SPARROW_DOWN, (f"{path} last written {age}s ago; Sparrow is not running, so no task "
-                       f"reaches the hook; {RESTART_HINT}")
+                       f"reaches the hook; {restart_hint()}")
     if not status.get("connected"):
         return SPARROW_NOT_CONNECTED, (
             f"Sparrow is running but not connected: {status.get('error') or 'no error given'}; "
@@ -530,27 +822,46 @@ def sparrow(args) -> int:
 
 def verify(_args) -> int:
     results: list = []
-    script = scripts_dir() / SCRIPT_NAME
+    registered = registered_definition() or {}
+    script = Path(os.path.expanduser(str(registered.get("script_path") or
+                                         _script_path(scripts_dir() / SCRIPT_NAME))))
+    staged = staged_definition_path()
+    pending = (f"; update the hook through your hooks tool to the definition in {staged}, as "
+               "install's REQUIRED hook: line says" if staged.is_file() else "")
     if not script.is_file():
         _check(results, False, "hook script", f"{script} missing; run ag2-sparrow-hatch install")
     elif not os.access(script, os.X_OK):
         _check(results, False, "hook script", f"{script} is not executable")
     elif script.read_text(encoding="utf-8", errors="replace") != _shipped(SCRIPT_NAME):
-        _check(results, False, "hook script", f"{script} differs from this ag2-sparrow's copy")
+        _check(results, False, "hook script",
+               f"{script} differs from this ag2-sparrow's copy{pending}")
     else:
         _check(results, True, "hook script", str(script))
 
-    definition_path = definitions_dir() / f"{HOOK_ID}.json"
+    def_path = definition_path()
     definition: dict = {}
     try:
-        definition = json.loads(definition_path.read_text(encoding="utf-8"))
+        definition = json.loads(def_path.read_text(encoding="utf-8"))
         bad = any(p in json.dumps(definition) for p in ("<AGENT_MXID>", REPLY_PLACEHOLDER)) or \
-            Path(os.path.expanduser(definition.get("script_path", ""))) != script
-        _check(results, not bad, "hook definition",
-               str(definition_path) if not bad else f"{definition_path} has a placeholder or "
-               "a script_path that is not the installed script")
-    except (OSError, ValueError) as e:
-        _check(results, False, "hook definition", f"{definition_path}: {e}")
+            not re.fullmatch(rf"{re.escape(HOOK_ID)}(\.[0-9a-f]{{12}})?\.sh", script.name) or \
+            script.parent != scripts_dir()
+        detail = (f"{def_path} has a placeholder or a script_path that is not an installed "
+                  "hook script" if bad else str(def_path))
+        missing = [k for k in HOOK_REQUIRED_KEYS if k not in definition]
+        if missing:
+            bad, detail = True, (f"{def_path} lacks {', '.join(missing)}: Hatch marks this hook "
+                                 "invalid and never runs it; re-add it through your hooks tool "
+                                 "with every field of the definition install prints")
+        if not bad and staged.is_file():
+            want = json.loads(staged.read_text(encoding="utf-8"))
+            if not definition_matches(definition, want):
+                bad, detail = True, f"{def_path} is not the definition install staged{pending}"
+        _check(results, not bad, "hook definition", detail)
+    except FileNotFoundError:
+        _check(results, False, "hook definition", f"{def_path} missing: the hook is not "
+               "registered; add it through your hooks tool as install's REQUIRED hook: line says")
+    except (OSError, ValueError, AttributeError) as e:
+        _check(results, False, "hook definition", f"{def_path}: {e}")
 
     cfg_path = config_path()
     cfg: dict = {}
@@ -583,7 +894,23 @@ def verify(_args) -> int:
     code, detail = check_sparrow(state_dir, instance=cfg.get("GATEWAY_INSTANCE"))
     _check(results, code == SPARROW_OK, "sparrow", detail)
 
-    ok, detail = service_status()
+    run = hook_last_run(state_dir)
+    if run is None:
+        ok, detail = False, (f"hook not running: it has never run ({hook_run_path(state_dir)} "
+                             "missing); register and enable it through your hooks tool as "
+                             "install's REQUIRED hook: line says")
+    elif not 0 <= time.time() - run[0] <= HOOK_VERIFY_MAX_AGE_S:
+        ok, detail = False, (f"hook not running: last run "
+                             f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(run[0]))} "
+                             f"({int(time.time() - run[0])}s ago); check that your hooks tool "
+                             "lists it enabled, and its hooks.logs")
+    elif run[1] != _sha256(_shipped(SCRIPT_NAME)):
+        ok, detail = False, f"the hook runs an older script{pending or '; run install again'}"
+    else:
+        ok, detail = True, f"last run {int(time.time() - run[0])}s ago, this ag2-sparrow's script"
+    _check(results, ok, "hook run", detail)
+
+    ok, detail = service_status(cfg.get("REPLY_COMMAND", ""))
     if ok is None:
         print(f"NOTE service: {detail}")
     else:
@@ -612,6 +939,32 @@ def verify(_args) -> int:
            "; ".join(problems) if problems else
            f"armed: a wake after {HEARTBEAT_INTERVAL_S}s quiet unless {activity} is fresher")
 
+    from . import keepalive
+    line, row = keepalive.status_line(cfg)
+    never = keepalive.last_keepawake(keepalive.log_path(cfg)) is None
+    task, step = keepalive.TASK, keepalive.register_step(cfg)
+    if row is None:
+        print(f"NOTE keepalive: {line} (no {task} task is installed)")
+    elif row["condition"] == "abnormal" and row["reason"] != keepalive.NOT_RUNNING:
+        _check(results, False, "keepalive", f"{line}; {keepalive.REASON_HINTS[row['reason']]}")
+    elif row["condition"] == "abnormal":
+        _check(results, False, "keepalive", f"{line}; " + (
+            f"{task} has never run: {step}" if never else
+            f"{task} has not run in the last {keepalive.STALE_S // 60} minutes; check that "
+            f"your scheduler still lists it, else {step}"))
+    elif row["condition"] == "unknown":
+        print(f"NOTE keepalive: {line} ({task} has not run yet; unless you already did, {step})")
+    else:
+        print(f"NOTE keepalive: {line}")
+    if row is not None and keepalive.listener_up(cfg, time.time()):
+        pid, problem = keepalive.unmanaged_health_problem(cfg)
+        if problem == keepalive.NO_HEALTH_COMMAND:
+            _check(results, False, "sparrow health", f"sparrow runs without the health command "
+                   f"(pid {pid}): its heartbeats carry no health row; run install")
+        elif problem == keepalive.UNKNOWN_ENV:
+            print("NOTE sparrow health: the running Sparrow's environment cannot be read, so "
+                  "whether its heartbeats carry the health row is unknown")
+
     mxid = cfg.get("AGENT_MXID") or "@your-agent:ag2.space"
     print(f"\nManual test: from another account, mention {mxid} in an AG2 Space room. Within a "
           "few polls a task file appears in the task_dir, the hook wakes the worker, and the "
@@ -620,10 +973,20 @@ def verify(_args) -> int:
 
 
 def uninstall(args) -> int:
-    """Stop, disable and remove the ag2-sparrow user service install wrote."""
-    if not args.service:
-        print("error: name what to remove: uninstall --service", file=sys.stderr)
+    """Remove the ag2-sparrow user service and/or the keepalive tasks install wrote."""
+    if not (args.service or args.keepalive):
+        print("error: name what to remove: uninstall --service and/or --keepalive",
+              file=sys.stderr)
         return 2
+    rc = 0
+    if args.keepalive:
+        from . import keepalive
+        rc = keepalive.uninstall_tasks(_installed_config())
+    return max(rc, uninstall_service(not args.keepalive)) if args.service else rc
+
+
+def uninstall_service(keepalive_on: bool = True) -> int:
+    """Stop, disable and remove the ag2-sparrow user service install wrote."""
     unit = service_path()
     if not unit.is_file():
         print(f"nothing to remove: {unit} is not installed")
@@ -632,7 +995,7 @@ def uninstall(args) -> int:
         print(f"error: {unit} was not written by install; remove it yourself", file=sys.stderr)
         return 1
     if systemd_user_available():
-        r = _systemd_run(["systemctl", "--user", "disable", "--now", SERVICE_NAME])
+        r = _systemctl(("--user", "disable", "--now", "ag2-sparrow.service"))
         if not _ok(r):
             print(f"error: systemctl --user disable --now {SERVICE_NAME} failed ({_why(r)}); "
                   f"{unit} was kept", file=sys.stderr)
@@ -641,9 +1004,9 @@ def uninstall(args) -> int:
     unit.unlink()
     print(f"removed: {unit}")
     if systemd_user_available():
-        _systemd_run(["systemctl", "--user", "daemon-reload"])
-    print("Linger was left as it is (other user services may need it); nothing restarts Sparrow "
-          "now, so keep ag2-sparrow running another way or run install again.")
+        _systemctl(("--user", "daemon-reload"))
+    print("Linger was left as it is (other user services may need it); "
+          + keepawake_note(_installed_config().get("REPLY_COMMAND", ""), keepalive_on) + ".")
     return 0
 
 
@@ -671,58 +1034,6 @@ def _read_body(args) -> "tuple[str | None, str]":
                       "[channel:], [thread] or [file:]; a reply is plain text to the asker's "
                       "message only. Use --no-send to post nothing")
     return body, ""
-
-
-def _normalized(text: str) -> str:
-    return unicodedata.normalize("NFKC", _MENTION.sub(" ", text)).casefold()
-
-
-def _words(text: str) -> list:
-    return _TOKEN.findall(_normalized(text))
-
-
-def _weight(tokens: list) -> int:
-    """How much of a quote `tokens` is, in units where ANSWERING_MIN_WORDS words or
-    ANSWERING_MIN_CHARS unspaced characters are each the minimum."""
-    chars = sum(1 for t in tokens if _UNSPACED_CHAR.fullmatch(t))
-    return (len(tokens) - chars) * ANSWERING_MIN_CHARS + chars * ANSWERING_MIN_WORDS
-
-
-def answers(body: str, quoted: str) -> bool:
-    """Whether `quoted` is ANSWERING_MIN_WORDS or more consecutive words of the message in
-    `body` (ANSWERING_MIN_CHARS characters of text written without spaces, such as Chinese,
-    Japanese or Thai; all of it when shorter); case, punctuation and @-mentions do not count.
-    A message with no words (e.g. only emoji) is named only by all of it, punctuation included."""
-    message = message_text(body)
-    have, want = _words(message), _words(quoted)
-    if not have:  # no words at all, e.g. a lone emoji: only the whole message names it
-        squeeze = "".join(_normalized(quoted).split())
-        return bool(squeeze) and squeeze == "".join(_normalized(message).split())
-    if not want or _weight(want) < min(ANSWERING_MIN_WORDS * ANSWERING_MIN_CHARS,
-                                       _weight(have)):
-        return False
-    return any(have[i:i + len(want)] == want for i in range(len(have) - len(want) + 1))
-
-
-def _task_body(task_file: Path) -> str:
-    try:
-        return message_body(task_file.read_text(encoding="utf-8", errors="replace"))
-    except OSError:
-        return ""
-
-
-def _misrouted(tid: str, task_dir: Path, result_dir: Path, instance: str, quoted: str) -> str:
-    """Why `quoted` does not bind this reply to task `tid`, naming the items it does fit."""
-    body = _task_body(task_dir / f"{tid}.txt")
-    fits = [item["result_file"] for item in list_open_tasks(task_dir, result_dir, instance)
-            if item["task_id"] != tid and answers(_task_body(Path(item["task_file"])), quoted)]
-    where = (f" Those words are from the message of {', '.join(fits)}: answer it with that "
-             "result_file." if fits else
-             f" Copy {ANSWERING_MIN_WORDS} or more consecutive words (or {ANSWERING_MIN_CHARS} "
-             "characters of text written without spaces) of the message you answer from its "
-             "snippet.")
-    return (f"--answering {quoted!r} is not the message of {tid} "
-            f"({snippet(body)[:200]!r}); nothing written.{where}")
 
 
 def _claims_dir(result_dir: Path) -> Path:
@@ -784,16 +1095,6 @@ def reply(args) -> int:
     if not (task_dir / f"{tid}.txt").is_file():
         print(f"error: no open task {tid} in {task_dir}", file=sys.stderr)
         return 2
-    if args.answering is None:
-        print(f"error: name the message this answers: --answering '<{ANSWERING_MIN_WORDS} or "
-              f"more consecutive words ({ANSWERING_MIN_CHARS} characters of text written "
-              "without spaces) copied from its snippet>'; nothing written",
-              file=sys.stderr)
-        return 2
-    if not answers(_task_body(task_dir / f"{tid}.txt"), args.answering):
-        print(f"error: {_misrouted(tid, task_dir, result_dir, instance, args.answering)}",
-              file=sys.stderr)
-        return 2
     if not (math.isfinite(args.wait) and 0 <= args.wait <= REPLY_WAIT_MAX_S):
         print(f"error: --wait must be 0 to {REPLY_WAIT_MAX_S:g} seconds", file=sys.stderr)
         return 2
@@ -836,6 +1137,38 @@ def reply(args) -> int:
         time.sleep(0.25)
 
 
+def _register_device_secrets() -> None:
+    """Withhold every credential candidate this host could hand Sparrow (the process env and the
+    device file, each on its own): whichever one precedence picks, the others stay withheld."""
+    gateway_credential_io.register_candidates(
+        dict(os.environ, AG2_DEVICE_ENV=str(device_env_path())), diagnostics.REGISTRY)
+
+
+def wake_context(_args) -> int:
+    from . import runtime_text
+    _register_device_secrets()
+    cfg = _installed_config()
+    values = {"<AGENT_MXID>": cfg.get("AGENT_MXID") or "<AGENT_MXID>",
+              "<REPLY_COMMAND>": cfg.get("REPLY_COMMAND") or find_reply_command()
+              or REPLY_COMMAND,
+              "<ACTIVITY_FILE>": cfg.get("ACTIVITY_FILE")
+              or str(_home() / ".muse" / "last_active")}
+    state = Path(cfg.get("STATE_DIR") or _dirs.state_dir())
+    instance = (cfg["GATEWAY_INSTANCE"] if "GATEWAY_INSTANCE" in cfg
+                else os.environ.get("GATEWAY_INSTANCE") or "").strip()
+    text, source = runtime_text.wake_context(
+        runtime_text.current_cache(state, instance), values,
+        runtime_text.owner_dm_room(state, instance, cfg.get("AGENT_MXID") or ""))
+    print(text, end="")
+    print(f"wake-context: {source}", file=sys.stderr)
+    return 0
+
+
+def _keepalive(args) -> int:
+    from . import keepalive
+    return keepalive.main(args)
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="ag2-sparrow-hatch",
                                  description="Meta Hatch adapter for ag2-sparrow.")
@@ -848,15 +1181,37 @@ def main(argv=None) -> int:
     p.add_argument("--activity-file", help="activity marker (default: ~/.muse/last_active)")
     p.add_argument("--gateway-instance", help="Sparrow's GATEWAY_INSTANCE (default: from the "
                    "environment, as ag2-sparrow reads it)")
-    p.add_argument("--force", action="store_true", help="replace a locally modified hook script "
-                   "or ag2-sparrow.service")
+    p.add_argument("--force", action="store_true", help="replace a locally modified hook script, "
+                   "ag2-sparrow.service, or keepalive tasks install did not write")
     p.add_argument("--no-service", action="store_true", help="do not set up the ag2-sparrow "
-                   "systemd user service that restarts Sparrow")
+                   "systemd user service; the agent's keepawake task still restarts Sparrow")
+    p.add_argument("--no-keepalive", action="store_true", help="do not schedule the keepalive "
+                   "task")
+    p.add_argument("--no-start", action="store_true", help="do not start, replace or check "
+                   "Sparrow now; the agent's keepawake task starts it on its next run")
+    p.add_argument("--cron-dir", help="where Hatch reads scheduled tasks (default: "
+                   "~/workspace/cron.d/minutely)")
+    p.add_argument("--keepalive-log", help="the keepalive log (default: "
+                   "~/keepalive-probe.log)")
     p.set_defaults(func=install)
     u = sub.add_parser("uninstall", help="remove what install set up")
     u.add_argument("--service", action="store_true", help="stop, disable and remove the "
                    "ag2-sparrow user service")
+    u.add_argument("--keepalive", action="store_true", help="remove the keepalive tasks install "
+                   "wrote (the keepalive log is kept)")
     u.set_defaults(func=uninstall)
+    k = sub.add_parser("keepalive", help="what the keepalive task and Sparrow run")
+    k.add_argument("action", choices=("keepawake", "health", "status", "report"),
+                   help="keepawake: restart Sparrow if it is down and append a line to the log; "
+                   "health: print Sparrow's health row (JSON); status: print the state, writing "
+                   "nothing; report: list the log's gaps and restarts")
+    k.add_argument("--log", help="the keepalive log (default: as install recorded it, else "
+                   "~/keepalive-probe.log)")
+    from . import keepalive
+    k.add_argument("--gap-minutes", type=float, default=keepalive.GAP_MINUTES,
+                   help=f"report: a gap longer than this is a stop (default "
+                   f"{keepalive.GAP_MINUTES})")
+    k.set_defaults(func=_keepalive)
     v = sub.add_parser("verify", help="check the installed hook")
     v.set_defaults(func=verify)
     s = sub.add_parser("sparrow", help=f"check that Sparrow is running (exit {SPARROW_DOWN}) "
@@ -869,16 +1224,16 @@ def main(argv=None) -> int:
                        f"Sparrow posted it (exit {REPLY_POSTED} posted, {REPLY_NOT_POSTED} not "
                        f"posted, {REPLY_UNCONFIRMED} queued but not confirmed)")
     r.add_argument("result_file", help="the item's result_file from the wake payload")
-    r.add_argument("--answering", metavar="WORDS",
-                   help=f"{ANSWERING_MIN_WORDS} or more consecutive words ({ANSWERING_MIN_CHARS} "
-                   "characters of text written without spaces) of the message this "
-                   "answers, copied from its snippet (required: a reply to another item's "
-                   "message is refused)")
+    # Accepted and ignored, so a worker still on an older prompt is not refused.
+    r.add_argument("--answering", help=argparse.SUPPRESS)
     r.add_argument("--body", help="the reply text (default: read from stdin)")
     r.add_argument("--no-send", action="store_true", help="close the item without posting")
     r.add_argument("--wait", type=float, default=REPLY_WAIT_S,
                    help=f"seconds to wait for Sparrow to confirm (default {REPLY_WAIT_S:g})")
     r.set_defaults(func=reply)
+    w = sub.add_parser("wake-context", help="print the prompt and worker note a woken worker "
+                       "follows (the backend's served copy when valid, else the built-in one)")
+    w.set_defaults(func=wake_context)
     args = ap.parse_args(argv)
     return args.func(args)
 

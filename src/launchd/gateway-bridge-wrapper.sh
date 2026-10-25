@@ -13,6 +13,9 @@
 # the launchd job tracks THIS pid and KeepAlive restarts the bridge on death —
 # the fix for the 2026-07-10 incident where the bridge died and stayed dead for
 # 3 days with nothing restarting it (mobile messages stranded in the cloud).
+#
+# Beside the bridge it keeps `src/sparrowd.py --agent-bridges` alive, the only supervisor of the
+# agent bridges declared under <workspace>/agents on this install; that child does its own scanning.
 
 set -euo pipefail
 
@@ -115,16 +118,46 @@ emit_restart_alert() {
     return 0
   fi
   echo "$NOW" > "$ALERT_STAMP"
-  printf '%s\n' "⚠️ The gateway bridge exited and was automatically restarted." > "$WORKSPACE/results/proactive-gateway-bridge-restarted-$NOW.txt"
+  printf '%s\n' "⚠️ The gateway bridge exited and was automatically restarted." \
+    | python3 "$REPO/src/result_publish.py" "$WORKSPACE/results/proactive-gateway-bridge-restarted-$NOW.txt"
   osascript -e "display notification \"The gateway bridge exited and was automatically restarted.\" with title \"Sutando\"" >/dev/null 2>&1 || true
 }
 if [ -f "$MARKER" ]; then emit_restart_alert; fi
 date +%s > "$MARKER"
 CHILD_PID=''
 STOPPING=0
+AGENTS_SUPERVISOR="$REPO/src/sparrowd.py"
+AGENTS_PID=''
+AGENTS_NEXT_START=0
+POLL_S=1
+# One agent-bridge supervisor at a time: started when none is running, relaunched
+# RESTART_DELAY after it exits (its own log says why), never while its pid is live.
+tend_agents_supervisor() {
+  if [ -n "$AGENTS_PID" ]; then
+    kill -0 "$AGENTS_PID" 2>/dev/null && return 0
+    set +e
+    wait "$AGENTS_PID"
+    local rc=$?
+    set -e
+    AGENTS_PID=''
+    echo "[gateway-bridge-wrapper] agent-bridge supervisor exited rc=$rc; relaunching in ${RESTART_DELAY}s" >&2
+    AGENTS_NEXT_START=$(( $(date +%s) + RESTART_DELAY ))
+  fi
+  [ "$(date +%s)" -ge "$AGENTS_NEXT_START" ] || return 0
+  python3 "$AGENTS_SUPERVISOR" --agent-bridges &
+  AGENTS_PID=$!
+  echo "[gateway-bridge-wrapper] agent-bridge supervisor started (pid $AGENTS_PID)" >&2
+}
+stop_agents_supervisor() {
+  [ -n "$AGENTS_PID" ] || return 0
+  kill "$AGENTS_PID" 2>/dev/null || true
+  wait "$AGENTS_PID" 2>/dev/null || true
+  AGENTS_PID=''
+}
 stop_wrapper() {
   STOPPING=1
   [ -z "$CHILD_PID" ] || kill "$CHILD_PID" 2>/dev/null || true
+  [ -z "$AGENTS_PID" ] || kill "$AGENTS_PID" 2>/dev/null || true
 }
 trap stop_wrapper TERM INT HUP
 while [ "$STOPPING" = 0 ]; do
@@ -138,18 +171,33 @@ while [ "$STOPPING" = 0 ]; do
   export REMOTE_TASK_TOKEN REMOTE_TASK_TIER
   if [ -z "$REMOTE_TASK_TOKEN" ]; then
     echo "[gateway-bridge-wrapper] token removed — nothing to relaunch; exiting cleanly." >&2
+    stop_agents_supervisor
     rm -f "$MARKER"
     exit 0
   fi
-  python3 "$REPO/src/remote-gateway-bridge.py" &
+  tend_agents_supervisor
+  # Once a named row holds the primary this legacy bridge is a secondary: it must not
+  # inherit the proactive room, or two bridges post nudges. Otherwise the variable is
+  # passed through as is, unset included: the bridge reads the device env only when unset.
+  if _PRIMARY="$(python3 "$REPO/scripts/connections.py" primary 2>/dev/null)" && [ -n "$_PRIMARY" ]; then
+    REMOTE_PROACTIVE_ROOM="" python3 "$REPO/src/remote-gateway-bridge.py" &
+  else
+    python3 "$REPO/src/remote-gateway-bridge.py" &
+  fi
   CHILD_PID=$!
+  # Poll rather than `wait`: /bin/bash has no `wait -n`, and the agent-bridge
+  # supervisor must be tended while the bridge runs.
+  while kill -0 "$CHILD_PID" 2>/dev/null && [ "$STOPPING" = 0 ]; do
+    tend_agents_supervisor
+    sleep "$POLL_S"
+  done
   set +e
   wait "$CHILD_PID"
   CHILD_RC=$?
   set -e
   CHILD_PID=''
   [ "$STOPPING" = 0 ] || break
-  [ "$CHILD_RC" -eq 75 ] && { rm -f "$MARKER"; exit 0; }
+  [ "$CHILD_RC" -eq 75 ] && { stop_agents_supervisor; rm -f "$MARKER"; exit 0; }
   emit_restart_alert
   sleep "$RESTART_DELAY" &
   CHILD_PID=$!
@@ -158,3 +206,4 @@ while [ "$STOPPING" = 0 ]; do
   set -e
   CHILD_PID=''
 done
+stop_agents_supervisor

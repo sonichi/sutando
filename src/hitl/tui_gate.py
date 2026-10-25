@@ -32,6 +32,39 @@ def guard_for(session: str, prompt: Optional[str], state: str) -> str:
     return hashlib.sha256(f"{session}\n{prompt or state}".encode()).hexdigest()[:16]
 
 
+# A usage limit is one episode per seat however its screen repaints (banner, menu, refused
+# turn): its cards share one guard, so every supervisor's card for it dedups onto one.
+LIMIT_EPISODE = "usage-limit"
+
+
+def limit_guard(session: str) -> str:
+    return f"{LIMIT_EPISODE}:{session}"
+
+
+def limit_card(req: HumanRequirement) -> bool:
+    return (req.subject or {}).get("episode") == LIMIT_EPISODE
+
+
+def limit_card_holds(req: HumanRequirement, pane: Optional[str], runtime: Optional[str] = None,
+                     outrun: bool = False) -> bool:
+    """A usage-limit card stays open while its limit stands on `pane`; every resolver asks this."""
+    if not limit_card(req):
+        return False
+    from delivery.pane_gate import limit_standing
+    return limit_standing(pane, runtime, outrun)
+
+
+def limit_unblock(session: Optional[str] = None, runtime: Optional[str] = None) -> str:
+    """How the owner lifts a usage limit, for the card body; the steps are the runtime's own."""
+    where = f"open its terminal (tmux session {session})" if session else "open its terminal"
+    if runtime == "codex":
+        return (f"It continues when the limit resets. To unblock it sooner, {where} and run "
+                "`codex login` to switch to another account.")
+    return (f"It continues when the limit resets. To unblock it sooner, {where} and run "
+            "/usage-credits to use extra credits, /login to switch to another account, "
+            "or /model to switch to a model with usage left.")
+
+
 def option_blocks(prompt: Optional[str]) -> List[Tuple[int, List[str], Optional[int]]]:
     """Each contiguous run of numbered lines: (start line, labels, caret index)."""
     blocks: List[Tuple[int, List[str], Optional[int]]] = []
@@ -89,10 +122,12 @@ def _open_terminal() -> Action:
 
 def requirement_for(state: str, gate: Optional[str], prompt: Optional[str],
                     session: str, detail: str, fallback_message: str,
-                    runtime: Optional[str] = None) -> HumanRequirement:
+                    runtime: Optional[str] = None,
+                    episode: Optional[str] = None) -> HumanRequirement:
     """The requirement a gate deserves; unparseable or non-semantic gates keep the
     blocked card with no button, so a key is never guessed. A session with no stamped
-    runtime predates the stamp and ran Claude, so `runtime` falls back to "claude"."""
+    runtime predates the stamp and ran Claude, so `runtime` falls back to "claude".
+    `episode` LIMIT_EPISODE keys the card on the seat, not the screen, and announces it once."""
     options, caret = parse_options(prompt)
     subject: Dict[str, object] = {
         "session": session,
@@ -106,10 +141,11 @@ def requirement_for(state: str, gate: Optional[str], prompt: Optional[str],
     kind, title, message, actions = FALLBACK_KIND, f"{session} · {state}", fallback_message, []
     option_for_action: Dict[str, int] = {}
 
-    if _NEVER_ONE_CLICK.search(prompt or "") or (gate is not None and gate not in SEMANTIC_GATES and state != "logged-out"):
-        pass  # keeps the blocked card: never a one-click answer on a trust/spend gate
+    if (episode == LIMIT_EPISODE or _NEVER_ONE_CLICK.search(prompt or "")
+            or (gate is not None and gate not in SEMANTIC_GATES and state != "logged-out")):
+        pass  # keeps the blocked card: never a one-click answer on a trust/spend gate or a limit
     elif gate == "login" or state == "logged-out":
-        kind, title = "auth", "Claude needs to be reconnected"
+        kind, title = "auth", "Claude needs you to sign in again"
         message = "Your Claude session has expired. Sign in again to continue."
         actions = [Action(id="authenticate", kind="authenticate", label="Sign in to Claude")]
     elif gate == "press-enter":
@@ -132,9 +168,13 @@ def requirement_for(state: str, gate: Optional[str], prompt: Optional[str],
             actions = [Action(id=f"opt{i + 1}", kind="select", label=o) for i, o in enumerate(options)]
 
     subject["option_for_action"] = option_for_action
+    guard = guard_for(session, prompt, state)
+    if episode == LIMIT_EPISODE:
+        guard = limit_guard(session)
+        subject.update(episode=episode, remind=False)
     return HumanRequirement(
         kind=kind, runtime=runtime or "claude", message=message, title=title,
-        guard=guard_for(session, prompt, state),
+        guard=guard,
         device={"id": session, "name": session},
         actions=actions + [_open_terminal()],
         subject=subject,

@@ -2,7 +2,7 @@
 """Regenerate the package modules from the canonical sutando src/ (single source).
 
 Everything in MAP below is bundled verbatim from sonichi/sutando `src/`, which is
-canonical for those modules — currently 19 of them, including outbox.py and its
+canonical for those modules — currently 39 of them, including outbox.py and its
 transport seam outbox_adapter.py. Only the modules NOT in MAP are package-canonical
 and intentionally diverge from src (remote_gateway_bridge, _dirs, send_allowlist:
 dir-interface, no workspace-resolution).
@@ -35,11 +35,22 @@ MAP = {
     "src/local_task_protocol.py": "local_task_protocol.py",
     "src/result_markers.py": "result_markers.py",
     "src/delivery/readiness.py": "result_ready.py",
+    # the one results/ publisher: the bridge stages and renames through it
+    "src/result_publish.py": "result_publish.py",
     # terminal disposal of a result file (claim / verify / quarantine / recover);
     # the gateway delegates, tests/gateway-disposal-delegation.test.py pins it
     "src/delivery/disposal.py": "result_disposal.py",
     "src/dedup_recovery.py": "dedup_recovery.py",
     "src/file_lock.py": "file_lock.py",
+    # one-process exclusion per work root (flock + holder record); builds on file_lock
+    "src/holder_lock.py": "holder_lock.py",
+    # where the gateway credentials come from and which source wins; parsing and masking are
+    # the generated gateway_credentials contract it imports
+    "src/gateway_credential_sources.py": "gateway_credential_sources.py",
+    # the non-blocking, bounded reader every adapter uses for a credential file
+    "src/bounded_file_read.py": "bounded_file_read.py",
+    # which homeservers are DotSpaces; the bridge's IPv4 preference asks it per gateway host
+    "src/dotspace.py": "dotspace.py",
     "src/workspace_lock.py": "workspace_lock.py",
     "src/chat_secret_filter.py": "chat_secret_filter.py",
     "src/policy/egress/result.py": "team_result_guard.py",
@@ -59,9 +70,28 @@ MAP = {
     "src/undelivered_quarantine.py": "undelivered_quarantine.py",
     # the destined-proactive filename grammar every bridge and the voice drain read
     "src/proactive_routing.py": "proactive_routing.py",
+    # task ordering (urgent > normal > low, FIFO within a tier) for every inbox consumer
+    "src/task_priority.py": "task_priority.py",
+    # one adapter's task execution lifecycle: work-dir lock, classifier, claims, publication
+    "src/task_lifecycle.py": "task_lifecycle.py",
     # worker-pool completion-record contract: the pool skill writes through it
     # and the bridge reads through it, so neither keeps a private predicate.
     "skills/worker-pool/scripts/pool_record.py": "pool_record.py",
+    # the CLI's abnormal-banner grammar (login prompt, provider limit, compaction, parked error), as data
+    "src/cli_wedge_patterns.py": "cli_wedge_patterns.py",
+    # the tmux tri-state probe and the guarded pane-key send with its two shell scripts
+    "src/tmux_probe.py": "tmux_probe.py",
+    "src/tmux_pane_keys.py": "tmux_pane_keys.py",
+    "src/tmux-pane-keys.sh": "tmux-pane-keys.sh",
+    "src/bounded-wait.sh": "bounded-wait.sh",
+    # the HITL decision domain and store (the claude-local card's CAS), imports relative-first
+    "src/hitl/__init__.py": "hitl/__init__.py",
+    "src/hitl/schema.py": "hitl/schema.py",
+    "src/hitl/host.py": "hitl/host.py",
+    "src/hitl/manager.py": "hitl/manager.py",
+    "src/hitl/projector.py": "hitl/projector.py",
+    "src/hitl/renotify.py": "hitl/renotify.py",
+    "src/hitl/replies.py": "hitl/replies.py",
 }
 PKG_DIR = Path(__file__).resolve().parent.parent / "ag2_sparrow"
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -82,6 +112,7 @@ def main() -> int:
             if have != want:
                 drift.append(pkg_name)
         else:
+            pkg.parent.mkdir(parents=True, exist_ok=True)
             pkg.write_text(want, encoding="utf-8")
     if check:
         if drift:
