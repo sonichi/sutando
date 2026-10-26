@@ -105,9 +105,11 @@ STAND_IN = ("import sys; sys.path.insert(0, %r); from ag2_sparrow import task_io
 SUCCESSOR = ("import sys; sys.path.insert(0, %r); from ag2_sparrow import holder_lock as h\n"
              "g = h.acquire(%r, install_id=h.install_id()); print('held' if isinstance(g, h.Acquired) else g, flush=True)\n"
              "sys.stdin.read(); h.release(g.owner)")
-REPLACER = ("import os, sys; sys.path.insert(0, %r); from ag2_sparrow import task_io\n"
-            "r = %r; os.rename(r, r + '.parked'); os.mkdir(r); o = task_io.acquire_lock(r, %r)\n"
-            "print('held', flush=True); sys.stdin.read(); task_io.release_lock(o)")
+REPLACER = ("import os, sys; sys.path.insert(0, %r); from ag2_sparrow import connect_common as cm, task_io\n"
+            "r, relay, agent, adapter = %r, %r, %r, %r\n"
+            "os.rename(r, r + '.parked'); os.rename(r + '.bridge', r + '.bridge.parked'); os.mkdir(r)\n"
+            "cm.write_seat(r + '.bridge', {'relay_url': relay, 'bearer': 'replacer-bearer-RRRR7777', 'agent_id': agent})\n"
+            "o = task_io.acquire_lock(r, adapter); print('held', flush=True); sys.stdin.read(); task_io.release_lock(o)")
 OP_HOLDER = ("import sys; sys.path.insert(0, %r); from ag2_sparrow import connect_common as cm\n"
              "from ag2_sparrow.adapters.codex.connect_cli import LOCAL\n"
              "with cm.operation_lock(LOCAL): print('held', flush=True); sys.stdin.read()")
@@ -1277,49 +1279,84 @@ class ConnectCode(Base):
             runner.stop_session()
 
     def replace_root(self):
-        """A real process parks the root, puts a fresh directory at its path and holds that with the
-        other adapter: the held inode is no longer what the path names."""
-        p = subprocess.Popen([sys.executable, "-c", REPLACER % (str(PKG), str(self.root), "claude-local")],
+        """A real process parks the root and its seat, seats a fresh root at the same paths with another
+        token and holds it with the other adapter: the held directories are no longer what the paths name."""
+        p = subprocess.Popen([sys.executable, "-c", REPLACER % (str(PKG), str(self.root), RELAY, AGENT, "claude-local")],
                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
         self.assertEqual(p.stdout.readline().strip(), "held")
         return p
 
-    def test_a_root_replaced_after_connect_holds_it_keeps_the_seat(self):
-        self.root.mkdir(parents=True)
-        late, writes, real, real_write = [], [], cm.acquire_lock, cm.write_seat
+    def assert_replaced_and_refused(self, target, wrap, why):
+        """connect with connect_common.`target` wrapped by `wrap(real, replace)`: it refuses, the replacing
+        root's seat keeps its own token, and the parked seat holds its previous bytes, never the new bearer."""
+        before = {p.name: p.read_bytes() for p in self.seated_by_another_adapter()}
+        late, inode = [], []
 
-        def acquired_then_replaced(root, adapter):
-            owner = real(root, adapter)
+        def replace():
             late.append(self.replace_root())
-            return owner
+            inode.append(os.stat(self.seat() / "token").st_ino)
         try:
-            with mock.patch.object(cm, "acquire_lock", side_effect=acquired_then_replaced), \
-                    mock.patch.object(cm, "write_seat", side_effect=lambda seat, r: (
-                        writes.append(seat) if late else None) or real_write(seat, r)):
-                self.assert_refused_untouched(None, f"{self.root} is no longer the directory connect holds",
-                                              spent="the code is spent but the seat was not written")
+            if target == "os.replace":
+                with mock.patch("os.replace", side_effect=wrap(os.replace, replace)):
+                    rc, out, err = self.connect(Backend())
+            else:
+                with mock.patch.object(cm, target, side_effect=wrap(getattr(cm, target), replace)):
+                    rc, out, err = self.connect(Backend())
         finally:
             for p in late:
                 unhold(p)
-        self.assertEqual((len(late), writes), (1, []), "write_seat never ran once the root was replaced")
+        self.assertEqual(len(late), 1, "replaced once")
+        self.assertEqual(os.stat(self.seat() / "token").st_ino, inode[0], "the replacing seat's token never replaced")
+        self.assertEqual(rc, cli.EXIT_UNUSABLE, out + err)
+        self.assertNotIn("connected:", out)
+        self.assertIn(why, err)
+        self.assertEqual((self.seat() / "token").read_text(), f"{RELAY}|replacer-bearer-RRRR7777\n",
+                         "the replacing root's seat is untouched")
+        parked = Path(str(self.seat().parent.parent) + ".parked") / "channels" / "ag2space"
+        self.assertEqual({p.name: p.read_bytes() for p in parked.iterdir()}, before, "the parked seat as it was")
 
-    def test_a_root_replaced_during_the_write_puts_the_previous_seat_back(self):
-        self.root.mkdir(parents=True)
-        late, real = [], cm.write_seat
+    def test_a_root_replaced_after_connect_holds_it_keeps_both_seats(self):
+        def wrap(real, replace):
+            return lambda root, adapter: (real(root, adapter), replace())[0]
+        self.assert_replaced_and_refused("acquire_lock", wrap, "is no longer what connect holds")
 
-        def written_then_replaced(seat, redeemed):
-            got = real(seat, redeemed)
-            if task_io.lock_holder(str(self.root)).get("adapter") == cm.CONNECT_HOLDER:
-                late.append(self.replace_root())
-            return got
-        try:
-            with mock.patch.object(cm, "write_seat", side_effect=written_then_replaced):
-                self.assert_refused_untouched(None, "was replaced while the seat was written; the previous seat "
-                                                    "was put back", spent="the code is spent but the seat was not written")
-        finally:
-            for p in late:
-                unhold(p)
-        self.assertEqual(len(late), 1)
+    def test_a_root_replaced_between_the_check_and_the_write_keeps_both_seats(self):
+        def wrap(real, replace):
+            calls = []
+
+            def checked(owner, root):
+                got = real(owner, root)
+                if not calls:
+                    replace()
+                calls.append(got)
+                return got
+            return checked
+        self.assert_replaced_and_refused("root_is_held", wrap, "was replaced while the seat was written")
+
+    def test_a_write_that_fails_partway_after_a_replacement_puts_the_held_seat_back(self):
+        def wrap(real, replace):
+            failed = []
+
+            def committing(src, dst, *a, **kw):
+                if os.path.basename(dst) == ".env" and not failed:
+                    failed.append(replace())
+                    raise PermissionError(13, "Permission denied")
+                return real(src, dst, *a, **kw)
+            return committing
+        self.assert_replaced_and_refused("os.replace", wrap, "could not be written (Permission denied); its "
+                                                             "previous files were put back")
+
+    def test_a_root_replaced_after_the_write_keeps_both_seats(self):
+        def wrap(real, replace):
+            calls = []
+
+            def checked(owner, root):
+                if calls:
+                    replace()
+                calls.append(True)
+                return real(owner, root)
+            return checked
+        self.assert_replaced_and_refused("root_is_held", wrap, "was replaced while the seat was written")
 
     def test_a_stable_root_through_the_same_seam_connects(self):
         self.seated_by_another_adapter()

@@ -1254,9 +1254,13 @@ def redeem_code(base: str, code: str, opener=None, sleep=None) -> "tuple[dict | 
 def seat_instance(seat) -> str:
     """The seat's GATEWAY_INSTANCE when its .env already holds a valid one (kept across reconnects), else
     a fresh one."""
-    path = os.path.join(_sources.seat_channel_dir(seat), ".env")
-    text, _why = read_regular(path)
-    kept = _sources.parse_env_text(text or "").get("GATEWAY_INSTANCE", "")
+    text, _why = read_regular(os.path.join(_sources.seat_channel_dir(seat), ".env"))
+    return instance_of(text or "")
+
+
+def instance_of(env_text: str) -> str:
+    """The valid GATEWAY_INSTANCE a seat .env's text holds, else a fresh one."""
+    kept = _sources.parse_env_text(env_text).get("GATEWAY_INSTANCE", "")
     return kept if _sources.SEAT_INSTANCE_RE.fullmatch(kept) else _sources.mint_gateway_instance()
 
 
@@ -1274,46 +1278,121 @@ def root_is_held(owner, root: str) -> bool:
     return stat.S_ISDIR(here.st_mode) and (here.st_dev, here.st_ino) == (held.st_dev, held.st_ino)
 
 
-def _identity(path) -> "tuple | None":
-    try:
-        st = os.lstat(path)
-    except FileNotFoundError:
-        return None
-    return stat.S_IFMT(st.st_mode), st.st_dev, st.st_ino
+_DIR_OPEN = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+_FILE_FLAGS = getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
 
 
-def _bytes_or_none(path) -> "bytes | None":
+def _seat_dirs(seat) -> "list[str]":
+    """The seat, its channels dir and its channel dir, outermost first."""
+    chan = _sources.seat_channel_dir(seat)
+    return [os.fspath(seat), os.path.dirname(chan), chan]
+
+
+def _open_seat_dirs(seat) -> "list[int]":
+    """_seat_dirs opened in turn, each through its parent's fd and made 0700 if missing; no link followed."""
+    paths, fds = _seat_dirs(seat), []
+    parent = os.open(os.path.dirname(paths[0]), _DIR_OPEN)
     try:
-        with open(path, "rb") as fh:
-            return fh.read()
+        for path in paths:
+            name = os.path.basename(path)
+            try:
+                os.mkdir(name, 0o700, dir_fd=fds[-1] if fds else parent)
+            except FileExistsError:
+                pass
+            fds.append(os.open(name, _DIR_OPEN, dir_fd=fds[-1] if fds else parent))
+    except OSError:
+        for fd in fds:
+            os.close(fd)
+        raise
+    finally:
+        os.close(parent)
+    return fds
+
+
+def _seat_bound(owner, root: str, seat, fds) -> bool:
+    """Each seat path still names the directory held open and, last, `root` still names owner's."""
+    for path, fd in zip(_seat_dirs(seat), fds):
+        try:
+            here, held = os.lstat(path), os.fstat(fd)
+        except OSError:
+            return False
+        if (here.st_dev, here.st_ino) != (held.st_dev, held.st_ino):
+            return False
+    return root_is_held(owner, root)
+
+
+def _read_at(dir_fd: int, name: str) -> "bytes | None":
+    try:
+        fd = os.open(name, os.O_RDONLY | _FILE_FLAGS, dir_fd=dir_fd)
     except FileNotFoundError:
         return None
+    with os.fdopen(fd, "rb") as fh:
+        return fh.read()
+
+
+def _put_at(dir_fd: int, name: str, data: "bytes | None") -> None:
+    """`data` as `name` in the held directory through a temp and a rename there, 0600; None removes it."""
+    if data is None:
+        try:
+            os.unlink(name, dir_fd=dir_fd)
+        except FileNotFoundError:
+            pass
+        return
+    tmp = f".{name}.{os.getpid()}.{time.monotonic_ns()}"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _FILE_FLAGS, 0o600, dir_fd=dir_fd)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+    except BaseException:
+        try:
+            os.unlink(tmp, dir_fd=dir_fd)
+        except FileNotFoundError:
+            pass
+        raise
 
 
 def write_seat_held(owner, root: str, seat, redeemed: dict) -> "tuple[str, str]":
-    """write_seat bound to the root `owner` holds: refused unless `root` names that directory first; if it
-    stops naming it, or a seat directory is replaced, during the write, the previous seat files are put back."""
-    if not root_is_held(owner, root):
-        return "", f"{root} is no longer the directory connect holds (it was replaced); the seat is unchanged"
-    chan = _sources.seat_channel_dir(seat)
-    dirs = (os.fspath(seat), os.path.dirname(chan), chan)
-    ids = [_identity(d) for d in dirs]
-    if any(i is not None and i[0] != stat.S_IFDIR for i in ids):
-        return "", f"{seat} is not a plain directory tree; the seat is unchanged"
-    names = (_sources.SEAT_TOKEN_NAME, ".env")
-    before = {n: _bytes_or_none(os.path.join(chan, n)) for n in names}
-    seat_env, problem = write_seat(seat, redeemed)
-    if problem:
-        return "", problem
-    if root_is_held(owner, root) and all(i is None or _identity(d) == i for d, i in zip(dirs, ids)):
-        return seat_env, ""
-    for n, data in before.items():
-        path = os.path.join(chan, n)
-        if data is None:
-            Path(path).unlink(missing_ok=True)
-        else:
-            _sources._replace_file(path, data.decode("utf-8"), 0o600)
-    return "", f"{root} was replaced while the seat was written; the previous seat was put back"
+    """write_seat bound to the root `owner` holds, all seat I/O through the seat directories held open:
+    refused unless the root and the seat paths name them first; if either is replaced by the end of the
+    write, the held channel dir gets its previous files back (never the path) and it refuses."""
+    try:
+        fds = _open_seat_dirs(seat)
+    except OSError as e:
+        return "", f"the seat {seat} could not be opened ({e.strerror or e}); the seat is unchanged"
+    try:
+        if not _seat_bound(owner, root, seat, fds):
+            return "", f"{root} or its seat is no longer what connect holds (it was replaced); the seat is unchanged"
+        chan = fds[-1]
+        before = {n: _read_at(chan, n) for n in (_sources.SEAT_TOKEN_NAME, ".env")}
+        files, problem = _sources.seat_credential_files(
+            seat, agent_id=redeemed["agent_id"], tier=STANDALONE_TIER, relay_url=redeemed["relay_url"],
+            bearer=redeemed["bearer"], instance=instance_of((before[".env"] or b"").decode("utf-8", "replace")))
+        if problem:
+            return "", problem
+        done = False
+        try:
+            os.fchmod(chan, 0o700)
+            for name, text in files.items():
+                _put_at(chan, name, text.encode("utf-8"))
+            done = _seat_bound(owner, root, seat, fds)
+        except OSError as e:
+            problem = f"the seat {seat} could not be written ({e.strerror or e}); its previous files were put back"
+        finally:
+            if not done:
+                for name, data in before.items():
+                    _put_at(chan, name, data)
+        if done:
+            return seat_env_path(seat), ""
+        return "", problem or (f"{root} was replaced while the seat was written; the previous seat files were put "
+                               "back in the seat directory connect held, and the seat now at the path was not touched")
+    except OSError as e:
+        return "", f"the seat {seat} could not be written or put back ({e.strerror or e})"
+    finally:
+        for fd in fds:
+            os.close(fd)
 
 
 def write_seat(seat, redeemed: dict) -> "tuple[str, str]":
