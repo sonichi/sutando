@@ -348,7 +348,8 @@ def redeem_into_seat(base: str, code_arg, trust_relay_host: str, preflight,
     if problem:
         return None, f"the code is spent but the seat was not written: {problem}; make a new code"
     written, held = cm.under_root(local, root,
-                                  lambda owner: cm.write_seat_held(owner, root, bridge_home(root), redeemed))
+                                  lambda owner: cm.write_seat_held(owner, root, bridge_home(root), redeemed),
+                                  precheck=lambda: cm.seat_problem(bridge_home(root)))
     if held:
         return None, (f"{held}; the code is spent and nothing was written ({bridge_home(root)} is unchanged): "
                       "make a new code in AG2 Space once the root is free")

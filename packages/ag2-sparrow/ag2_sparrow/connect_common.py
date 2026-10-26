@@ -693,32 +693,60 @@ def launcher_log(shape: Shape) -> str:
 CONNECT_HOLDER = "connect"
 
 
-def under_root(shape: Shape, root: str, act) -> "tuple[object, str]":
-    """(act(owner), '') run while this process holds `root`'s lock as `owner`, so no adapter takes or leaves
-    the root meanwhile; act binds itself to owner's root (root_is_held). A free root is taken; one held by `shape`'s own job on this very root is stopped, then
-    taken; anything else, or a root another process takes first, is (None, why) and act never runs."""
+def under_root(shape: Shape, root: str, act, precheck=None) -> "tuple[object, str]":
+    """(act(owner), '') run while this process holds `root`'s lock as `owner`; act returns (value, problem)
+    and binds itself to owner's root (root_is_held). A free root is taken; one held by `shape`'s own job on
+    this very root is stopped, then taken, and that job is started again on any path where act did not
+    succeed. `precheck()` refuses before anything stops; anything else is (None, why) and act never runs."""
     try:
         with operation_lock(shape):
             problem, _manager, held = _root_lock(shape, root)
+            problem = problem or (precheck() if precheck is not None else "")
             if problem:
                 return None, problem
-            if held:
-                problem = stop_supervisor(shape) or _await_free(root)
-                if problem:
-                    return None, problem
-                print(f"stopped: {job_name(shape)}")
-            Path(root).mkdir(parents=True, exist_ok=True)
+            done = False
             try:
-                owner = acquire_lock(root, CONNECT_HOLDER)
-            except LockRefused as e:
-                return None, (f"{root} was taken by another process first ({e.line})"
-                              + (f"; {job_name(shape)} is stopped" if held else ""))
-            try:
-                return act(owner), ""
+                if held:
+                    problem = stop_supervisor(shape) or _await_free(root)
+                    if problem:
+                        return None, problem
+                    print(f"stopped: {job_name(shape)}")
+                Path(root).mkdir(parents=True, exist_ok=True)
+                try:
+                    owner = acquire_lock(root, CONNECT_HOLDER)
+                except LockRefused as e:
+                    return None, f"{root} was taken by another process first ({e.line})"
+                try:
+                    result = act(owner)
+                finally:
+                    release_lock(owner)
+                done = not result[1]
+                return result, ""
             finally:
-                release_lock(owner)
+                if held and not done:
+                    _restart_stopped(shape, root)
     except Busy as e:
         return None, str(e)
+
+
+def start_command(shape: Shape) -> str:
+    """What starts the job by hand, verbatim for a refusal."""
+    if is_macos():
+        return f"launchctl bootstrap {_launchd_target()} {supervisor_path(shape)}"
+    return f"systemctl --user enable --now {shape.service_name}"
+
+
+def _restart_stopped(shape: Shape, root: str) -> None:
+    """Start the job under_root stopped and confirm a fresh launcher of it holds `root` again; else say so
+    on stderr with the command that starts it."""
+    problem = start_supervisor(shape)
+    rec = None if problem else _fresh_holder(shape, root, {})
+    if rec is not None:
+        print(f"started again: {job_name(shape)} (launcher pid {rec['pid']})")
+        return
+    why = problem or f"no launcher of it took {root} within {CONFIRM_TIMEOUT_S:.0f} s ({holder_line(root)})"
+    print(f"error: {job_name(shape)} was stopped for this connect and did not start again: {why}; start it "
+          f"with: {start_command(shape)}", file=sys.stderr)
 
 
 def _root_lock(shape: Shape, root: str) -> "tuple[str, str, bool]":
@@ -1252,13 +1280,6 @@ def redeem_code(base: str, code: str, opener=None, sleep=None) -> "tuple[dict | 
     return None, "unreachable"  # pragma: no cover - the loop always returns
 
 
-def seat_instance(seat) -> str:
-    """The seat's GATEWAY_INSTANCE when its .env already holds a valid one (kept across reconnects), else
-    a fresh one."""
-    text, _why = read_regular(os.path.join(_sources.seat_channel_dir(seat), ".env"))
-    return instance_of(text or "")
-
-
 def instance_of(env_text: str) -> str:
     """The valid GATEWAY_INSTANCE a seat .env's text holds, else a fresh one."""
     kept = _sources.parse_env_text(env_text).get("GATEWAY_INSTANCE", "")
@@ -1392,6 +1413,34 @@ def _put_at(dir_fd: int, name: str, data: "bytes | None") -> None:
         raise
 
 
+def seat_problem(seat) -> str:
+    """'' when the seat can be written now, else why not, changing nothing but the seat's lockfile: each
+    existing seat directory opens without following a link, its files are regular and within
+    SEAT_FILE_MAX, and the seat lock can be taken. A seat not there yet is ''."""
+    fds = []
+    try:
+        parent = os.open(os.path.dirname(_seat_dirs(seat)[0]), _DIR_OPEN)
+        try:
+            for path in _seat_dirs(seat):
+                try:
+                    fds.append(os.open(os.path.basename(path), _DIR_OPEN, dir_fd=fds[-1] if fds else parent))
+                except FileNotFoundError:
+                    return ""
+        finally:
+            os.close(parent)
+        for name in (_sources.SEAT_TOKEN_NAME, ".env"):
+            _read_at(fds[-1], name)
+        with seat_lock(fds[0]):
+            return ""
+    except FileNotFoundError:
+        return ""
+    except OSError as e:
+        return f"the seat {seat} cannot be written ({e.strerror or e}); the seat is unchanged"
+    finally:
+        for fd in fds:
+            os.close(fd)
+
+
 def write_seat_held(owner, root: str, seat, redeemed: dict) -> "tuple[str, str]":
     """write_seat bound to the root `owner` holds, all seat I/O through the seat directories held open:
     refused unless the root and the seat paths name them first; if either is replaced by the end of the
@@ -1420,12 +1469,9 @@ def _write_seat_locked(owner, root: str, seat, fds, redeemed: dict) -> "tuple[st
         before = {n: _read_at(chan, n) for n in (_sources.SEAT_TOKEN_NAME, ".env")}
     except OSError as e:
         return "", f"the seat {seat} cannot be read ({e.strerror or e}); the seat is unchanged"
-    files, problem = _sources.seat_credential_files(
-        seat, agent_id=redeemed["agent_id"], tier=STANDALONE_TIER, relay_url=redeemed["relay_url"],
-        bearer=redeemed["bearer"], instance=instance_of((before[".env"] or b"").decode("utf-8", "replace")))
+    written, problem = _rendered_seat(seat, redeemed, before[".env"])
     if problem:
         return "", problem
-    written = {name: text.encode("utf-8") for name, text in files.items()}
     done = False
     try:
         os.fchmod(chan, 0o700)
@@ -1445,19 +1491,41 @@ def _write_seat_locked(owner, root: str, seat, fds, redeemed: dict) -> "tuple[st
                            "back in the seat directory connect held, and the seat now at the path was not touched")
 
 
+def _rendered_seat(seat, redeemed: dict, env_now: "bytes | None") -> "tuple[dict, str]":
+    """({name: bytes}, '') of the seat files for `redeemed`, the instance kept from `env_now`, each within
+    SEAT_FILE_MAX so the reader takes it back; else ({}, why)."""
+    files, problem = _sources.seat_credential_files(
+        seat, agent_id=redeemed["agent_id"], tier=STANDALONE_TIER, relay_url=redeemed["relay_url"],
+        bearer=redeemed["bearer"], instance=instance_of((env_now or b"").decode("utf-8", "replace")))
+    if problem:
+        return {}, problem
+    out = {name: text.encode("utf-8") for name, text in files.items()}
+    big = [name for name, data in out.items() if len(data) > SEAT_FILE_MAX]
+    return ({}, f"the seat's {big[0]} would be larger than {SEAT_FILE_MAX} bytes") if big else (out, "")
+
+
 def write_seat(seat, redeemed: dict) -> "tuple[str, str]":
     """(the seat's .env path, '') or ('', why): the redeemed credential written by its owner, standalone
-    tier, the instance kept or minted once; under the seat lock, as every seat writer is."""
-    os.makedirs(seat, mode=0o700, exist_ok=True)
-    seat_fd = os.open(seat, _DIR_OPEN)
+    tier, the instance kept or minted once; through the seat directories held open, under the seat lock."""
+    os.makedirs(os.path.dirname(os.fspath(seat)), exist_ok=True)
     try:
-        with seat_lock(seat_fd):
-            problem = _sources.write_seat_credentials(seat, agent_id=redeemed["agent_id"], instance=seat_instance(seat),
-                                                      tier=STANDALONE_TIER, relay_url=redeemed["relay_url"],
-                                                      bearer=redeemed["bearer"])
+        fds = _open_seat_dirs(seat)
+    except OSError as e:
+        return "", f"the seat {seat} could not be opened ({e.strerror or e})"
+    try:
+        with seat_lock(fds[0]):
+            written, problem = _rendered_seat(seat, redeemed, _read_at(fds[-1], ".env"))
+            if problem:
+                return "", problem
+            os.fchmod(fds[-1], 0o700)
+            for name, data in written.items():
+                _put_at(fds[-1], name, data)
+        return seat_env_path(seat), ""
+    except OSError as e:
+        return "", f"the seat {seat} could not be written ({e.strerror or e})"
     finally:
-        os.close(seat_fd)
-    return ("", problem) if problem else (seat_env_path(seat), "")
+        for fd in fds:
+            os.close(fd)
 
 
 def served_setup_line(vendor: str) -> str:

@@ -118,6 +118,8 @@ SUCCESSOR_WRITER = ("import os, sys; sys.path.insert(0, %r); from ag2_sparrow im
                     "got = cm.write_seat_held(o, r, r + '.bridge', {'relay_url': relay, "
                     "'bearer': 'successor-bearer-UUUU9999', 'agent_id': agent})\n"
                     "print('written', got[1] or 'ok', flush=True); sys.stdin.read(); task_io.release_lock(o)")
+SEAT_HOLDER = ("import fcntl, os, sys; fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o600)\n"
+               "fcntl.flock(fd, fcntl.LOCK_EX); print('held', flush=True); sys.stdin.read()")
 OP_HOLDER = ("import sys; sys.path.insert(0, %r); from ag2_sparrow import connect_common as cm\n"
              "from ag2_sparrow.adapters.codex.connect_cli import LOCAL\n"
              "with cm.operation_lock(LOCAL): print('held', flush=True); sys.stdin.read()")
@@ -1187,7 +1189,7 @@ class ConnectCode(Base):
         checked = []
         real = cm.under_root
         with mock.patch.object(cm, "under_root",
-                               side_effect=lambda shape, root, act: checked.append((shape.name, root)) or real(shape, root, act)):
+                               side_effect=lambda shape, root, act, **kw: checked.append((shape.name, root)) or real(shape, root, act, **kw)):
             rc, _out, err = self.connect(Backend())
         self.assertEqual(rc, 0, err)
         self.assertEqual(checked, [(cli.SHAPE, str(self.root))], "asked once, before the seat")
@@ -1386,7 +1388,7 @@ class ConnectCode(Base):
                 rc, out, err = self.connect(Backend())
                 self.assertEqual(rc, cli.EXIT_UNUSABLE, out + err)
                 self.assertNotIn("connected:", out)
-                self.assertIn("the code is spent but the seat was not written", err)
+                self.assertIn("the seat is unchanged; the code is spent", err)
                 self.assertEqual(os.readlink(link), str(to), "the link itself is left as it was")
                 self.assertEqual({p: p.read_bytes() for p in elsewhere.rglob("*") if p.is_file()}, target,
                                  "nothing written through the link")
@@ -1501,6 +1503,79 @@ class ConnectCode(Base):
                     self.assertEqual(seat_env, "")
                     self.assertIn(f"token is larger than {bound} bytes", why)
                     self.assertEqual(token, b"x" * size, "the oversized file is left as it is")
+
+    def running_job(self):
+        """The agent connected once: its managed launcher live on the root."""
+        fake = self.fake()
+        self.assertEqual(self.connect(Backend(), fake)[0], 0)
+        self.assertIsNotNone(fake.runner.pid())
+        return fake
+
+    def assert_job_runs(self, fake, pid=None):
+        rec = task_io.lock_holder(str(self.root))
+        self.assertTrue(rec.get("live") and rec.get("adapter") == L.name, rec)
+        self.assertEqual(rec["pid"], fake.runner.pid(), "the managed launcher holds the root")
+        if pid is not None:
+            self.assertEqual(fake.runner.pid(), pid, "the same launcher, never stopped")
+
+    def test_a_reconnect_the_seat_refuses_leaves_the_running_job_as_it_was(self):
+        rotated = Backend(answer={"relay_url": RELAY, "bearer": "rotated-bearer-OOOO5555", "agent_id": AGENT})
+        for name in ("fifo token", "oversized token", "seat lock held"):
+            with self.subTest(name):
+                fake = self.running_job()
+                pid, token, holder = fake.runner.pid(), self.seat() / "token", None
+                if name == "fifo token":
+                    token.unlink()
+                    os.mkfifo(token)
+                elif name == "oversized token":
+                    token.write_bytes(b"x" * (64 * 1024 + 1))
+                else:
+                    holder = subprocess.Popen([sys.executable, "-c", SEAT_HOLDER, str(cb.bridge_home(self.root) / ".seat.lock")],
+                                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+                    self.assertEqual(holder.stdout.readline().strip(), "held")
+                try:
+                    with mock.patch.object(cm, "SEAT_WAIT_S", 0.3, create=True):
+                        rc, out, err = self.connect(rotated, fake)
+                finally:
+                    if holder is not None:
+                        unhold(holder)
+                self.assertEqual(rc, cli.EXIT_UNUSABLE, out + err)
+                self.assertNotIn("connected:", out)
+                self.assertNotIn("stopped:", out, "nothing was stopped for a refusal known in advance")
+                self.assert_job_runs(fake, pid)
+                fake.runner.stop_session()
+                token.unlink(missing_ok=True)
+
+    def test_a_job_stopped_for_a_write_that_then_refuses_is_started_again(self):
+        fake = self.running_job()
+        token = self.seat() / "token"
+        token.unlink()
+        os.mkfifo(token)
+        with mock.patch.object(cm, "seat_problem", return_value="", create=True):
+            rc, out, err = self.connect(Backend(), fake)
+        self.assertEqual(rc, cli.EXIT_UNUSABLE, out + err)
+        self.assertIn(f"stopped: {cm.job_name(L)}", out)
+        self.assertIn(f"started again: {cm.job_name(L)} (launcher pid {fake.runner.pid()})", out)
+        self.assert_job_runs(fake)
+
+    def test_a_stopped_job_that_does_not_start_again_says_so_with_the_command(self):
+        fake = self.running_job()
+        (self.seat() / "token").write_bytes(b"x" * (64 * 1024 + 1))
+        fake.runner.table[("systemctl", "restart")] = 1
+        with mock.patch.object(cm, "seat_problem", return_value="", create=True):
+            rc, out, err = self.connect(Backend(), fake)
+        self.assertEqual(rc, cli.EXIT_UNUSABLE, out + err)
+        self.assertIn(f"error: {cm.job_name(L)} was stopped for this connect and did not start again", err)
+        self.assertIn(f"start it with: systemctl --user enable --now {L.service_name}", err)
+
+    def test_a_credential_that_would_render_past_the_read_bound_is_refused_unwritten(self):
+        owner = self.held_root()
+        before = (self.seat() / "token").read_bytes()
+        seat_env, why = cm.write_seat_held(owner, str(self.root), cb.bridge_home(self.root),
+                                           {"relay_url": RELAY, "bearer": "b" * (64 * 1024), "agent_id": AGENT})
+        self.assertEqual(seat_env, "")
+        self.assertIn("the seat's token would be larger than 65536 bytes", why)
+        self.assertEqual((self.seat() / "token").read_bytes(), before)
 
     def test_a_stable_root_through_the_same_seam_connects(self):
         self.seated_by_another_adapter()
