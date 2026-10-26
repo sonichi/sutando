@@ -12,7 +12,8 @@ arrive as a token): `preview_connection` asks the gateway embedded in the token 
 token is, and `add_connection` saves only when the caller's `expected_server` matches
 what that preview says now. Adding is idempotent per server, never changes which row is
 primary (the first row ever saved becomes primary; `set_primary` is the one way to move
-it), and starts no bridge by itself: `launch` does, one bridge per plan entry.
+it), and starts no bridge by itself: `launch` does, one bridge per plan entry, and `start` is
+`launch` unless a bridge already holds the lease (the HTTP add starts the new row with it).
 
 This list is the install's instance directory. It never widens the Sutando Cloud bearer
 allowlist or any other authorization: a row only tells startup which bridge to launch.
@@ -20,7 +21,8 @@ allowlist or any other authorization: a row only tells startup which bridge to l
 Writers go through one lock file beside the record, publish by temp file + `os.replace`,
 and refuse a record over `MAX_BYTES` or off-schema on read. `status_for` joins a row
 read-only with the bridge's own `state/gateway-status[.<instance>].json` and the launch
-record `launch` leaves, into one `state`: pending, connected, disconnected or failed.
+record `launch` leaves, into one `state`: pending, connected, disconnected, failed or parked
+(disabled by the owner), plus `running`: whether a bridge is proven to hold the row's lease.
 
 Which process runs a bridge is read only from the bridge's own lease, through `workspace_lock`'s
 reader (`bridge_pid`): a lease that proves no holder is a refusal, never pid 0, and only a pid
@@ -84,7 +86,7 @@ MAX_ROWS = 64
 PRIMARY_TOKEN_REF = "REMOTE_TASK_TOKEN"
 INSTANCE_TOKEN_PREFIX = "AG2_REMOTE_TOKEN_"
 ADDED_BY = ("login", "owner", "ui", "env")
-STATES = ("pending", "connected", "disconnected", "failed")
+STATES = ("pending", "connected", "disconnected", "failed", "parked")
 SERVER_SOURCES = ("identity", "resolver", "gateway")
 # The bridge's own GATEWAY_INSTANCE charset; a row that fails it could never launch.
 INSTANCE_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
@@ -1163,9 +1165,9 @@ def _sidecar(instance: str, workspace: Optional[Path]) -> dict:
 def derive_state(sidecar: Mapping[str, object], launch: Mapping[str, object],
                  disabled: bool = False) -> "tuple[str, Optional[str]]":
     """(state, reason) from the bridge's sidecar and the last launch record; a disabled row is
-    `disconnected` with reason `disabled` whatever a stale sidecar still says."""
+    `parked` with reason `disabled` whatever a stale sidecar still says."""
     if disabled:
-        return "disconnected", "disabled"
+        return "parked", "disabled"
     if launch and launch.get("ok") is False:
         return "failed", str(launch.get("reason") or "launch_failed")
     if not sidecar:
@@ -1182,7 +1184,8 @@ def derive_state(sidecar: Mapping[str, object], launch: Mapping[str, object],
 
 def status_for(row: Mapping[str, object], workspace: Optional[Path] = None) -> dict:
     """The row plus `status` (connected, last_ok_ts from gateway-status), the derived `state`,
-    and every optional field spelled out (`disabled` false, identity fields None when unknown)."""
+    `running` (a bridge proven to hold the lease; None when the lease proves nothing) and every
+    optional field spelled out (`disabled` false, identity fields None when unknown)."""
     inst = str(row.get("instance") or "")
     sidecar = _sidecar(inst, workspace)
     launch = _read_json(launch_record_path(inst, workspace))
@@ -1196,6 +1199,10 @@ def status_for(row: Mapping[str, object], workspace: Optional[Path] = None) -> d
     out["state"] = state
     out["reason"] = reason
     out["launched_at"] = launch.get("ts")
+    try:
+        out["running"] = bool(bridge_pid(inst, workspace))
+    except BridgeLeaseIndeterminate:
+        out["running"] = None
     return out
 
 
@@ -1460,6 +1467,28 @@ def launch(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Mappi
         detail = (f"it stood down to a retained lease that goes stale in {wait:.0f}s; retry then" if wait is not None
                   else "no other process is proven to hold its lease")
         raise LaunchFailed(f"the bridge for {instance} (pid {pid}) exited (rc {rc}): {detail}")
+
+
+def start(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Mapping[str, str]] = None,
+          workspace: Optional[Path] = None, vault=None, spawn=None, python: Optional[str] = None) -> dict:
+    """`launch`, unless a process is already proven to hold the lease (`lease: already_running`,
+    nothing spawned). A launch that fails returns its record (`ok` false, `reason`), never raises."""
+    holder = _proven_holder(instance, workspace)
+    if holder:
+        return {"instance": instance, "ok": True, "pid": holder, "lease": "already_running"}
+    try:
+        return launch(instance, repo=repo, logs_dir=logs_dir, environ=environ, workspace=workspace,
+                      vault=vault, spawn=spawn, python=python)
+    except LaunchFailed:
+        return _read_json(launch_record_path(instance, workspace))
+
+
+def start_added(row: Mapping[str, object], **launch_kw) -> Optional[dict]:
+    """After an add: `start` the row's bridge, so a saved connection is never left waiting for the
+    next restart. None for the legacy row (its launcher owns it) and for a disabled one (reconnect)."""
+    if not row.get("instance") or row.get("disabled"):
+        return None
+    return start(str(row["instance"]), **launch_kw)
 
 
 def bridge_pid(instance: str, workspace: Optional[Path] = None) -> int:

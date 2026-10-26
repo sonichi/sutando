@@ -896,9 +896,9 @@ class StatusJoin(Base):
         self.assertEqual(C.derive_state({"connected": False, "error": "HTTP 401"}, {}), ("failed", "auth_rejected"))
         self.assertEqual(C.derive_state({"connected": False, "reenroll": {"pending": True}}, {}),
                          ("failed", "auth_rejected"))
-        self.assertEqual(C.derive_state({"connected": True}, {"ok": True}, True), ("disconnected", "disabled"),
-                         "a disabled row is disconnected whatever a stale sidecar says")
-        self.assertEqual(C.derive_state({}, {"ok": False, "reason": "no_token"}, True), ("disconnected", "disabled"))
+        self.assertEqual(C.derive_state({"connected": True}, {"ok": True}, True), ("parked", "disabled"),
+                         "a disabled row is parked whatever a stale sidecar says")
+        self.assertEqual(C.derive_state({}, {"ok": False, "reason": "no_token"}, True), ("parked", "disabled"))
 
     def test_status_joins_the_instance_suffixed_file_and_launch_record(self):
         C.import_from_env({"REMOTE_TASK_TOKEN": TOKEN_A}, workspace=self.ws, vault=self.vault)
@@ -1122,6 +1122,59 @@ class Launching(Base):
                              workspace=self.ws, vault=self.vault, spawn=self.spawn,
                              kill=lambda *a: self.fail("nothing to kill"), fetch=unreachable)
         self.assertEqual(record["stopped_pid"], 0)
+
+
+class Starting(Base):
+    """`start` / `start_added`: launch now unless the lease is already held; a failure is a record."""
+
+    def setUp(self):
+        super().setUp()
+        self.envs = []
+        self.spawn = self.bridge_spawn(lambda argv, env, log_path: self.envs.append(env))
+        self.kw = dict(repo=self.ws / "repo", logs_dir=self.ws / "logs", workspace=self.ws, vault=self.vault)
+
+    def test_an_added_row_starts_and_reads_running(self):
+        row, _ = self.add(TOKEN_B, fetch=agents("@s:beta-fixture.net"))
+        record = C.start_added(row, environ={}, spawn=self.spawn, **self.kw)
+        self.assertEqual((record["ok"], record["lease"], record["pid"]), (True, "held", self.child()))
+        status = C.status_for(self.rows()[0], self.ws)
+        self.assertEqual((status["running"], status["state"]), (True, "pending"))
+
+    def test_a_second_lane_starts_beside_the_running_primary(self):
+        primary, _ = self.add()
+        C.start_added(primary, environ={}, spawn=self.spawn, **self.kw)
+        second, _ = self.add(TOKEN_B, fetch=agents("@s:beta-fixture.net"))
+        C.start_added(second, environ={"REMOTE_PROACTIVE_ROOM": "!room"}, spawn=self.spawn, **self.kw)
+        self.assertEqual([C.bridge_pid(r["instance"], self.ws) > 0 for r in self.rows()], [True, True], "both lanes run")
+        self.assertEqual(self.envs[1]["REMOTE_PROACTIVE_ROOM"], "", "only the primary routes proactive messages")
+        self.assertEqual(C.primary_instance(self.ws), primary["instance"])
+
+    def test_a_held_lease_is_never_started_twice(self):
+        row, _ = self.add(TOKEN_B, fetch=agents("@s:beta-fixture.net"))
+        bridge = bridge_lease.start(self.ws, "beta-fixture-net")
+        try:
+            record = C.start("beta-fixture-net", environ={}, spawn=self.spawn, **self.kw)
+            self.assertEqual((record["ok"], record["lease"], record["pid"], self.envs), (True, "already_running", bridge.pid, []))
+        finally:
+            bridge_lease.stop(bridge)
+
+    def test_a_failed_start_is_failed_with_its_reason(self):
+        row, _ = self.add(TOKEN_B, fetch=agents("@s:beta-fixture.net"))
+        self.vault.store.clear()
+        record = C.start_added(row, environ={}, spawn=self.spawn, **self.kw)
+        self.assertEqual((record["ok"], record["reason"]), (False, "no_token"))
+        status = C.status_for(self.rows()[0], self.ws)
+        self.assertEqual((status["state"], status["reason"], status["running"]), ("failed", "no_token", False))
+
+    def test_parked_and_legacy_rows_are_not_started(self):
+        C.import_from_env({"REMOTE_TASK_TOKEN": TOKEN_A}, workspace=self.ws, vault=self.vault)
+        row, _ = self.add(TOKEN_B, fetch=agents("@s:beta-fixture.net"))
+        C.disconnect("beta-fixture-net", workspace=self.ws, kill=lambda *a: None)
+        legacy, parked = self.rows()
+        self.assertIsNone(C.start_added(legacy, environ={}, spawn=self.spawn, **self.kw))
+        self.assertIsNone(C.start_added(parked, environ={}, spawn=self.spawn, **self.kw))
+        self.assertEqual(self.envs, [])
+        self.assertEqual((C.status_for(parked, self.ws)["state"], C.status_for(parked, self.ws)["running"]), ("parked", False))
 
 
 class Identity(Base):
@@ -1353,7 +1406,7 @@ class Disconnect(Base):
         self.assertEqual((before["state"], before["disabled"]), ("connected", False))
         C.disconnect("beta-fixture-net", workspace=self.ws, kill=lambda *a: None)
         after = C.status_for(self.rows()[1], self.ws)
-        self.assertEqual((after["state"], after["reason"], after["disabled"]), ("disconnected", "disabled", True))
+        self.assertEqual((after["state"], after["reason"], after["disabled"]), ("parked", "disabled", True))
         self.assertEqual(after["status"], {"connected": True, "last_ok_ts": 5}, "the sidecar reading is still shown")
         self.assertEqual((C.status_for(self.rows()[0], self.ws)["state"], C.status_for(self.rows()[0], self.ws)["disabled"]),
                          ("pending", False))
@@ -1454,7 +1507,7 @@ class UpdateToken(Base):
         self.assertEqual(C.status_for(self.beta(), self.ws)["state"], "failed")
         C.disconnect("beta-fixture-net", workspace=self.ws, kill=lambda *a: None)
         before = self.beta()
-        self.assertEqual(C.status_for(before, self.ws)["state"], "disconnected")
+        self.assertEqual(C.status_for(before, self.ws)["state"], "parked")
         out = self.update("beta-fixture-net", self.NEW_B)
         self.assertEqual(self.vault.store["AG2_REMOTE_TOKEN_BETA_FIXTURE_NET"], self.NEW_B, "replaced under the same key")
         self.assertEqual(set(self.vault.store), {"AG2_REMOTE_TOKEN_ALPHA_FIXTURE_NET", "AG2_REMOTE_TOKEN_BETA_FIXTURE_NET"})

@@ -102,8 +102,13 @@ typed at the CLI, handed over by a browser flow, present in the environment):
    (`VaultKeyInUse`, 409 `vault_key_in_use`), and if the vault refuses, the add fails
    closed and nothing is written.
 
-Adding is **idempotent per connection** and starts no second bridge (the bridge's
-singleton lock is the backstop, not the policy). A row whose server the registry or an
+Adding through the HTTP route or the runtime API **starts the row's bridge at once**
+(`start_added`, which calls `start`: `launch` unless a process already holds the lease), so a
+saved connection never waits for the next restart; the response carries that `launch`
+record, and a start that fails leaves the row `failed` with its `reason`. A disabled row is
+not started (`reconnect` is the verb), nor the legacy row. The CLI `add` saves only; `start`
+runs the same unit. Adding is **idempotent per connection** and starts no second bridge (the
+bridge's singleton lock is the backstop, not the policy). A row whose server the registry or an
 identity vouches for (`resolver`/`identity`) matches a token for the same server, so one
 registered homeserver's endpoints (`chat.` and `matrix.`) are one connection. A
 provisional (`gateway`) row matches only a token for its own gateway host, so it can
@@ -150,8 +155,13 @@ under `state/connections-launch/<instance>.json`:
 |---|---|
 | `pending` | Saved; no sidecar yet (bridge not up, or never launched). |
 | `connected` | The sidecar says `connected: true`. |
-| `disconnected` | The sidecar says `connected: false` for a non-auth reason; or, with `reason: disabled`, the row was disconnected by the owner (whatever a stale sidecar still says). |
+| `disconnected` | The sidecar says `connected: false` for a non-auth reason. |
+| `parked` | With `reason: disabled`: the owner disconnected the row; its bridge is stopped and no launcher starts it until `reconnect` (whatever a stale sidecar still says). |
 | `failed` | With `reason`: `no_token`, `launch_failed`, `lease_timeout`, `exited` (the child ended and no other process holds the lease; `rc` in the launch record), `retained_lease`, `auth_rejected` (the sidecar reports a 401/403 or a pending re-enrol). |
+
+Beside `state`, every row carries `running`: `true` while a process is proven to hold the
+row's bridge lease, `false` when none does, `null` when the lease proves nothing
+(`bridge_lease_indeterminate`).
 
 Which process runs a bridge is read from the bridge's own lease, `state/locks/gateway-bridge.<instance>.lock`, the JSON record `workspace_lock` writes and heartbeats: `bridge_pid` reads it with `workspace_lock.read_lease` and accepts a pid only when `workspace_lock.lease_process` proves it is the process that wrote the record (this host, same recorded start time), so no unproven pid is ever signalled and a lease that proves nothing is `bridge_lease_indeterminate`, never "no bridge". `read_lease` also binds the record to what was asked: its `role`, `workspace` (compared as real paths) and `schema_version` must be the caller's, so a record copied from another bridge's path never lends that bridge's pid to this one. The writer is generation-aware the same way: acquire, heartbeat, release and retain take a record as their own only when pid, host **and** start time match, and a same-host holder whose pid now runs with another start time is reaped as gone.
 
@@ -335,7 +345,7 @@ not here.
 ## Surfaces
 
 - CLI: `scripts/connections.py list | known-servers | add | set-primary | remove | disconnect | reconnect | update-token | launch | import-env | launch-plan`. `update-token INSTANCE -` reads the new code from stdin, which keeps it out of the process list (`ps` shows every argument); a literal code in its place is for scripts. `set-primary` prints "reconnect it" when the new primary's bridge is running.
-- Runtime API (Unix socket, JSON-RPC): `connection.list`, `connection.known_servers`, `connection.add` (`{token}` previews; `{token, confirm: true, expected_server}` saves), `connection.remove`, `connection.set_primary`, `connection.disconnect`, `connection.reconnect`, `connection.update_token` (`{instance, token}`). Every refusal by code (the table above) is `CONFLICT`, the same class the HTTP 409 carries.
+- Runtime API (Unix socket, JSON-RPC): `connection.list`, `connection.known_servers`, `connection.add` (`{token}` previews; `{token, confirm: true, expected_server}` saves and starts the bridge), `connection.remove`, `connection.set_primary`, `connection.disconnect`, `connection.reconnect`, `connection.update_token` (`{instance, token}`). Every refusal by code (the table above) is `CONFLICT`, the same class the HTTP 409 carries.
 - HTTP (`src/agent-api.py` on `127.0.0.1:7843`, the web client's transport; routes dispatch to the same units):
 
   | Route | Body | Answer |
@@ -343,11 +353,11 @@ not here.
   | `GET /api/v1/connections` | — | 200 `{"connections": [rows joined with status, state, server_source, disabled, identity fields; no secrets]}` |
   | `GET /api/v1/connections/known-servers` | — | 200 `{"servers": [{"server", "connected", "instance", "primary", "disabled"}]}`; matched before any `<instance>` route (405 for another method, never a slug lookup) |
   | `POST /api/v1/connections` | `{"token", "confirm": false}` | 200 `{"preview": {...}}` |
-  | `POST /api/v1/connections` | `{"token", "confirm": true, "expected_server", "added_by": "ui"}` | 201 `{"created": true, "connection": row}`; 200 `{"created": false, ...}` for an existing row; 409 `{"error": "mismatch", "server_from_token", "expected_server"}`; 400 `{"error": ...}`; 503 `{"error": "vault_unavailable"}` |
+  | `POST /api/v1/connections` | `{"token", "confirm": true, "expected_server", "added_by": "ui"}` | 201 `{"created": true, "launch": record, "connection": row}`, the bridge started (`launch` null for a disabled row); 200 `{"created": false, ...}` for an existing row, started when it was not running; 409 `{"error": "mismatch", "server_from_token", "expected_server"}`; 400 `{"error": ...}`; 503 `{"error": "vault_unavailable"}` |
   | `DELETE /api/v1/connections/<instance>[?force=1]` | — | 204; 409 `{"error": "primary"}`; 409 `bridge_still_running`; 404 |
   | `POST /api/v1/connections/<instance>/primary` | `{}` | 200 `{"connection": row}` (with `relaunch_needed`); 409 `{"error": "disabled_cannot_be_primary"}`, `legacy_primary_running` or `bridge_lease_indeterminate` (nothing moved); 404 |
-  | `POST /api/v1/connections/<instance>/disconnect` | `{}` | 200 `{"connection": row}` (`disabled: true`, state `disconnected`); 409 `{"error": "primary_cannot_disconnect"}` or `bridge_still_running` (row unchanged); 404 |
-  | `POST /api/v1/connections/<instance>/reconnect` | `{}` | 202 `{"launch": record}`; clears `disabled`; 409 `bridge_still_running` |
+  | `POST /api/v1/connections/<instance>/disconnect` | `{}` | 200 `{"connection": row}` (`disabled: true`, state `parked`, bridge stopped and left down across restarts); 409 `{"error": "primary_cannot_disconnect"}` or `bridge_still_running` (row unchanged); 404 |
+  | `POST /api/v1/connections/<instance>/reconnect` | `{}` | 202 `{"launch": record}`; clears `disabled` and starts the bridge now; 409 `bridge_still_running` |
   | `POST /api/v1/connections/<instance>/token` | `{"token"}` | 200 `{"connection": row}` (secret replaced under the same `token_ref`, `disabled` cleared, bridge relaunched); 409 `{"error": "<code>"}` for `token_source_shadowed`, `token_server_mismatch`, `token_agent_mismatch`, `token_unverified`, `token_rejected`, `bridge_still_running`, `vault_unreadable` (nothing changed), `token_restore_failed`, `token_state_unknown`; 400 without a token; 404 |
 
   The legacy row (`instance: ""`) has no HTTP address (an empty segment is no segment); its

@@ -168,8 +168,8 @@ class CliTests(unittest.TestCase):
         self.assertTrue((self.keychain / "AG2_REMOTE_TOKEN_BETA_FIXTURE_NET").exists(), "the token stays in the vault")
         rows = json.loads(self.run_cli("list", "--json").stdout)
         self.assertEqual([(r["instance"], r["disabled"], r["state"], r["reason"]) for r in rows],
-                         [("alpha-fixture-net", False, "pending", None), ("beta-fixture-net", True, "disconnected", "disabled")])
-        self.assertIn("disconnected (disabled)", self.run_cli("list").stdout)
+                         [("alpha-fixture-net", False, "pending", None), ("beta-fixture-net", True, "parked", "disabled")])
+        self.assertIn("parked (disabled)", self.run_cli("list").stdout)
         self.assertEqual(self.run_cli("launch-plan").stdout.count("\n"), 1, "the plan omits the disabled row")
         self.assertIn("alpha-fixture-net\t", self.run_cli("launch-plan").stdout)
         proc = self.run_cli("disconnect", "nope")
