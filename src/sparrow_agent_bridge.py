@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""One agent's gateway bridge under sparrowd, from the declaration its claude-local install wrote.
+"""One agent's gateway bridge under sparrowd, from the declaration its claude-local or codex-local install wrote.
 
 A declaration is data the agent's own session could write, so it chooses nothing: everything the
 bridge runs with is derived from the declaration's path segment (`<agents>/<segment>.bridge/`) by the
@@ -38,10 +38,13 @@ for _p in (str(_SRC), str(_REPO / "packages" / "ag2-sparrow")):
         sys.path.insert(0, _p)
 
 from ag2_sparrow import agent_identity, gateway_credential_sources as _sources  # noqa: E402
-from ag2_sparrow.adapters.claude_code import cli as adapter  # noqa: E402
+from ag2_sparrow import connect_bridge as adapter  # noqa: E402
+from ag2_sparrow.adapters.claude_code.shape import LOCAL as CLAUDE_LOCAL  # noqa: E402
 from ag2_sparrow.bounded_file_read import read_regular  # noqa: E402
+from ag2_sparrow.adapters.codex.connect_cli import COMMAND as CODEX_LOCAL_COMMAND  # noqa: E402
 
-WRITTEN_BY = f"{adapter.COMMAND} install"
+WRITTEN_BY = f"{CLAUDE_LOCAL.command} install"
+WRITERS = (WRITTEN_BY, f"{CODEX_LOCAL_COMMAND} install")
 BRIDGE_MODULE = "ag2_sparrow.remote_gateway_bridge"
 SUFFIX = ".bridge"
 MAX_DECLARATION_BYTES = _sources.MAX_DECLARATION_BYTES
@@ -113,8 +116,8 @@ def load(path: Path, agents: Path) -> "tuple[dict | None, str]":
         decl = json.loads(raw.decode("utf-8"))
     except (ValueError, RecursionError) as e:  # UnicodeDecodeError is a ValueError
         return None, f"{path}: malformed ({type(e).__name__})"
-    if not isinstance(decl, dict) or decl.get("written_by") != WRITTEN_BY:
-        return None, f"{path}: not written by {WRITTEN_BY}"
+    if not isinstance(decl, dict) or decl.get("written_by") not in WRITERS:
+        return None, f"{path}: not written by {' or '.join(WRITERS)}"
     env = decl.get("env")
     mxid = env.get("AGENT_MXID") if isinstance(env, dict) else None
     try:
@@ -126,6 +129,8 @@ def load(path: Path, agents: Path) -> "tuple[dict | None, str]":
         return None, f"{path}: AGENT_MXID {mxid!r} is not the agent the segment {segment} names"
     root = str(Path(agents).resolve() / segment)
     seat = _sources.is_seat(env)
+    if not seat and decl["written_by"] != WRITTEN_BY:
+        return None, f"{path}: {decl['written_by']} declares only a seat's bridge"
     want_env, problem = seat_env(root, mxid) if seat else (adapter.bridge_env(root, mxid), "")
     if problem:
         return None, f"{path}: {problem}"

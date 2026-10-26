@@ -47,7 +47,7 @@ from ag2_sparrow.team_result_guard import resolve_access_tier  # noqa: E402
 from ag2_sparrow import task_io  # noqa: E402
 
 ADAPTER = PKG / "adapters" / "claude-code"
-MOD = ADAPTER / "ag2space-inbox"
+MOD = PKG / "ag2_sparrow" / "adapters" / "claude_code" / "ag2space-inbox"
 REGISTER = MOD / "hooks" / "register.ts"
 SRC = PKG.parents[1] / "src"
 HOST_PATH_RE = re.compile(r"/Users/|/home/[a-z]|/private/tmp|~/\.claude|~/\.sutando")
@@ -87,7 +87,7 @@ class PluginShape(unittest.TestCase):
             self.assertIn(name, src)
 
     def test_no_hardcoded_host_paths_in_added_files(self):
-        for path in sorted(p for p in ADAPTER.rglob("*") if p.is_file()):
+        for path in sorted(p for p in (*ADAPTER.rglob("*"), *MOD.rglob("*")) if p.is_file()):
             self.assertIsNone(HOST_PATH_RE.search(path.read_text(errors="replace")), path)
 
     def test_mod_tests_exist_for_the_claude_harness_and_ci_runs_them(self):
@@ -253,6 +253,7 @@ from ag2_sparrow import _dirs, connect_common as cm, holder_lock, service_manage
 from ag2_sparrow import claude_local_accepter as accepter, claude_local_card as card, claude_local_records as records  # noqa: E402
 
 from ag2_sparrow.adapters.claude_code import cli, detector, hmac_policy, hold as hold_mod, inbox, launcher, trust  # noqa: E402
+from ag2_sparrow.adapters.claude_code import shape as shape_mod  # noqa: E402
 from ag2_sparrow.hitl.schema import ActionReply, STATUS_IN_PROGRESS, STATUS_PENDING, STATUS_RESOLVED  # noqa: E402
 
 # The fake is a #!/bin/sh wrapper that execs the quoted interpreter on the body beside
@@ -2049,7 +2050,8 @@ class ConnectVerify(ConnectBase):
                       f"the bridge's state dir is read as its parent; run {cli.COMMAND} install to record it)", out)
         self.configure()
         (self.plugin / ".claude-plugin" / "plugin.json").unlink()
-        self.assertEqual(self.checks(self.main("verify")[1])["plugin"], "FAIL")
+        with mock.patch.object(shape_mod, "PLUGIN", self.home / "no-shipped-plugin"):
+            self.assertEqual(self.checks(self.main("verify")[1])["plugin"], "FAIL", "neither dir holds a plugin")
         (self.plugin / ".claude-plugin" / "plugin.json").write_text("{}")
         self.status(ts=int(time.time()) - cli.STATUS_MAX_AGE_S - 5)
         self.assertEqual(self.checks(self.main("verify")[1])["bridge"], "FAIL", "a stale status is no bridge")
@@ -2069,6 +2071,26 @@ class ConnectVerify(ConnectBase):
         self.assertEqual((rc, self.checks(out)["supervisor"]), (1, "FAIL"))
         with mock.patch.object(cm, "lock_held", return_value="unknown"):
             self.assertIn("INFO session: %s unknown (the lock of" % self.work, self.main("verify")[1])
+
+    def test_a_missing_recorded_plugin_dir_falls_back_to_the_shipped_plugin(self):
+        old = str(self.home / "repo" / "packages" / "ag2-sparrow" / "adapters" / "claude-code" / "ag2space-inbox")
+        self.configure(PLUGIN_DIR=old)
+        cfg = cli.read_config(cli.config_path())
+        argv = hold_mod.claude_argv(cfg, SESSION_ID)
+        self.assertEqual(argv[1:3], ["--plugin-dir", str(cli.PLUGIN)], "the in-repo dir an older install recorded")
+        out = self.main("verify")[1]
+        self.assertEqual(self.checks(out)["plugin"], "PASS", out)
+        self.assertIn(f"PASS plugin: recorded plugin dir {old} missing; using the shipped plugin {cli.PLUGIN} "
+                      f"(re-run {cli.COMMAND} install to record it)", out)
+
+    def test_a_recorded_plugin_dir_that_holds_a_plugin_stays_the_override(self):
+        self.configure()
+        cfg = cli.read_config(cli.config_path())
+        self.assertNotEqual(self.plugin, cli.PLUGIN)
+        self.assertEqual(hold_mod.claude_argv(cfg, SESSION_ID)[1:3], ["--plugin-dir", str(self.plugin)])
+        out = self.main("verify")[1]
+        self.assertIn(f"PASS plugin: {self.plugin}\n", out)
+        self.assertNotIn("shipped plugin", out)
 
     def test_verify_without_a_config_says_so(self):
         rc, out, _ = self.main("verify")
@@ -2195,9 +2217,11 @@ class ConnectCode(AgentRootBase):
     """`connect --base --code`: preflight before the code is spent, one redemption, the seat written by its
     owner, then install's own path with the seat's .env; the bearer never in argv, output, unit or config."""
 
-    def connect(self, backend, fake=None, *extra, sleeps=None, stdin=None, base=BASE, code_args=("--code", "-")):
+    def connect(self, backend, fake=None, *extra, sleeps=None, stdin=None, base=BASE, code_args=("--code", "-"),
+                plugin=True):
         fake = fake or self.bridged()
-        argv = ["connect", "--base", base, *code_args, "--plugin-dir", str(self.plugin), "--claude-config-dir",
+        argv = ["connect", "--base", base, *code_args, *(("--plugin-dir", str(self.plugin)) if plugin else ()),
+                "--claude-config-dir",
                 str(self.home / ".claude-sutando"), "--hmac-key-file", str(self.home / "task-hmac.key"), *extra]
         out, err = io.StringIO(), io.StringIO()
         stdin = io.StringIO(CODE + "\n") if stdin is None else stdin
@@ -2236,6 +2260,46 @@ class ConnectCode(AgentRootBase):
         self.assertIn("setup: built-in", out)
         for text in (out, err, unit, cli.config_path().read_text(), (seat / ".env").read_text()):
             self.assertNotIn(BEARER, text)
+
+    def seated_by_another_adapter(self):
+        """The agent's root and seat as another adapter left them: its credential in the seat."""
+        self.root.mkdir(parents=True)
+        cm.write_seat(cli.bridge_home(self.root), {"relay_url": RELAY, "bearer": "other-bearer-PPPP6666",
+                                                   "agent_id": AGENT})
+        return {p: p.read_bytes() for p in sorted(self.seat().iterdir())}
+
+    def test_a_root_another_adapter_holds_is_refused_before_the_seat_is_written(self):
+        before = self.seated_by_another_adapter()
+        holder = hold(self.root, "codex-local")
+        try:
+            backend = Backend()
+            rc, _out, err = self.connect(backend)
+        finally:
+            unhold(holder)
+        self.assertEqual({p: p.read_bytes() for p in sorted(self.seat().iterdir())}, before, "byte-identical")
+        self.assertEqual(rc, cli.EXIT_UNUSABLE)
+        self.assertIn(f"{self.root} is held by a session no job of", err)
+        self.assertIn("the code is spent and nothing was written", err)
+        self.assertEqual(len(backend.calls), 1, "the root is known only from the redemption's agent id")
+        self.assertFalse(cli.config_path().exists())
+        self.assertFalse(cm.service_path(cli.BRIDGE).exists())
+
+    def test_a_free_root_passes_installs_own_check_and_connect_proceeds(self):
+        self.seated_by_another_adapter()
+        checked = []
+        real = cm.root_lock_problem
+        with mock.patch.object(cm, "root_lock_problem",
+                               side_effect=lambda shape, root: checked.append((shape.name, root)) or real(shape, root)):
+            rc, _out, err = self.connect(Backend())
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(checked, [(cli.SHAPE, str(self.root))], "asked once, before the seat")
+        self.assertEqual((self.seat() / "token").read_text(), f"{RELAY}|{BEARER}\n")
+
+    def test_without_plugin_dir_the_shipped_plugin_is_used(self):
+        self.assertTrue((cli.PLUGIN / ".claude-plugin" / "plugin.json").is_file())
+        rc, _out, err = self.connect(Backend(), plugin=False)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self.cfg()["PLUGIN_DIR"], str(cli.PLUGIN))
 
     def test_the_instance_is_minted_once_and_kept_across_a_reconnect(self):
         fake = self.bridged()

@@ -1,6 +1,7 @@
 # claude-code adapter — a Claude Code session as an AG2 Space agent
 
-`ag2space-inbox/` is a Claude Code **Mod** (a plugin whose hooks run as
+`ag2space-inbox/` (in the package, `ag2_sparrow/adapters/claude_code/ag2space-inbox/`,
+shipped in the wheel) is a Claude Code **Mod** (a plugin whose hooks run as
 middleware, Claude Code 2.1.287+). Loaded into a session with
 `--plugin-dir`, it makes that session answer the task files Sparrow writes.
 `ag2-sparrow-claude-local` (below) hosts that session as a normal interactive
@@ -343,9 +344,8 @@ which the poll is ≤1 s. The installed shape is the interactive one.
 ## Launch: `ag2-sparrow-claude-local`
 
 ```bash
-ag2-sparrow-claude-local connect --base <url> --plugin-dir <dir>   # asks for the code; or, by hand:
+ag2-sparrow-claude-local connect --base <url>   # asks for the code; or, by hand:
 ag2-sparrow-claude-local install \
-  --plugin-dir packages/ag2-sparrow/adapters/claude-code/ag2space-inbox \
   --claude-config-dir <dir> \
   [--token-env-file <the agent's .env>] [--work <work>]
 ag2-sparrow-claude-local verify
@@ -354,12 +354,15 @@ ag2-sparrow-claude-local stop --confirm  # confirm an open stall card's Stop on 
 ag2-sparrow-claude-local uninstall
 ```
 
+The session loads the ag2space-inbox plugin this package ships;
+`--plugin-dir <dir>` on `install` or `connect` loads another copy instead (a
+working tree under edit, say).
+
 **Connect with a code.** On a host with no core, the two steps AG2 Space shows
 are the agent's whole setup:
 
 ```bash
-ag2-sparrow-claude-local connect --base <AG2 Space backend URL> \
-  --plugin-dir packages/ag2-sparrow/adapters/claude-code/ag2space-inbox
+ag2-sparrow-claude-local connect --base <AG2 Space backend URL>
 # asks for the acp.<code>; or pipe it in with --code - (e.g. pbpaste | ... --code -)
 ```
 

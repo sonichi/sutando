@@ -833,6 +833,26 @@ class SeatBridge(Base):
         self.assertEqual(specs, [])
         self.assertIn("env is not the canonical one", skipped[0])
 
+    def test_a_seat_codex_local_declared_is_one_worker_and_its_non_seat_declaration_is_not(self):
+        from ag2_sparrow import connect_bridge as cb
+        from ag2_sparrow.adapters.codex import connect_cli as codex
+        decl = self.declare_seat()
+        decl.unlink()
+        cfg = {"ROOT": str(self.root), "BRIDGE": "sparrowd", "AGENT_ID": AGENT,
+               "TOKEN_ENV_FILE": os.path.join(self.seat, ".env"), "TOKEN_VAULT_KEY": ""}
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(cb.wire_bridge(cfg, codex.COMMAND, codex.BRIDGE), "")
+        self.assertEqual(json.loads(decl.read_text())["written_by"], f"{codex.COMMAND} install")
+        specs, skipped = self.sd._agent_bridge_specs(self.ws, vault_keys=[])
+        self.assertEqual((skipped, [s.name for s in specs]), ([], [cli.worker_name(SEG)]))
+        decl.unlink()
+        body = json.loads(self.declare().read_text())
+        body["written_by"] = f"{codex.COMMAND} install"
+        decl.write_text(json.dumps(body))
+        specs, skipped = self.sd._agent_bridge_specs(self.ws, vault_keys=[cli.vault_key(SEG)])
+        self.assertEqual(specs, [])
+        self.assertIn("declares only a seat's bridge", skipped[0])
+
     def test_preflight_passes_a_seat_without_the_vault(self):
         self.declare_seat()
         out = io.StringIO()

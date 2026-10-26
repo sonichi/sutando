@@ -689,6 +689,25 @@ def launcher_log(shape: Shape) -> str:
     return str(log_path(shape)) if is_macos() else f"journalctl --user -u {shape.service_name}"
 
 
+def root_lock_problem(shape: Shape, root: str) -> str:
+    """'' unless `root` is held by a session no job of `shape` manages, or either cannot be probed: why.
+    Install refuses on it; connect asks it before writing the agent's seat."""
+    return _root_lock(shape, root)[0]
+
+
+def _root_lock(shape: Shape, root: str) -> "tuple[str, str]":
+    """(root_lock_problem's answer, the manager state it probed)."""
+    state, manager = lock_held(root), manager_state(shape)
+    if state == "unknown" or manager == "unknown":
+        return f"{root} is {holder_line(root)} and {job_name(shape)} is {manager}", manager
+    if state == "held" and manager != "active":
+        rec = lock_holder(root)
+        who = f"launcher pid {rec['pid']}" if rec.get("live") else "an unrecorded holder; lsof the lock file"
+        return (f"{root} is held by a session no job of {job_name(shape)} manages ({who}); stop it, then run "
+                "install again"), manager
+    return "", manager
+
+
 def _install_locked(shape: Shape, values: dict, root: str, revise=None, precheck=None, holder=None) -> int:
     """A quiescent replacement: both files owned, the same root as before, no orphan on it, the job
     stopped and absent, the root free; only then the files, the start, and the fresh holder."""
@@ -709,14 +728,9 @@ def _install_locked(shape: Shape, values: dict, root: str, revise=None, precheck
     unit, problem = render_supervisor(shape)
     if problem:
         return _refuse(problem)
-    state, manager = lock_held(root), manager_state(shape)
-    if state == "unknown" or manager == "unknown":
-        return _refuse(f"{root} is {holder_line(root)} and {job_name(shape)} is {manager}; nothing was applied")
-    if state == "held" and manager != "active":
-        rec = lock_holder(root)
-        who = f"launcher pid {rec['pid']}" if rec.get("live") else "an unrecorded holder; lsof the lock file"
-        return _refuse(f"{root} is held by a session no job of {job_name(shape)} manages ({who}); stop it, then run "
-                       "install again; nothing was applied")
+    problem, manager = _root_lock(shape, root)
+    if problem:
+        return _refuse(f"{problem}; nothing was applied")
     before = lock_holder(root)
     if unit_text is not None or manager != "absent":
         problem = stop_supervisor(shape)
