@@ -1920,6 +1920,9 @@ PROACTIVE_ACK_GATE: Callable[[str, str], "str | None"] | None = None
 # PROACTIVE_ROOM, so a bridge spawned before another became primary never carries it too.
 PROACTIVE_ROOM_KEEP: Callable[[], bool] | None = None
 PROACTIVE_ROUTE_GATE: Callable[[str, str, "str | None"], "str | None"] | None = None
+# Host-injected task -> reason or None, asked before a fresh task is queued: a reason settles it
+# as a redelivery instead. None (standalone default) queues every fresh task.
+TASK_INTAKE_GATE: Callable[[dict], "str | None"] | None = None
 # Routing state belongs to the gateway (owner 2026-09-07): the agent row's owner_dm_room is read at
 # connect and on a slow cadence and kept while offline; the pinned room is bootstrap, never authority.
 _ROUTING: dict = {"owner_dm": "", "persisted": "", "persisted_private": False, "identity": "",
@@ -4394,6 +4397,32 @@ def _fire_on_task(tid: str, path: Path, text: "str | None" = None) -> None:
                      name=f"on-task-{tid}", daemon=True).start()
 
 
+def _settle_as_handled(tid: str) -> bool:
+    """Answer a task this node will not queue with the redelivery control result; True when durable."""
+    rfile = RESULTS_DIR / f"{tid}.txt"
+    if rfile.exists():
+        # A reply the local core wrote with a plain write_text: this process
+        # has committed nothing yet, so fsync before claiming durable.
+        return _fsync_in_place(tid, rfile, RESULTS_DIR)
+    durable = _durable_write(rfile, GATEWAY_REDELIVERY_RESULT)
+    # Provenance the result BODY cannot carry: a Team runtime controls
+    # the body and can emit these exact bytes, but not this process's set.
+    if durable:
+        _REDELIVERED.add(tid)
+    return durable
+
+
+def _task_intake_veto(task: dict) -> "str | None":
+    """TASK_INTAKE_GATE's reason to settle a fresh task unqueued; a gate that raises delivers it."""
+    if TASK_INTAKE_GATE is None:
+        return None
+    try:
+        return TASK_INTAKE_GATE(task)
+    except Exception as exc:  # noqa: BLE001 — a broken gate must never drop a message
+        _log(f"task intake gate failed for {task.get('id')}: {diagnostics.describe(exc)}; delivering")
+        return None
+
+
 def _write_task(task: dict, hold: bool = False) -> "tuple[str, bool] | None":
     """Serialize a gateway task into tasks/task-<id>.txt (same schema as bridges).
     Returns (task id, durable) — `durable` says the queue write and its sidecar
@@ -4427,18 +4456,13 @@ def _write_task(task: dict, hold: bool = False) -> "tuple[str, bool] | None":
         or next(_task_archive.glob(f"*/{tid}.txt"), None) is not None
     )
     if task_archived or _delivered_copy_exists(tid):
-        rfile = RESULTS_DIR / f"{tid}.txt"
-        if rfile.exists():
-            # A reply the local core wrote with a plain write_text: this process
-            # has committed nothing yet, so fsync before claiming durable.
-            durable = _fsync_in_place(tid, rfile, RESULTS_DIR)
-        else:
-            durable = _durable_write(rfile, GATEWAY_REDELIVERY_RESULT)
-            # Provenance the result BODY cannot carry: a Team runtime controls
-            # the body and can emit these exact bytes, but not this process's set.
-            if durable:
-                _REDELIVERED.add(tid)
+        durable = _settle_as_handled(tid)
         _log(f"dedup: {tid} already handled — not re-queued")
+        return tid, durable
+    duplicate = _task_intake_veto(task)
+    if duplicate:
+        durable = _settle_as_handled(tid)
+        _log(f"{duplicate} ({tid})")
         return tid, durable
     TASKS_DIR.mkdir(parents=True, exist_ok=True)
     # Promote only the exact broker boolean plus Team request; the legacy Guest

@@ -374,6 +374,12 @@ def _ag2space_proactive_ack_gate(task_id: str, item_id: str):
     return initial_ack_veto(task_id, item_id, WS, _ag2space_worker_holder)
 
 
+def _lane_dedupe_gate(task: dict):
+    """A message another of this install's lanes already queued; seats are other agents, never asked."""
+    import lane_dedupe
+    return lane_dedupe.duplicate_reason(WS / "state", task, GATEWAY_INSTANCE, log=_log)  # noqa: F821
+
+
 _STATUS_ACK_MANIFEST = _REPO / "skills" / "status-ack" / "manifest.json"
 
 
@@ -407,6 +413,7 @@ OWNER_DM_UPGRADED_NOTIFY = _ag2space_owner_dm_upgraded
 PROACTIVE_DISPATCH_GATE = _ag2space_proactive_dispatch_gate
 PROACTIVE_ACK_GATE = _status_ack_gate()
 PROACTIVE_ROUTE_GATE = _ag2space_proactive_route_gate
+TASK_INTAKE_GATE = _lane_dedupe_gate if not gateway_credential_sources.is_seat(os.environ) else None  # noqa: F821
 PROACTIVE_ROOM_KEEP = _legacy_keeps_proactive_room if not GATEWAY_INSTANCE else None  # noqa: F821
 
 if _RUN_MAIN:  # pragma: no cover — script-entry tail; the subprocess suite drives it
