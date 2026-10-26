@@ -16,6 +16,7 @@ none, so each adapter owns its console script and the boundary rule holds. Stdli
 """
 from __future__ import annotations
 
+import errno
 import fcntl
 import getpass
 import json
@@ -1321,13 +1322,50 @@ def _seat_bound(owner, root: str, seat, fds) -> bool:
     return root_is_held(owner, root)
 
 
+SEAT_FILE_MAX = 64 * 1024
+SEAT_LOCK = ".seat.lock"
+SEAT_WAIT_S = 10.0
+
+
 def _read_at(dir_fd: int, name: str) -> "bytes | None":
+    """`name` in the held directory, None when absent; anything but a regular file of at most
+    SEAT_FILE_MAX bytes raises OSError (opened nonblocking, so a FIFO cannot hang the read)."""
     try:
-        fd = os.open(name, os.O_RDONLY | _FILE_FLAGS, dir_fd=dir_fd)
+        fd = os.open(name, os.O_RDONLY | os.O_NONBLOCK | _FILE_FLAGS, dir_fd=dir_fd)
     except FileNotFoundError:
         return None
     with os.fdopen(fd, "rb") as fh:
-        return fh.read()
+        if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
+            raise OSError(errno.EINVAL, f"{name} is not a regular file")
+        data = fh.read(SEAT_FILE_MAX + 1)
+    if len(data) > SEAT_FILE_MAX:
+        raise OSError(errno.EFBIG, f"{name} is larger than {SEAT_FILE_MAX} bytes")
+    return data
+
+
+class seat_lock:
+    """An exclusive flock on the lockfile inside the seat directory open at `seat_fd`, waited for up to
+    SEAT_WAIT_S; every seat writer holds it, so no two write or roll back one seat at once."""
+
+    def __init__(self, seat_fd: int):
+        self.seat_fd, self.fd = seat_fd, -1
+
+    def __enter__(self):
+        self.fd = os.open(SEAT_LOCK, os.O_RDWR | os.O_CREAT | os.O_NONBLOCK | _FILE_FLAGS, 0o600, dir_fd=self.seat_fd)
+        deadline = time.monotonic() + SEAT_WAIT_S
+        while True:
+            try:
+                fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return self
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    os.close(self.fd)
+                    raise OSError(errno.EBUSY, f"another writer has held the seat for {SEAT_WAIT_S:.0f} s")
+                time.sleep(0.05)
+
+    def __exit__(self, *exc):
+        os.close(self.fd)
+        return False
 
 
 def _put_at(dir_fd: int, name: str, data: "bytes | None") -> None:
@@ -1363,31 +1401,8 @@ def write_seat_held(owner, root: str, seat, redeemed: dict) -> "tuple[str, str]"
     except OSError as e:
         return "", f"the seat {seat} could not be opened ({e.strerror or e}); the seat is unchanged"
     try:
-        if not _seat_bound(owner, root, seat, fds):
-            return "", f"{root} or its seat is no longer what connect holds (it was replaced); the seat is unchanged"
-        chan = fds[-1]
-        before = {n: _read_at(chan, n) for n in (_sources.SEAT_TOKEN_NAME, ".env")}
-        files, problem = _sources.seat_credential_files(
-            seat, agent_id=redeemed["agent_id"], tier=STANDALONE_TIER, relay_url=redeemed["relay_url"],
-            bearer=redeemed["bearer"], instance=instance_of((before[".env"] or b"").decode("utf-8", "replace")))
-        if problem:
-            return "", problem
-        done = False
-        try:
-            os.fchmod(chan, 0o700)
-            for name, text in files.items():
-                _put_at(chan, name, text.encode("utf-8"))
-            done = _seat_bound(owner, root, seat, fds)
-        except OSError as e:
-            problem = f"the seat {seat} could not be written ({e.strerror or e}); its previous files were put back"
-        finally:
-            if not done:
-                for name, data in before.items():
-                    _put_at(chan, name, data)
-        if done:
-            return seat_env_path(seat), ""
-        return "", problem or (f"{root} was replaced while the seat was written; the previous seat files were put "
-                               "back in the seat directory connect held, and the seat now at the path was not touched")
+        with seat_lock(fds[0]):
+            return _write_seat_locked(owner, root, seat, fds, redeemed)
     except OSError as e:
         return "", f"the seat {seat} could not be written or put back ({e.strerror or e})"
     finally:
@@ -1395,12 +1410,53 @@ def write_seat_held(owner, root: str, seat, redeemed: dict) -> "tuple[str, str]"
             os.close(fd)
 
 
+def _write_seat_locked(owner, root: str, seat, fds, redeemed: dict) -> "tuple[str, str]":
+    """write_seat_held's transaction under the seat lock. The rollback only replaces a file that still
+    holds what this write put there, so a newer writer's bytes are never undone."""
+    if not _seat_bound(owner, root, seat, fds):
+        return "", f"{root} or its seat is no longer what connect holds (it was replaced); the seat is unchanged"
+    chan = fds[-1]
+    try:
+        before = {n: _read_at(chan, n) for n in (_sources.SEAT_TOKEN_NAME, ".env")}
+    except OSError as e:
+        return "", f"the seat {seat} cannot be read ({e.strerror or e}); the seat is unchanged"
+    files, problem = _sources.seat_credential_files(
+        seat, agent_id=redeemed["agent_id"], tier=STANDALONE_TIER, relay_url=redeemed["relay_url"],
+        bearer=redeemed["bearer"], instance=instance_of((before[".env"] or b"").decode("utf-8", "replace")))
+    if problem:
+        return "", problem
+    written = {name: text.encode("utf-8") for name, text in files.items()}
+    done = False
+    try:
+        os.fchmod(chan, 0o700)
+        for name, data in written.items():
+            _put_at(chan, name, data)
+        done = _seat_bound(owner, root, seat, fds)
+    except OSError as e:
+        problem = f"the seat {seat} could not be written ({e.strerror or e}); its previous files were put back"
+    finally:
+        if not done:
+            for name, data in before.items():
+                if _read_at(chan, name) == written[name]:
+                    _put_at(chan, name, data)
+    if done:
+        return seat_env_path(seat), ""
+    return "", problem or (f"{root} was replaced while the seat was written; the previous seat files were put "
+                           "back in the seat directory connect held, and the seat now at the path was not touched")
+
+
 def write_seat(seat, redeemed: dict) -> "tuple[str, str]":
     """(the seat's .env path, '') or ('', why): the redeemed credential written by its owner, standalone
-    tier, the instance kept or minted once."""
-    problem = _sources.write_seat_credentials(seat, agent_id=redeemed["agent_id"], instance=seat_instance(seat),
-                                              tier=STANDALONE_TIER, relay_url=redeemed["relay_url"],
-                                              bearer=redeemed["bearer"])
+    tier, the instance kept or minted once; under the seat lock, as every seat writer is."""
+    os.makedirs(seat, mode=0o700, exist_ok=True)
+    seat_fd = os.open(seat, _DIR_OPEN)
+    try:
+        with seat_lock(seat_fd):
+            problem = _sources.write_seat_credentials(seat, agent_id=redeemed["agent_id"], instance=seat_instance(seat),
+                                                      tier=STANDALONE_TIER, relay_url=redeemed["relay_url"],
+                                                      bearer=redeemed["bearer"])
+    finally:
+        os.close(seat_fd)
     return ("", problem) if problem else (seat_env_path(seat), "")
 
 

@@ -19,6 +19,7 @@ import plistlib
 import re
 import secrets
 import signal
+import select
 import shutil
 import stat
 import subprocess
@@ -344,6 +345,13 @@ REPLACER = ("import os, sys; sys.path.insert(0, %r); from ag2_sparrow import con
             "os.rename(r, r + '.parked'); os.rename(r + '.bridge', r + '.bridge.parked'); os.mkdir(r)\n"
             "cm.write_seat(r + '.bridge', {'relay_url': relay, 'bearer': 'replacer-bearer-RRRR7777', 'agent_id': agent})\n"
             "o = task_io.acquire_lock(r, adapter); print('held', flush=True); sys.stdin.read(); task_io.release_lock(o)")
+SUCCESSOR_WRITER = ("import os, sys; sys.path.insert(0, %r); from ag2_sparrow import connect_common as cm, task_io\n"
+                    "r, relay, agent, adapter = %r, %r, %r, %r\n"
+                    "os.rename(r, r + '.parked'); os.mkdir(r); o = task_io.acquire_lock(r, adapter)\n"
+                    "print('held', flush=True)\n"
+                    "got = cm.write_seat_held(o, r, r + '.bridge', {'relay_url': relay, "
+                    "'bearer': 'successor-bearer-UUUU9999', 'agent_id': agent})\n"
+                    "print('written', got[1] or 'ok', flush=True); sys.stdin.read(); task_io.release_lock(o)")
 OP_HOLDER = ("import sys; sys.path.insert(0, %r); from ag2_sparrow import connect_common as cm\n"
              "from ag2_sparrow.adapters.claude_code.cli import LOCAL\n"
              "with cm.operation_lock(LOCAL): print('held', flush=True); sys.stdin.read()")
@@ -2491,6 +2499,79 @@ class ConnectCode(AgentRootBase):
                 self.assertEqual(os.readlink(link), str(to), "the link itself is left as it was")
                 self.assertEqual({p: p.read_bytes() for p in elsewhere.rglob("*") if p.is_file()}, target,
                                  "nothing written through the link")
+
+    def test_a_successor_on_a_replaced_root_keeps_its_seat_write_over_the_older_rollback(self):
+        self.seated_by_another_adapter()
+        real, successor, early = cm.root_is_held, [], []
+
+        def checked(owner, root):
+            if successor or not hasattr(checked, "pre"):
+                checked.pre = True
+                return real(owner, root)
+            p = subprocess.Popen([sys.executable, "-c", SUCCESSOR_WRITER % (str(PKG), str(self.root), RELAY, AGENT,
+                                                                             "codex-local")],
+                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+            successor.append(p)
+            self.assertEqual(p.stdout.readline().strip(), "held")
+            if select.select([p.stdout], [], [], 3)[0]:     # the older writer's seat lock holds it off
+                early.append(p.stdout.readline().strip())
+            return real(owner, root)
+        try:
+            with mock.patch.object(cm, "root_is_held", side_effect=checked):
+                rc, out, err = self.connect(Backend())
+            p = successor[0]
+            line = early[0] if early else (p.stdout.readline().strip() if select.select([p.stdout], [], [], 30)[0]
+                                           else "no answer")
+        finally:
+            for p in successor:
+                unhold(p)
+        self.assertEqual(rc, cli.EXIT_UNUSABLE, out + err)
+        self.assertNotIn("connected:", out)
+        self.assertIn("was replaced while the seat was written", err)
+        self.assertEqual(line, "written ok", "the successor's own write succeeded")
+        self.assertEqual((self.seat() / "token").read_text(), f"{RELAY}|successor-bearer-UUUU9999\n",
+                         "the successor's credential survives the older writer's rollback")
+        self.assertEqual(early, [], "the successor waited for the older writer's seat lock")
+
+    def test_the_rollback_leaves_a_file_that_no_longer_holds_what_this_write_put_there(self):
+        self.seated_by_another_adapter()
+        real, late, newer = cm.root_is_held, [], f"{RELAY}|newer-bearer-VVVV0000\n"
+
+        def checked(owner, root):
+            if hasattr(checked, "pre") and not late:
+                late.append(self.replace_root())
+                (Path(str(self.seat().parent.parent) + ".parked") / "channels" / "ag2space" / "token").write_text(newer)
+            checked.pre = True
+            return real(owner, root)
+        try:
+            with mock.patch.object(cm, "root_is_held", side_effect=checked):
+                rc, out, err = self.connect(Backend())
+        finally:
+            for p in late:
+                unhold(p)
+        self.assertEqual(rc, cli.EXIT_UNUSABLE, out + err)
+        parked = Path(str(self.seat().parent.parent) + ".parked") / "channels" / "ag2space"
+        self.assertEqual((parked / "token").read_text(), newer, "bytes this write did not put there are left")
+        self.assertNotIn(BEARER, (parked / ".env").read_text() + (parked / "token").read_text())
+
+    def test_a_fifo_seat_file_is_refused_at_once_and_left_as_it_is(self):
+        self.seated_by_another_adapter()
+        token = self.seat() / "token"
+        token.unlink()
+        os.mkfifo(token)
+        got = []
+        t = threading.Thread(target=lambda: got.append(self.connect(Backend())), daemon=True)
+        t.start()
+        t.join(10)
+        if t.is_alive():
+            os.close(os.open(token, os.O_WRONLY))     # end the read connect is stuck in
+            t.join(30)
+            self.fail("connect hung reading the FIFO seat token")
+        rc, out, err = got[0]
+        self.assertEqual(rc, cli.EXIT_UNUSABLE, out + err)
+        self.assertNotIn("connected:", out)
+        self.assertIn("token is not a regular file", err)
+        self.assertTrue(stat.S_ISFIFO(os.lstat(token).st_mode), "the FIFO is left as it is")
 
     def test_a_stable_root_through_the_same_seam_connects(self):
         self.seated_by_another_adapter()
