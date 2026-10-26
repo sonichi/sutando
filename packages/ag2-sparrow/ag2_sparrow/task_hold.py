@@ -16,6 +16,8 @@ import stat
 import time
 from pathlib import Path
 
+from .delivery_core.contract import Defer
+
 from . import bounded_file_read, gateway_instance, local_task_protocol
 from .persisted_number import bounded_number
 
@@ -300,19 +302,6 @@ def disarm_notice(result_dir: Path, tid: str, token: str) -> None:
     _rewrite_notice(result_dir, tid, token, lambda f: {**f, "armed": False})
 
 
-def line_unchecked(result_dir: Path, tid: str, ts: "int | None") -> "str | None":
-    """Why the hold behind a hold line (ts below NOTICE_GEN_LIMIT) cannot be read now, or None: a
-    drain hands such a line back for a later pass rather than letting line_veto withdraw it."""
-    if ts is None or not 0 <= ts < NOTICE_GEN_LIMIT:
-        return None
-    try:
-        notice_record(result_dir, tid)
-        read(result_dir, tid)
-    except (OSError, ValueError) as e:
-        return f"its hold could not be checked ({e})"
-    return None
-
-
 def line_veto(result_dir: Path, tid: str, ts: "int | None") -> "str | None":
     """Asked at a drain's send of a message about `tid` named with `ts`: why a hold line (ts below
     NOTICE_GEN_LIMIT) must not be sent, or None. Only the record's own generation, once armed,
@@ -321,13 +310,15 @@ def line_veto(result_dir: Path, tid: str, ts: "int | None") -> "str | None":
         return None
     try:
         fields = notice_record(result_dir, tid)
+        held = read(result_dir, tid)
     except (OSError, ValueError) as e:
-        return f"its hold could not be checked ({e})"
+        # Unreadable is not absent: the drain keeps the line for a later pass.
+        return Defer(f"its hold could not be checked ({e})")
     if fields is not None and fields["gen"] is None:
-        return None if read(result_dir, tid) is not None else "no hold stands on it"
+        return None if held is not None else "no hold stands on it"
     if fields is None or fields["gen"] != ts:
         return "a later hold line replaced it, or no hold queued it"
-    if not fields["armed"] or read(result_dir, tid) is None:
+    if not fields["armed"] or held is None:
         return "no hold stands on it"
     return None
 

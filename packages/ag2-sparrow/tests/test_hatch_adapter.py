@@ -6492,6 +6492,33 @@ class Hold(Base):
         self.assertEqual(posts, [f"@bob:ag2.space {hatch_cli.HOLD_NOTICE}"], "posted once, on the next pass")
         self.assertEqual(hatch_cli.hold_line_outcome(self.results, self.TID), "delivered")
 
+    def test_a_hold_check_that_fails_inside_the_dispatch_veto_defers_the_line(self):
+        # Reviewer's probe: EMFILE on the veto's own read, after any earlier check passed, under the send lock.
+        self.add_task(self.TID, "$ev1")
+        self.assertEqual(self.hold(str(self.result_file)).returncode, hatch_cli.REPLY_POSTED)
+        real, failed = task_hold.notice_record, []
+
+        def flaky(*a, **k):
+            callers, frame = set(), sys._getframe(1)
+            while frame is not None and len(callers) < 8:
+                callers.add(frame.f_code.co_name)
+                frame = frame.f_back
+            if not failed and "line_veto" in callers:
+                failed.append(True)
+                raise OSError(errno.EMFILE, "Too many open files")
+            return real(*a, **k)
+        posts = []
+        with mock.patch.object(task_hold, "notice_record", side_effect=flaky):
+            self.drain_pass(posts)
+        self.assertTrue(failed, "the veto's read failed")
+        self.assertEqual(posts, [], "nothing sent on that pass")
+        self.assertTrue(self.notice.exists(), "and nothing withdrawn: the line is back in the queue")
+        self.assertEqual(hatch_cli.hold_line_outcome(self.results, self.TID), "undelivered")
+        self.drain_pass(posts)
+        self.drain_pass(posts)
+        self.assertEqual(posts, [f"@bob:ag2.space {hatch_cli.HOLD_NOTICE}"], "exactly one line, on the next pass")
+        self.assertEqual(hatch_cli.hold_line_outcome(self.results, self.TID), "delivered")
+
     def test_a_failed_marker_then_a_drain_pass_still_lets_hold_run_again(self):
         # Reviewer's B2: the drain withdraws the armed line no hold stands on; the retry must recover.
         self.add_task(self.TID, "$ev1")
