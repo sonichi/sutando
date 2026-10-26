@@ -578,8 +578,8 @@ class _VaultIntercept:
     def delete(self, key: str) -> None:
         self._m.delete_vault_key(key)
 
-    def writer_lock(self):
-        return self._m.writer_lock()
+    def writer_lock(self, wait_s=None):
+        return self._m.writer_lock(wait_s)
 
 
 def _vault(vault):
@@ -587,24 +587,35 @@ def _vault(vault):
 
 
 @contextlib.contextmanager
-def _vault_writer(vault):
+def _vault_writer(vault, wait_s=None):
     """The vault's own writer transaction when it has one (vault_intercept.writer_lock), else nothing.
     Taken only while connections.lock is held, never the reverse; one not taken is VaultUnavailable."""
     lock = getattr(vault, "writer_lock", None)
     with contextlib.ExitStack() as stack:
         try:
             if lock is not None:
-                stack.enter_context(lock())
+                stack.enter_context(lock() if wait_s is None else lock(wait_s=wait_s))
         except Exception as e:  # noqa: BLE001 - a held or broken lock both mean nothing may be written
-            raise VaultUnavailable(f"the secret vault's writer lock was not taken ({e}); nothing was written") from None
+            raise VaultUnavailable(f"the secret vault's writer lock was not taken ({_vault_cause(e)}); "
+                                   "nothing was written") from None
         yield
+
+
+_VAULT_CODE_RE = re.compile(r"^(vault_[a-z0-9_]{1,60}):")
+
+
+def _vault_cause(e: BaseException) -> str:
+    """The error's type and, when it leads with a `vault_*` code, that code: never its free text,
+    which may quote Keychain output."""
+    m = _VAULT_CODE_RE.match(str(getattr(e, "CODE", "") or e) + ":")
+    return f"{type(e).__name__}: {m.group(1)}" if m else type(e).__name__
 
 
 def _vault_store(vault, key: str, value: str) -> None:
     try:
         vault.set(key, value)
     except Exception as e:  # noqa: BLE001 - the vault's own error types vary; the cause is named
-        raise VaultUnavailable(f"could not store {key} in the secret vault ({type(e).__name__})") from None
+        raise VaultUnavailable(f"could not store {key} in the secret vault ({_vault_cause(e)})") from None
 
 
 def _vault_get(vault, key: str) -> str:
@@ -636,7 +647,7 @@ def _vault_delete(vault, key: str) -> None:
     try:
         vault.delete(key)
     except Exception as e:  # noqa: BLE001
-        raise VaultUnavailable(f"could not remove {key} from the secret vault ({type(e).__name__})") from None
+        raise VaultUnavailable(f"could not remove {key} from the secret vault ({_vault_cause(e)})") from None
 
 
 # ── record I/O ───────────────────────────────────────────────────────────────
@@ -1526,6 +1537,8 @@ def update_token(instance: str, token: str, *, repo: Path, logs_dir: Path,
                 raise TokenSourceShadowed(instance, ref)
             candidate = _updated_row(rec, row, seen, instance)
             _vault_snapshot(vault, ref)  # an unreadable vault refuses before the stop
+            with _vault_writer(vault, wait_s=0):  # so does a busy one; not held across the stop,
+                pass                               # which may wait on a bridge's own vault write
             stopped = stop_bridge(instance, workspace=workspace, kill=kill)
             # No other vault writer interleaves from the snapshot through the restore.
             with _vault_writer(vault):

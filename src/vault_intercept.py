@@ -173,17 +173,18 @@ def writer_lock_path() -> str:
     return os.path.join(os.path.dirname(_manifest_path()), "writer.lock")
 
 
-def _take_writer_lock(path: str) -> int:
+def _take_writer_lock(path: str, wait_s) -> int:
     import time
     from file_lock import try_lock_fd
     os.makedirs(os.path.dirname(path), exist_ok=True)
     fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
-    deadline = time.monotonic() + _WRITER_LOCK_WAIT_S
+    wait_s = _WRITER_LOCK_WAIT_S if wait_s is None else wait_s
+    deadline = time.monotonic() + wait_s
     try:
         while not try_lock_fd(fd):
             if time.monotonic() >= deadline:
                 raise VaultBusy(f"{VaultBusy.CODE}: another vault writer held the writer lock for "
-                                f"{_WRITER_LOCK_WAIT_S:g}s; nothing was written")
+                                f"{wait_s:g}s; nothing was written")
             time.sleep(0.05)
     except BaseException:
         os.close(fd)
@@ -192,12 +193,12 @@ def _take_writer_lock(path: str) -> int:
 
 
 @contextlib.contextmanager
-def writer_lock():
+def writer_lock(wait_s=None):
     """The one writer transaction every vault write runs under (set, delete, chat interception, the
     CLI): a cross-process lock, re-entrant within a thread, so a caller can hold it across a read,
     a write and a compare. Lock order: a caller holding connections.lock may take this; code holding
     this never takes connections.lock. A lock that cannot be taken is a RuntimeError, so the write
-    fails; one still held by another writer after _WRITER_LOCK_WAIT_S is VaultBusy."""
+    fails; one still held by another writer after `wait_s` (default _WRITER_LOCK_WAIT_S) is VaultBusy."""
     if getattr(_WRITER, "depth", 0):
         _WRITER.depth += 1
         try:
@@ -207,7 +208,7 @@ def writer_lock():
         return
     from file_lock import unlock_fd
     try:
-        fd = _take_writer_lock(writer_lock_path())
+        fd = _take_writer_lock(writer_lock_path(), wait_s)
     except OSError as e:
         raise RuntimeError(f"vault: writer lock unavailable ({type(e).__name__})") from None
     _WRITER.depth = 1

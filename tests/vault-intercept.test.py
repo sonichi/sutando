@@ -826,6 +826,16 @@ class TestWriterDeadlines(unittest.TestCase):
         self.assertFalse({"DEADLINE_HELD", "DEADLINE_CHAT"} & self._keys(), "nothing reaches the manifest")
         self.assertEqual(getattr(vault_intercept._WRITER, "depth", 0), 0)
 
+    def test_a_zero_wait_probe_refuses_at_once(self):
+        import time
+        self._hold_in_child()
+        began = time.monotonic()
+        with self.assertRaises(vault_intercept.VaultBusy):
+            with vault_intercept.writer_lock(0):
+                self.fail("taken while held")
+        self.assertLess(time.monotonic() - began, 0.5)
+        self.assertEqual(getattr(vault_intercept._WRITER, "depth", 0), 0)
+
     def _hung_security(self):
         import stat
         bindir = tempfile.mkdtemp(prefix="hung-security-")

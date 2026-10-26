@@ -212,9 +212,14 @@ The vault has **one writer transaction**, `vault_intercept.writer_lock`: a cross
 `writer.lock` beside the canonical manifest (`state/secret-vault/`), re-entrant within the thread
 that holds it. Every vault write runs inside it, Keychain and manifest alike: `set_vault_key`,
 `delete_vault_key`, chat interception (`vault set` in a message) and the secret-vault CLI all reach
-the same locked writer. `update_token` takes it after the bridge is stopped and holds it from the
+the same locked writer. Before it stops the bridge, `update_token` probes the lock without
+waiting: a lock another writer holds refuses the update with `vault_busy` and the bridge is never
+stopped. The probe is released before the stop, because a stopping bridge may be finishing its own
+vault write. After the stop it takes the lock again (bounded, below) and holds it from the
 prior-value snapshot through the new vault write, the record publication and any restore, so no
-other vault writer, in this process or another, can land in between. The lock order is
+other vault writer, in this process or another, can land in between. A narrow race remains: a
+writer that takes the lock between the probe and the re-take makes the re-take wait for it, with
+the bridge already stopped (and relaunched on the unchanged code if that wait runs out). The lock order is
 `connections.lock`, then the vault lock; nothing in the vault layer takes `connections.lock`. The
 lock is released when its holder raises or exits (a killed holder's lock is dropped by the
 kernel), and its file stays empty. A lock that cannot be taken fails the write.
@@ -225,7 +230,8 @@ lock within 30 s fails with `vault_busy` and writes nothing, and a `security` st
 that gives no answer within 15 s is killed and fails with `vault_keychain_timeout`, the manifest
 unchanged and the lock released (the item's Keychain state is then whatever `security` left; run
 the write again). Through `connections` both surface as `vault_unavailable` (HTTP 503), the
-message naming the code.
+message naming the code; only a leading `vault_*` code is passed through from the vault's error,
+never its free text, so no Keychain output or secret reaches the message.
 
 The lock lives beside the manifest of the **configured** workspace (`resolve_workspace`), not
 the `workspace=` a `connections` call is given: the record and the vault lock can sit in different
