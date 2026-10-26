@@ -1166,6 +1166,13 @@ class Starting(Base):
         status = C.status_for(self.rows()[0], self.ws)
         self.assertEqual((status["state"], status["reason"], status["running"]), ("failed", "no_token", False))
 
+    def test_a_lease_that_proves_nothing_reads_running_null(self):
+        row, _ = self.add(TOKEN_B, fetch=agents("@s:beta-fixture.net"))
+        lock = self.ws / "state" / "locks" / "gateway-bridge.beta-fixture-net.lock"
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        lock.write_text("not-a-lease\n")
+        self.assertIsNone(C.status_for(row, self.ws)["running"])
+
     def test_parked_and_legacy_rows_are_not_started(self):
         C.import_from_env({"REMOTE_TASK_TOKEN": TOKEN_A}, workspace=self.ws, vault=self.vault)
         row, _ = self.add(TOKEN_B, fetch=agents("@s:beta-fixture.net"))
