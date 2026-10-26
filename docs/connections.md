@@ -206,20 +206,29 @@ from a failure (`vault_unreadable` on a failure), so a concurrent update that co
 remove and re-add, is never undone by a stale snapshot. Once the vault write has begun, any
 failure (the Keychain write landed but the vault manifest did not, or the record write failed)
 is reconciled by **reading the key back** while the same hold of the record lock is kept (a writer
-that would commit meanwhile waits), compared by digest and never logged. The restore is a
-**compare-and-swap on the stored value**, because the public vault writers (`vault set`,
-`set_vault_key`, the secret-vault CLI) take no connections lock, and should not: the previous
-secret is written back only when a read shows exactly the new code this update wrote, then read
-back again. Read back as the previous secret, a bridge stopped for the update is relaunched on it
-and the error says whether that worked; still the new code, `token_restore_failed`; any other
-value (another writer's, left in place) or a read that fails, `token_state_unknown`, with the row
-unchanged. Neither of the last two relaunches.
+that would commit meanwhile waits), compared by digest and never logged.
 
-Two windows remain, because the Keychain offers no atomic compare-and-set: a public write that
-lands between the compare read and the restore write (one `security` read and one write apart) is
-overwritten, and the read-back then reports the previous secret; and a public write of exactly the
-same value as the new code cannot be told apart from this update's own write, so it is restored
-over. A public write after the final read-back is never touched. Otherwise it replaces the secret under the row's existing
+The vault has **one writer transaction**, `vault_intercept.writer_lock`: a cross-process lock on
+`writer.lock` beside the canonical manifest (`state/secret-vault/`), re-entrant within the thread
+that holds it. Every vault write runs inside it, Keychain and manifest alike: `set_vault_key`,
+`delete_vault_key`, chat interception (`vault set` in a message) and the secret-vault CLI all reach
+the same locked writer. `update_token` takes it after the bridge is stopped and holds it from the
+prior-value snapshot through the new vault write, the record publication and any restore, so no
+other vault writer, in this process or another, can land in between. The lock order is
+`connections.lock`, then the vault lock; nothing in the vault layer takes `connections.lock`. The
+lock is released when its holder raises or exits (a killed holder's lock is dropped by the
+kernel), and its file stays empty. A lock that cannot be taken fails the write.
+
+The restore is still a compare-and-swap on the stored value: the previous secret is written back
+only when a read shows exactly the new code this update wrote, then read back again. Read back
+as the previous secret, a bridge stopped for the update is relaunched on it and the error says
+whether that worked; still the new code, `token_restore_failed`; any other value or a read that
+fails, `token_state_unknown`, with the row unchanged. Neither of the last two relaunches. A public
+write that arrives meanwhile, a different value or the same new code, waits for the transaction
+and then lands, so its value is the final one. Only a write that bypasses `vault_intercept` (the
+`security` command run by hand) is outside the transaction.
+
+On success `update_token` replaces the secret under the row's existing
 `token_ref`, keeps the instance, primary flag, `added_at` and launch record, updates
 `gateway_url` and the identity fields from the preview, clears `disabled` and relaunches the
 bridge the way `reconnect` does, so a disconnected or failed row comes back on the new code;

@@ -54,6 +54,7 @@ import re
 import signal
 import subprocess
 import sys
+import contextlib
 import hashlib
 import http.client
 import ipaddress
@@ -577,9 +578,19 @@ class _VaultIntercept:
     def delete(self, key: str) -> None:
         self._m.delete_vault_key(key)
 
+    def writer_lock(self):
+        return self._m.writer_lock()
+
 
 def _vault(vault):
     return _VaultIntercept() if vault is None else vault
+
+
+def _vault_writer(vault):
+    """The vault's own writer transaction when it has one (vault_intercept.writer_lock), else nothing.
+    Taken only while connections.lock is held, never the reverse."""
+    lock = getattr(vault, "writer_lock", None)
+    return lock() if lock is not None else contextlib.nullcontext()
 
 
 def _vault_store(vault, key: str, value: str) -> None:
@@ -1473,8 +1484,8 @@ def update_token(instance: str, token: str, *, repo: Path, logs_dir: Path,
     transaction, right before the stop and the vault write, so a concurrent update or a remove and
     re-add is never undone by a stale snapshot. Once the vault write has begun, a failure is
     reconciled under that same hold of the record lock by reading the key back (`_reconcile_vault`): the previous
-    secret is put back only while the key holds exactly the new code (another writer's value is never
-    overwritten); read back as the previous secret, the stopped bridge is relaunched on it and the
+    secret is put back only while the key holds exactly the new code, all inside the vault's own writer
+    transaction (`_vault_writer`), so no other vault writer lands between the compare and the restore; read back as the previous secret, the stopped bridge is relaunched on it and the
     error says whether that worked; read back as the new code, `TokenRestoreFailed`; anything else,
     or a read that fails, `TokenStateUnknown`. Neither of those relaunches.
     Returns the row with `stopped_pid` and the launch record under `launch`; a launch that fails
@@ -1501,17 +1512,23 @@ def update_token(instance: str, token: str, *, repo: Path, logs_dir: Path,
             if (environ.get(ref) or "").strip():
                 raise TokenSourceShadowed(instance, ref)
             candidate = _updated_row(rec, row, seen, instance)
-            previous = _vault_snapshot(vault, ref)
+            _vault_snapshot(vault, ref)  # an unreadable vault refuses before the stop
             stopped = stop_bridge(instance, workspace=workspace, kill=kill)
-            mutating = True
-            _vault_store(vault, ref, new)
-            row.clear()
-            row.update(candidate)
-            _write(path, rec)
-        except Exception as e:  # noqa: BLE001 - settled below, once the vault is reconciled under the lock
+            # No other vault writer interleaves from the snapshot through the restore.
+            with _vault_writer(vault):
+                try:
+                    previous = _vault_snapshot(vault, ref)
+                    mutating = True
+                    _vault_store(vault, ref, new)
+                    row.clear()
+                    row.update(candidate)
+                    _write(path, rec)
+                except Exception:
+                    if mutating:
+                        found, restore = _reconcile_vault(vault, ref, previous, new)
+                    raise
+        except Exception as e:  # noqa: BLE001 - settled below, after the locks are released
             failure = e
-            if mutating:
-                found, restore = _reconcile_vault(vault, ref, previous, new)
     if failure is not None:
         e = failure
         if mutating:

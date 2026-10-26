@@ -2643,5 +2643,141 @@ class ZombieChild(Base):
         self.assertEqual(C.bridge_pid("beta-fixture-net", self.ws), 0)
 
 
+FAKE_SECURITY = r"""#!/usr/bin/env bash
+verb="$1"; shift; key=""; value=""
+while [ $# -gt 0 ]; do case "$1" in -s) key="$2"; shift 2;; -w) if [ "$verb" = add-generic-password ]; then value="$2"; shift 2; else shift; fi;; *) shift;; esac; done
+case "$verb" in
+  add-generic-password) printf '%s' "$value" > "$FAKE_KEYCHAIN/$key";;
+  find-generic-password) [ -f "$FAKE_KEYCHAIN/$key" ] && cat "$FAKE_KEYCHAIN/$key" || exit 44;;
+  delete-generic-password) [ -f "$FAKE_KEYCHAIN/$key" ] && rm "$FAKE_KEYCHAIN/$key" || exit 44;;
+  *) exit 1;;
+esac
+"""
+
+
+@unittest.skipIf(os.name == "nt", "the stub Keychain is a bash script")
+class CrossProcessVaultBarrier(Base):
+    """The public writer, in another process, cannot land between a failed update's compare and its
+    restore: it waits for update_token's vault transaction, then lands, and its value is final."""
+
+    REF = "AG2_REMOTE_TOKEN_BETA_FIXTURE_NET"
+    NEW = "https://relay.beta-fixture.net:8443|secret-beta-rotated"
+    THIRD = "https://relay.beta-fixture.net:8443|secret-beta-public"
+    PUBLIC = ("import sys\nsys.path.insert(0, sys.argv[1])\nimport vault_intercept as v\n"
+              "print(v._manifest_path(), flush=True)\nv.set_vault_key(sys.argv[2], sys.argv[3])\n"
+              "print('stored', flush=True)\n")
+
+    def setUp(self):
+        super().setUp()
+        self.add()
+        self.add(TOKEN_B, fetch=agents("@s:beta-fixture.net"))
+        import vault_intercept
+        self.vi = vault_intercept
+        self.keychain = self.ws / "keychain"
+        self.keychain.mkdir()
+        for key, value in self.vault.store.items():
+            (self.keychain / key).write_text(value)
+        bindir = self.ws / "bin"
+        bindir.mkdir()
+        (bindir / "security").write_text(FAKE_SECURITY)
+        (bindir / "security").chmod(0o755)
+        self.env = {"PATH": f"{bindir}{os.pathsep}{os.environ['PATH']}", "FAKE_KEYCHAIN": str(self.keychain),
+                    "SUTANDO_WORKSPACE": str(self.ws), "SUTANDO_TEST_MODE": "1"}
+        manifest = str(self.ws / "state" / "secret-vault" / "keys.json")
+        self.patches = [unittest.mock.patch.dict(os.environ, self.env),
+                        unittest.mock.patch.object(vault_intercept, "_manifest_path", lambda: manifest)]
+        for p in self.patches:
+            p.start()
+        self.manifest = manifest
+        self.vault = C._VaultIntercept()
+
+    def tearDown(self):
+        for p in reversed(self.patches):
+            p.stop()
+        super().tearDown()
+
+    def barrier(self, public):
+        """B's record write fails; once its reconcile has read NEW, a public set_vault_key starts in
+        another process. Whether it was still running during the pause, and its exit code."""
+        real_snapshot = C._vault_snapshot
+        state = {"failed": False, "child": None, "blocked": None}
+
+        def write(path, record):
+            state["failed"] = True
+            raise OSError("disk full")
+
+        def snapshot(vault, key):
+            value = real_snapshot(vault, key)
+            if state["failed"] and state["child"] is None:
+                self.assertEqual(value, self.NEW, "the reconcile observed this update's own write")
+                child = subprocess.Popen([sys.executable, "-c", self.PUBLIC, str(ROOT / "src"), self.REF, public],
+                                         stdout=subprocess.PIPE, env=isolated_child_env(**self.env), text=True)
+                state["child"] = child
+                state["manifest"] = child.stdout.readline().strip()
+                time.sleep(0.6)
+                state["blocked"] = child.poll() is None
+            return value
+        with unittest.mock.patch.object(C, "_write", write), unittest.mock.patch.object(C, "_vault_snapshot", snapshot):
+            with self.assertRaises(OSError):
+                C.update_token("beta-fixture-net", self.NEW, repo=self.ws / "repo", logs_dir=self.ws / "logs",
+                               environ={}, workspace=self.ws, vault=self.vault, spawn=self.bridge_spawn(),
+                               kill=os.kill, fetch=agents("@s:beta-fixture.net"))
+        child = state["child"]
+        self.assertIsNotNone(child, "the reconcile read NEW")
+        self.assertEqual(os.path.realpath(state["manifest"]), os.path.realpath(self.manifest), "one vault")
+        rc = child.wait(10)
+        child.stdout.close()
+        return state["blocked"], rc
+
+    def test_a_public_write_between_the_compare_and_the_restore_waits_and_is_final(self):
+        blocked, rc = self.barrier(self.THIRD)
+        self.assertTrue(blocked, "the public writer waited for update_token's vault transaction")
+        self.assertEqual(rc, 0)
+        self.assertEqual((self.keychain / self.REF).read_text(), self.THIRD, "the public value is the final one")
+
+    def test_a_public_write_of_the_same_new_value_is_final_too(self):
+        """ABA: a public write of exactly the update's new code is not mistaken for the update's own."""
+        blocked, rc = self.barrier(self.NEW)
+        self.assertTrue(blocked)
+        self.assertEqual(rc, 0)
+        self.assertEqual((self.keychain / self.REF).read_text(), self.NEW, "the public write landed after the restore")
+
+    def test_the_normal_restore_still_puts_the_previous_secret_back(self):
+        with unittest.mock.patch.object(C, "_write", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                C.update_token("beta-fixture-net", self.NEW, repo=self.ws / "repo", logs_dir=self.ws / "logs",
+                               environ={}, workspace=self.ws, vault=self.vault, spawn=self.bridge_spawn(),
+                               kill=os.kill, fetch=agents("@s:beta-fixture.net"))
+        self.assertEqual((self.keychain / self.REF).read_text(), TOKEN_B, "the previous secret is back")
+
+    def test_lock_order_connections_then_vault_never_deadlocks(self):
+        """update_token holds connections.lock then the vault lock; a public writer and a remove run
+        beside it and every one finishes."""
+        done = []
+
+        def public():
+            self.vi.set_vault_key("AG2_REMOTE_TOKEN_OTHER", "x")
+            done.append("public")
+
+        def remove():
+            C.remove_connection("beta-fixture-net", workspace=self.ws, vault=self.vault)
+            done.append("remove")
+
+        def update():
+            try:
+                C.update_token("beta-fixture-net", self.NEW, repo=self.ws / "repo", logs_dir=self.ws / "logs",
+                               environ={}, workspace=self.ws, vault=self.vault, spawn=self.bridge_spawn(),
+                               kill=os.kill, fetch=agents("@s:beta-fixture.net"))
+            except C.UnknownConnection:
+                pass
+            done.append("update")
+        threads = [threading.Thread(target=f) for f in (update, public, remove)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(20)
+        self.assertEqual(sorted(done), ["public", "remove", "update"], "no deadlock")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)
