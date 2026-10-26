@@ -238,12 +238,14 @@ INSERT INTO runtime_requests VALUES ('approval-m1','approval','t',NULL,
 
     # create_consuming's insert and consume are one transaction: another thread's
     # commit landing between them must wait, or it commits the insert alone.
-    txn = rs.RequestStore(str(tmp / "txn.sqlite"))
+    txn_path = str(tmp / "txn.sqlite")
+    txn = rs.RequestStore(txn_path)
     other = txn.create("capability", "m", "@a:hs", {})
     unapproved = txn.create("approval", "approval.request", "@a:hs", {})
     real_db, real_lock = txn._db, getattr(txn, "_lock", None)
     seen = threading.Condition()
-    evidence: list = []  # "blocked" (rival waits on the store lock) or "committed"
+    evidence: list = []  # first entry decides: only "blocked" passes
+    worker_errors: list = []
 
     def note(what):
         with seen:
@@ -263,9 +265,12 @@ INSERT INTO runtime_requests VALUES ('approval-m1','approval','t',NULL,
 
     def rival():
         try:
-            txn.transition(other["requestId"], "completed")
-        finally:
-            note("committed")
+            won = txn.transition(other["requestId"], "completed")
+        except BaseException as exc:  # noqa: BLE001 - any worker failure fails the case
+            worker_errors.append(repr(exc))
+            note("error")
+        else:
+            note("committed" if won else "lost")
 
     rival_thread = threading.Thread(target=rival, daemon=True)
 
@@ -288,16 +293,26 @@ INSERT INTO runtime_requests VALUES ('approval-m1','approval','t',NULL,
                                 idempotency_key="interleaved")
     first = evidence[0] if evidence else "none"
     rival_thread.join(30)
+    stuck = rival_thread.is_alive()
     txn._db = real_db
     if real_lock is not None:
         txn._lock = real_lock
     check(first == "blocked",
           f"a commit from another thread mid-create_consuming waits on the store lock (saw {first})")
-    check(lost is None and txn.by_idempotency_key("interleaved") is None,
-          "the lost consume leaves no row")
-    check(not rival_thread.is_alive() and txn.get(other["requestId"])["status"] == "completed",
-          "the waiting thread's write lands after the transaction")
-    txn.close()
+    check(not stuck and worker_errors == [] and evidence[-1:] == ["committed"],
+          f"the waiting thread finishes and commits (stuck={stuck}, errors={worker_errors[:2]})")
+    durable = sqlite3.connect(txn_path)
+    try:
+        orphans = durable.execute("SELECT COUNT(*) FROM runtime_requests"
+                                  " WHERE idempotency_key = 'interleaved'").fetchone()[0]
+        landed = durable.execute("SELECT status FROM runtime_requests WHERE request_id = ?",
+                                 (other["requestId"],)).fetchone()
+    finally:
+        durable.close()
+    check(lost is None and orphans == 0, "the lost consume leaves no committed row")
+    check(landed == ("completed",), f"the waiting thread's write is durable ({landed})")
+    if not stuck:  # a rival still holding the lock would hang close()
+        txn.close()
 
     print(f"\n{'PASS — request store unit suite green' if not FAILS else f'FAILED ({len(FAILS)})'}")
     return 1 if FAILS else 0
