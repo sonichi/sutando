@@ -822,12 +822,14 @@ def withdraw_start_grant(root, generation: str, rec, shape: Shape) -> str:
         path.unlink(missing_ok=True)
     if rec is None:
         return ""
-    if got.get("generation") != generation or (got.get("pid"), got.get("start")) != (rec.get("pid"), rec.get("start")):
-        return (f"the launcher holding {root} (pid {rec.get('pid')}) did not claim this start (generation "
+    launcher = rec.get("owner_pid", rec.get("pid"))
+    if got.get("generation") != generation or got.get("pid") != launcher or \
+            task_io.verify_lineage(launcher, got.get("start")) is not True:
+        return (f"the launcher holding {root} (pid {launcher}) did not claim this start (generation "
                 f"{generation[:8]}); it was not started by this operation")
     job = manager_pid(shape)
-    if job is None or job not in (rec.get("pid"), _parent_pid(rec.get("pid"))):
-        return (f"the launcher holding {root} (pid {rec.get('pid')}) is not the process {job_name(shape)} runs "
+    if job is None or job not in (launcher, _parent_pid(launcher)):
+        return (f"the launcher holding {root} (pid {launcher}) is not the process {job_name(shape)} runs "
                 f"as ({job or 'none'}); it was not started by this operation")
     return ""
 
@@ -1060,12 +1062,7 @@ def _install_locked(shape: Shape, values: dict, root: str, revise=None, precheck
     _write(sup, unit, 0o644)
     print(f"{'installed' if not old else 'changed' if old != dict(values, ROOT=root) else 'rewritten'}: {conf}")
     print(f"installed: {sup}")
-    generation, rec = publish_start_grant(root, shape.name), None
-    try:
-        problem = start_supervisor(shape)
-        rec = None if problem else _fresh_holder(shape, root, before)
-    finally:
-        claim_problem = withdraw_start_grant(root, generation, rec, shape)
+    problem, rec, claim_problem, generation = _start_granted(shape, root, before, restart=True)
     if problem:
         return _refuse(f"{problem}; the managed launcher did not acquire {root}; run {shape.command} uninstall, "
                        f"then {shape.command} install")
@@ -1129,13 +1126,7 @@ def _connect_install_locked(shape: Shape, values: dict, root: str, revise, prech
             return _refuse(f"{problem}; connect changes no job's definition: run {shape.command} install to change "
                            "it; nothing more was applied")
     published = unit.encode("utf-8")
-    before, rec = lock_holder(root), None
-    generation = publish_start_grant(root, shape.name)
-    try:
-        problem = start_supervisor(shape, restart=False)
-        rec = None if problem else _fresh_holder(shape, root, before)
-    finally:
-        claim_problem = withdraw_start_grant(root, generation, rec, shape)
+    problem, rec, claim_problem, generation = _start_granted(shape, root, lock_holder(root), restart=False)
     if problem:
         return _refuse(f"{problem}; the managed launcher did not acquire {root}")
     if claim_problem:
@@ -1154,6 +1145,19 @@ def _connect_install_locked(shape: Shape, values: dict, root: str, revise, prech
     print(f"the managed launcher acquired the expected root: {root} "
           f"({holder(root, rec) if holder is not None else 'launcher pid %s' % rec['pid']})")
     return 0
+
+
+def _start_granted(shape: Shape, root: str, before: dict, restart: bool) -> "tuple[str, dict | None, str, str]":
+    """The one way a locked operation starts `shape`'s job: publish the bound start grant (its launcher
+    cannot take the agent lock the operation holds), start, wait for the fresh holder, then retire the
+    grant and check the holder claimed it. (start problem, holder record, claim problem, generation)."""
+    generation, rec = publish_start_grant(root, shape.name), None
+    try:
+        problem = start_supervisor(shape, restart=restart)
+        rec = None if problem else _fresh_holder(shape, root, before)
+    finally:
+        claim_problem = withdraw_start_grant(root, generation, rec, shape)
+    return problem, rec, claim_problem, generation
 
 
 _STARTED: dict = {}

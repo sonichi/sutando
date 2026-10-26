@@ -366,6 +366,7 @@ CONTENDER = ("import sys; sys.path.insert(0, %r); from ag2_sparrow import connec
              "cm.AGENT_LOCK_WAIT_S = 0.3; cm.LAUNCH_WAIT_S = 0.3\n"
              "print('install', cm.install(other.LOCAL, {}, %r), flush=True)\n"
              "print('launch', cm.launch_admission(%r, other.LOCAL.name)[1] or 'admitted', flush=True)")
+# The manager's start, as every Runner start does it: the production admission, then the root.
 LAUNCHED = ("import sys; sys.path.insert(0, %r); from ag2_sparrow import connect_common as cm, holder_lock, task_io\n"
             "install = %r\n"
             "if install: holder_lock.install_id = lambda: install\n"
@@ -373,6 +374,16 @@ LAUNCHED = ("import sys; sys.path.insert(0, %r); from ag2_sparrow import connect
             "if why: print('refused', why, flush=True); sys.exit(75)\n"
             "o = task_io.acquire_lock(%r, %r); cm.end_admission(fd)\n"
             "print('held', flush=True); sys.stdin.read(); task_io.release_lock(o)")
+# The real launcher entry point (hold_and_supervise) with a sleep for its consumer, until stdin closes.
+REAL_LAUNCHER = ("import subprocess, sys; sys.path.insert(0, %r)\n"
+                 "from ag2_sparrow import connect_common as cm\n"
+                 "from ag2_sparrow.adapters.claude_code.cli import LOCAL\n"
+                 "cm.LAUNCH_WAIT_S = 5\n"
+                 "def prepare(owner, root): print('held', flush=True); return None, ''\n"
+                 "def supervise(child): sys.stdin.read(); child.kill(); child.wait(); return 0\n"
+                 "rc = cm.hold_and_supervise(LOCAL, %r, {'sig': None}, prepare, lambda ctx: subprocess.Popen(['sleep', '300']),\n"
+                 "                           supervise, lambda c: (c.kill(), c.wait()), 'run', 'test')\n"
+                 "print('refused', rc, flush=True)")
 OP_HOLDER = ("import sys; sys.path.insert(0, %r); from ag2_sparrow import connect_common as cm\n"
              "from ag2_sparrow.adapters.claude_code.cli import LOCAL\n"
              "with cm.operation_lock(LOCAL): print('held', flush=True); sys.stdin.read()")
@@ -403,9 +414,11 @@ def hold(root, name="first-launcher", script=STAND_IN, install=""):
 
 
 
-def launched(root, adapter, install=""):
+def launched(root, adapter, install="", real=False):
     """The manager's start: the launcher passes the agent lock's admission, then takes the root."""
-    p = subprocess.Popen([sys.executable, "-c", LAUNCHED % (str(PKG), install, str(root), "claude-local", str(root), adapter)],
+    script = REAL_LAUNCHER % (str(PKG), str(root)) if real else \
+        LAUNCHED % (str(PKG), install, str(root), "claude-local", str(root), adapter)
+    p = subprocess.Popen([sys.executable, "-c", script],
                          stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
     if p.stdout.readline().strip() != "held":
         p.wait(timeout=30)
@@ -464,10 +477,11 @@ class Runner:
         self.table, self.default, self.calls, self.root = dict(table or {}), default, [], root
         self.session, self.adapter, self.install = None, adapter, install
         self.enabled, self.registered, self.stop_delay, self.timers = False, registered, stop_delay, []
+        self.real = False
 
     def start_session(self, by_manager=False):
         self.stop_session()
-        self.session = launched(self.root, self.adapter, self.install) if by_manager else \
+        self.session = launched(self.root, self.adapter, self.install, self.real) if by_manager else \
             hold(self.root, self.adapter, install=self.install)
 
     def stop_session(self):
@@ -3178,6 +3192,25 @@ class ConnectCode(AgentRootBase):
         self.assertIn("is no longer the job this connect started (its unit or launcher changed)", err)
         self.assertIsNotNone(fake.runner.pid(), "not stopped")
         self.assertEqual(cm.supervisor_path(L).read_text(), foreign)
+
+    def test_the_real_launcher_started_by_install_and_by_connect_ends_up_alive(self):
+        for how in ("install", "connect"):
+            with self.subTest(how):
+                fake = self.bridged()
+                fake.runner.real = True                     # hold_and_supervise, through launch_admission
+                if how == "install":
+                    seed_seat(cli.bridge_home(self.root), BEARER)
+                    rc, out, err = (lambda fake: self.install_default(fake, "--token-env-file", str(cli.bridge_home(self.root) / "channels" / "ag2space" / ".env")))(fake)
+                else:
+                    rc, out, err = self.connect(Backend(), fake)
+                self.assertEqual(rc, 0, out + err)
+                self.assertIsNotNone(fake.runner.session)
+                self.assertIsNone(fake.runner.session.poll(), "the launcher is alive")
+                rec = task_io.lock_holder(str(self.root))
+                self.assertEqual((rec["owner_pid"], rec["live"]), (fake.runner.pid(), True), "and holds the root")
+                fake.runner.stop_session()
+                with mock.patch.object(sm, "_run", side_effect=fake), contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(cm.uninstall(L), 0)
 
     def test_a_running_job_refuses_connect_before_the_code_is_spent_and_is_left_running(self):
         fake = self.running_job()
