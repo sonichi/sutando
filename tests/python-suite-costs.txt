@@ -590,7 +590,8 @@
 1 tests/health-task-queue-inflight.test.py
 1 tests/heartbeat-freshness-bounds.test.py
 11 tests/heartbeat-pid-read-race.test.py
-189 tests/hermetic-env-sentinels.test.py
+90 tests/hermetic-env-sentinels-hatch-adapter.test.py
+100 tests/hermetic-env-sentinels.test.py
 137 tests/hermetic-env-structural.test.py
 1 tests/hermetic-workspace-guard.test.py
 0 tests/hitl-click-header.test.py
