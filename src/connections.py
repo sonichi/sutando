@@ -1312,10 +1312,12 @@ def _await_lease(instance: str, pid: int, workspace: Optional[Path], timeout_s: 
     when it ended first, holder the other process proven to hold it or 0; ('timeout', 0)."""
     deadline = time.monotonic() + timeout_s
     while True:
-        if _proven_holder(instance, workspace) == pid:
-            return "held", pid
         if _exited(pid):
-            return "exited", _proven_holder(instance, workspace)
+            holder = _proven_holder(instance, workspace)
+            return "exited", holder if holder != pid else 0
+        # An exited, unreaped child still proves its lease: held only if it is still running after.
+        if _proven_holder(instance, workspace) == pid and not _exited(pid):
+            return "held", pid
         if time.monotonic() >= deadline:
             return "timeout", 0
         time.sleep(0.05)
@@ -1470,7 +1472,7 @@ def update_token(instance: str, token: str, *, repo: Path, logs_dir: Path,
     (`VaultUnreadable`). The row, its token_ref and the previous secret are read inside the record
     transaction, right before the stop and the vault write, so a concurrent update or a remove and
     re-add is never undone by a stale snapshot. Once the vault write has begun, a failure is
-    reconciled by reading the key back (`_reconcile_vault`): the previous secret is put back when it
+    reconciled under that same hold of the record lock by reading the key back (`_reconcile_vault`): the previous secret is put back when it
     is not there; read back as the previous secret, the stopped bridge is relaunched on it and the
     error says whether that worked; read back as the new code, `TokenRestoreFailed`; anything else,
     or a read that fails, `TokenStateUnknown`. Neither of those relaunches.
@@ -1487,9 +1489,12 @@ def update_token(instance: str, token: str, *, repo: Path, logs_dir: Path,
         raise TokenRejected()
     vault = _vault(vault)
     new = token.strip()
-    ref, previous, mutating, stopped = "", None, False, 0
-    try:
-        with _transaction(workspace) as rec:
+    ref, previous, mutating, stopped, failure, found, restore = "", None, False, 0, None, "", ""
+    path = record_path(workspace)
+    # Snapshot, effects, publication and any reconcile share one hold of the record lock.
+    with locked_file(_lock_path(workspace), create_mode=0o600):
+        rec = _read_record(path)
+        try:
             row = _find(rec["rows"], instance)
             ref = row["token_ref"]
             if (environ.get(ref) or "").strip():
@@ -1501,9 +1506,14 @@ def update_token(instance: str, token: str, *, repo: Path, logs_dir: Path,
             _vault_store(vault, ref, new)
             row.clear()
             row.update(candidate)
-    except Exception as e:
+            _write(path, rec)
+        except Exception as e:  # noqa: BLE001 - settled below, once the vault is reconciled under the lock
+            failure = e
+            if mutating:
+                found, restore = _reconcile_vault(vault, ref, previous, new)
+    if failure is not None:
+        e = failure
         if mutating:
-            found, restore = _reconcile_vault(vault, ref, previous, new)
             cause = f"{type(e).__name__}: {e}"
             if found == "new":
                 raise TokenRestoreFailed(
@@ -1516,7 +1526,7 @@ def update_token(instance: str, token: str, *, repo: Path, logs_dir: Path,
                     f"and reading {ref} back {found}, so it is not known which secret it holds; the bridge was "
                     "not relaunched; run update-token again with the code you want") from None
         if not stopped:
-            raise
+            raise e
         try:
             relaunched = launch(instance, repo=repo, logs_dir=logs_dir, environ=environ, workspace=workspace,
                                 vault=vault, spawn=spawn, python=python)

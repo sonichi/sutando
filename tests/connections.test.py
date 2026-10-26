@@ -2510,5 +2510,108 @@ class LegacyCarrier(Base):
         self.assertTrue(C.legacy_keeps_proactive_room(self.ws), "fail-open, as the env-only launch")
 
 
+class ReconcileUnderLock(Base):
+    """A failed update reconciles the vault while it still holds the record lock: a writer that
+    would commit meanwhile waits, so its committed row and secret are never split."""
+
+    REF = "AG2_REMOTE_TOKEN_BETA_FIXTURE_NET"
+    A = "https://relay.beta-fixture.net:8443/a|secret-beta-A"
+    B = "https://relay.beta-fixture.net:8443/b|secret-beta-B"
+
+    def setUp(self):
+        super().setUp()
+        self.add()
+        self.add(TOKEN_B, fetch=agents("@s:beta-fixture.net"))
+
+    def update(self, token):
+        return C.update_token("beta-fixture-net", token, repo=self.ws / "repo", logs_dir=self.ws / "logs", environ={},
+                              workspace=self.ws, vault=self.vault, spawn=self.bridge_spawn(), kill=os.kill,
+                              fetch=agents("@s:beta-fixture.net"))
+
+    def pause_b_in_reconcile(self, other):
+        """B's row write fails; B pauses inside its reconcile while `other` runs. Whether `other`
+        finished during the pause, and B's error."""
+        real_write, real_reconcile = C._write, C._reconcile_vault
+        in_reconcile, gate, errors = threading.Event(), threading.Event(), {}
+
+        def write(path, record):
+            if threading.current_thread().name == "B":
+                raise OSError("disk full")
+            real_write(path, record)
+
+        def reconcile(*a, **k):
+            if threading.current_thread().name == "B":
+                in_reconcile.set()
+                gate.wait(10)
+            return real_reconcile(*a, **k)
+
+        def run_b():
+            try:
+                self.update(self.B)
+            except Exception as e:  # noqa: BLE001
+                errors["B"] = e
+        with unittest.mock.patch.object(C, "_write", write), unittest.mock.patch.object(C, "_reconcile_vault", reconcile):
+            b = threading.Thread(target=run_b, name="B")
+            b.start()
+            self.assertTrue(in_reconcile.wait(10))
+            o = threading.Thread(target=other, name="other")
+            o.start()
+            o.join(1.0)
+            other_done = not o.is_alive()
+            gate.set()
+            b.join(30)
+            o.join(30)
+        return other_done, errors.get("B")
+
+    def test_a_rotation_committing_during_the_reconcile_waits_and_wins(self):
+        other_done, error = self.pause_b_in_reconcile(lambda: self.update(self.A))
+        self.assertIsInstance(error, OSError)
+        self.assertFalse(other_done, "A was blocked on the record lock while B reconciled")
+        row = {r["instance"]: r for r in self.rows()}["beta-fixture-net"]
+        self.assertEqual((row["gateway_url"], self.vault.store[self.REF]),
+                         ("https://relay.beta-fixture.net:8443/a", self.A), "row and vault agree on A")
+
+    def test_a_remove_and_re_add_during_the_reconcile_waits_and_wins(self):
+        readded = "https://relay.beta-fixture.net:8443|secret-beta-readded"
+
+        def remove_and_re_add():
+            C.remove_connection("beta-fixture-net", workspace=self.ws, vault=self.vault)
+            self.add(readded, fetch=agents("@s:beta-fixture.net"))
+        other_done, error = self.pause_b_in_reconcile(remove_and_re_add)
+        self.assertIsInstance(error, OSError)
+        self.assertFalse(other_done, "the remove waited for B's reconcile")
+        self.assertIn("beta-fixture-net", {r["instance"] for r in self.rows()})
+        self.assertEqual(self.vault.store[self.REF], readded, "the re-added row's code survives B's failure")
+
+
+@unittest.skipUnless(hasattr(os, "waitid"), "needs waitid(WNOWAIT) to hold a zombie")
+class ZombieChild(Base):
+    """A child that took its lease and then exited is not a held lease, even before it is reaped."""
+
+    SCRIPT = ("import os, sys\nfrom pathlib import Path\nsys.path.insert(0, sys.argv[1])\n"
+              "import workspace_lock as wl\n"
+              "assert wl.acquire(sys.argv[3], Path(sys.argv[2])).status != 'deferred'\n"
+              "os._exit(2)\n")
+
+    def test_a_child_that_writes_its_lease_then_exits_2_fails_the_launch(self):
+        self.add()
+        self.add(TOKEN_B, fetch=agents("@s:beta-fixture.net"))
+
+        def spawn(argv, env, log_path):
+            proc = subprocess.Popen([sys.executable, "-c", self.SCRIPT, str(ROOT / "src"), str(self.ws),
+                                     C._bridge_role(env["GATEWAY_INSTANCE"])], env=isolated_child_env())
+            self.children.append(proc)
+            os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOWAIT)  # exited, not yet reaped
+            return proc
+        with self.assertRaises(C.LaunchFailed) as cm:
+            C.launch("beta-fixture-net", repo=self.ws / "repo", logs_dir=self.ws / "logs", environ={},
+                     workspace=self.ws, vault=self.vault, spawn=spawn)
+        self.assertIn("exited (rc 2)", str(cm.exception))
+        self.assertEqual(self.children[0].returncode, 2)
+        record = json.loads(C.launch_record_path("beta-fixture-net", self.ws).read_text())
+        self.assertEqual((record["ok"], record["reason"]), (False, "exited"))
+        self.assertEqual(C.bridge_pid("beta-fixture-net", self.ws), 0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)

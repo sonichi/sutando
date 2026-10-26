@@ -155,7 +155,8 @@ under `state/connections-launch/<instance>.json`:
 
 Which process runs a bridge is read from the bridge's own lease, `state/locks/gateway-bridge.<instance>.lock`, the JSON record `workspace_lock` writes and heartbeats: `bridge_pid` reads it with `workspace_lock.read_lease` and accepts a pid only when `workspace_lock.lease_process` proves it is the process that wrote the record (this host, same recorded start time), so no unproven pid is ever signalled and a lease that proves nothing is `bridge_lease_indeterminate`, never "no bridge". `read_lease` also binds the record to what was asked: its `role`, `workspace` (compared as real paths) and `schema_version` must be the caller's, so a record copied from another bridge's path never lends that bridge's pid to this one. The writer is generation-aware the same way: acquire, heartbeat, release and retain take a record as their own only when pid, host **and** start time match, and a same-host holder whose pid now runs with another start time is reaped as gone.
 
-The start time is `/proc` on Linux, `sysctl` on macOS and, on Windows, the process creation time from `outbox.process_identity` (the repository's one Windows process-identity primitive), used by the writer and the reader alike, so disconnect, remove, reconnect and update-token work there too. Freshness is wall-clock seconds in the record: a macOS clock step forward of more than the stale window (90 s) can make a live bridge's lease read as stale, so a successor reaps it; the next heartbeat then fails and the old bridge stops polling.
+The start time is `/proc` on Linux, `sysctl` on macOS and, on Windows, the process creation time from `outbox.process_identity` (the repository's one Windows process-identity primitive), read once per decision and used by the writer and the reader alike (an `UNKNOWN` answer is
+indeterminate, never a generation mismatch that reaps a live holder), so disconnect, remove, reconnect and update-token work there too. Freshness is wall-clock seconds in the record: a macOS clock step forward of more than the stale window (90 s) can make a live bridge's lease read as stale, so a successor reaps it; the next heartbeat then fails and the old bridge stops polling.
 
 `disconnect(instance)` stops the one bridge holding that instance's lease (the
 same stop `remove_connection` and `reconnect` use) and **then** marks the row `disabled`; the
@@ -173,7 +174,8 @@ is proven to hold the lease, by the same check the stop path uses (bound role an
 `lease_process` returning the child's pid, fresh), or has exited, so a disconnect or remove
 that starts in between waits and then stops the bridge it started; a bridge never comes up
 against a row that already says it is down. A same-pid record with another start time or
-from another host is never taken for the child's lease. A child that **exits** is a success
+from another host is never taken for the child's lease, and the child is polled around the proof,
+so one that wrote its lease and then exited (still unreaped) is never held. A child that **exits** is a success
 only when another process is proven to hold the lease (`lease: exited`, `holder_pid`: it stood
 down to a live duplicate). A child that stood down (rc 75) to a **retained** lease whose writer
 has gone is spawned once more when that lease goes stale within the bound, else the launch
@@ -203,7 +205,8 @@ record transaction**, right before the stop and the vault write, with a read tha
 from a failure (`vault_unreadable` on a failure), so a concurrent update that committed, or a
 remove and re-add, is never undone by a stale snapshot. Once the vault write has begun, any
 failure (the Keychain write landed but the vault manifest did not, or the record write failed)
-is reconciled by **reading the key back**, compared by digest and never logged: the previous
+is reconciled by **reading the key back** while the same hold of the record lock is kept (a writer
+that would commit meanwhile waits), compared by digest and never logged: the previous
 secret is put back when it is not there; read back as the previous secret, a bridge stopped for
 the update is relaunched on it and the error says whether that worked; read back as the new
 code, `token_restore_failed`; anything else, or a read that fails, `token_state_unknown`.

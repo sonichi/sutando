@@ -212,14 +212,16 @@ def _windows_identity(pid: int):
     return process_identity(pid)
 
 
+def _windows_start(ident) -> str | None:
+    return f"win-{ident.start_usec}" if ident.state.value == "ALIVE" and ident.start_usec else None
+
+
 def proc_start(pid: int, proc: Path = Path("/proc")) -> str | None:
     """`<boot id>:<start time>` of `pid`, which no later process with that pid shares:
     /proc's start ticks, on macOS kinfo_proc's p_starttime, on Windows the creation time;
     None where it cannot be read (or the process is gone)."""
     if _IS_WINDOWS:
-        ident = _windows_identity(pid)
-        birth = ident.start_usec
-        return f"win-{birth}" if ident.state.value == "ALIVE" and birth else None
+        return _windows_start(_windows_identity(pid))
     if sys.platform == "darwin" and not proc.is_dir():
         boot = _darwin_sysctl([_KERN, _KERN_BOOTTIME])
         info = _darwin_sysctl([_KERN, *_KERN_PROC_PID, pid])
@@ -274,12 +276,14 @@ def _is_mine(holder: dict | None) -> bool:
 
 
 def _probe(pid: int) -> tuple[str, str | None]:
-    """("dead" | "alive" | "unknown", start token or None) for a pid on this host."""
+    """("dead" | "alive" | "unknown", start token or None) for a pid on this host; "alive" always
+    carries the start token, so a caller never compares a missing token as a mismatch."""
     if _IS_WINDOWS:
-        state = _windows_identity(pid).state.value
-        if state == "DEAD":
+        ident = _windows_identity(pid)  # one snapshot: state and birth token from the same read
+        if ident.state.value == "DEAD":
             return "dead", None
-        return ("alive", proc_start(pid)) if state == "ALIVE" else ("unknown", None)
+        start = _windows_start(ident)
+        return ("alive", start) if start else ("unknown", None)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:

@@ -21,6 +21,7 @@ import tempfile
 import time
 import types
 import unittest
+import unittest.mock
 from pathlib import Path
 
 REPO = Path(__file__).parent.parent
@@ -92,8 +93,9 @@ class LockTest(unittest.TestCase):
         (proc / "77" / "stat").write_bytes(f"77 (a) b) {rest}".encode())
         self.assertEqual(self.mod.proc_start(77, proc), "b-1:12345")
         self.assertIsNone(self.mod.proc_start(78, proc), "a gone process has none")
-        # Above every platform's pid ceiling, so the darwin sysctl fallback finds nothing either.
-        self.assertIsNone(self.mod.proc_start(9_999_999, self.ws / "absent"))
+        with unittest.mock.patch.object(self.mod, "_darwin_sysctl", lambda mib: None), \
+                unittest.mock.patch.object(self.mod, "_IS_WINDOWS", False):
+            self.assertIsNone(self.mod.proc_start(77, self.ws / "absent"), "no proc root and no platform fallback")
         start = self.mod.proc_start(os.getpid())
         if sys.platform in ("linux", "darwin"):
             self.assertIsNotNone(start, "macOS reads it through sysctl")
@@ -512,6 +514,26 @@ class WindowsIdentityTest(unittest.TestCase):
         self.assertEqual(self.mod.acquire("r", self.ws).status, "reaped", "another process under the holder's pid")
         self._lock_path("r").write_text(json.dumps(dict(rec, pid=other, proc_start="win-2222")))
         self.assertEqual(self.mod.acquire("r", self.ws).status, "deferred", "the live writer keeps it")
+
+    def test_one_identity_read_per_decision_and_unknown_never_reaps(self):
+        import outbox
+        me, other = os.getpid(), _live_pid()
+        seq = {other: [("ALIVE", 2222), ("UNKNOWN",)]}
+        calls = []
+
+        def identity(pid):
+            calls.append(pid)
+            state = (seq[pid].pop(0) if seq.get(pid) else ("UNKNOWN",)) if pid == other else ("ALIVE", 1111)
+            return outbox.ProcessIdentity(pid, outbox.OwnerState(state[0]), *state[1:])
+        self._stub({})
+        self.mod._windows_identity = identity
+        self.assertEqual(self.mod.acquire("r", self.ws).status, "acquired")
+        rec = self.mod.read_lease("r", self.ws)
+        self._lock_path("r").write_text(json.dumps(dict(rec, pid=other, proc_start="win-2222")))
+        calls.clear()
+        self.assertEqual(self.mod.acquire("r", self.ws).status, "deferred", "a fresh live holder keeps the role")
+        self.assertEqual(calls.count(other), 1, "state and birth token come from one read")
+        self.assertEqual(self.mod.acquire("r", self.ws).status, "deferred", "UNKNOWN is never a generation mismatch")
 
 
 if __name__ == "__main__":
