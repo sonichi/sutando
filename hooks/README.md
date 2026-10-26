@@ -569,18 +569,31 @@ that never applied it named a private repo and a private agent in a public PR bo
 GitHub's edit history kept the first version after the fix. This moves the check to the
 command itself.
 
-- **Writes covered:** `gh pr create|edit|comment|review`, `gh issue create|comment|edit`,
-  `gh release create|edit`, and `gh api` POST/PATCH/PUT to `repos/<o>/<r>/issues…` or
-  `…/pulls…` plus GraphQL mutations. Text read: `--title`, `--body`, `--notes`, their
-  `-file` forms, a `"$(cat FILE)"` value, heredoc / here-string stdin, and every
-  `gh api` field (`-f`, `-F k=@file`, `--input`). `bash -c` / `sh -c` / `eval` strings
-  are scanned too.
+- **Writes covered:** `gh pr create|edit|comment|review|merge|close`,
+  `gh issue create|comment|edit|close`, `gh release create|edit`, `gh gist create --public`,
+  `gh repo create --public|edit`, and `gh api` POST/PATCH/PUT to any `repos/<o>/<r>/…`
+  endpoint (issues, pulls, releases, commit comments, …), `gists`, or a GraphQL mutation.
+  `gh api` is recognised by the first non-flag word after `gh`.
+- **Text read:** title/body/notes/comment/subject/description flags in every pflag form
+  (`--body x`, `--body=x`, `-bx`, `-b=x`, clusters such as `-dtx`), their `-file` forms, a
+  `"$(cat FILE)"` or `"$(cat <<'EOF' … EOF)"` value, heredoc / here-string stdin, and every
+  `gh api` field (`-f`, `-F k=@file`, `-fk=v`, `--input`).
+- **Where gh is found:** behind assignments and wrappers (`env` with flags, `timeout`,
+  `nice`, `nohup`, `time`, `command`, `exec`, `sudo`, `stdbuf`, `ionice`, `setsid`, …), shell
+  keywords (`if`/`then`/`do`/`{`/`!`, …), inside `` `…` `` and `$(…)` (also within double
+  quotes and unquoted heredocs), in `bash -c` / `eval` strings, and in a script fed to a
+  shell on stdin (`bash <<'EOF'`, `bash <<< …`, `cat <<'EOF' | bash`).
+- **Repo:** `--repo`, a PR/issue URL, an `o/r` argument to `gh repo`, else the cwd's git
+  remote the way gh picks it (the gh-resolved remote, then upstream, github, origin).
 - **What is private** is `src/public_write_privacy.py`: the terms in
   `<workspace>/state/privacy/public-denylist.txt`, plus, with no list, home-directory
-  paths, Matrix room IDs and MXIDs (example servers and placeholder user names
-  excepted). Names already public go in `public-allowlist.txt` beside it; the agent's
-  own `SUTANDO_AGENT_MXID` is always allowed, so this gate and
-  `comment-signature-guard.py` cannot deadlock.
+  paths, Matrix room IDs and MXIDs (any case; example servers and placeholder user names
+  such as `runner`, `ubuntu` and `linuxbrew` excepted). Names already public go in
+  `public-allowlist.txt` beside it; the agent's own `SUTANDO_AGENT_MXID` is always
+  allowed, so this gate and `comment-signature-guard.py` cannot deadlock.
+- **No denylist yet:** the built-in shapes are still enforced, the list check is skipped,
+  and a stderr warning names `python3 scripts/seed-public-denylist.py`. A host is never
+  locked out of public writes for want of a seed.
 - **The denylist never lives in the repo** (listing the terms would leak them).
   `python3 scripts/seed-public-denylist.py` builds it from this host's data: private
   repo names of the gh user and its orgs, room names and IDs from the workspace room
@@ -593,10 +606,12 @@ command itself.
   skips the scan; an unknown repo (no `--repo`, `{owner}` placeholders, gh failing) is
   scanned as public.
 - **Fails closed:** a body file that does not exist, stdin it cannot see, a value that
-  expands at run time (`"$BODY"`, backticks), a body file the same command writes with
-  anything but a heredoc, a line that does not lex, an internal error on a `gh` write,
-  and a public write on a host with no denylist are all refused. There is no override
-  variable; the allowlist is the escape.
+  expands at run time (`"$BODY"`, backticks), an unquoted heredoc or here-string whose
+  text contains `$` or backticks, a body file the same command writes other than by a
+  heredoc (`>`, `tee`, `cp`, `mv`, `ln`, `install`, `rsync`, `sed -i`, `perl -i`, `dd of=`),
+  a line that does not lex, a hook crash or unreadable hook input on a `gh` write: all
+  refused. Imports load only once the command looks like a `gh` write. There is no
+  override variable; the allowlist is the escape.
 
 ### Registration
 
@@ -606,8 +621,17 @@ That reaches each session's Agent-tool subagents, whatever their cwd: they run i
 same process and fire the parent's PreToolUse hooks. It takes effect on a session's next
 launch.
 
-**Not covered:** a Codex core (no Claude hooks), a `claude` run started without the
-launcher, `git push` / commit messages and `gh pr create --fill` text, a write made by a
-script the command runs (`python3 post.py`), and `xargs`-style indirection.
+### Not covered
+
+- a Codex core (no Claude hooks), or a `claude` run started without the launcher;
+- `git push` / commit messages, and `gh pr create --fill` text;
+- a write made by a script the command runs (`python3 post.py`, `bash post.sh`), or a body
+  file written by a program other than those listed under "Fails closed";
+- `xargs`-style indirection, and text piped into a shell from anything but a heredoc;
+- gh aliases (`gh alias set`), and gh reached through a variable or function (`$GH pr …`,
+  `"${cmd[@]}"`);
+- text split so no single span matches (a zero-width character inside a name, a name
+  assembled from parts at run time), and `env -S` / `watch` command strings;
+- a secret (non-`--public`) gist, which anyone with its URL can still read.
 
 Tests: `python3 tests/public-write-privacy-guard.test.py`

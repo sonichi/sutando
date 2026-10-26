@@ -8,8 +8,11 @@ end cases pipe a real PreToolUse payload into the hook as Claude Code does.
 
 Run:  python3 tests/public-write-privacy-guard.test.py
 """
+import contextlib
 import importlib.util
+import io
 import json
+import shutil
 import os
 import subprocess
 import sys
@@ -80,6 +83,8 @@ class Base(unittest.TestCase):
         (pdir / policy.DENYLIST_NAME).write_text(f"# test\nrepo: {TERM}\nagent: {AGENT}\n")
 
     def decide(self, command, lookup=PUBLIC):
+        # Each call asks `lookup` afresh rather than reading an earlier call's cached answer.
+        (policy.privacy_dir(self.ws) / policy.VISIBILITY_CACHE_NAME).unlink(missing_ok=True)
         return guard.decide(command, self.tmp, self.ws, lookup=lookup)
 
 
@@ -167,9 +172,201 @@ class FailsClosed(Base):
     def test_unparseable_line(self):
         self.assertRefused("gh pr comment 5 -R o/r -b 'unterminated", "does not parse")
 
-    def test_missing_denylist(self):
+
+
+class Unseeded(Base):
+    """No denylist yet: built-in shapes are still enforced, the list is skipped, and
+    stderr names the seeder, so an unseeded host is not locked out of public writes."""
+
+    def setUp(self):
+        super().setUp()
         (policy.privacy_dir(self.ws) / policy.DENYLIST_NAME).unlink()
-        self.assertRefused("gh pr comment 5 -R o/r -b 'anything'", "seed-public-denylist")
+
+    def decide_quiet(self, cmd):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            return self.decide(cmd), err.getvalue()
+
+    def test_clean_write_is_allowed_with_a_warning(self):
+        reason, err = self.decide_quiet("gh pr comment 5 -R o/r -b 'anything'")
+        self.assertIsNone(reason)
+        self.assertIn("seed-public-denylist.py", err)
+
+    def test_builtin_shapes_still_refused(self):
+        for needle in (LOCAL, MXID, ROOM_ID):
+            with self.subTest(needle=needle):
+                reason, _ = self.decide_quiet(f"gh pr comment 5 -R o/r -b 'see {needle}'")
+                self.assertIsNotNone(reason)
+
+    def test_list_terms_are_not_checked(self):
+        reason, _ = self.decide_quiet(f"gh pr comment 5 -R o/r -b 'uses {TERM}'")
+        self.assertIsNone(reason)
+
+
+class ReviewedSlips(Base):
+    """Shapes a review found slipping past the first version; each must now be read."""
+
+    def dirty(self):
+        return f"see {TERM} for details"
+
+    def assertBlocked(self, cmd):
+        reason = self.decide(cmd)
+        self.assertIsNotNone(reason, cmd)
+        return reason
+
+    def test_wrappers(self):
+        b = f"gh pr comment 5 -R o/r -b '{self.dirty()}'"
+        for prefix in ("timeout 60 ", "timeout -s KILL 60 ", "timeout --preserve-status 5m ", "nice ",
+                       "nice -n 5 ", "nice -10 ", "env -u X ", "env -i PATH=/bin ", "env -- ",
+                       "nohup ", "time -p ", "command -p ", "exec -a x ", "sudo -u me ",
+                       "stdbuf -oL ", "ionice -c 3 ", "caffeinate -i ", "setsid ",
+                       "timeout 60 env -u X nice "):
+            with self.subTest(prefix=prefix):
+                self.assertBlocked(prefix + b)
+
+    def test_compound_commands(self):
+        b = f"gh pr comment 5 -R o/r -b '{self.dirty()}'"
+        for cmd in (f"if true; then {b}; fi", f"if {b}; then :; fi",
+                    f"for i in 1; do {b}; done", f"while false; do :; done; {b}",
+                    f"{{ {b}; }}", f"! {b}", f"`{b}`", f'echo "`{b}`"', f'x="$({b})"',
+                    f"f() {{ {b}; }}; f", f"case x in x) {b};; esac"):
+            with self.subTest(cmd=cmd):
+                self.assertBlocked(cmd)
+
+    def test_script_on_shell_stdin(self):
+        for shell in ("bash", "sh -s", "zsh -", "bash -x"):
+            cmd = f"{shell} <<'EOF'\ngh pr comment 5 -R o/r -b '{self.dirty()}'\nEOF"
+            with self.subTest(shell=shell):
+                self.assertBlocked(cmd)
+        self.assertBlocked(f"bash <<< \"gh pr comment 5 -R o/r -b '{self.dirty()}'\"")
+        self.assertBlocked(f"cat <<'EOF' | bash\ngh pr comment 5 -R o/r -b '{self.dirty()}'\nEOF")
+        self.assertIsNone(self.decide("bash <<'EOF'\ngh pr comment 5 -R o/r -b 'clean'\nEOF"))
+
+    def test_unquoted_heredoc_that_expands_is_refused(self):
+        for inner in ("$(cat x.md)", "$BODY", "`cat x.md`", "${BODY}"):
+            with self.subTest(inner=inner):
+                reason = self.assertBlocked(f"gh pr comment 5 -R o/r -F - <<EOF\nhi {inner}\nEOF")
+                self.assertIn("unquoted", reason)
+        reason = self.assertBlocked("gh pr comment 5 -R o/r -F - <<< \"$BODY\"")
+        self.assertIn("unquoted", reason)
+        self.assertBlocked("bash <<EOF\ngh pr comment 5 -R o/r -b \"$X\"\nEOF")
+        self.assertBlocked(f"cat <<EOF\n$(gh pr comment 5 -R o/r -b '{self.dirty()}')\nEOF")
+        # Unquoted with no expansion, or quoted with `$` inside: the text is literal.
+        self.assertIsNone(self.decide("gh pr comment 5 -R o/r -F - <<EOF\nplain text\nEOF"))
+        self.assertIsNone(self.decide("gh pr comment 5 -R o/r -F - <<'EOF'\ncosts $5 and $(x)\nEOF"))
+        self.assertIsNone(self.decide("gh pr comment 5 -R o/r -F - <<EOF\ncosts \\$HOME\nEOF"))
+
+    def test_heredoc_inside_a_cat_substitution(self):
+        cmd = "gh pr comment 5 -R o/r --body \"$(cat <<'EOF'\n{}\nEOF\n)\""
+        self.assertBlocked(cmd.format(self.dirty()))
+        self.assertIsNone(self.decide(cmd.format("clean text, with a ' quote")))
+        self.assertBlocked("gh pr comment 5 -R o/r --body \"$(cat <<EOF\n$X\nEOF\n)\"")
+        two = ("cat > {f} <<'EOF'\nclean\nEOF\ngh pr comment 5 -R o/r --body \"$(cat <<'EOF'\n{t}\nEOF\n)\"")
+        self.assertBlocked(two.format(f=Path(self.tmp) / "a.md", t=self.dirty()))
+
+    def test_attached_short_flags(self):
+        body = Path(self.tmp) / "b.md"
+        body.write_text(self.dirty())
+        d = self.dirty().replace(" ", "_")
+        for cmd in (f"gh pr comment 5 -R o/r -b{d}", f"gh pr comment 5 -R o/r -b='{self.dirty()}'",
+                    f"gh pr comment 5 -Ro/r '-b{self.dirty()}'", f"gh pr comment 5 -R o/r -F{body}",
+                    f"gh pr create -R o/r -dt{d} -b ok", f"gh issue create -R o/r -t{d} -b ok",
+                    f"gh api repos/o/r/issues/5/comments -fbody={d}",
+                    f"gh api repos/o/r/issues/5/comments -Fbody=@{body}",
+                    f"gh api -XPATCH repos/o/r/pulls/5 -fbody={d}"):
+            with self.subTest(cmd=cmd):
+                self.assertBlocked(cmd)
+        self.assertIsNone(self.decide(f"gh api repos/o/r/issues/5 -X GET -fstate={d}"))
+
+    def test_more_verbs(self):
+        q = self.dirty()
+        for cmd in (f"gh pr merge 5 -R o/r --squash --body '{q}'",
+                    f"gh pr merge 5 -R o/r --subject '{q}'", f"gh pr merge 5 -R o/r -st '{q}'",
+                    f"gh pr close 5 -R o/r --comment '{q}'", f"gh pr close 5 -R o/r -c '{q}'",
+                    f"gh issue close 7 -R o/r -c '{q}'", f"gh issue close 7 -R o/r --comment='{q}'",
+                    f"gh repo edit o/r --description '{q}'", f"gh repo edit -d '{q}' o/r",
+                    f"gh repo create o/new --public -d '{q}'"):
+            with self.subTest(cmd=cmd):
+                self.assertBlocked(cmd)
+        self.assertIsNone(self.decide("gh pr merge 5 -R o/r --squash"))
+        self.assertIsNone(self.decide(f"gh repo edit o/r --description '{q}'", lookup=PRIVATE))
+
+    def test_public_gist(self):
+        f = Path(self.tmp) / "notes.md"
+        f.write_text(self.dirty())
+        self.assertBlocked(f"gh gist create --public {f}")
+        clean = Path(self.tmp) / "clean.md"
+        clean.write_text("nothing private")
+        self.assertBlocked(f"gh gist create -p -d '{self.dirty()}' {clean}")
+        self.assertBlocked(f"gh gist create --public - <<'EOF'\n{self.dirty()}\nEOF")
+        # A public gist has no repo, so a PRIVATE lookup cannot excuse it.
+        self.assertIsNotNone(self.decide(f"gh gist create --public {f}", lookup=PRIVATE))
+        self.assertIsNone(self.decide(f"gh gist create --public {clean}"))
+        self.assertIsNone(self.decide(f"gh gist create {f}"))
+
+    def test_api_endpoints(self):
+        q = self.dirty()
+        for ep in ("repos/o/r/releases", "repos/o/r/releases/9", "repos/o/r/commits/abc123/comments",
+                   "repos/o/r/comments/4", "/repos/o/r/pulls/5/merge", "repos/o/r", "gists"):
+            with self.subTest(ep=ep):
+                self.assertBlocked(f"gh api -X POST {ep} -f body='{q}'")
+        self.assertIsNone(self.decide(f"gh api -X POST repos/o/r/releases -f body='{q}'", lookup=PRIVATE))
+
+    def test_api_found_by_first_non_flag_word(self):
+        q = self.dirty()
+        self.assertBlocked(f"gh issue create -R o/r -t api -b '{q}'")
+        self.assertBlocked(f"gh pr comment 5 -R o/r -b 'call the api {TERM}'")
+        self.assertBlocked(f"gh -R o/r issue comment 7 -b '{q}'")
+
+    def test_body_file_replaced_in_same_command(self):
+        body = Path(self.tmp) / "body.md"
+        body.write_text("clean text")
+        for pre in (f"cp x.md {body}", f"mv x.md {body}", f"sed -i '' 's/a/b/' {body}",
+                    f"sed -i.bak 's/a/b/' {body}", f"perl -pi -e 's/a/b/' {body}",
+                    f"ln -sf x.md {body}", f"dd if=x.md of={body}", f"printf x | tee {body}"):
+            with self.subTest(pre=pre):
+                reason = self.assertBlocked(f"{pre} && gh pr comment 5 -R o/r -F {body}")
+                self.assertIn("same command", reason)
+        self.assertIsNone(self.decide(f"cat {body} && gh pr comment 5 -R o/r -F {body}"))
+
+
+class RepoFromRemote(Base):
+    def git_repo(self, url):
+        d = Path(self.tmp) / "checkout"
+        d.mkdir()
+        env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+        subprocess.run(["git", "init", "-q", str(d)], check=True, env=env)
+        subprocess.run(["git", "-C", str(d), "remote", "add", "origin", url], check=True, env=env)
+        return d
+
+    def test_bare_write_uses_the_cwd_remote(self):
+        d = self.git_repo("git@github.com:o/priv.git")
+        self.assertEqual(policy.repo_from_remote(d), "o/priv")
+        seen = []
+        look = lambda repo: seen.append(repo) or "PRIVATE"  # noqa: E731
+        self.assertIsNone(guard.decide(f"gh pr comment 5 -b '{TERM}'", str(d), self.ws, lookup=look))
+        self.assertEqual(seen, ["o/priv"])
+        (policy.privacy_dir(self.ws) / policy.VISIBILITY_CACHE_NAME).unlink()
+        self.assertIsNotNone(guard.decide(f"gh pr comment 5 -b '{TERM}'", str(d), self.ws, lookup=PUBLIC))
+
+    def test_api_placeholder_uses_the_cwd_remote(self):
+        d = self.git_repo("https://github.com/o/priv")
+        self.assertIsNone(guard.decide(f"gh api repos/{{owner}}/{{repo}}/issues -f body='{TERM}'",
+                                       str(d), self.ws, lookup=PRIVATE))
+
+    def test_no_remote_is_unknown(self):
+        self.assertIsNone(policy.repo_from_remote(self.tmp))
+
+
+class Patterns(unittest.TestCase):
+    def test_mixed_case_mxid(self):
+        self.assertTrue(policy.scan("ping @Zq-Agent:matrix.zq.chat", []))
+
+    def test_ci_home_paths_are_placeholders(self):
+        for user in ("runner", "ubuntu", "linuxbrew"):
+            with self.subTest(user=user):
+                self.assertEqual(policy.scan(f"at /home/{user}/work/x", []), [])
+        self.assertTrue(policy.scan("at /home/jdoe/work/x", []))
 
 
 class VisibilityCache(unittest.TestCase):
@@ -206,6 +403,52 @@ class Hook(Base):
         self.assertIn(TERM, out["permissionDecisionReason"])
         self.assertIsNone(self.run_hook("gh pr create -R o/r -t t --body 'clean'"))
         self.assertIsNone(self.run_hook("ls -la"))
+
+
+    def test_no_gh_skips_the_heavy_imports(self):
+        code = ("import sys, runpy, io; sys.stdin = io.StringIO(%r); sys.argv = ['h'];\n"
+                "try:\n    runpy.run_path(%r, run_name='__main__')\nexcept SystemExit:\n    pass\n"
+                "print('public_write_privacy' in sys.modules, '_shell_scan' in sys.modules)")
+        payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": "ls -la"}})
+        r = subprocess.run([sys.executable, "-c", code % (payload, str(HOOK))], capture_output=True,
+                           text=True, timeout=60)
+        self.assertEqual(r.stdout.split(), ["False", "False"], r.stderr)
+
+
+class HookFailsClosed(unittest.TestCase):
+    """A crash or unreadable input on a gh write denies; anything else is left alone."""
+
+    def broken_hook(self):
+        root = Path(tempfile.mkdtemp())
+        (root / "hooks").mkdir()
+        (root / "src").mkdir()
+        shutil.copy(HOOK, root / "hooks" / HOOK.name)
+        (root / "hooks" / "_shell_scan.py").write_text("raise ImportError('broken on purpose')\n")
+        return root / "hooks" / HOOK.name
+
+    def hook(self, hook_path, stdin):
+        r = subprocess.run([sys.executable, str(hook_path), "--workspace", tempfile.mkdtemp()],
+                           input=stdin, capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return json.loads(r.stdout)["hookSpecificOutput"] if r.stdout.strip() else None
+
+    def test_import_failure_denies_a_gh_write(self):
+        hook = self.broken_hook()
+        payload = {"tool_name": "Bash", "tool_input": {"command": "gh pr comment 5 -R o/r -b hi"}}
+        out = self.hook(hook, json.dumps(payload))
+        self.assertEqual(out["permissionDecision"], "deny")
+        self.assertIn("guard failed", out["permissionDecisionReason"])
+        self.assertIsNone(self.hook(hook, json.dumps({"tool_name": "Bash",
+                                                      "tool_input": {"command": "gh --version"}})))
+
+    def test_bad_json_denies_a_gh_write(self):
+        out = self.hook(HOOK, '{"tool_name": "Bash", "tool_input": {"command": "gh pr comment 5 -b x"')
+        self.assertEqual(out["permissionDecision"], "deny")
+        self.assertIsNone(self.hook(HOOK, "not json at all"))
+
+    def test_malformed_payload_denies_a_gh_write(self):
+        out = self.hook(HOOK, json.dumps({"tool_name": "Bash", "tool_input": "gh pr comment 5 -b x"}))
+        self.assertEqual(out["permissionDecision"], "deny")
 
 
 class DenylistStaysOutOfTheRepo(unittest.TestCase):

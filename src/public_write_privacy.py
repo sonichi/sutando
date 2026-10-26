@@ -41,14 +41,14 @@ BUILTIN_PATTERNS = (
     # Claude Code's project slug spells the same home path with dashes.
     ("local path", re.compile(r"-Users-[A-Za-z0-9._]+-")),
     ("Matrix room ID", re.compile(r"![A-Za-z0-9._~+/=-]{6,}:[A-Za-z0-9.-]+\.[A-Za-z]{2,}")),
-    ("Matrix ID", re.compile(r"(?<![\w.])@[a-z0-9._=/+-]+:[A-Za-z0-9.-]+\.[A-Za-z]{2,}")),
+    ("Matrix ID", re.compile(r"(?<![\w.])@[A-Za-z0-9._=/+-]+:[A-Za-z0-9.-]+\.[A-Za-z]{2,}")),
 )
 
 
 # Documentation placeholders: an example server or a stand-in user name names nobody.
 EXAMPLE_SERVER = re.compile(r":(?:[\w-]+\.)*(?:example\.(?:com|org|net)|example|test|localhost|invalid)$", re.I)
 PLACEHOLDER_USERS = {"someone", "admin", "user", "username", "name", "you", "me", "alice", "bob",
-                     "example", "runner", "shared", "x", "foo", "test"}
+                     "example", "runner", "ubuntu", "linuxbrew", "shared", "x", "foo", "test"}
 
 
 def _placeholder(category: str, matched: str) -> bool:
@@ -150,6 +150,36 @@ def _gh_visibility(repo: str) -> Optional[str]:
         return None
     value = r.stdout.strip().upper()
     return value if r.returncode == 0 and value else None
+
+
+GITHUB_REMOTE = re.compile(r"github\.com[:/]([^/\s]+)/([^/\s]+?)(?:\.git)?/?$")
+
+
+def repo_from_remote(cwd) -> Optional[str]:
+    """OWNER/NAME gh would target from `cwd` with no --repo: the remote marked
+    gh-resolved, else upstream, github, origin, else any GitHub remote."""
+    env = {k: v for k, v in os.environ.items() if k not in ("GIT_DIR", "GIT_WORK_TREE")}
+    try:
+        r = subprocess.run(["git", "-C", str(cwd), "config", "--get-regexp",
+                            r"^remote\..*\.(url|gh-resolved)$"],
+                           capture_output=True, text=True, timeout=5, env=env)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if r.returncode != 0:
+        return None
+    urls, resolved = {}, []
+    for line in r.stdout.splitlines():
+        key, _, value = line.partition(" ")
+        name, _, field = key[len("remote."):].rpartition(".")
+        if field == "gh-resolved":
+            resolved.append(name)
+        else:
+            urls[name] = value.strip()
+    for name in resolved + ["upstream", "github", "origin"] + sorted(urls):
+        m = GITHUB_REMOTE.search(urls.get(name, ""))
+        if m:
+            return f"{m.group(1)}/{m.group(2)}"
+    return None
 
 
 def repo_visibility(repo: Optional[str], cache_path: Optional[Path],
