@@ -155,10 +155,40 @@ class InterceptResult(NamedTuple):
 
 _WRITER = threading.local()
 
+# An update_token transaction legitimately holds the lock for seconds; past this a waiter gives up.
+_WRITER_LOCK_WAIT_S = 30.0
+# `security` can block on a Keychain unlock prompt; a write gives up after this, lock released.
+_KEYCHAIN_WRITE_TIMEOUT_S = 15
+KEYCHAIN_TIMEOUT_CODE = "vault_keychain_timeout"
+
+
+class VaultBusy(RuntimeError):
+    """Another vault writer held the writer lock past _WRITER_LOCK_WAIT_S; nothing was written."""
+
+    CODE = "vault_busy"
+
 
 def writer_lock_path() -> str:
     """The vault's writer lock, beside the manifest it guards."""
     return os.path.join(os.path.dirname(_manifest_path()), "writer.lock")
+
+
+def _take_writer_lock(path: str) -> int:
+    import time
+    from file_lock import try_lock_fd
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    deadline = time.monotonic() + _WRITER_LOCK_WAIT_S
+    try:
+        while not try_lock_fd(fd):
+            if time.monotonic() >= deadline:
+                raise VaultBusy(f"{VaultBusy.CODE}: another vault writer held the writer lock for "
+                                f"{_WRITER_LOCK_WAIT_S:g}s; nothing was written")
+            time.sleep(0.05)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
 
 
 @contextlib.contextmanager
@@ -166,7 +196,8 @@ def writer_lock():
     """The one writer transaction every vault write runs under (set, delete, chat interception, the
     CLI): a cross-process lock, re-entrant within a thread, so a caller can hold it across a read,
     a write and a compare. Lock order: a caller holding connections.lock may take this; code holding
-    this never takes connections.lock. A lock that cannot be taken is a RuntimeError, so the write fails."""
+    this never takes connections.lock. A lock that cannot be taken is a RuntimeError, so the write
+    fails; one still held by another writer after _WRITER_LOCK_WAIT_S is VaultBusy."""
     if getattr(_WRITER, "depth", 0):
         _WRITER.depth += 1
         try:
@@ -174,11 +205,9 @@ def writer_lock():
         finally:
             _WRITER.depth -= 1
         return
-    from pathlib import Path
-    from file_lock import locked_file
+    from file_lock import unlock_fd
     try:
-        held = locked_file(Path(writer_lock_path()), create_mode=0o600)
-        held.__enter__()
+        fd = _take_writer_lock(writer_lock_path())
     except OSError as e:
         raise RuntimeError(f"vault: writer lock unavailable ({type(e).__name__})") from None
     _WRITER.depth = 1
@@ -186,7 +215,18 @@ def writer_lock():
         yield
     finally:
         _WRITER.depth = 0
-        held.__exit__(None, None, None)
+        try:
+            unlock_fd(fd)
+        finally:
+            os.close(fd)
+
+
+def _keychain_write(argv: list, key: str, verb: str):
+    try:
+        return subprocess.run(argv, capture_output=True, timeout=_KEYCHAIN_WRITE_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"{KEYCHAIN_TIMEOUT_CODE}: could not {verb} '{key}' — security gave no answer "
+                           f"within {_KEYCHAIN_WRITE_TIMEOUT_S}s; the manifest is unchanged") from None
 
 
 def _store_in_keychain(key: str, value: str) -> None:
@@ -197,7 +237,7 @@ def _store_in_keychain(key: str, value: str) -> None:
 def _store_in_keychain_locked(key: str, value: str) -> None:
     # Note: value is passed as an argv element — briefly visible in `ps` to
     # the same user. Acceptable on a single-user Mac; not a multi-user safe API.
-    result = subprocess.run(
+    result = _keychain_write(
         [
             "security", "add-generic-password",
             "-a", _ACCOUNT,
@@ -205,7 +245,7 @@ def _store_in_keychain_locked(key: str, value: str) -> None:
             "-w", value,
             "-U",   # update if already exists
         ],
-        capture_output=True,
+        key, "store",
     )
     if result.returncode != 0:
         raise RuntimeError(
@@ -325,10 +365,8 @@ def _delete_from_keychain(key: str) -> None:
 def _delete_from_keychain_locked(key: str) -> None:
     # rc 44 is errSecItemNotFound — already gone, so the manifest drop proceeds.
     # Any other non-zero may leave the item LIVE; dropping it then strands a secret.
-    result = subprocess.run(
-        ["security", "delete-generic-password", "-a", _ACCOUNT, "-s", key],
-        capture_output=True,
-    )
+    result = _keychain_write(["security", "delete-generic-password", "-a", _ACCOUNT, "-s", key],
+                             key, "delete")
     if result.returncode not in (0, _ERRSEC_ITEM_NOT_FOUND):
         raise RuntimeError(
             f"vault: failed to delete '{key}' from Keychain "

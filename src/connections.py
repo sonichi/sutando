@@ -586,11 +586,18 @@ def _vault(vault):
     return _VaultIntercept() if vault is None else vault
 
 
+@contextlib.contextmanager
 def _vault_writer(vault):
     """The vault's own writer transaction when it has one (vault_intercept.writer_lock), else nothing.
-    Taken only while connections.lock is held, never the reverse."""
+    Taken only while connections.lock is held, never the reverse; one not taken is VaultUnavailable."""
     lock = getattr(vault, "writer_lock", None)
-    return lock() if lock is not None else contextlib.nullcontext()
+    with contextlib.ExitStack() as stack:
+        try:
+            if lock is not None:
+                stack.enter_context(lock())
+        except Exception as e:  # noqa: BLE001 - a held or broken lock both mean nothing may be written
+            raise VaultUnavailable(f"the secret vault's writer lock was not taken ({e}); nothing was written") from None
+        yield
 
 
 def _vault_store(vault, key: str, value: str) -> None:
@@ -995,8 +1002,8 @@ def set_primary(instance: str, *, workspace: Optional[Path] = None) -> dict:
 
 def remove_connection(instance: str, *, force: bool = False, workspace: Optional[Path] = None,
                       vault=None, kill=None) -> dict:
-    """Stop the bridge, then drop the row, its vault key and its launch record; the primary only
-    under `force`. Other rows and their bridges are untouched; no row inherits the primary flag.
+    """Stop the bridge, then drop the row, its vault key, its launch record and (a named row) its
+    status sidecar; the primary only under `force`. Other rows and their bridges are untouched; no row inherits the primary flag.
     An env-imported row is remembered so import_from_env does not bring it back."""
     vault = _vault(vault)
     with _transaction(workspace) as rec:
@@ -1009,10 +1016,16 @@ def remove_connection(instance: str, *, force: bool = False, workspace: Optional
         rows.remove(row)
         if row["added_by"] == "env":
             rec[REMOVED_KEY] = sorted(set(rec[REMOVED_KEY]) | {row["token_ref"]})
-    try:
-        launch_record_path(instance, workspace).unlink()
-    except FileNotFoundError:
-        pass
+    stale = [launch_record_path(instance, workspace)]
+    if instance:  # the named bridge is stopped, so its sidecar is the removed row's last reading
+        from workspace_default import status_path
+        name = f"gateway-status.{instance}.json"
+        stale += [status_path(name, _workspace(workspace)), _workspace(workspace) / name]
+    for path in stale:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
     out = dict(row)
     out["stopped_pid"] = stopped
     return out

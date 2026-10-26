@@ -7975,8 +7975,9 @@ def main() -> None:
         # A live bridge already polls this workspace: stand down. 75 tells a
         # supervising wrapper not to relaunch; a plain exit would loop it.
         sys.exit(75)
-    _settle_proactive_room()
+    # Heartbeat first: the settle can wait on the connections record lock past the stale window.
     _start_lock_heartbeat()
+    _settle_proactive_room()
     inflight: set[str] = _load_inflight()
     _recover_orphan_proactive()
     for sweep in (_retire_delivered_marks, _sweep_held_dir):

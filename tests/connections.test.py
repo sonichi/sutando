@@ -2779,5 +2779,53 @@ class CrossProcessVaultBarrier(Base):
         self.assertEqual(sorted(done), ["public", "remove", "update"], "no deadlock")
 
 
+class BusyVault(FakeVault):
+    """A vault whose writer lock another writer holds past the wait (vault_intercept.VaultBusy)."""
+
+    def writer_lock(self):
+        raise RuntimeError("vault_busy: another vault writer held the writer lock for 30s; nothing was written")
+
+
+class VaultWriterBusy(Base):
+    REF = "AG2_REMOTE_TOKEN_BETA_FIXTURE_NET"
+
+    def test_a_busy_writer_lock_fails_update_token_closed_as_vault_unavailable(self):
+        self.add()
+        self.add(TOKEN_B, fetch=agents("@s:beta-fixture.net"))
+        self.vault.__class__ = BusyVault
+        before = {r["instance"]: r for r in self.rows()}["beta-fixture-net"]
+        with self.assertRaises(C.VaultUnavailable) as ctx:
+            C.update_token("beta-fixture-net", UpdateToken.NEW_B, repo=self.ws / "repo", logs_dir=self.ws / "logs",
+                           environ={}, workspace=self.ws, vault=self.vault, spawn=self.bridge_spawn(),
+                           kill=lambda *a: self.fail("nothing runs"), fetch=agents("@s:beta-fixture.net"))
+        self.assertIn("vault_busy", str(ctx.exception))
+        self.assertNotIn("secret-beta", str(ctx.exception))
+        self.assertEqual(self.vault.store[self.REF], TOKEN_B, "the vault is untouched")
+        self.assertEqual({r["instance"]: r for r in self.rows()}["beta-fixture-net"], before, "the row is untouched")
+
+
+class RemoveClearsSidecar(Base):
+    def test_a_re_added_row_lists_pending_not_the_removed_rows_status(self):
+        self.add()
+        self.add(TOKEN_B, fetch=agents("@s:beta-fixture.net"))
+        C._record_launch("beta-fixture-net", self.ws, ok=True, pid=1)
+        (self.ws / "state" / "gateway-status.beta-fixture-net.json").write_text(
+            json.dumps({"connected": True, "last_ok_ts": 1700000000}))
+        (self.ws / "gateway-status.beta-fixture-net.json").write_text(json.dumps({"connected": True}))
+        C.remove_connection("beta-fixture-net", workspace=self.ws, vault=self.vault, kill=lambda *a: None)
+        self.add(TOKEN_B, fetch=agents("@s:beta-fixture.net"))
+        beta = {r["instance"]: r for r in C.list_connections(self.ws, vault=self.vault)}["beta-fixture-net"]
+        listed = C.status_for(beta, self.ws)
+        self.assertEqual((listed["state"], listed["status"]), ("pending", {"connected": None, "last_ok_ts": None}))
+
+    def test_remove_leaves_other_rows_sidecars(self):
+        self.add()
+        self.add(TOKEN_B, fetch=agents("@s:beta-fixture.net"))
+        alpha = self.ws / "state" / "gateway-status.alpha-fixture-net.json"
+        alpha.write_text(json.dumps({"connected": True, "last_ok_ts": 5}))
+        C.remove_connection("beta-fixture-net", workspace=self.ws, vault=self.vault, kill=lambda *a: None)
+        self.assertTrue(alpha.exists())
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)

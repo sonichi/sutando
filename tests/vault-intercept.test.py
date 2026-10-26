@@ -791,6 +791,83 @@ class TestWriterLock(unittest.TestCase):
             result = intercept_vault_commands("vault set LOCK_FAIL " + "sk-" + "a" * 20 + "T3BlbkFJ" + "b" * 20)
         self.assertEqual(result.failed, ["LOCK_FAIL"], "the chat path redacts and reports a failed store")
 
+
+class TestWriterDeadlines(unittest.TestCase):
+    """A held writer lock or a hung `security` call fails the write closed within a bound."""
+
+    def _hold_in_child(self):
+        import subprocess
+        code = ("import sys, time; sys.path.insert(0, sys.argv[1]); import vault_intercept as v;"
+                "v._manifest_path = lambda: sys.argv[2]; cm = v.writer_lock(); cm.__enter__();"
+                "print('held', flush=True); time.sleep(60)")
+        child = subprocess.Popen([sys.executable, "-c", code, str(REPO / "src"), vault_intercept._manifest_path()],
+                                 stdout=subprocess.PIPE, text=True)
+        self.addCleanup(lambda: (child.kill(), child.wait(), child.stdout.close()))
+        self.assertEqual(child.stdout.readline().strip(), "held")
+        return child
+
+    def _keys(self):
+        return set(vault_intercept._read_manifest())
+
+    def test_a_held_lock_times_out_and_the_write_fails_closed(self):
+        import time
+        self._hold_in_child()
+        with patch.object(vault_intercept, "_WRITER_LOCK_WAIT_S", 0.5), _mock_store() as run:
+            began = time.monotonic()
+            with self.assertRaises(vault_intercept.VaultBusy) as ctx:
+                vault_intercept.set_vault_key("DEADLINE_HELD", "v")
+            waited = time.monotonic() - began
+            result = intercept_vault_commands("vault set DEADLINE_CHAT " + "sk-" + "a" * 20 + "T3BlbkFJ" + "b" * 20)
+        self.assertLess(waited, 5, "the wait is bounded")
+        self.assertTrue(str(ctx.exception).startswith(vault_intercept.VaultBusy.CODE), str(ctx.exception))
+        self.assertEqual(ctx.exception.CODE, "vault_busy")
+        self.assertEqual(result.failed, ["DEADLINE_CHAT"], "the chat path redacts and reports a failed store")
+        self.assertFalse(run.called, "no Keychain call is made without the lock")
+        self.assertFalse({"DEADLINE_HELD", "DEADLINE_CHAT"} & self._keys(), "nothing reaches the manifest")
+        self.assertEqual(getattr(vault_intercept._WRITER, "depth", 0), 0)
+
+    def _hung_security(self):
+        import stat
+        bindir = tempfile.mkdtemp(prefix="hung-security-")
+        self.addCleanup(lambda: __import__("shutil").rmtree(bindir, ignore_errors=True))
+        stub = os.path.join(bindir, "security")
+        with open(stub, "w") as f:
+            f.write("#!/bin/sh\nexec sleep 30\n")
+        os.chmod(stub, stat.S_IRWXU)
+        return patch.dict(os.environ, {"PATH": bindir + os.pathsep + os.environ.get("PATH", "")})
+
+    def _lock_is_free(self):
+        import threading
+        got = threading.Event()
+
+        def take():
+            with vault_intercept.writer_lock():
+                got.set()
+        t = threading.Thread(target=take, daemon=True)
+        t.start()
+        free = got.wait(2)
+        t.join(5)
+        return free
+
+    def test_a_hung_security_write_times_out_and_leaves_the_lock_free(self):
+        import time
+        with self._hung_security(), patch.object(vault_intercept, "_KEYCHAIN_WRITE_TIMEOUT_S", 0.5):
+            began = time.monotonic()
+            with self.assertRaises(RuntimeError) as ctx:
+                vault_intercept.set_vault_key("DEADLINE_HUNG", "v")
+            self.assertLess(time.monotonic() - began, 5, "the security call is bounded")
+            self.assertTrue(str(ctx.exception).startswith(vault_intercept.KEYCHAIN_TIMEOUT_CODE), str(ctx.exception))
+            self.assertNotIn("DEADLINE_HUNG", self._keys(), "a timed-out store registers nothing")
+            vault_intercept._register_key("DEADLINE_KEEP")
+            with self.assertRaises(RuntimeError) as gone:
+                vault_intercept.delete_vault_key("DEADLINE_KEEP")
+            self.assertTrue(str(gone.exception).startswith(vault_intercept.KEYCHAIN_TIMEOUT_CODE))
+            self.assertIn("DEADLINE_KEEP", self._keys(), "a timed-out delete keeps the manifest entry")
+        self.assertEqual(getattr(vault_intercept._WRITER, "depth", 0), 0)
+        self.assertTrue(self._lock_is_free(), "the lock is released after the timeout")
+        vault_intercept._deregister_key("DEADLINE_KEEP")
+
+
 if __name__ == "__main__":
     loader = unittest.TestLoader()
     suite = unittest.TestSuite()
@@ -798,6 +875,7 @@ if __name__ == "__main__":
     # added here or it silently never runs (no error, just missing coverage).
     for cls in [
         TestNoVaultCommands,
+        TestWriterDeadlines,
         TestSingleVaultSet,
         TestUnrecognizedValueFailsClosed,
         TestMultipleVaultSets,

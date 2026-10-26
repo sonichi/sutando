@@ -219,8 +219,20 @@ other vault writer, in this process or another, can land in between. The lock or
 lock is released when its holder raises or exits (a killed holder's lock is dropped by the
 kernel), and its file stays empty. A lock that cannot be taken fails the write.
 The tradeoff is that vault writes are serialized: every other vault writer waits for the length
-of an `update_token` transaction (about 7 s in the live receipt), and a holder that is alive but
-wedged delays them until it exits.
+of an `update_token` transaction (about 7 s in the live receipt). Both waits are bounded, so a
+hung Keychain prompt cannot block every vault writer on the host: a writer that cannot take the
+lock within 30 s fails with `vault_busy` and writes nothing, and a `security` store or delete
+that gives no answer within 15 s is killed and fails with `vault_keychain_timeout`, the manifest
+unchanged and the lock released (the item's Keychain state is then whatever `security` left; run
+the write again). Through `connections` both surface as `vault_unavailable` (HTTP 503), the
+message naming the code.
+
+The lock lives beside the manifest of the **configured** workspace (`resolve_workspace`), not
+the `workspace=` a `connections` call is given: the record and the vault lock can sit in different
+workspaces. Keychain items are per host and per key, not per workspace, so two checkouts on one
+host with different workspaces share the same `AG2_REMOTE_TOKEN_<INST>` items under two different
+locks, and their writes to the same key are not serialized against each other. Give each
+checkout's rows distinct instance names, or point both at one workspace.
 
 The restore is still a compare-and-swap on the stored value: the previous secret is written back
 only when a read shows exactly the new code this update wrote, then read back again. Read back
@@ -239,8 +251,10 @@ a relaunch that fails is the row's `failed` state, not an error of the update. A
 identity refreshes its identity fields only from a verified preview of **the same agent**:
 adding or previewing another agent's code on that server leaves the row (and its token)
 exactly as it was. `remove_connection(instance)`
-stops that bridge the same way, then drops the row, its vault key and its launch record,
-and nothing else; the primary needs `force`, and no remaining row inherits the flag. A
+stops that bridge the same way, then drops the row, its vault key, its launch record and its
+status sidecar (`gateway-status.<instance>.json`, so a re-added name lists as `pending` until
+its new bridge reports, not with the removed row's `connected` and `last_ok_ts`), and nothing
+else; the legacy row's sidecar stays, since its bridge is not stopped here. The primary needs `force`, and no remaining row inherits the flag. A
 removed env-imported row is remembered in the record's `removed_env` list, so
 `import-env` does not bring it back while the variable is still set (it says
 "connection removed earlier; unset the variable"); an explicit add of that key clears
