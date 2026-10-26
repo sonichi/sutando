@@ -85,16 +85,16 @@ ag2_app_support_dir() {
 }
 '''
 
-# (ready marker, space.ag2.desktop dir, space.ag2.app dir) -> expected root
+# (ready marker, space.ag2.desktop dir, space.ag2.app dir), expected root, case
 STATES = [
-    ((False, False, False), "desktop"),  # fresh install
-    ((False, False, True), "legacy"),    # not migrated yet
-    ((False, True, False), "desktop"),   # only the new folder
-    ((False, True, True), "legacy"),     # move never completed: stay on old
-    ((True, False, False), "desktop"),   # stray marker, nothing to stay on
-    ((True, False, True), "legacy"),     # stray marker, no new folder
-    ((True, True, False), "desktop"),    # moved, rollback copy removed
-    ((True, True, True), "desktop"),     # moved, rollback copy kept
+    ((False, False, False), "desktop", "fresh install"),
+    ((False, False, True), "legacy", "not migrated yet"),
+    ((False, True, False), "desktop", "only the new folder"),
+    ((False, True, True), "legacy", "move never completed: stay on old"),
+    ((True, False, False), "desktop", "stray marker, nothing to stay on"),
+    ((True, False, True), "legacy", "stray marker, no new folder"),
+    ((True, True, False), "desktop", "moved, rollback copy removed"),
+    ((True, True, True), "desktop", "moved, rollback copy kept"),
 ]
 
 
@@ -117,8 +117,8 @@ class ResolverAgreesAcrossLanguages(_TempHome):
         self.assertEqual(self.shell("desktop-data-root", **extra), str(expected))
 
     def test_every_folder_state_matches_table_and_desktop_rule(self):
-        for state, want in STATES:
-            with self.subTest(marker=state[0], new=state[1], old=state[2]):
+        for state, want, case in STATES:
+            with self.subTest(case, marker=state[0], new=state[1], old=state[2]):
                 for p in (self.support / ".space.ag2.desktop.ready",):
                     if p.exists():
                         p.unlink()
