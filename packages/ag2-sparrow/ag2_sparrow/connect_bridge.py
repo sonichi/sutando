@@ -158,7 +158,8 @@ def agent_root(agent_id: str) -> "tuple[str, str]":
     return root, problem or served_elsewhere(agent_id, root)
 
 
-_NOT_SESSION = ("help", "base", "code", "trust_relay_host", "work", "inbox", "token_env_file", "bridge_state_dir")
+_NOT_SESSION = ("help", "base", "code", "trust_relay_host", "work", "inbox", "token_env_file", "bridge_state_dir",
+                "experimental_connect")
 
 
 def session_flags(args) -> list:
