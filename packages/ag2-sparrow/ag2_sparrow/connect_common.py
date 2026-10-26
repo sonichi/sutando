@@ -48,6 +48,7 @@ from .bounded_file_read import read_regular
 from .task_io import LockRefused, acquire_lock, install_id, lock_held, lock_holder, lock_path, release_lock  # noqa: F401
 
 EXIT_HELD = 75          # another session holds this work root: a supervisor must not relaunch over it
+EXIT_RETRY = 76         # an operation held the agent lock past admission: the manager restarts later
 EXIT_UNUSABLE = 2
 EXIT_CHILD_HELD = 1     # a child's own 75 is reported as this, so 75 means only "another holder"
 TERM_GRACE_S = 15.0
@@ -696,8 +697,42 @@ def agent_lock_path(root) -> Path:
 
 
 def _open_agent_lock(path: Path) -> int:
+    """The lock file's fd; OSError when its directory is not this user's own 0700 directory (a link,
+    another owner, group or world access) or the file cannot be opened."""
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    st = os.lstat(path.parent)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid() or st.st_mode & 0o077:
+        raise OSError(errno.EPERM, f"{path.parent} is not a directory only this user can use")
     return os.open(path, os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0), 0o600)
+
+
+def _holder_path(path: Path) -> Path:
+    return path.with_suffix(".holder")
+
+
+def _say_holder(path: Path, role: str) -> None:
+    """Record, while holding the lock at `path`, who holds it: pid, start time and role."""
+    _write(_holder_path(path), json.dumps({"pid": os.getpid(), "start": task_io.start_time(os.getpid()),
+                                           "role": role}), 0o600)
+
+
+def _unsay_holder(path: Path) -> None:
+    holder = _holder_path(path)
+    try:
+        if json.loads(holder.read_text(encoding="utf-8")).get("pid") == os.getpid():
+            holder.unlink()
+    except (OSError, ValueError):
+        pass
+
+
+def lock_holder_role(root) -> "dict":
+    """Who holds `root`'s agent lock, as its holder recorded it, only while that process lives with the
+    start time it recorded; {} when that cannot be shown."""
+    try:
+        rec = json.loads(_holder_path(agent_lock_path(root)).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return rec if task_io.verify_lineage(rec.get("pid"), rec.get("start")) is True else {}
 
 
 class agent_lock:
@@ -719,7 +754,10 @@ class agent_lock:
             held[1] += 1
             self.entered = True
             return self
-        fd = _open_agent_lock(self.path)
+        try:
+            fd = _open_agent_lock(self.path)
+        except OSError as e:
+            raise Busy(f"the agent lock {self.path} cannot be used ({e.strerror or e}); nothing was done")
         deadline = time.monotonic() + (AGENT_LOCK_WAIT_S if self.wait_s is None else self.wait_s)
         while True:
             try:
@@ -732,6 +770,7 @@ class agent_lock:
                                "then try again")
                 time.sleep(0.1)
         _AGENT_HELD[key] = [fd, 1]
+        _say_holder(self.path, "operation")
         self.entered = True
         return self
 
@@ -743,6 +782,7 @@ class agent_lock:
         held[1] -= 1
         if held[1] == 0:
             del _AGENT_HELD[self._key()]
+            _unsay_holder(self.path)
             os.close(held[0])
 
     def __exit__(self, *exc):
@@ -786,29 +826,39 @@ def _parent_pid(pid) -> "int | None":
         return None
 
 
-def launch_admission(root, wait_s: "float | None" = None) -> "tuple[int | None, str]":
+def launch_admission(root, state: "dict | None" = None, wait_s: "float | None" = None) -> "tuple[int | None, str]":
     """(fd, '') once a launcher holds the agent lock: it waits (polling, never blocking) up to `wait_s`
     (LAUNCH_WAIT_S) for an operation holding it to end, then keeps the fd until it holds the root
     (end_admission). An operation that starts the job releases the lock before it waits for the
-    launcher, so the launcher acts only after that operation is over. Else (None, why)."""
+    launcher, so the launcher acts only after that operation is over. A stop recorded in `state` ends
+    the wait at once. Else (None, why)."""
     path = agent_lock_path(root)
-    deadline = time.monotonic() + (LAUNCH_WAIT_S if wait_s is None else wait_s)
+    wait = LAUNCH_WAIT_S if wait_s is None else wait_s
+    deadline = time.monotonic() + wait
     while True:
-        fd = _open_agent_lock(path)
+        if state is not None and state.get("sig") is not None:
+            return None, "stopped while waiting for the agent lock"
+        try:
+            fd = _open_agent_lock(path)
+        except OSError as e:
+            return None, f"the agent lock {path} cannot be used ({e.strerror or e})"
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            _say_holder(path, "launcher")
             return fd, ""
         except BlockingIOError:
             os.close(fd)
         if time.monotonic() >= deadline:
-            return None, (f"an operation on this agent held {path} for longer than "
-                          f"{(LAUNCH_WAIT_S if wait_s is None else wait_s):.0f} s; the launcher does not act on the root")
+            return None, (f"an operation on this agent held {path} for longer than {wait:.0f} s; the launcher does "
+                          "not act on the root, and the manager starts it again")
         time.sleep(0.1)
 
 
-def end_admission(fd: "int | None") -> None:
+def end_admission(fd: "int | None", root=None) -> None:
     """Drop the agent lock admission kept, once the launcher holds the root (or gave up)."""
     if fd is not None:
+        if root is not None:
+            _unsay_holder(agent_lock_path(root))
         os.close(fd)
 
 
@@ -827,10 +877,14 @@ def install(shape: Shape, values: dict, root: str, revise=None, precheck=None, h
     (await_started) once the agent lock is released, by this call or by the operation holding it."""
     try:
         with agent_lock(root), operation_lock(shape):
-            if root_id is not None:
-                rc = _connect_install_locked(shape, values, root, revise, precheck, holder, root_id)
-            else:
-                rc = _install_locked(shape, values, root, revise, precheck, holder)
+            try:
+                if root_id is not None:
+                    rc = _connect_install_locked(shape, values, root, revise, precheck, holder, root_id)
+                else:
+                    rc = _install_locked(shape, values, root, revise, precheck, holder)
+            except BaseException:
+                abort_pending(root)
+                raise
     except Busy as e:
         return _refuse(str(e))
     return settle(root, rc)
@@ -1068,12 +1122,24 @@ def _start_pending(shape: Shape, root: str, before: dict, restart: bool, unit: s
     """Start `shape`'s job as the last step of an operation that holds the agent lock: its launcher waits
     in launch_admission until that lock is released, and the start is settled then (await_started), never
     while the lock is held. '' or the manager's refusal."""
+    running = manager_pid(shape)
     problem = start_supervisor(shape, restart=restart)
     if not problem:
+        job = manager_pid(shape)
         _PENDING.setdefault(threading.get_ident(), []).append(
             {"shape": shape, "root": root, "before": before, "unit": unit.encode("utf-8"), "root_id": root_id,
-             "holder": holder, "advice": advice, "undo": []})
+             "holder": holder, "advice": advice, "undo": [], "job": job,
+             "owned": running is None and job is not None})
     return problem
+
+
+def abort_pending(root) -> None:
+    """On an exception, while still holding `root`'s agent lock: undo every start this thread left pending
+    for it (_undo_start's rule), so none outlives the operation unsettled."""
+    mine = _PENDING.get(threading.get_ident(), [])
+    for p in [p for p in mine if p["root"] == root]:
+        mine.remove(p)
+        print(f"error: the operation failed after it started {job_name(p['shape'])}; {_undo_start(p)}", file=sys.stderr)
 
 
 def pending_start(shape: Shape) -> "dict | None":
@@ -1108,7 +1174,7 @@ def await_started() -> int:
                     why = _holder_problem(shape, root, rec, p)
                     undone = _undo_start(p) if why else ""
             except Busy:
-                undone = _undo_start(p)      # its holder can only be the launcher still in admission
+                undone = _undo_unlocked(p)
         if why:
             failed = 1
             print(f"error: {why}{p['advice']}; {undone}", file=sys.stderr)
@@ -1136,19 +1202,37 @@ def _holder_problem(shape: Shape, root: str, rec, p: dict) -> str:
     return ""
 
 
+def _undo_unlocked(p: dict) -> str:
+    """The undo when the agent lock stays busy: only while its recorded holder is this job's own
+    launcher (the manager's process, or the launchd shim's child), which holds it just until it takes
+    the root; any other holder is another operation, and the job is left to it."""
+    shape, holder = p["shape"], lock_holder_role(p["root"])
+    job = manager_pid(shape)
+    if holder.get("role") == "launcher" and job is not None and job in (holder["pid"], _parent_pid(holder["pid"])):
+        return _undo_start(p)
+    who = f"{holder.get('role', 'an unrecorded holder')} pid {holder.get('pid', '?')}"
+    return (f"another operation holds the agent lock ({who}), so {job_name(shape)} was left to it; stop it by hand "
+            f"once that ends if it should not run ({stop_command(shape)})")
+
+
 def _undo_start(p: dict) -> str:
     """Stop the job this operation started, and run its other undos, while the unit is the one it
-    published; else leave it. The line saying what was done."""
+    published and the manager still runs the job instance it started (or none); else leave it. The line
+    saying what was done."""
     shape = p["shape"]
-    for undo in p["undo"]:
-        undo()
+    if not p["owned"]:
+        return (f"{job_name(shape)} was already running when this operation asked for it, so it is not this "
+                f"operation's and was left as it is: stop it by hand if it should not run ({stop_command(shape)})")
     try:
         unit_now = supervisor_path(shape).read_bytes()
     except OSError:
         unit_now = None
-    if unit_now != p["unit"]:
+    job = manager_pid(shape)
+    if unit_now != p["unit"] or job not in (p["job"], None):
         return (f"{job_name(shape)} is no longer the job this connect started (its unit or launcher changed), so "
                 f"it was left as it is: stop it by hand ({stop_command(shape)})")
+    for undo in p["undo"]:
+        undo()
     problem = stop_supervisor(shape)
     if problem:
         return f"{job_name(shape)} could not be stopped ({problem}): stop it by hand ({stop_command(shape)})"
@@ -1175,6 +1259,8 @@ def _publish_noclobber(path: Path, text: str, mode: int) -> str:
         except FileExistsError:
             now, problem = file_text(path, "file")
             return problem if problem else "" if now == text else f"{path} appeared with other bytes than connect's"
+        except OSError as e:
+            return f"{path} could not be published ({e.strerror or e})"
     finally:
         os.unlink(tmp)
 
@@ -1277,24 +1363,30 @@ def hold_and_supervise(shape: Shape, root: str, state: dict, prepare, spawn, sup
     def refuse(line: str) -> int:
         print(f"{label}: refusing to start: {line}", file=sys.stderr)
         return EXIT_UNUSABLE
-    admitted, problem = launch_admission(root)
+    admitted, problem = launch_admission(root, state)
     if problem:
         if acquired is not None:
             acquired()
+        if state.get("sig") is not None:
+            print(f"{label}: stopped before the {noun} started", file=sys.stderr)
+            return 128 + state["sig"]
         print(f"{label}: refusing to start: {problem}", file=sys.stderr)
-        return EXIT_HELD
+        return EXIT_RETRY
     try:
         owner = task_io.acquire_lock(root, adapter or shape.name, retry_s=ACQUIRE_RETRY_S)
     except LockRefused as e:
-        end_admission(admitted)
+        end_admission(admitted, root)
         if acquired is not None:
             acquired()
         print(e.line, file=sys.stderr)
         return EXIT_HELD if e.code == 3 else EXIT_UNUSABLE
-    end_admission(admitted)
+    end_admission(admitted, root)
     if acquired is not None:
         acquired()
     try:
+        if state["sig"] is not None:
+            print(f"{label}: stopped before it touched the root", file=sys.stderr)
+            return 128 + state["sig"]
         if _is_link("tasks", owner.root_fd):
             return refuse("tasks/ under the held root is a symlink, not a directory")
         try:

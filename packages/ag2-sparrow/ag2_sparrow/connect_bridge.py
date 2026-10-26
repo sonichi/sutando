@@ -226,7 +226,11 @@ def under_agent_lock(root: str, fn) -> int:
     started is settled once the lock is released (cm.settle)."""
     try:
         with cm.agent_lock(root):
-            rc = fn()
+            try:
+                rc = fn()
+            except BaseException:
+                cm.abort_pending(root)
+                raise
     except cm.Busy as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
@@ -457,6 +461,9 @@ def finish_connect(seat: dict, install, command: str, flags) -> int:
     connect's closing line: what to verify, or how the spent code's seat is installed again."""
     try:
         rc = install()
+    except BaseException:
+        cm.abort_pending(seat["root"])
+        raise
     finally:
         seat["lock"].release()
     rc = cm.settle(seat["root"], rc)
