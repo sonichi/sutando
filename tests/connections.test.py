@@ -2384,7 +2384,9 @@ class VaultPartialWrite(Base):
         self.keychain = Keychain(self.vault.store)
         self.spawned = []
         manifest = self.ws / "vault-keys.json"
-        self.patches = [unittest.mock.patch.object(vault_intercept.subprocess, "run", self.keychain),
+        # Only vault_intercept's view of subprocess: the host label and the children keep the real one.
+        security = unittest.mock.Mock(wraps=subprocess, run=self.keychain, TimeoutExpired=subprocess.TimeoutExpired)
+        self.patches = [unittest.mock.patch.object(vault_intercept, "subprocess", security),
                         unittest.mock.patch.object(vault_intercept, "_manifest_path", lambda: str(manifest))]
         for p in self.patches:
             p.start()
@@ -2423,6 +2425,34 @@ class VaultPartialWrite(Base):
         self.assertIn("read back, AG2_REMOTE_TOKEN_BETA_FIXTURE_NET holds the NEW code", str(cm.exception))
         self.assertNotIn("secret-beta", str(cm.exception))
         self.assertEqual(self.spawned, [], "never relaunched")
+
+    def test_a_value_the_public_vault_writer_committed_meanwhile_is_never_restored_over(self):
+        """The public writer (set_vault_key) takes no connections lock: the restore is a compare-and-swap
+        on the stored value, so a third value is left in place and the outcome is token_state_unknown."""
+        theirs = "https://relay.beta-fixture.net:8443|secret-beta-public"
+
+        def write(path, record):
+            self.vi.set_vault_key(self.REF, theirs)
+            raise OSError("disk full")
+        with unittest.mock.patch.object(C, "_write", write):
+            with self.assertRaises(C.ConnectionsError) as cm:
+                self.update()
+        self.assertEqual(self.keychain.items[self.REF], theirs, "the public writer's value survives")
+        self.assertIsInstance(cm.exception, C.TokenStateUnknown)
+        self.assertIn("another writer's value", str(cm.exception))
+        self.assertNotIn("secret-beta", str(cm.exception))
+        self.assertEqual(self.spawned, [], "no relaunch on a value this update cannot vouch for")
+        self.assertEqual({r["instance"]: r for r in self.rows()}["beta-fixture-net"]["gateway_url"],
+                         "https://relay.beta-fixture.net:8443", "the row is unchanged")
+
+    def test_a_failed_publication_with_no_other_writer_restores_the_previous_secret(self):
+        with unittest.mock.patch.object(C, "_write", side_effect=OSError("disk full")):
+            with self.assertRaises(C.ConnectionsError) as cm:
+                self.update()
+        self.assertNotIsInstance(cm.exception, C.TokenStateUnknown)
+        self.assertEqual(self.keychain.items[self.REF], TOKEN_B, "compared as the new code, swapped back")
+        self.assertEqual(self.spawned, [TOKEN_B], "the stopped bridge relaunched on the previous secret")
+        self.assertIn("relaunched on the unchanged code", str(cm.exception))
 
     def test_a_read_back_that_cannot_tell_is_token_state_unknown(self):
         def write(path, record):

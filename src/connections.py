@@ -1472,8 +1472,9 @@ def update_token(instance: str, token: str, *, repo: Path, logs_dir: Path,
     (`VaultUnreadable`). The row, its token_ref and the previous secret are read inside the record
     transaction, right before the stop and the vault write, so a concurrent update or a remove and
     re-add is never undone by a stale snapshot. Once the vault write has begun, a failure is
-    reconciled under that same hold of the record lock by reading the key back (`_reconcile_vault`): the previous secret is put back when it
-    is not there; read back as the previous secret, the stopped bridge is relaunched on it and the
+    reconciled under that same hold of the record lock by reading the key back (`_reconcile_vault`): the previous
+    secret is put back only while the key holds exactly the new code (another writer's value is never
+    overwritten); read back as the previous secret, the stopped bridge is relaunched on it and the
     error says whether that worked; read back as the new code, `TokenRestoreFailed`; anything else,
     or a read that fails, `TokenStateUnknown`. Neither of those relaunches.
     Returns the row with `stopped_pid` and the launch record under `launch`; a launch that fails
@@ -1523,8 +1524,8 @@ def update_token(instance: str, token: str, *, repo: Path, logs_dir: Path,
             if found != "previous":
                 raise TokenStateUnknown(
                     f"{TokenStateUnknown.CODE}: the update of {instance} failed after the vault write began ({cause}) "
-                    f"and reading {ref} back {found}, so it is not known which secret it holds; the bridge was "
-                    "not relaunched; run update-token again with the code you want") from None
+                    f"and reading {ref} back {found}, so it is not known which secret it holds; the row is unchanged "
+                    "and the bridge was not relaunched; run update-token again with the code you want") from None
         if not stopped:
             raise e
         try:
@@ -1551,9 +1552,11 @@ def _digest(value: Optional[str]) -> Optional[str]:
 
 
 def _reconcile_vault(vault, ref: str, previous: Optional[str], new: str) -> "tuple[str, str]":
-    """After a failed write under `ref`: ('previous', ...) once a read-back shows the previous secret (put
-    back if needed), ('new', ...) when it still shows the new code, else why it could not tell; the second
-    item names the restore's own error. Values are compared by digest and never logged."""
+    """After a failed write under `ref`, a compare-and-swap on the stored value: the previous secret
+    goes back only while a read shows exactly the new code this update wrote. ('previous', ...) once a
+    read shows the previous secret, ('new', ...) when the restore failed, else why it could not tell
+    (a read that failed, or another writer's value, which is left as it is); the second item names the
+    restore's own error. Values are compared by digest and never logged."""
     def read_back() -> "tuple[bool, Optional[str]]":
         try:
             return True, _digest(_vault_snapshot(vault, ref))
@@ -1562,8 +1565,12 @@ def _reconcile_vault(vault, ref: str, previous: Optional[str], new: str) -> "tup
 
     want, fresh = _digest(previous), _digest(new)
     ok, got = read_back()
-    if ok and got == want:
+    if not ok:
+        return "failed", "none"
+    if got == want:
         return "previous", "none"
+    if got != fresh:
+        return "showed another writer's value, left in place", "none"
     restore = "none"
     try:
         vault.set(ref, previous) if previous is not None else vault.delete(ref)
@@ -1571,10 +1578,10 @@ def _reconcile_vault(vault, ref: str, previous: Optional[str], new: str) -> "tup
         restore = type(e).__name__
     ok, got = read_back()
     if not ok:
-        return "failed", restore
+        return "failed after the restore", restore
     if got == want:
         return "previous", restore
-    return ("new" if got == fresh else "showed neither secret"), restore
+    return ("new" if got == fresh else "showed another writer's value, left in place"), restore
 
 
 def _with_note(error: ConnectionsError, note: str) -> ConnectionsError:

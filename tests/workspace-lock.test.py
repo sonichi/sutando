@@ -35,17 +35,8 @@ def _live_pid() -> int:
     return os.getppid()
 
 
-def _dead_pid() -> int:
-    """The pid of a child that has already exited and been reaped."""
-    p = subprocess.Popen([sys.executable, "-c", "pass"])
-    p.wait()
-    if os.name == "nt":
-        return p.pid  # os.kill(pid, 0) would terminate a reuser on Windows
-    try:
-        os.kill(p.pid, 0)
-    except ProcessLookupError:
-        return p.pid
-    raise unittest.SkipTest(f"pid {p.pid} was reused before the test could plant it")
+# Never a real process: every test planting it stubs the platform probe for it.
+FAKE_PID = 424_242
 
 
 def _load() -> types.ModuleType:
@@ -63,6 +54,11 @@ class LockTest(unittest.TestCase):
 
     def tearDown(self):
         self._tmp.cleanup()
+
+    def _probing(self, table):
+        """The platform probe answering `table[pid]` for the pids it names, the real one otherwise."""
+        real = self.mod._probe
+        return unittest.mock.patch.object(self.mod, "_probe", lambda pid: table[pid] if pid in table else real(pid))
 
     def _lock_path(self, role="gw"):
         return self.ws / "state" / "locks" / f"{role}.lock"
@@ -120,10 +116,10 @@ class LockTest(unittest.TestCase):
         # holder untouched
         self.assertEqual(json.loads(self._lock_path().read_text())["pid"], live)
 
-    @unittest.skipIf(os.name == "nt", "no pid probe on Windows: heartbeat rule only")
     def test_dead_same_host_holder_is_reaped_immediately(self):
-        self._plant("gw", pid=_dead_pid(), hb_age_s=1)     # fresh, but nobody behind it
-        r = self.mod.acquire("gw", self.ws)
+        self._plant("gw", pid=FAKE_PID, hb_age_s=1)     # fresh, but nobody behind it
+        with self._probing({FAKE_PID: ("dead", None)}):
+            r = self.mod.acquire("gw", self.ws)
         self.assertEqual(r.status, "reaped")
         self.assertEqual(json.loads(self._lock_path().read_text())["pid"], os.getpid())
 
@@ -136,12 +132,26 @@ class LockTest(unittest.TestCase):
             child.kill(); child.wait()
 
     def test_holder_alive_under_another_uid_is_deferred(self):
-        # pid 1 exists on every unix host; kill(1, 0) raises EPERM unless root.
-        self._plant("gw", pid=1, hb_age_s=1)
-        self.assertEqual(self.mod.acquire("gw", self.ws).status, "deferred")
+        self._plant("gw", pid=FAKE_PID, hb_age_s=1)
+        with self._probing({FAKE_PID: ("unknown", None)}):
+            self.assertEqual(self.mod.acquire("gw", self.ws).status, "deferred")
+
+    def test_the_posix_probe_reads_eperm_as_unknown_and_esrch_as_dead(self):
+        def kill(err):
+            def raise_(pid, sig):
+                raise err
+            return raise_
+        self.mod._IS_WINDOWS = False
+        self.mod.proc_start = lambda pid, proc=None: None
+        real_os = self.mod.os
+        for err, want in ((PermissionError(), ("unknown", None)), (ProcessLookupError(), ("dead", None))):
+            self.mod.os = types.SimpleNamespace(**{k: getattr(real_os, k) for k in dir(real_os) if not k.startswith("__")})
+            self.mod.os.kill = kill(err)
+            self.assertEqual(self.mod._probe(FAKE_PID), want, type(err).__name__)
+        self.mod.os = real_os
 
     def test_dead_pid_on_another_host_follows_heartbeat_only(self):
-        dead = _dead_pid()
+        dead = FAKE_PID  # another host's pid is never probed
         self._plant("gw", pid=dead, hb_age_s=1, host="otherhost")
         self.assertEqual(self.mod.acquire("gw", self.ws).status, "deferred")
         self._plant("gw", pid=dead, hb_age_s=99999, host="otherhost")
@@ -163,7 +173,7 @@ class LockTest(unittest.TestCase):
 
     def test_retained_dead_holder_ages_out_by_heartbeat(self):
         p = self._lock_path()
-        self._plant("gw", pid=_dead_pid(), hb_age_s=1)
+        self._plant("gw", pid=FAKE_PID, hb_age_s=1)  # a retained holder is never probed
         d = json.loads(p.read_text()); d["retained"] = True; p.write_text(json.dumps(d))
         self.assertEqual(self.mod.acquire("gw", self.ws).status, "deferred")
         d["heartbeat_at"] -= 99999; p.write_text(json.dumps(d))
@@ -363,6 +373,7 @@ class LeaseReaderTest(unittest.TestCase):
     """read_lease / lease_is_live / lease_process: who holds a role, for a caller about to signal it."""
 
     setUp, tearDown, _lock_path, _plant = LockTest.setUp, LockTest.tearDown, LockTest._lock_path, LockTest._plant
+    _probing = LockTest._probing
 
     def test_read_lease_distinguishes_absent_from_malformed(self):
         self.assertIsNone(self.mod.read_lease("r", self.ws))
@@ -380,17 +391,19 @@ class LeaseReaderTest(unittest.TestCase):
         self.assertEqual(self.mod.read_lease("r", self.ws)["pid"], os.getpid(), "the writer's own record")
 
     def test_lease_is_live_is_acquires_decision(self):
-        for pid, age, host in ((_live_pid(), 0, HOST), (_live_pid(), 10_000, HOST), (_dead_pid(), 0, HOST),
-                               (_dead_pid(), 0, "otherhost")):
+        for pid, age, host in ((_live_pid(), 0, HOST), (_live_pid(), 10_000, HOST), (FAKE_PID, 0, HOST),
+                               (FAKE_PID, 0, "otherhost")):
             self._plant("r", pid, age, host)
-            live = self.mod.lease_is_live(self.mod.read_lease("r", self.ws))
-            self.assertEqual(live, self.mod.acquire("r", self.ws).status == "deferred", (pid, age, host))
+            with self._probing({FAKE_PID: ("dead", None)}):
+                live = self.mod.lease_is_live(self.mod.read_lease("r", self.ws))
+                self.assertEqual(live, self.mod.acquire("r", self.ws).status == "deferred", (pid, age, host))
             self._lock_path("r").unlink()
 
     def test_lease_process_proves_the_writer_or_refuses(self):
         self.mod.acquire("r", self.ws)
         self.assertEqual(self.mod.lease_process(self.mod.read_lease("r", self.ws)), os.getpid(), "start time matches")
-        self.assertEqual(self.mod.lease_process({"pid": _dead_pid(), "host": HOST}), 0, "gone")
+        with self._probing({FAKE_PID: ("dead", None)}):
+            self.assertEqual(self.mod.lease_process({"pid": FAKE_PID, "host": HOST}), 0, "gone")
         live = _live_pid()
         if self.mod.proc_start(live):
             self.assertEqual(self.mod.lease_process({"pid": live, "host": HOST, "proc_start": "other-boot:1"}), 0,
@@ -407,6 +420,7 @@ class LeaseBindingTest(unittest.TestCase):
     """A lease names the role, workspace and schema it was written for, and its writer's generation."""
 
     setUp, tearDown, _lock_path, _plant = LockTest.setUp, LockTest.tearDown, LockTest._lock_path, LockTest._plant
+    _probing = LockTest._probing
 
     def _written(self, role="r"):
         self.mod.acquire(role, self.ws)
