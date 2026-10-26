@@ -2361,11 +2361,24 @@ class ConnectCode(AgentRootBase):
         self.assert_code_unspent(backend, rc, err)
         self.assertIn("not a Claude Code plugin", err)
 
-    def test_a_host_with_a_core_is_refused_before_the_code_is_spent(self):
+    def test_under_a_host_supervisor_connect_declares_the_seat_with_no_vault_key(self):
         backend = Backend()
+        fake = self.bridged()
         with mock.patch.object(_dirs, "bridge_host", return_value="sparrowd"):
-            rc, _out, err = self.connect(backend)
-        self.assert_code_unspent(backend, rc, err)
+            rc, out, err = self.connect(backend, fake)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(len(backend.calls), 1)
+        self.assertFalse(cm.service_path(cli.BRIDGE).exists(), "the supervisor runs it: no unit of its own")
+        seat_env = str(self.seat() / ".env")
+        cfg = self.cfg()
+        self.assertEqual((cfg["BRIDGE"], cfg["TOKEN_ENV_FILE"], cfg["TOKEN_VAULT_KEY"]), ("sparrowd", seat_env, ""))
+        decl = cli.bridge_home(self.root) / cli.DECLARATION
+        body = json.loads(decl.read_text())
+        self.assertEqual((body["token_vault_key"], body["env"]), ("", cli.launch_env(cfg)[0]))
+        self.assertEqual((body["env"]["AG2_DEVICE_ENV"], body["env"]["REMOTE_TASK_TOKEN_FILE"], body["env"]["REMOTE_TASK_SEAT"]),
+                         (seat_env, str(self.seat() / "token"), "1"))
+        self.assertNotIn("vault set", out)
+        self.assertNotIn(BEARER, decl.read_text() + out + err)
 
     def test_a_malformed_code_or_base_is_refused_before_anything_runs(self):
         for extra in (("--code", "web.code-1"), ("--base", "ftp://backend.example")):
@@ -2800,7 +2813,7 @@ class ConnectHostSupervised(AgentRootBase):
 
     def test_the_host_names_no_token_file_and_needs_the_id_from_the_environment(self):
         rc, _, err = self.install_default(self.bridged(), "--token-env-file", str(self.relay))
-        self.assertEqual((rc, "--token-env-file is not read under sparrowd" in err), (2, True))
+        self.assertEqual((rc, "--token-env-file under sparrowd is the agent's seat" in err), (2, True))
         os.environ.pop("AGENT_MXID")
         rc, _, err = self.install_default(self.bridged())
         self.assertEqual(rc, 2)
@@ -2809,6 +2822,24 @@ class ConnectHostSupervised(AgentRootBase):
         os.environ["AGENT_MXID"] = AGENT
         rc, _, err = self.install_default(self.bridged())
         self.assertIn(f"a running bridge already serves {AGENT}", err, "the host's own agent is never a second bridge")
+
+    def test_a_seat_beside_the_root_is_installed_and_one_anywhere_else_is_refused(self):
+        from ag2_sparrow import gateway_credential_sources as owner
+        os.environ.pop("AGENT_MXID")
+        for seat in (self.home / "seat", cli.bridge_home(self.root)):
+            self.assertEqual(owner.write_seat_credentials(seat, agent_id=AGENT, instance="f" * 32, tier="team",
+                                                          relay_url="https://gw.example/relay", bearer="b-2"), "")
+        elsewhere = self.home / "seat" / "channels" / "ag2space" / ".env"
+        rc, _, err = self.install_default(self.bridged(), "--token-env-file", str(elsewhere))
+        self.assertEqual(rc, 2)
+        self.assertIn(f"is the agent's seat, {cli.seat_file(self.root)}", err)
+        self.assertFalse(self.decl().exists())
+        rc, out, err = self.install_default(self.bridged(), "--token-env-file", cli.seat_file(self.root))
+        self.assertEqual(rc, 0, err)
+        body = json.loads(self.decl().read_text())
+        self.assertEqual((body["token_vault_key"], body["env"]["AG2_DEVICE_ENV"]), ("", cli.seat_file(self.root)))
+        self.assertIn(f"with the seat {cli.seat_file(self.root)} and the token file it names", out)
+        self.assertNotIn("b-2", self.decl().read_text())
 
     def test_an_explicit_root_under_the_host_records_only_an_id_from_the_environment(self):
         os.environ.pop("AGENT_MXID")

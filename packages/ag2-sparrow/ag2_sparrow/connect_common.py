@@ -1203,13 +1203,18 @@ def seat_instance(seat) -> str:
     return kept if _sources.SEAT_INSTANCE_RE.fullmatch(kept) else _sources.mint_gateway_instance()
 
 
+def seat_env_path(seat) -> str:
+    """The seat's .env, where write_seat puts it."""
+    return os.path.join(_sources.seat_channel_dir(seat), ".env")
+
+
 def write_seat(seat, redeemed: dict) -> "tuple[str, str]":
     """(the seat's .env path, '') or ('', why): the redeemed credential written by its owner, standalone
     tier, the instance kept or minted once."""
     problem = _sources.write_seat_credentials(seat, agent_id=redeemed["agent_id"], instance=seat_instance(seat),
                                               tier=STANDALONE_TIER, relay_url=redeemed["relay_url"],
                                               bearer=redeemed["bearer"])
-    return ("", problem) if problem else (os.path.join(_sources.seat_channel_dir(seat), ".env"), "")
+    return ("", problem) if problem else (seat_env_path(seat), "")
 
 
 def served_setup_line(vendor: str) -> str:

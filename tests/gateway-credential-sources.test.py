@@ -2003,11 +2003,13 @@ def declaration_reads(source: str, rel: str) -> "list[str]":
 # Closed world for the declaration's reader: bridge_environ is exactly this (its docstring aside), and
 # these are the module's only mapping writes. A change to either is a reviewed edit of this test.
 READER_ENVIRON = """
-token_env = _sources.bridge_token_environ(token, url)
 strip = _sources.bridge_strip_keys() + _sources.BRIDGE_CARRIED_CONFIG
 host = os.environ if base is None else base
 env = {k: v for k, v in host.items() if k not in HOST_ONLY and k not in strip}
 env.update(decl["env"], REMOTE_PROACTIVE_ROOM="")
+if is_seat(decl):
+    return env
+token_env = _sources.bridge_token_environ(token, url)
 env.update(_sources.bridge_carried_config(host, read_regular))
 env.update(token_env)
 return env
