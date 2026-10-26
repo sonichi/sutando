@@ -50,7 +50,7 @@ def check(name, cond, detail=""):
 
 def _race_worker(state_dir, key, lane, barrier, out):
     barrier.wait()
-    out.put((lane, lane_dedupe.claim(Path(state_dir), key, lane, log=lambda _m: None)))
+    out.put((lane, lane_dedupe.claim_key(Path(state_dir), key, lane, log=lambda _m: None)))
 
 
 def main():
@@ -130,14 +130,14 @@ def main():
     # 4. TTL.
     ttl_dir = tmp / "ttl"
     key = lane_dedupe.key_of({"channel_id": "!r", "source_message_id": "$ttl"})
-    lane_dedupe.claim(ttl_dir, key, "a", now=1000.0, ttl=60)
-    check("a live claim blocks another lane", lane_dedupe.claim(ttl_dir, key, "b", now=1059.0, ttl=60) == "a")
-    check("an expired claim does not", lane_dedupe.claim(ttl_dir, key, "b", now=1061.0, ttl=60) is None)
-    check("the new claim now holds the key", lane_dedupe.claim(ttl_dir, key, "a", now=1062.0, ttl=60) == "b")
+    lane_dedupe.claim_key(ttl_dir, key, "a", now=1000.0, ttl=60)
+    check("a live claim blocks another lane", lane_dedupe.claim_key(ttl_dir, key, "b", now=1059.0, ttl=60) == "a")
+    check("an expired claim does not", lane_dedupe.claim_key(ttl_dir, key, "b", now=1061.0, ttl=60) is None)
+    check("the new claim now holds the key", lane_dedupe.claim_key(ttl_dir, key, "a", now=1062.0, ttl=60) == "b")
     import sqlite3
     con = sqlite3.connect(str(ttl_dir / lane_dedupe.STORE_NAME))
-    lane_dedupe.claim(ttl_dir, "other", "a", now=1000.0, ttl=60)
-    lane_dedupe.claim(ttl_dir, "fresh", "a", now=5000.0, ttl=60)
+    lane_dedupe.claim_key(ttl_dir, "other", "a", now=1000.0, ttl=60)
+    lane_dedupe.claim_key(ttl_dir, "fresh", "a", now=5000.0, ttl=60)
     rows = {r[0] for r in con.execute("SELECT key FROM claims")}
     con.close()
     check("expired rows are pruned", rows == {"fresh"}, repr(rows))
@@ -146,8 +146,8 @@ def main():
     warnings = []
     blocker = tmp / "not-a-dir"
     blocker.write_text("x")
-    r1 = lane_dedupe.claim(blocker / "state", key, "a", log=warnings.append)
-    r2 = lane_dedupe.claim(blocker / "state", key, "b", log=warnings.append)
+    r1 = lane_dedupe.claim_key(blocker / "state", key, "a", log=warnings.append)
+    r2 = lane_dedupe.claim_key(blocker / "state", key, "b", log=warnings.append)
     check("an unwritable store delivers", r1 is None and r2 is None)
     check("and warns once", len(warnings) == 1 and "delivering without the guard" in warnings[0], repr(warnings))
     bad = tmp / "malformed"
@@ -155,8 +155,8 @@ def main():
     (bad / lane_dedupe.STORE_NAME).write_bytes(b"this is not a sqlite database" * 100)
     bad_warnings = []
     check("a malformed store delivers",
-          lane_dedupe.claim(bad, key, "a", log=bad_warnings.append) is None
-          and lane_dedupe.claim(bad, key, "b", log=bad_warnings.append) is None)
+          lane_dedupe.claim_key(bad, key, "a", log=bad_warnings.append) is None
+          and lane_dedupe.claim_key(bad, key, "b", log=bad_warnings.append) is None)
     check("and warns once", len(bad_warnings) == 1, repr(bad_warnings))
 
     # 6. A real race between processes.

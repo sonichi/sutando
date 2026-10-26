@@ -3,7 +3,7 @@
 An install may run several gateway bridges ("lanes"), one per homeserver connection, all
 writing into the same workspace inbox. A Matrix event keeps its `event_id` on every
 homeserver that sees it, so the same message can arrive once per lane. Before a lane queues
-a task, `claim` records `(room, source_message_id)` in one SQLite store shared by every
+a task, `claim_key` records `(room, source_message_id)` in one SQLite store shared by every
 lane's bridge process; a key already held by ANOTHER lane is a duplicate. The same lane
 seeing its own key again is not, so a lane's own redelivery and retry semantics are kept.
 
@@ -49,7 +49,7 @@ def _warn(log: Callable[[str], None], message: str) -> None:
         log(message)
 
 
-def claim(state_dir: Path, key: str, lane: str, *, now: Optional[float] = None,
+def claim_key(state_dir: Path, key: str, lane: str, *, now: Optional[float] = None,
           ttl: float = TTL_S, log: Callable[[str], None] = print) -> Optional[str]:
     """Claim `key` for `lane`. Returns the other lane holding a live claim, else None (deliver)."""
     now = time.time() if now is None else now
@@ -90,7 +90,7 @@ def duplicate_reason(state_dir: Path, task: Mapping[str, object], lane: str, *,
     key = key_of(task)
     if key is None:
         return None
-    holder = claim(state_dir, key, lane, now=now, log=log)
+    holder = claim_key(state_dir, key, lane, now=now, log=log)
     if holder is None:
         return None
     return (f"lane dedupe: message {task.get('source_message_id')} on lane {lane_label(lane)} "
