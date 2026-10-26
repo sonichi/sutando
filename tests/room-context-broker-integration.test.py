@@ -27,7 +27,6 @@ Run: AG2SPACE_BACKEND_DIR=/path/to/ag2space-backend python3 tests/room-context-b
 """
 from __future__ import annotations
 
-import asyncio
 import json
 import os
 import stat
@@ -45,6 +44,8 @@ from _helpers.hermetic_env import hermetic_env, isolate_os_environ
 
 # Every spawn below inherits nothing from the outer environment; only the backend checkout passes.
 isolate_os_environ(AG2SPACE_BACKEND_DIR=os.environ.get("AG2SPACE_BACKEND_DIR", ""))
+
+import asyncio  # below the isolation: not in the checker's 3.9 stdlib fallback
 
 _TESTS = Path(__file__).resolve().parent
 _REPO = _TESTS.parent
