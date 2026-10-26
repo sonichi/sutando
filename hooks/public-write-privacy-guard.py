@@ -255,15 +255,18 @@ class Act:
 
 
 class Ctx:
+    """seg_bodies: each segment's own heredocs; own/assigns: the segment being read;
+    exported: earlier export/unset; maybe: earlier bare NAME=value, live only if exported."""
+
     def __init__(self, cwd, bodies, segments, seg_bodies):
         self.cwd = cwd
-        self.bodies = bodies          # every heredoc + here-string in this command
+        self.bodies = bodies
         self.segments = segments
-        self.seg_bodies = seg_bodies  # the bodies each segment itself redirects in
-        self.own = []                 # bodies of the segment being read
-        self.assigns = {}             # NAME=value prefixes of the segment being read
-        self.exported = {}            # export NAME=value / unset NAME earlier in the command
-        self.maybe = {}               # bare NAME=value earlier: applies only if already exported
+        self.seg_bodies = seg_bodies
+        self.own = []
+        self.assigns = {}
+        self.exported = {}
+        self.maybe = {}
 
 
 def _resolve(path_text: str, cwd):
