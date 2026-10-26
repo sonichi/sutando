@@ -122,6 +122,15 @@ SUCCESSOR_WRITER = ("import os, sys; sys.path.insert(0, %r); from ag2_sparrow im
                     "print('written', got[1] or 'ok', flush=True); sys.stdin.read(); task_io.release_lock(o)")
 SEAT_HOLDER = ("import fcntl, os, sys; fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o600)\n"
                "fcntl.flock(fd, fcntl.LOCK_EX); print('held', flush=True); sys.stdin.read()")
+AGENT_LOCK_HOLDER = ("import sys; sys.path.insert(0, %r); from ag2_sparrow import connect_common as cm\n"
+                     "lock = cm.agent_lock(%r); lock.__enter__(); grant = %r\n"
+                     "if grant: cm.publish_start_grant(%r)\n"
+                     "print('held', flush=True); sys.stdin.read()")
+CONTENDER = ("import sys; sys.path.insert(0, %r); from ag2_sparrow import connect_common as cm\n"
+             "from ag2_sparrow.adapters.%s import %s as other\n"
+             "cm.AGENT_LOCK_WAIT_S = 0.3; cm.LAUNCH_WAIT_S = 0.3\n"
+             "print('install', cm.install(other.LOCAL, {}, %r), flush=True)\n"
+             "print('launch', cm.launch_admission(%r) or 'admitted', flush=True)")
 OP_HOLDER = ("import sys; sys.path.insert(0, %r); from ag2_sparrow import connect_common as cm\n"
              "from ag2_sparrow.adapters.codex.connect_cli import LOCAL\n"
              "with cm.operation_lock(LOCAL): print('held', flush=True); sys.stdin.read()")
@@ -1208,7 +1217,7 @@ class ConnectCode(Base):
     def files(self):
         """Every file under the test home, by bytes, but the fake codex's call log and the empty operation
         lock files: what a refused connect may not change."""
-        return {str(p): p.read_bytes() for p in sorted(self.home.rglob("*")) if p.is_file() and p.suffix != ".oplock" and p.name != cm.SEAT_LOCK
+        return {str(p): p.read_bytes() for p in sorted(self.home.rglob("*")) if p.is_file() and p.suffix != ".oplock" and p.name != cm.SEAT_LOCK and p.parent.name != ".locks"
                 and not (p.parent == self.home and p.name.startswith("codex-"))}
 
     def assert_refused_untouched(self, fake, why, spent="the code is spent and nothing was written", unspent=False):
@@ -1293,6 +1302,8 @@ class ConnectCode(Base):
             self.assertEqual(successor.stdout.readline().strip(), "held")
             rec = task_io.lock_holder(str(self.root))
             self.assertEqual((rec["adapter"], rec["pid"], rec["live"]), (cli.SHAPE, dead.pid, False))
+            self.assertIn("is held by a holder with no live record", cm._managed_here(L, str(self.root)),
+                          "install's own check needs the record to be live")
             self.assert_refused_untouched(BridgeFake(runner), f"{cm.job_name(L)} is running for", unspent=True)
         finally:
             runner.stop_session()
@@ -1628,7 +1639,7 @@ class ConnectCode(Base):
         self.assertIn(f"; run {cli.COMMAND} install --codex-home {self.codex_home} --token-env-file "
                       f"{cb.seat_file(self.root)}\n", err)
 
-    def test_a_bridge_wiring_failure_after_install_starts_the_job_once_and_restarts_nothing(self):
+    def test_a_bridge_wiring_failure_after_install_unwinds_this_attempt_and_restarts_nothing(self):
         fake = self.running_job()
         fake.runner.stop_session()
         before = len(fake.runner.calls)
@@ -1639,8 +1650,9 @@ class ConnectCode(Base):
         self.assertIn("its bridge is not: ag2-sparrow was not found beside", err)
         starts = [c for c in fake.runner.calls[before:] if fake.runner.verb(c) in START_VERBS]
         self.assertEqual(len(starts), 1, "install started the job once; nothing started it again")
-        self.assertNotIn("started again", out)
-        self.assert_job_runs(fake)
+        self.assertNotIn("next:", out)
+        self.assertIn(f"; this attempt was undone: {cm.job_name(L)}, the job its install started, was stopped", err)
+        self.assertIsNone(fake.runner.pid(), "the job this attempt started is not left running")
 
     def test_a_job_started_after_the_seat_write_is_left_running_and_connect_refuses(self):
         fake = self.running_job()
@@ -1736,6 +1748,149 @@ class ConnectCode(Base):
         self.assertIn(f"{conf} differs from what connect would write; connect changes no job's definition", err)
         self.assertEqual(conf.read_bytes(), before)
         self.assertIsNone(fake.runner.pid(), "nothing was started")
+
+    def agent_lock_holder(self, grant=False):
+        """The production agent lock held by another process (and, with `grant`, a start it published)."""
+        p = subprocess.Popen([sys.executable, "-c", AGENT_LOCK_HOLDER % (str(PKG), str(self.root), grant, str(self.root))],
+                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        self.assertEqual(p.stdout.readline().strip(), "held")
+        self.addCleanup(lambda: unhold(p) if p.poll() is None else None)
+        return p
+
+    def test_both_adapters_resolve_one_lock_for_one_agent(self):
+        from ag2_sparrow.adapters.claude_code import cli as other
+        self.assertIs(other.cm.agent_lock_path, cm.agent_lock_path, "one production lock owner")
+        self.assertIs(other.cb.agent_root, cb.agent_root)
+        root = cb.agent_root(AGENT)[0]
+        self.assertEqual(root, str(self.root))
+        lock = cm.agent_lock_path(root)
+        self.assertEqual(lock, _dirs.agents_dir() / ".locks" / f"{self.root.name}.op")
+        self.assertFalse(str(lock).startswith(str(self.root) + os.sep), "outside the root")
+        self.root.mkdir(parents=True)
+        os.rename(self.root, str(self.root) + ".parked")
+        os.mkdir(self.root)
+        self.assertEqual(cm.agent_lock_path(str(self.root)), lock, "a replacement at the path takes the same lock")
+
+    def test_install_uninstall_and_wiring_wait_for_the_agent_lock_and_refuse(self):
+        fake = self.running_job()
+        fake.runner.stop_session()
+        cfg = cm.read_config(cli.config_path())
+        holder = self.agent_lock_holder()
+        with mock.patch.object(cm, "AGENT_LOCK_WAIT_S", 0.3), mock.patch.object(sm, "_run", side_effect=fake), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as err:
+            before = len(fake.runner.calls)
+            self.assertEqual(cm.install(L, {}, str(self.root)), 1)
+            self.assertEqual(cm.uninstall(L), 1)
+            wired = cb.wire_bridge_bound(cfg, cli.COMMAND, B, L, None)
+        self.assertEqual(err.getvalue().count("another operation on this agent is in progress"), 2, err.getvalue())
+        self.assertIn("another operation on this agent is in progress", wired)
+        self.assertEqual(fake.runner.calls[before:], [], "nothing reached the manager")
+        self.assertTrue(cli.config_path().exists(), "uninstall removed nothing")
+        holder.kill()
+        holder.wait(timeout=30)
+        with cm.agent_lock(str(self.root), wait_s=1):
+            pass                                    # a dead holder's flock is gone: nothing stale remains
+
+    def test_a_launcher_does_not_act_on_the_root_during_an_operation_unless_granted(self):
+        self.root.mkdir(parents=True)
+        calls = []
+
+        def launch():
+            err = io.StringIO()
+            with mock.patch.object(cm, "LAUNCH_WAIT_S", 0.3), contextlib.redirect_stderr(err):
+                rc = cm.hold_and_supervise(L, str(self.root), {"sig": None},
+                                           lambda owner, root: (calls.append(root), (None, "stop here"))[1],
+                                           None, None, None, "run", "test")
+            return rc, err.getvalue()
+        holder = self.agent_lock_holder()
+        rc, err = launch()
+        self.assertEqual(rc, cm.EXIT_HELD, err)
+        self.assertIn("published no start for this launcher", err)
+        self.assertEqual(calls, [], "the root was never taken")
+        unhold(holder)
+        holder = self.agent_lock_holder(grant=True)
+        rc, err = launch()
+        self.assertEqual((rc, calls), (cm.EXIT_UNUSABLE, [str(self.root)]), "the granted launcher went on")
+        self.assertIn("published no start", cm.launch_admission(str(self.root), wait_s=0.3), "one claim only")
+        unhold(holder)
+        self.assertEqual(cm.launch_admission(str(self.root), wait_s=0.3), "", "admitted once the operation ends")
+
+    def test_the_other_adapter_and_a_launcher_wait_while_connect_holds_the_agent(self):
+        real, seen = cm.install, []
+
+        def contended(*a, **kw):
+            r = subprocess.run([sys.executable, "-c", CONTENDER % (str(PKG), "claude_code", "cli", str(self.root),
+                                                                    str(self.root))],
+                               capture_output=True, text=True, timeout=60)
+            seen.append(r.stdout + r.stderr)
+            return real(*a, **kw)
+        with mock.patch.object(cm, "install", side_effect=contended):
+            rc, out, err = self.connect(Backend())
+        self.assertEqual(rc, 0, out + err)
+        self.assertIn("install 1", seen[0])
+        self.assertIn("another operation on this agent is in progress", seen[0])
+        self.assertIn("launch an operation on this agent holds", seen[0])
+
+    def test_unwinding_leaves_a_unit_that_is_no_longer_this_attempts(self):
+        fake, real = self.fake(), cb.wire_bridge
+        foreign = "[Service]\nExecStart=/a-successor\n# " + L.marker + "\n"
+
+        def wired_then_replaced(*a, **kw):
+            got = real(*a, **kw)
+            self.replace_root_now()
+            cm.supervisor_path(L).write_text(foreign)     # a successor's definition, published meanwhile
+            return got
+        with mock.patch.object(cb, "wire_bridge", side_effect=wired_then_replaced):
+            rc, out, err = self.connect(Backend(), fake)
+        self.assertNotEqual(rc, 0, out + err)
+        self.assertNotIn("next:", out)
+        self.assertIn(f"{cm.job_name(L)} is no longer the job this connect started (its unit or launcher changed), so "
+                      f"it was left as it is: stop it by hand", err)
+        self.assertEqual(cm.supervisor_path(L).read_text(), foreign, "the successor's unit is untouched")
+        self.assertIsNotNone(fake.runner.pid(), "its job was not stopped")
+
+    def test_unwinding_stops_this_attempts_job_and_leaves_a_held_replacement_alone(self):
+        fake, real, other = self.fake(), cb.wire_bridge, []
+
+        def wired_then_replaced(*a, **kw):
+            got = real(*a, **kw)
+            self.replace_root_now()
+            other.append(hold(self.root, "claude-local"))
+            return got
+        with mock.patch.object(cb, "wire_bridge", side_effect=wired_then_replaced):
+            rc, out, err = self.connect(Backend(), fake)
+        try:
+            self.assertNotEqual(rc, 0, out + err)
+            self.assertIsNone(fake.runner.pid(), "this attempt's job was stopped")
+            self.assertIsNone(other[0].poll(), "the replacement's holder is alive")
+            rec = task_io.lock_holder(str(self.root))
+            self.assertEqual((rec["adapter"], rec["pid"]), ("claude-local", other[0].pid), "and still holds it")
+        finally:
+            unhold(other[0])
+
+    def test_a_definition_published_by_another_writer_first_is_not_clobbered(self):
+        fake, real, theirs = self.fake(), cm.tempfile.mkstemp, "[Service]\nExecStart=/theirs\n"
+        sup = cm.supervisor_path(L)
+
+        def raced(*a, **kw):
+            if kw.get("prefix") == f".{sup.name}." and not sup.exists():
+                sup.parent.mkdir(parents=True, exist_ok=True)
+                sup.write_text(theirs)                   # the other writer publishes between check and write
+            return real(*a, **kw)
+        with mock.patch.object(cm.tempfile, "mkstemp", side_effect=raced):
+            rc, out, err = self.connect(Backend(), fake)
+        self.assertNotEqual(rc, 0, out + err)
+        self.assertIn(f"{sup} appeared with other bytes than connect's", err)
+        self.assertEqual(sup.read_text(), theirs, "the other writer's bytes are kept")
+        self.assertIsNone(fake.runner.pid(), "nothing was started")
+
+    def test_a_loaded_launchd_job_counts_as_started_only_for_connects_start(self):
+        loaded = (5, "", "Bootstrap failed: 5: Input/output error\n")
+        table = {("launchctl", "bootstrap"): loaded, ("launchctl", "print"): (0, "\tstate = running\n", "")}
+        run = lambda cmd, timeout=30: subprocess.CompletedProcess(cmd, *table[(cmd[0], cmd[1])])  # noqa: E731
+        with mock.patch.object(cm, "is_macos", return_value=True), mock.patch.object(sm, "_run", side_effect=run):
+            self.assertEqual(cm.start_supervisor(L, restart=False), "")
+            self.assertIn("launchctl bootstrap failed", cm.start_supervisor(L))
 
     def test_a_running_job_refuses_connect_before_the_code_is_spent_and_is_left_running(self):
         fake = self.running_job()

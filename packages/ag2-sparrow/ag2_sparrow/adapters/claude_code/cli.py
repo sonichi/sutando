@@ -262,15 +262,13 @@ def connect(args) -> int:
     if problem:
         print(f"error: {problem}", file=sys.stderr)
         return EXIT_UNUSABLE
-    print(cm.served_setup_line(SETUP_VENDOR))
     session = {k: v for k, v in vars(args).items() if k not in ("code", "trust_relay_host")}
-    rc = install(argparse.Namespace(**session, work=None, inbox=None, token_env_file=seat["seat_env"],
-                                    bridge_state_dir=None, root_identity=seat["root_id"]))
-    if rc == 0:
-        print(f"next: {COMMAND} verify (the bridge reports connected within a minute)")
-    else:
-        print(f"error: {cb.spent_code_line(COMMAND, seat['seat_env'], cb.session_flags(args))}", file=sys.stderr)
-    return rc
+
+    def installed() -> int:
+        print(cm.served_setup_line(SETUP_VENDOR))
+        return install(argparse.Namespace(**session, work=None, inbox=None, token_env_file=seat["seat_env"],
+                                          bridge_state_dir=None, root_identity=seat["root_id"]))
+    return cb.finish_connect(seat, installed, COMMAND, cb.session_flags(args))
 
 
 def child_env(cfg: dict, environ=None) -> dict:

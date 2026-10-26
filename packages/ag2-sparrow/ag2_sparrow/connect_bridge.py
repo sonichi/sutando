@@ -14,6 +14,7 @@ import json
 import os
 import re
 import shlex
+import sys
 import time
 from pathlib import Path
 
@@ -220,19 +221,51 @@ def bridge_problem(cfg: dict, command: str, bridge: cm.Shape, now=None) -> str:
 
 
 def wire_bridge_bound(cfg: dict, command: str, bridge: cm.Shape, local: cm.Shape, root_id) -> str:
-    """wire_bridge held to connect's root (`root_id`, None outside connect): refused unless the root path
-    still names that directory before wiring and after. On a mismatch this attempt's own artifacts are
-    undone (the bridge it wired, the job its install started) and nothing at the new `root` is touched."""
+    """wire_bridge under the agent lock, held to connect's root (`root_id`, None outside connect): refused
+    unless the root path names that directory before wiring and after. On a mismatch, or a wiring that
+    fails under connect, this attempt is undone: the bridge artifact it created (none was there before)
+    and the job its install started (cm.stop_started); nothing at the new `root` is touched."""
     root = cm.work_root(cfg)
+    try:
+        with cm.agent_lock(root):
+            return _wire_bound(cfg, command, bridge, local, root_id, root)
+    except cm.Busy as e:
+        return str(e)
+
+
+def _bridge_artifact(cfg: dict, bridge: cm.Shape) -> "Path | None":
+    """The bridge unit this install wires; a host supervisor's declaration is the credential owner's to read."""
+    return cm.supervisor_path(bridge) if bridge_mode(cfg) == UNIT else None
+
+
+def _bytes(path: "Path | None") -> "bytes | None":
+    try:
+        return path.read_bytes() if path is not None else None
+    except OSError:
+        return None
+
+
+def _wire_bound(cfg: dict, command: str, bridge: cm.Shape, local: cm.Shape, root_id, root: str) -> str:
     if root_id is not None and cm.dir_identity(root) != root_id:
         return _replaced(root, local, cm.stop_started(local, root), "")
+    artifact = _bridge_artifact(cfg, bridge)
+    before = _bytes(artifact)
     problem = wire_bridge(cfg, command, bridge)
-    if problem or root_id is None or cm.dir_identity(root) == root_id:
+    replaced = root_id is not None and cm.dir_identity(root) != root_id
+    if root_id is None or not (problem or replaced):
         return problem
-    unwired = unwire_bridge(cfg, command, bridge)
-    return _replaced(root, local, cm.stop_started(local, root),
-                     f"{cm.job_name(bridge)} could not be removed ({unwired}); " if unwired else
-                     f"the bridge this attempt wired ({cm.job_name(bridge)}) was removed; ")
+    after = _bytes(artifact)
+    note = "" if bridge_mode(cfg) in (UNIT, EXTERNAL) else \
+        f"the bridge declaration is left for {command} uninstall to remove; "
+    if before is None and after is not None:
+        unwired = unwire_bridge(cfg, command, bridge)
+        note = (f"{cm.job_name(bridge)} could not be removed ({unwired}); " if unwired else
+                f"the bridge this attempt wired ({cm.job_name(bridge)}) was removed; ")
+    stopped = cm.stop_started(local, root)
+    if replaced:
+        return _replaced(root, local, stopped, note)
+    return (f"{problem}; this attempt was undone: {note}"
+            + (stopped or f"{cm.job_name(local)}, the job its install started, was stopped"))
 
 
 def _replaced(root: str, local: cm.Shape, stopped: str, bridge_note: str) -> str:
@@ -354,11 +387,12 @@ def host_problem(command: str) -> str:
 
 def redeem_into_seat(base: str, code_arg, trust_relay_host: str, preflight,
                      local: cm.Shape) -> "tuple[dict | None, str]":
-    """({agent_id, root, seat_env, root_id}, '') or (None, the line to print): the code read, checked with
+    """({agent_id, root, seat_env, root_id, lock}, '') or (None, the line to print): the code read, checked with
     `preflight()` and refused while `local`'s job runs, both before it is spent; redeemed once; the
     credential written to the agent's seat only while this process holds the free root and its path still
-    names it (connect_common.under_root). `root_id` is that root's identity, for install to hold to. The
-    bearer never leaves the seat's token file."""
+    names it (connect_common.under_root). `root_id` is that root's identity, for install to hold to; `lock`
+    is the agent lock, taken once the root is known and held until finish_connect. The bearer never leaves
+    the seat's token file."""
     code, problem = cm.read_code(code_arg)
     problem = problem or cm.code_problem(base, code) or preflight() or cm.active_job_problem(local)
     if problem:
@@ -371,16 +405,46 @@ def redeem_into_seat(base: str, code_arg, trust_relay_host: str, preflight,
         str(_dirs.agents_dir() / agent_identity.root_segment(redeemed["agent_id"])), "")
     if problem:
         return None, f"the code is spent but the seat was not written: {problem}; make a new code"
+    lock = cm.agent_lock(root)
+    try:
+        lock.__enter__()
+    except cm.Busy as e:
+        return None, f"{e}; the code is spent and nothing was written: make a new code once it is done"
+    try:
+        seat, problem = _seat_under_lock(local, root, redeemed)
+    except BaseException:
+        lock.release()
+        raise
+    if problem:
+        lock.release()
+        return None, problem
+    return dict(seat, lock=lock), ""
 
+
+def _seat_under_lock(local: cm.Shape, root: str, redeemed: dict) -> "tuple[dict, str]":
     def act(owner):
         seat_env, why = cm.write_seat_held(owner, root, bridge_home(root), redeemed)
         return seat_env, cm.held_identity(owner), why
     written, held = cm.under_root(local, root, act, precheck=lambda: cm.seat_problem(bridge_home(root)))
     if held:
-        return None, (f"{held}; the code is spent and nothing was written ({bridge_home(root)} is unchanged): "
-                      "make a new code in AG2 Space once the root is free")
+        return {}, (f"{held}; the code is spent and nothing was written ({bridge_home(root)} is unchanged): "
+                    "make a new code in AG2 Space once the root is free")
     seat, root_id, problem = written
     if problem:
-        return None, f"the code is spent but the seat was not written: {problem}; make a new code"
+        return {}, f"the code is spent but the seat was not written: {problem}; make a new code"
     print(f"connected: {redeemed['agent_id']}; credentials in {Path(seat).parent} (mode 600)")
     return {"agent_id": redeemed["agent_id"], "root": root, "seat_env": seat, "root_id": root_id}, ""
+
+
+def finish_connect(seat: dict, install, command: str, flags) -> int:
+    """install() still under the agent lock connect took for the seat, then that lock released, and
+    connect's closing line: what to verify, or how the spent code's seat is installed again."""
+    try:
+        rc = install()
+    finally:
+        seat["lock"].release()
+    if rc == 0:
+        print(f"next: {command} verify (the bridge reports connected within a minute)")
+    else:
+        print(f"error: {spent_code_line(command, seat['seat_env'], flags)}", file=sys.stderr)
+    return rc
