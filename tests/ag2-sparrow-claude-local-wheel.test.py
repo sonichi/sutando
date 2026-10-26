@@ -102,6 +102,13 @@ case "$1" in
 esac
 """
 
+# A user manager with no claude-local job: connect refuses while the job runs or its state is unreadable.
+FAKE_SYSTEMCTL = """#!/bin/sh
+case " $* " in
+  *" show "*) printf 'not-found\\ninactive\\ndisabled\\n' ;;
+esac
+"""
+
 
 class InstalledWheel(unittest.TestCase):
     def setUp(self):
@@ -154,12 +161,14 @@ class InstalledWheel(unittest.TestCase):
         for rel in (".claude-plugin/plugin.json", "hooks/hooks.json", "hooks/register.ts"):
             self.assertTrue((plugin / rel).is_file(), "the wheel ships the plugin's %s" % rel)
         self.assertEqual(Path(out["plugin"]), plugin, "the default --plugin-dir is the shipped plugin")
-        # connect with no --plugin-dir passes its preflight on the shipped plugin and reaches the redemption,
-        # which a closed loopback port refuses with the code unspent.
+        # connect with no --plugin-dir passes its preflight on the shipped plugin and, with no job running,
+        # reaches the redemption, which a closed loopback port refuses with the code unspent.
         fake = self.tmp / "fakebin"
         fake.mkdir()
         (fake / "claude").write_text(FAKE_CLAUDE)
         (fake / "claude").chmod(0o755)
+        (fake / "systemctl").write_text(FAKE_SYSTEMCTL)
+        (fake / "systemctl").chmod(0o755)
         cenv = dict(env, PATH="%s:%s" % (fake, env["PATH"]), HOME=str(self.tmp / "chome"))
         r = subprocess.run([str(venv / "bin" / "ag2-sparrow-claude-local"), "connect", "--base", "http://127.0.0.1:9",
                             "--code", "-"], input="acp.wheel-code\n", capture_output=True, text=True,
