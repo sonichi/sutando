@@ -1255,7 +1255,8 @@ def _stop_row(row: Mapping[str, object], workspace: Optional[Path], kill) -> int
     """Stop the row's bridge and any held under one of its alias names; the first pid stopped."""
     stopped = 0
     for inst in [str(row["instance"])] + alias_instances(row):
-        stopped = stop_bridge(inst, workspace=workspace, kill=kill) or stopped
+        pid = stop_bridge(inst, workspace=workspace, kill=kill)
+        stopped = stopped or pid
     return stopped
 
 

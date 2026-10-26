@@ -785,6 +785,17 @@ class AddAdoptsLaunchKeys(ChannelFileBase):
         C.remove_connection("beta-fixture-net", force=True, workspace=self.ws, vault=self.vault)
         self.assertEqual(desktop.wait(timeout=10), 0, "removing it stops the bridge under its alias name too")
 
+    def test_stop_row_stops_every_name_and_returns_the_first_pid(self):
+        row = {"instance": "beta-fixture-net", "launch_keys": ["AG2_REMOTE_TOKEN_ONE", "AG2_REMOTE_TOKEN_TWO"]}
+        pids = {"beta-fixture-net": 0, "one": 11, "two": 22}
+        called = []
+        def fake_stop(inst, **_kw):
+            called.append(inst)
+            return pids[inst]
+        with unittest.mock.patch.object(C, "stop_bridge", fake_stop):
+            self.assertEqual(C._stop_row(row, self.ws, None), 11)
+        self.assertEqual(called, ["beta-fixture-net", "one", "two"])
+
     def test_disconnect_and_reconnect_reach_the_alias_bridge(self):
         C.import_from_env({"REMOTE_TASK_TOKEN": TOKEN_A}, workspace=self.ws, vault=self.vault)
         self.add(TOKEN_B, fetch=agents("@s:beta-fixture.net"))
