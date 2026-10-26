@@ -6,6 +6,7 @@ Import after hermetic_gateway.isolate_then_import, so the bridge module is alrea
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
 from pathlib import Path
 
@@ -38,10 +39,11 @@ def on(mod, **deadlines):
 
 
 def task(ws: Path, tid: str, thread_root=None, stamped=True, source="ag2space", room=ROOM,
-         body="please look into this", msg=MSG_EVT) -> Path:
+         body="please look into this", msg=MSG_EVT, timestamp=True) -> Path:
     """A task file shaped like the gateway's: routing fields below `task:`, `task_layout: mid`."""
-    lines = [f"id: {tid}", f"source: {source}", f"channel_id: {room}", "priority: normal",
-             f"timestamp: {_iso(T0)}", "task_layout: mid", f"task: {body}"]
+    lines = [f"id: {tid}", f"source: {source}", f"channel_id: {room}", "priority: normal"]
+    lines += [f"timestamp: {_iso(T0)}"] if timestamp else []
+    lines += ["task_layout: mid", f"task: {body}"]
     if thread_root is not None:
         lines.append(f"thread_root: {thread_root}")
     lines += [f"source_room_id: {room}", f"source_message_id: {msg}"]
@@ -60,3 +62,15 @@ def _iso(ts: float) -> str:
 
 def proactive_files(ws: Path) -> list:
     return sorted(p.name for p in (ws / "results").glob("proactive-*.txt"))
+
+
+def activity(ws: Path, tid: str, *phases: str) -> None:
+    """Drive the task's activity card through the real activity bus, projecting nowhere."""
+    import activity_bus
+    store = activity_bus.ActivityStore(ws, project=lambda row: None)
+    for i, phase in enumerate(phases):
+        store.apply(activity_bus.LifecycleTransition(tid, phase, ts=T0 + 1 + i, room=ROOM, message_event_id=MSG_EVT))
+
+
+def room_posts(lane) -> list:
+    return [p for p in lane.posts if p.get("room_id") == ROOM]

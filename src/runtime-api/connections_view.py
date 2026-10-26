@@ -47,7 +47,7 @@ class ConnectionsView:
     def list_connections(self) -> dict:
         """{connections: [...]} — every row joined with status and state; [] without a record."""
         try:
-            rows = connections.list_connections(self.workspace)
+            rows = connections.list_connections(self.workspace, vault=self.vault)
         except connections.SchemaError as e:
             raise ProtocolError(-32603, str(e))
         return {"connections": [connections.status_for(r, self.workspace) for r in rows]}

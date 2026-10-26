@@ -198,7 +198,12 @@ while [ "$STOPPING" = 0 ]; do
   CHILD_PID=''
   [ "$STOPPING" = 0 ] || break
   [ "$CHILD_RC" -eq 75 ] && { stop_agents_supervisor; rm -f "$MARKER"; exit 0; }
-  emit_restart_alert
+  # rc 69 is the bridge's poll-stall exit: an outage, already in its log and status file.
+  if [ "$CHILD_RC" -eq 69 ]; then
+    echo "[gateway-bridge-wrapper] bridge exited on a poll stall (rc 69); relaunching without an owner alert" >&2
+  else
+    emit_restart_alert
+  fi
   sleep "$RESTART_DELAY" &
   CHILD_PID=$!
   set +e

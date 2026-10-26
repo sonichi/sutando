@@ -116,7 +116,15 @@ the tombstone.
 creates a row once for `REMOTE_TASK_TOKEN` and each `AG2_REMOTE_TOKEN_<INST>` in the
 environment (copying the secret into the vault unless one is already there; never
 overwriting a row), then launches one bridge per `launch-plan` line through
-`scripts/connections.py launch <instance>`. The plan lists every row with an instance
+`scripts/connections.py launch <instance>`. When the environment holds no
+`REMOTE_TASK_TOKEN`, the primary row comes from the AG2 Space channel env file instead
+(the one `scripts/channel-env.sh` resolves; `REMOTE_TASK_TOKEN` or the legacy
+`AG2_REMOTE_TOKEN`, environment first when both exist): a desktop install signs in after
+the engine started, so the connect flow reaches the file but never this process's
+environment. `list` runs that import once when the record has never been written (an initialized record
+that is empty stays empty: its rows were removed on purpose), so the panel
+shows the connection on its next refresh without an engine restart; an import that fails
+is logged and the list still answers. The plan lists every row with an instance
 plus any env token the import could not record, so an unavailable vault degrades to
 the previous behaviour instead of losing a gateway. An unreadable record never reads
 as "no secondaries": `launch-plan` exits non-zero naming the parse error, startup prints

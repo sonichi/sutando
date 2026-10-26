@@ -16,10 +16,12 @@ isolate_os_environ(SUTANDO_SUPPRESS_CCD_FALLBACK_BANNER="1")
 
 import asyncio
 import json
+import os
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src" / "runtime-api"))
@@ -99,6 +101,17 @@ class ViewTests(unittest.TestCase):
 
     def test_list_is_empty_without_a_record(self):
         self.assertEqual(self.call("connection.list"), {"connections": []})
+
+    def test_list_on_an_empty_record_imports_the_channel_file_token_through_the_view_vault(self):
+        home = self.ws / "claude-home"
+        (home / "channels" / "ag2space").mkdir(parents=True)
+        (home / "channels" / "ag2space" / "relay-client.env").write_text(f"REMOTE_TASK_TOKEN={TOKEN_A}\n")
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(home)}):
+            rows = self.call("connection.list")["connections"]
+        self.assertEqual([(r["instance"], r["token_ref"], r["primary"], r["added_by"]) for r in rows],
+                         [("", "REMOTE_TASK_TOKEN", True, "env")])
+        self.assertEqual(self.vault.store, {"REMOTE_TASK_TOKEN": TOKEN_A}, "the view's vault, not the host's")
+        self.assertTrue(connections.record_path(self.ws).is_file())
 
     def test_add_is_preview_then_confirm(self):
         preview = self.call("connection.add", token=TOKEN_A)["preview"]

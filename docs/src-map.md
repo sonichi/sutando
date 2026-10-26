@@ -17,6 +17,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`access_store.py`** — Single writer contract for Discord access.json.
 - **`accessibility_probe.sh`** — Unbounded, this probe blocks forever on a session with nobody to answer the AppleScript prompt, and startup never reaches the services after it.
 - **`ack_claim.py`** — First-writer-wins claims on an acknowledgement key, shared by every sender of that ack.
+- **`ack_overlap.py`** — Whether a task's initial status ack would duplicate what the room already sees about it.
 - **`activity_bus.py`** — ActivityCard is the UI projection of a durable TaskRun state machine; runtime instrumentation only enriches that state machine with observations.
 - **`activity_policy.py`** — Access tier → capabilities → audience policy → projection.
 - **`activity_rows.py`** — The agent-activity row writer: one JSON row per line at <workspace>/state/agent-activity.jsonl, the live window the desktop renders, its per-day archive, the per-task index that keeps a summary exact after rotation, and the summary left at done.
@@ -211,6 +212,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`skill-manifest-config.sh`** — Generic, skill-agnostic: reads every installed skill's manifest.json "config" block (skills/MANIFEST.md's own convention, previously Node-only via inline-tools.ts) and prints "KEY=VALUE" for each key, NUL-terminated.
 - **`skill-setup-runner.ts`** — Shared runner for optional skills' setup() hooks.
 - **`skill_audience.py`** — Who a skill is for, and whether this install may link it: the one decision every installer calls.
+- **`skill_config.py`** — A skill's config value, read CLI > env > the skill's manifest `config` block (skills/MANIFEST.md).
 - **`skill_hooks.py`** — Discovery for skill-declared Claude Code hooks (`hooks` in a skill manifest).
 - **`skill_install.py`** — Atomic, fail-closed installs of skill directories into the core's skills dir.
 - **`skill_roots.py`** — Where installed skills live, and what their manifests declare — the one Python scan of the sanctioned roots: the engine's `<repo>/skills` and the owner's `<workspace>/skills`, the pair `skills/install.sh` links (the TS loader `loadSkillManifestTools` scans the same two).

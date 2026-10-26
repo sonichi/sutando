@@ -593,6 +593,120 @@ class ImportFromEnv(Base):
         self.assertEqual(self.rows(), [])
 
 
+class ChannelFileBase(Base):
+    """A Claude home of its own, so the channel env file the resolver picks is this test's."""
+
+    def setUp(self):
+        super().setUp()
+        self.home = self.ws / "claude-home"
+        self.channel = self.home / "channels" / "ag2space"
+        self.channel.mkdir(parents=True)
+        patcher = unittest.mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.home)})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def write_relay_env(self, line: str) -> Path:
+        path = self.channel / "relay-client.env"
+        path.write_text(f"# written by the connect flow\n{line}\n")
+        return path
+
+
+class ImportFromChannelFile(ChannelFileBase):
+    def test_file_token_creates_the_primary_row_when_the_environment_has_none(self):
+        self.write_relay_env(f'REMOTE_TASK_TOKEN="{TOKEN_A}"')
+        created = C.import_from_env({}, workspace=self.ws, vault=self.vault)
+        self.assertEqual([(r["instance"], r["token_ref"], r["primary"], r["added_by"], r["verified"], r["gateway_url"])
+                          for r in created],
+                         [("", "REMOTE_TASK_TOKEN", True, "env", False, "https://chat.alpha-fixture.net")])
+        self.assertEqual(self.vault.store, {"REMOTE_TASK_TOKEN": TOKEN_A}, "the quotes are peeled, as from the env")
+        self.assertEqual(C.import_from_env({}, workspace=self.ws, vault=self.vault), [], "once")
+        self.assertEqual(len(self.rows()), 1)
+
+    def test_legacy_spelling_in_the_file_counts_too(self):
+        self.write_relay_env(f"AG2_REMOTE_TOKEN={TOKEN_B}")
+        created = C.import_from_env({}, workspace=self.ws, vault=self.vault)
+        self.assertEqual([(r["instance"], r["token_ref"], r["server"]) for r in created],
+                         [("", "REMOTE_TASK_TOKEN", "beta-fixture.net")])
+
+    def test_environment_wins_over_the_file(self):
+        self.write_relay_env(f"REMOTE_TASK_TOKEN={TOKEN_B}")
+        created = C.import_from_env({"REMOTE_TASK_TOKEN": TOKEN_A}, workspace=self.ws, vault=self.vault)
+        self.assertEqual([(r["instance"], r["gateway_url"]) for r in created], [("", "https://chat.alpha-fixture.net")])
+        self.assertEqual(self.vault.store, {"REMOTE_TASK_TOKEN": TOKEN_A})
+
+    def test_neither_source_writes_nothing_and_raises_nothing(self):
+        self.assertEqual(C.import_from_env({}, workspace=self.ws, vault=self.vault), [])
+        self.write_relay_env("REMOTE_TASK_TOKEN=")
+        self.assertEqual(C.import_from_env({}, workspace=self.ws, vault=self.vault), [], "a blank value is no token")
+        self.assertFalse(C.record_path(self.ws).exists())
+
+    def test_a_removed_name_in_the_file_stays_skipped(self):
+        self.write_relay_env(f"REMOTE_TASK_TOKEN={TOKEN_A}")
+        C.import_from_env({}, workspace=self.ws, vault=self.vault)
+        C.remove_connection("", force=True, workspace=self.ws, vault=self.vault)
+        self.assertEqual(C.removed_env_refs(self.ws), ["REMOTE_TASK_TOKEN"])
+        self.assertEqual(C.import_from_env({}, workspace=self.ws, vault=self.vault), [])
+        self.assertEqual(self.rows(), [])
+
+    def test_no_channel_home_is_no_token(self):
+        self.assertEqual(C.primary_token_from_channel_file({}), "")
+        with unittest.mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.ws / "nowhere")}):
+            self.assertEqual(C.primary_token_from_channel_file({}), "")
+
+    def test_a_resolver_error_is_no_token_and_the_import_still_answers(self):
+        self.write_relay_env(f"REMOTE_TASK_TOKEN={TOKEN_A}")
+        import channel_credentials
+        with unittest.mock.patch.object(channel_credentials, "channel_credentials",
+                                        side_effect=PermissionError("channels dir unreadable")):
+            self.assertEqual(C.primary_token_from_channel_file({}), "")
+            self.assertEqual(C.import_from_env({}, workspace=self.ws, vault=self.vault), [])
+        self.assertFalse(C.record_path(self.ws).exists())
+
+
+class ListSelfHeals(ChannelFileBase):
+    def test_an_explicitly_emptied_record_is_not_refilled_from_the_file(self):
+        self.write_relay_env(f"REMOTE_TASK_TOKEN={TOKEN_A}")
+        self.assertEqual(len(C.list_connections(self.ws, vault=self.vault)), 1)
+        C.remove_connection("", force=True, workspace=self.ws, vault=self.vault)
+        self.assertTrue(C.record_path(self.ws).exists(), "removal leaves an initialized, empty record")
+        self.assertEqual(C.list_connections(self.ws, vault=self.vault), [],
+                         "a removed row must not come back while its token still sits in the file")
+        self.assertEqual(C.list_connections(self.ws, vault=self.vault), [], "and stays gone on the next list")
+
+    def test_an_empty_record_imports_the_file_token_and_persists_it(self):
+        self.write_relay_env(f"REMOTE_TASK_TOKEN={TOKEN_A}")
+        rows = C.list_connections(self.ws, vault=self.vault)
+        self.assertEqual([(r["instance"], r["token_ref"], r["primary"]) for r in rows], [("", "REMOTE_TASK_TOKEN", True)])
+        self.assertTrue(C.record_path(self.ws).exists(), "persisted, not answered from the file")
+        self.assertEqual(C._read(C.record_path(self.ws)), rows)
+        self.assertEqual(self.vault.store, {"REMOTE_TASK_TOKEN": TOKEN_A})
+
+    def test_an_empty_record_with_nothing_to_import_lists_empty(self):
+        self.assertEqual(C.list_connections(self.ws, vault=self.vault), [])
+        self.assertFalse(C.record_path(self.ws).exists())
+
+    def test_a_record_with_rows_never_imports(self):
+        self.add()
+        self.write_relay_env(f"REMOTE_TASK_TOKEN={TOKEN_B}")
+        with unittest.mock.patch.object(C, "import_from_env") as imported:
+            rows = C.list_connections(self.ws, vault=self.vault)
+        imported.assert_not_called()
+        self.assertEqual([r["instance"] for r in rows], ["alpha-fixture-net"])
+
+    def test_a_failing_import_is_logged_and_the_list_still_answers(self):
+        with unittest.mock.patch.object(C, "import_from_env", side_effect=RuntimeError("keychain locked")):
+            with self.assertLogs("connections", level="WARNING") as logs:
+                self.assertEqual(C.list_connections(self.ws, vault=self.vault), [])
+        self.assertIn("RuntimeError", logs.output[0])
+        self.assertNotIn("keychain locked", logs.output[0], "the cause is named by type, never by message")
+
+    def test_a_broken_record_still_raises(self):
+        C.record_path(self.ws).parent.mkdir(parents=True)
+        C.record_path(self.ws).write_text("{broken")
+        with self.assertRaises(C.SchemaError):
+            C.list_connections(self.ws, vault=self.vault)
+
+
 class Record(Base):
     def test_missing_record_lists_empty(self):
         self.assertEqual(self.rows(), [])

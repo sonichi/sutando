@@ -1,6 +1,6 @@
 ---
 name: status-ack
-description: Live-agent runner that tells a requester, once, that their AG2 Space task was received when the core has not answered it by its first-ack deadline, and tells the owner once per outage when only the standby watcher is reading the inbox. Off by default (STATUS_ACK_ENABLED). Not slash-invoked.
+description: Live-agent runner that tells a requester, once, that their AG2 Space task was received when no session has picked it up and no activity card or progress notice shows it by its first-ack deadline, and tells the owner once per outage when only the standby watcher is reading the inbox. Off by default (STATUS_ACK_ENABLED). Not slash-invoked.
 ---
 
 # status-ack
@@ -9,6 +9,17 @@ The core cannot say "received" while it is deep in a long turn or while its sess
 gone. This runner works outside the core's turn. On each pass it decides, per queued task,
 whether the requester is owed one status line. The decision comes from `src/status_ack_policy.py`
 and is made from observed facts only.
+
+## Scope
+
+It speaks only for a task **no session has picked up** (no RUNNING phase, no worker holding it)
+that shows **no activity card** (no row projected or owed in `state/activity/<task>.json`) and
+**no sent progress notice** (task-progress records `progress:<task>:sent` after a send; its first-notify marker is bookkeeping only). The predicate is
+`src/ack_overlap.py`. The gateway asks it again just before it sends the ack, for that ack's own
+outbox item only, so a pickup after publication withdraws the line and nothing else. Anything else is
+the card's and the progress notifier's to report, so this runner stays silent. A task a session
+claimed and then went quiet on is out of scope here. The second thing it does is the owner DM
+when the watcher is down.
 
 ## What it says, and where
 
@@ -45,8 +56,14 @@ and is made from observed facts only.
 | `STATUS_ACK_FIRST_ACK_DEADLINE_URGENT_S` / `_NORMAL_S` / `_LOW_S` | 30 / 120 / 600 | Seconds from intake to the first ack, by task priority |
 | `STATUS_ACK_POLL_S` | 15 | Seconds between passes with `--loop` |
 | `STATUS_ACK_WATCHER_DOWN_AFTER_S` | 120 | How long only a standby must hold the inbox before the owner alert |
+| `STATUS_ACK_PYTHON` | empty | The interpreter sparrowd runs the hosted loop with. Empty: sparrowd skips the worker. |
 
 ## Running
+
+The manifest declares a `supervised_worker` (`scripts/status_ack_worker.py`), so `sparrowd`
+hosts the loop beside the gateway bridge (`skills/MANIFEST.md`). Nothing runs until both are set:
+`STATUS_ACK_PYTHON` names an interpreter, which sparrowd reads when it starts, and
+`STATUS_ACK_ENABLED` is true. While off, the loop reads and writes nothing and keeps waiting.
 
 ```
 python3 skills/status-ack/scripts/status_ack.py --workspace <workspace> [--loop]
@@ -56,7 +73,25 @@ The runner is meant for the always-up live agent. It is not a core-session step,
 or one-shot agents never run it. Each pass prints one JSON report: what it spoke, what it
 withdrew, what it skipped and why, and which claims it settled.
 
+## Restart safety
+
+- **One runner per workspace.** The loop holds `state/status-ack/runner.lock`; a second runner
+  runs no pass while the first holds it.
+- **Startup recovery.** On its first pass, a claim this runner holds from a process that is gone,
+  whose file was never published (not in `results/`, not claimed by the gateway, not in
+  `results/archive/`, no outbox receipt), becomes `unknown`: it is never released and never
+  re-announced. A claim whose file was published is left for the receipt to settle; a claim a
+  live process holds is left alone. Confirmed and unknown claims are never touched.
+- **First-seen.** A task without an intake stamp is anchored at its first sighting, recorded
+  create-only in `state/status-ack/first-seen/`, so a restart neither restarts its deadline nor
+  loses it. Tasks that arrived while the runner was down get at most one line each.
+- **Bounded.** Hourly, first-seen records and ack claims of tasks that left the queue, and
+  alerts of outages that ended, are pruned after seven days; first-seen is also capped. A queued
+  task keeps every record.
+
 ## State
 
 - `<workspace>/state/ack-claims/`: one record per ack key, shared with `task-progress`.
 - `<workspace>/state/status-ack/watcher-outage.json`: when the current standby-only outage began.
+- `<workspace>/state/status-ack/first-seen/`: one create-only record per task, pruned as above.
+- `<workspace>/state/status-ack/runner.lock`: held by the one live runner.

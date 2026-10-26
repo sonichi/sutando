@@ -5,6 +5,8 @@ has ended, is waiting on the owner, or has a cancel pending gets nothing more. A
 withdraws the message; None lets it go. The gateway checks the task's own result itself.
 route_veto() checks the room and thread the message is about to go to against the task's
 HMAC-verified envelope, so a marker in a published file is never an override.
+initial_ack_veto() applies only to the message a task's `ack:<task>:initial` claim names as its
+own: it withdraws that ack when the card or the progress notifier already covers the task.
 """
 from __future__ import annotations
 
@@ -36,6 +38,21 @@ def dispatch_veto(task_id: str, workspace: Optional[Path] = None) -> Optional[st
         if cancel_target(text) == task_id:
             return f"a cancel for the task is pending ({f.name})"
     return None
+
+
+def initial_ack_veto(task_id: str, item_id: str, workspace: Optional[Path] = None, holder=None) -> Optional[str]:
+    """For the outbox item the task's initial-ack claim names (its `via` file), why it would now
+    duplicate the card or a progress notice; None for every other message about the task."""
+    import ack_claim
+    import ack_overlap
+    from status_ack_policy import ack_key
+    ws = Path(workspace) if workspace is not None else resolve_workspace()
+    rec = ack_claim.read(ws, ack_key(task_id))
+    via = rec.get("via") if rec else None
+    if not isinstance(via, str) or not via or not str(item_id).startswith(f"{Path(via).stem}~"):
+        return None
+    veto = ack_overlap.overlap_veto(ws, task_id, holder)
+    return f"initial ack withdrawn: {veto}" if veto else None
 
 
 def route_veto(task_id: str, room: str, thread_root: Optional[str], workspace: Optional[Path] = None) -> Optional[str]:

@@ -14,6 +14,8 @@ confirm (201 / 200 existing / 409 mismatch, token_rejected, vault_key_in_use /
 
 Run: python3 tests/agent-api-connections.test.py
 """
+from _helpers.hermetic_env import isolate_os_environ
+
 import http.client
 import http.server
 import importlib.util
@@ -26,16 +28,14 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+# Isolated before agent-api.py is imported (its WORKSPACE_DIR is read at import), so no outer
+# channel env file can be imported into the temp record by an empty list.
+_WS = tempfile.mkdtemp(prefix="agent-api-connections-")
+isolate_os_environ(SUTANDO_TEST_MODE="1", SUTANDO_WORKSPACE=_WS, SUTANDO_TELEMETRY="0",
+                   SUTANDO_SUPPRESS_CCD_FALLBACK_BANNER="1")
+
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
-
-_WS = tempfile.mkdtemp(prefix="agent-api-connections-")
-# Must be set BEFORE agent-api.py is imported: its WORKSPACE_DIR is read at import.
-os.environ["SUTANDO_TEST_MODE"] = "1"
-os.environ["SUTANDO_WORKSPACE"] = _WS
-os.environ.setdefault("SUTANDO_TELEMETRY", "0")
-os.environ["SUTANDO_SUPPRESS_CCD_FALLBACK_BANNER"] = "1"
-os.environ.pop("SUTANDO_API_TOKEN", None)
 
 
 def _load(name: str, path: Path):
@@ -380,6 +380,25 @@ check("a handler without a bound port still gates on host and bearer",
 status, body = _real("GET", "/api/v1/connections", {}, {}, workspace=WS)
 check("a broken record is 500 with the schema error", status == 500 and "connections.json" in body["error"], (status, body))
 (WS / "state" / "connections.json").unlink()
+
+print("== an empty record lists the token the connect flow wrote to the channel env file ==")
+_HOME = Path(tempfile.mkdtemp(prefix="agent-api-claude-home-"))
+(_HOME / "channels" / "ag2space").mkdir(parents=True)
+(_HOME / "channels" / "ag2space" / "relay-client.env").write_text(f"REMOTE_TASK_TOKEN={TOKEN_A}\n")
+os.environ["CLAUDE_CONFIG_DIR"] = str(_HOME)
+try:
+    s, b, _ = req("GET", "/api/v1/connections")
+finally:
+    os.environ.pop("CLAUDE_CONFIG_DIR", None)
+rows = (b or {}).get("connections") or []
+check("GET on an empty record answers the imported primary row without a restart",
+      s == 200 and [(r["instance"], r["token_ref"], r["primary"], r["added_by"]) for r in rows]
+      == [("", "REMOTE_TASK_TOKEN", True, "env")], f"{s} {b}")
+check("the imported secret went to the vault, never the response",
+      FakeVault.store.get("REMOTE_TASK_TOKEN") == TOKEN_A and no_secret(b))
+check("the row is persisted", (WS / "state" / "connections.json").is_file())
+s, b, _ = req("GET", "/api/v1/connections")
+check("a later GET lists the same row from the record", [r["token_ref"] for r in (b or {}).get("connections", [])] == ["REMOTE_TASK_TOKEN"], b)
 
 server.server_close()
 print()

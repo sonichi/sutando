@@ -984,7 +984,7 @@ class PersonalTest(unittest.TestCase):
 
     def test_roles_take_the_first_contact_payload_as_given(self):
         labels = gs.tour_page.role_labels
-        self.assertEqual(labels("Founder, Sales."), ["Founder", "Sales"])  # cinny-webclient#2231's line
+        self.assertEqual(labels("Founder, Sales."), ["Founder", "Sales"])  # the first-contact "I picked:" line
         self.assertEqual(labels("I picked: Founder, Sales."), ["Founder", "Sales"])  # the whole line
         self.assertEqual(labels("  i PICKED :researcher, founder"), ["Researcher", "Founder"])
         self.assertEqual(labels("Product Manager, Designer."), ["Product Manager", "Designer"])

@@ -46,7 +46,7 @@ def headers(**kw):
 
 
 def obs(**kw):
-    base = dict(task_id="task-1792000000000", headers=headers(), intake_at=T0, phase="RUNNING",
+    base = dict(task_id="task-1792000000000", headers=headers(), intake_at=T0, phase=None,
                 inbox="session")
     base.update(kw)
     return P.TaskObservation(**base)
@@ -153,45 +153,22 @@ holds("timers: no ack before the deadline", not_before_deadline, early)
 holds("timers: the ack is due by deadline + one poll interval", by_deadline_plus_one_poll, late)
 check(P.decide(obs(), T0 + 1).due_at == T0 + NORMAL, "timers: a WAIT names when it becomes due")
 
-# --- Claimed but still running -------------------------------------------------------------------
-def claimed_running_long(decide):
-    r = decide(obs(phase="RUNNING", started_at=T0 + 1, last_activity_at=T0 + 900), T0 + 900)
-    return r.action == P.SPEAK and r.template == "handed_off"
+# --- Scope: unpicked tasks only; a card or progress notice already speaks -------------------------
+def picked_up_or_shown_is_silent(decide):
+    cases = [obs(phase="RUNNING", started_at=T0 + 1, last_activity_at=T0 + 900), obs(worker_holder="worker-2"),
+             obs(card=True), obs(phase="QUEUED", card=True), obs(progress_notice=True)]
+    return all(decide(o, T0 + 10 * NORMAL).action == P.SUPPRESS for o in cases)
 
 
-def delegated_to_worker(decide):
-    r = decide(obs(phase=None, worker_holder="worker-2"), T0 + NORMAL)
-    return r.action == P.SPEAK and r.template == "handed_off"
+def speaks_regardless_of_pickup(o, now, deadlines=None):
+    return P.decide(dataclasses.replace(o, phase=None, worker_holder=None, card=False, progress_notice=False),
+                    now, deadlines)
 
 
-def claim_means_covered(o, now, deadlines=None):
-    if o.phase == "RUNNING" or o.worker_holder:
-        return P.Decision(P.SUPPRESS, "claimed", P.ack_key(o.task_id))
-    return P.decide(o, now, deadlines)
-
-
-holds("claimed_running_long: handed off, running, unanswered past the deadline acks", claimed_running_long,
-      claim_means_covered)
-holds("claimed: a task a worker holds is covered too", delegated_to_worker, claim_means_covered)
-
-def handoff_wording_ignores_activity(decide):
-    # RUNNING is hand-off, not engagement: fresh activity must not change the claim or the deadline.
-    quiet = decide(obs(phase="RUNNING"), T0 + NORMAL)
-    busy = decide(obs(phase="RUNNING", last_activity_at=T0 + NORMAL - 1), T0 + NORMAL)
-    return quiet.text == busy.text and quiet.due_at == busy.due_at == T0 + NORMAL
-
-
-def engagement_wording(o, now, deadlines=None):
-    r = P.decide(o, now, deadlines)
-    if r.action == P.SPEAK and o.last_activity_at:
-        return dataclasses.replace(r, text="Received. This is being worked on.")
-    return r
-
-
-holds("hand-off: the RUNNING line is the same with or without fresh activity", handoff_wording_ignores_activity,
-      engagement_wording)
-check(not any(w in P.TEMPLATES.get("handed_off", "worked on").lower() for w in ("worked on", "working", "progress")) and "handed_off" in P.TEMPLATES,
-      "hand-off: the line never claims the work is under way")
+holds("scope: a picked-up task, or one with a card or progress notice, gets no line",
+      picked_up_or_shown_is_silent, speaks_regardless_of_pickup)
+check(P.decide(obs(), T0 + NORMAL).action == P.SPEAK, "scope: an unpicked task with no card still gets its line")
+check("handed_off" not in P.TEMPLATES, "scope: no template reports a picked-up task")
 
 # --- Thread routing: the task's own verified room and thread, never a fallback -------------------
 def in_thread_keeps_root(decide):
@@ -270,7 +247,7 @@ SUPPRESSING = [
 
 
 def ignores_outcome(o, now, deadlines=None):
-    return P.decide(dataclasses.replace(o, result="none", phase="RUNNING", cancel_instruction=False,
+    return P.decide(dataclasses.replace(o, result="none", phase=None, cancel_instruction=False,
                                         cancel_requested=False, ack="none"), now, deadlines)
 
 
@@ -328,8 +305,7 @@ check(not any(ch.isdigit() for t in P.TEMPLATES.values() for ch in t)
 r = P.decide(obs(phase=None, inbox="standby_only"), T0 + NORMAL)
 check(r.watcher_down and r.template == "inbox_down", "watcher down: only a standby holds the inbox -> says so")
 r = P.decide(obs(phase="RUNNING", inbox="standby_only"), T0 + NORMAL)
-check(not r.watcher_down and r.template == "handed_off",
-      "watcher down: a task already claimed is not reported as unread")
+check(r.action == P.SUPPRESS and not r.watcher_down, "watcher down: a task already claimed gets no room line")
 check(P.inbox_state(True, ["standby"]) == "standby_only", "inbox: a tagged standby alone is standby_only")
 check(P.inbox_state(True, ["untagged"]) == "standby_only", "inbox: the untagged external standby counts too")
 check(P.inbox_state(True, ["standby", "session"]) == "session", "inbox: any session holder means session")

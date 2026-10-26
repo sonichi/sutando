@@ -12,12 +12,18 @@ notify also takes, then re-check the task. An ack counts as sent only once the o
 its DELIVERED receipt. While only a standby watcher holds the inbox past a threshold, the
 owner gets one DM naming the remedy, once per outage.
 
+It speaks only for a task no session has picked up that shows no activity card and no progress
+notice; a picked-up task is the card's and the progress notifier's to report.
+
 Off unless STATUS_ACK_ENABLED is true (CLI > env > manifest config, skills/MANIFEST.md).
+`serve()` is the hosted loop (scripts/status_ack_worker.py, the manifest's supervised_worker):
+one live runner per workspace, a startup recovery pass, then a pass per poll.
 Usage: status_ack.py --workspace <ws> [--loop] [--enabled 1]
 """
 from __future__ import annotations
 
 import argparse
+import fcntl
 import importlib.util
 import json
 import os
@@ -31,10 +37,13 @@ SKILL_DIR = Path(__file__).resolve().parents[1]
 # parents[3] is the checkout this skill ships in; its src/ and scripts/ are the core it observes.
 _REPO = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(_REPO / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import ack_claim
+import ack_overlap
 import local_record
 import proactive_routing
+import skill_config
 import status_ack_policy as policy
 from activity_bus import cancel_target
 from outbox import list_items
@@ -44,6 +53,8 @@ from result_publish import publish_text
 from task_archive import find_task_file
 from task_envelope import attested_task_headers, verify_text
 
+import first_seen
+
 HOLDER = "status-ack"
 CFG_ENABLED = "STATUS_ACK_ENABLED"
 CFG_DEADLINE = {"urgent": "STATUS_ACK_FIRST_ACK_DEADLINE_URGENT_S",
@@ -51,31 +62,21 @@ CFG_DEADLINE = {"urgent": "STATUS_ACK_FIRST_ACK_DEADLINE_URGENT_S",
                 "low": "STATUS_ACK_FIRST_ACK_DEADLINE_LOW_S"}
 CFG_POLL = "STATUS_ACK_POLL_S"
 CFG_WATCHER_DOWN = "STATUS_ACK_WATCHER_DOWN_AFTER_S"
-_TRUE = ("1", "true", "yes", "on")
 #: Sources with no attested Matrix room and event: never acknowledged here.
 NON_MATRIX_SOURCES = frozenset({"discord", "telegram", "slack", "voice", "phone", "whatsapp", "imessage"})
+#: How often the hosted loop prunes first-seen and ack-claim records of tasks that left the queue.
+PRUNE_EVERY_S = 3600.0
 OWNER_ALERT = ("The core is not reading its task inbox: only the standby watcher holds it, and {n} "
                "task(s) are waiting unread. To fix it, restart the core.")
 
 
 def manifest_config(manifest: Optional[Path] = None) -> dict:
-    try:
-        data = json.loads((manifest or SKILL_DIR / "manifest.json").read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
-    cfg = data.get("config") if isinstance(data, dict) else None
-    return cfg if isinstance(cfg, dict) else {}
+    return skill_config.manifest_config(manifest or SKILL_DIR / "manifest.json")
 
 
 def config_value(key: str, cli=None, environ=None, manifest_cfg=None) -> str:
     """CLI > env > manifest config; an empty value counts as unset."""
-    if cli is not None and str(cli).strip():
-        return str(cli).strip()
-    env = os.environ if environ is None else environ
-    if str(env.get(key) or "").strip():
-        return str(env[key]).strip()
-    cfg = manifest_config() if manifest_cfg is None else manifest_cfg
-    return str(cfg.get(key) or "").strip()
+    return skill_config.config_value(key, SKILL_DIR / "manifest.json", cli, environ, manifest_cfg)
 
 
 def _positive(raw: str, default: float) -> float:
@@ -97,14 +98,20 @@ class Settings:
 def settings(enabled=None, environ=None, manifest_cfg=None) -> Settings:
     get = lambda k, c=None: config_value(k, c, environ, manifest_cfg)  # noqa: E731
     deadlines = {p: _positive(get(k), policy.DEFAULT_FIRST_ACK_DEADLINE_S[p]) for p, k in CFG_DEADLINE.items()}
-    return Settings(enabled=get(CFG_ENABLED, enabled).lower() in _TRUE, deadlines=deadlines,
+    return Settings(enabled=get(CFG_ENABLED, enabled).lower() in skill_config.TRUE, deadlines=deadlines,
                     poll_s=_positive(get(CFG_POLL), 15.0), watcher_down_after_s=_positive(get(CFG_WATCHER_DOWN), 120.0))
 
 
+_PROBE = []
+
+
 def _load_probe():
+    if _PROBE:
+        return _PROBE[0]
     spec = importlib.util.spec_from_file_location("unanswered_tasks_probe", _REPO / "scripts" / "unanswered-tasks.py")
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
+    _PROBE.append(mod)
     return mod
 
 
@@ -228,7 +235,7 @@ def watch_inbox(ws: Path, snap: dict, cfg: Settings, now: float) -> Optional[str
     if now - outage["since"] < cfg.watcher_down_after_s:
         return None
     key = _alert_key(outage)
-    gen = ack_claim.claim(ws, key, HOLDER, now=now)
+    gen = ack_claim.claim(ws, key, HOLDER, now=now, pid=os.getpid())
     if not gen:
         return None
     waiting = sum(1 for t in snap.get("tasks") or [] if t.get("unclaimed_age_s") is not None)
@@ -238,7 +245,7 @@ def watch_inbox(ws: Path, snap: dict, cfg: Settings, now: float) -> Optional[str
     return name
 
 
-def observe(ws: Path, row: dict, inbox: str, alerted: bool):
+def observe(ws: Path, row: dict, inbox: str, alerted: bool, now: Optional[float] = None):
     """(TaskObservation, None) or (None, why this task is not considered at all)."""
     tid, own_file = row["task_id"], row.get("file") or f"{row['task_id']}.txt"
     text = _read(ws / "tasks" / own_file)
@@ -249,12 +256,15 @@ def observe(ws: Path, row: dict, inbox: str, alerted: bool):
         return None, "the task envelope is not verified"
     if (headers.get("source") or "").strip().lower() in NON_MATRIX_SOURCES:
         return None, "not a Matrix source"
+    seen = first_seen.record(ws, tid, time.time() if now is None else now)
+    intake = row.get("intake_at") if seen == first_seen.UNREADABLE else policy.intake_at(tid, headers, seen)
     return policy.TaskObservation(
-        task_id=tid, headers=headers, intake_at=row.get("intake_at"), phase=row.get("phase"),
+        task_id=tid, headers=headers, intake_at=intake, phase=row.get("phase"),
         result=result_state(ws, tid, bool(row.get("answered"))), ack=ack_claim.state(ws, policy.ack_key(tid)),
         worker_holder=row.get("holder"), inbox=inbox,
         cancel_instruction=cancel_target(text) is not None,
-        cancel_requested=cancel_pending(ws, tid, own_file), owner_alerted=alerted), None
+        cancel_requested=cancel_pending(ws, tid, own_file), owner_alerted=alerted,
+        card=ack_overlap.card_shown(ws, tid), progress_notice=ack_overlap.progress_shown(ws, tid)), None
 
 
 def routed_body(decision) -> Optional[str]:
@@ -268,11 +278,19 @@ def routed_body(decision) -> Optional[str]:
     return body
 
 
+def worker_holder(ws: Path, tid: str):
+    """The probe's own worker-holder lookup (it delegates to worker-pool); raising means unreadable."""
+    return _load_probe()._holder(ws, tid)
+
+
 def recheck(ws: Path, tid: str) -> Optional[str]:
     """Why an ack decided a moment ago must not be published now, or None."""
     state = result_state(ws, tid)
     if state != "none":
         return f"result state is now {state}"
+    overlap = ack_overlap.overlap_veto(ws, tid, worker_holder)
+    if overlap is not None:
+        return overlap
     try:
         veto = dispatch_veto(tid, ws)
     except Exception as exc:  # noqa: BLE001 - an unchecked task is never messaged
@@ -307,7 +325,7 @@ def run_once(ws: Path, cfg: Settings, now: Optional[float] = None, holders=None,
     inbox, alerted = (snap.get("inbox") or {}).get("state") or "unknown", owner_alerted(ws)
     for row in snap.get("tasks") or []:
         tid = row["task_id"]
-        obs, why = observe(ws, row, inbox, alerted)
+        obs, why = observe(ws, row, inbox, alerted, now)
         if obs is None:
             report.skipped[tid] = why
             continue
@@ -315,7 +333,8 @@ def run_once(ws: Path, cfg: Settings, now: Optional[float] = None, holders=None,
         if decision.action != policy.SPEAK:
             report.skipped[tid] = decision.reason
             continue
-        gen = ack_claim.claim(ws, decision.key, HOLDER, now=now, template=decision.template)
+        name = proactive_routing.about_task_filename(tid, _stamp_ms(now), channel="ag2space")
+        gen = ack_claim.claim(ws, decision.key, HOLDER, now=now, template=decision.template, pid=os.getpid(), via=name)
         if not gen:
             report.skipped[tid] = "another sender holds the initial ack"
             continue
@@ -331,11 +350,119 @@ def run_once(ws: Path, cfg: Settings, now: Optional[float] = None, holders=None,
             ack_claim.release(ws, decision.key, HOLDER, gen=_gen(gen))
             report.withdrawn[tid] = "the verified thread could not be carried"
             continue
-        name = proactive_routing.about_task_filename(tid, _stamp_ms(now), channel="ag2space")
         publish_text(ws / "results" / name, body)
-        ack_claim.update(ws, decision.key, HOLDER, gen=_gen(gen), via=name)
         report.spoken.append(tid)
     return report
+
+
+def _pid_alive(pid) -> bool:
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def _published(ws: Path, via) -> bool:
+    """True when the claim's file is in results/, claimed by the gateway, archived after delivery
+    (`archive/<via>` or the bridge's `archive/<stem>-<ts>.txt`), or has an outbox receipt."""
+    if not isinstance(via, str) or not via:
+        return False
+    results, stem = ws / "results", Path(via).stem
+    archive = results / "archive"
+    return ((results / via).exists() or any(results.glob(f"{stem}.sending*"))
+            or (archive / via).exists() or any(archive.glob(f"{stem}-[0-9]*.txt"))
+            or _receipt(ws, via) is not None)
+
+
+def recover(ws: Path) -> list:
+    """Startup: a claim this runner holds whose file was never published (or that names none),
+    from a process that is gone, becomes unknown: it is never released or re-announced. A claim
+    whose file is published is left for reconcile(); a live process's claim is left alone."""
+    settled = []
+    for rec in ack_claim.held_by(ws, HOLDER, "claimed"):
+        if (rec.get("pid") != os.getpid() and _pid_alive(rec.get("pid"))) or _published(ws, rec.get("via")):
+            continue
+        if ack_claim.update(ws, rec["key"], HOLDER, "unknown", gen=rec.get("gen"),
+                            reason="the runner stopped between claim and publish"):
+            settled.append((rec["key"], "unknown"))
+    return settled
+
+
+def _queued(ws: Path):
+    tasks = ws / "tasks"
+    if not tasks.is_dir():
+        return lambda tid: True
+    return lambda tid: find_task_file(tasks, tid) is not None
+
+
+def prune(ws: Path, now: float) -> dict:
+    """Bound the runner's records: first-seen and ack claims of tasks that left the queue, and
+    alerts of outages that ended, once past retention. A queued task keeps every record."""
+    queued, outage = _queued(ws), _outage(ws)
+    current = _alert_key(outage) if outage else None
+
+    def keep(rec: dict) -> bool:
+        kind, subject, _ = rec["key"].split(":")
+        if kind in ("ack", "progress"):
+            return queued(subject)
+        if kind == "alert":
+            return rec["key"] == current
+        return True
+
+    return {"first_seen": first_seen.prune(ws, queued, now),
+            "claims": ack_claim.prune(ws, keep, now, first_seen.RETENTION_S)}
+
+
+def runner_lock(ws: Path):
+    """The open lock file when this process is now the workspace's one live runner, else None."""
+    path = ws / "state" / "status-ack" / "runner.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fh = open(path, "a")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        fh.close()
+        return None
+    return fh
+
+
+def serve(ws: Path, settings_fn: Callable[[], Settings] = settings, passes: Optional[int] = None,
+          clock: Optional[Callable[[], float]] = None, sleep: Optional[Callable[[float], None]] = None,
+          holders=None, emit: Optional[Callable[[dict], None]] = None):
+    """The hosted loop. Settings are re-read every pass; while off it touches nothing and keeps
+    waiting, so a supervisor never sees it exit. Recovery runs once, under the runner lock."""
+    clock, sleep = clock or time.time, sleep or time.sleep
+    emit = emit or (lambda d: print(json.dumps(d, sort_keys=True, default=str), flush=True))
+    ws, lock, recovered, last_prune, n = Path(ws), None, None, None, 0
+    try:
+        while passes is None or n < passes:
+            n += 1
+            cfg = settings_fn()
+            if cfg.enabled and lock is None:
+                lock = runner_lock(ws)
+            if not cfg.enabled:
+                emit({"enabled": False})
+            elif lock is None:
+                emit({"enabled": True, "skipped": {"*": "another runner holds this workspace"}})
+            else:
+                now, first = clock(), recovered is None
+                if first:
+                    recovered = recover(ws)
+                report = run_once(ws, cfg, now=now, holders=holders).__dict__
+                if first:
+                    report["recovered"] = recovered
+                if last_prune is None or now - last_prune >= PRUNE_EVERY_S:
+                    report["pruned"], last_prune = prune(ws, now), now
+                emit(report)
+            sleep(cfg.poll_s)
+    finally:
+        if lock is not None:
+            lock.close()
 
 
 def main(argv=None) -> int:
@@ -344,13 +471,12 @@ def main(argv=None) -> int:
     ap.add_argument("--enabled", default=None, help=f"overrides {CFG_ENABLED}")
     ap.add_argument("--loop", action="store_true", help="repeat every STATUS_ACK_POLL_S seconds")
     a = ap.parse_args(argv)
-    cfg = settings(enabled=a.enabled)
-    while True:
-        r = run_once(Path(a.workspace), cfg)
-        print(json.dumps(r.__dict__, sort_keys=True, default=str), flush=True)
-        if not (a.loop and cfg.enabled):
-            return 0
-        time.sleep(cfg.poll_s)
+    if a.loop:
+        serve(Path(a.workspace), lambda: settings(enabled=a.enabled))
+        return 0
+    r = run_once(Path(a.workspace), settings(enabled=a.enabled))
+    print(json.dumps(r.__dict__, sort_keys=True, default=str), flush=True)
+    return 0
 
 
 if __name__ == "__main__":

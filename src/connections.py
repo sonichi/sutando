@@ -31,6 +31,7 @@ matches only its own gateway host, and a later identity re-keys it in place, slu
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import signal
@@ -572,9 +573,24 @@ def _find(rows: list, instance: str) -> dict:
 
 # ── API ──────────────────────────────────────────────────────────────────────
 
-def list_connections(workspace: Optional[Path] = None) -> list:
-    """Every row, validated; [] when no record exists."""
-    return _read(record_path(workspace))
+def list_connections(workspace: Optional[Path] = None, *, vault=None) -> list:
+    """Every row, validated; [] when no record exists.
+
+    An uninitialized record (no file yet) first takes what `import_from_env` finds, so a token the
+    connect flow wrote after the engine started shows up on the next list. A record that exists
+    but is empty is left alone: its rows were removed on purpose, and a lingering token must not
+    bring them back. An import that fails is logged and the list still answers; a record that
+    fails validation raises as before."""
+    path = record_path(workspace)
+    rows = _read(path)
+    if rows or path.exists():
+        return rows
+    try:
+        if import_from_env(workspace=workspace, vault=vault):
+            rows = _read(path)
+    except Exception as e:  # noqa: BLE001 - the list answers even when nothing could be imported
+        logging.getLogger(__name__).warning("connections: import on an empty record failed (%s)", type(e).__name__)
+    return rows
 
 
 def removed_env_refs(workspace: Optional[Path] = None) -> list:
@@ -731,10 +747,26 @@ def env_token_vars(environ: Mapping[str, str]) -> list:
     return out
 
 
+def primary_token_from_channel_file(environ: Mapping[str, str]) -> str:
+    """The relay token (`url|secret`) the AG2 Space channel env file holds under either relay
+    spelling, read through the resolver `scripts/channel-env.sh` uses; '' when the environment
+    names one itself, when no file resolves, or when the file holds none."""
+    try:
+        from channel_credentials import channel_credentials
+        from channel_token import RELAY_TOKEN_VARS
+        found = channel_credentials(RELAY_TOKEN_VARS, environ)
+    except Exception:  # noqa: BLE001 - no channel home or an unreadable file is simply no token
+        return ""
+    return next((found[var].strip() for var in RELAY_TOKEN_VARS if found.get(var)), "")
+
+
 def import_from_env(environ: Optional[Mapping[str, str]] = None, *,
                     workspace: Optional[Path] = None, vault=None, resolver=None) -> list:
     """Create a row once for REMOTE_TASK_TOKEN and each AG2_REMOTE_TOKEN_<INST>; existing rows stay.
 
+    The REMOTE_TASK_TOKEN row comes from the environment, else from the channel env file the
+    connect flow writes (`primary_token_from_channel_file`): a desktop install signs in after
+    the engine started, so the token reaches the file but never this process's environment.
     Env rows are unverified: the resolver's server when it knows the host, else the host. Only
     the REMOTE_TASK_TOKEN row (the legacy unsuffixed bridge) can become primary, and only when
     the install has none; a named env token never does, so no secondary ever inherits the
@@ -744,7 +776,7 @@ def import_from_env(environ: Optional[Mapping[str, str]] = None, *,
     """
     environ = os.environ if environ is None else environ
     candidates = []
-    primary_token = environ.get(PRIMARY_TOKEN_REF, "").strip()
+    primary_token = environ.get(PRIMARY_TOKEN_REF, "").strip() or primary_token_from_channel_file(environ)
     if gateway_url_of(primary_token):
         candidates.append(("", PRIMARY_TOKEN_REF, primary_token))
     for inst, var in env_token_vars(environ):
@@ -974,7 +1006,7 @@ def reconnect(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Ma
     answers to now (a provisional row is re-keyed), then `launch`."""
     stopped = stop_bridge(instance, workspace=workspace, kill=kill)
     environ = os.environ if environ is None else environ
-    rows = {r["instance"]: r for r in list_connections(workspace)}
+    rows = {r["instance"]: r for r in list_connections(workspace, vault=vault)}
     if instance in rows:
         ref = rows[instance]["token_ref"]
         token = (environ.get(ref) or "").strip() or _vault_get(_vault(vault), ref)

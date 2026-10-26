@@ -44,23 +44,24 @@ class Lane:
         p.write_text(body, encoding="utf-8")
         return p
 
-    def drain(self, gate=None, route_gate=None) -> None:
+    def drain(self, gate=None, route_gate=None, ack_gate=None) -> None:
         gb = self.gb
         saved = (gb.RESULTS_DIR, gb.ARCHIVE_RESULTS_DIR, gb.UNDELIVERABLE_RESULTS_DIR, gb.TASKS_DIR,
                  gb.PROACTIVE_ROOM, gb._req, gb.PROACTIVE_CLAIM_GATE, gb._log,
-                 getattr(gb, "PROACTIVE_DISPATCH_GATE", None), getattr(gb, "PROACTIVE_ROUTE_GATE", None))
+                 getattr(gb, "PROACTIVE_DISPATCH_GATE", None), getattr(gb, "PROACTIVE_ROUTE_GATE", None),
+                 getattr(gb, "PROACTIVE_ACK_GATE", None))
         gb.RESULTS_DIR, gb.ARCHIVE_RESULTS_DIR = self.results, self.results / "archive"
         gb.UNDELIVERABLE_RESULTS_DIR, gb.TASKS_DIR = self.results / "undelivered", self.tasks
         gb.PROACTIVE_ROOM, gb._req, gb.PROACTIVE_CLAIM_GATE = self.owner_dm, self._req, None
         gb._log, gb.PROACTIVE_DISPATCH_GATE = self.logs.append, gate
-        gb.PROACTIVE_ROUTE_GATE = route_gate
+        gb.PROACTIVE_ROUTE_GATE, gb.PROACTIVE_ACK_GATE = route_gate, ack_gate
         gb._ROUTING.update(owner_dm=self.owner_dm, loaded=True, next=gb.time.time() + 3600)
         try:
             gb._post_proactive()
         finally:
             (gb.RESULTS_DIR, gb.ARCHIVE_RESULTS_DIR, gb.UNDELIVERABLE_RESULTS_DIR, gb.TASKS_DIR,
              gb.PROACTIVE_ROOM, gb._req, gb.PROACTIVE_CLAIM_GATE, gb._log,
-             gb.PROACTIVE_DISPATCH_GATE, gb.PROACTIVE_ROUTE_GATE) = saved
+             gb.PROACTIVE_DISPATCH_GATE, gb.PROACTIVE_ROUTE_GATE, gb.PROACTIVE_ACK_GATE) = saved
             gb._ROUTING.update(owner_dm="", loaded=False, next=0.0)
 
     def backend(self):

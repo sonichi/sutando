@@ -199,7 +199,7 @@ def connections_http(method: str, path: str, body: dict, query: Optional[dict] =
     parts = [x for x in path[len(CONNECTIONS_PREFIX):].split("/") if x]
     try:
         if method == "GET" and not parts:
-            rows = _connections.list_connections(ws)
+            rows = _connections.list_connections(ws, vault=vault)
             return 200, {"connections": [_connections.status_for(r, ws) for r in rows]}
         if method == "POST" and not parts:
             token = body.get("token")
@@ -1317,9 +1317,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         """Check API token if configured. Returns True if authorized."""
         if not API_TOKEN:
             return True  # No token = no auth required (local use)
-        import hmac as _hmac
-        token = self.headers.get("Authorization", "").replace("Bearer ", "")
-        if _hmac.compare_digest(token, API_TOKEN):
+        if local_api_gate.bearer_matches(self.headers.get("Authorization", ""), API_TOKEN):
             return True
         self.send_json(401, {"error": "unauthorized"})
         return False

@@ -136,6 +136,11 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_response(429); self.end_headers(); return
             n = int(self.headers.get("Content-Length") or 0)
             STATE["room_posts"].append(json.loads(self.rfile.read(n).decode()))
+            if STATE["room_posts"][-1].get("op") == "members":  # pragma: no cover - the server thread is outside the gate's trace
+                STATE["room_posts"].pop()
+                body = json.dumps({"members": [{"user_id": "@agent-t:example.org"}, {"user_id": "@owner:example.org"}]}).encode()
+                self.send_response(200); self.send_header("Content-Type", "application/json")
+                self.end_headers(); self.wfile.write(body); return
             if STATE["force_room_400_body"] is not None:  # pragma: no cover - the server thread is outside the gate's trace
                 body = json.dumps(STATE["force_room_400_body"]).encode()
                 self.send_response(400)
@@ -1356,8 +1361,35 @@ def main() -> int:
           "sutando loader wires the ag2space proactive claim gate")
     check(getattr(rtc.PROACTIVE_DISPATCH_GATE, "__name__", "") == "_ag2space_proactive_dispatch_gate"
           and "left the queue" in str(rtc.PROACTIVE_DISPATCH_GATE("task-1761300000000"))
-          and getattr(rtc.PROACTIVE_ROUTE_GATE, "__name__", "") == "_ag2space_proactive_route_gate",
-          "sutando loader wires the dispatch and route gates; a task not in the queue is withdrawn")
+          and getattr(rtc.PROACTIVE_ROUTE_GATE, "__name__", "") == "_ag2space_proactive_route_gate"
+          and rtc.PROACTIVE_ACK_GATE is None,
+          "sutando loader wires the dispatch and route gates, and no ack gate while status-ack is off")
+    _on = rtc._status_ack_gate({"STATUS_ACK_ENABLED": "1"})
+    _saved_sc = sys.modules.get("skill_config")
+    sys.modules["skill_config"] = None
+    try:
+        _broken = rtc._status_ack_gate({"STATUS_ACK_ENABLED": "1"})
+    finally:
+        if _saved_sc is None:
+            sys.modules.pop("skill_config", None)
+        else:
+            sys.modules["skill_config"] = _saved_sc
+    check(_on is rtc._ag2space_proactive_ack_gate and _on("task-1761300000000", "proactive-x~0") is None
+          and rtc._status_ack_gate({"STATUS_ACK_ENABLED": "0"}) is None and _broken is None,
+          "the ack gate is installed only when status-ack is on; an unreadable switch installs none")
+    import proactive_dispatch_gate as _pdg
+    _seen, _real_veto = [], _pdg.initial_ack_veto
+    _pdg.initial_ack_veto = lambda *a, **k: _seen.append(a) or None
+    try:
+        _on("task-1761300000000", "proactive-x~0")
+    finally:
+        _pdg.initial_ack_veto = _real_veto
+    _hws = Path(tempfile.mkdtemp(prefix="ack-gate-holder-"))
+    (_hws / "deliveries" / "worker1").mkdir(parents=True)
+    (_hws / "deliveries" / "worker1" / "task-1761300000000.accepted").write_text("")
+    check(_seen and _seen[0][3] is rtc._ag2space_worker_holder
+          and rtc._ag2space_worker_holder(_hws, "task-1761300000000") == "worker1",
+          "the ack gate is given the worker-holder lookup, which reads a delivery sentinel")
     _activity = rtc.WS / "state" / "last-owner-activity.json"
     _activity.parent.mkdir(parents=True, exist_ok=True)
     _activity.write_text(json.dumps(
@@ -1639,7 +1671,7 @@ def main() -> int:
     _rec = json.loads(rtc._routing_file().read_text())
     check(_rec == {"identity": "@agent-t:example.org", "gateway": rtc._redact_url(rtc.URL),
                    "binding": rtc.gateway_instance.binding_digest("@agent-t:example.org", rtc.URL),
-                   "owner_dm": "!dm:example.org"} and len(_rec["binding"]) == 64,
+                   "owner_dm": "!dm:example.org", "private": True} and len(_rec["binding"]) == 64,
           "the reading is persisted under the state dir, bound to this identity and this gateway")
     _real_replace = rtc.os.replace; _faults = []
     def _fail_routing_once(src, dst):

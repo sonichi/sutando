@@ -684,24 +684,39 @@ def _gateway_owner() -> str:
     return gateway_instance.owner_mxid(owner, identity)
 
 
+def _owner_dm_is_private(room: str, owner: str) -> "bool | None":
+    """Whether only the agent and its owner are in `room`; None when the gateway cannot say."""
+    agent = _reenroll_identity()
+    if not (room and owner and agent):
+        return None
+    try:
+        answer = _req("POST", "/v1/room", {"op": "members", "room_id": room}, timeout=10)
+    except Exception:  # noqa: BLE001 - unreadable is undecided, never private
+        return None
+    if not isinstance(answer, dict) or answer.get("error") or not isinstance(answer.get("members"), list):
+        return None
+    members = {r.get("user_id") for r in answer["members"] if isinstance(r, dict)}
+    return bool(members) and members <= {agent, owner}
+
+
 def _owner_review_dm(owner: str) -> str:
-    if _GATEWAY_OWNER_DM_HINT:
+    if _GATEWAY_OWNER_DM_HINT and _owner_dm_is_private(_GATEWAY_OWNER_DM_HINT, owner) is True:
         _atomic_private_json(_WITHHELD_DM_CACHE,
-                             {"owner": owner, "room_id": _GATEWAY_OWNER_DM_HINT})
+                             {"owner": owner, "room_id": _GATEWAY_OWNER_DM_HINT, "private": True})
         return _GATEWAY_OWNER_DM_HINT
     cached = _read_private_json(_WITHHELD_DM_CACHE) or {}
     room = gateway_instance.owner_room(cached.get("room_id"), _reenroll_identity())
-    if cached.get("owner") == owner and room:
-        return room
+    if cached.get("owner") == owner and room and cached.get("private") is True:
+        return room  # an unmarked cache predates the membership check and may name a shared room
     answer = _req("POST", "/v1/room", {
         "op": "create", "invite": [owner], "is_direct": True,
         "name": "Private result reviews",
         "topic": "Owner-only review of results withheld from shared rooms.",
-    }, timeout=20)
+    }, timeout=_ROOM_POST_TIMEOUT_S)
     room = gateway_instance.owner_room((answer or {}).get("room_id"), _reenroll_identity())
     if not room:
         raise RuntimeError("gateway did not return a private review room")
-    _atomic_private_json(_WITHHELD_DM_CACHE, {"owner": owner, "room_id": room})
+    _atomic_private_json(_WITHHELD_DM_CACHE, {"owner": owner, "room_id": room, "private": True})
     return room
 
 
@@ -781,7 +796,7 @@ def _route_withheld_review(path: Path) -> bool:
             # Non-AG2 clients ignore it and retain the typed Yes/No fallback.
             payload["extra_content"] = {
                 "space.ag2.a2ui": _review_buttons(str(record["review_id"]))}
-        answer = _req("POST", "/v1/room", payload, timeout=20)
+        answer = _req("POST", "/v1/room", payload, timeout=_ROOM_POST_TIMEOUT_S)
         if not isinstance(answer, dict) or not answer.get("ok"):
             raise RuntimeError(f"private review DM part {index}/{len(messages)} was not accepted")
     record.update({"status": "awaiting_owner", "owner": owner, "dm_room_id": room,
@@ -953,8 +968,8 @@ def _post_room_message(room: str, body: str, dedupe_key: str, thread_root: "str 
     `deadline` (time.monotonic()) when one is given."""
     return _req("POST", "/v1/room", {"op": "message", "room_id": room, "body": body,
                                      "dedupe_key": dedupe_key,
-                                     **({"thread_root": thread_root} if thread_root else {})}, timeout=20,
-                **({"deadline": deadline} if deadline is not None else {}))
+                                     **({"thread_root": thread_root} if thread_root else {})},
+                timeout=_ROOM_POST_TIMEOUT_S, **({"deadline": deadline} if deadline is not None else {}))
 
 
 def _record_release_receipt(item_id: str, event_id: str) -> None:
@@ -1150,7 +1165,7 @@ def _edit_review_card(record: dict) -> "dict | None":
     answer = _req("POST", "/v1/room", {
         "op": "edit", "room_id": room, "event_id": event_id,
         "body": _resolved_review_body(record),
-    }, timeout=20)
+    }, timeout=_ROOM_POST_TIMEOUT_S)
     if (not isinstance(answer, dict) or room_response_refused(answer)
             or not (answer.get("ok") or answer.get("event_id"))):
         return None
@@ -1595,7 +1610,7 @@ def _project_claude_local(mods, room: str, log=print) -> list:
                 store.save(req, store.projection(req.id))
     if not projector.pending_ids(manager):
         return []
-    return projector.project(manager, lambda payload: _req("POST", "/v1/room", payload, timeout=20), room)
+    return projector.project(manager, lambda payload: _req("POST", "/v1/room", payload, timeout=_ROOM_POST_TIMEOUT_S), room)
 
 
 def _project_hitl(log=print) -> int:
@@ -1631,7 +1646,7 @@ def _project_hitl(log=print) -> int:
     # Each store gets its pass: a stuck card in one never holds back the other's.
     try:
         if pending_ids(manager):
-            got = project(manager, lambda payload: _req("POST", "/v1/room", payload, timeout=20), room)
+            got = project(manager, lambda payload: _req("POST", "/v1/room", payload, timeout=_ROOM_POST_TIMEOUT_S), room)
             done, failed = list(got or []), not got
     except Exception as e:  # noqa: BLE001 — re-raised below, after the claude-local pass
         failed, raised = True, e
@@ -1859,6 +1874,15 @@ ON_TASK_CMD = os.environ.get("REMOTE_TASK_ON_TASK") or ""
 # A read timeout on the long poll is indistinguishable from the documented
 # `200 {"tasks": []}` hold-window expiry, so it is only an outage once no poll
 POLL_TIMEOUT_GRACE_S = 3 * (POLL_WAIT + 10)
+# Backoff alone caps at 60s and never gives up, so a relay that stays down
+# leaves a live process polling into the void. 0 disables the exit.
+POLL_STALL_EXIT_S = float(os.environ.get("REMOTE_TASK_POLL_STALL_EXIT_S") or "600")
+# Exiting only helps where something restarts us. startup-runtime.sh launches the
+# primary and every named lane as a bare `&`, so the owner must be declared here.
+POLL_STALL_RESTART_OWNER = (os.environ.get("SUTANDO_BRIDGE_RESTART_OWNER") or "").strip()
+# EX_UNAVAILABLE: the wrapper relaunches on it without an owner alert, so an outage
+# does not queue a "bridge restarted" message every stall period.
+POLL_STALL_EXIT_CODE = 69
 # Proactive-message drain: when REMOTE_PROACTIVE_ROOM names a room id, every
 # `results/proactive-*.txt` the agent writes is delivered to that room as a
 _PROACTIVE_ROOM_ENV = os.environ.get("REMOTE_PROACTIVE_ROOM")
@@ -1879,11 +1903,13 @@ OWNER_DM_UPGRADED_NOTIFY: Callable[[str, str], None] | None = None
 # Host-injected task_id -> veto reason or None, asked right before a message about that task
 # is sent; None (standalone default) checks only the task's own result.
 PROACTIVE_DISPATCH_GATE: Callable[[str], "str | None"] | None = None
+# Host-injected (task_id, item_id) -> veto reason or None, asked for the same message with its item id.
+PROACTIVE_ACK_GATE: Callable[[str, str], "str | None"] | None = None
 PROACTIVE_ROUTE_GATE: Callable[[str, str, "str | None"], "str | None"] | None = None
 # Routing state belongs to the gateway (owner 2026-09-07): the agent row's owner_dm_room is read at
 # connect and on a slow cadence and kept while offline; the pinned room is bootstrap, never authority.
-_ROUTING: dict = {"owner_dm": "", "persisted": "", "identity": "", "gateway": "", "next": 0.0,
-                  "held_logged": 0.0}
+_ROUTING: dict = {"owner_dm": "", "persisted": "", "persisted_private": False, "identity": "",
+                  "gateway": "", "next": 0.0, "held_logged": 0.0}
 ROUTING_REFRESH_S = 300.0
 ROUTING_RETRY_S = 30.0
 OWNER_PRIVATE = "owner_private"
@@ -1896,14 +1922,17 @@ def _routing_file() -> Path:
     return _STATE / f"owner-routing{_INST_SUFFIX}.json"
 
 
-def _routing_record(identity: str, gateway_url: str, owner_dm: str) -> "dict | None":
+def _routing_record(identity: str, gateway_url: str, owner_dm: str, *,
+                    private: bool = False) -> "dict | None":
     """The owner-routing record as persisted: the redacted URL and the keyed binding of the full
-    one, never the full URL. None when no binding can be made, so nothing unbound is written."""
+    one, never the full URL. None when no binding can be made, so nothing unbound is written.
+    `private` only for a room whose membership was checked; a migrated legacy record is not."""
     binding = gateway_instance.binding_digest(identity, gateway_url, create=True)
     if not binding:
         return None
-    return {"identity": identity, "gateway": _redact_url(gateway_url), "binding": binding,
-            "owner_dm": gateway_instance.owner_room(owner_dm, identity)}
+    record = {"identity": identity, "gateway": _redact_url(gateway_url), "binding": binding,
+              "owner_dm": gateway_instance.owner_room(owner_dm, identity)}
+    return {**record, "private": True} if private else record
 
 
 def _migrate_routing() -> "routing_migrations.Result":
@@ -1922,7 +1951,8 @@ def _load_routing() -> None:
     if not _ROUTING["identity"] and not _ROUTING["gateway"]:
         _ROUTING["identity"], _ROUTING["gateway"] = current  # a reading set before any binding adopts this one
     elif (_ROUTING["identity"], _ROUTING["gateway"]) != current:  # re-enrolled: the old reading is not ours
-        _ROUTING.update(owner_dm="", persisted="", identity=current[0], gateway=current[1])
+        _ROUTING.update(owner_dm="", persisted="", persisted_private=False,
+                        identity=current[0], gateway=current[1])
     try:
         d = json.loads(_routing_file().read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -1931,16 +1961,26 @@ def _load_routing() -> None:
     bound = isinstance(d, dict) and d.get("identity") == current[0] and bool(d.get("binding")) \
         and hmac.compare_digest(str(d["binding"]).encode("utf-8"),
                                 gateway_instance.binding_digest(current[0], URL).encode("utf-8"))
-    disk = gateway_instance.owner_room(d.get("owner_dm"), current[0]) if bound else ""
+    on_disk = gateway_instance.owner_room(d.get("owner_dm"), current[0]) if bound else ""
+    # unchecked or since found shared: never adopted, and left unequal so the writer overwrites it
+    disk = on_disk if d.get("private") is True and on_disk != _ROUTING.get("shared") else ""
     # A reading that came from disk follows the disk; one the writer has not committed yet stays.
-    if not _ROUTING["owner_dm"] or _ROUTING["owner_dm"] == _ROUTING["persisted"]:
+    if not _ROUTING["owner_dm"] or not _uncommitted():
         _ROUTING["owner_dm"] = disk
-    _ROUTING["persisted"] = disk
+    _ROUTING["persisted"] = on_disk
+    _ROUTING["persisted_private"] = d.get("private") is True
+
+
+def _uncommitted() -> bool:
+    """The reading differs from the record, or names a room the record has not marked private."""
+    return _ROUTING["owner_dm"] != _ROUTING["persisted"] or (
+        bool(_ROUTING["owner_dm"]) and not _ROUTING["persisted_private"])
 
 
 def refresh_routing(force: bool = False) -> None:
     """Pull the agent's routing state from the gateway. A failed refresh books a short retry, not the
-    window; an answer without a DM (no row, no field) keeps the last reading, which lives on disk."""
+    window; an answer without a DM (no row, no field) keeps the last reading, which lives on disk.
+    A room is the owner DM only while its members are the agent and its owner; a shared room clears it."""
     reenrolled = bool(_ROUTING["identity"] or _ROUTING["gateway"]) and (
         (_reenroll_identity(), URL) != (_ROUTING["identity"], _ROUTING["gateway"]))
     _load_routing()
@@ -1949,18 +1989,30 @@ def refresh_routing(force: bool = False) -> None:
     if not force and now < _ROUTING["next"]:
         return
     try:
-        _gateway_owner()
+        owner = _gateway_owner()
     except Exception:  # noqa: BLE001 - offline: the last known owner DM stands
         _ROUTING["next"] = now + ROUTING_RETRY_S
         return
-    if _GATEWAY_OWNER_DM_HINT:
-        _ROUTING["owner_dm"] = _GATEWAY_OWNER_DM_HINT
-    if _ROUTING["owner_dm"] and _ROUTING["owner_dm"] != _ROUTING["persisted"]:  # until durably published
-        record = _routing_record(_reenroll_identity(), URL, _ROUTING["owner_dm"])
+    candidate = _GATEWAY_OWNER_DM_HINT or _ROUTING["owner_dm"]
+    private = _owner_dm_is_private(candidate, owner) if candidate else None
+    if private is False:
+        if now - _ROUTING.get("shared_logged", 0.0) >= ROUTING_REFRESH_S:
+            _ROUTING["shared_logged"] = now
+            _log(f"owner_dm_room {candidate} has members besides the agent and its owner: not an owner DM")
+        _ROUTING["owner_dm"], _ROUTING["shared"] = "", candidate
+    elif private is True:
+        _ROUTING["owner_dm"] = candidate
+        if _ROUTING.get("shared") == candidate:
+            _ROUTING["shared"] = ""
+    elif candidate != _ROUTING["owner_dm"]:  # undecided: a new room is not adopted, the checked one stands
+        _ROUTING["next"] = now + ROUTING_RETRY_S
+        return
+    if _uncommitted():  # until durably published, a cleared reading too
+        record = _routing_record(_reenroll_identity(), URL, _ROUTING["owner_dm"], private=True)
         if record is None or not _durable_write(_routing_file(), json.dumps(record)):
             _ROUTING["next"] = now + ROUTING_RETRY_S  # in memory it holds; the write is retried soon
             return
-        _ROUTING["persisted"] = _ROUTING["owner_dm"]
+        _ROUTING["persisted"], _ROUTING["persisted_private"] = _ROUTING["owner_dm"], True
     _ROUTING["next"] = now + (ROUTING_REFRESH_S if _ROUTING["owner_dm"] else ROUTING_RETRY_S)
 
 
@@ -2670,6 +2722,14 @@ def _append_log_file(line: str) -> None:
 
 
 _REQ_TIMEOUT_S = 35
+_ROOM_POST_TIMEOUT_S = 20
+_PROACTIVE_POST_TIMEOUT_S = 15
+_UPLOAD_TIMEOUT_S = 60
+_ACK_TIMEOUT_S = 10
+# The longest single request the outbound worker can be waiting on; a stop that
+# returns sooner can kill an accepted send whose response is still on the way.
+_OUTBOUND_SEND_TIMEOUT_S = max(_REQ_TIMEOUT_S, _ROOM_POST_TIMEOUT_S,
+                               _PROACTIVE_POST_TIMEOUT_S, _UPLOAD_TIMEOUT_S, _ACK_TIMEOUT_S)
 
 # urllib wraps only the send in URLError; a socket closed after it raises http.client's
 # errors bare (RemoteDisconnected is a ConnectionResetError), and those are outages too.
@@ -3109,7 +3169,7 @@ def _post_task_ack(tid: str, durable: bool = False, lease_id: "str | None" = Non
             body["durable"] = True
         bound = {} if deadline is None else {"deadline": deadline}   # a healthy ack's call is unchanged
         try:
-            _req("POST", f"/v1/tasks/{safe_tid}/ack", body, timeout=10, **bound)
+            _req("POST", f"/v1/tasks/{safe_tid}/ack", body, timeout=_ACK_TIMEOUT_S, **bound)
         except _NETWORK_ERRORS as e:
             if not _connection_dropped(e) or (dropped is None and not retry_inline):
                 raise
@@ -3119,7 +3179,7 @@ def _post_task_ack(tid: str, durable: bool = False, lease_id: "str | None" = Non
                 return False
             # A dropped link loses the ack; one prompt retry lands it inside the delivery lease.
             time.sleep(ACK_DROP_RETRY_S)
-            _req("POST", f"/v1/tasks/{safe_tid}/ack", body, timeout=10, **bound)
+            _req("POST", f"/v1/tasks/{safe_tid}/ack", body, timeout=_ACK_TIMEOUT_S, **bound)
         _ack_disabled_until = 0.0  # success (or re-enablement) → clear any backoff
         _forget_pending_ack(tid, lease_id)
         return True
@@ -3176,7 +3236,7 @@ def _post_ack_first(tid: str, lease_id: "str | None") -> str:
     if lease_id:
         body["lease_id"] = lease_id
     try:
-        _req("POST", f"/v1/tasks/{urllib.parse.quote(wire_tid, safe='')}/ack", body, timeout=10)
+        _req("POST", f"/v1/tasks/{urllib.parse.quote(wire_tid, safe='')}/ack", body, timeout=_ACK_TIMEOUT_S)
         return "accepted"
     except urllib.error.HTTPError as e:
         reason = _http_error_body(e).lower() if e.code == 404 else ""
@@ -3197,7 +3257,7 @@ def _ack_first_state(tid: str) -> "str | None":
     or None when it cannot be read."""
     wire_tid = _broker_tid(tid)
     try:
-        doc = _req("GET", f"/v1/tasks/{urllib.parse.quote(wire_tid, safe='')}/status", timeout=10)
+        doc = _req("GET", f"/v1/tasks/{urllib.parse.quote(wire_tid, safe='')}/status", timeout=_ACK_TIMEOUT_S)
     except (OSError, ValueError, http.client.HTTPException) as e:
         _log_backoff((tid, "ack-status"), f"ack_first task {tid}: status unreadable "
                      f"({diagnostics.describe(e)}) — kept staged")
@@ -5436,7 +5496,7 @@ def _upload_attachment(room: str, path_str: str) -> tuple[bool, str]:
     safe_room = urllib.parse.quote(room, safe="")
     try:
         _req("POST", f"/v1/rooms/{safe_room}/media",
-             {"filename": name, "content_b64": content_b64}, timeout=60)
+             {"filename": name, "content_b64": content_b64}, timeout=_UPLOAD_TIMEOUT_S)
     except urllib.error.HTTPError as e:
         return False, f"HTTP {e.code}"
     except (urllib.error.URLError, TimeoutError) as e:
@@ -5459,7 +5519,7 @@ def _upload_task_attachment(wire_id: str, ordinal: int, path_str: str) -> "tuple
     try:
         _req("POST", f"/v1/tasks/{safe_tid}/media",
              {"ordinal": ordinal, "filename": name, "content_b64": content_b64},
-             timeout=60)
+             timeout=_UPLOAD_TIMEOUT_S)
     except urllib.error.HTTPError as e:
         if e.code == 409:
             return "note", "content conflicts with the recorded upload"
@@ -5845,6 +5905,8 @@ def _proactive_dispatch_veto(item_id: str, payload: bytes) -> "str | None":
         return held
     try:
         veto = PROACTIVE_DISPATCH_GATE(tid) if PROACTIVE_DISPATCH_GATE is not None else None
+        if veto is None and PROACTIVE_ACK_GATE is not None:
+            veto = PROACTIVE_ACK_GATE(tid, item_id)
         if veto is None and PROACTIVE_ROUTE_GATE is not None:
             veto = PROACTIVE_ROUTE_GATE(tid, env.get("room_id"), env.get("thread_root"))
         return veto
@@ -6107,6 +6169,13 @@ def _post_proactive() -> None:
                 _hand_back(claim, f)
                 continue
             _GATE_FAILED_LOGGED.discard(f.name)
+        if route == "send" and room_override and f.name.startswith(_OWNER_MENTION_PREFIX):
+            # Its room was the owner DM when queued; send to the owner DM read now, or hold.
+            room_override = resolve_destination(OWNER_PRIVATE)
+            if not room_override:
+                _held(f"owner-mention result {f.name}")
+                _hand_back(claim, f)
+                continue
         if route == "drop":
             # Skip marker ([no-send]/[REPLIED]/[deduped:]) — the protocol says
             # archive silently, deliver nothing. Nothing was delivered, so on
@@ -7171,6 +7240,9 @@ def _owner_mention_dm_name(tid: str) -> str:
     return proactive_filename(f"owner-mention-{tid}", "ag2space")[:-len(".txt")]
 
 
+_OWNER_MENTION_PREFIX = "proactive-owner-mention-"
+
+
 def _owner_mention_dm_queued(tid: str) -> bool:
     """A copy already handed to the proactive leg (pending, claimed, sent or parked)."""
     name = _owner_mention_dm_name(tid)
@@ -7942,6 +8014,81 @@ def _poll_timeout_is_empty(last_ok: float, now: float,
     return (now - last_ok) <= grace
 
 
+def _poll_stalled(last_ok: float, now: float,
+                  limit: float = POLL_STALL_EXIT_S) -> bool:
+    """Whether the poll loop has gone `limit` seconds without a success."""
+    return limit > 0 and (now - last_ok) > limit
+
+
+_STALL_REPORTED_FOR: float | None = None
+# Set once the stall exit has stopped the outbound worker: from then on the loop
+# only waits for that stop, because a resumed poll would run with no outbound worker.
+_STALL_EXIT_PENDING = False
+
+
+def _worker_stop_budget_s() -> float:
+    """One join's wait: a full in-flight request plus the worker's scan slack."""
+    return _OUTBOUND_SEND_TIMEOUT_S + OUTBOUND_SCAN_S * 3 + 5
+
+
+def _stop_background_workers(outbound_thread, results_watcher) -> bool:
+    """Stop and join the outbound worker; True only once it has actually stopped.
+
+    Exiting while it is mid-send strands its claim, and the next process resends it.
+    The results watcher is only a wake-up doorbell, so its join is best-effort.
+    """
+    _OUTBOUND_STOP.set(); _OUTBOUND_WAKE.set()
+    outbound_thread.join(timeout=_worker_stop_budget_s())
+    if results_watcher is not None:
+        results_watcher.join(timeout=5)
+    return not outbound_thread.is_alive()
+
+
+def _abort_if_poll_stalled(anchor: float,
+                           before_exit: Callable[[], bool] | None = None) -> bool:
+    """Record a wedged-but-alive bridge, and exit only if something restarts us.
+
+    `anchor` is a `time.monotonic()` reading: wall time would count a sleeping Mac
+    as a stall. The exit is armed only when a restart owner is declared, since an
+    unsupervised lane that exits stays down; the status sidecar records it either way.
+    `before_exit` stops the workers and reports whether they stopped; until they
+    have, this returns True and the caller must skip the beat rather than poll.
+    """
+    global _STALL_REPORTED_FOR, _STALL_EXIT_PENDING
+    now = time.monotonic()
+    # Pass the limit explicitly: the parameter default binds at def time,
+    # so a reconfigured module global would otherwise never be read.
+    if not _STALL_EXIT_PENDING and not _poll_stalled(anchor, now, POLL_STALL_EXIT_S):
+        return False
+    stalled_s = int(now - anchor)
+    if not POLL_STALL_RESTART_OWNER:
+        # Once per stall episode, not once per poll: the loop calls this on every
+        # iteration and the sidecar is a file write.
+        if _STALL_REPORTED_FOR != anchor:
+            _STALL_REPORTED_FOR = anchor
+            _emit_gateway_status(False, error=(
+                f"stalled: no successful poll in {stalled_s}s (limit "
+                f"{POLL_STALL_EXIT_S:g}s); retrying -- no restart owner declared, "
+                "so exiting would end this lane"))
+            _log(f"WARN: no successful poll in {stalled_s}s and no restart owner "
+                 "(SUTANDO_BRIDGE_RESTART_OWNER unset) -- continuing to retry")
+        return False
+    if not _STALL_EXIT_PENDING:
+        _STALL_EXIT_PENDING = True
+        _emit_gateway_status(False, error=f"stalled: no successful poll in {stalled_s}s")
+        # sys.exit's message reaches only stderr; the bridge log is where the backoff
+        # lines that preceded this live, so the stall must be stated there too.
+        _log(f"stalled: no successful poll in {stalled_s}s (limit {POLL_STALL_EXIT_S:g}s) "
+             f"while the process stayed alive -- exiting so {POLL_STALL_RESTART_OWNER} restarts it")
+    if before_exit is not None and not before_exit():
+        _log("stall exit held: the outbound worker is still finishing a send -- "
+             "waiting for it to stop before exiting, without polling")
+        return True
+    print(f"FATAL: no successful poll in {stalled_s}s (limit {POLL_STALL_EXIT_S:g}s) "
+          f"-- exiting so {POLL_STALL_RESTART_OWNER} restarts the bridge.", file=sys.stderr)
+    sys.exit(POLL_STALL_EXIT_CODE)
+
+
 def main() -> None:
     # This process holds the gateway URL: nothing uncaught, in any thread, prints it raw.
     gateway_instance.install_scrubbing_excepthooks(lambda: URL)
@@ -8003,6 +8150,7 @@ def main() -> None:
     poll_grace_since = time.time()
     last_poll_ok: float | None = None
     poll_failures = 0  # consecutive network failures; the next good poll resets it
+    stall_anchor = time.monotonic()  # excludes system sleep on macOS, unlike time.time()
     _emit_gateway_status(False, error="starting — not yet connected")
     refresh_routing(force=True)  # the owner's DM comes from the gateway at connect, not from a pin
     _maybe_start_event_channel()  # additive/opt-in/isolated — never blocks the task loop
@@ -8011,15 +8159,21 @@ def main() -> None:
     while True:
         _stamp_loop_progress()
         try:
+            if _abort_if_poll_stalled(stall_anchor, lambda: _stop_background_workers(
+                    _outbound_thread, _results_watcher)):
+                continue
             if _LOCK_LOST.is_set() or not _heartbeat_singleton():
                 # Lost the poller lock (reaped after being deemed stale). Stop
                 # polling immediately so we don't dual-poll the relay bearer with
                 _log("singleton: lost workspace poller lock (reaped after stale takeover) "
                      "— exiting to avoid dual-poll")
-                _OUTBOUND_STOP.set(); _OUTBOUND_WAKE.set()
-                _outbound_thread.join(timeout=OUTBOUND_SCAN_S * 3 + 5)
-                if _results_watcher is not None:
-                    _results_watcher.join(timeout=5)
+                if not _stop_background_workers(_outbound_thread, _results_watcher):
+                    # The successor recovers a dead pid's claim and resends it, so a
+                    # send in flight must finish here first; the next pass re-joins.
+                    _log("singleton: outbound worker still finishing a send — "
+                         "waiting for it to stop before exiting")
+                    _LOCK_LOST.set()  # the next pass must come back here, never poll
+                    continue
                 return
             _post_heartbeat(inflight)
             _retry_withheld_reviews()
@@ -8033,6 +8187,7 @@ def main() -> None:
             try:
                 resp = _req("GET", f"/v1/tasks?wait={POLL_WAIT}{_POLL_PROOF}", timeout=POLL_WAIT + 10)
                 last_poll_ok = poll_grace_since = time.time()
+                stall_anchor = time.monotonic()
                 # A completed poll remains evidence even if accepting its tasks fails.
                 _emit_gateway_status(True, poll_ok_ts=last_poll_ok)
             except (TimeoutError, socket.timeout):
@@ -8090,6 +8245,9 @@ def main() -> None:
             if e.code in (401, 403):
                 if _recover_auth(e.code):
                     backoff = 1
+                    # The wait was on a human, not a stall: resume with the same
+                    # fresh anchor a newly started bridge gets.
+                    stall_anchor = time.monotonic()
                     continue
                 _emit_gateway_status(False, error=f"auth rejected HTTP {e.code}", poll_ok_ts=last_poll_ok)
                 sys.exit(f"FATAL: gateway auth rejected (HTTP {e.code}) — check REMOTE_TASK_TOKEN.")

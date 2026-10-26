@@ -49,6 +49,8 @@ with tempfile.TemporaryDirectory() as td:
         if (method, path) == ("GET", "/v1/agents"):
             return {"agents": [{"id": "@agent:ag2.space", "owner": "@owner:ag2.space",
                                 "owner_dm_room": "!owner-dm:ag2.space"}]}
+        if path == "/v1/room" and payload.get("op") == "members":
+            return {"members": [{"user_id": "@agent:ag2.space"}, {"user_id": "@owner:ag2.space"}]}
         if path == "/v1/room" and payload.get("op") == "create":
             return {"ok": True, "room_id": "!owner-dm:ag2.space"}
         if path == "/v1/room" and payload.get("op") == "message":
@@ -81,7 +83,7 @@ with tempfile.TemporaryDirectory() as td:
     check(record["status"] == "awaiting_owner" and record["dm_event_id"] == "$review-2",
           "review must bind to the delivered DM event")
     dm_posts = [p for m, u, p in calls
-                if u == "/v1/room" and p.get("room_id") == "!owner-dm:ag2.space"]
+                if u == "/v1/room" and p.get("op") == "message" and p.get("room_id") == "!owner-dm:ag2.space"]
     candidate_dm, decision_dm = dm_posts
     check("sensitive candidate" in candidate_dm["body"]
           and candidate_dm["mentions"] == [],
