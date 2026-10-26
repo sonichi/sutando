@@ -706,9 +706,10 @@ print(json.dumps({"calls": calls}))
     SCRUB = """
 import errno, io, json, os, traceback, urllib.error, urllib.request, http.client
 from ag2_sparrow import remote_gateway_bridge as m
-secret = "enrollment=Se%2fcR%2FeT"
-forms = [secret, secret.upper(), secret.lower(), "Se%2fcR%2FeT", "Se/cR/eT", "Se%252fcR%252FeT",
-         repr("Se\\ncR"), "Se\\x7fcR", "U2UvY1IvZVQ"]
+secret = "enrollment=SeQ4vXk9%2fcRz8LpW2%2FeTm3YhN7"
+forms = [secret, secret.upper(), secret.lower(), "SeQ4vXk9%2fcRz8LpW2%2FeTm3YhN7",
+         "SeQ4vXk9/cRz8LpW2/eTm3YhN7", "SeQ4vXk9%252fcRz8LpW2%252FeTm3YhN7",
+         repr("SeQ4vXk9\\ncRz8LpW2"), "SeQ4vXk9\\x7fcRz8LpW2", "U2VRNHZYazkvY1J6OExwVzIvZVRtM1loTjc"]
 text = " | ".join(forms)
 raised = [urllib.error.HTTPError(m.URL + "/v1/tasks", 503, text, {}, io.BytesIO(b"{}")),
           urllib.error.URLError(text), TimeoutError(text), ConnectionResetError(104, text),
@@ -736,7 +737,7 @@ print(json.dumps({"out": out, "forms": forms, "files": files}))
 """
 
     def test_an_exception_from_a_gateway_call_is_logged_and_persisted_only_as_its_type(self):
-        url = "https://gw.example/relay?enrollment=Se%2fcR%2FeT"
+        url = "https://gw.example/relay?enrollment=SeQ4vXk9%2fcRz8LpW2%2FeTm3YhN7"
         r = subprocess.run([sys.executable, "-c", PRELUDE + self.SCRUB], capture_output=True, text=True,
                            cwd=str(self.home), timeout=60, env=self.bridge_env(REMOTE_TASK_URL=url))
         self.assertEqual(r.returncode, 0, r.stderr)
@@ -756,7 +757,8 @@ print(json.dumps({"out": out, "forms": forms, "files": files}))
         for form in result["forms"]:
             self.assertNotIn(form, json.dumps(result["out"]), "nor from its attributes")
         self.assertEqual(result["out"][0]["code"], 503, "the status code survives")
-        for form in result["forms"] + ["cR", "eT", "Se%"]:
+        # Each piece is 8 mixed-case chars, so a random 6-char tmp-dir suffix cannot contain one.
+        for form in result["forms"] + ["SeQ4vXk9", "cRz8LpW2", "eTm3YhN7", "SeQ4vXk9%"]:
             self.assertNotIn(form, printed, form)
             for path, text in result["files"].items():
                 self.assertNotIn(form, text, (form, path))

@@ -400,6 +400,26 @@ jobs:
       - name: Run shell standalone tests (serial tail)
         run: bash scripts/run-shell-suites.sh tail 3 ${{ matrix.shard }}
 
+  # The ag2-sparrow tag publish runs this gate on 3.11; its suites import files from
+  # all over the repo, so it runs on every PR rather than behind a paths filter.
+  sparrow-publish-gate:
+    name: ag2-sparrow publish gate (python 3.11)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Test before publish (package suites + src-drift guard)
+        run: bash packages/ag2-sparrow/tools/publish_gate.sh
+
   python-standalone-tests:
     name: python standalone tests (${{ matrix.shard }}/9)
     needs: changes
@@ -615,7 +635,7 @@ jobs:
     # Carries the name the `main` ruleset requires. Splitting a suite into its
     # own job removes it from the required-context list; this keeps one gate
     # that fails when any suite fails, so a split cannot weaken protection.
-    needs: [changes, typecheck-and-test, node-tests, oot-python-tests, mod-harness-tests, shell-standalone-tests, shell-tail-tests, python-standalone-tests]
+    needs: [changes, typecheck-and-test, node-tests, oot-python-tests, mod-harness-tests, shell-standalone-tests, shell-tail-tests, python-standalone-tests, sparrow-publish-gate]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -656,4 +676,5 @@ jobs:
           check "shell-standalone-tests"  "${{ needs.shell-standalone-tests.result }}"
           check "shell-tail-tests"        "${{ needs.shell-tail-tests.result }}"
           check "python-standalone-tests" "${{ needs.python-standalone-tests.result }}"
+          check "sparrow-publish-gate"    "${{ needs.sparrow-publish-gate.result }}"
           exit "$rc"
