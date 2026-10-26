@@ -263,7 +263,7 @@ warn_unseeded_public_denylist() {
   [ -n "$ws" ] || ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null || true)"
   [ -n "$ws" ] || return 0
   [ -f "$ws/state/privacy/public-denylist.txt" ] && return 0
-  echo "public-write privacy gate: no denylist at $ws/state/privacy/public-denylist.txt — only home paths, Matrix IDs and room IDs are checked. Seed it once: python3 scripts/seed-public-denylist.py" >&2
+  echo "public-write privacy gate: no denylist at $ws/state/privacy/public-denylist.txt — only home paths, Matrix IDs and room IDs are checked. Seed it once by running scripts/seed-public-denylist.py" >&2
 }
 
 resolve_claude_settings_args() {
