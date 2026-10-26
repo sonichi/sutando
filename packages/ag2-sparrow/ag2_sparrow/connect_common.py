@@ -20,7 +20,6 @@ import contextlib
 import errno
 import fcntl
 import getpass
-import hashlib
 import json
 import os
 import platform
@@ -688,21 +687,19 @@ _AGENT_HELD: dict = {}
 
 
 def agent_lock_path(root) -> Path:
-    """The one lock every actor on an agent's root takes, outside that root so renaming or replacing the
-    root cannot escape it: <agents dir>/.locks/<agent segment>.op for an agent's own root, keyed by the
-    root's path for an explicit --work root."""
-    agents = _dirs.agents_dir()
-    root = os.fspath(root)
-    parent, name = os.path.split(root)
-    key = name if os.path.realpath(parent) == os.path.realpath(agents) else \
-        "work-" + hashlib.sha256(root.encode()).hexdigest()[:24]
-    return Path(agents) / ".locks" / f"{key}.op"
+    """The one lock every actor on an agent's root takes: <root's parent>/.locks/<root's name>.op, so for
+    an agent's own root <agents dir>/.locks/<agent segment>.op. It is outside the root and derived from the
+    root's path alone, so every process names the same file and renaming or replacing the root cannot
+    escape it."""
+    parent, name = os.path.split(os.path.normpath(os.fspath(root)))
+    return Path(parent) / ".locks" / f"{name}.op"
 
 
-def _grant_paths(root) -> "tuple[Path, Path]":
+def _grant_paths(root) -> "tuple[Path, Path, Path]":
+    """The published start, the claimed one, and the claimant's record, beside the agent lock."""
     lock = agent_lock_path(root)
     stem = lock.name[:-len(".op")]
-    return lock.parent / f"{stem}.grant", lock.parent / f"{stem}.grant.claimed"
+    return lock.parent / f"{stem}.grant", lock.parent / f"{stem}.grant.claimed", lock.parent / f"{stem}.claim"
 
 
 def _open_agent_lock(path: Path) -> int:
@@ -712,15 +709,18 @@ def _open_agent_lock(path: Path) -> int:
 
 class agent_lock:
     """The per-agent operation lock: an exclusive flock on agent_lock_path(root), taken by connect,
-    install, uninstall and bridge wiring (a launcher passes launch_admission). Nested takes in one process
+    install, uninstall and bridge wiring (a launcher passes launch_admission). Nested takes in one thread
     share it; it is waited for up to `wait_s` (AGENT_LOCK_WAIT_S), then Busy; the kernel drops it when
     the process dies, so no stale lock outlives its holder. `release()` is idempotent."""
 
     def __init__(self, root, wait_s: "float | None" = None):
         self.path, self.wait_s, self.entered = agent_lock_path(root), wait_s, False
 
+    def _key(self):
+        return threading.get_ident(), str(self.path)
+
     def __enter__(self):
-        key = str(self.path)
+        key = self._key()
         held = _AGENT_HELD.get(key)
         if held is not None:
             held[1] += 1
@@ -746,10 +746,10 @@ class agent_lock:
         if not self.entered:
             return
         self.entered = False
-        held = _AGENT_HELD[str(self.path)]
+        held = _AGENT_HELD[self._key()]
         held[1] -= 1
         if held[1] == 0:
-            del _AGENT_HELD[str(self.path)]
+            del _AGENT_HELD[self._key()]
             os.close(held[0])
 
     def __exit__(self, *exc):
@@ -757,57 +757,134 @@ class agent_lock:
         return False
 
 
-def publish_start_grant(root) -> str:
-    """Under the agent lock, before connect starts the job: one start generation a launcher may claim
-    instead of the lock connect holds. Returns the generation."""
-    grant, claimed = _grant_paths(root)
+def _agent_operation_in_progress() -> str:
+    """The agent lock under the agents dir some operation holds now, else ''. Uninstall asks it when no
+    config names a root: an operation that later writes a config does so under the operation lock it holds."""
+    for path in sorted((Path(_dirs.agents_dir()) / ".locks").glob("*.op")):
+        try:
+            fd = os.open(path, os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0))
+        except OSError:
+            continue
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return str(path)
+        finally:
+            os.close(fd)
+    return ""
+
+
+def publish_start_grant(root, adapter: str) -> str:
+    """Under the agent lock, right before an operation starts `adapter`'s job: one start a launcher of that
+    adapter may claim instead of the lock the operation holds. It names the publisher (pid and start time),
+    which is the lock's holder, so it is good only while that process lives. Returns the generation."""
+    grant, claimed, claim = _grant_paths(root)
     generation = secrets.token_hex(16)
-    claimed.unlink(missing_ok=True)
+    for stale in (claimed, claim):
+        stale.unlink(missing_ok=True)
     fd, tmp = tempfile.mkstemp(dir=str(grant.parent), prefix=f".{grant.name}.")
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        json.dump({"generation": generation, "pid": os.getpid()}, fh)
+        json.dump({"adapter": adapter, "generation": generation, "pid": os.getpid(),
+                   "start": task_io.start_time(os.getpid())}, fh)
     os.replace(tmp, grant)
     return generation
 
 
-def withdraw_start_grant(root) -> str:
-    """The generation a launcher claimed ('' when none did); both grant files removed."""
-    grant, claimed = _grant_paths(root)
+def manager_pid(shape: Shape) -> "int | None":
+    """The pid the manager runs the job as: systemd's MainPID, launchd's pid (the --launchd shim)."""
+    if is_macos():
+        r = _sm._run(["launchctl", "print", launchd_service(shape)])
+        m = re.search(r"^\s*pid = (\d+)", (r.stdout or "") if _ok(r) else "", re.M)
+        return int(m.group(1)) if m else None
+    r = _sm._systemctl(("--user", "show", "-p", "MainPID", "--value"), unit=shape.service_name)
+    value = (r.stdout or "").strip() if _ok(r) else ""
+    return int(value) if value.isdigit() and value != "0" else None
+
+
+def _parent_pid(pid) -> "int | None":
     try:
-        generation = json.loads(claimed.read_text(encoding="utf-8")).get("generation", "")
+        r = subprocess.run(["ps", "-o", "ppid=", "-p", str(int(pid))], capture_output=True, text=True, timeout=10)
+        return int(r.stdout.strip()) if r.returncode == 0 and r.stdout.strip().isdigit() else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def withdraw_start_grant(root, generation: str, rec, shape: Shape) -> str:
+    """'' when the launcher holding the root (`rec`, the fresh holder) claimed this very `generation` and
+    is the process the manager runs `shape`'s job as (or its --launchd shim's child), else why not; every
+    grant file is removed either way."""
+    grant, claimed, claim = _grant_paths(root)
+    try:
+        got = json.loads(claim.read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        generation = ""
-    grant.unlink(missing_ok=True)
-    claimed.unlink(missing_ok=True)
-    return generation
+        got = {}
+    for path in (grant, claimed, claim):
+        path.unlink(missing_ok=True)
+    if rec is None:
+        return ""
+    if got.get("generation") != generation or (got.get("pid"), got.get("start")) != (rec.get("pid"), rec.get("start")):
+        return (f"the launcher holding {root} (pid {rec.get('pid')}) did not claim this start (generation "
+                f"{generation[:8]}); it was not started by this operation")
+    job = manager_pid(shape)
+    if job is None or job not in (rec.get("pid"), _parent_pid(rec.get("pid"))):
+        return (f"the launcher holding {root} (pid {rec.get('pid')}) is not the process {job_name(shape)} runs "
+                f"as ({job or 'none'}); it was not started by this operation")
+    return ""
 
 
-def launch_admission(root, wait_s: "float | None" = None) -> str:
-    """'' when a launcher may act on `root`: the agent lock was free (taken and dropped at once), or the
-    operation holding it published a start generation and this launcher claimed it (one claim only).
-    Else, after `wait_s` (LAUNCH_WAIT_S), why not: a launcher started by anything else during an
-    operation does not touch the root until it ends. Never blocks on the lock."""
+def _grant_problem(grant: Path, adapter: str) -> str:
+    """'' for a grant this launcher may claim: its adapter's, from a publisher still alive with the start
+    time it recorded; a grant whose publisher is gone is stale and is removed."""
+    try:
+        rec = json.loads(grant.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return "none"
+    except (OSError, ValueError):
+        rec = {}
+    if task_io.verify_lineage(rec.get("pid"), rec.get("start")) is not True:
+        grant.unlink(missing_ok=True)
+        return "stale"
+    return "" if rec.get("adapter") == adapter else "another adapter's"
+
+
+def launch_admission(root, adapter: str, wait_s: "float | None" = None) -> "tuple[int | None, str]":
+    """(fd, '') when a launcher of `adapter` may take `root`: fd holds the agent lock, free when asked, and
+    the caller keeps it until it holds the root (end_admission); or (None, '') when the operation holding
+    the lock published a start for this adapter whose publisher still lives, and this launcher claimed it,
+    once. Else, after `wait_s` (LAUNCH_WAIT_S), (None, why). Never blocks on the lock."""
     path = agent_lock_path(root)
-    grant, claimed = _grant_paths(root)
-    deadline = time.monotonic() + (LAUNCH_WAIT_S if wait_s is None else wait_s)
+    grant, claimed, claim = _grant_paths(root)
+    deadline, stale = time.monotonic() + (LAUNCH_WAIT_S if wait_s is None else wait_s), False
     while True:
         fd = _open_agent_lock(path)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            return ""
+            return fd, ""
         except BlockingIOError:
-            pass
-        finally:
             os.close(fd)
-        try:
-            os.rename(grant, claimed)
-            return ""
-        except FileNotFoundError:
-            pass
+        why = _grant_problem(grant, adapter)
+        stale = stale or why == "stale"
+        why = "stale" if stale and why == "none" else why
+        if not why:
+            try:
+                os.rename(grant, claimed)
+                me = {"generation": json.loads(claimed.read_text(encoding="utf-8")).get("generation"),
+                      "pid": os.getpid(), "start": task_io.start_time(os.getpid())}
+                _write(claim, json.dumps(me), 0o600)
+                return None, ""
+            except (OSError, ValueError):
+                pass
         if time.monotonic() >= deadline:
-            return (f"an operation on this agent holds {path} and published no start for this launcher; it does "
-                    "not act on the root until that operation ends")
+            return None, (f"an operation on this agent holds {path} and published no start this {adapter} launcher "
+                          f"may claim ({why or 'claimed already'}); it does not act on the root until that "
+                          "operation ends")
         time.sleep(0.1)
+
+
+def end_admission(fd: "int | None") -> None:
+    """Drop the agent lock admission kept, once the launcher holds the root (or gave up)."""
+    if fd is not None:
+        os.close(fd)
 
 
 def install(shape: Shape, values: dict, root: str, revise=None, precheck=None, holder=None, root_id=None) -> int:
@@ -983,11 +1060,17 @@ def _install_locked(shape: Shape, values: dict, root: str, revise=None, precheck
     _write(sup, unit, 0o644)
     print(f"{'installed' if not old else 'changed' if old != dict(values, ROOT=root) else 'rewritten'}: {conf}")
     print(f"installed: {sup}")
-    problem = start_supervisor(shape)
+    generation, rec = publish_start_grant(root, shape.name), None
+    try:
+        problem = start_supervisor(shape)
+        rec = None if problem else _fresh_holder(shape, root, before)
+    finally:
+        claim_problem = withdraw_start_grant(root, generation, rec, shape)
     if problem:
         return _refuse(f"{problem}; the managed launcher did not acquire {root}; run {shape.command} uninstall, "
                        f"then {shape.command} install")
-    rec = _fresh_holder(shape, root, before)
+    if claim_problem:
+        return _refuse(f"{claim_problem}; run {shape.command} uninstall, then {shape.command} install")
     if rec is None:
         return _refuse(f"the managed launcher did not acquire {root} within {CONFIRM_TIMEOUT_S:.0f} s ({holder_line(root)}); "
                        f"its refusal is in {launcher_log(shape)}; run {shape.command} uninstall, then {shape.command} install")
@@ -1045,18 +1128,20 @@ def _connect_install_locked(shape: Shape, values: dict, root: str, revise, prech
         if problem:
             return _refuse(f"{problem}; connect changes no job's definition: run {shape.command} install to change "
                            "it; nothing more was applied")
-    before = lock_holder(root)
-    generation = publish_start_grant(root)
+    published = unit.encode("utf-8")
+    before, rec = lock_holder(root), None
+    generation = publish_start_grant(root, shape.name)
     try:
         problem = start_supervisor(shape, restart=False)
         rec = None if problem else _fresh_holder(shape, root, before)
     finally:
-        claimed = withdraw_start_grant(root)
+        claim_problem = withdraw_start_grant(root, generation, rec, shape)
     if problem:
         return _refuse(f"{problem}; the managed launcher did not acquire {root}")
+    if claim_problem:
+        return _refuse(f"{claim_problem}; connect leaves it as it is")
     if rec is not None:
-        _STARTED[shape.name] = {"generation": generation, "claimed": claimed, "pid": rec["pid"],
-                                "start": rec["start"], "unit": sup.read_bytes()}
+        _STARTED[shape.name] = {"generation": generation, "pid": rec["pid"], "start": rec["start"], "unit": published}
     if rec is not None and dir_identity(root) != root_id:
         problem = stop_started(shape, root)
         return _refuse(f"the launcher did not hold {root} as the directory connect wrote the seat for (it was "
@@ -1192,7 +1277,7 @@ def hold_and_supervise(shape: Shape, root: str, state: dict, prepare, spawn, sup
     def refuse(line: str) -> int:
         print(f"{label}: refusing to start: {line}", file=sys.stderr)
         return EXIT_UNUSABLE
-    problem = launch_admission(root)
+    admitted, problem = launch_admission(root, shape.name)
     if problem:
         if acquired is not None:
             acquired()
@@ -1201,10 +1286,12 @@ def hold_and_supervise(shape: Shape, root: str, state: dict, prepare, spawn, sup
     try:
         owner = task_io.acquire_lock(root, adapter or shape.name, retry_s=ACQUIRE_RETRY_S)
     except LockRefused as e:
+        end_admission(admitted)
         if acquired is not None:
             acquired()
         print(e.line, file=sys.stderr)
         return EXIT_HELD if e.code == 3 else EXIT_UNUSABLE
+    end_admission(admitted)
     if acquired is not None:
         acquired()
     try:
@@ -1352,13 +1439,21 @@ def uninstall(shape: Shape, before_free=None, token_file=None) -> int:
     """`before_free(config) -> problem` runs after the manager stop and before the root must read free:
     a shape whose session outlives its launcher stops it there. `token_file(config)` names the token
     file the install configured, for the kept line."""
-    cfg, _problem = owned_config(shape)
-    root = (cfg or {}).get("ROOT", "")
-    try:
-        with (agent_lock(root) if root else contextlib.nullcontext()), operation_lock(shape):
-            return _uninstall_locked(shape, before_free, token_file)
-    except Busy as e:
-        return _refuse(str(e))
+    for _attempt in range(2):
+        root = (owned_config(shape)[0] or {}).get("ROOT", "")
+        try:
+            with (agent_lock(root) if root else contextlib.nullcontext()), operation_lock(shape):
+                if (owned_config(shape)[0] or {}).get("ROOT", "") != root:
+                    continue
+                busy = "" if root else _agent_operation_in_progress()
+                if busy:
+                    return _refuse(f"no config names the root {job_name(shape)} serves, and an operation on an agent "
+                                   f"holds {busy}; nothing was removed; run {shape.command} uninstall once it ends")
+                return _uninstall_locked(shape, before_free, token_file)
+        except Busy as e:
+            return _refuse(str(e))
+    return _refuse(f"{shape.name}'s configured root changed while uninstall waited for its lock; nothing was "
+                   f"removed; run {shape.command} uninstall again")
 
 
 def _uninstall_locked(shape: Shape, before_free=None, token_file=None) -> int:

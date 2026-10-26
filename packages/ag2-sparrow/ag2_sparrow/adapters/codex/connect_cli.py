@@ -160,15 +160,18 @@ def install(args) -> int:
     if args.sandbox == "workspace-write":
         print("NOTE sandbox: workspace-write lets an owner turn write under the work root; a turn retried after "
               "the app-server dies can repeat side effects the first attempt already made")
-    rc = cm.install(LOCAL, values, root, root_id=getattr(args, "root_identity", None), holder=holder_words)
-    if rc != 0 or mode == EXTERNAL:
-        return rc
-    problem = cb.wire_bridge_bound(dict(values, ROOT=root), COMMAND, BRIDGE, LOCAL, getattr(args, "root_identity", None))
-    if problem:
-        print(f"error: the connector is installed but its bridge is not: {problem}; run "
-              f"{cb.rerun_install(COMMAND, where['token_file'], cb.session_flags(args))}", file=sys.stderr)
-        return EXIT_UNUSABLE
-    return 0
+    def installed() -> int:
+        rc = cm.install(LOCAL, values, root, root_id=getattr(args, "root_identity", None), holder=holder_words)
+        if rc != 0 or mode == EXTERNAL:
+            return rc
+        problem = cb.wire_bridge_bound(dict(values, ROOT=root), COMMAND, BRIDGE, LOCAL,
+                                       getattr(args, "root_identity", None))
+        if problem:
+            print(f"error: the connector is installed but its bridge is not: {problem}; run "
+                  f"{cb.rerun_install(COMMAND, where['token_file'], cb.session_flags(args))}", file=sys.stderr)
+            return EXIT_UNUSABLE
+        return 0
+    return cb.under_agent_lock(root, installed)
 
 
 def connect_preflight(args) -> str:

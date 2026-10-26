@@ -124,13 +124,20 @@ SEAT_HOLDER = ("import fcntl, os, sys; fd = os.open(sys.argv[1], os.O_RDWR | os.
                "fcntl.flock(fd, fcntl.LOCK_EX); print('held', flush=True); sys.stdin.read()")
 AGENT_LOCK_HOLDER = ("import sys; sys.path.insert(0, %r); from ag2_sparrow import connect_common as cm\n"
                      "lock = cm.agent_lock(%r); lock.__enter__(); grant = %r\n"
-                     "if grant: cm.publish_start_grant(%r)\n"
+                     "if grant: cm.publish_start_grant(%r, grant)\n"
                      "print('held', flush=True); sys.stdin.read()")
 CONTENDER = ("import sys; sys.path.insert(0, %r); from ag2_sparrow import connect_common as cm\n"
              "from ag2_sparrow.adapters.%s import %s as other\n"
              "cm.AGENT_LOCK_WAIT_S = 0.3; cm.LAUNCH_WAIT_S = 0.3\n"
              "print('install', cm.install(other.LOCAL, {}, %r), flush=True)\n"
-             "print('launch', cm.launch_admission(%r) or 'admitted', flush=True)")
+             "print('launch', cm.launch_admission(%r, other.LOCAL.name)[1] or 'admitted', flush=True)")
+LAUNCHED = ("import sys; sys.path.insert(0, %r); from ag2_sparrow import connect_common as cm, holder_lock, task_io\n"
+            "install = %r\n"
+            "if install: holder_lock.install_id = lambda: install\n"
+            "fd, why = cm.launch_admission(%r, %r, wait_s=5)\n"
+            "if why: print('refused', why, flush=True); sys.exit(75)\n"
+            "o = task_io.acquire_lock(%r, %r); cm.end_admission(fd)\n"
+            "print('held', flush=True); sys.stdin.read(); task_io.release_lock(o)")
 OP_HOLDER = ("import sys; sys.path.insert(0, %r); from ag2_sparrow import connect_common as cm\n"
              "from ag2_sparrow.adapters.codex.connect_cli import LOCAL\n"
              "with cm.operation_lock(LOCAL): print('held', flush=True); sys.stdin.read()")
@@ -150,6 +157,18 @@ def hold(root, adapter="codex-local"):
     return p
 
 
+
+def launched(root, adapter, install=""):
+    """The manager's start: the launcher passes the agent lock's admission, then takes the root."""
+    p = subprocess.Popen([sys.executable, "-c", LAUNCHED % (str(PKG), install, str(root), "codex-local", str(root), adapter)],
+                         stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    if p.stdout.readline().strip() != "held":
+        p.wait(timeout=30)
+        p.stdout.close()
+        p.stdin.close()
+        return None
+    return p
+
 def unhold(p):
     p.stdin.close()
     p.wait(timeout=30)
@@ -165,9 +184,9 @@ class Runner:
         self.table, self.default, self.calls, self.root, self.adapter = dict(table or {}), default, [], root, adapter
         self.session, self.enabled = None, False
 
-    def start_session(self):
+    def start_session(self, by_manager=False):
         self.stop_session()
-        self.session = hold(self.root, self.adapter)
+        self.session = launched(self.root, self.adapter) if by_manager else hold(self.root, self.adapter)
 
     def stop_session(self):
         if self.session is not None:
@@ -183,7 +202,8 @@ class Runner:
         if verb == "show":
             loaded = cm.service_path(L).exists()
             words = {"LoadState": "loaded" if loaded else "not-found", "ActiveState": "active" if self.session else "inactive",
-                     "SubState": "running" if self.session else "dead", "UnitFileState": "enabled" if self.enabled else "disabled"}
+                     "SubState": "running" if self.session else "dead", "UnitFileState": "enabled" if self.enabled else "disabled",
+                     "MainPID": str(self.session.pid) if self.session else "0"}
             props = cmd[cmd.index("-p") + 1].split(",")
             return (0, "".join(words[k] + "\n" for k in props), "")
         return self.default
@@ -199,7 +219,7 @@ class Runner:
             self.enabled = verb == "enable"
         if self.root and rc == 0:
             if verb in START_VERBS and not (verb == "start" and self.session):     # start is a no-op when active
-                self.start_session()
+                self.start_session(by_manager=True)
             elif verb in STOP_VERBS:
                 self.stop_session()
         return subprocess.CompletedProcess(cmd, rc, out, err)
@@ -322,7 +342,7 @@ class Install(Base):
         self.assertTrue((self.work / "tasks").is_dir() and (self.work / "results").is_dir())
         self.assertTrue(cm.service_path(L).read_text().startswith(cli.MARKER))
         self.assertNotIn(TOKEN, cfg_path.read_text())
-        self.assertEqual(runner.verbs("systemctl"), ["show", "show-environment", "daemon-reload", "enable", "restart"],
+        self.assertEqual(runner.verbs("systemctl"), ["show", "show-environment", "daemon-reload", "enable", "restart", "show"],
                          "absent and free: no stop, then register and start")
         self.assertIn(f"{self.ACQUIRED}: {self.work} (launcher pid {runner.pid()}, no live connector attached)", out)
         self.assertIsNone(self.server(), "install starts no connector itself; the manager does")
@@ -374,7 +394,7 @@ class Install(Base):
         self.assertEqual(rc, 0)
         verbs = runner.verbs("systemctl")
         self.assertEqual(verbs[:4], ["show", "stop", "disable", "show"], "stopped and proven inactive+disabled first")
-        self.assertEqual(verbs[-3:], ["daemon-reload", "enable", "restart"])
+        self.assertEqual(verbs[-4:], ["daemon-reload", "enable", "restart", "show"], "the last show reads MainPID")
         self.assertIn("changed: ", out)
         self.assertEqual(cm.read_config(cli.config_path())["SANDBOX"], "workspace-write")
         self.assertNotEqual(runner.pid(), old, "a fresh holder, not the old connector")
@@ -1691,7 +1711,8 @@ class ConnectCode(Base):
             return real(shape, **kw)
         with mock.patch.object(cm, "start_supervisor", side_effect=raced_then_started):
             rc, out, err = self.connect(Backend(), fake)
-        self.assertEqual(rc, 0, out + err)
+        self.assertNotEqual(rc, 0, out + err)
+        self.assertIn(f"(pid {raced[0]}) did not claim this start", err, "a holder that bypassed admission is not ours")
         self.assertEqual(fake.runner.pid(), raced[0], "the job that raced in is the one running, never restarted")
         self.assertNotIn("stopped:", out)
 
@@ -1749,7 +1770,7 @@ class ConnectCode(Base):
         self.assertEqual(conf.read_bytes(), before)
         self.assertIsNone(fake.runner.pid(), "nothing was started")
 
-    def agent_lock_holder(self, grant=False):
+    def agent_lock_holder(self, grant=""):
         """The production agent lock held by another process (and, with `grant`, a start it published)."""
         p = subprocess.Popen([sys.executable, "-c", AGENT_LOCK_HOLDER % (str(PKG), str(self.root), grant, str(self.root))],
                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
@@ -1805,15 +1826,17 @@ class ConnectCode(Base):
         holder = self.agent_lock_holder()
         rc, err = launch()
         self.assertEqual(rc, cm.EXIT_HELD, err)
-        self.assertIn("published no start for this launcher", err)
+        self.assertIn(f"published no start this {L.name} launcher may claim", err)
         self.assertEqual(calls, [], "the root was never taken")
         unhold(holder)
-        holder = self.agent_lock_holder(grant=True)
+        holder = self.agent_lock_holder(grant=L.name)
         rc, err = launch()
         self.assertEqual((rc, calls), (cm.EXIT_UNUSABLE, [str(self.root)]), "the granted launcher went on")
-        self.assertIn("published no start", cm.launch_admission(str(self.root), wait_s=0.3), "one claim only")
+        self.assertIn("published no start", cm.launch_admission(str(self.root), L.name, wait_s=0.3)[1], "one claim only")
         unhold(holder)
-        self.assertEqual(cm.launch_admission(str(self.root), wait_s=0.3), "", "admitted once the operation ends")
+        fd, why = cm.launch_admission(str(self.root), L.name, wait_s=0.3)
+        cm.end_admission(fd)
+        self.assertEqual((fd is not None, why), (True, ""), "admitted, holding the lock, once the operation ends")
 
     def test_the_other_adapter_and_a_launcher_wait_while_connect_holds_the_agent(self):
         real, seen = cm.install, []
@@ -1891,6 +1914,167 @@ class ConnectCode(Base):
         with mock.patch.object(cm, "is_macos", return_value=True), mock.patch.object(sm, "_run", side_effect=run):
             self.assertEqual(cm.start_supervisor(L, restart=False), "")
             self.assertIn("launchctl bootstrap failed", cm.start_supervisor(L))
+
+    def _main_with(self, fake, *argv):
+        with mock.patch.object(sm, "_run", side_effect=fake):
+            return self.main(*argv)
+
+    def launch_with(self, shape, gap=None):
+        """The production launcher sequence on the root, `gap()` run just before it takes the root."""
+        real, seen = task_io.acquire_lock, []
+
+        def acquire(*a, **kw):
+            if gap is not None:
+                seen.append(gap())
+            return real(*a, **kw)
+        err = io.StringIO()
+        with mock.patch.object(cm, "LAUNCH_WAIT_S", 0.3), mock.patch.object(task_io, "acquire_lock", side_effect=acquire), \
+                contextlib.redirect_stderr(err):
+            rc = cm.hold_and_supervise(shape, str(self.root), {"sig": None}, lambda owner, root: (None, "stop here"),
+                                       None, None, None, "run", "test")
+        return rc, err.getvalue(), seen
+
+    def other_thread_takes_the_agent_lock(self):
+        got = []
+
+        def take():
+            try:
+                with cm.agent_lock(str(self.root), wait_s=0.3):
+                    got.append("taken")
+            except cm.Busy:
+                got.append("busy")
+        t = threading.Thread(target=take)
+        t.start()
+        t.join(10)
+        return got[0]
+
+    def test_launcher_keeps_the_agent_lock_from_admission_until_it_holds_the_root(self):
+        self.root.mkdir(parents=True)
+        rc, err, seen = self.launch_with(L, gap=self.other_thread_takes_the_agent_lock)
+        self.assertEqual(rc, cm.EXIT_UNUSABLE, err)
+        self.assertIn("stop here", err, "the launcher took the root")
+        self.assertEqual(seen, ["busy"], "no actor gets the agent lock between admission and the root")
+
+    def test_a_grant_for_another_adapter_is_not_claimed(self):
+        from ag2_sparrow.adapters.claude_code import cli as other
+        self.root.mkdir(parents=True)
+        holder = self.agent_lock_holder(grant=L.name)
+        grant = cm.agent_lock_path(str(self.root)).with_suffix(".grant")
+        rc, err, _seen = self.launch_with(other.LOCAL)
+        self.assertEqual(rc, cm.EXIT_HELD, err)
+        self.assertIn("may claim (another adapter's)", err)
+        self.assertTrue(grant.exists(), "the other adapter's launcher left the grant")
+        rc, err, _seen = self.launch_with(L)
+        self.assertEqual(rc, cm.EXIT_UNUSABLE, err)
+        self.assertFalse(grant.exists(), "this adapter's launcher claimed it")
+        unhold(holder)
+
+    def test_a_grant_left_by_a_crashed_publisher_is_refused_and_removed(self):
+        self.root.mkdir(parents=True)
+        publisher = self.agent_lock_holder(grant=L.name)
+        publisher.kill()
+        publisher.wait(timeout=30)
+        grant = cm.agent_lock_path(str(self.root)).with_suffix(".grant")
+        self.assertTrue(grant.exists(), "the crash left its grant")
+        holder = self.agent_lock_holder()               # another operation holds the agent now
+        rc, err, _seen = self.launch_with(L)
+        self.assertEqual(rc, cm.EXIT_HELD, err)
+        self.assertIn("may claim (stale)", err)
+        self.assertFalse(grant.exists(), "the stale grant was removed")
+        unhold(holder)
+
+    def test_a_stray_launcher_that_claims_connects_start_is_not_taken_for_the_job(self):
+        fake, real, stray = self.fake(), cm.start_supervisor, []
+
+        def stray_first(shape, **kw):
+            if shape is L and not stray:
+                stray.append(launched(self.root, L.name))   # a launcher the manager did not start
+            return real(shape, **kw)
+        with mock.patch.object(cm, "start_supervisor", side_effect=stray_first):
+            rc, out, err = self.connect(Backend(), fake)
+        try:
+            self.assertNotEqual(rc, 0, out + err)
+            self.assertIn(f"(pid {stray[0].pid}) is not the process {cm.job_name(L)} runs as", err)
+            self.assertIsNone(stray[0].poll(), "the stray is left as it is")
+        finally:
+            unhold(stray[0])
+
+    def test_install_holds_one_agent_lock_across_its_setup_and_its_bridge(self):
+        fake = self.fake()
+        seed_seat(cb.bridge_home(self.root), BEARER)
+        real, gap = cm.install, []
+
+        def installed_then_uninstall_tries(*a, **kw):
+            rc = real(*a, **kw)
+            got = []
+            t = threading.Thread(target=lambda: got.append(cm.uninstall(L)))
+            with mock.patch.object(cm, "AGENT_LOCK_WAIT_S", 0.3), contextlib.redirect_stderr(io.StringIO()) as err:
+                t.start()
+                t.join(30)
+            gap.append((got[0], err.getvalue()))
+            return rc
+        with mock.patch.object(cm, "install", side_effect=installed_then_uninstall_tries):
+            rc, out, err = (lambda fake: self._main_with(fake, "install", "--token-env-file", cb.seat_file(self.root), "--codex-home", str(self.codex_home)))(fake)
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(gap[0][0], 1, "uninstall could not step in between install's setup and its bridge")
+        self.assertIn("another operation on this agent is in progress", gap[0][1])
+        self.assertTrue(cli.config_path().exists() and cm.service_path(B).exists(), "installed and wired whole")
+
+    def test_uninstall_rereads_the_root_under_its_lock_and_never_acts_on_an_unlocked_one(self):
+        a, b, c = self.home / "agents" / "agent-a", self.home / "agents" / "agent-b", self.home / "agents" / "agent-c"
+        for swaps, acted in (([b], True), ([b, c], False)):
+            with self.subTest(swaps=len(swaps)):
+                self.configure(ROOT=str(a))
+                real_lock, real_un, todo, ran = cm.agent_lock, cm._uninstall_locked, list(swaps), []
+
+                def lock(root, *args, **kw):
+                    got = real_lock(root, *args, **kw)
+                    if todo:
+                        self.configure(ROOT=str(todo.pop(0)))   # another install moves the root meanwhile
+                    return got
+
+                def uninstall_locked(*args, **kw):
+                    root = cm.read_config(cli.config_path())["ROOT"]
+                    ran.append((root, any(str(cm.agent_lock_path(root)) in str(k) for k in cm._AGENT_HELD)))
+                    return 0
+                err = io.StringIO()
+                with mock.patch.object(cm, "agent_lock", side_effect=lock), \
+                        mock.patch.object(cm, "_uninstall_locked", side_effect=uninstall_locked), \
+                        contextlib.redirect_stderr(err):
+                    rc = cm.uninstall(L)
+                if acted:
+                    self.assertEqual((rc, ran), (0, [(str(b), True)]), "acted on B with B's lock held")
+                else:
+                    self.assertEqual((rc, ran), (1, []), "fail closed: nothing acted on")
+                    self.assertIn("configured root changed while uninstall waited for its lock", err.getvalue())
+
+    def test_uninstall_with_no_config_waits_out_any_agent_operation(self):
+        self.root.mkdir(parents=True)
+        holder = self.agent_lock_holder()
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(cm.uninstall(L), 1)
+        self.assertIn("no config names the root", err.getvalue())
+        unhold(holder)
+        with contextlib.redirect_stdout(io.StringIO()) as out, mock.patch.object(sm, "_run", side_effect=self.fake()):
+            self.assertEqual(cm.uninstall(L), 0)
+        self.assertIn("nothing to remove", out.getvalue())
+
+    def test_an_identity_mismatch_at_start_leaves_a_unit_that_is_no_longer_this_attempts(self):
+        fake, real = self.fake(), cm._fresh_holder
+        foreign = "[Service]\nExecStart=/a-successor\n"
+
+        def held_then_moved(*a, **kw):
+            rec = real(*a, **kw)
+            self.replace_root_now()
+            cm.supervisor_path(L).write_text(foreign)
+            return rec
+        with mock.patch.object(cm, "_fresh_holder", side_effect=held_then_moved):
+            rc, out, err = self.connect(Backend(), fake)
+        self.assertNotEqual(rc, 0, out + err)
+        self.assertIn("is no longer the job this connect started (its unit or launcher changed)", err)
+        self.assertIsNotNone(fake.runner.pid(), "not stopped")
+        self.assertEqual(cm.supervisor_path(L).read_text(), foreign)
 
     def test_a_running_job_refuses_connect_before_the_code_is_spent_and_is_left_running(self):
         fake = self.running_job()

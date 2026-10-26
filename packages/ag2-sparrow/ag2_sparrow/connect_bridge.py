@@ -220,6 +220,17 @@ def bridge_problem(cfg: dict, command: str, bridge: cm.Shape, now=None) -> str:
     return ""
 
 
+def under_agent_lock(root: str, fn) -> int:
+    """fn() under the agent lock for `root`, so an install's local setup and its bridge wiring are one
+    operation no other actor (an uninstall, the other adapter) can step into; 1 when it is busy."""
+    try:
+        with cm.agent_lock(root):
+            return fn()
+    except cm.Busy as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+
+
 def wire_bridge_bound(cfg: dict, command: str, bridge: cm.Shape, local: cm.Shape, root_id) -> str:
     """wire_bridge under the agent lock, held to connect's root (`root_id`, None outside connect): refused
     unless the root path names that directory before wiring and after. On a mismatch, or a wiring that

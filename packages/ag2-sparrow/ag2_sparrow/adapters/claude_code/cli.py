@@ -209,16 +209,20 @@ def install(args) -> int:
                 print("rotating the session id: the old generation is proven gone")
         session_id = kept or mint_session_id()
         return dict(values, SESSION_ID=session_id)
-    rc = cm.install(LOCAL, values, root, root_id=getattr(args, "root_identity", None), revise=revise,
-                    precheck=lambda r: inbox.root_problem(r) or records.agent_problem(r, agent_id), holder=holder_words)
-    if rc != 0 or mode == EXTERNAL:
-        return rc
-    problem = cb.wire_bridge_bound(dict(values, ROOT=root), COMMAND, BRIDGE, LOCAL, getattr(args, "root_identity", None))
-    if problem:
-        print(f"error: the session is installed but its bridge is not: {problem}; run {COMMAND} install again",
-              file=sys.stderr)
-        return EXIT_UNUSABLE
-    return 0
+    def installed() -> int:
+        rc = cm.install(LOCAL, values, root, root_id=getattr(args, "root_identity", None), revise=revise,
+                        precheck=lambda r: inbox.root_problem(r) or records.agent_problem(r, agent_id),
+                        holder=holder_words)
+        if rc != 0 or mode == EXTERNAL:
+            return rc
+        problem = cb.wire_bridge_bound(dict(values, ROOT=root), COMMAND, BRIDGE, LOCAL,
+                                       getattr(args, "root_identity", None))
+        if problem:
+            print(f"error: the session is installed but its bridge is not: {problem}; run {COMMAND} install again",
+                  file=sys.stderr)
+            return EXIT_UNUSABLE
+        return 0
+    return cb.under_agent_lock(root, installed)
 
 
 def hmac_settings(args) -> "tuple[str, bool, str, str]":
