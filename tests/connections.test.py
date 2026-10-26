@@ -741,6 +741,45 @@ class ImportFromChannelFile(ChannelFileBase):
         self.assertFalse(C.record_path(self.ws).exists())
 
 
+class AddAdoptsLaunchKeys(ChannelFileBase):
+    """A launch key the desktop host wrote but no row holds: an add of its server must adopt it under
+    the instance the host's launcher runs (the key's own suffix), never start a second bridge."""
+
+    def setUp(self):
+        super().setUp()
+        self.spawned = []
+        self.spawn = self.bridge_spawn(lambda argv, env, log_path: self.spawned.append(env["GATEWAY_INSTANCE"]))
+
+    def test_an_unimported_launch_key_in_the_channel_file_is_adopted(self):
+        (self.channel / ".env").write_text(f"AG2_REMOTE_TOKEN='{TOKEN_A}'\nAG2_REMOTE_TOKEN_BETA_FIXTURE_NET='{TOKEN_B}'\n")
+        row, created = self.add("https://relay.beta-fixture.net:8443|secret-panel", fetch=agents("@s:beta-fixture.net"))
+        self.assertFalse(created, "the launch key's row is the connection")
+        self.assertEqual((row["instance"], row["token_ref"]), ("beta_fixture_net", "AG2_REMOTE_TOKEN_BETA_FIXTURE_NET"))
+        self.assertEqual(self.vault.store["AG2_REMOTE_TOKEN_BETA_FIXTURE_NET"], TOKEN_B, "the launcher's token is kept")
+        self.assertEqual([r["instance"] for r in self.rows()], ["", "beta_fixture_net"], "one row per server")
+        C.start_added(row, repo=self.ws / "repo", logs_dir=self.ws / "logs", environ={}, workspace=self.ws,
+                      vault=self.vault, spawn=self.spawn)
+        desktop_lane = bridge_lease.start(self.ws, "beta_fixture_net", wait=False)
+        self.children.append(desktop_lane)
+        self.assertEqual(desktop_lane.wait(timeout=10), 75, "the desktop lane's bridge stands down to the same lease")
+        self.assertEqual(self.spawned, ["beta_fixture_net"])
+
+    def test_an_environment_launch_key_is_adopted_too(self):
+        with unittest.mock.patch.dict(os.environ, {"AG2_REMOTE_TOKEN_BETA_FIXTURE_NET": TOKEN_B}):
+            row, created = self.add(TOKEN_B, fetch=agents("@s:beta-fixture.net"))
+        self.assertEqual((created, row["instance"]), (False, "beta_fixture_net"))
+
+    def test_an_unreadable_channel_file_is_no_keys(self):
+        import channel_env_resolve
+        with unittest.mock.patch.object(channel_env_resolve, "resolve_channel_env", side_effect=OSError("denied")):
+            self.assertEqual(C.channel_launch_keys({"AG2_REMOTE_TOKEN_QA": " https://qa|q ", "AG2_REMOTE_TOKEN_NIL": ""}),
+                             {"AG2_REMOTE_TOKEN_QA": "https://qa|q"})
+
+    def test_without_launch_keys_the_server_slug_is_kept(self):
+        row, created = self.add(TOKEN_B, fetch=agents("@s:beta-fixture.net"))
+        self.assertEqual((created, row["instance"]), (True, "beta-fixture-net"))
+
+
 class ListSelfHeals(ChannelFileBase):
     def test_an_explicitly_emptied_record_is_not_refilled_from_the_file(self):
         self.write_relay_env(f"REMOTE_TASK_TOKEN={TOKEN_A}")
@@ -1157,6 +1196,24 @@ class Starting(Base):
             self.assertEqual((record["ok"], record["lease"], record["pid"], self.envs), (True, "already_running", bridge.pid, []))
         finally:
             bridge_lease.stop(bridge)
+
+    def test_two_concurrent_starts_leave_one_bridge(self):
+        self.add(TOKEN_B, fetch=agents("@s:beta-fixture.net"))
+        gate = threading.Barrier(2)
+        records = []
+
+        def go():
+            gate.wait()
+            records.append(C.start("beta-fixture-net", environ={}, spawn=self.spawn, **self.kw))
+        threads = [threading.Thread(target=go) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(30)
+        holder = C.bridge_pid("beta-fixture-net", self.ws)
+        live = [c for c in self.children if c.poll() is None]
+        self.assertEqual(([r["ok"] for r in records], [c.pid for c in live]), ([True, True], [holder]),
+                         "both starts succeed and exactly one bridge holds the lease")
 
     def test_a_failed_start_is_failed_with_its_reason(self):
         row, _ = self.add(TOKEN_B, fetch=agents("@s:beta-fixture.net"))

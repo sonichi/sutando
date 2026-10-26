@@ -106,7 +106,11 @@ Adding through the HTTP route or the runtime API **starts the row's bridge at on
 (`start_added`, which calls `start`: `launch` unless a process already holds the lease), so a
 saved connection never waits for the next restart; the response carries that `launch`
 record, and a start that fails leaves the row `failed` with its `reason`. A disabled row is
-not started (`reconnect` is the verb), nor the legacy row. The CLI `add` saves only; `start`
+not started (`reconnect` is the verb), nor the legacy row. Before saving, an add imports any
+`AG2_REMOTE_TOKEN_<INST>` launch key (environment or AG2 Space channel env file) that no row holds
+yet, under the instance its own launcher runs it as; a token for one of those servers adopts that row
+(`created: false`) rather than saving a second row whose bridge would hold another lease. `start`'s
+check for a running bridge is advisory; the bridge lease is what keeps one holder. The CLI `add` saves only; `start`
 runs the same unit. Adding is **idempotent per connection** and starts no second bridge (the
 bridge's singleton lock is the backstop, not the policy). A row whose server the registry or an
 identity vouches for (`resolver`/`identity`) matches a token for the same server, so one

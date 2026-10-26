@@ -866,13 +866,33 @@ def known_servers(workspace: Optional[Path] = None, *, instances=None) -> list:
     return out
 
 
+def channel_launch_keys(environ: Optional[Mapping[str, str]] = None) -> dict:
+    """{var: token} for every `AG2_REMOTE_TOKEN_<INST>` the AG2 Space channel env file sets, then the
+    environment's (which win): the launch keys a desktop host writes after the engine started."""
+    environ = os.environ if environ is None else environ
+    found = {}
+    try:
+        from channel_env_resolve import resolve_channel_env
+        from channel_token import token_from_env_file
+        from util_paths import claude_home_path
+        path = resolve_channel_env(claude_home_path("channels"), "ag2space")
+        names = re.findall(r"^\s*(AG2_REMOTE_TOKEN_[A-Za-z0-9_]+)=", path.read_text(), re.M) if path else []
+        found = {v: token_from_env_file(v, path) for v in names}
+    except Exception:  # noqa: BLE001 - no channel home or an unreadable file is simply no keys
+        found = {}
+    found.update({v: environ[v] for v in environ if _ENV_VAR_RE.match(v)})
+    return {v: t.strip() for v, t in found.items() if t and t.strip()}
+
+
 def add_connection(token: str, *, added_by: str, expected_server: str, instance: Optional[str] = None,
                    preview: Optional[dict] = None, fetch: Optional[Callable] = None,
                    resolver=None, getaddrinfo=None, workspace: Optional[Path] = None,
-                   vault=None) -> "tuple[dict, bool]":
+                   vault=None, environ: Optional[Mapping[str, str]] = None) -> "tuple[dict, bool]":
     """Save the token as a row once its gateway still answers to `expected_server`.
 
-    Returns (row, created). The same connection (see `_same_connection`) returns its row,
+    Launch keys not yet in the record (`channel_launch_keys`) are imported first, under the instance
+    their launcher already runs them as, so a token for one of their servers adopts that row instead
+    of starting a second bridge on another slug. Returns (row, created). The same connection (see `_same_connection`) returns its row,
     re-keyed to the identity's server when the row was provisional and this preview is
     verified, and touches the vault never. The row is primary only when the install has no
     primary yet (the first row ever saved); later rows never are. The secret goes to the vault
@@ -898,6 +918,9 @@ def add_connection(token: str, *, added_by: str, expected_server: str, instance:
         raise ConnectionsError(f"instance {inst!r} is a reserved name ({', '.join(RESERVED_INSTANCES)}); pass another")
     ref = token_ref_for(inst)
     vault = _vault(vault)
+    keys = channel_launch_keys(environ)
+    if keys:
+        import_from_env(keys, workspace=workspace, vault=vault, resolver=resolver)
     stored = False
     try:
         with _transaction(workspace) as rec:
@@ -1473,6 +1496,8 @@ def start(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Mappin
           workspace: Optional[Path] = None, vault=None, spawn=None, python: Optional[str] = None) -> dict:
     """`launch`, unless a process is already proven to hold the lease (`lease: already_running`,
     nothing spawned). A launch that fails returns its record (`ok` false, `reason`), never raises."""
+    # Advisory, outside the record lock: it only saves a spawn. The bridge's lease is what keeps
+    # one holder; a racing start's child stands down to it and `launch` records that.
     holder = _proven_holder(instance, workspace)
     if holder:
         return {"instance": instance, "ok": True, "pid": holder, "lease": "already_running"}
