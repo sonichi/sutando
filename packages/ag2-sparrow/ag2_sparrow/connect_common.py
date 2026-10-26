@@ -693,40 +693,60 @@ def launcher_log(shape: Shape) -> str:
 CONNECT_HOLDER = "connect"
 
 
-def under_root(shape: Shape, root: str, act, precheck=None) -> "tuple[object, str]":
-    """(act(owner), '') run while this process holds `root`'s lock as `owner`; act returns (value, problem)
-    and binds itself to owner's root (root_is_held). A free root is taken; one held by `shape`'s own job on
-    this very root is stopped, then taken, and that job is started again on any path where act did not
-    succeed. `precheck()` refuses before anything stops; anything else is (None, why) and act never runs."""
+def under_root(shape: Shape, root: str, act, precheck=None) -> "tuple[object, str, tuple | None]":
+    """(act(owner), '', stopped) run while this process holds `root`'s lock as `owner`; act returns (value,
+    problem) and binds itself to owner's root (root_is_held). A free root is taken; one held by `shape`'s own
+    job on this very root is stopped, then taken. `precheck()` refuses before anything stops; anything else
+    is (None, why, None) and act never runs. When act fails the stopped job is started again here; when it
+    succeeds, `stopped` is the identity of the root whose job is still stopped, which the caller restores
+    (restore_stopped) unless its own install succeeds."""
     try:
         with operation_lock(shape):
             problem, _manager, held = _root_lock(shape, root)
             problem = problem or (precheck() if precheck is not None else "")
             if problem:
-                return None, problem
+                return None, problem, None
+            root_id = dir_identity(root) if held else None
             done = False
             try:
                 if held:
                     problem = stop_supervisor(shape) or _await_free(root)
                     if problem:
-                        return None, problem
+                        return None, problem, None
                     print(f"stopped: {job_name(shape)}")
                 Path(root).mkdir(parents=True, exist_ok=True)
                 try:
                     owner = acquire_lock(root, CONNECT_HOLDER)
                 except LockRefused as e:
-                    return None, f"{root} was taken by another process first ({e.line})"
+                    return None, f"{root} was taken by another process first ({e.line})", None
                 try:
-                    result = act(owner)
+                    if held and _fd_identity(owner.root_fd) != root_id:
+                        result = ("", f"{root} was replaced while {job_name(shape)} was stopped; nothing was written")
+                    else:
+                        result = act(owner)
                 finally:
                     release_lock(owner)
                 done = not result[1]
-                return result, ""
+                return result, "", root_id if done else None
             finally:
                 if held and not done:
-                    _restart_stopped(shape, root)
+                    _restart_stopped(shape, root, root_id)
     except Busy as e:
-        return None, str(e)
+        return None, str(e), None
+
+
+def dir_identity(path) -> "tuple | None":
+    """(st_dev, st_ino) of the directory `path` names (a link is not followed), else None."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return None
+    return (st.st_dev, st.st_ino) if stat.S_ISDIR(st.st_mode) else None
+
+
+def _fd_identity(fd: int) -> tuple:
+    st = os.fstat(fd)
+    return st.st_dev, st.st_ino
 
 
 def start_command(shape: Shape) -> str:
@@ -736,15 +756,31 @@ def start_command(shape: Shape) -> str:
     return f"systemctl --user enable --now {shape.service_name}"
 
 
-def _restart_stopped(shape: Shape, root: str) -> None:
-    """Start the job under_root stopped and confirm a fresh launcher of it holds `root` again; else say so
-    on stderr with the command that starts it."""
+def restore_stopped(shape: Shape, root: str, root_id: tuple) -> None:
+    """Start again, under the operation lock, the job under_root stopped on the root `root_id` names."""
+    try:
+        with operation_lock(shape):
+            _restart_stopped(shape, root, root_id)
+    except Busy as e:
+        print(f"error: {job_name(shape)} was stopped for this connect and was not started again ({e}); start it "
+              f"with: {start_command(shape)}", file=sys.stderr)
+
+
+def _restart_stopped(shape: Shape, root: str, root_id) -> None:
+    """Start the stopped job only while `root` still names the directory it served (`root_id`), and confirm
+    a fresh launcher of it holds that directory; else say so on stderr with the command that starts it."""
+    if root_id is None or dir_identity(root) != root_id:
+        print(f"error: {job_name(shape)} was stopped for this connect and was not started again: {root} is no "
+              f"longer the directory it served (it was replaced while the job was stopped); check what is at "
+              f"{root} now, then start it with: {start_command(shape)}", file=sys.stderr)
+        return
     problem = start_supervisor(shape)
     rec = None if problem else _fresh_holder(shape, root, {})
-    if rec is not None:
+    if rec is not None and dir_identity(root) == root_id:
         print(f"started again: {job_name(shape)} (launcher pid {rec['pid']})")
         return
-    why = problem or f"no launcher of it took {root} within {CONFIRM_TIMEOUT_S:.0f} s ({holder_line(root)})"
+    why = problem or (f"{root} was replaced while it started" if rec is not None else
+                      f"no launcher of it took {root} within {CONFIRM_TIMEOUT_S:.0f} s ({holder_line(root)})")
     print(f"error: {job_name(shape)} was stopped for this connect and did not start again: {why}; start it "
           f"with: {start_command(shape)}", file=sys.stderr)
 
@@ -1331,16 +1367,14 @@ def _open_seat_dirs(seat) -> "list[int]":
     return fds
 
 
+def _seat_paths_bound(seat, fds) -> bool:
+    """Each seat path still names the directory held open at the matching fd."""
+    return all(dir_identity(path) == _fd_identity(fd) for path, fd in zip(_seat_dirs(seat), fds))
+
+
 def _seat_bound(owner, root: str, seat, fds) -> bool:
     """Each seat path still names the directory held open and, last, `root` still names owner's."""
-    for path, fd in zip(_seat_dirs(seat), fds):
-        try:
-            here, held = os.lstat(path), os.fstat(fd)
-        except OSError:
-            return False
-        if (here.st_dev, here.st_ino) != (held.st_dev, held.st_ino):
-            return False
-    return root_is_held(owner, root)
+    return _seat_paths_bound(seat, fds) and root_is_held(owner, root)
 
 
 SEAT_FILE_MAX = 64 * 1024
@@ -1414,24 +1448,25 @@ def _put_at(dir_fd: int, name: str, data: "bytes | None") -> None:
 
 
 def seat_problem(seat) -> str:
-    """'' when the seat can be written now, else why not, changing nothing but the seat's lockfile: each
-    existing seat directory opens without following a link, its files are regular and within
-    SEAT_FILE_MAX, and the seat lock can be taken. A seat not there yet is ''."""
+    """'' when the seat can be written now, else why not, changing nothing but the seat's lockfile: the seat
+    lock can be taken first, then each existing seat directory opens without following a link and its files
+    are regular and within SEAT_FILE_MAX. A seat not there yet is ''."""
     fds = []
     try:
         parent = os.open(os.path.dirname(_seat_dirs(seat)[0]), _DIR_OPEN)
         try:
-            for path in _seat_dirs(seat):
-                try:
-                    fds.append(os.open(os.path.basename(path), _DIR_OPEN, dir_fd=fds[-1] if fds else parent))
-                except FileNotFoundError:
-                    return ""
+            fds.append(os.open(os.path.basename(_seat_dirs(seat)[0]), _DIR_OPEN, dir_fd=parent))
         finally:
             os.close(parent)
-        for name in (_sources.SEAT_TOKEN_NAME, ".env"):
-            _read_at(fds[-1], name)
         with seat_lock(fds[0]):
-            return ""
+            for path in _seat_dirs(seat)[1:]:
+                try:
+                    fds.append(os.open(os.path.basename(path), _DIR_OPEN, dir_fd=fds[-1]))
+                except FileNotFoundError:
+                    return ""
+            for name in (_sources.SEAT_TOKEN_NAME, ".env"):
+                _read_at(fds[-1], name)
+        return ""
     except FileNotFoundError:
         return ""
     except OSError as e:
@@ -1514,6 +1549,8 @@ def write_seat(seat, redeemed: dict) -> "tuple[str, str]":
         return "", f"the seat {seat} could not be opened ({e.strerror or e})"
     try:
         with seat_lock(fds[0]):
+            if not _seat_paths_bound(seat, fds):
+                return "", f"the seat {seat} was replaced while it was opened; it was not written"
             written, problem = _rendered_seat(seat, redeemed, _read_at(fds[-1], ".env"))
             if problem:
                 return "", problem

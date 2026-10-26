@@ -162,17 +162,12 @@ def install(args) -> int:
     if not (plugin / ".claude-plugin" / "plugin.json").is_file():
         print(f"error: {plugin} is not a Claude Code plugin (no .claude-plugin/plugin.json)", file=sys.stderr)
         return EXIT_UNUSABLE
-    key_file = str(Path(args.hmac_key_file).expanduser().resolve()) if args.hmac_key_file else ""
-    strict = args.hmac_strict or bool(key_file and not args.no_hmac_strict)
-    if strict:
-        problem = key_problem(key_file)
-        # A key not there yet is recorded, not refused: strictness is decided per task from the file as it is then.
-        if problem and not (key_file and hmac_policy.key_absent(key_file)):
-            why = "--hmac-strict" if args.hmac_strict else "strict mode, the default with --hmac-key-file (--no-hmac-strict opts out),"
-            print(f"error: {why} needs a usable key: {problem}", file=sys.stderr)
-            return EXIT_UNUSABLE
-        if problem:
-            print(f"warning: {problem}; it is read per task, so a key written there later is honoured without a reinstall")
+    key_file, strict, problem, note = hmac_settings(args)
+    if problem:
+        print(f"error: {problem}", file=sys.stderr)
+        return EXIT_UNUSABLE
+    if note:
+        print(f"warning: {note}; it is read per task, so a key written there later is honoured without a reinstall")
     where, problem = resolve_root(args)
     if problem:
         print(f"error: {problem}", file=sys.stderr)
@@ -226,6 +221,19 @@ def install(args) -> int:
     return 0
 
 
+def hmac_settings(args) -> "tuple[str, bool, str, str]":
+    """(key file, strict, the refusal, a warning) from the hmac options, as install records them and connect
+    checks them before anything is spent or stopped."""
+    key_file = str(Path(args.hmac_key_file).expanduser().resolve()) if args.hmac_key_file else ""
+    strict = args.hmac_strict or bool(key_file and not args.no_hmac_strict)
+    problem = key_problem(key_file) if strict else ""
+    # A key not there yet is recorded, not refused: strictness is decided per task from the file as it is then.
+    if problem and not (key_file and hmac_policy.key_absent(key_file)):
+        why = "--hmac-strict" if args.hmac_strict else "strict mode, the default with --hmac-key-file (--no-hmac-strict opts out),"
+        return key_file, strict, f"{why} needs a usable key: {problem}", ""
+    return key_file, strict, "", problem
+
+
 def plugin_dir(args) -> Path:
     """--plugin-dir when given, else the ag2space-inbox plugin this package ships."""
     return Path(args.plugin_dir).expanduser().resolve() if args.plugin_dir else PLUGIN
@@ -243,7 +251,7 @@ def connect_preflight(args) -> str:
     login = {"CLAUDE": os.path.abspath(claude), "CLAUDE_CONFIG_DIR": str(Path(args.claude_config_dir).expanduser()
                                                                          .resolve()) if args.claude_config_dir else ""}
     return (version_problem(claude) or launcher.tmux_problem() or launcher.socket_problem(config_dir())
-            or auth_problem(login))
+            or auth_problem(login) or hmac_settings(args)[2])
 
 
 def connect(args) -> int:
@@ -254,10 +262,13 @@ def connect(args) -> int:
     if problem:
         print(f"error: {problem}", file=sys.stderr)
         return EXIT_UNUSABLE
-    print(cm.served_setup_line(SETUP_VENDOR))
     session = {k: v for k, v in vars(args).items() if k not in ("code", "trust_relay_host")}
-    rc = install(argparse.Namespace(**session, work=None, inbox=None, token_env_file=seat["seat_env"],
-                                    bridge_state_dir=None))
+
+    def installed() -> int:
+        print(cm.served_setup_line(SETUP_VENDOR))
+        return install(argparse.Namespace(**session, work=None, inbox=None, token_env_file=seat["seat_env"],
+                                          bridge_state_dir=None))
+    rc = cb.install_restoring(LOCAL, seat, installed)
     if rc == 0:
         print(f"next: {COMMAND} verify (the bridge reports connected within a minute)")
     else:

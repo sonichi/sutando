@@ -2627,33 +2627,101 @@ class ConnectCode(AgentRootBase):
         if pid is not None:
             self.assertEqual(fake.runner.pid(), pid, "the same launcher, never stopped")
 
+    def seat_lock_holder(self):
+        p = subprocess.Popen([sys.executable, "-c", SEAT_HOLDER, str(cli.bridge_home(self.root) / ".seat.lock")],
+                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        self.assertEqual(p.stdout.readline().strip(), "held")
+        return p
+
     def test_a_reconnect_the_seat_refuses_leaves_the_running_job_as_it_was(self):
         rotated = Backend(answer={"relay_url": RELAY, "bearer": "rotated-bearer-OOOO5555", "agent_id": AGENT})
-        for name in ("fifo token", "oversized token", "seat lock held"):
+        for name in ("fifo token", "oversized token", "seat lock held", "seat lock held, no channel dir"):
             with self.subTest(name):
                 fake = self.running_job()
                 pid, token, holder = fake.runner.pid(), self.seat() / "token", None
-                if name == "fifo token":
-                    token.unlink()
-                    os.mkfifo(token)
-                elif name == "oversized token":
-                    token.write_bytes(b"x" * (64 * 1024 + 1))
-                else:
-                    holder = subprocess.Popen([sys.executable, "-c", SEAT_HOLDER, str(cli.bridge_home(self.root) / ".seat.lock")],
-                                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
-                    self.assertEqual(holder.stdout.readline().strip(), "held")
                 try:
+                    if name == "fifo token":
+                        token.unlink()
+                        os.mkfifo(token)
+                    elif name == "oversized token":
+                        token.write_bytes(b"x" * (64 * 1024 + 1))
+                    else:
+                        if name.endswith("no channel dir"):
+                            shutil.rmtree(self.seat().parent)
+                        holder = self.seat_lock_holder()
                     with mock.patch.object(cm, "SEAT_WAIT_S", 0.3, create=True):
                         rc, out, err = self.connect(rotated, fake)
+                    self.assertEqual(rc, cli.EXIT_UNUSABLE, out + err)
+                    self.assertNotIn("connected:", out)
+                    self.assertNotIn("stopped:", out, "nothing was stopped for a refusal known in advance")
+                    self.assert_job_runs(fake, pid)
                 finally:
                     if holder is not None:
                         unhold(holder)
-                self.assertEqual(rc, cli.EXIT_UNUSABLE, out + err)
-                self.assertNotIn("connected:", out)
-                self.assertNotIn("stopped:", out, "nothing was stopped for a refusal known in advance")
-                self.assert_job_runs(fake, pid)
-                fake.runner.stop_session()
-                token.unlink(missing_ok=True)
+                    fake.runner.stop_session()
+                    token.unlink(missing_ok=True)
+
+    def test_an_unusable_hmac_key_is_refused_before_the_code_is_spent_or_the_job_stopped(self):
+        fake = self.running_job()
+        pid = fake.runner.pid()
+        (self.home / "task-hmac.key").write_text("not-a-key")
+        backend = Backend()
+        rc, out, err = self.connect(backend, fake)
+        self.assertEqual(rc, cli.EXIT_UNUSABLE, out + err)
+        self.assertIn("needs a usable key", err)
+        self.assertIn("the code was not used", err)
+        self.assertEqual(backend.calls, [], "the code is not spent")
+        self.assertNotIn("stopped:", out)
+        self.assert_job_runs(fake, pid)
+
+    def test_an_install_refusal_after_the_seat_starts_the_stopped_job_again(self):
+        fake = self.running_job()
+        cm.supervisor_path(L).write_text("[Service]\nExecStart=/somebody-elses\n")
+        rc, out, err = self.connect(Backend(), fake)
+        self.assertEqual(rc, 1, out + err)
+        self.assertIn(f"stopped: {cm.job_name(L)}", out)
+        self.assertIn("connected: ", out, "the seat was written before install refused")
+        self.assertIn("was not written by install", err)
+        self.assertIn(f"started again: {cm.job_name(L)} (launcher pid {fake.runner.pid()})", out)
+        self.assert_job_runs(fake)
+
+    def test_a_root_replaced_while_its_job_is_stopped_never_gets_the_job_back(self):
+        fake = self.running_job()
+        real, calls = cm.root_is_held, []
+
+        def checked(owner, root):
+            if calls:
+                os.rename(root, root + ".parked")
+                os.mkdir(root)
+            calls.append(root)
+            return real(owner, root)
+        with mock.patch.object(cm, "root_is_held", side_effect=checked):
+            rc, out, err = self.connect(Backend(), fake)
+        self.assertEqual(rc, cli.EXIT_UNUSABLE, out + err)
+        self.assertIn(f"stopped: {cm.job_name(L)}", out)
+        self.assertIsNone(fake.runner.pid(), "no launcher was started on the replacement")
+        self.assertEqual(task_io.lock_held(str(self.root)), "free")
+        self.assertIn(f"error: {cm.job_name(L)} was stopped for this connect and was not started again: "
+                      f"{self.root} is no longer the directory it served", err)
+        self.assertIn(f"start it with: systemctl --user enable --now {L.service_name}", err)
+
+    def test_plain_write_seat_refuses_a_seat_replaced_after_it_was_opened(self):
+        self.seated_by_another_adapter()
+        seat, before = cli.bridge_home(self.root), (self.seat() / "token").read_bytes()
+        real = cm.seat_lock
+
+        @contextlib.contextmanager
+        def swapped(fd):
+            os.rename(seat, str(seat) + ".moved")
+            os.mkdir(seat)
+            with real(fd) as got:
+                yield got
+        with mock.patch.object(cm, "seat_lock", side_effect=swapped):
+            env, why = cm.write_seat(seat, {"relay_url": RELAY, "bearer": BEARER, "agent_id": AGENT})
+        self.assertEqual(env, "")
+        self.assertIn("was replaced while it was opened", why)
+        self.assertEqual(os.listdir(seat), [], "the seat now at the path is untouched")
+        self.assertEqual((Path(str(seat) + ".moved") / "channels" / "ag2space" / "token").read_bytes(), before)
 
     def test_a_job_stopped_for_a_write_that_then_refuses_is_started_again(self):
         fake = self.running_job()
