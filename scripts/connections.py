@@ -5,9 +5,25 @@
   add TOKEN [--yes --expected-server NAME] [--added-by owner] [--instance SLUG]
                                TOKEN is 'https://<gateway>|<secret>', or '-' to read it from stdin.
                                Without --yes: print the preview and ask before saving.
-  set-primary INSTANCE         move proactive/owner-DM defaults to this connection
+  set-primary INSTANCE         move proactive/owner-DM defaults to this connection; refused on a
+                               disconnected row (disabled_cannot_be_primary); a running bridge
+                               takes the room at its next reconnect ("reconnect it" is printed)
   remove INSTANCE [--force]    drop the row and its vault key; the primary needs --force
-  reconnect INSTANCE --repo DIR --logs-dir DIR   stop and relaunch that one bridge
+  disconnect INSTANCE          stop that bridge, then keep the row, token and launch record out of
+                               the plan until reconnect; refused on the primary, on the legacy
+                               row (legacy_row_unmanaged) and while the bridge will not stop
+                               (bridge_still_running: nothing changed)
+  reconnect INSTANCE --repo DIR --logs-dir DIR   stop and relaunch that one bridge (re-enables it)
+  update-token INSTANCE - --repo DIR --logs-dir DIR
+                               replace the row's secret with a new code for the same server and
+                               agent, re-enable and relaunch. '-' reads the code from stdin, which
+                               keeps it out of the process list; a literal code in its place works
+                               for scripts. Refused by code: token_source_shadowed (the row's
+                               AG2_REMOTE_TOKEN_<INST> is set in the environment: unset it first),
+                               token_server_mismatch, token_agent_mismatch, token_unverified (the
+                               gateway did not confirm the row's agent), token_rejected,
+                               legacy_row_unmanaged, bridge_still_running
+  known-servers [--json]       the resolver's DotSpace instances, each with its row if one exists
   launch INSTANCE --repo DIR --logs-dir DIR [--env-only]
                                start one bridge from the launch plan (--env-only: from the
                                AG2_REMOTE_TOKEN_<INST> variable alone, when the record is unreadable)
@@ -86,13 +102,36 @@ def cmd_add(args) -> int:
 
 def cmd_set_primary(args) -> int:
     row = connections.set_primary(args.instance, workspace=args.workspace)
-    print(f"primary is now {row['instance'] or '(legacy)'} ({row['server']})")
+    hint = "; its running bridge carries the proactive room after you reconnect it" if row.get("relaunch_needed") else ""
+    print(f"primary is now {row['instance'] or '(legacy)'} ({row['server']}){hint}")
     return 0
 
 
 def cmd_remove(args) -> int:
     row = connections.remove_connection(args.instance, force=args.force, workspace=args.workspace)
     print(f"removed {row['instance'] or '(legacy)'} ({row['token_ref']} deleted from the vault)")
+    return 0
+
+
+def cmd_disconnect(args) -> int:
+    row = connections.disconnect(args.instance, workspace=args.workspace)
+    stopped = f"stopped pid {row['stopped_pid']}; " if row.get("stopped_pid") else ""
+    print(f"disconnected {args.instance} ({stopped}token kept in vault as {row['token_ref']}; "
+          "reconnect to resume)")
+    return 0
+
+
+def cmd_known_servers(args) -> int:
+    servers = connections.known_servers(args.workspace)
+    if args.json:
+        print(json.dumps(servers, indent=2, sort_keys=True))
+        return 0
+    head = ("SERVER", "CONNECTED", "INSTANCE", "PRIMARY", "DISABLED")
+    body = [(s["server"], "yes" if s["connected"] else "no", s["instance"] or "-",
+             "yes" if s["primary"] else "no", "yes" if s["disabled"] else "no") for s in servers]
+    widths = [max(len(str(line[i])) for line in [head, *body]) for i in range(len(head))]
+    fmt = "  ".join("{:<%d}" % w for w in widths)
+    print("\n".join(fmt.format(*line).rstrip() for line in [head, *body]) if servers else "no known servers")
     return 0
 
 
@@ -107,6 +146,17 @@ def cmd_reconnect(args) -> int:
     record = connections.reconnect(args.instance, repo=args.repo, logs_dir=args.logs_dir, workspace=args.workspace)
     stopped = f"stopped pid {record['stopped_pid']}, " if record.get("stopped_pid") else ""
     print(f"reconnected {args.instance} ({stopped}pid {record['pid']})")
+    return 0
+
+
+def cmd_update_token(args) -> int:
+    token = sys.stdin.read().strip() if args.token == "-" else args.token
+    row = connections.update_token(args.instance, token, repo=args.repo, logs_dir=args.logs_dir,
+                                   workspace=args.workspace)
+    launched = row.get("launch") or {}
+    relaunch = (f"relaunched, pid {launched['pid']}" if launched.get("ok") else
+                f"relaunch failed: {launched.get('reason') or 'launch_failed'}")
+    print(f"updated token of {args.instance} ({row['server']}; vault key {row['token_ref']} replaced; {relaunch})")
     return 0
 
 
@@ -159,9 +209,18 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("set-primary"); s.add_argument("instance"); s.set_defaults(fn=cmd_set_primary)
     s = sub.add_parser("remove"); s.add_argument("instance"); s.add_argument("--force", action="store_true")
     s.set_defaults(fn=cmd_remove)
+    s = sub.add_parser("disconnect"); s.add_argument("instance"); s.set_defaults(fn=cmd_disconnect)
+    s = sub.add_parser("known-servers"); s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_known_servers)
     s = sub.add_parser("launch"); _launch_args(s); s.add_argument("--env-only", action="store_true")
     s.set_defaults(fn=cmd_launch)
     s = sub.add_parser("reconnect"); _launch_args(s); s.set_defaults(fn=cmd_reconnect)
+    s = sub.add_parser("update-token"); s.add_argument("instance")
+    s.add_argument("token", metavar="TOKEN|-",
+                   help="'-' reads the new code from stdin (keeps it out of the process list); "
+                        "a literal 'https://<gateway>|<secret>' works for scripts")
+    s.add_argument("--repo", type=Path, required=True); s.add_argument("--logs-dir", type=Path, required=True)
+    s.set_defaults(fn=cmd_update_token)
     sub.add_parser("import-env").set_defaults(fn=cmd_import_env)
     sub.add_parser("launch-plan").set_defaults(fn=cmd_launch_plan)
     sub.add_parser("primary").set_defaults(fn=cmd_primary)

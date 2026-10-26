@@ -27,6 +27,7 @@ import uuid
 from pathlib import Path
 
 from ... import _dirs, agent_identity, connect_common as cm, gateway_credential_sources as _sources, task_io
+from ...bounded_file_read import read_regular
 from ...connect_common import EXIT_CHILD_HELD, EXIT_HELD, EXIT_UNUSABLE, _v  # noqa: F401
 from ... import claude_local_accepter as accepter, claude_local_card as card, claude_local_records as records
 from . import detector, hmac_policy, hold, inbox, launcher, trust
@@ -149,6 +150,17 @@ def bridge_env(root, agent_id: str, token_file: str = "", state=None) -> dict:
     return env
 
 
+def seat_env(token_file: str, agent_id: str) -> "tuple[dict, str]":
+    """(the seat's launch variables, '') when `token_file` is a seat .env, ({}, '') when it is none, or
+    ({}, why): the credential owner exports the seat and clears what the bridge would inherit."""
+    if not token_file:
+        return {}, ""
+    seat, problem = _sources.seat_bridge_environ(token_file, read_regular)
+    if not problem and seat and seat["AGENT_MXID"] != agent_id:
+        problem = f"the seat .env {token_file} names {seat['AGENT_MXID']}, not {agent_id}"
+    return ({}, problem) if problem else (seat, "")
+
+
 def install_identity(token_file: str, host_binding: bool) -> str:
     """The agent id by the bridge's own chain over the token file it will run with; the host's binding
     counts only when that file is the host's own device env."""
@@ -218,6 +230,10 @@ def wire_bridge(cfg: dict) -> str:
     declaration the host's supervisor runs. '' or why not."""
     root, mode = cm.work_root(cfg), bridge_mode(cfg)
     env = bridge_env(root, cfg["AGENT_ID"], cfg.get("TOKEN_ENV_FILE", ""), bridge_state(cfg))
+    seat, problem = seat_env(cfg.get("TOKEN_ENV_FILE", ""), cfg["AGENT_ID"])
+    if problem:
+        return problem
+    env.update(seat)
     bridge_state(cfg).mkdir(parents=True, exist_ok=True)
     if mode != UNIT:
         path = bridge_home(root) / DECLARATION

@@ -1200,14 +1200,16 @@ class NoCeiling(_Loop):
         self.bridges.stop(first)
         age_retry(self.outbox_root, ASK_A, 700)
         token_file.write_text("REMOTE_TASK_TOKEN=rotated-secret\n")       # the re-onboard lands
+        token_file.chmod(0o600)
         second = self.bridges.start()
         self.bridges.wait_for(lambda: self.relay.results, second, "the result sent again")
         self.bridges.wait_for(lambda: not self.state("remote-task-ack-first"), second, "its mark retired")
         self.bridges.polls_after(second)
         self.bridges.stop(second)
-        self.assertGreaterEqual(self.logged("waiting for token rotation")
-                                + self.logged("token file already rotated"), 1,
-                                "the poll loop never entered its credential recovery")
+        # A bridge started after the re-onboard takes the rotated token from the file at startup.
+        self.assertGreaterEqual(self.logged("waiting for token rotation") + self.logged("token file already rotated")
+                                + self.logged("token loaded from REMOTE_TASK_TOKEN_FILE"), 1,
+                                "the rotated credential was never picked up from the token file")
         self.assertEqual(self.relay.results, [ANSWER])
         accepted = [bearer for p, bearer in self.relay.posted if p == ANSWER]
         self.assertEqual(accepted[-1], "Bearer rotated-secret")

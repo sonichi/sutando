@@ -297,14 +297,20 @@ class RuntimeDispatcher:
                                     "connections surface is not configured on this daemon")
             if method == "connection.list":
                 return self.connections.list_connections()
+            if method == "connection.known_servers":
+                return self.connections.known_servers()
             if method == "connection.add":
                 return self.connections.add(params)
             if method == "connection.remove":
                 return self.connections.remove(params)
             if method == "connection.set_primary":
                 return self.connections.set_primary(params)
+            if method == "connection.disconnect":
+                return self.connections.disconnect(params)
             if method == "connection.reconnect":
                 return self.connections.reconnect(params)
+            if method == "connection.update_token":
+                return self.connections.update_token(params)
         if method.startswith("task."):
             return self._task(method, params)
         raise ProtocolError(-32601, f"unknown method {method}")

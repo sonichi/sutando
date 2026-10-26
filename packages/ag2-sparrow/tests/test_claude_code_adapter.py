@@ -2185,6 +2185,45 @@ class ConnectAgentRoot(AgentRootBase):
         self.assertEqual(fake.verbs(), ["show", "stop", "disable", "show", "enable", "restart"],
                          "a reinstall stops the old bridge, proves it stopped, then starts the new unit")
 
+    def test_a_seat_token_env_file_runs_the_bridge_as_that_seat_alone(self):
+        from ag2_sparrow import gateway_credential_sources as owner
+        seat = self.home / "seat"
+        bearer = "seat-bearer-LLLL2222"
+        self.assertEqual(owner.write_seat_credentials(seat, agent_id=AGENT, instance="c" * 32, tier="team",
+                                                      relay_url="https://gw.example/relay", bearer=bearer), "")
+        seat_env = seat / "channels" / "ag2space" / ".env"
+        rc, _out, err = self.install_default(self.bridged(), "--token-env-file", str(seat_env))
+        self.assertEqual(rc, 0, err)
+        unit = cm.service_path(cli.BRIDGE).read_text()
+        for line in (f'Environment="AG2_DEVICE_ENV={seat_env}"', 'Environment="REMOTE_TASK_SEAT=1"',
+                     f'Environment="GATEWAY_INSTANCE={"c" * 32}"', 'Environment="REMOTE_TASK_TIER=team"',
+                     f'Environment="REMOTE_TASK_TOKEN_FILE={seat_env.parent / "token"}"', f'Environment="AGENT_MXID={AGENT}"',
+                     'Environment="REMOTE_TASK_TOKEN="', 'Environment="REMOTE_TASK_URL="', 'Environment="AGENT_ID="'):
+            self.assertIn(line + "\n", unit)
+        self.assertNotIn(bearer, unit + cli.config_path().read_text(), "the bearer stays in the seat's token file")
+
+    def test_a_seat_naming_another_agent_than_install_resolved_is_refused(self):
+        from ag2_sparrow import gateway_credential_sources as owner
+        seat = self.home / "seat"
+        self.assertEqual(owner.write_seat_credentials(seat, agent_id="@other.agent:ag2.space", instance="d" * 32,
+                                                      tier="owner", relay_url="https://gw.example/relay", bearer="b-1"), "")
+        with mock.patch.dict(os.environ, {"AGENT_MXID": AGENT}):
+            rc, _out, err = self.install_default(self.bridged(), "--token-env-file",
+                                                 str(seat / "channels" / "ag2space" / ".env"))
+        self.assertNotEqual(rc, 0)
+        self.assertIn(f"names @other.agent:ag2.space, not {AGENT}", err)
+        self.assertFalse(cm.service_path(cli.BRIDGE).exists())
+
+    def test_a_malformed_seat_env_file_is_refused_before_the_bridge_is_wired(self):
+        seat_env = self.home / "seat" / ".env"
+        seat_env.parent.mkdir(parents=True)
+        seat_env.write_text(f"AGENT_MXID={AGENT}\nREMOTE_TASK_TOKEN_FILE={seat_env.parent / 'token'}\n")
+        fake = self.bridged()
+        rc, _out, err = self.install_default(fake, "--token-env-file", str(seat_env))
+        self.assertNotEqual(rc, 0)
+        self.assertIn("GATEWAY_INSTANCE", err)
+        self.assertFalse(cm.service_path(cli.BRIDGE).exists(), "no unit for a seat the bridge would refuse")
+
     def test_on_macos_the_bridge_is_a_plist_with_the_same_dirs(self):
         rc, _, err = self.install_default(self.bridged(), mac=True)
         self.assertEqual(rc, 0, err)

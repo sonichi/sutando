@@ -516,6 +516,19 @@ def legacy_dotspace(config: Optional[Mapping[str, Any]] = None) -> DotSpace:
     return _entry_dotspace(DEFAULT_INSTANCES[0], "config")
 
 
+def registered_instances(config: Optional[Mapping[str, Any]] = None) -> List[DotSpace]:
+    """Every DotSpace the registry names (the configured `instances` list, else the built-in
+    default), one per server in registry order, from config alone: nothing is fetched."""
+    out: List[DotSpace] = []
+    seen = set()
+    for entry in _config_entries(config):
+        d = _entry_dotspace(entry, "config")
+        if d.server and d.server not in seen:
+            seen.add(d.server)
+            out.append(d)
+    return out
+
+
 def default_link_via(env: Optional[Mapping[str, str]] = None) -> str:
     """`?via=` for a link whose room names no server: the install's DotSpace, else the legacy one."""
     return link_via_for(current_server(env), fetch=NO_FETCH) or legacy_dotspace().link_via

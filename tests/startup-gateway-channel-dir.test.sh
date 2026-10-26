@@ -49,7 +49,8 @@ run_loop() {  # $1 = extra env assignments (string), evaluated before the block
     export REMOTE_PROACTIVE_ROOM='!parent:example'
     eval "$1"
     export ENV_DUMP PATH="$TMP/bin:$PATH" FAKE_KEYCHAIN="$TMP/keychain" SUTANDO_TEST_MODE=1 \
-      SUTANDO_WORKSPACE="$TMP/ws" CLAUDE_CONFIG_DIR="$TMP/cc" SUTANDO_SUPPRESS_CCD_FALLBACK_BANNER=1
+      SUTANDO_WORKSPACE="$TMP/ws" CLAUDE_CONFIG_DIR="$TMP/cc" SUTANDO_SUPPRESS_CCD_FALLBACK_BANNER=1 \
+      SUTANDO_BRIDGE_LOCK=0  # the stub bridge takes no lease
     PY="$PY"; REPO="$FAKE"; LOGS_DIR="$TMP/logs"
     eval "$LOOP" ) > "$TMP/loop-out" 2>&1
   # The bridge is launched detached; give the stub a moment to write.
