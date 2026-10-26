@@ -3,8 +3,8 @@
 derived path (run dir, bundled node) follows it.
 
 Each branch runs under a temp HOME with the launcher's env removed:
-SUTANDO_APP_SUPPORT set, space.ag2.desktop present, only space.ag2.app, and
-neither. More specific overrides (SUTANDO_RUN_DIR, SUTANDO_APP_NODE_DIR) still win.
+SUTANDO_APP_SUPPORT set, then every combination of the ready marker and the
+two folders, checked against the desktop app's data-folder rule. More specific overrides (SUTANDO_RUN_DIR, SUTANDO_APP_NODE_DIR) still win.
 
 Run: python3 tests/desktop-data-root-contract.test.py
 """
@@ -69,39 +69,81 @@ class _TempHome(unittest.TestCase):
         return ddr.desktop_data_root(env=extra, home=self.home)
 
 
+# Reference: the desktop app's data-folder rule, copied verbatim.
+DESKTOP_RULE = r'''
+# ag2_app_support_dir <home> [<uname -s>]
+# macOS: space.ag2.desktop once the app moved there (or on a new install), else
+# the old space.ag2.app, which macOS types as an application bundle.
+ag2_app_support_dir() {
+  local base="$1/Library/Application Support" os="${2:-$(uname -s)}"
+  if [ "$os" = Darwin ] && { { [ -e "$base/.space.ag2.desktop.ready" ] && [ -d "$base/space.ag2.desktop" ]; } \
+      || [ ! -d "$base/space.ag2.app" ]; }; then
+    printf '%s\n' "$base/space.ag2.desktop"
+  else
+    printf '%s\n' "$base/space.ag2.app"
+  fi
+}
+'''
+
+# (ready marker, space.ag2.desktop dir, space.ag2.app dir) -> expected root
+STATES = [
+    ((False, False, False), "desktop"),  # fresh install
+    ((False, False, True), "legacy"),    # not migrated yet
+    ((False, True, False), "desktop"),   # only the new folder
+    ((False, True, True), "legacy"),     # move never completed: stay on old
+    ((True, False, False), "desktop"),   # stray marker, nothing to stay on
+    ((True, False, True), "legacy"),     # stray marker, no new folder
+    ((True, True, False), "desktop"),    # moved, rollback copy removed
+    ((True, True, True), "desktop"),     # moved, rollback copy kept
+]
+
+
 class ResolverAgreesAcrossLanguages(_TempHome):
+    def build(self, marker: bool, new: bool, old: bool):
+        if marker:
+            (self.support / ".space.ag2.desktop.ready").write_text("")
+        if new:
+            self.desktop.mkdir()
+        if old:
+            self.legacy.mkdir()
+
+    def reference(self) -> str:
+        return subprocess.run(
+            ["bash", "-c", DESKTOP_RULE + '\nag2_app_support_dir "$1" Darwin', "_", str(self.home)],
+            capture_output=True, text=True, check=True).stdout.rstrip("\n")
+
     def assert_both(self, expected: Path, **extra):
         self.assertEqual(self.py_root(**extra), expected)
         self.assertEqual(self.shell("desktop-data-root", **extra), str(expected))
 
-    def test_neither_folder_falls_back_to_legacy(self):
-        self.assert_both(self.legacy)
-
-    def test_only_legacy_folder(self):
-        self.legacy.mkdir()
-        self.assert_both(self.legacy)
-
-    def test_desktop_folder_wins_once_present(self):
-        self.legacy.mkdir()
-        self.desktop.mkdir()
-        self.assert_both(self.desktop)
-
-    def test_desktop_folder_alone(self):
-        self.desktop.mkdir()
-        self.assert_both(self.desktop)
+    def test_every_folder_state_matches_table_and_desktop_rule(self):
+        for state, want in STATES:
+            with self.subTest(marker=state[0], new=state[1], old=state[2]):
+                for p in (self.support / ".space.ag2.desktop.ready",):
+                    if p.exists():
+                        p.unlink()
+                for d in (self.desktop, self.legacy):
+                    if d.is_dir():
+                        d.rmdir()
+                self.build(*state)
+                expected = self.desktop if want == "desktop" else self.legacy
+                self.assert_both(expected)
+                self.assertEqual(self.reference(), str(expected))
 
     def test_app_support_env_wins(self):
-        self.desktop.mkdir()
+        self.build(True, True, True)
         custom = self.home / "custom-root"
         self.assert_both(custom, SUTANDO_APP_SUPPORT=str(custom))
 
     def test_empty_app_support_env_is_unset(self):
-        self.desktop.mkdir()
+        self.build(True, True, True)
         self.assert_both(self.desktop, SUTANDO_APP_SUPPORT="")
 
     def test_desktop_name_as_file_is_not_a_root(self):
+        self.build(True, False, True)
         self.desktop.write_text("")
         self.assert_both(self.legacy)
+        self.assertEqual(self.reference(), str(self.legacy))
 
 
 class DerivedPathsFollowTheRoot(_TempHome):
@@ -126,15 +168,19 @@ class DerivedPathsFollowTheRoot(_TempHome):
         self.assertEqual(self.shell("run-dir", SUTANDO_APP_SUPPORT="/r"), "/r/run")
         self.assertEqual(self.shell("run-dir", SUTANDO_APP_SUPPORT="/r",
                                     SUTANDO_RUN_DIR="/explicit"), "/explicit")
-        self.desktop.rmdir()
+        self.legacy.mkdir()
         self.assertEqual(self.shell("run-dir"), str(self.legacy / "run"))
 
     def test_rundir_py_follows_root_and_matches_shell(self):
         saved = rundir.sys.platform
         rundir.sys.platform = "darwin"
         try:
+            self.assertEqual(rundir.run_dir(), self.desktop / "run")
+            self.legacy.mkdir()
             self.assertEqual(rundir.run_dir(), self.legacy / "run")
             self.desktop.mkdir()
+            self.assertEqual(rundir.run_dir(), self.legacy / "run")
+            (self.support / ".space.ag2.desktop.ready").write_text("")
             self.assertEqual(rundir.run_dir(), self.desktop / "run")
             os.environ["SUTANDO_APP_SUPPORT"] = "/r"
             self.assertEqual(rundir.run_dir(), Path("/r/run"))

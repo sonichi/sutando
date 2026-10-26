@@ -71,12 +71,13 @@ py() {
 
 # Mirrors src/desktop_data_root.py; tests/desktop-data-root-contract.test.py pins the two.
 desktop_data_root() {
+  local base="$HOME/Library/Application Support"
   if [ -n "${SUTANDO_APP_SUPPORT:-}" ]; then
     printf '%s' "$SUTANDO_APP_SUPPORT"
-  elif [ -d "$HOME/Library/Application Support/space.ag2.desktop" ]; then
-    printf '%s' "$HOME/Library/Application Support/space.ag2.desktop"
+  elif { [ -e "$base/.space.ag2.desktop.ready" ] && [ -d "$base/space.ag2.desktop" ]; } || [ ! -d "$base/space.ag2.app" ]; then
+    printf '%s' "$base/space.ag2.desktop"
   else
-    printf '%s' "$HOME/Library/Application Support/space.ag2.app"
+    printf '%s' "$base/space.ag2.app"
   fi
 }
 
@@ -373,8 +374,8 @@ print(_host_label(), end='')
     ;;
 
   desktop-data-root)
-    # The desktop app's macOS data folder: $SUTANDO_APP_SUPPORT, else
-    # space.ag2.desktop when present, else the pre-move space.ag2.app.
+    # The desktop app's macOS data folder: $SUTANDO_APP_SUPPORT, else space.ag2.desktop
+    # once the move finished (ready marker) or with no space.ag2.app, else space.ag2.app.
     desktop_data_root
     ;;
 

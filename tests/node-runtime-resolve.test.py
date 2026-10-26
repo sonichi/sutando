@@ -84,6 +84,7 @@ class ResolveNodeRuntimeTest(unittest.TestCase):
             node_dir = support / "space.ag2.desktop" / "engine" / "runtime" / "node" / "bin"
             node_dir.mkdir(parents=True)
             node = _make_exec(node_dir / "node")
+            (support / ".space.ag2.desktop.ready").write_text("")
             with mock.patch.dict(os.environ, {"HOME": home}):
                 out = hc.resolve_node_runtime(env={}, which=lambda _: "/usr/fake/node")
             self.assertEqual(out, {"source": "app-bundle", "path": node})
