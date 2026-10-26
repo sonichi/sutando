@@ -2700,6 +2700,10 @@ class ZombieProbeFailures(unittest.TestCase):
         with unittest.mock.patch.object(C.os, "waitpid", side_effect=PermissionError):
             self.assertFalse(C._zombie(12345))
 
+    def test_our_child_still_running_reads_as_running(self):
+        with unittest.mock.patch.object(C.os, "waitpid", return_value=(0, 0)):
+            self.assertFalse(C._zombie(12345))
+
     def test_ps_that_cannot_run_reads_as_running(self):
         with unittest.mock.patch.object(C.os, "waitpid", side_effect=ChildProcessError), \
                 unittest.mock.patch.object(C.subprocess, "run", side_effect=subprocess.TimeoutExpired("ps", 5)):
