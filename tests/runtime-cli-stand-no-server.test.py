@@ -103,6 +103,31 @@ def assert_safe_card(p, label):
           f"{label}: no credential value or channel path in output")
 
 
+def other_connect_errors():
+    # Only a missing or refusing socket means "no server"; any other connect
+    # error must surface, never become a silent in-process card.
+    import contextlib
+    import errno
+    import importlib.util
+    import io
+    from unittest import mock
+    os.environ.update(ENV)
+    spec = importlib.util.spec_from_file_location("sutando_runtime_cli", CLI)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    for exc in (PermissionError(errno.EACCES, "Permission denied"),
+                OSError(errno.ETIMEDOUT, "Operation timed out")):
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(socket.socket, "connect", side_effect=exc), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = mod.main(["sutando", "stand", "--json"])
+        name = type(exc).__name__ + f"/{errno.errorcode[exc.errno]}"
+        check(rc == 1 and str(exc.errno) in err.getvalue(),
+              f"{name} on connect surfaces as an error (rc={rc})")
+        check(out.getvalue() == "" and '"stand"' not in err.getvalue(),
+              f"{name} on connect prints no stand card")
+
+
 def main() -> int:
     seed()
     sys.path.insert(0, str(REPO / "src" / "runtime-api"))
@@ -136,6 +161,8 @@ def main() -> int:
     p = cli("sutando", "info")
     check(p.returncode == 1 and "Errno 2" in p.stderr,
           "sutando info without a server still errors")
+
+    other_connect_errors()
 
     if BIN.is_file():
         p = subprocess.run(["bash", str(BIN), "stand", "--json"],
