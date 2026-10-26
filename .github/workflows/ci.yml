@@ -205,9 +205,9 @@ jobs:
           timeout -k 5 120 python3 scripts/lint-old-collab-literals.py
 
   # The suites that used to run after the typecheck in the job above, now beside
-  # it: three runners of ~2 min each instead of one of ~5, same commands, same env.
-  node-and-oot-tests:
-    name: node + out-of-tree python tests
+  # it: node, out-of-tree python and the Mod harness each on their own runner.
+  node-tests:
+    name: node tests (ts + esm)
     needs: changes
     # Job-level, not per step: a docs-only diff skips the whole runner, and the
     # aggregator below treats that skip as a pass only when `changes` said so.
@@ -229,65 +229,6 @@ jobs:
 
       - name: Install Python test deps
         run: python3 -m pip install 'detect-secrets>=1.5.0' 'discord.py>=2.3'
-
-      # Python tests that live OUTSIDE tests/ and so are invisible to the
-      # `find tests -name '*.test.py'` discovery. Same reason the skill-manifest
-      # test is wired by hand. Without this they run only when someone
-      # remembers to run them locally, which is indistinguishable from passing.
-      # Notably src/remote-gateway-bridge.test.py — the suite the transport
-      # change process requires for ANY package change — and tools/test_no_drift.py,
-      # which is the guard against src/ and the package silently diverging.
-      - name: Run out-of-tree Python tests
-        run: |
-          timeout -k 5 120 python3 src/remote-gateway-bridge.test.py
-          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_gateway_status.py
-          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_poll_stall_exit.py
-          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_dns_timeout.py
-          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_dns_fallback.py
-          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_ack_retry.py
-          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_inflight_recovery.py
-          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_write_task_atomic.py
-          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_on_task_wake.py
-          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_pool_advertisement_push.py
-          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_lock_heartbeat_thread.py
-          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_worker_profile_labels.py
-          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_agent_profile_host_id.py
-          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_event_inbox_channel.py
-          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_event_consumer.py
-          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_event_wiring.py
-          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_human_action.py
-          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_launch_diagnostics.py
-          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_vault_token_tier.py
-          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_env_token_quotes.py
-          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_signal_exit_log.py
-          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_hatch_adapter.py
-          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_hatch_served_setup.py
-          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_claude_code_adapter.py
-          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_codex_connector.py
-          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_codex_local_connect.py
-          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_claude_routine_adapter.py
-          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_claude_cloud_session_adapter.py
-          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_adapter_relay_loop.py
-          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_adapter_boundaries.py
-          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_task_lifecycle.py
-          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_cloud_session_contract.py
-          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_cloud_session_interlock.py
-          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_adapter_differential.py
-          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_setup_fetch.py
-          timeout -k 5 120 python3 packages/ag2-sparrow/tools/test_no_drift.py
-          timeout -k 5 300 python3 packages/ag2-sparrow/tests/test_wheel_contents.py
-          timeout -k 5 120 python3 skills/agent-room-ops/test_room_ops.py
-          timeout -k 5 120 python3 skills/make-viral-video/scripts/test_source_tag.py
-
-      # The claude-local Mod tests run only under the CLI engine harness (`claude plugin
-      # test`), which needs no login. The CLI version is pinned so a release cannot move the harness.
-      - name: Run the claude-local Mod harness tests
-        env:
-          CLAUDE_CODE_ENABLE_FUNCTION_HOOKS: '1'
-        run: |
-          npm install --no-save --no-audit --no-fund --prefix "$RUNNER_TEMP/claude-cli" @anthropic-ai/claude-code@2.1.303
-          cd packages/ag2-sparrow/adapters/claude-code
-          timeout -k 5 120 "$RUNNER_TEMP/claude-cli/node_modules/.bin/claude" plugin test ag2space-inbox
 
       # TypeScript only. `npm test` also chains `npm run test:py`, and the
       # dedicated `python-standalone-tests` job below runs the identical
@@ -327,6 +268,87 @@ jobs:
             fi
           done < <(find tests -name '*.test.mjs' -not -path '*/node_modules/*' | sort)
           exit "$failed"
+
+  oot-python-tests:
+    name: out-of-tree python tests
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies (clean)
+        run: npm ci
+
+      - name: Install Python test deps
+        run: python3 -m pip install 'detect-secrets>=1.5.0' 'discord.py>=2.3'
+
+      # Suites outside discovery. One a tests/ delegator runs whole (runpy.run_path,
+      # run_name="__main__") is not listed: the python legs already run it.
+      - name: Run out-of-tree Python tests
+        run: |
+          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_gateway_status.py
+          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_poll_stall_exit.py
+          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_dns_timeout.py
+          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_dns_fallback.py
+          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_ack_retry.py
+          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_inflight_recovery.py
+          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_write_task_atomic.py
+          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_pool_advertisement_push.py
+          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_lock_heartbeat_thread.py
+          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_worker_profile_labels.py
+          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_agent_profile_host_id.py
+          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_event_inbox_channel.py
+          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_event_consumer.py
+          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_event_wiring.py
+          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_launch_diagnostics.py
+          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_vault_token_tier.py
+          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_env_token_quotes.py
+          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_signal_exit_log.py
+          timeout -k 5 120 python3 packages/ag2-sparrow/tools/test_no_drift.py
+          timeout -k 5 300 python3 packages/ag2-sparrow/tests/test_wheel_contents.py
+          timeout -k 5 120 python3 skills/agent-room-ops/test_room_ops.py
+          timeout -k 5 120 python3 skills/make-viral-video/scripts/test_source_tag.py
+
+  mod-harness-tests:
+    name: claude-local Mod harness
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies (clean)
+        run: npm ci
+
+      - name: Install Python test deps
+        run: python3 -m pip install 'detect-secrets>=1.5.0' 'discord.py>=2.3'
+
+      # The claude-local Mod tests run only under the CLI engine harness (`claude plugin
+      # test`), which needs no login. The CLI version is pinned so a release cannot move the harness.
+      - name: Run the claude-local Mod harness tests
+        env:
+          CLAUDE_CODE_ENABLE_FUNCTION_HOOKS: '1'
+        run: |
+          npm install --no-save --no-audit --no-fund --prefix "$RUNNER_TEMP/claude-cli" @anthropic-ai/claude-code@2.1.303
+          cd packages/ag2-sparrow/adapters/claude-code
+          timeout -k 5 120 "$RUNNER_TEMP/claude-cli/node_modules/.bin/claude" plugin test ag2space-inbox
 
   shell-standalone-tests:
     name: shell tests (lanes)
@@ -593,7 +615,7 @@ jobs:
     # Carries the name the `main` ruleset requires. Splitting a suite into its
     # own job removes it from the required-context list; this keeps one gate
     # that fails when any suite fails, so a split cannot weaken protection.
-    needs: [changes, typecheck-and-test, node-and-oot-tests, shell-standalone-tests, shell-tail-tests, python-standalone-tests]
+    needs: [changes, typecheck-and-test, node-tests, oot-python-tests, mod-harness-tests, shell-standalone-tests, shell-tail-tests, python-standalone-tests]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -628,7 +650,9 @@ jobs:
           }
           check "changes"                 "${{ needs.changes.result }}"
           check "typecheck-and-test"      "${{ needs.typecheck-and-test.result }}"
-          check "node-and-oot-tests"      "${{ needs.node-and-oot-tests.result }}"
+          check "node-tests"              "${{ needs.node-tests.result }}"
+          check "oot-python-tests"        "${{ needs.oot-python-tests.result }}"
+          check "mod-harness-tests"       "${{ needs.mod-harness-tests.result }}"
           check "shell-standalone-tests"  "${{ needs.shell-standalone-tests.result }}"
           check "shell-tail-tests"        "${{ needs.shell-tail-tests.result }}"
           check "python-standalone-tests" "${{ needs.python-standalone-tests.result }}"

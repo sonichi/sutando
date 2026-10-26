@@ -753,5 +753,104 @@ class AgentEndpoint(Base):
         self.assertEqual(bridge.MAX_DECLARATION_BYTES, _sources.MAX_DECLARATION_BYTES)
         self.assertEqual(_sources.MAX_DECLARATION_BYTES, 64 * 1024)
 
+SEAT_URL = "https://seat-gw.example/relay"
+SEAT_BEARER = "seat-bearer-QQQQ7777"
+
+
+class SeatBridge(Base):
+    """A seat that `connect` wired under sparrowd runs with exactly the env wire_bridge computes for it: its
+    own token file and .env, every host credential and URL name cleared, and never a vault read."""
+
+    def setUp(self):
+        super().setUp()
+        env = mock.patch.dict(os.environ, {"AG2_DEVICE_ENV": "/host/relay.env", "REMOTE_TASK_TOKEN_FILE": "/host/t",
+                                           "REMOTE_PROACTIVE_ROOM": "!owner-dm", "AGENT_MXID": "@core:x",
+                                           "REMOTE_TASK_URL": "https://host-gw/relay", "KEEP_ME": "1",
+                                           **Wrapper.HOST_TOKENS})
+        env.start()
+        self.addCleanup(env.stop)
+        saved = (_dirs._injected, local_task_protocol._TASK_STAMPER)
+        self.addCleanup(lambda: (setattr(_dirs, "_injected", saved[0]),
+                                 setattr(local_task_protocol, "_TASK_STAMPER", saved[1])))
+        self.root = self.ws / "agents" / SEG
+        self.seat = _sources.seat_channel_dir(cli.bridge_home(self.root))
+
+    def declare_seat(self, tier="team"):
+        """The seat as connect writes it beside the root, and the declaration install then writes for it."""
+        self.assertEqual(_sources.write_seat_credentials(cli.bridge_home(self.root), agent_id=AGENT, instance="e" * 32,
+                                                         tier=tier, relay_url=SEAT_URL, bearer=SEAT_BEARER), "")
+        cfg = {"ROOT": str(self.root), "BRIDGE": "sparrowd", "AGENT_ID": AGENT,
+               "TOKEN_ENV_FILE": os.path.join(self.seat, ".env"), "TOKEN_VAULT_KEY": ""}
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(cli.wire_bridge(cfg), "")
+        return cli.bridge_home(self.root) / cli.DECLARATION
+
+    def test_a_seat_declaration_is_one_worker_with_no_vault_key(self):
+        self.declare_seat()
+        specs, skipped = self.sd._agent_bridge_specs(self.ws, vault_keys=[])
+        self.assertEqual((skipped, [s.name for s in specs]), ([], [cli.worker_name(SEG)]))
+
+    def test_the_seat_runs_with_its_token_file_and_device_env_no_host_credential_and_no_vault_read(self):
+        decl = self.declare_seat()
+        launched = json.loads(decl.read_text())["env"]
+        asked, seen = [], {}
+
+        def no_vault(key):
+            asked.append(key)
+            raise KeyError(key)
+
+        def fake_run(module, run_name, alter_sys):
+            found = _sources.discover(os.environ, _sources.env_files(os.environ, bridge.read_regular),
+                                      read_token_file=bridge.read_regular, vault_lookup=no_vault)
+            seen.update(applied=runs_under(seen["env"]), found=(found.token, found.token_source, found.url, found.fatal))
+        with recording_bridge_environ(seen):
+            rc = bridge.main([str(decl)], workspace=self.ws, get_key=no_vault, run=fake_run)
+        self.assertEqual(rc, 0)
+        self.assertIs(seen.get("applied"), True, "the bridge ran under exactly the built environment")
+        env = seen["env"]
+        self.assertEqual(asked, [], "a seat bridge never reads the vault")
+        self.assertEqual((env["AG2_DEVICE_ENV"], env["REMOTE_TASK_TOKEN_FILE"]),
+                         (os.path.join(self.seat, ".env"), os.path.join(self.seat, "token")))
+        self.assertEqual({k: env[k] for k in launched}, launched, "exactly what wire_bridge computed for the seat")
+        for key in _sources.bridge_strip_keys() + (_sources.INJECTED_KEY,):
+            self.assertEqual(env.get(key, ""), "", f"{key} reached the seat bridge")
+        self.assertEqual((env["REMOTE_PROACTIVE_ROOM"], env["KEEP_ME"], env["AGENT_MXID"]), ("", "1", AGENT))
+        self.assertEqual(seen["found"], (SEAT_BEARER, "token_file", SEAT_URL, ""))
+
+    def test_a_seat_whose_env_names_another_token_file_or_another_seat_never_runs(self):
+        decl = self.declare_seat()
+        env_path = os.path.join(self.seat, ".env")
+        text = Path(env_path).read_text()
+        Path(env_path).write_text(text.replace(os.path.join(self.seat, "token"), "/host/t"))
+        specs, skipped = self.sd._agent_bridge_specs(self.ws, vault_keys=[])
+        self.assertEqual(specs, [])
+        self.assertIn("names a token file other than its own", skipped[0])
+        Path(env_path).write_text(text)
+        body = json.loads(decl.read_text())
+        body["env"]["AG2_DEVICE_ENV"] = "/elsewhere/.env"
+        decl.write_text(json.dumps(body))
+        specs, skipped = self.sd._agent_bridge_specs(self.ws, vault_keys=[])
+        self.assertEqual(specs, [])
+        self.assertIn("env is not the canonical one", skipped[0])
+
+    def test_preflight_passes_a_seat_without_the_vault(self):
+        self.declare_seat()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = bridge.main(["--preflight"], workspace=self.ws, get_key=lambda k: self.fail(f"vault read {k}"))
+        self.assertEqual((rc, out.getvalue()), (0, f"ok: {cli.worker_name(SEG)} (gateway from its seat's token file)\n"))
+
+    def test_a_non_seat_declaration_still_takes_the_vault_token(self):
+        decl = self.declare()
+        seen = {}
+        with recording_bridge_environ(seen):
+            rc = bridge.main([str(decl)], workspace=self.ws, get_key=vault(),
+                             run=lambda module, run_name, alter_sys: None)
+        self.assertEqual(rc, 0)
+        self.assertEqual((seen["env"]["REMOTE_TASK_TOKEN"], seen["env"][_sources.INJECTED_KEY]), ("tok-agent", "1"))
+        self.assertNotIn("AG2_DEVICE_ENV", seen["env"])
+        self.assertNotIn("REMOTE_TASK_TOKEN_FILE", seen["env"])
+
+
 if __name__ == "__main__":
     unittest.main()
