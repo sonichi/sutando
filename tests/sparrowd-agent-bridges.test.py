@@ -800,12 +800,13 @@ class SeatBridge(Base):
             raise KeyError(key)
 
         def fake_run(module, run_name, alter_sys):
-            env = dict(os.environ)
-            found = _sources.discover(env, _sources.env_files(env, bridge.read_regular),
+            found = _sources.discover(os.environ, _sources.env_files(os.environ, bridge.read_regular),
                                       read_token_file=bridge.read_regular, vault_lookup=no_vault)
-            seen.update(env=env, found=(found.token, found.token_source, found.url, found.fatal))
-        rc = bridge.main([str(decl)], workspace=self.ws, get_key=no_vault, run=fake_run)
+            seen.update(applied=runs_under(seen["env"]), found=(found.token, found.token_source, found.url, found.fatal))
+        with recording_bridge_environ(seen):
+            rc = bridge.main([str(decl)], workspace=self.ws, get_key=no_vault, run=fake_run)
         self.assertEqual(rc, 0)
+        self.assertIs(seen.get("applied"), True, "the bridge ran under exactly the built environment")
         env = seen["env"]
         self.assertEqual(asked, [], "a seat bridge never reads the vault")
         self.assertEqual((env["AG2_DEVICE_ENV"], env["REMOTE_TASK_TOKEN_FILE"]),
