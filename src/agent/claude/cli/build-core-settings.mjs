@@ -13,7 +13,7 @@
 // builder treats the obs settings as an opaque JSON blob and array-concats it
 // with the guard, so the two concerns never drift.
 //
-// Usage:  node build-core-settings.mjs <abs-path-to-guard-hook.py> [<obs-settings-json>] [<abs-path-to-skill-telemetry-hook.py>] [<abs-path-to-gmail-write-guard.py>] [<abs-path-to-gdocs-write-guard.py>] [<abs-path-to-native-pim-guard.py>]
+// Usage:  node build-core-settings.mjs <abs-path-to-guard-hook.py> [<obs-settings-json>] [<abs-path-to-skill-telemetry-hook.py>] [<abs-path-to-gmail-write-guard.py>] [<abs-path-to-gdocs-write-guard.py>] [<abs-path-to-native-pim-guard.py>] [<abs-path-to-public-write-privacy-guard.py>]
 //   arg1 (required): path to the guard hook script (skip-ask-user-question.py).
 //   arg2 (optional): the obs `--settings` JSON string from build-hook-settings.mjs;
 //                    empty / omitted → obs hooks are not included.
@@ -32,6 +32,9 @@
 //   arg6 (optional): path to hooks/native-pim-guard.py — registered under
 //                    PreToolUse[Bash]: denies commands that drive the native
 //                    macOS Calendar/Reminders/Contacts apps without consent.
+//   arg7 (optional): path to hooks/public-write-privacy-guard.py — registered under
+//                    PreToolUse[Bash]: denies a `gh` write to a non-private repo whose
+//                    text names a private repo, room, person or agent, or a local path.
 // Prints the merged settings JSON to stdout (exit 2 on a missing guard path,
 // exit 3 on an unparseable obs-settings blob).
 
@@ -138,8 +141,28 @@ if (nativePimGuardHook.trim()) {
 	};
 }
 
+// Always-on: --settings reaches the core, every worker and their subagents
+// whatever their cwd, which a project-level settings file does not.
+const publicWriteGuardHook = process.argv[8] || '';
+let publicWriteGuardSettings = null;
+if (publicWriteGuardHook.trim()) {
+	publicWriteGuardSettings = {
+		hooks: {
+			PreToolUse: [{ matcher: 'Bash', hooks: [{ type: 'command', command: `python3 ${shq(publicWriteGuardHook)}` }] }],
+		},
+	};
+}
+
 process.stdout.write(
 	JSON.stringify(
-		mergeHookSettings(guardSettings, obsSettings, skillTelemetrySettings, gmailWriteGuardSettings, gdocsWriteGuardSettings, nativePimGuardSettings),
+		mergeHookSettings(
+			guardSettings,
+			obsSettings,
+			skillTelemetrySettings,
+			gmailWriteGuardSettings,
+			gdocsWriteGuardSettings,
+			nativePimGuardSettings,
+			publicWriteGuardSettings,
+		),
 	),
 );

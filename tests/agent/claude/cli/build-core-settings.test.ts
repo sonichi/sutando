@@ -242,6 +242,26 @@ describe('build-core-settings.mjs', () => {
 		assert.equal(shellParsedPath(blk.hooks[0].command), NATIVE_PIM_GUARD);
 	});
 
+	it('registers the public-write privacy guard on Bash after every other guard', () => {
+		const PUBLIC_WRITE_GUARD = '/x/hooks/public-write-privacy-guard.py';
+		const o = JSON.parse(
+			execFileSync(
+				'node',
+				[CORE_BUILDER, GUARD, '', SKILL_TELEMETRY, GMAIL_WRITE_GUARD, GDOCS_WRITE_GUARD, NATIVE_PIM_GUARD, PUBLIC_WRITE_GUARD],
+				{ encoding: 'utf8' },
+			),
+		);
+		const last = o.hooks.PreToolUse[o.hooks.PreToolUse.length - 1];
+		assert.equal(last.matcher, 'Bash');
+		assert.equal(shellParsedPath(last.hooks[0].command), PUBLIC_WRITE_GUARD);
+	});
+
+	it('the launcher passes the public-write privacy guard to the builder', () => {
+		const launcher = fileURLToPath(new URL('../../../../src/agent/claude/cli/session-launch.sh', import.meta.url));
+		const src = execFileSync('cat', [launcher], { encoding: 'utf8' });
+		assert.match(src, /build-core-settings\.mjs"[^\n]*"\$REPO\/hooks\/public-write-privacy-guard\.py"/);
+	});
+
 	it('omitting the native PIM guard path leaves the previous shape untouched', () => {
 		const o = buildCore(GUARD, '', SKILL_TELEMETRY, GMAIL_WRITE_GUARD);
 		const matchers = o.hooks.PreToolUse.map((b: any) => b.matcher);

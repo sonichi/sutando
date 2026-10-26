@@ -560,3 +560,54 @@ string at a time, the same scope limit the other two hooks accept. Deploy is the
 per-node registration as `context-source-guard.py`'s "Deploy (per node)" section above
 (`PreToolUse` → `Bash` matcher, `$CLAUDE_CONFIG_DIR` awareness) — not done as part of
 landing this hook's source.
+
+## `public-write-privacy-guard.py`
+
+Denies a `gh` write to a repo that is not private when the text it would publish
+names something private. Prose asked every agent to check before posting; a subagent
+that never applied it named a private repo and a private agent in a public PR body, and
+GitHub's edit history kept the first version after the fix. This moves the check to the
+command itself.
+
+- **Writes covered:** `gh pr create|edit|comment|review`, `gh issue create|comment|edit`,
+  `gh release create|edit`, and `gh api` POST/PATCH/PUT to `repos/<o>/<r>/issues…` or
+  `…/pulls…` plus GraphQL mutations. Text read: `--title`, `--body`, `--notes`, their
+  `-file` forms, a `"$(cat FILE)"` value, heredoc / here-string stdin, and every
+  `gh api` field (`-f`, `-F k=@file`, `--input`). `bash -c` / `sh -c` / `eval` strings
+  are scanned too.
+- **What is private** is `src/public_write_privacy.py`: the terms in
+  `<workspace>/state/privacy/public-denylist.txt`, plus, with no list, home-directory
+  paths, Matrix room IDs and MXIDs (example servers and placeholder user names
+  excepted). Names already public go in `public-allowlist.txt` beside it; the agent's
+  own `SUTANDO_AGENT_MXID` is always allowed, so this gate and
+  `comment-signature-guard.py` cannot deadlock.
+- **The denylist never lives in the repo** (listing the terms would leak them).
+  `python3 scripts/seed-public-denylist.py` builds it from this host's data: private
+  repo names of the gh user and its orgs, room names and IDs from the workspace room
+  stores, person and agent names and account IDs from the collaboration rosters. It
+  drops GitHub logins, public repo names, names the public tree already uses, and
+  single dictionary words; it keeps lines under its `manual` marker and prints counts
+  only.
+- **Visibility** comes from `gh repo view --json visibility`, cached in
+  `state/privacy/repo-visibility.json` (PUBLIC 7 days, PRIVATE 1 hour). Only PRIVATE
+  skips the scan; an unknown repo (no `--repo`, `{owner}` placeholders, gh failing) is
+  scanned as public.
+- **Fails closed:** a body file that does not exist, stdin it cannot see, a value that
+  expands at run time (`"$BODY"`, backticks), a body file the same command writes with
+  anything but a heredoc, a line that does not lex, an internal error on a `gh` write,
+  and a public write on a host with no denylist are all refused. There is no override
+  variable; the allowlist is the escape.
+
+### Registration
+
+Auto-registered as `PreToolUse[Bash]` through `src/agent/claude/cli/build-core-settings.mjs`
+(arg7), which `session-launch.sh` passes to every core and worker session as `--settings`.
+That reaches each session's Agent-tool subagents, whatever their cwd: they run in the
+same process and fire the parent's PreToolUse hooks. It takes effect on a session's next
+launch.
+
+**Not covered:** a Codex core (no Claude hooks), a `claude` run started without the
+launcher, `git push` / commit messages and `gh pr create --fill` text, a write made by a
+script the command runs (`python3 post.py`), and `xargs`-style indirection.
+
+Tests: `python3 tests/public-write-privacy-guard.test.py`
