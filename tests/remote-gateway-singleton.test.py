@@ -219,6 +219,26 @@ class SingletonGlueTest(unittest.TestCase):
         self.assertEqual(reached, [], "the flag must stop the loop before any poll")
         self.assertTrue(any("lost workspace poller lock" in m for m in logged), logged)
 
+    def test_main_heartbeats_before_it_waits_to_settle_the_room(self):
+        # The settle can wait on the connections record lock; the lease must stay fresh meanwhile.
+        order = []
+
+        def settle():
+            order.append("settle")
+            raise KeyboardInterrupt("stop")
+        stubs = {"_acquire_singleton": lambda: True, "_start_lock_heartbeat": lambda: order.append("heartbeat"),
+                 "_settle_proactive_room": settle}
+        saved = {k: getattr(rgb, k) for k in stubs}
+        for k, v in stubs.items():
+            setattr(rgb, k, v)
+        try:
+            with self.assertRaises(KeyboardInterrupt):
+                rgb.main()
+        finally:
+            for k, v in saved.items():
+                setattr(rgb, k, v)
+        self.assertEqual(order, ["heartbeat", "settle"])
+
     def test_main_stands_down_with_exit_75_when_deferred(self):
         # A supervising wrapper (gateway-bridge-wrapper.sh) relaunches any child
         # that exits, except rc 75: so a deferral must exit 75, not return 0.

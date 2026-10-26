@@ -189,9 +189,11 @@ def connections_http(method: str, path: str, body: dict, query: Optional[dict] =
                      logs_dir: Optional[Path] = None, vault=None, fetch=None, spawn=None,
                      kill=None, getaddrinfo=None) -> "tuple[int, Optional[dict]]":
     """(status, payload) for one request under CONNECTIONS_PREFIX; payload None = empty body.
-    The HTTP shape of the connections domain: GET lists, POST previews or (confirm) creates,
-    DELETE removes, POST <instance>/primary moves the primary, POST <instance>/reconnect
-    relaunches. Dispatch only; every rule lives in src/connections.py."""
+    The HTTP shape of the connections domain: GET lists, GET known-servers offers the registry,
+    POST previews or (confirm) creates, DELETE removes, POST <instance>/primary moves the primary,
+    POST <instance>/disconnect stops and disables, POST <instance>/reconnect relaunches,
+    POST <instance>/token replaces the secret with a new code for the same connection.
+    Dispatch only; every rule lives in src/connections.py."""
     ws = Path(workspace) if workspace is not None else WORKSPACE_DIR
     repo = Path(repo) if repo is not None else REPO_DIR
     logs_dir = Path(logs_dir) if logs_dir is not None else ws / "logs"
@@ -201,6 +203,11 @@ def connections_http(method: str, path: str, body: dict, query: Optional[dict] =
         if method == "GET" and not parts:
             rows = _connections.list_connections(ws, vault=vault)
             return 200, {"connections": [_connections.status_for(r, ws) for r in rows]}
+        # A fixed name, matched before any <instance> route so it is never read as a slug.
+        if parts == ["known-servers"]:
+            if method != "GET":
+                return 405, {"error": "method not allowed"}
+            return 200, {"servers": _connections.known_servers(ws)}
         if method == "POST" and not parts:
             token = body.get("token")
             if not isinstance(token, str) or not token.strip():
@@ -220,28 +227,40 @@ def connections_http(method: str, path: str, body: dict, query: Optional[dict] =
                     instance=body.get("instance"), preview=preview, workspace=ws, vault=vault)
             except _connections.ConnectionMismatch as e:
                 return 409, {"error": "mismatch", "server_from_token": e.derived, "expected_server": e.claimed}
-            except _connections.TokenRejected:
-                return 409, {"error": "token_rejected"}
-            except _connections.VaultKeyInUse:
-                return 409, {"error": "vault_key_in_use"}
             return (201 if created else 200), {"created": created,
                                                "connection": _connections.status_for(row, ws)}
         if len(parts) == 1 and method == "DELETE":
             force = str((query.get("force") or [""])[0]).lower() in ("1", "true", "yes")
             try:
-                _connections.remove_connection(parts[0], force=force, workspace=ws, vault=vault)
+                _connections.remove_connection(parts[0], force=force, workspace=ws, vault=vault, kill=kill)
+            except _connections.Refusal as e:
+                return 409, {"error": e.CODE}
             except _connections.PrimaryProtected:
                 return 409, {"error": "primary"}
             return 204, None
         if len(parts) == 2 and method == "POST" and parts[1] == "primary":
             row = _connections.set_primary(parts[0], workspace=ws)
             return 200, {"connection": _connections.status_for(row, ws)}
+        if len(parts) == 2 and method == "POST" and parts[1] == "disconnect":
+            row = _connections.disconnect(parts[0], workspace=ws, kill=kill)
+            return 200, {"connection": _connections.status_for(row, ws)}
         if len(parts) == 2 and method == "POST" and parts[1] == "reconnect":
             record = _connections.reconnect(parts[0], repo=repo, logs_dir=logs_dir, workspace=ws,
                                             vault=vault, spawn=spawn, kill=kill, fetch=fetch,
                                             getaddrinfo=getaddrinfo)
             return 202, {"launch": record}
+        if len(parts) == 2 and method == "POST" and parts[1] == "token":
+            token = body.get("token")
+            if not isinstance(token, str) or not token.strip():
+                return 400, {"error": "missing required field: token"}
+            row = _connections.update_token(parts[0], token, repo=repo, logs_dir=logs_dir, workspace=ws,
+                                            vault=vault, spawn=spawn, kill=kill, fetch=fetch,
+                                            getaddrinfo=getaddrinfo)
+            return 200, {"connection": _connections.status_for(row, ws)}
         return 404, {"error": "not found"}
+    except _connections.Refusal as e:
+        # One rule for every state refusal: 409 with the module's own code.
+        return 409, {"error": e.CODE}
     except _connections.VaultUnavailable:
         return 503, {"error": "vault_unavailable"}
     except _connections.InvalidToken as e:

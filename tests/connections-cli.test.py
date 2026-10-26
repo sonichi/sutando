@@ -66,6 +66,7 @@ class CliTests(unittest.TestCase):
             PATH=f"{bindir}{os.pathsep}{os.environ['PATH']}",
             FAKE_KEYCHAIN=str(self.keychain),
             SUTANDO_SUPPRESS_CCD_FALLBACK_BANNER="1",
+            SUTANDO_BRIDGE_LOCK="0",  # the fake bridge scripts take no lease
             # The vault manifest resolves the workspace; keep it in the box.
             SUTANDO_TEST_MODE="1", SUTANDO_WORKSPACE=str(self.ws),
         )
@@ -153,6 +154,49 @@ class CliTests(unittest.TestCase):
         proc = self.run_cli("primary")
         self.assertEqual((proc.returncode, proc.stdout), (2, ""), "no primary: exit 2, nothing printed")
 
+    def test_disconnect_keeps_the_token_and_known_servers_joins_the_rows(self):
+        self.run_cli("add", TOKEN_A, "--yes", "--expected-server", "alpha-fixture.net")
+        self.run_cli("add", TOKEN_B, "--yes", "--expected-server", "beta-fixture.net")
+        proc = self.run_cli("disconnect", "alpha-fixture-net")
+        self.assertEqual(proc.returncode, 1, "the primary is refused, like remove without --force")
+        self.assertIn("primary_cannot_disconnect", proc.stderr)
+        proc = self.run_cli("disconnect", "beta-fixture-net")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("disconnected beta-fixture-net", proc.stdout)
+        self.assertIn("reconnect to resume", proc.stdout)
+        self.assert_no_secret(proc)
+        self.assertTrue((self.keychain / "AG2_REMOTE_TOKEN_BETA_FIXTURE_NET").exists(), "the token stays in the vault")
+        rows = json.loads(self.run_cli("list", "--json").stdout)
+        self.assertEqual([(r["instance"], r["disabled"], r["state"], r["reason"]) for r in rows],
+                         [("alpha-fixture-net", False, "pending", None), ("beta-fixture-net", True, "disconnected", "disabled")])
+        self.assertIn("disconnected (disabled)", self.run_cli("list").stdout)
+        self.assertEqual(self.run_cli("launch-plan").stdout.count("\n"), 1, "the plan omits the disabled row")
+        self.assertIn("alpha-fixture-net\t", self.run_cli("launch-plan").stdout)
+        proc = self.run_cli("disconnect", "nope")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("no connection", proc.stderr)
+        proc = self.run_cli("set-primary", "beta-fixture-net")
+        self.assertEqual(proc.returncode, 1, "a disconnected row cannot become primary")
+        self.assertIn("disabled_cannot_be_primary", proc.stderr)
+        self.assertEqual(self.run_cli("primary").stdout.strip(), "alpha-fixture-net", "the primary is unchanged")
+        self.run_cli("add", TOKEN_A.replace("alpha", "legacy"), "--yes", "--expected-server", "legacy-fixture.net",
+                     "--instance", "legacy-fixture")
+        proc = self.run_cli("add", TOKEN_A.replace("alpha", "reserved"), "--yes", "--expected-server", "reserved-fixture.net",
+                            "--instance", "known-servers")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("reserved", proc.stderr)
+
+        proc = self.run_cli("known-servers", "--json")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        servers = json.loads(proc.stdout)
+        self.assertTrue(servers, "the resolver's registry is never empty")
+        self.assertTrue(all(set(s) == {"server", "connected", "instance", "primary", "disabled"} for s in servers))
+        self.assertTrue(all(s["connected"] is False for s in servers), "fixture servers are registered nowhere")
+        self.assert_no_secret(proc)
+        proc = self.run_cli("known-servers")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue(proc.stdout.startswith("SERVER"))
+
     def test_import_env_then_launch_plan(self):
         extra = {"REMOTE_TASK_TOKEN": TOKEN_A, "AG2_REMOTE_TOKEN_DEV": TOKEN_B}
         proc = self.run_cli("import-env", env_extra=extra)
@@ -225,6 +269,27 @@ class CliTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 1)
         self.assertIn("no connection", proc.stderr)
 
+        launch_args = ("--repo", str(repo), "--logs-dir", str(box / "logs"))
+        self.run_cli("disconnect", "beta-fixture-net")
+        proc = self.run_cli("update-token", "beta-fixture-net", TOKEN_A, *launch_args)
+        self.assertEqual(proc.returncode, 1, "a code for another server is refused")
+        self.assertIn("token_server_mismatch", proc.stderr)
+        self.assert_no_secret(proc)
+        self.assertEqual((self.keychain / "AG2_REMOTE_TOKEN_BETA_FIXTURE_NET").read_text(), TOKEN_B, "the vault is untouched")
+        rotated = "https://beta-fixture.net/relay|secret-beta-rotated"
+        proc = self.run_cli("update-token", "beta-fixture-net", "-", *launch_args, stdin=rotated + "\n")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("updated token of beta-fixture-net (beta-fixture.net; vault key AG2_REMOTE_TOKEN_BETA_FIXTURE_NET replaced; "
+                      "relaunched, pid ", proc.stdout)
+        self.assert_no_secret(proc)
+        self.assertEqual((self.keychain / "AG2_REMOTE_TOKEN_BETA_FIXTURE_NET").read_text(), rotated)
+        rows = json.loads(self.run_cli("list", "--json").stdout)
+        self.assertEqual([(r["instance"], r["disabled"], r["token_ref"]) for r in rows],
+                         [("beta-fixture-net", False, "AG2_REMOTE_TOKEN_BETA_FIXTURE_NET")], "re-enabled, same key")
+        proc = self.run_cli("update-token", "nope", rotated, *launch_args)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("no connection", proc.stderr)
+
     def test_vault_failure_is_named_and_writes_no_row(self):
         (self.keychain / "AG2_REMOTE_TOKEN_ALPHA_FIXTURE_NET").mkdir()  # a directory makes the stub's write fail
         proc = self.run_cli("add", TOKEN_A, "--yes", "--expected-server", "alpha-fixture.net")
@@ -281,6 +346,79 @@ class InProcess(unittest.TestCase):
         rc, out, _ = self.run_main(["launch-plan"], launch_plan=lambda env, workspace=None: [
             {"instance": "dev", "token_ref": "AG2_REMOTE_TOKEN_DEV", "channel_dir": "dev-ag2space", "primary": True}])
         self.assertEqual(out, "dev\tAG2_REMOTE_TOKEN_DEV\tdev-ag2space\t1\n")
+
+    def test_disconnect_and_known_servers_print_the_unit_result(self):
+        rc, out, _ = self.run_main(["disconnect", "dev"], disconnect=lambda inst, workspace=None: {
+            "instance": inst, "token_ref": "AG2_REMOTE_TOKEN_DEV", "disabled": True, "stopped_pid": 31337})
+        self.assertEqual((rc, out), (0, "disconnected dev (stopped pid 31337; token kept in vault as AG2_REMOTE_TOKEN_DEV; "
+                                        "reconnect to resume)\n"))
+        servers = [{"server": "s.space", "connected": True, "instance": "s-space", "primary": True, "disabled": False},
+                   {"server": "dev.s.space", "connected": False, "instance": None, "primary": False, "disabled": False}]
+        rc, out, _ = self.run_main(["known-servers"], known_servers=lambda ws: servers)
+        self.assertEqual(rc, 0)
+        self.assertEqual(out.splitlines()[0].split(), ["SERVER", "CONNECTED", "INSTANCE", "PRIMARY", "DISABLED"])
+        self.assertEqual(out.splitlines()[1].split(), ["s.space", "yes", "s-space", "yes", "no"])
+        self.assertEqual(out.splitlines()[2].split(), ["dev.s.space", "no", "-", "no", "no"])
+        rc, out, _ = self.run_main(["known-servers", "--json"], known_servers=lambda ws: servers)
+        self.assertEqual(json.loads(out), servers)
+        rc, out, _ = self.run_main(["known-servers"], known_servers=lambda ws: [])
+        self.assertEqual(out, "no known servers\n")
+
+    def test_update_token_prints_the_unit_result_and_exits_one_on_a_mismatch(self):
+        def fake(launch):
+            return lambda inst, token, repo, logs_dir, workspace=None: {
+                "instance": inst, "server": "s.space", "token_ref": "AG2_REMOTE_TOKEN_DEV", "launch": launch}
+        args = ["update-token", "dev", "https://chat.s.space|new", "--repo", "/r", "--logs-dir", "/l"]
+        rc, out, _ = self.run_main(args, update_token=fake({"ok": True, "pid": 7}))
+        self.assertEqual((rc, out), (0, "updated token of dev (s.space; vault key AG2_REMOTE_TOKEN_DEV replaced; relaunched, pid 7)\n"))
+        rc, out, _ = self.run_main(args, update_token=fake({"ok": False, "reason": "launch_failed"}))
+        self.assertEqual((rc, out), (0, "updated token of dev (s.space; vault key AG2_REMOTE_TOKEN_DEV replaced; "
+                                        "relaunch failed: launch_failed)\n"))
+        with self.assertRaises(SystemExit) as cm:
+            self.run_main(["update-token", "dev", "--repo", "/r", "--logs-dir", "/l"], update_token=fake(None))
+        self.assertEqual(cm.exception.code, 2, "the token is a required argument, as for add")
+
+        def boom(*a, **k):
+            raise self.cli.connections.TokenAgentMismatch("dev", "the code is for agent @b:s.space, not @a:s.space")
+        rc, out, err = self.run_main(args, update_token=boom)
+        self.assertEqual((rc, out), (1, ""))
+        self.assertIn("connections: token_agent_mismatch: ", err)
+
+        def unknown(*a, **k):
+            raise self.cli.connections.TokenStateUnknown("token_state_unknown: the update of dev failed after the vault write began (OSError: disk full) and reading AG2_REMOTE_TOKEN_DEV back failed, so it is not known which secret it holds")
+        rc, out, err = self.run_main(args, update_token=unknown)
+        self.assertEqual((rc, out), (1, ""))
+        self.assertIn("connections: token_state_unknown: ", err)
+        self.assertNotIn("relaunched", err)
+
+    def test_update_token_help_documents_stdin_as_the_form_that_hides_the_code(self):
+        with self.assertRaises(SystemExit) as cm:
+            self.run_main(["update-token", "--help"])
+        self.assertEqual(cm.exception.code, 0)
+        import contextlib
+        import io
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), self.assertRaises(SystemExit):
+            self.cli.main(["update-token", "--help"])
+        self.assertIn("TOKEN|-", out.getvalue())
+        self.assertIn("stdin", out.getvalue())
+        self.assertIn("process list", out.getvalue())
+        self.assertIn("update-token INSTANCE - --repo", self.cli.__doc__, "the verb table shows the stdin form")
+
+    def test_set_primary_prints_the_relaunch_hint_and_exits_one_on_a_disabled_row(self):
+        rc, out, _ = self.run_main(["set-primary", "dev"], set_primary=lambda inst, workspace=None: {
+            "instance": inst, "server": "s.space", "primary": True, "relaunch_needed": True})
+        self.assertEqual((rc, out), (0, "primary is now dev (s.space); its running bridge carries the proactive room "
+                                        "after you reconnect it\n"))
+        rc, out, _ = self.run_main(["set-primary", "dev"], set_primary=lambda inst, workspace=None: {
+            "instance": inst, "server": "s.space", "primary": True, "relaunch_needed": False})
+        self.assertEqual((rc, out), (0, "primary is now dev (s.space)\n"))
+
+        def refused(inst, workspace=None):
+            raise self.cli.connections.DisabledCannotBePrimary(inst)
+        rc, out, err = self.run_main(["set-primary", "dev"], set_primary=refused)
+        self.assertEqual((rc, out), (1, ""))
+        self.assertIn("connections: disabled_cannot_be_primary: dev", err)
 
 
 if __name__ == "__main__":

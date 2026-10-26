@@ -135,7 +135,7 @@
    ],
    "status": "active",
    "canonical_for": "the state/connections.json record, preview-then-confirm add, primary and state semantics, and the startup launch plan for multi-gateway bridges",
-   "last_verified": "2026-10-24"
+   "last_verified": "2026-10-26"
   },
   "docs/delivery-protocol.md": {
    "title": "The file delivery protocol as a formal state machine",

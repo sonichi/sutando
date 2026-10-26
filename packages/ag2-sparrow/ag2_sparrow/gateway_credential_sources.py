@@ -8,9 +8,10 @@ SOURCES states the precedence once and discover() walks it. discover() registers
 before it picks the winners, so a sink can withhold a discarded one, every assignment of a
 credential key included. A credential file that exists but is refused is
 named, never treated as absent in silence. Fail-closed covers the credential tiers only: a refused
-AG2_DEVICE_ENV stops the file and vault token tiers and a refused REMOTE_TASK_TOKEN_FILE stops
-rotation (Discovery.fatal either way), while general config such as REMOTE_PROACTIVE_ROOM still
-falls through to the later files.
+AG2_DEVICE_ENV stops the file and vault token tiers, and a set REMOTE_TASK_TOKEN_FILE is the first token
+source: set at all, it closes the file and vault tiers, and refused, every tier (Discovery.fatal either way),
+while general config such as REMOTE_PROACTIVE_ROOM still falls through to the later files. A seat (SEAT_KEY,
+the per-agent channel dir write_seat_credentials writes) reads its own .env and token file only.
 Parsing and masking are the pure contract in gateway_credentials (generated from
 shared/ag2_gateway_credentials.py). Stdlib only; vendored byte-identical into the ag2-sparrow
 package by tools/sync_from_src.py.
@@ -21,6 +22,8 @@ import contextlib
 import json
 import os
 import os.path
+import re
+import secrets
 import shlex
 import tempfile
 import urllib.parse
@@ -227,9 +230,10 @@ def bridge_strip_keys() -> "tuple[str, ...]":
                                + URL_KEYS + tuple(contract.URL_ALIAS_PRECEDENCE)))
 
 # The precedence, stated once; the first source carrying a value wins (see discover() for each name:
-# "file" is the first listed .env file carrying a token, "token" the URL inside the winning one).
+# "token_file" is REMOTE_TASK_TOKEN_FILE, "file" the first listed .env file carrying a token, "token" the URL
+# inside the winning one).
 SOURCES = (
-    ("token", ("env", "file", "vault")),
+    ("token", ("token_file", "env", "file", "vault")),
     ("url", ("env", "token", "file")),
     ("token_file", ("env", "file")),
     ("media_token", ("env",)),
@@ -268,6 +272,117 @@ CHANNEL_DIR_KEY = "REMOTE_TASK_CHANNEL_DIR"
 def channel_dir(env: Mapping[str, str]) -> str:
     """Which channels/<dir>/ a Sparrow reads: REMOTE_TASK_CHANNEL_DIR, else the default."""
     return env.get(CHANNEL_DIR_KEY) or DEFAULT_CHANNEL_DIR
+
+
+# A seat: one agent's own channel dir, <seat>/channels/ag2space/, holding its .env and its token file.
+SEAT_KEY = "REMOTE_TASK_SEAT"
+SEAT_TOKEN_NAME = "token"
+SEAT_TIERS = ("owner", "team", "guest")  # highest first; the bridge's LOCAL_TIER vocabulary
+SEAT_INSTANCE_RE = re.compile(r"[0-9a-f]{32}")
+# What a seat bridge must not inherit: a token, URL or identity in the environment would win over the seat's own.
+SEAT_CLEARED = ("AGENT_ID", "AG2SPACE_USER_ID", "AG2_REMOTE_TIER", "GATEWAY_CREDENTIALS_INJECTED")
+
+
+def named_token_file(env: Mapping[str, str]) -> str:
+    """The token file REMOTE_TASK_TOKEN_FILE names in `env`, '' when none. A seat's holds its credential alone
+    and is opened private (read_private); a host's may be its channel .env, read as any other."""
+    return env.get(TOKEN_FILE_KEY) or ""
+
+
+def is_seat(env: Mapping[str, str]) -> bool:
+    """Whether `env` is a seat bridge's: SEAT_KEY, or a GATEWAY_INSTANCE in the seat's 32-hex form (a named
+    instance such as `dev` is none). Its token and URL come from its token file alone, its channel .env is
+    AG2_DEVICE_ENV alone, never the host's channel dir, environment token or vault."""
+    return bool(env.get(SEAT_KEY)) or bool(SEAT_INSTANCE_RE.fullmatch(env.get("GATEWAY_INSTANCE") or ""))
+
+
+def seat_channel_dir(seat) -> str:
+    """<seat>/channels/ag2space: where a seat's .env and token file live."""
+    return os.path.join(os.fspath(seat), "channels", DEFAULT_CHANNEL_DIR)
+
+
+def mint_gateway_instance() -> str:
+    """A fresh 32-hex GATEWAY_INSTANCE, for a seat that has none."""
+    return secrets.token_hex(16)
+
+
+def _seat_values_problem(values: Mapping[str, str]) -> str:
+    if not (values.get("AGENT_MXID") or "").strip():
+        return "AGENT_MXID is missing"
+    if not SEAT_INSTANCE_RE.fullmatch(values.get("GATEWAY_INSTANCE") or ""):
+        return "GATEWAY_INSTANCE is not 32 lowercase hex"
+    if (values.get("REMOTE_TASK_TIER") or "") not in SEAT_TIERS:
+        return f"REMOTE_TASK_TIER is not one of {', '.join(SEAT_TIERS)}"
+    if not values.get(TOKEN_FILE_KEY):
+        return f"{TOKEN_FILE_KEY} is missing"
+    return ""
+
+
+def _replace_file(path: str, text: str, mode: int) -> None:
+    """`text` at `path` through a temp file and os.replace, created at `mode`, so no reader sees a torn
+    or briefly wider file."""
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=f".{os.path.basename(path)}.")
+    try:
+        os.fchmod(fd, mode)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(tmp)
+        raise
+
+
+def write_seat_credentials(seat, *, agent_id: str, instance: str, tier: str, relay_url: str, bearer: str) -> str:
+    """Write a seat's channel dir: `.env` (AGENT_MXID, GATEWAY_INSTANCE, REMOTE_TASK_TOKEN_FILE,
+    REMOTE_TASK_TIER) and `token` (one line, <relay_url>|<bearer>), each 0600 through temp + rename, the dir
+    0700. A rewrite replaces the token in place, which is a rotation. '' or why not, never the bearer."""
+    chan = seat_channel_dir(seat)
+    token_path = os.path.join(chan, SEAT_TOKEN_NAME)
+    values = {"AGENT_MXID": (agent_id or "").strip(), "GATEWAY_INSTANCE": instance or "",
+              TOKEN_FILE_KEY: token_path, "REMOTE_TASK_TIER": tier or ""}
+    problem = _seat_values_problem(values)
+    if problem:
+        return f"the seat's {problem}"
+    for v in (values["AGENT_MXID"], token_path):
+        if "\n" in v or "\r" in v or v != v.strip() or v[:1] in "\"'" or v[-1:] in "\"'":
+            return "the agent id or the seat path cannot be carried on a .env line as it is"
+    why = gateway_url_problem(relay_url or "")
+    if why:
+        return f"the relay URL {why}"
+    if not bearer or any(c.isspace() or c == "|" or ord(c) < 0x20 for c in bearer):
+        return "the bearer is empty or holds whitespace, a control character or '|'"
+    os.makedirs(chan, mode=0o700, exist_ok=True)
+    os.chmod(chan, 0o700)
+    _replace_file(token_path, f"{relay_url}|{bearer}\n", 0o600)
+    _replace_file(os.path.join(chan, ".env"), "".join(f"{k}={v}\n" for k, v in values.items()), 0o600)
+    return ""
+
+
+def _clamp_tier(tier: str, cap: str) -> str:
+    return SEAT_TIERS[max(SEAT_TIERS.index(tier), SEAT_TIERS.index(cap))] if cap in SEAT_TIERS else tier
+
+
+def seat_bridge_environ(seat_env_path: str, read_text: "Callable[[str], object]",
+                        core_tier: str = "") -> "tuple[dict, str]":
+    """The environment a seat's bridge runs with, from its .env read through the caller's `read_text` (see
+    _read_result): the seat's keys exported (the bridge reads them from its environment only), SEAT_KEY set,
+    every inherited token, URL and identity variable cleared. `core_tier`, on a host with a core, caps the
+    tier. ({}, '') for a file that is no seat; its values never leave this call."""
+    text, reason = _read_result(read_text(seat_env_path))
+    if reason:
+        return {}, refusal_note(seat_env_path, reason)
+    values = parse_env_text(text or "")
+    if TOKEN_FILE_KEY not in values:
+        return {}, ""
+    problem = _seat_values_problem(values)
+    if problem:
+        return {}, f"the seat .env {seat_env_path}: {problem}"
+    out = {k: "" for k in bridge_strip_keys() + SEAT_CLEARED}
+    out.update({"AG2_DEVICE_ENV": seat_env_path, SEAT_KEY: "1", "AGENT_MXID": values["AGENT_MXID"].strip(),
+                "GATEWAY_INSTANCE": values["GATEWAY_INSTANCE"], TOKEN_FILE_KEY: values[TOKEN_FILE_KEY],
+                "REMOTE_TASK_TIER": _clamp_tier(values["REMOTE_TASK_TIER"], core_tier)})
+    return out, ""
 
 
 def _read_result(got) -> "tuple[Optional[str], str]":
@@ -320,9 +435,9 @@ def env_files(env: Mapping[str, str], read_text: "Callable[[str], object]") -> E
 def channel_env_paths(env: Mapping[str, str], channel_dir: str = DEFAULT_CHANNEL_DIR) -> "list[str]":
     """The channel .env files a Sparrow reads, in precedence order: AG2_DEVICE_ENV, then
     $CLAUDE_CONFIG_DIR/channels/<dir>/.env. Never a bare-home guess, which could pick up an
-    unrelated install's token. Paths only: the caller reads them."""
+    unrelated install's token. A seat reads its own .env alone. Paths only: the caller reads them."""
     paths = [env.get("AG2_DEVICE_ENV") or ""]
-    if env.get("CLAUDE_CONFIG_DIR"):
+    if env.get("CLAUDE_CONFIG_DIR") and not is_seat(env):
         paths.append(os.path.join(env["CLAUDE_CONFIG_DIR"], "channels", channel_dir, ".env"))
     return [p for p in paths if p]
 
@@ -482,16 +597,30 @@ def discover(env: Mapping[str, str], files: "Sequence[EnvFile]" = (), *,
     token_file_env = env.get(TOKEN_FILE_KEY) or ""
     token_file_text, token_file_reason = (_read_result(read_token_file(token_file_env))
                                           if (token_file_env and read_token_file) else ("", ""))
+    token_file_missing = bool(token_file_env and read_token_file) and token_file_text is None and not token_file_reason
     token_file_text = token_file_text or ""
     notes = [refusal_note(p, r) for p, r in getattr(files, "refused", ())]
     blocked = getattr(files, "blocked", "")
     fatal = [blocked] if blocked else []
     if token_file_reason:
         notes.append(refusal_note(token_file_env, token_file_reason))
-        # A refused named token file would silently disable rotation: after a 401 nothing could recover.
         fatal.append(f"REMOTE_TASK_TOKEN_FILE names {token_file_env}, which was refused "
-                     f"({token_file_reason}); token rotation cannot read it. Fix that file or unset "
+                     f"({token_file_reason}); no other credential source stands in for it. Fix that file or unset "
                      "REMOTE_TASK_TOKEN_FILE")
+    seat = is_seat(env)
+    if seat and token_file_missing:
+        fatal.append(f"REMOTE_TASK_TOKEN_FILE names {token_file_env}, which does not exist; a seat has no other "
+                     "credential source. Reconnect the agent")
+    if seat and not token_file_env:
+        fatal.append("this bridge is a seat but REMOTE_TASK_TOKEN_FILE is unset; a seat reads its token from its "
+                     "own token file only")
+    if seat and not env.get("AG2_DEVICE_ENV"):
+        fatal.append("this bridge is a seat but AG2_DEVICE_ENV does not name its .env")
+    # A named token file decides alone: refused, no tier stands in; blank or not yet written, only the env may.
+    # Named means authoritative: a channel .env or the vault would connect as a credential nobody named.
+    seat_without_file = seat and (not token_file_env or token_file_missing)
+    closed = (("token_file", "env", "file", "vault") if token_file_reason or seat_without_file
+              else ("env", "file", "vault") if seat else ("file", "vault") if token_file_env else ())
     if registry is not None:
         register_pairs(registry, [(key, unquote(env.get(key) or "")) for key in CREDENTIAL_KEYS])
         register_pairs(registry, [(key, values.get(key) or "") for _p, values in files for key in CREDENTIAL_KEYS])
@@ -505,6 +634,10 @@ def discover(env: Mapping[str, str], files: "Sequence[EnvFile]" = (), *,
 
     found = {"raw": "", "token_key": "", "source": "none", "source_file": "", "source_vals": {},
              "file_url": ""}
+
+    def token_from_token_file():
+        raw = token_file_token(token_file_text) if token_file_env else ""
+        return raw and dict(raw=raw, token_key=TOKEN_FILE_KEY, file_url=token_file_url(token_file_text))
 
     def token_env():
         raw, key = first_env(env, TOKEN_KEYS)
@@ -523,15 +656,23 @@ def discover(env: Mapping[str, str], files: "Sequence[EnvFile]" = (), *,
 
     tiers = dict(SOURCES)
     for name in tiers["token"]:
-        if blocked and name != "env":
+        if name in closed or (blocked and name != "env"):
             continue  # a refused explicit device file: no later tier may stand in for it
-        got = {"env": token_env, "file": token_file, "vault": token_vault}[name]()
+        got = {"token_file": token_from_token_file, "env": token_env, "file": token_file, "vault": token_vault}[name]()
         if got:
             found.update(got, source=name)
             break
     raw = found["raw"]
     url_from_token, token = contract.parse_onboarding_token(raw)
-    env_url, url_key = first_env(env, URL_KEYS)
+    env_url, url_key = ("", "") if seat else first_env(env, URL_KEYS)  # a seat's URL is its token file's
+    file_ok = token_file_env and not (token_file_reason or token_file_missing)
+    if file_ok and not raw:
+        fatal.append(f"REMOTE_TASK_TOKEN_FILE names {token_file_env}, which holds no token"
+                     + ("; a seat has no other credential source. Reconnect the agent" if seat else
+                        " and no REMOTE_TASK_TOKEN is set. Reconnect the agent or fix that file"))
+    elif seat and raw and not (url_from_token or found["file_url"]):
+        fatal.append(f"REMOTE_TASK_TOKEN_FILE names {token_file_env}, whose token carries no gateway URL; a seat's "
+                     "token file is one line, <relay_url>|<bearer>. Reconnect the agent")
     url = next((v for v in ({"env": env_url, "token": url_from_token, "file": found["file_url"]}[n]
                             for n in tiers["url"]) if v), "")
     token_file_path = next((v for v in ({"env": token_file_env, "file": found["source_file"]}[n]

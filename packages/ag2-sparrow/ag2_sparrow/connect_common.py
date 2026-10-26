@@ -17,6 +17,8 @@ none, so each adapter owns its console script and the boundary rule holds. Stdli
 from __future__ import annotations
 
 import fcntl
+import getpass
+import json
 import os
 import platform
 import plistlib
@@ -31,10 +33,15 @@ import sysconfig
 import tempfile
 import threading
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import _dirs, service_manager as _sm, task_io
+from . import _dirs, diagnostics, gateway_credential_sources as _sources, gateway_instance, service_manager as _sm
+from . import setup_fetch, task_io
+from .bounded_file_read import read_regular
 from .task_io import LockRefused, acquire_lock, install_id, lock_held, lock_holder, lock_path, release_lock  # noqa: F401
 
 EXIT_HELD = 75          # another session holds this work root: a supervisor must not relaunch over it
@@ -1051,3 +1058,162 @@ def _uninstall_locked(shape: Shape, before_free=None, token_file=None) -> int:
         print(f"removed: {conf}")
     print(kept_line(shape, relay))
     return 0
+
+
+# ── connect --code: redeem a one-time code for the agent's relay credential ─────
+
+CODE_PREFIX = "acp."        # what AG2 Space issues for an agent run by a local CLI
+REDEEM_PATH = "/connect/poll"
+REDEEM_TIMEOUT_S = 15
+REDEEM_BACKOFF_S = (1, 2, 4, 8, 16)     # one wait per 503 or 202 before the next attempt
+RETRY_AFTER_MAX_S = 30
+STANDALONE_TIER = "owner"   # no core on the host to cap it (plan 9.2); the key is required
+LOOPBACK_HOSTS = ("127.0.0.1", "::1", "localhost")
+GONE = {"agent_revoked": "the agent was removed in AG2 Space; add it again there for a new code"}
+
+
+def endpoint_problem(url: str, what: str) -> str:
+    """'' when `url` is https (plain http only on a loopback host, for tests), else why not."""
+    why = _sources.gateway_url_problem(url or "")
+    if why:
+        return f"{what} {why}"
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme.lower() != "https" and parts.hostname not in LOOPBACK_HOSTS:
+        return f"{what} is not https; only a loopback host may use plain http"
+    return ""
+
+
+def _relay_host_ok(relay_host: str, base_host: str) -> bool:
+    """The relay is on the base's own host or under it. A shared parent domain is not enough: without the
+    public suffix list, two hosts under one suffix (a.co.uk, b.co.uk) cannot be told apart from one owner's."""
+    relay_host, base_host = relay_host.rstrip(".").lower(), base_host.rstrip(".").lower()
+    return bool(base_host) and (relay_host == base_host or relay_host.endswith("." + base_host))
+
+
+def relay_problem(base: str, relay_url: str, trusted_host: str = "") -> str:
+    """'' when the relay URL the backend returned may be written: https, and on the base's host (or under it)
+    unless the owner named its host with --trust-relay-host; else why not."""
+    why = endpoint_problem(relay_url, "the relay URL AG2 Space returned")
+    if why:
+        return why
+    host = (urllib.parse.urlsplit(relay_url).hostname or "").lower()
+    base_host = urllib.parse.urlsplit(base).hostname or ""
+    if not _relay_host_ok(host, base_host) and host != trusted_host.lower():
+        return (f"the relay URL AG2 Space returned is on {host}, not {base_host} or a host under it; if that relay "
+                f"is expected, connect again with a new code and --trust-relay-host {host}")
+    return ""
+
+
+def code_problem(base: str, code: str) -> str:
+    """'' when `base` is a usable backend URL and `code` an agent code, else why not, without the code."""
+    why = endpoint_problem(base, "--base")
+    if why:
+        return why
+    if not (code or "").startswith(CODE_PREFIX) or len(code) <= len(CODE_PREFIX) or any(c.isspace() for c in code):
+        return f"the code is not an agent code (it starts with {CODE_PREFIX}); copy it from AG2 Space again"
+    return ""
+
+
+def read_code(arg, stdin=None, prompt=None) -> "tuple[str, str]":
+    """(code, '') or ('', why): `--code -` reads one line from stdin, no --code prompts on a terminal, and a
+    code on the command line still works with a warning, since ps and shell history keep it."""
+    stdin = stdin or sys.stdin
+    if arg == "-":
+        return stdin.readline(4096).strip(), ""
+    if arg is None:
+        if not stdin.isatty():
+            return "", "no code: pass --code - and pipe the code in, or run connect in a terminal to be asked for it"
+        return (prompt or getpass.getpass)("AG2 Space code: ").strip(), ""
+    print("warning: a code on the command line is kept by ps and shell history; next time use --code - or the "
+          "prompt", file=sys.stderr)
+    return arg.strip(), ""
+
+
+def _post_json(url: str, body: dict, opener) -> "tuple[int, bytes]":
+    with gateway_instance.gateway_call(url):
+        req = urllib.request.Request(url, data=json.dumps(body).encode("utf-8"), method="POST",
+                                     headers={"Content-Type": "application/json", "Accept": "application/json"})
+        try:
+            with (opener or urllib.request.urlopen)(req, timeout=REDEEM_TIMEOUT_S) as resp:
+                return resp.status, resp.read(64 * 1024)
+        except urllib.error.HTTPError as e:
+            try:
+                return e.code, e.read(64 * 1024) or b""
+            except Exception:  # noqa: BLE001 - an unreadable error body is only an empty one
+                return e.code, b""
+
+
+def _answer(raw: bytes) -> dict:
+    try:
+        got = json.loads((raw or b"").decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return {}
+    return got if isinstance(got, dict) else {}
+
+
+def _retry_after(answer: dict, default: float) -> float:
+    value = answer.get("retry_after")
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value != value:
+        return default
+    return min(max(float(value), 1.0), RETRY_AFTER_MAX_S)
+
+
+def redeem_code(base: str, code: str, opener=None, sleep=None) -> "tuple[dict | None, str]":
+    """({relay_url, bearer, agent_id}, '') or (None, why). The bearer and URL are registered as secrets
+    before this returns, so no later line can print them. A 503 or a 202 (still redeeming) is retried on
+    REDEEM_BACKOFF_S, a 202's retry_after honoured up to RETRY_AFTER_MAX_S."""
+    sleep = sleep or time.sleep
+    url = base.rstrip("/") + REDEEM_PATH
+    for wait in (*REDEEM_BACKOFF_S, None):
+        try:
+            status, raw = _post_json(url, {"device_code": code}, opener)
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            return None, (f"could not reach {base} ({diagnostics.describe(e)}); the code is still valid until it "
+                          "expires, try again")
+        answer = _answer(raw)
+        if status in (202, 503) and wait is not None:
+            sleep(_retry_after(answer, wait) if status == 202 else wait)
+            continue
+        if status == 202:
+            return None, "AG2 Space is still redeeming the code; run connect again with the same code in a minute"
+        if status == 503:
+            return None, "AG2 Space is busy (HTTP 503 on every try); the code is still valid, try again in a minute"
+        if status == 404:
+            reason = next((answer[k] for k in ("error", "reason", "state") if isinstance(answer.get(k), str)), "")
+            return None, GONE.get(reason, "the code was already used or has expired; make a new one in AG2 Space")
+        if status != 200:
+            return None, f"AG2 Space refused the code (HTTP {status})"
+        fields = {k: answer.get(k) for k in ("relay_url", "bearer", "agent_id")}
+        for value in (fields["bearer"], fields["relay_url"]):
+            if isinstance(value, str) and value:
+                diagnostics.register_secret(value)
+        if not all(isinstance(v, str) and v.strip() for v in fields.values()):
+            return None, "AG2 Space's answer had no relay_url, bearer or agent_id; the code is spent, make a new one"
+        diagnostics.register_gateway_url(fields["relay_url"])
+        return {k: v.strip() for k, v in fields.items()}, ""
+    return None, "unreachable"  # pragma: no cover - the loop always returns
+
+
+def seat_instance(seat) -> str:
+    """The seat's GATEWAY_INSTANCE when its .env already holds a valid one (kept across reconnects), else
+    a fresh one."""
+    path = os.path.join(_sources.seat_channel_dir(seat), ".env")
+    text, _why = read_regular(path)
+    kept = _sources.parse_env_text(text or "").get("GATEWAY_INSTANCE", "")
+    return kept if _sources.SEAT_INSTANCE_RE.fullmatch(kept) else _sources.mint_gateway_instance()
+
+
+def write_seat(seat, redeemed: dict) -> "tuple[str, str]":
+    """(the seat's .env path, '') or ('', why): the redeemed credential written by its owner, standalone
+    tier, the instance kept or minted once."""
+    problem = _sources.write_seat_credentials(seat, agent_id=redeemed["agent_id"], instance=seat_instance(seat),
+                                              tier=STANDALONE_TIER, relay_url=redeemed["relay_url"],
+                                              bearer=redeemed["bearer"])
+    return ("", problem) if problem else (os.path.join(_sources.seat_channel_dir(seat), ".env"), "")
+
+
+def served_setup_line(vendor: str) -> str:
+    """Which setup this connect follows: the served one when the backend gives one, else the built-in."""
+    setup = setup_fetch.fetch_setup(kind="acp", vendor=vendor)
+    revision = diagnostics.revision_field((setup or {}).get("revision"))
+    return f"setup: served revision {revision}" if revision is not None else "setup: built-in (no served setup)"

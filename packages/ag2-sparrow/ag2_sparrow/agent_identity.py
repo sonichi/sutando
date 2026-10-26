@@ -2,7 +2,7 @@
 
 `resolve` is the bridge's identity chain, in its order: the process env (`AGENT_MXID`, `AGENT_ID`),
 then the channel .env files (`AGENT_MXID`, `AGENT_ID`, `AG2SPACE_USER_ID`), then the durable binding
-`<state>/auth/ag2space.json`'s `agent_id`. The gateway bridge and the installers read it here, so an
+`<state>/auth/ag2space.json`'s `agent_id`, which a seat (strict) never reads. The gateway bridge and the installers read it here, so an
 install derives its root from exactly the identity the bridge will report. A launcher that has
 decided the identity sets `PINNED_KEY` (see `launch_environ`): the chain is then `AGENT_MXID` alone,
 so the bridge runs as the launcher's saved identity or as none, never one a file or binding supplies.
@@ -77,10 +77,13 @@ def launch_environ(base, mxid: str) -> dict:
     return env
 
 
-def resolve(state_dir, channel_value, environ=None) -> str:
+def resolve(state_dir, channel_value, environ=None, strict=None) -> str:
     """The agent id by the bridge's chain; `channel_value(key)` reads the channel .env tier. '' = unknown.
-    A pinned environment answers from its own `AGENT_MXID` alone."""
+    A pinned environment answers from its own `AGENT_MXID` alone. `strict` (default: the environment is a
+    seat's) stops at the channel tier: the host's binding is the host's agent, never a seat's."""
     env = os.environ if environ is None else environ
+    if strict is None:
+        strict = _sources.is_seat(env)
     if env.get(PINNED_KEY):
         return (env.get("AGENT_MXID") or "").strip()
     for key in ENV_KEYS:
@@ -91,7 +94,7 @@ def resolve(state_dir, channel_value, environ=None) -> str:
         v = (channel_value(key) or "").strip()
         if v:
             return v
-    return enrolled(state_dir)
+    return "" if strict else enrolled(state_dir)
 
 
 def root_segment(agent_id: str) -> str:

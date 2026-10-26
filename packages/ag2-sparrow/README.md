@@ -275,11 +275,26 @@ and, when the hook needs registering or updating, a `REQUIRED hook:` line
 naming the staged definition, followed by that definition (with its versioned
 `script_path`) for the agent's hooks tool.
 
-The token stays out of the hook, its config and the wake payload. Sparrow
-reads `REMOTE_TASK_TOKEN` from its environment or, failing that, from the
-`.env` file named by `AG2_DEVICE_ENV` at startup. `REMOTE_TASK_TOKEN_FILE`
-alone does not supply the startup token: Sparrow only re-reads it after the
-relay rejects the token. Keep the `.env` file mode 600.
+The token stays out of the hook, its config and the wake payload. When
+`REMOTE_TASK_TOKEN_FILE` is set, Sparrow reads its startup token from that
+file first, and re-reads it after the relay rejects the token. A set file it
+cannot read stops startup: no other source stands in. A seat's token file
+(below) must also be this user's own, mode 600, and not a symlink. A file with no token,
+or not yet written, leaves only `REMOTE_TASK_TOKEN` in the environment, never
+a channel `.env` or the vault. Without it, Sparrow reads `REMOTE_TASK_TOKEN` from its
+environment or, failing that, from the `.env` file named by `AG2_DEVICE_ENV`.
+Keep both files mode 600.
+
+A seat is one agent's own channel dir, `<seat>/channels/ag2space/`: a `.env`
+(`AGENT_MXID`, `GATEWAY_INSTANCE`, `REMOTE_TASK_TOKEN_FILE`,
+`REMOTE_TASK_TIER`) and a `token` file (`<relay_url>|<bearer>`), both mode
+600. A bridge started with `REMOTE_TASK_SEAT=1`, or with a 32-hex
+`GATEWAY_INSTANCE` (the launcher sets both from the seat `.env`, with every
+inherited token, URL and identity variable cleared), reads its token and
+gateway URL from that file only, its config from that `.env` only, and never
+the host's binding as its identity. A seat whose token file is missing, empty
+or carries no gateway URL writes the reason to its gateway status and waits a
+minute before it exits, so its service manager does not restart it in a loop.
 
 `ag2-sparrow-hatch install --mxid @x:ag2.space` writes:
 
