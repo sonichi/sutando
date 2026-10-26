@@ -359,7 +359,7 @@ SEAT_HOLDER = ("import fcntl, os, sys; fd = os.open(sys.argv[1], os.O_RDWR | os.
                "fcntl.flock(fd, fcntl.LOCK_EX); print('held', flush=True); sys.stdin.read()")
 AGENT_LOCK_HOLDER = ("import sys; sys.path.insert(0, %r); from ag2_sparrow import connect_common as cm\n"
                      "lock = cm.agent_lock(%r); lock.__enter__(); grant = %r\n"
-                     "if grant: cm.publish_start_grant(%r, grant)\n"
+                     "if grant:\n    try: cm.publish_start_grant(%r, grant)\n    except TypeError: cm.publish_start_grant(sys.argv[1])\n"
                      "print('held', flush=True); sys.stdin.read()")
 CONTENDER = ("import sys; sys.path.insert(0, %r); from ag2_sparrow import connect_common as cm\n"
              "from ag2_sparrow.adapters.%s import %s as other\n"
@@ -370,9 +370,10 @@ CONTENDER = ("import sys; sys.path.insert(0, %r); from ag2_sparrow import connec
 LAUNCHED = ("import sys; sys.path.insert(0, %r); from ag2_sparrow import connect_common as cm, holder_lock, task_io\n"
             "install = %r\n"
             "if install: holder_lock.install_id = lambda: install\n"
-            "fd, why = cm.launch_admission(%r, %r, wait_s=5)\n"
+            "try: fd, why = cm.launch_admission(%r, %r, wait_s=5)\n"
+            "except TypeError: fd, why = None, cm.launch_admission(sys.argv[1], wait_s=5)  # an older head, for fail-first\n"
             "if why: print('refused', why, flush=True); sys.exit(75)\n"
-            "o = task_io.acquire_lock(%r, %r); cm.end_admission(fd)\n"
+            "o = task_io.acquire_lock(%r, %r); getattr(cm, 'end_admission', lambda fd: None)(fd)\n"
             "print('held', flush=True); sys.stdin.read(); task_io.release_lock(o)")
 # The real launcher entry point (hold_and_supervise) with a sleep for its consumer, until stdin closes.
 REAL_LAUNCHER = ("import subprocess, sys; sys.path.insert(0, %r)\n"
@@ -418,7 +419,7 @@ def launched(root, adapter, install="", real=False):
     """The manager's start: the launcher passes the agent lock's admission, then takes the root."""
     script = REAL_LAUNCHER % (str(PKG), str(root)) if real else \
         LAUNCHED % (str(PKG), install, str(root), "claude-local", str(root), adapter)
-    p = subprocess.Popen([sys.executable, "-c", script],
+    p = subprocess.Popen([sys.executable, "-c", script, str(root)],
                          stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
     if p.stdout.readline().strip() != "held":
         p.wait(timeout=30)
@@ -2889,7 +2890,8 @@ class ConnectCode(AgentRootBase):
 
     def agent_lock_holder(self, grant=""):
         """The production agent lock held by another process (and, with `grant`, a start it published)."""
-        p = subprocess.Popen([sys.executable, "-c", AGENT_LOCK_HOLDER % (str(PKG), str(self.root), grant, str(self.root))],
+        p = subprocess.Popen([sys.executable, "-c", AGENT_LOCK_HOLDER % (str(PKG), str(self.root), grant, str(self.root)),
+                              str(self.root)],
                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
         self.assertEqual(p.stdout.readline().strip(), "held")
         self.addCleanup(lambda: unhold(p) if p.poll() is None else None)
