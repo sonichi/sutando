@@ -78,6 +78,10 @@ class Handler(BaseHTTPRequestHandler):
             payload = json.loads(self.rfile.read(ln) if ln else b"{}")
         except ValueError:
             payload = {}
+        if self.path.startswith("/v1/room") and payload.get("op") == "members":
+            # The bridge adopts the owner DM only when it holds just the agent and its owner.
+            self._json({"members": [{"user_id": "@mock-agent:example.org"}, {"user_id": "@o:example.org"}]})
+            return
         if self.path.startswith("/v1/room") and payload.get("body") == BODY:
             with LOCK:
                 STATE["posts"] += 1
