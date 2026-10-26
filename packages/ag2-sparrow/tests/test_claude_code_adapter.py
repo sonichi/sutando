@@ -2467,6 +2467,31 @@ class ConnectCode(AgentRootBase):
             return checked
         self.assert_replaced_and_refused("root_is_held", wrap, "was replaced while the seat was written")
 
+    def test_a_symlinked_seat_path_is_refused_and_nothing_is_written_through_it(self):
+        elsewhere = self.home / "elsewhere-seat"
+        cm.write_seat(elsewhere, {"relay_url": RELAY, "bearer": "elsewhere-bearer-SSSS8888", "agent_id": AGENT})
+        target = {p: p.read_bytes() for p in elsewhere.rglob("*") if p.is_file()}
+        home = cli.bridge_home(self.root)
+        for name in ("seat dir", "channel dir", "token"):
+            with self.subTest(name):
+                home.unlink() if home.is_symlink() else shutil.rmtree(home, ignore_errors=True)
+                self.root.mkdir(parents=True, exist_ok=True)
+                if name == "seat dir":
+                    link, to = home, elsewhere
+                else:
+                    cm.write_seat(home, {"relay_url": RELAY, "bearer": "other-bearer-PPPP6666", "agent_id": AGENT})
+                    link = self.seat() if name == "channel dir" else self.seat() / "token"
+                    to = elsewhere / link.relative_to(home)
+                    shutil.rmtree(link) if link.is_dir() else link.unlink()
+                link.symlink_to(to)
+                rc, out, err = self.connect(Backend())
+                self.assertEqual(rc, cli.EXIT_UNUSABLE, out + err)
+                self.assertNotIn("connected:", out)
+                self.assertIn("the code is spent but the seat was not written", err)
+                self.assertEqual(os.readlink(link), str(to), "the link itself is left as it was")
+                self.assertEqual({p: p.read_bytes() for p in elsewhere.rglob("*") if p.is_file()}, target,
+                                 "nothing written through the link")
+
     def test_a_stable_root_through_the_same_seam_connects(self):
         self.seated_by_another_adapter()
         seen, real = [], cm.acquire_lock
