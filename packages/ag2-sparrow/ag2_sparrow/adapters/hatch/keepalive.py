@@ -45,7 +45,7 @@ TASK_NOT_PICKED_UP, TASK_PICKUP_S = "task-not-picked-up", 15 * 60
 # A healthy row's reason while a task waits on a deliberate hold, never a problem.
 TASK_HELD = "task-held-for-owner"
 # A hold whose room line the drain has not delivered this long is reported, never acted on: the
-# line is still queued, being sent or parked (undelivered), or gone with no receipt (unconfirmed).
+# line is queued, being sent, parked or withdrawn (undelivered), or gone with no receipt (unconfirmed).
 TASK_HELD_UNDELIVERED, HELD_LINE_DELIVER_S = "task-held-line-undelivered", 10 * 60
 TASK_HELD_UNCONFIRMED = "task-held-line-unconfirmed"
 UPGRADE_FAILED = "upgrade-failed"
@@ -62,8 +62,8 @@ REASON_HINTS = {
                         "without running hold",
     TASK_HELD: "a worker parked an AG2 Space task for your go (ag2-sparrow-hatch hold)",
     TASK_HELD_UNDELIVERED: f"a task was held over {HELD_LINE_DELIVER_S // 60} minutes ago and its "
-                           "room notice is still queued, being sent, or was parked after failed "
-                           "sends, so the asker may have heard nothing: check Sparrow's proactive "
+                           "room notice is still queued, being sent, was parked after failed "
+                           "sends or was withdrawn unsent, so the asker may have heard nothing: check Sparrow's proactive "
                            "drain and the room",
     TASK_HELD_UNCONFIRMED: f"a task was held over {HELD_LINE_DELIVER_S // 60} minutes ago and its "
                            "room notice left the queue, but its delivery can't be confirmed (no "
@@ -1030,6 +1030,8 @@ def open_tasks(cfg: dict, now: float) -> "tuple[float | None, float | None, dict
         if mark is not None and not _cli.task_settled(result_dir, item["task_id"]):
             held = min(t for t in (held, mark["since"]) if t is not None)
             outcome = _cli.hold_line_outcome(result_dir, item["task_id"])
+            # The task is open, so a line withdrawn at its send left the asker with nothing.
+            outcome = "undelivered" if outcome == "withdrawn" else outcome
             if outcome != "delivered":
                 stuck[outcome] = min(t for t in (stuck.get(outcome), mark["since"]) if t is not None)
         elif oldest is None and ts is not None:

@@ -1376,6 +1376,11 @@ def _hold_under_lock(result_dir: Path, tid: str, body: str, lane_unchanged) -> i
             print(f"held: {tid} was already held; nothing posted again")
             return REPLY_POSTED
         record = task_hold.notice_record(result_dir, tid)
+        if record is not None and record["gen"] is not None and record["armed"] \
+                and hold_line_outcome(result_dir, tid) == "withdrawn":
+            # Armed by a hold whose marker never landed, and withdrawn for it: the next line replaces it.
+            task_hold.disarm_notice(result_dir, tid, record["token"])
+            record = {**record, "armed": False}
     except (OSError, ValueError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 2

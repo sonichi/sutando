@@ -866,8 +866,15 @@ BRIDGE_MAIN = BRIDGE.replace("print(json.dumps({", "try:\n    m.main()\n    exit
                              'print(json.dumps({"exited": exited, ')
 
 
-# A seat's refused startup, with the backoff recorded instead of slept.
-SEAT_MAIN = BRIDGE_MAIN.replace("try:\n    m.main()", "slept = []\nm.time.sleep = slept.append\ntry:\n    m.main()").replace(
+# A seat's refused startup, with the bridge's backoff recorded instead of slept; subprocess's own
+# wait loop (a `ps` the bridge runs) still sleeps, since the time module is shared.
+SEAT_MAIN = BRIDGE_MAIN.replace("try:\n    m.main()", (
+    "slept = []\n_real_sleep = m.time.sleep\n"
+    "def _sleep(s):\n"
+    "    if __import__('sys')._getframe(1).f_globals.get('__name__') == 'subprocess':\n"
+    "        return _real_sleep(s)\n"
+    "    slept.append(s)\n"
+    "m.time.sleep = _sleep\ntry:\n    m.main()")).replace(
     'print(json.dumps({"exited": exited, ', 'print(json.dumps({"exited": exited, "slept": slept, ')
 
 

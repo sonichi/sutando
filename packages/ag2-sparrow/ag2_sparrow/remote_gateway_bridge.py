@@ -6263,12 +6263,21 @@ def _send_proactive(claim: Path, f: Path, envelope: dict, owner_dm: bool, notice
                  f"resolves to {envelope['room_id']}; it is not re-routed")
     # The send and its dispatch-time recheck run under the send lock a producer takes to commit
     # an answer, so a message about a task is sent before its answer is queued or never.
+    tid = envelope.get("task_id")
     try:
         with _delivery_destination.send_lock(RESULTS_DIR, _delivery_destination.DRAIN_LOCK_WAIT_S):
-            result = core.deliver_one(item_id, payload)
+            unchecked = task_hold.line_unchecked(RESULTS_DIR, tid, about_task_ts(f.name)) if tid else None
+            if unchecked is None:
+                result = core.deliver_one(item_id, payload)
     except _delivery_destination.SendLockUnavailable as e:
         _hand_back(claim, f)
         _log(f"proactive {f.name} not sent: the send lock could not be taken ({diagnostics.describe(e)})")
+        return
+    if unchecked is not None:
+        # A read error is not a missing hold: the line waits for a pass that can check it.
+        _hand_back(claim, f)
+        _log_backoff(("proactive-hold-unchecked", f.name),
+                     f"proactive {f.name} not sent yet: {unchecked}; handed back")
         return
     item = read_item(core.backend.root, item_id) or {}
     status, room = item.get("status"), stored_room or envelope["room_id"]

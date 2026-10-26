@@ -295,6 +295,24 @@ def arm_notice(result_dir: Path, tid: str, token: str) -> None:
     _rewrite_notice(result_dir, tid, token, lambda f: {**f, "armed": True})
 
 
+def disarm_notice(result_dir: Path, tid: str, token: str) -> None:
+    """Take back the arming of the record's generation, whose hold was never placed."""
+    _rewrite_notice(result_dir, tid, token, lambda f: {**f, "armed": False})
+
+
+def line_unchecked(result_dir: Path, tid: str, ts: "int | None") -> "str | None":
+    """Why the hold behind a hold line (ts below NOTICE_GEN_LIMIT) cannot be read now, or None: a
+    drain hands such a line back for a later pass rather than letting line_veto withdraw it."""
+    if ts is None or not 0 <= ts < NOTICE_GEN_LIMIT:
+        return None
+    try:
+        notice_record(result_dir, tid)
+        read(result_dir, tid)
+    except (OSError, ValueError) as e:
+        return f"its hold could not be checked ({e})"
+    return None
+
+
 def line_veto(result_dir: Path, tid: str, ts: "int | None") -> "str | None":
     """Asked at a drain's send of a message about `tid` named with `ts`: why a hold line (ts below
     NOTICE_GEN_LIMIT) must not be sent, or None. Only the record's own generation, once armed,

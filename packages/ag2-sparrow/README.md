@@ -636,7 +636,7 @@ minutes old. The drain's own state decides which reason applies:
 
 | The hold's line | `reason` |
 | --- | --- |
-| still queued or being sent, or parked in `RESULT_DIR/undelivered/` under its own name after failed sends | `task-held-line-undelivered`: the asker may have heard nothing |
+| still queued or being sent, parked in `RESULT_DIR/undelivered/` under its own name after failed sends, or withdrawn unsent while the hold stands | `task-held-line-undelivered`: the asker may have heard nothing |
 | gone from the queue with no delivery receipt (the post may have happened and only the best-effort receipt write failed) | `task-held-line-unconfirmed`: delivery can't be confirmed |
 
 When more than one applies, `reason` names the first of

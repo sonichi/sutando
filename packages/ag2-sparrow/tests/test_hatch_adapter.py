@@ -2398,6 +2398,24 @@ class Keepalive(Base):
         outbox.record_delivered(root, f"{stem}~0", provider="ag2space-proactive")
         self.assertEqual(hatch_cli.hold_line_outcome(self.results, tid), "delivered")
 
+    def test_a_hold_line_withdrawn_unsent_reports_undelivered(self):
+        # Reviewer's B1: the drain withdrew the line of a hold that still stands; the asker heard nothing.
+        self.installed()
+        self.keepawake_at(time.time() - 60)
+        self.hook_ran()
+        tid = "task-1784700000005"
+        self.add_task(tid, "$held", mtime=time.time() - 30 * 60)
+        since = time.time() - keepalive.HELD_LINE_DELIVER_S - 60
+        task_hold.place(self.results, tid, task_hold.OWNER_GO, now=since)
+        stem = hatch_cli._hold_notice(Path(), tid).stem
+        outbox.park_item(self.results / delivery_destination.RECEIPT_DIR, f"{stem}~0",
+                         "withdrawn:its hold could not be checked ([Errno 24] Too many open files)")
+        self.assertEqual(hatch_cli.hold_line_outcome(self.results, tid), "withdrawn")
+        row = self.health()
+        self.assertEqual((row["condition"], row["reason"]), ("abnormal", keepalive.TASK_HELD_UNDELIVERED))
+        self.assertAlmostEqual(row["since"], since + keepalive.HELD_LINE_DELIVER_S, delta=1)
+        self.assertEqual(hc.validate(row), (row, None))
+
     def stale_hold(self, tid):
         self.add_task(tid, "$held", mtime=time.time() - 30 * 60)
         task_hold.place(self.results, tid, task_hold.OWNER_GO,
@@ -6451,6 +6469,46 @@ class Hold(Base):
         publish.assert_not_called()
         self.assertEqual(self.notice.read_text(), queued)
         self.assertIsNotNone(task_hold.read(self.results, self.TID))
+
+    def test_a_hold_whose_check_fails_once_is_deferred_and_posted_once(self):
+        # Reviewer's B1: a transient read error at the drain's send must not withdraw the line.
+        self.add_task(self.TID, "$ev1")
+        self.assertEqual(self.hold(str(self.result_file)).returncode, hatch_cli.REPLY_POSTED)
+        real, failed = task_hold.notice_record, []
+
+        def flaky(*a, **k):
+            if not failed:
+                failed.append(True)
+                raise OSError(errno.EMFILE, "Too many open files")
+            return real(*a, **k)
+        posts = []
+        with mock.patch.object(task_hold, "notice_record", side_effect=flaky):
+            self.drain_pass(posts)
+        self.assertTrue(failed, "the read failed once")
+        self.assertEqual(posts, [])
+        self.assertNotEqual(hatch_cli.hold_line_outcome(self.results, self.TID), "withdrawn")
+        self.drain_pass(posts)
+        self.drain_pass(posts)
+        self.assertEqual(posts, [f"@bob:ag2.space {hatch_cli.HOLD_NOTICE}"], "posted once, on the next pass")
+        self.assertEqual(hatch_cli.hold_line_outcome(self.results, self.TID), "delivered")
+
+    def test_a_failed_marker_then_a_drain_pass_still_lets_hold_run_again(self):
+        # Reviewer's B2: the drain withdraws the armed line no hold stands on; the retry must recover.
+        self.add_task(self.TID, "$ev1")
+        with mock.patch.object(task_hold, "place", side_effect=OSError("disk")):
+            r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED)
+        self.assertIn("Run hold again", r.stderr)
+        posts = []
+        self.drain_pass(posts)
+        self.assertEqual(posts, [], "no hold stands on that line")
+        self.assertEqual(hatch_cli.hold_line_outcome(self.results, self.TID), "withdrawn")
+        r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_POSTED, r.stderr)
+        self.assertIsNotNone(task_hold.read(self.results, self.TID))
+        self.drain_pass(posts)
+        self.drain_pass(posts)
+        self.assertEqual(posts, [f"@bob:ag2.space {hatch_cli.HOLD_NOTICE}"], "exactly one line reaches the room")
 
     def test_an_unreadable_marker_in_the_way_is_not_confirmed(self):
         self.add_task(self.TID, "$ev1")
