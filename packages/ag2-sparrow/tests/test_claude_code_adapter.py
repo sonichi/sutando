@@ -358,33 +358,53 @@ SUCCESSOR_WRITER = ("import os, sys; sys.path.insert(0, %r); from ag2_sparrow im
 SEAT_HOLDER = ("import fcntl, os, sys; fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o600)\n"
                "fcntl.flock(fd, fcntl.LOCK_EX); print('held', flush=True); sys.stdin.read()")
 AGENT_LOCK_HOLDER = ("import sys; sys.path.insert(0, %r); from ag2_sparrow import connect_common as cm\n"
-                     "lock = cm.agent_lock(%r); lock.__enter__(); grant = %r\n"
-                     "if grant:\n    try: cm.publish_start_grant(%r, grant)\n    except TypeError: cm.publish_start_grant(sys.argv[1])\n"
+                     "lock = cm.agent_lock(%r); lock.__enter__()\n"
                      "print('held', flush=True); sys.stdin.read()")
 CONTENDER = ("import sys; sys.path.insert(0, %r); from ag2_sparrow import connect_common as cm\n"
              "from ag2_sparrow.adapters.%s import %s as other\n"
              "cm.AGENT_LOCK_WAIT_S = 0.3; cm.LAUNCH_WAIT_S = 0.3\n"
              "print('install', cm.install(other.LOCAL, {}, %r), flush=True)\n"
-             "print('launch', cm.launch_admission(%r, other.LOCAL.name)[1] or 'admitted', flush=True)")
+             "print('launch', cm.launch_admission(%r)[1] or 'admitted', flush=True)")
 # The manager's start, as every Runner start does it: the production admission, then the root.
 LAUNCHED = ("import sys; sys.path.insert(0, %r); from ag2_sparrow import connect_common as cm, holder_lock, task_io\n"
             "install = %r\n"
             "if install: holder_lock.install_id = lambda: install\n"
-            "try: fd, why = cm.launch_admission(%r, %r, wait_s=5)\n"
-            "except TypeError: fd, why = None, cm.launch_admission(sys.argv[1], wait_s=5)  # an older head, for fail-first\n"
+            "try: fd, why = cm.launch_admission(sys.argv[1], wait_s=5)\n"
+            "except TypeError: fd, why = cm.launch_admission(sys.argv[1], sys.argv[2], wait_s=5)  # 8037d344, fail-first\n"
             "if why: print('refused', why, flush=True); sys.exit(75)\n"
-            "o = task_io.acquire_lock(%r, %r); getattr(cm, 'end_admission', lambda fd: None)(fd)\n"
+            "o = task_io.acquire_lock(sys.argv[1], %r); cm.end_admission(fd)\n"
             "print('held', flush=True); sys.stdin.read(); task_io.release_lock(o)")
-# The real launcher entry point (hold_and_supervise) with a sleep for its consumer, until stdin closes.
-REAL_LAUNCHER = ("import subprocess, sys; sys.path.insert(0, %r)\n"
-                 "from ag2_sparrow import connect_common as cm\n"
+# The real launcher entry point (hold_and_supervise), a sleep for its consumer; argv: root, a file whose
+# absence holds it between admission and the root ('' for none), a file it appends to once it acts.
+REAL_LAUNCHER = ("import os, subprocess, sys, time; sys.path.insert(0, %r)\n"
+                 "from ag2_sparrow import connect_common as cm, task_io\n"
                  "from ag2_sparrow.adapters.claude_code.cli import LOCAL\n"
+                 "root, pause, acted = sys.argv[1:4]\n"
                  "cm.LAUNCH_WAIT_S = 5\n"
-                 "def prepare(owner, root): print('held', flush=True); return None, ''\n"
-                 "def supervise(child): sys.stdin.read(); child.kill(); child.wait(); return 0\n"
-                 "rc = cm.hold_and_supervise(LOCAL, %r, {'sig': None}, prepare, lambda ctx: subprocess.Popen(['sleep', '300']),\n"
+                 "state = cm.stop_state(); cm.stop_handlers(state)\n"
+                 "real = task_io.acquire_lock\n"
+                 "def paused(*a, **kw):\n"
+                 "    while pause and not os.path.exists(pause):\n"
+                 "        if state['sig'] is not None: sys.exit(128 + state['sig'])\n"
+                 "        time.sleep(0.05)\n"
+                 "    return real(*a, **kw)\n"
+                 "task_io.acquire_lock = paused\n"
+                 "def prepare(owner, r):\n"
+                 "    with open(acted, 'a') as f: f.write('acted\\n')\n"
+                 "    print('held', flush=True); return None, ''\n"
+                 "def supervise(child):\n"
+                 "    import select\n"
+                 "    while state['sig'] is None and not (select.select([sys.stdin], [], [], 0.1)[0] and not sys.stdin.read(1)):\n"
+                 "        pass\n"
+                 "    child.kill(); child.wait(); return 0\n"
+                 "rc = cm.hold_and_supervise(LOCAL, root, state, prepare, lambda ctx: subprocess.Popen(['sleep', '300']),\n"
                  "                           supervise, lambda c: (c.kill(), c.wait()), 'run', 'test')\n"
                  "print('refused', rc, flush=True)")
+# launchd's shape: the job's pid is a shim whose child is the launcher; the stop signal is forwarded.
+SHIM = ("import signal, subprocess, sys\n"
+        "child = subprocess.Popen([sys.executable, '-c', sys.argv[1]] + sys.argv[2:])\n"
+        "signal.signal(signal.SIGTERM, lambda *a: child.terminate())\n"
+        "sys.exit(child.wait())")
 OP_HOLDER = ("import sys; sys.path.insert(0, %r); from ag2_sparrow import connect_common as cm\n"
              "from ag2_sparrow.adapters.claude_code.cli import LOCAL\n"
              "with cm.operation_lock(LOCAL): print('held', flush=True); sys.stdin.read()")
@@ -415,18 +435,17 @@ def hold(root, name="first-launcher", script=STAND_IN, install=""):
 
 
 
-def launched(root, adapter, install="", real=False):
-    """The manager's start: the launcher passes the agent lock's admission, then takes the root."""
-    script = REAL_LAUNCHER % (str(PKG), str(root)) if real else \
-        LAUNCHED % (str(PKG), install, str(root), "claude-local", str(root), adapter)
-    p = subprocess.Popen([sys.executable, "-c", script, str(root)],
-                         stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
-    if p.stdout.readline().strip() != "held":
-        p.wait(timeout=30)
-        p.stdout.close()
-        p.stdin.close()
-        return None
-    return p
+def launched(root, adapter, install="", real=False, pause="", acted="", shim=False):
+    """The manager's start, not waited for: its launcher waits in admission until the operation that
+    started it releases the agent lock."""
+    if real:
+        code = REAL_LAUNCHER % (str(PKG),)
+        argv = [sys.executable, "-c", SHIM, code] if shim else [sys.executable, "-c", code]
+        argv += [str(root), pause, acted or os.devnull]
+    else:
+        argv = [sys.executable, "-c", LAUNCHED % (str(PKG), install, adapter), str(root), "claude-local"]
+    return subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+
 
 def unhold(p):
     p.stdin.close()
@@ -478,20 +497,27 @@ class Runner:
         self.table, self.default, self.calls, self.root = dict(table or {}), default, [], root
         self.session, self.adapter, self.install = None, adapter, install
         self.enabled, self.registered, self.stop_delay, self.timers = False, registered, stop_delay, []
-        self.real = False
+        self.real, self.pause, self.acted, self.shim = False, "", "", False
 
     def start_session(self, by_manager=False):
         self.stop_session()
-        self.session = launched(self.root, self.adapter, self.install, self.real) if by_manager else \
+        self.session = launched(self.root, self.adapter, self.install, self.real, self.pause, self.acted,
+                                self.shim) if by_manager else \
             hold(self.root, self.adapter, install=self.install)
+        self.spawned = getattr(self, "spawned", []) + [self.session]
 
     def stop_session(self):
         for t in self.timers:
             t.join()
         self.timers.clear()
         if self.session is not None:
+            if self.real:
+                self.session.terminate()            # the manager's stop signal
             unhold(self.session)
             self.session = None
+
+    def alive(self):
+        return self.session is not None and self.session.poll() is None
 
     def end_session_later(self):
         session, self.session = self.session, None
@@ -505,14 +531,14 @@ class Runner:
 
     def answer(self, verb, cmd):
         if verb == "print":
-            if self.session:
+            if self.alive():
                 return (0, f"\tpid = {self.session.pid}\n\tstate = running\n", "")
             return (0, "\tstate = waiting\n", "") if self.registered else NOT_LOADED
         if verb == "show":
             loaded = cm.service_path(L).exists() or self.registered
-            words = {"LoadState": "loaded" if loaded else "not-found", "ActiveState": "active" if self.session else "inactive",
-                     "SubState": "running" if self.session else "dead", "UnitFileState": "enabled" if self.enabled else "disabled",
-                     "MainPID": str(self.session.pid) if self.session else "0"}
+            words = {"LoadState": "loaded" if loaded else "not-found", "ActiveState": "active" if self.alive() else "inactive",
+                     "SubState": "running" if self.alive() else "dead", "UnitFileState": "enabled" if self.enabled else "disabled",
+                     "MainPID": str(self.session.pid) if self.alive() else "0"}
             props = cmd[cmd.index("-p") + 1].split(",")
             return (0, "".join(words[k] + "\n" for k in props), "")
         return self.default
@@ -532,7 +558,7 @@ class Runner:
         if rc == 0 and verb == "bootout":
             self.registered = False
         if self.root and rc == 0:
-            if verb in START_VERBS and not (verb == "start" and self.session):     # start is a no-op when active
+            if verb in START_VERBS and not (verb == "start" and self.alive()):     # start is a no-op when active
                 self.start_session(by_manager=True)
             elif verb in STOP_VERBS:
                 self.end_session_later() if self.stop_delay else self.stop_session()
@@ -542,7 +568,7 @@ class Runner:
         return [self.verb(c) for c in self.calls if c[0] == program]
 
     def pid(self):
-        return self.session.pid if self.session else None
+        return self.session.pid if self.alive() else None
 
 
 class FakeClaudeWrapper(unittest.TestCase):
@@ -857,7 +883,8 @@ class ConnectInstall(ConnectBase):
         rc, out, err = self.install_with(other)
         self.assertEqual(rc, 1, "a held root is not enough: the holder must be this shape's launcher")
         self.assertIn(f"did not acquire {self.work}", err)
-        self.assertIn(f"held by launcher pid {other.pid()}", err)
+        self.assertRegex(err, r"held by launcher pid \d+\)")
+        self.assertIn("the job this operation started, was stopped", err)
         other.stop_session()
         rc, out, _ = self.install_with(self.runner())
         self.assertEqual(rc, 0)
@@ -870,7 +897,7 @@ class ConnectInstall(ConnectBase):
         rc, _, err = self.install_with(other)
         self.assertEqual(rc, 1, "same adapter, another install: not this manager's launcher")
         self.assertIn(f"did not acquire {self.work}", err)
-        self.assertIn(f"held by launcher pid {other.pid()}", err, "held all along, by the wrong install")
+        self.assertRegex(err, r"held by launcher pid \d+\)", "held all along, by the wrong install")
 
     def test_fresh_holder_refuses_the_snapshotted_holder_and_takes_a_different_one(self):
         self.configure()
@@ -2826,14 +2853,31 @@ class ConnectCode(AgentRootBase):
             if shape is L and not raced:
                 fake.runner.start_session()
                 raced.append(fake.runner.pid())
-                self.assertIsNone(launched(self.root, L.name), "a launcher claims this start, then loses the root")
             return real(shape, **kw)
+        before = len(fake.runner.calls)
         with mock.patch.object(cm, "start_supervisor", side_effect=raced_then_started):
             rc, out, err = self.connect(Backend(), fake)
-        self.assertNotEqual(rc, 0, out + err)
-        self.assertIn(f"(pid {raced[0]}) did not claim this start", err, "a holder that bypassed admission is not ours")
+        self.assertEqual(rc, 0, out + err)
         self.assertEqual(fake.runner.pid(), raced[0], "the job that raced in is the one running, never restarted")
         self.assertNotIn("stopped:", out)
+        self.assertFalse({fake.runner.verb(c) for c in fake.runner.calls[before:]} & {"stop", "restart", "bootout"})
+
+    def test_a_holder_that_is_not_the_managers_job_is_not_taken_for_it(self):
+        fake, real, stray = self.bridged(), cm.start_supervisor, []
+
+        def stray_first(shape, **kw):
+            if shape is L and not stray:
+                stray.append(hold(self.root, L.name))   # a launcher no manager started, outside the lock protocol
+            return real(shape, **kw)
+        with mock.patch.object(cm, "start_supervisor", side_effect=stray_first):
+            rc, out, err = self.connect(Backend(), fake)
+        try:
+            self.assertNotEqual(rc, 0, out + err)
+            self.assertIn(f"(pid {stray[0].pid}) is not the process {cm.job_name(L)} runs as", err)
+            self.assertIsNone(stray[0].poll(), "the stray is left as it is")
+            self.assertNotIn("next:", out)
+        finally:
+            unhold(stray[0])
 
     def replace_root_now(self):
         os.rename(self.root, str(self.root) + ".parked")
@@ -2889,10 +2933,9 @@ class ConnectCode(AgentRootBase):
         self.assertEqual(conf.read_bytes(), before)
         self.assertIsNone(fake.runner.pid(), "nothing was started")
 
-    def agent_lock_holder(self, grant=""):
-        """The production agent lock held by another process (and, with `grant`, a start it published)."""
-        p = subprocess.Popen([sys.executable, "-c", AGENT_LOCK_HOLDER % (str(PKG), str(self.root), grant, str(self.root)),
-                              str(self.root)],
+    def agent_lock_holder(self):
+        """The production agent lock held by another process."""
+        p = subprocess.Popen([sys.executable, "-c", AGENT_LOCK_HOLDER % (str(PKG), str(self.root))],
                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
         self.assertEqual(p.stdout.readline().strip(), "held")
         self.addCleanup(lambda: unhold(p) if p.poll() is None else None)
@@ -2932,31 +2975,17 @@ class ConnectCode(AgentRootBase):
         with cm.agent_lock(str(self.root), wait_s=1):
             pass                                    # a dead holder's flock is gone: nothing stale remains
 
-    def test_a_launcher_does_not_act_on_the_root_during_an_operation_unless_granted(self):
+    def test_a_launcher_does_not_act_on_the_root_until_the_operation_ends(self):
         self.root.mkdir(parents=True)
-        calls = []
-
-        def launch():
-            err = io.StringIO()
-            with mock.patch.object(cm, "LAUNCH_WAIT_S", 0.3), contextlib.redirect_stderr(err):
-                rc = cm.hold_and_supervise(L, str(self.root), {"sig": None},
-                                           lambda owner, root: (calls.append(root), (None, "stop here"))[1],
-                                           None, None, None, "run", "test")
-            return rc, err.getvalue()
         holder = self.agent_lock_holder()
-        rc, err = launch()
+        rc, err, _seen = self.launch_with(L)
         self.assertEqual(rc, cm.EXIT_HELD, err)
-        self.assertIn(f"published no start this {L.name} launcher may claim", err)
-        self.assertEqual(calls, [], "the root was never taken")
+        self.assertIn("held", err)
+        self.assertIn("the launcher does not act on the root", err)
         unhold(holder)
-        holder = self.agent_lock_holder(grant=L.name)
-        rc, err = launch()
-        self.assertEqual((rc, calls), (cm.EXIT_UNUSABLE, [str(self.root)]), "the granted launcher went on")
-        self.assertIn("published no start", cm.launch_admission(str(self.root), L.name, wait_s=0.3)[1], "one claim only")
-        unhold(holder)
-        fd, why = cm.launch_admission(str(self.root), L.name, wait_s=0.3)
-        cm.end_admission(fd)
-        self.assertEqual((fd is not None, why), (True, ""), "admitted, holding the lock, once the operation ends")
+        rc, err, _seen = self.launch_with(L)
+        self.assertEqual(rc, cm.EXIT_UNUSABLE, err)
+        self.assertIn("stop here", err, "once the operation ended the launcher took the root")
 
     def test_the_other_adapter_and_a_launcher_wait_while_connect_holds_the_agent(self):
         real, seen = cm.install, []
@@ -2972,7 +3001,7 @@ class ConnectCode(AgentRootBase):
         self.assertEqual(rc, 0, out + err)
         self.assertIn("install 1", seen[0])
         self.assertIn("another operation on this agent is in progress", seen[0])
-        self.assertIn("launch an operation on this agent holds", seen[0])
+        self.assertIn("launch an operation on this agent held", seen[0])
 
     def test_unwinding_leaves_a_unit_that_is_no_longer_this_attempts(self):
         fake, real = self.bridged(), cb.wire_bridge
@@ -3075,50 +3104,6 @@ class ConnectCode(AgentRootBase):
         self.assertIn("stop here", err, "the launcher took the root")
         self.assertEqual(seen, ["busy"], "no actor gets the agent lock between admission and the root")
 
-    def test_a_grant_for_another_adapter_is_not_claimed(self):
-        from ag2_sparrow.adapters.codex import connect_cli as other
-        self.root.mkdir(parents=True)
-        holder = self.agent_lock_holder(grant=L.name)
-        grant = cm.agent_lock_path(str(self.root)).with_suffix(".grant")
-        rc, err, _seen = self.launch_with(other.LOCAL)
-        self.assertEqual(rc, cm.EXIT_HELD, err)
-        self.assertIn("may claim (another adapter's)", err)
-        self.assertTrue(grant.exists(), "the other adapter's launcher left the grant")
-        rc, err, _seen = self.launch_with(L)
-        self.assertEqual(rc, cm.EXIT_UNUSABLE, err)
-        self.assertFalse(grant.exists(), "this adapter's launcher claimed it")
-        unhold(holder)
-
-    def test_a_grant_left_by_a_crashed_publisher_is_refused_and_removed(self):
-        self.root.mkdir(parents=True)
-        publisher = self.agent_lock_holder(grant=L.name)
-        publisher.kill()
-        publisher.wait(timeout=30)
-        grant = cm.agent_lock_path(str(self.root)).with_suffix(".grant")
-        self.assertTrue(grant.exists(), "the crash left its grant")
-        holder = self.agent_lock_holder()               # another operation holds the agent now
-        rc, err, _seen = self.launch_with(L)
-        self.assertEqual(rc, cm.EXIT_HELD, err)
-        self.assertIn("may claim (stale)", err)
-        self.assertFalse(grant.exists(), "the stale grant was removed")
-        unhold(holder)
-
-    def test_a_stray_launcher_that_claims_connects_start_is_not_taken_for_the_job(self):
-        fake, real, stray = self.bridged(), cm.start_supervisor, []
-
-        def stray_first(shape, **kw):
-            if shape is L and not stray:
-                stray.append(launched(self.root, L.name))   # a launcher the manager did not start
-            return real(shape, **kw)
-        with mock.patch.object(cm, "start_supervisor", side_effect=stray_first):
-            rc, out, err = self.connect(Backend(), fake)
-        try:
-            self.assertNotEqual(rc, 0, out + err)
-            self.assertIn(f"(pid {stray[0].pid}) is not the process {cm.job_name(L)} runs as", err)
-            self.assertIsNone(stray[0].poll(), "the stray is left as it is")
-        finally:
-            unhold(stray[0])
-
     def test_install_holds_one_agent_lock_across_its_setup_and_its_bridge(self):
         fake = self.bridged()
         seed_seat(cli.bridge_home(self.root), BEARER)
@@ -3186,8 +3171,9 @@ class ConnectCode(AgentRootBase):
 
         def held_then_moved(*a, **kw):
             rec = real(*a, **kw)
-            self.replace_root_now()
-            cm.supervisor_path(L).write_text(foreign)
+            if rec is not None and not os.path.exists(str(self.root) + ".parked"):
+                self.replace_root_now()
+                cm.supervisor_path(L).write_text(foreign)
             return rec
         with mock.patch.object(cm, "_fresh_holder", side_effect=held_then_moved):
             rc, out, err = self.connect(Backend(), fake)
@@ -3214,6 +3200,38 @@ class ConnectCode(AgentRootBase):
                 fake.runner.stop_session()
                 with mock.patch.object(sm, "_run", side_effect=fake), contextlib.redirect_stdout(io.StringIO()):
                     self.assertEqual(cm.uninstall(L), 0)
+
+    def test_a_launcher_held_past_the_operations_wait_never_acts_on_the_root(self):
+        for shim in (False, True):
+            with self.subTest("launchd shim child" if shim else "systemd direct"):
+                fake = self.bridged()
+                r = fake.runner
+                r.real, r.shim = True, shim
+                r.pause, r.acted = str(self.home / f"resume-{shim}"), str(self.home / f"acted-{shim}")
+                with mock.patch.object(cm, "AGENT_LOCK_WAIT_S", 0.5), mock.patch.object(cm, "is_macos", return_value=shim):
+                    rc, out, err = self.connect(Backend(), fake)
+                Path(r.pause).touch()                       # the paused launcher resumes after the failure
+                for launcher in r.spawned:
+                    launcher.wait(timeout=30)
+                self.assertNotEqual(rc, 0, out + err)
+                self.assertNotIn("next:", out)
+                self.assertIn("did not acquire", err)
+                self.assertIn("the job this operation started, was stopped", err)
+                self.assertFalse(Path(r.acted).exists(), "the late launcher never held or acted on the root")
+                self.assertEqual(task_io.lock_held(str(self.root)), "free")
+
+    def test_the_real_launcher_through_launchds_shim_ends_up_alive(self):
+        fake = self.bridged()
+        fake.runner.real, fake.runner.shim = True, True
+        with mock.patch.object(cm, "is_macos", return_value=True):
+            rc, out, err = self.connect(Backend(), fake)
+            self.assertEqual(rc, 0, out + err)
+            rec = task_io.lock_holder(str(self.root))
+            self.assertTrue(rec["live"])
+            self.assertEqual(cm._parent_pid(rec["owner_pid"]), fake.runner.pid(), "the shim's child holds the root")
+            self.assertEqual({p.suffix for p in cm.agent_lock_path(str(self.root)).parent.iterdir()}, {".op"},
+                             "no start files: the operation hands the launcher nothing but the lock")
+            fake.runner.stop_session()
 
     def test_a_running_job_refuses_connect_before_the_code_is_spent_and_is_left_running(self):
         fake = self.running_job()
@@ -3272,9 +3290,10 @@ class ConnectCode(AgentRootBase):
         with mock.patch.object(cm, "start_supervisor", side_effect=replaced_then_started):
             rc, out, err = self.connect(Backend(), fake)
         self.assertNotEqual(rc, 0, out + err)
-        self.assertIn(f"(it was replaced while the job started); {cm.job_name(L)} was stopped and nothing serves "
-                      f"{self.root}", err)
-        self.assertIsNone(fake.runner.pid(), "the launcher on the replacement was stopped")
+        self.assertIn(f"{self.root} was replaced after install started {cm.job_name(L)}", err)
+        self.assertIn(f"{cm.job_name(L)}, which held the directory that was there, was stopped", err)
+        self.assertNotIn("next:", out)
+        self.assertIsNone(fake.runner.pid(), "no launcher is left to take the replacement")
         self.assertEqual(task_io.lock_held(str(self.root)), "free")
 
     def test_without_plugin_dir_the_shipped_plugin_is_used(self):

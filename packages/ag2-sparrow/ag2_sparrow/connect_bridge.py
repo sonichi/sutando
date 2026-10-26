@@ -222,13 +222,15 @@ def bridge_problem(cfg: dict, command: str, bridge: cm.Shape, now=None) -> str:
 
 def under_agent_lock(root: str, fn) -> int:
     """fn() under the agent lock for `root`, so an install's local setup and its bridge wiring are one
-    operation no other actor (an uninstall, the other adapter) can step into; 1 when it is busy."""
+    operation no other actor (an uninstall, the other adapter) can step into; 1 when it is busy. The job it
+    started is settled once the lock is released (cm.settle)."""
     try:
         with cm.agent_lock(root):
-            return fn()
+            rc = fn()
     except cm.Busy as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
+    return cm.settle(root, rc)
 
 
 def wire_bridge_bound(cfg: dict, command: str, bridge: cm.Shape, local: cm.Shape, root_id) -> str:
@@ -264,6 +266,9 @@ def _wire_bound(cfg: dict, command: str, bridge: cm.Shape, local: cm.Shape, root
     problem = wire_bridge(cfg, command, bridge)
     replaced = root_id is not None and cm.dir_identity(root) != root_id
     if root_id is None or not (problem or replaced):
+        pending = cm.pending_start(local) if root_id is not None else None
+        if not problem and pending is not None and before is None and _bytes(artifact) is not None:
+            pending["undo"].append(lambda: unwire_bridge(cfg, command, bridge))
         return problem
     after = _bytes(artifact)
     note = "" if bridge_mode(cfg) in (UNIT, EXTERNAL) else \
@@ -454,6 +459,7 @@ def finish_connect(seat: dict, install, command: str, flags) -> int:
         rc = install()
     finally:
         seat["lock"].release()
+    rc = cm.settle(seat["root"], rc)
     if rc == 0:
         print(f"next: {command} verify (the bridge reports connected within a minute)")
     else:
