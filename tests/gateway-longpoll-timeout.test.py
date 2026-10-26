@@ -290,12 +290,12 @@ class GatewayStatusEvidenceTest(unittest.TestCase):
             replace = _GW.os.replace
             failed = []
 
-            def fail_once(src, dst):
+            def fail_once(src, dst, *a, **k):
                 if dst == _GW.GATEWAY_STATUS_FILE and not failed:
                     if json.loads(src.read_text())["last_ok_ts"] is not None:
                         failed.append(True)
                         raise OSError("status unavailable")
-                replace(src, dst)
+                replace(src, dst, *a, **k)
 
             with patch.object(_GW.os, "replace", side_effect=fail_once):
                 loop.run([(1, {"tasks": [self.TASK]}), self.timeout(),
@@ -882,7 +882,7 @@ class SlowDripTest(unittest.TestCase):
         clock = _Clock()
         with patch.object(self.gw, "time", clock), \
                 patch.object(self.gw, "TOKEN", "secret"), patch.object(self.gw, "URL", "http://relay.invalid"), \
-                patch.object(urllib.request, "urlopen", new=lambda *a, **k: self._drip(clock)()):
+                patch.object(urllib.request.OpenerDirector, "open", new=lambda *a, **k: self._drip(clock)()):
             start = clock.now
             with self.assertRaises(TimeoutError):
                 self.gw._req("POST", "/v1/tasks/task-1/ack", {"id": "task-1"}, timeout=10,
@@ -898,7 +898,7 @@ class SlowDripTest(unittest.TestCase):
         with patch.object(self.gw, "time", clock), patch.object(self.gw, "_log", new=logs.append), \
                 patch.object(self.gw, "TOKEN", "secret"), patch.object(self.gw, "URL", "http://relay.invalid"), \
                 patch.object(self.gw, "_forget_pending_ack", new=lambda *a, **k: None), \
-                patch.object(urllib.request, "urlopen", new=lambda *a, **k: self._drip(clock)()):
+                patch.object(urllib.request.OpenerDirector, "open", new=lambda *a, **k: self._drip(clock)()):
             self.gw._retry_dropped_acks([("task-1", True, "lease-1")], received, fates)
         self.assertLessEqual(clock.now - received, self.gw.ACK_RETRY_BUDGET_S + 1)
         self.assertIsNone(fates["task-1"], "a retry that ran out of budget is not acked")

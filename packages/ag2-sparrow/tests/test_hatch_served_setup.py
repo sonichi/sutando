@@ -3179,7 +3179,7 @@ class Upgrade(Base):
         with mock.patch.object(keepalive, "_found", return_value=[self.home]), \
                 mock.patch.object(keepalive, "last_keepawake", return_value=5000.0), \
                 mock.patch.object(keepalive, "hook_last_run", return_value=None), \
-                mock.patch.object(keepalive, "oldest_open_task", return_value=None):
+                mock.patch.object(keepalive, "open_tasks", return_value=(None, None, {})):
             row = keepalive.health_row(self.cfg, self.home / "log", now=5000.0)
         self.assertEqual((row["condition"], row["reason"]),
                          ("abnormal", self_upgrade.UPGRADE_FAILED), label)
@@ -4697,7 +4697,7 @@ class Health(Base):
         with mock.patch.object(keepalive, "_found", return_value=[self.home]), \
                 mock.patch.object(keepalive, "last_keepawake", return_value=1000.0), \
                 mock.patch.object(keepalive, "hook_last_run", return_value=None), \
-                mock.patch.object(keepalive, "oldest_open_task", return_value=1000.0 - 1000):
+                mock.patch.object(keepalive, "open_tasks", return_value=(1000.0 - 1000, None, {})):
             row = keepalive.health_row(cfg, self.home, now=1000.0)
             self.assertEqual((row["reason"], row["since"]), (keepalive.TASK_NOT_PICKED_UP, 900.0))
             # A cache applies only with a revision that normalises; a tunables-only cache is no cache.
@@ -4716,7 +4716,7 @@ class Health(Base):
         with mock.patch.object(keepalive, "_found", return_value=[self.home]), \
                 mock.patch.object(keepalive, "last_keepawake", return_value=1000.0), \
                 mock.patch.object(keepalive, "hook_last_run", return_value=None), \
-                mock.patch.object(keepalive, "oldest_open_task", return_value=None):
+                mock.patch.object(keepalive, "open_tasks", return_value=(None, None, {})):
             self.assertEqual(keepalive.health_row(cfg, self.home, now=1000.0 + 11 * 60)
                              ["condition"], "healthy")
             self.assertEqual(keepalive.health_row(cfg, self.home, now=1000.0 + 31 * 60)

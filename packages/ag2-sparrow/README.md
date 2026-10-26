@@ -255,7 +255,51 @@ Only an exit 0 counts as a posted reply; on 1 or 3 the worker reports the item
 in a `HANDOFF` block instead of retrying. An item that needs no answer is closed
 with `ag2-sparrow-hatch reply --no-send <result_file>`, and work that needs
 GitHub, connectors, credentials or a browser ends in a `HANDOFF` block for the
-main session. For a sender who is not the owner, the
+main session. An item that waits for the owner's go is parked with
+`ag2-sparrow-hatch hold <result_file>` before its `HANDOFF` block: it queues one
+line to the item's room (in its thread when it has one), then records a hold marker
+(`RESULT_DIR/.task-holds/<task id>.json`). The line is the served `runtime_text.held_line` from the
+setup cache `wake-context` reads, when that cache is usable and the line is one plain
+printable line of at most 300 characters with no backtick, no leading `[` or space, no
+delivery marker anywhere in it (judged by `result_markers.neutralize_markers`, so a mid-line
+`[dm-only]`, `[attach: …]` or `[channel: …]` is refused) and no `@`, so it cannot mention
+anyone (`@room` or `@user:server`). Markdown or HTML in it is posted as plain text;
+otherwise it is the built-in "Waiting for my owner's go on this.". The line is never queued twice: a
+durable record (`<task id>.notice` beside the marker) is written before it is
+queued, and only the caller that wrote it queues the line. A hold is recorded
+only once the line is proven queued, being sent, or delivered per the drain's
+receipt; with no such proof `hold` exits 3, queues nothing and records no hold. It
+refuses an item that already has a result or an outbox record, a room the
+proactive drain would not deliver to (including a room on another homeserver), and a
+`.task-holds` that is a symlink. The homeserver is judged by the identity the live drain
+publishes, never by the enrollment file or the environment: each Sparrow writes
+`STATE_DIR/auth/lane-identity[.<GATEWAY_INSTANCE>].json` (its agent id, instance, pid and a
+timestamp; never a token) at start and refreshes it at least every 10 seconds while it runs.
+`hold` accepts that record only when it is this instance's, its pid is the live Sparrow (and the
+lock's holder, when a lock is held), and its timestamp is under 30 seconds old (and no more than
+5 seconds ahead). Without such a record (before Sparrow's first pass, after it stops, or when it
+cannot write its state directory) `hold` exits 3: "can't confirm the room is deliverable yet". Exit 3 means the hold is not recorded, so the task still reads
+`task-not-picked-up`; running `hold` again records it when it can. The item's result_file
+stays free for the real answer. The line is queued as a message about the task
+(`proactive-about-<task id>--0.txt`), so the proactive outbox's dispatch-time recheck withdraws
+it, unsent, once the task is answered; the outbox also owns its claim, its retries and parking an
+uncertain send, which it never resends. `hold`'s commit (its settled check, the line's
+publication and the marker), `reply`'s commit (its claim and the answer) and the drain's send
+(the outbox's recheck and the POST) each run under the results dir's send lock: the fixed file
+`.proactive-send-lock/lock`, never unlinked, so every process and restart locks one inode.
+Acquiring it is the linearization point: the line is sent before the answer is queued, or
+withdrawn at its send. Once its answer is queued, `reply` reports where the line stands on
+stderr, read from the outbox: withdrawn (it will not post), already posted, parked unsent, or
+an unconfirmed outcome (a send that left with no confirmed result: the room may show it). If the
+answer cannot be written, `reply` releases its claim and exits 2, so a retry finds the task and
+its line as they were. A producer waits at most 30 seconds for the lock and then writes nothing
+(`hold` exits 3, `reply` exits 2: run it again); the drain waits 2 seconds and hands the line
+back unsent. The remaining boundary: once the drain has won the lock and begun the send, the line
+goes out ahead of the answer. Upgrade fence: a drain that sends under the lock declares it in
+its lane record (`send_lock`). `hold` refuses while the live Sparrow does not (exit 3, the task
+still reads `task-not-picked-up`), and `keepalive keepawake` restarts such a Sparrow, through
+the user service when one runs it, including one from before lane records that has held its lock
+over two minutes with none. For a sender who is not the owner, the
 note itself states the limits (no irreversible actions, configuration changes,
 credential use, private owner context or sends to other rooms; reply only in
 the room; go/no-go goes to the owner), so they do not depend on the worker
@@ -265,6 +309,14 @@ sends a heartbeat wake, skipped while the activity marker
 is still unwritten 30 minutes after its wake is woken for again, marked
 `rewake: true`, up to 3 wakes in all. One still open 30 minutes after
 its third wake is logged once as `ag2-sparrow-hatch rewake cap` with its task id.
+A held item is woken for with `held: true` on every wake, and the note tells the
+worker to answer nothing for it and repeat only its `HANDOFF` block, so a fresh
+worker session never acts on an item that waits for the owner's go. Only a hook that
+explains `held: true` is handed held items: it runs `task_fields` with
+`HATCH_HOOK_HELD_AWARE=1`. A hook registered before that (install stages a new script
+beside the registered one, and a package upgrade rewrites neither) is never listed a held
+item, so during a staged upgrade it never wakes a worker for one; once released, the item
+reaches it as an ordinary open item.
 
 Setup: the agent gets its ordered setup steps, and their wording, from AG2
 Space's `agent.setup.steps` Action, then runs `ag2-sparrow-hatch install --mxid
@@ -471,8 +523,9 @@ running alone. Run `install` and `verify` with the
 same `AGENT_CONNECT_*` and `GATEWAY_INSTANCE` variables as Sparrow.
 
 Sparrow rewrites `state/gateway-status.json` every poll. `verify` fails its
-`sparrow` check when that file is missing, not connected, or older than 3
-minutes, and `ag2-sparrow-hatch sparrow` runs the same check alone, exiting 10
+`sparrow` check when that file is missing, not connected, older than 3
+minutes, or dated more than 5 seconds in the future (a timestamp that is not a bounded
+number reads as missing), and `ag2-sparrow-hatch sparrow` runs the same check alone, exiting 10
 when Sparrow is not running and 11 when it is running but not connected. The
 5-minute heartbeat runs it too:
 
@@ -578,10 +631,35 @@ fresh keepawake line never hides a stopped hook:
 | the hook's last run (`STATE_DIR/hatch-hook-last-run`) is over 5 minutes old; a hook that never ran is timed from when `install` last wrote a script | `hook-not-running` |
 | a task file with no result (any `GATEWAY_INSTANCE`, the agent's own messages excepted) is over 15 minutes old | `task-not-picked-up` |
 
+A held task whose room line has not been delivered is counted too, once the hold is over 10
+minutes old. The drain's own state decides which reason applies:
+
+| The hold's line | `reason` |
+| --- | --- |
+| still queued or being sent, parked in `RESULT_DIR/undelivered/` under its own name after failed sends, or withdrawn unsent while the hold stands | `task-held-line-undelivered`: the asker may have heard nothing |
+| gone from the queue with no delivery receipt (the post may have happened and only the best-effort receipt write failed) | `task-held-line-unconfirmed`: delivery can't be confirmed |
+
 When more than one applies, `reason` names the first of
-`keepawake-not-running`, `hook-not-running`, `task-not-picked-up`, and `since`
-is when that one went bad. A task a worker handed off to the main session
-stays open, so it also reads `task-not-picked-up` until it is answered.
+`keepawake-not-running`, `hook-not-running`, `task-not-picked-up`,
+`task-held-line-undelivered`, `task-held-line-unconfirmed`, and `since`
+is when that one went bad.
+
+These two reasons report a held task; nothing acts on it. Keepawake never releases or changes a
+hold, and nothing re-sends, withdraws or re-routes its line. The owner sees the row and decides.
+
+The labels describe where the line sits, not whether anyone saw it. A send that timed out or was
+accepted without an event id may have reached the room, and the drain still returns it to the
+queue under its plain `.txt` name, or parks it under the same name after the retry limit. Such a
+line reads `task-held-line-undelivered` even though it may have been delivered, because nothing on
+disk records that a send was attempted. A task a worker handed off to the main session
+stays open, so it also reads `task-not-picked-up` until it is answered, unless
+the worker parked it with `hold`: a task with a whole, well-formed hold marker is
+not counted, and with nothing else wrong the row is `healthy` with reason
+`task-held-for-owner` and `since` the earliest hold. An absent, partial,
+unreadable or malformed marker (including a `since` that is not a finite number in range, or
+one more than 5 seconds in the future) is not a hold,
+and neither is one on a task the outbox already has an answer for, so that
+task still counts.
 
 The command prints `motion` as `unknown`, so Sparrow sends its own: `moving`
 from when it pulls a message until that message's reply (or `--no-send`) is

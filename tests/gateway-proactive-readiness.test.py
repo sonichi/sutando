@@ -51,7 +51,7 @@ def drain(tmp: Path, during_hold=None, claim_gate=None) -> list[str]:
     """One `_post_proactive` pass over `tmp`; `during_hold` runs inside the readiness hold."""
     posts: list[str] = []
 
-    def _fake_req(method, path, payload=None, timeout=None):
+    def _fake_req(method, path, payload=None, timeout=None, **_kw):
         if method == "POST":
             posts.append(payload.get("body", ""))
         return {"ok": True, "event_id": "$evt"}
