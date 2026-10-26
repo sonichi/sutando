@@ -8165,8 +8165,9 @@ def main() -> None:
         # A live bridge already polls this workspace: stand down. 75 tells a
         # supervising wrapper not to relaunch; a plain exit would loop it.
         sys.exit(75)
-    _settle_proactive_room()
+    # Heartbeat first: the settle can wait on the connections record lock past the stale window.
     _start_lock_heartbeat()
+    _settle_proactive_room()
     _lane_identity()  # published at start, so Hatch's fail-closed window is only startup
     atexit.register(_retract_own_lane)
     inflight: set[str] = _load_inflight()

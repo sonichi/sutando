@@ -1398,8 +1398,8 @@ def main() -> int:
     check(rtc.PROACTIVE_ROOM_KEEP is rtc._legacy_keeps_proactive_room, "the unsuffixed bridge asks whether it keeps the room")
     _main_src = (SRC_DIR.parent / "packages" / "ag2-sparrow" / "ag2_sparrow" / "remote_gateway_bridge.py").read_text()
     _main_src = _main_src[_main_src.index("def main() -> None:"):]
-    check(_main_src.index("_acquire_singleton()") < _main_src.index("_settle_proactive_room()")
-          < _main_src.index("_start_lock_heartbeat()"), "the room is settled right after the lease is taken")
+    check(_main_src.index("_acquire_singleton()") < _main_src.index("_start_lock_heartbeat()")
+          < _main_src.index("_settle_proactive_room()"), "the room is settled right after the lease heartbeats")
     _saved_room = (rtc.PROACTIVE_ROOM, rtc.PROACTIVE_ROOM_KEEP)
     for _keep, _want, _label in ((lambda: True, "!r:example.org", "kept while no named row is primary"),
                                  (lambda: (_ for _ in ()).throw(OSError("x")), "!r:example.org", "kept when the check fails"),

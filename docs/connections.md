@@ -40,7 +40,7 @@ which say what reading the vault back found.
 | `primary_cannot_disconnect` | `disconnect` | The row is primary; make another row primary first. |
 | `disabled_cannot_be_primary` | `set_primary` | The row is disconnected; a disabled primary never launches, so no bridge would carry the proactive room. Reconnect it first. |
 | `legacy_row_unmanaged` | `disconnect`, `update_token` | The legacy unsuffixed row (`instance: ""`) is launched from `REMOTE_TASK_TOKEN` in the environment, not from this directory; change that variable instead. |
-| `bridge_still_running` | `disconnect`, `remove`, `reconnect`, `update_token` | The bridge still held its lease past the stop deadline, or refused the signal; the message names the pid. The row is as it was: `disabled` is never written over a running bridge. |
+| `bridge_still_running` | `disconnect`, `remove`, `reconnect`, `update_token` | The bridge still held its lease past the stop deadline, released it but was still running at the deadline, or refused the signal; the message names the pid. Nothing changed: the row stays (never marked `disabled` over a live process), `remove` keeps the row, launch record, status file and vault key, `reconnect` spawns no second bridge, and `update_token` writes nothing and says the running bridge still runs on the old code. |
 | `bridge_lease_indeterminate` | `disconnect`, `remove`, `reconnect`, `update_token`, `set_primary` | The bridge's lease file exists but does not prove which process holds it (unreadable or malformed, written for another role, workspace or schema such as a copied lease, another host's, no recorded start time, or a start time that cannot be checked); the message names which. Nothing is signalled or written. Restart that bridge (`bash src/restart.sh`) so it writes a current lease. |
 | `legacy_primary_running` | `set_primary` | The legacy unsuffixed bridge holds its lease, whatever the record's primary (legacy, none, or a named row). It settles the proactive room once, right after taking its lease, so it may carry it and would keep it. Stop it (`bash src/restart.sh --stop-only`), make the new row primary, then start again (`bash src/startup.sh`). |
 | `token_source_shadowed` | `update_token` | The row's `token_ref` (`AG2_REMOTE_TOKEN_<INST>`) is set in the environment, which the bridge reads before the vault; the new secret would be stored and never used. Unset the variable (or let `import-env` own that row) and retry. |
@@ -162,7 +162,9 @@ indeterminate, never a generation mismatch that reaps a live holder), so disconn
 same stop `remove_connection` and `reconnect` use) and **then** marks the row `disabled`; the
 row, its vault key and its launch record stay, so the owner can come back without a new
 token. The stop is SIGTERM, then a wait of `STOP_TIMEOUT_S` until no process holds the lease
-(released, or its writer gone); a bridge that still holds it (or refuses the signal) is
+(released, or its writer gone) **and** the signalled process has exited, so a status write it
+makes after releasing its lease lands before the stop returns; a bridge that still holds it, is
+still running past the deadline after releasing it, or refuses the signal is
 `bridge_still_running` with its pid, and the row is not touched, so `disabled` never masks a
 live sidecar. The launch plan omits a
 disabled row, so a core restart leaves it down. The primary cannot be disconnected while it
@@ -212,15 +214,39 @@ The vault has **one writer transaction**, `vault_intercept.writer_lock`: a cross
 `writer.lock` beside the canonical manifest (`state/secret-vault/`), re-entrant within the thread
 that holds it. Every vault write runs inside it, Keychain and manifest alike: `set_vault_key`,
 `delete_vault_key`, chat interception (`vault set` in a message) and the secret-vault CLI all reach
-the same locked writer. `update_token` takes it after the bridge is stopped and holds it from the
+the same locked writer. Before it stops the bridge, `update_token` probes the lock, waiting at
+most 2 s so a chat interception's brief write is absorbed: a lock still held after that refuses the
+update with `vault_busy` and the bridge is never stopped. The probe is released before the stop, because a stopping bridge may be finishing its own
+vault write. After the stop it takes the lock again (bounded, below) and holds it from the
 prior-value snapshot through the new vault write, the record publication and any restore, so no
-other vault writer, in this process or another, can land in between. The lock order is
+other vault writer, in this process or another, can land in between. A narrow race remains: a
+writer that takes the lock between the probe and the re-take makes the re-take wait for it, with
+the bridge already stopped (and relaunched on the unchanged code if that wait runs out). The lock order is
 `connections.lock`, then the vault lock; nothing in the vault layer takes `connections.lock`. The
 lock is released when its holder raises or exits (a killed holder's lock is dropped by the
 kernel), and its file stays empty. A lock that cannot be taken fails the write.
 The tradeoff is that vault writes are serialized: every other vault writer waits for the length
-of an `update_token` transaction (about 7 s in the live receipt), and a holder that is alive but
-wedged delays them until it exits.
+of an `update_token` transaction (about 7 s in the live receipt). Both waits are bounded, so a
+hung Keychain prompt cannot block every vault writer on the host: a writer that cannot take the
+lock within `_WRITER_LOCK_WAIT_S` fails with `vault_busy` and writes nothing, and a `security`
+store or delete that gives no answer within 15 s is killed and the key is read back (5 s), so
+the manifest follows what the Keychain holds: a write that took effect anyway is kept (a store
+registered, a delete dropped) and succeeds; one that did not fails with `vault_keychain_timeout`,
+nothing changed; a read-back that also fails is `vault_keychain_state_unknown`, the manifest
+unchanged (a delete's entry is kept, so no secret is stranded; an `add` that saw it also deletes
+the key it may have stored). The lock is released either way. `_WRITER_LOCK_WAIT_S` (65 s) is
+derived from those bounds to exceed the longest legitimate hold, an `update_token` that stores,
+fails and restores: two writes each with a read-back plus three reads (55 s), plus 10 s margin.
+The bridge stop is outside the lock, so it does not count. Through `connections` both surface as `vault_unavailable` (HTTP 503), the
+message naming the code; only a leading `vault_*` code is passed through from the vault's error,
+never its free text, so no Keychain output or secret reaches the message.
+
+The lock lives beside the manifest of the **configured** workspace (`resolve_workspace`), not
+the `workspace=` a `connections` call is given: the record and the vault lock can sit in different
+workspaces. Keychain items are per host and per key, not per workspace, so two checkouts on one
+host with different workspaces share the same `AG2_REMOTE_TOKEN_<INST>` items under two different
+locks, and their writes to the same key are not serialized against each other. Give each
+checkout's rows distinct instance names, or point both at one workspace.
 
 The restore is still a compare-and-swap on the stored value: the previous secret is written back
 only when a read shows exactly the new code this update wrote, then read back again. Read back
@@ -239,8 +265,12 @@ a relaunch that fails is the row's `failed` state, not an error of the update. A
 identity refreshes its identity fields only from a verified preview of **the same agent**:
 adding or previewing another agent's code on that server leaves the row (and its token)
 exactly as it was. `remove_connection(instance)`
-stops that bridge the same way, then drops the row, its vault key and its launch record,
-and nothing else; the primary needs `force`, and no remaining row inherits the flag. A
+stops that bridge the same way, then drops the row, its vault key, its launch record and its
+status sidecar (`gateway-status.<instance>.json`, so a re-added name lists as `pending` until
+its new bridge reports, not with the removed row's `connected` and `last_ok_ts`), and nothing
+else. All of it happens under the record lock, after the stop has seen the old bridge exit, so
+neither a concurrent re-add of the same name nor the old bridge's last status write can be
+undone or land afterwards. The legacy row's sidecar stays, since its bridge is not stopped here. The primary needs `force`, and no remaining row inherits the flag. A
 removed env-imported row is remembered in the record's `removed_env` list, so
 `import-env` does not bring it back while the variable is still set (it says
 "connection removed earlier; unset the variable"); an explicit add of that key clears

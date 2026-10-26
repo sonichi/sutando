@@ -15,6 +15,7 @@ from _helpers.hermetic_env import isolate_os_environ, isolated_child_env
 # Before anything reads the environment: no outer credential selector survives.
 isolate_os_environ(SUTANDO_SUPPRESS_CCD_FALLBACK_BANNER="1")
 
+import contextlib
 import json
 import os
 import socket
@@ -2777,6 +2778,351 @@ class CrossProcessVaultBarrier(Base):
         for t in threads:
             t.join(20)
         self.assertEqual(sorted(done), ["public", "remove", "update"], "no deadlock")
+
+
+class BusyVault(FakeVault):
+    """A vault whose writer lock another writer holds past the wait (vault_intercept.VaultBusy)."""
+
+    def writer_lock(self, wait_s=None):
+        raise RuntimeError("vault_busy: another vault writer held the writer lock for 30s; nothing was written")
+
+
+class RealLockVault(FakeVault):
+    """FakeVault values under vault_intercept's real cross-process writer lock (a temp lock path)."""
+
+    def writer_lock(self, wait_s=None):
+        import vault_intercept
+        return vault_intercept.writer_lock(wait_s)
+
+
+class VaultWriterBusy(Base):
+    REF = "AG2_REMOTE_TOKEN_BETA_FIXTURE_NET"
+
+    def setUp(self):
+        super().setUp()
+        import vault_intercept
+        self.vi = vault_intercept
+        manifest = str(self.ws / "vault" / "keys.json")
+        for target, value in (("_manifest_path", lambda: manifest), ("_LEGACY_MANIFEST_PATH", manifest),
+                              ("_WRITER_LOCK_WAIT_S", 2.0)):
+            patcher = unittest.mock.patch.object(vault_intercept, target, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.vault = RealLockVault()
+        self.add()
+        self.add(TOKEN_B, fetch=agents("@s:beta-fixture.net"))
+        self.killed = []
+
+    def update(self, kill, vault=None):
+        return C.update_token("beta-fixture-net", UpdateToken.NEW_B, repo=self.ws / "repo", logs_dir=self.ws / "logs",
+                              environ={}, workspace=self.ws, vault=vault or self.vault, spawn=self.bridge_spawn(),
+                              kill=kill, fetch=agents("@s:beta-fixture.net"))
+
+    def beta(self):
+        return {r["instance"]: r for r in self.rows()}["beta-fixture-net"]
+
+    def stop_and_record(self, pid, sig):
+        self.killed.append(pid)
+        os.kill(pid, sig)
+
+    def hold_lock_in_child(self):
+        code = ("import sys, time; sys.path.insert(0, sys.argv[1]); import vault_intercept as v;"
+                "v._manifest_path = lambda: sys.argv[2]; cm = v.writer_lock(); cm.__enter__();"
+                "print('held', flush=True); time.sleep(60)")
+        child = subprocess.Popen([sys.executable, "-c", code, str(ROOT / "src"), self.vi._manifest_path()],
+                                 stdout=subprocess.PIPE, text=True)
+        self.addCleanup(lambda: (child.kill(), child.wait(), child.stdout.close()))
+        self.assertEqual(child.stdout.readline().strip(), "held")
+
+    def test_a_held_vault_lock_refuses_before_the_bridge_is_stopped(self):
+        bridge = bridge_lease.start(self.ws, "beta-fixture-net")
+        self.children.append(bridge)
+        before = self.beta()
+        self.hold_lock_in_child()
+        began = time.monotonic()
+        with self.assertRaises(C.VaultUnavailable) as ctx:
+            self.update(kill=lambda pid, sig: self.killed.append((pid, sig)))
+        waited = time.monotonic() - began
+        self.assertLess(waited, C.VAULT_PROBE_WAIT_S + 1.5, "the probe waits briefly, never out the lock")
+        self.assertIn("vault_busy", str(ctx.exception))
+        self.assertNotIn("secret-beta", str(ctx.exception))
+        self.assertEqual(self.killed, [], "no SIGTERM")
+        self.assertEqual(C.bridge_pid("beta-fixture-net", self.ws), bridge.pid, "the same bridge still runs")
+        self.assertEqual(self.vault.store[self.REF], TOKEN_B, "the vault is untouched")
+        self.assertEqual(self.beta(), before, "the row is untouched")
+
+    def test_a_brief_writer_on_the_lock_is_waited_out_and_the_update_lands(self):
+        bridge = bridge_lease.start(self.ws, "beta-fixture-net")
+        self.children.append(bridge)
+        code = ("import sys, time; sys.path.insert(0, sys.argv[1]); import vault_intercept as v;"
+                "v._manifest_path = lambda: sys.argv[2]; cm = v.writer_lock(); cm.__enter__();"
+                "print('held', flush=True); time.sleep(0.5); cm.__exit__(None, None, None)")
+        child = subprocess.Popen([sys.executable, "-c", code, str(ROOT / "src"), self.vi._manifest_path()],
+                                 stdout=subprocess.PIPE, text=True)
+        self.addCleanup(lambda: (child.kill(), child.wait(), child.stdout.close()))
+        self.assertEqual(child.stdout.readline().strip(), "held")
+        out = self.update(kill=self.stop_and_record)
+        self.assertEqual((self.killed, out["stopped_pid"]), ([bridge.pid], bridge.pid))
+        self.assertEqual(self.vault.store[self.REF], UpdateToken.NEW_B, "a chat write's brief hold does not refuse the update")
+
+    def test_a_vault_write_the_bridge_finishes_while_it_stops_lands_without_a_stall(self):
+        bridge = bridge_lease.start(self.ws, "beta-fixture-net")
+        self.children.append(bridge)
+        landed = []
+
+        def kill(pid, sig):
+            # The bridge finishes an in-flight vault write before it exits on SIGTERM.
+            def write():
+                with self.vi.writer_lock():
+                    landed.append(time.monotonic())
+            t = threading.Thread(target=write)
+            t.start()
+            t.join(5)
+            self.killed.append(pid)
+            os.kill(pid, sig)
+        began = time.monotonic()
+        out = self.update(kill)
+        self.assertLess(time.monotonic() - began, 1.5, "no wait toward the lock cap")
+        self.assertEqual((self.killed, out["stopped_pid"]), ([bridge.pid], bridge.pid))
+        self.assertEqual(len(landed), 1, "the bridge's own write landed during the stop")
+        self.assertEqual(self.vault.store[self.REF], UpdateToken.NEW_B)
+
+    def test_the_normal_path_is_unchanged(self):
+        out = self.update(kill=lambda *a: self.fail("nothing runs"))
+        self.assertEqual(out["stopped_pid"], 0)
+        self.assertEqual(self.vault.store[self.REF], UpdateToken.NEW_B)
+        self.assertEqual(self.beta()["gateway_url"], C.gateway_url_of(UpdateToken.NEW_B))
+
+    def test_a_hung_keychain_write_names_vault_keychain_timeout_and_no_secret(self):
+        import stat
+        bindir = self.ws / "bin"
+        bindir.mkdir()
+        stub = bindir / "security"
+        stub.write_text('#!/bin/sh\ncase "$1" in find-generic-password) exit 44;; esac\nexec sleep 30\n')
+        stub.chmod(stat.S_IRWXU)
+        with unittest.mock.patch.dict(os.environ, {"PATH": f"{bindir}{os.pathsep}{os.environ.get('PATH', '')}"}), \
+                unittest.mock.patch.object(self.vi, "_KEYCHAIN_WRITE_TIMEOUT_S", 0.5):
+            with self.assertRaises(C.ConnectionsError) as ctx:
+                self.update(kill=lambda *a: self.fail("nothing runs"), vault=C._VaultIntercept())
+        text = str(ctx.exception)
+        self.assertIn("vault_keychain_timeout", text)
+        for secret in ("secret-beta", UpdateToken.NEW_B, TOKEN_B):
+            self.assertNotIn(secret, text)
+
+    def keychain_stub(self, *flags):
+        """A `security` stand-in whose writes hang (one item file); `commits` lands a write first."""
+        import stat
+        bindir = self.ws / "bin"
+        bindir.mkdir(exist_ok=True)
+        for flag in flags:
+            (bindir / flag).write_text("")
+        stub = bindir / "security"
+        stub.write_text(f"""#!/bin/sh
+D='{bindir}'; verb="$1"; shift; v=""
+while [ $# -gt 0 ]; do [ "$1" = "-w" ] && [ "$verb" = add-generic-password ] && v="$2"; shift; done
+case "$verb" in
+  find-generic-password) [ -f "$D/item" ] && {{ cat "$D/item"; exit 0; }}; exit 44;;
+  add-generic-password) [ -f "$D/commits" ] && printf '%s' "$v" > "$D/item";;
+  delete-generic-password) [ -f "$D/commits" ] && rm -f "$D/item";;
+esac
+exec sleep 30
+""")
+        stub.chmod(stat.S_IRWXU)
+        stack = contextlib.ExitStack()
+        stack.enter_context(unittest.mock.patch.dict(os.environ, {"PATH": f"{bindir}{os.pathsep}{os.environ.get('PATH', '')}"}))
+        stack.enter_context(unittest.mock.patch.object(self.vi, "_KEYCHAIN_WRITE_TIMEOUT_S", 0.5))
+        stack.enter_context(unittest.mock.patch.object(self.vi, "_KEYCHAIN_READ_TIMEOUT_S", 0.5))
+        return stack, bindir / "item"
+
+    def fresh_ws(self):
+        self.tmp2 = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp2.cleanup)
+        self.ws = Path(self.tmp2.name)
+        self.vault = C._VaultIntercept()
+
+    def test_an_add_whose_store_lands_then_hangs_is_saved(self):
+        self.fresh_ws()
+        stack, item = self.keychain_stub("commits")
+        with stack:
+            row, _ = self.add()
+        self.assertEqual(item.read_text(), TOKEN_A)
+        self.assertEqual([r["instance"] for r in self.rows()], [row["instance"]])
+        self.assertIn(row["token_ref"], self.vi._read_manifest(), "the manifest matches the Keychain")
+
+    def test_an_add_whose_store_did_not_land_fails_naming_the_timeout(self):
+        self.fresh_ws()
+        stack, item = self.keychain_stub()
+        with stack, self.assertRaises(C.VaultUnavailable) as ctx:
+            self.add()
+        self.assertIn("vault_keychain_timeout", str(ctx.exception))
+        self.assertFalse(item.exists())
+        self.assertEqual(self.rows(), [])
+
+    def test_a_remove_whose_delete_lands_then_hangs_drops_the_row(self):
+        self.fresh_ws()
+        stack, item = self.keychain_stub("commits")
+        with stack:
+            row, _ = self.add()
+            C.remove_connection(row["instance"], force=True, workspace=self.ws, vault=self.vault)
+        self.assertFalse(item.exists())
+        self.assertEqual(self.rows(), [])
+        self.assertNotIn(row["token_ref"], self.vi._read_manifest())
+
+    def test_the_cause_passes_only_a_vault_code(self):
+        self.assertEqual(C._vault_cause(RuntimeError("vault_busy: held 30s")), "RuntimeError: vault_busy")
+        self.assertEqual(C._vault_cause(RuntimeError("vault: failed to store 'K': sk-secret")), "RuntimeError")
+        self.assertEqual(C._vault_cause(RuntimeError("https://x|secret: y")), "RuntimeError")
+
+
+class RemoveClearsSidecar(Base):
+    def test_a_re_added_row_lists_pending_not_the_removed_rows_status(self):
+        self.add()
+        self.add(TOKEN_B, fetch=agents("@s:beta-fixture.net"))
+        C._record_launch("beta-fixture-net", self.ws, ok=True, pid=1)
+        (self.ws / "state" / "gateway-status.beta-fixture-net.json").write_text(
+            json.dumps({"connected": True, "last_ok_ts": 1700000000}))
+        (self.ws / "gateway-status.beta-fixture-net.json").write_text(json.dumps({"connected": True}))
+        C.remove_connection("beta-fixture-net", workspace=self.ws, vault=self.vault, kill=lambda *a: None)
+        self.add(TOKEN_B, fetch=agents("@s:beta-fixture.net"))
+        beta = {r["instance"]: r for r in C.list_connections(self.ws, vault=self.vault)}["beta-fixture-net"]
+        listed = C.status_for(beta, self.ws)
+        self.assertEqual((listed["state"], listed["status"]), ("pending", {"connected": None, "last_ok_ts": None}))
+
+    LATE_WRITER = ("import signal, sys, time, json\nfrom pathlib import Path\nsys.path.insert(0, sys.argv[1])\n"
+                   "import workspace_lock as wl\nws, role, status = Path(sys.argv[2]), sys.argv[3], Path(sys.argv[4])\n"
+                   "wl.acquire(role, ws)\n"
+                   "def stop(*a):\n    wl.release(role, ws)\n    time.sleep(0.4)\n"
+                   "    status.write_text(json.dumps({'connected': True, 'last_ok_ts': 1}))\n    sys.exit(0)\n"
+                   "signal.signal(signal.SIGTERM, stop)\nprint('held', flush=True)\n"
+                   "while True:\n    time.sleep(0.2)\n    wl.heartbeat(role, ws)\n")
+
+    def test_a_bridge_whose_last_status_write_follows_its_lease_release_is_waited_for(self):
+        self.add()
+        self.add(TOKEN_B, fetch=agents("@s:beta-fixture.net"))
+        status = self.ws / "state" / "gateway-status.beta-fixture-net.json"
+        child = subprocess.Popen([sys.executable, "-c", self.LATE_WRITER, str(ROOT / "src"), str(self.ws),
+                                  C._bridge_role("beta-fixture-net"), str(status)],
+                                 stdout=subprocess.PIPE, env=isolated_child_env(), text=True)
+        self.children.append(child)
+        self.assertEqual(child.stdout.readline().strip(), "held")
+        gone = C.remove_connection("beta-fixture-net", workspace=self.ws, vault=self.vault, kill=os.kill)
+        self.assertEqual(gone["stopped_pid"], child.pid)
+        child.wait(5)
+        self.assertFalse(status.exists(), "the late status write landed before the cleanup, not after")
+
+    def test_a_concurrent_same_name_re_add_keeps_its_new_sidecar(self):
+        self.add()
+        self.add(TOKEN_B, fetch=agents("@s:beta-fixture.net"))
+        status = self.ws / "state" / "gateway-status.beta-fixture-net.json"
+        status.write_text(json.dumps({"connected": True, "last_ok_ts": 1}))
+        at_cleanup, readded = threading.Event(), threading.Event()
+        real = C.launch_record_path
+
+        def gated(instance, workspace=None):
+            if threading.current_thread().name == "remover" and not at_cleanup.is_set():
+                at_cleanup.set()
+                readded.wait(2)
+            return real(instance, workspace)
+
+        def remover():
+            C.remove_connection("beta-fixture-net", workspace=self.ws, vault=self.vault, kill=lambda *a: None)
+
+        def re_adder():
+            at_cleanup.wait(5)
+            self.add(TOKEN_B, fetch=agents("@s:beta-fixture.net"))
+            status.write_text(json.dumps({"connected": True, "last_ok_ts": 2}))  # the new bridge reports
+            readded.set()
+        with unittest.mock.patch.object(C, "launch_record_path", gated):
+            threads = [threading.Thread(target=remover, name="remover"), threading.Thread(target=re_adder)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(10)
+        self.assertTrue(status.exists(), "the remover deleted the re-added row's sidecar")
+        self.assertEqual(json.loads(status.read_text())["last_ok_ts"], 2)
+
+    def test_remove_leaves_other_rows_sidecars(self):
+        self.add()
+        self.add(TOKEN_B, fetch=agents("@s:beta-fixture.net"))
+        alpha = self.ws / "state" / "gateway-status.alpha-fixture-net.json"
+        alpha.write_text(json.dumps({"connected": True, "last_ok_ts": 5}))
+        C.remove_connection("beta-fixture-net", workspace=self.ws, vault=self.vault, kill=lambda *a: None)
+        self.assertTrue(alpha.exists())
+
+
+class LingeringBridge(Base):
+    """A bridge that releases its lease on SIGTERM but stays alive past the stop deadline: every
+    caller of stop_bridge refuses with bridge_still_running and leaves its state as it was."""
+
+    LINGER = ("import signal, sys, time\nfrom pathlib import Path\nsys.path.insert(0, sys.argv[1])\n"
+              "import workspace_lock as wl\nws, role = Path(sys.argv[2]), sys.argv[3]\nwl.acquire(role, ws)\n"
+              "signal.signal(signal.SIGTERM, lambda *a: wl.release(role, ws))\nprint('held', flush=True)\n"
+              "while True:\n    time.sleep(0.2)\n    wl.heartbeat(role, ws)\n")
+    INST = "beta-fixture-net"
+    REF = "AG2_REMOTE_TOKEN_BETA_FIXTURE_NET"
+
+    def setUp(self):
+        super().setUp()
+        patcher = unittest.mock.patch.object(C, "STOP_TIMEOUT_S", 1)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.add()
+        self.add(TOKEN_B, fetch=agents("@s:beta-fixture.net"))
+        C._record_launch(self.INST, self.ws, ok=True, pid=1)
+        self.status = self.ws / "state" / f"gateway-status.{self.INST}.json"
+        self.status.write_text(json.dumps({"connected": True, "last_ok_ts": 1}))
+        self.bridge = subprocess.Popen([sys.executable, "-c", self.LINGER, str(ROOT / "src"), str(self.ws),
+                                        C._bridge_role(self.INST)], stdout=subprocess.PIPE,
+                                       env=isolated_child_env(), text=True)
+        self.children.append(self.bridge)
+        self.assertEqual(self.bridge.stdout.readline().strip(), "held")
+        self.spawned = []
+
+    def spawn(self, argv, env, log_path):
+        self.spawned.append(env["GATEWAY_INSTANCE"])
+        return self.bridge_spawn()(argv, env, log_path)
+
+    def beta(self):
+        return {r["instance"]: r for r in self.rows()}.get(self.INST)
+
+    def assert_lingering(self, ctx):
+        self.assertIn("bridge_still_running", str(ctx.exception))
+        self.assertIn("released its lease", str(ctx.exception))
+        self.assertIsNone(self.bridge.poll(), "the old bridge is still alive")
+
+    def test_update_token_writes_nothing_and_says_the_old_code_is_still_active(self):
+        before = self.beta()
+        with self.assertRaises(C.BridgeStillRunning) as ctx:
+            C.update_token(self.INST, UpdateToken.NEW_B, repo=self.ws / "repo", logs_dir=self.ws / "logs", environ={},
+                           workspace=self.ws, vault=self.vault, spawn=self.spawn, kill=os.kill,
+                           fetch=agents("@s:beta-fixture.net"))
+        self.assert_lingering(ctx)
+        self.assertIn("still runs on the old code", str(ctx.exception))
+        self.assertEqual(self.vault.store[self.REF], TOKEN_B, "the vault still holds the old code")
+        self.assertEqual(self.beta(), before, "the row is unchanged")
+        self.assertEqual(self.spawned, [], "no second bridge")
+
+    def test_remove_keeps_the_row_launch_record_status_and_vault_key(self):
+        with self.assertRaises(C.BridgeStillRunning) as ctx:
+            C.remove_connection(self.INST, workspace=self.ws, vault=self.vault, kill=os.kill)
+        self.assert_lingering(ctx)
+        self.assertIsNotNone(self.beta(), "the row stays")
+        self.assertTrue(C.launch_record_path(self.INST, self.ws).exists(), "the launch record stays")
+        self.assertTrue(self.status.exists(), "the status file stays")
+        self.assertEqual(self.vault.store[self.REF], TOKEN_B, "the vault key stays")
+
+    def test_disconnect_does_not_mark_the_row_disabled(self):
+        with self.assertRaises(C.BridgeStillRunning) as ctx:
+            C.disconnect(self.INST, workspace=self.ws, kill=os.kill)
+        self.assert_lingering(ctx)
+        self.assertFalse(self.beta()["disabled"], "disabled is never written over a live process")
+
+    def test_reconnect_spawns_no_second_bridge(self):
+        with self.assertRaises(C.BridgeStillRunning) as ctx:
+            C.reconnect(self.INST, repo=self.ws / "repo", logs_dir=self.ws / "logs", environ={}, workspace=self.ws,
+                        vault=self.vault, spawn=self.spawn, kill=os.kill, fetch=agents("@s:beta-fixture.net"))
+        self.assert_lingering(ctx)
+        self.assertEqual(self.spawned, [], "no second bridge while the old one lives")
 
 
 if __name__ == "__main__":
