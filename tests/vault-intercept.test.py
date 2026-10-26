@@ -650,6 +650,7 @@ if __name__ == "__main__":
         TestHermeticManifest,
         TestKeychainInteraction,
         TestKeychainReadDeadline,
+        TestLookupVaultKey,
         TestRedactVaultCommands,
         TestErrorHandling,
     ]:

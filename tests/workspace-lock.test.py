@@ -92,7 +92,8 @@ class LockTest(unittest.TestCase):
         (proc / "77" / "stat").write_bytes(f"77 (a) b) {rest}".encode())
         self.assertEqual(self.mod.proc_start(77, proc), "b-1:12345")
         self.assertIsNone(self.mod.proc_start(78, proc), "a gone process has none")
-        self.assertIsNone(self.mod.proc_start(77, self.ws / "absent"))
+        # Above every platform's pid ceiling, so the darwin sysctl fallback finds nothing either.
+        self.assertIsNone(self.mod.proc_start(9_999_999, self.ws / "absent"))
         start = self.mod.proc_start(os.getpid())
         if sys.platform in ("linux", "darwin"):
             self.assertIsNotNone(start, "macOS reads it through sysctl")
