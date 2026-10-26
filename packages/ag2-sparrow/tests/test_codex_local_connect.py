@@ -1100,10 +1100,9 @@ class ConnectCode(Base):
                 mock.patch.object(urllib.request, "urlopen", side_effect=backend), \
                 mock.patch.object(sys, "stdin", stdin), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             rc = cli.main(["connect", "--base", BASE, "--code", "-", "--codex-home", str(self.codex_home)])
-            bare = cli.main(["connect"])
-        self.assertEqual((rc, bare), (cli.EXIT_UNUSABLE, cli.EXIT_UNUSABLE))
+        self.assertEqual(rc, cli.EXIT_UNUSABLE)
         self.assertEqual(err.getvalue(), "error: Codex connect is not enabled in this release; use install --work / "
-                                         "verify\n" * 2)
+                                         "verify\n")
         self.assertEqual(out.getvalue(), "")
         self.assertEqual(backend.calls, [], "no code is redeemed")
         self.assertEqual(stdin.read(), CODE + "\n", "the code is not even read")
@@ -1114,6 +1113,9 @@ class ConnectCode(Base):
         self.assertFalse(cli.config_path().exists(), "no config")
         self.assertFalse(cm.supervisor_path(cli.LOCAL).exists(), "no unit")
         self.assertFalse(cm.supervisor_path(cb.bridge_shape(cli.LOCAL)).exists(), "no bridge unit")
+        with contextlib.redirect_stderr(io.StringIO()) as bare:
+            self.assertEqual(cli.main(["connect"]), cli.EXIT_UNUSABLE, "the refusal comes before any argument check")
+        self.assertIn("not enabled in this release", bare.getvalue())
 
     def assert_code_unspent(self, backend, rc, err):
         self.assertEqual(rc, cli.EXIT_UNUSABLE)
