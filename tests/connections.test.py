@@ -2539,7 +2539,7 @@ class ReconcileUnderLock(Base):
                 raise OSError("disk full")
             real_write(path, record)
 
-        def reconcile(*a, **k):
+        def paused_reconcile_vault(*a, **k):
             if threading.current_thread().name == "B":
                 in_reconcile.set()
                 gate.wait(10)
@@ -2550,7 +2550,7 @@ class ReconcileUnderLock(Base):
                 self.update(self.B)
             except Exception as e:  # noqa: BLE001
                 errors["B"] = e
-        with unittest.mock.patch.object(C, "_write", write), unittest.mock.patch.object(C, "_reconcile_vault", reconcile):
+        with unittest.mock.patch.object(C, "_write", write), unittest.mock.patch.object(C, "_reconcile_vault", paused_reconcile_vault):
             b = threading.Thread(target=run_b, name="B")
             b.start()
             self.assertTrue(in_reconcile.wait(10))
