@@ -70,11 +70,20 @@ py() {
 }
 
 # Mirrors src/desktop_data_root.py; tests/desktop-data-root-contract.test.py pins the two.
+# The desktop ships its own rule beside this checkout; the built-in copy is the fallback.
 desktop_data_root() {
-  local base="$HOME/Library/Application Support"
+  local base="$HOME/Library/Application Support" shipped="$REPO_ROOT/../app-support.sh" out=""
   if [ -n "${SUTANDO_APP_SUPPORT:-}" ]; then
     printf '%s' "$SUTANDO_APP_SUPPORT"
-  elif { [ -e "$base/.space.ag2.desktop.ready" ] && [ -d "$base/space.ag2.desktop" ]; } || [ ! -d "$base/space.ag2.app" ]; then
+    return
+  fi
+  if [ -f "$shipped" ]; then
+    out="$(. "$shipped" >/dev/null 2>&1 && declare -F ag2_app_support_dir >/dev/null && ag2_app_support_dir "$HOME")" || out=""
+    case "$out" in *$'\n'*) out="" ;; esac
+  fi
+  if [ -n "$out" ]; then
+    printf '%s' "$out"
+  elif [ -e "$base/.space.ag2.desktop.ready" ] || [ -f "$base/space.ag2.desktop/.copied-from-space.ag2.app" ] || [ ! -d "$base/space.ag2.app" ]; then
     printf '%s' "$base/space.ag2.desktop"
   else
     printf '%s' "$base/space.ag2.app"
@@ -374,8 +383,8 @@ print(_host_label(), end='')
     ;;
 
   desktop-data-root)
-    # The desktop app's macOS data folder: $SUTANDO_APP_SUPPORT, else space.ag2.desktop
-    # once the move finished (ready marker) or with no space.ag2.app, else space.ag2.app.
+    # The desktop app's macOS data folder: $SUTANDO_APP_SUPPORT, else the desktop's
+    # shipped ../app-support.sh rule, else the built-in copy of it.
     desktop_data_root
     ;;
 
