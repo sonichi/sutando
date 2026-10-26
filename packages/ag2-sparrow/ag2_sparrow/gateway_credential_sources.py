@@ -617,6 +617,7 @@ def discover(env: Mapping[str, str], files: "Sequence[EnvFile]" = (), *,
     if seat and not env.get("AG2_DEVICE_ENV"):
         fatal.append("this bridge is a seat but AG2_DEVICE_ENV does not name its .env")
     # A named token file decides alone: refused, no tier stands in; blank or not yet written, only the env may.
+    # Named means authoritative: a channel .env or the vault would connect as a credential nobody named.
     seat_without_file = seat and (not token_file_env or token_file_missing)
     closed = (("token_file", "env", "file", "vault") if token_file_reason or seat_without_file
               else ("env", "file", "vault") if seat else ("file", "vault") if token_file_env else ())

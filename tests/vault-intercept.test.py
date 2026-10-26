@@ -133,6 +133,24 @@ class TestHermeticManifest(unittest.TestCase):
         self.assertEqual(before, after, f"suite wrote the real manifest at {real}")
 
 
+class TestLookupVaultKey(unittest.TestCase):
+    """Only errSecItemNotFound reads as absent; any other failure raises, never None."""
+
+    def test_present_absent_and_unreadable(self):
+        found = MagicMock(returncode=0, stdout=b"sk-value\n")
+        with patch("vault_intercept.subprocess.run", return_value=found):
+            self.assertEqual(vault_intercept.lookup_vault_key("K"), "sk-value")
+        with patch("vault_intercept.subprocess.run", return_value=MagicMock(returncode=44, stdout=b"")):
+            self.assertIsNone(vault_intercept.lookup_vault_key("K"))
+        with patch("vault_intercept.subprocess.run", return_value=MagicMock(returncode=51, stdout=b"")):
+            with self.assertRaises(RuntimeError):
+                vault_intercept.lookup_vault_key("K")
+        import subprocess
+        with patch("vault_intercept.subprocess.run", side_effect=subprocess.TimeoutExpired("security", 5)):
+            with self.assertRaises(RuntimeError):
+                vault_intercept.lookup_vault_key("K")
+
+
 class TestNoVaultCommands(unittest.TestCase):
     def test_empty_string(self):
         result = intercept_vault_commands("")
@@ -619,6 +637,160 @@ class TestErrorHandling(unittest.TestCase):
         self.assertIsInstance(result.failed, list)
 
 
+class TestWriterLock(unittest.TestCase):
+    """Every vault writer runs under writer_lock: with it held elsewhere, each entry point waits."""
+
+    def _waits_for_the_lock(self, label, entry):
+        import threading
+        done = threading.Event()
+        errors = []
+
+        def run():
+            try:
+                entry()
+            except BaseException as e:  # noqa: BLE001
+                errors.append(e)
+            done.set()
+        with _mock_store():
+            with vault_intercept.writer_lock():
+                t = threading.Thread(target=run)
+                t.start()
+                self.assertFalse(done.wait(0.3), f"{label} wrote while the writer lock was held")
+            self.assertTrue(done.wait(5), f"{label} never finished after the lock was released")
+            t.join(5)
+        self.assertEqual(errors, [], label)
+
+    def test_every_writer_entry_point_takes_the_lock(self):
+        import io
+        cli_spec = importlib.util.spec_from_file_location(
+            "secret_vault_cli", REPO / "skills" / "secret-vault" / "secret-vault.py")
+        cli = importlib.util.module_from_spec(cli_spec)
+        cli_spec.loader.exec_module(cli)
+        secret = "sk-" + "a" * 20 + "T3BlbkFJ" + "b" * 20
+
+        def cli_set():
+            with patch.object(sys, "stdin", io.StringIO("cli-value\n")), patch("builtins.print"):
+                cli.cmd_set("LOCK_CLI")
+
+        def cli_delete():
+            with patch("builtins.print"):
+                cli.cmd_delete("LOCK_CLI")
+        for label, entry in (("set_vault_key", lambda: vault_intercept.set_vault_key("LOCK_SET", "v")),
+                             ("delete_vault_key", lambda: vault_intercept.delete_vault_key("LOCK_SET")),
+                             ("chat interception", lambda: intercept_vault_commands(f"vault set LOCK_CHAT {secret}")),
+                             ("secret-vault CLI set", cli_set), ("secret-vault CLI delete", cli_delete)):
+            self._waits_for_the_lock(label, entry)
+
+    def test_every_entry_point_mutates_only_inside_the_one_writer_contract(self):
+        """Delegation: each entry's Keychain mutation and manifest write run with writer_lock held."""
+        import io
+        cli_spec = importlib.util.spec_from_file_location(
+            "secret_vault_cli", REPO / "skills" / "secret-vault" / "secret-vault.py")
+        cli = importlib.util.module_from_spec(cli_spec)
+        cli_spec.loader.exec_module(cli)
+        seen = []
+        real_register, real_deregister = vault_intercept._register_key, vault_intercept._deregister_key
+
+        def run(argv, **kw):
+            if argv[1] != "find-generic-password":
+                seen.append((argv[1], getattr(vault_intercept._WRITER, "depth", 0)))
+            return MagicMock(returncode=0, stdout=b"")
+
+        def register(key):
+            seen.append(("manifest", getattr(vault_intercept._WRITER, "depth", 0)))
+            real_register(key)
+
+        def deregister(key):
+            seen.append(("manifest", getattr(vault_intercept._WRITER, "depth", 0)))
+            real_deregister(key)
+        secret = "sk-" + "a" * 20 + "T3BlbkFJ" + "b" * 20
+        entries = (("set_vault_key", lambda: vault_intercept.set_vault_key("DELEG_SET", "v")),
+                   ("delete_vault_key", lambda: vault_intercept.delete_vault_key("DELEG_SET")),
+                   ("chat interception", lambda: intercept_vault_commands(f"vault set DELEG_CHAT {secret}")),
+                   ("CLI set", lambda: cli.cmd_set("DELEG_CLI")), ("CLI delete", lambda: cli.cmd_delete("DELEG_CLI")))
+        with patch("vault_intercept.subprocess.run", side_effect=run), \
+                patch.object(vault_intercept, "_register_key", register), \
+                patch.object(vault_intercept, "_deregister_key", deregister), \
+                patch.object(sys, "stdin", io.StringIO("cli-value\n")), patch("builtins.print"):
+            for label, entry in entries:
+                seen.clear()
+                entry()
+                self.assertTrue(seen and all(depth > 0 for _, depth in seen), (label, seen))
+
+    def test_the_lock_is_re_entrant_in_one_thread_and_never_takes_connections_lock(self):
+        with _mock_store(), vault_intercept.writer_lock(), vault_intercept.writer_lock():
+            vault_intercept.set_vault_key("LOCK_NESTED", "v")
+            vault_intercept.delete_vault_key("LOCK_NESTED")
+        self.assertEqual(getattr(vault_intercept._WRITER, "depth", 0), 0)
+        source = (REPO / "src" / "vault_intercept.py").read_text()
+        self.assertNotIn("connections", source.replace("connections.lock may take this", "")
+                         .replace("never takes connections.lock", ""), "a vault writer must not reach connections")
+
+    def test_the_lock_is_released_on_an_exception(self):
+        import threading
+        with self.assertRaises(ValueError):
+            with vault_intercept.writer_lock():
+                raise ValueError("boom")
+        self.assertEqual(getattr(vault_intercept._WRITER, "depth", 0), 0)
+        got = threading.Event()
+
+        def take():
+            with vault_intercept.writer_lock():
+                got.set()
+        t = threading.Thread(target=take)
+        t.start()
+        self.assertTrue(got.wait(5), "another holder takes it after the exception")
+        t.join(5)
+
+    def test_a_holder_killed_with_sigkill_leaves_no_held_lock(self):
+        import signal
+        import subprocess
+        import threading
+        code = ("import sys, time; sys.path.insert(0, sys.argv[1]); import vault_intercept as v;"
+                "v._manifest_path = lambda: sys.argv[2]; cm = v.writer_lock(); cm.__enter__();"
+                "print('held', flush=True); time.sleep(60)")
+        child = subprocess.Popen([sys.executable, "-c", code, str(REPO / "src"), vault_intercept._manifest_path()],
+                                 stdout=subprocess.PIPE, text=True)
+        try:
+            self.assertEqual(child.stdout.readline().strip(), "held")
+            blocked = threading.Event()
+
+            def take():
+                with vault_intercept.writer_lock():
+                    blocked.set()
+            t = threading.Thread(target=take, daemon=True)
+            t.start()
+            self.assertFalse(blocked.wait(0.3), "the child holds it")
+            os.kill(child.pid, signal.SIGKILL if hasattr(signal, "SIGKILL") else signal.SIGTERM)
+            child.wait(5)
+            self.assertTrue(blocked.wait(5), "the kernel released the dead holder's lock")
+            t.join(5)
+        finally:
+            if child.poll() is None:
+                child.kill()
+            child.wait()
+            child.stdout.close()
+
+    def test_neither_the_lock_file_nor_the_manifest_holds_a_secret_or_its_digest(self):
+        import hashlib
+        value = "sk-" + "q" * 40
+        with _mock_store():
+            vault_intercept.set_vault_key("NO_LEAK", value)
+        digests = {hashlib.sha256(value.encode()).hexdigest(), hashlib.md5(value.encode()).hexdigest()}
+        for path in (vault_intercept.writer_lock_path(), vault_intercept._manifest_path()):
+            body = open(path, encoding="utf-8", errors="replace").read()
+            self.assertNotIn(value, body, path)
+            for d in digests:
+                self.assertNotIn(d, body, path)
+        self.assertEqual(os.path.getsize(vault_intercept.writer_lock_path()), 0, "the lock file stays empty")
+
+    def test_a_lock_that_cannot_be_taken_fails_the_write(self):
+        with patch.object(vault_intercept, "writer_lock_path", return_value="/dev/null/no/writer.lock"), _mock_store():
+            with self.assertRaises(RuntimeError):
+                vault_intercept.set_vault_key("LOCK_FAIL", "v")
+            result = intercept_vault_commands("vault set LOCK_FAIL " + "sk-" + "a" * 20 + "T3BlbkFJ" + "b" * 20)
+        self.assertEqual(result.failed, ["LOCK_FAIL"], "the chat path redacts and reports a failed store")
+
 if __name__ == "__main__":
     loader = unittest.TestLoader()
     suite = unittest.TestSuite()
@@ -632,8 +804,10 @@ if __name__ == "__main__":
         TestHermeticManifest,
         TestKeychainInteraction,
         TestKeychainReadDeadline,
+        TestLookupVaultKey,
         TestRedactVaultCommands,
         TestErrorHandling,
+        TestWriterLock,
     ]:
         suite.addTests(loader.loadTestsFromTestCase(cls))
     runner = unittest.TextTestRunner(verbosity=2)

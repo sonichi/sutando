@@ -22,6 +22,23 @@ and refuse a record over `MAX_BYTES` or off-schema on read. `status_for` joins a
 read-only with the bridge's own `state/gateway-status[.<instance>].json` and the launch
 record `launch` leaves, into one `state`: pending, connected, disconnected or failed.
 
+Which process runs a bridge is read only from the bridge's own lease, through `workspace_lock`'s
+reader (`bridge_pid`): a lease that proves no holder is a refusal, never pid 0, and only a pid
+proven to be the lease's writer is ever signalled; a record written for another role, workspace or
+schema proves nothing. `launch` keeps the record lock until its child is proven, by that same check,
+to hold the lease or has exited; an exit is a success only when another holder is proven live.
+
+`disconnect` stops a row's bridge and then marks it `disabled`, keeping the row, the vault secret
+and the launch record: the plan skips a disabled row, so a restart leaves it down until
+`reconnect` clears the flag. A bridge that will not stop leaves the row as it was
+(`BridgeStillRunning`); the primary cannot be disconnected while it is primary, and a
+disabled row cannot become primary. `update_token` replaces the secret under a row's existing
+`token_ref` with a new code for the same server and agent (anything else is refused by code),
+clears the flag and relaunches; it is refused while a higher-precedence source (the row's
+environment variable) would shadow the vault. The legacy unsuffixed row is the environment's:
+`disconnect` and `update_token` refuse it (`LegacyRowUnmanaged`). Every such refusal is a
+`Refusal` whose `CODE` each surface returns unchanged.
+
 A row's `server_source` says where its server came from: `identity` (the resolver's
 registered DotSpace for the gateway host, confirmed by the gateway's own agent listing),
 `resolver` (the registered DotSpace alone) or `gateway` (the host itself, provisional). Two
@@ -37,6 +54,7 @@ import re
 import signal
 import subprocess
 import sys
+import contextlib
 import hashlib
 import http.client
 import ipaddress
@@ -53,7 +71,8 @@ from typing import Callable, Iterator, Mapping, Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from file_lock import locked_file, try_lock_fd, unlock_fd  # noqa: E402
+import workspace_lock  # noqa: E402
+from file_lock import locked_file  # noqa: E402
 
 STATE_NAME = "connections.json"
 LOCK_NAME = "connections.lock"
@@ -69,12 +88,19 @@ STATES = ("pending", "connected", "disconnected", "failed")
 SERVER_SOURCES = ("identity", "resolver", "gateway")
 # The bridge's own GATEWAY_INSTANCE charset; a row that fails it could never launch.
 INSTANCE_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
+# Fixed names on the HTTP resource: a row so named could never be addressed there.
+RESERVED_INSTANCES = ("known-servers", "token")
 _ENV_VAR_RE = re.compile(r"^AG2_REMOTE_TOKEN_([A-Za-z0-9_]+)$")
 _MXID_RE = re.compile(r"^@[^:]+:([A-Za-z0-9.-]+)(?::\d+)?$")
 _REQUIRED = ("server", "instance", "gateway_url", "token_ref", "primary", "added_by", "added_at", "verified",
              "server_source")
+# What the gateway's agent listing says about the one agent a verified preview names; never a secret.
+IDENTITY_FIELDS = ("agent_mxid", "agent_display_name", "agent_avatar_url", "owner_mxid")
+AVATAR_SCHEME = "mxc://"
 PROBE_TIMEOUT_S = 15
 STOP_TIMEOUT_S = 8
+# How long `launch` holds the record lock waiting for its child to take the bridge lease.
+LEASE_TIMEOUT_S = 20
 # Names that never belong to a public homeserver; a probe there would scan the operator's own network.
 RESERVED_SUFFIXES = (".localhost", ".local", ".internal", ".test", ".example", ".invalid", ".onion", ".home.arpa")
 # The host's own resolver unless a test injects one.
@@ -107,6 +133,136 @@ class PrimaryProtected(ConnectionsError):
     pass
 
 
+class Refusal(ConnectionsError):
+    """Refused by the row's or the code's state, nothing written: `CODE` is the error code every
+    surface returns as is (HTTP 409 `{"error": CODE}`, runtime-api CONFLICT, CLI exit 1)."""
+
+    CODE = "refused"
+
+
+class PrimaryCannotDisconnect(PrimaryProtected, Refusal):
+    """The primary row stays up while it is primary; make another row primary first."""
+
+    CODE = "primary_cannot_disconnect"
+
+    def __init__(self, instance: str):
+        super().__init__(f"{self.CODE}: {instance or '<primary>'} is the primary connection; "
+                         "make another connection primary first")
+
+
+class DisabledCannotBePrimary(Refusal):
+    """A disabled row never launches, so as primary no bridge would carry the proactive room."""
+
+    CODE = "disabled_cannot_be_primary"
+
+    def __init__(self, instance: str):
+        super().__init__(f"{self.CODE}: {instance} is disconnected; reconnect it before making it primary")
+
+
+class LegacyRowUnmanaged(Refusal):
+    """The unsuffixed bridge is launched by the environment, not by this directory."""
+
+    CODE = "legacy_row_unmanaged"
+
+    def __init__(self, verb: str):
+        super().__init__(f"{self.CODE}: the legacy unsuffixed bridge is launched from REMOTE_TASK_TOKEN in the "
+                         f"environment, so {verb} does not reach it; change that variable instead")
+
+
+class BridgeStillRunning(Refusal):
+    """The bridge kept its singleton lock past the stop deadline; the row is as it was."""
+
+    CODE = "bridge_still_running"
+
+    def __init__(self, instance: str, pid: int, detail: str = ""):
+        super().__init__(f"{self.CODE}: the bridge for {instance or '<primary>'} (pid {pid}) is still running"
+                         + (f" ({detail})" if detail else "") + "; nothing changed")
+        self.pid = pid
+
+
+class BridgeLeaseIndeterminate(Refusal):
+    """The bridge's lease does not show which process holds it; nothing is signalled or written."""
+
+    CODE = "bridge_lease_indeterminate"
+
+    def __init__(self, instance: str, detail: str):
+        super().__init__(f"{self.CODE}: the bridge lease of {instance or '<primary>'} does not prove its holder "
+                         f"({detail}); restart that bridge (bash src/restart.sh) and retry; nothing changed")
+
+
+class LegacyPrimaryRunning(Refusal):
+    """The legacy bridge runs and may carry the proactive room; it decides that only when it starts."""
+
+    CODE = "legacy_primary_running"
+
+    def __init__(self, instance: str, pid: int):
+        super().__init__(
+            f"{self.CODE}: the legacy unsuffixed bridge (pid {pid}) is running and may carry the proactive room, "
+            "which it decides only when it starts; stop it (bash src/restart.sh --stop-only), "
+            f"make {instance} primary, then start again (bash src/startup.sh) so the legacy bridge comes up "
+            f"without the room and {instance} with it; nothing changed")
+        self.pid = pid
+
+
+class VaultUnreadable(Refusal):
+    """The vault could not say whether it holds the row's current secret; nothing was touched."""
+
+    CODE = "vault_unreadable"
+
+
+class TokenRestoreFailed(Refusal):
+    """A write after the vault took the new code failed, and so did putting the previous secret back:
+    read back, the vault holds the NEW code while the row is unchanged."""
+
+    CODE = "token_restore_failed"
+
+
+class TokenStateUnknown(Refusal):
+    """An update failed after the vault write began and reading the key back could not establish
+    whether it holds the previous secret or the new code; the bridge is not relaunched on a guess."""
+
+    CODE = "token_state_unknown"
+
+
+class TokenSourceShadowed(Refusal):
+    """A source the bridge reads before the vault holds this row's token; a vault write would be ignored."""
+
+    CODE = "token_source_shadowed"
+
+    def __init__(self, instance: str, variable: str):
+        super().__init__(f"{self.CODE}: {variable} is set in the environment and outranks the vault; unset it "
+                         f"(or let import-env own it) before updating the token of {instance}")
+        self.variable = variable
+
+
+class TokenMismatch(Refusal):
+    """The new code is not this row's: `update_token` refuses it, naming the code in CODE."""
+
+    CODE = "token_mismatch"
+
+    def __init__(self, instance: str, detail: str):
+        super().__init__(f"{self.CODE}: {detail}; connection {instance or '<primary>'} is unchanged")
+
+
+class TokenServerMismatch(TokenMismatch):
+    """The previewed server is not the row's; a code for another server is a new connection."""
+
+    CODE = "token_server_mismatch"
+
+
+class TokenAgentMismatch(TokenMismatch):
+    """Both the row and the preview name an agent and they differ; add that agent as its own row."""
+
+    CODE = "token_agent_mismatch"
+
+
+class TokenUnverified(TokenMismatch):
+    """The row names an agent but the preview could not confirm one (gateway unreachable, an error,
+    or a listing not naming exactly one agent): the code is not shown to be this connection's."""
+
+    CODE = "token_unverified"
+
+
 class InvalidToken(ConnectionsError):
     pass
 
@@ -119,12 +275,19 @@ class LaunchFailed(ConnectionsError):
     pass
 
 
-class VaultKeyInUse(ConnectionsError):
+class VaultKeyInUse(Refusal):
     """The vault already holds a secret under this key and no row owns it."""
 
+    CODE = "vault_key_in_use"
 
-class TokenRejected(ConnectionsError):
+
+class TokenRejected(Refusal):
     """The gateway refused the token on the preview; nothing to store."""
+
+    CODE = "token_rejected"
+
+    def __init__(self):
+        super().__init__(f"{self.CODE}: the gateway rejected this token; nothing stored")
 
 
 # ── token → server ───────────────────────────────────────────────────────────
@@ -351,7 +514,8 @@ def preview_connection(token: str, *, fetch: Optional[Callable] = None, resolver
     registered = resolve_server(host, resolver)
     out = {"gateway_url": url, "gateway_host": host, "server": registered or host,
            "server_source": "resolver" if registered else "gateway",
-           "agent_mxid": None, "verified": False, "authenticated": None, "error": None}
+           "verified": False, "authenticated": None, "error": None}
+    out.update({k: None for k in IDENTITY_FIELDS})
     address = vetted_address(host, port, getaddrinfo)
     if address == "":
         raise InvalidToken("invalid_gateway")
@@ -371,11 +535,23 @@ def preview_connection(token: str, *, fetch: Optional[Callable] = None, resolver
         return out
     out["authenticated"] = True
     agents = answer.get("agents") if isinstance(answer, dict) else None
-    ids = [a.get("id") for a in agents if isinstance(a, dict) and isinstance(a.get("id"), str)] \
+    named = [a for a in agents if isinstance(a, dict) and isinstance(a.get("id"), str)] \
         if isinstance(agents, list) else []
-    if registered and len(ids) == 1 and server_of_mxid(ids[0]) == registered:
-        out.update(agent_mxid=ids[0], server_source="identity", verified=True)
+    if registered and len(named) == 1 and server_of_mxid(named[0]["id"]) == registered:
+        out.update(_identity_of(named[0]), server_source="identity", verified=True)
     return out
+
+
+def _identity_of(agent: Mapping[str, object]) -> dict:
+    """The row fields a listing entry carries for its agent: the mxid, and when the gateway
+    sends them, `display_name`, an `mxc://` `avatar_url` and the `owner` mxid; else None."""
+    owner = agent.get("owner")
+    avatar = agent.get("avatar_url")
+    name = agent.get("display_name")
+    return {"agent_mxid": agent["id"],
+            "agent_display_name": name.strip() if isinstance(name, str) and name.strip() else None,
+            "agent_avatar_url": avatar if isinstance(avatar, str) and avatar.startswith(AVATAR_SCHEME) else None,
+            "owner_mxid": owner if isinstance(owner, str) and server_of_mxid(owner) else None}
 
 
 # ── vault ────────────────────────────────────────────────────────────────────
@@ -393,15 +569,28 @@ class _VaultIntercept:
     def get(self, key: str) -> str:
         return self._m.get_vault_key(key)
 
+    def lookup(self, key: str) -> Optional[str]:
+        return self._m.lookup_vault_key(key)
+
     def set(self, key: str, value: str) -> None:
         self._m.set_vault_key(key, value)
 
     def delete(self, key: str) -> None:
         self._m.delete_vault_key(key)
 
+    def writer_lock(self):
+        return self._m.writer_lock()
+
 
 def _vault(vault):
     return _VaultIntercept() if vault is None else vault
+
+
+def _vault_writer(vault):
+    """The vault's own writer transaction when it has one (vault_intercept.writer_lock), else nothing.
+    Taken only while connections.lock is held, never the reverse."""
+    lock = getattr(vault, "writer_lock", None)
+    return lock() if lock is not None else contextlib.nullcontext()
 
 
 def _vault_store(vault, key: str, value: str) -> None:
@@ -416,6 +605,24 @@ def _vault_get(vault, key: str) -> str:
         return str(vault.get(key) or "")
     except Exception:  # noqa: BLE001 - a miss and a failure both read as absent
         return ""
+
+
+def _vault_snapshot(vault, key: str) -> Optional[str]:
+    """The secret under `key`, None when the vault says it holds none; VaultUnreadable when it
+    cannot tell, so a caller never mistakes a failed read for an absent secret."""
+    lookup = getattr(vault, "lookup", None)
+    try:
+        if lookup is not None:
+            value = lookup(key)
+        else:
+            try:
+                value = vault.get(key)
+            except KeyError:
+                return None
+    except Exception as e:  # noqa: BLE001 - the vault's own error types vary; the cause is named
+        raise VaultUnreadable(f"{VaultUnreadable.CODE}: could not read {key} from the secret vault "
+                              f"({type(e).__name__}); nothing changed") from None
+    return str(value) if value else None
 
 
 def _vault_delete(vault, key: str) -> None:
@@ -462,10 +669,16 @@ def _validate_row(row: object, index: int) -> dict:
         raise SchemaError(f"connections.json: row {index} instance {row['instance']!r} is not a slug")
     if row["added_by"] not in ADDED_BY:
         raise SchemaError(f"connections.json: row {index} added_by {row['added_by']!r} unknown")
-    if row.get("agent_mxid") is not None and not isinstance(row["agent_mxid"], str):
-        raise SchemaError(f"connections.json: row {index} agent_mxid is not a string")
+    for key in IDENTITY_FIELDS:
+        if row.get(key) is not None and not isinstance(row[key], str):
+            raise SchemaError(f"connections.json: row {index} {key} is not a string")
+    if row.get("agent_avatar_url") and not row["agent_avatar_url"].startswith(AVATAR_SCHEME):
+        raise SchemaError(f"connections.json: row {index} agent_avatar_url is not an {AVATAR_SCHEME} URI")
     if row["server_source"] not in SERVER_SOURCES:
         raise SchemaError(f"connections.json: row {index} server_source {row['server_source']!r} unknown")
+    # Absent on rows written before the flag existed: those load as enabled.
+    if "disabled" in row and not isinstance(row["disabled"], bool):
+        raise SchemaError(f"connections.json: row {index} field disabled is not a boolean")
     return row
 
 
@@ -555,13 +768,20 @@ def _now() -> str:
 
 def _row(*, server: str, instance: str, gateway_url: str, token_ref: str, primary: bool,
          added_by: str, verified: bool, server_source: str = "gateway",
-         agent_mxid: Optional[str] = None) -> dict:
+         identity: Optional[Mapping[str, object]] = None) -> dict:
     row = {"server": server, "instance": instance, "gateway_url": gateway_url,
            "token_ref": token_ref, "primary": primary, "added_by": added_by, "added_at": _now(),
-           "verified": verified, "server_source": server_source}
-    if agent_mxid:
-        row["agent_mxid"] = agent_mxid
+           "verified": verified, "server_source": server_source, "disabled": False}
+    _learn_fields(row, identity or {})
     return row
+
+
+def _learn_fields(row: dict, seen: Mapping[str, object]) -> None:
+    """Copy the identity fields a preview carries onto the row; an absent or empty one is left as is."""
+    for key in IDENTITY_FIELDS:
+        value = seen.get(key)
+        if isinstance(value, str) and value:
+            row[key] = value
 
 
 def _find(rows: list, instance: str) -> dict:
@@ -598,6 +818,32 @@ def removed_env_refs(workspace: Optional[Path] = None) -> list:
     return _read_record(record_path(workspace))[REMOVED_KEY]
 
 
+def known_servers(workspace: Optional[Path] = None, *, instances=None) -> list:
+    """Every DotSpace the resolver registers (`dotspace.registered_instances`: the configured
+    list, else the built-in default), one entry per server in registry order, joined with the
+    rows: `connected` is whether a row exists for it, `instance` that row's slug or None, and
+    `primary` / `disabled` that row's flags. Nothing is fetched; a server no row names is
+    the picker's offer, a server with a row is already in the directory."""
+    if instances is None:
+        try:
+            import dotspace  # type: ignore
+            instances = dotspace.registered_instances()
+        except Exception:  # noqa: BLE001 - without the resolver there is no registry to offer
+            instances = []
+    by_server = {r["server"]: r for r in list_connections(workspace)}
+    out, seen = [], set()
+    for d in instances:
+        server = str(getattr(d, "server", "") or "").lower()
+        if not server or server in seen:
+            continue
+        seen.add(server)
+        row = by_server.get(server)
+        out.append({"server": server, "connected": row is not None,
+                    "instance": row["instance"] if row else None,
+                    "primary": bool(row and row["primary"]), "disabled": bool(row and row.get("disabled"))})
+    return out
+
+
 def add_connection(token: str, *, added_by: str, expected_server: str, instance: Optional[str] = None,
                    preview: Optional[dict] = None, fetch: Optional[Callable] = None,
                    resolver=None, getaddrinfo=None, workspace: Optional[Path] = None,
@@ -622,10 +868,12 @@ def add_connection(token: str, *, added_by: str, expected_server: str, instance:
     if not isinstance(expected_server, str) or expected_server.strip().lower() != server:
         raise ConnectionMismatch(server, expected_server if isinstance(expected_server, str) else "")
     if seen.get("authenticated") is False:
-        raise TokenRejected("the gateway rejected this token; nothing stored")
+        raise TokenRejected()
     inst = instance if instance is not None else instance_for(server)
     if not INSTANCE_RE.match(inst):
         raise ConnectionsError(f"instance {inst!r} is not a slug of [A-Za-z0-9_-]{{1,32}}")
+    if inst in RESERVED_INSTANCES:
+        raise ConnectionsError(f"instance {inst!r} is a reserved name ({', '.join(RESERVED_INSTANCES)}); pass another")
     ref = token_ref_for(inst)
     vault = _vault(vault)
     stored = False
@@ -646,7 +894,7 @@ def add_connection(token: str, *, added_by: str, expected_server: str, instance:
                        primary=not any(r["primary"] for r in rows), added_by=added_by,
                        verified=bool(seen.get("verified")),
                        server_source=str(seen.get("server_source") or "gateway"),
-                       agent_mxid=seen.get("agent_mxid"))
+                       identity=seen)
             rows.append(row)
             rec[REMOVED_KEY] = [x for x in rec[REMOVED_KEY] if x != ref]
     except Exception:
@@ -676,12 +924,18 @@ def _same_connection(rows: list, seen: Mapping[str, object]) -> Optional[dict]:
 
 
 def _rekey(row: dict, seen: Mapping[str, object]) -> bool:
-    """A verified identity replaces a provisional server in place; the instance slug stays."""
-    if row["server_source"] == "identity" or not seen.get("verified"):
+    """A verified identity replaces a provisional server in place; the instance slug stays. A row
+    already keyed by identity only refreshes its identity fields from a verified preview of the
+    same server AND the same agent (or one it has not learned yet), never its key: another agent
+    of that server is another connection, whatever becomes of its code."""
+    if not seen.get("verified"):
+        return False
+    if row["server_source"] == "identity":
+        if str(seen.get("server") or "") == row["server"] and row.get("agent_mxid") in (None, seen.get("agent_mxid")):
+            _learn_fields(row, seen)
         return False
     row.update(server=str(seen["server"]), server_source="identity", verified=True)
-    if seen.get("agent_mxid"):
-        row["agent_mxid"] = seen["agent_mxid"]
+    _learn_fields(row, seen)
     return True
 
 
@@ -703,13 +957,40 @@ def primary_instance(workspace: Optional[Path] = None) -> Optional[str]:
     return None
 
 
+def legacy_keeps_proactive_room(workspace: Optional[Path] = None) -> bool:
+    """Asked by the legacy bridge right after it takes its lease: whether it may keep the proactive
+    room. Under the record lock, so a `set_primary` either committed first (False here) or runs
+    after and sees this bridge's lease (refused); an unreadable record keeps it (env-only fail-open)."""
+    try:
+        with locked_file(_lock_path(workspace), create_mode=0o600):
+            rows = _read(record_path(workspace))
+    except (SchemaError, OSError):
+        return True
+    return not any(r["primary"] and r["instance"] for r in rows)
+
+
 def set_primary(instance: str, *, workspace: Optional[Path] = None) -> dict:
-    """Make `instance` the primary; proactive and owner-DM defaults follow it at the next launch."""
+    """Make `instance` the primary; proactive and owner-DM defaults follow it at the next launch.
+    Refused before anything is written: a disabled row (`DisabledCannotBePrimary`: it never
+    launches); any named promotion while the legacy bridge runs, whatever the record's primary
+    (`LegacyPrimaryRunning`: it settles the room once, at start, so it may hold it); a lease that
+    proves no holder (`BridgeLeaseIndeterminate`). The returned row carries `relaunch_needed`: true when the
+    new primary's bridge is running, since it keeps its launch environment until `reconnect`."""
     with _transaction(workspace) as rec:
         row = _find(rec["rows"], instance)
+        if row.get("disabled"):
+            raise DisabledCannotBePrimary(instance)
+        promoted = not row["primary"]
+        if promoted and instance:
+            legacy = bridge_pid("", workspace)
+            if legacy:
+                raise LegacyPrimaryRunning(instance, legacy)
+        relaunch = bool(promoted and instance and bridge_pid(instance, workspace))
         for r in rec["rows"]:
             r["primary"] = r is row
-    return dict(row)
+    out = dict(row)
+    out["relaunch_needed"] = relaunch
+    return out
 
 
 def remove_connection(instance: str, *, force: bool = False, workspace: Optional[Path] = None,
@@ -735,6 +1016,31 @@ def remove_connection(instance: str, *, force: bool = False, workspace: Optional
     out = dict(row)
     out["stopped_pid"] = stopped
     return out
+
+
+def disconnect(instance: str, *, workspace: Optional[Path] = None, kill=None) -> dict:
+    """Stop the bridge, then mark the row disabled; the row, its vault key and its launch record
+    stay, so `reconnect` resumes it without a new token. The primary is refused while it is
+    primary (`PrimaryCannotDisconnect`), the legacy unsuffixed row always (`LegacyRowUnmanaged`),
+    and a bridge that keeps its lock past the stop deadline leaves the row enabled
+    (`BridgeStillRunning`): `disabled` is only ever written over a stopped bridge. Disconnecting
+    a disabled row is a no-op."""
+    with _transaction(workspace) as rec:
+        row = _find(rec["rows"], instance)
+        if not instance:
+            raise LegacyRowUnmanaged("disconnect")
+        if row["primary"]:
+            raise PrimaryCannotDisconnect(instance)
+        stopped = stop_bridge(instance, workspace=workspace, kill=kill)
+        row["disabled"] = True
+    out = dict(row)
+    out["stopped_pid"] = stopped
+    return out
+
+
+def _enable(instance: str, workspace: Optional[Path]) -> None:
+    with _transaction(workspace) as rec:
+        _find(rec["rows"], instance)["disabled"] = False
 
 
 def env_token_vars(environ: Mapping[str, str]) -> list:
@@ -823,8 +1129,12 @@ def _sidecar(instance: str, workspace: Optional[Path]) -> dict:
     return _read_json(status_read_path(name, _workspace(workspace)))
 
 
-def derive_state(sidecar: Mapping[str, object], launch: Mapping[str, object]) -> "tuple[str, Optional[str]]":
-    """(state, reason) from the bridge's sidecar and the last launch record."""
+def derive_state(sidecar: Mapping[str, object], launch: Mapping[str, object],
+                 disabled: bool = False) -> "tuple[str, Optional[str]]":
+    """(state, reason) from the bridge's sidecar and the last launch record; a disabled row is
+    `disconnected` with reason `disabled` whatever a stale sidecar still says."""
+    if disabled:
+        return "disconnected", "disabled"
     if launch and launch.get("ok") is False:
         return "failed", str(launch.get("reason") or "launch_failed")
     if not sidecar:
@@ -840,12 +1150,16 @@ def derive_state(sidecar: Mapping[str, object], launch: Mapping[str, object]) ->
 
 
 def status_for(row: Mapping[str, object], workspace: Optional[Path] = None) -> dict:
-    """The row plus `status` (connected, last_ok_ts from gateway-status) and the derived `state`."""
+    """The row plus `status` (connected, last_ok_ts from gateway-status), the derived `state`,
+    and every optional field spelled out (`disabled` false, identity fields None when unknown)."""
     inst = str(row.get("instance") or "")
     sidecar = _sidecar(inst, workspace)
     launch = _read_json(launch_record_path(inst, workspace))
-    state, reason = derive_state(sidecar, launch)
     out = dict(row)
+    out["disabled"] = bool(row.get("disabled"))
+    for key in IDENTITY_FIELDS:
+        out.setdefault(key, None)
+    state, reason = derive_state(sidecar, launch, out["disabled"])
     out["status"] = {"connected": bool(sidecar["connected"]) if "connected" in sidecar else None,
                      "last_ok_ts": sidecar.get("last_ok_ts")}
     out["state"] = state
@@ -858,10 +1172,10 @@ def status_for(row: Mapping[str, object], workspace: Optional[Path] = None) -> d
 
 def launch_plan(environ: Optional[Mapping[str, str]] = None, *,
                 workspace: Optional[Path] = None) -> list:
-    """One entry per bridge the plan launches: every row with an instance (the legacy
-    unsuffixed bridge is the primary launch path's), then any AG2_REMOTE_TOKEN_<INST>
-    still without a row (an import the vault refused) unless its row was removed.
-    An unreadable record raises, so a caller never mistakes it for an empty plan."""
+    """One entry per bridge the plan launches: every enabled row with an instance (the legacy
+    unsuffixed bridge is the primary launch path's; a disabled row stays down), then any
+    AG2_REMOTE_TOKEN_<INST> still without a row (an import the vault refused) unless its row
+    was removed. An unreadable record raises, so a caller never mistakes it for an empty plan."""
     environ = os.environ if environ is None else environ
     record = _read_record(record_path(workspace))
     rows = record["rows"]
@@ -869,7 +1183,7 @@ def launch_plan(environ: Optional[Mapping[str, str]] = None, *,
     seen_inst = {r["instance"] for r in rows}
     seen_ref = {r["token_ref"] for r in rows} | set(record[REMOVED_KEY])
     for r in rows:
-        if not r["instance"]:
+        if not r["instance"] or r.get("disabled"):
             continue
         plan.append({"instance": r["instance"], "token_ref": r["token_ref"],
                      "channel_dir": channel_dir_for(r["instance"], environ), "primary": r["primary"]})
@@ -884,17 +1198,27 @@ def launch_plan(environ: Optional[Mapping[str, str]] = None, *,
 def plan_entry(instance: str, environ: Optional[Mapping[str, str]] = None, *,
                workspace: Optional[Path] = None, env_only: bool = False) -> dict:
     """The plan entry for `instance`; with `env_only`, built from AG2_REMOTE_TOKEN_<INST> alone
-    (the fallback when the record cannot be read), never primary."""
+    (the fallback when the record cannot be read), never primary. A readable record still
+    refuses a row it marks disabled, in either mode."""
     environ = os.environ if environ is None else environ
     if env_only:
-        for inst, var in env_token_vars(environ):
-            if inst == instance:
-                return {"instance": inst, "token_ref": var, "channel_dir": channel_dir_for(inst, environ),
-                        "primary": False}
-        raise UnknownConnection(f"no AG2_REMOTE_TOKEN variable names {instance!r}")
+        try:
+            rows = _read(record_path(workspace))
+        except (SchemaError, OSError):
+            rows = []
+        var = next((v for inst, v in env_token_vars(environ) if inst == instance), "")
+        if any(r.get("disabled") and (r["instance"] == instance or (var and r["token_ref"] == var)) for r in rows):
+            raise ConnectionsError(f"connection {instance!r} is disconnected; reconnect it to launch")
+        if not var:
+            raise UnknownConnection(f"no AG2_REMOTE_TOKEN variable names {instance!r}")
+        return {"instance": instance, "token_ref": var, "channel_dir": channel_dir_for(instance, environ),
+                "primary": False}
     for entry in launch_plan(environ, workspace=workspace):
         if entry["instance"] == instance:
             return entry
+    # The record as read, never list_connections: launch calls this under the record lock.
+    if any(r["instance"] == instance and r.get("disabled") for r in _read(record_path(workspace))):
+        raise ConnectionsError(f"connection {instance!r} is disconnected; reconnect it to launch")
     raise UnknownConnection(f"no connection {instance!r} to launch")
 
 
@@ -938,65 +1262,179 @@ def _record_launch(instance: str, workspace: Optional[Path], **fields) -> dict:
     return record
 
 
-def _spawn(argv: list, env: dict, log_path: Path) -> int:
+# Children this process spawned, kept so their exit is observed and reaped, never guessed from a pid.
+_CHILDREN: dict = {}
+
+
+def _spawn(argv: list, env: dict, log_path: Path) -> "subprocess.Popen":
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with open(log_path, "ab") as log:
         proc = subprocess.Popen(argv, env=env, stdin=subprocess.DEVNULL, stdout=log,
                                 stderr=subprocess.STDOUT, start_new_session=True)
-    return proc.pid
+    return proc
+
+
+def _exited(pid: int) -> bool:
+    """Whether `pid` has ended: our own child by its exit status, any other by the kernel."""
+    child = _CHILDREN.get(pid)
+    if child is not None:
+        if child.poll() is None:
+            return False
+        _CHILDREN.pop(pid, None)
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
+def _bridge_role(instance: str) -> str:
+    """The bridge's own lease role (`_LOCK_ROLE` in remote_gateway_bridge)."""
+    return "gateway-bridge" + (f".{instance}" if instance else "")
+
+
+def _proven_holder(instance: str, workspace: Optional[Path]) -> int:
+    """The pid proven, by the same check the stop path uses, to hold a live lease bound to
+    `instance`'s role and this workspace; 0 when no such holder is proven."""
+    try:
+        holder = workspace_lock.read_lease(_bridge_role(instance), _workspace(workspace))
+        pid = workspace_lock.lease_process(holder) if holder else 0
+    except workspace_lock.LeaseIndeterminate:
+        return 0
+    return pid if pid and workspace_lock.lease_is_live(holder) else 0
+
+
+def _retained_wait(instance: str, workspace: Optional[Path]) -> Optional[float]:
+    """Seconds until a retained lease whose writer has exited goes stale; None for any other lease."""
+    try:
+        holder = workspace_lock.read_lease(_bridge_role(instance), _workspace(workspace))
+        if not holder or not holder.get("retained") or workspace_lock.lease_process(holder):
+            return None
+    except workspace_lock.LeaseIndeterminate:
+        return None
+    return workspace_lock.lease_stale_in(holder)
+
+
+def _await_lease(instance: str, pid: int, workspace: Optional[Path], timeout_s: float) -> "tuple[str, int]":
+    """('held', pid) once `pid` is proven to hold a live lease for `instance`; ('exited', holder)
+    when it ended first, holder the other process proven to hold it or 0; ('timeout', 0)."""
+    deadline = time.monotonic() + timeout_s
+    while True:
+        if _exited(pid):
+            holder = _proven_holder(instance, workspace)
+            return "exited", holder if holder != pid else 0
+        # An exited, unreaped child still proves its lease: held only if it is still running after.
+        if _proven_holder(instance, workspace) == pid and not _exited(pid):
+            return "held", pid
+        if time.monotonic() >= deadline:
+            return "timeout", 0
+        time.sleep(0.05)
+
+
+def _exit_code(child) -> Optional[int]:
+    poll = getattr(child, "poll", None)
+    return poll() if poll is not None else None
 
 
 def launch(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Mapping[str, str]] = None,
            workspace: Optional[Path] = None, vault=None, spawn=None, python: Optional[str] = None,
            env_only: bool = False) -> dict:
     """Start the bridge for one plan entry and leave a launch record; the bridge's own
-    singleton lock turns a duplicate into a clean stand-down."""
+    singleton lock turns a duplicate into a clean stand-down. The record lock is held from the
+    plan read until the child is proven to hold its lease or has exited (`lease` in the record),
+    so a `disconnect` or `remove` always finds the bridge it must stop. A child that exits is a
+    success only when another process is proven to hold the lease (`holder_pid`: it stood down to
+    a live duplicate); one that stood down to a retained lease whose writer is gone is spawned
+    again once that lease goes stale, if that fits in `LEASE_TIMEOUT_S` (else `retained_lease`);
+    any other exit fails (`exited`, with the child's rc). A child still without a lease by the
+    deadline is killed when it is ours and the launch fails (`lease_timeout`)."""
     environ = os.environ if environ is None else environ
-    entry = plan_entry(instance, environ, workspace=workspace, env_only=env_only)
-    try:
-        env = launch_env(entry, environ, vault=vault)
-    except NoToken as e:
-        _record_launch(instance, workspace, ok=False, reason="no_token")
-        raise LaunchFailed(str(e)) from None
-    argv = [python or sys.executable, str(Path(repo) / "src" / "remote-gateway-bridge.py")]
-    log_path = Path(logs_dir) / f"remote-gateway-bridge.{instance}.log"
-    try:
-        pid = (spawn or _spawn)(argv, env, log_path)
-    except Exception as e:  # noqa: BLE001 - the reason is recorded for status_for, then re-raised by name
-        _record_launch(instance, workspace, ok=False, reason="launch_failed")
-        raise LaunchFailed(f"could not start the bridge for {instance} ({type(e).__name__})") from None
-    return _record_launch(instance, workspace, ok=True, pid=pid)
+    # Holding the lock to the lease is safe: the bridge's startup never reads this record.
+    with locked_file(_lock_path(workspace), create_mode=0o600):
+        entry = plan_entry(instance, environ, workspace=workspace, env_only=env_only)
+        try:
+            env = launch_env(entry, environ, vault=vault)
+        except NoToken as e:
+            _record_launch(instance, workspace, ok=False, reason="no_token")
+            raise LaunchFailed(str(e)) from None
+        argv = [python or sys.executable, str(Path(repo) / "src" / "remote-gateway-bridge.py")]
+        log_path = Path(logs_dir) / f"remote-gateway-bridge.{instance}.log"
+        deadline = time.monotonic() + LEASE_TIMEOUT_S
+        for attempt in (1, 2):
+            try:
+                child = (spawn or _spawn)(argv, env, log_path)
+            except Exception as e:  # noqa: BLE001 - the reason is recorded for status_for, then re-raised by name
+                _record_launch(instance, workspace, ok=False, reason="launch_failed")
+                raise LaunchFailed(f"could not start the bridge for {instance} ({type(e).__name__})") from None
+            pid = int(getattr(child, "pid", child))
+            if hasattr(child, "poll"):
+                _CHILDREN[pid] = child
+            if env.get("SUTANDO_BRIDGE_LOCK", "1") == "0":
+                return _record_launch(instance, workspace, ok=True, pid=pid, lease="disabled")
+            lease, holder = _await_lease(instance, pid, workspace, max(0.0, deadline - time.monotonic()))
+            if lease == "held":
+                return _record_launch(instance, workspace, ok=True, pid=pid, lease=lease)
+            if lease == "timeout":
+                mine = _CHILDREN.pop(pid, None)
+                if mine is not None:
+                    mine.kill()
+                    mine.wait()
+                _record_launch(instance, workspace, ok=False, reason="lease_timeout", pid=pid)
+                raise LaunchFailed(f"the bridge for {instance} (pid {pid}) took no lease within {LEASE_TIMEOUT_S}s"
+                                   + ("; it was stopped" if mine is not None else ""))
+            if holder:
+                return _record_launch(instance, workspace, ok=True, pid=pid, lease=lease, holder_pid=holder)
+            rc = _exit_code(child)
+            wait = _retained_wait(instance, workspace) if rc in (None, 75) else None
+            if wait is not None and attempt == 1 and time.monotonic() + wait + 0.1 < deadline:
+                time.sleep(wait + 0.1)
+                continue
+            break
+        reason = "retained_lease" if wait is not None else "exited"
+        _record_launch(instance, workspace, ok=False, reason=reason, pid=pid, rc=rc)
+        detail = (f"it stood down to a retained lease that goes stale in {wait:.0f}s; retry then" if wait is not None
+                  else "no other process is proven to hold its lease")
+        raise LaunchFailed(f"the bridge for {instance} (pid {pid}) exited (rc {rc}): {detail}")
 
 
 def bridge_pid(instance: str, workspace: Optional[Path] = None) -> int:
-    """The pid in the bridge's held singleton lock, 0 when no process holds it."""
-    path = _workspace(workspace) / "state" / "locks" / f"gateway-bridge.{instance}.lock"
+    """The pid of the process proven to hold `instance`'s bridge lease (workspace_lock's own record
+    and identity check), 0 when none runs; `BridgeLeaseIndeterminate` when the lease proves neither."""
     try:
-        fd = os.open(str(path), os.O_RDWR)
-    except OSError:
-        return 0
-    try:
-        if try_lock_fd(fd):
-            unlock_fd(fd)
-            return 0
-        return int((os.read(fd, 32).decode() or "0").strip() or 0)
-    except (OSError, ValueError):
-        return 0
-    finally:
-        os.close(fd)
+        holder = workspace_lock.read_lease(_bridge_role(instance), _workspace(workspace))
+        return workspace_lock.lease_process(holder) if holder else 0
+    except workspace_lock.LeaseIndeterminate as e:
+        raise BridgeLeaseIndeterminate(instance, str(e)) from None
 
 
 def stop_bridge(instance: str, *, workspace: Optional[Path] = None, kill=None,
-                timeout_s: float = STOP_TIMEOUT_S) -> int:
-    """SIGTERM the bridge holding `instance`'s lock and wait for the lock to free; the pid, or 0."""
+                timeout_s: Optional[float] = None) -> int:
+    """SIGTERM the process proven to hold `instance`'s lease and wait until no process holds it;
+    the pid, or 0 when none held it. A holder still running at the deadline, or a signal the process
+    refuses, is `BridgeStillRunning`; a lease that proves no holder is `BridgeLeaseIndeterminate`
+    and nothing is signalled. Either way the caller writes nothing over a bridge that may be up."""
+    timeout_s = STOP_TIMEOUT_S if timeout_s is None else timeout_s
     pid = bridge_pid(instance, workspace)
     if not pid:
         return 0
-    (kill or os.kill)(pid, signal.SIGTERM)
+    try:
+        (kill or os.kill)(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass  # gone between the check and the signal
+    except OSError as e:
+        raise BridgeStillRunning(instance, pid, f"signal refused: {type(e).__name__}") from None
     deadline = time.monotonic() + timeout_s
-    while bridge_pid(instance, workspace) == pid and time.monotonic() < deadline:
+    while True:
+        _exited(pid)  # reaps our own child, so it stops reading as alive
+        holder = bridge_pid(instance, workspace)
+        if not holder:
+            return pid
+        if time.monotonic() >= deadline:
+            raise BridgeStillRunning(instance, holder, "lease still held after the stop deadline")
         time.sleep(0.1)
-    return pid
 
 
 def reconnect(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Mapping[str, str]] = None,
@@ -1008,6 +1446,8 @@ def reconnect(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Ma
     environ = os.environ if environ is None else environ
     rows = {r["instance"]: r for r in list_connections(workspace, vault=vault)}
     if instance in rows:
+        if rows[instance].get("disabled"):
+            _enable(instance, workspace)
         ref = rows[instance]["token_ref"]
         token = (environ.get(ref) or "").strip() or _vault_get(_vault(vault), ref)
         if token:
@@ -1020,3 +1460,172 @@ def reconnect(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Ma
                     vault=vault, spawn=spawn, python=python)
     record["stopped_pid"] = stopped
     return record
+
+
+def update_token(instance: str, token: str, *, repo: Path, logs_dir: Path,
+                 environ: Optional[Mapping[str, str]] = None, workspace: Optional[Path] = None,
+                 vault=None, spawn=None, kill=None, python: Optional[str] = None, fetch=None,
+                 resolver=None, getaddrinfo=None) -> dict:
+    """Replace the secret under `instance`'s token_ref with a new code for the same connection
+    (the homeserver's Get new token or Revoke, an agent moved away and back), then relaunch the
+    bridge the way `reconnect` does. The row keeps its instance, primary flag and added_at;
+    `gateway_url` and the identity fields follow the preview (a row without an agent identity
+    learns one, see `_rekey`) and `disabled` is cleared.
+
+    Refused with nothing touched, in this order: the legacy unsuffixed row (`LegacyRowUnmanaged`:
+    its token is the environment's); a row whose token_ref is set in `environ`
+    (`TokenSourceShadowed`: the bridge reads that variable before the vault, so the new secret
+    would never be used); a code the gateway rejected (`TokenRejected`); a code whose preview is
+    not this connection's, or whose verified server is already another row's
+    (`TokenServerMismatch`); a row naming an agent whose preview did not confirm that same agent:
+    unconfirmed (`TokenUnverified`) or another agent (`TokenAgentMismatch`); a bridge that will
+    not stop (`BridgeStillRunning`); a vault that cannot say whether it holds the current secret
+    (`VaultUnreadable`). The row, its token_ref and the previous secret are read inside the record
+    transaction, right before the stop and the vault write, so a concurrent update or a remove and
+    re-add is never undone by a stale snapshot. Once the vault write has begun, a failure is
+    reconciled under that same hold of the record lock by reading the key back (`_reconcile_vault`): the previous
+    secret is put back only while the key holds exactly the new code, all inside the vault's own writer
+    transaction (`_vault_writer`), so no other vault writer lands between the compare and the restore; read back as the previous secret, the stopped bridge is relaunched on it and the
+    error says whether that worked; read back as the new code, `TokenRestoreFailed`; anything else,
+    or a read that fails, `TokenStateUnknown`. Neither of those relaunches.
+    Returns the row with `stopped_pid` and the launch record under `launch`; a launch that fails
+    is that record (and the row's state), not an exception."""
+    environ = os.environ if environ is None else environ
+    current = _find(list_connections(workspace, vault=vault), instance)  # an unknown instance probes nothing
+    if not instance:
+        raise LegacyRowUnmanaged("update_token")
+    if (environ.get(current["token_ref"]) or "").strip():
+        raise TokenSourceShadowed(instance, current["token_ref"])
+    seen = preview_connection(token, fetch=fetch, resolver=resolver, getaddrinfo=getaddrinfo)
+    if seen.get("authenticated") is False:
+        raise TokenRejected()
+    vault = _vault(vault)
+    new = token.strip()
+    ref, previous, mutating, stopped, failure, found, restore = "", None, False, 0, None, "", ""
+    path = record_path(workspace)
+    # Snapshot, effects, publication and any reconcile share one hold of the record lock.
+    with locked_file(_lock_path(workspace), create_mode=0o600):
+        rec = _read_record(path)
+        try:
+            row = _find(rec["rows"], instance)
+            ref = row["token_ref"]
+            if (environ.get(ref) or "").strip():
+                raise TokenSourceShadowed(instance, ref)
+            candidate = _updated_row(rec, row, seen, instance)
+            _vault_snapshot(vault, ref)  # an unreadable vault refuses before the stop
+            stopped = stop_bridge(instance, workspace=workspace, kill=kill)
+            # No other vault writer interleaves from the snapshot through the restore.
+            with _vault_writer(vault):
+                try:
+                    previous = _vault_snapshot(vault, ref)
+                    mutating = True
+                    _vault_store(vault, ref, new)
+                    row.clear()
+                    row.update(candidate)
+                    _write(path, rec)
+                except Exception:
+                    if mutating:
+                        found, restore = _reconcile_vault(vault, ref, previous, new)
+                    raise
+        except Exception as e:  # noqa: BLE001 - settled below, after the locks are released
+            failure = e
+    if failure is not None:
+        e = failure
+        if mutating:
+            cause = f"{type(e).__name__}: {e}"
+            if found == "new":
+                raise TokenRestoreFailed(
+                    f"{TokenRestoreFailed.CODE}: the update of {instance} failed after the vault write began "
+                    f"({cause}) and restoring the previous secret failed ({restore}); read back, {ref} holds the NEW code "
+                    "while the row is unchanged" + ("; the bridge was left stopped" if stopped else "")) from None
+            if found != "previous":
+                raise TokenStateUnknown(
+                    f"{TokenStateUnknown.CODE}: the update of {instance} failed after the vault write began ({cause}) "
+                    f"and reading {ref} back {found}, so it is not known which secret it holds; the row is unchanged "
+                    "and the bridge was not relaunched; run update-token again with the code you want") from None
+        if not stopped:
+            raise e
+        try:
+            relaunched = launch(instance, repo=repo, logs_dir=logs_dir, environ=environ, workspace=workspace,
+                                vault=vault, spawn=spawn, python=python)
+            note = f"the bridge was relaunched on the unchanged code (pid {relaunched['pid']})"
+        except Exception as again:  # noqa: BLE001 - reported in the error below
+            note = f"the bridge stays stopped: relaunching it failed ({type(again).__name__})"
+        if isinstance(e, ConnectionsError):
+            raise _with_note(e, note) from None
+        raise ConnectionsError(f"could not update the token of {instance} ({type(e).__name__}); {note}") from e
+    out = dict(row)
+    out["stopped_pid"] = stopped
+    try:
+        out["launch"] = launch(instance, repo=repo, logs_dir=logs_dir, environ=environ, workspace=workspace,
+                               vault=vault, spawn=spawn, python=python)
+    except LaunchFailed:
+        out["launch"] = _read_json(launch_record_path(instance, workspace))
+    return out
+
+
+def _digest(value: Optional[str]) -> Optional[str]:
+    return None if value is None else hashlib.sha256(value.encode()).hexdigest()
+
+
+def _reconcile_vault(vault, ref: str, previous: Optional[str], new: str) -> "tuple[str, str]":
+    """After a failed write under `ref`, a compare-and-swap on the stored value: the previous secret
+    goes back only while a read shows exactly the new code this update wrote. ('previous', ...) once a
+    read shows the previous secret, ('new', ...) when the restore failed, else why it could not tell
+    (a read that failed, or another writer's value, which is left as it is); the second item names the
+    restore's own error. Values are compared by digest and never logged."""
+    def read_back() -> "tuple[bool, Optional[str]]":
+        try:
+            return True, _digest(_vault_snapshot(vault, ref))
+        except VaultUnreadable:
+            return False, None
+
+    want, fresh = _digest(previous), _digest(new)
+    ok, got = read_back()
+    if not ok:
+        return "failed", "none"
+    if got == want:
+        return "previous", "none"
+    if got != fresh:
+        return "showed another writer's value, left in place", "none"
+    restore = "none"
+    try:
+        vault.set(ref, previous) if previous is not None else vault.delete(ref)
+    except Exception as e:  # noqa: BLE001 - the read-back below decides what the vault holds
+        restore = type(e).__name__
+    ok, got = read_back()
+    if not ok:
+        return "failed after the restore", restore
+    if got == want:
+        return "previous", restore
+    return ("new" if got == fresh else "showed another writer's value, left in place"), restore
+
+
+def _with_note(error: ConnectionsError, note: str) -> ConnectionsError:
+    """`error` with `note` appended to its message, same class and attributes."""
+    error.args = (f"{error.args[0] if error.args else error}; {note}",) + tuple(error.args[1:])
+    return error
+
+
+def _updated_row(rec: dict, row: dict, seen: Mapping[str, object], instance: str) -> dict:
+    """The row `update_token` would write for `seen`, checked as `add_connection` checks a new row
+    (same connection, same agent, unique server) and against the record schema; a refusal here
+    precedes every external effect."""
+    if _same_connection([row], seen) is None:
+        raise TokenServerMismatch(instance, f"the code is for server {seen['server']!r}, not {row['server']!r}")
+    mine, theirs = row.get("agent_mxid"), seen.get("agent_mxid")
+    if mine and not theirs:
+        raise TokenUnverified(instance, f"the gateway did not confirm agent {mine} for this code"
+                              + (f" ({seen['error']})" if seen.get("error") else ""))
+    if mine and theirs != mine:
+        raise TokenAgentMismatch(instance, f"the code is for agent {theirs}, not {mine}")
+    candidate = dict(row)
+    candidate["gateway_url"] = str(seen["gateway_url"])
+    _rekey(candidate, seen)
+    candidate["disabled"] = False
+    taken = [r["instance"] for r in rec["rows"] if r is not row and r["server"] == candidate["server"]]
+    if taken:
+        raise TokenServerMismatch(instance, f"the code's server {candidate['server']!r} is connection {taken[0]!r}")
+    trial = [candidate if r is row else r for r in rec["rows"]]
+    _validate({"schema_version": SCHEMA_VERSION, "connections": trial, REMOVED_KEY: rec[REMOVED_KEY]})
+    return candidate

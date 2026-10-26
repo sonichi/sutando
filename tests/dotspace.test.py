@@ -104,6 +104,17 @@ class TestConfig(unittest.TestCase):
                               ("https://chat.s.space/x", "s.space")]:
             self.assertEqual(ds.dotspace_for(query, fetch=ds.NO_FETCH).server, server, query)
 
+    def test_registered_instances_enumerates_the_registry_once_each_without_fetching(self):
+        defaults = ds.registered_instances()
+        self.assertEqual([d.server for d in defaults], [e["server"] for e in ds.DEFAULT_INSTANCES])
+        self.assertTrue(all(d.is_dotspace and d.source == "config" for d in defaults))
+        cfg = {"instances": [{"server": "x.space", "gateway_host": "gw.x.space"},
+                             {"server": "X.space"}, {"server": ""}, {"server": "y.space"}, "junk"]}
+        listed = ds.registered_instances(cfg)
+        self.assertEqual([(d.server, d.gateway_host) for d in listed], [("x.space", "gw.x.space"), ("y.space", "")],
+                         "a configured list replaces the default, one entry per server, malformed ones dropped")
+        self.assertEqual(ds.registered_instances({"instances": []}), [])
+
     def test_configured_section_replaces_the_default(self):
         cfg = {"instances": [{"server": "x.space", "gateway_host": "gw.x.space",
                               "cloud_origin": "https://c.x.space", "prefer_ipv4": False}]}

@@ -34,11 +34,13 @@ messages where we want to prevent accidental secret exposure in task files but
 must not write to the owner's Keychain.
 """
 
+import contextlib
 import json
 import os
 import re
 import subprocess
 import sys
+import threading
 from datetime import datetime, timezone
 from typing import NamedTuple
 
@@ -151,7 +153,48 @@ class InterceptResult(NamedTuple):
     failed: list[str]  # keys that could NOT be stored (secret still redacted)
 
 
+_WRITER = threading.local()
+
+
+def writer_lock_path() -> str:
+    """The vault's writer lock, beside the manifest it guards."""
+    return os.path.join(os.path.dirname(_manifest_path()), "writer.lock")
+
+
+@contextlib.contextmanager
+def writer_lock():
+    """The one writer transaction every vault write runs under (set, delete, chat interception, the
+    CLI): a cross-process lock, re-entrant within a thread, so a caller can hold it across a read,
+    a write and a compare. Lock order: a caller holding connections.lock may take this; code holding
+    this never takes connections.lock. A lock that cannot be taken is a RuntimeError, so the write fails."""
+    if getattr(_WRITER, "depth", 0):
+        _WRITER.depth += 1
+        try:
+            yield
+        finally:
+            _WRITER.depth -= 1
+        return
+    from pathlib import Path
+    from file_lock import locked_file
+    try:
+        held = locked_file(Path(writer_lock_path()), create_mode=0o600)
+        held.__enter__()
+    except OSError as e:
+        raise RuntimeError(f"vault: writer lock unavailable ({type(e).__name__})") from None
+    _WRITER.depth = 1
+    try:
+        yield
+    finally:
+        _WRITER.depth = 0
+        held.__exit__(None, None, None)
+
+
 def _store_in_keychain(key: str, value: str) -> None:
+    with writer_lock():
+        _store_in_keychain_locked(key, value)
+
+
+def _store_in_keychain_locked(key: str, value: str) -> None:
     # Note: value is passed as an argv element — briefly visible in `ps` to
     # the same user. Acceptable on a single-user Mac; not a multi-user safe API.
     result = subprocess.run(
@@ -215,6 +258,25 @@ def get_vault_key(key: str) -> str:
     return result.stdout.decode().strip()
 
 
+def lookup_vault_key(key: str) -> str | None:
+    """The secret under `key`, or None only when Keychain reports the item absent. A read that
+    times out or fails any other way raises RuntimeError: a caller replacing a secret must not
+    take an unreadable one for an absent one."""
+    try:
+        result = subprocess.run(
+            ["security", "find-generic-password", "-a", _ACCOUNT, "-s", key, "-w"],
+            capture_output=True, timeout=_KEYCHAIN_READ_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"vault: key '{key}' not read — security gave no answer "
+                           f"within {_KEYCHAIN_READ_TIMEOUT_S}s") from None
+    if result.returncode == _ERRSEC_ITEM_NOT_FOUND:
+        return None
+    if result.returncode != 0:
+        raise RuntimeError(f"vault: key '{key}' not read (rc={result.returncode})")
+    return result.stdout.decode().strip()
+
+
 # Keys double as env-var names via the `env` verb / get_vault_key consumers, so
 # the public setter holds them to env-var-safe naming (the chat-interception
 # path has its own, looser matching + FP guards above).
@@ -256,6 +318,11 @@ _ERRSEC_ITEM_NOT_FOUND = 44  # errSecItemNotFound
 
 
 def _delete_from_keychain(key: str) -> None:
+    with writer_lock():
+        _delete_from_keychain_locked(key)
+
+
+def _delete_from_keychain_locked(key: str) -> None:
     # rc 44 is errSecItemNotFound — already gone, so the manifest drop proceeds.
     # Any other non-zero may leave the item LIVE; dropping it then strands a secret.
     result = subprocess.run(

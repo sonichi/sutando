@@ -10,7 +10,10 @@ carry a wildcard CORS grant. With the bearer: GET lists rows joined with status
 (server_source included, never a secret); POST previews, then creates on
 confirm (201 / 200 existing / 409 mismatch, token_rejected, vault_key_in_use /
 400 / 503 vault); DELETE <instance> is 204 or 409 primary; POST
-<instance>/primary is 200; POST <instance>/reconnect is 202.
+<instance>/primary is 200; POST <instance>/disconnect is 200 or 409
+primary_cannot_disconnect; POST <instance>/reconnect is 202; POST <instance>/token
+is 200 or 409 token_server_mismatch / token_agent_mismatch / token_rejected; GET
+known-servers is 200 and is never read as an instance.
 
 Run: python3 tests/agent-api-connections.test.py
 """
@@ -32,7 +35,7 @@ from pathlib import Path
 # channel env file can be imported into the temp record by an empty list.
 _WS = tempfile.mkdtemp(prefix="agent-api-connections-")
 isolate_os_environ(SUTANDO_TEST_MODE="1", SUTANDO_WORKSPACE=_WS, SUTANDO_TELEMETRY="0",
-                   SUTANDO_SUPPRESS_CCD_FALLBACK_BANNER="1")
+                   SUTANDO_SUPPRESS_CCD_FALLBACK_BANNER="1", SUTANDO_BRIDGE_LOCK="0")  # the spawn fake takes no lease
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
@@ -89,9 +92,13 @@ def fetch(url, token, address=None):
     return {"agents": [{"id": i} for i in GATEWAY.get(url, [])]}
 
 
+# Above any pid_max: the spawn fake's pid never runs, so launch sees it exit at once.
+DEAD_PID = 4_194_404
+
+
 def spawn(argv, env, log_path):
     SPAWNED.append(env["GATEWAY_INSTANCE"])
-    return 99
+    return DEAD_PID
 
 
 # The route calls connections_http with the module defaults; bind the fakes there.
@@ -164,7 +171,10 @@ for method, path, body in (("GET", "/api/v1/connections", None),
                            ("POST", "/api/v1/connections", {"token": TOKEN_A, "confirm": True, "expected_server": "alpha-fixture.net"}),
                            ("DELETE", "/api/v1/connections/x?force=1", None),
                            ("POST", "/api/v1/connections/x/primary", {}),
-                           ("POST", "/api/v1/connections/x/reconnect", {})):
+                           ("GET", "/api/v1/connections/known-servers", None),
+                           ("POST", "/api/v1/connections/x/disconnect", {}),
+                           ("POST", "/api/v1/connections/x/reconnect", {}),
+                           ("POST", "/api/v1/connections/x/token", {"token": TOKEN_A})):
     s, b, h = req(method, path, body, auth=False)
     check(f"{method} {path} without a bearer is 401", s == 401, f"{s} {b}")
     check(f"{method} {path} refusal carries no wildcard CORS grant", "Access-Control-Allow-Origin" not in h, h)
@@ -275,6 +285,13 @@ for inst in (["x"], 5):
     s, b, _ = req("POST", "/api/v1/connections", {"token": TOKEN_B, "confirm": True, "expected_server": "beta-fixture.net",
                                                   "instance": inst})
     check(f"instance {inst!r} is 400, not a crash", s == 400 and "error" in (b or {}), f"{s} {b}")
+for inst in C.RESERVED_INSTANCES:
+    s, b, _ = req("POST", "/api/v1/connections", {"token": "https://gw.unregistered-fixture.net|u", "confirm": True,
+                                                  "expected_server": "gw.unregistered-fixture.net", "instance": inst})
+    check(f"the fixed route name {inst!r} is refused as an instance (400 reserved)",
+          s == 400 and "reserved" in (b or {}).get("error", ""), f"{s} {b}")
+s, b, _ = req("GET", "/api/v1/connections")
+check("no reserved-name row was written", [r["instance"] for r in b["connections"]] == ["alpha-fixture-net", "beta-fixture-net"], b)
 
 print("== list with status ==")
 (WS / "state" / "gateway-status.alpha-fixture-net.json").write_text(json.dumps({"connected": True, "last_ok_ts": 7}))
@@ -297,13 +314,112 @@ check("unknown sub-route is 404", s == 404, f"{s} {b}")
 s, b, _ = req("POST", "/api/v1/connections", b"{not json")
 check("invalid JSON is 400", s == 400, f"{s} {b}")
 
+print("== known servers, disconnect, reconnect ==")
+dotspace.registered_instances = lambda: [dotspace.DotSpace(server="alpha-fixture.net"),
+                                         dotspace.DotSpace(server="gamma-fixture.net")]
+s, b, _ = req("GET", "/api/v1/connections/known-servers")
+check("known-servers is 200 with the registry joined to the rows", s == 200 and b == {"servers": [
+    {"server": "alpha-fixture.net", "connected": True, "instance": "alpha-fixture-net", "primary": True, "disabled": False},
+    {"server": "gamma-fixture.net", "connected": False, "instance": None, "primary": False, "disabled": False}]}, f"{s} {b}")
+check("known-servers leaks no secret or vault key", no_secret(b) and "token_ref" not in json.dumps(b))
+s, b, _ = req("POST", "/api/v1/connections/known-servers", {})
+check("POST known-servers is 405, never a slug lookup", s == 405, f"{s} {b}")
+s, b, _ = req("DELETE", "/api/v1/connections/known-servers")
+check("DELETE known-servers is 405, never a removal", s == 405, f"{s} {b}")
+s, b, _ = req("POST", "/api/v1/connections/alpha-fixture-net/disconnect", {})
+check("disconnecting the primary is 409 primary_cannot_disconnect", (s, b) == (409, {"error": "primary_cannot_disconnect"}), f"{s} {b}")
+s, b, _ = req("POST", "/api/v1/connections/beta-fixture-net/disconnect", {})
+check("disconnect is 200 with the disabled row", s == 200 and (b["connection"]["disabled"], b["connection"]["state"],
+      b["connection"]["reason"]) == (True, "disconnected", "disabled"), f"{s} {b}")
+check("disconnect leaks no secret", no_secret(b))
+check("the token stays in the vault", "AG2_REMOTE_TOKEN_BETA_FIXTURE_NET" in FakeVault.store)
+s, b, _ = req("GET", "/api/v1/connections")
+check("the list shows the flag and the state", [(r["instance"], r["disabled"], r["state"]) for r in b["connections"]]
+      == [("alpha-fixture-net", False, "connected"), ("beta-fixture-net", True, "disconnected")], b)
+check("every row spells out the identity fields", all(k in r for r in b["connections"] for k in C.IDENTITY_FIELDS))
+s, b, _ = req("POST", "/api/v1/connections/beta-fixture-net/disconnect", {})
+check("disconnecting twice is still 200", s == 200 and b["connection"]["disabled"] is True, f"{s} {b}")
+s, b, _ = req("POST", "/api/v1/connections/beta-fixture-net/primary", {})
+check("a disabled row made primary is 409 disabled_cannot_be_primary", (s, b) == (409, {"error": "disabled_cannot_be_primary"}), f"{s} {b}")
+s, b, _ = req("GET", "/api/v1/connections")
+check("the primary did not move", [r["primary"] for r in b["connections"]] == [True, False], b)
+# A production-writer lease the route's kill fake cannot clear: the stop deadline passes.
+from _helpers import bridge_lease  # noqa: E402
+_holder = bridge_lease.start(WS, "alpha-fixture-net")
+C.STOP_TIMEOUT_S, _saved_timeout = 0.3, C.STOP_TIMEOUT_S
+s, b, _ = req("DELETE", "/api/v1/connections/alpha-fixture-net?force=1")
+check("removing a row whose bridge will not stop is 409 bridge_still_running",
+      (s, b) == (409, {"error": "bridge_still_running"}), f"{s} {b}")
+C.STOP_TIMEOUT_S = _saved_timeout
+bridge_lease.stop(_holder)
+s, b, _ = req("GET", "/api/v1/connections")
+check("the row and its key stayed", [r["instance"] for r in b["connections"]] == ["alpha-fixture-net", "beta-fixture-net"]
+      and "AG2_REMOTE_TOKEN_ALPHA_FIXTURE_NET" in FakeVault.store, b)
+s, b, _ = req("POST", "/api/v1/connections/nope/disconnect", {})
+check("disconnecting an unknown instance is 404", s == 404, f"{s} {b}")
+s, b, _ = req("POST", "/api/v1/connections/beta-fixture-net/reconnect", {})
+check("reconnect is 202 and re-enables", s == 202 and b["launch"]["ok"] is True and SPAWNED == ["beta-fixture-net"], f"{s} {b} {SPAWNED}")
+s, b, _ = req("GET", "/api/v1/connections")
+check("the flag is cleared", [r["disabled"] for r in b["connections"]] == [False, False], b)
+SPAWNED.clear()
+
+print("== update token ==")
+s, b, _ = req("POST", "/api/v1/connections/beta-fixture-net/disconnect", {})
+s, b, _ = req("POST", "/api/v1/connections/beta-fixture-net/token", {})
+check("a missing token is 400", s == 400 and (b or {}).get("error") == "missing required field: token", f"{s} {b}")
+s, b, _ = req("POST", "/api/v1/connections/beta-fixture-net/token", {"token": TOKEN_A})
+check("a code for another server is 409 token_server_mismatch", (s, b) == (409, {"error": "token_server_mismatch"}), f"{s} {b}")
+GATEWAY["https://relay.beta-fixture.net"] = ["@other:beta-fixture.net"]
+s, b, _ = req("POST", "/api/v1/connections/beta-fixture-net/token", {"token": "https://relay.beta-fixture.net|secret-beta-rotated"})
+check("a code for another agent is 409 token_agent_mismatch", (s, b) == (409, {"error": "token_agent_mismatch"}), f"{s} {b}")
+GATEWAY["https://relay.beta-fixture.net"] = []
+s, b, _ = req("POST", "/api/v1/connections/beta-fixture-net/token", {"token": "https://relay.beta-fixture.net|secret-beta-rotated"})
+check("a code whose gateway names no agent for a row that names one is 409 token_unverified",
+      (s, b) == (409, {"error": "token_unverified"}), f"{s} {b}")
+GATEWAY["https://relay.beta-fixture.net"] = ["@sutando:beta-fixture.net"]
+os.environ["AG2_REMOTE_TOKEN_BETA_FIXTURE_NET"] = TOKEN_B
+s, b, _ = req("POST", "/api/v1/connections/beta-fixture-net/token", {"token": "https://relay.beta-fixture.net|secret-beta-rotated"})
+del os.environ["AG2_REMOTE_TOKEN_BETA_FIXTURE_NET"]
+check("a token_ref set in the environment is 409 token_source_shadowed", (s, b) == (409, {"error": "token_source_shadowed"}), f"{s} {b}")
+check("a refused code changed nothing", FakeVault.store["AG2_REMOTE_TOKEN_BETA_FIXTURE_NET"] == TOKEN_B and SPAWNED == [], SPAWNED)
+s, b, _ = req("GET", "/api/v1/connections")
+check("the refused row is still disabled", [r["disabled"] for r in b["connections"]] == [False, True], b)
+
+
+def _unknown(*a, **k):
+    raise C.TokenStateUnknown("token_state_unknown: the update of dev failed after the vault write began (OSError: disk full) and reading AG2_REMOTE_TOKEN_DEV back failed, so it is not known which secret it holds")
+
+
+_saved_update, api._connections.update_token = api._connections.update_token, _unknown
+s, b, _ = req("POST", "/api/v1/connections/beta-fixture-net/token", {"token": "https://relay.beta-fixture.net|secret-beta-rotated"})
+api._connections.update_token = _saved_update
+check("a vault that cannot be read back is 409 token_state_unknown, no secret",
+      (s, b) == (409, {"error": "token_state_unknown"}), f"{s} {b}")
+s, b, _ = req("POST", "/api/v1/connections/beta-fixture-net/token", {"token": "https://relay.beta-fixture.net|secret-beta-rotated"})
+check("the same connection's new code is 200 with the row", s == 200 and (b["connection"]["instance"], b["connection"]["token_ref"],
+      b["connection"]["disabled"], b["connection"]["state"]) == ("beta-fixture-net", "AG2_REMOTE_TOKEN_BETA_FIXTURE_NET", False, "pending"), f"{s} {b}")
+check("update leaks no secret", no_secret(b) and "secret-beta-rotated" not in json.dumps(b))
+check("the secret was replaced under the same key", FakeVault.store["AG2_REMOTE_TOKEN_BETA_FIXTURE_NET"] == "https://relay.beta-fixture.net|secret-beta-rotated")
+check("the bridge was relaunched once", SPAWNED == ["beta-fixture-net"], SPAWNED)
+s, b, _ = req("POST", "/api/v1/connections/beta-fixture-net/token", {"token": "https://rejecting-fixture.net|bad"})
+check("a code the gateway rejects is 409 token_rejected", (s, b) == (409, {"error": "token_rejected"}), f"{s} {b}")
+s, b, _ = req("POST", "/api/v1/connections/nope/token", {"token": TOKEN_B})
+check("updating an unknown instance is 404", s == 404, f"{s} {b}")
+s, b, _ = req("POST", "/api/v1/connections/token", {"token": TOKEN_B})
+check("/connections/token alone is 404, not an instance route", s == 404, f"{s} {b}")
+s, b, _ = req("GET", "/api/v1/connections/beta-fixture-net/token")
+check("GET <instance>/token is 404", s == 404, f"{s} {b}")
+s, b, _ = req("GET", "/api/v1/connections/known-servers")
+check("known-servers still answers beside the token route", s == 200 and "servers" in (b or {}), f"{s} {b}")
+SPAWNED.clear()
+
 print("== primary, reconnect, delete ==")
 s, b, _ = req("POST", "/api/v1/connections/beta-fixture-net/primary", {})
 check("set primary is 200", s == 200 and b["connection"]["primary"] is True, f"{s} {b}")
 s, b, _ = req("GET", "/api/v1/connections")
 check("exactly one primary after the move", [r["primary"] for r in b["connections"]] == [False, True])
 s, b, _ = req("POST", "/api/v1/connections/alpha-fixture-net/reconnect", {})
-check("reconnect is 202 with a launch record", s == 202 and b["launch"]["ok"] is True and b["launch"]["pid"] == 99, f"{s} {b}")
+check("reconnect is 202 with a launch record", s == 202 and b["launch"]["ok"] is True and b["launch"]["pid"] == DEAD_PID, f"{s} {b}")
 check("reconnect spawned exactly that bridge", SPAWNED == ["alpha-fixture-net"], SPAWNED)
 s, b, _ = req("DELETE", "/api/v1/connections/beta-fixture-net")
 check("deleting the primary is 409 primary", (s, b) == (409, {"error": "primary"}), f"{s} {b}")

@@ -655,6 +655,50 @@ class DiscoveryCases:
                                    vault_lookup=lambda k: VAULT_TOKEN)
         self.assertEqual((with_env.token, with_env.token_source), (ENV_TOKEN, "env"), "only the env tier may follow it")
 
+    def host_token_from(self, env, token_file_text):
+        """A host (non-seat) discovery with a token in the channel .env and in the vault; which tier won,
+        and every vault key that was read."""
+        vault_reads = []
+        read = (lambda p: (None, "")) if token_file_text is None else (lambda p: token_file_text)
+        found = self.o.discover(env, [("/chan", {"REMOTE_TASK_TOKEN": CHANNEL_TOKEN})], read_token_file=read,
+                                vault_lookup=lambda k: vault_reads.append(k) or VAULT_TOKEN)
+        return found, vault_reads
+
+    def test_a_host_named_token_file_present_outranks_the_env_token(self):
+        found, vault_reads = self.host_token_from(
+            {"REMOTE_TASK_TOKEN_FILE": "/t", "REMOTE_TASK_TOKEN": ENV_TOKEN, "REMOTE_TASK_URL": GW},
+            f"REMOTE_TASK_TOKEN={FILE_TOKEN}\n")
+        self.assertFalse(self.o.is_seat({"REMOTE_TASK_TOKEN_FILE": "/t"}))
+        self.assertEqual((found.token, found.token_source, found.token_key, found.fatal),
+                         (FILE_TOKEN, "token_file", "REMOTE_TASK_TOKEN_FILE", ""), "the named file beats the env")
+        self.assertEqual(vault_reads, [])
+
+    def test_a_host_named_token_file_missing_lets_only_the_env_stand_in(self):
+        env = {"REMOTE_TASK_TOKEN_FILE": "/t", "REMOTE_TASK_URL": GW}
+        found, vault_reads = self.host_token_from(dict(env, REMOTE_TASK_TOKEN=ENV_TOKEN), None)
+        self.assertEqual((found.token, found.token_source, found.fatal), (ENV_TOKEN, "env", ""),
+                         "a named file not yet written: the env token runs")
+        self.assertEqual((found.source_file, vault_reads), ("", []), "neither the channel .env nor the vault is read")
+        self.assertEqual(found.token_file, "/t", "rotation still watches the named file")
+        bare, vault_reads = self.host_token_from(env, None)
+        self.assertEqual((bare.token, bare.token_source, bare.source_file), ("", "none", ""),
+                         "the file and vault tiers are closed: no channel .env or vault token stands in")
+        self.assertNotIn(CHANNEL_TOKEN, bare.raw + bare.token)
+        self.assertEqual(vault_reads, [], "the vault is never consulted for a missing named token file")
+
+    def test_a_host_without_a_named_token_file_walks_env_then_file_then_vault(self):
+        base = {"REMOTE_TASK_URL": GW}
+        for env, token_file_text, want in (
+                (dict(base, REMOTE_TASK_TOKEN=ENV_TOKEN), None, (ENV_TOKEN, "env")),
+                (base, None, (CHANNEL_TOKEN, "file")),
+                (dict(base, REMOTE_TASK_TOKEN_FILE=""), None, (CHANNEL_TOKEN, "file"))):
+            with self.subTest(env=env):
+                found, _reads = self.host_token_from(env, token_file_text)
+                self.assertEqual((found.token, found.token_source, found.fatal), want + ("",))
+        vault_only = self.o.discover(base, [("/chan", {})], read_token_file=lambda p: (None, ""),
+                                     vault_lookup=lambda k: VAULT_TOKEN if k == "REMOTE_TASK_TOKEN" else "")
+        self.assertEqual((vault_only.token, vault_only.token_source), (VAULT_TOKEN, "vault"), "the vault is last")
+
     def test_a_seat_reads_its_own_token_file_and_nothing_else(self):
         seat = {"REMOTE_TASK_SEAT": "1", "AG2_DEVICE_ENV": "/seat/.env", "CLAUDE_CONFIG_DIR": "/core",
                 "REMOTE_TASK_TOKEN_FILE": "/seat/token", "REMOTE_TASK_TOKEN": ENV_TOKEN}
@@ -977,6 +1021,25 @@ class RealSinks(unittest.TestCase):
                     else:
                         self.assertEqual((out["token"], out["source"], out["fatal"]),
                                          ("core-token-QQQQ7777", "token_file", ""), "a live core starts as before")
+
+    def test_a_host_named_token_file_missing_never_connects_with_the_channel_env_or_vault(self):
+        for env_token in (ENV_TOKEN, None):
+            with self.subTest(env_token=env_token), tempfile.TemporaryDirectory() as td:
+                env = {"REMOTE_TASK_TOKEN_FILE": "TOKENFILE", "REMOTE_TASK_URL": GW}
+                if env_token:
+                    env["REMOTE_TASK_TOKEN"] = env_token
+                fx = Fixture(Path(td), ("missing", env, {"REMOTE_TASK_TOKEN": DEVICE_TOKEN},
+                                        {"REMOTE_TASK_TOKEN": CHANNEL_TOKEN}, VAULT_TOKEN, None, ("", "", "", "")))
+                self.assertFalse(fx.token_file.exists())
+                fx.candidates = []
+                out, err = self.bridge(fx, BRIDGE if env_token else BRIDGE_MAIN, timeout=20)
+                for other in (DEVICE_TOKEN, CHANNEL_TOKEN, VAULT_TOKEN):
+                    self.assertNotIn(other, json.dumps(out) + err)
+                if env_token:
+                    self.assertEqual((out["token"], out["source"], out["token_file"]), (ENV_TOKEN, "env", str(fx.token_file)))
+                else:
+                    self.assertEqual((out["token"], out["source"]), ("", "none"))
+                    self.assertIn("set REMOTE_TASK_TOKEN", out["exited"] or "", "it refuses to start, and says what to set")
 
     def test_a_missing_device_file_is_skipped_and_the_media_marker_is_carried(self):
         with tempfile.TemporaryDirectory() as td:

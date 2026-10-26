@@ -1394,6 +1394,20 @@ def main() -> int:
     _activity.parent.mkdir(parents=True, exist_ok=True)
     _activity.write_text(json.dumps(
         {"ts": int(time.time()), "channel": "ag2space", "summary": "hi"}))
+    # Once it holds the lease the unsuffixed bridge asks whether it keeps the proactive room.
+    check(rtc.PROACTIVE_ROOM_KEEP is rtc._legacy_keeps_proactive_room, "the unsuffixed bridge asks whether it keeps the room")
+    _main_src = (SRC_DIR.parent / "packages" / "ag2-sparrow" / "ag2_sparrow" / "remote_gateway_bridge.py").read_text()
+    _main_src = _main_src[_main_src.index("def main() -> None:"):]
+    check(_main_src.index("_acquire_singleton()") < _main_src.index("_settle_proactive_room()")
+          < _main_src.index("_start_lock_heartbeat()"), "the room is settled right after the lease is taken")
+    _saved_room = (rtc.PROACTIVE_ROOM, rtc.PROACTIVE_ROOM_KEEP)
+    for _keep, _want, _label in ((lambda: True, "!r:example.org", "kept while no named row is primary"),
+                                 (lambda: (_ for _ in ()).throw(OSError("x")), "!r:example.org", "kept when the check fails"),
+                                 (lambda: False, "", "dropped once a named row is primary")):
+        rtc.PROACTIVE_ROOM, rtc.PROACTIVE_ROOM_KEEP = "!r:example.org", _keep
+        rtc._settle_proactive_room()
+        check(rtc.PROACTIVE_ROOM == _want, f"proactive room {_label}")
+    rtc.PROACTIVE_ROOM, rtc.PROACTIVE_ROOM_KEEP = _saved_room
     # Unset → no scan, files untouched (existing hosts unchanged).
     (rtc.RESULTS_DIR / "proactive-t1.txt").write_text("nudge one\n")
     rtc.PROACTIVE_ROOM = ""
