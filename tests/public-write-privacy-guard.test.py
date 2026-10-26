@@ -417,6 +417,143 @@ class SecondReviewFindings(Base):
         self.assertIsNotNone(self.decide(f"gh gist edit abc123 --desc '{q}'", lookup=PRIVATE))
 
 
+FAKE_GH = """#!/bin/bash
+{ printf '%s\\n' "$@"
+  for a in "$@"; do f="${a#--body-file=}"; f="${f#-F}"; [ -f "$f" ] && cat "$f"; done
+  [ -t 0 ] || cat; } >> "$GH_SINK"
+"""
+
+
+class RealHookThenBash(unittest.TestCase):
+    """Each command goes through the real hook as Claude Code runs it; when the hook
+    allows it, real bash runs it against a recording `gh`. Invariant: a denied term
+    never reaches the sink of an allowed public write."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.ws = self.tmp / "ws"
+        pdir = policy.privacy_dir(self.ws)
+        pdir.mkdir(parents=True)
+        (pdir / policy.DENYLIST_NAME).write_text(f"repo: {TERM}\n")
+        self.cache = pdir / policy.VISIBILITY_CACHE_NAME
+        now = time.time()
+        self.cache.write_text(json.dumps({"o/r": {"visibility": "PUBLIC", "at": now},
+                                          "o/priv": {"visibility": "PRIVATE", "at": now}}))
+        self.cwd = self.tmp / "cwd"
+        self.cwd.mkdir()
+        (self.cwd / "dirty.md").write_text(f"see {TERM}\n")
+        (self.cwd / "body.md").write_text("clean marker\n")
+        self.bin = self.tmp / "bin"
+        self.bin.mkdir()
+        (self.bin / "gh").write_text(FAKE_GH)
+        (self.bin / "gh").chmod(0o755)
+        self.sink = self.tmp / "sink.txt"
+
+    def hook(self, command):
+        payload = {"tool_name": "Bash", "tool_input": {"command": command}, "cwd": str(self.cwd),
+                   "hook_event_name": "PreToolUse"}
+        env = {k: v for k, v in os.environ.items() if k != "GH_REPO"}
+        r = subprocess.run([sys.executable, str(HOOK), "--workspace", str(self.ws)],
+                           input=json.dumps(payload), capture_output=True, text=True, timeout=60, env=env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return json.loads(r.stdout)["hookSpecificOutput"] if r.stdout.strip() else None
+
+    def run_command(self, command, extra_env=None):
+        """("deny", reason) or ("allow", what the recording gh received)."""
+        out = self.hook(command)
+        if out:
+            self.assertEqual(out["permissionDecision"], "deny")
+            return "deny", out["permissionDecisionReason"]
+        env = {k: v for k, v in os.environ.items() if k != "GH_REPO"}
+        env.update(PATH=f"{self.bin}:{env.get('PATH', '')}", GH_SINK=str(self.sink), **(extra_env or {}))
+        subprocess.run(["bash", "-c", command], cwd=self.cwd, env=env, stdin=subprocess.DEVNULL,
+                       capture_output=True, timeout=60)
+        return "allow", self.sink.read_text() if self.sink.exists() else ""
+
+    def assertDenied(self, command, why=None, extra_env=None):
+        decision, detail = self.run_command(command, extra_env)
+        self.assertEqual(decision, "deny", f"{command!r} published: {detail!r}")
+        if why:
+            self.assertIn(why, detail)
+
+    def assertAllowedClean(self, command, marker="clean marker"):
+        decision, sink = self.run_command(command)
+        self.assertEqual(decision, "allow", sink)
+        self.assertIn(marker, sink)
+        self.assertNotIn(TERM, sink)
+
+    def test_the_five_published_shapes_are_denied(self):
+        for cmd in (f"> /dev/null gh pr comment 1 -R o/r -b {TERM}",
+                    f"2>/dev/null >/dev/null gh pr comment 1 -R o/r -b {TERM}",
+                    "cat >> dirty.md <<'EOF'\nclean\nEOF\ngh pr comment 1 -R o/r -F dirty.md",
+                    "cat dirty.md > body.md <<'EOF'\nclean\nEOF\ngh pr comment 1 -R o/r -F body.md",
+                    "env cp dirty.md body.md\ngh pr comment 1 -R o/r -F body.md",
+                    "timeout 5 cp dirty.md body.md && gh pr comment 1 -R o/r -F body.md",
+                    f"bash -o pipefail -c \"gh pr comment 1 -R o/r -b {TERM}\"",
+                    f"bash -euo pipefail -c \"gh pr comment 1 -R o/r -b {TERM}\"",
+                    f"bash -O extglob +o histexpand -c \"gh pr comment 1 -R o/r -b {TERM}\""):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+
+    def test_unknown_writers_and_expanding_targets_fail_closed(self):
+        writer = "python3 -c 'import sys,shutil; shutil.copy(\"dirty.md\", sys.argv[1])' body.md"
+        for cmd in (f"{writer} && gh pr comment 1 -R o/r -F body.md",
+                    "F=body.md; cp dirty.md \"$F\"; gh pr comment 1 -R o/r -F body.md",
+                    "cat dirty.md | tee -a body.md >/dev/null; gh pr comment 1 -R o/r -F body.md",
+                    "C='gh pr comment 1 -R o/r -F dirty.md'; bash -c \"$C\""):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+
+    def test_clean_controls_reach_gh(self):
+        self.assertAllowedClean("gh pr comment 1 -R o/r -F body.md")
+        self.assertAllowedClean("> /dev/null gh pr comment 1 -R o/r -b 'clean marker'")
+        self.assertAllowedClean("cat > body.md <<'EOF'\nclean marker\nEOF\ngh pr comment 1 -R o/r -F body.md")
+        self.assertAllowedClean("bash -o pipefail -c \"gh pr comment 1 -R o/r -b 'clean marker'\"")
+        self.assertAllowedClean("cat body.md && gh pr comment 1 -R o/r -F body.md && rm -f other.md")
+
+    def test_public_true_counts_as_public(self):
+        self.assertDenied(f"gh repo create o/new --public=true --description 'at {LOCAL}'")
+        self.assertDenied("gh gist create --public=true dirty.md")
+        self.assertDenied("gh gist create --public=1 dirty.md")
+        self.assertIsNone(self.hook("gh gist create --public=false dirty.md"))
+
+    def test_private_to_public_uses_the_destination_and_drops_the_cache(self):
+        self.assertDenied(f"gh repo edit o/priv --visibility public --accept-visibility-change-consequences "
+                          f"--description 'at {LOCAL}'")
+        self.assertDenied(f"gh repo edit o/priv --visibility=public --description '{TERM}'")
+        self.assertDenied(f"gh api -X PATCH repos/o/priv -F private=false -f description='{TERM}'")
+        self.assertDenied(f"gh api -X PATCH repos/o/priv -f visibility=public -f description='{TERM}'")
+        cache = json.loads(self.cache.read_text())
+        cache["o/priv"] = {"visibility": "PRIVATE", "at": time.time()}
+        self.cache.write_text(json.dumps(cache))
+        self.assertIsNone(self.hook("gh repo edit o/priv --visibility public --accept-visibility-change-consequences"))
+        self.assertNotIn("o/priv", json.loads(self.cache.read_text()))
+        self.assertIn("o/r", json.loads(self.cache.read_text()))
+
+    def test_body_files_go_through_the_shared_bounded_reader(self):
+        big = self.cwd / "big.md"
+        big.write_text("x" * 65537)
+        self.assertDenied("gh pr comment 1 -R o/r -F big.md", "65536")
+        (self.cwd / "bad.md").write_bytes(b"clean \xff\xfe")
+        self.assertDenied("gh pr comment 1 -R o/r -F bad.md", "UTF-8")
+        os.mkfifo(self.cwd / "pipe.md")
+        started = time.time()
+        self.assertDenied("gh pr comment 1 -R o/r -F pipe.md", "not a regular file")
+        self.assertLess(time.time() - started, 30)
+        (self.cwd / "max.md").write_text("clean marker " + "y" * (65536 - 13))
+        self.assertAllowedClean("gh pr comment 1 -R o/r -F max.md")
+
+    def test_heredoc_escape_parity(self):
+        env = {"BODY": LOCAL}
+        self.assertDenied("gh pr comment 1 -R o/r -F - <<EOF\nsee \\\\$BODY\nEOF", "unquoted", env)
+        self.assertDenied("gh pr comment 1 -R o/r -F - <<EOF\nsee \\\\\\\\$BODY\nEOF", "unquoted", env)
+        decision, sink = self.run_command("gh pr comment 1 -R o/r -F - <<EOF\nclean marker \\$BODY\nEOF",
+                                          env)
+        self.assertEqual(decision, "allow")
+        self.assertIn("clean marker $BODY", sink)
+        self.assertNotIn(LOCAL, sink)
+
+
 class Patterns(unittest.TestCase):
     def test_mixed_case_mxid(self):
         self.assertTrue(policy.scan("ping @Zq-Agent:matrix.zq.chat", []))

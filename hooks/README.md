@@ -607,21 +607,30 @@ command itself.
   single dictionary words; it keeps lines under its `manual` marker and prints counts
   only.
 - **Visibility** comes from `gh repo view --json visibility`, cached in
-  `state/privacy/repo-visibility.json` (PUBLIC 7 days, PRIVATE 1 hour). Only PRIVATE
+  `state/privacy/repo-visibility.json` (PUBLIC 7 days, PRIVATE 10 minutes). Only PRIVATE
   skips the scan; an unknown repo (no `--repo`, `{owner}` placeholders, gh failing) is
-  scanned as public.
-- **Fails closed:** a body file that does not exist, stdin it cannot see, a value that
-  expands at run time (`"$BODY"`, backticks), an unquoted heredoc or here-string whose
-  text contains `$` or backticks, a body file the same command writes other than by a
-  heredoc (`>`, `tee`, `cp`, `mv`, `ln`, `install`, `rsync`, `sed -i`, `perl -i`, `dd of=`),
-  a line that does not lex, a hook crash or unreadable hook input on a `gh` write: all
-  refused. Imports load only once the command looks like a `gh` write. There is no
-  override variable; the allowlist is the escape.
+  scanned as public. A write that makes its target public (`gh repo create --public[=true]`,
+  `gh repo edit --visibility public`, `gh api` PATCH `repos/o/r` with `private=false` or
+  `visibility=public`) is judged as public whatever the lookup says, and any visibility
+  change drops that repo's cached answer.
+- **Body files** are read through `src/body_file.py`, the shared bounded reader: over
+  65,536 bytes, not a regular file (FIFO, device) or not UTF-8 is refused.
+- **Fails closed:** a body file that does not exist, stdin that is not the gh command's
+  own heredoc or here-string, a value that expands at run time (`"$BODY"`, backticks), an
+  unquoted heredoc or here-string that bash expands (escape parity is parsed, so `\\$X`
+  expands), a body file this command may write (a redirect other than a plain heredoc into
+  `cat`/`tee`, an append, `cat FILE > body`, a redirect to a target that expands, `tee -a`,
+  or any program other than a known reader that names the file, wrappers included), a
+  shell or `eval` command string that expands when the line holds a gh write, a line that
+  does not lex, a hook crash or unreadable hook input on a `gh` write: all refused. Imports
+  load only once the command looks like a `gh` write. There is no override variable; the
+  allowlist is the escape.
 
 ### Registration
 
 Auto-registered as `PreToolUse[Bash]` through `src/agent/claude/cli/build-core-settings.mjs`
-(arg7), which `session-launch.sh` passes to every core and worker session as `--settings`.
+(arg7), run by the interpreter the launcher resolved (arg8, the same `$PY` as the rest of
+the launch; bare `python3` only when none resolves), which `session-launch.sh` passes to every core and worker session as `--settings`.
 That reaches each session's Agent-tool subagents, whatever their cwd: they run in the
 same process and fire the parent's PreToolUse hooks. It takes effect on a session's next
 launch.
@@ -631,7 +640,7 @@ launch.
 - a Codex core (no Claude hooks), or a `claude` run started without the launcher;
 - `git push` / commit messages, and `gh pr create --fill` text;
 - a write made by a script the command runs (`python3 post.py`, `bash post.sh`), or a body
-  file written by a program other than those listed under "Fails closed";
+  file written by a program that does not name it on its command line;
 - `xargs`-style indirection, and text piped into a shell from anything but a heredoc;
 - gh aliases (`gh alias set`), and gh reached through a variable or function (`$GH pr …`,
   `"${cmd[@]}"`);

@@ -27,19 +27,21 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 _shell_scan = None
 policy = None
+_body_file = None
 
 
 def _load_modules():
     """Imported lazily so a Bash call with no `gh` pays nothing, and an import
     failure lands inside main()'s fail-closed handler."""
-    global _shell_scan, policy
+    global _shell_scan, policy, _body_file
     if policy is None:
         for d in (str(HERE), str(HERE.parent / "src")):
             if d not in sys.path:
                 sys.path.insert(0, d)
         import _shell_scan as scan_mod
+        import body_file as body_mod
         import public_write_privacy as policy_mod
-        _shell_scan, policy = scan_mod, policy_mod
+        _shell_scan, policy, _body_file = scan_mod, policy_mod, body_mod
 
 
 TAG = "[public-write-privacy-guard]"
@@ -121,15 +123,15 @@ HEREDOC_CAT = re.compile(r"""^"?\$\(\s*cat\s*<<-?\s*(['"]?)[A-Za-z_][A-Za-z0-9_]
 WHOLE_CAT = re.compile(r"""^"?\$\(\s*(?:cat\s+|<\s*)(['"]?)([^'"\s$`()]+)\1\s*\)"?$""")
 HEREDOC = re.compile(r"<<(-?)\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\2")
 HEREDOC_WORD = re.compile(r"^<<-?(?!<)")
-REDIRECT = re.compile(r"^(?:\d|&)?>>?(.*)$")
-EXPANSION = re.compile(r"(?<!\\)(?:\$[\w{(@*#?!$-]|`)")
+REDIRECT_OP = re.compile(r"^(?:\d*|&)(<<<|<<-?|<>|<&|>&|&>>|&>|>>|>\||<|>)")
 GH_WRITE_HINT = re.compile(r"\bgh\b[\s\S]*\b(?:pr|issue|release|api|gist|repo|label)\b", re.I)
-# Programs that only read the files they name; any other program naming the body
-# file in the same command may be writing it.
-READERS = {"cat", "head", "tail", "less", "more", "wc", "grep", "rg", "ugrep", "diff", "ls", "stat",
-           "test", "[", "file", "echo", "printf", "md5", "md5sum", "shasum", "sha256sum", "gh", "cd",
-           "true", "jq", "bat"}
-COPIERS = {"cp", "mv", "ln", "install", "rsync", "tee"}
+# Programs that never write a file they name; any other program naming the body
+# file in the same command may write it, so that body is refused.
+READERS = {"cat", "head", "tail", "less", "more", "wc", "grep", "egrep", "fgrep", "rg", "ugrep", "diff",
+           "cmp", "ls", "stat", "test", "[", "file", "echo", "printf", "md5", "md5sum", "shasum",
+           "sha1sum", "sha256sum", "gh", "cd", "true", "false", "jq", "bat", "rm", "unlink", "chmod",
+           "realpath", "readlink", "basename", "dirname", "du", "sleep", "mkdir", "export", "unset",
+           "declare", "typeset"}
 
 
 GH_VALUE_LONGS = {"--repo", "--base", "--head", "--label", "--assignee", "--reviewer", "--project",
@@ -151,6 +153,21 @@ class Body:
         self.expands = expands      # bash rewrites it ($, backticks) before anyone reads it
 
 
+def _heredoc_expands(text: str) -> bool:
+    """Does bash rewrite this unquoted heredoc body? A backslash escapes the next
+    character, so parity decides: `\\$X` is a literal backslash then an expansion."""
+    i = 0
+    while i < len(text):
+        c = text[i]
+        if c == "\\":
+            i += 2
+            continue
+        if c == "`" or (c == "$" and re.match(r"[\w{(@*#?!$-]", text[i + 1:i + 2] or " ")):
+            return True
+        i += 1
+    return False
+
+
 def split_heredocs(command: str):
     """(command without heredoc bodies, [Body]). A body can hold an unbalanced
     quote that would make the whole line unlexable, so it is lifted out first."""
@@ -165,7 +182,7 @@ def split_heredocs(command: str):
             if (line.lstrip("\t") if strip_tabs else line) == tag:
                 pending.pop(0)
                 text = "\n".join(current)
-                bodies.append(Body(text, not quoted and bool(EXPANSION.search(text))))
+                bodies.append(Body(text, not quoted and _heredoc_expands(text)))
                 current = []
             else:
                 current.append(line)
@@ -248,17 +265,20 @@ class Act:
     """One publishing gh invocation. repo None: gh takes it from GH_REPO or the cwd's
     remote; "" means the target has no repo. `also` are repos it may target instead."""
 
-    def __init__(self, repo, label, texts, cwd, env_ok=True, also=()):
+    def __init__(self, repo, label, texts, cwd, env_ok=True, also=(), public=False, invalidate=False):
         self.repo, self.label, self.texts, self.cwd = repo, label, texts, cwd
         self.env_ok = env_ok
         self.also = list(also)
+        self.public = public            # the write makes or keeps the target public
+        self.invalidate = invalidate    # the write changes the target's visibility
 
 
 class Ctx:
     """seg_bodies: each segment's own heredocs; own/assigns: the segment being read;
     exported: earlier export/unset; maybe: earlier bare NAME=value, live only if exported."""
 
-    def __init__(self, cwd, bodies, segments, seg_bodies):
+    def __init__(self, cwd, bodies, segments, seg_bodies, command=""):
+        self.command = command
         self.cwd = cwd
         self.bodies = bodies
         self.segments = segments
@@ -290,16 +310,20 @@ def _read_file(word, ctx, label):
     if text == "-":
         return _stdin(ctx, label)
     path = _resolve(text, ctx.cwd)
-    writes = _writes(ctx)
+    writes, mentions = _writes(ctx)
+    named = re.compile(r"(?<![\w.-])" + re.escape(path.name) + r"(?![\w.-])")
+    if "*" in writes or any(named.search(m) for m in mentions):
+        raise Unreadable(f"{label} `{text}` may be written by another program in this same command; "
+                         "write it in a separate step so its content can be checked")
     if path in writes:
         if writes[path] is None:
             raise Unreadable(f"{label} `{text}` is written by this same command; write it in a "
                              "separate step so its content can be checked")
         return _checked(writes[path], label)
     try:
-        return [path.read_text(encoding="utf-8", errors="replace")]
-    except OSError as e:
-        raise Unreadable(f"cannot read {label} `{text}` ({e.strerror or e})")
+        return [_body_file.read_body_file(str(path))]
+    except SystemExit as e:
+        raise Unreadable(f"cannot read {label} `{text}`: {str(e.code).replace('ERROR: ', '')}")
 
 
 def _stdin(ctx, label):
@@ -337,10 +361,33 @@ def _assignment(word):
         return name, "{unresolved}"
 
 
+def _redirect_op(word):
+    if word.raw[:1] in ("'", '"'):
+        return None
+    m = REDIRECT_OP.match(word.raw)
+    return m
+
+
+def _drop_redirects(seg):
+    """The segment without its redirections, which bash allows anywhere, first included."""
+    out, skip = [], False
+    for w in seg:
+        if skip:
+            skip = False
+            continue
+        m = _redirect_op(w)
+        if m:
+            skip = m.group(0) == w.raw
+            continue
+        out.append(w)
+    return out
+
+
 def _strip_prefix(seg):
     """(command words, {NAME: value or None when unset}) after dropping shell
     keywords, assignments and wrappers (`timeout 60`, `env -u X`, `nice -n 5`)."""
     assigns = {}
+    seg = _drop_redirects(seg)
     while seg:
         text = seg[0].text
         if text in KEYWORDS:
@@ -455,8 +502,13 @@ def _gh_action(seg, ctx):
     valued = set(spec.shorts.values()) | spec.texts | spec.files | GH_VALUE_LONGS
     values, flags, positional = _parse_args(pre + tail[i:], {"R": "--repo", **spec.shorts}, valued,
                                             FLAG_ALIASES if words[0] == "gist" else None)
-    if spec.when and spec.when not in flags:
+    def on(name):
+        return name in flags or any(n == name and v is not None and v.text.lower() not in ("false", "0")
+                                    for n, v in values)
+
+    if spec.when and not on(spec.when):
         return None
+    visibility = [v.text.lower() for n, v in values if n == "--visibility" and v is not None]
     repo = "" if words[0] == "gist" else None
     texts, first = [], True
     for name, val in values:
@@ -483,25 +535,27 @@ def _gh_action(seg, ctx):
             repo = m.group(1)
         elif words[0] == "repo" and repo is None and w.text.count("/") == 1 and "{" not in w.text:
             repo = w.text
-    return _with_env_repo(repo, f"gh {words[0]} {words[1]}", texts, ctx)
+    public = "public" in visibility or (words == ["repo", "create"] and on("--public"))
+    return _with_env_repo(repo, f"gh {words[0]} {words[1]}", texts, ctx,
+                          public=public, invalidate=bool(visibility))
 
 
-def _with_env_repo(repo, label, texts, ctx):
+def _with_env_repo(repo, label, texts, ctx, **kw):
     """Apply GH_REPO the way gh does: a --repo flag or URL wins, then GH_REPO."""
     if repo is not None:
-        return Act(repo, label, texts, ctx.cwd)
+        return Act(repo, label, texts, ctx.cwd, **kw)
     for scope in (ctx.assigns, ctx.exported):
         if "GH_REPO" in scope:
             value = scope["GH_REPO"]
             if value:
-                return Act(value, label, texts, ctx.cwd)
-            return Act(None, label, texts, ctx.cwd, env_ok=False)
-    return Act(None, label, texts, ctx.cwd, also=ctx.maybe.get("GH_REPO", ()))
+                return Act(value, label, texts, ctx.cwd, **kw)
+            return Act(None, label, texts, ctx.cwd, env_ok=False, **kw)
+    return Act(None, label, texts, ctx.cwd, also=ctx.maybe.get("GH_REPO", ()), **kw)
 
 
 def _api_action(args, ctx):
     values, flags, positional = _parse_args(args, API_SHORTS, API_VALUE_LONGS)
-    method, fields, texts, repo = None, False, [], None
+    method, fields, texts, repo, kv = None, False, [], None, {}
     for name, val in values:
         if name == "--method":
             method = _need(name, val).text.upper()
@@ -509,6 +563,7 @@ def _api_action(args, ctx):
             fields = True
             val = _need(name, val)
             key, _, value = val.text.partition("=")
+            kv[key] = value.lower()
             raw_value = val.raw.split("=", 1)[1] if "=" in val.raw else value
             if name == "--field" and value.startswith("@"):
                 target = value[1:]
@@ -527,7 +582,10 @@ def _api_action(args, ctx):
     m = API_REPO.match(endpoint)
     if m:
         target = None if "{" in m.group(1) else m.group(1)
-        return _with_env_repo(target or repo, f"gh api {method} {m.group(2) or 'repo'}", texts, ctx)
+        changes = m.group(2) is None and ("private" in kv or "visibility" in kv)
+        public = m.group(2) is None and (kv.get("private") == "false" or kv.get("visibility") == "public")
+        return _with_env_repo(target or repo, f"gh api {method} {m.group(2) or 'repo'}", texts, ctx,
+                              public=public, invalidate=changes)
     if API_GIST.match(endpoint):
         return Act("", f"gh api {method} gists", texts, ctx.cwd)
     if endpoint.strip("/") == "graphql" and any("mutation" in t for t in texts):
@@ -540,39 +598,54 @@ def _non_flags(seg):
 
 
 def _writes(ctx):
-    """{path: bodies it receives, or None when its content cannot be known}
-    for every file this command writes."""
-    out = {}
+    """({path: bodies it receives, or None when its content cannot be known}, [words
+    other programs name]); "*" as a path means a write to a target that expands."""
+    out, mentions = {}, []
     cwd = ctx.cwd
-    if cwd is None:
-        return out
 
     def add(target, bodies):
-        if target and "$" not in target:
-            out[_resolve(target, cwd)] = bodies
+        if not target or target.startswith("&") or target in ("-", "/dev/null"):
+            return
+        if "$" in target or "`" in target or (cwd is None and not target.startswith(("/", "~"))):
+            out["*"] = None
+            return
+        path = _resolve(target, cwd)
+        out[path] = None if path in out else bodies
 
-    for idx, seg in enumerate(ctx.segments):
+    for idx, raw_seg in enumerate(ctx.segments):
         own = ctx.seg_bodies[idx]
-        prog = os.path.basename(seg[0].text)
-        feeds = own if prog in ("cat", "tee") and own else None
-        for i, w in enumerate(seg):
-            m = REDIRECT.match(w.text)
-            if m and w.text[:1] in ">&0123456789" and ">" in w.text:
-                add(m.group(1) or (seg[i + 1].text if i + 1 < len(seg) else None), feeds)
-        args = _non_flags(seg)
+        seg, _ = _strip_prefix(raw_seg)
+        prog = os.path.basename(seg[0].text) if seg else ""
+        args = _non_flags(seg) if seg else []
+        reads_stdin = prog == "tee" or (prog == "cat" and all(w.text == "-" for w in args))
+        feeds = own if own and reads_stdin else None
+        for i, w in enumerate(raw_seg):
+            m = _redirect_op(w)
+            if not m or "<" in m.group(1):
+                continue
+            op = m.group(1)
+            target = w.text[m.end():] or (raw_seg[i + 1].text if i + 1 < len(raw_seg) else None)
+            if op == ">&" and target and (target.isdigit() or target == "-"):
+                continue
+            add(target, None if op in (">>", "&>>") else feeds)
+        if not seg:
+            continue
         if prog == "tee":
+            appending = any(w.text in ("-a", "--append") for w in seg[1:])
             for w in args:
-                add(w.text, feeds)
-        elif prog in COPIERS or (prog in ("sed", "perl") and any(
-                w.text.startswith(("-i", "--in-place")) or (w.text.startswith("-") and not w.text.startswith("--") and "i" in w.text[1:])
-                for w in seg[1:])):
-            for w in args:
-                add(w.text, None)
-        elif prog == "dd":
+                add(w.text, None if appending else feeds)
+        elif prog not in READERS:
             for w in seg[1:]:
-                if w.text.startswith("of="):
-                    add(w.text[3:], None)
-    return out
+                if not _redirect_op(w):
+                    mentions.append(w.text)
+            if prog == "dd":
+                for w in seg[1:]:
+                    if w.text.startswith("of="):
+                        add(w.text[3:], None)
+            else:
+                for w in args:
+                    add(w.text, None)
+    return out, mentions
 
 
 def _assign_bodies(segments, bodies):
@@ -604,23 +677,42 @@ def _assign_bodies(segments, bodies):
 def _shell_scripts(seg, own, ctx):
     """The command text a shell segment runs: its -c string, or its stdin script."""
     if seg[0].basename_is("eval"):
-        return [Body(" ".join(w.text for w in seg[1:]), False)]
-    has_c = any(w.text.startswith("-") and not w.text.startswith("--") and "c" in w.text[1:]
-                for w in seg[1:])
-    args, skip = [], False
-    for w in seg[1:]:
-        if skip:
-            skip = False
-            continue
-        m = re.match(r"^(?:\d|&)?[<>]+-?", w.text)
-        if m:
-            skip = m.group(0) == w.text
-            continue
-        if not w.text.startswith("-") or w.text == "-":
-            args.append(w)
+        words = seg[1:]
+        positional, has_c, stdin = words, True, False
+    else:
+        args, i, has_c, stdin, positional = _drop_redirects(seg[1:]), 0, False, False, []
+        while i < len(args):
+            t = args[i].text
+            if t == "--":
+                positional = args[i + 1:]
+                break
+            if t in ("--rcfile", "--init-file"):
+                i += 2
+                continue
+            if t.startswith("--"):
+                i += 1
+                continue
+            if t[:1] in "-+" and len(t) > 1:
+                letters = t[1:]
+                has_c = has_c or (t[0] == "-" and "c" in letters)
+                stdin = stdin or (t[0] == "-" and "s" in letters)
+                i += 1 + letters.count("o") + letters.count("O")
+                continue
+            positional = args[i:]
+            break
+        words = positional[:1]
     if has_c:
-        return [Body(args[0].text, False)] if args else []
-    if not args or args[0].text == "-":
+        scripts = []
+        for w in words:
+            try:
+                _literal_or_raise(w)
+            except Unreadable:
+                if GH_WRITE_HINT.search(ctx.command):
+                    raise Unreadable("a shell or eval runs a command string that expands at run time, "
+                                     "so a gh write in it cannot be checked")
+            scripts.append(w.text)
+        return [Body(" ".join(scripts), False)] if scripts else []
+    if stdin or not positional or positional[0].text == "-":
         return list(own or ctx.bodies)
     return []
 
@@ -635,7 +727,7 @@ def actions(command: str, cwd, depth: int = 0):
         return []
     seg_bodies = _assign_bodies(segments, bodies)
     all_bodies = bodies + [b for own in seg_bodies for b in own if b not in bodies]
-    ctx = Ctx(cwd, all_bodies, segments, seg_bodies)
+    ctx = Ctx(cwd, all_bodies, segments, seg_bodies, command)
     found = []
     if depth < 3:
         inner = _substitutions(stripped)
@@ -683,7 +775,7 @@ def actions(command: str, cwd, depth: int = 0):
                 found.append(act)
     unique, seen = [], set()
     for act in found:
-        key = (act.repo, act.label, tuple(act.texts), tuple(act.also))
+        key = (act.repo, act.label, tuple(act.texts), tuple(act.also), act.public, act.invalidate)
         if key not in seen:
             seen.add(key)
             unique.append(act)
@@ -707,15 +799,22 @@ def decide(command: str, cwd, workspace: Path, lookup=None, remote=None):
     kwargs = {"lookup": lookup} if lookup else {}
     deny_terms = None
     problems = []
+    cache = pdir / policy.VISIBILITY_CACHE_NAME
     for act in acts:
-        if not any(t.strip() for t in act.texts):
+        if not act.invalidate and not any(t.strip() for t in act.texts):
             continue
         repo = act.repo
         if repo is None:
             repo = (os.environ.get("GH_REPO") if act.env_ok else None) or \
                 (remote(act.cwd) if act.cwd else None)
-        cache = pdir / policy.VISIBILITY_CACHE_NAME
-        targets = [(r, policy.repo_visibility(r, cache, **kwargs)) for r in [repo] + act.also]
+        if act.invalidate:
+            for r in [repo] + act.also:
+                policy.forget_visibility(r, cache)
+        if not any(t.strip() for t in act.texts):
+            continue
+        # A write that makes the target public is judged by where it lands, not where it is.
+        targets = [(r, "PUBLIC" if act.public else policy.repo_visibility(r, cache, **kwargs))
+                   for r in [repo] + act.also]
         if all(vis == "PRIVATE" for _, vis in targets):
             continue
         repo, vis = next((r, v) for r, v in targets if v != "PRIVATE")

@@ -2,6 +2,9 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { mkdtempSync, writeFileSync, chmodSync, existsSync, readFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 
 // Builders are plain .mjs (run by start-cli.sh via `node <builder> <args>`), so
 // we exercise them exactly as the shell does: exec and parse stdout.
@@ -260,6 +263,53 @@ describe('build-core-settings.mjs', () => {
 		const launcher = fileURLToPath(new URL('../../../../src/agent/claude/cli/session-launch.sh', import.meta.url));
 		const src = execFileSync('cat', [launcher], { encoding: 'utf8' });
 		assert.match(src, /build-core-settings\.mjs"[^\n]*"\$REPO\/hooks\/public-write-privacy-guard\.py"/);
+	});
+
+	it('runs every Python hook with the interpreter the launcher resolved, and that command executes', () => {
+		const realHook = fileURLToPath(new URL('../../../../hooks/public-write-privacy-guard.py', import.meta.url));
+		const dir = mkdtempSync(path.join(tmpdir(), 'resolved py '));
+		const mark = path.join(dir, 'used');
+		const wrapper = path.join(dir, "py's wrapper");
+		const realPy = execFileSync('python3', ['-c', 'import sys; print(sys.executable)'], { encoding: 'utf8' }).trim();
+		writeFileSync(wrapper, `#!/bin/sh\necho used > '${mark}'\nexec '${realPy}' "$@"\n`);
+		chmodSync(wrapper, 0o755);
+		const o = JSON.parse(
+			execFileSync(
+				'node',
+				[CORE_BUILDER, GUARD, '', SKILL_TELEMETRY, GMAIL_WRITE_GUARD, GDOCS_WRITE_GUARD, NATIVE_PIM_GUARD, realHook, wrapper],
+				{ encoding: 'utf8' },
+			),
+		);
+		const commands: string[] = [];
+		for (const blocks of Object.values(o.hooks) as any[]) for (const b of blocks) for (const h of b.hooks) commands.push(h.command);
+		const pyCommands = commands.filter((c) => c.includes(".py'"));
+		assert.ok(pyCommands.length >= 6, String(commands));
+		for (const c of pyCommands) {
+			const argv0 = execFileSync('/bin/bash', ['-c', `printf '%s\\n' ${c}`], { encoding: 'utf8' }).split('\n')[0];
+			assert.equal(argv0, wrapper, c);
+		}
+		const cmd = o.hooks.PreToolUse[o.hooks.PreToolUse.length - 1].hooks[0].command;
+		const payload = JSON.stringify({
+			tool_name: 'Bash',
+			tool_input: { command: "gh gist create --public - <<'EOF'\nping @someone-real:matrix.org\nEOF" },
+			cwd: dir,
+		});
+		const out = execFileSync('/bin/sh', ['-c', cmd], { input: payload, encoding: 'utf8' });
+		assert.equal(JSON.parse(out).hookSpecificOutput.permissionDecision, 'deny');
+		assert.ok(existsSync(mark) && readFileSync(mark, 'utf8').includes('used'), 'the resolved interpreter ran the hook');
+	});
+
+	it('keeps bare python3 when the launcher resolved no interpreter', () => {
+		const o = JSON.parse(execFileSync('node', [CORE_BUILDER, GUARD, '', SKILL_TELEMETRY, '', '', '', '/x/p.py', ''], { encoding: 'utf8' }));
+		const last = o.hooks.PreToolUse[o.hooks.PreToolUse.length - 1];
+		assert.match(last.hooks[0].command, /^python3 '/);
+	});
+
+	it('the launcher resolves the interpreter before building settings and passes it', () => {
+		const launcher = fileURLToPath(new URL('../../../../src/agent/claude/cli/session-launch.sh', import.meta.url));
+		const src = execFileSync('cat', [launcher], { encoding: 'utf8' });
+		assert.match(src, /\[ -n "\$\{PY:-\}" \] \|\| resolve_claude_py\n\s*CLAUDE_SETTINGS_JSON=/);
+		assert.match(src, /public-write-privacy-guard\.py" "\$PY"\)"/);
 	});
 
 	it('omitting the native PIM guard path leaves the previous shape untouched', () => {

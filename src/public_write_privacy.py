@@ -34,7 +34,7 @@ CASE_SENSITIVE = ("agent", "person")
 
 # A PUBLIC answer is cached longer than PRIVATE: a stale PUBLIC only scans a
 # private-repo post, a stale PRIVATE would skip the scan after a repo went public.
-TTL_SECONDS = {"PUBLIC": 7 * 86400, "PRIVATE": 3600}
+TTL_SECONDS = {"PUBLIC": 7 * 86400, "PRIVATE": 600}
 
 BUILTIN_PATTERNS = (
     ("local path", re.compile(r"/(?:Users|home)/[A-Za-z0-9._-]+(?=/|\b)")),
@@ -182,6 +182,28 @@ def repo_from_remote(cwd) -> Optional[str]:
     return None
 
 
+def _write_cache(cache_path: Path, cache: dict) -> None:
+    try:
+        Path(cache_path).parent.mkdir(parents=True, exist_ok=True)
+        tmp = Path(str(cache_path) + f".{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(cache, indent=1, sort_keys=True))
+        os.replace(tmp, cache_path)
+    except OSError:
+        pass
+
+
+def forget_visibility(repo: Optional[str], cache_path: Optional[Path]) -> None:
+    """Drop a cached answer for a repo whose visibility a command is changing."""
+    if not repo or cache_path is None:
+        return
+    try:
+        cache = json.loads(Path(cache_path).read_text())
+    except (OSError, ValueError):
+        return
+    if isinstance(cache, dict) and cache.pop(repo.lower(), None) is not None:
+        _write_cache(cache_path, cache)
+
+
 def repo_visibility(repo: Optional[str], cache_path: Optional[Path],
                     lookup: Callable[[str], Optional[str]] = _gh_visibility,
                     now: Optional[float] = None) -> Optional[str]:
@@ -203,11 +225,5 @@ def repo_visibility(repo: Optional[str], cache_path: Optional[Path],
     if value and cache_path is not None:
         cache = cache if isinstance(cache, dict) else {}
         cache[key] = {"visibility": value, "at": now}
-        try:
-            Path(cache_path).parent.mkdir(parents=True, exist_ok=True)
-            tmp = Path(str(cache_path) + f".{os.getpid()}.tmp")
-            tmp.write_text(json.dumps(cache, indent=1, sort_keys=True))
-            os.replace(tmp, cache_path)
-        except OSError:
-            pass
+        _write_cache(cache_path, cache)
     return value

@@ -13,7 +13,7 @@
 // builder treats the obs settings as an opaque JSON blob and array-concats it
 // with the guard, so the two concerns never drift.
 //
-// Usage:  node build-core-settings.mjs <abs-path-to-guard-hook.py> [<obs-settings-json>] [<abs-path-to-skill-telemetry-hook.py>] [<abs-path-to-gmail-write-guard.py>] [<abs-path-to-gdocs-write-guard.py>] [<abs-path-to-native-pim-guard.py>] [<abs-path-to-public-write-privacy-guard.py>]
+// Usage:  node build-core-settings.mjs <abs-path-to-guard-hook.py> [<obs-settings-json>] [<abs-path-to-skill-telemetry-hook.py>] [<abs-path-to-gmail-write-guard.py>] [<abs-path-to-gdocs-write-guard.py>] [<abs-path-to-native-pim-guard.py>] [<abs-path-to-public-write-privacy-guard.py>] [<python-interpreter>]
 //   arg1 (required): path to the guard hook script (skip-ask-user-question.py).
 //   arg2 (optional): the obs `--settings` JSON string from build-hook-settings.mjs;
 //                    empty / omitted → obs hooks are not included.
@@ -35,6 +35,8 @@
 //   arg7 (optional): path to hooks/public-write-privacy-guard.py — registered under
 //                    PreToolUse[Bash]: denies a `gh` write to a non-private repo whose
 //                    text names a private repo, room, person or agent, or a local path.
+//   arg8 (optional): the Python interpreter the launcher resolved; every Python hook
+//                    runs with it. Empty / omitted → `python3`.
 // Prints the merged settings JSON to stdout (exit 2 on a missing guard path,
 // exit 3 on an unparseable obs-settings blob).
 
@@ -53,10 +55,15 @@ const obsJson = process.argv[3] || '';
 // can contain any of these.)
 const shq = (s) => "'" + s.replace(/'/g, "'\\''") + "'";
 
+// arg8: the interpreter the launcher resolved (a bare `python3` can be the Xcode
+// stub on a fresh Mac, which exits before any hook's fail-closed handler runs).
+const pythonBin = (process.argv[9] || '').trim();
+const py = pythonBin ? shq(pythonBin) : 'python3';
+
 // The guard is a PreToolUse hook scoped to the single `AskUserQuestion` tool
 // (exact-string matcher). Defense-in-depth: the script itself re-checks the tool
 // name and no-ops for anything else, so the matcher is belt-and-suspenders.
-const guardCommand = `python3 ${shq(guardHook)}`;
+const guardCommand = `${py} ${shq(guardHook)}`;
 const guardSettings = {
 	hooks: {
 		PreToolUse: [{ matcher: 'AskUserQuestion', hooks: [{ type: 'command', command: guardCommand }] }],
@@ -97,7 +104,7 @@ let skillTelemetrySettings = null;
 if (skillTelemetryHook.trim()) {
 	skillTelemetrySettings = {
 		hooks: {
-			PostToolUse: [{ matcher: 'Skill', hooks: [{ type: 'command', command: `python3 ${shq(skillTelemetryHook)}` }] }],
+			PostToolUse: [{ matcher: 'Skill', hooks: [{ type: 'command', command: `${py} ${shq(skillTelemetryHook)}` }] }],
 		},
 	};
 }
@@ -109,7 +116,7 @@ let gmailWriteGuardSettings = null;
 if (gmailWriteGuardHook.trim()) {
 	gmailWriteGuardSettings = {
 		hooks: {
-			PreToolUse: [{ matcher: 'mcp__.*[Gg][Mm][Aa][Ii][Ll].*', hooks: [{ type: 'command', command: `python3 ${shq(gmailWriteGuardHook)}` }] }],
+			PreToolUse: [{ matcher: 'mcp__.*[Gg][Mm][Aa][Ii][Ll].*', hooks: [{ type: 'command', command: `${py} ${shq(gmailWriteGuardHook)}` }] }],
 		},
 	};
 }
@@ -122,7 +129,7 @@ if (gdocsWriteGuardHook.trim()) {
 	// The hook imports src/ from a CONFIGURED root, never a walk from __file__:
 	// the registration embeds this checkout (the hook file's grandparent).
 	const repoRoot = path.resolve(gdocsWriteGuardHook, '..', '..');
-	const command = `python3 ${shq(gdocsWriteGuardHook)} --repo ${shq(repoRoot)}`;
+	const command = `${py} ${shq(gdocsWriteGuardHook)} --repo ${shq(repoRoot)}`;
 	const entry = { matcher: 'mcp__.*__composio_exec', hooks: [{ type: 'command', command }] };
 	gdocsWriteGuardSettings = { hooks: { PreToolUse: [entry], PostToolUse: [entry] } };
 }
@@ -136,7 +143,7 @@ let nativePimGuardSettings = null;
 if (nativePimGuardHook.trim()) {
 	nativePimGuardSettings = {
 		hooks: {
-			PreToolUse: [{ matcher: NATIVE_PIM_GUARD_MATCHER, hooks: [{ type: 'command', command: `python3 ${shq(nativePimGuardHook)}` }] }],
+			PreToolUse: [{ matcher: NATIVE_PIM_GUARD_MATCHER, hooks: [{ type: 'command', command: `${py} ${shq(nativePimGuardHook)}` }] }],
 		},
 	};
 }
@@ -148,7 +155,7 @@ let publicWriteGuardSettings = null;
 if (publicWriteGuardHook.trim()) {
 	publicWriteGuardSettings = {
 		hooks: {
-			PreToolUse: [{ matcher: 'Bash', hooks: [{ type: 'command', command: `python3 ${shq(publicWriteGuardHook)}` }] }],
+			PreToolUse: [{ matcher: 'Bash', hooks: [{ type: 'command', command: `${py} ${shq(publicWriteGuardHook)}` }] }],
 		},
 	};
 }
