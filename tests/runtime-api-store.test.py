@@ -16,6 +16,7 @@ from __future__ import annotations
 import importlib.util
 import sqlite3
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -204,6 +205,70 @@ INSERT INTO runtime_requests VALUES ('approval-m1','approval','t',NULL,
     again = rs.RequestStore(old_db)
     check(again.get("approval-m1") is not None, "re-boot over migrated DB is clean")
     again.close()
+
+    # The connection is opened check_same_thread=False: a poller on another thread
+    # interleaving with writes used to corrupt reads (InterfaceError, None rows).
+    shared = rs.RequestStore(str(tmp / "threads.sqlite"))
+    errors: list = []
+    stop = threading.Event()
+
+    def poll():
+        while not stop.is_set():
+            try:
+                shared.pending()
+            except Exception as exc:  # noqa: BLE001 - every failure is the finding
+                errors.append(repr(exc))
+
+    poller = threading.Thread(target=poll)
+    poller.start()
+    try:
+        for i in range(2000):
+            rec7 = shared.create("capability", "m", "@a:hs", {"i": i},
+                                 idempotency_key=f"t{i}")
+            if rec7 is None or not shared.transition(rec7["requestId"], "completed",
+                                                     result={"i": i}):
+                errors.append(f"write {i} lost")
+    except Exception as exc:  # noqa: BLE001
+        errors.append(repr(exc))
+    finally:
+        stop.set()
+        poller.join()
+    check(errors == [], f"one store shared by two threads stays consistent: {errors[:3]}")
+    shared.close()
+
+    # create_consuming's insert and consume are one transaction: another thread's
+    # commit landing between them must wait, or it commits the insert alone.
+    txn = rs.RequestStore(str(tmp / "txn.sqlite"))
+    other = txn.create("capability", "m", "@a:hs", {})
+    unapproved = txn.create("approval", "approval.request", "@a:hs", {})
+    real_db = txn._db
+    rival_done = threading.Event()
+
+    def rival():
+        txn.transition(other["requestId"], "completed")
+        rival_done.set()
+
+    class Paused:
+        def __getattr__(self, name):
+            return getattr(real_db, name)
+
+        def execute(self, sql, *args):
+            if sql.startswith("UPDATE runtime_requests SET consumed_at"):
+                t = threading.Thread(target=rival)
+                t.start()
+                t.join(1.0)
+            return real_db.execute(sql, *args)
+
+    txn._db = Paused()
+    lost = txn.create_consuming(unapproved["requestId"], "capability", "m", "@a:hs", {},
+                                idempotency_key="interleaved")
+    rival_done.wait(5)
+    txn._db = real_db
+    check(lost is None and txn.by_idempotency_key("interleaved") is None,
+          "a commit from another thread mid-create_consuming waits; the lost consume leaves no row")
+    check(txn.get(other["requestId"])["status"] == "completed",
+          "the waiting thread's write lands after the transaction")
+    txn.close()
 
     print(f"\n{'PASS — request store unit suite green' if not FAILS else f'FAILED ({len(FAILS)})'}")
     return 1 if FAILS else 0
