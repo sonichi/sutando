@@ -38,11 +38,16 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from urllib.parse import parse_qs
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _helpers.hermetic_env import hermetic_env, isolate_os_environ
+
+# Every spawn below inherits nothing from the outer environment; only the backend checkout passes.
+isolate_os_environ(AG2SPACE_BACKEND_DIR=os.environ.get("AG2SPACE_BACKEND_DIR", ""))
 
 _TESTS = Path(__file__).resolve().parent
 _REPO = _TESTS.parent
-sys.path.insert(0, str(_TESTS))
-from _helpers.hermetic_env import hermetic_env
 
 COMBINED = "voice-outcome-v1,room-context-v1"
 # The poll string the bridge sent before #5865 (the voice-only baseline of case a).
@@ -290,8 +295,11 @@ class CombinedPollAgainstTheBroker(unittest.TestCase):
         self.assertIn("poll proof in force: &capabilities=" + COMBINED, combined["log"])
         self.assertIn("poll proof in force: " + VOICE_ONLY_PROOF, baseline["log"])
         self.assertEqual(len(combined["served"]), 1, combined["log"][-2000:])
-        self.assertIn("capabilities=" + COMBINED.replace(",", "%2C"),
-                      combined["query"][0].replace(",", "%2C"))
+        # On the wire, not just in the bridge's log: each arm's serving poll names exactly its set.
+        caps = lambda q: sorted(c for v in parse_qs(q).get("capabilities", []) for c in v.split(","))
+        self.assertEqual(len(baseline["query"]), 1, baseline["log"][-2000:])
+        self.assertEqual(caps(combined["query"][0]), ["room-context-v1", "voice-outcome-v1"])
+        self.assertEqual(caps(baseline["query"][0]), ["voice-outcome-v1"])
         self.assertTrue(combined["served"][0]["ack_first"])
         # Same served task, ack, result payload and recorded outcome either way.
         for key in ("served", "ack_paths", "ack_bodies", "results", "record", "task_headers"):
