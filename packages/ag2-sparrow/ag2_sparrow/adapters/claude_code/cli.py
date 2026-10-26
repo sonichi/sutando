@@ -190,8 +190,8 @@ SEAT_ENV_KEEP = ("PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "
 
 def seat_child_env(launch: dict, environ=None) -> dict:
     """A seat bridge's whole environment: SEAT_ENV_KEEP from `environ` (default os.environ), then the seat's
-    launch_env over it. Anything else the launcher holds never reaches the bridge."""
-    return dict(cm.child_env_from(SEAT_ENV_KEEP, environ), **launch)
+    launch_env over it, then an empty owner room set last so nothing overrides it. Nothing else reaches it."""
+    return {**cm.child_env_from(SEAT_ENV_KEEP, environ), **launch, "REMOTE_PROACTIVE_ROOM": ""}
 
 
 def install_identity(token_file: str, host_binding: bool) -> str:

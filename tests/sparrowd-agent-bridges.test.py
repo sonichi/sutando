@@ -821,9 +821,11 @@ class SeatBridge(Base):
         for key in _sources.bridge_strip_keys() + (_sources.INJECTED_KEY,):
             self.assertEqual(env.get(key, ""), "", f"{key} reached the seat bridge")
         self.assertEqual({k: env.get(k) for k in self.KEPT}, self.KEPT, "the allowlisted names survive")
-        for key in ("KEEP_ME", "SUTANDO_FOO", "SUTANDO_SUPERVISED", "REMOTE_PROACTIVE_ROOM"):
+        for key in ("KEEP_ME", "SUTANDO_FOO", "SUTANDO_SUPERVISED"):
             self.assertNotIn(key, env, f"{key} is not on the seat allowlist")
-        self.assertEqual(set(env) - set(launched) - set(cli.SEAT_ENV_KEEP), set(), "nothing outside the allowlist")
+        self.assertEqual(env["REMOTE_PROACTIVE_ROOM"], "", "the host's owner room is replaced, never inherited")
+        self.assertEqual(set(env) - set(launched) - set(cli.SEAT_ENV_KEEP), {"REMOTE_PROACTIVE_ROOM"},
+                         "nothing outside the allowlist")
         self.assertEqual(env["AGENT_MXID"], AGENT)
         self.assertEqual(seen["found"], (SEAT_BEARER, "token_file", SEAT_URL, ""))
 
@@ -864,6 +866,32 @@ class SeatBridge(Base):
         rc = bridge.main([str(decl)], workspace=self.ws, get_key=lambda k: self.fail(f"vault read {k}"), run=start)
         self.assertEqual(rc, 0)
         self.assertEqual(seen, {"token": SEAT_BEARER, "url": SEAT_URL, "source": "token_file", "fatal": ""})
+
+    def test_a_seat_never_holds_a_proactive_room_or_drains_a_proactive_file(self):
+        decl = self.declare_seat()
+        with open(os.path.join(self.seat, ".env"), "a", encoding="utf-8") as fh:
+            fh.write("REMOTE_PROACTIVE_ROOM=!seat-env-room:x\n")
+        self.assertEqual(os.environ["REMOTE_PROACTIVE_ROOM"], "!owner-dm", "the host sets it too")
+        results = self.root / "results"
+        results.mkdir(parents=True)
+        planted = results / "proactive-1784700000002.txt"
+        planted.write_text("a nudge for the owner\n", encoding="utf-8")
+        name, seen = "ag2_sparrow.remote_gateway_bridge", {}
+        modules = mock.patch.dict(sys.modules)
+        modules.start()
+        self.addCleanup(modules.stop)
+        sys.modules.pop(name, None)
+
+        def start(module, run_name, alter_sys):
+            local_task_protocol.set_task_stamper(None)
+            mod = importlib.import_module(module)
+            seen.update(env_room=os.environ.get("REMOTE_PROACTIVE_ROOM"), bridge_room=mod.PROACTIVE_ROOM)
+            mod._post_proactive()
+            seen["left"] = sorted(p.name for p in results.iterdir())
+        rc = bridge.main([str(decl)], workspace=self.ws, get_key=lambda k: self.fail(f"vault read {k}"), run=start)
+        self.assertEqual(rc, 0)
+        self.assertEqual(seen, {"env_room": "", "bridge_room": "", "left": [planted.name]},
+                         "the seat's own .env and the host never give it a proactive room, and it claims no nudge")
 
     def test_a_seat_whose_env_names_another_token_file_or_another_seat_never_runs(self):
         decl = self.declare_seat()
