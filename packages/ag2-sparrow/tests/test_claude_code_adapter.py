@@ -497,14 +497,14 @@ class Runner:
         self.table, self.default, self.calls, self.root = dict(table or {}), default, [], root
         self.session, self.adapter, self.install = None, adapter, install
         self.enabled, self.registered, self.stop_delay, self.timers = False, registered, stop_delay, []
-        self.real, self.pause, self.acted, self.shim = False, "", "", False
+        self.real, self.pause, self.acted, self.shim, self.spawned = False, "", "", False, []
 
     def start_session(self, by_manager=False):
         self.stop_session()
         self.session = launched(self.root, self.adapter, self.install, self.real, self.pause, self.acted,
                                 self.shim) if by_manager else \
             hold(self.root, self.adapter, install=self.install)
-        self.spawned = getattr(self, "spawned", []) + [self.session]
+        self.spawned.append(self.session)
 
     def stop_session(self):
         for t in self.timers:
@@ -3211,14 +3211,21 @@ class ConnectCode(AgentRootBase):
                 with mock.patch.object(cm, "AGENT_LOCK_WAIT_S", 0.5), mock.patch.object(cm, "is_macos", return_value=shim):
                     rc, out, err = self.connect(Backend(), fake)
                 Path(r.pause).touch()                       # the paused launcher resumes after the failure
-                for launcher in r.spawned:
-                    launcher.wait(timeout=30)
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline and not Path(r.acted).exists() \
+                        and any(launcher.poll() is None for launcher in r.spawned):
+                    time.sleep(0.1)
+                acted, held = Path(r.acted).exists(), task_io.lock_held(str(self.root))
+                for launcher in r.spawned:                  # cleanup, so one shape cannot leak into the next
+                    if launcher.poll() is None:
+                        launcher.terminate()
+                        launcher.wait(timeout=30)
+                self.assertFalse(acted, "the late launcher never held or acted on the root")
+                self.assertEqual(held, "free")
                 self.assertNotEqual(rc, 0, out + err)
                 self.assertNotIn("next:", out)
                 self.assertIn("did not acquire", err)
                 self.assertIn("the job this operation started, was stopped", err)
-                self.assertFalse(Path(r.acted).exists(), "the late launcher never held or acted on the root")
-                self.assertEqual(task_io.lock_held(str(self.root)), "free")
 
     def test_the_real_launcher_through_launchds_shim_ends_up_alive(self):
         fake = self.bridged()
