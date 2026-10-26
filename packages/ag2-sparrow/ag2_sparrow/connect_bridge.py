@@ -334,7 +334,7 @@ def redeem_into_seat(base: str, code_arg, trust_relay_host: str, preflight,
                      local: cm.Shape) -> "tuple[dict | None, str]":
     """({agent_id, root, seat_env}, '') or (None, the line to print): the code read, checked with
     `preflight()` before it is spent, redeemed once, and the credential written to the agent's seat by its
-    owner only while this process holds the root (connect_common.under_root). The bearer never leaves the seat's token file."""
+    owner only while this process holds the root and its path still names it (connect_common.under_root). The bearer never leaves the seat's token file."""
     code, problem = cm.read_code(code_arg)
     problem = problem or cm.code_problem(base, code) or preflight()
     if problem:
@@ -347,7 +347,8 @@ def redeem_into_seat(base: str, code_arg, trust_relay_host: str, preflight,
         str(_dirs.agents_dir() / agent_identity.root_segment(redeemed["agent_id"])), "")
     if problem:
         return None, f"the code is spent but the seat was not written: {problem}; make a new code"
-    written, held = cm.under_root(local, root, lambda: cm.write_seat(bridge_home(root), redeemed))
+    written, held = cm.under_root(local, root,
+                                  lambda owner: cm.write_seat_held(owner, root, bridge_home(root), redeemed))
     if held:
         return None, (f"{held}; the code is spent and nothing was written ({bridge_home(root)} is unchanged): "
                       "make a new code in AG2 Space once the root is free")

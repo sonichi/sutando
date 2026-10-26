@@ -693,8 +693,8 @@ CONNECT_HOLDER = "connect"
 
 
 def under_root(shape: Shape, root: str, act) -> "tuple[object, str]":
-    """(act(), '') run while this process holds `root`'s lock, so no adapter takes or leaves the root
-    meanwhile. A free root is taken; one held by `shape`'s own job on this very root is stopped, then
+    """(act(owner), '') run while this process holds `root`'s lock as `owner`, so no adapter takes or leaves
+    the root meanwhile; act binds itself to owner's root (root_is_held). A free root is taken; one held by `shape`'s own job on this very root is stopped, then
     taken; anything else, or a root another process takes first, is (None, why) and act never runs."""
     try:
         with operation_lock(shape):
@@ -713,7 +713,7 @@ def under_root(shape: Shape, root: str, act) -> "tuple[object, str]":
                 return None, (f"{root} was taken by another process first ({e.line})"
                               + (f"; {job_name(shape)} is stopped" if held else ""))
             try:
-                return act(), ""
+                return act(owner), ""
             finally:
                 release_lock(owner)
     except Busy as e:
@@ -1263,6 +1263,57 @@ def seat_instance(seat) -> str:
 def seat_env_path(seat) -> str:
     """The seat's .env, where write_seat puts it."""
     return os.path.join(_sources.seat_channel_dir(seat), ".env")
+
+
+def root_is_held(owner, root: str) -> bool:
+    """Whether the path `root` still names the directory `owner` holds open (a link is not followed)."""
+    try:
+        here, held = os.lstat(root), os.fstat(owner.root_fd)
+    except OSError:
+        return False
+    return stat.S_ISDIR(here.st_mode) and (here.st_dev, here.st_ino) == (held.st_dev, held.st_ino)
+
+
+def _identity(path) -> "tuple | None":
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    return stat.S_IFMT(st.st_mode), st.st_dev, st.st_ino
+
+
+def _bytes_or_none(path) -> "bytes | None":
+    try:
+        with open(path, "rb") as fh:
+            return fh.read()
+    except FileNotFoundError:
+        return None
+
+
+def write_seat_held(owner, root: str, seat, redeemed: dict) -> "tuple[str, str]":
+    """write_seat bound to the root `owner` holds: refused unless `root` names that directory first; if it
+    stops naming it, or a seat directory is replaced, during the write, the previous seat files are put back."""
+    if not root_is_held(owner, root):
+        return "", f"{root} is no longer the directory connect holds (it was replaced); the seat is unchanged"
+    chan = _sources.seat_channel_dir(seat)
+    dirs = (os.fspath(seat), os.path.dirname(chan), chan)
+    ids = [_identity(d) for d in dirs]
+    if any(i is not None and i[0] != stat.S_IFDIR for i in ids):
+        return "", f"{seat} is not a plain directory tree; the seat is unchanged"
+    names = (_sources.SEAT_TOKEN_NAME, ".env")
+    before = {n: _bytes_or_none(os.path.join(chan, n)) for n in names}
+    seat_env, problem = write_seat(seat, redeemed)
+    if problem:
+        return "", problem
+    if root_is_held(owner, root) and all(i is None or _identity(d) == i for d, i in zip(dirs, ids)):
+        return seat_env, ""
+    for n, data in before.items():
+        path = os.path.join(chan, n)
+        if data is None:
+            Path(path).unlink(missing_ok=True)
+        else:
+            _sources._replace_file(path, data.decode("utf-8"), 0o600)
+    return "", f"{root} was replaced while the seat was written; the previous seat was put back"
 
 
 def write_seat(seat, redeemed: dict) -> "tuple[str, str]":
