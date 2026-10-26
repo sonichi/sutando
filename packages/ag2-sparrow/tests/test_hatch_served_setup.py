@@ -1083,11 +1083,13 @@ print(json.dumps({"files": files, "status": json.load(open(m.GATEWAY_STATUS_FILE
     def test_the_media_token_a_rotated_token_and_a_url_username_are_registered(self):
         media, rotated = "media-tok-77", "rotated-secret-99"
         token_file = self.home / "token"
-        token_file.write_text(f"REMOTE_TASK_TOKEN={rotated}\n")
+        token_file.write_text("REMOTE_TASK_TOKEN=start-secret-55\n")  # the startup token; then a rotation
+        token_file.chmod(0o600)
         url = "https://longusername1:pw-123456@gw.example/relay"
         out = self.bridge("""
 import json
 from ag2_sparrow import remote_gateway_bridge as m
+open(m.TOKEN_FILE, "w").write("REMOTE_TASK_TOKEN=ROTATED\\n")
 assert m._reload_rotated_token(), "the rotation is read"
 for word in ("MEDIA", "ROTATED", "longusername1"):
     m._log("a line naming " + word)

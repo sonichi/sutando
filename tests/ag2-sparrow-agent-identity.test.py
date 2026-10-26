@@ -91,6 +91,15 @@ class Resolve(unittest.TestCase):
         (self.dir / "auth" / "ag2space.json").write_text("{not json")
         self.assertEqual(ai.enrolled(self.dir), "")
 
+    def test_a_seat_is_strict_and_never_reads_the_hosts_binding(self):
+        self.binding("@core:x")
+        seat = {"REMOTE_TASK_SEAT": "1"}
+        self.assertEqual(ai.resolve(self.dir, {"AGENT_MXID": "@seat:x"}.get, seat), "@seat:x")
+        self.assertEqual(ai.resolve(self.dir, {}.get, seat), "", "a seat with no identity of its own is unknown")
+        self.assertEqual(ai.resolve(self.dir, {}.get, {}, strict=True), "")
+        self.assertEqual(ai.resolve(self.dir, {}.get, seat, strict=False), "@core:x", "strict is the caller's to override")
+        self.assertEqual(ai.resolve(self.dir, {}.get, {}), "@core:x", "the core keeps its binding tier")
+
     def test_env_files_skip_what_cannot_be_read_and_keep_an_explicit_blank(self):
         good, bad, blank = self.dir / "a.env", self.dir / "b.env", self.dir / "c.env"
         good.write_text("# note\n\nAGENT_MXID='@q:x'\nnoequals\n")

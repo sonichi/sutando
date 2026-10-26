@@ -2028,6 +2028,7 @@ def main() -> int:
     tok_file = tok_dir / "relay.env"
     # _read_token_file: dotenv form (export prefix + quotes stripped)
     tok_file.write_text('# comment\nexport REMOTE_TASK_TOKEN="dotenv-secret"\nOTHER=x\n')
+    tok_file.chmod(0o600)  # a token file is read only when it is private
     check(rtc._read_token_file(str(tok_file)) == "dotenv-secret",
           "_read_token_file parses dotenv form (export + quotes)")
     # raw onboarding-string form (no KEY=)
