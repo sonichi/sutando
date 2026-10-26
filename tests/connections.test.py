@@ -2644,6 +2644,72 @@ class ZombieChild(Base):
         self.assertEqual(C.bridge_pid("beta-fixture-net", self.ws), 0)
 
 
+@unittest.skipIf(os.name == "nt", "zombies are a POSIX state")
+class ZombieWithoutWaitid(Base):
+    """Where os.waitid is missing (macOS before 3.13), an exited, unreaped bridge still reads as stopped."""
+
+    BRIDGE = ("import os, signal, sys, time\nfrom pathlib import Path\nsys.path.insert(0, sys.argv[1])\n"
+              "import workspace_lock as wl\nws, role = Path(sys.argv[2]), sys.argv[3]\nwl.acquire(role, ws)\n"
+              "signal.signal(signal.SIGTERM, lambda *a: (wl.release(role, ws), os._exit(0)))\n"
+              "print('held', flush=True)\nwhile True:\n    time.sleep(0.2)\n")
+    PARENT = ("import subprocess, sys, time\nsubprocess.Popen([sys.executable, '-c', *sys.argv[1:]])\n"
+              "time.sleep(600)\n")
+    INST = "beta-fixture-net"
+
+    def setUp(self):
+        super().setUp()
+        patcher = unittest.mock.patch.object(C, "STOP_TIMEOUT_S", 10)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        if hasattr(os, "waitid"):
+            waitid = os.waitid
+            del os.waitid
+            self.addCleanup(setattr, os, "waitid", waitid)
+        self.add()
+        self.add(TOKEN_B, fetch=agents("@s:beta-fixture.net"))
+        self.args = [self.BRIDGE, str(ROOT / "src"), str(self.ws), C._bridge_role(self.INST)]
+
+    def start(self, argv):
+        proc = subprocess.Popen(argv, stdout=subprocess.PIPE, env=isolated_child_env(), text=True)
+        self.children.append(proc)
+        self.assertEqual(proc.stdout.readline().strip(), "held")
+        return proc
+
+    def assert_stops_promptly(self, pid):
+        t0 = time.monotonic()
+        self.assertEqual(C.stop_bridge(self.INST, workspace=self.ws), pid)
+        self.assertLess(time.monotonic() - t0, 3, "an exited bridge was waited on as if it still ran")
+        self.assertEqual(C.bridge_pid(self.INST, self.ws), 0)
+
+    def test_our_exited_unreaped_child_is_stopped(self):
+        proc = self.start([sys.executable, "-c", *self.args])
+        self.assert_stops_promptly(proc.pid)
+
+    def test_another_process_exited_unreaped_child_is_stopped(self):
+        self.start([sys.executable, "-c", self.PARENT, *self.args])
+        pid = C.bridge_pid(self.INST, self.ws)
+        self.assertTrue(pid)
+        self.assert_stops_promptly(pid)
+
+
+@unittest.skipIf(os.name == "nt", "zombies are a POSIX state")
+class ZombieProbeFailures(unittest.TestCase):
+    """A probe that cannot answer reads as still running, so stop_bridge keeps waiting instead of guessing."""
+
+    def test_a_waitpid_error_other_than_not_our_child_reads_as_running(self):
+        with unittest.mock.patch.object(C.os, "waitpid", side_effect=PermissionError):
+            self.assertFalse(C._zombie(12345))
+
+    def test_our_child_still_running_reads_as_running(self):
+        with unittest.mock.patch.object(C.os, "waitpid", return_value=(0, 0)):
+            self.assertFalse(C._zombie(12345))
+
+    def test_ps_that_cannot_run_reads_as_running(self):
+        with unittest.mock.patch.object(C.os, "waitpid", side_effect=ChildProcessError), \
+                unittest.mock.patch.object(C.subprocess, "run", side_effect=subprocess.TimeoutExpired("ps", 5)):
+            self.assertFalse(C._zombie(12345))
+
+
 FAKE_SECURITY = r"""#!/usr/bin/env bash
 verb="$1"; shift; key=""; value=""
 while [ $# -gt 0 ]; do case "$1" in -s) key="$2"; shift 2;; -w) if [ "$verb" = add-generic-password ]; then value="$2"; shift 2; else shift; fi;; *) shift;; esac; done
@@ -3097,7 +3163,7 @@ class LingeringBridge(Base):
                            workspace=self.ws, vault=self.vault, spawn=self.spawn, kill=os.kill,
                            fetch=agents("@s:beta-fixture.net"))
         self.assert_lingering(ctx)
-        self.assertIn("still runs on the old code", str(ctx.exception))
+        self.assertIn("was not confirmed stopped and may still be running on the old code", str(ctx.exception))
         self.assertEqual(self.vault.store[self.REF], TOKEN_B, "the vault still holds the old code")
         self.assertEqual(self.beta(), before, "the row is unchanged")
         self.assertEqual(self.spawned, [], "no second bridge")

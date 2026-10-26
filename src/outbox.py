@@ -1237,6 +1237,8 @@ def requeue_item_with_epoch(root: Path, item_id: str, *, reset_attempts: bool = 
         if d.get("status") != "PARKED":
             return RequeueOutcome.NOT_PARKED, None
         _release_locked(root, item_id, force=True)
+        if d.get("reason") == "outcome-unknown" or dispatch_unsettled(d):
+            d["prior_outcome_unknown"] = True  # an earlier send may be visible; never cleared
         d["resend_epoch"] = int(d.get("resend_epoch", 0) or 0) + 1
         d["status"] = "QUEUED"
         d["reason"] = None

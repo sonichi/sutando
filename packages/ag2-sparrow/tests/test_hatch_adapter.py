@@ -4,6 +4,7 @@ The hook script runs against a stub hook runtime (log/silent/wake/state) and the
 real task-field helper; `flock` and `timeout` are stubbed. Run:
     python3 packages/ag2-sparrow/tests/test_hatch_adapter.py
 """
+import hashlib
 import json
 import os
 import re
@@ -16,10 +17,13 @@ import sys
 import tempfile
 import time
 import contextlib
+import errno
 import io
+import textwrap
 import threading
 import types
 import unittest
+import urllib.error
 from pathlib import Path
 from unittest import mock
 
@@ -32,7 +36,8 @@ isolate_os_environ()
 PKG_ROOT = Path(__file__).resolve().parents[1]
 HATCH = PKG_ROOT / "ag2_sparrow" / "adapters" / "hatch"
 sys.path.insert(0, str(PKG_ROOT))
-from ag2_sparrow import agent_identity, gateway_credential_io, health_command as hc, holder_lock, outbox, service_manager as sm, task_io  # noqa: E402
+from ag2_sparrow import agent_identity, bounded_file_read, delivery_destination, gateway_credential_io, health_command as hc, holder_lock, outbox, service_manager as sm, task_hold, task_io  # noqa: E402
+from ag2_sparrow.result_markers import parse_markers  # noqa: E402
 from ag2_sparrow.adapters.hatch import (  # noqa: E402
     cli as hatch_cli, keepalive, runtime_text, task_fields)
 
@@ -52,6 +57,8 @@ REAL_ENSURE_SPARROW = keepalive.ensure_sparrow
 # The CLIs run in-process so repository coverage traces them.
 SCRIPT = HATCH / "ag2-sparrow-hatch.sh"
 AGENT = "@watch-agent:ag2.space"
+# This process's start, as a drain writes it into its lane record and lock.
+OWN_START = task_io.start_time(os.getpid())
 
 RUNTIME = r"""
 log() { printf 'LOG %s\n' "$1" >>"$EVENTS"; }
@@ -140,6 +147,11 @@ def run_main(main, args, env):
         except SystemExit as e:
             rc = e.code
     return types.SimpleNamespace(returncode=rc, stdout=out.getvalue(), stderr=err.getvalue())
+
+
+def claim_of(queued: Path, pid: int) -> Path:
+    """The name the drain renames `queued` to while process `pid` sends it."""
+    return queued.with_suffix(f".sending.{pid}.1")
 
 
 def py_env(home):
@@ -279,7 +291,7 @@ class HookScript(Base):
     def reason(self):
         return Path(str(self.wake_out) + ".reason").read_text().strip()
 
-    def run_script(self, **env_extra):
+    def run_script(self, script=None, **env_extra):
         env = py_env(self.home)
         env.update({
             "PATH": f"{self.bin}:{os.environ['PATH']}",
@@ -289,7 +301,7 @@ class HookScript(Base):
             "WAKE_OUT": str(self.wake_out),
         })
         env.update(env_extra)
-        return subprocess.run(["bash", str(SCRIPT)], env=env, capture_output=True, text=True)
+        return subprocess.run(["bash", str(script or SCRIPT)], env=env, capture_output=True, text=True)
 
     def events_list(self):
         return self.events.read_text().split() if self.events.exists() else []
@@ -367,7 +379,79 @@ class HookScript(Base):
         self.assertEqual((m["task_id"], m["rewake"], m["wakes"]), ("task-1784700000001", True, 1))
         self.assertIn("rewake: true", p["worker_note"])
         self.assertIn("repeat its HANDOFF block", p["worker_note"])
+        self.assertIn("hold <its result_file>` once", p["worker_note"])
         self.assertEqual(self.stored()["woken"]["task-1784700000001"]["n"], 2)
+
+    def test_a_held_item_is_rewoken_as_held_and_never_answered(self):
+        self.add_task("task-1784700000001", "$held", mtime=1000)
+        self.add_task("task-1784700000002", "$open", mtime=2000)
+        self.run_script()
+        self.assertNotIn("held: true", self.payload()["worker_note"])
+        # The worker parked the first item with `hold` after its first wake.
+        task_hold.place(self.results, "task-1784700000001")
+        st = self.stored()
+        for tid in ("task-1784700000001", "task-1784700000002"):
+            st["woken"][tid]["at"] -= 1800000
+        self.state.write_text(json.dumps(st))
+        self.reset()
+        self.run_script()
+        p = self.payload()
+        held, open_ = p["matches"]
+        self.assertEqual((held["task_id"], held["rewake"], held["held"]),
+                         ("task-1784700000001", True, True))
+        self.assertEqual((open_["task_id"], open_["rewake"]), ("task-1784700000002", True))
+        self.assertNotIn("held", open_, "an unheld item is unchanged")
+        note = p["worker_note"]
+        self.assertIn("Items with held: true already wait for your owner's go: never answer one", note)
+        self.assertIn("repeat only its HANDOFF block", note)
+        self.assertIn("If one is held (held: true), waits on the main session", note)
+        # Released (answered through `reply`), the item is woken for as before, unflagged.
+        task_hold.release(self.results, "task-1784700000001")
+        st = self.stored()
+        st["woken"]["task-1784700000001"]["at"] -= 1800000
+        self.state.write_text(json.dumps(st))
+        self.reset()
+        self.run_script()
+        (m,) = self.payload()["matches"]
+        self.assertNotIn("held", m)
+        self.assertNotIn("held: true already wait", self.payload()["worker_note"])
+
+    def test_a_hook_registered_before_the_held_branch_never_wakes_for_a_held_item(self):
+        # A pip upgrade leaves the registered hook as it was: 0.6.0's shell with this package.
+        old = Path(__file__).with_name("hatch_hook_0_6_0.sh")
+        source = json.loads(old.with_name(old.name + ".provenance.json").read_text())
+        self.assertEqual((source["source_tag"], hashlib.sha256(old.read_bytes()).hexdigest()),
+                         ("sparrow-v0.6.0", source["sha256"]), "the fixture is the released hook, unedited")
+        self.assertNotIn("held", old.read_text())
+        self.add_task("task-1784700000001", "$held", mtime=1000)
+        self.add_task("task-1784700000002", "$open", mtime=2000)
+        self.run_script(script=old)
+        task_hold.place(self.results, "task-1784700000001")
+        st = self.stored()
+        for tid in ("task-1784700000001", "task-1784700000002"):
+            st["woken"][tid]["at"] -= 1800000
+        self.state.write_text(json.dumps(st))
+        self.reset()
+        self.run_script(script=old)
+        self.assertEqual([m["task_id"] for m in self.payload()["matches"]], ["task-1784700000002"],
+                         "the old hook is never handed the held item")
+        self.assertTrue(all("held" not in m for m in self.payload()["matches"]))
+        # Released, the item comes back to the old hook as an ordinary open item.
+        task_hold.release(self.results, "task-1784700000001")
+        self.reset()
+        self.run_script(script=old)
+        self.assertEqual([m["task_id"] for m in self.payload()["matches"]], ["task-1784700000001"])
+
+    def test_held_items_are_listed_only_to_a_hook_that_declares_it_explains_them(self):
+        self.add_task("task-1784700000001", "$held")
+        task_hold.place(self.results, "task-1784700000001")
+        argv = ["--task-dir", str(self.tasks), "--result-dir", str(self.results)]
+        for env, want in (({}, []), ({task_fields.HELD_AWARE_ENV: "0"}, []),
+                          ({task_fields.HELD_AWARE_ENV: "1"}, ["task-1784700000001"])):
+            with self.subTest(env=env):
+                r = run_main(task_fields.main, argv, {**py_env(self.home), **env})
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertEqual([i["task_id"] for i in json.loads(r.stdout)], want)
 
     def test_rewakes_stop_at_the_cap(self):
         self.add_task("task-1784700000001", "$reply")
@@ -796,6 +880,17 @@ class TaskFields(Base):
         self.assertEqual((item["event_id"], item["thread_root"], item["sender"], item["sender_name"],
                           item["access_tier"], item["collaborator"]),
                          ("$m", "$t", "@bob:ag2.space", "Bob", "owner", False))
+
+    def test_a_held_task_carries_held_and_an_unheld_one_does_not(self):
+        self.add_task("task-1784700000001", "$held", mtime=1000)
+        self.add_task("task-1784700000002", "$open", mtime=2000)
+        task_hold.place(self.results, "task-1784700000001")
+        held, open_ = task_fields.list_open_tasks(self.tasks, self.results)
+        self.assertEqual((held["task_id"], held["held"]), ("task-1784700000001", True))
+        self.assertNotIn("held", open_)
+        # A marker that is not a whole, well-formed hold is no hold.
+        (self.results / task_hold.HOLD_DIR / "task-1784700000002.json").write_text("{")
+        self.assertNotIn("held", task_fields.list_open_tasks(self.tasks, self.results)[1])
 
     def test_snippet_skips_the_matrix_reply_fallback(self):
         # As the gateway folds it: quoted lines, the blank separator, then the reply.
@@ -1244,6 +1339,28 @@ class Cli(Base):
         self.assertEqual(code, hatch_cli.SPARROW_DOWN)
         code, detail = hatch_cli.check_sparrow(self.state, now=1010, instance="blue")
         self.assertEqual(code, hatch_cli.SPARROW_OK, detail)
+
+    def test_a_status_dated_in_the_future_or_stale_reads_down(self):
+        self.state.mkdir()
+        status = self.state / "gateway-status.json"
+        now = 1_800_000_000
+        skew = hatch_cli.SPARROW_STATUS_FUTURE_SKEW_S
+        for ts, want in ((1e11, hatch_cli.SPARROW_DOWN), (now + 60, hatch_cli.SPARROW_DOWN),
+                         (now + skew + 0.000001, hatch_cli.SPARROW_DOWN),
+                         (now + skew + 0.5, hatch_cli.SPARROW_DOWN), (now + skew, hatch_cli.SPARROW_OK),
+                         (now - 181, hatch_cli.SPARROW_DOWN), (now + 2, hatch_cli.SPARROW_OK),
+                         (now - 10, hatch_cli.SPARROW_OK)):
+            with self.subTest(age=now - ts):
+                status.write_text(json.dumps({"connected": True, "ts": ts}))
+                self.assertEqual(hatch_cli.check_sparrow(self.state, now=now, instance="")[0], want)
+
+    def test_an_unrepresentable_status_ts_reads_down_without_crashing(self):
+        self.state.mkdir()
+        for raw in ("1" + "0" * 400, "-1" + "0" * 400, "NaN", "Infinity", "true", '"1000"'):
+            with self.subTest(ts=raw[:8]):
+                (self.state / "gateway-status.json").write_text('{"connected": true, "ts": %s}' % raw)
+                code, detail = hatch_cli.check_sparrow(self.state, now=1010, instance="")
+                self.assertEqual(code, hatch_cli.SPARROW_DOWN, detail)
 
     def test_install_keeps_auto_upgrade_off(self):
         self.assertEqual(self.cli("install", "--mxid", AGENT).returncode, 0)
@@ -2204,6 +2321,210 @@ class Keepalive(Base):
         self.assertIn("health=abnormal (task-not-picked-up); an AG2 Space task has been open "
                       "over 15 minutes", self.cli("verify").stdout)
 
+    def test_a_deliberately_held_task_reports_held_not_stuck(self):
+        self.installed()
+        self.keepawake_at(time.time() - 60)
+        self.hook_ran()
+        old = time.time() - 20 * 60
+        tid = "task-1784700000005"
+        self.add_task(tid, "$held", mtime=old)
+        task_hold.place(self.results, tid, task_hold.OWNER_GO, now=old + 30)
+        outbox.record_delivered(self.results / delivery_destination.RECEIPT_DIR, hatch_cli._hold_notice(Path(), tid).stem + "~0")
+        row = self.health()
+        self.assertEqual((row["condition"], row["reason"]), ("healthy", keepalive.TASK_HELD))
+        self.assertAlmostEqual(row["since"], old + 30, delta=1)
+        self.assertEqual(hc.validate(row), (row, None))
+        # Kill control: the same task without its marker is the stuck one.
+        task_hold.release(self.results, tid)
+        self.assertEqual(self.health()["reason"], keepalive.TASK_NOT_PICKED_UP)
+
+    def test_a_hold_whose_room_line_never_delivers_reports_stuck(self):
+        self.installed()
+        self.keepawake_at(time.time() - 60)
+        self.hook_ran()
+        tid = "task-1784700000005"
+        self.add_task(tid, "$held", mtime=time.time() - 30 * 60)
+        bound = 10 * 60
+        since = time.time() - bound - 60
+        task_hold.place(self.results, tid, task_hold.OWNER_GO, now=since)
+        (self.results / hatch_cli._hold_notice(Path(), tid).name).write_text("[channel: !room:ag2.space]\nheld\n")
+        row = self.health()
+        self.assertEqual((row["condition"], row["reason"]), ("abnormal", "task-held-line-undelivered"))
+        self.assertAlmostEqual(row["since"], since + bound, delta=1)
+        self.assertEqual(hc.validate(row), (row, None))
+        self.assertEqual((keepalive.TASK_HELD_UNDELIVERED, keepalive.HELD_LINE_DELIVER_S),
+                         ("task-held-line-undelivered", bound))
+        self.assertIn(keepalive.TASK_HELD_UNDELIVERED, keepalive.REASON_HINTS)
+        # Controls: a delivered line is a healthy hold, and so is a young undelivered one.
+        outbox.record_delivered(self.results / delivery_destination.RECEIPT_DIR, hatch_cli._hold_notice(Path(), tid).stem + "~0")
+        self.assertEqual((self.health()["condition"], self.health()["reason"]), ("healthy", keepalive.TASK_HELD))
+        task_hold.release(self.results, tid)
+        shutil.rmtree(self.results / delivery_destination.RECEIPT_DIR)
+        task_hold.place(self.results, tid, task_hold.OWNER_GO, now=time.time() - 60)
+        self.assertEqual(self.health()["reason"], keepalive.TASK_HELD)
+
+    def test_the_held_line_outcome_is_the_proactive_outboxs(self):
+        self.installed()
+        self.keepawake_at(time.time() - 60)
+        self.hook_ran()
+        tid = "task-1784700000005"
+        self.add_task(tid, "$held", mtime=time.time() - 30 * 60)
+        since = time.time() - keepalive.HELD_LINE_DELIVER_S - 60
+        task_hold.place(self.results, tid, task_hold.OWNER_GO, now=since)
+        stem = hatch_cli._hold_notice(Path(), tid).stem
+        root = self.results / delivery_destination.RECEIPT_DIR
+        # Gone from the queue with no outbox record at all: nothing proves where it went.
+        row = self.health()
+        self.assertEqual((row["condition"], row["reason"]), ("abnormal", "task-held-line-unconfirmed"))
+        self.assertEqual(hatch_cli.hold_line_outcome(self.results, tid), "unconfirmed")
+        self.assertIn("can't be confirmed", keepalive.REASON_HINTS[keepalive.TASK_HELD_UNCONFIRMED])
+        self.assertNotIn("heard nothing", keepalive.REASON_HINTS[keepalive.TASK_HELD_UNCONFIRMED])
+        self.assertEqual(hc.validate(row), (row, None))
+        claim = self.results / f"{stem}.sending.4242.1"
+        claim.write_text("held\n")
+        self.assertEqual(hatch_cli.hold_line_outcome(self.results, tid), "undelivered", "still being sent")
+        claim.unlink()
+        for reason, want in (("refused: room not found", "undelivered"),
+                             ("outcome-unknown", "unconfirmed"),
+                             ("withdrawn: the task has been answered", "withdrawn")):
+            with self.subTest(reason=reason):
+                shutil.rmtree(root, ignore_errors=True)
+                outbox.park_item(root, f"{stem}~0", reason)
+                self.assertEqual(hatch_cli.hold_line_outcome(self.results, tid), want)
+        shutil.rmtree(root)
+        outbox.record_dispatching(root, f"{stem}~0", "incarnation-1")  # a send left, no outcome
+        self.assertEqual(hatch_cli.hold_line_outcome(self.results, tid), "unconfirmed")
+        shutil.rmtree(root)
+        outbox.record_delivered(root, f"{stem}~0", provider="ag2space-proactive")
+        self.assertEqual(hatch_cli.hold_line_outcome(self.results, tid), "delivered")
+
+    def test_a_hold_line_withdrawn_unsent_reports_undelivered(self):
+        # Reviewer's B1: the drain withdrew the line of a hold that still stands; the asker heard nothing.
+        self.installed()
+        self.keepawake_at(time.time() - 60)
+        self.hook_ran()
+        tid = "task-1784700000005"
+        self.add_task(tid, "$held", mtime=time.time() - 30 * 60)
+        since = time.time() - keepalive.HELD_LINE_DELIVER_S - 60
+        task_hold.place(self.results, tid, task_hold.OWNER_GO, now=since)
+        stem = hatch_cli._hold_notice(Path(), tid).stem
+        outbox.park_item(self.results / delivery_destination.RECEIPT_DIR, f"{stem}~0",
+                         "withdrawn:its hold could not be checked ([Errno 24] Too many open files)")
+        self.assertEqual(hatch_cli.hold_line_outcome(self.results, tid), "withdrawn")
+        row = self.health()
+        self.assertEqual((row["condition"], row["reason"]), ("abnormal", keepalive.TASK_HELD_UNDELIVERED))
+        self.assertAlmostEqual(row["since"], since + keepalive.HELD_LINE_DELIVER_S, delta=1)
+        self.assertEqual(hc.validate(row), (row, None))
+
+    def stale_hold(self, tid):
+        self.add_task(tid, "$held", mtime=time.time() - 30 * 60)
+        task_hold.place(self.results, tid, task_hold.OWNER_GO,
+                        now=time.time() - keepalive.HELD_LINE_DELIVER_S - 60)
+        return self.results / hatch_cli._hold_notice(Path(), tid).name
+
+    def test_keepawake_never_touches_a_hold(self):
+        self.installed()
+        tid = "task-1784700000005"
+        notice = self.stale_hold(tid)
+        notice.write_text("[channel: !room:ag2.space]\nheld\n")
+        mark = task_hold.read(self.results, tid)
+        with mock.patch.object(keepalive, "restart_listener", return_value=(False, "test")):
+            self.cli("keepalive", "keepawake")
+        self.assertEqual(task_hold.read(self.results, tid), mark, "the hold is reported, never released")
+        self.assertTrue(notice.exists(), "and its queued line is left to the drain")
+        self.assertEqual(self.health()["reason"], keepalive.TASK_HELD_UNDELIVERED)
+
+    def test_a_parked_line_is_matched_by_its_exact_name_only(self):
+        short, long = "task-1784700000005", "task-1784700000005-1792760000"
+        for tid in (short, long):
+            self.stale_hold(tid)
+        root = self.results / delivery_destination.RECEIPT_DIR
+        outbox.park_item(root, hatch_cli._hold_notice(Path(), long).stem + "~0", "refused: room not found")
+        self.assertEqual(hatch_cli.hold_line_outcome(self.results, long), "undelivered")
+        self.assertEqual(hatch_cli.hold_line_outcome(self.results, short), "unconfirmed",
+                         "another task's park is no evidence about this one")
+
+    def test_an_unwritable_log_never_stops_the_listener_check(self):
+        self.installed()
+        self.log.parent.mkdir(parents=True, exist_ok=True)
+        self.log.unlink(missing_ok=True)
+        self.log.mkdir()  # any write to it fails
+        with mock.patch.object(keepalive, "listener_up", return_value=False), \
+                mock.patch.object(keepalive, "restart_listener", return_value=(True, "test")) as restart:
+            r = self.cli("keepalive", "keepawake")
+        restart.assert_called_once()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("keepalive log not written", r.stderr)
+
+    def test_a_far_future_or_unrepresentable_hold_time_is_no_hold(self):
+        self.installed()
+        self.keepawake_at(time.time() - 60)
+        self.hook_ran()
+        tid = "task-1784700000005"
+        self.add_task(tid, "$held", mtime=time.time() - 20 * 60)
+        task_hold.place(self.results, tid)
+        marker = self.results / task_hold.HOLD_DIR / f"{tid}.json"
+        good = json.loads(marker.read_text())
+        for since in (time.time() + 3600, 10**400, -10**400):
+            with self.subTest(since=str(since)[:12]):
+                marker.write_text(json.dumps({**good, "since": since}))
+                row = self.health()
+                self.assertEqual((row["condition"], row["reason"]), ("abnormal", keepalive.TASK_NOT_PICKED_UP))
+                self.assertIsNone(task_hold.read(self.results, tid))
+                self.assertEqual(keepalive.open_tasks({"RESULT_DIR": str(self.results),
+                                                       "TASK_DIR": str(self.tasks)}, time.time())[1], None)
+
+    def test_a_hold_never_masks_a_stuck_task_beside_it(self):
+        self.installed()
+        self.keepawake_at(time.time() - 60)
+        self.hook_ran()
+        old = time.time() - 20 * 60
+        self.add_task("task-1784700000005", "$held", mtime=old - 60)
+        task_hold.place(self.results, "task-1784700000005")
+        self.add_task("task-1784700000006", "$stuck", mtime=old)
+        row = self.health()
+        self.assertEqual((row["condition"], row["reason"]), ("abnormal", keepalive.TASK_NOT_PICKED_UP))
+        self.assertAlmostEqual(row["since"], old + keepalive.TASK_PICKUP_S, delta=1)
+
+    def test_a_marker_that_is_not_a_whole_well_formed_hold_still_reads_stuck(self):
+        self.installed()
+        self.keepawake_at(time.time() - 60)
+        self.hook_ran()
+        tid = "task-1784700000005"
+        self.add_task(tid, "$held", mtime=time.time() - 20 * 60)
+        task_hold.place(self.results, tid)
+        self.assertEqual(self.health()["reason"], keepalive.TASK_HELD, "control: a whole hold")
+        marker = self.results / task_hold.HOLD_DIR / f"{tid}.json"
+        for torn in ("", "{", '{"reason": "owner-go"}',
+                     '{"reason": "owner-go", "state": "held", "since": NaN, "token": "t"}',
+                     '{"reason": "owner-go", "state": "held", "since": Infinity, "token": "t"}',
+                     '{"reason": "owner-go", "since": 1e300, "token": "t"}'):
+            marker.write_text(torn)
+            row = self.health()
+            self.assertEqual(row["reason"], keepalive.TASK_NOT_PICKED_UP, repr(torn))
+            self.assertEqual(hc.validate(row), (row, None), repr(torn))
+        task_hold.release(self.results, tid)
+        task_hold.place(self.results, tid)
+        if os.geteuid() != 0:
+            marker.chmod(0)
+            self.addCleanup(marker.chmod, 0o600)
+            self.assertEqual(self.health()["reason"], keepalive.TASK_NOT_PICKED_UP, "chmod 000")
+
+    def test_a_hold_on_a_task_the_outbox_already_answered_reads_stuck(self):
+        self.installed()
+        self.keepawake_at(time.time() - 60)
+        self.hook_ran()
+        tid = "task-1784700000005"
+        self.add_task(tid, "$held", mtime=time.time() - 20 * 60)
+        task_hold.place(self.results, tid)
+        self.assertEqual(self.health()["reason"], keepalive.TASK_HELD, "control")
+        outbox.record_delivered(self.results / ".outbox", tid)  # delivered, archive failed
+        self.assertEqual(self.health()["reason"], keepalive.TASK_NOT_PICKED_UP)
+
+    def test_an_unlistable_task_dir_reports_neither_held_nor_stuck(self):
+        with mock.patch.object(task_fields, "list_open_tasks", side_effect=OSError("gone")):
+            self.assertEqual(keepalive.open_tasks({}, time.time()), (None, None, {}))
+
     def test_the_health_command_survives_a_path_with_a_space(self):
         command = keepalive.health_command("/opt/my tools/ag2-sparrow-hatch")
         self.assertEqual(shlex.split(command),
@@ -2342,19 +2663,65 @@ class StartSparrow(Base):
     cli, state = Cli.cli, Cli.state
     crons = Keepalive.crons
     task = Keepalive.task
+    # The status identity the bridge's writer records: its pid, start and sub-second write time.
+    IDENT = ("import json, sys, time; sys.path.insert(0, sys.argv[2]); from ag2_sparrow.task_io import "
+             "start_time; from ag2_sparrow.workspace_lock import proc_start; p = int(sys.argv[1]); "
+             "g = proc_start(p); print(json.dumps({'pid': p, 'start': start_time(p), 'proc_start': g, "
+             "'written_at': time.time()})[1:-1]); print(json.dumps(g))")
 
     def setUp(self):
         super().setUp()
         self.seen = self.home / "sparrow-seen"
-        # Stands in for ag2-sparrow: reports itself connected, records its env, stays up.
+        # Stands in for ag2-sparrow: takes the lock, reports itself connected, records its env,
+        # stays up.
+        lock = ('{"role": "gateway-bridge", "pid": %s, "host": "' + hatch_cli.workspace_lock._host_label()
+                + '", "workspace": "%s", "acquired_at": %s, "heartbeat_at": %s, "schema_version": 1, '
+                '"proc_start": %s}')
         executable(self.bin / hatch_cli.SPARROW_COMMAND,
                    '#!/bin/sh\necho "$REMOTE_HEALTH_COMMAND" > ' + str(self.seen) + "\n"
-                   'printf \'{"connected": true, "ts": %s, "error": null}\' "$(date +%s)" > '
+                   'mkdir -p "$AGENT_CONNECT_STATE_DIR/locks"\nnow=$(date +%s)\n'
+                   f'out=$("{sys.executable}" -c {shlex.quote(self.IDENT)} $$ "{PKG_ROOT}")\n'
+                   'ident=$(echo "$out" | head -1)\npst=$(echo "$out" | tail -1)\n'
+                   f"printf '{lock}' $$ \"$(dirname \"$AGENT_CONNECT_STATE_DIR\")\" $now $now \"$pst\" > "
+                   '"$AGENT_CONNECT_STATE_DIR/locks/gateway-bridge.lock"\n'
+                   'printf \'{"connected": true, "ts": %s, "error": null, %s}\' "$now" "$ident" > '
                    '"$AGENT_CONNECT_STATE_DIR/gateway-status.json"\nsleep 3\n')
         for name, value in (("SPAWN_SETTLE_S", 0.3), ("START_WAIT_S", 5.0), ("STOP_WAIT_S", 5.0)):
             p = mock.patch.object(keepalive, name, value)
             p.start()
             self.addCleanup(p.stop)
+        # What ps and /proc would say of each fixture process: a start time a test may set back
+        # (a long-running drain), and Sparrow's argv on hosts without /proc.
+        self.starts, self.argvs = {}, {}
+        real_start, real_proc = agent_identity.start_time, keepalive._proc
+
+        def start(pid):
+            return self.starts.get(pid) or real_start(pid)
+
+        def proc(pid, name):
+            if name == "cmdline" and not Path("/proc").is_dir():
+                if pid in self.argvs:
+                    return b"\0".join(a.encode() for a in self.argvs[pid]) + b"\0"
+                # No /proc: ps gives a spawned fixture's argv, split on spaces.
+                out = subprocess.run(["ps", "-o", "command=", "-p", str(pid)], capture_output=True).stdout
+                return b"\0".join(out.split()) + b"\0" if out.strip() else None
+            return real_proc(pid, name)
+        for target, attr, fn in ((agent_identity, "start_time", start), (task_io, "start_time", start),
+                                 (keepalive, "_proc", proc)):
+            p = mock.patch.object(target, attr, fn)
+            p.start()
+            self.addCleanup(p.stop)
+        if not hasattr(os, "pidfd_open"):
+            # No pidfd (macOS): a stand-in handle, so stop_holder's proof runs; the signal is by pid.
+            real_stop = keepalive._stop
+            for attr, fn in (("_pidfd_open", lambda pid: ("handle", pid)),
+                             ("_stop", lambda pid, handle=None: real_stop(pid))):
+                p = mock.patch.object(keepalive, attr, fn)
+                p.start()
+                self.addCleanup(p.stop)
+
+    def started_ago(self, proc, ago):
+        self.starts[proc.pid] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - ago))
 
     def install(self, *extra):
         with mock.patch.object(keepalive, "ensure_sparrow", REAL_ENSURE_SPARROW):
@@ -2370,13 +2737,17 @@ class StartSparrow(Base):
             if linger else "") + f"pathlib.Path({str(ready)!r}).touch()\ntime.sleep(60)\n")
         self.old_argv = [sys.executable, str(script)]
         proc = subprocess.Popen(self.old_argv)
+        if sparrow:
+            self.argvs[proc.pid] = self.old_argv
         self.wait_for(ready)
         self.addCleanup(lambda: proc.poll() is None and proc.kill())
         threading.Thread(target=proc.wait, daemon=True).start()
         path = self.state / "locks" / "gateway-bridge.lock"
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({"role": "gateway-bridge", "pid": proc.pid,
+        self.started_ago(proc, 5)  # it started, then took its lock
+        path.write_text(json.dumps({"role": "gateway-bridge", "workspace": str(self.state.parent), "pid": proc.pid,
                                     "host": hatch_cli.workspace_lock._host_label(),
+                                    "acquired_at": int(time.time()), "schema_version": 1,
                                     "heartbeat_at": int(time.time())}))
         (self.state / "gateway-status.json").write_text(json.dumps(
             {"connected": True, "ts": int(time.time()) - 5, "error": None}))
@@ -2426,6 +2797,9 @@ class StartSparrow(Base):
         self.assertFalse(self.seen.exists())
         self.assertIn("sparrow: running and connected", r.stdout)
 
+    def cfg(self):
+        return {"STATE_DIR": str(self.state), "GATEWAY_INSTANCE": ""}
+
     def keepawake(self, env):
         """keepawake against the old Sparrow, its environment read as `env`."""
         self.cli("install", "--mxid", AGENT, "--no-service")
@@ -2440,6 +2814,931 @@ class StartSparrow(Base):
         self.assertTrue(line.endswith(" listener=up restarted=1 reason=no-health-command"), line)
         self.assertEqual(old.wait(5), -signal.SIGTERM)
         self.assertEqual(self.wait_for(self.seen), f"{self.reply_stub} keepalive health")
+
+    def lane_of(self, proc, **extra):
+        (self.state / "auth").mkdir(parents=True, exist_ok=True)
+        (self.state / "auth" / "lane-identity.json").write_text(json.dumps(
+            {"agent_id": AGENT, "instance": "", "pid": proc.pid, "ts": time.time(),
+             "start": task_io.start_time(proc.pid), **extra}))
+
+    def test_keepawake_replaces_a_running_sparrow_from_before_the_send_lock(self):
+        old = self.old_sparrow()
+        self.lane_of(old)  # its drain publishes a lane record without the send-lock protocol
+        want = keepalive.health_command(str(self.reply_stub))
+        r, line = self.keepawake({"REMOTE_HEALTH_COMMAND": want})
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertTrue(line.endswith(" listener=up restarted=1 reason=drain-predates-send-lock"), line)
+        self.assertEqual(old.wait(5), -signal.SIGTERM)
+        self.assertEqual(self.wait_for(self.seen), f"{self.reply_stub} keepalive health")
+
+    def unit_successor(self, fake):
+        """What `systemctl restart` of our unit does: a new Sparrow, the unit's MainPID, takes the
+        lock and connects."""
+        proc = subprocess.Popen([str(self.bin / hatch_cli.SPARROW_COMMAND)],
+                                env={**py_env(self.home), "AGENT_CONNECT_STATE_DIR": str(self.state)})
+        self.addCleanup(lambda: proc.poll() is None and proc.kill())
+        threading.Thread(target=proc.wait, daemon=True).start()
+        fake.state, fake.main_pid = "active", proc.pid
+        return proc
+
+    def keepawake_unit(self, fake, on_restart=None):
+        want = keepalive.health_command(str(self.reply_stub))
+        with self.service(fake, on_restart=on_restart), \
+                mock.patch.object(keepalive, "stop_holder", wraps=keepalive.stop_holder) as stop:
+            r, line = self.keepawake({"REMOTE_HEALTH_COMMAND": want})
+        return r, line, stop
+
+    def restarted_unit(self, fake, before=None):
+        def restart(cmd):
+            fake.calls.append(cmd[1:])
+            if before:
+                before()
+            successor = self.unit_successor(fake)
+            self.successors.append(successor.pid)
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        self.successors = []
+        return restart
+
+    def test_keepawake_stops_an_outside_legacy_holder_before_starting_the_inactive_unit(self):
+        # Reviewer's repro: an installed, inactive unit does not run the detached legacy holder.
+        old, _rec = self.legacy()
+        fake = FakeSystemd(state="inactive")
+        r, line, stop = self.keepawake_unit(fake, self.restarted_unit(fake))
+        self.assertEqual(old.wait(5), -signal.SIGTERM, "the outside holder is stopped first")
+        stop.assert_called_once()
+        said = r.stdout + r.stderr + repr(fake.calls)
+        self.assertEqual(fake.ran("start"), [["--user", "start", "ag2-sparrow.service"]], said)
+        self.assertEqual(fake.ran("restart"), [], "a stopped unit is started, never restarted")
+        self.assertTrue(line.endswith(" restarted=1 reason=drain-predates-send-lock"), line)
+        self.assertEqual(hatch_cli.live_lock_holder(hatch_cli._lock_record(self.state, "")),
+                         self.successors[0], "the unit's new Sparrow owns the lock")
+
+    def test_keepawake_restarts_the_unit_that_runs_the_legacy_holder_in_place(self):
+        old, _rec = self.legacy()
+        fake = FakeSystemd(state="active", main_pid=old.pid)
+        r, line, stop = self.keepawake_unit(fake, self.restarted_unit(fake, before=old.terminate))
+        stop.assert_not_called()
+        self.assertEqual(old.wait(5), -signal.SIGTERM, "systemd stopped its own MainPID")
+        self.assertTrue(line.endswith(" restarted=1 reason=drain-predates-send-lock"), line)
+
+    def test_keepawake_reports_no_success_until_a_successor_owns_the_lock(self):
+        old, _rec = self.legacy()
+        fake = FakeSystemd(state="active", main_pid=old.pid)
+        with mock.patch.object(keepalive, "START_WAIT_S", 0):
+            r, line, stop = self.keepawake_unit(fake, lambda cmd: subprocess.CompletedProcess(cmd, 0, "", ""))
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("no successor holds the lock", r.stderr)
+        self.assertTrue(line.endswith(" restarted=0 reason=drain-predates-send-lock"), line)
+        self.done_with(old)
+
+    def test_replace_old_drain_fails_closed_wherever_the_unit_or_the_holder_is_unproven(self):
+        cfg = self.cfg()
+        for owner, props, stopped, restart, why in (
+                ("other", None, True, (True, ""), "hand-made unit"),
+                (keepalive.UNIT_UNREACHABLE, None, True, (True, ""), "did not answer"),
+                ("ours", None, True, (True, ""), "well-formed state"),
+                ("ours", {"ActiveState": "inactive", "MainPID": 0}, False, (True, ""), "was not stopped"),
+                ("ours", {"ActiveState": "inactive", "MainPID": 0}, True, (False, "restart failed"),
+                 "restart failed")):
+            with self.subTest(why), mock.patch.object(keepalive, "_unit_owner", return_value=owner), \
+                    mock.patch.object(hatch_cli, "_unit_props", return_value=props), \
+                    mock.patch.object(keepalive, "drain_predates_send_lock", return_value=4242), \
+                    mock.patch.object(keepalive, "stop_holder", return_value=stopped), \
+                    mock.patch.object(keepalive, "restart_listener", return_value=restart) as rl, \
+                    contextlib.redirect_stdout(io.StringIO()):
+                ok, how = keepalive.replace_old_drain(cfg, 4242)
+            self.assertIs(ok, False)
+            self.assertIn(why, how)
+            if why != "restart failed":
+                rl.assert_not_called()
+
+    def test_keepawake_leaves_a_generation_that_rolled_before_its_action(self):
+        # Reviewer's probe: the selected legacy holder hands the lock to a live generation that
+        # declares protocol 3 between keepawake's choice and its action.
+        old, rec = self.legacy()
+        new = self.old_sparrow()  # writes its own canonical lock; rewritten below as declaring
+        self.lock_path().write_text(json.dumps(rec))
+        real, calls = keepalive.drain_predates_send_lock, []
+
+        def choose_then_roll(cfg, now=None):
+            picked = real(cfg, now)
+            if not calls:
+                self.lock_path().write_text(json.dumps({
+                    **rec, "pid": new.pid, "send_lock": delivery_destination.SEND_LOCK_PROTOCOL,
+                    "start": task_io.start_time(new.pid), "acquired_at": int(time.time())}))
+            calls.append(picked)
+            return picked
+        fake = FakeSystemd(state="active", main_pid=new.pid)
+        with mock.patch.object(keepalive, "drain_predates_send_lock", side_effect=choose_then_roll):
+            r, line, stop = self.keepawake_unit(fake)
+        self.assertEqual(calls[0], old.pid, "the legacy holder was selected")
+        stop.assert_not_called()
+        self.assertEqual(fake.ran("restart"), [], "the current generation is not restarted")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("left untouched", r.stdout)
+        self.assertTrue(line.endswith(" listener=up restarted=0 reason=drain-predates-send-lock"), line)
+        self.assertIsNone(old.poll())
+        self.assertIsNone(new.poll())
+        self.done_with(old)
+        self.done_with(new)
+
+    def rolling(self, roll, at_show=2, **kw):
+        """FakeSystemd that calls `roll` as it answers its `at_show`th `show`."""
+        fake = FakeSystemd(**kw)
+        real, shows = fake.__call__, []
+
+        def call(cmd):
+            if cmd[0] == "systemctl" and cmd[2:3] == ["show"]:
+                shows.append(cmd)
+                if len(shows) == at_show:
+                    roll(fake)
+            return real(cmd)
+        return fake, call, shows
+
+    def test_keepawake_restarts_nothing_when_the_generation_rolls_at_the_final_show(self):
+        # Reviewer's probe: the lock and/or unit roll to a current protocol-3 generation while
+        # the action's own unit read answers, after the last legacy proof.
+        for case in ("lock and unit", "lock only", "unit only"):
+            with self.subTest(case):
+                old, rec = self.legacy()
+                self.old_pid = old.pid
+                new = self.old_sparrow()
+                self.lock_path().write_text(json.dumps(rec))
+
+                def roll(fake, new=new, rec=rec, case=case):
+                    if case != "unit only":
+                        self.lock_path().write_text(json.dumps({
+                            **rec, "pid": new.pid, "send_lock": delivery_destination.SEND_LOCK_PROTOCOL,
+                            "start": task_io.start_time(new.pid), "acquired_at": int(time.time())}))
+                    if case != "lock only":
+                        fake.main_pid = new.pid
+                fake, call, shows = self.rolling(roll, state="active", main_pid=old.pid)
+                want = keepalive.health_command(str(self.reply_stub))
+                with self.service(fake), mock.patch.object(sm, "_run", side_effect=systemd_seam(call)), \
+                        mock.patch.object(keepalive, "stop_holder", wraps=keepalive.stop_holder) as stop, \
+                        mock.patch.object(keepalive, "_spawn_sparrow", wraps=keepalive._spawn_sparrow) as spawn:
+                    r, line = self.keepawake({"REMOTE_HEALTH_COMMAND": want})
+                self.assertGreaterEqual(len(shows), 2, "the roll happened at the action's unit read")
+                self.assertEqual(fake.ran("restart"), [], "the current generation is not restarted")
+                self.assertEqual(fake.ran("reset-failed"), [], "nor reset")
+                self.assertEqual(fake.ran("stop"), [], "nor stopped through the unit")
+                stop.assert_not_called()
+                spawn.assert_not_called()
+                self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+                self.assertTrue(line.endswith(" listener=up restarted=0 reason=drain-predates-send-lock"), line)
+                self.assertIsNone(old.poll())
+                self.assertIsNone(new.poll())
+                self.done_with(old)
+                self.done_with(new)
+                (self.home / "keepalive-probe.log").unlink()
+
+    def keepawake_successor(self, successor, sync_second=False):
+        """keepawake against a legacy holder its unit runs, whose restart makes `successor(fake)`
+        the lock's and status's state; returns (result, log line)."""
+        old, _rec = self.legacy()
+        self.old_pid = old.pid
+        fake = FakeSystemd(state="active", main_pid=old.pid)
+
+        def restart(cmd):
+            fake.calls.append(cmd[1:])
+            old.terminate()
+            successor(fake, t0)
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        if not getattr(self, "installed", False):
+            self.installed = self.cli("install", "--mxid", AGENT, "--no-service").returncode == 0
+        want = keepalive.health_command(str(self.reply_stub))
+        if sync_second:  # the action then falls in the same whole second as `t0`
+            time.sleep(1.02 - time.time() % 1)
+        t0 = time.time()
+        # The restart sets the successor's state before it returns, so the first poll decides.
+        with self.service(fake, on_restart=restart), mock.patch.object(keepalive, "START_WAIT_S", 0), \
+                mock.patch.object(keepalive, "sparrow_env", return_value={"REMOTE_HEALTH_COMMAND": want}):
+            r = self.cli("keepalive", "keepawake")
+        self.done_with(old)
+        return r, (self.home / "keepalive-probe.log").read_text().strip()
+
+    def take_lock(self, pid, **declares):
+        now = int(time.time())
+        self.lock_path().write_text(json.dumps({
+            **declares, "role": "gateway-bridge", "workspace": str(self.state.parent), "pid": pid,
+            "host": hatch_cli.workspace_lock._host_label(), "acquired_at": now, "heartbeat_at": now,
+            "schema_version": 1}))
+
+    def connected_status(self, **fields):
+        (self.state / "gateway-status.json").write_text(json.dumps({"connected": True, "error": None, **fields}))
+
+    def test_keepawake_reports_no_success_from_a_non_sparrow_pid_and_a_same_second_status(self):
+        # Reviewer's /bin/sleep probe: a live non-Sparrow pid in the lock, and a connected status
+        # dated before the action in the action's own second, naming no process.
+        sleeper = subprocess.Popen(["/bin/sleep", "30"])
+        self.addCleanup(lambda: sleeper.poll() is None and sleeper.kill())
+
+        def successor(fake, t0):
+            self.take_lock(sleeper.pid)
+            self.connected_status(ts=int(t0))
+            fake.main_pid = sleeper.pid
+        r, line = self.keepawake_successor(successor, sync_second=True)
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertNotIn("now holds the lock and is connected", r.stdout)
+        self.assertTrue(line.endswith(" restarted=0 reason=drain-predates-send-lock"), line)
+
+    def sparrow_proc(self):
+        """A live process running Sparrow's command line: (proc, start, precise proc_start)."""
+        script = self.home / "successor" / hatch_cli.SPARROW_COMMAND
+        script.parent.mkdir(parents=True, exist_ok=True)
+        script.write_text("import time\ntime.sleep(30)\n")
+        argv = [sys.executable, str(script)]  # Sparrow's command line, in /proc and ps alike
+        proc = subprocess.Popen(argv)
+        self.addCleanup(lambda: proc.poll() is None and proc.kill())
+        self.argvs[proc.pid] = argv
+        return proc, task_io.start_time(proc.pid), keepalive.process_start(proc.pid)
+
+    def current_generation(self, fake=None):
+        """A connected current-protocol Sparrow holding the lock with its own status; the unit's
+        MainPID when `fake` is given."""
+        proc, st, gen = self.sparrow_proc()
+        self.take_lock(proc.pid, send_lock=delivery_destination.SEND_LOCK_PROTOCOL, start=st, proc_start=gen)
+        self.connected_status(ts=int(time.time()), pid=proc.pid, start=st, proc_start=gen,
+                              written_at=time.time())
+        if fake is not None:
+            fake.state, fake.main_pid = "active", proc.pid
+        return proc
+
+    def test_keepawake_takes_success_only_from_the_lock_holders_own_status_after_the_action(self):
+        # Negative controls beside the probe; the legitimate successor is the positive one.
+        cases = {
+            "a status naming another process": lambda p, st, g: dict(pid=p + 1, start=st, proc_start=g, written_at=time.time()),
+            "a status of a reused pid": lambda p, st, g: dict(pid=p, start="2001-01-01T00:00:00Z", proc_start=g, written_at=time.time()),
+            "a status of another generation": lambda p, st, g: dict(pid=p, start=st, proc_start="boot:1", written_at=time.time()),
+            "a status written before the action": lambda p, st, g: dict(pid=p, start=st, proc_start=g, written_at=time.time() - 30),
+            "a status with whole-second time only": lambda p, st, g: dict(pid=p, start=st, proc_start=g),
+            "a disconnected successor": lambda p, st, g: dict(pid=p, start=st, proc_start=g, written_at=time.time(), connected=False),
+            "a legitimate successor": lambda p, st, g: dict(pid=p, start=st, proc_start=g, written_at=time.time()),
+        }
+        for case, fields in cases.items():
+            with self.subTest(case):
+                def successor(fake, _t0, fields=fields):
+                    proc, st, gen = self.sparrow_proc()
+                    self.take_lock(proc.pid, send_lock=delivery_destination.SEND_LOCK_PROTOCOL, start=st, proc_start=gen)
+                    self.connected_status(ts=int(time.time()), **fields(proc.pid, st, gen))
+                    fake.main_pid = proc.pid
+                r, line = self.keepawake_successor(successor)
+                (self.home / "keepalive-probe.log").unlink()
+                if case == "a legitimate successor":
+                    self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+                    self.assertTrue(line.endswith(" restarted=1 reason=drain-predates-send-lock"), line)
+                else:
+                    self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+                    self.assertTrue(line.endswith(" restarted=0 reason=drain-predates-send-lock"), line)
+
+    def test_keepawake_certifies_no_successor_whose_lock_rolled_during_its_proof(self):
+        # Reviewer's probe: the lock rolls from A to B during A's process proof or its status
+        # read, while A's matching connected status stays.
+        for at in ("process proof", "status read"):
+            with self.subTest(at):
+                rolled, real_proof, real_read = [], keepalive.proven_sparrow, keepalive._status_snapshot
+
+                def roll():
+                    if not rolled and getattr(self, "succ", None) is not None:
+                        b, st, gen = self.sparrow_proc()
+                        self.take_lock(b.pid, send_lock=delivery_destination.SEND_LOCK_PROTOCOL, start=st,
+                                       proc_start=gen)
+                        rolled.append(b.pid)
+
+                def proof(cfg, pid, lock, at=at):
+                    ok = real_proof(cfg, pid, lock)
+                    if at == "process proof" and pid == getattr(self.succ, "pid", None):
+                        roll()
+                    return ok
+
+                def read(state, instance, at=at):
+                    status = real_read(state, instance)
+                    if at == "status read":
+                        roll()
+                    return status
+
+                def successor(fake, _t0):
+                    self.succ = self.current_generation(fake)
+                self.succ = None
+                with mock.patch.object(keepalive, "proven_sparrow", side_effect=proof), \
+                        mock.patch.object(keepalive, "_status_snapshot", side_effect=read):
+                    r, line = self.keepawake_successor(successor)
+                (self.home / "keepalive-probe.log").unlink()
+                self.assertTrue(rolled, "the lock rolled to B")
+                self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+                self.assertNotIn(f"Sparrow pid {self.succ.pid} now holds the lock", r.stdout)
+                self.assertTrue(line.endswith(" restarted=0 reason=drain-predates-send-lock"), line)
+
+    def stop_seam(self, opened=("handle", 0), lock_extra=None):
+        """keepawake against a legacy holder no unit runs, with _pidfd_open answering `opened`
+        (an object, None or an exception) and _stop recording, never signalling: (result, events)."""
+        old, rec = self.legacy()
+        if lock_extra:
+            self.lock_path().write_text(json.dumps({**rec, **lock_extra}))
+        events, real_proof = [], keepalive.proven_sparrow
+
+        def open_(pid):
+            events.append(("open", pid))
+            if isinstance(opened, Exception):
+                raise opened
+            return opened
+
+        def proof(cfg, pid, lock):
+            events.append(("proof", pid))
+            return real_proof(cfg, pid, lock)
+
+        def stop(pid, handle=None):
+            events.append(("signal", pid, handle))
+            return False
+        want = keepalive.health_command(str(self.reply_stub))
+        with mock.patch.object(keepalive, "_pidfd_open", side_effect=open_), \
+                mock.patch.object(keepalive, "proven_sparrow", side_effect=proof), \
+                mock.patch.object(keepalive, "_stop", side_effect=stop), \
+                mock.patch.object(keepalive.os, "kill", wraps=os.kill) as kill:
+            r, _line = self.keepawake({"REMOTE_HEALTH_COMMAND": want})
+        self.assertNotIn(mock.call(old.pid, signal.SIGTERM), kill.call_args_list, "never a bare-pid SIGTERM")
+        self.assertIsNone(old.poll())
+        self.done_with(old)
+        return r, [e for e in events if e[1] == old.pid]
+
+    def test_stop_holder_signals_only_through_a_handle_opened_before_its_proof(self):
+        r, events = self.stop_seam(opened=("handle", 4242))
+        kinds = [e[0] for e in events]
+        self.assertIn("signal", kinds, events)
+        last_proof = max(i for i, k in enumerate(kinds) if k == "proof")
+        self.assertLess(kinds.index("open"), last_proof, "the handle is opened before the proof it binds")
+        self.assertEqual(events[kinds.index("signal")][2], ("handle", 4242), "the signal goes through that handle")
+
+    def test_stop_holder_signals_nothing_without_a_stable_handle(self):
+        for case, opened in (("no pidfd on this platform", None), ("pidfd_open failed", OSError(errno.EMFILE, "x"))):
+            with self.subTest(case):
+                r, events = self.stop_seam(opened=opened)
+                self.assertNotIn("signal", [e[0] for e in events], events)
+                self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+                self.assertIn("no stable process handle", r.stderr)
+
+    def test_stop_holder_signals_nothing_when_the_lock_names_another_precise_generation(self):
+        # Same pid and same whole-second start, but the lock's proc_start is another process's.
+        r, events = self.stop_seam(lock_extra={"proc_start": "boot-of-another:1"})
+        self.assertNotIn("signal", [e[0] for e in events], events)
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+
+    def test_keepawake_leaves_a_generation_that_came_up_while_the_outside_holder_stopped(self):
+        # Reviewer's probe: the unit starts healthy generation B during the stop wait.
+        old, _rec = self.legacy()
+        self.old_pid = old.pid
+        fake, real_stop, came = FakeSystemd(state="inactive"), keepalive._stop, []
+
+        def stop(pid, handle=None):
+            done = real_stop(pid, handle)
+            if pid == old.pid:
+                came.append(self.current_generation(fake))
+            return done
+        want = keepalive.health_command(str(self.reply_stub))
+        with self.service(fake), \
+                mock.patch.object(keepalive, "_stop", side_effect=stop), \
+                mock.patch.object(keepalive, "START_WAIT_S", 0.5):
+            r, line = self.keepawake({"REMOTE_HEALTH_COMMAND": want})
+        self.assertEqual(old.wait(5), -signal.SIGTERM, "the outside holder was stopped")
+        self.assertEqual(fake.ran("restart"), [])
+        self.assertEqual(fake.ran("reset-failed"), [])
+        self.assertIsNone(came[0].poll(), "the new generation is left running")
+        self.assertIn("not restarted:", r.stdout)
+        self.assertIn(f"Sparrow pid {came[0].pid} now holds the lock and is connected", r.stdout)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.done_with(old)
+
+    def test_keepawake_never_restarts_a_generation_that_came_up_after_the_final_check(self):
+        # Reviewer's probe: healthy generation B comes up after the last inactive-unit proof, as
+        # that `show` answers or during the action itself; only a `start` may follow.
+        for when in ("after the final show", "during the start"):
+            with self.subTest(when):
+                old, _rec = self.legacy()
+                self.old_pid = old.pid
+                fake, came, stopped, real_stop = FakeSystemd(state="inactive"), [], [], keepalive._stop
+
+                def stop(pid, handle=None, old=old):
+                    done = real_stop(pid, handle)
+                    stopped.append(len(fake.calls))
+                    return done
+
+                def call(cmd, when=when):
+                    verb = cmd[2:3] if cmd[0] == "systemctl" else []
+                    if verb == ["start"]:
+                        fake.calls.append(cmd[1:])
+                        if when == "during the start" and not came:
+                            came.append(self.current_generation(fake))
+                        return subprocess.CompletedProcess(cmd, 0, "", "")  # a no-op for an active unit
+                    out = fake(cmd)
+                    if verb == ["show"] and stopped and when == "after the final show" and not came:
+                        came.append(self.current_generation(fake))
+                    return out
+                want = keepalive.health_command(str(self.reply_stub))
+                with self.service(fake), mock.patch.object(sm, "_run", side_effect=systemd_seam(call)), \
+                        mock.patch.object(keepalive, "_stop", side_effect=stop), \
+                        mock.patch.object(keepalive, "START_WAIT_S", 0):
+                    r, line = self.keepawake({"REMOTE_HEALTH_COMMAND": want})
+                said = r.stdout + r.stderr + repr(fake.calls)
+                self.assertTrue(came, "B came up after the final check")
+                self.assertEqual(old.wait(5), -signal.SIGTERM, "the outside holder was stopped")
+                acted = [c[1] for c in fake.calls[stopped[0]:] if c[1] not in ("show", "is-active", "show-environment")]
+                self.assertIn(acted, ([], ["start"]), said)  # nothing, or the no-op start
+                if when == "during the start":
+                    self.assertEqual(acted, ["start"], said)
+                self.assertEqual(fake.ran("reset-failed") + fake.ran("restart"), [], said)
+                self.assertIsNone(came[0].poll(), "B is left running")
+                self.assertIn(f"Sparrow pid {came[0].pid} now holds the lock and is connected", r.stdout)
+                self.assertEqual(r.returncode, 0, said)
+                self.done_with(old)
+                came[0].kill()
+                (self.home / "keepalive-probe.log").unlink()
+
+    def test_keepawake_certifies_no_successor_whose_lock_stopped_being_canonical(self):
+        # Reviewer's probe: during the status read the record keeps every generation field but
+        # stops being this workspace's canonical lock, or is replaced by an equal one.
+        for case, change in (("another workspace", {"workspace": "/elsewhere"}),
+                             ("another role", {"role": "gateway-bridge-x"}),
+                             ("another schema", {"schema_version": 2}),
+                             ("the same record in another file", {})):
+            with self.subTest(case):
+                real_read, changed = keepalive._status_snapshot, []
+
+                def read(state, instance, change=change):
+                    status = real_read(state, instance)
+                    if not changed:
+                        lock = json.loads(self.lock_path().read_text())
+                        fresh = self.lock_path().with_name("fresh.lock")
+                        fresh.write_text(json.dumps({**lock, **change}))
+                        os.replace(fresh, self.lock_path())  # a new inode, as any rewrite makes
+                        changed.append(True)
+                    return status
+                with mock.patch.object(keepalive, "_status_snapshot", side_effect=read):
+                    r, line = self.keepawake_successor(lambda fake, _t0: self.current_generation(fake))
+                (self.home / "keepalive-probe.log").unlink()
+                self.assertTrue(changed)
+                self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+                self.assertNotIn("now holds the lock and is connected", r.stdout)
+                self.assertTrue(line.endswith(" restarted=0 reason=drain-predates-send-lock"), line)
+
+    def test_keepawake_restarts_nothing_while_the_unit_is_reloading(self):
+        old, _rec = self.legacy()
+        self.old_pid = old.pid
+        fake = FakeSystemd(state="reloading", main_pid=old.pid)
+        r, line, stop = self.keepawake_unit(fake)
+        self.assertEqual(fake.ran("restart"), [])
+        self.assertEqual(fake.ran("reset-failed"), [])
+        stop.assert_not_called()
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertTrue(line.endswith(" restarted=0 reason=drain-predates-send-lock"), line)
+        self.assertIsNone(old.poll())
+        self.done_with(old)
+
+    def acquired(self, proc, ago):
+        """Rewrite `proc`'s lock record as main's workspace_lock writes it, taken `ago` s back by
+        `proc`, which started just before."""
+        self.started_ago(proc, ago + 5)
+        path = self.state / "locks" / "gateway-bridge.lock"
+        now = int(time.time())
+        path.write_text(json.dumps({"role": "gateway-bridge", "workspace": str(self.state.parent), "pid": proc.pid,
+                                    "host": hatch_cli.workspace_lock._host_label(),
+                                    "acquired_at": now - ago, "heartbeat_at": now,
+                                    "schema_version": 1}))
+
+    def declared_lock(self, proc, ago, **declares):
+        """`proc`'s lock as this package's drain takes it: its protocol and start declared."""
+        path = self.state / "locks" / "gateway-bridge.lock"
+        now = int(time.time())
+        path.write_text(json.dumps({**declares, "role": "gateway-bridge", "workspace": str(self.state.parent), "pid": proc.pid,
+                                    "host": hatch_cli.workspace_lock._host_label(),
+                                    "acquired_at": now - ago, "heartbeat_at": now,
+                                    "schema_version": 1}))
+
+    def test_keepawake_keeps_a_drain_whose_lane_and_its_fallback_both_failed(self):
+        # Reviewer's probe: the first publication and the empty-record fallback both refused, so
+        # no lane record exists; the drain's lock still says it honours the protocol.
+        from ag2_sparrow import remote_gateway_bridge as gb
+        old = self.old_sparrow()
+        self.declared_lock(old, keepalive.LANE_GRACE_S + 60,
+                           send_lock=delivery_destination.SEND_LOCK_PROTOCOL,
+                           start=task_io.start_time(old.pid))
+        full = OSError(errno.ENOSPC, "No space left on device")
+        with mock.patch.object(agent_identity, "_write_at", side_effect=full), \
+                mock.patch.object(agent_identity, "_poison_at", side_effect=full), \
+                mock.patch.object(gb, "_STATE", self.state), mock.patch.object(gb, "_log"), \
+                mock.patch.object(gb, "_reenroll_identity", return_value=AGENT), \
+                mock.patch.dict(gb._LANE_OWNED, clear=True):
+            gb._lane_identity()
+        self.assertEqual(agent_identity.lane_state(self.state, "")[0], agent_identity.LANE_ABSENT)
+        want = keepalive.health_command(str(self.reply_stub))
+        for _ in range(2):
+            r, line = self.keepawake({"REMOTE_HEALTH_COMMAND": want})
+            self.assertTrue(line.endswith(" listener=up restarted=0"), line)
+        self.assertIsNone(old.poll(), "a drain whose lock declares the protocol is never replaced")
+
+    def test_keepawake_judges_a_declaring_lock_by_its_protocol_and_its_process(self):
+        want = keepalive.health_command(str(self.reply_stub))
+        for proto, start, restarted in ((delivery_destination.SEND_LOCK_PROTOCOL - 1, "own", 1),
+                                        (delivery_destination.SEND_LOCK_PROTOCOL, "2001-01-01T00:00:00Z", 0)):
+            with self.subTest(proto=proto, start=start):
+                old = self.old_sparrow()
+                self.declared_lock(old, keepalive.LANE_GRACE_S + 60, send_lock=proto,
+                                   start=task_io.start_time(old.pid) if start == "own" else start)
+                r, line = self.keepawake({"REMOTE_HEALTH_COMMAND": want})
+                self.assertTrue(line.endswith(f" restarted={restarted}" + (
+                    " reason=drain-predates-send-lock" if restarted else "")), line)
+                if restarted:
+                    self.assertEqual(old.wait(5), -signal.SIGTERM)
+                else:
+                    old.kill()
+                    old.wait(5)
+
+    def test_the_drain_declares_its_protocol_and_start_in_the_lock_it_takes(self):
+        from ag2_sparrow import remote_gateway_bridge as gb, workspace_lock
+        ws = self.home / "lockws"
+        ws.mkdir()
+        self.assertEqual(workspace_lock.acquire("gateway-bridge", ws, declares=gb._lock_declares()).status,
+                         "acquired")
+        holder = workspace_lock.read_holder("gateway-bridge", ws)
+        self.assertEqual((holder["send_lock"], holder["start"], holder["pid"]),
+                         (delivery_destination.SEND_LOCK_PROTOCOL, OWN_START, os.getpid()))
+        self.assertTrue(workspace_lock.heartbeat("gateway-bridge", ws))
+        self.assertEqual(workspace_lock.read_holder("gateway-bridge", ws)["send_lock"],
+                         delivery_destination.SEND_LOCK_PROTOCOL, "a heartbeat keeps the declaration")
+        workspace_lock.release("gateway-bridge", ws)
+        deferred = workspace_lock.LockResult("deferred", holder={})
+        with mock.patch.object(gb, "_lock_on", return_value=True), mock.patch.object(gb, "_log"), \
+                mock.patch.object(gb, "_ws_acquire", return_value=deferred) as take:
+            self.assertFalse(gb._acquire_singleton())
+        self.assertEqual(take.call_args.kwargs["declares"], gb._lock_declares(), "the drain's own take")
+
+    def test_keepawake_never_signals_a_recycled_pid_under_a_legacy_lock(self):
+        # Reviewer's probe: a released main's lock, old and fresh, now names a live process that
+        # is not Sparrow, or a Sparrow that started after that lock was taken (its pid reused).
+        for case in ("not sparrow", "started after the lock"):
+            with self.subTest(case):
+                old = self.old_sparrow(sparrow=case != "not sparrow")
+                self.acquired(old, keepalive.LANE_GRACE_S + 60)
+                if case == "started after the lock":
+                    self.started_ago(old, 1)
+                with mock.patch.object(keepalive, "stop_holder", wraps=keepalive.stop_holder) as stop:
+                    r, line = self.keepawake(None)  # its environment cannot be read: unknown-env
+                stop.assert_not_called()
+                self.assertTrue(line.endswith(" listener=up restarted=0 reason=unknown-env"), line)
+                self.assertIsNone(old.poll(), "the recycled pid was not signalled")
+                self.assertIsNone(keepalive.drain_predates_send_lock(self.cfg()))
+                old.kill()
+                old.wait(5)
+
+    def test_keepawake_still_replaces_a_genuine_legacy_sparrow(self):
+        old = self.old_sparrow()
+        self.acquired(old, keepalive.LANE_GRACE_S + 60)  # a released main, running since then
+        want = keepalive.health_command(str(self.reply_stub))
+        with mock.patch.object(keepalive, "stop_holder", wraps=keepalive.stop_holder) as stop:
+            r, line = self.keepawake({"REMOTE_HEALTH_COMMAND": want})
+        stop.assert_called_once()
+        self.assertTrue(line.endswith(" restarted=1 reason=drain-predates-send-lock"), line)
+        self.assertEqual(old.wait(5), -signal.SIGTERM)
+
+    def lock_path(self):
+        return self.state / "locks" / "gateway-bridge.lock"
+
+    BAD_LOCKS = ("a start the second after the lock", "acquired at Infinity",
+                 "acquired in the far future", "acquired after its heartbeat", "a string time",
+                 "another workspace", "no workspace", "another role", "another schema",
+                 "a declared start of another process", "another pid", "malformed JSON",
+                 "a symlink to another workspace's lock", "a FIFO", "an oversized lock")
+
+    def stamp(self, t):
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
+
+    def bad_lock(self, case, old, rec):
+        """Put `case` in place of `old`'s canonical lock `rec` (start times included)."""
+        lock, acquired = self.lock_path(), rec["acquired_at"]
+        if lock.is_symlink() or lock.exists():
+            lock.unlink()
+        self.starts[old.pid] = self.stamp(acquired - 5)
+        changes = {"acquired at Infinity": {"acquired_at": float("inf")},
+                   "acquired in the far future": {"acquired_at": 4000000000, "heartbeat_at": 4000000000},
+                   "acquired after its heartbeat": {"heartbeat_at": acquired - 10},
+                   "a string time": {"acquired_at": str(acquired)},
+                   "another workspace": {"workspace": str(self.home / "elsewhere")},
+                   "no workspace": {"workspace": None}, "another role": {"role": "gateway-bridge-x"},
+                   "another schema": {"schema_version": 2}, "another pid": {"pid": os.getppid()},
+                   "a declared start of another process": {"start": "2001-01-01T00:00:00Z"},
+                   "an oversized lock": {"pad": "x" * 5000}}
+        if case == "a start the second after the lock":
+            self.starts[old.pid] = self.stamp(acquired + 1)
+        if case == "malformed JSON":
+            lock.write_text("{")
+        elif case == "a FIFO":
+            os.mkfifo(lock)
+        elif case.startswith("a symlink"):
+            foreign = self.home / "other-ws" / "state" / "locks" / "gateway-bridge.lock"
+            foreign.parent.mkdir(parents=True, exist_ok=True)
+            foreign.write_text(json.dumps({**rec, "workspace": str(foreign.parents[2])}))
+            lock.symlink_to(foreign)
+        else:
+            lock.write_text(json.dumps({**rec, **changes.get(case, {})}))
+
+    def legacy(self):
+        """A released main's Sparrow and its canonical lock, held long enough to be replaced."""
+        old = self.old_sparrow()
+        self.acquired(old, keepalive.LANE_GRACE_S + 60)
+        return old, json.loads(self.lock_path().read_text())
+
+    def done_with(self, old):
+        if old.poll() is None:
+            old.kill()
+        old.wait(5)
+        if self.lock_path().is_symlink() or self.lock_path().exists():
+            self.lock_path().unlink()  # a FIFO left here would block the next fixture's write
+
+    def test_stop_signals_only_the_proven_sparrow_of_the_lock_it_rereads(self):
+        old, rec = self.legacy()
+        for case in self.BAD_LOCKS:
+            with self.subTest(case):
+                self.bad_lock(case, old, rec)
+                with mock.patch.object(keepalive.os, "kill") as kill, \
+                        contextlib.redirect_stderr(io.StringIO()):
+                    t = threading.Thread(target=keepalive.stop_holder, args=(self.cfg(), old.pid), daemon=True)
+                    t.start()
+                    t.join(10)
+                self.assertFalse(t.is_alive(), "the reread blocked")
+                kill.assert_not_called()
+                self.assertIsNone(old.poll(), "nor signalled through a handle")
+        self.lock_path().unlink()
+        for began in (rec["acquired_at"], rec["acquired_at"] - 30):  # same second, and earlier
+            with self.subTest(began=began):
+                self.lock_path().write_text(json.dumps(rec))
+                self.starts[old.pid] = self.stamp(began)
+                self.assertTrue(keepalive.proven_sparrow(self.cfg(), old.pid, rec), "same generation")
+        self.starts[old.pid] = "not a time"
+        self.assertFalse(keepalive.proven_sparrow(self.cfg(), old.pid, rec))
+        self.starts[old.pid] = self.stamp(-100)
+        self.assertFalse(keepalive.proven_sparrow(self.cfg(), old.pid, rec), "no bounded start epoch")
+        self.starts[old.pid] = None
+        with mock.patch.object(keepalive.agent_identity, "start_time", return_value=None):
+            self.assertFalse(keepalive.proven_sparrow(self.cfg(), old.pid, rec), "no start: no proof")
+        self.assertFalse(keepalive.proven_sparrow(self.cfg(), old.pid, None))
+        self.done_with(old)
+
+    def test_keepawake_signals_no_holder_its_lock_cannot_prove(self):
+        want = keepalive.health_command(str(self.reply_stub))
+        for case in self.BAD_LOCKS:
+            with self.subTest(case):
+                old, rec = self.legacy()
+                self.bad_lock(case, old, rec)
+                out = {}
+                with mock.patch.object(keepalive, "stop_holder", wraps=keepalive.stop_holder) as stop, \
+                        mock.patch.object(keepalive.os, "kill", wraps=os.kill) as kill:
+                    t = threading.Thread(target=lambda: out.update(
+                        r=self.keepawake({"REMOTE_HEALTH_COMMAND": want})), daemon=True)
+                    t.start()
+                    t.join(20)
+                self.assertFalse(t.is_alive(), "keepawake blocked on the lock")
+                stop.assert_not_called()
+                self.assertNotIn(mock.call(old.pid, signal.SIGTERM), kill.call_args_list)
+                self.assertIn(" listener=up restarted=0", out["r"][1])
+                self.assertIsNone(old.poll(), "the holder is left untouched")
+                self.done_with(old)
+        old, rec = self.legacy()  # the positive control: this lock's own legacy Sparrow
+        self.starts[old.pid] = self.stamp(rec["acquired_at"])
+        r, line = self.keepawake({"REMOTE_HEALTH_COMMAND": want})
+        self.assertTrue(line.endswith(" restarted=1 reason=drain-predates-send-lock"), line)
+        self.assertEqual(old.wait(5), -signal.SIGTERM)
+
+    def test_a_legacy_sparrow_that_took_its_lock_a_tenth_of_a_second_after_starting_is_replaced(self):
+        # As a main-built Sparrow does: its whole-second start and a fractional lock time agree.
+        old = self.old_sparrow()
+        began = int(time.time()) - keepalive.LANE_GRACE_S - 60
+        self.starts[old.pid] = self.stamp(began)
+        rec = json.loads(self.lock_path().read_text())
+        for acquired in (began + 0.1, began + 0.9):
+            with self.subTest(acquired=acquired):
+                self.lock_path().write_text(json.dumps({**rec, "acquired_at": acquired}))
+                self.assertTrue(keepalive.proven_sparrow(self.cfg(), old.pid,
+                                                         hatch_cli._lock_record(self.state, "")))
+                with mock.patch.object(keepalive, "_stop", return_value=True) as stop:
+                    self.assertTrue(keepalive.stop_holder(self.cfg(), old.pid))
+                stop.assert_called_once()
+                self.assertEqual(stop.call_args.args[0], old.pid)
+                self.assertIsNotNone(stop.call_args.args[1], "signalled through the handle")
+        want = keepalive.health_command(str(self.reply_stub))
+        with mock.patch.object(keepalive, "stop_holder", wraps=keepalive.stop_holder) as stop:
+            r, line = self.keepawake({"REMOTE_HEALTH_COMMAND": want})
+        stop.assert_called_once()
+        self.assertTrue(line.endswith(" restarted=1 reason=drain-predates-send-lock"), line)
+        self.assertEqual(old.wait(5), -signal.SIGTERM)
+
+    def test_unmanaged_health_problem_reads_the_lock_holder_and_its_environment(self):
+        old = self.old_sparrow()
+        want = keepalive.health_command(str(self.reply_stub))
+        self.cli("install", "--mxid", AGENT, "--no-service")
+        cfg = {**self.cfg(), "REPLY_COMMAND": str(self.reply_stub)}
+        with mock.patch.object(keepalive, "_command", return_value=str(self.reply_stub)), \
+                mock.patch.object(keepalive, "_unit_owner", return_value=None):
+            for env, problem in (({"REMOTE_HEALTH_COMMAND": want}, None),
+                                 ({"HOME": "x"}, keepalive.NO_HEALTH_COMMAND),
+                                 (None, keepalive.UNKNOWN_ENV)):
+                with self.subTest(problem=problem), \
+                        mock.patch.object(keepalive, "sparrow_env", return_value=env):
+                    self.assertEqual(keepalive.unmanaged_health_problem(cfg), (old.pid, problem))
+        with mock.patch.object(keepalive, "_unit_owner", return_value="ours"):
+            self.assertEqual(keepalive.unmanaged_health_problem(cfg), (None, None), "a unit runs it")
+        self.done_with(old)
+
+    def test_install_signals_no_outside_sparrow_its_lock_cannot_prove(self):
+        for case in self.BAD_LOCKS:
+            with self.subTest(case):
+                old, rec = self.legacy()
+                self.old_pid = old.pid
+                self.bad_lock(case, old, rec)
+                fake = FakeSystemd(state="inactive")
+                with self.service(fake), mock.patch.object(keepalive, "START_WAIT_S", 0.5), \
+                        mock.patch.object(keepalive.os, "kill", wraps=os.kill) as kill:
+                    t = threading.Thread(target=self.call_ensure, daemon=True)
+                    t.start()
+                    t.join(30)
+                self.assertFalse(t.is_alive(), "install blocked on the lock")
+                self.assertNotIn(mock.call(old.pid, signal.SIGTERM), kill.call_args_list)
+                self.assertIsNone(old.poll(), "the holder is left untouched")
+                self.done_with(old)
+        old, rec = self.legacy()  # the positive control: install replaces this lock's own Sparrow
+        self.old_pid = old.pid
+        fake = FakeSystemd(state="inactive")
+
+        def restarted(cmd):
+            self.status(-1)
+            return fake(cmd)
+        with self.service(fake, on_restart=restarted):
+            self.assertEqual(self.call_ensure(), 0, self.out + self.err)
+        self.assertEqual(old.wait(5), -signal.SIGTERM)
+
+    def test_keepawake_replaces_a_main_version_sparrow_that_publishes_no_lane_record(self):
+        old = self.old_sparrow()
+        self.acquired(old, keepalive.LANE_GRACE_S + 60)  # no lane-identity file at all
+        want = keepalive.health_command(str(self.reply_stub))
+        r, line = self.keepawake({"REMOTE_HEALTH_COMMAND": want})
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertTrue(line.endswith(" listener=up restarted=1 reason=drain-predates-send-lock"), line)
+        self.assertEqual(old.wait(5), -signal.SIGTERM)
+
+    def test_keepawake_keeps_a_drain_whose_lane_record_cannot_be_read(self):
+        old = self.old_sparrow()
+        self.acquired(old, keepalive.LANE_GRACE_S + 60)
+        self.lane_of(old, send_lock=delivery_destination.SEND_LOCK_PROTOCOL)  # current and valid
+        want = keepalive.health_command(str(self.reply_stub))
+
+        def denied(*a, **k):
+            raise PermissionError(13, "state directory unreadable")
+        with mock.patch.object(agent_identity, "_read_at", denied):
+            r, line = self.keepawake({"REMOTE_HEALTH_COMMAND": want})
+        self.assertTrue(line.endswith(" listener=up restarted=0"), line)
+        self.assertIsNone(old.poll(), "a drain is not replaced on a read error")
+        self.assertIn("unreadable", r.stderr)
+
+    def test_keepawake_keeps_a_drain_whose_stale_lane_record_declares_the_send_lock(self):
+        # A drain whose record went stale over a few slow sends in one pass still has the protocol.
+        old = self.old_sparrow()
+        self.acquired(old, keepalive.LANE_GRACE_S + 60)
+        self.lane_of(old, send_lock=delivery_destination.SEND_LOCK_PROTOCOL)
+        rec = json.loads((self.state / "auth" / "lane-identity.json").read_text())
+        rec["ts"] -= agent_identity.LANE_FRESH_S + 15
+        (self.state / "auth" / "lane-identity.json").write_text(json.dumps(rec))
+        self.assertEqual(agent_identity.lane_state(self.state, "")[0], agent_identity.LANE_STALE)
+        want = keepalive.health_command(str(self.reply_stub))
+        r, line = self.keepawake({"REMOTE_HEALTH_COMMAND": want})
+        self.assertTrue(line.endswith(" listener=up restarted=0"), line)
+        self.assertIsNone(old.poll(), "a stale record that declares the protocol replaces nothing")
+
+    def test_keepawake_replaces_a_drain_whose_stale_lane_record_lacks_the_send_lock(self):
+        old = self.old_sparrow()
+        self.acquired(old, 5)  # within the grace period: only the record itself is evidence
+        self.lane_of(old)
+        rec = json.loads((self.state / "auth" / "lane-identity.json").read_text())
+        rec["ts"] -= agent_identity.LANE_FRESH_S + 15
+        (self.state / "auth" / "lane-identity.json").write_text(json.dumps(rec))
+        want = keepalive.health_command(str(self.reply_stub))
+        r, line = self.keepawake({"REMOTE_HEALTH_COMMAND": want})
+        self.assertTrue(line.endswith(" listener=up restarted=1 reason=drain-predates-send-lock"), line)
+        self.assertEqual(old.wait(5), -signal.SIGTERM)
+
+    def test_keepawake_judges_a_stale_record_only_when_this_process_wrote_it(self):
+        # A predecessor's stale record under a reused pid, declaring the protocol or not, is no
+        # evidence: the holder is judged by its grace period alone, as one with no record is.
+        want = keepalive.health_command(str(self.reply_stub))
+        stale = time.time() - agent_identity.LANE_FRESH_S - 15
+        for declared, held_for, restarted in (
+                (True, keepalive.LANE_GRACE_S + 60, 1), (False, 5, 0),
+                (False, keepalive.LANE_GRACE_S + 60, 1), (True, 5, 0)):
+            with self.subTest(declared=declared, held_for=held_for):
+                old = self.old_sparrow()
+                self.acquired(old, held_for)
+                proto = {"send_lock": delivery_destination.SEND_LOCK_PROTOCOL} if declared else {}
+                self.lane_of(old, ts=stale, start="2001-01-01T00:00:00Z", **proto)
+                self.assertEqual(agent_identity.lane_state(self.state, "")[0], agent_identity.LANE_STALE)
+                r, line = self.keepawake({"REMOTE_HEALTH_COMMAND": want})
+                self.assertTrue(line.endswith(f" listener=up restarted={restarted}"
+                                              + (" reason=drain-predates-send-lock" if restarted else "")),
+                                line)
+                if restarted:
+                    self.assertEqual(old.wait(5), -signal.SIGTERM)
+                else:
+                    self.assertIsNone(old.poll())
+                    old.kill()
+                    old.wait(5)
+        old = self.old_sparrow()
+        self.acquired(old, 5)
+        self.lane_of(old, ts=stale)  # the holder's own record, stale, without the protocol
+        r, line = self.keepawake({"REMOTE_HEALTH_COMMAND": want})
+        self.assertTrue(line.endswith(" restarted=1 reason=drain-predates-send-lock"), line)
+        self.assertEqual(old.wait(5), -signal.SIGTERM)
+
+    def test_own_record_falls_back_to_the_lock_when_no_start_time_compares(self):
+        rec, owned = {"pid": 7, "ts": 1000.0}, agent_identity.owned_by
+        with mock.patch.object(agent_identity, "start_time", return_value=None):
+            self.assertTrue(owned({**rec, "start": "x"}, 7, 1000))
+            self.assertFalse(owned(rec, 7, 1002), "written before this lock")
+            self.assertFalse(owned(rec, 7, None), "no lock time: unbound")
+        self.assertFalse(owned(rec, 8, 1000))
+        self.assertFalse(owned(None, 7, 1000))
+
+    def test_a_failed_lane_publication_reads_invalid_and_replaces_no_drain(self):
+        from ag2_sparrow import remote_gateway_bridge as gb
+        want = keepalive.health_command(str(self.reply_stub))
+        lane = self.state / "auth" / "lane-identity.json"
+        for before in ("a record", "no record"):
+            with self.subTest(before):
+                old = self.old_sparrow()
+                self.acquired(old, keepalive.LANE_GRACE_S + 60)
+                lane.parent.mkdir(parents=True, exist_ok=True)
+                lane.unlink(missing_ok=True)
+                if before == "a record":
+                    self.lane_of(old, send_lock=delivery_destination.SEND_LOCK_PROTOCOL, ts=0)
+                full = OSError(errno.ENOSPC, "No space left on device")
+                with mock.patch.object(agent_identity, "_write_at", side_effect=full), \
+                        mock.patch.object(gb, "_STATE", self.state), mock.patch.object(gb, "_log"), \
+                        mock.patch.object(gb, "_reenroll_identity", return_value=AGENT), \
+                        mock.patch.dict(gb._LANE_OWNED, clear=True):
+                    gb._lane_identity()  # the drain's own publisher, failing on a full disk
+                self.assertTrue(lane.exists(), "a failed publication leaves evidence, not absence")
+                self.assertEqual(agent_identity.lane_state(self.state, ""),
+                                 (agent_identity.LANE_INVALID, None))
+                for _ in range(2):
+                    r, line = self.keepawake({"REMOTE_HEALTH_COMMAND": want})
+                    self.assertTrue(line.endswith(" listener=up restarted=0"), line)
+                self.assertIsNone(old.poll(), "no replacement loop on a persistent write failure")
+                old.kill()
+                old.wait(5)
+
+    def test_keepawake_keeps_a_drain_whose_lane_record_is_invalid(self):
+        # A modern drain's corrupt record, failed-write tombstone or emptied one is no proof the
+        # live owner lacks the protocol, nor is a symlink or FIFO, whose open must not block.
+        lane = self.state / "auth" / "lane-identity.json"
+        target = self.home / "lane-target.json"
+        target.write_text("{}")
+        for kind, make in (("malformed", lambda: lane.write_text("{")),
+                           ("emptied", lambda: lane.write_text("")),
+                           ("tombstone", lambda: lane.write_text(
+                               json.dumps({"instance": "", "retracted": True}))),
+                           ("symlink", lambda: lane.symlink_to(target)),
+                           ("fifo", lambda: os.mkfifo(lane))):
+            with self.subTest(kind):
+                old = self.old_sparrow()
+                self.acquired(old, keepalive.LANE_GRACE_S + 60)
+                lane.parent.mkdir(parents=True, exist_ok=True)
+                lane.unlink(missing_ok=True)
+                make()
+                want = keepalive.health_command(str(self.reply_stub))
+                out = {}
+                t = threading.Thread(target=lambda: out.update(
+                    r=self.keepawake({"REMOTE_HEALTH_COMMAND": want})), daemon=True)
+                t.start()
+                t.join(20)
+                self.assertFalse(t.is_alive(), "keepawake blocked on the lane record")
+                r, line = out["r"]
+                self.assertTrue(line.endswith(" listener=up restarted=0"), line)
+                self.assertIsNone(old.poll(), "an invalid record replaces no drain")
+                self.assertIn("lane record of Sparrow", r.stderr)
+                self.assertIn("invalid; not replacing it", r.stderr)
+                old.kill()
+                old.wait(5)
+
+    def test_keepawake_gives_a_just_started_sparrow_time_to_publish_its_lane(self):
+        old = self.old_sparrow()
+        self.acquired(old, 5)
+        want = keepalive.health_command(str(self.reply_stub))
+        r, line = self.keepawake({"REMOTE_HEALTH_COMMAND": want})
+        self.assertTrue(line.endswith(" listener=up restarted=0"), line)
+        self.assertIsNone(old.poll())
+
+    def test_keepawake_leaves_a_sparrow_that_declares_the_send_lock(self):
+        old = self.old_sparrow()
+        self.lane_of(old, send_lock=delivery_destination.SEND_LOCK_PROTOCOL)
+        want = keepalive.health_command(str(self.reply_stub))
+        r, line = self.keepawake({"REMOTE_HEALTH_COMMAND": want})
+        self.assertTrue(line.endswith(" listener=up restarted=0"), line)
+        self.assertIsNone(old.poll())
 
     def test_keepawake_leaves_a_sparrow_it_cannot_read_or_that_has_it(self):
         old = self.old_sparrow()
@@ -2485,7 +3784,7 @@ class StartSparrow(Base):
         real_which, real_proc = shutil.which, keepalive._proc
 
         def run(cmd):
-            if cmd[2:3] == ["restart"] and on_restart:
+            if cmd[2:3] in (["restart"], ["start"]) and on_restart:
                 return on_restart(cmd)
             return fake(cmd)
 
@@ -3673,6 +4972,2470 @@ class ReplyWithoutAnswering(Base):
         r = self.reply(str(result), "--body", "@chi:ag2.space yes", "--wait", "0")
         self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED, r.stderr)
         self.assertEqual(result.read_text(), "@chi:ag2.space yes")
+
+class Hold(Base):
+    """`hold`: a parked item gets one room line and a hold marker; its result slot stays open."""
+    TID = "task-1784700000001"
+
+    def setUp(self):
+        super().setUp()
+        self.result_file = self.results / f"{self.TID}.txt"
+        self.notice = self.results / hatch_cli._hold_notice(Path(), self.TID).name
+        self.mxid = AGENT
+        self.lane_record = True  # the drain has published its lane, as self.mxid
+        self.send_lock = True  # and declares the send-lock protocol
+
+    def env(self):
+        env = py_env(self.home)
+        env.update(AGENT_CONNECT_RESULT_DIR=str(self.results), AGENT_CONNECT_TASK_DIR=str(self.tasks),
+                   AGENT_CONNECT_STATE_DIR=str(self.home / "state"))
+        auth = self.home / "state" / "auth"
+        auth.mkdir(parents=True, exist_ok=True)
+        (auth / "ag2space.json").write_text(json.dumps({"agent_id": self.mxid}))
+        if self.lane_record:
+            (auth / "lane-identity.json").write_text(json.dumps(
+                {"agent_id": self.mxid, "instance": "", "pid": os.getpid(), "start": OWN_START, "ts": time.time(),
+                 **({"send_lock": delivery_destination.SEND_LOCK_PROTOCOL} if self.send_lock else {})}))
+        return env
+
+    def armed_mark(self):
+        """A notice record whose generation a hold armed, as a hold that stood leaves it."""
+        task_hold.arm_notice(self.results, self.TID, task_hold.mark_notice(self.results, self.TID))
+
+    def hold(self, *args, cfg=None, env=None):
+        with mock.patch.object(hatch_cli, "_installed_config", return_value=cfg or {}):
+            return run_main(hatch_cli.main, ["hold", *args], {**self.env(), **(env or {})})
+
+    def line(self):
+        """The body hold queues for the default task."""
+        return f"[channel: !room:ag2.space]\n@bob:ag2.space {hatch_cli.HOLD_NOTICE}\n"
+
+    def delivered_without_receipt(self):
+        """The drain posted the line and archived it, but its best-effort receipt failed."""
+        self.notice.unlink()
+
+    def room_task(self, room):
+        text = task_text(self.TID, "$ev1", "@bob:ag2.space").replace("!room:ag2.space", room)
+        self.add_task(self.TID, "$ev1", text=text)
+
+    def test_one_room_line_and_a_marker_once(self):
+        self.add_task(self.TID, "$ev1")
+        r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_POSTED, r.stderr)
+        body = self.notice.read_text()
+        parsed = parse_markers(body, skip_after_channel=True)
+        self.assertEqual([(a.kind, a.value) for a in parsed.actions],
+                         [("redirect", "!room:ag2.space")])
+        self.assertEqual(parsed.body.strip(), f"@bob:ag2.space {hatch_cli.HOLD_NOTICE}")
+        self.assertEqual(task_hold.read(self.results, self.TID)["reason"], task_hold.OWNER_GO)
+        self.assertFalse(self.result_file.exists(), "the real answer still owns the result slot")
+        outbox.record_delivered(self.results / delivery_destination.RECEIPT_DIR, self.notice.stem + "~0")
+        self.notice.unlink()  # the drain delivered, recorded its receipt and archived it
+        r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_POSTED, r.stderr)
+        self.assertIn("already held", r.stdout)
+        self.assertFalse(self.notice.exists(), "a second hold never posts again")
+
+    def test_a_threaded_message_gets_the_line_in_its_thread(self):
+        self.add_task(self.TID, "$ev1", thread_root="$root")
+        self.assertEqual(self.hold(str(self.result_file)).returncode, hatch_cli.REPLY_POSTED)
+        kinds = [(a.kind, a.value) for a in parse_markers(self.notice.read_text()).actions]
+        self.assertIn(("thread", "$root"), kinds)
+
+    SERVED = "Waiting for my owner's OK on this."
+
+    def serve(self, line, revision="acp.muse.2026-10-24.1", **extra):
+        """The setup cache the keepawake run writes, serving `line` as runtime_text.held_line."""
+        shipped = runtime_text.builtin()
+        text = {**{f: shipped[f] for f in runtime_text.TEXT_FIELDS}, "tier_addenda": {}}
+        if line is not None:
+            text["held_line"] = line
+        state = self.home / "state"
+        state.mkdir(parents=True, exist_ok=True)
+        (state / runtime_text.CACHE_NAME).write_text(json.dumps(
+            {"revision": revision, "text_schema_version": 1, "runtime_text": text, **extra}))
+
+    def posted(self):
+        """(the routing actions, the text) of the queued hold line."""
+        parsed = parse_markers(self.notice.read_text(), skip_after_channel=True)
+        return [(a.kind, a.value) for a in parsed.actions], parsed.body.strip()
+
+    def test_the_served_line_is_posted_once_in_the_tasks_own_thread(self):
+        self.add_task(self.TID, "$ev1", thread_root="$root")
+        self.serve(self.SERVED)
+        self.assertEqual(self.hold(str(self.result_file)).returncode, hatch_cli.REPLY_POSTED)
+        self.assertEqual(self.posted(), ([("redirect", "!room:ag2.space"), ("thread", "$root")],
+                                         f"@bob:ag2.space {self.SERVED}"))
+        outbox.record_delivered(self.results / delivery_destination.RECEIPT_DIR, self.notice.stem + "~0")
+        self.notice.unlink()
+        self.serve("A newer served line.", revision="acp.muse.2026-10-25.1")
+        r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_POSTED, r.stderr)
+        self.assertIn("already held", r.stdout)
+        self.assertFalse(self.notice.exists(), "a re-park never posts, whatever is served now")
+
+    def test_without_a_usable_served_line_the_built_in_one_is_posted(self):
+        self.add_task(self.TID, "$ev1")
+        self.serve("Waiting.\n[channel: !other:ag2.space]")
+        self.assertEqual(self.hold(str(self.result_file)).returncode, hatch_cli.REPLY_POSTED)
+        self.assertEqual(self.posted(), ([("redirect", "!room:ag2.space")],
+                                         f"@bob:ag2.space {hatch_cli.HOLD_NOTICE}"))
+
+    def test_a_mid_line_marker_or_mention_in_the_served_line_falls_back(self):
+        for i, line in enumerate(("Waiting [dm-only] for my owner.", "Waiting. [attach: /etc/hosts]",
+                                  "Waiting. [channel: !other:ag2.space]", "Waiting for @room.",
+                                  "Waiting, @alice:ag2.space.")):
+            with self.subTest(line=line):
+                tid = f"task-17847000001{i:02d}"
+                self.result_file = self.results / f"{tid}.txt"
+                self.notice = self.results / hatch_cli._hold_notice(Path(), tid).name
+                self.add_task(tid, f"$ev{i}", thread_root="$root")
+                self.serve(line)
+                r = self.hold(str(self.result_file))
+                self.assertEqual(r.returncode, hatch_cli.REPLY_POSTED, r.stderr)
+                self.assertEqual(self.posted(), ([("redirect", "!room:ag2.space"), ("thread", "$root")],
+                                                 f"@bob:ag2.space {hatch_cli.HOLD_NOTICE}"))
+
+    def test_a_served_line_for_a_revision_sparrow_did_not_announce_is_not_used(self):
+        self.add_task(self.TID, "$ev1")
+        self.serve(self.SERVED)
+        (self.home / "state" / "setup-hint.json").write_text(
+            json.dumps({"setup_revision": "acp.muse.2026-10-25.1"}))
+        self.assertEqual(self.hold(str(self.result_file)).returncode, hatch_cli.REPLY_POSTED)
+        self.assertEqual(self.posted()[1], f"@bob:ag2.space {hatch_cli.HOLD_NOTICE}")
+
+    def test_only_one_plain_line_is_taken_from_the_served_text(self):
+        def cache(line, **over):
+            shipped = runtime_text.builtin()
+            text = {**{f: shipped[f] for f in runtime_text.TEXT_FIELDS}, "held_line": line}
+            return {"revision": "r1", "text_schema_version": 1, "runtime_text": text, **over}
+        self.assertEqual(runtime_text.held_line(cache(self.SERVED)), self.SERVED)
+        self.assertEqual(runtime_text.held_line(cache("x" * runtime_text.HELD_LINE_MAX)),
+                         "x" * runtime_text.HELD_LINE_MAX)
+        for bad in ("Waiting.\n[channel: !other:ag2.space]", "[channel: !other:ag2.space] ok",
+                    "[thread: $other] ok", "Waiting.\u2028[channel: !other:ag2.space]",
+                    "Waiting.\r", " Waiting.", "", "run `<REPLY_COMMAND> reply` now",
+                    "x" * (runtime_text.HELD_LINE_MAX + 1), 7, None, ["Waiting."],
+                    "Waiting [dm-only] for my owner.", "Waiting. [attach: /etc/hosts]",
+                    "Waiting. [file: /etc/hosts]", "Waiting. [send: /etc/hosts]",
+                    "Waiting. [channel: !other:ag2.space]", "Waiting [thread: $other] here.",
+                    "Waiting. [no-send]", "Waiting for @room.", "Waiting, @alice:ag2.space.",
+                    "Waiting (cc @alice)."):
+            with self.subTest(line=bad):
+                self.assertIsNone(runtime_text.held_line(cache(bad)))
+        self.assertEqual(runtime_text.held_line(cache("Waiting [soon] for my owner.")),
+                         "Waiting [soon] for my owner.", "a bracket that is no marker is plain text")
+        self.assertIsNone(runtime_text.held_line(cache(self.SERVED, text_schema_version=2)))
+        self.assertIsNone(runtime_text.held_line(None))
+
+    def test_lock_order_a_the_reply_withdraws_first_and_the_drain_posts_nothing(self):
+        from ag2_sparrow import remote_gateway_bridge as gb
+        self.add_task(self.TID, "$ev1")
+        self.assertEqual(self.hold(str(self.result_file)).returncode, hatch_cli.REPLY_POSTED)
+        posts, answers = [], []
+        ready = gb.read_ready_result
+
+        def claimed(path):
+            # The drain has renamed the line to its claim: the worker answers right now.
+            if path.name.startswith(self.notice.stem + delivery_destination.CLAIM_INFIX) and not answers:
+                with mock.patch.object(outbox, "_activity_completed", return_value=None):
+                    answers.append(run_main(hatch_cli.main, ["reply", str(self.result_file), "--body",
+                                                             "done", "--wait", "0"], self.env()))
+            return ready(path)
+
+        def req(method, path, payload=None, timeout=None, **_kw):
+            if method == "POST":
+                posts.append(payload)
+            return {"ok": True, "event_id": "$evt"}
+        with mock.patch.object(gb, "RESULTS_DIR", self.results), \
+                mock.patch.object(gb, "ARCHIVE_RESULTS_DIR", self.results / "archive"), \
+                mock.patch.object(gb, "UNDELIVERABLE_RESULTS_DIR", self.results / "undelivered"), \
+                mock.patch.object(gb, "PROACTIVE_ROOM", ""), mock.patch.object(gb, "_req", req), \
+                mock.patch.object(gb, "PROACTIVE_CLAIM_GATE", None), mock.patch.object(gb, "_log"), \
+                mock.patch.object(gb, "_STATE", self.home / "state"), \
+                mock.patch.object(gb, "read_ready_result", claimed), \
+                mock.patch.dict(gb._ROUTING, {"owner_dm": "", "loaded": True, "next": time.time() + 3600}), \
+                mock.patch.dict(os.environ, {"AGENT_MXID": AGENT}):
+            gb._post_proactive()
+        self.assertEqual(len(answers), 1, "the answer landed while the line was claimed")
+        self.assertEqual(self.result_file.read_text(), "done", answers[0].stderr)
+        self.assertEqual(posts, [], "the claimed line was withdrawn, never posted")
+        self.assertIn("will not post: the drain withdraws it now that the task is answered",
+                      answers[0].stderr)
+        self.assertFalse(list(self.results.glob(f"{self.notice.stem}.sending.*")))
+        self.assertEqual(hatch_cli.hold_line_outcome(self.results, self.TID), "withdrawn")
+        self.assertNotEqual(hatch_cli.hold_line_outcome(self.results, self.TID), "delivered")
+
+    def test_lock_order_b_the_drain_sends_first_and_the_reply_reports_the_post(self):
+        from ag2_sparrow import remote_gateway_bridge as gb
+        self.add_task(self.TID, "$ev1")
+        self.assertEqual(self.hold(str(self.result_file)).returncode, hatch_cli.REPLY_POSTED)
+        posts, answers, workers = [], [], []
+
+        def answer():
+            with mock.patch.object(outbox, "_activity_completed", return_value=None):
+                answers.append(run_main(hatch_cli.main, ["reply", str(self.result_file), "--body",
+                                                         "done", "--wait", "0"], self.env()))
+
+        def req(method, path, payload=None, timeout=None, **_kw):
+            if method == "POST":
+                # The drain has found no withdrawal and is about to send: the worker answers now.
+                worker = threading.Thread(target=answer)
+                worker.start()
+                worker.join(1.0)
+                posts.append((payload["body"], self.result_file.exists()))
+                workers.append(worker)
+            return {"ok": True, "event_id": "$evt"}
+        with mock.patch.object(gb, "RESULTS_DIR", self.results), \
+                mock.patch.object(gb, "ARCHIVE_RESULTS_DIR", self.results / "archive"), \
+                mock.patch.object(gb, "UNDELIVERABLE_RESULTS_DIR", self.results / "undelivered"), \
+                mock.patch.object(gb, "PROACTIVE_ROOM", ""), mock.patch.object(gb, "_req", req), \
+                mock.patch.object(gb, "PROACTIVE_CLAIM_GATE", None), mock.patch.object(gb, "_log"), \
+                mock.patch.object(gb, "_STATE", self.home / "state"), \
+                mock.patch.dict(gb._ROUTING, {"owner_dm": "", "loaded": True, "next": time.time() + 3600}), \
+                mock.patch.dict(os.environ, {"AGENT_MXID": AGENT}):
+            gb._post_proactive()
+            workers[0].join(30)
+        self.assertEqual(posts, [(f"@bob:ag2.space {hatch_cli.HOLD_NOTICE}", False)],
+                         "the answer waited for the send it raced; it never came before the line")
+        self.assertEqual(self.result_file.read_text(), "done", answers[0].stderr)
+        self.assertIn("was already posted before this answer", answers[0].stderr)
+        self.assertNotIn("withdraw", answers[0].stderr, "the losing reply never claims a withdrawal")
+
+    def drain_with(self, req, archive=None, url=None, ready=None, own_env=True):
+        """One real drain pass; `req` stands in for the gateway unless `url` names a real one.
+        Without `own_env` it runs in the environment it finds, as a drain beside hold must."""
+        from ag2_sparrow import remote_gateway_bridge as gb
+        net = (mock.patch.multiple(gb, URL=url, TOKEN="t") if url else mock.patch.object(gb, "_req", req))
+        seam = mock.patch.object(gb, "read_ready_result", ready) if ready else contextlib.nullcontext()
+        with mock.patch.object(gb, "RESULTS_DIR", self.results), \
+                mock.patch.object(gb, "ARCHIVE_RESULTS_DIR", archive or self.results / "archive"), \
+                mock.patch.object(gb, "UNDELIVERABLE_RESULTS_DIR", self.results / "undelivered"), \
+                mock.patch.object(gb, "PROACTIVE_ROOM", ""), net, seam, \
+                mock.patch.object(gb, "PROACTIVE_CLAIM_GATE", None), mock.patch.object(gb, "_log"), \
+                mock.patch.object(gb, "_STATE", self.home / "state"), \
+                mock.patch.dict(gb._ROUTING, {"owner_dm": "", "loaded": True, "next": time.time() + 3600}), \
+                (mock.patch.dict(os.environ, {"AGENT_MXID": AGENT}) if own_env else contextlib.nullcontext()):
+            gb._post_proactive()
+
+    def drain_pass(self, posts, archive=None, fail=None, ready=None, own_env=True):
+        """A drain pass whose gateway records each posted body, or raises `fail` after recording."""
+        def req(method, path, payload=None, timeout=None, **_kw):
+            if method == "POST":
+                posts.append(payload["body"])
+                if fail is not None:
+                    raise fail
+            return {"ok": True, "event_id": "$evt"}
+        self.drain_with(req, archive=archive, ready=ready, own_env=own_env)
+
+    def reply_now(self, *extra):
+        with mock.patch.object(outbox, "_activity_completed", return_value=None):
+            return run_main(hatch_cli.main, ["reply", str(self.result_file), "--body", "done",
+                                             "--wait", "0", *extra], self.env())
+
+    def test_an_answer_committed_while_hold_publishes_never_follows_its_line(self):
+        # Kewei's interleaving: hold pauses after reserving its notice, the answer runs, hold
+        # publishes and places, and the drain runs before hold's last check.
+        self.add_task(self.TID, "$ev1")
+        at_mark, go, posts, codes = threading.Event(), threading.Event(), [], {}
+        real_mark, real_place = task_hold.mark_notice, task_hold.place
+
+        def mark(*a, **k):
+            at_mark.set()
+            go.wait(10)
+            return real_mark(*a, **k)
+
+        def place(*a, **k):
+            token = real_place(*a, **k)
+            self.drain_pass(posts)
+            return token
+
+        def run(name, argv):
+            codes[name] = hatch_cli.main(argv)
+        with mock.patch.dict(os.environ, self.env(), clear=True), \
+                mock.patch.object(hatch_cli, "_installed_config", return_value={}), \
+                mock.patch.object(task_hold, "mark_notice", mark), \
+                mock.patch.object(task_hold, "place", place), \
+                mock.patch.object(outbox, "_activity_completed", return_value=None), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            holder = threading.Thread(target=run, args=("hold", ["hold", str(self.result_file)]))
+            holder.start()
+            self.assertTrue(at_mark.wait(10))
+            answer = threading.Thread(target=run, args=("reply", [
+                "reply", str(self.result_file), "--body", "done", "--wait", "0"]))
+            answer.start()
+            answer.join(1.0)
+            answered_before_publish = self.result_file.exists()
+            go.set()
+            holder.join(30)
+            answer.join(30)
+            self.drain_pass(posts)
+        self.assertFalse(answered_before_publish, "the answer waits for hold's transaction")
+        self.assertEqual(posts, [], "a line published before the answer is withdrawn by it")
+        self.assertEqual(self.result_file.read_text(), "done")
+        self.assertEqual(codes["hold"], hatch_cli.REPLY_POSTED)
+
+    def test_a_withdrawn_line_whose_archive_fails_stays_withdrawn(self):
+        self.add_task(self.TID, "$ev1")
+        self.assertEqual(self.hold(str(self.result_file)).returncode, hatch_cli.REPLY_POSTED)
+        self.assertIn("will not post", self.reply_now().stderr)
+        blocked = self.results / "archive-is-a-file"
+        blocked.write_text("")
+        posts = []
+        for _ in range(3):  # the outbox withdraws it; its file cannot be archived and stays queued
+            self.drain_pass(posts, archive=blocked / "archive")
+            self.assertEqual(hatch_cli.hold_line_outcome(self.results, self.TID), "undelivered")
+        self.drain_pass(posts)
+        self.assertEqual(posts, [], "a withdrawn line never posts, however often its archive fails")
+        self.assertEqual(hatch_cli.hold_line_outcome(self.results, self.TID), "withdrawn")
+        self.assertFalse(self.notice.exists(), "retired once the archive takes it")
+    def test_a_send_with_an_unknown_outcome_is_never_reported_as_withdrawn(self):
+        # The proactive outbox parks an uncertain send, never resends it (#5857's contract).
+        self.add_task(self.TID, "$ev1")
+        self.assertEqual(self.hold(str(self.result_file)).returncode, hatch_cli.REPLY_POSTED)
+        posts = []
+        self.drain_pass(posts, fail=TimeoutError("applied, then timed out"))
+        self.assertEqual(len(posts), 1)
+        self.assertEqual(hatch_cli.hold_line_outcome(self.results, self.TID), "unconfirmed")
+        note = self.reply_now().stderr
+        self.assertIn("with an unconfirmed outcome (the room may already show it)", note)
+        self.assertNotIn("withdraws", note)
+        self.drain_pass(posts)
+        self.assertEqual(len(posts), 1, "never sent again")
+    def gateway(self, handler):
+        """A real local gateway on a free port, run by `handler`'s do_POST; returns its URL."""
+        import http.server
+
+        class Quiet(handler):
+            def log_message(self, *a):
+                pass
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Quiet)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return f"http://127.0.0.1:{server.server_address[1]}"
+
+    def test_a_plain_fixed_length_success_is_delivered_and_settled(self):
+        import http.server
+        posts = []
+
+        class Ok(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                posts.append(self.rfile.read(int(self.headers.get("Content-Length") or 0)))
+                body = b'{"ok": true, "event_id": "$local"}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+        url = self.gateway(Ok)
+        self.add_task(self.TID, "$ev1")
+        self.assertEqual(self.hold(str(self.result_file)).returncode, hatch_cli.REPLY_POSTED)
+        self.drain_with(None, url=url)
+        self.assertEqual(len(posts), 1)
+        self.assertEqual(list(self.results.glob(f"{self.notice.stem}.sending.*")), [], "settled, not stranded")
+        self.assertEqual(hatch_cli.hold_line_outcome(self.results, self.TID), "delivered")
+        self.drain_with(None, url=url)
+        self.assertEqual(len(posts), 1, "never sent twice")
+
+    def test_a_send_that_began_counts_against_the_budget_before_the_post(self):
+        # Each child process POSTs and dies before settling; orphan recovery runs between them.
+        from ag2_sparrow import remote_gateway_bridge as gb
+        self.add_task(self.TID, "$ev1")
+        self.assertEqual(self.hold(str(self.result_file)).returncode, hatch_cli.REPLY_POSTED)
+        posts = self.home / "posts"
+        child = textwrap.dedent(f"""
+            import os, time
+            from pathlib import Path
+            from ag2_sparrow import remote_gateway_bridge as gb
+            results = Path({str(self.results)!r})
+            gb.RESULTS_DIR, gb.ARCHIVE_RESULTS_DIR = results, results / "archive"
+            gb.UNDELIVERABLE_RESULTS_DIR, gb._STATE = results / "undelivered", Path({str(self.home / "state")!r})
+            gb.PROACTIVE_ROOM, gb.PROACTIVE_CLAIM_GATE, gb._log = "", None, lambda *a: None
+            gb._ROUTING.update(owner_dm="", loaded=True, next=time.time() + 3600)
+            def crash(method, path, payload=None, **kw):
+                with open({str(posts)!r}, "a") as fh:
+                    fh.write("post\\n")
+                os._exit(77)
+            gb._req = crash
+            gb._recover_orphan_proactive()
+            gb._post_proactive()
+        """)
+        codes = [subprocess.run([sys.executable, "-c", child], env={**py_env(self.home), "AGENT_MXID": AGENT},
+                                capture_output=True, text=True, timeout=60).returncode
+                 for _ in range(gb.MAX_TRANSIENT_ATTEMPTS + 4)]
+        sent = posts.read_text().count("post") if posts.exists() else 0
+        # The outbox marks a send before it leaves; the next claim finds the mark and parks it.
+        self.assertEqual(sent, 1, codes)
+        self.assertEqual(hatch_cli.hold_line_outcome(self.results, self.TID), "unconfirmed")
+
+    def test_a_requeued_parked_line_gets_a_fresh_budget(self):
+        from ag2_sparrow import outbox_cli
+        self.add_task(self.TID, "$ev1")
+        self.assertEqual(self.hold(str(self.result_file)).returncode, hatch_cli.REPLY_POSTED)
+        posts = []
+        self.drain_pass(posts, fail=TimeoutError("applied, then timed out"))
+        (item,) = delivery_destination.lane_items(self.results, self.notice.stem)
+        self.assertEqual(item["status"], "PARKED")
+        (parked,) = (self.results / "undelivered").glob(f"{self.notice.stem}-*.txt")
+        # The operator's resend, as the drain's log spells it: requeue and restore its own body.
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            rc = outbox_cli.main(["--root", str(self.results / delivery_destination.RECEIPT_DIR),
+                                  "requeue", item["item_id"], "--body-id", self.notice.stem,
+                                  "--body-sha256", hashlib.sha256(parked.read_bytes()).hexdigest()])
+        self.assertEqual(rc, 0)
+        self.assertTrue(self.notice.exists(), "the body is back in the queue")
+        self.drain_pass(posts)
+        self.assertEqual(len(posts), 2, "the requeued line is sent again, once")
+        self.assertEqual(hatch_cli.hold_line_outcome(self.results, self.TID), "delivered")
+    def test_a_requeue_keeps_the_proof_that_an_earlier_send_may_have_landed(self):
+        from ag2_sparrow import outbox_cli
+        self.add_task(self.TID, "$ev1")
+        self.assertEqual(self.hold(str(self.result_file)).returncode, hatch_cli.REPLY_POSTED)
+        posts = []
+        self.drain_pass(posts, fail=TimeoutError("applied, then timed out"))
+        (item,) = delivery_destination.lane_items(self.results, self.notice.stem)
+        self.assertEqual(item["reason"], "outcome-unknown")
+        (parked,) = (self.results / "undelivered").glob(f"{self.notice.stem}-*.txt")
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            rc = outbox_cli.main(["--root", str(self.results / delivery_destination.RECEIPT_DIR),
+                                  "requeue", item["item_id"], "--body-id", self.notice.stem,
+                                  "--body-sha256", hashlib.sha256(parked.read_bytes()).hexdigest()])
+        self.assertEqual(rc, 0)
+        (item,) = delivery_destination.lane_items(self.results, self.notice.stem)
+        self.assertEqual(item["status"], "QUEUED")
+        self.assertEqual(hatch_cli.hold_line_outcome(self.results, self.TID), "unconfirmed")
+        note = self.reply_now().stderr  # before the resend: attempt 0 may already be in the room
+        self.assertIn("the room may already show it", note)
+        self.assertNotIn("will not post", note)
+
+    def test_an_answer_whose_temp_file_cleanup_fails_is_reported_as_written(self):
+        self.add_task(self.TID, "$ev1")
+        self.assertEqual(self.hold(str(self.result_file)).returncode, hatch_cli.REPLY_POSTED)
+        real = Path.unlink
+
+        def refuse(path):
+            raise PermissionError(13, "cleanup refused")
+        with mock.patch.object(Path, "unlink", autospec=True, side_effect=lambda path, *a, **k: (
+                refuse(path) if path.name.startswith(f".{self.result_file.name}.")
+                else real(path, *a, **k))):
+            r = self.reply_now()
+        self.assertEqual(self.result_file.read_text(), "done")
+        self.assertIn(r.returncode, (hatch_cli.REPLY_POSTED, hatch_cli.REPLY_UNCONFIRMED), r.stderr)
+        self.assertNotIn("nothing written", r.stderr)
+
+    def test_hold_refuses_when_the_drain_is_swapped_while_it_waits_for_the_lock(self):
+        self.add_task(self.TID, "$ev1")
+        lock = self.home / "state" / "locks" / "gateway-bridge.lock"
+        lock.parent.mkdir(parents=True, exist_ok=True)
+
+        def holder(pid):
+            now = int(time.time())
+            lock.write_text(json.dumps({"role": "gateway-bridge", "pid": pid, "acquired_at": now,
+                                        "host": hatch_cli.workspace_lock._host_label(),
+                                        "heartbeat_at": now, "schema_version": 1}))
+        holder(os.getpid())  # the record's publisher holds the singleton when hold first looks
+        real = delivery_destination.send_lock
+
+        @contextlib.contextmanager
+        def swapped(*a, **k):
+            with real(*a, **k):
+                holder(os.getppid())  # a successor takes it while hold waited for the lock
+                yield
+        with mock.patch.object(delivery_destination, "send_lock", swapped):
+            r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED, r.stdout + r.stderr)
+        self.assertIn("drain changed", r.stderr)
+        self.assertFalse(self.notice.exists())
+        self.assertIsNone(task_hold.read(self.results, self.TID))
+
+    def test_a_parked_line_that_was_sent_is_never_reported_unsent(self):
+        from ag2_sparrow import remote_gateway_bridge as gb
+        self.add_task(self.TID, "$ev1")
+        self.assertEqual(self.hold(str(self.result_file)).returncode, hatch_cli.REPLY_POSTED)
+        posts = []
+        for _ in range(gb.MAX_TRANSIENT_ATTEMPTS + 1):
+            self.drain_pass(posts, fail=TimeoutError("applied, then timed out"))
+        note = self.reply_now().stderr
+        self.assertIn("with an unconfirmed outcome (the room may already show it)", note)
+        self.assertNotIn("parked unsent", note)
+
+    def test_a_send_whose_dispatch_mark_cannot_be_written_is_never_sent(self):
+        self.add_task(self.TID, "$ev1")
+        self.assertEqual(self.hold(str(self.result_file)).returncode, hatch_cli.REPLY_POSTED)
+        posts = []
+        with mock.patch.object(outbox, "record_dispatching", side_effect=OSError(28, "No space left on device")):
+            try:
+                self.drain_pass(posts)
+            except OSError:
+                pass
+        self.assertEqual(posts, [], "a send not marked on disk does not leave")
+        self.assertTrue(self.lock_is_free())
+        self.assertNotEqual(hatch_cli.hold_line_outcome(self.results, self.TID), "delivered")
+    def test_an_answer_whose_publication_fails_leaves_the_task_and_its_line_as_they_were(self):
+        self.add_task(self.TID, "$ev1")
+        self.assertEqual(self.hold(str(self.result_file)).returncode, hatch_cli.REPLY_POSTED)
+        line = self.notice.read_text()
+        real = hatch_cli._publish_once
+
+        def failing(path, body):
+            if path == self.result_file:
+                raise OSError(28, "No space left on device")
+            return real(path, body)
+        with mock.patch.object(hatch_cli, "_publish_once", failing):
+            r = self.reply_now()
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertIn("nothing written", r.stderr)
+        self.assertFalse(self.result_file.exists())
+        self.assertEqual(self.notice.read_text(), line, "the hold line is untouched")
+        self.assertFalse((hatch_cli._claims_dir(self.results) / self.TID).exists(), "the claim is released")
+        r = self.reply_now()
+        self.assertIn(r.returncode, (hatch_cli.REPLY_POSTED, hatch_cli.REPLY_UNCONFIRMED), r.stderr)
+        self.assertEqual(self.result_file.read_text(), "done")
+        posts = []
+        self.drain_pass(posts)
+        self.assertEqual(posts, [], "withdrawn now that the retry answered it")
+    def test_a_busy_or_broken_lock_hands_back_and_writes_nothing(self):
+        self.add_task(self.TID, "$ev1")
+        self.assertEqual(self.hold(str(self.result_file)).returncode, hatch_cli.REPLY_POSTED)
+        done = []
+        with delivery_destination.send_lock(self.results):
+            with mock.patch.object(delivery_destination, "PRODUCER_LOCK_WAIT_S", 0.3):
+                worker = threading.Thread(target=lambda: done.append(self.reply_now()))
+                worker.start()
+                worker.join(5)
+                self.assertFalse(worker.is_alive(), "a reply never waits on the lock unbounded")
+            posts = []
+            self.drain_pass(posts)  # the drain's own wait is short: it hands the claim back
+        self.assertEqual(done[0].returncode, 2, done[0].stderr)
+        self.assertIn("nothing written", done[0].stderr)
+        self.assertFalse(self.result_file.exists())
+        self.assertEqual(posts, [])
+        self.assertEqual(hatch_cli.hold_line_outcome(self.results, self.TID), "undelivered", "handed back unsent")
+        lock_dir = self.results / delivery_destination.SEND_LOCK_DIR
+        shutil.rmtree(lock_dir)
+        lock_dir.write_text("")  # the lock cannot be opened at all
+        self.drain_pass(posts)
+        self.assertEqual(posts, [])
+        self.assertEqual(hatch_cli.hold_line_outcome(self.results, self.TID), "undelivered")
+        r = self.reply_now()
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertFalse(self.result_file.exists())
+
+    def test_hold_refuses_while_the_running_sparrow_predates_the_send_lock(self):
+        self.add_task(self.TID, "$ev1")
+        self.send_lock = False
+        r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED, r.stdout)
+        self.assertIn("predates the hold-line send lock", r.stderr)
+        self.assertFalse(self.notice.exists())
+        self.assertIsNone(task_hold.read(self.results, self.TID))
+
+    def lock_is_free(self):
+        import fcntl  # POSIX only, like the lock under test
+        lock = self.results / delivery_destination.SEND_LOCK_DIR / "lock"
+        fd = os.open(lock, os.O_RDWR)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except BlockingIOError:
+            return False
+        finally:
+            os.close(fd)
+
+    def test_every_send_outcome_releases_the_lock_and_keeps_its_inode(self):
+        lock = self.results / delivery_destination.SEND_LOCK_DIR / "lock"
+        inode = None
+        outcomes = [urllib.error.URLError(ConnectionRefusedError(61, "refused")), TimeoutError("slow"),
+                    urllib.error.HTTPError("u", 503, "busy", {}, None), {"ok": True},
+                    urllib.error.HTTPError("u", 401, "auth", {}, None)]
+        for n, outcome in enumerate(outcomes):
+            with self.subTest(outcome=repr(outcome)[:40]):
+                self.TID = f"task-17847000002{n:02d}"
+                self.result_file = self.results / f"{self.TID}.txt"
+                self.notice = hatch_cli._hold_notice(self.results, self.TID)
+                self.add_task(self.TID, f"$o{n}")
+                self.assertEqual(self.hold(str(self.result_file)).returncode, hatch_cli.REPLY_POSTED)
+                calls = []
+
+                def req(method, path, payload=None, timeout=None, outcome=outcome, **_kw):
+                    if method == "POST":
+                        calls.append(self.lock_is_free())
+                    if isinstance(outcome, BaseException):
+                        raise outcome
+                    return outcome
+                try:
+                    self.drain_with(req)
+                except urllib.error.HTTPError as e:
+                    self.assertEqual(e.code, 401, "only an auth refusal is raised out of the drain")
+                self.assertEqual(calls, [False], "one send, made under the lock")
+                self.assertTrue(self.lock_is_free(), "released whatever the outcome")
+                inode = inode or lock.stat().st_ino
+                self.assertEqual(lock.stat().st_ino, inode, "one lock file, never recreated")
+                self.result_file.write_text("done")  # answered: the next pass leaves this line alone
+    def test_the_send_has_a_wall_clock_deadline_and_releases_the_lock(self):
+        import http.server
+        dribbled = threading.Event()
+
+        class Dribble(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                self.send_response(200)
+                self.send_header("Content-Length", "64")
+                self.end_headers()
+                for _ in range(40):  # about 8 s, each byte inside the socket timeout
+                    try:
+                        self.wfile.write(b" ")
+                        self.wfile.flush()
+                    except OSError:
+                        break
+                    time.sleep(0.2)
+                dribbled.set()
+
+            def log_message(self, *a):
+                pass
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Dribble)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.add_task(self.TID, "$ev1")
+        self.assertEqual(self.hold(str(self.result_file)).returncode, hatch_cli.REPLY_POSTED)
+        started = time.monotonic()
+        with mock.patch.object(delivery_destination, "SEND_DEADLINE_S", 1.0):
+            self.drain_with(None, url=f"http://127.0.0.1:{server.server_address[1]}")
+        self.assertLess(time.monotonic() - started, 4.0, "a dribbling body cannot hold the lock")
+        self.assertTrue(self.lock_is_free())
+        self.assertEqual(hatch_cli.hold_line_outcome(self.results, self.TID), "unconfirmed",
+                         "an unfinished send is parked as uncertain, never resent")
+
+    def test_the_deadline_covers_slow_headers(self):
+        import http.server
+
+        class SlowHeaders(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                for byte in b"HTTP/1.1 200 OK\r\nX-Slow: " + b"a" * 60:
+                    try:
+                        self.wfile.write(bytes([byte]))
+                        self.wfile.flush()
+                    except OSError:
+                        return
+                    time.sleep(0.1)
+        url = self.gateway(SlowHeaders)
+        self.add_task(self.TID, "$ev1")
+        self.assertEqual(self.hold(str(self.result_file)).returncode, hatch_cli.REPLY_POSTED)
+        started = time.monotonic()
+        with mock.patch.object(delivery_destination, "SEND_DEADLINE_S", 1.0):
+            self.drain_with(None, url=url)
+        self.assertLess(time.monotonic() - started, 3.0, "headers arriving slowly cannot hold the lock")
+        self.assertTrue(self.lock_is_free())
+        self.assertEqual(hatch_cli.hold_line_outcome(self.results, self.TID), "unconfirmed",
+                         "an unfinished send is parked as uncertain, never resent")
+
+    def test_the_deadline_covers_an_error_body(self):
+        import http.server
+        from ag2_sparrow import remote_gateway_bridge as gb
+
+        class SlowError(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                self.send_response(400)
+                self.send_header("Content-Length", "64")
+                self.end_headers()
+                for _ in range(30):
+                    try:
+                        self.wfile.write(b" ")
+                        self.wfile.flush()
+                    except OSError:
+                        return
+                    time.sleep(0.1)
+        url = self.gateway(SlowError)
+        started = time.monotonic()
+        with mock.patch.multiple(gb, URL=url, TOKEN="t"):
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                gb._req("POST", "/v1/room", {"op": "message"}, timeout=15,
+                        deadline=time.monotonic() + 0.5)
+            gb._http_error_body(caught.exception)
+        self.assertLess(time.monotonic() - started, 2.0, "an error body arriving slowly is cut at the deadline")
+
+    def tls_gateway(self, handler):
+        """A local HTTPS gateway with a throwaway self-signed cert; returns (url, client context)."""
+        import http.server
+        import ssl
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d)
+        subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+                        "-keyout", str(d / "k.pem"), "-out", str(d / "c.pem"), "-subj", "/CN=127.0.0.1",
+                        "-addext", "subjectAltName=IP:127.0.0.1"], check=True, capture_output=True)
+        serve = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        serve.load_cert_chain(d / "c.pem", d / "k.pem")
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        server.socket = serve.wrap_socket(server.socket, server_side=True)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        client = ssl.create_default_context(cafile=str(d / "c.pem"))
+        return f"https://127.0.0.1:{server.server_address[1]}", client
+
+    def bounded_req(self, url, budget, client=None):
+        """gb._req against `url` with a `budget` s deadline; returns (raised, seconds)."""
+        import http.client
+        from ag2_sparrow import remote_gateway_bridge as gb
+        patch = mock.patch.object(http.client, "_create_https_context", lambda v: client)
+        started, raised = time.monotonic(), None
+        with mock.patch.multiple(gb, URL=url, TOKEN="t"), (patch if client else contextlib.nullcontext()):
+            try:
+                gb._req("POST", "/v1/room", {"op": "message"}, timeout=15,
+                        deadline=time.monotonic() + budget)
+            except Exception as e:  # noqa: BLE001 - the test reads what the deadline raised
+                raised = e
+        return raised, time.monotonic() - started
+
+    def test_the_deadline_covers_slow_https_headers(self):
+        import http.server
+
+        class SlowHeaders(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                for byte in b"HTTP/1.1 200 OK\r\nX-Slow: " + b"a" * 60:
+                    try:
+                        self.wfile.write(bytes([byte]))
+                        self.wfile.flush()
+                    except OSError:
+                        return
+                    time.sleep(0.1)
+            log_message = lambda *a: None  # noqa: E731
+        url, client = self.tls_gateway(SlowHeaders)
+        raised, took = self.bounded_req(url, 0.3, client)
+        self.assertIsInstance(raised, TimeoutError, repr(raised))
+        self.assertLess(took, 1.0, "TLS-wrapped headers arriving slowly are cut at the deadline")
+
+    def test_the_deadline_covers_a_slow_https_error_body(self):
+        import http.server
+
+        class SlowError(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                self.send_response(400)
+                self.send_header("Content-Length", "64")
+                self.end_headers()
+                for _ in range(30):
+                    try:
+                        self.wfile.write(b" ")
+                        self.wfile.flush()
+                    except OSError:
+                        return
+                    time.sleep(0.1)
+            log_message = lambda *a: None  # noqa: E731
+        url, client = self.tls_gateway(SlowError)
+        raised, took = self.bounded_req(url, 0.3, client)
+        self.assertIsInstance(raised, urllib.error.HTTPError, repr(raised))
+        self.assertLess(took, 1.0, "a TLS-wrapped error body arriving slowly is cut at the deadline")
+        self.assertTrue(raised.fp.closed, "its buffered response is closed, its socket released")
+
+    def test_the_deadline_covers_a_stalled_tls_handshake(self):
+        import socket as sk
+        quiet = sk.socket()
+        quiet.bind(("127.0.0.1", 0))
+        quiet.listen(5)  # accepts the connection and never speaks TLS
+        self.addCleanup(quiet.close)
+        raised, took = self.bounded_req(f"https://127.0.0.1:{quiet.getsockname()[1]}", 0.3)
+        self.assertIsNotNone(raised)
+        self.assertLess(took, 1.0, "a handshake that never answers is cut at the deadline")
+
+    def test_the_deadline_is_shared_by_every_connect_candidate(self):
+        import socket as sk
+        from ag2_sparrow import remote_gateway_bridge as gb
+        addrs = [(sk.AF_INET, sk.SOCK_STREAM, 6, "", ("127.0.0.1", 9)),
+                 (sk.AF_INET, sk.SOCK_STREAM, 6, "", ("127.0.0.2", 9))]
+
+        def stalled(sock, address):
+            time.sleep(sock.gettimeout())
+            raise TimeoutError("timed out")
+        with mock.patch.object(sk, "getaddrinfo", return_value=addrs), \
+                mock.patch.object(sk.socket, "connect", stalled):
+            raised, took = self.bounded_req("http://stalled.example:9", 0.3)
+        self.assertIsInstance(raised, TimeoutError, repr(raised))
+        self.assertLess(took, 0.45, "two candidates share one budget, not one each")
+
+    def test_the_deadline_covers_name_resolution(self):
+        import socket as sk
+
+        def slow_resolver(*a, **k):
+            time.sleep(0.8)
+            return [(sk.AF_INET, sk.SOCK_STREAM, 6, "", ("127.0.0.1", 9))]
+        with mock.patch.object(sk, "getaddrinfo", slow_resolver):
+            raised, took = self.bounded_req("http://slow-dns.example:9", 0.2)
+        self.assertIsInstance(raised, TimeoutError, repr(raised))
+        self.assertLess(took, 0.5, "a resolver that outlasts the deadline is not waited for")
+
+    def test_connect_by_moves_past_an_address_family_this_host_cannot_open(self):
+        from ag2_sparrow import remote_gateway_bridge as gb
+        import socket as sk
+        listener = sk.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        self.addCleanup(listener.close)
+        port = listener.getsockname()[1]
+        candidates = [(sk.AF_INET6, sk.SOCK_STREAM, 6, "", ("::1", port, 0, 0)),
+                      (sk.AF_INET, sk.SOCK_STREAM, 6, "", ("127.0.0.1", port))]
+        real, families = sk.socket, []
+
+        def restricted(family=-1, *a, **k):
+            families.append(family)
+            if family == sk.AF_INET6:
+                raise OSError(errno.EAFNOSUPPORT, "Address family not supported")
+            return real(family, *a, **k)
+        socks = []
+        with mock.patch.object(gb.socket, "getaddrinfo", return_value=candidates), \
+                mock.patch.object(gb.socket, "socket", restricted):
+            made = gb._connect_by(("localhost", port), time.monotonic() + 5, 5, None, socks)
+        self.addCleanup(made.close)
+        self.assertEqual(families, [sk.AF_INET6, sk.AF_INET])
+        self.assertEqual(made.getpeername(), ("127.0.0.1", port))
+        self.assertEqual(socks, [made], "only a socket actually made is recorded")
+
+    def test_connect_by_reports_each_way_a_connection_fails_or_is_made(self):
+        import socket as sk
+        from ag2_sparrow import remote_gateway_bridge as gb
+        with self.assertRaises(TimeoutError):  # no budget left: nothing is started
+            gb._connect_by(("127.0.0.1", 9), time.monotonic() - 1, 5, None, [])
+        with mock.patch.object(sk, "getaddrinfo", side_effect=sk.gaierror(8, "no such host")):
+            with self.assertRaises(sk.gaierror):
+                gb._connect_by(("nowhere.invalid", 9), time.monotonic() + 5, 5, None, [])
+        listener = sk.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        self.addCleanup(listener.close)
+        socks = []
+        made = gb._connect_by(("127.0.0.1", listener.getsockname()[1]), time.monotonic() + 5, 5,
+                              ("127.0.0.1", 0), socks)
+        self.addCleanup(made.close)
+        self.assertEqual(socks, [made], "the socket is recorded for the deadline timer")
+
+    def test_lane_state_tells_absent_invalid_unreadable_fresh_and_stale_apart(self):
+        ai = agent_identity
+        state = self.home / "state"
+        self.assertEqual(len({ai.LANE_ABSENT, ai.LANE_INVALID, ai.LANE_UNREADABLE}), 3,
+                         "absent, invalid and unreadable are distinct outcomes")
+        self.assertEqual(ai.lane_state(None, ""), (ai.LANE_ABSENT, None))
+        self.assertEqual(ai.lane_state(state, ""), (ai.LANE_ABSENT, None), "no auth dir")
+        auth = state / "auth"
+        auth.mkdir(parents=True)
+        self.assertEqual(ai.lane_state(state, ""), (ai.LANE_ABSENT, None), "no file")
+        lane = auth / "lane-identity.json"
+        for kind, text in (("malformed", "{"), ("emptied", ""), ("a list", "[]"),
+                           ("tombstone", json.dumps({"instance": "", "retracted": True})),
+                           ("not UTF-8", b"\xff"), ("oversized", " " * 5000 + "{}")):
+            with self.subTest(kind):
+                (lane.write_bytes if isinstance(text, bytes) else lane.write_text)(text)
+                self.assertEqual(ai.lane_state(state, ""), (ai.LANE_INVALID, None))
+                self.assertIsNone(ai.published_lane_record(state, ""))
+        rec = agent_identity.publish_lane(state, "", AGENT, delivery_destination.SEND_LOCK_PROTOCOL)
+        st, got = ai.lane_state(state, "")
+        self.assertEqual((st, got["agent_id"]), (ai.LANE_FRESH, AGENT))
+        st, got = ai.lane_state(state, "", now=rec["ts"] + ai.LANE_FRESH_S + 1)
+        self.assertEqual((st, got["pid"]), (ai.LANE_STALE, os.getpid()))
+        self.assertIsNone(ai.published_lane_record(state, "", now=rec["ts"] + ai.LANE_FRESH_S + 1))
+        real_open = os.open
+
+        def denied(path, *a, **k):
+            if path == "lane-identity.json":
+                raise PermissionError(13, "denied")
+            return real_open(path, *a, **k)
+        with mock.patch.object(bounded_file_read.os, "open", denied):
+            self.assertEqual(ai.lane_state(state, ""), (ai.LANE_UNREADABLE, None), "open refused")
+            self.assertIsNone(ai.published_lane_record(state, ""))
+        with mock.patch.object(bounded_file_read.os, "read", side_effect=OSError(5, "I/O error")):
+            self.assertEqual(ai.lane_state(state, ""), (ai.LANE_UNREADABLE, None), "read failed")
+        with mock.patch.object(ai, "_auth_dir", side_effect=OSError(5, "I/O error")):
+            self.assertEqual(ai.lane_state(state, ""), (ai.LANE_UNREADABLE, None), "dir failed")
+
+    def test_a_fifo_lane_record_is_refused_without_blocking_the_reader(self):
+        auth = self.home / "state" / "auth"
+        auth.mkdir(parents=True)
+        os.mkfifo(auth / "lane-identity.json")
+        out = []
+        t = threading.Thread(target=lambda: out.append((
+            agent_identity.lane_state(self.home / "state", ""),
+            agent_identity.published_lane_record(self.home / "state", ""))), daemon=True)
+        t.start()
+        t.join(2)
+        self.assertFalse(t.is_alive(), "the lane reader blocked on a FIFO")
+        self.assertEqual(out, [((agent_identity.LANE_INVALID, None), None)])
+
+    def test_hold_that_cannot_take_the_send_lock_records_nothing(self):
+        self.add_task(self.TID, "$ev1")
+        with mock.patch.object(delivery_destination, "send_lock",
+                               side_effect=delivery_destination.SendLockUnavailable("busy")):
+            r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED, r.stderr)
+        self.assertIn("send lock was not taken", r.stderr)
+        self.assertFalse(self.notice.exists())
+        self.assertIsNone(task_hold.read(self.results, self.TID))
+
+    def test_hold_finds_a_hold_a_peer_placed_while_it_waited_for_the_lock(self):
+        self.add_task(self.TID, "$ev1")
+        real = delivery_destination.send_lock
+
+        @contextlib.contextmanager
+        def peer_holds_first(*a, **k):
+            with real(*a, **k):
+                task_hold.place(self.results, self.TID, task_hold.OWNER_GO)
+                yield
+        with mock.patch.object(delivery_destination, "send_lock", peer_holds_first):
+            r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_POSTED, r.stderr)
+        self.assertIn("already held", r.stdout)
+        self.assertFalse(self.notice.exists(), "the peer's hold posts nothing here")
+
+    def test_hold_reports_a_marker_it_cannot_read_under_the_lock(self):
+        self.add_task(self.TID, "$ev1")
+        real = delivery_destination.send_lock
+
+        @contextlib.contextmanager
+        def marker_breaks(*a, **k):
+            with real(*a, **k), mock.patch.object(task_hold, "read", side_effect=ValueError("bad marker")):
+                yield
+        with mock.patch.object(delivery_destination, "send_lock", marker_breaks):
+            r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, 2, r.stdout)
+        self.assertIn("bad marker", r.stderr)
+        self.assertFalse(self.notice.exists())
+
+    def test_reply_after_the_line_was_delivered_says_it_was_already_posted(self):
+        self.add_task(self.TID, "$ev1")
+        self.assertEqual(self.hold(str(self.result_file)).returncode, hatch_cli.REPLY_POSTED)
+        posts = []
+        self.drain_pass(posts)
+        self.assertEqual(len(posts), 1)
+        self.assertIn("was already posted before this answer", self.reply_now().stderr)
+
+    def lock_holder(self, pid):
+        lock = self.home / "state" / "locks" / "gateway-bridge.lock"
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        now = int(time.time())
+        lock.write_text(json.dumps({"role": "gateway-bridge", "pid": pid, "acquired_at": now,
+                                    "host": hatch_cli.workspace_lock._host_label(),
+                                    "heartbeat_at": now, "schema_version": 1}))
+
+    def statuses(self, notice):
+        return [(i.get("status"), i.get("reason")) for i in
+                delivery_destination.lane_items(self.results, notice.stem)]
+
+    def hold_refused_while_the_drain_waits(self, posts):
+        """Reviewer's production ordering: hold publishes line A under the send lock; the real
+        drain claims A, then waits for that lock; the drain is swapped before hold's second fence,
+        so hold refuses; the drain then takes the lock and sends. Returns (hold result, A)."""
+        self.add_task(self.TID, "$ev1")
+        self.lock_holder(os.getpid())
+        real, seen, drain = hatch_cli._publish_once, {}, []
+
+        def publish_then_drain_claims(path, body):
+            done = real(path, body)
+            seen["a"] = path
+            t = threading.Thread(target=self.drain_pass, args=(posts,), kwargs={"own_env": False},
+                                 daemon=True)
+            t.start()
+            drain.append(t)
+            deadline = time.monotonic() + 10
+            while path.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)  # until the drain's claim renames it, before it asks for the lock
+            self.assertFalse(path.exists(), "the drain claimed the line")
+            self.lock_holder(os.getppid())
+            return done
+        with mock.patch.object(delivery_destination, "DRAIN_LOCK_WAIT_S", 20.0), \
+                mock.patch.object(hatch_cli, "_publish_once", publish_then_drain_claims):
+            r = self.hold(str(self.result_file), env={"AGENT_MXID": AGENT})
+        self.assertEqual(len(drain), 1, r.stdout + r.stderr)
+        drain[0].join(30)
+        self.assertFalse(drain[0].is_alive(), "the drain finished its send")
+        return r, seen["a"]
+
+    def test_a_refused_hold_line_the_drain_claimed_before_the_lock_is_never_sent(self):
+        posts = []
+        r, a = self.hold_refused_while_the_drain_waits(posts)
+        self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED, r.stdout + r.stderr)
+        self.assertIn("drain changed", r.stderr)
+        self.assertIsNone(task_hold.read(self.results, self.TID), "no marker without the fence")
+        self.assertEqual(posts, [], f"line A of a refused hold was sent; outbox={self.statuses(a)}")
+        self.assertEqual([s for s, _ in self.statuses(a)], ["PARKED"])
+        self.assertTrue(self.statuses(a)[0][1].startswith(hatch_cli.WITHDRAWN + ":"), self.statuses(a))
+        self.assertFalse(a.exists() or list(self.results.glob(f"{a.stem}.sending.*")),
+                         "the drain retired A's file")
+        # A put back under its live name, as an orphan recovery would, still never sends.
+        a.write_text(self.line())
+        self.lock_holder(os.getpid())
+        self.drain_pass(posts)
+        self.assertEqual(posts, [])
+
+    def test_the_next_hold_queues_a_new_generation_the_drain_sends_once(self):
+        posts = []
+        r, a = self.hold_refused_while_the_drain_waits(posts)
+        self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED, r.stderr)
+        self.lock_holder(os.getpid())
+        r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_POSTED, r.stdout + r.stderr)
+        b = hatch_cli._hold_notice(self.results, self.TID)
+        self.assertNotEqual(b.name, a.name)
+        self.assertEqual(b.read_text(), self.line(), "B is queued whole, nothing deleted or hid it")
+        a.write_text(self.line())  # A back under its live name beside B
+        self.drain_pass(posts)
+        self.drain_pass(posts)
+        self.assertEqual(posts, [self.line().split("\n")[1]], "B is sent exactly once, A never")
+        self.assertEqual([s for s, _ in self.statuses(b)], ["DELIVERED"])
+        self.assertTrue(all(s == "PARKED" for s, _ in self.statuses(a)), self.statuses(a))
+        self.assertIn("already posted before this answer", self.reply_now().stderr)
+
+    def test_a_hold_whose_arming_or_advance_fails_stays_retryable(self):
+        self.add_task(self.TID, "$ev1")
+        for broken in ("arm_notice", "advance_notice"):
+            with self.subTest(broken):
+                with mock.patch.object(task_hold, broken, side_effect=OSError(28, "No space left")):
+                    r = self.hold(str(self.result_file))
+                self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED, r.stdout + r.stderr)
+                self.assertIn("hold was not recorded", r.stderr)
+                self.assertIsNone(task_hold.read(self.results, self.TID))
+                self.assertFalse(task_hold.notice_record(self.results, self.TID)["armed"])
+                posts = []
+                self.drain_pass(posts)
+                self.assertEqual(posts, [], "a line no hold armed is never sent")
+        r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_POSTED, r.stdout + r.stderr)
+        posts = []
+        self.drain_pass(posts)
+        self.drain_pass(posts)
+        self.assertEqual(len(posts), 1, "the retry is not stuck, and its one line posts once")
+
+    def test_hold_refuses_a_fresh_lane_record_another_process_wrote_under_its_pid(self):
+        # Reviewer's probe: this pid and protocol 3, fresh, but a predecessor's start time.
+        self.add_task(self.TID, "$ev1")
+        self.env()
+        self.lane_record = False
+        record = self.home / "state" / "auth" / "lane-identity.json"
+        record.write_text(json.dumps({**json.loads(record.read_text()),
+                                      "start": "2001-01-01T00:00:00Z", "ts": time.time()}))
+        self.assertIsNone(hatch_cli._lane_snapshot({"STATE_DIR": str(self.home / "state")}, ""))
+        r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED, r.stdout + r.stderr)
+        self.assertIn("no live Sparrow drain has published its lane identity", r.stderr)
+        self.assertFalse(task_hold.notice_marked(self.results, self.TID))
+
+    def test_a_hold_whose_writes_are_short_still_posts_its_one_line(self):
+        self.add_task(self.TID, "$ev1")
+        real = os.write
+        short = mock.patch.object(os, "write", lambda fd, data: real(fd, bytes(data[:1])))
+        with short:
+            r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_POSTED, r.stdout + r.stderr)
+        posts = []
+        self.drain_pass(posts)
+        self.assertEqual(len(posts), 1, self.statuses(hatch_cli._hold_notice(self.results, self.TID)))
+        self.assertTrue(task_hold.notice_record(self.results, self.TID)["armed"])
+        with short:
+            agent_identity.publish_lane(self.home / "state", "", AGENT, delivery_destination.SEND_LOCK_PROTOCOL)
+        self.assertEqual(agent_identity.lane_state(self.home / "state", "")[0], agent_identity.LANE_FRESH,
+                         "the lane record is whole too")
+
+    def test_a_refused_hold_leaves_a_line_an_earlier_hold_queued(self):
+        self.add_task(self.TID, "$ev1")
+        self.armed_mark()
+        self.notice.write_text(self.line())
+        swapped = iter([True, True])
+        with mock.patch.object(hatch_cli, "_lane_snapshot", side_effect=lambda *a: (
+                (os.getpid(), "ag2.space", True) if next(swapped, False) else None)):
+            r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED, r.stdout + r.stderr)
+        self.assertIn("drain changed while hold ran; its line is never sent", r.stderr)
+        self.assertEqual(self.notice.read_text(), self.line(), "not this run's line to take back")
+
+    def test_the_drain_withdraws_a_hold_line_its_record_does_not_arm(self):
+        self.add_task(self.TID, "$ev1")
+        line = self.line()
+        for setup, sent in (("no record", False), ("unarmed", False), ("armed, no marker", False),
+                            ("unreadable record", False), ("legacy record", False),
+                            ("legacy record with marker", True), ("armed with marker", True)):
+            with self.subTest(setup):
+                shutil.rmtree(self.results / task_hold.HOLD_DIR, ignore_errors=True)
+                for f in self.results.glob("proactive-*"):
+                    f.unlink()
+                shutil.rmtree(self.results / delivery_destination.RECEIPT_DIR, ignore_errors=True)
+                if setup != "no record":
+                    token = task_hold.mark_notice(self.results, self.TID)
+                path = self.results / task_hold.HOLD_DIR / f"{self.TID}.notice"
+                if setup == "unreadable record":
+                    path.write_text("{")
+                if setup.startswith("legacy record"):
+                    path.write_text(json.dumps({"token": "t"}))  # a notice from before generations
+                if setup.startswith("armed"):
+                    task_hold.arm_notice(self.results, self.TID, token)
+                if setup.endswith("with marker"):
+                    task_hold.place(self.results, self.TID)
+                self.notice.write_text(line)
+                posts = []
+                self.drain_pass(posts)
+                self.assertEqual(bool(posts), sent, self.statuses(self.notice))
+                task_hold.release(self.results, self.TID)
+
+    def test_a_deadline_bound_error_keeps_its_body_through_the_scrub(self):
+        import http.server
+        from ag2_sparrow import remote_gateway_bridge as gb
+
+        class Upgraded(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"reason": "room_upgraded", "replacement_room": "!new:ag2.space"}')
+        url = self.gateway(Upgraded)
+        with mock.patch.multiple(gb, URL=url, TOKEN="t"):
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                gb._req("POST", "/v1/room", {"op": "message"}, timeout=15, deadline=time.monotonic() + 5)
+        self.assertEqual(gb._room_upgraded_to(gb._http_error_body(caught.exception)), "!new:ag2.space")
+
+    def test_an_answered_item_is_not_held(self):
+        self.add_task(self.TID, "$ev1")
+        self.result_file.write_text("done\n")
+        r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_NOT_POSTED)
+        self.assertIsNone(task_hold.read(self.results, self.TID))
+        self.assertFalse(self.notice.exists())
+
+    def test_an_item_the_outbox_already_settled_is_not_held(self):
+        self.add_task(self.TID, "$ev1")
+        outbox.record_delivered(self.results / ".outbox", self.TID)
+        r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_NOT_POSTED)
+        self.assertFalse(self.notice.exists())
+        self.assertIsNone(task_hold.read(self.results, self.TID))
+
+    def test_a_result_file_outside_the_payload_is_refused(self):
+        self.add_task(self.TID, "$ev1")
+        r = self.hold(str(self.home / "elsewhere" / f"{self.TID}.txt"))
+        self.assertEqual(r.returncode, 2)
+        self.assertIsNone(task_hold.read(self.results, self.TID))
+
+    def test_a_room_the_drain_would_not_deliver_to_is_refused(self):
+        for room in ("!missing-server", "#alias:ag2.space", "C0123", "!foreign:other.space"):
+            with self.subTest(room=room):
+                self.room_task(room)
+                r = self.hold(str(self.result_file))
+                self.assertEqual(r.returncode, 2, r.stdout)
+                self.assertIsNone(task_hold.read(self.results, self.TID))
+                self.assertFalse(self.notice.exists())
+
+    def test_the_homeserver_check_is_the_drains_own(self):
+        self.room_task("!foreign:other.space")
+        self.mxid = "@watch-agent:other.space"
+        self.assertEqual(self.hold(str(self.result_file)).returncode, hatch_cli.REPLY_POSTED)
+
+    def test_an_unknown_identity_records_no_hold(self):
+        self.room_task("!foreign:other.space")
+        self.mxid = ""
+        r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED, r.stdout)
+        self.assertIn("can't confirm the room is deliverable", r.stderr)
+        self.assertFalse(self.notice.exists())
+        self.assertIsNone(task_hold.read(self.results, self.TID))
+
+    def test_the_published_lane_wins_over_snapshot_and_environment(self):
+        self.add_task(self.TID, "$ev1")
+        self.mxid = "@watch-agent:other.space"  # what the drain published
+        with mock.patch.object(keepalive, "sparrow_env", side_effect=AssertionError("read")):
+            r = self.hold(str(self.result_file), cfg={"AGENT_MXID": AGENT},
+                          env={"AGENT_MXID": AGENT, "AGENT_ID": AGENT})
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertFalse(self.notice.exists())
+
+    def test_hold_never_reads_another_process_environment(self):
+        self.add_task(self.TID, "$ev1")
+        with mock.patch.object(hatch_cli, "live_lock_holder", return_value=4242), \
+                mock.patch.object(keepalive, "sparrow_env", side_effect=AssertionError("read")):
+            r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_POSTED, r.stderr)
+
+    def test_a_notice_loser_never_installs_a_hold_on_an_unqueued_line(self):
+        self.add_task(self.TID, "$ev1")
+        with mock.patch.object(task_hold, "mark_notice", return_value=None):
+            r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED)
+        self.assertIn("not proven queued", r.stderr)
+        self.assertIsNone(task_hold.read(self.results, self.TID))
+
+    def test_a_hold_that_finds_an_unarmed_record_queues_the_next_generation(self):
+        self.add_task(self.TID, "$ev1")
+        owner = task_hold.mark_notice(self.results, self.TID)  # caller A, mid-queue
+        r = self.hold(str(self.result_file))  # caller B finds A's unarmed record, no line yet
+        self.assertEqual(r.returncode, hatch_cli.REPLY_POSTED, r.stderr)
+        self.assertTrue(hatch_cli._hold_notice(self.results, self.TID).exists())
+        with self.assertRaises(ValueError):
+            task_hold.arm_notice(self.results, self.TID, owner)  # A's generation is retired
+
+    def test_a_publish_that_wrote_nothing_installs_no_hold(self):
+        self.add_task(self.TID, "$ev1")
+        with mock.patch.object(hatch_cli, "_publish_once", return_value=False):
+            r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED)
+        self.assertIsNone(task_hold.read(self.results, self.TID))
+
+    def test_a_line_delivered_without_a_receipt_is_never_queued_again(self):
+        self.add_task(self.TID, "$ev1")
+        with mock.patch.object(task_hold, "place", side_effect=OSError("disk")):
+            self.assertEqual(self.hold(str(self.result_file)).returncode, hatch_cli.REPLY_UNCONFIRMED)
+        self.delivered_without_receipt()
+        r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED)
+        self.assertIn("nothing proves it was delivered", r.stderr)
+        self.assertFalse(self.notice.exists(), "never queued twice")
+        self.assertIsNone(task_hold.read(self.results, self.TID))
+
+    def test_an_unreadable_outbox_item_fails_closed(self):
+        self.add_task(self.TID, "$ev1")
+        root = self.results / delivery_destination.RECEIPT_DIR
+        outbox.record_delivered(root, self.notice.stem + "~0")
+        for item in root.rglob("*.json"):
+            item.write_text("{")
+        r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED)
+        self.assertFalse(self.notice.exists())
+        self.assertEqual(hatch_cli._line_state(self.results, self.TID, self.line()), "unknown")
+        self.assertEqual(hatch_cli.hold_line_outcome(self.results, self.TID), "unconfirmed")
+    def test_a_line_that_failed_to_queue_is_queued_by_the_retry(self):
+        self.add_task(self.TID, "$ev1")
+        with mock.patch.object(hatch_cli, "_publish_once", side_effect=OSError("disk")):
+            self.assertEqual(self.hold(str(self.result_file)).returncode, hatch_cli.REPLY_UNCONFIRMED)
+        self.assertFalse(self.notice.exists())
+        self.assertEqual(self.hold(str(self.result_file)).returncode, hatch_cli.REPLY_POSTED)
+        self.assertTrue(hatch_cli._hold_notice(self.results, self.TID).exists(),
+                        "the retry queues the next generation")
+        posts = []
+        self.drain_pass(posts)
+        self.assertEqual(len(posts), 1)
+
+    def test_a_line_the_drain_already_delivered_is_never_queued_again(self):
+        self.add_task(self.TID, "$ev1")
+        outbox.record_delivered(self.results / delivery_destination.RECEIPT_DIR, self.notice.stem + "~0",
+                                provider="ag2space-proactive", destination="!room:ag2.space")
+        r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_POSTED, r.stderr)
+        self.assertFalse(self.notice.exists())
+        self.assertIsNotNone(task_hold.read(self.results, self.TID))
+
+    def test_a_line_being_sent_is_not_queued_again(self):
+        self.add_task(self.TID, "$ev1")
+        task_hold.mark_notice(self.results, self.TID)
+        claimed = self.results / f"{self.notice.stem}.sending.4242"
+        claimed.write_text(self.line())
+        self.assertEqual(self.hold(str(self.result_file)).returncode, hatch_cli.REPLY_POSTED)
+        self.assertFalse(self.notice.exists())
+
+    def test_a_pre_existing_empty_line_file_is_not_queued(self):
+        self.add_task(self.TID, "$ev1")
+        self.notice.write_text("")  # an empty hold-line file the drain never sends
+        r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED, r.stdout)
+        self.assertIsNone(task_hold.read(self.results, self.TID))
+        self.assertEqual(hatch_cli._line_state(self.results, self.TID, self.line()), "unknown")
+
+    def test_an_empty_or_foreign_queued_file_is_no_proof(self):
+        for content in ("", "   \n", "something else\n"):
+            with self.subTest(content=content):
+                self.add_task(self.TID, "$ev1")
+                self.armed_mark()
+                self.notice.write_text(content)
+                r = self.hold(str(self.result_file))
+                self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED, r.stdout)
+                self.assertIsNone(task_hold.read(self.results, self.TID))
+                shutil.rmtree(self.results / task_hold.HOLD_DIR)
+                self.notice.unlink()
+
+    def test_a_temp_cleanup_error_after_the_link_still_holds(self):
+        self.add_task(self.TID, "$ev1")
+        real = os.unlink
+
+        def temp_unlink_fails(path, *a, **k):
+            if str(path).startswith(".") and str(path).endswith(".tmp"):
+                raise PermissionError("cleanup")
+            return real(path, *a, **k)
+        with mock.patch.object(task_hold.os, "unlink", side_effect=temp_unlink_fails):
+            r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_POSTED, r.stderr)
+        self.assertIsNotNone(task_hold.read(self.results, self.TID))
+
+    def test_no_published_lane_records_no_hold_even_with_enrollment(self):
+        # Enrollment names the room's server and AGENT_MXID agrees: neither is consulted.
+        for lane in (None, "{", '{"agent_id": 7}', '{"agent_id": ""}'):
+            with self.subTest(lane=lane):
+                self.add_task(self.TID, "$ev1")
+                env = self.env()
+                record = self.home / "state" / "auth" / "lane-identity.json"
+                if lane is None:
+                    record.unlink()
+                else:
+                    record.write_text(lane)
+                with mock.patch.object(hatch_cli, "_installed_config", return_value={}):
+                    r = run_main(hatch_cli.main, ["hold", str(self.result_file)],
+                                 {**env, "AGENT_MXID": AGENT})
+                self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED, r.stdout)
+                self.assertIn("can't confirm the room is deliverable yet", r.stderr)
+                self.assertFalse(self.notice.exists())
+                self.assertIsNone(task_hold.read(self.results, self.TID))
+
+    def test_a_drain_claim_between_listing_and_reading_still_confirms(self):
+        self.add_task(self.TID, "$ev1")
+        real = hatch_cli.result_ready.read_ready_result
+        claimed = []
+
+        def drain_claims_first(path):
+            if Path(path) == self.notice and not claimed:  # listed, then renamed by the drain
+                claimed.append(self.notice.with_suffix(".sending.4242"))
+                os.rename(self.notice, claimed[0])
+            return real(path)
+        with mock.patch.object(hatch_cli.result_ready, "read_ready_result",
+                               side_effect=drain_claims_first):
+            r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_POSTED, r.stderr)
+        self.assertTrue(claimed and claimed[0].exists(), "the line moved to the drain's claim")
+        self.assertIsNotNone(task_hold.read(self.results, self.TID))
+
+    def test_a_claim_handed_back_mid_read_is_found_on_the_rescan(self):
+        self.add_task(self.TID, "$ev1")
+        task_hold.mark_notice(self.results, self.TID)
+        claim = self.notice.with_suffix(".sending.4242")
+        claim.write_text(self.line())
+        real = hatch_cli.result_ready.read_ready_result
+
+        def drain_hands_back(path):
+            if Path(path) == claim and claim.exists():  # the drain hands an unready claim back
+                os.rename(claim, self.notice)
+            return real(path)
+        with mock.patch.object(hatch_cli.result_ready, "read_ready_result",
+                               side_effect=drain_hands_back):
+            self.assertEqual(hatch_cli._line_state(self.results, self.TID, self.line()), "queued")
+
+    def test_only_a_claim_the_drain_makes_counts_as_queued(self):
+        self.add_task(self.TID, "$ev1")
+        self.armed_mark()
+        stray = self.results / f"{self.notice.stem}.sending.x"
+        stray.write_text(self.line())
+        self.assertEqual(hatch_cli._line_state(self.results, self.TID, self.line()), "unknown")
+        r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED, r.stdout)
+        self.assertIsNone(task_hold.read(self.results, self.TID))
+        self.assertEqual(delivery_destination.claim_pid(stray.name), None)
+        self.assertEqual(delivery_destination.claim_pid(
+            claim_of(self.notice, 4242).name), 4242)
+
+    def test_a_leading_zero_claim_is_neither_queued_nor_live(self):
+        self.add_task(self.TID, "$ev1")
+        self.armed_mark()
+        stray = self.results / f"{self.notice.stem}.sending.0{os.getpid()}"
+        stray.write_text(self.line())
+        self.assertEqual(hatch_cli._line_state(self.results, self.TID, self.line()), "unknown")
+        r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED, r.stdout)
+        self.assertIsNone(task_hold.read(self.results, self.TID))
+        for suffix in ("0", f"0{os.getpid()}", f"+{os.getpid()}", f" {os.getpid()}", f"{os.getpid()} ", ""):
+            with self.subTest(suffix=suffix):
+                self.assertIsNone(delivery_destination.claim_pid(f"{self.notice.stem}.sending.{suffix}"))
+
+    def test_a_drain_identity_that_differs_from_enrollment_decides_the_room(self):
+        from ag2_sparrow import remote_gateway_bridge as gb
+        self.add_task(self.TID, "$ev1")  # room !room:ag2.space; enrolled as @watch-agent:ag2.space
+        self.lane_record = False  # the drain below publishes it
+        state = self.home / "state"
+        with mock.patch.object(gb, "_STATE", state), \
+                mock.patch.dict(os.environ, {"AGENT_MXID": "@watch-agent:other.space"}):
+            drain_accepts = gb._room_is_deliverable_here("!room:ag2.space")
+        self.assertFalse(drain_accepts, "the live drain refuses the room")
+        r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertFalse(self.notice.exists())
+        self.assertIsNone(task_hold.read(self.results, self.TID))
+
+    def test_a_drain_identity_matching_the_room_still_holds(self):
+        from ag2_sparrow import remote_gateway_bridge as gb
+        self.add_task(self.TID, "$ev1")
+        self.mxid = "@watch-agent:other.space"  # a stale enrollment the live lane overrides
+        self.lane_record = False  # the drain below publishes it
+        with mock.patch.object(gb, "_STATE", self.home / "state"), \
+                mock.patch.dict(os.environ, {"AGENT_MXID": AGENT}):
+            self.assertTrue(gb._room_is_deliverable_here("!room:ag2.space"))
+        r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_POSTED, r.stdout + r.stderr)
+
+    def test_an_adjacent_infix_claim_is_not_this_notices_claim(self):
+        self.add_task(self.TID, "$ev1")
+        self.armed_mark()
+        for infix in ("x", "5"):  # `<stem>.sending.5.sending.<pid>` parses a canonical pid too
+            with self.subTest(infix=infix):
+                fake = self.results / f"{self.notice.stem}.sending.{infix}.sending.{os.getpid()}"
+                fake.write_text(self.line())
+                self.assertEqual(hatch_cli._line_state(self.results, self.TID, self.line()), "unknown")
+                r = self.hold(str(self.result_file))
+                self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED, r.stdout)
+                self.assertIsNone(task_hold.read(self.results, self.TID))
+                base = delivery_destination.claim_base(fake.name)
+                self.assertEqual(base, f"{self.notice.stem}.sending.{infix}")
+                fake.unlink()
+        self.assertEqual(delivery_destination.claim_base(
+            claim_of(self.notice, 4242).name), self.notice.stem)
+
+    def test_a_pid_past_the_native_range_is_no_claim(self):
+        self.add_task(self.TID, "$ev1")
+        self.armed_mark()
+        for pid in (os.getpid() + 2**32, 2**31):
+            with self.subTest(pid=pid):
+                alias = self.results / f"{self.notice.stem}.sending.{pid}"
+                alias.write_text(self.line())
+                self.assertIsNone(delivery_destination.claim_pid(alias.name))
+                self.assertEqual(hatch_cli._line_state(self.results, self.TID, self.line()), "unknown")
+                r = self.hold(str(self.result_file))
+                self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED, r.stdout)
+                self.assertIsNone(task_hold.read(self.results, self.TID))
+                alias.unlink()
+        self.assertEqual(delivery_destination.claim_pid(f"x.sending.{2**31 - 1}"), 2**31 - 1)
+
+    def test_an_out_of_domain_lane_pid_fails_closed_without_crashing(self):
+        self.lane_record = False
+        for pid in (os.getpid() + 2**32, 2**31):
+            with self.subTest(pid=pid):
+                self.add_task(self.TID, "$ev1")
+                auth = self.home / "state" / "auth"
+                auth.mkdir(parents=True, exist_ok=True)
+                (auth / "lane-identity.json").write_text(
+                    json.dumps({"agent_id": AGENT, "instance": "", "pid": pid, "ts": time.time()}))
+                r = self.hold(str(self.result_file))
+                self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED, r.stdout + r.stderr)
+                self.assertFalse(self.notice.exists())
+                self.assertIsNone(task_hold.read(self.results, self.TID))
+
+    def test_an_unrepresentable_lane_ts_fails_closed_without_crashing(self):
+        from ag2_sparrow import agent_identity
+        self.lane_record = False
+        for ts in (10**400, -10**400):
+            with self.subTest(sign=ts > 0):
+                self.add_task(self.TID, "$ev1")
+                auth = self.home / "state" / "auth"
+                auth.mkdir(parents=True, exist_ok=True)
+                (auth / "lane-identity.json").write_text(
+                    json.dumps({"agent_id": AGENT, "instance": "", "pid": os.getpid(), "start": OWN_START, "ts": ts}))
+                self.assertIsNone(agent_identity.published_lane_record(self.home / "state", ""))
+                r = self.hold(str(self.result_file))
+                self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED, r.stdout + r.stderr)
+                self.assertFalse(self.notice.exists())
+                self.assertIsNone(task_hold.read(self.results, self.TID))
+
+    def test_a_dead_drains_stale_lane_records_no_hold(self):
+        self.add_task(self.TID, "$ev1")  # the live drain is on other.space and refuses this room
+        self.lane_record = False
+        dead = subprocess.Popen([sys.executable, "-c", "pass"])
+        dead.wait()
+        auth = self.home / "state" / "auth"
+        auth.mkdir(parents=True, exist_ok=True)
+        (auth / "lane-identity.json").write_text(json.dumps({"agent_id": AGENT, "instance": "", "pid": dead.pid, "ts": time.time()}))
+        r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED, r.stdout + r.stderr)
+        self.assertFalse(self.notice.exists())
+        self.assertIsNone(task_hold.read(self.results, self.TID))
+
+    def test_a_failed_lane_publish_records_no_hold_on_stale_enrollment(self):
+        from ag2_sparrow import agent_identity, remote_gateway_bridge as gb
+        self.add_task(self.TID, "$ev1")  # enrolled as @watch-agent:ag2.space, the room's server
+        self.lane_record = False
+        writer = getattr(agent_identity, "publish_lane", None)
+        with mock.patch.object(gb, "_STATE", self.home / "state"), mock.patch.object(gb, "_log"), \
+                mock.patch.object(agent_identity, "publish_lane", side_effect=OSError("disk"), create=True), \
+                mock.patch.dict(os.environ, {"AGENT_MXID": "@watch-agent:other.space"}):
+            self.assertFalse(gb._room_is_deliverable_here("!room:ag2.space"))
+        self.assertIsNotNone(writer)
+        r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED, r.stdout + r.stderr)
+        self.assertFalse(self.notice.exists())
+        self.assertIsNone(task_hold.read(self.results, self.TID))
+
+    def test_a_failed_marker_reports_not_confirmed_and_a_retry_does_not_requeue(self):
+        self.add_task(self.TID, "$ev1")
+        with mock.patch.object(task_hold, "place", side_effect=OSError("disk")):
+            r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED)
+        self.assertIn("still reads task-not-picked-up", r.stderr)
+        self.assertIsNone(task_hold.read(self.results, self.TID))
+        queued = self.notice.read_text()
+        with mock.patch.object(hatch_cli, "_publish_once") as publish:
+            r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_POSTED, r.stderr)
+        publish.assert_not_called()
+        self.assertEqual(self.notice.read_text(), queued)
+        self.assertIsNotNone(task_hold.read(self.results, self.TID))
+
+    def test_a_hold_whose_check_fails_once_is_deferred_and_posted_once(self):
+        # Reviewer's B1: a transient read error at the drain's send must not withdraw the line.
+        self.add_task(self.TID, "$ev1")
+        self.assertEqual(self.hold(str(self.result_file)).returncode, hatch_cli.REPLY_POSTED)
+        real, failed = task_hold.notice_record, []
+
+        def flaky(*a, **k):
+            if not failed:
+                failed.append(True)
+                raise OSError(errno.EMFILE, "Too many open files")
+            return real(*a, **k)
+        posts = []
+        with mock.patch.object(task_hold, "notice_record", side_effect=flaky):
+            self.drain_pass(posts)
+        self.assertTrue(failed, "the read failed once")
+        self.assertEqual(posts, [])
+        self.assertNotEqual(hatch_cli.hold_line_outcome(self.results, self.TID), "withdrawn")
+        self.drain_pass(posts)
+        self.drain_pass(posts)
+        self.assertEqual(posts, [f"@bob:ag2.space {hatch_cli.HOLD_NOTICE}"], "posted once, on the next pass")
+        self.assertEqual(hatch_cli.hold_line_outcome(self.results, self.TID), "delivered")
+
+    def test_a_hold_check_that_fails_inside_the_dispatch_veto_defers_the_line(self):
+        # Reviewer's probe: EMFILE on the veto's own read, after any earlier check passed, under the send lock.
+        self.add_task(self.TID, "$ev1")
+        self.assertEqual(self.hold(str(self.result_file)).returncode, hatch_cli.REPLY_POSTED)
+        real, failed = task_hold.notice_record, []
+
+        def flaky(*a, **k):
+            callers, frame = set(), sys._getframe(1)
+            while frame is not None and len(callers) < 8:
+                callers.add(frame.f_code.co_name)
+                frame = frame.f_back
+            if not failed and "line_veto" in callers:
+                failed.append(True)
+                raise OSError(errno.EMFILE, "Too many open files")
+            return real(*a, **k)
+        posts = []
+        with mock.patch.object(task_hold, "notice_record", side_effect=flaky):
+            self.drain_pass(posts)
+        self.assertTrue(failed, "the veto's read failed")
+        self.assertEqual(posts, [], "nothing sent on that pass")
+        self.assertTrue(self.notice.exists(), "and nothing withdrawn: the line is back in the queue")
+        self.assertEqual(hatch_cli.hold_line_outcome(self.results, self.TID), "undelivered")
+        self.drain_pass(posts)
+        self.drain_pass(posts)
+        self.assertEqual(posts, [f"@bob:ag2.space {hatch_cli.HOLD_NOTICE}"], "exactly one line, on the next pass")
+        self.assertEqual(hatch_cli.hold_line_outcome(self.results, self.TID), "delivered")
+
+    def test_a_marker_read_that_fails_inside_the_dispatch_veto_defers_the_line(self):
+        # Reviewer's probe: the same EMFILE, moved onto the marker read (its file, or its dir).
+        for where in ("the marker file", "the hold dir"):
+            with self.subTest(where):
+                shutil.rmtree(self.results)  # each case starts from a fresh results dir
+                self.results.mkdir()
+                self.add_task(self.TID, "$ev1")
+                self.assertEqual(self.hold(str(self.result_file)).returncode, hatch_cli.REPLY_POSTED)
+                failed, real_json, real_dir = [], task_hold._json_at, task_hold._open_dir
+
+                def in_marker_read():
+                    callers, frame = set(), sys._getframe(2)
+                    while frame is not None and len(callers) < 10:
+                        callers.add(frame.f_code.co_name)
+                        frame = frame.f_back
+                    return "line_veto" in callers and not callers & {"notice_record", "_rewrite_notice"}
+
+                def json_at(dfd, name, where=where):
+                    if where == "the marker file" and not failed and name.endswith(".json") and in_marker_read():
+                        failed.append(name)
+                        return None, "unreadable (EMFILE)"
+                    return real_json(dfd, name)
+
+                def open_dir(result_dir, create, where=where):
+                    if where == "the hold dir" and not failed and not create and in_marker_read():
+                        failed.append("dir")
+                        raise OSError(errno.EMFILE, "Too many open files")
+                    return real_dir(result_dir, create)
+                posts = []
+                with mock.patch.object(task_hold, "_json_at", side_effect=json_at), \
+                        mock.patch.object(task_hold, "_open_dir", side_effect=open_dir):
+                    self.drain_pass(posts)
+                self.assertTrue(failed, "the marker read failed inside the veto")
+                self.assertEqual(posts, [], "nothing sent on that pass")
+                self.assertTrue(self.notice.exists(), "and nothing withdrawn")
+                self.drain_pass(posts)
+                self.drain_pass(posts)
+                self.assertEqual(posts, [f"@bob:ag2.space {hatch_cli.HOLD_NOTICE}"], "exactly one line, next pass")
+
+    def test_a_failed_marker_then_a_drain_pass_still_lets_hold_run_again(self):
+        # Reviewer's B2: the drain withdraws the armed line no hold stands on; the retry must recover.
+        self.add_task(self.TID, "$ev1")
+        with mock.patch.object(task_hold, "place", side_effect=OSError("disk")):
+            r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED)
+        self.assertIn("Run hold again", r.stderr)
+        posts = []
+        self.drain_pass(posts)
+        self.assertEqual(posts, [], "no hold stands on that line")
+        self.assertEqual(hatch_cli.hold_line_outcome(self.results, self.TID), "withdrawn")
+        r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_POSTED, r.stderr)
+        self.assertIsNotNone(task_hold.read(self.results, self.TID))
+        self.drain_pass(posts)
+        self.drain_pass(posts)
+        self.assertEqual(posts, [f"@bob:ag2.space {hatch_cli.HOLD_NOTICE}"], "exactly one line reaches the room")
+
+    def test_an_unreadable_marker_in_the_way_is_not_confirmed(self):
+        self.add_task(self.TID, "$ev1")
+        (self.results / task_hold.HOLD_DIR).mkdir()
+        (self.results / task_hold.HOLD_DIR / f"{self.TID}.json").write_text("{")
+        r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED)
+        self.assertIn("unreadable hold marker", r.stderr)
+
+    def test_a_concurrent_hold_that_placed_first_is_already_held(self):
+        self.add_task(self.TID, "$ev1")
+        real = task_hold.place
+
+        def racer(*a, **k):
+            real(*a, **k)
+            return real(*a, **k)
+        with mock.patch.object(task_hold, "place", side_effect=racer):
+            r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_POSTED, r.stderr)
+        self.assertIn("already held", r.stdout)
+
+    def test_a_symlinked_hold_dir_is_refused(self):
+        self.add_task(self.TID, "$ev1")
+        outside = self.home / "outside"
+        outside.mkdir()
+        (self.results / task_hold.HOLD_DIR).symlink_to(outside)
+        r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, 2)
+        self.assertEqual(list(outside.iterdir()), [])
+
+    def test_the_answer_withdraws_the_line_and_ends_the_hold(self):
+        self.add_task(self.TID, "$ev1")
+        self.assertEqual(self.hold(str(self.result_file)).returncode, hatch_cli.REPLY_POSTED)
+        with mock.patch.object(outbox, "_activity_completed", return_value=None):
+            r = run_main(hatch_cli.main, ["reply", str(self.result_file), "--no-send"], self.env())
+        self.assertEqual(r.returncode, hatch_cli.REPLY_POSTED, r.stderr)
+        self.assertIsNone(task_hold.read(self.results, self.TID), "the answer ends the hold")
+        posts = []
+        self.drain_pass(posts)
+        self.assertEqual(posts, [], "a hold line never follows the answer")
+        self.assertEqual(hatch_cli.hold_line_outcome(self.results, self.TID), "withdrawn")
+    def test_an_answer_still_posts_when_the_hold_dir_is_refused(self):
+        self.add_task(self.TID, "$ev1")
+        outside = self.home / "outside"
+        outside.mkdir()
+        (self.results / task_hold.HOLD_DIR).symlink_to(outside)
+        with mock.patch.object(outbox, "_activity_completed", return_value=None):
+            r = run_main(hatch_cli.main, ["reply", str(self.result_file), "--no-send"], self.env())
+        self.assertEqual(r.returncode, hatch_cli.REPLY_POSTED, r.stderr)
+
+    def test_a_failed_hold_release_never_fails_a_posted_reply(self):
+        self.add_task(self.TID, "$ev1")
+        self.assertEqual(self.hold(str(self.result_file)).returncode, hatch_cli.REPLY_POSTED)
+        sent = []
+
+        def sparrow():  # the drain sends the reply and records the delivery
+            deadline = time.monotonic() + 10
+            while not self.result_file.exists() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            sent.append(self.result_file.read_text())
+            outbox.record_delivered(self.results / ".outbox", self.TID)
+            self.result_file.unlink()
+        t = threading.Thread(target=sparrow)
+        t.start()
+        self.addCleanup(t.join)
+        with mock.patch.object(outbox, "_activity_completed", return_value=None), \
+                mock.patch.object(task_hold, "release", side_effect=OSError("io")):
+            r = run_main(hatch_cli.main, ["reply", str(self.result_file), "--body",
+                                          "@bob:ag2.space done", "--wait", "10"], self.env())
+        self.assertEqual(r.returncode, hatch_cli.REPLY_POSTED, r.stderr)
+        self.assertIn("posted:", r.stdout)
+        self.assertEqual(sent, ["@bob:ag2.space done"])
+        self.assertIn("could not release the hold", r.stderr)
+
+    def test_a_failed_hold_release_never_fails_a_closed_reply(self):
+        self.add_task(self.TID, "$ev1")
+        self.assertEqual(self.hold(str(self.result_file)).returncode, hatch_cli.REPLY_POSTED)
+        with mock.patch.object(outbox, "_activity_completed", return_value=None), \
+                mock.patch.object(task_hold, "release", side_effect=OSError("io")):
+            r = run_main(hatch_cli.main, ["reply", str(self.result_file), "--no-send"], self.env())
+        self.assertEqual(r.returncode, hatch_cli.REPLY_POSTED, r.stderr)
+        self.assertEqual(self.result_file.read_text(), "[no-send]\n")
+
+    def test_a_failed_release_after_an_answer_mid_hold_is_not_fatal(self):
+        self.add_task(self.TID, "$ev1")
+        with mock.patch.object(hatch_cli, "task_settled", side_effect=[False, True]), \
+                mock.patch.object(task_hold, "release", side_effect=OSError("io")):
+            r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_NOT_POSTED)
+        self.assertFalse(self.notice.exists())
+
+    def test_an_answer_landing_mid_hold_is_never_followed_by_its_line(self):
+        self.add_task(self.TID, "$ev1")
+        calls = []
+
+        def settled(result_dir, tid):
+            calls.append(tid)
+            if len(calls) == 3:  # hold's last check: the answer has just landed
+                self.result_file.write_text("done")
+            return self.result_file.exists()
+        with mock.patch.object(hatch_cli, "task_settled", side_effect=settled):
+            r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_NOT_POSTED)
+        self.assertIn("answered meanwhile", r.stderr)
+        self.assertIsNone(task_hold.read(self.results, self.TID))
+        posts = []
+        self.drain_pass(posts)
+        self.assertEqual(posts, [], "the outbox withdraws the line at its send")
+        self.assertEqual(hatch_cli.hold_line_outcome(self.results, self.TID), "withdrawn")
+class TaskHold(unittest.TestCase):
+    """The generic hold record: confined to the literal hold dir, whole or not a hold."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root)
+        self.results = self.root / "results"
+        self.results.mkdir()
+        self.dir = self.results / task_hold.HOLD_DIR
+
+    def test_close_errors_after_the_link_never_undo_a_published_marker(self):
+        real_close, real_link = os.close, os.link
+        linked = []
+
+        def link(*a, **k):
+            real_link(*a, **k)
+            linked.append(True)
+
+        def close_fails_after_link(fd):
+            real_close(fd)
+            if linked:
+                raise OSError("close")
+        with mock.patch.object(task_hold.os, "link", side_effect=link), \
+                mock.patch.object(task_hold.os, "close", side_effect=close_fails_after_link):
+            token = task_hold.place(self.results, "task-1784700000001")
+        self.assertIsNotNone(token)
+        self.assertEqual(task_hold.read(self.results, "task-1784700000001")["token"], token)
+
+    def test_a_notice_record_moves_through_generations_and_judges_only_hold_lines(self):
+        from ag2_sparrow.proactive_routing import about_task_filename, about_task_ts
+        tid = "task-1784700000003"
+        self.assertIsNone(task_hold.notice_record(self.results, tid))
+        token = task_hold.mark_notice(self.results, tid)
+        self.assertEqual(task_hold.notice_record(self.results, tid),
+                         {"token": token, "gen": 0, "armed": False})
+        token2, gen = task_hold.advance_notice(self.results, tid, token)
+        self.assertEqual(gen, 1)
+        with self.assertRaises(ValueError):
+            task_hold.advance_notice(self.results, tid, token)  # a retired generation's token
+        task_hold.arm_notice(self.results, tid, token2)
+        with self.assertRaises(ValueError):
+            task_hold.advance_notice(self.results, tid, token2)  # an armed one is not replaced
+        task_hold.place(self.results, tid)
+        self.assertEqual(about_task_ts(about_task_filename(tid, 1)), 1)
+        self.assertIsNone(about_task_ts("proactive-1.txt"))
+        self.assertIsNone(task_hold.line_veto(self.results, tid, 1), "armed, held: sent")
+        self.assertIsNotNone(task_hold.line_veto(self.results, tid, 0), "a retired generation")
+        self.assertIsNone(task_hold.line_veto(self.results, tid, None), "not about a task")
+        self.assertIsNone(task_hold.line_veto(self.results, tid, 1784700000000), "a timestamped message")
+        (self.dir / f"{tid}.notice").write_text(json.dumps({"token": "t", "gen": -1}))
+        with self.assertRaises(ValueError):
+            task_hold.notice_record(self.results, tid)
+        self.assertIn("could not be checked", task_hold.line_veto(self.results, tid, 1))
+
+    def test_a_fifo_at_a_hold_marker_reads_as_no_hold_without_blocking(self):
+        tid = "task-1784700000002"
+        self.dir.mkdir()
+        os.mkfifo(self.dir / f"{tid}.json")
+        out = []
+        t = threading.Thread(target=lambda: out.append(task_hold.read(self.results, tid)),
+                             daemon=True)
+        t.start()
+        t.join(2)
+        self.assertFalse(t.is_alive(), "the hold reader blocked on a FIFO")
+        self.assertEqual(out, [None])
+
+    def test_ids_that_could_leave_the_hold_dir_are_refused(self):
+        bad = ("../escaped", "task-../../escaped", "../../task-1", "/tmp/task-1", "task-a/b",
+               "task-a\\b", "task-1\x00", "", "task-blue~../x", "task-~1", "task-..", None)
+        for tid in bad:
+            with self.subTest(tid=tid):
+                with self.assertRaises(ValueError):
+                    task_hold.place(self.results, tid)
+                with self.assertRaises(ValueError):
+                    task_hold.release(self.results, tid)
+                self.assertIsNone(task_hold.read(self.results, tid))
+        self.assertEqual(list(self.root.rglob("*.json")), [])
+
+    def test_a_symlinked_hold_dir_is_never_written_read_or_pruned_through(self):
+        outside = self.root / "outside"
+        outside.mkdir()
+        victim = outside / "task-1784700000002.json"
+        victim.write_text('{"reason": "owner-go", "since": 1, "token": "t"}')
+        self.dir.symlink_to(outside)
+        with self.assertRaises(ValueError):
+            task_hold.place(self.results, "task-1784700000001")
+        self.assertIsNone(task_hold.read(self.results, "task-1784700000002"))
+        with self.assertRaises(ValueError):
+            task_hold.prune(self.results, self.root)
+        self.assertEqual(sorted(p.name for p in outside.iterdir()), [victim.name])
+
+    def test_a_file_in_place_of_the_hold_dir_is_refused(self):
+        self.dir.write_text("")
+        with self.assertRaises(ValueError):
+            task_hold.place(self.results, "task-1784700000001")
+
+    def test_marker_symlinks_inside_or_outside_are_not_holds(self):
+        outside = self.root / "outside.json"
+        outside.write_text('{"reason": "owner-go", "since": 1, "token": "t"}')
+        self.assertIsNotNone(task_hold.place(self.results, "task-1784700000002", now=1))
+        (self.dir / "task-1784700000001.json").symlink_to(self.dir / "task-1784700000002.json")
+        (self.dir / "task-1784700000003.json").symlink_to(outside)
+        for tid in ("task-1784700000001", "task-1784700000003"):
+            self.assertIsNone(task_hold.read(self.results, tid), tid)
+            self.assertIsNone(task_hold.place(self.results, tid), "never written through")
+        self.assertTrue(task_hold.release(self.results, "task-1784700000001"))
+        self.assertIsNotNone(task_hold.read(self.results, "task-1784700000002"),
+                             "releasing an alias never removes its target")
+        self.assertTrue(outside.exists())
+
+    def test_a_named_instance_id_is_a_task_id(self):
+        token = task_hold.place(self.results, "task-blue~task-1784700000004", now=5)
+        self.assertEqual(task_hold.read(self.results, "task-blue~task-1784700000004"),
+                         {"reason": task_hold.OWNER_GO, "since": 5, "token": token})
+
+    def test_only_a_whole_well_formed_marker_is_a_hold(self):
+        tid = "task-1784700000001"
+        self.assertIsNotNone(task_hold.place(self.results, tid, now=5))
+        self.assertIsNone(task_hold.place(self.results, tid), "one marker")
+        path = self.dir / f"{tid}.json"
+        for torn in ("", "{", "[]", "\xff", '{"reason": "owner-go", "since": 1}',
+                     '{"reason": "owner-go", "since": true, "token": "t"}',
+                     '{"reason": "owner-go", "state": "held", "since": NaN, "token": "t"}',
+                     '{"reason": "owner-go", "since": -Infinity, "token": "t"}',
+                     '{"reason": "owner-go", "since": 1e300, "token": "t"}',
+                     '{"reason": "Bad Reason", "since": 1, "token": "t"}', "x" * 5000):
+            path.write_bytes(torn.encode("utf-8", "surrogateescape") if torn != "\xff"
+                             else b"\xff")
+            self.assertIsNone(task_hold.read(self.results, tid), repr(torn[:40]))
+        path.unlink()
+        path.mkdir()
+        self.assertIsNone(task_hold.read(self.results, tid), "a directory is not a marker")
+        path.rmdir()
+        if os.geteuid() != 0:
+            task_hold.place(self.results, tid)
+            path.chmod(0)
+            self.addCleanup(path.chmod, 0o600)
+            self.assertIsNone(task_hold.read(self.results, tid), "chmod 000")
+
+    def test_non_finite_or_unbounded_since_is_refused_on_write(self):
+        for since in (float("nan"), float("inf"), -1, 1e300):
+            with self.assertRaises(ValueError):
+                task_hold.place(self.results, "task-1784700000001", now=since)
+
+    def test_release_with_a_token_removes_only_that_hold(self):
+        tid = "task-1784700000001"
+        old = task_hold.place(self.results, tid)
+        task_hold.release(self.results, tid)
+        new = task_hold.place(self.results, tid)
+        self.assertFalse(task_hold.release(self.results, tid, old), "never erases a newer hold")
+        self.assertEqual(task_hold.read(self.results, tid)["token"], new)
+        self.assertTrue(task_hold.release(self.results, tid, new))
+        self.assertFalse(task_hold.release(self.results, tid))
+
+    def test_a_failed_write_leaves_no_marker_and_no_temp(self):
+        tid = "task-1784700000001"
+        with mock.patch.object(task_hold.os, "fsync", side_effect=OSError("disk")):
+            with self.assertRaises(OSError):
+                task_hold.place(self.results, tid)
+        self.assertIsNone(task_hold.read(self.results, tid))
+        self.assertEqual(list(self.dir.iterdir()), [])
+
+    def test_an_unreadable_marker_file_is_not_a_hold(self):
+        task_hold.place(self.results, "task-1784700000001")
+        with mock.patch.object(task_hold.os, "read", side_effect=OSError("io")):
+            self.assertIsNone(task_hold.read(self.results, "task-1784700000001"))
+
+    def test_a_temp_that_was_never_created_leaves_nothing(self):
+        real = os.open
+
+        def refuse_temp(path, *a, **k):
+            if str(path).startswith("."):
+                raise PermissionError("no")
+            return real(path, *a, **k)
+        with mock.patch.object(task_hold.os, "open", side_effect=refuse_temp):
+            with self.assertRaises(PermissionError):
+                task_hold.place(self.results, "task-1784700000001")
+        self.assertEqual(list(self.dir.iterdir()), [])
+
+    def successor_during(self, tid, call):
+        """Patch os.`call` so that, on its first use by release, another thread retires the
+        old hold and places its own, given a moment to finish before release goes on."""
+        real = getattr(os, call)
+        new, threads = [], []
+
+        def successor():
+            task_hold.release(self.results, tid)
+            new.append(task_hold.place(self.results, tid))
+
+        def hooked(*a, **k):
+            if not threads:
+                threads.append(threading.Thread(target=successor))
+                threads[0].start()
+                threads[0].join(0.5)
+            return real(*a, **k)
+        return mock.patch.object(task_hold.os, call, side_effect=hooked), new, threads
+
+    def test_an_old_token_never_erases_a_successor_placed_mid_release(self):
+        tid = "task-1784700000001"
+        old = task_hold.place(self.results, tid)
+        patch, new, threads = self.successor_during(tid, "read")
+        with patch:
+            task_hold.release(self.results, tid, old)
+        threads[0].join()
+        self.assertEqual((task_hold.read(self.results, tid) or {}).get("token"), new[0])
+        self.assertEqual(sorted(n for n in os.listdir(self.dir) if n != task_hold.LOCK_NAME),
+                         [f"{tid}.json"], "nothing hidden")
+
+    def test_a_successor_between_the_check_and_the_unlink_survives(self):
+        tid = "task-1784700000001"
+        old = task_hold.place(self.results, tid)
+        patch, new, threads = self.successor_during(tid, "unlink")
+        with patch:
+            task_hold.release(self.results, tid, old)
+        threads[0].join()
+        self.assertIsNotNone(new[0])
+        self.assertEqual((task_hold.read(self.results, tid) or {}).get("token"), new[0],
+                         "the old token's release removed only the old hold")
+
+    def test_a_symlinked_lock_file_is_refused(self):
+        self.dir.mkdir()
+        (self.dir / task_hold.LOCK_NAME).symlink_to(self.root / "elsewhere")
+        with self.assertRaises(OSError):
+            task_hold.place(self.results, "task-1784700000001")
+        self.assertFalse((self.root / "elsewhere").exists())
+
+    def test_a_stale_releaser_dying_mid_release_hides_nothing(self):
+        tid = "task-1784700000001"
+        token = task_hold.place(self.results, tid)
+        with mock.patch.object(task_hold.os, "unlink", side_effect=RuntimeError("crash")):
+            self.assertFalse(task_hold.release(self.results, tid, "an-old-token"),
+                             "a stale token stops before touching the name")
+            with self.assertRaises(RuntimeError):
+                task_hold.release(self.results, tid, token)
+        self.assertEqual(task_hold.read(self.results, tid)["token"], token,
+                         "still visible under its own name")
+        self.assertEqual(sorted(n for n in os.listdir(self.dir) if n != task_hold.LOCK_NAME),
+                         [f"{tid}.json"])
+
+    def test_a_tokened_release_of_an_unreadable_or_foreign_marker_removes_nothing(self):
+        tid = "task-1784700000001"
+        path = self.dir / f"{tid}.json"
+        task_hold.place(self.results, tid)
+        for body in (b"{", b"[]"):
+            path.write_bytes(body)
+            self.assertFalse(task_hold.release(self.results, tid, "t"))
+            self.assertTrue(path.exists())
+        with mock.patch.object(task_hold.os, "read", side_effect=OSError("io")):
+            self.assertFalse(task_hold.release(self.results, tid, "t"))
+        path.unlink()
+        path.symlink_to(self.root)
+        self.assertFalse(task_hold.release(self.results, tid, "t"))
+        self.assertTrue(path.is_symlink())
+
+    def test_a_failed_dir_fsync_after_the_link_still_reports_the_published_marker(self):
+        real = os.fsync
+        calls = []
+
+        def dir_fsync_fails(fd):
+            calls.append(fd)
+            if len(calls) > 1:
+                raise OSError("dir fsync")
+            return real(fd)
+        with mock.patch.object(task_hold.os, "fsync", side_effect=dir_fsync_fails):
+            token = task_hold.place(self.results, "task-1784700000001")
+        self.assertIsNotNone(token)
+        self.assertEqual(task_hold.read(self.results, "task-1784700000001")["token"], token)
+
+    def test_a_mismatched_token_leaves_the_marker(self):
+        tid = "task-1784700000001"
+        token = task_hold.place(self.results, tid)
+        self.assertFalse(task_hold.release(self.results, tid, "not-the-token"))
+        self.assertEqual(task_hold.read(self.results, tid)["token"], token)
+        self.assertEqual(sorted(os.listdir(self.dir)), [task_hold.LOCK_NAME, f"{tid}.json"])
+
+    def test_a_vanished_hold_dir_never_writes_into_the_cwd(self):
+        cwd = self.root / "cwd"
+        cwd.mkdir()
+        self.addCleanup(os.chdir, os.getcwd())
+        os.chdir(cwd)
+        with mock.patch.object(task_hold, "_open_dir", return_value=None):
+            with self.assertRaises(FileNotFoundError):
+                task_hold.place(self.results, "task-1784700000001")
+            with self.assertRaises(FileNotFoundError):
+                task_hold.mark_notice(self.results, "task-1784700000001")
+        self.assertEqual(list(cwd.iterdir()), [])
+
+    def test_a_short_write_still_writes_the_whole_marker(self):
+        real = os.write
+        with mock.patch.object(task_hold.os, "write", side_effect=lambda fd, b: real(fd, bytes(b[:8]))):
+            token = task_hold.place(self.results, "task-1784700000001", now=5)
+        self.assertEqual(task_hold.read(self.results, "task-1784700000001"),
+                         {"reason": "owner-go", "since": 5, "token": token})
+
+    def test_the_notice_record_is_once_and_confined(self):
+        tid = "task-1784700000001"
+        self.assertFalse(task_hold.notice_marked(self.results, tid))
+        owner = task_hold.mark_notice(self.results, tid)
+        self.assertIsNotNone(owner)
+        self.assertIsNone(task_hold.mark_notice(self.results, tid))
+        self.assertTrue(task_hold.notice_marked(self.results, tid))
+        task_hold.clear_notice(self.results, tid, "someone-else")
+        self.assertTrue(task_hold.notice_marked(self.results, tid), "only its owner clears it")
+        task_hold.clear_notice(self.results, tid, owner)
+        task_hold.clear_notice(self.results, tid, owner)
+        self.assertFalse(task_hold.notice_marked(self.results, tid))
+        with mock.patch.object(task_hold.os, "stat", side_effect=PermissionError("no")):
+            self.assertTrue(task_hold.notice_marked(self.results, tid), "unreadable counts as queued")
+        shutil.rmtree(self.dir)
+        self.dir.symlink_to(self.root)
+        self.assertTrue(task_hold.notice_marked(self.results, tid), "a refused dir counts as queued")
+
+    def test_a_temp_cleanup_error_after_the_link_is_success_and_closes_the_dir(self):
+        real_unlink, real_close = os.unlink, os.close
+        closed = []
+
+        def temp_unlink_fails(path, *a, **k):
+            if str(path).endswith(".tmp"):
+                raise PermissionError("cleanup")
+            return real_unlink(path, *a, **k)
+
+        def tracking_close(fd):
+            closed.append(fd)
+            return real_close(fd)
+        real_held, opened = task_hold._held_dir, []
+
+        def tracking_held(*a, **k):
+            opened.append(real_held(*a, **k))
+            return opened[-1]
+        with mock.patch.object(task_hold.os, "unlink", side_effect=temp_unlink_fails), \
+                mock.patch.object(task_hold.os, "close", side_effect=tracking_close), \
+                mock.patch.object(task_hold, "_held_dir", side_effect=tracking_held):
+            token = task_hold.place(self.results, "task-1784700000001")
+        self.assertIsNotNone(token)
+        self.assertEqual(task_hold.read(self.results, "task-1784700000001")["token"], token)
+        self.assertIn(opened[0], closed, "the dir fd is closed")
+
+    def test_a_dir_swapped_while_opened_is_refused(self):
+        self.dir.mkdir()
+        with mock.patch.object(task_hold.os, "fstat",
+                               side_effect=lambda fd: os.stat_result((0,) * 10)):
+            with self.assertRaises(ValueError):
+                task_hold.place(self.results, "task-1784700000001")
+
+    def test_bad_reasons_are_refused(self):
+        with self.assertRaises(ValueError):
+            task_hold.place(self.results, "task-1784700000001", reason="Owner Go")
+
+    def test_prune_keeps_open_tasks_and_ignores_foreign_names(self):
+        tasks = self.root / "tasks"
+        tasks.mkdir()
+        (tasks / "task-1784700000001.txt").write_text("x")
+        task_hold.place(self.results, "task-1784700000001")
+        task_hold.place(self.results, "task-1784700000002")
+        stray = self.dir / "notes.json"
+        stray.write_text("{}")
+        with mock.patch.object(task_hold.os, "unlink", side_effect=FileNotFoundError):
+            task_hold.prune(self.results, tasks)  # a racing prune already removed it
+        task_hold.prune(self.results, tasks)
+        self.assertIsNotNone(task_hold.read(self.results, "task-1784700000001"))
+        self.assertIsNone(task_hold.read(self.results, "task-1784700000002"))
+        self.assertTrue(stray.exists())
+        task_hold.prune(self.root / "absent", tasks)
+        self.assertFalse(task_hold.release(self.root / "absent", "task-1784700000001"))
+
+class DeliveryDestination(unittest.TestCase):
+    """One owner for where the drain posts: the drain and `hold` both delegate here."""
+
+    def test_drain_room_applies_route_and_homeserver(self):
+        cases = {"[channel: !r:ag2.space]\nhi": "!r:ag2.space",
+                 "[channel: !r:other.space]\nhi": None, "[channel: !nohost]\nhi": None,
+                 "[channel: C0123]\nhi": None, "[channel: !r:ag2.space]\n[no-send]": None,
+                 "plain": None}
+        for body, want in cases.items():
+            self.assertEqual(delivery_destination.drain_room(body, "ag2.space"), want, body)
+        self.assertEqual(delivery_destination.drain_room("[channel: !r:other.space]\nhi", ""),
+                         "!r:other.space", "identity unknown: posted, as the drain does")
+        self.assertEqual(delivery_destination.homeserver_of("@a:ag2.space:8448"), "ag2.space:8448")
+        self.assertEqual(delivery_destination.homeserver_of("a"), "")
+        self.assertFalse(delivery_destination.deliverable_here("!nohost", "ag2.space"))
+
+    def test_the_drain_receipt_is_where_hold_looks(self):
+        from ag2_sparrow import remote_gateway_bridge as gb
+        results = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, results)
+        stem = hatch_cli._hold_notice(Path(), "task-1784700000001").stem
+        with mock.patch.object(gb, "RESULTS_DIR", results):
+            root = gb._proactive_outbox_root()
+        outbox.record_delivered(root, gb._proactive_item_id(stem, "x"), provider="ag2space-proactive")
+        self.assertEqual(hatch_cli._line_state(results, "task-1784700000001", "x"), "delivered")
+
+    def lane_state(self):
+        state = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, state)
+        return state
+
+    def test_hold_reads_only_the_published_lane(self):
+        state = self.lane_state()
+        cfg = {"STATE_DIR": str(state)}
+        self.assertEqual(hatch_cli._lane_homeserver(cfg, ""), "")
+        (state / "auth").mkdir()
+        (state / "auth" / "ag2space.json").write_text('{"agent_id": "@e:enrolled.space"}')
+        self.assertEqual(hatch_cli._lane_homeserver(cfg, ""), "", "no enrollment fallback")
+        lane = state / "auth" / "lane-identity.json"
+        lane.write_text(json.dumps({"agent_id": "@l:lane.space", "instance": "", "pid": os.getpid(), "start": OWN_START, "ts": time.time()}))
+        self.assertEqual(hatch_cli._lane_homeserver(cfg, ""), "lane.space")
+
+    def test_one_bounded_number_reader_for_persisted_values(self):
+        from ag2_sparrow.persisted_number import bounded_number
+        for value, want in ((5, 5.0), (5.5, 5.5), (-10, -10.0), (11, None), (10**400, None),
+                            (-10**400, None), (float("inf"), None), (float("nan"), None),
+                            (True, None), ("5", None), (None, None)):
+            with self.subTest(value=str(value)[:12]):
+                self.assertEqual(bounded_number(value, -10, 10), want)
+
+    def test_every_pid_predicate_rejects_the_same_out_of_domain_values(self):
+        from ag2_sparrow import agent_identity, outbox
+        state = self.lane_state()
+        (state / "auth").mkdir()
+        for pid in (2**31, os.getpid() + 2**32, -1, True):
+            with self.subTest(pid=pid):
+                self.assertTrue(hatch_cli.process_gone(pid), "Hatch: no live owner")
+                if not isinstance(pid, bool):
+                    self.assertIsNone(delivery_destination.claim_pid(f"proactive-a.sending.{pid}"))
+                (state / "auth" / "lane-identity.json").write_text(
+                    json.dumps({"agent_id": "@a:ag2.space", "instance": "", "pid": pid, "ts": time.time()}))
+                self.assertIsNone(agent_identity.published_lane_record(state, ""))
+                self.assertIsNone(outbox.valid_pid(pid))
+        self.assertEqual(outbox.valid_pid(outbox.PID_MAX), outbox.PID_MAX)
+
+    def test_a_lane_record_past_the_freshness_bound_is_no_lane(self):
+        state = self.lane_state()
+        (state / "auth").mkdir()
+        lane, now = state / "auth" / "lane-identity.json", time.time()
+        for ts, server in ((now - 29, "ag2.space"), (now - 31, ""), (now + 60, ""),
+                           (float("inf"), ""), (float("nan"), ""), (float("-inf"), "")):
+            with self.subTest(age=now - ts):
+                lane.write_text(json.dumps({"agent_id": "@a:ag2.space", "instance": "",
+                                            "pid": os.getpid(), "start": OWN_START, "ts": ts}))
+                self.assertEqual(hatch_cli._lane_homeserver({"STATE_DIR": str(state)}, ""), server)
+
+    def test_a_drain_that_cannot_write_lets_its_lane_go_stale(self):
+        from ag2_sparrow import agent_identity, remote_gateway_bridge as gb
+        if os.geteuid() == 0:
+            self.skipTest("root ignores the permission bits this relies on")
+        state = self.lane_state()
+        agent_identity.publish_lane(state, "", "@old:ag2.space")  # this process's old lane
+        auth, record = state / "auth", state / "auth" / "lane-identity.json"
+        record.chmod(0o400)
+        auth.chmod(0o500)
+        self.addCleanup(record.chmod, 0o600)
+        self.addCleanup(auth.chmod, 0o700)
+        with mock.patch.object(gb, "_STATE", state), mock.patch.object(gb, "_log"), \
+                mock.patch.dict(os.environ, {"AGENT_MXID": "@new:other.space"}):
+            self.assertFalse(gb._room_is_deliverable_here("!room:ag2.space"))
+        self.assertEqual(json.loads(record.read_text())["agent_id"], "@old:ag2.space", "nothing could change it")
+        later = time.time() + 31
+        with mock.patch.object(agent_identity.time, "time", return_value=later):
+            self.assertEqual(hatch_cli._lane_homeserver({"STATE_DIR": str(state)}, ""), "",
+                             "the unrefreshed record has gone stale")
+
+    def test_the_drain_refreshes_its_lane_as_a_heartbeat(self):
+        from ag2_sparrow import agent_identity, remote_gateway_bridge as gb
+        state = self.lane_state()
+        with mock.patch.object(gb, "_STATE", state), mock.patch.dict(os.environ, {"AGENT_MXID": "@a:ag2.space"}):
+            gb._lane_identity()
+            first = json.loads((state / "auth" / "lane-identity.json").read_text())["ts"]
+            gb._lane_identity()
+            self.assertEqual(json.loads((state / "auth" / "lane-identity.json").read_text())["ts"], first,
+                             "no rewrite while it is fresh")
+            with mock.patch.object(agent_identity.time, "time", return_value=first + 11):
+                gb._lane_identity()
+        self.assertEqual(json.loads((state / "auth" / "lane-identity.json").read_text())["ts"], first + 11)
+
+    def test_auth_removed_after_its_mkdir_never_reaches_the_cwd(self):
+        from ag2_sparrow import agent_identity
+        for always in (False, True):
+            with self.subTest(always=always):
+                state, cwd = self.lane_state(), self.lane_state()
+                auth = state / "auth"
+                real, removed, busy = os.lstat, [], []
+
+                def lstat(path, *a, **k):
+                    if not busy and os.fspath(path) == os.fspath(auth) and (always or not removed):
+                        removed.append(True)
+                        busy.append(True)
+                        try:
+                            shutil.rmtree(auth, ignore_errors=True)
+                        finally:
+                            busy.clear()
+                    return real(path, *a, **k)
+                here = os.getcwd()
+                os.chdir(cwd)
+                try:
+                    with mock.patch("os.lstat", side_effect=lstat):
+                        if always:
+                            with self.assertRaises(OSError):
+                                agent_identity.publish_lane(state, "", "@a:ag2.space")
+                        else:
+                            agent_identity.publish_lane(state, "", "@a:ag2.space")
+                finally:
+                    os.chdir(here)
+                self.assertEqual(sorted(p.name for p in cwd.iterdir()), [], "nothing written to the CWD")
+                self.assertTrue(removed)
+                if not always:
+                    self.assertEqual(agent_identity.published_lane_record(state, "")["agent_id"], "@a:ag2.space")
+
+    def test_a_stale_dead_or_foreign_lane_record_is_no_lane(self):
+        state = self.lane_state()
+        cfg = {"STATE_DIR": str(state)}
+        (state / "auth").mkdir()
+        lane = state / "auth" / "lane-identity.json"
+        dead = subprocess.Popen([sys.executable, "-c", "pass"])
+        dead.wait()
+        for rec in ({"agent_id": "@old:ag2.space", "instance": "", "pid": dead.pid, "ts": time.time()},
+                    {"agent_id": "@old:ag2.space", "instance": "dev", "pid": os.getpid(), "start": OWN_START, "ts": time.time()},
+                    {"agent_id": "@old:ag2.space", "pid": os.getpid(), "start": OWN_START, "ts": time.time()},
+                    {"agent_id": "@old:ag2.space", "instance": "", "pid": True, "ts": time.time()}):
+            with self.subTest(rec=rec):
+                lane.write_text(json.dumps(rec))
+                self.assertEqual(hatch_cli._lane_homeserver(cfg, ""), "")
+        lane.write_text(json.dumps({"agent_id": "@l:ag2.space", "instance": "", "pid": os.getpid(), "start": OWN_START, "ts": time.time()}))
+        with mock.patch.object(hatch_cli, "_lock_record", return_value={"pid": 4242}), \
+                mock.patch.object(hatch_cli, "live_lock_holder", return_value=4242):
+            self.assertEqual(hatch_cli._lane_homeserver(cfg, ""), "", "the lock names another live drain")
+        with mock.patch.object(hatch_cli, "_lock_record", return_value={"pid": os.getpid()}), \
+                mock.patch.object(hatch_cli, "live_lock_holder", return_value=os.getpid()):
+            self.assertEqual(hatch_cli._lane_homeserver(cfg, ""), "ag2.space")
+
+    def test_two_instances_sharing_state_keep_their_own_lanes(self):
+        from ag2_sparrow import agent_identity, remote_gateway_bridge as gb
+        state = self.lane_state()
+        for inst, mxid in (("blue", "@blue:blue.space"), ("green", "@green:green.space"),
+                           ("blue", "@blue:blue.space")):
+            with mock.patch.object(gb, "_STATE", state), mock.patch.object(gb, "GATEWAY_INSTANCE", inst), \
+                    mock.patch.dict(os.environ, {"AGENT_MXID": mxid}):
+                gb._room_is_deliverable_here("!r:blue.space")
+        for inst, server in (("blue", "blue.space"), ("green", "green.space"), ("", "")):
+            with self.subTest(instance=inst):
+                self.assertEqual(hatch_cli._lane_homeserver({"STATE_DIR": str(state)}, inst), server)
+        self.assertEqual(sorted(p.name for p in (state / "auth").iterdir() if p.suffix == ".json"),
+                         ["lane-identity.blue.json", "lane-identity.green.json"])
+
+    def test_concurrent_publishes_leave_one_whole_record(self):
+        from ag2_sparrow import agent_identity
+        state = self.lane_state()
+        ids = [f"@a{i}:lane.space" for i in range(8)]
+        seen, stop = [], threading.Event()
+
+        def read():
+            while not stop.is_set():
+                path = state / "auth" / "lane-identity.json"
+                if path.exists():
+                    seen.append(agent_identity.published_lane_record(state, ""))
+
+        reader = threading.Thread(target=read)
+        reader.start()
+        writers = [threading.Thread(target=lambda m=m: [agent_identity.publish_lane(state, "", m)
+                                                         for _ in range(25)]) for m in ids]
+        for t in writers:
+            t.start()
+        for t in writers:
+            t.join()
+        stop.set()
+        reader.join()
+        self.assertNotIn(None, seen, "a reader never sees a partial record")
+        self.assertIn(agent_identity.published_lane_record(state, "")["agent_id"], ids)
+        self.assertEqual(sorted(p.name for p in (state / "auth").iterdir()),
+                         ["lane-identity.json", "lane-identity.lock"])
+
+    def test_the_drain_publishes_on_a_pass_with_no_proactive_file_and_at_start(self):
+        import inspect
+        from ag2_sparrow import agent_identity, remote_gateway_bridge as gb
+        state, results = self.lane_state(), self.lane_state()
+        with mock.patch.object(gb, "_STATE", state), mock.patch.object(gb, "RESULTS_DIR", results), \
+                mock.patch.dict(os.environ, {"AGENT_MXID": "@a:lane.space"}):
+            gb._post_proactive()
+        self.assertEqual(agent_identity.published_lane_record(state, "")["agent_id"], "@a:lane.space")
+        main = inspect.getsource(gb.main)
+        self.assertLess(main.index("_lane_identity()"), main.index("_start_outbound_worker("),
+                        "published at drain start, before the first pass")
+        self.assertIn("atexit.register(_retract_own_lane)", main, "retracted at clean exit")
+
+    def test_the_published_lane_record_never_holds_a_token(self):
+        from ag2_sparrow import agent_identity, remote_gateway_bridge as gb
+        state = self.lane_state()
+        secret = "lane-secret-token-ZZZZ9999"
+        with mock.patch.object(gb, "_STATE", state), mock.patch.object(gb, "TOKEN", secret), \
+                mock.patch.dict(os.environ, {"AGENT_MXID": "@a:lane.space", "REMOTE_TASK_TOKEN": secret}):
+            gb._room_is_deliverable_here("!r:lane.space")
+        raw = (state / "auth" / "lane-identity.json").read_text()
+        self.assertNotIn(secret, raw)
+        rec = json.loads(raw)
+        self.assertEqual(set(rec), {"agent_id", "instance", "pid", "start", "ts", "send_lock"})
+        self.assertEqual((rec["agent_id"], rec["instance"], rec["pid"]), ("@a:lane.space", "", os.getpid()))
+        self.assertEqual(hatch_cli._lane_homeserver({"STATE_DIR": str(state)}, ""), "lane.space")
+        self.assertEqual(sorted(p.name for p in (state / "auth").iterdir()),
+                         ["lane-identity.json", "lane-identity.lock"])
+
+    @staticmethod
+    def failing_first_replace():
+        real, calls = os.replace, []
+
+        def replace(*a, **k):
+            calls.append(a)
+            if len(calls) == 1:
+                raise OSError("disk")
+            return real(*a, **k)
+        return replace
+
+    @staticmethod
+    def refusing_record_unlink(name="lane-identity.json"):
+        real = os.unlink
+
+        def unlink(path, *a, **k):
+            if os.path.basename(os.fspath(path)) == name:
+                raise PermissionError("unlink")
+            return real(path, *a, **k)
+        return unlink
+
+    def test_a_failed_publish_or_a_clean_exit_retracts_the_record(self):
+        from ag2_sparrow import agent_identity, remote_gateway_bridge as gb
+        state = self.lane_state()
+        agent_identity.publish_lane(state, "", "@old:other.space")
+        with mock.patch.object(gb, "_STATE", state), mock.patch.object(gb, "_log"), \
+                mock.patch("os.replace", side_effect=self.failing_first_replace()), \
+                mock.patch.dict(os.environ, {"AGENT_MXID": "@new:ag2.space"}):
+            gb._room_is_deliverable_here("!r:ag2.space")
+        self.assertIsNone(agent_identity.published_lane_record(state, ""), "readers fail closed")
+        own = agent_identity.publish_lane(state, "", "@a:ag2.space")
+        agent_identity.retract_lane(state, "", os.getpid() + 1)
+        self.assertIsNotNone(agent_identity.published_lane_record(state, ""), "only its publisher retracts it")
+        agent_identity.retract_lane(state, "", own["pid"], own["ts"] + 1)
+        self.assertIsNotNone(agent_identity.published_lane_record(state, ""), "nor a later record of its pid")
+        agent_identity.retract_lane(state, "", own["pid"], own["ts"])
+        self.assertIsNone(agent_identity.published_lane_record(state, ""))
+
+    def test_a_failed_publish_and_a_failed_unlink_read_as_missing(self):
+        from ag2_sparrow import agent_identity, remote_gateway_bridge as gb
+        state = self.lane_state()
+        agent_identity.publish_lane(state, "", "@old:ag2.space")  # this process's old lane
+        with mock.patch.object(gb, "_STATE", state), mock.patch.object(gb, "_log"), \
+                mock.patch("os.replace", side_effect=self.failing_first_replace()), \
+                mock.patch("os.unlink", side_effect=self.refusing_record_unlink()), \
+                mock.patch.dict(os.environ, {"AGENT_MXID": "@new:other.space"}):
+            drain_accepts = gb._room_is_deliverable_here("!room:ag2.space")
+        self.assertFalse(drain_accepts)
+        self.assertEqual(hatch_cli._lane_homeserver({"STATE_DIR": str(state)}, ""), "",
+                         "the predicates agree: Hatch has no lane either")
+
+    def test_a_failed_publish_whose_tombstone_also_fails_empties_the_record(self):
+        from ag2_sparrow import agent_identity
+        state = self.lane_state()
+        agent_identity.publish_lane(state, "", "@old:ag2.space")
+        with mock.patch("os.replace", side_effect=OSError("disk")), \
+                mock.patch("os.unlink", side_effect=self.refusing_record_unlink()), \
+                self.assertRaises(OSError):
+            agent_identity.publish_lane(state, "", "@new:other.space")
+        self.assertIsNone(agent_identity.published_lane_record(state, ""))
+        self.assertEqual((state / "auth" / "lane-identity.json").read_bytes(), b"")
+
+    def interleave(self, first, successor):
+        """Run `first` until it is about to unlink or replace the record, run `successor`, then let
+        `first` finish; the record must be the successor's."""
+        from ag2_sparrow import agent_identity
+        real_unlink, real_replace = os.unlink, os.replace
+        paused, go, holder = threading.Event(), threading.Event(), {}
+
+        def pause(path):
+            if threading.current_thread() is holder.get("t") and \
+                    os.path.basename(os.fspath(path)) == "lane-identity.json":
+                paused.set()
+                go.wait(5)
+                return True
+            return False
+
+        def unlink(path, *a, **k):
+            pause(path)
+            return real_unlink(path, *a, **k)
+
+        def replace(src, dst, *a, **k):
+            if pause(dst):
+                raise OSError("disk")
+            return real_replace(src, dst, *a, **k)
+        with mock.patch("os.unlink", side_effect=unlink), mock.patch("os.replace", side_effect=replace):
+            t = holder["t"] = threading.Thread(target=first)
+            t.start()
+            self.assertTrue(paused.wait(5))
+            succ = threading.Thread(target=successor)
+            succ.start()
+            succ.join(0.5)  # finishes only when nothing serializes it behind `first`
+            go.set()
+            t.join(5)
+            succ.join(5)
+        return agent_identity
+
+    def test_a_successor_published_during_a_stale_retract_survives(self):
+        from ag2_sparrow import agent_identity
+        state = self.lane_state()
+        agent_identity.publish_lane(state, "", "@old:ag2.space")
+        paused, go, holder = threading.Event(), threading.Event(), {}
+
+        def after_read(real):
+            def read(*a, **k):
+                rec = real(*a, **k)
+                if threading.current_thread() is holder.get("t"):  # the retract's ownership read
+                    paused.set()
+                    go.wait(5)
+                return rec
+            return read
+        patches = [mock.patch.object(agent_identity, name, side_effect=after_read(getattr(agent_identity, name)))
+                   for name in ("_read_at", "published_lane_record") if hasattr(agent_identity, name)]
+        with contextlib.ExitStack() as stack:
+            for p in patches:
+                stack.enter_context(p)
+            t = holder["t"] = threading.Thread(target=agent_identity.retract_lane, args=(state, "", os.getpid()))
+            t.start()
+            self.assertTrue(paused.wait(5))
+            succ = threading.Thread(target=agent_identity.publish_lane, args=(state, "", "@new:other.space"))
+            succ.start()
+            succ.join(0.5)  # finishes only when nothing serializes it behind the retract
+            go.set()
+            t.join(5)
+            succ.join(5)
+        self.assertEqual((agent_identity.published_lane_record(state, "") or {}).get("agent_id"),
+                         "@new:other.space")
+
+    def test_a_successor_published_during_a_failed_publish_survives(self):
+        from ag2_sparrow import agent_identity, remote_gateway_bridge as gb
+        state = self.lane_state()
+        agent_identity.publish_lane(state, "", "@old:ag2.space")
+        with mock.patch.object(gb, "_STATE", state), mock.patch.object(gb, "_log"), \
+                mock.patch.dict(os.environ, {"AGENT_MXID": "@mid:ag2.space"}):
+            self.interleave(gb._lane_identity,
+                            lambda: agent_identity.publish_lane(state, "", "@new:other.space"))
+        self.assertEqual((agent_identity.published_lane_record(state, "") or {}).get("agent_id"),
+                         "@new:other.space")
+
+    def test_the_drain_delegates_to_it(self):
+        from ag2_sparrow import remote_gateway_bridge as gb
+        state = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, state)
+        with mock.patch.object(delivery_destination, "deliverable_here", return_value=False) as d, \
+                mock.patch.object(gb, "_STATE", state), \
+                mock.patch.object(gb, "_reenroll_identity", return_value="@a:ag2.space"):
+            self.assertFalse(gb._room_is_deliverable_here("!r:ag2.space"))
+        d.assert_called_once_with("!r:ag2.space", "ag2.space")
+        with mock.patch.object(delivery_destination, "route", return_value=("x", None, "")) as r:
+            self.assertEqual(gb._proactive_route("b"), ("x", None, ""))
+        r.assert_called_once_with("b", skip_after_channel=gb.DELIVERY_SKIP_AFTER_CHANNEL)
+        self.assertIs(gb._MATRIX_ROOM_RE, delivery_destination.MATRIX_ROOM_RE)
+
 
 if __name__ == "__main__":
     unittest.main()
