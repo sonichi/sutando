@@ -1528,19 +1528,27 @@ def launch(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Mappi
 def start(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Mapping[str, str]] = None,
           workspace: Optional[Path] = None, vault=None, spawn=None, python: Optional[str] = None) -> dict:
     """`launch`, unless a process is already proven to hold the lease (`lease: already_running`,
-    nothing spawned). A launch that fails returns its record (`ok` false, `reason`), never raises."""
-    # Advisory, outside the record lock: it only saves a spawn. The bridge's lease is what keeps
-    # one holder; a racing start's child stands down to it and `launch` records that.
-    row = _row_named(instance, workspace) or {}
-    for name in [instance] + alias_instances(row):
-        holder = _proven_holder(name, workspace)
-        if holder:
-            return {"instance": instance, "ok": True, "pid": holder, "lease": "already_running", "as": name}
+    nothing spawned). A start that fails returns its record (`ok` false, `reason`; any other
+    refusal is recorded under its class, e.g. `vault_unavailable`), never raises."""
     try:
+        # Advisory, outside the record lock: it only saves a spawn. The bridge's lease is what keeps
+        # one holder; a racing start's child stands down to it and `launch` records that.
+        row = _row_named(instance, workspace) or {}
+        for name in [instance] + alias_instances(row):
+            holder = _proven_holder(name, workspace)
+            if holder:
+                return {"instance": instance, "ok": True, "pid": holder, "lease": "already_running", "as": name}
         return launch(instance, repo=repo, logs_dir=logs_dir, environ=environ, workspace=workspace,
                       vault=vault, spawn=spawn, python=python)
     except LaunchFailed:
         return _read_json(launch_record_path(instance, workspace))
+    except ConnectionsError as e:
+        return _record_launch(instance, workspace, ok=False, reason=_error_reason(e))
+
+
+def _error_reason(e: Exception) -> str:
+    """`VaultUnavailable` → `vault_unavailable`."""
+    return re.sub(r"(?<!^)(?=[A-Z])", "_", type(e).__name__).lower()
 
 
 def start_added(row: Mapping[str, object], **launch_kw) -> Optional[dict]:

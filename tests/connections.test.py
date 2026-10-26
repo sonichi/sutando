@@ -1287,6 +1287,17 @@ class Starting(Base):
         status = C.status_for(self.rows()[0], self.ws)
         self.assertEqual((status["state"], status["reason"], status["running"]), ("failed", "no_token", False))
 
+    def test_a_refusal_during_start_is_a_failed_record_not_an_exception(self):
+        row, _ = self.add(TOKEN_B, fetch=agents("@s:beta-fixture.net"))
+        def refuse(*_a, **_kw):
+            raise C.VaultUnavailable("secret vault not importable (ImportError)")
+        with unittest.mock.patch.object(C, "launch_env", refuse):
+            record = C.start_added(row, environ={}, spawn=self.spawn, **self.kw)
+        self.assertEqual((record["ok"], record["reason"]), (False, "vault_unavailable"))
+        self.assertEqual([r["instance"] for r in self.rows()], ["beta-fixture-net"], "the saved row stays")
+        status = C.status_for(self.rows()[0], self.ws)
+        self.assertEqual((status["state"], status["reason"]), ("failed", "vault_unavailable"))
+
     def test_a_lease_that_proves_nothing_reads_running_null(self):
         row, _ = self.add(TOKEN_B, fetch=agents("@s:beta-fixture.net"))
         lock = self.ws / "state" / "locks" / "gateway-bridge.beta-fixture-net.lock"
@@ -2437,9 +2448,19 @@ class ChildExit(Base):
 
     def test_a_retained_lease_that_goes_stale_within_the_bound_is_waited_out(self):
         lease = self.retained()
-        lease["heartbeat_at"] = int(time.time()) - workspace_lock.DEFAULT_STALE_SECONDS + 1
-        (self.ws / "state" / "locks" / "gateway-bridge.beta-fixture-net.lock").write_text(json.dumps(lease))
-        record = self.launch(bridge_lease.spawner(self.ws, started=self.children))
+        lock = self.ws / "state" / "locks" / "gateway-bridge.beta-fixture-net.lock"
+        real = bridge_lease.spawner(self.ws, started=self.children)
+
+        def spawn(argv, env, log_path):
+            # The first child defers to the fresh lease however slowly it starts; only then does
+            # the lease age to go stale within the bound, so the second child takes it.
+            proc = real(argv, env, log_path)
+            if len(self.children) == 1:
+                proc.wait(timeout=10)
+                lease["heartbeat_at"] = int(time.time()) - workspace_lock.DEFAULT_STALE_SECONDS + 2
+                lock.write_text(json.dumps(lease))
+            return proc
+        record = self.launch(spawn)
         self.assertEqual(len(self.children), 2, "the first child stood down, the second took the lease")
         self.assertEqual(self.children[0].returncode, 75)
         self.assertEqual((record["ok"], record["lease"], record["pid"]), (True, "held", self.children[1].pid))

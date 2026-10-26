@@ -450,6 +450,21 @@ check("a refusing vault is 503 vault_unavailable", (s, b) == (503, {"error": "va
 api.connections_http = lambda method, path, body, query=None: _real(
     method, path, body, query, vault=FakeVault(), fetch=fetch, spawn=spawn, getaddrinfo=public_getaddrinfo)
 
+print("== a vault refusal while starting the added bridge ==")
+_real_launch_env = C.launch_env
+def _refusing_launch_env(*_a, **_kw):
+    raise C.VaultUnavailable("secret vault not importable (ImportError)")
+C.launch_env = _refusing_launch_env
+try:
+    s, b, _ = req("POST", "/api/v1/connections", {"token": TOKEN_A, "confirm": True, "expected_server": "alpha-fixture.net"})
+finally:
+    C.launch_env = _real_launch_env
+check("the add still succeeds with the saved row", s in (200, 201) and (b or {}).get("connection", {}).get("instance") == "alpha-fixture-net", f"{s} {b}")
+check("its launch is a failed record naming the class",
+      ((b or {}).get("launch") or {}).get("ok") is False and b["launch"].get("reason") == "vault_unavailable", f"{b}")
+s, b, _ = req("GET", "/api/v1/connections")
+check("the row persists", "alpha-fixture-net" in [r["instance"] for r in (b or {}).get("connections") or []], f"{s} {b}")
+
 print("== SUTANDO_API_TOKEN, when set, is the bearer ==")
 api.API_TOKEN = "operator-token"
 s, b, _ = req("GET", "/api/v1/connections")
