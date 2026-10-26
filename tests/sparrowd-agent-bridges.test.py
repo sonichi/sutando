@@ -893,6 +893,28 @@ class SeatBridge(Base):
         self.assertEqual(seen, {"env_room": "", "bridge_room": "", "left": [planted.name]},
                          "the seat's own .env and the host never give it a proactive room, and it claims no nudge")
 
+    def test_the_bridge_itself_gives_a_seat_no_proactive_room_when_its_env_names_none(self):
+        """The bridge's own is_seat guard, with no REMOTE_PROACTIVE_ROOM in the process environment to mask
+        it: the seat's .env names a room, and the imported bridge still holds none."""
+        decl = self.declare_seat()
+        with open(os.path.join(self.seat, ".env"), "a", encoding="utf-8") as fh:
+            fh.write("REMOTE_PROACTIVE_ROOM=!seat-env-room:x\n")
+        launched = json.loads(decl.read_text())["env"]
+        env = {k: v for k, v in cli.seat_child_env(launched).items() if k != "REMOTE_PROACTIVE_ROOM"}
+        name = "ag2_sparrow.remote_gateway_bridge"
+        modules = mock.patch.dict(sys.modules)
+        modules.start()
+        self.addCleanup(modules.stop)
+        sys.modules.pop(name, None)
+        local_task_protocol.set_task_stamper(None)
+        _dirs.set_dirs(task_dir=launched["AGENT_CONNECT_TASK_DIR"], result_dir=launched["AGENT_CONNECT_RESULT_DIR"],
+                       state_dir=launched["AGENT_CONNECT_STATE_DIR"])
+        with mock.patch.dict(os.environ, env, clear=True):
+            self.assertNotIn("REMOTE_PROACTIVE_ROOM", os.environ)
+            mod = importlib.import_module(name)
+            self.assertEqual((mod.TOKEN, mod._FOUND.token_source), (SEAT_BEARER, "token_file"), "it ran as the seat")
+            self.assertEqual(mod.PROACTIVE_ROOM, "", "a seat took the proactive room its .env names")
+
     def test_a_seat_whose_env_names_another_token_file_or_another_seat_never_runs(self):
         decl = self.declare_seat()
         env_path = os.path.join(self.seat, ".env")
