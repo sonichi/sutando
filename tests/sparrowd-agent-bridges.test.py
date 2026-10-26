@@ -758,15 +758,21 @@ SEAT_BEARER = "seat-bearer-QQQQ7777"
 
 
 class SeatBridge(Base):
-    """A seat that `connect` wired under sparrowd runs with exactly the env wire_bridge computes for it: its
-    own token file and .env, every host credential and URL name cleared, and never a vault read."""
+    """A seat that `connect` wired under sparrowd runs with exactly the env wire_bridge computes for it, over
+    only cli.SEAT_ENV_KEEP of sparrowd's: its own token file and .env, no host credential, URL or other
+    variable, and never a vault read."""
+
+    # Allowlisted names sparrowd holds; each reaches the seat bridge unchanged.
+    KEPT = {"PATH": os.environ.get("PATH") or "/usr/bin:/bin", "HOME": "/home/probe", "LANG": "C.UTF-8",
+            "TZ": "UTC", "SSL_CERT_FILE": "/etc/ssl/probe.pem", "DO_NOT_TRACK": "1", "SUTANDO_TELEMETRY": "0"}
 
     def setUp(self):
         super().setUp()
         env = mock.patch.dict(os.environ, {"AG2_DEVICE_ENV": "/host/relay.env", "REMOTE_TASK_TOKEN_FILE": "/host/t",
                                            "REMOTE_PROACTIVE_ROOM": "!owner-dm", "AGENT_MXID": "@core:x",
                                            "REMOTE_TASK_URL": "https://host-gw/relay", "KEEP_ME": "1",
-                                           **Wrapper.HOST_TOKENS})
+                                           "SUTANDO_FOO": "host-value", "SUTANDO_SUPERVISED": "1",
+                                           **self.KEPT, **Wrapper.HOST_TOKENS})
         env.start()
         self.addCleanup(env.stop)
         saved = (_dirs._injected, local_task_protocol._TASK_STAMPER)
@@ -814,8 +820,50 @@ class SeatBridge(Base):
         self.assertEqual({k: env[k] for k in launched}, launched, "exactly what wire_bridge computed for the seat")
         for key in _sources.bridge_strip_keys() + (_sources.INJECTED_KEY,):
             self.assertEqual(env.get(key, ""), "", f"{key} reached the seat bridge")
-        self.assertEqual((env["REMOTE_PROACTIVE_ROOM"], env["KEEP_ME"], env["AGENT_MXID"]), ("", "1", AGENT))
+        self.assertEqual({k: env.get(k) for k in self.KEPT}, self.KEPT, "the allowlisted names survive")
+        for key in ("KEEP_ME", "SUTANDO_FOO", "SUTANDO_SUPERVISED", "REMOTE_PROACTIVE_ROOM"):
+            self.assertNotIn(key, env, f"{key} is not on the seat allowlist")
+        self.assertEqual(set(env) - set(launched) - set(cli.SEAT_ENV_KEEP), set(), "nothing outside the allowlist")
+        self.assertEqual(env["AGENT_MXID"], AGENT)
         self.assertEqual(seen["found"], (SEAT_BEARER, "token_file", SEAT_URL, ""))
+
+    def test_no_sutando_or_host_relay_token_reaches_the_seat_but_proxy_and_ca_settings_do(self):
+        decl = self.declare_seat()
+        planted = {"SUTANDO_BAR": "s1", "SUTANDO_BRIDGE_LOCK": "0", "AG2_REMOTE_TOKEN": "host-ag2-remote",
+                   "AG2_REMOTE_TOKEN_PRD": "host-prd", "AG2_RELAY_TOKEN": "host-relay",
+                   "AG2_RELAY_TOKEN_BRIDGE_X": "host-relay-x"}
+        network = {"HTTPS_PROXY": "http://proxy.example:3128", "HTTP_PROXY": "http://proxy.example:3128",
+                   "NO_PROXY": "localhost", "ALL_PROXY": "socks5://proxy.example:1080",
+                   "https_proxy": "http://proxy.example:3128", "http_proxy": "http://proxy.example:3128",
+                   "no_proxy": "localhost", "all_proxy": "socks5://proxy.example:1080",
+                   "SSL_CERT_FILE": "/etc/ssl/corp.pem", "SSL_CERT_DIR": "/etc/ssl/certs",
+                   "REQUESTS_CA_BUNDLE": "/etc/ssl/corp-bundle.pem", "LOGNAME": "probe"}
+        seen = {}
+        with mock.patch.dict(os.environ, {**planted, **network}), recording_bridge_environ(seen):
+            rc = bridge.main([str(decl)], workspace=self.ws, get_key=lambda k: self.fail(f"vault read {k}"),
+                             run=lambda module, run_name, alter_sys: None)
+        self.assertEqual(rc, 0)
+        env = seen["env"]
+        for key, value in planted.items():
+            self.assertNotEqual(env.get(key), value, f"the host's {key} reached the seat bridge")
+        self.assertEqual([k for k in env if k.startswith("SUTANDO_") and k not in cli.SEAT_ENV_KEEP], [])
+        self.assertEqual({k: env.get(k) for k in network}, network, "proxy and CA settings reach the seat bridge")
+
+    def test_the_real_bridge_module_starts_as_the_seat(self):
+        decl = self.declare_seat()
+        name, seen = "ag2_sparrow.remote_gateway_bridge", {}
+        modules = mock.patch.dict(sys.modules)
+        modules.start()
+        self.addCleanup(modules.stop)
+        sys.modules.pop(name, None)
+
+        def start(module, run_name, alter_sys):
+            local_task_protocol.set_task_stamper(None)
+            mod = importlib.import_module(module)
+            seen.update(token=mod.TOKEN, url=mod.URL, source=mod._FOUND.token_source, fatal=mod._FOUND.fatal)
+        rc = bridge.main([str(decl)], workspace=self.ws, get_key=lambda k: self.fail(f"vault read {k}"), run=start)
+        self.assertEqual(rc, 0)
+        self.assertEqual(seen, {"token": SEAT_BEARER, "url": SEAT_URL, "source": "token_file", "fatal": ""})
 
     def test_a_seat_whose_env_names_another_token_file_or_another_seat_never_runs(self):
         decl = self.declare_seat()
