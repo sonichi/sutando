@@ -3050,5 +3050,80 @@ class RemoveClearsSidecar(Base):
         self.assertTrue(alpha.exists())
 
 
+class LingeringBridge(Base):
+    """A bridge that releases its lease on SIGTERM but stays alive past the stop deadline: every
+    caller of stop_bridge refuses with bridge_still_running and leaves its state as it was."""
+
+    LINGER = ("import signal, sys, time\nfrom pathlib import Path\nsys.path.insert(0, sys.argv[1])\n"
+              "import workspace_lock as wl\nws, role = Path(sys.argv[2]), sys.argv[3]\nwl.acquire(role, ws)\n"
+              "signal.signal(signal.SIGTERM, lambda *a: wl.release(role, ws))\nprint('held', flush=True)\n"
+              "while True:\n    time.sleep(0.2)\n    wl.heartbeat(role, ws)\n")
+    INST = "beta-fixture-net"
+    REF = "AG2_REMOTE_TOKEN_BETA_FIXTURE_NET"
+
+    def setUp(self):
+        super().setUp()
+        patcher = unittest.mock.patch.object(C, "STOP_TIMEOUT_S", 1)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.add()
+        self.add(TOKEN_B, fetch=agents("@s:beta-fixture.net"))
+        C._record_launch(self.INST, self.ws, ok=True, pid=1)
+        self.status = self.ws / "state" / f"gateway-status.{self.INST}.json"
+        self.status.write_text(json.dumps({"connected": True, "last_ok_ts": 1}))
+        self.bridge = subprocess.Popen([sys.executable, "-c", self.LINGER, str(ROOT / "src"), str(self.ws),
+                                        C._bridge_role(self.INST)], stdout=subprocess.PIPE,
+                                       env=isolated_child_env(), text=True)
+        self.children.append(self.bridge)
+        self.assertEqual(self.bridge.stdout.readline().strip(), "held")
+        self.spawned = []
+
+    def spawn(self, argv, env, log_path):
+        self.spawned.append(env["GATEWAY_INSTANCE"])
+        return self.bridge_spawn()(argv, env, log_path)
+
+    def beta(self):
+        return {r["instance"]: r for r in self.rows()}.get(self.INST)
+
+    def assert_lingering(self, ctx):
+        self.assertIn("bridge_still_running", str(ctx.exception))
+        self.assertIn("released its lease", str(ctx.exception))
+        self.assertIsNone(self.bridge.poll(), "the old bridge is still alive")
+
+    def test_update_token_writes_nothing_and_says_the_old_code_is_still_active(self):
+        before = self.beta()
+        with self.assertRaises(C.BridgeStillRunning) as ctx:
+            C.update_token(self.INST, UpdateToken.NEW_B, repo=self.ws / "repo", logs_dir=self.ws / "logs", environ={},
+                           workspace=self.ws, vault=self.vault, spawn=self.spawn, kill=os.kill,
+                           fetch=agents("@s:beta-fixture.net"))
+        self.assert_lingering(ctx)
+        self.assertIn("still runs on the old code", str(ctx.exception))
+        self.assertEqual(self.vault.store[self.REF], TOKEN_B, "the vault still holds the old code")
+        self.assertEqual(self.beta(), before, "the row is unchanged")
+        self.assertEqual(self.spawned, [], "no second bridge")
+
+    def test_remove_keeps_the_row_launch_record_status_and_vault_key(self):
+        with self.assertRaises(C.BridgeStillRunning) as ctx:
+            C.remove_connection(self.INST, workspace=self.ws, vault=self.vault, kill=os.kill)
+        self.assert_lingering(ctx)
+        self.assertIsNotNone(self.beta(), "the row stays")
+        self.assertTrue(C.launch_record_path(self.INST, self.ws).exists(), "the launch record stays")
+        self.assertTrue(self.status.exists(), "the status file stays")
+        self.assertEqual(self.vault.store[self.REF], TOKEN_B, "the vault key stays")
+
+    def test_disconnect_does_not_mark_the_row_disabled(self):
+        with self.assertRaises(C.BridgeStillRunning) as ctx:
+            C.disconnect(self.INST, workspace=self.ws, kill=os.kill)
+        self.assert_lingering(ctx)
+        self.assertFalse(self.beta()["disabled"], "disabled is never written over a live process")
+
+    def test_reconnect_spawns_no_second_bridge(self):
+        with self.assertRaises(C.BridgeStillRunning) as ctx:
+            C.reconnect(self.INST, repo=self.ws / "repo", logs_dir=self.ws / "logs", environ={}, workspace=self.ws,
+                        vault=self.vault, spawn=self.spawn, kill=os.kill, fetch=agents("@s:beta-fixture.net"))
+        self.assert_lingering(ctx)
+        self.assertEqual(self.spawned, [], "no second bridge while the old one lives")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)

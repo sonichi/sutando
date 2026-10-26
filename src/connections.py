@@ -1588,6 +1588,8 @@ def update_token(instance: str, token: str, *, repo: Path, logs_dir: Path,
                     f"{TokenStateUnknown.CODE}: the update of {instance} failed after the vault write began ({cause}) "
                     f"and reading {ref} back {found}, so it is not known which secret it holds; the row is unchanged "
                     "and the bridge was not relaunched; run update-token again with the code you want") from None
+        if isinstance(e, BridgeStillRunning):
+            raise _with_note(e, f"the running bridge still runs on the old code; {ref} was not changed") from None
         if not stopped:
             raise e
         try:
