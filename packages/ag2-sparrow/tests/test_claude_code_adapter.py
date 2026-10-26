@@ -2760,7 +2760,8 @@ class ConnectCode(AgentRootBase):
         with mock.patch.object(cm, "manager_state", return_value="unknown"):
             rc, out, err = self.connect(backend)
         self.assertEqual(rc, cli.EXIT_UNUSABLE, out + err)
-        self.assertIn("state cannot be read; connect writes the seat only while it is stopped", err)
+        self.assertIn(f"state cannot be read; connect writes the seat only while it is stopped: stop it "
+                      f"(systemctl --user stop {L.service_name}), then connect again; the code was not used", err)
         self.assertEqual(backend.calls, [])
 
     def test_a_stopped_job_connects_and_install_starts_it_with_the_new_seat(self):

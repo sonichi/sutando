@@ -723,7 +723,8 @@ def active_job_problem(shape: Shape) -> str:
     agent, so a credential rotation is stop, then connect."""
     state = manager_state(shape)
     if state == "unknown":
-        return f"{job_name(shape)}'s state cannot be read; connect writes the seat only while it is stopped"
+        return (f"{job_name(shape)}'s state cannot be read; connect writes the seat only while it is stopped: "
+                f"stop it ({stop_command(shape)}), then connect again")
     if state != "active":
         return ""
     served = (owned_config(shape)[0] or {}).get("ROOT") or "an unrecorded root"
