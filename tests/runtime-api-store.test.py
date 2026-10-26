@@ -241,12 +241,33 @@ INSERT INTO runtime_requests VALUES ('approval-m1','approval','t',NULL,
     txn = rs.RequestStore(str(tmp / "txn.sqlite"))
     other = txn.create("capability", "m", "@a:hs", {})
     unapproved = txn.create("approval", "approval.request", "@a:hs", {})
-    real_db = txn._db
-    rival_done = threading.Event()
+    real_db, real_lock = txn._db, getattr(txn, "_lock", None)
+    seen = threading.Condition()
+    evidence: list = []  # "blocked" (rival waits on the store lock) or "committed"
+
+    def note(what):
+        with seen:
+            evidence.append(what)
+            seen.notify_all()
+
+    class WatchedLock:
+        # A failed non-blocking try from the rival is proof the transaction holds it.
+        def __enter__(self):
+            if not real_lock.acquire(blocking=False):
+                note("blocked")
+                real_lock.acquire()
+            return self
+
+        def __exit__(self, *exc):
+            real_lock.release()
 
     def rival():
-        txn.transition(other["requestId"], "completed")
-        rival_done.set()
+        try:
+            txn.transition(other["requestId"], "completed")
+        finally:
+            note("committed")
+
+    rival_thread = threading.Thread(target=rival, daemon=True)
 
     class Paused:
         def __getattr__(self, name):
@@ -254,19 +275,27 @@ INSERT INTO runtime_requests VALUES ('approval-m1','approval','t',NULL,
 
         def execute(self, sql, *args):
             if sql.startswith("UPDATE runtime_requests SET consumed_at"):
-                t = threading.Thread(target=rival)
-                t.start()
-                t.join(1.0)
+                rival_thread.start()
+                with seen:
+                    if not seen.wait_for(lambda: evidence, timeout=30):
+                        evidence.append("timeout")
             return real_db.execute(sql, *args)
 
     txn._db = Paused()
+    if real_lock is not None:
+        txn._lock = WatchedLock()
     lost = txn.create_consuming(unapproved["requestId"], "capability", "m", "@a:hs", {},
                                 idempotency_key="interleaved")
-    rival_done.wait(5)
+    first = evidence[0] if evidence else "none"
+    rival_thread.join(30)
     txn._db = real_db
+    if real_lock is not None:
+        txn._lock = real_lock
+    check(first == "blocked",
+          f"a commit from another thread mid-create_consuming waits on the store lock (saw {first})")
     check(lost is None and txn.by_idempotency_key("interleaved") is None,
-          "a commit from another thread mid-create_consuming waits; the lost consume leaves no row")
-    check(txn.get(other["requestId"])["status"] == "completed",
+          "the lost consume leaves no row")
+    check(not rival_thread.is_alive() and txn.get(other["requestId"])["status"] == "completed",
           "the waiting thread's write lands after the transaction")
     txn.close()
 
