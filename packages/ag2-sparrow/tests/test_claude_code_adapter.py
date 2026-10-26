@@ -2573,6 +2573,44 @@ class ConnectCode(AgentRootBase):
         self.assertIn("token is not a regular file", err)
         self.assertTrue(stat.S_ISFIFO(os.lstat(token).st_mode), "the FIFO is left as it is")
 
+    def held_root(self):
+        """The agent's seated root, held by this process as connect holds it."""
+        self.seated_by_another_adapter()
+        owner = task_io.acquire_lock(str(self.root), cm.CONNECT_HOLDER)
+        self.addCleanup(task_io.release_lock, owner)
+        return owner
+
+    def test_write_seat_held_refuses_a_fifo_token_within_a_bound_and_no_writer(self):
+        owner, token = self.held_root(), self.seat() / "token"
+        token.unlink()
+        os.mkfifo(token)
+        got = []
+        t = threading.Thread(target=lambda: got.append(cm.write_seat_held(
+            owner, str(self.root), cli.bridge_home(self.root), {"relay_url": RELAY, "bearer": BEARER, "agent_id": AGENT})),
+            daemon=True)
+        t.start()
+        t.join(5)
+        self.assertFalse(t.is_alive(), "write_seat_held returned within 5 s, with no writer on the FIFO")
+        self.assertEqual(got[0][0], "")
+        self.assertIn("(token is not a regular file); the seat is unchanged", got[0][1])
+        self.assertTrue(stat.S_ISFIFO(os.lstat(token).st_mode), "the FIFO is left as it is")
+
+    def test_write_seat_held_reads_a_seat_file_up_to_the_bound_and_refuses_one_over_it(self):
+        owner, bound = self.held_root(), 64 * 1024
+        for size, ok in ((bound - 1, True), (bound, True), (bound + 1, False)):
+            with self.subTest(size):
+                (self.seat() / "token").write_bytes(b"x" * size)
+                seat_env, why = cm.write_seat_held(owner, str(self.root), cli.bridge_home(self.root),
+                                                   {"relay_url": RELAY, "bearer": BEARER, "agent_id": AGENT})
+                token = (self.seat() / "token").read_bytes()
+                if ok:
+                    self.assertEqual((why, token), ("", f"{RELAY}|{BEARER}\n".encode()))
+                    self.assertEqual(seat_env, str(self.seat() / ".env"))
+                else:
+                    self.assertEqual(seat_env, "")
+                    self.assertIn(f"token is larger than {bound} bytes", why)
+                    self.assertEqual(token, b"x" * size, "the oversized file is left as it is")
+
     def test_a_stable_root_through_the_same_seam_connects(self):
         self.seated_by_another_adapter()
         seen, real = [], cm.acquire_lock
