@@ -2826,6 +2826,7 @@ class ConnectCode(AgentRootBase):
             if shape is L and not raced:
                 fake.runner.start_session()
                 raced.append(fake.runner.pid())
+                self.assertIsNone(launched(self.root, L.name), "a launcher claims this start, then loses the root")
             return real(shape, **kw)
         with mock.patch.object(cm, "start_supervisor", side_effect=raced_then_started):
             rc, out, err = self.connect(Backend(), fake)
