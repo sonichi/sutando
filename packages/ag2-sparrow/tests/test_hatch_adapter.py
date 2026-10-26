@@ -5679,9 +5679,10 @@ class Hold(Base):
 
     def bounded_req(self, url, budget, client=None):
         """gb._req against `url` with a `budget` s deadline; returns (raised, seconds)."""
-        import http.client
+        import ssl
         from ag2_sparrow import remote_gateway_bridge as gb
-        patch = mock.patch.object(http.client, "_create_https_context", lambda v: client)
+        # http.client._create_https_context exists only on 3.12+; every version calls this one.
+        patch = mock.patch.object(ssl, "_create_default_https_context", lambda *a, **k: client)
         started, raised = time.monotonic(), None
         with mock.patch.multiple(gb, URL=url, TOKEN="t"), (patch if client else contextlib.nullcontext()):
             try:
