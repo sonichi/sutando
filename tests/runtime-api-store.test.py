@@ -16,6 +16,7 @@ from __future__ import annotations
 import importlib.util
 import sqlite3
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -204,6 +205,36 @@ INSERT INTO runtime_requests VALUES ('approval-m1','approval','t',NULL,
     again = rs.RequestStore(old_db)
     check(again.get("approval-m1") is not None, "re-boot over migrated DB is clean")
     again.close()
+
+    # The connection is opened check_same_thread=False: a poller on another thread
+    # interleaving with writes used to corrupt reads (InterfaceError, None rows).
+    shared = rs.RequestStore(str(tmp / "threads.sqlite"))
+    errors: list = []
+    stop = threading.Event()
+
+    def poll():
+        while not stop.is_set():
+            try:
+                shared.pending()
+            except Exception as exc:  # noqa: BLE001 - every failure is the finding
+                errors.append(repr(exc))
+
+    poller = threading.Thread(target=poll)
+    poller.start()
+    try:
+        for i in range(2000):
+            rec7 = shared.create("capability", "m", "@a:hs", {"i": i},
+                                 idempotency_key=f"t{i}")
+            if rec7 is None or not shared.transition(rec7["requestId"], "completed",
+                                                     result={"i": i}):
+                errors.append(f"write {i} lost")
+    except Exception as exc:  # noqa: BLE001
+        errors.append(repr(exc))
+    finally:
+        stop.set()
+        poller.join()
+    check(errors == [], f"one store shared by two threads stays consistent: {errors[:3]}")
+    shared.close()
 
     print(f"\n{'PASS — request store unit suite green' if not FAILS else f'FAILED ({len(FAILS)})'}")
     return 1 if FAILS else 0
