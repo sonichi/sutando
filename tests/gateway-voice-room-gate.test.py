@@ -60,7 +60,7 @@ class FakeGateway:
         self.owner = OWNER
         self.posts = []
 
-    def req(self, method, path, payload=None, timeout=None):
+    def req(self, method, path, payload=None, timeout=None, **_kw):
         self.calls.append((method, path, payload))
         if path == "/v1/agents":
             return {"agents": [{"id": AGENT, "owner": self.owner, "owner_dm_room": DM_ROOM}]}

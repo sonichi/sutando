@@ -11,12 +11,16 @@ environment) and sends the row on its heartbeat. The row is healthy while the la
 keepawake line is under two intervals old, unknown while a task that has not run yet
 is that young, else abnormal (`keepawake-not-running`). A fresh keepawake line does not
 mask the hook: the row is also abnormal when the hook has not run in HOOK_STALE_S
-(`hook-not-running`) or a task has waited over TASK_PICKUP_S (`task-not-picked-up`).
+(`hook-not-running`), a task has waited over TASK_PICKUP_S (`task-not-picked-up`), or a held
+task's room line is still queued or parked after HELD_LINE_DELIVER_S (`task-held-line-undelivered`)
+or left the queue with no receipt (`task-held-line-unconfirmed`).
 `keepalive report` lists the log's gaps, and reads the lines of the earlier
 watchdog-and-probe pair too."""
 from __future__ import annotations
 
+import calendar
 import datetime
+import math
 import json
 import os
 import shlex
@@ -26,7 +30,8 @@ import sys
 import time
 from pathlib import Path
 
-from ... import _dirs, agent_identity, diagnostics, workspace_lock
+from ... import _dirs, agent_identity, delivery_destination, diagnostics, task_hold, workspace_lock
+from ...persisted_number import bounded_number
 from . import cli as _cli, task_fields
 
 TASK, INTERVAL_MIN = "sparrow-keepawake", 15
@@ -37,13 +42,32 @@ STALE_S = 2 * INTERVAL_MIN * 60
 NOT_RUNNING = "keepawake-not-running"
 HOOK_NOT_RUNNING, HOOK_STALE_S = "hook-not-running", 5 * 60
 TASK_NOT_PICKED_UP, TASK_PICKUP_S = "task-not-picked-up", 15 * 60
+# A healthy row's reason while a task waits on a deliberate hold, never a problem.
+TASK_HELD = "task-held-for-owner"
+# A hold whose room line the drain has not delivered this long is reported, never acted on: the
+# line is queued, being sent, parked or withdrawn (undelivered), or gone with no receipt (unconfirmed).
+TASK_HELD_UNDELIVERED, HELD_LINE_DELIVER_S = "task-held-line-undelivered", 10 * 60
+TASK_HELD_UNCONFIRMED = "task-held-line-unconfirmed"
 UPGRADE_FAILED = "upgrade-failed"
 NO_HEALTH_COMMAND, UNKNOWN_ENV = "no-health-command", "unknown-env"
+# A running Sparrow from before the send lock: hold refuses for it and keepawake restarts it.
+OLD_DRAIN = "drain-predates-send-lock"
+# How long a live drain may go without its lane record before it counts as an older drain.
+LANE_GRACE_S = 120
 REASON_HINTS = {
     HOOK_NOT_RUNNING: f"the hook has not run in the last {HOOK_STALE_S // 60} minutes; see "
                       "the hook run line above",
     TASK_NOT_PICKED_UP: f"an AG2 Space task has been open over {TASK_PICKUP_S // 60} minutes: "
-                        "the hook is not waking a worker for it, or a worker handed it off",
+                        "the hook is not waking a worker for it, or a worker handed it off "
+                        "without running hold",
+    TASK_HELD: "a worker parked an AG2 Space task for your go (ag2-sparrow-hatch hold)",
+    TASK_HELD_UNDELIVERED: f"a task was held over {HELD_LINE_DELIVER_S // 60} minutes ago and its "
+                           "room notice is still queued, being sent, was parked after failed "
+                           "sends or was withdrawn unsent, so the asker may have heard nothing: check Sparrow's proactive "
+                           "drain and the room",
+    TASK_HELD_UNCONFIRMED: f"a task was held over {HELD_LINE_DELIVER_S // 60} minutes ago and its "
+                           "room notice left the queue, but its delivery can't be confirmed (no "
+                           "receipt): check the room and Sparrow's log",
     UPGRADE_FAILED: "an automatic ag2-sparrow upgrade failed; its outcome and the version "
                     "installed now are in hatch-upgrade.json and hatch-upgrade.log in the "
                     "state dir",
@@ -241,23 +265,70 @@ def _spawn_sparrow(cfg: dict) -> "tuple[bool, str]":
     return False, f"{exe} exited {code} at once ({why})"
 
 
-def restart_listener(cfg: dict) -> "tuple[bool, str]":
-    """Through the user service install wrote when there is one, else a detached Sparrow."""
+def restart_listener(cfg: dict, bound: "tuple | None" = None) -> "tuple[bool | None, str]":
+    """Through the user service install wrote when there is one, else a detached Sparrow. With
+    `bound`, only the transition keepawake proved, re-read after the unit's own state: ("running",
+    old pid, its lock) restarts the unit only while it runs that generation, else (False, why);
+    ("stopped", old pid) starts it (`start` alone) only while it is down and no live
+    Sparrow holds the lock, else (None, why), a current generation left untouched. Neither resets
+    nor restarts on a mismatch."""
     owner = _unit_owner()
     if owner == UNIT_UNREACHABLE:
         return False, (f"{_cli.service_path()} is installed but systemctl --user did not answer; "
                        "no detached Sparrow is started beside that service")
+    if bound is not None and owner != "ours":
+        return False, f"{_cli.SERVICE_NAME} is no longer this install's unit; nothing was restarted"
     if owner == "ours":
         # A unit left failed by its start limit stays down until reset.
-        if _cli._unit_props() is None:
+        props = _cli._unit_props()
+        if props is None:
             return False, (f"systemctl --user show {_cli.SERVICE_NAME} did not give a well-formed state; "
                            "it was neither reset nor restarted")
+        if bound is not None:
+            why = _generation_moved(cfg, props, *bound[1:]) if bound[0] == "running" \
+                else _not_stopped(cfg, props, bound[1])
+            if why:
+                return (False if bound[0] == "running" else None), f"{why}; nothing was reset or restarted"
+        if bound is not None and bound[0] == "stopped":
+            # Only `start`, a no-op for a unit that came up after the check; a failed unit that
+            # needs reset-failed is left to the next pass's down-listener restart.
+            r = _cli._systemctl(("--user", "start", "ag2-sparrow.service"))
+            if _cli._ok(r):
+                return True, f"systemctl --user start {_cli.SERVICE_NAME}"
+            return False, f"systemctl --user start {_cli.SERVICE_NAME} failed ({_cli._why(r)})"
         _cli._systemctl(("--user", "reset-failed", "ag2-sparrow.service"))
         r = _cli._systemctl(("--user", "restart", "ag2-sparrow.service"))
         if _cli._ok(r):
             return True, f"systemctl --user restart {_cli.SERVICE_NAME}"
         return False, f"systemctl --user restart {_cli.SERVICE_NAME} failed ({_cli._why(r)})"
     return _spawn_sparrow(cfg)
+
+
+_IDENTITY = ("pid", "acquired_at", "start", "proc_start", "send_lock")
+
+
+def _generation_moved(cfg: dict, props: dict, old: int, lock: dict) -> "str | None":
+    """Why the unit or the lock no longer runs the legacy generation `old` took as `lock`; None
+    while the unit is exactly active with it as MainPID and the lock still proves that drain."""
+    if props["ActiveState"] != "active" or props["MainPID"] != old:
+        return (f"{_cli.SERVICE_NAME} no longer runs the old Sparrow (pid {old}): "
+                f"ActiveState={props['ActiveState']}, MainPID={props['MainPID']}")
+    now = _cli._lock_record(_state_dir(cfg), _instance(cfg)) or {}
+    if any(now.get(k) != lock.get(k) for k in _IDENTITY) or drain_predates_send_lock(cfg) != old:
+        return f"the lock no longer names the legacy drain (pid {old}) keepawake selected"
+    return None
+
+
+def _not_stopped(cfg: dict, props: dict, old: int) -> "str | None":
+    """Why the unit may not be started after `old` stopped: it is not down, or a live Sparrow
+    holds the lock (a current generation came up meanwhile). None while both are clear."""
+    if props["ActiveState"] not in ("inactive", "failed") or props["MainPID"] != 0:
+        return (f"{_cli.SERVICE_NAME} came up while the old Sparrow (pid {old}) stopped: "
+                f"ActiveState={props['ActiveState']}, MainPID={props['MainPID']}")
+    holder = _cli.live_lock_holder(_cli._lock_record(_state_dir(cfg), _instance(cfg)))
+    if holder is not None:
+        return f"Sparrow pid {holder} took the lock while the old Sparrow (pid {old}) stopped"
+    return None
 
 
 def _proc(pid: int, name: str) -> "bytes | None":
@@ -292,6 +363,59 @@ def sparrow_env(pid: int) -> "dict[str, str] | None":
         return None
     pairs = (p.split(b"=", 1) for p in env.split(b"\0") if b"=" in p)
     return {k.decode(errors="replace"): v.decode(errors="replace") for k, v in pairs}
+
+
+def proven_sparrow(cfg: dict, pid: int, lock: "dict | None") -> bool:
+    """`pid` runs Sparrow now and is the process that took `lock`, this workspace's canonical
+    lock (cli.canonical_lock), not a later one given its pid: its start time is the one the lock
+    declares or, for a lock that declares none, a bounded epoch no later than the lock's (both
+    whole seconds, so the same second passes and the next one does not). False whenever that
+    cannot be read."""
+    if not _cli.canonical_lock(lock, _state_dir(cfg), _instance(cfg)) or lock.get("pid") != pid \
+            or not is_sparrow_pid(pid):
+        return False
+    start = agent_identity.start_time(pid)
+    if start is None:
+        return False
+    if "start" in lock:
+        return lock["start"] == start
+    try:
+        began = calendar.timegm(time.strptime(start, "%Y-%m-%dT%H:%M:%SZ"))
+    except ValueError:
+        return False
+    return bounded_number(began, 1, time.time()) is not None and began <= math.floor(lock["acquired_at"])
+
+
+def stop_holder(cfg: dict, pid: int) -> bool:
+    """SIGTERM the lock holder `pid` through a pidfd opened before the lock is re-read and proved
+    (proven_sparrow, and the record's precise proc_start where it names one), then wait; nothing
+    is signalled without that handle or that proof."""
+    try:
+        handle = _pidfd_open(pid)
+    except ProcessLookupError:
+        return True
+    except OSError as e:
+        print(f"error: no stable process handle for pid {pid} (pidfd_open: {diagnostics.describe(e)}); "
+              "it was not signalled", file=sys.stderr)
+        return False
+    if handle is None:
+        print(f"error: no stable process handle for pid {pid} on this platform (no pidfd); it was "
+              "not signalled: stop Sparrow by hand", file=sys.stderr)
+        return False
+    try:
+        lock = _cli._lock_record(_state_dir(cfg), _instance(cfg))
+        why = None if proven_sparrow(cfg, pid, lock) else \
+            f"pid {pid} is not proven to be the Sparrow holding the lock"
+        # A legacy lock predates proc_start; one that names it must match it exactly.
+        if why is None and "proc_start" in (lock or {}):
+            why = unproven_holder(lock, pid)
+        if why:
+            print(f"error: {why}; it was not signalled", file=sys.stderr)
+            return False
+        return _stop(pid, handle)
+    finally:
+        if isinstance(handle, int):
+            os.close(handle)
 
 
 def _pidfd_open(pid: int) -> "int | None":
@@ -350,12 +474,47 @@ def unmanaged_health_problem(cfg: dict) -> "tuple[int | None, str | None]":
     return pid, health_env_problem(cfg, pid)
 
 
-def replace_sparrow(cfg: dict, pid: int) -> "tuple[bool, str]":
-    """Stop Sparrow `pid`, which lacks this install's REMOTE_HEALTH_COMMAND, and start one
-    that has it."""
-    print(f"replacing: Sparrow (pid {pid}) runs without "
-          f"REMOTE_HEALTH_COMMAND={health_command(_command(cfg))}")
-    if not _stop(pid):
+def _is_epoch(value) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def drain_predates_send_lock(cfg: dict, now: "float | None" = None) -> "int | None":
+    """The pid of the live, connected Sparrow that is not this package's drain: its own lane
+    record, fresh or stale, lacks the send-lock protocol, or it has held its lock past
+    LANE_GRACE_S with no record of its own, as a drain from before lane records (the released
+    main) does. A drain whose lock declares its protocol is judged by that alone, so a lane record
+    it could not write is no evidence against it. A record another process left under a reused
+    pid is not its own. None otherwise: when the live pid is not proven to be the Sparrow that
+    took the lock (proven_sparrow), and when the record is invalid or cannot be read."""
+    state, instance = _state_dir(cfg), _instance(cfg)
+    holder = _cli._lock_record(state, instance)
+    pid = _cli.live_lock_holder(holder)
+    if pid is None or _cli.check_sparrow(state, now=now, instance=instance)[0] != _cli.SPARROW_OK:
+        return None
+    if not proven_sparrow(cfg, pid, holder):
+        return None  # the live pid is not proven to be the Sparrow that took this lock
+    acquired = (holder or {}).get("acquired_at")
+    if "send_lock" in holder:
+        return None if holder["send_lock"] == delivery_destination.SEND_LOCK_PROTOCOL else pid
+    lane, rec = agent_identity.lane_state(state, instance)
+    if lane in (agent_identity.LANE_INVALID, agent_identity.LANE_UNREADABLE):
+        print(f"lane record of Sparrow (pid {pid}) {lane}; not replacing it", file=sys.stderr)
+        return None
+    # Stale counts too: a drain slowed by its sends still declares what it honours.
+    if agent_identity.owned_by(rec, pid, acquired):
+        return None if rec.get("send_lock") == delivery_destination.SEND_LOCK_PROTOCOL else pid
+    # This package's drain publishes its record on its first pass, every few seconds after.
+    now = time.time() if now is None else now
+    old = _is_epoch(acquired) and 0 <= now - acquired and now - acquired > LANE_GRACE_S
+    return pid if old else None
+
+
+def replace_sparrow(cfg: dict, pid: int, why: str = "") -> "tuple[bool, str]":
+    """Stop Sparrow `pid`, which lacks this install's REMOTE_HEALTH_COMMAND (or `why`), and
+    start one that has it."""
+    print(f"replacing: Sparrow (pid {pid}) " + (why or "runs without "
+          f"REMOTE_HEALTH_COMMAND={health_command(_command(cfg))}"))
+    if not stop_holder(cfg, pid):
         return False, f"the old Sparrow (pid {pid}) did not stop"
     ok, how = restart_listener(cfg)
     return ok, (how if ok else
@@ -566,7 +725,7 @@ def ensure_sparrow(cfg: dict, health: bool) -> int:
                           "Sparrow's lock; run install again once it exits", file=sys.stderr)
                     return 1
                 print(f"replacing: the Sparrow outside {_cli.SERVICE_NAME} (pid {holder})")
-                if not _stop(holder):
+                if not stop_holder(cfg, holder):
                     return 1
                 stopped = holder
             start = True
@@ -594,17 +753,23 @@ def ensure_sparrow(cfg: dict, health: bool) -> int:
     return _await_connected(state, instance, started if start else since)
 
 
+def _connected_since(state: Path, instance: str, since: "float | None") -> "tuple[bool, str]":
+    """Whether Sparrow reports running and connected (after `since`, when given), and its detail."""
+    code, detail = _cli.check_sparrow(state, instance=instance)
+    try:
+        ts = bounded_number(json.loads(_cli.sparrow_status_path(state, instance).read_text(
+            encoding="utf-8"))["ts"], 0, 1e11)
+    except (OSError, ValueError, KeyError, TypeError):
+        ts = None
+    return code == _cli.SPARROW_OK and (since is None or (ts is not None and ts >= int(since))), detail
+
+
 def _await_connected(state: Path, instance: str, since: "float | None") -> int:
     """0 once Sparrow reports running and connected (after `since`, when given), else 1."""
-    path = _cli.sparrow_status_path(state, instance)
     deadline = time.monotonic() + START_WAIT_S
     while True:
-        code, detail = _cli.check_sparrow(state, instance=instance)
-        try:
-            ts = float(json.loads(path.read_text(encoding="utf-8"))["ts"])
-        except (OSError, ValueError, KeyError, TypeError):
-            ts = None
-        if code == _cli.SPARROW_OK and (since is None or (ts is not None and ts >= int(since))):
+        ok, detail = _connected_since(state, instance, since)
+        if ok:
             print(f"sparrow: {detail}")
             return 0
         if time.monotonic() >= deadline:
@@ -612,6 +777,101 @@ def _await_connected(state: Path, instance: str, since: "float | None") -> int:
                   f"{detail}", file=sys.stderr)
             return 1
         time.sleep(0.5)
+
+
+def _status_snapshot(state: Path, instance: str) -> "dict | None":
+    """Sparrow's status file, read once; None when it cannot be read as an object."""
+    try:
+        status = json.loads(_cli.sparrow_status_path(state, instance).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return status if isinstance(status, dict) else None
+
+
+def _successor(cfg: dict, old: "tuple[int, str | None]", since: float) -> "tuple[int | None, str]":
+    """The pid of a Sparrow other than `old` (pid, start) proven to hold the lock, whose own
+    status, read in one snapshot, names its pid and start and says connected, written after
+    `since`; else None and what is missing."""
+    state, instance = _state_dir(cfg), _instance(cfg)
+    lock, file_id = _cli.lock_snapshot(state, instance)
+    pid = _cli.live_lock_holder(lock)
+    if pid is None:
+        return None, "no live Sparrow holds the lock"
+    start = agent_identity.start_time(pid)
+    if (pid, start) == old:
+        return None, f"the old Sparrow (pid {pid}) still holds the lock"
+    if start is None or not proven_sparrow(cfg, pid, lock):
+        return None, f"pid {pid} holds the lock but is not proven to be the Sparrow that took it"
+    gen = (lock or {}).get("proc_start")
+    if not isinstance(gen, str) or not gen or process_start(pid) != gen:
+        return None, f"pid {pid} is not proven to be the generation its lock names (proc_start)"
+    status = _status_snapshot(state, instance) or {}
+    if status.get("pid") != pid or status.get("start") != start or status.get("proc_start") != gen:
+        return None, f"the status file was not written by Sparrow pid {pid}"
+    at = bounded_number(status.get("written_at"), 0, 1e11)
+    if at is None or not since < at <= time.time() + _cli.SPARROW_STATUS_FUTURE_SKEW_S:
+        return None, f"Sparrow pid {pid} has written no status since the restart"
+    if status.get("connected") is not True:
+        return None, f"Sparrow pid {pid} is running but not connected"
+    now, now_id = _cli.lock_snapshot(state, instance)
+    if file_id is None or now_id != file_id or not _cli.canonical_lock(now, state, instance) \
+            or any(now.get(k) != lock.get(k) for k in _IDENTITY) or process_start(pid) != gen:
+        return None, f"the lock moved off Sparrow pid {pid} while its status was read"
+    return pid, f"Sparrow pid {pid} now holds the lock and is connected"
+
+
+def _await_successor(cfg: dict, old: "tuple[int, str | None]", since: float) -> "tuple[bool, str]":
+    """True once _successor finds one; False after START_WAIT_S, saying what is missing."""
+    deadline = time.monotonic() + START_WAIT_S
+    while True:
+        pid, detail = _successor(cfg, old, since)
+        if pid is not None:
+            return True, detail
+        if time.monotonic() >= deadline:
+            return False, f"no successor holds the lock and reports connected {START_WAIT_S:g}s later ({detail})"
+        time.sleep(0.5)
+
+
+def replace_old_drain(cfg: dict, old: int) -> "tuple[bool | None, str]":
+    """Replace `old`, the legacy drain keepawake selected, re-proving it at the action: None when
+    the lock no longer names it (the generation rolled: nothing is touched). The unit is
+    restarted in place only when it is active with `old` as its MainPID, and restart_listener
+    re-proves both right before it; otherwise `old` is an outside holder, stopped through
+    stop_holder first, and the unit started only while still down with no live holder. True only
+    once a successor holds the lock and is connected (_successor)."""
+    owner = _unit_owner()
+    if owner == "other":
+        return False, "a hand-made unit runs it; restart that unit"
+    if owner == UNIT_UNREACHABLE:
+        return False, f"{_cli.service_path()} is installed but systemctl --user did not answer; nothing was restarted"
+    props = _cli._unit_props() if owner == "ours" else None
+    if owner == "ours" and props is None:
+        return False, (f"systemctl --user show {_cli.SERVICE_NAME} did not give a well-formed state; "
+                       "nothing was restarted")
+    since = time.time()
+    lock = _cli._lock_record(_state_dir(cfg), _instance(cfg))
+    if drain_predates_send_lock(cfg) != old:
+        return None, f"the lock no longer names the legacy drain (pid {old}); it was left untouched"
+    identity = (old, agent_identity.start_time(old))
+    runs_it = props is not None and props["ActiveState"] in ("active", "reloading") \
+        and props["MainPID"] == old
+    if runs_it:
+        ok, how = restart_listener(cfg, bound=("running", old, lock or {}))
+    elif owner == "ours":
+        print(f"replacing: Sparrow (pid {old}) predates the hold-line send lock and runs outside "
+              f"{_cli.SERVICE_NAME} (ActiveState={props['ActiveState']}, MainPID={props['MainPID']})")
+        if not stop_holder(cfg, old):
+            return False, f"the old Sparrow (pid {old}) was not stopped; the unit was not restarted"
+        ok, how = restart_listener(cfg, bound=("stopped", old))
+        if ok is None:
+            print(f"not restarted: {how}")
+            ok = True  # the generation that came up is judged as the successor below
+    else:
+        ok, how = replace_sparrow(cfg, old, "predates the hold-line send lock")
+    if not ok:
+        return False, how
+    ok, detail = _await_successor(cfg, identity, since)
+    return ok, f"{how}; {detail}"
 
 
 def keepawake(cfg: dict, log: Path, now: float | None = None) -> int:
@@ -636,11 +896,19 @@ def keepawake(cfg: dict, log: Path, now: float | None = None) -> int:
     upgrade = _served_setup(cfg, settled, blocked) if free else "running"
     line = f"{_utc(now)} keepawake listener={'up' if up else 'down'} restarted={restarted}" \
         + (f" reason={reason}" if reason else "") + (f" upgrade={upgrade}" if upgrade else "")
-    log.parent.mkdir(parents=True, exist_ok=True)
-    with log.open("a", encoding="utf-8") as fh:
-        fh.write(line + "\n")
-    print(line)
+    _log_line(log, line)
     return rc
+
+
+def _log_line(log: Path, line: str) -> None:
+    """Append to the keepalive log, best effort: a log that cannot be written goes to stderr."""
+    try:
+        log.parent.mkdir(parents=True, exist_ok=True)
+        with log.open("a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+    except OSError as e:
+        print(f"keepalive log not written ({diagnostics.describe(e)})", file=sys.stderr)
+    print(line)
 
 
 def _keep_listener(cfg: dict, now: float) -> "tuple[bool, int, int, str | None]":
@@ -657,9 +925,16 @@ def _keep_listener(cfg: dict, now: float) -> "tuple[bool, int, int, str | None]"
             rc = 1
     else:
         pid, reason = unmanaged_health_problem(cfg)
-        if reason == NO_HEALTH_COMMAND:
-            ok, how = replace_sparrow(cfg, pid)
-            if ok:
+        old = drain_predates_send_lock(cfg) if reason != NO_HEALTH_COMMAND else None
+        if reason == NO_HEALTH_COMMAND or old is not None:
+            if old is not None:
+                reason = OLD_DRAIN
+                ok, how = replace_old_drain(cfg, old)
+            else:
+                ok, how = replace_sparrow(cfg, pid)
+            if ok is None:
+                print(f"not replaced: {how}")
+            elif ok:
                 restarted = 1
                 print(f"restarted: {how}")
             else:
@@ -733,21 +1008,35 @@ def hook_last_run(cfg: dict) -> "float | None":
     return run[0] if run is not None else _mtime(_cli.installed_marker_path())
 
 
-def oldest_open_task(cfg: dict) -> "float | None":
-    """mtime of the oldest task of any instance with no result, the agent's own excepted."""
+def open_tasks(cfg: dict, now: float) -> "tuple[float | None, float | None, dict]":
+    """(mtime of the oldest open task nobody holds, earliest deliberate hold, {outcome: earliest
+    hold} for holds whose room line is 'undelivered' or 'unconfirmed') across every instance,
+    the agent's own tasks excepted."""
     agent = (cfg.get("AGENT_MXID") or "").lower()
+    result_dir = Path(cfg.get("RESULT_DIR") or _dirs.result_dir())
     try:
         items = task_fields.list_open_tasks(Path(cfg.get("TASK_DIR") or _dirs.task_dir()),
-                                            Path(cfg.get("RESULT_DIR") or _dirs.result_dir()),
-                                            instance=None)
+                                            result_dir, instance=None)
     except OSError:
-        return None
+        return None, None, {}
+    oldest = held = None
+    stuck: dict = {}
     for item in items:
-        if (item.get("sender") or "").lower() != agent:
-            ts = _mtime(Path(item["task_file"]))
-            if ts is not None:
-                return ts
-    return None
+        if (item.get("sender") or "").lower() == agent:
+            continue
+        mark = task_hold.read(result_dir, item["task_id"])
+        ts = _mtime(Path(item["task_file"]))
+        # A task whose answer the outbox already has is a failed cleanup, never a hold.
+        if mark is not None and not _cli.task_settled(result_dir, item["task_id"]):
+            held = min(t for t in (held, mark["since"]) if t is not None)
+            outcome = _cli.hold_line_outcome(result_dir, item["task_id"])
+            # The task is open, so a line withdrawn at its send left the asker with nothing.
+            outcome = "undelivered" if outcome == "withdrawn" else outcome
+            if outcome != "delivered":
+                stuck[outcome] = min(t for t in (stuck.get(outcome), mark["since"]) if t is not None)
+        elif oldest is None and ts is not None:
+            oldest = ts
+    return oldest, held, stuck
 
 
 def health_row(cfg: dict, log: Path, now: float | None = None) -> dict | None:
@@ -773,15 +1062,20 @@ def health_row(cfg: dict, log: Path, now: float | None = None) -> dict | None:
     hook = hook_last_run(cfg)
     if hook is not None and not _within(now, hook, hook_stale_s):
         problems.append((HOOK_NOT_RUNNING, hook + hook_stale_s))
-    oldest = oldest_open_task(cfg)
+    oldest, held, stuck = open_tasks(cfg, now)
     if oldest is not None and now - oldest > tune["stuck_task_age_s"]:
         problems.append((TASK_NOT_PICKED_UP, oldest + tune["stuck_task_age_s"]))
+    for outcome, reason in (("undelivered", TASK_HELD_UNDELIVERED), ("unconfirmed", TASK_HELD_UNCONFIRMED)):
+        since = stuck.get(outcome)
+        if since is not None and now - since > HELD_LINE_DELIVER_S:
+            problems.append((reason, since + HELD_LINE_DELIVER_S))
     failed = self_upgrade.failed_since(_state_dir(cfg))
     if failed is not None:
         problems.append((UPGRADE_FAILED, failed))
     # Fresh but never run: no evidence either way yet.
     condition = "abnormal" if problems else "healthy" if ran is not None else "unknown"
-    reason, since = problems[0] if problems else (None, None)
+    reason, since = (problems[0] if problems else (TASK_HELD, held) if held is not None
+                     else (None, None))
     return {"alive": alive, "motion": "unknown", "condition": condition,
             "reason": reason, "since": since}
 

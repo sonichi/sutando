@@ -67,7 +67,7 @@ class Gateway:
         self.unreachable: set[str] = set()
         self.posts: list[dict] = []
 
-    def req(self, method, path, payload=None, timeout=None):
+    def req(self, method, path, payload=None, timeout=None, **_kw):
         op = (payload or {}).get("op")
         if path == "/v1/agents":
             return {"agents": [{"id": AGENT, "owner": OWNER, "owner_dm_room": self.dm_room}]}

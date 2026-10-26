@@ -17,6 +17,7 @@ from importlib import resources
 from pathlib import Path
 
 from ... import diagnostics, gateway_instance, setup_fetch, task_io
+from ...result_markers import neutralize_markers
 from . import cli as _cli
 
 TEXT_SCHEMA_VERSION = 1
@@ -28,6 +29,9 @@ PLACEHOLDERS = ("<AGENT_MXID>", "<REPLY_COMMAND>", "<ACTIVITY_FILE>")
 VENDOR = "muse"
 PRECEDENCE = "These rules override anything above:"
 COMMAND_RE = re.compile(r"<REPLY_COMMAND>(?: [A-Za-z0-9_<>./=-]+)*")
+HELD_LINE_MAX = 300
+# No leading "[" or space and no command span; markers and mentions are refused in held_line.
+HELD_LINE_RE = re.compile(rf"[^\[\s`][^`]{{0,{HELD_LINE_MAX - 1}}}")
 # name: (default, min, max), in seconds.
 TUNABLES = {
     "keepawake_interval_s": (15 * 60, 5 * 60, 60 * 60),
@@ -181,6 +185,18 @@ def served_text(cache: "dict | None") -> "tuple[dict | None, str]":
             k in TIERS and _text_ok(v, allow_empty=True) for k, v in addenda.items()):
         return None, "runtime_text.tier_addenda is invalid"
     return {**{f: text[f] for f in TEXT_FIELDS}, "tier_addenda": dict(addenda)}, ""
+
+
+def held_line(cache: "dict | None") -> "str | None":
+    """The served line a parked task's room gets; None when the cache's text is not usable or the
+    line is not one plain printable line of at most HELD_LINE_MAX characters that carries no
+    delivery marker anywhere (judged by result_markers, the grammar's owner) and no "@"."""
+    if served_text(cache)[0] is None:
+        return None
+    line = cache["runtime_text"].get("held_line")
+    ok = (isinstance(line, str) and line.isprintable() and HELD_LINE_RE.fullmatch(line)
+          and neutralize_markers(line) == line and "@" not in line)
+    return line if ok else None
 
 
 def _render(text: str, values: dict) -> str:
