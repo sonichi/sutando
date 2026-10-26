@@ -338,6 +338,18 @@ def test_bridge_channels_set_is_documented():
     )
 
 
+def test_the_item_key_names_the_files_own_route():
+    """An unmarked file keeps the body-only key; a marked room or thread makes a distinct item."""
+    from proactive_routing import proactive_item_id
+    import hashlib
+    plain = proactive_item_id("proactive-1", "body")
+    assert plain == f"proactive-1~{hashlib.sha256(b'body').hexdigest()[:16]}", plain
+    keys = {plain, proactive_item_id("proactive-1", "body", "!One:s", None),
+            proactive_item_id("proactive-1", "body", "!Two:s", None),
+            proactive_item_id("proactive-1", "body", None, "$T")}
+    assert len(keys) == 4, keys
+
+
 def main():
     test_discord_active_routes_to_discord()
     test_telegram_active_routes_to_telegram()
@@ -357,6 +369,7 @@ def main():
     test_peeked_claim_never_takes_another_bridges_address()
     test_bridges_delegate_the_pre_claim_peek()
     test_bridge_channels_set_is_documented()
+    test_the_item_key_names_the_files_own_route()
     print("All proactive-routing tests passed.")
 
 

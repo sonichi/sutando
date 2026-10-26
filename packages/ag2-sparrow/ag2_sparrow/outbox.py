@@ -970,6 +970,67 @@ def _activity_completed(item_id: str) -> None:
         pass
 
 
+#: The statuses outbox writers store; any other value in a present record is corruption.
+LIFECYCLE_STATUSES = frozenset({"QUEUED", "READY", "CLAIMED", "DELIVERED", "PARKED"})
+
+
+def receipt_state(root: Path, item_id: str) -> str:
+    """An item's status only when its record reads cleanly; "absent" only when no
+    directory entry exists, and "unknown" for anything else present — unreadable,
+    malformed, not a regular file, or not a status a writer stores. Judged and read
+    through one descriptor that follows no symlink, so it validates what it reads."""
+    return receipt(root, item_id)[0]
+
+
+def receipt(root: Path, item_id: str) -> "tuple[str, Optional[int]]":
+    """(`receipt_state`, the record's resend epoch) from one read; the epoch is None unless
+    the status is a stored one and the epoch a non-negative int (absent counts as 0)."""
+    return receipt_record(root, item_id)[:2]
+
+
+RECEIPT_READ_LIMIT = 4 << 20
+
+
+def receipt_record(root: Path, item_id: str) -> "tuple[str, Optional[int], Optional[dict]]":
+    """`receipt` plus the record it was read from, all from one bounded, non-blocking read of a
+    regular file through a descriptor that follows no symlink; the record is None unless the
+    state is a stored status. A caller that needs the payload reads it here, never separately."""
+    import stat as _stat
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    if not nofollow:  # no no-follow primitive: a link could not be refused
+        return "unknown", None, None
+    try:
+        fd = os.open(_item_path(Path(root), item_id), os.O_RDONLY | nofollow | getattr(os, "O_NONBLOCK", 0))
+    except FileNotFoundError:
+        return "absent", None, None
+    except OSError:
+        return "unknown", None, None
+    try:
+        st = os.fstat(fd)
+        if not _stat.S_ISREG(st.st_mode) or st.st_size > RECEIPT_READ_LIMIT:
+            return "unknown", None, None
+        chunks, size = [], 0
+        while size <= RECEIPT_READ_LIMIT:
+            chunk = os.read(fd, RECEIPT_READ_LIMIT + 1 - size)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+        if size > RECEIPT_READ_LIMIT:
+            return "unknown", None, None
+        data = json.loads(b"".join(chunks).decode("utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError):
+        return "unknown", None, None
+    finally:
+        os.close(fd)
+    status = data.get("status") if isinstance(data, dict) else None
+    if not (isinstance(status, str) and status in LIFECYCLE_STATUSES):
+        return "unknown", None, None
+    epoch = data.get("resend_epoch", 0)
+    valid = isinstance(epoch, int) and not isinstance(epoch, bool) and epoch >= 0
+    return status, epoch if valid else None, data
+
+
 def item_status(root: Path, item_id: str) -> Optional[str]:
     """Public read of an item's lifecycle status (READY/CLAIMED/DELIVERED/
     PARKED...); None when no record exists or it cannot be opened. A record
@@ -1177,6 +1238,34 @@ def list_items(root: Path, status: Optional[str] = None) -> list[dict]:
         if status is None or rec.get("status") == status:
             out.append(rec)
     return out
+
+
+class BornParked(str, Enum):
+    """Only CREATED means this call wrote the record; the other two touched nothing."""
+
+    CREATED = "created"
+    ALREADY_PARKED = "already-parked"
+    EXISTS = "exists"
+
+
+def publish_parked(root: Path, item_id: str, payload: str, reason: str, *,
+                   source_ready_sha256: Optional[str] = None) -> BornParked:
+    """Create `item_id` already PARKED, in one write under its lock, so it never has a READY moment
+    a drain could claim and no crash can leave it live. ALREADY_PARKED when it exists PARKED with
+    this payload (a retry, or a second writer racing); EXISTS when it exists any other way. Its
+    only way out is an operator's `requeue_item_with_epoch`."""
+    root = Path(root)
+    with _item_lock(root, item_id):
+        if _item_path(root, item_id).exists():
+            d = _read_item(root, item_id)
+            same = d.get("status") == "PARKED" and d.get("payload") == payload
+            return BornParked.ALREADY_PARKED if same else BornParked.EXISTS
+        _write_item(root, item_id, {
+            "item_id": item_id, "payload": payload, "status": "PARKED", "reason": reason,
+            "attempts": 0, "published_at": time.time(),
+            **source_proof_fields(source_ready_sha256, payload, new_publication_id()),
+        })
+        return BornParked.CREATED
 
 
 class RequeueOutcome(str, Enum):

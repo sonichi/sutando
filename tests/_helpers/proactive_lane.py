@@ -80,12 +80,12 @@ class Lane:
         gb = self.gb
         if hasattr(gb, "_PROACTIVE_CORE"):
             gb._PROACTIVE_CORE = None
-        saved = gb.RESULTS_DIR
-        gb.RESULTS_DIR = self.results
+        saved = (gb.RESULTS_DIR, gb.ARCHIVE_RESULTS_DIR)
+        gb.RESULTS_DIR, gb.ARCHIVE_RESULTS_DIR = self.results, self.results / "archive"  # as in production
         try:
             gb._recover_orphan_proactive()
         finally:
-            gb.RESULTS_DIR = saved
+            gb.RESULTS_DIR, gb.ARCHIVE_RESULTS_DIR = saved
 
     def items(self) -> list:
         from ag2_sparrow import outbox

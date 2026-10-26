@@ -24,7 +24,7 @@
      a fresh torn claim is still refused
  16. a malformed claim naming a dead pid                         -> parked, logged with its file's age;
      one naming a live owner is refused
- 17. a delivered file kept claimed, then orphan-recovered live   -> archived by its DELIVERED item, not resent
+ 17. a delivered file kept claimed, then orphan-recovered       -> hidden (never re-queued), archived, not resent
 
 Run: python3 tests/gateway-proactive-recovery-edges.test.py
 """
@@ -41,6 +41,7 @@ import json
 import shlex
 import subprocess
 import urllib.error
+from unittest import mock
 
 from _helpers import proactive_lane as pl
 from _helpers.hermetic_env import isolated_child_env
@@ -85,6 +86,16 @@ def die_as_restart(lane, item_id: str) -> None:
     for c in lane.results.glob("proactive-*.sending.*"):
         c.rename(lane.results / (c.name.split(".sending.")[0] + ".txt"))
     lane.restart()
+
+
+def archive_moves_through(rename):
+    """The delivered archive and its hidden fallback are no-replace placements: route them through `rename`."""
+    real = gb.undelivered_quarantine.rename_noreplace
+
+    def move(src, dst):
+        to_archive = Path(dst).parent.name == "archive" or gb._DELIVERED_INFIX in Path(dst).name
+        return rename(Path(src), dst) if to_archive else real(src, dst)
+    return mock.patch.object(gb.undelivered_quarantine, "rename_noreplace", move)
 
 
 def two_generations() -> None:
@@ -385,7 +396,8 @@ def delivered_archive_fails() -> None:
         return real(self, target)
     Path.rename = rename
     try:
-        lane.drain()
+        with archive_moves_through(rename):
+            lane.drain()
     finally:
         Path.rename = real
     live = sorted(q.name for q in lane.results.glob("proactive-*.txt"))
@@ -408,7 +420,8 @@ def delivered_cannot_be_hidden() -> None:
         return real(self, target)
     Path.rename = rename
     try:
-        lane.drain()
+        with archive_moves_through(rename):
+            lane.drain()
     finally:
         Path.rename = real
     claims = list(lane.results.glob("proactive-9h.sending.*"))
@@ -432,7 +445,8 @@ def newer_body_survives_archive_failure() -> None:
         return real(self, target)
     Path.rename = rename
     try:
-        lane.drain()
+        with archive_moves_through(rename):
+            lane.drain()
     finally:
         Path.rename = real
     canonical = lane.results / "proactive-10.txt"
@@ -588,7 +602,8 @@ def recovered_delivered_claim_not_resent() -> None:
         return real(self, target)
     Path.rename = rename
     try:
-        lane.drain()
+        with archive_moves_through(rename):
+            lane.drain()
     finally:
         Path.rename = real
     dead = subprocess.Popen([sys.executable, "-c", "pass"])
@@ -598,11 +613,13 @@ def recovered_delivered_claim_not_resent() -> None:
         c.rename(c.with_name(f"proactive-17.sending.{dead.pid}.{rest[1] if len(rest) > 1 else '0'}"))
     lane.restart()
     recovered = lane.where("proactive-17")
+    hidden = list(lane.results.glob(".proactive-17.delivered-*"))
     for _ in range(2):
         lane.drain()
-    check(recovered == "pending" and len(lane.posts) == 1 and lane.where("proactive-17") == "archived",
-          f"17. a delivered file orphan recovery returns to its live name is archived, not resent "
-          f"({recovered} -> {lane.where('proactive-17')}, {len(lane.posts)} POSTs)")
+    check(recovered == "gone" and len(hidden) == 1 and len(lane.posts) == 1
+          and lane.where("proactive-17") == "archived",
+          f"17. a delivered file orphan recovery finds is hidden, never re-queued, then archived, not resent "
+          f"({recovered}, {len(hidden)} hidden -> {lane.where('proactive-17')}, {len(lane.posts)} POSTs)")
 
 
 def upgrade_park_refused() -> None:

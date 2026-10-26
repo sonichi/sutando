@@ -184,6 +184,62 @@ class PublisherFailurePaths(unittest.TestCase):
                     self.assertEqual(mod.main(["result_publish.py", "--help"]), 2)
 
 
+class WitnessedPublish(unittest.TestCase):
+    """`publish_witnessed`: the witness is a second name of the committed inode,
+    so a link count above 1 survives the consumer renaming the result away."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name)
+
+    MODULES = (result_publish, _load_vendored())  # the bridge imports the vendored copy
+
+    def test_the_witness_shares_the_committed_inode_through_a_rename(self):
+        for mod in self.MODULES:
+            with self.subTest(mod=mod.__file__):
+                target, witness = self.dir / "proactive-a.txt", self.dir / ".proactive-a.txt.t.witness"
+                mod.publish_witnessed(target, "body\n", witness)
+                self.assertEqual(target.read_text(), "body\n")
+                self.assertEqual(os.stat(witness).st_ino, os.stat(target).st_ino)
+                target.rename(self.dir / "retired.txt")
+                self.assertEqual(os.stat(witness).st_nlink, 2)
+                self.assertEqual([p.name for p in self.dir.iterdir() if p.name.endswith(".tmp")], [])
+                for p in self.dir.iterdir():
+                    p.unlink()
+
+    def test_a_taken_name_is_refused_and_leaves_no_witness(self):
+        for mod in self.MODULES:
+            with self.subTest(mod=mod.__file__):
+                target, witness = self.dir / "proactive-a.txt", self.dir / ".proactive-a.txt.t.witness"
+                target.write_text("other\n")
+                with self.assertRaises(FileExistsError):
+                    mod.publish_witnessed(target, "body\n", witness)
+                self.assertEqual(target.read_text(), "other\n")
+                self.assertEqual(sorted(p.name for p in self.dir.iterdir()), ["proactive-a.txt"])
+                target.unlink()
+
+    def test_any_failed_commit_link_removes_the_witness(self):
+        import errno
+        for mod in self.MODULES:
+            for code in (errno.EPERM, errno.EXDEV, errno.ENOSPC, errno.EIO):
+                with self.subTest(mod=mod.__file__, errno=errno.errorcode[code]):
+                    target, witness = self.dir / "proactive-a.txt", self.dir / ".proactive-a.txt.t.witness"
+                    with mock.patch.object(mod.os, "link", side_effect=OSError(code, os.strerror(code))):
+                        with self.assertRaises(OSError) as raised:
+                            mod.publish_witnessed(target, "body\n", witness)
+                    self.assertEqual(raised.exception.errno, code)
+                    self.assertEqual(list(self.dir.iterdir()), [], "no witness, staging or target left")
+
+    def test_a_failed_witness_rename_leaves_no_staging(self):
+        for mod in self.MODULES:
+            with self.subTest(mod=mod.__file__):
+                target = self.dir / "proactive-a.txt"
+                with self.assertRaises(OSError):
+                    mod.publish_witnessed(target, "body\n", self.dir / "no-such-dir" / "w.witness")
+                self.assertEqual(list(self.dir.iterdir()), [])
+
+
 class ConcurrencyDrill(unittest.TestCase):
     """Forked writers through the production publisher; a polling reader sees whole bodies only."""
 
@@ -375,6 +431,42 @@ class DelegationTest(unittest.TestCase):
             if line.startswith(("import ", "from ")) and "__future__" not in line:
                 self.assertIn(line.split()[1].split(".")[0], ("os", "secrets", "sys", "pathlib"), line)
 
+
+
+class TestExclusiveMode(unittest.TestCase):
+    """`exclusive=True` commits by link: a taken name is refused with nothing replaced
+    and no staging left, so a caller minting per-publish names has one publisher."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name)
+
+    def test_a_free_name_is_published_whole(self):
+        out = result_publish.publish_text(self.dir / "proactive-x.txt", BODY, exclusive=True)
+        self.assertEqual(out.read_text(), BODY)
+        self.assertEqual([p.name for p in self.dir.iterdir()], ["proactive-x.txt"])
+
+    def test_a_taken_name_is_refused_with_nothing_replaced(self):
+        target = self.dir / "proactive-x.txt"
+        target.write_text("first\n")
+        with self.assertRaises(FileExistsError):
+            result_publish.publish_text(target, BODY, exclusive=True)
+        self.assertEqual(target.read_text(), "first\n")
+        self.assertEqual([p.name for p in self.dir.iterdir()], ["proactive-x.txt"], "no staging left")
+
+    def test_default_mode_still_replaces(self):
+        target = self.dir / "task-1.txt"
+        target.write_text("first\n")
+        result_publish.publish_text(target, BODY)
+        self.assertEqual(target.read_text(), BODY)
+
+    def test_vendored_copy_has_the_same_mode(self):
+        vendored = _load_vendored()
+        target = self.dir / "proactive-y.txt"
+        vendored.publish_text(target, BODY, exclusive=True)
+        with self.assertRaises(FileExistsError):
+            vendored.publish_text(target, BODY, exclusive=True)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

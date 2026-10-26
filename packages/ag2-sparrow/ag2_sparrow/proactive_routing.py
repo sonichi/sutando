@@ -126,10 +126,15 @@ def about_task_filename(task_id: str, ts, channel: "str | None" = None) -> str:
 PROACTIVE_OUTBOX_DIRNAME = ".outbox-ag2space-proactive"
 
 
-def proactive_item_id(stem: str, body: str) -> str:
-    """One outbox item per file name and body: a new body under a delivered name is a new send.
-    The room and thread are left out, since they are re-resolved on every pass."""
-    return f"{stem}~{hashlib.sha256(body.encode('utf-8')).hexdigest()[:16]}"
+def proactive_item_id(stem: str, body: str, room: "str | None" = None, thread: "str | None" = None) -> str:
+    """One outbox item per file name, body and the route the file itself names (its `[channel:]` room
+    and `[thread:]` root): a new body, or the same body marked for another room or thread, is a new
+    send. A default room and a task's thread are re-resolved on every pass and are left out, so an
+    unmarked file keeps the original body-only key."""
+    if room is None and thread is None:
+        return f"{stem}~{hashlib.sha256(body.encode('utf-8')).hexdigest()[:16]}"
+    key = json.dumps([body, room, thread], ensure_ascii=False)
+    return f"{stem}~r{hashlib.sha256(key.encode('utf-8')).hexdigest()[:16]}"
 
 
 def about_task(name) -> "str | None":

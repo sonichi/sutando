@@ -113,6 +113,42 @@ def rename_noreplace(src: Path, dst: Path, log: Optional[Log] = None) -> None:
     raise FileExistsError(errno.ENOTSUP, "no no-replace rename on this platform; nothing moved", str(dst))
 
 
+def _probe_renameat() -> "Optional[Callable[[int, bytes, int, bytes], int]]":
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+    except OSError:  # pragma: no cover - no libc to speak of
+        return None
+    if sys.platform == "darwin" and hasattr(libc, "renameatx_np"):  # pragma: no cover - Linux CI
+        fn = libc.renameatx_np
+        fn.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+        fn.restype = ctypes.c_int
+        return lambda sfd, a, dfd, b: fn(sfd, a, dfd, b, 4)                # RENAME_EXCL
+    if sys.platform.startswith("linux") and hasattr(libc, "renameat2"):
+        fn = libc.renameat2
+        fn.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+        fn.restype = ctypes.c_int
+        return lambda sfd, a, dfd, b: fn(sfd, a, dfd, b, 1)                # RENAME_NOREPLACE
+    return None
+
+
+_RENAMEAT = _probe_renameat()
+
+
+def renameat_noreplace(src: str, dst: str, *, src_dir_fd: int, dst_dir_fd: int) -> None:
+    """`rename_noreplace` relative to two directory handles: FileExistsError (EEXIST)
+    when `dst` exists, and FileExistsError (ENOTSUP) with nothing moved when this
+    platform or filesystem has no such primitive."""
+    if _RENAMEAT is not None:
+        if _RENAMEAT(src_dir_fd, os.fsencode(src), dst_dir_fd, os.fsencode(dst)) == 0:
+            return
+        err = ctypes.get_errno()
+        if err == errno.EEXIST:
+            raise FileExistsError(errno.EEXIST, os.strerror(errno.EEXIST), dst)
+        if err not in (errno.ENOSYS, errno.EINVAL, errno.ENOTSUP, getattr(errno, "EOPNOTSUPP", errno.ENOTSUP)):
+            raise OSError(err, os.strerror(err), src)
+    raise FileExistsError(errno.ENOTSUP, "no no-replace rename on this platform; nothing moved", dst)
+
+
 def no_primitive(e: OSError) -> bool:
     """The refusal meant "this platform cannot", not "the name is taken"."""
     return isinstance(e, FileExistsError) and e.errno == errno.ENOTSUP
