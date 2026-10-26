@@ -78,9 +78,11 @@ VERBS = {
     ("issue", "edit"): Spec({"--body", "--title"}, {"--body-file"}, {**_COMMON, "m": "--milestone"}),
     ("issue", "close"): Spec({"--comment"}, (), {"R": "--repo", "c": "--comment", "r": "--reason"}),
     ("release", "create"): Spec({"--notes", "--title"}, {"--notes-file"},
-                                {"R": "--repo", "n": "--notes", "F": "--notes-file", "t": "--title"}),
+                                {"R": "--repo", "n": "--notes", "F": "--notes-file", "t": "--title"},
+                                positional="assets"),
     ("release", "edit"): Spec({"--notes", "--title"}, {"--notes-file"},
                               {"R": "--repo", "n": "--notes", "F": "--notes-file", "t": "--title"}),
+    ("release", "upload"): Spec(set(), (), {"R": "--repo"}, positional="assets"),
     ("pr", "reopen"): Spec({"--comment"}, (), {"R": "--repo", "c": "--comment"}),
     ("issue", "reopen"): Spec({"--comment"}, (), {"R": "--repo", "c": "--comment"}),
     ("label", "create"): Spec({"--description"}, (), {"R": "--repo", "d": "--description", "c": "--color"},
@@ -118,6 +120,7 @@ WRAPPERS = {
 }
 GH_URL = re.compile(r"https://github\.com/([^/\s]+/[^/\s]+)/(?:pull|issues)/\d+")
 API_REPO = re.compile(r"^(?:https://api\.github\.com)?/?repos/([^/\s?]+/[^/\s?]+)(?:/([^/\s?]+))?")
+API_NEW_REPO = re.compile(r"^(?:https://api\.github\.com)?/?(?:user|orgs/[^/\s?]+)/repos/?(?:\?|$)")
 API_GIST = re.compile(r"^(?:https://api\.github\.com)?/?gists(?:/|$|\?)")
 HEREDOC_CAT = re.compile(r"""^"?\$\(\s*cat\s*<<-?\s*(['"]?)[A-Za-z_][A-Za-z0-9_]*\1\s*\)"?$""")
 WHOLE_CAT = re.compile(r"""^"?\$\(\s*(?:cat\s+|<\s*)(['"]?)([^'"\s$`()]+)\1\s*\)"?$""")
@@ -145,6 +148,10 @@ GH_VALUE_LONGS = {"--repo", "--base", "--head", "--label", "--assignee", "--revi
 
 class Unreadable(Exception):
     pass
+
+
+class Unscannable(Unreadable):
+    """A file the shared reader will not read (too large, not UTF-8, not regular, missing)."""
 
 
 class Body:
@@ -285,6 +292,8 @@ class Ctx:
         self.seg_bodies = seg_bodies
         self.own = []
         self.raw_seg = []
+        self.dirs = []
+        self.oldpwd = None
         self.assigns = {}
         self.exported = {}
         self.maybe = {}
@@ -329,7 +338,7 @@ def _read_file(word, ctx, label):
     try:
         return [_body_file.read_body_file(str(path))]
     except SystemExit as e:
-        raise Unreadable(f"cannot read {label} `{text}`: {str(e.code).replace('ERROR: ', '')}")
+        raise Unscannable(f"cannot read {label} `{text}`: {str(e.code).replace('ERROR: ', '')}")
 
 
 def _stdin_sources(ctx, label):
@@ -542,7 +551,7 @@ def _gh_action(seg, ctx):
         return None
     visibility = [v.text.lower() for n, v in values if n == "--visibility" and v is not None]
     repo = "" if words[0] == "gist" else None
-    texts, first = [], True
+    texts, first, url_repo = [], True, None
     for name, val in values:
         if name == "--repo":
             repo = _literal_or_raise(_need(name, val))
@@ -562,14 +571,33 @@ def _gh_action(seg, ctx):
                 texts += _read_file(w, ctx, "file")
             first = False
             continue
+        if spec.positional == "assets":
+            if not first:
+                texts += _asset_text(w, ctx)
+            first = False
+            continue
         m = GH_URL.search(w.text)
-        if m and not repo:
-            repo = m.group(1)
+        if m and not url_repo:
+            url_repo = m.group(1)
         elif words[0] == "repo" and repo is None and w.text.count("/") == 1 and "{" not in w.text:
             repo = w.text
     public = "public" in visibility or (words == ["repo", "create"] and on("--public"))
-    return _with_env_repo(repo, f"gh {words[0]} {words[1]}", texts, ctx,
-                          public=public, invalidate=bool(visibility))
+    label = f"gh {words[0]} {words[1]}"
+    if url_repo:
+        # gh posts to the URL's repo whatever --repo says; a disagreeing --repo is scanned too.
+        also = [repo] if repo and repo.lower() != url_repo.lower() else []
+        return Act(url_repo, label, texts, ctx.cwd, also=also, public=public, invalidate=bool(visibility))
+    return _with_env_repo(repo, label, texts, ctx, public=public, invalidate=bool(visibility))
+
+
+def _asset_text(word, ctx):
+    """A release asset's text when it is a readable text file; a binary or oversized
+    asset cannot be scanned and is let through (listed under Not covered)."""
+    text = _literal_or_raise(word).split("#", 1)[0]
+    try:
+        return _read_file(_shell_scan.Word(raw=text, text=text), ctx, "release asset")
+    except Unscannable:
+        return []
 
 
 def _with_env_repo(repo, label, texts, ctx, **kw):
@@ -599,9 +627,12 @@ def _api_action(args, ctx):
             raw_value = val.raw.split("=", 1)[1] if "=" in val.raw else value
             if name == "--field" and value.startswith("@"):
                 target = value[1:]
-                texts += _read_file(_shell_scan.Word(raw=target, text=target), ctx, f"field {key}")
+                got = _read_file(_shell_scan.Word(raw=target, text=target), ctx, f"field {key}")
             else:
-                texts.append(_literal_or_raise(_shell_scan.Word(raw=raw_value, text=value, quoted=val.quoted)))
+                got = [_literal_or_raise(_shell_scan.Word(raw=raw_value, text=value, quoted=val.quoted))]
+            texts += got
+            if key == "content":
+                texts += [d for d in map(_base64_text, got) if d]
         elif name == "--input":
             fields = True
             texts += _read_file(_need(name, val), ctx, "--input")
@@ -618,11 +649,24 @@ def _api_action(args, ctx):
         public = m.group(2) is None and (kv.get("private") == "false" or kv.get("visibility") == "public")
         return _with_env_repo(target or repo, f"gh api {method} {m.group(2) or 'repo'}", texts, ctx,
                               public=public, invalidate=changes)
+    if API_NEW_REPO.match(endpoint) and method == "POST":
+        if kv.get("private") == "true" or kv.get("visibility") in ("private", "internal"):
+            return None
+        return Act("", f"gh api {method} new repo", texts, ctx.cwd, public=True)
     if API_GIST.match(endpoint):
         return Act("", f"gh api {method} gists", texts, ctx.cwd)
     if endpoint.strip("/") == "graphql" and any("mutation" in t for t in texts):
         return Act("", "gh api graphql mutation", texts, ctx.cwd)
     return None
+
+
+def _base64_text(value):
+    import base64
+    import binascii
+    try:
+        return base64.b64decode("".join(value.split()), validate=True).decode("utf-8")
+    except (binascii.Error, ValueError):
+        return ""
 
 
 def _non_flags(seg):
@@ -739,7 +783,7 @@ def _shell_scripts(seg, own, ctx):
             try:
                 _literal_or_raise(w)
             except Unreadable:
-                if GH_WRITE_HINT.search(ctx.command):
+                if GH_WRITE_HINT.search(_unquoted(ctx.command)):
                     raise Unreadable("a shell or eval runs a command string that expands at run time, "
                                      "so a gh write in it cannot be checked")
             scripts.append(w.text)
@@ -747,6 +791,66 @@ def _shell_scripts(seg, own, ctx):
     if stdin or not positional or positional[0].text == "-":
         return _stdin_sources(ctx, "a shell's stdin script") or list(ctx.bodies)
     return []
+
+
+# Programs that run a command whose arguments are built at run time: gh under them is refused.
+RUNNERS = {"xargs", "parallel", "sem", "rush", "watch", "script", "find", "flock", "su", "runuser",
+           "ssh", "entr", "tmux", "screen", "chroot", "nsenter", "dbus-run-session", "fswatch"}
+
+
+def _unquoted(text):
+    return re.sub(r"[\"'\\]", "", text)
+
+
+def _runs_gh_write(texts):
+    """Does this runner's argv (or a command string in it) start a gh write or gh api?"""
+    tokens = [t for t in re.split(r"[\s;&|()]+", _unquoted(" ".join(texts))) if t]
+    for i, t in enumerate(tokens):
+        if os.path.basename(t).lower() != "gh":
+            continue
+        words, j = [], i + 1
+        while j < len(tokens) and len(words) < 2:
+            if tokens[j].startswith("-"):
+                j += 2 if tokens[j] in REPO_FLAGS else 1
+                continue
+            words.append(tokens[j])
+            j += 1
+            if words[0] == "api":
+                break
+        if words[:1] == ["api"] or tuple(words) in VERBS:
+            return True
+    return False
+
+
+def _env_split(raw_seg):
+    return any(w.basename_is("env") for w in raw_seg) and any(
+        w.text.startswith(("-S", "--split-string")) for w in raw_seg[1:])
+
+
+def _refuse_runner(prog):
+    raise Unreadable(f"gh runs under `{prog}`, which builds its arguments at run time where "
+                     "this guard cannot see them; run gh directly")
+
+
+def _change_dir(ctx, prog, args):
+    """The cwd after cd/pushd/popd, or None when it cannot be known."""
+    args = [a for a in args if a not in ("-L", "-P", "-q", "--")]
+    if prog == "popd":
+        return ctx.dirs.pop() if ctx.dirs and not args else None
+    target = args[0] if args else ("~" if prog == "cd" else None)
+    if target is None or target.startswith(("+", "-")) and target != "-" or "$" in target or "`" in target:
+        return None
+    if target == "-":
+        target = ctx.oldpwd
+        if target is None:
+            return None
+    elif ctx.cwd is None and not target.startswith(("/", "~")):
+        return None
+    new = str(_resolve(target, ctx.cwd or "/"))
+    if prog == "pushd":
+        ctx.dirs.append(ctx.cwd)
+    ctx.oldpwd = ctx.cwd
+    return new
 
 
 GH_REPO_ANYWHERE = re.compile(r"""\bGH_REPO=(['"]?)([^'"\s;&|)]*)\1""")
@@ -758,11 +862,14 @@ def actions(command: str, cwd, depth: int = 0, inherited=None):
     stripped, bodies = split_heredocs(command)
     segments = _shell_scan.segments(stripped)
     if not segments and stripped.strip():
-        if GH_WRITE_HINT.search(command):
+        if GH_WRITE_HINT.search(_unquoted(command)):
             raise Unreadable("the command does not parse as shell")
         return []
     seg_bodies = _assign_bodies(segments, bodies)
     all_bodies = bodies + [b for own in seg_bodies for b in own if b not in bodies]
+    if cwd is not None and re.search(r"\b(?:cd|pushd|popd)\b", stripped) and \
+            any(w.is_operator and w.text == "(" for w in _shell_scan.words(stripped)):
+        cwd = None
     ctx = Ctx(cwd, all_bodies, segments, seg_bodies, command)
     if inherited:
         ctx.exported = dict(inherited[0])
@@ -783,6 +890,8 @@ def actions(command: str, cwd, depth: int = 0, inherited=None):
                 found += actions(text, cwd, depth + 1, sub_env)
     for idx, seg in enumerate(segments):
         ctx.raw_seg = seg
+        if _env_split(seg) and _runs_gh_write([w.text for w in seg[1:]]):
+            _refuse_runner("env -S")
         seg, ctx.assigns = _strip_prefix(seg)
         ctx.own = seg_bodies[idx]
         if not seg:
@@ -797,11 +906,12 @@ def actions(command: str, cwd, depth: int = 0, inherited=None):
                     name, value = _assignment(w)
                     ctx.exported[name] = value
             continue
-        if seg[0].basename_is("cd"):
-            target = seg[1].text if len(seg) > 1 else os.path.expanduser("~")
-            ctx.cwd = None if ("$" in target or ctx.cwd is None and not target.startswith(("/", "~"))) \
-                else str(_resolve(target, ctx.cwd or "/"))
+        prog = os.path.basename(seg[0].text)
+        if prog in ("cd", "pushd", "popd"):
+            ctx.cwd = _change_dir(ctx, prog, [w.text for w in seg[1:]])
             continue
+        if prog in RUNNERS and _runs_gh_write([w.text for w in seg[1:]]):
+            _refuse_runner(prog)
         if _named(seg[0], SHELLS | {"eval"}):
             if depth >= 3:
                 continue
@@ -830,7 +940,7 @@ def actions(command: str, cwd, depth: int = 0, inherited=None):
 
 def decide(command: str, cwd, workspace: Path, lookup=None, remote=None):
     """None to allow, or the refusal text."""
-    if not isinstance(command, str) or not GH_WRITE_HINT.search(command):
+    if not isinstance(command, str) or not GH_WRITE_HINT.search(_unquoted(command)):
         return None
     _load_modules()
     try:
@@ -898,7 +1008,7 @@ def _deny(reason):
 
 def main(argv):
     raw = sys.stdin.read()
-    if "gh" not in raw.lower():
+    if "gh" not in _unquoted(raw).lower():
         return 0
     import json
     try:
@@ -906,7 +1016,7 @@ def main(argv):
         if not isinstance(payload, dict):
             raise ValueError("payload is not an object")
     except ValueError:
-        if GH_WRITE_HINT.search(raw):
+        if GH_WRITE_HINT.search(_unquoted(raw)):
             _deny(f"PUBLIC-WRITE PRIVACY GATE: refused — the hook input is not valid JSON, so a "
                   f"possible gh write cannot be checked. {TAG}")
         return 0
@@ -915,7 +1025,7 @@ def main(argv):
         if payload.get("tool_name") != "Bash":
             return 0
         command = (payload.get("tool_input") or {}).get("command") or ""
-        if not isinstance(command, str) or not GH_WRITE_HINT.search(command):
+        if not isinstance(command, str) or not GH_WRITE_HINT.search(_unquoted(command)):
             return 0
         _load_modules()
         workspace = Path(argv[argv.index("--workspace") + 1]) if "--workspace" in argv \

@@ -599,6 +599,107 @@ class FourthReviewFindings(RealHookThenBash):
         self.assertIsNone(self.hook(f"GH_REPO=o/priv bash -c \"{b}\""))
 
 
+class FifthReviewFindings(RealHookThenBash):
+    """URL targets over --repo, pushd/popd, command runners, de-quoted gh, API repo
+    creation, release assets, base64 contents, and the launch-log warning."""
+
+    def allowed(self, cmd):
+        self.assertIsNone(self.hook(cmd), cmd)
+
+    def test_a_url_target_beats_repo_flag(self):
+        for cmd in (f"gh pr comment https://github.com/o/r/pull/1 -R o/priv -b {TERM}",
+                    f"gh issue comment https://github.com/o/r/issues/1 --repo o/priv -b {TERM}",
+                    f"gh pr comment -R o/r https://github.com/o/priv/pull/1 -b {TERM}"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        self.allowed(f"gh pr comment https://github.com/o/priv/pull/1 -R o/priv -b {TERM}")
+        self.allowed(f"gh pr comment https://github.com/o/priv/pull/1 -b {TERM}")
+
+    def test_directory_stack_is_tracked(self):
+        (self.cwd / "sub").mkdir()
+        (self.cwd / "sub" / "body.md").write_text(f"see {TERM}\n")
+        for cmd in ("pushd sub >/dev/null && gh pr comment 1 -R o/r -F body.md",
+                    "cd sub; gh pr comment 1 -R o/r -F body.md",
+                    "pushd sub >/dev/null; pushd .. >/dev/null; popd >/dev/null; gh pr comment 1 -R o/r -F body.md",
+                    "pushd +1 >/dev/null; gh pr comment 1 -R o/r -F body.md",
+                    "(cd sub) && gh pr comment 1 -R o/r -F body.md"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        self.assertAllowedClean("pushd sub >/dev/null && popd >/dev/null && gh pr comment 1 -R o/r -F body.md")
+        self.assertAllowedClean("cd sub && cd - >/dev/null && gh pr comment 1 -R o/r -F body.md")
+        self.assertAllowedClean(f"pushd sub >/dev/null && gh pr comment 1 -R o/r -F {self.cwd / 'body.md'}")
+
+    def test_gh_under_a_command_runner_is_refused(self):
+        for cmd in (f"echo 1 | xargs gh pr comment -R o/r -b {TERM}",
+                    f"echo 1 | GH_REPO=o/r xargs gh pr comment -b {TERM}",
+                    "echo 1 | xargs -I{} gh pr comment {} -R o/r -b clean",
+                    r"find . -name dirty.md -exec gh pr comment 1 -R o/r -F {} \;",
+                    f"parallel gh pr comment {{}} -R o/r -b {TERM} ::: 1",
+                    f"watch -n 1 gh pr comment 1 -R o/r -b {TERM}",
+                    f"script -q /dev/null -c \"gh pr comment 1 -R o/r -b {TERM}\"",
+                    f"env -S \"gh pr comment 1 -R o/r -b {TERM}\"",
+                    "echo x | xargs gh api repos/o/r/issues -f body=x"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd, "runs under")
+        for cmd in ("echo 5 | xargs gh pr view -R o/r", "watch -n 30 gh pr checks 5 -R o/r",
+                    "find . -name 'gh-pr*'"):
+            with self.subTest(cmd=cmd):
+                self.allowed(cmd)
+
+    def test_quoting_cannot_hide_gh(self):
+        for cmd in (f"g''h pr comment 1 -R o/r -b {TERM}", f"g\\h pr comment 1 -R o/r -b {TERM}",
+                    f"gh p''r comment 1 -R o/r -b {TERM}", f"\"gh\" \"pr\" comment 1 -R o/r -b {TERM}"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+
+    def test_api_repo_creation(self):
+        for cmd in (f"gh api user/repos -f name=x -f description='see {TERM}'",
+                    f"gh api -X POST /orgs/o/repos -f name=x -f description={TERM}",
+                    f"gh api orgs/o/repos -f name=x -F private=false -f description={TERM}"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        self.allowed(f"gh api user/repos -f name=x -F private=true -f description={TERM}")
+        self.allowed(f"gh api orgs/o/repos -f name=x -f visibility=internal -f description={TERM}")
+
+    def test_release_asset_text_is_scanned(self):
+        (self.cwd / "notes.txt").write_text(f"see {TERM}\n")
+        (self.cwd / "ok.txt").write_text("clean\n")
+        (self.cwd / "app.bin").write_bytes(b"\x00\xff\xfe binary")
+        for cmd in ("gh release create v1 -R o/r notes.txt", "gh release create v1 ok.txt notes.txt -R o/r",
+                    "gh release upload v1 -R o/r 'notes.txt#Release notes'"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        self.allowed("gh release create v1 -R o/r ok.txt app.bin -n clean")
+        self.allowed("gh release upload v1 -R o/r ok.txt")
+
+    def test_base64_contents_are_decoded(self):
+        import base64
+        dirty = base64.b64encode(f"see {TERM}\n".encode()).decode()
+        clean = base64.b64encode(b"nothing private\n").decode()
+        (self.cwd / "c.b64").write_text(dirty)
+        for cmd in (f"gh api -X PUT repos/o/r/contents/x.md -f message=add -f content={dirty}",
+                    "gh api -X PUT repos/o/r/contents/x.md -f message=add -F content=@c.b64"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        self.allowed(f"gh api -X PUT repos/o/r/contents/x.md -f message=add -f content={clean}")
+
+    def test_the_launch_log_names_the_seeder_until_seeded(self):
+        launcher = REPO / "src" / "agent" / "claude" / "cli" / "session-launch.sh"
+        ws = self.tmp / "unseeded"
+
+        def warn():
+            r = subprocess.run(["bash", "-c", 'REPO="$1"; . "$2"; warn_unseeded_public_denylist "$3"', "_",
+                                str(REPO), str(launcher), str(ws)], capture_output=True, text=True, timeout=60)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            return r.stderr
+        self.assertIn("seed-public-denylist.py", warn())
+        target = policy.privacy_dir(ws) / policy.DENYLIST_NAME
+        target.parent.mkdir(parents=True)
+        target.write_text("# seeded\n")
+        self.assertEqual(warn(), "")
+        self.assertIn("warn_unseeded_public_denylist\n", launcher.read_text())
+
+
 class Patterns(unittest.TestCase):
     def test_mixed_case_mxid(self):
         self.assertTrue(policy.scan("ping @Zq-Agent:matrix.zq.chat", []))

@@ -570,10 +570,13 @@ GitHub's edit history kept the first version after the fix. This moves the check
 command itself.
 
 - **Writes covered:** `gh pr create|edit|comment|review|merge|close|reopen`,
-  `gh issue create|comment|edit|close|reopen`, `gh release create|edit`,
+  `gh issue create|comment|edit|close|reopen`, `gh release create|edit|upload` (text assets
+  included),
   `gh label create|edit` (name and description), `gh gist create --public`, `gh gist edit`,
   `gh repo create --public|edit`, and `gh api` POST/PATCH/PUT to any `repos/<o>/<r>/…`
-  endpoint (issues, pulls, releases, commit comments, …), `gists`, or a GraphQL mutation.
+  endpoint (issues, pulls, releases, commit comments, base64 `content` decoded, …), a new
+  repo via `user/repos` or `orgs/<o>/repos` unless it is created private or internal, `gists`,
+  or a GraphQL mutation.
   `gh api` is recognised by the first non-flag word after `gh`.
 - **Text read:** title/body/notes/comment/subject/description flags in every pflag form
   (`--body x`, `--body=x`, `-bx`, `-b=x`, clusters such as `-dtx`), their `-file` forms, a
@@ -587,7 +590,8 @@ command itself.
   keywords (`if`/`then`/`do`/`{`/`!`, …), inside `` `…` `` and `$(…)` (also within double
   quotes and unquoted heredocs), in `bash -c` / `eval` strings, and in a script fed to a
   shell on stdin (`bash <<'EOF'`, `bash <<< …`, `cat <<'EOF' | bash`).
-- **Repo:** `--repo`, a PR/issue URL, an `o/r` argument to `gh repo`, else `GH_REPO`
+- **Repo:** a PR/issue URL (gh posts there whatever `--repo` says; a disagreeing `--repo` is
+  scanned too), `--repo`, an `o/r` argument to `gh repo`, else `GH_REPO`
   (inline, via `env`, `export`/`unset` earlier in the command, or the session's environment,
   carried into `bash -c`, `sh -c`, `eval`, shell stdin scripts and substitutions),
   else the cwd's git remote the way gh picks it (the gh-resolved remote, then upstream,
@@ -616,6 +620,16 @@ command itself.
   `gh repo edit --visibility public`, `gh api` PATCH `repos/o/r` with `private=false` or
   `visibility=public`) is judged as public whatever the lookup says, and any visibility
   change drops that repo's cached answer.
+- **Directories:** `cd`, `cd -`, `pushd` and `popd` are tracked for relative body files.
+  After a `pushd +N`, a `cd "$X"`, or any directory change on a line with a subshell or
+  substitution, the cwd is unknown and a relative body file is refused.
+- **Command runners refused:** a gh write or `gh api` started by `xargs`, `parallel`, `sem`,
+  `rush`, `watch`, `script`, `find -exec`, `flock`, `su`, `runuser`, `ssh`, `entr`, `tmux`,
+  `screen`, `chroot`, `nsenter`, `dbus-run-session`, `fswatch` or `env -S` is refused: the
+  runner builds gh's arguments at run time, where this guard cannot see them. gh reads under
+  a runner (`watch gh pr checks`) pass.
+- **Quoting** cannot hide gh: the precheck runs on the command with quotes and backslashes
+  removed (`g''h`, `g\h`, `gh p''r`).
 - **Body files** are read through `src/body_file.py`, the shared bounded reader: over
   65,536 bytes, not a regular file (FIFO, device) or not UTF-8 is refused.
 - **Fails closed:** a body file that does not exist, stdin that is not the gh command's
@@ -644,11 +658,14 @@ launch.
 - `git push` / commit messages, and `gh pr create --fill` text;
 - a write made by a script the command runs (`python3 post.py`, `bash post.sh`), or a body
   file written by a program that does not name it on its command line;
-- `xargs`-style indirection, and text piped into a shell from anything but a heredoc;
+- text piped into a shell from anything but a heredoc, or gh started by a runner not listed
+  above;
 - gh aliases (`gh alias set`), and gh reached through a variable or function (`$GH pr …`,
   `"${cmd[@]}"`);
 - text split so no single span matches (a zero-width character inside a name, a name
   assembled from parts at run time), and `env -S` / `watch` command strings;
-- a secret (non-`--public`) gist, which anyone with its URL can still read.
+- a secret (non-`--public`) gist, which anyone with its URL can still read;
+- a release asset that is binary or over 65,536 bytes, which cannot be scanned as text;
+- gh named through ANSI-C quoting (`$'\x67h'`).
 
 Tests: `python3 tests/public-write-privacy-guard.test.py`
