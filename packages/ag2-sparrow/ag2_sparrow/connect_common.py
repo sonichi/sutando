@@ -489,19 +489,23 @@ def stop_command(shape: Shape) -> str:
     return f"systemctl --user stop {shape.service_name}"
 
 
-def start_supervisor(shape: Shape) -> str:
-    """Register and start the unit on disk: '' when the manager accepted, else why not. Never readiness."""
+def start_supervisor(shape: Shape, restart: bool = True) -> str:
+    """Register and start the unit on disk: '' when the manager accepted, else why not. Never readiness.
+    restart=False only starts it if inactive (systemd `start`; launchd's bootstrap of a loaded job is a no-op)."""
     path = supervisor_path(shape)
     if is_macos():
         log_path(shape).parent.mkdir(parents=True, exist_ok=True)
         r = _sm._run(["launchctl", "bootstrap", _launchd_target(), str(path)], shape.manager_timeout_s)
-        return "" if _ok(r) else f"launchctl bootstrap failed ({_why(r)})"
+        return "" if _ok(r) or (not restart and agent_loaded(shape) == "active") else \
+            f"launchctl bootstrap failed ({_why(r)})"
     if not _sm.systemd_user_available():
         return "systemctl --user is not available here"
     unit, bound = shape.service_name, shape.manager_timeout_s
     for verb, run in (("daemon-reload", lambda: _sm._systemctl(("--user", "daemon-reload"), timeout=bound)),
                       (f"enable {unit}", lambda: _sm._systemctl(("--user", "enable"), unit=unit, timeout=bound)),
-                      (f"restart {unit}", lambda: _sm._systemctl(("--user", "restart"), unit=unit, timeout=bound))):
+                      (f"restart {unit}", lambda: _sm._systemctl(("--user", "restart"), unit=unit, timeout=bound))
+                      if restart else
+                      (f"start {unit}", lambda: _sm._systemctl(("--user", "start"), unit=unit, timeout=bound))):
         r = run()
         if not _ok(r):
             return f"systemctl --user {verb} failed ({_why(r)})"
@@ -678,11 +682,13 @@ def install(shape: Shape, values: dict, root: str, revise=None, precheck=None, h
     so a value that may only change over a quiescent root (a session id) is decided there.
     `precheck(root) -> problem` is the launcher's own refusal of the root, asked before anything moves.
     `holder(root, record)` names who holds the root in the closing line, in the shape's own words.
-    `root_id`, connect's identity of the root it wrote the seat for: install applies nothing unless `root`
-    still names it, and stops its own new job if the launcher it started does not hold that directory."""
+    `root_id`, connect's identity of the root it wrote the seat for, makes it connect's install
+    (_connect_install_locked), which never stops, disables or restarts a job."""
     try:
         with operation_lock(shape):
-            return _install_locked(shape, values, root, revise, precheck, holder, root_id)
+            if root_id is not None:
+                return _connect_install_locked(shape, values, root, revise, precheck, holder, root_id)
+            return _install_locked(shape, values, root, revise, precheck, holder)
     except Busy as e:
         return _refuse(str(e))
 
@@ -736,6 +742,22 @@ def _free_root_problem(root: str) -> str:
     return "" if state == "free" else f"{root} is {holder_line(root)}; stop what holds it, then connect again"
 
 
+def stop_started(shape: Shape, root: str) -> str:
+    """'' once the job connect's install started is stopped after `root` was replaced under it: only while
+    nothing holds the directory now at `root` (the job holds the one it started on), checked again after;
+    else why it was left, with the command that stops it."""
+    by_hand = f"stop it by hand ({stop_command(shape)})"
+    if lock_held(root) != "free":
+        return f"{job_name(shape)} was left running because {root} is now {holder_line(root)}: {by_hand}"
+    problem = stop_supervisor(shape)
+    if problem:
+        return f"{job_name(shape)} could not be stopped ({problem}): {by_hand}"
+    print(f"stopped: {job_name(shape)} (the job this connect started)")
+    if lock_held(root) != "free":
+        return f"{job_name(shape)} was stopped, but {root} is now {holder_line(root)}"
+    return ""
+
+
 def dir_identity(path) -> "tuple | None":
     """(st_dev, st_ino) of the directory `path` names (a link is not followed), else None."""
     try:
@@ -781,8 +803,7 @@ def _managed_here(shape: Shape, root: str) -> str:
     return ""
 
 
-def _install_locked(shape: Shape, values: dict, root: str, revise=None, precheck=None, holder=None,
-                    root_id=None) -> int:
+def _install_locked(shape: Shape, values: dict, root: str, revise=None, precheck=None, holder=None) -> int:
     """A quiescent replacement: both files owned, the same root as before, no orphan on it, the job
     stopped and absent, the root free; only then the files, the start, and the fresh holder."""
     conf, sup, marker = config_path(shape), supervisor_path(shape), supervisor_marker(shape)
@@ -814,9 +835,6 @@ def _install_locked(shape: Shape, values: dict, root: str, revise=None, precheck
     problem = _await_free(root)
     if problem:
         return _refuse(f"{problem} after the stop; nothing was applied")
-    if root_id is not None and dir_identity(root) != root_id:
-        return _refuse(f"{root} is no longer the directory connect wrote the seat for (it was replaced); nothing "
-                       "was applied")
     if revise is not None:
         values = revise(old, values)
     for key in ("INBOX_DIR", "RESULTS_DIR"):
@@ -830,7 +848,68 @@ def _install_locked(shape: Shape, values: dict, root: str, revise=None, precheck
         return _refuse(f"{problem}; the managed launcher did not acquire {root}; run {shape.command} uninstall, "
                        f"then {shape.command} install")
     rec = _fresh_holder(shape, root, before)
-    if root_id is not None and (rec is None or dir_identity(root) != root_id):
+    if rec is None:
+        return _refuse(f"the managed launcher did not acquire {root} within {CONFIRM_TIMEOUT_S:.0f} s ({holder_line(root)}); "
+                       f"its refusal is in {launcher_log(shape)}; run {shape.command} uninstall, then {shape.command} install")
+    linger(shape)
+    print(f"the managed launcher acquired the expected root: {root} "
+          f"({holder(root, rec) if holder is not None else 'launcher pid %s' % rec['pid']})")
+    return 0
+
+
+def _connect_install_locked(shape: Shape, values: dict, root: str, revise, precheck, holder, root_id) -> int:
+    """connect's install: it never stops, disables or restarts a job. It refuses, touching nothing, while
+    the job runs (one that started after the seat was written already has the new seat), when the root is
+    no longer `root_id` or is held, and when its config or unit exists with other bytes than it would write
+    (changing a definition is install's, not connect's); it writes only what is absent, starts the job only
+    if inactive, and stops only the job it started if that launcher holds another directory."""
+    conf, sup, marker = config_path(shape), supervisor_path(shape), supervisor_marker(shape)
+    old, problem = owned_config(shape)
+    if problem:
+        return _refuse(problem)
+    old = old or {}
+    _text, problem = owned_text(sup, marker, "supervisor file")
+    if problem:
+        return _refuse(problem)
+    if old.get("ROOT") and old["ROOT"] != root:
+        return _refuse(f"the work root is {old['ROOT']}, not {root}; run {shape.command} uninstall, then "
+                       f"{shape.command} install")
+    problem = precheck(root) if precheck is not None else ""
+    if problem:
+        return _refuse(f"{problem}; nothing was applied")
+    unit, problem = render_supervisor(shape)
+    if problem:
+        return _refuse(problem)
+    state = manager_state(shape)
+    if state in ("active", "unknown"):
+        return _refuse(f"{job_name(shape)} is {'running' if state == 'active' else 'in a state that cannot be read'}"
+                       " (it started after the seat was written); connect stops nothing, so a running job keeps "
+                       "the seat it has read; nothing was applied")
+    if dir_identity(root) != root_id:
+        return _refuse(f"{root} is no longer the directory connect wrote the seat for (it was replaced); nothing "
+                       "was applied")
+    if lock_held(root) != "free":
+        return _refuse(f"{root} is {holder_line(root)}; nothing was applied")
+    if revise is not None:
+        values = revise(old, values)
+    files = ((conf, render_config(shape, dict(values, ROOT=root)), 0o600), (sup, unit, 0o644))
+    for path, text, _mode in files:
+        now, problem = file_text(path, "file")
+        if problem or (now is not None and now != text):
+            return _refuse(problem or f"{path} differs from what connect would write; connect changes no job's "
+                           f"definition: run {shape.command} install to change it; nothing was applied")
+    for key in ("INBOX_DIR", "RESULTS_DIR"):
+        Path(values[key]).mkdir(parents=True, exist_ok=True)
+    for path, text, mode in files:
+        if not path.exists():
+            _write(path, text, mode)
+            print(f"installed: {path}")
+    before = lock_holder(root)
+    problem = start_supervisor(shape, restart=False)
+    if problem:
+        return _refuse(f"{problem}; the managed launcher did not acquire {root}")
+    rec = _fresh_holder(shape, root, before)
+    if rec is not None and dir_identity(root) != root_id:
         problem = stop_supervisor(shape)
         return _refuse(f"the launcher did not hold {root} as the directory connect wrote the seat for (it was "
                        f"replaced while the job started); "
@@ -838,7 +917,7 @@ def _install_locked(shape: Shape, values: dict, root: str, revise=None, precheck
                           f"{job_name(shape)} was stopped and nothing serves {root}"))
     if rec is None:
         return _refuse(f"the managed launcher did not acquire {root} within {CONFIRM_TIMEOUT_S:.0f} s ({holder_line(root)}); "
-                       f"its refusal is in {launcher_log(shape)}; run {shape.command} uninstall, then {shape.command} install")
+                       f"its refusal is in {launcher_log(shape)}")
     linger(shape)
     print(f"the managed launcher acquired the expected root: {root} "
           f"({holder(root, rec) if holder is not None else 'launcher pid %s' % rec['pid']})")

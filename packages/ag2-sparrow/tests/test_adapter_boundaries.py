@@ -123,10 +123,10 @@ BRIDGE_CALLS = {"seat_bridge_environ", "write_bridge_declaration", "remove_bridg
                 "read_code", "relay_problem", "code_problem"}
 BRIDGE_ENV_KEYS = {"AGENT_CONNECT_TASK_DIR", "AGENT_CONNECT_RESULT_DIR", "AGENT_CONNECT_STATE_DIR", "AG2_DEVICE_ENV",
                    "REMOTE_TASK_SEAT", "REMOTE_TASK_TOKEN_FILE", "AGENT_MXID"}
-BRIDGE_DELEGATES = {"adapters/claude_code/cli.py": ("cb.wire_bridge(", "cb.unwire_bridge(", "cb.redeem_into_seat(",
+BRIDGE_DELEGATES = {"adapters/claude_code/cli.py": ("cb.wire_bridge(", "cb.wire_bridge_bound(", "cb.unwire_bridge(", "cb.redeem_into_seat(",
                                                     "cb.host_problem(", "cb.agent_root("),
                     "adapters/claude_code/shape.py": ("bridge_shape(LOCAL)",),
-                    "adapters/codex/connect_cli.py": ("cb.wire_bridge(", "cb.unwire_bridge(", "cb.redeem_into_seat(",
+                    "adapters/codex/connect_cli.py": ("cb.wire_bridge_bound(", "cb.unwire_bridge(", "cb.redeem_into_seat(",
                                                       "cb.host_problem(", "cb.agent_root(", "cb.bridge_shape(LOCAL)")}
 
 

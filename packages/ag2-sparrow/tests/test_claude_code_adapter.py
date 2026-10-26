@@ -45,7 +45,7 @@ sys.path.insert(0, str(PKG))
 from ag2_sparrow.local_task_protocol import parse_task_headers  # noqa: E402
 from ag2_sparrow.team_result_guard import resolve_access_tier  # noqa: E402
 
-from ag2_sparrow import task_io  # noqa: E402
+from ag2_sparrow import connect_bridge as cb, task_io  # noqa: E402
 from ag2_sparrow import gateway_credential_sources as _sources  # noqa: E402
 
 ADAPTER = PKG / "adapters" / "claude-code"
@@ -372,7 +372,7 @@ def SHOWING(**words):
     return lambda cmd: (0, "".join(words[k] + "\n" for k in cmd[cmd.index("-p") + 1].split(",")), "")
 
 
-START_VERBS = ("restart", "bootstrap", "kickstart")
+START_VERBS = ("restart", "start", "bootstrap", "kickstart")
 STOP_VERBS = ("stop", "bootout")
 
 
@@ -487,7 +487,7 @@ class Runner:
         if rc == 0 and verb == "bootout":
             self.registered = False
         if self.root and rc == 0:
-            if verb in START_VERBS:
+            if verb in START_VERBS and not (verb == "start" and self.session):     # start is a no-op when active
                 self.start_session()
             elif verb in STOP_VERBS:
                 self.end_session_later() if self.stop_delay else self.stop_session()
@@ -2738,10 +2738,105 @@ class ConnectCode(AgentRootBase):
             rc, out, err = self.connect(Backend(), fake)
         self.assertEqual(rc, cli.EXIT_UNUSABLE, out + err)
         self.assertIn("its bridge is not: ag2-sparrow was not found beside", err)
-        starts = [c for c in fake.runner.calls[before:] if fake.runner.verb(c) in ("restart", "bootstrap", "kickstart")]
+        starts = [c for c in fake.runner.calls[before:] if fake.runner.verb(c) in START_VERBS]
         self.assertEqual(len(starts), 1, "install started the job once; nothing started it again")
         self.assertNotIn("started again", out)
         self.assert_job_runs(fake)
+
+    def test_a_job_started_after_the_seat_write_is_left_running_and_connect_refuses(self):
+        fake = self.running_job()
+        fake.runner.stop_session()
+        rotated = Backend(answer={"relay_url": RELAY, "bearer": "rotated-bearer-OOOO5555", "agent_id": AGENT})
+        real, raced = cm.install, []
+
+        def started_then_installed(*a, **kw):
+            fake.runner.start_session()          # the manager, sparrowd or the owner starts it in the hand-off
+            raced.append((fake.runner.pid(), len(fake.runner.calls)))
+            return real(*a, **kw)
+        with mock.patch.object(cm, "install", side_effect=started_then_installed):
+            rc, out, err = self.connect(rotated, fake)
+        pid, mark = raced[0]
+        self.assertNotEqual(rc, 0, out + err)
+        self.assertEqual(fake.runner.pid(), pid, "the raced launcher is the one still running")
+        self.assert_job_runs(fake, pid)
+        verbs = [fake.runner.verb(c) for c in fake.runner.calls[mark:]]
+        self.assertFalse(set(verbs) & {"stop", "disable", "restart", "bootout", "kickstart", "start", "bootstrap"},
+                         verbs)
+        self.assertNotIn("stopped:", out)
+        self.assertIn("connect stops nothing, so a running job keeps the seat it has read", err)
+        self.assertEqual(len(rotated.calls), 1)
+        self.assertEqual((self.seat() / "token").read_text(), f"{RELAY}|rotated-bearer-OOOO5555\n")
+        self.assertIn("the code is spent and its credential is in the seat", err)
+
+    def test_a_job_started_between_connects_check_and_its_start_is_kept_not_restarted(self):
+        fake = self.running_job()
+        fake.runner.stop_session()
+        real, raced = cm.start_supervisor, []
+
+        def raced_then_started(shape, **kw):
+            if shape is L and not raced:
+                fake.runner.start_session()
+                raced.append(fake.runner.pid())
+            return real(shape, **kw)
+        with mock.patch.object(cm, "start_supervisor", side_effect=raced_then_started):
+            rc, out, err = self.connect(Backend(), fake)
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(fake.runner.pid(), raced[0], "the job that raced in is the one running, never restarted")
+        self.assertNotIn("stopped:", out)
+
+    def replace_root_now(self):
+        os.rename(self.root, str(self.root) + ".parked")
+        os.mkdir(self.root)
+
+    def test_a_root_replaced_after_install_and_before_the_bridge_is_wired_unwinds_this_attempt(self):
+        fake, real = self.bridged(), cm.install
+
+        def installed_then_replaced(*a, **kw):
+            rc = real(*a, **kw)
+            self.assertIsNotNone(fake.runner.pid(), "install started the job")
+            self.replace_root_now()
+            return rc
+        with mock.patch.object(cm, "install", side_effect=installed_then_replaced):
+            rc, out, err = self.connect(Backend(), fake)
+        self.assertNotEqual(rc, 0, out + err)
+        self.assertNotIn("next:", out)
+        self.assertIn(f"{self.root} was replaced after install started {cm.job_name(L)}; {cm.job_name(L)}, which "
+                      f"held the directory that was there, was stopped; nothing at {self.root} was touched", err)
+        self.assertIsNone(fake.runner.pid(), "the job this attempt started is not left on the parked root")
+        self.assertFalse(cm.service_path(cli.BRIDGE).exists(), "the bridge was not wired")
+        self.assertEqual(task_io.lock_held(str(self.root)), "free", "the replacement is untouched")
+        self.assertEqual(os.listdir(self.root), [], "nothing was written into the replacement")
+
+    def test_a_root_replaced_while_the_bridge_is_wired_unwinds_this_attempt(self):
+        fake, real = self.bridged(), cb.wire_bridge
+
+        def wired_then_replaced(*a, **kw):
+            got = real(*a, **kw)
+            self.assertTrue(cm.service_path(cli.BRIDGE).exists())
+            self.replace_root_now()
+            return got
+        with mock.patch.object(cb, "wire_bridge", side_effect=wired_then_replaced):
+            rc, out, err = self.connect(Backend(), fake)
+        self.assertNotEqual(rc, 0, out + err)
+        self.assertNotIn("next:", out)
+        self.assertIn(f"the bridge this attempt wired ({cm.job_name(cli.BRIDGE)}) was removed; {cm.job_name(L)}, which held "
+                      f"the directory that was there, was stopped; nothing at {self.root} was touched", err)
+        self.assertFalse(cm.service_path(cli.BRIDGE).exists(), "this attempt's bridge unit is gone")
+        self.assertIsNone(fake.runner.pid(), "this attempt's job is stopped")
+        self.assertEqual(task_io.lock_held(str(self.root)), "free", "the replacement is untouched")
+        self.assertEqual(os.listdir(self.root), [], "nothing was written into the replacement")
+
+    def test_connect_changes_no_jobs_definition_and_refuses_when_it_would(self):
+        fake = self.running_job()
+        fake.runner.stop_session()
+        conf = cli.config_path()
+        conf.write_text(conf.read_text().replace("ROOT=", "# edited by hand\nROOT=", 1))
+        before = conf.read_bytes()
+        rc, out, err = self.connect(Backend(), fake)
+        self.assertNotEqual(rc, 0, out + err)
+        self.assertIn(f"{conf} differs from what connect would write; connect changes no job's definition", err)
+        self.assertEqual(conf.read_bytes(), before)
+        self.assertIsNone(fake.runner.pid(), "nothing was started")
 
     def test_a_running_job_refuses_connect_before_the_code_is_spent_and_is_left_running(self):
         fake = self.running_job()
@@ -2792,11 +2887,11 @@ class ConnectCode(AgentRootBase):
     def test_a_root_replaced_while_install_starts_the_job_gets_that_job_stopped(self):
         fake, real = self.bridged(), cm.start_supervisor
 
-        def replaced_then_started(shape):
+        def replaced_then_started(shape, **kw):
             if shape is L:
                 os.rename(self.root, str(self.root) + ".parked")
                 os.mkdir(self.root)
-            return real(shape)
+            return real(shape, **kw)
         with mock.patch.object(cm, "start_supervisor", side_effect=replaced_then_started):
             rc, out, err = self.connect(Backend(), fake)
         self.assertNotEqual(rc, 0, out + err)

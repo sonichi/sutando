@@ -219,6 +219,28 @@ def bridge_problem(cfg: dict, command: str, bridge: cm.Shape, now=None) -> str:
     return ""
 
 
+def wire_bridge_bound(cfg: dict, command: str, bridge: cm.Shape, local: cm.Shape, root_id) -> str:
+    """wire_bridge held to connect's root (`root_id`, None outside connect): refused unless the root path
+    still names that directory before wiring and after. On a mismatch this attempt's own artifacts are
+    undone (the bridge it wired, the job its install started) and nothing at the new `root` is touched."""
+    root = cm.work_root(cfg)
+    if root_id is not None and cm.dir_identity(root) != root_id:
+        return _replaced(root, local, cm.stop_started(local, root), "")
+    problem = wire_bridge(cfg, command, bridge)
+    if problem or root_id is None or cm.dir_identity(root) == root_id:
+        return problem
+    unwired = unwire_bridge(cfg, command, bridge)
+    return _replaced(root, local, cm.stop_started(local, root),
+                     f"{cm.job_name(bridge)} could not be removed ({unwired}); " if unwired else
+                     f"the bridge this attempt wired ({cm.job_name(bridge)}) was removed; ")
+
+
+def _replaced(root: str, local: cm.Shape, stopped: str, bridge_note: str) -> str:
+    return (f"{root} was replaced after install started {cm.job_name(local)}; {bridge_note}"
+            + (stopped or f"{cm.job_name(local)}, which held the directory that was there, was stopped")
+            + f"; nothing at {root} was touched; check what is there, then connect again")
+
+
 def wire_bridge(cfg: dict, command: str, bridge: cm.Shape) -> str:
     """After the launcher's install: the agent's bridge pointed at this root, as its own unit or as a
     declaration the host's supervisor runs. '' or why not."""

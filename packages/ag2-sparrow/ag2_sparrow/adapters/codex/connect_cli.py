@@ -163,7 +163,7 @@ def install(args) -> int:
     rc = cm.install(LOCAL, values, root, root_id=getattr(args, "root_identity", None), holder=holder_words)
     if rc != 0 or mode == EXTERNAL:
         return rc
-    problem = cb.wire_bridge(dict(values, ROOT=root), COMMAND, BRIDGE)
+    problem = cb.wire_bridge_bound(dict(values, ROOT=root), COMMAND, BRIDGE, LOCAL, getattr(args, "root_identity", None))
     if problem:
         print(f"error: the connector is installed but its bridge is not: {problem}; run "
               f"{cb.rerun_install(COMMAND, where['token_file'], cb.session_flags(args))}", file=sys.stderr)

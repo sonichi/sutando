@@ -213,7 +213,7 @@ def install(args) -> int:
                     precheck=lambda r: inbox.root_problem(r) or records.agent_problem(r, agent_id), holder=holder_words)
     if rc != 0 or mode == EXTERNAL:
         return rc
-    problem = wire_bridge(dict(values, ROOT=root))
+    problem = cb.wire_bridge_bound(dict(values, ROOT=root), COMMAND, BRIDGE, LOCAL, getattr(args, "root_identity", None))
     if problem:
         print(f"error: the session is installed but its bridge is not: {problem}; run {COMMAND} install again",
               file=sys.stderr)
