@@ -155,11 +155,13 @@ class InterceptResult(NamedTuple):
 
 _WRITER = threading.local()
 
-# An update_token transaction legitimately holds the lock for seconds; past this a waiter gives up.
-_WRITER_LOCK_WAIT_S = 30.0
+_KEYCHAIN_READ_TIMEOUT_S = 5
 # `security` can block on a Keychain unlock prompt; a write gives up after this, lock released.
 _KEYCHAIN_WRITE_TIMEOUT_S = 15
+# Above update_token's worst legitimate hold: two writes each with a read-back, three reads.
+_WRITER_LOCK_WAIT_S = 2 * (_KEYCHAIN_WRITE_TIMEOUT_S + _KEYCHAIN_READ_TIMEOUT_S) + 3 * _KEYCHAIN_READ_TIMEOUT_S + 10
 KEYCHAIN_TIMEOUT_CODE = "vault_keychain_timeout"
+KEYCHAIN_STATE_UNKNOWN_CODE = "vault_keychain_state_unknown"
 
 
 class VaultBusy(RuntimeError):
@@ -222,12 +224,26 @@ def writer_lock(wait_s=None):
             os.close(fd)
 
 
-def _keychain_write(argv: list, key: str, verb: str):
+def _keychain_write(argv: list, key: str, verb: str, landed):
+    """Run a `security` write; on a timeout, read the key back: `landed(read)` True means the write
+    took effect (the result is None), False means it did not (vault_keychain_timeout)."""
     try:
         return subprocess.run(argv, capture_output=True, timeout=_KEYCHAIN_WRITE_TIMEOUT_S)
     except subprocess.TimeoutExpired:
-        raise RuntimeError(f"{KEYCHAIN_TIMEOUT_CODE}: could not {verb} '{key}' — security gave no answer "
-                           f"within {_KEYCHAIN_WRITE_TIMEOUT_S}s; the manifest is unchanged") from None
+        pass
+    try:
+        took = landed(lookup_vault_key(key))
+    except RuntimeError:
+        took = None
+    if took:
+        return None
+    if took is None:
+        raise RuntimeError(f"{KEYCHAIN_STATE_UNKNOWN_CODE}: could not {verb} '{key}' — security gave no answer "
+                           f"within {_KEYCHAIN_WRITE_TIMEOUT_S}s and reading it back failed; the manifest is "
+                           "unchanged and the Keychain item may or may not hold the write") from None
+    raise RuntimeError(f"{KEYCHAIN_TIMEOUT_CODE}: could not {verb} '{key}' — security gave no answer "
+                       f"within {_KEYCHAIN_WRITE_TIMEOUT_S}s and reading it back shows it did not take "
+                       "effect; nothing was changed") from None
 
 
 def _store_in_keychain(key: str, value: str) -> None:
@@ -246,9 +262,9 @@ def _store_in_keychain_locked(key: str, value: str) -> None:
             "-w", value,
             "-U",   # update if already exists
         ],
-        key, "store",
+        key, "store", lambda read: read == value,
     )
-    if result.returncode != 0:
+    if result is not None and result.returncode != 0:
         raise RuntimeError(
             f"vault: failed to store '{key}': "
             f"{result.stderr.decode(errors='replace').strip()}"
@@ -274,8 +290,6 @@ def list_vault_keys() -> list[str]:
     """Return all key names stored in the vault manifest (no values)."""
     return sorted(_read_manifest().keys())
 
-
-_KEYCHAIN_READ_TIMEOUT_S = 5
 
 
 def get_vault_key(key: str) -> str:
@@ -367,8 +381,8 @@ def _delete_from_keychain_locked(key: str) -> None:
     # rc 44 is errSecItemNotFound — already gone, so the manifest drop proceeds.
     # Any other non-zero may leave the item LIVE; dropping it then strands a secret.
     result = _keychain_write(["security", "delete-generic-password", "-a", _ACCOUNT, "-s", key],
-                             key, "delete")
-    if result.returncode not in (0, _ERRSEC_ITEM_NOT_FOUND):
+                             key, "delete", lambda read: read is None)
+    if result is not None and result.returncode not in (0, _ERRSEC_ITEM_NOT_FOUND):
         raise RuntimeError(
             f"vault: failed to delete '{key}' from Keychain "
             f"(rc={result.returncode}); manifest entry kept so the secret is not stranded"

@@ -99,6 +99,7 @@ IDENTITY_FIELDS = ("agent_mxid", "agent_display_name", "agent_avatar_url", "owne
 AVATAR_SCHEME = "mxc://"
 PROBE_TIMEOUT_S = 15
 STOP_TIMEOUT_S = 8
+VAULT_PROBE_WAIT_S = 2  # outlasts a chat interception's brief write, never a hung holder
 # How long `launch` holds the record lock waiting for its child to take the bridge lease.
 LEASE_TIMEOUT_S = 20
 # Names that never belong to a public homeserver; a probe there would scan the operator's own network.
@@ -122,7 +123,8 @@ class ConnectionMismatch(ConnectionsError):
 
 
 class VaultUnavailable(ConnectionsError):
-    """The secret vault refused or could not be reached; nothing was written."""
+    """The secret vault refused or could not be reached; nothing was written, unless the message
+    names vault_keychain_state_unknown (the Keychain may hold the write)."""
 
 
 class UnknownConnection(ConnectionsError):
@@ -906,8 +908,8 @@ def add_connection(token: str, *, added_by: str, expected_server: str, instance:
                 raise ConnectionsError(f"instance {inst!r} is taken by another server; pass another instance")
             if _vault_get(vault, ref):
                 raise VaultKeyInUse(f"vault key {ref} already holds a secret that no connection owns")
+            stored = True  # a failed store may still have landed (vault_keychain_state_unknown)
             _vault_store(vault, ref, token.strip())
-            stored = True
             row = _row(server=server, instance=inst, gateway_url=str(seen["gateway_url"]), token_ref=ref,
                        primary=not any(r["primary"] for r in rows), added_by=added_by,
                        verified=bool(seen.get("verified")),
@@ -1014,10 +1016,14 @@ def set_primary(instance: str, *, workspace: Optional[Path] = None) -> dict:
 def remove_connection(instance: str, *, force: bool = False, workspace: Optional[Path] = None,
                       vault=None, kill=None) -> dict:
     """Stop the bridge, then drop the row, its vault key, its launch record and (a named row) its
-    status sidecar; the primary only under `force`. Other rows and their bridges are untouched; no row inherits the primary flag.
+    status sidecar, all under the record lock; the primary only under `force`. Other rows and their
+    bridges are untouched; no row inherits the primary flag.
     An env-imported row is remembered so import_from_env does not bring it back."""
     vault = _vault(vault)
-    with _transaction(workspace) as rec:
+    path = record_path(workspace)
+    # Cleanup stays under the record lock: a same-name re-add must not have its new files deleted.
+    with locked_file(_lock_path(workspace), create_mode=0o600):
+        rec = _read_record(path)
         rows = rec["rows"]
         row = _find(rows, instance)
         if row["primary"] and not force:
@@ -1027,16 +1033,17 @@ def remove_connection(instance: str, *, force: bool = False, workspace: Optional
         rows.remove(row)
         if row["added_by"] == "env":
             rec[REMOVED_KEY] = sorted(set(rec[REMOVED_KEY]) | {row["token_ref"]})
-    stale = [launch_record_path(instance, workspace)]
-    if instance:  # the named bridge is stopped, so its sidecar is the removed row's last reading
-        from workspace_default import status_path
-        name = f"gateway-status.{instance}.json"
-        stale += [status_path(name, _workspace(workspace)), _workspace(workspace) / name]
-    for path in stale:
-        try:
-            path.unlink()
-        except FileNotFoundError:
-            pass
+        _write(path, rec)
+        stale = [launch_record_path(instance, workspace)]
+        if instance:  # stop_bridge waited for the process to exit, so no later status write lands
+            from workspace_default import status_path
+            name = f"gateway-status.{instance}.json"
+            stale += [status_path(name, _workspace(workspace)), _workspace(workspace) / name]
+        for stale_path in stale:
+            try:
+                stale_path.unlink()
+            except FileNotFoundError:
+                pass
     out = dict(row)
     out["stopped_pid"] = stopped
     return out
@@ -1306,6 +1313,16 @@ def _exited(pid: int) -> bool:
             return False
         _CHILDREN.pop(pid, None)
         return True
+    waitid = getattr(os, "waitid", None)
+    if waitid is not None:
+        try:  # an exited, unreaped child of this process: seen without reaping it
+            if waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None:
+                return True
+        except OSError:
+            pass
+    if os.name == "nt":
+        from outbox import OwnerState, process_identity
+        return process_identity(pid).state == OwnerState.DEAD
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -1436,8 +1453,8 @@ def bridge_pid(instance: str, workspace: Optional[Path] = None) -> int:
 
 def stop_bridge(instance: str, *, workspace: Optional[Path] = None, kill=None,
                 timeout_s: Optional[float] = None) -> int:
-    """SIGTERM the process proven to hold `instance`'s lease and wait until no process holds it;
-    the pid, or 0 when none held it. A holder still running at the deadline, or a signal the process
+    """SIGTERM the process proven to hold `instance`'s lease and wait until no process holds it and
+    that process has exited; the pid, or 0 when none held it. A holder still running at the deadline, or a signal the process
     refuses, is `BridgeStillRunning`; a lease that proves no holder is `BridgeLeaseIndeterminate`
     and nothing is signalled. Either way the caller writes nothing over a bridge that may be up."""
     timeout_s = STOP_TIMEOUT_S if timeout_s is None else timeout_s
@@ -1454,8 +1471,10 @@ def stop_bridge(instance: str, *, workspace: Optional[Path] = None, kill=None,
     while True:
         _exited(pid)  # reaps our own child, so it stops reading as alive
         holder = bridge_pid(instance, workspace)
-        if not holder:
+        if not holder and _exited(pid):
             return pid
+        if not holder and time.monotonic() >= deadline:
+            raise BridgeStillRunning(instance, pid, "process still running after it released its lease")
         if time.monotonic() >= deadline:
             raise BridgeStillRunning(instance, holder, "lease still held after the stop deadline")
         time.sleep(0.1)
@@ -1537,7 +1556,7 @@ def update_token(instance: str, token: str, *, repo: Path, logs_dir: Path,
                 raise TokenSourceShadowed(instance, ref)
             candidate = _updated_row(rec, row, seen, instance)
             _vault_snapshot(vault, ref)  # an unreadable vault refuses before the stop
-            with _vault_writer(vault, wait_s=0):  # so does a busy one; not held across the stop,
+            with _vault_writer(vault, wait_s=VAULT_PROBE_WAIT_S):  # a busy one too; not held across the stop,
                 pass                               # which may wait on a bridge's own vault write
             stopped = stop_bridge(instance, workspace=workspace, kill=kill)
             # No other vault writer interleaves from the snapshot through the restore.

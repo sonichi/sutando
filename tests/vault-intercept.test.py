@@ -836,15 +836,36 @@ class TestWriterDeadlines(unittest.TestCase):
         self.assertLess(time.monotonic() - began, 0.5)
         self.assertEqual(getattr(vault_intercept._WRITER, "depth", 0), 0)
 
-    def _hung_security(self):
+    def _hung_security(self, *flags):
+        """A `security` stand-in whose writes hang; `commits` makes a write land first, `find_hangs`
+        hangs the read-back too. The item lives in a file beside it."""
         import stat
         bindir = tempfile.mkdtemp(prefix="hung-security-")
         self.addCleanup(lambda: __import__("shutil").rmtree(bindir, ignore_errors=True))
+        for flag in flags:
+            open(os.path.join(bindir, flag), "w").close()
+        self.item = os.path.join(bindir, "item")
         stub = os.path.join(bindir, "security")
         with open(stub, "w") as f:
-            f.write("#!/bin/sh\nexec sleep 30\n")
+            f.write(f"""#!/bin/sh
+D='{bindir}'; verb="$1"; shift; v=""
+while [ $# -gt 0 ]; do [ "$1" = "-w" ] && [ "$verb" = add-generic-password ] && v="$2"; shift; done
+case "$verb" in
+  find-generic-password) [ -f "$D/find_hangs" ] && exec sleep 30; [ -f "$D/item" ] && {{ cat "$D/item"; exit 0; }}; exit 44;;
+  add-generic-password) [ -f "$D/commits" ] && printf '%s' "$v" > "$D/item";;
+  delete-generic-password) [ -f "$D/commits" ] && rm -f "$D/item";;
+esac
+exec sleep 30
+""")
         os.chmod(stub, stat.S_IRWXU)
         return patch.dict(os.environ, {"PATH": bindir + os.pathsep + os.environ.get("PATH", "")})
+
+    def _deadlines(self):
+        from contextlib import ExitStack
+        stack = ExitStack()
+        stack.enter_context(patch.object(vault_intercept, "_KEYCHAIN_WRITE_TIMEOUT_S", 0.5))
+        stack.enter_context(patch.object(vault_intercept, "_KEYCHAIN_READ_TIMEOUT_S", 0.5))
+        return stack
 
     def _lock_is_free(self):
         import threading
@@ -861,7 +882,7 @@ class TestWriterDeadlines(unittest.TestCase):
 
     def test_a_hung_security_write_times_out_and_leaves_the_lock_free(self):
         import time
-        with self._hung_security(), patch.object(vault_intercept, "_KEYCHAIN_WRITE_TIMEOUT_S", 0.5):
+        with self._hung_security(), self._deadlines():
             began = time.monotonic()
             with self.assertRaises(RuntimeError) as ctx:
                 vault_intercept.set_vault_key("DEADLINE_HUNG", "v")
@@ -869,6 +890,7 @@ class TestWriterDeadlines(unittest.TestCase):
             self.assertTrue(str(ctx.exception).startswith(vault_intercept.KEYCHAIN_TIMEOUT_CODE), str(ctx.exception))
             self.assertNotIn("DEADLINE_HUNG", self._keys(), "a timed-out store registers nothing")
             vault_intercept._register_key("DEADLINE_KEEP")
+            open(self.item, "w").write("kept")
             with self.assertRaises(RuntimeError) as gone:
                 vault_intercept.delete_vault_key("DEADLINE_KEEP")
             self.assertTrue(str(gone.exception).startswith(vault_intercept.KEYCHAIN_TIMEOUT_CODE))
@@ -876,6 +898,45 @@ class TestWriterDeadlines(unittest.TestCase):
         self.assertEqual(getattr(vault_intercept._WRITER, "depth", 0), 0)
         self.assertTrue(self._lock_is_free(), "the lock is released after the timeout")
         vault_intercept._deregister_key("DEADLINE_KEEP")
+
+    def test_a_store_that_lands_then_hangs_is_read_back_and_registered(self):
+        with self._hung_security("commits"), self._deadlines():
+            vault_intercept.set_vault_key("LANDED_SET", "v-set")
+            self.assertIn("LANDED_SET", self._keys(), "the manifest matches what the Keychain holds")
+            secret = "sk-" + "a" * 20 + "T3BlbkFJ" + "b" * 20
+            result = intercept_vault_commands(f"vault set LANDED_CHAT {secret}")
+        self.assertEqual((result.stored, result.failed), (["LANDED_CHAT"], []))
+        self.assertIn("LANDED_CHAT", self._keys())
+        for k in ("LANDED_SET", "LANDED_CHAT"):
+            vault_intercept._deregister_key(k)
+
+    def test_a_delete_that_lands_then_hangs_drops_the_manifest_entry(self):
+        with self._hung_security("commits"), self._deadlines():
+            vault_intercept._register_key("LANDED_DEL")
+            open(self.item, "w").write("v")
+            vault_intercept.delete_vault_key("LANDED_DEL")
+        self.assertNotIn("LANDED_DEL", self._keys())
+
+    def test_an_unreadable_read_back_is_state_unknown_and_changes_no_manifest(self):
+        with self._hung_security("commits", "find_hangs"), self._deadlines():
+            with self.assertRaises(RuntimeError) as ctx:
+                vault_intercept.set_vault_key("UNKNOWN_SET", "v-unknown")
+            vault_intercept._register_key("UNKNOWN_DEL")
+            with self.assertRaises(RuntimeError) as gone:
+                vault_intercept.delete_vault_key("UNKNOWN_DEL")
+        for e in (ctx.exception, gone.exception):
+            self.assertTrue(str(e).startswith(vault_intercept.KEYCHAIN_STATE_UNKNOWN_CODE), str(e))
+            self.assertNotIn("v-unknown", str(e))
+        self.assertNotIn("UNKNOWN_SET", self._keys())
+        self.assertIn("UNKNOWN_DEL", self._keys(), "an unknown delete keeps the entry, so no secret is stranded")
+        vault_intercept._deregister_key("UNKNOWN_DEL")
+        self.assertTrue(self._lock_is_free())
+
+    def test_the_lock_wait_outlasts_the_worst_legitimate_hold(self):
+        # update_token's hold: snapshot read, store + read-back, restore read, restore + read-back, final read.
+        worst = 2 * (vault_intercept._KEYCHAIN_WRITE_TIMEOUT_S + vault_intercept._KEYCHAIN_READ_TIMEOUT_S) \
+            + 3 * vault_intercept._KEYCHAIN_READ_TIMEOUT_S
+        self.assertGreater(vault_intercept._WRITER_LOCK_WAIT_S, worst)
 
 
 if __name__ == "__main__":
