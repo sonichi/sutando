@@ -68,6 +68,7 @@ from util_paths import _host_label, actor_env_names, channel_access_path, claude
 import slack_access  # noqa: E402
 import session_runtime  # noqa: E402
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
+from desktop_data_root import desktop_data_root  # noqa: E402
 from sutando_platform import (  # noqa: E402
     find_pids,
     probe_pids,
@@ -731,8 +732,8 @@ def resolve_node_runtime(env: Optional[dict] = None, which=shutil.which) -> dict
         # declaration — set-but-invalid is a packaging error, NOT a case to
         # silently rescue via PATH. Surface it as its own failure source.
         return {"source": "invalid-explicit", "path": explicit}
-    app_dir = env.get("SUTANDO_APP_NODE_DIR", "") or os.path.expanduser(
-        "~/Library/Application Support/space.ag2.app/engine/runtime/node/bin"
+    app_dir = env.get("SUTANDO_APP_NODE_DIR", "") or str(
+        desktop_data_root(env) / "engine" / "runtime" / "node" / "bin"
     )
     app_node = os.path.join(app_dir, "node")
     if os.path.isfile(app_node) and os.access(app_node, os.X_OK):

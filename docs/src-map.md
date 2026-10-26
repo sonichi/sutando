@@ -82,6 +82,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`dashboard_schedules.py`** — Cron parsing, schedule validation and atomic crons.json persistence.
 - **`dedup_recovery.py`** — Recovery for a `[deduped: <holder>]` result whose holder never answered.
 - **`dedup_soundness.py`** — Is a `[deduped: X]` sound?
+- **`desktop_data_root.py`** — The AG2 Space desktop app's macOS data folder, for code that runs without the launcher's env.
 - **`discord-bridge.py`** — Discord bridge for Sutando — listens for DMs, writes to tasks/, sends replies from results/.
 - **`discord-read.py`** — Read recent messages from a Discord channel via REST API.
 - **`discord_access.py`** — Shared Discord collaborator policy and verified task admission.
