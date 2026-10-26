@@ -1320,6 +1320,8 @@ def _exited(pid: int) -> bool:
                 return True
         except OSError:
             pass
+    elif os.name != "nt" and _zombie(pid):
+        return True
     if os.name == "nt":
         from outbox import OwnerState, process_identity
         return process_identity(pid).state == OwnerState.DEAD
@@ -1330,6 +1332,25 @@ def _exited(pid: int) -> bool:
     except OSError:
         return False
     return False
+
+
+def _zombie(pid: int) -> bool:
+    """Whether `pid` has exited but is unreaped, where waitid is missing: our child is reaped, any other read from ps."""
+    try:
+        if os.waitpid(pid, os.WNOHANG)[0] == pid:
+            return True
+    except ChildProcessError:
+        pass
+    except OSError:
+        return False
+    else:
+        return False
+    ps = "/bin/ps" if os.path.exists("/bin/ps") else "ps"
+    try:
+        out = subprocess.run([ps, "-o", "stat=", "-p", str(pid)], capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return out.strip().startswith("Z")
 
 
 def _bridge_role(instance: str) -> str:
@@ -1589,7 +1610,7 @@ def update_token(instance: str, token: str, *, repo: Path, logs_dir: Path,
                     f"and reading {ref} back {found}, so it is not known which secret it holds; the row is unchanged "
                     "and the bridge was not relaunched; run update-token again with the code you want") from None
         if isinstance(e, BridgeStillRunning):
-            raise _with_note(e, f"the running bridge still runs on the old code; {ref} was not changed") from None
+            raise _with_note(e, f"the bridge was not confirmed stopped and may still be running on the old code; {ref} was not changed") from None
         if not stopped:
             raise e
         try:
