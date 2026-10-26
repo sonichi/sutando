@@ -21,7 +21,6 @@ shares: the service manager (systemd `--user`, launchd) is the only supervisor; 
 occupancy and the holder record attribution, never readiness.
 
 ```bash
-ag2-sparrow-codex-local connect --base <AG2 Space backend URL> [--codex-home <dir>] ...   # asks for the code
 ag2-sparrow-codex-local install --work <dir> [--codex-home <dir>] [--sandbox read-only|workspace-write] \
     [--allow-non-owner] [--model <m>] [--codex <path>]
 ag2-sparrow-codex-local install --token-env-file <the agent's .env> [the same options]
@@ -29,7 +28,10 @@ ag2-sparrow-codex-local verify
 ag2-sparrow-codex-local uninstall
 ```
 
-**Connect with a code.** On a host with no core, `connect` is the agent's whole setup, with
+**Connect with a code (experimental, off in this release).** `connect` refuses ("Codex connect is not
+enabled in this release; use install --work / verify") before it reads or redeems a code or touches any
+root, seat, unit or lock. Use `install --work` and `verify`. What follows is the experimental path.
+On a host with no core, `connect` is the agent's whole setup, with
 claude-local's `connect` behaviour, from the same package code (`connect_bridge`): it checks the
 machine before the code is spent (no host supervisor, no `AGENT_CONNECT_TASK_DIR`, the Codex pin, and
 `codex login status` under `--codex-home`), reads the code from a prompt or `--code -` (a code on the

@@ -1078,7 +1078,8 @@ class ConnectCode(Base):
 
     def connect(self, backend, fake=None, *extra, sleeps=None, stdin=None, base=BASE, code_args=("--code", "-")):
         fake = fake or self.fake()
-        argv = ["connect", "--base", base, *code_args, "--codex-home", str(self.codex_home), *extra]
+        argv = ["connect", "--experimental-connect", "--base", base, *code_args, "--codex-home", str(self.codex_home),
+                *extra]
         out, err = io.StringIO(), io.StringIO()
         stdin = io.StringIO(CODE + "\n") if stdin is None else stdin
         with mock.patch.object(sm, "_run", side_effect=fake), mock.patch.object(cm, "is_macos", return_value=False), \
@@ -1091,6 +1092,28 @@ class ConnectCode(Base):
 
     def seat(self):
         return cb.bridge_home(self.root) / "channels" / "ag2space"
+
+    def test_connect_is_off_without_the_experimental_flag_and_touches_nothing(self):
+        backend, fake, stdin = Backend(), self.fake(), io.StringIO(CODE + "\n")
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(sm, "_run", side_effect=fake), mock.patch.object(cm, "is_macos", return_value=False), \
+                mock.patch.object(urllib.request, "urlopen", side_effect=backend), \
+                mock.patch.object(sys, "stdin", stdin), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = cli.main(["connect", "--base", BASE, "--code", "-", "--codex-home", str(self.codex_home)])
+            bare = cli.main(["connect"])
+        self.assertEqual((rc, bare), (cli.EXIT_UNUSABLE, cli.EXIT_UNUSABLE))
+        self.assertEqual(err.getvalue(), "error: Codex connect is not enabled in this release; use install --work / "
+                                         "verify\n" * 2)
+        self.assertEqual(out.getvalue(), "")
+        self.assertEqual(backend.calls, [], "no code is redeemed")
+        self.assertEqual(stdin.read(), CODE + "\n", "the code is not even read")
+        self.assertEqual(fake.runner.calls, [], "no manager is asked anything")
+        self.assertFalse(self.root.exists(), "no root")
+        self.assertFalse(cb.bridge_home(self.root).exists(), "no seat")
+        self.assertFalse(cm.agent_lock_path(self.root).parent.exists(), "no agent lock")
+        self.assertFalse(cli.config_path().exists(), "no config")
+        self.assertFalse(cm.supervisor_path(cli.LOCAL).exists(), "no unit")
+        self.assertFalse(cm.supervisor_path(cb.bridge_shape(cli.LOCAL)).exists(), "no bridge unit")
 
     def assert_code_unspent(self, backend, rc, err):
         self.assertEqual(rc, cli.EXIT_UNUSABLE)
