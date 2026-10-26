@@ -2692,6 +2692,20 @@ class ZombieWithoutWaitid(Base):
         self.assert_stops_promptly(pid)
 
 
+@unittest.skipIf(os.name == "nt", "zombies are a POSIX state")
+class ZombieProbeFailures(unittest.TestCase):
+    """A probe that cannot answer reads as still running, so stop_bridge keeps waiting instead of guessing."""
+
+    def test_a_waitpid_error_other_than_not_our_child_reads_as_running(self):
+        with unittest.mock.patch.object(C.os, "waitpid", side_effect=PermissionError):
+            self.assertFalse(C._zombie(12345))
+
+    def test_ps_that_cannot_run_reads_as_running(self):
+        with unittest.mock.patch.object(C.os, "waitpid", side_effect=ChildProcessError), \
+                unittest.mock.patch.object(C.subprocess, "run", side_effect=subprocess.TimeoutExpired("ps", 5)):
+            self.assertFalse(C._zombie(12345))
+
+
 FAKE_SECURITY = r"""#!/usr/bin/env bash
 verb="$1"; shift; key=""; value=""
 while [ $# -gt 0 ]; do case "$1" in -s) key="$2"; shift 2;; -w) if [ "$verb" = add-generic-password ]; then value="$2"; shift 2; else shift; fi;; *) shift;; esac; done
