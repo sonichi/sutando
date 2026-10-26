@@ -569,22 +569,27 @@ that never applied it named a private repo and a private agent in a public PR bo
 GitHub's edit history kept the first version after the fix. This moves the check to the
 command itself.
 
-- **Writes covered:** `gh pr create|edit|comment|review|merge|close`,
-  `gh issue create|comment|edit|close`, `gh release create|edit`, `gh gist create --public`,
+- **Writes covered:** `gh pr create|edit|comment|review|merge|close|reopen`,
+  `gh issue create|comment|edit|close|reopen`, `gh release create|edit`,
+  `gh label create|edit` (name and description), `gh gist create --public`, `gh gist edit`,
   `gh repo create --public|edit`, and `gh api` POST/PATCH/PUT to any `repos/<o>/<r>/…`
   endpoint (issues, pulls, releases, commit comments, …), `gists`, or a GraphQL mutation.
   `gh api` is recognised by the first non-flag word after `gh`.
 - **Text read:** title/body/notes/comment/subject/description flags in every pflag form
   (`--body x`, `--body=x`, `-bx`, `-b=x`, clusters such as `-dtx`), their `-file` forms, a
-  `"$(cat FILE)"` or `"$(cat <<'EOF' … EOF)"` value, heredoc / here-string stdin, and every
+  `"$(cat FILE)"` or `"$(cat <<'EOF' … EOF)"` value, stdin from the gh command's own heredoc
+  or here-string (stdin from a pipe or a file redirect is refused), and every
   `gh api` field (`-f`, `-F k=@file`, `-fk=v`, `--input`).
 - **Where gh is found:** behind assignments and wrappers (`env` with flags, `timeout`,
   `nice`, `nohup`, `time`, `command`, `exec`, `sudo`, `stdbuf`, `ionice`, `setsid`, …), shell
   keywords (`if`/`then`/`do`/`{`/`!`, …), inside `` `…` `` and `$(…)` (also within double
   quotes and unquoted heredocs), in `bash -c` / `eval` strings, and in a script fed to a
   shell on stdin (`bash <<'EOF'`, `bash <<< …`, `cat <<'EOF' | bash`).
-- **Repo:** `--repo`, a PR/issue URL, an `o/r` argument to `gh repo`, else the cwd's git
-  remote the way gh picks it (the gh-resolved remote, then upstream, github, origin).
+- **Repo:** `--repo`, a PR/issue URL, an `o/r` argument to `gh repo`, else `GH_REPO`
+  (inline, via `env`, `export`/`unset` earlier in the command, or the session's environment),
+  else the cwd's git remote the way gh picks it (the gh-resolved remote, then upstream,
+  github, origin). A bare `GH_REPO=x;` that may or may not be exported counts both ways: the
+  text is scanned unless every possible target is private.
 - **What is private** is `src/public_write_privacy.py`: the terms in
   `<workspace>/state/privacy/public-denylist.txt`, plus, with no list, home-directory
   paths, Matrix room IDs and MXIDs (any case; example servers and placeholder user names

@@ -2,12 +2,12 @@
 """public-write-privacy-guard — PreToolUse[Bash] hook that refuses a `gh` write
 to a non-private repo when the text it would publish names something private.
 
-Covered writes: `gh pr create|edit|comment|review|merge|close`, `gh issue
-create|comment|edit|close`, `gh release create|edit`, `gh gist create --public`,
-`gh repo create --public|edit`, and `gh api` POST/PATCH/PUT to any `repos/<o>/<r>/…`
+Covered writes: `gh pr create|edit|comment|review|merge|close|reopen`, `gh issue
+create|comment|edit|close|reopen`, `gh release create|edit`, `gh label create|edit`,
+`gh gist create --public|edit`, `gh repo create --public|edit`, and `gh api` POST/PATCH/PUT to any `repos/<o>/<r>/…`
 endpoint, `gists`, or a GraphQL mutation. Scanned: text flags (long, `=`, attached
-and clustered short forms), their -file forms, `$(cat FILE)` values, heredoc and
-here-string stdin, `gh api` fields, and gh run inside wrappers, compound commands,
+and clustered short forms), their -file forms, `$(cat FILE)` values, stdin from the
+command's own heredoc or here-string, `gh api` fields, and gh run inside wrappers, compound commands,
 substitutions, `bash -c`, `eval` and shell stdin scripts.
 What counts as private is src/public_write_privacy.py; this hook only parses.
 
@@ -50,12 +50,12 @@ class Spec:
     """One publishing gh verb: which flags carry text, which name a file, and
     which short flags take a value (so a cluster like `-dbTEXT` splits right)."""
 
-    def __init__(self, texts, files=(), shorts=None, when=None, positional_files=False):
+    def __init__(self, texts, files=(), shorts=None, when=None, positional="ignore"):
         self.texts = set(texts)
         self.files = set(files)
         self.shorts = dict(shorts or {})
         self.when = when                    # a long flag that must be present, or None
-        self.positional_files = positional_files
+        self.positional = positional        # ignore | files | text | gist-edit
 
 
 _COMMON = {"R": "--repo", "b": "--body", "F": "--body-file", "t": "--title"}
@@ -79,8 +79,16 @@ VERBS = {
                                 {"R": "--repo", "n": "--notes", "F": "--notes-file", "t": "--title"}),
     ("release", "edit"): Spec({"--notes", "--title"}, {"--notes-file"},
                               {"R": "--repo", "n": "--notes", "F": "--notes-file", "t": "--title"}),
+    ("pr", "reopen"): Spec({"--comment"}, (), {"R": "--repo", "c": "--comment"}),
+    ("issue", "reopen"): Spec({"--comment"}, (), {"R": "--repo", "c": "--comment"}),
+    ("label", "create"): Spec({"--description"}, (), {"R": "--repo", "d": "--description", "c": "--color"},
+                              positional="text"),
+    ("label", "edit"): Spec({"--description", "--name"}, (), {"R": "--repo", "d": "--description",
+                            "c": "--color", "n": "--name"}, positional="text"),
     ("gist", "create"): Spec({"--desc"}, (), {"d": "--desc", "f": "--filename"}, when="--public",
-                             positional_files=True),
+                             positional="files"),
+    ("gist", "edit"): Spec({"--desc"}, {"--add"}, {"d": "--desc", "a": "--add", "f": "--filename",
+                           "r": "--remove"}, positional="gist-edit"),
     ("repo", "edit"): Spec({"--description", "--homepage"}, (), {"d": "--description", "h": "--homepage"}),
     ("repo", "create"): Spec({"--description", "--homepage"}, (), {"d": "--description", "h": "--homepage",
                              "g": "--gitignore", "l": "--license", "p": "--template", "t": "--team"},
@@ -115,7 +123,7 @@ HEREDOC = re.compile(r"<<(-?)\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\2")
 HEREDOC_WORD = re.compile(r"^<<-?(?!<)")
 REDIRECT = re.compile(r"^(?:\d|&)?>>?(.*)$")
 EXPANSION = re.compile(r"(?<!\\)(?:\$[\w{(@*#?!$-]|`)")
-GH_WRITE_HINT = re.compile(r"\bgh\b[\s\S]*\b(?:pr|issue|release|api|gist|repo)\b", re.I)
+GH_WRITE_HINT = re.compile(r"\bgh\b[\s\S]*\b(?:pr|issue|release|api|gist|repo|label)\b", re.I)
 # Programs that only read the files they name; any other program naming the body
 # file in the same command may be writing it.
 READERS = {"cat", "head", "tail", "less", "more", "wc", "grep", "rg", "ugrep", "diff", "ls", "stat",
@@ -236,6 +244,16 @@ def _literal_or_raise(word) -> str:
     return word.text
 
 
+class Act:
+    """One publishing gh invocation. repo None: gh takes it from GH_REPO or the cwd's
+    remote; "" means the target has no repo. `also` are repos it may target instead."""
+
+    def __init__(self, repo, label, texts, cwd, env_ok=True, also=()):
+        self.repo, self.label, self.texts, self.cwd = repo, label, texts, cwd
+        self.env_ok = env_ok
+        self.also = list(also)
+
+
 class Ctx:
     def __init__(self, cwd, bodies, segments, seg_bodies):
         self.cwd = cwd
@@ -243,6 +261,9 @@ class Ctx:
         self.segments = segments
         self.seg_bodies = seg_bodies  # the bodies each segment itself redirects in
         self.own = []                 # bodies of the segment being read
+        self.assigns = {}             # NAME=value prefixes of the segment being read
+        self.exported = {}            # export NAME=value / unset NAME earlier in the command
+        self.maybe = {}               # bare NAME=value earlier: applies only if already exported
 
 
 def _resolve(path_text: str, cwd):
@@ -279,9 +300,10 @@ def _read_file(word, ctx, label):
 
 
 def _stdin(ctx, label):
-    bodies = ctx.own or ctx.bodies
+    bodies = ctx.own
     if not bodies:
-        raise Unreadable(f"{label} reads stdin, which this guard cannot see; pass --body-file <path>")
+        raise Unreadable(f"{label} reads stdin that is not this command's own heredoc or here-string, "
+                         "which this guard cannot see; pass --body-file <path>")
     return _checked(bodies, label)
 
 
@@ -302,17 +324,33 @@ def _is_assignment(text):
     return bool(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", text, re.S))
 
 
+def _assignment(word):
+    """(NAME, value) for NAME=value; a value bash expands becomes an unresolvable repo."""
+    name, _, _ = word.text.partition("=")
+    try:
+        _literal_or_raise(_shell_scan.Word(raw=word.raw.split("=", 1)[-1], text=""))
+        return name, word.text.split("=", 1)[1]
+    except Unreadable:
+        return name, "{unresolved}"
+
+
 def _strip_prefix(seg):
-    """Drop shell keywords, assignments and wrappers (`timeout 60`, `env -u X`,
-    `nice -n 5`) in front of the command that actually runs."""
+    """(command words, {NAME: value or None when unset}) after dropping shell
+    keywords, assignments and wrappers (`timeout 60`, `env -u X`, `nice -n 5`)."""
+    assigns = {}
     while seg:
         text = seg[0].text
-        if text in KEYWORDS or _is_assignment(text):
+        if text in KEYWORDS:
+            seg = seg[1:]
+            continue
+        if _is_assignment(text):
+            name, value = _assignment(seg[0])
+            assigns[name] = value
             seg = seg[1:]
             continue
         name = os.path.basename(text)
         if name not in WRAPPERS:
-            return seg
+            return seg, assigns
         valued, positional = WRAPPERS[name]
         i = 1
         while i < len(seg):
@@ -321,14 +359,20 @@ def _strip_prefix(seg):
                 i += 1
                 break
             if a.startswith("-") and len(a) > 1:
+                if name == "env" and a in ("-u", "--unset") and i + 1 < len(seg):
+                    assigns[seg[i + 1].text] = None
+                elif name == "env" and a.startswith(("-u", "--unset=")) and len(a) > 2:
+                    assigns[a.split("=", 1)[1] if a.startswith("--") else a[2:]] = None
                 i += 2 if a in valued else 1
                 continue
             if name == "env" and _is_assignment(a):
+                key, value = _assignment(seg[i])
+                assigns[key] = value
                 i += 1
                 continue
             break
         seg = seg[i + positional:]
-    return seg
+    return seg, assigns
 
 
 def _parse_args(args, shorts, valued_longs, aliases=None):
@@ -411,7 +455,7 @@ def _gh_action(seg, ctx):
     if spec.when and spec.when not in flags:
         return None
     repo = "" if words[0] == "gist" else None
-    texts = []
+    texts, first = [], True
     for name, val in values:
         if name == "--repo":
             repo = _literal_or_raise(_need(name, val))
@@ -420,15 +464,36 @@ def _gh_action(seg, ctx):
         elif name in spec.files:
             texts += _read_file(_need(name, val), ctx, name)
     for w in positional:
-        if spec.positional_files:
+        if spec.positional == "files":
             texts += _read_file(w, ctx, "file")
+            continue
+        if spec.positional == "text":
+            texts.append(_literal_or_raise(w))
+            continue
+        if spec.positional == "gist-edit":
+            if not first and (w.text == "-" or _resolve(_literal_or_raise(w), ctx.cwd).is_file()):
+                texts += _read_file(w, ctx, "file")
+            first = False
             continue
         m = GH_URL.search(w.text)
         if m and not repo:
             repo = m.group(1)
         elif words[0] == "repo" and repo is None and w.text.count("/") == 1 and "{" not in w.text:
             repo = w.text
-    return repo, f"gh {words[0]} {words[1]}", texts, ctx.cwd
+    return _with_env_repo(repo, f"gh {words[0]} {words[1]}", texts, ctx)
+
+
+def _with_env_repo(repo, label, texts, ctx):
+    """Apply GH_REPO the way gh does: a --repo flag or URL wins, then GH_REPO."""
+    if repo is not None:
+        return Act(repo, label, texts, ctx.cwd)
+    for scope in (ctx.assigns, ctx.exported):
+        if "GH_REPO" in scope:
+            value = scope["GH_REPO"]
+            if value:
+                return Act(value, label, texts, ctx.cwd)
+            return Act(None, label, texts, ctx.cwd, env_ok=False)
+    return Act(None, label, texts, ctx.cwd, also=ctx.maybe.get("GH_REPO", ()))
 
 
 def _api_action(args, ctx):
@@ -459,11 +524,11 @@ def _api_action(args, ctx):
     m = API_REPO.match(endpoint)
     if m:
         target = None if "{" in m.group(1) else m.group(1)
-        return target or repo, f"gh api {method} {m.group(2) or 'repo'}", texts, ctx.cwd
+        return _with_env_repo(target or repo, f"gh api {method} {m.group(2) or 'repo'}", texts, ctx)
     if API_GIST.match(endpoint):
-        return "", f"gh api {method} gists", texts, ctx.cwd
+        return Act("", f"gh api {method} gists", texts, ctx.cwd)
     if endpoint.strip("/") == "graphql" and any("mutation" in t for t in texts):
-        return "", "gh api graphql mutation", texts, ctx.cwd
+        return Act("", "gh api graphql mutation", texts, ctx.cwd)
     return None
 
 
@@ -578,9 +643,19 @@ def actions(command: str, cwd, depth: int = 0):
             if "gh" in text.lower():
                 found += actions(text, cwd, depth + 1)
     for idx, seg in enumerate(segments):
-        seg = _strip_prefix(seg)
+        seg, ctx.assigns = _strip_prefix(seg)
         ctx.own = seg_bodies[idx]
         if not seg:
+            for name, value in ctx.assigns.items():
+                ctx.maybe.setdefault(name, []).append(value)
+            continue
+        if seg[0].text in ("export", "declare", "typeset", "unset"):
+            for w in seg[1:]:
+                if seg[0].text == "unset" and not w.text.startswith("-"):
+                    ctx.exported[w.text] = None
+                elif _is_assignment(w.text):
+                    name, value = _assignment(w)
+                    ctx.exported[name] = value
             continue
         if seg[0].basename_is("cd"):
             target = seg[1].text if len(seg) > 1 else os.path.expanduser("~")
@@ -605,7 +680,7 @@ def actions(command: str, cwd, depth: int = 0):
                 found.append(act)
     unique, seen = [], set()
     for act in found:
-        key = (act[0], act[1], tuple(act[2]))
+        key = (act.repo, act.label, tuple(act.texts), tuple(act.also))
         if key not in seen:
             seen.add(key)
             unique.append(act)
@@ -629,14 +704,18 @@ def decide(command: str, cwd, workspace: Path, lookup=None, remote=None):
     kwargs = {"lookup": lookup} if lookup else {}
     deny_terms = None
     problems = []
-    for repo, label, texts, act_cwd in acts:
-        if not any(t.strip() for t in texts):
+    for act in acts:
+        if not any(t.strip() for t in act.texts):
             continue
-        if repo is None and act_cwd:
-            repo = remote(act_cwd)
-        vis = policy.repo_visibility(repo, pdir / policy.VISIBILITY_CACHE_NAME, **kwargs)
-        if vis == "PRIVATE":
+        repo = act.repo
+        if repo is None:
+            repo = (os.environ.get("GH_REPO") if act.env_ok else None) or \
+                (remote(act.cwd) if act.cwd else None)
+        cache = pdir / policy.VISIBILITY_CACHE_NAME
+        targets = [(r, policy.repo_visibility(r, cache, **kwargs)) for r in [repo] + act.also]
+        if all(vis == "PRIVATE" for _, vis in targets):
             continue
+        repo, vis = next((r, v) for r, v in targets if v != "PRIVATE")
         if deny_terms is None:
             deny_terms = policy.load_terms(pdir / policy.DENYLIST_NAME)
             if deny_terms is None:
@@ -646,10 +725,10 @@ def decide(command: str, cwd, workspace: Path, lookup=None, remote=None):
                       file=sys.stderr)
             allow = [t.text for t in (policy.load_terms(pdir / policy.ALLOWLIST_NAME) or [])]
             allow += policy.own_identities()
-        hits = policy.scan("\n".join(texts), deny_terms, allow)
+        hits = policy.scan("\n".join(act.texts), deny_terms, allow)
         if hits:
             where = repo or "a repo this guard could not resolve (pass --repo OWNER/NAME)"
-            problems.append(f"{label} to {where} ({(vis or 'visibility unknown').lower()}): "
+            problems.append(f"{act.label} to {where} ({(vis or 'visibility unknown').lower()}): "
                             + "; ".join(f"`{h.matched}` [{h.category}]" for h in hits))
     if not problems:
         return None

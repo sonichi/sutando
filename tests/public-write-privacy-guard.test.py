@@ -20,6 +20,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parent.parent
 HOOK = REPO / "hooks" / "public-write-privacy-guard.py"
@@ -356,6 +357,64 @@ class RepoFromRemote(Base):
 
     def test_no_remote_is_unknown(self):
         self.assertIsNone(policy.repo_from_remote(self.tmp))
+
+
+class SecondReviewFindings(Base):
+    """Stdin read only from the gh segment's own heredoc, GH_REPO honoured as gh
+    honours it, and the reopen / label / gist edit verbs."""
+
+    ONLY_PUB = staticmethod(lambda repo: "PUBLIC" if repo == "o/pub" else "PRIVATE")
+
+    def test_stdin_is_never_matched_to_an_unrelated_heredoc(self):
+        cmd = f"cat <<'EOF' >/dev/null\nharmless\nEOF\necho {TERM} | gh issue comment 1 -R o/r -F -"
+        self.assertIn("stdin", self.decide(cmd))
+        self.assertIn("stdin", self.decide("cat <<'EOF' | gh pr comment 5 -R o/r -F -\nclean\nEOF"))
+        self.assertIsNone(self.decide("gh pr comment 5 -R o/r -F - <<'EOF'\nclean\nEOF"))
+
+    def remote_checkout(self, url):
+        d = Path(self.tmp) / "co"
+        env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+        subprocess.run(["git", "init", "-q", str(d)], check=True, env=env)
+        subprocess.run(["git", "-C", str(d), "remote", "add", "origin", url], check=True, env=env)
+        return str(d)
+
+    def run_in(self, cwd, cmd, lookup):
+        (policy.privacy_dir(self.ws) / policy.VISIBILITY_CACHE_NAME).unlink(missing_ok=True)
+        return guard.decide(cmd, cwd, self.ws, lookup=lookup)
+
+    def test_gh_repo_is_honoured(self):
+        priv = self.remote_checkout("https://github.com/o/priv.git")
+        b = f"gh pr comment 5 -b '{TERM}'"
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("GH_REPO", None)
+            for cmd in (f"GH_REPO=o/pub {b}", f"env GH_REPO=o/pub {b}", f"export GH_REPO=o/pub; {b}",
+                        f"GH_REPO=o/pub; {b}", f"GH_REPO=\"$X\" {b}",
+                        f"GH_REPO=o/pub gh api repos/{{owner}}/{{repo}}/issues -f body='{TERM}'"):
+                with self.subTest(cmd=cmd):
+                    self.assertIsNotNone(self.run_in(priv, cmd, self.ONLY_PUB))
+            self.assertIsNone(self.run_in(priv, b, self.ONLY_PUB))
+            self.assertIsNone(self.run_in(priv, f"GH_REPO=o/pub gh pr comment 5 -R o/priv -b '{TERM}'",
+                                          self.ONLY_PUB))
+        with mock.patch.dict(os.environ, {"GH_REPO": "o/pub"}):
+            self.assertIsNotNone(self.run_in(priv, b, self.ONLY_PUB))
+            self.assertIsNone(self.run_in(priv, f"env -u GH_REPO {b}", self.ONLY_PUB))
+            self.assertIsNone(self.run_in(priv, f"unset GH_REPO; {b}", self.ONLY_PUB))
+            self.assertIsNone(self.run_in(priv, f"GH_REPO=o/priv {b}", self.ONLY_PUB))
+
+    def test_reopen_label_and_gist_edit(self):
+        f = Path(self.tmp) / "g.md"
+        f.write_text(f"see {TERM}")
+        q = f"see {TERM}"
+        for cmd in (f"gh pr reopen 5 -R o/r --comment '{q}'", f"gh issue reopen 7 -R o/r -c '{q}'",
+                    f"gh label create '{TERM}' -R o/r", f"gh label create bug -R o/r -d '{q}'",
+                    f"gh label edit bug -R o/r --name '{TERM}'", f"gh label edit bug -R o/r --description='{q}'",
+                    f"gh gist edit abc123 --desc '{q}'", f"gh gist edit abc123 --add {f}",
+                    f"gh gist edit abc123 {f}", f"gh gist edit abc123 -f g.md - <<'EOF'\n{q}\nEOF"):
+            with self.subTest(cmd=cmd):
+                self.assertIsNotNone(self.decide(cmd))
+        self.assertIsNone(self.decide("gh pr reopen 5 -R o/r"))
+        self.assertIsNone(self.decide("gh gist edit abc123 -f notes.md"))
+        self.assertIsNotNone(self.decide(f"gh gist edit abc123 --desc '{q}'", lookup=PRIVATE))
 
 
 class Patterns(unittest.TestCase):
