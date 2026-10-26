@@ -8,13 +8,18 @@ Covers src/lane_dedupe.py and the gateway bridge's delegation to it:
   3. a task without source_message_id, or a hook task, is never deduped;
   4. claims expire after the TTL;
   5. an unwritable or malformed store fails open, with one warning line;
-  6. processes racing on one key: exactly one wins (real multiprocessing);
-  7. the loader installs the gate for a connection lane and never for a seat.
+  6. processes racing on one key: exactly one wins (real multiprocessing), and a claim
+     made while another connection holds a claim transaction open waits for it, then sees
+     the key (fails with a deferred BEGIN);
+  7. only same-tier copies are collapsed: lanes that disagree on the attested tier both
+     deliver, with one WARNING naming both lanes and tiers;
+  8. the loader installs the gate for a connection lane and never for a seat.
 
 Run: python3 tests/gateway-lane-dedupe.test.py   (exit 0 pass / 1 fail)
 """
 import importlib.util
 import multiprocessing
+import sqlite3
 import os
 import subprocess
 import sys
@@ -48,9 +53,13 @@ def check(name, cond, detail=""):
         failures.append(name)
 
 
+def _holder(*args, **kwargs):
+    return lane_dedupe.claim_key(*args, **kwargs)[0]
+
+
 def _race_worker(state_dir, key, lane, barrier, out):
     barrier.wait()
-    out.put((lane, lane_dedupe.claim_key(Path(state_dir), key, lane, log=lambda _m: None)))
+    out.put((lane, _holder(Path(state_dir), key, lane, log=lambda _m: None)))
 
 
 def main():
@@ -72,7 +81,7 @@ def main():
 
     room = {"channel_id": "!room:example.org", "source_room_id": "!room:example.org"}
 
-    # 7a. Delegation: a connection lane's loader installs the module's gate.
+    # 8a. Delegation: a connection lane's loader installs the module's gate.
     check("the loader installs the lane dedupe gate", rgb.TASK_INTAKE_GATE is rgb._lane_dedupe_gate)
 
     # 1. Same event, two lanes.
@@ -130,15 +139,14 @@ def main():
     # 4. TTL.
     ttl_dir = tmp / "ttl"
     key = lane_dedupe.key_of({"channel_id": "!r", "source_message_id": "$ttl"})
-    lane_dedupe.claim_key(ttl_dir, key, "a", now=1000.0, ttl=60)
-    check("a live claim blocks another lane", lane_dedupe.claim_key(ttl_dir, key, "b", now=1059.0, ttl=60) == "a")
-    check("an expired claim does not", lane_dedupe.claim_key(ttl_dir, key, "b", now=1061.0, ttl=60) is None)
-    check("the new claim now holds the key", lane_dedupe.claim_key(ttl_dir, key, "a", now=1062.0, ttl=60) == "b")
-    import sqlite3
+    _holder(ttl_dir, key, "a", now=1000.0, ttl=60)
+    check("a live claim blocks another lane", _holder(ttl_dir, key, "b", now=1059.0, ttl=60) == "a")
+    check("an expired claim does not", _holder(ttl_dir, key, "b", now=1061.0, ttl=60) is None)
+    check("the new claim now holds the key", _holder(ttl_dir, key, "a", now=1062.0, ttl=60) == "b")
     con = sqlite3.connect(str(ttl_dir / lane_dedupe.STORE_NAME))
-    lane_dedupe.claim_key(ttl_dir, "other", "a", now=1000.0, ttl=60)
-    lane_dedupe.claim_key(ttl_dir, "fresh", "a", now=5000.0, ttl=60)
-    rows = {r[0] for r in con.execute("SELECT key FROM claims")}
+    _holder(ttl_dir, "other", "a", now=1000.0, ttl=60)
+    _holder(ttl_dir, "fresh", "a", now=5000.0, ttl=60)
+    rows = {r[0] for r in con.execute("SELECT event FROM event_claims")}
     con.close()
     check("expired rows are pruned", rows == {"fresh"}, repr(rows))
 
@@ -146,8 +154,8 @@ def main():
     warnings = []
     blocker = tmp / "not-a-dir"
     blocker.write_text("x")
-    r1 = lane_dedupe.claim_key(blocker / "state", key, "a", log=warnings.append)
-    r2 = lane_dedupe.claim_key(blocker / "state", key, "b", log=warnings.append)
+    r1 = _holder(blocker / "state", key, "a", log=warnings.append)
+    r2 = _holder(blocker / "state", key, "b", log=warnings.append)
     check("an unwritable store delivers", r1 is None and r2 is None)
     check("and warns once", len(warnings) == 1 and "delivering without the guard" in warnings[0], repr(warnings))
     bad = tmp / "malformed"
@@ -155,8 +163,8 @@ def main():
     (bad / lane_dedupe.STORE_NAME).write_bytes(b"this is not a sqlite database" * 100)
     bad_warnings = []
     check("a malformed store delivers",
-          lane_dedupe.claim_key(bad, key, "a", log=bad_warnings.append) is None
-          and lane_dedupe.claim_key(bad, key, "b", log=bad_warnings.append) is None)
+          _holder(bad, key, "a", log=bad_warnings.append) is None
+          and _holder(bad, key, "b", log=bad_warnings.append) is None)
     check("and warns once", len(bad_warnings) == 1, repr(bad_warnings))
 
     # 6. A real race between processes.
@@ -176,7 +184,53 @@ def main():
     check("exactly one racing process wins", len(winners) == 1, repr(results))
     check("every loser names the winner", holders == set(winners), repr(results))
 
-    # 7b. A seat bridge is another agent: the loader never installs the gate there.
+    # 6b. Deterministic: A holds an open claim transaction after its read; B must wait, then see it.
+    import threading
+    lock_dir = tmp / "lock"
+    _holder(lock_dir, "warmup", "x")
+    event = "lock-event"
+    lock_key = lane_dedupe.hashlib.sha256(f"{event}\n".encode()).hexdigest()
+    a = sqlite3.connect(str(lock_dir / lane_dedupe.STORE_NAME), timeout=10, isolation_level=None)
+    a.execute("BEGIN IMMEDIATE")
+    check("A reads the key as free", a.execute("SELECT 1 FROM event_claims WHERE key = ?",
+                                               (lock_key,)).fetchone() is None)
+    b_out, b_warn = [], []
+    b = threading.Thread(target=lambda: b_out.append(lane_dedupe.claim_key(
+        lock_dir, event, "laneB", log=b_warn.append)))
+    b.start()
+    b.join(0.5)
+    check("B waits while A's claim is open", b.is_alive())
+    a.execute("INSERT INTO event_claims (key, event, lane, tier, ts) VALUES (?, ?, 'laneA', '', ?)",
+              (lock_key, event, lane_dedupe.time.time()))
+    a.execute("COMMIT")
+    a.close()
+    b.join(10)
+    check("then B sees A's claim", b_out and b_out[0][0] == "laneA", repr((b_out, b_warn)))
+    con = sqlite3.connect(str(lock_dir / lane_dedupe.STORE_NAME))
+    lanes = [r[0] for r in con.execute("SELECT lane FROM event_claims WHERE event = ?", (event,))]
+    con.close()
+    check("and never inserts the key too", lanes == ["laneA"], repr(lanes))
+
+    # 7. Tiers: same tier collapses, a disagreement delivers both with one WARNING.
+    logs.clear()
+    on_lane("", "task-T1", source_message_id="$tier1", access_tier="owner", **room)
+    on_lane("sspace", "task-T2", source_message_id="$tier1", access_tier="owner", **room)
+    check("the same event at the same tier on two lanes is one task",
+          (rgb.TASKS_DIR / "task-T1.txt").exists() and not (rgb.TASKS_DIR / "task-sspace~task-T2.txt").exists())
+    logs.clear()
+    on_lane("", "task-T3", source_message_id="$tier2", access_tier="owner", **room)
+    on_lane("sspace", "task-T4", source_message_id="$tier2", access_tier="team", **room)
+    check("the same event at different tiers is two tasks",
+          (rgb.TASKS_DIR / "task-T3.txt").exists() and (rgb.TASKS_DIR / "task-sspace~task-T4.txt").exists())
+    warned = [m for m in logs if m.startswith("WARNING lane dedupe")]
+    check("with one WARNING naming both lanes and tiers", len(warned) == 1
+          and "as team on lane sspace" in warned[0] and "lane primary as owner" in warned[0], repr(logs))
+    on_lane("", "task-T5", source_message_id="$tier3", access_tier="team", **room)
+    on_lane("sspace", "task-T6", source_message_id="$tier3", access_tier="team", collaborator=True, **room)
+    check("a collaborator attestation is a different tier",
+          (rgb.TASKS_DIR / "task-sspace~task-T6.txt").exists())
+
+    # 8. A seat bridge is another agent: the loader never installs the gate there.
     probe = (
         "import importlib.util, sys\n"
         f"spec = importlib.util.spec_from_file_location('rgb', {str(REPO / 'src' / 'remote-gateway-bridge.py')!r})\n"
