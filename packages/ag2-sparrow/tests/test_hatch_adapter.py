@@ -6519,6 +6519,45 @@ class Hold(Base):
         self.assertEqual(posts, [f"@bob:ag2.space {hatch_cli.HOLD_NOTICE}"], "exactly one line, on the next pass")
         self.assertEqual(hatch_cli.hold_line_outcome(self.results, self.TID), "delivered")
 
+    def test_a_marker_read_that_fails_inside_the_dispatch_veto_defers_the_line(self):
+        # Reviewer's probe: the same EMFILE, moved onto the marker read (its file, or its dir).
+        for where in ("the marker file", "the hold dir"):
+            with self.subTest(where):
+                shutil.rmtree(self.results)  # each case starts from a fresh results dir
+                self.results.mkdir()
+                self.add_task(self.TID, "$ev1")
+                self.assertEqual(self.hold(str(self.result_file)).returncode, hatch_cli.REPLY_POSTED)
+                failed, real_json, real_dir = [], task_hold._json_at, task_hold._open_dir
+
+                def in_marker_read():
+                    callers, frame = set(), sys._getframe(2)
+                    while frame is not None and len(callers) < 10:
+                        callers.add(frame.f_code.co_name)
+                        frame = frame.f_back
+                    return "line_veto" in callers and not callers & {"notice_record", "_rewrite_notice"}
+
+                def json_at(dfd, name, where=where):
+                    if where == "the marker file" and not failed and name.endswith(".json") and in_marker_read():
+                        failed.append(name)
+                        return None, "unreadable (EMFILE)"
+                    return real_json(dfd, name)
+
+                def open_dir(result_dir, create, where=where):
+                    if where == "the hold dir" and not failed and not create and in_marker_read():
+                        failed.append("dir")
+                        raise OSError(errno.EMFILE, "Too many open files")
+                    return real_dir(result_dir, create)
+                posts = []
+                with mock.patch.object(task_hold, "_json_at", side_effect=json_at), \
+                        mock.patch.object(task_hold, "_open_dir", side_effect=open_dir):
+                    self.drain_pass(posts)
+                self.assertTrue(failed, "the marker read failed inside the veto")
+                self.assertEqual(posts, [], "nothing sent on that pass")
+                self.assertTrue(self.notice.exists(), "and nothing withdrawn")
+                self.drain_pass(posts)
+                self.drain_pass(posts)
+                self.assertEqual(posts, [f"@bob:ag2.space {hatch_cli.HOLD_NOTICE}"], "exactly one line, next pass")
+
     def test_a_failed_marker_then_a_drain_pass_still_lets_hold_run_again(self):
         # Reviewer's B2: the drain withdraws the armed line no hold stands on; the retry must recover.
         self.add_task(self.TID, "$ev1")

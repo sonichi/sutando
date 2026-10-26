@@ -93,7 +93,10 @@ def _json_at(dfd: int, name: str) -> "tuple[dict | None, str]":
 
 
 def _read_at(dfd: int, name: str) -> "dict | None":
-    record = _json_at(dfd, name)[0]
+    return _marker(_json_at(dfd, name)[0])
+
+
+def _marker(record) -> "dict | None":
     if not (isinstance(record, dict) and isinstance(record.get("reason"), str)
             and _REASON_RE.fullmatch(record["reason"]) and _valid_since(record.get("since"))
             and isinstance(record.get("token"), str) and record["token"]):
@@ -173,6 +176,22 @@ def read(result_dir: Path, tid: str) -> "dict | None":
         return None
     try:
         return _read_at(dfd, name)
+    finally:
+        os.close(dfd)
+
+
+def read_checked(result_dir: Path, tid: str) -> "dict | None":
+    """`read`, but an unreadable hold dir or marker raises OSError instead of reading as None:
+    one that cannot be read now is not one that is absent."""
+    name = _name(tid)
+    dfd = _open_dir(result_dir, create=False)
+    if dfd is None:
+        return None
+    try:
+        record, why = _json_at(dfd, name)
+        if record is None and bounded_file_read.unreadable(why):
+            raise OSError(f"the hold marker of {tid} is {why}")
+        return _marker(record)
     finally:
         os.close(dfd)
 
@@ -310,7 +329,7 @@ def line_veto(result_dir: Path, tid: str, ts: "int | None") -> "str | None":
         return None
     try:
         fields = notice_record(result_dir, tid)
-        held = read(result_dir, tid)
+        held = read_checked(result_dir, tid)
     except (OSError, ValueError) as e:
         # Unreadable is not absent: the drain keeps the line for a later pass.
         return Defer(f"its hold could not be checked ({e})")
