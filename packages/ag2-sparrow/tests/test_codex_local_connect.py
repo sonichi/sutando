@@ -152,6 +152,7 @@ REAL_LAUNCHER = ("import os, subprocess, sys, time; sys.path.insert(0, %r)\n"
                  "        time.sleep(0.05)\n"
                  "    return real(*a, **kw)\n"
                  "task_io.acquire_lock = paused\n"
+                 "if acted != os.devnull: open(acted + '.ready', 'w').close()   # its stop handlers are in place\n"
                  "def prepare(owner, r):\n"
                  "    with open(acted, 'a') as f: f.write('acted\\n')\n"
                  "    print('held', flush=True); return None, ''\n"
@@ -224,12 +225,12 @@ class Runner:
 
     def stop_session(self):
         if self.session is not None:
-            if self.real:                           # the manager's stop: its process group, SIGTERM, then SIGKILL
+            if self.real:                           # the manager's stop: SIGTERM to its process group, then a bound
                 try:
                     os.killpg(self.session.pid, signal.SIGTERM)
                     self.session.wait(timeout=self.stop_timeout)
                 except subprocess.TimeoutExpired:
-                    os.killpg(self.session.pid, signal.SIGKILL)
+                    return                              # the stop timed out: the job is left running
                 except ProcessLookupError:
                     pass
             unhold(self.session)
@@ -237,6 +238,16 @@ class Runner:
 
     def alive(self):
         return self.session is not None and self.session.poll() is None
+
+    def reap(self):
+        """The test's own cleanup: every launcher it spawned, and its process group, gone."""
+        for spawned in self.spawned:
+            if self.real and spawned.poll() is None:
+                try:
+                    os.killpg(spawned.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+        self.stop_session()
 
     def verb(self, cmd):
         return cmd[1] if cmd[0] == "launchctl" else next(a for a in cmd[1:] if not a.startswith("--"))
@@ -269,6 +280,8 @@ class Runner:
                 self.start_session(by_manager=True)
             elif verb in STOP_VERBS:
                 self.stop_session()
+                if self.alive():
+                    return subprocess.CompletedProcess(cmd, 1, "", "Job for the unit timed out stopping")
         return subprocess.CompletedProcess(cmd, rc, out, err)
 
     def verbs(self, program):
@@ -311,7 +324,7 @@ class Base(unittest.TestCase):
             p.start()
             self.addCleanup(p.stop)
         self.runners = []
-        self.addCleanup(lambda: [r.stop_session() for r in self.runners])
+        self.addCleanup(lambda: [r.reap() for r in self.runners])
 
     def runner(self, table=None, default=0, root=True, adapter="codex-local"):
         r = Runner(table, default, str(self.work) if root else None, adapter)
@@ -2130,7 +2143,7 @@ class ConnectCode(Base):
             with self.subTest("launchd shim child" if shim else "systemd direct"):
                 fake = self.fake()
                 r = fake.runner
-                r.real, r.shim = True, shim
+                r.real, r.shim, r.stop_timeout = True, shim, 2       # the stop times out on the paused launcher
                 r.pause, r.acted = str(self.home / f"resume-{shim}"), str(self.home / f"acted-{shim}")
                 with mock.patch.object(cm, "AGENT_LOCK_WAIT_S", 0.5), mock.patch.object(cm, "is_macos", return_value=shim):
                     rc, out, err = self.connect(Backend(), fake)
@@ -2149,7 +2162,6 @@ class ConnectCode(Base):
                 self.assertNotEqual(rc, 0, out + err)
                 self.assertNotIn("next:", out)
                 self.assertIn("did not acquire", err)
-                self.assertIn("the job this operation started, was stopped", err)
 
     def test_the_real_launcher_through_launchds_shim_ends_up_alive(self):
         fake = self.fake()
@@ -2170,11 +2182,19 @@ class ConnectCode(Base):
                 fake = self.fake()
                 fake.runner.real, fake.runner.shim = True, shim
                 fake.runner.acted = str(self.home / f"acted-{shim}")
-                started = time.monotonic()
+                ready = Path(fake.runner.acted + ".ready")
+
+                def refused_once_waiting(*a, **kw):
+                    deadline = time.monotonic() + 30
+                    while not ready.exists() and time.monotonic() < deadline:
+                        time.sleep(0.05)                # the launcher is in admission, waiting for this lock
+                    started.append(time.monotonic())
+                    return "the bridge was refused"
+                started = []
                 with mock.patch.object(cm, "is_macos", return_value=shim), \
-                        mock.patch.object(cb, "wire_bridge", return_value="the bridge was refused"):
+                        mock.patch.object(cb, "wire_bridge", side_effect=refused_once_waiting):
                     rc, out, err = self.connect(Backend(), fake)
-                took = time.monotonic() - started
+                took = time.monotonic() - started[0]
                 self.assertNotEqual(rc, 0, out + err)
                 self.assertIn("this attempt was undone", err)
                 self.assertLess(took, 8, "the launcher left admission on the stop, not at its 20 s wait or the kill")
