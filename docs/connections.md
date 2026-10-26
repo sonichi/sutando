@@ -218,6 +218,9 @@ other vault writer, in this process or another, can land in between. The lock or
 `connections.lock`, then the vault lock; nothing in the vault layer takes `connections.lock`. The
 lock is released when its holder raises or exits (a killed holder's lock is dropped by the
 kernel), and its file stays empty. A lock that cannot be taken fails the write.
+The tradeoff is that vault writes are serialized: every other vault writer waits for the length
+of an `update_token` transaction (about 7 s in the live receipt), and a holder that is alive but
+wedged delays them until it exits.
 
 The restore is still a compare-and-swap on the stored value: the previous secret is written back
 only when a read shows exactly the new code this update wrote, then read back again. Read back
