@@ -11,6 +11,7 @@ Format: `- Brief description of what changed. ([#NNN])`
 ## Added
 
 <!-- feat() PRs go here -->
+- connections: adding a connection over HTTP or the runtime API starts its bridge at once (`connections.start_added`; `connections.py start` runs the same unit and never starts a second bridge over a held lease); a failed start leaves the row `failed` with its `reason`. Rows now carry `running` (bridge lease held), and a disconnected row reads `state: parked` (`reason: disabled`) instead of `disconnected`.
 - skills: a manifest may set `"audience": "developer"`; `skills/install.sh`, `skills/install.ps1` and `health-check --fix` then skip that skill unless sutando config sets `skills.developer` to `true`. An unknown audience value counts as developer-only. A developer skill already linked on a host is left in place with a note. ([#5725])
 - ag2-sparrow: a `REMOTE_HEALTH_COMMAND` row whose `motion` is `unknown` (the Hatch keepalive row) is sent as `moving` while a message Sparrow pulled waits for its result to be posted, `idle` otherwise, so the health dot shows a Hatch agent at work. ([#5682])
 - tutorial: `getting_started.py publish` reads the setup app's saved inputs (`<workspace>/state/onboarding/tutorial-inputs.json`: owner DM room, owner, agent id, picked roles) for any flag left out, so `publish` alone works; `--name` defaults to `auto`. The skill now answers an owner DM line `/tutorial` (the setup app ends the first-contact message with it) and runs by its script path, which a core that cannot find skills by name can still follow.

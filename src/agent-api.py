@@ -190,7 +190,7 @@ def connections_http(method: str, path: str, body: dict, query: Optional[dict] =
                      kill=None, getaddrinfo=None) -> "tuple[int, Optional[dict]]":
     """(status, payload) for one request under CONNECTIONS_PREFIX; payload None = empty body.
     The HTTP shape of the connections domain: GET lists, GET known-servers offers the registry,
-    POST previews or (confirm) creates, DELETE removes, POST <instance>/primary moves the primary,
+    POST previews or (confirm) creates and starts the bridge, DELETE removes, POST <instance>/primary moves the primary,
     POST <instance>/disconnect stops and disables, POST <instance>/reconnect relaunches,
     POST <instance>/token replaces the secret with a new code for the same connection.
     Dispatch only; every rule lives in src/connections.py."""
@@ -227,7 +227,9 @@ def connections_http(method: str, path: str, body: dict, query: Optional[dict] =
                     instance=body.get("instance"), preview=preview, workspace=ws, vault=vault)
             except _connections.ConnectionMismatch as e:
                 return 409, {"error": "mismatch", "server_from_token": e.derived, "expected_server": e.claimed}
-            return (201 if created else 200), {"created": created,
+            launch = _connections.start_added(row, repo=repo, logs_dir=logs_dir, workspace=ws,
+                                              vault=vault, spawn=spawn)
+            return (201 if created else 200), {"created": created, "launch": launch,
                                                "connection": _connections.status_for(row, ws)}
         if len(parts) == 1 and method == "DELETE":
             force = str((query.get("force") or [""])[0]).lower() in ("1", "true", "yes")

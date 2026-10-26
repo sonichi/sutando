@@ -27,6 +27,9 @@
   launch INSTANCE --repo DIR --logs-dir DIR [--env-only]
                                start one bridge from the launch plan (--env-only: from the
                                AG2_REMOTE_TOKEN_<INST> variable alone, when the record is unreadable)
+  start INSTANCE --repo DIR --logs-dir DIR
+                               launch unless a bridge already holds the lease; exit 1 naming the
+                               reason when it did not start
   import-env                   rows once for REMOTE_TASK_TOKEN and each AG2_REMOTE_TOKEN_<INST>
   launch-plan                  one 'instance<TAB>token_ref<TAB>channel_dir<TAB>primary' line per bridge
   primary                      the primary row's instance ('' = the legacy bridge); exit 2 when none
@@ -142,6 +145,15 @@ def cmd_launch(args) -> int:
     return 0
 
 
+def cmd_start(args) -> int:
+    record = connections.start(args.instance, repo=args.repo, logs_dir=args.logs_dir, workspace=args.workspace)
+    if not record.get("ok"):
+        print(f"connections: {args.instance} did not start: {record.get('reason') or 'launch_failed'}", file=sys.stderr)
+        return 1
+    print(f"{'already running' if record.get('lease') == 'already_running' else 'started'} {args.instance} (pid {record['pid']})")
+    return 0
+
+
 def cmd_reconnect(args) -> int:
     record = connections.reconnect(args.instance, repo=args.repo, logs_dir=args.logs_dir, workspace=args.workspace)
     stopped = f"stopped pid {record['stopped_pid']}, " if record.get("stopped_pid") else ""
@@ -214,6 +226,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(fn=cmd_known_servers)
     s = sub.add_parser("launch"); _launch_args(s); s.add_argument("--env-only", action="store_true")
     s.set_defaults(fn=cmd_launch)
+    s = sub.add_parser("start"); _launch_args(s); s.set_defaults(fn=cmd_start)
     s = sub.add_parser("reconnect"); _launch_args(s); s.set_defaults(fn=cmd_reconnect)
     s = sub.add_parser("update-token"); s.add_argument("instance")
     s.add_argument("token", metavar="TOKEN|-",
