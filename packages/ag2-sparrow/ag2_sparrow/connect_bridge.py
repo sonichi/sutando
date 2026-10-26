@@ -157,15 +157,32 @@ def agent_root(agent_id: str) -> "tuple[str, str]":
     return root, problem or served_elsewhere(agent_id, root)
 
 
-def rerun_install(command: str, token_file: str) -> str:
-    """The install that repeats one given the agent's own seat (`token_file`), else the bare one."""
-    return f"{command} install " + (f"--token-env-file {shlex.quote(token_file)}" if token_file else "again")
+_NOT_SESSION = ("help", "base", "code", "trust_relay_host", "work", "inbox", "token_env_file", "bridge_state_dir")
 
 
-def spent_code_line(command: str, seat_env: str) -> str:
+def session_flags(args) -> list:
+    """The session options `args` carries away from their defaults, as install takes them again; read
+    through the parser main() records on args."""
+    parser, out = getattr(args, "parser", None), []
+    for action in (parser._actions if parser is not None else ()):
+        value = getattr(args, action.dest, action.default)
+        if not action.option_strings or action.dest in _NOT_SESSION or value is None or value == action.default:
+            continue
+        flag = next(o for o in action.option_strings if o.startswith("--"))
+        out += [flag] if value is True else [flag, str(value)]
+    return out
+
+
+def rerun_install(command: str, token_file: str, flags=()) -> str:
+    """The install that repeats one given the agent's own seat (`token_file`) and these session flags,
+    else the bare one."""
+    return f"{command} install " + (shlex.join([*flags, "--token-env-file", token_file]) if token_file else "again")
+
+
+def spent_code_line(command: str, seat_env: str, flags=()) -> str:
     """After a connect whose install failed: the code is spent, but the seat it wrote recovers it."""
     return (f"the code is spent and its credential is in the seat {seat_env}; once the line above is fixed, run "
-            f"{rerun_install(command, seat_env)} (no new code is needed)")
+            f"{rerun_install(command, seat_env, flags)} (no new code is needed)")
 
 
 def bridge_fix(cfg: dict, command: str, bridge: cm.Shape) -> str:
@@ -316,8 +333,8 @@ def host_problem(command: str) -> str:
 def redeem_into_seat(base: str, code_arg, trust_relay_host: str, preflight,
                      local: cm.Shape) -> "tuple[dict | None, str]":
     """({agent_id, root, seat_env}, '') or (None, the line to print): the code read, checked with
-    `preflight()` before it is spent, redeemed once, the root checked as `local`'s install checks it, and
-    the credential written to the agent's seat by its owner. The bearer never leaves the seat's token file."""
+    `preflight()` before it is spent, redeemed once, and the credential written to the agent's seat by its
+    owner only while this process holds the root (connect_common.under_root). The bearer never leaves the seat's token file."""
     code, problem = cm.read_code(code_arg)
     problem = problem or cm.code_problem(base, code) or preflight()
     if problem:
@@ -328,11 +345,13 @@ def redeem_into_seat(base: str, code_arg, trust_relay_host: str, preflight,
     problem = cm.relay_problem(base, redeemed["relay_url"], trust_relay_host or "")
     root, problem = ("", problem) if problem else cm.canonical_root(
         str(_dirs.agents_dir() / agent_identity.root_segment(redeemed["agent_id"])), "")
-    held = "" if problem else cm.root_lock_problem(local, root)
+    if problem:
+        return None, f"the code is spent but the seat was not written: {problem}; make a new code"
+    written, held = cm.under_root(local, root, lambda: cm.write_seat(bridge_home(root), redeemed))
     if held:
         return None, (f"{held}; the code is spent and nothing was written ({bridge_home(root)} is unchanged): "
                       "make a new code in AG2 Space once the root is free")
-    seat, problem = ("", problem) if problem else cm.write_seat(bridge_home(root), redeemed)
+    seat, problem = written
     if problem:
         return None, f"the code is spent but the seat was not written: {problem}; make a new code"
     print(f"connected: {redeemed['agent_id']}; credentials in {Path(seat).parent} (mode 600)")

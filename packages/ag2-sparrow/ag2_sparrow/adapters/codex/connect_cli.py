@@ -166,7 +166,7 @@ def install(args) -> int:
     problem = cb.wire_bridge(dict(values, ROOT=root), COMMAND, BRIDGE)
     if problem:
         print(f"error: the connector is installed but its bridge is not: {problem}; run "
-              f"{cb.rerun_install(COMMAND, where['token_file'])}", file=sys.stderr)
+              f"{cb.rerun_install(COMMAND, where['token_file'], cb.session_flags(args))}", file=sys.stderr)
         return EXIT_UNUSABLE
     return 0
 
@@ -195,7 +195,7 @@ def connect(args) -> int:
     if rc == 0:
         print(f"next: {COMMAND} verify (the bridge reports connected within a minute)")
     else:
-        print(f"error: {cb.spent_code_line(COMMAND, seat['seat_env'])}", file=sys.stderr)
+        print(f"error: {cb.spent_code_line(COMMAND, seat['seat_env'], cb.session_flags(args))}", file=sys.stderr)
     return rc
 
 
@@ -321,7 +321,7 @@ def main(argv=None) -> int:
     p.add_argument("--token-env-file", help="instead of --work: the agent's 0600 env file (a seat .env, or one with "
                    "REMOTE_TASK_TOKEN and AGENT_MXID); the root is the agent's own and install runs its bridge")
     session_options(p)
-    p.set_defaults(func=install)
+    p.set_defaults(func=install, parser=p)
     c = sub.add_parser("connect", help="check this machine, redeem the one-time code from AG2 Space for the agent's "
                        "relay credential, write it to the agent's seat (mode 600), then install as install does")
     c.add_argument("--base", required=True, help="the AG2 Space backend URL the code was issued by")
@@ -330,7 +330,7 @@ def main(argv=None) -> int:
     c.add_argument("--trust-relay-host", help="accept a relay URL on this host although it is not --base's host "
                    "or under it (only when AG2 Space told you to)")
     session_options(c)
-    c.set_defaults(func=connect)
+    c.set_defaults(func=connect, parser=c)
     run_help = (f"what the manager runs: the launcher of the connector on its own app-server; refused unless "
                 f"{cm.MANAGED_VAR}=1 is in the environment, as the unit sets it (a guard against an accidental hand "
                 "start, not a security boundary)")

@@ -689,36 +689,63 @@ def launcher_log(shape: Shape) -> str:
     return str(log_path(shape)) if is_macos() else f"journalctl --user -u {shape.service_name}"
 
 
-def root_lock_problem(shape: Shape, root: str) -> str:
-    """'' unless `root` is held by anything but `shape`'s active job on this very root, or either cannot be
-    probed: why.
-    Install refuses on it; connect asks it before writing the agent's seat."""
-    return _root_lock(shape, root)[0]
+CONNECT_HOLDER = "connect"
 
 
-def _root_lock(shape: Shape, root: str) -> "tuple[str, str]":
-    """(root_lock_problem's answer, the manager state it probed)."""
+def under_root(shape: Shape, root: str, act) -> "tuple[object, str]":
+    """(act(), '') run while this process holds `root`'s lock, so no adapter takes or leaves the root
+    meanwhile. A free root is taken; one held by `shape`'s own job on this very root is stopped, then
+    taken; anything else, or a root another process takes first, is (None, why) and act never runs."""
+    try:
+        with operation_lock(shape):
+            problem, _manager, held = _root_lock(shape, root)
+            if problem:
+                return None, problem
+            if held:
+                problem = stop_supervisor(shape) or _await_free(root)
+                if problem:
+                    return None, problem
+                print(f"stopped: {job_name(shape)}")
+            Path(root).mkdir(parents=True, exist_ok=True)
+            try:
+                owner = acquire_lock(root, CONNECT_HOLDER)
+            except LockRefused as e:
+                return None, (f"{root} was taken by another process first ({e.line})"
+                              + (f"; {job_name(shape)} is stopped" if held else ""))
+            try:
+                return act(), ""
+            finally:
+                release_lock(owner)
+    except Busy as e:
+        return None, str(e)
+
+
+def _root_lock(shape: Shape, root: str) -> "tuple[str, str, bool]":
+    """('' or why the root may not be taken, the manager state probed, whether it is held by `shape`'s
+    own job on it): held by anything else, or unprobeable, refuses."""
     state, manager = lock_held(root), manager_state(shape)
     if state == "unknown" or manager == "unknown":
-        return f"{root} is {holder_line(root)} and {job_name(shape)} is {manager}", manager
+        return f"{root} is {holder_line(root)} and {job_name(shape)} is {manager}", manager, False
     if state == "held" and manager != "active":
         rec = lock_holder(root)
         who = f"launcher pid {rec['pid']}" if rec.get("live") else "an unrecorded holder; lsof the lock file"
         return (f"{root} is held by a session no job of {job_name(shape)} manages ({who}); stop it, then run "
-                "install again"), manager
+                "install again"), manager, False
     if state == "held":
-        return _managed_here(shape, root), manager
-    return "", manager
+        return _managed_here(shape, root), manager, True
+    return "", manager, False
 
 
 def _managed_here(shape: Shape, root: str) -> str:
-    """'' only when the active job's recorded root is `root` and the lock's record names this shape;
-    an unreadable config, no recorded root, another root or another holder all refuse."""
+    """'' only when the active job's recorded root is `root` and the lock's record is live and names
+    this shape and install; an unreadable config, another root, a stale record or another holder refuse."""
     cfg, problem = owned_config(shape)
     managed = (cfg or {}).get("ROOT", "")
     rec = lock_holder(root)
-    if problem or managed != root or rec.get("adapter") != shape.name:
-        who = f"{rec.get('adapter')} pid {rec.get('pid')}" if rec else "an unrecorded holder"
+    ours = rec.get("live") is True and rec.get("adapter") == shape.name and rec.get("install_id") == install_id()
+    if problem or managed != root or not ours:
+        who = ("a holder with no live record" if rec.get("live") is not True else f"{rec.get('adapter')} pid "
+               f"{rec.get('pid')}" + ("" if rec.get("install_id") == install_id() else " of another install"))
         return (f"{root} is held by {who} while {job_name(shape)} is active for "
                 f"{managed or 'no recorded work root'}; stop that session, then run install again")
     return ""
@@ -744,7 +771,7 @@ def _install_locked(shape: Shape, values: dict, root: str, revise=None, precheck
     unit, problem = render_supervisor(shape)
     if problem:
         return _refuse(problem)
-    problem, manager = _root_lock(shape, root)
+    problem, manager, _held = _root_lock(shape, root)
     if problem:
         return _refuse(f"{problem}; nothing was applied")
     before = lock_holder(root)

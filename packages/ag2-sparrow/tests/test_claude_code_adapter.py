@@ -2287,17 +2287,18 @@ class ConnectCode(AgentRootBase):
     def test_a_free_root_passes_installs_own_check_and_connect_proceeds(self):
         self.seated_by_another_adapter()
         checked = []
-        real = cm.root_lock_problem
-        with mock.patch.object(cm, "root_lock_problem",
-                               side_effect=lambda shape, root: checked.append((shape.name, root)) or real(shape, root)):
+        real = cm.under_root
+        with mock.patch.object(cm, "under_root",
+                               side_effect=lambda shape, root, act: checked.append((shape.name, root)) or real(shape, root, act)):
             rc, _out, err = self.connect(Backend())
         self.assertEqual(rc, 0, err)
         self.assertEqual(checked, [(cli.SHAPE, str(self.root))], "asked once, before the seat")
         self.assertEqual((self.seat() / "token").read_text(), f"{RELAY}|{BEARER}\n")
 
     def files(self):
-        """Every file under the test home, by bytes: what a refused connect may not change."""
-        return {str(p): p.read_bytes() for p in sorted(self.home.rglob("*")) if p.is_file()}
+        """Every file under the test home, by bytes, but the empty operation lock file: what a refused connect
+        may not change."""
+        return {str(p): p.read_bytes() for p in sorted(self.home.rglob("*")) if p.is_file() and p.suffix != ".oplock"}
 
     def assert_refused_untouched(self, fake, why):
         """connect refuses before the seat, the agent's seat byte-identical and no file anywhere changed."""
@@ -2329,16 +2330,21 @@ class ConnectCode(AgentRootBase):
         cases = (("no config", None, L.name, "active for no recorded work root"),
                  ("no recorded root", "", L.name, "active for no recorded work root"),
                  ("unparsable config", "unparsable", L.name, "active for no recorded work root"),
-                 ("another holder", "root", "codex-local", "is held by codex-local pid"))
+                 ("another holder, this root", "root", "codex-local", "is held by codex-local pid"),
+                 ("this adapter, another root", "elsewhere", L.name, "is held by claude-local pid"),
+                 ("this adapter and root, another install", "root", (L.name, "/elsewhere/site-packages/ag2_sparrow"),
+                  "of another install"))
         for name, root, adapter, why in cases:
             with self.subTest(name):
                 shutil.rmtree(self.agents, ignore_errors=True)
+                root = str(self.home / "agent-a") if root == "elsewhere" else root
+                adapter, install = adapter if isinstance(adapter, tuple) else (adapter, "")
                 cli.config_path().unlink(missing_ok=True)
                 if root is not None:
                     self.configure(ROOT=str(self.root) if root in ("root", "unparsable") else root)
                 if root == "unparsable":
                     cli.config_path().write_text(cli.config_path().read_text() + "ROOT='unclosed\n")
-                fake = self.bridged(adapter=adapter)
+                fake = self.bridged(adapter=adapter, install=install)
                 self.root.mkdir(parents=True)
                 fake.runner.start_session()
                 try:
@@ -2346,12 +2352,60 @@ class ConnectCode(AgentRootBase):
                 finally:
                     fake.runner.stop_session()
 
+    def test_an_independent_holder_of_this_shape_on_the_root_is_refused_while_the_job_serves_another(self):
+        a = self.home / "agent-a"
+        fake = self.bridged(root=a)
+        rc, _out, err = self.install_default(fake, "--work", str(a))
+        self.assertEqual(rc, 0, err)
+        self.root.mkdir(parents=True)
+        holder = hold(self.root, L.name)
+        try:
+            self.assert_refused_untouched(fake, f"{self.root} is held by claude-local pid {holder.pid} while "
+                                                f"{cm.job_name(L)} is active for {a}")
+        finally:
+            unhold(holder)
+
+    def test_a_stale_record_of_this_shape_does_not_vouch_for_a_successor_that_has_not_published(self):
+        self.configure(ROOT=str(self.root))
+        self.root.mkdir(parents=True)
+        dead = hold(self.root, L.name)
+        dead.kill()
+        dead.wait(timeout=30)
+        dead.stdin.close()
+        dead.stdout.close()
+        fake = self.bridged()
+        fake.runner.session = hold(self.root, script=UNPUBLISHED)   # the manager reads active while it lives
+        try:
+            rec = task_io.lock_holder(str(self.root))
+            self.assertEqual((rec["adapter"], rec["pid"], rec["live"]), (L.name, dead.pid, False))
+            self.assert_refused_untouched(fake, f"{self.root} is held by a holder with no live record")
+        finally:
+            fake.runner.stop_session()
+
+    def test_a_holder_that_takes_the_root_after_the_clean_check_keeps_the_seat(self):
+        self.root.mkdir(parents=True)
+        late, real = [], cm._root_lock
+
+        def checked_then_taken(shape, root):
+            got = real(shape, root)
+            if not late:
+                late.append(hold(self.root, "codex-local"))
+            return got
+        try:
+            with mock.patch.object(cm, "_root_lock", side_effect=checked_then_taken):
+                self.assert_refused_untouched(None, f"{self.root} was taken by another process first")
+        finally:
+            for p in late:
+                unhold(p)
+        self.assertEqual(len(late), 1)
+
     def test_a_failed_install_after_connect_names_the_seat_that_recovers_the_spent_code(self):
         seat = cli.bridge_home(self.root) / "channels" / "ag2space" / ".env"
-        rerun = f"{cli.COMMAND} install --token-env-file {seat}"
+        rerun = (f"{cli.COMMAND} install --plugin-dir {self.plugin} --claude-config-dir {self.home / '.claude-sutando'} "
+                 f"--hmac-key-file {self.home / 'task-hmac.key'} --permission-mode plan --token-env-file {seat}")
         with mock.patch.object(cm, "console_script",
                                side_effect=lambda shape: "" if shape is cli.BRIDGE else str(self.bin / shape.command)):
-            rc, _out, err = self.connect(Backend())
+            rc, _out, err = self.connect(Backend(), None, "--permission-mode", "plan")
         self.assertEqual(rc, cli.EXIT_UNUSABLE, err)
         self.assertIn("the session is installed but its bridge is not: ag2-sparrow was not found beside", err)
         self.assertIn(f"the code is spent and its credential is in the seat {seat}; once the line above is fixed, run "

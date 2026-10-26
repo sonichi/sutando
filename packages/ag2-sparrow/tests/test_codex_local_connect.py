@@ -12,6 +12,7 @@ import io
 import json
 import os
 import plistlib
+import shlex
 import shutil
 import signal
 import stat
@@ -101,6 +102,9 @@ FORBIDDEN_ARGS = ("--once", "--idle-exit", "--push", "--thread-id", "--ephemeral
                   "stub", "proxy", "--list-models", "--list-loaded")
 STAND_IN = ("import sys; sys.path.insert(0, %r); from ag2_sparrow import task_io\n"
             "o = task_io.acquire_lock(%r, %r); print('held', flush=True); sys.stdin.read(); task_io.release_lock(o)")
+SUCCESSOR = ("import sys; sys.path.insert(0, %r); from ag2_sparrow import holder_lock as h\n"
+             "g = h.acquire(%r, install_id=h.install_id()); print('held' if isinstance(g, h.Acquired) else g, flush=True)\n"
+             "sys.stdin.read(); h.release(g.owner)")
 OP_HOLDER = ("import sys; sys.path.insert(0, %r); from ag2_sparrow import connect_common as cm\n"
              "from ag2_sparrow.adapters.codex.connect_cli import LOCAL\n"
              "with cm.operation_lock(LOCAL): print('held', flush=True); sys.stdin.read()")
@@ -1168,19 +1172,19 @@ class ConnectCode(Base):
     def test_a_free_root_passes_installs_own_check_and_connect_proceeds(self):
         self.seated_by_another_adapter()
         checked = []
-        real = cm.root_lock_problem
-        with mock.patch.object(cm, "root_lock_problem",
-                               side_effect=lambda shape, root: checked.append((shape.name, root)) or real(shape, root)):
+        real = cm.under_root
+        with mock.patch.object(cm, "under_root",
+                               side_effect=lambda shape, root, act: checked.append((shape.name, root)) or real(shape, root, act)):
             rc, _out, err = self.connect(Backend())
         self.assertEqual(rc, 0, err)
         self.assertEqual(checked, [(cli.SHAPE, str(self.root))], "asked once, before the seat")
         self.assertEqual((self.seat() / "token").read_text(), f"{RELAY}|{BEARER}\n")
 
     def files(self):
-        """Every file under the test home, by bytes, but the fake codex's own call log: what a refused connect
-        may not change."""
-        return {str(p): p.read_bytes() for p in sorted(self.home.rglob("*"))
-                if p.is_file() and not (p.parent == self.home and p.name.startswith("codex-"))}
+        """Every file under the test home, by bytes, but the fake codex's call log and the empty operation
+        lock file: what a refused connect may not change."""
+        return {str(p): p.read_bytes() for p in sorted(self.home.rglob("*")) if p.is_file() and p.suffix != ".oplock"
+                and not (p.parent == self.home and p.name.startswith("codex-"))}
 
     def assert_refused_untouched(self, fake, why):
         """connect refuses before the seat, the agent's seat byte-identical and no file anywhere changed."""
@@ -1214,10 +1218,12 @@ class ConnectCode(Base):
         cases = (("no config", None, cli.SHAPE, "active for no recorded work root"),
                  ("no recorded root", "", cli.SHAPE, "active for no recorded work root"),
                  ("unparsable config", "unparsable", cli.SHAPE, "active for no recorded work root"),
-                 ("another holder", "root", "claude-local", "is held by claude-local pid"))
+                 ("another holder, this root", "root", "claude-local", "is held by claude-local pid"),
+                 ("this adapter, another root", "elsewhere", cli.SHAPE, "is held by codex-local pid"))
         for name, root, adapter, why in cases:
             with self.subTest(name):
                 shutil.rmtree(self.root.parent.parent, ignore_errors=True)
+                root = str(self.home / "agent-a") if root == "elsewhere" else root
                 cli.config_path().unlink(missing_ok=True)
                 if root is not None:
                     self.configure(ROOT=str(self.root) if root in ("root", "unparsable") else root)
@@ -1232,15 +1238,68 @@ class ConnectCode(Base):
                 finally:
                     runner.stop_session()
 
+    def test_an_independent_holder_of_this_shape_on_the_root_is_refused_while_the_job_serves_another(self):
+        a = self.home / "agent-a"
+        fake = BridgeFake(Runner(None, 0, str(a)))
+        self.runners.append(fake.runner)
+        with mock.patch.object(sm, "_run", side_effect=fake):
+            self.assertEqual(self.main("install", "--work", str(a), "--codex-home", str(self.codex_home))[0], 0)
+        self.root.mkdir(parents=True)
+        holder = hold(self.root, cli.SHAPE)
+        try:
+            self.assert_refused_untouched(fake, f"{self.root} is held by codex-local pid {holder.pid} while "
+                                                f"{cm.job_name(L)} is active for {a}")
+        finally:
+            unhold(holder)
+
+    def test_a_stale_record_of_this_shape_does_not_vouch_for_a_successor_that_has_not_published(self):
+        self.configure(ROOT=str(self.root))
+        self.root.mkdir(parents=True)
+        dead = hold(self.root, cli.SHAPE)
+        dead.kill()
+        dead.wait(timeout=30)
+        dead.stdin.close()
+        dead.stdout.close()
+        successor = subprocess.Popen([sys.executable, "-c", SUCCESSOR % (str(PKG), str(self.root))],
+                                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        runner = Runner(None, 0, str(self.root))
+        runner.session = successor                       # the manager reads active while it lives
+        self.runners.append(runner)
+        try:
+            self.assertEqual(successor.stdout.readline().strip(), "held")
+            rec = task_io.lock_holder(str(self.root))
+            self.assertEqual((rec["adapter"], rec["pid"], rec["live"]), (cli.SHAPE, dead.pid, False))
+            self.assert_refused_untouched(BridgeFake(runner), f"{self.root} is held by a holder with no live record")
+        finally:
+            runner.stop_session()
+
+    def test_a_holder_that_takes_the_root_after_the_clean_check_keeps_the_seat(self):
+        self.root.mkdir(parents=True)
+        late, real = [], cm._root_lock
+
+        def checked_then_taken(shape, root):
+            got = real(shape, root)
+            if not late:
+                late.append(hold(self.root, "claude-local"))
+            return got
+        try:
+            with mock.patch.object(cm, "_root_lock", side_effect=checked_then_taken):
+                self.assert_refused_untouched(None, f"{self.root} was taken by another process first")
+        finally:
+            for p in late:
+                unhold(p)
+        self.assertEqual(len(late), 1)
+
     def test_a_failed_install_after_the_seat_says_the_seat_recovers_the_spent_code(self):
         a = self.home / "agent-a"
         fake = BridgeFake(Runner(None, 0, str(a)))
         self.runners.append(fake.runner)
         with mock.patch.object(sm, "_run", side_effect=fake):
             self.assertEqual(self.main("install", "--work", str(a), "--codex-home", str(self.codex_home))[0], 0)
-        rc, out, err = self.connect(Backend(), fake)
+        rc, out, err = self.connect(Backend(), fake, "--sandbox", "workspace-write", "--model", "gpt-test")
         self.assertEqual(rc, 1, out + err)
-        rerun = f"{cli.COMMAND} install --token-env-file {cb.seat_file(self.root)}"
+        rerun = (f"{cli.COMMAND} install --codex-home {self.codex_home} --sandbox workspace-write --model gpt-test "
+                 f"--token-env-file {cb.seat_file(self.root)}")
         self.assertIn(f"the work root is {a}, not {self.root}", err)
         self.assertIn(f"the code is spent and its credential is in the seat {cb.seat_file(self.root)}; once the line "
                       f"above is fixed, run {rerun} (no new code is needed)", err)
@@ -1248,9 +1307,11 @@ class ConnectCode(Base):
             self.assertEqual(self.main("uninstall")[0], 0)
         fake = self.fake()
         with mock.patch.object(sm, "_run", side_effect=fake):
-            rc, _out, err = self.main(*rerun.split()[1:], "--codex-home", str(self.codex_home))
+            rc, _out, err = self.main(*shlex.split(rerun)[1:])
         self.assertEqual(rc, 0, err)
-        self.assertEqual(cm.read_config(cli.config_path())["ROOT"], str(self.root))
+        cfg = cm.read_config(cli.config_path())
+        self.assertEqual((cfg["ROOT"], cfg["CODEX_HOME"], cfg["SANDBOX"], cfg["MODEL"]),
+                         (str(self.root), str(self.codex_home), "workspace-write", "gpt-test"))
 
     def test_a_bridge_that_does_not_wire_names_the_install_with_the_seat(self):
         with mock.patch.object(cm, "console_script",
@@ -1258,7 +1319,8 @@ class ConnectCode(Base):
             rc, _out, err = self.connect(Backend())
         self.assertEqual(rc, cli.EXIT_UNUSABLE, err)
         self.assertIn("the connector is installed but its bridge is not: ag2-sparrow was not found beside", err)
-        self.assertIn(f"; run {cli.COMMAND} install --token-env-file {cb.seat_file(self.root)}\n", err)
+        self.assertIn(f"; run {cli.COMMAND} install --codex-home {self.codex_home} --token-env-file "
+                      f"{cb.seat_file(self.root)}\n", err)
 
     def test_a_job_active_for_the_redeemed_root_vouches_for_it_and_connect_proceeds(self):
         fake = self.fake()

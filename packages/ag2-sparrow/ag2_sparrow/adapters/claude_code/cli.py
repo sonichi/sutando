@@ -261,7 +261,7 @@ def connect(args) -> int:
     if rc == 0:
         print(f"next: {COMMAND} verify (the bridge reports connected within a minute)")
     else:
-        print(f"error: {cb.spent_code_line(COMMAND, seat['seat_env'])}", file=sys.stderr)
+        print(f"error: {cb.spent_code_line(COMMAND, seat['seat_env'], cb.session_flags(args))}", file=sys.stderr)
     return rc
 
 
@@ -537,7 +537,7 @@ def main(argv=None) -> int:
     p.add_argument("--bridge-state-dir", help="with an explicit root: the AGENT_CONNECT_STATE_DIR of the bridge you "
                    "run, where verify reads its status and the card store sits (default: Sparrow's state dir)")
     session_options(p)
-    p.set_defaults(func=install)
+    p.set_defaults(func=install, parser=p)
     c = sub.add_parser("connect", help="check this machine, redeem the one-time code from AG2 Space for the agent's "
                        "relay credential, write it to the agent's seat (mode 600), then install as install does")
     c.add_argument("--base", required=True, help="the AG2 Space backend URL the code was issued by")
@@ -546,7 +546,7 @@ def main(argv=None) -> int:
     c.add_argument("--trust-relay-host", help="accept a relay URL on this host although it is not --base's host "
                    "or under it (only when AG2 Space told you to)")
     session_options(c)
-    c.set_defaults(func=connect)
+    c.set_defaults(func=connect, parser=c)
     run_help = (f"what the manager runs: the launcher of one tmux-hosted session; refused unless {cm.MANAGED_VAR}=1 "
                 "is in the environment, as the unit sets it (a guard against an accidental hand start, not a "
                 "security boundary; use attach to look at the session)")
