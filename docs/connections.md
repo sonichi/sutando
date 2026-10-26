@@ -22,6 +22,7 @@ startup (`src/startup-runtime.sh`) all call that module and never touch the file
 | `agent_mxid` | The agent's identity at that server, when the gateway named it. |
 | `agent_display_name`, `agent_avatar_url`, `owner_mxid` | Optional, from the same listing entry as `agent_mxid` and only on a verified preview: the entry's `display_name`, its `avatar_url` (stored only as an `mxc://` URI) and its `owner` mxid. Absent until the gateway sends them; never a secret. The list spells every one of them out, `null` when unknown. |
 | `disabled` | `true` after `disconnect`: the bridge is stopped and the launch plan skips the row, token and launch record kept, until `reconnect` or `update_token` clears it. Written only over a stopped bridge (below). Absent on older rows, which load as enabled. |
+| `launch_keys` | Optional: `AG2_REMOTE_TOKEN_<INST>` names a host wrote for this same server after the row existed (`import-env` records them instead of adding a second row). A host's launcher runs such a key as `<inst>` lowercased, so those are the row's alias instances: the plan never launches them, `start`/`launch` report a bridge already up under one (`lease: alias_running`) instead of spawning beside it, `running` counts it, and `disconnect`, `remove`, `reconnect` and `update_token` stop it with the row's own bridge. |
 
 An explicit `instance` must be a slug of `[A-Za-z0-9_-]{1,32}` and not one of the HTTP
 resource's fixed names (`known-servers`, `token`): a row so named could never be addressed

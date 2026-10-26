@@ -764,6 +764,59 @@ class AddAdoptsLaunchKeys(ChannelFileBase):
         self.assertEqual(desktop_lane.wait(timeout=10), 75, "the desktop lane's bridge stands down to the same lease")
         self.assertEqual(self.spawned, ["beta_fixture_net"])
 
+    def test_a_key_that_appears_after_a_panel_row_becomes_its_alias(self):
+        row, _ = self.add(TOKEN_B, fetch=agents("@s:beta-fixture.net"))
+        alias_key = "AG2_REMOTE_TOKEN_BETA_DFIXTURE_DNET"
+        C.import_from_env({alias_key: "https://relay.beta-fixture.net:8443|desktop"}, workspace=self.ws, vault=self.vault)
+        rows = self.rows()
+        self.assertEqual([(r["instance"], r.get("launch_keys")) for r in rows], [("beta-fixture-net", [alias_key])],
+                         "one row, the key recorded as its alias, no second row")
+        self.assertEqual([e["instance"] for e in C.launch_plan({alias_key: "x|y"}, workspace=self.ws)], ["beta-fixture-net"],
+                         "the plan never launches the alias as a lane of its own")
+        desktop = bridge_lease.start(self.ws, "beta_dfixture_dnet")
+        self.children.append(desktop)
+        kw = dict(repo=self.ws / "repo", logs_dir=self.ws / "logs", environ={}, workspace=self.ws, vault=self.vault,
+                  spawn=self.spawn)
+        self.assertEqual(C.start("beta-fixture-net", **kw)["as"], "beta_dfixture_dnet")
+        self.assertEqual(C.launch("beta-fixture-net", **kw)["lease"], "alias_running")
+        self.assertEqual(self.spawned, [], "no second bridge beside the live alias")
+        self.assertTrue(C.status_for(self.rows()[0], self.ws)["running"])
+        self.assertEqual(C.bridge_pid("beta_dfixture_dnet", self.ws), desktop.pid, "the live lease was not moved")
+        C.remove_connection("beta-fixture-net", force=True, workspace=self.ws, vault=self.vault)
+        self.assertEqual(desktop.wait(timeout=10), 0, "removing it stops the bridge under its alias name too")
+
+    def test_disconnect_and_reconnect_reach_the_alias_bridge(self):
+        C.import_from_env({"REMOTE_TASK_TOKEN": TOKEN_A}, workspace=self.ws, vault=self.vault)
+        self.add(TOKEN_B, fetch=agents("@s:beta-fixture.net"))
+        C.import_from_env({"AG2_REMOTE_TOKEN_BETA_DFIXTURE_DNET": "https://relay.beta-fixture.net:8443|d"},
+                          workspace=self.ws, vault=self.vault)
+        desktop = bridge_lease.start(self.ws, "beta_dfixture_dnet")
+        self.children.append(desktop)
+        out = C.reconnect("beta-fixture-net", repo=self.ws / "repo", logs_dir=self.ws / "logs", environ={},
+                          workspace=self.ws, vault=self.vault, spawn=self.spawn, fetch=agents("@s:beta-fixture.net"))
+        self.assertEqual((out["stopped_pid"], desktop.wait(timeout=10)), (desktop.pid, 0), "reconnect replaces the alias bridge")
+        self.assertEqual(self.spawned, ["beta-fixture-net"], "and starts the one canonical name")
+        C.disconnect("beta-fixture-net", workspace=self.ws)
+        self.assertEqual(C.bridge_pid("beta-fixture-net", self.ws), 0)
+
+    def test_a_running_launcher_bridge_keeps_its_lease_through_an_add(self):
+        desktop = bridge_lease.start(self.ws, "beta_fixture_net")
+        self.children.append(desktop)
+        with unittest.mock.patch.dict(os.environ, {"AG2_REMOTE_TOKEN_BETA_FIXTURE_NET": TOKEN_B}):
+            row, _ = self.add(TOKEN_B, fetch=agents("@s:beta-fixture.net"))
+        record = C.start_added(row, repo=self.ws / "repo", logs_dir=self.ws / "logs", environ={}, workspace=self.ws,
+                               vault=self.vault, spawn=self.spawn)
+        self.assertEqual((record["lease"], record["pid"], self.spawned), ("already_running", desktop.pid, []))
+        self.assertEqual(C.bridge_pid("beta_fixture_net", self.ws), desktop.pid)
+
+    def test_launch_keys_must_be_launch_key_names(self):
+        self.add(TOKEN_B, fetch=agents("@s:beta-fixture.net"))
+        rec = json.loads(C.record_path(self.ws).read_text())
+        rec["connections"][0]["launch_keys"] = ["PATH"]
+        C.record_path(self.ws).write_text(json.dumps(rec))
+        with self.assertRaises(C.SchemaError):
+            C.list_connections(self.ws)
+
     def test_an_environment_launch_key_is_adopted_too(self):
         with unittest.mock.patch.dict(os.environ, {"AG2_REMOTE_TOKEN_BETA_FIXTURE_NET": TOKEN_B}):
             row, created = self.add(TOKEN_B, fetch=agents("@s:beta-fixture.net"))
