@@ -554,6 +554,51 @@ class RealHookThenBash(unittest.TestCase):
         self.assertNotIn(LOCAL, sink)
 
 
+class FourthReviewFindings(RealHookThenBash):
+    """Stream paths, competing stdin sources, and GH_REPO carried into nested shells."""
+
+    def test_stream_body_paths_are_refused(self):
+        for path in ("/dev/stdin", "/dev/fd/0", "/proc/self/fd/0"):
+            for flag in (f"-F {path}", f"--body-file={path}"):
+                cmd = f"cat dirty.md | gh pr comment 1 -R o/r {flag}"
+                with self.subTest(cmd=cmd):
+                    self.assertDenied(cmd)
+        os.symlink("/dev/stdin", self.cwd / "link.md")
+        self.assertDenied("cat dirty.md | gh pr comment 1 -R o/r -F link.md")
+
+    def test_one_stdin_source_only(self):
+        for cmd in ("gh pr comment 1 -R o/r -F - <<'EOF' < dirty.md\nclean\nEOF",
+                    "gh pr comment 1 -R o/r -F - <<'EOF' 0< dirty.md\nclean\nEOF",
+                    "gh pr comment 1 -R o/r -F - <<< 'clean' < dirty.md",
+                    "< dirty.md gh pr comment 1 -R o/r -F - <<< 'clean'",
+                    "gh pr comment 1 -R o/r -F - < dirty.md",
+                    "gh pr comment 1 -R o/r -F - 0<&3 <<< clean",
+                    "bash <<'EOF' < run.sh\ngh pr comment 1 -R o/r -b clean\nEOF"):
+            with self.subTest(cmd=cmd):
+                (self.cwd / "run.sh").write_text(f"gh pr comment 1 -R o/r -b {TERM}\n")
+                self.assertDenied(cmd)
+        self.assertAllowedClean("gh pr comment 1 -R o/r -F - < body.md")
+        self.assertAllowedClean("gh pr comment 1 -R o/r -F - <<'EOF'\nclean marker\nEOF")
+
+    def private_checkout(self):
+        env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+        subprocess.run(["git", "init", "-q", str(self.cwd)], check=True, env=env)
+        subprocess.run(["git", "-C", str(self.cwd), "remote", "add", "origin",
+                        "https://github.com/o/priv.git"], check=True, env=env)
+
+    def test_gh_repo_reaches_nested_shells(self):
+        self.private_checkout()
+        b = f"gh pr comment 1 -b {TERM}"
+        for cmd in (f"GH_REPO=o/r bash -c \"{b}\"", f"env GH_REPO=o/r sh -c \"{b}\"",
+                    f"export GH_REPO=o/r; eval \"{b}\"", f"export GH_REPO=o/r; bash -o pipefail -c \"{b}\"",
+                    f"export GH_REPO=o/r; x=$({b})", f"GH_REPO=o/r bash <<'EOF'\n{b}\nEOF"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        # The same nested writes stay allowed when they really land in the private checkout's repo.
+        self.assertIsNone(self.hook(f"bash -c \"{b}\""))
+        self.assertIsNone(self.hook(f"GH_REPO=o/priv bash -c \"{b}\""))
+
+
 class Patterns(unittest.TestCase):
     def test_mixed_case_mxid(self):
         self.assertTrue(policy.scan("ping @Zq-Agent:matrix.zq.chat", []))

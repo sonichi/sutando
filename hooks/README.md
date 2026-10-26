@@ -577,8 +577,10 @@ command itself.
   `gh api` is recognised by the first non-flag word after `gh`.
 - **Text read:** title/body/notes/comment/subject/description flags in every pflag form
   (`--body x`, `--body=x`, `-bx`, `-b=x`, clusters such as `-dtx`), their `-file` forms, a
-  `"$(cat FILE)"` or `"$(cat <<'EOF' … EOF)"` value, stdin from the gh command's own heredoc
-  or here-string (stdin from a pipe or a file redirect is refused), and every
+  `"$(cat FILE)"` or `"$(cat <<'EOF' … EOF)"` value, stdin from the gh command's own heredoc,
+  here-string or `<` file (exactly one source: a pipe, a `<&` dup, or two sources where bash's
+  last would win are refused; so are stream paths such as `/dev/stdin`, `/dev/fd/N` and
+  `/proc/self/fd/N`, symlinked or not), and every
   `gh api` field (`-f`, `-F k=@file`, `-fk=v`, `--input`).
 - **Where gh is found:** behind assignments and wrappers (`env` with flags, `timeout`,
   `nice`, `nohup`, `time`, `command`, `exec`, `sudo`, `stdbuf`, `ionice`, `setsid`, …), shell
@@ -586,7 +588,8 @@ command itself.
   quotes and unquoted heredocs), in `bash -c` / `eval` strings, and in a script fed to a
   shell on stdin (`bash <<'EOF'`, `bash <<< …`, `cat <<'EOF' | bash`).
 - **Repo:** `--repo`, a PR/issue URL, an `o/r` argument to `gh repo`, else `GH_REPO`
-  (inline, via `env`, `export`/`unset` earlier in the command, or the session's environment),
+  (inline, via `env`, `export`/`unset` earlier in the command, or the session's environment,
+  carried into `bash -c`, `sh -c`, `eval`, shell stdin scripts and substitutions),
   else the cwd's git remote the way gh picks it (the gh-resolved remote, then upstream,
   github, origin). A bare `GH_REPO=x;` that may or may not be exported counts both ways: the
   text is scanned unless every possible target is private.

@@ -284,6 +284,7 @@ class Ctx:
         self.segments = segments
         self.seg_bodies = seg_bodies
         self.own = []
+        self.raw_seg = []
         self.assigns = {}
         self.exported = {}
         self.maybe = {}
@@ -310,6 +311,11 @@ def _read_file(word, ctx, label):
     if text == "-":
         return _stdin(ctx, label)
     path = _resolve(text, ctx.cwd)
+    real = os.path.realpath(str(path))
+    if re.match(r"^/(?:dev/(?:stdin|fd/|tty)|proc/(?:self|\d+)/fd/)", real) or \
+            re.match(r"^/(?:dev/(?:stdin|fd/)|proc/(?:self|\d+)/fd/)", str(path)):
+        raise Unreadable(f"{label} `{text}` reads a stream, which this guard cannot see; "
+                         "pass --body-file <path> to a regular file")
     writes, mentions = _writes(ctx)
     named = re.compile(r"(?<![\w.-])" + re.escape(path.name) + r"(?![\w.-])")
     if "*" in writes or any(named.search(m) for m in mentions):
@@ -326,11 +332,37 @@ def _read_file(word, ctx, label):
         raise Unreadable(f"cannot read {label} `{text}`: {str(e.code).replace('ERROR: ', '')}")
 
 
+def _stdin_sources(ctx, label):
+    """What the segment being read feeds its stdin: [Body], [] when nothing of its
+    own, refusing more than one source (bash's last redirect wins) or a dup."""
+    files, i, seg = [], 0, ctx.raw_seg
+    while i < len(seg):
+        m = _redirect_op(seg[i])
+        op = m.group(1) if m else ""
+        fd = m.group(0)[:-len(op)] if m else ""
+        if op in ("<", "<>", "<&") and fd in ("", "0"):
+            rest = seg[i].text[m.end():]
+            target = rest or (seg[i + 1].text if i + 1 < len(seg) else "")
+            if op == "<&":
+                raise Unreadable(f"{label} reads a duplicated stdin (`<&`), which this guard cannot see")
+            files.append(target)
+            i += 1 if rest else 2
+            continue
+        i += 1
+    if len(files) + len(ctx.own) > 1:
+        raise Unreadable(f"{label}: this command gives stdin more than one source (heredoc, here-string "
+                         "or `<` file), and bash's last one wins; give it exactly one")
+    if files:
+        word = _shell_scan.Word(raw=files[0], text=files[0])
+        return [Body(t, False) for t in _read_file(word, ctx, f"{label} (stdin from `<`)")]
+    return list(ctx.own)
+
+
 def _stdin(ctx, label):
-    bodies = ctx.own
+    bodies = _stdin_sources(ctx, label)
     if not bodies:
-        raise Unreadable(f"{label} reads stdin that is not this command's own heredoc or here-string, "
-                         "which this guard cannot see; pass --body-file <path>")
+        raise Unreadable(f"{label} reads stdin that is not this command's own heredoc, here-string "
+                         "or `<` file, which this guard cannot see; pass --body-file <path>")
     return _checked(bodies, label)
 
 
@@ -713,12 +745,16 @@ def _shell_scripts(seg, own, ctx):
             scripts.append(w.text)
         return [Body(" ".join(scripts), False)] if scripts else []
     if stdin or not positional or positional[0].text == "-":
-        return list(own or ctx.bodies)
+        return _stdin_sources(ctx, "a shell's stdin script") or list(ctx.bodies)
     return []
 
 
-def actions(command: str, cwd, depth: int = 0):
-    """Every publishing gh invocation in `command`: (repo, label, [texts], cwd)."""
+GH_REPO_ANYWHERE = re.compile(r"""\bGH_REPO=(['"]?)([^'"\s;&|)]*)\1""")
+
+
+def actions(command: str, cwd, depth: int = 0, inherited=None):
+    """Every publishing gh invocation in `command`. `inherited` is ({exported},
+    {maybe}) from the shell that runs this one."""
     stripped, bodies = split_heredocs(command)
     segments = _shell_scan.segments(stripped)
     if not segments and stripped.strip():
@@ -728,16 +764,25 @@ def actions(command: str, cwd, depth: int = 0):
     seg_bodies = _assign_bodies(segments, bodies)
     all_bodies = bodies + [b for own in seg_bodies for b in own if b not in bodies]
     ctx = Ctx(cwd, all_bodies, segments, seg_bodies, command)
+    if inherited:
+        ctx.exported = dict(inherited[0])
+        ctx.maybe = {k: list(v) for k, v in inherited[1].items()}
     found = []
     if depth < 3:
+        # A substitution may run after any assignment on the line: every GH_REPO it sets is a candidate.
+        maybe = {k: list(v) for k, v in ctx.maybe.items()}
+        for _, value in GH_REPO_ANYWHERE.findall(command):
+            maybe.setdefault("GH_REPO", []).append("{unresolved}" if "$" in value or "`" in value else value)
+        sub_env = (ctx.exported, maybe)
         inner = _substitutions(stripped)
         for b in bodies:
             if b.expands:
                 inner += _substitutions(b.text)
         for text in inner:
             if "gh" in text.lower():
-                found += actions(text, cwd, depth + 1)
+                found += actions(text, cwd, depth + 1, sub_env)
     for idx, seg in enumerate(segments):
+        ctx.raw_seg = seg
         seg, ctx.assigns = _strip_prefix(seg)
         ctx.own = seg_bodies[idx]
         if not seg:
@@ -763,7 +808,8 @@ def actions(command: str, cwd, depth: int = 0):
             for script in _shell_scripts(seg, ctx.own, ctx):
                 if "gh" not in script.text.lower():
                     continue
-                inner_acts = actions(script.text, ctx.cwd, depth + 1)
+                inner_acts = actions(script.text, ctx.cwd, depth + 1,
+                                     ({**ctx.exported, **ctx.assigns}, ctx.maybe))
                 if inner_acts and script.expands:
                     raise Unreadable("a script fed to a shell from an unquoted heredoc expands "
                                      "`$`/backticks first; quote the delimiter (<<'EOF')")
