@@ -165,8 +165,8 @@ def install(args) -> int:
         return rc
     problem = cb.wire_bridge(dict(values, ROOT=root), COMMAND, BRIDGE)
     if problem:
-        print(f"error: the connector is installed but its bridge is not: {problem}; run {COMMAND} install again",
-              file=sys.stderr)
+        print(f"error: the connector is installed but its bridge is not: {problem}; run "
+              f"{cb.rerun_install(COMMAND, where['token_file'])}", file=sys.stderr)
         return EXIT_UNUSABLE
     return 0
 
@@ -194,6 +194,8 @@ def connect(args) -> int:
     rc = install(argparse.Namespace(**session, work=None, token_env_file=seat["seat_env"]))
     if rc == 0:
         print(f"next: {COMMAND} verify (the bridge reports connected within a minute)")
+    else:
+        print(f"error: {cb.spent_code_line(COMMAND, seat['seat_env'])}", file=sys.stderr)
     return rc
 
 

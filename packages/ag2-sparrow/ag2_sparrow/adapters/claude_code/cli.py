@@ -260,6 +260,8 @@ def connect(args) -> int:
                                     bridge_state_dir=None))
     if rc == 0:
         print(f"next: {COMMAND} verify (the bridge reports connected within a minute)")
+    else:
+        print(f"error: {cb.spent_code_line(COMMAND, seat['seat_env'])}", file=sys.stderr)
     return rc
 
 

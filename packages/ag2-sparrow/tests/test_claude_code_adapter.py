@@ -2263,7 +2263,7 @@ class ConnectCode(AgentRootBase):
 
     def seated_by_another_adapter(self):
         """The agent's root and seat as another adapter left them: its credential in the seat."""
-        self.root.mkdir(parents=True)
+        self.root.mkdir(parents=True, exist_ok=True)
         cm.write_seat(cli.bridge_home(self.root), {"relay_url": RELAY, "bearer": "other-bearer-PPPP6666",
                                                    "agent_id": AGENT})
         return {p: p.read_bytes() for p in sorted(self.seat().iterdir())}
@@ -2294,6 +2294,78 @@ class ConnectCode(AgentRootBase):
         self.assertEqual(rc, 0, err)
         self.assertEqual(checked, [(cli.SHAPE, str(self.root))], "asked once, before the seat")
         self.assertEqual((self.seat() / "token").read_text(), f"{RELAY}|{BEARER}\n")
+
+    def files(self):
+        """Every file under the test home, by bytes: what a refused connect may not change."""
+        return {str(p): p.read_bytes() for p in sorted(self.home.rglob("*")) if p.is_file()}
+
+    def assert_refused_untouched(self, fake, why):
+        """connect refuses before the seat, the agent's seat byte-identical and no file anywhere changed."""
+        seat = self.seated_by_another_adapter()
+        before, backend = self.files(), Backend()
+        rc, out, err = self.connect(backend, fake)
+        self.assertEqual(rc, cli.EXIT_UNUSABLE, out + err)
+        self.assertEqual({p: p.read_bytes() for p in sorted(self.seat().iterdir())}, seat, "byte-identical")
+        self.assertEqual(self.files(), before, "nothing else was written")
+        self.assertNotIn("connected:", out)
+        self.assertIn(why, err)
+        self.assertIn("the code is spent and nothing was written", err)
+        self.assertEqual(len(backend.calls), 1)
+
+    def test_a_job_active_for_another_root_does_not_vouch_for_a_held_root(self):
+        a = self.home / "agent-a"
+        fake = self.bridged(root=a)
+        rc, _out, err = self.install_default(fake, "--work", str(a))
+        self.assertEqual(rc, 0, err)
+        self.root.mkdir(parents=True)
+        holder = hold(self.root, "codex-local")
+        try:
+            self.assert_refused_untouched(fake, f"{self.root} is held by codex-local pid {holder.pid} while "
+                                                f"{cm.job_name(L)} is active for {a}")
+        finally:
+            unhold(holder)
+
+    def test_an_active_job_that_cannot_be_proven_to_manage_the_root_fails_closed(self):
+        cases = (("no config", None, L.name, "active for no recorded work root"),
+                 ("no recorded root", "", L.name, "active for no recorded work root"),
+                 ("unparsable config", "unparsable", L.name, "active for no recorded work root"),
+                 ("another holder", "root", "codex-local", "is held by codex-local pid"))
+        for name, root, adapter, why in cases:
+            with self.subTest(name):
+                shutil.rmtree(self.agents, ignore_errors=True)
+                cli.config_path().unlink(missing_ok=True)
+                if root is not None:
+                    self.configure(ROOT=str(self.root) if root in ("root", "unparsable") else root)
+                if root == "unparsable":
+                    cli.config_path().write_text(cli.config_path().read_text() + "ROOT='unclosed\n")
+                fake = self.bridged(adapter=adapter)
+                self.root.mkdir(parents=True)
+                fake.runner.start_session()
+                try:
+                    self.assert_refused_untouched(fake, why)
+                finally:
+                    fake.runner.stop_session()
+
+    def test_a_failed_install_after_connect_names_the_seat_that_recovers_the_spent_code(self):
+        seat = cli.bridge_home(self.root) / "channels" / "ag2space" / ".env"
+        rerun = f"{cli.COMMAND} install --token-env-file {seat}"
+        with mock.patch.object(cm, "console_script",
+                               side_effect=lambda shape: "" if shape is cli.BRIDGE else str(self.bin / shape.command)):
+            rc, _out, err = self.connect(Backend())
+        self.assertEqual(rc, cli.EXIT_UNUSABLE, err)
+        self.assertIn("the session is installed but its bridge is not: ag2-sparrow was not found beside", err)
+        self.assertIn(f"the code is spent and its credential is in the seat {seat}; once the line above is fixed, run "
+                      f"{rerun} (no new code is needed)", err)
+
+    def test_a_job_active_for_the_redeemed_root_vouches_for_it_and_connect_proceeds(self):
+        fake = self.bridged()
+        self.assertEqual(self.connect(Backend(), fake)[0], 0)
+        self.assertEqual(task_io.lock_held(str(self.root)), "held", "the job manages the root and holds it")
+        rotated = Backend(answer={"relay_url": RELAY, "bearer": "rotated-bearer-OOOO5555", "agent_id": AGENT})
+        rc, out, err = self.connect(rotated, fake)
+        self.assertEqual(rc, 0, err)
+        self.assertIn(f"connected: {AGENT}", out)
+        self.assertEqual((self.seat() / "token").read_text(), f"{RELAY}|rotated-bearer-OOOO5555\n")
 
     def test_without_plugin_dir_the_shipped_plugin_is_used(self):
         self.assertTrue((cli.PLUGIN / ".claude-plugin" / "plugin.json").is_file())

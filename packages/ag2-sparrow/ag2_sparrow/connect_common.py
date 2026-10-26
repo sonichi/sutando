@@ -690,7 +690,8 @@ def launcher_log(shape: Shape) -> str:
 
 
 def root_lock_problem(shape: Shape, root: str) -> str:
-    """'' unless `root` is held by a session no job of `shape` manages, or either cannot be probed: why.
+    """'' unless `root` is held by anything but `shape`'s active job on this very root, or either cannot be
+    probed: why.
     Install refuses on it; connect asks it before writing the agent's seat."""
     return _root_lock(shape, root)[0]
 
@@ -705,7 +706,22 @@ def _root_lock(shape: Shape, root: str) -> "tuple[str, str]":
         who = f"launcher pid {rec['pid']}" if rec.get("live") else "an unrecorded holder; lsof the lock file"
         return (f"{root} is held by a session no job of {job_name(shape)} manages ({who}); stop it, then run "
                 "install again"), manager
+    if state == "held":
+        return _managed_here(shape, root), manager
     return "", manager
+
+
+def _managed_here(shape: Shape, root: str) -> str:
+    """'' only when the active job's recorded root is `root` and the lock's record names this shape;
+    an unreadable config, no recorded root, another root or another holder all refuse."""
+    cfg, problem = owned_config(shape)
+    managed = (cfg or {}).get("ROOT", "")
+    rec = lock_holder(root)
+    if problem or managed != root or rec.get("adapter") != shape.name:
+        who = f"{rec.get('adapter')} pid {rec.get('pid')}" if rec else "an unrecorded holder"
+        return (f"{root} is held by {who} while {job_name(shape)} is active for "
+                f"{managed or 'no recorded work root'}; stop that session, then run install again")
+    return ""
 
 
 def _install_locked(shape: Shape, values: dict, root: str, revise=None, precheck=None, holder=None) -> int:

@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import time
 from pathlib import Path
 
@@ -154,6 +155,17 @@ def agent_root(agent_id: str) -> "tuple[str, str]":
     """(the agent's own root under the agents dir, '') or (root, why it cannot be served here)."""
     root, problem = cm.canonical_root(str(_dirs.agents_dir() / agent_identity.root_segment(agent_id)), "")
     return root, problem or served_elsewhere(agent_id, root)
+
+
+def rerun_install(command: str, token_file: str) -> str:
+    """The install that repeats one given the agent's own seat (`token_file`), else the bare one."""
+    return f"{command} install " + (f"--token-env-file {shlex.quote(token_file)}" if token_file else "again")
+
+
+def spent_code_line(command: str, seat_env: str) -> str:
+    """After a connect whose install failed: the code is spent, but the seat it wrote recovers it."""
+    return (f"the code is spent and its credential is in the seat {seat_env}; once the line above is fixed, run "
+            f"{rerun_install(command, seat_env)} (no new code is needed)")
 
 
 def bridge_fix(cfg: dict, command: str, bridge: cm.Shape) -> str:
