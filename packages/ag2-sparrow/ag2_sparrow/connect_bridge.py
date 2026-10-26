@@ -332,11 +332,13 @@ def host_problem(command: str) -> str:
 
 def redeem_into_seat(base: str, code_arg, trust_relay_host: str, preflight,
                      local: cm.Shape) -> "tuple[dict | None, str]":
-    """({agent_id, root, seat_env}, '') or (None, the line to print): the code read, checked with
-    `preflight()` before it is spent, redeemed once, and the credential written to the agent's seat by its
-    owner only while this process holds the root and its path still names it (connect_common.under_root). The bearer never leaves the seat's token file."""
+    """({agent_id, root, seat_env, root_id}, '') or (None, the line to print): the code read, checked with
+    `preflight()` and refused while `local`'s job runs, both before it is spent; redeemed once; the
+    credential written to the agent's seat only while this process holds the free root and its path still
+    names it (connect_common.under_root). `root_id` is that root's identity, for install to hold to. The
+    bearer never leaves the seat's token file."""
     code, problem = cm.read_code(code_arg)
-    problem = problem or cm.code_problem(base, code) or preflight()
+    problem = problem or cm.code_problem(base, code) or preflight() or cm.active_job_problem(local)
     if problem:
         return None, f"{problem}; the code was not used"
     redeemed, problem = cm.redeem_code(base, code)
@@ -347,26 +349,16 @@ def redeem_into_seat(base: str, code_arg, trust_relay_host: str, preflight,
         str(_dirs.agents_dir() / agent_identity.root_segment(redeemed["agent_id"])), "")
     if problem:
         return None, f"the code is spent but the seat was not written: {problem}; make a new code"
-    written, held, stopped = cm.under_root(local, root,
-                                  lambda owner: cm.write_seat_held(owner, root, bridge_home(root), redeemed),
-                                  precheck=lambda: cm.seat_problem(bridge_home(root)))
+
+    def act(owner):
+        seat_env, why = cm.write_seat_held(owner, root, bridge_home(root), redeemed)
+        return seat_env, cm.held_identity(owner), why
+    written, held = cm.under_root(local, root, act, precheck=lambda: cm.seat_problem(bridge_home(root)))
     if held:
         return None, (f"{held}; the code is spent and nothing was written ({bridge_home(root)} is unchanged): "
                       "make a new code in AG2 Space once the root is free")
-    seat, problem = written
+    seat, root_id, problem = written
     if problem:
         return None, f"the code is spent but the seat was not written: {problem}; make a new code"
     print(f"connected: {redeemed['agent_id']}; credentials in {Path(seat).parent} (mode 600)")
-    return {"agent_id": redeemed["agent_id"], "root": root, "seat_env": seat, "stopped": stopped}, ""
-
-
-def install_restoring(local: cm.Shape, seat: dict, install) -> int:
-    """install()'s exit code. When connect stopped the agent's job for the seat (seat["stopped"]) and install
-    does not then succeed, by a refusal or an exception, that job is started again on the root it served."""
-    rc = 1
-    try:
-        rc = install()
-    finally:
-        if rc != 0 and seat.get("stopped") is not None:
-            cm.restore_stopped(local, seat["root"], seat["stopped"])
-    return rc
+    return {"agent_id": redeemed["agent_id"], "root": root, "seat_env": seat, "root_id": root_id}, ""

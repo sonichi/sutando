@@ -673,14 +673,16 @@ def _fresh_holder(shape: Shape, root: str, before: dict) -> "dict | None":
 
 # ── install ──────────────────────────────────────────────────────────────────
 
-def install(shape: Shape, values: dict, root: str, revise=None, precheck=None, holder=None) -> int:
+def install(shape: Shape, values: dict, root: str, revise=None, precheck=None, holder=None, root_id=None) -> int:
     """`revise(old_config, values) -> values` runs once the job is stopped and the root proven free,
     so a value that may only change over a quiescent root (a session id) is decided there.
     `precheck(root) -> problem` is the launcher's own refusal of the root, asked before anything moves.
-    `holder(root, record)` names who holds the root in the closing line, in the shape's own words."""
+    `holder(root, record)` names who holds the root in the closing line, in the shape's own words.
+    `root_id`, connect's identity of the root it wrote the seat for: install applies nothing unless `root`
+    still names it, and stops its own new job if the launcher it started does not hold that directory."""
     try:
         with operation_lock(shape):
-            return _install_locked(shape, values, root, revise, precheck, holder)
+            return _install_locked(shape, values, root, revise, precheck, holder, root_id)
     except Busy as e:
         return _refuse(str(e))
 
@@ -693,46 +695,44 @@ def launcher_log(shape: Shape) -> str:
 CONNECT_HOLDER = "connect"
 
 
-def under_root(shape: Shape, root: str, act, precheck=None) -> "tuple[object, str, tuple | None]":
-    """(act(owner), '', stopped) run while this process holds `root`'s lock as `owner`; act returns (value,
-    problem) and binds itself to owner's root (root_is_held). A free root is taken; one held by `shape`'s own
-    job on this very root is stopped, then taken. `precheck()` refuses before anything stops; anything else
-    is (None, why, None) and act never runs. When act fails the stopped job is started again here; when it
-    succeeds, `stopped` is the identity of the root whose job is still stopped, which the caller restores
-    (restore_stopped) unless its own install succeeds."""
+def under_root(shape: Shape, root: str, act, precheck=None) -> "tuple[object, str]":
+    """(act(owner), '') run while this process holds `root`'s lock as `owner`, taken only while no job of
+    `shape` runs and the root is free, so nothing is ever stopped for it; act binds itself to owner's root
+    (root_is_held). A running or unreadable job, a held root, a `precheck()` refusal or a root another
+    process takes first is (None, why), and act never runs."""
     try:
         with operation_lock(shape):
-            problem, _manager, held = _root_lock(shape, root)
-            problem = problem or (precheck() if precheck is not None else "")
+            problem = active_job_problem(shape) or _free_root_problem(root) or (precheck() if precheck else "")
             if problem:
-                return None, problem, None
-            root_id = dir_identity(root) if held else None
-            done = False
+                return None, problem
+            Path(root).mkdir(parents=True, exist_ok=True)
             try:
-                if held:
-                    problem = stop_supervisor(shape) or _await_free(root)
-                    if problem:
-                        return None, problem, None
-                    print(f"stopped: {job_name(shape)}")
-                Path(root).mkdir(parents=True, exist_ok=True)
-                try:
-                    owner = acquire_lock(root, CONNECT_HOLDER)
-                except LockRefused as e:
-                    return None, f"{root} was taken by another process first ({e.line})", None
-                try:
-                    if held and _fd_identity(owner.root_fd) != root_id:
-                        result = ("", f"{root} was replaced while {job_name(shape)} was stopped; nothing was written")
-                    else:
-                        result = act(owner)
-                finally:
-                    release_lock(owner)
-                done = not result[1]
-                return result, "", root_id if done else None
+                owner = acquire_lock(root, CONNECT_HOLDER)
+            except LockRefused as e:
+                return None, f"{root} was taken by another process first ({e.line})"
+            try:
+                return act(owner), ""
             finally:
-                if held and not done:
-                    _restart_stopped(shape, root, root_id)
+                release_lock(owner)
     except Busy as e:
-        return None, str(e), None
+        return None, str(e)
+
+
+def active_job_problem(shape: Shape) -> str:
+    """'' unless `shape`'s job runs or its state cannot be read: connect writes a seat only for a stopped
+    agent, so a credential rotation is stop, then connect."""
+    state = manager_state(shape)
+    if state == "unknown":
+        return f"{job_name(shape)}'s state cannot be read; connect writes the seat only while it is stopped"
+    if state != "active":
+        return ""
+    served = (owned_config(shape)[0] or {}).get("ROOT") or "an unrecorded root"
+    return f"{job_name(shape)} is running for {served}; stop it first ({stop_command(shape)}), then connect again"
+
+
+def _free_root_problem(root: str) -> str:
+    state = lock_held(root)
+    return "" if state == "free" else f"{root} is {holder_line(root)}; stop what holds it, then connect again"
 
 
 def dir_identity(path) -> "tuple | None":
@@ -744,45 +744,9 @@ def dir_identity(path) -> "tuple | None":
     return (st.st_dev, st.st_ino) if stat.S_ISDIR(st.st_mode) else None
 
 
-def _fd_identity(fd: int) -> tuple:
-    st = os.fstat(fd)
-    return st.st_dev, st.st_ino
-
-
-def start_command(shape: Shape) -> str:
-    """What starts the job by hand, verbatim for a refusal."""
-    if is_macos():
-        return f"launchctl bootstrap {_launchd_target()} {supervisor_path(shape)}"
-    return f"systemctl --user enable --now {shape.service_name}"
-
-
-def restore_stopped(shape: Shape, root: str, root_id: tuple) -> None:
-    """Start again, under the operation lock, the job under_root stopped on the root `root_id` names."""
-    try:
-        with operation_lock(shape):
-            _restart_stopped(shape, root, root_id)
-    except Busy as e:
-        print(f"error: {job_name(shape)} was stopped for this connect and was not started again ({e}); start it "
-              f"with: {start_command(shape)}", file=sys.stderr)
-
-
-def _restart_stopped(shape: Shape, root: str, root_id) -> None:
-    """Start the stopped job only while `root` still names the directory it served (`root_id`), and confirm
-    a fresh launcher of it holds that directory; else say so on stderr with the command that starts it."""
-    if root_id is None or dir_identity(root) != root_id:
-        print(f"error: {job_name(shape)} was stopped for this connect and was not started again: {root} is no "
-              f"longer the directory it served (it was replaced while the job was stopped); check what is at "
-              f"{root} now, then start it with: {start_command(shape)}", file=sys.stderr)
-        return
-    problem = start_supervisor(shape)
-    rec = None if problem else _fresh_holder(shape, root, {})
-    if rec is not None and dir_identity(root) == root_id:
-        print(f"started again: {job_name(shape)} (launcher pid {rec['pid']})")
-        return
-    why = problem or (f"{root} was replaced while it started" if rec is not None else
-                      f"no launcher of it took {root} within {CONFIRM_TIMEOUT_S:.0f} s ({holder_line(root)})")
-    print(f"error: {job_name(shape)} was stopped for this connect and did not start again: {why}; start it "
-          f"with: {start_command(shape)}", file=sys.stderr)
+def held_identity(owner) -> tuple:
+    """(st_dev, st_ino) of the root `owner` holds open."""
+    return _fdid(owner.root_fd)
 
 
 def _root_lock(shape: Shape, root: str) -> "tuple[str, str, bool]":
@@ -816,7 +780,8 @@ def _managed_here(shape: Shape, root: str) -> str:
     return ""
 
 
-def _install_locked(shape: Shape, values: dict, root: str, revise=None, precheck=None, holder=None) -> int:
+def _install_locked(shape: Shape, values: dict, root: str, revise=None, precheck=None, holder=None,
+                    root_id=None) -> int:
     """A quiescent replacement: both files owned, the same root as before, no orphan on it, the job
     stopped and absent, the root free; only then the files, the start, and the fresh holder."""
     conf, sup, marker = config_path(shape), supervisor_path(shape), supervisor_marker(shape)
@@ -848,6 +813,9 @@ def _install_locked(shape: Shape, values: dict, root: str, revise=None, precheck
     problem = _await_free(root)
     if problem:
         return _refuse(f"{problem} after the stop; nothing was applied")
+    if root_id is not None and dir_identity(root) != root_id:
+        return _refuse(f"{root} is no longer the directory connect wrote the seat for (it was replaced); nothing "
+                       "was applied")
     if revise is not None:
         values = revise(old, values)
     for key in ("INBOX_DIR", "RESULTS_DIR"):
@@ -861,6 +829,12 @@ def _install_locked(shape: Shape, values: dict, root: str, revise=None, precheck
         return _refuse(f"{problem}; the managed launcher did not acquire {root}; run {shape.command} uninstall, "
                        f"then {shape.command} install")
     rec = _fresh_holder(shape, root, before)
+    if root_id is not None and (rec is None or dir_identity(root) != root_id):
+        problem = stop_supervisor(shape)
+        return _refuse(f"the launcher did not hold {root} as the directory connect wrote the seat for (it was "
+                       f"replaced while the job started); "
+                       + (f"{job_name(shape)} could not be stopped: {problem}" if problem else
+                          f"{job_name(shape)} was stopped and nothing serves {root}"))
     if rec is None:
         return _refuse(f"the managed launcher did not acquire {root} within {CONFIRM_TIMEOUT_S:.0f} s ({holder_line(root)}); "
                        f"its refusal is in {launcher_log(shape)}; run {shape.command} uninstall, then {shape.command} install")
@@ -1367,9 +1341,14 @@ def _open_seat_dirs(seat) -> "list[int]":
     return fds
 
 
+def _fdid(fd: int) -> tuple:
+    st = os.fstat(fd)
+    return st.st_dev, st.st_ino
+
+
 def _seat_paths_bound(seat, fds) -> bool:
     """Each seat path still names the directory held open at the matching fd."""
-    return all(dir_identity(path) == _fd_identity(fd) for path, fd in zip(_seat_dirs(seat), fds))
+    return all(dir_identity(path) == _fdid(fd) for path, fd in zip(_seat_dirs(seat), fds))
 
 
 def _seat_bound(owner, root: str, seat, fds) -> bool:
@@ -1537,32 +1516,6 @@ def _rendered_seat(seat, redeemed: dict, env_now: "bytes | None") -> "tuple[dict
     out = {name: text.encode("utf-8") for name, text in files.items()}
     big = [name for name, data in out.items() if len(data) > SEAT_FILE_MAX]
     return ({}, f"the seat's {big[0]} would be larger than {SEAT_FILE_MAX} bytes") if big else (out, "")
-
-
-def write_seat(seat, redeemed: dict) -> "tuple[str, str]":
-    """(the seat's .env path, '') or ('', why): the redeemed credential written by its owner, standalone
-    tier, the instance kept or minted once; through the seat directories held open, under the seat lock."""
-    os.makedirs(os.path.dirname(os.fspath(seat)), exist_ok=True)
-    try:
-        fds = _open_seat_dirs(seat)
-    except OSError as e:
-        return "", f"the seat {seat} could not be opened ({e.strerror or e})"
-    try:
-        with seat_lock(fds[0]):
-            if not _seat_paths_bound(seat, fds):
-                return "", f"the seat {seat} was replaced while it was opened; it was not written"
-            written, problem = _rendered_seat(seat, redeemed, _read_at(fds[-1], ".env"))
-            if problem:
-                return "", problem
-            os.fchmod(fds[-1], 0o700)
-            for name, data in written.items():
-                _put_at(fds[-1], name, data)
-        return seat_env_path(seat), ""
-    except OSError as e:
-        return "", f"the seat {seat} could not be written ({e.strerror or e})"
-    finally:
-        for fd in fds:
-            os.close(fd)
 
 
 def served_setup_line(vendor: str) -> str:

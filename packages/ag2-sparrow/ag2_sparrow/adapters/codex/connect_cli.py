@@ -160,7 +160,7 @@ def install(args) -> int:
     if args.sandbox == "workspace-write":
         print("NOTE sandbox: workspace-write lets an owner turn write under the work root; a turn retried after "
               "the app-server dies can repeat side effects the first attempt already made")
-    rc = cm.install(LOCAL, values, root, holder=holder_words)
+    rc = cm.install(LOCAL, values, root, root_id=getattr(args, "root_identity", None), holder=holder_words)
     if rc != 0 or mode == EXTERNAL:
         return rc
     problem = cb.wire_bridge(dict(values, ROOT=root), COMMAND, BRIDGE)
@@ -189,12 +189,10 @@ def connect(args) -> int:
     if problem:
         print(f"error: {problem}", file=sys.stderr)
         return EXIT_UNUSABLE
+    print(cm.served_setup_line(SETUP_VENDOR))
     session = {k: v for k, v in vars(args).items() if k not in ("code", "trust_relay_host", "base")}
-
-    def installed() -> int:
-        print(cm.served_setup_line(SETUP_VENDOR))
-        return install(argparse.Namespace(**session, work=None, token_env_file=seat["seat_env"]))
-    rc = cb.install_restoring(LOCAL, seat, installed)
+    rc = install(argparse.Namespace(**session, work=None, token_env_file=seat["seat_env"],
+                                    root_identity=seat["root_id"]))
     if rc == 0:
         print(f"next: {COMMAND} verify (the bridge reports connected within a minute)")
     else:

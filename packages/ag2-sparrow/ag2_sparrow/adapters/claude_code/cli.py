@@ -209,7 +209,7 @@ def install(args) -> int:
                 print("rotating the session id: the old generation is proven gone")
         session_id = kept or mint_session_id()
         return dict(values, SESSION_ID=session_id)
-    rc = cm.install(LOCAL, values, root, revise=revise,
+    rc = cm.install(LOCAL, values, root, root_id=getattr(args, "root_identity", None), revise=revise,
                     precheck=lambda r: inbox.root_problem(r) or records.agent_problem(r, agent_id), holder=holder_words)
     if rc != 0 or mode == EXTERNAL:
         return rc
@@ -262,13 +262,10 @@ def connect(args) -> int:
     if problem:
         print(f"error: {problem}", file=sys.stderr)
         return EXIT_UNUSABLE
+    print(cm.served_setup_line(SETUP_VENDOR))
     session = {k: v for k, v in vars(args).items() if k not in ("code", "trust_relay_host")}
-
-    def installed() -> int:
-        print(cm.served_setup_line(SETUP_VENDOR))
-        return install(argparse.Namespace(**session, work=None, inbox=None, token_env_file=seat["seat_env"],
-                                          bridge_state_dir=None))
-    rc = cb.install_restoring(LOCAL, seat, installed)
+    rc = install(argparse.Namespace(**session, work=None, inbox=None, token_env_file=seat["seat_env"],
+                                    bridge_state_dir=None, root_identity=seat["root_id"]))
     if rc == 0:
         print(f"next: {COMMAND} verify (the bridge reports connected within a minute)")
     else:
