@@ -866,8 +866,15 @@ BRIDGE_MAIN = BRIDGE.replace("print(json.dumps({", "try:\n    m.main()\n    exit
                              'print(json.dumps({"exited": exited, ')
 
 
-# A seat's refused startup, with the backoff recorded instead of slept.
-SEAT_MAIN = BRIDGE_MAIN.replace("try:\n    m.main()", "slept = []\nm.time.sleep = slept.append\ntry:\n    m.main()").replace(
+# A seat's refused startup, with the bridge's backoff recorded instead of slept; subprocess's own
+# wait loop (a `ps` the bridge runs) still sleeps, since the time module is shared.
+SEAT_MAIN = BRIDGE_MAIN.replace("try:\n    m.main()", (
+    "slept = []\n_real_sleep = m.time.sleep\n"
+    "def _sleep(s):\n"
+    "    if __import__('sys')._getframe(1).f_globals.get('__name__') == 'subprocess':\n"
+    "        return _real_sleep(s)\n"
+    "    slept.append(s)\n"
+    "m.time.sleep = _sleep\ntry:\n    m.main()")).replace(
     'print(json.dumps({"exited": exited, ', 'print(json.dumps({"exited": exited, "slept": slept, ')
 
 
@@ -1561,6 +1568,27 @@ class BoundedRead(unittest.TestCase):
                 self.assertEqual(m.read_regular(str(root)), (None, "not a regular file"))
                 self.assertEqual(m.read_regular(str(root / "bad")), (None, "not UTF-8"))
                 self.assertEqual(m.read_regular(str(root / "big"), limit=32), (None, "over 32 bytes"))
+
+    def test_a_dir_relative_no_follow_read_refuses_a_symlink(self):
+        for name, m in self.COPIES.items():
+            with self.subTest(copy=name), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                (root / "ok").write_text("{}")
+                (root / "link").symlink_to(root / "ok")
+                dfd = os.open(td, os.O_RDONLY | os.O_DIRECTORY)
+                self.addCleanup(os.close, dfd)
+                self.assertEqual(m.read_regular("ok", dir_fd=dfd, follow=False), ("{}", ""))
+                self.assertEqual(m.read_regular("link", dir_fd=dfd, follow=False), (None, "a symlink"))
+                self.assertEqual(m.read_regular("link", dir_fd=dfd), ("{}", ""), "followed by default")
+                self.assertEqual(m.read_regular("missing", dir_fd=dfd, follow=False), (None, ""))
+                os.chmod(root / "ok", 0)
+                text, why = m.read_regular("ok", dir_fd=dfd, follow=False)
+                os.chmod(root / "ok", 0o600)
+                if os.geteuid() != 0:
+                    self.assertEqual((text, why), (None, "unreadable (EACCES)"))
+                self.assertTrue(m.unreadable("unreadable (EACCES)"))
+                self.assertFalse(m.unreadable("not a regular file"))
+                self.assertFalse(m.unreadable("a symlink"))
 
 
 SOURCE_KEYS = set(owner.CREDENTIAL_KEYS) | {owner.TOKEN_FILE_KEY}

@@ -180,6 +180,14 @@ class DesignAClaimBackend:
             outbox.clear_dispatching(self.root, item_id)
             return outbox._release_locked(self.root, item_id, token.worker)
 
+    def release(self, token: ClaimToken) -> bool:
+        with outbox._item_lock(self.root, token.item_id):
+            rec = outbox.read_delivery_claim(self.root, token.item_id)
+            if rec is None or rec.drainer_id != token.worker or \
+                    self._incarnation_of(token.item_id) != token.incarnation:
+                return False
+            return outbox._release_locked(self.root, token.item_id, token.worker)
+
     def park_unclaimed(self, item_id: str, reason: str, on_release=None) -> bool:
         """Park a live item no claimant holds; refused (False) once it settled or is claimed."""
         return outbox.park_unclaimed(self.root, item_id, reason, self.reclaim_ttl_s, on_release)

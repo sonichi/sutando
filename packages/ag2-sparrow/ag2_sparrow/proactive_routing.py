@@ -109,9 +109,9 @@ def proactive_filename(ts, channel: "str | None" = None) -> str:
     return f"proactive-{ts}.to-{channel}.txt"
 
 
-# A message about one task names it: proactive-about-<task id>--<ts>[.to-<channel>].txt. The
-# gateway threads it in that task's conversation and re-checks the task before it is sent.
-_ABOUT_TASK_RE = re.compile(r"\Aproactive-about-(task-[A-Za-z0-9._-]+)--(\d+)(?:\.to-[a-z0-9_-]+)?\.txt\Z")
+# A message about one task (a named instance's id included) names it: proactive-about-<task id>--<ts>
+# [.to-<channel>].txt. The gateway threads it in that task's conversation and re-checks the task first.
+_ABOUT_TASK_RE = re.compile(r"\Aproactive-about-(task-[A-Za-z0-9._~-]+)--(\d+)(?:\.to-[a-z0-9_-]+)?\.txt\Z")
 
 
 def about_task_filename(task_id: str, ts, channel: "str | None" = None) -> str:
@@ -136,6 +136,12 @@ def about_task(name) -> "str | None":
     """The task a proactive message is about, or None for any other proactive name."""
     m = _ABOUT_TASK_RE.match(Path(name).name)
     return m.group(1) if m else None
+
+
+def about_task_ts(name) -> "int | None":
+    """The `<ts>` a proactive message about a task was named with, or None for any other name."""
+    m = _ABOUT_TASK_RE.match(Path(name).name)
+    return int(m.group(2)) if m else None
 
 
 def proactive_destination(name) -> "str | None":

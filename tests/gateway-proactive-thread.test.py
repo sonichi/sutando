@@ -64,7 +64,7 @@ def drain(body: str):
     posts: list[dict] = []
     logs: list[str] = []
 
-    def _fake_req(method, path, payload=None, timeout=None):
+    def _fake_req(method, path, payload=None, timeout=None, **_kw):
         if method == "POST":
             posts.append(payload)
         return {"ok": True, "event_id": "$evt"}
