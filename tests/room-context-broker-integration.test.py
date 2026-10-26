@@ -42,7 +42,7 @@ from pathlib import Path
 _TESTS = Path(__file__).resolve().parent
 _REPO = _TESTS.parent
 sys.path.insert(0, str(_TESTS))
-from _helpers.hermetic_env import hermetic_env  # noqa: E402
+from _helpers.hermetic_env import hermetic_env
 
 COMBINED = "voice-outcome-v1,room-context-v1"
 # The poll string the bridge sent before #5865 (the voice-only baseline of case a).
@@ -58,19 +58,19 @@ elif not (_BROKER_DIR / "broker" / "room_context.py").is_file():
     SKIP = f"AG2SPACE_BACKEND_DIR={_BACKEND} has no services/agent-message-broker/broker/room_context.py"
 else:
     try:
-        import aiohttp  # noqa: F401
-        import pytest  # noqa: F401  (the backend harness imports it)
+        import aiohttp
+        import pytest
     except ImportError as e:  # pragma: no cover - depends on the host
         SKIP = f"the backend harness needs aiohttp and pytest: {e}"
 
 if not SKIP:
     sys.path[:0] = [str(_BROKER_DIR / "tests"), str(_BROKER_DIR), str(_BROKER_DIR.parent)]
-    import test_api_v1 as api_harness  # noqa: E402
-    import test_room_context as rc_harness  # noqa: E402
-    from test_task_state_routes import _granted  # noqa: E402
-    from aiohttp import web  # noqa: E402
-    from api.v1 import build_app  # noqa: E402
-    from broker import room_context as broker_rc  # noqa: E402
+    import test_api_v1 as api_harness
+    import test_room_context as rc_harness
+    from test_task_state_routes import _granted
+    from aiohttp import web
+    from api.v1 import build_app
+    from broker import room_context as broker_rc
     AGENT, OWNER, ROOM, TOKEN = (api_harness.AGENT, api_harness.OWNER, api_harness.ROOM,
                                  api_harness.BEARER["a"])
 
@@ -80,9 +80,10 @@ class Broker:
 
     def __init__(self, test, masq, hub_kw=None):
         self.masq = masq
-        self.polls: "list[str]" = []                       # each GET /v1/tasks query
-        self.served: "list[tuple[str, list]]" = []          # (query, tasks) when non-empty
-        self.posted: "list[tuple[str, object, int]]" = []   # (path, json body, status)
+        # Recorded: each GET /v1/tasks query; (query, tasks) when non-empty; (path, json body, status).
+        self.polls: "list[str]" = []
+        self.served: "list[tuple[str, list]]" = []
+        self.posted: "list[tuple[str, object, int]]" = []
         self.loop = asyncio.new_event_loop()
         threading.Thread(target=self.loop.run_forever, daemon=True).start()
         self.deps, self.runner, self.url = self.call(self._start(hub_kw))
