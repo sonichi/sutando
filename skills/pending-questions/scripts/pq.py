@@ -8,7 +8,7 @@
   pq.py resolve <ask-id> [--answered]
   pq.py remind [--force]           # the reminder (--notify) through src/check-pending-questions.py
   pq.py clicks [--json]            # the owner's decision-card clicks, each handed out once
-  pq.py ack <ask-id>               # the core acted on that choice; its card is settled
+  pq.py ack <ask-id> --token <t>   # the core acted on that choice; its card is settled
 
 Every verb delegates: `ask` to scripts/ask-owner.py with this skill's adapter injected,
 `list`, `reconcile` and `resolve` to the sibling room-database adapter (the one reader

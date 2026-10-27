@@ -277,10 +277,17 @@ def owner_status(cells: dict) -> Optional[str]:
 
 
 def _mark(cells: dict, prop: str) -> Optional[str]:
-    """A mark counts only when the row's own Host wrote it ("<value>@<host>"): two hosts that
-    both created one row on stale replicas merge to one Host, and the other's mark is ignored."""
+    """A mark counts only when the row's own Host wrote it ("<value>[+<token>]@<host>"): two hosts
+    that both created one row on stale replicas merge to one Host, and the other's mark is ignored.
+    The optional token names the click claim that wrote a Closed mark; it is not part of the value."""
     val, _, tag = str(cells.get(prop) or "").partition("@")
+    val = val.partition("+")[0]
     return val if val and (tag or None) == (cells.get("host") or None) else None
+
+
+def mark_token(raw) -> Optional[str]:
+    """The claim token a Closed mark carries ("<value>+<token>@<host>"), or None."""
+    return str(raw or "").partition("@")[0].partition("+")[2] or None
 
 
 def effective_status(cells: dict) -> str:
@@ -379,13 +386,14 @@ class RoomDbStore:
     def _tag(self, value: str) -> str:
         return f"{value}@{self.host}" if self.host else value
 
-    def close(self, ask_id: str, to: str, require_open: bool = False) -> None:
+    def close(self, ask_id: str, to: str, require_open: bool = False, token: Optional[str] = None) -> None:
         """Record a closure made by code in the Closed cell; Status stays the owner's.
-        `require_open`: an owner's terminal Status refuses the close in the same guarded write."""
+        `require_open`: an owner's terminal Status refuses the close in the same guarded write.
+        `token`: the click claim closing it, written into the mark so its retry can know its own."""
         if to not in TERMINAL:
             raise StoreError(f"code only closes a row; {to!r} is not Answered or Resolved")
         expect = {"closed": [None], **({"status": OPEN_RAW} if require_open else {})}
-        self._guarded(ask_id, {"closed": self._tag(to)}, expect)
+        self._guarded(ask_id, {"closed": self._tag(f"{to}+{token}" if token else to)}, expect)
 
     def clear(self, ask_id: str, props: list) -> None:
         """Remove stale code marks from this host's row; Status is not touched."""

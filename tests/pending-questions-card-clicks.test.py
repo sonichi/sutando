@@ -66,6 +66,10 @@ def make_card(m: HitlManager, ask_id: str, question="Merge #12?", options=OPTION
     return m.create(req).id
 
 
+def token_of(m: HitlManager, card: str) -> str:
+    return m.get(card).subject["claim"]["token"]
+
+
 def click(m: HitlManager, card: str, action_id: str) -> None:
     req = m.get(card)
     m.apply_action(ActionReply(hitl_id=req.id, expected_revision=req.revision, action_id=action_id,
@@ -119,10 +123,12 @@ class _Room(unittest.TestCase):
 class HandedOnce(_Room):
     def test_a_click_is_actionable_once_then_awaits_ack(self):
         click(self.m, self.card, "option-1")
-        self.assertFalse(room_db.ack_click(self.ws, self.ask_id, self.m)[0], "nothing handed yet: no ack")
+        self.assertFalse(room_db.ack_click(self.ws, self.ask_id, "x", self.m)[0], "nothing handed yet: no ack")
         [first] = self.run_clicks()
         self.assertEqual((first["actionable"], first["closed"], first["action_id"], first["consequence"]),
                          (True, True, "option-1", "wait for the CLA"))
+        self.assertEqual(first["token"], token_of(self.m, self.card))
+        self.assertIn(f"ack with --token {first['token']}", reader.click_line(first))
         self.assertEqual(reader.click_line(first)[:len(f"- [{self.ask_id}] chose option-1 'Hold' -> wait")],
                          f"- [{self.ask_id}] chose option-1 'Hold' -> wait")
         self.assertEqual(self.store.status_of(self.ask_id), "Answered")
@@ -130,10 +136,10 @@ class HandedOnce(_Room):
         self.assertEqual((again["actionable"], again["handed_before"]), (False, True))
         self.assertNotIn("chose", reader.click_line(again))
         self.assertIn("awaiting ack", reader.click_line(again))
-        self.assertTrue(room_db.ack_click(self.ws, self.ask_id, self.m)[0])
+        self.assertTrue(room_db.ack_click(self.ws, self.ask_id, first["token"], self.m)[0])
         self.assertEqual(self.m.get(self.card).status, STATUS_RESOLVED)
         self.assertEqual(self.run_clicks(), [])
-        self.assertFalse(room_db.ack_click(self.ws, self.ask_id, self.m)[0], "nothing left to ack")
+        self.assertFalse(room_db.ack_click(self.ws, self.ask_id, first["token"], self.m)[0], "nothing left to ack")
 
     def test_the_lock_lives_beside_the_hitl_store(self):
         self.run_clicks()
@@ -155,32 +161,6 @@ class HandedOnce(_Room):
         text = "".join(o for o, _ in outs)
         self.assertEqual(text.count(" chose option-1 'Hold'"), 1, text)
         self.assertEqual(self.m.get(self.card).status, STATUS_IN_PROGRESS, "claimed until ack, never cancelled")
-
-    def test_a_close_that_cannot_be_recorded_is_handed_once_and_retried_after_ack(self):
-        click(self.m, self.card, "approve")
-        fail = (False, "not recorded: nothing held")
-        with mock.patch.object(room_db, "_close_for_click", return_value=fail):
-            [first] = self.run_clicks()
-            [again] = self.run_clicks()
-        self.assertEqual((first["actionable"], first["closed"]), (True, False))
-        self.assertEqual((again["actionable"], again["handed_before"]), (False, True))
-        self.assertTrue(room_db.ack_click(self.ws, self.ask_id, self.m)[0])
-        with mock.patch.object(room_db, "_close_for_click", return_value=fail):
-            [acked] = self.run_clicks()
-        self.assertTrue(acked["acked_before"])
-        self.assertIn("acknowledged before, not a new decision", reader.click_line(acked))
-        [settled] = self.run_clicks()
-        self.assertEqual((settled["actionable"], settled["closed"]), (False, True))
-        self.assertEqual(self.m.get(self.card).status, STATUS_RESOLVED)
-
-    def test_a_handed_click_whose_row_closes_later_records_it(self):
-        click(self.m, self.card, "approve")
-        with mock.patch.object(room_db, "_close_for_click", return_value=(False, "not recorded: x")):
-            self.run_clicks()
-        [again] = self.run_clicks()
-        self.assertEqual((again["closed"], again["actionable"]), (True, False))
-        self.assertTrue(self.m.get(self.card).subject["claim"]["row_closed"])
-
 
 class CrashBoundaries(_Room):
     def die_in_close(self, after_close: bool):
@@ -206,13 +186,130 @@ class CrashBoundaries(_Room):
         [again] = self.run_clicks()
         self.assertFalse(again["actionable"])
 
-    def test_death_after_the_handoff_is_shown_awaiting_ack_never_offered_again(self):
+    def test_death_after_the_handoff_is_reoffered_after_the_lease_and_not_before(self):
         click(self.m, self.card, "option-1")
         self.child("with mock.patch.object(reader, 'click_line', side_effect=lambda c: os._exit(17)):\n"
                    f"    reader.main(['clicks', '--workspace', str(ws), '--store-adapter', {ADAPTER!r}])")
+        claim = self.m.get(self.card).subject["claim"]
+        self.assertEqual(claim["state"], cards.HANDED)
+        handed_at = claim["handed_at"]
+        [inside] = room_db.clicks(self.ws, manager=self.m, now=handed_at + cards.HANDED_LEASE_SEC - 1)
+        self.assertEqual((inside["actionable"], inside["handed_before"]), (False, True))
+        self.assertIn("re-offered if no ack comes within the lease", reader.click_line(inside))
+        [after] = room_db.clicks(self.ws, manager=self.m, now=handed_at + cards.HANDED_LEASE_SEC)
+        self.assertEqual((after["actionable"], after["reoffered"]), (True, True))
+        self.assertIn("chose option-1 'Hold' -> wait for the CLA (re-offered", reader.click_line(after))
+        fresh = self.m.get(self.card).subject["claim"]
+        self.assertNotEqual(fresh["token"], claim["token"])
+        self.assertEqual(fresh["handed_at"], handed_at + cards.HANDED_LEASE_SEC)
+        [next_pass] = room_db.clicks(self.ws, manager=self.m, now=handed_at + cards.HANDED_LEASE_SEC + 1)
+        self.assertFalse(next_pass["actionable"], "a re-offer starts a new lease")
+
+    def test_an_ack_inside_the_lease_prevents_any_reoffer(self):
+        click(self.m, self.card, "option-1")
         [c] = self.run_clicks()
-        self.assertEqual((c["actionable"], c["handed_before"]), (False, True))
-        self.assertIn("act on it only if no earlier turn did", reader.click_line(c))
+        handed_at = self.m.get(self.card).subject["claim"]["handed_at"]
+        self.assertTrue(room_db.ack_click(self.ws, self.ask_id, c["token"], self.m)[0])
+        self.assertEqual(room_db.clicks(self.ws, manager=self.m, now=handed_at + 100 * cards.HANDED_LEASE_SEC), [])
+        self.assertEqual(self.m.get(self.card).status, STATUS_RESOLVED)
+
+    def test_two_consumers_after_the_lease_get_exactly_one_reoffer(self):
+        click(self.m, self.card, "option-1")
+        self.run_clicks()
+        claim = self.m.get(self.card).subject["claim"]
+        cards.stamp_claim(self.m, self.card, {**claim, "handed_at": claim["handed_at"] - cards.HANDED_LEASE_SEC - 5})
+        slow = ("real = rdb._close_for_click\n"
+                "import pending_questions_clicks as pc, time\n"
+                "real_cards = pc.answered_cards\n"
+                "def slow_cards(m):\n    got = real_cards(m)\n    time.sleep(1.5)\n    return got\n"
+                "with mock.patch.object(pc, 'answered_cards', slow_cards):\n"
+                f"    reader.main(['clicks', '--workspace', str(ws), '--store-adapter', {ADAPTER!r}])\n"
+                "sys.stdout.flush()\nos._exit(17)")
+        plain = (f"reader.main(['clicks', '--workspace', str(ws), '--store-adapter', {ADAPTER!r}])\n"
+                 "sys.stdout.flush()\nos._exit(17)")
+        procs = [subprocess.Popen([sys.executable, "-c", self.code(b)], env=self.env, stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE, text=True) for b in (slow, plain)]
+        outs = [p.communicate(timeout=120) for p in procs]
+        self.assertEqual([p.returncode for p in procs], [17, 17], "".join(e[-1500:] for _, e in outs))
+        text = "".join(o for o, _ in outs)
+        self.assertEqual(text.count(" chose option-1 'Hold'"), 1, text)
+        self.assertEqual(text.count("(re-offered"), 1, text)
+
+
+class TokenAndOutage(_Room):
+    def _owner_sets(self, status):
+        self.store.client.set_cells(room_db.DB_SCHEMA, self.store._rid(self.ask_id), {"status": status})
+
+    def test_a_late_ack_after_a_reoffer_is_refused_as_stale(self):
+        click(self.m, self.card, "option-1")
+        [first] = self.run_clicks()
+        handed_at = self.m.get(self.card).subject["claim"]["handed_at"]
+        [again] = room_db.clicks(self.ws, manager=self.m, now=handed_at + cards.HANDED_LEASE_SEC)
+        self.assertTrue(again["reoffered"])
+        self.assertNotEqual(again["token"], first["token"])
+        ok, msg = room_db.ack_click(self.ws, self.ask_id, first["token"], self.m)
+        self.assertFalse(ok)
+        self.assertIn("stale ack", msg)
+        self.assertEqual(self.m.get(self.card).status, STATUS_IN_PROGRESS, "the late ack changed nothing")
+        self.assertTrue(room_db.ack_click(self.ws, self.ask_id, again["token"], self.m)[0])
+        self.assertEqual(self.m.get(self.card).status, STATUS_RESOLVED)
+
+    def test_a_recovered_claim_never_takes_credit_for_an_unrelated_resolve(self):
+        click(self.m, self.card, "option-1")
+        cards.stamp_claim(self.m, self.card, {"token": "claimtok", "state": cards.CLAIMING})
+        self.child("import pending_questions_clicks as pc\n"
+                   "with mock.patch.object(pc, 'retire_cards', side_effect=lambda *a, **k: os._exit(17)):\n"
+                   "    rdb.resolve(ws, " + repr(self.ask_id) + ", 'Answered')")
+        self.assertEqual(self.store.status_of(self.ask_id), "Answered", "resolve closed the row")
+        self.assertEqual(self.m.get(self.card).status, STATUS_IN_PROGRESS, "the crash left the card")
+        [c] = self.run_clicks()
+        self.assertEqual((c["stale"], c["actionable"]), (True, False), c["close_message"])
+        self.assertNotIn("chose", reader.click_line(c))
+        self.assertEqual(self.m.get(self.card).status, STATUS_CANCELLED)
+
+    def test_the_claims_own_earlier_close_is_recognised_by_its_token(self):
+        click(self.m, self.card, "option-1")
+        cards.stamp_claim(self.m, self.card, {"token": "claimtok", "state": cards.CLAIMING})
+        self.store.close(self.ask_id, "Answered", require_open=True, token="claimtok")
+        [c] = self.run_clicks()
+        self.assertEqual((c["actionable"], c["token"]), (True, "claimtok"), c["close_message"])
+
+    def test_an_outage_defers_a_click_even_beside_a_terminal_owner_status(self):
+        self._owner_sets("resolved")
+        click(self.m, self.card, "approve")
+        with mock.patch.object(room_db, "room_store", return_value=(None, "room capability unreachable")):
+            [c] = self.run_clicks()
+        self.assertEqual((c["deferred"], c["actionable"], c["stale"]), (True, False, False), c["close_message"])
+        self.assertIn("deferred", reader.click_line(c))
+        self.assertNotIn("chose", reader.click_line(c))
+        self.assertEqual(self.m.get(self.card).subject["claim"]["state"], cards.CLAIMING, "retryable")
+        self.assertFalse((self.ws / "state" / "pending-questions-outbox" / "closed").exists(), "no local close")
+        [back] = self.run_clicks()
+        self.assertEqual((back["stale"], back["actionable"]), (True, False), "the owner's Status wins")
+
+    def test_an_unreachable_room_or_an_absent_row_defers(self):
+        click(self.m, self.card, "approve")
+        with mock.patch.object(room_db, "room_store", return_value=(self.store, "room")), \
+                mock.patch.object(type(self.store), "close", side_effect=OSError("socket refused")):
+            [c] = self.run_clicks()
+        self.assertTrue(c["deferred"])
+        self.assertIn("unreachable", c["close_message"])
+        with mock.patch.object(type(self.store), "close",
+                               side_effect=room_db.GuardFailed(self.ask_id, {})):
+            [c] = self.run_clicks()
+        self.assertTrue(c["deferred"])
+        self.assertIn("no row in the room yet", c["close_message"])
+        [c] = self.run_clicks()
+        self.assertTrue(c["actionable"], "the deferred click is handed over once the room answers")
+
+
+    def test_a_row_in_view_commits_the_store_history_before_its_click_closes_it(self):
+        click(self.m, self.card, "approve")
+        with mock.patch.object(room_db, "store_history", return_value=False), \
+                mock.patch.object(room_db.Outbox, "commit_history") as ch:
+            [c] = self.run_clicks()
+        ch.assert_called_once_with(self.ask_id)
+        self.assertTrue(c["actionable"])
 
 
 class OwnerStatusWins(_Room):
@@ -262,7 +359,7 @@ class ExactChoice(unittest.TestCase):
         m = _manager(ws)
         card = make_card(m, "ask-x", question, options)
         click(m, card, action_id)
-        return cards.clicks(ws, lambda *a: (True, "closed"), room_db.REFUSED_PREFIX, room_db.CODE_CLOSED_PREFIX, m)[0]
+        return cards.clicks(ws, lambda *a: (cards.CLOSED, "closed"), m)[0]
 
     def test_a_long_label_and_a_long_question_report_the_exact_operation(self):
         label = "Ship it to production after the canary has run for two full hours without alerts " * 3
@@ -302,29 +399,35 @@ class CoreEntries(_Room):
         self.assertIn(f"[{self.ask_id}] chose approve 'Approve' -> merge it", text)
         rc, text = self._main(["clicks", "--json", *base])
         self.assertEqual(json.loads(text)[0]["handed_before"], True)
-        rc, text = self._main(["ack", self.ask_id, *base])
+        token = token_of(self.m, self.card)
+        rc, text = self._main(["ack", self.ask_id, "--token", "superseded", *base])
+        self.assertEqual(rc, 1, text)
+        self.assertIn("stale ack", text)
+        rc, text = self._main(["ack", self.ask_id, "--token", token, *base])
         self.assertEqual(rc, 0, text)
         rc, text = self._main(["clicks", *base])
         self.assertIn("no question-card clicks waiting", text)
-        rc, text = self._main(["ack", self.ask_id, *base])
+        rc, text = self._main(["ack", self.ask_id, "--token", token, *base])
         self.assertEqual(rc, 1)
 
     def test_refusals_change_nothing(self):
         with self.assertRaises(SystemExit):
             self._main(["ack", "--workspace", str(self.ws)])
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            self._main(["ack", self.ask_id, "--workspace", str(self.ws)])
         with mock.patch.object(reader, "_adapter", return_value=(None, "no adapter")):
-            self.assertEqual(reader.ack(self.ws, "a")[0], False)
+            self.assertEqual(reader.ack(self.ws, "a", "t")[0], False)
             self.assertEqual(reader.clicks(self.ws), (None, "no store: no adapter"))
             rc, text = self._main(["clicks", "--workspace", str(self.ws)])
             self.assertEqual(rc, 1)
             self.assertIn("not read", text)
         with mock.patch.object(reader, "_adapter", return_value=(object(), "p")):
             self.assertIn("takes no card clicks", reader.clicks(self.ws)[1])
-            self.assertIn("takes no acks", reader.ack(self.ws, "a")[1])
+            self.assertIn("takes no acks", reader.ack(self.ws, "a", "t")[1])
         boom = mock.Mock(clicks=mock.Mock(side_effect=OSError("x")), ack_click=mock.Mock(side_effect=OSError("y")))
         with mock.patch.object(reader, "_adapter", return_value=(boom, "p")):
             self.assertIn("adapter failed", reader.clicks(self.ws)[1])
-            self.assertIn("adapter failed", reader.ack(self.ws, "a")[1])
+            self.assertIn("adapter failed", reader.ack(self.ws, "a", "t")[1])
 
     def test_pq_cli_forwards_clicks_and_ack(self):
         spec = importlib.util.spec_from_file_location("pq_cli_c", PQ / "pq.py")
@@ -332,7 +435,7 @@ class CoreEntries(_Room):
         spec.loader.exec_module(pq)
         with mock.patch.object(reader, "main", return_value=0) as rm:
             self.assertEqual(pq.main(["clicks", "--json"]), 0)
-            self.assertEqual(pq.main(["ack", "ask-1"]), 0)
+            self.assertEqual(pq.main(["ack", "ask-1", "--token", "t"]), 0)
         self.assertEqual(rm.call_args_list[0].args[0][:2], ["clicks", "--json"])
         self.assertIn("--store-adapter", rm.call_args_list[1].args[0])
 
@@ -340,7 +443,7 @@ class CoreEntries(_Room):
         click(self.m, self.card, "approve")
         [c] = room_db.clicks(self.ws)
         self.assertTrue(c["actionable"])
-        self.assertTrue(room_db.ack_click(self.ws, self.ask_id)[0])
+        self.assertTrue(room_db.ack_click(self.ws, self.ask_id, c["token"])[0])
 
 
 if __name__ == "__main__":

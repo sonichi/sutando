@@ -27,7 +27,7 @@ python3 skills/pending-questions/scripts/pq.py reconcile
 python3 skills/pending-questions/scripts/pq.py resolve <ask-id> [--answered]
 python3 skills/pending-questions/scripts/pq.py remind [--force]
 python3 skills/pending-questions/scripts/pq.py clicks [--json]
-python3 skills/pending-questions/scripts/pq.py ack <ask-id>
+python3 skills/pending-questions/scripts/pq.py ack <ask-id> --token <token>
 ```
 
 **Trigger: any time you would write a question for the owner into terminal or summary text, file
@@ -90,23 +90,32 @@ adapter's `clicks` (`scripts/pending_questions_clicks.py`):
 
 - Each pass runs under one exclusive lock beside the HITL store
   (`state/hitl/pending-questions-clicks.lock`); its holder is the only live claimant, so no pid
-  is probed. A claim still marked `claiming` was left by a pass that died before handing the
-  choice over, and is re-offered.
-- The pass claims the click (a token, saved atomically on the card), closes the row as Answered
-  in one guarded write that also requires the owner's Status to be open, and records the claim
-  `handed` before returning it. The choice prints once, as
-  `[<ask-id>] chose <action-id> '<label>' -> <consequence>`, to that caller alone. A later pass, by
-  any consumer, prints it as "handed out earlier, awaiting ack — not a new decision".
-- The core acts, then runs `… ack <ask-id>`: a closed row settles the card; one whose close is
-  still pending is marked acknowledged and later passes only retry the close.
-- A row already closed by the owner's own Status, or by code without this click's claim, makes
-  the click stale: "already answered — not a decision", and its card is cancelled.
+  is probed. A claim still marked `claiming` was left by a pass that died; it is retried with the
+  same token.
+- The pass claims the click (a token, saved atomically on the card) and closes the row as
+  Answered in one guarded write that requires the owner's Status to be open and writes the token
+  into the Closed mark (`Answered+<token>@<host>`). A refusal whose mark carries this token is
+  the claim's own earlier close. Any other refusal (the owner's Status, or a close by code such as
+  `resolve`) makes the click stale: "already answered — not a decision", and its card is
+  cancelled.
+- **Fail closed.** Only the room can say the owner's Status is open, so a click never closes
+  through a local close record: when the room store is missing or unreachable, or the row is not
+  in it yet, the click is deferred — nothing is handed over, the claim stays, and the next pass
+  retries.
+- On a close the claim is recorded `handed` (with `handed_at`) before it is returned. The choice
+  prints once, as `[<ask-id>] chose <action-id> '<label>' -> <consequence> … ack with --token
+  <token>`, to that caller alone. Later passes, by any consumer, print it as "handed out earlier,
+  awaiting ack — not a new decision" for the lease (`HANDED_LEASE_SEC`, 10 minutes).
+- The core acts, then runs `… ack <ask-id> --token <token>`, which settles the card. A handed claim
+  older than the lease is re-offered as `chose` to the next pass with a fresh token, so a consumer
+  that died after the handoff does not strand the choice. The trade-off: exclusive within the
+  lease, at-least-once after it. An ack carrying a superseded token (a consumer that acked after
+  its lease was re-offered) is refused as stale and changes nothing.
 - `resolve` retires (cancels) the question's card whenever it closes the row or the room refuses
   the close.
 
-The one window left: a pass that dies after recording `handed` and before its caller printed the
-choice leaves it handed but unseen; every later pass shows it as awaiting ack, with the choice,
-rather than offering it again.
+A pass that dies after recording `handed` and before its caller printed the choice leaves it
+handed but unseen; it is shown as awaiting ack until the lease runs out, then re-offered.
 
 ## The outbox
 

@@ -18,15 +18,17 @@ does, on demand; the two are the adapter's separate entry points). Never read an
 answer task before it asks for the close).
 
 `clicks` returns the owner's decision-card clicks after the adapter closed each clicked question's
-row: [{ask_id, action_id, label, consequence, actionable, stale, handed_before, acked_before,
-closed, close_message, ...}]; only an `actionable` one is a decision, handed to this caller alone.
-`ack` settles it once acted on. With no adapter, or one without them, both refuse and change nothing.
+row: [{ask_id, action_id, label, consequence, actionable, token, stale, deferred, handed_before,
+closed, close_message, ...}]; only an `actionable` one is a decision, handed to this caller alone
+until its lease runs out unacked (then re-offered to the next caller with a new token).
+`ack` with that token settles it once acted on; a superseded token is refused. With no adapter, or one without them, both refuse and change nothing.
 
 CLI, for shell readers: `python3 src/pending_questions_reader.py list [--json] | count | summary`
 (`summary` is the count and where the questions live, never their text); and the
 writes a core caller makes through the same contract: `resolve <ask-id> [--answered]`
 (Resolved, or Answered), which is `resolve` above and nothing else; `clicks [--json]`, run on a
-`hitl_click: true` task; and `ack <ask-id>` once the core has acted on a choice `clicks` handed it. `--store-adapter <path>`
+`hitl_click: true` task; and `ack <ask-id> --token <token>` once the core has acted on a choice
+`clicks` handed it. `--store-adapter <path>`
 injects an adapter file in place of the declared one.
 """
 from __future__ import annotations
@@ -208,13 +210,13 @@ def clicks(workspace, adapter=None) -> tuple:
         return None, f"adapter failed ({type(e).__name__}: {e})"
 
 
-def ack(workspace, ask_id: str, adapter=None) -> tuple:
+def ack(workspace, ask_id: str, token: str, adapter=None) -> tuple:
     """(done, message): the core acted on that question's choice; the adapter's `ack_click`."""
     mod, why = _adapter(adapter)
     if mod is None or not hasattr(mod, "ack_click"):
         return False, f"not acknowledged: {why if mod is None else f'adapter {why} takes no acks'}"
     try:
-        return mod.ack_click(Path(workspace), ask_id)
+        return mod.ack_click(Path(workspace), ask_id, token)
     except Exception as e:  # noqa: BLE001
         return False, f"not acknowledged: adapter failed ({type(e).__name__}: {e})"
 
@@ -226,11 +228,13 @@ def click_line(c: dict) -> str:
     if c.get("stale"):
         return f"- [{c['ask_id']}] already answered — not a decision (a late click on {what}) — {q}"
     if c.get("actionable"):
-        return f"- [{c['ask_id']}] chose {what} — {q}"
-    if c.get("acked_before"):
-        return f"- [{c['ask_id']}] acknowledged before, not a new decision ({what}); its row is not closed yet — {q}"
+        again = " (re-offered: the consumer it was handed to never acked)" if c.get("reoffered") else ""
+        return f"- [{c['ask_id']}] chose {what}{again} — {q} — ack with --token {c['token']}"
+    if c.get("deferred"):
+        return (f"- [{c['ask_id']}] deferred — the room cannot confirm the owner has not answered "
+                f"otherwise; not a decision yet ({what}); retried next pass — {q}")
     return (f"- [{c['ask_id']}] handed out earlier, awaiting ack — not a new decision ({what}); "
-            f"act on it only if no earlier turn did, then ack — {q}")
+            f"re-offered if no ack comes within the lease — {q}")
 
 
 def _norm_title(text: str) -> str:
@@ -275,6 +279,7 @@ def main(argv=None) -> int:
     ap.add_argument("ask_id", nargs="?", default=None, help="resolve / ack: the question's ask id")
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--answered", action="store_true", help="resolve: mark it Answered, not Resolved")
+    ap.add_argument("--token", default=None, help="ack: the token `clicks` printed with the choice")
     ap.add_argument("--workspace", type=Path, default=None)
     ap.add_argument("--store-adapter", default=None, help="an adapter file in place of the declared one")
     # intermixed: an optional positional after `--workspace` is otherwise swallowed on 3.12
@@ -286,7 +291,9 @@ def main(argv=None) -> int:
     if args.command in ("resolve", "ack") and not args.ask_id:
         ap.error(f"{args.command} needs an ask id")
     if args.command == "ack":
-        ok, msg = ack(args.workspace, args.ask_id, store)
+        if not args.token:
+            ap.error("ack needs the --token `clicks` printed with the choice")
+        ok, msg = ack(args.workspace, args.ask_id, args.token, store)
         print(msg)
         return 0 if ok else 1
     if args.command == "clicks":

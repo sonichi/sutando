@@ -53,7 +53,7 @@ import pending_questions_ask as core_ask
 import pending_questions_clicks as cards
 from pending_questions_outbox import (Outbox as HeldRecords, local_closes, mark_room_introduced,
                                       mark_store_used, room_introduced, store_history)
-from pending_questions_store import (DB_SCHEMA, INCOMPLETE, TERMINAL, GuardFailed, Outbox, Question,
+from pending_questions_store import (DB_SCHEMA, INCOMPLETE, TERMINAL, GuardFailed, Outbox, Question, mark_token,
                                      RoomDbStore, ScriptDbClient, StoreError, outbox_items, reconcile_pending,
                                      safe_body, waiting_item, write_question)
 from ag2space_links import database_link
@@ -69,10 +69,8 @@ SETTLE_SEC = 1.0
 ROOM_KEY = "PENDING_QUESTIONS_ROOM"
 # The collab service URL; set, it overrides the capability's own resolution (an outage rehearsal).
 URL_KEY = "PENDING_QUESTIONS_COLLAB_URL"
-# `resolve`'s answer when the room saw the row and refused the close (closed already, no such row);
-# the second when only a code Closed mark, no owner Status, had closed it.
+# `resolve`'s answer when the room saw the row and refused the close (closed already, no such row).
 REFUSED_PREFIX = "room database: not changed"
-CODE_CLOSED_PREFIX = REFUSED_PREFIX + " (closed by code)"
 
 
 def skill_scripts(workspace: Path) -> Optional[Path]:
@@ -289,7 +287,7 @@ def resolve(workspace: Path, ask_id: str, status: str, manager=None) -> tuple:
     return ok, msg
 
 
-def _close_row(workspace: Path, ask_id: str, status: str, require_open: bool = False) -> tuple:
+def _close_row(workspace: Path, ask_id: str, status: str) -> tuple:
     """(closed, message): the row's Closed cell takes `status` (Answered or Resolved) after a
     reconcile files any held question; a store that cannot be written leaves a local close
     record instead. A row in view before the history marker was ever committed commits it
@@ -309,30 +307,48 @@ def _close_row(workspace: Path, ask_id: str, status: str, require_open: bool = F
                     Outbox(ws).commit_history(ask_id)
                 except StoreError as e:
                     return _close_locally(ws, ask_id, status, f"room database: left open — {e}", "its row is in view")
-            store.close(ask_id, status, require_open=require_open)
+            store.close(ask_id, status)
             return True, f"room database: {ask_id} -> {status} in {store.where(ask_id)}"
     except GuardFailed as g:
         if not g.current and any(e["ask_id"] == ask_id for e in Outbox(ws).entries()):
             return _close_locally(ws, ask_id, status, "its held entry has no row yet")
-        owner = g.current.get("status") in TERMINAL
-        prefix = CODE_CLOSED_PREFIX if g.current.get("closed") and not owner else REFUSED_PREFIX
-        return False, f"{prefix} — {type(g).__name__}: {g}"
+        return False, f"{REFUSED_PREFIX} — {type(g).__name__}: {g}"
     except Exception as e:  # noqa: BLE001
         return _close_locally(ws, ask_id, status, f"room database unreachable ({type(e).__name__}: {e})")
 
 
-def _close_for_click(ws: Path, ask_id: str, status: str) -> tuple:
-    return _close_row(ws, ask_id, status, require_open=True)
+def _close_for_click(ws: Path, ask_id: str, token: str) -> tuple:
+    """(closed | stale | deferred, message) for a click claim. Only the room itself can say the
+    owner's Status is open, so there is no local fallback: anything it cannot verify defers."""
+    from util_paths import host_label
+    store, where = room_store(ws)
+    if store is None:
+        return cards.DEFERRED, f"deferred: room database not used ({where}); the owner's Status cannot be checked"
+    try:
+        with getattr(store, "operation", nullcontext)():
+            reconcile_pending(store, ws, host_label())
+            if not store_history(ws) and store.status_of(ask_id) is not None:
+                Outbox(ws).commit_history(ask_id)
+            store.close(ask_id, "Answered", require_open=True, token=token)
+            return cards.CLOSED, f"room database: {ask_id} -> Answered in {store.where(ask_id)}"
+    except GuardFailed as g:
+        if mark_token(g.current.get("closed")) == token:
+            return cards.CLOSED, f"room database: {ask_id} closed earlier by this claim"
+        if not g.current:
+            return cards.DEFERRED, f"deferred: {ask_id} has no row in the room yet"
+        return cards.STALE, f"{REFUSED_PREFIX} — {type(g).__name__}: {g}"
+    except Exception as e:  # noqa: BLE001
+        return cards.DEFERRED, f"deferred: room database unreachable ({type(e).__name__}: {e})"
 
 
-def clicks(workspace: Path, manager=None) -> list:
-    """The owner's decision-card clicks, each handed over as an actionable choice exactly once
-    (pending_questions_clicks); the row closes through this adapter's guarded close."""
-    return cards.clicks(Path(workspace), _close_for_click, REFUSED_PREFIX, CODE_CLOSED_PREFIX, manager)
+def clicks(workspace: Path, manager=None, now=None) -> list:
+    """The owner's decision-card clicks, each handed over as an actionable choice once, and again
+    only after an unacked lease (pending_questions_clicks); the row closes through this adapter."""
+    return cards.clicks(Path(workspace), _close_for_click, manager, now)
 
 
-def ack_click(workspace: Path, ask_id: str, manager=None) -> tuple:
-    return cards.ack_click(Path(workspace), ask_id, manager)
+def ack_click(workspace: Path, ask_id: str, token: str, manager=None) -> tuple:
+    return cards.ack_click(Path(workspace), ask_id, token, manager)
 
 
 # ---- the ask ----------------------------------------------------------------------
