@@ -112,7 +112,11 @@ adapter's `clicks` (`scripts/pending_questions_clicks.py`):
   past its deadline (`lease_until`) is re-offered as `chose` to the next pass, ONCE, with a fresh
   token, so a consumer that died after the handoff does not strand the choice. After that single
   re-offer an unacked claim is listed as "NEEDS ATTENTION — handed out twice, never acknowledged"
-  and never offered again. A `handed_at` in the future (the clock went back) counts as fresh. An
+  and never offered again. A `handed_at` ahead of this clock (a clock that ran ahead, or this one stepped back) is never
+  expired on sight, so a backward step cannot steal a live lease; it holds at most one lease from
+  the first pass that sees it (`skew_seen_at`), so a clock far ahead cannot hold the click for the
+  whole skew. `clicks --due` (and so the health check) also surfaces an unseen skewed claim and a
+  NEEDS ATTENTION one. An
   ack carrying a superseded token is refused as stale and changes nothing.
 - **At-least-once, at most twice.** The core acts before it acks, so a consumer slower than the
   lease, or a clock jump, can let a second consumer receive the same `chose`. Rule: before acting

@@ -91,11 +91,27 @@ def _lease(now: float) -> dict:
     return {"handed_at": now, "lease_until": now + HANDED_LEASE_SEC}
 
 
-def _lease_expired(claim: dict, now: float) -> bool:
-    """Past the stored deadline, and not handed in the future (a clock that went back is fresh)."""
+FRESH, EXPIRED, SKEWED = "fresh", "expired", "skewed"
+
+
+def _lease_state(claim: dict, now: float) -> str:
+    """fresh | expired | skewed. A `handed_at` ahead of this clock (stamped by a clock that ran
+    ahead, or seen after this one stepped back) is never expired on sight, so a backward step
+    cannot steal a live lease; but it holds at most one lease from when a pass first saw it
+    (`skew_seen_at`), so a clock far ahead cannot hold the click for the whole skew. `skewed`
+    means no pass has recorded that first sight yet."""
     handed_at = float(claim.get("handed_at") or 0)
-    deadline = float(claim.get("lease_until") or handed_at + HANDED_LEASE_SEC)
-    return handed_at <= now and now >= deadline
+    if handed_at > now:
+        seen = claim.get("skew_seen_at")
+        if seen is None or float(seen) > now:
+            return SKEWED
+        return EXPIRED if now >= float(seen) + HANDED_LEASE_SEC else FRESH
+    deadline = min(float(claim.get("lease_until") or handed_at + HANDED_LEASE_SEC), handed_at + HANDED_LEASE_SEC)
+    return EXPIRED if now >= deadline else FRESH
+
+
+def _lease_expired(claim: dict, now: float) -> bool:
+    return _lease_state(claim, now) == EXPIRED
 
 
 def clicks(workspace: Path, closer, manager=None, now: Optional[float] = None) -> list:
@@ -117,6 +133,9 @@ def clicks(workspace: Path, closer, manager=None, now: Optional[float] = None) -
                      "deferred": False, "handed_before": handed, "closed": handed, "token": None,
                      "close_message": "closed earlier by this click"}
             if handed:
+                if _lease_state(claim, clock()) == SKEWED:
+                    claim = {**claim, "skew_seen_at": clock()}  # the bound starts at this first sight
+                    stamp_claim(manager, c["hitl_id"], claim)
                 if _lease_expired(claim, clock()):
                     if int(claim.get("reoffers") or 0) < MAX_REOFFERS:
                         claim = {**claim, **_lease(clock()), "token": _token(),
@@ -144,9 +163,10 @@ def clicks(workspace: Path, closer, manager=None, now: Optional[float] = None) -
 
 
 def due_clicks(workspace: Path, manager=None, now: Optional[float] = None) -> list:
-    """Ask ids a `clicks` pass would act on now, read-only: a click never processed, a claim left
-    `claiming` (deferred, or its pass died), or a handed claim past its deadline with its re-offer
-    unused. The periodic pass calls `clicks` only when this is non-empty."""
+    """Ask ids a `clicks` pass would act on, or that need the owner's attention, read-only: a click
+    never processed, a claim left `claiming` (deferred, or its pass died), a handed claim past its
+    deadline (to be re-offered, or listed NEEDS ATTENTION once its re-offer is used), or one stamped
+    ahead of this clock that no pass has seen yet. The health check warns while this is non-empty."""
     manager = manager or manager_for(workspace)
     now = time.time() if now is None else now
     out = []
@@ -154,7 +174,7 @@ def due_clicks(workspace: Path, manager=None, now: Optional[float] = None) -> li
         claim = c["claim"]
         if claim.get("state") != HANDED:
             out.append(c["ask_id"])
-        elif _lease_expired(claim, now) and int(claim.get("reoffers") or 0) < MAX_REOFFERS:
+        elif _lease_state(claim, now) in (EXPIRED, SKEWED):
             out.append(c["ask_id"])
     return out
 

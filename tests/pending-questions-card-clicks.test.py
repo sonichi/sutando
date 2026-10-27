@@ -422,8 +422,10 @@ class Wakeup(_Room):
         self.assertEqual(room_db.due_clicks(self.ws, self.m, now=t + 1), [], "inside the lease")
         self.assertEqual(room_db.due_clicks(self.ws, self.m, now=t + cards.HANDED_LEASE_SEC), [self.ask_id])
         room_db.clicks(self.ws, manager=self.m, now=t + cards.HANDED_LEASE_SEC)
-        self.assertEqual(room_db.due_clicks(self.ws, self.m, now=t + 100 * cards.HANDED_LEASE_SEC), [],
-                         "the single re-offer is used: needs attention, not owed a pass")
+        self.assertEqual(room_db.due_clicks(self.ws, self.m, now=t + cards.HANDED_LEASE_SEC + 1), [],
+                         "inside the re-offer's lease")
+        self.assertEqual(room_db.due_clicks(self.ws, self.m, now=t + 100 * cards.HANDED_LEASE_SEC), [self.ask_id],
+                         "its re-offer used and unacked: NEEDS ATTENTION is surfaced, not skipped")
         with mock.patch.object(reader, "_adapter", return_value=(None, "no adapter")):
             self.assertEqual(reader.due_clicks(self.ws), (None, "no store: no adapter"))
         with mock.patch.object(reader, "_adapter", return_value=(object(), "p")):
@@ -437,8 +439,61 @@ class Wakeup(_Room):
         click_ws_buf = io.StringIO()
         with contextlib.redirect_stdout(click_ws_buf):
             rc = reader.main(["clicks", "--due", "--workspace", str(self.ws), "--store-adapter", ADAPTER])
-        self.assertEqual(rc, 1)
-        self.assertIn("0 decision-card click(s) owe a pass", click_ws_buf.getvalue())
+        self.assertEqual(rc, 0, "the re-offer was stamped ahead of this clock and is unseen: surfaced")
+        self.assertIn(f"1 decision-card click(s) owe a pass: {self.ask_id}", click_ws_buf.getvalue())
+
+
+class SkewedClock(_Room):
+    """A handed_at ahead of this clock: never stolen on sight, held at most one lease from first sight."""
+
+    def _handed_at(self, handed_at):
+        click(self.m, self.card, "option-1")
+        self.run_clicks()
+        claim = self.m.get(self.card).subject["claim"]
+        cards.stamp_claim(self.m, self.card, {**claim, "handed_at": handed_at,
+                                              "lease_until": handed_at + cards.HANDED_LEASE_SEC})
+        return claim
+
+    def test_a_clock_far_ahead_holds_the_click_for_one_lease_not_the_whole_skew(self):
+        t = 1_800_000_000.0
+        self._handed_at(t + 365 * 86400)  # stamped by a clock a year ahead
+        self.assertEqual(room_db.due_clicks(self.ws, self.m, now=t), [self.ask_id], "unseen skew is surfaced")
+        [first] = room_db.clicks(self.ws, manager=self.m, now=t)
+        self.assertFalse(first["actionable"], "never stolen on sight")
+        self.assertEqual(self.m.get(self.card).subject["claim"]["skew_seen_at"], t)
+        [inside] = room_db.clicks(self.ws, manager=self.m, now=t + cards.HANDED_LEASE_SEC - 1)
+        self.assertFalse(inside["actionable"])
+        self.assertEqual(room_db.due_clicks(self.ws, self.m, now=t + cards.HANDED_LEASE_SEC), [self.ask_id])
+        [after] = room_db.clicks(self.ws, manager=self.m, now=t + cards.HANDED_LEASE_SEC)
+        self.assertEqual((after["actionable"], after["reoffered"]), (True, True),
+                         "bounded at one lease from first sight, not a year (or the +30 days probed)")
+
+    def test_a_clock_that_stepped_back_cannot_steal_a_live_lease(self):
+        claim = self._handed_at(1_800_000_000.0)
+        back = 1_800_000_000.0 - 1  # this clock is now 1 s behind the stamp
+        [c] = room_db.clicks(self.ws, manager=self.m, now=back)
+        self.assertFalse(c["actionable"], "no immediate steal")
+        [c] = room_db.clicks(self.ws, manager=self.m, now=back + cards.HANDED_LEASE_SEC)
+        self.assertFalse(c["actionable"], "once this clock passes the stamp, the original lease still holds")
+        [c] = room_db.clicks(self.ws, manager=self.m, now=1_800_000_000.0 + cards.HANDED_LEASE_SEC)
+        self.assertTrue(c["reoffered"], "and ends where it always did")
+
+    def test_a_first_sight_from_the_future_is_taken_again(self):
+        t = 1_800_000_000.0
+        claim = self._handed_at(t + 1000)
+        cards.stamp_claim(self.m, self.card, {**self.m.get(self.card).subject["claim"], "skew_seen_at": t + 500})
+        [c] = room_db.clicks(self.ws, manager=self.m, now=t)
+        self.assertFalse(c["actionable"])
+        self.assertEqual(self.m.get(self.card).subject["claim"]["skew_seen_at"], t)
+
+    def test_a_deadline_stored_beyond_one_lease_is_clamped(self):
+        t = 1_800_000_000.0
+        click(self.m, self.card, "option-1")
+        self.run_clicks()
+        claim = self.m.get(self.card).subject["claim"]
+        cards.stamp_claim(self.m, self.card, {**claim, "handed_at": t, "lease_until": t + 365 * 86400})
+        [c] = room_db.clicks(self.ws, manager=self.m, now=t + cards.HANDED_LEASE_SEC)
+        self.assertTrue(c["reoffered"])
 
 
 class RollbackAndClock(_Room):

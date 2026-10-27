@@ -1623,7 +1623,7 @@ def check_decision_card_clicks(workspace_dir: Optional[Path] = None) -> "dict | 
     if not due:
         return None
     return {"name": "decision-card-clicks", "status": "warn",
-            "detail": (f"{len(due)} decision-card click(s) owe a pass ({', '.join(due)}) — run "
+            "detail": (f"{len(due)} decision-card click(s) owe a pass or need attention ({', '.join(due)}) — run "
                        "`python3 src/pending_questions_reader.py clicks` and handle its output as for a "
                        "`hitl_click: true` task (CLAUDE.md, Pending decisions)")}
 
