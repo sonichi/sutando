@@ -86,18 +86,20 @@ text: `queue_question` creates a `choice` HITL request (`src/hitl/cards.py`, the
 card producer uses) with runtime `pending-questions`, guard and `subject.ask_id` set to the ask id,
 `turn_on_action`, and one button per choice: with a default, one per `ordered_options()` entry
 (Approve first, carrying the default); with options alone, exactly the options as given, with no
-Approve. The AG2 Space gateway projects it to the owner's DM, and storing a card is not showing it:
-the ask waits up to 30 seconds (`CARD_SHOW_WAIT_SEC`) for the gateway's projection record. Posted
-in time, the question is asked by the card alone and its row's `**Sent:**` record reads
-`**Sent:** card hitl_… shown in ag2space owner-dm (decision card) at …`; the reminder counts that
-record as a recent send, as it does a drained text file. Not posted in time, the card is withdrawn
-(`hitl.cards.withdraw`: cancelled, and never posted while still unshown) and the question is asked
-as text at once (`note: decision card not used (… not posted within 30s; withdrawn)`). One race
-remains visible: if the gateway is already posting the card when it is withdrawn, the owner sees
-that card as well as the text; a click on it is refused as stale. Text is also used when the card
-cannot be stored, and for every other bridge (only that gateway projects cards). There is no
-delayed fallback: nothing later re-asks a carded question except the reminder, and only once its
-card record is an hour old.
+Approve. The ask is ordered so that no card exists without a durable question: the card is built
+and its id allocated, the question is held in the outbox and its row is written, both naming that
+id (`**Sent:** card hitl_… for ag2space owner-dm (decision card) at …`), and only then is the card
+stored for the AG2 Space gateway to post in the owner's DM. A process that dies before the card is
+stored leaves the held question and no card; one that dies after leaves both. Once a card exists,
+no text is sent for that question. Text is the ask only when the card cannot be built, the
+question cannot be held (then no card is stored at all), or the card cannot be stored; and for
+every other bridge (only that gateway projects cards).
+
+The limit: nothing here can see the DM. If the gateway never posts the card (it is down, or skips
+it), the owner is not asked until the reminder runs. The reminder counts a card as sent only once
+the gateway recorded it as posted (the HITL projection record) within the last hour; a card with
+no such record, or no card at all, resurfaces as text when the reminder runs, and only then;
+nothing is scheduled.
 
 The click is owner-checked and recorded by the bridge (`chosen_action`), and with `turn_on_action`
 the same relay task reaches the core headed `hitl_click: true`, its body the button label. That
@@ -108,7 +110,9 @@ requires the owner's Status to be open (a room outage records the close locally 
 close), and prints `[<ask-id>] chose <action-id> '<label>' -> <consequence>` from the card's own
 record. The core acts only on `chose` lines, then runs `… ack <ask-id>` and answers `[no-send]`;
 until the ack the card stays claimed, so a run that dies before the core acted replays the same
-choice (`(replayed: not acknowledged yet)`) rather than losing it.
+choice (`(replayed: not acknowledged yet)`) rather than losing it. The claim (`closing`) is stamped
+on the card before the row is closed, so a run that dies between the close and its record finds
+the row closed by code, not by the owner, and replays the choice instead of calling it stale.
 
 A click on a row already closed, by code or by the owner's own Status, is reported as "already
 answered — not a decision" (`stale`) and its card is cancelled. A close that could not be recorded
@@ -116,9 +120,7 @@ at all still prints the choice, every run, until the core acks it; after the ack
 retry the close and print "acknowledged before, not a new decision". Nothing marks a choice as
 handed over before the core has it: only the ack does. `resolve` retires (cancels) the question's card whenever it closes the row or the room
 refuses the close. A Status the owner sets on the row himself does not retire the card (reconcile
-does not touch cards); a later click on it is reported stale. If the outbox cannot hold a question
-whose card was stored, the card is withdrawn (never posted when still unshown) and the question is
-asked as text.
+does not touch cards); a later click on it is reported stale. 
 
 ## The outbox
 

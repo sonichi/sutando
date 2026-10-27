@@ -7,6 +7,7 @@ and the store location are one policy; the projector and the reply handler do th
 
 from __future__ import annotations
 
+import uuid
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
 
@@ -22,6 +23,11 @@ def manager_for(workspace: Optional[Path] = None) -> HitlManager:
     return HitlManager(HitlStore(default_store(Path(workspace) if workspace is not None else None)))
 
 
+def new_id() -> str:
+    """A requirement id allocated before the card is stored, so a record can name it first."""
+    return f"hitl_{uuid.uuid4().hex[:12]}"
+
+
 def as_action(a: Any) -> Action:
     """An Action from an Action, an {id, label[, kind]} mapping or an (id, label[, kind]) pair."""
     if isinstance(a, Action):
@@ -34,7 +40,8 @@ def as_action(a: Any) -> Action:
 
 def choice_request(question: str, actions: Iterable[Any], guard: str, subject: Dict[str, Any], *,
                    runtime: str, title: str = "", device: Optional[Dict[str, str]] = None,
-                   kind: str = CHOICE_KIND, turn_on_action: bool = True) -> HumanRequirement:
+                   kind: str = CHOICE_KIND, turn_on_action: bool = True,
+                   req_id: Optional[str] = None) -> HumanRequirement:
     """One button per action. `guard` keys the card to the producer's own record, so the
     store dedupes a repeat; with `turn_on_action` the applied click reaches the core as a task."""
     acts = [as_action(a) for a in actions]
@@ -42,9 +49,12 @@ def choice_request(question: str, actions: Iterable[Any], guard: str, subject: D
         raise ValueError("a choice card needs at least one action")
     if len({a.id for a in acts}) != len(acts):
         raise ValueError("action ids must be unique on one card")
-    return HumanRequirement(kind=kind, runtime=runtime, message=question, title=title, guard=guard,
-                            device=device, actions=acts, subject=dict(subject or {}),
-                            turn_on_action=turn_on_action)
+    req = HumanRequirement(kind=kind, runtime=runtime, message=question, title=title, guard=guard,
+                           device=device, actions=acts, subject=dict(subject or {}),
+                           turn_on_action=turn_on_action)
+    if req_id is not None:
+        req.id = req_id
+    return req
 
 
 def create_choice(question: str, actions: Iterable[Any], guard: str, subject: Dict[str, Any], *,
@@ -57,17 +67,3 @@ def create_choice(question: str, actions: Iterable[Any], guard: str, subject: Di
                          device=device, kind=kind, turn_on_action=turn_on_action)
     return (manager or manager_for(workspace)).create(req)
 
-
-def withdraw(manager: HitlManager, req_id: str) -> bool:
-    """Cancel a card; one the gateway never showed is marked current so it is never posted.
-    Returns True when it was still unshown (nothing reached the owner)."""
-    req = manager.get(req_id)
-    if req is None:
-        return False
-    unshown = manager.store.projection(req_id).get("revision", 0) == 0
-    manager.cancel(req_id)
-    if unshown:
-        cur = manager.get(req_id)
-        if cur is not None:
-            manager.record_projection(req_id, cur.revision, None)
-    return unshown

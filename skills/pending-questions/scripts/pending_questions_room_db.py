@@ -70,6 +70,8 @@ ROOM_KEY = "PENDING_QUESTIONS_ROOM"
 URL_KEY = "PENDING_QUESTIONS_COLLAB_URL"
 # `resolve`'s answer when the room saw the row and refused the close (closed already, no such row).
 REFUSED_PREFIX = "room database: not changed"
+# The refusal when only a code Closed mark (no owner Status) closed the row.
+CODE_CLOSED_PREFIX = REFUSED_PREFIX + " (closed by code)"
 
 
 def skill_scripts(workspace: Path) -> Optional[Path]:
@@ -314,7 +316,9 @@ def _close_row(workspace: Path, ask_id: str, status: str, require_open: bool = F
     except GuardFailed as g:
         if not g.current and any(e["ask_id"] == ask_id for e in Outbox(ws).entries()):
             return _close_locally(ws, ask_id, status, "its held entry has no row yet")
-        return False, f"{REFUSED_PREFIX} — {type(g).__name__}: {g}"
+        owner = g.current.get("status") in TERMINAL
+        prefix = CODE_CLOSED_PREFIX if g.current.get("closed") and not owner else REFUSED_PREFIX
+        return False, f"{prefix} — {type(g).__name__}: {g}"
     except Exception as e:  # noqa: BLE001
         return _close_locally(ws, ask_id, status, f"room database unreachable ({type(e).__name__}: {e})")
 
@@ -326,7 +330,7 @@ def ask_owner(question: str, context: Optional[str] = None, urgency: str = "live
               host: Optional[str] = None, now: Optional[float] = None, store=None,
               default_action: Optional[str] = None, reason: Optional[str] = None,
               options=(), priority: str = "Medium") -> dict:
-    """Queue (core), hold, row, bounded reconcile, notify — each step reported, none raising past here.
+    """Hold (core), row, card or text, bounded reconcile, notify — each step reported, none raising.
     `store` is this adapter's store; None leaves the question in the outbox. No outbox record,
     no row: the question is still queued to the owner, and the report says it was not held. A
     confirmed row commits the store-history marker, then releases its outbox entry; a marker
@@ -368,6 +372,7 @@ def ask_owner(question: str, context: Optional[str] = None, urgency: str = "live
                     out["history_error"] = f"{type(e).__name__}: {e}"
             else:
                 out["record"] = f"outbox {out['outbox']}"
+        core_ask.create_card(out)  # only now: the outbox, and the row when it landed, name it
         if out["record"] is not None and out["outbox"] is None:
             try:
                 rec = reconcile_pending(store, ws, host)
@@ -386,12 +391,14 @@ def _close_for_click(ws: Path, ask_id: str, status: str) -> tuple:
 def clicks(workspace: Path, manager=None, closer=None) -> list:
     """Close the row of every question card the owner clicked (Answered); the card stays claimed
     until `ack_click`, so a run that dies before the core acts replays the same choice.
+    The claim (`closing`) is stamped on the card BEFORE the close: a run that dies between the
+    close and its `row_closed` stamp finds the row closed by code and replays the choice.
     One dict per click, oldest first, with `closed`, `close_message` and the flags the core reads:
-    `stale` — the row was closed already, by code or by the owner's own Status (one guarded
-    write), so the click is NOT a decision and its card is cancelled; `replay` — this click
-    closed its row on an earlier run and was not acknowledged; `reported_before` — the core
-    acknowledged this choice but its row is not closed yet (the close is retried each run).
-    Nothing here marks a choice as handed over: only `ack_click` does, after the core acted."""
+    `stale` — the row was closed already, by the owner's own Status or by code without this
+    click's claim (one guarded write), so the click is NOT a decision and its card is cancelled;
+    `replay` — this click closed its row on an earlier run and was not acknowledged;
+    `reported_before` — the core acknowledged this choice but its row is not closed yet (the
+    close is retried each run). Only `ack_click` marks a choice as handed over."""
     ws = Path(workspace)
     if manager is None:
         from hitl.cards import manager_for  # noqa: PLC0415
@@ -403,15 +410,18 @@ def clicks(workspace: Path, manager=None, closer=None) -> list:
             out.append({**click, "closed": True, "stale": False, "replay": True,
                         "close_message": "closed by this click on an earlier run; not acknowledged yet"})
             continue
+        if not click["closing"]:
+            core_ask.stamp_card(manager, click["hitl_id"], closing=True)
         ok, msg = closer(ws, click["ask_id"], "Answered")
-        stale = not ok and msg.startswith(REFUSED_PREFIX)
+        replay = not ok and click["closing"] and msg.startswith(CODE_CLOSED_PREFIX)
+        stale = not ok and not replay and msg.startswith(REFUSED_PREFIX)
         if ok and click["reported_before"]:
             manager.resolve(click["hitl_id"])  # acknowledged earlier: the late close settles it
-        elif ok:
+        elif ok or replay:
             core_ask.stamp_card(manager, click["hitl_id"], row_closed=True)
         elif stale:
             manager.cancel(click["hitl_id"])
-        out.append({**click, "closed": ok, "stale": stale, "replay": False, "close_message": msg})
+        out.append({**click, "closed": ok or replay, "stale": stale, "replay": replay, "close_message": msg})
     return out
 
 
