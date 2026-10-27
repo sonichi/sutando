@@ -461,6 +461,16 @@ class PointerEdges(unittest.TestCase):
         self.assertIsNone(ask.claim_pointer(m, req.id, t - 5000))
         self.assertTrue(ask.claim_pointer(m, req.id, t + ask.POINTER_CLAIM_RETRY_SEC), "stale once its window passes")
 
+    def test_a_claim_stamped_far_ahead_holds_one_window_from_first_sight_not_the_whole_skew(self):
+        ws, m, req, q = self._live()
+        t = req.created_at + ask.CARD_POINTER_GRACE_SEC + 10
+        self.assertTrue(ask.claim_pointer(m, req.id, t + 365 * 86400))  # a clock a year ahead claimed it
+        self.assertIsNone(ask.claim_pointer(m, req.id, t), "never taken on sight")
+        self.assertEqual(m.get(req.id).subject["pointer_skew_seen_at"], t)
+        self.assertIsNone(ask.claim_pointer(m, req.id, t + ask.POINTER_CLAIM_RETRY_SEC - 1))
+        self.assertTrue(ask.claim_pointer(m, req.id, t + ask.POINTER_CLAIM_RETRY_SEC),
+                        "retried one window after first sight, not a year later")
+
     def test_a_card_posted_after_the_claim_and_before_the_write_gets_no_pointer(self):
         ws, m, req, q = self._live()
         real = ask.claim_pointer

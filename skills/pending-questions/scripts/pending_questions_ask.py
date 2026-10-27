@@ -160,8 +160,17 @@ def claim_pointer(manager, card_id: str, now: float) -> Optional[str]:
         if subject.get("pointer_sent_at") or now - req.created_at < CARD_POINTER_GRACE_SEC:
             return None
         claimed_at = float(subject.get("pointer_claim_at") or 0)
-        if claimed_at and now < claimed_at + POINTER_CLAIM_RETRY_SEC:
-            return None  # fresh, or stamped in the future by a clock that has since gone back
+        if claimed_at > now:
+            # Stamped ahead of this clock: never taken on sight, held one window from first sight.
+            seen = subject.get("pointer_skew_seen_at")
+            if seen is None or float(seen) > now:
+                req.subject = {**subject, "pointer_skew_seen_at": now}
+                manager.store.save(req)
+                return None
+            if now < float(seen) + POINTER_CLAIM_RETRY_SEC:
+                return None
+        elif claimed_at and now < claimed_at + POINTER_CLAIM_RETRY_SEC:
+            return None
         token = os.urandom(8).hex()
         req.subject = {**subject, "pointer_claim_at": now, "pointer_claim": token}
         manager.store.save(req)

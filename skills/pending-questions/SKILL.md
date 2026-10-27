@@ -116,8 +116,9 @@ exactly the options as given, with no Approve — and `subject.choices` holding 
   (`POINTER_CLAIM_RETRY_SEC`) — its claimant died or failed to publish — is claimed again and
   retried. So the pointer is at-least-once: overlapping reminders queue one per claim, a death
   before the publish is retried later, and a death between the publish and the sent mark can
-  deliver it twice. A claim stamped in the future (the clock went back) stays fresh until its
-  window passes. Just before the file is written the card is re-checked under the store lock
+  deliver it twice. A claim stamped ahead of this clock is never taken on sight, and is held
+  at most one window from the first reminder that sees it (`pointer_skew_seen_at`), so a clock
+  far ahead cannot hold the pointer for the whole skew. Just before the file is written the card is re-checked under the store lock
   (live, unposted, still this claim's), so a post recorded after the claim cancels the pointer;
   the gateway records a post only after its send returns, so the one window left is a send in
   flight — bounded by one projector send, and the pointer then only says the card may not have
