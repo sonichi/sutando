@@ -379,11 +379,13 @@ class RoomDbStore:
     def _tag(self, value: str) -> str:
         return f"{value}@{self.host}" if self.host else value
 
-    def close(self, ask_id: str, to: str) -> None:
-        """Record a closure made by code in the Closed cell; Status stays the owner's."""
+    def close(self, ask_id: str, to: str, require_open: bool = False) -> None:
+        """Record a closure made by code in the Closed cell; Status stays the owner's.
+        `require_open`: an owner's terminal Status refuses the close in the same guarded write."""
         if to not in TERMINAL:
             raise StoreError(f"code only closes a row; {to!r} is not Answered or Resolved")
-        self._guarded(ask_id, {"closed": self._tag(to)}, {"closed": [None]})
+        expect = {"closed": [None], **({"status": OPEN_RAW} if require_open else {})}
+        self._guarded(ask_id, {"closed": self._tag(to)}, expect)
 
     def clear(self, ask_id: str, props: list) -> None:
         """Remove stale code marks from this host's row; Status is not touched."""

@@ -26,7 +26,8 @@ CLI, for shell readers: `python3 src/pending_questions_reader.py list [--json] |
 (`summary` is the count and where the questions live, never their text); and the
 writes a core caller makes through the same contract: `resolve <ask-id> [--answered]`
 (Resolved, or Answered), which is `resolve` above and nothing else, and `clicks [--json]`, run on
-a `hitl_click: true` task, which is `clicks` above. `--store-adapter <path>`
+a `hitl_click: true` task, which is `clicks` above, and `ack <ask-id>` once the core has acted on
+a choice (until then a re-run replays it). `--store-adapter <path>`
 injects an adapter file in place of the declared one.
 """
 from __future__ import annotations
@@ -210,14 +211,28 @@ def clicks(workspace, adapter=None) -> tuple:
         return None, f"adapter failed ({type(e).__name__}: {e})"
 
 
+def ack(workspace, ask_id: str, adapter=None) -> tuple:
+    """(done, message): the core acted on that question's choice; the adapter's `ack_click`."""
+    mod, why = _adapter(adapter)
+    if mod is None or not hasattr(mod, "ack_click"):
+        return False, f"not acknowledged: {why if mod is None else f'adapter {why} takes no acks'}"
+    try:
+        return mod.ack_click(Path(workspace), ask_id)
+    except Exception as e:  # noqa: BLE001
+        return False, f"not acknowledged: adapter failed ({type(e).__name__}: {e})"
+
+
 def click_line(c: dict) -> str:
-    """Only a fresh click reads as `chose`: a stale or already-reported one is never a new decision."""
+    """Only a fresh or replayed click reads as `chose`, with its exact action id and consequence;
+    a stale or already-reported one is never a decision."""
     q = " ".join(c["question"].split())[:120]
+    what = f"{c['action_id']} {c['label']!r}" + (f" -> {c['consequence']}" if c.get("consequence") else "")
     if c.get("stale"):
-        return f"- [{c['ask_id']}] already answered — not a decision (a late click on {c['label']!r}) — {q}"
+        return f"- [{c['ask_id']}] already answered — not a decision (a late click on {what}) — {q}"
     if c.get("reported_before"):
-        return f"- [{c['ask_id']}] reported before, not a new decision ({c['label']!r}); its row is not closed yet — {q}"
-    return f"- [{c['ask_id']}] chose {c['label']!r} — {q}"
+        return f"- [{c['ask_id']}] reported before, not a new decision ({what}); its row is not closed yet — {q}"
+    replay = " (replayed: not acknowledged yet)" if c.get("replay") else ""
+    return f"- [{c['ask_id']}] chose {what}{replay} — {q}"
 
 
 def _norm_title(text: str) -> str:
@@ -258,8 +273,8 @@ def main(argv=None) -> int:
     import argparse  # noqa: PLC0415
     ap = argparse.ArgumentParser(description="List or count the owner's pending questions (read-only), "
                                  "or resolve one, or apply card clicks, through the declared store.")
-    ap.add_argument("command", choices=("list", "count", "summary", "resolve", "clicks"))
-    ap.add_argument("ask_id", nargs="?", default=None, help="resolve: the question's ask id")
+    ap.add_argument("command", choices=("list", "count", "summary", "resolve", "clicks", "ack"))
+    ap.add_argument("ask_id", nargs="?", default=None, help="resolve / ack: the question's ask id")
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--answered", action="store_true", help="resolve: mark it Answered, not Resolved")
     ap.add_argument("--workspace", type=Path, default=None)
@@ -270,9 +285,13 @@ def main(argv=None) -> int:
         from workspace_default import resolve_workspace  # noqa: PLC0415 — heavy loader
         args.workspace = resolve_workspace(migrate=False)
     store = declared(DECLARATION, args.workspace, override=args.store_adapter)  # the CLI is an edge
+    if args.command in ("resolve", "ack") and not args.ask_id:
+        ap.error(f"{args.command} needs an ask id")
+    if args.command == "ack":
+        ok, msg = ack(args.workspace, args.ask_id, store)
+        print(msg)
+        return 0 if ok else 1
     if args.command == "resolve":
-        if not args.ask_id:
-            ap.error("resolve needs an ask id")
         ok, msg = resolve(args.workspace, args.ask_id, "Answered" if args.answered else "Resolved", store)
         print(msg)
         return 0 if ok else 1
@@ -287,7 +306,7 @@ def main(argv=None) -> int:
             print("no question-card clicks waiting")
         for c in [] if args.json else done:
             print(click_line(c))
-            print(f"    {c['message']}")
+            print(f"    {c['close_message']}")
         return 0 if all(c["closed"] or c.get("stale") for c in done) else 1
     g = gather(args.workspace, store)
     for note in g["notes"]:

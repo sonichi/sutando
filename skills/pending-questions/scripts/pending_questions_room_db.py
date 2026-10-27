@@ -294,7 +294,7 @@ def resolve(workspace: Path, ask_id: str, status: str, manager=None) -> tuple:
     return ok, msg
 
 
-def _close_row(workspace: Path, ask_id: str, status: str) -> tuple:
+def _close_row(workspace: Path, ask_id: str, status: str, require_open: bool = False) -> tuple:
     """(closed, message): the row's Closed cell takes `status` (Answered or Resolved) after a
     reconcile files any held question; a store that cannot be written leaves a local close
     record instead. A row in view before the history marker was ever committed commits it
@@ -314,7 +314,7 @@ def _close_row(workspace: Path, ask_id: str, status: str) -> tuple:
                     Outbox(ws).commit_history(ask_id)
                 except StoreError as e:
                     return _close_locally(ws, ask_id, status, f"room database: left open — {e}", "its row is in view")
-            store.close(ask_id, status)
+            store.close(ask_id, status, require_open=require_open)
             return True, f"room database: {ask_id} -> {status} in {store.where(ask_id)}"
     except GuardFailed as g:
         if not g.current and any(e["ask_id"] == ask_id for e in Outbox(ws).entries()):
@@ -390,29 +390,52 @@ def ask_owner(question: str, context: Optional[str] = None, urgency: str = "live
     return out
 
 
+def _close_for_click(ws: Path, ask_id: str, status: str) -> tuple:
+    return _close_row(ws, ask_id, status, require_open=True)
+
+
 def clicks(workspace: Path, manager=None, closer=None) -> list:
-    """Close the row of every question card the owner clicked (Answered) and settle the card.
-    One dict per click, oldest first, with `closed`, `message` and two flags the core must read:
-    `stale` — the row was closed already (answered another way), so the click is NOT a decision
-    and its card is cancelled; `reported_before` — an earlier run handed this click over but
-    could not close the row, which stays in progress for the next run."""
+    """Close the row of every question card the owner clicked (Answered); the card stays claimed
+    until `ack_click`, so a run that dies before the core acts replays the same choice.
+    One dict per click, oldest first, with `closed`, `close_message` and the flags the core reads:
+    `stale` — the row was closed already, by code or by the owner's own Status (one guarded
+    write), so the click is NOT a decision and its card is cancelled; `replay` — this click
+    closed its row on an earlier run and was not acknowledged; `reported_before` — an earlier
+    run could not close the row, which stays for the next run."""
     ws = Path(workspace)
     if manager is None:
         from hitl.cards import manager_for  # noqa: PLC0415
         manager = manager_for(ws)
-    closer = closer or _close_row
+    closer = closer or _close_for_click
     out = []
     for click in core_ask.answered_cards(manager):
+        if click["row_closed"]:
+            out.append({**click, "closed": True, "stale": False, "replay": True,
+                        "close_message": "closed by this click on an earlier run; not acknowledged yet"})
+            continue
         ok, msg = closer(ws, click["ask_id"], "Answered")
         stale = not ok and msg.startswith(REFUSED_PREFIX)
         if ok:
-            manager.resolve(click["hitl_id"])
+            core_ask.stamp_card(manager, click["hitl_id"], row_closed=True)
         elif stale:
             manager.cancel(click["hitl_id"])
         else:
-            core_ask.mark_reported(manager, click["hitl_id"])
-        out.append({**click, "closed": ok, "stale": stale, "message": msg})
+            core_ask.stamp_card(manager, click["hitl_id"], reported=True)
+        out.append({**click, "closed": ok, "stale": stale, "replay": False, "close_message": msg})
     return out
+
+
+def ack_click(workspace: Path, ask_id: str, manager=None) -> tuple:
+    """(done, message): the core acted on this question's choice; its claimed card is settled."""
+    if manager is None:
+        from hitl.cards import manager_for  # noqa: PLC0415
+        manager = manager_for(Path(workspace))
+    done = [c["hitl_id"] for c in core_ask.answered_cards(manager) if c["ask_id"] == ask_id and c["row_closed"]]
+    for hid in done:
+        manager.resolve(hid)
+    if not done:
+        return False, f"no claimed click for {ask_id} to acknowledge"
+    return True, f"acknowledged {ask_id} ({', '.join(done)})"
 
 
 def report_lines(out: dict) -> list:

@@ -56,3 +56,18 @@ def create_choice(question: str, actions: Iterable[Any], guard: str, subject: Di
     req = choice_request(question, actions, guard, subject, runtime=runtime, title=title,
                          device=device, kind=kind, turn_on_action=turn_on_action)
     return (manager or manager_for(workspace)).create(req)
+
+
+def withdraw(manager: HitlManager, req_id: str) -> bool:
+    """Cancel a card; one the gateway never showed is marked current so it is never posted.
+    Returns True when it was still unshown (nothing reached the owner)."""
+    req = manager.get(req_id)
+    if req is None:
+        return False
+    unshown = manager.store.projection(req_id).get("revision", 0) == 0
+    manager.cancel(req_id)
+    if unshown:
+        cur = manager.get(req_id)
+        if cur is not None:
+            manager.record_projection(req_id, cur.revision, None)
+    return unshown

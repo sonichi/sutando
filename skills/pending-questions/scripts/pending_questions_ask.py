@@ -221,6 +221,12 @@ def card_actions(default_action: Optional[str], options) -> list:
             for i, (label, _) in enumerate(card_choices(default_action, options))]
 
 
+def card_consequences(default_action: Optional[str], options) -> dict:
+    """{action id: what it does}, kept on the card so a click reports the exact consequence."""
+    return {aid: what for (aid, _), (_, what) in zip(card_actions(default_action, options),
+                                                    card_choices(default_action, options))}
+
+
 def card_message(question: str, context: Optional[str], default_action: Optional[str],
                  reason: Optional[str], options, link: Optional[str] = None,
                  intro: Optional[str] = None) -> str:
@@ -245,7 +251,8 @@ def raise_card(ask_id: str, question: str, context: Optional[str], host: str, ws
     from hitl.cards import create_choice  # noqa: PLC0415
     req = create_choice(
         card_message(question, context, default_action, reason, options, link, intro),
-        card_actions(default_action, options), ask_id, {"ask_id": ask_id},
+        card_actions(default_action, options), ask_id, {"ask_id": ask_id, "choices": card_consequences(
+            default_action, options)},
         runtime=CARD_RUNTIME, title=f"Question from the {host} core",
         device={"id": f"{CARD_RUNTIME}:{ask_id}", "name": host},
         manager=manager, workspace=None if manager is not None else ws)
@@ -260,11 +267,23 @@ def answered_cards(manager) -> list:
     for req in sorted(manager.active(), key=lambda r: r.created_at):
         if req.runtime != CARD_RUNTIME or req.status != STATUS_IN_PROGRESS or not req.chosen_action:
             continue
+        subject = req.subject or {}
         label = next((a.label for a in req.actions if a.id == req.chosen_action), req.chosen_action)
-        out.append({"hitl_id": req.id, "ask_id": (req.subject or {}).get("ask_id") or req.guard,
-                    "action_id": req.chosen_action, "label": label, "question": req.message,
-                    "reported_before": bool((req.subject or {}).get("reported"))})
+        out.append({"hitl_id": req.id, "ask_id": subject.get("ask_id") or req.guard,
+                    "action_id": req.chosen_action, "label": label,
+                    "consequence": (subject.get("choices") or {}).get(req.chosen_action, ""),
+                    "question": req.message, "reported_before": bool(subject.get("reported")),
+                    "row_closed": bool(subject.get("row_closed"))})
     return out
+
+
+def stamp_card(manager, hitl_id: str, **fields) -> None:
+    """Merge `fields` into a live card's subject, under the store lock."""
+    with manager.store.locked():
+        req = manager.get(hitl_id)
+        if req is not None and not req.terminal:
+            req.subject = {**(req.subject or {}), **fields}
+            manager.store.save(req)
 
 
 def card_shown(manager, req) -> bool:
@@ -306,15 +325,6 @@ def unshown_cards_as_text(ws: Path, manager=None, now: Optional[float] = None,
         except Exception as e:  # noqa: BLE001
             out.append({"ask_id": ask_id, "hitl_id": req.id, "error": f"{type(e).__name__}: {e}"})
     return out
-
-
-def mark_reported(manager, hitl_id: str) -> None:
-    """A click already handed to the core: a later run reports it as such, not as a new choice."""
-    with manager.store.locked():
-        req = manager.get(hitl_id)
-        if req is not None and not req.terminal:
-            req.subject = {**(req.subject or {}), "reported": True}
-            manager.store.save(req)
 
 
 def retire_cards(manager, ask_id: str) -> list:
@@ -403,7 +413,26 @@ def queue_question(question: str, context: Optional[str] = None, task_file: Opti
         out["outbox"] = str(Outbox(ws).save(out["question"], out["sent_line"], now))
     except Exception as e:  # noqa: BLE001 — reported; the caller must not proceed as if held
         out["outbox_error"] = f"outbox: {type(e).__name__}: {e}"
+        if out["card"]:
+            _card_to_text(out, question, context, host, ws, link, intro, manager)
     return out
+
+
+def _card_to_text(out: dict, question, context, host, ws, link, intro, manager) -> None:
+    """No record holds the question, so no row will close its card: withdraw it and ask as text."""
+    try:
+        from hitl.cards import manager_for, withdraw  # noqa: PLC0415
+        withdraw(manager or manager_for(Path(ws)), out["card"])
+    except Exception as e:  # noqa: BLE001
+        out["card_error"] = f"card {out['card']} not withdrawn ({type(e).__name__}: {e})"
+    out["card"] = None
+    body, _ = proactive_body(question, context, host, Destination(), link, intro)
+    try:
+        name = proactive_filename(out["ask_id"], None)
+        write_proactive(Path(ws) / "results", name, body)
+        out["proactive_file"], out["where"] = name, "owner-dm (last-active bridge)"
+    except Exception as e:  # noqa: BLE001
+        out["send_error"] = f"{type(e).__name__}: {e}"
 
 
 def ask_owner(question: str, context: Optional[str] = None, urgency: str = "live",

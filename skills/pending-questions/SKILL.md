@@ -99,16 +99,22 @@ reminder also asks it again as text.
 The click is owner-checked and recorded by the bridge (`chosen_action`), and with `turn_on_action`
 the same relay task reaches the core headed `hitl_click: true`, its body the button label. That
 header is how the core recognises it: it runs `python3 src/pending_questions_reader.py clicks`
-(`pq.py clicks` is the same), which reaches this adapter's `clicks`; that finds every `pending-questions`
-card in progress with a chosen action, closes its row as Answered through `resolve`'s row close
-(so a room outage records the close locally like any other), settles the card, and prints
-`[<ask-id>] chose '<label>'`; the core acts only on such `chose` lines and answers `[no-send]`. A close that
-could not be recorded at all leaves the card in progress for the next run, and a later run reports
-it as "reported before", not as a new choice. `resolve` retires (cancels) the question's card
-whenever it closes the row or the room refuses the close, so a question closed through `resolve`
-(after a text answer, say) leaves no live card. A Status the owner sets on the row himself does not
-retire the card (reconcile does not touch cards); a click on a card whose row was already closed is reported as "already answered —
-not a decision" (`stale`) and its card is cancelled.
+(`pq.py clicks` is the same), which reaches this adapter's `clicks`. For every `pending-questions`
+card in progress with a chosen action it closes the row as Answered in one guarded write that also
+requires the owner's Status to be open (a room outage records the close locally like any other
+close), and prints `[<ask-id>] chose <action-id> '<label>' -> <consequence>` from the card's own
+record. The core acts only on `chose` lines, then runs `… ack <ask-id>` and answers `[no-send]`;
+until the ack the card stays claimed, so a run that dies before the core acted replays the same
+choice (`(replayed: not acknowledged yet)`) rather than losing it.
+
+A click on a row already closed, by code or by the owner's own Status, is reported as "already
+answered — not a decision" (`stale`) and its card is cancelled. A close that could not be recorded
+at all leaves the card for the next run, which reports it as "reported before", not as a new
+choice. `resolve` retires (cancels) the question's card whenever it closes the row or the room
+refuses the close. A Status the owner sets on the row himself does not retire the card (reconcile
+does not touch cards); a later click on it is reported stale. If the outbox cannot hold a question
+whose card was stored, the card is withdrawn (never posted when still unshown) and the question is
+asked as text.
 
 ## The outbox
 
