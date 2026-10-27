@@ -500,6 +500,26 @@ class PointerEdges(unittest.TestCase):
             self.assertIsNone(ask.claim_pointer(m, req.id, now), "never replaced on sight")
         self.assertTrue(ask.claim_pointer(m, req.id, t + ask.POINTER_CLAIM_RETRY_SEC), "one window after first sight")
 
+    def test_every_pass_credits_a_claim_and_grace_only_gates_the_replacement(self):
+        """keweichen's trace through send_card_pointers: a claim at C+1810 whose publish failed, the
+        clock corrected to C, then C+150, C+300, C+1800 (C = the card's creation, grace 1800 s)."""
+        ws, m, req, q = self._live()
+        C = req.created_at
+        with mock.patch.object(ask, "write_proactive", side_effect=OSError("results full")):
+            ask.send_card_pointers([q], ws, now=C + 1810, manager=m, host="h")
+        self.assertEqual(m.get(req.id).subject["pointer_lease"], {"observed_at": C + 1810, "elapsed": 0.0})
+        trace = []
+        for now in (C, C + 150, C + 300):
+            self.assertEqual(ask.send_card_pointers([q], ws, now=now, manager=m, host="h"), [], "before grace")
+            trace.append(m.get(req.id).subject["pointer_lease"]["elapsed"])
+        self.assertEqual(trace, [0.0, 150.0, 300.0], "lease progress is credited and saved through the correction")
+        self.assertEqual([n for n in _proactive(ws) if "pointer" in n], [], "no pointer before grace")
+        claim_before = m.get(req.id).subject["pointer_claim"]
+        sent = ask.send_card_pointers([q], ws, now=C + 1800, manager=m, host="h")
+        self.assertEqual(len(sent), 1, "the first grace-eligible pass replaces the spent claim")
+        self.assertNotEqual(m.get(req.id).subject["pointer_claim"], claim_before)
+        self.assertEqual(len([n for n in _proactive(ws) if "pointer" in n]), 1, "exactly one pointer")
+
     def test_a_card_posted_after_the_claim_and_before_the_write_gets_no_pointer(self):
         ws, m, req, q = self._live()
         real = ask.claim_pointer

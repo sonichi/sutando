@@ -188,7 +188,8 @@ adapter's `clicks` (`scripts/pending_questions_clicks.py`):
   the close.
 - **Wakeup.** A deferred click, or a handoff whose lease ran out, owes a pass with no new task to
   trigger it. `src/health-check.py` (run every proactive-loop pass, and by the launchd fallback)
-  reads that through the core reader (`clicks --due`, read-only) and warns
+  reads that through the core reader (`clicks --due`, whose only write is crediting each handed
+  lease with this pass) and warns
   `decision-card-clicks`, naming `… clicks` to run; the core handles that output as for a
   `hitl_click` task. A host that never runs the health check retries only on the next click task.
 

@@ -29,7 +29,8 @@ CLI, for shell readers: `python3 src/pending_questions_reader.py list [--json] |
 (`summary` is the count and where the questions live, never their text); and the
 writes a core caller makes through the same contract: `resolve <ask-id> [--answered]`
 (Resolved, or Answered), which is `resolve` above and nothing else; `clicks [--json]`, run on a
-`hitl_click: true` task (`--due` is the read-only probe, exit 0 when a pass is owed, that
+`hitl_click: true` task (`--due` is the probe, exit 0 when a pass is owed; its only write is the
+lease credit each pass earns, that
 health-check's `decision-card-clicks` warn uses so a deferred or expired click is retried); and
 `ack <ask-id> --token <token>` once the core has acted on a choice `clicks` handed it. `--store-adapter <path>`
 injects an adapter file in place of the declared one.
@@ -301,7 +302,8 @@ def main(argv=None) -> int:
     ap.add_argument("--answered", action="store_true", help="resolve: mark it Answered, not Resolved")
     ap.add_argument("--token", default=None, help="ack: the token `clicks` printed with the choice")
     ap.add_argument("--due", action="store_true",
-                    help="clicks: only say whether a pass is owed (exit 0 when it is, 1 when not); read-only")
+                    help="clicks: only say whether a pass is owed (exit 0 when it is, 1 when not); "
+                         "its only write is crediting this pass to each handed lease")
     ap.add_argument("--workspace", type=Path, default=None)
     ap.add_argument("--store-adapter", default=None, help="an adapter file in place of the declared one")
     # intermixed: an optional positional after `--workspace` is otherwise swallowed on 3.12

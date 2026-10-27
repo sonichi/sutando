@@ -153,24 +153,28 @@ def card_pointer_body(title: str, host: str) -> str:
 
 
 def claim_pointer(manager, card_id: str, now: float) -> Optional[str]:
-    """Under the HITL store lock: the card is live, has no post recorded, is past the grace and has
-    no pointer sent; a claim already on it is credited this pass (pending_questions_lease) and
-    kept until its lease has run POINTER_CLAIM_RETRY_SEC. Otherwise a new claim (token and a new
-    lease) is stamped. Returns its token, for the one claimant only."""
+    """Under the HITL store lock, for a live card with no post recorded and no pointer sent: a claim
+    already on it is credited this pass and saved (pending_questions_lease), before anything else,
+    so every pass counts; it is kept until its lease has run POINTER_CLAIM_RETRY_SEC. A new claim
+    (token and a new lease) is stamped only when there is no live claim AND the card is past its
+    grace. Returns that token, for the one claimant only."""
     with manager.store.locked():
         req = manager.get(card_id)
         if req is None or req.terminal or manager.store.projection(card_id).get("revision", 0) > 0:
             return None
         subject = req.subject or {}
-        if subject.get("pointer_sent_at") or now - req.created_at < CARD_POINTER_GRACE_SEC:
+        if subject.get("pointer_sent_at"):
             return None
         if subject.get("pointer_claim"):
             lease = lease_mod.advance(subject.get("pointer_lease"), now, POINTER_MAX_STEP_SEC)
+            if lease != subject.get("pointer_lease"):
+                subject = {**subject, "pointer_lease": lease}
+                req.subject = subject
+                manager.store.save(req)
             if not lease_mod.expired(lease, POINTER_CLAIM_RETRY_SEC):
-                if lease != subject.get("pointer_lease"):
-                    req.subject = {**subject, "pointer_lease": lease}
-                    manager.store.save(req)
                 return None
+        if now - req.created_at < CARD_POINTER_GRACE_SEC:
+            return None
         token = os.urandom(8).hex()
         req.subject = {**subject, "pointer_claim": token, "pointer_lease": lease_mod.new(now)}
         manager.store.save(req)

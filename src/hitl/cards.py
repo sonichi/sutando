@@ -66,4 +66,3 @@ def create_choice(question: str, actions: Iterable[Any], guard: str, subject: Di
     req = choice_request(question, actions, guard, subject, runtime=runtime, title=title,
                          device=device, kind=kind, turn_on_action=turn_on_action)
     return (manager or manager_for(workspace)).create(req)
-
