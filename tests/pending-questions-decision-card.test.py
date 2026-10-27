@@ -124,10 +124,7 @@ class Delegation(unittest.TestCase):
         self.assertTrue(all(c.kwargs["runtime"] == rf.HITL_RUNTIME for c in cc.call_args_list))
         self.assertTrue(_manager(ws).get(rid).turn_on_action)
 
-    def test_the_pool_store_handle_is_the_helpers(self):
-        src = (REPO / "skills" / "worker-pool" / "scripts" / "pool_wedge_cards.py").read_text()
-        self.assertIn("from hitl.cards import manager_for", src)
-        self.assertEqual(src.count("choice_request("), 4, "every wedge card is built by the helper")
+# Every wedge card path builds through the helper: pool-wedge-cards.test.py, WedgeCardsUseTheHelper.
 
     def test_queue_question_builds_its_card_through_the_helper(self):
         ws = _ws("ag2space")
