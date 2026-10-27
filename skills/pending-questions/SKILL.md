@@ -93,11 +93,13 @@ adapter's `clicks` (`scripts/pending_questions_clicks.py`):
   is probed. A claim still marked `claiming` was left by a pass that died; it is retried with the
   same token.
 - The pass claims the click (a token, saved atomically on the card) and closes the row as
-  Answered in one guarded write that requires the owner's Status to be open and writes the token
-  into the Closed mark (`Answered+<token>@<host>`). A refusal whose mark carries this token is
-  the claim's own earlier close. Any other refusal (the owner's Status, or a close by code such as
-  `resolve`) makes the click stale: "already answered — not a decision", and its card is
-  cancelled.
+  Answered in one guarded write that requires the owner's Status to be open. The same write puts
+  a plain `Answered@<host>` in Closed (what a reader that predates click tokens understands) and
+  the token in Recovery (`click:<token>@<host>`, which such a reader ignores). A refused close
+  first checks the owner's Status: Answered or Resolved makes the click stale whatever any mark
+  says. Otherwise a Recovery token equal to this claim's is the claim's own earlier close, and any
+  other refusal (a close by code such as `resolve`) makes the click stale: "already answered — not
+  a decision", and its card is cancelled.
 - **Fail closed.** Only the room can say the owner's Status is open, so a click never closes
   through a local close record: when the room store is missing or unreachable, or the row is not
   in it yet, the click is deferred — nothing is handed over, the claim stays, and the next pass
@@ -118,6 +120,11 @@ adapter's `clicks` (`scripts/pending_questions_clicks.py`):
   already resolved, the thing is not already done) and skip what is.
 - `resolve` retires (cancels) the question's card whenever it closes the row or the room refuses
   the close.
+- **Wakeup.** A deferred click, or a handoff whose lease ran out, owes a pass with no new task to
+  trigger it. `src/health-check.py` (run every proactive-loop pass, and by the launchd fallback)
+  reads that through the core reader (`clicks --due`, read-only) and warns
+  `decision-card-clicks`, naming `… clicks` to run; the core handles that output as for a
+  `hitl_click` task. A host that never runs the health check retries only on the next click task.
 
 A pass that dies after recording `handed` and before its caller printed the choice leaves it
 handed but unseen; it is shown as awaiting ack until the lease runs out, then re-offered.

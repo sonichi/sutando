@@ -107,7 +107,7 @@ def clicks(workspace: Path, closer, manager=None, now: Optional[float] = None) -
     message)."""
     ws = Path(workspace)
     manager = manager or manager_for(ws)
-    now = time.time() if now is None else now
+    clock = time.time if now is None else (lambda: now)  # sampled at each transition, inside the lock
     out = []
     with clicks_lock(manager):
         for c in answered_cards(manager):
@@ -117,9 +117,9 @@ def clicks(workspace: Path, closer, manager=None, now: Optional[float] = None) -
                      "deferred": False, "handed_before": handed, "closed": handed, "token": None,
                      "close_message": "closed earlier by this click"}
             if handed:
-                if _lease_expired(claim, now):
+                if _lease_expired(claim, clock()):
                     if int(claim.get("reoffers") or 0) < MAX_REOFFERS:
-                        claim = {**claim, **_lease(now), "token": _token(),
+                        claim = {**claim, **_lease(clock()), "token": _token(),
                                  "reoffers": int(claim.get("reoffers") or 0) + 1}
                         stamp_claim(manager, c["hitl_id"], claim)
                         entry.update(actionable=True, reoffered=True, token=claim["token"])
@@ -132,7 +132,7 @@ def clicks(workspace: Path, closer, manager=None, now: Optional[float] = None) -
                 stamp_claim(manager, c["hitl_id"], claim)
             outcome, entry["close_message"] = closer(ws, c["ask_id"], claim["token"])
             if outcome == CLOSED:
-                stamp_claim(manager, c["hitl_id"], {**claim, "state": HANDED, **_lease(now)})
+                stamp_claim(manager, c["hitl_id"], {**claim, "state": HANDED, **_lease(clock())})
                 entry.update(actionable=True, closed=True, token=claim["token"])
             elif outcome == STALE:
                 manager.cancel(c["hitl_id"])
@@ -140,6 +140,22 @@ def clicks(workspace: Path, closer, manager=None, now: Optional[float] = None) -
             else:
                 entry["deferred"] = True  # the claim stays `claiming`, to be retried
             out.append(entry)
+    return out
+
+
+def due_clicks(workspace: Path, manager=None, now: Optional[float] = None) -> list:
+    """Ask ids a `clicks` pass would act on now, read-only: a click never processed, a claim left
+    `claiming` (deferred, or its pass died), or a handed claim past its deadline with its re-offer
+    unused. The periodic pass calls `clicks` only when this is non-empty."""
+    manager = manager or manager_for(workspace)
+    now = time.time() if now is None else now
+    out = []
+    for c in answered_cards(manager):
+        claim = c["claim"]
+        if claim.get("state") != HANDED:
+            out.append(c["ask_id"])
+        elif _lease_expired(claim, now) and int(claim.get("reoffers") or 0) < MAX_REOFFERS:
+            out.append(c["ask_id"])
     return out
 
 

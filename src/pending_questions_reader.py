@@ -29,8 +29,9 @@ CLI, for shell readers: `python3 src/pending_questions_reader.py list [--json] |
 (`summary` is the count and where the questions live, never their text); and the
 writes a core caller makes through the same contract: `resolve <ask-id> [--answered]`
 (Resolved, or Answered), which is `resolve` above and nothing else; `clicks [--json]`, run on a
-`hitl_click: true` task; and `ack <ask-id> --token <token>` once the core has acted on a choice
-`clicks` handed it. `--store-adapter <path>`
+`hitl_click: true` task (`--due` is the read-only probe, exit 0 when a pass is owed, that
+health-check's `decision-card-clicks` warn uses so a deferred or expired click is retried); and
+`ack <ask-id> --token <token>` once the core has acted on a choice `clicks` handed it. `--store-adapter <path>`
 injects an adapter file in place of the declared one.
 """
 from __future__ import annotations
@@ -212,6 +213,17 @@ def clicks(workspace, adapter=None) -> tuple:
         return None, f"adapter failed ({type(e).__name__}: {e})"
 
 
+def due_clicks(workspace, adapter=None) -> tuple:
+    """(ask ids a clicks pass would act on now, None), or (None, why). Read-only."""
+    mod, why = _adapter(adapter)
+    if mod is None or not hasattr(mod, "due_clicks"):
+        return None, f"no store: {why}" if mod is None else f"adapter {why} takes no card clicks"
+    try:
+        return mod.due_clicks(Path(workspace)), None
+    except Exception as e:  # noqa: BLE001
+        return None, f"adapter failed ({type(e).__name__}: {e})"
+
+
 def ack(workspace, ask_id: str, token: str, adapter=None) -> tuple:
     """(done, message): the core acted on that question's choice; the adapter's `ack_click`."""
     mod, why = _adapter(adapter)
@@ -286,6 +298,8 @@ def main(argv=None) -> int:
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--answered", action="store_true", help="resolve: mark it Answered, not Resolved")
     ap.add_argument("--token", default=None, help="ack: the token `clicks` printed with the choice")
+    ap.add_argument("--due", action="store_true",
+                    help="clicks: only say whether a pass is owed (exit 0 when it is, 1 when not); read-only")
     ap.add_argument("--workspace", type=Path, default=None)
     ap.add_argument("--store-adapter", default=None, help="an adapter file in place of the declared one")
     # intermixed: an optional positional after `--workspace` is otherwise swallowed on 3.12
@@ -302,6 +316,13 @@ def main(argv=None) -> int:
         ok, msg = ack(args.workspace, args.ask_id, args.token, store)
         print(msg)
         return 0 if ok else 1
+    if args.command == "clicks" and args.due:
+        due, why = due_clicks(args.workspace, store)
+        if due is None:
+            print(f"clicks: not read — {why}")
+            return 1
+        print(f"{len(due)} decision-card click(s) owe a pass" + (f": {', '.join(due)}" if due else ""))
+        return 0 if due else 1
     if args.command == "clicks":
         done, why = clicks(args.workspace, store)
         if done is None:

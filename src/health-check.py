@@ -1611,6 +1611,23 @@ def check_workspace_wiring() -> "dict | None":
     }
 
 
+def check_decision_card_clicks(workspace_dir: Optional[Path] = None) -> "dict | None":
+    """The periodic wakeup for decision-card clicks: a deferred click, or a handoff whose lease ran
+    out unacked, has no task left to trigger its retry, so this warns until a `clicks` pass runs."""
+    import pending_questions_reader as pq_reader  # noqa: PLC0415 — the core contract, adapter injected
+    ws = Path(workspace_dir) if workspace_dir else WORKSPACE_DIR
+    try:
+        due, _ = pq_reader.due_clicks(ws, skill_roots.declared(pq_reader.DECLARATION, ws))
+    except Exception:  # noqa: BLE001 — an unreadable store is not a click owed
+        return None
+    if not due:
+        return None
+    return {"name": "decision-card-clicks", "status": "warn",
+            "detail": (f"{len(due)} decision-card click(s) owe a pass ({', '.join(due)}) — run "
+                       "`python3 src/pending_questions_reader.py clicks` and handle its output as for a "
+                       "`hitl_click: true` task (CLAUDE.md, Pending decisions)")}
+
+
 CURRENT_TRACK_READ_BUDGET = 32 * 1024
 
 
@@ -13016,6 +13033,10 @@ def run_all_checks() -> list[dict]:
     _wiring = check_workspace_wiring()
     if _wiring:
         checks.append(_wiring)
+
+    _card_clicks = check_decision_card_clicks()
+    if _card_clicks:
+        checks.append(_card_clicks)
 
     _mem_index = check_memory_index_integrity()
     if _mem_index:

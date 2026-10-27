@@ -357,6 +357,172 @@ class TokenAndOutage(_Room):
         self.assertTrue(c["actionable"])
 
 
+def _health_check():
+    spec = importlib.util.spec_from_file_location("hc_for_card_clicks", REPO / "src" / "health-check.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+HC = _health_check()
+
+
+class Wakeup(_Room):
+    """A deferred click or an expired lease is retried from the periodic health check (run by the
+    proactive loop every pass, and by the launchd fallback), with no new task."""
+
+    def loop_pass(self):
+        """The health check's warn, then the command it names, run as the core would."""
+        warn = HC.check_decision_card_clicks(self.ws)
+        if warn is None:
+            return None, ""
+        cmd = "python3 src/pending_questions_reader.py clicks"
+        self.assertIn(f"`{cmd}`", warn["detail"])
+        self.assertEqual((warn["name"], warn["status"]), ("decision-card-clicks", "warn"))
+        r = subprocess.run(["bash", "-c", f"{cmd} --workspace {self.ws} --store-adapter {ADAPTER}"], cwd=REPO,
+                           env=self.env, capture_output=True, text=True, timeout=120)
+        return warn, r.stdout
+
+    def test_nothing_owed_raises_no_warn(self):
+        self.assertEqual(self.loop_pass(), (None, ""))
+
+    def test_the_health_run_registers_the_check(self):
+        self.assertIn("check_decision_card_clicks()", (REPO / "src" / "health-check.py").read_text())
+
+    def test_a_handoff_whose_consumer_died_is_reoffered_by_the_next_loop_pass(self):
+        click(self.m, self.card, "option-1")
+        self.child("with mock.patch.object(reader, 'click_line', side_effect=lambda c: os._exit(17)):\n"
+                   f"    reader.main(['clicks', '--workspace', str(ws), '--store-adapter', {ADAPTER!r}])")
+        self.assertEqual(self.loop_pass(), (None, ""), "inside the lease nothing is owed")
+        claim = self.m.get(self.card).subject["claim"]
+        past = claim["handed_at"] - cards.HANDED_LEASE_SEC - 1
+        cards.stamp_claim(self.m, self.card, {**claim, "handed_at": past, "lease_until": past + cards.HANDED_LEASE_SEC})
+        warn, out = self.loop_pass()
+        self.assertIn(self.ask_id, warn["detail"])
+        self.assertIn(f"[{self.ask_id}] chose option-1 'Hold' -> wait for the CLA (re-offered", out)
+        self.assertEqual(self.loop_pass(), (None, ""), "re-offered: owed nothing more")
+
+    def test_a_click_deferred_in_an_outage_is_handed_over_by_the_next_loop_pass(self):
+        click(self.m, self.card, "approve")
+        with mock.patch.object(room_db, "room_store", return_value=(None, "room unreachable")):
+            [c] = self.run_clicks()
+        self.assertTrue(c["deferred"])
+        warn, out = self.loop_pass()
+        self.assertIn(f"[{self.ask_id}] chose approve 'Approve' -> merge it", out)
+
+    def test_an_unreadable_store_raises_no_warn(self):
+        with mock.patch.object(reader, "due_clicks", side_effect=OSError("store gone")):
+            self.assertIsNone(HC.check_decision_card_clicks(self.ws))
+
+    def test_the_due_probe(self):
+        click(self.m, self.card, "option-1")
+        self.assertEqual(room_db.due_clicks(self.ws, self.m), [self.ask_id], "a click never processed")
+        [c] = self.run_clicks()
+        t = self.m.get(self.card).subject["claim"]["handed_at"]
+        self.assertEqual(room_db.due_clicks(self.ws, self.m, now=t + 1), [], "inside the lease")
+        self.assertEqual(room_db.due_clicks(self.ws, self.m, now=t + cards.HANDED_LEASE_SEC), [self.ask_id])
+        room_db.clicks(self.ws, manager=self.m, now=t + cards.HANDED_LEASE_SEC)
+        self.assertEqual(room_db.due_clicks(self.ws, self.m, now=t + 100 * cards.HANDED_LEASE_SEC), [],
+                         "the single re-offer is used: needs attention, not owed a pass")
+        with mock.patch.object(reader, "_adapter", return_value=(None, "no adapter")):
+            self.assertEqual(reader.due_clicks(self.ws), (None, "no store: no adapter"))
+        with mock.patch.object(reader, "_adapter", return_value=(object(), "p")):
+            self.assertIn("takes no card clicks", reader.due_clicks(self.ws)[1])
+        with mock.patch.object(reader, "_adapter", return_value=(mock.Mock(due_clicks=mock.Mock(side_effect=OSError("x"))), "p")):
+            self.assertIn("adapter failed", reader.due_clicks(self.ws)[1])
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                self.assertEqual(reader.main(["clicks", "--due", "--workspace", str(self.ws)]), 1)
+            self.assertIn("not read", buf.getvalue())
+        click_ws_buf = io.StringIO()
+        with contextlib.redirect_stdout(click_ws_buf):
+            rc = reader.main(["clicks", "--due", "--workspace", str(self.ws), "--store-adapter", ADAPTER])
+        self.assertEqual(rc, 1)
+        self.assertIn("0 decision-card click(s) owe a pass", click_ws_buf.getvalue())
+
+
+class RollbackAndClock(_Room):
+    @staticmethod
+    def base_effective_status(cells):
+        """The reviewed base's reader (main at 20f3042b), verbatim in behaviour: no click tokens."""
+        names = {"open": "Open", "answered": "Answered", "resolved": "Resolved"}
+        status = names.get(cells.get("status"))
+        owner = status if status in ("Answered", "Resolved") else None
+        val, _, tag = str(cells.get("closed") or "").partition("@")
+        closed = val if val and (tag or None) == (cells.get("host") or None) else None
+        return owner or (closed if closed in ("Answered", "Resolved") else None) or "Open"
+
+    def test_a_click_close_reads_closed_to_the_base_reader(self):
+        click(self.m, self.card, "option-1")
+        [c] = self.run_clicks()
+        self.assertTrue(c["actionable"])
+        cells = self.store.client.row(room_db.DB_SCHEMA, self.store._rid(self.ask_id))["cells"]
+        self.assertEqual(cells["closed"], f"Answered@{RDBT.HOST}", "Closed stays the base's grammar")
+        self.assertEqual(cells["recovery"], f"click:{c['token']}@{RDBT.HOST}")
+        self.assertEqual(self.base_effective_status(cells), "Answered")
+        self.assertEqual(self.store.status_of(self.ask_id), "Answered")
+        self.assertEqual(self.store.click_token_of(self.ask_id), c["token"])
+
+    def test_a_click_mark_that_cannot_be_read_defers(self):
+        click(self.m, self.card, "option-1")
+        cards.stamp_claim(self.m, self.card, {"token": "claimtok", "state": cards.CLAIMING})
+        self.store.close(self.ask_id, "Answered", require_open=True, token="claimtok")
+        with mock.patch.object(type(self.store), "click_token_of", side_effect=OSError("row unreadable")):
+            [c] = self.run_clicks()
+        self.assertTrue(c["deferred"])
+
+    def test_the_lease_starts_when_the_handoff_is_persisted_not_before_the_lock(self):
+        click(self.m, self.card, "option-1")
+        clock = [100.0]
+        real = room_db._close_for_click
+
+        def slow_close(*a):
+            clock[0] = 701.0  # lock wait and room I/O took ten minutes
+            return real(*a)
+        with mock.patch.object(cards.time, "time", side_effect=lambda: clock[0]), \
+                mock.patch.object(room_db, "_close_for_click", slow_close):
+            [c] = room_db.clicks(self.ws, manager=self.m)
+        claim = self.m.get(self.card).subject["claim"]
+        self.assertEqual((claim["handed_at"], claim["lease_until"]), (701.0, 701.0 + cards.HANDED_LEASE_SEC))
+        [nxt] = room_db.clicks(self.ws, manager=self.m, now=702.0)
+        self.assertFalse(nxt["actionable"], "a fresh lease is not already expired")
+
+
+class ParentReaderNeverTextsACard(_Room):
+    """Rolling the ask side back to this PR must not bring a text ask back beside a live card."""
+
+    def _rem(self):
+        spec = importlib.util.spec_from_file_location("pq_remind_parent", PQ / "pending_questions_remind.py")
+        rem = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(rem)
+        return rem
+
+    def test_a_live_card_record_is_never_reminded_as_text_force_included(self):
+        import pending_questions_ask as ask
+        record = f"**Sent:** card {self.card} for ag2space owner-dm (decision card) at 2026-01-01T00:00:00Z"
+        self.assertTrue(ask.asked_recently(record, self.ws / "results"))
+        rem = self._rem()
+        q = {"ask_id": self.ask_id, "title": "Merge #12?", "body": record}
+        g = {"waiting": [q], "notes": [], "unavailable": False}
+        with mock.patch.object(rem, "gather", return_value=g), \
+                mock.patch.object(rem, "presenter_mode_active", return_value=False), \
+                mock.patch.object(rem, "deliver") as dv:
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rem.main(["--notify", "--force"], workspace=self.ws)
+        dv.assert_not_called()
+        self.assertIn("wait as live decision cards; no text sent", buf.getvalue())
+
+    def test_a_gone_card_or_an_unreadable_record_leaves_it_due(self):
+        import pending_questions_ask as ask
+        self.m.cancel(self.card)
+        record = f"**Sent:** card {self.card} for ag2space owner-dm (decision card) at 2026-01-01T00:00:00Z"
+        self.assertFalse(ask.asked_recently(record, self.ws / "results"))
+        self.assertIsNone(ask.card_sent("**Sent:** card hitl_x for x at 2026-13-99T99:99:99Z"))
+        with mock.patch("pending_questions_clicks.manager_for", side_effect=OSError("store gone")):
+            self.assertEqual(ask.card_state(self.ws, "hitl_x")[0], "unknown")
+
+
 class OwnerStatusWins(_Room):
     def _owner_sets(self, status):
         self.store.client.set_cells(room_db.DB_SCHEMA, self.store._rid(self.ask_id), {"status": status})

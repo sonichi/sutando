@@ -26,7 +26,7 @@ for _p in (REPO / "src", HERE):
 from workspace_default import resolve_workspace
 from result_publish import publish_text
 from presenter_mode import presenter_mode_active
-from pending_questions_ask import SENT_QUIET_SEC, asked_recently
+from pending_questions_ask import SENT_QUIET_SEC, asked_recently, card_live
 
 WORKSPACE = resolve_workspace(migrate=False)
 RESULTS_DIR = WORKSPACE / "results"
@@ -330,6 +330,12 @@ def main(argv=None, workspace=None, adapter=None):
 
     if not force and presenter_mode_active(WORKSPACE):
         print(f"(presenter-mode) {len(questions)} pending questions — suppressed")
+        return 0
+
+    carded = [q for q in questions if card_live(q.get("body", ""), WORKSPACE)]
+    questions = [q for q in questions if q not in carded]  # a live card is the ask, --force or not
+    if carded and not questions:
+        print(f"(cards) {len(carded)} pending questions wait as live decision cards; no text sent")
         return 0
 
     if not force:

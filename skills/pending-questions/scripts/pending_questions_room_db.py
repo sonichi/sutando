@@ -53,7 +53,7 @@ import pending_questions_ask as core_ask
 import pending_questions_clicks as cards
 from pending_questions_outbox import (Outbox as HeldRecords, local_closes, mark_room_introduced,
                                       mark_store_used, room_introduced, store_history)
-from pending_questions_store import (DB_SCHEMA, INCOMPLETE, TERMINAL, GuardFailed, Outbox, Question, mark_token,
+from pending_questions_store import (DB_SCHEMA, INCOMPLETE, TERMINAL, GuardFailed, Outbox, Question,
                                      RoomDbStore, ScriptDbClient, StoreError, outbox_items, reconcile_pending,
                                      safe_body, waiting_item, write_question)
 from ag2space_links import database_link
@@ -334,10 +334,14 @@ def _close_for_click(ws: Path, ask_id: str, token: str) -> tuple:
     except GuardFailed as g:
         if g.current.get("status") in TERMINAL:  # the owner's own answer wins, whatever any mark says
             return cards.STALE, f"{REFUSED_PREFIX} — the owner set {g.current['status']} — {type(g).__name__}: {g}"
-        if mark_token(g.current.get("closed")) == token:
-            return cards.CLOSED, f"room database: {ask_id} closed earlier by this claim"
         if not g.current:
             return cards.DEFERRED, f"deferred: {ask_id} has no row in the room yet"
+        try:
+            ours = store.click_token_of(ask_id) == token
+        except Exception as e:  # noqa: BLE001
+            return cards.DEFERRED, f"deferred: the row's click mark cannot be read ({type(e).__name__}: {e})"
+        if ours:
+            return cards.CLOSED, f"room database: {ask_id} closed earlier by this claim"
         return cards.STALE, f"{REFUSED_PREFIX} — {type(g).__name__}: {g}"
     except Exception as e:  # noqa: BLE001
         return cards.DEFERRED, f"deferred: room database unreachable ({type(e).__name__}: {e})"
@@ -347,6 +351,10 @@ def clicks(workspace: Path, manager=None, now=None) -> list:
     """The owner's decision-card clicks, each handed over as an actionable choice once, and again
     only after an unacked lease (pending_questions_clicks); the row closes through this adapter."""
     return cards.clicks(Path(workspace), _close_for_click, manager, now)
+
+
+def due_clicks(workspace: Path, manager=None, now=None) -> list:
+    return cards.due_clicks(Path(workspace), manager, now)
 
 
 def ack_click(workspace: Path, ask_id: str, token: str, manager=None) -> tuple:

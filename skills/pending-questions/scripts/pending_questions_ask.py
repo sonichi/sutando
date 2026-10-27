@@ -44,6 +44,10 @@ SENT_QUIET_SEC = 3600
 SENT_RE = re.compile(
     r"^\*\*Sent:\*\*\s+queued\s+(?P<where>.*?)\s+via\s+(?P<file>proactive-\S+\.txt)\s+at\s+"
     r"(?P<ts>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)\s*$", re.MULTILINE)
+# Grammar of a decision-card record; whether the card is live is the HITL store's to say.
+CARD_SENT_RE = re.compile(
+    r"^\*\*Sent:\*\*\s+card\s+(?P<card>hitl_\S+)\s+for\s+.*?\s+at\s+"
+    r"(?P<ts>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)\s*$", re.MULTILINE)
 # Bridges whose drain honours a `[channel:]` room redirect (telegram drops it).
 _ROOM_MARKER_BRIDGES = frozenset({"discord", "slack", "ag2space"})
 MACOS_FIX = ("allow notifications for your terminal app under System Settings > "
@@ -105,6 +109,39 @@ def sent_at(body: str) -> Optional[float]:
     return None if q is None else q[1]
 
 
+def card_sent(body: str):
+    """(card id, epoch) of the entry's decision-card record; None without one or with a bad stamp."""
+    m = CARD_SENT_RE.search(body or "")
+    if not m:
+        return None
+    try:
+        ts = datetime.strptime(m.group("ts"), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
+    except ValueError:
+        return None
+    return m.group("card"), ts
+
+
+def card_state(workspace: Path, card_id: str, manager=None) -> tuple:
+    """("live" | "gone" | "unknown", projection): live is a stored card not yet settled; gone is
+    no card, or a settled one; unknown is a store that cannot be read."""
+    try:
+        if manager is None:
+            from pending_questions_clicks import manager_for  # noqa: PLC0415
+            manager = manager_for(Path(workspace))
+        req = manager.get(card_id)
+        if req is None or req.terminal:
+            return "gone", {}
+        return "live", manager.store.projection(card_id)
+    except Exception:  # noqa: BLE001
+        return "unknown", {}
+
+
+def card_live(body: str, workspace: Path, manager=None) -> bool:
+    """The entry's question is asked by a card that is live, or that the store cannot rule out."""
+    c = card_sent(body)
+    return c is not None and card_state(workspace, c[0], manager)[0] != "gone"
+
+
 def drained(results_dir: Path, name: str) -> bool:
     """A queued file some drain took: neither the file, any claim of it (`.sending`,
     `.sending.<pid>`) nor a parked copy in the undelivered/ quarantine remains."""
@@ -128,11 +165,15 @@ def drained(results_dir: Path, name: str) -> bool:
 
 def asked_recently(body: str, results_dir: Path, now: Optional[float] = None,
                    within: float = SENT_QUIET_SEC) -> bool:
-    """Queued within `within` AND drained. An undrained file is not a delivery
-    (the reminder's own contract), so that entry stays due."""
+    """Queued within `within` AND drained; or a decision-card record whose card is still live. An
+    undrained file is not a delivery (the reminder's own contract), so that entry stays due; a live
+    card is the question's one surface, so the reminder never texts beside it. A card that is gone
+    leaves the entry due."""
     q = queued_send(body)
     if q is None:
-        return False
+        c = card_sent(body)
+        # A live card (or one the store cannot rule out) is the ask: never text beside it.
+        return c is not None and card_state(Path(results_dir).parent, c[0])[0] != "gone"
     name, ts = q
     if (time.time() if now is None else now) - ts >= within:
         return False
