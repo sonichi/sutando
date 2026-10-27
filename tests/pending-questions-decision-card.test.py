@@ -476,6 +476,8 @@ class CrashBoundaries(unittest.TestCase):
         self.assertEqual((c["stale"], c["closed"]), (False, True), "a dead holder's claim is taken over")
         self.assertFalse(room_db._held_by_live_other(True), "a legacy boolean claim is not a live holder")
         self.assertFalse(room_db._held_by_live_other(f"{os.getpid()}:x"), "our own claim")
+        with mock.patch.object(room_db.os, "kill", side_effect=PermissionError):
+            self.assertTrue(room_db._held_by_live_other("1:x"), "a pid we may not signal is alive")
 
     def test_a_definite_card_failure_rewrites_the_row_so_the_reminder_does_not_reask(self):
         store, _ = room_db.room_store(self.ws)
