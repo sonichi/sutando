@@ -653,5 +653,63 @@ class RefusalWriterTests(unittest.TestCase):
                          "two refused sends are two attempts, whatever their interleaving")
 
 
+
+def _floats_at(o, path="$"):
+    if isinstance(o, float):
+        return [path]
+    if isinstance(o, dict):
+        return [f for k, v in o.items() for f in _floats_at(v, f"{path}.{k}")]
+    if isinstance(o, (list, tuple)):
+        return [f for i, v in enumerate(o) for f in _floats_at(v, f"{path}[{i}]")]
+    return []
+
+
+class NoFloatOnTheWireTests(unittest.TestCase):
+    """A room refuses a float anywhere in event content (canonical JSON), so no projected
+    payload, card or notice, carries one at any depth."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.mgr = HitlManager(HitlStore(Path(self.tmp.name)))
+
+    def test_the_whole_projected_payload_has_no_float(self):
+        req = self.mgr.create(make_req(
+            kind="permission", expires_at=1793110319.208562,
+            subject={"tool": "Bash", "input": {"timeout": 1.5, "retries": 3.0, "argv": [0.25, "x"],
+                                               "nested": {"deep": [{"at": 1793110319.5}]}},
+                     "options": [{"weight": 2.0}], "choices": {"a": "do a"}}))
+        sent = RecordingSender()
+        project(self.mgr, sent, ROOM)
+        self.mgr.resolve(req.id)
+        project(self.mgr, sent, ROOM)
+        self.assertEqual(len(sent.sent), 2)
+        for payload in sent.sent:
+            self.assertEqual(_floats_at(payload), [], payload)
+        wire = sent.sent[0]["extra_content"][WIRE_FIELD]
+        self.assertEqual(wire["expires_at"], "1793110319.208562")
+        self.assertEqual(wire["subject"]["input"],
+                         {"timeout": "1.5", "retries": 3, "argv": ["0.25", "x"],
+                          "nested": {"deep": [{"at": "1793110319.5"}]}})
+        self.assertEqual(wire["subject"]["options"], [{"weight": 2}])
+
+    def test_an_integral_expiry_stays_a_number(self):
+        self.mgr.create(make_req(expires_at=1793110320.0))
+        sent = RecordingSender()
+        project(self.mgr, sent, ROOM)
+        expires = sent.sent[0]["extra_content"][WIRE_FIELD]["expires_at"]
+        self.assertEqual((type(expires), expires), (int, 1793110320))
+
+    def test_a_due_reminder_notice_carries_no_float(self):
+        self.mgr.create(make_req(expires_at=10 ** 7 + 0.5, created_at=1000.0, updated_at=1000.0))
+        sent = RecordingSender()
+        project(self.mgr, sent, ROOM, clock=lambda: 1000.0)
+        project(self.mgr, sent, ROOM, clock=lambda: 1000.0 + 31 * 60)
+        notices = [p for p in sent.sent if WIRE_FIELD not in p["extra_content"]]
+        self.assertEqual(len(notices), 1, "a reminder notice went out")
+        for payload in sent.sent:
+            self.assertEqual(_floats_at(payload), [], payload)
+
+
 if __name__ == "__main__":
     unittest.main()

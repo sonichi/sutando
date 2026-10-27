@@ -29,6 +29,7 @@ from .schema import (
     NOTICE_FIELD,
     WIRE_FIELD,
     category_of,
+    wire_safe,
 )
 
 Sender = Callable[[Dict], Dict]
@@ -202,7 +203,7 @@ def project_pass(manager: HitlManager, send: Sender, room_id: str, clock: Option
         else:
             payload["op"] = "message"
         try:
-            answer = send(payload)
+            answer = send(wire_safe(payload))
         except Exception as e:  # noqa: BLE001 — classified; anything not this card's re-raises
             code = _refusal_code(e)
             if code is None:
@@ -231,10 +232,10 @@ def _send_notices(manager: HitlManager, send: Sender, room_id: str,
         notice = {"notice": n.notice, "ids": [r.id for r, _ in n.members],
                   "runtime": n.req.runtime, "device": device.get("id") or "",
                   "host": device.get("host") or ""}
-        answer = send({"room_id": room_id, "op": "message",
-                       "body": renotify.body(n.notice, n.req, now, since=n.since, queued=n.queued),
-                       "dedupe_key": renotify.dedupe_key(n.notice, n.req, ledger, n.reminders),
-                       "extra_content": {NOTICE_FIELD: notice}})
+        answer = send(wire_safe({"room_id": room_id, "op": "message",
+                                 "body": renotify.body(n.notice, n.req, now, since=n.since, queued=n.queued),
+                                 "dedupe_key": renotify.dedupe_key(n.notice, n.req, ledger, n.reminders),
+                                 "extra_content": {NOTICE_FIELD: notice}}))
         if not isinstance(answer, dict) or not (answer.get("ok") or answer.get("event_id")):
             continue
         # Every card the notice covered is stamped, so none of them is ever sent again.

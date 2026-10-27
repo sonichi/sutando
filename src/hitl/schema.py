@@ -21,6 +21,18 @@ NOTICE_FIELD = "space.ag2.hitl_notice"
 # (claims, tokens, leases, session keys) and never leaves the host.
 WIRE_SUBJECT_FIELDS = ("tool", "input", "options", "choices")
 
+
+def wire_safe(value: Any) -> Any:
+    """`value` with no float at any depth, as canonical JSON requires: an integral float becomes
+    an int, any other float its shortest decimal string (repr), so no digit is lost."""
+    if isinstance(value, float):
+        return int(value) if value.is_integer() else repr(value)
+    if isinstance(value, dict):
+        return {k: wire_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [wire_safe(v) for v in value]
+    return value
+
 KINDS = frozenset(
     {"auth", "permission", "choice", "confirmation", "billing", "external_action",
      "core-blocked", "unknown"}
@@ -177,7 +189,7 @@ class HumanRequirement:
             wire["turn_on_action"] = True
         # `answer` is inbound-only (what the human typed back); a card never
         # renders it, so it is persisted but deliberately not on the wire.
-        return wire
+        return wire_safe(wire)
 
 
 class StaleRequirementError(Exception):
