@@ -12,6 +12,10 @@ Run: python3 tests/tmux-session-targets-are-exact.test.py
 """
 from __future__ import annotations
 
+from _helpers.hermetic_env import isolate_os_environ
+
+isolate_os_environ()
+
 import re
 import subprocess
 import sys
