@@ -45,6 +45,7 @@ from result_markers import neutralize_markers
 from undelivered_quarantine import quarantine_dir
 from util_paths import host_label
 from pending_questions_clicks import CARD_RUNTIME
+import pending_questions_lease as lease_mod
 
 # The only bridge that projects HITL cards (to the owner's DM).
 CARD_BRIDGE = "ag2space"
@@ -52,6 +53,9 @@ CARD_BRIDGE = "ag2space"
 CARD_POINTER_GRACE_SEC = 1800
 # A pointer claim with no sent mark this old is taken to have died or failed, and is retried.
 POINTER_CLAIM_RETRY_SEC = 300
+# The most one reminder pass credits a pointer claim: half its window, so no single clock jump
+# releases a claim that a live claimant may still be publishing.
+POINTER_MAX_STEP_SEC = 150
 # A question queued and drained this recently is not re-raised by the reminder.
 SENT_QUIET_SEC = 3600
 # Grammar of the queue record; the reminder reads it back.
@@ -149,9 +153,10 @@ def card_pointer_body(title: str, host: str) -> str:
 
 
 def claim_pointer(manager, card_id: str, now: float) -> Optional[str]:
-    """Under the HITL store lock: the card is live, has no post recorded, is past the grace, has no
-    pointer sent, and no pointer claim younger than POINTER_CLAIM_RETRY_SEC; then a claim
-    (`pointer_claim_at`, `pointer_claim`) is stamped. Returns its token, for the one claimant only."""
+    """Under the HITL store lock: the card is live, has no post recorded, is past the grace and has
+    no pointer sent; a claim already on it is credited this pass (pending_questions_lease) and
+    kept until its lease has run POINTER_CLAIM_RETRY_SEC. Otherwise a new claim (token and a new
+    lease) is stamped. Returns its token, for the one claimant only."""
     with manager.store.locked():
         req = manager.get(card_id)
         if req is None or req.terminal or manager.store.projection(card_id).get("revision", 0) > 0:
@@ -159,20 +164,15 @@ def claim_pointer(manager, card_id: str, now: float) -> Optional[str]:
         subject = req.subject or {}
         if subject.get("pointer_sent_at") or now - req.created_at < CARD_POINTER_GRACE_SEC:
             return None
-        claimed_at = float(subject.get("pointer_claim_at") or 0)
-        if claimed_at > now:
-            # Stamped ahead of this clock: never taken on sight, held one window from first sight.
-            seen = subject.get("pointer_skew_seen_at")
-            if seen is None or float(seen) > now:
-                req.subject = {**subject, "pointer_skew_seen_at": now}
-                manager.store.save(req)
+        if subject.get("pointer_claim"):
+            lease = lease_mod.advance(subject.get("pointer_lease"), now, POINTER_MAX_STEP_SEC)
+            if not lease_mod.expired(lease, POINTER_CLAIM_RETRY_SEC):
+                if lease != subject.get("pointer_lease"):
+                    req.subject = {**subject, "pointer_lease": lease}
+                    manager.store.save(req)
                 return None
-            if now < float(seen) + POINTER_CLAIM_RETRY_SEC:
-                return None
-        elif claimed_at and now < claimed_at + POINTER_CLAIM_RETRY_SEC:
-            return None
         token = os.urandom(8).hex()
-        req.subject = {**subject, "pointer_claim_at": now, "pointer_claim": token}
+        req.subject = {**subject, "pointer_claim": token, "pointer_lease": lease_mod.new(now)}
         manager.store.save(req)
         return token
 
@@ -200,7 +200,8 @@ def send_card_pointers(questions, workspace: Path, now: Optional[float] = None, 
     """For each question whose card is live, has no post recorded and is older than
     CARD_POINTER_GRACE_SEC, queue a text pointer to the owner's DM. The pointer is claimed first
     (`claim_pointer`, under the HITL store lock), only the claimant publishes, and then it is
-    marked sent (`pointer_sent_at`). A claim with no sent mark older than POINTER_CLAIM_RETRY_SEC
+    marked sent (`pointer_sent_at`). A claim with no sent mark whose elapsed-time lease has run
+    POINTER_CLAIM_RETRY_SEC (pending_questions_lease)
     (its claimant died or failed to publish) is claimed again and retried: at-least-once, so a
     death between the publish and the sent mark can deliver it twice. Overlapping reminders queue
     one pointer per claim. Just before the file is written the card is re-checked under the store

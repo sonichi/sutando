@@ -110,15 +110,16 @@ exactly the options as given, with no Approve — and `subject.choices` holding 
   whose store cannot say — `--force` included; such questions are left to the card. Once posted,
   the question's last-asked time is the gateway's `notified_at`. A live card with no post
   recorded 30 minutes (`CARD_POINTER_GRACE_SEC`) after it was stored gets a text pointer. Under the
-  HITL store lock the card is re-checked (live, unposted, no pointer sent, no fresh claim) and a
-  claim (`pointer_claim_at`, with a token) is stamped; only the claimant publishes, then marks it
-  sent (`pointer_sent_at`). A claim with no sent mark older than 5 minutes
-  (`POINTER_CLAIM_RETRY_SEC`) — its claimant died or failed to publish — is claimed again and
-  retried. So the pointer is at-least-once: overlapping reminders queue one per claim, a death
-  before the publish is retried later, and a death between the publish and the sent mark can
-  deliver it twice. A claim stamped ahead of this clock is never taken on sight, and is held
-  at most one window from the first reminder that sees it (`pointer_skew_seen_at`), so a clock
-  far ahead cannot hold the pointer for the whole skew. Just before the file is written the card is re-checked under the store lock
+  HITL store lock the card is re-checked (live, unposted, no pointer sent, no live claim) and a
+  claim (a token with its own lease, `pointer_lease`) is stamped; only the claimant publishes,
+  then marks it sent (`pointer_sent_at`). The claim's lease is the same elapsed-time lease as a
+  click's (see Decision-card clicks): each reminder pass credits at most `POINTER_MAX_STEP_SEC`
+  (150 s) and nothing for a backward step, and a claim whose lease has run 5 minutes
+  (`POINTER_CLAIM_RETRY_SEC`) with no sent mark — its claimant died or failed to publish — is
+  claimed again, with a new lease, and retried. So the pointer is at-least-once: overlapping
+  reminders queue one per claim, a death before the publish is retried later, a death between
+  the publish and the sent mark can deliver it twice, and no clock step replaces a live claim.
+  Just before the file is written the card is re-checked under the store lock
   (live, unposted, still this claim's), so a post recorded after the claim cancels the pointer;
   the gateway records a post only after its send returns, so the one window left is a send in
   flight — bounded by one projector send, and the pointer then only says the card may not have

@@ -403,10 +403,12 @@ class CardPointer(unittest.TestCase):
         self.assertIn("results gone", sent)
         t = req.created_at + ask.CARD_POINTER_GRACE_SEC
         subject = m.get(req.id).subject
-        self.assertEqual((subject.get("pointer_claim_at"), subject.get("pointer_sent_at")), (t, None))
+        self.assertEqual((subject.get("pointer_lease"), subject.get("pointer_sent_at")),
+                         ({"observed_at": t, "elapsed": 0.0}, None))
         self.assertEqual(ask.send_card_pointers([q], ws, now=t + 60, manager=m, host="h"), [],
                          "a fresh claim is not retried yet")
-        [(_, name)] = ask.send_card_pointers([q], ws, now=t + ask.POINTER_CLAIM_RETRY_SEC, manager=m, host="h")
+        ask.send_card_pointers([q], ws, now=t + ask.POINTER_MAX_STEP_SEC + 60, manager=m, host="h")
+        [(_, name)] = ask.send_card_pointers([q], ws, now=t + ask.POINTER_CLAIM_RETRY_SEC + 60, manager=m, host="h")
         self.assertEqual(_proactive(ws), [name], "the failed publish is retried once its claim is old")
         self.assertTrue(m.get(req.id).subject.get("pointer_sent_at"))
         self.assertEqual(ask.send_card_pointers([q], ws, now=t + 99999, manager=m, host="h"), [], "then never again")
@@ -457,19 +459,46 @@ class PointerEdges(unittest.TestCase):
         ws, m, req, q = self._live()
         t = req.created_at + ask.CARD_POINTER_GRACE_SEC + 10
         self.assertTrue(ask.claim_pointer(m, req.id, t))
-        self.assertIsNone(ask.claim_pointer(m, req.id, t - 1), "a claim from the future is fresh")
+        self.assertIsNone(ask.claim_pointer(m, req.id, t - 1), "a backward step credits nothing")
         self.assertIsNone(ask.claim_pointer(m, req.id, t - 5000))
-        self.assertTrue(ask.claim_pointer(m, req.id, t + ask.POINTER_CLAIM_RETRY_SEC), "stale once its window passes")
+        self.assertIsNone(ask.claim_pointer(m, req.id, t), "catching back up credits nothing")
+        self.assertEqual(m.get(req.id).subject["pointer_lease"], {"observed_at": t, "elapsed": 0.0})
+        self.assertIsNone(ask.claim_pointer(m, req.id, t + ask.POINTER_CLAIM_RETRY_SEC - 1),
+                          "a single jump credits one step only")
+        self.assertTrue(ask.claim_pointer(m, req.id, t + ask.POINTER_CLAIM_RETRY_SEC + ask.POINTER_MAX_STEP_SEC),
+                        "the window is spent by observed time across passes")
 
-    def test_a_claim_stamped_far_ahead_holds_one_window_from_first_sight_not_the_whole_skew(self):
+    def test_the_pointer_claim_lease_table(self):
+        """The same invariant as the click lease, at W=300, step=150, around the window and a renewal."""
         ws, m, req, q = self._live()
         t = req.created_at + ask.CARD_POINTER_GRACE_SEC + 10
-        self.assertTrue(ask.claim_pointer(m, req.id, t + 365 * 86400))  # a clock a year ahead claimed it
-        self.assertIsNone(ask.claim_pointer(m, req.id, t), "never taken on sight")
-        self.assertEqual(m.get(req.id).subject["pointer_skew_seen_at"], t)
-        self.assertIsNone(ask.claim_pointer(m, req.id, t + ask.POINTER_CLAIM_RETRY_SEC - 1))
-        self.assertTrue(ask.claim_pointer(m, req.id, t + ask.POINTER_CLAIM_RETRY_SEC),
-                        "retried one window after first sight, not a year later")
+        first = ask.claim_pointer(m, req.id, t)
+        cases = [  # (pass time, claim expected?, credited after the pass, why)
+            (t + 150, False, 150.0, "one step"),
+            (t + 299, False, 299.0, "W - 1"),
+            (t + 298, False, 299.0, "1 s back: no steal, no credit"),
+            (t + 299, False, 299.0, "catch-up: no double credit"),
+            (t + 300, True, 0.0, "W: a new claim, a new lease"),
+            (t + 299, False, 0.0, "1 s back after the renewal: the fresh claim is kept"),
+            (t + 300 + 150, False, 150.0, "the renewed claim counts from its own start"),
+        ]
+        tokens = [first]
+        for now, takes, credited, why in cases:
+            with self.subTest(why=why):
+                got = ask.claim_pointer(m, req.id, now)
+                self.assertEqual(bool(got), takes)
+                if got:
+                    tokens.append(got)
+                self.assertEqual(m.get(req.id).subject["pointer_lease"]["elapsed"], credited)
+        self.assertEqual(len(set(tokens)), 2, "exactly one replacement")
+
+    def test_a_claim_stamped_just_under_a_window_ahead_is_never_replaced_on_sight(self):
+        ws, m, req, q = self._live()
+        t = req.created_at + ask.CARD_POINTER_GRACE_SEC + 10
+        self.assertTrue(ask.claim_pointer(m, req.id, t + ask.POINTER_CLAIM_RETRY_SEC - 1))
+        for now in (t, t + 150, t + ask.POINTER_CLAIM_RETRY_SEC - 1):
+            self.assertIsNone(ask.claim_pointer(m, req.id, now))
+        self.assertEqual(m.get(req.id).subject["pointer_lease"]["elapsed"], 0.0)
 
     def test_a_card_posted_after_the_claim_and_before_the_write_gets_no_pointer(self):
         ws, m, req, q = self._live()
@@ -734,12 +763,13 @@ class CrashBoundaries(unittest.TestCase):
         self.child(f"with mock.patch.object(ask, 'write_proactive', side_effect=lambda *a, **k: os._exit(17)):\n"
                    f"    ask.send_card_pointers([{q!r}], ws, now={now!r}, host='h')")
         subject = _manager(self.ws).get(req.id).subject
-        self.assertEqual((subject.get("pointer_claim_at"), subject.get("pointer_sent_at")), (now, None))
+        self.assertEqual((subject.get("pointer_lease"), subject.get("pointer_sent_at")),
+                         ({"observed_at": now, "elapsed": 0.0}, None), "the claim and its lease landed before the death")
         self.assertEqual([n for n in _proactive(self.ws) if "pointer" in n], [])
-        inside = now + ask.POINTER_CLAIM_RETRY_SEC - 1
-        out_before = subprocess.run([sys.executable, "-c", self.pointer_child(q, inside)], env=self.env,
-                                    capture_output=True, text=True, timeout=120)
-        self.assertEqual(out_before.stdout.strip(), "0", "not retried inside the claim window")
+        for inside in (now + ask.POINTER_MAX_STEP_SEC, now + ask.POINTER_CLAIM_RETRY_SEC - 1):
+            out_before = subprocess.run([sys.executable, "-c", self.pointer_child(q, inside)], env=self.env,
+                                        capture_output=True, text=True, timeout=120)
+            self.assertEqual(out_before.stdout.strip(), "0", "not retried inside the claim window")
         later = now + ask.POINTER_CLAIM_RETRY_SEC
         retried = subprocess.run([sys.executable, "-c", self.pointer_child(q, later)], env=self.env,
                                  capture_output=True, text=True, timeout=120)
@@ -757,6 +787,8 @@ class CrashBoundaries(unittest.TestCase):
             env=self.env, capture_output=True, text=True, timeout=120)
         self.assertEqual(failed.returncode, 17, failed.stderr[-1500:])
         self.assertIsNone(_manager(self.ws).get(req.id).subject.get("pointer_sent_at"))
+        subprocess.run([sys.executable, "-c", self.pointer_child(q, now + ask.POINTER_MAX_STEP_SEC)],
+                       env=self.env, capture_output=True, text=True, timeout=120)
         retried = subprocess.run([sys.executable, "-c", self.pointer_child(q, now + ask.POINTER_CLAIM_RETRY_SEC)],
                                  env=self.env, capture_output=True, text=True, timeout=120)
         self.assertEqual(retried.stdout.strip(), "1", retried.stderr[-1500:])
