@@ -27,9 +27,10 @@ import uuid
 from pathlib import Path
 
 from ... import _dirs, connect_bridge as cb, connect_common as cm, task_io
-from ...connect_bridge import (DECLARATION, EXTERNAL, STATUS_MAX_AGE_S, UNIT, bridge_env, bridge_home,  # noqa: F401
-                               bridge_mode, bridge_state, install_identity, kept_token, launch_env, seat_env, seat_file,
-                               served_elsewhere, statuses, url_vault_key, vault_key, worker_name)
+from ...connect_bridge import (DECLARATION, EXTERNAL, SEAT_ENV_KEEP, STATUS_MAX_AGE_S, UNIT, bridge_env,  # noqa: F401
+                               bridge_home, bridge_mode, bridge_state, install_identity, kept_token, launch_env,
+                               seat_child_env, seat_env, seat_file, served_elsewhere, statuses, url_vault_key,
+                               vault_key, worker_name)
 from ...connect_common import EXIT_CHILD_HELD, EXIT_HELD, EXIT_UNUSABLE, _v  # noqa: F401
 from ... import claude_local_accepter as accepter, claude_local_card as card, claude_local_records as records
 from . import detector, hmac_policy, hold, inbox, launcher, trust

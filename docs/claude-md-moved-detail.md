@@ -95,7 +95,8 @@ Current contents (the protection is DIRECTORY-level — everything under
 `state/auth/` is exempt, including additions after this list):
 - `cloud-auth.json` — per-host cloud-side auth credentials
 - `device.json` — per-host device identity (UUID + provisioning metadata)
-- `ag2space.json` — enrolled agent identity (stand_id source)
+- `ag2space.json` — enrolled agent identity (a stand_id source, beside the ag2space
+  channel `.env`; `agent_identity.host_enrolled` sets stand_id only when they agree)
 - `stand.json` — Stand record + OwnerBinding (owner-confirmed, 2026-08-23)
 - `entrance-links.json` — verified EntranceLink records (I2)
 - `task-hmac.key` — task-envelope trust root
