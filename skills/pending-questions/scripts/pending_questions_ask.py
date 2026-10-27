@@ -160,19 +160,28 @@ def claim_pointer(manager, card_id: str, now: float) -> Optional[str]:
         if subject.get("pointer_sent_at") or now - req.created_at < CARD_POINTER_GRACE_SEC:
             return None
         claimed_at = float(subject.get("pointer_claim_at") or 0)
-        if claimed_at and claimed_at <= now < claimed_at + POINTER_CLAIM_RETRY_SEC:
-            return None
+        if claimed_at and now < claimed_at + POINTER_CLAIM_RETRY_SEC:
+            return None  # fresh, or stamped in the future by a clock that has since gone back
         token = os.urandom(8).hex()
         req.subject = {**subject, "pointer_claim_at": now, "pointer_claim": token}
         manager.store.save(req)
         return token
 
 
+def _pointer_owed(manager, card_id: str, token: str):
+    """The live, unposted card this claim still holds; None otherwise. Call under the store lock."""
+    req = manager.get(card_id)
+    if req is None or req.terminal or (req.subject or {}).get("pointer_claim") != token:
+        return None
+    return None if manager.store.projection(card_id).get("revision", 0) > 0 else req
+
+
 def mark_pointer_sent(manager, card_id: str, token: str, now: float) -> None:
-    """Record the pointer as sent, under the store lock, for the claim that published it."""
+    """Record the pointer as sent, under the store lock, for the claim that published it. A card
+    settled or archived meanwhile is left as it is: saving it would revive a terminal record."""
     with manager.store.locked():
         req = manager.get(card_id)
-        if req is not None and (req.subject or {}).get("pointer_claim") == token:
+        if req is not None and not req.terminal and (req.subject or {}).get("pointer_claim") == token:
             req.subject = {**(req.subject or {}), "pointer_sent_at": now}
             manager.store.save(req)
 
@@ -185,7 +194,11 @@ def send_card_pointers(questions, workspace: Path, now: Optional[float] = None, 
     marked sent (`pointer_sent_at`). A claim with no sent mark older than POINTER_CLAIM_RETRY_SEC
     (its claimant died or failed to publish) is claimed again and retried: at-least-once, so a
     death between the publish and the sent mark can deliver it twice. Overlapping reminders queue
-    one pointer per claim. Never raises: [(ask_id, proactive file | error)]."""
+    one pointer per claim. Just before the file is written the card is re-checked under the store
+    lock (still live, unposted, this claim's); the projector records a post only after its send
+    returns, so a pointer can still meet a card whose send is in flight — bounded by one projector
+    send, and the pointer says only that the card may not have arrived. Never raises:
+    [(ask_id, proactive file | error)]."""
     now = time.time() if now is None else now
     out = []
     for q in questions:
@@ -200,8 +213,11 @@ def send_card_pointers(questions, workspace: Path, now: Optional[float] = None, 
             if token is None:
                 continue
             name = proactive_filename(f"{q.get('ask_id') or c[0]}-pointer", None)
-            write_proactive(Path(workspace) / "results", name, card_pointer_body(q.get("title", ""),
-                                                                               host or host_label()))
+            with manager.store.locked():  # re-checked and written as one step against the store
+                if _pointer_owed(manager, c[0], token) is None:
+                    continue  # posted, settled or re-claimed since the claim: no pointer
+                write_proactive(Path(workspace) / "results", name, card_pointer_body(q.get("title", ""),
+                                                                                   host or host_label()))
             mark_pointer_sent(manager, c[0], token, now)
             out.append((q.get("ask_id"), name))
         except Exception as e:  # noqa: BLE001

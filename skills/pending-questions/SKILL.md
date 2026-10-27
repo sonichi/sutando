@@ -116,8 +116,12 @@ exactly the options as given, with no Approve — and `subject.choices` holding 
   (`POINTER_CLAIM_RETRY_SEC`) — its claimant died or failed to publish — is claimed again and
   retried. So the pointer is at-least-once: overlapping reminders queue one per claim, a death
   before the publish is retried later, and a death between the publish and the sent mark can
-  deliver it twice. A post that lands after the claim and before the file can still meet a
-  pointer that says it may not have arrived. The pointer says the question waits as a card in
+  deliver it twice. A claim stamped in the future (the clock went back) stays fresh until its
+  window passes. Just before the file is written the card is re-checked under the store lock
+  (live, unposted, still this claim's), so a post recorded after the claim cancels the pointer;
+  the gateway records a post only after its send returns, so the one window left is a send in
+  flight — bounded by one projector send, and the pointer then only says the card may not have
+  arrived. Marking a pointer sent never touches a settled or archived card. The pointer says the question waits as a card in
   his AG2 Space DM and may not have arrived, and quotes its title, with no options, no approve
   wording, and a note that a reply does not answer it. Only a card that is gone leaves the
   question due for text. Nothing is scheduled: all of this happens when the reminder runs.

@@ -427,6 +427,55 @@ class CardPointer(unittest.TestCase):
         dv.assert_not_called()
 
 
+class PointerEdges(unittest.TestCase):
+    def _live(self):
+        ws = _ws("ag2space")
+        m = _manager(ws)
+        out = _ask("Merge #7?", workspace=ws, host="h", default_action="merge it", options=OPTIONS, manager=m)
+        req = m.get(out["card"])
+        return ws, m, req, {"ask_id": out["ask_id"], "title": "Merge #7?", "body": out["sent_line"]}
+
+    def test_marking_sent_never_revives_a_settled_or_archived_card(self):
+        ws, m, req, q = self._live()
+        token = ask.claim_pointer(m, req.id, req.created_at + ask.CARD_POINTER_GRACE_SEC)
+        m.resolve(req.id)
+        self.assertTrue(m.store.archive(req.id))
+        ask.mark_pointer_sent(m, req.id, token, req.created_at + ask.CARD_POINTER_GRACE_SEC + 1)
+        self.assertFalse(m.store._path(req.id).exists(), "the archived card is not written back live")
+        self.assertIsNone(m.get(req.id).subject.get("pointer_sent_at"))
+
+    def test_a_terminal_card_is_not_marked_either(self):
+        ws, m, req, q = self._live()
+        token = ask.claim_pointer(m, req.id, req.created_at + ask.CARD_POINTER_GRACE_SEC)
+        m.cancel(req.id)
+        before = m.get(req.id).revision
+        ask.mark_pointer_sent(m, req.id, token, req.created_at + ask.CARD_POINTER_GRACE_SEC + 1)
+        self.assertEqual(m.get(req.id).revision, before)
+        self.assertIsNone(m.get(req.id).subject.get("pointer_sent_at"))
+
+    def test_a_clock_that_went_back_cannot_steal_a_fresh_claim(self):
+        ws, m, req, q = self._live()
+        t = req.created_at + ask.CARD_POINTER_GRACE_SEC + 10
+        self.assertTrue(ask.claim_pointer(m, req.id, t))
+        self.assertIsNone(ask.claim_pointer(m, req.id, t - 1), "a claim from the future is fresh")
+        self.assertIsNone(ask.claim_pointer(m, req.id, t - 5000))
+        self.assertTrue(ask.claim_pointer(m, req.id, t + ask.POINTER_CLAIM_RETRY_SEC), "stale once its window passes")
+
+    def test_a_card_posted_after_the_claim_and_before_the_write_gets_no_pointer(self):
+        ws, m, req, q = self._live()
+        real = ask.claim_pointer
+
+        def claim_then_post(mgr, card_id, now):
+            token = real(mgr, card_id, now)
+            mgr.record_projection(card_id, mgr.get(card_id).revision, "$posted")  # the projector's ledger
+            return token
+        with mock.patch.object(ask, "claim_pointer", claim_then_post):
+            self.assertEqual(ask.send_card_pointers([q], ws, now=req.created_at + ask.CARD_POINTER_GRACE_SEC,
+                                                    manager=m, host="h"), [])
+        self.assertEqual([n for n in _proactive(ws) if "pointer" in n], [])
+        self.assertIsNone(m.get(req.id).subject.get("pointer_sent_at"))
+
+
 class ReminderNeverTextsACard(unittest.TestCase):
     def _rem(self):
         spec = importlib.util.spec_from_file_location("pq_remind_f", PQ / "pending_questions_remind.py")
