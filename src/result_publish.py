@@ -13,7 +13,7 @@ two publishers of one name never rename each other's bytes. Shell writers use
 the CLI: `python3 src/result_publish.py <path>` with the body on stdin.
 
 The CLI refuses a `source: cron` task's result that names no destination and
-carries no skip marker: no bridge routes it, so it would be archived unsent.
+carries no skip marker: no bridge routes it, a `[channel:]` redirect included, so it would be archived unsent.
 Owner-facing cron output goes through deliver-owner-dm.py instead;
 `--allow-undeliverable` publishes anyway.
 """
@@ -126,8 +126,8 @@ def undeliverable_reason(path: str | Path, text: str) -> str | None:
         return None
     if any((headers.get(k) or "").strip() for k in ("channel_id", "chat_id")):
         return None
-    actions = markers.parse_markers(text).actions
-    if markers.has_skip_action(actions) or any(a.kind == "redirect" for a in actions):
+    # A [channel:] redirect does not count: no consumer reads a channel-less cron result to see it.
+    if markers.has_skip_action(markers.parse_markers(text).actions):
         return None
     return f"{task_id} is a cron task with no channel_id or chat_id"
 

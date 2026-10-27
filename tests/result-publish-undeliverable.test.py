@@ -2,8 +2,8 @@
 """result_publish.py refuses a cron task's result that no bridge would deliver.
 
 A `source: cron` task with no channel_id/chat_id has no consumer, so a plain body
-is archived unsent. The CLI refuses it (exit 2, nothing written) unless the body
-is a skip marker or redirect, the task names a destination, the result is not in
+is archived unsent, even with a [channel:] redirect. The CLI refuses it (exit 2,
+nothing written) unless the body is a skip marker, the task names a destination, the result is not in
 the canonical workspace's results/, or the caller passes --allow-undeliverable.
 A missing or unreadable task file, or a helper that will not import, publishes.
 
@@ -79,9 +79,22 @@ class RefuseUndeliverable(unittest.TestCase):
         self.assertEqual(proc.returncode, 2, proc.stderr)
         self.assertFalse(target.exists())
 
-    def test_skip_markers_and_redirect_publish(self):
+    def test_bare_redirect_on_channel_less_cron_task_is_refused(self):
+        self._task("task-cron-redirect", CRON_TASK)
+        proc, target = self._publish("task-cron-redirect", "[channel: 1234567890]\nreport\n")
+        self.assertEqual(proc.returncode, 2, proc.stderr)
+        self.assertFalse(target.exists())
+
+    def test_redirect_on_routed_task_publishes(self):
+        self._task("task-cron-redirect-routed", ROUTED_TASK)
+        body = "[channel: 1234567890]\nreport\n"
+        proc, target = self._publish("task-cron-redirect-routed", body)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(target.read_text(encoding="utf-8"), body)
+
+    def test_skip_markers_publish(self):
         for i, body in enumerate(("[no-send] delivered via owner DM\n", "[REPLIED] posted\n",
-                                  "[deduped: task-other-1]\n", "[channel: 1234567890]\nreport\n")):
+                                  "[deduped: task-other-1]\n")):
             with self.subTest(body=body):
                 tid = f"task-cron-hourly-skip{i}"
                 self._task(tid, CRON_TASK)
@@ -130,7 +143,8 @@ class RefuseUndeliverable(unittest.TestCase):
         cases = [
             (res / "task-cron-a.txt", "report\n", True),
             (res / "task-cron-a.txt", "[no-send] x\n", False),
-            (res / "task-cron-a.txt", "[channel: 1234567890]\nreport\n", False),
+            (res / "task-cron-a.txt", "[channel: 1234567890]\nreport\n", True),
+            (res / "task-cron-routed.txt", "[channel: 1234567890]\nreport\n", False),
             (res / "task-cron-routed.txt", "report\n", False),
             (res / "task-chat-b.txt", "report\n", False),
             (res / "task-cron-missing.txt", "report\n", False),
