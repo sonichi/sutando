@@ -339,6 +339,11 @@ class RoomDbStore:
     def insert(self, q: Question, sent_line: str) -> dict:
         return self.insert_raw(q.ask_id, q.question, question_body(q, sent_line), q.priority)
 
+    def redeliver(self, q: Question, sent_line: str) -> None:
+        """Rewrite this row's body with a new delivery record, in one body write under `lock`."""
+        rid = self._rid(q.ask_id)
+        self._locked(lambda: self.client.set_body(DB_SCHEMA, rid, question_body(q, sent_line)))
+
     def complete(self, ask_id: str) -> bool:
         """The row is present, carries this exact ask id (and this host), has a body and no
         incomplete mark: the confirmation an outbox entry is deleted on."""
@@ -379,11 +384,13 @@ class RoomDbStore:
     def _tag(self, value: str) -> str:
         return f"{value}@{self.host}" if self.host else value
 
-    def close(self, ask_id: str, to: str) -> None:
-        """Record a closure made by code in the Closed cell; Status stays the owner's."""
+    def close(self, ask_id: str, to: str, require_open: bool = False) -> None:
+        """Record a closure made by code in the Closed cell; Status stays the owner's.
+        `require_open`: an owner's terminal Status refuses the close in the same guarded write."""
         if to not in TERMINAL:
             raise StoreError(f"code only closes a row; {to!r} is not Answered or Resolved")
-        self._guarded(ask_id, {"closed": self._tag(to)}, {"closed": [None]})
+        expect = {"closed": [None], **({"status": OPEN_RAW} if require_open else {})}
+        self._guarded(ask_id, {"closed": self._tag(to)}, expect)
 
     def clear(self, ask_id: str, props: list) -> None:
         """Remove stale code marks from this host's row; Status is not touched."""

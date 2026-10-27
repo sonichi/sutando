@@ -16,7 +16,8 @@ its held entry; a held entry with no row waits (not yet in the room), or is done
 locally; a local close naming neither is `pending_close`. `unavailable: True` and `done: None`
 when the room cannot be read — never a zero. `reconcile_pass(workspace)` is the explicit pass
 (outbox replay, local closes, stale marks, the transitional legacy ingest, the history
-backfill); `ask_owner` queues and holds its new question before room work, then reconciles after
+backfill); `ask_owner` asks (a decision card when options or a default are given and the question
+is bound for AG2 Space, else text), holds its new question before room work, then reconciles after
 its row is confirmed, and writes no row when
 the outbox could not hold the question; a confirmed row commits the history marker BEFORE
 its outbox entry is deleted, and keeps the entry when that commit fails. `resolve` closes
@@ -24,7 +25,8 @@ the row (committing the history marker first when the row is in view and the mar
 a marker that cannot be written leaves the row open and records the close locally), else
 records the closure locally for the next reconcile — only for a question held in the outbox,
 or in outage mode once a row of this workspace was ever confirmed; an unknown id with neither
-is refused and changes no count. `remind` is the reminder.
+is refused and changes no count. `clicks` closes, through `resolve`, the row of each question
+card the owner clicked and returns the decisions. `remind` is the reminder.
 
 `serve` answers one pending_questions_store.DbClient request (JSON on stdin) over
 one connection to the room's databases document, writing only the DATABASE.md
@@ -66,6 +68,10 @@ SETTLE_SEC = 1.0
 ROOM_KEY = "PENDING_QUESTIONS_ROOM"
 # The collab service URL; set, it overrides the capability's own resolution (an outage rehearsal).
 URL_KEY = "PENDING_QUESTIONS_COLLAB_URL"
+# `resolve`'s answer when the room saw the row and refused the close (closed already, no such row).
+REFUSED_PREFIX = "room database: not changed"
+# The refusal when only a code Closed mark (no owner Status) closed the row.
+CODE_CLOSED_PREFIX = REFUSED_PREFIX + " (closed by code)"
 
 
 def skill_scripts(workspace: Path) -> Optional[Path]:
@@ -267,7 +273,25 @@ def _close_locally(ws: Path, ask_id: str, status: str, why: str, basis: Optional
     return True, f"recorded locally as {status} in {p} ({why}; {basis}); the next reconcile applies it to the row"
 
 
-def resolve(workspace: Path, ask_id: str, status: str) -> tuple:
+def resolve(workspace: Path, ask_id: str, status: str, manager=None) -> tuple:
+    """`_close_row`, then the question's card is retired once the row is closed (or recorded
+    closed) or the room refuses the close, so no later click can read as a decision."""
+    ok, msg = _close_row(workspace, ask_id, status)
+    if ok or msg.startswith(REFUSED_PREFIX):
+        try:
+            if manager is None:
+                from hitl.cards import manager_for  # noqa: PLC0415
+                manager = manager_for(Path(workspace))
+            gone = core_ask.retire_cards(manager, ask_id)
+        except Exception as e:  # noqa: BLE001 — the row's close stands; a live card is only reported
+            msg += f"; its decision card could not be retired ({type(e).__name__}: {e})"
+        else:
+            if gone:
+                msg += f"; decision card {', '.join(gone)} retired"
+    return ok, msg
+
+
+def _close_row(workspace: Path, ask_id: str, status: str, require_open: bool = False) -> tuple:
     """(closed, message): the row's Closed cell takes `status` (Answered or Resolved) after a
     reconcile files any held question; a store that cannot be written leaves a local close
     record instead. A row in view before the history marker was ever committed commits it
@@ -287,12 +311,14 @@ def resolve(workspace: Path, ask_id: str, status: str) -> tuple:
                     Outbox(ws).commit_history(ask_id)
                 except StoreError as e:
                     return _close_locally(ws, ask_id, status, f"room database: left open — {e}", "its row is in view")
-            store.close(ask_id, status)
+            store.close(ask_id, status, require_open=require_open)
             return True, f"room database: {ask_id} -> {status} in {store.where(ask_id)}"
     except GuardFailed as g:
         if not g.current and any(e["ask_id"] == ask_id for e in Outbox(ws).entries()):
             return _close_locally(ws, ask_id, status, "its held entry has no row yet")
-        return False, f"room database: not changed — {type(g).__name__}: {g}"
+        owner = g.current.get("status") in TERMINAL
+        prefix = CODE_CLOSED_PREFIX if g.current.get("closed") and not owner else REFUSED_PREFIX
+        return False, f"{prefix} — {type(g).__name__}: {g}"
     except Exception as e:  # noqa: BLE001
         return _close_locally(ws, ask_id, status, f"room database unreachable ({type(e).__name__}: {e})")
 
@@ -304,7 +330,7 @@ def ask_owner(question: str, context: Optional[str] = None, urgency: str = "live
               host: Optional[str] = None, now: Optional[float] = None, store=None,
               default_action: Optional[str] = None, reason: Optional[str] = None,
               options=(), priority: str = "Medium") -> dict:
-    """Queue (core), hold, row, bounded reconcile, notify — each step reported, none raising past here.
+    """Hold (core), row, card or text, bounded reconcile, notify — each step reported, none raising.
     `store` is this adapter's store; None leaves the question in the outbox. No outbox record,
     no row: the question is still queued to the owner, and the report says it was not held. A
     confirmed row commits the store-history marker, then releases its outbox entry; a marker
@@ -324,7 +350,7 @@ def ask_owner(question: str, context: Optional[str] = None, urgency: str = "live
                                   default_action, reason, options, priority)
     out.update({"reconcile": rec, "record": None, "db_error": out["outbox_error"], "link": link,
                 "macos": None, "macos_fix": None, "history_error": None})
-    if out["proactive_file"] and intro:
+    if (out["proactive_file"] or out["card"]) and intro:
         try:
             mark_room_introduced(ws, out["ask_id"])
         except OSError as e:
@@ -346,6 +372,13 @@ def ask_owner(question: str, context: Optional[str] = None, urgency: str = "live
                     out["history_error"] = f"{type(e).__name__}: {e}"
             else:
                 out["record"] = f"outbox {out['outbox']}"
+        # only now: the outbox, and the row when it landed, name it
+        row_landed = bool(out["record"]) and not str(out["record"]).startswith("outbox ")
+        if core_ask.create_card(out) == core_ask.CARD_NOT_STORED and row_landed:
+            try:
+                store.redeliver(Question.from_dict(out["question"]), out["sent_line"])
+            except Exception as e:  # noqa: BLE001 — the row names an absent card: the reminder texts again
+                out["db_error"] = f"row delivery record not rewritten ({type(e).__name__}: {e})"
         if out["record"] is not None and out["outbox"] is None:
             try:
                 rec = reconcile_pending(store, ws, host)
@@ -355,6 +388,82 @@ def ask_owner(question: str, context: Optional[str] = None, urgency: str = "live
     if urgency == "live":
         out["macos"], out["macos_fix"] = core_ask.notify_macos(f"Question: {question}")
     return out
+
+
+def _close_for_click(ws: Path, ask_id: str, status: str) -> tuple:
+    return _close_row(ws, ask_id, status, require_open=True)
+
+
+def _clicks_lock(manager):
+    from file_lock import locked_file  # noqa: PLC0415
+    return locked_file(Path(manager.store.root).parent / "pending-questions-clicks.lock", create_mode=0o600)
+
+
+def _claim_token() -> str:
+    return f"{os.getpid()}:{os.urandom(6).hex()}"
+
+
+def clicks(workspace: Path, manager=None, closer=None) -> list:
+    """Close the row of every question card the owner clicked (Answered); the card stays claimed
+    until `ack_click`, so a run that dies before the core acts replays the same choice.
+    The whole pass runs under one exclusive lock beside the HITL store, so two readers never act
+    on the same snapshot. The claim (`closing`, a pid:nonce token) is stamped on the card BEFORE
+    the close: a run that dies between the close and its `row_closed` stamp finds the row closed
+    by code and replays the choice. Under the lock any existing claim is this click's own, from a
+    run that did not finish: it is replayed, never skipped (a pid can be reused or unsignalable).
+    One dict per click, oldest first, with `closed`, `close_message` and the flags the core reads:
+    `stale` — the row was closed already, by the owner's own Status or by code without this
+    click's claim (one guarded write), so the click is NOT a decision and its card is cancelled;
+    `replay` — this click closed its row on an earlier run and was not acknowledged;
+    `reported_before` — the core acknowledged this choice but its row is not closed yet (the
+    close is retried each run). Only `ack_click` marks a choice as handed over."""
+    ws = Path(workspace)
+    if manager is None:
+        from hitl.cards import manager_for  # noqa: PLC0415
+        manager = manager_for(ws)
+    closer = closer or _close_for_click
+    out = []
+    with _clicks_lock(manager):
+        for click in core_ask.answered_cards(manager):
+            if click["row_closed"]:
+                out.append({**click, "closed": True, "stale": False, "replay": True,
+                            "close_message": "closed by this click on an earlier run; not acknowledged yet"})
+                continue
+            claimed = bool(click["closing"])
+            core_ask.stamp_card(manager, click["hitl_id"], closing=_claim_token())
+            ok, msg = closer(ws, click["ask_id"], "Answered")
+            replay = not ok and claimed and msg.startswith(CODE_CLOSED_PREFIX)
+            stale = not ok and not replay and msg.startswith(REFUSED_PREFIX)
+            if ok and click["reported_before"]:
+                manager.resolve(click["hitl_id"])  # acknowledged earlier: the late close settles it
+            elif ok or replay:
+                core_ask.stamp_card(manager, click["hitl_id"], row_closed=True)
+            elif stale:
+                manager.cancel(click["hitl_id"])
+            out.append({**click, "closed": ok or replay, "stale": stale, "replay": replay, "close_message": msg})
+    return out
+
+
+def ack_click(workspace: Path, ask_id: str, manager=None) -> tuple:
+    """(done, message): the core acted on this question's choice. A card whose row is closed is
+    settled; one whose close is still pending is marked acknowledged, so later runs retry the
+    close without presenting the choice again."""
+    if manager is None:
+        from hitl.cards import manager_for  # noqa: PLC0415
+        manager = manager_for(Path(workspace))
+    done = []
+    with _clicks_lock(manager):
+        for c in core_ask.answered_cards(manager):
+            if c["ask_id"] != ask_id or c["reported_before"]:
+                continue
+            if c["row_closed"]:
+                manager.resolve(c["hitl_id"])
+            else:
+                core_ask.stamp_card(manager, c["hitl_id"], reported=True)
+            done.append(c["hitl_id"])
+    if not done:
+        return False, f"no claimed click for {ask_id} to acknowledge"
+    return True, f"acknowledged {ask_id} ({', '.join(done)})"
 
 
 def report_lines(out: dict) -> list:

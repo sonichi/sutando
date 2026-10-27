@@ -26,6 +26,7 @@ python3 skills/pending-questions/scripts/pq.py list [--json]
 python3 skills/pending-questions/scripts/pq.py reconcile
 python3 skills/pending-questions/scripts/pq.py resolve <ask-id> [--answered]
 python3 skills/pending-questions/scripts/pq.py remind [--force]
+python3 skills/pending-questions/scripts/pq.py clicks [--json]
 ```
 
 **Trigger: any time you would write a question for the owner into terminal or summary text, file
@@ -76,6 +77,68 @@ count (`python3 src/pending_questions_reader.py summary`).
 - `remind` is the only way a reminder is sent (`src/check-pending-questions.py --notify`
   with this skill's adapter). Nothing is scheduled, and no pass surfaces questions: the
   owner is asked once, as questions come up, and reminded when he asks.
+
+## Decision cards
+
+A question asked with `--default-action` and/or `--option` whose destination is AG2 Space (its
+task's bridge, else the bridge the owner was last active on) is asked as a decision card, not
+text: `queue_question` creates a `choice` HITL request (`src/hitl/cards.py`, the one builder every
+card producer uses) with runtime `pending-questions`, guard and `subject.ask_id` set to the ask id,
+`turn_on_action`, and one button per choice: with a default, one per `ordered_options()` entry
+(Approve first, carrying the default); with options alone, exactly the options as given, with no
+Approve. The ask is ordered so that no card exists without a durable question: the card is built
+and its id allocated, the question is held in the outbox and its row is written, both naming that
+id (`**Sent:** card hitl_… for ag2space owner-dm (decision card) at …`), and only then is the card
+stored for the AG2 Space gateway to post in the owner's DM. A process that dies before the card is
+stored leaves the held question and no card; one that dies after leaves both. The ask reports
+`stored, not yet shown: decision card hitl_…` — storing is not showing. Once a card exists, no
+text is sent for that question. Text is the ask only when the card cannot be built, the question
+cannot be held (then no card is stored at all), or the card is provably not stored; and for every
+other bridge (only that gateway projects cards). `create_card` returns stored, not stored or
+unknown: a store that raised but whose card file is there (a save that failed after its rename) is
+stored, and one that cannot be checked is unknown; both are kept as the card, with no text. On a
+definite failure the text goes to the question's own destination with its link, and then the
+outbox entry and the row are rewritten to name that file (the row through the store's one body
+write), so the next reminder sees a drained text, not an absent card. A death between the text
+and the rewrite leaves a record naming an absent card, which the reminder reads as due: the
+owner may be texted twice, never not at all.
+
+The limit: nothing here can see the DM. If the gateway never posts the card (it is down, or skips
+it), the owner is not asked by this skill until he reads the card: the reminder never sends text
+while the question's card is live (pending or clicked), posted or not, nor when the store cannot
+say. The card's own follow-ups are the HITL renotify's. When the gateway posted it, the question's
+last-asked time is the gateway's `notified_at`. A live card with no post recorded 30 minutes
+(`CARD_POINTER_GRACE_SEC`) after it was stored gets a text pointer when the reminder runs, once
+per card (recorded on the card, so a gateway that stays down is not repeated): it says the question is waiting as a card in his AG2 Space DM and may not
+have arrived, and quotes the question's title. It carries no options and no approve wording, and
+says a reply does not answer it; the card stays the only place he chooses. Only a card that is gone (never stored, or settled
+without closing the row) leaves the question due, and the reminder then texts it, when it runs;
+nothing is scheduled.
+
+The click is owner-checked and recorded by the bridge (`chosen_action`), and with `turn_on_action`
+the same relay task reaches the core headed `hitl_click: true`, its body the button label. That
+header is how the core recognises it: it runs `python3 src/pending_questions_reader.py clicks`
+(`pq.py clicks` is the same), which reaches this adapter's `clicks`. For every `pending-questions`
+card in progress with a chosen action it closes the row as Answered in one guarded write that also
+requires the owner's Status to be open (a room outage records the close locally like any other
+close), and prints `[<ask-id>] chose <action-id> '<label>' -> <consequence>` from the card's own
+record. The core acts only on `chose` lines, then runs `… ack <ask-id>` and answers `[no-send]`;
+until the ack the card stays claimed, so a run that dies before the core acted replays the same
+choice (`(replayed: not acknowledged yet)`) rather than losing it. The claim (`closing`) is stamped
+on the card before the row is closed, so a run that dies between the close and its record finds
+the row closed by code, not by the owner, and replays the choice instead of calling it stale.
+`clicks` and `ack` run under one exclusive lock beside the HITL store
+(`state/hitl/pending-questions-clicks.lock`), and the claim is a `pid:nonce` token. Under that lock
+any claim already on a card is a run that did not finish: it is replayed, never skipped (a pid can
+be reused, or unsignalable).
+
+A click on a row already closed, by code or by the owner's own Status, is reported as "already
+answered — not a decision" (`stale`) and its card is cancelled. A close that could not be recorded
+at all still prints the choice, every run, until the core acks it; after the ack, later runs only
+retry the close and print "acknowledged before, not a new decision". Nothing marks a choice as
+handed over before the core has it: only the ack does. `resolve` retires (cancels) the question's card whenever it closes the row or the room
+refuses the close. A Status the owner sets on the row himself does not retire the card (reconcile
+does not touch cards); a later click on it is reported stale. 
 
 ## The outbox
 

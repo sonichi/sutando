@@ -12,6 +12,14 @@ here is the whole ask and the outbox is the record.
 
 Question and context text is embedded, never interpolated: result markers are
 neutralized (`[ file:`), so no text can become a drain action.
+
+A question with a default or options that is bound for AG2 Space is asked as a decision card
+instead (`hitl.cards`; guard = ask id). Order: the card is built and its id pre-allocated, the
+question is held (outbox, then the caller's row) naming that id, and only then is the card stored
+(`create_card`), so no card ever exists without a durable question. Once a card exists no text is
+sent; text is the ask only when the card cannot be built or stored. Nothing here sees the DM, so
+the reminder counts a card as sent only once the gateway recorded it as posted. `answered_cards`
+reads back the clicks the bridge applied, so the adapter can close each row.
 """
 from __future__ import annotations
 
@@ -33,16 +41,26 @@ for _p in (REPO / "src", HERE):
         sys.path.insert(0, str(_p))
 from local_record import new_name, write_text_whole
 from pending_questions_outbox import Outbox, one_line_title
-from proactive_routing import BRIDGE_CHANNELS, proactive_filename
+from proactive_routing import BRIDGE_CHANNELS, proactive_filename, should_claim_proactive
 from result_markers import neutralize_markers
 from undelivered_quarantine import quarantine_dir
 from util_paths import host_label
 
+# The HITL runtime of a question's card; its guard is the ask id.
+CARD_RUNTIME = "pending-questions"
+# The only bridge that projects HITL cards (to the owner's DM).
+CARD_BRIDGE = "ag2space"
+# A live card with no post recorded this long after it was stored gets one text pointer, ever.
+CARD_POINTER_GRACE_SEC = 1800
 # A question queued and drained this recently is not re-raised by the reminder.
 SENT_QUIET_SEC = 3600
 # Grammar of the queue record; the reminder reads it back.
 SENT_RE = re.compile(
     r"^\*\*Sent:\*\*\s+queued\s+(?P<where>.*?)\s+via\s+(?P<file>proactive-\S+\.txt)\s+at\s+"
+    r"(?P<ts>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)\s*$", re.MULTILINE)
+# Grammar of a card record; whether the card was shown is the HITL store's to say.
+CARD_SENT_RE = re.compile(
+    r"^\*\*Sent:\*\*\s+card\s+(?P<card>hitl_\S+)\s+for\s+.*?\s+at\s+"
     r"(?P<ts>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)\s*$", re.MULTILINE)
 # Bridges whose drain honours a `[channel:]` room redirect (telegram drops it).
 _ROOM_MARKER_BRIDGES = frozenset({"discord", "slack", "ag2space"})
@@ -100,9 +118,92 @@ def queued_send(body: str):
     return m.group("file"), ts
 
 
-def sent_at(body: str) -> Optional[float]:
+def card_sent(body: str):
+    """(card id, epoch) of the entry's card record; None without one or with a bad stamp."""
+    m = CARD_SENT_RE.search(body or "")
+    if not m:
+        return None
+    try:
+        ts = datetime.strptime(m.group("ts"), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
+    except ValueError:
+        return None
+    return m.group("card"), ts
+
+
+def card_state(workspace: Path, card_id: str, manager=None) -> tuple:
+    """("live" | "gone" | "unknown", projection): live is a stored card not yet settled; gone is
+    no card, or a settled one; unknown is a store that cannot be read."""
+    try:
+        if manager is None:
+            from hitl.cards import manager_for  # noqa: PLC0415
+            manager = manager_for(Path(workspace))
+        req = manager.get(card_id)
+        if req is None or req.terminal:
+            return "gone", {}
+        return "live", manager.store.projection(card_id)
+    except Exception:  # noqa: BLE001
+        return "unknown", {}
+
+
+def card_posted(workspace: Path, card_id: str, manager=None) -> bool:
+    """The gateway recorded this live card as posted."""
+    state, pj = card_state(workspace, card_id, manager)
+    return state == "live" and pj.get("revision", 0) > 0
+
+
+def sent_at(body: str, workspace: Optional[Path] = None) -> Optional[float]:
+    """When the question last reached the owner: a drained file's queue stamp; for a card, the
+    gateway's last post (`notified_at`) once it posted one, else the record's stamp."""
     q = queued_send(body)
-    return None if q is None else q[1]
+    if q is not None:
+        return q[1]
+    c = card_sent(body)
+    if c is None:
+        return None
+    if workspace is not None:
+        state, pj = card_state(workspace, c[0])
+        if state == "live" and pj.get("notified_at"):
+            return float(pj["notified_at"])
+    return c[1]
+
+
+def card_pointer_body(title: str, host: str) -> str:
+    """A pointer to the card, never a decision surface: no options, nothing a reply answers."""
+    return (f"[dm-only]\nA question from the {host} core is waiting for you as a decision card in your "
+            "AG2 Space DM, and it may not have arrived there.\n\n"
+            f"\u201c{' '.join(neutralize_markers(title or '').split())}\u201d\n\n"
+            "Open that card to choose; a reply to this message does not answer it.\n")
+
+
+def send_card_pointers(questions, workspace: Path, now: Optional[float] = None, manager=None,
+                       host: Optional[str] = None) -> list:
+    """For each question whose card is live, has no post recorded and is older than
+    CARD_POINTER_GRACE_SEC, queue one text pointer to the owner's DM — once per card, recorded
+    durably on the card (`pointer_at`, the store's fsynced save) after the file is queued, so a
+    gateway that stays down is not repeated. Never raises: [(ask_id, proactive file | error)]."""
+    now = time.time() if now is None else now
+    out = []
+    for q in questions:
+        c = card_sent(q.get("body", ""))
+        if c is None:
+            continue
+        try:
+            if manager is None:
+                from hitl.cards import manager_for  # noqa: PLC0415
+                manager = manager_for(Path(workspace))
+            req = manager.get(c[0])
+            if req is None or req.terminal or manager.store.projection(c[0]).get("revision", 0) > 0:
+                continue
+            if (req.subject or {}).get("pointer_at") or now - req.created_at < CARD_POINTER_GRACE_SEC:
+                continue
+            name = proactive_filename(f"{q.get('ask_id') or c[0]}-pointer-{int(now)}", None)
+            write_proactive(Path(workspace) / "results", name, card_pointer_body(q.get("title", ""),
+                                                                               host or host_label()))
+            stamp_card(manager, c[0], pointer_at=now)
+            out.append((q.get("ask_id"), name))
+        except Exception as e:  # noqa: BLE001
+            out.append((q.get("ask_id"), f"FAILED — {type(e).__name__}: {e}"))
+    return out
 
 
 def drained(results_dir: Path, name: str) -> bool:
@@ -128,11 +229,18 @@ def drained(results_dir: Path, name: str) -> bool:
 
 def asked_recently(body: str, results_dir: Path, now: Optional[float] = None,
                    within: float = SENT_QUIET_SEC) -> bool:
-    """Queued within `within` AND drained. An undrained file is not a delivery
-    (the reminder's own contract), so that entry stays due."""
+    """Queued within `within` AND drained; or a card record whose card is still live. An
+    undrained file is not a delivery, so that entry stays due; a live card, posted or not, is
+    the question's one surface, so the reminder never texts beside it (the HITL renotify owns
+    its follow-ups). A card that is gone (never stored, or settled) leaves the entry due."""
+    now = time.time() if now is None else now
     q = queued_send(body)
     if q is None:
-        return False
+        c = card_sent(body)
+        if c is None:
+            return False
+        # A live card (or one the store cannot rule out) is the ask: never text beside it.
+        return card_state(Path(results_dir).parent, c[0])[0] != "gone"
     name, ts = q
     if (time.time() if now is None else now) - ts >= within:
         return False
@@ -178,6 +286,107 @@ def proactive_body(question: str, context: Optional[str], host: str,
     return body, routed
 
 
+def wants_card(default_action: Optional[str], options) -> bool:
+    return bool((default_action or "").strip()) or any(str(a).strip() for a, _ in options or ())
+
+
+def card_reaches_owner(dest: Destination, ws: Path) -> bool:
+    """A card is projected only by the AG2 Space gateway, to the owner's DM: the question must be
+    bound there (its task's bridge, else the bridge the owner was last active on)."""
+    if dest.bridge:
+        return dest.bridge == CARD_BRIDGE
+    return should_claim_proactive(Path(ws) / "state" / "last-owner-activity.json", CARD_BRIDGE)
+
+
+def card_choices(default_action: Optional[str], options) -> list:
+    """(label, consequence) per button: with a default, the row's order (Approve first, carrying it);
+    options alone are the buttons exactly as given, with no Approve the asker never proposed."""
+    from pending_questions_store import ordered_options  # noqa: PLC0415
+    if (default_action or "").strip():
+        return ordered_options(default_action, options)
+    return [(str(a).strip(), str(b).strip()) for a, b in options or () if str(a).strip()]
+
+
+def card_actions(default_action: Optional[str], options) -> list:
+    """(id, label) per button; `approve` only for the Approve that carries a proposed default."""
+    has_default = bool((default_action or "").strip())
+    return [("approve" if has_default and i == 0 else f"option-{i}", label)
+            for i, (label, _) in enumerate(card_choices(default_action, options))]
+
+
+def card_consequences(default_action: Optional[str], options) -> dict:
+    """{action id: what it does}, kept on the card so a click reports the exact consequence."""
+    return {aid: what for (aid, _), (_, what) in zip(card_actions(default_action, options),
+                                                    card_choices(default_action, options))}
+
+
+def card_message(question: str, context: Optional[str], default_action: Optional[str],
+                 reason: Optional[str], options, link: Optional[str] = None,
+                 intro: Optional[str] = None) -> str:
+    parts = [question.strip()]
+    if context and context.strip():
+        parts.append(context.strip())
+    if reason and reason.strip() and (default_action or "").strip():
+        parts.append(f"Why Approve: {reason.strip()}")
+    parts.append("\n".join(f"{label}: {what}" if what else label
+                           for label, what in card_choices(default_action, options)))
+    if link:
+        parts.append(f"Or set its Status on the row: {link}")
+    if intro and intro.strip():
+        parts.append(intro.strip())
+    return "\n\n".join(parts)
+
+
+def build_card(ask_id: str, question: str, context: Optional[str], host: str,
+               default_action: Optional[str], reason: Optional[str], options,
+               link: Optional[str] = None, intro: Optional[str] = None):
+    """The question's card, built but not stored, with its id already allocated."""
+    from hitl.cards import choice_request, new_id  # noqa: PLC0415
+    return choice_request(
+        card_message(question, context, default_action, reason, options, link, intro),
+        card_actions(default_action, options), ask_id,
+        {"ask_id": ask_id, "choices": card_consequences(default_action, options)},
+        runtime=CARD_RUNTIME, title=f"Question from the {host} core",
+        device={"id": f"{CARD_RUNTIME}:{ask_id}", "name": host}, req_id=new_id())
+
+
+def answered_cards(manager) -> list:
+    """Every question card the owner clicked and nobody has closed yet:
+    [{hitl_id, ask_id, action_id, label}], oldest first."""
+    from hitl.schema import STATUS_IN_PROGRESS  # noqa: PLC0415
+    out = []
+    for req in sorted(manager.active(), key=lambda r: r.created_at):
+        if req.runtime != CARD_RUNTIME or req.status != STATUS_IN_PROGRESS or not req.chosen_action:
+            continue
+        subject = req.subject or {}
+        label = next((a.label for a in req.actions if a.id == req.chosen_action), req.chosen_action)
+        out.append({"hitl_id": req.id, "ask_id": subject.get("ask_id") or req.guard,
+                    "action_id": req.chosen_action, "label": label,
+                    "consequence": (subject.get("choices") or {}).get(req.chosen_action, ""),
+                    "question": req.message, "reported_before": bool(subject.get("reported")),
+                    "row_closed": bool(subject.get("row_closed")), "closing": subject.get("closing") or None})
+    return out
+
+
+def stamp_card(manager, hitl_id: str, **fields) -> None:
+    """Merge `fields` into a live card's subject, under the store lock."""
+    with manager.store.locked():
+        req = manager.get(hitl_id)
+        if req is not None and not req.terminal:
+            req.subject = {**(req.subject or {}), **fields}
+            manager.store.save(req)
+
+
+def retire_cards(manager, ask_id: str) -> list:
+    """Cancel every live card of this question (clicked or not); returns their ids."""
+    gone = []
+    for req in manager.active():
+        if req.runtime == CARD_RUNTIME and ((req.subject or {}).get("ask_id") or req.guard) == ask_id:
+            manager.cancel(req.id)
+            gone.append(req.id)
+    return gone
+
+
 def write_proactive(results: Path, name: str, body: str) -> Path:
     """Publish atomically: a drain claims proactive-*.txt on sight."""
     return write_text_whole(Path(results) / name, body)
@@ -204,10 +413,13 @@ def queue_question(question: str, context: Optional[str] = None, task_file: Opti
                    workspace: Optional[Path] = None, host: Optional[str] = None, now: Optional[float] = None,
                    link: Optional[str] = None, intro: Optional[str] = None,
                    default_action: Optional[str] = None, reason: Optional[str] = None,
-                   options=(), priority: str = "Medium") -> dict:
-    """Queue the proactive file, then hold the question in the outbox. Nothing raises past here:
-    `send_error` says why no file was queued, `outbox_error` why no record was saved — and a
-    caller with a store must not write its row without `outbox`."""
+                   options=(), priority: str = "Medium", manager=None) -> dict:
+    """Hold the question in the outbox, naming how it is asked: by a card built here (a default or
+    options, bound for AG2 Space) but NOT yet stored — the caller writes its row, then calls
+    `create_card` — or by the proactive file, queued here. Nothing raises past here: `card_error`
+    says why a card was not used, `send_error` why no file was queued, `outbox_error` why no
+    record was saved — and a caller with a store must not write its row without `outbox`.
+    `manager` is the HITL store handle (tests); None uses the workspace's."""
     from workspace_default import resolve_workspace  # noqa: PLC0415 — heavy loader
     ws = Path(workspace) if workspace else resolve_workspace(migrate=False)
     host = host or host_label()
@@ -215,6 +427,7 @@ def queue_question(question: str, context: Optional[str] = None, task_file: Opti
     ask_id = new_ask_id(now)
     out = {"ask_id": ask_id, "heading": entry_heading(question, now), "workspace": str(ws), "host": host,
            "bridge": None, "channel": None, "where": None, "proactive_file": None, "send_error": None,
+           "card": None, "card_error": None,
            "sent_line": None, "outbox": None, "outbox_error": None,
            "question": question_dict(ask_id, question, context, now, default_action, reason, options, priority)}
     dest = Destination()
@@ -223,25 +436,99 @@ def queue_question(question: str, context: Optional[str] = None, task_file: Opti
             dest = destination_from_task(Path(task_file).read_text(encoding="utf-8"), ws)
         except (OSError, UnicodeDecodeError) as e:
             out["send_error"] = f"task file unreadable ({e}); queued for the owner's DM instead"
+    card = None
+    if wants_card(default_action, options) and card_reaches_owner(dest, ws):
+        try:
+            card = build_card(ask_id, question, context, host, default_action, reason, options, link, intro)
+        except Exception as e:  # noqa: BLE001 — asked as text below
+            out["card_error"] = f"{type(e).__name__}: {e}"
+    if card is not None:
+        out["bridge"], out["where"] = CARD_BRIDGE, f"{CARD_BRIDGE} owner-dm (decision card)"
+        out["sent_line"] = f"**Sent:** card {card.id} for {out['where']} at {_iso(time.time())}"
+        try:
+            out["outbox"] = str(Outbox(ws).save(out["question"], out["sent_line"], now))
+        except Exception as e:  # noqa: BLE001 — no durable question: no card either; asked as text
+            out["outbox_error"] = f"outbox: {type(e).__name__}: {e}"
+            out["card_error"] = "the question could not be held, so no card names it"
+            card = None
+        else:
+            out["card"], out["_card"], out["_manager"] = card.id, card, manager
+            out["_text"] = (dest, link, intro)
+            return out
+    _ask_by_text(out, question, context, host, dest, link, intro)
+    if out["outbox"] is None and out["outbox_error"] is None:
+        try:
+            out["outbox"] = str(Outbox(ws).save(out["question"], out["sent_line"], now))
+        except Exception as e:  # noqa: BLE001 — reported; the caller must not proceed as if held
+            out["outbox_error"] = f"outbox: {type(e).__name__}: {e}"
+    return out
+
+
+def _ask_by_text(out: dict, question, context, host, dest, link, intro) -> None:
     body, routed = proactive_body(question, context, host, dest, link, intro)
     out["bridge"], out["channel"] = dest.bridge, dest.channel if routed else None
     out["where"] = (f"{dest.bridge} {dest.channel}" if routed else
                     f"{dest.bridge} owner-dm" if dest.bridge else "owner-dm (last-active bridge)")
+    out["card"] = None
     try:
-        name = proactive_filename(ask_id, dest.bridge)
-        write_proactive(ws / "results", name, body)
+        name = proactive_filename(out["ask_id"], dest.bridge)
+        write_proactive(Path(out["workspace"]) / "results", name, body)
         out["proactive_file"] = name
-    except Exception as e:  # noqa: BLE001 — the question is still recorded below
+    except Exception as e:  # noqa: BLE001 — the question is still recorded
         out["send_error"] = f"{type(e).__name__}: {e}"
     if out["proactive_file"]:
         out["sent_line"] = f"**Sent:** queued {out['where']} via {out['proactive_file']} at {_iso(time.time())}"
     else:
         out["sent_line"] = f"**Sent:** FAILED — {out['send_error']} at {_iso(time.time())}"
+
+
+CARD_STORED, CARD_NOT_STORED, CARD_UNKNOWN = "stored", "not stored", "unknown"
+
+
+def create_card(out: dict) -> str:
+    """Store the card `queue_question` built, after the caller made the question durable. Returns
+    stored | not stored | unknown. A failed store whose card file is nonetheless there (a save that
+    raised after its rename) is stored; one that cannot be checked is unknown, and is treated as a
+    card too. Only a card provably absent falls back to text (`card_to_text`)."""
+    card, manager = out.pop("_card", None), out.pop("_manager", None)
+    text = out.pop("_text", (Destination(), None, None))
+    if card is None:
+        return CARD_NOT_STORED
+    from hitl.cards import manager_for  # noqa: PLC0415
     try:
-        out["outbox"] = str(Outbox(ws).save(out["question"], out["sent_line"], now))
-    except Exception as e:  # noqa: BLE001 — reported; the caller must not proceed as if held
-        out["outbox_error"] = f"outbox: {type(e).__name__}: {e}"
-    return out
+        manager = manager or manager_for(Path(out["workspace"]))
+        manager.create(card)
+        out["card_outcome"] = CARD_STORED
+        return CARD_STORED
+    except Exception as e:  # noqa: BLE001
+        err = f"{type(e).__name__}: {e}"
+    try:
+        present = manager is not None and manager.get(card.id) is not None
+    except Exception as e:  # noqa: BLE001
+        out["card_outcome"] = CARD_UNKNOWN
+        out["card_error"] = f"card {card.id}: store failed ({err}) and could not be checked ({e}); kept as the ask"
+        return CARD_UNKNOWN
+    if present:
+        out["card_outcome"] = CARD_STORED
+        out["card_error"] = f"card {card.id}: the store reported {err}, but the card is there; kept as the ask"
+        return CARD_STORED
+    out["card_outcome"] = CARD_NOT_STORED
+    out["card_error"] = f"card {card.id} not stored ({err})"
+    card_to_text(out, *text)
+    return CARD_NOT_STORED
+
+
+def card_to_text(out: dict, dest, link, intro) -> None:
+    """The definite-failure fallback: the text goes first, to the question's own destination with
+    its link, then the held record is re-saved naming that file (a death in between leaves a
+    record naming an absent card, which the reminder reads as due: text again, never silence)."""
+    q = out["question"]
+    _ask_by_text(out, q["question"], q.get("context"), out["host"], dest, link, intro)
+    if out.get("outbox"):
+        try:
+            Outbox(Path(out["workspace"])).save(q, out["sent_line"])
+        except Exception as e:  # noqa: BLE001
+            out["outbox_error"] = f"outbox: delivery record not rewritten ({type(e).__name__}: {e})"
 
 
 def ask_owner(question: str, context: Optional[str] = None, urgency: str = "live",
@@ -252,6 +539,7 @@ def ask_owner(question: str, context: Optional[str] = None, urgency: str = "live
     """The whole ask with no room store: queue, hold in the outbox, notify."""
     out = queue_question(question, context, task_file, workspace, host, now, None, None,
                          default_action, reason, options, priority)
+    create_card(out)
     out.update({"record": f"outbox {out['outbox']}" if out["outbox"] else None,
                 "db_error": out["outbox_error"] or "no room database store", "link": None,
                 "macos": None, "macos_fix": None})
@@ -274,13 +562,19 @@ def report_lines(out: dict) -> list:
         lines.append(f"recorded: FAILED — {out.get('db_error')} (NOT recorded anywhere; ask by hand)")
     if out.get("link"):
         lines.append(f"row: {out['link']}")
-    if out.get("proactive_file"):
+    if out.get("card"):
+        lines.append(f"stored, not yet shown: decision card {out['card']} for {out['where']} — the gateway "
+                     "posts it; nothing here sees the DM. His click arrives as a `hitl_click` task: run "
+                     "`src/pending_questions_reader.py clicks`")
+    elif out.get("proactive_file"):
         lines.append(f"sent: queued {out['where']} via results/{out['proactive_file']} "
                      "(a bridge drain delivers it; the reminder re-raises an undrained file)")
     else:
         lines.append(f"sent: FAILED — {out.get('send_error')} (the record stands; ask by hand)")
-    if out.get("send_error") and out.get("proactive_file"):
+    if out.get("send_error") and (out.get("proactive_file") or out.get("card")):
         lines.append(f"note: {out['send_error']}")
+    if out.get("card_error"):
+        lines.append(f"note: decision card not used ({out['card_error']}); asked as text instead")
     if out.get("macos") is True:
         lines.append("macos: notification sent")
     elif out.get("macos") is False:

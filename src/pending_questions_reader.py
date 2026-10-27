@@ -17,10 +17,17 @@ does, on demand; the two are the adapter's separate entry points). Never read an
 (False, why) and records nothing — the caller keeps the answer it holds (agent-api files the
 answer task before it asks for the close).
 
+`clicks` returns the owner's decision-card choices ([{ask_id, label, closed, stale, reported_before,
+message, ...}]) after the adapter closed each clicked question's row (a `stale` click, on a row
+answered another way, is not a decision); with no adapter, or one without `clicks`, it is
+(None, why) and nothing is closed.
+
 CLI, for shell readers: `python3 src/pending_questions_reader.py list [--json] | count | summary`
 (`summary` is the count and where the questions live, never their text); and the
-one write a core caller makes through the same contract, `resolve <ask-id> [--answered]`
-(Resolved, or Answered), which is `resolve` above and nothing else. `--store-adapter <path>`
+writes a core caller makes through the same contract: `resolve <ask-id> [--answered]`
+(Resolved, or Answered), which is `resolve` above and nothing else, and `clicks [--json]`, run on
+a `hitl_click: true` task, which is `clicks` above, and `ack <ask-id>` once the core has acted on
+a choice (until then a re-run replays it). `--store-adapter <path>`
 injects an adapter file in place of the declared one.
 """
 from __future__ import annotations
@@ -191,6 +198,43 @@ def resolve(workspace, ask_id: str, status: str, adapter=None) -> tuple:
         return False, f"not closed: adapter failed ({type(e).__name__}: {e}); nothing records the close"
 
 
+def clicks(workspace, adapter=None) -> tuple:
+    """(choices, None), or (None, why) when there is no adapter or it cannot take the clicks."""
+    mod, why = _adapter(adapter)
+    if mod is None:
+        return None, f"no store: {why}"
+    if not hasattr(mod, "clicks"):
+        return None, f"adapter {why} takes no card clicks"
+    try:
+        return mod.clicks(Path(workspace)), None
+    except Exception as e:  # noqa: BLE001
+        return None, f"adapter failed ({type(e).__name__}: {e})"
+
+
+def ack(workspace, ask_id: str, adapter=None) -> tuple:
+    """(done, message): the core acted on that question's choice; the adapter's `ack_click`."""
+    mod, why = _adapter(adapter)
+    if mod is None or not hasattr(mod, "ack_click"):
+        return False, f"not acknowledged: {why if mod is None else f'adapter {why} takes no acks'}"
+    try:
+        return mod.ack_click(Path(workspace), ask_id)
+    except Exception as e:  # noqa: BLE001
+        return False, f"not acknowledged: adapter failed ({type(e).__name__}: {e})"
+
+
+def click_line(c: dict) -> str:
+    """Only a fresh or replayed click reads as `chose`, with its exact action id and consequence;
+    a stale or already-reported one is never a decision."""
+    q = " ".join(c["question"].split())[:120]
+    what = f"{c['action_id']} {c['label']!r}" + (f" -> {c['consequence']}" if c.get("consequence") else "")
+    if c.get("stale"):
+        return f"- [{c['ask_id']}] already answered — not a decision (a late click on {what}) — {q}"
+    if c.get("reported_before"):
+        return f"- [{c['ask_id']}] acknowledged before, not a new decision ({what}); its row is not closed yet — {q}"
+    replay = " (replayed: not acknowledged yet)" if c.get("replay") else ""
+    return f"- [{c['ask_id']}] chose {what}{replay} — {q}"
+
+
 def _norm_title(text: str) -> str:
     from result_markers import neutralize_markers  # noqa: PLC0415 — the rows' title rule
     return " ".join(neutralize_markers(text or "").split())[:120].casefold()
@@ -228,9 +272,9 @@ def unknown_line(g: dict) -> str:
 def main(argv=None) -> int:
     import argparse  # noqa: PLC0415
     ap = argparse.ArgumentParser(description="List or count the owner's pending questions (read-only), "
-                                 "or resolve one through the declared store.")
-    ap.add_argument("command", choices=("list", "count", "summary", "resolve"))
-    ap.add_argument("ask_id", nargs="?", default=None, help="resolve: the question's ask id")
+                                 "or resolve one, or apply card clicks, through the declared store.")
+    ap.add_argument("command", choices=("list", "count", "summary", "resolve", "clicks", "ack"))
+    ap.add_argument("ask_id", nargs="?", default=None, help="resolve / ack: the question's ask id")
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--answered", action="store_true", help="resolve: mark it Answered, not Resolved")
     ap.add_argument("--workspace", type=Path, default=None)
@@ -241,12 +285,29 @@ def main(argv=None) -> int:
         from workspace_default import resolve_workspace  # noqa: PLC0415 — heavy loader
         args.workspace = resolve_workspace(migrate=False)
     store = declared(DECLARATION, args.workspace, override=args.store_adapter)  # the CLI is an edge
+    if args.command in ("resolve", "ack") and not args.ask_id:
+        ap.error(f"{args.command} needs an ask id")
+    if args.command == "ack":
+        ok, msg = ack(args.workspace, args.ask_id, store)
+        print(msg)
+        return 0 if ok else 1
     if args.command == "resolve":
-        if not args.ask_id:
-            ap.error("resolve needs an ask id")
         ok, msg = resolve(args.workspace, args.ask_id, "Answered" if args.answered else "Resolved", store)
         print(msg)
         return 0 if ok else 1
+    if args.command == "clicks":
+        done, why = clicks(args.workspace, store)
+        if done is None:
+            print(f"clicks: not read — {why}")
+            return 1
+        if args.json:
+            print(json.dumps(done, ensure_ascii=False, indent=1))
+        elif not done:
+            print("no question-card clicks waiting")
+        for c in [] if args.json else done:
+            print(click_line(c))
+            print(f"    {c['close_message']}")
+        return 0 if all(c["closed"] or c.get("stale") for c in done) else 1
     g = gather(args.workspace, store)
     for note in g["notes"]:
         print(note, file=sys.stderr)
