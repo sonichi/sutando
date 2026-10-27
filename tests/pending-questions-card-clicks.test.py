@@ -205,6 +205,39 @@ class CrashBoundaries(_Room):
         [next_pass] = room_db.clicks(self.ws, manager=self.m, now=handed_at + cards.HANDED_LEASE_SEC + 1)
         self.assertFalse(next_pass["actionable"], "a re-offer starts a new lease")
 
+    def test_a_second_lease_expiry_gives_no_second_reoffer(self):
+        click(self.m, self.card, "option-1")
+        [first] = self.run_clicks()
+        t0 = self.m.get(self.card).subject["claim"]["handed_at"]
+        [again] = room_db.clicks(self.ws, manager=self.m, now=t0 + cards.HANDED_LEASE_SEC)
+        self.assertTrue(again["reoffered"])
+        for later in (t0 + 2 * cards.HANDED_LEASE_SEC, t0 + 50 * cards.HANDED_LEASE_SEC):
+            [stuck] = room_db.clicks(self.ws, manager=self.m, now=later)
+            self.assertEqual((stuck["actionable"], stuck["needs_attention"]), (False, True))
+            line = reader.click_line(stuck)
+            self.assertNotIn("chose", line)
+            self.assertIn("NEEDS ATTENTION", line)
+            self.assertIn(f"--token {again['token']}", line)
+        self.assertEqual(self.m.get(self.card).subject["claim"]["reoffers"], 1)
+        self.assertTrue(room_db.ack_click(self.ws, self.ask_id, again["token"], self.m)[0], "it can still be acked")
+
+    def test_a_future_dated_handoff_is_fresh_not_expired(self):
+        click(self.m, self.card, "option-1")
+        self.run_clicks()
+        claim = self.m.get(self.card).subject["claim"]
+        future = claim["handed_at"] + 10 * cards.HANDED_LEASE_SEC  # the clock went back after the handoff
+        cards.stamp_claim(self.m, self.card, {**claim, "handed_at": future,
+                                              "lease_until": future + cards.HANDED_LEASE_SEC})
+        [c] = room_db.clicks(self.ws, manager=self.m, now=claim["handed_at"] + 2 * cards.HANDED_LEASE_SEC)
+        self.assertEqual((c["actionable"], c["handed_before"]), (False, True))
+        legacy = {k: v for k, v in claim.items() if k != "lease_until"}
+        cards.stamp_claim(self.m, self.card, {**legacy, "handed_at": future})
+        [c] = room_db.clicks(self.ws, manager=self.m, now=claim["handed_at"] + 2 * cards.HANDED_LEASE_SEC)
+        self.assertFalse(c["actionable"], "no deadline stored: handed_at in the future still counts as fresh")
+        cards.stamp_claim(self.m, self.card, {**claim, "handed_at": future, "lease_until": 0})
+        [c] = room_db.clicks(self.ws, manager=self.m, now=claim["handed_at"] + 2 * cards.HANDED_LEASE_SEC)
+        self.assertFalse(c["actionable"], "a future handed_at is fresh whatever the stored deadline says")
+
     def test_an_ack_inside_the_lease_prevents_any_reoffer(self):
         click(self.m, self.card, "option-1")
         [c] = self.run_clicks()
@@ -217,7 +250,8 @@ class CrashBoundaries(_Room):
         click(self.m, self.card, "option-1")
         self.run_clicks()
         claim = self.m.get(self.card).subject["claim"]
-        cards.stamp_claim(self.m, self.card, {**claim, "handed_at": claim["handed_at"] - cards.HANDED_LEASE_SEC - 5})
+        past = claim["handed_at"] - cards.HANDED_LEASE_SEC - 5
+        cards.stamp_claim(self.m, self.card, {**claim, "handed_at": past, "lease_until": past + cards.HANDED_LEASE_SEC})
         slow = ("real = rdb._close_for_click\n"
                 "import pending_questions_clicks as pc, time\n"
                 "real_cards = pc.answered_cards\n"

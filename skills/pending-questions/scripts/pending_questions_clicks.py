@@ -13,10 +13,13 @@ recorded click into an actionable choice:
   into the Closed mark. A refusal whose mark carries this token is this claim's own earlier close;
   any other refusal makes the click stale (card cancelled). A close the room cannot verify (an
   outage) defers the click: nothing is handed over and the claim stays to be retried.
-- On a close the claim is recorded `handed` (with `handed_at`) BEFORE the choice is returned. Later
-  passes report it as "awaiting ack" for HANDED_LEASE_SEC; `ack_click` with the claim's token
-  settles it. A handed claim older than the lease is re-offered with a fresh token: exclusive
-  within the lease, at-least-once after it; an ack carrying the superseded token is refused.
+- On a close the claim is recorded `handed` (with `handed_at` and its deadline `lease_until`)
+  BEFORE the choice is returned. Later passes report it as "awaiting ack" until the deadline;
+  `ack_click` with the claim's token settles it. Past the deadline it is re-offered ONCE, with a
+  fresh token: a choice is delivered at most twice, so a consumer re-checks current state before
+  acting. After that single re-offer an unacked claim is listed as needing attention, never
+  offered again. A `handed_at` in the future (the clock went back) counts as fresh, not expired.
+  An ack carrying a superseded token is refused.
 """
 from __future__ import annotations
 
@@ -29,9 +32,10 @@ CARD_RUNTIME = "pending-questions"
 CLAIMING, HANDED = "claiming", "handed"
 CLOSED, STALE, DEFERRED = "closed", "stale", "deferred"
 LOCK_NAME = "pending-questions-clicks.lock"
-# A handed choice not acked within this long is offered again: exclusive inside the lease,
-# at-least-once after it (a consumer that died after the handoff must not strand the choice).
+# A handed choice not acked within this long is offered again, once: a consumer that died after
+# the handoff must not strand it, and no choice is delivered more than twice.
 HANDED_LEASE_SEC = 600
+MAX_REOFFERS = 1
 
 
 def manager_for(workspace):
@@ -83,11 +87,23 @@ def _token() -> str:
     return os.urandom(8).hex()
 
 
+def _lease(now: float) -> dict:
+    return {"handed_at": now, "lease_until": now + HANDED_LEASE_SEC}
+
+
+def _lease_expired(claim: dict, now: float) -> bool:
+    """Past the stored deadline, and not handed in the future (a clock that went back is fresh)."""
+    handed_at = float(claim.get("handed_at") or 0)
+    deadline = float(claim.get("lease_until") or handed_at + HANDED_LEASE_SEC)
+    return handed_at <= now and now >= deadline
+
+
 def clicks(workspace: Path, closer, manager=None, now: Optional[float] = None) -> list:
     """One dict per unsettled click, oldest first: the choice plus `actionable` (True in the pass
-    that hands it over, and again only once a handed claim outlived HANDED_LEASE_SEC unacked:
-    `reoffered`), `token` (what `ack_click` must carry), `stale`, `deferred`, `handed_before`,
-    `closed` and `close_message`. `closer(ws, ask_id, token)` returns (closed | stale | deferred,
+    that hands it over, and once more when a handed claim outlived its deadline unacked:
+    `reoffered`), `needs_attention` (unacked past the deadline after that single re-offer),
+    `token` (what `ack_click` must carry), `stale`, `deferred`, `handed_before`, `closed` and
+    `close_message`. `closer(ws, ask_id, token)` returns (closed | stale | deferred,
     message)."""
     ws = Path(workspace)
     manager = manager or manager_for(ws)
@@ -97,15 +113,18 @@ def clicks(workspace: Path, closer, manager=None, now: Optional[float] = None) -
         for c in answered_cards(manager):
             claim = c.pop("claim")
             handed = claim.get("state") == HANDED
-            entry = {**c, "actionable": False, "reoffered": False, "stale": False, "deferred": False,
-                     "handed_before": handed, "closed": handed, "token": None,
+            entry = {**c, "actionable": False, "reoffered": False, "needs_attention": False, "stale": False,
+                     "deferred": False, "handed_before": handed, "closed": handed, "token": None,
                      "close_message": "closed earlier by this click"}
             if handed:
-                if now - float(claim.get("handed_at") or 0) >= HANDED_LEASE_SEC:
-                    # the consumer it was handed to never acked within the lease: offer it again
-                    claim = {**claim, "token": _token(), "handed_at": now}
-                    stamp_claim(manager, c["hitl_id"], claim)
-                    entry.update(actionable=True, reoffered=True, token=claim["token"])
+                if _lease_expired(claim, now):
+                    if int(claim.get("reoffers") or 0) < MAX_REOFFERS:
+                        claim = {**claim, **_lease(now), "token": _token(),
+                                 "reoffers": int(claim.get("reoffers") or 0) + 1}
+                        stamp_claim(manager, c["hitl_id"], claim)
+                        entry.update(actionable=True, reoffered=True, token=claim["token"])
+                    else:
+                        entry.update(needs_attention=True, token=claim.get("token"))
                 out.append(entry)
                 continue
             if not claim.get("token"):
@@ -113,7 +132,7 @@ def clicks(workspace: Path, closer, manager=None, now: Optional[float] = None) -
                 stamp_claim(manager, c["hitl_id"], claim)
             outcome, entry["close_message"] = closer(ws, c["ask_id"], claim["token"])
             if outcome == CLOSED:
-                stamp_claim(manager, c["hitl_id"], {**claim, "state": HANDED, "handed_at": now})
+                stamp_claim(manager, c["hitl_id"], {**claim, "state": HANDED, **_lease(now)})
                 entry.update(actionable=True, closed=True, token=claim["token"])
             elif outcome == STALE:
                 manager.cancel(c["hitl_id"])

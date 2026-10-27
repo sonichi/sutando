@@ -107,10 +107,15 @@ adapter's `clicks` (`scripts/pending_questions_clicks.py`):
   <token>`, to that caller alone. Later passes, by any consumer, print it as "handed out earlier,
   awaiting ack — not a new decision" for the lease (`HANDED_LEASE_SEC`, 10 minutes).
 - The core acts, then runs `… ack <ask-id> --token <token>`, which settles the card. A handed claim
-  older than the lease is re-offered as `chose` to the next pass with a fresh token, so a consumer
-  that died after the handoff does not strand the choice. The trade-off: exclusive within the
-  lease, at-least-once after it. An ack carrying a superseded token (a consumer that acked after
-  its lease was re-offered) is refused as stale and changes nothing.
+  past its deadline (`lease_until`) is re-offered as `chose` to the next pass, ONCE, with a fresh
+  token, so a consumer that died after the handoff does not strand the choice. After that single
+  re-offer an unacked claim is listed as "NEEDS ATTENTION — handed out twice, never acknowledged"
+  and never offered again. A `handed_at` in the future (the clock went back) counts as fresh. An
+  ack carrying a superseded token is refused as stale and changes nothing.
+- **At-least-once, at most twice.** The core acts before it acks, so a consumer slower than the
+  lease, or a clock jump, can let a second consumer receive the same `chose`. Rule: before acting
+  on a `chose`, re-check the current state (the PR is not already merged, the question is not
+  already resolved, the thing is not already done) and skip what is.
 - `resolve` retires (cancels) the question's card whenever it closes the row or the room refuses
   the close.
 

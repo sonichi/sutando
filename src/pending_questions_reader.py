@@ -20,7 +20,9 @@ answer task before it asks for the close).
 `clicks` returns the owner's decision-card clicks after the adapter closed each clicked question's
 row: [{ask_id, action_id, label, consequence, actionable, token, stale, deferred, handed_before,
 closed, close_message, ...}]; only an `actionable` one is a decision, handed to this caller alone
-until its lease runs out unacked (then re-offered to the next caller with a new token).
+until its lease runs out unacked (then re-offered once to the next caller with a new token; after
+that it is listed as `needs_attention`, never offered again). A `chose` can therefore arrive twice:
+the caller re-checks current state before acting.
 `ack` with that token settles it once acted on; a superseded token is refused. With no adapter, or one without them, both refuse and change nothing.
 
 CLI, for shell readers: `python3 src/pending_questions_reader.py list [--json] | count | summary`
@@ -230,6 +232,10 @@ def click_line(c: dict) -> str:
     if c.get("actionable"):
         again = " (re-offered: the consumer it was handed to never acked)" if c.get("reoffered") else ""
         return f"- [{c['ask_id']}] chose {what}{again} — {q} — ack with --token {c['token']}"
+    if c.get("needs_attention"):
+        return (f"- [{c['ask_id']}] NEEDS ATTENTION — handed out twice, never acknowledged ({what}); not "
+                f"a new decision: check whether it was acted on, then ack with --token {c['token']} or "
+                f"resolve the question — {q}")
     if c.get("deferred"):
         return (f"- [{c['ask_id']}] deferred — the room cannot confirm the owner has not answered "
                 f"otherwise; not a decision yet ({what}); retried next pass — {q}")
