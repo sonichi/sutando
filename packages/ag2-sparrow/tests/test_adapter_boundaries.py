@@ -115,6 +115,55 @@ def direct_imports(text, steps):
                   for a in n.names if a.name in owned)
 
 
+# One owner, connect_bridge: the agent bridge's launch env, its unit or declaration, and connect's
+# redemption into the seat. Neither -local adapter builds any of them itself.
+BRIDGE_ADAPTERS = ("claude_code", "codex")
+BRIDGE_CALLS = {"seat_bridge_environ", "write_bridge_declaration", "remove_bridge_declaration", "render_supervisor",
+                "start_supervisor", "stop_supervisor", "write_seat_credentials", "write_seat", "redeem_code",
+                "read_code", "relay_problem", "code_problem"}
+BRIDGE_ENV_KEYS = {"AGENT_CONNECT_TASK_DIR", "AGENT_CONNECT_RESULT_DIR", "AGENT_CONNECT_STATE_DIR", "AG2_DEVICE_ENV",
+                   "REMOTE_TASK_SEAT", "REMOTE_TASK_TOKEN_FILE", "AGENT_MXID"}
+BRIDGE_DELEGATES = {"adapters/claude_code/cli.py": ("cb.wire_bridge(", "cb.wire_bridge_bound(", "cb.unwire_bridge(", "cb.redeem_into_seat(",
+                                                    "cb.host_problem(", "cb.agent_root("),
+                    "adapters/claude_code/shape.py": ("bridge_shape(LOCAL)",),
+                    "adapters/codex/connect_cli.py": ("cb.wire_bridge_bound(", "cb.unwire_bridge(", "cb.redeem_into_seat(",
+                                                      "cb.host_problem(", "cb.agent_root(", "cb.bridge_shape(LOCAL)")}
+
+
+def bridge_builders(tree):
+    """Calls of a bridge-building step and literal launch-env keys, as (kind, name)."""
+    found = []
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Call):
+            name = n.func.attr if isinstance(n.func, ast.Attribute) else getattr(n.func, "id", "")
+            if name in BRIDGE_CALLS:
+                found.append(("call", name))
+        elif isinstance(n, ast.Constant) and n.value in BRIDGE_ENV_KEYS:
+            found.append(("env key", n.value))
+    return found
+
+
+class SharedAgentBridge(unittest.TestCase):
+    def test_neither_local_adapter_builds_its_own_bridge_launch_env_or_redemption(self):
+        for adapter in BRIDGE_ADAPTERS:
+            for path in sorted((PKG_ROOT / PKG / "adapters" / adapter).rglob("*.py")):
+                with self.subTest(module=str(path.relative_to(PKG_ROOT))):
+                    self.assertEqual(bridge_builders(ast.parse(path.read_text(encoding="utf-8"))), [])
+
+    def test_both_delegate_to_connect_bridge(self):
+        for rel, calls in BRIDGE_DELEGATES.items():
+            text = (PKG_ROOT / PKG / rel).read_text(encoding="utf-8")
+            for call in calls:
+                with self.subTest(module=rel, call=call):
+                    self.assertIn(call, text)
+
+    def test_the_scan_catches_a_copy(self):
+        copy = 'env = {"AGENT_CONNECT_TASK_DIR": t}\nseat = _sources.seat_bridge_environ(p, read)\ncm.start_supervisor(B)\n'
+        self.assertEqual(sorted(bridge_builders(ast.parse(copy))), [("call", "seat_bridge_environ"),
+                                                                    ("call", "start_supervisor"),
+                                                                    ("env key", "AGENT_CONNECT_TASK_DIR")])
+
+
 class BoundaryTest(unittest.TestCase):
     def test_the_package_has_no_crossings(self):
         self.assertEqual(violations(PKG_ROOT), [])

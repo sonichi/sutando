@@ -89,8 +89,25 @@ from ag2_sparrow.cli_wedge_patterns import ABNORMAL_PATTERNS
 out["patterns"] = sorted(name for name, _ in ABNORMAL_PATTERNS)
 from ag2_sparrow.adapters.claude_code import cli
 out["cli"] = cli.COMMAND
+out["plugin"] = str(cli.PLUGIN)
 print(json.dumps(out))
 '''
+
+# A logged-in Claude Code new enough for the adapter's pin: the two calls connect's preflight makes.
+FAKE_CLAUDE = """#!/bin/sh
+case "$1" in
+  --version) echo "2.1.303 (Claude Code)" ;;
+  auth) echo '{"loggedIn": true}' ;;
+  *) exit 3 ;;
+esac
+"""
+
+# A user manager with no claude-local job: connect refuses while the job runs or its state is unreadable.
+FAKE_SYSTEMCTL = """#!/bin/sh
+case " $* " in
+  *" show "*) printf 'not-found\\ninactive\\ndisabled\\n' ;;
+esac
+"""
 
 
 class InstalledWheel(unittest.TestCase):
@@ -140,6 +157,26 @@ class InstalledWheel(unittest.TestCase):
                 self.assertNotIn(forbidden, text, "%s names a repo-only helper" % script.name)
         self.assertTrue((package / "tmux-pane-keys.sh").is_file() and (package / "bounded-wait.sh").is_file())
         self.assertTrue((venv / "bin" / "ag2-sparrow-claude-local").is_file(), "the console script is installed")
+        plugin = package / "adapters" / "claude_code" / "ag2space-inbox"
+        for rel in (".claude-plugin/plugin.json", "hooks/hooks.json", "hooks/register.ts"):
+            self.assertTrue((plugin / rel).is_file(), "the wheel ships the plugin's %s" % rel)
+        self.assertEqual(Path(out["plugin"]), plugin, "the default --plugin-dir is the shipped plugin")
+        # connect with no --plugin-dir passes its preflight on the shipped plugin and, with no job running,
+        # reaches the redemption, which a closed loopback port refuses with the code unspent.
+        fake = self.tmp / "fakebin"
+        fake.mkdir()
+        (fake / "claude").write_text(FAKE_CLAUDE)
+        (fake / "claude").chmod(0o755)
+        (fake / "systemctl").write_text(FAKE_SYSTEMCTL)
+        (fake / "systemctl").chmod(0o755)
+        cenv = dict(env, PATH="%s:%s" % (fake, env["PATH"]), HOME=str(self.tmp / "chome"))
+        r = subprocess.run([str(venv / "bin" / "ag2-sparrow-claude-local"), "connect", "--base", "http://127.0.0.1:9",
+                            "--code", "-"], input="acp.wheel-code\n", capture_output=True, text=True,
+                           cwd=str(elsewhere), env=cenv, timeout=120)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertNotIn("not a Claude Code plugin", r.stderr)
+        self.assertIn("could not reach http://127.0.0.1:9", r.stderr, "preflight passed without --plugin-dir")
+        self.assertIn("the code is still valid", r.stderr)
 
 
 if __name__ == "__main__":

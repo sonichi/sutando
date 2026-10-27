@@ -8,7 +8,7 @@ the repo and the logs dir; this view never resolves them, never touches the vaul
 itself (the module does, through the injected `vault`), and returns rows that
 carry a vault key name, never a secret. The methods are the daemon-native form
 of the HTTP resource: GET = list, POST without confirm = preview, POST with
-confirm = create (201 ↔ created true, 200 ↔ existing row), DELETE = remove,
+confirm = create and start the bridge (201 ↔ created true, 200 ↔ existing row), DELETE = remove,
 POST <instance>/primary = set_primary, POST <instance>/disconnect = disconnect,
 POST <instance>/reconnect = reconnect, POST <instance>/token = update_token,
 GET known-servers = known_servers; a confirm whose identity moved and every state
@@ -68,7 +68,7 @@ class ConnectionsView:
 
     # ── connection.add ──────────────────────────────────────────────────────
     def add(self, params: dict) -> dict:
-        """confirm false (default): {preview}. confirm true + expected_server: {created, connection}."""
+        """confirm false (default): {preview}. confirm true + expected_server: {created, launch, connection}."""
         token = params.get("token")
         if not isinstance(token, str) or not token.strip():
             raise ProtocolError(-32602, "missing required param: token")
@@ -89,11 +89,13 @@ class ConnectionsView:
                     workspace=self.workspace, vault=self.vault)
             except connections.ConnectionMismatch as e:
                 raise ProtocolError(CONFLICT, f"mismatch: {e}")
+            launch = connections.start_added(row, repo=self.repo, logs_dir=self.logs_dir,
+                                             workspace=self.workspace, vault=self.vault, spawn=self.spawn)
         except connections.Refusal as e:
             raise ProtocolError(CONFLICT, str(e))
         except connections.ConnectionsError as e:
             raise ProtocolError(-32602, str(e))
-        return {"created": created, "connection": connections.status_for(row, self.workspace)}
+        return {"created": created, "launch": launch, "connection": connections.status_for(row, self.workspace)}
 
     # ── connection.remove ───────────────────────────────────────────────────
     def remove(self, params: dict) -> dict:

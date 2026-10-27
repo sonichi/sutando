@@ -893,6 +893,16 @@ class SeatBridge(Base):
         self.assertEqual(seen, {"env_room": "", "bridge_room": "", "left": [planted.name]},
                          "the seat's own .env and the host never give it a proactive room, and it claims no nudge")
 
+    def test_the_owners_seat_child_env_sets_an_empty_proactive_room_last(self):
+        from ag2_sparrow import connect_bridge
+        self.assertIs(cli.seat_child_env, connect_bridge.seat_child_env, "cli only re-exports the owner's")
+        self.assertIs(cli.SEAT_ENV_KEEP, connect_bridge.SEAT_ENV_KEEP)
+        launch = {"AGENT_MXID": AGENT, "REMOTE_PROACTIVE_ROOM": "!from-launch:x"}
+        built = connect_bridge.seat_child_env(launch, {"REMOTE_PROACTIVE_ROOM": "!host:x", "HOME": "/home/probe"})
+        self.assertEqual(built["REMOTE_PROACTIVE_ROOM"], "", "neither the host nor the launch values override it")
+        self.assertEqual(list(built)[-1], "REMOTE_PROACTIVE_ROOM")
+        self.assertEqual((built["HOME"], built["AGENT_MXID"]), ("/home/probe", AGENT))
+
     def test_the_bridge_itself_gives_a_seat_no_proactive_room_when_its_env_names_none(self):
         """The bridge's own is_seat guard, with no REMOTE_PROACTIVE_ROOM in the process environment to mask
         it: the seat's .env names a room, and the imported bridge still holds none."""
@@ -930,6 +940,26 @@ class SeatBridge(Base):
         specs, skipped = self.sd._agent_bridge_specs(self.ws, vault_keys=[])
         self.assertEqual(specs, [])
         self.assertIn("env is not the canonical one", skipped[0])
+
+    def test_a_seat_codex_local_declared_is_one_worker_and_its_non_seat_declaration_is_not(self):
+        from ag2_sparrow import connect_bridge as cb
+        from ag2_sparrow.adapters.codex import connect_cli as codex
+        decl = self.declare_seat()
+        decl.unlink()
+        cfg = {"ROOT": str(self.root), "BRIDGE": "sparrowd", "AGENT_ID": AGENT,
+               "TOKEN_ENV_FILE": os.path.join(self.seat, ".env"), "TOKEN_VAULT_KEY": ""}
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(cb.wire_bridge(cfg, codex.COMMAND, codex.BRIDGE), "")
+        self.assertEqual(json.loads(decl.read_text())["written_by"], f"{codex.COMMAND} install")
+        specs, skipped = self.sd._agent_bridge_specs(self.ws, vault_keys=[])
+        self.assertEqual((skipped, [s.name for s in specs]), ([], [cli.worker_name(SEG)]))
+        decl.unlink()
+        body = json.loads(self.declare().read_text())
+        body["written_by"] = f"{codex.COMMAND} install"
+        decl.write_text(json.dumps(body))
+        specs, skipped = self.sd._agent_bridge_specs(self.ws, vault_keys=[cli.vault_key(SEG)])
+        self.assertEqual(specs, [])
+        self.assertIn("declares only a seat's bridge", skipped[0])
 
     def test_preflight_passes_a_seat_without_the_vault(self):
         self.declare_seat()

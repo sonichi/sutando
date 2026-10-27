@@ -255,6 +255,10 @@ s, b, _ = req("POST", "/api/v1/connections", {"token": "https://chat.alpha-fixtu
 check("an existing connection is 200 created:false", s == 200 and (b or {}).get("created") is False, f"{s} {b}")
 s, b, _ = req("POST", "/api/v1/connections", {"token": TOKEN_B, "confirm": True, "expected_server": "beta-fixture.net"})
 check("a second server is 201 and not primary", s == 201 and not b["connection"]["primary"], f"{s} {b}")
+check("confirm started each new bridge, the existing one again while it was down",
+      SPAWNED == ["alpha-fixture-net", "alpha-fixture-net", "beta-fixture-net"] and b["launch"]["ok"] is True, (SPAWNED, b))
+check("the second lane does not take the primary", b["connection"]["primary"] is False and b["connection"]["running"] is False, b)
+SPAWNED.clear()
 
 print("== refusals the review asked for ==")
 s, b, _ = req("POST", "/api/v1/connections", {"token": "https://rejecting-fixture.net|bad", "confirm": True,
@@ -329,13 +333,15 @@ check("DELETE known-servers is 405, never a removal", s == 405, f"{s} {b}")
 s, b, _ = req("POST", "/api/v1/connections/alpha-fixture-net/disconnect", {})
 check("disconnecting the primary is 409 primary_cannot_disconnect", (s, b) == (409, {"error": "primary_cannot_disconnect"}), f"{s} {b}")
 s, b, _ = req("POST", "/api/v1/connections/beta-fixture-net/disconnect", {})
-check("disconnect is 200 with the disabled row", s == 200 and (b["connection"]["disabled"], b["connection"]["state"],
-      b["connection"]["reason"]) == (True, "disconnected", "disabled"), f"{s} {b}")
+check("disconnect is 200 with the parked row", s == 200 and (b["connection"]["disabled"], b["connection"]["state"],
+      b["connection"]["reason"]) == (True, "parked", "disabled"), f"{s} {b}")
+check("a restart's launch plan leaves the parked row down",
+      [e["instance"] for e in C.launch_plan({}, workspace=WS)] == ["alpha-fixture-net"])
 check("disconnect leaks no secret", no_secret(b))
 check("the token stays in the vault", "AG2_REMOTE_TOKEN_BETA_FIXTURE_NET" in FakeVault.store)
 s, b, _ = req("GET", "/api/v1/connections")
 check("the list shows the flag and the state", [(r["instance"], r["disabled"], r["state"]) for r in b["connections"]]
-      == [("alpha-fixture-net", False, "connected"), ("beta-fixture-net", True, "disconnected")], b)
+      == [("alpha-fixture-net", False, "connected"), ("beta-fixture-net", True, "parked")], b)
 check("every row spells out the identity fields", all(k in r for r in b["connections"] for k in C.IDENTITY_FIELDS))
 s, b, _ = req("POST", "/api/v1/connections/beta-fixture-net/disconnect", {})
 check("disconnecting twice is still 200", s == 200 and b["connection"]["disabled"] is True, f"{s} {b}")
@@ -443,6 +449,21 @@ s, b, _ = req("POST", "/api/v1/connections", {"token": TOKEN_A, "confirm": True,
 check("a refusing vault is 503 vault_unavailable", (s, b) == (503, {"error": "vault_unavailable"}), f"{s} {b}")
 api.connections_http = lambda method, path, body, query=None: _real(
     method, path, body, query, vault=FakeVault(), fetch=fetch, spawn=spawn, getaddrinfo=public_getaddrinfo)
+
+print("== a vault refusal while starting the added bridge ==")
+_real_launch_env = C.launch_env
+def _refusing_launch_env(*_a, **_kw):
+    raise C.VaultUnavailable("secret vault not importable (ImportError)")
+C.launch_env = _refusing_launch_env
+try:
+    s, b, _ = req("POST", "/api/v1/connections", {"token": TOKEN_A, "confirm": True, "expected_server": "alpha-fixture.net"})
+finally:
+    C.launch_env = _real_launch_env
+check("the add still succeeds with the saved row", s in (200, 201) and (b or {}).get("connection", {}).get("instance") == "alpha-fixture-net", f"{s} {b}")
+check("its launch is a failed record naming the class",
+      ((b or {}).get("launch") or {}).get("ok") is False and b["launch"].get("reason") == "vault_unavailable", f"{b}")
+s, b, _ = req("GET", "/api/v1/connections")
+check("the row persists", "alpha-fixture-net" in [r["instance"] for r in (b or {}).get("connections") or []], f"{s} {b}")
 
 print("== SUTANDO_API_TOKEN, when set, is the bearer ==")
 api.API_TOKEN = "operator-token"

@@ -2370,15 +2370,23 @@ class Guard(unittest.TestCase):
             self.assert_flagged(name)
 
     def test_the_cli_names_neither_the_accessor_nor_the_record_key(self):
-        rel = "adapters/claude_code/cli.py"
-        shipped = (PKG / "ag2_sparrow" / rel).read_text(encoding="utf-8")
-        words = {getattr(n, "id", None) or getattr(n, "attr", None) or getattr(n, "name", None) or _constant(n)
-                 for n in ast.walk(ast.parse(shipped))}
-        self.assertEqual(words & (OWNER_ONLY | KEY_TUPLES | {RECORD_KEY}), set())
-        self.assertEqual(credential_access(shipped, rel), [])
+        for rel in ("adapters/claude_code/cli.py", "adapters/codex/connect_cli.py", "connect_bridge.py"):
+            shipped = (PKG / "ag2_sparrow" / rel).read_text(encoding="utf-8")
+            words = {getattr(n, "id", None) or getattr(n, "attr", None) or getattr(n, "name", None) or _constant(n)
+                     for n in ast.walk(ast.parse(shipped))}
+            with self.subTest(module=rel):
+                self.assertEqual(words & (OWNER_ONLY | KEY_TUPLES | {RECORD_KEY}), set())
+                self.assertEqual(credential_access(shipped, rel), [])
+
+    def test_the_adapters_reach_the_owner_only_through_connect_bridge(self):
+        for rel in ("adapters/claude_code/cli.py", "adapters/codex/connect_cli.py"):
+            tree = ast.parse((PKG / "ag2_sparrow" / rel).read_text(encoding="utf-8"))
+            with self.subTest(module=rel):
+                self.assertEqual([n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)
+                                  and ast.unparse(n.value) == "_sources"], [])
 
     def test_the_adapter_hands_the_owner_a_path_and_holds_no_record(self):
-        text = (PKG / "ag2_sparrow" / "adapters" / "claude_code" / "cli.py").read_text(encoding="utf-8")
+        text = (PKG / "ag2_sparrow" / "connect_bridge.py").read_text(encoding="utf-8")
         tree = ast.parse(text)
         parents = {c: n for n in ast.walk(tree) for c in ast.iter_child_nodes(n)}
         uses = [n for n in ast.walk(tree) if isinstance(n, ast.Attribute) and ast.unparse(n.value) == "_sources"]
@@ -2390,7 +2398,7 @@ class Guard(unittest.TestCase):
             call = parents[use]
             self.assertTrue(isinstance(call, ast.Call) and call.func is use)
             self.assertEqual([k.arg for k in call.keywords if k.arg is None], [], "no ** spread into the owner")
-        self.assertEqual(declaration_reads(text, "adapters/claude_code/cli.py"), [])
+        self.assertEqual(declaration_reads(text, "connect_bridge.py"), [])
         self.assertNotIn("owned_declaration", text)
 
     def test_a_read_of_the_declaration_path_outside_the_owner_is_flagged(self):

@@ -333,29 +333,40 @@ def _replace_file(path: str, text: str, mode: int) -> None:
         raise
 
 
-def write_seat_credentials(seat, *, agent_id: str, instance: str, tier: str, relay_url: str, bearer: str) -> str:
-    """Write a seat's channel dir: `.env` (AGENT_MXID, GATEWAY_INSTANCE, REMOTE_TASK_TOKEN_FILE,
-    REMOTE_TASK_TIER) and `token` (one line, <relay_url>|<bearer>), each 0600 through temp + rename, the dir
-    0700. A rewrite replaces the token in place, which is a rotation. '' or why not, never the bearer."""
-    chan = seat_channel_dir(seat)
-    token_path = os.path.join(chan, SEAT_TOKEN_NAME)
+def seat_credential_files(seat, *, agent_id: str, instance: str, tier: str, relay_url: str,
+                          bearer: str) -> "tuple[dict, str]":
+    """({name in the seat's channel dir: its text}, '') or ({}, why not, never the bearer): the `token`
+    (one line, <relay_url>|<bearer>) and `.env` (AGENT_MXID, GATEWAY_INSTANCE, REMOTE_TASK_TOKEN_FILE,
+    REMOTE_TASK_TIER) write_seat_credentials writes, for a writer that holds the channel dir open itself."""
+    token_path = os.path.join(seat_channel_dir(seat), SEAT_TOKEN_NAME)
     values = {"AGENT_MXID": (agent_id or "").strip(), "GATEWAY_INSTANCE": instance or "",
               TOKEN_FILE_KEY: token_path, "REMOTE_TASK_TIER": tier or ""}
     problem = _seat_values_problem(values)
     if problem:
-        return f"the seat's {problem}"
+        return {}, f"the seat's {problem}"
     for v in (values["AGENT_MXID"], token_path):
         if "\n" in v or "\r" in v or v != v.strip() or v[:1] in "\"'" or v[-1:] in "\"'":
-            return "the agent id or the seat path cannot be carried on a .env line as it is"
+            return {}, "the agent id or the seat path cannot be carried on a .env line as it is"
     why = gateway_url_problem(relay_url or "")
     if why:
-        return f"the relay URL {why}"
+        return {}, f"the relay URL {why}"
     if not bearer or any(c.isspace() or c == "|" or ord(c) < 0x20 for c in bearer):
-        return "the bearer is empty or holds whitespace, a control character or '|'"
+        return {}, "the bearer is empty or holds whitespace, a control character or '|'"
+    return {SEAT_TOKEN_NAME: f"{relay_url}|{bearer}\n", ".env": "".join(f"{k}={v}\n" for k, v in values.items())}, ""
+
+
+def write_seat_credentials(seat, *, agent_id: str, instance: str, tier: str, relay_url: str, bearer: str) -> str:
+    """Write a seat's channel dir (seat_credential_files): each file 0600 through temp + rename, the dir
+    0700. A rewrite replaces the token in place, which is a rotation. '' or why not, never the bearer."""
+    files, problem = seat_credential_files(seat, agent_id=agent_id, instance=instance, tier=tier,
+                                           relay_url=relay_url, bearer=bearer)
+    if problem:
+        return problem
+    chan = seat_channel_dir(seat)
     os.makedirs(chan, mode=0o700, exist_ok=True)
     os.chmod(chan, 0o700)
-    _replace_file(token_path, f"{relay_url}|{bearer}\n", 0o600)
-    _replace_file(os.path.join(chan, ".env"), "".join(f"{k}={v}\n" for k, v in values.items()), 0o600)
+    for name, text in files.items():
+        _replace_file(os.path.join(chan, name), text, 0o600)
     return ""
 
 

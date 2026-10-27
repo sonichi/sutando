@@ -10,7 +10,8 @@
 # Guards:
 #   - the tag MUST equal the packaged __version__ (fail loudly on mismatch);
 #   - the version MUST NOT already exist on PyPI (no silent re-upload);
-#   - the package test suites + src-drift guard run before any upload.
+#   - the package test suites + src-drift guard run before any upload, and on
+#     every PR in ci.yml (sparrow-publish-gate job), on the same Python.
 #
 # One-time PyPI setup (owner): project ag2-sparrow → Publishing → add GitHub
 # Trusted Publisher (owner: sonichi, repo: sutando, workflow:
@@ -77,10 +78,7 @@ jobs:
             echo "::error::version $VER already on PyPI — bump __version__"; exit 1
           fi
       - name: Test before publish (package suites + src-drift guard)
-        run: |
-          set -e
-          for t in packages/ag2-sparrow/tests/test_*.py; do python3 "$t"; done
-          python3 packages/ag2-sparrow/tools/test_no_drift.py
+        run: bash packages/ag2-sparrow/tools/publish_gate.sh
       - name: Build sdist + wheel
         run: |
           python3 -m pip install --quiet build

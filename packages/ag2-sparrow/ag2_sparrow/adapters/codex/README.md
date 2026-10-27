@@ -23,9 +23,31 @@ occupancy and the holder record attribution, never readiness.
 ```bash
 ag2-sparrow-codex-local install --work <dir> [--codex-home <dir>] [--sandbox read-only|workspace-write] \
     [--allow-non-owner] [--model <m>] [--codex <path>]
+ag2-sparrow-codex-local install --token-env-file <the agent's .env> [the same options]
 ag2-sparrow-codex-local verify
 ag2-sparrow-codex-local uninstall
 ```
+
+**Connect with a code (experimental, off in this release).** `connect` refuses ("Codex connect is not
+enabled in this release; use install --work / verify") before it reads or redeems a code or touches any
+root, seat, unit or lock. Use `install --work` and `verify`. What follows is the experimental path.
+On a host with no core, `connect` is the agent's whole setup, with
+claude-local's `connect` behaviour, from the same package code (`connect_bridge`): it checks the
+machine before the code is spent (no host supervisor, no `AGENT_CONNECT_TASK_DIR`, the Codex pin, and
+`codex login status` under `--codex-home`), reads the code from a prompt or `--code -` (a code on the
+command line works with a warning), requires https for `--base` and the relay URL (plain http only on
+a loopback host) and a relay on `--base`'s host or under it unless `--trust-relay-host` names it,
+retries a 202 or 503 on a 1, 2, 4, 8, 16 s backoff, and says why a 404'd code is gone. The credential
+owner writes the seat beside the agent's root (`<root>.bridge/channels/ag2space/{.env,token}`, 0600,
+`GATEWAY_INSTANCE` minted once and kept across reconnects), then `install --token-env-file <seat>/.env`
+runs. The bearer is only ever in the seat's `token`.
+
+**The agent's bridge.** `--work` is a root a bridge you run feeds, as before. `--token-env-file` alone
+makes the root the agent's own (`<agents dir>/<segment of its id>`) and has install wire that agent's
+bridge, exactly as claude-local's install does: one launch environment (the root's `tasks/` and
+`results/`, the bridge's state at `<root>.bridge/state`, a seat's exports with every inherited token
+cleared) in a marked unit or launchd agent of its own, `ag2-sparrow-codex-local-bridge`. `verify` adds
+the bridge's connected status and its unit; `uninstall` stops and removes that unit too.
 
 `install` checks `codex --version` against the pin (0.160.1, the version the stdio shape was measured
 on; parsed from the line starting with `codex`; older is one line and exit 2, nothing written), then

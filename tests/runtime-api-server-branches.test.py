@@ -28,6 +28,7 @@ sys.path.insert(0, str(REPO / "src" / "runtime-api"))
 sys.path.insert(0, str(REPO / "src"))
 
 import server as srv  # noqa: E402
+import identity_source  # noqa: E402
 
 
 class _DeadWriter:
@@ -193,7 +194,7 @@ class HelperFallbacks(unittest.TestCase):
     def test_channels_dir_none_when_resolver_unimportable(self):
         import unittest.mock as mock
         with mock.patch.dict(sys.modules, {"util_paths": None}):
-            self.assertIsNone(srv._channels_dir())
+            self.assertIsNone(identity_source.channels_dir())
 
     def test_host_label_resolves_via_repo_script(self):
         import subprocess
@@ -207,7 +208,7 @@ class HelperFallbacks(unittest.TestCase):
              mock.patch("subprocess.run", fake_run):
             os.environ.pop("SUTANDO_HOST_LABEL", None)
             # exact value: the success path must surface the script's label
-            self.assertEqual(srv._host_label(), "lab-host")
+            self.assertEqual(identity_source.host_label(), "lab-host")
 
     def test_watchers_fall_back_on_malformed_poll_interval(self):
         import unittest.mock as mock
@@ -233,9 +234,9 @@ class HelperFallbacks(unittest.TestCase):
 
     def test_host_label_none_when_script_fails(self):
         import unittest.mock as mock
-        with mock.patch.object(srv, "_HERE",
+        with mock.patch.object(identity_source, "_HERE",
                                Path(tempfile.mkdtemp()) / "src" / "runtime-api"):
-            self.assertIsNone(srv._host_label())
+            self.assertIsNone(identity_source.host_label())
 
     def test_enrolled_agent_id_absent_and_corrupt(self):
         # The reader moved to rundir.py so daemon, CLI and shell share it.

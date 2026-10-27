@@ -33,7 +33,11 @@ DATA_FILES = ("ag2_sparrow/tmux-pane-keys.sh",
               "ag2_sparrow/adapters/claude_routine/routine-prompt.md",
               "ag2_sparrow/adapters/claude_routine/README.md",
               "ag2_sparrow/adapters/claude_cloud_session/session-prompt.md",
-              "ag2_sparrow/adapters/claude_cloud_session/README.md")
+              "ag2_sparrow/adapters/claude_cloud_session/README.md",
+              # the plugin claude-local loads when no --plugin-dir is given
+              "ag2_sparrow/adapters/claude_code/ag2space-inbox/.claude-plugin/plugin.json",
+              "ag2_sparrow/adapters/claude_code/ag2space-inbox/hooks/hooks.json",
+              "ag2_sparrow/adapters/claude_code/ag2space-inbox/hooks/register.ts")
 
 
 def _expected_packages():
