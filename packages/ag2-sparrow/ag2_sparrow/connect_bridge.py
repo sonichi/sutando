@@ -120,6 +120,20 @@ def launch_env(cfg: dict) -> "tuple[dict, str]":
     return env, ""
 
 
+# All a seat bridge keeps of its launcher's environment beside launch_env: no credential, and of the
+# SUTANDO_* names only the telemetry setting, so the owner's opt-out still holds in the bridge.
+_PROXY_NAMES = ("HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "ALL_PROXY")
+SEAT_ENV_KEEP = ("PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "TZ",
+                 "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "DO_NOT_TRACK", "SUTANDO_TELEMETRY",
+                 *_PROXY_NAMES, *(n.lower() for n in _PROXY_NAMES))
+
+
+def seat_child_env(launch: dict, environ=None) -> dict:
+    """A seat bridge's whole environment: SEAT_ENV_KEEP from `environ` (default os.environ), then the seat's
+    launch_env over it, then an empty owner room set last so nothing overrides it. Nothing else reaches it."""
+    return {**cm.child_env_from(SEAT_ENV_KEEP, environ), **launch, "REMOTE_PROACTIVE_ROOM": ""}
+
+
 def install_identity(token_file: str, host_binding: bool) -> str:
     """The agent id by the bridge's own chain over the token file it will run with; the host's binding
     counts only when that file is the host's own device env."""

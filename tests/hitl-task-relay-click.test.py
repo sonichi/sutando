@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
 
@@ -64,6 +65,67 @@ class TaskRelayClickTests(unittest.TestCase):
                                     "action_id": "allow", "guard": self.req.guard})
         self.assertTrue(rgb._handle_hitl_action(t))
         self.assertEqual(self.mgr.get(self.req.id).chosen_action, "allow")
+
+    def test_task_tier_refusal_is_reported_without_applying_the_click(self):
+        for tier in ("team", "guest"):
+            with self.subTest(tier=tier):
+                t = self._task(access_tier=tier, hitl_action={
+                    "hitl_id": self.req.id, "expected_revision": self.req.revision,
+                    "action_id": "allow", "guard": self.req.guard})
+                out = rgb._handle_hitl_action(t)
+                self.assertTrue(str(out).startswith("refused:"), out)
+                self.assertIsNone(self.mgr.get(self.req.id).chosen_action)
+                self.assertTrue(rgb._hitl_control_body(out).startswith(
+                    "That click did not apply"))
+
+    def test_missing_and_owner_tier_allow_owner_clicks(self):
+        missing = self._task(hitl_action={
+            "hitl_id": self.req.id, "expected_revision": self.req.revision,
+            "action_id": "allow", "guard": self.req.guard})
+        self.assertEqual(rgb._handle_hitl_action(missing), "applied")
+        self.assertEqual(self.mgr.get(self.req.id).chosen_action, "allow")
+
+        req = self.mgr.create(HumanRequirement(
+            kind="permission", runtime="claude", message="Approve this action",
+            guard=f"hook:{os.urandom(4).hex()}",
+            actions=[Action(id="allow", kind="allow_once", label="Allow")]))
+        owner_tier = self._task(access_tier="owner", hitl_action={
+            "hitl_id": req.id, "expected_revision": req.revision,
+            "action_id": "allow", "guard": req.guard})
+        self.assertEqual(rgb._handle_hitl_action(owner_tier), "applied")
+        self.assertEqual(self.mgr.get(req.id).chosen_action, "allow")
+
+    def test_local_tier_cap_refuses_a_claimed_owner_task(self):
+        with patch.object(rgb, "_load_tier_map", return_value={OWNER: "team"}):
+            t = self._task(access_tier="owner", hitl_action={
+                "hitl_id": self.req.id, "expected_revision": self.req.revision,
+                "action_id": "allow", "guard": self.req.guard})
+            out = rgb._handle_hitl_action(t)
+        self.assertTrue(str(out).startswith("refused:"), out)
+        self.assertIsNone(self.mgr.get(self.req.id).chosen_action)
+
+    def test_event_click_checks_the_attested_tier(self):
+        handler = rgb._hitl_reply_handler(OWNER, log=lambda *_: None)
+        self.assertIsNotNone(handler)
+        for n, tier in enumerate(("team", "guest")):
+            with self.subTest(tier=tier):
+                handler.offer({
+                    "type": "message.created", "event_id": f"$tiered{n}", "actor_id": OWNER,
+                    "access_tier": tier,
+                    "content": {"space.ag2.hitl.action": {
+                        "hitl_id": self.req.id, "expected_revision": self.req.revision,
+                        "action_id": "allow", "guard": self.req.guard}},
+                })
+                self.assertEqual(handler.last_outcome, "refused")
+                self.assertIsNone(self.mgr.get(self.req.id).chosen_action)
+
+    def test_capped_owner_typed_label_stays_a_message(self):
+        self.mgr.record_projection(self.req.id, self.req.revision, "$card-capped")
+        with patch.object(rgb, "_load_tier_map", return_value={OWNER: "team"}):
+            out = rgb._handle_hitl_action(self._task(
+                access_tier="owner", reply_to_event="$card-capped", task="Allow"))
+        self.assertIs(out, False)
+        self.assertIsNone(self.mgr.get(self.req.id).chosen_action)
 
     def test_reply_to_the_card_with_a_label_is_applied(self):
         self.mgr.record_projection(self.req.id, self.req.revision, "$card")
