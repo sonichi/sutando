@@ -524,8 +524,9 @@ class RefusalClassTests(unittest.TestCase):
         req = self.mgr.create(make_req())
         for i in range(pj.PROJECTION_MAX_REFUSALS):
             later = lambda: 10.0 ** 7 * (i + 1)  # noqa: E731
-            pj.project_pass(self.mgr, self._raising(400), ROOM, clock=lambda: time.time() + later(),
-                            monotonic=lambda: time.monotonic() + later())
+            with self.assertRaises(OSError):  # a lone refusal also backs the caller off
+                pj.project_pass(self.mgr, self._raising(400), ROOM, clock=lambda: time.time() + later(),
+                                monotonic=lambda: time.monotonic() + later())
         self.assertTrue(self.mgr.projection_failed(req.id))
         self.assertFalse(self.mgr.needs_projection(req.id))
         self.assertEqual(pending_ids(self.mgr), [], "a failed card is not pending work")
@@ -559,7 +560,10 @@ class RefusalWriterTests(unittest.TestCase):
             self.addCleanup(pj._RETRY_DEADLINES.clear)
 
     def _pass(self, send, wall, mono):
-        return self.pj.project_pass(self.mgr, send, ROOM, clock=lambda: wall, monotonic=lambda: mono)
+        try:
+            return self.pj.project_pass(self.mgr, send, ROOM, clock=lambda: wall, monotonic=lambda: mono)
+        except OSError as e:  # nothing accepted: re-raised for the caller's backoff, pass attached
+            return e.projection
 
     def test_an_endpoint_wide_404_fails_no_card_and_recovers(self):
         a = self.mgr.create(make_req(guard="a", device={"id": "da", "name": "n"}))
@@ -644,14 +648,118 @@ class RefusalWriterTests(unittest.TestCase):
             "store.save = save\n"
             "def send(p):\n"
             "    e = OSError('HTTP 400'); e.code = 400; raise e\n"
-            "projector.project_pass(HitlManager(store), send, '!r', **({'monotonic': time.monotonic} "
-            "if 'monotonic' in projector.project_pass.__code__.co_varnames else {}))\n"
+            "try:\n"
+            "    projector.project_pass(HitlManager(store), send, '!r', monotonic=time.monotonic)\n"
+            "except OSError:\n"
+            "    pass\n"
         ) % (src, root)
         procs = [subprocess.Popen([sys.executable, "-c", child]) for _ in range(2)]
         self.assertEqual([p.wait(timeout=60) for p in procs], [0, 0])
         self.assertEqual(self.mgr.store.projection(req.id).get("refusals"), 2,
                          "two refused sends are two attempts, whatever their interleaving")
 
+
+
+class EndpointWideRefusalTests(unittest.TestCase):
+    """A card-class 4xx is charged to a card only on evidence that it is that card's: a relay
+    that refuses every card identically fails none of them and backs the caller off."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.mgr = HitlManager(HitlStore(Path(self.tmp.name)))
+        from hitl import projector as pj
+        self.pj = pj
+        self.addCleanup(pj._RETRY_DEADLINES.clear)
+        self.addCleanup(getattr(pj, "_REFUSED_SINCE_ACCEPT", {}).clear)
+        self.t = 0
+
+    def card(self, g):
+        return self.mgr.create(make_req(guard=g, device={"id": f"d{g}", "name": "n"}))
+
+    def drive(self, send):
+        """One pass a long way past every per-card wait; returns (pass, raised)."""
+        self.t += 10 ** 7
+        wall, mono = time.time() + self.t, time.monotonic() + self.t
+        try:
+            return self.pj.project_pass(self.mgr, send, ROOM, clock=lambda: wall, monotonic=lambda: mono), None
+        except OSError as e:
+            return e.projection, e
+
+    def refused_for(self, *bad):
+        ok = RecordingSender()
+
+        def send(payload):
+            if payload["extra_content"].get(WIRE_FIELD, {}).get("id") in bad:
+                _refusing(400)(payload)
+            return ok(payload)
+        return send
+
+    def test_an_endpoint_wide_400_fails_no_card_and_reaches_the_caller(self):
+        cards = [self.card(g) for g in ("a", "b", "c")]
+        for _ in range(self.pj.PROJECTION_MAX_REFUSALS * 2):
+            got, raised = self.drive(_refusing(400))
+            self.assertIsNotNone(raised, "the caller's backoff must engage")
+            self.assertTrue(raised.endpoint_wide)
+            self.assertEqual((got.refused, got.failed), ([], []))
+        for req in cards:
+            self.assertFalse(self.mgr.projection_failed(req.id))
+            self.assertNotIn("refusals", self.mgr.store.projection(req.id))
+        got, raised = self.drive(RecordingSender())
+        self.assertIsNone(raised)
+        self.assertEqual(sorted(i for i, _ in got.done), sorted(r.id for r in cards))
+
+    def test_cards_refused_in_separate_passes_are_still_the_endpoints(self):
+        a = self.card("a")
+        _, raised = self.drive(_refusing(400))   # alone: ambiguous, charged once and raised
+        self.assertFalse(raised.endpoint_wide)
+        b = self.card("b")
+        for _ in range(self.pj.PROJECTION_MAX_REFUSALS * 2):
+            _, raised = self.drive(_refusing(400))
+            self.assertTrue(raised.endpoint_wide)
+        self.assertEqual(self.mgr.store.projection(a.id).get("refusals"), 1)
+        self.assertNotIn("refusals", self.mgr.store.projection(b.id))
+        self.assertFalse(self.mgr.projection_failed(a.id) or self.mgr.projection_failed(b.id))
+
+    def test_one_card_refused_beside_an_accepted_one_is_that_cards(self):
+        bad, good = self.card("a"), self.card("b")
+        got, raised = self.drive(self.refused_for(bad.id))
+        self.assertIsNone(raised, "a pass that delivered a card is not the relay's failure")
+        self.assertEqual([i for i, _ in got.done], [good.id])
+        self.assertEqual([(i, n) for i, n, _, _ in got.refused], [(bad.id, 1)])
+        self.assertNotIn("refusals", self.mgr.store.projection(good.id))
+
+    def test_a_lone_refused_card_is_charged_and_the_caller_backs_off(self):
+        """One card alone cannot tell the relay's fault from its own: charge it (so a bad card
+        ends at the bound) and raise (so the caller backs off meanwhile)."""
+        req = self.card("a")
+        n = self.pj.PROJECTION_MAX_REFUSALS
+        for i in range(n):
+            got, raised = self.drive(_refusing(400))
+            self.assertIsNotNone(raised)
+            self.assertFalse(raised.endpoint_wide)
+        self.assertEqual([i for i, _, _ in got.failed], [req.id])
+        self.assertTrue(self.mgr.projection_failed(req.id))
+        self.assertEqual(pending_ids(self.mgr), [], "nothing left to drive: the caller's backoff resets")
+
+    def test_a_bad_card_fails_at_the_bound_across_passes_where_others_succeed(self):
+        bad = self.card("bad")
+        for i in range(self.pj.PROJECTION_MAX_REFUSALS):
+            self.card(f"good{i}")
+            got, raised = self.drive(self.refused_for(bad.id))
+            self.assertIsNone(raised)
+        self.assertEqual([i for i, _, _ in got.failed], [bad.id])
+        self.assertTrue(self.mgr.projection_failed(bad.id))
+
+    def test_a_failed_card_is_no_evidence_against_the_endpoint(self):
+        first = self.card("a")
+        for _ in range(self.pj.PROJECTION_MAX_REFUSALS):
+            self.drive(_refusing(400))
+        self.assertTrue(self.mgr.projection_failed(first.id))
+        second = self.card("b")
+        _, raised = self.drive(_refusing(400))
+        self.assertFalse(raised.endpoint_wide, "only a card still owed counts as another victim")
+        self.assertEqual(self.mgr.store.projection(second.id).get("refusals"), 1)
 
 
 _SAFE_INT = 2 ** 53 - 1  # canonical JSON's integer range is [-(2**53)+1, 2**53-1]

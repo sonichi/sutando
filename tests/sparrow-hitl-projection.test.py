@@ -225,5 +225,63 @@ class OneRefusedCard(unittest.TestCase):
         self.assertIn("invalid edit: bad content", failed[0], "the relay's own reason reaches the log")
 
 
+class EndpointWideRefusal(OneRefusedCard):
+    """A relay that refuses every card identically is the relay's fault: the driver backs off
+    relay-wide and no card is charged or marked failed, however long it lasts."""
+
+    def _send(self, method, path, payload=None, timeout=None):
+        self.posts.append(payload["extra_content"][hs.WIRE_FIELD]["id"])
+        raise urllib.error.HTTPError("https://example.invalid/relay/v1/room", 400, "Bad Request", None,
+                                     io.BytesIO(b'{"error": "bad request"}'))
+
+    def test_every_card_refused_backs_off_and_fails_none(self):
+        logs = []
+        for i in range(B._hitl_modules()[1].PROJECTION_MAX_REFUSALS * 3):
+            B._HITL_BACKOFF["until"] = 0.0  # let each pulse through, keep the delay
+            later = 10 ** 7 * (i + 1)
+            with mock.patch("time.time", return_value=B.time.time() + later), \
+                    mock.patch("time.monotonic", return_value=B.time.monotonic() + later):
+                with self.assertRaises(urllib.error.HTTPError):
+                    B._project_hitl(log=logs.append)
+            self.assertGreater(B._HITL_BACKOFF["delay"], 0.0, "the relay-wide backoff engages")
+        for card in (self.bad, self.good):
+            self.assertFalse(self.manager.projection_failed(card))
+            self.assertNotIn("refusals", self.manager.store.projection(card))
+        self.assertFalse([line for line in logs if "could not be projected" in line], logs)
+
+    test_the_next_card_still_projects_in_the_same_pass = None
+    test_the_refused_card_stops_after_the_bound_and_is_said_once = None
+
+
+class LoneRefusedCard(OneRefusedCard):
+    """The only card owed, refused: it is charged toward the bound and the driver also backs
+    off; once it is marked failed the driver goes idle and the backoff clears."""
+
+    def setUp(self):
+        super().setUp()
+        self.manager.cancel(self.good)
+        self.manager.record_projection(self.good, 99, "$x")
+
+    def test_it_is_charged_backed_off_then_failed_and_the_driver_idles(self):
+        bound = B._hitl_modules()[1].PROJECTION_MAX_REFUSALS
+        logs = []
+        for i in range(bound):
+            B._HITL_BACKOFF["until"] = 0.0
+            later = 10 ** 7 * (i + 1)
+            with mock.patch("time.time", return_value=B.time.time() + later), \
+                    mock.patch("time.monotonic", return_value=B.time.monotonic() + later):
+                with self.assertRaises(urllib.error.HTTPError):
+                    B._project_hitl(log=logs.append)
+            self.assertGreater(B._HITL_BACKOFF["delay"], 0.0)
+        self.assertTrue(self.manager.projection_failed(self.bad))
+        self.assertEqual(len([line for line in logs if "could not be projected" in line]), 1, logs)
+        B._HITL_BACKOFF["until"] = 0.0
+        self.assertEqual(B._project_hitl(log=logs.append), 0)
+        self.assertEqual(B._HITL_BACKOFF["delay"], 0.0, "nothing owed: the backoff clears")
+
+    test_the_next_card_still_projects_in_the_same_pass = None
+    test_the_refused_card_stops_after_the_bound_and_is_said_once = None
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

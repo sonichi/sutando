@@ -1671,7 +1671,9 @@ def _project_hitl(log=print) -> int:
                 continue
         except Exception as e:  # noqa: BLE001 — re-raised below, after both passes
             failed, raised = True, raised or e
-            continue
+            got = getattr(e, "projection", None)  # a pass that accepted nothing still reports its cards
+            if not isinstance(got, projector.ProjectionPass):
+                continue
         done += got.done
         refused += got.refused
         gave_up += got.failed

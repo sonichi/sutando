@@ -123,8 +123,9 @@ class HitlArchiveCheckTest(unittest.TestCase):
             raise err
 
         for i in range(getattr(projector, "PROJECTION_MAX_REFUSALS", 5)):
-            projector.project_pass(mgr, refuse, "!r", clock=lambda: time.time() + 10 ** 7 * (i + 1),
-                                   monotonic=lambda: time.monotonic() + 10 ** 7 * (i + 1))
+            with self.assertRaises(OSError):  # a lone refusal is also re-raised for the caller's backoff
+                projector.project_pass(mgr, refuse, "!r", clock=lambda: time.time() + 10 ** 7 * (i + 1),
+                                       monotonic=lambda: time.monotonic() + 10 ** 7 * (i + 1))
         out = hc.check_hitl_archive()
         self.assertEqual(out["status"], "warn")
         self.assertIn(f"1 card(s) could not be projected ({req.id})", out["detail"])
@@ -143,8 +144,9 @@ class HitlArchiveCheckTest(unittest.TestCase):
             raise err
 
         for i in range(getattr(projector, "PROJECTION_MAX_REFUSALS", 5)):
-            projector.project_pass(mgr, refuse, "!r", clock=lambda: time.time() + 10 ** 7 * (i + 1),
-                                   monotonic=lambda: time.monotonic() + 10 ** 7 * (i + 1))
+            with self.assertRaises(OSError):  # a lone refusal is also re-raised for the caller's backoff
+                projector.project_pass(mgr, refuse, "!r", clock=lambda: time.time() + 10 ** 7 * (i + 1),
+                                       monotonic=lambda: time.monotonic() + 10 ** 7 * (i + 1))
         self.assertTrue(mgr.projection_failed(req.id))
         out = hc.check_hitl_archive()
         self.assertEqual(out["status"], "warn")
