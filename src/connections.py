@@ -844,7 +844,10 @@ def _adopt_launch_keys(rows: list, workspace: Optional[Path], vault) -> bool:
     try:
         known = {r["token_ref"] for r in rows} | {k for r in rows for k in r.get("launch_keys") or []}
         known |= set(removed_env_refs(workspace))
-        new = {v: t for v, t in channel_launch_keys().items() if v not in known}
+        taken = {r["instance"] for r in rows}
+        # A key whose instance another row holds never becomes a row; skipping it keeps a list read-only.
+        new = {v: t for v, t in channel_launch_keys().items()
+               if v not in known and v[len(INSTANCE_TOKEN_PREFIX):].lower() not in taken}
         if not new:
             return False
         import_from_env(new, workspace=workspace, vault=vault)
@@ -1241,8 +1244,10 @@ def derive_state(sidecar: Mapping[str, object], launch: Mapping[str, object],
     return "disconnected", None
 
 
-def _writer_gone(pid: object) -> bool:
-    """Whether `pid` names a process that no longer exists; anything unprovable is not gone."""
+def _writer_gone(sidecar: Mapping[str, object]) -> bool:
+    """Pid liveness of the sidecar's writer: gone when its pid is free or now names a process that
+    started at another time. A hung writer is alive; anything unprovable is not gone."""
+    pid = sidecar.get("pid")
     if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
         return False
     try:
@@ -1251,7 +1256,11 @@ def _writer_gone(pid: object) -> bool:
         return True
     except OSError:
         return False
-    return False
+    started = sidecar.get("proc_start")
+    if not isinstance(started, str) or not started:
+        return False
+    now = workspace_lock.proc_start(pid)
+    return now is not None and now != started
 
 
 def status_for(row: Mapping[str, object], workspace: Optional[Path] = None) -> dict:
@@ -1260,7 +1269,7 @@ def status_for(row: Mapping[str, object], workspace: Optional[Path] = None) -> d
     optional field spelled out (`disabled` false, identity fields None when unknown)."""
     inst = str(row.get("instance") or "")
     sidecar = _sidecar(inst, workspace)
-    if sidecar.get("connected") and _writer_gone(sidecar.get("pid")):
+    if sidecar.get("connected") and _writer_gone(sidecar):
         sidecar = {**sidecar, "connected": False}  # a bridge that died says nothing about now
     launch = _read_json(launch_record_path(inst, workspace))
     out = dict(row)

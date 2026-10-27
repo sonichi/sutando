@@ -900,6 +900,25 @@ class ListSelfHeals(ChannelFileBase):
         C.remove_connection("beta", force=True, workspace=self.ws, vault=self.vault, kill=lambda *a, **k: None)
         self.assertEqual([r["instance"] for r in C.list_connections(self.ws, vault=self.vault)], [""])
 
+    def test_a_key_whose_instance_another_row_holds_leaves_the_record_untouched(self):
+        C.import_from_env({"REMOTE_TASK_TOKEN": TOKEN_A}, workspace=self.ws, vault=self.vault)
+        self.add(TOKEN_B, fetch=agents("@s:beta-fixture.net"), instance="beta")
+        self.write_relay_env("AG2_REMOTE_TOKEN_BETA=https://chat.gamma-fixture.net|g")
+        before = C.record_path(self.ws).read_bytes()
+        with unittest.mock.patch.object(C, "import_from_env") as imported, \
+                unittest.mock.patch.object(C, "resolve_server") as resolved:
+            rows = C.list_connections(self.ws, vault=self.vault)
+        imported.assert_not_called(); resolved.assert_not_called()
+        self.assertEqual(([r["instance"] for r in rows], C.record_path(self.ws).read_bytes()), (["", "beta"], before))
+
+    def test_a_failing_adoption_is_logged_and_the_existing_rows_still_list(self):
+        C.import_from_env({"REMOTE_TASK_TOKEN": TOKEN_A}, workspace=self.ws, vault=self.vault)
+        with unittest.mock.patch.object(C, "channel_launch_keys", side_effect=RuntimeError("keychain locked")):
+            with self.assertLogs("connections", level="WARNING") as logs:
+                rows = C.list_connections(self.ws, vault=self.vault)
+        self.assertEqual([r["instance"] for r in rows], [""])
+        self.assertIn("adopting launch keys failed (RuntimeError)", logs.output[0])
+
     def test_a_failing_import_is_logged_and_the_list_still_answers(self):
         with unittest.mock.patch.object(C, "import_from_env", side_effect=RuntimeError("keychain locked")):
             with self.assertLogs("connections", level="WARNING") as logs:
@@ -1028,6 +1047,18 @@ class StatusJoin(Base):
         self.assertEqual(C.derive_state({"connected": True}, {"ok": True}, True), ("parked", "disabled"),
                          "a disabled row is parked whatever a stale sidecar says")
         self.assertEqual(C.derive_state({}, {"ok": False, "reason": "no_token"}, True), ("parked", "disabled"))
+
+    def test_only_a_provably_missing_writer_is_gone(self):
+        self.assertEqual([C._writer_gone({"pid": p}) for p in (None, True, 0, -1, "12")], [False] * 5)
+        self.assertFalse(C._writer_gone({}), "no pid proves nothing")
+        with unittest.mock.patch.object(C.os, "kill", side_effect=PermissionError("another user's")):
+            self.assertFalse(C._writer_gone({"pid": 12345}), "a pid we may not signal is alive")
+        me = os.getpid()
+        self.assertFalse(C._writer_gone({"pid": me}), "a live pid with no recorded start is alive")
+        self.assertFalse(C._writer_gone({"pid": me, "proc_start": C.workspace_lock.proc_start(me)}))
+        self.assertTrue(C._writer_gone({"pid": me, "proc_start": "boot:1"}), "a reused pid is another process")
+        with unittest.mock.patch.object(C.workspace_lock, "proc_start", return_value=None):
+            self.assertFalse(C._writer_gone({"pid": me, "proc_start": "boot:1"}), "an unreadable start proves nothing")
 
     def test_a_sidecar_whose_bridge_died_is_not_connected(self):
         C.import_from_env({"REMOTE_TASK_TOKEN": TOKEN_A}, workspace=self.ws, vault=self.vault)

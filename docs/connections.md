@@ -140,8 +140,9 @@ Unaddressed proactive messages (a `results/proactive-*.txt` naming no room) and 
 cards go to the primary row's bridge, under its instance or a launch-key alias, read from the
 record on every pass (`connections.owns_unaddressed`, injected as the bridge's
 `OWNS_UNADDRESSED`), so a promotion moves them without a relaunch. With no named primary, or an
-unreadable record, the legacy unsuffixed bridge owns them. A desktop host that parks the primary's
-lane because the owner signed in on another homeserver moves the primary to the signed-in lane.
+unreadable record, the legacy unsuffixed bridge owns them. While the primary's bridge is down they
+are held, never handed to another lane. A desktop host that parks the primary's lane because the
+owner signed in on another homeserver moves the primary to the signed-in lane.
 
 While the **legacy** bridge (`instance: ""`) runs the order differs. Its launchers (the
 launchd wrapper and the bare launch in `startup-runtime.sh`) read `primary` before they spawn
@@ -314,8 +315,10 @@ that is empty stays empty: its rows were removed on purpose), so the panel
 shows the connection on its next refresh without an engine restart; an import that fails
 is logged and the list still answers. A record that exists still adopts, on `list`, any
 `AG2_REMOTE_TOKEN_<INST>` the channel env file or environment holds that no row owns and
-`removed_env` does not name: the key a desktop sign-in on another homeserver writes. A row's
-sidecar whose writing bridge has exited reads as not connected. The plan lists every enabled row with an
+`removed_env` does not name: the key a desktop sign-in on another homeserver writes. A key whose
+instance another row already holds is skipped without a write. A row's sidecar reads as not
+connected when a pid-liveness check proves its writer gone: the pid is free, or now names a
+process with another start time (`proc_start`). A hung but live bridge still reads as connected. The plan lists every enabled row with an
 instance (a disabled row stays down, and its env token is not re-planned either) plus any
 env token the import could not record, so an unavailable vault degrades to the previous
 behaviour instead of losing a gateway. The plan is startup's only source of what to launch,

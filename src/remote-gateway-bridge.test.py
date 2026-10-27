@@ -1782,6 +1782,13 @@ def main() -> int:
     rtc.OWNS_UNADDRESSED = lambda: (_ for _ in ()).throw(OSError("x"))
     check(rtc.owns_unaddressed() is True, "a failed primary check keeps the launch-time rule")
     (rtc.RESULTS_DIR / "proactive-t1i.txt").unlink(); rtc.OWNS_UNADDRESSED = _saved_owns
+    _real_resolve, _asked = rtc.resolve_destination, []
+    rtc.resolve_destination = lambda audience, **kw: _asked.append(audience) or ""
+    rtc.OWNS_UNADDRESSED = lambda: False
+    check(rtc._project_hitl() == 0 and not _asked, "a bridge that is not the primary projects no cards")
+    rtc.GATEWAY_INSTANCE, rtc.OWNS_UNADDRESSED = "dev", lambda: True
+    check(rtc._project_hitl() == 0 and _asked == [rtc.OWNER_PRIVATE], "a named primary looks for the owner DM to project cards")
+    rtc.resolve_destination, rtc.GATEWAY_INSTANCE, rtc.OWNS_UNADDRESSED = _real_resolve, _inst, _saved_owns
     rtc._reenroll_identity = lambda: "@agent-t:example.org"
     rtc._ROUTING.update(owner_dm="", persisted="", next=0.0, loaded=False)
     STATE["agents"] = [{"id": "@agent-t:example.org", "owner": "@owner:example.org", "owner_dm_room": "!dm:example.org"}]
