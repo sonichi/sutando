@@ -155,15 +155,15 @@ def bridge_environ(decl: dict, token: str, base=None, url: str = "") -> dict:
     """What the bridge runs under: sparrowd's environment minus the host-only variables, every name the
     owner lists for a host's gateway tokens and endpoints and every key it carries, plus the derived env, an empty owner
     DM, the owner's carried config (resolved here, from the host's files if need be) and the agent's token
-    (with `url`, the agent's own gateway from endpoint(), when the token embeds none). A seat's is the
-    derived env alone: its credential is its own token file, so no token, URL or carried config is added."""
+    (with `url`, the agent's own gateway from endpoint(), when the token embeds none). A seat's is an
+    allowlist: the adapter's seat_child_env, its derived env over a few safe host names and nothing else."""
+    host = os.environ if base is None else base
+    if is_seat(decl):
+        return adapter.seat_child_env(decl["env"], host)
     # The carried keys come only from the owner's result below, never from the generic base.
     strip = _sources.bridge_strip_keys() + _sources.BRIDGE_CARRIED_CONFIG
-    host = os.environ if base is None else base
     env = {k: v for k, v in host.items() if k not in HOST_ONLY and k not in strip}
     env.update(decl["env"], REMOTE_PROACTIVE_ROOM="")
-    if is_seat(decl):
-        return env
     token_env = _sources.bridge_token_environ(token, url)
     env.update(_sources.bridge_carried_config(host, read_regular))
     env.update(token_env)

@@ -128,6 +128,29 @@ def other_connect_errors():
               f"{name} on connect prints no stand card")
 
 
+def desktop_install():
+    # A desktop install has no ag2space.json: the agent is named only by the
+    # gateway's channel .env, which must still give the card its stand_id.
+    root = TMP / "desktop"
+    lane = root / "claude-home" / "channels" / "ag2space"
+    lane.mkdir(parents=True)
+    (root / "state" / "auth").mkdir(parents=True)
+    (lane / ".env").write_text("AGENT_ID=@desk-test:example.org\n"
+                               "REMOTE_TASK_TOKEN=secret\n")
+    env = {**ENV, "SUTANDO_RUNTIME_STATE": str(root / "state"),
+           "CLAUDE_CONFIG_DIR": str(root / "claude-home"),
+           "SUTANDO_RUNTIME_SOCKET": str(root / "rt.sock")}
+    p = subprocess.run([*PYBASE, str(CLI), "sutando", "stand", "--json"],
+                       capture_output=True, text=True, timeout=60, env=env)
+    try:
+        card = json.loads(p.stdout)
+    except ValueError:
+        card = {}
+    check(card.get("stand", {}).get("stand_id") == "@desk-test:example.org",
+          f"desktop install: stand_id from the lane .env (rc={p.returncode})")
+    check("secret" not in p.stdout, "desktop install: no token in the card")
+
+
 def main() -> int:
     seed()
     sys.path.insert(0, str(REPO / "src" / "runtime-api"))
@@ -163,6 +186,7 @@ def main() -> int:
           "sutando info without a server still errors")
 
     other_connect_errors()
+    desktop_install()
 
     if BIN.is_file():
         p = subprocess.run(["bash", str(BIN), "stand", "--json"],

@@ -1897,8 +1897,10 @@ POLL_STALL_EXIT_CODE = 69
 # Proactive-message drain: when REMOTE_PROACTIVE_ROOM names a room id, every
 # `results/proactive-*.txt` the agent writes is delivered to that room as a
 _PROACTIVE_ROOM_ENV = os.environ.get("REMOTE_PROACTIVE_ROOM")
+# A seat never drains the host's proactive room, whatever its environment or its .env names.
 PROACTIVE_ROOM = (
-    _PROACTIVE_ROOM_ENV
+    "" if gateway_credential_sources.is_seat(os.environ)
+    else _PROACTIVE_ROOM_ENV
     if _PROACTIVE_ROOM_ENV is not None
     else _config_from_channel_env("REMOTE_PROACTIVE_ROOM")
 )
