@@ -26,6 +26,8 @@ python3 skills/pending-questions/scripts/pq.py list [--json]
 python3 skills/pending-questions/scripts/pq.py reconcile
 python3 skills/pending-questions/scripts/pq.py resolve <ask-id> [--answered]
 python3 skills/pending-questions/scripts/pq.py remind [--force]
+python3 skills/pending-questions/scripts/pq.py clicks [--json]
+python3 skills/pending-questions/scripts/pq.py ack <ask-id>
 ```
 
 **Trigger: any time you would write a question for the owner into terminal or summary text, file
@@ -76,6 +78,35 @@ count (`python3 src/pending_questions_reader.py summary`).
 - `remind` is the only way a reminder is sent (`src/check-pending-questions.py --notify`
   with this skill's adapter). Nothing is scheduled, and no pass surfaces questions: the
   owner is asked once, as questions come up, and reminded when he asks.
+
+## Decision-card clicks
+
+A question's decision card is a HITL `choice` requirement with runtime `pending-questions`, guard
+and `subject.ask_id` set to the ask id and `subject.choices` mapping each action id to what it
+does. The bridge owner-checks a click, records it (`chosen_action`) and, the card asking for a
+turn, forwards it to the core as a task headed `hitl_click: true`. The core then runs
+`python3 src/pending_questions_reader.py clicks` (`pq.py clicks` is the same), which reaches this
+adapter's `clicks` (`scripts/pending_questions_clicks.py`):
+
+- Each pass runs under one exclusive lock beside the HITL store
+  (`state/hitl/pending-questions-clicks.lock`); its holder is the only live claimant, so no pid
+  is probed. A claim still marked `claiming` was left by a pass that died before handing the
+  choice over, and is re-offered.
+- The pass claims the click (a token, saved atomically on the card), closes the row as Answered
+  in one guarded write that also requires the owner's Status to be open, and records the claim
+  `handed` before returning it. The choice prints once, as
+  `[<ask-id>] chose <action-id> '<label>' -> <consequence>`, to that caller alone. A later pass, by
+  any consumer, prints it as "handed out earlier, awaiting ack — not a new decision".
+- The core acts, then runs `… ack <ask-id>`: a closed row settles the card; one whose close is
+  still pending is marked acknowledged and later passes only retry the close.
+- A row already closed by the owner's own Status, or by code without this click's claim, makes
+  the click stale: "already answered — not a decision", and its card is cancelled.
+- `resolve` retires (cancels) the question's card whenever it closes the row or the room refuses
+  the close.
+
+The one window left: a pass that dies after recording `handed` and before its caller printed the
+choice leaves it handed but unseen; every later pass shows it as awaiting ack, with the choice,
+rather than offering it again.
 
 ## The outbox
 

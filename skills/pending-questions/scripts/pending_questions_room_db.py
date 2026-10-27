@@ -24,7 +24,9 @@ the row (committing the history marker first when the row is in view and the mar
 a marker that cannot be written leaves the row open and records the close locally), else
 records the closure locally for the next reconcile — only for a question held in the outbox,
 or in outage mode once a row of this workspace was ever confirmed; an unknown id with neither
-is refused and changes no count. `remind` is the reminder.
+is refused and changes no count; a question's decision card is retired with it. `clicks` and
+`ack_click` hand each card click to one consumer (`pending_questions_clicks`). `remind` is the
+reminder.
 
 `serve` answers one pending_questions_store.DbClient request (JSON on stdin) over
 one connection to the room's databases document, writing only the DATABASE.md
@@ -48,6 +50,7 @@ for _p in (REPO / "src", HERE):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 import pending_questions_ask as core_ask
+import pending_questions_clicks as cards
 from pending_questions_outbox import (Outbox as HeldRecords, local_closes, mark_room_introduced,
                                       mark_store_used, room_introduced, store_history)
 from pending_questions_store import (DB_SCHEMA, INCOMPLETE, TERMINAL, GuardFailed, Outbox, Question,
@@ -66,6 +69,10 @@ SETTLE_SEC = 1.0
 ROOM_KEY = "PENDING_QUESTIONS_ROOM"
 # The collab service URL; set, it overrides the capability's own resolution (an outage rehearsal).
 URL_KEY = "PENDING_QUESTIONS_COLLAB_URL"
+# `resolve`'s answer when the room saw the row and refused the close (closed already, no such row);
+# the second when only a code Closed mark, no owner Status, had closed it.
+REFUSED_PREFIX = "room database: not changed"
+CODE_CLOSED_PREFIX = REFUSED_PREFIX + " (closed by code)"
 
 
 def skill_scripts(workspace: Path) -> Optional[Path]:
@@ -267,7 +274,22 @@ def _close_locally(ws: Path, ask_id: str, status: str, why: str, basis: Optional
     return True, f"recorded locally as {status} in {p} ({why}; {basis}); the next reconcile applies it to the row"
 
 
-def resolve(workspace: Path, ask_id: str, status: str) -> tuple:
+def resolve(workspace: Path, ask_id: str, status: str, manager=None) -> tuple:
+    """`_close_row`, then the question's decision card is retired once the row is closed (or recorded
+    closed) or the room refuses the close, so no later click can read as a decision."""
+    ok, msg = _close_row(workspace, ask_id, status)
+    if ok or msg.startswith(REFUSED_PREFIX):
+        try:
+            gone = cards.retire_cards(manager or cards.manager_for(workspace), ask_id)
+        except Exception as e:  # noqa: BLE001 — the row's close stands; a live card is only reported
+            msg += f"; its decision card could not be retired ({type(e).__name__}: {e})"
+        else:
+            if gone:
+                msg += f"; decision card {', '.join(gone)} retired"
+    return ok, msg
+
+
+def _close_row(workspace: Path, ask_id: str, status: str, require_open: bool = False) -> tuple:
     """(closed, message): the row's Closed cell takes `status` (Answered or Resolved) after a
     reconcile files any held question; a store that cannot be written leaves a local close
     record instead. A row in view before the history marker was ever committed commits it
@@ -287,14 +309,30 @@ def resolve(workspace: Path, ask_id: str, status: str) -> tuple:
                     Outbox(ws).commit_history(ask_id)
                 except StoreError as e:
                     return _close_locally(ws, ask_id, status, f"room database: left open — {e}", "its row is in view")
-            store.close(ask_id, status)
+            store.close(ask_id, status, require_open=require_open)
             return True, f"room database: {ask_id} -> {status} in {store.where(ask_id)}"
     except GuardFailed as g:
         if not g.current and any(e["ask_id"] == ask_id for e in Outbox(ws).entries()):
             return _close_locally(ws, ask_id, status, "its held entry has no row yet")
-        return False, f"room database: not changed — {type(g).__name__}: {g}"
+        owner = g.current.get("status") in TERMINAL
+        prefix = CODE_CLOSED_PREFIX if g.current.get("closed") and not owner else REFUSED_PREFIX
+        return False, f"{prefix} — {type(g).__name__}: {g}"
     except Exception as e:  # noqa: BLE001
         return _close_locally(ws, ask_id, status, f"room database unreachable ({type(e).__name__}: {e})")
+
+
+def _close_for_click(ws: Path, ask_id: str, status: str) -> tuple:
+    return _close_row(ws, ask_id, status, require_open=True)
+
+
+def clicks(workspace: Path, manager=None) -> list:
+    """The owner's decision-card clicks, each handed over as an actionable choice exactly once
+    (pending_questions_clicks); the row closes through this adapter's guarded close."""
+    return cards.clicks(Path(workspace), _close_for_click, REFUSED_PREFIX, CODE_CLOSED_PREFIX, manager)
+
+
+def ack_click(workspace: Path, ask_id: str, manager=None) -> tuple:
+    return cards.ack_click(Path(workspace), ask_id, manager)
 
 
 # ---- the ask ----------------------------------------------------------------------
