@@ -79,6 +79,40 @@ count (`python3 src/pending_questions_reader.py summary`).
   with this skill's adapter). Nothing is scheduled, and no pass surfaces questions: the
   owner is asked once, as questions come up, and reminded when he asks.
 
+## Decision cards (the ask)
+
+A question asked with `--default-action` and/or `--option` whose destination is AG2 Space (its
+task's bridge, else the bridge the owner was last active on) is asked as a decision card, built by
+`src/hitl/cards.py` (the one builder every card producer uses): one button per choice — with a
+default, one per `ordered_options()` entry, Approve first and carrying it; with options alone,
+exactly the options as given, with no Approve — and `subject.choices` holding each consequence.
+
+- **Order.** The card is built and its id allocated; the question is held in the outbox and its
+  row is written, both naming that id (`**Sent:** card hitl_<id> for ag2space owner-dm (decision
+  card) at <time>`); only then is the card stored, for the AG2 Space gateway to post in the
+  owner's DM. No card exists without a durable question. The ask reports
+  `stored, not yet shown: decision card hitl_<id>`: storing is not showing.
+- **One surface.** Once a card exists, no text is sent for that question. `create_card` returns
+  stored, not stored or unknown: a store that raised but whose card file is there, or one that
+  cannot be checked, is kept as the card, and the report says no text was sent.
+- **Text instead.** Only when the card cannot be built, the question cannot be held (then no card
+  is stored), or the card is provably not stored; and for every other bridge. On a definite card
+  failure the text goes to the question's own destination with the row's own link (the one the
+  row write returned), and the question is held again, flagged `redeliver`, naming that file. A
+  landed row is rewritten now (one body write, `RoomDbStore.redeliver`) and the held entry goes;
+  a row that could not be rewritten, or whose write was never confirmed, takes the record at the
+  next reconcile, which replays the entry and rewrites the row before releasing it. A death
+  before the hold leaves a record naming an absent card, which the reminder reads as due: text
+  again, never silence.
+- **The reminder.** It never sends text for a question whose card is live (pending or clicked) or
+  whose store cannot say — `--force` included; such questions are left to the card. Once posted,
+  the question's last-asked time is the gateway's `notified_at`. A live card with no post
+  recorded 30 minutes (`CARD_POINTER_GRACE_SEC`) after it was stored gets one text pointer, once
+  per card (recorded on the card as `pointer_at`): it says the question waits as a card in his
+  AG2 Space DM and may not have arrived, and quotes its title, with no options, no approve
+  wording, and a note that a reply does not answer it. Only a card that is gone leaves the
+  question due for text. Nothing is scheduled: all of this happens when the reminder runs.
+
 ## Decision-card clicks
 
 A question's decision card is a HITL `choice` requirement with runtime `pending-questions`, guard

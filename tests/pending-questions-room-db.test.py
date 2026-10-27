@@ -860,7 +860,10 @@ class TestDelegation(unittest.TestCase):
         self.assertNotRegex(s, r"\bledger\.|FileStore|pending-questions\.md")
         core = self.src(self.SKILL + "pending_questions_ask.py")
         self.assertIn("Outbox(ws).save(out[\"question\"], out[\"sent_line\"], now)", core)
-        self.assertLess(core.index("write_proactive(ws"), core.index("Outbox(ws).save("), "queue, then hold")
+        self.assertLess(core.index("_ask_by_text(out, question"), core.rindex("Outbox(ws).save("),
+                        "text: queue, then hold")
+        self.assertLess(core.index("Outbox(ws).save("), core.index("def create_card("),
+                        "card: hold, then store the card")
 
     def test_the_store_confirms_the_exact_ask_id_before_the_outbox_entry_goes(self):
         s = self.src(self.SKILL + "pending_questions_store.py")

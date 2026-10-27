@@ -317,6 +317,22 @@ def _close_row(workspace: Path, ask_id: str, status: str) -> tuple:
         return _close_locally(ws, ask_id, status, f"room database unreachable ({type(e).__name__}: {e})")
 
 
+def _redeliver_now(ws: Path, store, out: dict) -> None:
+    """After a card fallback the held entry (flagged redeliver) names the text; a landed row takes
+    the same record now, and the entry goes once it has. Anything less is left to the next
+    reconcile, which replays the entry into the row the same way."""
+    if store is None or not out["record"] or str(out["record"]).startswith("outbox "):
+        return
+    q = Question.from_dict(out["question"])
+    try:
+        store.redeliver(q, out["sent_line"])
+        if out["outbox"]:
+            Outbox(ws).delete(q.ask_id)
+            out["outbox"] = None
+    except Exception as e:  # noqa: BLE001 — the held entry stays: the next reconcile rewrites the row
+        out["db_error"] = f"row delivery record not rewritten yet ({type(e).__name__}: {e}); held for reconcile"
+
+
 def _close_for_click(ws: Path, ask_id: str, token: str) -> tuple:
     """(closed | stale | deferred, message) for a click claim. Only the room itself can say the
     owner's Status is open, so there is no local fallback: anything it cannot verify defers."""
@@ -368,7 +384,7 @@ def ask_owner(question: str, context: Optional[str] = None, urgency: str = "live
               host: Optional[str] = None, now: Optional[float] = None, store=None,
               default_action: Optional[str] = None, reason: Optional[str] = None,
               options=(), priority: str = "Medium") -> dict:
-    """Queue (core), hold, row, bounded reconcile, notify — each step reported, none raising past here.
+    """Hold (core), row, card or text, bounded reconcile, notify — each step reported, none raising.
     `store` is this adapter's store; None leaves the question in the outbox. No outbox record,
     no row: the question is still queued to the owner, and the report says it was not held. A
     confirmed row commits the store-history marker, then releases its outbox entry; a marker
@@ -388,7 +404,7 @@ def ask_owner(question: str, context: Optional[str] = None, urgency: str = "live
                                   default_action, reason, options, priority)
     out.update({"reconcile": rec, "record": None, "db_error": out["outbox_error"], "link": link,
                 "macos": None, "macos_fix": None, "history_error": None})
-    if out["proactive_file"] and intro:
+    if (out["proactive_file"] or out["card"]) and intro:
         try:
             mark_room_introduced(ws, out["ask_id"])
         except OSError as e:
@@ -410,6 +426,9 @@ def ask_owner(question: str, context: Optional[str] = None, urgency: str = "live
                     out["history_error"] = f"{type(e).__name__}: {e}"
             else:
                 out["record"] = f"outbox {out['outbox']}"
+        # only now: the outbox, and the row when it landed, name the card
+        if core_ask.create_card(out, link=out["link"]) == core_ask.CARD_NOT_STORED:
+            _redeliver_now(ws, store, out)
         if out["record"] is not None and out["outbox"] is None:
             try:
                 rec = reconcile_pending(store, ws, host)

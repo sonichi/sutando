@@ -401,25 +401,23 @@ def decision_for_reply(text: str) -> str | None:
 def hitl_manager(ws: Path):
     """The engine's HITL store: the bridge projects what is created here and applies the clicks."""
     _engine_modules()
-    from hitl.manager import HitlManager, HitlStore, default_store  # type: ignore
+    from hitl.cards import manager_for  # type: ignore
 
-    return HitlManager(HitlStore(default_store(ws)))
+    return manager_for(ws)
 
 
 def register_ask(ws: Path, draft_id: str, title: str, device: str) -> str:
     """One HumanRequirement per draft: the card the owner sees, keyed to the draft by guard."""
     _engine_modules()
-    from hitl.schema import Action, HumanRequirement  # type: ignore
+    from hitl.cards import create_choice  # type: ignore
 
-    req = HumanRequirement(
-        kind="choice", runtime=HITL_RUNTIME, title="File a bug report?",
-        message=f"I hit what looks like a Sutando/AG2 Space defect: {title}. File it to the team?",
-        guard=draft_id, device={"id": f"{HITL_RUNTIME}:{draft_id}", "name": device},
-        actions=[Action(id=a["id"], kind=a["kind"], label=a["label"]) for a in ASK_ACTIONS],
-        subject={"draft_id": draft_id, "title": title},
-        turn_on_action=True,  # the click reaches the core as a task, so the Stop hook runs at once
-    )
-    return hitl_manager(ws).create(req).id
+    # turn_on_action (the helper's default): the click reaches the core as a task, so the Stop hook runs at once
+    return create_choice(
+        f"I hit what looks like a Sutando/AG2 Space defect: {title}. File it to the team?",
+        ASK_ACTIONS, draft_id, {"draft_id": draft_id, "title": title},
+        runtime=HITL_RUNTIME, title="File a bug report?",
+        device={"id": f"{HITL_RUNTIME}:{draft_id}", "name": device}, manager=hitl_manager(ws),
+    ).id
 
 
 def requirement_for_draft(manager, draft_id: str):
@@ -438,18 +436,16 @@ HELD_ACTIONS = [
 def register_held(ws: Path, manager, draft_id: str, title: str, device: str) -> str:
     """The post got no answer: a new card says so and asks again. Same guard grammar with a suffix,
     so the store dedupes a repeat and the click's task path is the same one."""
-    from hitl.schema import Action, HumanRequirement  # type: ignore
+    _engine_modules()
+    from hitl.cards import create_choice  # type: ignore
 
-    req = HumanRequirement(
-        kind="choice", runtime=HITL_RUNTIME, title="Bug report: filed or not?",
-        message=(f"The report \"{title}\" was sent but no answer came back, so it may or may not be filed. "
-                 f"File it again, or skip it?"),
-        guard=f"{draft_id}:held", device={"id": f"{HITL_RUNTIME}:{draft_id}:held", "name": device},
-        actions=[Action(id=a["id"], kind=a["kind"], label=a["label"]) for a in HELD_ACTIONS],
-        subject={"draft_id": draft_id, "title": title, "held": True},
-        turn_on_action=True,
-    )
-    return manager.create(req).id
+    return create_choice(
+        (f"The report \"{title}\" was sent but no answer came back, so it may or may not be filed. "
+         f"File it again, or skip it?"),
+        HELD_ACTIONS, f"{draft_id}:held", {"draft_id": draft_id, "title": title, "held": True},
+        runtime=HITL_RUNTIME, title="Bug report: filed or not?",
+        device={"id": f"{HITL_RUNTIME}:{draft_id}:held", "name": device}, manager=manager,
+    ).id
 
 
 def apply_clicks(ws: Path, prefs: dict, device: str, *, release_automatic: bool = True) -> dict:

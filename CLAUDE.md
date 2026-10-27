@@ -168,7 +168,7 @@ When you need the owner's word or are blocked:
 
 `python3 src/pending_questions_reader.py list` is read-only, only when the owner asks or you are blocked; `… resolve <id>` when he answers. `python3 src/check-pending-questions.py` reconciles and lists; `--notify` reminds, on demand only; nothing is scheduled or surfaced per pass.
 
-A task headed `hitl_click: true` is the owner's click on a decision card: run `python3 src/pending_questions_reader.py clicks`, act only on a `chose` line (ack within 10 minutes or it is re-offered once), then `… ack <ask-id> --token <token>` with the token it printed, and answer `[no-send]`. A `chose` can arrive twice: before acting, re-check the current state (already merged, already resolved, already done) and skip what is.
+With `--default` or `--option`, a question bound for AG2 Space is asked as a decision card, not text. A task headed `hitl_click: true` is the owner's click on such a card: run `python3 src/pending_questions_reader.py clicks`, act only on a `chose` line (ack within 10 minutes or it is re-offered once), then `… ack <ask-id> --token <token>` with the token it printed, and answer `[no-send]`. A `chose` can arrive twice: before acting, re-check the current state (already merged, already resolved, already done) and skip what is.
 
 ## Task progress notifications
 

@@ -45,8 +45,8 @@ MAX_REOFFERS = 1
 
 
 def manager_for(workspace):
-    from hitl.manager import HitlManager, HitlStore, default_store  # noqa: PLC0415
-    return HitlManager(HitlStore(default_store(Path(workspace))))
+    from hitl.cards import manager_for as store_manager  # noqa: PLC0415
+    return store_manager(Path(workspace))
 
 
 def clicks_lock(manager):
@@ -70,16 +70,20 @@ def answered_cards(manager) -> list:
     return out
 
 
-def stamp_claim(manager, hitl_id: str, claim: dict) -> bool:
-    """Save the card's claim, whole, in one atomic store write under the store lock. False when
-    the card is gone or terminal (retired meanwhile, e.g. by a concurrent `resolve`): not saved."""
+def stamp_subject(manager, hitl_id: str, **fields) -> bool:
+    """Merge `fields` into the card's subject in one atomic store write under the store lock. False
+    when the card is gone or terminal (retired meanwhile, e.g. by a concurrent `resolve`): not saved."""
     with manager.store.locked():
         req = manager.get(hitl_id)
         if req is None or req.terminal:
             return False
-        req.subject = {**(req.subject or {}), "claim": dict(claim)}
+        req.subject = {**(req.subject or {}), **fields}
         manager.store.save(req)
         return True
+
+
+def stamp_claim(manager, hitl_id: str, claim: dict) -> bool:
+    return stamp_subject(manager, hitl_id, claim=dict(claim))
 
 
 def retire_cards(manager, ask_id: str) -> list:

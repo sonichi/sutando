@@ -350,6 +350,11 @@ class RoomDbStore:
     def insert(self, q: Question, sent_line: str) -> dict:
         return self.insert_raw(q.ask_id, q.question, question_body(q, sent_line), q.priority)
 
+    def redeliver(self, q: Question, sent_line: str) -> None:
+        """Rewrite this row's body with a new delivery record, in one body write under `lock`."""
+        rid = self._rid(q.ask_id)
+        self._locked(lambda: self.client.set_body(DB_SCHEMA, rid, question_body(q, sent_line)))
+
     def complete(self, ask_id: str) -> bool:
         """The row is present, carries this exact ask id (and this host), has a body and no
         incomplete mark: the confirmation an outbox entry is deleted on."""
@@ -445,8 +450,9 @@ class Outbox(HeldRecords):
         super().__init__(workspace)
         self.workspace = Path(workspace)
 
-    def save(self, q: Question, sent_line: str, now: Optional[float] = None) -> Path:  # type: ignore[override]
-        return super().save(q.to_dict(), sent_line, now)
+    def save(self, q: Question, sent_line: str, now: Optional[float] = None,  # type: ignore[override]
+             redeliver: bool = False) -> Path:
+        return super().save(q.to_dict(), sent_line, now, redeliver)
 
     def commit_history(self, ask_id: str) -> None:
         """The durable fact a confirmed row proves, committed before any local evidence goes."""
@@ -476,6 +482,8 @@ class Outbox(HeldRecords):
                 store.insert(q, e["sent"] or f"**Sent:** record not kept; held in the outbox since {e['saved_at']}")
                 if not store.complete(q.ask_id):
                     raise StoreError("the row is still incomplete after the replay")
+                if e.get("redeliver"):
+                    store.redeliver(q, e["sent"])  # a row born with an older record takes this one
                 self.commit_history(q.ask_id)
                 self.delete(q.ask_id)
                 flushed.append(q.ask_id)
