@@ -109,14 +109,20 @@ adapter's `clicks` (`scripts/pending_questions_clicks.py`):
   <token>`, to that caller alone. Later passes, by any consumer, print it as "handed out earlier,
   awaiting ack — not a new decision" for the lease (`HANDED_LEASE_SEC`, 10 minutes).
 - The core acts, then runs `… ack <ask-id> --token <token>`, which settles the card. A handed claim
-  past its deadline (`lease_until`) is re-offered as `chose` to the next pass, ONCE, with a fresh
-  token, so a consumer that died after the handoff does not strand the choice. After that single
-  re-offer an unacked claim is listed as "NEEDS ATTENTION — handed out twice, never acknowledged"
-  and never offered again. A `handed_at` ahead of this clock (a clock that ran ahead, or this one stepped back) is never
-  expired on sight, so a backward step cannot steal a live lease; it holds at most one lease from
-  the first pass that sees it (`skew_seen_at`), so a clock far ahead cannot hold the click for the
-  whole skew. `clicks --due` (and so the health check) also surfaces an unseen skewed claim and a
-  NEEDS ATTENTION one. An
+  whose lease has expired is re-offered as `chose` to the next pass, ONCE, with a fresh token and
+  a new lease, so a consumer that died after the handoff does not strand the choice. After that
+  single re-offer an unacked claim is listed as "NEEDS ATTENTION — handed out twice, never
+  acknowledged" and never offered again; `clicks --due` (and so the health check) surfaces it.
+- **The lease** (`scripts/pending_questions_lease.py`) counts elapsed time, not wall-clock
+  deadlines. Invariant: it expires exactly when the time credited to it reaches its window
+  (`HANDED_LEASE_SEC`, 600 s), and each pass credits `clamp(now - observed_at, 0, max_step)`,
+  where `observed_at` is the latest wall time seen for it and only moves forward. So a backward
+  step credits nothing and can never expire or flag a lease early; catching back up credits
+  nothing either (no span is counted twice), so a step back of D seconds delays expiry by at most
+  D; one forward jump credits at most `LEASE_MAX_STEP_SEC` (300 s, the health check's fallback
+  cadence); repeated passes at one time credit 0; a handoff or re-offer starts a new lease. The
+  passes are every `clicks` and every `clicks --due` (the health check), each crediting and saving
+  the lease atomically under the clicks lock, so a restart resumes from the saved credit. An
   ack carrying a superseded token is refused as stale and changes nothing.
 - **At-least-once, at most twice.** The core acts before it acks, so a consumer slower than the
   lease, or a clock jump, can let a second consumer receive the same `chose`. Rule: before acting

@@ -9,17 +9,18 @@ recorded click into an actionable choice:
   live claimant. A claim still marked `claiming` was left by a pass that died; it is retried with
   the same token.
 - The pass claims the click (a token, saved atomically), then the adapter closes the row as
-  Answered in one guarded write that requires the owner's Status to be open and writes the token
-  into the Closed mark. A refusal whose mark carries this token is this claim's own earlier close;
+  Answered in one guarded write that requires the owner's Status to be open and leaves the token
+  beside the Closed mark. A refusal whose token is this claim's is its own earlier close;
   any other refusal makes the click stale (card cancelled). A close the room cannot verify (an
   outage) defers the click: nothing is handed over and the claim stays to be retried.
-- On a close the claim is recorded `handed` (with `handed_at` and its deadline `lease_until`)
-  BEFORE the choice is returned. Later passes report it as "awaiting ack" until the deadline;
-  `ack_click` with the claim's token settles it. Past the deadline it is re-offered ONCE, with a
-  fresh token: a choice is delivered at most twice, so a consumer re-checks current state before
-  acting. After that single re-offer an unacked claim is listed as needing attention, never
-  offered again. A `handed_at` in the future (the clock went back) counts as fresh, not expired.
-  An ack carrying a superseded token is refused.
+- On a close the claim is recorded `handed` with a new lease BEFORE the choice is returned. The
+  lease is pending_questions_lease's elapsed-time lease: it expires once HANDED_LEASE_SEC has been
+  credited across passes, each pass crediting at most LEASE_MAX_STEP_SEC and nothing for a
+  backward step, so no wall-clock step can expire or stretch it. Later passes report the claim as
+  "awaiting ack"; `ack_click` with its token settles it. Once expired it is re-offered ONCE with a
+  fresh token and a new lease: a choice is delivered at most twice, so a consumer re-checks current
+  state before acting. After that single re-offer an expired claim is listed as needing attention,
+  never offered again. An ack carrying a superseded token is refused.
 """
 from __future__ import annotations
 
@@ -28,6 +29,8 @@ import time
 from pathlib import Path
 from typing import Optional
 
+import pending_questions_lease as lease_mod
+
 CARD_RUNTIME = "pending-questions"
 CLAIMING, HANDED = "claiming", "handed"
 CLOSED, STALE, DEFERRED = "closed", "stale", "deferred"
@@ -35,6 +38,9 @@ LOCK_NAME = "pending-questions-clicks.lock"
 # A handed choice not acked within this long is offered again, once: a consumer that died after
 # the handoff must not strand it, and no choice is delivered more than twice.
 HANDED_LEASE_SEC = 600
+# The most one pass credits: the health check's launchd fallback runs every 300 s, so on a host
+# where it runs real and credited time agree, and no single clock jump spends the whole lease.
+LEASE_MAX_STEP_SEC = 300
 MAX_REOFFERS = 1
 
 
@@ -87,31 +93,13 @@ def _token() -> str:
     return os.urandom(8).hex()
 
 
-def _lease(now: float) -> dict:
-    return {"handed_at": now, "lease_until": now + HANDED_LEASE_SEC}
-
-
-FRESH, EXPIRED, SKEWED = "fresh", "expired", "skewed"
-
-
-def _lease_state(claim: dict, now: float) -> str:
-    """fresh | expired | skewed. A `handed_at` ahead of this clock (stamped by a clock that ran
-    ahead, or seen after this one stepped back) is never expired on sight, so a backward step
-    cannot steal a live lease; but it holds at most one lease from when a pass first saw it
-    (`skew_seen_at`), so a clock far ahead cannot hold the click for the whole skew. `skewed`
-    means no pass has recorded that first sight yet."""
-    handed_at = float(claim.get("handed_at") or 0)
-    if handed_at > now:
-        seen = claim.get("skew_seen_at")
-        if seen is None or float(seen) > now:
-            return SKEWED
-        return EXPIRED if now >= float(seen) + HANDED_LEASE_SEC else FRESH
-    deadline = min(float(claim.get("lease_until") or handed_at + HANDED_LEASE_SEC), handed_at + HANDED_LEASE_SEC)
-    return EXPIRED if now >= deadline else FRESH
-
-
-def _lease_expired(claim: dict, now: float) -> bool:
-    return _lease_state(claim, now) == EXPIRED
+def _advanced(manager, c: dict, claim: dict, now: float) -> dict:
+    """Credit this pass to a handed claim's lease (pending_questions_lease) and persist it."""
+    lease = lease_mod.advance(claim.get("lease"), now, LEASE_MAX_STEP_SEC)
+    if lease != claim.get("lease"):
+        claim = {**claim, "lease": lease}
+        stamp_claim(manager, c["hitl_id"], claim)
+    return claim
 
 
 def clicks(workspace: Path, closer, manager=None, now: Optional[float] = None) -> list:
@@ -133,12 +121,10 @@ def clicks(workspace: Path, closer, manager=None, now: Optional[float] = None) -
                      "deferred": False, "handed_before": handed, "closed": handed, "token": None,
                      "close_message": "closed earlier by this click"}
             if handed:
-                if _lease_state(claim, clock()) == SKEWED:
-                    claim = {**claim, "skew_seen_at": clock()}  # the bound starts at this first sight
-                    stamp_claim(manager, c["hitl_id"], claim)
-                if _lease_expired(claim, clock()):
+                claim = _advanced(manager, c, claim, clock())
+                if lease_mod.expired(claim.get("lease"), HANDED_LEASE_SEC):
                     if int(claim.get("reoffers") or 0) < MAX_REOFFERS:
-                        claim = {**claim, **_lease(clock()), "token": _token(),
+                        claim = {**claim, "lease": lease_mod.new(clock()), "handed_at": clock(), "token": _token(),
                                  "reoffers": int(claim.get("reoffers") or 0) + 1}
                         stamp_claim(manager, c["hitl_id"], claim)
                         entry.update(actionable=True, reoffered=True, token=claim["token"])
@@ -151,7 +137,8 @@ def clicks(workspace: Path, closer, manager=None, now: Optional[float] = None) -
                 stamp_claim(manager, c["hitl_id"], claim)
             outcome, entry["close_message"] = closer(ws, c["ask_id"], claim["token"])
             if outcome == CLOSED:
-                stamp_claim(manager, c["hitl_id"], {**claim, "state": HANDED, **_lease(clock())})
+                stamp_claim(manager, c["hitl_id"], {**claim, "state": HANDED, "handed_at": clock(),
+                                                    "lease": lease_mod.new(clock())})
                 entry.update(actionable=True, closed=True, token=claim["token"])
             elif outcome == STALE:
                 manager.cancel(c["hitl_id"])
@@ -163,19 +150,21 @@ def clicks(workspace: Path, closer, manager=None, now: Optional[float] = None) -
 
 
 def due_clicks(workspace: Path, manager=None, now: Optional[float] = None) -> list:
-    """Ask ids a `clicks` pass would act on, or that need the owner's attention, read-only: a click
-    never processed, a claim left `claiming` (deferred, or its pass died), a handed claim past its
-    deadline (to be re-offered, or listed NEEDS ATTENTION once its re-offer is used), or one stamped
-    ahead of this clock that no pass has seen yet. The health check warns while this is non-empty."""
+    """Ask ids a `clicks` pass would act on, or that need the owner's attention: a click never
+    processed, a claim left `claiming` (deferred, or its pass died), or a handed claim whose lease
+    expired (to be re-offered, or listed NEEDS ATTENTION once its re-offer is used). Its only write
+    is crediting this pass to each handed lease, under the clicks lock, so a host whose clicks pass
+    runs only on demand still ages its leases on the health check's cadence."""
     manager = manager or manager_for(workspace)
-    now = time.time() if now is None else now
+    clock = time.time if now is None else (lambda: now)
     out = []
-    for c in answered_cards(manager):
-        claim = c["claim"]
-        if claim.get("state") != HANDED:
-            out.append(c["ask_id"])
-        elif _lease_state(claim, now) in (EXPIRED, SKEWED):
-            out.append(c["ask_id"])
+    with clicks_lock(manager):
+        for c in answered_cards(manager):
+            claim = c["claim"]
+            if claim.get("state") != HANDED:
+                out.append(c["ask_id"])
+            elif lease_mod.expired(_advanced(manager, c, claim, clock()).get("lease"), HANDED_LEASE_SEC):
+                out.append(c["ask_id"])
     return out
 
 

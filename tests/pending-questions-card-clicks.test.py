@@ -22,6 +22,7 @@ import json
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -33,6 +34,7 @@ for p in (REPO / "src", PQ):
         sys.path.insert(0, str(p))
 
 import pending_questions_clicks as cards
+import pending_questions_lease as lease_mod
 import pending_questions_reader as reader
 import pending_questions_room_db as room_db
 from hitl.manager import HitlManager, HitlStore
@@ -68,6 +70,15 @@ def make_card(m: HitlManager, ask_id: str, question="Merge #12?", options=OPTION
 
 def token_of(m: HitlManager, card: str) -> str:
     return m.get(card).subject["claim"]["token"]
+
+
+def lease_of(m: HitlManager, card: str) -> dict:
+    return m.get(card).subject["claim"]["lease"]
+
+
+def set_lease(m: HitlManager, card: str, observed_at: float, elapsed: float) -> None:
+    claim = m.get(card).subject["claim"]
+    cards.stamp_claim(m, card, {**claim, "lease": {"observed_at": observed_at, "elapsed": elapsed}})
 
 
 def click(m: HitlManager, card: str, action_id: str) -> None:
@@ -191,27 +202,31 @@ class CrashBoundaries(_Room):
         self.child("with mock.patch.object(reader, 'click_line', side_effect=lambda c: os._exit(17)):\n"
                    f"    reader.main(['clicks', '--workspace', str(ws), '--store-adapter', {ADAPTER!r}])")
         claim = self.m.get(self.card).subject["claim"]
-        self.assertEqual(claim["state"], cards.HANDED)
-        handed_at = claim["handed_at"]
-        [inside] = room_db.clicks(self.ws, manager=self.m, now=handed_at + cards.HANDED_LEASE_SEC - 1)
-        self.assertEqual((inside["actionable"], inside["handed_before"]), (False, True))
+        self.assertEqual((claim["state"], claim["lease"]["elapsed"]), (cards.HANDED, 0.0))
+        t = claim["lease"]["observed_at"]
+        for now in (t + cards.LEASE_MAX_STEP_SEC, t + cards.HANDED_LEASE_SEC - 1):  # credited 300, then 599
+            [inside] = room_db.clicks(self.ws, manager=self.m, now=now)
+            self.assertEqual((inside["actionable"], inside["handed_before"]), (False, True))
         self.assertIn("re-offered if no ack comes within the lease", reader.click_line(inside))
-        [after] = room_db.clicks(self.ws, manager=self.m, now=handed_at + cards.HANDED_LEASE_SEC)
+        [after] = room_db.clicks(self.ws, manager=self.m, now=t + cards.HANDED_LEASE_SEC)  # credited 600
         self.assertEqual((after["actionable"], after["reoffered"]), (True, True))
         self.assertIn("chose option-1 'Hold' -> wait for the CLA (re-offered", reader.click_line(after))
         fresh = self.m.get(self.card).subject["claim"]
         self.assertNotEqual(fresh["token"], claim["token"])
-        self.assertEqual(fresh["handed_at"], handed_at + cards.HANDED_LEASE_SEC)
-        [next_pass] = room_db.clicks(self.ws, manager=self.m, now=handed_at + cards.HANDED_LEASE_SEC + 1)
+        self.assertEqual(fresh["lease"], {"observed_at": t + cards.HANDED_LEASE_SEC, "elapsed": 0.0}, "renewal resets both")
+        [next_pass] = room_db.clicks(self.ws, manager=self.m, now=t + cards.HANDED_LEASE_SEC + 1)
         self.assertFalse(next_pass["actionable"], "a re-offer starts a new lease")
 
     def test_a_second_lease_expiry_gives_no_second_reoffer(self):
         click(self.m, self.card, "option-1")
         [first] = self.run_clicks()
-        t0 = self.m.get(self.card).subject["claim"]["handed_at"]
+        t0 = lease_of(self.m, self.card)["observed_at"]
+        room_db.clicks(self.ws, manager=self.m, now=t0 + cards.LEASE_MAX_STEP_SEC)
         [again] = room_db.clicks(self.ws, manager=self.m, now=t0 + cards.HANDED_LEASE_SEC)
         self.assertTrue(again["reoffered"])
-        for later in (t0 + 2 * cards.HANDED_LEASE_SEC, t0 + 50 * cards.HANDED_LEASE_SEC):
+        r = t0 + cards.HANDED_LEASE_SEC
+        room_db.clicks(self.ws, manager=self.m, now=r + cards.LEASE_MAX_STEP_SEC)
+        for later in (r + cards.HANDED_LEASE_SEC, r + 50 * cards.HANDED_LEASE_SEC):
             [stuck] = room_db.clicks(self.ws, manager=self.m, now=later)
             self.assertEqual((stuck["actionable"], stuck["needs_attention"]), (False, True))
             line = reader.click_line(stuck)
@@ -221,37 +236,19 @@ class CrashBoundaries(_Room):
         self.assertEqual(self.m.get(self.card).subject["claim"]["reoffers"], 1)
         self.assertTrue(room_db.ack_click(self.ws, self.ask_id, again["token"], self.m)[0], "it can still be acked")
 
-    def test_a_future_dated_handoff_is_fresh_not_expired(self):
-        click(self.m, self.card, "option-1")
-        self.run_clicks()
-        claim = self.m.get(self.card).subject["claim"]
-        future = claim["handed_at"] + 10 * cards.HANDED_LEASE_SEC  # the clock went back after the handoff
-        cards.stamp_claim(self.m, self.card, {**claim, "handed_at": future,
-                                              "lease_until": future + cards.HANDED_LEASE_SEC})
-        [c] = room_db.clicks(self.ws, manager=self.m, now=claim["handed_at"] + 2 * cards.HANDED_LEASE_SEC)
-        self.assertEqual((c["actionable"], c["handed_before"]), (False, True))
-        legacy = {k: v for k, v in claim.items() if k != "lease_until"}
-        cards.stamp_claim(self.m, self.card, {**legacy, "handed_at": future})
-        [c] = room_db.clicks(self.ws, manager=self.m, now=claim["handed_at"] + 2 * cards.HANDED_LEASE_SEC)
-        self.assertFalse(c["actionable"], "no deadline stored: handed_at in the future still counts as fresh")
-        cards.stamp_claim(self.m, self.card, {**claim, "handed_at": future, "lease_until": 1})
-        [c] = room_db.clicks(self.ws, manager=self.m, now=claim["handed_at"] + 2 * cards.HANDED_LEASE_SEC)
-        self.assertFalse(c["actionable"], "a future handed_at is fresh whatever the stored deadline says")
-
     def test_an_ack_inside_the_lease_prevents_any_reoffer(self):
         click(self.m, self.card, "option-1")
         [c] = self.run_clicks()
-        handed_at = self.m.get(self.card).subject["claim"]["handed_at"]
+        t = lease_of(self.m, self.card)["observed_at"]
         self.assertTrue(room_db.ack_click(self.ws, self.ask_id, c["token"], self.m)[0])
-        self.assertEqual(room_db.clicks(self.ws, manager=self.m, now=handed_at + 100 * cards.HANDED_LEASE_SEC), [])
+        for i in range(1, 6):
+            self.assertEqual(room_db.clicks(self.ws, manager=self.m, now=t + i * cards.LEASE_MAX_STEP_SEC), [])
         self.assertEqual(self.m.get(self.card).status, STATUS_RESOLVED)
 
     def test_two_consumers_after_the_lease_get_exactly_one_reoffer(self):
         click(self.m, self.card, "option-1")
         self.run_clicks()
-        claim = self.m.get(self.card).subject["claim"]
-        past = claim["handed_at"] - cards.HANDED_LEASE_SEC - 5
-        cards.stamp_claim(self.m, self.card, {**claim, "handed_at": past, "lease_until": past + cards.HANDED_LEASE_SEC})
+        set_lease(self.m, self.card, observed_at=time.time(), elapsed=cards.HANDED_LEASE_SEC)  # spent
         slow = ("real = rdb._close_for_click\n"
                 "import pending_questions_clicks as pc, time\n"
                 "real_cards = pc.answered_cards\n"
@@ -277,8 +274,9 @@ class TokenAndOutage(_Room):
     def test_a_late_ack_after_a_reoffer_is_refused_as_stale(self):
         click(self.m, self.card, "option-1")
         [first] = self.run_clicks()
-        handed_at = self.m.get(self.card).subject["claim"]["handed_at"]
-        [again] = room_db.clicks(self.ws, manager=self.m, now=handed_at + cards.HANDED_LEASE_SEC)
+        t = lease_of(self.m, self.card)["observed_at"]
+        room_db.clicks(self.ws, manager=self.m, now=t + cards.LEASE_MAX_STEP_SEC)
+        [again] = room_db.clicks(self.ws, manager=self.m, now=t + cards.HANDED_LEASE_SEC)
         self.assertTrue(again["reoffered"])
         self.assertNotEqual(again["token"], first["token"])
         ok, msg = room_db.ack_click(self.ws, self.ask_id, first["token"], self.m)
@@ -394,9 +392,9 @@ class Wakeup(_Room):
         self.child("with mock.patch.object(reader, 'click_line', side_effect=lambda c: os._exit(17)):\n"
                    f"    reader.main(['clicks', '--workspace', str(ws), '--store-adapter', {ADAPTER!r}])")
         self.assertEqual(self.loop_pass(), (None, ""), "inside the lease nothing is owed")
-        claim = self.m.get(self.card).subject["claim"]
-        past = claim["handed_at"] - cards.HANDED_LEASE_SEC - 1
-        cards.stamp_claim(self.m, self.card, {**claim, "handed_at": past, "lease_until": past + cards.HANDED_LEASE_SEC})
+        # one lease step short, last seen a full step ago: the health check's own pass spends it
+        set_lease(self.m, self.card, observed_at=time.time() - cards.LEASE_MAX_STEP_SEC,
+                  elapsed=cards.HANDED_LEASE_SEC - cards.LEASE_MAX_STEP_SEC)
         warn, out = self.loop_pass()
         self.assertIn(self.ask_id, warn["detail"])
         self.assertIn(f"[{self.ask_id}] chose option-1 'Hold' -> wait for the CLA (re-offered", out)
@@ -418,13 +416,15 @@ class Wakeup(_Room):
         click(self.m, self.card, "option-1")
         self.assertEqual(room_db.due_clicks(self.ws, self.m), [self.ask_id], "a click never processed")
         [c] = self.run_clicks()
-        t = self.m.get(self.card).subject["claim"]["handed_at"]
-        self.assertEqual(room_db.due_clicks(self.ws, self.m, now=t + 1), [], "inside the lease")
+        t = lease_of(self.m, self.card)["observed_at"]
+        self.assertEqual(room_db.due_clicks(self.ws, self.m, now=t + cards.LEASE_MAX_STEP_SEC), [], "inside the lease")
+        self.assertEqual(lease_of(self.m, self.card)["elapsed"], cards.LEASE_MAX_STEP_SEC, "the probe ages the lease")
         self.assertEqual(room_db.due_clicks(self.ws, self.m, now=t + cards.HANDED_LEASE_SEC), [self.ask_id])
         room_db.clicks(self.ws, manager=self.m, now=t + cards.HANDED_LEASE_SEC)
-        self.assertEqual(room_db.due_clicks(self.ws, self.m, now=t + cards.HANDED_LEASE_SEC + 1), [],
-                         "inside the re-offer's lease")
-        self.assertEqual(room_db.due_clicks(self.ws, self.m, now=t + 100 * cards.HANDED_LEASE_SEC), [self.ask_id],
+        r = t + cards.HANDED_LEASE_SEC
+        self.assertEqual(room_db.due_clicks(self.ws, self.m, now=r + 1), [], "inside the re-offer's lease")
+        room_db.due_clicks(self.ws, self.m, now=r + cards.LEASE_MAX_STEP_SEC)
+        self.assertEqual(room_db.due_clicks(self.ws, self.m, now=r + cards.HANDED_LEASE_SEC), [self.ask_id],
                          "its re-offer used and unacked: NEEDS ATTENTION is surfaced, not skipped")
         with mock.patch.object(reader, "_adapter", return_value=(None, "no adapter")):
             self.assertEqual(reader.due_clicks(self.ws), (None, "no store: no adapter"))
@@ -443,57 +443,91 @@ class Wakeup(_Room):
         self.assertIn(f"1 decision-card click(s) owe a pass: {self.ask_id}", click_ws_buf.getvalue())
 
 
-class SkewedClock(_Room):
-    """A handed_at ahead of this clock: never stolen on sight, held at most one lease from first sight."""
+class LeaseInvariant(unittest.TestCase):
+    """pending_questions_lease: a lease expires exactly when credited time reaches its window; a pass
+    credits clamp(now - observed_at, 0, max_step) and observed_at only moves forward."""
 
-    def _handed_at(self, handed_at):
+    W, STEP = 600.0, 300.0
+
+    def run_passes(self, times, start=1000.0, lease=None):
+        lease = lease or lease_mod.new(start)
+        for t in times:
+            lease = lease_mod.advance(lease, t, self.STEP)
+        return lease
+
+    def test_table(self):
+        T = 1000.0
+        cases = [  # (pass times after a lease made at T, credited, expired?, why)
+            ([T + 300, T + 599], 599.0, False, 'W - 1'),
+            ([T + 300, T + 600], 600.0, True, 'W exactly'),
+            ([T + 300, T + 601], 600.0, True, 'W + 1 is capped by the step'),
+            ([T + 300, T + 300, T + 300], 300.0, False, 'repeated passes at one time credit 0'),
+            ([T + 10**9], 300.0, False, 'a forward jump credits one step only'),
+            ([T + 10**9, T + 10**9 + 299], 599.0, False, '... and then real deltas again'),
+            ([T - 3600], 0.0, False, 'backward step credits 0'),
+            ([T - 1, T + 299], 299.0, False, 'rollback 1 s: no steal, nothing lost'),
+            ([T + 300, T - 50, T + 300], 300.0, False, 'rollback then catch-up: no double credit'),
+            ([T + 300, T - 50, T + 600], 600.0, True, '... credit resumes only past the high water'),
+        ]
+        for times, credited, exp, why in cases:
+            with self.subTest(why=why, times=times):
+                lease = self.run_passes(times, start=T)
+                self.assertEqual(lease["elapsed"], credited)
+                self.assertEqual(lease_mod.expired(lease, self.W), exp)
+                self.assertEqual(lease["observed_at"], max([T, *times]), "observed_at only moves forward")
+
+    def test_a_renewal_resets_both_fields_and_a_missing_lease_starts_now(self):
+        old = self.run_passes([1300, 1600], start=1000)
+        self.assertTrue(lease_mod.expired(old, self.W))
+        self.assertEqual(lease_mod.new(1601), {"observed_at": 1601.0, "elapsed": 0.0})
+        self.assertEqual(lease_mod.advance(None, 5, self.STEP), {"observed_at": 5.0, "elapsed": 0.0})
+        self.assertFalse(lease_mod.expired(None, self.W))
+
+
+class LeaseInProduction(_Room):
+    def _handed(self):
         click(self.m, self.card, "option-1")
-        self.run_clicks()
-        claim = self.m.get(self.card).subject["claim"]
-        cards.stamp_claim(self.m, self.card, {**claim, "handed_at": handed_at,
-                                              "lease_until": handed_at + cards.HANDED_LEASE_SEC})
-        return claim
+        [c] = self.run_clicks()
+        return lease_of(self.m, self.card)["observed_at"], c
 
-    def test_a_clock_far_ahead_holds_the_click_for_one_lease_not_the_whole_skew(self):
-        t = 1_800_000_000.0
-        self._handed_at(t + 365 * 86400)  # stamped by a clock a year ahead
-        self.assertEqual(room_db.due_clicks(self.ws, self.m, now=t), [self.ask_id], "unseen skew is surfaced")
-        [first] = room_db.clicks(self.ws, manager=self.m, now=t)
-        self.assertFalse(first["actionable"], "never stolen on sight")
-        self.assertEqual(self.m.get(self.card).subject["claim"]["skew_seen_at"], t)
-        [inside] = room_db.clicks(self.ws, manager=self.m, now=t + cards.HANDED_LEASE_SEC - 1)
-        self.assertFalse(inside["actionable"])
-        self.assertEqual(room_db.due_clicks(self.ws, self.m, now=t + cards.HANDED_LEASE_SEC), [self.ask_id])
-        [after] = room_db.clicks(self.ws, manager=self.m, now=t + cards.HANDED_LEASE_SEC)
-        self.assertEqual((after["actionable"], after["reoffered"]), (True, True),
-                         "bounded at one lease from first sight, not a year (or the +30 days probed)")
+    def test_a_one_second_rollback_after_a_late_reoffer_never_raises_attention(self):
+        t, _ = self._handed()
+        room_db.clicks(self.ws, manager=self.m, now=t + 300)
+        [re] = room_db.clicks(self.ws, manager=self.m, now=t + 700)  # a late re-offer
+        self.assertTrue(re["reoffered"])
+        [back] = room_db.clicks(self.ws, manager=self.m, now=t + 699)  # then the clock steps back 1 s
+        self.assertEqual((back["actionable"], back["needs_attention"]), (False, False))
+        self.assertEqual(lease_of(self.m, self.card), {"observed_at": t + 700, "elapsed": 0.0})
 
-    def test_a_clock_that_stepped_back_cannot_steal_a_live_lease(self):
-        claim = self._handed_at(1_800_000_000.0)
-        back = 1_800_000_000.0 - 1  # this clock is now 1 s behind the stamp
-        [c] = room_db.clicks(self.ws, manager=self.m, now=back)
-        self.assertFalse(c["actionable"], "no immediate steal")
-        [c] = room_db.clicks(self.ws, manager=self.m, now=back + cards.HANDED_LEASE_SEC)
-        self.assertFalse(c["actionable"], "once this clock passes the stamp, the original lease still holds")
-        [c] = room_db.clicks(self.ws, manager=self.m, now=1_800_000_000.0 + cards.HANDED_LEASE_SEC)
-        self.assertTrue(c["reoffered"], "and ends where it always did")
+    def test_a_stamp_just_under_a_window_ahead_is_held_one_window_of_observed_time(self):
+        t, _ = self._handed()
+        set_lease(self.m, self.card, observed_at=t + cards.HANDED_LEASE_SEC - 1, elapsed=0.0)  # stamped W-1 ahead
+        for now in (t, t + 300, t + cards.HANDED_LEASE_SEC - 1):  # behind or at the stamp: nothing credited
+            [c] = room_db.clicks(self.ws, manager=self.m, now=now)
+            self.assertFalse(c["actionable"])
+        self.assertEqual(lease_of(self.m, self.card)["elapsed"], 0.0)
+        room_db.clicks(self.ws, manager=self.m, now=t + cards.HANDED_LEASE_SEC - 1 + 300)
+        [c] = room_db.clicks(self.ws, manager=self.m, now=t + cards.HANDED_LEASE_SEC - 1 + 600)
+        self.assertTrue(c["reoffered"], "one window of observed time after the clock reached the stamp")
 
-    def test_a_first_sight_from_the_future_is_taken_again(self):
-        t = 1_800_000_000.0
-        claim = self._handed_at(t + 1000)
-        cards.stamp_claim(self.m, self.card, {**self.m.get(self.card).subject["claim"], "skew_seen_at": t + 500})
-        [c] = room_db.clicks(self.ws, manager=self.m, now=t)
-        self.assertFalse(c["actionable"])
-        self.assertEqual(self.m.get(self.card).subject["claim"]["skew_seen_at"], t)
+    def test_a_far_future_stamp_does_not_matter(self):
+        t, _ = self._handed()
+        set_lease(self.m, self.card, observed_at=t, elapsed=0.0)
+        room_db.clicks(self.ws, manager=self.m, now=t + 300)
+        [c] = room_db.clicks(self.ws, manager=self.m, now=t + 600)
+        self.assertTrue(c["reoffered"], "only observed deltas count")
 
-    def test_a_deadline_stored_beyond_one_lease_is_clamped(self):
-        t = 1_800_000_000.0
-        click(self.m, self.card, "option-1")
-        self.run_clicks()
-        claim = self.m.get(self.card).subject["claim"]
-        cards.stamp_claim(self.m, self.card, {**claim, "handed_at": t, "lease_until": t + 365 * 86400})
-        [c] = room_db.clicks(self.ws, manager=self.m, now=t + cards.HANDED_LEASE_SEC)
-        self.assertTrue(c["reoffered"])
+    def test_a_restart_resumes_from_the_persisted_lease(self):
+        t, _ = self._handed()
+        self.child("import pending_questions_clicks as pc\n"
+                   "real = pc.stamp_claim\n"
+                   "def stamp_then_die(*a, **k):\n    real(*a, **k)\n    os._exit(17)\n"
+                   "with mock.patch.object(pc, 'stamp_claim', stamp_then_die):\n"
+                   f"    rdb.clicks(ws, now={t + 300!r})")
+        self.assertEqual(lease_of(self.m, self.card), {"observed_at": t + 300, "elapsed": 300.0},
+                         "both fields landed in one atomic save before the death")
+        [c] = room_db.clicks(self.ws, manager=self.m, now=t + 600)
+        self.assertTrue(c["reoffered"], "the next process resumes from the persisted credit")
 
 
 class RollbackAndClock(_Room):
@@ -537,8 +571,7 @@ class RollbackAndClock(_Room):
         with mock.patch.object(cards.time, "time", side_effect=lambda: clock[0]), \
                 mock.patch.object(room_db, "_close_for_click", slow_close):
             [c] = room_db.clicks(self.ws, manager=self.m)
-        claim = self.m.get(self.card).subject["claim"]
-        self.assertEqual((claim["handed_at"], claim["lease_until"]), (701.0, 701.0 + cards.HANDED_LEASE_SEC))
+        self.assertEqual(lease_of(self.m, self.card), {"observed_at": 701.0, "elapsed": 0.0})
         [nxt] = room_db.clicks(self.ws, manager=self.m, now=702.0)
         self.assertFalse(nxt["actionable"], "a fresh lease is not already expired")
 
