@@ -372,7 +372,13 @@ def ask_owner(question: str, context: Optional[str] = None, urgency: str = "live
                     out["history_error"] = f"{type(e).__name__}: {e}"
             else:
                 out["record"] = f"outbox {out['outbox']}"
-        core_ask.create_card(out)  # only now: the outbox, and the row when it landed, name it
+        # only now: the outbox, and the row when it landed, name it
+        row_landed = bool(out["record"]) and not str(out["record"]).startswith("outbox ")
+        if core_ask.create_card(out) == core_ask.CARD_NOT_STORED and row_landed:
+            try:
+                store.redeliver(Question.from_dict(out["question"]), out["sent_line"])
+            except Exception as e:  # noqa: BLE001 — the row names an absent card: the reminder texts again
+                out["db_error"] = f"row delivery record not rewritten ({type(e).__name__}: {e})"
         if out["record"] is not None and out["outbox"] is None:
             try:
                 rec = reconcile_pending(store, ws, host)
@@ -388,11 +394,36 @@ def _close_for_click(ws: Path, ask_id: str, status: str) -> tuple:
     return _close_row(ws, ask_id, status, require_open=True)
 
 
+def _clicks_lock(manager):
+    from file_lock import locked_file  # noqa: PLC0415
+    return locked_file(Path(manager.store.root).parent / "pending-questions-clicks.lock", create_mode=0o600)
+
+
+def _claim_token() -> str:
+    return f"{os.getpid()}:{os.urandom(6).hex()}"
+
+
+def _held_by_live_other(token) -> bool:
+    """A claim another live process stamped (pid:nonce); a bare legacy flag or a dead pid is not."""
+    pid, sep, _ = str(token or "").partition(":")
+    if not sep or not pid.isdigit() or int(pid) == os.getpid():
+        return False
+    try:
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
 def clicks(workspace: Path, manager=None, closer=None) -> list:
     """Close the row of every question card the owner clicked (Answered); the card stays claimed
     until `ack_click`, so a run that dies before the core acts replays the same choice.
-    The claim (`closing`) is stamped on the card BEFORE the close: a run that dies between the
-    close and its `row_closed` stamp finds the row closed by code and replays the choice.
+    The whole pass runs under one exclusive lock beside the HITL store, so two readers never act
+    on the same snapshot. The claim (`closing`, a pid:nonce token) is stamped on the card BEFORE
+    the close: a run that dies between the close and its `row_closed` stamp finds the row closed
+    by code and replays the choice; a claim another live process holds is skipped, never cancelled.
     One dict per click, oldest first, with `closed`, `close_message` and the flags the core reads:
     `stale` — the row was closed already, by the owner's own Status or by code without this
     click's claim (one guarded write), so the click is NOT a decision and its card is cancelled;
@@ -405,23 +436,26 @@ def clicks(workspace: Path, manager=None, closer=None) -> list:
         manager = manager_for(ws)
     closer = closer or _close_for_click
     out = []
-    for click in core_ask.answered_cards(manager):
-        if click["row_closed"]:
-            out.append({**click, "closed": True, "stale": False, "replay": True,
-                        "close_message": "closed by this click on an earlier run; not acknowledged yet"})
-            continue
-        if not click["closing"]:
-            core_ask.stamp_card(manager, click["hitl_id"], closing=True)
-        ok, msg = closer(ws, click["ask_id"], "Answered")
-        replay = not ok and click["closing"] and msg.startswith(CODE_CLOSED_PREFIX)
-        stale = not ok and not replay and msg.startswith(REFUSED_PREFIX)
-        if ok and click["reported_before"]:
-            manager.resolve(click["hitl_id"])  # acknowledged earlier: the late close settles it
-        elif ok or replay:
-            core_ask.stamp_card(manager, click["hitl_id"], row_closed=True)
-        elif stale:
-            manager.cancel(click["hitl_id"])
-        out.append({**click, "closed": ok or replay, "stale": stale, "replay": replay, "close_message": msg})
+    with _clicks_lock(manager):
+        for click in core_ask.answered_cards(manager):
+            if click["row_closed"]:
+                out.append({**click, "closed": True, "stale": False, "replay": True,
+                            "close_message": "closed by this click on an earlier run; not acknowledged yet"})
+                continue
+            if _held_by_live_other(click["closing"]):
+                continue
+            claimed = bool(click["closing"])
+            core_ask.stamp_card(manager, click["hitl_id"], closing=_claim_token())
+            ok, msg = closer(ws, click["ask_id"], "Answered")
+            replay = not ok and claimed and msg.startswith(CODE_CLOSED_PREFIX)
+            stale = not ok and not replay and msg.startswith(REFUSED_PREFIX)
+            if ok and click["reported_before"]:
+                manager.resolve(click["hitl_id"])  # acknowledged earlier: the late close settles it
+            elif ok or replay:
+                core_ask.stamp_card(manager, click["hitl_id"], row_closed=True)
+            elif stale:
+                manager.cancel(click["hitl_id"])
+            out.append({**click, "closed": ok or replay, "stale": stale, "replay": replay, "close_message": msg})
     return out
 
 
@@ -433,14 +467,15 @@ def ack_click(workspace: Path, ask_id: str, manager=None) -> tuple:
         from hitl.cards import manager_for  # noqa: PLC0415
         manager = manager_for(Path(workspace))
     done = []
-    for c in core_ask.answered_cards(manager):
-        if c["ask_id"] != ask_id or c["reported_before"]:
-            continue
-        if c["row_closed"]:
-            manager.resolve(c["hitl_id"])
-        else:
-            core_ask.stamp_card(manager, c["hitl_id"], reported=True)
-        done.append(c["hitl_id"])
+    with _clicks_lock(manager):
+        for c in core_ask.answered_cards(manager):
+            if c["ask_id"] != ask_id or c["reported_before"]:
+                continue
+            if c["row_closed"]:
+                manager.resolve(c["hitl_id"])
+            else:
+                core_ask.stamp_card(manager, c["hitl_id"], reported=True)
+            done.append(c["hitl_id"])
     if not done:
         return False, f"no claimed click for {ask_id} to acknowledge"
     return True, f"acknowledged {ask_id} ({', '.join(done)})"

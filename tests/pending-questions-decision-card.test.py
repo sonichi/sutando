@@ -17,9 +17,11 @@ isolate_os_environ()
 import ast
 import importlib.util
 import json
+import os
 import sys
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -268,25 +270,105 @@ class OrderAndSingleSurface(unittest.TestCase):
         self.assertIn(out["card"], order[0][1], "the row names the card before it exists")
 
 
+class CardOutcomes(unittest.TestCase):
+    def _queued(self, ws, m, **kw):
+        tf = ws / "task.txt"
+        tf.write_text("task: x\n")
+        with mock.patch.object(ask, "destination_from_task",
+                               return_value=ask.Destination(bridge="ag2space", channel="!dm:test.invalid")):
+            return ask.queue_question("Merge?", task_file=str(tf), workspace=ws, host="h", default_action="merge",
+                                      options=OPTIONS, manager=m, link="https://row.test.invalid/7", **kw)
+
+    def test_a_save_that_raises_after_its_rename_is_a_stored_card_and_no_text(self):
+        ws = _ws("ag2space")
+        m = _manager(ws)
+        real = m.store.save
+
+        def save_then_fail(req, projection=None):
+            real(req, projection)
+            raise OSError("directory fsync failed")
+        out = self._queued(ws, m)
+        with mock.patch.object(m.store, "save", save_then_fail):
+            self.assertEqual(ask.create_card(out), ask.CARD_STORED)
+        self.assertIn("the card is there", out["card_error"])
+        self.assertEqual(_proactive(ws), [])
+        self.assertIsNotNone(m.get(out["card"]))
+
+    def test_an_uncheckable_store_is_unknown_and_kept_as_the_card(self):
+        ws = _ws("ag2space")
+        m = _manager(ws)
+        out = self._queued(ws, m)
+        with mock.patch.object(m, "create", side_effect=OSError("disk")), \
+                mock.patch.object(m, "get", side_effect=OSError("unreadable")):
+            self.assertEqual(ask.create_card(out), ask.CARD_UNKNOWN)
+        self.assertEqual(_proactive(ws), [], "no text beside a card that may exist")
+
+    def test_a_definite_failure_texts_the_same_destination_with_the_link_and_rewrites_the_record(self):
+        ws = _ws("ag2space")
+        m = _manager(ws)
+        out = self._queued(ws, m)
+        with mock.patch.object(m, "create", side_effect=OSError("disk full")):
+            self.assertEqual(ask.create_card(out), ask.CARD_NOT_STORED)
+        self.assertEqual(_proactive(ws), [out["proactive_file"]])
+        self.assertTrue(out["proactive_file"].endswith(".to-ag2space.txt"), out["proactive_file"])
+        body = (ws / "results" / out["proactive_file"]).read_text()
+        self.assertIn("[channel: !dm:test.invalid]", body)
+        self.assertIn("https://row.test.invalid/7", body)
+        held = json.loads(Path(out["outbox"]).read_text())
+        self.assertEqual(held["sent"], out["sent_line"])
+        self.assertIn(f"via {out['proactive_file']}", held["sent"])
+        (ws / "results" / out["proactive_file"]).unlink()  # a drain took it
+        self.assertTrue(ask.asked_recently(held["sent"], ws / "results"), "the next reminder does not re-ask")
+
+    def test_an_outbox_that_cannot_be_rewritten_is_reported(self):
+        ws = _ws("ag2space")
+        m = _manager(ws)
+        out = self._queued(ws, m)
+        with mock.patch.object(m, "create", side_effect=OSError("disk full")), \
+                mock.patch.object(ask.Outbox, "save", side_effect=OSError("outbox gone")):
+            ask.create_card(out)
+        self.assertIn("not rewritten", out["outbox_error"])
+
+    def test_the_ask_reports_a_card_as_stored_not_yet_shown(self):
+        ws = _ws("ag2space")
+        out = _ask("Merge?", workspace=ws, host="h", default_action="merge", options=OPTIONS, manager=_manager(ws))
+        lines = ask.report_lines(out)
+        self.assertTrue(any(ln.startswith("stored, not yet shown: decision card") for ln in lines), lines)
+        self.assertFalse(any(ln.startswith("sent:") for ln in lines), lines)
+
+
 class ReminderSeesTheCard(unittest.TestCase):
     def _body(self, ws, m):
         out = _ask("Merge?", workspace=ws, host="h", default_action="merge", options=OPTIONS, manager=m)
         return out, "# Request\n\nMerge?\n\n# Delivery\n\n" + out["sent_line"] + "\n"
 
-    def test_an_unposted_card_is_not_a_send_so_the_reminder_resurfaces_it(self):
-        ws = _ws("ag2space")
-        out, body = self._body(ws, _manager(ws))
-        self.assertFalse(ask.asked_recently(body, ws / "results"))
-
-    def test_a_posted_card_is_a_recent_send_for_an_hour(self):
+    def test_the_reminder_never_texts_beside_a_live_card_posted_or_not(self):
         ws = _ws("ag2space")
         m = _manager(ws)
         out, body = self._body(ws, m)
-        m.record_projection(out["card"], m.get(out["card"]).revision, "$ev")
         _, at = ask.card_sent(body)
-        self.assertTrue(ask.asked_recently(body, ws / "results", now=at + 60))
-        self.assertFalse(ask.asked_recently(body, ws / "results", now=at + ask.SENT_QUIET_SEC))
-        self.assertEqual(ask.sent_at(body), at)
+        self.assertTrue(ask.asked_recently(body, ws / "results", now=at + 10 * ask.SENT_QUIET_SEC), "unposted")
+        m.record_projection(out["card"], m.get(out["card"]).revision, "$ev", {"notified_at": at + 500})
+        self.assertTrue(ask.asked_recently(body, ws / "results", now=at + 10 * ask.SENT_QUIET_SEC), "posted")
+        self.assertEqual(ask.sent_at(body, ws), at + 500, "recency from the gateway's post")
+        self.assertEqual(ask.sent_at(body), at, "no workspace: the record's stamp")
+
+    def test_a_card_that_is_gone_leaves_the_question_due(self):
+        ws = _ws("ag2space")
+        m = _manager(ws)
+        out, body = self._body(ws, m)
+        m.cancel(out["card"])
+        self.assertFalse(ask.asked_recently(body, ws / "results"))
+        absent = body.replace(out["card"], "hitl_000000000000")
+        self.assertFalse(ask.asked_recently(absent, ws / "results"))
+        self.assertEqual(ask.sent_at(body, ws), ask.card_sent(body)[1])
+
+    def test_a_store_that_cannot_be_read_is_never_texted_beside(self):
+        ws = _ws("ag2space")
+        out, body = self._body(ws, _manager(ws))
+        with mock.patch("hitl.cards.manager_for", side_effect=OSError("store gone")):
+            self.assertTrue(ask.asked_recently(body, ws / "results"))
+            self.assertFalse(ask.card_posted(ws, out["card"]))
 
     def test_the_reminder_uses_this_check(self):
         rem_spec = importlib.util.spec_from_file_location("pq_remind_t", PQ / "pending_questions_remind.py")
@@ -294,9 +376,7 @@ class ReminderSeesTheCard(unittest.TestCase):
         rem_spec.loader.exec_module(rem)
         self.assertIs(rem.asked_recently, ask.asked_recently)
 
-    def test_an_unreadable_store_or_stamp_is_not_a_send(self):
-        with mock.patch("hitl.cards.manager_for", side_effect=OSError("store gone")):
-            self.assertFalse(ask.card_posted(Path("/nonexistent"), "hitl_x"))
+    def test_a_bad_stamp_is_no_record(self):
         self.assertIsNone(ask.card_sent("**Sent:** card hitl_x for ag2space at 2026-13-99T99:99:99Z"))
         self.assertIsNone(ask.card_sent("no record"))
 
@@ -329,9 +409,106 @@ class CrashBoundaries(unittest.TestCase):
         self.addCleanup(patch.stop)
 
     def child(self, body):
-        code = CHILD.format(src=str(REPO / "src"), pq=str(PQ), ws=str(self.ws), body=body)
-        r = subprocess.run([sys.executable, "-c", code], env=self.env, capture_output=True, text=True, timeout=120)
+        r = subprocess.run([sys.executable, "-c", self.code(body)], env=self.env, capture_output=True, text=True,
+                           timeout=120)
         self.assertEqual(r.returncode, 17, r.stderr[-2000:])
+        return r.stdout
+
+    def code(self, body):
+        return CHILD.format(src=str(REPO / "src"), pq=str(PQ), ws=str(self.ws), body=body)
+
+    def clicked(self, action_id="option-1"):
+        store, _ = room_db.room_store(self.ws)
+        out = room_db.ask_owner("Merge #12?", urgency="durable", workspace=self.ws, host=self.rdbt.HOST,
+                                store=store, default_action="merge it", options=[("Hold", "wait")])
+        m = _manager(self.ws)
+        req = m.get(out["card"])
+        m.apply_action(ActionReply(hitl_id=req.id, expected_revision=req.revision, action_id=action_id,
+                                   guard=req.guard))
+        return store, out, m
+
+    def test_two_concurrent_click_readers_never_cancel_the_winners_card(self):
+        """Both readers snapshot the click before either closes (a barrier right after the
+        snapshot); B's close lands after A's. Unserialised, B saw no claim and cancelled A's card."""
+        store, out, m = self.clicked()
+        barrier = self.ws / "barrier"
+        barrier.mkdir()
+
+        def reader_code(name, delay):
+            return (
+                "import json, time\n"
+                "real_cards, real_close = ask.answered_cards, rdb._close_for_click\n"
+                "def snapshot(mgr):\n"
+                "    got = real_cards(mgr)\n"
+                f"    (Path({str(barrier)!r}) / {name!r}).touch()\n"
+                "    end = time.monotonic() + 3\n"
+                f"    while len(list(Path({str(barrier)!r}).iterdir())) < 2 and time.monotonic() < end:\n"
+                "        time.sleep(0.02)\n"
+                "    return got\n"
+                "def close(*a):\n"
+                f"    time.sleep({delay})\n"
+                "    return real_close(*a)\n"
+                "with mock.patch.object(ask, 'answered_cards', snapshot), mock.patch.object(rdb, '_close_for_click', close):\n"
+                "    res = rdb.clicks(ws)\n"
+                "print(json.dumps([[c['replay'], c['stale'], c['closed']] for c in res]), flush=True)\n"
+                "os._exit(17)")
+        procs = [subprocess.Popen([sys.executable, "-c", self.code(reader_code(n, d))], env=self.env,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                 for n, d in (("a", 0), ("b", 1.5))]
+        results = [p.communicate(timeout=120) for p in procs]
+        self.assertEqual([p.returncode for p in procs], [17, 17], "".join(e[-1500:] for _, e in results))
+        outcomes = [c for o, _ in results for c in json.loads(o)]
+        self.assertNotIn([False, True, False], outcomes, "no reader calls the real choice stale")
+        self.assertEqual(m.get(out["card"]).status, STATUS_IN_PROGRESS, "the winner's card is not cancelled")
+        self.assertEqual(store.status_of(out["ask_id"]), "Answered")
+        self.assertTrue(room_db.ack_click(self.ws, out["ask_id"], m)[0], "the choice can still be acked")
+
+    def test_a_claim_another_live_process_holds_is_skipped(self):
+        store, out, m = self.clicked()
+        holder = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        self.addCleanup(holder.kill)
+        ask.stamp_card(m, out["card"], closing=f"{holder.pid}:abc")
+        self.assertEqual(room_db.clicks(self.ws, manager=m), [], "skipped, not cancelled")
+        self.assertEqual(m.get(out["card"]).status, STATUS_IN_PROGRESS)
+        holder.kill()
+        holder.wait()
+        [c] = room_db.clicks(self.ws, manager=m)
+        self.assertEqual((c["stale"], c["closed"]), (False, True), "a dead holder's claim is taken over")
+        self.assertFalse(room_db._held_by_live_other(True), "a legacy boolean claim is not a live holder")
+        self.assertFalse(room_db._held_by_live_other(f"{os.getpid()}:x"), "our own claim")
+
+    def test_a_definite_card_failure_rewrites_the_row_so_the_reminder_does_not_reask(self):
+        store, _ = room_db.room_store(self.ws)
+        with mock.patch("hitl.manager.HitlManager.create", side_effect=OSError("disk full")):
+            out = room_db.ask_owner("Merge #12?", urgency="durable", workspace=self.ws, host=self.rdbt.HOST,
+                                    store=store, default_action="merge it", options=[("Hold", "wait")])
+        self.assertEqual(out["card_outcome"], ask.CARD_NOT_STORED)
+        [row] = store.entries()
+        self.assertIn(f"via {out['proactive_file']}", row["body"])
+        self.assertNotIn("**Sent:** card", row["body"])
+        (self.ws / "results" / out["proactive_file"]).unlink()  # a drain took it
+        self.assertTrue(ask.asked_recently(row["body"], self.ws / "results"), "not re-asked")
+
+    def test_a_row_rewrite_that_fails_is_reported(self):
+        store, _ = room_db.room_store(self.ws)
+        with mock.patch("hitl.manager.HitlManager.create", side_effect=OSError("disk full")), \
+                mock.patch.object(type(store), "redeliver", side_effect=OSError("room gone")):
+            out = room_db.ask_owner("Merge #12?", urgency="durable", workspace=self.ws, host=self.rdbt.HOST,
+                                    store=store, default_action="merge it", options=[("Hold", "wait")])
+        self.assertIn("not rewritten", out["db_error"])
+
+    def test_death_between_the_fallback_text_and_its_record_texts_again_never_silence(self):
+        self.child("real = ask.write_proactive\n"
+                   "def write_then_die(*a, **k):\n    real(*a, **k)\n    os._exit(17)\n"
+                   "with mock.patch('hitl.manager.HitlManager.create', side_effect=OSError('disk full')), \\\n"
+                   "        mock.patch.object(ask, 'write_proactive', write_then_die):\n"
+                   f"    rdb.ask_owner('Merge #12?', urgency='durable', workspace=ws, host={self.rdbt.HOST!r}, "
+                   "store=store, default_action='merge it', options=[('Hold', 'wait')])")
+        store, _ = room_db.room_store(self.ws)
+        [row] = store.entries()
+        self.assertIn("**Sent:** card", row["body"], "the record still names the card that was never stored")
+        self.assertEqual(len(_proactive(self.ws)), 1, "the text went out")
+        self.assertFalse(ask.asked_recently(row["body"], self.ws / "results"), "due: text again, not silence")
 
     def ask_in_child(self, die_at):
         self.child(f"with mock.patch.object({die_at}, side_effect=lambda *a, **k: os._exit(17)):\n"

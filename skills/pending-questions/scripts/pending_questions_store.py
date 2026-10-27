@@ -339,6 +339,11 @@ class RoomDbStore:
     def insert(self, q: Question, sent_line: str) -> dict:
         return self.insert_raw(q.ask_id, q.question, question_body(q, sent_line), q.priority)
 
+    def redeliver(self, q: Question, sent_line: str) -> None:
+        """Rewrite this row's body with a new delivery record, in one body write under `lock`."""
+        rid = self._rid(q.ask_id)
+        self._locked(lambda: self.client.set_body(DB_SCHEMA, rid, question_body(q, sent_line)))
+
     def complete(self, ask_id: str) -> bool:
         """The row is present, carries this exact ask id (and this host), has a body and no
         incomplete mark: the confirmation an outbox entry is deleted on."""

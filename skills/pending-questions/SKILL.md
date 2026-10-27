@@ -90,15 +90,25 @@ Approve. The ask is ordered so that no card exists without a durable question: t
 and its id allocated, the question is held in the outbox and its row is written, both naming that
 id (`**Sent:** card hitl_… for ag2space owner-dm (decision card) at …`), and only then is the card
 stored for the AG2 Space gateway to post in the owner's DM. A process that dies before the card is
-stored leaves the held question and no card; one that dies after leaves both. Once a card exists,
-no text is sent for that question. Text is the ask only when the card cannot be built, the
-question cannot be held (then no card is stored at all), or the card cannot be stored; and for
-every other bridge (only that gateway projects cards).
+stored leaves the held question and no card; one that dies after leaves both. The ask reports
+`stored, not yet shown: decision card hitl_…` — storing is not showing. Once a card exists, no
+text is sent for that question. Text is the ask only when the card cannot be built, the question
+cannot be held (then no card is stored at all), or the card is provably not stored; and for every
+other bridge (only that gateway projects cards). `create_card` returns stored, not stored or
+unknown: a store that raised but whose card file is there (a save that failed after its rename) is
+stored, and one that cannot be checked is unknown; both are kept as the card, with no text. On a
+definite failure the text goes to the question's own destination with its link, and then the
+outbox entry and the row are rewritten to name that file (the row through the store's one body
+write), so the next reminder sees a drained text, not an absent card. A death between the text
+and the rewrite leaves a record naming an absent card, which the reminder reads as due: the
+owner may be texted twice, never not at all.
 
 The limit: nothing here can see the DM. If the gateway never posts the card (it is down, or skips
-it), the owner is not asked until the reminder runs. The reminder counts a card as sent only once
-the gateway recorded it as posted (the HITL projection record) within the last hour; a card with
-no such record, or no card at all, resurfaces as text when the reminder runs, and only then;
+it), the owner is not asked by this skill until he reads the card: the reminder never sends text
+while the question's card is live (pending or clicked), posted or not, nor when the store cannot
+say. The card's own follow-ups are the HITL renotify's. When the gateway posted it, the question's
+last-asked time is the gateway's `notified_at`. Only a card that is gone (never stored, or settled
+without closing the row) leaves the question due, and the reminder then texts it, when it runs;
 nothing is scheduled.
 
 The click is owner-checked and recorded by the bridge (`chosen_action`), and with `turn_on_action`
@@ -113,6 +123,9 @@ until the ack the card stays claimed, so a run that dies before the core acted r
 choice (`(replayed: not acknowledged yet)`) rather than losing it. The claim (`closing`) is stamped
 on the card before the row is closed, so a run that dies between the close and its record finds
 the row closed by code, not by the owner, and replays the choice instead of calling it stale.
+`clicks` and `ack` run under one exclusive lock beside the HITL store
+(`state/hitl/pending-questions-clicks.lock`), and the claim is a `pid:nonce` token: a claim another
+live process holds is skipped, never cancelled; a dead holder's claim is taken over.
 
 A click on a row already closed, by code or by the owner's own Status, is reported as "already
 answered — not a decision" (`stale`) and its card is cancelled. A close that could not be recorded
