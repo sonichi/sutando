@@ -401,7 +401,9 @@ class CardPointer(unittest.TestCase):
             [(_, sent)] = ask.send_card_pointers([q], ws, now=req.created_at + ask.CARD_POINTER_GRACE_SEC,
                                                  manager=m, host="h")
         self.assertIn("results gone", sent)
-        self.assertFalse((m.get(req.id).subject or {}).get("pointer_at"), "unsent: not stamped")
+        self.assertTrue((m.get(req.id).subject or {}).get("pointer_at"), "claimed before the write: never twice")
+        self.assertEqual(ask.send_card_pointers([q], ws, now=req.created_at + 10 * ask.CARD_POINTER_GRACE_SEC,
+                                                manager=m, host="h"), [])
 
     def test_the_reminder_runs_the_pointer_step(self):
         rem_spec = importlib.util.spec_from_file_location("pq_remind_p", PQ / "pending_questions_remind.py")
@@ -648,6 +650,74 @@ class CrashBoundaries(unittest.TestCase):
         self.child(f"with mock.patch.object({die_at}, side_effect=lambda *a, **k: os._exit(17)):\n"
                    f"    rdb.ask_owner('Merge #12?', urgency='durable', workspace=ws, host={self.rdbt.HOST!r}, "
                    "store=store, default_action='merge it', options=[('Hold', 'wait')])")
+
+    def _carded(self):
+        store, _ = room_db.room_store(self.ws)
+        out = room_db.ask_owner("Merge #12?", urgency="durable", workspace=self.ws, host=self.rdbt.HOST,
+                                store=store, default_action="merge it", options=[("Hold", "wait")])
+        req = _manager(self.ws).get(out["card"])
+        q = {"ask_id": out["ask_id"], "title": "Merge #12?", "body": out["sent_line"]}
+        return out, req, q
+
+    def pointer_child(self, q, now, extra=""):
+        return self.code(extra + f"res = ask.send_card_pointers([{q!r}], ws, now={now!r}, host='h')\n"
+                         "print(len(res), flush=True)\nos._exit(17)")
+
+    def test_death_after_the_pointer_claim_sends_none_and_never_a_second(self):
+        out, req, q = self._carded()
+        now = req.created_at + ask.CARD_POINTER_GRACE_SEC
+        self.child(f"with mock.patch.object(ask, 'write_proactive', side_effect=lambda *a, **k: os._exit(17)):\n"
+                   f"    ask.send_card_pointers([{q!r}], ws, now={now!r}, host='h')")
+        self.assertTrue(_manager(self.ws).get(req.id).subject.get("pointer_at"), "claimed before the death")
+        self.assertEqual([n for n in _proactive(self.ws) if "pointer" in n], [])
+        self.assertEqual(ask.send_card_pointers([q], self.ws, now=now + 99999, host="h"), [], "never a second")
+
+    def test_two_overlapping_reminders_queue_one_pointer(self):
+        out, req, q = self._carded()
+        now = req.created_at + ask.CARD_POINTER_GRACE_SEC
+        slow = ("import time\nreal = ask.write_proactive\n"
+                "def slow(*a, **k):\n    time.sleep(1.0)\n    return real(*a, **k)\n"
+                "ask.write_proactive = slow\n")
+        procs = [subprocess.Popen([sys.executable, "-c", self.pointer_child(q, now, slow)], env=self.env,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) for _ in range(2)]
+        outs = [p.communicate(timeout=120) for p in procs]
+        self.assertEqual([p.returncode for p in procs], [17, 17], "".join(e[-1500:] for _, e in outs))
+        self.assertEqual(sorted(int(o.strip()) for o, _ in outs), [0, 1], "exactly one claimant published")
+        self.assertEqual(len([n for n in _proactive(self.ws) if "pointer" in n]), 1)
+
+    def test_a_card_posted_before_the_claim_gets_no_pointer(self):
+        out, req, q = self._carded()
+        m = _manager(self.ws)
+        real = ask.claim_pointer
+
+        def post_then_claim(mgr, card_id, now):
+            m.record_projection(card_id, m.get(card_id).revision, "$posted")  # the projector wins the race
+            return real(mgr, card_id, now)
+        with mock.patch.object(ask, "claim_pointer", post_then_claim):
+            self.assertEqual(ask.send_card_pointers([q], self.ws, now=req.created_at + ask.CARD_POINTER_GRACE_SEC,
+                                                    manager=m, host="h"), [])
+        self.assertEqual([n for n in _proactive(self.ws) if "pointer" in n], [])
+
+    def test_a_fallback_with_history_unwritable_keeps_the_hold_and_never_counts_zero(self):
+        store, _ = room_db.room_store(self.ws)
+        ro = OSError("state marker read-only")
+        with mock.patch("hitl.manager.HitlManager.create", side_effect=OSError("disk full")), \
+                mock.patch.object(room_db, "mark_store_used", side_effect=ro), \
+                mock.patch("pending_questions_store.mark_store_used", side_effect=ro):
+            out = room_db.ask_owner("Merge #12?", urgency="durable", workspace=self.ws, host=self.rdbt.HOST,
+                                    store=store, default_action="merge it", options=[("Hold", "wait")])
+        self.assertIn("read-only", out["history_error"])
+        held = {e["ask_id"]: e for e in ask.Outbox(self.ws).entries()}
+        self.assertIn(out["ask_id"], held, "the hold is the evidence; it stays")
+        self.assertTrue(held[out["ask_id"]]["redeliver"])
+        with mock.patch.object(room_db, "room_store", return_value=(None, "room unreachable")):
+            g = room_db.gather(self.ws)
+        self.assertTrue(g["unavailable"] or out["ask_id"] in [w["ask_id"] for w in g["waiting"]], g)
+        self.assertNotEqual((g["unavailable"], len(g["waiting"])), (False, 0), "never a measured zero")
+        room_db.reconcile_pass(self.ws)
+        [row] = store.entries()
+        self.assertIn(f"via {out['proactive_file']}", row["body"])
+        self.assertEqual(ask.Outbox(self.ws).entries(), [], "released once history is committed")
 
     def test_death_while_holding_the_question_leaves_no_card(self):
         self.ask_in_child("ask.Outbox, 'save'")

@@ -44,7 +44,7 @@ from proactive_routing import BRIDGE_CHANNELS, proactive_filename, should_claim_
 from result_markers import neutralize_markers
 from undelivered_quarantine import quarantine_dir
 from util_paths import host_label
-from pending_questions_clicks import CARD_RUNTIME, stamp_subject
+from pending_questions_clicks import CARD_RUNTIME
 
 # The only bridge that projects HITL cards (to the owner's DM).
 CARD_BRIDGE = "ag2space"
@@ -146,12 +146,28 @@ def card_pointer_body(title: str, host: str) -> str:
             "Open that card to choose; a reply to this message does not answer it.\n")
 
 
+def claim_pointer(manager, card_id: str, now: float) -> bool:
+    """Under the HITL store lock: the card is live, has no post recorded, is past the grace and has
+    no pointer yet; then `pointer_at` is stamped. True only for the one caller that stamped it."""
+    with manager.store.locked():
+        req = manager.get(card_id)
+        if req is None or req.terminal or manager.store.projection(card_id).get("revision", 0) > 0:
+            return False
+        if (req.subject or {}).get("pointer_at") or now - req.created_at < CARD_POINTER_GRACE_SEC:
+            return False
+        req.subject = {**(req.subject or {}), "pointer_at": now}
+        manager.store.save(req)
+        return True
+
+
 def send_card_pointers(questions, workspace: Path, now: Optional[float] = None, manager=None,
                        host: Optional[str] = None) -> list:
     """For each question whose card is live, has no post recorded and is older than
-    CARD_POINTER_GRACE_SEC, queue one text pointer to the owner's DM — once per card, recorded
-    durably on the card (`pointer_at`, the store's fsynced save) after the file is queued, so a
-    gateway that stays down is not repeated. Never raises: [(ask_id, proactive file | error)]."""
+    CARD_POINTER_GRACE_SEC, queue one text pointer to the owner's DM — at most once per card. The
+    pointer is claimed first (`claim_pointer`: under the HITL store lock, re-check the card is
+    still live, unposted and unclaimed, and stamp `pointer_at` with the store's fsynced save), and
+    only the claimant publishes, so overlapping reminders queue one pointer and a crash after the
+    claim queues none. Never raises: [(ask_id, proactive file | error)]."""
     now = time.time() if now is None else now
     out = []
     for q in questions:
@@ -162,15 +178,11 @@ def send_card_pointers(questions, workspace: Path, now: Optional[float] = None, 
             if manager is None:
                 from hitl.cards import manager_for  # noqa: PLC0415
                 manager = manager_for(Path(workspace))
-            req = manager.get(c[0])
-            if req is None or req.terminal or manager.store.projection(c[0]).get("revision", 0) > 0:
+            if not claim_pointer(manager, c[0], now):
                 continue
-            if (req.subject or {}).get("pointer_at") or now - req.created_at < CARD_POINTER_GRACE_SEC:
-                continue
-            name = proactive_filename(f"{q.get('ask_id') or c[0]}-pointer-{int(now)}", None)
+            name = proactive_filename(f"{q.get('ask_id') or c[0]}-pointer", None)
             write_proactive(Path(workspace) / "results", name, card_pointer_body(q.get("title", ""),
                                                                                host or host_label()))
-            stamp_subject(manager, c[0], pointer_at=now)
             out.append((q.get("ask_id"), name))
         except Exception as e:  # noqa: BLE001
             out.append((q.get("ask_id"), f"FAILED — {type(e).__name__}: {e}"))

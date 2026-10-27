@@ -98,8 +98,10 @@ exactly the options as given, with no Approve — and `subject.choices` holding 
 - **Text instead.** Only when the card cannot be built, the question cannot be held (then no card
   is stored), or the card is provably not stored; and for every other bridge. On a definite card
   failure the text goes to the question's own destination with the row's own link (the one the
-  row write returned), and the question is held again, flagged `redeliver`, naming that file. A
-  landed row is rewritten now (one body write, `RoomDbStore.redeliver`) and the held entry goes;
+  row write returned), and the question is held again, flagged `redeliver`, naming that file. For
+  a landed row, in order: the store history is committed, the row is rewritten (one body write,
+  `RoomDbStore.redeliver`), and only then does the held entry go — a history that cannot be
+  written keeps the hold, so an outage never counts the question as zero;
   a row that could not be rewritten, or whose write was never confirmed, takes the record at the
   next reconcile, which replays the entry and rewrites the row before releasing it. A death
   before the hold leaves a record naming an absent card, which the reminder reads as due: text
@@ -107,10 +109,13 @@ exactly the options as given, with no Approve — and `subject.choices` holding 
 - **The reminder.** It never sends text for a question whose card is live (pending or clicked) or
   whose store cannot say — `--force` included; such questions are left to the card. Once posted,
   the question's last-asked time is the gateway's `notified_at`. A live card with no post
-  recorded 30 minutes (`CARD_POINTER_GRACE_SEC`) after it was stored gets one text pointer, once
-  per card (recorded on the card as `pointer_at`): it says the question waits as a card in his
-  AG2 Space DM and may not have arrived, and quotes its title, with no options, no approve
-  wording, and a note that a reply does not answer it. Only a card that is gone leaves the
+  recorded 30 minutes (`CARD_POINTER_GRACE_SEC`) after it was stored gets one text pointer, at most
+  once per card: under the HITL store lock the card is re-checked (live, unposted, unclaimed) and
+  `pointer_at` is stamped, and only then is the file published — overlapping reminders queue one
+  pointer, and a death after the claim queues none. A post that lands after the claim and before
+  the file can still meet a pointer that says it may not have arrived. The pointer says the
+  question waits as a card in his AG2 Space DM and may not have arrived, and quotes its title,
+  with no options, no approve wording, and a note that a reply does not answer it. Only a card that is gone leaves the
   question due for text. Nothing is scheduled: all of this happens when the reminder runs.
 
 ## Decision-card clicks

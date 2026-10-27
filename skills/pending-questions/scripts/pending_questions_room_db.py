@@ -318,12 +318,18 @@ def _close_row(workspace: Path, ask_id: str, status: str) -> tuple:
 
 
 def _redeliver_now(ws: Path, store, out: dict) -> None:
-    """After a card fallback the held entry (flagged redeliver) names the text; a landed row takes
-    the same record now, and the entry goes once it has. Anything less is left to the next
-    reconcile, which replays the entry into the row the same way."""
+    """After a card fallback the held entry (flagged redeliver) names the text. In order: commit the
+    store history (a row of this workspace exists), rewrite the landed row, then release the hold —
+    the order `Outbox.flush` keeps. Any step that fails keeps the hold for the next reconcile, so
+    the question is never missing from an offline count."""
     if store is None or not out["record"] or str(out["record"]).startswith("outbox "):
         return
     q = Question.from_dict(out["question"])
+    try:
+        Outbox(ws).commit_history(q.ask_id)
+    except StoreError as e:
+        out["history_error"] = f"{e}; the hold stays until a reconcile commits it"
+        return
     try:
         store.redeliver(q, out["sent_line"])
         if out["outbox"]:
