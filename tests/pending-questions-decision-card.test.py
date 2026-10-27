@@ -369,7 +369,7 @@ class CardPointer(unittest.TestCase):
         t = req.created_at + ask.CARD_POINTER_GRACE_SEC
         self.assertEqual(len(ask.send_card_pointers([q], ws, now=t, manager=m, host="h")), 1)
         stored = json.loads(m.store._path(req.id).read_text())
-        self.assertEqual(stored["requirement"]["subject"]["pointer_at"], t, "durable on the card")
+        self.assertEqual(stored["requirement"]["subject"]["pointer_sent_at"], t, "durable on the card")
         self.assertEqual(ask.send_card_pointers([q], ws, now=t + 10 * ask.SENT_QUIET_SEC, host="h"), [],
                          "a second pass, with a fresh store handle, sends nothing")
         self.assertEqual(len(_proactive(ws)), 1)
@@ -401,9 +401,15 @@ class CardPointer(unittest.TestCase):
             [(_, sent)] = ask.send_card_pointers([q], ws, now=req.created_at + ask.CARD_POINTER_GRACE_SEC,
                                                  manager=m, host="h")
         self.assertIn("results gone", sent)
-        self.assertTrue((m.get(req.id).subject or {}).get("pointer_at"), "claimed before the write: never twice")
-        self.assertEqual(ask.send_card_pointers([q], ws, now=req.created_at + 10 * ask.CARD_POINTER_GRACE_SEC,
-                                                manager=m, host="h"), [])
+        t = req.created_at + ask.CARD_POINTER_GRACE_SEC
+        subject = m.get(req.id).subject
+        self.assertEqual((subject.get("pointer_claim_at"), subject.get("pointer_sent_at")), (t, None))
+        self.assertEqual(ask.send_card_pointers([q], ws, now=t + 60, manager=m, host="h"), [],
+                         "a fresh claim is not retried yet")
+        [(_, name)] = ask.send_card_pointers([q], ws, now=t + ask.POINTER_CLAIM_RETRY_SEC, manager=m, host="h")
+        self.assertEqual(_proactive(ws), [name], "the failed publish is retried once its claim is old")
+        self.assertTrue(m.get(req.id).subject.get("pointer_sent_at"))
+        self.assertEqual(ask.send_card_pointers([q], ws, now=t + 99999, manager=m, host="h"), [], "then never again")
 
     def test_the_reminder_runs_the_pointer_step(self):
         rem_spec = importlib.util.spec_from_file_location("pq_remind_p", PQ / "pending_questions_remind.py")
@@ -663,14 +669,39 @@ class CrashBoundaries(unittest.TestCase):
         return self.code(extra + f"res = ask.send_card_pointers([{q!r}], ws, now={now!r}, host='h')\n"
                          "print(len(res), flush=True)\nos._exit(17)")
 
-    def test_death_after_the_pointer_claim_sends_none_and_never_a_second(self):
+    def test_death_after_the_pointer_claim_is_retried_later_and_delivers_once(self):
         out, req, q = self._carded()
         now = req.created_at + ask.CARD_POINTER_GRACE_SEC
         self.child(f"with mock.patch.object(ask, 'write_proactive', side_effect=lambda *a, **k: os._exit(17)):\n"
                    f"    ask.send_card_pointers([{q!r}], ws, now={now!r}, host='h')")
-        self.assertTrue(_manager(self.ws).get(req.id).subject.get("pointer_at"), "claimed before the death")
+        subject = _manager(self.ws).get(req.id).subject
+        self.assertEqual((subject.get("pointer_claim_at"), subject.get("pointer_sent_at")), (now, None))
         self.assertEqual([n for n in _proactive(self.ws) if "pointer" in n], [])
-        self.assertEqual(ask.send_card_pointers([q], self.ws, now=now + 99999, host="h"), [], "never a second")
+        inside = now + ask.POINTER_CLAIM_RETRY_SEC - 1
+        out_before = subprocess.run([sys.executable, "-c", self.pointer_child(q, inside)], env=self.env,
+                                    capture_output=True, text=True, timeout=120)
+        self.assertEqual(out_before.stdout.strip(), "0", "not retried inside the claim window")
+        later = now + ask.POINTER_CLAIM_RETRY_SEC
+        retried = subprocess.run([sys.executable, "-c", self.pointer_child(q, later)], env=self.env,
+                                 capture_output=True, text=True, timeout=120)
+        self.assertEqual((retried.returncode, retried.stdout.strip()), (17, "1"), retried.stderr[-1500:])
+        again = subprocess.run([sys.executable, "-c", self.pointer_child(q, later + 99999)], env=self.env,
+                               capture_output=True, text=True, timeout=120)
+        self.assertEqual(again.stdout.strip(), "0")
+        self.assertEqual(len([n for n in _proactive(self.ws) if "pointer" in n]), 1, "exactly one across retries")
+
+    def test_a_pointer_publish_that_fails_in_a_real_process_is_retried(self):
+        out, req, q = self._carded()
+        now = req.created_at + ask.CARD_POINTER_GRACE_SEC
+        failed = subprocess.run([sys.executable, "-c", self.pointer_child(
+            q, now, "ask.write_proactive = lambda *a, **k: (_ for _ in ()).throw(OSError('results full'))\n")],
+            env=self.env, capture_output=True, text=True, timeout=120)
+        self.assertEqual(failed.returncode, 17, failed.stderr[-1500:])
+        self.assertIsNone(_manager(self.ws).get(req.id).subject.get("pointer_sent_at"))
+        retried = subprocess.run([sys.executable, "-c", self.pointer_child(q, now + ask.POINTER_CLAIM_RETRY_SEC)],
+                                 env=self.env, capture_output=True, text=True, timeout=120)
+        self.assertEqual(retried.stdout.strip(), "1", retried.stderr[-1500:])
+        self.assertEqual(len([n for n in _proactive(self.ws) if "pointer" in n]), 1)
 
     def test_two_overlapping_reminders_queue_one_pointer(self):
         out, req, q = self._carded()

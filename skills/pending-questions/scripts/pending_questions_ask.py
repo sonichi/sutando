@@ -50,6 +50,8 @@ from pending_questions_clicks import CARD_RUNTIME
 CARD_BRIDGE = "ag2space"
 # A live card with no post recorded this long after it was stored gets one text pointer, ever.
 CARD_POINTER_GRACE_SEC = 1800
+# A pointer claim with no sent mark this old is taken to have died or failed, and is retried.
+POINTER_CLAIM_RETRY_SEC = 300
 # A question queued and drained this recently is not re-raised by the reminder.
 SENT_QUIET_SEC = 3600
 # Grammar of the queue record; the reminder reads it back.
@@ -146,28 +148,44 @@ def card_pointer_body(title: str, host: str) -> str:
             "Open that card to choose; a reply to this message does not answer it.\n")
 
 
-def claim_pointer(manager, card_id: str, now: float) -> bool:
-    """Under the HITL store lock: the card is live, has no post recorded, is past the grace and has
-    no pointer yet; then `pointer_at` is stamped. True only for the one caller that stamped it."""
+def claim_pointer(manager, card_id: str, now: float) -> Optional[str]:
+    """Under the HITL store lock: the card is live, has no post recorded, is past the grace, has no
+    pointer sent, and no pointer claim younger than POINTER_CLAIM_RETRY_SEC; then a claim
+    (`pointer_claim_at`, `pointer_claim`) is stamped. Returns its token, for the one claimant only."""
     with manager.store.locked():
         req = manager.get(card_id)
         if req is None or req.terminal or manager.store.projection(card_id).get("revision", 0) > 0:
-            return False
-        if (req.subject or {}).get("pointer_at") or now - req.created_at < CARD_POINTER_GRACE_SEC:
-            return False
-        req.subject = {**(req.subject or {}), "pointer_at": now}
+            return None
+        subject = req.subject or {}
+        if subject.get("pointer_sent_at") or now - req.created_at < CARD_POINTER_GRACE_SEC:
+            return None
+        claimed_at = float(subject.get("pointer_claim_at") or 0)
+        if claimed_at and claimed_at <= now < claimed_at + POINTER_CLAIM_RETRY_SEC:
+            return None
+        token = os.urandom(8).hex()
+        req.subject = {**subject, "pointer_claim_at": now, "pointer_claim": token}
         manager.store.save(req)
-        return True
+        return token
+
+
+def mark_pointer_sent(manager, card_id: str, token: str, now: float) -> None:
+    """Record the pointer as sent, under the store lock, for the claim that published it."""
+    with manager.store.locked():
+        req = manager.get(card_id)
+        if req is not None and (req.subject or {}).get("pointer_claim") == token:
+            req.subject = {**(req.subject or {}), "pointer_sent_at": now}
+            manager.store.save(req)
 
 
 def send_card_pointers(questions, workspace: Path, now: Optional[float] = None, manager=None,
                        host: Optional[str] = None) -> list:
     """For each question whose card is live, has no post recorded and is older than
-    CARD_POINTER_GRACE_SEC, queue one text pointer to the owner's DM — at most once per card. The
-    pointer is claimed first (`claim_pointer`: under the HITL store lock, re-check the card is
-    still live, unposted and unclaimed, and stamp `pointer_at` with the store's fsynced save), and
-    only the claimant publishes, so overlapping reminders queue one pointer and a crash after the
-    claim queues none. Never raises: [(ask_id, proactive file | error)]."""
+    CARD_POINTER_GRACE_SEC, queue a text pointer to the owner's DM. The pointer is claimed first
+    (`claim_pointer`, under the HITL store lock), only the claimant publishes, and then it is
+    marked sent (`pointer_sent_at`). A claim with no sent mark older than POINTER_CLAIM_RETRY_SEC
+    (its claimant died or failed to publish) is claimed again and retried: at-least-once, so a
+    death between the publish and the sent mark can deliver it twice. Overlapping reminders queue
+    one pointer per claim. Never raises: [(ask_id, proactive file | error)]."""
     now = time.time() if now is None else now
     out = []
     for q in questions:
@@ -178,11 +196,13 @@ def send_card_pointers(questions, workspace: Path, now: Optional[float] = None, 
             if manager is None:
                 from hitl.cards import manager_for  # noqa: PLC0415
                 manager = manager_for(Path(workspace))
-            if not claim_pointer(manager, c[0], now):
+            token = claim_pointer(manager, c[0], now)
+            if token is None:
                 continue
             name = proactive_filename(f"{q.get('ask_id') or c[0]}-pointer", None)
             write_proactive(Path(workspace) / "results", name, card_pointer_body(q.get("title", ""),
                                                                                host or host_label()))
+            mark_pointer_sent(manager, c[0], token, now)
             out.append((q.get("ask_id"), name))
         except Exception as e:  # noqa: BLE001
             out.append((q.get("ask_id"), f"FAILED — {type(e).__name__}: {e}"))

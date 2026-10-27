@@ -109,13 +109,17 @@ exactly the options as given, with no Approve — and `subject.choices` holding 
 - **The reminder.** It never sends text for a question whose card is live (pending or clicked) or
   whose store cannot say — `--force` included; such questions are left to the card. Once posted,
   the question's last-asked time is the gateway's `notified_at`. A live card with no post
-  recorded 30 minutes (`CARD_POINTER_GRACE_SEC`) after it was stored gets one text pointer, at most
-  once per card: under the HITL store lock the card is re-checked (live, unposted, unclaimed) and
-  `pointer_at` is stamped, and only then is the file published — overlapping reminders queue one
-  pointer, and a death after the claim queues none. A post that lands after the claim and before
-  the file can still meet a pointer that says it may not have arrived. The pointer says the
-  question waits as a card in his AG2 Space DM and may not have arrived, and quotes its title,
-  with no options, no approve wording, and a note that a reply does not answer it. Only a card that is gone leaves the
+  recorded 30 minutes (`CARD_POINTER_GRACE_SEC`) after it was stored gets a text pointer. Under the
+  HITL store lock the card is re-checked (live, unposted, no pointer sent, no fresh claim) and a
+  claim (`pointer_claim_at`, with a token) is stamped; only the claimant publishes, then marks it
+  sent (`pointer_sent_at`). A claim with no sent mark older than 5 minutes
+  (`POINTER_CLAIM_RETRY_SEC`) — its claimant died or failed to publish — is claimed again and
+  retried. So the pointer is at-least-once: overlapping reminders queue one per claim, a death
+  before the publish is retried later, and a death between the publish and the sent mark can
+  deliver it twice. A post that lands after the claim and before the file can still meet a
+  pointer that says it may not have arrived. The pointer says the question waits as a card in
+  his AG2 Space DM and may not have arrived, and quotes its title, with no options, no approve
+  wording, and a note that a reply does not answer it. Only a card that is gone leaves the
   question due for text. Nothing is scheduled: all of this happens when the reminder runs.
 
 ## Decision-card clicks
