@@ -16,7 +16,8 @@ its held entry; a held entry with no row waits (not yet in the room), or is done
 locally; a local close naming neither is `pending_close`. `unavailable: True` and `done: None`
 when the room cannot be read — never a zero. `reconcile_pass(workspace)` is the explicit pass
 (outbox replay, local closes, stale marks, the transitional legacy ingest, the history
-backfill); `ask_owner` runs it first, then the queue, then the row, and writes no row when
+backfill); `ask_owner` queues and holds its new question before room work, then reconciles after
+its row is confirmed, and writes no row when
 the outbox could not hold the question; a confirmed row commits the history marker BEFORE
 its outbox entry is deleted, and keeps the entry when that commit fails. `resolve` closes
 the row (committing the history marker first when the row is in view and the marker is not;
@@ -32,6 +33,7 @@ shapes through the client's own put_database / put_row_body.
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 import asyncio
 import json
 import os
@@ -51,6 +53,7 @@ from pending_questions_outbox import (Outbox as HeldRecords, local_closes, mark_
 from pending_questions_store import (DB_SCHEMA, INCOMPLETE, TERMINAL, GuardFailed, Outbox, Question,
                                      RoomDbStore, ScriptDbClient, StoreError, outbox_items, reconcile_pending,
                                      safe_body, waiting_item, write_question)
+from ag2space_links import database_link
 from workspace_default import status_path
 
 # The skill directories that provide the room capability, canonical name first.
@@ -60,8 +63,6 @@ CLI_MODULE = "room_collab.py"
 IDENTITY_VARS = ("AG2SPACE_USER_ID", "AG2_MATRIX_USER_ID")
 GAP = 1024
 SETTLE_SEC = 1.0
-# The documented room-surface link shape; `page` is the database id.
-LINK_TEMPLATE = "{origin}/#/room/{room}?surface=db&page={db}"
 ROOM_KEY = "PENDING_QUESTIONS_ROOM"
 # The collab service URL; set, it overrides the capability's own resolution (an outage rehearsal).
 URL_KEY = "PENDING_QUESTIONS_COLLAB_URL"
@@ -111,14 +112,21 @@ def configured_room(workspace: Path, environ) -> str:
     return room
 
 
+def db_link(origin: str, room: str, db: str) -> Optional[str]:
+    """The database's page in the room, as the app opens it; None when origin or room is unusable."""
+    try:
+        return database_link(origin, room, db)
+    except ValueError:
+        return None
+
+
 def _db_link(scripts: Path, room: str, url_override: str) -> Optional[str]:
     """The database's page in the room, from the capability's own URL resolution; None if unknown."""
     try:
         if str(scripts) not in sys.path:
             sys.path.insert(0, str(scripts))
         from room_collab import resolve_url  # noqa: PLC0415 — the injected capability
-        return LINK_TEMPLATE.format(origin=resolve_url(url_override or None).rstrip("/"), room=room,
-                                    db=DB_SCHEMA["id"])
+        return db_link(resolve_url(url_override or None), room, DB_SCHEMA["id"])
     except Exception:  # noqa: BLE001 — a link is a convenience, never a precondition
         return None
 
@@ -272,14 +280,15 @@ def resolve(workspace: Path, ask_id: str, status: str) -> tuple:
     if store is None:
         return _close_locally(ws, ask_id, status, f"room database: not used ({where})")
     try:
-        reconcile_pending(store, ws, host_label())
-        if not store_history(ws) and store.status_of(ask_id) is not None:
-            try:
-                Outbox(ws).commit_history(ask_id)
-            except StoreError as e:
-                return _close_locally(ws, ask_id, status, f"room database: left open — {e}", "its row is in view")
-        store.close(ask_id, status)
-        return True, f"room database: {ask_id} -> {status} in {store.where(ask_id)}"
+        with getattr(store, "operation", nullcontext)():
+            reconcile_pending(store, ws, host_label())
+            if not store_history(ws) and store.status_of(ask_id) is not None:
+                try:
+                    Outbox(ws).commit_history(ask_id)
+                except StoreError as e:
+                    return _close_locally(ws, ask_id, status, f"room database: left open — {e}", "its row is in view")
+            store.close(ask_id, status)
+            return True, f"room database: {ask_id} -> {status} in {store.where(ask_id)}"
     except GuardFailed as g:
         if not g.current and any(e["ask_id"] == ask_id for e in Outbox(ws).entries()):
             return _close_locally(ws, ask_id, status, "its held entry has no row yet")
@@ -295,7 +304,7 @@ def ask_owner(question: str, context: Optional[str] = None, urgency: str = "live
               host: Optional[str] = None, now: Optional[float] = None, store=None,
               default_action: Optional[str] = None, reason: Optional[str] = None,
               options=(), priority: str = "Medium") -> dict:
-    """Reconcile, queue (core), hold, row, notify — each step reported, none raising past here.
+    """Queue (core), hold, row, bounded reconcile, notify — each step reported, none raising past here.
     `store` is this adapter's store; None leaves the question in the outbox. No outbox record,
     no row: the question is still queued to the owner, and the report says it was not held. A
     confirmed row commits the store-history marker, then releases its outbox entry; a marker
@@ -306,11 +315,6 @@ def ask_owner(question: str, context: Optional[str] = None, urgency: str = "live
     ws = Path(workspace) if workspace else resolve_workspace(migrate=False)
     host = host or host_label()
     rec = None
-    if store is not None:
-        try:
-            rec = reconcile_pending(store, ws, host)
-        except Exception as e:  # noqa: BLE001 — this ask still goes out
-            rec = {"flushed": [], "closed": [], "moved": [], "errors": [f"{type(e).__name__}: {e}"]}
     intro = None
     if store is not None and not room_introduced(ws):
         intro = (f"All my questions for you are kept in the Pending questions database in {store.label}; "
@@ -325,22 +329,29 @@ def ask_owner(question: str, context: Optional[str] = None, urgency: str = "live
             mark_room_introduced(ws, out["ask_id"])
         except OSError as e:
             out["send_error"] = f"{type(e).__name__}: {e}"
-    if out["outbox"] is None:
-        out["db_error"] = f"{out['outbox_error']}; the room was NOT written (no durable record to replay)"
-    else:
-        q = Question.from_dict(out["question"])
-        w = write_question(q, store, out["sent_line"])
-        out["link"], out["db_error"] = w.link or link, w.db_error
-        if w.complete:
-            out["record"] = store.where(q.ask_id)
-            try:
-                mark_store_used(ws, q.ask_id)
-                Outbox(ws).delete(q.ask_id)
-                out["outbox"] = None
-            except OSError as e:  # the entry stays: local evidence a later outage can be read from
-                out["history_error"] = f"{type(e).__name__}: {e}"
+    with getattr(store, "operation", nullcontext)():
+        if out["outbox"] is None:
+            out["db_error"] = f"{out['outbox_error']}; the room was NOT written (no durable record to replay)"
         else:
-            out["record"] = f"outbox {out['outbox']}"
+            q = Question.from_dict(out["question"])
+            w = write_question(q, store, out["sent_line"])
+            out["link"], out["db_error"] = w.link or link, w.db_error
+            if w.complete:
+                out["record"] = store.where(q.ask_id)
+                try:
+                    mark_store_used(ws, q.ask_id)
+                    Outbox(ws).delete(q.ask_id)
+                    out["outbox"] = None
+                except OSError as e:  # the entry stays: local evidence a later outage can be read from
+                    out["history_error"] = f"{type(e).__name__}: {e}"
+            else:
+                out["record"] = f"outbox {out['outbox']}"
+        if out["record"] is not None and out["outbox"] is None:
+            try:
+                rec = reconcile_pending(store, ws, host)
+            except Exception as e:  # noqa: BLE001
+                rec = {"flushed": [], "closed": [], "moved": [], "errors": [f"{type(e).__name__}: {e}"]}
+    out["reconcile"] = rec
     if urgency == "live":
         out["macos"], out["macos_fix"] = core_ask.notify_macos(f"Question: {question}")
     return out
@@ -497,18 +508,9 @@ def _load_capability(scripts: str):
 def channel_credentials(cap, environ=None) -> dict:
     """The capability's credential variables from the AG2 Space channel env file the shared
     resolver picks; empty when a variable already names either, so the two never mix."""
-    from channel_env_resolve import resolve_channel_env
-    from channel_token import token_from_env_file
-    from util_paths import claude_home_path
-    env = os.environ if environ is None else environ
+    from channel_credentials import channel_credentials as shared
     names = (*getattr(cap, "URL_VARS", ()), *getattr(cap, "TOKEN_VARS", ()))
-    if not names or any(env.get(v) for v in names):
-        return {}
-    path = resolve_channel_env(claude_home_path("channels"), "ag2space")
-    if path is None:
-        return {}
-    found = {v: token_from_env_file(v, path) for v in names}
-    return {v: x for v, x in found.items() if x}
+    return shared(names, environ)
 
 
 def _credentials(cap, collab_url: Optional[str]) -> tuple:
@@ -530,7 +532,7 @@ async def _serve(args, req: dict) -> object:
     cap = _load_capability(args.skill_scripts)
     from room_collab_client import open_room_collab  # noqa: PLC0415
     url, token = _credentials(cap, args.collab_url or None)
-    link = LINK_TEMPLATE.format(origin=url.rstrip("/"), room=args.room, db=req["schema"]["id"])
+    link = db_link(url, args.room, req["schema"]["id"])
     async with open_room_collab(url, args.room, token, kind="db") as doc:
         result = await apply(doc, req, args.user_id, int(time.time() * 1000), link)
         await doc.settle(SETTLE_SEC)

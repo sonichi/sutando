@@ -1,5 +1,41 @@
 # Proactive loop — rationale and measurements
 
+## Completion and missing-driver health
+
+A completed pass publishes `state/loop-completions/<host>.json` through
+the core `loop_completion` module. This host-scoped record contains `version: 1`, `host`,
+and a finite, nonnegative Unix `completed_at` timestamp. The writer locks and
+atomically replaces the record, preserving the newest completion under concurrent
+writers. Ordinary `core-status.sh idle` only records work status. A proactive
+pass finishes with `core-status.sh idle "" --loop-complete`; the durable Codex
+scheduler also records completion when it finds the scheduled pass's result,
+using its publication mtime (capped at observation time). A delayed result cannot
+renew proof to the later polling time; foreign-host scheduler state is discarded.
+Enqueueing a task, a scheduler heartbeat, and completing an unrelated task are
+not proof that a proactive pass finished.
+
+The `cron-schedule` health probe reads only this host's record. It warns after
+7 hours without completion and fails after 26 hours. Existing
+`SUTANDO_CRON_STALE_WARN_H` and `SUTANDO_CRON_STALE_FAIL_H` overrides remain
+supported. Missing first proof has a bounded grace period after installation of
+the explicit writer; the health detail says it is awaiting proof. Once that
+period expires, absence warns even if ordinary conversations continue. Invalid,
+unreadable, or future-dated proof warns immediately. The legacy shared
+`state/last-loop-ok` marker and peer-host records cannot establish liveness.
+
+For a Codex core, `cron-runner` and the scheduler's `health` command also require
+one canonical core-owned `main-loop` / `prompt_skill: proactive-loop` entry in the
+host's `crons.json`; an hourly-only config or worker-owned loop cannot satisfy
+that requirement. Shared policy lives in the core `cron_loop_policy` module. An explicit
+disabled marker plus a proven impossible cron date is deliberate parking and
+exempts completion health. A disabled marker alone does not stop a schedulable
+entry. Autonomy pause and self-development settings do not exempt the health
+pass. These checks diagnose missing configuration; they do not recreate a driver
+or modify the host's schedules.
+
+The archived rationale below predates this completion contract where it refers
+to ordinary `idle` as the final pass command.
+
 Every paragraph below is the verbatim text that lived in `skills/proactive-loop/SKILL.md` until
 it was reduced to commands (sonichi/sutando PR: commands, not lessons). The skill now names a step
 number; the matching section here carries the measurement, the incident and the reasoning. This
@@ -576,7 +612,7 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
    a duplicate. Which rows may go is the owner's call (a pending question -> "MEMORY.md byte
    budget"); the guard's job is only to stop the write that would decide it by accident.
 
-8. **If blocked, ask.** `python3 scripts/ask-owner.py "<question>" [--context "<why / options>"] [--task-file <workspace>/tasks/<task>.txt]` — through the store an installed skill declares it records the question as a row of the owner's Pending questions database (held in `<workspace>/state/pending-questions-outbox/` while the room is unreachable), queues it to the owner and fires the macOS notification. Never hand-edit; the per-host `pending-questions.md` is read-only history. Read the output: a `FAILED` line is not an ask. Confirm with `python3 src/pending_questions_reader.py list --json` that the ask id is listed. Don't stop — apply the Pivot-on-block rule and pick another menu item.
+8. **If blocked, ask.** `python3 scripts/ask-owner.py "<question>" [--context "<why / options>"] [--task-file <workspace>/tasks/<task>.txt]` — through the store an installed skill declares it records the question as a row of the owner's Pending questions database (held in `<workspace>/state/pending-questions-outbox/` while the room is unreachable), queues it to the owner and fires the macOS notification. Never hand-edit; the per-host `pending-questions.md` is read-only history. The new question is queued and held before room-database work; after its row is confirmed, older questions are reconciled within the same 90-second subprocess-operation budget. A failed write keeps the outbox entry for a later explicit reconcile. Read the output: a `FAILED` line is not an ask. Confirm with `python3 src/pending_questions_reader.py list --json` that the ask id is listed. Don't stop — apply the Pivot-on-block rule and pick another menu item.
 
 9. **Ensure the streaming watcher is running.** **Read the `task-watcher` probe from the `health-check.py` run you already did in step 3 — do not re-derive liveness here.** That probe is the authoritative signal: it enumerates real watcher process trees (`_watcher_trees()` in `src/health-check.py`) and reports which of four states holds. Act on the state it names:
 

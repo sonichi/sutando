@@ -23,6 +23,8 @@ row it lands or observes marks the store as used.
 from __future__ import annotations
 
 import hashlib
+import time
+from contextlib import contextmanager, nullcontext
 import json
 import re
 import subprocess
@@ -200,13 +202,33 @@ class ScriptDbClient:
 
     def __init__(self, argv: list, timeout: float = 90.0):
         self.argv, self.timeout = list(argv), timeout
+        self._deadline = None
+
+    @contextmanager
+    def operation(self):
+        previous = self._deadline
+        deadline = time.monotonic() + self.timeout
+        self._deadline = min(previous, deadline) if previous is not None else deadline
+        try:
+            yield
+        finally:
+            self._deadline = previous
+
+    def remaining_timeout(self):
+        timeout = self.timeout
+        if self._deadline is not None:
+            timeout = min(timeout, self._deadline - time.monotonic())
+            if timeout <= 0:
+                raise StoreError("room database: operation deadline exceeded")
+        return timeout
 
     def _call(self, req: dict):
+        timeout = self.remaining_timeout()
         try:
             r = subprocess.run(self.argv, input=json.dumps(req), capture_output=True,
-                               text=True, timeout=self.timeout)
+                               text=True, timeout=timeout)
         except subprocess.TimeoutExpired:
-            raise StoreError(f"room database: no reply within {self.timeout:.0f}s") from None
+            raise StoreError(f"room database: no reply within {timeout:.2f}s") from None
         except OSError as e:
             raise StoreError(f"room database: could not run the adapter ({e})") from None
         try:
@@ -287,6 +309,9 @@ class RoomDbStore:
         self.last_link: Optional[str] = None
         self._keys: dict = {}
 
+    def operation(self):
+        return getattr(self.client, "operation", nullcontext)()
+
     def _rid(self, ask_id: str) -> str:
         """This host's row for `ask_id`: the existing one it owns, else a new key that carries
         the host, so two hosts' rows for one ask id are two rows, never one shared row."""
@@ -317,15 +342,22 @@ class RoomDbStore:
     def complete(self, ask_id: str) -> bool:
         """The row is present, carries this exact ask id (and this host), has a body and no
         incomplete mark: the confirmation an outbox entry is deleted on."""
-        r = self.client.row(DB_SCHEMA, self._rid(ask_id))
+        rid = self._rid(ask_id)
+        r = self.client.row(DB_SCHEMA, rid)
         if not r or not (r.get("body") or "").strip():
             return False
         cells = r.get("cells") or {}
         if cells.get("ask_id") != ask_id or not self.owns(cells):
             return False
-        return _mark(cells, "recovery") != INCOMPLETE
+        if _mark(cells, "recovery") == INCOMPLETE:
+            return False
+        self._keys[ask_id] = rid
+        return True
 
     def _locked(self, fn):
+        remaining = getattr(self.client, "remaining_timeout", None)
+        if remaining is not None:
+            remaining()
         if self.lock is None:
             raise StoreError("the room database store has no lock; refusing an unserialized write")
         err, result = ledger.under_lock(self.lock, fn)
@@ -497,23 +529,24 @@ def reconcile_pending(store, workspace, host: Optional[str]) -> dict:
     single call site). A row landed commits the history marker before its local evidence
     goes (flush, replay, ingest); a row merely observed commits it here — the one backfill
     for a workspace whose rows predate the marker, so no read ever has to write."""
-    ob = Outbox(workspace)
-    flushed, errors = ob.flush(store)
-    closed, close_errors = ob.replay_closes(store)
-    errors += close_errors
-    seen = []
-    try:
-        for r in store.entries():
-            seen.append(r["ask_id"])
-            if r["stale"]:
-                store.clear(r["ask_id"], r["stale"])
-    except Exception as e:  # noqa: BLE001
-        errors.append(f"stale marks: {type(e).__name__}: {e}")
-    import pending_questions_compat as compat  # noqa: PLC0415 — transitional; see its docstring
-    moved, ingest_errors = compat.ingest_legacy_file_entries(workspace, host, store)
-    if seen:
+    with getattr(store, "operation", nullcontext)():
+        ob = Outbox(workspace)
+        flushed, errors = ob.flush(store)
+        closed, close_errors = ob.replay_closes(store)
+        errors += close_errors
+        seen = []
         try:
-            mark_store_used(workspace, min(seen))
-        except OSError as e:
-            errors.append(f"store history: {type(e).__name__}: {e}")
-    return {"flushed": flushed, "closed": closed, "moved": moved, "errors": errors + ingest_errors}
+            for r in store.entries():
+                seen.append(r["ask_id"])
+                if r["stale"]:
+                    store.clear(r["ask_id"], r["stale"])
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"stale marks: {type(e).__name__}: {e}")
+        import pending_questions_compat as compat  # noqa: PLC0415 — transitional; see its docstring
+        moved, ingest_errors = compat.ingest_legacy_file_entries(workspace, host, store)
+        if seen:
+            try:
+                mark_store_used(workspace, min(seen))
+            except OSError as e:
+                errors.append(f"store history: {type(e).__name__}: {e}")
+        return {"flushed": flushed, "closed": closed, "moved": moved, "errors": errors + ingest_errors}

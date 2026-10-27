@@ -110,6 +110,8 @@ match. Review DMs, publication retries, and decision-result acknowledgements
 are durable and idempotent, so a retry neither spams the owner nor publishes the
 result twice.
 
+The same final scan (`policy/egress/result.guard_result_for_tier`) runs on every bridge's non-owner reply leg, Slack included. Besides markers and secrets it withholds a result that quotes internal error detail (a raw OS error, a traceback, or a local filesystem path): those belong in the owner's log, never in another person's conversation. On Slack a proactive owner notice resolves its recipient the way inbound tier resolution does, so an allowlisted member missing from `tierMap` is never treated as owner.
+
 ### Owner-mention tasks
 
 With the room's per-agent **admit on owner mention** policy on, the broker also

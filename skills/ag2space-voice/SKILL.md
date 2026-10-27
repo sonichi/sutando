@@ -36,8 +36,23 @@ top of that. Remove the directory and the engine boots, types and tests unchange
   `[dm-only]` delivery note, and a `verify` that re-asks the gateway bridge when the
   result is delivered. Results therefore land as
   `results/proactive-result-<task>-<ts>.to-ag2space.txt` with `[channel: <room>]` first.
+- **In-flight work** keeps the origin and recent context from when the `work` call
+  began (or the turn the relay agent's turn check sends), including across the relay
+  agent's wait for the user to finish, its request check, a room switch or
+  disconnect/reconnect. A pending
+  transcription is omitted if the room changes, the turns provider is replaced,
+  or the client disconnects; the new session's words never fill that old task.
+  Re-announcing the room already bound, and a spoken farewell ("research X, bye"),
+  change none of these, so the owner's words for that task are kept. Delivery
+  still re-checks the original room's membership and honors `[dm-only]`.
 - **Prompt**: a `ROOM:` context line while docked, and one system notice per actual
   room change.
+- **`current_room`** — "which room are you in?" is answered from the binding at the
+  moment it is asked, never from what the model remembers: the notice comes once per
+  change, can be missed (a reconnect, a busy session) and can be outweighed by an
+  earlier room still in context. It sits with `navigate_ui` in `voiceSurface()`, under
+  the same condition, with its WHERE YOU ARE prompt rule and a turn-check rule. It is
+  listed as an answering tool, so the turn never also goes to the core.
 - **`navigate.ts` / `navigate-protocol.ts`** — the `navigate_ui` tool ("let's talk in my
   DM", "take me to GTM in Investors", "go home"). It is contributed through
   `voiceSurface()`, so it is on the web voice session only, never the phone tool table,

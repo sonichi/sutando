@@ -73,6 +73,28 @@ claude_named_process_running() {
   [ -n "$(claude_named_pids)" ]
 }
 
+# A private socket (SUTANDO_TMUX_SOCKET set, e.g. a desktop install) is shared
+# with no other install, so a same-name claude outside its server is foreign.
+claude_private_socket_in_use() {
+  [ -n "${SUTANDO_TMUX_SOCKET:-}" ]
+}
+
+# claude_named_pids restricted to processes running inside a pane of the tmux
+# server on $TMUX_SOCKET (the pane pid itself or one of its descendants).
+claude_named_pids_on_socket() {
+  local panes pid p depth
+  panes="$(tmux -S "$TMUX_SOCKET" list-panes -a -F '#{pane_pid}' 2>/dev/null)" || return 0
+  [ -n "$panes" ] || return 0
+  for pid in $(claude_named_pids); do
+    p="$pid"; depth=0
+    while [ -n "$p" ] && [ "$p" -gt 1 ] 2>/dev/null && [ "$depth" -lt 16 ]; do
+      if printf '%s\n' "$panes" | grep -qx "$p"; then echo "$pid"; break; fi
+      p="$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')"
+      depth=$((depth + 1))
+    done
+  done
+}
+
 claude_named_tmux_session_exists() {
   command -v tmux > /dev/null 2>&1 || return 1
   tmux -S "$TMUX_SOCKET" has-session -t "=$SESSION" 2>/dev/null
@@ -80,7 +102,11 @@ claude_named_tmux_session_exists() {
 
 claude_named_session_running() {
   claude_named_tmux_session_exists || return 1
-  claude_named_process_running
+  if claude_private_socket_in_use; then
+    [ -n "$(claude_named_pids_on_socket)" ]
+  else
+    claude_named_process_running
+  fi
 }
 
 # Optional working-directory override. Unset: no override, launches from cwd.
@@ -115,7 +141,9 @@ resolve_claude_config_dir_and_seed() {
     export CLAUDE_CONFIG_DIR="$_ccd"
     echo "  ✓ CLAUDE_CONFIG_DIR=$_ccd"
     if [ -n "$PY" ] && "$PY" -c 'import sys' > /dev/null 2>&1; then
-      _ccd="$_ccd" _cwd="${SUTANDO_CLAUDE_WORKING_DIR:-}" _accept_bypass="${SUTANDO_ACCEPT_BYPASS_PERMISSIONS:-}" "$PY" - <<'PY' || echo "  ⚠ onboarding-seed skipped (non-fatal)"
+      # No override: claude starts in this checkout, which a git repo makes Claude Code ask
+      # about (2026-10-22: a PR checkout's core restarted into that prompt and sat there).
+      _ccd="$_ccd" _cwd="${SUTANDO_CLAUDE_WORKING_DIR:-$(cd "$REPO" && pwd -P)}" _accept_bypass="${SUTANDO_ACCEPT_BYPASS_PERMISSIONS:-}" "$PY" - <<'PY' || echo "  ⚠ onboarding-seed skipped (non-fatal)"
 import json, os
 ccd = os.environ["_ccd"]
 target = os.path.join(ccd, ".claude.json")
@@ -156,10 +184,11 @@ if (cfg.get("fullscreenUpsellSeenCount") or 0) < 3:
     cfg["fullscreenUpsellSeenCount"] = 3
     changed = True
     upsell_seeded = True
-# Trust-seed for the explicitly-configured working dir. Claude Code keys the
+# Trust-seed for the dir claude starts in. Claude Code keys the
 # folder-trust dialog on projects[<abs cwd>].hasTrustDialogAccepted; a fresh
-# scoped config lacks it for a custom cwd, so a detached session would hang on
-# the prompt. Only pre-trust the one dir the caller explicitly chose.
+# scoped config lacks it, so a detached session would hang on the prompt.
+# Only pre-trust the one dir the caller explicitly chose, or else the launcher's
+# own checkout (physical path, as getcwd() reports it).
 cwd = os.environ.get("_cwd") or ""
 trusted_dir = None
 if cwd:
@@ -370,6 +399,7 @@ install_claude_personal_hook() {
 # (caller decides what that means — abort, retry, or a heal path).
 launch_claude_session() {
   tmux -S "$TMUX_SOCKET" new-session -d -s "$SESSION" ${ENV_ARGS[@]+"${ENV_ARGS[@]}"} ${CWD_ARGS[@]+"${CWD_ARGS[@]}"} \
+    -e "CLAUDE_CONFIG_DIR=$CLAUDE_CONFIG_DIR" \
     claude --name "$SESSION" ${SURFACE_ARGS[@]+"${SURFACE_ARGS[@]}"} --dangerously-skip-permissions --add-dir "$HOME" \
     ${SETTINGS_ARGS[@]+"${SETTINGS_ARGS[@]}"} ${SESSION_ARGS[@]+"${SESSION_ARGS[@]}"} \
     -- "$BOOT_PROMPT" || true

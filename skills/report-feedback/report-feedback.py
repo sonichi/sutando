@@ -28,6 +28,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -78,6 +79,7 @@ ASK_ACTIONS = [
 AUTO_STATE_FILE = "feedback-auto-reports.json"
 AUTO_DEDUPE_WINDOW_S = 24 * 3600
 AUTO_DAILY_CAP = 5
+HISTORICAL_HOLD_S = 72 * 3600
 
 
 def _git(repo: Path, *args: str) -> Optional[str]:
@@ -164,6 +166,35 @@ def body_with_versions(body: str, versions: dict) -> str:
     return "\n".join(lines)
 
 
+def recovery_report_content(rec: dict) -> tuple[str, dict]:
+    """Describe the persisted hold interval without changing the draft or recovery state."""
+    recovery = dict(rec["payload"]["recovery"])
+    timestamps = {}
+    for key, value in (("observed_at", rec.get("created")), ("released", recovery.get("released"))):
+        try:
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError("unknown timestamp")
+            timestamps[key] = datetime.fromtimestamp(value, timezone.utc).isoformat().replace("+00:00", "Z")
+        except (ValueError, OverflowError, OSError):
+            value = None
+            timestamps[key] = "unknown"
+        recovery[key] = value
+    observed, released = recovery["observed_at"], recovery["released"]
+    elapsed = (released - observed if observed is not None and released is not None
+               and released >= observed else None)
+    recovery["held_seconds"] = elapsed
+    recovery["historical"] = elapsed >= HISTORICAL_HOLD_S if elapsed is not None else None
+    duration = str(timedelta(seconds=elapsed)) if elapsed is not None else "unknown"
+    lines = [rec["payload"]["body"], "", "### Automatic report timing",
+             f"- Original observation (UTC): {timestamps['observed_at']}",
+             f"- Released (UTC): {timestamps['released']}",
+             f"- Elapsed hold duration: {duration}"]
+    if recovery["historical"]:
+        lines.extend(["", "**Historical report:** Held for at least 72 hours. This describes an earlier "
+                      "observation and may not reflect the current state."])
+    return "\n".join(lines), recovery
+
+
 def _redact(text: str) -> str:
     """Best-effort scrub of secrets/PII before a log excerpt leaves the machine.
 
@@ -217,7 +248,7 @@ def resolve_workspace() -> Path:
 
 
 # Wrappers, not aliases: each hands its sibling down as the injected reader, so
-# patching _keychain_get / read_keychain_auth here still steers the chain.
+# patching _keychain_get here still steers the chain (every Keychain key is a candidate).
 _normalize_base = cloud_auth.normalize_base
 _fnv1a64 = cloud_auth.fnv1a64
 origin_vault_key = cloud_auth.origin_vault_key
@@ -233,7 +264,7 @@ def read_keychain_auth():
 
 
 def read_cloud_auth(ws: Path):
-    return cloud_auth.read_cloud_auth(ws, keychain_auth=read_keychain_auth)
+    return cloud_auth.read_cloud_auth(ws, keychain_get=_keychain_get)
 
 
 def why_no_logs(ws: Path) -> str:
@@ -721,7 +752,12 @@ def decide(ws: Path, prefs: dict, draft_id: str, choice: str, *, owner_approved:
     if rec["payload"].get("recovery") and not recovery_ready(rec):
         print(f"HELD: incident {draft_id} is awaiting recovery.")
         return 3
-    base, token = read_cloud_auth(ws)
+    auth = read_cloud_auth(ws)
+    base, token = auth
+    refusal = None if token else cloud_auth.refusal_message(auth)
+    if refusal:
+        print(f"ACCOUNT_REFUSED: {refusal} The draft stays parked.")
+        return 2
     if not token:
         print(f"NOT_SIGNED_IN: not signed in to Sutando Cloud (probed {base or resolve_cloud_origin()}) — the draft stays parked; sign in, then retry.")
         return 2
@@ -731,8 +767,11 @@ def decide(ws: Path, prefs: dict, draft_id: str, choice: str, *, owner_approved:
     ctx["versions"] = d.get("versions") or {
         name: {"version": "unknown", "commit": "unknown"} for name in ("sutando", "ag2space")
     }
+    body = d["body"]
     if d.get("recovery"):
         ctx["recovery"] = d["recovery"]
+        if d.get("auto"):
+            body, ctx["recovery"] = recovery_report_content(rec)
     with_logs = choice == "file" and prefs["sendLogs"] and not d.get("no_logs")
     if with_logs:
         excerpt, names = logs_excerpt(ws)
@@ -743,7 +782,7 @@ def decide(ws: Path, prefs: dict, draft_id: str, choice: str, *, owner_approved:
             ctx["logs_omitted"] = why_no_logs(ws)
     else:
         ctx["logs_opted_out"] = True
-    payload = {"kind": d["kind"], "severity": d["severity"], "title": d["title"], "body": body_with_versions(d["body"], ctx["versions"]), "context": ctx}
+    payload = {"kind": d["kind"], "severity": d["severity"], "title": d["title"], "body": body_with_versions(body, ctx["versions"]), "context": ctx}
     mark_posting(ws, draft_id)
     receipt: dict = {}
     try:
@@ -859,7 +898,12 @@ def _main() -> None:
         print(f"ASKED: draft {draft_id} parked as {req_id}; the bridge delivers the card. After the owner answers, run --apply.")
         return
 
-    base, token = read_cloud_auth(ws)
+    auth = read_cloud_auth(ws)
+    base, token = auth
+    refusal = None if token else cloud_auth.refusal_message(auth)
+    if refusal:
+        print(f"ACCOUNT_REFUSED: {refusal}")
+        sys.exit(2)
     if not token:
         print(f"NOT_SIGNED_IN: not signed in to Sutando Cloud (probed {base or resolve_cloud_origin()}) — ask the user to sign in (Settings → Sutando Cloud), then retry.")
         sys.exit(2)

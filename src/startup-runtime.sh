@@ -538,54 +538,54 @@ start_gateway_lanes() {
     # the redirect below); the bridge stamps launched_via into gateway-status
     # and skips its own bare-launch file log. See remote_gateway_bridge._log.
     if [ -n "$PY" ]; then
-      SUTANDO_SUPERVISED=1 "$PY" "$REPO/src/remote-gateway-bridge.py" >> "$LOGS_DIR/remote-gateway-bridge.log" 2>&1 &
+      # Once a named row holds the primary, the legacy bridge is a secondary: it must not
+      # inherit the proactive room, or two bridges post nudges. Otherwise the variable passes
+      # through as is, unset included: the bridge reads the device env only when unset.
+      if _gw_primary="$("$PY" "$REPO/scripts/connections.py" primary 2>/dev/null)" && [ -n "$_gw_primary" ]; then
+        SUTANDO_SUPERVISED=1 REMOTE_PROACTIVE_ROOM="" "$PY" "$REPO/src/remote-gateway-bridge.py" >> "$LOGS_DIR/remote-gateway-bridge.log" 2>&1 &
+      else
+        SUTANDO_SUPERVISED=1 "$PY" "$REPO/src/remote-gateway-bridge.py" >> "$LOGS_DIR/remote-gateway-bridge.log" 2>&1 &
+      fi
       echo "  ✓ gateway bridge (self-defers if already running)"
     else
       echo "  ⊘ gateway bridge skipped — no runnable python3"
     fi
     fi
 
-    # Named secondary gateways (multi-gateway): every AG2_REMOTE_TOKEN_<INST> in
-    # the environment launches one extra bridge for that gateway (e.g.
-    # AG2_REMOTE_TOKEN_DEV → instance "dev" against the dev homeserver). Each
-    # instance gets its own lock role + state files via GATEWAY_INSTANCE, and
-    # deliberately inherits NO REMOTE_PROACTIVE_ROOM — proactive nudges stay with
-    # the primary (owner-DM) gateway only.
-    # No pgrep dedupe here (env vars are invisible to pgrep -f): the bridge's own
-    # per-instance singleton lock (role gateway-bridge.<inst>) makes a duplicate
-    # launch self-defer and exit, so always-spawn is safe and simpler.
-    for _gw_var in $(env | grep -o '^AG2_REMOTE_TOKEN_[A-Za-z0-9_][A-Za-z0-9_]*' || true); do
-      _gw_inst="$(printf '%s' "${_gw_var#AG2_REMOTE_TOKEN_}" | tr '[:upper:]' '[:lower:]')"
-      # The guard must wrap the WHOLE command. `VAR=1 [ -n "$PY" ] && cmd` applies
-      # the assignments to `[` and runs cmd with NONE of them — so the named
-      # gateway launched without GATEWAY_INSTANCE / its own REMOTE_TASK_TOKEN /
-      # the REMOTE_PROACTIVE_ROOM= scoping, collapsing onto the primary gateway's
-      # credentials (CR #2599, @qingyun-wu).
-      # The ✓ belongs INSIDE the branch too. Fixing the guard shape here while
-      # leaving the success line outside it still reported a launch that never
-      # happened — per named instance, on a configured remote-control surface.
-      if [ -n "$PY" ]; then
-        # REMOTE_TASK_CHANNEL_DIR isolates this instance's channel config
-        # (.env fallback + access.json). Without it the named instance defaults
-        # to channels/ag2space/ and inherits PROD's credentials and tier map —
-        # the exact failure #2701 exists to prevent (review P1, bassil).
-        # Convention: instance "dev" → channels/dev-ag2space/; anything else →
-        # channels/<inst>-ag2space/ unless the operator overrides via
-        # REMOTE_TASK_CHANNEL_DIR_<INST>.
-        _gw_chdir_var="REMOTE_TASK_CHANNEL_DIR_${_gw_var#AG2_REMOTE_TOKEN_}"
-        _gw_chdir="${!_gw_chdir_var:-${_gw_inst}-ag2space}"
-        _gw_token_file_var="REMOTE_TASK_TOKEN_FILE_${_gw_var#AG2_REMOTE_TOKEN_}"
-        _gw_token_file="${!_gw_token_file_var:-$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels "$_gw_chdir" .env)}"
-        [ -f "$_gw_token_file" ] || _gw_token_file=""
-        SUTANDO_SUPERVISED=1 GATEWAY_INSTANCE="$_gw_inst" REMOTE_TASK_TOKEN="${!_gw_var}" \
-          REMOTE_TASK_URL= REMOTE_TASK_TOKEN_FILE="$_gw_token_file" \
-          REMOTE_TASK_CHANNEL_DIR="$_gw_chdir" \
-          REMOTE_PROACTIVE_ROOM= \
-          "$PY" "$REPO/src/remote-gateway-bridge.py" >> "$LOGS_DIR/remote-gateway-bridge.$_gw_inst.log" 2>&1 &
-        echo "  ✓ gateway bridge ($_gw_inst — self-defers if already running)"
-      else
-        echo "  ⊘ gateway bridge ($_gw_inst) skipped — no runnable python3"
+    # Named gateways (multi-gateway): one extra bridge per connection row with an
+    # instance (src/connections.py), each against its own homeserver. Env tokens
+    # become rows once (import-env); the plan also covers any AG2_REMOTE_TOKEN_<INST>
+    # the import could not record, so nothing is lost. Each instance gets its own
+    # lock role + state files via GATEWAY_INSTANCE; only the primary row inherits
+    # REMOTE_PROACTIVE_ROOM — proactive nudges stay with the primary gateway.
+    # No pgrep dedupe: the bridge's own per-instance singleton lock makes a
+    # duplicate launch self-defer and exit.
+    if [ -n "$PY" ]; then
+      "$PY" "$REPO/scripts/connections.py" import-env > /dev/null 2>> "$LOGS_DIR/remote-gateway-bridge.log" \
+        || echo "  ⚠ connections import-env failed — launching secondaries from the environment"
+      # One launch per plan line; the token, env shape and launch record are the module's.
+      # An unreadable record is said out loud and the environment's tokens launch on their own.
+      _gw_launch_flag=""
+      if ! _gw_plan="$("$PY" "$REPO/scripts/connections.py" launch-plan 2>> "$LOGS_DIR/remote-gateway-bridge.log")"; then
+        echo "  ⚠ connections launch-plan failed (see remote-gateway-bridge.log) — launching from the environment"
+        _gw_launch_flag="--env-only"
+        _gw_plan="$(env | grep -o '^AG2_REMOTE_TOKEN_[A-Za-z0-9_][A-Za-z0-9_]*' \
+          | sed 's/^AG2_REMOTE_TOKEN_//' | tr '[:upper:]' '[:lower:]')"
       fi
-    done
+      while IFS="$(printf '\t')" read -r _gw_inst _gw_rest; do
+        [ -n "$_gw_inst" ] || continue
+        if "$PY" "$REPO/scripts/connections.py" launch "$_gw_inst" --repo "$REPO" --logs-dir "$LOGS_DIR" $_gw_launch_flag \
+             >> "$LOGS_DIR/remote-gateway-bridge.log" 2>&1; then
+          echo "  ✓ gateway bridge ($_gw_inst — self-defers if already running)"
+        else
+          echo "  ⊘ gateway bridge ($_gw_inst) not launched — see remote-gateway-bridge.log"
+        fi
+      done <<< "$_gw_plan"
+    else
+      # Without python3 the plan cannot be read; name every instance the environment declares.
+      for _gw_var in $(env | grep -o '^AG2_REMOTE_TOKEN_[A-Za-z0-9_][A-Za-z0-9_]*' || true); do
+        echo "  ⊘ gateway bridge ($(printf '%s' "${_gw_var#AG2_REMOTE_TOKEN_}" | tr '[:upper:]' '[:lower:]')) skipped — no runnable python3"
+      done
+    fi
   fi
 }

@@ -19,9 +19,13 @@ journaled, rather than refused.
 
 from __future__ import annotations
 
+import contextlib
+import fnmatch
 import hashlib
 import json
 import os
+import re
+import stat
 import sys
 import tempfile
 import time
@@ -33,10 +37,14 @@ from typing import NamedTuple
 # derives its classification from parse_markers rather than a parallel grammar.
 try:  # pragma: no cover - the packaged twin exercises the relative imports
     from .result_markers import parse_markers  # packaged sibling (ag2-sparrow)
-    from .local_task_protocol import canonical_access_tier, parse_task_headers
+    from .local_task_protocol import canonical_access_tier, find_archived_task, parse_task_headers
+    from .task_archive import find_task_file
+    from .file_lock import lock_fd, unlock_fd
 except ImportError:
     from result_markers import parse_markers  # monorepo src/ on sys.path
-    from local_task_protocol import canonical_access_tier, parse_task_headers
+    from local_task_protocol import canonical_access_tier, find_archived_task, parse_task_headers
+    from task_archive import find_task_file
+    from file_lock import lock_fd, unlock_fd
 
 TEAM_LEAK_RESULT = (
     "I completed the Team task, but the response was withheld because it may "
@@ -83,6 +91,22 @@ class TeamResultLeakError(RuntimeError):
     """A Team result carried a delivery-control marker or a likely secret."""
 
 
+# An internal error carries this host's paths and state ids; it is the owner's to read, never a
+# guarded reader's. Paths match only under per-user and temp roots (POSIX, Windows), never `/x/y`.
+INTERNAL_ERROR_DETAIL = "internal error detail"
+_INTERNAL_ERROR_RE = re.compile(
+    r"\[(?:Errno|WinError) \d+\]"
+    r"|Traceback \(most recent call last\)"
+    r"|(?<![\w.~/-])(?:/(?:Users|home|root|tmp|var/tmp|private/(?:var|tmp)|var/folders)|~/Library)/[^\s'\"`]+"
+    r"|(?<![\w.~/-])[A-Za-z]:[\\/]Users[\\/][^\s'\"`]+")
+
+
+def carries_internal_error_detail(body) -> bool:
+    """True when the text a reader would see quotes a raw OS error, a traceback, or a local path.
+    Marker values are excluded: an admitted `[file:]` path is consumed by the transport, never shown."""
+    return bool(_INTERNAL_ERROR_RE.search(parse_markers(body or "").body or ""))
+
+
 def resolve_access_tier(task_file) -> str:
     """Read a task's effective tier without letting a task-last body escalate.
 
@@ -115,6 +139,15 @@ def resolve_access_tier(task_file) -> str:
         return "guest"
     tier = normed.pop()
     return tier if tier in {"owner", "team", "guest"} else "guest"
+
+
+def resolve_route_tier(tier, tasks_dir: Path, task_id: str) -> str:
+    """The tier a reply is guarded with: the route's own tier when it carries one,
+    else the task file's (live, claimed, or archived); no task file anywhere is guest."""
+    if tier and tier != "unknown":
+        return tier
+    task_file = find_task_file(tasks_dir, task_id) or find_archived_task(tasks_dir, task_id)
+    return resolve_access_tier(task_file) if task_file else "guest"
 
 
 def sensitive_data_filter_enabled(task_file, tier=None) -> bool:
@@ -216,6 +249,8 @@ def scan_team_result(body: str, repo: Path, secret_filter=None,
     # Marker checks stay above this narrow scanner opt-out.
     if not scan_sensitive_data:
         return body
+    if carries_internal_error_detail(body):
+        raise TeamResultLeakError(INTERNAL_ERROR_DETAIL)
     filter_chat_secrets = secret_filter or load_team_result_scanner(repo)
     try:
         result = filter_chat_secrets(body)
@@ -226,14 +261,15 @@ def scan_team_result(body: str, repo: Path, secret_filter=None,
     return body
 
 
-def is_suppression_only(body: str) -> bool:
+def is_suppression_only(body: str, skip_after_channel: bool = False) -> bool:
     """True when every marker the shared parser executes is suppressive.
 
     Classification, not validation: the guard does not inspect a dedup target,
     because the consumer that dereferences one already rejects an id it cannot
     look up safely. Deciding here would be a second, drifting copy of that rule.
+    skip_after_channel: the parse_markers flag of the delivery verdict to classify.
     """
-    actions = parse_markers(body or "").actions
+    actions = parse_markers(body or "", skip_after_channel=skip_after_channel).actions
     return bool(actions) and all(action.kind == "skip" for action in actions)
 
 
@@ -284,13 +320,482 @@ def _bounded_context(context) -> dict:
     return {key: str(context.get(key) or "")[:512] for key in keys}
 
 
-def withheld_review_id(task_id: str) -> str:
-    identity = task_id.encode() if task_id else os.urandom(32)
+def withheld_review_id(task_id: str, body_digest: str = "") -> str:
+    """Task-keyed for a task's first recorded body; a later, different body of the
+    same task gets its own id, keyed by the digest of that body."""
+    if not task_id:
+        identity = os.urandom(32)
+    else:
+        identity = (task_id + ("\0" + body_digest if body_digest else "")).encode()
     return f"wr_{hashlib.sha256(identity).hexdigest()[:16]}"
 
 
-def withheld_review_path(state_dir: Path, task_id: str) -> Path:
-    return Path(state_dir) / WITHHELD_RESULT_DIR / f"{withheld_review_id(task_id)}.json"
+def withheld_review_path(state_dir: Path, task_id: str, body_digest: str = "") -> Path:
+    return Path(state_dir) / WITHHELD_RESULT_DIR / f"{withheld_review_id(task_id, body_digest)}.json"
+
+
+def _body_digest(body: str) -> str:
+    return hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+
+def _holds(path: Path, field: str, body: str) -> bool:
+    """The record at `path` is about exactly `body`; unreadable is not a match."""
+    try:
+        return read_json_strict(path).get(field) == body
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
+# Ids a record may take for one body of a task: the task-keyed one, then ones keyed
+# by the body's digest. Every id ever issued is reserved in `issued/`, never released.
+_ID_TRIES = 8
+
+
+def _candidates(path_of, state_dir: Path, task_id: str, body: str):
+    digest = _body_digest(body)
+    yield path_of(state_dir, task_id)
+    yield path_of(state_dir, task_id, digest)
+    for n in range(2, _ID_TRIES):
+        yield path_of(state_dir, task_id, f"{digest}#{n}")
+
+
+def _archived(path: Path) -> Path:
+    return path.parent / "archive" / path.name
+
+
+def _reservation(path: Path) -> Path:
+    return path.parent / "issued" / f"{path.stem}.issued"
+
+
+def _reserve(path: Path, digest: str) -> bool:
+    """Reserve `path`'s id for the body with `digest`: an exclusive create, so an id
+    is issued exactly once and the reservation outlives archive and resolution."""
+    _ensure_dir(_reservation(path).parent)
+    try:
+        fd = os.open(_reservation(path),
+                     os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    except FileExistsError:
+        return False
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(digest)
+        handle.flush()
+        os.fsync(handle.fileno())
+    return True
+
+
+def _issued_to(path: Path, field: str) -> "str | None":
+    """The body digest `path`'s id was issued to; None if never issued. A record
+    from before reservations existed is reserved first (seeding), and an unreadable
+    one counts as issued to no body this rule can match."""
+    try:
+        return read_strict(_reservation(path)).strip()
+    except FileNotFoundError:
+        pass
+    for existing in (_archived(path), path):           # a decision owns the id it decided
+        if present(existing):
+            _reserve(path, _record_digest(existing, field))
+            return read_strict(_reservation(path)).strip()
+    return None
+
+
+def _record_digest(path: Path, field: str) -> str:
+    """The digest of the body a record holds; "unreadable" matches no body."""
+    try:
+        body = read_json_strict(path).get(field)
+    except (OSError, ValueError, AttributeError):
+        return "unreadable"
+    return _body_digest(body) if isinstance(body, str) else "unreadable"
+
+
+def _record_of(path: Path, digest: str, field: str) -> "Path | None":
+    """The record of an id issued to `digest`, its decision first: only a record
+    holding that very body, never another body's copy under the same id."""
+    for existing in (_archived(path), path):
+        if present(existing) and _record_digest(existing, field) == digest:
+            return existing
+    return None
+
+
+@contextlib.contextmanager
+def _ledger_lock(directory: Path):
+    """The one lock under which a record directory's ids are issued, its records
+    written, and its records archived: no transition interleaves with another."""
+    issued = Path(directory) / "issued"
+    _ensure_dir(issued)  # raises on a linked or odd issued/
+    fd = os.open(issued / ".lock", os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    try:
+        lock_fd(fd)
+        try:
+            yield
+        finally:
+            unlock_fd(fd)
+    finally:
+        os.close(fd)
+
+
+def _record_directory(path: Path) -> Path:
+    path = Path(path)
+    return path.parent.parent if path.parent.name == "archive" else path.parent
+
+
+def _owns_its_id(path: Path, field: str) -> bool:
+    """A live record may act only while its id is reserved to the body it holds
+    and no decision for that id is archived; an archived decision is immutable."""
+    return (path.parent.name != "archive" and not present(_archived(path))
+            and _issued_to(path, field) == _record_digest(path, field))
+
+
+def present(path: Path, kind: "int | None" = None) -> bool:
+    """True when `path` is there as `kind`; False only when it is genuinely absent (see _walk).
+    A symlink, a wrong kind or any other error is unknown and raises OSError, never reads absent."""
+    mode = _walk(path)
+    if mode is None:
+        return False
+    if kind is not None and stat.S_IFMT(mode) != kind:
+        raise OSError(f"{path}: not a path of its kind")
+    return True
+
+
+def entries(directory: Path, pattern: str) -> list:
+    """The names under `directory` matching `pattern`; [] only when it is genuinely absent."""
+    if not present(directory, stat.S_IFDIR):
+        return []
+    directory = directory if isinstance(directory, Path) else Path(directory)
+    return sorted(directory / name for name in os.listdir(directory)
+                  if fnmatch.fnmatchcase(name, pattern))
+
+
+def read_strict(path: Path) -> str:
+    """The text of a record file, read only through the strict walk and never through a link;
+    a missing file raises FileNotFoundError, anything else unknown raises OSError."""
+    if not present(path, stat.S_IFREG):
+        raise FileNotFoundError(2, "No such file or directory", str(path))
+    with os.fdopen(_open_no_follow(path), "r", encoding="utf-8") as handle:
+        return handle.read()
+
+
+def _open_no_follow(path: Path) -> int:
+    path = path if isinstance(path, Path) else Path(path)
+    flags = (os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+             | getattr(os, "O_CLOEXEC", 0))
+    if not hasattr(os, "O_DIRECTORY"):  # no dir_fd walk on this platform: the leaf alone
+        return _regular_only(os.open(path, flags))
+    fd = _open_dir(path.parent)
+    try:
+        return _regular_only(os.open(path.name, flags, dir_fd=fd))
+    finally:
+        os.close(fd)
+
+
+def _regular_only(fd: int) -> int:
+    # Opened non-blocking, so a FIFO cannot hang the open; anything but a regular file is refused.
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        raise OSError("not a regular file")
+    return fd
+
+
+def _open_dir(directory: Path) -> int:
+    # Each directory from the namespace down is opened relative to the last and never through a
+    # link, so a directory swapped for a link after the walk is refused, not followed.
+    nofollow, flags = getattr(os, "O_NOFOLLOW", 0), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    root = _namespace_root(directory / "entry")         # the same root the walk of an entry uses
+    fd = os.open(root, flags | nofollow)
+    try:
+        for name in directory.relative_to(root).parts:
+            step = os.open(name, flags | nofollow, dir_fd=fd)
+            os.close(fd)
+            fd = step
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def read_json_strict(path: Path):
+    return json.loads(read_strict(path))
+
+
+_NAMESPACES = (WITHHELD_RESULT_DIR, SUPPRESSED_RESULT_DIR)
+
+
+def _namespace_root(path: Path) -> Path:
+    return next((a for a in (path, *path.parents) if a.name in _NAMESPACES), path.parent)
+
+
+def namespace_problems(directory: Path) -> list:
+    """Read-only, no lock: each entry of a review namespace that a reader would refuse, as
+    (path, reason), across live records, archive/, conflicts/, claims/ and issued/."""
+    directory = directory if isinstance(directory, Path) else Path(directory)
+    problems = []
+    for folder, records in ((directory, True), (directory / "archive", True),
+                            (directory / "archive" / "superseded", True),
+                            (directory / "conflicts", True), (directory / "claims", False),
+                            (directory / "issued", False)):
+        try:
+            paths = entries(folder, "wr_*.json" if records else "*")
+        except OSError:
+            problems.append((folder, "a link, an odd entry or no access"))
+            continue
+        for path in paths:
+            try:
+                if not records:
+                    present(path, stat.S_IFREG)  # a directory, FIFO or link here is unknown
+                elif not isinstance(read_json_strict(path), dict):
+                    problems.append((path, "not a JSON object"))
+            except OSError:
+                problems.append((path, "a link, an odd entry or no access"))
+            except ValueError:
+                problems.append((path, "not valid JSON"))
+    return problems
+
+
+def _walk(path) -> "int | None":
+    # lstat each step from the record namespace (or the parent) down: a link is unknown, and so is
+    # a file on the way (ENOTDIR); None only when genuinely absent below a real, readable directory.
+    path = path if isinstance(path, Path) else Path(path)
+    root = _namespace_root(path)
+    steps = [root, *reversed([a for a in path.parents if root in a.parents]), path]
+    for step in dict.fromkeys(steps):
+        try:
+            status = os.lstat(step)
+        except FileNotFoundError:
+            _absent(step)
+            return None
+        mode = status.st_mode
+        if stat.S_ISLNK(mode) or getattr(status, "st_file_attributes", 0) & _REPARSE_POINT:
+            raise OSError(f"{step}: a symlink or junction")
+    return mode
+
+
+_REPARSE_POINT = 0x400  # FILE_ATTRIBUTE_REPARSE_POINT: a Windows junction is not S_ISLNK
+
+
+def _still_at(fd: int, directory: Path) -> bool:
+    """The held directory is still the one at its path in the namespace: no link on the way,
+    and the same device and inode as the fd. A rename or rebind after the open fails this."""
+    try:
+        if not present(directory, stat.S_IFDIR):
+            return False
+        held, there = os.fstat(fd), os.lstat(directory)
+    except OSError:
+        return False  # unknown is not "still there"
+    return (held.st_dev, held.st_ino) == (there.st_dev, there.st_ino)
+
+
+def _absent(path: Path) -> None:
+    # Missing is absent only below a readable directory. The walk already refused links inside the
+    # namespace; above it (a linked workspace or state root) a link to a directory is followed.
+    for ancestor in path.parents:
+        try:
+            os.stat(ancestor)
+        except FileNotFoundError:
+            continue
+        if not os.access(ancestor, os.R_OK | os.X_OK):
+            raise OSError(f"{path}: {ancestor} is not a readable directory")
+        return
+    raise OSError(f"{path}: no existing ancestor")
+
+
+_VERSION_KEYS = ("status", "decision_claim_id", "generation")
+
+
+def record_version(record) -> dict:
+    """The compare-and-set key of a record snapshot: what a writer read it as."""
+    record = record if isinstance(record, dict) else {}
+    return {key: record.get(key, 0 if key == "generation" else None) for key in _VERSION_KEYS}
+
+
+def update_record(path: Path, record: dict, field: str = "withheld_body", *,
+                  expect: dict) -> bool:
+    """Rewrite a live record under the ledger lock, only while it owns its id and is
+    still the version `expect` names: a stale snapshot never overwrites a newer one."""
+    path = Path(path)
+    with _ledger_lock(_record_directory(path)):
+        return _write_owned_record(path, record, field, expect)
+
+
+def _write_owned_record(path: Path, record: dict, field: str, expect: dict,
+                        landed: "list | None" = None) -> bool:
+    """The one writer of a live record; the caller holds the ledger lock. Refuses a
+    record that does not own its id, would change its body, or changed since read."""
+    try:
+        if not present(path, stat.S_IFREG) or not _owns_its_id(path, field):
+            return False
+        current = read_json_strict(path)
+    except (OSError, ValueError):
+        return False  # ownership that cannot be read is refused, never written
+    if (not isinstance(current, dict) or record.get(field) != current.get(field)
+            or record_version(current) != expect):
+        return False
+    record["generation"] = int(current.get("generation") or 0) + 1
+    temporary, replaced = None, False
+    try:
+        fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+        if os.name != "nt":
+            os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(record, handle, ensure_ascii=False, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        replaced = True
+        _fsync_directory(path.parent)  # success is reported only once the rename is durable
+    except Exception:  # noqa: BLE001 — any failure reports whether the rename happened
+        if landed is not None:
+            landed.append(replaced)  # whether the new record may be on disk
+        return False
+    finally:
+        if temporary is not None:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+    return True
+
+
+def _ensure_dir(directory: Path) -> Path:
+    """`directory` as a real directory, created only when genuinely absent; a link or an odd entry
+    on the way raises. Moves use verified directory fds or are refused; other writes check the
+    path first, so a concurrent swapper with state-dir write access could redirect those."""
+    if not present(directory, stat.S_IFDIR):
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if not present(directory, stat.S_IFDIR):
+            raise FileNotFoundError(2, "No such file or directory", str(directory))
+    return directory
+
+
+def _durable_move(source: Path, target: Path) -> None:
+    """Move a record so its only copy is never deleted before the new one is durable:
+    link, sync the target directory, then unlink and sync the source directory."""
+    if not present(source, stat.S_IFREG):                # a real file, reached through no link
+        raise FileNotFoundError(2, "No such file or directory", str(source))
+    _ensure_dir(target.parent)
+    if not hasattr(os, "O_DIRECTORY"):                   # no fd confinement here: refuse, never by path
+        raise OSError(f"{source}: a confined move needs directory fds; the record stays")
+    source_fd = _open_dir(source.parent)
+    try:
+        target_fd = _open_dir(target.parent)             # a folder swapped for a link is refused here
+        try:
+            os.link(source.name, target.name, src_dir_fd=source_fd, dst_dir_fd=target_fd,
+                    follow_symlinks=False)               # no-clobber: an existing file stays
+            _fsync_fd(target_fd)                         # the directory linked into, by fd, not name
+            if not (_still_at(target_fd, target.parent) and _still_at(source_fd, source.parent)):
+                os.unlink(target.name, dir_fd=target_fd)  # rebound after the open: undo, keep the source
+                _fsync_fd(target_fd)
+                raise OSError(f"{target.parent}: moved after it was opened; the record stays")
+            os.unlink(source.name, dir_fd=source_fd)
+            _fsync_fd(source_fd)
+            # The source is gone now, so only the target's place decides whether the copy escaped.
+            if not _still_at(target_fd, target.parent):    # rebound between the check and the unlink
+                os.link(target.name, source.name, src_dir_fd=target_fd, dst_dir_fd=source_fd,
+                        follow_symlinks=False)
+                _fsync_fd(source_fd)                     # the record is back before the copy goes
+                os.unlink(target.name, dir_fd=target_fd)
+                _fsync_fd(target_fd)
+                raise OSError(f"{target.parent}: moved during the move; the record was put back")
+        finally:
+            os.close(target_fd)
+    finally:
+        os.close(source_fd)
+
+
+def archive_record(path: Path, field: str = "withheld_body") -> bool:
+    """Move a resolved record into its directory's `archive/`, under the ledger
+    lock, never over an existing decision and only for the body its id was
+    issued to: the id stays reserved, so it is never issued again."""
+    path = Path(path)
+    with _ledger_lock(_record_directory(path)):
+        try:
+            if not present(path, stat.S_IFREG) or not _owns_its_id(path, field):
+                return False
+        except OSError:
+            return False  # stays live; it acts only once its ownership reads again
+        archive = path.parent / "archive"
+        try:
+            os.chmod(_ensure_dir(archive), 0o700)
+            _durable_move(path, archive / path.name)
+        except OSError:
+            return False
+    return True
+
+
+CONFLICTS_DIR = "conflicts"
+
+
+def actionable_records(directory: Path, field: str = "withheld_body"):
+    """The live records of `directory` that may act, under the ledger lock, and the
+    ones frozen instead: a record whose id is reserved to another body, or whose
+    id already has an archived decision, moves to `conflicts/` for the owner and
+    never acts. Returns (actionable [(path, record)], frozen [path])."""
+    directory = Path(directory)
+    actionable, frozen = [], []
+    if not present(directory, stat.S_IFDIR):
+        return actionable, frozen
+    with _ledger_lock(directory):
+        for path in entries(directory, "*.json"):
+            try:
+                record = read_json_strict(path)
+            except OSError:
+                continue                                 # unknown (a link, unreadable): never acts
+            except ValueError:
+                record = None                            # malformed: never acts, frozen below
+            if isinstance(record, dict) and _owns_its_id(path, field):
+                actionable.append((path, record))
+                continue
+            if _proven_superseded(path, field):
+                continue                                 # reconciled by the caller, never frozen
+            target = directory / CONFLICTS_DIR / f"{path.stem}.{_record_digest(path, field)[:16]}.json"
+            try:
+                _durable_move(path, target)
+                frozen.append(target)
+            except OSError:
+                continue
+    return actionable, frozen
+
+
+def _find_record(path_of, state_dir: Path, task_id: str, body: str, field: str) -> Path:
+    """Where the record of this exact body is, without issuing an id."""
+    digest, unissued = _body_digest(body), None
+    first = path_of(state_dir, task_id)
+    if not present(first.parent):
+        return first
+    with _ledger_lock(first.parent):
+        for path in _candidates(path_of, state_dir, task_id, body):
+            owner = _issued_to(path, field)
+            if owner == digest:
+                found = _record_of(path, digest, field)
+                if found is not None:
+                    return found
+            elif owner is None and unissued is None:
+                unissued = path                     # where this body's record would be issued
+    return unissued or path_of(state_dir, task_id, digest)
+
+
+def _issue_record(path_of, state_dir: Path, task_id: str, body: str, field: str,
+                  make_payload) -> "tuple[Path | None, bool]":
+    """The record for this exact body, issuing an id only once, ever: an id
+    reserved for this body returns its record (its decision first) and is never
+    written again; one reserved for another body is skipped. Returns (path, saved);
+    runs under the ledger lock, as does every archive, so no transition interleaves."""
+    first = path_of(state_dir, task_id)
+    digest = _body_digest(body)
+    with _ledger_lock(first.parent):
+        for path in _candidates(path_of, state_dir, task_id, body):
+            owner = _issued_to(path, field)
+            if owner is None and _reserve(path, digest):
+                return path, _write_artifact(path, make_payload(path), field)
+            if (owner or _issued_to(path, field)) == digest:
+                found = _record_of(path, digest, field)
+                if found is not None:
+                    return found, True
+        return None, False
+
+
+def withheld_review_artifact(state_dir: Path, task_id: str, body: str) -> Path:
+    """Where the private review of this exact withheld body lives."""
+    return _find_record(withheld_review_path, state_dir, task_id, body, "withheld_body")
 
 
 def is_attach_only_withhold(body: str) -> bool:
@@ -300,8 +805,8 @@ def is_attach_only_withhold(body: str) -> bool:
     return "attach" in kinds and "redirect" not in kinds
 
 
-def quarantined_attachment_path(state_dir: Path, task_id: str) -> Path:
-    return Path(state_dir) / SUPPRESSED_RESULT_DIR / f"qa_{withheld_review_id(task_id)}.json"
+def quarantined_attachment_path(state_dir: Path, task_id: str, body_digest: str = "") -> Path:
+    return Path(state_dir) / SUPPRESSED_RESULT_DIR / f"qa_{withheld_review_id(task_id, body_digest)}.json"
 
 
 def journal_quarantined_attachment(body: str, state_dir: Path, task_id: str,
@@ -314,29 +819,32 @@ def journal_quarantined_attachment(body: str, state_dir: Path, task_id: str,
     timestamp = float(time.time() if now is None else now)
     directory = Path(state_dir) / SUPPRESSED_RESULT_DIR
     try:
-        directory.mkdir(parents=True, exist_ok=True)
-        os.chmod(directory, 0o700)
+        os.chmod(_ensure_dir(directory), 0o700)
     except OSError:
         return False
-    payload = {
-        "schema_version": 1,
-        "record_id": withheld_review_id(task_id),
-        "task_id": task_id,
-        "status": "withheld_attachment_pending",
-        "created_at": datetime.fromtimestamp(timestamp, timezone.utc).isoformat(),
-        "withheld_body": body,
-    }
+    def payload(record: Path) -> dict:
+        return {
+            "schema_version": 1,
+            "record_id": record.stem[len("qa_"):],
+            "task_id": task_id,
+            "status": "withheld_attachment_pending",
+            "created_at": datetime.fromtimestamp(timestamp, timezone.utc).isoformat(),
+            "withheld_body": body,
+        }
     try:
-        return _write_artifact(quarantined_attachment_path(state_dir, task_id), payload)
+        return _issue_record(quarantined_attachment_path, state_dir, task_id, body,
+                             "withheld_body", payload)[1]
     except OSError:
         # best-effort for real: a failed record costs the release option,
         # never the already-decided withhold and never the delivery loop
         return False
 
 
-def _write_artifact(path: Path, payload: dict) -> bool:
-    if path.is_file():
-        return True
+def _write_artifact(path: Path, payload: dict, field: str) -> bool:
+    """True only when `path` holds a record of this payload's body: an existing
+    record of another body is never claimed as written."""
+    if present(path, stat.S_IFREG):
+        return _holds(path, field, payload[field])
     fd, temporary = tempfile.mkstemp(prefix=".withheld-", suffix=".tmp", dir=path.parent)
     try:
         if os.name != "nt":
@@ -352,9 +860,12 @@ def _write_artifact(path: Path, payload: dict) -> bool:
                 os.rename(temporary, path)
             else:
                 os.link(temporary, path)
+            _fsync_directory(path.parent)
         except FileExistsError:
             pass
-        return path.is_file()
+        except OSError:
+            return False
+        return _holds(path, field, payload[field])
     finally:
         try:
             os.unlink(temporary)
@@ -372,34 +883,253 @@ def materialize_withheld_verdict(verdict: TeamResultVerdict, body: str,
     directory = Path(state_dir) / WITHHELD_RESULT_DIR
     bounded = _bounded_context(context)
     try:
-        directory.mkdir(parents=True, exist_ok=True)
-        os.chmod(directory, 0o700)
+        os.chmod(_ensure_dir(directory), 0o700)
     except OSError:
         return TeamResultVerdict(VERDICT_LEAK, TEAM_LEAK_RESULT_UNSAVED, verdict.reason)
-    artifact = withheld_review_path(state_dir, task_id)
-    payload = {
-        "schema_version": 2,
-        "review_id": withheld_review_id(task_id),
-        "status": "pending_dm",
-        "created_at": datetime.fromtimestamp(timestamp, timezone.utc).isoformat(),
-        "task_id": task_id,
-        "agent_id": agent_id,
-        "reason": verdict.reason,
-        "context": bounded,
-        "withheld_body": body,
-    }
+    def payload(artifact: Path) -> dict:
+        return {
+            "schema_version": 2,
+            "review_id": artifact.stem,
+            "status": "pending_dm",
+            "created_at": datetime.fromtimestamp(timestamp, timezone.utc).isoformat(),
+            "task_id": task_id,
+            "agent_id": agent_id,
+            "reason": verdict.reason,
+            "context": bounded,
+            "withheld_body": body,
+        }
     try:
-        saved = _write_artifact(artifact, payload)
+        artifact, saved = _issue_record(withheld_review_path, state_dir, task_id, body,
+                                        "withheld_body", payload)
     except Exception:  # noqa: BLE001 — storage failure must remain fail-closed
-        saved = False
+        artifact, saved = None, False
     if not saved:
         return TeamResultVerdict(VERDICT_LEAK, TEAM_LEAK_RESULT_UNSAVED, verdict.reason)
+    if artifact.parent.name == "archive":
+        return TeamResultVerdict(
+            VERDICT_SUPPRESS, "[no-send]", f"{verdict.reason}; already decided in owner review {artifact.stem}")
     return TeamResultVerdict(
         VERDICT_SUPPRESS, "[no-send]", f"{verdict.reason}; pending private owner review")
 
 
-def suppressed_record_path(state_dir: Path, task_id: str) -> Path:
-    return Path(state_dir) / SUPPRESSED_RESULT_DIR / f"{withheld_review_id(task_id)}.json"
+def withheld_decision_lock(directory: Path):
+    """The ledger lock: decision claims and publication checks serialize with every
+    id issue, record write and archive in the directory."""
+    return _ledger_lock(directory)
+
+
+def _live_undecided_record(path: Path) -> "dict | None":
+    # An archived decision for the same review always wins over a live record.
+    if present(_archived(path)):
+        return None
+    try:
+        record = read_json_strict(path)
+    except (OSError, ValueError):
+        return None
+    return record if isinstance(record, dict) else None
+
+
+def _issued_claim(path: Path, claim_id: str) -> Path:
+    return path.parent / "claims" / f"{path.stem}.{claim_id}"
+
+
+def withheld_claim_publishable(path: Path, claim_id) -> bool:
+    """True only when claim_withheld_decision issued this claim id for this review
+    (its ledger entry) and the live record still carries it as a pending release."""
+    path = Path(path)
+    if not (isinstance(claim_id, str) and len(claim_id) == 32
+            and all(c in "0123456789abcdef" for c in claim_id)):
+        return False
+    with withheld_decision_lock(_record_directory(path)):
+        record = _live_undecided_record(path)
+        issued = present(_issued_claim(path, claim_id), stat.S_IFREG)
+    return (issued and record is not None and record.get("status") == "publish_pending"
+            and record.get("decision") == "false_positive"
+            and record.get("decision_claim_id") == claim_id and decision_is_durable(record))
+
+
+def decision_is_durable(record) -> bool:
+    """A decided record acts (POST, card edit) only once its decision is durable; a record
+    without the flag predates it and was written durably."""
+    return isinstance(record, dict) and record.get("decision_durable") is not False
+
+
+def archived_withheld_decision(path: Path) -> "dict | None":
+    """The archived decision that owns this review, or None if there is none; {}
+    when it exists but is unreadable. A live copy beside it must never act."""
+    path = Path(path)
+    archived = _archived(path)
+    with withheld_decision_lock(_record_directory(path)):
+        try:
+            if not present(archived):
+                return None
+            record = read_json_strict(archived)
+        except (OSError, ValueError):
+            return {}
+    return record if isinstance(record, dict) else {}
+
+
+# The reconcile table: the only archived (status, decision) pairs a live copy may be
+# reconciled to. Any other pair, or a malformed archive, is frozen for the owner.
+ARCHIVED_OUTCOMES = {
+    ("kept_private", "sensitive"): "kept_private",
+    ("published", "false_positive"): "published",
+    ("publish_failed", "false_positive"): "publish_failed",
+}
+
+
+def archived_outcome(archived) -> "str | None":
+    """The outcome an archived decision proves, or None when it proves none."""
+    if not isinstance(archived, dict):
+        return None
+    key = (archived.get("status"), archived.get("decision"))
+    return ARCHIVED_OUTCOMES.get(key) if all(isinstance(k, str) for k in key) else None
+
+
+def _proven_superseded(path: Path, field: str) -> bool:
+    """A live copy of the very body its archived decision holds, and that decision
+    proves an outcome: the one case reconciled instead of frozen. Lock held by caller."""
+    archived = _archived(path)
+    if not (present(path, stat.S_IFREG) and present(archived, stat.S_IFREG)):
+        return False
+    try:
+        decision = read_json_strict(archived)
+    except (OSError, ValueError):
+        return False
+    digest = _record_digest(path, field)
+    return (archived_outcome(decision) is not None and digest != "unreadable"
+            and digest == _record_digest(archived, field)
+            and _issued_to(path, field) == digest)
+
+
+def proven_superseded_record(path: Path, field: str = "withheld_body") -> bool:
+    path = Path(path)
+    with _ledger_lock(_record_directory(path)):
+        return _proven_superseded(path, field)
+
+
+def retire_superseded_record(path: Path, field: str = "withheld_body") -> bool:
+    """Move a live copy that a proven archived decision outranks into
+    archive/superseded/; anything else stays for the freeze. The archive is untouched."""
+    path = Path(path)
+    with _ledger_lock(_record_directory(path)):
+        if not _proven_superseded(path, field):
+            return False
+        target = path.parent / "archive" / "superseded"
+        _durable_move(path, target / f"{path.stem}.{os.urandom(4).hex()}.json")
+        return True
+
+
+def claim_withheld_decision(path: Path, updates: dict) -> "dict | None":
+    """Apply the owner's decision only to a record still awaiting it and owning its
+    id; None means it was already decided (or is gone), so the reply changes nothing."""
+    path = Path(path)
+    with _ledger_lock(_record_directory(path)):
+        record = _live_undecided_record(path)
+        if (record is None or record.get("status") != "awaiting_owner"
+                or not _owns_its_id(path, "withheld_body")):
+            return None
+        if entries(_issued_claim(path, "*").parent, f"{path.stem}.*"):
+            return None  # an earlier claim whose decision did not survive: never a second one
+        claim_id = os.urandom(16).hex()
+        ledger = _issued_claim(path, claim_id)
+        _ensure_dir(ledger.parent)
+        os.close(os.open(ledger, os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0),
+                         0o600))
+        _fsync_directory(ledger.parent)  # the ledger entry is durable before the record names it
+        expect, landed = record_version(record), []
+        record.update(updates, decision_claim_id=claim_id, decision_durable=False)
+        if _write_owned_record(path, record, "withheld_body", expect, landed):
+            # Synced, so the decision is durable; only now may anything act on it.
+            durable = dict(record, decision_durable=True)
+            return durable if _write_owned_record(path, durable, "withheld_body",
+                                                  record_version(record)) else record
+        if not any(landed):
+            try:
+                ledger.unlink(missing_ok=True)  # nothing was written: the owner may answer again
+                _fsync_directory(ledger.parent)
+            except Exception:  # noqa: BLE001 — a left claim is reported as lost, never silent
+                pass
+        return None
+
+
+def establish_decision(path: Path) -> bool:
+    """The durability barrier: sync a decided record whose decision is not yet durable and
+    mark it so; True when it is durable and may act."""
+    path = Path(path)
+    with _ledger_lock(_record_directory(path)):
+        try:
+            current = read_json_strict(path)
+        except (OSError, ValueError):
+            return False
+        if not isinstance(current, dict):
+            return False
+        if decision_is_durable(current):
+            return True
+        try:
+            _fsync_directory(path.parent)
+        except OSError:
+            return False
+        return _write_owned_record(path, dict(current, decision_durable=True), "withheld_body",
+                                   record_version(current))
+
+
+def issued_claims(path: Path) -> list:
+    """The claim ids issued for this review, oldest name first."""
+    path = Path(path)
+    return sorted(p.name[len(path.stem) + 1:] for p in
+                  entries(_issued_claim(path, "*").parent, f"{path.stem}.*"))
+
+
+def record_release_receipt(path: Path, claim_id, event_id: str) -> bool:
+    """Durably note on a pending release the event id that confirmed it, before the outbox
+    is told it was delivered; the outbox itself keeps no receipt."""
+    path = Path(path)
+    with _ledger_lock(_record_directory(path)):
+        try:
+            current = read_json_strict(path)
+        except (OSError, ValueError):
+            return False
+        if not isinstance(current, dict) or current.get("decision_claim_id") != claim_id:
+            return False
+        if current.get("status") == "published":
+            return True  # already settled by this claim's release
+        if current.get("status") != "publish_pending":
+            return False
+        return _write_owned_record(path, dict(current, release_event_id=event_id),
+                                   "withheld_body", record_version(current))
+
+
+def decision_lost(path: Path) -> bool:
+    """True when a claim was issued for this still-undecided review but its decision did
+    not survive: no later decision is accepted, and the owner must be told."""
+    path = Path(path)
+    with _ledger_lock(_record_directory(path)):
+        record = _live_undecided_record(path)
+        return (record is not None and record.get("status") == "awaiting_owner"
+                and bool(entries(_issued_claim(path, "*").parent, f"{path.stem}.*")))
+
+
+def _fsync_directory(directory: Path) -> None:
+    if os.name != "nt":
+        fd = os.open(directory, os.O_RDONLY)
+        try:
+            _fsync_fd(fd)
+        finally:
+            os.close(fd)
+
+
+def _fsync_fd(fd: int) -> None:
+    os.fsync(fd)
+
+
+def suppressed_record_path(state_dir: Path, task_id: str, body_digest: str = "") -> Path:
+    return Path(state_dir) / SUPPRESSED_RESULT_DIR / f"{withheld_review_id(task_id, body_digest)}.json"
+
+
+def suppressed_record_for(state_dir: Path, task_id: str, body: str) -> Path:
+    """Where the suppression record of this exact body lives."""
+    return _find_record(suppressed_record_path, state_dir, task_id, body, "suppressed_body")
 
 
 def journal_suppressed_result(verdict: TeamResultVerdict, body: str,
@@ -417,24 +1147,25 @@ def journal_suppressed_result(verdict: TeamResultVerdict, body: str,
     timestamp = float(time.time() if now is None else now)
     directory = Path(state_dir) / SUPPRESSED_RESULT_DIR
     try:
-        directory.mkdir(parents=True, exist_ok=True)
-        os.chmod(directory, 0o700)
+        os.chmod(_ensure_dir(directory), 0o700)
     except OSError:
         return TeamResultVerdict(VERDICT_SUPPRESS, TEAM_SUPPRESS_RESULT,
                                  "suppression record unwritable")
-    payload = {
-        "schema_version": 1,
-        "record_id": withheld_review_id(task_id),
-        "status": "suppressed_silent_close",
-        "created_at": datetime.fromtimestamp(timestamp, timezone.utc).isoformat(),
-        "task_id": task_id,
-        "agent_id": agent_id,
-        "reason": verdict.reason,
-        "context": _bounded_context(context),
-        "suppressed_body": body,
-    }
+    def payload(record: Path) -> dict:
+        return {
+            "schema_version": 1,
+            "record_id": record.stem,
+            "status": "suppressed_silent_close",
+            "created_at": datetime.fromtimestamp(timestamp, timezone.utc).isoformat(),
+            "task_id": task_id,
+            "agent_id": agent_id,
+            "reason": verdict.reason,
+            "context": _bounded_context(context),
+            "suppressed_body": body,
+        }
     try:
-        saved = _write_artifact(suppressed_record_path(state_dir, task_id), payload)
+        saved = _issue_record(suppressed_record_path, state_dir, task_id, body,
+                              "suppressed_body", payload)[1]
     except Exception:  # noqa: BLE001 -- storage failure must remain fail-closed
         saved = False
     if not saved:

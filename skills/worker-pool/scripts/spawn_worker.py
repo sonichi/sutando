@@ -39,6 +39,18 @@ import tmux_probe  # noqa: E402
 
 import worker_identity as wi  # noqa: E402
 
+
+# The core's own identity: inherited, these stamp a worker's direct posts as
+# "worker-<core id>" while pool delivery stamps the worker's real id.
+_CORE_ONLY_ENV = ("SUTANDO_CORE_ID", "SUTANDO_CORE_POOL_SIZE", "SUTANDO_WORKER_SEAT")
+
+
+def inherited_env(drop=()) -> dict:
+    """The spawner's environment minus the core-only identity, for a worker."""
+    return {k: v for k, v in os.environ.items()
+            if k not in _CORE_ONLY_ENV and k not in drop}
+
+
 DEFAULT_SOCKET = "/tmp/sutando-tmux.sock"
 
 
@@ -145,7 +157,7 @@ def session_exists(name: str, socket=None, runner=_run) -> bool:
 
 
 def core_runtime(repo, runner=_run) -> str:
-    """The runtime the core is configured for; a worker runs the same one."""
+    """The runtime the core is configured for; fresh workers default to it."""
     r = runner(["bash", str(Path(repo) / "scripts" / "sutando-config.sh"), "core-runtime"])
     return ((r.stdout or "").strip() if r.returncode == 0 else "") or "claude"
 
@@ -181,6 +193,9 @@ def plan(workspace, repo, *, runtime: str = "claude", cwd: str = "",
         "env": {"SUTANDO_TMUX_SOCKET": socket,
                 "SUTANDO_TMUX_SESSION": wi.tmux_session_name(worker_id),
                 "SUTANDO_INSTANCE_ID": worker_id,
+                # What say/mention/notify stamp as space.ag2.worker; pool delivery
+                # stamps the same bare id, so both paths name one worker.
+                "SUTANDO_WORKER_ID": worker_id,
                 "SUTANDO_WORKER_RUNTIME": runtime,
                 "SUTANDO_TASKS_DIR": delivery_dir,
                 # The inbox holds sentinels, not task bodies. The reader is TOLD
@@ -300,6 +315,20 @@ def spawn(workspace, repo, *, runtime=None, cwd: str = "",
     the only part that starts reading.
     """
     socket = socket or default_socket()
+    # Rooms are bound to a worker's id and inbox, so re-minting either would
+    # leave every binding pointing at nothing. Only the run is new.
+    resumed_id = wi.worker_for_session(workspace, resume) if resume else None
+    if resume and not resumed_id:
+        raise SpawnRefused(
+            f"no worker in this workspace has session {resume!r} in its lineage; "
+            "refusing rather than resuming a conversation into a stranger's record")
+    if resumed_id:
+        session = next((row for row in wi.sessions(workspace, resumed_id)
+                        if row.get("session_id") == resume), {})
+        if not runtime:
+            runtime = session.get("runtime")
+        if not cwd:
+            cwd = (session.get("transcript") or {}).get("cwd", "")
     runtime = resolve_runtime(repo, runtime, runner)
     if runtime == "codex" and resume:
         raise SpawnRefused("Codex cannot resume without a recorded CLI session id")
@@ -316,13 +345,6 @@ def spawn(workspace, repo, *, runtime=None, cwd: str = "",
             "this checkout writes ONE watcher sentinel for every watcher, so a "
             "second watcher would erase the core's stamp — refusing to spawn")
 
-    # Rooms are bound to a worker's id and inbox, so re-minting either would
-    # leave every binding pointing at nothing. Only the run is new.
-    resumed_id = wi.worker_for_session(workspace, resume) if resume else None
-    if resume and not resumed_id:
-        raise SpawnRefused(
-            f"no worker in this workspace has session {resume!r} in its lineage; "
-            "refusing rather than resuming a conversation into a stranger's record")
     session_id = resume or (None if runtime == "codex" else str(uuid.uuid4()))
 
     # Preconditions are answered BEFORE the first durable write: a refusal after
@@ -362,8 +384,7 @@ def spawn(workspace, repo, *, runtime=None, cwd: str = "",
 
     # start-cli prefers RESUME, so an INHERITED one would beat the SESSION_ID a
     # fresh spawn sets: drop both, then state the single intent.
-    env = {k: v for k, v in os.environ.items()
-           if k not in ("SUTANDO_CLAUDE_RESUME", "SUTANDO_CLAUDE_SESSION_ID")}
+    env = inherited_env(drop=("SUTANDO_CLAUDE_RESUME", "SUTANDO_CLAUDE_SESSION_ID"))
     env.update(p["env"])
     if runtime == "claude":
         env.update({"SUTANDO_CLAUDE_RESUME": session_id} if resumed_id
@@ -407,7 +428,9 @@ def main(argv=None) -> int:
     ap.add_argument("--repo", default=str(_REPO))
     ap.add_argument("--folder", default="", help="the worker's working directory")
     ap.add_argument("--label", default="")
-    ap.add_argument("--runtime", default="", help="default: the core's configured runtime")
+    ap.add_argument("--runtime", default="",
+                    help="default: the core's configured runtime for fresh workers; "
+                         "the recorded session's runtime for --resume")
     ap.add_argument("--socket", default="")
     ap.add_argument("--new", action="store_true", help="fresh session (default)")
     ap.add_argument("--resume", default="", metavar="SESSION_ID",

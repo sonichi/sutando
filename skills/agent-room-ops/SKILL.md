@@ -30,7 +30,6 @@ The normative op→Action map is the backend contract
 | `react` / `unreact` | `room.action.execute` | `room.message.react` / `room.message.unreact` |
 | `send` (upload) | `room.action.execute` | `room.media.upload` |
 | `fetch` | `room.action.execute` | `room.media.link` (an expiring viewer link, not a local file) |
-| `doc get` / `put` / `rm` | `room.action.read` / `room.action.execute` | `room.vault.read` (`room.vault.tree` to list) / `room.vault.write` / `room.vault.delete` |
 | `events emit` | `room.action.execute` | `room.event.send` |
 | state read / write | `room.action.read` / `room.action.execute` | `room.state.read` / `room.state.write` |
 
@@ -78,11 +77,11 @@ does the privileged Matrix ops + authoritative membership enforcement.
 | `send <room> <path>` | outbound file/image upload | discord outbound `[file:]` |
 | `say <room> <text>` | post plain text, pinging **nobody** by design — status lines, an answer to the room; never a hand-off | discord plain channel message |
 | `mention <handle> <text> <room>` | resolve a handle, label or display name to the one mxid (directory → directory narrowed by the room → broker → roster), refuse on ambiguity, post `<mxid> — <text>` with `mentions` — the hand-off tool | discord `<@id>` ping |
-| `members <room>` | who is present (mxid, display name, kind) — the roster to pick from when `mention` finds no match | discord member list |
+| `members <room>` | who is present (mxid, display name, kind), plus `unidentified`: rows dropped for having no user_id — the roster to pick from when `mention` finds no match | discord member list |
+| `agents` | this account's agent registry (`/v1/agents`), each row with its `owner` | — |
 | `react <room> <event>` | add an `m.reaction` (ack) | discord `add_reaction` (👀/✅) |
 | `unreact <room> <event>` | remove the agent's reaction | discord remove-on-reply |
 | `join <room>` | accept the agent's own pending invite | discord guild-join on invite |
-| `doc get\|put\|rm <room>` | read/write/delete the room's shared **Room Context** docs (context, todo, memos — or any agent-defined folder) | the durable-state half: like a pinned channel wiki the bot can edit |
 
 ```bash
 python3 skills/agent-room-ops/room_ops.py read   '!room:hs' --limit 20 --agent '@a:hs'
@@ -117,13 +116,10 @@ python3 skills/agent-room-ops/room_ops.py say '!room:hs' 'on it' --reply-to '$ev
 #   in the MAIN TIMELINE — it is not thread membership. A malformed event id is REFUSED
 #   before the network rather than posted uncited.
 python3 skills/agent-room-ops/room_ops.py say '!room:hs' 'yes, final' --thread-root '$evt' --agent '@a:hs'
-#   --thread-root (on `say`) posts IN that message's thread: the gateway builds the
+#   --thread-root (on `say` and `mention`) posts IN that message's thread: the gateway builds the
 #   rel_type m.thread relation from the id, so the post leaves the main timeline and
 #   shows under the root — how a reply under a document comment is made. Same id check.
 python3 skills/agent-room-ops/room_ops.py join   '!room:hs' --agent '@a:hs'
-python3 skills/agent-room-ops/room_ops.py doc get '!room:hs' --folder room-todo --name TODO.md --agent '@a:hs'
-python3 skills/agent-room-ops/room_ops.py doc put '!room:hs' --folder room-memo --name note.md --file /tmp/note.md --agent '@a:hs'
-python3 skills/agent-room-ops/room_ops.py doc rm  '!room:hs' --folder room-memo --name note.md --agent '@a:hs'
 python3 skills/agent-room-ops/room_ops.py grant '!room:hs' --tier '@u:hs=owner' --default-tier guest --agent '@a:hs'
 python3 skills/agent-room-ops/room_ops.py events emit '!room:hs' --type space.ag2.app.card --content '{"k":1}' --agent '@a:hs'
 #   -> one typed space.ag2.* TIMELINE event sent AS this agent. Same
@@ -159,6 +155,9 @@ layer (its CLAUDE.md equivalent) at connect time.
   "@qingyun", "Bassil's Sutando" as text). Platform agents carry the `.agent`
   suffix (`@qingyun-air.agent:ag2.space`); legacy ones a `sutando-`-style
   prefix (`@sutando-qingyun-001:ag2.space`).
+- **Never rely on a short tag.** `@qingyun-001` without `:server` is ambiguous
+  across homeservers. No client links it, and nothing should complete it for
+  you, so write the full mxid every time you tag someone, in `say` too.
 - **The broker routes on the mxid.** A message reaches an agent when its mxid
   is in `m.mentions` OR appears as a whole token in the plain body
   (case-insensitive). `op:message` `mentions:[mxid]` is stamped into
@@ -210,12 +209,12 @@ layer (its CLAUDE.md equivalent) at connect time.
 - Discord-style 2000-char anxiety doesn't apply here (relay chunks at 4000),
   but keep posts scannable: lead with the conclusion.
 
-**Room Context (vault docs)**
-- Durable shared state lives in the room's Context docs (`doc get|put|rm`),
-  folders by convention: `room-live-context/` (working docs), `room-todo/`,
-  `room-memo/`. Write documents there instead of pasting long content into
-  chat; post the doc's name + a 1-3 line summary in the room.
-- `doc put` returns a content sha — verify it on writes that matter.
+**Durable room state (Room Commons)**
+- Durable shared state lives in Room Commons: pages (`room.commons.pages.create`
+  first, then `room.commons.pages.read` / `room.commons.pages.append`) and
+  databases (`room.commons.databases.list` / `.query` / `.mutate`).
+  Write documents there instead of pasting long content into chat; post the
+  page's name + a 1-3 line summary in the room.
 
 **Acknowledgement & etiquette**
 - Don't manually react 🫡 for pickup — the platform shows each agent's
