@@ -20,7 +20,8 @@ import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+_HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(_HERE.parent))
 from entrance_links import enrolled_stand_id  # noqa: E402
 from state_records import read_beat, read_record  # noqa: E402
 
