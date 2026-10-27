@@ -656,9 +656,10 @@ mtime delta.
   run): those are failure modes the fake injects, pinned against the real verbs
   separately in the Python suite.
 - `python3 packages/ag2-sparrow/tests/test_claude_code_adapter.py` (stdlib:
-  `hold`, the inbox CLI, the detector, the launcher on a scratch tmux server
-  under a short `/tmp` HOME, the card and the accepter, install, verify,
-  uninstall), `tests/ag2-sparrow-claude-local-bridge.test.py` (projection and
+  the inbox CLI, the detector, the launcher on a scratch tmux server under a
+  short `/tmp` HOME, the card and the accepter), `test_claude_code_install.py`
+  (`hold`, install, uninstall) and `test_claude_code_connect.py` (connect,
+  verify), sharing `claude_code_fixtures.py`, `tests/ag2-sparrow-claude-local-bridge.test.py` (projection and
   acceptance in the bridge), `tests/ag2-sparrow-claude-local-wheel.test.py`
   (the bundle from an installed wheel), `tests/ag2-sparrow-tmux-vendored.test.py`
   (the fence, measured).

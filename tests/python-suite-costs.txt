@@ -19,7 +19,9 @@
 11 tests/ag2-sparrow-adapter-differential.test.py
 1 tests/ag2-sparrow-agent-identity.test.py
 16 tests/ag2-sparrow-claude-cloud-session.test.py
-112 tests/ag2-sparrow-claude-code-adapter.test.py
+60 tests/ag2-sparrow-claude-code-adapter.test.py
+75 tests/ag2-sparrow-claude-code-connect.test.py
+60 tests/ag2-sparrow-claude-code-install.test.py
 1 tests/ag2-sparrow-claude-local-bridge.test.py
 8 tests/ag2-sparrow-claude-local-wheel.test.py
 26 tests/ag2-sparrow-claude-routine.test.py
