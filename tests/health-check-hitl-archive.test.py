@@ -123,10 +123,32 @@ class HitlArchiveCheckTest(unittest.TestCase):
             raise err
 
         for i in range(getattr(projector, "PROJECTION_MAX_REFUSALS", 5)):
-            projector.project(mgr, refuse, "!r", clock=lambda: time.time() + 10 ** 7 * (i + 1))
+            projector.project_pass(mgr, refuse, "!r", clock=lambda: time.time() + 10 ** 7 * (i + 1),
+                                   monotonic=lambda: time.monotonic() + 10 ** 7 * (i + 1))
         out = hc.check_hitl_archive()
         self.assertEqual(out["status"], "warn")
         self.assertIn(f"1 card(s) could not be projected ({req.id})", out["detail"])
+
+    def test_a_failed_card_in_a_sibling_store_the_bridge_projects_warns(self):
+        self.fill(1)
+        sibling = self.root.with_name(self.root.name + "-claude-local")
+        mgr = hm.HitlManager(hm.HitlStore(sibling))
+        req = mgr.create(schema.HumanRequirement(
+            kind="choice", runtime="claude-local", message="m", guard="g",
+            actions=[schema.Action(id="ok", kind="choose", label="OK")]))
+
+        def refuse(payload):
+            err = OSError("HTTP 400")
+            err.code = 400
+            raise err
+
+        for i in range(getattr(projector, "PROJECTION_MAX_REFUSALS", 5)):
+            projector.project_pass(mgr, refuse, "!r", clock=lambda: time.time() + 10 ** 7 * (i + 1),
+                                   monotonic=lambda: time.monotonic() + 10 ** 7 * (i + 1))
+        self.assertTrue(mgr.projection_failed(req.id))
+        out = hc.check_hitl_archive()
+        self.assertEqual(out["status"], "warn")
+        self.assertIn(req.id, out["detail"])
 
     def test_an_unreadable_status_file_degrades_to_the_live_count(self):
         self.fill(1)

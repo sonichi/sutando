@@ -212,7 +212,9 @@ class OneRefusedCard(unittest.TestCase):
         logs = []
         for _ in range(bound * 3):
             B._hitl_backoff_reset()
-            with mock.patch("time.time", return_value=B.time.time() + 10 ** 7 * (len(self.posts) + 1)):
+            later = 10 ** 7 * (len(self.posts) + 1)
+            with mock.patch("time.time", return_value=B.time.time() + later), \
+                    mock.patch("time.monotonic", return_value=B.time.monotonic() + later):
                 self._pass(logs)
         self.assertEqual(self.posts.count(self.bad), bound)
         self.assertEqual(self.posts.count(self.good), 1)

@@ -508,7 +508,7 @@ class RefusalClassTests(unittest.TestCase):
         return send
 
     def test_transport_refusals_propagate_and_record_nothing(self):
-        for code in (401, 403, 408, 429, 500, 503):
+        for code in (401, 403, 404, 405, 408, 409, 410, 429, 500, 503):
             with self.subTest(code=code):
                 req = self.mgr.create(make_req(guard=f"g{code}", device={"id": f"d{code}", "name": "n"}))
                 with self.assertRaises(OSError):
@@ -523,7 +523,9 @@ class RefusalClassTests(unittest.TestCase):
         from hitl import projector as pj
         req = self.mgr.create(make_req())
         for i in range(pj.PROJECTION_MAX_REFUSALS):
-            pj.project_pass(self.mgr, self._raising(400), ROOM, clock=lambda: time.time() + 10 ** 7 * (i + 1))
+            later = lambda: 10.0 ** 7 * (i + 1)  # noqa: E731
+            pj.project_pass(self.mgr, self._raising(400), ROOM, clock=lambda: time.time() + later(),
+                            monotonic=lambda: time.monotonic() + later())
         self.assertTrue(self.mgr.projection_failed(req.id))
         self.assertFalse(self.mgr.needs_projection(req.id))
         self.assertEqual(pending_ids(self.mgr), [], "a failed card is not pending work")
@@ -532,6 +534,123 @@ class RefusalClassTests(unittest.TestCase):
         sent = RecordingSender()
         self.assertEqual([i for i, _ in project(self.mgr, sent, ROOM)], [req.id])
         self.assertNotIn("failed_revision", self.mgr.store.projection(req.id))
+
+
+
+def _refusing(code):
+    def send(payload):
+        err = OSError(f"HTTP {code}")
+        err.code = code
+        raise err
+    return send
+
+
+class RefusalWriterTests(unittest.TestCase):
+    """The refusal count, the bound and the revision fence are one writer transaction, and the
+    retry wait survives a wall-clock spike and a restart without freezing a card."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.mgr = HitlManager(HitlStore(Path(self.tmp.name)))
+        from hitl import projector as pj
+        self.pj = pj
+        if hasattr(pj, "_RETRY_DEADLINES"):
+            self.addCleanup(pj._RETRY_DEADLINES.clear)
+
+    def _pass(self, send, wall, mono):
+        return self.pj.project_pass(self.mgr, send, ROOM, clock=lambda: wall, monotonic=lambda: mono)
+
+    def test_an_endpoint_wide_404_fails_no_card_and_recovers(self):
+        a = self.mgr.create(make_req(guard="a", device={"id": "da", "name": "n"}))
+        b = self.mgr.create(make_req(guard="b", device={"id": "db", "name": "n"}))
+        for i in range(self.pj.PROJECTION_MAX_REFUSALS * 2):
+            with self.assertRaises(OSError):
+                project(self.mgr, _refusing(404), ROOM)
+        for req in (a, b):
+            self.assertFalse(self.mgr.projection_failed(req.id))
+            self.assertNotIn("refusals", self.mgr.store.projection(req.id))
+        self.assertEqual(sorted(i for i, _ in project(self.mgr, RecordingSender(), ROOM)), sorted([a.id, b.id]))
+
+    def test_a_revision_accepted_while_its_refusal_is_recorded_is_never_failed(self):
+        """Another writer accepts the revision between the refused send and its bookkeeping."""
+        import threading
+        req = self.mgr.create(make_req())
+        n = self.pj.PROJECTION_MAX_REFUSALS
+        for i in range(n - 1):
+            self._pass(_refusing(400), 1000.0 + 10 ** 6 * i, 10.0 ** 6 * i)
+        other = HitlManager(HitlStore(Path(self.tmp.name)))
+        armed, threads, real = [], [], self.mgr.store.projection
+
+        def projection(req_id):
+            seen = real(req_id)
+            if armed:  # the refusal's read is done; the other writer accepts before its write
+                armed.clear()
+                t = threading.Thread(target=other.record_projection, args=(req.id, req.revision, "$accepted"))
+                t.start()
+                t.join(1.0)  # blocks only while this pass holds the store lock
+                threads.append(t)
+            return seen
+
+        self.mgr.store.projection = projection
+
+        def send(payload):
+            armed.append(1)
+            _refusing(400)(payload)
+
+        self._pass(send, 1000.0 + 10 ** 6 * n, 10.0 ** 6 * n)
+        for t in threads:
+            t.join(10)
+        self.assertEqual(len(threads), 1, "the accepting writer ran during the refusal's bookkeeping")
+        ledger = real(req.id)
+        self.assertEqual((ledger["revision"], ledger["event_id"]), (1, "$accepted"))
+        self.assertFalse(self.mgr.projection_failed(req.id), "an accepted revision is never failed")
+
+    def test_a_corrected_forward_clock_spike_does_not_freeze_a_refused_card(self):
+        req = self.mgr.create(make_req())
+        year = 365 * 86400.0
+        self._pass(_refusing(400), 1000.0, 0.0)                 # retry in 30 s
+        self._pass(_refusing(400), 1000.0 + year + 31, 31.0)    # the second refusal under a spiked clock
+        sent = RecordingSender()
+        self.assertEqual(self._pass(sent, 1100.0, 31.0 + 61).done, [(req.id, "$ev1")],
+                         "once the clock is corrected the card is retried after its real wait")
+
+    def test_after_a_restart_a_deadline_written_under_a_spiked_clock_is_not_trusted(self):
+        req = self.mgr.create(make_req())
+        year = 365 * 86400.0
+        self._pass(_refusing(400), 1000.0 + year, 0.0)
+        getattr(self.pj, "_RETRY_DEADLINES", {}).clear()  # a restart: no in-process deadline survives
+        self.assertEqual(pending_ids(self.mgr, clock=lambda: 1000.0), [req.id])
+        self.assertEqual(len(self._pass(RecordingSender(), 1000.0, 5.0).done), 1)
+
+    def test_two_processes_refused_at_once_both_count(self):
+        req = self.mgr.create(make_req())
+        root, src = self.tmp.name, str(Path(__file__).resolve().parent.parent / "src")
+        child = (
+            "import os, sys, time\n"
+            "sys.path.insert(0, %r)\n"
+            "from pathlib import Path\n"
+            "from hitl.manager import HitlManager, HitlStore\n"
+            "from hitl import projector\n"
+            "root = Path(%r)\n"
+            "store = HitlStore(root)\n"
+            "real = store.save\n"
+            "def save(*a, **k):\n"
+            "    (root / ('.at-save-%%d' %% os.getpid())).touch()\n"
+            "    end = time.time() + 2\n"
+            "    while len(list(root.glob('.at-save-*'))) < 2 and time.time() < end:\n"
+            "        time.sleep(0.02)\n"
+            "    real(*a, **k)\n"
+            "store.save = save\n"
+            "def send(p):\n"
+            "    e = OSError('HTTP 400'); e.code = 400; raise e\n"
+            "projector.project_pass(HitlManager(store), send, '!r', **({'monotonic': time.monotonic} "
+            "if 'monotonic' in projector.project_pass.__code__.co_varnames else {}))\n"
+        ) % (src, root)
+        procs = [subprocess.Popen([sys.executable, "-c", child]) for _ in range(2)]
+        self.assertEqual([p.wait(timeout=60) for p in procs], [0, 0])
+        self.assertEqual(self.mgr.store.projection(req.id).get("refusals"), 2,
+                         "two refused sends are two attempts, whatever their interleaving")
 
 
 if __name__ == "__main__":

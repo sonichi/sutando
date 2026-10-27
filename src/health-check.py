@@ -2902,12 +2902,17 @@ def check_hitl_archive() -> "dict | None":
     """
     name = "hitl-archive"
     try:
-        from hitl.manager import ARCHIVE_STATUS_STALE_S, archive_health, default_store
-        h = archive_health(default_store(WORKSPACE_DIR))
+        from hitl.manager import ARCHIVE_STATUS_STALE_S, archive_health, store_roots
+        default, *siblings = store_roots(WORKSPACE_DIR)
+        h = archive_health(default)
+        failed_elsewhere = [i for root in siblings
+                            for i in (archive_health(root) or {}).get("projection_failed", [])]
     except Exception as e:  # noqa: BLE001 — an optional tier never breaks the report
         return {"name": name, "status": "warn", "detail": f"hitl store unreadable ({e})"}
     if h is None:
-        return None
+        if not failed_elsewhere:
+            return None
+        h = {"live": 0, "failures": 0, "error": "", "reported": False, "stale": False}
     problems = []
     if h["stale"]:
         problems.append(f"archive status stale: not refreshed in over "
@@ -2918,7 +2923,7 @@ def check_hitl_archive() -> "dict | None":
     if h["live"] > HITL_LIVE_WARN:
         problems.append(f"{h['live']} live records (> {HITL_LIVE_WARN}); the gateway re-reads "
                         f"each one every second")
-    failed = h.get("projection_failed") or []
+    failed = [*(h.get("projection_failed") or []), *failed_elsewhere]
     if failed:
         problems.append(f"{len(failed)} card(s) could not be projected ({', '.join(failed[:5])}): "
                         f"the relay refused them; the gateway log names the error")

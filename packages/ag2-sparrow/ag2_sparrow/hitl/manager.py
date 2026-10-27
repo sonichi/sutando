@@ -20,7 +20,7 @@ from contextlib import contextmanager
 import dataclasses
 from dataclasses import asdict
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 try:
     from ..file_lock import lock_fd, unlock_fd   # the vendored package layout
@@ -108,12 +108,24 @@ def archive_health(store_root: Path, now: Optional[float] = None) -> Optional[Di
             "projection_failed": [p.stem for p in live if _projection_failed_on_disk(p)]}
 
 
+def _failed(revision: int, ledger: Dict) -> bool:
+    return ledger.get("failed_revision") == revision and ledger.get("revision", 0) < revision
+
+
 def _projection_failed_on_disk(path: Path) -> bool:
     try:
         raw = json.loads(path.read_text())
-        return (raw.get("projection") or {}).get("failed_revision") == raw["requirement"]["revision"]
+        return _failed(raw["requirement"]["revision"], raw.get("projection") or {})
     except (OSError, ValueError, KeyError, TypeError, AttributeError):
         return False
+
+
+def store_roots(workspace: Optional[Path] = None) -> List[Path]:
+    """Every requirement store beside the default one (an adapter may keep its own root there)."""
+    default = default_store(workspace)
+    siblings = sorted(p for p in default.parent.glob(default.name + "-*")
+                      if p.is_dir() and not p.name.endswith("-archive"))
+    return [default, *siblings]
 
 
 def default_store(workspace: Optional[Path] = None) -> Path:
@@ -377,17 +389,28 @@ class HitlManager:
         return ledger.get("revision", 0) < req.revision
 
     def projection_failed(self, req_id: str) -> bool:
-        """The relay refused this revision's card past the retry bound."""
+        """The relay refused this revision's card past the retry bound, and no send was accepted."""
         req = self.store.load(req_id)
-        return req is not None and self.store.projection(req_id).get("failed_revision") == req.revision
+        return req is not None and _failed(req.revision, self.store.projection(req_id))
 
-    def record_refusal(self, req_id: str, revision: int, fields: Dict) -> None:
-        """Merge one refused send's bookkeeping (hitl.projector) into the ledger, for that revision only."""
+    def refuse_projection(self, req_id: str, revision: int, error: str, max_refusals: int,
+                          retry_fields: Callable[[int], Dict]) -> Optional[Tuple[int, bool]]:
+        """Count one refused send of `revision` and give up at `max_refusals`, in one locked
+        read-modify-write. -> (attempt, failed), or None when the revision moved on or was accepted."""
         with self.store.locked():
             req = self.store.load(req_id)
             if req is None or req.revision != revision:
-                return
-            self.store.save(req, projection={**self.store.projection(req_id), **fields})
+                return None
+            ledger = self.store.projection(req_id)
+            if ledger.get("revision", 0) >= revision or ledger.get("failed_revision") == revision:
+                return None
+            n = (ledger.get("refusals") or 0) if ledger.get("refused_revision") == revision else 0
+            n += 1
+            failed = n >= max_refusals
+            fields: Dict = {"refused_revision": revision, "refusals": n, "refused_error": error}
+            fields.update({"retry_at": None, "failed_revision": revision} if failed else retry_fields(n))
+            self.store.save(req, projection={**ledger, **fields})
+            return n, failed
 
     def record_projection(self, req_id: str, revision: int, event_id: Optional[str],
                           extra: Optional[Dict] = None) -> None:
