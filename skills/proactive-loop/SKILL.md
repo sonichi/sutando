@@ -64,7 +64,8 @@ caps this file and refuses date stamps in it).
    any pending connector wait that lost it; idempotent, and a failure never blocks the pass.
 2. **Questions.** Nothing surfaces on a pass: a question reaches the owner once, when asked
    (`scripts/ask-owner.py`); `src/check-pending-questions.py --notify` reminds only when he asks,
-   flagless it files what the outbox holds, sends nothing. `src/pending_questions_reader.py list`
+   flagless it files what the outbox holds and sends only the one pointer owed for a decision card
+   the gateway never posted. `src/pending_questions_reader.py list`
    only when he asks or you are blocked on an answer.
 3. **Health.** `python3 src/health-check.py`; fix with `--fix` what it can. A warn is a pointer into the
    record: before investigating, `grep -in "<entity from the warn TEXT>" "$H/current-track.md"` and `pending_questions_reader.py list --json | grep -i "<entity>"`

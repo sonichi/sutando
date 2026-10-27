@@ -3,9 +3,10 @@
 replay, local closes, legacy ingest) through the sibling adapter and lists this host's open
 rows plus held questions; `--notify` (what `pq.py remind` passes) raises the due set over
 macOS, voice and the owner's DM, and `--force` with it skips the cooldown, presenter mode and
-the sent-quiet window. Without `--notify` NOTHING is sent — an installed schedule running the
-core entry with no flag is that silent pass. An unreachable room is reported as UNKNOWN,
-never as zero, and nothing is reminded from a count that could not be measured.
+the sent-quiet window. Without `--notify` no reminder is sent — an installed schedule running the
+core entry with no flag is that pass; the one thing every pass (outside presenter mode) may send
+is the single text pointer for a decision card the gateway never posted (`send_card_pointers`).
+An unreachable room is reported as UNKNOWN, never as zero, and nothing is reminded from a count that could not be measured.
 `--store-adapter <path>` injects another adapter file; the pass is the manifest contract's
 two entry points on whichever adapter it reads through — `reconcile_pass(ws)`, its errors kept
 in the notes, then the read-only `gather(ws)` (skills/MANIFEST.md).
@@ -318,8 +319,13 @@ def main(argv=None, workspace=None, adapter=None):
         for q in questions:
             print(f"- [{q.get('ask_id') or 'no ask id'}] {q['title']} (not yet in the room)")
         return 0
-    if "--notify" not in argv:  # the scheduled or flagless run: reconcile and list, send nothing
-        print(f"{len(questions)} pending questions; nothing sent (reminders are on demand: --notify)")
+    # The pointer completes an ask whose card never posted, so it rides every pass, flagless included.
+    pointers = send_card_pointers(questions, WORKSPACE) if force or not presenter_mode_active(WORKSPACE) else []
+    for ask_id, sent in pointers:
+        print(f"card pointer: [{ask_id}] {sent} (its card was never posted; the card stays the only answer)")
+    if "--notify" not in argv:  # the scheduled or flagless run: reconcile and list, no reminder
+        print(f"{len(questions)} pending questions; {'no reminder' if pointers else 'nothing'} sent "
+              "(reminders are on demand: --notify)")
         for q in questions:
             print(f"- [{q.get('ask_id') or 'no ask id'}] {q['title']}"
                   + ("" if q.get("in_room", True) else " (not yet in the room)"))
@@ -332,8 +338,6 @@ def main(argv=None, workspace=None, adapter=None):
         print(f"(presenter-mode) {len(questions)} pending questions — suppressed")
         return 0
 
-    for ask_id, sent in send_card_pointers(questions, WORKSPACE):
-        print(f"card pointer: [{ask_id}] {sent} (its card was never posted; the card stays the only answer)")
     carded = [q for q in questions if card_live(q.get("body", ""), WORKSPACE)]
     questions = [q for q in questions if q not in carded]  # a live card is the ask, --force or not
     if carded and not questions:

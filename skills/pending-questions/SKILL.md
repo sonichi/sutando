@@ -77,7 +77,9 @@ count (`python3 src/pending_questions_reader.py summary`).
   cases the record stays and `reconcile` reports it.
 - `remind` is the only way a reminder is sent (`src/check-pending-questions.py --notify`
   with this skill's adapter). Nothing is scheduled, and no pass surfaces questions: the
-  owner is asked once, as questions come up, and reminded when he asks.
+  owner is asked once, as questions come up, and reminded when he asks. The one exception
+  completes that single ask: every pass, flagless included, sends the pointer for a decision
+  card the gateway never posted (see The reminder, below).
 
 ## Decision cards (the ask)
 
@@ -104,8 +106,8 @@ exactly the options as given, with no Approve — and `subject.choices` holding 
   written keeps the hold, so an outage never counts the question as zero;
   a row that could not be rewritten, or whose write was never confirmed, takes the record at the
   next reconcile, which replays the entry and rewrites the row before releasing it. A death
-  before the hold leaves a record naming an absent card, which the reminder reads as due: text
-  again, never silence.
+  before the hold leaves a record naming an absent card, which the next `--notify` reminder
+  reads as due and texts.
 - **The reminder.** It never sends text for a question whose card is live (pending or clicked) or
   whose store cannot say — `--force` included; such questions are left to the card. Once posted,
   the question's last-asked time is the gateway's `notified_at`. A live card with no post
@@ -127,7 +129,9 @@ exactly the options as given, with no Approve — and `subject.choices` holding 
   arrived. Marking a pointer sent never touches a settled or archived card. The pointer says the question waits as a card in
   his AG2 Space DM and may not have arrived, and quotes its title, with no options, no approve
   wording, and a note that a reply does not answer it. Only a card that is gone leaves the
-  question due for text. Nothing is scheduled: all of this happens when the reminder runs.
+  question due for text. The pointer step runs on every pass of `src/check-pending-questions.py`,
+  flagless included (the proactive loop's pass, or an old schedule), outside presenter mode, so an
+  unposted card is pointed to without anyone asking; the text reminders still need `--notify`.
 
 ## Decision-card clicks
 
@@ -253,7 +257,7 @@ The adapter looks for the room capability's scripts (`room_collab_client.py`,
 - **Persisted schedules.** The `pending-questions` entry is gone from
   `skills/schedule-crons/crons.example.json`. An old `crons.json` entry that still runs
   `python3 src/check-pending-questions.py` (with no flag or the retired `--reconcile-only`)
-  now reconciles and lists; it sends nothing.
+  now reconciles and lists; it sends nothing but an owed decision-card pointer.
 
 ## Testing against an unreachable room
 

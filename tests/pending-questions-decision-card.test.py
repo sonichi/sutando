@@ -428,6 +428,35 @@ class CardPointer(unittest.TestCase):
         sp.assert_called_once()
         dv.assert_not_called()
 
+    def _flagless(self, presenter):
+        """The unattended pass (no `--notify`) over a real card past its grace; only gather is stubbed."""
+        rem_spec = importlib.util.spec_from_file_location("pq_remind_u", PQ / "pending_questions_remind.py")
+        rem = importlib.util.module_from_spec(rem_spec)
+        rem_spec.loader.exec_module(rem)
+        ws, m, req, q = self._live()
+        req.created_at -= ask.CARD_POINTER_GRACE_SEC + 60
+        m.store.save(req)
+        g = {"waiting": [q], "notes": [], "unavailable": False}
+        buf = io.StringIO()
+        with mock.patch.object(rem, "gather", return_value=g), \
+                mock.patch.object(rem, "presenter_mode_active", return_value=presenter), \
+                mock.patch.object(rem, "deliver") as dv, contextlib.redirect_stdout(buf):
+            rem.main([], workspace=ws)
+        dv.assert_not_called()  # the flagless pass never sends a reminder
+        return ws, m, req, buf.getvalue()
+
+    def test_the_unattended_pass_points_to_a_card_that_never_posted(self):
+        ws, m, req, out = self._flagless(presenter=False)
+        self.assertEqual(len(_proactive(ws)), 1, out)
+        self.assertTrue(m.get(req.id).subject.get("pointer_sent_at"))
+        self.assertIn("card pointer:", out)
+        self.assertIn("no reminder sent", out)
+
+    def test_presenter_mode_holds_the_pointer_for_a_later_pass(self):
+        ws, m, req, _ = self._flagless(presenter=True)
+        self.assertEqual(_proactive(ws), [])
+        self.assertIsNone(m.get(req.id).subject.get("pointer_claim"), "nothing claimed: a later pass sends it")
+
 
 class PointerEdges(unittest.TestCase):
     def _live(self):
