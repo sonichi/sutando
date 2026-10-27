@@ -234,7 +234,7 @@ class CrashBoundaries(_Room):
         cards.stamp_claim(self.m, self.card, {**legacy, "handed_at": future})
         [c] = room_db.clicks(self.ws, manager=self.m, now=claim["handed_at"] + 2 * cards.HANDED_LEASE_SEC)
         self.assertFalse(c["actionable"], "no deadline stored: handed_at in the future still counts as fresh")
-        cards.stamp_claim(self.m, self.card, {**claim, "handed_at": future, "lease_until": 0})
+        cards.stamp_claim(self.m, self.card, {**claim, "handed_at": future, "lease_until": 1})
         [c] = room_db.clicks(self.ws, manager=self.m, now=claim["handed_at"] + 2 * cards.HANDED_LEASE_SEC)
         self.assertFalse(c["actionable"], "a future handed_at is fresh whatever the stored deadline says")
 
