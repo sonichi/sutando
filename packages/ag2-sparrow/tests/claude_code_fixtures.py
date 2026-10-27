@@ -79,6 +79,7 @@ from ag2_sparrow import claude_local_accepter as accepter, claude_local_card as 
 
 from ag2_sparrow.adapters.claude_code import cli, detector, hmac_policy, hold as hold_mod, inbox, launcher, trust  # noqa: E402
 from ag2_sparrow.adapters.claude_code import shape as shape_mod  # noqa: E402
+
 from ag2_sparrow.hitl.schema import ActionReply, STATUS_IN_PROGRESS, STATUS_PENDING, STATUS_RESOLVED  # noqa: E402
 
 # The fake is a #!/bin/sh wrapper that execs the quoted interpreter on the body beside
