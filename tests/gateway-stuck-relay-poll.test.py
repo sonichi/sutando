@@ -23,10 +23,11 @@ import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-_REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _helpers.hermetic_env import hermetic_env  # noqa: E402
 from _helpers.hermetic_gateway import isolate_then_import  # noqa: E402
 _GW, _ = isolate_then_import()
+_REPO = Path(__file__).resolve().parent.parent
 
 # The stub holds longer than this read timeout; the real one is the poll budget.
 _SHORT_READ_TIMEOUT_S = 0.3
@@ -495,9 +496,8 @@ class SupervisorRelaunchTest(unittest.TestCase):
             (d / "shims" / "osascript").write_text("#!/bin/bash\nexit 0\n")
             for f in ("scripts/sutando-config.sh", "shims/python3", "shims/osascript"):
                 os.chmod(d / f, 0o755)
-            env = {k: v for k, v in os.environ.items() if k != "AG2_REMOTE_TOKEN"}
-            env.update(PATH=f"{d / 'shims'}:{os.environ['PATH']}", REMOTE_TASK_TOKEN="t",
-                       SUTANDO_GATEWAY_BRIDGE_RESTART_DELAY="0")
+            env = hermetic_env(d / "home", PATH=f"{d / 'shims'}:{os.environ['PATH']}",
+                               REMOTE_TASK_TOKEN="t", SUTANDO_GATEWAY_BRIDGE_RESTART_DELAY="0")
             r = subprocess.run(["bash", str(wrapper)], cwd=d, env=env, capture_output=True,
                                text=True, timeout=30)
             runs = int((d / "runs").read_text())
