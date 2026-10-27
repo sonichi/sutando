@@ -19,6 +19,11 @@ import time
 import unittest
 from pathlib import Path
 
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 REPO = Path(__file__).resolve().parent.parent
 
 # Point the bridge's dirs at a temp tree + pin the host label BEFORE importing,
@@ -214,6 +219,26 @@ class SingletonGlueTest(unittest.TestCase):
         self.assertEqual(reached, [], "the flag must stop the loop before any poll")
         self.assertTrue(any("lost workspace poller lock" in m for m in logged), logged)
 
+    def test_main_heartbeats_before_it_waits_to_settle_the_room(self):
+        # The settle can wait on the connections record lock; the lease must stay fresh meanwhile.
+        order = []
+
+        def settle():
+            order.append("settle")
+            raise KeyboardInterrupt("stop")
+        stubs = {"_acquire_singleton": lambda: True, "_start_lock_heartbeat": lambda: order.append("heartbeat"),
+                 "_settle_proactive_room": settle}
+        saved = {k: getattr(rgb, k) for k in stubs}
+        for k, v in stubs.items():
+            setattr(rgb, k, v)
+        try:
+            with self.assertRaises(KeyboardInterrupt):
+                rgb.main()
+        finally:
+            for k, v in saved.items():
+                setattr(rgb, k, v)
+        self.assertEqual(order, ["heartbeat", "settle"])
+
     def test_main_stands_down_with_exit_75_when_deferred(self):
         # A supervising wrapper (gateway-bridge-wrapper.sh) relaunches any child
         # that exits, except rc 75: so a deferral must exit 75, not return 0.
@@ -292,7 +317,7 @@ class SingletonGlueTest(unittest.TestCase):
             rgb._release_singleton()
         finally:
             rgb._join_push_thread, rgb._ws_retain = orig_join, orig_retain
-        failed = [l for l in lines if "singleton: retain failed (locks dir unwritable)" in l]
+        failed = [l for l in lines if "singleton: retain failed (OSError at " in l and "unwritable" not in l]
         self.assertEqual(len(failed), 1, lines)
         self.assertEqual(json.loads(self._lockfile().read_text())["pid"], os.getpid())
 

@@ -53,6 +53,38 @@ class TestResolveCloudOrigin(unittest.TestCase):
         self.assertEqual(offenders, [])
 
 
+class TestBaselessStoredCredentialIsProductions(unittest.TestCase):
+    """A stored credential that names no origin (a pre-scoping cloud-auth.json, a metering env
+    without endpoint) is a production credential: on a dev.ag2.space install it binds to the
+    production Cloud, never to dev-sutando. An empty base for a NEW session stays the default."""
+
+    def test_on_a_dev_instance_a_baseless_credential_never_reaches_dev_sutando(self):
+        import importlib
+        import tempfile
+        dev, prod = "https://dev-sutando.ag2.space", "https://sutando.ag2.space"
+        env = {"AGENT_MXID": "@a:dev.ag2.space", "SUTANDO_METERING_HEADERS": json.dumps({"Authorization": "Bearer sutk_m"})}
+        try:
+            with mock.patch.dict("os.environ", env, clear=True):
+                ca = importlib.reload(cloud_auth)
+                self.assertEqual((ca.DEFAULT_CLOUD_ORIGIN, ca.PRODUCTION_CLOUD_ORIGIN), (dev, prod))
+                self.assertEqual(ca.normalize_base(""), dev, "a new session's default is this install's Cloud")
+                self.assertEqual(ca.credential_base(""), prod)
+                self.assertEqual(ca.credential_base(None), prod)
+                self.assertEqual(ca.credential_base("https://sutando.ag2.ai/"), prod)
+                self.assertEqual(ca.credential_base(dev + "/"), dev, "a credential that names dev stays dev's")
+                self.assertEqual(ca._metering_env_auth(), (prod, "sutk_m"))
+                with tempfile.TemporaryDirectory() as tmp:
+                    ws = Path(tmp) / "ws"
+                    (ws / "state" / "auth").mkdir(parents=True)
+                    (ws / "state" / "auth" / "cloud-auth.json").write_text(json.dumps({"token": "sutk_f"}))
+                    with mock.patch.object(ca.Path, "home", return_value=Path(tmp) / "home"):
+                        found = list(ca._file_candidates(ws))
+                self.assertEqual(found, [(prod, "sutk_f")])
+                self.assertNotIn(dev, [o for o, _ in found])
+        finally:
+            importlib.reload(cloud_auth)
+
+
 class TestKeyDerivation(unittest.TestCase):
     def test_matches_desktop_host_keys(self):
         # cloud_session.rs origin_key_suffix: a drifted slug or FNV hash orphans every session.

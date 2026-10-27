@@ -135,7 +135,7 @@ def _dispatch_events(a):
             try:
                 filters = json.loads(a.filters)
             except ValueError as e:
-                # Structured error, exit 0 — same convention as doc's --file failure.
+                # Structured error, exit 0, like every other ok:false result.
                 return {"ok": False, "reason": f"--filters is not valid JSON: {e}"}
         return _events.subscribe(a.room_id, types, filters=filters, agent_mxid=a.agent_mxid)
     if a.events_cmd == "unsubscribe":
@@ -169,19 +169,6 @@ def _main(argv):
     p.add_argument("path")
     p.add_argument("--caption", default=None)
     p.add_argument("--agent", dest="agent_mxid", default=os.environ.get("AGENT_MXID"))
-
-    # `context` and its old name `doc`. "doc" said nothing about WHICH store,
-    # and agents looking for the live collaborative document landed here.
-    for _name, _help in (("context", "read/write/delete a room Context document"),
-                         ("doc", "deprecated alias for `context` (NOT the live Room Doc)")):
-        p = sub.add_parser(_name, help=_help)
-        p.add_argument("action", choices=["get", "put", "rm"])
-        p.add_argument("room")
-        p.add_argument("--folder", default="room-live-context")
-        p.add_argument("--name", help="document filename (e.g. TODO.md)")
-        p.add_argument("--file", help="put: local file to upload (else stdin)")
-        p.add_argument("--message", help="put: commit message")
-        p.add_argument("--agent")
 
     p = sub.add_parser("join", help="accept this agent's own pending room invite")
     p.add_argument("room_id")
@@ -308,29 +295,6 @@ def _main(argv):
         res = _media.fetch_media(a.ref, a.agent_mxid, a.room_id)
     elif a.cmd == "send":
         res = _media.send_media(a.room_id, a.path, a.agent_mxid, caption=a.caption)
-    elif a.cmd in ("context", "doc"):
-        import doc as _doc
-        if a.cmd == "doc":
-            print("note: `room_ops doc` is now `room_ops context`. This is the room's\n      Context-document FOLDER. The live collaborative document (Doc tab,\n      whiteboard, deck) is a different store — see the room-collab skill.",
-                  file=__import__("sys").stderr)
-        if a.action == "get":
-            res = _doc.doc_get(a.room, folder=a.folder, name=a.name, agent_mxid=a.agent)
-        elif a.action == "put":
-            import sys as _sys
-            try:
-                content = open(a.file).read() if a.file else _sys.stdin.read()
-            except (OSError, UnicodeDecodeError) as e:
-                content = None
-                res = {"ok": False, "reason": f"cannot read --file {a.file}: {e}"}
-            if content is not None:
-                res = _doc.doc_put(a.room, content, folder=a.folder,
-                                   name=a.name or "CONTEXT.md", message=a.message,
-                                   agent_mxid=a.agent)
-        else:
-            if not a.name:
-                res = {"ok": False, "reason": "--name is required for rm"}
-            else:
-                res = _doc.doc_rm(a.room, a.name, folder=a.folder, agent_mxid=a.agent)
     elif a.cmd == "join":
         res = _join.join_room(a.room_id, a.agent_mxid)
     elif a.cmd == "rooms":

@@ -18,6 +18,12 @@ through each call site, with git's answer checked.
 
 Run: python3 tests/health-check-git-stdin-no-pipe.test.py
 """
+
+from _helpers.hermetic_env import isolate_os_environ, isolated_child_env
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import ast
 import importlib.util
 import os
@@ -97,7 +103,7 @@ def load():
 m = load()
 
 # Ambient gc/maintenance/hooks must not touch the temp repos (#3542 shape).
-GENV = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_SYSTEM=os.devnull,
+GENV = isolated_child_env(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_SYSTEM=os.devnull,
             GIT_CONFIG_NOSYSTEM="1")
 GIT = ["git", "-c", "gc.auto=0", "-c", "maintenance.auto=false", "-c", "core.fsmonitor=false"]
 

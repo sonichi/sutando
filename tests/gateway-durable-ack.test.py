@@ -36,6 +36,11 @@ import urllib.error
 from pathlib import Path
 from unittest.mock import patch
 
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 REPO = Path(__file__).resolve().parent.parent
 SCRIPT = REPO / "src" / "remote-gateway-bridge.py"
 
@@ -85,7 +90,7 @@ class DurableAck(unittest.TestCase):
         self.addCleanup(self._req_patch.stop)
         self.addCleanup(self._tmp.cleanup)
 
-    def _fake_req(self, method, path, payload=None, timeout=35):
+    def _fake_req(self, method, path, payload=None, timeout=35, **_kw):
         self.calls.append((method, path, payload))
         return {}
 
@@ -492,7 +497,7 @@ class DurableAck(unittest.TestCase):
         self.assertTrue(mod._record_pending_acks([("task-regen", True, "gen-1")]))
         stale = _http(404, b'{"error":"not leased to you","reason":"stale lease generation"}')
 
-        def req(method, path, payload=None, timeout=35):
+        def req(method, path, payload=None, timeout=35, **_kw):
             self.calls.append((method, path, payload))
             mod._record_pending_acks([("task-regen", True, "gen-2")])
             raise stale
@@ -532,7 +537,7 @@ class DurableAck(unittest.TestCase):
         mod = self.mod
         alive = [True, False]
 
-        def req(method, path, payload=None, timeout=35):
+        def req(method, path, payload=None, timeout=35, **_kw):
             self.calls.append((method, path, payload))
             if path.startswith("/v1/tasks?wait="):
                 return {"tasks": list(tasks)}

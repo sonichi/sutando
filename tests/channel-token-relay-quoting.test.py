@@ -8,6 +8,12 @@ quote bytes and every relay answered 401. Peeling is safe only for the
 `url|hex` relay shape — a bot token may legitimately contain quotes, which
 tests/discord-token-delegation.test.py pins.
 """
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import os
 import sys
 

@@ -48,6 +48,11 @@ from unittest import mock
 import tempfile
 import time
 
+from _helpers.hermetic_env import isolate_os_environ, isolated_child_env  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 REPO = pathlib.Path(__file__).resolve().parent.parent
 LEDGER_CLI = REPO / "src" / "turn_ledger.py"
 ROOM_OPS = REPO / "skills" / "agent-room-ops"
@@ -381,7 +386,7 @@ print(json.dumps(turn_ledger.read_entries()))
 '''
     with tempfile.TemporaryDirectory() as tmp:
         ws = _workspace(tmp)
-        env = dict(os.environ, SUTANDO_TEST_MODE="1", SUTANDO_WORKSPACE=str(ws),
+        env = isolated_child_env(SUTANDO_TEST_MODE="1", SUTANDO_WORKSPACE=str(ws),
                    ROOM_OPS=str(ROOM_OPS), SRC=str(REPO / "src"), WS=str(ws))
         out = subprocess.run([sys.executable, "-c", driver], capture_output=True,
                              text=True, env=env)
@@ -567,7 +572,7 @@ def test_an_unrecognised_stop_never_blocks() -> None:
 
 def _hook_with_open_stdin(ws: pathlib.Path, written: str) -> dict:
     """Run the real hook with a writer that sends `written` and never closes stdin."""
-    env = dict(os.environ, SUTANDO_TEST_MODE="1", SUTANDO_WORKSPACE=str(ws))
+    env = isolated_child_env(SUTANDO_TEST_MODE="1", SUTANDO_WORKSPACE=str(ws))
     env.pop("CLAUDE_CODE_SESSION_ID", None)
     proc = subprocess.Popen(["/bin/bash", str(REPO / "src" / "check-pending-tasks.sh")],
                             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -1061,7 +1066,7 @@ def _run_hook_script(script: pathlib.Path, ws: pathlib.Path, session_id: str | N
     `session_id=None` omits the env var entirely, simulating a caller outside
     Claude Code (or a hook whose session could not be determined).
     """
-    env = dict(os.environ, SUTANDO_TEST_MODE="1", SUTANDO_WORKSPACE=str(ws))
+    env = isolated_child_env(SUTANDO_TEST_MODE="1", SUTANDO_WORKSPACE=str(ws))
     env.pop("CLAUDE_CODE_SESSION_ID", None)
     if session_id:
         env["CLAUDE_CODE_SESSION_ID"] = session_id
@@ -1108,7 +1113,7 @@ def test_two_sessions_do_not_reset_or_satisfy_each_others_gate() -> None:
               decision == {}, repr(decision))
 
     def _run_ledger_cli(ws: pathlib.Path, session_id: str, *args: str) -> None:
-        env = dict(os.environ, SUTANDO_TEST_MODE="1", SUTANDO_WORKSPACE=str(ws),
+        env = isolated_child_env(SUTANDO_TEST_MODE="1", SUTANDO_WORKSPACE=str(ws),
                    CLAUDE_CODE_SESSION_ID=session_id)
         out = subprocess.run([sys.executable, str(ledger_cli), *args],
                              capture_output=True, text=True, env=env)

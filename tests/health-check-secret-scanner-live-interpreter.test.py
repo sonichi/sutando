@@ -40,6 +40,11 @@ import types
 
 # health-check resolves workspace/channel config at import, so isolate before
 # exec_module or this reads the developer's real per-user config.
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 os.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp(prefix="ccd-secret-scanner-")
 
 SRC = pathlib.Path(__file__).resolve().parents[1] / "src" / "health-check.py"

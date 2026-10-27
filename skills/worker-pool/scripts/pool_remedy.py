@@ -107,7 +107,8 @@ def resume(workspace, repo, *, runner=None, spawn=None) -> dict:
         dead = [w for w, o in obs.items()
                 if w in stopped and o.session_alive is False and not o.paused]
         restarted = {w: recover(workspace, repo, w, runner=runner, spawn=spawn) for w in dead}
-        _reset_ladders(workspace, forget=restarted)
+        _reset_ladders(workspace, forget=[
+            w for w, out in restarted.items() if out["outcome"] != SUSPENDED])
     return {"was_suspended": was, "restarted": restarted}
 
 
@@ -218,6 +219,8 @@ def close_dead_runs(workspace, worker_id, closed: list | None = None) -> list:
 def recover(workspace, repo, worker_id, *, runner=None, spawn=None) -> dict:
     """Recover one worker. Never raises for an expected refusal: the caller is a
     timer with nobody watching, so every outcome is a value it can record."""
+    if suspension(workspace):
+        return {"worker_id": worker_id, "outcome": SUSPENDED}
     spawn = spawn or sw.spawn
     if sup.is_paused(workspace, worker_id):
         return {"worker_id": worker_id, "outcome": PAUSED}
@@ -246,6 +249,11 @@ def recover(workspace, repo, worker_id, *, runner=None, spawn=None) -> dict:
         if not sessions:
             return {"worker_id": worker_id, "outcome": NO_SESSION}
         session = sessions[-1]
+        if last.get("session_id"):
+            session = next((s for s in sessions if s.get("session_id") == last["session_id"]), None)
+            if session is None:
+                return {"worker_id": worker_id, "outcome": NO_SESSION,
+                        "why": f"recorded incarnation session {last['session_id']!r} is not in this worker's lineage"}
         kw = {"resume": session["session_id"], "runtime": "claude", "socket": socket,
               "cwd": (session.get("transcript") or {}).get("cwd") or str(repo)}
     if runner is not None:
@@ -263,6 +271,7 @@ def recover(workspace, repo, worker_id, *, runner=None, spawn=None) -> dict:
     closed: list = []
     try:
         close_dead_runs(workspace, worker_id, closed)
+        pd.reconcile_interrupted(workspace, worker_id)
         out = spawn(workspace, repo, **kw)
     except (sw.SpawnRefused, sw.SpawnRetained, OSError) as e:
         return {"worker_id": worker_id, "outcome": FAILED, "why": str(e),
@@ -424,7 +433,7 @@ def apply(workspace, repo, decisions: dict, *, runner=None, spawn=None) -> dict:
             "escalations": sorted(w for w, d in decisions.items() if d == ps.ESCALATE)}
 
 
-def main(argv=None) -> int:
+def main(argv=None, *, runner=None) -> int:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--workspace", required=True)
     p.add_argument("--repo", required=True)
@@ -457,7 +466,7 @@ def main(argv=None) -> int:
         print(json.dumps({"suspended": suspend(a.workspace, a.suspend)}))
         return 0
     with pool_lock(a.workspace):
-        return _sweep(a)
+        return _sweep(a, runner)
 
 
 def _repair_human_cards(workspace, tick) -> None:
@@ -486,7 +495,7 @@ def _repair_human_cards(workspace, tick) -> None:
             tick["decisions"][w] = ps.CARD_HUMAN
 
 
-def _sweep(a) -> int:
+def _sweep(a, runner=None) -> int:
     try:
         resumed = resume(a.workspace, a.repo) if a.resume else None
         held = suspension(a.workspace)
@@ -527,7 +536,8 @@ def _sweep(a) -> int:
                  if o.get("session_alive") is True and w not in tick.get("wedged", [])}
         now_asks = {w: ps.WEDGE_CARDS.get(k) for w, k in tick.get("wedge_kinds", {}).items()}
         acted["cards_closed"] = wc.resolve_cleared(
-            a.workspace, clear, wedges=now_asks, observations=tick["observations"], recovered=recovered)
+            a.workspace, clear, wedges=now_asks, observations=tick["observations"], recovered=recovered,
+            runner=runner)
     print(json.dumps({"decisions": tick["decisions"], "auth_expired": tick["auth_expired"],
                       **acted}, indent=2, sort_keys=True))
     outcomes = list(acted["recoveries"].values()) + list(((resumed or {}).get("restarted") or {}).values())

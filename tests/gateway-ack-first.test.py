@@ -32,6 +32,9 @@ import urllib.request
 from pathlib import Path
 from unittest.mock import patch
 
+from _helpers.hermetic_gateway import assert_hermetic, isolate_then_import  # noqa: E402
+_GW, _IMPORT_READS = isolate_then_import()   # before anything else imports the bridge
+
 _REPO = Path(__file__).resolve().parent.parent
 _PKG = _REPO / "packages" / "ag2-sparrow"
 _TESTS = Path(__file__).resolve().parent
@@ -39,8 +42,6 @@ if str(_PKG) not in sys.path:
     sys.path.insert(0, str(_PKG))
 
 sys.path.insert(0, str(_TESTS))
-from _helpers.hermetic_gateway import assert_hermetic, isolate_then_import  # noqa: E402
-_GW, _IMPORT_READS = isolate_then_import()   # before anything else imports the bridge
 
 from _helpers.gateway_relay import Bridges, Relay  # noqa: E402
 from ag2_sparrow import delivery_core, outbox, remote_gateway_bridge as gw  # noqa: E402
@@ -151,7 +152,7 @@ class _Bridge(unittest.TestCase):
         return gw._take_ack_first(dict(task), self.inflight)
 
     def staged(self, tid: str) -> "list[Path]":
-        return sorted(gw._held_dir().glob(f"{tid}.txt.*.tmp"))
+        return sorted(gw._held_dir().glob(f".{tid}.txt.*.tmp"))
 
     def manifest(self) -> dict:
         return json.loads(gw.ACK_FIRST_MANIFEST_FILE.read_text()) if gw.ACK_FIRST_MANIFEST_FILE.exists() else {}
@@ -863,7 +864,7 @@ class ThroughTheLoop(unittest.TestCase):
         return json.loads(path.read_text()) if path.exists() else {}
 
     def staged(self) -> "list[Path]":
-        return sorted((self.ws / "tasks" / ".ack-first").glob(f"{ASK_A}.txt.*.tmp"))
+        return sorted((self.ws / "tasks" / ".ack-first").glob(f".{ASK_A}.txt.*.tmp"))
 
     def entry(self) -> dict:
         return self.state("remote-task-ack-first-manifest").get(ASK_A) or {}

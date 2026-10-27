@@ -21,9 +21,10 @@ import time
 from ... import task_lifecycle
 from ...collaborator_turn import ENV_KEEP, child_env, run_collaborator_turn  # noqa: F401
 from ...relay_loop import (COLLAB_LIMITER_FILE, NO_ROOM, NON_OWNER_FAILED, TEXT_MAX, Outcome, RateLimiter, RelayLoop,
-                           build_payload, count_arg, log, positive_arg, result_body)
+                           build_payload, count_arg, log, nonnegative_float, positive_arg, positive_float, result_body)
 from ...task_io import (LockRefused, acquire_lock, clear_attributed_pidfile, exit_code, exit_on_sigterm,
-                        is_collaborator, make_dirs, non_owner_note, release_lock, root_path, stoppable_sleep)
+                        is_collaborator, make_dirs, non_owner_note, process_identity, release_lock, root_path,
+                        stoppable_sleep, verify_lineage)
 
 SESSION_RE = re.compile(r"session_[A-Za-z0-9]+")
 ROOM_RE = re.compile(r"![^\s:]+:\S+")
@@ -117,20 +118,23 @@ class Adapter(RelayLoop):
         self.args, self.clock, self.sleep, self.run = args, clock, sleep, run
         self.note = note if note is not None else non_owner_note()
         self.env = child_env(environ)
-        self.lc = task_lifecycle.Lifecycle(args.work, clock=clock, log=log)
+        self.lc = task_lifecycle.Lifecycle(args.work, clock=clock, log=log, identity=process_identity(),
+                                           lineage=verify_lineage)
         self.limiter = JournalGate(self.lc.journal, args.max_per_hour)
         # Collaborator turns never touch the session, so they have their own cap, outside the rate journal.
         self.collab_limiter = RateLimiter(os.path.join(args.state, COLLAB_LIMITER_FILE),
                                           args.max_collaborator_per_hour, clock)
         # The loop's done ledger is the settled-ids ledger: same one-id-per-line format, repaired on open.
         self.done_path = self.lc.settled.path
-        self.attempts, self.limited, self.not_before, self.lanes = {}, {}, {}, {}
+        self.attempts, self.limited, self.not_before, self.lanes, self.seen_at = {}, {}, {}, {}, {}
         self.blocked_until = 0.0
 
     def recover(self):
         self.lc.recover()
 
     def _phase(self, task_id):
+        if self.not_before.get(task_id, 0) > self.clock():
+            return None                                 # parked: not read again until its park ends
         try:
             rec = self.lc.claims.load(task_id)
         except task_lifecycle.ClaimUnreadable:
@@ -150,6 +154,18 @@ class Adapter(RelayLoop):
             return wait
         return max(max(self.limiter.times) + self.args.min_gap_seconds - self.clock(), 0.0)
 
+    def contained(self, name, unit, *args):
+        """The serve loop's one containment: a state read that failed on I/O (a plain StateIOError) anywhere in a
+        task's probe or step parks that task for a retry and the loop goes on. A failed durable write
+        (StateWriteError) and a refusal on what the state says still stop the adapter (exit 2)."""
+        try:
+            return unit(*args)
+        except task_lifecycle.StateWriteError:
+            raise
+        except task_lifecycle.StateIOError as e:
+            self.park(name[:-4], e)
+            return False
+
     def park(self, task_id, why):
         log("parked ->", task_id, why)
         self.not_before[task_id] = self.clock() + PARK_SECONDS
@@ -167,6 +183,7 @@ class Adapter(RelayLoop):
         for d in (self.attempts, self.limited, self.not_before):
             d.pop(name[:-4], None)
         self.lanes.pop(name, None)
+        self.seen_at.pop(name, None)
 
     def _publish(self, name, seen):
         if self.lc.publish_and_settle(name[:-4]) == "parked":
@@ -177,14 +194,25 @@ class Adapter(RelayLoop):
     def step(self, name, seen):
         """Handle one task; returns True when it reached a final result."""
         task_id = name[:-4]
-        if task_id in self.lc.settled:
-            log("already settled, never called again ->", task_id)
-            seen.add(task_id)
-            return True
         try:
             rec = self.lc.claims.load(task_id)
         except task_lifecycle.ClaimUnreadable as e:
+            if task_id in self.lc.settled:
+                log("already settled, never called again ->", task_id)
+                seen.add(task_id)
+                return True
             return self.park(task_id, e)
+        # A local claim is never this adapter's to repair: it only reads the ledger for one.
+        local = bool(rec and rec.get("claim_mode") == task_lifecycle.LOCAL)
+        # Its repair's failures are classified by contained(), never here: a read parks, a write stops.
+        settled = task_id in self.lc.settled if local else self.lc.is_settled(task_id)
+        if settled:
+            log("already settled, never called again ->", task_id)
+            seen.add(task_id)
+            return True
+        if local:
+            log("foreign claim (local), left alone ->", task_id)
+            return self.park(task_id, "a local claim")
         if rec and rec["phase"] not in task_lifecycle.CALLABLE:
             return self._publish(name, seen)
         task = self.read_task(name, seen)
@@ -211,6 +239,9 @@ class Adapter(RelayLoop):
             return True
         if decision == "park":
             return self.park(task_id, state)
+        if collaborator and self.too_old(name):
+            log("collaborator task waited too long ->", task_id)
+            return self.finish(name, NON_OWNER_FAILED, seen)
         attempt = self.lc.prepare(task_id, result_body(INTERRUPTED, self.args.result_mode, owner, LABEL))
         if not self.lc.begin_call(task_id, attempt, os.path.join(self.args.inbox, name)):
             self._settled(name, seen)
@@ -218,7 +249,7 @@ class Adapter(RelayLoop):
         if collaborator:
             self.collab_limiter.record()
             log("collaborator turn ->", task_id, "attempt", attempt, "chars", len(text))
-            turn = run_collaborator_turn(self.args.claude, text, self.env, self.args.timeout, run=self.run)
+            turn = run_collaborator_turn(self.args.claude, text, self.env, self.args.collaborator_timeout, run=self.run)
             log("result <-", task_id, turn.kind, turn.detail)
             self.lc.record_outcome(task_id, "final", turn.text if turn.kind == "ok" else NON_OWNER_FAILED, turn.detail)
             return self._publish(name, seen)
@@ -271,7 +302,13 @@ def build_parser():
                     help="retries per task for failures that prove the turn was not queued; anything ambiguous is never retried")
     ap.add_argument("--backoff", type=float, default=2.0, help="first retry delay, doubled per retry")
     ap.add_argument("--backoff-max", type=float, default=60.0)
-    ap.add_argument("--timeout", type=float, default=60.0, help="seconds per claude call, collaborator turns included")
+    ap.add_argument("--timeout", type=float, default=60.0, help="seconds per claude --cloud call")
+    ap.add_argument("--collaborator-timeout", type=positive_float, default=60.0,
+                    help="seconds per collaborator turn, more than 0")
+    ap.add_argument("--collaborator-max-age", type=nonnegative_float, default=1800.0,
+                    help="a collaborator task that waited longer than this many seconds gets the plain failure line "
+                         "at once instead of a turn, counted since the task was first seen in a pending scan, or "
+                         "its file time if earlier; a restart does not reset it. 0 turns the cut-off off")
     ap.add_argument("--once", type=count_arg, default=0, help="exit after N tasks")
     ap.add_argument("--idle-exit", type=float, default=0, help="exit after S idle seconds")
     ap.add_argument("--poll", type=float, default=1.0)

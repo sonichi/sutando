@@ -18,6 +18,12 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+sys.path.append(str(Path(__file__).resolve().parents[3] / "tests"))
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 PKG_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PKG_ROOT))
 from ag2_sparrow import collaborator_turn as ct, relay_loop as rl, result_disposal, result_ready, task_io  # noqa: E402
@@ -42,7 +48,8 @@ class Loop(rl.RelayLoop):
                                      max_retries=1, backoff=2.0, backoff_max=60.0, once=0, idle_exit=0, poll=0.01,
                                      allow_non_owner=kw.get("allow_non_owner", False),
                                      allow_collaborator=kw.get("allow_collaborator", False),
-                                     max_collaborator_per_hour=kw.get("max_collaborator_per_hour", 10))
+                                     max_collaborator_per_hour=kw.get("max_collaborator_per_hour", 10),
+                                     collaborator_max_age=kw.get("collaborator_max_age", 1800.0))
         for d in (args.inbox, args.results, args.state):
             os.makedirs(d, exist_ok=True)
         self.init_loop(args, "sends.json", clock=lambda: 1000.0, sleep=lambda s: None)
@@ -335,6 +342,27 @@ class InertTextTest(unittest.TestCase):
             self.assertEqual(parse_markers(turn.text).actions, [], raw)
             self.assertIn("HI", turn.text)
 
+    def test_the_bracket_fallback_is_reached_when_the_quoted_form_is_not_enough(self):
+        from ag2_sparrow.result_markers import parse_markers
+        with mock.patch.object(ct, "neutralize_markers", side_effect=lambda s: s):
+            body = ct.inert_text("[no-send]\nHI [dm-only]\n[file: /x]")
+            self.assertEqual(body, "[ no-send]\nHI [ dm-only]\n[ file: /x]", "every bracket opened")
+            self.assertEqual(parse_markers(body).actions, [])
+            turn = ct.run_collaborator_turn("claude", "t", {}, run=FakeRun(stdout=json.dumps({"result": "[no-send]\nHI"})))
+            self.assertEqual((turn.kind, turn.text), ("ok", "[ no-send]\nHI"))
+
+    def test_both_parser_modes_are_consulted(self):
+        from ag2_sparrow.result_markers import Action, ParseResult
+        calls = []
+
+        def only_after_channel(text, skip_after_channel=False):
+            calls.append(skip_after_channel)
+            return ParseResult(text, [Action("skip", "no-send")] if skip_after_channel else [])
+        with mock.patch.object(ct, "parse_markers", side_effect=only_after_channel):
+            self.assertTrue(ct._executes("x"))
+            self.assertIsNone(ct.inert_text("x"), "a body only the delivery verdict's mode acts on is still refused")
+        self.assertEqual(calls[:2], [False, True])
+
     def test_text_that_still_acts_after_quoting_is_a_failed_turn(self):
         with mock.patch.object(ct, "_executes", return_value=True):
             self.assertIsNone(ct.inert_text("[no-send]\nHI"))
@@ -356,6 +384,21 @@ class PositiveArgTest(unittest.TestCase):
                 self.assertIn("--max-collaborator-per-hour: must be 1 or more", err.getvalue())
             self.assertEqual(build().parse_args(["--work", "w", "--max-collaborator-per-hour", "1"] + need)
                              .max_collaborator_per_hour, 1)
+            for flag, bad, msg in (("--collaborator-timeout", "0", "must be a finite number more than 0"),
+                                   ("--collaborator-timeout", "-1", "must be a finite number more than 0"),
+                                   ("--collaborator-timeout", "inf", "must be a finite number more than 0"),
+                                   ("--collaborator-timeout", "1e309", "must be a finite number more than 0"),
+                                   ("--collaborator-timeout", "nan", "must be a finite number more than 0"),
+                                   ("--collaborator-max-age", "-1", "must be a finite number, 0 or more"),
+                                   ("--collaborator-max-age", "inf", "must be a finite number, 0 or more"),
+                                   ("--collaborator-max-age", "1e309", "must be a finite number, 0 or more"),
+                                   ("--collaborator-max-age", "nan", "must be a finite number, 0 or more")):
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err), self.assertRaises(SystemExit):
+                    build().parse_args(["--work", "w", flag, bad] + need)
+                self.assertIn("%s: %s" % (flag, msg), err.getvalue())
+            args = build().parse_args(["--work", "w", "--collaborator-max-age", "0", "--collaborator-timeout", "0.5"] + need)
+            self.assertEqual((args.collaborator_max_age, args.collaborator_timeout), (0.0, 0.5), "0 is off; any positive timeout")
 
 
 class LaneSchedulingTest(unittest.TestCase):
@@ -366,6 +409,7 @@ class LaneSchedulingTest(unittest.TestCase):
         write_task(loop.args.inbox, "task-c", "normal", 100, tier="team")
         p = Path(loop.args.inbox) / "task-c.txt"
         p.write_text(p.read_text().replace("access_tier: team", "collaborator: true\naccess_tier: team"))
+        os.utime(p, (100, 100))            # the rewrite must keep the ordering mtime
         write_task(loop.args.inbox, "task-o", "normal", 200)
         return loop
 
@@ -421,6 +465,50 @@ class LaneSchedulingTest(unittest.TestCase):
                 self.assertEqual(loop.classify(headers), want, (headers, flags))
                 refused = loop.refusal("task-x%d.txt" % len(loop.lanes), headers, set())
                 self.assertEqual(refused is None, not want.startswith("refused"), (headers, flags))
+
+    def test_a_task_is_too_old_once_it_waited_past_the_max_age_since_first_seen(self):
+        with tempfile.TemporaryDirectory() as d:
+            loop = self.loop(d, collaborator_max_age=1000.0)   # task-c mtime 100, task-o mtime 200, clock 1000
+            now = [loop.clock()]
+            loop.clock = lambda: now[0]
+            self.assertFalse(loop.too_old("task-never-seen.txt"))
+            self.assertEqual(loop.next_ready(["task-c.txt", "task-o.txt"]), ("task-c.txt", 0.0))
+            self.assertEqual(loop.seen_at, {"task-c.txt": 100.0, "task-o.txt": 200.0},
+                             "every task in the scan is stamped from its file time, selected or not")
+            self.assertEqual(list(loop.lanes), ["task-c.txt"], "stamping does not depend on classifying")
+            now[0] = 1100
+            self.assertFalse(loop.too_old("task-c.txt"), "exactly the limit is still fresh")
+            now[0] = 1101
+            self.assertTrue(loop.too_old("task-c.txt"))
+            self.assertFalse(loop.too_old("task-o.txt"))
+            loop.next_ready(["task-c.txt", "task-o.txt"])
+            loop.lane("task-c.txt")
+            self.assertTrue(loop.too_old("task-c.txt"), "a later scan or look does not restart the clock")
+            again = self.loop(d, collaborator_max_age=1000.0)
+            again.clock = lambda: now[0]
+            again.next_ready(["task-c.txt"])
+            self.assertTrue(again.too_old("task-c.txt"), "a restart does not reset it: the file time seeds it")
+            loop.args.collaborator_max_age = 0
+            self.assertFalse(loop.too_old("task-c.txt"), "0 turns the cut-off off")
+            loop._settled("task-c.txt", set())
+            self.assertNotIn("task-c.txt", loop.seen_at)
+
+    def test_first_seen_is_the_scan_when_the_file_is_newer_or_gone(self):
+        with tempfile.TemporaryDirectory() as d:
+            loop = self.loop(d)
+            p = Path(loop.args.inbox) / "task-c.txt"
+            os.utime(p, (5000, 5000))
+            loop.next_ready(["task-c.txt", "task-gone.txt"])
+            self.assertEqual(loop.seen_at, {"task-c.txt": 1000.0, "task-gone.txt": 1000.0},
+                             "a future file time never makes a task younger than its first scan")
+
+    def test_a_stale_collaborator_takes_the_ungated_lane_past_a_full_cap(self):
+        with tempfile.TemporaryDirectory() as d:
+            loop = self.loop(d, collaborator_max_age=500.0)     # task-c mtime 100: 900 s old at clock 1000
+            loop.collab_limiter.record()
+            self.assertEqual(loop.next_ready(["task-c.txt"]), ("task-c.txt", 0.0), "stale: the line, at once")
+            loop.args.collaborator_max_age = 5000.0
+            self.assertEqual(loop.next_ready(["task-c.txt"])[0], None, "fresh: it waits on its cap")
 
     def test_a_lane_is_read_once_and_a_vanished_task_is_the_providers_to_report(self):
         with tempfile.TemporaryDirectory() as d:

@@ -2,6 +2,12 @@
 """A minutes-old last successful poll is a retry, not proof of non-delivery.
 Run: python3 tests/health-check-gateway-transient-outage.test.py"""
 from __future__ import annotations
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import json
 import os
@@ -58,6 +64,29 @@ class TestTransientIsNotAnOutage(unittest.TestCase):
         with mock.patch.dict(os.environ, {"REMOTE_TASK_POLL_WAIT": "50"}):
             reloaded = _load()
         self.assertEqual(reloaded.GATEWAY_TRANSIENT_OUTAGE_S, 3 * (50 + 25))
+
+    def test_the_bound_equals_the_bridge_s_grace_for_every_poll_wait(self):
+        """The probe copies the bridge's arithmetic; compare the two live values, not literals."""
+        import subprocess
+        import sys
+        probe = (
+            "import importlib.util, sys\n"
+            "sys.path.insert(0, sys.argv[1])\n"
+            "from _helpers.hermetic_gateway import isolate_then_import\n"
+            "gw, _ = isolate_then_import(env={'REMOTE_TASK_POLL_WAIT': sys.argv[2]})\n"
+            "spec = importlib.util.spec_from_file_location('hc', sys.argv[3])\n"
+            "hc = importlib.util.module_from_spec(spec)\n"
+            "try:\n    spec.loader.exec_module(hc)\nexcept SystemExit:\n    pass\n"
+            "print(gw.POLL_TIMEOUT_GRACE_S, hc.GATEWAY_TRANSIENT_OUTAGE_S)\n")
+        for wait in ("10", "25", "35", "50"):
+            with self.subTest(poll_wait=wait):
+                out = subprocess.run(
+                    [sys.executable, "-c", probe, str(REPO / "tests"), wait,
+                     str(REPO / "src" / "health-check.py")],
+                    capture_output=True, text=True, timeout=60)
+                self.assertEqual(out.returncode, 0, out.stderr[-2000:])
+                bridge, health = (float(v) for v in out.stdout.split()[-2:])
+                self.assertEqual(health, bridge)
 
     def test_past_the_grace_the_bridge_and_the_probe_agree_it_is_an_outage(self):
         # Between the old 300s literal and the bridge's grace the two disagreed:

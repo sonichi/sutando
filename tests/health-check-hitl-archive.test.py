@@ -1,6 +1,11 @@
 """check_hitl_archive: health-check surfaces a failing HITL archive step or a
 regrown live store, which the gateway would otherwise re-read every second."""
 
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import json
 import sys

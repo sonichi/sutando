@@ -29,6 +29,12 @@ import urllib.error
 from pathlib import Path
 from unittest import mock
 
+sys.path.append(str(Path(__file__).resolve().parents[3] / "tests"))
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 PKG_ROOT = Path(__file__).resolve().parents[1]
 REPO_SRC = PKG_ROOT.parents[1] / "src"
 sys.path.insert(0, str(PKG_ROOT))
@@ -356,6 +362,28 @@ class LockTest(Base):
         self.assertEqual(rc, 2)
         self.assertIn("root changed", err)
 
+    def test_lock_held_is_holder_locks_occupancy(self):
+        """task_io.lock_held delegates to the one tri-state reader; unobserved reads as unknown."""
+        self.assertEqual(task_io.lock_held(str(self.work)), "free")
+        with mock.patch.object(holder_lock, "occupancy", return_value="unobserved") as occ:
+            self.assertEqual(task_io.lock_held(str(self.work)), "unknown")
+        occ.assert_called_once_with(str(self.work))
+        with mock.patch.object(holder_lock, "occupancy", side_effect=holder_lock.LockError("x")):
+            self.assertEqual(task_io.lock_held(str(self.work)), "unknown")
+        child = subprocess.Popen(["sleep", "30"])
+        self.addCleanup(lambda: (child.kill(), child.wait(10)))
+        start = holder_lock.start_time(child.pid)
+        self.work.mkdir(exist_ok=True)
+        lock_dir = Path(holder_lock.lock_dir(str(self.work)))
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        (lock_dir / "lock").touch()
+        (lock_dir / "holder").write_bytes(json.dumps({
+            "schema": 2, "adapter": "claude-local", "pid": child.pid, "start": start, "host": holder_lock._host(),
+            "install_id": "i", "lock": {"dev": 1, "ino": 2}, "acquired_at": 1.0, "owner_pid": 2 ** 22 - 1,
+            "owner_start": "2000-01-01T00:00:00Z", "consumer": {"pid": child.pid, "start": start},
+            "tombstone": None}).encode())
+        self.assertEqual(task_io.lock_held(str(self.work)), "held", "a free flock, a live consumer: the sticky rule")
+
     def test_the_lock_is_the_first_act(self):
         self.holder()
         before = sorted(os.listdir(self.work))
@@ -392,10 +420,14 @@ class FreshDirTest(Base):
 
     def test_with_the_marker_only_the_allowlist_is_accepted(self):
         self.assertEqual(self.main()[0], 0)
-        for name in ("done", ".rate.jsonl.123.abcd.tmp"):
+        for name in ("done", ".rate.jsonl.123.abcd.tmp", ".rate.jsonl.456.abcd.tmp"):
             (self.work / "state" / name).write_text("")
+        old = time.time() - vendored.TEMP_SWEEP_AFTER - 5
+        os.utime(self.work / "state" / ".rate.jsonl.123.abcd.tmp", (old, old))
         self.assertEqual(self.main()[0], 0)
         self.assertFalse((self.work / "state" / ".rate.jsonl.123.abcd.tmp").exists(), "a crash's temp is cleared")
+        self.assertTrue((self.work / "state" / ".rate.jsonl.456.abcd.tmp").exists(),
+                        "a fresh temp may be a live writer's, mid-replace: kept, and the start still accepted")
         stale = self.work / "state" / "connector.pid"
         stale.write_text("abc")
         os.utime(stale, (time.time() - 100, time.time() - 100))
@@ -1382,8 +1414,14 @@ class SettledIdsTest(Base):
         self.assertEqual((self.work / "s").read_bytes(), b"task-a\ntask-bb\n")
         self.assertEqual(synced, [str(self.work / "s")])
 
-    def test_any_terminated_malformed_record_is_refused_naming_its_offset(self):
-        for text, offset in (("task-a\nnot a task id\ntask-b\n", 7), ("task-a\ntask-c x\n", 7), ("\n", 0)):
+    def test_any_terminated_malformed_record_is_refused_naming_its_offset_and_only_an_unterminated_tail_is_cut(self):
+        """A short append leaves only a prefix of `id\\n`, never a newline-terminated malformed record: that shape
+        is corruption, refused with the bytes untouched (a settled id is never silently dropped)."""
+        (self.work / "s").write_text("task-a\ntask-b")
+        self.assertEqual(self.lc.SettledIds(self.work / "s").ids, {"task-a"})
+        self.assertEqual((self.work / "s").read_text(), "task-a\n", "the unterminated tail cut")
+        for text, offset in (("task-a\nnot a task id\ntask-b\n", 7), ("task-a\ntask-c x\n", 7), ("\n", 0),
+                             ("task-safe\nnot a task id\n", 10), ("task-a\ntastask-a\n", 7)):
             with self.subTest(text=text):
                 (self.work / "s").write_text(text)
                 with self.assertRaises(self.lc.LedgerError) as e:
@@ -1400,20 +1438,28 @@ class SettledIdsTest(Base):
         with self.assertRaises(self.lc.LedgerError):
             self.lc.SettledIds(self.work / "s")
 
-    def test_append_writes_every_byte_then_fsyncs_then_remembers(self):
+    def test_append_is_one_write_then_fsyncs_then_remembers_and_a_short_write_is_cut_and_re_appended(self):
         ids = self.lc.SettledIds(self.work / "s")
         real_write, order = os.write, []
 
-        def one_byte(fd, data):
+        def counted(fd, data):
             order.append("write")
-            return real_write(fd, data[:1])
-        with mock.patch.object(self.lc.os, "write", one_byte), \
+            return real_write(fd, data)
+        with mock.patch.object(self.lc.os, "write", counted), \
                 mock.patch.object(self.lc.os, "fsync", lambda fd: order.append("fsync")):
             ids.add("task-abc")
         self.assertEqual((self.work / "s").read_text(), "task-abc\n")
-        self.assertEqual(order.count("write"), len("task-abc\n"))
-        self.assertEqual(order[-2:], ["fsync", "fsync"], "the file, then its directory on creation")
+        self.assertEqual(order, ["write", "fsync", "fsync"], "one write, the file, then its directory on creation")
         self.assertIn("task-abc", ids)
+        with mock.patch.object(self.lc.os, "write", lambda fd, data: real_write(fd, data[:3])):
+            with self.assertRaises(self.lc.LedgerIOError):
+                ids.add("task-def")
+        self.assertEqual(((self.work / "s").read_bytes(), "task-def" in ids), (b"task-abc\ntas", False), "torn, not remembered")
+        stale = self.lc.SettledIds.__new__(self.lc.SettledIds)
+        stale.path, stale.ids, stale.durable = ids.path, {"task-abc"}, {"task-abc"}     # loaded before the torn write
+        stale.add("task-def")
+        self.assertEqual((self.work / "s").read_bytes(), b"task-abc\ntask-def\n", "the torn tail cut, the id re-appended once")
+        self.assertEqual(self.lc.SettledIds(self.work / "s").ids, {"task-abc", "task-def"})
         with self.assertRaises(self.lc.LedgerError):
             ids.add("../escape")
 
@@ -1517,6 +1563,176 @@ class SettledIdsTest(Base):
         self.assertEqual(order, ["add", "compact"])
         self.assertIn("task-a", self.lc.SettledIds(path).ids)
         self.assertFalse(again.claims.dir("task-a").exists())
+
+    def test_cloud_recovery_completes_a_settlement_and_is_settled_requires_it(self):
+        """The generic recovery and the cloud adapter's reader take the same repair-then-check: a SETTLED claim
+        whose ledger append failed (id absent, body left) or whose body unlink failed (id present, body left)
+        is complete after one recover(); is_settled repairs before it answers and never reports a debt final."""
+        life = self.life()
+        for tid, patch in (("task-a", (self.lc.SettledIds, "add", self.lc.LedgerIOError("cannot append"))),
+                           ("task-b", (self.lc.ClaimStore, "unstage", self.lc.StateIOError("cannot remove body")))):
+            self.run_to_outcome(life, tid)
+            with mock.patch.object(patch[0], patch[1], side_effect=patch[2]):
+                with self.assertRaises(self.lc.StateError):
+                    life.publish_and_settle(tid)
+            self.assertTrue((life.claims.dir(tid) / "body").is_file(), tid)
+            self.assertFalse(life.settlement_complete(tid))
+        self.assertEqual(("task-a" in life.settled, "task-b" in life.settled), (False, True))
+        again = self.life()
+        again.recover()
+        for tid in ("task-a", "task-b"):
+            self.assertEqual((again.settlement_complete(tid), (again.claims.dir(tid) / "body").exists()), (True, False), tid)
+            self.assertTrue(again.is_settled(tid))
+        self.assertFalse(again.is_settled("task-zz"))
+        self.run_to_outcome(life, "task-c")
+        with mock.patch.object(self.lc.ClaimStore, "unstage", side_effect=self.lc.StateIOError("cannot remove body")):
+            with self.assertRaises(self.lc.StateError):
+                life.publish_and_settle("task-c")
+            with self.assertRaises(self.lc.StateError):
+                self.life().is_settled("task-c")
+        self.assertTrue(self.life().is_settled("task-c"), "repaired before it answers")
+        self.assertFalse((life.claims.dir("task-c") / "body").exists())
+
+    def ledger_fsync_fails(self, path):
+        """os.fsync failing on the ledger file only (its directory and every other file sync as usual)."""
+        real = os.fsync
+
+        def fsync(fd):
+            st = os.fstat(fd)
+            led = os.stat(path) if os.path.exists(path) else None
+            if led and (st.st_dev, st.st_ino) == (led.st_dev, led.st_ino):
+                raise OSError(errno.EIO, "I/O error")
+            return real(fd)
+        return mock.patch.object(self.lc.os, "fsync", fsync)
+
+    def test_a_visible_ledger_id_counts_only_after_a_successful_sync_before_the_body_goes(self):
+        """The whole record lands and its fsync fails: the settlement is incomplete. A fresh Lifecycle that sees the
+        line syncs the ledger (successfully) before it removes the staged body or answers settled; while the sync
+        keeps failing it removes nothing and answers nothing final."""
+        life = self.life()
+        self.run_to_outcome(life)
+        path = self.work / "state" / "settled-ids"
+        with self.ledger_fsync_fails(path):
+            with self.assertRaises(self.lc.LedgerError):
+                life.publish_and_settle("task-a")
+        self.assertEqual(("task-a\n" in path.read_text(), (life.claims.dir("task-a") / "body").is_file()), (True, True))
+        with self.ledger_fsync_fails(path):
+            fresh = self.life()
+            self.assertFalse(fresh.settlement_complete("task-a"), "visible, not durable")
+            with self.assertRaises(self.lc.LedgerError):
+                fresh.publish_and_settle("task-a")
+            with self.assertRaises(self.lc.LedgerError):
+                fresh.is_settled("task-a")
+        self.assertTrue((life.claims.dir("task-a") / "body").is_file(), "nothing removed while the sync fails")
+        order, real_fsync, real_unstage = [], os.fsync, self.lc.ClaimStore.unstage
+        led = os.stat(path)
+
+        def fsync(fd):
+            real_fsync(fd)
+            st = os.fstat(fd)
+            if (st.st_dev, st.st_ino) == (led.st_dev, led.st_ino):
+                order.append("ledger synced")
+        with mock.patch.object(self.lc.os, "fsync", fsync), \
+                mock.patch.object(self.lc.ClaimStore, "unstage", lambda s, t: (order.append("body removed"), real_unstage(s, t))[1]):
+            fresh = self.life()
+            self.assertEqual(fresh.publish_and_settle("task-a"), "settled")
+        self.assertEqual(order[:2], ["ledger synced", "body removed"], "the sync first, then the body")
+        self.assertEqual(path.read_text().count("task-a\n"), 1)
+        self.assertTrue(fresh.settlement_complete("task-a"))
+
+    def test_durable_is_only_what_this_instances_fsync_covered_never_what_a_repair_re_read(self):
+        """The open-time read sees a torn tail and fsyncs; before its repair takes the flock another writer cuts
+        that tail and appends task-b (its own fsync failing). The repair re-reads task-b: visible, never durable."""
+        path = self.work / "s"
+        path.write_bytes(b"task-a\ntask-")
+        real_repair = self.lc.SettledIds._repair
+
+        def other_writer_first(led, fd):
+            with open(path, "r+b") as f:                # the other writer: cut, append, its fsync never succeeded
+                f.truncate(len(b"task-a\n"))
+                f.seek(0, 2)
+                f.write(b"task-b\n")
+            return real_repair(led, fd)
+        with mock.patch.object(self.lc.SettledIds, "_repair", other_writer_first):
+            ids = self.lc.SettledIds(path)
+        self.assertEqual((ids.ids, ids.durable), ({"task-a", "task-b"}, {"task-a"}))
+
+    def test_settlement_complete_counts_a_ledger_id_only_once_it_is_durable(self):
+        """A complete settlement read by a process whose ledger fsync fails: visible, not durable, not complete."""
+        life = self.life()
+        self.run_to_outcome(life)
+        self.assertEqual(life.publish_and_settle("task-a"), "settled")
+        self.assertTrue(self.life().settlement_complete("task-a"))
+        with self.ledger_fsync_fails(self.work / "state" / "settled-ids"):
+            fresh = self.life()
+        self.assertEqual(("task-a" in fresh.settled, fresh.settlement_complete("task-a")), (True, False))
+
+    def test_generation_recovery_compacts_only_over_a_complete_settlement(self):
+        """Even with the trailing ledger sync not standing guard, a dead generation's due SETTLED claim whose id is
+        visible but not durable (its sync failing) is kept by recovery: compaction is gated on the settlement."""
+        (self.work / "state").mkdir(parents=True, exist_ok=True)
+        life = self.life()
+        claims = life.claims
+        claims.save({"schema": 1, "task_id": "task-g", "attempt": 1, "created_at": 1.0, "phase": self.lc.SETTLED,
+                     "settled_at": self.clock() - self.lc.COMPACT_AFTER - 1, "claim_mode": self.lc.LOCAL,
+                     "generation": dict(GEN)})
+        with open(self.work / "state" / "settled-ids", "ab") as f:
+            f.write(b"task-g\n")
+        with self.ledger_fsync_fails(self.work / "state" / "settled-ids"), \
+                mock.patch.object(self.lc.SettledIds, "sync", lambda led: None):
+            again = self.life()
+            again.recover(generation=dict(GEN), proof=False)
+        self.assertIsNotNone(claims.load("task-g"), "kept: never compacted over an undurable id")
+        self.life().recover(generation=dict(GEN), proof=False)
+        self.assertIsNone(claims.load("task-g"), "compacted once the sync succeeds")
+
+    def test_compaction_never_runs_before_the_ledger_sync_succeeds(self):
+        """A due call-less claim whose id is visible but whose ledger sync fails: reconcile_unbound skips it (one
+        logged line) and the claim (the only other witness) is kept; once the sync succeeds it is compacted."""
+        life = self.life()
+        self.task("task-free")
+        life.complete_without_call("task-free", "refused\n", "not admitted")
+        life.claims.save(dict(life.claims.load("task-free"), settled_at=self.clock() - self.lc.COMPACT_AFTER - 1))
+        path = self.work / "state" / "settled-ids"
+        with self.ledger_fsync_fails(path):
+            self.life().reconcile_unbound()
+        self.assertIsNotNone(life.claims.load("task-free"), "kept: compaction never precedes a successful sync")
+        self.life().reconcile_unbound()
+        self.assertIsNone(life.claims.load("task-free"))
+        self.assertIn("task-free", self.lc.SettledIds(path).ids)
+
+    def test_cloud_recovery_skips_a_claim_whose_repair_fails_and_finishes_it_next_pass(self):
+        """One cloud claim's body unlink fails (EIO): the start completes, the others are reconciled, the failing
+        one is logged, kept (never compacted) and finished by the next pass. A local claim is never touched."""
+        life = self.life()
+        for tid in ("task-a", "task-b"):
+            self.run_to_outcome(life, tid)
+            with mock.patch.object(self.lc.SettledIds, "add", side_effect=self.lc.LedgerIOError("cannot append")):
+                with self.assertRaises(self.lc.StateError):
+                    life.publish_and_settle(tid)
+        local = self.lc.ClaimStore(self.work / "state" / "claims")
+        local.save({"schema": 1, "task_id": "task-l", "attempt": 1, "created_at": 1.0, "phase": self.lc.SETTLED,
+                    "settled_at": 1.0, "claim_mode": self.lc.LOCAL, "generation": {"pid": 1, "start": "x"}})
+        local.stage("task-l", b"the local owner's\n")
+        real_unstage, self.logs = self.lc.ClaimStore.unstage, []
+
+        def unstage(store, task_id):
+            if task_id == "task-b":
+                raise self.lc.StateIOError("cannot remove body ([Errno 5] I/O error)")
+            return real_unstage(store, task_id)
+        self.clock.t += 25 * 3600
+        with mock.patch.object(self.lc.ClaimStore, "unstage", unstage):
+            again = self.lc.Lifecycle(self.work, clock=self.clock, log=lambda *a: self.logs.append(" ".join(map(str, a))))
+            again.recover()
+        self.assertIsNone(again.claims.load("task-a"), "reconciled, then compacted")
+        self.assertTrue((again.claims.dir("task-b") / "body").is_file(), "skipped: kept, body left")
+        self.assertIsNotNone(again.claims.load("task-b"), "never compacted while incomplete")
+        self.assertEqual(len([m for m in self.logs if "settlement repair skipped" in m and "task-b" in m]), 1)
+        self.assertTrue((again.claims.dir("task-l") / "body").is_file(), "a local claim is left alone")
+        self.assertNotIn("task-l", again.settled)
+        self.life().recover()
+        self.assertIsNone(self.life().claims.load("task-b"), "finished by the next pass")
+        self.assertIn("task-b", self.lc.SettledIds(self.work / "state" / "settled-ids").ids)
 
     def test_compaction_never_truncates_the_settled_ids(self):
         life = self.life()
@@ -1918,17 +2134,28 @@ class BoundaryGuardTest(SpyMixin, unittest.TestCase):
                 found.append(node.value[:60])
         return found
 
+    # The one named exception: the claude-local Mod's lifecycle CLI. It is that adapter's only
+    # importer; every other claude_code module reaches the lifecycle through it.
+    LOCAL_INBOX = ("adapters", "claude_code", "inbox.py")
+
     @staticmethod
     def production_modules():
-        """Every production module outside the cloud-session adapter and the owner itself."""
+        """Every production module outside the cloud-session adapter, the local inbox CLI and the owner."""
         pkg = PKG_ROOT / "ag2_sparrow"
         for path in sorted(pkg.rglob("*.py")):
             rel = path.relative_to(pkg)
             if "__pycache__" in rel.parts or rel.parts[:2] == ("adapters", "claude_cloud_session"):
                 continue
-            if rel.name == "task_lifecycle.py":
+            if rel.name == "task_lifecycle.py" or rel.parts == BoundaryGuardTest.LOCAL_INBOX:
                 continue
             yield path
+
+    def test_the_local_inbox_cli_is_the_one_named_exception(self):
+        inbox = PKG_ROOT / "ag2_sparrow" / Path(*self.LOCAL_INBOX)
+        self.assertTrue(self.references(inbox), "the exception is real: the inbox CLI imports the owner")
+        names = {str(p.relative_to(PKG_ROOT)) for p in self.production_modules()}
+        self.assertIn("ag2_sparrow/adapters/claude_code/launcher.py", names, "the rest of the adapter is still scanned")
+        self.assertIn("ag2_sparrow/adapters/claude_code/hold.py", names)
 
     def test_nothing_outside_the_cloud_session_adapter_reaches_the_owner(self):
         modules = list(self.production_modules())
@@ -1968,6 +2195,42 @@ class BoundaryGuardTest(SpyMixin, unittest.TestCase):
 
 class ErrorBranchTest(Base):
     """The error and edge branches of the owner's helpers, driven with real files."""
+
+    def test_finish_staged_completes_only_with_the_recorded_verifying_body(self):
+        lc = self.lc
+        life = lc.Lifecycle(self.work, identity={"pid": 1, "start": 1}, lineage=lambda *a: True, log=lambda *a: None)
+        self.assertEqual(life.finish_staged("nope"), "parked")
+        store = life.claims
+        rec = {"schema": 1, "task_id": "t", "attempt": 1, "phase": lc.TURN_CONFIRMED, "claim_mode": lc.LOCAL,
+               "turn_id": "turn-1", "generation": {"pid": 1, "start": 1}}
+        store.save(rec)
+        self.assertEqual(life.finish_staged("t"), "parked", "no recorded descriptor")
+        body = b"answer\n"
+        identity = life._identity_of(rec, "turn-1")
+        name, _ = life._blob_name(rec, identity)
+        store.save(dict(rec, staged={"identity": identity, "length": len(body), "sha256": lc._sha256(body), "blob": name}))
+        self.assertEqual(life.finish_staged("t"), "parked", "the blob is missing")
+        (store.dir("t") / name).write_bytes(body)
+        self.assertEqual(life.finish_staged("t"), "staged")
+        self.assertEqual(store.load("t")["phase"], lc.RESULT_STAGED)
+
+    def test_a_rename_that_landed_is_committed_and_a_failed_write_is_io(self):
+        lc = self.lc
+        store = lc.ClaimStore(self.work / "claims")
+        with mock.patch.object(lc, "fsync_dir", side_effect=OSError(errno.EIO, "dir fsync")):
+            with self.assertRaises(lc.RenamedNotDurable):
+                lc.write_durable(self.work / "f", b"x")
+            self.assertEqual((self.work / "f").read_bytes(), b"x", "the rename landed")
+            (self.work / "claims" / "t").mkdir(parents=True)
+            with self.assertRaises(lc.StateCommitted):
+                store.save({"task_id": "t", "phase": "PREPARED"})
+            with self.assertRaises(lc.StateCommitted):
+                store.stage("t", b"body")
+        with mock.patch.object(lc, "write_durable", side_effect=OSError(errno.ENOSPC, "full")):
+            with self.assertRaises(lc.StateIOError):
+                store.save({"task_id": "t", "phase": "PREPARED"})
+            with self.assertRaises(lc.StateIOError):
+                store.stage("t", b"body")
 
     def test_helpers_report_missing_paths_and_log_to_stderr(self):
         lc = self.lc
@@ -2017,11 +2280,11 @@ class ErrorBranchTest(Base):
 
     def test_the_ledger_fails_closed_and_adds_once(self):
         path = self.work / "ids"
-        path.write_bytes(b"\xff\xfe\n")
+        path.write_bytes(b"\xff\xfe\ntask-a\n")
         with self.assertRaises(self.lc.LedgerError):
             self.lc.SettledIds(path)
         path.write_bytes(b"task-a\ntask-b")
-        with mock.patch.object(self.lc.os, "truncate", side_effect=OSError(errno.EPERM, "no")):
+        with mock.patch.object(self.lc.os, "ftruncate", side_effect=OSError(errno.EPERM, "no")):
             with self.assertRaises(self.lc.LedgerError):
                 self.lc.SettledIds(path)
         path.write_bytes(b"task-a\n")
@@ -2091,6 +2354,1009 @@ class ErrorBranchTest(Base):
         self.assertTrue((life.claims.root / "task-a").is_dir())
 
 
+# ── claim modes, the turn transitions and the staged commit ───────────────────
+
+GEN = {"pid": 2 ** 22 - 1, "start": "2026-01-01T00:00:00Z"}
+OTHER = {"pid": 2 ** 22 - 2, "start": "2026-01-01T00:00:01Z"}
+
+
+def main_lifecycle():
+    """The pre-claude-local task_lifecycle checked in as a fixture, as its own module; a missing
+    fixture is an error, never a skip."""
+    path = PKG_ROOT.parents[1] / "tests" / "fixtures" / "old_main" / "task_lifecycle_pre_local.py"
+    spec = importlib.util.spec_from_file_location("task_lifecycle_main", path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def snapshot(root):
+    """Every file under `root` with its bytes, so "nothing changed" is a byte comparison."""
+    out = {}
+    for base, _, names in os.walk(root):
+        for name in names:
+            p = Path(base) / name
+            try:
+                out[str(p.relative_to(root))] = p.read_bytes()
+            except OSError:
+                out[str(p.relative_to(root))] = None
+    return out
+
+
+class LocalClaimTest(Base):
+    """Claim modes, authorize_call, confirm_turn, stage_result's commit order, the parked rule,
+    mode-enforced recovery, the state allowlist and the format fence."""
+
+    def setUp(self):
+        super().setUp()
+        self.lineage = {}
+
+    def life(self, lineage=None, identity=None):
+        lc = self.lc.Lifecycle(self.work, clock=self.clock, log=self.logged,
+                               identity=identity, lineage=lineage or self.lineage.get)
+        return lc
+
+    def logged(self, *a):
+        self.logs = getattr(self, "logs", [])
+        self.logs.append(" ".join(map(str, a)))
+
+    def local_dir(self):
+        self.assertIsNone(self.lc.prepare_work_dir(str(self.work)))
+        self.lc.enable_local_format(str(self.work))
+
+    def claimed(self, life, tid="task-a", gen=GEN):
+        self.task(tid)
+        return life.prepare(tid, "interrupted\n", mode=self.lc.LOCAL, generation=gen)
+
+    def confirmed(self, life, tid="task-a", gen=GEN, text="hello"):
+        attempt = self.claimed(life, tid, gen)
+        h = self.lc._sha256(text.encode())
+        nonce = life.authorize_call(tid, attempt, text_hash=h)
+        life.confirm_turn(tid, "turn-1", nonce, h)
+        return attempt
+
+    def claim_bytes(self, tid="task-a"):
+        return (self.work / "state" / "claims" / tid / "claim.json").read_bytes()
+
+    # each recovery and fence branch, on both copies
+
+    def test_generation_recovery_settles_or_keeps_each_phase_exactly_once(self):
+        self.local_dir()
+        life = self.life()
+        for tid in ("task-gone", "task-done", "task-wait", "task-call", "task-lost", "task-new", "task-old"):
+            self.claimed(life, tid)
+        (self.work / "tasks" / "task-gone.txt").unlink()
+        self.results.mkdir(exist_ok=True)
+        (self.results / "task-done.txt").write_text("already\n")
+        for tid, phase in (("task-call", "CALLING"), ("task-lost", "OUTCOME_UNKNOWN"), ("task-new", "SOMETHING_NEW")):
+            life.claims.save(dict(life.claims.load(tid), phase=phase))
+        lost = {"identity": "i", "length": 1, "sha256": "0" * 64, "blob": "blob.1.absent"}
+        life.claims.save(dict(life.claims.load("task-lost"), staged=lost))
+        old = self.clock.t - self.lc.COMPACT_AFTER - 1
+        life.claims.save(dict(life.claims.load("task-old"), phase="SETTLED", settled_at=old))
+        self.logs = []
+        again = self.life(lineage=lambda pid, start: False)
+        again.recover(generation=GEN, proof=False)
+        phase = {t: (again.claims.load(t) or {}).get("phase") for t in
+                 ("task-gone", "task-done", "task-wait", "task-call", "task-lost", "task-new", "task-old")}
+        self.assertEqual(phase, {"task-gone": "SETTLED", "task-done": "SETTLED", "task-wait": "PREPARED",
+                                 "task-call": "SETTLED", "task-lost": "RESULT_STAGED", "task-new": "SOMETHING_NEW",
+                                 "task-old": None})
+        self.assertEqual((self.results / "task-call.txt").read_bytes(), b"interrupted\n", "counted, never resent")
+        self.assertFalse((self.results / "task-lost.txt").exists(), "no verified staged body: parked")
+        self.assertIn("task-old", again.settled, "re-recorded before it was compacted")
+        self.assertIn("a phase this reader does not know, left alone -> task-new SOMETHING_NEW", self.logs)
+        self.assertIn("no verified staged body; parked -> task-lost", self.logs)
+
+    def test_the_cloud_recovery_leaves_an_unknown_phase_alone(self):
+        life = self.life()
+        self.task()
+        life.prepare("task-a", "i\n")
+        life.claims.save(dict(life.claims.load("task-a"), phase="SOMETHING_NEW"))
+        self.logs = []
+        self.life(lineage=lambda pid, start: False).recover()
+        self.assertEqual(life.claims.load("task-a")["phase"], "SOMETHING_NEW")
+        self.assertIn("a phase this reader does not know, left alone -> task-a SOMETHING_NEW", self.logs)
+
+    def test_the_sweep_survives_an_unlistable_dir_a_vanished_temp_and_a_failed_unlink(self):
+        self.local_dir()
+        life = self.life()
+        self.confirmed(life)
+        d = self.work / "state" / "claims" / "task-a"
+        temp = d / (".task-a.1.%s.%d.deadbeef.tmp" % ("a" * 24, 2 ** 22 - 1))
+        temp.write_bytes(b"x")
+        real_listdir, real_unlink = os.listdir, os.unlink
+        self.logs = []
+        dead = self.life(lineage=lambda pid, start: False)
+        with mock.patch.object(self.lc.os, "listdir", lambda p=".": (_ for _ in ()).throw(OSError(errno.EIO, "io"))
+                               if str(p) == str(d) else real_listdir(p)):
+            dead._sweep_temps("task-a", self.clock.t)
+        with mock.patch.object(self.lc, "_lstat", return_value=None):
+            dead._sweep_temps("task-a", self.clock.t)
+        self.assertTrue(temp.exists(), "unlisted or vanished: nothing removed")
+
+        def unlink(p, **k):
+            if str(p) == str(temp):
+                raise OSError(errno.EBUSY, "busy")
+            return real_unlink(p, **k)
+        with mock.patch.object(self.lc.os, "unlink", unlink):
+            dead._sweep_temps("task-a", self.clock.t)
+        self.assertTrue(temp.exists())
+        self.assertTrue(any(x.startswith("a leftover temp could not be swept -> task-a") for x in self.logs), self.logs)
+
+    def test_an_unknown_format_marker_is_refused_at_startup_and_by_the_fence(self):
+        self.assertIsNone(self.lc.prepare_work_dir(str(self.work)))
+        (self.work / "state" / "format").write_text("ag2-sparrow-work-v99\n")
+        self.assertIn("says 'ag2-sparrow-work-v99'", self.lc.prepare_work_dir(str(self.work)))
+        with self.assertRaises(self.lc.StateError):
+            self.lc.enable_local_format(str(self.work))
+        (self.work / "state" / "format").unlink()
+        self.assertIsNone(self.life()._format(), "an absent marker reads as no format")
+
+    def test_the_fence_reports_a_marker_it_cannot_write(self):
+        self.assertIsNone(self.lc.prepare_work_dir(str(self.work)))
+        with mock.patch.object(self.lc, "write_durable", side_effect=OSError(errno.EROFS, "read-only")):
+            with self.assertRaises(self.lc.StateError) as e:
+                self.lc.enable_local_format(str(self.work))
+        self.assertIn("read-only", str(e.exception))
+
+    def test_a_blob_that_is_not_a_file_is_a_state_error_never_absent(self):
+        self.local_dir()
+        life = self.life()
+        self.confirmed(life)
+        (self.work / "state" / "claims" / "task-a" / "blob.x").mkdir()
+        self.assertIsNone(life.claims.blob("task-a", "blob.none"))
+        with self.assertRaises(self.lc.StateError):
+            life.claims.blob("task-a", "blob.x")
+
+    def test_staging_parks_a_claim_past_its_turn_and_a_result_that_reads_back_wrong(self):
+        self.local_dir()
+        life = self.life()
+        self.confirmed(life)
+        rec = life.claims.load("task-a")
+        life.claims.save(dict(rec, phase="OUTCOME_UNKNOWN"))
+        self.logs = []
+        self.assertEqual(life.stage_result("task-a", b"ok\n", "turn-1"), "parked")
+        self.assertIn("stage refused: claim is OUTCOME_UNKNOWN -> task-a", self.logs)
+        life.claims.save(rec)
+        with mock.patch.object(life, "_verified", return_value=None):
+            self.assertEqual(life.stage_result("task-a", b"ok\n", "turn-1"), "parked")
+        self.assertIn("the result read back does not verify; parked -> task-a", self.logs)
+        self.assertEqual(life.claims.load("task-a")["phase"], "TURN_CONFIRMED")
+
+    # claim modes and the PREPARED refusal
+
+    def test_claims_carry_their_mode_and_a_legacy_claim_re_prepares_as_today(self):
+        life = self.life(identity={"pid": 4242, "start": "s"})
+        self.task()
+        life.prepare("task-a", "i\n")
+        rec = life.claims.load("task-a")
+        self.assertEqual((rec["claim_mode"], rec["claim_version"], rec["writer"]),
+                         ("cloud", self.lc.CLAIM_VERSION, {"pid": 4242, "start": "s"}))
+        self.assertNotIn("generation", rec)
+        legacy = {k: v for k, v in rec.items() if k not in ("claim_mode", "claim_version", "writer")}
+        life.claims.save(legacy)
+        again = self.life(lineage=lambda pid, start: True)
+        self.assertEqual(again.prepare("task-a", "i\n"), 1, "no writer recorded: re-prepared as today")
+        self.assertEqual(again.claims.load("task-a")["writer"], again.identity)
+
+    def test_a_prepared_cloud_claim_is_refused_while_its_writer_is_live_or_unobserved(self):
+        a = self.life(identity={"pid": 4242, "start": "s"})
+        self.task()
+        a.prepare("task-a", "i\n")
+        before = self.claim_bytes()
+        for seen in (True, None):
+            with self.subTest(writer=seen):
+                b = self.life(lineage=lambda pid, start, seen=seen: seen, identity={"pid": 4343, "start": "t"})
+                with self.assertRaises(self.lc.AttemptInProgress):
+                    b.prepare("task-a", "i\n")
+                self.assertEqual(self.claim_bytes(), before, "refused with the claim's bytes unchanged")
+        b = self.life(lineage=lambda pid, start: False, identity={"pid": 4343, "start": "t"})
+        self.assertEqual(b.prepare("task-a", "i\n"), 1, "a dead writer's claim is re-prepared")
+        self.assertEqual(b.claims.load("task-a")["writer"], {"pid": 4343, "start": "t"})
+        self.assertEqual(a.identity, {"pid": 4242, "start": "s"})
+        own = self.life(lineage=lambda pid, start: True, identity={"pid": 4343, "start": "t"})
+        self.assertEqual(own.prepare("task-a", "i\n"), 1, "our own writer identity is never 'elsewhere'")
+
+    def test_the_default_liveness_admits_only_a_verified_dead_pid(self):
+        self.assertIs(self.lc._dead_or_unobserved(2 ** 22 - 1), False)
+        self.assertIsNone(self.lc._dead_or_unobserved(os.getpid()), "live is unobserved by default, never admitted")
+        self.assertIsNone(self.lc._dead_or_unobserved(2 ** 70))
+        life = self.lc.Lifecycle(self.work, clock=self.clock, log=quiet)
+        self.assertIs(life.lineage, self.lc._dead_or_unobserved)
+        self.assertEqual(life.identity, {"pid": os.getpid(), "start": None})
+
+    def test_a_local_claim_needs_the_fence_and_binds_to_its_generation(self):
+        life = self.life()
+        self.task()
+        self.assertIsNone(self.lc.prepare_work_dir(str(self.work)))
+        with self.assertRaises(self.lc.StateError) as e:
+            life.prepare("task-a", "i\n", mode=self.lc.LOCAL, generation=GEN)
+        self.assertIn("claude-local/1", e.exception.message)
+        self.assertIsNone(life.claims.load("task-a"), "no claim written without the fence")
+        with self.assertRaises(ValueError):
+            life.prepare("task-a", "i\n", mode=self.lc.LOCAL)
+        with self.assertRaises(ValueError):
+            life.prepare("task-a", "i\n", mode="other")
+        self.lc.enable_local_format(str(self.work))
+        self.assertEqual((self.work / "state" / "format").read_text(), "claude-local/1\n")
+        self.assertTrue((self.work / "state" / "claims.lock").is_file())
+        self.assertIsNone(self.lc.prepare_work_dir(str(self.work)), "the bumped dir is served by this binary")
+        self.assertEqual(life.prepare("task-a", "i\n", mode=self.lc.LOCAL, generation=GEN), 1)
+        rec = life.claims.load("task-a")
+        self.assertEqual((rec["claim_mode"], rec["generation"]), ("local", GEN))
+        self.assertNotIn("writer", rec)
+
+    def test_cli_a_claims_and_exits_while_the_consumer_lives_so_cli_b_refuses_with_unchanged_bytes(self):
+        self.local_dir()
+        a = self.life(lineage=lambda pid, start: True)
+        self.claimed(a)
+        before = self.claim_bytes()
+        b = self.life(lineage=lambda pid, start: True)
+        with self.assertRaises(self.lc.AttemptInProgress):
+            b.prepare("task-a", "i\n", mode=self.lc.LOCAL, generation=OTHER)
+        self.assertEqual(self.claim_bytes(), before)
+        c = self.life(lineage=lambda pid, start: None)
+        with self.assertRaises(self.lc.AttemptInProgress):
+            c.prepare("task-a", "i\n", mode=self.lc.LOCAL, generation=OTHER)
+        self.assertEqual(self.claim_bytes(), before, "unobserved refuses too")
+        same = self.life(lineage=lambda pid, start: True)
+        self.assertEqual(same.prepare("task-a", "i\n", mode=self.lc.LOCAL, generation=GEN), 1,
+                         "the same generation gets its attempt back")
+        self.assertEqual(self.claim_bytes(), before, "and nothing is rewritten")
+        dead = self.life(lineage=lambda pid, start: False)
+        self.assertEqual(dead.prepare("task-a", "i\n", mode=self.lc.LOCAL, generation=OTHER), 1)
+        self.assertEqual(dead.claims.load("task-a")["generation"], OTHER, "a dead generation's claim is re-prepared")
+
+    # authorize_call and confirm_turn
+
+    def test_two_authorize_calls_yield_one_token(self):
+        self.local_dir()
+        life = self.life()
+        attempt = self.claimed(life)
+        h = self.lc._sha256(b"hello")
+        self.assertIsNone(life.authorize_call("task-a", attempt + 1, text_hash=h), "another attempt never authorizes")
+        self.assertEqual(life.claims.load("task-a")["phase"], "PREPARED")
+        token = life.authorize_call("task-a", attempt, text_hash=h)
+        self.assertRegex(token, r"^[0-9a-f]{32}$")
+        rec = life.claims.load("task-a")
+        self.assertEqual((rec["phase"], rec["call"]["nonce"], rec["call"]["text_hash"]), ("CALLING", token, h))
+        self.assertIsNone(life.authorize_call("task-a", attempt, text_hash=h), "CALLING never authorizes a second submit")
+        self.assertIsNone(self.life().authorize_call("task-a", attempt, text_hash=h), "from another CLI either")
+        self.assertEqual(life.claims.load("task-a")["call"]["nonce"], token, "the one token stands")
+        self.assertIsNone(life.authorize_call("task-b", 1), "no claim, no token")
+
+    def test_confirm_turn_validates_the_nonce_and_hash_and_records_the_turn(self):
+        self.local_dir()
+        life = self.life()
+        attempt = self.claimed(life)
+        h = self.lc._sha256(b"hello")
+        with self.assertRaises(self.lc.TurnRefused):
+            life.confirm_turn("task-a", "turn-1", "x", h)
+        token = life.authorize_call("task-a", attempt, text_hash=h)
+        before = self.claim_bytes()
+        for nonce, hsh, turn in ((token[::-1], h, "turn-1"), (token, self.lc._sha256(b"other"), "turn-1"), (token, h, "")):
+            with self.subTest(nonce=nonce != token, hash=hsh != h, turn=turn):
+                with self.assertRaises(self.lc.TurnRefused):
+                    life.confirm_turn("task-a", turn, nonce, hsh)
+                self.assertEqual(self.claim_bytes(), before, "refused with the claim untouched")
+        life.confirm_turn("task-a", "turn-1", token, h)
+        rec = life.claims.load("task-a")
+        self.assertEqual((rec["phase"], rec["turn_id"]), ("TURN_CONFIRMED", "turn-1"))
+        self.assertEqual(list(life.journal.charges()), [("task-a", 1)], "the turn is the charge")
+        with self.assertRaises(self.lc.TurnRefused):
+            life.confirm_turn("task-a", "turn-2", token, h)
+        self.assertEqual(life.claims.load("task-a")["turn_id"], "turn-1", "one confirmation per call")
+        legacy = self.life()
+        self.task("task-b")
+        n = legacy.prepare("task-b", "i\n")
+        legacy.mark_calling("task-b", n)
+        with self.assertRaises(self.lc.TurnRefused):
+            legacy.confirm_turn("task-b", "turn-9", "", "")
+
+    # stage_result: the six-step order and the parked rule
+
+    def test_stage_result_follows_the_six_step_commit_order(self):
+        self.local_dir()
+        life = self.life()
+        self.confirmed(life)
+        events = []
+        real_link, real_read = os.link, self.lc._read_strict
+
+        def link(a, b, **k):
+            events.append("link " + Path(b).name)
+            return real_link(a, b, **k)
+
+        def read(p):
+            if Path(p).name.startswith("blob."):
+                events.append("read " + Path(p).name)
+            return real_read(p)
+        with contextlib.ExitStack() as stack:
+            for patch in durable_events(self.lc, events):
+                stack.enter_context(patch)
+            stack.enter_context(mock.patch.object(self.lc.os, "link", link))
+            stack.enter_context(mock.patch.object(self.lc, "_read_strict", read))
+            self.assertEqual(life.stage_result("task-a", b"the answer\n", "turn-1"), "staged")
+        rec = life.claims.load("task-a")
+        blob = rec["staged"]["blob"]
+        self.assertEqual(events, ["fsync <temp>", "replace claim.json", "dir task-a", "fsync <temp>", "link " + blob,
+                                  "dir task-a", "read " + blob, "fsync <temp>", "replace claim.json", "dir task-a"],
+                         "descriptor, temp, link, directory, verify, phase")
+        self.assertEqual((rec["phase"], rec["staged"]["identity"], rec["staged"]["length"]),
+                         ("RESULT_STAGED", {"task_id": "task-a", "attempt": 1, "generation": GEN, "turn_id": "turn-1"}, 11))
+        self.assertEqual(rec["staged"]["sha256"], self.lc._sha256(b"the answer\n"))
+        d = self.work / "state" / "claims" / "task-a"
+        self.assertEqual(sorted(os.listdir(d)), [blob, "claim.json"], "no temp outlives the call")
+        self.assertEqual((d / blob).read_bytes(), b"the answer\n")
+        self.assertEqual(life.publish_and_settle("task-a"), "settled")
+        self.assertEqual((self.results / "task-a.txt").read_bytes(), b"the answer\n")
+        self.assertTrue((d / blob).exists(), "the committed body is immutable; compaction removes the claim")
+
+    def test_same_different_corrupt_and_duplicate_candidates(self):
+        self.local_dir()
+        life = self.life()
+        self.confirmed(life)
+        self.assertEqual(life.stage_result("task-a", b"first\n", "turn-2"), "parked", "not the recorded turn")
+        self.assertEqual(life.claims.load("task-a")["phase"], "TURN_CONFIRMED")
+        self.assertEqual(life.stage_result("task-a", b"first\n", "turn-1"), "staged")
+        d = self.work / "state" / "claims" / "task-a"
+        blob = life.claims.load("task-a")["staged"]["blob"]
+        self.assertEqual(life.stage_result("task-a", b"first\n", "turn-1"), "staged", "an identical retry finishes")
+        self.assertEqual(life.stage_result("task-a", b"second\n", "turn-1"), "parked", "different bytes park")
+        self.assertEqual((d / blob).read_bytes(), b"first\n", "with the original intact")
+        self.assertEqual(life.claims.load("task-a")["phase"], "RESULT_STAGED")
+        # a retry that finds a final with other bytes (a corrupt or foreign candidate) parks the claim
+        self.setUp()
+        self.local_dir()
+        life = self.life()
+        self.confirmed(life)
+        before = self.claim_bytes()
+        with mock.patch.object(self.lc.Lifecycle, "_commit_blob", side_effect=Crash):
+            with self.assertRaises(Crash):
+                life.stage_result("task-a", b"first\n", "turn-1")
+        rec = life.claims.load("task-a")
+        self.assertEqual(rec["phase"], "TURN_CONFIRMED", "the descriptor is anchored first")
+        (self.work / "state" / "claims" / "task-a" / rec["staged"]["blob"]).write_bytes(b"corrupt\n")
+        self.assertEqual(life.stage_result("task-a", b"first\n", "turn-1"), "parked", "a corrupt final parks")
+        self.assertEqual(life.claims.load("task-a")["phase"], "TURN_CONFIRMED")
+        self.assertEqual((self.work / "state" / "claims" / "task-a" / rec["staged"]["blob"]).read_bytes(), b"corrupt\n")
+        self.assertEqual(life.stage_result("task-a", b"second\n", "turn-1"), "parked", "a second candidate parks")
+        self.assertNotEqual(self.claim_bytes(), before)
+        self.assertEqual(life.claims.load("task-a")["staged"]["sha256"], self.lc._sha256(b"first\n"),
+                         "the first descriptor stands")
+        self.assertFalse((self.results / "task-a.txt").exists())
+        self.assertEqual(life.publish_and_settle("task-a"), "parked")
+        again = self.life(lineage=lambda pid, start: False)
+        again.recover(generation=GEN, proof=False)
+        rec = again.claims.load("task-a")
+        self.assertEqual((rec["phase"], rec["outcome"]["detail"]),
+                         ("SETTLED", "turn confirmed, no result (the committed result does not match its descriptor)"),
+                         "once nobody will stage again, a mismatched blob is answered as interrupted, never kept parked")
+        self.assertEqual((self.results / "task-a.txt").read_bytes(), b"interrupted\n", "and never delivered")
+
+    def test_the_existing_final_path_fsyncs_the_directory_before_the_phase_and_parks_while_it_fails(self):
+        self.local_dir()
+        life = self.life()
+        self.confirmed(life)
+        d = self.work / "state" / "claims" / "task-a"
+        real = self.lc.fsync_dir
+
+        def crash_after_the_link(path):
+            if any(n.startswith("blob.") for n in os.listdir(d)):
+                raise Crash
+            return real(path)
+        with mock.patch.object(self.lc, "fsync_dir", crash_after_the_link):
+            with self.assertRaises(Crash):
+                life.stage_result("task-a", b"body\n", "turn-1")
+        rec = life.claims.load("task-a")
+        self.assertTrue((d / rec["staged"]["blob"]).exists(), "the final was linked, its directory not yet synced")
+        self.assertEqual(rec["phase"], "TURN_CONFIRMED")
+
+        def failing(path):
+            if Path(path).name == "task-a":
+                raise OSError(errno.EIO, "fsync failed")
+            return real(path)
+        with mock.patch.object(self.lc, "fsync_dir", failing):
+            for _ in range(2):
+                self.assertEqual(life.stage_result("task-a", b"body\n", "turn-1"), "parked")
+                self.assertEqual(life.claims.load("task-a")["phase"], "TURN_CONFIRMED", "stays while the fsync fails")
+                self.assertEqual(life.publish_and_settle("task-a"), "parked")
+                self.assertFalse((self.results / "task-a.txt").exists(), "zero publication")
+        events = []
+        with contextlib.ExitStack() as stack:
+            for patch in durable_events(self.lc, events):
+                stack.enter_context(patch)
+            self.assertEqual(life.stage_result("task-a", b"body\n", "turn-1"), "staged")
+        self.assertEqual(events[events.index("dir task-a"):], ["dir task-a", "fsync <temp>", "replace claim.json", "dir task-a"],
+                         "the existing final's directory is fsynced before RESULT_STAGED is saved")
+        self.assertEqual(life.publish_and_settle("task-a"), "settled")
+        self.assertEqual((self.results / "task-a.txt").read_bytes(), b"body\n")
+
+    def kill_at(self, boundary):
+        """Run stage_result to the named boundary and die there; returns the claim's phase at death."""
+        self.setUp()
+        self.local_dir()
+        life = self.life()
+        self.confirmed(life)
+        saves = []
+        real_save, real_link, real_fsync, real_verified = (self.lc.ClaimStore.save, os.link, self.lc.fsync_dir,
+                                                          self.lc.Lifecycle._verified)
+
+        def save(store, rec):
+            real_save(store, rec)
+            saves.append(rec["phase"])
+            if boundary == "descriptor" and rec["phase"] == "TURN_CONFIRMED" and rec.get("staged"):
+                raise Crash
+            if boundary == "phase" and rec["phase"] == "RESULT_STAGED":
+                raise Crash
+
+        def link(a, b, **k):
+            if boundary == "temp":
+                raise Crash
+            real_link(a, b, **k)
+            if boundary == "link":
+                raise Crash
+
+        def fsync(path):
+            real_fsync(path)
+            if boundary == "dirsync" and Path(path).name == "task-a" and saves == ["TURN_CONFIRMED"]:
+                raise Crash
+
+        def verified(lc, task_id, descriptor):
+            out = real_verified(lc, task_id, descriptor)
+            if boundary == "verify":
+                raise Crash
+            return out
+        with mock.patch.object(self.lc.ClaimStore, "save", save), mock.patch.object(self.lc.os, "link", link), \
+                mock.patch.object(self.lc, "fsync_dir", fsync), mock.patch.object(self.lc.Lifecycle, "_verified", verified):
+            with self.assertRaises(Crash):
+                life.stage_result("task-a", b"body\n", "turn-1")
+        return life.claims.load("task-a")["phase"]
+
+    def test_a_writer_killed_between_the_temp_fsync_and_the_link_then_a_same_bytes_retry_stages(self):
+        """A real kill leaves the fsynced temp behind (no finally runs); the retry writes its own temp,
+        links the final and stages; the dead writer's temp is swept, never taken for the final."""
+        self.local_dir()
+        life = self.life()
+        self.confirmed(life)
+        d = self.work / "state" / "claims" / "task-a"
+        pid = os.fork()
+        if pid == 0:                                    # the writer, killed at the link
+            try:
+                self.lc.os.link = lambda *a, **k: os.kill(os.getpid(), signal.SIGKILL)
+                life.stage_result("task-a", b"body\n", "turn-1")
+            finally:
+                os._exit(3)
+        _, status = os.waitpid(pid, 0)
+        self.assertTrue(os.WIFSIGNALED(status) and os.WTERMSIG(status) == signal.SIGKILL, status)
+        left = [n for n in os.listdir(d) if n.endswith(".tmp")]
+        self.assertEqual(len(left), 1, "the killed writer's fsynced temp is left")
+        self.assertEqual((d / left[0]).read_bytes(), b"body\n")
+        self.assertFalse(any(n.startswith("blob.") for n in os.listdir(d)), "no final was linked")
+        rec = life.claims.load("task-a")
+        self.assertEqual((rec["phase"], rec["staged"]["sha256"]), ("TURN_CONFIRMED", self.lc._sha256(b"body\n")))
+        again = self.life(lineage=lambda p, start: False if p == pid else None)
+        self.assertEqual(again.stage_result("task-a", b"body\n", "turn-1"), "staged", "the same bytes finish")
+        self.assertEqual((d / rec["staged"]["blob"]).read_bytes(), b"body\n")
+        self.assertEqual(again.stage_result("task-a", b"other\n", "turn-1"), "parked", "different bytes never")
+        again._sweep_temps("task-a", time.time())
+        self.assertEqual([n for n in os.listdir(d) if n.endswith(".tmp")], [], "the dead writer's temp is swept")
+        self.assertEqual(again.publish_and_settle("task-a"), "settled")
+        self.assertEqual((self.results / "task-a.txt").read_bytes(), b"body\n")
+
+    def test_a_kill_at_each_of_the_six_boundaries_is_recovered_twice(self):
+        for boundary, expect in (("descriptor", b"interrupted\n"), ("temp", b"interrupted\n"), ("link", b"body\n"),
+                                 ("dirsync", b"body\n"), ("verify", b"body\n"), ("phase", b"body\n")):
+            with self.subTest(boundary=boundary):
+                phase = self.kill_at(boundary)
+                self.assertEqual(phase, "RESULT_STAGED" if boundary == "phase" else "TURN_CONFIRMED")
+                d = self.work / "state" / "claims" / "task-a"
+                temps = [n for n in os.listdir(d) if n.endswith(".tmp")]
+                self.assertEqual(temps, [], "a temp never outlives the call")
+                again = self.life(lineage=lambda pid, start: False)
+                self.assertEqual(again.recover(now=None), None)
+                self.assertEqual(again.claims.load("task-a")["phase"], phase, "the cloud path leaves a local claim alone")
+                again.recover(generation=OTHER, proof=False)
+                self.assertEqual(again.claims.load("task-a")["phase"], phase, "another generation's path leaves it alone")
+                again.recover(generation=GEN, proof=False)
+                self.assertEqual((self.results / "task-a.txt").read_bytes(), expect)
+                self.assertEqual(again.claims.load("task-a")["phase"], "SETTLED")
+                self.assertIn("task-a", again.settled)
+                before = snapshot(self.work)
+                self.life(lineage=lambda pid, start: False).recover(generation=GEN, proof=False)
+                self.assertEqual(snapshot(self.work), before, "the second recovery changes nothing")
+                self.assertEqual([n for n in os.listdir(self.results) if n.startswith("task-a")], ["task-a.txt"],
+                                 "published exactly once")
+
+    def test_the_sweep_removes_only_a_dead_or_stale_temp_and_fsyncs_after_each(self):
+        self.local_dir()
+        life = self.life()
+        self.confirmed(life)
+        d = self.work / "state" / "claims" / "task-a"
+        digest = "a" * 24
+        dead = d / (".task-a.1.%s.%d.deadbeef.tmp" % (digest, 2 ** 22 - 1))
+        live = d / (".task-a.1.%s.%d.cafebabe.tmp" % (digest, 4242))
+        stale = d / (".task-a.1.%s.%d.0badf00d.tmp" % (digest, 4343))
+        final = d / ("blob.1.%s" % digest)
+        for p in (dead, live, stale, final):
+            p.write_bytes(b"x")
+        old = self.clock.t - self.lc.TEMP_SWEEP_AFTER - 1
+        os.utime(stale, (old, old))
+        os.utime(final, (old, old))
+        os.utime(live, (self.clock.t, self.clock.t))        # young on the lifecycle's clock
+        os.utime(dead, (self.clock.t, self.clock.t))        # young too: swept for its dead pid alone
+        events = []
+        lineage = lambda pid, start: False if pid == 2 ** 22 - 1 else None  # noqa: E731
+        real_unlink = os.unlink
+        with contextlib.ExitStack() as stack:
+            for patch in durable_events(self.lc, events):
+                stack.enter_context(patch)
+            stack.enter_context(mock.patch.object(self.lc.os, "unlink",
+                                                  lambda p, **k: (events.append("unlink " + Path(p).name), real_unlink(p, **k))[1]))
+            self.life(lineage=lineage).recover(generation=GEN, proof=False)
+        self.assertFalse(dead.exists(), "a dead writer's temp is swept")
+        self.assertFalse(stale.exists(), "an over-age temp is swept")
+        self.assertTrue(live.exists(), "a live (unobserved) writer's young temp is spared")
+        self.assertTrue(final.exists(), "never a final")
+        swept = [i for i, e in enumerate(events) if e in ("unlink " + dead.name, "unlink " + stale.name)]
+        self.assertEqual(len(swept), 2, events)
+        for i in swept:
+            self.assertEqual(events[i + 1], "dir task-a", "each sweep unlink is followed by a directory fsync: %s" % events[i:i + 2])
+        self.assertEqual(life.claims.load("task-a")["phase"], "SETTLED")
+
+    # the parked rule and mode enforcement
+
+    def test_publish_and_settle_is_parked_for_a_phase_it_did_not_advance(self):
+        self.local_dir()
+        life = self.life()
+        self.confirmed(life)
+        self.assertEqual(life.publish_and_settle("task-a"), "parked", "TURN_CONFIRMED")
+        self.assertEqual(life.publish_and_settle("task-zz"), "parked", "no claim")
+        rec = life.claims.load("task-a")
+        life.claims.save(dict(rec, phase="SOMETHING_NEW"))
+        self.assertEqual(life.publish_and_settle("task-a"), "parked", "an unknown phase")
+        self.assertFalse((self.results / "task-a.txt").exists())
+        life.claims.save(rec)
+        self.assertEqual(life.stage_result("task-a", b"ok\n", "turn-1"), "staged")
+        with mock.patch.object(life, "_publish", side_effect=OSError(errno.EACCES, "Permission denied")):
+            self.assertEqual(life.publish_and_settle("task-a"), "parked", "an I/O failure parks by default")
+            with self.assertRaises(self.lc.StateIOError) as ctx:
+                life.publish_and_settle("task-a", io_raises=True)
+        self.assertIn("cannot publish %s" % (self.results / "task-a.txt"), str(ctx.exception))
+        self.assertEqual(life.claims.load("task-a")["phase"], self.lc.RESULT_STAGED, "the claim is as it was")
+        self.assertEqual(life.publish_and_settle("task-a"), "settled")
+        self.assertEqual(life.publish_and_settle("task-a"), "settled", "already SETTLED stays settled")
+        self.assertEqual(life.publish_and_settle("task-a", io_raises=True), "settled", "and raises nothing there")
+
+    def test_interrupt_turn_answers_a_confirmed_local_claim_in_place_of_what_it_recorded(self):
+        """The one move recovery and a live generation's lost claim share: TURN_CONFIRMED -> the interrupted
+        body staged, the descriptor dropped, the detail recorded; any other claim is left as it is."""
+        self.local_dir()
+        life = self.life()
+        self.confirmed(life)
+        with mock.patch.object(self.lc.os, "link", side_effect=OSError(errno.ENOSPC, "No space left on device")):
+            self.assertEqual(life.stage_result("task-a", b"accepted\n", "turn-1"), "parked")
+        self.assertTrue(life.claims.load("task-a").get("staged"), "a descriptor with no blob")
+        self.assertEqual(life.interrupt_turn("task-a", "the accepted answer's staging was lost"), "staged")
+        rec = life.claims.load("task-a")
+        self.assertEqual((rec["phase"], rec["staged"], rec["outcome"]["kind"], rec["outcome"]["detail"]),
+                         (self.lc.RESULT_STAGED, None, "unknown", "the accepted answer's staging was lost"))
+        self.assertEqual(rec["outcome"]["at"], self.clock(), "the clock's now by default")
+        self.assertEqual(life.publish_and_settle("task-a"), "settled")
+        self.assertEqual((self.results / "task-a.txt").read_bytes(), b"interrupted\n", "the interrupted body, nothing else")
+        self.assertEqual(life.interrupt_turn("task-a", "again"), "parked", "SETTLED is not a confirmed turn")
+        self.claimed(life, "task-b")
+        before = self.claim_bytes("task-b")
+        self.assertEqual(life.interrupt_turn("task-b", "x"), "parked", "PREPARED is left alone")
+        self.assertEqual(self.claim_bytes("task-b"), before)
+        self.assertEqual(life.interrupt_turn("task-zz", "x"), "parked", "no claim")
+        self.task("task-c")
+        life.prepare("task-c", "ic\n")
+        self.assertEqual(life.interrupt_turn("task-c", "x"), "parked", "a cloud claim is never a local turn")
+
+    def test_interrupt_turn_is_one_durable_transition_and_a_committed_outcome_unknown_is_resumed(self):
+        """A directory fsync that fails after the claim.json rename answers StateCommitted with RESULT_STAGED on
+        disk (no intermediate phase); resume_outcome moves a committed OUTCOME_UNKNOWN to RESULT_STAGED and
+        recovery takes that one move; both then publish the durable interrupted body."""
+        self.local_dir()
+        life = self.life()
+        self.confirmed(life, "task-fs")
+        real_replace, real_fsync_dir, last, hits = os.replace, self.lc.fsync_dir, [], []
+
+        def replace_noting(src, dst):
+            last[:] = [Path(dst).name]
+            return real_replace(src, dst)
+
+        def fsync_dir_eio_after_claim_rename(path):
+            if last == ["claim.json"] and not hits:
+                hits.append(path)
+                raise OSError(errno.EIO, "I/O error")
+            return real_fsync_dir(path)
+        with mock.patch.object(self.lc.os, "replace", replace_noting), \
+                mock.patch.object(self.lc, "fsync_dir", fsync_dir_eio_after_claim_rename):
+            with self.assertRaises(self.lc.StateCommitted):
+                life.interrupt_turn("task-fs", "turn confirmed, no result")
+        rec = life.claims.load("task-fs")
+        self.assertEqual((len(hits), rec["phase"], rec["staged"], rec["outcome"]["detail"]),
+                         (1, self.lc.RESULT_STAGED, None, "turn confirmed, no result"), "one transition landed")
+        self.assertEqual(life.publish_and_settle("task-fs"), "settled")
+        self.assertEqual((self.results / "task-fs.txt").read_bytes(), b"interrupted\n")
+        self.confirmed(life, "task-ou")
+        rec = life.claims.load("task-ou")
+        life.claims.stage("task-ou", b"interrupted\n")
+        life.claims.save(dict(rec, phase=self.lc.OUTCOME_UNKNOWN, staged=None, outcome={"kind": "unknown", "detail": "older", "at": 1.0}))
+        self.assertEqual(life.resume_outcome("task-ou"), "staged")
+        self.assertEqual(life.claims.load("task-ou")["phase"], self.lc.RESULT_STAGED)
+        self.assertEqual(life.resume_outcome("task-ou"), "parked", "only OUTCOME_UNKNOWN is resumed")
+        self.assertEqual(life.publish_and_settle("task-ou"), "settled")
+        self.assertEqual((self.results / "task-ou.txt").read_bytes(), b"interrupted\n")
+        self.confirmed(life, "task-rec")
+        rec = life.claims.load("task-rec")
+        life.claims.stage("task-rec", b"interrupted\n")
+        life.claims.save(dict(rec, phase=self.lc.OUTCOME_UNKNOWN, staged=None, outcome={"kind": "unknown", "detail": "older", "at": 1.0}))
+        again = self.life(lineage=lambda pid, start: False)
+        with mock.patch.object(self.lc.Lifecycle, "resume_outcome", wraps=again.resume_outcome) as resumed:
+            again.recover(generation=GEN, proof=False)
+        self.assertEqual([c.args[:1] for c in resumed.call_args_list], [("task-rec",)], "recovery takes the one move")
+        self.assertEqual((self.results / "task-rec.txt").read_bytes(), b"interrupted\n")
+        self.assertEqual(again.claims.load("task-rec")["phase"], self.lc.SETTLED)
+        self.task("task-cloud")
+        life.prepare("task-cloud", "ic\n")
+        self.assertEqual(life.resume_outcome("task-cloud"), "parked", "a cloud claim is never resumed here")
+
+    def corrupt_blob(self, life, tid):
+        """A committed blob whose bytes no longer match the claim's descriptor, the phase rolled back to
+        TURN_CONFIRMED as if the move's last save never landed."""
+        rec = life.claims.load(tid)
+        life.claims.save(dict(rec, phase=self.lc.TURN_CONFIRMED))
+        (life.claims.dir(tid) / rec["staged"]["blob"]).write_bytes(b"not those bytes\n")
+
+    def test_close_turn_is_the_one_decision_for_a_confirmed_turn_nobody_stages_again(self):
+        """Verifying blob -> finished (published as recorded); no blob, or a committed blob that does not
+        match its descriptor -> interrupted, the detail naming the mismatch, never those bytes; a verifying
+        blob is never written again (finished with the blob writer failing); a claim save that fails raises,
+        nothing moved; not such a turn -> parked."""
+        self.local_dir()
+        life = self.life()
+        self.confirmed(life, "task-ok")
+        self.assertEqual(life.stage_result("task-ok", b"recorded\n", "turn-1"), "staged")
+        life.claims.save(dict(life.claims.load("task-ok"), phase=self.lc.TURN_CONFIRMED))
+        self.assertEqual(life.close_turn("task-ok", "lost"), "finished")
+        self.assertEqual(life.publish_and_settle("task-ok"), "settled")
+        self.assertEqual((self.results / "task-ok.txt").read_bytes(), b"recorded\n")
+        self.confirmed(life, "task-io")
+        self.assertEqual(life.stage_result("task-io", b"recorded\n", "turn-1"), "staged")
+        life.claims.save(dict(life.claims.load("task-io"), phase=self.lc.TURN_CONFIRMED))
+        before = self.claim_bytes("task-io")
+        with mock.patch.object(self.lc, "write_durable", side_effect=OSError(errno.EIO, "I/O error")):
+            with self.assertRaises(self.lc.StateIOError):
+                life.close_turn("task-io", "lost")
+        self.assertEqual(self.claim_bytes("task-io"), before, "a save that fails moves nothing")
+        with mock.patch.object(self.lc.Lifecycle, "_commit_blob", side_effect=OSError(errno.EIO, "I/O error")) as blob:
+            self.assertEqual(life.close_turn("task-io", "lost"), "finished", "the verified blob is final: no blob write")
+        self.assertEqual((blob.call_count, life.claims.load("task-io")["phase"]), (0, self.lc.RESULT_STAGED))
+        self.confirmed(life, "task-none")
+        with mock.patch.object(self.lc.os, "link", side_effect=OSError(errno.ENOSPC, "No space left on device")):
+            self.assertEqual(life.stage_result("task-none", b"accepted\n", "turn-1"), "parked")
+        self.assertEqual(life.close_turn("task-none", "turn confirmed, no result"), "interrupted")
+        self.assertEqual(life.claims.load("task-none")["outcome"]["detail"], "turn confirmed, no result")
+        self.confirmed(life, "task-bad")
+        self.assertEqual(life.stage_result("task-bad", b"recorded\n", "turn-1"), "staged")
+        self.corrupt_blob(life, "task-bad")
+        self.logs = []
+        self.assertEqual(life.close_turn("task-bad", "turn confirmed, no result"), "interrupted")
+        rec = life.claims.load("task-bad")
+        self.assertEqual((rec["phase"], rec["staged"], rec["outcome"]["detail"]),
+                         (self.lc.RESULT_STAGED, None, "turn confirmed, no result (the committed result does not match its descriptor)"))
+        self.assertIn("a committed result does not match its descriptor; answered as interrupted -> task-bad", self.logs)
+        self.assertEqual(life.publish_and_settle("task-bad"), "settled")
+        self.assertEqual((self.results / "task-bad.txt").read_bytes(), b"interrupted\n", "never the bytes that do not verify")
+        self.assertEqual(life.close_turn("task-bad", "x"), "parked", "SETTLED is not a confirmed turn")
+        self.claimed(life, "task-prep")
+        self.assertEqual(life.close_turn("task-prep", "x"), "parked")
+        self.assertEqual(life.close_turn("task-zz", "x"), "parked", "no claim")
+
+    def test_generation_recovery_answers_a_mismatched_committed_blob_as_interrupted_through_close_turn(self):
+        """The same state through the other caller: a dead generation's TURN_CONFIRMED claim whose committed
+        blob does not verify is answered as interrupted (the detail naming it), never parked with the
+        descriptor kept, and never delivered."""
+        self.local_dir()
+        life = self.life()
+        self.confirmed(life, "task-bad")
+        self.assertEqual(life.stage_result("task-bad", b"recorded\n", "turn-1"), "staged")
+        self.corrupt_blob(life, "task-bad")
+        again = self.life(lineage=lambda pid, start: False)
+        with mock.patch.object(self.lc.Lifecycle, "close_turn", wraps=again.close_turn) as closed:
+            again.recover(generation=GEN, proof=False)
+        self.assertEqual([c.args[:2] for c in closed.call_args_list], [("task-bad", "turn confirmed, no result")],
+                         "recovery takes the one decision")
+        rec = again.claims.load("task-bad")
+        self.assertEqual((rec["phase"], rec["staged"], rec["outcome"]["detail"]),
+                         (self.lc.SETTLED, None, "turn confirmed, no result (the committed result does not match its descriptor)"))
+        self.assertEqual((self.results / "task-bad.txt").read_bytes(), b"interrupted\n")
+        self.assertEqual(sorted(again.settled.ids), ["task-bad"])
+
+    def test_reconcile_unbound_takes_only_claims_no_generation_owns(self):
+        """reconcile_unbound is for claims answered without a call: a SETTLED claim bound to a generation (live
+        or another) is its generation's recovery to repair and compact, never this pass's, even when due."""
+        self.local_dir()
+        life = self.life()
+        old = self.clock() - self.lc.COMPACT_AFTER - 1
+        for tid, gen in (("task-live", GEN), ("task-other", {"pid": 2 ** 22 - 1, "start": "gone"})):
+            self.confirmed(life, tid, gen=gen)
+            life.claims.save(dict(life.claims.load(tid), phase=self.lc.SETTLED, settled_at=old))
+            life.claims.stage(tid, b"left for its generation\n")
+        self.task("task-free")
+        life.complete_without_call("task-free", "refused\n", "not admitted")
+        life.claims.save(dict(life.claims.load("task-free"), settled_at=old))
+        with mock.patch.object(self.lc.Lifecycle, "reconcile_settled", wraps=life.reconcile_settled) as repaired:
+            life.reconcile_unbound()
+        self.assertEqual([c.args[:1] for c in repaired.call_args_list], [("task-free",)], "only the call-less claim")
+        self.assertIsNone(life.claims.load("task-free"), "the call-less claim compacts once due")
+        for tid in ("task-live", "task-other"):
+            self.assertEqual(life.claims.load(tid)["phase"], self.lc.SETTLED, "a generation's claim is left: %s" % tid)
+            self.assertTrue((life.claims.dir(tid) / "body").is_file(), tid)
+
+    def test_reconcile_settled_completes_a_settlement_whose_ledger_append_failed(self):
+        """_settle saves SETTLED, then appends the id and removes the staged body; an append that fails leaves
+        SETTLED without the id. reconcile_settled finishes both, idempotently; anything not SETTLED is False."""
+        self.local_dir()
+        life = self.life()
+        self.confirmed(life, "task-led")
+        self.assertEqual(life.stage_result("task-led", b"answer\n", "turn-1"), "staged")
+        life.claims.stage("task-led", b"a legacy staged body\n")      # a real file, so an unstage that does nothing fails
+        with mock.patch.object(self.lc.SettledIds, "add", side_effect=self.lc.LedgerIOError("cannot append")):
+            with self.assertRaises(self.lc.LedgerIOError):
+                life.publish_and_settle("task-led")
+        self.assertEqual((life.claims.load("task-led")["phase"], "task-led" in life.settled), (self.lc.SETTLED, False))
+        self.assertTrue((life.claims.dir("task-led") / "body").is_file())
+        self.assertFalse(life.settlement_complete("task-led"))
+        self.assertTrue(life.reconcile_settled("task-led"))
+        self.assertTrue(life.reconcile_settled("task-led"), "idempotent")
+        self.assertIn("task-led", self.lc.SettledIds(life.settled.path).ids, "durable in the ledger, once")
+        self.assertEqual(open(life.settled.path).read().count("task-led\n"), 1)
+        self.assertFalse((life.claims.dir("task-led") / "body").exists(), "the real staged body removed")
+        self.assertTrue(life.settlement_complete("task-led"))
+        self.confirmed(life, "task-open")
+        self.assertFalse(life.reconcile_settled("task-open"))
+        self.assertFalse(life.reconcile_settled("task-none"))
+
+    def test_two_lifecycles_loaded_before_either_appends_record_a_settled_id_once(self):
+        """Two instances loaded while the ledger is empty (two waiting CLI calls) settle the same id one after
+        the other: the append re-reads the ledger under its lock, so the id is recorded exactly once."""
+        self.local_dir()
+        first, second = self.life(), self.life()
+        self.confirmed(first, "task-race")
+        self.assertEqual(first.stage_result("task-race", b"answer\n", "turn-1"), "staged")
+        first.claims.save(dict(first.claims.load("task-race"), phase=self.lc.SETTLED, settled_at=1.0))
+        self.assertEqual(("task-race" in first.settled, "task-race" in second.settled), (False, False), "both stale")
+        self.assertTrue(first.reconcile_settled("task-race"))
+        self.assertTrue(second.reconcile_settled("task-race"))
+        self.assertEqual(open(first.settled.path).read().count("task-race\n"), 1, "one ledger line")
+        third = self.lc.SettledIds(first.settled.path)
+        stale = self.lc.SettledIds(first.settled.path)
+        third.add("task-race2")
+        stale.add("task-race2")
+        self.assertEqual(open(first.settled.path).read().splitlines(), ["task-race", "task-race2"])
+
+    def test_one_generation_recovery_pass_delivers_a_verifying_blob_with_no_blob_write(self):
+        """One recovery pass, as hold runs it once per start, with the blob writer failing on every call:
+        the verified blob is final, so the claim moves on by its own save and the accepted answer is
+        published exactly once, nothing interrupted; no second pass is needed."""
+        self.local_dir()
+        life = self.life()
+        self.confirmed(life, "task-eio")
+        self.assertEqual(life.stage_result("task-eio", b"the verified answer\n", "turn-1"), "staged")
+        life.claims.save(dict(life.claims.load("task-eio"), phase=self.lc.TURN_CONFIRMED))
+        again = self.life(lineage=lambda pid, start: False)
+        with mock.patch.object(self.lc.Lifecycle, "_commit_blob", side_effect=OSError(errno.EIO, "I/O error")) as blob, \
+                mock.patch.object(self.lc.Lifecycle, "close_turn", wraps=again.close_turn) as closed:
+            again.recover(generation=GEN, proof=False)
+        self.assertEqual((closed.call_count, blob.call_count), (1, 0), "the decision taken once, no blob write")
+        self.assertEqual((self.results / "task-eio.txt").read_bytes(), b"the verified answer\n", "the accepted answer, exactly")
+        self.assertEqual(again.claims.load("task-eio")["phase"], self.lc.SETTLED)
+
+    def test_legacy_recover_refuses_local_claims_and_the_generation_path_settles_them(self):
+        self.local_dir()
+        life = self.life()
+        self.confirmed(life)
+        self.confirmed(life, "task-b")
+        self.assertEqual(life.stage_result("task-b", b"b\n", "turn-1"), "staged")
+        self.task("task-c")
+        n = life.prepare("task-c", "ic\n")
+        life.begin_call("task-c", n, self.work / "tasks" / "task-c.txt")
+        life.record_outcome("task-c", "queued", "[no-send]\n")
+        life.claims.save({k: v for k, v in life.claims.load("task-c").items() if k not in ("claim_mode", "claim_version", "writer")})
+        before = snapshot(self.work / "state")
+        self.logs = []
+        again = self.life(lineage=lambda pid, start: False)
+        again.recover()
+        after = snapshot(self.work / "state")
+        self.assertEqual((self.results / "task-c.txt").read_bytes(), b"[no-send]\n", "the legacy claim is published")
+        for tid in ("task-a", "task-b"):
+            self.assertEqual(after["claims/%s/claim.json" % tid], before["claims/%s/claim.json" % tid], tid)
+            self.assertFalse((self.results / ("%s.txt" % tid)).exists(), tid)
+        self.assertEqual({k: v for k, v in after.items() if k.startswith("claims/task-b/blob")},
+                         {k: v for k, v in before.items() if k.startswith("claims/task-b/blob")})
+        self.assertEqual(sorted(self.logs.count("foreign claim (local), left alone -> %s" % t) for t in ("task-a", "task-b")), [1, 1])
+        self.assertEqual(sorted(again.settled.ids), ["task-c"], "the ledger holds only the legacy claim")
+        with self.assertRaises(ValueError):
+            again.recover(generation=GEN)
+        with self.assertRaises(ValueError):
+            again.recover(generation=GEN, proof=True)
+        self.assertEqual(snapshot(self.work / "state"), after, "no proof, no effect")
+        again.recover(generation=GEN, proof=False)
+        self.assertEqual((self.results / "task-a.txt").read_bytes(), b"interrupted\n", "turn confirmed, no result")
+        self.assertEqual((self.results / "task-b.txt").read_bytes(), b"b\n", "the verified blob, exactly")
+        self.assertEqual(again.claims.load("task-a")["outcome"]["detail"], "turn confirmed, no result")
+        self.assertEqual(sorted(again.settled.ids), ["task-a", "task-b", "task-c"])
+        self.assertEqual(list(again.journal.charges()), [("task-a", 1), ("task-b", 1), ("task-c", 1)])
+
+    def test_the_state_allowlist_admits_the_local_records_and_locks_as_plain_files(self):
+        self.assertIsNone(self.lc.prepare_work_dir(str(self.work)))
+        for name in ("claude-local-plugin.json", "claude-local-supervisor.json", "claims.lock", "progress.lock"):
+            self.assertIn(name, self.lc.STATE_ALLOWED)
+            self.assertIn(name, self.lc.STATE_OPTIONAL_FILES)
+            (self.work / "state" / name).write_text("")
+        self.assertIsNone(self.lc.prepare_work_dir(str(self.work)))
+        (self.work / "state" / "claims.lock").unlink()
+        (self.work / "state" / "claims.lock").mkdir()
+        self.assertIn("not a plain file", self.lc.prepare_work_dir(str(self.work)))
+
+    def test_unmodified_main_refuses_the_fenced_work_dir_at_startup_with_everything_unchanged(self):
+        old = main_lifecycle()
+        self.assertEqual(old.FORMAT, "cloud-session/1")
+        self.assertFalse(hasattr(old, "FORMAT_LOCAL"))
+        self.local_dir()
+        life = self.life()
+        self.claimed(life, "task-p")
+        self.confirmed(life, "task-t")
+        self.confirmed(life, "task-s")
+        self.assertEqual(life.stage_result("task-s", b"s\n", "turn-1"), "staged")
+        before = snapshot(self.work)
+        refusal = old.prepare_work_dir(str(self.work))
+        self.assertIsNotNone(refusal)
+        self.assertIn("claude-local/1", refusal)
+        self.assertEqual(snapshot(self.work), before, "claim, body, result and ledger untouched")
+        self.assertIsNone(self.lc.prepare_work_dir(str(self.work)), "this binary serves it")
+        fresh = Path(self.tmp.name + "-fresh")
+        fresh.mkdir()
+        self.addCleanup(shutil.rmtree, fresh, True)
+        self.assertIsNone(old.prepare_work_dir(str(fresh)))
+        with self.assertRaises(self.lc.StateError):
+            self.lc.enable_local_format(str(Path(self.tmp.name + "-none")))
+        self.assertIsNone(self.lc.prepare_work_dir(str(fresh)), "a cloud-session/1 dir is still served")
+
+    def test_the_fence_order_is_lock_then_state_then_marker(self):
+        self.assertIsNone(self.lc.prepare_work_dir(str(self.work)))
+        events = []
+        with contextlib.ExitStack() as stack:
+            for patch in durable_events(self.lc, events):
+                stack.enter_context(patch)
+            self.lc.enable_local_format(str(self.work))
+        self.assertEqual(events, ["fsync claims.lock", "dir state", "fsync <temp>", "replace format", "dir state"])
+        self.lc.enable_local_format(str(self.work))
+        self.assertEqual((self.work / "state" / "format").read_text(), "claude-local/1\n", "idempotent")
+
+
+class CloudStepRefusalTest(SpyMixin, unittest.TestCase):
+    """The activated cloud adapter's step on a local TURN_CONFIRMED claim changes nothing; a cloud and
+    an untagged-legacy RESULT_STAGED claim are the positive controls."""
+
+    def adapter(self, work, claude):
+        argv = ["--work", str(work), "--session-id", "session_X", "--claude", str(claude), "--poll", "0.01",
+                "--timeout", "10", "--idle-exit", "0.1"]
+        args = sa.build_parser().parse_args(argv)
+        args.inbox, args.results, args.state = (os.path.join(str(work), d) for d in ("tasks", "results", "state"))
+        return sa.Adapter(args, environ={"PATH": "/usr/bin:/bin", "HOME": str(work.parent)})
+
+    def test_step_leaves_a_local_claim_alone_and_publishes_cloud_and_legacy_staged_claims(self):
+        with tempfile.TemporaryDirectory() as d:
+            work = Path(d) / "work"
+            work.mkdir()
+            claude = self.fake_claude(d)
+            self.assertIsNone(vendored.prepare_work_dir(str(work)))
+            vendored.enable_local_format(str(work))
+            life = vendored.Lifecycle(work, clock=Clock(), log=quiet)
+            for tid in ("task-l", "task-c", "task-g"):
+                self.write_task(work, tid)
+            n = life.prepare("task-l", "i\n", mode=vendored.LOCAL, generation=GEN)
+            h = vendored._sha256(b"x")
+            life.confirm_turn("task-l", "turn-1", life.authorize_call("task-l", n, text_hash=h), h)
+            self.assertEqual(life.stage_result("task-l", b"local\n", "turn-1"), "staged")
+            life.claims.save(dict(life.claims.load("task-l"), phase="TURN_CONFIRMED"))
+            for tid in ("task-c", "task-g"):
+                n = life.prepare(tid, "i\n")
+                life.begin_call(tid, n, work / "tasks" / (tid + ".txt"))
+                life.record_outcome(tid, "queued", tid.encode().decode() + "\n")
+            life.claims.save({k: v for k, v in life.claims.load("task-g").items()
+                              if k not in ("claim_mode", "claim_version", "writer")})
+            self.assertNotIn("claim_mode", life.claims.load("task-g"))
+            before = snapshot(work)
+            err = io.StringIO()
+            with self.write_spy(work) as seen, contextlib.redirect_stderr(err):
+                ad = self.adapter(work, claude)
+                done = set()
+                self.assertFalse(ad.step("task-l.txt", done))
+                self.assertEqual(done, set(), "no seen set")
+                self.assertEqual(snapshot(work), before, "no ledger, body or result changed")
+                self.assertIn("foreign claim (local)", err.getvalue())
+                self.assertTrue(ad.step("task-c.txt", done))
+                self.assertTrue(ad.step("task-g.txt", done))
+            self.assertEqual({p for who, p in seen if "task-l" in p}, set(), "not one write touched the local claim")
+            self.assertEqual((work / "results" / "task-c.txt").read_text(), "task-c\n")
+            self.assertEqual((work / "results" / "task-g.txt").read_text(), "task-g\n")
+            self.assertFalse((work / "results" / "task-l.txt").exists())
+            self.assertEqual(done, {"task-c", "task-g"})
+            self.assertEqual((Path(d) / "bin" / "claude.calls").exists(), False, "no provider call")
+
+
+class BridgeEntryTest(Base):
+    """The gateway bridge's own entries in a work root its state dir sits in, run against both copies."""
+
+    def bridge_writes(self, work):
+        """What the gateway bridge writes when its state dir sits directly in the work root, through its
+        own writers: the poller lock (workspace_lock), the default HITL store, and its log."""
+        from ag2_sparrow import workspace_lock
+        from ag2_sparrow.hitl.manager import HitlStore, default_store
+        src = (PKG_ROOT / "ag2_sparrow" / "remote_gateway_bridge.py").read_text()
+        for pin in ('_LOG_DIR = _STATE.parent / "logs"', '_LOG_FILE = _LOG_DIR / "gateway-bridge.log"',
+                    '_LOCK_ROLE = f"gateway-bridge{_INST_SUFFIX}"', "_LOCK_WS = _STATE.parent",
+                    "manager = HitlManager(HitlStore(default_store(workspace)))", '_LOG_FILE.with_suffix(".log.1")'):
+            self.assertIn(pin, src, "the bridge's layout moved: update task_lifecycle's BRIDGE_* names")
+        self.assertEqual(workspace_lock.acquire("gateway-bridge", Path(work)).status, "acquired")
+        workspace_lock.acquire("gateway-bridge.second", Path(work))
+        HitlStore(default_store(Path(work)))
+        (Path(work) / "logs").mkdir(exist_ok=True)
+        for name in ("gateway-bridge.log", "gateway-bridge.log.1"):
+            (Path(work) / "logs" / name).write_text("[remote-gateway-bridge] line\n")
+
+    def test_a_root_the_bridge_used_still_allows_a_new_session(self):
+        self.assertIsNone(self.lc.prepare_work_dir(str(self.work)), "the adapter initialises the root")
+        self.bridge_writes(self.work)
+        self.assertTrue((self.work / "state" / "locks" / "gateway-bridge.lock.guard").is_file())
+        self.assertTrue((self.work / "state" / "hitl" / "requirements").is_dir())
+        self.assertIsNone(self.lc.prepare_work_dir(str(self.work)), "the old session gone, a new one may start")
+        with tempfile.TemporaryDirectory() as d:
+            self.bridge_writes(d)
+            self.assertIsNone(self.lc.prepare_work_dir(d, check_only=True))
+            self.assertFalse(os.path.exists(os.path.join(d, "state", "format")), "check_only writes nothing")
+            self.assertIsNone(self.lc.prepare_work_dir(d), "the bridge ran first: still a fresh root")
+        foreign = {"a foreign lock": ("state/locks/other.lock", "file"), "a foreign store": ("state/hitl/notes", "dir"),
+                   "a foreign log": ("logs/other.log", "file"), "a link for the lock": ("state/locks/gateway-bridge.lock", "link")}
+        for what, (rel, kind) in foreign.items():
+            for marked in (True, False) if not rel.startswith("logs/") else (False,):
+                with self.subTest(what=what, marked=marked), tempfile.TemporaryDirectory() as d:
+                    if marked:
+                        self.assertIsNone(self.lc.prepare_work_dir(d))
+                    path = Path(d) / rel
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    {"file": lambda: path.write_text("x"), "dir": path.mkdir,
+                     "link": lambda: os.symlink(Path(d) / "elsewhere", path)}[kind]()
+                    line = self.lc.prepare_work_dir(d)
+                    self.assertIsNotNone(line, rel)
+                    self.assertIn(rel.split("/")[0], line)
+
+    def test_check_only_leaves_a_stale_record_temp_that_a_start_sweeps(self):
+        self.assertIsNone(self.lc.prepare_work_dir(str(self.work)))
+        temp = self.work / "state" / ".settled-ids.1.abcdef.tmp"
+        temp.write_text("x")
+        old = time.time() - self.lc.TEMP_SWEEP_AFTER - 5
+        os.utime(temp, (old, old))
+        self.assertIsNone(self.lc.prepare_work_dir(str(self.work), check_only=True))
+        self.assertTrue(temp.exists(), "a check writes nothing")
+        self.assertIsNone(self.lc.prepare_work_dir(str(self.work)))
+        self.assertFalse(temp.exists())
+
+    def test_a_layout_refusal_and_an_unreadable_root_read_differently(self):
+        (self.work / "stray").write_text("x")
+        self.assertFalse(self.lc.prepare_work_dir(str(self.work)).startswith(self.lc.UNCHECKED))
+        with mock.patch.object(self.lc.os, "listdir", side_effect=PermissionError(13, "denied")):
+            self.assertTrue(self.lc.prepare_work_dir(str(self.work)).startswith(self.lc.UNCHECKED))
+        self.assertIsNone(self.lc.prepare_work_dir(str(self.work / "absent"), check_only=True), "install creates it")
+
+
 def load_tests(loader, tests, pattern):
     suite = unittest.TestSuite()
     copies = [("vendored", vendored)]
@@ -2099,12 +3365,13 @@ def load_tests(loader, tests, pattern):
         copies.append(("src", src))
     for label, mod in copies:
         for case in (LockTest, FreshDirTest, ProbeTest, ProbeBothDirsTest, ClassifyTest, PublicationTest,
-                     JournalTest, SettledIdsTest, DecisionTest, ErrorBranchTest):
+                     JournalTest, SettledIdsTest, DecisionTest, ErrorBranchTest, LocalClaimTest, BridgeEntryTest):
             if label == "src" and case in (LockTest, FreshDirTest, ProbeBothDirsTest):
                 continue
             bound = GATE(type("%s_%s" % (case.__name__, label), (case,), {"lc": mod}))
             suite.addTests(loader.loadTestsFromTestCase(bound))
     suite.addTests(loader.loadTestsFromTestCase(GATE(StructureTest)))
+    suite.addTests(loader.loadTestsFromTestCase(GATE(CloudStepRefusalTest)))
     suite.addTests(loader.loadTestsFromTestCase(BoundaryGuardTest))
     return suite
 

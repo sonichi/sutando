@@ -25,6 +25,11 @@ Run: python3 tests/runtime-api-e2e.test.py   (stdlib only)
 """
 from __future__ import annotations
 
+from _helpers.hermetic_env import isolate_os_environ, isolated_child_env
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import json
 import os
@@ -160,7 +165,7 @@ threading.Thread(target=_gw_srv.serve_forever, daemon=True).start()
 GW_URL = f"http://127.0.0.1:{_gw_srv.server_address[1]}"
 
 TMP = tempfile.mkdtemp(prefix="runtime-api-e2e-")
-ENV = {**os.environ,
+ENV = {**isolated_child_env(),
        # instance lock + run dir must not collide with a live daemon's default
        "SUTANDO_RUN_DIR": str(Path(TMP) / "run"),
        "SUTANDO_RUNTIME_SOCKET": str(Path(TMP) / "rt.sock"),

@@ -131,8 +131,9 @@ class _Bridge:
     _NOOP = ("_recover_orphan_proactive", "_maybe_start_event_channel",
              "_push_pool_advertisement", "_retry_withheld_reviews", "refresh_routing")
 
-    def __init__(self, gw, relay, root: Path, time_scale=None):
+    def __init__(self, gw, relay, root: Path, time_scale=None, owner="launchd"):
         self.gw, self.relay, self.root = gw, relay, root
+        self.owner = owner
         self.time_scale = time_scale
         self.poll_outcomes: list[str] = []
         self.logs: list[str] = []
@@ -143,7 +144,8 @@ class _Bridge:
         gw = self.gw
         names = ("TOKEN", "URL", "time", "_acquire_singleton", "_heartbeat_singleton", "_req",
                  "_log", "_emit_gateway_status", "GATEWAY_STATUS_FILE", "STUCK_POLL_RECOVERY_FILE",
-                 "_last_heartbeat_at", "_heartbeat_retry_at", "_ack_disabled_until") + self._NOOP
+                 "_last_heartbeat_at", "_heartbeat_retry_at", "_ack_disabled_until",
+                 "POLL_STALL_RESTART_OWNER", "_STUCK_EXIT_PENDING") + self._NOOP
         for n in names:
             self._saved[n] = getattr(gw, n, None)
         # Absent before the fix: the harness must run there so the asserts can fail.
@@ -152,6 +154,9 @@ class _Bridge:
         gw._OUTBOUND_STOP.clear()
         gw._OUTBOUND_WAKE.clear()
         gw.TOKEN, gw.URL = "secret", self.relay.url
+        # The exit is armed only where something relaunches the bridge (the launchd plist).
+        gw.POLL_STALL_RESTART_OWNER = self.owner
+        gw._STUCK_EXIT_PENDING = False
         self.clock = gw.time = _Clock(gw)
         gw._acquire_singleton = lambda *a, **k: True
         gw._last_heartbeat_at = gw._heartbeat_retry_at = gw._ack_disabled_until = 0.0
@@ -266,6 +271,16 @@ class StuckRelayPollTest(unittest.TestCase):
         stuck_lines = [m for m in b.logs if m.startswith("stuck relay poll: ") and "consecutive" in m]
         self.assertEqual(len(stuck_lines), 1, "logged once per episode")
 
+    def test_with_no_restart_owner_a_stuck_poll_is_surfaced_but_never_exits(self):
+        # A bare `&` lane has nothing to relaunch it, so exiting would end it for good.
+        with _Bridge(self.gw, self.relay, self.root, owner="") as b:
+            rc = b.run(passes=self.n() + 2)
+        self.assertIsNone(rc, "an unsupervised lane exited")
+        self.assertIs(b.writes[-1].get("stuck_poll"), True, "the stuck session is still surfaced")
+        self.assertEqual(sum("no restart owner declared" in m for m in b.logs), 1, b.logs)
+        self.assertFalse((self.root / "state" / "gateway-stuck-poll.json").exists(),
+                         "a restart that never ran was recorded")
+
     def test_timeouts_with_nothing_else_answering_are_an_outage_not_a_stuck_poll(self):
         real = self.gw._post_heartbeat
         with _Bridge(self.gw, self.relay, self.root) as b:
@@ -327,6 +342,8 @@ class StuckPollDecisionTest(unittest.TestCase):
         self.logs: list[str] = []
         self._saved = (gw.STUCK_POLL_RECOVERY_FILE, gw._log, dict(gw._POLL_STREAK),
                        dict(gw._LAST_REQ_OK))
+        self._owner = gw.POLL_STALL_RESTART_OWNER
+        gw.POLL_STALL_RESTART_OWNER = "launchd"
         gw.STUCK_POLL_RECOVERY_FILE = self.stamp
         gw._log = lambda m: self.logs.append(str(m))
         gw._POLL_STREAK.update(timeouts=0, since=None, stuck_since=None, held_logged=False)
@@ -338,6 +355,7 @@ class StuckPollDecisionTest(unittest.TestCase):
     def tearDown(self):
         gw = self.gw
         gw._durable_write = self._durable_write
+        gw.POLL_STALL_RESTART_OWNER = self._owner
         if hasattr(gw, "_BAD_STAMP"):
             gw._BAD_STAMP.clear(); gw._BAD_STAMP.update(self._bad)
         gw.STUCK_POLL_RECOVERY_FILE, gw._log, streak, req_ok = self._saved
@@ -469,6 +487,8 @@ class SupervisorRelaunchTest(unittest.TestCase):
                 f"p = Path({str(d / 'runs')!r}); n = int(p.read_text()) if p.exists() else 0\n"
                 "p.write_text(str(n + 1))\n"
                 f"sys.exit({code} if n == 0 else 75)\n")
+            # The wrapper also tends the agent-bridge supervisor; a stub that idles keeps it quiet.
+            (d / "src" / "sparrowd.py").write_text("import time\ntime.sleep(60)\n")
             wrapper = d / "src" / "launchd" / "gateway-bridge-wrapper.sh"
             wrapper.write_text((_REPO / "src" / "launchd" / "gateway-bridge-wrapper.sh").read_text())
             (d / "shims" / "python3").write_text(f'#!/bin/bash\nexec "{sys.executable}" "$@"\n')
@@ -482,7 +502,7 @@ class SupervisorRelaunchTest(unittest.TestCase):
                                text=True, timeout=30)
             runs = int((d / "runs").read_text())
         self.assertEqual(runs, 2, f"the wrapper did not relaunch exit {code}:\n{r.stderr}")
-        self.assertIn("automatically restarting", r.stderr)
+        self.assertIn(f"rc {code}); relaunching", r.stderr)
         self.assertEqual(r.returncode, 0, "the stand-down after the relaunch ends the wrapper")
 
 

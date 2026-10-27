@@ -20,8 +20,10 @@ import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from local_task_protocol import reply_action_text
-from workspace_default import resolve_workspace
+try:
+    from ..local_task_protocol import reply_action_text   # the vendored package layout
+except ImportError:
+    from local_task_protocol import reply_action_text     # the repo's src/ on sys.path
 
 from .manager import HitlManager
 from .schema import Action, ActionReply, HumanRequirement, MalformedActionError, StaleRequirementError, STATUS_IN_PROGRESS
@@ -34,8 +36,10 @@ TUI_ACTION_KIND = "tui_select"
 
 
 def actions_dir(workspace: Optional[Path] = None) -> Path:
-    ws = Path(workspace) if workspace is not None else resolve_workspace()
-    return ws / "state" / "hitl" / "actions"
+    if workspace is None:
+        from workspace_default import resolve_workspace
+        workspace = resolve_workspace()
+    return Path(workspace) / "state" / "hitl" / "actions"
 
 
 def parse_reply(event: Dict[str, Any]) -> Optional[ActionReply]:

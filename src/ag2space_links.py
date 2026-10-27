@@ -6,10 +6,18 @@ opened outside. Standard library only: skills import it without the rest of core
 """
 from __future__ import annotations
 
+import os
 import re
+import sys
 import urllib.parse
+from typing import Optional
 
-DEFAULT_VIA = "ag2.space"
+try:
+    import dotspace
+except ImportError:  # imported by file path: the sibling resolver sits in this directory
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import dotspace
+
 MATRIX_TO = "https://matrix.to/#/"
 # The app's route section for a room; a URL path segment, not a filesystem path.
 ROOM_ROUTE = "home"
@@ -19,8 +27,26 @@ _ROOM = re.compile(r"^[!#][^\s:]+:\S+$")
 _DB_PAGE = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
 
 
-def room_link(room_id: str, event_id: str = "", via: str = DEFAULT_VIA) -> str:
-    """`https://matrix.to/#/<room>[/<event>][?via=<server>]`; empty `via` drops the query."""
+def default_via(room_id: str = "") -> str:
+    """`?via=` for `room_id`: its own server's DotSpace (rooms are `!x:server`), else the install's."""
+    if dotspace.server_of_matrix_id(room_id):
+        return dotspace.link_via_for(room_id, fetch=dotspace.NO_FETCH)
+    return dotspace.default_link_via()
+
+
+def __getattr__(name: str):
+    # `DEFAULT_VIA` stays importable; it is the install's via, resolved on each read.
+    if name == "DEFAULT_VIA":
+        return default_via()
+    raise AttributeError(name)
+
+
+def room_link(room_id: str, event_id: str = "", via: Optional[str] = None) -> str:
+    """`https://matrix.to/#/<room>[/<event>][?via=<server>]`; `via` None takes the room's
+    server's DotSpace (`default_via`), empty `via` drops the query."""
+    via = default_via(room_id) if via is None else via.strip().lower()
+    if via and not dotspace.is_server_name(via):
+        via = ""  # an explicit via that is not a server name never reaches the query
     frag = f"{room_id}/{event_id}" if event_id else room_id
     return f"{MATRIX_TO}{frag}?via={via}" if via else f"{MATRIX_TO}{frag}"
 

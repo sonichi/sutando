@@ -6,6 +6,15 @@ Run: python3 tests/telegram-ingress-identity.test.py
 """
 from __future__ import annotations
 
+import json
+import sys
+from pathlib import Path
+
+from _helpers.hermetic_env import isolate_os_environ, isolated_child_env
+
+# Before anything reads the environment; a --bridge child keeps the hermetic environment its harness built.
+isolate_os_environ(**(json.loads(Path(sys.argv[4]).read_text()) if sys.argv[1:2] == ["--bridge"] else {}))
+
 import importlib.util
 import io
 import json
@@ -21,6 +30,8 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _helpers.process_group import popen_bound  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "src"))
@@ -82,7 +93,7 @@ class Harness:
     def __init__(self):
         self.tmp = tempfile.TemporaryDirectory(prefix="telegram-ingress-")
         self.root = Path(self.tmp.name)
-        self.env = os.environ.copy()
+        self.env = isolated_child_env()
         supplied = self.env.get("SUTANDO_WORKSPACE") if self.env.get("SUTANDO_TEST_MODE") == "1" else None
         self.ws = Path(supplied) if supplied else self.root / "workspace"
         self.tasks, self.results = self.ws / "tasks", self.ws / "results"
@@ -120,8 +131,8 @@ class Harness:
     def start(self, name, argv):
         out, err = self.logs / f"{name}.stdout", self.logs / f"{name}.stderr"
         with out.open("w") as stdout, err.open("w") as stderr:
-            proc = subprocess.Popen(argv, cwd=REPO, env=self.env, stdin=subprocess.PIPE,
-                                    stdout=stdout, stderr=stderr, text=True, start_new_session=True)
+            proc = popen_bound(argv, cwd=REPO, env=self.env, stdin=subprocess.PIPE,
+                                    stdout=stdout, stderr=stderr, text=True)
         self.processes.append(proc)
         self.witness.append({"argv": argv, "pid": proc.pid, "started": datetime.now(timezone.utc).isoformat()})
         return proc
@@ -131,7 +142,10 @@ class Harness:
         argv = [sys.executable]
         if self.env.get("SUTANDO_TEST_SUBPROCESS_COVERAGE") == "1":
             argv += ["-m", "coverage", "run", f"--rcfile={REPO / '.coveragerc'}"]
-        proc = self.start(name, argv + [str(Path(__file__).resolve()), "--bridge", str(events), str(int(hold))])
+        env_file = self.root / f"{name}.env.json"
+        env_file.write_text(json.dumps(self.env))
+        proc = self.start(name, argv + [str(Path(__file__).resolve()), "--bridge", str(events), str(int(hold)),
+                                        str(env_file)])
         self.wait(lambda: len(self.calls(events, "getUpdates")) == 1, proc)
         return proc, events
 

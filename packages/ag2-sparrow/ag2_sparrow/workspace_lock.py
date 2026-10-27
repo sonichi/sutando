@@ -23,15 +23,24 @@ This primitive gives the bridge/supervisor a role lock that closes both:
 Liveness = **heartbeat freshness**: the 83188 ghost was alive-but-stale, and a
 hung-but-running holder that stopped heartbeating should lose the lock. A live
 pid is therefore never proof of ownership (pid recycling). One narrowing: a
-holder recorded on THIS host whose pid no longer exists cannot be polling, so it
-is reaped at once instead of blocking a successor for the whole stale window.
+holder recorded on THIS host that no longer runs cannot be polling, so it is
+reaped at once instead of blocking a successor for the whole stale window.
 A holder on another host is judged by heartbeat alone, and a holder that called
 `retain()` (it exits on purpose while still owning the role) ages out normally.
-Residual risk: no process start time is recorded, so a dead holder whose pid was
-already reused reads as alive and falls back to the heartbeat rule.
+
+Ownership is generational: the record carries `proc_start` (boot id + start time,
+`proc_start()`: /proc on Linux, sysctl on macOS, the process creation time from
+`outbox.process_identity` on Windows), and acquire/heartbeat/release/retain treat a
+record as their own only when pid, host AND that start time match. A same-host holder
+whose pid now names a process with another start time is gone (its pid was reused).
+Residual risk: a record without `proc_start` (written where it cannot be read) falls
+back to the pid rule, so a dead holder whose pid was reused reads as alive until stale.
+`read_lease` binds a record to the role, workspace and schema the caller asked for, and
+`lease_process` proves its pid is still the writer, for a caller about to signal it.
 
 Lock file: `<workspace>/state/locks/<role>.lock`
-  {"role","pid","host","workspace","acquired_at","heartbeat_at","schema_version":1}
+  {"role","pid","host","workspace","acquired_at","heartbeat_at","schema_version":1,
+   "proc_start" (where the start time can be read)}
 
 The lock is per-`(workspace, role)`: the file lives under the workspace (so it
 is inherently workspace-scoped — the contended resource is the relay/task bus
@@ -47,6 +56,8 @@ Python API (bridge/supervisor import this directly):
     heartbeat("gateway-bridge")          # call ~every 30s while holding
     release("gateway-bridge")            # on shutdown
     retain("gateway-bridge")             # exiting but keep the role until stale
+    read_lease("gateway-bridge")         # the holder record; LeaseIndeterminate if malformed
+    lease_process(holder)                # its pid only when proven to be the writer, else 0/raise
 
 CLI (bash consumers, e.g. supervisor):
     workspace_lock.py acquire   --role R [--workspace W] [--stale-seconds N]
@@ -65,6 +76,7 @@ import contextlib
 import json
 import os
 import socket
+import struct
 import sys
 import time
 from pathlib import Path
@@ -154,9 +166,84 @@ def _read(path: Path) -> dict | None:
         return None  # corrupt → treat as absent/reapable
 
 
-def _payload(role: str, workspace: Path) -> dict:
+def _darwin_sysctl(mib: list) -> bytes | None:
+    """The raw value of sysctl `mib` on macOS; None when it cannot be read or is empty."""
+    import ctypes
+    import ctypes.util
+    try:
+        libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+        arr, size = (ctypes.c_int * len(mib))(*mib), ctypes.c_size_t(0)
+        if libc.sysctl(arr, len(mib), None, ctypes.byref(size), None, 0) != 0 or not size.value:
+            return None
+        buf = ctypes.create_string_buffer(size.value)
+        if libc.sysctl(arr, len(mib), buf, ctypes.byref(size), None, 0) != 0:
+            return None
+        return buf.raw[:size.value] or None
+    except (OSError, AttributeError, TypeError):
+        return None
+
+
+# CTL_KERN, then KERN_PROC/KERN_PROC_PID, KERN_BOOTTIME and KERN_PROCARGS2 (<sys/sysctl.h>).
+_KERN, _KERN_PROC_PID, _KERN_BOOTTIME, _KERN_PROCARGS2 = 1, (14, 1), 21, 49
+
+
+def proc_argv(pid: int) -> list[str] | None:
+    """The argv of `pid` on macOS (KERN_PROCARGS2); None elsewhere or when unreadable."""
+    if sys.platform != "darwin":
+        return None
+    raw = _darwin_sysctl([_KERN, _KERN_PROCARGS2, pid])
+    if raw is None or len(raw) < 4:
+        return None
+    argc = int.from_bytes(raw[:4], sys.byteorder)
+    _exe, _, rest = raw[4:].partition(b"\0")
+    args = rest.lstrip(b"\0").split(b"\0")
+    return [a.decode(errors="replace") for a in args[:argc]] if 0 < argc <= len(args) else None
+
+
+_IS_WINDOWS = os.name == "nt"
+
+
+def _windows_identity(pid: int):
+    """The repository's Windows process-identity primitive (state + creation-time birth token)."""
+    try:
+        from .outbox import process_identity
+    except ImportError:
+        from outbox import process_identity
+    return process_identity(pid)
+
+
+def _windows_start(ident) -> str | None:
+    return f"win-{ident.start_usec}" if ident.state.value == "ALIVE" and ident.start_usec else None
+
+
+def proc_start(pid: int, proc: Path = Path("/proc")) -> str | None:
+    """`<boot id>:<start time>` of `pid`, which no later process with that pid shares:
+    /proc's start ticks, on macOS kinfo_proc's p_starttime, on Windows the creation time;
+    None where it cannot be read (or the process is gone)."""
+    if _IS_WINDOWS:
+        return _windows_start(_windows_identity(pid))
+    if sys.platform == "darwin" and not proc.is_dir():
+        boot = _darwin_sysctl([_KERN, _KERN_BOOTTIME])
+        info = _darwin_sysctl([_KERN, *_KERN_PROC_PID, pid])
+        if boot is None or info is None or len(boot) < 12 or len(info) < 12:
+            return None
+        # struct timeval {time_t; suseconds_t} opens both kern.boottime and kinfo_proc.
+        (bsec, busec), (sec, usec) = (struct.unpack_from("=qi", b) for b in (boot, info))
+        return f"darwin-{bsec}.{busec:06d}:{sec}.{usec:06d}" if sec > 0 else None
+    try:
+        boot = (proc / "sys" / "kernel" / "random" / "boot_id").read_text().strip()
+        stat = (proc / str(pid) / "stat").read_bytes()
+    except (OSError, ValueError):
+        return None
+    fields = stat[stat.rfind(b")") + 1:].split()
+    # starttime is field 22 of stat(5); fields here start at field 3 (state).
+    ticks = fields[19].decode() if len(fields) > 19 and fields[19].isdigit() else ""
+    return f"{boot}:{ticks}" if boot and ticks else None
+
+
+def _payload(role: str, workspace: Path, declares: "dict | None" = None) -> dict:
     now = _now()
-    return {
+    data = {**(declares or {}),
         "role": role,
         "pid": os.getpid(),
         "host": _host_label(),
@@ -165,6 +252,54 @@ def _payload(role: str, workspace: Path) -> dict:
         "heartbeat_at": now,
         "schema_version": SCHEMA_VERSION,
     }
+    start = _own_start()
+    if start:
+        data["proc_start"] = start
+    return data
+
+
+_OWN_START: dict = {}
+
+
+def _own_start() -> str | None:
+    """This process's start token, read once per pid (a fork reads its own)."""
+    pid = os.getpid()
+    if pid not in _OWN_START:
+        _OWN_START[pid] = proc_start(pid)
+    return _OWN_START[pid]
+
+
+def _is_mine(holder: dict | None) -> bool:
+    """Whether `holder` was written by this very process: pid, host and start time."""
+    return bool(holder) and holder.get("pid") == os.getpid() and holder.get("host") == _host_label() \
+        and holder.get("proc_start") == _own_start()
+
+
+def _probe(pid: int) -> tuple[str, str | None]:
+    """("dead" | "alive" | "unknown", start token or None) for a pid on this host; "alive" always
+    carries the start token, so a caller never compares a missing token as a mismatch."""
+    if _IS_WINDOWS:
+        ident = _windows_identity(pid)  # one snapshot: state and birth token from the same read
+        if ident.state.value == "DEAD":
+            return "dead", None
+        start = _windows_start(ident)
+        return ("alive", start) if start else ("unknown", None)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return "dead", None
+    except OSError:  # EPERM: the pid exists under another uid
+        pass
+    start = proc_start(pid)
+    if start is None:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return "dead", None
+        except OSError:
+            pass
+        return "unknown", None
+    return "alive", start
 
 
 def _is_fresh(holder: dict, stale_seconds: int) -> bool:
@@ -175,19 +310,17 @@ def _is_fresh(holder: dict, stale_seconds: int) -> bool:
 
 
 def _holder_is_dead(holder: dict, host: str) -> bool:
-    """True only for a non-retained holder on THIS host whose pid is gone."""
-    if os.name == "nt" or holder.get("host") != host or holder.get("retained"):
-        return False  # os.kill(pid, 0) terminates the process on Windows
+    """True only for a non-retained holder on THIS host whose pid is gone or now another process."""
+    if holder.get("host") != host or holder.get("retained"):
+        return False
     pid = holder.get("pid")
     if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
         return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
+    state, start = _probe(pid)
+    if state == "dead":
         return True
-    except OSError:  # EPERM: the pid exists under another uid
-        return False
-    return False
+    recorded = holder.get("proc_start")
+    return state == "alive" and isinstance(recorded, str) and bool(recorded) and start != recorded
 
 
 def _write_atomic(path: Path, data: dict) -> None:
@@ -197,10 +330,12 @@ def _write_atomic(path: Path, data: dict) -> None:
 
 
 def acquire(role: str, workspace: Path | str | None = None,
-            stale_seconds: int = DEFAULT_STALE_SECONDS) -> LockResult:
+            stale_seconds: int = DEFAULT_STALE_SECONDS, declares: "dict | None" = None) -> LockResult:
+    """Take the role's lock; `declares` adds fields the holder states about itself for readers
+    (never overriding the lock's own), written in the same step as the take."""
     ws = workspace if isinstance(workspace, Path) else _resolve_workspace(workspace)
     path = _lock_path(ws, role)
-    data = _payload(role, ws)
+    data = _payload(role, ws, declares)
     # The whole read-decide-write runs under the guard flock, so no other
     # acquire/heartbeat/release can interleave — the reap→take is atomic.
     with _guard(ws, role):
@@ -209,7 +344,7 @@ def acquire(role: str, workspace: Path | str | None = None,
             # absent, or corrupt/unreadable → treat as free and take it
             _write_atomic(path, data)
             return LockResult("acquired")
-        if holder.get("pid") == os.getpid() and holder.get("host") == data["host"]:
+        if _is_mine(holder):
             # idempotent re-acquire — refresh, preserving the original generation
             data["acquired_at"] = holder.get("acquired_at", data["acquired_at"])
             _write_atomic(path, data)
@@ -229,7 +364,7 @@ def heartbeat(role: str, workspace: Path | str | None = None) -> bool:
     path = _lock_path(ws, role)
     with _guard(ws, role):
         holder = _read(path)
-        if not holder or holder.get("pid") != os.getpid() or holder.get("host") != _host_label():
+        if not _is_mine(holder):
             return False
         holder["heartbeat_at"] = _now()
         _write_atomic(path, holder)
@@ -237,12 +372,12 @@ def heartbeat(role: str, workspace: Path | str | None = None) -> bool:
 
 
 def release(role: str, workspace: Path | str | None = None) -> None:
-    """Remove the lock iff we still hold it (pid+host match), under the guard."""
+    """Remove the lock iff we still hold it (pid, host and start time match), under the guard."""
     ws = workspace if isinstance(workspace, Path) else _resolve_workspace(workspace)
     path = _lock_path(ws, role)
     with _guard(ws, role):
         holder = _read(path)
-        if holder and holder.get("pid") == os.getpid() and holder.get("host") == _host_label():
+        if _is_mine(holder):
             try:
                 os.unlink(path)
             except FileNotFoundError:  # pragma: no cover - unlink race
@@ -256,11 +391,80 @@ def retain(role: str, workspace: Path | str | None = None) -> bool:
     path = _lock_path(ws, role)
     with _guard(ws, role):
         holder = _read(path)
-        if not holder or holder.get("pid") != os.getpid() or holder.get("host") != _host_label():
+        if not _is_mine(holder):
             return False
         holder["retained"] = True
         _write_atomic(path, holder)
         return True
+
+
+class LeaseIndeterminate(Exception):
+    """A lease file exists but does not show which process holds the role."""
+
+
+def read_lease(role: str, workspace: Path | str | None = None) -> dict | None:
+    """The lease as its holder wrote it; None only when no lease file exists. Unlike `acquire`,
+    which takes a corrupt lease as free, an unreadable or malformed one is LeaseIndeterminate,
+    and so is one written for another role, workspace or schema (a copied record)."""
+    ws = workspace if isinstance(workspace, Path) else _resolve_workspace(workspace)
+    path = _lock_path(ws, role)
+    try:
+        text = path.read_text()
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        raise LeaseIndeterminate(f"{path.name} is unreadable ({type(e).__name__})") from None
+    try:
+        holder = json.loads(text)
+    except ValueError:
+        raise LeaseIndeterminate(f"{path.name} is not a lease record") from None
+    if not isinstance(holder, dict):
+        raise LeaseIndeterminate(f"{path.name} is not a lease record")
+    pid = holder.get("pid")
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        raise LeaseIndeterminate(f"{path.name} names no valid pid")
+    if not isinstance(holder.get("host"), str) or not holder["host"]:
+        raise LeaseIndeterminate(f"{path.name} names no host")
+    if holder.get("schema_version") != SCHEMA_VERSION:
+        raise LeaseIndeterminate(f"{path.name} is not schema_version {SCHEMA_VERSION}")
+    if holder.get("role") != role:
+        raise LeaseIndeterminate(f"{path.name} is a lease for role {holder.get('role')!r}, not {role!r}")
+    recorded = holder.get("workspace")
+    if not isinstance(recorded, str) or os.path.realpath(recorded) != os.path.realpath(str(ws)):
+        raise LeaseIndeterminate(f"{path.name} is a lease for another workspace")
+    return holder
+
+
+def lease_stale_in(holder: dict, stale_seconds: int = DEFAULT_STALE_SECONDS) -> float:
+    """Seconds until `acquire` would take `holder` as stale; 0 when it already would."""
+    hb = holder.get("heartbeat_at")
+    if not isinstance(hb, (int, float)) or isinstance(hb, bool):
+        return 0.0
+    return max(0.0, hb + stale_seconds - time.time())
+
+
+def lease_is_live(holder: dict, stale_seconds: int = DEFAULT_STALE_SECONDS) -> bool:
+    """Whether `acquire` would defer to `holder` rather than take the role."""
+    return _is_fresh(holder, stale_seconds) and not _holder_is_dead(holder, _host_label())
+
+
+def lease_process(holder: dict) -> int:
+    """The holder's pid when that process provably wrote the lease (this host, same `proc_start`),
+    0 when it provably no longer runs, else LeaseIndeterminate: never a pid that is not proven."""
+    pid = holder.get("pid")
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        raise LeaseIndeterminate("the lease names no valid pid")
+    if holder.get("host") != _host_label():
+        raise LeaseIndeterminate(f"the lease is held on host {holder.get('host')!r}, not this one")
+    state, current = _probe(pid)
+    if state == "dead":
+        return 0
+    if current is None:
+        raise LeaseIndeterminate(f"the start time of pid {pid} cannot be read")
+    recorded = holder.get("proc_start")
+    if not isinstance(recorded, str) or not recorded:
+        raise LeaseIndeterminate(f"the lease for pid {pid} records no start time")
+    return pid if current == recorded else 0
 
 
 def read_holder(role: str, workspace: Path | str | None = None) -> dict | None:

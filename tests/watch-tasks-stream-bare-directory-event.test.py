@@ -23,6 +23,9 @@ import subprocess
 import tempfile
 import time
 from pathlib import Path
+import sys  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _helpers.process_group import popen_bound  # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
 FAILURES: list[str] = []
@@ -74,10 +77,10 @@ class Harness:
         for k in ("SUTANDO_TASK_EVENT_HANDLER", "SUTANDO_INSTANCE_ID", "SUTANDO_TASKS_DIR",
                   "SUTANDO_WORKSPACE_DIR", "SUTANDO_INBOX_KIND"):
             env.pop(k, None)
-        self.proc = subprocess.Popen(
+        self.proc = popen_bound(
             ["bash", "src/watch-tasks-stream.sh", str(self.ws / "tasks"), "--role", "standby", "--inbox", str(self.ws / "tasks")],
             cwd=str(REPO), env=env, stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL, text=True, start_new_session=True)
+            stderr=subprocess.DEVNULL, text=True)
 
     def deliver_file_event(self, path: Path) -> None:
         with self.feed.open("a") as fh:

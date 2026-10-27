@@ -1,8 +1,10 @@
 """Shared tmux pane-key argv and crash-safe send guard. Owns the socket mutex,
-pending ticket record, revocation, uncertainty fence and explicit recovery."""
+pending ticket record, revocation, uncertainty fence and explicit recovery.
+Stdlib only; vendored byte-identical into ag2-sparrow beside its shell script."""
 from pathlib import Path
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -14,10 +16,62 @@ SCRIPT = Path(__file__).resolve().parent / "tmux-pane-keys.sh"
 TIMEOUT_S = 22
 BUSY = 75
 UNCERTAIN = 125
+# Exit of a fenced action: 0 sent, 1 predicate false (the ticket ends .orphaned, nothing sent),
+# UNCERTAIN for a ticket neither sent nor orphaned, BUSY for another sender.
+WITHHELD = 1
+# The script's own orphan command, substituted by the script for the ticket it claimed.
+ORPHAN = "$ORPHAN"
+NONCE_RE = re.compile(r"^[0-9a-f]{32}$")
+SESSION_ID_RE = re.compile(r"^\$\d+$")
+TITLE_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
 def argv(socket, target, *keys, tmux="tmux"):
-    return ["bash", str(SCRIPT), "--tmux", str(tmux), "-S", str(socket), "-t", target, "--", *keys]
+    """The guarded send; the script takes this interpreter explicitly, never a repo helper."""
+    return ["bash", str(SCRIPT), "--tmux", str(tmux), "--python", sys.executable, "-S", str(socket),
+            "-t", target, "--", *keys]
+
+
+def fence_argv(socket, target_pane, predicate_format, action_cmd, tmux="tmux"):
+    """The guarded fenced action: the script builds fenced(target_pane, predicate_format, action_cmd)
+    with its own ORPHAN and runs it through the ticket claim, so a false predicate sends nothing."""
+    return ["bash", str(SCRIPT), "--tmux", str(tmux), "--python", sys.executable, "-S", str(socket),
+            "-t", target_pane, "--fence", predicate_format, action_cmd]
+
+
+def tmux_quote(value):
+    """A tmux single-quoted word, the script's rule: literal; an embedded ' closes, is double-quoted, reopens."""
+    return "'" + str(value).replace("'", "'\"'\"'") + "'"
+
+
+def predicate(nonce, pane_pid, session_id, session_created, title_token=None):
+    """The fence condition the server evaluates against the pane `-t` selects: the exact pane pid,
+    session id and creation time, the generation nonce matched by glob against the pane's own start
+    command (`hold --generation=<hex> --`, never a path in the format), and the pane title when a
+    token is given. No pane_id term: the target already names the pane."""
+    if not NONCE_RE.match(str(nonce)):
+        raise ValueError("the generation nonce is 32 hex characters")
+    if not SESSION_ID_RE.match(str(session_id)):
+        raise ValueError("a tmux session id is $<n>")
+    terms = ["#{==:#{pane_pid},%d}" % int(pane_pid), "#{==:#{session_id},%s}" % session_id,
+             "#{==:#{session_created},%d}" % int(session_created),
+             "#{m:*--generation=%s --*,#{pane_start_command}}" % nonce]
+    if title_token is not None:
+        if not TITLE_TOKEN_RE.match(str(title_token)):
+            raise ValueError("a title token is 1-64 of [A-Za-z0-9_-]")
+        terms.append("#{==:#{pane_title},%s}" % title_token)
+    out = terms[-1]
+    for term in reversed(terms[:-1]):
+        out = "#{&&:%s,%s}" % (term, out)
+    return out
+
+
+def fenced(target_pane, predicate_format, action_cmd, orphan=ORPHAN):
+    """The one server command of a fenced action, exactly as the script builds it: the action runs
+    only while the predicate holds; otherwise the ticket is orphaned, which the script exits 1 on."""
+    false_branch = tmux_quote("run-shell " + tmux_quote(orphan))
+    return "if-shell -F -t %s %s %s %s" % (tmux_quote(target_pane), tmux_quote(predicate_format),
+                                            tmux_quote(action_cmd), false_branch)
 
 
 def guard_path(socket):
@@ -75,7 +129,10 @@ def finish_guard(socket, completed=False, sweep=False):
 
 
 def _lock_fd(fd):
-    from file_lock import lock_fd
+    try:
+        from .file_lock import lock_fd    # the vendored package layout
+    except ImportError:
+        from file_lock import lock_fd     # the repo's src/ on sys.path
 
     try:
         lock_fd(fd, blocking=False)

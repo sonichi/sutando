@@ -860,6 +860,7 @@ export function createWritePageTool(deps: ReadRoomDeps): ToolDefinition {
 		description:
 			'Write a note into an AG2 Space room\'s Commons, where every member sees it: a new document page (`title` + `text`), or `text` appended to the end of an existing page (`kind` from a search_commons hit, or "markdown" for the room\'s main Doc). ' +
 			'A comment or remark on a page ("leave a comment", "留言") is add_comment, not this: appended text becomes part of the page. ' +
+			'A LaTeX or Typst file or project (.tex, .typ) is not this either: a page written here is a plain Doc page. Use find_room_actions ("latex project", "typst") for it. ' +
 			WRITE_CONFIRMATION +
 			'Leave `room` out for the room this session is in. ' +
 			'Returns {ok:true, room, did:"created"|"appended", title, kind} — then tell the user in one sentence what was written where. ' +

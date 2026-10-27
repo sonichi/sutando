@@ -46,14 +46,14 @@ def reply_for(req, action_id="reauth", **kw):
 
 class SchemaTests(unittest.TestCase):
     def test_wire_shape(self):
-        req = make_req(title="t", device={"id": "d1", "name": "Qingyun's Air"})
+        req = make_req(title="t", device={"id": "d1", "name": "the owner's laptop"})
         w = req.to_wire()
         self.assertEqual(w["kind"], "auth")
         self.assertEqual(w["status"], "pending")
         self.assertEqual(w["revision"], 1)
         self.assertEqual(w["guard"], "screen-hash-abc")
         self.assertEqual(w["actions"][0], {"id": "reauth", "kind": "authenticate", "label": "Re-authenticate"})
-        self.assertEqual(w["device"]["name"], "Qingyun's Air")
+        self.assertEqual(w["device"]["name"], "the owner's laptop")
         self.assertEqual(WIRE_FIELD, "space.ag2.hitl")
 
     def test_every_card_names_the_host_at_the_wire(self):
@@ -125,9 +125,36 @@ class SchemaTests(unittest.TestCase):
         req.transition("resolved")  # probe cleared it, no click ever came
         self.assertTrue(req.terminal)
 
+    def test_the_third_layer_pins_a_reply_to_the_requirements_room(self):
+        """When the requirement names a room, a reply from any other room is stale."""
+        req = make_req(room="!owner-dm:ag2.space")
+        reply = reply_for(req)
+        with self.assertRaises(StaleRequirementError) as e:
+            validate_action(req, reply)
+        self.assertIn("another room", str(e.exception))
+        reply.room = "!other:ag2.space"
+        with self.assertRaises(StaleRequirementError):
+            validate_action(req, reply)
+        reply.room = "!owner-dm:ag2.space"
+        self.assertEqual(validate_action(req, reply).id, "reauth")
+        anywhere = make_req()
+        self.assertEqual(anywhere.room, "", "a requirement with no room takes a reply from anywhere")
+        self.assertEqual(validate_action(anywhere, reply_for(anywhere, room="!x:y")).id, "reauth")
+        wire = ActionReply.from_wire({"hitl_id": req.id, "expected_revision": 1, "action_id": "reauth",
+                                      "guard": req.guard, "room": "!owner-dm:ag2.space", "sender": "@chi:ag2.space"})
+        self.assertEqual((wire.room, wire.sender), ("!owner-dm:ag2.space", "@chi:ag2.space"))
+        bare = ActionReply.from_wire({"hitl_id": req.id, "expected_revision": 1, "action_id": "reauth", "guard": "g"})
+        self.assertEqual((bare.room, bare.sender), ("", ""))
+
     def test_action_reply_from_wire_rejects_garbage(self):
         with self.assertRaises(MalformedActionError):
             ActionReply.from_wire({"hitl_id": "x"})
+
+
+def _is_dir_fd(fd):
+    import os as _os
+    import stat as _stat
+    return _stat.S_ISDIR(_os.fstat(fd).st_mode)
 
 
 class ManagerTests(unittest.TestCase):
@@ -163,6 +190,54 @@ class ManagerTests(unittest.TestCase):
         self.assertEqual(action.kind, "authenticate")
         self.assertEqual(self.mgr.get(req.id).status, "in_progress")
         self.assertEqual(self.mgr.get(req.id).chosen_action, "reauth")
+
+    def test_apply_action_runs_the_patch_after_the_reload_inside_the_one_save(self):
+        """`patch(req)` runs after the reload and before the sole save, so what it sets lands
+        in the same write as the acceptance; the production save count is exactly one."""
+        req = self.mgr.create(make_req(kind="choice"))
+        saves = []
+        real = HitlStore.save
+
+        def counting(store, r, projection=None):
+            saves.append((r.id, r.status, dict(r.subject)))
+            return real(store, r, projection)
+        seen = []
+
+        def patch(r):
+            seen.append((r.status, r.chosen_action, r.revision))
+            r.subject["claude-local"] = {"effect_phase": "STOPPING", "stall_token": "t1"}
+        with mock.patch.object(HitlStore, "save", counting):
+            action = self.mgr.apply_action(reply_for(req), patch=patch)
+        self.assertEqual(action.id, "reauth")
+        self.assertEqual(seen, [("in_progress", "reauth", 2)], "the patch sees the accepted, reloaded requirement")
+        self.assertEqual(saves, [(req.id, "in_progress", {"claude-local": {"effect_phase": "STOPPING",
+                                                                            "stall_token": "t1"}})],
+                         "exactly one save, carrying the patch")
+        stored = self.mgr.get(req.id)
+        self.assertEqual((stored.status, stored.chosen_action, stored.subject["claude-local"]["effect_phase"]),
+                         ("in_progress", "reauth", "STOPPING"))
+        stale = self.mgr.create(make_req(kind="choice", guard="g2"))
+        with self.assertRaises(StaleRequirementError):
+            self.mgr.apply_action(reply_for(stale, expected_revision=9), patch=lambda r: r.subject.update(never="written"))
+        self.assertNotIn("never", self.mgr.get(stale.id).subject, "a refused action runs no patch")
+
+    def test_save_fsyncs_the_store_directory_after_the_replace_and_raises_when_it_fails(self):
+        """The record is durable, or the caller hears that it may not be."""
+        req = make_req()
+        import os as _os
+        real_fsync, real_replace = _os.fsync, _os.replace
+        order = []
+        with mock.patch.object(_os, "replace", lambda a, b: (order.append("replace"), real_replace(a, b))[1]), \
+                mock.patch.object(_os, "fsync", lambda fd: (order.append("dir" if _is_dir_fd(fd) else "file"),
+                                                            real_fsync(fd))[1]):
+            self.mgr.store.save(req)
+        self.assertEqual(order, ["file", "replace", "dir"], "file fsync, replace, then the directory fsync")
+        real = _os.fsync
+        with mock.patch.object(_os, "fsync", lambda fd: (_ for _ in ()).throw(OSError(5, "fsync failed"))
+                               if _is_dir_fd(fd) else real(fd)):
+            with self.assertRaises(OSError):
+                self.mgr.store.save(req)
+        self.assertIsNotNone(self.mgr.store.load(req.id), "the replace stood; only its durability is in doubt")
 
     def test_apply_action_stale_leaves_state_untouched(self):
         req = self.mgr.create(make_req())
@@ -275,6 +350,20 @@ class DefaultRunnerTest(unittest.TestCase):
             [sys.executable, "-c", "print('hitl-runner-probe')"])
         self.assertEqual(rc, 0)
         self.assertIn("hitl-runner-probe", out)
+
+
+class DefaultPathsTest(unittest.TestCase):
+    def test_no_workspace_resolves_through_the_repo_resolver_imported_at_the_call(self):
+        """The resolver is imported only when no workspace is given, so a vendored copy never needs it."""
+        import types
+        from hitl import manager, replies
+        ws = Path(tempfile.mkdtemp(prefix="hitl-ws-"))
+        fake = types.ModuleType("workspace_default")
+        fake.resolve_workspace = lambda *a, **kw: ws
+        with mock.patch.dict(sys.modules, {"workspace_default": fake}):
+            self.assertEqual(manager.default_store(), ws / "state" / "hitl" / "requirements")
+            self.assertEqual(replies.actions_dir(), ws / "state" / "hitl" / "actions")
+        self.assertEqual(manager.default_store(ws / "x"), ws / "x" / "state" / "hitl" / "requirements")
 
 
 if __name__ == "__main__":

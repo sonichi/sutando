@@ -830,52 +830,11 @@ def render_dashboard() -> str:
 
 # ── Mutating-request gate ────────────────────────────────────────────────────
 
-# CORS hides a cross-origin response but does not stop the request, and a
-# safelisted text/plain POST reaches the handler with no preflight.
-_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
-# A wildcard bind names no host, so the legitimate Host set cannot be derived
-# from it; DASHBOARD_ALLOWED_HOSTS supplies it explicitly for LAN mode.
-_WILDCARD_BINDS = frozenset({"0.0.0.0", "::", ""})
-
-
-def _authority_host(value: str) -> str:
-    """Hostname from a Host/Origin authority, minus port and IPv6 brackets."""
-    v = (value or "").strip().lower()
-    if v.startswith("["):
-        return v[1:].split("]", 1)[0]
-    return v.rsplit(":", 1)[0] if v.count(":") == 1 else v
-
-
-def _allowed_mutation_hosts(bind: str, declared: str) -> "set[str] | None":
-    """Host names a mutation may carry. None = wildcard bind with none declared."""
-    names = {h for h in (_authority_host(x) for x in (declared or "").split(",")) if h}
-    if (bind or "").strip().lower() in _WILDCARD_BINDS:
-        return (_LOOPBACK_HOSTS | names) if names else None
-    return _LOOPBACK_HOSTS | {bind.strip().lower()} | names
-
-
-def mutation_request_allowed(origin, host, content_type, *, expect_body,
-                             bind="127.0.0.1", allowed_hosts=""):
-    """Fail-closed gate for state-changing dashboard requests → (ok, reason)."""
-    permitted = _allowed_mutation_hosts(bind, allowed_hosts)
-    if permitted is None:
-        # Refusing loudly beats 403-ing every save with "host not allowed": on a
-        # wildcard bind the operator must name the hosts, or rebinding is free.
-        return False, ("wildcard DASHBOARD_BIND requires DASHBOARD_ALLOWED_HOSTS "
-                       "(comma-separated) before mutations are accepted")
-    if _authority_host(host) not in permitted:
-        # DNS rebinding: the attacker's name resolves to us, so only the Host
-        # header still carries it.
-        return False, "host not allowed"
-    if not origin:
-        return False, "missing Origin"
-    if urlparse(origin).netloc.strip().lower() != (host or "").strip().lower():
-        return False, "cross-origin request refused"
-    if expect_body and (content_type or "").split(";", 1)[0].strip().lower() != "application/json":
-        # Non-safelisted type: a cross-origin sender must preflight, which this
-        # server never grants.
-        return False, "Content-Type must be application/json"
-    return True, None
+# One gate, shared with the agent API; the names stay importable from here.
+from local_api_gate import (  # noqa: E402
+    _LOOPBACK_HOSTS, _WILDCARD_BINDS, _allowed_mutation_hosts, _authority_host,
+    mutation_request_allowed,
+)
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
