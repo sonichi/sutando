@@ -22,11 +22,21 @@ NOTICE_FIELD = "space.ag2.hitl_notice"
 WIRE_SUBJECT_FIELDS = ("tool", "input", "options", "choices")
 
 
+# Canonical JSON's integer range; a number outside it is refused like a float.
+WIRE_INT_MAX = 2 ** 53 - 1
+
+
 def wire_safe(value: Any) -> Any:
-    """`value` with no float at any depth, as canonical JSON requires: an integral float becomes
-    an int, any other float its shortest decimal string (repr), so no digit is lost."""
+    """`value` with only canonical-JSON numbers at any depth: an integral float within
+    +-WIRE_INT_MAX becomes an int, any other float or out-of-range int its repr string."""
+    if isinstance(value, bool):
+        return value
     if isinstance(value, float):
-        return int(value) if value.is_integer() else repr(value)
+        if value.is_integer() and -WIRE_INT_MAX <= value <= WIRE_INT_MAX:
+            return int(value)
+        return repr(value)
+    if isinstance(value, int):
+        return value if -WIRE_INT_MAX <= value <= WIRE_INT_MAX else repr(value)
     if isinstance(value, dict):
         return {k: wire_safe(v) for k, v in value.items()}
     if isinstance(value, (list, tuple)):

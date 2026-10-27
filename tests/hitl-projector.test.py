@@ -654,8 +654,14 @@ class RefusalWriterTests(unittest.TestCase):
 
 
 
+_SAFE_INT = 2 ** 53 - 1  # canonical JSON's integer range is [-(2**53)+1, 2**53-1]
+
+
 def _floats_at(o, path="$"):
+    """Every path holding a number canonical JSON refuses: any float, or an int out of range."""
     if isinstance(o, float):
+        return [path]
+    if isinstance(o, int) and not isinstance(o, bool) and not -_SAFE_INT <= o <= _SAFE_INT:
         return [path]
     if isinstance(o, dict):
         return [f for k, v in o.items() for f in _floats_at(v, f"{path}.{k}")]
@@ -700,8 +706,30 @@ class NoFloatOnTheWireTests(unittest.TestCase):
         expires = sent.sent[0]["extra_content"][WIRE_FIELD]["expires_at"]
         self.assertEqual((type(expires), expires), (int, 1793110320))
 
+    def test_numbers_at_the_edge_of_the_canonical_range_through_the_persisted_store(self):
+        edge = {"max": _SAFE_INT, "min": -_SAFE_INT, "over": 2 ** 53, "under": -(2 ** 53),
+                "max_f": float(_SAFE_INT), "min_f": float(-_SAFE_INT),
+                "over_f": float(2 ** 53), "under_f": -float(2 ** 53),
+                "huge_f": 1e100, "huge": 10 ** 30, "flag": True}
+        req = self.mgr.create(make_req(kind="permission", expires_at=float(2 ** 53),
+                                       subject={"tool": "Bash", "input": edge}))
+        self.assertEqual(HitlManager(HitlStore(Path(self.tmp.name))).get(req.id).subject["input"], edge,
+                         "the store kept every value as written")
+        sent = RecordingSender()
+        project(self.mgr, sent, ROOM)
+        self.assertEqual(_floats_at(sent.sent[0]), [], sent.sent[0])
+        wire = sent.sent[0]["extra_content"][WIRE_FIELD]
+        self.assertEqual(wire["subject"]["input"], {
+            "max": _SAFE_INT, "min": -_SAFE_INT, "over": "9007199254740992", "under": "-9007199254740992",
+            "max_f": _SAFE_INT, "min_f": -_SAFE_INT,
+            "over_f": "9007199254740992.0", "under_f": "-9007199254740992.0",
+            "huge_f": "1e+100", "huge": str(10 ** 30), "flag": True})
+        self.assertEqual(wire["expires_at"], "9007199254740992.0")
+
     def test_a_due_reminder_notice_carries_no_float(self):
-        self.mgr.create(make_req(expires_at=10 ** 7 + 0.5, created_at=1000.0, updated_at=1000.0))
+        """The notice is built from the persisted device, not from to_wire(): its own guard is pinned."""
+        self.mgr.create(make_req(device={"id": 7.5, "name": "n", "host": 2.5},
+                                 created_at=1000.0, updated_at=1000.0))
         sent = RecordingSender()
         project(self.mgr, sent, ROOM, clock=lambda: 1000.0)
         project(self.mgr, sent, ROOM, clock=lambda: 1000.0 + 31 * 60)
