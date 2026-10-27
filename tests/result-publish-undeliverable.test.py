@@ -3,8 +3,9 @@
 
 A `source: cron` task with no channel_id/chat_id has no consumer, so a plain body
 is archived unsent. The CLI refuses it (exit 2, nothing written) unless the body
-is a skip marker or redirect, the task names a destination, or the caller passes
---allow-undeliverable. A result whose task file is absent publishes as before.
+is a skip marker or redirect, the task names a destination, the result is not in
+the canonical workspace's results/, or the caller passes --allow-undeliverable.
+A missing or unreadable task file, or a helper that will not import, publishes.
 
 Run: python3 tests/result-publish-undeliverable.test.py
 """
@@ -27,6 +28,12 @@ CLI = REPO / "src" / "result_publish.py"
 sys.path.insert(0, str(REPO / "src"))
 
 import result_publish  # noqa: E402
+
+sys.path.insert(0, str(REPO / "packages" / "ag2-sparrow"))
+from ag2_sparrow import result_publish as vendored_publish  # noqa: E402
+
+# The bridge imports the vendored copy, so every in-process decision runs on both.
+MODULES = (result_publish, vendored_publish)
 
 CRON_TASK = ("id: {tid}\ntimestamp: 2026-10-26T12:00:00Z\nsource: cron\nuser_id: cron-runner\n"
              "access_tier: owner\npriority: low\ntask: /hourly-report\n")
@@ -114,20 +121,57 @@ class RefuseUndeliverable(unittest.TestCase):
             self.assertEqual(proc.returncode, 0, proc.stderr)
             self.assertTrue(target.exists())
 
+    def test_in_process_decisions_on_both_copies(self):
+        self._task("task-cron-a", CRON_TASK)
+        self._task("task-cron-routed", ROUTED_TASK)
+        self._task("task-chat-b", "id: task-chat-b\nsource: chat\ntask: x\n")
+        (self.ws / "tasks" / "task-cron-dir.txt").mkdir()
+        res = self.ws / "results"
+        cases = [
+            (res / "task-cron-a.txt", "report\n", True),
+            (res / "task-cron-a.txt", "[no-send] x\n", False),
+            (res / "task-cron-a.txt", "[channel: 1234567890]\nreport\n", False),
+            (res / "task-cron-routed.txt", "report\n", False),
+            (res / "task-chat-b.txt", "report\n", False),
+            (res / "task-cron-missing.txt", "report\n", False),
+            # unreadable task file: fail open
+            (res / "task-cron-dir.txt", "report\n", False),
+            (res / "proactive-1.txt", "report\n", False),
+            (self.ws / "elsewhere" / "task-cron-a.txt", "report\n", False),
+        ]
+        with mock.patch.dict("os.environ", self._env()):
+            for mod in MODULES:
+                for target, body, refused in cases:
+                    with self.subTest(mod=mod.__name__, target=target.name, body=body):
+                        reason = mod.undeliverable_reason(target, body)
+                        self.assertEqual(reason is not None, refused, reason)
+
+    def test_helper_import_failure_publishes(self):
+        self._task("task-cron-c", CRON_TASK)
+        target = self.ws / "results" / "task-cron-c.txt"
+        with mock.patch.dict("os.environ", self._env()):
+            for mod in MODULES:
+                with self.subTest(mod=mod.__name__), \
+                        mock.patch.object(mod, "_helpers", side_effect=ImportError("gone")):
+                    self.assertIsNone(mod.undeliverable_reason(target, "report\n"))
+
     def test_in_process_main_refuses_and_overrides(self):
         self._task("task-cron-hourly-8", CRON_TASK)
         target = self.ws / "results" / "task-cron-hourly-8.txt"
-        with mock.patch.dict("os.environ", self._env()), \
-                mock.patch.object(result_publish.sys, "stderr", io.StringIO()) as err:
-            with mock.patch.object(result_publish.sys, "stdin", io.StringIO("report\n")):
-                self.assertEqual(result_publish.main(["result_publish.py", str(target)]), 2)
-            self.assertIn("deliver-owner-dm.py", err.getvalue())
-            self.assertFalse(target.exists())
-            self.assertIsNone(result_publish.undeliverable_reason(target, "[no-send] x\n"))
-            with mock.patch.object(result_publish.sys, "stdin", io.StringIO("report\n")):
-                self.assertEqual(result_publish.main(
-                    ["result_publish.py", "--allow-undeliverable", str(target)]), 0)
-        self.assertEqual(target.read_text(encoding="utf-8"), "report\n")
+        with mock.patch.dict("os.environ", self._env()):
+            for mod in MODULES:
+                with self.subTest(mod=mod.__name__), \
+                        mock.patch.object(mod.sys, "stderr", io.StringIO()) as err:
+                    with mock.patch.object(mod.sys, "stdin", io.StringIO("report\n")):
+                        self.assertEqual(mod.main(["result_publish.py", str(target)]), 2)
+                    self.assertIn("deliver-owner-dm.py", err.getvalue())
+                    self.assertFalse(target.exists())
+                    with mock.patch.object(mod.sys, "stdin", io.StringIO("report\n")):
+                        self.assertEqual(mod.main(
+                            ["result_publish.py", "--allow-undeliverable", str(target)]), 0)
+                    self.assertEqual(target.read_text(encoding="utf-8"), "report\n")
+                    target.unlink()
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
