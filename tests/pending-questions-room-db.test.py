@@ -6,6 +6,12 @@ unreachable, is replayed idempotently by the next pass (an incomplete row resume
 is listed once as "not yet in the room"; a host reads only its own rows; code never
 writes the owner's Status and never reopens a closed row; the reminder sends nothing
 unless asked. No real room is touched: the room-collab capability is a fake."""
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import asyncio
 import contextlib
 import importlib.util
@@ -295,7 +301,7 @@ class TestDiscoveryAndScriptClient(_Ws):
         self.assertEqual(where, ROOM)
         self.assertIn(AGENT, store.client.argv)
         self.assertEqual(store.lock, self.ws / "state" / "pending-questions-db.lock")
-        self.assertEqual(store.link, f"https://collab.test.invalid/#/room/{ROOM}?surface=db&page=pendingq")
+        self.assertEqual(store.link, "https://collab.test.invalid/home/!ownerdm%3Atest.invalid?surface=database&page=pendingq")
 
     def test_the_script_client_round_trips_through_the_adapter(self):
         _install_fake_capability(self.ws)

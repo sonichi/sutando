@@ -1469,6 +1469,72 @@ class TestCard(Base):
         self.assertEqual((connectors.list_markers(self.ws), self.spawned), ([], []))
 
 
+class TestCardStationAccount(Base):
+    """No card, from `card` or `await`, when the agent's account is not the one the station was stamped for."""
+
+    def stamp(self, user):
+        (self.ws / "state").mkdir(exist_ok=True)
+        stamp = {"version": 1, "has_station_entry": True, "cloud_user_id": user, "spawned_at": "2026-09-15T00:00:00Z"}
+        (self.ws / "state" / "station-core-stamp.json").write_text(json.dumps(stamp))
+
+    def assert_no_card(self):
+        self.assertEqual((connectors.list_markers(self.ws), connectors.read_cards(self.ws), self.spawned), ([], [], []))
+
+    def test_card_on_another_account_posts_no_card_and_names_both(self):
+        self.stamp("u-desktop")
+        for private in (False, True):
+            with self.subTest(private=private):
+                room = SHARED if private else ROOM
+                code, out = run(self.ws, card_argv("googlecalendar", room=room, private=private),
+                                FakeCloud(self.ws, user="u-agent"), self.spawn)
+                self.assertEqual((code, out["reason"], out["cloud_user_id"], out["stamp_cloud_user_id"]),
+                                 (connectors.EXIT_NO, "account_changed", "u-agent", "u-desktop"))
+                self.assertEqual((out["wait_id"], out["message"], out["base"]), (None, None, "https://sutando.ag2.space"))
+                self.assert_no_card()
+
+    def test_await_on_another_account_posts_no_card_and_names_both(self):
+        self.stamp("u-desktop")
+        for argv in (await_argv("linear"), private_argv("linear")):
+            with self.subTest(private="--private" in argv):
+                code, out = run(self.ws, argv, FakeCloud(self.ws, user="u-agent"), self.spawn)
+                self.assertEqual((code, out["reason"], out["cloud_user_id"], out["stamp_cloud_user_id"], out["wait_id"]),
+                                 (connectors.EXIT_NO, "account_changed", "u-agent", "u-desktop", None))
+                self.assert_no_card()
+
+    def test_the_stamp_is_read_once_so_both_ids_come_from_one_read(self):
+        reads = [{"version": 1, "cloud_user_id": "u-desktop"}, None]
+        reader = mock.Mock(side_effect=lambda _ws: reads.pop(0))
+        with mock.patch.object(connectors, "read_station_stamp", reader):
+            code, out = run(self.ws, card_argv("googlecalendar"), FakeCloud(self.ws, user="u-agent"), self.spawn)
+        self.assertEqual((code, out["reason"], out["stamp_cloud_user_id"], reader.call_count),
+                         (connectors.EXIT_NO, "account_changed", "u-desktop", 1))
+        self.assert_no_card()
+
+    def test_the_stamped_account_still_gets_its_card(self):
+        self.stamp("u-owner")
+        code, out = run(self.ws, card_argv("googlecalendar"), FakeCloud(self.ws), self.spawn)
+        self.assertEqual((code, out["message"]["operation_id"]), (connectors.EXIT_OK, "task-abc:connect-card"))
+        self.assertEqual(self.spawned, [out["wait_id"]])
+
+    def test_no_stamp_or_an_unknown_account_keeps_the_card(self):
+        for name, stamped, user in (("no stamp", None, "u-agent"), ("stamp without account", "", "u-agent"),
+                                    ("unknown agent account", "u-desktop", "")):
+            with self.subTest(name):
+                stamp_file = self.ws / "state" / "station-core-stamp.json"
+                if stamped is None:
+                    stamp_file.unlink(missing_ok=True)
+                else:
+                    self.stamp(stamped)
+                task = f"task-{len(self.spawned)}"
+                self.origin(task)
+                with mock.patch.object(connectors, "ACCOUNT_RETRY_S", ()):
+                    code, out = run(self.ws, card_argv("googlecalendar", task=task, reply=f"$e{task}"),
+                                    FakeCloud(self.ws, user=user), self.spawn)
+                self.assertEqual(code, connectors.EXIT_OK)
+                self.assertIsNotNone(out["message"])
+                self.assertNotIn("reason", out)
+
+
 class TestCardSwitch(Base):
     def test_switch_payload_and_a_fresh_baseline(self):
         cloud = FakeCloud(self.ws, connections=linear_rows(OLD_ID))
@@ -1778,6 +1844,64 @@ class CloudPostTests(unittest.TestCase):
                 with self.assertRaises(cloud_auth.CloudError) as ctx:
                     self.cloud(exc).post("/api/x")
                 self.assertEqual((ctx.exception.status, ctx.exception.code), (0, "network"))
+
+
+class TestStampedAccountCredential(unittest.TestCase):
+    """#5261: cloud_auth refuses a credential for another user than the stamp; connect-apps
+    names that as wrong_account instead of acting as that user or saying 'not signed in'."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        tmp = Path(self._tmp.name)
+        self.ws = tmp / "ws"
+        (self.ws / "state" / "auth").mkdir(parents=True)
+        (self.ws / "state" / "auth" / "cloud-auth.json").write_text(
+            json.dumps({"apiBase": "https://sutando.ag2.space", "token": "sutk_B"}))
+        (self.ws / "state" / "station-core-stamp.json").write_text(
+            json.dumps({"version": 1, "has_station_entry": True, "cloud_user_id": "u-A", "spawned_at": "x"}))
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("SUTANDO_PACKAGED", "SUTANDO_APP_SUPPORT", "SUTANDO_METERING_HEADERS")}
+        self.ids = {"sutk_B": "u-B"}
+        for p in (mock.patch.dict(os.environ, env, clear=True),
+                  mock.patch.object(cloud_auth.Path, "home", return_value=tmp / "home"),
+                  mock.patch.object(cloud_auth, "keychain_get", return_value=None),
+                  mock.patch.object(cloud_auth, "cloud_request", side_effect=self.me),
+                  mock.patch.object(cloud_auth, "_USER_IDS", {}, create=True)):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def me(self, base, token, method, path, **_):
+        if token not in self.ids:
+            raise cloud_auth.CloudError(0, "network", "down")
+        return {"id": self.ids[token]}
+
+    def test_another_users_file_is_never_sent_and_reads_as_wrong_account(self):
+        sent = []
+        cloud = connectors.Cloud(self.ws, request=lambda *a, **k: sent.append(a) or {})
+        with self.assertRaises(connectors.Setup) as ctx:
+            cloud.get("/api/connectors")
+        self.assertEqual(ctx.exception.code, "wrong_account")
+        self.assertIn("u-B", str(ctx.exception))
+        self.assertIn("u-A", str(ctx.exception))
+        with self.assertRaises(connectors.Setup):
+            cloud.post("/api/x")
+        self.assertEqual(sent, [], "no call acts as the other account")
+
+    def test_an_unreachable_account_check_is_a_retriable_cloud_error(self):
+        self.ids = {}
+        with self.assertRaises(cloud_auth.CloudError) as ctx:
+            connectors.Cloud(self.ws, request=lambda *a, **k: {}).get("/api/connectors")
+        self.assertEqual((ctx.exception.status, ctx.exception.code), (0, "account_unverified"))
+        self.assertIn("try again", str(ctx.exception))
+        self.assertIn("temporarily unavailable", str(ctx.exception))
+        self.assertNotIn("sign in", str(ctx.exception))
+
+    def test_the_stamped_users_credential_still_serves(self):
+        self.ids = {"sutk_B": "u-A"}
+        cloud = connectors.Cloud(self.ws, request=lambda base, tok, *a, **k: {"connections": [], "tok": tok})
+        self.assertEqual(cloud.get("/api/connectors")["tok"], "sutk_B")
+        self.assertIsNone(cloud.refused)
 
 
 if __name__ == "__main__":

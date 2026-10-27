@@ -107,7 +107,130 @@ class Base(unittest.TestCase):
         return rem.recover(self.ws, REPO, self.wid, runner=self.t, **kw)
 
 
+class DeliveryRecoveryControls(Base):
+    def setUp(self):
+        super().setUp()
+        import pool_router as router
+        self.router = router
+        self.tid = "task-interrupted"
+        (self.ws / "tasks").mkdir()
+        rem.pd.payload_path(self.ws, self.tid).write_text("task: keep the original payload\n")
+        router.deliver_one(self.ws, self.wid, self.tid)
+        self.accepted = rem.pd.accept(Path(self.inbox) / f"{self.tid}.txt")
+
+    @staticmethod
+    def snapshot(root):
+        return {str(p.relative_to(root)): p.read_bytes() for p in root.rglob("*") if p.is_file()}
+
+    def test_live_paused_suspended_and_indeterminate_sessions_do_not_release(self):
+        for guard, expected in (("live", rem.ALREADY_RUNNING), ("paused", rem.PAUSED),
+                                ("suspended", rem.SUSPENDED), ("unknown", rem.INDETERMINATE)):
+            with self.subTest(guard=guard):
+                with contextlib.ExitStack() as stack:
+                    if guard == "paused":
+                        path = wi.worker_dir(self.ws, self.wid) / sup.PAUSED_MARKER
+                        path.touch()
+                        stack.callback(path.unlink)
+                    elif guard == "suspended":
+                        rem.suspend(self.ws, "test-stop")
+                        stack.callback(rem.suspended_path(self.ws).unlink)
+                    else:
+                        stack.enter_context(mock.patch.object(sw, "session_state", return_value=(
+                            "exists" if guard == "live" else "unknown")))
+                    before = self.snapshot(self.ws)
+                    with mock.patch.object(rem.pd, "reconcile_interrupted", wraps=rem.pd.reconcile_interrupted) as reconcile:
+                        self.assertEqual(self.recover()["outcome"], expected)
+                    reconcile.assert_not_called()
+                    self.assertEqual(self.snapshot(self.ws), before)
+                    self.assertEqual(len(self.t.launches()), self.launched_before)
+
+    def test_recovery_leaves_another_worker_and_another_workspace_unchanged(self):
+        other = wi.create_worker(self.ws, runtime="claude", cwd=str(REPO))["worker_id"]
+        sibling_ws = self.ws / "separate-workspace"
+        for ws, wid, tid in ((self.ws, other, "task-other"), (sibling_ws, self.wid, self.tid)):
+            rem.pd.payload_path(ws, tid).parent.mkdir(parents=True, exist_ok=True)
+            rem.pd.payload_path(ws, tid).write_text("task: keep the original payload\n")
+            self.router.deliver_one(ws, wid, tid)
+            rem.pd.accept(rem.pd.deliveries_dir(ws, wid) / f"{tid}.txt")
+        roots = [rem.pd.deliveries_dir(self.ws, other), wi.worker_dir(self.ws, other), sibling_ws]
+        before = [self.snapshot(p) for p in roots]
+        self.assertEqual(self.recover()["outcome"], rem.RECOVERED)
+        self.assertEqual([self.snapshot(p) for p in roots], before)
+        self.assertEqual(rem.pd.find(self.ws, self.wid, self.tid).suffix, ".txt")
+
+    def test_conflicting_holders_fail_recovery_before_launch(self):
+        other = wi.create_worker(self.ws, runtime="claude", cwd=str(REPO))["worker_id"]
+        other_folder = rem.pd.deliveries_dir(self.ws, other)
+        other_folder.mkdir(parents=True, exist_ok=True)
+        twin = other_folder / f"{self.tid}.accepted"
+        twin.touch()
+        out = self.recover()
+        self.assertEqual(out["outcome"], rem.FAILED)
+        self.assertIn("refusing to choose", out["why"])
+        self.assertEqual(len(self.t.launches()), self.launched_before)
+        self.assertTrue(self.accepted.is_file())
+        self.assertTrue(twin.is_file())
+
+    def test_reconciliation_io_failure_prevents_launch_and_retry_recovers(self):
+        lock = Path(self.inbox) / rem.pd.LOCK_NAME
+        lock.unlink()
+        lock.mkdir()
+        runs = wi.incarnations(self.ws, self.wid)
+        out = self.recover()
+        self.assertEqual(out["outcome"], rem.FAILED)
+        self.assertIn(".lock", out["why"])
+        self.assertEqual(out["closed_runs"], [runs[-1]["incarnation_id"]])
+        self.assertEqual(len(self.t.launches()), self.launched_before)
+        self.assertTrue(self.accepted.exists())
+        lock.rmdir()
+        self.assertEqual(self.recover()["outcome"], rem.RECOVERED)
+        self.assertFalse(self.accepted.exists())
+        self.assertEqual(rem.pd.find(self.ws, self.wid, self.tid).suffix, ".txt")
+        self.assertEqual(len(self.t.launches()), self.launched_before + 1)
+
+    def test_partial_reconciliation_failure_is_idempotent_on_retry(self):
+        tid = "task-z-second"
+        rem.pd.payload_path(self.ws, tid).write_text("task: second payload\n")
+        self.router.deliver_one(self.ws, self.wid, tid)
+        accepted = rem.pd.accept(Path(self.inbox) / f"{tid}.txt")
+        rename = os.rename
+
+        def fail_second(source, *args, **kwargs):
+            if source == accepted.name:
+                raise OSError("interrupted second transition")
+            return rename(source, *args, **kwargs)
+
+        with mock.patch.object(rem.pd.os, "rename", side_effect=fail_second):
+            out = self.recover()
+        self.assertEqual(out["outcome"], rem.FAILED)
+        self.assertEqual(len(self.t.launches()), self.launched_before)
+        self.assertEqual(rem.pd.find(self.ws, self.wid, self.tid).suffix, ".txt")
+        self.assertTrue(accepted.is_file())
+        self.assertEqual(self.recover()["outcome"], rem.RECOVERED)
+        self.assertEqual([p.name for p in rem.pd.pending(self.ws, self.wid)],
+                         [f"{self.tid}.txt", f"{tid}.txt"])
+        self.assertEqual(rem.pd.accepted(self.ws, self.wid), [])
+        self.assertEqual(self.router.committed_recipient(self.ws, tid), self.wid)
+
+
 class ItResumesTheSameWorker(Base):
+    def test_shared_recovery_checks_suspension_before_probes_or_writes(self):
+        rem.suspend(self.ws, "renewed-stop")
+        before = {p: p.read_bytes() for p in wi.worker_dir(self.ws, self.wid).glob("*.json")}
+        with mock.patch.object(sup, "is_paused", side_effect=AssertionError("past guard")), \
+                mock.patch.object(wi, "sessions", side_effect=AssertionError("read lineage")), \
+                mock.patch.object(sw, "session_state", side_effect=AssertionError("probed")), \
+                mock.patch.object(rem, "close_dead_runs", side_effect=AssertionError("closed")), \
+                mock.patch.object(sw, "spawn", side_effect=AssertionError("launched")):
+            self.assertEqual(self.recover(), {"worker_id": self.wid, "outcome": rem.SUSPENDED})
+        self.assertEqual({p: p.read_bytes() for p in before}, before)
+        self.assertEqual(len(self.t.launches()), self.launched_before)
+
+    def test_another_workspaces_suspension_does_not_block_recovery(self):
+        rem.suspend(self.ws / "other", "unrelated-stop")
+        self.assertEqual(self.recover()["outcome"], rem.RECOVERED)
+        self.assertEqual(len(self.t.launches()), self.launched_before + 1)
+
     def test_a_dead_worker_comes_back_on_its_own_session(self):
         out = self.recover()
         self.assertEqual(out["outcome"], rem.RECOVERED)
@@ -136,6 +259,201 @@ class ItResumesTheSameWorker(Base):
         self.assertEqual(sockets, {SOCK},
                          "a timer has no SUTANDO_TMUX_SOCKET; falling back to it probes and "
                          "launches on a tmux server the worker never ran on")
+
+
+class RecoverySessionSelection(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.ws = Path(tmp.name)
+        timer = mock.patch.object(sw, "ensure_remedy_timer", return_value={"installed": False})
+        timer.start()
+        self.addCleanup(timer.stop)
+        self.t = FakeTmux()
+        self.a_dir, self.b_dir = self.ws / "project-a", self.ws / "project-b"
+        self.a_dir.mkdir()
+        self.b_dir.mkdir()
+        first = wi.create_worker(self.ws, runtime="claude", cwd=str(self.a_dir),
+                                 tmux_socket=SOCK)
+        self.wid, self.a = first["worker_id"], first["runtime_session_id"]
+        wi.end_incarnation(self.ws, self.wid, first["incarnation_id"], "exited")
+        self.b = "later-session-b"
+        wi.record_session(self.ws, self.wid, self.b, runtime="claude",
+                          relation=wi.RELATION_NEW, cwd=str(self.b_dir))
+        b_run = wi.start_incarnation(self.ws, self.wid, self.b, tmux_socket=SOCK,
+                                     tmux_session=wi.tmux_session_name(self.wid))
+        wi.end_incarnation(self.ws, self.wid, b_run["incarnation_id"], "exited")
+        sw.pr.register_worker(self.ws, self.wid, "alpha", room="test-room", runtime="claude")
+        sw.spawn(self.ws, REPO, resume=self.a, socket=SOCK, runner=self.t)
+        self.t.live.clear()
+        other = wi.create_worker(self.ws, runtime="claude", cwd=str(self.b_dir))
+        self.other, self.other_session = other["worker_id"], other["runtime_session_id"]
+        sw.pr.register_worker(self.ws, self.other, "beta", runtime="claude")
+        import pool_router as router
+        self.router = router
+        (self.ws / "tasks").mkdir()
+        for task_id in ("task-pending", "task-accepted"):
+            rem.pd.payload_path(self.ws, task_id).write_text(
+                "source: test\nchannel_id: test-room\ntask: payload for " + task_id + "\n")
+            self.assertEqual(router.route(self.ws, {"id": task_id, "channel_id": "test-room"})
+                             ["delivered"], [self.wid])
+        rem.pd.accept(rem.pd.deliveries_dir(self.ws, self.wid) / "task-accepted.txt")
+
+    def snapshot(self, *, include_runs=False):
+        mutable = {wi.incarnations_path(self.ws, self.wid), wi.current_path(self.ws, self.wid)}
+        return {str(p.relative_to(self.ws)): p.read_bytes() for p in self.ws.rglob("*")
+                if p.is_file() and (include_runs or p not in mutable)}
+
+    def assert_reconciled(self, before):
+        old = f"deliveries/{self.wid}/task-accepted.accepted"
+        expected = dict(before)
+        if old in expected:
+            expected[old.replace(".accepted", ".txt")] = expected.pop(old)
+        self.assertEqual(self.snapshot(), expected)
+
+    def recover(self, *, reopened=False):
+        if reopened:
+            code = """
+import json, runpy, sys
+from unittest import mock
+m = runpy.run_path(sys.argv[1], run_name='recovery_fixture')
+rem, t = m['rem'], m['FakeTmux']()
+with mock.patch.object(rem.sw, 'ensure_remedy_timer', return_value={'installed': False}):
+    out = rem.recover(sys.argv[2], sys.argv[3], sys.argv[4], runner=t)
+keys = ('SUTANDO_CLAUDE_RESUME', 'SUTANDO_CLAUDE_WORKING_DIR', 'SUTANDO_TMUX_SOCKET',
+        'SUTANDO_WORKER_ID', 'SUTANDO_INSTANCE_ID', 'SUTANDO_TASKS_DIR')
+print(json.dumps({'out': out, 'launches': [{k: e.get(k) for k in keys}
+                                         for _, e in t.launches()]}))
+"""
+            cp = subprocess.run([sys.executable, "-c", code, __file__, str(self.ws),
+                                 str(REPO), self.wid], env=dict(os.environ),
+                                capture_output=True, text=True, timeout=20)
+            self.assertEqual(cp.returncode, 0, cp.stderr)
+            result = json.loads(cp.stdout)
+            self.assertEqual(len(result["launches"]), 1)
+            return result["out"], result["launches"][0]
+        before = len(self.t.launches())
+        out = rem.recover(self.ws, REPO, self.wid, runner=self.t)
+        self.assertEqual(len(self.t.launches()), before + 1)
+        return out, self.t.launches()[-1][1]
+
+    def assert_selected(self, out, env, sid, folder):
+        self.assertEqual(out["outcome"], rem.RECOVERED)
+        self.assertEqual(out["session_id"], sid)
+        for key, value in {"SUTANDO_CLAUDE_RESUME": sid,
+                           "SUTANDO_CLAUDE_WORKING_DIR": str(folder),
+                           "SUTANDO_TMUX_SOCKET": SOCK, "SUTANDO_WORKER_ID": self.wid,
+                           "SUTANDO_INSTANCE_ID": self.wid,
+                           "SUTANDO_TASKS_DIR": str(rem.pd.deliveries_dir(self.ws, self.wid))}.items():
+            self.assertEqual(env[key], value, key)
+
+    def test_latest_incarnation_selects_a_and_survives_reopening(self):
+        for reopened in (False, True):
+            with self.subTest(reopened=reopened):
+                self.t.live.clear()
+                before, runs = self.snapshot(), wi.incarnations(self.ws, self.wid)
+                with mock.patch.dict(os.environ, {"SUTANDO_TMUX_SOCKET": "/wrong/default.sock"}):
+                    out, env = self.recover(reopened=reopened)
+                self.assert_selected(out, env, self.a, self.a_dir)
+                self.assert_reconciled(before)
+                after = wi.incarnations(self.ws, self.wid)
+                self.assertEqual(len(after), len(runs) + 1)
+                self.assertEqual(after[:-2], runs[:-1])
+                self.assertEqual(after[-2], {**runs[-1], "ended_at": after[-2]["ended_at"],
+                                             "end_reason": "crashed"})
+                self.assertIsNotNone(after[-2]["ended_at"])
+                self.assertEqual(out["closed_runs"], [runs[-1]["incarnation_id"]])
+                self.assertEqual(after[-1]["session_id"], self.a)
+                self.assertIsNone(after[-1]["ended_at"])
+                self.assertEqual(wi.current(self.ws, self.wid), {
+                    "session_id": self.a, "incarnation_id": after[-1]["incarnation_id"]})
+                for task_id in ("task-pending", "task-accepted"):
+                    self.assertEqual(self.router.committed_recipient(self.ws, task_id), self.wid)
+                self.assertEqual([p.name for p in rem.pd.pending(self.ws, self.wid)],
+                                 ["task-pending.txt", "task-accepted.txt"])
+                self.assertEqual(rem.pd.accepted(self.ws, self.wid), [])
+
+    def test_failed_recovery_retries_a_even_after_current_is_cleared(self):
+        before, runs = self.snapshot(), wi.incarnations(self.ws, self.wid)
+        self.t.launcher_fails = True
+        out, env = self.recover()
+        self.assertEqual(out["outcome"], rem.FAILED)
+        self.assertIn("not logged in", out["why"])
+        self.assertEqual(env["SUTANDO_CLAUDE_RESUME"], self.a)
+        self.assertEqual(env["SUTANDO_CLAUDE_WORKING_DIR"], str(self.a_dir))
+        failed = wi.incarnations(self.ws, self.wid)
+        self.assertEqual(len(failed), len(runs) + 1)
+        self.assertEqual(failed[-1]["session_id"], self.a)
+        self.assertEqual(failed[-1]["end_reason"], "crashed")
+        self.assertTrue(all(r["ended_at"] is not None for r in failed))
+        self.assertEqual(wi.current(self.ws, self.wid), {"session_id": None, "incarnation_id": None})
+        self.assert_reconciled(before)
+        out, env = self.recover(reopened=True)
+        self.assert_selected(out, env, self.a, self.a_dir)
+        self.assertEqual(out["closed_runs"], [])
+        retried = wi.incarnations(self.ws, self.wid)
+        self.assertEqual(retried[:-1], failed)
+        self.assertEqual(retried[-1]["session_id"], self.a)
+        self.assertIsNone(retried[-1]["ended_at"])
+        self.assert_reconciled(before)
+
+    def test_inconsistent_reference_refuses_without_mutation_or_launch(self):
+        path = wi.incarnations_path(self.ws, self.wid)
+        for missing in ("unrecorded-session", self.other_session):
+            with self.subTest(reference=missing):
+                runs = wi.incarnations(self.ws, self.wid)
+                runs[-1]["session_id"] = missing
+                path.write_text(json.dumps({"incarnations": runs}))
+                before, launches = self.snapshot(include_runs=True), len(self.t.launches())
+                out = rem.recover(self.ws, REPO, self.wid, runner=self.t)
+                self.assertEqual(out["outcome"], rem.NO_SESSION)
+                self.assertIn(missing, out["why"])
+                self.assertEqual(len(self.t.launches()), launches)
+                self.assertEqual(self.snapshot(include_runs=True), before)
+
+    def test_legacy_missing_or_empty_reference_uses_latest_lineage(self):
+        path = wi.incarnations_path(self.ws, self.wid)
+        for reference in (None, "", "absent"):
+            with self.subTest(reference=reference):
+                self.t.live.clear()
+                runs = wi.incarnations(self.ws, self.wid)
+                if reference == "absent":
+                    runs[-1].pop("session_id")
+                else:
+                    runs[-1]["session_id"] = reference
+                path.write_text(json.dumps({"incarnations": runs}))
+                out, env = self.recover()
+                self.assert_selected(out, env, self.b, self.b_dir)
+
+    def test_legacy_without_incarnations_uses_latest_lineage(self):
+        wi.incarnations_path(self.ws, self.wid).write_text(json.dumps({"incarnations": []}))
+        with mock.patch.dict(os.environ, {"SUTANDO_TMUX_SOCKET": SOCK}):
+            out, env = self.recover()
+        self.assert_selected(out, env, self.b, self.b_dir)
+
+    def test_selected_session_with_empty_folder_uses_repository(self):
+        rows = wi.sessions(self.ws, self.wid)
+        rows[0]["transcript"]["cwd"] = ""
+        wi.sessions_path(self.ws, self.wid).write_text(json.dumps({"sessions": rows}))
+        out, env = self.recover()
+        self.assert_selected(out, env, self.a, REPO)
+
+    def test_pause_and_suspension_preserve_the_multi_session_worker(self):
+        pause = wi.worker_dir(self.ws, self.wid) / sup.PAUSED_MARKER
+        pause.touch()
+        before, launches = self.snapshot(include_runs=True), len(self.t.launches())
+        out = rem.recover(self.ws, REPO, self.wid, runner=self.t)
+        self.assertEqual(out["outcome"], rem.PAUSED)
+        self.assertEqual(self.snapshot(include_runs=True), before)
+        pause.unlink()
+        rem.suspend(self.ws, "test suspension")
+        with rem.pool_lock(self.ws):
+            pass
+        before = self.snapshot(include_runs=True)
+        out = rem.restart(self.ws, REPO, self.wid, runner=self.t)
+        self.assertEqual(out["result"], rem.SUSPENDED)
+        self.assertEqual(self.snapshot(include_runs=True), before)
+        self.assertEqual(len(self.t.launches()), launches)
 
 
 class CodexRecovery(unittest.TestCase):
@@ -354,6 +672,16 @@ class APartialCloseIsBounded(Base):
 
 
 class ApplyingATick(Base):
+    def test_human_dispatch_rechecks_pause_and_suspension(self):
+        marker = wi.worker_dir(self.ws, self.wid) / sup.PAUSED_MARKER
+        with mock.patch.object(rem.wc, "raise_card") as raised:
+            marker.touch()
+            rem.apply(self.ws, REPO, {self.wid: ps.CARD_HUMAN}, runner=self.t)
+            marker.unlink()
+            rem.suspend(self.ws, "test")
+            rem.apply(self.ws, REPO, {self.wid: ps.CARD_HUMAN}, runner=self.t)
+            raised.assert_not_called()
+
     def test_only_recover_acts_and_escalate_passes_through(self):
         other = wi.new_worker_id()
         seen = []
@@ -457,6 +785,103 @@ class TheSweepOnALoggedOutWorker(Base):
         active = rem.wc.manager_for(self.ws).active()
         self.assertEqual([r.subject["wedge"] for r in active], [ps.CARD_CAUSE])
         self.assertIn("API Error: 500", active[0].message)
+
+
+
+class PressedProxyRecovery(Base):
+    def sweep(self, pane, frame, pending, *, previous="old", alive=True,
+              sample_at=1000.0, dry_run=False, held=None, paused=False):
+        sup.save_state(self.ws, ps.SupervisionState(
+            last_sample_at=sample_at, workers={self.wid: ps.WorkerEvidence(
+                wedge_consecutive=3, wedge_first_detected_at=100.0,
+                wedge_escalated=True, wedge_kind="abnormal", last_pane_id=previous)}))
+        args = types.SimpleNamespace(workspace=self.ws, repo=REPO, resume=False,
+                                     recipient=None, dry_run=dry_run)
+        with contextlib.ExitStack() as stack:
+            for obj, name, value in (
+                (sup, "probe_session", alive), (sup, "session_watcher_holds", True),
+                (sup, "observe_pane", (pane, frame)), (sup, "work_outstanding", pending),
+                (sup, "is_paused", paused), (rem, "suspension", held),
+                (rem, "ensure_supervisors", {}), (rem, "ensure_input_watches", {}),
+                (rem.wc, "raise_card", {"outcome": "refused"})):
+                stack.enter_context(mock.patch.object(obj, name, return_value=value))
+            stack.enter_context(mock.patch.object(rem, "time", types.SimpleNamespace(time=lambda: 1300.0)))
+            stack.enter_context(mock.patch.object(rem.subprocess, "run",
+                                                  side_effect=AssertionError("no external action")))
+            output = stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            self.assertEqual(rem._sweep(args), 0)
+        out = json.loads(output.getvalue())
+        self.assertEqual(out["recoveries"], {})
+        return out
+
+    def pressed_card(self):
+        from hitl.schema import ActionReply
+        def capture(argv, **kw):
+            return subprocess.CompletedProcess(argv, 0, API_PANE, "")
+        out = rem.wc.raise_card(self.ws, self.wid, ps.CARD_CAUSE,
+                                 runner=capture, routed=lambda *a: True)
+        manager = rem.wc.manager_for(self.ws)
+        req = manager.get(out["hitl_id"])
+        manager.apply_action(ActionReply(hitl_id=req.id, expected_revision=req.revision,
+                                         action_id=rem.wc.PROXY_ACTION, guard=req.guard))
+        return req.id
+
+    def test_uncertain_or_wedged_observations_retain_pressed_proxy(self):
+        cases = [(None, None, True, "old", True),
+                 (ps.PANE_UNKNOWN, "new", True, "old", True),
+                 (ps.PANE_IDLE, "new", None, "old", True),
+                 (ps.PANE_ABNORMAL, "new", True, "old", True),
+                 (ps.PANE_LOGGED_OUT, "new", True, "old", True),
+                 (ps.PANE_GATE, "new", True, "old", True),
+                 (ps.PANE_LIMIT, "new", True, "old", True),
+                 (ps.PANE_WORKING, "old", True, "old", True),
+                 (ps.PANE_WORKING, "new", True, None, True),
+                 (ps.PANE_WORKING, None, False, "old", True),
+                 (ps.PANE_IDLE, None, False, "old", True),
+                 (ps.PANE_IDLE, "new", False, "old", None)]
+        for pane, frame, pending, previous, alive in cases:
+            with self.subTest(pane=pane, frame=frame, pending=pending, previous=previous, alive=alive):
+                rid = self.pressed_card()
+                out = self.sweep(pane, frame, pending, previous=previous, alive=alive)
+                self.assertNotIn(rid, out["cards_closed"])
+                manager = rem.wc.manager_for(self.ws)
+                self.assertEqual(manager.get(rid).status, "in_progress")
+                manager.expire(rid)
+
+    def test_healthy_recovery_persists_and_closes_only_once(self):
+        for pane, pending in ((ps.PANE_IDLE, False), (ps.PANE_IDLE, True),
+                              (ps.PANE_WORKING, True), (ps.PANE_WORKING, False)):
+            with self.subTest(pane=pane, pending=pending):
+                rid = self.pressed_card()
+                self.assertEqual(self.sweep(pane, "new", pending)["cards_closed"], [rid])
+                self.assertEqual(rem.wc.manager_for(self.ws).get(rid).status, "resolved")
+                self.assertEqual(self.sweep(pane, "newer", pending)["cards_closed"], [])
+
+    def test_ineligible_sweeps_retain_pressed_proxy(self):
+        for options in ({"sample_at": 1.0}, {"dry_run": True},
+                        {"held": "held"}, {"paused": True}):
+            with self.subTest(options=options):
+                rid = self.pressed_card()
+                self.assertNotIn(rid, self.sweep(ps.PANE_IDLE, "new", False,
+                                               **options).get("cards_closed", []))
+                manager = rem.wc.manager_for(self.ws)
+                self.assertEqual(manager.get(rid).status, "in_progress")
+                manager.expire(rid)
+
+    def test_failed_and_empty_capture_retain_pressed_proxy(self):
+        real_observe = sup.observe_pane
+        for result in (subprocess.CompletedProcess([], 1, "", "failed"),
+                       subprocess.CompletedProcess([], 0, "", "")):
+            with self.subTest(returncode=result.returncode):
+                with mock.patch.object(sup, "_open_tmux", return_value=(SOCK, "seat")):
+                    pane, frame = real_observe(self.ws, self.wid,
+                                               runner=lambda *a, **k: result)
+                self.assertEqual((pane, frame), (None, None))
+                rid = self.pressed_card()
+                self.assertEqual(self.sweep(pane, frame, True)["cards_closed"], [])
+                manager = rem.wc.manager_for(self.ws)
+                self.assertEqual(manager.get(rid).status, "in_progress")
+                manager.expire(rid)
 
 
 class OneCopyOfEachModule(unittest.TestCase):

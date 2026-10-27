@@ -23,6 +23,8 @@ row it lands or observes marks the store as used.
 from __future__ import annotations
 
 import hashlib
+import time
+from contextlib import contextmanager, nullcontext
 import json
 import re
 import subprocess
@@ -200,13 +202,33 @@ class ScriptDbClient:
 
     def __init__(self, argv: list, timeout: float = 90.0):
         self.argv, self.timeout = list(argv), timeout
+        self._deadline = None
+
+    @contextmanager
+    def operation(self):
+        previous = self._deadline
+        deadline = time.monotonic() + self.timeout
+        self._deadline = min(previous, deadline) if previous is not None else deadline
+        try:
+            yield
+        finally:
+            self._deadline = previous
+
+    def remaining_timeout(self):
+        timeout = self.timeout
+        if self._deadline is not None:
+            timeout = min(timeout, self._deadline - time.monotonic())
+            if timeout <= 0:
+                raise StoreError("room database: operation deadline exceeded")
+        return timeout
 
     def _call(self, req: dict):
+        timeout = self.remaining_timeout()
         try:
             r = subprocess.run(self.argv, input=json.dumps(req), capture_output=True,
-                               text=True, timeout=self.timeout)
+                               text=True, timeout=timeout)
         except subprocess.TimeoutExpired:
-            raise StoreError(f"room database: no reply within {self.timeout:.0f}s") from None
+            raise StoreError(f"room database: no reply within {timeout:.2f}s") from None
         except OSError as e:
             raise StoreError(f"room database: could not run the adapter ({e})") from None
         try:
@@ -261,6 +283,17 @@ def _mark(cells: dict, prop: str) -> Optional[str]:
     return val if val and (tag or None) == (cells.get("host") or None) else None
 
 
+# A click claim's close leaves its token in the Recovery cell ("click:<token>@<host>") beside a
+# plain Closed mark, so a reader that predates tokens still reads the row as closed.
+CLICK_MARK = "click:"
+
+
+def click_token(cells: dict) -> Optional[str]:
+    """The click claim token this row's own host left in Recovery, or None."""
+    val = _mark(cells, "recovery") or ""
+    return val[len(CLICK_MARK):] or None if val.startswith(CLICK_MARK) else None
+
+
 def effective_status(cells: dict) -> str:
     """The owner's terminal Status wins; then the row's Closed mark; else Open."""
     closed = _mark(cells, "closed")
@@ -286,6 +319,9 @@ class RoomDbStore:
         self.host, self.link = host, link
         self.last_link: Optional[str] = None
         self._keys: dict = {}
+
+    def operation(self):
+        return getattr(self.client, "operation", nullcontext)()
 
     def _rid(self, ask_id: str) -> str:
         """This host's row for `ask_id`: the existing one it owns, else a new key that carries
@@ -317,15 +353,22 @@ class RoomDbStore:
     def complete(self, ask_id: str) -> bool:
         """The row is present, carries this exact ask id (and this host), has a body and no
         incomplete mark: the confirmation an outbox entry is deleted on."""
-        r = self.client.row(DB_SCHEMA, self._rid(ask_id))
+        rid = self._rid(ask_id)
+        r = self.client.row(DB_SCHEMA, rid)
         if not r or not (r.get("body") or "").strip():
             return False
         cells = r.get("cells") or {}
         if cells.get("ask_id") != ask_id or not self.owns(cells):
             return False
-        return _mark(cells, "recovery") != INCOMPLETE
+        if _mark(cells, "recovery") == INCOMPLETE:
+            return False
+        self._keys[ask_id] = rid
+        return True
 
     def _locked(self, fn):
+        remaining = getattr(self.client, "remaining_timeout", None)
+        if remaining is not None:
+            remaining()
         if self.lock is None:
             raise StoreError("the room database store has no lock; refusing an unserialized write")
         err, result = ledger.under_lock(self.lock, fn)
@@ -347,11 +390,19 @@ class RoomDbStore:
     def _tag(self, value: str) -> str:
         return f"{value}@{self.host}" if self.host else value
 
-    def close(self, ask_id: str, to: str) -> None:
-        """Record a closure made by code in the Closed cell; Status stays the owner's."""
+    def close(self, ask_id: str, to: str, require_open: bool = False, token: Optional[str] = None) -> None:
+        """Record a closure made by code in the Closed cell; Status stays the owner's.
+        `require_open`: an owner's terminal Status refuses the close in the same guarded write.
+        `token`: the click claim closing it, left in Recovery in the same write (see CLICK_MARK)."""
         if to not in TERMINAL:
             raise StoreError(f"code only closes a row; {to!r} is not Answered or Resolved")
-        self._guarded(ask_id, {"closed": self._tag(to)}, {"closed": [None]})
+        expect = {"closed": [None], **({"status": OPEN_RAW} if require_open else {})}
+        cells = {"closed": self._tag(to), **({"recovery": self._tag(CLICK_MARK + token)} if token else {})}
+        self._guarded(ask_id, cells, expect)
+
+    def click_token_of(self, ask_id: str) -> Optional[str]:
+        r = self.client.row(DB_SCHEMA, self._rid(ask_id))
+        return click_token((r or {}).get("cells") or {})
 
     def clear(self, ask_id: str, props: list) -> None:
         """Remove stale code marks from this host's row; Status is not touched."""
@@ -497,23 +548,24 @@ def reconcile_pending(store, workspace, host: Optional[str]) -> dict:
     single call site). A row landed commits the history marker before its local evidence
     goes (flush, replay, ingest); a row merely observed commits it here — the one backfill
     for a workspace whose rows predate the marker, so no read ever has to write."""
-    ob = Outbox(workspace)
-    flushed, errors = ob.flush(store)
-    closed, close_errors = ob.replay_closes(store)
-    errors += close_errors
-    seen = []
-    try:
-        for r in store.entries():
-            seen.append(r["ask_id"])
-            if r["stale"]:
-                store.clear(r["ask_id"], r["stale"])
-    except Exception as e:  # noqa: BLE001
-        errors.append(f"stale marks: {type(e).__name__}: {e}")
-    import pending_questions_compat as compat  # noqa: PLC0415 — transitional; see its docstring
-    moved, ingest_errors = compat.ingest_legacy_file_entries(workspace, host, store)
-    if seen:
+    with getattr(store, "operation", nullcontext)():
+        ob = Outbox(workspace)
+        flushed, errors = ob.flush(store)
+        closed, close_errors = ob.replay_closes(store)
+        errors += close_errors
+        seen = []
         try:
-            mark_store_used(workspace, min(seen))
-        except OSError as e:
-            errors.append(f"store history: {type(e).__name__}: {e}")
-    return {"flushed": flushed, "closed": closed, "moved": moved, "errors": errors + ingest_errors}
+            for r in store.entries():
+                seen.append(r["ask_id"])
+                if r["stale"]:
+                    store.clear(r["ask_id"], r["stale"])
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"stale marks: {type(e).__name__}: {e}")
+        import pending_questions_compat as compat  # noqa: PLC0415 — transitional; see its docstring
+        moved, ingest_errors = compat.ingest_legacy_file_entries(workspace, host, store)
+        if seen:
+            try:
+                mark_store_used(workspace, min(seen))
+            except OSError as e:
+                errors.append(f"store history: {type(e).__name__}: {e}")
+        return {"flushed": flushed, "closed": closed, "moved": moved, "errors": errors + ingest_errors}

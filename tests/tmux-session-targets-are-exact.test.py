@@ -12,6 +12,10 @@ Run: python3 tests/tmux-session-targets-are-exact.test.py
 """
 from __future__ import annotations
 
+from _helpers.hermetic_env import isolate_os_environ
+
+isolate_os_environ()
+
 import re
 import subprocess
 import sys
@@ -35,7 +39,7 @@ BARE = [
 
 # Launchers, attach helpers and the shared sender: a separate fix, so the number here can only fall.
 FOLLOW_UP = {
-    "scripts/tmux-send-line.sh": 3,
+    "scripts/tmux-send-line.sh": 2,
     "src/Sutando/main.swift": 1,
     "src/agent/agy/cli/start-cli.sh": 3,
     "src/agent/claude/cli/start-cli.sh": 11,

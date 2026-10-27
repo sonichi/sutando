@@ -27,6 +27,11 @@ from unittest import mock
 
 # Shadow the vault boundary before _gateway (and, lazily, channel_token) can reach
 # it — installed at module level, ahead of the import below.
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 _VAULT_STORE: dict = {}
 _VAULT_CALLS: list = []
 

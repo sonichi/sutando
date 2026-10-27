@@ -18,6 +18,7 @@ import json
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -41,6 +42,7 @@ sup, ps, wi = rem.sup, rem.ps, rem.wi
 wc = getattr(rem, "wc", None)
 from hitl.manager import HitlManager, HitlStore  # noqa: E402
 from hitl.schema import ActionReply  # noqa: E402
+import tmux_pane_keys  # noqa: E402
 
 WID = "7c54b230a8d94ea9b86f52d70134ac68"
 SOCK = "/tmp/pool-wedge-cards.sock"
@@ -59,6 +61,7 @@ CODEX_PICKER = "◦ Working (2m • esc to interrupt)\n› 4. gpt-5.5 (current)\
 CODEX_ABNORMAL = "API Error: 500 internal server error\n› \n"
 CAUSE = getattr(ps, "CARD_CAUSE", "card_cause")
 FROZEN = getattr(ps, "CARD_FROZEN", "card_frozen")
+HUMAN = ps.CARD_HUMAN
 LOGIN = getattr(ps, "CARD_LOGIN", "card_login")
 PANES["logged-out"] = f"❯ /startup\n  ⎿  Login expired · Please run /login\n\n❯ \n{FOOTER}\n"
 
@@ -72,7 +75,7 @@ class Tmux:
     """Every session alive; capture-pane shows `pane`; anything that could act on a
     session (kill-session, send-keys, new-session) is recorded."""
 
-    ACTING = ("kill-session", "send-keys", "new-session", "respawn-pane", "respawn-window")
+    ACTING = ("kill-session", "send-keys", "new-session", "respawn-pane", "respawn-window", str(tmux_pane_keys.SCRIPT))
 
     def __init__(self, pane):
         self.pane, self.calls = pane, []
@@ -138,16 +141,46 @@ class NoWedgeActsOnTheSession(unittest.TestCase):
                 st, d = ps.evaluate(st, {"w": o}, t)
                 seen.add(d["w"])
                 t += 300.0
-        self.assertEqual(seen - {ps.NOTHING, ps.ESCALATE, CAUSE, FROZEN, LOGIN}, set())
+        self.assertEqual(seen - {ps.NOTHING, ps.ESCALATE, CAUSE, FROZEN, LOGIN, HUMAN}, set())
         self.assertNotIn(ps.RECOVER, seen)
 
     def test_no_wedge_decision_reaches_kill_send_keys_or_spawn(self):
         self.assertIsNotNone(wc, "no wedge card module")
-        for which in (ps.ESCALATE, CAUSE, FROZEN, LOGIN):
+        for which in (ps.ESCALATE, CAUSE, FROZEN, LOGIN, HUMAN):
             for label, pane in PANES.items():
                 ws, t = pool(), Tmux(pane)
                 rem.apply(ws, REPO, {WID: which}, runner=t, spawn=never_spawn)
                 self.assertEqual(t.acted(), [], (which, label))
+
+
+class HumanCard(unittest.TestCase):
+    def test_gate_and_limit_offer_only_the_workers_terminal_and_deduplicate(self):
+        for pane in (PANES["gate"], PANES["limit"]):
+            with self.subTest(pane=pane):
+                ws = pool()
+                def no_proxy(*_):
+                    self.fail("human cards must not probe the proxy")
+                t = Tmux(pane)
+                out = wc.raise_card(ws, WID, HUMAN, runner=t, routed=no_proxy,
+                                    manager=manager(ws))
+                req = manager(ws).get(out["hitl_id"])
+                self.assertEqual(req.subject["worker_id"], WID)
+                self.assertEqual(req.subject["session"], NAME)
+                self.assertEqual(req.device["socket"], SOCK)
+                self.assertEqual([a.id for a in req.actions], ["open_terminal"])
+                self.assertFalse(req.turn_on_action)
+                again, _, _ = card(ws, HUMAN, pane + "\n")
+                self.assertEqual(again["hitl_id"], req.id)
+                self.assertEqual(wc.drive_escapes(ws, runner=t, manager=manager(ws)), {})
+                self.assertEqual(t.acted(), [])
+
+    def test_action_time_recheck_refuses_a_cleared_or_unknown_pane(self):
+        ws = pool()
+        for pane in (PANES["abnormal"], MOVED, "unrecognized output", ""):
+            out, t, req = card(ws, HUMAN, pane)
+            self.assertNotEqual(out["outcome"], "carded")
+            self.assertIsNone(req)
+            self.assertEqual(t.acted(), [])
 
 
 class FrozenCard(unittest.TestCase):
@@ -169,9 +202,11 @@ class FrozenCard(unittest.TestCase):
     def test_pressed_and_still_frozen_types_one_escape(self):
         _, _, req = card(self.ws, FROZEN, PANES["frozen"])
         press(self.ws, req, "send_escape")
+        self.assertEqual(wc.resolve_cleared(self.ws, {WID}), [])
+        self.assertEqual(manager(self.ws).get(req.id).status, "in_progress")
         t = Tmux(PANES["frozen"])
         self.assertEqual(wc.drive_escapes(self.ws, runner=t, manager=manager(self.ws)), {req.id: "sent"})
-        self.assertEqual(t.acted(), [["tmux", "-S", SOCK, "send-keys", "-t", f"={NAME}:0", "Escape"]])
+        self.assertEqual(t.acted(), [tmux_pane_keys.argv(SOCK, f"={NAME}:0", "Escape")])
         self.assertEqual(wc.drive_escapes(self.ws, runner=Tmux(PANES["frozen"]),
                                           manager=manager(self.ws)), {}, "typed once")
 
@@ -225,6 +260,43 @@ class CauseCard(unittest.TestCase):
         self.assertEqual(wc.resolve_cleared(self.ws, {WID}, manager=manager(self.ws)), [req.id])
 
 
+    def test_pressed_proxy_requires_positive_clear_and_resolves_once(self):
+        _, t, req = card(self.ws, CAUSE, PANES["abnormal"], routed=True)
+        with patch.object(wc.subprocess, "run", side_effect=AssertionError("no command allowed")):
+            press(self.ws, req, wc.PROXY_ACTION)
+            for wedges in ({WID: CAUSE}, {WID: FROZEN}, {WID: None}, {}):
+                self.assertEqual(wc.resolve_cleared(self.ws, set(), wedges=wedges), [])
+                self.assertEqual(manager(self.ws).get(req.id).status, "in_progress")
+            self.assertEqual(wc.resolve_cleared(self.ws, {WID}, recovered=set()), [])
+            self.assertEqual(wc.resolve_cleared(self.ws, set(), recovered={WID},
+                                               wedges={WID: FROZEN}), [])
+            self.assertEqual(wc.resolve_cleared(self.ws, {WID}), [req.id])
+            self.assertEqual(manager(self.ws).get(req.id).status, "resolved")
+            self.assertEqual(wc.resolve_cleared(self.ws, {WID}), [])
+        self.assertEqual(t.acted(), [])
+        _, _, pending = card(self.ws, CAUSE, PANES["abnormal"])
+        self.assertEqual(wc.resolve_cleared(self.ws, {WID}, recovered=set()), [pending.id])
+
+    def test_positive_clear_does_not_complete_other_pressed_cards(self):
+        for fields in ({"source": "other"}, {"wedge": LOGIN},
+                       {"chosen_action": "open_terminal"}):
+            with self.subTest(fields=fields):
+                _, _, req = card(self.ws, CAUSE, PANES["abnormal"], routed=True)
+                press(self.ws, req, wc.PROXY_ACTION)
+                m = manager(self.ws)
+                with m.store.locked():
+                    cur = m.get(req.id)
+                    for key, value in fields.items():
+                        if key == "chosen_action":
+                            cur.chosen_action = value
+                        else:
+                            cur.subject[key] = value
+                    m.store.save(cur)
+                self.assertEqual(wc.resolve_cleared(self.ws, {WID}), [])
+                self.assertEqual(manager(self.ws).get(req.id).status, "in_progress")
+                m.expire(req.id)
+
+
 class LoginCard(unittest.TestCase):
     def setUp(self):
         self.assertIsNotNone(wc, "no wedge card module")
@@ -256,7 +328,7 @@ class LoginCard(unittest.TestCase):
         m = manager(self.ws)
         kept = wc.resolve_cleared(self.ws, set(), manager=m, wedges={WID: LOGIN})
         self.assertEqual(kept, [], "the pane still shows the expired login")
-        for now_asks in (CAUSE, None):     # abnormal text, or a gate/limit that escalates
+        for now_asks in (CAUSE, HUMAN):
             _, _, again = card(self.ws, LOGIN, PANES["logged-out"])
             self.assertEqual(wc.resolve_cleared(self.ws, set(), manager=manager(self.ws),
                                                 wedges={WID: now_asks}), [again.id], now_asks)
@@ -277,7 +349,7 @@ class CodexCards(unittest.TestCase):
         self.assertEqual(wc.drive_escapes(self.ws, runner=recheck, manager=manager(self.ws)),
                          {req.id: "sent"})
         self.assertEqual(recheck.acted(),
-                         [["tmux", "-S", SOCK, "send-keys", "-t", f"={NAME}:0", "Escape"]])
+                         [tmux_pane_keys.argv(SOCK, f"={NAME}:0", "Escape")])
 
     def test_codex_picker_over_a_working_marker_clears_frozen_card(self):
         # Codex's selected › row is a gate even when the old working marker remains.
@@ -348,7 +420,7 @@ class CardEdges(unittest.TestCase):
         press(self.ws, req, "send_escape")
 
         def send_fails(argv, **kw):
-            if "send-keys" in argv:
+            if str(tmux_pane_keys.SCRIPT) in argv:
                 raise OSError("server exited")
             return Done(0, PANES["frozen"])
         self.assertEqual(wc.drive_escapes(self.ws, runner=send_fails, manager=manager(self.ws)),

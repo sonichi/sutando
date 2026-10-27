@@ -2,7 +2,13 @@
 """A skill declares its own hook; core discovers, never names one."""
 from __future__ import annotations
 
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import json
+import os
 import shlex
 import shutil
 import subprocess
@@ -14,6 +20,18 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from skill_hooks import discover
+
+
+# The claude-hooks probe is Claude-only (#5414); pin the runtime so a codex host still exercises it.
+_RUNTIME_PIN = mock.patch.dict(os.environ, {"SUTANDO_CORE_RUNTIME": "claude"})
+
+
+def setUpModule():
+    _RUNTIME_PIN.start()
+
+
+def tearDownModule():
+    _RUNTIME_PIN.stop()
 
 
 class SkillHookDiscovery(unittest.TestCase):

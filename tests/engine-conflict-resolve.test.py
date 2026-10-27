@@ -9,6 +9,11 @@ workspace symlink, ENGINE_UPDATE_PENDING.json in the updater's own shape.
 """
 from __future__ import annotations
 
+from _helpers.hermetic_env import isolate_os_environ, isolated_child_env
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import json
 import os
 import shutil
@@ -31,7 +36,7 @@ FIXTURE_IDENT = {
 
 
 def git(repo, *args, check=True):
-    env = dict(os.environ)
+    env = isolated_child_env()
     env.update(FIXTURE_IDENT)
     proc = subprocess.run(["git", "-C", str(repo)] + list(args),
                           capture_output=True, text=True, env=env)
@@ -41,6 +46,7 @@ def git(repo, *args, check=True):
 
 
 def run_script(name, *args, env=None):
+    env = env if env is not None else isolated_child_env()
     return subprocess.run([sys.executable, str(SCRIPTS / name)] + list(args),
                           capture_output=True, text=True, env=env)
 
@@ -345,7 +351,7 @@ class TestGitResolution(unittest.TestCase):
         self.assertTrue(self.real_git)
 
     def sanitized_env(self, **extra):
-        env = dict(os.environ)
+        env = isolated_child_env()
         env["PATH"] = ""
         env.pop("ENGINE_CONFLICT_GIT", None)
         env.update(extra)
@@ -462,7 +468,7 @@ class TestProposalDelivery(unittest.TestCase):
         return d
 
     def deliver(self, *args, env_room=None):
-        env = dict(os.environ)
+        env = isolated_child_env()
         env["PATH"] = ""  # no osascript: notification tier degrades cleanly
         env["SUTANDO_HOST_LABEL"] = "testhost"
         env.pop("ENGINE_CONFLICT_NOTIFY_ROOM", None)

@@ -16,6 +16,11 @@ import sys
 import tempfile
 import urllib.error
 
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 REPO = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "packages" / "ag2-sparrow"))
 m = importlib.import_module("ag2_sparrow.remote_gateway_bridge")
@@ -311,7 +316,7 @@ i = src.find(anchor)
 check(i != -1, "the drain anchor is still present in remote_gateway_bridge.py")
 if i != -1:
     drain = src[i:]
-    gi, pi = drain.find("_guarded_result_body"), drain.find("parse_markers(body)")
+    gi, pi = drain.find("_guarded_result_body"), drain.find("parse_markers(body")
     check(gi != -1 and pi != -1 and gi < pi,
           "in the drain, _guarded_result_body precedes parse_markers")
 

@@ -19,6 +19,7 @@ REPO = Path(__file__).resolve().parent.parent  # lint-workspace-resolution: allo
 
 DISCORD = "src/discord-bridge.py"
 AG2 = "packages/ag2-sparrow/ag2_sparrow/remote_gateway_bridge.py"
+AG2_INSTANCE = "packages/ag2-sparrow/ag2_sparrow/gateway_instance.py"
 SLACK = "src/slack-bridge.py"
 
 # Each cell: (claim, [(path, pattern), ...]) — the anchors are what --verify
@@ -46,7 +47,8 @@ ROWS: "list[tuple[str, dict[str, tuple[str, list[tuple[str, str]]]]]]" = [
                      (DISCORD, r"from ingress_identity import provider_task_id, already_admitted")]),
         "ag2space": ("`task-<inst>~<broker_id>` — injective mapping from the "
                      "provider id, so a replayed lease maps to the same file",
-                     [(AG2, r'return f"task-\{GATEWAY_INSTANCE\}~\{broker_tid\}"')]),
+                     [(AG2, r"gateway_instance\.local_tid\(broker_tid, GATEWAY_INSTANCE\)"),
+                      (AG2_INSTANCE, r'return f"task-\{instance\}~\{broker_tid\}" if instance')]),
         "slack": ("`task-sl<team>~<channel>-<ts>` via provider_task_id — "
                   "injective from the provider event, replay-deduped by "
                   "already_admitted",
@@ -105,10 +107,10 @@ ROWS: "list[tuple[str, dict[str, tuple[str, list[tuple[str, str]]]]]]" = [
         "discord": ("`DeliveryReceipt` (CONFIRMED carries the provider "
                     "message id) + append-only `outbox_log`",
                     [(DISCORD, r"import outbox_log")]),
-        "ag2space": ("gateway `event_id` when present; bare `ok` trusted as "
-                     "delivered; `record_delivered` via the vendored outbox",
-                     [(AG2, r"from .outbox import DeliveryOutcome, "
-                            r"record_delivered")]),
+        "ag2space": ("gateway `event_id` only, recorded as `provider_ref` on the "
+                     "proactive outbox item before it is marked delivered",
+                     [(AG2, r"from \.outbox import .*record_provider_ref"),
+                      (AG2, r"PROACTIVE_TRUST_OK", "absent")]),
         "slack": ("none persisted for replies (failures printed); proactive "
                   "marked delivered in `slack_proactive_receipts`",
                   [(SLACK, r"mark_delivered as mark_proactive_delivered"),
@@ -151,9 +153,10 @@ ROWS: "list[tuple[str, dict[str, tuple[str, list[tuple[str, str]]]]]]" = [
         "discord": ("in-memory attempt counter on the marker leg; the "
                     "proactive leg already rides the outbox-backed fence",
                     [(DISCORD, r"from proactive_claim_fence import ProactiveClaimFence")]),
-        "ag2space": ("closest to canon: vendored outbox `classify_response` "
-                     "three-state + `record_delivered`",
-                     [(AG2, r"from .outbox_adapter import classify_response")]),
+        "ag2space": ("none: the proactive leg rides a DeliveryCore lane over the "
+                     "room-message provider; uncertain sends park",
+                     [(AG2, r"AG2SpaceRoomMessageProvider\(lambda \*a: _post_proactive_message"),
+                      (AG2, r"_PROACTIVE_ATTEMPTS", "absent")]),
         "slack": ("private `slack_proactive_receipts` + bare poll-loop retry",
                   [(SLACK, r"from slack_proactive_receipts import")]),
     }),
@@ -182,8 +185,9 @@ ROWS: "list[tuple[str, dict[str, tuple[str, list[tuple[str, str]]]]]]" = [
         "discord": ("`resolve_channel_token(\"DISCORD_BOT_TOKEN\")` over "
                     "channels/discord/.env",
                     [(DISCORD, r'resolve_channel_token\("DISCORD_BOT_TOKEN"')]),
-        "ag2space": ("REMOTE_TASK_TOKEN via the ag2space channel env",
-                     [(AG2, r'vals.get\("REMOTE_TASK_TOKEN"\)')]),
+        "ag2space": ("`gateway_credential_sources.discover`: REMOTE_TASK_TOKEN env -> channel .env -> "
+                     "vault",
+                     [(AG2, r'gateway_credential_sources\.discover\(')]),
         "slack": ("SLACK_BOT_TOKEN / SLACK_APP_TOKEN: env -> channel .env -> "
                   "vault",
                   [(SLACK, r'token_from_vault\("SLACK_BOT_TOKEN"\)')]),

@@ -1,5 +1,5 @@
 {
-  "_comment": "TEMPLATE — do not edit in place. The live config is per-user data and lives at <workspace>/config/phone-conversation.json (the workspace resolves via `bash scripts/sutando-config.sh workspace`, default <repo>/workspace/). On first run conversation-server copies this template there if it is missing. Edit the workspace copy, never this file. Keys: model + googleSearch are voice prefs; phone ships with the package default 2.5+search:true.",
-  "model": "gemini-2.5-flash-native-audio-preview-12-2025",
+  "_comment": "TEMPLATE — do not edit in place. The live config is per-user data and lives at <workspace>/config/phone-conversation.json (the workspace resolves via `bash scripts/sutando-config.sh workspace`, default <repo>/workspace/). On first run conversation-server copies this template there if it is missing. Edit the workspace copy, never this file. Keys: model + googleSearch are voice prefs; phone ships with the package default 3.8 Live + search:true.",
+  "model": "gemini-3.8-live",
   "googleSearch": true
 }

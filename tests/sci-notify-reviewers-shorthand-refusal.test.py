@@ -33,6 +33,8 @@ def _load():
     spec = importlib.util.spec_from_file_location("_nr_short", SCRIPT)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
+    # A repo with no CODEOWNERS; the gate's own suite is notify-reviewers-codeowners.
+    mod.codeowner_gate = lambda *a, **k: (True, [])
     return mod
 
 

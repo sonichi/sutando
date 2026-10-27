@@ -4262,6 +4262,39 @@ function isLoopbackAddress(address: string | undefined): boolean {
 	return address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1';
 }
 
+/** /voice-tasks/view: the task table on one page, refreshed every second from /voice-tasks. */
+const VOICE_TASKS_VIEW_HTML = `<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Voice tasks</title>
+<style>
+body{font:14px/1.4 -apple-system,system-ui,sans-serif;margin:16px;background:#111;color:#eee}
+h1{font-size:18px;margin:0 0 4px}.sub{color:#999;margin-bottom:12px}
+table{border-collapse:collapse;width:100%}th,td{text-align:left;padding:6px 8px;border-bottom:1px solid #333;vertical-align:top}
+th{color:#999;font-weight:normal}.pending td{color:#fff}.done td{color:#777}
+.tag{display:inline-block;padding:1px 6px;border-radius:4px;font-size:12px;background:#333}
+.tag.working{background:#1d4ed8}.tag.queued{background:#6d28d9}.tag.unheard{background:#b45309}.tag.heard{background:#166534}.tag.retired{background:#444}.tag.cancelled{background:#444}.tag.dm{background:#7c2d12}
+</style></head><body>
+<h1>Pending (the core is still working on): <span id="pending">…</span></h1>
+<div class="sub" id="sub"></div>
+<table><thead><tr><th>time</th><th>request</th><th>core</th><th>heard</th></tr></thead><tbody id="rows"></tbody></table>
+<script>
+const esc=(s)=>String(s).replace(/[&<>"]/g,(c)=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+async function tick(){
+  try{
+    const d=await (await fetch('/voice-tasks',{cache:'no-store'})).json();
+    document.getElementById('pending').textContent=d.pending==null?'?':d.pending;
+    document.getElementById('sub').textContent=d.pending==null?(d.note||''):('the core is working on '+d.working+' · done, waiting to be read: '+d.doneNotHeard+' · '+new Date(d.at).toLocaleTimeString());
+    document.getElementById('rows').innerHTML=(d.tasks||[]).map((t)=>{
+      const time=new Date(t.submittedAt).toLocaleTimeString();
+      const core=t.retired?'<span class="tag retired">ended, nothing to say</span>':t.state==='started'?'<span class="tag working">working</span>':t.state==='queued'?'<span class="tag queued">queued</span>':t.state==='cancelled'?'<span class="tag cancelled">cancelled</span>':'<span class="tag">done</span>';
+      const heard=t.heard?'<span class="tag heard">heard ('+esc(t.delivery)+')</span>':t.delivery==='dm'?'<span class="tag dm">DM copy, not heard</span>':t.retired||t.state==='cancelled'?'':'<span class="tag unheard">not heard</span>';
+      return '<tr class="'+(t.pending?'pending':'done')+'"><td>'+time+'</td><td>'+esc(t.text)+'</td><td>'+core+'</td><td>'+heard+'</td></tr>';
+    }).join('');
+  }catch(e){document.getElementById('sub').textContent='cannot reach /voice-tasks: '+e;}
+}
+tick();setInterval(tick,1000);
+</script></body></html>`;
+
 const server = createServer((req, res) => {
 	const url = new URL(req.url || '/', `http://${req.headers.host}`);
 
@@ -4404,6 +4437,28 @@ const server = createServer((req, res) => {
 	// on switch_mode / zoom-auto-flip). Returns "active" or "meeting".
 	// Falls back to "active" if the file is missing. Combined with the
 	// presenter badge poll to render the composite 3-mode badge in the UI.
+	// The relay agent's task table, live: what the voice agent last wrote to state/voice-task-status.json
+	// (every row with where the core stands and whether the user heard the answer, plus the pending count
+	// get_task_status reports). /voice-tasks is the JSON; /voice-tasks/view is a page that refreshes itself.
+	// The rows are the owner's spoken requests: local-only, like /api/task-history (review of #5348, B2).
+	if ((url.pathname === '/voice-tasks' || url.pathname === '/voice-tasks/view') && !LAN_SHARE && !isLoopbackAddress(req.socket.remoteAddress)) {
+		res.writeHead(403, { 'Content-Type': 'application/json' });
+		res.end(JSON.stringify({ error: 'voice tasks are local-only' }));
+		return;
+	}
+	if (url.pathname === '/voice-tasks') {
+		let body = '{"at":0,"pending":null,"working":0,"doneNotHeard":0,"tasks":[],"note":"the voice agent has not written state/voice-task-status.json yet"}';
+		try { body = readFileSync(join(STATE_DIR, 'voice-task-status.json'), 'utf-8'); } catch {}
+		res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+		res.end(body);
+		return;
+	}
+	if (url.pathname === '/voice-tasks/view') {
+		res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+		res.end(VOICE_TASKS_VIEW_HTML);
+		return;
+	}
+
 	if (url.pathname === '/voice-mode') {
 		let mode = 'active';
 		try {

@@ -10,12 +10,24 @@ cancel is the documented CANCEL_INSTRUCTION signal, never a file deletion.
 Run: python3 tests/runtime-api-tasks-view.test.py
 Exit: 0 on pass, 1 on fail.
 """
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import asyncio
 import concurrent.futures
 import contextlib
+import itertools
+import json
+import os
+import queue
+import subprocess
 import sys
 import tempfile
 import threading
+import types
 import unittest
 import unittest.mock
 from pathlib import Path
@@ -24,11 +36,13 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src" / "runtime-api"))
 sys.path.insert(0, str(ROOT / "src"))
 
+from task_priority import parse_priority_from_file, sort_tasks_by_priority
 from tasks_view import TasksView  # noqa: E402
 from dispatcher import RuntimeDispatcher  # noqa: E402
 
 from protocol import ProtocolError  # noqa: E402
 from local_task_protocol import parse_task_headers_lenient  # noqa: E402
+from activity_bus import cancel_target  # noqa: E402
 
 
 class TasksViewTests(unittest.TestCase):
@@ -53,6 +67,29 @@ class TasksViewTests(unittest.TestCase):
         self.assertEqual(th.get("access_tier"), "owner")
         self.assertEqual(th.get("user_id"), "@me:example.org")
         self.assertEqual(th.body, "review the PR")
+
+    def test_queue_priority_roundtrip_order_and_body_confinement(self):
+        import os
+        for keyed in (False, True):
+            paths = []
+            for index, priority in enumerate(("low", "normal", "urgent")):
+                with self.subTest(keyed=keyed, priority=priority):
+                    text = "work\npriority: urgent"
+                    if keyed:
+                        out = self.view.submit_idempotent(
+                            text, priority=priority, idempotency_key=priority)
+                    else:
+                        out = self.view.submit(text, priority=priority)
+                    path = self._task_file(out["taskId"])
+                    self.assertEqual(parse_priority_from_file(path), priority)
+                    os.utime(path, (100 + index, 100 + index))
+                    paths.append(path)
+            self.assertEqual(sort_tasks_by_priority(paths), paths[::-1])
+            older = self._task_file(self.view.submit("older")["taskId"])
+            newer = self._task_file(self.view.submit("newer")["taskId"])
+            os.utime(older, (200, 200))
+            os.utime(newer, (201, 201))
+            self.assertEqual(sort_tasks_by_priority([newer, older]), [older, newer])
 
     def test_get_result_no_id_returns_newest_runtime_api_only(self):
         import os
@@ -254,8 +291,13 @@ class TasksViewTests(unittest.TestCase):
         self.assertIsNone(self.view.details("task-ghost"))
 
     def test_list_tasks_enumerates_live_only(self):
+        first_body = "first   request\twith\n  multiple\u2003spaces"
+        second_body = "second " + "界" * 200
         a = self.view.submit("first")["taskId"]
-        b = self.view.submit("second")["taskId"]
+        first_file = self._task_file(a)
+        first_file.write_text(first_file.read_text().replace(
+            "task: first\n", f"task: {first_body}\n"))
+        b = self.view.submit(second_body)["taskId"]
         # claimed task still listed (as in_progress); done task drops off
         (self.tasks / f"{a}.txt").rename(self.tasks / f"{a}.claimed-core-1.txt")
         c = self.view.submit("third")["taskId"]
@@ -263,26 +305,202 @@ class TasksViewTests(unittest.TestCase):
         (self.results / f"{c}.txt").write_text("done")
         out = self.view.list_tasks()
         by_id = {t["taskId"]: t for t in out["tasks"]}
+        self.assertEqual(set(by_id), {a, b, c})
         self.assertEqual(by_id[a]["state"], "in_progress")
         self.assertEqual(by_id[b]["state"], "pending")
         self.assertEqual(by_id[c]["state"], "done")  # file still live until archived
         self.assertEqual(by_id[b]["source"], "runtime-api")
+        self.assertEqual(by_id[a]["preview"], "first request with multiple spaces")
+        self.assertEqual(by_id[b]["preview"], "second " + "界" * 153)
+        self.assertEqual(len(by_id[b]["preview"]), 160)
+        self.assertEqual(by_id[c]["preview"], "third")
+        self.assertEqual(self.view.details(a)["task"], first_body)
+        self.assertEqual(self.view.details(b)["task"], second_body)
         self.assertNotIn("truncated", out)
+        filtered = self.view.list_tasks(unfinished_only=True)
+        self.assertEqual(filtered, {"tasks": [t for t in out["tasks"]
+                                              if t["taskId"] != c]})
+
+    def test_unfinished_order_limit_and_truncation_count_eligible_rows(self):
+        self.results.mkdir()
+        eligible = []
+        all_ids = []
+        for index in range(7):
+            tid = self.view.submit(f"work {index}")["taskId"]
+            all_ids.append(tid)
+            stamp = 1000 + index / 10
+            os.utime(self._task_file(tid), (stamp, stamp))
+            if index % 2 == 0:
+                (self.results / f"{tid}.txt").write_text("done")
+            else:
+                eligible.insert(0, tid)
+        for limit in (0, 1, 2, 3, 4, 200):
+            with self.subTest(limit=limit):
+                got = self.view.list_tasks(limit=limit, unfinished_only=True)
+                self.assertEqual([row["taskId"] for row in got["tasks"]],
+                                 eligible[:limit])
+                self.assertEqual({row["state"] for row in got["tasks"]},
+                                 {"pending"} if limit else set())
+                self.assertEqual(got.get("truncated", False), len(eligible) > limit)
+                if limit >= len(eligible):
+                    self.assertNotIn("truncated", got)
+        default = self.view.list_tasks(limit=2)
+        self.assertEqual(default, self.view.list_tasks(limit=2, unfinished_only=False))
+        self.assertEqual([row["taskId"] for row in default["tasks"]], all_ids[::-1][:2])
+        self.assertEqual(default["tasks"][0]["state"], "done")
+        self.assertTrue(default["truncated"])
+
+    def test_unfinished_all_completed_is_empty_without_truncation(self):
+        self.results.mkdir()
+        for i in range(3):
+            tid = self.view.submit(f"done {i}")["taskId"]
+            (self.results / f"{tid}.txt").write_text("ready")
+        for limit in (0, 1, 3):
+            self.assertEqual(self.view.list_tasks(limit=limit, unfinished_only=True),
+                             {"tasks": []})
+
+    def test_unfinished_preserves_unready_results_and_human_waiting_states(self):
+        self.results.mkdir()
+        expected = {}
+        for body in (None, "", " \t\n", b"torn \xe4\xb8"):
+            tid = self.view.submit("awaiting result")["taskId"]
+            if body is not None:
+                (self.results / f"{tid}.txt").write_bytes(
+                    body if isinstance(body, bytes) else body.encode())
+            expected[tid] = "pending"
+        pending = {}
+        self.view.hitl_lookup = lambda tid: pending.get(tid, [])
+        for kind, state in (("elicitation", "waiting_for_input"),
+                            ("approval", "waiting_for_approval"),
+                            ("human_action", "waiting_for_human_action")):
+            tid = self.view.submit("awaiting human")["taskId"]
+            pending[tid] = [kind]
+            expected[tid] = state
+        got = self.view.list_tasks(unfinished_only=True)
+        self.assertEqual({row["taskId"]: row["state"] for row in got["tasks"]}, expected)
+        self.assertNotIn("truncated", got)
+        for tid in expected:
+            (self.results / f"{tid}.txt").write_text("ready")
+        self.assertEqual(self.view.list_tasks(unfinished_only=True), {"tasks": []})
+
+    def test_list_tasks_disappearing_during_metadata_access(self):
+        real_stat = Path.stat
+        for mode, unfinished in itertools.product(("control", "claim", "archive"),
+                                                  (False, True)):
+            with self.subTest(mode=mode, unfinished=unfinished):
+                victim_id = self.view.submit("being processed")["taskId"]
+                queued_id = self.view.submit("still queued")["taskId"]
+                victim = self._task_file(victim_id)
+                mutated = False
+
+                def checked_stat(path, *args, **kwargs):
+                    nonlocal mutated
+                    if path == victim and not mutated:
+                        mutated = True
+                        if mode == "claim":
+                            path.rename(path.with_name(f"{victim_id}.claimed-worker-1.txt"))
+                        elif mode == "archive":
+                            path.unlink()
+                    return real_stat(path, *args, **kwargs)
+
+                with unittest.mock.patch.object(Path, "stat", checked_stat):
+                    rows = self.view.list_tasks(unfinished_only=unfinished)["tasks"]
+                ids = {row["taskId"] for row in rows}
+                self.assertTrue(mutated)
+                self.assertIn(queued_id, ids)
+                if mode == "control":
+                    self.assertIn(victim_id, ids)
+
+    def test_metadata_scans_propagate_operational_errors(self):
+        import errno
+        task_id = self.view.submit("queued")["taskId"]
+        result = self.results / f"{task_id}.txt"
+        self.results.mkdir(exist_ok=True)
+        result.write_text("ready")
+        real_stat = Path.stat
+        for victim, scan in ((self._task_file(task_id), self.view.list_tasks),
+                             (result, self.view.list_results)):
+            for fault in (PermissionError("denied"), OSError(errno.EIO, "I/O fault")):
+                with self.subTest(scan=scan.__name__, fault=type(fault).__name__):
+                    def checked_stat(path, *args, **kwargs):
+                        if path == victim:
+                            raise fault
+                        return real_stat(path, *args, **kwargs)
+
+                    with unittest.mock.patch.object(Path, "stat", checked_stat):
+                        with self.assertRaises(type(fault)) as raised:
+                            scan()
+                    self.assertIs(raised.exception, fault)
+
+    def test_result_disappearing_during_metadata_access(self):
+        task_id = self.view.submit("finished")["taskId"]
+        self.results.mkdir(exist_ok=True)
+        victim = self.results / f"{task_id}.txt"
+        victim.write_text("ready")
+        real_stat = Path.stat
+
+        def checked_stat(path, *args, **kwargs):
+            if path == victim:
+                path.unlink()
+            return real_stat(path, *args, **kwargs)
+
+        with unittest.mock.patch.object(Path, "stat", checked_stat):
+            self.assertEqual(self.view.list_results(), {"results": []})
+
+    def test_list_tasks_retains_mtime_and_limit_semantics(self):
+        import os
+        older = self.view.submit("older")["taskId"]
+        newer = self.view.submit("newer")["taskId"]
+        os.utime(self._task_file(older), (1000.1, 1000.1))
+        os.utime(self._task_file(newer), (1000.9, 1000.9))
+        (self.tasks / "task-other.txt").write_text("private")
+        (self.tasks / "task-rtapi-directory.txt").mkdir()
+        real_stat = Path.stat
+        seen = set()
+
+        def checked_stat(path, *args, **kwargs):
+            metadata = real_stat(path, *args, **kwargs)
+            if path in (self._task_file(older), self._task_file(newer)):
+                self.assertNotIn(path, seen, "enumeration must retain metadata")
+                seen.add(path)
+                if path == self._task_file(newer):
+                    path.unlink()
+            return metadata
+
+        with unittest.mock.patch.object(Path, "stat", checked_stat), \
+                unittest.mock.patch.object(self.view, "status", return_value={"state": "pending"}):
+            rows = self.view.list_tasks(limit=1)
+        self.assertEqual([row["taskId"] for row in rows["tasks"]], [newer])
+        self.assertNotIn("preview", rows["tasks"][0])
+        self.assertTrue(rows["truncated"])
+        self.assertEqual(seen, {self._task_file(older), self._task_file(newer)})
+        rows = self.view.list_tasks()
+        self.assertEqual([row["taskId"] for row in rows["tasks"]], [older])
+        self.assertEqual(rows["tasks"][0]["preview"], "older")
+        self.assertNotIn("truncated", rows)
 
     def test_list_tasks_empty_dir(self):
         view = TasksView(self.tasks / "nope", self.results, "@me:x")
         self.assertEqual(view.list_tasks(), {"tasks": []})
+        self.assertEqual(view.list_tasks(unfinished_only=True), {"tasks": []})
 
     def test_cancel_writes_cancel_instruction_signal(self):
         tid = self.view.submit("long job")["taskId"]
+        original = self._task_file(tid).read_bytes()
         out = self.view.cancel(tid)
         self.assertEqual(out["cancelled"], "requested")
         cancel_file = self._task_file(out["cancelTaskId"])
         th = parse_task_headers_lenient(cancel_file.read_text())
-        self.assertTrue(th.body.startswith(f"CANCEL_INSTRUCTION: {tid}"))
+        self.assertEqual(cancel_target(th.body), tid)
+        self.assertEqual(th.get("source"), "runtime-api")
+        self.assertEqual(th.get("channel_id"), "runtime-api")
+        self.assertEqual(th.get("user_id"), "@me:example.org")
+        self.assertEqual(th.get("access_tier"), "owner")
         self.assertEqual(th.get("priority"), "urgent")
+        self.assertEqual(parse_priority_from_file(cancel_file), "urgent")
         # the original task file is untouched — the consumer decides
         self.assertTrue(self._task_file(tid).exists())
+        self.assertEqual(self._task_file(tid).read_bytes(), original)
 
     def test_cancel_done_task_is_noop_and_unknown_raises(self):
         self.results.mkdir(parents=True)
@@ -290,7 +508,9 @@ class TasksViewTests(unittest.TestCase):
         self.tasks.mkdir(parents=True, exist_ok=True)
         (self.tasks / "task-rtapi-done1.txt").write_text(
             "id: task-rtapi-done1\ntask: x\n")
+        before = set(self.tasks.iterdir())
         out = self.view.cancel("task-rtapi-done1")
+        self.assertEqual(set(self.tasks.iterdir()), before)
         self.assertIs(out["cancelled"], False)
         with self.assertRaises(ValueError):
             self.view.cancel("task-rtapi-never-existed")
@@ -309,6 +529,58 @@ class TasksViewIdempotencyTests(unittest.TestCase):
 
     def _receipts(self):
         return list((self.tasks / ".runtime-api-idempotency").glob("*.task"))
+
+    def test_pre_change_receipts_preserve_identity_and_reject_conflicts(self):
+        import hashlib
+        import os
+        for instance in (None, "worker-1"):
+            for state in ("pending", "claimed", "archived", "result-only"):
+                with self.subTest(instance=instance, state=state):
+                    key = f"legacy-{instance}-{state}"
+                    digest = hashlib.sha256(key.encode()).hexdigest()
+                    tid = f"task-rtapi-{digest}"
+                    raw = (f"id: {tid}\ntimestamp: 2026-09-01T00:00:00Z\n"
+                           "task: original\nsource: runtime-api\n"
+                           "channel_id: runtime-api\nuser_id: @owner:example.org\n"
+                           "access_tier: owner\npriority: low\n"
+                           + (f"instance_id: {instance}\n" if instance else ""))
+                    receipt = self.tasks / ".runtime-api-idempotency" / f"{digest}.task"
+                    receipt.parent.mkdir(parents=True, exist_ok=True)
+                    receipt.write_text(raw)
+                    if state == "result-only":
+                        self.results.mkdir(exist_ok=True)
+                        (self.results / f"{tid}.txt").write_text("done")
+                    else:
+                        destination = self.tasks / f"{tid}.txt"
+                        if state == "claimed":
+                            destination = self.tasks / f"{tid}.claimed-worker.txt"
+                        elif state == "archived":
+                            destination = self.tasks / "archive" / "2026-09" / f"{tid}.txt"
+                            destination.parent.mkdir(parents=True, exist_ok=True)
+                        os.link(receipt, destination)
+                    before = set(self.tasks.rglob("*.txt"))
+                    view = TasksView(self.tasks, self.results, "@owner:example.org",
+                                     instance=instance)
+                    out = view.submit_idempotent("original", idempotency_key=key,
+                                                 priority="low")
+                    self.assertEqual(out["taskId"], tid)
+                    self.assertEqual(out["state"], {"pending": "pending",
+                        "claimed": "in_progress", "archived": "done",
+                        "result-only": "done"}[state])
+                    self.assertEqual(set(self.tasks.rglob("*.txt")), before)
+                    self.assertEqual(receipt.read_text(), raw)
+                    for text, priority, actor, scope in (
+                        ("different", "low", "@owner:example.org", instance),
+                        ("original", "urgent", "@owner:example.org", instance),
+                        ("original", "low", "@other:example.org", instance),
+                        ("original", "low", "@owner:example.org", "other-worker"),
+                    ):
+                        other = TasksView(self.tasks, self.results, actor, instance=scope)
+                        with self.assertRaisesRegex(ValueError, "already bound"):
+                            other.submit_idempotent(text, idempotency_key=key,
+                                                    priority=priority)
+                    self.assertEqual(receipt.read_text(), raw)
+                    self.assertEqual(set(self.tasks.rglob("*.txt")), before)
 
     def test_same_key_survives_restart_and_archive_without_a_second_task(self):
         first = self.view.submit_idempotent(
@@ -624,6 +896,199 @@ class DispatchTests(unittest.TestCase):
         def __getattr__(self, name):
             raise AssertionError(f"task.* reached {name}")
 
+    def _dispatcher(self, base):
+        return RuntimeDispatcher(
+            self._No(), self._No(), "@me:x", executors={},
+            tasks_view=TasksView(base / "tasks", base / "results", "@me:x"))
+
+    def test_list_unfinished_boolean_delegation_and_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = self._dispatcher(Path(tmp))
+            for params, expected in (({}, False), ({"unfinishedOnly": False}, False),
+                                     ({"unfinishedOnly": True}, True)):
+                with self.subTest(params=params), unittest.mock.patch.object(
+                        d.tasks, "list_tasks", return_value={"tasks": []}) as listing:
+                    self.assertEqual(asyncio.run(d.handle("task.list", params)),
+                                     {"tasks": []})
+                    listing.assert_called_once_with(unfinished_only=expected)
+
+    def test_list_rejects_non_boolean_unfinished_without_read_or_mutation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            d = self._dispatcher(base)
+            tid = d.tasks.submit("keep this request")["taskId"]
+            d.tasks.results_dir.mkdir()
+            (d.tasks.results_dir / f"{tid}.txt").write_text("ready")
+
+            def snapshot():
+                return {str(p.relative_to(base)): (p.read_bytes(), p.stat().st_ino,
+                                                   p.stat().st_mtime_ns)
+                        for p in base.rglob("*") if p.is_file()}
+
+            before = snapshot()
+            for value in (None, 0, 1, -1, 0.0, "", "true", "false", [], [True], {},
+                          {"unfinishedOnly": True}):
+                with self.subTest(value=value), unittest.mock.patch.object(
+                        d.tasks, "list_tasks") as listing:
+                    with self.assertRaises(ProtocolError) as raised:
+                        asyncio.run(d.handle("task.list", {"unfinishedOnly": value}))
+                    self.assertEqual(raised.exception.code, -32602)
+                    self.assertIn("boolean", str(raised.exception))
+                    listing.assert_not_called()
+                    self.assertEqual(snapshot(), before)
+
+    def _list_with_process_mutation(self, mode, boundary, acknowledgment="done"):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            d = self._dispatcher(base)
+            victim_id = asyncio.run(d.handle("task.submit", {"task": "victim"}))["taskId"]
+            queued_id = asyncio.run(d.handle("task.submit", {"task": "queued"}))["taskId"]
+            victim = base / "tasks" / f"{victim_id}.txt"
+            caller = r"""
+import asyncio, json, sys, time
+from pathlib import Path
+from unittest.mock import patch
+sys.path.insert(0, sys.argv[1])
+from tasks_view import TasksView
+from dispatcher import RuntimeDispatcher
+base, victim, boundary = Path(sys.argv[2]), Path(sys.argv[3]), sys.argv[4]
+real_stat = Path.stat
+seen = False
+def coordinated_stat(path, *args, **kwargs):
+    global seen
+    if path != victim or seen:
+        return real_stat(path, *args, **kwargs)
+    seen = True
+    metadata = real_stat(path, *args, **kwargs) if boundary == "after" else None
+    print(json.dumps({"boundary": boundary, "at": time.time_ns()}), flush=True)
+    if sys.stdin.readline().strip() != "done":
+        raise RuntimeError("mutation acknowledgment missing")
+    return metadata if boundary == "after" else real_stat(path, *args, **kwargs)
+d = RuntimeDispatcher(None, None, "@me:x", executors={},
+    tasks_view=TasksView(base / "tasks", base / "results", "@me:x"))
+with patch.object(Path, "stat", coordinated_stat):
+    rows = asyncio.run(d.handle("task.list", {}))
+print(json.dumps({"rows": rows, "at": time.time_ns()}), flush=True)
+"""
+            with subprocess.Popen(
+                    [sys.executable, "-B", "-c", caller,
+                     str(ROOT / "src" / "runtime-api"), str(base), str(victim), boundary],
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE, text=True) as child:
+                try:
+                    lines = queue.Queue()
+                    reader = threading.Thread(
+                        target=lambda: lines.put(child.stdout.readline()), daemon=True)
+                    reader.start()
+                    try:
+                        line = lines.get(timeout=10)
+                    except queue.Empty:
+                        self.fail("caller did not reach metadata boundary")
+                    self.assertTrue(line, "caller exited before metadata boundary")
+                    event = json.loads(line)
+                    self.assertEqual(event["boundary"], boundary)
+                    mutation = subprocess.run(
+                        [sys.executable, "-B", "-c", r"""
+import json, sys, time
+from pathlib import Path
+p, mode = Path(sys.argv[1]), sys.argv[2]
+if mode == "claim":
+    p.rename(p.with_name(p.stem + ".claimed-worker-1.txt"))
+elif mode == "archive":
+    p.unlink()
+print(json.dumps({"mode": mode, "at": time.time_ns()}))
+""", str(victim), mode], capture_output=True, text=True, timeout=10)
+                    self.assertEqual(mutation.returncode, 0, mutation.stderr)
+                    changed = json.loads(mutation.stdout)
+                    output, error = child.communicate(acknowledgment + "\n", timeout=10)
+                    if acknowledgment != "done":
+                        self.assertNotEqual(child.returncode, 0)
+                        self.assertIn("mutation acknowledgment missing", error)
+                        return
+                    self.assertEqual(child.returncode, 0, error)
+                    result = json.loads(output)
+                    self.assertLessEqual(event["at"], changed["at"])
+                    self.assertLessEqual(changed["at"], result["at"])
+                    ids = {r["taskId"] for r in result["rows"]["tasks"]}
+                    self.assertIn(queued_id, ids)
+                    if mode == "control" or boundary == "after":
+                        self.assertEqual(ids, {victim_id, queued_id})
+                    later = asyncio.run(self._dispatcher(base).handle("task.list", {}))
+                    expected = {queued_id} if mode == "archive" else {victim_id, queued_id}
+                    self.assertEqual({r["taskId"] for r in later["tasks"]}, expected)
+                finally:
+                    if child.poll() is None:
+                        child.kill()
+                        child.communicate(timeout=10)
+
+    def test_list_separate_process_claim_archive_and_control(self):
+        for mode in ("control", "claim", "archive"):
+            for boundary in ("before", "after"):
+                with self.subTest(mode=mode, boundary=boundary):
+                    self._list_with_process_mutation(mode, boundary)
+
+    def test_list_process_missing_acknowledgment_fails(self):
+        self._list_with_process_mutation("control", "before", acknowledgment="")
+
+    def test_submit_idempotency_retry_after_restart_and_completion(self):
+        for lifecycle in ("completion", "archive"):
+            with self.subTest(lifecycle=lifecycle), tempfile.TemporaryDirectory() as tmp:
+                base = Path(tmp)
+                params = {"task": "do it", "idempotencyKey": "request-42"}
+                first = asyncio.run(self._dispatcher(base).handle("task.submit", params))
+                tid = first["taskId"]
+                task_file = base / "tasks" / f"{tid}.txt"
+                original = task_file.read_bytes()
+                retry = asyncio.run(self._dispatcher(base).handle("task.submit", params))
+                self.assertEqual(retry, first)
+                self.assertEqual(list((base / "tasks").glob("task-*.txt")), [task_file])
+                self.assertEqual(task_file.read_bytes(), original)
+                if lifecycle == "completion":
+                    (base / "results").mkdir()
+                    (base / "results" / f"{tid}.txt").write_text("done")
+                    task_file.unlink()
+                else:
+                    archive = base / "tasks" / "archive"
+                    archive.mkdir()
+                    task_file.rename(archive / task_file.name)
+                finished = asyncio.run(self._dispatcher(base).handle("task.submit", params))
+                self.assertEqual(finished, {"taskId": tid, "state": "done"})
+                self.assertEqual(list((base / "tasks").glob("task-*.txt")), [])
+
+    def test_submit_idempotency_rejects_invalid_keys_and_collisions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            for key in ("", "   ", None, False, 42, [], {}, "x" * 1025,
+                        "é" * 513):
+                with self.subTest(key=repr(key)[:30]):
+                    with self.assertRaises(ProtocolError) as raised:
+                        asyncio.run(self._dispatcher(base).handle(
+                            "task.submit", {"task": "work", "idempotencyKey": key}))
+                    self.assertEqual(raised.exception.code, -32602)
+                    self.assertEqual(list((base / "tasks").glob("task-*.txt")), [])
+            params = {"task": "work", "idempotencyKey": "request-42"}
+            first = asyncio.run(self._dispatcher(base).handle("task.submit", params))
+            task_file = base / "tasks" / f"{first['taskId']}.txt"
+            original = task_file.read_bytes()
+            for change in ({"task": "different"}, {"priority": "low"}):
+                with self.subTest(change=change):
+                    with self.assertRaises(ProtocolError) as raised:
+                        asyncio.run(self._dispatcher(base).handle(
+                            "task.submit", {**params, **change}))
+                    self.assertEqual(raised.exception.code, -32602)
+                    self.assertEqual(list((base / "tasks").glob("task-*.txt")), [task_file])
+                    self.assertEqual(task_file.read_bytes(), original)
+
+    def test_submit_without_key_remains_non_idempotent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            first = asyncio.run(self._dispatcher(base).handle("task.submit", {"task": "hi"}))
+            second = asyncio.run(self._dispatcher(base).handle("task.submit", {"task": "hi"}))
+            self.assertNotEqual(first["taskId"], second["taskId"])
+            self.assertEqual(
+                {p.name for p in (base / "tasks").glob("task-*.txt")},
+                {f"{first['taskId']}.txt", f"{second['taskId']}.txt"})
+
     def test_submit_status_result_dispatch(self):
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
@@ -719,9 +1184,10 @@ class ForeignTaskOwnershipTests(unittest.TestCase):
         self.assertIsNone(self.view.details(self.FOREIGN))
 
     def test_foreign_task_is_not_enumerated(self):
-        listed = self.view.list_tasks()["tasks"]
-        self.assertEqual([e["taskId"] for e in listed], [],
-                         f"another source's task leaked into task.list: {listed}")
+        for unfinished in (False, True):
+            listed = self.view.list_tasks(unfinished_only=unfinished)["tasks"]
+            self.assertEqual([e["taskId"] for e in listed], [],
+                             f"another source's task leaked into task.list: {listed}")
 
     def test_foreign_task_cannot_be_cancelled(self):
         out = self.view.cancel(self.FOREIGN)
@@ -791,6 +1257,109 @@ class ForeignTaskOwnershipTests(unittest.TestCase):
         self.assertIn(tid, [e["taskId"] for e in self.view.list_tasks()["tasks"]])
 
 
+class ResultOrderingTests(unittest.TestCase):
+    SECOND = 1_800_000_000
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.results = Path(tmp.name) / "results"
+        self.results.mkdir()
+        self.view = TasksView(Path(tmp.name) / "tasks", self.results, "@me:x")
+        self.ascending = []
+        for name, fraction in (("mu", 100_000_000), ("alpha", 500_000_000),
+                               ("zeta", 900_000_000)):
+            path = self.results / f"task-rtapi-{name}.txt"
+            path.write_text(f"{name} answer")
+            ns = self.SECOND * 1_000_000_000 + fraction
+            os.utime(path, ns=(ns, ns))
+            self.ascending.append(path)
+        observed = [p.stat().st_mtime_ns for p in self.ascending]
+        self.assertEqual(observed, sorted(set(observed)))
+        self.assertEqual({n // 1_000_000_000 for n in observed}, {self.SECOND})
+
+    def test_same_second_order_is_independent_of_enumeration_and_filename(self):
+        for name, body in (("task-rtapi-blank", " \n\t"),
+                           ("task-foreign", "foreign answer")):
+            path = self.results / f"{name}.txt"
+            path.write_text(body)
+            os.utime(path, (self.SECOND + 1, self.SECOND + 1))
+        real_glob = Path.glob
+        blank = self.results / "task-rtapi-blank.txt"
+        for order in itertools.permutations(self.ascending):
+            with self.subTest(order=[p.name for p in order]):
+                def ordered_glob(directory, pattern):
+                    matches = list(real_glob(directory, pattern))
+                    if directory == self.results:
+                        self.assertEqual(set(matches), {blank, *order})
+                        return iter([blank, *order])
+                    return iter(matches)
+
+                with unittest.mock.patch.object(Path, "glob", ordered_glob):
+                    self.assertEqual(self.view.get_result(), {
+                        "taskId": "task-rtapi-zeta", "result": "zeta answer",
+                        "latest": True})
+                    listed = self.view.list_results()["results"]
+                    self.assertEqual([r["taskId"] for r in listed],
+                                     [p.stem for p in reversed(self.ascending)])
+                    for result in listed:
+                        self.assertIs(type(result["ts"]), int)
+                        self.assertEqual(result["ts"], self.SECOND)
+                    self.assertEqual(self.view.list_results(limit=1), {
+                        "results": listed[:1], "truncated": True})
+                self.assertEqual(self.view.get_result("task-rtapi-mu"), {
+                    "taskId": "task-rtapi-mu", "result": "mu answer"})
+                self.assertIsNone(self.view.get_result("task-foreign"))
+
+    def test_equal_precise_mtimes_preserve_enumeration_order(self):
+        ns = self.SECOND * 1_000_000_000 + 500_000_000
+        for path in self.ascending:
+            os.utime(path, ns=(ns, ns))
+        for order in itertools.permutations(self.ascending):
+            with self.subTest(order=[p.name for p in order]), \
+                    unittest.mock.patch.object(Path, "glob", return_value=order):
+                self.assertEqual(self.view._result_files(),
+                                 [(p, self.SECOND) for p in order])
+
+    def test_full_stat_precision_and_single_cached_stat(self):
+        real_stat = Path.stat
+        metadata = {
+            path: types.SimpleNamespace(
+                st_mode=path.stat().st_mode, st_mtime=self.SECOND + 0.5,
+                st_mtime_ns=self.SECOND * 1_000_000_000 + 500_000_000 + i)
+            for i, path in enumerate(self.ascending)
+        }
+        directory = self.results / "task-rtapi-directory.txt"
+        directory.mkdir()
+        for read in (self.view._result_files, self.view.list_results,
+                     self.view.get_result):
+            with self.subTest(read=read.__name__):
+                calls = dict.fromkeys([*self.ascending, directory], 0)
+
+                def counted_stat(path, *args, **kwargs):
+                    if path in calls:
+                        calls[path] += 1
+                    if path in metadata:
+                        return metadata[path]
+                    return real_stat(path, *args, **kwargs)
+
+                with unittest.mock.patch.object(Path, "stat", counted_stat), \
+                        unittest.mock.patch.object(Path, "glob",
+                                                   return_value=[directory, *self.ascending]):
+                    got = read()
+                self.assertEqual(calls, dict.fromkeys(calls, 1))
+                if read == self.view._result_files:
+                    self.assertEqual(got, [(p, self.SECOND)
+                                          for p in reversed(self.ascending)])
+                elif read == self.view.list_results:
+                    self.assertEqual(got["results"], [
+                        {"taskId": p.stem, "ts": self.SECOND,
+                         "preview": p.read_text()}
+                        for p in reversed(self.ascending)])
+                else:
+                    self.assertEqual(got["taskId"], "task-rtapi-zeta")
+
+
 class ArchivalRaceTests(unittest.TestCase):
     """Archival unlinks a live result name. Enumeration and listing must
     absorb that; a raise here reached asyncio.gather and ended the daemon."""
@@ -829,6 +1398,7 @@ class ArchivalRaceTests(unittest.TestCase):
     def test_archived_after_the_ready_read_still_returns_the_answer(self):
         import tasks_view as tv_mod
         real_read = tv_mod.read_ready_result
+        os.utime(self.f, ns=(1_800_000_000_900_000_000,) * 2)
 
         def read_then_archive(f):
             body = real_read(f)
@@ -840,6 +1410,8 @@ class ArchivalRaceTests(unittest.TestCase):
             got = self.view.list_results()["results"]
         self.assertEqual([e["taskId"] for e in got], ["task-rtapi-race"])
         self.assertIsInstance(got[0]["ts"], int)
+        self.assertEqual(got[0]["ts"], 1_800_000_000)
+        self.assertEqual(got[0]["preview"], "READY BODY")
 
 
 class TasksViewAssignedIdTests(unittest.TestCase):
@@ -867,8 +1439,10 @@ class TasksViewAssignedIdTests(unittest.TestCase):
         self._write("task-rtapi-C1.claimed-core-2.txt", "task-rtapi-C1")
         self._write("task-rtapi-A1.assigned-core-2.txt", "task-rtapi-A1")
 
-        listed = sorted(e["taskId"] for e in self.view.list_tasks()["tasks"])
-        self.assertEqual(listed, ["task-rtapi-A1", "task-rtapi-C1", "task-rtapi-P1"])
+        for unfinished in (False, True):
+            listed = sorted(e["taskId"] for e in self.view.list_tasks(
+                unfinished_only=unfinished)["tasks"])
+            self.assertEqual(listed, ["task-rtapi-A1", "task-rtapi-C1", "task-rtapi-P1"])
 
     def test_a_name_the_grammar_rejects_is_skipped_not_emitted_as_null(self):
         # A missing id suffix is filesystem-portable and matches the glob, but
@@ -892,6 +1466,7 @@ class TasksViewAssignedIdTests(unittest.TestCase):
         got = self.view.get_result(listed[0])
         self.assertIsNotNone(got, "a listed id must resolve to its result")
         self.assertEqual(got["result"], "the answer")
+        self.assertEqual(self.view.list_tasks(unfinished_only=True), {"tasks": []})
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

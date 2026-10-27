@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { injectSilentContext } from '../src/browser-tools.js';
+import { localTimeValue } from '../src/local_time.js';
 
 // The AG2 Space voice plugin against the real task bridge: the client announces its
 // room with a `session.context` frame, the plugin binds it as the session's origin on
@@ -34,6 +35,7 @@ const {
 const {
 	createRoomBinding, roomOrigin, roomOriginFromTaskHeader, sessionRoomNotice, roomContextLines, voiceRoomTaskGuidance, DM_ONLY_DELIVERY_NOTE, ORIGIN_CHANNEL,
 	setVoiceRoomVerifier, requestVoiceRoomVerdict, readVoiceRoomVerdict, voiceRoomCheckKey, VOICE_ROOM_CHECK_DIR, VOICE_ROOM_VERDICT_TTL_S,
+	createCurrentRoomTool, CURRENT_ROOM_PROMPT_RULE, CURRENT_ROOM_TURN_CHECK_RULE,
 } = await plugin('room-binding.ts');
 const { handleSessionContextFrame } = await plugin('tools.ts');
 
@@ -562,6 +564,63 @@ describe('bindSessionContextFrame — a forged but valid room id never becomes a
 	});
 });
 
+describe('a session.context frame during the transcription wait', () => {
+	// eslint-disable-next-line @typescript-eslint/no-explicit-any
+	const delegate = async (task: string) => (await (workTool.execute as any)({ task }, null)) as { taskId: string };
+	const bodyOf = (taskId: string) => readFileSync(join(TASK_DIR, `${taskId}.txt`), 'utf-8');
+	const frame = (room: string) => ({ type: 'session.context', version: 1, room_id: room, room_name: 'Docked', surface: 'room' });
+	const OTHER = '!next-room:ag2.space';
+	const written: string[] = [];
+	// The owner spoke just now and no words have landed, so the call waits; `read` resolves on its first read.
+	function lateSpeech() {
+		let input = '';
+		let signal!: () => void;
+		const read = new Promise<void>((r) => { signal = r; });
+		bridge.setVoiceTurnsProvider(() => {
+			signal();
+			return { items: [{ role: 'assistant', content: 'Previous turn.' }], pendingInput: input, lastUserSpeechAt: Date.now() };
+		});
+		return { read, say(words: string) { input = words; } };
+	}
+
+	after(() => {
+		bridge.setVoiceTurnsProvider(null);
+		setVoiceRoomVerifier(null);
+		setVoiceSessionRoom(null);
+		for (const id of written) { try { rmSync(join(TASK_DIR, `${id}.txt`), { force: true }); } catch {} }
+	});
+
+	it('the same room re-announced keeps the owner\'s late words in the task', { timeout: 5000 }, async () => {
+		setVoiceSessionRoom(null);
+		setVoiceRoomVerifier(async (room) => verdictFor(room, true));
+		assert.equal((await bindSessionContextFrame(frame(VERIFIED)))?.change, 'entered');
+		const speech = lateSpeech();
+		const pending = delegate('room probe: re-announce during the wait');
+		await speech.read;
+		assert.equal((await bindSessionContextFrame(frame(VERIFIED)))?.change, 'none');
+		speech.say('summarise the launch thread');
+		const { taskId } = await pending;
+		written.push(taskId);
+		assert.match(bodyOf(taskId), new RegExp(`^source_room_id: ${VERIFIED}$`, 'm'));
+		assert.match(bodyOf(taskId), /--- spoken[\s\S]*user: summarise the launch thread/);
+	});
+
+	it('a switch to another room still drops words read after it', { timeout: 5000 }, async () => {
+		setVoiceSessionRoom(null);
+		setVoiceRoomVerifier(async (room) => verdictFor(room, true));
+		assert.equal((await bindSessionContextFrame(frame(VERIFIED)))?.change, 'entered');
+		const speech = lateSpeech();
+		const pending = delegate('room probe: switch during the wait');
+		await speech.read;
+		assert.equal((await bindSessionContextFrame(frame(OTHER)))?.change, 'entered');
+		speech.say('words said in the next room');
+		const { taskId } = await pending;
+		written.push(taskId);
+		assert.match(bodyOf(taskId), new RegExp(`^source_room_id: ${VERIFIED}$`, 'm'));
+		assert.doesNotMatch(bodyOf(taskId), /words said in the next room|--- spoken/);
+	});
+});
+
 describe('the result leg re-checks the room: a forged source_room_id never becomes a [channel:] destination', () => {
 	const forgedTask = 'task-1700000000900';
 	const verifiedTask = 'task-1700000000901';
@@ -667,7 +726,7 @@ describe('what the core is handed for a room: the origin, its header keys and th
 		assert.equal(o.contextLine, voiceRoomTaskGuidance(VERIFIED));
 		assert.equal(o.dmOnlyNote, DM_ONLY_DELIVERY_NOTE);
 		assert.equal(bridge.buildVoiceTaskHeader('task-2', '2026-09-18T10:00:00.000Z', 'owner-1', o), [
-			'id: task-2', 'timestamp: 2026-09-18T10:00:00.000Z', 'source: voice', 'interaction_type: realtime_audio', 'media_form: live_stream',
+			'id: task-2', 'timestamp: 2026-09-18T10:00:00.000Z', `local_time: ${localTimeValue(new Date('2026-09-18T10:00:00.000Z'))}`, 'source: voice', 'interaction_type: realtime_audio', 'media_form: live_stream',
 			`channel_id: ${VERIFIED}`, 'channel_kind: room', `source_room_id: ${VERIFIED}`, 'user_id: owner-1', 'access_tier: owner', 'priority: urgent', '',
 		].join('\n'));
 	});
@@ -700,6 +759,54 @@ describe('what the core is handed for a room: the origin, its header keys and th
 		assert.deepEqual(await pending, { change: 'none', room: null });
 		assert.equal(bridge.getVoiceSessionOrigin(), null);
 		setVoiceRoomVerifier(null);
+	});
+});
+
+// The model hears the room only in a notice injected at each change; a notice can be missed or
+// outweighed by older context, so "which room are you in" must be answered from the binding.
+describe('current_room — where the session is docked, read from the binding when asked', () => {
+	const OTHER = '!other:ag2.space';
+	const roomFrame = (id: string | null, name?: string) => ({ type: 'session.context', version: 1, room_id: id, room_name: name ?? null, surface: id ? 'room' : 'dm' });
+
+	it('names the bound room, follows each move, and is not docked in the DM or after the client leaves', async () => {
+		setVoiceRoomVerifier(async (room: string) => verdictFor(room, room === VERIFIED || room === OTHER));
+		const local = createRoomBinding({ set: () => {} });
+		const tool = createCurrentRoomTool(() => local.current());
+		const ask = () => tool.execute({}, {} as never);
+		assert.equal(tool.name, 'current_room');
+		assert.equal(tool.execution, 'inline');
+		assert.deepEqual(await ask(), { docked: false, room: null }, 'no frame yet: the DM');
+		await local.bind(roomFrame(VERIFIED, 'Ops'));
+		assert.deepEqual(await ask(), { docked: true, room: 'Ops' });
+		await local.bind(roomFrame(OTHER, 'Design'));
+		assert.deepEqual(await ask(), { docked: true, room: 'Design' }, 'the room opened last, never the one before it');
+		await local.bind(roomFrame(null));
+		assert.deepEqual(await ask(), { docked: false, room: null });
+		await local.bind(roomFrame(VERIFIED, 'Ops'));
+		local.release();
+		assert.deepEqual(await ask(), { docked: false, room: null }, 'a released binding names no room');
+		setVoiceRoomVerifier(null);
+	});
+
+	it('a refused room is not where the session is; an unnamed room is named by its id', async () => {
+		setVoiceRoomVerifier(vouchForVerifiedOnly);
+		const local = createRoomBinding({ set: () => {} });
+		const tool = createCurrentRoomTool(() => local.current());
+		await local.bind(roomFrame(FORGED, 'Somewhere'));
+		assert.deepEqual(await tool.execute({}, {} as never), { docked: false, room: null });
+		await local.bind(roomFrame(VERIFIED));
+		assert.deepEqual(await tool.execute({}, {} as never), { docked: true, room: VERIFIED });
+		setVoiceRoomVerifier(null);
+	});
+
+	it('the prompt rule sends every where-are-you question to the tool, and the turn check keeps it off the core', () => {
+		assert.match(CURRENT_ROOM_PROMPT_RULE, /^- WHERE YOU ARE: /);
+		assert.match(CURRENT_ROOM_PROMPT_RULE, /current_room, every time/);
+		assert.match(CURRENT_ROOM_PROMPT_RULE, /never from memory, an earlier notice/);
+		assert.match(CURRENT_ROOM_PROMPT_RULE, /not docked .*their DM/i);
+		assert.match(CURRENT_ROOM_TURN_CHECK_RULE, /^- none: /);
+		assert.match(CURRENT_ROOM_TURN_CHECK_RULE, /current_room/);
+		assert.match(CURRENT_ROOM_TURN_CHECK_RULE, /never work/);
 	});
 });
 }

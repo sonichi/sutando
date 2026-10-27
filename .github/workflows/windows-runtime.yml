@@ -11,6 +11,8 @@ on:
     - cron: '37 8 * * *'
   workflow_dispatch: {}
 
+# IMPORTANT: tests must never emit product telemetry; removing or weakening this makes CI test runs
+# count as real users on the admin DAU. Enforced by tests/telemetry-test-optout-guard.test.py.
 env:
   SUTANDO_TELEMETRY: "0"
 
@@ -225,6 +227,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { $failures += 'single-instance.test.py failed' }
           python tests/file-lock.test.py
           if ($LASTEXITCODE -ne 0) { $failures += 'file-lock.test.py failed' }
+          python tests/holder-lock.test.py
+          if ($LASTEXITCODE -ne 0) { $failures += 'holder-lock.test.py failed' }
           python tests/outbox-windows.test.py
           if ($LASTEXITCODE -ne 0) { $failures += 'outbox-windows.test.py failed' }
           python tests/proactive-recovery-process-probe.test.py

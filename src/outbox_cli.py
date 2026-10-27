@@ -16,6 +16,7 @@ import argparse
 import getpass
 import json
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Optional
@@ -59,7 +60,8 @@ def _emit(obj, as_json: bool, where=None) -> None:
                   f"attempts={rec.get('attempts',0)} "
                   f"epoch={rec.get('resend_epoch',0)} "
                   f"{rec.get('item_id','?')}"
-                  + (f"  reason={rec['reason']}" if rec.get("reason") else ""))
+                  + (f"  reason={rec['reason']}" if rec.get("reason") else "")
+                  + (f"  file={rec['file']}" if rec.get("file") else ""))
         return
     for k in sorted(obj):
         print(f"{k}: {obj[k]}")
@@ -82,31 +84,74 @@ def cmd_inspect(args) -> int:
     return 0
 
 
+_SHA256_RE = re.compile(r"[0-9a-f]{64}")
+
+
 def cmd_requeue(args) -> int:
-    """Exit 0 only when this call performed the transition; 3 = nothing to do.
+    """Exit 0 only when this call performed the transition; 3 = nothing to do;
+    4 = the body could not be restored on this host (the record is left as
+    the requeue made it; the body stays listed in undelivered/); 5 = refused before
+    anything changed: a malformed --body-sha256, or none while several bodies are parked;
+    6 = the item record cannot be parsed: nothing changed and no body was restored.
 
     A distinct code matters for the idempotent re-run: "already queued" is not
     a failure, and a script must be able to tell it from "I recovered it".
     """
-    result = outbox.requeue_item(
+    sha = getattr(args, "body_sha256", None)
+    if sha is not None and not _SHA256_RE.fullmatch(sha):
+        # Refused before any state change: an empty or partial digest would restore any copy.
+        _emit({"item_id": args.item_id, "result": "refused",
+               "error": "--body-sha256 must be a 64-character hex digest"}, args.json)
+        return 5
+    if sha is None:
+        copies = undelivered_quarantine.find_quarantined(
+            args.results_dir or Path(args.root).parent, getattr(args, "body_id", None) or args.item_id)
+        if len(copies) > 1:
+            # Several parked generations: which one is this item's is the operator's call, not "newest".
+            _emit({"item_id": args.item_id, "result": "refused",
+                   "error": "several quarantined bodies share this name; pass --body-sha256 for one",
+                   "candidates": {str(p): undelivered_quarantine.sha256_of(p) for p in copies}}, args.json)
+            return 5
+    result, epoch_written = outbox.requeue_item_with_epoch(
         args.root, args.item_id,
         reset_attempts=args.reset_attempts,
         operator=args.operator or _default_operator(),
-        reason=args.reason)
+        reason=args.reason, operator_release=True)
     payload = {"item_id": args.item_id, "result": result.value}
+    if result is outbox.RequeueOutcome.UNREADABLE:
+        # A restored body would be refused by the drain, so it stays quarantined.
+        payload["error"] = ("the item record cannot be parsed, so it cannot be requeued and its body "
+                            "was not restored; check the room first (it may have posted), then see "
+                            "'Unreadable item records' in docs/remote-gateway-protocol.md")
+        _emit(payload, args.json)
+        return 6
     # NOT_PARKED too, not just REQUEUED: the two halves commit separately, so
     # gating the restore on the transition strands the body on every retry.
     restored = False
-    if result in (outbox.RequeueOutcome.REQUEUED, outbox.RequeueOutcome.NOT_PARKED):
+    if (result is outbox.RequeueOutcome.NOT_PARKED
+            and outbox.item_status(args.root, args.item_id) == "DELIVERED"):
+        # A copy still listed in undelivered/ is not owed again once delivered.
+        payload["body"] = "not-restored: delivered"
+    elif result in (outbox.RequeueOutcome.REQUEUED, outbox.RequeueOutcome.NOT_PARKED):
         if result is outbox.RequeueOutcome.REQUEUED:
-            payload["resend_epoch"] = outbox.resend_epoch_for(args.root, args.item_id)
+            payload["resend_epoch"] = epoch_written
         results_dir = args.results_dir or Path(args.root).parent
         body_id = getattr(args, "body_id", None) or args.item_id
-        outcome, path = undelivered_quarantine.restore(results_dir, body_id)
+        outcome, path = (undelivered_quarantine.restore(results_dir, body_id, body_sha256=sha) if sha
+                         else undelivered_quarantine.restore(results_dir, body_id))
         payload["body_id"] = body_id
         payload["body"] = outcome.value
         payload["body_path"] = str(path) if path else None
         restored = outcome is undelivered_quarantine.RestoreOutcome.RESTORED
+        if outcome is undelivered_quarantine.RestoreOutcome.NO_SAFE_MOVE:
+            # Left QUEUED, never parked again: a reply published under this id meanwhile
+            # must still be sent, and the drain only acts on a live result.
+            payload["error"] = (f"the quarantined body {path} could not be moved back on this host; "
+                                "it is untouched and the item stays queued — copy it to "
+                                f"{undelivered_quarantine.canonical_result(results_dir, body_id)} "
+                                "by hand, or re-run this requeue where a no-replace rename works")
+            _emit(payload, args.json)
+            return 4
     _emit(payload, args.json)
     if result is outbox.RequeueOutcome.REQUEUED or restored:
         return 0
@@ -145,6 +190,9 @@ def build_parser() -> argparse.ArgumentParser:
                          "instance keys the record by the broker id and names "
                          "the body file by the instance-qualified local id, so "
                          "one id cannot address both.")
+    rq.add_argument("--body-sha256", dest="body_sha256",
+                    help="restore only the quarantined copy with exactly this content, when one "
+                         "name holds several parked bodies")
     rq.add_argument("--operator", help="recorded as who did it")
     rq.add_argument("--reason", help="recorded as why")
     rq.set_defaults(func=cmd_requeue)

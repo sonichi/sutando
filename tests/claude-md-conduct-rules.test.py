@@ -19,7 +19,7 @@ def _norm(text: str) -> str:
 
 ROUTING = (
     "Reply in the conversation the request came from: a task with `channel_id`/`source_room_id` is "
-    "answered in that room, threaded to `source_message_id`.",
+    "answered in that room, replying to `source_message_id`.",
     "In a room with other people (anything but the owner's own DM), post only what they are meant to "
     "read: a reply to their message, what the owner asked to be posted there, or work the room asked for.",
     "goes to the owner's DM even when asked in the room or by voice while docked in it; nothing goes in "
@@ -28,6 +28,10 @@ ROUTING = (
     "history, files from Drive/Dropbox/Notion, credentials, health or financial records) goes to the DM "
     "whatever the audience.",
     "post it in the DM and exactly one line in the room: 'I sent it to you in our DM.' Never move silently.",
+)
+THREADING = (
+    "- `[thread]` — task-result lead line: AG2 Space threads the answer on the ask. Threading is your call, "
+    "e.g. a side discussion that would crowd the timeline; when unsure, reply in the timeline.",
 )
 # The audience test replaced this: a room's readers, not the data's origin, decide what it may see.
 ROUTING_GONE = ("however personal the topic",)
@@ -63,7 +67,8 @@ class ConductRulesArePinned(unittest.TestCase):
     def _check(self, name):
         s = _norm((REPO / name).read_text(encoding="utf-8"))
         for group, sentences in (("routing", ROUTING), ("language", LANGUAGE), ("blockers", BLOCKERS),
-                                 ("skills-before-refusing", SKILLS_FIRST), ("queue", QUEUE)):
+                                 ("skills-before-refusing", SKILLS_FIRST), ("queue", QUEUE),
+                                 ("threading", THREADING)):
             for sentence in sentences:
                 self.assertIn(_norm(sentence), s, f"{name}: the {group} rule lost: {sentence[:60]!r}")
         for gone in ROUTING_GONE:

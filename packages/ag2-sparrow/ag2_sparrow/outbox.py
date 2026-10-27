@@ -15,6 +15,15 @@ Two rules, both about not-knowing:
     ok-with-no-id may already have been delivered, so retrying duplicates
     rather than repairs.
 
+Malformed claims (a complete record with invalid fields) err toward never
+displacing a possibly-live owner: any pid the record plausibly names blocks a
+takeover while that pid reads ALIVE or UNKNOWN, whatever its age. The cost is
+that a corrupt record naming a live pid (e.g. "pid": true, which is pid 1) never
+ages out. No safe manual remedy exists yet: a raw unlink bypasses the item lock and
+instance checks, so it can duplicate a live delivery or remove a successor's claim.
+Clearing one needs every drainer quiesced, no provider call in flight, any
+indeterminate outcome reconciled, then a locked administrative release.
+
 Contracts: tests/sparrow-outbox-claim-protocol.test.py, tests/outbox-race-check.py
 """
 from __future__ import annotations
@@ -29,11 +38,13 @@ import math
 import os
 import threading
 import time
+import unicodedata
+import uuid
 from dataclasses import dataclass
 from enum import Enum
 from functools import lru_cache
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 try:
     from .file_lock import lock_fd
@@ -58,6 +69,10 @@ class ProcessIdentity:
     pid: int
     state: OwnerState
     start_usec: Optional[int] = None
+
+
+# The largest pid any supported OS hands out; native probes narrow a pid to a C int.
+PID_MAX = 2**31 - 1
 
 
 _PROC_PIDTBSDINFO = 3
@@ -250,7 +265,11 @@ class ClaimRecord:
     pid: int
     start_usec: Optional[int]
     claimed_at: float
-    state: str = "HELD"          # HELD | UNKNOWN (torn)
+    state: str = "HELD"          # HELD | UNKNOWN (torn or malformed)
+    # Malformed = a complete write with invalid fields; it ages by file mtime, never a sweep.
+    malformed: bool = False
+    file_mtime: Optional[float] = None
+    candidate_pid: Optional[int] = None  # lenient: may refuse a takeover, never authorize one
 
 
 def _claims_dir(root: Path) -> Path:
@@ -475,25 +494,101 @@ def _read_claim_at(p: Path, item_id: str) -> Optional[ClaimRecord]:
     if not raw.strip():
         return ClaimRecord(item_id, "", -1, None, 0.0, state="UNKNOWN")
     try:
-        d = json.loads(raw)
+        d = json.loads(raw, parse_int=_bounded_int)
     except json.JSONDecodeError:
         return ClaimRecord(item_id, "", -1, None, 0.0, state="UNKNOWN")
+    except (ValueError, OverflowError):
+        d = None
+    # The writer emits one complete JSON object, so anything that decodes was finished:
+    # invalid fields are malformed, not torn, and must not take the torn-write sweep.
     if not isinstance(d, dict):
-        return ClaimRecord(item_id, "", -1, None, 0.0, state="UNKNOWN")
-    # Valid JSON carrying wrong types is still a claim we cannot read. Raising
-    # here would abort a drainer mid-scan; UNKNOWN keeps the item un-stealable.
-    try:
-        pid = int(d.get("pid", -1))
-        claimed_at = float(d.get("claimed_at", 0.0))
-        raw_start = d.get("start_usec")
-        start_usec = None if raw_start is None else int(raw_start)
-    except (TypeError, ValueError):
-        return ClaimRecord(item_id, "", -1, None, 0.0, state="UNKNOWN")
+        return _malformed_claim(p, item_id, {})
+    pid, start_usec, claimed_at = d.get("pid"), d.get("start_usec"), d.get("claimed_at")
+    if not (valid_pid(pid) is not None and (start_usec is None or _valid_start_usec(start_usec))
+            and _valid_claimed_at(claimed_at)):
+        return _malformed_claim(p, item_id, d)
     return ClaimRecord(item_id=str(d.get("item_id", item_id)),
                        drainer_id=str(d.get("drainer_id", "")),
                        pid=pid,
                        start_usec=start_usec,
-                       claimed_at=claimed_at)
+                       claimed_at=float(claimed_at))
+
+
+_OVERSIZE = object()
+
+
+def _bounded_int(text: str) -> object:
+    """An int no claim field could need decodes as a sentinel every validator rejects,
+    so one oversized value spoils only its own field, not the whole record."""
+    return int(text) if len(text.lstrip("-")) <= 20 else _OVERSIZE
+
+
+def _malformed_claim(p: Path, item_id: str, d: dict) -> ClaimRecord:
+    """UNKNOWN, keeping whatever still parses: the item id for terminal retirement,
+    a valid pid and birth token for the liveness rules."""
+    raw_id, raw_drainer, raw_start = d.get("item_id"), d.get("drainer_id"), d.get("start_usec")
+    try:
+        mtime: Optional[float] = os.stat(str(p)).st_mtime
+    except OSError:
+        mtime = None
+    return ClaimRecord(item_id=raw_id if isinstance(raw_id, str) else item_id,
+                       drainer_id=raw_drainer if isinstance(raw_drainer, str) else "",
+                       pid=valid_pid(d.get("pid")) or -1,
+                       start_usec=raw_start if _valid_start_usec(raw_start) else None,
+                       claimed_at=0.0, state="UNKNOWN", malformed=True, file_mtime=mtime,
+                       candidate_pid=_candidate_owner_pid(d.get("pid")))
+
+
+def _candidate_owner_pid(raw: object) -> Optional[int]:
+    """valid_pid(int(raw)) for every JSON value the reader can see, None where int() raises.
+    Only ever evidence AGAINST a takeover; in a PID namespace pid 1 (true) is a drainer."""
+    if type(raw) is bool or (type(raw) is float and math.isfinite(raw)):
+        raw = int(raw)
+    elif type(raw) is str:
+        return _int_string_pid(raw)
+    return valid_pid(raw)
+
+
+# Exactly the characters int() strips: every c with int(c + "1" + c) == 1.
+_INT_WHITESPACE = frozenset(map(chr, (
+    *range(0x09, 0x0E), 0x20, 0x85, 0xA0, 0x1680, *range(0x20_00, 0x20_0B),
+    0x20_28, 0x20_29, 0x20_2F, 0x20_5F, 0x3000)))
+_INT_WHITESPACE_CHARS = "".join(sorted(_INT_WHITESPACE))
+
+
+def _int_string_pid(raw: str) -> Optional[int]:
+    """int()'s string grammar (whitespace, one '+', digit groups joined by '_'), read in
+    linear time: more than 10 significant digits is past PID_MAX at any length."""
+    text = raw.strip(_INT_WHITESPACE_CHARS)
+    if text.startswith("+"):
+        text = text[1:]
+    groups = text.split("_")
+    if not all(g and g.isdecimal() for g in groups):
+        return None
+    digits = "".join(str(unicodedata.decimal(c)) for g in groups for c in g).lstrip("0") or "0"
+    return valid_pid(int(digits)) if len(digits) <= 10 else None
+
+
+_START_USEC_LIMIT = 2**63
+_CLAIMED_AT_BOUND = 2**53
+
+
+def valid_pid(pid) -> Optional[int]:
+    """`pid` when it is an int (never a bool) with 0 < pid <= PID_MAX, else None."""
+    if isinstance(pid, bool) or not isinstance(pid, int) or not 0 < pid <= PID_MAX:
+        return None
+    return pid
+
+
+def _valid_start_usec(value: object) -> bool:
+    return type(value) is int and 0 < value < _START_USEC_LIMIT
+
+
+def _valid_claimed_at(value: object) -> bool:
+    if type(value) is int:
+        return -_CLAIMED_AT_BOUND <= value <= _CLAIMED_AT_BOUND
+    return (type(value) is float and math.isfinite(value)
+            and -_CLAIMED_AT_BOUND <= value <= _CLAIMED_AT_BOUND)
 
 
 def may_reclaim_delivery(root: Path, item_id: str, ttl_seconds: float) -> bool:
@@ -510,13 +605,22 @@ def may_reclaim_delivery(root: Path, item_id: str, ttl_seconds: float) -> bool:
 
 
 def _record_is_reclaimable(rec: ClaimRecord, ttl_seconds: float) -> bool:
-    if rec.state == "UNKNOWN":
+    if rec.state == "UNKNOWN" and not rec.malformed:
         return False                      # torn: we do not know; do not steal
-    owner = process_identity(rec.pid)
-    if owner.state is OwnerState.UNKNOWN:
-        return False
-    if owner.state is OwnerState.ALIVE and not _pid_was_reused(rec, owner):
-        return False
+    # Refusing needs only a plausible owner; proving reuse needs the strict pid and token.
+    owner_pid = rec.candidate_pid if rec.malformed else rec.pid
+    if owner_pid is not None:
+        owner = process_identity(owner_pid)
+        if owner.state is OwnerState.UNKNOWN:
+            return False
+        if owner.state is OwnerState.ALIVE and not (
+                valid_pid(rec.pid) is not None and _pid_was_reused(rec, owner)):
+            return False
+    if rec.malformed:
+        # claimed_at is untrusted here; the filesystem's mtime is not.
+        if rec.file_mtime is None:
+            return False
+        return (time.time() - rec.file_mtime) >= max(ttl_seconds, SWAP_GRACE_S)
     return (time.time() - rec.claimed_at) >= ttl_seconds
 
 
@@ -527,8 +631,8 @@ def _pid_was_reused(rec: ClaimRecord, owner: ProcessIdentity) -> bool:
     liveness check returns early, and the TTL never gets a say — the item stalls
     forever rather than being redelivered.
     """
-    if rec.start_usec is None or owner.start_usec is None:
-        return False                      # cannot tell: treat as the same owner
+    if not (_valid_start_usec(rec.start_usec) and _valid_start_usec(owner.start_usec)):
+        return False                      # cannot tell: an invalid token proves nothing
     return rec.start_usec != owner.start_usec
 
 
@@ -564,7 +668,7 @@ def _reclaim_locked(root: Path, item_id: str, ttl_seconds: float,
     observed = read_delivery_claim(root, item_id)
     if observed is None:
         return _acquire_locked(root, item_id, drainer_id)
-    if observed.state == "UNKNOWN":
+    if observed.state == "UNKNOWN" and not observed.malformed:
         # A torn claim names no owner, so no age of it condemns a live writer —
         # but past the grace period its writer is gone and it would wedge forever.
         if not _sweep_if_abandoned(_claim_path(root, item_id)):
@@ -684,7 +788,8 @@ def _release_own_instance(p: Path, item_id: str, drainer_id: str) -> bool:
     """
     observed = _read_claim_at(p, item_id)
     # A torn claim has no readable owner, so nobody can prove they hold it.
-    if observed is None or observed.state == "UNKNOWN" or observed.drainer_id != drainer_id:
+    if observed is None or (observed.state == "UNKNOWN" and not observed.malformed) \
+            or observed.drainer_id != drainer_id:
         return False
     tomb = p.with_name(f"{p.name}.release-{_claim_stamp(observed)}")
     try:
@@ -727,11 +832,22 @@ def _item_path(root: Path, item_id: str) -> Path:
     return _items_dir(root) / f"{_safe_key(item_id)}.json"
 
 
+UNREADABLE_ITEM = "unreadable-item"
+
+
 def _read_item(root: Path, item_id: str) -> dict:
+    """The stored record, or a fresh one only when no record exists. A record that exists
+    but cannot be parsed reads as parked with a send in doubt, so it is never sent again."""
     try:
-        return json.loads(_item_path(root, item_id).read_text(encoding="utf-8"))
-    except (FileNotFoundError, json.JSONDecodeError):
+        d = json.loads(_item_path(root, item_id).read_text(encoding="utf-8"))
+    except FileNotFoundError:
         return {"item_id": item_id, "attempts": 0, "status": "QUEUED", "reason": None}
+    except ValueError:
+        d = None
+    if isinstance(d, dict):
+        return d
+    return {"item_id": item_id, "attempts": 0, "status": "PARKED", "reason": UNREADABLE_ITEM,
+            "unreadable": True, "dispatching": {"incarnation": None, "at": None}}
 
 
 def _write_item(root: Path, item_id: str, data: dict) -> None:
@@ -743,8 +859,10 @@ def _write_item(root: Path, item_id: str, data: dict) -> None:
 
 
 def record_delivered(root: Path, item_id: str, *, provider: Optional[str] = None,
-                     destination: Optional[str] = None) -> None:
-    """Mark an item delivered and persist WHERE it went.
+                     destination: Optional[str] = None,
+                     provider_ref: Optional[str] = None) -> None:
+    """Mark an item delivered and persist WHERE it went and the provider's own reference
+    to it (a room message's event id).
 
     The log line naming provider/destination rotates; a receipt that omits them
     cannot answer "delivered to where" after that. Absent values are not stored,
@@ -757,8 +875,88 @@ def record_delivered(root: Path, item_id: str, *, provider: Optional[str] = None
         d["provider"] = provider
     if destination:
         d["destination"] = destination
+    if provider_ref:
+        d["provider_ref"] = provider_ref
+    d.pop("dispatching", None)
     _write_item(Path(root), item_id, d)
     _activity_completed(item_id)
+
+
+def record_dispatching(root: Path, item_id: str, incarnation: str) -> bool:
+    """Under the item lock and its claim: a send is about to leave. A later claim that
+    still finds it knows that send may have landed and was never settled. False, and
+    nothing written, when the record could not be parsed."""
+    d = _read_item(Path(root), item_id)
+    if d.get("unreadable"):
+        return False
+    d["dispatching"] = {"incarnation": incarnation, "at": time.time()}
+    _write_item(Path(root), item_id, d)
+    return True
+
+
+def clear_dispatching(root: Path, item_id: str) -> None:
+    """Under the item lock: the dispatch has an outcome, so nothing is left in doubt."""
+    d = _read_item(Path(root), item_id)
+    if d.pop("dispatching", None) is not None:
+        _write_item(Path(root), item_id, d)
+
+
+def released_by_operator(d: dict) -> bool:
+    """A person released this item for exactly its stored payload, destination included."""
+    mark = d.get("operator_release")
+    return isinstance(mark, str) and mark == hashlib.sha256(
+        (d.get("payload") or "").encode("utf-8")).hexdigest()
+
+
+def park_unclaimed(root: Path, item_id: str, reason: str, reclaim_ttl_s: float = 300.0,
+                   on_release: "Optional[Callable[[ClaimRecord], None]]" = None) -> bool:
+    """Park an item no one holds, under its lock, only while it is still live and unsettled:
+    never over DELIVERED, a receipt, a dispatch mark or a live claim. A claim a reclaim may
+    take (a dead owner past `reclaim_ttl_s`, a torn one past its grace) goes first. False when it changed."""
+    with _item_lock(Path(root), item_id):
+        if not _item_path(Path(root), item_id).exists():
+            return False
+        d = _read_item(Path(root), item_id)
+        if d.get("status") in ("DELIVERED", "PARKED") or dispatch_unsettled(d):
+            return False
+        rec = read_delivery_claim(Path(root), item_id)
+        if rec is not None:
+            if rec.state == "UNKNOWN" and not rec.malformed:
+                # Torn: the same grace-period sweep the claim route uses, never a younger one.
+                if not _sweep_if_abandoned(_claim_path(Path(root), item_id)):
+                    return False
+            elif not _record_is_reclaimable(rec, reclaim_ttl_s):
+                return False
+            else:
+                _release_locked(Path(root), item_id, rec.drainer_id, force=True)
+            if on_release is not None:
+                on_release(rec)
+        d.update(status="PARKED", reason=reason)
+        _write_item(Path(root), item_id, d)
+        return True
+
+
+def dispatch_unsettled(d: dict) -> bool:
+    """A send that left without a completed outcome: a receipt recorded, or a mark still set."""
+    return bool(d.get("provider_ref")) or isinstance(d.get("dispatching"), dict)
+
+
+def record_provider_ref(root: Path, item_id: str, provider_ref: str,
+                        destination: Optional[str] = None) -> bool:
+    """The provider's proof that a send landed, and where, kept on the item before it is
+    completed, so a crash after the send settles it as delivered instead of sending it again.
+    False when the item is missing or already terminal."""
+    with _item_lock(Path(root), item_id):
+        if not _item_path(Path(root), item_id).exists():
+            return False
+        d = _read_item(Path(root), item_id)
+        if d.get("status") in ("DELIVERED", "PARKED"):
+            return False
+        d["provider_ref"] = provider_ref
+        if destination:
+            d["destination"] = destination
+        _write_item(Path(root), item_id, d)
+        return True
 
 
 def _activity_completed(item_id: str) -> None:
@@ -774,7 +972,8 @@ def _activity_completed(item_id: str) -> None:
 
 def item_status(root: Path, item_id: str) -> Optional[str]:
     """Public read of an item's lifecycle status (READY/CLAIMED/DELIVERED/
-    PARKED...); None when no record exists or the record is unreadable."""
+    PARKED...); None when no record exists or it cannot be opened. A record
+    that cannot be parsed reads PARKED."""
     try:
         if not _item_path(Path(root), item_id).exists():
             return None
@@ -852,6 +1051,7 @@ def retry_failed_locked(root: Path, item_id: str, now: float) -> None:
     retry["next_attempt_at"] = (min(now + delay, retry["deadline"])
                                 if now < retry["deadline"] else now + delay)
     d["attempts"] = int(d.get("attempts", 0)) + 1
+    d.pop("dispatching", None)  # a definite refusal: nothing is in doubt, in this same write
     if _retry_exhausted(retry, now):
         d.update(status="PARKED", reason="retry-window-exhausted")
     _write_item(root, item_id, d)
@@ -860,14 +1060,17 @@ def retry_failed_locked(root: Path, item_id: str, now: float) -> None:
 def note_attempt(root: Path, item_id: str) -> int:
     d = _read_item(Path(root), item_id)
     d["attempts"] = int(d.get("attempts", 0)) + 1
+    d.pop("dispatching", None)
     _write_item(Path(root), item_id, d)
     return d["attempts"]
 
 
 def park_item(root: Path, item_id: str, reason: str = "") -> None:
+    """One write: a parked item carries no dispatch mark, so no crash can leave it unmarked and live."""
     d = _read_item(Path(root), item_id)
     d["status"] = "PARKED"
     d["reason"] = reason
+    d.pop("dispatching", None)
     _write_item(Path(root), item_id, d)
 
 
@@ -890,8 +1093,76 @@ def read_item(root: Path, item_id: str) -> Optional[dict]:
     return _read_item(Path(root), item_id)
 
 
+PROOF_VERSION = 1
+
+
+def new_publication_id() -> str:
+    """A fresh identity for one publish or requeue by this writer (never a clock value)."""
+    return uuid.uuid4().hex
+
+
+def _proof_binding(payload: str, publication_id) -> str:
+    """What a stamped proof vouches for: this version, the stored payload and the
+    publication that wrote them. It only ever decides archive versus quarantine."""
+    return hashlib.sha256(json.dumps([PROOF_VERSION, payload, publication_id]).encode("utf-8")).hexdigest()
+
+
+def source_proof(record: Optional[dict]) -> Optional[str]:
+    """The record's source digest, trusted only from this writer's stamp
+    (`proof_version`) and only while its binding still matches the stored payload
+    and publish; main's records, earlier heads' and unknown shapes have none."""
+    if not record:
+        return None
+    proof, payload = record.get("source_ready_sha256"), record.get("payload")
+    if (record.get("proof_version") != PROOF_VERSION or not proof or not isinstance(payload, str)
+            or not record.get("publication_id")
+            or record.get("source_payload_sha256") != _proof_binding(payload, record.get("publication_id"))):
+        return None
+    return proof
+
+
+def source_proof_fields(source_ready_sha256: Optional[str], payload: str, publication_id: str) -> dict:
+    """Every source-proof field, written atomically with the payload and publication they vouch for."""
+    fields = {"publication_id": publication_id}
+    if source_ready_sha256:
+        fields.update(proof_version=PROOF_VERSION, source_ready_sha256=source_ready_sha256,
+                      source_payload_sha256=_proof_binding(payload, publication_id))
+    return fields
+
+
+def source_digest(ready_body: str) -> str:
+    """The digest an outbox record keeps of the result it was built from: the
+    readiness-normalized body, so surrounding whitespace is the same source."""
+    return hashlib.sha256(ready_body.encode("utf-8")).hexdigest()
+
+
+def delivered_body_differs(root: Path, item_id: str, ready_body: Optional[str]) -> bool:
+    """True when the id is DELIVERED and a live result whose ready body is
+    `ready_body` was never provably what was sent (None: nothing provable).
+    Decided on the record's source proof (`source_proof`), valid only while it
+    describes the stored payload. A record without a valid proof (an earlier
+    `source_sha256`, or a payload replaced without it) proves only a source
+    identical to its stored wire body; any marker a path strips or acts on
+    ([dm-only], [channel:], [file:]...) makes it unprovable."""
+    d = read_item(root, item_id)
+    if not d or d.get("status") != "DELIVERED":
+        return False
+    if ready_body is None:
+        return True
+    proof = source_proof(d)
+    if proof:
+        return proof != source_digest(ready_body)
+    try:
+        stored = json.loads(d.get("payload") or "")
+    except (TypeError, ValueError):
+        return True
+    return not isinstance(stored, dict) or stored.get("body") != ready_body
+
+
 def list_items(root: Path, status: Optional[str] = None) -> list[dict]:
-    """Every item record, newest id order, optionally filtered by status."""
+    """Every item record, newest id order, optionally filtered by status. A record that
+    cannot be read or parsed is listed as PARKED `unreadable-item` by its file name; its
+    item id cannot be recovered from that name, so it carries none."""
     d = _items_dir(Path(root))
     if not d.is_dir():
         return []
@@ -899,28 +1170,43 @@ def list_items(root: Path, status: Optional[str] = None) -> list[dict]:
     for p in sorted(d.glob("*.json")):
         try:
             rec = json.loads(p.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            continue
+        except (OSError, ValueError):
+            rec = None
+        if not isinstance(rec, dict):
+            rec = {"status": "PARKED", "reason": UNREADABLE_ITEM, "unreadable": True, "file": p.name}
         if status is None or rec.get("status") == status:
             out.append(rec)
     return out
 
 
 class RequeueOutcome(str, Enum):
-    """Only REQUEUED means this call moved the item; the other two touched
-    nothing, which is what makes a repeated requeue safe to script."""
+    """Only REQUEUED means this call moved the item; the others touched
+    nothing, which is what makes a repeated requeue safe to script. UNREADABLE:
+    the record exists but cannot be parsed, so there is no payload to requeue."""
 
     REQUEUED = "requeued"
     NOT_PARKED = "not-parked"
     ABSENT = "absent"
+    UNREADABLE = "unreadable"
 
 
 def requeue_item(root: Path, item_id: str, *, reset_attempts: bool = False,
                  operator: Optional[str] = None,
                  reason: Optional[str] = None) -> RequeueOutcome:
+    """Operator recovery: PARKED -> QUEUED. See `requeue_item_with_epoch`."""
+    return requeue_item_with_epoch(root, item_id, reset_attempts=reset_attempts,
+                                   operator=operator, reason=reason)[0]
+
+
+def requeue_item_with_epoch(root: Path, item_id: str, *, reset_attempts: bool = False,
+                            operator: Optional[str] = None,
+                            reason: Optional[str] = None,
+                            payload: Optional[str] = None,
+                            operator_release: bool = False) -> "tuple[RequeueOutcome, Optional[int]]":
     """Operator recovery: PARKED -> QUEUED as ONE atomic transition.
 
-    Refuses anything not PARKED, which is what makes it idempotent AND keeps it
+    Refuses anything not PARKED, and a record that could not be parsed (it has no
+    payload to send). That is what makes it idempotent AND keeps it
     from creating a second delivery: a live claim only exists on an item that is
     not parked, so this can never destroy one. The force-release below therefore
     clears a residue of the parked attempt, never a peer's in-flight work.
@@ -934,23 +1220,43 @@ def requeue_item(root: Path, item_id: str, *, reset_attempts: bool = False,
     already at MAX_ATTEMPTS, the next failure re-parks it immediately; that is
     the intended "one more try" semantic, and --reset-attempts is the full
     budget.
+
+    Returns the epoch written under the lock (None unless REQUEUED): a later
+    read can see a peer's re-requeue, and a rollback keyed on it undoes theirs.
+    A requeue keeps the stored payload unless `payload` replaces it: only for a send that
+    provably never left, whose destination has moved since. `operator_release` records that a
+    person released exactly the stored payload (see released_by_operator); automation never sets it.
     """
     root = Path(root)
     with _item_lock(root, item_id):
         if not _item_path(root, item_id).exists():
-            return RequeueOutcome.ABSENT
+            return RequeueOutcome.ABSENT, None
         d = _read_item(root, item_id)
+        if d.get("unreadable"):
+            return RequeueOutcome.UNREADABLE, None
         if d.get("status") != "PARKED":
-            return RequeueOutcome.NOT_PARKED
+            return RequeueOutcome.NOT_PARKED, None
         _release_locked(root, item_id, force=True)
+        if d.get("reason") == "outcome-unknown" or dispatch_unsettled(d):
+            d["prior_outcome_unknown"] = True  # an earlier send may be visible; never cleared
         d["resend_epoch"] = int(d.get("resend_epoch", 0) or 0) + 1
         d["status"] = "QUEUED"
         d["reason"] = None
         if reset_attempts:
             d["attempts"] = 0
             d.pop("retry", None)
+        d.pop("dispatching", None)  # the operator's resend is deliberate
         d["requeued_at"] = time.time()
         d["requeued_by"] = operator or "unknown"
         d["requeue_reason"] = reason or ""
+        if payload is not None:
+            d["payload"] = payload
+        d.pop("operator_release", None)
+        if operator_release:
+            d["operator_release"] = hashlib.sha256((d.get("payload") or "").encode("utf-8")).hexdigest()
+        proof = source_proof(d)
+        for field in ("proof_version", "source_ready_sha256", "source_payload_sha256"):
+            d.pop(field, None)
+        d.update(source_proof_fields(proof, d.get("payload") or "", new_publication_id()))
         _write_item(root, item_id, d)
-        return RequeueOutcome.REQUEUED
+        return RequeueOutcome.REQUEUED, d["resend_epoch"]

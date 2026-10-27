@@ -35,6 +35,7 @@ const {
 	NAVIGATE_UI_TIMEOUT_MS, NAVIGATE_UI_UNSUPPORTED_MESSAGE, NAVIGATE_UI_CLIENT_OUTDATED_MESSAGE, NAVIGATE_UI_ROOM_QUERY_MISSING_MESSAGE, NAVIGATION_PROMPT_RULE,
 } = await plugin('navigate.ts');
 const pluginTools = await plugin('tools.ts');
+const { CURRENT_ROOM_PROMPT_RULE, CURRENT_ROOM_TURN_CHECK_RULE, setVoiceRoomVerifier } = await plugin('room-binding.ts');
 type SessionContextFrame = Record<string, unknown> & { version: number };
 /** The frame the AG2 Space client sends (webapp voiceRoomBinding.ts), before capabilities are added. */
 const buildSessionContextFrame = (ctx: { roomId: string; roomName?: string } | null): SessionContextFrame => ctx
@@ -426,20 +427,45 @@ describe('navigate_ui exposure — declared only where a client can answer it', 
 	it('without the channel the skill contributes no tool and no rule; with it, both reach the prompt', async () => {
 		const { buildInstructions } = await import('../src/voice-agent-config.js');
 		const offSurface = surfaceWith({});
-		assert.deepEqual([offSurface.tools, offSurface.promptRules], [[], []]);
+		assert.deepEqual([offSurface.tools, offSurface.promptRules, offSurface.answeringTools, offSurface.turnCheckRules], [[], [], [], []]);
 		for (const off of [buildInstructions(ctx(offSurface) as never, OVERRIDES), buildInstructions(ctx() as never, OVERRIDES)]) {
 			assert.ok(!off.includes('NAVIGATION:'));
 			assert.ok(!off.includes('navigate_ui'));
+			assert.ok(!off.includes('current_room'));
 		}
 		const onSurface = surfaceWith({ REMOTE_TASK_TOKEN: 'tok' });
-		assert.deepEqual(onSurface.tools.map((t: { name: string }) => t.name), ['navigate_ui']);
-		assert.deepEqual(onSurface.promptRules, [NAVIGATION_PROMPT_RULE]);
+		assert.deepEqual(onSurface.tools.map((t: { name: string }) => t.name), ['navigate_ui', 'current_room']);
+		assert.deepEqual(onSurface.promptRules, [NAVIGATION_PROMPT_RULE, CURRENT_ROOM_PROMPT_RULE]);
+		assert.deepEqual(onSurface.answeringTools, ['current_room'], 'a turn current_room answers is not also sent to the core');
+		assert.deepEqual(onSurface.turnCheckRules, [CURRENT_ROOM_TURN_CHECK_RULE]);
 		const lines = buildInstructions(ctx(onSurface) as never, OVERRIDES).split('\n');
 		assert.equal(lines.filter(l => l.startsWith('- NAVIGATION: ')).length, 1);
 		const rule = lines.findIndex(l => l.startsWith('- NAVIGATION: '));
-		assert.ok(lines[rule - 1].startsWith('- For SIMPLE actions') && lines[rule + 1].startsWith('- For IN-PLACE EDITS'), 'where the rule has always sat');
+		assert.ok(lines[rule - 1].startsWith('- For SIMPLE actions') && lines[rule + 1].startsWith('- WHERE YOU ARE: ') && lines[rule + 2].startsWith('- For IN-PLACE EDITS'), 'where the rules have always sat');
 		assert.ok(lines.some(l => l.startsWith('- navigate_ui: ') && l.endsWith('. Instant.')), 'listed with the instant tools');
-		assert.ok(lines.some(l => l.includes(', navigate_ui — call these directly')), 'and in the joined names line');
+		assert.ok(lines.some(l => l.startsWith('- current_room: The AG2 Space room this voice session is docked in right now') && l.endsWith('. Instant.')));
+		assert.ok(lines.some(l => l.includes(', navigate_ui, current_room — call these directly')), 'and in the joined names line');
+	});
+
+	it('the declared current_room reads the binding setup() wired to the client\'s frames', async () => {
+		setVoiceRoomVerifier(async (room: string) => ({ room_id: room, verified: true, reason: 'joined', checked_at: Date.now() / 1000 }));
+		const frameHandlers: Array<(f: Record<string, unknown>) => unknown> = [];
+		const goneHandlers: Array<() => void> = [];
+		pluginTools.setup({
+			session: {}, injectText: () => {}, injectContext: () => {},
+			clientAttached: () => true, sendClientFrame: () => true,
+			onClientFrame: (h: (f: Record<string, unknown>) => unknown) => { frameHandlers.push(h); },
+			onClientDisconnected: (h: () => void) => { goneHandlers.push(h); },
+			setVoiceSessionOrigin: () => {}, getVoiceSessionOrigin: () => null, setVoiceTaskOriginResolver: () => {},
+		});
+		const tool = surfaceWith({ REMOTE_TASK_TOKEN: 'tok' }).tools.find((t: { name: string }) => t.name === 'current_room');
+		const ask = () => tool.execute({}, {} as never);
+		frameHandlers.forEach(h => h(buildSessionContextFrame({ roomId: '!wired:ag2.space', roomName: 'Wired' })));
+		await delay(5);
+		assert.deepEqual(await ask(), { docked: true, room: 'Wired' });
+		goneHandlers.forEach(h => h());
+		assert.deepEqual(await ask(), { docked: false, room: null }, 'the client leaving releases the room');
+		setVoiceRoomVerifier(null);
 	});
 
 	it('navigateUiAvailable: a gateway token in the env or in channels/ag2space/.env, nothing else', () => {

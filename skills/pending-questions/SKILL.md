@@ -26,14 +26,28 @@ python3 skills/pending-questions/scripts/pq.py list [--json]
 python3 skills/pending-questions/scripts/pq.py reconcile
 python3 skills/pending-questions/scripts/pq.py resolve <ask-id> [--answered]
 python3 skills/pending-questions/scripts/pq.py remind [--force]
+python3 skills/pending-questions/scripts/pq.py clicks [--json]
+python3 skills/pending-questions/scripts/pq.py ack <ask-id> --token <token>
 ```
 
-- `ask` reconciles, queues the question to the owner (the task's conversation only for an
+**Trigger: any time you would write a question for the owner into terminal or summary text, file
+it instead** with `ask` (or `scripts/ask-owner.py`; add `--unless-open` to file nothing when an
+open row already has that question — it reports `already open: [<id>]`). The terminal and a compaction summary reach no one.
+This skill's `hooks/compact-carry.py` keeps owner questions out of compaction summaries and, after
+one, has the core file any never-asked question it carried; `session-state.md` shows only the
+count (`python3 src/pending_questions_reader.py summary`).
+
+- `ask` queues the question to the owner (the task's conversation only for an
   owner-tier task in his DM; otherwise his DM), saves it to the outbox, writes the row born
   with its `**Sent:**` record, and once that exact row is confirmed complete commits the
   store-history marker and THEN deletes the outbox file — a marker that cannot be written
   keeps the file (`history: FAILED` in the report) so the local evidence outlives the
-  failure. If the outbox cannot hold the question, NO row is written: the owner is still
+  failure. Only after that confirmation does it reconcile the older backlog. Room subprocess
+  calls share one operation budget (90 seconds by default), so failures cannot renew the
+  timeout for each older question; the held entries remain for a later explicit reconcile.
+  The shared reconcile pass applies that budget to every caller, including `pq reconcile`
+  and reminders. Resolving an answer shares it across reconciliation and the row close.
+  If the outbox cannot hold the question, NO row is written: the owner is still
   asked, and the report says nothing holds it. Read the output: a `FAILED` line is not an
   ask. Then continue; never block.
 - `list` is READ-ONLY — it writes no file, not even the history marker — and lists each ask
@@ -48,6 +62,8 @@ python3 skills/pending-questions/scripts/pq.py remind [--force]
   an outage, not an empty outbox — whatever became of the one-time introduction message.
 - `reconcile` is the explicit pass: outbox replay, local close records, stale marks, the
   transitional legacy ingest, and the history backfill for rows that predate the marker.
+  Legacy ingest refuses an archive boundary hidden by damaged Markdown before creating
+  rows or marking source entries moved; it reports the affected line numbers.
   Every step commits the history marker before it releases local evidence (an outbox entry,
   a close record, a legacy file entry), and keeps that evidence when the commit fails. `ask`
   and `remind` run it; `list` does not.
@@ -62,6 +78,72 @@ python3 skills/pending-questions/scripts/pq.py remind [--force]
 - `remind` is the only way a reminder is sent (`src/check-pending-questions.py --notify`
   with this skill's adapter). Nothing is scheduled, and no pass surfaces questions: the
   owner is asked once, as questions come up, and reminded when he asks.
+
+## Decision-card clicks
+
+A question's decision card is a HITL `choice` requirement with runtime `pending-questions`, guard
+and `subject.ask_id` set to the ask id and `subject.choices` mapping each action id to what it
+does. The bridge owner-checks a click, records it (`chosen_action`) and, the card asking for a
+turn, forwards it to the core as a task headed `hitl_click: true`. The core then runs
+`python3 src/pending_questions_reader.py clicks` (`pq.py clicks` is the same), which reaches this
+adapter's `clicks` (`scripts/pending_questions_clicks.py`):
+
+- Each pass runs under one exclusive lock beside the HITL store
+  (`state/hitl/pending-questions-clicks.lock`); its holder is the only live claimant, so no pid
+  is probed. A claim still marked `claiming` was left by a pass that died; it is retried with the
+  same token.
+- The pass claims the click (a token, saved atomically on the card) and closes the row as
+  Answered in one guarded write that requires the owner's Status to be open. The same write puts
+  a plain `Answered@<host>` in Closed (what a reader that predates click tokens understands) and
+  the token in Recovery (`click:<token>@<host>`, which such a reader ignores). A refused close
+  first checks the owner's Status: Answered or Resolved makes the click stale whatever any mark
+  says. Otherwise a Recovery token equal to this claim's is the claim's own earlier close, and any
+  other refusal (a close by code such as `resolve`) makes the click stale: "already answered — not
+  a decision", and its card is cancelled.
+- **Fail closed.** Only the room can say the owner's Status is open, so a click never closes
+  through a local close record: when the room store is missing or unreachable, or the row is not
+  in it yet, the click is deferred — nothing is handed over, the claim stays, and the next pass
+  retries.
+- On a close the claim is recorded `handed` (with `handed_at`) before it is returned. The choice
+  prints once, as `[<ask-id>] chose <action-id> '<label>' -> <consequence> … ack with --token
+  <token>`, to that caller alone. Later passes, by any consumer, print it as "handed out earlier,
+  awaiting ack — not a new decision" for the lease (`HANDED_LEASE_SEC`, 10 minutes).
+- The core acts, then runs `… ack <ask-id> --token <token>`, which settles the card. A handed claim
+  whose lease has expired is re-offered as `chose` to the next pass, ONCE, with a fresh token and
+  a new lease, so a consumer that died after the handoff does not strand the choice. After that
+  single re-offer an unacked claim is listed as "NEEDS ATTENTION — handed out twice, never
+  acknowledged" and never offered again; `clicks --due` (and so the health check) surfaces it.
+- **The lease** (`scripts/pending_questions_lease.py`) counts elapsed time, not wall-clock
+  deadlines. Invariant: it expires exactly when the time credited to it reaches its window
+  (`HANDED_LEASE_SEC`, 600 s); each pass credits `clamp(now - observed_at, 0, max_step)` and then
+  sets `observed_at = now`. With `LEASE_MAX_STEP_SEC` (300 s, the health check's fallback cadence)
+  below the window: a backward step credits nothing, so a rollback never expires a lease or raises
+  NEEDS ATTENTION; a forward spike of any size credits at most one step, and once the clock is
+  corrected normal time resumes, so a spike never freezes recovery; repeated passes at one time
+  credit 0; no single pass expires a fresh lease; a handoff or re-offer starts a new lease. The
+  trade-off, chosen on purpose: catching back up after a rollback is credited again, so a rollback
+  can over-credit by at most one step — bounded, where refusing all double credit would freeze the
+  lease for the whole span of a corrected forward spike. The passes are every `clicks` and every
+  `clicks --due` (the health check), each crediting and saving the lease atomically under the
+  clicks lock, so a restart resumes from the saved credit.
+- **A retired card wins.** Each claim save re-checks the card under the HITL store lock and is
+  refused for a card already settled (a concurrent `resolve` retiring it); the pass then hands
+  nothing over and returns no token, printing "settled meanwhile — not a decision". An
+  ack carrying a superseded token is refused as stale and changes nothing.
+- **At-least-once, at most twice.** The core acts before it acks, so a consumer slower than the
+  lease, or a clock jump, can let a second consumer receive the same `chose`. Rule: before acting
+  on a `chose`, re-check the current state (the PR is not already merged, the question is not
+  already resolved, the thing is not already done) and skip what is.
+- `resolve` retires (cancels) the question's card whenever it closes the row or the room refuses
+  the close.
+- **Wakeup.** A deferred click, or a handoff whose lease ran out, owes a pass with no new task to
+  trigger it. `src/health-check.py` (run every proactive-loop pass, and by the launchd fallback)
+  reads that through the core reader (`clicks --due`, read-only) and warns
+  `decision-card-clicks`, naming `… clicks` to run; the core handles that output as for a
+  `hitl_click` task. A host that never runs the health check retries only on the next click task.
+
+A pass that dies after recording `handed` and before its caller printed the choice leaves it
+handed but unseen; it is shown as awaiting ack until the lease runs out, then re-offered.
 
 ## The outbox
 

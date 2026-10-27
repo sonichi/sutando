@@ -30,6 +30,12 @@ import unittest
 
 # Module init resolves the token during exec_module, so both boundaries must be
 # hermetic before the bridge is imported.
+sys.path.append(str(pathlib.Path(__file__).resolve().parents[3] / "tests"))
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 os.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp(prefix="ccd-env-token-quotes-")
 
 _FAKE_VI = types.ModuleType("vault_intercept")

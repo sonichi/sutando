@@ -9,7 +9,7 @@ server implementation):
 
   - subscription management — `events_subscribe` / `events_unsubscribe` /
     `events_subscriptions` ops on the generic `POST {base}/v1/room` envelope
-    (one privileged endpoint, many ops — same shape as doc/mention).
+    (one privileged endpoint, many ops — same shape as mention).
   - typed emit — the `event` op on that same envelope: send one typed
     `space.ag2.*` TIMELINE event as this agent. The receive half above had no
     counterpart, so an agent could subscribe to typed events it had no way to
@@ -67,7 +67,7 @@ def _result(ok, *, room_id=None, subscription_id=None, subscriptions=None, reaso
 # --------------------------------------------------------------------------- #
 def _op_call(op, room_id, agent_mxid, gate, extra=None, *, gated=True):
     """Gate check (room-scoped ops only) → op-envelope POST → response dict or
-    a degraded _result. Mirrors doc._call — same envelope, same degrade map."""
+    a degraded _result."""
     agent_mxid = agent_mxid or os.environ.get("AGENT_MXID")
     if gated:
         if not room_id:
