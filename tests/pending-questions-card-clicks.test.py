@@ -308,6 +308,17 @@ class TokenAndOutage(_Room):
         [c] = self.run_clicks()
         self.assertEqual((c["actionable"], c["token"]), (True, "claimtok"), c["close_message"])
 
+    def test_the_owners_status_wins_over_a_matching_token_mark_whose_clearing_failed(self):
+        click(self.m, self.card, "option-1")
+        cards.stamp_claim(self.m, self.card, {"token": "claimtok", "state": cards.CLAIMING})
+        self.store.close(self.ask_id, "Answered", require_open=True, token="claimtok")  # this claim's mark
+        self._owner_sets("resolved")  # then the owner answered on the row himself
+        with mock.patch.object(type(self.store), "clear", side_effect=OSError("stale mark not cleared")):
+            [c] = self.run_clicks()
+        self.assertEqual((c["actionable"], c["stale"]), (False, True), c["close_message"])
+        self.assertNotIn("chose", reader.click_line(c))
+        self.assertEqual(self.m.get(self.card).status, STATUS_CANCELLED)
+
     def test_an_outage_defers_a_click_even_beside_a_terminal_owner_status(self):
         self._owner_sets("resolved")
         click(self.m, self.card, "approve")

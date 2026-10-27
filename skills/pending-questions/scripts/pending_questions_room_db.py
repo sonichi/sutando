@@ -332,6 +332,8 @@ def _close_for_click(ws: Path, ask_id: str, token: str) -> tuple:
             store.close(ask_id, "Answered", require_open=True, token=token)
             return cards.CLOSED, f"room database: {ask_id} -> Answered in {store.where(ask_id)}"
     except GuardFailed as g:
+        if g.current.get("status") in TERMINAL:  # the owner's own answer wins, whatever any mark says
+            return cards.STALE, f"{REFUSED_PREFIX} — the owner set {g.current['status']} — {type(g).__name__}: {g}"
         if mark_token(g.current.get("closed")) == token:
             return cards.CLOSED, f"room database: {ask_id} closed earlier by this claim"
         if not g.current:
