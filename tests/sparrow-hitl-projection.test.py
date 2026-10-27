@@ -168,12 +168,13 @@ class OneRefusedCard(unittest.TestCase):
 
     def setUp(self):
         self.ws = Path(tempfile.mkdtemp())
-        self.posts = []
+        self.posts, self.notices = [], []
         self._saved = (B._STATE, B.PROACTIVE_ROOM, B._req)
         B._STATE = self.ws / "state"
         B.PROACTIVE_ROOM = "!room:example.invalid"
         B._ROUTING.update(owner_dm="!room:example.invalid", loaded=True, next=B.time.time() + 3600)
         self.manager = hm.HitlManager(hm.HitlStore(hm.default_store(self.ws)))
+        self.addCleanup(B._hitl_modules()[1]._NO_ACCEPT_SINCE.clear)
         ids = sorted(self.manager.create(hs.HumanRequirement(
             kind="choice", runtime="claude", message=f"card {g}", guard=g,
             actions=[hs.Action(id="ok", kind="answer", label="OK")])).id for g in ("g1", "g2"))
@@ -187,6 +188,9 @@ class OneRefusedCard(unittest.TestCase):
         B._hitl_backoff_reset()
 
     def _send(self, method, path, payload=None, timeout=None):
+        if hs.WIRE_FIELD not in payload["extra_content"]:
+            self.notices.append((payload["extra_content"][hs.NOTICE_FIELD]["notice"], payload["body"]))
+            return {"ok": True, "event_id": f"$n{len(self.notices)}"}
         card = payload["extra_content"][hs.WIRE_FIELD]["id"]
         self.posts.append(card)
         if card == self.bad:
@@ -216,8 +220,11 @@ class OneRefusedCard(unittest.TestCase):
             with mock.patch("time.time", return_value=B.time.time() + later), \
                     mock.patch("time.monotonic", return_value=B.time.monotonic() + later):
                 self._pass(logs)
-        self.assertEqual(self.posts.count(self.bad), bound)
+        # Charged at once beside the accepted card; one uncharged try opens the grace.
+        self.assertEqual(self.posts.count(self.bad), bound + 1)
         self.assertEqual(self.posts.count(self.good), 1)
+        self.assertEqual([n for n, _ in self.notices], ["failed"], "the owner is told once")
+        self.assertIn(self.manager.get(self.bad).message, self.notices[0][1])
         failed = [line for line in logs if "could not be projected" in line]
         self.assertEqual(len(failed), 1, logs)
         self.assertIn(self.bad, failed[0])
@@ -232,11 +239,11 @@ class EndpointWideRefusal(OneRefusedCard):
     def setUp(self):
         super().setUp()
         projector = B._hitl_modules()[1]
-        for state in (projector._RETRY_DEADLINES, projector._REFUSED_SINCE_ACCEPT, projector._NO_ACCEPT_SINCE):
+        for state in (projector._RETRY_DEADLINES, projector._NO_ACCEPT_SINCE):
             self.addCleanup(state.clear)
 
     def _send(self, method, path, payload=None, timeout=None):
-        self.posts.append(payload["extra_content"][hs.WIRE_FIELD]["id"])
+        self.posts.append(payload["extra_content"].get(hs.WIRE_FIELD, {}).get("id", "notice"))
         body = b'{"error": "bad request", "request_id": "r%d"}' % len(self.posts)
         raise urllib.error.HTTPError("https://example.invalid/relay/v1/room", 400, "Bad Request", None,
                                      io.BytesIO(body))
@@ -275,8 +282,8 @@ class EndpointWideRefusal(OneRefusedCard):
 
 
 class LoneRefusedCard(OneRefusedCard):
-    """The only card owed, refused: it is charged toward the bound and the driver also backs
-    off; once it is marked failed the driver goes idle and the backoff clears."""
+    """The only card owed, refused: the first refusal opens the grace uncharged, later ones are
+    charged toward the bound while the driver backs off; once failed and announced, it idles."""
 
     def setUp(self):
         super().setUp()
@@ -286,7 +293,7 @@ class LoneRefusedCard(OneRefusedCard):
     def test_it_is_charged_backed_off_then_failed_and_the_driver_idles(self):
         bound = B._hitl_modules()[1].PROJECTION_MAX_REFUSALS
         logs = []
-        for i in range(bound):
+        for i in range(bound + 1):
             B._HITL_BACKOFF["until"] = 0.0
             later = 10 ** 7 * (i + 1)
             with mock.patch("time.time", return_value=B.time.time() + later), \
@@ -296,6 +303,7 @@ class LoneRefusedCard(OneRefusedCard):
             self.assertGreater(B._HITL_BACKOFF["delay"], 0.0)
         self.assertTrue(self.manager.projection_failed(self.bad))
         self.assertEqual(len([line for line in logs if "could not be projected" in line]), 1, logs)
+        self.assertEqual([n for n, _ in self.notices], ["failed"])
         B._HITL_BACKOFF["until"] = 0.0
         self.assertEqual(B._project_hitl(log=logs.append), 0)
         self.assertEqual(B._HITL_BACKOFF["delay"], 0.0, "nothing owed: the backoff clears")

@@ -122,7 +122,8 @@ class HitlArchiveCheckTest(unittest.TestCase):
             err.code = 400
             raise err
 
-        for i in range(getattr(projector, "PROJECTION_MAX_REFUSALS", 5)):
+        self.addCleanup(projector._NO_ACCEPT_SINCE.clear)
+        for i in range(projector.PROJECTION_MAX_REFUSALS + 1):  # the first falls inside the grace
             with self.assertRaises(OSError):  # a lone refusal is also re-raised for the caller's backoff
                 projector.project_pass(mgr, refuse, "!r", clock=lambda: time.time() + 10 ** 7 * (i + 1),
                                        monotonic=lambda: time.monotonic() + 10 ** 7 * (i + 1))
@@ -136,7 +137,6 @@ class HitlArchiveCheckTest(unittest.TestCase):
             kind="choice", runtime="claude", message="m", guard=g,
             actions=[schema.Action(id="ok", kind="choose", label="OK")])) for g in ("g1", "g2")]
         self.addCleanup(projector._NO_ACCEPT_SINCE.clear)
-        self.addCleanup(projector._REFUSED_SINCE_ACCEPT.clear)
 
         def refuse(payload):
             err = OSError("HTTP 400")
@@ -166,7 +166,8 @@ class HitlArchiveCheckTest(unittest.TestCase):
             err.code = 400
             raise err
 
-        for i in range(getattr(projector, "PROJECTION_MAX_REFUSALS", 5)):
+        self.addCleanup(projector._NO_ACCEPT_SINCE.clear)
+        for i in range(projector.PROJECTION_MAX_REFUSALS + 1):  # the first falls inside the grace
             with self.assertRaises(OSError):  # a lone refusal is also re-raised for the caller's backoff
                 projector.project_pass(mgr, refuse, "!r", clock=lambda: time.time() + 10 ** 7 * (i + 1),
                                        monotonic=lambda: time.monotonic() + 10 ** 7 * (i + 1))

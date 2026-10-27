@@ -22,7 +22,7 @@ from hitl.projector import (  # noqa: E402
 )
 from hitl.schema import (  # noqa: E402
     Action, CATEGORY_BLOCKED, CATEGORY_DECISION, HumanRequirement, KINDS,
-    STATUS_RESOLVED, WIRE_FIELD, category_of,
+    NOTICE_FIELD, STATUS_RESOLVED, WIRE_FIELD, category_of,
 )
 
 ROOM = "!room:ag2.space"
@@ -521,15 +521,16 @@ class RefusalClassTests(unittest.TestCase):
 
     def test_a_refused_card_is_retried_at_its_next_revision(self):
         from hitl import projector as pj
+        self.addCleanup(pj._NO_ACCEPT_SINCE.clear)
         req = self.mgr.create(make_req())
-        for i in range(pj.PROJECTION_MAX_REFUSALS):
+        for i in range(pj.PROJECTION_MAX_REFUSALS + 1):  # the first falls inside the grace
             later = lambda: 10.0 ** 7 * (i + 1)  # noqa: E731
-            with self.assertRaises(OSError):  # a lone refusal also backs the caller off
+            with self.assertRaises(OSError):
                 pj.project_pass(self.mgr, self._raising(400), ROOM, clock=lambda: time.time() + later(),
                                 monotonic=lambda: time.monotonic() + later())
         self.assertTrue(self.mgr.projection_failed(req.id))
         self.assertFalse(self.mgr.needs_projection(req.id))
-        self.assertEqual(pending_ids(self.mgr), [], "a failed card is not pending work")
+        self.assertEqual(pending_ids(self.mgr), [req.id], "a failed card owes only its failure notice")
         self.mgr.resolve(req.id)
         self.assertTrue(self.mgr.needs_projection(req.id), "a new revision gets a fresh try")
         sent = RecordingSender()
@@ -556,8 +557,8 @@ class RefusalWriterTests(unittest.TestCase):
         self.mgr = HitlManager(HitlStore(Path(self.tmp.name)))
         from hitl import projector as pj
         self.pj = pj
-        if hasattr(pj, "_RETRY_DEADLINES"):
-            self.addCleanup(pj._RETRY_DEADLINES.clear)
+        self.addCleanup(pj._RETRY_DEADLINES.clear)
+        self.addCleanup(pj._NO_ACCEPT_SINCE.clear)
 
     def _pass(self, send, wall, mono):
         try:
@@ -646,6 +647,7 @@ class RefusalWriterTests(unittest.TestCase):
             "        time.sleep(0.02)\n"
             "    real(*a, **k)\n"
             "store.save = save\n"
+            "projector._NO_ACCEPT_SINCE[str(root)] = time.monotonic() - projector.PROJECTION_ENDPOINT_GRACE_S - 1\n"
             "def send(p):\n"
             "    e = OSError('HTTP 400'); e.code = 400; raise e\n"
             "try:\n"
@@ -660,10 +662,7 @@ class RefusalWriterTests(unittest.TestCase):
 
 
 
-class EndpointWideRefusalTests(unittest.TestCase):
-    """A card-class 4xx is charged to a card only on evidence that it is that card's: a relay
-    that refuses every card identically fails none of them and backs the caller off."""
-
+class _RefusalDrive(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -671,8 +670,7 @@ class EndpointWideRefusalTests(unittest.TestCase):
         from hitl import projector as pj
         self.pj = pj
         self.addCleanup(pj._RETRY_DEADLINES.clear)
-        self.addCleanup(getattr(pj, "_REFUSED_SINCE_ACCEPT", {}).clear)
-        self.addCleanup(getattr(pj, "_NO_ACCEPT_SINCE", {}).clear)
+        self.addCleanup(pj._NO_ACCEPT_SINCE.clear)
         self.t = 0
 
     def card(self, g):
@@ -696,6 +694,11 @@ class EndpointWideRefusalTests(unittest.TestCase):
                 _refusing(400)(payload)
             return ok(payload)
         return send
+
+
+class EndpointWideRefusalTests(_RefusalDrive):
+    """A card-class 4xx is charged at once only beside an accepted card; a pass that accepts
+    nothing charges no card within the grace, however many cards it refused, and backs off."""
 
     def test_an_endpoint_wide_400_fails_no_card_within_the_grace_and_reaches_the_caller(self):
         cards = [self.card(g) for g in ("a", "b", "c")]
@@ -731,6 +734,10 @@ class EndpointWideRefusalTests(unittest.TestCase):
             self.assertFalse(raised.endpoint_wide)
         for req in cards:
             self.assertTrue(self.mgr.projection_failed(req.id))
+        self.assertEqual(sorted(pending_ids(self.mgr)), sorted(r.id for r in cards), "failure notices owed")
+        got, raised = self.drive(RecordingSender())
+        self.assertIsNone(raised)
+        self.assertEqual(sorted(i for i, _ in got.done), sorted(r.id for r in cards))
         self.assertEqual(pending_ids(self.mgr), [])
 
     def test_an_accepted_send_restarts_the_grace(self):
@@ -745,28 +752,19 @@ class EndpointWideRefusalTests(unittest.TestCase):
         for req in (d, e):
             self.assertNotIn("refusals", self.mgr.store.projection(req.id))
 
-    def test_cards_refused_in_separate_passes_are_still_the_endpoints(self):
-        """`b` is refused while `a` waits out its own retry: only the record of `a`'s refusal
-        since the last accepted send shows the refusal is shared."""
-        a = self.card("a")
-        _, raised = self.drive(_refusing(400))   # alone: ambiguous, charged once and raised
-        self.assertFalse(raised.endpoint_wide)
-        b = self.card("b")
-        sent = []
-
-        def refuse(payload):
-            sent.append(payload["extra_content"][WIRE_FIELD]["id"])
-            _refusing(400)(payload)
-        _, raised = self.drive(refuse, step=1)
-        self.assertEqual(sent, [b.id], "a is still waiting out its retry")
-        self.assertTrue(raised.endpoint_wide)
-        for _ in range(self.pj.PROJECTION_MAX_REFUSALS * 4):
-            _, raised = self.drive(refuse, step=10)
+    def test_a_lone_card_refused_inside_the_grace_is_not_charged_and_reaches_the_caller(self):
+        """One card alone cannot tell the relay's fault from its own: the relay gets the grace."""
+        req = self.card("a")
+        steps = int(self.pj.PROJECTION_ENDPOINT_GRACE_S // 10) - 1
+        for _ in range(steps):
+            got, raised = self.drive(_refusing(400), step=10)
+            self.assertIsNotNone(raised, "the caller's backoff must engage")
+            self.assertEqual(raised.code, 400)
             self.assertTrue(raised.endpoint_wide)
-        self.assertIn(a.id, sent[1:])
-        self.assertEqual(self.mgr.store.projection(a.id).get("refusals"), 1)
-        self.assertNotIn("refusals", self.mgr.store.projection(b.id))
-        self.assertFalse(self.mgr.projection_failed(a.id) or self.mgr.projection_failed(b.id))
+            self.assertEqual((got.refused, got.failed), ([], []))
+        self.assertGreater(steps, self.pj.PROJECTION_MAX_REFUSALS)
+        self.assertNotIn("refusals", self.mgr.store.projection(req.id))
+        self.assertFalse(self.mgr.projection_failed(req.id))
 
     def test_one_card_refused_beside_an_accepted_one_is_that_cards(self):
         bad, good = self.card("a"), self.card("b")
@@ -776,18 +774,19 @@ class EndpointWideRefusalTests(unittest.TestCase):
         self.assertEqual([(i, n) for i, n, _, _ in got.refused], [(bad.id, 1)])
         self.assertNotIn("refusals", self.mgr.store.projection(good.id))
 
-    def test_a_lone_refused_card_is_charged_and_the_caller_backs_off(self):
-        """One card alone cannot tell the relay's fault from its own: charge it (so a bad card
-        ends at the bound) and raise (so the caller backs off meanwhile)."""
+    def test_a_lone_card_refused_past_the_grace_is_charged_and_fails_within_the_bound(self):
         req = self.card("a")
+        _, raised = self.drive(_refusing(400))  # opens the grace
+        self.assertTrue(raised.endpoint_wide)
         n = self.pj.PROJECTION_MAX_REFUSALS
         for i in range(n):
             got, raised = self.drive(_refusing(400))
             self.assertIsNotNone(raised)
             self.assertFalse(raised.endpoint_wide)
+            self.assertEqual(self.mgr.store.projection(req.id).get("refusals"), i + 1)
         self.assertEqual([i for i, _, _ in got.failed], [req.id])
         self.assertTrue(self.mgr.projection_failed(req.id))
-        self.assertEqual(pending_ids(self.mgr), [], "nothing left to drive: the caller's backoff resets")
+        self.assertFalse(self.mgr.needs_projection(req.id), "given up on this revision")
 
     def test_a_bad_card_fails_at_the_bound_across_passes_where_others_succeed(self):
         bad = self.card("bad")
@@ -798,15 +797,87 @@ class EndpointWideRefusalTests(unittest.TestCase):
         self.assertEqual([i for i, _, _ in got.failed], [bad.id])
         self.assertTrue(self.mgr.projection_failed(bad.id))
 
-    def test_a_failed_card_is_no_evidence_against_the_endpoint(self):
+    def test_a_card_first_refused_after_the_grace_ran_out_is_charged_at_once(self):
         first = self.card("a")
-        for _ in range(self.pj.PROJECTION_MAX_REFUSALS):
+        for _ in range(self.pj.PROJECTION_MAX_REFUSALS + 1):
             self.drive(_refusing(400))
         self.assertTrue(self.mgr.projection_failed(first.id))
         second = self.card("b")
         _, raised = self.drive(_refusing(400))
-        self.assertFalse(raised.endpoint_wide, "only a card still owed counts as another victim")
+        self.assertFalse(raised.endpoint_wide, "the grace runs from the first refusal since an accept")
         self.assertEqual(self.mgr.store.projection(second.id).get("refusals"), 1)
+
+
+def _cards_refused(notice_send):
+    """Refuse every card with a 400; hand every notice to `notice_send`."""
+    def send(payload):
+        if WIRE_FIELD in payload["extra_content"]:
+            _refusing(400)(payload)
+        return notice_send(payload)
+    return send
+
+
+class NoticesOnARefusedPassTests(_RefusalDrive):
+    """A pass that accepts no card still sends its due notices before re-raising the refusal,
+    and a card given up on is announced to the owner exactly once per revision."""
+
+    def setUp(self):
+        super().setUp()
+        self.sent = RecordingSender()
+
+    def blocked_with_a_reminder_due(self):
+        a = self.card("a")
+        self.drive(self.sent)
+        self.sent.sent.clear()
+        self.card("b")
+        return a
+
+    def test_due_notices_go_out_on_a_pass_that_accepts_no_card(self):
+        a = self.blocked_with_a_reminder_due()
+        got, raised = self.drive(_cards_refused(self.sent))
+        self.assertIsNotNone(raised, "the card refusal still reaches the caller")
+        self.assertEqual(raised.code, 400)
+        self.assertEqual([p["extra_content"][NOTICE_FIELD]["notice"] for p in self.sent.sent], ["reminder"])
+        self.assertEqual([i for i, _ in got.done], [a.id])
+        self.assertEqual(self.mgr.store.projection(a.id).get("reminders"), 1)
+
+    def test_a_notice_failure_on_a_no_accept_pass_still_raises_the_card_refusal(self):
+        self.blocked_with_a_reminder_due()
+
+        def notice_down(payload):
+            raise RuntimeError("notice transport down")
+        got, raised = self.drive(_cards_refused(notice_down))
+        self.assertIsNotNone(raised)
+        self.assertEqual(raised.code, 400, "the notice failure never masks the card refusal")
+        self.assertIs(raised.projection, got)
+
+    def test_a_failed_card_is_announced_once_per_revision_across_a_restart(self):
+        req = self.mgr.create(make_req(kind="choice", guard="q", message="Pick a deploy target\nmore",
+                                       device={"id": "dq", "name": "n"},
+                                       actions=[Action(id="ok", kind="choose", label="OK")]))
+        self.drive(_refusing(400))  # opens the grace
+        for _ in range(self.pj.PROJECTION_MAX_REFUSALS - 1):
+            self.drive(_refusing(400))
+        self.assertFalse(self.mgr.projection_failed(req.id))
+        got, raised = self.drive(_cards_refused(self.sent))  # the bound: failed, then announced
+        self.assertIsNotNone(raised)
+        self.assertEqual([i for i, _, _ in got.failed], [req.id])
+        self.assertEqual(len(self.sent.sent), 1)
+        notice = self.sent.sent[0]
+        self.assertEqual(notice["extra_content"][NOTICE_FIELD]["notice"], "failed")
+        self.assertEqual(notice["dedupe_key"], f"hitl:{req.id}:failed:{req.revision}")
+        self.assertIn("Pick a deploy target", notice["body"])
+        self.assertNotIn(WIRE_FIELD, notice["extra_content"])
+        for word in ("claim", "token", "lease", "guard"):
+            self.assertNotIn(word, json.dumps(notice).lower())
+        self.assertEqual(self.mgr.store.projection(req.id).get("failed_notice"), req.revision)
+        self.pj._RETRY_DEADLINES.clear()
+        self.pj._NO_ACCEPT_SINCE.clear()
+        self.mgr = HitlManager(HitlStore(Path(self.tmp.name)))  # a fresh process over the same store
+        self.assertEqual(pending_ids(self.mgr), [])
+        got, raised = self.drive(self.sent)
+        self.assertIsNone(raised)
+        self.assertEqual((got.done, len(self.sent.sent)), ([], 1), "no second notice at the same revision")
 
 
 _SAFE_INT = 2 ** 53 - 1  # canonical JSON's integer range is [-(2**53)+1, 2**53-1]

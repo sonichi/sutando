@@ -15,7 +15,7 @@ returning the gateway's dict answer) — this module never imports a bridge.
 from __future__ import annotations
 
 import time
-from typing import Callable, Dict, List, NamedTuple, Optional, Set, Tuple
+from typing import Callable, Dict, List, NamedTuple, Optional, Tuple
 
 from . import renotify
 from .manager import HitlManager
@@ -43,10 +43,9 @@ PROJECTION_RETRY_MAX_S = 600.0
 _CARD_4XX = frozenset({400, 413, 422})
 # (store root, id, revision) -> monotonic retry deadline; the persisted retry_at serves a restart.
 _RETRY_DEADLINES: Dict[Tuple[str, str, int], float] = {}
-# How long a refusal shared by owed cards is excused as the relay's; past it, each card is charged.
-PROJECTION_ENDPOINT_GRACE_S = PROJECTION_RETRY_MAX_S
-# store root -> {code: card ids refused with it} since the relay last accepted a send.
-_REFUSED_SINCE_ACCEPT: Dict[str, Dict[int, Set[str]]] = {}
+# Seconds (monotonic) from the first refusal since an accepted send during which a pass that
+# accepts nothing charges no card, the relay being as likely at fault; past it, each is charged.
+PROJECTION_ENDPOINT_GRACE_S = 600.0
 # store root -> monotonic time of the first refusal since the relay last accepted a send.
 _NO_ACCEPT_SINCE: Dict[str, float] = {}
 
@@ -91,7 +90,7 @@ def fallback_body(req: HumanRequirement) -> str:
 def _notices(manager: HitlManager, now: float) -> List[renotify.Notice]:
     entries = [(r, manager.store.projection(r.id)) for r in manager.store.all()
                if r.decided_by is None]
-    return renotify.plan(entries, now)
+    return renotify.plan(entries, now) + renotify.failures(entries)
 
 
 def _refusal_code(exc: BaseException) -> Optional[int]:
@@ -187,10 +186,10 @@ def project_pass(manager: HitlManager, send: Sender, room_id: str, clock: Option
     A rejected send is skipped (nothing recorded) so the next drive retries it.
     A 400, 413 or 422 never stops the other cards in the pass. It is charged to its card
     (backed off on its own and, after PROJECTION_MAX_REFUSALS, marked failed for that
-    revision) as `_settle_refusals` decides; when no send was accepted the first refusal is
-    re-raised afterwards, carrying this pass as `.projection`. Any other exception from the
-    sender propagates at once — the caller owns transport retry cadence, this module owns
-    idempotency. `describe` renders a refusal's response body for the log.
+    revision) as `_settle_refusals` decides; when no card was accepted the due notices are
+    still sent, then the first refusal is re-raised, carrying this pass as `.projection`.
+    Any other exception from the sender propagates at once — the caller owns transport retry
+    cadence, this module owns idempotency. `describe` renders a refusal's response body for the log.
     """
     clock = clock or time.time
     now, mono = clock(), (monotonic or time.monotonic)()
@@ -227,57 +226,49 @@ def project_pass(manager: HitlManager, send: Sender, room_id: str, clock: Option
         out.done.append((req.id, event_id))
     if out.done:
         _accepted(manager)
-    if held:
-        _settle_refusals(manager, held, now, mono, out)
-    out.done.extend(_send_notices(manager, send, room_id, clock()))
-    return out
-
-
-def _accepted(manager: HitlManager) -> None:
-    _REFUSED_SINCE_ACCEPT.pop(str(manager.store.root), None)
-    _NO_ACCEPT_SINCE.pop(str(manager.store.root), None)
-
-
-def _settle_refusals(manager: HitlManager, held: List[Tuple[HumanRequirement, int, str, BaseException]],
-                     now: float, mono: float, out: ProjectionPass) -> None:
-    """Charge each refused card unless the refusal is evidently the endpoint's, and raise when
-    the relay accepted nothing this pass so the caller's backoff engages.
-
-    With a send accepted, every refusal is its card's. Otherwise a status another still-owed card
-    was refused with (this pass, or since the last accepted send) is excused as the endpoint's for
-    PROJECTION_ENDPOINT_GRACE_S from the first refusal since an accepted send; a lone refusal, or
-    any refusal past that grace, is charged, so a defect cards share still ends in failed.
-    """
-    if out.done:
-        for req, code, detail, _ in held:
-            _refuse(manager, req, code, detail, now, mono, out)
-        return
-    root = str(manager.store.root)
-    seen = _REFUSED_SINCE_ACCEPT.setdefault(root, {})
-    in_grace = mono - _NO_ACCEPT_SINCE.setdefault(root, mono) < PROJECTION_ENDPOINT_GRACE_S
-    this_pass: Dict[int, Set[str]] = {}
-    for req, code, _, _ in held:
-        this_pass.setdefault(code, set()).add(req.id)
-    endpoint_wide = False
-    for req, code, detail, _ in held:
-        others = {i for i in seen.get(code, set()) | this_pass[code] if i != req.id and manager.needs_projection(i)}
-        if others and in_grace:
-            endpoint_wide = True
-        else:
-            _refuse(manager, req, code, detail, now, mono, out)
-    for code, ids in this_pass.items():
-        seen.setdefault(code, set()).update(ids)
-    first = held[0][3]
+    first = _settle_refusals(manager, held, now, mono, out) if held else None
+    if first is None:
+        _send_notices(manager, send, room_id, clock(), out.done)
+        return out
     try:
-        first.projection, first.endpoint_wide = out, endpoint_wide  # type: ignore[attr-defined]
-    except AttributeError:
+        _send_notices(manager, send, room_id, clock(), out.done)
+    except Exception:  # noqa: BLE001 — the card refusal is what the caller must back off on
         pass
     raise first
 
 
-def _send_notices(manager: HitlManager, send: Sender, room_id: str,
-                  now: float) -> List[Tuple[str, Optional[str]]]:
-    out: List[Tuple[str, Optional[str]]] = []
+def _accepted(manager: HitlManager) -> None:
+    _NO_ACCEPT_SINCE.pop(str(manager.store.root), None)
+
+
+def _settle_refusals(manager: HitlManager, held: List[Tuple[HumanRequirement, int, str, BaseException]],
+                     now: float, mono: float, out: ProjectionPass) -> Optional[BaseException]:
+    """Charge each refused card unless the refusal may be the relay's; return the refusal to
+    re-raise when the relay accepted nothing this pass, so the caller's backoff engages.
+
+    With a card accepted, every refusal is its card's and is charged at once. Otherwise no card,
+    however many were refused, is charged until PROJECTION_ENDPOINT_GRACE_S has passed since the
+    first refusal after an accepted send; past it each is charged, so a card's own defect still
+    ends in failed.
+    """
+    if out.done:
+        for req, code, detail, _ in held:
+            _refuse(manager, req, code, detail, now, mono, out)
+        return None
+    in_grace = mono - _NO_ACCEPT_SINCE.setdefault(str(manager.store.root), mono) < PROJECTION_ENDPOINT_GRACE_S
+    if not in_grace:
+        for req, code, detail, _ in held:
+            _refuse(manager, req, code, detail, now, mono, out)
+    first = held[0][3]
+    try:
+        first.projection, first.endpoint_wide = out, in_grace  # type: ignore[attr-defined]
+    except AttributeError:
+        pass
+    return first
+
+
+def _send_notices(manager: HitlManager, send: Sender, room_id: str, now: float,
+                  out: List[Tuple[str, Optional[str]]]) -> None:
     for n in _notices(manager, now):
         ledger = dict(next(pj for r, pj in n.members if r.id == n.req.id))
         # No card field (a second card would never get the status edits); the notice field lets
@@ -297,4 +288,3 @@ def _send_notices(manager: HitlManager, send: Sender, room_id: str,
         for r, pj in n.members:
             manager.record_notice(r.id, renotify.after(n.notice, pj, now, n.reminders))
         out.append((n.req.id, str(answer.get("event_id") or "") or None))
-    return out
