@@ -672,17 +672,19 @@ class EndpointWideRefusalTests(unittest.TestCase):
         self.pj = pj
         self.addCleanup(pj._RETRY_DEADLINES.clear)
         self.addCleanup(getattr(pj, "_REFUSED_SINCE_ACCEPT", {}).clear)
+        self.addCleanup(getattr(pj, "_NO_ACCEPT_SINCE", {}).clear)
         self.t = 0
 
     def card(self, g):
         return self.mgr.create(make_req(guard=g, device={"id": f"d{g}", "name": "n"}))
 
-    def drive(self, send):
-        """One pass a long way past every per-card wait; returns (pass, raised)."""
-        self.t += 10 ** 7
+    def drive(self, send, step=10 ** 7, describe=None):
+        """One pass `step` seconds after the last (by default past every wait); returns (pass, raised)."""
+        self.t += step
         wall, mono = time.time() + self.t, time.monotonic() + self.t
         try:
-            return self.pj.project_pass(self.mgr, send, ROOM, clock=lambda: wall, monotonic=lambda: mono), None
+            return self.pj.project_pass(self.mgr, send, ROOM, clock=lambda: wall, monotonic=lambda: mono,
+                                        describe=describe), None
         except OSError as e:
             return e.projection, e
 
@@ -695,10 +697,10 @@ class EndpointWideRefusalTests(unittest.TestCase):
             return ok(payload)
         return send
 
-    def test_an_endpoint_wide_400_fails_no_card_and_reaches_the_caller(self):
+    def test_an_endpoint_wide_400_fails_no_card_within_the_grace_and_reaches_the_caller(self):
         cards = [self.card(g) for g in ("a", "b", "c")]
-        for _ in range(self.pj.PROJECTION_MAX_REFUSALS * 2):
-            got, raised = self.drive(_refusing(400))
+        for _ in range(self.pj.PROJECTION_MAX_REFUSALS * 4):
+            got, raised = self.drive(_refusing(400), step=10)
             self.assertIsNotNone(raised, "the caller's backoff must engage")
             self.assertTrue(raised.endpoint_wide)
             self.assertEqual((got.refused, got.failed), ([], []))
@@ -709,14 +711,59 @@ class EndpointWideRefusalTests(unittest.TestCase):
         self.assertIsNone(raised)
         self.assertEqual(sorted(i for i, _ in got.done), sorted(r.id for r in cards))
 
+    def test_an_outage_whose_bodies_carry_request_ids_charges_no_card(self):
+        cards = [self.card(g) for g in ("a", "b")]
+        ids = iter(range(10 ** 6))
+        for _ in range(self.pj.PROJECTION_MAX_REFUSALS * 4):
+            _, raised = self.drive(_refusing(400), step=10, describe=lambda e: f"bad request {next(ids)}")
+            self.assertTrue(raised.endpoint_wide)
+        for req in cards:
+            self.assertNotIn("refusals", self.mgr.store.projection(req.id))
+
+    def test_a_defect_two_cards_share_fails_both_once_the_grace_runs_out(self):
+        cards = [self.card(g) for g in ("a", "b")]
+        for _ in range(20):
+            self.drive(_refusing(400), step=10)
+        for req in cards:
+            self.assertFalse(self.mgr.projection_failed(req.id), "still within the grace")
+        for _ in range(self.pj.PROJECTION_MAX_REFUSALS):
+            _, raised = self.drive(_refusing(400))
+            self.assertFalse(raised.endpoint_wide)
+        for req in cards:
+            self.assertTrue(self.mgr.projection_failed(req.id))
+        self.assertEqual(pending_ids(self.mgr), [])
+
+    def test_an_accepted_send_restarts_the_grace(self):
+        a, b = self.card("a"), self.card("b")
+        self.drive(_refusing(400), step=10)
+        c = self.card("c")
+        got, _ = self.drive(self.refused_for(a.id, b.id), step=self.pj.PROJECTION_ENDPOINT_GRACE_S - 10)
+        self.assertEqual([i for i, _ in got.done], [c.id])
+        d, e = self.card("d"), self.card("e")
+        _, raised = self.drive(_refusing(400), step=20)  # a and b still wait out their retry
+        self.assertTrue(raised.endpoint_wide, "the grace counts from the first refusal after an accept")
+        for req in (d, e):
+            self.assertNotIn("refusals", self.mgr.store.projection(req.id))
+
     def test_cards_refused_in_separate_passes_are_still_the_endpoints(self):
+        """`b` is refused while `a` waits out its own retry: only the record of `a`'s refusal
+        since the last accepted send shows the refusal is shared."""
         a = self.card("a")
         _, raised = self.drive(_refusing(400))   # alone: ambiguous, charged once and raised
         self.assertFalse(raised.endpoint_wide)
         b = self.card("b")
-        for _ in range(self.pj.PROJECTION_MAX_REFUSALS * 2):
-            _, raised = self.drive(_refusing(400))
+        sent = []
+
+        def refuse(payload):
+            sent.append(payload["extra_content"][WIRE_FIELD]["id"])
+            _refusing(400)(payload)
+        _, raised = self.drive(refuse, step=1)
+        self.assertEqual(sent, [b.id], "a is still waiting out its retry")
+        self.assertTrue(raised.endpoint_wide)
+        for _ in range(self.pj.PROJECTION_MAX_REFUSALS * 4):
+            _, raised = self.drive(refuse, step=10)
             self.assertTrue(raised.endpoint_wide)
+        self.assertIn(a.id, sent[1:])
         self.assertEqual(self.mgr.store.projection(a.id).get("refusals"), 1)
         self.assertNotIn("refusals", self.mgr.store.projection(b.id))
         self.assertFalse(self.mgr.projection_failed(a.id) or self.mgr.projection_failed(b.id))

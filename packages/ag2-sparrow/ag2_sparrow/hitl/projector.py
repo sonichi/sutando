@@ -43,8 +43,12 @@ PROJECTION_RETRY_MAX_S = 600.0
 _CARD_4XX = frozenset({400, 413, 422})
 # (store root, id, revision) -> monotonic retry deadline; the persisted retry_at serves a restart.
 _RETRY_DEADLINES: Dict[Tuple[str, str, int], float] = {}
-# store root -> {(code, detail): card ids refused that way} since the relay last accepted a send.
-_REFUSED_SINCE_ACCEPT: Dict[str, Dict[Tuple[int, str], Set[str]]] = {}
+# How long a refusal shared by owed cards is excused as the relay's; past it, each card is charged.
+PROJECTION_ENDPOINT_GRACE_S = PROJECTION_RETRY_MAX_S
+# store root -> {code: card ids refused with it} since the relay last accepted a send.
+_REFUSED_SINCE_ACCEPT: Dict[str, Dict[int, Set[str]]] = {}
+# store root -> monotonic time of the first refusal since the relay last accepted a send.
+_NO_ACCEPT_SINCE: Dict[str, float] = {}
 
 
 class ProjectionPass(NamedTuple):
@@ -221,10 +225,17 @@ def project_pass(manager: HitlManager, send: Sender, room_id: str, clock: Option
         manager.record_projection(req.id, req.revision, event_id if not target else None, extra)
         _RETRY_DEADLINES.pop((str(manager.store.root), req.id, req.revision), None)
         out.done.append((req.id, event_id))
+    if out.done:
+        _accepted(manager)
     if held:
         _settle_refusals(manager, held, now, mono, out)
     out.done.extend(_send_notices(manager, send, room_id, clock()))
     return out
+
+
+def _accepted(manager: HitlManager) -> None:
+    _REFUSED_SINCE_ACCEPT.pop(str(manager.store.root), None)
+    _NO_ACCEPT_SINCE.pop(str(manager.store.root), None)
 
 
 def _settle_refusals(manager: HitlManager, held: List[Tuple[HumanRequirement, int, str, BaseException]],
@@ -232,30 +243,30 @@ def _settle_refusals(manager: HitlManager, held: List[Tuple[HumanRequirement, in
     """Charge each refused card unless the refusal is evidently the endpoint's, and raise when
     the relay accepted nothing this pass so the caller's backoff engages.
 
-    With a send accepted, every refusal is its card's. Otherwise a refusal another still-pending
-    card drew identically (this pass, or since the last accepted send) is the endpoint's and
-    charges nobody; a lone refusal is ambiguous and is charged, bounded by PROJECTION_MAX_REFUSALS.
+    With a send accepted, every refusal is its card's. Otherwise a status another still-owed card
+    was refused with (this pass, or since the last accepted send) is excused as the endpoint's for
+    PROJECTION_ENDPOINT_GRACE_S from the first refusal since an accepted send; a lone refusal, or
+    any refusal past that grace, is charged, so a defect cards share still ends in failed.
     """
-    root = str(manager.store.root)
     if out.done:
-        _REFUSED_SINCE_ACCEPT.pop(root, None)
         for req, code, detail, _ in held:
             _refuse(manager, req, code, detail, now, mono, out)
         return
+    root = str(manager.store.root)
     seen = _REFUSED_SINCE_ACCEPT.setdefault(root, {})
-    this_pass: Dict[Tuple[int, str], Set[str]] = {}
-    for req, code, detail, _ in held:
-        this_pass.setdefault((code, detail), set()).add(req.id)
+    in_grace = mono - _NO_ACCEPT_SINCE.setdefault(root, mono) < PROJECTION_ENDPOINT_GRACE_S
+    this_pass: Dict[int, Set[str]] = {}
+    for req, code, _, _ in held:
+        this_pass.setdefault(code, set()).add(req.id)
     endpoint_wide = False
     for req, code, detail, _ in held:
-        sig = (code, detail)
-        others = {i for i in seen.get(sig, set()) | this_pass[sig] if i != req.id and manager.needs_projection(i)}
-        if others:
+        others = {i for i in seen.get(code, set()) | this_pass[code] if i != req.id and manager.needs_projection(i)}
+        if others and in_grace:
             endpoint_wide = True
         else:
             _refuse(manager, req, code, detail, now, mono, out)
-    for sig, ids in this_pass.items():
-        seen.setdefault(sig, set()).update(ids)
+    for code, ids in this_pass.items():
+        seen.setdefault(code, set()).update(ids)
     first = held[0][3]
     try:
         first.projection, first.endpoint_wide = out, endpoint_wide  # type: ignore[attr-defined]
@@ -281,7 +292,7 @@ def _send_notices(manager: HitlManager, send: Sender, room_id: str,
                                  "extra_content": {NOTICE_FIELD: notice}}))
         if not isinstance(answer, dict) or not (answer.get("ok") or answer.get("event_id")):
             continue
-        _REFUSED_SINCE_ACCEPT.pop(str(manager.store.root), None)
+        _accepted(manager)
         # Every card the notice covered is stamped, so none of them is ever sent again.
         for r, pj in n.members:
             manager.record_notice(r.id, renotify.after(n.notice, pj, now, n.reminders))

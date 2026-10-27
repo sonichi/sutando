@@ -226,19 +226,26 @@ class OneRefusedCard(unittest.TestCase):
 
 
 class EndpointWideRefusal(OneRefusedCard):
-    """A relay that refuses every card identically is the relay's fault: the driver backs off
-    relay-wide and no card is charged or marked failed, however long it lasts."""
+    """A relay that refuses every card with one status is the relay's fault for a grace period:
+    the driver backs off relay-wide and no card is charged; past it, each card is charged."""
+
+    def setUp(self):
+        super().setUp()
+        projector = B._hitl_modules()[1]
+        for state in (projector._RETRY_DEADLINES, projector._REFUSED_SINCE_ACCEPT, projector._NO_ACCEPT_SINCE):
+            self.addCleanup(state.clear)
 
     def _send(self, method, path, payload=None, timeout=None):
         self.posts.append(payload["extra_content"][hs.WIRE_FIELD]["id"])
+        body = b'{"error": "bad request", "request_id": "r%d"}' % len(self.posts)
         raise urllib.error.HTTPError("https://example.invalid/relay/v1/room", 400, "Bad Request", None,
-                                     io.BytesIO(b'{"error": "bad request"}'))
+                                     io.BytesIO(body))
 
     def test_every_card_refused_backs_off_and_fails_none(self):
         logs = []
         for i in range(B._hitl_modules()[1].PROJECTION_MAX_REFUSALS * 3):
             B._HITL_BACKOFF["until"] = 0.0  # let each pulse through, keep the delay
-            later = 10 ** 7 * (i + 1)
+            later = 10 * (i + 1)
             with mock.patch("time.time", return_value=B.time.time() + later), \
                     mock.patch("time.monotonic", return_value=B.time.monotonic() + later):
                 with self.assertRaises(urllib.error.HTTPError):
@@ -248,6 +255,20 @@ class EndpointWideRefusal(OneRefusedCard):
             self.assertFalse(self.manager.projection_failed(card))
             self.assertNotIn("refusals", self.manager.store.projection(card))
         self.assertFalse([line for line in logs if "could not be projected" in line], logs)
+
+    def test_past_the_grace_a_defect_both_cards_share_ends_in_failed(self):
+        projector = B._hitl_modules()[1]
+        logs = []
+        for i in range(projector.PROJECTION_MAX_REFUSALS + 1):
+            B._HITL_BACKOFF["until"] = 0.0
+            later = 10 ** 7 * (i + 1)
+            with mock.patch("time.time", return_value=B.time.time() + later), \
+                    mock.patch("time.monotonic", return_value=B.time.monotonic() + later):
+                with self.assertRaises(urllib.error.HTTPError):
+                    B._project_hitl(log=logs.append)
+        for card in (self.bad, self.good):
+            self.assertTrue(self.manager.projection_failed(card))
+        self.assertEqual(len([line for line in logs if "could not be projected" in line]), 2, logs)
 
     test_the_next_card_still_projects_in_the_same_pass = None
     test_the_refused_card_stops_after_the_bound_and_is_said_once = None
