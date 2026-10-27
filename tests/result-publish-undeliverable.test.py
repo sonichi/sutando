@@ -68,7 +68,7 @@ class RefuseUndeliverable(unittest.TestCase):
         self._task("task-cron-hourly-1", CRON_TASK)
         proc, target = self._publish("task-cron-hourly-1", "Hourly report: 3 P0s resolved.\n")
         self.assertEqual(proc.returncode, 2, proc.stderr)
-        self.assertIn("deliver-owner-dm.py", proc.stderr)
+        self.assertIn("channel-bound result", proc.stderr)
         self.assertEqual(len(proc.stderr.strip().splitlines()), 1, proc.stderr)
         self.assertFalse(target.exists())
         self.assertEqual(list((self.ws / "results").iterdir()), [])
@@ -178,7 +178,7 @@ class RefuseUndeliverable(unittest.TestCase):
                         mock.patch.object(mod.sys, "stderr", io.StringIO()) as err:
                     with mock.patch.object(mod.sys, "stdin", io.StringIO("report\n")):
                         self.assertEqual(mod.main(["result_publish.py", str(target)]), 2)
-                    self.assertIn("deliver-owner-dm.py", err.getvalue())
+                    self.assertIn("channel-bound result", err.getvalue())
                     self.assertFalse(target.exists())
                     with mock.patch.object(mod.sys, "stdin", io.StringIO("report\n")):
                         self.assertEqual(mod.main(

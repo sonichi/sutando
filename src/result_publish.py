@@ -14,7 +14,8 @@ the CLI: `python3 src/result_publish.py <path>` with the body on stdin.
 
 The CLI refuses a `source: cron` task's result that names no destination and
 carries no skip marker: no bridge routes it, a `[channel:]` redirect included, so it would be archived unsent.
-Owner-facing cron output goes through deliver-owner-dm.py instead;
+Owner-facing cron output goes through a channel-bound result instead (a task
+with a destination header, or a proactive result routed to the owner's channel);
 `--allow-undeliverable` publishes anyway.
 """
 from __future__ import annotations
@@ -143,9 +144,10 @@ def main(argv: list[str]) -> int:
     text = sys.stdin.read()
     reason = None if allow else undeliverable_reason(args[0], text)
     if reason:
-        print(f"result_publish: refused, {reason}: nothing would deliver this body; use "
-              "workspace/scripts/deliver-owner-dm.py --task-id <id> --body-file <f>, "
-              "start it with [no-send], or pass --allow-undeliverable", file=sys.stderr)
+        print(f"result_publish: refused, {reason}: nothing would deliver this body; send it "
+              "as a channel-bound result (a task with a destination header, or a "
+              "proactive result routed to the owner's channel), start it with [no-send], "
+              "or pass --allow-undeliverable", file=sys.stderr)
         return 2
     publish_text(args[0], text)
     return 0
