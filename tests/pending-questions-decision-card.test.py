@@ -166,6 +166,23 @@ class QueueQuestion(unittest.TestCase):
         self.assertTrue(out["card"])
         self.assertEqual([(a.label) for a in _manager(ws).get(out["card"]).actions], ["Approve", "Decline"])
 
+    def test_options_alone_are_the_buttons_as_given_with_no_approve(self):
+        ws = _ws("ag2space")
+        m = _manager(ws)
+        out = ask.queue_question("Which port?", workspace=ws, host="h",
+                                 options=[("8080", "the dev port"), ("Hold", "wait")], manager=m)
+        req = m.get(out["card"])
+        self.assertEqual([(a.id, a.label) for a in req.actions], [("option-0", "8080"), ("option-1", "Hold")])
+        self.assertNotIn("Approve", req.message)
+
+    def test_storing_a_card_is_reported_as_not_yet_shown(self):
+        ws = _ws("ag2space")
+        out = ask.queue_question("Merge?", workspace=ws, host="h", default_action="merge",
+                                 options=OPTIONS, manager=_manager(ws))
+        sent = next(ln for ln in ask.report_lines(out) if ln.startswith("sent:"))
+        self.assertIn("STORED", sent)
+        self.assertIn("not yet shown", out["sent_line"])
+
     def test_no_options_and_no_default_stays_plain_text(self):
         ws = _ws("ag2space")
         out = ask.queue_question("What next?", workspace=ws, host="h", manager=_manager(ws))
@@ -190,6 +207,43 @@ class QueueQuestion(unittest.TestCase):
         self.assertIn("disk full", out["card_error"])
         self.assertEqual(_proactive(ws), [out["proactive_file"]])
         self.assertTrue(any("asked as text instead" in ln for ln in ask.report_lines(out)))
+
+
+class UnshownCard(unittest.TestCase):
+    def _card(self):
+        ws = _ws("ag2space")
+        m = _manager(ws)
+        out = ask.queue_question("Merge #1?", workspace=ws, host="h", default_action="merge",
+                                 options=OPTIONS, manager=m)
+        return ws, m, out, m.get(out["card"])
+
+    def test_a_card_never_shown_within_the_grace_is_asked_as_text_once(self):
+        ws, m, out, req = self._card()
+        self.assertEqual(ask.unshown_cards_as_text(ws, m, now=req.created_at + 10, host="h"), [], "inside the grace")
+        self.assertEqual(_proactive(ws), [])
+        done = ask.unshown_cards_as_text(ws, m, now=req.created_at + ask.CARD_SHOW_GRACE_SEC, host="h")
+        self.assertEqual([(d["ask_id"], d["hitl_id"]) for d in done], [(out["ask_id"], req.id)])
+        files = _proactive(ws)
+        self.assertEqual(files, [done[0]["proactive_file"]])
+        body = (ws / "results" / files[0]).read_text()
+        self.assertIn("Merge #1?", body)
+        self.assertIn("was not shown", body)
+        self.assertEqual(ask.unshown_cards_as_text(ws, m, now=req.created_at + 9999, host="h"), [], "once per card")
+        self.assertEqual(m.get(req.id).status, "pending", "the card stays answerable")
+
+    def test_a_shown_card_is_never_doubled_as_text(self):
+        ws, m, out, req = self._card()
+        m.record_projection(req.id, req.revision, "$event")
+        self.assertEqual(ask.unshown_cards_as_text(ws, m, now=req.created_at + 9999, host="h"), [])
+        self.assertEqual(_proactive(ws), [])
+
+    def test_reconcile_runs_the_fallback_even_with_no_room(self):
+        ws, m, out, req = self._card()
+        with mock.patch.object(ask, "CARD_SHOW_GRACE_SEC", 0), \
+                mock.patch.object(room_db, "room_store", return_value=(None, "no room")):
+            rec = room_db.reconcile_pass(ws)
+        self.assertEqual([t["ask_id"] for t in rec["texted"]], [out["ask_id"]])
+        self.assertEqual(len(_proactive(ws)), 1)
 
 
 class Clicks(unittest.TestCase):

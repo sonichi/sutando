@@ -84,12 +84,17 @@ A question asked with `--default-action` and/or `--option` whose destination is 
 task's bridge, else the bridge the owner was last active on) is asked as a decision card, not
 text: `queue_question` creates a `choice` HITL request (`src/hitl/cards.py`, the one builder every
 card producer uses) with runtime `pending-questions`, guard and `subject.ask_id` set to the ask id,
-one button per `ordered_options()` entry (Approve first) and `turn_on_action`. The AG2 Space
-gateway projects it to the owner's DM. No text ask is queued; the text is only the fallback when
-the card cannot be stored (`note: decision card not created …` in the report), and every other
-bridge still gets text, since only that gateway projects cards. The row's `**Sent:**` record names
-the card (`**Sent:** card hitl_… to ag2space owner-dm (decision card) at …`), so a reminder asks it
-again as text.
+`turn_on_action`, and one button per choice: with a default, one per `ordered_options()` entry
+(Approve first, carrying the default); with options alone, exactly the options as given, with no
+Approve. The AG2 Space gateway projects it to the owner's DM; storing it is not showing it, so the
+report says `sent: STORED as decision card … not yet shown`. No text ask is queued at once. Text is
+the fallback when the card cannot be stored (`note: decision card not created …`), for every other
+bridge (only that gateway projects cards), and for a card the gateway has not recorded as projected
+within 10 minutes (`CARD_SHOW_GRACE_SEC`): the next `reconcile`, `ask` or reminder sends the
+question as text to the owner's DM, once per card, and reports it. Nothing is scheduled, so that
+fallback waits for one of those runs. The row's `**Sent:**` record names the card
+(`**Sent:** card hitl_… stored for ag2space owner-dm (decision card, not yet shown) at …`), so a
+reminder also asks it again as text.
 
 The click is owner-checked and recorded by the bridge (`chosen_action`), and with `turn_on_action`
 the same relay task reaches the core headed `hitl_click: true`, its body the button label. That
@@ -100,8 +105,9 @@ card in progress with a chosen action, closes its row as Answered through `resol
 `[<ask-id>] chose '<label>'`; the core acts only on such `chose` lines and answers `[no-send]`. A close that
 could not be recorded at all leaves the card in progress for the next run, and a later run reports
 it as "reported before", not as a new choice. `resolve` retires (cancels) the question's card
-whenever it closes the row or the room refuses the close, so an answer by text or by Status leaves
-no live card; a click on a card whose row was already closed is reported as "already answered —
+whenever it closes the row or the room refuses the close, so a question closed through `resolve`
+(after a text answer, say) leaves no live card. A Status the owner sets on the row himself does not
+retire the card (reconcile does not touch cards); a click on a card whose row was already closed is reported as "already answered —
 not a decision" (`stale`) and its card is cancelled.
 
 ## The outbox

@@ -15,7 +15,9 @@ neutralized (`[ file:`), so no text can become a drain action.
 
 A question with a default or options that is bound for AG2 Space is asked as a decision card
 instead (one button per option, Approve first; `hitl.cards`), with the ask id as its guard, and
-no text is queued; the text ask is the fallback when the card cannot be created. `answered_cards`
+no text is queued at once; the text ask is the fallback when the card cannot be created, and
+`unshown_cards_as_text` sends it as text once the card has gone unshown for CARD_SHOW_GRACE_SEC
+(the gateway records each projection; nothing here can see the DM). `answered_cards`
 reads back the clicks the bridge applied, so the adapter can close each row.
 """
 from __future__ import annotations
@@ -47,6 +49,10 @@ from util_paths import host_label
 CARD_RUNTIME = "pending-questions"
 # The only bridge that projects HITL cards (to the owner's DM).
 CARD_BRIDGE = "ag2space"
+# A card the gateway has not shown this long after it was stored is asked again as text.
+CARD_SHOW_GRACE_SEC = 600
+UNSHOWN_NOTE = ("Its decision card was not shown to you, so it is sent as text; "
+                "a click on the card, if it appears, answers it as well.")
 # A question queued and drained this recently is not re-raised by the reminder.
 SENT_QUIET_SEC = 3600
 # Grammar of the queue record; the reminder reads it back.
@@ -199,23 +205,32 @@ def card_reaches_owner(dest: Destination, ws: Path) -> bool:
     return should_claim_proactive(Path(ws) / "state" / "last-owner-activity.json", CARD_BRIDGE)
 
 
-def card_actions(default_action: Optional[str], options) -> list:
-    """(id, label) per button, Approve first, from the row's own option order."""
+def card_choices(default_action: Optional[str], options) -> list:
+    """(label, consequence) per button: with a default, the row's order (Approve first, carrying it);
+    options alone are the buttons exactly as given, with no Approve the asker never proposed."""
     from pending_questions_store import ordered_options  # noqa: PLC0415
-    opts = ordered_options(default_action, options)
-    return [("approve" if i == 0 else f"option-{i}", label) for i, (label, _) in enumerate(opts)]
+    if (default_action or "").strip():
+        return ordered_options(default_action, options)
+    return [(str(a).strip(), str(b).strip()) for a, b in options or () if str(a).strip()]
+
+
+def card_actions(default_action: Optional[str], options) -> list:
+    """(id, label) per button; `approve` only for the Approve that carries a proposed default."""
+    has_default = bool((default_action or "").strip())
+    return [("approve" if has_default and i == 0 else f"option-{i}", label)
+            for i, (label, _) in enumerate(card_choices(default_action, options))]
 
 
 def card_message(question: str, context: Optional[str], default_action: Optional[str],
                  reason: Optional[str], options, link: Optional[str] = None,
                  intro: Optional[str] = None) -> str:
-    from pending_questions_store import ordered_options  # noqa: PLC0415
     parts = [question.strip()]
     if context and context.strip():
         parts.append(context.strip())
-    if reason and reason.strip():
+    if reason and reason.strip() and (default_action or "").strip():
         parts.append(f"Why Approve: {reason.strip()}")
-    parts.append("\n".join(f"{label}: {what}" for label, what in ordered_options(default_action, options)))
+    parts.append("\n".join(f"{label}: {what}" if what else label
+                           for label, what in card_choices(default_action, options)))
     if link:
         parts.append(f"Or set its Status on the row: {link}")
     if intro and intro.strip():
@@ -249,6 +264,47 @@ def answered_cards(manager) -> list:
         out.append({"hitl_id": req.id, "ask_id": (req.subject or {}).get("ask_id") or req.guard,
                     "action_id": req.chosen_action, "label": label, "question": req.message,
                     "reported_before": bool((req.subject or {}).get("reported"))})
+    return out
+
+
+def card_shown(manager, req) -> bool:
+    """The gateway recorded a projection of this card (the owner's DM has it)."""
+    return manager.store.projection(req.id).get("revision", 0) > 0
+
+
+def unshown_cards_as_text(ws: Path, manager=None, now: Optional[float] = None,
+                          grace: float = None, host: Optional[str] = None) -> list:
+    """A card stored but never shown within `grace` is asked again as text in the owner's DM,
+    once per card; the card stays, so whichever he answers closes the row. Never raises:
+    [{ask_id, hitl_id, proactive_file | error}]."""
+    grace = CARD_SHOW_GRACE_SEC if grace is None else grace
+    now = time.time() if now is None else now
+    out = []
+    try:
+        if manager is None:
+            from hitl.cards import manager_for  # noqa: PLC0415
+            manager = manager_for(Path(ws))
+        live = [r for r in manager.active() if r.runtime == CARD_RUNTIME and not r.chosen_action
+                and not (r.subject or {}).get("text_fallback") and now - r.created_at >= grace]
+    except Exception as e:  # noqa: BLE001
+        return [{"ask_id": None, "hitl_id": None, "error": f"{type(e).__name__}: {e}"}]
+    for req in live:
+        ask_id = (req.subject or {}).get("ask_id") or req.guard
+        try:
+            if card_shown(manager, req):
+                continue
+            body, _ = proactive_body(req.message, None, host or host_label(), Destination(),
+                                     intro=UNSHOWN_NOTE)
+            name = proactive_filename(f"{ask_id}-text", None)
+            write_proactive(Path(ws) / "results", name, body)
+            with manager.store.locked():
+                cur = manager.get(req.id)
+                if cur is not None and not cur.terminal:
+                    cur.subject = {**(cur.subject or {}), "text_fallback": name}
+                    manager.store.save(cur)
+            out.append({"ask_id": ask_id, "hitl_id": req.id, "proactive_file": name})
+        except Exception as e:  # noqa: BLE001
+            out.append({"ask_id": ask_id, "hitl_id": req.id, "error": f"{type(e).__name__}: {e}"})
     return out
 
 
@@ -323,7 +379,7 @@ def queue_question(question: str, context: Optional[str] = None, task_file: Opti
         try:
             out["card"] = raise_card(ask_id, question, context, host, ws, default_action, reason,
                                      options, link, intro, manager)
-            out["bridge"], out["where"] = CARD_BRIDGE, f"{CARD_BRIDGE} owner-dm (decision card)"
+            out["bridge"], out["where"] = CARD_BRIDGE, f"{CARD_BRIDGE} owner-dm (decision card, not yet shown)"
         except Exception as e:  # noqa: BLE001 — the text ask below is the fallback
             out["card_error"] = f"{type(e).__name__}: {e}"
     if not out["card"]:
@@ -338,7 +394,7 @@ def queue_question(question: str, context: Optional[str] = None, task_file: Opti
         except Exception as e:  # noqa: BLE001 — the question is still recorded below
             out["send_error"] = f"{type(e).__name__}: {e}"
     if out["card"]:
-        out["sent_line"] = f"**Sent:** card {out['card']} to {out['where']} at {_iso(time.time())}"
+        out["sent_line"] = f"**Sent:** card {out['card']} stored for {out['where']} at {_iso(time.time())}"
     elif out["proactive_file"]:
         out["sent_line"] = f"**Sent:** queued {out['where']} via {out['proactive_file']} at {_iso(time.time())}"
     else:
@@ -381,8 +437,10 @@ def report_lines(out: dict) -> list:
     if out.get("link"):
         lines.append(f"row: {out['link']}")
     if out.get("card"):
-        lines.append(f"sent: decision card {out['card']} for {out['where']} (the gateway projects it; "
-                     "his click arrives as a `hitl_click` task — run `src/pending_questions_reader.py clicks`)")
+        lines.append(f"sent: STORED as decision card {out['card']} for {out['where']} — the gateway "
+                     f"must project it; if it is not shown within {CARD_SHOW_GRACE_SEC // 60} min, the next "
+                     "reconcile, ask or reminder sends it as text. His click arrives as a `hitl_click` task: "
+                     "run `src/pending_questions_reader.py clicks`")
     elif out.get("proactive_file"):
         lines.append(f"sent: queued {out['where']} via results/{out['proactive_file']} "
                      "(a bridge drain delivers it; the reminder re-raises an undrained file)")
