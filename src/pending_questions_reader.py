@@ -230,7 +230,7 @@ def click_line(c: dict) -> str:
     if c.get("stale"):
         return f"- [{c['ask_id']}] already answered — not a decision (a late click on {what}) — {q}"
     if c.get("reported_before"):
-        return f"- [{c['ask_id']}] reported before, not a new decision ({what}); its row is not closed yet — {q}"
+        return f"- [{c['ask_id']}] acknowledged before, not a new decision ({what}); its row is not closed yet — {q}"
     replay = " (replayed: not acknowledged yet)" if c.get("replay") else ""
     return f"- [{c['ask_id']}] chose {what}{replay} — {q}"
 

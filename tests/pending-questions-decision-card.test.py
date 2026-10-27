@@ -360,15 +360,32 @@ class Clicks(unittest.TestCase):
         self.assertNotIn("chose", line)
         self.assertIn("already answered — not a decision", line)
 
-    def test_a_close_that_could_not_be_recorded_keeps_the_card_and_is_not_a_new_choice_next_run(self):
+    def test_a_close_that_could_not_be_recorded_keeps_the_choice_until_the_ack(self):
         ws, m, out = self._clicked()
         fail = lambda *a: (False, "not recorded: nothing held")  # noqa: E731
         first = room_db.clicks(ws, manager=m, closer=fail)
         self.assertEqual(m.get(out["card"]).status, STATUS_IN_PROGRESS)
         self.assertIn("chose", reader.click_line(first[0]))
+        self.assertEqual(room_db.ack_click(ws, out["ask_id"], m)[0], True)
         again = room_db.clicks(ws, manager=m, closer=fail)
         self.assertTrue(again[0]["reported_before"])
         self.assertNotIn("chose", reader.click_line(again[0]))
+        self.assertEqual(room_db.ack_click(ws, out["ask_id"], m)[0], False, "acknowledged once")
+        settled = room_db.clicks(ws, manager=m, closer=lambda *a: (True, "closed"))
+        self.assertEqual(m.get(out["card"]).status, STATUS_RESOLVED, "the late close settles it")
+        self.assertNotIn("chose", reader.click_line(settled[0]))
+
+    def test_a_crash_before_the_choice_is_emitted_still_replays_it(self):
+        ws, m, out = self._clicked()
+        fail = lambda *a: (False, "not recorded: nothing held")  # noqa: E731
+        loaded = reader.load_adapter(str(PQ / "pending_questions_room_db.py"))
+        with mock.patch.object(loaded, "_close_for_click", fail), \
+                mock.patch.object(reader, "click_line", side_effect=KeyboardInterrupt("crash before print")):
+            with self.assertRaises(KeyboardInterrupt):
+                reader.main(["clicks", "--workspace", str(ws), "--store-adapter", str(PQ / "pending_questions_room_db.py")])
+        again = room_db.clicks(ws, manager=m, closer=fail)
+        self.assertFalse(again[0]["reported_before"])
+        self.assertIn("chose option-1 'Hold'", reader.click_line(again[0]), "the owner's choice is not lost")
 
     def test_the_real_resolve_records_the_close_locally_without_a_room(self):
         ws, m, out = self._clicked()

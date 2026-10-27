@@ -389,8 +389,9 @@ def clicks(workspace: Path, manager=None, closer=None) -> list:
     One dict per click, oldest first, with `closed`, `close_message` and the flags the core reads:
     `stale` — the row was closed already, by code or by the owner's own Status (one guarded
     write), so the click is NOT a decision and its card is cancelled; `replay` — this click
-    closed its row on an earlier run and was not acknowledged; `reported_before` — an earlier
-    run could not close the row, which stays for the next run."""
+    closed its row on an earlier run and was not acknowledged; `reported_before` — the core
+    acknowledged this choice but its row is not closed yet (the close is retried each run).
+    Nothing here marks a choice as handed over: only `ack_click` does, after the core acted."""
     ws = Path(workspace)
     if manager is None:
         from hitl.cards import manager_for  # noqa: PLC0415
@@ -404,24 +405,32 @@ def clicks(workspace: Path, manager=None, closer=None) -> list:
             continue
         ok, msg = closer(ws, click["ask_id"], "Answered")
         stale = not ok and msg.startswith(REFUSED_PREFIX)
-        if ok:
+        if ok and click["reported_before"]:
+            manager.resolve(click["hitl_id"])  # acknowledged earlier: the late close settles it
+        elif ok:
             core_ask.stamp_card(manager, click["hitl_id"], row_closed=True)
         elif stale:
             manager.cancel(click["hitl_id"])
-        else:
-            core_ask.stamp_card(manager, click["hitl_id"], reported=True)
         out.append({**click, "closed": ok, "stale": stale, "replay": False, "close_message": msg})
     return out
 
 
 def ack_click(workspace: Path, ask_id: str, manager=None) -> tuple:
-    """(done, message): the core acted on this question's choice; its claimed card is settled."""
+    """(done, message): the core acted on this question's choice. A card whose row is closed is
+    settled; one whose close is still pending is marked acknowledged, so later runs retry the
+    close without presenting the choice again."""
     if manager is None:
         from hitl.cards import manager_for  # noqa: PLC0415
         manager = manager_for(Path(workspace))
-    done = [c["hitl_id"] for c in core_ask.answered_cards(manager) if c["ask_id"] == ask_id and c["row_closed"]]
-    for hid in done:
-        manager.resolve(hid)
+    done = []
+    for c in core_ask.answered_cards(manager):
+        if c["ask_id"] != ask_id or c["reported_before"]:
+            continue
+        if c["row_closed"]:
+            manager.resolve(c["hitl_id"])
+        else:
+            core_ask.stamp_card(manager, c["hitl_id"], reported=True)
+        done.append(c["hitl_id"])
     if not done:
         return False, f"no claimed click for {ask_id} to acknowledge"
     return True, f"acknowledged {ask_id} ({', '.join(done)})"

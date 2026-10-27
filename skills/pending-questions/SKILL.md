@@ -112,8 +112,9 @@ choice (`(replayed: not acknowledged yet)`) rather than losing it.
 
 A click on a row already closed, by code or by the owner's own Status, is reported as "already
 answered — not a decision" (`stale`) and its card is cancelled. A close that could not be recorded
-at all leaves the card for the next run, which reports it as "reported before", not as a new
-choice. `resolve` retires (cancels) the question's card whenever it closes the row or the room
+at all still prints the choice, every run, until the core acks it; after the ack, later runs only
+retry the close and print "acknowledged before, not a new decision". Nothing marks a choice as
+handed over before the core has it: only the ack does. `resolve` retires (cancels) the question's card whenever it closes the row or the room
 refuses the close. A Status the owner sets on the row himself does not retire the card (reconcile
 does not touch cards); a later click on it is reported stale. If the outbox cannot hold a question
 whose card was stored, the card is withdrawn (never posted when still unshown) and the question is
