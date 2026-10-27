@@ -111,6 +111,23 @@ class HitlArchiveCheckTest(unittest.TestCase):
         self.assertEqual(out["status"], "warn")
         self.assertIn("1 settled record(s) failing to archive", out["detail"])
 
+    def test_a_card_that_could_not_be_projected_warns(self):
+        mgr = hm.HitlManager(hm.HitlStore(self.root))
+        req = mgr.create(schema.HumanRequirement(
+            kind="choice", runtime="claude", message="m", guard="g",
+            actions=[schema.Action(id="ok", kind="choose", label="OK")]))
+
+        def refuse(payload):
+            err = OSError("HTTP 400")
+            err.code = 400
+            raise err
+
+        for i in range(getattr(projector, "PROJECTION_MAX_REFUSALS", 5)):
+            projector.project(mgr, refuse, "!r", clock=lambda: time.time() + 10 ** 7 * (i + 1))
+        out = hc.check_hitl_archive()
+        self.assertEqual(out["status"], "warn")
+        self.assertIn(f"1 card(s) could not be projected ({req.id})", out["detail"])
+
     def test_an_unreadable_status_file_degrades_to_the_live_count(self):
         self.fill(1)
         hm.archive_status_path(self.root).write_text("[not json")

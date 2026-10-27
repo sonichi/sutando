@@ -17,6 +17,9 @@ from .host import device_host
 WIRE_FIELD = "space.ag2.hitl"
 # Follow-up notice tag: which cards a reminder or recovery message is about.
 NOTICE_FIELD = "space.ag2.hitl_notice"
+# The subject fields a card may show. The rest of `subject` is the producer's own bookkeeping
+# (claims, tokens, leases, session keys) and never leaves the host.
+WIRE_SUBJECT_FIELDS = ("tool", "input", "options", "choices")
 
 KINDS = frozenset(
     {"auth", "permission", "choice", "confirmation", "billing", "external_action",
@@ -165,8 +168,9 @@ class HumanRequirement:
             wire["device"] = device
         if self.actions:
             wire["actions"] = [a.to_wire() for a in self.actions]
-        if self.subject:
-            wire["subject"] = dict(self.subject)
+        subject = {k: self.subject[k] for k in WIRE_SUBJECT_FIELDS if k in (self.subject or {})}
+        if subject:
+            wire["subject"] = subject
         if self.expires_at is not None:
             wire["expires_at"] = self.expires_at
         if self.turn_on_action:

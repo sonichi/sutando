@@ -713,6 +713,46 @@ class OwnerStatusWins(_Room):
         self.assertIn("could not be retired", msg)
 
 
+class WireCarriesNoClaim(_Room):
+    """The claim is local bookkeeping: the card's projected revisions never carry it to the room."""
+
+    def _floats(self, o):
+        if isinstance(o, float):
+            return [o]
+        if isinstance(o, dict):
+            return [f for v in o.values() for f in self._floats(v)]
+        if isinstance(o, list):
+            return [f for v in o for f in self._floats(v)]
+        return []
+
+    def test_a_clicked_then_acked_card_projects_no_claim_token_or_lease(self):
+        from hitl import projector
+        from hitl.schema import WIRE_FIELD
+        sent = []
+
+        def send(payload):
+            sent.append(payload)
+            return {"ok": True, "event_id": f"$e{len(sent)}"}
+
+        projector.project(self.m, send, "!dm:example.invalid")
+        click(self.m, self.card, "option-1")
+        [c] = self.run_clicks()
+        self.assertTrue(room_db.ack_click(self.ws, self.ask_id, c["token"], self.m)[0])
+        self.assertIn("claim", self.m.get(self.card).subject, "the claim stays in the local record")
+        projector.project(self.m, send, "!dm:example.invalid")
+        cards_sent = [p for p in sent if WIRE_FIELD in p.get("extra_content", {})]
+        self.assertEqual(cards_sent[-1]["extra_content"][WIRE_FIELD]["status"], STATUS_RESOLVED)
+        for payload in cards_sent:
+            wire = payload["extra_content"][WIRE_FIELD]
+            dumped = json.dumps(payload)
+            self.assertNotIn("claim", wire.get("subject", {}))
+            for leak in (c["token"], '"token"', "handed_at", '"lease"', "observed_at", '"elapsed"'):
+                self.assertNotIn(leak, dumped, f"revision {wire['revision']} carries {leak}")
+            self.assertEqual(self._floats(wire.get("subject", {})), [],
+                             "a float in the subject is refused by the room (canonical JSON)")
+            self.assertEqual(wire["subject"]["choices"], {"approve": "merge it", "option-1": "wait for the CLA"})
+
+
 class ExactChoice(unittest.TestCase):
     def _handed(self, question, options, action_id):
         ws = Path(tempfile.mkdtemp(prefix="pq-clicks-x-"))

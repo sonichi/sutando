@@ -2918,6 +2918,10 @@ def check_hitl_archive() -> "dict | None":
     if h["live"] > HITL_LIVE_WARN:
         problems.append(f"{h['live']} live records (> {HITL_LIVE_WARN}); the gateway re-reads "
                         f"each one every second")
+    failed = h.get("projection_failed") or []
+    if failed:
+        problems.append(f"{len(failed)} card(s) could not be projected ({', '.join(failed[:5])}): "
+                        f"the relay refused them; the gateway log names the error")
     if problems:
         return {"name": name, "status": "warn", "detail": "; ".join(problems)}
     state = "archive healthy" if h["reported"] else "no archive report yet"

@@ -69,6 +69,8 @@ _ARCHIVE_PUBLISHED: Dict[str, tuple] = {}
 # writer (older than ARCHIVE_STATUS_STALE_S) from a steady state.
 ARCHIVE_STATUS_REFRESH_S = 300
 ARCHIVE_STATUS_STALE_S = 600
+# Ledger fields of a refused projection; a projection that lands clears them.
+REFUSAL_KEYS = ("refused_revision", "refusals", "retry_at", "refused_error", "failed_revision")
 
 
 def archive_status_path(store_root: Path) -> Path:
@@ -78,8 +80,8 @@ def archive_status_path(store_root: Path) -> Path:
 
 
 def archive_health(store_root: Path, now: Optional[float] = None) -> Optional[Dict]:
-    """What health-check reads: live record count plus the published archive
-    failures, or None when this host has no store. `stale` means a report exists
+    """What health-check reads: live record count, the published archive failures and the
+    live cards the relay refused past the retry bound, or None when this host has no store. `stale` means a report exists
     but the writer stopped refreshing it, so its count is unknown."""
     root = Path(store_root)
     if not root.is_dir():
@@ -96,12 +98,22 @@ def archive_health(store_root: Path, now: Optional[float] = None) -> Optional[Di
     now = time.time() if now is None else now
     stale = bool(status) and (not isinstance(updated, (int, float))
                               or now - updated > ARCHIVE_STATUS_STALE_S)
-    return {"live": sum(1 for _ in root.glob("hitl_*.json")),
+    live = sorted(root.glob("hitl_*.json"))
+    return {"live": len(live),
             "failures": failures,
             "error": str(status.get("error") or ""),
             "updated_at": updated,
             "reported": bool(status),
-            "stale": stale}
+            "stale": stale,
+            "projection_failed": [p.stem for p in live if _projection_failed_on_disk(p)]}
+
+
+def _projection_failed_on_disk(path: Path) -> bool:
+    try:
+        raw = json.loads(path.read_text())
+        return (raw.get("projection") or {}).get("failed_revision") == raw["requirement"]["revision"]
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return False
 
 
 def default_store(workspace: Optional[Path] = None) -> Path:
@@ -359,7 +371,23 @@ class HitlManager:
         req = self.store.load(req_id)
         if req is None or req.decided_by == POLICY_DECIDER:
             return False  # a policy answer is a record, never a card
-        return self.store.projection(req_id).get("revision", 0) < req.revision
+        ledger = self.store.projection(req_id)
+        if ledger.get("failed_revision") == req.revision:
+            return False  # given up on this revision; a later one is tried afresh
+        return ledger.get("revision", 0) < req.revision
+
+    def projection_failed(self, req_id: str) -> bool:
+        """The relay refused this revision's card past the retry bound."""
+        req = self.store.load(req_id)
+        return req is not None and self.store.projection(req_id).get("failed_revision") == req.revision
+
+    def record_refusal(self, req_id: str, revision: int, fields: Dict) -> None:
+        """Merge one refused send's bookkeeping (hitl.projector) into the ledger, for that revision only."""
+        with self.store.locked():
+            req = self.store.load(req_id)
+            if req is None or req.revision != revision:
+                return
+            self.store.save(req, projection={**self.store.projection(req_id), **fields})
 
     def record_projection(self, req_id: str, revision: int, event_id: Optional[str],
                           extra: Optional[Dict] = None) -> None:
@@ -373,7 +401,8 @@ class HitlManager:
             if revision <= current.get("revision", 0):
                 return
             event_id = event_id or current.get("event_id")
-            self.store.save(req, projection={**current, **(extra or {}),
+            kept = {k: v for k, v in current.items() if k not in REFUSAL_KEYS}
+            self.store.save(req, projection={**kept, **(extra or {}),
                                              "revision": revision, "event_id": event_id})
 
     def record_notice(self, req_id: str, fields: Dict) -> None:
@@ -390,8 +419,8 @@ class HitlManager:
             req = self.store.load(req_id)
             if req is None or req.status not in TERMINAL_STATUSES:
                 return False
-            if self.needs_projection(req_id):
-                return False
+            if self.needs_projection(req_id) or self.projection_failed(req_id):
+                return False  # a failed card stays live, where health-check sees it
             if renotify.due(req, self.store.projection(req_id), now) is not None:
                 return False
             return self.store.archive(req_id)

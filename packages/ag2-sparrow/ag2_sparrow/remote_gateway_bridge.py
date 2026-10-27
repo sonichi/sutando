@@ -1606,13 +1606,13 @@ def _claude_local_store_root() -> Path:
     return store_root(_STATE)
 
 
-def _project_claude_local(mods, room: str, log=print) -> list:
+def _project_claude_local(mods, room: str, log=print):
     """Project the claude-local root's cards into the owner DM (the room filled on the
     requirement under the store lock when the launcher could not know it)."""
     manager_mod, projector, _ = mods
     root = _claude_local_store_root()
     if not root.is_dir():
-        return []
+        return projector.ProjectionPass([], [], [])
     store = manager_mod.HitlStore(root)
     manager = manager_mod.HitlManager(store, policy=None)
     with store.locked():
@@ -1624,8 +1624,9 @@ def _project_claude_local(mods, room: str, log=print) -> list:
                     sub["room"] = room
                 store.save(req, store.projection(req.id))
     if not projector.pending_ids(manager):
-        return []
-    return projector.project(manager, lambda payload: _req("POST", "/v1/room", payload, timeout=_ROOM_POST_TIMEOUT_S), room)
+        return projector.ProjectionPass([], [], [])
+    return projector.project_pass(manager, lambda payload: _req("POST", "/v1/room", payload, timeout=_ROOM_POST_TIMEOUT_S), room,
+                                  describe=_http_error_body)
 
 
 def _project_hitl(log=print) -> int:
@@ -1651,26 +1652,40 @@ def _project_hitl(log=print) -> int:
             return 0
         manager_mod, projector, _ = mods
         HitlManager, HitlStore, default_store = manager_mod.HitlManager, manager_mod.HitlStore, manager_mod.default_store
-        pending_ids, project = projector.pending_ids, projector.project
+        pending_ids, project_pass = projector.pending_ids, projector.project_pass
     except Exception as e:  # noqa: BLE001 — an optional tier never breaks the pulse
         log(f"hitl: projector unavailable ({diagnostics.describe(e)}); cards will not be delivered")
         return 0
     workspace = _STATE.parent
     manager = HitlManager(HitlStore(default_store(workspace)))
-    done, failed, raised = [], False, None
+    done, refused, gave_up, failed, raised = [], [], [], False, None
     # Each store gets its pass: a stuck card in one never holds back the other's.
-    try:
-        if pending_ids(manager):
-            got = project(manager, lambda payload: _req("POST", "/v1/room", payload, timeout=_ROOM_POST_TIMEOUT_S), room)
-            done, failed = list(got or []), not got
-    except Exception as e:  # noqa: BLE001 — re-raised below, after the claude-local pass
-        failed, raised = True, e
-    try:
-        done += _project_claude_local(mods, room, log)
-    except Exception as e:  # noqa: BLE001 — re-raised below
-        failed, raised = True, raised or e
+    for drive in ("default", "claude-local"):
+        try:
+            if drive == "claude-local":
+                got = _project_claude_local(mods, room, log)
+            elif pending_ids(manager):
+                got = project_pass(manager, lambda payload: _req("POST", "/v1/room", payload, timeout=_ROOM_POST_TIMEOUT_S), room,
+                                   describe=_http_error_body)
+            else:
+                continue
+        except Exception as e:  # noqa: BLE001 — re-raised below, after both passes
+            failed, raised = True, raised or e
+            continue
+        done += got.done
+        refused += got.refused
+        gave_up += got.failed
+        # A pass whose every send was rejected; one card's own refusal is not the relay's.
+        failed = failed or (drive == "default" and not (got.done or got.refused or got.failed))
     for req_id, event_id in done:
         log(f"hitl: projected {req_id} -> {event_id or 'no event id'}")
+    for req_id, attempt, error, delay in refused:
+        log(f"hitl: card {req_id} refused by the relay ({error}), attempt {attempt}/"
+            f"{projector.PROJECTION_MAX_REFUSALS}; retrying it in {delay:g}s")
+    for req_id, revision, error in gave_up:
+        log(f"hitl: card {req_id} could not be projected at revision {revision}: refused "
+            f"{projector.PROJECTION_MAX_REFUSALS} times ({error}); no further retries for this "
+            f"revision, health-check reports it")
     if failed:
         _hitl_backoff_bump(log)  # a refusing or raising sender
         if raised is not None:

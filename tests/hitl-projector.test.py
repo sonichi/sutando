@@ -490,5 +490,49 @@ class ArchiveTests(unittest.TestCase):
         self.assertNotIn("task-late", self.mgr.get(req.id).blocked_task_ids)
 
 
+
+class RefusalClassTests(unittest.TestCase):
+    """Only a 4xx about the payload is the card's own; auth, timeouts, rate limits, 5xx and network
+    errors are the sender's and propagate to the caller's backoff with nothing recorded."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.mgr = HitlManager(HitlStore(Path(self.tmp.name)))
+
+    def _raising(self, code):
+        def send(payload):
+            err = OSError(f"HTTP {code}")
+            err.code = code
+            raise err
+        return send
+
+    def test_transport_refusals_propagate_and_record_nothing(self):
+        for code in (401, 403, 408, 429, 500, 503):
+            with self.subTest(code=code):
+                req = self.mgr.create(make_req(guard=f"g{code}", device={"id": f"d{code}", "name": "n"}))
+                with self.assertRaises(OSError):
+                    project(self.mgr, self._raising(code), ROOM)
+                ledger = self.mgr.store.projection(req.id)
+                self.assertNotIn("refusals", ledger)
+                self.assertTrue(self.mgr.needs_projection(req.id))
+                self.mgr.cancel(req.id)
+                self.mgr.record_projection(req.id, 99, "$x")
+
+    def test_a_refused_card_is_retried_at_its_next_revision(self):
+        from hitl import projector as pj
+        req = self.mgr.create(make_req())
+        for i in range(pj.PROJECTION_MAX_REFUSALS):
+            pj.project_pass(self.mgr, self._raising(400), ROOM, clock=lambda: time.time() + 10 ** 7 * (i + 1))
+        self.assertTrue(self.mgr.projection_failed(req.id))
+        self.assertFalse(self.mgr.needs_projection(req.id))
+        self.assertEqual(pending_ids(self.mgr), [], "a failed card is not pending work")
+        self.mgr.resolve(req.id)
+        self.assertTrue(self.mgr.needs_projection(req.id), "a new revision gets a fresh try")
+        sent = RecordingSender()
+        self.assertEqual([i for i, _ in project(self.mgr, sent, ROOM)], [req.id])
+        self.assertNotIn("failed_revision", self.mgr.store.projection(req.id))
+
+
 if __name__ == "__main__":
     unittest.main()

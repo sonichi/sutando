@@ -15,7 +15,7 @@ returning the gateway's dict answer) — this module never imports a bridge.
 from __future__ import annotations
 
 import time
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, NamedTuple, Optional, Tuple
 
 from . import renotify
 from .manager import HitlManager
@@ -33,6 +33,21 @@ from .schema import (
 
 Sender = Callable[[Dict], Dict]
 Clock = Callable[[], float]
+
+# A card the relay refuses outright is retried this many times, spaced out, then marked failed.
+PROJECTION_MAX_REFUSALS = 5
+PROJECTION_RETRY_BASE_S = 30.0
+PROJECTION_RETRY_MAX_S = 600.0
+# Refusals of the sender rather than of one payload: they propagate to the caller's backoff.
+_TRANSPORT_4XX = frozenset({401, 403, 407, 408, 425, 429})
+
+
+class ProjectionPass(NamedTuple):
+    """One drive: accepted [(id, event_id)], refused [(id, attempt, error, retry_in_s)] still
+    to be retried, and failed [(id, revision, error)] newly given up on."""
+    done: List[Tuple[str, Optional[str]]]
+    refused: List[Tuple[str, int, str, float]]
+    failed: List[Tuple[str, int, str]]
 
 # The card colours these two apart; a client that ignores the card field saw the
 # blocking header for every kind, so a mere decision read as an alarm.
@@ -70,7 +85,45 @@ def _notices(manager: HitlManager, now: float) -> List[renotify.Notice]:
     return renotify.plan(entries, now)
 
 
-def pending_ids(manager: HitlManager, clock: Clock = time.time) -> List[str]:
+def _refusal_code(exc: BaseException) -> Optional[int]:
+    """The 4xx with which the relay refused this one payload, or None for a transport failure."""
+    code = getattr(exc, "code", None)
+    code = code if isinstance(code, int) else getattr(exc, "status", None)
+    if isinstance(code, int) and 400 <= code < 500 and code not in _TRANSPORT_4XX:
+        return code
+    return None
+
+
+def _detail(describe: Optional[Callable[[BaseException], str]], exc: BaseException) -> str:
+    try:
+        return " ".join(str(describe(exc) or "").split()) if describe else ""
+    except Exception:  # noqa: BLE001 — a body that cannot be read never hides the refusal
+        return ""
+
+
+def _backing_off(manager: HitlManager, req: HumanRequirement, now: float) -> bool:
+    ledger = manager.store.projection(req.id)
+    return ledger.get("refused_revision") == req.revision and (ledger.get("retry_at") or 0) > now
+
+
+def _refuse(manager: HitlManager, req: HumanRequirement, code: int, detail: str, now: float,
+            out: "ProjectionPass") -> None:
+    ledger = manager.store.projection(req.id)
+    n = (ledger.get("refusals") or 0) if ledger.get("refused_revision") == req.revision else 0
+    n += 1
+    error = f"HTTP {code}: {detail[:200]}" if detail else f"HTTP {code}"
+    fields: Dict = {"refused_revision": req.revision, "refusals": n, "refused_error": error}
+    if n >= PROJECTION_MAX_REFUSALS:
+        manager.record_refusal(req.id, req.revision, {**fields, "retry_at": None,
+                                                      "failed_revision": req.revision})
+        out.failed.append((req.id, req.revision, error))
+        return
+    delay = min(PROJECTION_RETRY_BASE_S * 2 ** (n - 1), PROJECTION_RETRY_MAX_S)
+    manager.record_refusal(req.id, req.revision, {**fields, "retry_at": now + delay})
+    out.refused.append((req.id, n, error, delay))
+
+
+def pending_ids(manager: HitlManager, clock: Optional[Clock] = None) -> List[str]:
     """Requirement ids whose revision is ahead of their projection, or that owe
     the owner a follow-up notice (hitl.renotify).
 
@@ -82,12 +135,12 @@ def pending_ids(manager: HitlManager, clock: Clock = time.time) -> List[str]:
     A failed move is skipped, warned once per id, and counted in the status
     health-check reads (`archive_health`); cleanup never blocks delivery.
     """
-    now = clock()
+    now = (clock or time.time)()
     owed = {r.id for n in _notices(manager, now) for r, _ in n.members}
     out: List[str] = []
     failed: Dict[str, BaseException] = {}
     for r in manager.store.all():
-        if manager.needs_projection(r.id) or r.id in owed:
+        if (manager.needs_projection(r.id) and not _backing_off(manager, r, now)) or r.id in owed:
             out.append(r.id)
         elif r.terminal:
             try:
@@ -99,18 +152,28 @@ def pending_ids(manager: HitlManager, clock: Clock = time.time) -> List[str]:
 
 
 def project(manager: HitlManager, send: Sender, room_id: str,
-            clock: Clock = time.time) -> List[Tuple[str, Optional[str]]]:
+            clock: Optional[Clock] = None) -> List[Tuple[str, Optional[str]]]:
+    """`project_pass`, returning only the projections accepted this drive."""
+    return project_pass(manager, send, room_id, clock).done
+
+
+def project_pass(manager: HitlManager, send: Sender, room_id: str, clock: Optional[Clock] = None,
+                 describe: Optional[Callable[[BaseException], str]] = None) -> ProjectionPass:
     """Drive every requirement whose revision is ahead of its projection, then
     send each follow-up notice that is due as a NEW message.
 
-    Returns [(req_id, event_id_or_None), ...] for the projections that were
-    accepted this drive. A rejected send is skipped (nothing recorded) so the
-    next drive retries it; an exception from the sender propagates — the
-    caller owns retry cadence, this module owns idempotency.
+    A rejected send is skipped (nothing recorded) so the next drive retries it.
+    A 4xx raised for one card is that card's: it is backed off on its own and,
+    after PROJECTION_MAX_REFUSALS, marked failed for that revision, while the
+    other cards in the pass still go out. Any other exception from the sender
+    propagates — the caller owns transport retry cadence, this module owns
+    idempotency. `describe` renders a refusal's response body for the log.
     """
-    out: List[Tuple[str, Optional[str]]] = []
+    clock = clock or time.time
+    now = clock()
+    out = ProjectionPass([], [], [])
     for req in manager.store.all():
-        if not manager.needs_projection(req.id):
+        if not manager.needs_projection(req.id) or _backing_off(manager, req, now):
             continue
         target = manager.projection_target(req.id)
         payload: Dict = {
@@ -123,14 +186,21 @@ def project(manager: HitlManager, send: Sender, room_id: str,
             payload.update({"op": "edit", "event_id": target})
         else:
             payload["op"] = "message"
-        answer = send(payload)
+        try:
+            answer = send(payload)
+        except Exception as e:  # noqa: BLE001 — classified; anything not this card's re-raises
+            code = _refusal_code(e)
+            if code is None:
+                raise
+            _refuse(manager, req, code, _detail(describe, e), now, out)
+            continue
         if not isinstance(answer, dict) or not (answer.get("ok") or answer.get("event_id")):
             continue
         event_id = str(answer.get("event_id") or "") or None
         extra = None if target else renotify.on_create(req, clock())
         manager.record_projection(req.id, req.revision, event_id if not target else None, extra)
-        out.append((req.id, event_id))
-    out.extend(_send_notices(manager, send, room_id, clock()))
+        out.done.append((req.id, event_id))
+    out.done.extend(_send_notices(manager, send, room_id, clock()))
     return out
 
 
