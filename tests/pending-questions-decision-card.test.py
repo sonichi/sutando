@@ -460,27 +460,27 @@ class PointerEdges(unittest.TestCase):
         t = req.created_at + ask.CARD_POINTER_GRACE_SEC + 10
         self.assertTrue(ask.claim_pointer(m, req.id, t))
         self.assertIsNone(ask.claim_pointer(m, req.id, t - 1), "a backward step credits nothing")
-        self.assertIsNone(ask.claim_pointer(m, req.id, t - 5000))
-        self.assertIsNone(ask.claim_pointer(m, req.id, t), "catching back up credits nothing")
-        self.assertEqual(m.get(req.id).subject["pointer_lease"], {"observed_at": t, "elapsed": 0.0})
-        self.assertIsNone(ask.claim_pointer(m, req.id, t + ask.POINTER_CLAIM_RETRY_SEC - 1),
-                          "a single jump credits one step only")
-        self.assertTrue(ask.claim_pointer(m, req.id, t + ask.POINTER_CLAIM_RETRY_SEC + ask.POINTER_MAX_STEP_SEC),
-                        "the window is spent by observed time across passes")
+        self.assertIsNone(ask.claim_pointer(m, req.id, t - 5))
+        self.assertEqual(m.get(req.id).subject["pointer_lease"], {"observed_at": t - 5, "elapsed": 0.0})
+        self.assertIsNone(ask.claim_pointer(m, req.id, t), "the catch-up over-credits the 5 s, at most a step")
+        self.assertEqual(m.get(req.id).subject["pointer_lease"]["elapsed"], 5.0)
 
     def test_the_pointer_claim_lease_table(self):
-        """The same invariant as the click lease, at W=300, step=150, around the window and a renewal."""
+        """The same invariant as the click lease, at W=300, step=150: around the window, a rollback,
+        a year's spike then correction, and a renewal."""
         ws, m, req, q = self._live()
         t = req.created_at + ask.CARD_POINTER_GRACE_SEC + 10
+        year = 365 * 86400
         first = ask.claim_pointer(m, req.id, t)
-        cases = [  # (pass time, claim expected?, credited after the pass, why)
+        cases = [  # (pass time, claim taken?, credited after the pass, why)
             (t + 150, False, 150.0, "one step"),
             (t + 299, False, 299.0, "W - 1"),
-            (t + 298, False, 299.0, "1 s back: no steal, no credit"),
-            (t + 299, False, 299.0, "catch-up: no double credit"),
-            (t + 300, True, 0.0, "W: a new claim, a new lease"),
+            (t + 298, False, 299.0, "1 s back: credits 0, no steal"),
+            (t + 300, True, 0.0, "the catch-up over-credits at most a step: a new claim, a new lease"),
             (t + 299, False, 0.0, "1 s back after the renewal: the fresh claim is kept"),
-            (t + 300 + 150, False, 150.0, "the renewed claim counts from its own start"),
+            (t + 300 + year, False, 150.0, "a year's spike credits one step only"),
+            (t + 300, False, 150.0, "corrected: credits 0"),
+            (t + 450, True, 0.0, "normal time resumes: no freeze"),
         ]
         tokens = [first]
         for now, takes, credited, why in cases:
@@ -490,15 +490,15 @@ class PointerEdges(unittest.TestCase):
                 if got:
                     tokens.append(got)
                 self.assertEqual(m.get(req.id).subject["pointer_lease"]["elapsed"], credited)
-        self.assertEqual(len(set(tokens)), 2, "exactly one replacement")
+        self.assertEqual(len(set(tokens)), 3, "two replacements, each at a spent lease")
 
-    def test_a_claim_stamped_just_under_a_window_ahead_is_never_replaced_on_sight(self):
+    def test_a_claim_stamped_just_under_a_window_ahead_is_replaced_one_window_after_first_sight(self):
         ws, m, req, q = self._live()
         t = req.created_at + ask.CARD_POINTER_GRACE_SEC + 10
         self.assertTrue(ask.claim_pointer(m, req.id, t + ask.POINTER_CLAIM_RETRY_SEC - 1))
         for now in (t, t + 150, t + ask.POINTER_CLAIM_RETRY_SEC - 1):
-            self.assertIsNone(ask.claim_pointer(m, req.id, now))
-        self.assertEqual(m.get(req.id).subject["pointer_lease"]["elapsed"], 0.0)
+            self.assertIsNone(ask.claim_pointer(m, req.id, now), "never replaced on sight")
+        self.assertTrue(ask.claim_pointer(m, req.id, t + ask.POINTER_CLAIM_RETRY_SEC), "one window after first sight")
 
     def test_a_card_posted_after_the_claim_and_before_the_write_gets_no_pointer(self):
         ws, m, req, q = self._live()

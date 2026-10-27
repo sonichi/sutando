@@ -118,7 +118,8 @@ exactly the options as given, with no Approve — and `subject.choices` holding 
   (`POINTER_CLAIM_RETRY_SEC`) with no sent mark — its claimant died or failed to publish — is
   claimed again, with a new lease, and retried. So the pointer is at-least-once: overlapping
   reminders queue one per claim, a death before the publish is retried later, a death between
-  the publish and the sent mark can deliver it twice, and no clock step replaces a live claim.
+  the publish and the sent mark can deliver it twice, and no single clock step replaces a live
+  claim (a rollback or a corrected spike moves its lease by at most one 150 s step).
   Just before the file is written the card is re-checked under the store lock
   (live, unposted, still this claim's), so a post recorded after the claim cancels the pointer;
   the gateway records a post only after its send returns, so the one window left is a send in
