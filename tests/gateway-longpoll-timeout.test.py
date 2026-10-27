@@ -750,7 +750,7 @@ class RoundAccountingTest(unittest.TestCase):
         with _Loop(self.gw, poll_raises=TimeoutError("The read operation timed out"),
                    advance=1.0) as loop:
             loop.run()
-        self.assertTrue(any(m.startswith("poll read timed out after 35s inside the")
+        self.assertTrue(any(m.startswith(f"poll read timed out after {self.gw.POLL_READ_TIMEOUT_S}s inside the")
                             for m in loop.logs))
 
 
