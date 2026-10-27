@@ -337,6 +337,83 @@ class CardOutcomes(unittest.TestCase):
         self.assertFalse(any(ln.startswith("sent:") for ln in lines), lines)
 
 
+class CardPointer(unittest.TestCase):
+    def _live(self, posted=False):
+        ws = _ws("ag2space")
+        m = _manager(ws)
+        out = _ask("Merge #7 into main?", workspace=ws, host="h", default_action="merge it",
+                   options=[("Hold", "wait for the CLA")], manager=m)
+        req = m.get(out["card"])
+        if posted:
+            m.record_projection(req.id, req.revision, "$ev")
+        q = {"ask_id": out["ask_id"], "title": "Merge #7 into main?", "body": out["sent_line"]}
+        return ws, m, req, q
+
+    def test_the_pointer_goes_out_after_the_grace_and_not_before(self):
+        ws, m, req, q = self._live()
+        early = req.created_at + ask.CARD_POINTER_GRACE_SEC - 1
+        self.assertEqual(ask.send_card_pointers([q], ws, now=early, manager=m, host="h"), [])
+        self.assertEqual(_proactive(ws), [])
+        late = req.created_at + ask.CARD_POINTER_GRACE_SEC
+        [(ask_id, name)] = ask.send_card_pointers([q], ws, now=late, manager=m, host="h")
+        self.assertEqual((ask_id, _proactive(ws)), (q["ask_id"], [name]))
+        self.assertEqual(m.get(req.id).status, "pending", "the card stays the only surface")
+
+    def test_two_reminder_passes_send_a_single_pointer_recorded_on_the_card(self):
+        ws, m, req, q = self._live()
+        t = req.created_at + ask.CARD_POINTER_GRACE_SEC
+        self.assertEqual(len(ask.send_card_pointers([q], ws, now=t, manager=m, host="h")), 1)
+        stored = json.loads(m.store._path(req.id).read_text())
+        self.assertEqual(stored["requirement"]["subject"]["pointer_at"], t, "durable on the card")
+        self.assertEqual(ask.send_card_pointers([q], ws, now=t + 10 * ask.SENT_QUIET_SEC, host="h"), [],
+                         "a second pass, with a fresh store handle, sends nothing")
+        self.assertEqual(len(_proactive(ws)), 1)
+
+    def test_never_for_a_posted_or_settled_card_or_a_text_ask(self):
+        ws, m, req, q = self._live(posted=True)
+        self.assertEqual(ask.send_card_pointers([q], ws, now=req.created_at + 99999, manager=m, host="h"), [])
+        ws, m, req, q = self._live()
+        m.cancel(req.id)
+        self.assertEqual(ask.send_card_pointers([q], ws, now=req.created_at + 99999, manager=m, host="h"), [])
+        text_q = {"ask_id": "a", "title": "t", "body": "**Sent:** queued owner-dm via proactive-a.txt at 2026-01-01T00:00:00Z"}
+        self.assertEqual(ask.send_card_pointers([text_q], ws, manager=m, host="h"), [])
+
+    def test_the_pointer_is_not_a_decision_surface(self):
+        ws, m, req, q = self._live()
+        [(_, name)] = ask.send_card_pointers([q], ws, now=req.created_at + ask.CARD_POINTER_GRACE_SEC,
+                                             manager=m, host="h")
+        body = (ws / "results" / name).read_text()
+        self.assertIn("Merge #7 into main?", body)
+        self.assertIn("decision card", body)
+        self.assertIn("may not have arrived", body)
+        for word in ("Approve", "Hold", "merge it", "wait for the CLA", "Decline", "Reply here", "->"):
+            self.assertNotIn(word, body, f"pointer must carry no option or answer wording: {word}")
+        self.assertTrue(body.startswith("[dm-only]"))
+
+    def test_a_pointer_that_cannot_be_written_is_reported(self):
+        ws, m, req, q = self._live()
+        with mock.patch.object(ask, "write_proactive", side_effect=OSError("results gone")):
+            [(_, sent)] = ask.send_card_pointers([q], ws, now=req.created_at + ask.CARD_POINTER_GRACE_SEC,
+                                                 manager=m, host="h")
+        self.assertIn("results gone", sent)
+        self.assertFalse((m.get(req.id).subject or {}).get("pointer_at"), "unsent: not stamped")
+
+    def test_the_reminder_runs_the_pointer_step(self):
+        rem_spec = importlib.util.spec_from_file_location("pq_remind_p", PQ / "pending_questions_remind.py")
+        rem = importlib.util.module_from_spec(rem_spec)
+        rem_spec.loader.exec_module(rem)
+        self.assertIs(rem.send_card_pointers, ask.send_card_pointers)
+        ws, m, req, q = self._live()
+        g = {"waiting": [q], "notes": [], "unavailable": False}
+        with mock.patch.object(rem, "gather", return_value=g), \
+                mock.patch.object(rem, "presenter_mode_active", return_value=False), \
+                mock.patch.object(rem, "send_card_pointers", return_value=[(q["ask_id"], "proactive-x.txt")]) as sp, \
+                mock.patch.object(rem, "deliver") as dv:
+            rem.main(["--notify"], workspace=ws)
+        sp.assert_called_once()
+        dv.assert_not_called()
+
+
 class ReminderSeesTheCard(unittest.TestCase):
     def _body(self, ws, m):
         out = _ask("Merge?", workspace=ws, host="h", default_action="merge", options=OPTIONS, manager=m)
@@ -463,21 +540,15 @@ class CrashBoundaries(unittest.TestCase):
         self.assertEqual(store.status_of(out["ask_id"]), "Answered")
         self.assertTrue(room_db.ack_click(self.ws, out["ask_id"], m)[0], "the choice can still be acked")
 
-    def test_a_claim_another_live_process_holds_is_skipped(self):
+    def test_a_claim_naming_a_live_pid_is_replayed_never_skipped(self):
         store, out, m = self.clicked()
         holder = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
         self.addCleanup(holder.kill)
-        ask.stamp_card(m, out["card"], closing=f"{holder.pid}:abc")
-        self.assertEqual(room_db.clicks(self.ws, manager=m), [], "skipped, not cancelled")
-        self.assertEqual(m.get(out["card"]).status, STATUS_IN_PROGRESS)
-        holder.kill()
-        holder.wait()
+        ask.stamp_card(m, out["card"], closing=f"{holder.pid}:reused")  # a live (e.g. reused) pid
         [c] = room_db.clicks(self.ws, manager=m)
-        self.assertEqual((c["stale"], c["closed"]), (False, True), "a dead holder's claim is taken over")
-        self.assertFalse(room_db._held_by_live_other(True), "a legacy boolean claim is not a live holder")
-        self.assertFalse(room_db._held_by_live_other(f"{os.getpid()}:x"), "our own claim")
-        with mock.patch.object(room_db.os, "kill", side_effect=PermissionError):
-            self.assertTrue(room_db._held_by_live_other("1:x"), "a pid we may not signal is alive")
+        self.assertEqual((c["stale"], c["closed"], c["action_id"]), (False, True, "option-1"), c["close_message"])
+        self.assertIn("chose option-1 'Hold'", reader.click_line(c))
+        self.assertFalse(hasattr(room_db, "_held_by_live_other"), "no live-holder skip")
 
     def test_a_definite_card_failure_rewrites_the_row_so_the_reminder_does_not_reask(self):
         store, _ = room_db.room_store(self.ws)

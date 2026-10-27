@@ -107,7 +107,11 @@ The limit: nothing here can see the DM. If the gateway never posts the card (it 
 it), the owner is not asked by this skill until he reads the card: the reminder never sends text
 while the question's card is live (pending or clicked), posted or not, nor when the store cannot
 say. The card's own follow-ups are the HITL renotify's. When the gateway posted it, the question's
-last-asked time is the gateway's `notified_at`. Only a card that is gone (never stored, or settled
+last-asked time is the gateway's `notified_at`. A live card with no post recorded 30 minutes
+(`CARD_POINTER_GRACE_SEC`) after it was stored gets a text pointer when the reminder runs, once
+per card (recorded on the card, so a gateway that stays down is not repeated): it says the question is waiting as a card in his AG2 Space DM and may not
+have arrived, and quotes the question's title. It carries no options and no approve wording, and
+says a reply does not answer it; the card stays the only place he chooses. Only a card that is gone (never stored, or settled
 without closing the row) leaves the question due, and the reminder then texts it, when it runs;
 nothing is scheduled.
 
@@ -124,8 +128,9 @@ choice (`(replayed: not acknowledged yet)`) rather than losing it. The claim (`c
 on the card before the row is closed, so a run that dies between the close and its record finds
 the row closed by code, not by the owner, and replays the choice instead of calling it stale.
 `clicks` and `ack` run under one exclusive lock beside the HITL store
-(`state/hitl/pending-questions-clicks.lock`), and the claim is a `pid:nonce` token: a claim another
-live process holds is skipped, never cancelled; a dead holder's claim is taken over.
+(`state/hitl/pending-questions-clicks.lock`), and the claim is a `pid:nonce` token. Under that lock
+any claim already on a card is a run that did not finish: it is replayed, never skipped (a pid can
+be reused, or unsignalable).
 
 A click on a row already closed, by code or by the owner's own Status, is reported as "already
 answered — not a decision" (`stale`) and its card is cancelled. A close that could not be recorded

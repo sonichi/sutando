@@ -403,27 +403,14 @@ def _claim_token() -> str:
     return f"{os.getpid()}:{os.urandom(6).hex()}"
 
 
-def _held_by_live_other(token) -> bool:
-    """A claim another live process stamped (pid:nonce); a bare legacy flag or a dead pid is not."""
-    pid, sep, _ = str(token or "").partition(":")
-    if not sep or not pid.isdigit() or int(pid) == os.getpid():
-        return False
-    try:
-        os.kill(int(pid), 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
-
-
 def clicks(workspace: Path, manager=None, closer=None) -> list:
     """Close the row of every question card the owner clicked (Answered); the card stays claimed
     until `ack_click`, so a run that dies before the core acts replays the same choice.
     The whole pass runs under one exclusive lock beside the HITL store, so two readers never act
     on the same snapshot. The claim (`closing`, a pid:nonce token) is stamped on the card BEFORE
     the close: a run that dies between the close and its `row_closed` stamp finds the row closed
-    by code and replays the choice; a claim another live process holds is skipped, never cancelled.
+    by code and replays the choice. Under the lock any existing claim is this click's own, from a
+    run that did not finish: it is replayed, never skipped (a pid can be reused or unsignalable).
     One dict per click, oldest first, with `closed`, `close_message` and the flags the core reads:
     `stale` — the row was closed already, by the owner's own Status or by code without this
     click's claim (one guarded write), so the click is NOT a decision and its card is cancelled;
@@ -441,8 +428,6 @@ def clicks(workspace: Path, manager=None, closer=None) -> list:
             if click["row_closed"]:
                 out.append({**click, "closed": True, "stale": False, "replay": True,
                             "close_message": "closed by this click on an earlier run; not acknowledged yet"})
-                continue
-            if _held_by_live_other(click["closing"]):
                 continue
             claimed = bool(click["closing"])
             core_ask.stamp_card(manager, click["hitl_id"], closing=_claim_token())

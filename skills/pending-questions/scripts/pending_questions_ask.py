@@ -50,6 +50,8 @@ from util_paths import host_label
 CARD_RUNTIME = "pending-questions"
 # The only bridge that projects HITL cards (to the owner's DM).
 CARD_BRIDGE = "ag2space"
+# A live card with no post recorded this long after it was stored gets one text pointer, ever.
+CARD_POINTER_GRACE_SEC = 1800
 # A question queued and drained this recently is not re-raised by the reminder.
 SENT_QUIET_SEC = 3600
 # Grammar of the queue record; the reminder reads it back.
@@ -163,6 +165,45 @@ def sent_at(body: str, workspace: Optional[Path] = None) -> Optional[float]:
         if state == "live" and pj.get("notified_at"):
             return float(pj["notified_at"])
     return c[1]
+
+
+def card_pointer_body(title: str, host: str) -> str:
+    """A pointer to the card, never a decision surface: no options, nothing a reply answers."""
+    return (f"[dm-only]\nA question from the {host} core is waiting for you as a decision card in your "
+            "AG2 Space DM, and it may not have arrived there.\n\n"
+            f"\u201c{' '.join(neutralize_markers(title or '').split())}\u201d\n\n"
+            "Open that card to choose; a reply to this message does not answer it.\n")
+
+
+def send_card_pointers(questions, workspace: Path, now: Optional[float] = None, manager=None,
+                       host: Optional[str] = None) -> list:
+    """For each question whose card is live, has no post recorded and is older than
+    CARD_POINTER_GRACE_SEC, queue one text pointer to the owner's DM — once per card, recorded
+    durably on the card (`pointer_at`, the store's fsynced save) after the file is queued, so a
+    gateway that stays down is not repeated. Never raises: [(ask_id, proactive file | error)]."""
+    now = time.time() if now is None else now
+    out = []
+    for q in questions:
+        c = card_sent(q.get("body", ""))
+        if c is None:
+            continue
+        try:
+            if manager is None:
+                from hitl.cards import manager_for  # noqa: PLC0415
+                manager = manager_for(Path(workspace))
+            req = manager.get(c[0])
+            if req is None or req.terminal or manager.store.projection(c[0]).get("revision", 0) > 0:
+                continue
+            if (req.subject or {}).get("pointer_at") or now - req.created_at < CARD_POINTER_GRACE_SEC:
+                continue
+            name = proactive_filename(f"{q.get('ask_id') or c[0]}-pointer-{int(now)}", None)
+            write_proactive(Path(workspace) / "results", name, card_pointer_body(q.get("title", ""),
+                                                                               host or host_label()))
+            stamp_card(manager, c[0], pointer_at=now)
+            out.append((q.get("ask_id"), name))
+        except Exception as e:  # noqa: BLE001
+            out.append((q.get("ask_id"), f"FAILED — {type(e).__name__}: {e}"))
+    return out
 
 
 def drained(results_dir: Path, name: str) -> bool:
