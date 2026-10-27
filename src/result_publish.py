@@ -91,7 +91,9 @@ def _helpers():
     try:
         from . import local_task_protocol, result_markers, task_archive
     except ImportError:
-        import local_task_protocol, result_markers, task_archive
+        import local_task_protocol
+        import result_markers
+        import task_archive
     return local_task_protocol, result_markers, task_archive
 
 
