@@ -184,18 +184,13 @@ def reconcile_pass(workspace: Path, environ=None) -> dict:
     """The explicit pass: {"flushed", "closed", "moved", "errors"}; without a store, one error."""
     from util_paths import host_label
     ws = Path(workspace)
-    texted = core_ask.unshown_cards_as_text(ws)
     store, where = room_store(ws, environ)
     if store is None:
-        rec = {"flushed": [], "closed": [], "moved": [], "errors": [f"room database: not used ({where})"]}
-    else:
-        try:
-            rec = reconcile_pending(store, ws, host_label())
-        except Exception as e:  # noqa: BLE001
-            rec = {"flushed": [], "closed": [], "moved": [], "errors": [f"{type(e).__name__}: {e}"]}
-    rec["errors"] = list(rec.get("errors") or []) + [f"unshown card as text: {t['error']}" for t in texted if "error" in t]
-    rec["texted"] = [t for t in texted if "error" not in t]
-    return rec
+        return {"flushed": [], "closed": [], "moved": [], "errors": [f"room database: not used ({where})"]}
+    try:
+        return reconcile_pending(store, ws, host_label())
+    except Exception as e:  # noqa: BLE001
+        return {"flushed": [], "closed": [], "moved": [], "errors": [f"{type(e).__name__}: {e}"]}
 
 
 def gather(workspace: Path, environ=None) -> dict:
@@ -378,12 +373,6 @@ def ask_owner(question: str, context: Optional[str] = None, urgency: str = "live
                 rec = reconcile_pending(store, ws, host)
             except Exception as e:  # noqa: BLE001
                 rec = {"flushed": [], "closed": [], "moved": [], "errors": [f"{type(e).__name__}: {e}"]}
-    texted = core_ask.unshown_cards_as_text(ws, host=host)
-    if texted:
-        rec = dict(rec or {"flushed": [], "closed": [], "moved": [], "errors": []})
-        rec["errors"] = list(rec.get("errors") or []) + [f"unshown card as text: {t['error']}"
-                                                         for t in texted if "error" in t]
-        rec["texted"] = [t for t in texted if "error" not in t]
     out["reconcile"] = rec
     if urgency == "live":
         out["macos"], out["macos_fix"] = core_ask.notify_macos(f"Question: {question}")
@@ -449,9 +438,6 @@ def report_lines(out: dict) -> list:
         lines.append(f"reconcile: applied {len(rec['closed'])} local close(s)")
     if rec.get("moved"):
         lines.append(f"reconcile: moved {len(rec['moved'])} legacy file entr(ies) into the database")
-    for t in rec.get("texted") or []:
-        lines.append(f"reconcile: card {t['hitl_id']} for [{t['ask_id']}] was never shown; asked as text "
-                     f"via results/{t['proactive_file']}")
     if out.get("history_error"):
         lines.append(f"history: FAILED — {out['history_error']}; the row landed, and its outbox entry is kept "
                      "until a reconcile commits the history")

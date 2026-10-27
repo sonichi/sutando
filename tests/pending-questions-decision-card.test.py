@@ -39,6 +39,20 @@ from hitl.schema import (Action, ActionReply, STATUS_CANCELLED, STATUS_IN_PROGRE
                          StaleRequirementError)
 
 OPTIONS = [("Hold", "wait for the CLA")]
+REAL_WAIT_SHOWN = ask.wait_shown
+
+
+def _gateway_posts(manager, hitl_id, *a, **k):
+    """Stands in for the gateway: records the card as posted, as `project()` does."""
+    req = manager.get(hitl_id)
+    manager.record_projection(hitl_id, req.revision, "$posted")
+    return True
+
+
+def setUpModule():
+    patcher = mock.patch.object(ask, "wait_shown", _gateway_posts)
+    patcher.start()
+    unittest.addModuleCleanup(patcher.stop)
 
 
 def _ws(last_active=None) -> Path:
@@ -177,14 +191,6 @@ class QueueQuestion(unittest.TestCase):
         self.assertEqual([(a.id, a.label) for a in req.actions], [("option-0", "8080"), ("option-1", "Hold")])
         self.assertNotIn("Approve", req.message)
 
-    def test_storing_a_card_is_reported_as_not_yet_shown(self):
-        ws = _ws("ag2space")
-        out = ask.queue_question("Merge?", workspace=ws, host="h", default_action="merge",
-                                 options=OPTIONS, manager=_manager(ws))
-        sent = next(ln for ln in ask.report_lines(out) if ln.startswith("sent:"))
-        self.assertIn("STORED", sent)
-        self.assertIn("not yet shown", out["sent_line"])
-
     def test_no_options_and_no_default_stays_plain_text(self):
         ws = _ws("ag2space")
         out = ask.queue_question("What next?", workspace=ws, host="h", manager=_manager(ws))
@@ -211,41 +217,103 @@ class QueueQuestion(unittest.TestCase):
         self.assertTrue(any("asked as text instead" in ln for ln in ask.report_lines(out)))
 
 
-class UnshownCard(unittest.TestCase):
-    def _card(self):
+class WaitForThePost(unittest.TestCase):
+    def test_posted_in_time_asks_by_card_only(self):
         ws = _ws("ag2space")
         m = _manager(ws)
-        out = ask.queue_question("Merge #1?", workspace=ws, host="h", default_action="merge",
-                                 options=OPTIONS, manager=m)
-        return ws, m, out, m.get(out["card"])
+        ticks = iter([0.0, 0.0, 1.0])
 
-    def test_a_card_never_shown_within_the_grace_is_asked_as_text_once(self):
-        ws, m, out, req = self._card()
-        self.assertEqual(ask.unshown_cards_as_text(ws, m, now=req.created_at + 10, host="h"), [], "inside the grace")
-        self.assertEqual(_proactive(ws), [])
-        done = ask.unshown_cards_as_text(ws, m, now=req.created_at + ask.CARD_SHOW_GRACE_SEC, host="h")
-        self.assertEqual([(d["ask_id"], d["hitl_id"]) for d in done], [(out["ask_id"], req.id)])
-        files = _proactive(ws)
-        self.assertEqual(files, [done[0]["proactive_file"]])
-        body = (ws / "results" / files[0]).read_text()
-        self.assertIn("Merge #1?", body)
-        self.assertIn("was not shown", body)
-        self.assertEqual(ask.unshown_cards_as_text(ws, m, now=req.created_at + 9999, host="h"), [], "once per card")
-        self.assertEqual(m.get(req.id).status, "pending", "the card stays answerable")
+        def sleep(_):
+            req = m.store.all()[0]
+            m.record_projection(req.id, req.revision, "$ev")
 
-    def test_a_shown_card_is_never_doubled_as_text(self):
-        ws, m, out, req = self._card()
-        m.record_projection(req.id, req.revision, "$event")
-        self.assertEqual(ask.unshown_cards_as_text(ws, m, now=req.created_at + 9999, host="h"), [])
-        self.assertEqual(_proactive(ws), [])
+        with mock.patch.object(ask, "wait_shown",
+                               lambda mgr, hid: REAL_WAIT_SHOWN(mgr, hid, 30, sleep, lambda: next(ticks))):
+            out = ask.queue_question("Merge?", workspace=ws, host="h", default_action="merge",
+                                     options=OPTIONS, manager=m)
+        self.assertTrue(out["card"])
+        self.assertEqual(_proactive(ws), [], "card only")
+        self.assertIn(f"**Sent:** card {out['card']} shown in", out["sent_line"])
+        self.assertIsNotNone(ask.card_sent(out["sent_line"]))
+        self.assertTrue(any(ln.startswith("sent: decision card") for ln in ask.report_lines(out)))
 
-    def test_reconcile_runs_the_fallback_even_with_no_room(self):
-        ws, m, out, req = self._card()
-        with mock.patch.object(ask, "CARD_SHOW_GRACE_SEC", 0), \
-                mock.patch.object(room_db, "room_store", return_value=(None, "no room")):
-            rec = room_db.reconcile_pass(ws)
-        self.assertEqual([t["ask_id"] for t in rec["texted"]], [out["ask_id"]])
-        self.assertEqual(len(_proactive(ws)), 1)
+    def test_not_posted_in_time_withdraws_the_card_and_sends_the_text_once(self):
+        ws = _ws("ag2space")
+        m = _manager(ws)
+        clock = iter([0.0, 10.0, 31.0])
+        slept = []
+        with mock.patch.object(ask, "wait_shown",
+                               lambda mgr, hid: REAL_WAIT_SHOWN(mgr, hid, 30, slept.append, lambda: next(clock))):
+            out = ask.queue_question("Merge?", workspace=ws, host="h", default_action="merge",
+                                     options=OPTIONS, manager=m)
+        self.assertEqual(len(slept), 1)
+        self.assertIsNone(out["card"])
+        self.assertIn("not posted within 30s; withdrawn", out["card_error"])
+        self.assertEqual(_proactive(ws), [out["proactive_file"]], "the text, once")
+        [req] = m.store.all()
+        self.assertEqual(req.status, STATUS_CANCELLED)
+        self.assertFalse(m.needs_projection(req.id), "the withdrawn card is never posted")
+        self.assertTrue(any("asked as text instead" in ln for ln in ask.report_lines(out)))
+
+    def test_a_card_posted_while_being_withdrawn_reads_cancelled(self):
+        ws = _ws("ag2space")
+        m = _manager(ws)
+
+        def late(mgr, hid):
+            _gateway_posts(mgr, hid)
+            return False
+        with mock.patch.object(ask, "wait_shown", late):
+            out = ask.queue_question("Merge?", workspace=ws, host="h", default_action="merge",
+                                     options=OPTIONS, manager=m)
+        self.assertIn("posted meanwhile", out["card_error"])
+        self.assertTrue(out["proactive_file"])
+        self.assertTrue(m.needs_projection(m.store.all()[0].id), "the posted card is edited to cancelled")
+
+    def test_a_projection_ledger_that_cannot_be_read_is_not_a_post(self):
+        ws = _ws("ag2space")
+        with mock.patch.object(ask, "wait_shown", side_effect=OSError("store gone")):
+            out = ask.queue_question("Merge?", workspace=ws, host="h", default_action="merge",
+                                     options=OPTIONS, manager=_manager(ws))
+        self.assertIn("not confirmed posted", out["card_error"])
+        self.assertTrue(out["proactive_file"])
+
+    def test_the_real_wait_returns_at_once_when_posted(self):
+        ws = _ws()
+        m = _manager(ws)
+        req = cards.create_choice("q", [("a", "A")], "g", {}, runtime="rt", manager=m)
+        m.record_projection(req.id, req.revision, "$ev")
+        self.assertTrue(REAL_WAIT_SHOWN(m, req.id, sleep=lambda _: self.fail("no wait")))
+        self.assertFalse(REAL_WAIT_SHOWN(m, "hitl_missing0000", timeout=0))
+
+
+class ReminderSeesTheCard(unittest.TestCase):
+    def test_a_carded_question_is_a_recent_send(self):
+        ws = _ws("ag2space")
+        out = ask.queue_question("Merge?", workspace=ws, host="h", default_action="merge",
+                                 options=OPTIONS, manager=_manager(ws))
+        body = "# Request\n\nMerge?\n\n# Delivery\n\n" + out["sent_line"] + "\n"
+        shown = ask.card_sent(body)
+        self.assertTrue(ask.asked_recently(body, ws / "results", now=shown + 60))
+        self.assertFalse(ask.asked_recently(body, ws / "results", now=shown + ask.SENT_QUIET_SEC))
+        self.assertEqual(ask.sent_at(body), shown)
+
+    def test_the_reminder_does_not_resend_a_carded_question(self):
+        rem_spec = importlib.util.spec_from_file_location("pq_remind_t", PQ / "pending_questions_remind.py")
+        rem = importlib.util.module_from_spec(rem_spec)
+        rem_spec.loader.exec_module(rem)
+        ws = _ws("ag2space")
+        out = ask.queue_question("Merge?", workspace=ws, host="h", default_action="merge",
+                                 options=OPTIONS, manager=_manager(ws))
+        fresh = {"ask_id": out["ask_id"], "title": "Merge?", "body": out["sent_line"]}
+        old = {"ask_id": "ask-old", "title": "Old?",
+               "body": "**Sent:** card hitl_0123456789ab shown in ag2space owner-dm (decision card) at 2020-01-01T00:00:00Z"}
+        self.assertTrue(ask.asked_recently(fresh["body"], ws / "results"))
+        self.assertFalse(ask.asked_recently(old["body"], ws / "results"))
+        self.assertIs(rem.asked_recently, ask.asked_recently, "the reminder uses this check")
+
+    def test_a_malformed_card_stamp_is_no_stamp(self):
+        self.assertIsNone(ask.card_sent("**Sent:** card hitl_x shown in ag2space at 2026-13-99T99:99:99Z"))
+        self.assertIsNone(ask.card_sent("no record"))
 
 
 class Clicks(unittest.TestCase):
@@ -461,40 +529,6 @@ class EdgePaths(unittest.TestCase):
                                      options=OPTIONS, manager=_manager(ws))
         self.assertIn("results gone", out["send_error"])
 
-    def test_unshown_fallback_errors_are_reported_not_raised(self):
-        ws = _ws("ag2space")
-        m = _manager(ws)
-        out = ask.queue_question("Merge?", workspace=ws, host="h", default_action="merge",
-                                 options=OPTIONS, manager=m)
-        with mock.patch.object(m, "active", side_effect=OSError("store gone")):
-            self.assertIn("store gone", ask.unshown_cards_as_text(ws, m)[0]["error"])
-        with mock.patch.object(ask, "write_proactive", side_effect=OSError("results gone")):
-            [t] = ask.unshown_cards_as_text(ws, m, now=time.time() + 9999, host="h")
-        self.assertEqual((t["ask_id"], "results gone" in t["error"]), (out["ask_id"], True))
-
-    def test_the_ask_and_pq_reconcile_report_a_text_fallback(self):
-        ws = _ws("ag2space")
-        m = _manager(ws)
-        ask.queue_question("Merge?", workspace=ws, host="h", default_action="merge", options=OPTIONS, manager=m)
-        with mock.patch.object(ask, "CARD_SHOW_GRACE_SEC", 0), \
-                mock.patch.object(ask, "card_reaches_owner", return_value=False), \
-                mock.patch.object(ask, "write_proactive", wraps=ask.write_proactive):
-            out = room_db.ask_owner("Other?", urgency="durable", workspace=ws, host="h", store=None)
-        lines = room_db.report_lines(out)
-        self.assertTrue(any("was never shown; asked as text" in ln for ln in lines), lines)
-        spec = importlib.util.spec_from_file_location("pq_cli_r", PQ / "pq.py")
-        pq = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(pq)
-        rec = {"flushed": [], "closed": [], "moved": [], "errors": [],
-               "texted": [{"hitl_id": "hitl_1", "ask_id": "a1", "proactive_file": "proactive-a1-text.txt"}]}
-        import contextlib
-        import io
-        buf = io.StringIO()
-        with mock.patch.object(room_db, "reconcile_pass", return_value=rec), contextlib.redirect_stdout(buf):
-            pq.main(["reconcile", "--workspace", str(ws)])
-        self.assertIn("was never shown; asked as text", buf.getvalue())
-
-
 class OutboxFailure(unittest.TestCase):
     def test_a_card_whose_question_cannot_be_held_is_withdrawn_and_asked_as_text(self):
         ws = _ws("ag2space")
@@ -507,7 +541,7 @@ class OutboxFailure(unittest.TestCase):
         self.assertEqual(_proactive(ws), [out["proactive_file"]], "asked as text instead")
         [req] = [r for r in m.store.all() if r.runtime == ask.CARD_RUNTIME]
         self.assertEqual(req.status, STATUS_CANCELLED)
-        self.assertFalse(m.needs_projection(req.id), "an unshown card is never posted")
+        self.assertTrue(m.needs_projection(req.id), "the posted card is edited to cancelled")
 
     def test_withdrawing_a_shown_card_still_projects_the_cancellation(self):
         ws = _ws()

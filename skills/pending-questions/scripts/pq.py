@@ -95,9 +95,6 @@ def cmd_reconcile(args: list) -> int:
     rec = adapter.reconcile_pass(_workspace(opts.workspace))
     for err in rec["errors"]:
         print(f"reconcile: FAILED — {err}")
-    for t in rec.get("texted") or []:
-        print(f"reconcile: card {t['hitl_id']} for [{t['ask_id']}] was never shown; asked as text "
-              f"via results/{t['proactive_file']}")
     print(f"reconcile: filed {len(rec['flushed'])} held, applied {len(rec['closed'])} local close(s), "
           f"moved {len(rec['moved'])} legacy entr(ies)")
     return 1 if rec["errors"] else 0
