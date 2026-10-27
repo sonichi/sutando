@@ -168,6 +168,8 @@ When you need the owner's word or are blocked:
 
 `python3 src/pending_questions_reader.py list` is read-only, only when the owner asks or you are blocked; `… resolve <id>` when he answers. `python3 src/check-pending-questions.py` reconciles and lists; `--notify` reminds, on demand only; nothing is scheduled or surfaced per pass.
 
+With `--default` or `--option`, a question bound for AG2 Space is asked as a decision card, not text. His click arrives as a task headed `hitl_click: true` whose body is the button label: run `python3 src/pending_questions_reader.py clicks` (it closes each clicked question's row and prints the choice), act on it, and answer `[no-send]`.
+
 ## Task progress notifications
 
 **Call notify BEFORE doing any work** — the notification must be the first thing the user sees

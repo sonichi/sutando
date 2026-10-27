@@ -16,7 +16,8 @@ its held entry; a held entry with no row waits (not yet in the room), or is done
 locally; a local close naming neither is `pending_close`. `unavailable: True` and `done: None`
 when the room cannot be read — never a zero. `reconcile_pass(workspace)` is the explicit pass
 (outbox replay, local closes, stale marks, the transitional legacy ingest, the history
-backfill); `ask_owner` queues and holds its new question before room work, then reconciles after
+backfill); `ask_owner` asks (a decision card when options or a default are given and the question
+is bound for AG2 Space, else text), holds its new question before room work, then reconciles after
 its row is confirmed, and writes no row when
 the outbox could not hold the question; a confirmed row commits the history marker BEFORE
 its outbox entry is deleted, and keeps the entry when that commit fails. `resolve` closes
@@ -24,7 +25,8 @@ the row (committing the history marker first when the row is in view and the mar
 a marker that cannot be written leaves the row open and records the close locally), else
 records the closure locally for the next reconcile — only for a question held in the outbox,
 or in outage mode once a row of this workspace was ever confirmed; an unknown id with neither
-is refused and changes no count. `remind` is the reminder.
+is refused and changes no count. `clicks` closes, through `resolve`, the row of each question
+card the owner clicked and returns the decisions. `remind` is the reminder.
 
 `serve` answers one pending_questions_store.DbClient request (JSON on stdin) over
 one connection to the room's databases document, writing only the DATABASE.md
@@ -66,6 +68,8 @@ SETTLE_SEC = 1.0
 ROOM_KEY = "PENDING_QUESTIONS_ROOM"
 # The collab service URL; set, it overrides the capability's own resolution (an outage rehearsal).
 URL_KEY = "PENDING_QUESTIONS_COLLAB_URL"
+# `resolve`'s answer when the room saw the row and refused the close (closed already, no such row).
+REFUSED_PREFIX = "room database: not changed"
 
 
 def skill_scripts(workspace: Path) -> Optional[Path]:
@@ -292,7 +296,7 @@ def resolve(workspace: Path, ask_id: str, status: str) -> tuple:
     except GuardFailed as g:
         if not g.current and any(e["ask_id"] == ask_id for e in Outbox(ws).entries()):
             return _close_locally(ws, ask_id, status, "its held entry has no row yet")
-        return False, f"room database: not changed — {type(g).__name__}: {g}"
+        return False, f"{REFUSED_PREFIX} — {type(g).__name__}: {g}"
     except Exception as e:  # noqa: BLE001
         return _close_locally(ws, ask_id, status, f"room database unreachable ({type(e).__name__}: {e})")
 
@@ -324,7 +328,7 @@ def ask_owner(question: str, context: Optional[str] = None, urgency: str = "live
                                   default_action, reason, options, priority)
     out.update({"reconcile": rec, "record": None, "db_error": out["outbox_error"], "link": link,
                 "macos": None, "macos_fix": None, "history_error": None})
-    if out["proactive_file"] and intro:
+    if (out["proactive_file"] or out["card"]) and intro:
         try:
             mark_room_introduced(ws, out["ask_id"])
         except OSError as e:
@@ -354,6 +358,26 @@ def ask_owner(question: str, context: Optional[str] = None, urgency: str = "live
     out["reconcile"] = rec
     if urgency == "live":
         out["macos"], out["macos_fix"] = core_ask.notify_macos(f"Question: {question}")
+    return out
+
+
+def clicks(workspace: Path, manager=None, closer=None) -> list:
+    """Close the row of every question card the owner clicked, through `resolve` (Answered), and
+    settle its card once the close is recorded (in the room or locally) or the room refuses it
+    (the row is closed already); a close that could not be recorded at all leaves the card in
+    progress for the next run. Returns one dict per click, oldest first: the decision the core
+    acts on, plus `closed` and `message`."""
+    ws = Path(workspace)
+    if manager is None:
+        from hitl.cards import manager_for  # noqa: PLC0415
+        manager = manager_for(ws)
+    closer = closer or resolve
+    out = []
+    for click in core_ask.answered_cards(manager):
+        ok, msg = closer(ws, click["ask_id"], "Answered")
+        if ok or msg.startswith(REFUSED_PREFIX):
+            manager.resolve(click["hitl_id"])
+        out.append({**click, "closed": ok, "message": msg})
     return out
 
 

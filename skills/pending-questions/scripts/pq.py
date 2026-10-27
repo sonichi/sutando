@@ -7,10 +7,12 @@
   pq.py reconcile                  # the explicit pass: outbox replay, local closes, legacy ingest
   pq.py resolve <ask-id> [--answered]
   pq.py remind [--force]           # the reminder (--notify) through src/check-pending-questions.py
+  pq.py clicks [--json]            # the owner's decision-card clicks: close each row, print the choice
 
 Every verb delegates: `ask` to scripts/ask-owner.py with this skill's adapter injected,
 `list`, `reconcile` and `resolve` to the sibling room-database adapter (the one reader
-and writer), `remind` to the reminder entry with that adapter injected.
+and writer), `remind` to the reminder entry and `clicks` to core's reader entry, each with that
+adapter injected.
 """
 from __future__ import annotations
 
@@ -109,12 +111,18 @@ def cmd_resolve(args: list) -> int:
     return 0 if ok else 1
 
 
+def cmd_clicks(args: list) -> int:
+    import pending_questions_reader as reader  # noqa: PLC0415 — the core contract prints the choices
+    return reader.main(["clicks", *_with_adapter(args)])
+
+
 def cmd_remind(args: list) -> int:
     args = args if "--notify" in args else ["--notify", *args]
     return subprocess.run([sys.executable, str(REMINDER), *_with_adapter(args)]).returncode
 
 
-VERBS = {"ask": cmd_ask, "list": cmd_list, "reconcile": cmd_reconcile, "resolve": cmd_resolve, "remind": cmd_remind}
+VERBS = {"ask": cmd_ask, "list": cmd_list, "reconcile": cmd_reconcile, "resolve": cmd_resolve,
+         "remind": cmd_remind, "clicks": cmd_clicks}
 
 
 def main(argv=None) -> int:

@@ -17,10 +17,15 @@ does, on demand; the two are the adapter's separate entry points). Never read an
 (False, why) and records nothing — the caller keeps the answer it holds (agent-api files the
 answer task before it asks for the close).
 
+`clicks` returns the owner's decision-card choices ([{ask_id, label, closed, message, ...}]) after
+the adapter closed each clicked question's row; with no adapter, or one without `clicks`, it is
+(None, why) and nothing is closed.
+
 CLI, for shell readers: `python3 src/pending_questions_reader.py list [--json] | count | summary`
 (`summary` is the count and where the questions live, never their text); and the
-one write a core caller makes through the same contract, `resolve <ask-id> [--answered]`
-(Resolved, or Answered), which is `resolve` above and nothing else. `--store-adapter <path>`
+writes a core caller makes through the same contract: `resolve <ask-id> [--answered]`
+(Resolved, or Answered), which is `resolve` above and nothing else, and `clicks [--json]`, run on
+a `hitl_click: true` task, which is `clicks` above. `--store-adapter <path>`
 injects an adapter file in place of the declared one.
 """
 from __future__ import annotations
@@ -191,6 +196,19 @@ def resolve(workspace, ask_id: str, status: str, adapter=None) -> tuple:
         return False, f"not closed: adapter failed ({type(e).__name__}: {e}); nothing records the close"
 
 
+def clicks(workspace, adapter=None) -> tuple:
+    """(choices, None), or (None, why) when there is no adapter or it cannot take the clicks."""
+    mod, why = _adapter(adapter)
+    if mod is None:
+        return None, f"no store: {why}"
+    if not hasattr(mod, "clicks"):
+        return None, f"adapter {why} takes no card clicks"
+    try:
+        return mod.clicks(Path(workspace)), None
+    except Exception as e:  # noqa: BLE001
+        return None, f"adapter failed ({type(e).__name__}: {e})"
+
+
 def _norm_title(text: str) -> str:
     from result_markers import neutralize_markers  # noqa: PLC0415 — the rows' title rule
     return " ".join(neutralize_markers(text or "").split())[:120].casefold()
@@ -228,8 +246,8 @@ def unknown_line(g: dict) -> str:
 def main(argv=None) -> int:
     import argparse  # noqa: PLC0415
     ap = argparse.ArgumentParser(description="List or count the owner's pending questions (read-only), "
-                                 "or resolve one through the declared store.")
-    ap.add_argument("command", choices=("list", "count", "summary", "resolve"))
+                                 "or resolve one, or apply card clicks, through the declared store.")
+    ap.add_argument("command", choices=("list", "count", "summary", "resolve", "clicks"))
     ap.add_argument("ask_id", nargs="?", default=None, help="resolve: the question's ask id")
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--answered", action="store_true", help="resolve: mark it Answered, not Resolved")
@@ -247,6 +265,19 @@ def main(argv=None) -> int:
         ok, msg = resolve(args.workspace, args.ask_id, "Answered" if args.answered else "Resolved", store)
         print(msg)
         return 0 if ok else 1
+    if args.command == "clicks":
+        done, why = clicks(args.workspace, store)
+        if done is None:
+            print(f"clicks: not read — {why}")
+            return 1
+        if args.json:
+            print(json.dumps(done, ensure_ascii=False, indent=1))
+        elif not done:
+            print("no question-card clicks waiting")
+        for c in [] if args.json else done:
+            print(f"- [{c['ask_id']}] chose {c['label']!r} — {' '.join(c['question'].split())[:120]}")
+            print(f"    {c['message']}")
+        return 0 if all(c["closed"] for c in done) else 1
     g = gather(args.workspace, store)
     for note in g["notes"]:
         print(note, file=sys.stderr)

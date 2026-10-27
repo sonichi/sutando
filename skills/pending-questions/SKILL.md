@@ -26,6 +26,7 @@ python3 skills/pending-questions/scripts/pq.py list [--json]
 python3 skills/pending-questions/scripts/pq.py reconcile
 python3 skills/pending-questions/scripts/pq.py resolve <ask-id> [--answered]
 python3 skills/pending-questions/scripts/pq.py remind [--force]
+python3 skills/pending-questions/scripts/pq.py clicks [--json]
 ```
 
 **Trigger: any time you would write a question for the owner into terminal or summary text, file
@@ -76,6 +77,28 @@ count (`python3 src/pending_questions_reader.py summary`).
 - `remind` is the only way a reminder is sent (`src/check-pending-questions.py --notify`
   with this skill's adapter). Nothing is scheduled, and no pass surfaces questions: the
   owner is asked once, as questions come up, and reminded when he asks.
+
+## Decision cards
+
+A question asked with `--default-action` and/or `--option` whose destination is AG2 Space (its
+task's bridge, else the bridge the owner was last active on) is asked as a decision card, not
+text: `queue_question` creates a `choice` HITL request (`src/hitl/cards.py`, the one builder every
+card producer uses) with runtime `pending-questions`, guard and `subject.ask_id` set to the ask id,
+one button per `ordered_options()` entry (Approve first) and `turn_on_action`. The AG2 Space
+gateway projects it to the owner's DM. No text ask is queued; the text is only the fallback when
+the card cannot be stored (`note: decision card not created …` in the report), and every other
+bridge still gets text, since only that gateway projects cards. The row's `**Sent:**` record names
+the card (`**Sent:** card hitl_… to ag2space owner-dm (decision card) at …`), so a reminder asks it
+again as text.
+
+The click is owner-checked and recorded by the bridge (`chosen_action`), and with `turn_on_action`
+the same relay task reaches the core headed `hitl_click: true`, its body the button label. That
+header is how the core recognises it: it runs `python3 src/pending_questions_reader.py clicks`
+(`pq.py clicks` is the same), which reaches this adapter's `clicks`; that finds every `pending-questions`
+card in progress with a chosen action, closes its row as Answered through `resolve` (so a room
+outage records the close locally like any other), settles the card, and prints
+`[<ask-id>] chose '<label>'`; the core acts on that choice and answers `[no-send]`. A close that
+could not be recorded at all leaves the card in progress for the next run.
 
 ## The outbox
 
