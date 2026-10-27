@@ -6,6 +6,8 @@ then the channel .env files (`AGENT_MXID`, `AGENT_ID`, `AG2SPACE_USER_ID`), then
 install derives its root from exactly the identity the bridge will report. A launcher that has
 decided the identity sets `PINNED_KEY` (see `launch_environ`): the chain is then `AGENT_MXID` alone,
 so the bridge runs as the launcher's saved identity or as none, never one a file or binding supplies.
+`host_enrolled` is the install's own id for its Stand: those file and binding tiers, set only when
+every value present agrees.
 A .env file's lines are parsed by the credential owner, gateway_credential_sources. Stdlib only.
 
 `publish_lane` is the one writer of `<state>/auth/lane-identity[.<instance>].json`: the id the live
@@ -35,6 +37,7 @@ from pathlib import Path
 
 from . import bounded_file_read
 from . import gateway_credential_sources as _sources
+from . import gateway_credential_io
 from .outbox import valid_pid
 from .persisted_number import bounded_number
 from .gateway_instance import suffix as _instance_suffix
@@ -359,6 +362,27 @@ def resolve(state_dir, channel_value, environ=None, strict=None) -> str:
         if v:
             return v
     return "" if strict else enrolled(state_dir)
+
+
+def host_enrolled(state_dir, environ=None) -> str:
+    """This install's own agent id from its own records: the channel .env tier (FILE_KEYS, in every
+    file the bridge reads) and the binding. Never the process env, which is the caller's, not the
+    install's. '' when none, when two values disagree, when a file or the binding exists but cannot
+    be read, or for a seat, whose files are another agent's."""
+    env = os.environ if environ is None else environ
+    if _sources.is_seat(env):
+        return ""
+    files = gateway_credential_io.channel_env_files(env)
+    if files.refused:
+        return ""
+    ids = {v.strip() for _path, vals in files for k in FILE_KEYS if (v := vals.get(k) or "").strip()}
+    binding = Path(state_dir) / "auth" / "ag2space.json" if state_dir is not None else None
+    if binding is not None and (binding.exists() or binding.is_symlink()):
+        bound = enrolled(state_dir)
+        if not bound:
+            return ""
+        ids.add(bound)
+    return next(iter(ids)) if len(ids) == 1 else ""
 
 
 def root_segment(agent_id: str) -> str:
