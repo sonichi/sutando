@@ -9,6 +9,11 @@ shared helper (src/hitl/cards.py) that every card producer uses; its click close
   no options, another bridge, or a card that cannot be stored -> the text ask;
 - a click maps back to its row through the ask id and closes it via `resolve`.
 """
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import ast
 import importlib.util
 import json
@@ -29,7 +34,8 @@ import pending_questions_room_db as room_db
 import pending_questions_reader as reader
 from hitl import cards
 from hitl.manager import HitlManager, HitlStore
-from hitl.schema import Action, ActionReply, STATUS_IN_PROGRESS, STATUS_RESOLVED
+from hitl.schema import (Action, ActionReply, STATUS_CANCELLED, STATUS_IN_PROGRESS, STATUS_RESOLVED,
+                         StaleRequirementError)
 
 OPTIONS = [("Hold", "wait for the CLA")]
 
@@ -206,16 +212,24 @@ class Clicks(unittest.TestCase):
         self.assertEqual(m.get(out["card"]).status, STATUS_RESOLVED)
         self.assertEqual(room_db.clicks(ws, manager=m, closer=closer), [], "reported once")
 
-    def test_a_row_the_room_refuses_to_close_still_settles_the_card(self):
+    def test_a_click_on_a_row_closed_already_is_stale_never_a_choice(self):
         ws, m, out = self._clicked("approve")
         done = room_db.clicks(ws, manager=m, closer=lambda *a: (False, f"{room_db.REFUSED_PREFIX} — closed already"))
-        self.assertEqual(done[0]["label"], "Approve")
-        self.assertEqual(m.get(out["card"]).status, STATUS_RESOLVED)
+        self.assertEqual((done[0]["label"], done[0]["stale"], done[0]["closed"]), ("Approve", True, False))
+        self.assertEqual(m.get(out["card"]).status, STATUS_CANCELLED)
+        line = reader.click_line(done[0])
+        self.assertNotIn("chose", line)
+        self.assertIn("already answered — not a decision", line)
 
-    def test_a_close_that_could_not_be_recorded_keeps_the_card_for_the_next_run(self):
+    def test_a_close_that_could_not_be_recorded_keeps_the_card_and_is_not_a_new_choice_next_run(self):
         ws, m, out = self._clicked()
-        room_db.clicks(ws, manager=m, closer=lambda *a: (False, "not recorded: nothing held"))
+        fail = lambda *a: (False, "not recorded: nothing held")  # noqa: E731
+        first = room_db.clicks(ws, manager=m, closer=fail)
         self.assertEqual(m.get(out["card"]).status, STATUS_IN_PROGRESS)
+        self.assertIn("chose", reader.click_line(first[0]))
+        again = room_db.clicks(ws, manager=m, closer=fail)
+        self.assertTrue(again[0]["reported_before"])
+        self.assertNotIn("chose", reader.click_line(again[0]))
 
     def test_the_real_resolve_records_the_close_locally_without_a_room(self):
         ws, m, out = self._clicked()
@@ -224,6 +238,40 @@ class Clicks(unittest.TestCase):
         self.assertTrue(done[0]["closed"], done[0]["message"])
         self.assertTrue((Path(out["outbox"]).parent / "closed" / f"{out['ask_id']}.json").is_file())
         self.assertEqual(m.get(out["card"]).status, STATUS_RESOLVED)
+
+    def test_an_answer_by_text_retires_the_card_so_a_late_click_is_refused(self):
+        ws = _ws("ag2space")
+        out = ask.queue_question("Merge?", workspace=ws, host="h", default_action="merge",
+                                 options=OPTIONS, manager=_manager(ws))
+        with mock.patch.object(room_db, "room_store", return_value=(None, "no room")):
+            ok, msg = room_db.resolve(ws, out["ask_id"], "Answered")
+        self.assertTrue(ok, msg)
+        self.assertIn("retired", msg)
+        m = _manager(ws)
+        req = m.get(out["card"])
+        self.assertEqual(req.status, STATUS_CANCELLED)
+        with self.assertRaises(StaleRequirementError):
+            m.apply_action(ActionReply(hitl_id=req.id, expected_revision=req.revision - 1,
+                                       action_id="approve", guard=req.guard))
+        self.assertEqual(room_db.clicks(ws, manager=m), [])
+
+    def test_core_resolve_retires_a_card_already_clicked(self):
+        ws, m, out = self._clicked()
+        adapter = str(PQ / "pending_questions_room_db.py")
+        loaded = reader.load_adapter(adapter)
+        with mock.patch.object(loaded, "room_store", return_value=(None, "no room")):
+            ok, msg = reader.resolve(ws, out["ask_id"], "Resolved", adapter)
+        self.assertTrue(ok, msg)
+        self.assertEqual(m.get(out["card"]).status, STATUS_CANCELLED)
+        self.assertEqual(ask.answered_cards(m), [], "the click is never handed to the core")
+
+    def test_a_refused_close_also_retires_the_card(self):
+        ws = _ws("ag2space")
+        out = ask.queue_question("Merge?", workspace=ws, host="h", default_action="merge",
+                                 options=OPTIONS, manager=_manager(ws))
+        with mock.patch.object(room_db, "_close_row", return_value=(False, f"{room_db.REFUSED_PREFIX} — closed")):
+            room_db.resolve(ws, out["ask_id"], "Answered")
+        self.assertEqual(_manager(ws).get(out["card"]).status, STATUS_CANCELLED)
 
     def test_other_runtimes_cards_are_not_this_skills(self):
         ws = _ws()

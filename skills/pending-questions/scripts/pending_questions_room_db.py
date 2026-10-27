@@ -271,7 +271,25 @@ def _close_locally(ws: Path, ask_id: str, status: str, why: str, basis: Optional
     return True, f"recorded locally as {status} in {p} ({why}; {basis}); the next reconcile applies it to the row"
 
 
-def resolve(workspace: Path, ask_id: str, status: str) -> tuple:
+def resolve(workspace: Path, ask_id: str, status: str, manager=None) -> tuple:
+    """`_close_row`, then the question's card is retired once the row is closed (or recorded
+    closed) or the room refuses the close, so no later click can read as a decision."""
+    ok, msg = _close_row(workspace, ask_id, status)
+    if ok or msg.startswith(REFUSED_PREFIX):
+        try:
+            if manager is None:
+                from hitl.cards import manager_for  # noqa: PLC0415
+                manager = manager_for(Path(workspace))
+            gone = core_ask.retire_cards(manager, ask_id)
+        except Exception as e:  # noqa: BLE001 — the row's close stands; a live card is only reported
+            msg += f"; its decision card could not be retired ({type(e).__name__}: {e})"
+        else:
+            if gone:
+                msg += f"; decision card {', '.join(gone)} retired"
+    return ok, msg
+
+
+def _close_row(workspace: Path, ask_id: str, status: str) -> tuple:
     """(closed, message): the row's Closed cell takes `status` (Answered or Resolved) after a
     reconcile files any held question; a store that cannot be written leaves a local close
     record instead. A row in view before the history marker was ever committed commits it
@@ -362,22 +380,27 @@ def ask_owner(question: str, context: Optional[str] = None, urgency: str = "live
 
 
 def clicks(workspace: Path, manager=None, closer=None) -> list:
-    """Close the row of every question card the owner clicked, through `resolve` (Answered), and
-    settle its card once the close is recorded (in the room or locally) or the room refuses it
-    (the row is closed already); a close that could not be recorded at all leaves the card in
-    progress for the next run. Returns one dict per click, oldest first: the decision the core
-    acts on, plus `closed` and `message`."""
+    """Close the row of every question card the owner clicked (Answered) and settle the card.
+    One dict per click, oldest first, with `closed`, `message` and two flags the core must read:
+    `stale` — the row was closed already (answered another way), so the click is NOT a decision
+    and its card is cancelled; `reported_before` — an earlier run handed this click over but
+    could not close the row, which stays in progress for the next run."""
     ws = Path(workspace)
     if manager is None:
         from hitl.cards import manager_for  # noqa: PLC0415
         manager = manager_for(ws)
-    closer = closer or resolve
+    closer = closer or _close_row
     out = []
     for click in core_ask.answered_cards(manager):
         ok, msg = closer(ws, click["ask_id"], "Answered")
-        if ok or msg.startswith(REFUSED_PREFIX):
+        stale = not ok and msg.startswith(REFUSED_PREFIX)
+        if ok:
             manager.resolve(click["hitl_id"])
-        out.append({**click, "closed": ok, "message": msg})
+        elif stale:
+            manager.cancel(click["hitl_id"])
+        else:
+            core_ask.mark_reported(manager, click["hitl_id"])
+        out.append({**click, "closed": ok, "stale": stale, "message": msg})
     return out
 
 

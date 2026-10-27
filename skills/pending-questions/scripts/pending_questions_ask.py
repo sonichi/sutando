@@ -247,8 +247,28 @@ def answered_cards(manager) -> list:
             continue
         label = next((a.label for a in req.actions if a.id == req.chosen_action), req.chosen_action)
         out.append({"hitl_id": req.id, "ask_id": (req.subject or {}).get("ask_id") or req.guard,
-                    "action_id": req.chosen_action, "label": label, "question": req.message})
+                    "action_id": req.chosen_action, "label": label, "question": req.message,
+                    "reported_before": bool((req.subject or {}).get("reported"))})
     return out
+
+
+def mark_reported(manager, hitl_id: str) -> None:
+    """A click already handed to the core: a later run reports it as such, not as a new choice."""
+    with manager.store.locked():
+        req = manager.get(hitl_id)
+        if req is not None and not req.terminal:
+            req.subject = {**(req.subject or {}), "reported": True}
+            manager.store.save(req)
+
+
+def retire_cards(manager, ask_id: str) -> list:
+    """Cancel every live card of this question (clicked or not); returns their ids."""
+    gone = []
+    for req in manager.active():
+        if req.runtime == CARD_RUNTIME and ((req.subject or {}).get("ask_id") or req.guard) == ask_id:
+            manager.cancel(req.id)
+            gone.append(req.id)
+    return gone
 
 
 def write_proactive(results: Path, name: str, body: str) -> Path:

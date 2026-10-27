@@ -17,8 +17,9 @@ does, on demand; the two are the adapter's separate entry points). Never read an
 (False, why) and records nothing — the caller keeps the answer it holds (agent-api files the
 answer task before it asks for the close).
 
-`clicks` returns the owner's decision-card choices ([{ask_id, label, closed, message, ...}]) after
-the adapter closed each clicked question's row; with no adapter, or one without `clicks`, it is
+`clicks` returns the owner's decision-card choices ([{ask_id, label, closed, stale, reported_before,
+message, ...}]) after the adapter closed each clicked question's row (a `stale` click, on a row
+answered another way, is not a decision); with no adapter, or one without `clicks`, it is
 (None, why) and nothing is closed.
 
 CLI, for shell readers: `python3 src/pending_questions_reader.py list [--json] | count | summary`
@@ -209,6 +210,16 @@ def clicks(workspace, adapter=None) -> tuple:
         return None, f"adapter failed ({type(e).__name__}: {e})"
 
 
+def click_line(c: dict) -> str:
+    """Only a fresh click reads as `chose`: a stale or already-reported one is never a new decision."""
+    q = " ".join(c["question"].split())[:120]
+    if c.get("stale"):
+        return f"- [{c['ask_id']}] already answered — not a decision (a late click on {c['label']!r}) — {q}"
+    if c.get("reported_before"):
+        return f"- [{c['ask_id']}] reported before, not a new decision ({c['label']!r}); its row is not closed yet — {q}"
+    return f"- [{c['ask_id']}] chose {c['label']!r} — {q}"
+
+
 def _norm_title(text: str) -> str:
     from result_markers import neutralize_markers  # noqa: PLC0415 — the rows' title rule
     return " ".join(neutralize_markers(text or "").split())[:120].casefold()
@@ -275,9 +286,9 @@ def main(argv=None) -> int:
         elif not done:
             print("no question-card clicks waiting")
         for c in [] if args.json else done:
-            print(f"- [{c['ask_id']}] chose {c['label']!r} — {' '.join(c['question'].split())[:120]}")
+            print(click_line(c))
             print(f"    {c['message']}")
-        return 0 if all(c["closed"] for c in done) else 1
+        return 0 if all(c["closed"] or c.get("stale") for c in done) else 1
     g = gather(args.workspace, store)
     for note in g["notes"]:
         print(note, file=sys.stderr)

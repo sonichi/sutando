@@ -95,10 +95,14 @@ The click is owner-checked and recorded by the bridge (`chosen_action`), and wit
 the same relay task reaches the core headed `hitl_click: true`, its body the button label. That
 header is how the core recognises it: it runs `python3 src/pending_questions_reader.py clicks`
 (`pq.py clicks` is the same), which reaches this adapter's `clicks`; that finds every `pending-questions`
-card in progress with a chosen action, closes its row as Answered through `resolve` (so a room
-outage records the close locally like any other), settles the card, and prints
-`[<ask-id>] chose '<label>'`; the core acts on that choice and answers `[no-send]`. A close that
-could not be recorded at all leaves the card in progress for the next run.
+card in progress with a chosen action, closes its row as Answered through `resolve`'s row close
+(so a room outage records the close locally like any other), settles the card, and prints
+`[<ask-id>] chose '<label>'`; the core acts only on such `chose` lines and answers `[no-send]`. A close that
+could not be recorded at all leaves the card in progress for the next run, and a later run reports
+it as "reported before", not as a new choice. `resolve` retires (cancels) the question's card
+whenever it closes the row or the room refuses the close, so an answer by text or by Status leaves
+no live card; a click on a card whose row was already closed is reported as "already answered —
+not a decision" (`stale`) and its card is cancelled.
 
 ## The outbox
 
