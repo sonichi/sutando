@@ -115,14 +115,20 @@ adapter's `clicks` (`scripts/pending_questions_clicks.py`):
   acknowledged" and never offered again; `clicks --due` (and so the health check) surfaces it.
 - **The lease** (`scripts/pending_questions_lease.py`) counts elapsed time, not wall-clock
   deadlines. Invariant: it expires exactly when the time credited to it reaches its window
-  (`HANDED_LEASE_SEC`, 600 s), and each pass credits `clamp(now - observed_at, 0, max_step)`,
-  where `observed_at` is the latest wall time seen for it and only moves forward. So a backward
-  step credits nothing and can never expire or flag a lease early; catching back up credits
-  nothing either (no span is counted twice), so a step back of D seconds delays expiry by at most
-  D; one forward jump credits at most `LEASE_MAX_STEP_SEC` (300 s, the health check's fallback
-  cadence); repeated passes at one time credit 0; a handoff or re-offer starts a new lease. The
-  passes are every `clicks` and every `clicks --due` (the health check), each crediting and saving
-  the lease atomically under the clicks lock, so a restart resumes from the saved credit. An
+  (`HANDED_LEASE_SEC`, 600 s); each pass credits `clamp(now - observed_at, 0, max_step)` and then
+  sets `observed_at = now`. With `LEASE_MAX_STEP_SEC` (300 s, the health check's fallback cadence)
+  below the window: a backward step credits nothing, so a rollback never expires a lease or raises
+  NEEDS ATTENTION; a forward spike of any size credits at most one step, and once the clock is
+  corrected normal time resumes, so a spike never freezes recovery; repeated passes at one time
+  credit 0; no single pass expires a fresh lease; a handoff or re-offer starts a new lease. The
+  trade-off, chosen on purpose: catching back up after a rollback is credited again, so a rollback
+  can over-credit by at most one step — bounded, where refusing all double credit would freeze the
+  lease for the whole span of a corrected forward spike. The passes are every `clicks` and every
+  `clicks --due` (the health check), each crediting and saving the lease atomically under the
+  clicks lock, so a restart resumes from the saved credit.
+- **A retired card wins.** Each claim save re-checks the card under the HITL store lock and is
+  refused for a card already settled (a concurrent `resolve` retiring it); the pass then hands
+  nothing over and returns no token, printing "settled meanwhile — not a decision". An
   ack carrying a superseded token is refused as stale and changes nothing.
 - **At-least-once, at most twice.** The core acts before it acks, so a consumer slower than the
   lease, or a clock jump, can let a second consumer receive the same `chose`. Rule: before acting

@@ -239,6 +239,8 @@ def click_line(c: dict) -> str:
     """Only an actionable click reads as `chose`, with its exact action id and consequence."""
     q = " ".join(c["question"].split())[:120]
     what = f"{c['action_id']} {c['label']!r}" + (f" -> {c['consequence']}" if c.get("consequence") else "")
+    if c.get("retired"):
+        return f"- [{c['ask_id']}] settled meanwhile — not a decision ({what}) — {q}"
     if c.get("stale"):
         return f"- [{c['ask_id']}] already answered — not a decision (a late click on {what}) — {q}"
     if c.get("actionable"):

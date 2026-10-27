@@ -70,13 +70,16 @@ def answered_cards(manager) -> list:
     return out
 
 
-def stamp_claim(manager, hitl_id: str, claim: dict) -> None:
-    """Save the card's claim, whole, in one atomic store write under the store lock."""
+def stamp_claim(manager, hitl_id: str, claim: dict) -> bool:
+    """Save the card's claim, whole, in one atomic store write under the store lock. False when
+    the card is gone or terminal (retired meanwhile, e.g. by a concurrent `resolve`): not saved."""
     with manager.store.locked():
         req = manager.get(hitl_id)
-        if req is not None and not req.terminal:
-            req.subject = {**(req.subject or {}), "claim": dict(claim)}
-            manager.store.save(req)
+        if req is None or req.terminal:
+            return False
+        req.subject = {**(req.subject or {}), "claim": dict(claim)}
+        manager.store.save(req)
+        return True
 
 
 def retire_cards(manager, ask_id: str) -> list:
@@ -100,6 +103,14 @@ def _advanced(manager, c: dict, claim: dict, now: float) -> dict:
         claim = {**claim, "lease": lease}
         stamp_claim(manager, c["hitl_id"], claim)
     return claim
+
+
+def _retired(manager, c: dict) -> dict:
+    """The entry fields for a card whose claim save was refused: re-read, never actionable."""
+    req = manager.get(c["hitl_id"])
+    status = req.status if req is not None else "gone"
+    return {"actionable": False, "retired": True,
+            "close_message": f"not handed over: the card was settled meanwhile ({status})"}
 
 
 def clicks(workspace: Path, closer, manager=None, now: Optional[float] = None) -> list:
@@ -126,20 +137,27 @@ def clicks(workspace: Path, closer, manager=None, now: Optional[float] = None) -
                     if int(claim.get("reoffers") or 0) < MAX_REOFFERS:
                         claim = {**claim, "lease": lease_mod.new(clock()), "handed_at": clock(), "token": _token(),
                                  "reoffers": int(claim.get("reoffers") or 0) + 1}
-                        stamp_claim(manager, c["hitl_id"], claim)
-                        entry.update(actionable=True, reoffered=True, token=claim["token"])
+                        if stamp_claim(manager, c["hitl_id"], claim):
+                            entry.update(actionable=True, reoffered=True, token=claim["token"])
+                        else:
+                            entry.update(_retired(manager, c))
                     else:
                         entry.update(needs_attention=True, token=claim.get("token"))
                 out.append(entry)
                 continue
             if not claim.get("token"):
                 claim = {"token": _token(), "state": CLAIMING}
-                stamp_claim(manager, c["hitl_id"], claim)
+                if not stamp_claim(manager, c["hitl_id"], claim):
+                    entry.update(_retired(manager, c))
+                    out.append(entry)
+                    continue
             outcome, entry["close_message"] = closer(ws, c["ask_id"], claim["token"])
             if outcome == CLOSED:
-                stamp_claim(manager, c["hitl_id"], {**claim, "state": HANDED, "handed_at": clock(),
-                                                    "lease": lease_mod.new(clock())})
-                entry.update(actionable=True, closed=True, token=claim["token"])
+                if stamp_claim(manager, c["hitl_id"], {**claim, "state": HANDED, "handed_at": clock(),
+                                                       "lease": lease_mod.new(clock())}):
+                    entry.update(actionable=True, closed=True, token=claim["token"])
+                else:
+                    entry.update(_retired(manager, c), closed=True)
             elif outcome == STALE:
                 manager.cancel(c["hitl_id"])
                 entry["stale"] = True
