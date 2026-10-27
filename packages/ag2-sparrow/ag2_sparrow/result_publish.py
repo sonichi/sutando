@@ -89,36 +89,38 @@ def publish_text(path: str | Path, text: str, mode: int = 0o666) -> Path:
 
 def _helpers():
     try:
-        from . import local_task_protocol, result_markers, task_archive
+        from . import local_task_protocol, result_markers, task_archive, workspace_default
     except ImportError:
         import local_task_protocol
         import result_markers
         import task_archive
-    return local_task_protocol, result_markers, task_archive
+        import workspace_default
+    return local_task_protocol, result_markers, task_archive, workspace_default
 
 
 def undeliverable_reason(path: str | Path, text: str) -> str | None:
     """Why no bridge would deliver `text` published at `path`, or None when one would.
 
     Fails open: an unknown name, a missing task file or a helper that will not load publishes."""
-    target = Path(path).resolve()
-    if target.parent.name != "results":
-        return None
     try:
-        protocol, markers, archive = _helpers()
+        protocol, markers, archive, wsd = _helpers()
     except ImportError:
         return None
+    target = Path(path).resolve()
     task_id = archive.task_id_from_filename(target.name)
     if task_id is None:
         return None
-    tasks_dir = target.parent.parent / "tasks"
     try:
+        workspace = wsd.resolve_workspace(migrate=False).resolve()
+        if target.parent != workspace / "results":
+            return None
+        tasks_dir = workspace / "tasks"
         task_file = (archive.find_task_file(tasks_dir, task_id)
                      or protocol.find_archived_task(tasks_dir, task_id))
         if task_file is None:
             return None
         headers = protocol.parse_task_headers(task_file.read_text(encoding="utf-8")).headers
-    except (OSError, UnicodeDecodeError):
+    except (OSError, UnicodeDecodeError, ValueError):
         return None
     if (headers.get("source") or "").strip().casefold() != "cron":
         return None

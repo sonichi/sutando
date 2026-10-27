@@ -10,15 +10,23 @@ Run: python3 tests/result-publish-undeliverable.test.py
 """
 from __future__ import annotations
 
-import importlib
+import io
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
+
+from _helpers.hermetic_env import isolate_os_environ, isolated_child_env  # noqa: E402
+
+isolate_os_environ()
 
 REPO = Path(__file__).resolve().parents[1]
 CLI = REPO / "src" / "result_publish.py"
+sys.path.insert(0, str(REPO / "src"))
+
+import result_publish  # noqa: E402
 
 CRON_TASK = ("id: {tid}\ntimestamp: 2026-10-26T12:00:00Z\nsource: cron\nuser_id: cron-runner\n"
              "access_tier: owner\npriority: low\ntask: /hourly-report\n")
@@ -43,8 +51,11 @@ class RefuseUndeliverable(unittest.TestCase):
     def _publish(self, tid, body, *flags):
         target = self.ws / "results" / f"{tid}.txt"
         proc = subprocess.run([sys.executable, str(CLI), *flags, str(target)],
-                              input=body, text=True, capture_output=True)
+                              input=body, text=True, capture_output=True, env=self._env())
         return proc, target
+
+    def _env(self):
+        return isolated_child_env(SUTANDO_TEST_MODE="1", SUTANDO_WORKSPACE=str(self.ws))
 
     def test_cron_task_without_destination_is_refused(self):
         self._task("task-cron-hourly-1", CRON_TASK)
@@ -94,14 +105,29 @@ class RefuseUndeliverable(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(target.read_text(encoding="utf-8"), "Hourly report\n")
 
-    def test_vendored_copy_reaches_the_same_verdict(self):
-        sys.path.insert(0, str(REPO / "packages" / "ag2-sparrow"))
-        vendored = importlib.import_module("ag2_sparrow.result_publish")
+    def test_result_outside_the_workspace_publishes(self):
         self._task("task-cron-hourly-7", CRON_TASK)
-        target = self.ws / "results" / "task-cron-hourly-7.txt"
-        self.assertIsNotNone(vendored.undeliverable_reason(target, "Hourly report\n"))
-        self.assertIsNone(vendored.undeliverable_reason(target, "[no-send] x\n"))
+        with tempfile.TemporaryDirectory() as other:
+            target = Path(other) / "results" / "task-cron-hourly-7.txt"
+            proc = subprocess.run([sys.executable, str(CLI), str(target)], input="Hourly report\n",
+                                  text=True, capture_output=True, env=self._env())
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertTrue(target.exists())
 
+    def test_in_process_main_refuses_and_overrides(self):
+        self._task("task-cron-hourly-8", CRON_TASK)
+        target = self.ws / "results" / "task-cron-hourly-8.txt"
+        with mock.patch.dict("os.environ", self._env()), \
+                mock.patch.object(result_publish.sys, "stderr", io.StringIO()) as err:
+            with mock.patch.object(result_publish.sys, "stdin", io.StringIO("report\n")):
+                self.assertEqual(result_publish.main(["result_publish.py", str(target)]), 2)
+            self.assertIn("deliver-owner-dm.py", err.getvalue())
+            self.assertFalse(target.exists())
+            self.assertIsNone(result_publish.undeliverable_reason(target, "[no-send] x\n"))
+            with mock.patch.object(result_publish.sys, "stdin", io.StringIO("report\n")):
+                self.assertEqual(result_publish.main(
+                    ["result_publish.py", "--allow-undeliverable", str(target)]), 0)
+        self.assertEqual(target.read_text(encoding="utf-8"), "report\n")
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
