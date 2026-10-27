@@ -1766,6 +1766,22 @@ def main() -> int:
     check(len(STATE["room_posts"]) == n_posts and (rtc.RESULTS_DIR / "proactive-t1f.txt").exists(),
           "a named secondary never consumes an unaddressed nudge, whatever room the pin or the registry names")
     (rtc.RESULTS_DIR / "proactive-t1f.txt").unlink(); rtc.GATEWAY_INSTANCE = _inst
+    check(rtc.OWNS_UNADDRESSED is rtc._owns_unaddressed, "the host answers which bridge is the primary")
+    _saved_owns = rtc.OWNS_UNADDRESSED
+    rtc.GATEWAY_INSTANCE, rtc.OWNS_UNADDRESSED = "dev", lambda: True  # the record made this lane the primary
+    n_posts = len(STATE["room_posts"]); (rtc.RESULTS_DIR / "proactive-t1h.txt").write_text("nudge for the new primary\n")
+    rtc._post_proactive()
+    check(len(STATE["room_posts"]) == n_posts + 1 and STATE["room_posts"][-1]["room_id"] == "!dm:example.org"
+          and not (rtc.RESULTS_DIR / "proactive-t1h.txt").exists(),
+          "a named lane the record made primary delivers an unaddressed nudge to its owner DM")
+    rtc.GATEWAY_INSTANCE, rtc.OWNS_UNADDRESSED = _inst, lambda: False  # the unsuffixed bridge once a lane is primary
+    n_posts = len(STATE["room_posts"]); (rtc.RESULTS_DIR / "proactive-t1i.txt").write_text("not the legacy's\n")
+    rtc._post_proactive()
+    check(len(STATE["room_posts"]) == n_posts and (rtc.RESULTS_DIR / "proactive-t1i.txt").exists(),
+          "the unsuffixed bridge leaves unaddressed nudges once a named lane is primary")
+    rtc.OWNS_UNADDRESSED = lambda: (_ for _ in ()).throw(OSError("x"))
+    check(rtc.owns_unaddressed() is True, "a failed primary check keeps the launch-time rule")
+    (rtc.RESULTS_DIR / "proactive-t1i.txt").unlink(); rtc.OWNS_UNADDRESSED = _saved_owns
     rtc._reenroll_identity = lambda: "@agent-t:example.org"
     rtc._ROUTING.update(owner_dm="", persisted="", next=0.0, loaded=False)
     STATE["agents"] = [{"id": "@agent-t:example.org", "owner": "@owner:example.org", "owner_dm_room": "!dm:example.org"}]

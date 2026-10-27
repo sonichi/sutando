@@ -513,6 +513,20 @@ class Primary(Base):
         C.remove_connection("beta-fixture-net", force=True, workspace=self.ws, vault=self.vault, kill=lambda *a, **k: None)
         self.assertIsNone(C.primary_instance(self.ws), "no row inherits the primary flag")
 
+    def test_the_primary_row_owns_unaddressed_nudges(self):
+        self.assertTrue(C.owns_unaddressed("", self.ws) and not C.owns_unaddressed("dev", self.ws), "no record: legacy")
+        C.import_from_env({"REMOTE_TASK_TOKEN": TOKEN_A}, workspace=self.ws, vault=self.vault)
+        self.add(TOKEN_B, fetch=agents("@s:beta-fixture.net"))
+        self.assertEqual([C.owns_unaddressed(i, self.ws) for i in ("", "beta-fixture-net")], [True, False])
+        C.set_primary("beta-fixture-net", workspace=self.ws)
+        self.assertEqual([C.owns_unaddressed(i, self.ws) for i in ("", "beta-fixture-net", "other")], [False, True, False])
+        rec = json.loads(C.record_path(self.ws).read_text())
+        rec["connections"][1]["launch_keys"] = ["AG2_REMOTE_TOKEN_BETA"]
+        C.record_path(self.ws).write_text(json.dumps(rec))
+        self.assertTrue(C.owns_unaddressed("beta", self.ws), "a launch-key alias is the same bridge")
+        C.record_path(self.ws).write_text("{broken")
+        self.assertEqual([C.owns_unaddressed(i, self.ws) for i in ("", "beta")], [True, False], "unreadable: legacy")
+
     def test_primary_in_the_plan_keeps_the_proactive_room(self):
         self.add()
         self.add(TOKEN_B, fetch=agents("@s:beta-fixture.net"))
@@ -874,6 +888,18 @@ class ListSelfHeals(ChannelFileBase):
         imported.assert_not_called()
         self.assertEqual([r["instance"] for r in rows], ["alpha-fixture-net"])
 
+    def test_a_launch_key_written_after_the_record_becomes_a_row_and_a_removed_one_stays_gone(self):
+        self.write_relay_env(f"REMOTE_TASK_TOKEN={TOKEN_A}\nAG2_REMOTE_TOKEN_BETA={TOKEN_B}")
+        C.import_from_env({"REMOTE_TASK_TOKEN": TOKEN_A}, workspace=self.ws, vault=self.vault)
+        rows = C.list_connections(self.ws, vault=self.vault)
+        self.assertEqual([(r["instance"], r["token_ref"], r["primary"]) for r in rows],
+                         [("", "REMOTE_TASK_TOKEN", True), ("beta", "AG2_REMOTE_TOKEN_BETA", False)])
+        with unittest.mock.patch.object(C, "import_from_env") as imported:
+            C.list_connections(self.ws, vault=self.vault)
+        imported.assert_not_called()
+        C.remove_connection("beta", force=True, workspace=self.ws, vault=self.vault, kill=lambda *a, **k: None)
+        self.assertEqual([r["instance"] for r in C.list_connections(self.ws, vault=self.vault)], [""])
+
     def test_a_failing_import_is_logged_and_the_list_still_answers(self):
         with unittest.mock.patch.object(C, "import_from_env", side_effect=RuntimeError("keychain locked")):
             with self.assertLogs("connections", level="WARNING") as logs:
@@ -1002,6 +1028,15 @@ class StatusJoin(Base):
         self.assertEqual(C.derive_state({"connected": True}, {"ok": True}, True), ("parked", "disabled"),
                          "a disabled row is parked whatever a stale sidecar says")
         self.assertEqual(C.derive_state({}, {"ok": False, "reason": "no_token"}, True), ("parked", "disabled"))
+
+    def test_a_sidecar_whose_bridge_died_is_not_connected(self):
+        C.import_from_env({"REMOTE_TASK_TOKEN": TOKEN_A}, workspace=self.ws, vault=self.vault)
+        dead = subprocess.Popen([sys.executable, "-c", "pass"]); dead.wait()
+        self._sidecar("gateway-status.json", connected=True, last_ok_ts=1700000000, pid=dead.pid)
+        status = C.status_for(self.rows()[0], self.ws)
+        self.assertEqual((status["state"], status["status"]["connected"]), ("disconnected", False))
+        self._sidecar("gateway-status.json", connected=True, last_ok_ts=1700000000, pid=os.getpid())
+        self.assertEqual(C.status_for(self.rows()[0], self.ws)["state"], "connected")
 
     def test_status_joins_the_instance_suffixed_file_and_launch_record(self):
         C.import_from_env({"REMOTE_TASK_TOKEN": TOKEN_A}, workspace=self.ws, vault=self.vault)

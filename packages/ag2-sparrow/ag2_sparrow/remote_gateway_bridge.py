@@ -1637,8 +1637,8 @@ def _project_hitl(log=print) -> int:
     calling this every pulse re-sends nothing; it is the driver that was
     missing, not the machinery.
     """
-    if GATEWAY_INSTANCE:
-        return 0  # only the primary gateway (launched without GATEWAY_INSTANCE) projects the owner's cards
+    if not owns_unaddressed():
+        return 0  # only the primary gateway projects the owner's cards
     room = resolve_destination(OWNER_PRIVATE)  # a runtime prompt is the owner's, whatever room raised it
     if not room:
         _held("the runtime prompt card")
@@ -1933,6 +1933,9 @@ PROACTIVE_ACK_GATE: Callable[[str, str], "str | None"] | None = None
 # Host-injected () -> bool, asked once right after the poller lease is taken: False drops
 # PROACTIVE_ROOM, so a bridge spawned before another became primary never carries it too.
 PROACTIVE_ROOM_KEEP: Callable[[], bool] | None = None
+# Host-injected () -> bool: whether this bridge owns unaddressed nudges and the owner's cards.
+# None (standalone default): only the bridge launched without GATEWAY_INSTANCE does.
+OWNS_UNADDRESSED: Callable[[], bool] | None = None
 PROACTIVE_ROUTE_GATE: Callable[[str, str, "str | None"], "str | None"] | None = None
 # Host-injected task -> reason or None, asked before a fresh task is queued: a reason settles it
 # as a redelivery instead. None (standalone default) queues every fresh task.
@@ -2061,8 +2064,8 @@ def resolve_destination(audience: str, *, room_id: str | None = None,
     reading kept identity-bound on disk across restarts and outages; with no reading it is "" and the
     caller holds the message, never the pinned room. CURRENT_ROOM is the triggering room;
     SELECTED_MEMBERS are explicit recipients (the one list-valued audience); SYSTEM is the
-    configured destination. Eligibility is the instance, never the pin: only the primary (launched
-    without GATEWAY_INSTANCE) owns unaddressed nudges and projects cards."""
+    configured destination. Eligibility is the instance, never the pin: only the primary
+    (`owns_unaddressed`) owns unaddressed nudges and projects cards."""
     if audience == OWNER_PRIVATE:
         refresh_routing()
         return _ROUTING["owner_dm"]
@@ -2073,6 +2076,17 @@ def resolve_destination(audience: str, *, room_id: str | None = None,
     if audience == SYSTEM:
         return PROACTIVE_ROOM or ""
     raise ValueError(f"unknown audience {audience!r}")
+
+
+def owns_unaddressed() -> bool:
+    """Whether this bridge is the primary: the host's answer, else launched without GATEWAY_INSTANCE."""
+    if OWNS_UNADDRESSED is None:
+        return not GATEWAY_INSTANCE
+    try:
+        return bool(OWNS_UNADDRESSED())
+    except Exception as e:  # noqa: BLE001 - an unanswerable host keeps the launch-time rule
+        _log_backoff(("owns-unaddressed", type(e).__name__), f"primary check failed ({diagnostics.describe(e)})")
+        return not GATEWAY_INSTANCE
 
 
 def proactive_room() -> str:
@@ -6191,8 +6205,8 @@ def _post_proactive() -> None:
             continue  # another homeserver's lane owns it; a claim here can only park it
         # No target of its own AND no default: skip BEFORE claiming. Claiming it
         # would spin (claim -> no destination -> hand back) on every pass.
-        if route == "send" and peek_room is None and GATEWAY_INSTANCE:
-            continue  # a named secondary never owns unaddressed nudges; the primary runs without GATEWAY_INSTANCE
+        if route == "send" and peek_room is None and not owns_unaddressed():
+            continue  # a secondary never owns unaddressed nudges
         if route == "send" and peek_room is None and not proactive_room():
             _held(f"owner-directed {f.name}")
             continue
@@ -6230,7 +6244,7 @@ def _post_proactive() -> None:
         if route == "foreign" or (
                 route == "send" and room_override is not None
                 and not _room_is_deliverable_here(room_override)) or (
-                route == "send" and room_override is None and (GATEWAY_INSTANCE or not proactive_room())):
+                route == "send" and room_override is None and (not owns_unaddressed() or not proactive_room())):
             # Hand back rather than eat: a foreign target seen only post-claim, or one that vanished
             # and left an unaddressed body this instance may not own or cannot place.
             _hand_back(claim, f)

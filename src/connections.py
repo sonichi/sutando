@@ -825,17 +825,33 @@ def list_connections(workspace: Optional[Path] = None, *, vault=None) -> list:
     connect flow wrote after the engine started shows up on the next list. A record that exists
     but is empty is left alone: its rows were removed on purpose, and a lingering token must not
     bring them back. An import that fails is logged and the list still answers; a record that
-    fails validation raises as before."""
+    fails validation raises as before. A record that exists still adopts the launch keys a host
+    wrote after it (`channel_launch_keys`), as `add_connection` does; a removed key stays removed."""
     path = record_path(workspace)
     rows = _read(path)
     if rows or path.exists():
-        return rows
+        return _read(path) if _adopt_launch_keys(rows, workspace, vault) else rows
     try:
         if import_from_env(workspace=workspace, vault=vault):
             rows = _read(path)
     except Exception as e:  # noqa: BLE001 - the list answers even when nothing could be imported
         logging.getLogger(__name__).warning("connections: import on an empty record failed (%s)", type(e).__name__)
     return rows
+
+
+def _adopt_launch_keys(rows: list, workspace: Optional[Path], vault) -> bool:
+    """Import the launch keys no row owns yet; True when the import ran. Never raises."""
+    try:
+        known = {r["token_ref"] for r in rows} | {k for r in rows for k in r.get("launch_keys") or []}
+        known |= set(removed_env_refs(workspace))
+        new = {v: t for v, t in channel_launch_keys().items() if v not in known}
+        if not new:
+            return False
+        import_from_env(new, workspace=workspace, vault=vault)
+        return True
+    except Exception as e:  # noqa: BLE001 - the list answers even when nothing could be adopted
+        logging.getLogger(__name__).warning("connections: adopting launch keys failed (%s)", type(e).__name__)
+        return False
 
 
 def removed_env_refs(workspace: Optional[Path] = None) -> list:
@@ -1015,6 +1031,19 @@ def legacy_keeps_proactive_room(workspace: Optional[Path] = None) -> bool:
     except (SchemaError, OSError):
         return True
     return not any(r["primary"] and r["instance"] for r in rows)
+
+
+def owns_unaddressed(instance: str, workspace: Optional[Path] = None) -> bool:
+    """Whether the bridge running as `instance` owns unaddressed proactive messages and the owner's
+    cards: the primary row's bridge, under its slug or a launch-key alias. With no named primary, or
+    an unreadable record, the legacy unsuffixed bridge owns them, as before any row existed."""
+    try:
+        primary = next((r for r in _read(record_path(workspace)) if r["primary"]), None)
+    except (SchemaError, OSError):
+        primary = None
+    if primary is None or not primary["instance"]:
+        return not instance
+    return bool(instance) and instance in [primary["instance"]] + alias_instances(primary)
 
 
 def set_primary(instance: str, *, workspace: Optional[Path] = None) -> dict:
@@ -1212,12 +1241,27 @@ def derive_state(sidecar: Mapping[str, object], launch: Mapping[str, object],
     return "disconnected", None
 
 
+def _writer_gone(pid: object) -> bool:
+    """Whether `pid` names a process that no longer exists; anything unprovable is not gone."""
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
 def status_for(row: Mapping[str, object], workspace: Optional[Path] = None) -> dict:
     """The row plus `status` (connected, last_ok_ts from gateway-status), the derived `state`,
     `running` (a bridge proven to hold the lease; None when the lease proves nothing) and every
     optional field spelled out (`disabled` false, identity fields None when unknown)."""
     inst = str(row.get("instance") or "")
     sidecar = _sidecar(inst, workspace)
+    if sidecar.get("connected") and _writer_gone(sidecar.get("pid")):
+        sidecar = {**sidecar, "connected": False}  # a bridge that died says nothing about now
     launch = _read_json(launch_record_path(inst, workspace))
     out = dict(row)
     out["disabled"] = bool(row.get("disabled"))
