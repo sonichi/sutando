@@ -14,7 +14,7 @@ except ImportError:
 
 HEALTH_CAUSES = frozenset("""
 voice-agent voice-watchers voice-transport bodhi-dist cli-wedge pane-key-fence secret-scanner
-node-runtime cron-runner session-crons memory-dir-override workspace-wiring
+node-runtime cron-runner session-crons memory-dir-override workspace-wiring decision-card-clicks
 context-read-budget workspace-root-tidy memory-dir-siblings carrier-set memory-index
 memory-sync onboarding-status hitl-archive host-subtrees per-host-config-backup sync-conflicts-unmerged
 skills-driver-code-drift live-checkout-branch engine-revision-drift migrate-reader-contract
