@@ -927,6 +927,17 @@ class TestChannelBindingMatchesStand(unittest.TestCase):
             self.assertNotIn(k, ent)
         self.assertNotIn("b-bot", json.dumps(card))
 
+    def test_a_link_reports_the_stand_it_records_not_the_cards(self):
+        self._enroll(self.A)
+        self._link(self.B)
+        _card, ent = self._discord()
+        self.assertEqual(ent["stand_id"], self.B)
+        self.assertNotEqual(ent["status"], "active")
+        self._link(self.A, subject="a-bot")
+        self.assertEqual(self._discord()[1]["stand_id"], self.A)
+        self._link("")
+        self.assertNotIn("stand_id", self._discord()[1])
+
     def test_link_bound_to_this_stand_is_active(self):
         self._enroll(self.A)
         self._link(self.A, subject="a-bot")

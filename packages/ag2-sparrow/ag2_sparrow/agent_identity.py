@@ -37,6 +37,7 @@ from pathlib import Path
 
 from . import bounded_file_read
 from . import gateway_credential_sources as _sources
+from . import gateway_credential_io
 from .outbox import valid_pid
 from .persisted_number import bounded_number
 from .gateway_instance import suffix as _instance_suffix
@@ -371,7 +372,7 @@ def host_enrolled(state_dir, environ=None) -> str:
     env = os.environ if environ is None else environ
     if _sources.is_seat(env):
         return ""
-    files = _sources.env_files(env, bounded_file_read.read_regular)
+    files = gateway_credential_io.channel_env_files(env)
     if files.refused:
         return ""
     ids = {v.strip() for _path, vals in files for k in FILE_KEYS if (v := vals.get(k) or "").strip()}

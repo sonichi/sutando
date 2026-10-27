@@ -247,6 +247,9 @@ class IdentityView:
             ent["status"] = "configured_unverified"
         else:
             ent["status"] = "not_configured"
+        bound = (link or (active[0] if active else {})).get("stand_id")
+        if isinstance(bound, str) and bound:
+            ent["stand_id"] = bound  # the Stand the stored link records, never the card's
         if evidence:
             ent["evidence"] = evidence
         if details:
