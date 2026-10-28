@@ -126,7 +126,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`install-gateway-bridge-launchd.sh`** — Install / uninstall / check the launchd-supervised ag2.space gateway-bridge.
 - **`install-health-check-launchd.sh`** — Install / uninstall the launchd-supervised health-check FALLBACK job.
 - **`install-sutando-app-launchd.sh`** — Install / uninstall / check the launchd-supervised Sutando.app job.
-- **`lane_dedupe.py`** — Cross-lane duplicate guard: one room message becomes one task, whichever lane saw it first.
+- **`lane_dedupe.py`** — Cross-lane duplicate guard: one room message becomes one task, answered by its owner lane when known.
 - **`live-agent-runtime.ts`** — LiveAgentRuntime — step 5a-2 of the interaction-planes refactor.
 - **`local_api_gate.py`** — The one gate for the loopback HTTP services' privileged routes.
 - **`local_record.py`** — Local JSON records: one object per file under a directory, each written whole in one rename and read back only when its file name is a safe single path segment that the record itself names.
@@ -474,7 +474,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 
 - **`agents_view.py`** — Read-only agent discovery over the per-host liveness directory.
 - **`capability_registry.py`** — Provider-neutral, ephemeral read-capability registry.
-- **`connections_view.py`** — Connections surface for the Sutando Server: connection.list / known_servers / add / remove / set_primary / promote / unpark / disconnect / reconnect / update_token.
+- **`connections_view.py`** — Connections surface for the Sutando Server: connection.list / known_servers / add / remove / set_primary / promote / park / park_legacy / unpark / disconnect / reconnect / update_token.
 - **`dispatcher.py`** — Runtime-API request-domain dispatch, separated from socket transport.
 - **`ha_adapter.py`** — runtime-api ↔ human-action adapter, over the HITL Requirement store.
 - **`identity_source.py`** — Where the identity surface reads from, and the one IdentityView built from it.

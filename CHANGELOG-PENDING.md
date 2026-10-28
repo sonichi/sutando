@@ -52,6 +52,7 @@ Format: `- Brief description of what changed. ([#NNN])`
 ## Changed
 
 <!-- refactor(), perf(), docs() changes visible to operators go here -->
+- connections: moving the primary (`promote`) keeps the old connection running as a secondary, so the old homeserver's rooms still get answers; `promote --park` keeps the old behaviour. New `park INSTANCE` and `park-legacy` (the final cutover: every connection but the primary) on the CLI, HTTP (`POST <instance>/park`, `POST park-legacy`) and runtime API; a message two lanes receive is answered by the lane its agent is addressed on, else the primary.
 - voice: the built-in voice model default is `gemini-3.8-live` (was `gemini-2.5-flash-native-audio-preview-12-2025`), the model the seeded-install migration already moves to; search stays on. It applies where no config file sets a model (the packaged app seeds no template) and to new phone installs, whose template now carries it. Existing config files are unchanged. When Gemini refuses the configured model and no automatic revert applies (a config-less install never has one), the voice-offline notice now says to change the model in `config/voice-agent.json` in the Sutando workspace and restart; it said to update `VOICE_NATIVE_AUDIO_MODEL` in `.env`, which voice-agent does not read. ([#5442])
 
 ## Security

@@ -212,7 +212,7 @@ for origin in ("https://evil-fixture.net", "null", "http://localhost.evil-fixtur
     check(f"no CORS grant is echoed to {origin}", "Access-Control-Allow-Origin" not in h, h)
 check("nothing was stored by the refused requests", (FakeVault.store, SPAWNED) == ({}, []))
 s, b, _ = req("GET", "/api/v1/connections")
-check("nothing was stored by the refused requests (record)", b == {"connections": [], "capabilities": ["legacy_readopt"], "no_primary": False}, b)
+check("nothing was stored by the refused requests (record)", b == {"connections": [], "capabilities": list(C.CAPABILITIES), "no_primary": False}, b)
 
 print("== CORS: echo the loopback Origin only, never * ==")
 s, b, h = req("GET", "/api/v1/connections", headers={"Origin": "http://localhost:5173"})
@@ -243,7 +243,7 @@ check("preview names the registered, identity-confirmed server",
       (p.get("server"), p.get("server_source"), p.get("verified")) == ("alpha-fixture.net", "identity", True), p)
 check("preview carries no secret", no_secret(b))
 s, b, _ = req("GET", "/api/v1/connections")
-check("a preview saves nothing", b == {"connections": [], "capabilities": ["legacy_readopt"], "no_primary": False})
+check("a preview saves nothing", b == {"connections": [], "capabilities": list(C.CAPABILITIES), "no_primary": False})
 
 s, b, _ = req("POST", "/api/v1/connections", {"token": TOKEN_A, "confirm": True})
 check("confirm without expected_server is 400", s == 400, f"{s} {b}")
@@ -439,15 +439,30 @@ check("reconnect is 202 with a launch record", s == 202 and b["launch"]["ok"] is
 check("reconnect spawned exactly that bridge", SPAWNED == ["alpha-fixture-net"], SPAWNED)
 CONNECTS.append(True)
 s, b, _ = req("POST", "/api/v1/connections/alpha-fixture-net/promote", {})
-check("promote is 200 naming the parked row", s == 200 and (b["connection"]["primary"], b["previous"], b["changed"],
-      b["relaunch_needed"]) == (True, "beta-fixture-net", True, False), f"{s} {b}")
+check("promote is 200 and keeps the old primary", s == 200 and (b["connection"]["primary"], b["previous"], b["kept"],
+      b["changed"], b["relaunch_needed"]) == (True, None, "beta-fixture-net", True, False), f"{s} {b}")
 s, b, _ = req("GET", "/api/v1/connections")
-check("the old primary is parked, not removed", [(r["instance"], r["primary"], r["parked"], r["reason"]) for r in b["connections"]]
-      == [("alpha-fixture-net", True, False, None), ("beta-fixture-net", False, True, "parked")], b)
+check("the old primary is a secondary, not parked", [(r["instance"], r["primary"], r["parked"]) for r in b["connections"]]
+      == [("alpha-fixture-net", True, False), ("beta-fixture-net", False, False)], b)
+s, b, _ = req("POST", "/api/v1/connections/alpha-fixture-net/park", {})
+check("parking the primary is 409 primary_cannot_park", (s, b) == (409, {"error": "primary_cannot_park"}), f"{s} {b}")
+s, b, _ = req("POST", "/api/v1/connections/beta-fixture-net/park", {})
+check("park is 200 with the parked row", s == 200 and (b["connection"]["parked"], b["connection"]["reason"])
+      == (True, "parked"), f"{s} {b}")
 s, b, _ = req("POST", "/api/v1/connections/beta-fixture-net/unpark", {})
 check("unpark is 200 and starts the bridge", s == 200 and b["connection"]["parked"] is False and b["launch"]["ok"] is True, f"{s} {b}")
-s, b, _ = req("POST", "/api/v1/connections/beta-fixture-net/promote", {})
-check("a promote back is 200", s == 200 and b["previous"] == "alpha-fixture-net", f"{s} {b}")
+s, b, _ = req("POST", "/api/v1/connections/beta-fixture-net/promote", {"park": "yes"})
+check("a non-boolean park is 400", s == 400, f"{s} {b}")
+s, b, _ = req("POST", "/api/v1/connections/beta-fixture-net/promote", {"park": True})
+check("a promote back with park parks the old primary", s == 200 and (b["previous"], b["kept"]) == ("alpha-fixture-net", None),
+      f"{s} {b}")
+s, b, _ = req("POST", "/api/v1/connections/alpha-fixture-net/unpark", {})
+s, b, _ = req("GET", "/api/v1/connections/park-legacy")
+check("GET park-legacy is 405, never an instance", s == 405, f"{s} {b}")
+s, b, _ = req("POST", "/api/v1/connections/park-legacy", {})
+check("park-legacy is 200 and parks every row but the primary", s == 200 and (b["primary"], b["parked"])
+      == ("beta-fixture-net", ["alpha-fixture-net"]), f"{s} {b}")
+s, b, _ = req("POST", "/api/v1/connections/alpha-fixture-net/unpark", {})
 s, b, _ = req("POST", "/api/v1/connections/beta-fixture-net/promote", {})
 check("promoting the primary again changes nothing", s == 200 and (b["changed"], b["previous"]) == (False, None), f"{s} {b}")
 CONNECTS.clear()
@@ -512,7 +527,7 @@ FakeVault.store.clear()
 C.import_from_env({"REMOTE_TASK_TOKEN": "https://chat.alpha-fixture.net|rotated"}, workspace=WS, vault=FakeVault())
 s, b, _ = req("GET", "/api/v1/connections")
 check("the list names the capability the client gates its reconnect button on",
-      s == 200 and b["capabilities"] == ["legacy_readopt"] and [r["instance"] for r in b["connections"]] == [""], f"{s} {b}")
+      s == 200 and "legacy_readopt" in b["capabilities"] and [r["instance"] for r in b["connections"]] == [""], f"{s} {b}")
 s, b, _ = req("POST", "/api/v1/connections", {"token": TOKEN_A, "confirm": True, "expected_server": "alpha-fixture.net"})
 check("the paste is a 201 create of a named row, not 'already connected'",
       s == 201 and b["created"] is True and b["connection"]["instance"] == "alpha-fixture-net"
