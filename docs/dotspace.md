@@ -17,8 +17,12 @@ room's own server; the bridge's IPv4 preference asks per host. Only Sutando Clou
 (`src/cloud_auth.py`) and the Station probe (`src/runtime-health.py`) use `current_server()`:
 Sutando Cloud is per install today, so an install on several DotSpaces reaches one cloud, that
 of the server its identity (`AGENT_MXID` / `AG2SPACE_USER_ID`) or onboarding token names, else
-ag2.space's. `current_server()` never raises and never picks between bridges: it reads one
-process's environment; a multi-DotSpace install passes the server explicitly.
+the primary connection's server when the caller passes it (`primary_server=`, read from
+`connections.primary_server()`), else ag2.space's. This module reads no connections record, so
+the bundled copy stays standard-library only. `current_server()` never raises and never picks
+between bridges: it reads one process's environment; a multi-DotSpace install passes the server
+explicitly. A link whose room names no server takes its via the same way
+(`default_link_via(primary_server=...)`).
 
 ## Trust model
 

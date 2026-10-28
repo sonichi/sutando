@@ -79,8 +79,8 @@ WELL_KNOWN_PATH = "/.well-known/matrix/client"
 WELL_KNOWN_TIMEOUT_S = 1.5
 WELL_KNOWN_TTL_S = 3600.0
 WELL_KNOWN_NEGATIVE_TTL_S = 900.0
-# The instance installs ran against before this resolver existed: the fallback whenever the
-# install's own server is unknown.
+# The instance installs ran against before this resolver existed: the fallback only when neither
+# the process nor the caller's primary connection names a server.
 LEGACY_SERVER = "ag2.space"
 LEGACY_CLOUD_HOST = "sutando.ag2.ai"
 # The shared production Sutando Cloud: the fallback of every instance without a Cloud of its
@@ -529,33 +529,39 @@ def registered_instances(config: Optional[Mapping[str, Any]] = None) -> List[Dot
     return out
 
 
-def default_link_via(env: Optional[Mapping[str, str]] = None) -> str:
-    """`?via=` for a link whose room names no server: the install's DotSpace, else the legacy one."""
-    return link_via_for(current_server(env), fetch=NO_FETCH) or legacy_dotspace().link_via
+def default_link_via(env: Optional[Mapping[str, str]] = None, primary_server: str = "") -> str:
+    """`?via=` for a link whose room names no server: the install's DotSpace, else the legacy one.
+    `primary_server` is the caller's primary connection's server (see `current_server`)."""
+    return link_via_for(current_server(env, primary_server=primary_server), fetch=NO_FETCH) \
+        or legacy_dotspace().link_via
 
 
 def default_cloud_origin(env: Optional[Mapping[str, str]] = None,
-                         config: Optional[Mapping[str, Any]] = None) -> str:
+                         config: Optional[Mapping[str, Any]] = None, primary_server: str = "") -> str:
     """Sutando Cloud for this install: its server's DotSpace's, else the legacy entry's, else
     `PRODUCTION_CLOUD_ORIGIN` (an instance with no cloud of its own uses the shared Cloud;
-    `trusted_cloud_hosts` lists it). Config only, never a fetch (callers read this at import)."""
-    own = cloud_origin_for(current_server(env), fetch=NO_FETCH, config=config)
+    `trusted_cloud_hosts` lists it). Config only, never a fetch (callers read this at import).
+    `primary_server` only picks among configured entries, so no host joins the trusted set."""
+    own = cloud_origin_for(current_server(env, primary_server=primary_server), fetch=NO_FETCH, config=config)
     return own or legacy_dotspace(config).cloud_origin or PRODUCTION_CLOUD_ORIGIN
 
 
 # ----------------------------------------------------------------- install
 
 
-def current_server(env: Optional[Mapping[str, str]] = None, own_gateway: str = "") -> str:
+def current_server(env: Optional[Mapping[str, str]] = None, own_gateway: str = "",
+                   primary_server: str = "") -> str:
     """This process's homeserver: the server of AGENT_MXID / AG2SPACE_USER_ID, else the host of
-    `own_gateway` (the gateway URL the credential owner resolved, passed by the caller), else "".
-    One process serves one connection; an install on several passes the server itself."""
+    `own_gateway` (the gateway URL the credential owner resolved, passed by the caller), else
+    `primary_server` (the install's primary connection, read by the caller: this module reads no
+    record), else "". One process serves one connection; an install on several passes the server."""
     env = os.environ if env is None else env
     for key in MXID_ENV_KEYS:
         server = server_of_mxid(env.get(key, ""))
         if server:
             return server
-    return server_of_gateway_url(own_gateway)
+    primary = (primary_server or "").strip().lower()
+    return server_of_gateway_url(own_gateway) or (primary if is_server_name(primary) else "")
 
 
 if __name__ == "__main__":  # pragma: no cover — `python3 dotspace.py <server|host>`
