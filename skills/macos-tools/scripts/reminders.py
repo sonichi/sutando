@@ -26,6 +26,7 @@ from pathlib import Path
 # Sibling helper: the scripts run by path, so their directory is not on sys.path.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import native_pim_consent as consent  # noqa: E402
+from applescript_args import osascript_cmd  # noqa: E402
 
 _app_launched = False
 
@@ -37,10 +38,10 @@ def _ensure_reminders_running():
         _app_launched = True
 
 
-def run_applescript(script: str) -> tuple[str, str]:
+def run_applescript(script: str, *values: str) -> tuple[str, str]:
     _ensure_reminders_running()
     result = subprocess.run(
-        ["osascript", "-e", script],
+        osascript_cmd(script, *values),
         capture_output=True, text=True, timeout=15,
     )
     consent.exit_if_denied("Reminders", result.stderr)
@@ -120,39 +121,55 @@ def _is_due_today_or_overdue(due_str: str) -> bool:
         return False
 
 
-def add_reminder(name: str, due_date: str = "", list_name: str = "") -> str:
-    target = f'list "{list_name}"' if list_name else "default list"
-    due_clause = ""
-    if due_date:
-        due_clause = f', due date:date "{due_date}"'
-
-    script = f"""
+ADD_SCRIPT = """
+on run argv
+set reminderName to item 1 of argv
+set dueText to item 2 of argv
+set listName to item 3 of argv
+if dueText is not "" then set dueDate to date dueText
 tell application "Reminders"
-    tell {target}
-        make new reminder with properties {{name:"{name}"{due_clause}}}
+    if listName is "" then
+        set targetList to default list
+    else
+        set targetList to list listName
+    end if
+    tell targetList
+        if dueText is "" then
+            make new reminder with properties {name:reminderName}
+        else
+            make new reminder with properties {name:reminderName, due date:dueDate}
+        end if
     end tell
 end tell
+end run
 """
-    out, err = run_applescript(script)
+
+COMPLETE_SCRIPT = """
+on run argv
+set reminderName to item 1 of argv
+tell application "Reminders"
+    repeat with aList in every list
+        set rems to (reminders of aList whose name is reminderName and completed is false)
+        repeat with r in rems
+            set completed of r to true
+            return "Done: " & name
+        end repeat
+    end repeat
+    return "Not found: " & reminderName
+end tell
+end run
+"""
+
+
+def add_reminder(name: str, due_date: str = "", list_name: str = "") -> str:
+    out, err = run_applescript(ADD_SCRIPT, name, due_date, list_name)
     if err:
         return f"Error: {err}"
     return f"Added: {name}" + (f" (due {due_date})" if due_date else "")
 
 
 def complete_reminder(name: str) -> str:
-    script = f"""
-tell application "Reminders"
-    repeat with aList in every list
-        set rems to (reminders of aList whose name is "{name}" and completed is false)
-        repeat with r in rems
-            set completed of r to true
-            return "Done: " & name
-        end repeat
-    end repeat
-    return "Not found: " & "{name}"
-end tell
-"""
-    out, err = run_applescript(script)
+    out, err = run_applescript(COMPLETE_SCRIPT, name)
     if err:
         return f"Error: {err}"
     return out or f"Not found: {name}"

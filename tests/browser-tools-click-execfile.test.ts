@@ -28,7 +28,7 @@ function extractClickBody(): string {
 	const markerStart = SRC.indexOf("'Click at a specific screen coordinate");
 	if (markerStart < 0) return '';
 	// Find the handler function body starting after the tool description.
-	const handlerStart = SRC.indexOf('shortcut.toLowerCase().split', markerStart);
+	const handlerStart = SRC.indexOf('shortcutScript(shortcut)', markerStart);
 	if (handlerStart < 0) return '';
 	// Walk forward ~600 chars — enough to cover the shortcut + coordinate branches.
 	return SRC.slice(handlerStart, handlerStart + 800);

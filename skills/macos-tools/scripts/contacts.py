@@ -24,24 +24,14 @@ from pathlib import Path
 # Sibling helper: the scripts run by path, so their directory is not on sys.path.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import native_pim_consent as consent  # noqa: E402
+from applescript_args import osascript_cmd  # noqa: E402
 
-
-def _osascript(script: str, timeout: int) -> subprocess.CompletedProcess:
-    result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=timeout)
-    consent.exit_if_denied("Contacts", result.stderr)
-    return result
-
-
-def search_contacts(query: str) -> list[dict]:
-    # Ensure Contacts.app is running (AppleScript fails with -600 if not)
-    import time
-    subprocess.run(["open", "-ga", "Contacts"], capture_output=True, timeout=5)
-    time.sleep(1)
-    # Search by name or email
-    script = f"""
+SEARCH_SCRIPT = """
+on run argv
+set searchText to item 1 of argv
 tell application "Contacts"
     set output to ""
-    set results to (every person whose name contains "{query}")
+    set results to (every person whose name contains searchText)
     if (count of results) > 20 then set results to items 1 thru 20 of results
     repeat with p in results
         set pName to name of p
@@ -57,8 +47,76 @@ tell application "Contacts"
     end repeat
     return output
 end tell
+end run
 """
-    result = _osascript(script, timeout=30)
+
+ADD_SCRIPT = """
+on run argv
+set firstName to item 1 of argv
+set lastName to item 2 of argv
+set phoneValue to item 3 of argv
+set emailValue to item 4 of argv
+tell application "Contacts"
+if lastName is "" then
+    set newPerson to make new person with properties {first name:firstName}
+else
+    set newPerson to make new person with properties {first name:firstName, last name:lastName}
+end if
+if phoneValue is not "" then
+    make new phone at end of phones of newPerson with properties {label:"mobile", value:phoneValue}
+end if
+if emailValue is not "" then
+    make new email at end of emails of newPerson with properties {label:"home", value:emailValue}
+end if
+save
+end tell
+end run
+"""
+
+UPDATE_SCRIPT = """
+on run argv
+set searchText to item 1 of argv
+set phoneValue to item 2 of argv
+set emailValue to item 3 of argv
+tell application "Contacts"
+set results to (every person whose name contains searchText)
+if (count of results) = 0 then
+    return "NOT_FOUND: no contact matching " & searchText
+end if
+set p to item 1 of results
+if phoneValue is not "" then
+    -- Remove existing phones and add new one
+    repeat while (count of phones of p) > 0
+        delete (item 1 of phones of p)
+    end repeat
+    make new phone at end of phones of p with properties {label:"mobile", value:phoneValue}
+end if
+if emailValue is not "" then
+    repeat while (count of emails of p) > 0
+        delete (item 1 of emails of p)
+    end repeat
+    make new email at end of emails of p with properties {label:"home", value:emailValue}
+end if
+save
+return "OK: updated " & (name of p)
+end tell
+end run
+"""
+
+
+def _osascript(script: str, timeout: int, *values: str) -> subprocess.CompletedProcess:
+    result = subprocess.run(osascript_cmd(script, *values), capture_output=True, text=True, timeout=timeout)
+    consent.exit_if_denied("Contacts", result.stderr)
+    return result
+
+
+def search_contacts(query: str) -> list[dict]:
+    # Ensure Contacts.app is running (AppleScript fails with -600 if not)
+    import time
+    subprocess.run(["open", "-ga", "Contacts"], capture_output=True, timeout=5)
+    time.sleep(1)
+    # Search by name or email
+    result = _osascript(SEARCH_SCRIPT, 30, query)
     if result.returncode != 0:
         return [{"error": result.stderr.strip()}]
 
@@ -122,17 +180,7 @@ def main(argv=None):
         import time
         subprocess.run(["open", "-ga", "Contacts"], capture_output=True, timeout=5)
         time.sleep(1)
-        props = f'first name:"{first}"'
-        if last:
-            props += f', last name:"{last}"'
-        lines = [f'set newPerson to make new person with properties {{{props}}}']
-        if phone:
-            lines.append(f'make new phone at end of phones of newPerson with properties {{label:"mobile", value:"{phone}"}}')
-        if email:
-            lines.append(f'make new email at end of emails of newPerson with properties {{label:"home", value:"{email}"}}')
-        lines.append("save")
-        script = 'tell application "Contacts"\n' + "\n".join(lines) + '\nend tell'
-        result = _osascript(script, timeout=15)
+        result = _osascript(ADD_SCRIPT, 15, first, last, phone or "", email or "")
         if result.returncode != 0:
             print(f"Error: {result.stderr.strip()}")
             sys.exit(1)
@@ -155,26 +203,7 @@ def main(argv=None):
         import time
         subprocess.run(["open", "-ga", "Contacts"], capture_output=True, timeout=5)
         time.sleep(1)
-        lines = [f'set results to (every person whose name contains "{name}")']
-        lines.append('if (count of results) = 0 then')
-        lines.append(f'    return "NOT_FOUND: no contact matching {name}"')
-        lines.append('end if')
-        lines.append('set p to item 1 of results')
-        if phone:
-            lines.append('-- Remove existing phones and add new one')
-            lines.append('repeat while (count of phones of p) > 0')
-            lines.append('    delete (item 1 of phones of p)')
-            lines.append('end repeat')
-            lines.append(f'make new phone at end of phones of p with properties {{label:"mobile", value:"{phone}"}}')
-        if email:
-            lines.append('repeat while (count of emails of p) > 0')
-            lines.append('    delete (item 1 of emails of p)')
-            lines.append('end repeat')
-            lines.append(f'make new email at end of emails of p with properties {{label:"home", value:"{email}"}}')
-        lines.append("save")
-        lines.append('return "OK: updated " & (name of p)')
-        script = 'tell application "Contacts"\n' + "\n".join(lines) + '\nend tell'
-        result = _osascript(script, timeout=15)
+        result = _osascript(UPDATE_SCRIPT, 15, name, phone or "", email or "")
         if result.returncode != 0:
             print(f"Error: {result.stderr.strip()}")
             sys.exit(1)

@@ -2604,10 +2604,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let myPath = ProcessInfo.processInfo.arguments[0]
         let myPid = ProcessInfo.processInfo.processIdentifier
         // Detached shell: wait for current pid to die, then exec the same binary.
-        let script = "while kill -0 \(myPid) 2>/dev/null; do sleep 0.1; done; exec \"\(myPath)\""
+        // pid and path are positional parameters so the path is never parsed as shell text.
+        let script = "while kill -0 \"$1\" 2>/dev/null; do sleep 0.1; done; exec \"$2\""
         let task = Process()
         task.launchPath = "/bin/sh"
-        task.arguments = ["-c", script]
+        task.arguments = ["-c", script, "sutando-relaunch", String(myPid), myPath]
         do {
             try task.run()
             logToFile("restartSelf: spawned relaunch helper (pid will be \(myPid)), terminating")

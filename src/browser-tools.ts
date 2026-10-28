@@ -21,6 +21,7 @@ import { readCaptureToken } from './util_paths.js';
 import { meetingHoldsModel } from './meeting-input-hold.js';
 import { setupHint, scrollOutcome } from './osascript-setup-hint.js';
 import { withScheme } from './url-scheme.js';
+import { shortcutScript } from './keyboard-shortcut.js';
 
 const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
 
@@ -141,12 +142,10 @@ export const scrollTool: ToolDefinition = {
 					+ `var moved=null,info=null;for(var i=0;i<list.length;i++){var e=list[i];var b4=e.scrollTop;${op};if(e.scrollTop!==b4){moved=e;info={tag:e.tagName,cls:(e.className&&e.className.toString?e.className.toString().slice(0,40):''),b4:b4,aft:e.scrollTop};break}}`
 					+ `var wy0=window.scrollY;if(!moved){${winOp}}var wy1=window.scrollY;`
 					+ `return JSON.stringify({moved:!!moved||wy1!==wy0,via:moved?'el':'window',cands:list.length,info:info,wy0:wy0,wy1:wy1});})()`;
-				const tmpScroll = `/tmp/sutando-scroll-${Date.now()}.scpt`;
-				writeFileSync(tmpScroll, `tell application "Google Chrome" to tell active tab of front window to execute javascript "${js.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`);
+				const scrollScript = `tell application "Google Chrome" to tell active tab of front window to execute javascript "${js.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
 				let _out = '';
-				try { _out = execSync(`osascript ${tmpScroll}`, { timeout: 5_000 }).toString().trim(); }
+				try { _out = execFileSync('osascript', ['-e', scrollScript], { timeout: 5_000 }).toString().trim(); }
 				catch (e) { _noteHint(e); console.log(`${ts()} [Scroll] osascript error: ${e instanceof Error ? e.message : e}`); }
-				try { unlinkSync(tmpScroll); } catch {}
 				if (_out) {
 					try {
 						const d = JSON.parse(_out);
@@ -168,12 +167,10 @@ export const scrollTool: ToolDefinition = {
 				if (direction === 'top') js = scrollFn('e.scrollTop=0');
 				else if (direction === 'bottom') js = scrollFn('e.scrollTop=e.scrollHeight');
 				else js = scrollFn(`e.scrollBy(0,${direction === 'down' ? px : -px})`);
-				const tmpScroll = `/tmp/sutando-scroll-${Date.now()}.scpt`;
-				writeFileSync(tmpScroll, `tell application "Google Chrome" to tell active tab of front window to execute javascript "${js.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`);
+				const scrollScript = `tell application "Google Chrome" to tell active tab of front window to execute javascript "${js.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
 				let _out = '';
-				try { _out = execSync(`osascript ${tmpScroll}`, { timeout: 5_000 }).toString().trim(); }
+				try { _out = execFileSync('osascript', ['-e', scrollScript], { timeout: 5_000 }).toString().trim(); }
 				catch (e) { _noteHint(e); console.log(`${ts()} [Scroll] osascript error (target branch): ${e instanceof Error ? e.message : e}`); }
-				try { unlinkSync(tmpScroll); } catch {}
 				try {
 					const d = JSON.parse(_out);
 					_scrollMoved = !!d.moved;
@@ -284,10 +281,7 @@ end repeat
 end repeat
 return "not found"
 end tell`;
-			const tmpFile = `/tmp/sutando-switchtab-${Date.now()}.scpt`;
-			writeFileSync(tmpFile, script);
-			const result = execSync(`osascript ${tmpFile}`, { timeout: 5_000 }).toString().trim();
-			try { unlinkSync(tmpFile); } catch {}
+			const result = execFileSync('osascript', ['-e', script], { timeout: 5_000 }).toString().trim();
 			if (result === 'not found') {
 				console.log(`${ts()} [SwitchTab] no tab matching "${keyword}"`);
 				return { error: `No Chrome tab found matching "${keyword}"` };
@@ -524,21 +518,9 @@ export const clickTool: ToolDefinition = {
 		if (!isMacOS()) return macOSOnlyError('click');
 		try {
 			if (shortcut) {
-				// Parse shortcut like "cmd+shift+5"
-				const parts = shortcut.toLowerCase().split('+');
-				const key = parts.pop()!;
-				const modifiers = parts.map(m => {
-					if (m === 'cmd' || m === 'command') return 'command down';
-					if (m === 'shift') return 'shift down';
-					if (m === 'ctrl' || m === 'control') return 'control down';
-					if (m === 'alt' || m === 'option') return 'option down';
-					return '';
-				}).filter(Boolean).join(', ');
-				const keyCode = key.length === 1 ? `"${key}"` : `${key}`;
-				const cmd = modifiers
-					? `tell application "System Events" to keystroke ${keyCode} using {${modifiers}}`
-					: `tell application "System Events" to keystroke ${keyCode}`;
-				execFileSync('osascript', ['-e', cmd], { timeout: 5_000 });
+				const built = shortcutScript(shortcut);
+				if ('error' in built) return { error: `click failed: ${built.error}` };
+				execFileSync('osascript', ['-e', built.script], { timeout: 5_000 });
 				console.log(`${ts()} [Click] shortcut: ${shortcut}`);
 				return { status: 'pressed', shortcut };
 			}
