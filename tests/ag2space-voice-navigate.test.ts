@@ -35,6 +35,7 @@ const {
 	NAVIGATE_UI_TIMEOUT_MS, NAVIGATE_UI_UNSUPPORTED_MESSAGE, NAVIGATE_UI_CLIENT_OUTDATED_MESSAGE, NAVIGATE_UI_ROOM_QUERY_MISSING_MESSAGE, NAVIGATION_PROMPT_RULE,
 } = await plugin('navigate.ts');
 const pluginTools = await plugin('tools.ts');
+const { pythonOnPath, resetCacheForTests } = await import('../src/python-binary.js');
 const { CURRENT_ROOM_PROMPT_RULE, CURRENT_ROOM_TURN_CHECK_RULE, setVoiceRoomVerifier } = await plugin('room-binding.ts');
 type SessionContextFrame = Record<string, unknown> & { version: number };
 /** The frame the AG2 Space client sends (webapp voiceRoomBinding.ts), before capabilities are added. */
@@ -502,6 +503,10 @@ describe('navigate_ui exposure — declared only where a client can answer it', 
 			primary: false, added_by: 'login', added_at: '2026-10-01T00:00:00Z', verified: true, server_source: 'identity', ...extra,
 		});
 		const write = (rows: unknown[]) => writeFileSync(join(ws, 'state', 'connections.json'), JSON.stringify({ schema_version: 1, connections: rows }));
+		// A Linux runner's /usr/bin/python3 reads as the macOS stub; name the interpreter outright.
+		const savedPy = process.env.SUTANDO_PY;
+		process.env.SUTANDO_PY = pythonOnPath() ?? '';
+		resetCacheForTests();
 		try {
 			assert.equal(enabledConnectionExists(ws), false, 'no record');
 			mkdirSync(join(ws, 'state'), { recursive: true });
@@ -510,6 +515,8 @@ describe('navigate_ui exposure — declared only where a client can answer it', 
 			write([row('s-space', 's.space', { primary: true })]);
 			assert.equal(enabledConnectionExists(ws), true, 'an s.space-only install');
 		} finally {
+			if (savedPy === undefined) delete process.env.SUTANDO_PY; else process.env.SUTANDO_PY = savedPy;
+			resetCacheForTests();
 			rmSync(ws, { recursive: true, force: true });
 		}
 	});

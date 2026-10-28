@@ -1168,11 +1168,6 @@ def read_rows(workspace: Optional[Path] = None) -> list:
         return []
 
 
-def primary_row(workspace: Optional[Path] = None) -> Optional[dict]:
-    """The primary row, read only; None when no row is primary or the record is unreadable."""
-    return next((r for r in read_rows(workspace) if r["primary"]), None)
-
-
 def primary_server(workspace: Optional[Path] = None) -> str:
     """The primary row's homeserver, "" when there is none: the install's default server, which a
     caller passes to `dotspace` instead of naming one."""
