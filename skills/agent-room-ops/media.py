@@ -66,7 +66,7 @@ def fetch_media(ref, agent_mxid=None, room_id=None, *, gate=None, dest_dir=None)
     gate = load_gate() if gate is None else gate
     if not gate_allows(agent_mxid, room_id, gate):
         return _result(False, ref=ref, room_id=room_id, reason=f"client gate denied for {agent_mxid}")
-    base, headers = gateway()
+    base, headers = gateway(room_id)
     if not base:
         return _result(False, ref=ref, room_id=room_id, reason="no gateway configured")
     from _gateway import urlencode
@@ -117,7 +117,7 @@ def send_media(room_id, path, agent_mxid=None, *, gate=None, caption=None):
         return _result(False, room_id=room_id, reason=f"stat failed: {e}")
     if size > MAX_BYTES:
         return _result(False, room_id=room_id, path=path, reason=f"file exceeds {MAX_BYTES} bytes")
-    base, headers = gateway()
+    base, headers = gateway(room_id)
     if not base:
         return _result(False, room_id=room_id, reason="no gateway configured")
     try:
