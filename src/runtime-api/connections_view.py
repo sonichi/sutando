@@ -123,7 +123,7 @@ class ConnectionsView:
 
     # ── connection.promote ──────────────────────────────────────────────────
     def promote(self, params: dict) -> dict:
-        """{connection, previous, stopped_pid, launch, changed}: the primary moved, the old one parked."""
+        """{connection, previous, stopped_pid, launch, changed, relaunch_needed}: the primary moved, the old one parked."""
         instance = self._instance(params)
         try:
             row = connections.promote(instance, repo=self.repo, logs_dir=self.logs_dir, workspace=self.workspace,
@@ -133,7 +133,8 @@ class ConnectionsView:
         except connections.ConnectionsError as e:
             raise ProtocolError(-32602, str(e))
         return {"connection": connections.status_for(row, self.workspace), "previous": row["previous"],
-                "stopped_pid": row["stopped_pid"], "launch": row["launch"], "changed": row["changed"]}
+                "stopped_pid": row["stopped_pid"], "launch": row["launch"], "changed": row["changed"],
+                "relaunch_needed": row["relaunch_needed"]}
 
     # ── connection.unpark ───────────────────────────────────────────────────
     def unpark(self, params: dict) -> dict:

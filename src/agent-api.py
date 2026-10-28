@@ -194,13 +194,16 @@ def connections_http(method: str, path: str, body: dict, query: Optional[dict] =
     POST <instance>/promote moves it while the old primary runs and parks the old one,
     POST <instance>/unpark brings a parked row back, POST <instance>/disconnect stops and disables,
     POST <instance>/reconnect relaunches,
-    POST <instance>/token replaces the secret with a new code for the same connection.
-    Dispatch only; every rule lives in src/connections.py."""
+    POST <instance>/token replaces the secret with a new code for the same connection;
+    <instance> `legacy` names the legacy row. Dispatch only; every rule lives in src/connections.py."""
     ws = Path(workspace) if workspace is not None else WORKSPACE_DIR
     repo = Path(repo) if repo is not None else REPO_DIR
     logs_dir = Path(logs_dir) if logs_dir is not None else ws / "logs"
     query = query or {}
     parts = [x for x in path[len(CONNECTIONS_PREFIX):].split("/") if x]
+    # The legacy row's instance is "", which no path segment can carry.
+    if parts[:1] == [_connections.LEGACY_PATH_SEGMENT]:
+        parts[0] = ""
     try:
         if method == "GET" and not parts:
             rows = _connections.list_connections(ws, vault=vault)
@@ -249,7 +252,8 @@ def connections_http(method: str, path: str, body: dict, query: Optional[dict] =
             row = _connections.promote(parts[0], repo=repo, logs_dir=logs_dir, workspace=ws, vault=vault,
                                        spawn=spawn, kill=kill)
             return 200, {"connection": _connections.status_for(row, ws), "previous": row["previous"],
-                         "stopped_pid": row["stopped_pid"], "launch": row["launch"], "changed": row["changed"]}
+                         "stopped_pid": row["stopped_pid"], "launch": row["launch"], "changed": row["changed"],
+                         "relaunch_needed": row["relaunch_needed"]}
         if len(parts) == 2 and method == "POST" and parts[1] == "unpark":
             row = _connections.unpark(parts[0], repo=repo, logs_dir=logs_dir, workspace=ws, vault=vault, spawn=spawn)
             return 200, {"connection": _connections.status_for(row, ws), "launch": row["launch"]}

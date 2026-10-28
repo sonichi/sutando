@@ -127,6 +127,10 @@ def cmd_promote(args) -> int:
     parked = row["previous"]
     tail = "" if parked is None else f"; parked {parked or '(legacy)'}" + (
         f" (stopped pid {row['stopped_pid']})" if row.get("stopped_pid") else "")
+    if row.get("legacy_stopped_pid"):
+        tail += f"; parked the rowless legacy bridge (stopped pid {row['legacy_stopped_pid']})"
+    if row.get("relaunch_needed"):
+        tail += "; its bridge runs without the proactive room: restart it"
     print(f"primary is now {row['instance'] or '(legacy)'} ({row['server']}){tail}")
     return 0
 

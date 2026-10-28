@@ -211,7 +211,15 @@ class ViewTests(unittest.TestCase):
     def test_promote_moves_the_primary_off_a_running_legacy_bridge_and_unpark_brings_it_back(self):
         from _helpers import bridge_lease
         started = []
-        self.view.spawn, self.view.kill = bridge_lease.spawner(self.ws, started=started), None
+        inner = bridge_lease.spawner(self.ws, started=started)
+
+        def spawn(argv, env, log_path):
+            proc = inner(argv, env, log_path)
+            status = self.ws / "state" / f"gateway-status.{env['GATEWAY_INSTANCE']}.json"
+            status.parent.mkdir(parents=True, exist_ok=True)
+            status.write_text(json.dumps({"pid": proc.pid, "connected": True}))
+            return proc
+        self.view.spawn, self.view.kill = spawn, None
         connections.import_from_env({"REMOTE_TASK_TOKEN": TOKEN_A}, workspace=self.ws, vault=self.vault)
         connections.add_connection(TOKEN_B, added_by="owner", expected_server="beta-fixture.net", workspace=self.ws,
                                    vault=self.vault, preview=connections.preview_connection(TOKEN_B, fetch=self.gateway,
@@ -220,8 +228,8 @@ class ViewTests(unittest.TestCase):
         try:
             out = self.call("connection.promote", instance="beta-fixture-net")
             legacy.wait(5)
-            self.assertEqual((out["connection"]["primary"], out["previous"], out["stopped_pid"], out["changed"]),
-                             (True, "", legacy.pid, True))
+            self.assertEqual((out["connection"]["primary"], out["previous"], out["stopped_pid"], out["changed"],
+                              out["relaunch_needed"]), (True, "", legacy.pid, True, False))
             self.assertEqual(out["launch"]["pid"], started[0].pid)
             listed = {r["instance"]: r for r in self.call("connection.list")["connections"]}
             self.assertEqual((listed[""]["state"], listed[""]["reason"], listed[""]["parked"]), ("parked", "parked", True))

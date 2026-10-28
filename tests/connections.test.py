@@ -2112,10 +2112,30 @@ class Promote(Base):
     def setUp(self):
         super().setUp()
         self.events = []
-        self.spawn = self.bridge_spawn(lambda argv, env, log_path: self.events.append(("spawn", env["GATEWAY_INSTANCE"])))
+        self.spawned_env = []
+        self.connects = True
+        self.spawn = self.connecting_spawn()
         C.import_from_env({"REMOTE_TASK_TOKEN": "https://chat.s.space|legacy"}, workspace=self.ws, vault=self.vault)
         self.add(TOKEN_B, fetch=agents("@s:beta-fixture.net"))
         self.assertEqual(C.primary_instance(self.ws), "", "the legacy row is primary")
+
+    def connecting_spawn(self):
+        """The test bridge, plus the status file a real one writes once the gateway answers its poll."""
+        inner = self.bridge_spawn(lambda argv, env, log_path: (
+            self.events.append(("spawn", env["GATEWAY_INSTANCE"])),
+            self.spawned_env.append((C.primary_instance(self.ws), env.get("REMOTE_PROACTIVE_ROOM")))))
+
+        def spawn(argv, env, log_path):
+            proc = inner(argv, env, log_path)
+            if self.connects:
+                self.sidecar(env["GATEWAY_INSTANCE"], connected=True, pid=proc.pid)
+            return proc
+        return spawn
+
+    def sidecar(self, instance, **fields):
+        path = self.ws / "state" / f"gateway-status.{instance}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(fields))
 
     def legacy(self):
         proc = bridge_lease.start(self.ws, "")
@@ -2129,7 +2149,8 @@ class Promote(Base):
     def promote(self, instance, **kw):
         kw.setdefault("kill", self.kill)
         kw.setdefault("spawn", self.spawn)
-        return C.promote(instance, repo=self.ws / "repo", logs_dir=self.ws / "logs", environ={}, workspace=self.ws,
+        kw.setdefault("environ", {})
+        return C.promote(instance, repo=self.ws / "repo", logs_dir=self.ws / "logs", workspace=self.ws,
                          vault=self.vault, **kw)
 
     def refusing(self, *pids):
@@ -2330,6 +2351,100 @@ class Promote(Base):
         self.assertEqual((rows[self.BETA].get("parked"), rows[self.ALPHA]["primary"]), (None, True),
                          "never parked over a bridge that is still up")
         self.assertTrue(C.bridge_pid(self.BETA, self.ws))
+
+    ROOM = "!proactive:s.space"
+
+    def test_the_primary_flips_before_the_new_bridge_launches_so_it_carries_the_proactive_room(self):
+        self.legacy()
+        out = self.promote(self.BETA, environ={"REMOTE_PROACTIVE_ROOM": self.ROOM})
+        self.assertEqual(self.spawned_env, [(self.BETA, self.ROOM)], "primary at spawn time, room in its env")
+        self.assertIs(out["relaunch_needed"], False)
+
+    def test_a_running_secondary_is_relaunched_as_the_primary_with_the_room(self):
+        self.legacy()
+        first = C.start(self.BETA, repo=self.ws / "repo", logs_dir=self.ws / "logs", environ={"REMOTE_PROACTIVE_ROOM": self.ROOM},
+                        workspace=self.ws, vault=self.vault, spawn=self.spawn)
+        self.assertEqual(self.spawned_env, [("", "")], "started as a secondary, without the room")
+        out = self.promote(self.BETA, environ={"REMOTE_PROACTIVE_ROOM": self.ROOM})
+        self.assertIn(("kill", first["pid"]), self.events, "the secondary bridge is stopped")
+        self.assertEqual(self.spawned_env[-1], (self.BETA, self.ROOM))
+        self.assertEqual((out["launch"]["lease"], out["relaunch_needed"]), ("held", False))
+        self.assertEqual(C.bridge_pid(self.BETA, self.ws), out["launch"]["pid"])
+
+    def test_promoting_back_to_the_legacy_row_says_its_bridge_needs_a_relaunch(self):
+        self.legacy()
+        self.promote(self.BETA)
+        C.unpark("", repo=self.ws, logs_dir=self.ws, workspace=self.ws, vault=self.vault)
+        self.legacy()
+        self.assertIs(self.promote("")["relaunch_needed"], True, "it settled the room while a named row was primary")
+
+    def test_the_old_bridge_survives_when_the_new_one_never_connects(self):
+        legacy = self.legacy()
+        self.connects = False
+        with self.assertRaises(C.NewPrimaryNotConnected) as cm:
+            self.promote(self.BETA, connect_timeout_s=0.5)
+        self.assertEqual((cm.exception.CODE, cm.exception.reason), ("new_primary_not_connected", "timeout"))
+        self.assertIsInstance(cm.exception, C.Refusal)
+        self.assertNotIn(("kill", legacy.pid), self.events)
+        self.assertEqual((C.bridge_pid("", self.ws), C.bridge_pid(self.BETA, self.ws)), (legacy.pid, 0))
+        self.assertEqual(C.primary_instance(self.ws), "", "the primary flips back")
+        self.assertFalse(C.legacy_parked(self.ws))
+        self.assertTrue(C.owns_unaddressed("", self.ws))
+
+    def test_a_rejected_token_rolls_back_without_waiting_out_the_deadline(self):
+        legacy = self.legacy()
+        self.connects = False
+        inner = self.spawn
+
+        def spawn(argv, env, log_path):
+            proc = inner(argv, env, log_path)
+            self.sidecar(env["GATEWAY_INSTANCE"], connected=False, pid=proc.pid, error="HTTP Error 401: Unauthorized")
+            return proc
+        t0 = time.monotonic()
+        with self.assertRaises(C.NewPrimaryNotConnected) as cm:
+            self.promote(self.BETA, spawn=spawn, connect_timeout_s=30)
+        self.assertLess(time.monotonic() - t0, 10)
+        self.assertEqual(cm.exception.reason, "auth_rejected")
+        self.assertEqual((C.bridge_pid("", self.ws), C.primary_instance(self.ws)), (legacy.pid, ""))
+
+    def test_a_secondary_stopped_for_the_relaunch_comes_back_when_the_promote_rolls_back(self):
+        self.legacy()
+        C.start(self.BETA, repo=self.ws / "repo", logs_dir=self.ws / "logs", environ={}, workspace=self.ws,
+                vault=self.vault, spawn=self.spawn)
+        self.connects = False
+        with self.assertRaises(C.NewPrimaryNotConnected):
+            self.promote(self.BETA, connect_timeout_s=0.5)
+        self.assertTrue(C.bridge_pid(self.BETA, self.ws), "running again as a secondary")
+        self.assertEqual(self.spawned_env[-1], ("", ""))
+
+    def covered_legacy(self):
+        """An install whose REMOTE_TASK_TOKEN names a server a named row already covers: no legacy row."""
+        with C._transaction(self.ws) as rec:
+            rec["rows"] = [r for r in rec["rows"] if r["instance"]]
+        C.import_from_env({"REMOTE_TASK_TOKEN": TOKEN_B}, workspace=self.ws, vault=self.vault)
+        self.assertNotIn("", self.by_inst(), "the env token gets no row")
+        self.add(fetch=agents("@a:alpha-fixture.net"))
+        return self.legacy()
+
+    def test_a_legacy_bridge_a_named_row_covers_is_stopped_and_parked(self):
+        legacy = self.covered_legacy()
+        out = self.promote(self.ALPHA)
+        self.assertEqual((out["legacy_stopped_pid"], out["changed"]), (legacy.pid, True))
+        legacy.wait(5)
+        self.assertEqual(C.bridge_pid("", self.ws), 0)
+        self.assertTrue(C.legacy_parked(self.ws), "its launchers and the bridge itself stand down")
+        self.assertEqual(sorted(e["instance"] for e in C.launch_plan({}, workspace=self.ws)), [self.ALPHA, self.BETA])
+        out = C.unpark("", repo=self.ws, logs_dir=self.ws, workspace=self.ws, vault=self.vault)
+        self.assertEqual((out["instance"], out["launch"]), ("", None))
+        self.assertFalse(C.legacy_parked(self.ws))
+
+    def test_a_covered_legacy_bridge_stays_up_when_the_new_one_never_connects(self):
+        legacy = self.covered_legacy()
+        self.connects = False
+        with self.assertRaises(C.NewPrimaryNotConnected):
+            self.promote(self.ALPHA, connect_timeout_s=0.5)
+        self.assertEqual(C.bridge_pid("", self.ws), legacy.pid)
+        self.assertFalse(C.legacy_parked(self.ws))
 
     def test_an_unreadable_record_parks_nothing(self):
         C.record_path(self.ws).write_text("{broken")

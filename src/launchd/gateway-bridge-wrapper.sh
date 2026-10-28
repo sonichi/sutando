@@ -215,7 +215,7 @@ while [ "$STOPPING" = 0 ]; do
   [ "$STOPPING" = 0 ] || break
   # Stopped by a primary move (or stood down on it): no alert, and the loop above waits.
   python3 "$REPO/scripts/connections.py" legacy-parked >/dev/null 2>&1 && continue
-  [ "$CHILD_RC" -eq 75 ] &&{ stop_agents_supervisor; rm -f "$MARKER"; exit 0; }
+  [ "$CHILD_RC" -eq 75 ] && { stop_agents_supervisor; rm -f "$MARKER"; exit 0; }
   # rc 69 is the bridge's poll-stall exit: an outage, already in its log and status file.
   if [ "$CHILD_RC" -eq 69 ]; then
     echo "[gateway-bridge-wrapper] bridge exited on a poll stall (rc 69); relaunching without an owner alert" >&2
