@@ -41,6 +41,8 @@ def _load(name, path):
     return mod
 
 
+ciw = _load("ciw_primary", REPO / "src" / "core-input-watch.py")
+ss = _load("ss_primary", REPO / "src" / "services_status.py")
 hc = _load("hc_primary", REPO / "src" / "health-check.py")
 rh = _load("rh_primary", REPO / "src" / "runtime-health.py")
 rd = _load("rundir_primary", REPO / "src" / "runtime-api" / "rundir.py")
@@ -118,6 +120,53 @@ class MovedInstall(unittest.TestCase):
         Install(self, None)
         self.assertEqual(hc._gateway_primary_sidecar().name, "gateway-status.json")
         self.assertEqual(hc._gateway_connected_detail(), "running + connected")
+
+
+class SiblingReaders(unittest.TestCase):
+    """core-input-watch and the services row read the primary's sidecar through one helper."""
+
+    ROWS = [row("ag2.space", "", parked=True), row("s.space", "s-space", primary=True)]
+
+    def test_the_helper_names_the_primary_sidecar_or_the_unsuffixed_one(self):
+        inst = Install(self, self.ROWS)
+        self.assertEqual(connections.primary_sidecar_name(inst.state), "gateway-status.s-space.json")
+        bare = Install(self, None)
+        self.assertEqual(connections.primary_sidecar_name(bare.state), "gateway-status.json")
+
+    def test_an_unreadable_record_names_the_unsuffixed_sidecar(self):
+        inst = Install(self, None)
+        (inst.state / "connections.json").write_text("{not json")
+        self.assertEqual(connections.primary_sidecar_name(inst.state), "gateway-status.json")
+
+    def test_gateway_alive_follows_the_primary_not_the_parked_legacy_file(self):
+        inst = Install(self, self.ROWS)
+        inst.sidecar("", connected=False, age_s=5)  # parked bridge, fresh but down
+        inst.sidecar("s-space")
+        with mock.patch.object(ciw, "_pgrep", side_effect=AssertionError("fell back to pgrep")):
+            self.assertIs(ciw.gateway_alive("", str(inst.state)), True)
+
+    def test_gateway_alive_reads_down_from_the_primary_sidecar(self):
+        inst = Install(self, self.ROWS)
+        inst.sidecar("", age_s=5)
+        inst.sidecar("s-space", connected=False)
+        with mock.patch.object(ciw, "_pgrep", side_effect=AssertionError("fell back to pgrep")):
+            self.assertIs(ciw.gateway_alive("", str(inst.state)), False)
+
+    def test_services_row_probes_the_primary_sidecar(self):
+        inst = Install(self, self.ROWS)
+        with mock.patch.object(ss, "STATE_DIR", inst.state):
+            spec = next(s for s in ss.service_registry() if s["id"] == "gateway")
+        self.assertEqual(spec["probe"][1], inst.state / "gateway-status.s-space.json")
+        inst.sidecar("s-space")
+        status, _, _ = ss.probe_gateway(spec["probe"][1], "x", time.time(), pgrep=lambda pat: [])
+        self.assertEqual(status, "running")
+
+    def test_lane_label_and_skip_use_stored_rows_only(self):
+        Install(self, self.ROWS + [row("dev.s.space", "dev", disabled=True)])
+        with mock.patch.object(connections, "status_for", side_effect=AssertionError("probed")):
+            self.assertEqual(hc._gateway_lane_label("dev"), "dev (dev.s.space)")
+            skip = hc._gateway_lanes_not_served(hc.WORKSPACE_DIR / "state")
+        self.assertTrue({"", "s-space", "dev"} <= skip)
 
 
 class ThreeServers(unittest.TestCase):

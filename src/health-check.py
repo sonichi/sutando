@@ -6969,17 +6969,15 @@ def check_gateway_bridge() -> "dict | None":
 
 
 def _gateway_rows(workspace: "Path | None" = None) -> "list[dict]":
-    """`connections.status_for` of every row; [] on an install with no connections record."""
+    """Every row as stored (no sidecar read, no lease probe); [] with no connections record."""
     import connections  # noqa: PLC0415
-    ws = WORKSPACE_DIR if workspace is None else workspace
-    return [connections.status_for(r, ws) for r in connections.read_rows(ws)]
+    return connections.read_rows(WORKSPACE_DIR if workspace is None else workspace)
 
 
 def _gateway_primary_sidecar() -> Path:
     """The primary connection's status sidecar; the unsuffixed one when no row is primary."""
     import connections  # noqa: PLC0415
-    row = connections.primary_row(WORKSPACE_DIR)
-    return Path(status_read_path(connections.sidecar_name(row["instance"] if row else ""), WORKSPACE_DIR))
+    return Path(status_read_path(connections.primary_sidecar_name(WORKSPACE_DIR / "state"), WORKSPACE_DIR))
 
 
 def _gateway_where() -> str:
@@ -7001,7 +6999,7 @@ def _gateway_lanes_not_served(state_dir: Path) -> "set[str]":
     root = Path(state_dir)
     out = set()
     for r in _gateway_rows(root.parent if root.name == "state" else root):
-        if r.get("primary") or r.get("state") == "parked":
+        if r.get("primary") or r.get("parked") or r.get("disabled"):
             out.update([r["instance"], *connections.alias_instances(r)])
     return out
 

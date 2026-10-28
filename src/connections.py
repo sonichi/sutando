@@ -1808,6 +1808,16 @@ def sidecar_name(instance: str) -> str:
     return f"gateway-status{'.' + instance if instance else ''}.json"
 
 
+def primary_sidecar_name(state_dir: Path) -> str:
+    """The primary row's sidecar name, read from the record under `state_dir`; the unsuffixed
+    name when no row is primary or the record is unreadable."""
+    try:
+        rows = _read(Path(state_dir) / STATE_NAME)
+    except (SchemaError, OSError):
+        rows = []
+    return sidecar_name(next((r["instance"] for r in rows if r["primary"]), ""))
+
+
 def _sidecar(instance: str, workspace: Optional[Path]) -> dict:
     from workspace_default import status_read_path
     return _read_json(status_read_path(sidecar_name(instance), _workspace(workspace)))

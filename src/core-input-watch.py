@@ -503,6 +503,11 @@ GATEWAY_STATUS_MAX_AGE_S = 90.0
 GATEWAY_OUTAGE_MAX_AGE_S = 90.0
 
 
+def _primary_sidecar_name(state_dir):
+    from connections import primary_sidecar_name
+    return primary_sidecar_name(state_dir)
+
+
 def _gateway_status(state_dir):
     """Read the bridge's own liveness sidecar. Returns True/False if the file
     is present and fresh, else None (meaning: no opinion, fall back to pgrep).
@@ -526,7 +531,7 @@ def _gateway_status(state_dir):
         # Serving verdict is gateway_serving's; the freshness window and the
         # reconnect grace below are this reader's. Stale -> None, as before.
         v = read_gateway_verdict(
-            os.path.join(state_dir, "gateway-status.json"),
+            os.path.join(state_dir, _primary_sidecar_name(state_dir)),
             now=now,
             max_age=GATEWAY_STATUS_MAX_AGE_S,
         )
@@ -546,7 +551,7 @@ def _gateway_status(state_dir):
 def gateway_alive(app_data, state_dir=None):
     """Whether the relay gateway is up.
 
-    Prefer the bridge's OWN status sidecar (state/gateway-status.json), which
+    Prefer the bridge's OWN status sidecar (the primary connection's state/gateway-status sidecar), which
     remote_gateway_bridge rewrites on every poll outcome. It reports whether the
     connection is *serving*; the pgrep paths below only ever answered "is there a
     process whose argv looks right", which is a proxy for the wrong thing.
