@@ -119,6 +119,11 @@ the packaged gateway: `_probe_rename()` calls `ctypes.CDLL(None)` before reachin
 its existing Windows `os.rename` branch. Preserve this failed evidence until a
 fix has its own Windows result; passing lock tests must not hide a failed import.
 
+Follow-up [PR #5963](https://github.com/sonichi/sutando/pull/5963) fixes that
+quarantine probe and passes 13 native no-clobber tests. The gateway then reaches
+an unrelated unconditional `fcntl` import in `task_hold.py`; full Windows gateway
+startup remains blocked and needs its own fix and end-to-end verification.
+
 The [Windows runtime workflow](../.github/workflows/windows-runtime.yml) runs on
 schedule, manual dispatch, or the `windows-ci` PR label. It is skipped on ordinary
 PRs and is not a required check. A green Ubuntu check cannot replace a Windows
