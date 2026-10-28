@@ -212,12 +212,12 @@ class TestOwnerRoomAccess(Base):
     def test_pending_questions_serve_opens_the_room_with_its_servers_credentials(self):
         pq = importlib.import_module("pending_questions_room_db")
         args = types.SimpleNamespace(skill_scripts=str(self.scripts), collab_url=None,
-                                     room=ROOMS["ag2.space"], user_id="@a:x")
+                                     room=ROOMS["dev.s.space"], user_id="@a:x")
         with mock.patch.object(pq, "apply", mock.AsyncMock(return_value=[])):
             asyncio.run(pq._serve(args, {"op": "rows", "schema": {"id": "pendingq"}}))
         import room_collab_client
         self.assertEqual(room_collab_client.OPENED[-1],
-                         (origin("ag2.space"), ROOMS["ag2.space"], secret("ag2.space")))
+                         (origin("dev.s.space"), ROOMS["dev.s.space"], secret("dev.s.space")))
 
 
 class TestCronRoom(Base):
