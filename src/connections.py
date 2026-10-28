@@ -214,6 +214,16 @@ class NewPrimaryNotConnected(Refusal):
         self.reason = reason
 
 
+class PromoteConflict(Refusal):
+    """The primary moved, or the row `promote` was to park changed, while it waited for the new bridge."""
+
+    CODE = "promote_conflict"
+
+    def __init__(self, instance: str):
+        super().__init__(f"{self.CODE}: the primary moved while {instance} was connecting; the other change "
+                         "stands, the bridge this call started is stopped and nothing was parked")
+
+
 class LegacyRowUnmanaged(Refusal):
     """The unsuffixed bridge is launched by the environment, not by this directory."""
 
@@ -1172,10 +1182,11 @@ def promote(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Mapp
     row covers its server) is stopped and parked as well (`legacy_parked`). Ownership moves at the
     flip (`owns_unaddressed` reads the record per pass): until the new bridge polls nobody owns
     unaddressed messages, and they wait. Refused before anything changes: a disabled row. A start
-    that fails is `NewPrimaryNotStarted`, one that never connects `NewPrimaryNotConnected`; those
-    and a refused stop (`BridgeStillRunning`, `BridgeLeaseIndeterminate`) re-raise after the
-    rollback: the primary flag and a cleared `parked` flag are restored, a bridge this call
-    started is stopped and one it stopped is started again, and the old bridge was never touched
+    that fails is `NewPrimaryNotStarted`, one that never connects `NewPrimaryNotConnected`; those,
+    a refused stop (`BridgeStillRunning`, `BridgeLeaseIndeterminate`) and `PromoteConflict` (the
+    primary moved, or the row to park was removed or parked, while it waited) re-raise after the
+    rollback: the primary flag (never over a newer move) and a cleared `parked` flag are restored,
+    a bridge this call started is stopped and one it stopped is started again, and the old bridge was never touched
     (a rowless legacy bridge already stopped stays parked). The legacy row is `_promote_legacy`.
     Idempotent: on the current primary it only starts the bridge if it is down. The row carries
     `previous` (the parked instance, None when nothing was parked), `stopped_pid`,
@@ -1216,10 +1227,13 @@ def promote(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Mapp
     failure = None
     with locked_file(_lock_path(workspace), create_mode=0o600):
         rec = _read_record(path)
-        row = _find(rec["rows"], instance)
+        row = next((r for r in rec["rows"] if r["instance"] == instance), None)
         old = next((r for r in rec["rows"] if old_inst is not None and r["instance"] == old_inst), None)
         stopped = legacy_stopped = 0
         try:
+            # Another writer may have moved the primary while the new bridge connected.
+            if row is None or not row["primary"] or (old_inst is not None and (old is None or old.get("parked"))):
+                raise PromoteConflict(instance)
             if row.get("disabled"):
                 raise DisabledCannotBePrimary(instance)
             if not any(not r["instance"] for r in rec["rows"]):
@@ -1227,7 +1241,7 @@ def promote(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Mapp
                 rec[LEGACY_PARKED_KEY] = rec[LEGACY_PARKED_KEY] or bool(legacy_stopped)
             stopped = _stop_row(old, workspace, kill) if old is not None else 0
         except ConnectionsError as e:
-            _undo_promote(rec, **undo)
+            _undo_promote(rec, **undo, restore_primary=not isinstance(e, PromoteConflict))
             failure = e
         else:
             if old is not None:
@@ -1298,9 +1312,11 @@ def _await_connected(instance: str, pid: int, workspace: Optional[Path], timeout
 
 
 def _undo_promote(rec: dict, *, instance: str, before: Optional[str], was_parked: bool,
-                  workspace: Optional[Path], kill, started: int, relaunched: bool) -> None:
-    """Under the record lock: stop the bridge `promote` started, put the primary back on `before` and
-    restore the row's `parked` flag; a bridge that will not stop keeps the row unparked."""
+                  workspace: Optional[Path], kill, started: int, relaunched: bool,
+                  restore_primary: bool = True) -> None:
+    """Under the record lock: stop the bridge `promote` started, put the primary back on `before`
+    (unless another writer moved it since) and restore the row's `parked` flag; a bridge that will
+    not stop keeps the row unparked."""
     down = True
     if started:
         try:
@@ -1308,7 +1324,8 @@ def _undo_promote(rec: dict, *, instance: str, before: Optional[str], was_parked
         except ConnectionsError:
             down = False
     for r in rec["rows"]:
-        r["primary"] = r["instance"] == before
+        if restore_primary:
+            r["primary"] = r["instance"] == before
         if r["instance"] == instance and was_parked and down:
             r["parked"] = True
     _write(record_path(workspace), rec)

@@ -2417,6 +2417,47 @@ class Promote(Base):
         self.assertTrue(C.bridge_pid(self.BETA, self.ws), "running again as a secondary")
         self.assertEqual(self.spawned_env[-1], ("", ""))
 
+    def flipping_during_connect(self, move):
+        """`_await_connected` that runs `move` (another writer) before it returns."""
+        real = C._await_connected
+
+        def await_connected(*a, **kw):
+            real(*a, **kw)
+            move()
+        return unittest.mock.patch.object(C, "_await_connected", await_connected)
+
+    def test_a_set_primary_during_the_connect_wait_is_a_conflict_and_stands(self):
+        legacy = self.legacy()
+        self.add(fetch=agents("@a:alpha-fixture.net"))
+
+        def panel_move():
+            with C._transaction(self.ws) as rec:
+                for r in rec["rows"]:
+                    r["primary"] = r["instance"] == self.ALPHA
+        with self.flipping_during_connect(panel_move), self.assertRaises(C.PromoteConflict) as cm:
+            self.promote(self.BETA)
+        self.assertEqual(cm.exception.CODE, "promote_conflict")
+        self.assertIsInstance(cm.exception, C.Refusal)
+        self.assertEqual(C.primary_instance(self.ws), self.ALPHA, "the other writer's move is not overwritten")
+        self.assertNotIn(("kill", legacy.pid), self.events, "nothing parked or stopped on a stale owner")
+        self.assertEqual((C.bridge_pid("", self.ws), C.bridge_pid(self.BETA, self.ws)), (legacy.pid, 0))
+        self.assertFalse(any(r.get("parked") for r in self.rows()))
+
+    def test_a_parked_target_keeps_its_flag_when_the_promote_conflicts(self):
+        self.legacy()
+        self.add(fetch=agents("@a:alpha-fixture.net"))
+        self.promote(self.BETA)
+        self.promote(self.ALPHA)
+
+        def park_alpha_elsewhere():
+            with C._transaction(self.ws) as rec:
+                C._find(rec["rows"], self.ALPHA)["parked"] = True
+        with self.flipping_during_connect(park_alpha_elsewhere), self.assertRaises(C.PromoteConflict):
+            self.promote(self.BETA)
+        rows = self.by_inst()
+        self.assertEqual((rows[self.BETA].get("parked"), C.bridge_pid(self.BETA, self.ws)), (True, 0))
+        self.assertTrue(C.bridge_pid(self.ALPHA, self.ws), "the old owner's bridge was not stopped")
+
     def covered_legacy(self):
         """An install whose REMOTE_TASK_TOKEN names a server a named row already covers: no legacy row."""
         with C._transaction(self.ws) as rec:

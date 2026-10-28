@@ -49,6 +49,7 @@ which say what reading the vault back found.
 | `parked_cannot_be_primary` | `set_primary` | The row is parked and would not launch. `promote` it (which un-parks it and starts its bridge), or `unpark` it first. |
 | `legacy_bridge_not_running` | `promote` | The target is the legacy row and its bridge is not running; the engine never launches that bridge, so `unpark` it, start it (`bash src/startup.sh`, or let the launchd job resume it), then promote. Nothing changed. |
 | `new_primary_not_started` | `promote` | The new row's bridge did not start (the message names the launch `reason`). The old primary was never stopped; the primary flag and a `parked` flag the call cleared are restored. |
+| `promote_conflict` | `promote` | Another writer moved the primary, or removed or parked the row this promote was to park, while the new bridge was connecting. That change stands: the bridge this call started is stopped, a `parked` flag it cleared is restored, and nothing was parked or stopped. Re-read the list and retry if still wanted. |
 | `new_primary_not_connected` | `promote` | The new row's bridge started but its own status never showed a gateway poll within `CONNECT_TIMEOUT_S` (`reason: timeout`), showed its token rejected (`auth_rejected`), or the bridge exited (`exited`). Rolled back: that bridge is stopped, the primary and `parked` flags are restored, a secondary bridge the call stopped to relaunch is started again, and the old primary's bridge was never touched. |
 | `legacy_row_unmanaged` | `disconnect`, `update_token` | The legacy unsuffixed row (`instance: ""`) is launched from `REMOTE_TASK_TOKEN` in the environment, not from this directory; change that variable instead. |
 | `bridge_still_running` | `disconnect`, `remove`, `reconnect`, `update_token`, `promote` | The bridge still held its lease past the stop deadline, released it but was still running at the deadline, or refused the signal; the message names the pid. Nothing changed: the row stays (never marked `disabled` over a live process), `remove` keeps the row, launch record, status file and vault key, `reconnect` spawns no second bridge, and `update_token` writes nothing and says the bridge was not confirmed stopped and may still be running on the old code. `promote` rolls back: the old primary stays primary and unparked, a bridge the call started for the new row is stopped and a `parked` flag it cleared is restored (left cleared when that bridge will not stop either). Retrying is safe. |
@@ -186,8 +187,10 @@ still up. In order:
    Steps 2 and 3 roll back on failure and the old primary's bridge is never touched.
 4. Under one hold of the record lock: stop the old owner's bridge by the same path `disconnect`
    uses (lease-proven pid, SIGTERM, wait for lease release and exit) and mark that row `parked`;
-   a legacy bridge with no row of its own is stopped and recorded as `legacy_parked`. A refused
-   stop rolls back as the table says.
+   a legacy bridge with no row of its own is stopped and recorded as `legacy_parked`. First it
+   checks the row is still the primary and the row to park is still there and unparked; if another
+   writer changed either during step 3, it is `promote_conflict`. A refused stop or a conflict
+   rolls back as the table says.
 
 `promote('')`, back to the legacy row, needs that bridge running (`legacy_bridge_not_running`:
 the engine never launches it) and runs step 4 alone. The legacy bridge settled the proactive room
@@ -196,7 +199,9 @@ when it started, so when a named row was primary it runs without the room: the a
 
 Ownership never doubles: delivery is claim-based and every bridge reads `owns_unaddressed` from the
 record on each pass, so before the flip only the old bridge owns unaddressed messages and cards,
-after it only the new one, and until the new bridge polls nobody does (they wait, never lost). The
+after it only the new one, and until the new bridge polls nobody does (they wait, never lost).
+During the connect wait (step 3, `CONNECT_TIMEOUT_S`, 60 s at most) both bridges hold
+`REMOTE_PROACTIVE_ROOM` in their environment; only the one `owns_unaddressed` names posts there. The
 result is the new row plus `previous` (the parked instance, `""` for the legacy row, `null` when
 nothing was parked), `stopped_pid`, `legacy_stopped_pid` (a rowless legacy bridge stopped, else 0),
 `launch` (the start record, `null` for the legacy row), `changed` and `relaunch_needed` (the new
@@ -434,7 +439,7 @@ not here.
   | `POST /api/v1/connections` | `{"token", "confirm": true, "expected_server", "added_by": "ui"}` | 201 `{"created": true, "launch": record, "connection": row}`, the bridge started (`launch` null for a disabled row); 200 `{"created": false, ...}` for an existing row, started when it was not running; 409 `{"error": "mismatch", "server_from_token", "expected_server"}`; 400 `{"error": ...}`; 503 `{"error": "vault_unavailable"}` |
   | `DELETE /api/v1/connections/<instance>[?force=1]` | — | 204; 409 `{"error": "primary"}`; 409 `bridge_still_running`; 404 |
   | `POST /api/v1/connections/<instance>/primary` | `{}` | 200 `{"connection": row}` (with `relaunch_needed`); 409 `{"error": "disabled_cannot_be_primary"}`, `legacy_primary_running` or `bridge_lease_indeterminate` (nothing moved); 404 |
-  | `POST /api/v1/connections/<instance>/promote` | `{}` | 200 `{"connection": row, "previous", "stopped_pid", "launch", "changed", "relaunch_needed"}`: the new row's bridge relaunched as primary and connected, the old owner's stopped and its row `parked`; 409 `disabled_cannot_be_primary`, `legacy_bridge_not_running`, `new_primary_not_started`, `new_primary_not_connected`, `bridge_still_running` or `bridge_lease_indeterminate` (rolled back, primary unmoved); 404 |
+  | `POST /api/v1/connections/<instance>/promote` | `{}` | 200 `{"connection": row, "previous", "stopped_pid", "launch", "changed", "relaunch_needed"}`: the new row's bridge relaunched as primary and connected, the old owner's stopped and its row `parked`; 409 `disabled_cannot_be_primary`, `legacy_bridge_not_running`, `new_primary_not_started`, `new_primary_not_connected`, `promote_conflict`, `bridge_still_running` or `bridge_lease_indeterminate` (rolled back, primary unmoved); 404 |
   | `POST /api/v1/connections/<instance>/unpark` | `{}` | 200 `{"connection": row, "launch": record}`: `parked` cleared and the bridge started as a secondary; 404 |
   | `POST /api/v1/connections/<instance>/disconnect` | `{}` | 200 `{"connection": row}` (`disabled: true`, state `parked`, bridge stopped and left down across restarts); 409 `{"error": "primary_cannot_disconnect"}` or `bridge_still_running` (row unchanged); 404 |
   | `POST /api/v1/connections/<instance>/reconnect` | `{}` | 202 `{"launch": record}`; clears `disabled` and starts the bridge now; 409 `bridge_still_running` |
