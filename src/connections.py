@@ -99,6 +99,8 @@ STATES = ("pending", "connected", "disconnected", "failed", "parked")
 SERVER_SOURCES = ("identity", "resolver", "gateway")
 # The bridge's own GATEWAY_INSTANCE charset; a row that fails it could never launch.
 INSTANCE_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
+# The desktop's device env file is the legacy row's credential file, never a named lane's.
+DEVICE_ENV_VAR = "AG2_DEVICE_ENV"
 # The HTTP path segment that names the legacy row, whose instance is "" (an empty segment is dropped).
 LEGACY_PATH_SEGMENT = "legacy"
 # Fixed names on the HTTP resource: a row so named could never be addressed there.
@@ -348,6 +350,10 @@ class InvalidToken(ConnectionsError):
 
 class NoToken(ConnectionsError):
     """No secret under the row's token_ref, in the environment or the vault."""
+
+
+class NoIdentity(ConnectionsError):
+    """A named row with no recorded agent: its bridge would run as whichever agent it inherited."""
 
 
 class LaunchFailed(ConnectionsError):
@@ -1898,12 +1904,13 @@ def launch_plan(environ: Optional[Mapping[str, str]] = None, *,
         if not r["instance"] or r.get("disabled") or r.get("parked"):
             continue
         plan.append({"instance": r["instance"], "token_ref": r["token_ref"],
-                     "channel_dir": channel_dir_for(r["instance"], environ), "primary": r["primary"]})
+                     "channel_dir": channel_dir_for(r["instance"], environ), "primary": r["primary"],
+                     "agent_mxid": r.get("agent_mxid") or ""})
     for inst, var in env_token_vars(environ):
         if inst in seen_inst or var in seen_ref:
             continue
         plan.append({"instance": inst, "token_ref": var,
-                     "channel_dir": channel_dir_for(inst, environ), "primary": False})
+                     "channel_dir": channel_dir_for(inst, environ), "primary": False, "agent_mxid": ""})
     return plan
 
 
@@ -1925,7 +1932,7 @@ def plan_entry(instance: str, environ: Optional[Mapping[str, str]] = None, *,
         if not var:
             raise UnknownConnection(f"no AG2_REMOTE_TOKEN variable names {instance!r}")
         return {"instance": instance, "token_ref": var, "channel_dir": channel_dir_for(instance, environ),
-                "primary": False}
+                "primary": False, "agent_mxid": ""}
     for entry in launch_plan(environ, workspace=workspace):
         if entry["instance"] == instance:
             return entry
@@ -1958,13 +1965,22 @@ def _token_file(entry: Mapping[str, str], environ: Mapping[str, str]) -> str:
 def launch_env(entry: Mapping[str, object], environ: Optional[Mapping[str, str]] = None, *,
                vault=None) -> dict:
     """The bridge's environment for one plan entry: the token from the env var of its token_ref,
-    else the vault; no gateway URL beside the token; the proactive room only for the primary."""
+    else the vault; no gateway URL beside the token; the proactive room only for the primary.
+    A named entry runs as its row's own agent (`NoIdentity` when the row has none), never one the
+    environment inherited, and without the legacy device env file."""
     environ = os.environ if environ is None else environ
     ref = str(entry["token_ref"])
     token = (environ.get(ref) or "").strip() or _vault_get(_vault(vault), ref)
     if not token:
         raise NoToken(f"no token under {ref}")
     env = dict(environ)
+    if entry["instance"]:
+        mxid = str(entry.get("agent_mxid") or "").strip()
+        if not server_of_mxid(mxid):
+            raise NoIdentity(f"connection {entry['instance']!r} has no recorded agent and its gateway named "
+                             "none; reconnect it once the gateway answers")
+        env = _agent_identity().launch_environ(env, mxid)
+        env.pop(DEVICE_ENV_VAR, None)
     env.update({
         "SUTANDO_SUPERVISED": "1",
         "GATEWAY_INSTANCE": str(entry["instance"]),
@@ -1975,6 +1991,43 @@ def launch_env(entry: Mapping[str, object], environ: Optional[Mapping[str, str]]
         "REMOTE_PROACTIVE_ROOM": environ.get("REMOTE_PROACTIVE_ROOM", "") if entry.get("primary") else "",
     })
     return env
+
+
+def _verified_agent(token: str, fetch=None, getaddrinfo=None) -> str:
+    """The agent a verified preview of `token` names; '' when it names none or cannot be read."""
+    if not token:
+        return ""
+    try:
+        seen = preview_connection(token, fetch=fetch, getaddrinfo=getaddrinfo)
+    except ConnectionsError:
+        return ""
+    mxid = seen.get("agent_mxid") if seen.get("verified") else None
+    return mxid if isinstance(mxid, str) else ""
+
+
+def _learn_missing_identity(instance: str, environ: Mapping[str, str], workspace: Optional[Path], vault,
+                            fetch=None, getaddrinfo=None) -> None:
+    """Learn onto a launchable named row that has no agent the identity its own token answers to."""
+    row = _row_named(instance, workspace)
+    if not instance or row is None or row.get("agent_mxid") or row.get("disabled") or row.get("parked"):
+        return
+    ref = str(row["token_ref"])
+    token = (environ.get(ref) or "").strip() or _vault_get(_vault(vault), ref)
+    if not token:
+        return  # launch_env names the missing token
+    try:
+        learn_identity(instance, preview_connection(token, fetch=fetch, getaddrinfo=getaddrinfo), workspace=workspace)
+    except ConnectionsError:
+        pass  # launch_env refuses the row that is still without one
+
+
+def _agent_identity():
+    """The bridge's own identity module, imported on first launch so the record API stays stdlib-only."""
+    pkg = str(Path(__file__).resolve().parent.parent / "packages" / "ag2-sparrow")  # lint-workspace-resolution: allow-repo-root — locates the CODE package
+    if pkg not in sys.path:
+        sys.path.append(pkg)
+    from ag2_sparrow import agent_identity
+    return agent_identity
 
 
 def _record_launch(instance: str, workspace: Optional[Path], **fields) -> dict:
@@ -2093,7 +2146,7 @@ def _exit_code(child) -> Optional[int]:
 
 def launch(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Mapping[str, str]] = None,
            workspace: Optional[Path] = None, vault=None, spawn=None, python: Optional[str] = None,
-           env_only: bool = False) -> dict:
+           env_only: bool = False, fetch=None, getaddrinfo=None) -> dict:
     """Start the bridge for one plan entry and leave a launch record; the bridge's own
     singleton lock turns a duplicate into a clean stand-down. The record lock is held from the
     plan read until the child is proven to hold its lease or has exited (`lease` in the record),
@@ -2102,11 +2155,16 @@ def launch(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Mappi
     a live duplicate); one that stood down to a retained lease whose writer is gone is spawned
     again once that lease goes stale, if that fits in `LEASE_TIMEOUT_S` (else `retained_lease`);
     any other exit fails (`exited`, with the child's rc). A child still without a lease by the
-    deadline is killed when it is ours and the launch fails (`lease_timeout`)."""
+    deadline is killed when it is ours and the launch fails (`lease_timeout`). A row with no
+    recorded agent learns it from its own token first; one still without is refused (`no_identity`)."""
     environ = os.environ if environ is None else environ
+    if not env_only:
+        _learn_missing_identity(instance, environ, workspace, vault, fetch, getaddrinfo)
     # Holding the lock to the lease is safe: the bridge's startup never reads this record.
     with locked_file(_lock_path(workspace), create_mode=0o600):
         entry = plan_entry(instance, environ, workspace=workspace, env_only=env_only)
+        if env_only and not entry["agent_mxid"]:
+            entry["agent_mxid"] = _verified_agent((environ.get(entry["token_ref"]) or "").strip(), fetch, getaddrinfo)
         for alias in alias_instances(_row_named(instance, workspace) or {}):
             holder = _proven_holder(alias, workspace)
             if holder:  # the same connection, already up under the name its host launched it as
@@ -2115,6 +2173,9 @@ def launch(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Mappi
             env = launch_env(entry, environ, vault=vault)
         except NoToken as e:
             _record_launch(instance, workspace, ok=False, reason="no_token")
+            raise LaunchFailed(str(e)) from None
+        except NoIdentity as e:
+            _record_launch(instance, workspace, ok=False, reason="no_identity")
             raise LaunchFailed(str(e)) from None
         argv = [python or sys.executable, str(Path(repo) / "src" / "remote-gateway-bridge.py")]
         log_path = Path(logs_dir) / f"remote-gateway-bridge.{instance}.log"
@@ -2251,7 +2312,7 @@ def reconnect(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Ma
             except ConnectionsError:
                 pass
     record = launch(instance, repo=repo, logs_dir=logs_dir, environ=environ, workspace=workspace,
-                    vault=vault, spawn=spawn, python=python)
+                    vault=vault, spawn=spawn, python=python, fetch=fetch, getaddrinfo=getaddrinfo)
     record["stopped_pid"] = stopped
     return record
 
@@ -2345,7 +2406,8 @@ def update_token(instance: str, token: str, *, repo: Path, logs_dir: Path,
             raise e
         try:
             relaunched = launch(instance, repo=repo, logs_dir=logs_dir, environ=environ, workspace=workspace,
-                                vault=vault, spawn=spawn, python=python)
+                                vault=vault, spawn=spawn, python=python, fetch=fetch,
+                                getaddrinfo=getaddrinfo)
             note = f"the bridge was relaunched on the unchanged code (pid {relaunched['pid']})"
         except Exception as again:  # noqa: BLE001 - reported in the error below
             note = f"the bridge stays stopped: relaunching it failed ({type(again).__name__})"
@@ -2356,7 +2418,8 @@ def update_token(instance: str, token: str, *, repo: Path, logs_dir: Path,
     out["stopped_pid"] = stopped
     try:
         out["launch"] = launch(instance, repo=repo, logs_dir=logs_dir, environ=environ, workspace=workspace,
-                               vault=vault, spawn=spawn, python=python)
+                               vault=vault, spawn=spawn, python=python, fetch=fetch,
+                               getaddrinfo=getaddrinfo)
     except LaunchFailed:
         out["launch"] = _read_json(launch_record_path(instance, workspace))
     return out

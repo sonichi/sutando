@@ -273,7 +273,7 @@ under `state/connections-launch/<instance>.json`:
 | `connected` | The sidecar says `connected: true`. |
 | `disconnected` | The sidecar says `connected: false` for a non-auth reason. |
 | `parked` | With `reason: disabled`: the owner disconnected the row; its bridge is stopped and no launcher starts it until `reconnect` (whatever a stale sidecar still says). With `reason: parked`: `promote` moved the primary off it; down until `unpark` or a promote back. |
-| `failed` | With `reason`: `no_token`, `launch_failed`, `lease_timeout`, `exited` (the child ended and no other process holds the lease; `rc` in the launch record), `retained_lease`, `auth_rejected` (the sidecar reports a 401/403 or a pending re-enrol). |
+| `failed` | With `reason`: `no_token`, `no_identity` (a named row whose gateway named no agent), `launch_failed`, `lease_timeout`, `exited` (the child ended and no other process holds the lease; `rc` in the launch record), `retained_lease`, `auth_rejected` (the sidecar reports a 401/403 or a pending re-enrol). |
 
 Beside `state`, every row carries `running`: `true` while a process is proven to hold the
 row's bridge lease, `false` when none does, `null` when the lease proves nothing
@@ -430,7 +430,17 @@ as "no secondaries": `launch-plan` exits non-zero naming the parse error, startu
 a ⚠ line and launches each `AG2_REMOTE_TOKEN_<INST>` with `launch --env-only`, from the
 variable alone. That env-only path is fail-open by design: an unreadable record cannot say a row
 is disabled, so its token launches anyway rather than leaving every secondary down. The legacy
-unsuffixed bridge keeps its own launch path. Each `launch` waits up to `LEASE_TIMEOUT_S` (20 s)
+unsuffixed bridge keeps its own launch path.
+
+Each named bridge runs as its own row's agent (`agent_mxid`), whatever the launching shell holds:
+startup loads the legacy channel env first, and its `AGENT_ID`/`AGENT_MXID` would otherwise make
+every later lane report, judge rooms and stamp tasks as the legacy agent. `launch` drops the
+inherited `AGENT_ID`, pins `AGENT_MXID` to the row's agent (the bridge then reads no identity from
+a channel file or the host binding) and drops `AG2_DEVICE_ENV`, the legacy row's credential file.
+A row with no agent learns it first from a verified preview of its own token; an env-only launch
+takes it from that preview without writing the record. A lane still without one is not started:
+`no_identity` in its launch record, named in `remote-gateway-bridge.log`. Reconnect it once its
+gateway answers. The legacy row's environment is unchanged. Each `launch` waits up to `LEASE_TIMEOUT_S` (20 s)
 for its child's lease, one bridge after another, so startup can take N × 20 s when every one of
 N bridges stalls before its lease.
 
