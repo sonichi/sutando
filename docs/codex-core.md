@@ -34,6 +34,12 @@ bash skills/install.sh
 bash src/agent/start-cli.sh --restart
 ```
 
+That command starts the core and the local agent API (`127.0.0.1:7843`) when
+nothing serves it yet; the AG2 Space desktop hands its connect code to that API,
+so a core moved to AG2 Space from the desktop needs it running. It does not start
+the other local services (voice, web client, dashboard, bridges): for those, start
+everything with `bash src/startup.sh`, which then launches the same core.
+
 With `core.runtime: codex`, `skills/install.sh` links every repo skill and every
 `<workspace>/skills/` skill into `$CODEX_HOME/skills/` (resolved by
 `scripts/sutando-config.sh codex-home-path skills`) as well as Claude's skills
@@ -58,8 +64,13 @@ The Codex implementation:
   not copy Claude login state or run the Claude-only preflight for a Codex core;
 - exports the configured `CODEX_HOME` and requires `codex login status` to pass
   before any background service launches;
-- forwards `CODEX_HOME` and `CLAUDE_CONFIG_DIR` into the core session, so skills
-  that read the engine's channel state (such as `ag2space/access.json`) find it;
+- resolves `CLAUDE_CONFIG_DIR` the same way the Claude launcher does (the
+  configured `core_config_dirs[type=claude]`, else `<workspace>/.claude-sutando`),
+  refusing to start when that configuration is invalid, and forwards it with
+  `CODEX_HOME` into the core session, so skills that read the engine's channel
+  state (such as `ag2space/access.json`) find it whichever CLI is the core;
+- starts the local agent API on port 7843 when nothing listens there (skipped with
+  `--external-helpers`, whose embedder owns its services);
 - owns the same `sutando-core` tmux session used by the menu bar, health checks,
   and terminal attachment;
 - validates `codex` availability and authentication before changing the live

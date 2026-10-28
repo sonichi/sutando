@@ -41,6 +41,7 @@ NEEDED = (
     "src/result_publish.py",
     "src/agent/task-event-handler-lookup.sh",
     "src/claude_config_dir.sh",
+    "src/local_services.sh",
     "src/shutdown.py",
     "src/workspace_default.py",
     "src/sutando_config.py",

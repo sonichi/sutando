@@ -121,6 +121,8 @@ class CodexCoreLauncherTests(unittest.TestCase):
             "src/agent/restart-guard.sh",
             "src/agent/tmux-socket-guard.sh",
             "src/agent/core-runtime-record.sh",
+            "src/claude_config_dir.sh",
+            "src/local_services.sh",
             "src/core_runtime_record.py",
             "src/codex_project_trust.py",
             "src/toml_fallback.py",
@@ -196,6 +198,14 @@ class CodexCoreLauncherTests(unittest.TestCase):
         self.bin.mkdir()
         self._write_exe("codex", '#!/bin/bash\n[ "${1:-}" = login ] && exit 0\nexit 0\n')
         self._write_exe("fswatch", '#!/bin/bash\nexit 0\n')
+        # Nothing listens on the agent API port; the fake API only records its start.
+        self._write_exe("lsof", '#!/bin/bash\nexit 1\n')
+        (self.root / "src/agent-api.py").write_text(
+            "import os, sys\n"
+            "with open(os.environ['AGENT_API_LOG'], 'a') as f:\n"
+            "    f.write(os.getcwd() + ' core_session=' + os.environ.get('SUTANDO_CORE_SESSION', '')\n"
+            "            + ' ' + ' '.join(sys.argv) + '\\n')\n"
+        )
         self._write_exe("uname", '#!/bin/bash\nprintf "Darwin\\n"\n')
         self._write_exe("launchctl", '''#!/bin/bash
 if [ "${1:-}" = print ]; then
@@ -377,6 +387,7 @@ exit 0
             "LAUNCHCTL_STATE": str(Path(self.tmp.name) / "launchctl-loaded"),
             "HEARTBEAT_LOG": str(Path(self.tmp.name) / "heartbeat.log"),
             "HEARTBEAT_PID": str(Path(self.tmp.name) / "heartbeat.pid"),
+            "AGENT_API_LOG": str(Path(self.tmp.name) / "agent-api.log"),
             "SCHEDULER_LOG": str(Path(self.tmp.name) / "scheduler.log"),
             "SUTANDO_CODEX_SCHEDULER_SCRIPT": str(self.root / "fake-codex-scheduler.py"),
             "SUTANDO_HOST_LABEL": "test-host",
@@ -414,6 +425,7 @@ exit 0
             "LAUNCHCTL_STATE": str(Path(self.tmp.name) / "launchctl-loaded"),
             "HEARTBEAT_LOG": str(Path(self.tmp.name) / "heartbeat.log"),
             "HEARTBEAT_PID": str(Path(self.tmp.name) / "heartbeat.pid"),
+            "AGENT_API_LOG": str(Path(self.tmp.name) / "agent-api.log"),
             "SUTANDO_HOST_LABEL": "test-host",
             "SUTANDO_CORE_SESSION_WAIT_S": "0",
         })
@@ -566,18 +578,55 @@ if [ "${1:-}" = print ]; then [ -f "$LAUNCHCTL_STATE" ]; else exit 0; fi
         self.assertFalse(marker.exists())
         self.assertNotIn("kill-session", self._tmux_calls())
 
-    def test_core_session_receives_claude_config_dir(self):
-        ccd = str(Path(self.tmp.name) / "ccd")
-        result = self.run_launcher(env_extra={"CLAUDE_CONFIG_DIR": ccd})
-        self.assertEqual(result.returncode, 0, result.stderr)
+    def _core_session_line(self):
         core = [l for l in self._tmux_calls().splitlines() if "new-session -d -s sutando-core " in l + " "]
         self.assertTrue(core, self._tmux_calls())
-        self.assertIn(f"-e CLAUDE_CONFIG_DIR={ccd}", core[0])
+        return core[0]
 
-    def test_core_session_omits_an_unset_claude_config_dir(self):
+    def test_core_session_resolves_claude_config_dir_when_none_is_inherited(self):
         result = self.run_launcher(env_extra={"CLAUDE_CONFIG_DIR": ""})
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertNotIn("CLAUDE_CONFIG_DIR=", self._tmux_calls())
+        ccd = self.root.resolve() / "workspace" / ".claude-sutando"
+        self.assertIn(f"-e CLAUDE_CONFIG_DIR={ccd}", self._core_session_line())
+        self.assertTrue(ccd.is_dir())
+
+    def test_core_session_takes_the_configured_claude_config_dir_over_an_inherited_one(self):
+        stray = str(Path(self.tmp.name) / "stray")
+        result = self.run_launcher(env_extra={"CLAUDE_CONFIG_DIR": stray})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        line = self._core_session_line()
+        self.assertIn(f"-e CLAUDE_CONFIG_DIR={self.root.resolve() / 'workspace' / '.claude-sutando'}", line)
+        self.assertNotIn(stray, line)
+
+    def test_an_invalid_claude_config_dir_refuses_before_the_core_is_touched(self):
+        cfg = json.loads((self.root / "sutando.config.json").read_text())
+        # Both the claude entry and the legacy field: only the CLAUDE_CONFIG_DIR resolver refuses this.
+        cfg["core_config_dirs"].append({"id": "claude-x", "type": "claude", "env_name": "CLAUDE_CONFIG_DIR",
+                                        "synced": False, "value": str(Path(self.tmp.name) / "ccd")})
+        cfg["claude_sutando_config_dir"] = {"subdir": ".claude-legacy"}
+        (self.root / "sutando.config.json").write_text(json.dumps(cfg))
+        result = self.run_launcher("--restart")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("refusing to start", result.stderr)
+        self.assertNotIn("kill-session", self._tmux_calls())
+
+    def test_documented_restart_starts_the_agent_api(self):
+        result = self.run_launcher("--restart")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Starting agent API (port 7843)", result.stdout)
+        started = _read_when_nonempty(Path(self.tmp.name) / "agent-api.log", time.monotonic() + 5)
+        self.assertIsNotNone(started, "the launcher did not start the agent API")
+        self.assertEqual(started.split()[0], str(self.root.resolve()))
+        self.assertTrue(started.rstrip().endswith("src/agent-api.py"), started)
+        self.assertIn(" core_session= ", started, "the API must not inherit the core-session marker")
+
+    def test_a_running_agent_api_is_left_alone(self):
+        self._write_exe("lsof", '#!/bin/bash\nexit 0\n')
+        self._write_exe("curl", '#!/bin/bash\nexit 0\n')
+        result = self.run_launcher()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("agent API (already running)", result.stdout)
+        self.assertFalse((Path(self.tmp.name) / "agent-api.log").exists())
 
     def test_launches_codex_and_managed_task_notifier(self):
         result = self.run_launcher(env_extra={

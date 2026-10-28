@@ -231,6 +231,19 @@ for dependency in tmux fswatch; do
   fi
 done
 
+# Same resolve-or-refuse as the Claude launcher: the engine's channel paths live
+# under it whichever CLI is the core.
+. "$REPO/src/claude_config_dir.sh"
+if _ccd="$(resolve_claude_config_dir "$REPO" start-cli)"; then
+  mkdir -p "$_ccd"
+  export CLAUDE_CONFIG_DIR="$_ccd"
+  echo "  ✓ CLAUDE_CONFIG_DIR=$_ccd"
+else
+  _ccd_rc=$?
+  [ "$_ccd_rc" = 2 ] || exit 1
+  echo "  ✓ CLAUDE_CONFIG_DIR=$CLAUDE_CONFIG_DIR (caller-provided; config helper absent)"
+fi
+
 WORKING_DIR="${SUTANDO_CODEX_WORKING_DIR:-${SUTANDO_CORE_WORKING_DIR:-$REPO}}"
 WORKING_DIR="${WORKING_DIR/#\~/$HOME}"
 mkdir -p "$WORKING_DIR"
@@ -240,7 +253,7 @@ CORE_ENV_ARGS=(-e SUTANDO_CORE_SESSION=1 -e SUTANDO_CORE_RUNTIME=codex)
 [ -n "${SUTANDO_DEFAULT_WORKSPACE:-}" ] && CORE_ENV_ARGS+=(-e "SUTANDO_DEFAULT_WORKSPACE=$SUTANDO_DEFAULT_WORKSPACE")
 [ -n "${CODEX_HOME:-}" ] && CORE_ENV_ARGS+=(-e "CODEX_HOME=$CODEX_HOME")
 # Skills read channel state (ag2space access.json) under it; tmux's server env can predate it.
-[ -n "${CLAUDE_CONFIG_DIR:-}" ] && CORE_ENV_ARGS+=(-e "CLAUDE_CONFIG_DIR=$CLAUDE_CONFIG_DIR")
+CORE_ENV_ARGS+=(-e "CLAUDE_CONFIG_DIR=$CLAUDE_CONFIG_DIR")
 # tmux's server environment can predate the product-mode override, so forward
 # the self-development policy explicitly into the persistent core session.
 if [ "${SUTANDO_SELF_DEVELOPMENT_ENABLED+x}" = x ]; then
@@ -493,6 +506,17 @@ if [ "$RECONCILE_SCHEDULES" = 1 ]; then
 fi
 
 check_external_helpers || exit 1
+
+# Clients hand connect codes to the local agent API, and startup.sh is not the only way a
+# core starts. An --external-helpers embedder owns its services; the API is not the core.
+ensure_local_agent_api() {
+  [ -z "$EXTERNAL_HELPERS" ] || return 0
+  local ws
+  ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" && [ -n "$ws" ] || return 0
+  . "$REPO/src/local_services.sh"
+  ( unset SUTANDO_CORE_SESSION; ensure_agent_api "$REPO" "$(heartbeat_python)" "$ws/logs" )
+}
+ensure_local_agent_api
 
 if [ "${1:-}" = "--restart" ]; then
   tmux_available && tmux -S "$TMUX_SOCKET" kill-session -t "=$WATCHER_SESSION" 2>/dev/null || true
