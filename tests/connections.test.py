@@ -2560,6 +2560,21 @@ class LegacyReadopt(Base):
         self.assertEqual(C.bridge_pid("", self.ws), 0, "the bridge on the dead token is stopped")
         self.assertEqual(self.legacy_parked_cli(), 0, "its launchers wait instead of starting it")
 
+    def test_a_code_for_another_agent_than_the_legacy_rows_is_refused(self):
+        self.moved_to_s_space()
+        with C._transaction(self.ws) as rec:
+            next(r for r in rec["rows"] if not r["instance"])["agent_mxid"] = "@agent-a:ag2.space"
+        legacy = self.legacy()
+        with self.assertRaises(C.TokenAgentMismatch) as cm:
+            self.paste()
+        self.assertEqual(cm.exception.CODE, "token_agent_mismatch")
+        self.assertIn("", [r["instance"] for r in self.rows()], "agent A's row stays")
+        self.assertNotIn("AG2_REMOTE_TOKEN_AG2_SPACE", self.vault.store)
+        self.assertEqual(C.bridge_pid("", self.ws), legacy.pid, "agent A's bridge is not stopped")
+        self.assertEqual(C.removed_env_refs(self.ws), [])
+        row, created = self.add(self.FRESH, fetch=agents("@agent-a:ag2.space"), environ=self.ENV, kill=os.kill)
+        self.assertEqual((row["instance"], created), ("ag2-space", True), "the same agent's fresh code is adopted")
+
     def test_a_running_legacy_primary_is_refused_and_nothing_changes(self):
         legacy = self.legacy()
         before = self.rows()

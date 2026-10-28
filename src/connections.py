@@ -1010,7 +1010,8 @@ def add_connection(token: str, *, added_by: str, expected_server: str, instance:
     becomes a new named, app-managed row and the legacy row is retired the way `promote` leaves a
     legacy bridge a named row covers. Its row is dropped, its bridge stopped, the record marked
     `legacy_parked` and REMOTE_TASK_TOKEN remembered as removed, so no launcher starts it on the
-    dead token. Refused while that bridge runs as the primary (`LegacyPrimaryInUse`).
+    dead token. Refused for another agent than the one the legacy row learned (`TokenAgentMismatch`,
+    as `update_token`) and while that bridge runs as the primary (`LegacyPrimaryInUse`).
     """
     if added_by not in ADDED_BY:
         raise ConnectionsError(f"added_by must be one of {', '.join(ADDED_BY)}")
@@ -1042,6 +1043,9 @@ def add_connection(token: str, *, added_by: str, expected_server: str, instance:
             existing = _same_connection(rows, seen)
             retired = None
             if existing is not None and _readopts_legacy(existing, seen, token, vault, environ):
+                mine, theirs = existing.get("agent_mxid"), seen.get("agent_mxid")
+                if mine and theirs != mine:
+                    raise TokenAgentMismatch("", f"the code is for agent {theirs}, not {mine}")
                 pid = bridge_pid("", workspace)
                 if pid and (existing["primary"] or not any(r["primary"] for r in rows)):
                     raise LegacyPrimaryInUse(pid)
