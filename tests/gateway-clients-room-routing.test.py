@@ -45,10 +45,10 @@ _FAKE_VI = types.ModuleType("vault_intercept")
 _FAKE_VI.get_vault_key = lambda var: (_ for _ in ()).throw(KeyError(var))
 sys.modules["vault_intercept"] = _FAKE_VI
 
-import channel_credentials  # noqa: E402
-import channel_env_resolve  # noqa: E402
-import connections  # noqa: E402
-import owner_room_access as access  # noqa: E402
+import channel_credentials
+import channel_env_resolve
+import connections
+import owner_room_access as access
 import result_markers  # noqa: E402
 
 
@@ -143,6 +143,11 @@ class TestRoomEnv(Base):
         with self.assertRaises(connections.NoConnectionForRoom):
             channel_credentials.room_env((), ("T",), UNSERVED_ROOM)
 
+    def test_primary_row_is_none_for_an_unreadable_record(self):
+        self.assertEqual(connections.primary_row(self.three.workspace)["server"], PRIMARY)
+        connections.record_path(self.three.workspace).write_text("{not json")
+        self.assertIsNone(connections.primary_row(self.three.workspace))
+
     def test_single_connection_and_no_token_vars_keep_the_callers_chain(self):
         self.assertIsNone(channel_credentials.room_env(("U",), (), ROOMS["s.space"]))
         connections.record_path(self.three.workspace).unlink()
@@ -236,6 +241,15 @@ class TestCronRoom(Base):
             self.assertEqual(self.ensure.main(), 0)
         self.assertIn("s.space", out.getvalue())
         self.assertEqual(json.loads(crons.read_text())[0]["room"], "auto")
+
+    def test_without_core_src_or_with_one_connection_the_env_chain_is_kept(self):
+        empty = self.three.root / "no-core"
+        empty.mkdir()
+        self.assertEqual(self.ensure.resolve_token(str(empty), ROOMS["dev.s.space"]),
+                         (gateway("ag2.space"), secret("ag2.space")))
+        connections.record_path(self.three.workspace).unlink()
+        self.assertEqual(self.ensure.resolve_token(str(ROOT), ROOMS["dev.s.space"]),
+                         (gateway("ag2.space"), secret("ag2.space")))
 
     def test_cron_notify_posts_through_the_rooms_server(self):
         for server, room in ROOMS.items():

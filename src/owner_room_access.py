@@ -33,11 +33,8 @@ def owner_routing_path(workspace: Path) -> Path:
     """`state/owner-routing.<instance>.json`, the file the primary connection's bridge writes; the
     unsuffixed file when the primary is the legacy row, none is recorded, or its file is absent."""
     legacy = status_path("owner-routing.json", Path(workspace))
-    try:
-        import connections
-        row = connections.primary_row(Path(workspace))
-    except Exception:  # noqa: BLE001 - no record reader is the single-connection install
-        row = None
+    import connections
+    row = connections.primary_row(Path(workspace))
     if not row or not row.get("instance"):
         return legacy
     own = status_path(f"owner-routing.{row['instance']}.json", Path(workspace))

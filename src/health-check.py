@@ -13934,24 +13934,19 @@ def _gateway_owner_room(source: str = "ag2space") -> "str | None":
 
 def _primary_channel_source(source: str = "ag2space") -> str:
     """The channel dir of the primary connection's bridge; `source` for the legacy row or none."""
-    try:
-        import connections
-        row = connections.primary_row(WORKSPACE_DIR)
-        return connections.channel_dir_for(row["instance"]) if row and row.get("instance") else source
-    except Exception:  # noqa: BLE001 - an unreadable record is the single-connection install
-        return source
+    import connections
+    row = connections.primary_row(WORKSPACE_DIR)
+    return connections.channel_dir_for(row["instance"]) if row and row.get("instance") else source
 
 
 def _gateway_creds(source: str = "ag2space", room: "str | None" = None) -> "tuple[str, str] | None":
     """(url, token) for the gateway op:message endpoint, or None. With several connections,
     the one serving `room`'s server (no room: the primary), and None when it has none. Else
     the one-token form (REMOTE_TASK_TOKEN='https://gw|secret') or the legacy AG2_REMOTE_* aliases."""
+    import connections
     try:
-        import connections
         routed = connections.room_credential(room, workspace=WORKSPACE_DIR)
-    except ImportError:
-        routed = None
-    except Exception:  # noqa: BLE001 - a refused room is never answered with another server's token
+    except connections.ConnectionsError:  # never answered with another server's token
         return None
     if routed is not None:
         url, token = routed

@@ -52,10 +52,7 @@ def _routed(repo, room):
         return None
     if src not in sys.path:
         sys.path.insert(0, src)
-    try:
-        import connections
-    except Exception:
-        return None
+    import connections
     try:
         got = connections.room_credential(room)
     except connections.ConnectionsError as e:
