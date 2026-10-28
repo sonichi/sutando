@@ -2,6 +2,10 @@
 
 Reference for the bash/CLI tools every Sutando session can call directly. Linked from `CLAUDE.md` to keep the per-session context budget small — open this file when you need to know what's available rather than carrying it on every turn.
 
+Platform scope and verification evidence live in the [Windows/macOS support
+matrix](platform-support.md). An available tool name alone does not establish
+that its desktop backend, dependencies, or permissions work on the current host.
+
 **Voice room tools** — the optional `ag2space-voice` skill reads, searches and writes
 s.space rooms through the registered MCP connection. A `no_credential` or
 `credential_refused` answer means the owner must reconnect through Connect in the app;
