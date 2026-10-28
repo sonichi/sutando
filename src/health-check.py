@@ -1628,16 +1628,15 @@ def check_decision_card_clicks(workspace_dir: Optional[Path] = None) -> "dict | 
                        "`hitl_click: true` task (CLAUDE.md, Pending decisions)")}
 
 
-NO_PRIMARY_DETAIL = "no primary connection — choose one in Settings → Connections"
-
-
 def check_connections_primary(workspace_dir: Optional[Path] = None) -> "dict | None":
-    """WARN when the connections record has rows but no primary: nothing then delivers unaddressed
-    proactive messages or the owner's cards, and nothing else says so."""
+    """WARN when the connections record has rows but no primary, or a primary whose bridge has no
+    proactive room yet; otherwise say so when the legacy row is not primary. None when all is plain."""
     import connections  # noqa: PLC0415
-    if not connections.no_primary(Path(workspace_dir) if workspace_dir else WORKSPACE_DIR):
+    found = connections.notes(Path(workspace_dir) if workspace_dir else WORKSPACE_DIR)
+    if not found:
         return None
-    return {"name": "connections-primary", "status": "warn", "detail": NO_PRIMARY_DETAIL}
+    status = "warn" if any(level == "warn" for level, _ in found) else "ok"
+    return {"name": "connections-primary", "status": status, "detail": "; ".join(text for _, text in found)}
 
 
 CURRENT_TRACK_READ_BUDGET = 32 * 1024

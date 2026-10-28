@@ -86,6 +86,9 @@ def _preview_text(p: dict) -> str:
 def cmd_list(args) -> int:
     rows = [connections.status_for(r, args.workspace) for r in connections.list_connections(args.workspace)]
     print(json.dumps(rows, indent=2, sort_keys=True) if args.json else (_table(rows) if rows else "no connections"))
+    if not args.json:
+        for level, text in connections.notes(args.workspace):
+            print(f"{level}: {text}")
     return 0
 
 
