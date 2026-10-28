@@ -143,11 +143,20 @@ primary connection rather than from a fixed URL. Each DotSpace in the registry
 config) names its `mcp_url`:
 
 ```bash
-server=$(python3 scripts/connections.py list --json \
-  | python3 -c 'import json,sys; print(next((r["server"] for r in json.load(sys.stdin) if r["primary"]), ""))')
-mcp_url=$(python3 src/dotspace.py "$server" | python3 -c 'import json,sys; print(json.load(sys.stdin)["mcp_url"])')
-echo "$mcp_url"
+server="${AG2_SERVER:-$(python3 scripts/connections.py list --json \
+  | python3 -c 'import json,sys; print(next((r["server"] for r in json.load(sys.stdin) if r["primary"]), ""))')}"
+mcp_url=""
+if [ -z "$server" ]; then
+  echo "no primary connection: set AG2_SERVER=<your homeserver, e.g. ag2.space> and rerun" >&2
+else
+  mcp_url=$(python3 src/dotspace.py "$server" | python3 -c 'import json,sys; print(json.load(sys.stdin)["mcp_url"])')
+  [ -n "$mcp_url" ] && echo "$mcp_url" || echo "no mcp_url registered for $server: add it under core.dotspace.instances" >&2
+fi
 ```
+
+With no connections record (a Codex core set up without the app) the first check prints the fix
+and leaves `$mcp_url` empty: export `AG2_SERVER` with your homeserver and rerun. Do not continue
+with an empty URL.
 
 Find the Codex home with `bash scripts/sutando-config.sh core-config-dir-value codex`,
 then add that URL to its `config.toml`:
