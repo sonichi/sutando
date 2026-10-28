@@ -230,6 +230,43 @@ class TestDeviceEnv(_Base):
         self.assertIsNone(m.resolve_channel_env(channels, "ag2space"))
 
 
+class TestLaunchKeyEnv(_Base):
+    """A host signed in only on a secondary homeserver writes a launch key and no primary token."""
+
+    LAUNCH = "AG2_REMOTE_TOKEN_S_DSPACE='https://relay.example|s'\n"
+
+    def test_a_file_with_only_a_launch_key_is_found_for_launch_keys_not_for_sourcing(self):
+        channels, chan = self._channel()
+        (chan / ".env").write_text(self.LAUNCH)
+        self.assertIsNone(m.resolve_channel_env(channels, "ag2space"))
+        self.assertEqual(m.resolve_launch_key_env(channels, "ag2space"), chan / ".env")
+
+    def test_the_primary_token_file_keeps_precedence(self):
+        channels, chan = self._channel()
+        (chan / ".env").write_text(self.LAUNCH)
+        (chan / "relay-client.env").write_text(TOKEN_LINE)
+        self.assertEqual(m.resolve_launch_key_env(channels, "ag2space"), chan / "relay-client.env")
+
+    def test_a_blank_launch_key_does_not_count(self):
+        channels, chan = self._channel()
+        (chan / ".env").write_text("AG2_REMOTE_TOKEN_S_DSPACE=''\n")
+        self.assertIsNone(m.resolve_launch_key_env(channels, "ag2space"))
+
+    def test_a_launch_key_file_linked_out_of_the_tree_is_refused(self):
+        channels, chan = self._channel()
+        outside = self._tmpdir() / "secret.env"
+        outside.write_text(self.LAUNCH)
+        (chan / ".env").symlink_to(outside)
+        self.assertIsNone(m.resolve_launch_key_env(channels, "ag2space"))
+
+    def test_the_launcher_named_file_with_only_a_launch_key_is_used(self):
+        channels, _ = self._channel()
+        named = self._tmpdir() / "device.env"
+        named.write_text(self.LAUNCH)
+        os.environ["AG2_DEVICE_ENV"] = str(named)
+        self.assertEqual(m.resolve_launch_key_env(channels, "ag2space"), named)
+
+
 class TestCli(_Base):
     """`main()` in-process. The wrapper cases below cover the same paths through
     bash, but only as a subprocess — which no coverage run can see."""

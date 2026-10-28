@@ -876,6 +876,12 @@ class ListSelfHeals(ChannelFileBase):
         self.assertEqual(C._read(C.record_path(self.ws)), rows)
         self.assertEqual(self.vault.store, {"REMOTE_TASK_TOKEN": TOKEN_A})
 
+    def test_a_fresh_install_with_only_a_launch_key_in_the_file_lists_its_row(self):
+        self.write_relay_env(f"AG2_REMOTE_TOKEN_BETA={TOKEN_B}")
+        rows = C.list_connections(self.ws, vault=self.vault)
+        self.assertEqual([(r["instance"], r["token_ref"]) for r in rows], [("beta", "AG2_REMOTE_TOKEN_BETA")])
+        self.assertEqual(C._read(C.record_path(self.ws)), rows, "persisted, not answered from the file")
+
     def test_an_empty_record_with_nothing_to_import_lists_empty(self):
         self.assertEqual(C.list_connections(self.ws, vault=self.vault), [])
         self.assertFalse(C.record_path(self.ws).exists())

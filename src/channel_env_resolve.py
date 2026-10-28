@@ -36,6 +36,7 @@ call it on any host without importing a stack.
 from __future__ import annotations
 
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -98,6 +99,36 @@ def resolve_channel_env(channels_dir, source: str) -> Path | None:
         if not channel_env_is_contained(candidate, channels_dir, source):
             continue
         if _has_token(candidate):
+            return candidate
+    return None
+
+
+LAUNCH_KEY_RE = re.compile(r"^\s*(AG2_REMOTE_TOKEN_[A-Za-z0-9_]+)=", re.M)
+
+
+def _has_launch_key(path: Path) -> bool:
+    try:
+        names = LAUNCH_KEY_RE.findall(path.read_text())
+    except (OSError, UnicodeDecodeError):
+        return False
+    return any(token_from_env_file(var, path) for var in names)
+
+
+def resolve_launch_key_env(channels_dir, source: str) -> Path | None:
+    """`resolve_channel_env`'s pick, else the first file in the same order and under the same
+    containment that holds a launch key: a host signed in only on a secondary homeserver writes
+    `AG2_REMOTE_TOKEN_<INST>` and no primary token."""
+    picked = resolve_channel_env(channels_dir, source)
+    if picked is not None:
+        return picked
+    named = (os.environ.get(DEVICE_ENV_VAR) or "").strip() if source == DEVICE_ENV_SOURCE else ""
+    if named and Path(named).is_file() and _has_launch_key(Path(named)):
+        return Path(named)
+    channel_dir = Path(channels_dir) / source
+    if not channel_dir.is_dir():
+        return None
+    for candidate in candidates(channel_dir):
+        if channel_env_is_contained(candidate, channels_dir, source) and _has_launch_key(candidate):
             return candidate
     return None
 

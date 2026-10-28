@@ -894,18 +894,18 @@ def list_connections(workspace: Optional[Path] = None, *, vault=None) -> list:
     connect flow wrote after the engine started shows up on the next list. A record that exists
     but is empty is left alone: its rows were removed on purpose, and a lingering token must not
     bring them back. An import that fails is logged and the list still answers; a record that
-    fails validation raises as before. A record that exists still adopts the launch keys a host
-    wrote after it (`channel_launch_keys`), as `add_connection` does; a removed key stays removed."""
+    fails validation raises as before. Every list then adopts the launch keys a host wrote
+    (`channel_launch_keys`), as `add_connection` does; a removed key stays removed."""
     path = record_path(workspace)
     rows = _read(path)
-    if rows or path.exists():
-        return _read(path) if _adopt_launch_keys(rows, workspace, vault) else rows
-    try:
-        if import_from_env(workspace=workspace, vault=vault):
-            rows = _read(path)
-    except Exception as e:  # noqa: BLE001 - the list answers even when nothing could be imported
-        logging.getLogger(__name__).warning("connections: import on an empty record failed (%s)", type(e).__name__)
-    return rows
+    if not rows and not path.exists():
+        try:
+            if import_from_env(workspace=workspace, vault=vault):
+                rows = _read(path)
+        except Exception as e:  # noqa: BLE001 - the list answers even when nothing could be imported
+            logging.getLogger(__name__).warning("connections: import on an empty record failed (%s)", type(e).__name__)
+    # A desktop that signs in on a secondary homeserver first writes only its launch key.
+    return _read(path) if _adopt_launch_keys(rows, workspace, vault) else rows
 
 
 def _adopt_launch_keys(rows: list, workspace: Optional[Path], vault) -> bool:
@@ -963,10 +963,10 @@ def channel_launch_keys(environ: Optional[Mapping[str, str]] = None) -> dict:
     environ = os.environ if environ is None else environ
     found = {}
     try:
-        from channel_env_resolve import resolve_channel_env
+        from channel_env_resolve import resolve_launch_key_env
         from channel_token import token_from_env_file
         from util_paths import claude_home_path
-        path = resolve_channel_env(claude_home_path("channels"), "ag2space")
+        path = resolve_launch_key_env(claude_home_path("channels"), "ag2space")
         names = re.findall(r"^\s*(AG2_REMOTE_TOKEN_[A-Za-z0-9_]+)=", path.read_text(), re.M) if path else []
         found = {v: token_from_env_file(v, path) for v in names}
     except Exception:  # noqa: BLE001 - no channel home or an unreadable file is simply no keys
