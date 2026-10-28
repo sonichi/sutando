@@ -981,12 +981,11 @@ class ListSelfHeals(ChannelFileBase):
         self.assertFalse(C.status_for(row, self.ws)["relaunch_needed"])
 
     def test_list_prints_the_notes_under_its_table(self):
-        import subprocess as sp
         C.import_from_env({"AG2_REMOTE_TOKEN_DEV": TOKEN_B, "AG2_REMOTE_TOKEN_QA": "https://qa-fixture.net|q"},
                           workspace=self.ws, vault=self.vault)
         cli = Path(C.__file__).resolve().parents[1] / "scripts" / "connections.py"
-        out = sp.run([sys.executable, str(cli), "--workspace", str(self.ws), "list"], capture_output=True, text=True,
-                     env={**os.environ, "SUTANDO_WORKSPACE": str(self.ws)})
+        out = subprocess.run([sys.executable, str(cli), "--workspace", str(self.ws), "list"], capture_output=True,
+                             text=True, env=isolated_child_env(SUTANDO_WORKSPACE=str(self.ws)))
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertIn("warn: no primary connection — choose one in Settings → Connections", out.stdout)
 
