@@ -161,7 +161,9 @@ A client gates its "Reconnect with a code" action on `legacy_readopt` in the lis
 A saved row is primary only when the install has no primary yet. `import-env` gives the
 flag to the `REMOTE_TASK_TOKEN` row (the legacy unsuffixed bridge). A named
 `AG2_REMOTE_TOKEN_<INST>` row gets it only when it is then the record's sole row, with no
-primary and no unsuffixed row or token (a desktop signed in only on a secondary homeserver);
+primary, no unsuffixed row or token, and no legacy bridge configured in the environment
+(`REMOTE_TASK_URL`, `AG2_REMOTE_URL`, `REMOTE_TASK_TOKEN_FILE`): a desktop signed in only on a
+secondary homeserver;
 with two or more rows none is picked. That row carries `relaunch_needed: true` when its bridge
 already runs. Rows with no primary are reported: the list answers `no_primary: true` and the
 health check warns "no primary connection — choose one in Settings → Connections". Removing
