@@ -29,10 +29,22 @@ def capability_scripts(roots: Iterable[Path], names: Iterable[str], modules: Ite
     return None
 
 
+def owner_routing_path(workspace: Path) -> Path:
+    """`state/owner-routing.<instance>.json`, the file the primary connection's bridge writes; the
+    unsuffixed file when the primary is the legacy row, none is recorded, or its file is absent."""
+    legacy = status_path("owner-routing.json", Path(workspace))
+    import connections
+    row = connections.primary_row(Path(workspace))
+    if not row or not row.get("instance"):
+        return legacy
+    own = status_path(f"owner-routing.{row['instance']}.json", Path(workspace))
+    return own if own.is_file() else legacy
+
+
 def owner_routing(workspace: Path) -> dict:
-    """The gateway's reading of the owner (`state/owner-routing.json`); {} when absent or unreadable."""
+    """The gateway's reading of the owner (`owner_routing_path`); {} when absent or unreadable."""
     try:
-        d = json.loads(status_path("owner-routing.json", Path(workspace)).read_text(encoding="utf-8"))
+        d = json.loads(owner_routing_path(workspace).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
     return d if isinstance(d, dict) else {}
@@ -57,9 +69,18 @@ def channel_credentials(cap, environ=None) -> dict:
     return shared(names, environ)
 
 
-def resolve_credentials(cap, collab_url: Optional[str]) -> tuple:
-    """(url, token) by the capability's own order; when that finds neither, from the channel
-    env file the shared resolver picks (a desktop install keeps them there)."""
+def resolve_credentials(cap, collab_url: Optional[str], room: Optional[str] = None,
+                        workspace: Optional[Path] = None) -> tuple:
+    """(url, token) for acting in `room`: on an install with several connections, the one serving
+    the room's server (`channel_credentials.room_env`; no room is the primary). Otherwise by the
+    capability's own order, then from the channel env file the shared resolver picks."""
+    if not collab_url:
+        from channel_credentials import room_env
+        routed = room_env(getattr(cap, "URL_VARS", ()), getattr(cap, "TOKEN_VARS", ()), room,
+                          workspace=workspace)
+        if routed is not None:
+            os.environ.update(routed)
+            return cap.resolve_url(None), cap.resolve_token(None)
     try:
         return cap.resolve_url(collab_url), cap.resolve_token(None)
     except Exception:

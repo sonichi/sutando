@@ -193,7 +193,7 @@ def _run(argv):
         g.add_argument("--ack", choices=sorted(_react.ACK))
         p.add_argument("--agent", dest="agent_mxid", default=os.environ.get("AGENT_MXID"))
 
-    p = sub.add_parser("rooms", help="list this agent's joined rooms")
+    p = sub.add_parser("rooms", help="list this agent's joined rooms (primary connection)")
     p.add_argument("--agent", dest="agent_mxid", default=os.environ.get("AGENT_MXID"))
 
     p = sub.add_parser("members", help="list a room's members (user_id, display name, kind)")
@@ -218,10 +218,10 @@ def _run(argv):
     e.add_argument("--agent", dest="agent_mxid", default=os.environ.get("AGENT_MXID"))
     e = esub.add_parser("list", help="list this agent's own subscriptions")
     e.add_argument("--agent", dest="agent_mxid", default=os.environ.get("AGENT_MXID"))
-    e = esub.add_parser("pull", help="one long-poll round for pending events")
+    e = esub.add_parser("pull", help="one long-poll round for pending events (primary connection)")
     e.add_argument("--cursor", type=int, default=0)
     e.add_argument("--wait", type=int, default=_events.DEFAULT_WAIT)
-    e = esub.add_parser("stream", help="SSE-follow events; one JSON line per event")
+    e = esub.add_parser("stream", help="SSE-follow events; one JSON line per event (primary connection)")
     e.add_argument("--cursor-file", default=None,
                    help="durable resume cursor (enables reconnect-with-backoff)")
     e.add_argument("--cursor", type=int, default=None,
@@ -229,7 +229,7 @@ def _run(argv):
     e.add_argument("--once", action="store_true", help="exit after the first event")
     e.add_argument("--max-events", type=int, default=None)
 
-    sub.add_parser("agents", help="list this account's registered agents with owners (/v1/agents)")
+    sub.add_parser("agents", help="list this account's registered agents with owners (/v1/agents, primary connection)")
 
     p = sub.add_parser("resolve", help="resolve a friendly handle -> agent mxid (via /v1/agents)")
     p.add_argument("handle")
@@ -280,7 +280,7 @@ def _run(argv):
                    help="disable the grant (authoritative=false); leaves other policy fields intact")
     p.add_argument("--agent", dest="agent_mxid", default=os.environ.get("AGENT_MXID"))
 
-    p = sub.add_parser("history", help="read all joined rooms with window pagination and coverage receipts")
+    p = sub.add_parser("history", help="read all joined rooms with window pagination and coverage receipts (primary connection)")
     p.add_argument("--since", required=True, help="ISO 8601 time with timezone")
     p.add_argument("--until", help="ISO 8601 time with timezone; default now")
     p.add_argument("--pages", type=int, default=20)
