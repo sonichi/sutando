@@ -962,12 +962,22 @@ class ListSelfHeals(ChannelFileBase):
         self.assertEqual(sorted((r["instance"], r["primary"]) for r in created), [("", True), ("beta", False)])
 
     def test_a_legacy_bridge_configured_in_the_environment_keeps_the_primary_off_the_named_row(self):
-        for var, value in (("REMOTE_TASK_URL", "https://prod.example/relay"),
-                           ("REMOTE_TASK_TOKEN_FILE", "/tmp/prod.env"), ("AG2_REMOTE_URL", "https://p.example")):
-            with self.subTest(var=var):
-                ws = self.ws / var
-                created = C.import_from_env({"AG2_REMOTE_TOKEN_BETA": TOKEN_B, var: value}, workspace=ws, vault=self.vault)
+        legacy = {"url+token file": {"REMOTE_TASK_URL": "https://prod.example/relay", "REMOTE_TASK_TOKEN_FILE": "/tmp/p.env"},
+                  "token file": {"REMOTE_TASK_TOKEN_FILE": "/tmp/p.env"},
+                  "url+agent": {"REMOTE_TASK_URL": "https://prod.example/relay", "AGENT_ID": "@a:alpha-fixture.net"},
+                  "alt url+agent": {"AG2_REMOTE_URL": "https://p.example", "AGENT_ID": "@a:alpha-fixture.net"}}
+        for name, env in legacy.items():
+            with self.subTest(name):
+                created = C.import_from_env({"AG2_REMOTE_TOKEN_BETA": TOKEN_B, **env}, workspace=self.ws / name,
+                                            vault=self.vault)
                 self.assertEqual([(r["instance"], r["primary"]) for r in created], [("beta", False)])
+
+    def test_a_stale_relay_url_alone_does_not_hold_the_primary_back(self):
+        for var in ("REMOTE_TASK_URL", "AG2_REMOTE_URL"):
+            with self.subTest(var):
+                created = C.import_from_env({"AG2_REMOTE_TOKEN_BETA": TOKEN_B, var: "https://old.example/relay"},
+                                            workspace=self.ws / var, vault=self.vault)
+                self.assertEqual([(r["instance"], r["primary"]) for r in created], [("beta", True)])
 
     def test_a_named_row_beside_an_existing_one_never_takes_the_primary(self):
         C.import_from_env({"AG2_REMOTE_TOKEN_BETA": TOKEN_B}, workspace=self.ws, vault=self.vault)

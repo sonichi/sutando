@@ -1577,9 +1577,16 @@ def import_from_env(environ: Optional[Mapping[str, str]] = None, *,
     return out
 
 
-# Any of these configures the legacy unsuffixed bridge, which then keeps the proactive room.
-LEGACY_BRIDGE_ENV = ("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN", "REMOTE_TASK_URL", "AG2_REMOTE_URL",
-                     "REMOTE_TASK_TOKEN_FILE")
+# A token source configures the legacy bridge; a relay URL does so only beside AGENT_ID (the desktop's rule).
+LEGACY_TOKEN_ENV = ("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN", "REMOTE_TASK_TOKEN_FILE")
+LEGACY_URL_ENV = ("REMOTE_TASK_URL", "AG2_REMOTE_URL")
+
+
+def legacy_bridge_configured(environ: Mapping[str, str]) -> bool:
+    """Whether the environment configures the legacy unsuffixed bridge: a token source, or a relay
+    URL with AGENT_ID. A URL left alone by an earlier sign-in configures nothing."""
+    has = lambda v: bool((environ.get(v) or "").strip())  # noqa: E731
+    return any(has(v) for v in LEGACY_TOKEN_ENV) or (has("AGENT_ID") and any(has(v) for v in LEGACY_URL_ENV))
 
 
 def _sole_named_primary(rows: list, candidates: list, environ: Mapping[str, str]) -> Optional[dict]:
@@ -1589,7 +1596,7 @@ def _sole_named_primary(rows: list, candidates: list, environ: Mapping[str, str]
         return None
     if any(not inst for inst, _ref, _tok in candidates):
         return None
-    if any((environ.get(v) or "").strip() for v in LEGACY_BRIDGE_ENV):
+    if legacy_bridge_configured(environ):
         return None
     row = rows[0]
     return None if row.get("disabled") or row.get("parked") else row

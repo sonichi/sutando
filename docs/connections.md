@@ -164,9 +164,10 @@ A client gates its "Reconnect with a code" action on `legacy_readopt` in the lis
 A saved row is primary only when the install has no primary yet. `import-env` gives the
 flag to the `REMOTE_TASK_TOKEN` row (the legacy unsuffixed bridge). A named
 `AG2_REMOTE_TOKEN_<INST>` row gets it only when it is then the record's sole row, with no
-primary, no unsuffixed row or token, and no legacy bridge configured in the environment
-(`REMOTE_TASK_URL`, `AG2_REMOTE_URL`, `REMOTE_TASK_TOKEN_FILE`): a desktop signed in only on a
-secondary homeserver; with two or more rows none is picked. When its bridge already runs (the
+primary, no unsuffixed row or token, and no legacy bridge configured in the environment (a
+token source, `REMOTE_TASK_TOKEN_FILE` included, or `REMOTE_TASK_URL`/`AG2_REMOTE_URL` beside
+`AGENT_ID`, the desktop's rule; a relay URL alone is a leftover and counts for nothing): a
+desktop signed in only on a secondary homeserver; with two or more rows none is picked. When its bridge already runs (the
 flip can happen inside a list read, which never relaunches), the record keeps that bridge's pid
 under `relaunch_pending`: until that bridge is replaced, its row lists `relaunch_needed: true`
 and the health check warns that it has no proactive room until it restarts. Rows with no primary
