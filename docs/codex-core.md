@@ -135,16 +135,29 @@ attached terminal's jump prompt visible; Escape dismisses that client prompt.
 
 The AG2 Space desktop app writes an `ag2-space` entry into `$CODEX_HOME/config.toml`.
 A Codex core set up without the app has no such entry, so it has no AG2 Space
-Actions (`room.commons.*` included) until you add the hosted server yourself. Find
-the Codex home with `bash scripts/sutando-config.sh core-config-dir-value codex`,
-then add this to its `config.toml`:
+Actions (`room.commons.*` included) until you add the hosted server yourself.
+
+The MCP endpoint belongs to the homeserver your agent is on, so take it from your
+primary connection rather than from a fixed URL. Each DotSpace in the registry
+(`DEFAULT_INSTANCES` in `src/dotspace.py`, or `core.dotspace.instances` in your
+config) names its `mcp_url`:
+
+```bash
+server=$(python3 scripts/connections.py list --json \
+  | python3 -c 'import json,sys; print(next((r["server"] for r in json.load(sys.stdin) if r["primary"]), ""))')
+mcp_url=$(python3 src/dotspace.py "$server" | python3 -c 'import json,sys; print(json.load(sys.stdin)["mcp_url"])')
+echo "$mcp_url"
+```
+
+Find the Codex home with `bash scripts/sutando-config.sh core-config-dir-value codex`,
+then add that URL to its `config.toml`:
 
 ```toml
 [mcp_servers.ag2-space]
-url = "https://mcp.ag2.space/mcp"
+url = "<the mcp_url printed above>"
 ```
 
-`codex mcp add ag2-space --url https://mcp.ag2.space/mcp` writes the same entry
+`codex mcp add ag2-space --url "$mcp_url"` writes the same entry
 and starts the sign-in. The server uses OAuth, so no token goes in the file:
 
 ```bash

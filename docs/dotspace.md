@@ -44,11 +44,14 @@ instance is a config entry.
    ]}}}
    ```
 
-   Optional per entry: `cloud_origin`, `link_via` (default: server), `prefer_ipv4` (default:
-   true). When the section is absent the built-in list applies — ag2.space, dev.ag2.space,
-   s.space, dev.s.space with their `chat.` / `dev-chat.` gateways; `cloud_origin` only on
-   ag2.space (`https://sutando.ag2.space`) and dev.ag2.space (`https://dev-sutando.ag2.space`)
-   — so today's installs behave as before. The most specific server wins (`chat.dev.s.space`
+   Optional per entry: `cloud_origin`, `mcp_url`, `link_via` (default: server), `prefer_ipv4`
+   (default: true). When the section is absent the built-in list applies — ag2.space,
+   dev.ag2.space, s.space, dev.s.space with their `chat.` / `dev-chat.` gateways and their MCP
+   endpoints (`mcp.` / `dev-mcp.` under ag2.space and s.space, path `/mcp`); `cloud_origin` only
+   on ag2.space (`https://sutando.ag2.space`) and dev.ag2.space (`https://dev-sutando.ag2.space`)
+   — so today's installs behave as before. The registry is the one place a per-server endpoint
+   is written down: a caller takes `dotspace_for(<its primary connection's server>).mcp_url`,
+   never a literal URL (`docs/codex-core.md` shows the lookup). The most specific server wins (`chat.dev.s.space`
    is dev.s.space's gateway). A registered instance is trusted without any round trip; an
    explicit `dotspace_for(server)` with the real fetch still reads its well-known, only to
    fill the fields the entry leaves unset.

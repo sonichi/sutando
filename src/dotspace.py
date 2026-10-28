@@ -12,7 +12,7 @@ probe).
 who operates it. Whether a server IS a DotSpace is therefore decided by the registry alone:
 
   1. the config section `core.dotspace.instances` (sutando.config.json), a list of
-     {server, gateway_host, cloud_origin?, link_via?, prefer_ipv4?}. `DEFAULT_INSTANCES`
+     {server, gateway_host, cloud_origin?, mcp_url?, link_via?, prefer_ipv4?}. `DEFAULT_INSTANCES`
      applies when the section is absent, so today's installs behave as before. A registered
      server is trusted without any round trip; an explicit `dotspace_for(server)` with the
      real fetch still reads its well-known, only to fill the fields config left unset.
@@ -154,11 +154,11 @@ def _never_fetched(host: str) -> bool:
 
 DEFAULT_INSTANCES: Tuple[Dict[str, str], ...] = (
     {"server": "ag2.space", "gateway_host": "chat.ag2.space",
-     "cloud_origin": PRODUCTION_CLOUD_ORIGIN},
+     "cloud_origin": PRODUCTION_CLOUD_ORIGIN, "mcp_url": "https://mcp.ag2.space/mcp"},
     {"server": "dev.ag2.space", "gateway_host": "dev-chat.ag2.space",
-     "cloud_origin": "https://dev-sutando.ag2.space"},
-    {"server": "s.space", "gateway_host": "chat.s.space"},
-    {"server": "dev.s.space", "gateway_host": "dev-chat.s.space"},
+     "cloud_origin": "https://dev-sutando.ag2.space", "mcp_url": "https://dev-mcp.ag2.space/mcp"},
+    {"server": "s.space", "gateway_host": "chat.s.space", "mcp_url": "https://mcp.s.space/mcp"},
+    {"server": "dev.s.space", "gateway_host": "dev-chat.s.space", "mcp_url": "https://dev-mcp.s.space/mcp"},
 )
 
 MXID_ENV_KEYS = ("AGENT_MXID", "AG2SPACE_USER_ID")

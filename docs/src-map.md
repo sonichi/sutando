@@ -123,7 +123,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`install-claude-hooks.sh`** — install-claude-hooks.sh — idempotent install of Sutando-owned project-level Claude Code hooks (PreCompact + Stop).
 - **`install-credential-proxy-launchd.sh`** — Install / uninstall the launchd-supervised credential-proxy job.
 - **`install-cron-runner-launchd.sh`** — Install / uninstall the launchd-supervised cron-runner job.
-- **`install-gateway-bridge-launchd.sh`** — Install / uninstall / check the launchd-supervised ag2.space gateway-bridge.
+- **`install-gateway-bridge-launchd.sh`** — Install / uninstall / check the launchd-supervised gateway-bridge.
 - **`install-health-check-launchd.sh`** — Install / uninstall the launchd-supervised health-check FALLBACK job.
 - **`install-sutando-app-launchd.sh`** — Install / uninstall / check the launchd-supervised Sutando.app job.
 - **`lane_dedupe.py`** — Cross-lane duplicate guard: one room message becomes one task, whichever lane saw it first.
@@ -399,7 +399,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`channel-bridge-wrapper.sh`** — launchd entry point shared by Slack, Discord, and Telegram bridges.
 - **`credential-proxy-wrapper.sh`** — Wrapper for launchd-managed credential-proxy.
 - **`evict-own-bridge.sh`** — Evict a pre-existing BARE channel bridge that belongs to THIS checkout, before the launchd wrapper starts its own supervised child.
-- **`gateway-bridge-wrapper.sh`** — Wrapper for the launchd-managed ag2.space gateway bridge (src/remote-gateway-bridge.py).
+- **`gateway-bridge-wrapper.sh`** — Wrapper for the launchd-managed gateway bridge (src/remote-gateway-bridge.py).
 
 ## `src/observability/`
 
