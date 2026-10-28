@@ -217,7 +217,7 @@ class CliTests(unittest.TestCase):
         self.assertIn("AG2_REMOTE_TOKEN_DEV: connection removed earlier; unset the variable", proc.stdout)
         self.assertNotIn("imported dev", proc.stdout)
 
-    def test_a_corrupt_record_fails_the_plan_loudly_and_env_only_launch_still_works(self):
+    def test_a_corrupt_record_fails_the_plan_loudly_and_env_only_launch_needs_a_named_agent(self):
         (self.ws / "state").mkdir(parents=True, exist_ok=True)
         (self.ws / "state" / "connections.json").write_text('{"schema_version": 1, "connections": [{"tru')
         proc = self.run_cli("launch-plan")
@@ -232,13 +232,9 @@ class CliTests(unittest.TestCase):
         out = box / "env-only.txt"
         proc = self.run_cli("launch", "dev", "--repo", str(repo), "--logs-dir", str(box / "logs"), "--env-only",
                             env_extra={"AG2_REMOTE_TOKEN_DEV": TOKEN_B, "FAKE_OUT": str(out)})
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        for _ in range(50):
-            if out.exists():
-                break
-            import time
-            time.sleep(0.1)
-        self.assertEqual(out.read_text(), "dev")
+        self.assertEqual(proc.returncode, 1, "a gateway that names no agent: refused, not inherited")
+        self.assertIn("has no recorded agent", proc.stderr)
+        self.assertFalse(out.exists())
 
     def test_launch_and_reconnect_run_the_bridge_entry_point(self):
         box = Path(self.tmp.name)
@@ -250,6 +246,10 @@ class CliTests(unittest.TestCase):
             "+ os.environ['REMOTE_TASK_CHANNEL_DIR'] + ' ' + repr(os.environ['REMOTE_PROACTIVE_ROOM']))\n")
         out = box / "launched.txt"
         self.run_cli("add", TOKEN_B, "--yes", "--expected-server", "beta-fixture.net")
+        record_file = self.ws / "state" / "connections.json"
+        record = json.loads(record_file.read_text())
+        record["connections"][0]["agent_mxid"] = "@me:beta-fixture.net"  # what a reachable gateway would name
+        record_file.write_text(json.dumps(record))
         proc = self.run_cli("launch", "beta-fixture-net", "--repo", str(repo), "--logs-dir", str(box / "logs"),
                             env_extra={"FAKE_OUT": str(out), "REMOTE_PROACTIVE_ROOM": "!room:x"})
         self.assertEqual(proc.returncode, 0, proc.stderr)
@@ -271,6 +271,9 @@ class CliTests(unittest.TestCase):
 
         launch_args = ("--repo", str(repo), "--logs-dir", str(box / "logs"))
         self.run_cli("disconnect", "beta-fixture-net")
+        record = json.loads(record_file.read_text())
+        del record["connections"][0]["agent_mxid"]  # unverified again: a rotation it cannot confirm is accepted
+        record_file.write_text(json.dumps(record))
         proc = self.run_cli("update-token", "beta-fixture-net", TOKEN_A, *launch_args)
         self.assertEqual(proc.returncode, 1, "a code for another server is refused")
         self.assertIn("token_server_mismatch", proc.stderr)
@@ -280,7 +283,7 @@ class CliTests(unittest.TestCase):
         proc = self.run_cli("update-token", "beta-fixture-net", "-", *launch_args, stdin=rotated + "\n")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("updated token of beta-fixture-net (beta-fixture.net; vault key AG2_REMOTE_TOKEN_BETA_FIXTURE_NET replaced; "
-                      "relaunched, pid ", proc.stdout)
+                      "relaunch failed: no_identity)", proc.stdout, "no agent named: the bridge is not started")
         self.assert_no_secret(proc)
         self.assertEqual((self.keychain / "AG2_REMOTE_TOKEN_BETA_FIXTURE_NET").read_text(), rotated)
         rows = json.loads(self.run_cli("list", "--json").stdout)

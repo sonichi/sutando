@@ -37,6 +37,8 @@ import dotspace  # noqa: E402
 import workspace_lock  # noqa: E402
 from _helpers import bridge_lease  # noqa: E402
 
+agent_identity = C._agent_identity()
+
 # Above any pid_max (2**22 on Linux, 99999 on macOS): a spawn fake's pid that never runs.
 DEAD_PID = 4_194_404
 
@@ -44,7 +46,8 @@ DEAD_PID = 4_194_404
 REGISTRY = {"instances": [{"server": "s.space", "gateway_host": "chat.s.space"},
                           {"server": "ag2.space", "gateway_host": "chat.ag2.space"},
                           {"server": "alpha-fixture.net", "gateway_host": "chat.alpha-fixture.net"},
-                          {"server": "beta-fixture.net", "gateway_host": "relay.beta-fixture.net"}]}
+                          {"server": "beta-fixture.net", "gateway_host": "relay.beta-fixture.net"},
+                          {"server": "dev.s.space", "gateway_host": "chat.dev.s.space"}]}
 UNREGISTERED = "https://gw.unregistered-fixture.net|secret-u"
 
 
@@ -662,7 +665,10 @@ class ImportFromEnv(Base):
                                     workspace=self.ws, vault=self.vault)
         self.assertEqual([(r["instance"], r["primary"]) for r in created], [("dev", False), ("qa", False)])
         entry = C.plan_entry("dev", {}, workspace=self.ws)
-        env = C.launch_env(entry, {"REMOTE_PROACTIVE_ROOM": "!parent:example"}, vault=self.vault)
+        with self.assertRaises(C.NoIdentity):
+            C.launch_env(entry, {"REMOTE_PROACTIVE_ROOM": "!parent:example"}, vault=self.vault)
+        env = C.launch_env(dict(entry, agent_mxid="@s:beta-fixture.net"), {"REMOTE_PROACTIVE_ROOM": "!parent:example"},
+                           vault=self.vault)
         self.assertEqual(env["REMOTE_PROACTIVE_ROOM"], "")
         later = C.import_from_env({"REMOTE_TASK_TOKEN": TOKEN_A}, workspace=self.ws, vault=self.vault)
         self.assertEqual([(r["instance"], r["primary"]) for r in later], [("", True)])
@@ -890,6 +896,7 @@ class ListSelfHeals(ChannelFileBase):
         environ = {"AG2_REMOTE_TOKEN_BETA": TOKEN_B, "REMOTE_PROACTIVE_ROOM": "!nudges:beta-fixture.net"}
         entry = C.plan_entry("beta", environ, workspace=self.ws)
         self.assertTrue(entry["primary"])
+        entry["agent_mxid"] = "@s:beta-fixture.net"
         self.assertEqual(C.launch_env(entry, environ, vault=self.vault)["REMOTE_PROACTIVE_ROOM"],
                          "!nudges:beta-fixture.net")
 
@@ -1273,8 +1280,10 @@ class Launching(Base):
         env = {"AG2_REMOTE_TOKEN_DEV": TOKEN_B, "AG2_REMOTE_TOKEN_QA": "https://qa-fixture.net|q",
                "REMOTE_TASK_CHANNEL_DIR_QA": "qa-custom"}
         self.assertEqual(C.launch_plan(env, workspace=self.ws), [
-            {"instance": "dev", "token_ref": "AG2_REMOTE_TOKEN_DEV", "channel_dir": "dev-ag2space", "primary": False},
-            {"instance": "qa", "token_ref": "AG2_REMOTE_TOKEN_QA", "channel_dir": "qa-custom", "primary": False},
+            {"instance": "dev", "token_ref": "AG2_REMOTE_TOKEN_DEV", "channel_dir": "dev-ag2space", "primary": False,
+             "agent_mxid": "@s:beta-fixture.net"},
+            {"instance": "qa", "token_ref": "AG2_REMOTE_TOKEN_QA", "channel_dir": "qa-custom", "primary": False,
+             "agent_mxid": ""},
         ])
         self.assertEqual([p["instance"] for p in C.launch_plan({"AG2_REMOTE_TOKEN_X": TOKEN_B}, workspace=self.ws)],
                          ["dev", "x"])
@@ -1376,12 +1385,17 @@ class Launching(Base):
         with self.assertRaises(C.SchemaError):
             C.launch("dev", repo=self.repo, logs_dir=self.logs, environ={"AG2_REMOTE_TOKEN_DEV": TOKEN_B},
                      workspace=self.ws, vault=self.vault, spawn=self.spawn)
+        with self.assertRaises(C.LaunchFailed):
+            C.launch("dev", repo=self.repo, logs_dir=self.logs, environ={"AG2_REMOTE_TOKEN_DEV": TOKEN_B},
+                     workspace=self.ws, vault=self.vault, spawn=self.spawn, env_only=True, fetch=unreachable)
+        self.assertEqual(self.spawned, [], "env-only with no agent its token names: refused, not inherited")
         record = C.launch("dev", repo=self.repo, logs_dir=self.logs, environ={"AG2_REMOTE_TOKEN_DEV": TOKEN_B},
-                          workspace=self.ws, vault=self.vault, spawn=self.spawn, env_only=True)
+                          workspace=self.ws, vault=self.vault, spawn=self.spawn, env_only=True,
+                          fetch=agents("@s:beta-fixture.net"))
         self.assertEqual(record["pid"], self.child())
         env = self.spawned[0][1]
-        self.assertEqual((env["GATEWAY_INSTANCE"], env["REMOTE_TASK_TOKEN"], env["REMOTE_PROACTIVE_ROOM"]),
-                         ("dev", TOKEN_B, ""))
+        self.assertEqual((env["GATEWAY_INSTANCE"], env["REMOTE_TASK_TOKEN"], env["REMOTE_PROACTIVE_ROOM"],
+                          env["AGENT_MXID"]), ("dev", TOKEN_B, "", "@s:beta-fixture.net"))
         with self.assertRaises(C.UnknownConnection):
             C.plan_entry("nope", {"AG2_REMOTE_TOKEN_DEV": TOKEN_B}, workspace=self.ws, env_only=True)
 
@@ -3005,10 +3019,11 @@ class Edges(Base):
         self.assertEqual(self.rows(), [])
         row, _ = self.add(TOKEN_B, fetch=unreachable)
         private = lambda h, p, **k: [(2, 1, 6, "", ("127.0.0.1", p))]  # noqa: E731
-        C.reconnect(row["instance"], repo=self.ws, logs_dir=self.ws / "logs", environ={}, workspace=self.ws,
-                    vault=self.vault, spawn=self.bridge_spawn(), kill=lambda *a: None,
-                    fetch=lambda *a: self.fail("probed a private address"), getaddrinfo=private)
-        self.assertEqual(self.rows()[0]["server_source"], "resolver", "nothing learned, bridge launched anyway")
+        with self.assertRaises(C.LaunchFailed):
+            C.reconnect(row["instance"], repo=self.ws, logs_dir=self.ws / "logs", environ={}, workspace=self.ws,
+                        vault=self.vault, spawn=self.bridge_spawn(), kill=lambda *a: None,
+                        fetch=lambda *a: self.fail("probed a private address"), getaddrinfo=private)
+        self.assertEqual(self.rows()[0]["server_source"], "resolver", "nothing learned, so no bridge launched")
 
     def test_auth_rejection_and_outage_are_named_without_the_secret(self):
         p = C.preview_connection(TOKEN_A, fetch=http_error(401))
@@ -3065,11 +3080,76 @@ class Edges(Base):
     def test_reconnect_tolerates_an_unusable_stored_token(self):
         row, _ = self.add(TOKEN_B, fetch=unreachable)
         self.vault.store[row["token_ref"]] = "opaque-bearer"
-        record = C.reconnect(row["instance"], repo=self.ws, logs_dir=self.ws / "logs", environ={},
-                             workspace=self.ws, vault=self.vault, spawn=self.bridge_spawn(), kill=lambda *a: None,
-                             fetch=unreachable)
-        self.assertEqual(record["pid"], self.child())
+        with self.assertRaises(C.LaunchFailed):
+            C.reconnect(row["instance"], repo=self.ws, logs_dir=self.ws / "logs", environ={},
+                        workspace=self.ws, vault=self.vault, spawn=self.bridge_spawn(), kill=lambda *a: None,
+                        fetch=unreachable)
         self.assertEqual(self.rows()[0]["server_source"], "resolver")
+        self.assertEqual(C._read_json(C.launch_record_path(row["instance"], self.ws))["reason"], "no_identity",
+                         "a token that names no agent launches no bridge under an inherited one")
+
+
+class LaneIdentity(Base):
+    """A named lane runs as its own row's agent, never the legacy channel's it inherited."""
+
+    INHERITED = {"AGENT_ID": "@legacy:ag2.space", "AGENT_MXID": "@legacy:ag2.space",
+                 "AG2_DEVICE_ENV": "/legacy/channels/ag2space/.env", "PATH": "/usr/bin"}
+
+    def setUp(self):
+        super().setUp()
+        self.add("https://chat.s.space|secret-s", fetch=agents("@me:s.space"), instance="sspace")
+        self.add("https://chat.dev.s.space|secret-d", fetch=agents("@me:dev.s.space"), instance="devsspace")
+
+    def env(self, instance, environ=None):
+        return C.launch_env(C.plan_entry(instance, {}, workspace=self.ws), environ or self.INHERITED, vault=self.vault)
+
+    def test_each_named_lane_carries_its_own_agent_and_no_device_env(self):
+        for instance, mxid in (("sspace", "@me:s.space"), ("devsspace", "@me:dev.s.space")):
+            env = self.env(instance)
+            self.assertEqual(env["AGENT_MXID"], mxid, instance)
+            self.assertNotIn("AGENT_ID", env, f"{instance}: the inherited id is dropped")
+            self.assertNotIn("AG2_DEVICE_ENV", env, f"{instance}: the legacy device env is not this lane's")
+            self.assertEqual(agent_identity.resolve(None, lambda k: "@legacy:ag2.space", env), mxid,
+                             f"{instance}: the bridge's chain answers with the row's agent, files ignored")
+
+    def test_the_legacy_row_is_unchanged(self):
+        env = C.launch_env({"instance": "", "token_ref": "REMOTE_TASK_TOKEN", "channel_dir": "ag2space",
+                            "primary": True}, dict(self.INHERITED, REMOTE_TASK_TOKEN=TOKEN_A), vault=self.vault)
+        self.assertEqual({k: env.get(k) for k in self.INHERITED}, self.INHERITED)
+        self.assertNotIn(agent_identity.PINNED_KEY, env)
+
+    def test_a_row_without_an_agent_is_refused_not_inherited(self):
+        C.import_from_env({"AG2_REMOTE_TOKEN_QA": "https://qa-fixture.net|q"}, workspace=self.ws, vault=self.vault)
+        with self.assertRaises(C.NoIdentity):
+            self.env("qa")
+        spawned = []
+        with self.assertRaises(C.LaunchFailed):
+            C.launch("qa", repo=self.ws, logs_dir=self.ws / "logs", environ=self.INHERITED, workspace=self.ws,
+                     vault=self.vault, spawn=lambda *a: spawned.append(a), fetch=unreachable)
+        self.assertEqual(spawned, [])
+        self.assertEqual(C._read_json(C.launch_record_path("qa", self.ws))["reason"], "no_identity")
+
+    def test_a_token_that_cannot_be_previewed_names_no_agent(self):
+        self.assertEqual(C._verified_agent(""), "")
+        self.assertEqual(C._verified_agent("no-gateway-in-it"), "", "an invalid token is no agent, not an error")
+        C.import_from_env({"AG2_REMOTE_TOKEN_QA": "https://qa-fixture.net|q"}, workspace=self.ws, vault=self.vault)
+        self.vault.store.clear()
+        with self.assertRaises(C.LaunchFailed):
+            C.launch("qa", repo=self.ws, logs_dir=self.ws / "logs", environ={}, workspace=self.ws,
+                     vault=self.vault, spawn=lambda *a: self.fail("spawned"), fetch=unreachable)
+        self.assertEqual(C._read_json(C.launch_record_path("qa", self.ws))["reason"], "no_token",
+                         "no token to learn from: the missing token is what is named")
+
+    def test_launch_learns_a_missing_agent_from_the_rows_own_token(self):
+        C.import_from_env({"AG2_REMOTE_TOKEN_BETA": TOKEN_B}, workspace=self.ws, vault=self.vault)
+        self.assertNotIn("agent_mxid", C._row_named("beta", self.ws))
+        spawned = []
+        record = C.launch("beta", repo=self.ws, logs_dir=self.ws / "logs", environ=self.INHERITED, workspace=self.ws,
+                          vault=self.vault, spawn=self.bridge_spawn(lambda argv, env, log: spawned.append(env)),
+                          fetch=agents("@s:beta-fixture.net"))
+        self.assertEqual(record["pid"], self.child())
+        self.assertEqual(C._row_named("beta", self.ws)["agent_mxid"], "@s:beta-fixture.net")
+        self.assertEqual(spawned[0]["AGENT_MXID"], "@s:beta-fixture.net")
 
 
 def plant_lease(ws, instance, **fields):

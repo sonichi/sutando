@@ -61,7 +61,7 @@ def _run(payload, *, raises=None):
     """Drive room_members with the gateway stubbed at the http_json seam."""
     saved_g, saved_h = mem.gateway, mem.http_json
     try:
-        mem.gateway = lambda: ("https://example.invalid", {})
+        mem.gateway = lambda *_a: ("https://example.invalid", {})
         if raises is not None:
             def _boom(*a, **k):
                 raise raises
@@ -97,7 +97,7 @@ check(_run({"ok": True})["members"] == [], "missing members key -> empty list, o
 
 saved = mem.gateway
 try:
-    mem.gateway = lambda: (None, {})
+    mem.gateway = lambda *_a: (None, {})
     check(mem.room_members("!r:ag2.space")["reason"] == "no gateway configured",
           "no gateway configured is named, not a crash")
 finally:

@@ -74,6 +74,8 @@ class NoCloudTrust(unittest.TestCase):
             C.add_connection("https://b-fixture.net|t", added_by="ui", expected_server="b-fixture.net",
                              fetch=lambda *a: {}, workspace=ws, vault=vault)
             C.set_primary("b-fixture-net", workspace=ws)
+            with C._transaction(ws) as rec:  # an unregistered gateway confirms no agent; record one
+                next(r for r in rec["rows"] if r["instance"] == "b-fixture-net")["agent_mxid"] = "@me:b-fixture.net"
             C.launch("b-fixture-net", repo=ws, logs_dir=ws / "logs", environ={"SUTANDO_BRIDGE_LOCK": "0"}, workspace=ws, vault=vault,
                      spawn=lambda argv, env, log: 4_194_404)  # above any pid_max: never runs
             C.remove_connection("b-fixture-net", force=True, workspace=ws, vault=vault)

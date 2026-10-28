@@ -7,10 +7,16 @@
 # to src/channel_env_resolve.py, which delegates containment and the non-empty
 # token rule to their existing owners. The caller sources this path, so an
 # unguarded pick would execute a credential file the sender contract refuses.
+# With `--room <room-id>` the file is the one for the connection serving that room's server.
 # Exits 1 (printing nothing on stdout) when no candidate qualifies.
 set -u
 
-src="${1:?usage: channel-env.sh <channel-source>}"
+src="${1:?usage: channel-env.sh <channel-source> [--room <room-id>]}"
+room=()
+if [ "$#" -ge 2 ]; then
+  [ "$2" = "--room" ] && [ "$#" -eq 3 ] && [ -n "$3" ] || { echo "usage: channel-env.sh <channel-source> [--room <room-id>]" >&2; exit 2; }
+  room=(--room "$3")
+fi
 case "$src" in
   *[!a-z0-9._-]*|""|.|..) echo "channel-env: invalid source '$src'" >&2; exit 2 ;;
 esac
@@ -23,4 +29,4 @@ base="$(bash "$repo/scripts/sutando-config.sh" claude-home-path)"
 . "$repo/scripts/python-binary.sh"
 py="$(require_python "$repo" "resolve the channel env file")" || exit 1
 
-exec "$py" "$repo/src/channel_env_resolve.py" "$base/channels" "$src"
+exec "$py" "$repo/src/channel_env_resolve.py" "$base/channels" "$src" ${room[@]+"${room[@]}"}
