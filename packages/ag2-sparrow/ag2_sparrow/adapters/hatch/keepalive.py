@@ -57,10 +57,10 @@ LANE_GRACE_S = 120
 REASON_HINTS = {
     HOOK_NOT_RUNNING: f"the hook has not run in the last {HOOK_STALE_S // 60} minutes; see "
                       "the hook run line above",
-    TASK_NOT_PICKED_UP: f"an AG2 Space task has been open over {TASK_PICKUP_S // 60} minutes: "
+    TASK_NOT_PICKED_UP: f"an s.space task has been open over {TASK_PICKUP_S // 60} minutes: "
                         "the hook is not waking a worker for it, or a worker handed it off "
                         "without running hold",
-    TASK_HELD: "a worker parked an AG2 Space task for your go (ag2-sparrow-hatch hold)",
+    TASK_HELD: "a worker parked an s.space task for your go (ag2-sparrow-hatch hold)",
     TASK_HELD_UNDELIVERED: f"a task was held over {HELD_LINE_DELIVER_S // 60} minutes ago and its "
                            "room notice is still queued, being sent, was parked after failed "
                            "sends or was withdrawn unsent, so the asker may have heard nothing: check Sparrow's proactive "
