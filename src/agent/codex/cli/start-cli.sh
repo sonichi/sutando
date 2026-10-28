@@ -630,6 +630,19 @@ log_session_start() {
     >> "$ws/state/session-starts.log"
 }
 
+# Polls <check...> within the session-up budget; on a miss names <what> and fails.
+wait_core_up() {
+  local what="$1"
+  shift
+  for _ in $(seq 1 "$SESSION_UP_TRIES"); do
+    "$@" && break
+    sleep 0.2
+  done
+  "$@" && return 0
+  echo "  ⚠ $what did not come up within ~${SESSION_UP_LABEL} — sentinel NOT cleared, no core is serving." >&2
+  return 1
+}
+
 # The session outlived its core window (restarted above, or the core exited): recreate the
 # core as the session's lowest window, the notifier's target, and leave every sibling running.
 heal_core_window() {
@@ -650,14 +663,7 @@ heal_core_window() {
   fi
   tmux -S "$TMUX_SOCKET" select-window -t "=$SESSION:$idx" 2>/dev/null || true
   tmux -S "$TMUX_SOCKET" set-environment -t "=$SESSION" SUTANDO_CORE_RUNTIME codex 2>/dev/null || true
-  for _ in $(seq 1 "$SESSION_UP_TRIES"); do
-    codex_core_live && break
-    sleep 0.2
-  done
-  if ! codex_core_live; then
-    echo "  ⚠ healed core window did not come up within ~${SESSION_UP_LABEL} — sentinel NOT cleared, no core is serving." >&2
-    return 1
-  fi
+  wait_core_up "the healed core window" codex_core_live || return 1
   log_session_start
   record_confirmed_core_runtime codex "$(heartbeat_python)"
   clear_shutdown_sentinel
@@ -670,7 +676,7 @@ heal_core_window() {
 if session_exists "$SESSION"; then
   heal_core_window || exit 1
   if [ -t 1 ] && [ -z "${TMUX:-}" ]; then
-    exec tmux -S "$TMUX_SOCKET" attach -t "$SESSION"
+    exec tmux -S "$TMUX_SOCKET" attach -t "=$SESSION"
   fi
   echo "Healed the core window in $SESSION (session and sibling windows preserved)."
   exit 0
@@ -681,18 +687,10 @@ fi
 start_core_session_and_helpers() {
   ensure_codex_project_trust
   tmux -S "$TMUX_SOCKET" new-session -d -s "$SESSION" "${CORE_ENV_ARGS[@]}" codex "${CODEX_ARGS[@]}"
-  for _ in $(seq 1 "$SESSION_UP_TRIES"); do
-    session_exists "$SESSION" && break
-    sleep 0.2
-  done
-  if session_exists "$SESSION"; then
-    log_session_start
-    record_confirmed_core_runtime codex "$(heartbeat_python)"
-    clear_shutdown_sentinel
-  else
-    echo "  ⚠ $SESSION did not come up within ~${SESSION_UP_LABEL} — sentinel NOT cleared, no core is serving." >&2
-    return 1
-  fi
+  wait_core_up "$SESSION" session_exists "$SESSION" || return 1
+  log_session_start
+  record_confirmed_core_runtime codex "$(heartbeat_python)"
+  clear_shutdown_sentinel
   ensure_task_notifier
   ensure_codex_observer
   ensure_core_monitor
