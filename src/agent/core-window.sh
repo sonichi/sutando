@@ -3,11 +3,13 @@
 # core's own window, so sibling windows in the session (gateway lanes, monitor) keep running.
 
 # sutando_core_window_ids <socket> <session> <live|all> <cli>...: ids of windows whose pane
-# was started as one of the named CLIs; `live` leaves out panes that already exited.
+# was started as one of the named CLIs (`live`: still running). Fails when panes are unreadable.
 sutando_core_window_ids() {
-  local socket="$1" session="$2" mode="$3" wid dead cmd rt
+  local socket="$1" session="$2" mode="$3" rows wid dead cmd rt
   shift 3
-  tmux -S "$socket" list-panes -s -t "=$session" -F '#{window_id} #{pane_dead} #{pane_start_command}' 2>/dev/null \
+  rows="$(tmux -S "$socket" list-panes -s -t "=$session" -F '#{window_id} #{pane_dead} #{pane_start_command}' 2>/dev/null)" \
+    || return 1
+  printf '%s\n' "$rows" \
     | while read -r wid dead cmd _; do
         [ "$mode" = all ] || [ "$dead" = 0 ] || continue
         cmd="${cmd#\"}"; cmd="${cmd%\"}"

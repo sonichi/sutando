@@ -299,6 +299,7 @@ exit 0
     _CORE_WINDOW = (
         'for _a in "$@"; do [ "$_a" = list-windows ] && { echo 0; exit 0; }; done\n'
         'for _a in "$@"; do case "$_a" in *pane_start_command*)\n'
+        '  [ "${FAKE_PANES_UNREADABLE:-}" = 1 ] && exit 1\n'
         '  [ "${FAKE_NO_CORE_WINDOW:-}" = 1 ] || echo "@0 0 codex -C x"; exit 0 ;; esac; done\n'
         'for _a in "$@"; do [ "$_a" = kill-window ] && { printf \'%s\\n\' "$*" >> "$TMUX_LOG"; touch "$TMUX_STATE"; exit 0; }; done\n'
     )
@@ -891,6 +892,24 @@ if [ "${1:-}" = print ]; then [ -f "$LAUNCHCTL_STATE" ]; else exit 0; fi
         self.assertLess(calls.index("kill-window -t @0\n"),
                         calls.index("new-session -d -s sutando-core"))
         self.assertNotIn("kill-session -t =sutando-core\n", calls)
+
+    def test_unreadable_panes_reuse_the_session_instead_of_healing(self):
+        result = self.run_launcher(env_extra={"TMUX_ACTIVE_RUNTIME": "codex", "FAKE_PANES_UNREADABLE": "1"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("already running (codex)", result.stdout)
+        self.assertNotIn("new-window", self._tmux_calls())
+
+    def test_restart_with_unreadable_panes_falls_back_to_the_session(self):
+        result = self.run_launcher("--restart", env_extra={"TMUX_ACTIVE_RUNTIME": "codex", "FAKE_PANES_UNREADABLE": "1"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self._tmux_calls()
+        self.assertLess(calls.index("kill-session -t =sutando-core\n"), calls.index("new-session -d -s sutando-core"))
+
+    def test_a_session_without_a_core_window_is_healed_not_reused(self):
+        result = self.run_launcher(env_extra={"TMUX_ACTIVE_RUNTIME": "codex", "FAKE_NO_CORE_WINDOW": "1"})
+        self.assertIn("healing core window", result.stderr)
+        self.assertIn("new-window -dP -F #{window_index} -t sutando-core:0", self._tmux_calls())
+        self.assertNotIn("new-session -d -s sutando-core ", self._tmux_calls() + " ")
 
     def test_unmarked_existing_session_is_replaced(self):
         result = self.run_launcher(env_extra={"TMUX_ACTIVE_RUNTIME": "unknown"})

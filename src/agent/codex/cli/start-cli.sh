@@ -501,9 +501,13 @@ if [ "${1:-}" = "--restart" ]; then
   # Only the core's window (either CLI, for a runtime switch): its last window takes the
   # session with it, and a surviving sibling leaves the session for the heal below.
   if session_exists "$SESSION"; then
-    for _win in $(sutando_core_window_ids "$TMUX_SOCKET" "$SESSION" all codex claude); do
-      tmux -S "$TMUX_SOCKET" kill-window -t "$_win" 2>/dev/null || true
-    done
+    if _wins="$(sutando_core_window_ids "$TMUX_SOCKET" "$SESSION" all codex claude)"; then
+      for _win in $_wins; do
+        tmux -S "$TMUX_SOCKET" kill-window -t "$_win" 2>/dev/null || true
+      done
+    else
+      tmux -S "$TMUX_SOCKET" kill-session -t "=$SESSION" 2>/dev/null || true
+    fi
   fi
   # Hand the heartbeat over as well: ensure_core_heartbeat only starts one when none is running.
   _hb_py="$(heartbeat_python)"
@@ -524,10 +528,16 @@ elif session_exists "$SESSION" && [ "$(session_runtime)" != "codex" ]; then
 fi
 
 codex_core_live() {
-  [ -n "$(sutando_core_window_ids "$TMUX_SOCKET" "$SESSION" live codex)" ]
+  local ids
+  ids="$(sutando_core_window_ids "$TMUX_SOCKET" "$SESSION" live codex)" && [ -n "$ids" ]
+}
+# Missing only when the panes were read: an unreadable listing never heals over a core it cannot see.
+codex_core_missing() {
+  local ids
+  ids="$(sutando_core_window_ids "$TMUX_SOCKET" "$SESSION" live codex)" && [ -z "$ids" ]
 }
 
-if session_exists "$SESSION" && codex_core_live; then
+if session_exists "$SESSION" && ! codex_core_missing; then
   record_confirmed_core_runtime codex "$(heartbeat_python)"
   apply_tmux_defaults
   ensure_task_notifier
