@@ -2268,6 +2268,73 @@ class Promote(Base):
         self.assertEqual((out["primary"], out["previous"], out["stopped_pid"], out["launch"]), (True, self.BETA, beta, None))
         self.assertEqual((self.by_inst()[self.BETA]["parked"], C.bridge_pid(self.BETA, self.ws)), (True, 0))
 
+    def test_a_parked_target_whose_start_fails_stays_parked(self):
+        self.legacy()
+        self.add(fetch=agents("@a:alpha-fixture.net"))
+        self.promote(self.BETA)
+        self.promote(self.ALPHA)
+        C.stop_bridge(self.BETA, workspace=self.ws)
+
+        def broken(argv, env, log_path):
+            raise OSError("no python")
+        with self.assertRaises(C.NewPrimaryNotStarted):
+            self.promote(self.BETA, spawn=broken)
+        rows = self.by_inst()
+        self.assertEqual((rows[self.BETA]["parked"], rows[self.ALPHA]["primary"]), (True, True))
+
+    def no_primary(self):
+        self.add(fetch=agents("@a:alpha-fixture.net"))
+        C.set_primary(self.ALPHA, workspace=self.ws)
+        C.remove_connection(self.ALPHA, force=True, workspace=self.ws, vault=self.vault)
+        self.assertIsNone(C.primary_instance(self.ws))
+
+    def test_no_primary_and_no_legacy_bridge_parks_nothing(self):
+        self.no_primary()
+        out = self.promote(self.BETA)
+        self.assertEqual((out["previous"], out["stopped_pid"], out["changed"]), (None, 0, True))
+        self.assertIsNone(self.by_inst()[""].get("parked"))
+
+    def test_no_primary_with_the_legacy_bridge_running_parks_the_legacy_row(self):
+        self.no_primary()
+        legacy = self.legacy()
+        out = self.promote(self.BETA)
+        self.assertEqual((out["previous"], out["stopped_pid"]), ("", legacy.pid))
+        self.assertTrue(C.legacy_parked(self.ws))
+
+    def test_a_row_disconnected_while_its_bridge_starts_is_refused_and_rolled_back(self):
+        legacy = self.legacy()
+        real_start = C.start
+
+        def start(instance, **kw):
+            record = real_start(instance, **kw)
+            with C._transaction(self.ws) as rec:
+                C._find(rec["rows"], self.BETA)["disabled"] = True
+            return record
+        with unittest.mock.patch.object(C, "start", start), self.assertRaises(C.DisabledCannotBePrimary):
+            self.promote(self.BETA)
+        self.assertEqual((C.primary_instance(self.ws), C.bridge_pid("", self.ws), C.bridge_pid(self.BETA, self.ws)),
+                         ("", legacy.pid, 0))
+
+    def test_a_started_bridge_that_will_not_stop_leaves_its_row_unparked(self):
+        self.legacy()
+        self.add(fetch=agents("@a:alpha-fixture.net"))
+        self.promote(self.BETA)
+        self.promote(self.ALPHA)
+        C.stop_bridge(self.BETA, workspace=self.ws)
+
+        def refuse(pid, sig):
+            raise PermissionError("not my process")
+        with self.assertRaises(C.BridgeStillRunning):
+            self.promote(self.BETA, kill=refuse)
+        rows = self.by_inst()
+        self.assertEqual((rows[self.BETA].get("parked"), rows[self.ALPHA]["primary"]), (None, True),
+                         "never parked over a bridge that is still up")
+        self.assertTrue(C.bridge_pid(self.BETA, self.ws))
+
+    def test_an_unreadable_record_parks_nothing(self):
+        C.record_path(self.ws).write_text("{broken")
+        self.assertFalse(C.legacy_parked(self.ws))
+
     def test_a_disabled_row_is_refused_before_anything_runs(self):
         self.legacy()
         C.disconnect(self.BETA, workspace=self.ws, kill=lambda *a: None)

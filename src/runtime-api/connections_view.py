@@ -142,8 +142,6 @@ class ConnectionsView:
         try:
             row = connections.unpark(instance, repo=self.repo, logs_dir=self.logs_dir, workspace=self.workspace,
                                      vault=self.vault, spawn=self.spawn)
-        except connections.Refusal as e:
-            raise ProtocolError(CONFLICT, str(e))
         except connections.ConnectionsError as e:
             raise ProtocolError(-32602, str(e))
         return {"connection": connections.status_for(row, self.workspace), "launch": row["launch"]}

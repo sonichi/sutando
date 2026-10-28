@@ -236,6 +236,12 @@ class ViewTests(unittest.TestCase):
             for proc in started:
                 bridge_lease.stop(proc)
 
+    def test_promote_and_unpark_of_an_unknown_instance_are_invalid_params(self):
+        for method in ("connection.promote", "connection.unpark"):
+            with self.assertRaises(ProtocolError) as cm:
+                self.call(method, instance="nope")
+            self.assertEqual(cm.exception.code, -32602, method)
+
     def test_confirm_against_a_moved_identity_is_a_conflict(self):
         preview = self.call("connection.add", token=TOKEN_A)["preview"]
         self.assertEqual((preview["server"], preview["verified"]), ("alpha-fixture.net", True))

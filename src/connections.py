@@ -1101,9 +1101,10 @@ def set_primary(instance: str, *, workspace: Optional[Path] = None) -> dict:
     """Make `instance` the primary; proactive and owner-DM defaults follow it at the next launch.
     Refused before anything is written: a disabled or parked row (`DisabledCannotBePrimary`,
     `ParkedCannotBePrimary`: neither launches); any named promotion while the legacy bridge runs,
-    whatever the record's primary (`LegacyPrimaryRunning`: it settles the room once, at start, so it may hold it); a lease that
-    proves no holder (`BridgeLeaseIndeterminate`). The returned row carries `relaunch_needed`: true when the
-    new primary's bridge is running, since it keeps its launch environment until `reconnect`."""
+    whatever the record's primary (`LegacyPrimaryRunning`: it settles the room once, at start, so it
+    may hold it); a lease that proves no holder (`BridgeLeaseIndeterminate`). The returned row carries
+    `relaunch_needed`: true when the new primary's bridge is running, since it keeps its launch
+    environment until `reconnect`."""
     with _transaction(workspace) as rec:
         row = _find(rec["rows"], instance)
         if row.get("disabled"):
