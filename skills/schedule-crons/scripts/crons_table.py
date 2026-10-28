@@ -459,7 +459,7 @@ def load_capability(scripts: Path):
 async def run_plan(scripts: Path, room: str, user: str, build):
     """Open the room's databases, plan with `build(rd, maps, by, now_ms)`, write it in one update."""
     cap, open_room, rd = load_capability(scripts)
-    url, token = resolve_credentials(cap, None)
+    url, token = resolve_credentials(cap, None, room)
     async with open_room(url, room, token, kind="db") as doc:
         plan = build(rd, doc.database, user, int(time.time() * 1000))
         if plan.writes:

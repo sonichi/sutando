@@ -482,6 +482,13 @@ environment variable, its launch keys, its channel env file and its vault key wh
 gateway, if any, is the row's own host: another server's token is never used. `room_ops.py`
 prints `{"ok": false, "reason": ...}` and exits 1; `channel-env.sh` prints nothing and exits 1.
 
+The same rule serves every other gateway client: the pending-questions and Crons room databases
+and the tutorial page (`channel_credentials.room_env`), `ensure-cron-room.py` and
+`cron-notify.py`, `bee_actions.py`, and `health-check.py --notify-gateway`, which posts to the
+`REMOTE_ALERT_ROOM` of the primary's channel dir. The owner DM those databases default to is read
+from the primary's `state/owner-routing.<instance>.json`. `room_ops.py` verbs that name no room
+(`rooms`, `history`, `agents`, `resolve`, `events list|pull|stream`) act through the primary.
+
 ## Known servers
 
 `known_servers()` is the Add picker's offer: every DotSpace the resolver registers

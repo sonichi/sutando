@@ -1236,6 +1236,16 @@ def _lane_holds_room(row: Mapping[str, object], room_id: str, workspace: Optiona
     return False
 
 
+def primary_row(workspace: Optional[Path] = None) -> Optional[dict]:
+    """The primary row as recorded, read only (no import, no vault); None when no row is
+    primary or the record is missing or unreadable."""
+    try:
+        rows = _read(record_path(workspace))
+    except (SchemaError, OSError):
+        return None
+    return next((dict(r) for r in rows if r["primary"]), None)
+
+
 def connection_for_room(room_id: Optional[str], workspace: Optional[Path] = None) -> Optional[dict]:
     """The row a room operation acts through: the row whose server equals the room ID's domain
     exactly; for an ID naming no domain, the one row whose bridge has a task open in it, else the

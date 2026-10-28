@@ -13923,14 +13923,34 @@ def _gateway_owner_room(source: str = "ag2space") -> "str | None":
     a health alert can carry host/config/outage details that must never leak into
     a team room (qingyun #2487 P1-privacy). Requiring an explicit config entry
     makes the target owner-controlled and owner-only by construction; unset means
-    no gateway post at all (the Slack surface stays as the backup)."""
-    return (_env_file_dict(claude_home_path("channels", source, ".env")).get("REMOTE_ALERT_ROOM") or "").strip() or None
+    no gateway post at all (the Slack surface stays as the backup). The primary
+    connection's own channel dir is read first when the primary is a named row."""
+    for src in dict.fromkeys((_primary_channel_source(source), source)):
+        room = (_env_file_dict(claude_home_path("channels", src, ".env")).get("REMOTE_ALERT_ROOM") or "").strip()
+        if room:
+            return room
+    return None
 
 
-def _gateway_creds(source: str = "ag2space") -> "tuple[str, str] | None":
-    """(url, token) for the gateway op:message endpoint, or None. Supports the
-    one-token onboarding form (REMOTE_TASK_TOKEN='https://gw|secret') and the
-    legacy AG2_REMOTE_URL / AG2_REMOTE_TOKEN aliases honored by startup.sh."""
+def _primary_channel_source(source: str = "ag2space") -> str:
+    """The channel dir of the primary connection's bridge; `source` for the legacy row or none."""
+    import connections
+    row = connections.primary_row(WORKSPACE_DIR)
+    return connections.channel_dir_for(row["instance"]) if row and row.get("instance") else source
+
+
+def _gateway_creds(source: str = "ag2space", room: "str | None" = None) -> "tuple[str, str] | None":
+    """(url, token) for the gateway op:message endpoint, or None. With several connections,
+    the one serving `room`'s server (no room: the primary), and None when it has none. Else
+    the one-token form (REMOTE_TASK_TOKEN='https://gw|secret') or the legacy AG2_REMOTE_* aliases."""
+    import connections
+    try:
+        routed = connections.room_credential(room, workspace=WORKSPACE_DIR)
+    except connections.ConnectionsError:  # never answered with another server's token
+        return None
+    if routed is not None:
+        url, token = routed
+        return url.rstrip("/"), connections.secret_of(token) or token.strip()
     env = _env_file_dict(claude_home_path("channels", source, ".env"))
 
     def get(key: str) -> str:
@@ -13949,7 +13969,7 @@ def _default_gateway_sender(text: str) -> bool:
     the same transport notify.py uses (POST {url}/v1/room, op:message), so it
     reaches the owner even when the core is wedged. Returns True on a 2xx."""
     room = _gateway_owner_room()
-    creds = _gateway_creds()
+    creds = _gateway_creds(room=room) if room else None
     if not room or not creds:
         return False
     url, token = creds
