@@ -537,7 +537,9 @@ start_gateway_lanes() {
     # SUTANDO_SUPERVISED=1 marks the launch as supervised (stdout persisted by
     # the redirect below); the bridge stamps launched_via into gateway-status
     # and skips its own bare-launch file log. See remote_gateway_bridge._log.
-    if [ -n "$PY" ]; then
+    if [ -n "$PY" ] && "$PY" "$REPO/scripts/connections.py" legacy-parked > /dev/null 2>&1; then
+      echo "  ⊘ gateway bridge (legacy) parked by a primary move — scripts/connections.py unpark '' to resume"
+    elif [ -n "$PY" ]; then
       # Once a named row holds the primary, the legacy bridge is a secondary: it must not
       # inherit the proactive room, or two bridges post nudges. Otherwise the variable passes
       # through as is, unset included: the bridge reads the device env only when unset.

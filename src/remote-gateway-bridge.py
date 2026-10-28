@@ -388,6 +388,11 @@ def _legacy_keeps_proactive_room() -> bool:
     return legacy_keeps_proactive_room(WS)
 
 
+def _legacy_stand_down():
+    from connections import legacy_parked
+    return "a primary move parked the legacy connection; unpark it to resume" if legacy_parked(WS) else None
+
+
 def _owns_unaddressed() -> bool:
     from connections import owns_unaddressed
     return owns_unaddressed(GATEWAY_INSTANCE, WS)  # noqa: F821
@@ -421,6 +426,8 @@ PROACTIVE_ROUTE_GATE = _ag2space_proactive_route_gate
 TASK_INTAKE_GATE = _lane_dedupe_gate if not gateway_credential_sources.is_seat(os.environ) else None  # noqa: F821
 PROACTIVE_ROOM_KEEP = _legacy_keeps_proactive_room if not GATEWAY_INSTANCE else None  # noqa: F821
 OWNS_UNADDRESSED = _owns_unaddressed
+STAND_DOWN_GATE = (_legacy_stand_down if not GATEWAY_INSTANCE  # noqa: F821
+                   and not gateway_credential_sources.is_seat(os.environ) else None)  # noqa: F821
 
 if _RUN_MAIN:  # pragma: no cover — script-entry tail; the subprocess suite drives it
     __name__ = "__main__"

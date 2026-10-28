@@ -118,5 +118,41 @@ echo "legacy rotation -> first=$seen_first second=$seen_second removed-stop=$rem
 [ "$seen_second" -gt 0 ] || { echo "FAIL: a rotated token in .env never reached a relaunched child (stale export won)"; fail=1; }
 [ "$removed_lines" -gt 0 ] && [ "$alive_after" -eq 0 ] || { echo "FAIL: a removed token did not stop the loop cleanly"; fail=1; }
 
+# A primary move parks the legacy row: the wrapper stays up tending the agent bridges, launches
+# no bridge and raises no alert, then launches one again once the row is unparked.
+parked_case() {
+  local d; d=$(mktemp -d); mkdir -p "$d/src/launchd" "$d/scripts" "$d/ws/state/channel-bridge-supervisor" "$d/ws/results" "$d/shims"
+  cat > "$d/scripts/sutando-config.sh" <<EOS
+#!/bin/bash
+case "\${1:-}" in workspace) echo "$d/ws" ;; *) echo "$d/none.env" ;; esac
+EOS
+  chmod +x "$d/scripts/sutando-config.sh"
+  printf 'import os,sys\nsys.exit(0 if sys.argv[1:] == ["legacy-parked"] and os.path.exists("%s/parked") else 1)\n' "$d" > "$d/scripts/connections.py"
+  printf 'import time\nopen("%s/launched.log","a").write("x\\n")\nwhile True: time.sleep(0.2)\n' "$d" > "$d/src/remote-gateway-bridge.py"
+  printf 'import time\nwhile True: time.sleep(0.2)\n' > "$d/src/sparrowd.py"
+  cp "$REPO/src/launchd/gateway-bridge-wrapper.sh" "$d/src/launchd/"; cp "$REPO/src/result_publish.py" "$d/src/"
+  printf '#!/bin/bash\nexec "%s" "$@"\n' "$PY" > "$d/shims/python3"; printf '#!/bin/bash\nexit 0\n' > "$d/shims/osascript"
+  chmod +x "$d/shims/python3" "$d/shims/osascript"
+  touch "$d/parked"
+  ( cd "$d" || exit 1; env -u AG2_REMOTE_TOKEN PATH="$d/shims:$PATH" REMOTE_TASK_TOKEN=t SUTANDO_GATEWAY_BRIDGE_RESTART_DELAY=1 \
+      bash src/launchd/gateway-bridge-wrapper.sh > o.log 2>&1 & p=$!
+    sleep 3
+    if kill -0 $p 2>/dev/null; then echo 1 > alive.txt; else echo 0 > alive.txt; fi
+    [ -f launched.log ] && echo 1 > early.txt || echo 0 > early.txt
+    pgrep -f "$d/src/sparrowd.py" > /dev/null && echo 1 > agents.txt || echo 0 > agents.txt
+    rm -f "$d/parked"
+    for _ in $(seq 1 30); do [ -f launched.log ] && break; sleep 0.2; done
+    kill -TERM $p 2>/dev/null; wait $p 2>/dev/null )
+  echo "$(cat "$d/alive.txt") $(cat "$d/early.txt") $(cat "$d/agents.txt") $([ -f "$d/launched.log" ] && echo 1 || echo 0) $(ls "$d/ws/results" | wc -l | tr -d ' ')"
+  rm -rf "$d"
+}
+read -r p_alive p_early p_agents p_resumed p_alerts <<<"$(parked_case)"
+echo "parked legacy -> alive=$p_alive launched-while-parked=$p_early agents=$p_agents resumed=$p_resumed alerts=$p_alerts (want 1 0 1 1 0)"
+[ "$p_alive" -eq 1 ] || { echo "FAIL: a parked legacy row ended the wrapper (and its agent bridges)"; fail=1; }
+[ "$p_early" -eq 0 ] || { echo "FAIL: the bridge launched while the legacy row was parked"; fail=1; }
+[ "$p_agents" -eq 1 ] || { echo "FAIL: the agent-bridge supervisor was not kept up while parked"; fail=1; }
+[ "$p_resumed" -eq 1 ] || { echo "FAIL: the bridge did not launch after the row was unparked"; fail=1; }
+[ "$p_alerts" -eq 0 ] || { echo "FAIL: parking raised an owner alert"; fail=1; }
+
 [ "$fail" -eq 0 ] && echo "PASS"
 exit $fail

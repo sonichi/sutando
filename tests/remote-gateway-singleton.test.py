@@ -239,6 +239,43 @@ class SingletonGlueTest(unittest.TestCase):
                 setattr(rgb, k, v)
         self.assertEqual(order, ["heartbeat", "settle"])
 
+    def _run_main_with_gate(self, gate):
+        order = []
+
+        def settle():
+            order.append("settle")
+            raise KeyboardInterrupt("stop")
+        stubs = {"_acquire_singleton": lambda: True, "_start_lock_heartbeat": lambda: order.append("heartbeat"),
+                 "_settle_proactive_room": settle, "STAND_DOWN_GATE": gate, "_log": order.append}
+        saved = {k: getattr(rgb, k) for k in stubs}
+        for k, v in stubs.items():
+            setattr(rgb, k, v)
+        try:
+            try:
+                rgb.main()
+            except SystemExit as e:
+                order.append(("exit", e.code))
+            except KeyboardInterrupt:
+                pass
+        finally:
+            for k, v in saved.items():
+                setattr(rgb, k, v)
+        return order
+
+    def test_main_stands_down_with_exit_75_when_the_host_parked_it(self):
+        # After the lease, before the room settles or anything polls: rc 75 is never relaunched.
+        order = self._run_main_with_gate(lambda: "parked by a primary move")
+        self.assertEqual(order, ["heartbeat", "standing down: parked by a primary move", ("exit", 75)])
+
+    def test_main_runs_when_the_gate_says_nothing_or_cannot_answer(self):
+        self.assertEqual(self._run_main_with_gate(lambda: None), ["heartbeat", "settle"])
+
+        def boom():
+            raise OSError("record unreadable")
+        order = self._run_main_with_gate(boom)
+        self.assertEqual((order[0], order[-1]), ("heartbeat", "settle"))
+        self.assertTrue(order[1].startswith("stand-down check failed"), order)
+
     def test_main_stands_down_with_exit_75_when_deferred(self):
         # A supervising wrapper (gateway-bridge-wrapper.sh) relaunches any child
         # that exits, except rc 75: so a deferral must exit 75, not return 0.

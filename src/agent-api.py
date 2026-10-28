@@ -191,7 +191,9 @@ def connections_http(method: str, path: str, body: dict, query: Optional[dict] =
     """(status, payload) for one request under CONNECTIONS_PREFIX; payload None = empty body.
     The HTTP shape of the connections domain: GET lists, GET known-servers offers the registry,
     POST previews or (confirm) creates and starts the bridge, DELETE removes, POST <instance>/primary moves the primary,
-    POST <instance>/disconnect stops and disables, POST <instance>/reconnect relaunches,
+    POST <instance>/promote moves it while the old primary runs and parks the old one,
+    POST <instance>/unpark brings a parked row back, POST <instance>/disconnect stops and disables,
+    POST <instance>/reconnect relaunches,
     POST <instance>/token replaces the secret with a new code for the same connection.
     Dispatch only; every rule lives in src/connections.py."""
     ws = Path(workspace) if workspace is not None else WORKSPACE_DIR
@@ -243,6 +245,14 @@ def connections_http(method: str, path: str, body: dict, query: Optional[dict] =
         if len(parts) == 2 and method == "POST" and parts[1] == "primary":
             row = _connections.set_primary(parts[0], workspace=ws)
             return 200, {"connection": _connections.status_for(row, ws)}
+        if len(parts) == 2 and method == "POST" and parts[1] == "promote":
+            row = _connections.promote(parts[0], repo=repo, logs_dir=logs_dir, workspace=ws, vault=vault,
+                                       spawn=spawn, kill=kill)
+            return 200, {"connection": _connections.status_for(row, ws), "previous": row["previous"],
+                         "stopped_pid": row["stopped_pid"], "launch": row["launch"], "changed": row["changed"]}
+        if len(parts) == 2 and method == "POST" and parts[1] == "unpark":
+            row = _connections.unpark(parts[0], repo=repo, logs_dir=logs_dir, workspace=ws, vault=vault, spawn=spawn)
+            return 200, {"connection": _connections.status_for(row, ws), "launch": row["launch"]}
         if len(parts) == 2 and method == "POST" and parts[1] == "disconnect":
             row = _connections.disconnect(parts[0], workspace=ws, kill=kill)
             return 200, {"connection": _connections.status_for(row, ws)}

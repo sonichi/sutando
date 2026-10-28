@@ -172,6 +172,8 @@ for method, path, body in (("GET", "/api/v1/connections", None),
                            ("DELETE", "/api/v1/connections/x?force=1", None),
                            ("POST", "/api/v1/connections/x/primary", {}),
                            ("GET", "/api/v1/connections/known-servers", None),
+                           ("POST", "/api/v1/connections/x/promote", {}),
+                           ("POST", "/api/v1/connections/x/unpark", {}),
                            ("POST", "/api/v1/connections/x/disconnect", {}),
                            ("POST", "/api/v1/connections/x/reconnect", {}),
                            ("POST", "/api/v1/connections/x/token", {"token": TOKEN_A})):
@@ -427,6 +429,18 @@ check("exactly one primary after the move", [r["primary"] for r in b["connection
 s, b, _ = req("POST", "/api/v1/connections/alpha-fixture-net/reconnect", {})
 check("reconnect is 202 with a launch record", s == 202 and b["launch"]["ok"] is True and b["launch"]["pid"] == DEAD_PID, f"{s} {b}")
 check("reconnect spawned exactly that bridge", SPAWNED == ["alpha-fixture-net"], SPAWNED)
+s, b, _ = req("POST", "/api/v1/connections/alpha-fixture-net/promote", {})
+check("promote is 200 naming the parked row", s == 200 and (b["connection"]["primary"], b["previous"], b["changed"])
+      == (True, "beta-fixture-net", True), f"{s} {b}")
+s, b, _ = req("GET", "/api/v1/connections")
+check("the old primary is parked, not removed", [(r["instance"], r["primary"], r["parked"], r["reason"]) for r in b["connections"]]
+      == [("alpha-fixture-net", True, False, None), ("beta-fixture-net", False, True, "parked")], b)
+s, b, _ = req("POST", "/api/v1/connections/beta-fixture-net/unpark", {})
+check("unpark is 200 and starts the bridge", s == 200 and b["connection"]["parked"] is False and b["launch"]["ok"] is True, f"{s} {b}")
+s, b, _ = req("POST", "/api/v1/connections/beta-fixture-net/promote", {})
+check("a promote back is 200", s == 200 and b["previous"] == "alpha-fixture-net", f"{s} {b}")
+s, b, _ = req("POST", "/api/v1/connections/beta-fixture-net/promote", {})
+check("promoting the primary again changes nothing", s == 200 and (b["changed"], b["previous"]) == (False, None), f"{s} {b}")
 s, b, _ = req("DELETE", "/api/v1/connections/beta-fixture-net")
 check("deleting the primary is 409 primary", (s, b) == (409, {"error": "primary"}), f"{s} {b}")
 s, b, h = req("DELETE", "/api/v1/connections/alpha-fixture-net")

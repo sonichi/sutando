@@ -8,6 +8,15 @@
   set-primary INSTANCE         move proactive/owner-DM defaults to this connection; refused on a
                                disconnected row (disabled_cannot_be_primary); a running bridge
                                takes the room at its next reconnect ("reconnect it" is printed)
+  promote INSTANCE --repo DIR --logs-dir DIR
+                               make this connection primary while the old primary's bridge runs (the
+                               legacy one included): start this bridge, stop the old one, park its row.
+                               Refused by code: disabled_cannot_be_primary, legacy_bridge_not_running,
+                               new_primary_not_started, bridge_still_running (rolled back)
+  unpark INSTANCE --repo DIR --logs-dir DIR
+                               clear a parked row and start its bridge ('' = the legacy row, which its
+                               launchers resume)
+  legacy-parked                exit 0 when a primary move parked the legacy row, else 1
   remove INSTANCE [--force]    drop the row and its vault key; the primary needs --force
   disconnect INSTANCE          stop that bridge, then keep the row, token and launch record out of
                                the plan until reconnect; refused on the primary, on the legacy
@@ -108,6 +117,35 @@ def cmd_set_primary(args) -> int:
     hint = "; its running bridge carries the proactive room after you reconnect it" if row.get("relaunch_needed") else ""
     print(f"primary is now {row['instance'] or '(legacy)'} ({row['server']}){hint}")
     return 0
+
+
+def cmd_promote(args) -> int:
+    row = connections.promote(args.instance, repo=args.repo, logs_dir=args.logs_dir, workspace=args.workspace)
+    if not row["changed"]:
+        print(f"{row['instance'] or '(legacy)'} is already primary")
+        return 0
+    parked = row["previous"]
+    tail = "" if parked is None else f"; parked {parked or '(legacy)'}" + (
+        f" (stopped pid {row['stopped_pid']})" if row.get("stopped_pid") else "")
+    print(f"primary is now {row['instance'] or '(legacy)'} ({row['server']}){tail}")
+    return 0
+
+
+def cmd_unpark(args) -> int:
+    row = connections.unpark(args.instance, repo=args.repo, logs_dir=args.logs_dir, workspace=args.workspace)
+    launch = row.get("launch")
+    if launch is None:
+        tail = "its launchers resume it" if not row["instance"] else "not started"
+    elif launch.get("ok"):
+        tail = f"bridge pid {launch['pid']}"
+    else:
+        tail = f"start failed: {launch.get('reason') or 'launch_failed'}"
+    print(f"unparked {row['instance'] or '(legacy)'} ({tail})")
+    return 0 if launch is None or launch.get("ok") else 1
+
+
+def cmd_legacy_parked(args) -> int:
+    return 0 if connections.legacy_parked(args.workspace) else 1
 
 
 def cmd_remove(args) -> int:
@@ -219,6 +257,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--instance", default=None)
     s.set_defaults(fn=cmd_add)
     s = sub.add_parser("set-primary"); s.add_argument("instance"); s.set_defaults(fn=cmd_set_primary)
+    s = sub.add_parser("promote"); _launch_args(s); s.set_defaults(fn=cmd_promote)
+    s = sub.add_parser("unpark"); _launch_args(s); s.set_defaults(fn=cmd_unpark)
+    sub.add_parser("legacy-parked").set_defaults(fn=cmd_legacy_parked)
     s = sub.add_parser("remove"); s.add_argument("instance"); s.add_argument("--force", action="store_true")
     s.set_defaults(fn=cmd_remove)
     s = sub.add_parser("disconnect"); s.add_argument("instance"); s.set_defaults(fn=cmd_disconnect)

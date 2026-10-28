@@ -305,6 +305,10 @@ class RuntimeDispatcher:
                 return self.connections.remove(params)
             if method == "connection.set_primary":
                 return self.connections.set_primary(params)
+            if method == "connection.promote":
+                return self.connections.promote(params)
+            if method == "connection.unpark":
+                return self.connections.unpark(params)
             if method == "connection.disconnect":
                 return self.connections.disconnect(params)
             if method == "connection.reconnect":

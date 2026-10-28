@@ -420,6 +420,27 @@ class InProcess(unittest.TestCase):
         self.assertEqual((rc, out), (1, ""))
         self.assertIn("connections: disabled_cannot_be_primary: dev", err)
 
+    def test_promote_unpark_and_legacy_parked_print_and_exit_by_the_module(self):
+        argv = ["--repo", "/r", "--logs-dir", "/l"]
+        moved = {"instance": "s-space", "server": "s.space", "changed": True, "previous": "", "stopped_pid": 41}
+        rc, out, _ = self.run_main(["promote", "s-space", *argv], promote=lambda inst, **kw: dict(moved))
+        self.assertEqual((rc, out), (0, "primary is now s-space (s.space); parked (legacy) (stopped pid 41)\n"))
+        rc, out, _ = self.run_main(["promote", "s-space", *argv], promote=lambda inst, **kw: dict(moved, changed=False))
+        self.assertEqual((rc, out), (0, "s-space is already primary\n"))
+
+        def refused(inst, **kw):
+            raise self.cli.connections.BridgeStillRunning("", 41)
+        rc, _, err = self.run_main(["promote", "s-space", *argv], promote=refused)
+        self.assertEqual(rc, 1)
+        self.assertIn("connections: bridge_still_running", err)
+        rc, out, _ = self.run_main(["unpark", "", *argv], unpark=lambda inst, **kw: {"instance": "", "launch": None})
+        self.assertEqual((rc, out), (0, "unparked (legacy) (its launchers resume it)\n"))
+        rc, out, _ = self.run_main(["unpark", "dev", *argv], unpark=lambda inst, **kw: {
+            "instance": "dev", "launch": {"ok": False, "reason": "no_token"}})
+        self.assertEqual((rc, out), (1, "unparked dev (start failed: no_token)\n"))
+        self.assertEqual(self.run_main(["legacy-parked"], legacy_parked=lambda ws=None: True)[0], 0)
+        self.assertEqual(self.run_main(["legacy-parked"], legacy_parked=lambda ws=None: False)[0], 1)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=1)

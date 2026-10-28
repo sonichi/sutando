@@ -1953,6 +1953,9 @@ PROACTIVE_ROOM_KEEP: Callable[[], bool] | None = None
 # Host-injected () -> bool: whether this bridge owns unaddressed nudges and the owner's cards.
 # None (standalone default): only the bridge launched without GATEWAY_INSTANCE does.
 OWNS_UNADDRESSED: Callable[[], bool] | None = None
+# Host-injected () -> reason or None, asked once right after the poller lease is taken: a reason
+# stands this bridge down (exit 75) before it polls. None (standalone default) never stands down.
+STAND_DOWN_GATE: Callable[[], "str | None"] | None = None
 PROACTIVE_ROUTE_GATE: Callable[[str, str, "str | None"], "str | None"] | None = None
 # Host-injected task -> reason or None, asked before a fresh task is queued: a reason settles it
 # as a redelivery instead. None (standalone default) queues every fresh task.
@@ -8043,6 +8046,20 @@ def _acquire_singleton() -> bool:
     return True
 
 
+def _stand_down_if_asked() -> None:
+    """Exit 75 (a supervising wrapper does not relaunch) when the host says this bridge must not run."""
+    if STAND_DOWN_GATE is None:
+        return
+    try:
+        reason = STAND_DOWN_GATE()
+    except Exception as e:  # noqa: BLE001 — an unanswerable host keeps the bridge running
+        _log(f"stand-down check failed ({diagnostics.describe(e)}) — running")
+        return
+    if reason:
+        _log(f"standing down: {reason}")
+        sys.exit(75)
+
+
 def _settle_proactive_room() -> None:
     """Ask the host whether this bridge keeps PROACTIVE_ROOM now that it holds the lease."""
     global PROACTIVE_ROOM
@@ -8261,6 +8278,7 @@ def main() -> None:
         sys.exit(75)
     # Heartbeat first: the settle can wait on the connections record lock past the stale window.
     _start_lock_heartbeat()
+    _stand_down_if_asked()
     _settle_proactive_room()
     _lane_identity()  # published at start, so Hatch's fail-closed window is only startup
     atexit.register(_retract_own_lane)
