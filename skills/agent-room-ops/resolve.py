@@ -365,7 +365,7 @@ def resolve_in_room(query: str, room_id: str) -> dict:
         return {**out, "reason": "empty query"}
     if not room_id:
         return {**out, "reason": "room_id required"}
-    base, headers = gateway()
+    base, headers = gateway(room_id)
     if not base:
         return {**out, "reason": "no gateway configured"}
     try:
