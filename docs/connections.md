@@ -247,6 +247,22 @@ answer); the legacy row's launchers resume it (the launchd job within its relaun
 install at the next `bash src/startup.sh`). Un-parking never moves the primary and is idempotent.
 `reconnect` also clears `parked`.
 
+### Moving a terminal-run core to s.space
+
+A core started from a shell, not the desktop app, is never signed in to s.space for you: it keeps
+the ag2.space bridge it started with, and goes silent if ag2.space stops taking writes. The health
+check warns (`sspace-migration`) while every row is on ag2.space and none on s.space. Nothing
+migrates by itself; from the repo:
+
+1. Get a connect code for this agent at s.space's agent portal.
+2. `python3 scripts/connections.py add '<code>'` — quote it (the code holds a `|`); it previews the
+   server and agent and asks before saving the `s-space` row (a secondary, its bridge not started).
+3. `python3 scripts/connections.py promote s-space --repo . --logs-dir "$(bash scripts/sutando-config.sh workspace)/logs"`
+   — starts the s.space bridge as primary, waits for it to connect, then stops and parks the
+   ag2.space bridge (the legacy one included). A failure rolls back and changes nothing.
+
+To go back: `unpark ''`, let its launcher resume the legacy bridge, then `promote ''`.
+
 ## State
 
 `status_for(row)` joins the row with the bridge's own
