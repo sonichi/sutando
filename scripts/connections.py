@@ -218,6 +218,8 @@ def cmd_import_env(args) -> int:
     created = connections.import_from_env(os.environ, workspace=args.workspace)
     for row in created:
         print(f"imported {row['instance'] or '(legacy)'} from {row['token_ref']}")
+        if row.get("relaunch_needed"):
+            print(f"{row['instance']} is now primary; its running bridge has no proactive room until it restarts")
     for ref in connections.removed_env_refs(args.workspace):
         if os.environ.get(ref, "").strip():
             print(f"{ref}: connection removed earlier; unset the variable")

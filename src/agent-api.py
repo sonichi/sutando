@@ -207,7 +207,8 @@ def connections_http(method: str, path: str, body: dict, query: Optional[dict] =
     try:
         if method == "GET" and not parts:
             rows = _connections.list_connections(ws, vault=vault)
-            return 200, {"connections": [_connections.status_for(r, ws) for r in rows]}
+            return 200, {"connections": [_connections.status_for(r, ws) for r in rows],
+                         "no_primary": _connections.no_primary(ws)}
         # A fixed name, matched before any <instance> route so it is never read as a slug.
         if parts == ["known-servers"]:
             if method != "GET":

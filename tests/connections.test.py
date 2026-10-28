@@ -582,7 +582,7 @@ class RemoveConnection(Base):
     def test_removed_env_row_is_not_imported_again(self):
         env = {"AG2_REMOTE_TOKEN_DEV": TOKEN_B}
         C.import_from_env(env, workspace=self.ws, vault=self.vault)
-        C.remove_connection("dev", workspace=self.ws, vault=self.vault)
+        C.remove_connection("dev", force=True, workspace=self.ws, vault=self.vault)  # the sole row is primary
         self.assertEqual(C.removed_env_refs(self.ws), ["AG2_REMOTE_TOKEN_DEV"])
         self.assertEqual(C.import_from_env(env, workspace=self.ws, vault=self.vault), [])
         self.assertEqual(self.rows(), [])
@@ -656,9 +656,11 @@ class ImportFromEnv(Base):
         self.add(TOKEN_B, fetch=unreachable)
         self.assertEqual(C.import_from_env({"AG2_REMOTE_TOKEN_DEV": TOKEN_B}, workspace=self.ws, vault=self.vault), [])
 
-    def test_named_env_tokens_never_become_primary_or_inherit_the_room(self):
-        created = C.import_from_env({"AG2_REMOTE_TOKEN_DEV": TOKEN_B}, workspace=self.ws, vault=self.vault)
-        self.assertEqual([(r["instance"], r["primary"]) for r in created], [("dev", False)])
+    def test_named_env_tokens_beside_another_row_never_become_primary_or_inherit_the_room(self):
+        created = C.import_from_env({"AG2_REMOTE_TOKEN_DEV": TOKEN_B,
+                                     "AG2_REMOTE_TOKEN_QA": "https://qa-fixture.net|q"},
+                                    workspace=self.ws, vault=self.vault)
+        self.assertEqual([(r["instance"], r["primary"]) for r in created], [("dev", False), ("qa", False)])
         entry = C.plan_entry("dev", {}, workspace=self.ws)
         env = C.launch_env(entry, {"REMOTE_PROACTIVE_ROOM": "!parent:example"}, vault=self.vault)
         self.assertEqual(env["REMOTE_PROACTIVE_ROOM"], "")
@@ -876,11 +878,69 @@ class ListSelfHeals(ChannelFileBase):
         self.assertEqual(C._read(C.record_path(self.ws)), rows)
         self.assertEqual(self.vault.store, {"REMOTE_TASK_TOKEN": TOKEN_A})
 
-    def test_a_fresh_install_with_only_a_launch_key_in_the_file_lists_its_row(self):
+    def test_a_fresh_install_with_only_a_launch_key_in_the_file_lists_its_row_as_primary(self):
+        """A host signed in only on a secondary homeserver: its sole row takes the primary, owns the
+        unaddressed nudges and cards, and its launch carries the proactive room."""
         self.write_relay_env(f"AG2_REMOTE_TOKEN_BETA={TOKEN_B}")
         rows = C.list_connections(self.ws, vault=self.vault)
-        self.assertEqual([(r["instance"], r["token_ref"]) for r in rows], [("beta", "AG2_REMOTE_TOKEN_BETA")])
+        self.assertEqual([(r["instance"], r["token_ref"], r["primary"]) for r in rows],
+                         [("beta", "AG2_REMOTE_TOKEN_BETA", True)])
         self.assertEqual(C._read(C.record_path(self.ws)), rows, "persisted, not answered from the file")
+        self.assertEqual([C.owns_unaddressed(i, self.ws) for i in ("beta", "")], [True, False])
+        environ = {"AG2_REMOTE_TOKEN_BETA": TOKEN_B, "REMOTE_PROACTIVE_ROOM": "!nudges:beta-fixture.net"}
+        entry = C.plan_entry("beta", environ, workspace=self.ws)
+        self.assertTrue(entry["primary"])
+        self.assertEqual(C.launch_env(entry, environ, vault=self.vault)["REMOTE_PROACTIVE_ROOM"],
+                         "!nudges:beta-fixture.net")
+
+    def test_two_suffixed_rows_leave_the_primary_unpicked(self):
+        self.write_relay_env(f"AG2_REMOTE_TOKEN_BETA={TOKEN_B}\nAG2_REMOTE_TOKEN_GAMMA=https://chat.gamma-fixture.net|g")
+        rows = C.list_connections(self.ws, vault=self.vault)
+        self.assertEqual([(r["instance"], r["primary"]) for r in rows], [("beta", False), ("gamma", False)])
+        self.assertEqual([C.owns_unaddressed(i, self.ws) for i in ("", "beta", "gamma")], [True, False, False])
+
+    def test_rows_with_no_primary_are_reported_and_the_health_check_warns(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("hc_for_no_primary", Path(C.__file__).parent / "health-check.py")
+        hc = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(hc)
+        self.assertFalse(C.no_primary(self.ws), "no record: nothing to report")
+        self.assertIsNone(hc.check_connections_primary(self.ws))
+        self.write_relay_env(f"AG2_REMOTE_TOKEN_BETA={TOKEN_B}\nAG2_REMOTE_TOKEN_GAMMA=https://chat.gamma-fixture.net|g")
+        C.list_connections(self.ws, vault=self.vault)
+        self.assertTrue(C.no_primary(self.ws))
+        warn = hc.check_connections_primary(self.ws)
+        self.assertEqual((warn["name"], warn["status"]), ("connections-primary", "warn"))
+        self.assertIn("choose one in Settings → Connections", warn["detail"])
+        C.set_primary("beta", workspace=self.ws)
+        self.assertFalse(C.no_primary(self.ws))
+        self.assertIsNone(hc.check_connections_primary(self.ws))
+
+    def test_an_unsuffixed_candidate_keeps_the_primary_off_the_named_row(self):
+        created = C.import_from_env({"REMOTE_TASK_TOKEN": TOKEN_A, "AG2_REMOTE_TOKEN_BETA": TOKEN_B},
+                                    workspace=self.ws, vault=self.vault)
+        self.assertEqual(sorted((r["instance"], r["primary"]) for r in created), [("", True), ("beta", False)])
+
+    def test_a_named_row_beside_an_existing_one_never_takes_the_primary(self):
+        C.import_from_env({"AG2_REMOTE_TOKEN_BETA": TOKEN_B}, workspace=self.ws, vault=self.vault)
+        C.set_primary("beta", workspace=self.ws)
+        rec = json.loads(C.record_path(self.ws).read_text())
+        rec["connections"][0]["primary"] = False
+        C.record_path(self.ws).write_text(json.dumps(rec))
+        created = C.import_from_env({"AG2_REMOTE_TOKEN_GAMMA": "https://chat.gamma-fixture.net|g"},
+                                    workspace=self.ws, vault=self.vault)
+        self.assertEqual([(r["instance"], r["primary"]) for r in created], [("gamma", False)])
+
+    def test_the_sole_row_whose_bridge_already_runs_says_it_needs_a_relaunch(self):
+        bridge = bridge_lease.start(self.ws, "beta")
+        try:
+            created = C.import_from_env({"AG2_REMOTE_TOKEN_BETA": TOKEN_B}, workspace=self.ws, vault=self.vault)
+        finally:
+            bridge_lease.stop(bridge)
+        self.assertEqual([(r["instance"], r["primary"], r["relaunch_needed"]) for r in created], [("beta", True, True)])
+        self.assertNotIn("relaunch_needed", self.rows()[0], "a hint for the caller, not a row field")
+        quiet = C.import_from_env({"AG2_REMOTE_TOKEN_DELTA": TOKEN_A}, workspace=self.ws / "other", vault=self.vault)
+        self.assertEqual([r["relaunch_needed"] for r in quiet], [False])
 
     def test_an_empty_record_with_nothing_to_import_lists_empty(self):
         self.assertEqual(C.list_connections(self.ws, vault=self.vault), [])

@@ -1628,6 +1628,18 @@ def check_decision_card_clicks(workspace_dir: Optional[Path] = None) -> "dict | 
                        "`hitl_click: true` task (CLAUDE.md, Pending decisions)")}
 
 
+NO_PRIMARY_DETAIL = "no primary connection — choose one in Settings → Connections"
+
+
+def check_connections_primary(workspace_dir: Optional[Path] = None) -> "dict | None":
+    """WARN when the connections record has rows but no primary: nothing then delivers unaddressed
+    proactive messages or the owner's cards, and nothing else says so."""
+    import connections  # noqa: PLC0415
+    if not connections.no_primary(Path(workspace_dir) if workspace_dir else WORKSPACE_DIR):
+        return None
+    return {"name": "connections-primary", "status": "warn", "detail": NO_PRIMARY_DETAIL}
+
+
 CURRENT_TRACK_READ_BUDGET = 32 * 1024
 
 
@@ -13046,6 +13058,10 @@ def run_all_checks() -> list[dict]:
     _card_clicks = check_decision_card_clicks()
     if _card_clicks:
         checks.append(_card_clicks)
+
+    _no_primary = check_connections_primary()
+    if _no_primary:
+        checks.append(_no_primary)
 
     _mem_index = check_memory_index_integrity()
     if _mem_index:

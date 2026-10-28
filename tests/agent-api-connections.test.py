@@ -212,7 +212,7 @@ for origin in ("https://evil-fixture.net", "null", "http://localhost.evil-fixtur
     check(f"no CORS grant is echoed to {origin}", "Access-Control-Allow-Origin" not in h, h)
 check("nothing was stored by the refused requests", (FakeVault.store, SPAWNED) == ({}, []))
 s, b, _ = req("GET", "/api/v1/connections")
-check("nothing was stored by the refused requests (record)", b == {"connections": []}, b)
+check("nothing was stored by the refused requests (record)", b == {"connections": [], "no_primary": False}, b)
 
 print("== CORS: echo the loopback Origin only, never * ==")
 s, b, h = req("GET", "/api/v1/connections", headers={"Origin": "http://localhost:5173"})
@@ -243,7 +243,7 @@ check("preview names the registered, identity-confirmed server",
       (p.get("server"), p.get("server_source"), p.get("verified")) == ("alpha-fixture.net", "identity", True), p)
 check("preview carries no secret", no_secret(b))
 s, b, _ = req("GET", "/api/v1/connections")
-check("a preview saves nothing", b == {"connections": []})
+check("a preview saves nothing", b == {"connections": [], "no_primary": False})
 
 s, b, _ = req("POST", "/api/v1/connections", {"token": TOKEN_A, "confirm": True})
 check("confirm without expected_server is 400", s == 400, f"{s} {b}")
@@ -569,6 +569,15 @@ check("the imported secret went to the vault, never the response",
 check("the row is persisted", (WS / "state" / "connections.json").is_file())
 s, b, _ = req("GET", "/api/v1/connections")
 check("a later GET lists the same row from the record", [r["token_ref"] for r in (b or {}).get("connections", [])] == ["REMOTE_TASK_TOKEN"], b)
+check("a record with a primary says so", (b or {}).get("no_primary") is False, b)
+
+print("== rows with no primary are reported, so the panel can ask for one ==")
+(WS / "state" / "connections.json").unlink()
+C.import_from_env({"AG2_REMOTE_TOKEN_DEV": TOKEN_B, "AG2_REMOTE_TOKEN_QA": "https://qa-fixture.net|q"},
+                  workspace=WS, vault=FakeVault())
+s, b, _ = req("GET", "/api/v1/connections")
+check("two named rows and no primary list with no_primary true",
+      s == 200 and len((b or {}).get("connections", [])) == 2 and b.get("no_primary") is True, f"{s} {b}")
 
 server.server_close()
 print()

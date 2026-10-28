@@ -135,9 +135,13 @@ row to the identity's server in place: one row, one bridge, the instance slug an
 key unchanged. A row keyed by identity is never demoted.
 
 A saved row is primary only when the install has no primary yet. `import-env` gives the
-flag only to the `REMOTE_TASK_TOKEN` row (the legacy unsuffixed bridge), never to a
-named `AG2_REMOTE_TOKEN_<INST>`; removing the primary leaves none until `set_primary`
-or the next saved row. Adding **never changes which row is primary** except that the very
+flag to the `REMOTE_TASK_TOKEN` row (the legacy unsuffixed bridge). A named
+`AG2_REMOTE_TOKEN_<INST>` row gets it only when it is then the record's sole row, with no
+primary and no unsuffixed row or token (a desktop signed in only on a secondary homeserver);
+with two or more rows none is picked. That row carries `relaunch_needed: true` when its bridge
+already runs. Rows with no primary are reported: the list answers `no_primary: true` and the
+health check warns "no primary connection — choose one in Settings → Connections". Removing
+the primary leaves none until `set_primary` or the next saved row. Adding **never changes which row is primary** except that the very
 first row saved becomes primary. `set_primary(instance)` is the one way to move it,
 and moving it is what moves proactive and owner-DM routing **at the next launch**: a bridge
 already running keeps the environment it was launched with. A disabled row is refused

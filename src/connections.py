@@ -1093,6 +1093,16 @@ def primary_instance(workspace: Optional[Path] = None) -> Optional[str]:
     return None
 
 
+def no_primary(workspace: Optional[Path] = None) -> bool:
+    """Whether the record has rows but none is primary: then no bridge owns unaddressed proactive
+    messages or the owner's cards. Read only; an unreadable or missing record is False."""
+    try:
+        rows = _read(record_path(workspace))
+    except (SchemaError, OSError):
+        return False
+    return bool(rows) and not any(r["primary"] for r in rows)
+
+
 def legacy_keeps_proactive_room(workspace: Optional[Path] = None) -> bool:
     """Asked by the legacy bridge right after it takes its lease: whether it may keep the proactive
     room. Under the record lock, so a `set_primary` either committed first (False here) or runs
@@ -1451,12 +1461,15 @@ def import_from_env(environ: Optional[Mapping[str, str]] = None, *,
     The REMOTE_TASK_TOKEN row comes from the environment, else from the channel env file the
     connect flow writes (`primary_token_from_channel_file`): a desktop install signs in after
     the engine started, so the token reaches the file but never this process's environment.
-    Env rows are unverified: the resolver's server when it knows the host, else the host. Only
-    the REMOTE_TASK_TOKEN row (the legacy unsuffixed bridge) can become primary, and only when
-    the install has none; a named env token never does, so no secondary ever inherits the
-    proactive room. A name whose row was removed is skipped until the variable is unset. The
-    secret is copied into the vault under the row's token_ref unless the vault already holds
-    one. Returns the rows created.
+    Env rows are unverified: the resolver's server when it knows the host, else the host. The
+    REMOTE_TASK_TOKEN row (the legacy unsuffixed bridge) becomes primary when the install has none.
+    A named env row becomes primary only when it is then the record's sole row, with no primary
+    and no unsuffixed row or candidate (a host signed in only on a secondary homeserver); among
+    several none is picked, so no secondary inherits the proactive room by chance. That row
+    carries `relaunch_needed` when its bridge already runs, since it settled the proactive room
+    at launch. A name whose row was removed is skipped until the variable is unset. The secret
+    is copied into the vault under the row's token_ref unless the vault already holds one.
+    Returns the rows created.
     """
     environ = os.environ if environ is None else environ
     candidates = []
@@ -1491,8 +1504,34 @@ def import_from_env(environ: Optional[Mapping[str, str]] = None, *,
                        primary=(inst == "" and not any(r["primary"] for r in rows)), added_by="env",
                        verified=False, server_source="resolver" if resolved else "gateway")
             rows.append(row)
-            created.append(dict(row))
-    return created
+            created.append(row)
+        sole = _sole_named_primary(rows, candidates)
+        if sole is not None and any(r is sole for r in created):
+            sole["primary"] = True
+    out = [dict(r) for r in created]
+    for r in out:
+        if r["primary"] and r["instance"]:
+            r["relaunch_needed"] = _bridge_running(r["instance"], workspace)
+    return out
+
+
+def _sole_named_primary(rows: list, candidates: list) -> Optional[dict]:
+    """The one named row that may take the primary: no primary, no unsuffixed row or candidate,
+    and it is the only row, enabled and not parked."""
+    if len(rows) != 1 or any(r["primary"] or not r["instance"] for r in rows):
+        return None
+    if any(not inst for inst, _ref, _tok in candidates):
+        return None
+    row = rows[0]
+    return None if row.get("disabled") or row.get("parked") else row
+
+
+def _bridge_running(instance: str, workspace: Optional[Path]) -> bool:
+    """Whether `instance`'s bridge holds its lease; a lease that proves nothing counts as running."""
+    try:
+        return bool(bridge_pid(instance, workspace))
+    except BridgeLeaseIndeterminate:
+        return True
 
 
 # ── status ───────────────────────────────────────────────────────────────────
