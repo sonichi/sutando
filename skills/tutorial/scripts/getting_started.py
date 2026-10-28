@@ -14,8 +14,9 @@ resolver; unknown omits it). `--name auto` uses this agent's Matrix profile disp
 name made from its mxid's localpart, else "Sutando"; it never fails.
 
 room_commons.py is found beside this skill, else in the installed skills directory. Its
-credentials come from the environment, else from the AG2 Space channel env file
-(src/channel_credentials.py); nothing here prints them.
+credentials are the connection serving the room's server on an install with several
+(src/channel_credentials.py room_env), else the environment's, else the AG2 Space channel env
+file's; nothing here prints them.
 
 One page per room, created once. <workspace>/state/tutorial/getting-started.json records each
 room's entry under a lock: `creating` with an operation_id before the page is made through
@@ -94,20 +95,25 @@ def find_room_commons(environ: Optional[Mapping[str, str]] = None) -> Path:
     return next((c for c in candidates if c.is_file()), candidates[0])
 
 
-def capability_names(script: Path) -> tuple:
-    """The credential variables room_commons.py reads (its URL_VARS and TOKEN_VARS); () when it
-    cannot be loaded, which leaves the credentials to it alone."""
+def capability_vars(script: Path) -> tuple:
+    """(URL_VARS, TOKEN_VARS) of room_commons.py; ((), ()) when it cannot be loaded, which leaves
+    the credentials to it alone."""
     try:
         sys.path.insert(0, str(script.parent))
         spec = importlib.util.spec_from_file_location("_tutorial_room_commons", script)
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
     except Exception:  # noqa: BLE001
-        return ()
+        return (), ()
     finally:
         with contextlib.suppress(ValueError):
             sys.path.remove(str(script.parent))
-    return (*getattr(mod, "URL_VARS", ()), *getattr(mod, "TOKEN_VARS", ()))
+    return tuple(getattr(mod, "URL_VARS", ())), tuple(getattr(mod, "TOKEN_VARS", ()))
+
+
+def capability_names(script: Path) -> tuple:
+    """The credential variables room_commons.py reads (its URL_VARS and TOKEN_VARS)."""
+    return tuple(v for names in capability_vars(script) for v in names)
 
 
 def connect_actions(script: Path, env: Optional[Dict[str, str]] = None):
@@ -117,7 +123,7 @@ def connect_actions(script: Path, env: Optional[Dict[str, str]] = None):
     sys.path.insert(0, str(script.parent))
     saved = dict(os.environ)
     try:
-        os.environ.update({k: v for k, v in (env or {}).items() if k not in os.environ})
+        os.environ.update({k: v for k, v in (env or {}).items() if k not in os.environ or v == ""})
         spec = importlib.util.spec_from_file_location("room_commons", script)
         rc = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(rc)
@@ -129,12 +135,16 @@ def connect_actions(script: Path, env: Optional[Dict[str, str]] = None):
             sys.path.remove(str(script.parent))
 
 
-def commons_env(script: Path, environ: Optional[Mapping[str, str]] = None) -> Dict[str, str]:
-    """The environment for room_commons.py: this one, plus its credentials from the AG2 Space
-    channel env file when the environment names none of them."""
-    from channel_credentials import channel_credentials
+def commons_env(script: Path, environ: Optional[Mapping[str, str]] = None,
+                room: Optional[str] = None) -> Dict[str, str]:
+    """The environment for room_commons.py acting in `room`: with several connections, the
+    credential of the one serving its server; else this one, plus its credentials from the
+    AG2 Space channel env file when the environment names none of them."""
+    from channel_credentials import channel_credentials, room_env
     env = dict(os.environ if environ is None else environ)
-    env.update(channel_credentials(capability_names(script), env))
+    url_vars, token_vars = capability_vars(script)
+    routed = room_env(url_vars, token_vars, room, environ=env)
+    env.update(routed if routed is not None else channel_credentials((*url_vars, *token_vars), env))
     return env
 
 
@@ -572,7 +582,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     if not script.is_file():
         print(json.dumps({"ok": False, "reason": "room-commons not installed", "path": str(script)}))
         return 3
-    env = commons_env(script)
+    try:
+        env = commons_env(script, room=args.room)
+    except Exception as exc:  # noqa: BLE001 - the room's server has no usable connection
+        print(json.dumps({"ok": False, "reason": redact(str(exc), os.environ)}))
+        return 4
     try:
         result = publish(Commons(script, args.room, env), marker_path(_workspace()),
                          name, args.owner, args.summon,
