@@ -212,7 +212,7 @@ for origin in ("https://evil-fixture.net", "null", "http://localhost.evil-fixtur
     check(f"no CORS grant is echoed to {origin}", "Access-Control-Allow-Origin" not in h, h)
 check("nothing was stored by the refused requests", (FakeVault.store, SPAWNED) == ({}, []))
 s, b, _ = req("GET", "/api/v1/connections")
-check("nothing was stored by the refused requests (record)", b == {"connections": []}, b)
+check("nothing was stored by the refused requests (record)", b == {"connections": [], "capabilities": ["legacy_readopt"]}, b)
 
 print("== CORS: echo the loopback Origin only, never * ==")
 s, b, h = req("GET", "/api/v1/connections", headers={"Origin": "http://localhost:5173"})
@@ -243,7 +243,7 @@ check("preview names the registered, identity-confirmed server",
       (p.get("server"), p.get("server_source"), p.get("verified")) == ("alpha-fixture.net", "identity", True), p)
 check("preview carries no secret", no_secret(b))
 s, b, _ = req("GET", "/api/v1/connections")
-check("a preview saves nothing", b == {"connections": []})
+check("a preview saves nothing", b == {"connections": [], "capabilities": ["legacy_readopt"]})
 
 s, b, _ = req("POST", "/api/v1/connections", {"token": TOKEN_A, "confirm": True})
 check("confirm without expected_server is 400", s == 400, f"{s} {b}")
@@ -505,6 +505,24 @@ check("the minted token stops working once the operator set one", s == 401, f"{s
 s, b, _ = req("GET", "/api/v1/connections", auth="Bearer operator-token")
 check("the operator's token reads", s == 200, f"{s} {b}")
 api.API_TOKEN = ""
+
+print("== a fresh code for the legacy row's server is adopted into a named row ==")
+C.record_path(WS).unlink()
+FakeVault.store.clear()
+C.import_from_env({"REMOTE_TASK_TOKEN": "https://chat.alpha-fixture.net|rotated"}, workspace=WS, vault=FakeVault())
+s, b, _ = req("GET", "/api/v1/connections")
+check("the list names the capability the client gates its reconnect button on",
+      s == 200 and b["capabilities"] == ["legacy_readopt"] and [r["instance"] for r in b["connections"]] == [""], f"{s} {b}")
+s, b, _ = req("POST", "/api/v1/connections", {"token": TOKEN_A, "confirm": True, "expected_server": "alpha-fixture.net"})
+check("the paste is a 201 create of a named row, not 'already connected'",
+      s == 201 and b["created"] is True and b["connection"]["instance"] == "alpha-fixture-net"
+      and b["connection"]["legacy"] is False, f"{s} {b}")
+check("the secret is in the vault under the new row's key", FakeVault.store.get("AG2_REMOTE_TOKEN_ALPHA_FIXTURE_NET") == TOKEN_A)
+s, b, _ = req("GET", "/api/v1/connections")
+check("the legacy row is retired and parked for its launchers",
+      [r["instance"] for r in b["connections"]] == ["alpha-fixture-net"] and C.legacy_parked(WS), b)
+C.record_path(WS).unlink()
+FakeVault.store.clear()
 
 print("== DELETE elsewhere ==")
 s, b, _ = req("DELETE", "/task")
