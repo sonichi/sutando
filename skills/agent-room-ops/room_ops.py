@@ -52,6 +52,7 @@ import rooms as _rooms     # noqa: E402
 import members as _members # noqa: E402
 import events as _events   # noqa: E402
 import history as _history # noqa: E402
+import _gateway            # noqa: E402
 
 
 def _record_say(res):
@@ -146,6 +147,15 @@ def _dispatch_events(a):
 
 
 def _main(argv):
+    """A room whose server has no usable connection is a hard failure, never a quiet no-op."""
+    try:
+        return _run(argv)
+    except _gateway.RoomConnectionError as e:
+        print(json.dumps({"ok": False, "reason": str(e)}, indent=2))
+        return 1
+
+
+def _run(argv):
     import argparse
     ap = argparse.ArgumentParser(prog="room_ops", description="Agent room-participation ops (gateway-only, gated).")
     sub = ap.add_subparsers(dest="cmd", required=True)
