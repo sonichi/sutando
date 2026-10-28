@@ -559,6 +559,13 @@ An upgrade never needs Sparrow stopped by hand. After writing its files,
   SIGTERM and started again the way the keepawake task starts it, which sets
   it. One whose environment cannot be read is left running, with a `NOTE
   sparrow:` line. If none runs, one is started.
+- Either way, a running Sparrow is replaced (the unit restarted, or the
+  detached one stopped with SIGTERM and started again) when it is not the
+  listener this install configured: its drain's published identity is not the
+  `--mxid` install saved, or it started before the relay token file last
+  changed. Sparrow reads both only at its start, so this is how an agent
+  already set up for another id or server is moved over. `verify` fails its
+  `identity` check while the running drain serves another id than the config.
 
 It then waits up to 30 seconds for Sparrow's status file to say it is running
 and connected, written by the process now running (after the unit's last start,
