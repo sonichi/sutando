@@ -2,13 +2,18 @@
 """Append one row to the agent's event log, which the desktop client streams into the room's
 events drawer and the dock's Events panel.
 
-  activity.py append "<line>" --kind processing|thinking|working|notice \
+  activity.py append "<line>" --kind processing|thinking|working|notice|wedge \
       [--task-id ID --from MXID --text "<the user's message>"] [--room ROOM_ID]
   activity.py done "<what was done>" --task-id ID [--room ROOM_ID]
   activity.py queue --task-file <workspace>/tasks/<task>.txt      -> {"depth": N, "position": K}
 
 A row: {"ts": epoch, "room": ROOM, "line": str, "kind": str, "task": {"id","from","text"}, "done": bool}
 at <workspace>/state/agent-activity.jsonl. Rows of a task stay live in the drawer until its `done` row.
+
+`--kind wedge` is the exception to all of that: the seat is stopped and needs the owner. It is written
+with NO room, so the client shows it wherever the owner is looking and shows it even through a drawer
+they dismissed — dismissing quiets activity, and a blocker is not activity, it is why activity stopped.
+Passing --room with it is refused; --task-file still names the task, just not a room.
 """
 from __future__ import annotations
 
@@ -79,7 +84,8 @@ def main(argv: list[str] | None = None) -> int:
         if name == "done":
             s.add_argument("--into", dest="task_into", default=None,
                            help="consolidated reply: event id of the message whose reply answered this one too")
-        s.add_argument("--room", default=None, help="room id; default: the owner's latest AG2 Space room")
+        s.add_argument("--room", default=None,
+                       help="room id; default: the owner's latest AG2 Space room. Refused with --kind wedge")
         s.add_argument("--workspace", default=None, help=argparse.SUPPRESS)  # tests only
         s.add_argument("--task-id", default=None)
         s.add_argument("--task-file", default=None, help="a task file: fills --task-id/--from/--text/--room from its headers")
@@ -110,9 +116,14 @@ def main(argv: list[str] | None = None) -> int:
     if getattr(a, "task_into", None):
         task = dict(task or {}, into=a.task_into)
     done = a.cmd == "done"
+    kind = "done" if done else a.kind
+    if kind == "wedge":
+        if a.room:
+            ap.error("a wedge belongs to the owner, not a room: drop --room")
+        room = None  # roomless = the client's global row: every room, and through a dismissed drawer
     ws = Path(a.workspace) if a.workspace else None
-    rec = append(a.line, kind="done" if done else a.kind, room=room or default_room(ws), task=task, done=done,
-                 workspace=ws)
+    rec = append(a.line, kind=kind, room=room if kind == "wedge" else (room or default_room(ws)),
+                 task=task, done=done, workspace=ws)
     print(json.dumps(rec, ensure_ascii=False))
     return 0
 
