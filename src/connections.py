@@ -786,6 +786,8 @@ def _validate_row(row: object, index: int) -> dict:
 REMOVED_KEY = "removed_env"
 # Record-level park of a legacy bridge that has no row of its own (a named row covers its server).
 LEGACY_PARKED_KEY = "legacy_parked"
+# {instance: pid} of a bridge running when an import made its row primary: it has no proactive room.
+RELAUNCH_KEY = "relaunch_pending"
 # What this engine's connections surfaces support, listed beside the rows so a client can gate on it.
 CAPABILITIES = ("legacy_readopt",)
 
@@ -812,14 +814,17 @@ def _validate(payload: object) -> dict:
     parked = payload.get(LEGACY_PARKED_KEY, False)
     if not isinstance(parked, bool):
         raise SchemaError(f"connections.json: '{LEGACY_PARKED_KEY}' is not a boolean")
-    return {"rows": rows, REMOVED_KEY: sorted(set(removed)), LEGACY_PARKED_KEY: parked}
+    pending = payload.get(RELAUNCH_KEY, {})
+    if not isinstance(pending, dict) or not all(isinstance(k, str) and type(v) is int for k, v in pending.items()):
+        raise SchemaError(f"connections.json: '{RELAUNCH_KEY}' is not a map of instance to pid")
+    return {"rows": rows, REMOVED_KEY: sorted(set(removed)), LEGACY_PARKED_KEY: parked, RELAUNCH_KEY: dict(pending)}
 
 
 def _read_record(path: Path) -> dict:
     try:
         size = path.stat().st_size
     except FileNotFoundError:
-        return {"rows": [], REMOVED_KEY: [], LEGACY_PARKED_KEY: False}
+        return {"rows": [], REMOVED_KEY: [], LEGACY_PARKED_KEY: False, RELAUNCH_KEY: {}}
     if size > MAX_BYTES:
         raise SchemaError(f"connections.json: {size} bytes exceeds the {MAX_BYTES}-byte bound")
     try:
@@ -858,6 +863,8 @@ def _write(path: Path, record: dict) -> None:
                REMOVED_KEY: sorted(set(record[REMOVED_KEY]))}
     if record.get(LEGACY_PARKED_KEY):
         payload[LEGACY_PARKED_KEY] = True
+    if record.get(RELAUNCH_KEY):
+        payload[RELAUNCH_KEY] = dict(record[RELAUNCH_KEY])
     _validate(payload)
     _atomic_json(path, payload)
 
@@ -1556,18 +1563,30 @@ def import_from_env(environ: Optional[Mapping[str, str]] = None, *,
             rows.append(row)
             created.append(row)
         sole = _sole_named_primary(rows, candidates, environ)
+        relaunch = {}
         if sole is not None and any(r is sole for r in created):
             sole["primary"] = True
+            pid = _bridge_pid_or_none(sole["instance"], workspace)
+            relaunch[sole["instance"]] = pid != 0
+            if pid:
+                rec.setdefault(RELAUNCH_KEY, {})[sole["instance"]] = pid
     out = [dict(r) for r in created]
     for r in out:
-        if r["primary"] and r["instance"]:
-            r["relaunch_needed"] = _bridge_running(r["instance"], workspace)
+        if r["instance"] in relaunch:
+            r["relaunch_needed"] = relaunch[r["instance"]]
     return out
 
 
-# Any of these configures the legacy unsuffixed bridge, which then keeps the proactive room.
-LEGACY_BRIDGE_ENV = ("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN", "REMOTE_TASK_URL", "AG2_REMOTE_URL",
-                     "REMOTE_TASK_TOKEN_FILE")
+# A token source configures the legacy bridge; a relay URL does so only beside AGENT_ID (the desktop's rule).
+LEGACY_TOKEN_ENV = ("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN", "REMOTE_TASK_TOKEN_FILE")
+LEGACY_URL_ENV = ("REMOTE_TASK_URL", "AG2_REMOTE_URL")
+
+
+def legacy_bridge_configured(environ: Mapping[str, str]) -> bool:
+    """Whether the environment configures the legacy unsuffixed bridge: a token source, or a relay
+    URL with AGENT_ID. A URL left alone by an earlier sign-in configures nothing."""
+    has = lambda v: bool((environ.get(v) or "").strip())  # noqa: E731
+    return any(has(v) for v in LEGACY_TOKEN_ENV) or (has("AGENT_ID") and any(has(v) for v in LEGACY_URL_ENV))
 
 
 def _sole_named_primary(rows: list, candidates: list, environ: Mapping[str, str]) -> Optional[dict]:
@@ -1577,18 +1596,51 @@ def _sole_named_primary(rows: list, candidates: list, environ: Mapping[str, str]
         return None
     if any(not inst for inst, _ref, _tok in candidates):
         return None
-    if any((environ.get(v) or "").strip() for v in LEGACY_BRIDGE_ENV):
+    if legacy_bridge_configured(environ):
         return None
     row = rows[0]
     return None if row.get("disabled") or row.get("parked") else row
 
 
-def _bridge_running(instance: str, workspace: Optional[Path]) -> bool:
-    """Whether `instance`'s bridge holds its lease; a lease that proves nothing counts as running."""
+def _bridge_pid_or_none(instance: str, workspace: Optional[Path]) -> Optional[int]:
+    """`instance`'s bridge pid, 0 when none runs; None when its lease proves nothing."""
     try:
-        return bool(bridge_pid(instance, workspace))
+        return bridge_pid(instance, workspace)
     except BridgeLeaseIndeterminate:
-        return True
+        return None
+
+
+def relaunch_needed(row: Mapping[str, object], record: Mapping[str, object],
+                    workspace: Optional[Path] = None) -> bool:
+    """Whether the primary `row`'s bridge is still the one that ran when an import made it primary,
+    so it has no proactive room. A restart replaces the pid, which ends it; read only."""
+    inst = str(row.get("instance") or "")
+    pid = (record.get(RELAUNCH_KEY) or {}).get(inst)
+    if not (pid and row.get("primary")):
+        return False
+    return _bridge_pid_or_none(inst, workspace) == pid
+
+
+def notes(workspace: Optional[Path] = None) -> "list[tuple[str, str]]":
+    """(level, text) lines on the record that the rows alone do not say: no primary, a primary
+    whose bridge needs a restart, a legacy row that is not primary. Read only; [] when unreadable."""
+    try:
+        rec = _read_record(record_path(workspace))
+    except (SchemaError, OSError):
+        return []
+    rows = rec["rows"]
+    out = []
+    primary = next((r for r in rows if r["primary"]), None)
+    if rows and primary is None:
+        out.append(("warn", "no primary connection — choose one in Settings → Connections"))
+    if primary is not None and relaunch_needed(primary, rec, workspace):
+        out.append(("warn", f"{primary['instance']} became primary while its bridge ran: it has no proactive "
+                            "room until that bridge restarts (reconnect it)"))
+    legacy = next((r for r in rows if not r["instance"]), None)
+    if legacy is not None and primary is not None and legacy is not primary:
+        out.append(("info", f"the legacy (unsuffixed) connection to {legacy['server']} is not primary; "
+                            f"proactive messages go to {primary['instance']}. Moving them back is `promote ''`"))
+    return out
 
 
 # ── status ───────────────────────────────────────────────────────────────────
@@ -1671,6 +1723,11 @@ def status_for(row: Mapping[str, object], workspace: Optional[Path] = None) -> d
     out["state"] = state
     out["reason"] = reason
     out["launched_at"] = launch.get("ts")
+    try:
+        record = _read_record(record_path(workspace))
+    except (SchemaError, OSError):
+        record = {}
+    out["relaunch_needed"] = relaunch_needed(row, record, workspace)
     try:
         out["running"] = any(bridge_pid(name, workspace) for name in [inst] + alias_instances(row))
     except BridgeLeaseIndeterminate:

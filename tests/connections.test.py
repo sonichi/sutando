@@ -916,18 +916,68 @@ class ListSelfHeals(ChannelFileBase):
         self.assertFalse(C.no_primary(self.ws))
         self.assertIsNone(hc.check_connections_primary(self.ws))
 
+    def _hc(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("hc_for_notes", Path(C.__file__).parent / "health-check.py")
+        hc = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(hc)
+        return hc
+
+    def test_a_list_that_makes_a_running_lane_primary_says_it_needs_a_relaunch_until_it_restarts(self):
+        """The flip can happen inside a GET; nothing is relaunched from a read, so the list and the
+        health check carry it until that bridge is replaced."""
+        self.write_relay_env(f"AG2_REMOTE_TOKEN_BETA={TOKEN_B}")
+        bridge = bridge_lease.start(self.ws, "beta")
+        try:
+            rows = [C.status_for(r, self.ws) for r in C.list_connections(self.ws, vault=self.vault)]
+            self.assertEqual([(r["instance"], r["primary"], r["relaunch_needed"]) for r in rows], [("beta", True, True)])
+            warn = self._hc().check_connections_primary(self.ws)
+            self.assertEqual(warn["status"], "warn")
+            self.assertIn("no proactive room until that bridge restarts", warn["detail"])
+        finally:
+            bridge_lease.stop(bridge)
+        self.assertFalse(C.status_for(self.rows()[0], self.ws)["relaunch_needed"], "no bridge: nothing to relaunch")
+        again = bridge_lease.start(self.ws, "beta")
+        try:
+            self.assertFalse(C.status_for(self.rows()[0], self.ws)["relaunch_needed"], "a restarted bridge has the room")
+            self.assertIsNone(self._hc().check_connections_primary(self.ws))
+        finally:
+            bridge_lease.stop(again)
+
+    def test_a_legacy_row_that_is_not_primary_is_said_in_status_and_health(self):
+        C.import_from_env({"REMOTE_TASK_TOKEN": TOKEN_A}, workspace=self.ws, vault=self.vault)
+        self.assertEqual(C.notes(self.ws), [], "the legacy row as primary needs no note")
+        C.import_from_env({"AG2_REMOTE_TOKEN_BETA": TOKEN_B}, workspace=self.ws, vault=self.vault)
+        C.set_primary("beta", workspace=self.ws)
+        [(level, text)] = C.notes(self.ws)
+        self.assertEqual(level, "info")
+        self.assertIn("legacy (unsuffixed) connection to alpha-fixture.net is not primary", text)
+        self.assertIn("`promote ''`", text)
+        info = self._hc().check_connections_primary(self.ws)
+        self.assertEqual((info["status"], info["detail"]), ("ok", text))
+
     def test_an_unsuffixed_candidate_keeps_the_primary_off_the_named_row(self):
         created = C.import_from_env({"REMOTE_TASK_TOKEN": TOKEN_A, "AG2_REMOTE_TOKEN_BETA": TOKEN_B},
                                     workspace=self.ws, vault=self.vault)
         self.assertEqual(sorted((r["instance"], r["primary"]) for r in created), [("", True), ("beta", False)])
 
     def test_a_legacy_bridge_configured_in_the_environment_keeps_the_primary_off_the_named_row(self):
-        for var, value in (("REMOTE_TASK_URL", "https://prod.example/relay"),
-                           ("REMOTE_TASK_TOKEN_FILE", "/tmp/prod.env"), ("AG2_REMOTE_URL", "https://p.example")):
-            with self.subTest(var=var):
-                ws = self.ws / var
-                created = C.import_from_env({"AG2_REMOTE_TOKEN_BETA": TOKEN_B, var: value}, workspace=ws, vault=self.vault)
+        legacy = {"url+token file": {"REMOTE_TASK_URL": "https://prod.example/relay", "REMOTE_TASK_TOKEN_FILE": "/tmp/p.env"},
+                  "token file": {"REMOTE_TASK_TOKEN_FILE": "/tmp/p.env"},
+                  "url+agent": {"REMOTE_TASK_URL": "https://prod.example/relay", "AGENT_ID": "@a:alpha-fixture.net"},
+                  "alt url+agent": {"AG2_REMOTE_URL": "https://p.example", "AGENT_ID": "@a:alpha-fixture.net"}}
+        for name, env in legacy.items():
+            with self.subTest(name):
+                created = C.import_from_env({"AG2_REMOTE_TOKEN_BETA": TOKEN_B, **env}, workspace=self.ws / name,
+                                            vault=self.vault)
                 self.assertEqual([(r["instance"], r["primary"]) for r in created], [("beta", False)])
+
+    def test_a_stale_relay_url_alone_does_not_hold_the_primary_back(self):
+        for var in ("REMOTE_TASK_URL", "AG2_REMOTE_URL"):
+            with self.subTest(var):
+                created = C.import_from_env({"AG2_REMOTE_TOKEN_BETA": TOKEN_B, var: "https://old.example/relay"},
+                                            workspace=self.ws / var, vault=self.vault)
+                self.assertEqual([(r["instance"], r["primary"]) for r in created], [("beta", True)])
 
     def test_a_named_row_beside_an_existing_one_never_takes_the_primary(self):
         C.import_from_env({"AG2_REMOTE_TOKEN_BETA": TOKEN_B}, workspace=self.ws, vault=self.vault)

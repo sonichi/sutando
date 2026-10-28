@@ -33,6 +33,9 @@ Beside the rows, the record may carry `legacy_parked: true`: `promote` stopped a
 unsuffixed bridge that has no row of its own (its `REMOTE_TASK_TOKEN` names a server a named row
 already covers, so `import-env` gave it none), or an add re-adopted the legacy row's server into
 a named row (below). `legacy_parked` reads it like a parked legacy row, and `unpark ''` clears it.
+It may also carry `relaunch_pending: {"<instance>": <pid>}`: the bridge that was running when an
+import made that row primary. While that same pid holds the row's lease the row lists
+`relaunch_needed: true`; a restarted bridge ends it.
 
 ### Refusals by code
 
@@ -161,12 +164,17 @@ A client gates its "Reconnect with a code" action on `legacy_readopt` in the lis
 A saved row is primary only when the install has no primary yet. `import-env` gives the
 flag to the `REMOTE_TASK_TOKEN` row (the legacy unsuffixed bridge). A named
 `AG2_REMOTE_TOKEN_<INST>` row gets it only when it is then the record's sole row, with no
-primary, no unsuffixed row or token, and no legacy bridge configured in the environment
-(`REMOTE_TASK_URL`, `AG2_REMOTE_URL`, `REMOTE_TASK_TOKEN_FILE`): a desktop signed in only on a
-secondary homeserver;
-with two or more rows none is picked. That row carries `relaunch_needed: true` when its bridge
-already runs. Rows with no primary are reported: the list answers `no_primary: true` and the
-health check warns "no primary connection — choose one in Settings → Connections". Removing
+primary, no unsuffixed row or token, and no legacy bridge configured in the environment (a
+token source, `REMOTE_TASK_TOKEN_FILE` included, or `REMOTE_TASK_URL`/`AG2_REMOTE_URL` beside
+`AGENT_ID`, the desktop's rule; a relay URL alone is a leftover and counts for nothing): a
+desktop signed in only on a secondary homeserver; with two or more rows none is picked. When its bridge already runs (the
+flip can happen inside a list read, which never relaunches), the record keeps that bridge's pid
+under `relaunch_pending`: until that bridge is replaced, its row lists `relaunch_needed: true`
+and the health check warns that it has no proactive room until it restarts. Rows with no primary
+are reported: the list answers `no_primary: true` and the health check warns "no primary
+connection — choose one in Settings → Connections". A legacy row that is not primary is said in
+`list` and the health check; moving the primary back to it is an explicit `promote ''`, never
+an import or a sign-in. Removing
 the primary leaves none until `set_primary` or the next saved row. Adding **never changes which row is primary** except that the very
 first row saved becomes primary. `set_primary(instance)` is the one way to move it,
 and moving it is what moves proactive and owner-DM routing **at the next launch**: a bridge
