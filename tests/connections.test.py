@@ -2566,6 +2566,130 @@ class Promote(Base):
         self.assertEqual(C.primary_instance(self.ws), "")
 
 
+class LegacyReadopt(Base):
+    """A fresh code for the legacy row's server is adopted into a named, app-managed row and the
+    legacy row retired, so its launchers never start it on the rotated environment token."""
+
+    OLD = "https://chat.ag2.space|rotated-away"
+    FRESH = "https://chat.ag2.space|fresh-secret"
+    ENV = {"REMOTE_TASK_TOKEN": OLD}
+
+    def setUp(self):
+        super().setUp()
+        C.import_from_env(self.ENV, workspace=self.ws, vault=self.vault)
+        self.add("https://chat.s.space|s", fetch=agents("@s:s.space"))
+
+    def moved_to_s_space(self, *, parked=True):
+        with C._transaction(self.ws) as rec:
+            for r in rec["rows"]:
+                r["primary"] = r["instance"] == "s-space"
+                if not r["instance"] and parked:
+                    r["parked"] = True
+
+    def paste(self, token=None, **kw):
+        kw.setdefault("environ", self.ENV)
+        return self.add(token or self.FRESH, fetch=agents("@me:ag2.space"), **kw)
+
+    def legacy(self):
+        proc = bridge_lease.start(self.ws, "")
+        self.children.append(proc)
+        return proc
+
+    def legacy_parked_cli(self):
+        return subprocess.run([sys.executable, str(ROOT / "scripts" / "connections.py"), "--workspace", str(self.ws),
+                               "legacy-parked"], env=isolated_child_env(), capture_output=True).returncode
+
+    def test_a_fresh_code_for_the_parked_legacy_server_becomes_a_managed_row(self):
+        self.moved_to_s_space()
+        row, created = self.paste()
+        self.assertTrue(created, "the UI shows the normal success, not 'Already connected'")
+        self.assertEqual((row["instance"], row["server"], row["token_ref"], row["added_by"], row["primary"]),
+                         ("ag2-space", "ag2.space", "AG2_REMOTE_TOKEN_AG2_SPACE", "owner", False))
+        self.assertEqual(self.vault.store["AG2_REMOTE_TOKEN_AG2_SPACE"], self.FRESH)
+        self.assertEqual(sorted(r["instance"] for r in self.rows()), ["ag2-space", "s-space"], "the legacy row is retired")
+        self.assertTrue(C.legacy_parked(self.ws))
+        self.assertIn("REMOTE_TASK_TOKEN", C.removed_env_refs(self.ws))
+        self.assertEqual(C.primary_instance(self.ws), "s-space", "the primary does not move")
+        again, created = self.paste()
+        self.assertEqual((again["instance"], created), ("ag2-space", False), "the named row is now the match")
+        self.assertEqual(C.import_from_env(self.ENV, workspace=self.ws, vault=self.vault), [],
+                         "the dead env token never brings the legacy row back")
+        self.assertEqual(sorted(e["instance"] for e in C.launch_plan(self.ENV, workspace=self.ws)),
+                         ["ag2-space", "s-space"], "the new row launches like any added row")
+
+    def test_the_launcher_gate_stands_the_legacy_bridge_down_after_adoption(self):
+        self.moved_to_s_space(parked=False)
+        legacy = self.legacy()
+        self.assertEqual(self.legacy_parked_cli(), 1, "a running secondary legacy bridge is not parked yet")
+        self.paste(kill=os.kill)
+        legacy.wait(5)
+        self.assertEqual(C.bridge_pid("", self.ws), 0, "the bridge on the dead token is stopped")
+        self.assertEqual(self.legacy_parked_cli(), 0, "its launchers wait instead of starting it")
+
+    def test_a_code_for_another_agent_than_the_legacy_rows_is_refused(self):
+        self.moved_to_s_space()
+        with C._transaction(self.ws) as rec:
+            next(r for r in rec["rows"] if not r["instance"])["agent_mxid"] = "@agent-a:ag2.space"
+        legacy = self.legacy()
+        with self.assertRaises(C.TokenAgentMismatch) as cm:
+            self.paste()
+        self.assertEqual(cm.exception.CODE, "token_agent_mismatch")
+        self.assertIn("", [r["instance"] for r in self.rows()], "agent A's row stays")
+        self.assertNotIn("AG2_REMOTE_TOKEN_AG2_SPACE", self.vault.store)
+        self.assertEqual(C.bridge_pid("", self.ws), legacy.pid, "agent A's bridge is not stopped")
+        self.assertEqual(C.removed_env_refs(self.ws), [])
+        row, created = self.add(self.FRESH, fetch=agents("@agent-a:ag2.space"), environ=self.ENV, kill=os.kill)
+        self.assertEqual((row["instance"], created), ("ag2-space", True), "the same agent's fresh code is adopted")
+
+    def test_a_running_legacy_primary_is_refused_and_nothing_changes(self):
+        legacy = self.legacy()
+        before = self.rows()
+        with self.assertRaises(C.LegacyPrimaryInUse) as cm:
+            self.paste()
+        self.assertEqual((cm.exception.CODE, cm.exception.pid), ("legacy_primary_in_use", legacy.pid))
+        self.assertEqual(self.rows(), before)
+        self.assertNotIn("AG2_REMOTE_TOKEN_AG2_SPACE", self.vault.store)
+        self.assertFalse(C.legacy_parked(self.ws))
+        self.assertEqual(C.bridge_pid("", self.ws), legacy.pid)
+
+    def test_a_running_legacy_bridge_with_no_primary_row_owns_the_room_and_is_refused(self):
+        with C._transaction(self.ws) as rec:
+            for r in rec["rows"]:
+                r["primary"] = False
+        self.legacy()
+        with self.assertRaises(C.LegacyPrimaryInUse):
+            self.paste()
+
+    def test_a_stopped_legacy_primary_hands_the_primary_to_the_adopted_row(self):
+        row, created = self.paste()
+        self.assertEqual((created, row["primary"]), (True, True), "the install keeps one primary")
+
+    def test_the_code_the_legacy_row_already_runs_on_or_an_unverified_one_changes_nothing(self):
+        self.moved_to_s_space()
+        row, created = self.paste(self.OLD)
+        self.assertEqual((row["instance"], created), ("", False))
+        row, created = self.add(self.FRESH, fetch=unreachable, environ=self.ENV)
+        self.assertEqual((row["instance"], created), ("", False))
+        self.assertEqual(sorted(r["instance"] for r in self.rows()), ["", "s-space"])
+        self.assertFalse(C.removed_env_refs(self.ws))
+        self.assertNotIn("AG2_REMOTE_TOKEN_AG2_SPACE", self.vault.store)
+
+    def test_a_refused_stop_takes_the_new_secret_back_out(self):
+        self.moved_to_s_space(parked=False)
+        legacy = self.legacy()
+
+        def refuse(pid, sig):
+            raise PermissionError("not my process")
+        with self.assertRaises(C.BridgeStillRunning):
+            self.paste(kill=refuse)
+        self.assertNotIn("AG2_REMOTE_TOKEN_AG2_SPACE", self.vault.store)
+        self.assertIn("", [r["instance"] for r in self.rows()])
+        self.assertEqual(C.bridge_pid("", self.ws), legacy.pid)
+
+    def test_the_engine_lists_the_capability(self):
+        self.assertIn("legacy_readopt", C.CAPABILITIES)
+
+
 class KnownServers(Base):
     INSTANCES = [dotspace.DotSpace(server="alpha-fixture.net", gateway_host="chat.alpha-fixture.net"),
                  dotspace.DotSpace(server="beta-fixture.net", gateway_host="relay.beta-fixture.net"),

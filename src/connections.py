@@ -38,7 +38,9 @@ disabled row cannot become primary. `update_token` replaces the secret under a r
 `token_ref` with a new code for the same server and agent (anything else is refused by code),
 clears the flag and relaunches; it is refused while a higher-precedence source (the row's
 environment variable) would shadow the vault. The legacy unsuffixed row is the environment's:
-`disconnect` and `update_token` refuse it (`LegacyRowUnmanaged`). Every such refusal is a
+`disconnect` and `update_token` refuse it (`LegacyRowUnmanaged`); a fresh code for its server goes
+through `add_connection`, which adopts it into a named row and retires the legacy one (`legacy_readopt`
+in `CAPABILITIES`). Every such refusal is a
 `Refusal` whose `CODE` each surface returns unchanged.
 
 `promote` moves the primary in one operation while the old primary's bridge runs, the legacy one
@@ -266,6 +268,18 @@ class LegacyPrimaryRunning(Refusal):
             "which it decides only when it starts; stop it (bash src/restart.sh --stop-only), "
             f"make {instance} primary, then start again (bash src/startup.sh) so the legacy bridge comes up "
             f"without the room and {instance} with it; nothing changed")
+        self.pid = pid
+
+
+class LegacyPrimaryInUse(Refusal):
+    """A fresh code for the legacy row's server is not adopted underneath its running primary bridge."""
+
+    CODE = "legacy_primary_in_use"
+
+    def __init__(self, pid: int):
+        super().__init__(
+            f"{self.CODE}: the legacy unsuffixed bridge (pid {pid}) is running as the primary; make another "
+            "connection primary first (promote), then paste the code again; nothing changed")
         self.pid = pid
 
 
@@ -772,6 +786,8 @@ def _validate_row(row: object, index: int) -> dict:
 REMOVED_KEY = "removed_env"
 # Record-level park of a legacy bridge that has no row of its own (a named row covers its server).
 LEGACY_PARKED_KEY = "legacy_parked"
+# What this engine's connections surfaces support, listed beside the rows so a client can gate on it.
+CAPABILITIES = ("legacy_readopt",)
 
 
 def _validate(payload: object) -> dict:
@@ -978,7 +994,7 @@ def channel_launch_keys(environ: Optional[Mapping[str, str]] = None) -> dict:
 def add_connection(token: str, *, added_by: str, expected_server: str, instance: Optional[str] = None,
                    preview: Optional[dict] = None, fetch: Optional[Callable] = None,
                    resolver=None, getaddrinfo=None, workspace: Optional[Path] = None,
-                   vault=None, environ: Optional[Mapping[str, str]] = None) -> "tuple[dict, bool]":
+                   vault=None, environ: Optional[Mapping[str, str]] = None, kill=None) -> "tuple[dict, bool]":
     """Save the token as a row once its gateway still answers to `expected_server`.
 
     Launch keys not yet in the record (`channel_launch_keys`) are imported first, under the instance
@@ -988,6 +1004,14 @@ def add_connection(token: str, *, added_by: str, expected_server: str, instance:
     verified, and touches the vault never. The row is primary only when the install has no
     primary yet (the first row ever saved); later rows never are. The secret goes to the vault
     under the row's token_ref before the row exists; a vault key no row owns is never overwritten.
+
+    A verified code for the legacy row's server that is not the secret that row runs on re-adopts
+    the server (`_readopts_legacy`): getting it rotated the environment's credential, so the code
+    becomes a new named, app-managed row and the legacy row is retired the way `promote` leaves a
+    legacy bridge a named row covers. Its row is dropped, its bridge stopped, the record marked
+    `legacy_parked` and REMOTE_TASK_TOKEN remembered as removed, so no launcher starts it on the
+    dead token. Refused for another agent than the one the legacy row learned (`TokenAgentMismatch`,
+    as `update_token`) and while that bridge runs as the primary (`LegacyPrimaryInUse`).
     """
     if added_by not in ADDED_BY:
         raise ConnectionsError(f"added_by must be one of {', '.join(ADDED_BY)}")
@@ -1017,6 +1041,16 @@ def add_connection(token: str, *, added_by: str, expected_server: str, instance:
         with _transaction(workspace) as rec:
             rows = rec["rows"]
             existing = _same_connection(rows, seen)
+            retired = None
+            if existing is not None and _readopts_legacy(existing, seen, token, vault, environ):
+                mine, theirs = existing.get("agent_mxid"), seen.get("agent_mxid")
+                if mine and theirs != mine:
+                    raise TokenAgentMismatch("", f"the code is for agent {theirs}, not {mine}")
+                pid = bridge_pid("", workspace)
+                if pid and (existing["primary"] or not any(r["primary"] for r in rows)):
+                    raise LegacyPrimaryInUse(pid)
+                rows.remove(existing)
+                retired, existing = existing, None
             if existing is not None:
                 _rekey(existing, seen)
                 return dict(existing), False
@@ -1026,6 +1060,10 @@ def add_connection(token: str, *, added_by: str, expected_server: str, instance:
                 raise VaultKeyInUse(f"vault key {ref} already holds a secret that no connection owns")
             stored = True  # a failed store may still have landed (vault_keychain_state_unknown)
             _vault_store(vault, ref, token.strip())
+            if retired is not None:
+                stop_bridge("", workspace=workspace, kill=kill)
+                rec[LEGACY_PARKED_KEY] = True
+                rec[REMOVED_KEY] = sorted(set(rec[REMOVED_KEY]) | {retired["token_ref"]})
             row = _row(server=server, instance=inst, gateway_url=str(seen["gateway_url"]), token_ref=ref,
                        primary=not any(r["primary"] for r in rows), added_by=added_by,
                        verified=bool(seen.get("verified")),
@@ -1042,6 +1080,17 @@ def add_connection(token: str, *, added_by: str, expected_server: str, instance:
                 pass
         raise
     return dict(row), True
+
+
+def _readopts_legacy(row: Mapping[str, object], seen: Mapping[str, object], token: str, vault,
+                     environ: Optional[Mapping[str, str]]) -> bool:
+    """Whether a code matched to `row` re-adopts its server: the row is the legacy one, the preview
+    is verified, and the code is not the secret the row's vault key or environment holds."""
+    if row["instance"] or not seen.get("verified"):
+        return False
+    environ = os.environ if environ is None else environ
+    held = (environ.get(PRIMARY_TOKEN_REF) or "").strip() or primary_token_from_channel_file(environ)
+    return token.strip() not in (held, _vault_snapshot(vault, str(row["token_ref"])))
 
 
 def _same_connection(rows: list, seen: Mapping[str, object]) -> Optional[dict]:

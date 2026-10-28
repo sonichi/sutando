@@ -110,7 +110,7 @@ class ViewTests(unittest.TestCase):
         return asyncio.run(self.disp.handle(method, params))
 
     def test_list_is_empty_without_a_record(self):
-        self.assertEqual(self.call("connection.list"), {"connections": []})
+        self.assertEqual(self.call("connection.list"), {"connections": [], "capabilities": ["legacy_readopt"]})
 
     def test_list_on_an_empty_record_imports_the_channel_file_token_through_the_view_vault(self):
         home = self.ws / "claude-home"
@@ -128,7 +128,7 @@ class ViewTests(unittest.TestCase):
         self.assertEqual((preview["server"], preview["agent_mxid"], preview["verified"], preview["authenticated"]),
                          ("alpha-fixture.net", "@sutando:alpha-fixture.net", True, True))
         self.assertEqual(preview["gateway_url"], "https://chat.alpha-fixture.net")
-        self.assertEqual(self.call("connection.list"), {"connections": []}, "a preview saves nothing")
+        self.assertEqual(self.call("connection.list"), {"connections": [], "capabilities": ["legacy_readopt"]}, "a preview saves nothing")
         self.assertEqual(self.vault.store, {})
 
         out = self.call("connection.add", token=TOKEN_A, confirm=True, expected_server="alpha-fixture.net",
@@ -259,7 +259,7 @@ class ViewTests(unittest.TestCase):
         self.assertTrue(str(cm.exception).startswith("mismatch"))
         self.assertIn("alpha-fixture.net", str(cm.exception))
         self.assertNotIn("secret-alpha", str(cm.exception))
-        self.assertEqual(self.call("connection.list"), {"connections": []})
+        self.assertEqual(self.call("connection.list"), {"connections": [], "capabilities": ["legacy_readopt"]})
         self.assertEqual(self.vault.store, {})
 
     def test_status_state_and_set_primary(self):

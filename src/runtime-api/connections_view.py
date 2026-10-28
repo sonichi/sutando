@@ -52,12 +52,14 @@ class ConnectionsView:
 
     # ── connection.list ─────────────────────────────────────────────────────
     def list_connections(self) -> dict:
-        """{connections: [...]} — every row joined with status and state; [] without a record."""
+        """{connections: [...], capabilities: [...]} — every row joined with status and state ([] without
+        a record), and what this engine's connections support (`connections.CAPABILITIES`)."""
         try:
             rows = connections.list_connections(self.workspace, vault=self.vault)
         except connections.SchemaError as e:
             raise ProtocolError(-32603, str(e))
-        return {"connections": [connections.status_for(r, self.workspace) for r in rows]}
+        return {"connections": [connections.status_for(r, self.workspace) for r in rows],
+                "capabilities": list(connections.CAPABILITIES)}
 
     # ── connection.known_servers ────────────────────────────────────────────
     def known_servers(self) -> dict:
@@ -87,7 +89,7 @@ class ConnectionsView:
                 row, created = connections.add_connection(
                     token, added_by=str(params.get("added_by", "owner")), expected_server=expected,
                     instance=params.get("instance"), preview=preview,
-                    workspace=self.workspace, vault=self.vault)
+                    workspace=self.workspace, vault=self.vault, kill=self.kill)
             except connections.ConnectionMismatch as e:
                 raise ProtocolError(CONFLICT, f"mismatch: {e}")
             launch = connections.start_added(row, repo=self.repo, logs_dir=self.logs_dir,

@@ -208,6 +208,7 @@ def connections_http(method: str, path: str, body: dict, query: Optional[dict] =
         if method == "GET" and not parts:
             rows = _connections.list_connections(ws, vault=vault)
             return 200, {"connections": [_connections.status_for(r, ws) for r in rows],
+                         "capabilities": list(_connections.CAPABILITIES),
                          "no_primary": _connections.no_primary(ws)}
         # A fixed name, matched before any <instance> route so it is never read as a slug.
         if parts == ["known-servers"]:
@@ -230,7 +231,7 @@ def connections_http(method: str, path: str, body: dict, query: Optional[dict] =
             try:
                 row, created = _connections.add_connection(
                     token, added_by=str(body.get("added_by", "ui")), expected_server=expected,
-                    instance=body.get("instance"), preview=preview, workspace=ws, vault=vault)
+                    instance=body.get("instance"), preview=preview, workspace=ws, vault=vault, kill=kill)
             except _connections.ConnectionMismatch as e:
                 return 409, {"error": "mismatch", "server_from_token": e.derived, "expected_server": e.claimed}
             launch = _connections.start_added(row, repo=repo, logs_dir=logs_dir, workspace=ws,
