@@ -4059,9 +4059,34 @@ class StartSparrow(Base):
         with self.healthy(), mock.patch.object(keepalive, "stop_holder", return_value=False):
             r = self.install()
         self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
-        self.assertIn(f"error: Sparrow was not replaced: the old Sparrow (pid {old.pid}) did not stop",
+        self.assertIn(f"error: Sparrow was not replaced: the old Sparrow (pid {old.pid}) did not stop. "
+                      f"Stop it with: kill -TERM {old.pid} ; then run ag2-sparrow-hatch install again",
                       r.stderr)
         self.assertIsNone(old.poll())
+
+    def test_install_without_a_pidfd_names_the_stop_command_and_signals_nothing(self):
+        old = self.old_sparrow()
+        self.lane_of(old, agent_id=self.OTHER, send_lock=delivery_destination.SEND_LOCK_PROTOCOL)
+        with self.healthy(), mock.patch.object(keepalive, "_pidfd_open", return_value=None):
+            r = self.install()
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("on this platform (no pidfd); it was not signalled", r.stderr)
+        self.assertIn(f"Stop it with: kill -TERM {old.pid} ; then run ag2-sparrow-hatch install again",
+                      r.stderr)
+        self.assertIsNone(old.poll(), "a bare pid is never signalled")
+
+    def test_install_reads_the_stale_reason_once_and_says_that_reason(self):
+        old = self.old_sparrow()
+        self.lane_of(old, agent_id=self.OTHER, send_lock=delivery_destination.SEND_LOCK_PROTOCOL)
+        # A second read would see a drain that already moved: None, and the health wording.
+        reasons = iter([f"serves {self.OTHER}, not {AGENT}, the AGENT_MXID install saved", None])
+        with self.healthy(), mock.patch.object(keepalive, "stale_listener",
+                                               side_effect=lambda cfg, pid: next(reasons)) as read:
+            r = self.install()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(read.call_count, 1)
+        self.assertIn(f"replacing: Sparrow (pid {old.pid}) serves {self.OTHER}", r.stdout)
+        self.assertNotIn("runs without REMOTE_HEALTH_COMMAND", r.stdout)
 
     def test_install_restarts_the_active_unit_when_its_sparrow_is_stale(self):
         for agent, age, why in ((self.OTHER, 60, f"serves {self.OTHER}, not {AGENT}"),

@@ -719,6 +719,7 @@ def ensure_sparrow(cfg: dict, health: bool) -> int:
               "neither starts nor replaces the Sparrow it runs; run ag2-sparrow-hatch verify")
         return 0
     start, stopped, since = False, None, None
+    stale = stale_listener(cfg, alive) if owner is None and alive is not None else None
     if owner == "ours":
         props = _cli._unit_props()
         if props is None:
@@ -752,10 +753,12 @@ def ensure_sparrow(cfg: dict, health: bool) -> int:
                     return 1
                 stopped = holder
             start = True
-    elif alive is not None and stale_listener(cfg, alive):
-        ok, how = replace_sparrow(cfg, alive, stale_listener(cfg, alive))
+    elif stale:
+        ok, how = replace_sparrow(cfg, alive, stale)
         if not ok:
-            print(f"error: Sparrow was not replaced: {how}", file=sys.stderr)
+            # Without a pidfd nothing is signalled (stop_proven), so the stop is left to the user.
+            print(f"error: Sparrow was not replaced: {how}. Stop it with: kill -TERM {alive} ; then "
+                  "run ag2-sparrow-hatch install again", file=sys.stderr)
             return 1
         print(f"started: {how}")
         return _await_connected(state, instance, started)
