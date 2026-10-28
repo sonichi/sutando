@@ -422,3 +422,10 @@ or refused core turn. Read `<workspace>/state/quota-state.json` (written by the 
 `--gate` exits non-zero when the core is not routed through the proxy or the state is stale. A
 core paused on "usage limit reached" resumes on its own at `resets_at_5h`; switching to a smaller
 model (above) is the way to keep going before then.
+While quota is high the proxy also rewrites the model requests run on (`skills/quota-tracker/SKILL.md`
+→ "Model fallback"): `quota-state.json`'s `fallback.tier` / `fallback.active_model_map` say what is
+actually running, `health-check.py`'s `quota-model-fallback` probe reports it, and
+`python3 skills/quota-tracker/scripts/fallback-config.py show|set …` adjusts the thresholds (per-host
+override under `<workspace>/hosts/<host>/`). A
+`fallback.runtime_switch.to == "codex"` means the unified quota was rejected and a Codex switch was
+requested — it is a manual step in this version.

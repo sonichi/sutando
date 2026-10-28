@@ -18,7 +18,7 @@ node-runtime cron-runner session-crons memory-dir-override workspace-wiring deci
 context-read-budget workspace-root-tidy memory-dir-siblings carrier-set memory-index
 memory-sync onboarding-status hitl-archive host-subtrees per-host-config-backup sync-conflicts-unmerged
 skills-driver-code-drift live-checkout-branch engine-revision-drift migrate-reader-contract
-tcc-documents-access quota-telemetry core-request-rejections core-quota quota-account-identity
+tcc-documents-access quota-telemetry quota-model-fallback core-request-rejections core-quota quota-account-identity
 battery memory cron-schedule core-proactive-loop core-supervisor gateway-bridge runtime-identity
 daily-cron-punctuality live-tree-drift disk-space skill-symlinks task-queue pool-advertisement pool-suspended held-no-consumer
 orphaned-results stranded-destined-proactive proactive-quarantine stale-proactive-backlog
