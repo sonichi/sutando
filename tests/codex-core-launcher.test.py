@@ -121,6 +121,7 @@ class CodexCoreLauncherTests(unittest.TestCase):
             "src/agent/restart-guard.sh",
             "src/agent/tmux-socket-guard.sh",
             "src/agent/core-runtime-record.sh",
+            "src/agent/core-window.sh",
             "src/core_runtime_record.py",
             "src/codex_project_trust.py",
             "src/toml_fallback.py",
@@ -293,7 +294,14 @@ exit 0
             shutil.rmtree(self.tmp.name, ignore_errors=True)
 
     # Every fake tmux answers the notifier's window lookup: the core has one window, index 0.
-    _CORE_WINDOW = 'for _a in "$@"; do [ "$_a" = list-windows ] && { echo 0; exit 0; }; done\n'
+    # The core-window lookup sees one live Codex window unless FAKE_NO_CORE_WINDOW=1; killing it
+    # ends the one-window session, as tmux does.
+    _CORE_WINDOW = (
+        'for _a in "$@"; do [ "$_a" = list-windows ] && { echo 0; exit 0; }; done\n'
+        'for _a in "$@"; do case "$_a" in *pane_start_command*)\n'
+        '  [ "${FAKE_NO_CORE_WINDOW:-}" = 1 ] || echo "@0 0 codex -C x"; exit 0 ;; esac; done\n'
+        'for _a in "$@"; do [ "$_a" = kill-window ] && { printf \'%s\\n\' "$*" >> "$TMUX_LOG"; touch "$TMUX_STATE"; exit 0; }; done\n'
+    )
 
     def fake_core_pane(self, program="codex"):
         """Run a process whose command line is <program>; fake tmux reports it as the core pane."""
@@ -880,8 +888,9 @@ if [ "${1:-}" = print ]; then [ -f "$LAUNCHCTL_STATE" ]; else exit 0; fi
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Core runtime changed (claude → codex)", result.stdout)
         calls = self._tmux_calls()
-        self.assertLess(calls.index("kill-session -t =sutando-core\n"),
+        self.assertLess(calls.index("kill-window -t @0\n"),
                         calls.index("new-session -d -s sutando-core"))
+        self.assertNotIn("kill-session -t =sutando-core\n", calls)
 
     def test_unmarked_existing_session_is_replaced(self):
         result = self.run_launcher(env_extra={"TMUX_ACTIVE_RUNTIME": "unknown"})
@@ -2641,6 +2650,90 @@ exit 0
         self.assertIn("could not record pending for task-owner", result.stderr)
         self.assertIn("could not record worker ownership", result.stderr)
         self.assertEqual((results / "task-owner.txt").read_text(), "done\n")
+
+
+REAL_TMUX = shutil.which("tmux", path="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")
+
+
+@unittest.skipUnless(REAL_TMUX, "tmux not found")
+class CoreWindowRestartTests(unittest.TestCase):
+    """Real tmux on a private socket: a restart or heal replaces only the core's window."""
+
+    def setUp(self):
+        self.case = CodexCoreLauncherTests()
+        self.case.setUp()
+        self.addCleanup(self.case.tearDown)
+        self.sock = str(Path(self.case.tmp.name) / "tmux.sock")
+        self.addCleanup(subprocess.run, [REAL_TMUX, "-S", self.sock, "kill-server"], capture_output=True)
+        (self.case.bin / "tmux").unlink()
+        (self.case.bin / "tmux").symlink_to(REAL_TMUX)
+        # A core that stays up like the real CLI; `login status` still succeeds.
+        codex = self.case.bin / "codex"
+        codex.write_text('#!/bin/bash\n[ "${1:-}" = login ] && exit 0\nexec sleep 300\n')
+        codex.chmod(0o755)
+
+    def tmux(self, *args):
+        return subprocess.run([REAL_TMUX, "-S", self.sock, *args], capture_output=True, text=True, check=True).stdout
+
+    def panes(self):
+        rows = self.tmux("list-panes", "-s", "-t", "=sutando-core", "-F",
+                         "#{window_id}|#{window_index}|#{window_name}|#{pane_id}|#{pane_pid}|#{pane_start_command}")
+        return [dict(zip(("wid", "idx", "name", "pane", "pid", "cmd"), r.split("|", 5))) for r in rows.splitlines()]
+
+    def session_with(self, first, *rest):
+        """first/rest: (name, argv) windows; the session is marked as a Codex core."""
+        name, argv = first
+        self.tmux("new-session", "-d", "-s", "sutando-core", "-n", name, *argv)
+        for name, argv in rest:
+            self.tmux("new-window", "-d", "-t", "=sutando-core", "-n", name, *argv)
+        self.tmux("set-environment", "-t", "=sutando-core", "SUTANDO_CORE_RUNTIME", "codex")
+
+    def gateway(self):
+        return next(p for p in self.panes() if p["name"] == "gateway-x")
+
+    def core(self):
+        cores = [p for p in self.panes() if p["cmd"].split(" ", 1)[0].strip('"').endswith("codex")]
+        self.assertEqual(len(cores), 1, self.panes())
+        return cores[0]
+
+    def assert_core_is_the_lowest_window(self, core):
+        self.assertEqual(int(core["idx"]), min(int(p["idx"]) for p in self.panes()), self.panes())
+
+    def test_restart_replaces_a_stale_core_window_and_keeps_the_gateway_pane(self):
+        self.session_with(("core", [str(self.case.bin / "codex"), "-C", "old"]), ("gateway-x", ["sleep", "300"]))
+        stale, gateway = self.core(), self.gateway()
+        result = self.case.run_launcher("--restart", env_extra={"SUTANDO_TMUX_SOCKET": self.sock})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(gateway, self.panes(), "the gateway pane did not survive the restart")
+        os.kill(int(gateway["pid"]), 0)
+        core = self.core()
+        self.assertNotEqual(core["wid"], stale["wid"])
+        self.assertIn(" -C ", core["cmd"])
+        self.assertNotIn(" -C old", core["cmd"])
+        self.assert_core_is_the_lowest_window(core)
+        self.assertEqual(self.tmux("show-environment", "-t", "=sutando-core", "SUTANDO_CORE_RUNTIME").strip(),
+                         "SUTANDO_CORE_RUNTIME=codex")
+
+    def test_a_dead_core_window_is_healed_without_a_restart(self):
+        self.session_with(("monitor", ["sleep", "300"]), ("gateway-x", ["sleep", "300"]))
+        gateway = self.gateway()
+        result = self.case.run_launcher(env_extra={"SUTANDO_TMUX_SOCKET": self.sock})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(gateway, self.panes(), "the gateway pane did not survive the heal")
+        os.kill(int(gateway["pid"]), 0)
+        self.assertIn("healing core window", result.stderr)
+        core = self.core()
+        # Index 0 was taken by a sibling: the core is swapped into the notifier's target slot.
+        self.assert_core_is_the_lowest_window(core)
+        self.assertEqual(len(self.panes()), 3, self.panes())
+
+    def test_a_live_core_is_reused_not_healed(self):
+        self.session_with(("core", [str(self.case.bin / "codex"), "-C", "live"]), ("gateway-x", ["sleep", "300"]))
+        before = self.panes()
+        result = self.case.run_launcher(env_extra={"SUTANDO_TMUX_SOCKET": self.sock})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("already running (codex)", result.stdout)
+        self.assertEqual(self.panes(), before)
 
 
 if __name__ == "__main__":

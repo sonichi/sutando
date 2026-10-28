@@ -12,8 +12,8 @@ this gitignored per-clone override:
 
 Save it as `sutando.config.local.json`, then run:
 
-> **Never run `--restart` from inside the sutando-core session** — it kills the canonical
-> session, which is the agent running the command. Run it from a terminal outside the core,
+> **Never run `--restart` from inside the sutando-core session** — it kills the core's
+> window, which is the agent running the command. Run it from a terminal outside the core,
 > or have the owner type `restart core` in a **Discord** DM — that is the only adapter wired
 > to it (`src/discord-bridge.py:3032`; slack and telegram do not import
 > `core_restart_intent`), and it needs Sutando.app running to consume the intent.
@@ -77,7 +77,14 @@ The Codex implementation:
 - runs a separate `sutando-core-observer` tmux session (`cli/codex-observer.mjs`)
   that follows the core's rollout file and writes its HealthStatus runtime
   observation record (`docs/health-snapshot.md`, "Runtime observation");
-- restarts the core and notifier together, preventing duplicate task consumers.
+- restarts the core and notifier together, preventing duplicate task consumers;
+- replaces only the core's own window on `--restart` (the window started as
+  `codex`, or `claude` when switching runtimes), so sibling windows in the
+  session, such as the desktop's `gateway-<instance>` lanes, keep running. When
+  the session outlives its core window (the core exited), the next launch heals
+  it the same way: it recreates the core as the session's lowest-index window,
+  where the task notifier types, and leaves every sibling untouched. A session
+  with no other window still ends with its core, as before.
 
 Task wakeups leave tmux copy mode before typing. The shared sender issues
 `copy-mode -q` and then, in the same tmux command list, an `if-shell -F

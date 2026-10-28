@@ -14,6 +14,7 @@ cd "$REPO"
 # Shared with the claude launcher: one owner for the in-session restart policy.
 . "$REPO/src/agent/restart-guard.sh"
 . "$REPO/src/agent/core-runtime-record.sh"
+. "$REPO/src/agent/core-window.sh"
 
 # This entry point only launches the canonical core. A Codex pool worker uses
 # the pool's runtime launcher instead.
@@ -497,7 +498,13 @@ check_external_helpers || exit 1
 if [ "${1:-}" = "--restart" ]; then
   tmux_available && tmux -S "$TMUX_SOCKET" kill-session -t "=$WATCHER_SESSION" 2>/dev/null || true
   tmux_available && tmux -S "$TMUX_SOCKET" kill-session -t "=$OBSERVER_SESSION" 2>/dev/null || true
-  tmux_available && tmux -S "$TMUX_SOCKET" kill-session -t "=$SESSION" 2>/dev/null || true
+  # Only the core's window (either CLI, for a runtime switch): its last window takes the
+  # session with it, and a surviving sibling leaves the session for the heal below.
+  if session_exists "$SESSION"; then
+    for _win in $(sutando_core_window_ids "$TMUX_SOCKET" "$SESSION" all codex claude); do
+      tmux -S "$TMUX_SOCKET" kill-window -t "$_win" 2>/dev/null || true
+    done
+  fi
   # Hand the heartbeat over as well: ensure_core_heartbeat only starts one when none is running.
   _hb_py="$(heartbeat_python)"
   if [ -n "$EXTERNAL_HELPERS" ]; then
@@ -516,7 +523,11 @@ elif session_exists "$SESSION" && [ "$(session_runtime)" != "codex" ]; then
   tmux -S "$TMUX_SOCKET" kill-session -t "=$SESSION" 2>/dev/null || true
 fi
 
-if session_exists "$SESSION"; then
+codex_core_live() {
+  [ -n "$(sutando_core_window_ids "$TMUX_SOCKET" "$SESSION" live codex)" ]
+}
+
+if session_exists "$SESSION" && codex_core_live; then
   record_confirmed_core_runtime codex "$(heartbeat_python)"
   apply_tmux_defaults
   ensure_task_notifier
@@ -618,6 +629,52 @@ log_session_start() {
     "$(hostname | sed 's/\..*//')" "$(date +%s)" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     >> "$ws/state/session-starts.log"
 }
+
+# The session outlived its core window (restarted above, or the core exited): recreate the
+# core as the session's lowest window, the notifier's target, and leave every sibling running.
+heal_core_window() {
+  local idx low
+  echo "  ⚠ $SESSION exists but its Codex core is gone — healing core window (sibling windows preserved)" >&2
+  for _win in $(sutando_core_window_ids "$TMUX_SOCKET" "$SESSION" all codex); do
+    tmux -S "$TMUX_SOCKET" kill-window -t "$_win" 2>/dev/null || true
+  done
+  ensure_codex_project_trust
+  if ! idx="$(sutando_new_core_window "$TMUX_SOCKET" "$SESSION" "${CORE_ENV_ARGS[@]}" -c "$REPO" codex "${CODEX_ARGS[@]}")" \
+     || [ -z "$idx" ]; then
+    echo "  ⚠ could not create a core window in $SESSION — sentinel NOT cleared, no core is serving." >&2
+    return 1
+  fi
+  low="$(tmux -S "$TMUX_SOCKET" list-windows -t "=$SESSION" -F '#{window_index}' 2>/dev/null | sort -n | head -1)"
+  if [ -n "$low" ] && [ "$low" != "$idx" ]; then
+    tmux -S "$TMUX_SOCKET" swap-window -d -s "=$SESSION:$idx" -t "=$SESSION:$low" 2>/dev/null && idx="$low"
+  fi
+  tmux -S "$TMUX_SOCKET" select-window -t "=$SESSION:$idx" 2>/dev/null || true
+  tmux -S "$TMUX_SOCKET" set-environment -t "=$SESSION" SUTANDO_CORE_RUNTIME codex 2>/dev/null || true
+  for _ in $(seq 1 "$SESSION_UP_TRIES"); do
+    codex_core_live && break
+    sleep 0.2
+  done
+  if ! codex_core_live; then
+    echo "  ⚠ healed core window did not come up within ~${SESSION_UP_LABEL} — sentinel NOT cleared, no core is serving." >&2
+    return 1
+  fi
+  log_session_start
+  record_confirmed_core_runtime codex "$(heartbeat_python)"
+  clear_shutdown_sentinel
+  ensure_task_notifier
+  ensure_codex_observer
+  ensure_core_monitor
+  ensure_core_heartbeat
+}
+
+if session_exists "$SESSION"; then
+  heal_core_window || exit 1
+  if [ -t 1 ] && [ -z "${TMUX:-}" ]; then
+    exec tmux -S "$TMUX_SOCKET" attach -t "$SESSION"
+  fi
+  echo "Healed the core window in $SESSION (session and sibling windows preserved)."
+  exit 0
+fi
 
 # Creates the core session, waits for has-session within the configured budget
 # (new-session rc=0 only means tmux accepted it), then starts the helpers.

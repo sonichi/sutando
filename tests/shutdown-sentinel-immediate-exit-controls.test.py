@@ -37,6 +37,7 @@ NEEDED = (
     "src/agent/codex/cli/start-cli.sh",
     "src/agent/restart-guard.sh",
     "src/agent/core-runtime-record.sh",
+    "src/agent/core-window.sh",
     "src/core_runtime_record.py",
     "src/result_publish.py",
     "src/agent/task-event-handler-lookup.sh",
