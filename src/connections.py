@@ -788,6 +788,7 @@ REMOVED_KEY = "removed_env"
 LEGACY_PARKED_KEY = "legacy_parked"
 # {instance: pid} of a bridge running when an import made its row primary: it has no proactive room.
 RELAUNCH_KEY = "relaunch_pending"
+LEASE_UNPROVEN = -1  # the pid recorded when the lease proved no holder
 # What this engine's connections surfaces support, listed beside the rows so a client can gate on it.
 CAPABILITIES = ("legacy_readopt",)
 
@@ -863,8 +864,11 @@ def _write(path: Path, record: dict) -> None:
                REMOVED_KEY: sorted(set(record[REMOVED_KEY]))}
     if record.get(LEGACY_PARKED_KEY):
         payload[LEGACY_PARKED_KEY] = True
-    if record.get(RELAUNCH_KEY):
-        payload[RELAUNCH_KEY] = dict(record[RELAUNCH_KEY])
+    # Only the primary's entry means anything; the rest are dropped on the next write.
+    pending = {k: v for k, v in (record.get(RELAUNCH_KEY) or {}).items()
+               if any(r["primary"] and r["instance"] == k for r in record["rows"])}
+    if pending:
+        payload[RELAUNCH_KEY] = pending
     _validate(payload)
     _atomic_json(path, payload)
 
@@ -1568,8 +1572,8 @@ def import_from_env(environ: Optional[Mapping[str, str]] = None, *,
             sole["primary"] = True
             pid = _bridge_pid_or_none(sole["instance"], workspace)
             relaunch[sole["instance"]] = pid != 0
-            if pid:
-                rec.setdefault(RELAUNCH_KEY, {})[sole["instance"]] = pid
+            if pid != 0:
+                rec.setdefault(RELAUNCH_KEY, {})[sole["instance"]] = LEASE_UNPROVEN if pid is None else pid
     out = [dict(r) for r in created]
     for r in out:
         if r["instance"] in relaunch:
@@ -1613,12 +1617,14 @@ def _bridge_pid_or_none(instance: str, workspace: Optional[Path]) -> Optional[in
 def relaunch_needed(row: Mapping[str, object], record: Mapping[str, object],
                     workspace: Optional[Path] = None) -> bool:
     """Whether the primary `row`'s bridge is still the one that ran when an import made it primary,
-    so it has no proactive room. A restart replaces the pid, which ends it; read only."""
+    so it has no proactive room. A restart replaces the pid, which ends it; a lease that proved no
+    holder then counts until a current lease proves one. Read only."""
     inst = str(row.get("instance") or "")
     pid = (record.get(RELAUNCH_KEY) or {}).get(inst)
     if not (pid and row.get("primary")):
         return False
-    return _bridge_pid_or_none(inst, workspace) == pid
+    current = _bridge_pid_or_none(inst, workspace)
+    return current == pid or (pid == LEASE_UNPROVEN and current is None)
 
 
 def notes(workspace: Optional[Path] = None) -> "list[tuple[str, str]]":

@@ -944,6 +944,52 @@ class ListSelfHeals(ChannelFileBase):
         finally:
             bridge_lease.stop(again)
 
+    def test_an_indeterminate_lease_at_the_flip_is_recorded_and_warns_until_a_lease_proves_a_holder(self):
+        indeterminate = C.BridgeLeaseIndeterminate("beta", "unreadable")
+        with unittest.mock.patch.object(C, "bridge_pid", side_effect=indeterminate):
+            created = C.import_from_env({"AG2_REMOTE_TOKEN_BETA": TOKEN_B}, workspace=self.ws, vault=self.vault)
+            self.assertEqual([(r["primary"], r["relaunch_needed"]) for r in created], [(True, True)])
+            self.assertEqual(json.loads(C.record_path(self.ws).read_text())[C.RELAUNCH_KEY], {"beta": C.LEASE_UNPROVEN})
+            self.assertTrue(C.status_for(self.rows()[0], self.ws)["relaunch_needed"])
+            self.assertEqual([lvl for lvl, _ in C.notes(self.ws)], ["warn"])
+        self.assertFalse(C.status_for(self.rows()[0], self.ws)["relaunch_needed"], "a provable lease ends it")
+
+    def test_a_relaunch_entry_off_the_primary_is_pruned_on_the_next_write(self):
+        C.import_from_env({"AG2_REMOTE_TOKEN_BETA": TOKEN_B}, workspace=self.ws, vault=self.vault)
+        rec = json.loads(C.record_path(self.ws).read_text())
+        rec[C.RELAUNCH_KEY] = {"beta": 4242, "gone": 99}
+        C.record_path(self.ws).write_text(json.dumps(rec))
+        C.import_from_env({"AG2_REMOTE_TOKEN_GAMMA": "https://chat.gamma-fixture.net|g"}, workspace=self.ws, vault=self.vault)
+        self.assertEqual(json.loads(C.record_path(self.ws).read_text())[C.RELAUNCH_KEY], {"beta": 4242})
+        C.set_primary("gamma", workspace=self.ws)
+        self.assertNotIn(C.RELAUNCH_KEY, json.loads(C.record_path(self.ws).read_text()), "the old primary's entry goes")
+
+    def test_a_malformed_relaunch_map_is_a_schema_error_and_readers_stay_quiet(self):
+        C.import_from_env({"AG2_REMOTE_TOKEN_BETA": TOKEN_B}, workspace=self.ws, vault=self.vault)
+        row = self.rows()[0]
+        rec = json.loads(C.record_path(self.ws).read_text())
+        rec[C.RELAUNCH_KEY] = {"beta": "not-a-pid"}
+        C.record_path(self.ws).write_text(json.dumps(rec))
+        with self.assertRaises(C.SchemaError):
+            C.list_connections(self.ws)
+        self.assertEqual(C.notes(self.ws), [], "an unreadable record says nothing")
+        rec[C.RELAUNCH_KEY] = {"beta": 1}
+        rec[C.LEGACY_PARKED_KEY] = "yes"
+        C.record_path(self.ws).write_text(json.dumps(rec))
+        with self.assertRaises(C.SchemaError):
+            C.list_connections(self.ws)
+        self.assertFalse(C.status_for(row, self.ws)["relaunch_needed"])
+
+    def test_list_prints_the_notes_under_its_table(self):
+        import subprocess as sp
+        C.import_from_env({"AG2_REMOTE_TOKEN_DEV": TOKEN_B, "AG2_REMOTE_TOKEN_QA": "https://qa-fixture.net|q"},
+                          workspace=self.ws, vault=self.vault)
+        cli = Path(C.__file__).resolve().parents[1] / "scripts" / "connections.py"
+        out = sp.run([sys.executable, str(cli), "--workspace", str(self.ws), "list"], capture_output=True, text=True,
+                     env={**os.environ, "SUTANDO_WORKSPACE": str(self.ws)})
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("warn: no primary connection — choose one in Settings → Connections", out.stdout)
+
     def test_a_legacy_row_that_is_not_primary_is_said_in_status_and_health(self):
         C.import_from_env({"REMOTE_TASK_TOKEN": TOKEN_A}, workspace=self.ws, vault=self.vault)
         self.assertEqual(C.notes(self.ws), [], "the legacy row as primary needs no note")
