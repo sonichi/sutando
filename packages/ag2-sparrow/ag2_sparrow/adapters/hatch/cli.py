@@ -964,6 +964,11 @@ def verify(_args) -> int:
     state_dir = Path(cfg.get("STATE_DIR") or _dirs.state_dir())
     code, detail = check_sparrow(state_dir, instance=cfg.get("GATEWAY_INSTANCE"))
     _check(results, code == SPARROW_OK, "sparrow", detail)
+    wrong = live_identity_mismatch(cfg, (cfg.get("GATEWAY_INSTANCE") or "").strip())
+    if wrong is not None:
+        _check(results, False, "identity",
+               f"the running Sparrow (pid {wrong[0]}) serves {wrong[1]}, not {cfg.get('AGENT_MXID')} "
+               "as the config says; run ag2-sparrow-hatch install again to replace it")
 
     run = hook_last_run(state_dir)
     if run is None:
@@ -1280,6 +1285,15 @@ def _lane_snapshot(cfg: dict, instance: str) -> "tuple[int, str, bool] | None":
     the lock names another live process, or the record is not that process's own (another one
     wrote it under a reused pid). A drain from an older package lacks the protocol, and
     keepawake replaces it."""
+    rec = _live_lane_record(cfg, instance)
+    if rec is None:
+        return None
+    return (rec["pid"], delivery_destination.homeserver_of(rec["agent_id"]),
+            rec.get("send_lock") == delivery_destination.SEND_LOCK_PROTOCOL)
+
+
+def _live_lane_record(cfg: dict, instance: str) -> "dict | None":
+    """The live drain's own fresh lane record, under the conditions _lane_snapshot names; else None."""
     state = Path(cfg.get("STATE_DIR") or _dirs.state_dir())
     rec = agent_identity.published_lane_record(state, instance)
     if rec is None or process_gone(rec["pid"]):
@@ -1289,8 +1303,17 @@ def _lane_snapshot(cfg: dict, instance: str) -> "tuple[int, str, bool] | None":
         return None  # a lock names the live drain, and it is not the publisher
     if not agent_identity.owned_by(rec, rec["pid"], (holder or {}).get("acquired_at")):
         return None
-    return (rec["pid"], delivery_destination.homeserver_of(rec["agent_id"]),
-            rec.get("send_lock") == delivery_destination.SEND_LOCK_PROTOCOL)
+    return rec
+
+
+def live_identity_mismatch(cfg: dict, instance: str) -> "tuple[int, str] | None":
+    """(pid, agent_id) of the live drain when the id it serves is not the AGENT_MXID install saved;
+    None when they match, or when there is no saved MXID or no live drain record to compare."""
+    want = saved_mxid(cfg.get("AGENT_MXID"))
+    rec = _live_lane_record(cfg, instance) if want else None
+    if rec is None or rec["agent_id"].lower() == want.lower():
+        return None
+    return rec["pid"], rec["agent_id"]
 
 
 def _lane_homeserver(cfg: dict, instance: str) -> str:
