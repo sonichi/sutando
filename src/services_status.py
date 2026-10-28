@@ -281,7 +281,7 @@ def service_registry() -> list[dict]:
         # P1). With a live named secondary, a dead primary's stale sidecar falls
         # through to pgrep and the secondary's process reads as "running".
         # Instance-aware probing is tracked separately; until then this row
-        # reports the desktop's ACTIVE lane (F20), else the primary bridge.
+        # reports the desktop's ACTIVE lane, else the primary bridge.
         {"id": "gateway", "name": "AG2 Gateway",
          "probe": ("gateway", gateway_status_path(STATE_DIR), r"remote-gateway-bridge\.py$")},
         {"id": "task-watcher", "name": "Task Watcher",

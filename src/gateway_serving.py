@@ -42,7 +42,7 @@ def active_lane() -> str | None:
 
 def status_path(state_dir) -> Path:
     """The active lane's `gateway-status.<lane>.json` when it exists, else the unsuffixed one.
-    s.space signs in as a secondary lane (F20), so its bridge writes only the suffixed file."""
+    s.space signs in as a secondary lane, so its bridge writes only the suffixed file."""
     lane = active_lane()
     if lane:
         p = Path(state_dir) / f"gateway-status.{lane}.json"

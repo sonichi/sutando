@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""F20: s.space signs in as a secondary gateway lane, so its bridge writes only
+"""s.space signs in as a secondary gateway lane, so its bridge writes only
 state/gateway-status.<lane>.json. The three sidecar readers must resolve the
 desktop's active lane (channels/active-gateway-lane) to that file, and fall back
 to the unsuffixed state/gateway-status.json when there is no active lane, it is
@@ -10,22 +10,23 @@ Exit code: 0 on pass, 1 on fail.
 
 from __future__ import annotations
 
-import json
-import os
-import sys
-import tempfile
-import time
-from pathlib import Path
+from _helpers.hermetic_env import isolate_os_environ
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
+import importlib.util  # noqa: E402
+import json  # noqa: E402
+import os  # noqa: E402
+import sys  # noqa: E402
+import tempfile  # noqa: E402
+import time  # noqa: E402
+from pathlib import Path  # noqa: E402
 
 APP = Path(tempfile.mkdtemp())
 WS = Path(tempfile.mkdtemp())
 (WS / "state").mkdir()
-isolate_os_environ(SUTANDO_APP_SUPPORT=str(APP), SUTANDO_WORKSPACE_DIR=str(WS))
-
-import importlib.util  # noqa: E402
+os.environ["SUTANDO_APP_SUPPORT"] = str(APP)
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
