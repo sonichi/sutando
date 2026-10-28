@@ -1519,8 +1519,9 @@ def import_from_env(environ: Optional[Mapping[str, str]] = None, *,
     the engine started, so the token reaches the file but never this process's environment.
     Env rows are unverified: the resolver's server when it knows the host, else the host. The
     REMOTE_TASK_TOKEN row (the legacy unsuffixed bridge) becomes primary when the install has none.
-    A named env row becomes primary only when it is then the record's sole row, with no primary
-    and no unsuffixed row or candidate (a host signed in only on a secondary homeserver); among
+    A named env row becomes primary only when it is then the record's sole row, with no primary,
+    no unsuffixed row or candidate and no legacy bridge configured in the environment (a host
+    signed in only on a secondary homeserver); among
     several none is picked, so no secondary inherits the proactive room by chance. That row
     carries `relaunch_needed` when its bridge already runs, since it settled the proactive room
     at launch. A name whose row was removed is skipped until the variable is unset. The secret
@@ -1561,7 +1562,7 @@ def import_from_env(environ: Optional[Mapping[str, str]] = None, *,
                        verified=False, server_source="resolver" if resolved else "gateway")
             rows.append(row)
             created.append(row)
-        sole = _sole_named_primary(rows, candidates)
+        sole = _sole_named_primary(rows, candidates, environ)
         relaunch = {}
         if sole is not None and any(r is sole for r in created):
             sole["primary"] = True
@@ -1576,12 +1577,19 @@ def import_from_env(environ: Optional[Mapping[str, str]] = None, *,
     return out
 
 
-def _sole_named_primary(rows: list, candidates: list) -> Optional[dict]:
+# Any of these configures the legacy unsuffixed bridge, which then keeps the proactive room.
+LEGACY_BRIDGE_ENV = ("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN", "REMOTE_TASK_URL", "AG2_REMOTE_URL",
+                     "REMOTE_TASK_TOKEN_FILE")
+
+
+def _sole_named_primary(rows: list, candidates: list, environ: Mapping[str, str]) -> Optional[dict]:
     """The one named row that may take the primary: no primary, no unsuffixed row or candidate,
-    and it is the only row, enabled and not parked."""
+    no legacy bridge configured in the environment, and it is the only row, enabled and not parked."""
     if len(rows) != 1 or any(r["primary"] or not r["instance"] for r in rows):
         return None
     if any(not inst for inst, _ref, _tok in candidates):
+        return None
+    if any((environ.get(v) or "").strip() for v in LEGACY_BRIDGE_ENV):
         return None
     row = rows[0]
     return None if row.get("disabled") or row.get("parked") else row
