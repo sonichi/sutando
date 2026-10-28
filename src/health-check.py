@@ -89,6 +89,7 @@ from cron_entry_digest import digest_map, drifted  # noqa: E402
 from cron_ownership import CORE as CRON_CORE, entry_owner  # noqa: E402
 from gateway_serving import (  # noqa: E402
     read_verdict as read_gateway_verdict,
+    status_path as _gateway_lane_status_path,
     safe_num as _gateway_num,
     verdict_from_record as _gateway_verdict_from_record,
 )
@@ -6971,12 +6972,18 @@ GATEWAY_STATUS_MAX_AGE_S = 180.0
 GATEWAY_TRANSIENT_OUTAGE_S = 3 * (float(os.environ.get("REMOTE_TASK_POLL_WAIT") or 25) + 10)
 
 
+def _gateway_status_path() -> Path:
+    """The active lane's sidecar (gateway_serving.status_path), else the legacy-aware unsuffixed one."""
+    p = _gateway_lane_status_path(WORKSPACE_DIR / "state")
+    return p if p.name != "gateway-status.json" else Path(status_read_path("gateway-status.json", WORKSPACE_DIR))
+
+
 def _gateway_last_ok_age_h(path: "Path | None" = None,
                            now: "float | None" = None) -> "float | None":
     """Hours since the sidecar's `last_ok_ts`; None when it is absent or
     unusable, so an unknown start is never reported as a fresh one."""
     import time as _time
-    p = path or (status_read_path("gateway-status.json", WORKSPACE_DIR))
+    p = path or _gateway_status_path()
     now = _time.time() if now is None else now
     try:
         last = json.loads(Path(p).read_text()).get("last_ok_ts")
@@ -6999,7 +7006,7 @@ def check_runtime_identity(path: "Path | None" = None,
     an UNREADABLE or MALFORMED one warns — the probe's own input being
     damaged must never render as a clean pass."""
     name = "runtime-identity"
-    p = path or (status_read_path("gateway-status.json", WORKSPACE_DIR))
+    p = path or _gateway_status_path()
     p = Path(p)
     if not p.exists():
         return {"name": name, "status": "ok",
@@ -7243,7 +7250,7 @@ def _gateway_status_stale_age_s(path: "Path | None" = None,
     together with "sidecar stopped being written" — only the latter is a signal.
     """
     import time as _time
-    p = path or (status_read_path("gateway-status.json", WORKSPACE_DIR))
+    p = path or _gateway_status_path()
     now = _time.time() if now is None else now
     try:
         ts = json.loads(Path(p).read_text()).get("ts")
@@ -7263,7 +7270,7 @@ def _gateway_status_ts_malformed(path: "Path | None" = None) -> bool:
     Separate from the age helper because its caller reads None as healthy: a
     writer emitting garbage is an outage, and has no age to report.
     """
-    p = path or (status_read_path("gateway-status.json", WORKSPACE_DIR))
+    p = path or _gateway_status_path()
     try:
         raw = json.loads(Path(p).read_text()).get("ts")
     except (OSError, ValueError, AttributeError, TypeError):
@@ -7279,7 +7286,7 @@ def _gateway_serving(path: "Path | None" = None, now: "float | None" = None) -> 
     The sidecar verdict itself is owned by gateway_serving; only the freshness
     window is this reader's."""
     import time as _time
-    p = path or (status_read_path("gateway-status.json", WORKSPACE_DIR))
+    p = path or _gateway_status_path()
     now = _time.time() if now is None else now
     v = read_gateway_verdict(p, now=now, max_age=GATEWAY_STATUS_MAX_AGE_S)
     return None if v is None else v.serving

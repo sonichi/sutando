@@ -14,12 +14,41 @@ lane that has never completed a poll carries `connected: true` with
 from __future__ import annotations
 
 import json
+import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
 
 # A record stamped further ahead than this is not clock skew, it is corruption.
 FUTURE_SKEW_S = 5.0
+
+# The bridge's GATEWAY_INSTANCE shape; anything else in the selector is ignored.
+_LANE_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*(\.[a-z0-9][a-z0-9_-]*)*$")
+
+
+def active_lane() -> str | None:
+    """The desktop's signed-in gateway lane ($SUTANDO_APP_SUPPORT/channels/active-gateway-lane), or None."""
+    root = (os.environ.get("SUTANDO_APP_SUPPORT") or "").strip()
+    if not root:
+        return None
+    try:
+        lines = (Path(root) / "channels" / "active-gateway-lane").read_text().splitlines()
+    except (OSError, UnicodeDecodeError):
+        return None
+    lane = lines[0].strip() if lines else ""
+    return lane if _LANE_RE.match(lane) and lane not in ("all", "primary") else None
+
+
+def status_path(state_dir) -> Path:
+    """The active lane's `gateway-status.<lane>.json` when it exists, else the unsuffixed one.
+    s.space signs in as a secondary lane (F20), so its bridge writes only the suffixed file."""
+    lane = active_lane()
+    if lane:
+        p = Path(state_dir) / f"gateway-status.{lane}.json"
+        if p.exists():
+            return p
+    return Path(state_dir) / "gateway-status.json"
 
 
 def safe_num(v, *, nonneg: bool = False) -> float | None:

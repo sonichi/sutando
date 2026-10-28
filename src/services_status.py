@@ -55,7 +55,7 @@ from pathlib import Path
 # a status file written to the wrong tree is invisible to every post-M0 reader.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from workspace_default import resolve_workspace  # noqa: E402
-from gateway_serving import read_verdict as read_gateway_verdict  # noqa: E402
+from gateway_serving import read_verdict as read_gateway_verdict, status_path as gateway_status_path  # noqa: E402
 
 WORKSPACE = resolve_workspace()
 STATE_DIR = WORKSPACE / "state"
@@ -281,9 +281,9 @@ def service_registry() -> list[dict]:
         # P1). With a live named secondary, a dead primary's stale sidecar falls
         # through to pgrep and the secondary's process reads as "running".
         # Instance-aware probing is tracked separately; until then this row
-        # reports the PRIMARY bridge only.
+        # reports the desktop's ACTIVE lane (F20), else the primary bridge.
         {"id": "gateway", "name": "AG2 Gateway",
-         "probe": ("gateway", GATEWAY_STATUS_PATH, r"remote-gateway-bridge\.py$")},
+         "probe": ("gateway", gateway_status_path(STATE_DIR), r"remote-gateway-bridge\.py$")},
         {"id": "task-watcher", "name": "Task Watcher",
          # Every instance's sentinel; one fixed name reported only the newest.
          "probe": ("watcher_sentinels", STATE_DIR)},
