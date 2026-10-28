@@ -1201,6 +1201,113 @@ def owns_unaddressed(instance: str, workspace: Optional[Path] = None) -> bool:
     return bool(instance) and instance in [primary["instance"]] + alias_instances(primary)
 
 
+# ── room → connection ────────────────────────────────────────────────────────
+
+class NoConnectionForRoom(ConnectionsError):
+    """A room-scoped operation has no usable connection; never answered with another server's."""
+
+
+def server_of_room(room_id: str) -> str:
+    """The domain after a room ID's first colon, lowercased; '' for an ID that names none."""
+    _, sep, server = (room_id or "").strip().partition(":")
+    return server.lower() if sep and server else ""
+
+
+def _row_servers(row: Mapping[str, object]) -> set:
+    return {s for s in (str(row["server"]).lower(), server_of_mxid(str(row.get("agent_mxid") or ""))) if s}
+
+
+def _lane_holds_room(row: Mapping[str, object], room_id: str, workspace: Optional[Path]) -> bool:
+    """Whether the row's bridge has an open task in `room_id` (its `remote-task-rooms` sidecar)."""
+    for inst in [str(row["instance"])] + alias_instances(row):
+        path = _workspace(workspace) / "state" / f"remote-task-rooms{'.' + inst if inst else ''}.json"
+        try:
+            rooms = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(rooms, dict) and room_id in rooms.values():
+            return True
+    return False
+
+
+def connection_for_room(room_id: Optional[str], workspace: Optional[Path] = None) -> Optional[dict]:
+    """The row a room operation acts through: the row whose server equals the room ID's domain
+    exactly; for an ID naming no domain, the one row whose bridge has a task open in it, else the
+    primary; with no room, the primary. None keeps the caller's own single-connection
+    resolution: fewer than two rows, no primary, or an unreadable record.
+    NoConnectionForRoom when the domain has no row, or its row is disconnected."""
+    try:
+        rows = _read(record_path(workspace))
+    except (SchemaError, OSError):
+        return None
+    if len(rows) < 2:
+        return None
+    server = server_of_room(room_id or "")
+    if not server:
+        lanes = [r for r in rows if room_id and _lane_holds_room(r, room_id, workspace)]
+        primary = lanes[0] if len(lanes) == 1 else next((r for r in rows if r["primary"]), None)
+        return dict(primary) if primary else None
+    row = next((r for r in rows if server in _row_servers(r)), None)
+    if row is None:
+        have = ", ".join(sorted(str(r["server"]) for r in rows))
+        raise NoConnectionForRoom(f"no connection for server {server} (connected: {have}); "
+                                  f"connect {server} to act in this room")
+    if row.get("disabled"):
+        raise NoConnectionForRoom(f"connection {row['instance'] or '<legacy>'} for server {server} "
+                                  "is disconnected; reconnect it to act in this room")
+    return dict(row)
+
+
+def _channel_dir_tokens(channel_dir: Optional[str]) -> list:
+    """Relay tokens in `channels/<channel_dir>`'s env file; None is the legacy row's channel."""
+    try:
+        from channel_credentials import CHANNEL
+        from channel_env_resolve import resolve_channel_env
+        from channel_token import RELAY_TOKEN_VARS, token_from_env_file
+        from util_paths import claude_home_path
+        path = resolve_channel_env(claude_home_path("channels"), channel_dir or CHANNEL)
+        return [token_from_env_file(v, path) for v in RELAY_TOKEN_VARS] if path else []
+    except Exception:  # noqa: BLE001 - no channel home or an unreadable file is simply no token
+        return []
+
+
+def connection_credential(row: Mapping[str, object], environ: Optional[Mapping[str, str]] = None, *,
+                          vault=None) -> "tuple[str, str]":
+    """(gateway_url, token) for one row: the first token among its env var, its launch keys, its
+    channel env file and its vault key whose embedded gateway (if any) is the row's own host."""
+    environ = os.environ if environ is None else environ
+    ref, instance = str(row["token_ref"]), str(row["instance"])
+    refs = [ref] + [str(k) for k in row.get("launch_keys") or []]
+    candidates = [environ.get(r, "") for r in refs]
+    if instance:
+        keys = channel_launch_keys(environ)
+        candidates += [keys.get(r, "") for r in refs]
+    candidates += _channel_dir_tokens(channel_dir_for(instance, environ) if instance else None)
+    host = host_of_url(str(row["gateway_url"]))
+
+    def own(tok) -> str:
+        tok = (tok or "").strip()
+        return tok if tok and (not gateway_url_of(tok) or host_of_url(gateway_url_of(tok)) == host) else ""
+    tok = next((own(t) for t in candidates if own(t)), "")
+    if not tok:
+        try:
+            tok = own(_vault_get(_vault(vault), ref))
+        except VaultUnavailable:
+            tok = ""
+    if tok:
+        return str(row["gateway_url"]), tok
+    raise NoConnectionForRoom(f"connection {instance or '<legacy>'} for server {row['server']} has no "
+                              f"token for its gateway under {ref}")
+
+
+def room_credential(room_id: Optional[str], *, workspace: Optional[Path] = None,
+                    environ: Optional[Mapping[str, str]] = None, vault=None) -> "Optional[tuple[str, str]]":
+    """(gateway_url, token) a room operation must use, or None to keep the caller's own resolution
+    (see `connection_for_room`). NoConnectionForRoom names what is missing."""
+    row = connection_for_room(room_id, workspace)
+    return None if row is None else connection_credential(row, environ, vault=vault)
+
+
 def set_primary(instance: str, *, workspace: Optional[Path] = None) -> dict:
     """Make `instance` the primary; proactive and owner-DM defaults follow it at the next launch.
     Refused before anything is written: a disabled or parked row (`DisabledCannotBePrimary`,

@@ -451,6 +451,27 @@ with `REMOTE_PROACTIVE_ROOM` empty, so exactly one bridge posts nudges. Otherwis
 passes through untouched, unset included: the bridge reads the desktop's device env only when it
 is unset, so an exported empty value would silence nudges on a plain install.
 
+## Acting in a room
+
+A tool that acts in a room outside the task bridge (`room_ops.py`, `notify.py`,
+`scripts/channel-env.sh --room <room-id>`) asks `connections.room_credential(room_id)` which
+connection to use. The rule:
+
+- a room ID's domain (after its first colon) picks the row whose `server` (or `agent_mxid`
+  server) is **exactly** that domain, so a room on `dev.example.org` never matches a row for
+  `example.org`;
+- an ID with no domain picks the one row whose bridge has a task open in that room (its
+  `state/remote-task-rooms[.<instance>].json`), else the primary;
+- no room picks the primary;
+- fewer than two rows, no primary, or an unreadable record answers `None`, and the tool keeps
+  its single-connection credential chain unchanged.
+
+A domain no row serves, or a disconnected row, is refused with `NoConnectionForRoom` naming the
+server, and so is a row with no token for its own gateway. The token is the first of the row's
+environment variable, its launch keys, its channel env file and its vault key whose embedded
+gateway, if any, is the row's own host: another server's token is never used. `room_ops.py`
+prints `{"ok": false, "reason": ...}` and exits 1; `channel-env.sh` prints nothing and exits 1.
+
 ## Known servers
 
 `known_servers()` is the Add picker's offer: every DotSpace the resolver registers
