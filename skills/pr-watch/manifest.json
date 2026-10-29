@@ -1,0 +1,17 @@
+{
+  "name": "pr-watch",
+  "version": "0.1.0",
+  "owner": "github:sonichi/sutando",
+  "license": "MIT",
+  "stability": "experimental",
+  "access_tier": "owner",
+  "description": "Event-driven GitHub PR watching: a Claude Code mod runs `gh webhook forward` per watched repo and turns each relevant pull_request / pull_request_review event into a session turn, with no polling and no Monitor expiry. Opt-in: the mod is installed into a dev-mods folder by `pr_watch.py install-mod`, never auto-loaded.",
+  "permissions": {
+    "network": true,
+    "filesystem": "read-write",
+    "secrets": "none"
+  },
+  "provenance": {
+    "source_repo": "https://github.com/sonichi/sutando"
+  }
+}
