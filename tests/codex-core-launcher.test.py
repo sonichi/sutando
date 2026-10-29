@@ -1695,17 +1695,17 @@ exit 0
         (tasks / "task-owner.txt").write_text("task: deliver me\n")
         scratch = Path(self.tmp.name)
         count, buf, emits = scratch / "count", scratch / "buf", scratch / "emits"
+        ready, diagnostic = scratch / "ready", scratch / "diagnostic"
         # ONE event, then hold the fifo open: only the retry timer can wake the loop.
         watcher = self.root / "src/watch-tasks-stream.sh"
         watcher.write_text(
             "#!/bin/bash\n"
             'printf \'TASK_FILE: task-owner.txt\\n\'\n'
             'printf \'emit\\n\' >> "$EMITS"\n'
-            "sleep 9\n"
+            'while [ ! -s "$SUTANDO_RESULTS_DIR/task-owner.txt" ]; do sleep 0.05; done\n'
         )
         watcher.chmod(0o755)
-        # Transition by CAPTURE COUNT, not elapsed time — deterministic regardless
-        # of machine speed (see the commit body for why call 1 is idle, 2-45 unsafe).
+        # The pane clears only after the production notifier has refused the first send.
         self._write_exe("tmux", '''#!/bin/bash
 printf '%s\n' "$*" >> "$TMUX_LOG"
 _last="${@: -1}"
@@ -1715,7 +1715,7 @@ for _a in "$@"; do
       n=$(( $(cat "$CALL_COUNT" 2>/dev/null || echo 0) + 1 )); printf %s "$n" > "$CALL_COUNT"
       if [ "$n" -eq 1 ]; then
         printf '› \n← for agents\n'
-      elif [ "$n" -le 45 ]; then
+      elif [ ! -e "$READY" ]; then
         printf '› half typed\n← for agents\n'
       else
         printf '› %s\n← for agents\n' "$(cat "$PANE_BUF" 2>/dev/null)"
@@ -1741,6 +1741,7 @@ exit 0
             CALL_COUNT=str(count),
             PANE_BUF=str(buf),
             EMITS=str(emits),
+            READY=str(ready),
             SUTANDO_TMUX_SOCKET=str(Path(self.tmp.name) / "test.sock"),
             SUTANDO_TMUX_SESSION="sutando-core",
             SUTANDO_TASKS_DIR=str(tasks),
@@ -1751,10 +1752,24 @@ exit 0
             SUTANDO_NOTIFIER_RETRY_INTERVAL="1",
         )
         script = self.root / "src/agent/codex/cli/task-notifier.sh"
-        result = subprocess.run(
-            ["/bin/bash", str(script)], env=env, capture_output=True, text=True, timeout=30
-        )
-        stderr = result.stderr
+        with diagnostic.open("w") as stderr_file:
+            process = popen_bound(["/bin/bash", str(script)], env=env,
+                                  stdout=subprocess.PIPE, stderr=stderr_file, text=True)
+            try:
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline:
+                    if "will retry on the next idle cycle" in diagnostic.read_text():
+                        break
+                    time.sleep(0.02)
+                self.assertIn("will retry on the next idle cycle", diagnostic.read_text())
+                ready.touch()
+                process.communicate(timeout=10)
+                self.assertEqual(process.returncode, 0, diagnostic.read_text())
+            finally:
+                if process.poll() is None:
+                    os.killpg(process.pid, signal.SIGTERM)
+                    process.communicate(timeout=3)
+        stderr = diagnostic.read_text()
         # Phase 2: the unsafe pane refused to take the prompt, and said so.
         self.assertIn("refusing to type task-owner.txt", stderr, stderr)
         # Phase 3: delivered once the pane cleared, on the timer alone.
