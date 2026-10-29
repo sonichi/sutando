@@ -12,8 +12,8 @@ this gitignored per-clone override:
 
 Save it as `sutando.config.local.json`, then run:
 
-> **Never run `--restart` from inside the sutando-core session** — it kills the canonical
-> session, which is the agent running the command. Run it from a terminal outside the core,
+> **Never run `--restart` from inside the sutando-core session** — it kills the core's
+> window, which is the agent running the command. Run it from a terminal outside the core,
 > or have the owner type `restart core` in a **Discord** DM — that is the only adapter wired
 > to it (`src/discord-bridge.py:3032`; slack and telegram do not import
 > `core_restart_intent`), and it needs Sutando.app running to consume the intent.
@@ -33,6 +33,12 @@ codex login status
 bash skills/install.sh
 bash src/agent/start-cli.sh --restart
 ```
+
+That command starts the core and the local agent API (`127.0.0.1:7843`) when
+nothing serves it yet; the AG2 Space desktop hands its connect code to that API,
+so a core moved to AG2 Space from the desktop needs it running. It does not start
+the other local services (voice, web client, dashboard, bridges): for those, start
+everything with `bash src/startup.sh`, which then launches the same core.
 
 With `core.runtime: codex`, `skills/install.sh` links every repo skill and every
 `<workspace>/skills/` skill into `$CODEX_HOME/skills/` (resolved by
@@ -58,8 +64,13 @@ The Codex implementation:
   not copy Claude login state or run the Claude-only preflight for a Codex core;
 - exports the configured `CODEX_HOME` and requires `codex login status` to pass
   before any background service launches;
-- forwards `CODEX_HOME` and `CLAUDE_CONFIG_DIR` into the core session, so skills
-  that read the engine's channel state (such as `ag2space/access.json`) find it;
+- resolves `CLAUDE_CONFIG_DIR` the same way the Claude launcher does (the
+  configured `core_config_dirs[type=claude]`, else `<workspace>/.claude-sutando`),
+  refusing to start when that configuration is invalid, and forwards it with
+  `CODEX_HOME` into the core session, so skills that read the engine's channel
+  state (such as `ag2space/access.json`) find it whichever CLI is the core;
+- starts the local agent API on port 7843 when nothing listens there (skipped with
+  `--external-helpers`, whose embedder owns its services);
 - owns the same `sutando-core` tmux session used by the menu bar, health checks,
   and terminal attachment;
 - validates `codex` availability and authentication before changing the live
@@ -77,7 +88,16 @@ The Codex implementation:
 - runs a separate `sutando-core-observer` tmux session (`cli/codex-observer.mjs`)
   that follows the core's rollout file and writes its HealthStatus runtime
   observation record (`docs/health-snapshot.md`, "Runtime observation");
-- restarts the core and notifier together, preventing duplicate task consumers.
+- restarts the core and notifier together, preventing duplicate task consumers;
+- replaces only the core's own window on `--restart` (the window started as
+  `codex`, or `claude` when switching runtimes), so sibling windows in the
+  session, such as the desktop's `gateway-<instance>` lanes, keep running. When
+  the session outlives its core window (the core exited), the next launch heals
+  it the same way: it recreates the core as the session's lowest-index window,
+  where the task notifier types, and leaves every sibling untouched. A session
+  with no other window still ends with its core, as before. A live window that is neither a
+  known sibling (`gateway-*`, `monitor`) nor started as `codex` could be a core the
+  launcher cannot identify, so it refuses to heal (exit 3) rather than start a second core.
 
 Task wakeups leave tmux copy mode before typing. The shared sender issues
 `copy-mode -q` and then, in the same tmux command list, an `if-shell -F

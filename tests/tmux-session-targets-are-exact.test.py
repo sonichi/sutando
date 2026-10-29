@@ -42,7 +42,7 @@ FOLLOW_UP = {
     "scripts/tmux-send-line.sh": 2,
     "src/Sutando/main.swift": 1,
     "src/agent/agy/cli/start-cli.sh": 3,
-    "src/agent/claude/cli/start-cli.sh": 11,
+    "src/agent/claude/cli/start-cli.sh": 9,
     "src/agent/claude/cli/task-notifier.sh": 1,
     "src/agent/codex/cli/start-cli.sh": 4,
     "src/agent/codex/cli/task-notifier-supervisor.sh": 1,

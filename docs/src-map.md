@@ -126,10 +126,11 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`install-gateway-bridge-launchd.sh`** — Install / uninstall / check the launchd-supervised gateway-bridge.
 - **`install-health-check-launchd.sh`** — Install / uninstall the launchd-supervised health-check FALLBACK job.
 - **`install-sutando-app-launchd.sh`** — Install / uninstall / check the launchd-supervised Sutando.app job.
-- **`lane_dedupe.py`** — Cross-lane duplicate guard: one room message becomes one task, whichever lane saw it first.
+- **`lane_dedupe.py`** — Cross-lane duplicate guard: one room message becomes one task, answered by its owner lane when known.
 - **`live-agent-runtime.ts`** — LiveAgentRuntime — step 5a-2 of the interaction-planes refactor.
 - **`local_api_gate.py`** — The one gate for the loopback HTTP services' privileged routes.
 - **`local_record.py`** — Local JSON records: one object per file under a directory, each written whole in one rename and read back only when its file name is a safe single path segment that the record itself names.
+- **`local_services.sh`** — Local HTTP service helpers shared by startup.sh and the Codex core launcher, so a core started without startup.sh still serves the local agent API.
 - **`local_task_protocol.py`** — Local Task Protocol — read-side reference implementation.
 - **`local_time.ts`** — The owner's wall clock for the `local_time:` task header; mirrors local_task_protocol.local_time_value (ISO-8601 with offset, then the IANA zone).
 - **`loop_completion.py`** — Host-specific proof that a proactive-loop pass completed.
@@ -321,6 +322,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 ## `src/agent/`
 
 - **`core-runtime-record.sh`** — Called only after the adapter confirms its named core is present.
+- **`core-window.sh`** — Core-window policy shared by the runtime launchers: a restart or heal replaces only the core's own window, so sibling windows in the session (gateway lanes, monitor) keep running.
 - **`graceful-restart.sh`** — Graceful core-restart orchestrator.
 - **`restart-guard.sh`** — Shared policy for both runtime launchers: a `--restart` issued from inside the core session kill-sessions the very agent running the command.
 - **`restart-prep.sh`** — Graceful-restart Phase-1 prep; see notes/graceful-restart-design.md.
@@ -474,7 +476,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 
 - **`agents_view.py`** — Read-only agent discovery over the per-host liveness directory.
 - **`capability_registry.py`** — Provider-neutral, ephemeral read-capability registry.
-- **`connections_view.py`** — Connections surface for the Sutando Server: connection.list / known_servers / add / remove / set_primary / promote / unpark / disconnect / reconnect / update_token.
+- **`connections_view.py`** — Connections surface for the Sutando Server: connection.list / known_servers / add / remove / set_primary / promote / park / park_legacy / unpark / disconnect / reconnect / update_token.
 - **`dispatcher.py`** — Runtime-API request-domain dispatch, separated from socket transport.
 - **`ha_adapter.py`** — runtime-api ↔ human-action adapter, over the HITL Requirement store.
 - **`identity_source.py`** — Where the identity surface reads from, and the one IdentityView built from it.

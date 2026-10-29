@@ -82,6 +82,8 @@ WELL_KNOWN_NEGATIVE_TTL_S = 900.0
 # The instance installs ran against before this resolver existed: the fallback only when neither
 # the process nor the caller's primary connection names a server.
 LEGACY_SERVER = "ag2.space"
+# Where an install still only on LEGACY_SERVER is asked to move.
+SUCCESSOR_SERVER = "s.space"
 LEGACY_CLOUD_HOST = "sutando.ag2.ai"
 # The shared production Sutando Cloud: the fallback of every instance without a Cloud of its
 # own and the home of every pre-scoping credential. A constant, so no instances list empties it.

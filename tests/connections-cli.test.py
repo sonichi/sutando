@@ -444,6 +444,32 @@ class InProcess(unittest.TestCase):
         self.assertEqual(self.run_main(["legacy-parked"], legacy_parked=lambda ws=None: True)[0], 0)
         self.assertEqual(self.run_main(["legacy-parked"], legacy_parked=lambda ws=None: False)[0], 1)
 
+    def test_promote_keeps_the_old_lane_unless_asked_to_park_it(self):
+        argv = ["--repo", "/r", "--logs-dir", "/l"]
+        seen = []
+
+        def promote(inst, **kw):
+            seen.append(kw["park"])
+            return {"instance": "s-space", "server": "s.space", "changed": True, "previous": None, "kept": ""}
+        rc, out, _ = self.run_main(["promote", "s-space", *argv], promote=promote)
+        self.assertEqual((rc, out), (0, "primary is now s-space (s.space); (legacy) keeps running as a secondary\n"))
+        self.run_main(["promote", "s-space", "--park", *argv], promote=promote)
+        self.assertEqual(seen, [False, True])
+
+    def test_park_and_park_legacy_print_what_they_parked(self):
+        rc, out, _ = self.run_main(["park", ""], park=lambda inst, workspace=None: {
+            "instance": "", "parked": True, "stopped_pid": 41})
+        self.assertEqual((rc, out), (0, "parked (legacy) (stopped pid 41)\n"))
+        rc, out, _ = self.run_main(["park-legacy"], park_legacy=lambda workspace=None: {
+            "primary": "s-space", "parked": ["", "dev"], "stopped": {"": 41}})
+        self.assertEqual((rc, out), (0, "parked (legacy), dev; s-space stays primary\n"))
+
+        def refused(inst, workspace=None):
+            raise self.cli.connections.PrimaryCannotPark(inst)
+        rc, _, err = self.run_main(["park", "s-space"], park=refused)
+        self.assertEqual(rc, 1)
+        self.assertIn("connections: primary_cannot_park", err)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=1)

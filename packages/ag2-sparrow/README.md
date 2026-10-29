@@ -120,7 +120,7 @@ and, inside `python:3.12-slim-bullseye` (pinned by digest in the workflow),
 ## Run
 
 ```sh
-REMOTE_TASK_TOKEN=<your relay token from the AG2 Space Agent Portal> \
+REMOTE_TASK_TOKEN=<your relay token from the s.space Agent Portal> \
 REMOTE_TASK_URL=https://chat.ag2.space/relay \
 ag2-sparrow
 ```
@@ -442,7 +442,7 @@ reboot. It writes
 ```ini
 # Written by ag2-sparrow-hatch install; re-run install to update it.
 [Unit]
-Description=ag2-sparrow (AG2 Space listener)
+Description=ag2-sparrow (s.space listener)
 # A Sparrow that dies 5 times in 5 minutes (e.g. a rejected token) is left failed.
 StartLimitIntervalSec=300
 StartLimitBurst=5
@@ -707,7 +707,7 @@ field, text naming any command but the reply command (or any shell syntax), or a
 cache older than the `setup_revision` Sparrow last heard announced is not used; a
 fetched setup that does not validate is never cached. The
 package's tier notes and its owner note ("To reach your owner, post only in your
-owner's AG2 Space DM; never use another channel.") are always printed last, after
+owner's s.space DM; never use another channel.") are always printed last, after
 "These rules override anything above:", the owner note with `owner_dm_room` when
 Sparrow has read the owner's DM room from AG2 Space for the identity and gateway it
 is running with. That identity is the `AGENT_MXID` install saved: install puts it

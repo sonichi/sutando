@@ -2330,7 +2330,7 @@ class Keepalive(Base):
                          (True, "abnormal", "task-not-picked-up"))
         self.assertAlmostEqual(row["since"], old + keepalive.TASK_PICKUP_S, delta=1)
         self.assertEqual(hc.validate(row), (row, None))
-        self.assertIn("health=abnormal (task-not-picked-up); an AG2 Space task has been open "
+        self.assertIn("health=abnormal (task-not-picked-up); an s.space task has been open "
                       "over 15 minutes", self.cli("verify").stdout)
 
     def test_a_deliberately_held_task_reports_held_not_stuck(self):

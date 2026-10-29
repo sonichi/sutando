@@ -535,7 +535,7 @@ def session_options(p) -> None:
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog=COMMAND, description="A Claude Code session in a tmux pane on this machine as "
-                                 "an AG2 Space agent (Mods API, CLI %s+)." % _v(MIN_CLI))
+                                 "an s.space agent (Mods API, CLI %s+)." % _v(MIN_CLI))
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("install", help="record the paths, mint the session id, write the unit, have the manager "
                        "start the session (a reinstall stops the old one first)")
@@ -549,13 +549,13 @@ def main(argv=None) -> int:
                    "run, where verify reads its status and the card store sits (default: Sparrow's state dir)")
     session_options(p)
     p.set_defaults(func=install, parser=p)
-    c = sub.add_parser("connect", help="check this machine, redeem the one-time code from AG2 Space for the agent's "
+    c = sub.add_parser("connect", help="check this machine, redeem the one-time code from s.space for the agent's "
                        "relay credential, write it to the agent's seat (mode 600), then install as install does")
-    c.add_argument("--base", required=True, help="the AG2 Space backend URL the code was issued by")
-    c.add_argument("--code", help="the one-time code from AG2 Space (starts with acp.): - reads it from stdin; "
+    c.add_argument("--base", required=True, help="the s.space backend URL the code was issued by")
+    c.add_argument("--code", help="the one-time code from s.space (starts with acp.): - reads it from stdin; "
                    "omitted, connect asks for it. A code given here is kept by ps and shell history")
     c.add_argument("--trust-relay-host", help="accept a relay URL on this host although it is not --base's host "
-                   "or under it (only when AG2 Space told you to)")
+                   "or under it (only when s.space told you to)")
     session_options(c)
     c.set_defaults(func=connect, parser=c)
     run_help = (f"what the manager runs: the launcher of one tmux-hosted session; refused unless {cm.MANAGED_VAR}=1 "

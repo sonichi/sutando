@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Connections surface for the Sutando Server: connection.list / known_servers / add / remove /
-set_primary / promote / unpark / disconnect / reconnect / update_token.
+set_primary / promote / park / park_legacy / unpark / disconnect / reconnect / update_token.
 
 Thin binding over the connections DOMAIN module (src/connections.py), the one
 writer of `state/connections.json`. The composer injects the resolved workspace,
@@ -10,7 +10,7 @@ carry a vault key name, never a secret. The methods are the daemon-native form
 of the HTTP resource: GET = list, POST without confirm = preview, POST with
 confirm = create and start the bridge (201 ↔ created true, 200 ↔ existing row), DELETE = remove,
 POST <instance>/primary = set_primary, POST <instance>/promote = promote,
-POST <instance>/unpark = unpark, POST <instance>/disconnect = disconnect,
+POST <instance>/park = park, POST park-legacy = park_legacy, POST <instance>/unpark = unpark, POST <instance>/disconnect = disconnect,
 POST <instance>/reconnect = reconnect, POST <instance>/token = update_token,
 GET known-servers = known_servers; a confirm whose identity moved and every state
 refusal the module codes (`connections.Refusal`: a disconnect of the primary, a
@@ -125,18 +125,43 @@ class ConnectionsView:
 
     # ── connection.promote ──────────────────────────────────────────────────
     def promote(self, params: dict) -> dict:
-        """{connection, previous, stopped_pid, launch, changed, relaunch_needed}: the primary moved, the old one parked."""
+        """{connection, previous, kept, stopped_pid, launch, changed, relaunch_needed}: the primary moved; the
+        old one keeps running unless `park: true`."""
         instance = self._instance(params)
+        park = params.get("park", False)
+        if not isinstance(park, bool):
+            raise ProtocolError(-32602, "park must be a boolean")
         try:
             row = connections.promote(instance, repo=self.repo, logs_dir=self.logs_dir, workspace=self.workspace,
-                                      vault=self.vault, spawn=self.spawn, kill=self.kill)
+                                      vault=self.vault, spawn=self.spawn, kill=self.kill, park=park)
         except connections.Refusal as e:
             raise ProtocolError(CONFLICT, str(e))
         except connections.ConnectionsError as e:
             raise ProtocolError(-32602, str(e))
         return {"connection": connections.status_for(row, self.workspace), "previous": row["previous"],
-                "stopped_pid": row["stopped_pid"], "launch": row["launch"], "changed": row["changed"],
-                "relaunch_needed": row["relaunch_needed"]}
+                "kept": row["kept"], "stopped_pid": row["stopped_pid"], "launch": row["launch"],
+                "changed": row["changed"], "relaunch_needed": row["relaunch_needed"]}
+
+    # ── connection.park / connection.park_legacy ────────────────────────────
+    def park(self, params: dict) -> dict:
+        """{connection, stopped_pid}: a secondary's bridge stopped and its row parked."""
+        instance = self._instance(params)
+        try:
+            row = connections.park(instance, workspace=self.workspace, kill=self.kill)
+        except connections.Refusal as e:
+            raise ProtocolError(CONFLICT, str(e))
+        except connections.ConnectionsError as e:
+            raise ProtocolError(-32602, str(e))
+        return {"connection": connections.status_for(row, self.workspace), "stopped_pid": row["stopped_pid"]}
+
+    def park_legacy(self, params: dict) -> dict:
+        """{primary, parked, stopped}: every connection but the primary parked (the cutover)."""
+        try:
+            return connections.park_legacy(workspace=self.workspace, kill=self.kill)
+        except connections.Refusal as e:
+            raise ProtocolError(CONFLICT, str(e))
+        except connections.ConnectionsError as e:
+            raise ProtocolError(-32602, str(e))
 
     # ── connection.unpark ───────────────────────────────────────────────────
     def unpark(self, params: dict) -> dict:

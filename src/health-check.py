@@ -6830,6 +6830,30 @@ def _gateway_lock_pids() -> "dict[str, str]":
     return out
 
 
+def check_sspace_migration(workspace_dir: Optional[Path] = None) -> "dict | None":
+    """WARN when every connection row is on the legacy DotSpace and none on its successor: a
+    terminal-run core is never moved by the desktop and goes silent if the legacy one goes read-only."""
+    import connections  # noqa: PLC0415
+    import dotspace  # noqa: PLC0415
+    ws = Path(workspace_dir) if workspace_dir else WORKSPACE_DIR
+    try:
+        # Read the record as it is: list_connections may import or adopt rows, a write.
+        rows = connections._read(connections.record_path(ws))
+    except Exception:  # noqa: BLE001 — an unreadable record is reported by the connections surfaces
+        return None
+    legacy, target = dotspace.LEGACY_SERVER, dotspace.SUCCESSOR_SERVER
+    servers = {dotspace.dotspace_for(str(r.get("server") or ""), fetch=dotspace.NO_FETCH).server for r in rows}
+    if servers != {legacy}:
+        return None
+    inst = connections.instance_for(target)
+    return {"name": "sspace-migration", "status": "warn",
+            "detail": (f"only connected to {legacy}, no {target} connection — get a connect code at "
+                       f"{target}'s agent portal, then from the repo run: python3 scripts/connections.py add "
+                       f"'<code>' && python3 scripts/connections.py promote {inst} --repo . --logs-dir "
+                       '"$(bash scripts/sutando-config.sh workspace)/logs" (docs/connections.md, '
+                       f'"Moving a terminal-run core to {target}")')}
+
+
 def check_gateway_bridge() -> "dict | None":
     """Health of the gateway bridge (remote-gateway-bridge.py) of the primary connection — the
     process that carries MOBILE-app messages from the cloud gateway down to the
@@ -13443,6 +13467,7 @@ def run_all_checks() -> list[dict]:
     # branches are unit-tested in tests/health-check-gateway-bridge.test.py; this
     # call site is exercised by the running health check, not that unit test.)
     checks += [c for c in (check_gateway_bridge(),) if c is not None]  # pragma: no cover
+    checks += [c for c in (check_sspace_migration(),) if c is not None]  # pragma: no cover
 
     # (External plugin probes moved out with their plugins in #1427 round ④ —
     # a plugin manifest declares its own health_probe; the host checks host
