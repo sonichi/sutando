@@ -43,7 +43,7 @@ instance is a config entry.
    ```json
    {"core": {"dotspace": {"instances": [
      {"server": "ag2.space", "gateway_host": "chat.ag2.space",
-      "cloud_origin": "https://sutando.ag2.space"},
+      "cloud_origin": "https://sutando.s.space"},
      {"server": "s.space", "gateway_host": "chat.s.space"}
    ]}}}
    ```
@@ -52,7 +52,8 @@ instance is a config entry.
    (default: true). When the section is absent the built-in list applies — ag2.space,
    dev.ag2.space, s.space, dev.s.space with their `chat.` / `dev-chat.` gateways and their MCP
    endpoints (`mcp.` / `dev-mcp.` under ag2.space and s.space, path `/mcp`); `cloud_origin` only
-   on ag2.space (`https://sutando.ag2.space`) and dev.ag2.space (`https://dev-sutando.ag2.space`)
+   on ag2.space (`https://sutando.s.space`, the shared production Cloud) and dev.ag2.space
+   (`https://dev-sutando.ag2.space`)
    — so today's installs behave as before. The registry is the one place a per-server endpoint
    is written down: a caller takes `dotspace_for(<its primary connection's server>).mcp_url`,
    never a literal URL (`docs/codex-core.md` shows the lookup). The most specific server wins (`chat.dev.s.space`
@@ -62,11 +63,11 @@ instance is a config entry.
 
    **Sutando Cloud is undecided** (per DotSpace or shared), so the s.space defaults carry no
    `cloud_origin`: `cloud_origin_for("s.space")` is `""` and callers fall back to the shared
-   production Cloud, `PRODUCTION_CLOUD_ORIGIN` (`https://sutando.ag2.space`) — a constant, so
+   production Cloud, `PRODUCTION_CLOUD_ORIGIN` (`https://sutando.s.space`) — a constant, so
    an instances list that registers ag2.space without a `cloud_origin` cannot empty it. An
    operator opts an instance into its own Cloud by setting `cloud_origin` on its entry;
    `trusted_cloud_hosts()` is then those configured hosts plus the shared production host and
-   the retired `sutando.ag2.ai`, nothing else.
+   the retired `sutando.ag2.space` and `sutando.ag2.ai`, nothing else.
 
 2. **Well-known (capability discovery)** — the homeserver's declaration at
    `https://<host>/.well-known/matrix/client`, in a block under `space.ag2.dotspace`:
@@ -113,12 +114,12 @@ instance is a config entry.
 ## Credentials stay bound to their origin
 
 `src/cloud_auth.py` pairs a stored Sutando Cloud token only with the origin it was stored for.
-The retired production origin (`sutando.ag2.ai`), the bare pre-scoping Keychain key, and a
+A retired production origin (`sutando.ag2.space`, `sutando.ag2.ai`), the bare pre-scoping Keychain key, and a
 stored record that names no origin (a `cloud-auth.json` without `apiBase`, a metering env
 without endpoint — `credential_base`) are production credentials: they normalise to and pair
-with `https://sutando.ag2.space` on every install, never with the current instance's Cloud. An
-s.space or dev.ag2.space install therefore never sends a production bearer to `sutando.s.space`
-or `dev-sutando.ag2.space`. Only a NEW session (`normalize_base("")`, the env override unset)
+with `https://sutando.s.space` on every install, never with the current instance's Cloud. A
+dev.ag2.space install therefore never sends a production bearer to `dev-sutando.ag2.space`, and
+no install sends one to a retired host. Only a NEW session (`normalize_base("")`, the env override unset)
 takes this install's own Cloud.
 
 ## Adding a sibling

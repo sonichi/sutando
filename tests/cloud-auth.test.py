@@ -61,7 +61,7 @@ class TestBaselessStoredCredentialIsProductions(unittest.TestCase):
     def test_on_a_dev_instance_a_baseless_credential_never_reaches_dev_sutando(self):
         import importlib
         import tempfile
-        dev, prod = "https://dev-sutando.ag2.space", "https://sutando.ag2.space"
+        dev, prod = "https://dev-sutando.ag2.space", "https://sutando.s.space"
         env = {"AGENT_MXID": "@a:dev.ag2.space", "SUTANDO_METERING_HEADERS": json.dumps({"Authorization": "Bearer sutk_m"})}
         try:
             with mock.patch.dict("os.environ", env, clear=True):
@@ -96,7 +96,7 @@ class TestKeyDerivation(unittest.TestCase):
     def test_injected_reader_and_signed_out_sentinel(self):
         with mock.patch.dict("os.environ", {}, clear=True):
             self.assertEqual(cloud_auth.read_keychain_auth(get=lambda k: cloud_auth.SIGNED_OUT_SENTINEL), (None, None))
-            self.assertEqual(cloud_auth.read_keychain_auth(get=lambda k: "sutk_x"), ("https://sutando.ag2.space", "sutk_x"))
+            self.assertEqual(cloud_auth.read_keychain_auth(get=lambda k: "sutk_x"), ("https://sutando.s.space", "sutk_x"))
 
 
 class TestReadCloudAuthOrder(unittest.TestCase):
@@ -163,7 +163,7 @@ class TestReadCloudAuthOrder(unittest.TestCase):
                 "SUTANDO_METERING_HEADERS": json.dumps({"Authorization": "Bearer sutk_metering"}),
                 "SUTANDO_METERING_ENDPOINT": "https://sutando.ag2.space/api/usage/v2"}):
                 self.assertEqual(cloud_auth.read_cloud_auth(ws, keychain_auth=none),
-                                 ("https://sutando.ag2.space", "sutk_metering"))
+                                 ("https://sutando.s.space", "sutk_metering"))
 
 
 class TestSignedOutIsTerminalUnderTheHost(unittest.TestCase):
@@ -216,7 +216,7 @@ class TestStampedAccountIsNeverSwapped(unittest.TestCase):
     """#5261: once the desktop stamped the station for a user, a credential for another
     user (an older cloud-auth.json, the metering token) is refused, never returned."""
 
-    BASE = "https://sutando.ag2.space"
+    BASE = "https://sutando.s.space"
     IDS = {"sutk_A": "u-A", "sutk_A2": "u-A", "sutk_B": "u-B"}
 
     def setUp(self):
@@ -403,7 +403,7 @@ class TestCloudRequest(unittest.TestCase):
             out = cloud_auth.cloud_request("https://sutando.ag2.ai", "sutk_x", "POST", "/api/skills/a/install", {"agentId": "@b"})
         self.assertEqual(out, {"ok": True})
         req = opener.open.call_args.args[0]
-        self.assertEqual(req.full_url, "https://sutando.ag2.space/api/skills/a/install")  # retired origin normalized
+        self.assertEqual(req.full_url, "https://sutando.s.space/api/skills/a/install")  # retired origin normalized
         self.assertEqual(req.get_header("Authorization"), "Bearer sutk_x")
         self.assertEqual(json.loads(req.data), {"agentId": "@b"})
 
@@ -445,6 +445,27 @@ class TestCloudRequestEdges(unittest.TestCase):
         self.assertIsNone(cloud_auth._decode(b""))
         self.assertEqual(cloud_auth._decode(b"<html>"), {"detail": "<html>"})
         self.assertIsNone(cloud_auth._NoRedirect().redirect_request(None, None, 307, "", {}, "https://evil"))
+
+
+class TestDesktopSessionKeyIsFound(unittest.TestCase):
+    """The desktop stores the session under its own origin's key. With no env override, or an
+    empty one, the reader probes that key first and pairs the token with the production origin."""
+
+    KEY = "AG2_CLOUD_TOKEN_HTTPS___SUTANDO_S_SPACE_8755F5E0654F784B"
+
+    def test_s_space_session_key_is_probed_first_and_found(self):
+        self.assertEqual(cloud_auth.origin_vault_key("https://sutando.s.space"), self.KEY)
+        store = {self.KEY: "sutk_desktop"}
+        for env in ({}, {"AG2_CLOUD_ORIGIN": ""}):
+            probed = []
+
+            def get(key):
+                probed.append(key)
+                return store.get(key)
+
+            with mock.patch.dict("os.environ", env, clear=True):
+                self.assertEqual(cloud_auth.read_keychain_auth(get=get), ("https://sutando.s.space", "sutk_desktop"), env)
+            self.assertEqual(probed[0], self.KEY, env)
 
 
 if __name__ == "__main__":

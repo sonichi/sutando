@@ -87,7 +87,9 @@ SUCCESSOR_SERVER = "s.space"
 LEGACY_CLOUD_HOST = "sutando.ag2.ai"
 # The shared production Sutando Cloud: the fallback of every instance without a Cloud of its
 # own and the home of every pre-scoping credential. A constant, so no instances list empties it.
-PRODUCTION_CLOUD_ORIGIN = "https://sutando.ag2.space"
+PRODUCTION_CLOUD_ORIGIN = "https://sutando.s.space"
+# Earlier hosts of that same Cloud; a credential stored under one belongs to PRODUCTION_CLOUD_ORIGIN.
+RETIRED_CLOUD_HOSTS = ("sutando.ag2.space", LEGACY_CLOUD_HOST)
 CONFIG_SECTION = "dotspace"
 CONFIG_LIST = "instances"
 # A Matrix server name and nothing else (DNS labels or an IPv6 literal, an optional port): what a
@@ -498,8 +500,8 @@ def trusted_cloud_hosts(config: Optional[Mapping[str, Any]] = None) -> frozenset
     well-known declaration never widens this), the shared production Cloud that an instance with
     no cloud of its own falls back to (`PRODUCTION_CLOUD_ORIGIN`, and the legacy entry's when
     config gives it one, so the fallback and this allowlist always agree), and the retired
-    production host."""
-    hosts = {LEGACY_CLOUD_HOST, server_of_gateway_url(PRODUCTION_CLOUD_ORIGIN)}
+    production hosts."""
+    hosts = {*RETIRED_CLOUD_HOSTS, server_of_gateway_url(PRODUCTION_CLOUD_ORIGIN)}
     shared = server_of_gateway_url(legacy_dotspace(config).cloud_origin)
     if shared:
         hosts.add(shared)

@@ -93,7 +93,7 @@ class TestConfig(unittest.TestCase):
         self.assertEqual((d.server, d.operator, d.gateway_host, d.link_via, d.cloud_origin,
                           d.prefer_ipv4, d.source),
                          ("ag2.space", "ag2", "chat.ag2.space", "ag2.space",
-                          "https://sutando.ag2.space", True, "config"))
+                          "https://sutando.s.space", True, "config"))
         self.assertTrue(d.is_dotspace)
 
     def test_each_built_in_instance_names_its_mcp_url(self):
@@ -131,7 +131,7 @@ class TestConfig(unittest.TestCase):
         self.assertEqual((d.server, d.cloud_origin, d.prefer_ipv4, d.source),
                          ("x.space", "https://c.x.space", False, "config"))
         self.assertFalse(ds.dotspace_for("ag2.space", fetch=ds.NO_FETCH, config=cfg).is_dotspace)
-        self.assertEqual(ds.trusted_cloud_hosts(cfg), frozenset({"c.x.space", "sutando.ag2.space", ds.LEGACY_CLOUD_HOST}))
+        self.assertEqual(ds.trusted_cloud_hosts(cfg), frozenset({"c.x.space", "sutando.s.space", "sutando.ag2.space", ds.LEGACY_CLOUD_HOST}))
         self.assertFalse(ds.dotspace_for("not-ag2.example", fetch=Fetcher(block(server="not-ag2.example",
                          gateway_url="https://gw.not-ag2.example", cloud_origin="", mcp_url="")), config=cfg).is_dotspace)
 
@@ -448,17 +448,17 @@ class TestPerServer(unittest.TestCase):
     def test_two_servers_resolve_independently_in_one_process(self):
         a = ds.dotspace_for("ag2.space", fetch=ds.NO_FETCH)
         b = ds.dotspace_for("s.space", fetch=ds.NO_FETCH)
-        self.assertEqual((a.link_via, a.cloud_origin), ("ag2.space", "https://sutando.ag2.space"))
+        self.assertEqual((a.link_via, a.cloud_origin), ("ag2.space", "https://sutando.s.space"))
         self.assertEqual((b.link_via, b.cloud_origin, b.is_dotspace), ("s.space", "", True))
         opt_in = {"instances": [{"server": "s.space", "cloud_origin": "https://sutando.s.space"}]}
         self.assertEqual(ds.cloud_origin_for("s.space", fetch=ds.NO_FETCH, config=opt_in), "https://sutando.s.space")
         self.assertEqual(ds.trusted_cloud_hosts(opt_in), frozenset({"sutando.s.space", "sutando.ag2.space", ds.LEGACY_CLOUD_HOST}))
         self.assertEqual(ds.link_via_for("!r:ag2.space", fetch=ds.NO_FETCH), "ag2.space")
         self.assertEqual(ds.link_via_for("!r:s.space", fetch=ds.NO_FETCH), "s.space")
-        self.assertEqual(ds.cloud_origin_for("@a:ag2.space", fetch=ds.NO_FETCH), "https://sutando.ag2.space")
+        self.assertEqual(ds.cloud_origin_for("@a:ag2.space", fetch=ds.NO_FETCH), "https://sutando.s.space")
         self.assertEqual(ds.cloud_origin_for("@a:s.space", fetch=ds.NO_FETCH), "")
         self.assertEqual(ds.trusted_cloud_hosts(),
-                         frozenset({"sutando.ag2.space", "dev-sutando.ag2.space", ds.LEGACY_CLOUD_HOST}))
+                         frozenset({"sutando.s.space", "sutando.ag2.space", "dev-sutando.ag2.space", ds.LEGACY_CLOUD_HOST}))
         import ag2space_links as links
         self.assertEqual(links.room_link("!r:ag2.space"), "https://matrix.to/#/!r:ag2.space?via=ag2.space")
         self.assertEqual(links.room_link("!r:s.space", "$e"), "https://matrix.to/#/!r:s.space/$e?via=s.space")
@@ -477,15 +477,15 @@ class TestPerServer(unittest.TestCase):
 
     def test_install_defaults_follow_the_install_server(self):
         # Cloud is undecided for s.space (no cloud_origin): the production origin, as today.
-        self.assertEqual(ds.default_cloud_origin({"AGENT_MXID": "@a:s.space"}), "https://sutando.ag2.space")
+        self.assertEqual(ds.default_cloud_origin({"AGENT_MXID": "@a:s.space"}), "https://sutando.s.space")
         self.assertEqual(ds.default_link_via({"AGENT_MXID": "@a:s.space"}), "s.space")
         self.assertEqual(ds.default_cloud_origin({"REMOTE_TASK_TOKEN": "https://chat.s.space|x"}),
-                         "https://sutando.ag2.space")
+                         "https://sutando.s.space")
         self.assertEqual(ds.default_cloud_origin({"AGENT_MXID": "@a:dev.ag2.space"}), "https://dev-sutando.ag2.space")
         # An unknown install falls back to the legacy instance, never to "".
-        self.assertEqual(ds.default_cloud_origin({}), "https://sutando.ag2.space")
+        self.assertEqual(ds.default_cloud_origin({}), "https://sutando.s.space")
         self.assertEqual(ds.default_link_via({}), "ag2.space")
-        self.assertEqual(ds.default_cloud_origin({"AGENT_MXID": "@a:matrix.org"}), "https://sutando.ag2.space")
+        self.assertEqual(ds.default_cloud_origin({"AGENT_MXID": "@a:matrix.org"}), "https://sutando.s.space")
 
     def test_install_defaults_never_fetch(self):
         f = Fetcher(block())
@@ -499,29 +499,29 @@ class TestPerServer(unittest.TestCase):
 
 
 class TestAg2SpaceInstallUnchanged(unittest.TestCase):
-    """An ag2.space install sees exactly the literals it saw before the resolver."""
+    """An ag2.space install resolves to the production Cloud on sutando.s.space; its other literals are unchanged."""
 
     def test_callers_reproduce_todays_literals(self):
         env = {"AGENT_MXID": "@a:ag2.space"}
         with mock.patch.dict("os.environ", env, clear=True):
             self.assertEqual(ds.current_server(), "ag2.space")
-            self.assertEqual(ds.default_cloud_origin(), "https://sutando.ag2.space")
+            self.assertEqual(ds.default_cloud_origin(), "https://sutando.s.space")
             self.assertEqual(ds.trusted_cloud_hosts(),
-                             frozenset({"sutando.ag2.ai", "sutando.ag2.space", "dev-sutando.ag2.space"}))
+                             frozenset({"sutando.ag2.ai", "sutando.ag2.space", "sutando.s.space", "dev-sutando.ag2.space"}))
             import ag2space_links as links
             self.assertEqual(links.DEFAULT_VIA, "ag2.space")
             self.assertEqual(links.room_link("!r:ag2.space"), "https://matrix.to/#/!r:ag2.space?via=ag2.space")
             self.assertEqual(links.room_link("noserver"), "https://matrix.to/#/noserver?via=ag2.space")
             cloud_auth = importlib.reload(importlib.import_module("cloud_auth"))
-            self.assertEqual(cloud_auth.DEFAULT_CLOUD_ORIGIN, "https://sutando.ag2.space")
+            self.assertEqual(cloud_auth.DEFAULT_CLOUD_ORIGIN, "https://sutando.s.space")
             self.assertEqual(cloud_auth.TRUSTED_API_HOSTS & {"sutando.ag2.ai", "sutando.ag2.space"},
                              {"sutando.ag2.ai", "sutando.ag2.space"})
-            self.assertEqual(cloud_auth.normalize_base("https://sutando.ag2.ai"), "https://sutando.ag2.space")
-            self.assertEqual(cloud_auth.RETIRED_CLOUD_ORIGINS, ("https://sutando.ag2.ai",))
-            self.assertEqual(_load("rh_ds", "src/runtime-health.py")._STATION_GATEWAY_HOST, "sutando.ag2.space")
+            self.assertEqual(cloud_auth.normalize_base("https://sutando.ag2.ai"), "https://sutando.s.space")
+            self.assertEqual(cloud_auth.RETIRED_CLOUD_ORIGINS, ("https://sutando.ag2.space", "https://sutando.ag2.ai"))
+            self.assertEqual(_load("rh_ds", "src/runtime-health.py")._STATION_GATEWAY_HOST, "sutando.s.space")
             ru = _load("report_usage_ds", "skills/skill-usage-report/scripts/report-usage.py")
-            self.assertEqual(ru.CLOUD_FALLBACK, "https://sutando.ag2.space")
-            self.assertEqual(ru.CLOUD, "https://sutando.ag2.space")
+            self.assertEqual(ru.CLOUD_FALLBACK, "https://sutando.s.space")
+            self.assertEqual(ru.CLOUD, "https://sutando.s.space")
         with mock.patch.dict("os.environ", {}, clear=True):
             self.assertEqual(links.DEFAULT_VIA, "ag2.space", "no identity at all: the legacy via")
 
@@ -530,9 +530,9 @@ class TestAg2SpaceInstallUnchanged(unittest.TestCase):
             import ag2space_links as links
             self.assertEqual(links.DEFAULT_VIA, "s.space")
             cloud_auth = importlib.reload(importlib.import_module("cloud_auth"))
-            self.assertEqual(cloud_auth.DEFAULT_CLOUD_ORIGIN, "https://sutando.ag2.space",
-                             "no per-instance Cloud for s.space: the production origin, as today")
-            self.assertNotIn("sutando.s.space", cloud_auth.TRUSTED_API_HOSTS)
+            self.assertEqual(cloud_auth.DEFAULT_CLOUD_ORIGIN, "https://sutando.s.space",
+                             "no per-instance Cloud for s.space: the shared production origin")
+            self.assertIn("sutando.s.space", cloud_auth.TRUSTED_API_HOSTS)
             self.assertIn("sutando.ag2.space", cloud_auth.TRUSTED_API_HOSTS)
         importlib.reload(importlib.import_module("cloud_auth"))
 
@@ -540,9 +540,9 @@ class TestAg2SpaceInstallUnchanged(unittest.TestCase):
         """A production credential (retired-origin or bare pre-scoping key) is never paired with
         another instance's Cloud, and the retired origin never normalises to one."""
         import cloud_auth
-        prod, retired = "https://sutando.ag2.space", "https://sutando.ag2.ai"
+        prod, retired = "https://sutando.s.space", "https://sutando.ag2.space"
         store = {cloud_auth.origin_vault_key(retired): "sutk_retired", "AG2_CLOUD_TOKEN": "sutk_bare"}
-        cases = [({"AGENT_MXID": "@a:s.space"}, "https://sutando.s.space"),
+        cases = [({"AGENT_MXID": "@a:s.space"}, "https://cloud.s.space"),
                  ({"AGENT_MXID": "@a:dev.ag2.space"}, "https://dev-sutando.ag2.space")]
         for env, other in cases:
             with mock.patch.dict("os.environ", {**env, "AG2_CLOUD_ORIGIN": other}, clear=True):
@@ -634,23 +634,23 @@ class SharedCloudAgreement(unittest.TestCase):
     LEGACY_NO_CLOUD = {"instances": [{"server": "ag2.space", "gateway_host": "chat.ag2.space"}]}
 
     def test_the_shared_production_cloud_is_a_constant_not_an_instances_entry(self):
-        self.assertEqual(ds.PRODUCTION_CLOUD_ORIGIN, "https://sutando.ag2.space")
+        self.assertEqual(ds.PRODUCTION_CLOUD_ORIGIN, "https://sutando.s.space")
         self.assertEqual(ds.legacy_dotspace(self.LEGACY_NO_CLOUD).cloud_origin, "")
         for env in ({"AGENT_MXID": "@a:ag2.space"}, {"AGENT_MXID": "@a:s.space"}, {}):
             self.assertEqual(ds.default_cloud_origin(env, config=self.LEGACY_NO_CLOUD), ds.PRODUCTION_CLOUD_ORIGIN, env)
-        self.assertEqual(ds.trusted_cloud_hosts(self.LEGACY_NO_CLOUD), frozenset({"sutando.ag2.space", ds.LEGACY_CLOUD_HOST}))
+        self.assertEqual(ds.trusted_cloud_hosts(self.LEGACY_NO_CLOUD), frozenset({"sutando.s.space", "sutando.ag2.space", ds.LEGACY_CLOUD_HOST}))
         self.assertIn("sutando.ag2.space", ds.trusted_cloud_hosts({"instances": []}))
         # A legacy entry with its own Cloud still wins the fallback, and both hosts are allowlisted.
         moved = {"instances": [{"server": "ag2.space", "cloud_origin": "https://cloud.ag2.space"}]}
         self.assertEqual(ds.default_cloud_origin({"AGENT_MXID": "@a:s.space"}, config=moved), "https://cloud.ag2.space")
-        self.assertEqual(ds.trusted_cloud_hosts(moved), frozenset({"cloud.ag2.space", "sutando.ag2.space", ds.LEGACY_CLOUD_HOST}))
+        self.assertEqual(ds.trusted_cloud_hosts(moved), frozenset({"cloud.ag2.space", "sutando.s.space", "sutando.ag2.space", ds.LEGACY_CLOUD_HOST}))
         import cloud_auth
         self.assertIs(cloud_auth.PRODUCTION_CLOUD_ORIGIN, ds.PRODUCTION_CLOUD_ORIGIN)
 
     def test_only_s_space_registered_and_no_cloud_uses_the_shared_production_cloud(self):
         env = {"AGENT_MXID": "@a:s.space"}
         origin = ds.default_cloud_origin(env, config=self.MINIMAL)
-        self.assertEqual(origin, "https://sutando.ag2.space")
+        self.assertEqual(origin, "https://sutando.s.space")
         self.assertIn(ds.server_of_gateway_url(origin), ds.trusted_cloud_hosts(self.MINIMAL))
         self.assertEqual(ds.cloud_origin_for("s.space", fetch=ds.NO_FETCH, config=self.MINIMAL), "")
 

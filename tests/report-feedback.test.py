@@ -277,7 +277,7 @@ class TestReportFeedbackCloudAuth(unittest.TestCase):
                     mock.patch.dict(os.environ, {}, clear=True):
                 self.assertEqual(
                     report_feedback.read_cloud_auth(ws),
-                    ("https://sutando.ag2.space", "t"),
+                    ("https://sutando.s.space", "t"),
                 )
 
     def test_keychain_tier_used_when_no_auth_file(self):
@@ -287,18 +287,18 @@ class TestReportFeedbackCloudAuth(unittest.TestCase):
                     mock.patch.object(
                         report_feedback, "_keychain_get",
                         side_effect=lambda k: "sutk_key" if k == report_feedback.origin_vault_key(
-                            "https://sutando.ag2.space") else None,
+                            "https://sutando.s.space") else None,
                     ), \
                     mock.patch.dict(os.environ, {}, clear=True):
                 self.assertEqual(
                     report_feedback.read_cloud_auth(ws),
-                    ("https://sutando.ag2.space", "sutk_key"),
+                    ("https://sutando.s.space", "sutk_key"),
                 )
 
 
 class TestReportFeedbackStampedAccount(unittest.TestCase):
     def test_under_a_stamp_every_keychain_key_is_a_candidate(self):
-        cur = report_feedback.origin_vault_key("https://sutando.ag2.space")
+        cur = report_feedback.origin_vault_key("https://sutando.s.space")
         store = {cur: "sutk_B", "AG2_CLOUD_TOKEN": "sutk_A"}
         ids = {"sutk_A": "u-A", "sutk_B": "u-B"}
         with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as fake_home:
@@ -311,7 +311,7 @@ class TestReportFeedbackStampedAccount(unittest.TestCase):
                     mock.patch.object(report_feedback.cloud_auth, "cloud_request",
                                       side_effect=lambda b, t, *a, **k: {"id": ids[t]}), \
                     mock.patch.dict(os.environ, {}, clear=True):
-                self.assertEqual(report_feedback.read_cloud_auth(ws), ("https://sutando.ag2.space", "sutk_A"))
+                self.assertEqual(report_feedback.read_cloud_auth(ws), ("https://sutando.s.space", "sutk_A"))
 
 
 class TestKeychainAuth(unittest.TestCase):
@@ -345,7 +345,7 @@ class TestKeychainAuth(unittest.TestCase):
             # (sending a bearer to the retired host drops it on the redirect).
             self.assertEqual(
                 report_feedback.read_keychain_auth(),
-                ("https://sutando.ag2.space", "sutk_old"),
+                ("https://sutando.s.space", "sutk_old"),
             )
 
     def test_no_retired_fallback_for_non_default_origin(self):
@@ -390,7 +390,7 @@ class TestKeychainAuth(unittest.TestCase):
                 mock.patch.dict(os.environ, {}, clear=True):
             self.assertEqual(
                 report_feedback.read_keychain_auth(),
-                ("https://sutando.ag2.space", "sutk_bare"),
+                ("https://sutando.s.space", "sutk_bare"),
             )
 
 
