@@ -70,6 +70,20 @@ assert d["agent_id"] == "@agent:ag2.space", d["agent_id"]
 assert d["config_dir"] and d["config_dir"].endswith(".claude-sutando"), d["config_dir"]
 PY
   then ok "agent_id read from device-auth env"; else bad "agent_id extraction (parser did not read AGENT_ID)"; fi
+  # 5) a moved install: the primary connection row's agent wins over the device env.
+  mkdir -p "$T2/ws/state"
+  cat > "$T2/ws/state/connections.json" <<'JSON'
+{"schema_version": 1, "connections": [
+ {"server": "ag2.space", "instance": "", "gateway_url": "https://chat.ag2.space", "token_ref": "REMOTE_TASK_TOKEN",
+  "primary": false, "added_by": "env", "added_at": "2026-10-01T00:00:00Z", "verified": true,
+  "server_source": "identity", "parked": true, "agent_mxid": "@agent:ag2.space"},
+ {"server": "s.space", "instance": "s-space", "gateway_url": "https://chat.s.space", "token_ref": "AG2_REMOTE_TOKEN_S_SPACE",
+  "primary": true, "added_by": "login", "added_at": "2026-10-02T00:00:00Z", "verified": true,
+  "server_source": "identity", "agent_mxid": "@agent:s.space"}]}
+JSON
+  out4="$(SUTANDO_TEST_MODE=1 SUTANDO_WORKSPACE="$T2/ws" bash "$REPO/scripts/sutando-whoami.sh")"
+  if WHOAMI_OUT="$out4" python3 -c 'import json,os; d=json.loads(os.environ["WHOAMI_OUT"]); assert d["agent_id"] == "@agent:s.space", d["agent_id"]'
+  then ok "agent_id is the primary connection's agent"; else bad "agent_id ignored the primary connection row"; fi
 else
   bad "config-dir resolver returned empty under test mode"
 fi

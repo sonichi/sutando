@@ -31,7 +31,16 @@ def default_via(room_id: str = "") -> str:
     """`?via=` for `room_id`: its own server's DotSpace (rooms are `!x:server`), else the install's."""
     if dotspace.server_of_matrix_id(room_id):
         return dotspace.link_via_for(room_id, fetch=dotspace.NO_FETCH)
-    return dotspace.default_link_via()
+    return dotspace.default_link_via(primary_server=_primary_server())
+
+
+def _primary_server() -> str:
+    """The primary connection's server, "" where core's connections record cannot be read."""
+    try:
+        from connections import primary_server
+        return primary_server()
+    except Exception:  # noqa: BLE001 - a skill importing this without core falls back to the legacy via
+        return ""
 
 
 def __getattr__(name: str):

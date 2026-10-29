@@ -17,8 +17,12 @@ room's own server; the bridge's IPv4 preference asks per host. Only Sutando Clou
 (`src/cloud_auth.py`) and the Station probe (`src/runtime-health.py`) use `current_server()`:
 Sutando Cloud is per install today, so an install on several DotSpaces reaches one cloud, that
 of the server its identity (`AGENT_MXID` / `AG2SPACE_USER_ID`) or onboarding token names, else
-ag2.space's. `current_server()` never raises and never picks between bridges: it reads one
-process's environment; a multi-DotSpace install passes the server explicitly.
+the primary connection's server when the caller passes it (`primary_server=`, read from
+`connections.primary_server()`), else ag2.space's. This module reads no connections record, so
+the bundled copy stays standard-library only. `current_server()` never raises and never picks
+between bridges: it reads one process's environment; a multi-DotSpace install passes the server
+explicitly. A link whose room names no server takes its via the same way
+(`default_link_via(primary_server=...)`).
 
 ## Trust model
 
@@ -44,11 +48,14 @@ instance is a config entry.
    ]}}}
    ```
 
-   Optional per entry: `cloud_origin`, `link_via` (default: server), `prefer_ipv4` (default:
-   true). When the section is absent the built-in list applies — ag2.space, dev.ag2.space,
-   s.space, dev.s.space with their `chat.` / `dev-chat.` gateways; `cloud_origin` only on
-   ag2.space (`https://sutando.ag2.space`) and dev.ag2.space (`https://dev-sutando.ag2.space`)
-   — so today's installs behave as before. The most specific server wins (`chat.dev.s.space`
+   Optional per entry: `cloud_origin`, `mcp_url`, `link_via` (default: server), `prefer_ipv4`
+   (default: true). When the section is absent the built-in list applies — ag2.space,
+   dev.ag2.space, s.space, dev.s.space with their `chat.` / `dev-chat.` gateways and their MCP
+   endpoints (`mcp.` / `dev-mcp.` under ag2.space and s.space, path `/mcp`); `cloud_origin` only
+   on ag2.space (`https://sutando.ag2.space`) and dev.ag2.space (`https://dev-sutando.ag2.space`)
+   — so today's installs behave as before. The registry is the one place a per-server endpoint
+   is written down: a caller takes `dotspace_for(<its primary connection's server>).mcp_url`,
+   never a literal URL (`docs/codex-core.md` shows the lookup). The most specific server wins (`chat.dev.s.space`
    is dev.s.space's gateway). A registered instance is trusted without any round trip; an
    explicit `dotspace_for(server)` with the real fetch still reads its well-known, only to
    fill the fields the entry leaves unset.

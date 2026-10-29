@@ -13,9 +13,10 @@
 #   instance_id  stable per-host install id (state/auth/device.json machineId;
 #                falls back to "unprovisioned-<host>" before provisioning)
 #   host         short hostname (matches the hosts/<hostname>/ convention)
-#   agent_id     the @…:ag2.space mxid, read LOCALLY from the device-auth env
-#                (<config_dir>/channels/ag2space/.env AGENT_ID) that the connect
-#                flow writes; null before a device is connected
+#   agent_id     the agent mxid of the primary connection (state/connections.json
+#                agent_mxid), else AGENT_ID from the device-auth env
+#                (<config_dir>/channels/ag2space/.env) that the connect flow
+#                writes; null before a device is connected
 #   workspace    absolute workspace path — the USER DATA folder (M0 resolver)
 #   repo         absolute path of this checkout (the CODE)
 #   config_dir   absolute .claude-sutando config dir (sessions/memory/channels)
@@ -23,9 +24,9 @@
 #                sutando-core actually up on this host, and where (the "where are
 #                the instances" signal). Best-effort; never fails the whoami.
 #
-# Identity note: agent_id is read LOCALLY from the device-auth env — that is where
-# the connect flow persists it. If it is absent the device is unprovisioned; a
-# future gateway whoami op can additionally cross-check token → identity server-side.
+# Identity note: agent_id is read LOCALLY — the primary connection row first, so a
+# move to another server reports the agent that now serves the owner, then the
+# device-auth env. If both are absent the device is unprovisioned.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -64,10 +65,16 @@ try:
 except (OSError, ValueError):
     pass
 
-# Agent identity: read AGENT_ID from the device-auth env — the file the connect
-# flow writes (channels/ag2space/.env). Absent before a device is connected.
+# The primary row's agent, else AGENT_ID from the device-auth env the connect flow writes.
 agent_id = None
-if config_dir:
+try:
+    sys.path.insert(0, os.path.join(repo, "src"))
+    import connections
+
+    agent_id = ((connections.primary_row(ws) or {}).get("agent_mxid") or "").strip() or None
+except Exception:
+    pass
+if config_dir and not agent_id:
     env_path = os.path.join(config_dir, "channels", "ag2space", ".env")
     try:
         with open(env_path) as f:

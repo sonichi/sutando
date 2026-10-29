@@ -32,7 +32,6 @@ ALLOW: dict[str, "tuple[str, ...] | None"] = {
     "packages/ag2-sparrow/ag2_sparrow/dotspace.py": None,
     "src/health-check.py": ("ag2.space mobile", "ag2.space gateway not configured"),
     "skills/task-progress/scripts/notify.py": ("(e.g. dev.ag2.space)",),
-    "skills/skill-usage-report/manifest.json": ('"AG2_CLOUD_ORIGIN": "https://sutando.ag2.space"',),
     "packages/ag2-sparrow/ag2_sparrow/adapters/hatch/cli.py": ("@my-agent:ag2.space", "@your-agent:ag2.space"),
     "packages/ag2-sparrow/ag2_sparrow/adapters/hatch/ag2-sparrow-hatch.sh": ("@your-agent:ag2.space",),
 }

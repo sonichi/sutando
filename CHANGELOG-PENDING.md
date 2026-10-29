@@ -58,3 +58,5 @@ Format: `- Brief description of what changed. ([#NNN])`
 ## Security
 
 <!-- security fixes go here -->
+
+- report-feedback: automatic bug reports now default OFF when `state/feedback-prefs.json` (or its `autoReport` key) is absent, so nothing is filed without the owner turning the Settings toggle on; `sendLogs` stays OFF. ([#5992](https://github.com/sonichi/sutando/pull/5992))
