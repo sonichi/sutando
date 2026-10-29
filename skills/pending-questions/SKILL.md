@@ -83,7 +83,7 @@ count (`python3 src/pending_questions_reader.py summary`).
 
 ## Decision cards (the ask)
 
-A question asked with `--default-action` and/or `--option` whose destination is AG2 Space (its
+A question asked with `--default-action` and/or `--option` whose destination is s.space (its
 task's bridge, else the bridge the owner was last active on) is asked as a decision card, built by
 `src/hitl/cards.py` (the one builder every card producer uses): one button per choice — with a
 default, one per `ordered_options()` entry, Approve first and carrying it; with options alone,
@@ -91,8 +91,8 @@ exactly the options as given, with no Approve — and `subject.choices` holding 
 
 - **Order.** The card is built and its id allocated; the question is held in the outbox and its
   row is written, both naming that id (`**Sent:** card hitl_<id> for ag2space owner-dm (decision
-  card) at <time>`); only then is the card stored, for the AG2 Space gateway to post in the
-  owner's DM: the asking task's own conversation when that is his AG2 Space DM (`req.room`, so
+  card) at <time>`); only then is the card stored, for the s.space gateway to post in the
+  owner's DM: the asking task's own conversation when that is his s.space DM (`req.room`, so
   his click reaches the session bound to that room), else the gateway's default owner DM. No
   card exists without a durable question. The ask reports
   `stored, not yet shown: decision card hitl_<id>`: storing is not showing.
@@ -129,7 +129,7 @@ exactly the options as given, with no Approve — and `subject.choices` holding 
   the gateway records a post only after its send returns, so the one window left is a send in
   flight — bounded by one projector send, and the pointer then only says the card may not have
   arrived. Marking a pointer sent never touches a settled or archived card. The pointer says the question waits as a card in
-  his AG2 Space DM and may not have arrived, and quotes its title, with no options, no approve
+  his s.space DM and may not have arrived, and quotes its title, with no options, no approve
   wording, and a note that a reply does not answer it. Only a card that is gone leaves the
   question due for text. The pointer step runs on every pass of `src/check-pending-questions.py`,
   flagless included (the proactive loop's pass, or an old schedule), outside presenter mode, so an

@@ -1,4 +1,4 @@
-# claude-code adapter — a Claude Code session as an AG2 Space agent
+# claude-code adapter — a Claude Code session as an s.space agent
 
 `ag2space-inbox/` (in the package, `ag2_sparrow/adapters/claude_code/ag2space-inbox/`,
 shipped in the wheel) is a Claude Code **Mod** (a plugin whose hooks run as
@@ -358,7 +358,7 @@ The session loads the ag2space-inbox plugin this package ships;
 `--plugin-dir <dir>` on `install` or `connect` loads another copy instead (a
 working tree under edit, say).
 
-**Connect with a code.** On a host with no core, the two steps AG2 Space shows
+**Connect with a code.** On a host with no core, the two steps s.space shows
 are the agent's whole setup:
 
 ```bash
@@ -384,7 +384,7 @@ credential. The credential owner writes it to the agent's seat beside its root,
 `REMOTE_TASK_TOKEN_FILE`, `REMOTE_TASK_TIER=owner`) and a `token` file, both
 mode 600. The bearer is never printed and never on a command line. `connect`
 then runs install with `--token-env-file` set to that `.env`, so the bridge runs
-as that seat alone. A new code (AG2 Space's Reconnect) rewrites `token` in place.
+as that seat alone. A new code (s.space's Reconnect) rewrites `token` in place.
 On a host whose bridges a supervisor runs (Sutando's), `connect` refuses: the
 worker pool owns the seats there.
 

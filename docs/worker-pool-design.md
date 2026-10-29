@@ -52,7 +52,7 @@ unique base and display labels resolve to a worker ID where intent is captured.
 A human name shared by workers is refused. New broker display names equal to
 `core`, any existing worker ID, or shaped like a full 32-hex ID are refused.
 Registration refuses a new ID already used as another worker's name. The
-optional `display_label` from AG2 Space also changes the name shown to people;
+optional `display_label` from s.space also changes the name shown to people;
 removing it restores the base label. Human status renders the effective name
 with the full ID, such as
 `kc-reviewer-ryan (274cb60d473744dba54040a9de119877)`.
@@ -61,7 +61,7 @@ with the full ID, such as
 |---|---|---|
 | `worker_id` | `7c54b230a8d94ea9b86f52d70134ac68` | routing, directories, binding references, message headers; immutable |
 | `label` | `worker-1`, `code reviewer` | base routing alias; renameable |
-| `display_label` | `kc-reviewer-ryan` | optional AG2 Space display override; unique names can address the worker |
+| `display_label` | `kc-reviewer-ryan` | optional s.space display override; unique names can address the worker |
 | `incarnation_id` | minted per session | which run of that worker accepted an attempt |
 
 **The id is `uuid.uuid4().hex`** — 32 lowercase hex, exactly the

@@ -125,7 +125,7 @@ Adding through the HTTP route or the runtime API **starts the row's bridge at on
 saved connection never waits for the next restart; the response carries that `launch`
 record, and a start that fails leaves the row `failed` with its `reason`. A disabled row is
 not started (`reconnect` is the verb), nor the legacy row. Before saving, an add imports any
-`AG2_REMOTE_TOKEN_<INST>` launch key (environment or AG2 Space channel env file) that no row holds
+`AG2_REMOTE_TOKEN_<INST>` launch key (environment or s.space channel env file) that no row holds
 yet, under the instance its own launcher runs it as; a token for one of those servers adopts that row
 (`created: false`) rather than saving a second row whose bridge would hold another lease. `start`'s
 check for a running bridge is advisory; the bridge lease is what keeps one holder. The CLI `add` saves only; `start`
@@ -486,7 +486,7 @@ creates a row once for `REMOTE_TASK_TOKEN` and each `AG2_REMOTE_TOKEN_<INST>` in
 environment (copying the secret into the vault unless one is already there; never
 overwriting a row), then launches one bridge per `launch-plan` line through
 `scripts/connections.py launch <instance>`. When the environment holds no
-`REMOTE_TASK_TOKEN`, the primary row comes from the AG2 Space channel env file instead
+`REMOTE_TASK_TOKEN`, the primary row comes from the s.space channel env file instead
 (the one `scripts/channel-env.sh` resolves; `REMOTE_TASK_TOKEN` or the legacy
 `AG2_REMOTE_TOKEN`, environment first when both exist): a desktop install signs in after
 the engine started, so the connect flow reaches the file but never this process's

@@ -1,6 +1,6 @@
 ---
 name: tutorial
-description: "Show a new owner what to try first. Voice: on \"tutorial\", \"walk me through\" or \"show me what you can do\", walk the workspace tutorial one short section at a time. AG2 Space: on an owner DM message with a line `/tutorial` (the setup app ends the first-contact message with one), after the greeting, create (or refresh) one \"Getting started\" HTML page there, a short AG2 Space tour with one thing to try per part, and summon the owner to it."
+description: "Show a new owner what to try first. Voice: on \"tutorial\", \"walk me through\" or \"show me what you can do\", walk the workspace tutorial one short section at a time. s.space: on an owner DM message with a line `/tutorial` (the setup app ends the first-contact message with one), after the greeting, create (or refresh) one \"Getting started\" HTML page there, a short s.space tour with one thing to try per part, and summon the owner to it."
 user-invocable: true
 ---
 
@@ -21,9 +21,9 @@ Keep each step conversational and brief: this is spoken, not read. Say what to t
 details unless asked. A section that needs an app they have not connected (email, phone, the
 morning briefing) gets one sentence on connecting it, not the full step.
 
-## AG2 Space mode: the Getting started page
+## s.space mode: the Getting started page
 
-Used when an owner message in their AG2 Space DM has a line that is exactly `/tutorial`, or the owner
+Used when an owner message in their s.space DM has a line that is exactly `/tutorial`, or the owner
 asks for the tutorial there. The setup app ends the automatic first-contact message with that line,
 so the page follows the first greeting; the owner can send `/tutorial` again at any time. Run the
 script below by its path: a core that cannot find skills by name still has it. The line asks for
@@ -39,7 +39,7 @@ not retry the page in the same turn.
    - a name made from your mxid's localpart (`@chi-air-blue.agent:…` gives `Chi Air Blue`);
    - `Sutando`.
 
-   Your mxid is `$AGENT_MXID`, else the AG2 Space channel env file's, else `--agent-mxid`.
+   Your mxid is `$AGENT_MXID`, else the s.space channel env file's, else `--agent-mxid`.
 2. Tailor the prompts when you know the owner's work. You know it when either:
    - the first-contact message has a line `I picked: <labels>.`, for example
      `I picked: Founder, Product Manager.`. These are the persona labels the owner chose at
@@ -74,7 +74,7 @@ not retry the page in the same turn.
 
    You need not source any env file. `room_commons.py` is found beside this skill, else in the
    installed skills directory. When the environment names none of its credentials, they are read
-   from the AG2 Space channel env file through the shared resolver
+   from the s.space channel env file through the shared resolver
    (`src/channel_credentials.py`). They are passed to that process only and never printed.
 
    `--core` defaults to `auto`: the core runtime the engine resolves
@@ -92,7 +92,7 @@ not retry the page in the same turn.
    finishing a page an earlier run created but did not complete. `--summon` forces a summon, e.g.
    when the owner asks for the tutorial again.
 4. Exit 3 (room-commons not installed) or 4 (a room-commons call failed): leave the greeting as is
-   and say nothing about the page unless the owner asks. A failure that is a Sutando or AG2 Space
+   and say nothing about the page unless the owner asks. A failure that is a Sutando or s.space
    defect goes to `report-feedback`.
 
 Run it in the owner's own DM (the default, `--audience dm`). Only when the owner asks for the page
@@ -118,7 +118,7 @@ each room's entry.
 `getting_started.py plan --room <room>` shows what `publish` would do; `render --name <name>`
 prints the HTML.
 
-**What the page says.** A short, interactive AG2 Space tour (`scripts/tour_page.py`). Each step is
+**What the page says.** A short, interactive s.space tour (`scripts/tour_page.py`). Each step is
 one line on what it is and one thing to try, in this order:
 1. Your DM: what the owner asks for themselves comes back in the DM, never in a room.
 2. Rooms.
@@ -133,11 +133,11 @@ one line on what it is and one thing to try, in this order:
 
 On a Claude Code core it adds "Import your Claude Code history"; on Codex or an unknown core that
 step is left out. Every prompt says where to paste it (your DM or a room). When every step is
-done, a closing card offers one more prompt. UI labels match the AG2 Space client and its current
+done, a closing card offers one more prompt. UI labels match the s.space client and its current
 screenshots; reword them in `tour_page.py` when the client changes.
 
 **Screenshots.** `assets/*.jpg` are real UI crops, adapted from Zerlinda's Sutando's "Getting
-started with AG2 Space" page. Each is cropped so that no person's name, room or account shows,
+started with s.space" page. Each is cropped so that no person's name, room or account shows,
 and each is at most 60 KB. They are inlined as `data:` URIs, so the page stays self-contained. A
 step names its images in `Section.images` as (file, alt).
 

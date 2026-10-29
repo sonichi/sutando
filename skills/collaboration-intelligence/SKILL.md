@@ -44,7 +44,7 @@ So: ask for a handful of mappings (GitHub handle ↔ chat id ↔ person) before 
 
 | source | provides | consequence |
 |---|---|---|
-| AG2 Space / Matrix | `channel_id`, `room_name`, `room_members`, `room_member_count`, `user_id` | rooms, names and rosters available |
+| s.space / Matrix | `channel_id`, `room_name`, `room_members`, `room_member_count`, `user_id` | rooms, names and rosters available |
 | Discord | `channel_id`, `channel_name`, `guild_name`, `user_id` | **no roster, no member count** — membership is `unknown`, not empty |
 | Slack | `channel_id`, `user_id` | id and speaker only; name and roster `unknown` |
 
@@ -260,7 +260,7 @@ per customer:
 
 | Venue | Purpose |
 |---|---|
-| Slack Connect, AG2 Space, WhatsApp | day-to-day coordination |
+| Slack Connect, s.space, WhatsApp | day-to-day coordination |
 | GitHub or issue tracker | technical work and delivery status |
 | Email, documents, contracts, CRM | formal decisions and commitments |
 | Meetings | synchronous discussion — record the outcome in a durable venue afterward |

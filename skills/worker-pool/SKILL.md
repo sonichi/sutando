@@ -15,7 +15,7 @@ contracts are in [`docs/worker-pool-design.md`](../../docs/worker-pool-design.md
 - `spawn_worker.py` — mint a worker: identity records, delivery folder, tmux session, watcher; refuses before any side effect, rolls back on a launcher failure.
 - `create_worker.py` — the one command that spawns and registers under the roster lock, so the roster cannot go stale.
 - `rename_worker.py` — change a worker's base routing alias after creation: `python3 skills/worker-pool/scripts/rename_worker.py --worker <id-or-label> --label "<new alias>" [--workspace W]`. The id and its tmux session name stay.
-- `apply_profile_label_overrides.py` — apply an AG2 Space profile's complete worker display-label map from JSON stdin with `--workspace W --profile-mxid M --config-version N`.
+- `apply_profile_label_overrides.py` — apply an s.space profile's complete worker display-label map from JSON stdin with `--workspace W --profile-mxid M --config-version N`.
 - `worker_bootstrap.py` — a worker session's first-turn decision (worker vs core mode) from its env.
 - `pool_roster.py` — owner bindings + compiled roster; `register_worker` is the locked read-merge-write. `set_worker_state` / `remove_worker` are its writers for a worker's lifecycle.
 - `pool_manage.py` — stop, retire, re-enable or remove a worker (below).
@@ -102,7 +102,7 @@ The 32-hex `worker_id` is stable and is the roster key, delivery recipient, and
 room binding target. The roster's base `label` is a routing alias.
 `rename_worker` changes it without changing the ID.
 
-AG2 Space can set an optional `display_label` override for a worker. It appears
+s.space can set an optional `display_label` override for a worker. It appears
 in the picker, session list, pool advertisement, and human status. An exact
 full ID or `core` always selects that recipient. A unique base or display label
 can address a worker in `pool_ask --to`, room binding, and task requests; a
@@ -113,7 +113,7 @@ status uses `name (full worker_id)`, for example
 `kc-reviewer-ryan (274cb60d473744dba54040a9de119877)`. The `pool_ask --who`
 JSON keeps `label` as the base routing alias and adds `display_label` as the
 effective name; text adds `alias=<base label>` when the names differ. Removing
-an AG2 Space override restores the base label as the visible name.
+an s.space override restores the base label as the visible name.
 
 `apply_profile_label_overrides.py` reads the complete override map, keyed by
 full worker ID, under the roster lock. It tracks the broker snapshot in
@@ -214,7 +214,7 @@ python3 skills/worker-pool/scripts/pool_ask.py --workspace "$WS" --to <label|id|
 
 - `--who` lists `core` and each worker as `name (full worker_id)`, with bound
   rooms and session liveness; `(you)` marks the caller. It shows the base routing
-  alias separately when an AG2 Space display override differs.
+  alias separately when an s.space display override differs.
 - `--to X --ask "..."` writes `tasks/<task id>.txt` with `source: pool-ask`,
   `requested_worker: <id>` (never for the core, which is the default recipient) and
   `reply_to_instance: <asker>`, then routes it. A worker finds it in its inbox like

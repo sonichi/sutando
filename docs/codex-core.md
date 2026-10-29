@@ -35,8 +35,8 @@ bash src/agent/start-cli.sh --restart
 ```
 
 That command starts the core and the local agent API (`127.0.0.1:7843`) when
-nothing serves it yet; the AG2 Space desktop hands its connect code to that API,
-so a core moved to AG2 Space from the desktop needs it running. It does not start
+nothing serves it yet; the s.space desktop hands its connect code to that API,
+so a core moved to s.space from the desktop needs it running. It does not start
 the other local services (voice, web client, dashboard, bridges): for those, start
 everything with `bash src/startup.sh`, which then launches the same core.
 
@@ -151,10 +151,10 @@ also defers after the configured confirmation retries. An unobservable successfu
 send keeps the existing advisory behavior. A race with scrolling can leave the
 attached terminal's jump prompt visible; Escape dismisses that client prompt.
 
-## AG2 Space MCP without the desktop app
+## s.space MCP without the desktop app
 
-The AG2 Space desktop app writes an `ag2-space` entry into `$CODEX_HOME/config.toml`.
-A Codex core set up without the app has no such entry, so it has no AG2 Space
+The s.space desktop app writes an `ag2-space` entry into `$CODEX_HOME/config.toml`.
+A Codex core set up without the app has no such entry, so it has no s.space
 Actions (`room.commons.*` included) until you add the hosted server yourself.
 
 The MCP endpoint belongs to the homeserver your agent is on, so take it from your
@@ -190,13 +190,13 @@ url = "<the mcp_url printed above>"
 and starts the sign-in. The server uses OAuth, so no token goes in the file:
 
 ```bash
-codex mcp login ag2-space   # sign in to AG2 Space in the browser
+codex mcp login ag2-space   # sign in to s.space in the browser
 codex mcp list              # ag2-space: enabled, Auth no longer "Not logged in"
 ```
 
 That connection acts as you. To act as your agent, call the server's `agent_link`
 tool once from a Codex session with the one-time link code on the agent's
-settings page in AG2 Space. Restart the core afterwards
+settings page in s.space. Restart the core afterwards
 (`bash src/agent/start-cli.sh --restart`, from outside the core session).
 
 ## Externally managed monitor and heartbeat
@@ -314,7 +314,7 @@ bash src/agent/start-cli.sh --runtime codex --restart
 ```
 
 The leading `--runtime` flag wins over `SUTANDO_CORE_RUNTIME`, which otherwise
-wins over the AG2 Space desktop's selection, which wins over `core.runtime`. The
+wins over the s.space desktop's selection, which wins over `core.runtime`. The
 desktop selection is `coreRuntime` in the desktop's `runtime.json`
 (`$SUTANDO_APP_SUPPORT/runtime.json`, or the directory above a bundled
 `engine/<checkout>`), so launchd jobs started without the desktop's environment

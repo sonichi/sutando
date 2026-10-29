@@ -278,7 +278,7 @@ validator: [`scripts/lint-skill.py`](../scripts/lint-skill.py).
 
 **Design principle — transport-agnostic.** The manifest + a checksum + a lockfile
 are the format; where a package is *resolved from* (a git repo today, a hosted
-registry later, e.g. AG2 Space) is a separate concern. git→hosted is a resolver
+registry later, e.g. s.space) is a separate concern. git→hosted is a resolver
 backend swap, never a re-format.
 
 ### Fields (superset of the tool-loader fields above)

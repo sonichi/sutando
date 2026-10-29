@@ -84,7 +84,7 @@ Return `{"tasks": []}` on long-poll timeout. The client uses an HTTP timeout of
 
 A task object **must** carry a unique `"id"`. Recognized string fields
 (`task`, `source`, `channel_id`, `user_id`, `priority`, …) are newline-confined
-and written into the local task file the core consumes. For AG2 Space, the
+and written into the local task file the core consumes. For s.space, the
 broker also supplies its room-policy `access_tier` attestation.
 
 Owner replies to runtime action cards are interpreted before local task-file
@@ -106,7 +106,7 @@ fit the verb — is refused by name rather than resolved from the sentence, and
 the room always comes from `channel_id`, never from `picker_args`. A broker
 that sends no `picker_command` keeps the prose fallback.
 
-An AG2 Space broker may additionally send `"session_scope": "room"`. The
+An s.space broker may additionally send `"session_scope": "room"`. The
 bridge writes only that exact value as a trusted pre-body header; missing,
 unknown, or malformed values are omitted, preserving the main-session path for
 older brokers, bridges, and Sutando installations. An optional task handler may
@@ -116,11 +116,11 @@ room-specific provider session.
 **`capabilities` (the poll's proof).** Every poll carries
 `&capabilities=voice-outcome-v1`, the voice-outcome contract the heartbeat also
 declares (below). One agent's credential may be used by more than one bridge, so
-an AG2 Space broker serves a voice relay ask only to a poll that names the
+an s.space broker serves a voice relay ask only to a poll that names the
 contract itself, and serves a poll without it the tasks behind that ask; a relay
 that predates the parameter ignores it.
 
-**`ack_first` (acknowledging first).** An AG2 Space broker marks a voice relay ask
+**`ack_first` (acknowledging first).** An s.space broker marks a voice relay ask
 it serves with `"ack_first": true`, at most one per response. The bridge handles
 a task served with that exact boolean before the rest of the response, on its
 own, and publishes it to the core only once its ack is accepted:
@@ -254,7 +254,7 @@ body: { "id": "ask-…", "body": "", "status": "failed",
 `"capabilities": ["voice-outcome-v1"]` and an explicit boolean `dm_only`: `true`
 when the body carries `[dm-only]` anywhere (a standalone marker line is stripped
 from `body`; an inline mention stays in it), `false` otherwise, a skip and a fold
-included. An AG2 Space broker reads the two only for a voice relay ask, and treats
+included. An s.space broker reads the two only for a voice relay ask, and treats
 such an ask's result without them as private: an older bridge strips the marker
 line and sends no `dm_only`, so its private answers still reach only the owner.
 Both are part of the payload the outbox stores, so a retry, also after a restart,
@@ -321,7 +321,7 @@ body: {
 
 `voice-outcome-v1` declares the voice-outcome contract: the poll's proof and
 acknowledging an `ack_first` task before publishing it under `GET /v1/tasks`, and
-`dm_only` and `consolidated_into` under `POST /v1/results`. An AG2 Space broker
+`dm_only` and `consolidated_into` under `POST /v1/results`. An s.space broker
 keeps the declaration to decide whether a new call may use the voice relay; the
 poll and every result carry the contract again, because a Mac can be downgraded
 after the declaration was read.
@@ -353,7 +353,7 @@ Sutando checkout (no `health` row) forwards the self-report unchanged, or nothin
 A relay that answers the heartbeat with `404` or `405` is retried after 60 s, doubling to at most
 30 minutes, so a relay that deploys the route is picked up without a restart.
 
-`team-collaborator` tells the AG2 Space control plane that this gateway
+`team-collaborator` tells the s.space control plane that this gateway
 understands the per-agent Collaborator control layered over Team. Gateways
 without it safely keep Team on their prior restricted path.
 
@@ -828,7 +828,7 @@ not promise downstream Matrix delivery.
   fail closed to Guest. Every serialized wire field is newline-confined, and the
   bridge emits the resolved `access_tier:` independently, so message text cannot
   forge a higher tier.
-- A broker-attested AG2 Space **Team** tier plus exact boolean
+- A broker-attested s.space **Team** tier plus exact boolean
   `collaborator: true` is the explicit trusted-runtime opt-in. The legacy wire
   tier remains Guest with `requested_access_tier: team`, so older gateways stay
   restricted. A capable bridge promotes that signed combination and adds one
@@ -896,7 +896,7 @@ without the health checker. A passing report alone does not invent a core
 status. If the gateway or host is down, no heartbeat can be sent; the broker's
 existing contact timeout still yields disconnected/unknown.
 
-The AG2 Space dashboard already classifies `error` as unhealthy, so this
+The s.space dashboard already classifies `error` as unhealthy, so this
 requires updating Sutando's health checker and restarting its gateway bridge;
 no dashboard schema change is needed. Reporting starts after the first health
 check completes and follows the installed check cadence.
