@@ -109,8 +109,9 @@ export const register: Register = (on) => {
   })
 
   on('turn.complete', async ($, e, next) => {
-    const done = await next(e)
+    // Cleared before next(e): if anything beneath throws, held events must not wait forever.
     turnRunning = false
+    const done = await next(e)
     const text = takeEvents(pending, template)
     pending = []
     if (text) void $.prompt.submit({ text })
