@@ -38,6 +38,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from tmux_probe import has_session as _tmux_has_session  # noqa: E402
 import cli_wedge  # noqa: E402 — owns the core pane target and its capture
+import connections  # noqa: E402 — the install's gateway rows and which one is primary
 import dotspace  # noqa: E402 — which cloud this install's DotSpace runs
 import session_runtime  # noqa: E402 — the one reading of a session's runtime stamp
 from worker_auth_state import signed_in_since  # noqa: E402 — the one "signed in again" reading
@@ -228,12 +229,14 @@ def _core_running():
 
 
 def _gateway_configured():
-    """Whether the ag2.space mobile gateway is provisioned on THIS host.
+    """Whether a gateway is provisioned on THIS host.
 
-    The gateway bridge only runs where a remote task token is configured (env or
-    channels/ag2space/.env). Returns True (configured), False (config readable,
-    no token), or None (can't tell — no CLAUDE_CONFIG_DIR / unreadable .env).
+    The gateway bridge only runs where an enabled connection row exists or a remote task
+    token is configured (env or channels/ag2space/.env). Returns True (configured), False
+    (config readable, no token), or None (can't tell — no CLAUDE_CONFIG_DIR / unreadable .env).
     Mirrors health-check.check_gateway_bridge's detection."""
+    if connections.enabled_rows():
+        return True
     if os.environ.get("REMOTE_TASK_TOKEN") or os.environ.get("AG2_REMOTE_TOKEN"):
         return True
     cfg = os.environ.get("CLAUDE_CONFIG_DIR")
@@ -282,7 +285,7 @@ def _gateway_running():
 # attribute a Station failure to "AG2 Space not running" rather than guess.
 _AG2SPACE_APP_MARKER = "AG2 Space.app/Contents/MacOS"
 _STATION_GATEWAY_HOST = dotspace.server_of_gateway_url(
-    dotspace.default_cloud_origin())
+    dotspace.default_cloud_origin(primary_server=connections.primary_server()))
 
 
 def _ag2space_app_running():

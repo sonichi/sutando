@@ -1,1 +1,1 @@
-{ "description": "AG2 Space inbox connector", "modules": ["./register.ts"] }
+{ "description": "s.space inbox connector", "modules": ["./register.ts"] }

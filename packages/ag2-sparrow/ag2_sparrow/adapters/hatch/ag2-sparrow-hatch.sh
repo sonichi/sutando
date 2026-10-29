@@ -162,7 +162,7 @@ elif [[ "$n" -eq 0 ]]; then
       reason="heartbeat: Sparrow is not running; restart it, post nothing"
       payload="$(jq -cn --arg d "$sparrow_detail" --arg marker "$ACTIVITY_FILE" '{heartbeat: true,
         matches: [], total: 0, sparrow_down: $d,
-        worker_note: ("Heartbeat. Touch " + $marker + ". No AG2 Space message reaches you: "
+        worker_note: ("Heartbeat. Touch " + $marker + ". No s.space message reaches you: "
                       + $d + ". Restart Sparrow as that says, then exit; post nothing.")}')"
       ;;
     11)
@@ -170,7 +170,7 @@ elif [[ "$n" -eq 0 ]]; then
       reason="heartbeat: Sparrow is running but not connected; report it to your owner, post nothing"
       payload="$(jq -cn --arg d "$sparrow_detail" --arg marker "$ACTIVITY_FILE" '{heartbeat: true,
         matches: [], total: 0, sparrow_not_connected: $d,
-        worker_note: ("Heartbeat. Touch " + $marker + ". No AG2 Space message reaches you: "
+        worker_note: ("Heartbeat. Touch " + $marker + ". No s.space message reaches you: "
                       + $d + ". Restarting Sparrow alone will not fix this: tell your owner in "
                       + "your run report, then exit; post nothing.")}')"
       ;;
@@ -179,7 +179,7 @@ elif [[ "$n" -eq 0 ]]; then
       ;;
   esac
 else
-  reason="$n AG2 Space task(s) need answers"
+  reason="$n s.space task(s) need answers"
   payload="$(printf '%s' "$result" | jq -c --arg note "$REMAINING_WORK_NOTE" --arg limits "$NON_OWNER_NOTE" \
     --arg rewake "$REWAKE_NOTE" --arg quoted "$REPLY_CONTEXT_NOTE" \
     --arg unlabelled "$UNLABELLED_CONTEXT_NOTE" --arg held "$HELD_NOTE" \

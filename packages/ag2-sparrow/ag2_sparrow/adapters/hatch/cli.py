@@ -399,7 +399,7 @@ def render_service(exec_start: str, env: dict, unset: "tuple[str, ...]" = ()) ->
                    for k, v in env.items())
     if unset:
         rows += f"UnsetEnvironment={' '.join(unset)}\n"
-    return (f"{SERVICE_MARKER}\n[Unit]\nDescription=ag2-sparrow (AG2 Space listener)\n"
+    return (f"{SERVICE_MARKER}\n[Unit]\nDescription=ag2-sparrow (s.space listener)\n"
             "# A Sparrow that dies 5 times in 5 minutes (e.g. a rejected token) is left failed.\n"
             "StartLimitIntervalSec=300\nStartLimitBurst=5\n\n"
             f"[Service]\n{rows}ExecStart={exec_start}\nRestart=always\nRestartSec=10\n"
@@ -879,7 +879,7 @@ def check_sparrow(state_dir: Path, now: float | None = None,
         return SPARROW_NOT_CONNECTED, (
             f"Sparrow is running but not connected: {status.get('error') or 'no error given'}; "
             "if the token was rejected, a restart does not help: put a valid relay token from "
-            "the AG2 Space Agent Portal in REMOTE_TASK_TOKEN (the .env file AG2_DEVICE_ENV "
+            "the s.space Agent Portal in REMOTE_TASK_TOKEN (the .env file AG2_DEVICE_ENV "
             "names), then restart Sparrow")
     return SPARROW_OK, f"running and connected ({path} written {max(age, 0)}s ago)"
 
@@ -964,6 +964,11 @@ def verify(_args) -> int:
     state_dir = Path(cfg.get("STATE_DIR") or _dirs.state_dir())
     code, detail = check_sparrow(state_dir, instance=cfg.get("GATEWAY_INSTANCE"))
     _check(results, code == SPARROW_OK, "sparrow", detail)
+    wrong = live_identity_mismatch(cfg, (cfg.get("GATEWAY_INSTANCE") or "").strip())
+    if wrong is not None:
+        _check(results, False, "identity",
+               f"the running Sparrow (pid {wrong[0]}) serves {wrong[1]}, not {cfg.get('AGENT_MXID')} "
+               "as the config says; run ag2-sparrow-hatch install again to replace it")
 
     run = hook_last_run(state_dir)
     if run is None:
@@ -1037,7 +1042,7 @@ def verify(_args) -> int:
                   "whether its heartbeats carry the health row is unknown")
 
     mxid = cfg.get("AGENT_MXID") or "@your-agent:ag2.space"
-    print(f"\nManual test: from another account, mention {mxid} in an AG2 Space room. Within a "
+    print(f"\nManual test: from another account, mention {mxid} in an s.space room. Within a "
           "few polls a task file appears in the task_dir, the hook wakes the worker, and the "
           "reply lands in that message's thread tagging you. hooks.logs shows the wake.")
     return 0 if all(results) else 1
@@ -1280,6 +1285,15 @@ def _lane_snapshot(cfg: dict, instance: str) -> "tuple[int, str, bool] | None":
     the lock names another live process, or the record is not that process's own (another one
     wrote it under a reused pid). A drain from an older package lacks the protocol, and
     keepawake replaces it."""
+    rec = _live_lane_record(cfg, instance)
+    if rec is None:
+        return None
+    return (rec["pid"], delivery_destination.homeserver_of(rec["agent_id"]),
+            rec.get("send_lock") == delivery_destination.SEND_LOCK_PROTOCOL)
+
+
+def _live_lane_record(cfg: dict, instance: str) -> "dict | None":
+    """The live drain's own fresh lane record, under the conditions _lane_snapshot names; else None."""
     state = Path(cfg.get("STATE_DIR") or _dirs.state_dir())
     rec = agent_identity.published_lane_record(state, instance)
     if rec is None or process_gone(rec["pid"]):
@@ -1289,8 +1303,17 @@ def _lane_snapshot(cfg: dict, instance: str) -> "tuple[int, str, bool] | None":
         return None  # a lock names the live drain, and it is not the publisher
     if not agent_identity.owned_by(rec, rec["pid"], (holder or {}).get("acquired_at")):
         return None
-    return (rec["pid"], delivery_destination.homeserver_of(rec["agent_id"]),
-            rec.get("send_lock") == delivery_destination.SEND_LOCK_PROTOCOL)
+    return rec
+
+
+def live_identity_mismatch(cfg: dict, instance: str) -> "tuple[int, str] | None":
+    """(pid, agent_id) of the live drain when the id it serves is not the AGENT_MXID install saved;
+    None when they match, or when there is no saved MXID or no live drain record to compare."""
+    want = saved_mxid(cfg.get("AGENT_MXID"))
+    rec = _live_lane_record(cfg, instance) if want else None
+    if rec is None or rec["agent_id"].lower() == want.lower():
+        return None
+    return rec["pid"], rec["agent_id"]
 
 
 def _lane_homeserver(cfg: dict, instance: str) -> str:
@@ -1343,7 +1366,7 @@ def hold(args) -> int:
               "task-not-picked-up", file=sys.stderr)
         return REPLY_UNCONFIRMED
     if not room or delivery_destination.drain_room(body, lane) != room:
-        print(f"error: task {tid} names no AG2 Space room Sparrow would deliver to",
+        print(f"error: task {tid} names no s.space room Sparrow would deliver to",
               file=sys.stderr)
         return 2
     if not snap[2]:
@@ -1540,7 +1563,7 @@ def reply(args) -> int:
         record = outbox.read_item(root, item) or {}
         status = record.get("status")
         if status == "DELIVERED":
-            print(f"posted: {result_file.name} (accepted by the AG2 Space gateway)")
+            print(f"posted: {result_file.name} (accepted by the s.space gateway)")
             return REPLY_POSTED
         if status == "PARKED":
             print(f"NOT posted: Sparrow gave up on {result_file.name}: "
@@ -1597,7 +1620,7 @@ def main(argv=None) -> int:
                                  description="Meta Hatch adapter for ag2-sparrow.")
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("install", help="install the Hatch hook script, definition and config")
-    p.add_argument("--mxid", required=True, help="the agent's AG2 Space MXID")
+    p.add_argument("--mxid", required=True, help="the agent's s.space MXID")
     p.add_argument("--task-dir", help="Sparrow's task dir (default: as ag2-sparrow resolves it)")
     p.add_argument("--result-dir", help="Sparrow's result dir (default: as ag2-sparrow resolves it)")
     p.add_argument("--state-dir", help="Sparrow's state dir (default: as ag2-sparrow resolves it)")

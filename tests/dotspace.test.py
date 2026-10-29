@@ -96,6 +96,15 @@ class TestConfig(unittest.TestCase):
                           "https://sutando.ag2.space", True, "config"))
         self.assertTrue(d.is_dotspace)
 
+    def test_each_built_in_instance_names_its_mcp_url(self):
+        got = {d.server: d.mcp_url for d in ds.registered_instances({})}
+        self.assertEqual(got, {"ag2.space": "https://mcp.ag2.space/mcp", "dev.ag2.space": "https://dev-mcp.ag2.space/mcp",
+                               "s.space": "https://mcp.s.space/mcp", "dev.s.space": "https://dev-mcp.s.space/mcp"})
+        self.assertEqual(ds.dotspace_for("@u:dev.s.space", fetch=ds.NO_FETCH, config={}).mcp_url,
+                         "https://dev-mcp.s.space/mcp", "the per-server lookup a caller derives from its primary row")
+        listed = ds.registered_instances({"instances": [{"server": "x.space", "gateway_host": "gw.x.space"}]})
+        self.assertEqual(listed[0].mcp_url, "", "a configured entry without one names none")
+
     def test_gateway_host_and_subdomains_match_their_instance(self):
         for query, server in [("chat.ag2.space", "ag2.space"), ("dev-chat.s.space", "dev.s.space"),
                               ("x.dev.ag2.space", "dev.ag2.space"), ("chat.dev.s.space", "dev.s.space"),

@@ -375,9 +375,23 @@ def _ag2space_proactive_ack_gate(task_id: str, item_id: str):
 
 
 def _lane_dedupe_gate(task: dict):
-    """A message another of this install's lanes already queued; seats are other agents, never asked."""
+    """A message another of this install's lanes queued, or one the lane its owner names will answer;
+    seats are other agents, never asked."""
     import lane_dedupe
-    return lane_dedupe.duplicate_reason(WS / "state", task, GATEWAY_INSTANCE, log=_log)  # noqa: F821
+    try:
+        from connections import event_owner_lanes
+        owners = event_owner_lanes(task, WS)
+    except Exception as e:  # noqa: BLE001 - no owner read keeps the first-come guard
+        _log(f"lane dedupe: owner lanes unreadable ({type(e).__name__}); first lane answers")  # noqa: F821
+        owners = []
+    mode = _INTAKE_MODE  # noqa: F821
+    deadline = mode["deadline"]
+    wait_s = None if deadline is None else max(0.0, deadline - time.monotonic())
+    try:
+        return lane_dedupe.duplicate_reason(WS / "state", task, GATEWAY_INSTANCE, log=_log,  # noqa: F821
+                                            owner_lanes=owners, wait_s=wait_s, defer=mode["defer"])
+    except lane_dedupe.OwnerPending:
+        return INTAKE_DEFER  # noqa: F821
 
 
 _STATUS_ACK_MANIFEST = _REPO / "skills" / "status-ack" / "manifest.json"
@@ -390,7 +404,7 @@ def _legacy_keeps_proactive_room() -> bool:
 
 def _legacy_stand_down():
     from connections import legacy_parked
-    return "a primary move parked the legacy connection; unpark it to resume" if legacy_parked(WS) else None
+    return "the legacy connection is parked; unpark it to resume" if legacy_parked(WS) else None
 
 
 def _owns_unaddressed() -> bool:

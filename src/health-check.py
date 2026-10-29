@@ -4029,7 +4029,7 @@ def _default_local_notifier(msg: str) -> bool:
 # Per-bridge EXACT detail: gateway-bridge's other warns (not-serving, duplicate
 # pileup) describe a live process, so only this string may respawn one.
 GATEWAY_DOWN_DETAIL = (
-    "configured but NOT running — ag2.space mobile messages will not be delivered"
+    "configured but NOT running — gateway messages will not be delivered"
 )
 DOWN_BRIDGE_DETAILS = {
     "telegram-bridge": "configured but not running",
@@ -6761,7 +6761,7 @@ def check_core_supervisor() -> dict:
     # which is how a status tool teaches its reader to skip the warn line.
     if state == "gateway-down" and not _gateway_configured():
         return {"name": name, "status": "ok",
-                "detail": "core up; ag2.space gateway not configured on this host"}
+                "detail": "core up; gateway not configured on this host"}
     if state in needs_user:
         return {"name": name, "status": "warn", "detail": f"core needs you: {detail}"}
     if state in degraded:
@@ -6770,13 +6770,16 @@ def check_core_supervisor() -> dict:
 
 
 def _gateway_configured() -> bool:
-    """Is the ag2.space mobile gateway configured on this host?
+    """Is a gateway configured on this host: any enabled connection row, or the legacy relay token?
 
     `startup.sh` is deliberately silent when it is not — "a Sutando-only user
     never sees it" — so absence of the bridge is the EXPECTED state, not a fault.
     Shared by the two probes that must agree about that; they did not, which is
     the bug this helper exists to close.
     """
+    import connections  # noqa: PLC0415
+    if connections.enabled_rows(WORKSPACE_DIR):
+        return True
     try:
         if os.environ.get("REMOTE_TASK_TOKEN") or os.environ.get("AG2_REMOTE_TOKEN"):
             return True
@@ -6827,8 +6830,32 @@ def _gateway_lock_pids() -> "dict[str, str]":
     return out
 
 
+def check_sspace_migration(workspace_dir: Optional[Path] = None) -> "dict | None":
+    """WARN when every connection row is on the legacy DotSpace and none on its successor: a
+    terminal-run core is never moved by the desktop and goes silent if the legacy one goes read-only."""
+    import connections  # noqa: PLC0415
+    import dotspace  # noqa: PLC0415
+    ws = Path(workspace_dir) if workspace_dir else WORKSPACE_DIR
+    try:
+        # Read the record as it is: list_connections may import or adopt rows, a write.
+        rows = connections._read(connections.record_path(ws))
+    except Exception:  # noqa: BLE001 — an unreadable record is reported by the connections surfaces
+        return None
+    legacy, target = dotspace.LEGACY_SERVER, dotspace.SUCCESSOR_SERVER
+    servers = {dotspace.dotspace_for(str(r.get("server") or ""), fetch=dotspace.NO_FETCH).server for r in rows}
+    if servers != {legacy}:
+        return None
+    inst = connections.instance_for(target)
+    return {"name": "sspace-migration", "status": "warn",
+            "detail": (f"only connected to {legacy}, no {target} connection — get a connect code at "
+                       f"{target}'s agent portal, then from the repo run: python3 scripts/connections.py add "
+                       f"'<code>' && python3 scripts/connections.py promote {inst} --repo . --logs-dir "
+                       '"$(bash scripts/sutando-config.sh workspace)/logs" (docs/connections.md, '
+                       f'"Moving a terminal-run core to {target}")')}
+
+
 def check_gateway_bridge() -> "dict | None":
-    """Health of the ag2.space gateway bridge (remote-gateway-bridge.py) — the
+    """Health of the gateway bridge (remote-gateway-bridge.py) of the primary connection — the
     process that carries MOBILE-app messages from the cloud gateway down to the
     local core (and results back up).
 
@@ -6920,10 +6947,10 @@ def check_gateway_bridge() -> "dict | None":
             "name": "gateway-bridge",
             "status": "warn",
             "detail": f"process running but NOT serving — {since}; "
-                      "ag2.space mobile messages are not being delivered",
+                      f"{_gateway_where()} messages are not being delivered",
         }
     if verdict is True:
-        return _gateway_ok_unless_lane_stalled("running + connected")
+        return _gateway_ok_unless_lane_stalled(_gateway_connected_detail())
     # The bridge rewrites this file on every poll outcome, so silence past the
     # freshness window means the writer stopped — evidence, not absence of it.
     stale_age = _gateway_status_stale_age_s()
@@ -6934,7 +6961,7 @@ def check_gateway_bridge() -> "dict | None":
             "detail": (
                 f"process running but its status sidecar has not been written for "
                 f"{stale_age:.0f}s (freshness window {GATEWAY_STATUS_MAX_AGE_S:.0f}s) — "
-                "the bridge is not reporting poll outcomes, so ag2.space mobile "
+                f"the bridge is not reporting poll outcomes, so {_gateway_where()} "
                 "messages may not be delivered"
             ),
         }
@@ -6944,25 +6971,70 @@ def check_gateway_bridge() -> "dict | None":
             "status": "warn",
             "detail": ("process running but its status sidecar carries an unusable "
                        "timestamp — the writer is not reporting poll outcomes, so "
-                       "ag2.space mobile messages may not be delivered"),
+                       f"{_gateway_where()} messages may not be delivered"),
         }
     # Primary said nothing and is not merely stale, so it may not exist at all.
     # Ask the lanes before calling a live PID healthy — one of them owns it.
     lanes = _gateway_lane_verdicts()
     if lanes and not any(serving for _, serving, _ in lanes):
-        never = [ln for ln, _, ever in lanes if not ever]
+        never = [_gateway_lane_label(ln) for ln, _, ever in lanes if not ever]
         why = (f"lane {', '.join(never)} has never completed a poll" if never
-               else f"lane {', '.join(ln for ln, _, _ in lanes)} is not connected")
+               else f"lane {', '.join(_gateway_lane_label(ln) for ln, _, _ in lanes)} is not connected")
         return {
             "name": "gateway-bridge",
             "status": "warn",
             "detail": (f"process running but NOT serving — {why}; "
-                       "ag2.space mobile messages are not being delivered"),
+                       "messages on those connections are not being delivered"),
         }
     if lanes:
-        served = ", ".join(ln for ln, serving, _ in lanes if serving)
+        served = ", ".join(_gateway_lane_label(ln) for ln, serving, _ in lanes if serving)
         return _gateway_ok_unless_lane_stalled(f"running + connected (lane {served})")
     return _gateway_ok_unless_lane_stalled("running")
+
+
+def _gateway_rows(workspace: "Path | None" = None) -> "list[dict]":
+    """Every row as stored (no sidecar read, no lease probe); [] with no connections record."""
+    import connections  # noqa: PLC0415
+    return connections.read_rows(WORKSPACE_DIR if workspace is None else workspace)
+
+
+def _gateway_primary_sidecar() -> Path:
+    """The primary connection's status sidecar; the unsuffixed one when no row is primary."""
+    import connections  # noqa: PLC0415
+    return Path(status_read_path(connections.primary_sidecar_name(WORKSPACE_DIR / "state"), WORKSPACE_DIR))
+
+
+def _gateway_where() -> str:
+    """The primary connection's server, for a message the owner reads; "gateway" without one."""
+    import connections  # noqa: PLC0415
+    return connections.primary_server(WORKSPACE_DIR) or "gateway"
+
+
+def _gateway_connected_detail() -> str:
+    import connections  # noqa: PLC0415
+    server = connections.primary_server(WORKSPACE_DIR)
+    return f"running + connected ({server})" if server else "running + connected"
+
+
+def _gateway_lanes_not_served(state_dir: Path) -> "set[str]":
+    """Lane names a scan of `state_dir` skips: the primary's own (read as the primary) and every
+    parked or disabled row's, whose sidecar goes stale by design."""
+    import connections  # noqa: PLC0415
+    root = Path(state_dir)
+    out = set()
+    for r in _gateway_rows(root.parent if root.name == "state" else root):
+        if r.get("primary") or r.get("parked") or r.get("disabled"):
+            out.update([r["instance"], *connections.alias_instances(r)])
+    return out
+
+
+def _gateway_lane_label(lane: str, rows: "list[dict] | None" = None) -> str:
+    """`lane (server)` when a row names the lane's server, else the lane alone."""
+    import connections  # noqa: PLC0415
+    rows = _gateway_rows() if rows is None else rows
+    server = next((r["server"] for r in rows
+                   if lane in (r["instance"], *connections.alias_instances(r)) and r.get("server")), "")
+    return f"{lane} ({server})" if server else lane
 
 
 GATEWAY_STATUS_MAX_AGE_S = 180.0
@@ -6976,7 +7048,7 @@ def _gateway_last_ok_age_h(path: "Path | None" = None,
     """Hours since the sidecar's `last_ok_ts`; None when it is absent or
     unusable, so an unknown start is never reported as a fresh one."""
     import time as _time
-    p = path or (status_read_path("gateway-status.json", WORKSPACE_DIR))
+    p = path or _gateway_primary_sidecar()
     now = _time.time() if now is None else now
     try:
         last = json.loads(Path(p).read_text()).get("last_ok_ts")
@@ -6999,7 +7071,7 @@ def check_runtime_identity(path: "Path | None" = None,
     an UNREADABLE or MALFORMED one warns — the probe's own input being
     damaged must never render as a clean pass."""
     name = "runtime-identity"
-    p = path or (status_read_path("gateway-status.json", WORKSPACE_DIR))
+    p = path or _gateway_primary_sidecar()
     p = Path(p)
     if not p.exists():
         return {"name": name, "status": "ok",
@@ -7124,8 +7196,11 @@ def _gateway_lane_verdicts(state_dir: "Path | None" = None,
         entries = sorted(root.glob("gateway-status.*.json"))
     except OSError:
         return out
+    skip = _gateway_lanes_not_served(root)
     for f in entries:
         lane = f.name[len("gateway-status."):-len(".json")]
+        if lane in skip:
+            continue
         v = read_gateway_verdict(f, now=now, max_age=GATEWAY_STATUS_MAX_AGE_S)
         if v is None:
             continue
@@ -7150,8 +7225,11 @@ def _gateway_stale_lanes(state_dir: "Path | None" = None,
         entries = sorted(root.glob("gateway-status.*.json"))
     except OSError:
         return out
+    skip = _gateway_lanes_not_served(root)
     for f in entries:
         lane = f.name[len("gateway-status."):-len(".json")]
+        if lane in skip:
+            continue
         age = _gateway_status_stale_age_s(f, now=now)
         if age is not None:
             out.append((lane, age))
@@ -7180,7 +7258,10 @@ def _gateway_ok_unless_lane_stalled(detail: str, now: "float | None" = None) -> 
     stalled = _gateway_stale_lanes()
     if not stalled:
         return {"name": "gateway-bridge", "status": "ok", "detail": detail}
+    rows = _gateway_rows()
+
     def _aged(ln, age):
+        ln = _gateway_lane_label(ln, rows)
         return (f"{ln} (last write {age:.0f}s ago)" if age < 3600
                 else f"{ln} (last write {age / 3600:.1f}h ago)")
 
@@ -7243,7 +7324,7 @@ def _gateway_status_stale_age_s(path: "Path | None" = None,
     together with "sidecar stopped being written" — only the latter is a signal.
     """
     import time as _time
-    p = path or (status_read_path("gateway-status.json", WORKSPACE_DIR))
+    p = path or _gateway_primary_sidecar()
     now = _time.time() if now is None else now
     try:
         ts = json.loads(Path(p).read_text()).get("ts")
@@ -7263,7 +7344,7 @@ def _gateway_status_ts_malformed(path: "Path | None" = None) -> bool:
     Separate from the age helper because its caller reads None as healthy: a
     writer emitting garbage is an outage, and has no age to report.
     """
-    p = path or (status_read_path("gateway-status.json", WORKSPACE_DIR))
+    p = path or _gateway_primary_sidecar()
     try:
         raw = json.loads(Path(p).read_text()).get("ts")
     except (OSError, ValueError, AttributeError, TypeError):
@@ -7279,7 +7360,7 @@ def _gateway_serving(path: "Path | None" = None, now: "float | None" = None) -> 
     The sidecar verdict itself is owned by gateway_serving; only the freshness
     window is this reader's."""
     import time as _time
-    p = path or (status_read_path("gateway-status.json", WORKSPACE_DIR))
+    p = path or _gateway_primary_sidecar()
     now = _time.time() if now is None else now
     v = read_gateway_verdict(p, now=now, max_age=GATEWAY_STATUS_MAX_AGE_S)
     return None if v is None else v.serving
@@ -13386,6 +13467,7 @@ def run_all_checks() -> list[dict]:
     # branches are unit-tested in tests/health-check-gateway-bridge.test.py; this
     # call site is exercised by the running health check, not that unit test.)
     checks += [c for c in (check_gateway_bridge(),) if c is not None]  # pragma: no cover
+    checks += [c for c in (check_sspace_migration(),) if c is not None]  # pragma: no cover
 
     # (External plugin probes moved out with their plugins in #1427 round ④ —
     # a plugin manifest declares its own health_probe; the host checks host
@@ -13923,14 +14005,34 @@ def _gateway_owner_room(source: str = "ag2space") -> "str | None":
     a health alert can carry host/config/outage details that must never leak into
     a team room (qingyun #2487 P1-privacy). Requiring an explicit config entry
     makes the target owner-controlled and owner-only by construction; unset means
-    no gateway post at all (the Slack surface stays as the backup)."""
-    return (_env_file_dict(claude_home_path("channels", source, ".env")).get("REMOTE_ALERT_ROOM") or "").strip() or None
+    no gateway post at all (the Slack surface stays as the backup). The primary
+    connection's own channel dir is read first when the primary is a named row."""
+    for src in dict.fromkeys((_primary_channel_source(source), source)):
+        room = (_env_file_dict(claude_home_path("channels", src, ".env")).get("REMOTE_ALERT_ROOM") or "").strip()
+        if room:
+            return room
+    return None
 
 
-def _gateway_creds(source: str = "ag2space") -> "tuple[str, str] | None":
-    """(url, token) for the gateway op:message endpoint, or None. Supports the
-    one-token onboarding form (REMOTE_TASK_TOKEN='https://gw|secret') and the
-    legacy AG2_REMOTE_URL / AG2_REMOTE_TOKEN aliases honored by startup.sh."""
+def _primary_channel_source(source: str = "ag2space") -> str:
+    """The channel dir of the primary connection's bridge; `source` for the legacy row or none."""
+    import connections
+    row = connections.primary_row(WORKSPACE_DIR)
+    return connections.channel_dir_for(row["instance"]) if row and row.get("instance") else source
+
+
+def _gateway_creds(source: str = "ag2space", room: "str | None" = None) -> "tuple[str, str] | None":
+    """(url, token) for the gateway op:message endpoint, or None. With several connections,
+    the one serving `room`'s server (no room: the primary), and None when it has none. Else
+    the one-token form (REMOTE_TASK_TOKEN='https://gw|secret') or the legacy AG2_REMOTE_* aliases."""
+    import connections
+    try:
+        routed = connections.room_credential(room, workspace=WORKSPACE_DIR)
+    except connections.ConnectionsError:  # never answered with another server's token
+        return None
+    if routed is not None:
+        url, token = routed
+        return url.rstrip("/"), connections.secret_of(token) or token.strip()
     env = _env_file_dict(claude_home_path("channels", source, ".env"))
 
     def get(key: str) -> str:
@@ -13949,7 +14051,7 @@ def _default_gateway_sender(text: str) -> bool:
     the same transport notify.py uses (POST {url}/v1/room, op:message), so it
     reaches the owner even when the core is wedged. Returns True on a 2xx."""
     room = _gateway_owner_room()
-    creds = _gateway_creds()
+    creds = _gateway_creds(room=room) if room else None
     if not room or not creds:
         return False
     url, token = creds

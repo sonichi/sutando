@@ -395,13 +395,23 @@ class TestKeychainAuth(unittest.TestCase):
 
 
 class TestPrefs(unittest.TestCase):
-    def test_missing_file_reports_but_sends_no_logs(self):
-        # Absence is not consent: reporting still works, the excerpt does not.
+    def test_missing_file_files_nothing_automatically(self):
+        # Absence is not consent: no automatic report and no log excerpt.
         with tempfile.TemporaryDirectory() as td:
             self.assertEqual(
                 report_feedback.read_prefs(Path(td)),
-                {"autoReport": True, "sendLogs": False, "askFirst": False},
+                {"autoReport": False, "sendLogs": False, "askFirst": False},
             )
+
+    def test_only_an_explicit_true_enables_automatic_reports(self):
+        with tempfile.TemporaryDirectory() as td:
+            ws = Path(td)
+            (ws / "state").mkdir()
+            p = ws / "state" / "feedback-prefs.json"
+            p.write_text(json.dumps({"sendLogs": True}))
+            self.assertFalse(report_feedback.read_prefs(ws)["autoReport"])
+            p.write_text(json.dumps({"autoReport": True}))
+            self.assertTrue(report_feedback.read_prefs(ws)["autoReport"])
 
     def test_reads_written_values(self):
         with tempfile.TemporaryDirectory() as td:
@@ -421,11 +431,11 @@ class TestPrefs(unittest.TestCase):
             (ws / "state").mkdir()
             p = ws / "state" / "feedback-prefs.json"
             p.write_text("{not json")
-            self.assertEqual(report_feedback.read_prefs(ws), {"autoReport": True, "sendLogs": False, "askFirst": False})
+            self.assertEqual(report_feedback.read_prefs(ws), {"autoReport": False, "sendLogs": False, "askFirst": False})
             # Each key falls back to its OWN default, and an explicit True for
             # sendLogs must still be honoured or the opt-in is unusable.
             p.write_text(json.dumps({"autoReport": "no", "sendLogs": True}))
-            self.assertEqual(report_feedback.read_prefs(ws), {"autoReport": True, "sendLogs": True, "askFirst": False})
+            self.assertEqual(report_feedback.read_prefs(ws), {"autoReport": False, "sendLogs": True, "askFirst": False})
 
 
 class TestAskFirst(unittest.TestCase):
@@ -438,7 +448,8 @@ class TestAskFirst(unittest.TestCase):
     def _ws(self, td, prefs=None):
         ws = Path(td); (ws / "state").mkdir()
         if prefs is not None:
-            (ws / "state" / "feedback-prefs.json").write_text(json.dumps(prefs))
+            # Ask-first cases exercise automatic reporting, so they opt in explicitly.
+            (ws / "state" / "feedback-prefs.json").write_text(json.dumps({"autoReport": True, **prefs}))
         return ws
 
     def test_decide_skip_drops_the_draft_without_filing(self):
@@ -614,7 +625,7 @@ class TestAskFirst(unittest.TestCase):
 
     def test_a_failed_registration_keeps_the_draft_and_apply_retries_it(self):
         with tempfile.TemporaryDirectory() as td:
-            ws = self._ws(td)
+            ws = self._ws(td, {})
             with mock.patch.object(report_feedback, "resolve_workspace", return_value=ws), \
                     mock.patch.object(report_feedback, "register_ask", side_effect=OSError("store locked")), \
                     self.assertRaises(SystemExit) as cm:
@@ -1302,6 +1313,8 @@ class TestMain(unittest.TestCase):
     def test_auto_duplicate_exits_3_after_one_post(self):
         with tempfile.TemporaryDirectory() as td:
             ws = Path(td)
+            (ws / "state").mkdir()
+            (ws / "state" / "feedback-prefs.json").write_text(json.dumps({"autoReport": True}))
             with mock.patch.object(report_feedback, "resolve_workspace", return_value=ws), \
                     mock.patch.object(report_feedback, "read_cloud_auth", return_value=("https://x", "tok")), \
                     mock.patch.object(report_feedback.urllib.request, "urlopen", return_value=_FakeResp()) as uo:
@@ -1329,6 +1342,8 @@ class TestMain(unittest.TestCase):
     def test_auto_report_is_flagged_in_context(self):
         with tempfile.TemporaryDirectory() as td:
             ws = Path(td)
+            (ws / "state").mkdir()
+            (ws / "state" / "feedback-prefs.json").write_text(json.dumps({"autoReport": True}))
             with mock.patch.object(report_feedback, "resolve_workspace", return_value=ws), \
                     mock.patch.object(report_feedback, "read_cloud_auth", return_value=("https://x", "tok")), \
                     mock.patch.object(report_feedback.urllib.request, "urlopen", return_value=_FakeResp()) as uo:

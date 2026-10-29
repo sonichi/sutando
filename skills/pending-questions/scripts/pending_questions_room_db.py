@@ -5,8 +5,9 @@ core reaches through the manifest's `pending_questions_store` declaration.
 `room_store(workspace)` is the discovery, kept at this edge: the room capability (the
 `room-commons` skill, else its `room-collab` alias, in the workspace's skills then the
 repo's) and the owner's DM room and agent identity from the gateway's own reading
-(`state/owner-routing.json`, an `AG2SPACE_USER_ID` / `AG2_MATRIX_USER_ID` identity
-winning). It returns a pending_questions_store.RoomDbStore whose client runs this
+(the primary connection's `state/owner-routing[.<instance>].json`, an `AG2SPACE_USER_ID` /
+`AG2_MATRIX_USER_ID` identity winning); `serve` acts through the connection serving the room's
+server. It returns a pending_questions_store.RoomDbStore whose client runs this
 file's `serve`, or None and the reason when anything is missing.
 
 `gather(workspace)` is READ-ONLY — it writes no file, not even the history marker — and
@@ -585,7 +586,7 @@ def _load_capability(scripts: str):
 async def _serve(args, req: dict) -> object:
     cap = _load_capability(args.skill_scripts)
     from room_collab_client import open_room_collab  # noqa: PLC0415
-    url, token = _credentials(cap, args.collab_url or None)
+    url, token = _credentials(cap, args.collab_url or None, args.room)
     link = db_link(url, args.room, req["schema"]["id"])
     async with open_room_collab(url, args.room, token, kind="db") as doc:
         result = await apply(doc, req, args.user_id, int(time.time() * 1000), link)

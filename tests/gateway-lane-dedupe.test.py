@@ -13,7 +13,10 @@ Covers src/lane_dedupe.py and the gateway bridge's delegation to it:
      the key (fails with a deferred BEGIN);
   7. only same-tier copies are collapsed: lanes that disagree on the attested tier both
      deliver, with one WARNING naming both lanes and tiers;
-  8. the loader installs the gate for a connection lane and never for a seat.
+  8. the loader installs the gate for a connection lane and never for a seat;
+  9. owner lanes (connections.event_owner_lanes): another lane waits for the owner's claim and
+     settles as its duplicate, the owner answers at once, and a claim that never comes is answered
+     by the waiting lane after the wait; an unreadable owner read keeps the first-come guard.
 
 Run: python3 tests/gateway-lane-dedupe.test.py   (exit 0 pass / 1 fail)
 """
@@ -143,6 +146,9 @@ def main():
     check("a live claim blocks another lane", _holder(ttl_dir, key, "b", now=1059.0, ttl=60) == "a")
     check("an expired claim does not", _holder(ttl_dir, key, "b", now=1061.0, ttl=60) is None)
     check("the new claim now holds the key", _holder(ttl_dir, key, "a", now=1062.0, ttl=60) == "b")
+    check("holder_of is None without a store", lane_dedupe.holder_of(tmp / "absent", key) is None)
+    check("holder_of names the live claimant", lane_dedupe.holder_of(ttl_dir, key, now=1062.5, ttl=60) == "b")
+    check("holder_of is None for an unclaimed key", lane_dedupe.holder_of(ttl_dir, "nobody", now=1062.5, ttl=60) is None)
     con = sqlite3.connect(str(ttl_dir / lane_dedupe.STORE_NAME))
     _holder(ttl_dir, "other", "a", now=1000.0, ttl=60)
     _holder(ttl_dir, "fresh", "a", now=5000.0, ttl=60)
@@ -240,6 +246,87 @@ def main():
     env["GATEWAY_INSTANCE"] = "0" * 32
     proc = subprocess.run([sys.executable, "-c", probe], env=env, capture_output=True, text=True, timeout=120)
     check("a seat bridge has no lane dedupe gate", "GATE True" in proc.stdout, proc.stdout + proc.stderr)
+
+    # 9. Owner lanes decide which lane answers a message both lanes receive.
+    import threading
+    import connections
+    real_owner = connections.event_owner_lanes
+    owners = {"lanes": []}
+    connections.event_owner_lanes = lambda task, ws=None: list(owners["lanes"])
+    lane_dedupe.OWNER_WAIT_S, real_wait = 2.0, lane_dedupe.OWNER_WAIT_S
+    try:
+        def owner_claims(lane, mid, delay=0.3):
+            event = lane_dedupe.key_of({"source_message_id": mid, **room})
+            t = threading.Timer(delay, lambda: lane_dedupe.claim_key(rgb.WS / "state", event, lane, "owner"))
+            t.start()
+            return t
+
+        owners["lanes"] = ["s_space"]
+        logs.clear()
+        t = owner_claims("s_space", "$own1")
+        on_lane("", "task-O1", source_message_id="$own1", access_tier="owner", **room)
+        t.join()
+        on_lane("s_space", "task-O2", source_message_id="$own1", access_tier="owner", **room)
+        check("the primary owns an unaddressed message the legacy lane saw first",
+              not (rgb.TASKS_DIR / "task-O1.txt").exists() and (rgb.TASKS_DIR / "task-s_space~task-O2.txt").exists())
+        check("the legacy lane says whose it is", any("is lane s_space's to answer" in m for m in logs), repr(logs))
+
+        owners["lanes"] = [""]
+        t = owner_claims("", "$own2")
+        on_lane("s_space", "task-O3", source_message_id="$own2", access_tier="owner", **room)
+        t.join()
+        on_lane("", "task-O4", source_message_id="$own2", access_tier="owner", **room)
+        check("a mention of the legacy mxid is answered by the legacy lane only",
+              not (rgb.TASKS_DIR / "task-s_space~task-O3.txt").exists() and (rgb.TASKS_DIR / "task-O4.txt").exists())
+
+        owners["lanes"] = ["s_space"]
+        on_lane("s_space", "task-O5", source_message_id="$own3", access_tier="owner", **room)
+        on_lane("", "task-O6", source_message_id="$own3", access_tier="owner", **room)
+        check("the owner first: the other lane settles at once",
+              (rgb.TASKS_DIR / "task-s_space~task-O5.txt").exists() and not (rgb.TASKS_DIR / "task-O6.txt").exists())
+
+        lane_dedupe.OWNER_WAIT_S = 0.3
+        on_lane("", "task-O7", source_message_id="$own4", access_tier="owner", **room)
+        on_lane("s_space", "task-O8", source_message_id="$own4", access_tier="owner", **room)
+        check("an owner that never claims: the waiting lane answers once",
+              (rgb.TASKS_DIR / "task-O7.txt").exists() and not (rgb.TASKS_DIR / "task-s_space~task-O8.txt").exists())
+
+        def broken(task, ws=None):
+            raise RuntimeError("record exploded")
+        connections.event_owner_lanes = broken
+        logs.clear()
+        on_lane("", "task-O9", source_message_id="$own5", access_tier="owner", **room)
+        on_lane("s_space", "task-O10", source_message_id="$own5", access_tier="owner", **room)
+        check("an unreadable owner read keeps the first-come guard",
+              (rgb.TASKS_DIR / "task-O9.txt").exists() and not (rgb.TASKS_DIR / "task-s_space~task-O10.txt").exists()
+              and any("owner lanes unreadable" in m for m in logs), repr(logs))
+
+        # 10. A message waiting on a down owner lane delays no sibling's ack, and a round waits once.
+        import time
+        owners_by_msg = {"$w1": ["s_space"], "$w2": ["s_space"], "$w3": []}
+        connections.event_owner_lanes = lambda task, ws=None: list(owners_by_msg[task["source_message_id"]])
+        rgb._INTAKE_ROUND_WAIT_S = 0.6
+        acks, real_post = [], rgb._post_task_ack
+        t0 = time.monotonic()
+        rgb._post_task_ack = lambda tid, durable, lease, dropped=None: acks.append((tid, time.monotonic() - t0)) or True
+        rgb.GATEWAY_INSTANCE = ""
+        try:
+            batch = [{"id": f"task-W{n}", "task": "hello", "source_message_id": f"$w{n}",
+                      "access_tier": "owner", **room} for n in (1, 2, 3)]
+            fates = {rgb._served_key(t): None for t in batch}
+            rgb._take_served_round(batch, set(), [], fates, [])
+        finally:
+            rgb.GATEWAY_INSTANCE = ""
+            rgb._post_task_ack = real_post
+        at = dict(acks)
+        check("the sibling with no owner wait is acked before any waited message",
+              at.get("task-W3", 9) < 0.3, repr(acks))
+        check("the waited messages are still answered once the wait ends",
+              {"task-W1", "task-W2"} <= set(at) and at["task-W1"] >= 0.5, repr(acks))
+        check("a round waits once, not once per message", at.get("task-W2", 9) < 0.9, repr(acks))
+    finally:
+        connections.event_owner_lanes = real_owner
+        lane_dedupe.OWNER_WAIT_S = real_wait
 
     print(f"\n{'FAIL' if failures else 'PASS'}: {len(failures)} failure(s)")
     return 1 if failures else 0

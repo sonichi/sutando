@@ -1259,7 +1259,7 @@ class ConnectCode(AgentRootBase):
     def test_a_used_or_expired_code_says_make_a_new_one_and_writes_nothing(self):
         rc, _out, err = self.connect(Backend(404))
         self.assertEqual(rc, cli.EXIT_UNUSABLE)
-        self.assertIn("already used or has expired; make a new one in AG2 Space", err)
+        self.assertIn("already used or has expired; make a new one in s.space", err)
         self.assertFalse(self.seat().exists())
         self.assertFalse(cli.config_path().exists())
 
@@ -1339,7 +1339,7 @@ class ConnectCode(AgentRootBase):
 
     def test_a_404_names_why_the_code_is_gone(self):
         for body, why in (({"error": "gone"}, "already used or has expired; make a new one"),
-                          ({"error": "agent_revoked"}, "the agent was removed in AG2 Space; add it again"),
+                          ({"error": "agent_revoked"}, "the agent was removed in s.space; add it again"),
                           ({}, "already used or has expired")):
             with self.subTest(body=body):
                 rc, _out, err = self.connect(Backend((404, body)))
@@ -1435,7 +1435,7 @@ class RedeemEdges(unittest.TestCase):
         self.assertIn("already used or has expired", cm.redeem_code(BASE, CODE, opener=gone)[1])
         teapot = lambda req, timeout=None: (_ for _ in ()).throw(
             urllib.error.HTTPError(req.full_url, 418, "x", {}, io.BytesIO(b"")))
-        self.assertEqual(cm.redeem_code(BASE, CODE, opener=teapot)[1], "AG2 Space refused the code (HTTP 418)")
+        self.assertEqual(cm.redeem_code(BASE, CODE, opener=teapot)[1], "s.space refused the code (HTTP 418)")
 
     def test_a_relay_must_be_on_the_bases_host_or_under_it_never_a_sibling_under_a_public_suffix(self):
         ok = (("https://api.example.co.uk/api", "https://api.example.co.uk/relay"),

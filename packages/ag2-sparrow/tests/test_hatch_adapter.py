@@ -1559,6 +1559,18 @@ class Service(Base):
         # UnsetEnvironment= applies after Environment=, so the saved identity is never also unset.
         self.assertNotRegex(unit, r"UnsetEnvironment=.*AGENT_MXID")
 
+    def test_a_new_mxid_restarts_the_running_unit_under_the_new_identity(self):
+        fake = FakeSystemd()
+        r = self.with_systemd(fake, "install", "--mxid", StartSparrow.OTHER, env={"USER": "hatch"})
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        fake.calls.clear()
+        r = self.with_systemd(fake, "install", "--mxid", AGENT, env={"USER": "hatch"})
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn(f"\nEnvironment=AGENT_MXID={AGENT}\n", self.unit.read_text())
+        self.assertEqual(len(fake.ran("stop")), 1, fake.calls)
+        self.assertEqual(fake.ran("enable"), [["--user", "enable", "--now", "ag2-sparrow.service"]])
+        self.assertEqual(fake.state, "active")
+
     def test_a_number_its_consumer_cannot_take_stops_reloads_and_starts_nothing(self):
         # The exact answer: an active unit, a 5,000-digit MainPID and a start timestamp.
         for name, change in [("5000-digit pid", {"MainPID": "7" * 5000})] + list(StartSparrow.OVERSIZED.items()):
@@ -2318,7 +2330,7 @@ class Keepalive(Base):
                          (True, "abnormal", "task-not-picked-up"))
         self.assertAlmostEqual(row["since"], old + keepalive.TASK_PICKUP_S, delta=1)
         self.assertEqual(hc.validate(row), (row, None))
-        self.assertIn("health=abnormal (task-not-picked-up); an AG2 Space task has been open "
+        self.assertIn("health=abnormal (task-not-picked-up); an s.space task has been open "
                       "over 15 minutes", self.cli("verify").stdout)
 
     def test_a_deliberately_held_task_reports_held_not_stuck(self):
@@ -3990,6 +4002,139 @@ class StartSparrow(Base):
             rc = REAL_ENSURE_SPARROW(hatch_cli._installed_config(), True)
         self.out, self.err = out.getvalue(), err.getvalue()
         return rc
+
+    # The id an earlier install set this agent up as, on another server.
+    OTHER = "@watch-agent:other.example"
+
+    def relay_env(self, age_s=0):
+        """The relay token file, last written `age_s` ago."""
+        relay = self.home / ".config" / "ag2-sparrow" / "relay.env"
+        relay.parent.mkdir(parents=True, exist_ok=True)
+        relay.write_text("REMOTE_TASK_TOKEN=x\n")
+        os.utime(relay, (time.time() - age_s,) * 2)
+        return relay
+
+    def healthy(self):
+        return mock.patch.object(keepalive, "sparrow_env", return_value={
+            "REMOTE_HEALTH_COMMAND": keepalive.health_command(str(self.reply_stub))})
+
+    def test_install_replaces_a_sparrow_that_serves_another_id(self):
+        old = self.old_sparrow()
+        self.lane_of(old, agent_id=self.OTHER, send_lock=delivery_destination.SEND_LOCK_PROTOCOL)
+        self.relay_env(age_s=60)
+        with self.healthy():
+            r = self.install()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn(f"replacing: Sparrow (pid {old.pid}) serves {self.OTHER}, not {AGENT}, the "
+                      "AGENT_MXID install saved", r.stdout)
+        self.assertEqual(old.wait(5), -signal.SIGTERM)
+        self.assertEqual(self.wait_for(self.seen), f"{self.reply_stub} keepalive health")
+        self.assertIn("sparrow: running and connected", r.stdout)
+
+    def test_install_replaces_a_sparrow_started_before_the_token_file_changed(self):
+        old = self.old_sparrow()  # started 5 s ago
+        self.lane_of(old, send_lock=delivery_destination.SEND_LOCK_PROTOCOL)
+        relay = self.relay_env()
+        with self.healthy():
+            r = self.install()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn(f"replacing: Sparrow (pid {old.pid}) started before {relay} changed", r.stdout)
+        self.assertEqual(old.wait(5), -signal.SIGTERM)
+        self.assertEqual(self.wait_for(self.seen), f"{self.reply_stub} keepalive health")
+
+    def test_install_leaves_a_sparrow_that_serves_the_saved_id_and_the_current_token(self):
+        old = self.old_sparrow()
+        self.lane_of(old, send_lock=delivery_destination.SEND_LOCK_PROTOCOL)
+        self.relay_env(age_s=60)
+        with self.healthy():
+            r = self.install()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn("replacing:", r.stdout)
+        self.assertIsNone(old.poll())
+        self.assertFalse(self.seen.exists())
+
+    def test_install_fails_when_a_sparrow_that_serves_another_id_cannot_be_stopped(self):
+        old = self.old_sparrow()
+        self.lane_of(old, agent_id=self.OTHER, send_lock=delivery_destination.SEND_LOCK_PROTOCOL)
+        with self.healthy(), mock.patch.object(keepalive, "stop_holder", return_value=False):
+            r = self.install()
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn(f"error: Sparrow was not replaced: the old Sparrow (pid {old.pid}) did not stop. "
+                      f"Stop it with: kill -TERM {old.pid} ; then run ag2-sparrow-hatch install again",
+                      r.stderr)
+        self.assertIsNone(old.poll())
+
+    def test_install_without_a_pidfd_names_the_stop_command_and_signals_nothing(self):
+        old = self.old_sparrow()
+        self.lane_of(old, agent_id=self.OTHER, send_lock=delivery_destination.SEND_LOCK_PROTOCOL)
+        with self.healthy(), mock.patch.object(keepalive, "_pidfd_open", return_value=None):
+            r = self.install()
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("on this platform (no pidfd); it was not signalled", r.stderr)
+        self.assertIn(f"Stop it with: kill -TERM {old.pid} ; then run ag2-sparrow-hatch install again",
+                      r.stderr)
+        self.assertIsNone(old.poll(), "a bare pid is never signalled")
+
+    def test_install_reads_the_stale_reason_once_and_says_that_reason(self):
+        old = self.old_sparrow()
+        self.lane_of(old, agent_id=self.OTHER, send_lock=delivery_destination.SEND_LOCK_PROTOCOL)
+        # A second read would see a drain that already moved: None, and the health wording.
+        reasons = iter([f"serves {self.OTHER}, not {AGENT}, the AGENT_MXID install saved", None])
+        with self.healthy(), mock.patch.object(keepalive, "stale_listener",
+                                               side_effect=lambda cfg, pid: next(reasons)) as read:
+            r = self.install()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(read.call_count, 1)
+        self.assertIn(f"replacing: Sparrow (pid {old.pid}) serves {self.OTHER}", r.stdout)
+        self.assertNotIn("runs without REMOTE_HEALTH_COMMAND", r.stdout)
+
+    def test_install_restarts_the_active_unit_when_its_sparrow_is_stale(self):
+        for agent, age, why in ((self.OTHER, 60, f"serves {self.OTHER}, not {AGENT}"),
+                                (AGENT, 0, "started before ")):
+            with self.subTest(why=why):
+                old = self.old_sparrow()
+                self.old_pid = old.pid
+                self.lane_of(old, agent_id=agent, send_lock=delivery_destination.SEND_LOCK_PROTOCOL)
+                fake = FakeSystemd(state="active", main_pid=old.pid, ran=True)
+
+                def restarted(cmd):
+                    self.status(-1)
+                    return fake(cmd)
+                with self.service(fake, on_restart=restarted):
+                    self.relay_env(age_s=age)
+                    r = self.call_ensure()
+                self.assertEqual(r, 0, self.out + self.err)
+                self.assertIn(f"replacing: Sparrow (pid {old.pid}) {why}", self.out)
+                self.assertEqual(fake.ran("restart"), [["--user", "restart", "ag2-sparrow.service"]])
+                old.kill()
+                old.wait(5)
+
+    def test_install_leaves_the_active_unit_whose_sparrow_is_current(self):
+        old = self.old_sparrow()
+        self.old_pid = old.pid
+        self.lane_of(old, send_lock=delivery_destination.SEND_LOCK_PROTOCOL)
+        fake = FakeSystemd(state="active", main_pid=old.pid, ran=True)
+        with self.service(fake):
+            self.relay_env(age_s=60)
+            r = self.call_ensure()
+        self.assertEqual(r, 0, self.out + self.err)
+        self.assertNotIn("replacing:", self.out)
+        self.assertEqual(fake.ran("restart"), [])
+        self.assertIsNone(old.poll())
+
+    def test_verify_fails_when_the_running_drain_serves_another_id(self):
+        old = self.old_sparrow()
+        self.lane_of(old, agent_id=self.OTHER)
+        self.cli("install", "--mxid", AGENT, "--no-service")
+        r = self.cli("verify")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn(f"\nFAIL identity: the running Sparrow (pid {old.pid}) serves {self.OTHER}, not "
+                      f"{AGENT} as the config says; run ag2-sparrow-hatch install again to replace it\n",
+                      r.stdout)
+        self.lane_of(old)
+        r = self.cli("verify")
+        self.assertNotIn("identity:", r.stdout)
+        self.assertIsNone(old.poll(), "verify only observes")
 
     def test_install_fails_loudly_when_sparrow_does_not_connect(self):
         executable(self.bin / hatch_cli.SPARROW_COMMAND,

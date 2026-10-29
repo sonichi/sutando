@@ -53,9 +53,9 @@ RETIRED_CLOUD_ORIGINS = cloud_auth.RETIRED_CLOUD_ORIGINS
 SIGNED_OUT_SENTINEL = cloud_auth.SIGNED_OUT_SENTINEL
 
 # Owner prefs written by the desktop Settings UI (host is the single writer).
-# autoReport defaults ON; sendLogs defaults OFF. The log excerpt is the part
-# that carries incidental owner data, so it is opt-in rather than opt-out.
-PREFS_DEFAULTS = {"autoReport": True, "sendLogs": False, "askFirst": False}
+# Both default OFF: an automatic report leaves the machine, so absence of the
+# file or key is not consent. Only an explicit true from the Settings toggle files.
+PREFS_DEFAULTS = {"autoReport": False, "sendLogs": False, "askFirst": False}
 # Ask-first: an automatic report is parked as a draft and the owner gets a card
 # (File / File without logs / Skip) instead of a filing; the reply files or drops it.
 DRAFTS_DIR = "feedback-drafts"
@@ -292,13 +292,12 @@ def read_prefs(ws: Path) -> dict:
 
     Written by the desktop Settings toggles ("File automatic bug reports",
     "Send logs with bug reports"). Missing file, missing key, or a non-bool
-    value all read as PREFS_DEFAULTS: autoReport ON, sendLogs OFF.
+    value all read as PREFS_DEFAULTS: autoReport OFF, sendLogs OFF.
 
-    The two defaults differ on purpose. Absence of the file must never disable
-    REPORTING on installs that predate the toggles. But absence is not consent
-    either, and the log excerpt is the part that carries incidental owner data
-    (paths with usernames, hostnames, workspace content), so it is opt-in: an
-    owner who has never opened Settings ships no logs.
+    Absence is not consent. An automatic report sends the owner's error context
+    to the cloud, and the log excerpt adds incidental owner data (paths with
+    usernames, hostnames, workspace content), so both are opt-in: an owner who
+    has never turned the toggles on files nothing automatically.
     """
     prefs = dict(PREFS_DEFAULTS)
     try:
@@ -306,7 +305,6 @@ def read_prefs(ws: Path) -> dict:
         for k in prefs:
             if isinstance(d.get(k), bool):
                 prefs[k] = d[k]
-        # The room the ask-first card goes to (the owner's DM); a string, unlike the switches.
     except Exception:
         pass
     return prefs
