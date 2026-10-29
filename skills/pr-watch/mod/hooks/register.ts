@@ -36,10 +36,30 @@ export class Dedupe {
   }
 }
 
-export function promptFor(template: unknown, line: string): string {
+/** One message for any number of event lines, built from the config's template. */
+export function messageFor(template: unknown, lines: readonly string[]): string {
   const t = typeof template === 'string' && template.trim() ? template : DEFAULT_PROMPT
-  return t.includes('{event}') ? t.split('{event}').join(line) : `[pr-watch] ${line}\n${t}`
+  const event = lines.join('\n')
+  return t.includes('{event}') ? t.split('{event}').join(event) : `[pr-watch] ${event}\n${t}`
 }
+
+/** The message for the waiting lines, or null when none wait; the caller clears them once delivered. */
+export function takeEvents(waiting: readonly string[], template: unknown): string | null {
+  return waiting.length ? messageFor(template, waiting) : null
+}
+
+type CallResult = { deny?: unknown; context?: readonly string[]; [key: string]: unknown }
+
+/** `r` with `text` appended to what the model reads after the tool, or null when `r` is a deny. */
+export function withContext<R extends CallResult>(r: R, text: string): R | null {
+  if (typeof r.deny === 'string') return null
+  return { ...r, context: [...(r.context ?? []), text] }
+}
+
+// Module state: a reload starts these over, and session.start respawns the runner that fills them.
+let pending: string[] = []
+let turnRunning = false
+let template: unknown
 
 export const register: Register = (on) => {
   on('session.start', async ($, e, next) => {
@@ -63,13 +83,16 @@ export const register: Register = (on) => {
           for (const n of notes) $.ui.log(`pr-watch: ${n}`)
           for (const line of events) {
             if (!dedupe.fresh(line, await $.clock.now())) continue
-            let template: unknown
             try {
               template = JSON.parse(await $.fs.read(`${STATE_DIR}/config.json`)).prompt
             } catch {
               template = undefined
             }
-            void $.prompt.submit({ text: promptFor(template, line) })
+            pending.push(line)
+            if (turnRunning) continue
+            const text = takeEvents(pending, template)
+            pending = []
+            if (text) void $.prompt.submit({ text })
           }
         }
         $.ui.log(`pr-watch: runner exited (${end?.code ?? 'signal'})`, { to: 'debug' })
@@ -79,4 +102,29 @@ export const register: Register = (on) => {
     })()
     return started
   })
+
+  on('turn.start', async ($, e, next) => {
+    turnRunning = true
+    return next(e)
+  })
+
+  on('turn.complete', async ($, e, next) => {
+    const done = await next(e)
+    turnRunning = false
+    const text = takeEvents(pending, template)
+    pending = []
+    if (text) void $.prompt.submit({ text })
+    return done
+  })
+
+  // A prompt submitted mid-turn waits for idle, so events ride on the main loop's next tool result instead.
+  on('tool.call', async ($, e, next) => {
+    const r = await next(e)
+    if (e.agentId || !pending.length) return r
+    const text = takeEvents(pending, template)
+    const out = text ? withContext(r, text) : null
+    if (!out) return r
+    pending = []
+    return out
+  }).catch(($, e, next) => (next.called ? next(e) : { deny: 'pr-watch: hook failed before running the tool' }))
 }

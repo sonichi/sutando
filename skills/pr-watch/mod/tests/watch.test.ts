@@ -1,5 +1,5 @@
 import { test, expect } from 'claude-code/testing'
-import { Dedupe, DEFAULT_PROMPT, promptFor, takeLines } from '../hooks/register'
+import { Dedupe, DEFAULT_PROMPT, messageFor, takeEvents, takeLines, withContext } from '../hooks/register'
 
 test('only complete event lines are taken; the partial tail is carried', () => {
   const r = takeLines('noise\nPR_EVENT a/b#1 closed author=x head=abc merged=true\nPR_EVENT a/b#2 synch')
@@ -30,7 +30,23 @@ test('a repeated line inside the window is dropped, and passes again after it', 
 })
 
 test('the prompt template fills {event}, and falls back to the default', () => {
-  expect(promptFor('see {event} now', 'PR_EVENT a/b#1 opened')).toBe('see PR_EVENT a/b#1 opened now')
-  expect(promptFor(undefined, 'PR_EVENT x')).toBe(DEFAULT_PROMPT.replace('{event}', 'PR_EVENT x'))
-  expect(promptFor('no placeholder', 'PR_EVENT x')).toBe('[pr-watch] PR_EVENT x\nno placeholder')
+  expect(messageFor('see {event} now', ['PR_EVENT a/b#1 opened'])).toBe('see PR_EVENT a/b#1 opened now')
+  expect(messageFor(undefined, ['PR_EVENT x'])).toBe(DEFAULT_PROMPT.replace('{event}', 'PR_EVENT x'))
+  expect(messageFor('no placeholder', ['PR_EVENT x'])).toBe('[pr-watch] PR_EVENT x\nno placeholder')
+})
+
+test('events that waited are joined into one message', () => {
+  expect(takeEvents([], 'x {event}')).toBe(null)
+  expect(takeEvents(['PR_EVENT a/b#1 closed', 'PR_EVENT a/b#2 synchronize'], 'see:\n{event}\nend'))
+    .toBe('see:\nPR_EVENT a/b#1 closed\nPR_EVENT a/b#2 synchronize\nend')
+})
+
+test('the message rides after the tool result, keeping context already there', () => {
+  expect(withContext({ result: 'ok' }, 'ev')).toEqual({ result: 'ok', context: ['ev'] })
+  expect(withContext({ result: 'ok', context: ['first'] }, 'ev')).toEqual({ result: 'ok', context: ['first', 'ev'] })
+})
+
+test('a denied call carries nothing, so the events wait for the next one', () => {
+  expect(withContext({ deny: 'no' }, 'ev')).toBe(null)
+  expect(withContext({ deny: undefined, result: 1 }, 'ev')).toEqual({ deny: undefined, result: 1, context: ['ev'] })
 })
