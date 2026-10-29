@@ -42,6 +42,8 @@
   import-env                   rows once for REMOTE_TASK_TOKEN and each AG2_REMOTE_TOKEN_<INST>
   launch-plan                  one 'instance<TAB>token_ref<TAB>channel_dir<TAB>primary' line per bridge
   primary                      the primary row's instance ('' = the legacy bridge); exit 2 when none
+  enabled                      each row a bridge serves (neither disabled nor parked), one instance per
+                               line ('' = the legacy bridge); exit 1 when there is none
 
 Each verb parses, calls one unit and prints; policy lives in the module.
 """
@@ -240,6 +242,13 @@ def cmd_primary(args) -> int:
     return 0
 
 
+def cmd_enabled(args) -> int:
+    rows = connections.enabled_rows(args.workspace)
+    for r in rows:
+        print(r["instance"])
+    return 0 if rows else 1
+
+
 def cmd_launch_plan(args) -> int:
     for e in connections.launch_plan(os.environ, workspace=args.workspace):
         print(f"{e['instance']}\t{e['token_ref']}\t{e['channel_dir']}\t{1 if e['primary'] else 0}")
@@ -287,6 +296,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("import-env").set_defaults(fn=cmd_import_env)
     sub.add_parser("launch-plan").set_defaults(fn=cmd_launch_plan)
     sub.add_parser("primary").set_defaults(fn=cmd_primary)
+    sub.add_parser("enabled").set_defaults(fn=cmd_enabled)
     return p
 
 

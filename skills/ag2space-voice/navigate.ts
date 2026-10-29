@@ -1,8 +1,10 @@
 // navigate_ui: the voice agent asks the attached AG2 Space client to open the DM, a
 // room or home, and waits for its `ui.navigated` reply. The client resolves room names.
 
+import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
 import {
@@ -15,6 +17,8 @@ import {
 	type UiNavigateTarget,
 } from './navigate-protocol.js';
 import { claudeHomePath } from '../../src/util_paths.js';
+import { resolvePython } from '../../src/python-binary.js';
+import { resolveWorkspace } from '../../src/workspace_default.js';
 
 /** How long the tool waits for the client's `ui.navigated` before giving up. */
 export const NAVIGATE_UI_TIMEOUT_MS = 6000;
@@ -34,16 +38,35 @@ export const NAVIGATE_UI_ROOM_QUERY_MISSING_MESSAGE =
 
 const _GATEWAY_TOKEN_KEYS = ['REMOTE_TASK_TOKEN', 'AG2_REMOTE_TOKEN'];
 
-/** Whether this install has the ag2space gateway channel provisioned: the only
- *  client that answers `ui.navigate`. Same detection as runtime-health.py. */
-export function navigateUiAvailable(env: NodeJS.ProcessEnv = process.env): boolean {
+const CONNECTIONS_CLI = fileURLToPath(new URL('../../scripts/connections.py', import.meta.url));
+
+/** Whether the connections record has a row a bridge serves, asked of its owner
+ *  (`connections.py enabled`) so the rule is not copied here. False when it cannot answer. */
+export function enabledConnectionExists(workspace: string = resolveWorkspace()): boolean {
+	const py = resolvePython();
+	if (!py) return false;
+	const r = spawnSync(py, [CONNECTIONS_CLI, '--workspace', workspace, 'enabled'], { timeout: 5000, stdio: 'ignore' });
+	return r.status === 0;
+}
+
+let _connectionProbe: () => boolean = () => enabledConnectionExists();
+
+/** Replace (or, with null, restore) the connections probe; tests keep the host's record out. */
+export function setConnectionProbe(probe: (() => boolean) | null): void {
+	_connectionProbe = probe ?? (() => enabledConnectionExists());
+}
+
+/** Whether this install has a gateway provisioned (an enabled connection, or the
+ *  legacy relay token): the only client that answers `ui.navigate`. Same detection as runtime-health.py. */
+export function navigateUiAvailable(env: NodeJS.ProcessEnv = process.env, hasConnection: () => boolean = _connectionProbe): boolean {
 	if (_GATEWAY_TOKEN_KEYS.some(k => env[k])) return true;
 	try {
 		const lines = readFileSync(claudeHomePath('channels', 'ag2space', '.env'), 'utf-8').split('\n');
-		return lines.some(l => _GATEWAY_TOKEN_KEYS.some(k => l.startsWith(`${k}=`) && l.length > k.length + 1));
+		if (lines.some(l => _GATEWAY_TOKEN_KEYS.some(k => l.startsWith(`${k}=`) && l.length > k.length + 1))) return true;
 	} catch {
-		return false;
+		// no legacy channel file: the connections record decides
 	}
+	return hasConnection();
 }
 
 export interface VoiceNavigateClient {

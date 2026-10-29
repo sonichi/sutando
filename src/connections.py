@@ -1159,6 +1159,27 @@ def primary_instance(workspace: Optional[Path] = None) -> Optional[str]:
     return None
 
 
+def read_rows(workspace: Optional[Path] = None) -> list:
+    """Every row as stored, read only: unlike `list_connections` it never imports from the
+    environment. [] when the record is missing or unreadable."""
+    try:
+        return _read(record_path(workspace))
+    except (SchemaError, OSError):
+        return []
+
+
+def primary_server(workspace: Optional[Path] = None) -> str:
+    """The primary row's homeserver, "" when there is none: the install's default server, which a
+    caller passes to `dotspace` instead of naming one."""
+    row = primary_row(workspace)
+    return row["server"] if row else ""
+
+
+def enabled_rows(workspace: Optional[Path] = None) -> list:
+    """The rows a bridge serves (neither disabled nor parked), read only."""
+    return [r for r in read_rows(workspace) if not r.get("disabled") and not r.get("parked")]
+
+
 def no_primary(workspace: Optional[Path] = None) -> bool:
     """Whether the record has rows but none is primary: then no bridge owns unaddressed proactive
     messages or the owner's cards. Read only; an unreadable or missing record is False."""
@@ -1782,10 +1803,24 @@ def _read_json(path: Path) -> dict:
     return payload if isinstance(payload, dict) else {}
 
 
+def sidecar_name(instance: str) -> str:
+    """The status file a bridge running as `instance` writes under `state/`."""
+    return f"gateway-status{'.' + instance if instance else ''}.json"
+
+
+def primary_sidecar_name(state_dir: Path) -> str:
+    """The primary row's sidecar name, read from the record under `state_dir`; the unsuffixed
+    name when no row is primary or the record is unreadable."""
+    try:
+        rows = _read(Path(state_dir) / STATE_NAME)
+    except (SchemaError, OSError):
+        rows = []
+    return sidecar_name(next((r["instance"] for r in rows if r["primary"]), ""))
+
+
 def _sidecar(instance: str, workspace: Optional[Path]) -> dict:
     from workspace_default import status_read_path
-    name = f"gateway-status{'.' + instance if instance else ''}.json"
-    return _read_json(status_read_path(name, _workspace(workspace)))
+    return _read_json(status_read_path(sidecar_name(instance), _workspace(workspace)))
 
 
 def derive_state(sidecar: Mapping[str, object], launch: Mapping[str, object],

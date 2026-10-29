@@ -67,11 +67,16 @@ STATUS_PATH = STATE_DIR / "services-status.json"
 # Liveness window shared with the .alive heartbeat: a signal older than this is
 # treated as "the thing that writes it is gone", i.e. offline.
 ALIVE_TTL_S = 90.0
-# The gateway bridge rewrites state/gateway-status.json on EVERY poll outcome,
+# The gateway bridge rewrites its state/gateway-status sidecar on EVERY poll outcome,
 # so a sidecar older than this means the bridge is wedged or predates the
 # sidecar — either way it has no usable opinion and pgrep answers instead.
-GATEWAY_STATUS_PATH = STATE_DIR / "gateway-status.json"
 GATEWAY_STATUS_TTL_S = 180.0
+
+
+def gateway_status_path() -> Path:
+    """The primary connection's sidecar under STATE_DIR."""
+    from connections import primary_sidecar_name
+    return STATE_DIR / primary_sidecar_name(STATE_DIR)
 
 
 def _host_label() -> str:
@@ -275,15 +280,10 @@ def service_registry() -> list[dict]:
     return [
         {"id": "core", "name": "Sutando Core",
          "probe": ("alive_file", CORES_DIR / f"{host}.alive")},
-        # KNOWINGLY PRIMARY-ONLY (#2503): named GATEWAY_INSTANCE bridges publish
-        # SUFFIXED sidecars this probe does not read, and the pgrep fallback is
-        # identity-blind (instance identity lives only in env — the launcher's
-        # P1). With a live named secondary, a dead primary's stale sidecar falls
-        # through to pgrep and the secondary's process reads as "running".
-        # Instance-aware probing is tracked separately; until then this row
-        # reports the PRIMARY bridge only.
+        # Reads the primary connection's sidecar; the pgrep fallback is identity-blind,
+        # so a live named secondary can still mask a dead primary once the sidecar is stale.
         {"id": "gateway", "name": "AG2 Gateway",
-         "probe": ("gateway", GATEWAY_STATUS_PATH, r"remote-gateway-bridge\.py$")},
+         "probe": ("gateway", gateway_status_path(), r"remote-gateway-bridge\.py$")},
         {"id": "task-watcher", "name": "Task Watcher",
          # Every instance's sentinel; one fixed name reported only the newest.
          "probe": ("watcher_sentinels", STATE_DIR)},

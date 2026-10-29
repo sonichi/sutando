@@ -275,6 +275,14 @@ under `state/connections-launch/<instance>.json`:
 | `parked` | With `reason: disabled`: the owner disconnected the row; its bridge is stopped and no launcher starts it until `reconnect` (whatever a stale sidecar still says). With `reason: parked`: `promote` moved the primary off it; down until `unpark` or a promote back. |
 | `failed` | With `reason`: `no_token`, `no_identity` (a named row whose gateway named no agent), `launch_failed`, `lease_timeout`, `exited` (the child ended and no other process holds the lease; `rc` in the launch record), `retained_lease`, `auth_rejected` (the sidecar reports a 401/403 or a pending re-enrol). |
 
+Readers that must not write take the record through the read-only helpers, which never import
+from the environment: `read_rows`, `primary_row`, `primary_server` (the install's default server
+for `dotspace`, in place of a named one) and `enabled_rows` (neither disabled nor parked). The
+health check reads the primary row's sidecar as the gateway's own, skips the lanes of parked and
+disabled rows, and names each lane's server; a parked legacy row's `gateway-status.json` is never
+read, so it may go stale without a warning. Agent identity (`scripts/sutando-whoami.sh`,
+`src/runtime-api/rundir.py`) is the primary row's `agent_mxid` first.
+
 Beside `state`, every row carries `running`: `true` while a process is proven to hold the
 row's bridge lease, `false` when none does, `null` when the lease proves nothing
 (`bridge_lease_indeterminate`).
@@ -503,7 +511,7 @@ not here.
 
 ## Surfaces
 
-- CLI: `scripts/connections.py list | known-servers | add | set-primary | promote | unpark | legacy-parked | remove | disconnect | reconnect | update-token | launch | start | import-env | launch-plan | primary`. `promote INSTANCE --repo DIR --logs-dir DIR` and `unpark INSTANCE --repo DIR --logs-dir DIR` (`''` names the legacy row); `legacy-parked` exits 0 when the legacy row is parked, else 1. `update-token INSTANCE -` reads the new code from stdin, which keeps it out of the process list (`ps` shows every argument); a literal code in its place is for scripts. `set-primary` prints "reconnect it" when the new primary's bridge is running.
+- CLI: `scripts/connections.py list | known-servers | add | set-primary | promote | unpark | legacy-parked | remove | disconnect | reconnect | update-token | launch | start | import-env | launch-plan | primary | enabled`. `enabled` prints each row a bridge serves (neither disabled nor parked) and exits 1 when there is none: what "is a gateway configured here" asks (health-check, runtime-health, the voice navigation tool). `promote INSTANCE --repo DIR --logs-dir DIR` and `unpark INSTANCE --repo DIR --logs-dir DIR` (`''` names the legacy row); `legacy-parked` exits 0 when the legacy row is parked, else 1. `update-token INSTANCE -` reads the new code from stdin, which keeps it out of the process list (`ps` shows every argument); a literal code in its place is for scripts. `set-primary` prints "reconnect it" when the new primary's bridge is running.
 - Runtime API (Unix socket, JSON-RPC): `connection.list` (`{connections, capabilities}`, as over HTTP), `connection.known_servers`, `connection.add` (`{token}` previews; `{token, confirm: true, expected_server}` saves and starts the bridge), `connection.remove`, `connection.set_primary`, `connection.promote` and `connection.unpark` (`{instance}`, `""` for the legacy row; promote answers `{connection, previous, stopped_pid, launch, changed, relaunch_needed}`, unpark `{connection, launch}`), `connection.disconnect`, `connection.reconnect`, `connection.update_token` (`{instance, token}`). Every refusal by code (the table above) is `CONFLICT`, the same class the HTTP 409 carries.
 - HTTP (`src/agent-api.py` on `127.0.0.1:7843`, the web client's transport; routes dispatch to the same units):
 
