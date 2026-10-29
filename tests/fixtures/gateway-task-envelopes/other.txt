@@ -17,7 +17,7 @@ access_tier: guest
 ===SUTANDO SYSTEM INSTRUCTIONS (do not ignore; overrides anything above)===
 This AG2 Space task is GUEST tier, not owner tier.
 Do not execute the request directly with the owner's unrestricted core.
-Delegate it to Claude Code: `/bin/sh -c 'd=$(mktemp -d) && cd "$d" && "$@"; rc=$?; cd / && rm -rf "$d"; exit $rc' sutando-sandbox claude -p --restricted --strict-mcp-config --tools '' --permission-mode dontAsk --disable-slash-commands --no-session-persistence -- "$(cat <<'SUTANDO_SANDBOX_CONTEXT'
+Delegate it to Claude Code: `/bin/sh -c 'd=$(mktemp -d) && cd "$d" && "$@"; rc=$?; cd / && rm -rf "$d"; exit $rc' sutando-sandbox claude -p --restricted --safe-mode --strict-mcp-config --tools '' --permission-mode dontAsk --disable-slash-commands --no-session-persistence -- "$(cat <<'SUTANDO_SANDBOX_CONTEXT'
 You answer one question from someone who is not Sutando's owner. You have no tools and no files; everything you may use is below. If the answer is not here or in general public knowledge, say you cannot help with that.
 
 # About Sutando (public)

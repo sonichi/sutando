@@ -25,6 +25,8 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import subprocess
+import sys
 import tempfile
 from contextlib import contextmanager
 from pathlib import Path
@@ -76,6 +78,11 @@ RUNNERS = {
 
 # Rendered when no safe runner is installed: its absence is the "unavailable" signal.
 FALLBACK = "claude"
+UNAVAILABLE = "Sandbox unavailable; refusing non-owner task."
+
+
+class SandboxUnavailable(RuntimeError):
+    """No safe, successful answer was produced; subprocess output stays private."""
 
 
 class Invocation(NamedTuple):
@@ -146,8 +153,8 @@ def select_runner(order: Optional[Sequence] = None, which: Callable = shutil.whi
 def _base_args(runner: Runner) -> list:
     if runner.safe and runner.name == "claude":
         # --tools "" leaves no built-in tool; --strict-mcp-config with no --mcp-config
-        # loads no MCP server; --restricted ignores user/project/local settings.
-        return ["-p", "--restricted", "--strict-mcp-config", "--tools", CLAUDE_TOOLS,
+        # loads no MCP server; restricted/safe-mode suppress settings and memory.
+        return ["-p", "--restricted", "--safe-mode", "--strict-mcp-config", "--tools", CLAUDE_TOOLS,
                 "--permission-mode", "dontAsk", "--disable-slash-commands",
                 "--no-session-persistence"]
     raise ValueError(f"no safe invocation for runner {runner.name!r}")
@@ -176,7 +183,7 @@ def _read_faq() -> str:
     try:
         return FAQ_PATH.read_text(encoding="utf-8")
     except OSError:  # inside the ag2-sparrow zipapp: read through the zip importer
-        return __loader__.get_data(str(FAQ_PATH)).decode("utf-8")
+        return __loader__.get_data(str(FAQ_PATH)).decode("utf-8").replace("\r\n", "\n")
 
 
 def context_preamble() -> str:
@@ -219,3 +226,52 @@ def selected_or_fallback(order: Optional[Sequence] = None, which: Callable = shu
     none is installed, so the core's attempt fails and it reports the sandbox unavailable."""
     picked = select_runner(order, which, env)
     return picked[0] if picked else RUNNERS[FALLBACK]
+
+
+def native_binary(binary: str) -> str:
+    """Bypass Windows shell shims so untrusted text never reaches cmd.exe."""
+    if sys.platform != "win32":
+        return binary
+    path = Path(binary)
+    if path.suffix.lower() == ".exe":
+        return str(path)
+    if path.name.lower() in ("claude.cmd", "claude.ps1"):
+        native = path.parent / "node_modules" / "@anthropic-ai" / "claude-code" / "bin" / "claude.exe"
+        if native.is_file():
+            return str(native)
+    raise SandboxUnavailable(UNAVAILABLE)
+
+
+def answer(question: str, *, timeout: float = 240) -> str:
+    """Run the shared no-file policy once; never return failed process output."""
+    try:
+        picked = select_runner()
+        if picked is None:
+            raise SandboxUnavailable(UNAVAILABLE)
+        runner, binary = picked
+        with empty_dir() as cwd:
+            call = invocation(runner, native_binary(binary), context_preamble() + question, cwd=cwd)
+            result = subprocess.run(call.argv, cwd=call.cwd, stdin=subprocess.DEVNULL,
+                                    capture_output=True, encoding="utf-8", errors="replace",
+                                    timeout=timeout, shell=False)
+        if result.returncode or not result.stdout.strip():
+            raise SandboxUnavailable(UNAVAILABLE)
+        return result.stdout
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        raise SandboxUnavailable(UNAVAILABLE) from exc
+
+
+def main() -> int:
+    """UTF-8 stdin/stdout adapter for dispatchers that cannot import Python."""
+    try:
+        question = sys.stdin.buffer.read().decode("utf-8")
+        output = answer(question)
+        status = 0
+    except (SandboxUnavailable, UnicodeError):
+        output, status = UNAVAILABLE, 1
+    sys.stdout.buffer.write(output.encode("utf-8"))
+    return status
+
+
+if __name__ == "__main__":
+    sys.exit(main())

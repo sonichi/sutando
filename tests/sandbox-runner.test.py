@@ -151,6 +151,7 @@ class Invocations(unittest.TestCase):
         self.assertEqual(a[:2], ["/b/claude", "-p"])
         self.assertEqual(a[a.index("--tools") + 1], "")
         self.assertIn("--restricted", a)
+        self.assertIn("--safe-mode", a)
         self.assertIn("--strict-mcp-config", a)
         self.assertNotIn("--mcp-config", a)
         self.assertNotIn("--add-dir", a)
@@ -164,7 +165,8 @@ class Invocations(unittest.TestCase):
         with sr.empty_dir() as d:
             self.assertEqual(os.listdir(d), [])
             self.assertFalse(Path(d).resolve().is_relative_to(REPO.resolve()))
-            self.assertEqual(stat.S_IMODE(os.stat(d).st_mode), 0o700)
+            if os.name != "nt":
+                self.assertEqual(stat.S_IMODE(os.stat(d).st_mode), 0o700)
             with sr.empty_dir() as d2:
                 self.assertNotEqual(d, d2)
         self.assertFalse(os.path.exists(d))
@@ -207,7 +209,7 @@ class Invocations(unittest.TestCase):
     def test_shell_command_shape(self):
         line = sr.shell_command(sr.RUNNERS["claude"], "P", out_path="/o")
         self.assertTrue(line.startswith("/bin/sh -c 'd=$(mktemp -d) && cd \"$d\""))
-        self.assertIn(" claude -p --restricted --strict-mcp-config --tools '' ", line)
+        self.assertIn(" claude -p --restricted --safe-mode --strict-mcp-config --tools '' ", line)
         self.assertTrue(line.endswith("P < /dev/null > /o"))
         self.assertNotIn("Read", line.split("--tools")[1].split("--")[0])
 
@@ -258,7 +260,7 @@ class GuardrailNamesTheSelectedRunner(unittest.TestCase):
         lines = guardrail.ag2space_tier_lines("guest", False, "results/t.txt")
         block = "\n".join(lines)
         self.assertIn("Delegate it to Claude Code: `/bin/sh -c", block)
-        self.assertIn(" claude -p --restricted --strict-mcp-config --tools '' ", block)
+        self.assertIn(" claude -p --restricted --safe-mode --strict-mcp-config --tools '' ", block)
         self.assertNotIn("codex", block)
         # The surrounding policy wording survives the swap.
         for phrase in ("NO NETWORK", "NO permitted fallback", "unrestricted core",
@@ -328,8 +330,9 @@ class DiscordBridgeDelegates(unittest.TestCase):
         claude = self._render("claude")
         for tier in ("team", "guest"):
             self.assertIn("codex-bounded.sh --stall 0 --max 240 -- /bin/sh -c 'd=$(mktemp -d) && cd", claude[tier])
-            self.assertIn(" claude -p --restricted --strict-mcp-config --tools '' ", claude[tier])
-            self.assertIn("< /dev/null > /R/.codex-staging-{id}.txt", claude[tier])
+            self.assertIn(" claude -p --restricted --safe-mode --strict-mcp-config --tools '' ", claude[tier])
+            staging = str(Path("/R")) + "/.codex-staging-{id}.txt"
+            self.assertIn("< /dev/null > " + staging, claude[tier])
             stage1 = claude[tier][claude[tier].index("Stage 1:"):claude[tier].index("Stage 2:")]
             self.assertNotIn("codex exec", stage1)  # the PR-review path stays codex-only
             self.assertIn(sr.FAQ_PATH.read_text().strip(), stage1)

@@ -16,7 +16,7 @@ Telegram tasks include an `access_tier` field set by the bridge (same tiers as D
 
 Discord tasks include an `access_tier` field set by the bridge:
 - **owner**: Full access — process normally with all capabilities
-- **team**: Delegate to the sandboxed agent, using the command `src/policy/sandbox_runner.py` renders (macOS/Linux bridges; the Windows dispatcher is the exception above) (stdin from `/dev/null`; assert its OUTPUT is non-empty, since a refusal also exits 0). The sandbox reads no file: it runs in a fresh empty temp dir with no tools and no MCP, and its only context is the prompt (the question plus the public FAQ in `src/policy/sandbox_faq.md`). The runner is the first safe one installed in the order `SUTANDO_SANDBOX_RUNNERS` gives (declared in `skills/claude-codex/manifest.json`); today only `claude` is safe — agy and codex are skipped because neither can be confined to read nothing. No system mutations. **Exception — a per-channel collaborator.** A team sender listed under a channel's `collaborators` in `access.json` gets the `team-collaborator` engage rulebook in THAT channel only. That list is the owner's attestation for this surface: it is hand-configured, per-channel, and is a deliberate owner act rather than a wire flag a sender can set. Scope is strictly per-channel — membership in another channel's list does not carry over, and it grants engagement, not owner authority.
+- **team**: Delegate to the sandboxed agent through `src/policy/sandbox_runner.py` (shell command on macOS/Linux, stdin/stdout adapter for the Windows dispatcher). Close child stdin and require nonempty output. The sandbox reads no file: it runs in a fresh empty temp dir with no tools, MCP, or loaded memory/customizations, and its only context is the prompt (the question plus the public FAQ in `src/policy/sandbox_faq.md`). The runner is the first safe one installed in the order `SUTANDO_SANDBOX_RUNNERS` gives (declared in `skills/claude-codex/manifest.json`); today only `claude` is safe — agy and codex are skipped because neither can be confined to read nothing. No system mutations. **Exception — a per-channel collaborator.** A team sender listed under a channel's `collaborators` in `access.json` gets the `team-collaborator` engage rulebook in THAT channel only. That list is the owner's attestation for this surface: it is hand-configured, per-channel, and is a deliberate owner act rather than a wire flag a sender can set. Scope is strictly per-channel — membership in another channel's list does not carry over, and it grants engagement, not owner authority.
 - **guest**: Delegate to sandboxed agent. Information only — answer questions about Sutando. This is the fail-closed default for any sender no allowlist names. `other` is the legacy spelling of this tier: the Discord bridge no longer emits it, and readers resolve it to `guest` through `local_task_protocol.canonical_access_tier` (a `tierMap` value of `other` is written out as `guest`).
 
 Owner is determined by `allowFrom` in `$CLAUDE_CONFIG_DIR/channels/discord/access.json` (set via `/discord:access`).
@@ -45,12 +45,35 @@ The bridge and dispatcher must resolve the same workspace and
 `CLAUDE_CONFIG_DIR`, including the task envelope key and Discord access file.
 After updating code, restart both services through the host's normal launcher.
 Unsigned or invalid tasks, revoked collaborators, and other non-owner tasks
-use the Windows dispatcher's read-only sandbox path (`codex exec --sandbox read-only`,
-which still lets the answer read owner files: the no-file sandbox below covers the
-macOS/Linux bridges only, #5459). If the sandbox is unavailable
+use the shared no-file policy in `src/policy/sandbox_runner.py`, invoked through its
+UTF-8 stdin/stdout adapter. If the sandbox is unavailable
 or fails, the dispatcher returns its failure result without granting normal
 capabilities. Owner processing is unchanged. No access-file migration or automatic
 collaborator grant is performed.
+
+The Windows adapter uses the same runner selection, flags, public FAQ, and fresh
+empty directory as the other bridges. It passes only the question to the runner,
+closes child stdin, and bounds each call to 240 seconds. It rejects nonzero exits
+and empty answers without publishing subprocess diagnostics. Claude runs with
+`--restricted`, `--safe-mode`, no tools, and no MCP; Codex read-only is never a
+fallback. Host-managed policy remains trusted, including managed hooks.
+
+Windows requires a working Python 3.9+ and a Claude version supporting these
+flags (verified with Claude 2.1.288). It launches a native `.exe` directly; current
+npm installations resolve to `node_modules/@anthropic-ai/claude-code/bin/claude.exe`
+beside their shim. Older or custom shell-only installations are refused, so task
+text cannot be interpreted by `cmd.exe`. Upgrade/install native Claude if those
+hosts need non-owner replies.
+
+Run `pwsh -NoProfile -File tests/windows-sandbox-canary.test.ps1 -RunLive` after
+installing/upgrading the runner. This opt-in test uses the installed Claude
+authentication, starts an isolated dispatcher with temporary tasks and dummy
+secrets, and requires nonempty successful answers for guest, plain Team, legacy
+other, and ambient tasks, plus a correct answer to an allowed public question.
+Missing authentication or an unavailable runner fails
+the test; it is not accepted as proof of isolation. It also checks that a dummy
+parent `CLAUDE.md` is not loaded. Deterministic Windows CI covers argument
+boundaries, routing, cleanup, and fail-closed behavior without model credentials.
 
 ### Reading another Discord channel's content (contextNotFrom gate)
 

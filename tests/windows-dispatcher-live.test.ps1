@@ -1,5 +1,5 @@
 #!/usr/bin/env pwsh
-# Real Windows integration path with deterministic Claude and Codex shims:
+# Real Windows integration path with deterministic owner and native sandbox fixtures:
 # FileSystemWatcher -> atomic claim -> owner result -> archive -> sandbox routing,
 # plus an archive blocked by a scanner-style open handle and an empty task body.
 [CmdletBinding()]
@@ -12,7 +12,7 @@ $workspace = Join-Path $tempRoot ('sutando-dispatcher-live-' + [guid]::NewGuid()
 $shimDir = Join-Path $workspace 'bin'
 $errorModeFile = Join-Path $workspace 'fake-error-mode'
 $staleModeFile = Join-Path $workspace 'fake-stale-once'
-$codexModeFile = Join-Path $workspace 'fake-codex-mode'
+$sandboxModeFile = Join-Path $workspace 'fake-sandbox-mode'
 $blockModeFile = Join-Path $workspace 'fake-block-mode'
 $childPidFile = Join-Path $workspace 'fake-child.pid'
 $callsFile = Join-Path $workspace 'fake-claude-calls'
@@ -22,6 +22,10 @@ $oldPath = $env:PATH
 $oldTestMode = $env:SUTANDO_TEST_MODE
 $oldWorkspace = $env:SUTANDO_WORKSPACE
 $oldConfigRoot = $env:CLAUDE_CONFIG_DIR
+$oldSandboxOrder = $env:SUTANDO_SANDBOX_RUNNERS
+$oldSandboxMode = $env:SUTANDO_NATIVE_SANDBOX_MODE
+$oldSandboxCaptures = $env:SUTANDO_NATIVE_SANDBOX_CAPTURES
+. (Join-Path $PSScriptRoot '_helpers\native-sandbox-fixture.ps1')
 
 # Import only the production stop primitive; never run machine-wide service discovery.
 $restartAst = [Management.Automation.Language.Parser]::ParseFile(
@@ -95,20 +99,7 @@ echo {"type":"result","subtype":"success","is_error":false,"result":"WINDOWS_OWN
 exit /b 0
 '@
     Set-Content -Path (Join-Path $shimDir 'claude.cmd') -Value $shim -Encoding ascii
-    $codexShim = @'
-param([Parameter(ValueFromRemainingArguments=$true)][string[]]$Args)
-$outIndex = [Array]::IndexOf($Args, '-o')
-if ($outIndex -lt 0) { exit 2 }
-$out = $Args[$outIndex + 1]
-if (Test-Path $env:SUTANDO_FAKE_CODEX_FILE) {
-    $mode = (Get-Content $env:SUTANDO_FAKE_CODEX_FILE -Raw).Trim()
-    if ($mode -eq 'fail') { exit 125 }
-    if ($mode -eq 'empty') { [IO.File]::WriteAllText($out, ''); exit 0 }
-}
-[IO.File]::WriteAllText($out, 'WINDOWS_SANDBOX_OK')
-exit 0
-'@
-    Set-Content -Path (Join-Path $shimDir 'codex.ps1') -Value $codexShim -Encoding utf8
+    New-NativeSandboxFixture $shimDir | Out-Null
     # Isolate command lookup so the real user-level claude.exe cannot outrank
     # the shim merely because the dispatcher prefers a native executable.
     $pwshDir = Split-Path (Get-Command pwsh -ErrorAction Stop).Source -Parent
@@ -120,7 +111,9 @@ exit 0
     New-Item -ItemType Directory -Force -Path $env:CLAUDE_CONFIG_DIR | Out-Null
     $env:SUTANDO_FAKE_ERROR_FILE = $errorModeFile
     $env:SUTANDO_FAKE_STALE_FILE = $staleModeFile
-    $env:SUTANDO_FAKE_CODEX_FILE = $codexModeFile
+    $env:SUTANDO_NATIVE_SANDBOX_MODE = $sandboxModeFile
+    $env:SUTANDO_NATIVE_SANDBOX_CAPTURES = Join-Path $workspace 'captures\sandbox'
+    $env:SUTANDO_SANDBOX_RUNNERS = 'claude'
     $env:SUTANDO_FAKE_BLOCK_FILE = $blockModeFile
     $env:SUTANDO_FAKE_CHILD_PID = $childPidFile
     $env:SUTANDO_FAKE_CALLS_FILE = $callsFile
@@ -222,16 +215,16 @@ exit 0
         throw "unexpected non-owner result: $nonOwnerBody"
     }
 
-    Set-Content -Path $codexModeFile -Value 'fail' -Encoding ascii
+    Set-Content -Path $sandboxModeFile -Value 'fail' -Encoding ascii
     $sandboxFailureId = "task-windows-team-failure-$PID"
     Write-Task $sandboxFailureId 'Exercise sandbox failure.' 'team'
     $sandboxFailureResult = Join-Path $workspace "results\$sandboxFailureId.txt"
     Wait-ForPath $sandboxFailureResult
     $sandboxFailureBody = (Get-Content $sandboxFailureResult -Raw).Trim()
-    if ($sandboxFailureBody -ne 'Sandbox unavailable (codex exit 125) — no reply generated.') {
+    if ($sandboxFailureBody -ne 'Sandbox unavailable; refusing non-owner task.') {
         throw "unexpected sandbox failure result: $sandboxFailureBody"
     }
-    Remove-Item $codexModeFile
+    Remove-Item $sandboxModeFile
 
     $collaboratorId = "task-windows-unsigned-collaborator-$PID"
     Write-Task $collaboratorId 'Return the unsigned collaborator integration marker.' 'team' -Collaborator
@@ -241,6 +234,10 @@ exit 0
     if ($collaboratorBody -ne 'WINDOWS_SANDBOX_OK') {
         throw "unsigned collaborator did not use the sandbox path: $collaboratorBody"
     }
+    $sandboxCaptures = @(Get-ChildItem -LiteralPath $env:SUTANDO_NATIVE_SANDBOX_CAPTURES -Filter '*.json' |
+        ForEach-Object { Get-Content -LiteralPath $_.FullName -Raw | ConvertFrom-Json })
+    if ($sandboxCaptures.Count -ne 3) { throw 'Expected three native sandbox invocations.' }
+    foreach ($capture in $sandboxCaptures) { Assert-NativeSandboxCapture $capture }
 
     New-Item -ItemType File -Path $errorModeFile | Out-Null
     $errorId = "task-windows-error-$PID"
@@ -326,9 +323,11 @@ exit 0
     $env:SUTANDO_TEST_MODE = $oldTestMode
     $env:SUTANDO_WORKSPACE = $oldWorkspace
     $env:CLAUDE_CONFIG_DIR = $oldConfigRoot
+    $env:SUTANDO_SANDBOX_RUNNERS = $oldSandboxOrder
     Remove-Item Env:SUTANDO_FAKE_ERROR_FILE -ErrorAction SilentlyContinue
     Remove-Item Env:SUTANDO_FAKE_STALE_FILE -ErrorAction SilentlyContinue
-    Remove-Item Env:SUTANDO_FAKE_CODEX_FILE -ErrorAction SilentlyContinue
+    $env:SUTANDO_NATIVE_SANDBOX_MODE = $oldSandboxMode
+    $env:SUTANDO_NATIVE_SANDBOX_CAPTURES = $oldSandboxCaptures
     Remove-Item Env:SUTANDO_FAKE_BLOCK_FILE -ErrorAction SilentlyContinue
     Remove-Item Env:SUTANDO_FAKE_CHILD_PID -ErrorAction SilentlyContinue
     Remove-Item Env:SUTANDO_FAKE_CALLS_FILE -ErrorAction SilentlyContinue

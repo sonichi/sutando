@@ -106,11 +106,7 @@ if (-not $claudeCmd) {
     exit 1
 }
 $CLAUDE = $claudeCmd.Source
-$codexAll = Get-Command codex -All -ErrorAction SilentlyContinue
-$codexCmd = ($codexAll | Where-Object { $_.Path -and $_.Path.ToLower().EndsWith('.exe') } | Select-Object -First 1)
-if (-not $codexCmd) { $codexCmd = ($codexAll | Select-Object -First 1) }
-$CODEX = if ($codexCmd) { $codexCmd.Source } else { $null }
-Log "task-dispatcher started. claude=$CLAUDE codex=$(if ($CODEX) { $CODEX } else { 'unavailable' }) workspace=$WORKSPACE"
+Log "task-dispatcher started. claude=$CLAUDE workspace=$WORKSPACE"
 
 if ($ValidateOnly) {
     Remove-Item $pidFile -ErrorAction SilentlyContinue
@@ -214,15 +210,6 @@ function Get-TaskHeader($path, $key) {
     return $null
 }
 
-function Get-SystemInstructions($path) {
-    $content = Get-Content -Raw -Path $path -ErrorAction SilentlyContinue
-    if (-not $content) { return $null }
-    $marker = '===SUTANDO SYSTEM INSTRUCTIONS'
-    $start = $content.LastIndexOf($marker, [StringComparison]::Ordinal)
-    if ($start -lt 0) { return $null }
-    return $content.Substring($start).Trim()
-}
-
 # Session map persists across dispatcher restarts so a channel keeps the same
 # resumable claude conversation. Schema:
 #   { "<channel_id>": "<session-uuid>", ... }
@@ -287,41 +274,29 @@ function Test-StaleClaudeSession($call) {
     return "$stdout`n$($call.Stderr)" -match '(?i)No conversation found with session ID'
 }
 
-function Invoke-CodexSandbox($prompt, $systemInstructions, $taskId, $tier, $stderrPath) {
-    if (-not $CODEX) {
-        return 'Sandbox unavailable (codex exit 127) — no reply generated.'
+function Invoke-SharedSandbox($prompt) {
+    $unavailable = 'Sandbox unavailable; refusing non-owner task.'
+    $candidates = @()
+    $python = Get-Command python -ErrorAction SilentlyContinue
+    if ($python) { $candidates += ,@($python.Source) }
+    $py = Get-Command py -ErrorAction SilentlyContinue
+    if ($py) { $candidates += ,@($py.Source, '-3') }
+    foreach ($candidate in $candidates) {
+        $exe = $candidate[0]
+        $prefixArgs = @($candidate | Select-Object -Skip 1)
+        try {
+            & $exe @prefixArgs -c 'import sys; sys.exit(0)' 2>$null | Out-Null
+            if ($LASTEXITCODE -ne 0) { continue }
+        } catch { continue }
+        try {
+            $output = $prompt | & $exe @prefixArgs -X utf8 (Join-Path $REPO 'src/policy/sandbox_runner.py') 2>$null
+            if ($LASTEXITCODE -ne 0) { return $unavailable }
+            $answer = $output -join "`n"
+            if ([string]::IsNullOrWhiteSpace($answer)) { return $unavailable }
+            return $answer
+        } catch { return $unavailable }
     }
-
-    $staging = Join-Path $RESULTS ".codex-staging-$taskId.txt"
-    Remove-Item -Path $staging, $stderrPath -ErrorAction SilentlyContinue
-    $sandboxPrompt = @"
-You are answering on behalf of Sutando, an autonomous personal AI agent.
-Reply directly and briefly to the user's message. Return factual information only.
-This is a $tier-tier request. Do not modify files, run external actions, access credentials, or reveal private owner context.
-
-User request:
-$prompt
-
-Trusted execution policy:
-$systemInstructions
-"@
-    $args = @('exec', '--sandbox', 'read-only', '--skip-git-repo-check')
-    if ($tier -eq 'guest') { $args += @('-C', [IO.Path]::GetTempPath()) }
-    $args += @('-o', $staging, '--', $sandboxPrompt)
-    $null | & $CODEX @args 2>$stderrPath | Out-Null
-    $exitCode = $LASTEXITCODE
-    Remove-Item -Path $stderrPath -ErrorAction SilentlyContinue
-    if ($exitCode -ne 0) {
-        Remove-Item -Path $staging -ErrorAction SilentlyContinue
-        return "Sandbox unavailable (codex exit $exitCode) — no reply generated."
-    }
-    if (-not (Test-Path $staging) -or (Get-Item $staging).Length -eq 0) {
-        Remove-Item -Path $staging -ErrorAction SilentlyContinue
-        return 'Sandbox unavailable (codex exited 0 with no output) — no reply generated.'
-    }
-    $result = Get-Content -Raw -Path $staging
-    Remove-Item -Path $staging -ErrorAction SilentlyContinue
-    return $result
+    return $unavailable
 }
 
 # Claim a task by renaming it to `.processing` - atomic on NTFS. Returns the
@@ -416,14 +391,13 @@ function Process-Task($claimedPath, $taskId) {
     }
 
     # A verified Discord collaborator keeps the complete body and channel rulebook.
-    # Other non-owner tasks retain the read-only sandbox path.
+    # Other non-owner tasks use the shared no-file sandbox policy.
     $accessTier = Get-TaskHeader $claimedPath 'access_tier'
     $collaborator = if ($accessTier -eq 'team') { Get-VerifiedDiscordCollaborator $claimedPath } else { $null }
-    $systemInstructions = Get-SystemInstructions $claimedPath
     if ($accessTier -and $accessTier -ne 'owner' -and -not $collaborator) {
         $tier = if ($accessTier -in @('team', 'guest')) { $accessTier } else { 'guest' }
-        Log "${taskId}: processing non-owner task in codex read-only sandbox (access_tier=$tier)"
-        $result = Invoke-CodexSandbox $prompt $systemInstructions $taskId $tier "$claimedPath.stderr"
+        Log "${taskId}: processing non-owner task in shared no-file sandbox (access_tier=$tier)"
+        $result = Invoke-SharedSandbox $prompt
         $resultFile = Join-Path $RESULTS "$taskId.txt"
         Publish-TaskResult $taskId $result
         $null = Complete-TaskClaim $claimedPath $taskId

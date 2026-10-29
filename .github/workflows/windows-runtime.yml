@@ -160,6 +160,16 @@ jobs:
         shell: pwsh
         run: pwsh -NoProfile -File tests/windows-dispatcher-live.test.ps1
 
+      - name: Verify shared no-file sandbox and Windows argument boundaries
+        shell: pwsh
+        run: |
+          python -X utf8 tests/sandbox-answer.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'sandbox-answer.test.py failed' }
+          python -X utf8 tests/sandbox-runner.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'sandbox-runner.test.py failed' }
+          pwsh -NoProfile -File tests/windows-dispatcher-sandbox.test.ps1
+          if ($LASTEXITCODE -ne 0) { throw 'windows-dispatcher-sandbox.test.ps1 failed' }
+
       - name: Verify Discord collaborator dispatch and authorization
         shell: pwsh
         run: |

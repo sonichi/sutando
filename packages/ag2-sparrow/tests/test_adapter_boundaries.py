@@ -15,8 +15,9 @@ PKG = "ag2_sparrow"
 CODE = (".py", ".sh", ".ts", ".json")
 SEGMENT = re.compile(r"(?:^|[/.\\])adapters(?:[/.\\]|$)")
 CROSS = re.compile(r"adapters[/.]([A-Za-z0-9_-]+)|\.\./([A-Za-z0-9_-]+)/")
-# Sandbox runner names, not adapter paths: these shared modules name the codex CLI.
-RUNNER_NAMES = {("ag2_sparrow.sandbox_runner", "codex"), ("ag2_sparrow.team_guardrail", "codex")}
+# CLI/install names, not adapter paths: the sandbox also resolves Claude's npm binary.
+RUNNER_NAMES = {("ag2_sparrow.sandbox_runner", "codex"), ("ag2_sparrow.team_guardrail", "codex"),
+                ("ag2_sparrow.sandbox_runner", "claude-code")}
 
 
 def modules(root):
@@ -195,12 +196,16 @@ class PositiveControlTest(unittest.TestCase):
         self.assertIn(("adapter path", "ag2_sparrow/adapters/a/hook.sh", "adapters.b"), found)
 
     def test_runner_names_pass_only_in_their_two_modules(self):
-        codex = {"ag2_sparrow/adapters/codex/__init__.py": ""}
-        allowed = {"ag2_sparrow/sandbox_runner.py": "R = 'codex'\n",
+        codex = {"ag2_sparrow/adapters/codex/__init__.py": "", "adapters/claude-code/__init__.py": ""}
+        allowed = {"ag2_sparrow/sandbox_runner.py": "R = 'codex'\nP = 'claude-code'\n",
                    "ag2_sparrow/team_guardrail.py": "L = {'codex': 'Codex'}\n"}
         self.assertEqual(violations(self.tree({**codex, **allowed})), [])
         for rel, text in (("ag2_sparrow/other.py", "R = 'codex'\n"),
                           ("ag2_sparrow/sub/sandbox_runner.py", "R = 'codex'\n"),
+                          ("ag2_sparrow/other.py", "P = 'claude-code'\n"),
+                          ("ag2_sparrow/sub/sandbox_runner.py", "P = 'claude-code'\n"),
+                          ("ag2_sparrow/team_guardrail.py", "P = 'claude-code'\n"),
+                          ("ag2_sparrow/sandbox_runner.py", "P = 'adapters/claude-code/bin'\n"),
                           ("ag2_sparrow/sandbox_runner.py", "R = 'b'\n"),
                           ("ag2_sparrow/team_guardrail.py", "P = 'adapters/codex/x.sh'\n")):
             with self.subTest(rel=rel, text=text):

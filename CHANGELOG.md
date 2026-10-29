@@ -4,6 +4,10 @@ All notable changes are documented here. Format follows [Keep a Changelog](https
 
 ## [Unreleased]
 
+### Security
+
+- Windows guest and non-collaborator Team replies now use the shared no-file sandbox policy. The shared Claude runner also requires `--safe-mode` on Windows, macOS, and Linux to suppress loaded memory and customizations. Upgrade Claude Code if the installed CLI does not support this flag: restricted requests fail closed instead of falling back to owner access. Verified with Claude Code 2.1.288 on Windows. ([#5965](https://github.com/sonichi/sutando/pull/5965))
+
 ### Added
 
 - Codex cores and workers on macOS automatically redeem an available earned reset when the weekly allowance is exhausted at least 24 hours before renewal. This is on by default; set `SUTANDO_CODEX_AUTO_RESET_ENABLED=0` and restart to disable it. The Codex API currently reports whole-number usage, so the 99.9% threshold fires at a reported 100% used. ([#4829](https://github.com/sonichi/sutando/pull/4829))
