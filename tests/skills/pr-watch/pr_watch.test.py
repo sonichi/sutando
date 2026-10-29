@@ -257,6 +257,12 @@ class InstallMod(_Tmp):
         self.state = mods / "pr-watch" / "state"
         self.assertNotEqual(self.cli("install-mod", "--mods-dir", str(mods))[0], 0)
 
+    def test_the_checkout_copy_resolves_through_the_workspace_loader(self):
+        sys.path.insert(0, str(REPO / "src"))
+        with mock.patch("workspace_default.resolve_workspace", return_value=self.tmp / "ws") as rw:
+            self.assertEqual(pw.resolve_state_dir(), self.tmp / "ws" / "state" / "pr-watch")
+        rw.assert_called_once_with()
+
     def test_the_state_copy_resolves_its_own_dir(self):
         self.cli("install-mod", "--mods-dir", str(self.tmp / "dev-mods"))
         copy = self.state / "pr_watch.py"

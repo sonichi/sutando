@@ -30,8 +30,7 @@ import time
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
-SKILL_DIR = Path(__file__).resolve().parent.parent
-REPO_DIR = SKILL_DIR.parent.parent
+SKILL_DIR = Path(__file__).resolve().parents[1]  # lint-workspace-resolution: allow-repo-root
 MOD_SRC = SKILL_DIR / "mod"
 MOD_NAME = "pr-watch"
 
@@ -68,11 +67,9 @@ def resolve_state_dir(explicit: Optional[str] = None) -> Path:
     # The copy install-mod places in the state dir runs without a checkout around it.
     if here.name == MOD_NAME and here.parent.name == "state":
         return here
-    script = REPO_DIR / "scripts" / "sutando-config.sh"
-    out = subprocess.run(["bash", str(script), "workspace"], capture_output=True, text=True, check=True)
-    ws = out.stdout.strip()
-    if not ws:
-        raise SystemExit("pr-watch: sutando-config.sh printed no workspace")
+    sys.path.insert(0, str(SKILL_DIR.parents[1] / "src"))
+    from workspace_default import resolve_workspace
+    ws = resolve_workspace()
     return Path(ws) / "state" / MOD_NAME
 
 
