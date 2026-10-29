@@ -37,7 +37,7 @@ Per watched repo (`config.json`), filtered by `pr_watch.py`:
 | `pull_request` `opened`, `synchronize`, `reopened`, `ready_for_review`, `closed` | the PR author is a watched `--author` (`*` = anyone) | `PR_EVENT o/r#N <action> author=… head=<sha8> merged=true\|false reason=author` |
 | `pull_request` `synchronize`, `reopened`, `ready_for_review`, `closed` | the watch has `--reviewed` and one of the `--me` logins has submitted a review on the PR, whoever wrote it | `PR_EVENT o/r#N <action> author=… head=<sha8> merged=… reason=reviewed` |
 | `pull_request` `review_requested` | the requested reviewer is one of the `--me` logins, on any PR in the repo | `PR_EVENT o/r#N review_requested reviewer=… author=… head=…` |
-| `pull_request_review` `submitted` | on a watched author's PR | `PR_EVENT o/r#N review_submitted by=… state=approved\|changes_requested\|commented author=… head=…` |
+| `pull_request_review` `submitted` | on a watched author's PR, by someone other than the `--me` logins (the owner's own review echoing back is dropped, though it still marks the PR reviewed) | `PR_EVENT o/r#N review_submitted by=… state=approved\|changes_requested\|commented author=… head=…` |
 | `pull_request_review` `dismissed` | the dismissed review is by one of the `--me` logins, on any PR in the repo | `PR_EVENT o/r#N review_dismissed reviewer=… author=… head=…` |
 
 An event matching both the author rule and the reviewed rule yields one line, `reason=author`.
@@ -178,7 +178,9 @@ checkout: the runner copy in the state dir has no repo root to resolve the defau
 1. **One forwarder hook per repo.** GitHub refuses a second with `HTTP 422 Hook already exists`.
    Before starting, the runner lists the repo's forwarder hooks (`name: cli`, url
    `https://webhook-forwarder.github.com/hook`); if one exists that it did not create, it prints a
-   `PR_WATCH_NOTE`, does not start, and retries every 5 minutes. Another session or person
+   `PR_WATCH_NOTE`, does not start, and retries every 5 minutes, or at once on the next SIGHUP
+   (`add`, `remove`, `config set`). `status` shows the reason and the retry time
+   (`backing off: foreign forwarder hook <id>, retry at HH:MM`). Another session or person
    forwarding the same repo therefore blocks this watch until they stop.
 2. **A killed forwarder can leave its hook behind.** The runner records the ids of the hooks its
    forwarders create in `state/pr-watch/hooks.json`, and deletes exactly those ids when a forwarder

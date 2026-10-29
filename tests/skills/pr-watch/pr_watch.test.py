@@ -152,6 +152,16 @@ class EventFilter(unittest.TestCase):
         other = [{"repo": "acme/widgets", "authors": ["zed"], "me": ["bob"]}]
         self.assertIsNone(self.line("pull_request_review.submitted", other))
 
+    def test_my_own_review_echoing_back_is_dropped_but_still_marks_the_pr(self):
+        mine = [{"repo": "acme/widgets", "authors": ["alice"], "me": ["Bob"], "reviewed": True}]
+        self.assertIsNone(self.line("pull_request_review.submitted", mine))
+        lk = pw.ReviewedLookup()
+        with mock.patch.object(lk, "fetch", side_effect=AssertionError("no call expected")):
+            lk.observe(fixture("pull_request_review.submitted"), mine)
+            self.assertTrue(lk("acme/widgets", 7, ["Bob"]))
+        star = [{"repo": "acme/widgets", "authors": ["alice"], "me": ["*"]}]
+        self.assertIsNotNone(self.line("pull_request_review.submitted", star))
+
     def test_every_line_is_one_line(self):
         for f in FIXTURES.glob("*.json"):
             line = pw.classify(json.loads(f.read_text()), WATCHES)
@@ -665,6 +675,88 @@ class InProcess(_Tmp):
         self.assertIn("api -X DELETE repos/acme/widgets/hooks/77", self.calls("api -X DELETE"))
         self.assertEqual(json.loads(self.st.hooks.read_text()), {})
         self.assertFalse(self.st.runner_pid.exists())
+
+    def test_a_backoff_is_recorded_and_status_says_why(self):
+        self.hookfile.write_text("55\n")
+        runner = pw.Runner(self.st)
+        before = time.time()
+        delay, _ = self.forward(runner)
+        self.assertEqual(delay, pw.CONFLICT_DELAY_S)
+        b = json.loads(self.st.backoff.read_text())["acme/widgets"]
+        self.assertEqual(b["reason"], "foreign forwarder hook 55")
+        self.assertGreaterEqual(b["retry_at"], before + pw.CONFLICT_DELAY_S)
+        with mock.patch.object(pw, "runner_pid", return_value=os.getpid()):
+            _, out, _ = self.cli("status")
+        at = time.strftime("%H:%M", time.localtime(b["retry_at"]))
+        self.assertIn(f"forwarder acme/widgets: backing off: foreign forwarder hook 55, retry at {at}", out)
+        with mock.patch.object(pw, "runner_pid", return_value=None):
+            self.assertIn("forwarder acme/widgets: not running", self.cli("status")[1])
+        self.hookfile.write_text("")
+        self.forward(runner)
+        self.assertEqual(json.loads(self.st.backoff.read_text()), {})
+
+    def test_a_wake_cuts_a_backoff_short_and_a_plain_wait_does_not(self):
+        runner = pw.Runner(self.st)
+        gone = threading.Event()
+        rounds = []
+
+        def once(repo):
+            rounds.append(time.time())
+            if len(rounds) == 2:
+                gone.set()
+            return pw.CONFLICT_DELAY_S
+        with mock.patch.object(runner, "forward_once", side_effect=once):
+            t = threading.Thread(target=runner.loop, args=("acme/widgets", gone), daemon=True)
+            t.start()
+            time.sleep(1)
+            self.assertEqual(len(rounds), 1, "still backing off without a wake")
+            runner.wake()
+            t.join(timeout=10)
+        self.assertFalse(t.is_alive())
+        self.assertEqual(len(rounds), 2)
+        self.assertLess(rounds[1] - rounds[0], 5)
+
+    def test_shutdown_wakes_a_backed_off_loop(self):
+        runner = pw.Runner(self.st)
+        with mock.patch.object(runner, "forward_once", return_value=pw.CONFLICT_DELAY_S):
+            t = threading.Thread(target=runner.loop, args=("acme/widgets", threading.Event()), daemon=True)
+            t.start()
+            time.sleep(0.5)
+            runner.shutdown()
+            t.join(timeout=10)
+        self.assertFalse(t.is_alive())
+
+    def test_cmd_run_retries_a_backed_off_repo_on_sighup(self):
+        os.environ["FAKE_GH_HOLD"] = "30"
+        self.hookfile.write_text("55\n")
+        handlers = {s: signal.getsignal(s) for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)}
+        self.addCleanup(lambda: [signal.signal(s, h) for s, h in handlers.items()])
+        pid = os.getpid()
+        result = {}
+
+        def drive():
+            deadline = time.time() + 20
+            while time.time() < deadline and "acme/widgets" not in (
+                    json.loads(self.st.backoff.read_text()) if self.st.backoff.exists() else {}):
+                time.sleep(0.2)
+            self.hookfile.write_text("")
+            sent = time.time()
+            os.kill(pid, signal.SIGHUP)
+            while time.time() < sent + 15 and not self.calls("webhook forward"):
+                time.sleep(0.2)
+            result["after"] = time.time() - sent
+            os.kill(pid, signal.SIGTERM)
+
+        t = threading.Thread(target=drive)
+        t.start()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = pw.cmd_run(self.st)
+        t.join()
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(self.calls("webhook forward")), 1)
+        self.assertLess(result["after"], 15)
+        self.assertEqual(json.loads(self.st.backoff.read_text()), {})
 
     def test_cmd_run_without_the_extension_exits_3(self):
         os.environ["FAKE_GH_EXT"] = "nothing installed"

@@ -109,6 +109,7 @@ class State:
         self.lock = root / "run.lock"
         self.logs = root / "logs"
         self.tracker = root / "tracker.json"
+        self.backoff = root / "backoff.json"
 
     def ensure(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
@@ -290,7 +291,8 @@ def classify(payload: dict, watches: List[dict], reviewed: Optional[ReviewedFn] 
                 return None
             return (f"PR_EVENT {where} review_dismissed reviewer={_safe(by)} "
                     f"author={_safe(author)} head={_safe(head)}")
-        if action != "submitted" or not _has(watch.get("authors", []), author):
+        # An owner's own review echoing back: observe() still marks the PR reviewed.
+        if action != "submitted" or not _has(watch.get("authors", []), author) or _has(me, by):
             return None
         state = (review.get("state") or "").lower()
         commit = (review.get("commit_id") or "")[:8]
@@ -513,6 +515,9 @@ class Runner:
         self.procs: Dict[str, subprocess.Popen] = {}
         self.procs_lock = threading.Lock()
         self.reviewed = ReviewedLookup()
+        self.wake_cond = threading.Condition()
+        self.wake_gen = 0
+        self.backoff_lock = threading.Lock()
 
     def emit(self, line: str) -> None:
         with self.out_lock:
@@ -532,6 +537,33 @@ class Runner:
     def watches(self) -> List[dict]:
         return load_config(self.st)["watches"]
 
+    def wake(self) -> None:
+        """Cut every backed-off loop's wait short, so a reload retries at once."""
+        with self.wake_cond:
+            self.wake_gen += 1
+            self.wake_cond.notify_all()
+
+    def pause(self, delay: float, gone: threading.Event, seen: int) -> bool:
+        """Wait `delay`, or until stopped, the repo is dropped or a wake after `seen`; True to end the loop."""
+        with self.wake_cond:
+            self.wake_cond.wait_for(
+                lambda: self.stop.is_set() or gone.is_set() or self.wake_gen != seen, timeout=delay)
+        return self.stop.is_set() or gone.is_set()
+
+    def set_backoff(self, repo: str, reason: Optional[str], delay: float = 0) -> None:
+        with self.backoff_lock:
+            data = read_json(self.st.backoff, {})
+            if reason is None:
+                data.pop(repo, None)
+            else:
+                data[repo] = {"reason": reason, "retry_at": time.time() + delay}
+            write_json(self.st.backoff, data)
+
+    def back_off(self, repo: str, reason: str, note: str) -> int:
+        self.note(note)
+        self.set_backoff(repo, reason, CONFLICT_DELAY_S)
+        return CONFLICT_DELAY_S
+
     def sync(self) -> None:
         wanted = {w["repo"] for w in self.watches()}
         for repo in list(self.threads):
@@ -550,21 +582,24 @@ class Runner:
 
     def loop(self, repo: str, gone: threading.Event) -> None:
         while not self.stop.is_set() and not gone.is_set():
+            seen = self.wake_gen
             delay = self.forward_once(repo)
-            if self.stop.wait(delay) or gone.is_set():
+            if self.pause(delay, gone, seen):
                 break
+        self.set_backoff(repo, None)
         drop_recorded(self.st, repo)
 
     def forward_once(self, repo: str) -> int:
         drop_recorded(self.st, repo)
         before = forwarder_hook_ids(repo)
         if before is None:
-            self.note(f"{repo}: cannot list hooks (need admin on the repo); retrying")
-            return CONFLICT_DELAY_S
+            return self.back_off(repo, "cannot list hooks (need admin on the repo)",
+                                 f"{repo}: cannot list hooks (need admin on the repo); retrying")
         if before:
-            self.note(f"{repo}: another webhook forwarder already holds this repo "
-                      f"(hook {before[0]}); GitHub allows one, retrying later")
-            return CONFLICT_DELAY_S
+            return self.back_off(repo, f"foreign forwarder hook {before[0]}",
+                                 f"{repo}: another webhook forwarder already holds this repo "
+                                 f"(hook {before[0]}); GitHub allows one, retrying later")
+        self.set_backoff(repo, None)
         err_path = self.st.logs / (repo.replace("/", "_") + ".err")
         proc = subprocess.Popen(
             ["gh", "webhook", "forward", f"--repo={repo}", f"--events={EVENTS}"],
@@ -591,8 +626,8 @@ class Runner:
         self._save_forwarders()
         drop_recorded(self.st, repo)
         if conflict.is_set():
-            self.note(f"{repo}: GitHub refused a second forwarder ({HOOK_EXISTS}); retrying later")
-            return CONFLICT_DELAY_S
+            return self.back_off(repo, f"GitHub refused a second forwarder ({HOOK_EXISTS})",
+                                 f"{repo}: GitHub refused a second forwarder ({HOOK_EXISTS}); retrying later")
         return RESTART_DELAY_S
 
     def _stderr(self, proc: subprocess.Popen, path: Path, conflict: threading.Event) -> None:
@@ -616,6 +651,7 @@ class Runner:
 
     def shutdown(self) -> None:
         self.stop.set()
+        self.wake()
         with self.procs_lock:
             procs = list(self.procs.values())
         for p in procs:
@@ -628,6 +664,7 @@ class Runner:
                 p.kill()
         drop_recorded(self.st)
         write_json(self.st.forwarders, {})
+        write_json(self.st.backoff, {})
 
 
 def cmd_run(st: State) -> int:
@@ -663,6 +700,7 @@ def cmd_run(st: State) -> int:
                 reload.clear()
                 runner.emit_template()
                 runner.sync()
+                runner.wake()
     finally:
         runner.shutdown()
         try:
@@ -854,10 +892,19 @@ def cmd_status(st: State) -> int:
     pid = runner_pid(st)
     print(f"runner: {'pid ' + str(pid) if pid else 'not running'}")
     fwd = read_json(st.forwarders, {})
+    backoff = read_json(st.backoff, {}) if pid else {}
     for w in load_config(st)["watches"]:
         p = fwd.get(w["repo"])
         alive = isinstance(p, int) and pid_alive(p) and is_forwarder(p)
-        print(f"forwarder {w['repo']}: {'pid ' + str(p) if alive else 'not running'}")
+        b = backoff.get(w["repo"])
+        if alive:
+            why = f"pid {p}"
+        elif isinstance(b, dict) and isinstance(b.get("retry_at"), (int, float)):
+            at = time.strftime("%H:%M", time.localtime(b["retry_at"]))
+            why = f"backing off: {b.get('reason')}, retry at {at} (or on the next add, remove or config set)"
+        else:
+            why = "not running"
+        print(f"forwarder {w['repo']}: {why}")
     hooks = read_json(st.hooks, {})
     if not hooks:
         print("recorded hook ids: none")
