@@ -62,7 +62,7 @@ REASON_HINTS = {
     TASK_NOT_PICKED_UP: f"an s.space task has been open over {TASK_PICKUP_S // 60} minutes: "
                         "the hook is not waking a worker for it, or a worker handed it off "
                         "without running hold",
-    LISTENER_NOT_CONNECTED: "Sparrow is running but not connected to s.space, so no task reaches "
+    LISTENER_NOT_CONNECTED: "Sparrow is running but not connected to its gateway, so no task reaches "
                             "this agent; a restart does not fix a rejected token: fix the relay "
                             "token (REMOTE_TASK_TOKEN) or the connection; ag2-sparrow-hatch "
                             "verify names the error",
