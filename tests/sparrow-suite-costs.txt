@@ -1,0 +1,2 @@
+# seconds  path — measured on ubuntu-latest: per-file seconds publish_gate.sh printed in CI.
+# A missing file counts as 1s; the table only steers balance, never which files run.
