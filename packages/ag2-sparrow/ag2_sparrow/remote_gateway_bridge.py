@@ -1960,6 +1960,15 @@ PROACTIVE_ROUTE_GATE: Callable[[str, str, "str | None"], "str | None"] | None = 
 # Host-injected task -> reason or None, asked before a fresh task is queued: a reason settles it
 # as a redelivery instead. None (standalone default) queues every fresh task.
 TASK_INTAKE_GATE: Callable[[dict], "str | None"] | None = None
+# A gate returns INTAKE_DEFER while it would wait on another lane; `defer` makes it answer that at
+# once, and `deadline` (monotonic) bounds the whole round's waiting.
+INTAKE_DEFER = "\0intake-defer"
+_INTAKE_MODE: dict = {"defer": False, "deadline": None}
+_INTAKE_ROUND_WAIT_S = 6.0
+
+
+class _IntakeDeferred(Exception):
+    """A fresh task whose intake gate would wait; the round takes it after every sibling's ack."""
 # Routing state belongs to the gateway (owner 2026-09-07): the agent row's owner_dm_room is read at
 # connect and on a slow cadence and kept while offline; the pinned room is bootstrap, never authority.
 _ROUTING: dict = {"owner_dm": "", "persisted": "", "persisted_private": False, "identity": "",
@@ -4465,10 +4474,13 @@ def _task_intake_veto(task: dict) -> "str | None":
     if TASK_INTAKE_GATE is None:
         return None
     try:
-        return TASK_INTAKE_GATE(task)
+        reason = TASK_INTAKE_GATE(task)
     except Exception as exc:  # noqa: BLE001 — a broken gate must never drop a message
         _log(f"task intake gate failed for {task.get('id')}: {diagnostics.describe(exc)}; delivering")
         return None
+    if reason == INTAKE_DEFER:
+        raise _IntakeDeferred()
+    return reason
 
 
 def _write_task(task: dict, hold: bool = False) -> "tuple[str, bool] | None":
@@ -5455,7 +5467,7 @@ def _isolated(task: dict, take, *args, fates: "dict | None" = None) -> bool:
 
 
 def _take_served_task(task: dict, inflight: "set[str]", pending_ack: list,
-                      fates: "dict | None" = None) -> bool:
+                      fates: "dict | None" = None, deferred: "list | None" = None) -> bool:
     """One served task that is not `ack_first`: consumed as a control, or queued and its
     ack added to `pending_ack`. True when it newly entered the in-flight set."""
     hitl_out = _handle_hitl_action(task)
@@ -5472,6 +5484,16 @@ def _take_served_task(task: dict, inflight: "set[str]", pending_ack: list,
         _log(f"consumed private review decision {task.get('id')}")
         _set_fate(fates, task, "consumed")
         return False
+    try:
+        return _queue_served(task, inflight, pending_ack, fates)
+    except _IntakeDeferred:
+        if deferred is None:
+            raise
+        deferred.append(task)
+        return False
+
+
+def _queue_served(task: dict, inflight: "set[str]", pending_ack: list, fates: "dict | None") -> bool:
     written = _write_task(task)
     if not written:
         _set_fate(fates, task, "dropped")       # _write_task logged why
@@ -5481,6 +5503,47 @@ def _take_served_task(task: dict, inflight: "set[str]", pending_ack: list,
     fresh = tid not in inflight
     inflight.add(tid)
     return fresh
+
+
+def _commit_round_acks(pending_ack: list, inflight: "set[str]", dropped: list, fates: dict) -> None:
+    """Ack only after task file, in-flight set and ack ledger are durable;
+    any failure withholds every ack in `pending_ack`, redeliveries included."""
+    committed = _save_inflight(inflight) if pending_ack else True
+    if pending_ack and committed:
+        committed = _record_pending_acks(pending_ack)
+    if pending_ack and not committed:
+        _log(f"acks withheld for {len(pending_ack)} task(s): the in-flight set or "
+             "ack ledger did not commit")
+    for tid, durable, lease in pending_ack if committed else ():
+        if _post_task_ack(tid, durable, lease, dropped=dropped):
+            fates[_broker_tid(tid)] = "acked"
+
+
+def _take_served_round(tasks: list, inflight: "set[str]", pending_ack: list, fates: dict,
+                       dropped: list) -> bool:
+    """Take and ack every non-`ack_first` task. One whose intake gate would wait on another
+    lane is taken after every sibling's ack, so the wait delays no one else's lease."""
+    added = False
+    deferred: list = []
+    _INTAKE_MODE["defer"] = True
+    try:
+        for task in tasks:
+            if task.get("ack_first") is not True:
+                added |= _isolated(task, _take_served_task, task, inflight, pending_ack,
+                                   fates, deferred, fates=fates)
+    finally:
+        _INTAKE_MODE["defer"] = False
+    _commit_round_acks(pending_ack, inflight, dropped, fates)
+    if deferred:
+        _INTAKE_MODE["deadline"] = time.monotonic() + _INTAKE_ROUND_WAIT_S
+        try:
+            for task in deferred:
+                late_ack: list = []
+                added |= _isolated(task, _queue_served, task, inflight, late_ack, fates, fates=fates)
+                _commit_round_acks(late_ack, inflight, dropped, fates)
+        finally:
+            _INTAKE_MODE["deadline"] = None
+    return added
 
 
 def _set_fate(fates: "dict | None", task: dict, fate: str) -> None:
@@ -8370,21 +8433,7 @@ def main() -> None:
                 if task.get("ack_first") is True:
                     added |= _isolated(task, _take_ack_first, task, inflight, fates, dropped,
                                        fates=fates)
-            for task in tasks:
-                if task.get("ack_first") is not True:
-                    added |= _isolated(task, _take_served_task, task, inflight, pending_ack,
-                                       fates, fates=fates)
-            # Ack only after task file, in-flight set and ack ledger are durable;
-            # any failure withholds every ack this round, redeliveries included.
-            committed = _save_inflight(inflight) if pending_ack else True
-            if pending_ack and committed:
-                committed = _record_pending_acks(pending_ack)
-            if pending_ack and not committed:
-                _log(f"acks withheld for {len(pending_ack)} task(s): the in-flight set or "
-                     "ack ledger did not commit")
-            for tid, durable, lease in pending_ack if committed else ():
-                if _post_task_ack(tid, durable, lease, dropped=dropped):
-                    fates[_broker_tid(tid)] = "acked"
+            added |= _take_served_round(tasks, inflight, pending_ack, fates, dropped)
             _retry_dropped_acks(dropped, received_at, fates)
             _settle_round(fates)
             if added:

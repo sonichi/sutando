@@ -142,19 +142,30 @@ def _await_owner(state_dir: Path, event: str, tier: str, owners, wait_s: float, 
         sleep(OWNER_POLL_S)
 
 
+class OwnerPending(Exception):
+    """The owner lane has not claimed yet and the caller asked not to wait."""
+
+
 def duplicate_reason(state_dir: Path, task: Mapping[str, object], lane: str, *,
                      now: Optional[float] = None, log: Callable[[str], None] = print,
-                     owner_lanes=(), wait_s: Optional[float] = None, sleep=None) -> Optional[str]:
+                     owner_lanes=(), wait_s: Optional[float] = None, sleep=None,
+                     defer: bool = False) -> Optional[str]:
     """One log line naming both lanes when another lane already took this message at the same
     tier, else None; lanes that disagree on the tier both deliver, with one WARNING. With
-    `owner_lanes` not naming `lane`, an owner's claim within `wait_s` (`OWNER_WAIT_S`) makes this one the duplicate."""
+    `owner_lanes` not naming `lane`, an owner's claim within `wait_s` (`OWNER_WAIT_S`) makes this one the duplicate; `defer` raises
+    OwnerPending instead of waiting."""
     event = key_of(task)
     if event is None:
         return None
     tier = tier_of(task)
     if owner_lanes and lane not in owner_lanes:
-        owner = _await_owner(state_dir, event, tier, list(owner_lanes),
-                             OWNER_WAIT_S if wait_s is None else wait_s, sleep or time.sleep)
+        if defer:
+            owner = holder_of(state_dir, event, tier)
+            if owner is None or owner not in owner_lanes:
+                raise OwnerPending()
+        else:
+            owner = _await_owner(state_dir, event, tier, list(owner_lanes),
+                                 OWNER_WAIT_S if wait_s is None else wait_s, sleep or time.sleep)
         if owner is not None:
             return (f"lane dedupe: message {task.get('source_message_id')} on lane {lane_label(lane)} "
                     f"is lane {lane_label(owner)}'s to answer; settled as a redelivery")

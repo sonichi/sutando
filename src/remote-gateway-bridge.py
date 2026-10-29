@@ -384,8 +384,14 @@ def _lane_dedupe_gate(task: dict):
     except Exception as e:  # noqa: BLE001 - no owner read keeps the first-come guard
         _log(f"lane dedupe: owner lanes unreadable ({type(e).__name__}); first lane answers")  # noqa: F821
         owners = []
-    return lane_dedupe.duplicate_reason(WS / "state", task, GATEWAY_INSTANCE, log=_log,  # noqa: F821
-                                        owner_lanes=owners)
+    mode = _INTAKE_MODE  # noqa: F821
+    deadline = mode["deadline"]
+    wait_s = None if deadline is None else max(0.0, deadline - time.monotonic())
+    try:
+        return lane_dedupe.duplicate_reason(WS / "state", task, GATEWAY_INSTANCE, log=_log,  # noqa: F821
+                                            owner_lanes=owners, wait_s=wait_s, defer=mode["defer"])
+    except lane_dedupe.OwnerPending:
+        return INTAKE_DEFER  # noqa: F821
 
 
 _STATUS_ACK_MANIFEST = _REPO / "skills" / "status-ack" / "manifest.json"

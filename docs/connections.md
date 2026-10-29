@@ -203,7 +203,7 @@ guard (`src/lane_dedupe.py`, the bridge's `TASK_INTAKE_GATE`) makes it one task,
 `connections.event_owner_lanes` picks the lane that answers it from facts every lane reads alike:
 the one lane whose agent the message names by full mxid or replies to (`reply_to_sender`), else
 the primary. Any other lane waits up to `OWNER_WAIT_S` (6 s) for that lane's claim and settles as
-a redelivery once it appears. There is no preference (the first lane to see it answers) unless two
+a redelivery once it appears; the wait runs after the round's other acks, so it holds none of them. There is no preference (the first lane to see it answers) unless two
 enabled rows exist, the owner's bridge runs and its agent is listed in the task's `room_members`,
 so a room only one agent is in is answered at once by that agent's lane. A message the owner lane
 never receives is answered by the waiting lane after the wait, never dropped.

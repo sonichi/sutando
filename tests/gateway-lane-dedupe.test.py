@@ -300,6 +300,30 @@ def main():
         check("an unreadable owner read keeps the first-come guard",
               (rgb.TASKS_DIR / "task-O9.txt").exists() and not (rgb.TASKS_DIR / "task-s_space~task-O10.txt").exists()
               and any("owner lanes unreadable" in m for m in logs), repr(logs))
+
+        # 10. A message waiting on a down owner lane delays no sibling's ack, and a round waits once.
+        import time
+        owners_by_msg = {"$w1": ["s_space"], "$w2": ["s_space"], "$w3": []}
+        connections.event_owner_lanes = lambda task, ws=None: list(owners_by_msg[task["source_message_id"]])
+        rgb._INTAKE_ROUND_WAIT_S = 0.6
+        acks, real_post = [], rgb._post_task_ack
+        t0 = time.monotonic()
+        rgb._post_task_ack = lambda tid, durable, lease, dropped=None: acks.append((tid, time.monotonic() - t0)) or True
+        rgb.GATEWAY_INSTANCE = ""
+        try:
+            batch = [{"id": f"task-W{n}", "task": "hello", "source_message_id": f"$w{n}",
+                      "access_tier": "owner", **room} for n in (1, 2, 3)]
+            fates = {rgb._served_key(t): None for t in batch}
+            rgb._take_served_round(batch, set(), [], fates, [])
+        finally:
+            rgb.GATEWAY_INSTANCE = ""
+            rgb._post_task_ack = real_post
+        at = dict(acks)
+        check("the sibling with no owner wait is acked before any waited message",
+              at.get("task-W3", 9) < 0.3, repr(acks))
+        check("the waited messages are still answered once the wait ends",
+              {"task-W1", "task-W2"} <= set(at) and at["task-W1"] >= 0.5, repr(acks))
+        check("a round waits once, not once per message", at.get("task-W2", 9) < 0.9, repr(acks))
     finally:
         connections.event_owner_lanes = real_owner
         lane_dedupe.OWNER_WAIT_S = real_wait
