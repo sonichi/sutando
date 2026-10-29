@@ -604,7 +604,9 @@ lock, is not a restart. Each run appends one line to `~/keepalive-probe.log`:
 2026-10-16T03:02:51Z keepawake listener=down restarted=1
 ```
 
-`listener` is what the run found; `restarted=1` means it started Sparrow again.
+`listener` is what the run found: `up`, `up-not-connected` (running, but its
+gateway connection is down, which a restart does not fix, so none is attempted)
+or `down`; `restarted=1` means it started Sparrow again.
 With no systemd unit for Sparrow (one install wrote or a hand-made one; a unit
 runs its own Sparrow, which the run never replaces), a running Sparrow whose
 `REMOTE_HEALTH_COMMAND` (from `/proc`) is missing or differs from this
@@ -630,12 +632,13 @@ panel shows this agent's core instead of asking you to update:
 | none yet | timed from when install wrote the task: `unknown` for its first 30 minutes (neither red nor green), then `abnormal` / `keepawake-not-running` (a task the scheduler never runs) | | |
 | no `sparrow-keepawake` task installed | no row: the panel shows the basic status, as before | | |
 
-Two more checks turn the row `abnormal` whatever the keepawake line says, so a
+Three more checks turn the row `abnormal` whatever the keepawake line says, so a
 fresh keepawake line never hides a stopped hook:
 
 | Check | `reason` |
 | --- | --- |
 | the hook's last run (`STATE_DIR/hatch-hook-last-run`) is over 5 minutes old; a hook that never ran is timed from when `install` last wrote a script | `hook-not-running` |
+| Sparrow's status file says it is running but not connected (the check `verify` reports as "Sparrow is running but not connected", for example a rejected relay token); `since` is its last good poll (`last_ok_ts`), when it has one. A restart does not fix this: fix the token or the connection | `listener-not-connected` |
 | a task file with no result (any `GATEWAY_INSTANCE`, the agent's own messages excepted) is over 15 minutes old | `task-not-picked-up` |
 
 A held task whose room line has not been delivered is counted too, once the hold is over 10
@@ -647,7 +650,7 @@ minutes old. The drain's own state decides which reason applies:
 | gone from the queue with no delivery receipt (the post may have happened and only the best-effort receipt write failed) | `task-held-line-unconfirmed`: delivery can't be confirmed |
 
 When more than one applies, `reason` names the first of
-`keepawake-not-running`, `hook-not-running`, `task-not-picked-up`,
+`keepawake-not-running`, `hook-not-running`, `listener-not-connected`, `task-not-picked-up`,
 `task-held-line-undelivered`, `task-held-line-unconfirmed`, and `since`
 is when that one went bad.
 

@@ -2023,7 +2023,7 @@ class InstallOrderTest(Service):
 class Keepalive(Base):
     """The one keepawake task install schedules, the command it runs, and Sparrow's health row."""
     cli, state, sparrow_status = Cli.cli, Cli.state, Cli.sparrow_status
-    LINE = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ keepawake listener=(up|down) "
+    LINE = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ keepawake listener=(up|up-not-connected|down) "
                       r"restarted=[01]( reason=\S+)?$")
 
     @property
@@ -2133,7 +2133,7 @@ class Keepalive(Base):
 
     def test_keepawake_leaves_a_running_listener_alone_and_status_writes_nothing(self):
         self.installed()
-        self.sparrow_status(connected=False, error="401")
+        self.sparrow_status()
         r = self.cli("keepalive", "status")
         self.assertRegex(r.stdout.strip(), r"Z listener=up last_keepawake=never health=unknown$")
         self.assertFalse(self.log.exists())
@@ -2147,6 +2147,53 @@ class Keepalive(Base):
                         "no lock record names the running Sparrow")
         self.assertRegex(self.cli("keepalive", "status").stdout.strip(),
                          r"Z listener=up last_keepawake=\S+Z health=healthy$")
+
+    def test_a_running_sparrow_that_is_not_connected_says_so_and_is_not_restarted(self):
+        self.installed()
+        self.hook_ran()
+        self.sparrow_status(connected=False, error="401 token rejected")
+        with mock.patch.object(keepalive, "restart_listener") as restart:
+            r = self.cli("keepalive", "keepawake")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        restart.assert_not_called()
+        (line,) = self.log.read_text().splitlines()
+        self.assertRegex(line, self.LINE)
+        self.assertIn(" keepawake listener=up-not-connected restarted=0", line)
+        row = self.health()
+        self.assertEqual((row["alive"], row["condition"], row["reason"]),
+                         (True, "abnormal", keepalive.LISTENER_NOT_CONNECTED))
+        self.assertIsNone(row["since"], "the status file names no last good poll")
+        self.assertEqual(hc.validate(row), (row, None))
+        self.assertRegex(self.cli("keepalive", "status").stdout.strip(),
+                         r"Z listener=up-not-connected last_keepawake=\S+Z "
+                         r"health=abnormal \(listener-not-connected\)$")
+        r = self.cli("verify")
+        self.assertIn("FAIL sparrow: Sparrow is running but not connected: 401 token rejected", r.stdout)
+        self.assertIn("health=abnormal (listener-not-connected); Sparrow is running but not "
+                      "connected", r.stdout)
+        self.assertIn("a restart does not fix a rejected token", r.stdout)
+        # Kill control: the same Sparrow connected again reads plain up and healthy.
+        self.sparrow_status()
+        self.assertEqual(self.health()["condition"], "healthy")
+        self.assertRegex(self.cli("keepalive", "status").stdout.strip(),
+                         r"Z listener=up last_keepawake=\S+Z health=healthy$")
+
+    def test_a_lost_connection_outranks_a_task_it_left_waiting(self):
+        self.installed()
+        self.keepawake_at(time.time() - 60)
+        self.hook_ran()
+        self.add_task("task-1784700000009", "$waiting", mtime=time.time() - 20 * 60)
+        self.sparrow_status()
+        self.assertEqual(self.health()["reason"], keepalive.TASK_NOT_PICKED_UP)
+        status = self.state / "gateway-status.json"
+        rec = json.loads(status.read_text())
+        rec.update(connected=False, error="401", last_ok_ts=int(time.time()) - 3600)
+        status.write_text(json.dumps(rec))
+        row = self.health()
+        self.assertEqual((row["condition"], row["reason"]),
+                         ("abnormal", keepalive.LISTENER_NOT_CONNECTED))
+        self.assertAlmostEqual(row["since"], time.time() - 3600, delta=5)
+        self.assertEqual(hc.validate(row), (row, None))
 
     def test_keepawake_restarts_through_the_installed_service(self):
         self.installed()

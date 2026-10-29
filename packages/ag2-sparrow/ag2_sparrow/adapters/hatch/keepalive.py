@@ -4,14 +4,15 @@ Every 15 minutes the agent's scheduler runs `keepalive keepawake` (the run is wh
 the agent awake); the agent registers that task itself, since Hatch's scheduler does not
 run task files on disk. It restarts Sparrow if Sparrow is not running, replaces one no unit
 runs whose REMOTE_HEALTH_COMMAND is missing or not this install's, and appends one line
-to the keepalive log: `<utc> keepawake listener=up|down restarted=0|1[ reason=...]`. A scheduler
+to the keepalive log: `<utc> keepawake listener=up|up-not-connected|down restarted=0|1[ reason=...]`. A scheduler
 that stops running the task cannot report that itself, so Sparrow does: it runs
 `keepalive health` (REMOTE_HEALTH_COMMAND, which install puts in Sparrow's
 environment) and sends the row on its heartbeat. The row is healthy while the last
 keepawake line is under two intervals old, unknown while a task that has not run yet
 is that young, else abnormal (`keepawake-not-running`). A fresh keepawake line does not
 mask the hook: the row is also abnormal when the hook has not run in HOOK_STALE_S
-(`hook-not-running`), a task has waited over TASK_PICKUP_S (`task-not-picked-up`), or a held
+(`hook-not-running`), Sparrow runs but its gateway connection is down (`listener-not-connected`,
+ranked above a waiting task, which it causes), a task has waited over TASK_PICKUP_S (`task-not-picked-up`), or a held
 task's room line is still queued or parked after HELD_LINE_DELIVER_S (`task-held-line-undelivered`)
 or left the queue with no receipt (`task-held-line-unconfirmed`).
 `keepalive report` lists the log's gaps, and reads the lines of the earlier
@@ -42,6 +43,7 @@ STALE_S = 2 * INTERVAL_MIN * 60
 NOT_RUNNING = "keepawake-not-running"
 HOOK_NOT_RUNNING, HOOK_STALE_S = "hook-not-running", 5 * 60
 TASK_NOT_PICKED_UP, TASK_PICKUP_S = "task-not-picked-up", 15 * 60
+LISTENER_NOT_CONNECTED = "listener-not-connected"
 # A healthy row's reason while a task waits on a deliberate hold, never a problem.
 TASK_HELD = "task-held-for-owner"
 # A hold whose room line the drain has not delivered this long is reported, never acted on: the
@@ -60,6 +62,10 @@ REASON_HINTS = {
     TASK_NOT_PICKED_UP: f"an s.space task has been open over {TASK_PICKUP_S // 60} minutes: "
                         "the hook is not waking a worker for it, or a worker handed it off "
                         "without running hold",
+    LISTENER_NOT_CONNECTED: "Sparrow is running but not connected to s.space, so no task reaches "
+                            "this agent; a restart does not fix a rejected token: fix the relay "
+                            "token (REMOTE_TASK_TOKEN) or the connection; ag2-sparrow-hatch "
+                            "verify names the error",
     TASK_HELD: "a worker parked an s.space task for your go (ag2-sparrow-hatch hold)",
     TASK_HELD_UNDELIVERED: f"a task was held over {HELD_LINE_DELIVER_S // 60} minutes ago and its "
                            "room notice is still queued, being sent, was parked after failed "
@@ -160,6 +166,17 @@ def listener_up(cfg: dict, now: float) -> bool:
     """Running, connected or not: a rejected token is not fixed by a restart."""
     code, _ = _cli.check_sparrow(_state_dir(cfg), now=now, instance=_instance(cfg))
     return code != _cli.SPARROW_DOWN
+
+
+def listener_not_connected(cfg: dict, now: float) -> bool:
+    """Running but not connected, judged by verify's own check (check_sparrow)."""
+    code, _ = _cli.check_sparrow(_state_dir(cfg), now=now, instance=_instance(cfg))
+    return code == _cli.SPARROW_NOT_CONNECTED
+
+
+def listener_label(cfg: dict, now: float, up: bool) -> str:
+    """The `listener=` value for a listener_up result."""
+    return "down" if not up else "up-not-connected" if listener_not_connected(cfg, now) else "up"
 
 
 def _found(directory: Path, name: str) -> "list[Path]":
@@ -920,6 +937,7 @@ def keepawake(cfg: dict, log: Path, now: float | None = None) -> int:
             up, restarted, rc, reason = _keep_listener(cfg, now)
         else:
             up, restarted, rc, reason = listener_up(cfg, now), 0, 0, None
+            up = listener_label(cfg, now, up)
     if not free:
         print("an upgrade is running; Sparrow is left as it is")
     elif blocked:
@@ -927,7 +945,7 @@ def keepawake(cfg: dict, log: Path, now: float | None = None) -> int:
         print(f"error: Sparrow is not restarted: {blocked}; run ag2-sparrow-hatch install to "
               "put a verified version back", file=sys.stderr)
     upgrade = _served_setup(cfg, settled, blocked) if free else "running"
-    line = f"{_utc(now)} keepawake listener={'up' if up else 'down'} restarted={restarted}" \
+    line = f"{_utc(now)} keepawake listener={up} restarted={restarted}" \
         + (f" reason={reason}" if reason else "") + (f" upgrade={upgrade}" if upgrade else "")
     _log_line(log, line)
     return rc
@@ -944,10 +962,11 @@ def _log_line(log: Path, line: str) -> None:
     print(line)
 
 
-def _keep_listener(cfg: dict, now: float) -> "tuple[bool, int, int, str | None]":
+def _keep_listener(cfg: dict, now: float) -> "tuple[str, int, int, str | None]":
     """Restart Sparrow if it is down, or replace one without the health command:
-    (up, restarted, rc, reason)."""
+    (listener label as found, restarted, rc, reason)."""
     up, restarted, rc, reason = listener_up(cfg, now), 0, 0, None
+    label = listener_label(cfg, now, up)
     if not up:
         ok, how = restart_listener(cfg)
         if ok:
@@ -973,7 +992,7 @@ def _keep_listener(cfg: dict, now: float) -> "tuple[bool, int, int, str | None]"
             else:
                 print(f"the replace failed: {how}", file=sys.stderr)
                 rc = 1
-    return up, restarted, rc, reason
+    return label, restarted, rc, reason
 
 
 def _settle_upgrade(cfg: dict, now: float) -> "tuple[str | None, str | None]":
@@ -1095,6 +1114,11 @@ def health_row(cfg: dict, log: Path, now: float | None = None) -> dict | None:
     hook = hook_last_run(cfg)
     if hook is not None and not _within(now, hook, hook_stale_s):
         problems.append((HOOK_NOT_RUNNING, hook + hook_stale_s))
+    # Before TASK_NOT_PICKED_UP: a lost connection is why a task waits, so it is the reason sent.
+    if listener_not_connected(cfg, now):
+        last_ok = bounded_number((_status_snapshot(_state_dir(cfg), _instance(cfg)) or {})
+                                 .get("last_ok_ts"), 0, 1e11)
+        problems.append((LISTENER_NOT_CONNECTED, last_ok))
     oldest, held, stuck = open_tasks(cfg, now)
     if oldest is not None and now - oldest > tune["stuck_task_age_s"]:
         problems.append((TASK_NOT_PICKED_UP, oldest + tune["stuck_task_age_s"]))
@@ -1121,9 +1145,10 @@ def status_line(cfg: dict, now: float | None = None) -> "tuple[str, dict | None]
     health = ("none" if row is None else row["condition"]
               + (f" ({row['reason']})" if row["reason"] else ""))
     up = listener_up(cfg, now)
+    label = listener_label(cfg, now, up)
     # The row cannot carry this: a Sparrow without the command never asks for the row.
     flag = up and unmanaged_health_problem(cfg)[1] == NO_HEALTH_COMMAND
-    return (f"{_utc(now)} listener={'up' if up else 'down'} "
+    return (f"{_utc(now)} listener={label} "
             f"last_keepawake={_utc(last) if last is not None else 'never'} health={health}"
             + (f" flag=sparrow-{NO_HEALTH_COMMAND}" if flag else ""), row)
 
