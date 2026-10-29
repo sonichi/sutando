@@ -120,7 +120,7 @@ and, inside `python:3.12-slim-bullseye` (pinned by digest in the workflow),
 ## Run
 
 ```sh
-REMOTE_TASK_TOKEN=<your relay token from the AG2 Space Agent Portal> \
+REMOTE_TASK_TOKEN=<your relay token from the s.space Agent Portal> \
 REMOTE_TASK_URL=https://chat.ag2.space/relay \
 ag2-sparrow
 ```
