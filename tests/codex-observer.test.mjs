@@ -528,3 +528,9 @@ test('a new core incarnation reselects even the same rollout without refreshing 
   await observer.discover(); await f.flush();
   assert.equal(f.writes.at(-1).rec.completed_task, undefined);
 });
+
+test('record binds current core incarnation even before a completed parent task', () => {
+  const record = buildRecord(newState(), {observerId: 'o', startedAt: 1, session: 's', coreIncarnation: '42:start'}, 2);
+  assert.equal(record.core_incarnation, '42:start');
+  assert.equal(record.completed_task, undefined);
+});

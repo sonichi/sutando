@@ -156,6 +156,7 @@ send_prompt_keys() {
   if [ "${TRACK_INFLIGHT:-0}" = 1 ]; then
     [ "$incarnation" = "$(core_incarnation)" ] || return 1
     [ "$incarnation" = "$(pane_incarnation "$target")" ] || return 1
+    "$NOTIFIER_PY" "$PICKUP_PY" ready "$WORKSPACE_DIR" "$SESSION" "$incarnation" || return 1
     "$NOTIFIER_PY" "$PICKUP_PY" send "$TMUX_SOCKET" "$target" "$incarnation" "$@"
   else
     bash "$REPO/src/tmux-pane-keys.sh" --python "$NOTIFIER_PY" -S "$TMUX_SOCKET" -t "$target" -- "$@"
@@ -663,6 +664,7 @@ process_responsive_queue() {
       "$NOTIFIER_PY" "$DISPATCH_PY" inflight-live "$INFLIGHT_DIR" "$filename" "$incarnation" || live_rc=$?
       [ "$live_rc" != 0 ] || continue
       [ "$live_rc" = 1 ] || return 0
+      "$NOTIFIER_PY" "$PICKUP_PY" ready "$WORKSPACE_DIR" "$SESSION" "$incarnation" || return 0
       if ! core_is_idle; then
         clear_automation_leftover && core_is_idle || return 0
       fi

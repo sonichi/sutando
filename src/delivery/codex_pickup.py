@@ -29,6 +29,14 @@ def mark(workspace, filename, incarnation, prompt):
     mark_inflight(inflight, filename, incarnation, hashlib.sha256(prompt.encode()).hexdigest())
 
 
+def ready(workspace, session, incarnation, now=None):
+    record, _ = load(workspace, "core", time.time() if now is None else now)
+    return bool(record and incarnation and record["observer"] == "codex-observer"
+                and record["session"] == session and record.get("core_incarnation") == incarnation
+                and record["phase"] == "idle" and record["motion"] == "idle"
+                and record["condition"] == "healthy")
+
+
 def yielded(workspace, filename, incarnation, session, timeout=3600, now=None):
     inflight, acknowledged = paths(workspace)
     if not incarnation or not inflight_is_live(inflight, filename, incarnation):
@@ -131,6 +139,8 @@ def send_keys(socket, target, incarnation, *keys):
 def main():
     command, workspace, *args = sys.argv[1:]
     try:
+        if command == "ready":
+            return 0 if ready(workspace, *args) else 1
         if command == "send":
             return send_keys(workspace, *args)
         if command == "mark":

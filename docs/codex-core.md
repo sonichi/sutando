@@ -102,7 +102,13 @@ The Codex implementation:
 ### Pickup while delegated work continues
 
 The managed core notifier keeps reading task announcements while a previously
-submitted task awaits its final result. It admits another task only when the
+submitted task awaits its final result. Every new submission, including the first
+one after notifier restart, requires a fresh, healthy, idle observer record bound
+to the same core process incarnation. Missing, unknown, stale or moving runtime
+state blocks submission even if the terminal looks idle. A newly started core with
+no authoritative turn state waits until a real interactive turn completes; there
+is no pane-only fallback. The observer must be restarted to emit incarnation data.
+It admits another task only when the
 terminal is positively idle and empty, and the observer has witnessed the exact
 submitted prompt in a successfully completed **parent** turn. The receipt binds
 the prompt digest, its acceptance/completion times and the core process incarnation.

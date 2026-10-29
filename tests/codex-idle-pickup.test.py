@@ -16,20 +16,26 @@ import unittest
 
 REPO = Path(os.environ.get("PICKUP_TEST_REPO", Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(REPO / "src"))
-from delivery.codex_pickup import mark, paths, yielded, record_event, warning
+from delivery.codex_pickup import mark, paths, yielded, record_event, warning, ready
 from runtime_observation import write
+
+
+def idle_record(incarnation="7:start", session="core"):
+    now = time.time()
+    return dict(schema=1, observer="codex-observer", observer_version="test", observer_id="test",
+                observer_started_at=now-100, seat="core", session=session, claude_session_id=None,
+                seq=2, changed_at=now, condition_since=None, last_success_at=now, heartbeat_at=now,
+                phase="idle", motion="idle", condition="healthy", reason=None,
+                core_incarnation=incarnation)
 
 
 def observation(ws, filename, incarnation="7:start", digest=None):
     marker = paths(ws)[0] / filename
-    now = time.time() + .01
-    rec = dict(schema=1, observer="codex-observer", observer_version="test", observer_id="test",
-               observer_started_at=now-100, seat="core", session="core", claude_session_id=None,
-               seq=2, changed_at=now, condition_since=None, last_success_at=now, heartbeat_at=now,
-               phase="idle", motion="idle", condition="healthy", reason=None,
-               completed_task=dict(prompt_sha256=digest or marker.read_text().splitlines()[1],
-                                   accepted_at=marker.stat().st_mtime + .001, completed_at=now,
-                                   core_incarnation=incarnation))
+    rec = idle_record(incarnation)
+    rec["heartbeat_at"] += .01
+    rec["completed_task"] = dict(prompt_sha256=digest or marker.read_text().splitlines()[1],
+                                 accepted_at=marker.stat().st_mtime + .001,
+                                 completed_at=rec["heartbeat_at"], core_incarnation=incarnation)
     write(rec, ws)
     return rec
 
@@ -40,6 +46,9 @@ class ReceiptTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.ws = Path(self.tmp.name)
         mark(self.ws, "task-a.txt", "7:start", "private prompt")
+
+    def test_missing_observation_refuses_first_submission(self):
+        self.assertFalse(ready(self.ws, "core", "7:start"))
 
     def test_exact_completed_turn_is_durable_when_observer_moves_on(self):
         observation(self.ws, "task-a.txt")
@@ -81,7 +90,7 @@ class ReceiptTests(unittest.TestCase):
 
 
 class SchedulerTests(unittest.TestCase):
-    def run_scheduler(self, scenario):
+    def run_scheduler(self, scenario, runtime=None):
         with tempfile.TemporaryDirectory() as temp:
             ws = Path(temp)
             for d in ["tasks", "results", "queue", "payload", "logs", "context"]:
@@ -90,6 +99,7 @@ class SchedulerTests(unittest.TestCase):
                 (ws/"tasks"/name).write_text("task: test\n")
                 (ws/"payload"/name).write_text(str(ws/"tasks"/name))
             (ws/"queue/task-a.txt").write_text("low")
+            write(idle_record() if runtime is None else runtime, ws)
             script = Path(os.environ.get("PICKUP_TEST_NOTIFIER", REPO/"src/agent/codex/cli/task-notifier.sh")).read_text()
             names = ["has_result", "task_payload", "log_notifier", "queue_head", "submit_task",
                      "pickup_event", "finish_responsive_task", "reconcile_finished_pickups", "process_responsive_queue", "process_announced_queue"]
@@ -130,7 +140,18 @@ deliver_prompt() {
             except subprocess.TimeoutExpired:
                 raise AssertionError("notifier still waits for delegated result instead of accepting the next idle turn") from None
             self.assertEqual(result.returncode, 0, result.stderr)
-            return (ws/"sent").read_text().splitlines()
+            return (ws/"sent").read_text().splitlines() if (ws/"sent").exists() else []
+
+    def test_restart_with_idle_looking_pane_requires_fresh_matching_idle_observer(self):
+        for patch in [dict(phase="unknown", motion="unknown"), dict(phase="tool", motion="moving"),
+                      dict(heartbeat_at=time.time()-100), dict(core_incarnation="8:other"),
+                      dict(session="other"), dict(observer="other"), dict(core_incarnation=None),
+                      dict(condition="unknown"), dict(condition="abnormal", reason="quota-limit")]:
+            with self.subTest(patch=patch):
+                record = idle_record()
+                record.update(patch)
+                self.assertEqual(self.run_scheduler("process_announced_queue", runtime=record), [])
+        self.assertEqual(self.run_scheduler("process_announced_queue"), ["task-a.txt"])
 
     def test_completed_parent_turn_releases_next_task_without_worker_result(self):
         sent = self.run_scheduler('''process_announced_queue
@@ -229,7 +250,7 @@ log_notifier() { :; }
 """ + functions + "\ndeliver_prompt task-a.txt 'Sutando task ready: task-a.txt. synthetic'\n"
             env = {"PATH": os.environ['PATH'], "HOME": temp, "WORKSPACE_DIR": temp, "REPO": str(REPO),
                    "PICKUP_PY": str(shim), "NOTIFIER_PY": sys.executable, "TMUX_SOCKET": str(ws/'socket'),
-                   "TRACK_INFLIGHT": "1", "POLL_INTERVAL": ".01", "SUBMIT_CONFIRM_TIMEOUT": "1", "SUBMIT_RETRIES": "1",
+                   "SESSION": "core", "TRACK_INFLIGHT": "1", "POLL_INTERVAL": ".01", "SUBMIT_CONFIRM_TIMEOUT": "1", "SUBMIT_RETRIES": "1",
                    "REPLACEMENT": str(int(replacement)), "FAIL_PASTE": str(int(fail_paste))}
             proc = subprocess.run(['bash', '-c', harness], env=env, capture_output=True, text=True, timeout=5)
             return proc.returncode, (ws/'entered').read_text() if (ws/'entered').exists() else None, (paths(ws)[0]/'task-a.txt').exists(), proc.stderr

@@ -202,6 +202,16 @@ class CodexCoreLauncherTests(unittest.TestCase):
                 "synced": False, "value": str(self.root / "codex-home"),
             }],
         }))
+        started = subprocess.check_output(["ps", "-o", "lstart=", "-p", str(os.getpid())],
+                                          env={**os.environ, "LC_ALL": "C", "TZ": "UTC"}, text=True)
+        now = time.time()
+        record = dict(schema=1, observer="codex-observer", observer_version="test", observer_id="test",
+                      observer_started_at=now, seat="core", session="sutando-core", claude_session_id=None,
+                      seq=1, changed_at=now, condition_since=None, last_success_at=now, heartbeat_at=now,
+                      phase="idle", motion="idle", condition="healthy", reason=None,
+                      core_incarnation=f"{os.getpid()}:{' '.join(started.split())}")
+        subprocess.run([sys.executable, str(self.root / "src/runtime_observation.py"), "write",
+                        "--workspace", str(workspace)], input=json.dumps(record), text=True, check=True)
         self.bin.mkdir()
         self._write_exe("codex", '#!/bin/bash\n[ "${1:-}" = login ] && exit 0\nexit 0\n')
         self._write_exe("fswatch", '#!/bin/bash\nexit 0\n')
@@ -2227,6 +2237,17 @@ exit 0
         self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
         self.assertIn("send-keys -t =sutando-core:0 -l -- Sutando task ready: task-owner.txt", calls)
         self.assertTrue(done.exists())
+
+    def test_managed_notifier_restart_unknown_observer_does_not_send_into_idle_pane(self):
+        path = self.root / "workspace/state/runtime-observations/core.json"
+        record = json.loads(path.read_text())
+        record.update(phase="unknown", motion="unknown", seq=2, heartbeat_at=time.time())
+        subprocess.run([sys.executable, str(self.root / "src/runtime_observation.py"), "write",
+                        "--workspace", str(self.root / "workspace")], input=json.dumps(record), text=True, check=True)
+        result, calls, done = self._run_managed_notifier_against_pane("› \n← for agents\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("send-keys", calls)
+        self.assertFalse(done.exists())
 
     def test_managed_notifier_holds_while_a_real_picker_is_open(self):
         result, calls, done = self._run_managed_notifier_against_pane(

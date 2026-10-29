@@ -81,6 +81,12 @@ def validate(record) -> dict:
         out[key] = record[key]
     if (out["condition"] == "abnormal") != (out["reason"] is not None):
         raise ValueError("reason is required exactly when abnormal")
+    incarnation = record.get("core_incarnation")
+    if incarnation is not None:
+        if (not isinstance(incarnation, str) or not 1 <= len(incarnation) <= 160
+                or "\n" in incarnation or "\r" in incarnation):
+            raise ValueError("bad core_incarnation")
+        out["core_incarnation"] = incarnation
     completed = record.get("completed_task")
     if completed is not None:
         if not isinstance(completed, dict):

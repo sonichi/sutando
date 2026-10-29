@@ -45,6 +45,13 @@ class ValidateTests(Base):
                                      for k, v in rec().items()}))
         self.assertNotIn("extra", out)
 
+    def test_optional_core_incarnation_is_preserved_and_bounded(self):
+        self.assertEqual(ro.validate(rec(core_incarnation="42:start"))["core_incarnation"], "42:start")
+        self.assertNotIn("core_incarnation", ro.validate(rec()))
+        for bad in ["", 42, "x" * 161, "42\nstart", "42\rstart"]:
+            with self.assertRaises(ValueError):
+                ro.validate(rec(core_incarnation=bad))
+
     def test_completed_task_is_optional_bounded_and_contains_only_metadata(self):
         receipt = {"prompt_sha256": "a" * 64, "accepted_at": NOW - 8,
                    "completed_at": NOW - 3, "core_incarnation": "42:Tue Oct  6 02:00:00 2026"}

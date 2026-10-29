@@ -132,6 +132,7 @@ export function buildRecord(state, ident, now) {
   return {
     ...(state.completedTask && ident.coreIncarnation
       ? {completed_task: {...state.completedTask, core_incarnation: ident.coreIncarnation}} : {}),
+    ...(ident.coreIncarnation ? {core_incarnation: ident.coreIncarnation} : {}),
     schema: 1, observer: OBSERVER, observer_version: VERSION, observer_id: ident.observerId,
     observer_started_at: ident.startedAt, seat: 'core', session: ident.session, claude_session_id: null,
     seq: state.seq, changed_at: state.changedAt || ident.startedAt, condition_since: state.conditionSince,
