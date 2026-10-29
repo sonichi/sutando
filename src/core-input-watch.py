@@ -546,7 +546,7 @@ def _gateway_status(state_dir):
 def gateway_alive(app_data, state_dir=None):
     """Whether the relay gateway is up.
 
-    Prefer the bridge's OWN status sidecar (state/gateway-status.json), which
+    Prefer the bridge's OWN status sidecar (the active lane's, else the primary connection's), which
     remote_gateway_bridge rewrites on every poll outcome. It reports whether the
     connection is *serving*; the pgrep paths below only ever answered "is there a
     process whose argv looks right", which is a proxy for the wrong thing.

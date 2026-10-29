@@ -2285,12 +2285,12 @@ class LegacyHandoff(Base):
         self.assertEqual((out["primary"], out["relaunch_needed"]), (True, True), "relaunch_needed reads the same lease")
 
 
-class Promote(Base):
-    """`promote` moves the primary while the old primary's bridge runs (the legacy one included):
-    start the new bridge, stop the old one, park its row, flip; refused stops roll back."""
+class PromoteFixtures(Base):
+    """An install whose legacy row is primary beside one named row, and a bridge spawn that connects."""
 
     BETA = "beta-fixture-net"
     ALPHA = "alpha-fixture-net"
+    PARK = False
 
     def setUp(self):
         super().setUp()
@@ -2333,6 +2333,7 @@ class Promote(Base):
         kw.setdefault("kill", self.kill)
         kw.setdefault("spawn", self.spawn)
         kw.setdefault("environ", {})
+        kw.setdefault("park", self.PARK)
         return C.promote(instance, repo=self.ws / "repo", logs_dir=self.ws / "logs", workspace=self.ws,
                          vault=self.vault, **kw)
 
@@ -2346,6 +2347,28 @@ class Promote(Base):
 
     def by_inst(self):
         return {r["instance"]: r for r in self.rows()}
+
+    def no_primary(self):
+        self.add(fetch=agents("@a:alpha-fixture.net"))
+        C.set_primary(self.ALPHA, workspace=self.ws)
+        C.remove_connection(self.ALPHA, force=True, workspace=self.ws, vault=self.vault)
+        self.assertIsNone(C.primary_instance(self.ws))
+
+    def covered_legacy(self):
+        """An install whose REMOTE_TASK_TOKEN names a server a named row already covers: no legacy row."""
+        with C._transaction(self.ws) as rec:
+            rec["rows"] = [r for r in rec["rows"] if r["instance"]]
+        C.import_from_env({"REMOTE_TASK_TOKEN": TOKEN_B}, workspace=self.ws, vault=self.vault)
+        self.assertNotIn("", self.by_inst(), "the env token gets no row")
+        self.add(fetch=agents("@a:alpha-fixture.net"))
+        return self.legacy()
+
+
+class Promote(PromoteFixtures):
+    """`promote(park=True)` moves the primary while the old primary's bridge runs (the legacy one
+    included): start the new bridge, stop the old one, park its row, flip; refused stops roll back."""
+
+    PARK = True
 
     def test_the_running_legacy_primary_is_stopped_and_parked_and_the_new_row_takes_over(self):
         legacy = self.legacy()
@@ -2485,12 +2508,6 @@ class Promote(Base):
             self.promote(self.BETA, spawn=broken)
         rows = self.by_inst()
         self.assertEqual((rows[self.BETA]["parked"], rows[self.ALPHA]["primary"]), (True, True))
-
-    def no_primary(self):
-        self.add(fetch=agents("@a:alpha-fixture.net"))
-        C.set_primary(self.ALPHA, workspace=self.ws)
-        C.remove_connection(self.ALPHA, force=True, workspace=self.ws, vault=self.vault)
-        self.assertIsNone(C.primary_instance(self.ws))
 
     def test_no_primary_and_no_legacy_bridge_parks_nothing(self):
         self.no_primary()
@@ -2641,15 +2658,6 @@ class Promote(Base):
         self.assertEqual((rows[self.BETA].get("parked"), C.bridge_pid(self.BETA, self.ws)), (True, 0))
         self.assertTrue(C.bridge_pid(self.ALPHA, self.ws), "the old owner's bridge was not stopped")
 
-    def covered_legacy(self):
-        """An install whose REMOTE_TASK_TOKEN names a server a named row already covers: no legacy row."""
-        with C._transaction(self.ws) as rec:
-            rec["rows"] = [r for r in rec["rows"] if r["instance"]]
-        C.import_from_env({"REMOTE_TASK_TOKEN": TOKEN_B}, workspace=self.ws, vault=self.vault)
-        self.assertNotIn("", self.by_inst(), "the env token gets no row")
-        self.add(fetch=agents("@a:alpha-fixture.net"))
-        return self.legacy()
-
     def test_a_legacy_bridge_a_named_row_covers_is_stopped_and_parked(self):
         legacy = self.covered_legacy()
         out = self.promote(self.ALPHA)
@@ -2681,6 +2689,169 @@ class Promote(Base):
             self.promote(self.BETA)
         self.assertEqual(self.events, [])
         self.assertEqual(C.primary_instance(self.ws), "")
+
+
+class PromoteKeepsLanes(PromoteFixtures):
+    """The default move keeps the old owner's bridge running as a secondary; parking is `park`, one
+    row at a time, or `park_legacy` for the cutover."""
+
+    PARK = False
+
+    def test_a_move_keeps_the_legacy_row_enabled_and_running(self):
+        legacy = self.legacy()
+        out = self.promote(self.BETA)
+        self.assertEqual((out["primary"], out["previous"], out["kept"], out["stopped_pid"], out["changed"]),
+                         (True, None, "", 0, True))
+        self.assertNotIn(("kill", legacy.pid), self.events)
+        self.assertEqual((C.bridge_pid("", self.ws), C.bridge_pid(self.BETA, self.ws)), (legacy.pid, self.child()))
+        rows = self.by_inst()
+        self.assertEqual((rows[""]["primary"], bool(rows[""].get("parked")), bool(rows[""].get("disabled"))),
+                         (False, False, False))
+        self.assertFalse(C.legacy_parked(self.ws), "the legacy bridge keeps polling")
+        status = C.status_for(rows[""], self.ws)
+        self.assertEqual((status["parked"], status["running"]), (False, True))
+        self.assertEqual((C.owns_unaddressed(self.BETA, self.ws), C.owns_unaddressed("", self.ws)), (True, False),
+                         "the primary alone owns unaddressed messages")
+        self.assertFalse([t for level, t in C.notes(self.ws) if level == "warn"],
+                         "a running non-primary legacy lane is not a warning")
+
+    def test_a_named_old_primary_keeps_running_too(self):
+        self.legacy()
+        self.add(fetch=agents("@a:alpha-fixture.net"))
+        self.promote(self.ALPHA)
+        alpha = C.bridge_pid(self.ALPHA, self.ws)
+        out = self.promote(self.BETA)
+        self.assertEqual((out["kept"], out["previous"]), (self.ALPHA, None))
+        self.assertEqual(C.bridge_pid(self.ALPHA, self.ws), alpha)
+        self.assertEqual(sorted(e["instance"] for e in C.launch_plan({}, workspace=self.ws)), [self.ALPHA, self.BETA])
+
+    def test_park_stops_one_secondary_and_refuses_the_primary(self):
+        legacy = self.legacy()
+        self.promote(self.BETA)
+        with self.assertRaises(C.PrimaryCannotPark) as cm:
+            C.park(self.BETA, workspace=self.ws, kill=self.kill)
+        self.assertEqual(cm.exception.CODE, "primary_cannot_park")
+        out = C.park("", workspace=self.ws, kill=self.kill)
+        self.assertEqual((out["parked"], out["stopped_pid"]), (True, legacy.pid))
+        legacy.wait(5)
+        self.assertTrue(C.legacy_parked(self.ws))
+        self.assertEqual(C.primary_instance(self.ws), self.BETA)
+        C.unpark("", repo=self.ws, logs_dir=self.ws, workspace=self.ws, vault=self.vault)
+        self.assertFalse(C.legacy_parked(self.ws))
+
+    def test_park_refused_by_the_bridge_leaves_the_row_as_it_was(self):
+        legacy = self.legacy()
+        self.promote(self.BETA)
+        with self.assertRaises(C.BridgeStillRunning):
+            C.park("", workspace=self.ws, kill=self.refusing(legacy.pid))
+        self.assertIsNone(self.by_inst()[""].get("parked"))
+        self.assertEqual(C.bridge_pid("", self.ws), legacy.pid)
+
+    def test_park_legacy_parks_every_lane_but_the_primary(self):
+        legacy = self.legacy()
+        self.add(fetch=agents("@a:alpha-fixture.net"))
+        self.promote(self.ALPHA)
+        self.promote(self.BETA)
+        alpha = C.bridge_pid(self.ALPHA, self.ws)
+        out = C.park_legacy(workspace=self.ws, kill=self.kill)
+        self.assertEqual((out["primary"], sorted(out["parked"]), out["stopped"]),
+                         (self.BETA, ["", self.ALPHA], {"": legacy.pid, self.ALPHA: alpha}))
+        rows = self.by_inst()
+        self.assertEqual((rows[""]["parked"], rows[self.ALPHA]["parked"], rows[self.BETA].get("parked")), (True, True, None))
+        self.assertEqual((C.bridge_pid("", self.ws), C.bridge_pid(self.ALPHA, self.ws)), (0, 0))
+        self.assertTrue(C.bridge_pid(self.BETA, self.ws), "the primary keeps running")
+        self.assertTrue(C.legacy_parked(self.ws))
+        self.assertEqual(C.park_legacy(workspace=self.ws, kill=self.kill)["parked"], [], "a rerun is a no-op")
+
+    def test_park_legacy_parks_a_rowless_legacy_bridge(self):
+        legacy = self.covered_legacy()
+        self.promote(self.ALPHA)
+        self.assertEqual(C.bridge_pid("", self.ws), legacy.pid, "the move kept it")
+        out = C.park_legacy(workspace=self.ws, kill=self.kill)
+        self.assertEqual((sorted(out["parked"]), out["stopped"][""]), (["", self.BETA], legacy.pid))
+        self.assertTrue(C.legacy_parked(self.ws))
+
+    def test_park_of_the_rowless_legacy_bridge_stops_and_records_it(self):
+        legacy = self.covered_legacy()
+        self.promote(self.ALPHA)
+        out = C.park("", workspace=self.ws, kill=self.kill)
+        self.assertEqual((out["parked"], out["stopped_pid"]), (True, legacy.pid))
+        self.assertTrue(C.legacy_parked(self.ws))
+
+    def test_park_legacy_needs_a_primary(self):
+        self.no_primary()
+        with self.assertRaises(C.NoPrimary) as cm:
+            C.park_legacy(workspace=self.ws, kill=self.kill)
+        self.assertEqual(cm.exception.CODE, "no_primary")
+        self.assertFalse(any(r.get("parked") for r in self.rows()))
+
+    def test_promoting_the_legacy_row_back_keeps_the_named_bridge(self):
+        self.legacy()
+        self.promote(self.BETA)
+        beta = C.bridge_pid(self.BETA, self.ws)
+        out = self.promote("")
+        self.assertEqual((out["primary"], out["kept"], out["previous"], out["stopped_pid"]), (True, self.BETA, None, 0))
+        self.assertEqual(C.bridge_pid(self.BETA, self.ws), beta)
+
+
+class EventOwner(Base):
+    """`event_owner_lanes`: which lane answers a room message two running lanes may both receive."""
+
+    LEGACY_MXID, NEW_MXID = "@sutando:ag2.space", "@sutando:beta-fixture.net"
+    NEW = "beta-fixture-net"
+
+    def setUp(self):
+        super().setUp()
+        C.import_from_env({"REMOTE_TASK_TOKEN": "https://chat.ag2.space|legacy"}, workspace=self.ws, vault=self.vault)
+        self.add(TOKEN_B, fetch=agents(self.NEW_MXID))
+        with C._transaction(self.ws) as rec:
+            for r in rec["rows"]:
+                r["primary"] = r["instance"] == self.NEW
+                if not r["instance"]:
+                    r["agent_mxid"] = self.LEGACY_MXID
+        self.bridges = [bridge_lease.start(self.ws, ""), bridge_lease.start(self.ws, self.NEW)]
+        self.children.extend(self.bridges)
+        self.members = f"@owner:ag2.space, {self.LEGACY_MXID}, {self.NEW_MXID}"
+
+    def owner(self, body="hello", **fields):
+        fields.setdefault("room_members", self.members)
+        return C.event_owner_lanes({"task": body, **fields}, self.ws)
+
+    def test_the_primary_owns_an_unaddressed_message(self):
+        self.assertEqual(self.owner("anyone around?"), [self.NEW])
+
+    def test_a_mention_of_the_legacy_mxid_is_the_legacy_lanes(self):
+        self.assertEqual(self.owner(f"{self.LEGACY_MXID} can you check this?"), [""])
+        self.assertEqual(self.owner("thanks", reply_to_sender=self.LEGACY_MXID), [""], "a reply to its message")
+
+    def test_an_unreadable_record_gives_no_preference(self):
+        C.record_path(self.ws).write_text("{broken")
+        self.assertEqual(self.owner(), [])
+
+    def test_a_mention_of_the_new_mxid_is_the_primarys(self):
+        self.assertEqual(self.owner(f"hi {self.NEW_MXID}"), [self.NEW])
+
+    def test_both_named_falls_back_to_the_primary(self):
+        self.assertEqual(self.owner(f"{self.LEGACY_MXID} and {self.NEW_MXID}"), [self.NEW])
+
+    def test_a_longer_id_sharing_the_prefix_is_not_a_mention(self):
+        self.assertEqual(self.owner(f"{self.LEGACY_MXID}x hello"), [self.NEW])
+
+    def test_no_preference_when_the_owner_is_not_a_listed_member(self):
+        self.assertEqual(self.owner(f"{self.LEGACY_MXID} hi", room_members=f"@owner:ag2.space, {self.NEW_MXID}"), [])
+        self.assertEqual(self.owner("hi", room_members=f"@owner:ag2.space, {self.LEGACY_MXID}"), [],
+                         "a legacy-only room: the legacy lane answers at once")
+        self.assertEqual(self.owner("hi", room_members=None), [])
+
+    def test_no_preference_when_the_owner_bridge_is_down_or_parked(self):
+        bridge_lease.stop(self.bridges[1])
+        self.assertEqual(self.owner("hi"), [])
+        with C._transaction(self.ws) as rec:
+            C._find(rec["rows"], "")["parked"] = True
+        self.assertEqual(self.owner(f"{self.LEGACY_MXID} hi"), [], "a single enabled lane has nothing to prefer")
+
+    def test_members_beyond_the_cap_are_not_read_as_listed(self):
+        self.assertEqual(C._listed_members(f"@a:x, {self.NEW_MXID} (+4 more)"), {"@a:x", self.NEW_MXID})
 
 
 class LegacyReadopt(Base):

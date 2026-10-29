@@ -41,14 +41,15 @@ def active_lane() -> str | None:
 
 
 def status_path(state_dir) -> Path:
-    """The active lane's `gateway-status.<lane>.json` when it exists, else the unsuffixed one.
-    s.space signs in as a secondary lane, so its bridge writes only the suffixed file."""
+    """The active lane's `gateway-status.<lane>.json` when it exists, else the primary connection's
+    sidecar (the unsuffixed file without a primary row). s.space signs in as a secondary lane."""
     lane = active_lane()
     if lane:
         p = Path(state_dir) / f"gateway-status.{lane}.json"
         if p.exists():
             return p
-    return Path(state_dir) / "gateway-status.json"
+    from connections import primary_sidecar_name
+    return Path(state_dir) / primary_sidecar_name(state_dir)
 
 
 def safe_num(v, *, nonneg: bool = False) -> float | None:

@@ -277,7 +277,7 @@ class TestReportFeedbackCloudAuth(unittest.TestCase):
                     mock.patch.dict(os.environ, {}, clear=True):
                 self.assertEqual(
                     report_feedback.read_cloud_auth(ws),
-                    ("https://sutando.ag2.space", "t"),
+                    ("https://sutando.s.space", "t"),
                 )
 
     def test_keychain_tier_used_when_no_auth_file(self):
@@ -287,18 +287,18 @@ class TestReportFeedbackCloudAuth(unittest.TestCase):
                     mock.patch.object(
                         report_feedback, "_keychain_get",
                         side_effect=lambda k: "sutk_key" if k == report_feedback.origin_vault_key(
-                            "https://sutando.ag2.space") else None,
+                            "https://sutando.s.space") else None,
                     ), \
                     mock.patch.dict(os.environ, {}, clear=True):
                 self.assertEqual(
                     report_feedback.read_cloud_auth(ws),
-                    ("https://sutando.ag2.space", "sutk_key"),
+                    ("https://sutando.s.space", "sutk_key"),
                 )
 
 
 class TestReportFeedbackStampedAccount(unittest.TestCase):
     def test_under_a_stamp_every_keychain_key_is_a_candidate(self):
-        cur = report_feedback.origin_vault_key("https://sutando.ag2.space")
+        cur = report_feedback.origin_vault_key("https://sutando.s.space")
         store = {cur: "sutk_B", "AG2_CLOUD_TOKEN": "sutk_A"}
         ids = {"sutk_A": "u-A", "sutk_B": "u-B"}
         with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as fake_home:
@@ -311,7 +311,7 @@ class TestReportFeedbackStampedAccount(unittest.TestCase):
                     mock.patch.object(report_feedback.cloud_auth, "cloud_request",
                                       side_effect=lambda b, t, *a, **k: {"id": ids[t]}), \
                     mock.patch.dict(os.environ, {}, clear=True):
-                self.assertEqual(report_feedback.read_cloud_auth(ws), ("https://sutando.ag2.space", "sutk_A"))
+                self.assertEqual(report_feedback.read_cloud_auth(ws), ("https://sutando.s.space", "sutk_A"))
 
 
 class TestKeychainAuth(unittest.TestCase):
@@ -345,7 +345,7 @@ class TestKeychainAuth(unittest.TestCase):
             # (sending a bearer to the retired host drops it on the redirect).
             self.assertEqual(
                 report_feedback.read_keychain_auth(),
-                ("https://sutando.ag2.space", "sutk_old"),
+                ("https://sutando.s.space", "sutk_old"),
             )
 
     def test_no_retired_fallback_for_non_default_origin(self):
@@ -390,18 +390,28 @@ class TestKeychainAuth(unittest.TestCase):
                 mock.patch.dict(os.environ, {}, clear=True):
             self.assertEqual(
                 report_feedback.read_keychain_auth(),
-                ("https://sutando.ag2.space", "sutk_bare"),
+                ("https://sutando.s.space", "sutk_bare"),
             )
 
 
 class TestPrefs(unittest.TestCase):
-    def test_missing_file_reports_but_sends_no_logs(self):
-        # Absence is not consent: reporting still works, the excerpt does not.
+    def test_missing_file_files_nothing_automatically(self):
+        # Absence is not consent: no automatic report and no log excerpt.
         with tempfile.TemporaryDirectory() as td:
             self.assertEqual(
                 report_feedback.read_prefs(Path(td)),
-                {"autoReport": True, "sendLogs": False, "askFirst": False},
+                {"autoReport": False, "sendLogs": False, "askFirst": False},
             )
+
+    def test_only_an_explicit_true_enables_automatic_reports(self):
+        with tempfile.TemporaryDirectory() as td:
+            ws = Path(td)
+            (ws / "state").mkdir()
+            p = ws / "state" / "feedback-prefs.json"
+            p.write_text(json.dumps({"sendLogs": True}))
+            self.assertFalse(report_feedback.read_prefs(ws)["autoReport"])
+            p.write_text(json.dumps({"autoReport": True}))
+            self.assertTrue(report_feedback.read_prefs(ws)["autoReport"])
 
     def test_reads_written_values(self):
         with tempfile.TemporaryDirectory() as td:
@@ -421,11 +431,11 @@ class TestPrefs(unittest.TestCase):
             (ws / "state").mkdir()
             p = ws / "state" / "feedback-prefs.json"
             p.write_text("{not json")
-            self.assertEqual(report_feedback.read_prefs(ws), {"autoReport": True, "sendLogs": False, "askFirst": False})
+            self.assertEqual(report_feedback.read_prefs(ws), {"autoReport": False, "sendLogs": False, "askFirst": False})
             # Each key falls back to its OWN default, and an explicit True for
             # sendLogs must still be honoured or the opt-in is unusable.
             p.write_text(json.dumps({"autoReport": "no", "sendLogs": True}))
-            self.assertEqual(report_feedback.read_prefs(ws), {"autoReport": True, "sendLogs": True, "askFirst": False})
+            self.assertEqual(report_feedback.read_prefs(ws), {"autoReport": False, "sendLogs": True, "askFirst": False})
 
 
 class TestAskFirst(unittest.TestCase):
@@ -438,7 +448,8 @@ class TestAskFirst(unittest.TestCase):
     def _ws(self, td, prefs=None):
         ws = Path(td); (ws / "state").mkdir()
         if prefs is not None:
-            (ws / "state" / "feedback-prefs.json").write_text(json.dumps(prefs))
+            # Ask-first cases exercise automatic reporting, so they opt in explicitly.
+            (ws / "state" / "feedback-prefs.json").write_text(json.dumps({"autoReport": True, **prefs}))
         return ws
 
     def test_decide_skip_drops_the_draft_without_filing(self):
@@ -614,7 +625,7 @@ class TestAskFirst(unittest.TestCase):
 
     def test_a_failed_registration_keeps_the_draft_and_apply_retries_it(self):
         with tempfile.TemporaryDirectory() as td:
-            ws = self._ws(td)
+            ws = self._ws(td, {})
             with mock.patch.object(report_feedback, "resolve_workspace", return_value=ws), \
                     mock.patch.object(report_feedback, "register_ask", side_effect=OSError("store locked")), \
                     self.assertRaises(SystemExit) as cm:
@@ -1302,6 +1313,8 @@ class TestMain(unittest.TestCase):
     def test_auto_duplicate_exits_3_after_one_post(self):
         with tempfile.TemporaryDirectory() as td:
             ws = Path(td)
+            (ws / "state").mkdir()
+            (ws / "state" / "feedback-prefs.json").write_text(json.dumps({"autoReport": True}))
             with mock.patch.object(report_feedback, "resolve_workspace", return_value=ws), \
                     mock.patch.object(report_feedback, "read_cloud_auth", return_value=("https://x", "tok")), \
                     mock.patch.object(report_feedback.urllib.request, "urlopen", return_value=_FakeResp()) as uo:
@@ -1329,6 +1342,8 @@ class TestMain(unittest.TestCase):
     def test_auto_report_is_flagged_in_context(self):
         with tempfile.TemporaryDirectory() as td:
             ws = Path(td)
+            (ws / "state").mkdir()
+            (ws / "state" / "feedback-prefs.json").write_text(json.dumps({"autoReport": True}))
             with mock.patch.object(report_feedback, "resolve_workspace", return_value=ws), \
                     mock.patch.object(report_feedback, "read_cloud_auth", return_value=("https://x", "tok")), \
                     mock.patch.object(report_feedback.urllib.request, "urlopen", return_value=_FakeResp()) as uo:

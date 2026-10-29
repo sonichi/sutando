@@ -106,7 +106,7 @@
    ],
    "status": "active",
    "canonical_for": "Codex core setup, earned-reset policy, and rollback",
-   "last_verified": "2026-10-22"
+   "last_verified": "2026-10-28"
   },
   "docs/community-use-cases/README.md": {
    "title": "Community use cases",
@@ -575,7 +575,7 @@
    ],
    "status": "canonical",
    "canonical_for": "DotSpace resolution: which homeservers are AG2-operated, the well-known block and the core.dotspace config",
-   "last_verified": "2026-10-24"
+   "last_verified": "2026-10-28"
   }
  }
 }

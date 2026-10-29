@@ -34,6 +34,7 @@ NEEDED = (
     # kills it at line 23 and the sentinel then "survives" only by never being cleared.
     "src/agent/restart-guard.sh",
     "src/agent/core-runtime-record.sh",
+    "src/agent/core-window.sh",
     "src/core_runtime_record.py",
     "src/result_publish.py",
     "src/agent/task-event-handler-lookup.sh",

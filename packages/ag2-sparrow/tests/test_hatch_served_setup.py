@@ -44,7 +44,7 @@ SHA_NEW, SHA_OLD, SHA_SDIST = "a" * 64, "b" * 64, "c" * 64
 NEW = {"ag2_sparrow-0.6.0-py3-none-any.whl": SHA_NEW}
 REAL_STOP, REAL_START = self_upgrade.stop_sparrow, self_upgrade.start_sparrow
 REAL_DISTRIBUTION = self_upgrade._distribution
-OWNER_NOTE = ("To reach your owner, post only in your owner's AG2 Space DM; "
+OWNER_NOTE = ("To reach your owner, post only in your owner's s.space DM; "
               "never use another channel.")
 
 

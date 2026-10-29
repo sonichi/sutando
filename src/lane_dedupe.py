@@ -1,4 +1,4 @@
-"""Cross-lane duplicate guard: one room message becomes one task, whichever lane saw it first.
+"""Cross-lane duplicate guard: one room message becomes one task, answered by its owner lane when known.
 
 An install may run several gateway bridges ("lanes"), one per homeserver connection, all
 writing into the same workspace inbox. A Matrix event keeps its `event_id` on every
@@ -7,6 +7,11 @@ a task, `claim_key` records `(room, source_message_id)` with the broker-attested
 SQLite store shared by every lane's bridge process; the same event at the same tier, already
 held by ANOTHER lane, is a duplicate. Lanes that disagree on the tier both deliver. The same lane
 seeing its own claim again is not a duplicate, so its own redelivery and retry semantics are kept.
+
+Which lane answers is first-come unless the caller names the event's owner lanes (the lane whose
+agent the message addresses, else the primary): another lane then waits up to `OWNER_WAIT_S` for an
+owner's claim and settles as a duplicate once it appears; past the wait it claims as before, so a
+message the owner never receives is still answered once.
 
 Claims expire after `TTL_S` and expired rows are pruned on each claim. A task without a
 `source_message_id`, or a hook task, is never deduped. Any store failure (unwritable
@@ -25,6 +30,9 @@ from typing import Callable, Mapping, Optional
 STORE_NAME = "gateway-seen.sqlite3"
 TTL_S = 24 * 3600
 BUSY_TIMEOUT_S = 2.0
+# Outlasts the owner lane's own poll of the same event; past it the message is answered, never dropped.
+OWNER_WAIT_S = 6.0
+OWNER_POLL_S = 0.25
 
 _WARNED: "set[str]" = set()
 
@@ -104,14 +112,63 @@ def claim_key(state_dir: Path, event: str, lane: str, tier: str = "", *, now: Op
             con.close()
 
 
+def holder_of(state_dir: Path, event: str, tier: str = "", *, now: Optional[float] = None,
+              ttl: float = TTL_S) -> Optional[str]:
+    """The lane holding an unexpired claim on (`event`, `tier`), read only; None when unclaimed or unreadable."""
+    now = time.time() if now is None else now
+    path = Path(state_dir) / STORE_NAME
+    if not path.exists():
+        return None
+    key = hashlib.sha256(f"{event}\n{tier}".encode("utf-8")).hexdigest()
+    try:
+        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=BUSY_TIMEOUT_S)
+        try:
+            row = con.execute("SELECT lane FROM event_claims WHERE key = ? AND ts > ?", (key, now - ttl)).fetchone()
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return None
+    return None if row is None else str(row[0])
+
+
+def _await_owner(state_dir: Path, event: str, tier: str, owners, wait_s: float, sleep) -> Optional[str]:
+    deadline = time.monotonic() + wait_s
+    while True:
+        holder = holder_of(state_dir, event, tier)
+        if holder is not None and holder in owners:
+            return holder
+        if time.monotonic() >= deadline:
+            return None
+        sleep(OWNER_POLL_S)
+
+
+class OwnerPending(Exception):
+    """The owner lane has not claimed yet and the caller asked not to wait."""
+
+
 def duplicate_reason(state_dir: Path, task: Mapping[str, object], lane: str, *,
-                     now: Optional[float] = None, log: Callable[[str], None] = print) -> Optional[str]:
+                     now: Optional[float] = None, log: Callable[[str], None] = print,
+                     owner_lanes=(), wait_s: Optional[float] = None, sleep=None,
+                     defer: bool = False) -> Optional[str]:
     """One log line naming both lanes when another lane already took this message at the same
-    tier, else None; lanes that disagree on the tier both deliver, with one WARNING."""
+    tier, else None; lanes that disagree on the tier both deliver, with one WARNING. With
+    `owner_lanes` not naming `lane`, an owner's claim within `wait_s` (`OWNER_WAIT_S`) makes this one the duplicate; `defer` raises
+    OwnerPending instead of waiting."""
     event = key_of(task)
     if event is None:
         return None
     tier = tier_of(task)
+    if owner_lanes and lane not in owner_lanes:
+        if defer:
+            owner = holder_of(state_dir, event, tier)
+            if owner is None or owner not in owner_lanes:
+                raise OwnerPending()
+        else:
+            owner = _await_owner(state_dir, event, tier, list(owner_lanes),
+                                 OWNER_WAIT_S if wait_s is None else wait_s, sleep or time.sleep)
+        if owner is not None:
+            return (f"lane dedupe: message {task.get('source_message_id')} on lane {lane_label(lane)} "
+                    f"is lane {lane_label(owner)}'s to answer; settled as a redelivery")
     holder, disagreeing = claim_key(state_dir, event, lane, tier, now=now, log=log)
     if holder is not None:
         return (f"lane dedupe: message {task.get('source_message_id')} on lane {lane_label(lane)} "
