@@ -27,3 +27,22 @@ sutando_new_core_window() {
   tmux -S "$socket" new-window -dP -F '#{window_index}' -t "$session:0" "$@" 2>/dev/null \
     || tmux -S "$socket" new-window -dP -F '#{window_index}' -t "$session" "$@"
 }
+
+# sutando_unidentified_live_windows <socket> <session> <cli>...: ids of live windows that are
+# neither one of the named CLIs nor a known sibling (`gateway-*`, `monitor`): a core the
+# command match cannot see. Fails when panes are unreadable.
+sutando_unidentified_live_windows() {
+  local socket="$1" session="$2" rows wid dead name cmd rt known
+  shift 2
+  rows="$(tmux -S "$socket" list-panes -s -t "=$session" -F '#{window_id}|#{pane_dead}|#{window_name}|#{pane_start_command}' 2>/dev/null)" \
+    || return 1
+  printf '%s\n' "$rows" \
+    | while IFS='|' read -r wid dead name cmd; do
+        [ "$dead" = 0 ] || continue
+        case "$name" in gateway-*|monitor) continue ;; esac
+        cmd="${cmd#\"}"; cmd="${cmd%%\"*}"; cmd="${cmd%% *}"
+        known=
+        for rt in "$@"; do [ "${cmd##*/}" = "$rt" ] && known=1; done
+        [ -n "$known" ] || echo "$wid"
+      done | sort -u
+}

@@ -84,7 +84,9 @@ The Codex implementation:
   the session outlives its core window (the core exited), the next launch heals
   it the same way: it recreates the core as the session's lowest-index window,
   where the task notifier types, and leaves every sibling untouched. A session
-  with no other window still ends with its core, as before.
+  with no other window still ends with its core, as before. A live window that is neither a
+  known sibling (`gateway-*`, `monitor`) nor started as `codex` could be a core the
+  launcher cannot identify, so it refuses to heal (exit 3) rather than start a second core.
 
 Task wakeups leave tmux copy mode before typing. The shared sender issues
 `copy-mode -q` and then, in the same tmux command list, an `if-shell -F

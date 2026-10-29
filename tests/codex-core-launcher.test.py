@@ -2746,6 +2746,22 @@ class CoreWindowRestartTests(unittest.TestCase):
         self.assert_core_is_the_lowest_window(core)
         self.assertEqual(len(self.panes()), 3, self.panes())
 
+    def test_panes_present_but_no_core_identifiable_refuses_to_heal(self):
+        self.session_with(("work", ["sleep", "300"]), ("gateway-x", ["sleep", "300"]))
+        before = self.panes()
+        result = self.case.run_launcher(env_extra={"SUTANDO_TMUX_SOCKET": self.sock})
+        self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
+        self.assertIn("not healing", result.stderr)
+        self.assertNotIn("healing core window", result.stderr)
+        self.assertEqual(self.panes(), before, "a second core must not be created")
+
+    def test_restart_with_an_unidentifiable_core_refuses_too(self):
+        self.session_with(("work", ["sleep", "300"]), ("gateway-x", ["sleep", "300"]))
+        before = self.panes()
+        result = self.case.run_launcher("--restart", env_extra={"SUTANDO_TMUX_SOCKET": self.sock})
+        self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
+        self.assertEqual(self.panes(), before)
+
     def test_a_live_core_is_reused_not_healed(self):
         self.session_with(("core", [str(self.case.bin / "codex"), "-C", "live"]), ("gateway-x", ["sleep", "300"]))
         before = self.panes()

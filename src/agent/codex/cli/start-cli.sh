@@ -656,7 +656,12 @@ wait_core_up() {
 # The session outlived its core window (restarted above, or the core exited): recreate the
 # core as the session's lowest window, the notifier's target, and leave every sibling running.
 heal_core_window() {
-  local idx low
+  local idx low others
+  # Empty "live codex" also means a core the command match cannot see: a second core would poll the same workspace.
+  if others="$(sutando_unidentified_live_windows "$TMUX_SOCKET" "$SESSION" codex)" && [ -n "$others" ]; then
+    echo "  ⚠ $SESSION has live windows ($(echo $others)) that are not a known sibling and not identifiable as the Codex core — not healing, a second core would double-poll. Stop the core or kill the session, then relaunch." >&2
+    return 3
+  fi
   echo "  ⚠ $SESSION exists but its Codex core is gone — healing core window (sibling windows preserved)" >&2
   for _win in $(sutando_core_window_ids "$TMUX_SOCKET" "$SESSION" all codex); do
     tmux -S "$TMUX_SOCKET" kill-window -t "$_win" 2>/dev/null || true
@@ -684,7 +689,7 @@ heal_core_window() {
 }
 
 if session_exists "$SESSION"; then
-  heal_core_window || exit 1
+  heal_core_window || exit "$?"
   if [ -t 1 ] && [ -z "${TMUX:-}" ]; then
     exec tmux -S "$TMUX_SOCKET" attach -t "=$SESSION"
   fi
