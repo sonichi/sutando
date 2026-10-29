@@ -65,7 +65,7 @@ from tour_page import (  # noqa: E402,F401  (the page lives in tour_page; these 
     render_page, sections_for,
 )
 
-SUMMON_CONTEXT = "A short tour of AG2 Space, with one thing to try in each part."
+SUMMON_CONTEXT = "A short tour of s.space, with one thing to try in each part."
 PROFILE_TIMEOUT = 5
 CREATE_ACTION = "room.commons.pages.create"
 SECRET_NAME = re.compile(r"TOKEN|SECRET|PASSWORD|KEY", re.I)
