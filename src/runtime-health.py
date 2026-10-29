@@ -37,7 +37,6 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from tmux_probe import has_session as _tmux_has_session  # noqa: E402
-from channel_env_resolve import resolve_channel_env  # noqa: E402
 import cli_wedge  # noqa: E402 — owns the core pane target and its capture
 import connections  # noqa: E402 — the install's gateway rows and which one is primary
 import dotspace  # noqa: E402 — which cloud this install's DotSpace runs
@@ -243,11 +242,12 @@ def _gateway_configured():
     cfg = os.environ.get("CLAUDE_CONFIG_DIR")
     if not cfg:
         return None
-    # Which file defines the token is content, not filename — delegated so this
-    # surface cannot disagree with startup or health-check about configuredness.
+    # Delegated so this surface agrees with startup and health-check; imported here because
+    # the resolver pulls in shared/, which a helper loading this file from a bare src copy lacks.
     try:
+        from channel_env_resolve import resolve_channel_env
         return resolve_channel_env(os.path.join(cfg, "channels"), "ag2space") is not None
-    except OSError:
+    except (OSError, ImportError):
         return None
 
 
