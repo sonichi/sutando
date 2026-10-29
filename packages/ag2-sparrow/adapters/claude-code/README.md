@@ -362,7 +362,7 @@ working tree under edit, say).
 are the agent's whole setup:
 
 ```bash
-ag2-sparrow-claude-local connect --base <AG2 Space backend URL>
+ag2-sparrow-claude-local connect --base <s.space backend URL>
 # asks for the acp.<code>; or pipe it in with --code - (e.g. pbpaste | ... --code -)
 ```
 
