@@ -3,6 +3,7 @@
 # Regression: a completed parent turn must release the inbox while its worker result is pending.
 # Run the scheduler case with PICKUP_TEST_NOTIFIER pointing to the base notifier to reproduce the failure.
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -13,9 +14,11 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 REPO = Path(os.environ.get("PICKUP_TEST_REPO", Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(REPO / "src"))
+from delivery import codex_pickup as pickup
 from delivery.codex_pickup import mark, paths, yielded, record_event, warning, ready
 from runtime_observation import write
 
@@ -87,6 +90,85 @@ class ReceiptTests(unittest.TestCase):
         for malformed in [[], {"blocked": []}, {"blocked": True}]:
             (self.ws / "state/codex-pickup.json").write_text(json.dumps(malformed))
             self.assertIsNone(warning(self.ws))
+
+
+class CommandTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.ws = Path(self.tmp.name)
+
+    def invoke(self, command, *args, stdin=""):
+        with mock.patch.object(sys, "argv", ["pickup", command, str(self.ws), *args]), \
+                mock.patch.object(sys, "stdin", io.StringIO(stdin)):
+            return pickup.main()
+
+    def test_cli_marks_and_releases_only_with_matching_runtime_and_completion(self):
+        self.assertEqual(self.invoke("ready", "core", "7:start"), 1)
+        self.assertEqual(self.invoke("mark", "task-a.txt", "7:start", stdin="private task text"), 0)
+        marker = paths(self.ws)[0] / "task-a.txt"
+        self.assertEqual(marker.read_text().splitlines()[0], "7:start")
+        self.assertNotIn("private task text", marker.read_text())
+        write(idle_record(), self.ws)
+        self.assertEqual(self.invoke("ready", "core", "7:start"), 0)
+        self.assertEqual(self.invoke("yielded", "task-a.txt", "7:start", "core"), 1)
+        observation(self.ws, "task-a.txt")
+        self.assertEqual(self.invoke("yielded", "task-a.txt", "7:start", "core"), 0)
+        self.assertTrue((paths(self.ws)[1] / "task-a.txt").is_file())
+        self.assertTrue(marker.is_file())
+
+    def test_cli_refuses_oversized_prompt_invalid_request_and_write_failure(self):
+        self.assertEqual(self.invoke("mark", "task-a.txt", "7:start", stdin="x" * (1024 * 1024 + 1)), 2)
+        self.assertFalse(paths(self.ws)[0].exists())
+        self.assertEqual(self.invoke("mark", "../escape", "7:start", stdin="task"), 2)
+        self.assertEqual(self.invoke("unknown"), 2)
+        self.assertEqual(self.invoke("ready", "core"), 2)
+        self.assertEqual(self.invoke("record", "unknown-event"), 2)
+        with mock.patch.object(pickup, "write_status", side_effect=OSError("disk unavailable")):
+            self.assertEqual(self.invoke("record", "submitted", "task-a.txt"), 2)
+
+    def test_cli_timing_and_hold_resolution_are_bounded_metadata(self):
+        with mock.patch.object(pickup.time, "time", return_value=100):
+            self.assertEqual(self.invoke("record", "enqueued", "task-a.txt"), 0)
+        with mock.patch.object(pickup.time, "time", return_value=102):
+            self.assertEqual(self.invoke("record", "submitted", "task-a.txt"), 0)
+        path = self.ws / "state/codex-pickup.json"
+        self.assertEqual(json.loads(path.read_text())["recent"][-1]["wait_ms"], 2000)
+        self.assertEqual(self.invoke("record", "held", "task-a.txt"), 0)
+        self.assertIsNotNone(warning(self.ws))
+        self.assertEqual(self.invoke("record", "completed", "task-a.txt"), 0)
+        self.assertIsNone(warning(self.ws))
+        self.assertNotIn("task-a.txt", path.read_text())
+
+    def test_corrupt_and_oversized_metadata_recovers_without_false_warning(self):
+        path = self.ws / "state/codex-pickup.json"
+        path.parent.mkdir(parents=True)
+        for raw in ["[]", "{invalid", "x" * 65537]:
+            with self.subTest(raw=raw[:8]):
+                path.write_text(raw)
+                self.assertIsNone(warning(self.ws))
+                self.assertEqual(self.invoke("record", "enqueued", "task-a.txt"), 0)
+                self.assertEqual(json.loads(path.read_text())["counts"]["enqueued"], 1)
+                self.assertLess(path.stat().st_size, 65536)
+
+    def test_oversized_receipt_cannot_release_a_task(self):
+        self.assertEqual(self.invoke("mark", "task-a.txt", "7:start", stdin="task"), 0)
+        observation(self.ws, "task-a.txt")
+        (paths(self.ws)[0] / "task-a.txt").write_text("7:start\n" + "a" * 1024)
+        self.assertEqual(self.invoke("yielded", "task-a.txt", "7:start", "core"), 1)
+        self.assertFalse((paths(self.ws)[1] / "task-a.txt").exists())
+
+    def test_send_cli_pins_pid_preserves_keys_and_propagates_guard_failure(self):
+        with mock.patch.object(pickup.subprocess, "run", return_value=subprocess.CompletedProcess([], 75)) as run:
+            self.assertEqual(self.invoke("send", "%7", "7:start", "-l", "--", "literal ; task"), 75)
+            argv = run.call_args.args[0]
+            self.assertEqual(argv[argv.index("--expected-pid") + 1], "7")
+            self.assertEqual(argv[argv.index("-t") + 1], "%7")
+            self.assertEqual(argv[-3:], ["-l", "--", "literal ; task"])
+            run.reset_mock()
+            self.assertEqual(self.invoke("send", "core:0", "7:start", "C-m"), 2)
+            self.assertEqual(self.invoke("send", "%7", "unknown", "C-m"), 2)
+            run.assert_not_called()
 
 
 class SchedulerTests(unittest.TestCase):

@@ -1215,6 +1215,14 @@ class CliSmokeTest(unittest.TestCase):
 class InflightRecordTest(unittest.TestCase):
     """The at-most-once record between a confirmed submit and a ready result."""
 
+    def test_invalid_prompt_digest_cannot_replace_existing_receipt(self):
+        mark_inflight(self.dir, "task-a.txt", "4242", "a" * 64)
+        original = (self.dir / "task-a.txt").read_bytes()
+        for invalid in ("short", "A" * 64, "a" * 63 + "\n"):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                mark_inflight(self.dir, "task-a.txt", "4242", invalid)
+            self.assertEqual((self.dir / "task-a.txt").read_bytes(), original)
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)

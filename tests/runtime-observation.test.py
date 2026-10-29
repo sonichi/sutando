@@ -52,6 +52,11 @@ class ValidateTests(Base):
             with self.assertRaises(ValueError):
                 ro.validate(rec(core_incarnation=bad))
 
+    def test_completed_task_rejects_non_object_records(self):
+        for invalid in ([], "receipt", 1, True):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                ro.validate(rec(completed_task=invalid))
+
     def test_completed_task_is_optional_bounded_and_contains_only_metadata(self):
         receipt = {"prompt_sha256": "a" * 64, "accepted_at": NOW - 8,
                    "completed_at": NOW - 3, "core_incarnation": "42:Tue Oct  6 02:00:00 2026"}
