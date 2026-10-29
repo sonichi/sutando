@@ -113,6 +113,19 @@ class TestRequirement(unittest.TestCase):
         self.assertNotEqual(req("permission", PERM).guard, req("permission", PERM, session="t").guard)
         self.assertNotEqual(req("permission", PERM).guard, req("permission", SELECT).guard)
 
+    def test_the_guard_ignores_the_pane_repainting_around_the_dialog(self):
+        framed = "  ─────────\n" + PERM
+        for chrome in ("⏺ Running sleep 5 … · 3s\n", "Sutando: thinking [-]\n  ⎿  Churned for 9s\n"):
+            self.assertEqual(req("permission", chrome + framed).guard, req("permission", framed).guard)
+        self.assertEqual(req("permission", framed + "\n  ⏵⏵ bypass permissions on · 1 monitor").guard,
+                         req("permission", framed).guard)
+        self.assertEqual(req("permission", PERM_CARET_ON_NO).guard, req("permission", PERM).guard)
+
+    def test_everything_inside_the_dialog_still_keys_it(self):
+        edit = ("  ─────────\n  Edit file\n  ╭──────╮\n  │ - a = 1 │\n  │ + a = {} │\n  ╰──────╯\n"
+                "  Do you want to make this edit to a.py?\n  ❯ 1. Yes\n    2. No\n")
+        self.assertNotEqual(req("permission", edit.format(2)).guard, req("permission", edit.format(3)).guard)
+
 
 class TestKeys(unittest.TestCase):
     def test_yes_with_the_caret_already_on_yes_is_just_enter(self):

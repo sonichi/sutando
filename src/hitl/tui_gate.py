@@ -22,14 +22,34 @@ _NEVER_ONE_CLICK = re.compile(r"trust the files|Do you trust|Bypass Permissions|
                               r"Fable limit|usage credits|hit your (?:session|usage|weekly) limit", re.I)
 _OPTION = re.compile(r"^\s*(❯)?\s*(\d+)\.\s+(.*\S)\s*$")
 _FRAME = re.compile(r"^[\s─━│┃┌┐└┘╭╮╰╯├┤┬┴┼═║╔╗╚╝]*$")
+_EDGE = frozenset("─━═╭┌╔")  # a rule or a box top: where a dialog starts
 _HINT = re.compile(r"Esc to cancel|Enter to (confirm|select)|↑/↓|shift\+tab|Tab to", re.I)
 _YES = re.compile(r"^\s*yes\b", re.I)
 _NO = re.compile(r"^\s*no\b", re.I)
 
 
 def guard_for(session: str, prompt: Optional[str], state: str) -> str:
-    """The episode key: same session + same dialog text = same requirement."""
-    return hashlib.sha256(f"{session}\n{prompt or state}".encode()).hexdigest()[:16]
+    """The episode key: same session + same dialog = same requirement."""
+    episode = dialog_identity(prompt) or prompt or state
+    return hashlib.sha256(f"{session}\n{episode}".encode()).hexdigest()[:16]
+
+
+def dialog_identity(prompt: Optional[str]) -> Optional[str]:
+    """The live option dialog's own text: its lines from the rule above it to its last option,
+    caret and side borders dropped. Status bands, spinners and footers around it repaint."""
+    blocks = option_blocks(prompt)
+    if not blocks:
+        return None
+    start, labels, _ = next((b for b in reversed(blocks) if b[2] is not None), blocks[-1])
+    body: List[str] = []
+    for line in reversed((prompt or "").splitlines()[:start]):
+        s = line.strip()
+        if _OPTION.match(line) or s.startswith("✓") or s[:1] in _EDGE:
+            break  # the dialog's top edge, or an older dialog above it
+        s = s.strip("│┃║ ")
+        if s and not _HINT.search(s):
+            body.append(s)
+    return "\n".join(body[::-1] + labels)
 
 
 # A usage limit is one episode per seat however its screen repaints (banner, menu, refused
