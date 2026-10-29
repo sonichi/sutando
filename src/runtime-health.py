@@ -37,6 +37,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from tmux_probe import has_session as _tmux_has_session  # noqa: E402
+from channel_env_resolve import resolve_channel_env  # noqa: E402
 import cli_wedge  # noqa: E402 — owns the core pane target and its capture
 import connections  # noqa: E402 — the install's gateway rows and which one is primary
 import dotspace  # noqa: E402 — which cloud this install's DotSpace runs
@@ -232,8 +233,8 @@ def _gateway_configured():
     """Whether a gateway is provisioned on THIS host.
 
     The gateway bridge only runs where an enabled connection row exists or a remote task
-    token is configured (env or channels/ag2space/.env). Returns True (configured), False
-    (config readable, no token), or None (can't tell — no CLAUDE_CONFIG_DIR / unreadable .env).
+    token is configured (env, or any contained file under channels/ag2space/). Returns True
+    (configured), False (config readable, no token), or None (can't tell — no CLAUDE_CONFIG_DIR).
     Mirrors health-check.check_gateway_bridge's detection."""
     if connections.enabled_rows():
         return True
@@ -242,14 +243,12 @@ def _gateway_configured():
     cfg = os.environ.get("CLAUDE_CONFIG_DIR")
     if not cfg:
         return None
+    # Which file defines the token is content, not filename — delegated so this
+    # surface cannot disagree with startup or health-check about configuredness.
     try:
-        with open(os.path.join(cfg, "channels", "ag2space", ".env")) as f:
-            for ln in f:
-                if ln.startswith(("REMOTE_TASK_TOKEN=", "AG2_REMOTE_TOKEN=")):
-                    return True
+        return resolve_channel_env(os.path.join(cfg, "channels"), "ag2space") is not None
     except OSError:
         return None
-    return False
 
 
 def _gateway_running():
