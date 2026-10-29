@@ -463,7 +463,7 @@ def _seat_under_lock(local: cm.Shape, root: str, redeemed: dict) -> "tuple[dict,
     written, held = cm.under_root(local, root, act, precheck=lambda: cm.seat_problem(bridge_home(root)))
     if held:
         return {}, (f"{held}; the code is spent and nothing was written ({bridge_home(root)} is unchanged): "
-                    "make a new code in AG2 Space once the root is free")
+                    "make a new code in s.space once the root is free")
     seat, root_id, problem = written
     if problem:
         return {}, f"the code is spent but the seat was not written: {problem}; make a new code"

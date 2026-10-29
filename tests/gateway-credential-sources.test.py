@@ -1368,7 +1368,7 @@ class RealSinks(unittest.TestCase):
                 if kind == "retained":
                     self.assertEqual(shown.splitlines().count(" Environment=<withheld>"), 5,
                                      "a line per old one, in context")
-                    self.assertIn("+Description=ag2-sparrow (AG2 Space listener)\n", shown, "the rest is shown")
+                    self.assertIn("+Description=ag2-sparrow (s.space listener)\n", shown, "the rest is shown")
 
     def test_a_drop_in_is_never_read_and_its_lines_would_be_withheld(self):
         drop_in = ("[Service]\nEnvironment=REMOTE_TASK_TOKEN=synth-drop-in-5698\n"
