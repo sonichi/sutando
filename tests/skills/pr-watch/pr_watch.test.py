@@ -358,5 +358,223 @@ class Runner(_Tmp):
         self.assertNotIn("webhook forward", self.log.read_text())
 
 
+FWD_GH = """#!/usr/bin/env python3
+import os, sys, time
+env = os.environ
+with open(env["FAKE_GH_LOG"], "a") as fh:
+    fh.write(" ".join(sys.argv[1:]) + "\\n")
+a = sys.argv[1:]
+if a[:2] == ["extension", "list"]:
+    print(env.get("FAKE_GH_EXT", "gh webhook  cli/gh-webhook  v0.2.0")); sys.exit(0)
+if a[:3] == ["api", "-X", "DELETE"]:
+    sys.exit(0)
+if a[:1] == ["api"]:
+    if env.get("FAKE_GH_LISTFAIL"):
+        sys.stderr.write("HTTP 404\\n"); sys.exit(1)
+    hf = env["FAKE_GH_HOOKFILE"]
+    print(open(hf).read() if os.path.exists(hf) else ""); sys.exit(0)
+if a[:2] == ["webhook", "forward"]:
+    if env.get("FAKE_GH_CONFLICT"):
+        sys.stderr.write("HTTP 422: Hook already exists on this repository\\n"); sys.exit(1)
+    with open(env["FAKE_GH_HOOKFILE"], "a") as fh:
+        fh.write("77\\n")
+    for name in env.get("FAKE_GH_EMIT", "").split():
+        sys.stdout.write(open(name).read()); sys.stdout.flush()
+    time.sleep(float(env.get("FAKE_GH_HOLD", "3")))
+    sys.exit(0)
+sys.exit(0)
+"""
+
+
+class InProcess(_Tmp):
+    """The runner's methods and cmd_run in this process, against a fake gh on PATH."""
+
+    def setUp(self):
+        super().setUp()
+        bin_dir = self.tmp / "bin"
+        bin_dir.mkdir()
+        gh = bin_dir / "gh"
+        gh.write_text(FWD_GH)
+        gh.chmod(gh.stat().st_mode | stat.S_IXUSR)
+        self.log = self.tmp / "gh.log"
+        self.hookfile = self.tmp / "hooks.txt"
+        self.env = {"PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+                    "FAKE_GH_LOG": str(self.log), "FAKE_GH_HOOKFILE": str(self.hookfile),
+                    "FAKE_GH_EMIT": " ".join(str(FIXTURES / f"{n}.json") for n in
+                                             ("pull_request.labeled", "pull_request.opened"))}
+        p = mock.patch.dict(os.environ, self.env)
+        p.start()
+        self.addCleanup(p.stop)
+        self.st = pw.State(self.state)
+        self.st.ensure()
+        self.cli("add", "--repo", "acme/widgets", "--author", "alice")
+
+    def calls(self, prefix):
+        return [l for l in self.log.read_text().splitlines() if l.startswith(prefix)] if self.log.exists() else []
+
+    def forward(self, runner=None):
+        runner = runner or pw.Runner(self.st)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            delay = runner.forward_once("acme/widgets")
+        return delay, out.getvalue().splitlines()
+
+    def test_forward_once_emits_records_and_deletes_its_hook(self):
+        delay, lines = self.forward()
+        self.assertEqual(delay, pw.RESTART_DELAY_S)
+        self.assertEqual(lines, ["PR_EVENT acme/widgets#7 opened author=alice head=a1b2c3d4 merged=false"])
+        self.assertEqual(self.calls("api -X DELETE"), ["api -X DELETE repos/acme/widgets/hooks/77"])
+        self.assertEqual(json.loads(self.st.hooks.read_text()), {})
+        self.assertEqual(json.loads(self.st.forwarders.read_text()), {})
+
+    def test_forward_once_backs_off_on_a_422(self):
+        os.environ["FAKE_GH_CONFLICT"] = "1"
+        delay, lines = self.forward()
+        self.assertEqual(delay, pw.CONFLICT_DELAY_S)
+        self.assertEqual(len(lines), 1)
+        self.assertIn("refused a second forwarder", lines[0])
+        self.assertIn(pw.HOOK_EXISTS, (self.state / "logs" / "acme_widgets.err").read_text())
+
+    def test_forward_once_backs_off_when_hooks_cannot_be_listed(self):
+        os.environ["FAKE_GH_LISTFAIL"] = "1"
+        delay, lines = self.forward()
+        self.assertEqual(delay, pw.CONFLICT_DELAY_S)
+        self.assertEqual(lines, ["PR_WATCH_NOTE acme/widgets: cannot list hooks (need admin on the repo); retrying"])
+        self.assertEqual(self.calls("webhook forward"), [])
+
+    def test_cmd_run_reloads_on_sighup_and_cleans_up_on_sigterm(self):
+        os.environ["FAKE_GH_HOLD"] = "30"
+        handlers = {s: signal.getsignal(s) for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)}
+        self.addCleanup(lambda: [signal.signal(s, h) for s, h in handlers.items()])
+        pid = os.getpid()
+
+        def drive():
+            hooks = self.st.hooks
+            deadline = time.time() + 20
+            while time.time() < deadline and json.loads(hooks.read_text() if hooks.exists() else "{}") != {"acme/widgets": [77]}:
+                time.sleep(0.2)
+            cfg = json.loads(self.st.config.read_text())
+            cfg["watches"] = []
+            self.st.config.write_text(json.dumps(cfg))
+            os.kill(pid, signal.SIGHUP)
+            time.sleep(2.5)
+            os.kill(pid, signal.SIGTERM)
+
+        t = threading.Thread(target=drive)
+        t.start()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = pw.cmd_run(self.st)
+        t.join()
+        self.assertEqual(rc, 0)
+        self.assertIn("PR_EVENT acme/widgets#7 opened", out.getvalue())
+        self.assertIn("api -X DELETE repos/acme/widgets/hooks/77", self.calls("api -X DELETE"))
+        self.assertEqual(json.loads(self.st.hooks.read_text()), {})
+        self.assertFalse(self.st.runner_pid.exists())
+
+    def test_cmd_run_without_the_extension_exits_3(self):
+        os.environ["FAKE_GH_EXT"] = "nothing installed"
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(pw.cmd_run(self.st), 3)
+        self.assertIn("cli/gh-webhook extension is missing", out.getvalue())
+        with mock.patch.object(pw.shutil, "which", return_value=None):
+            self.assertFalse(pw.gh_webhook_installed())
+
+    def test_cmd_run_exits_4_while_another_runner_holds_the_lock(self):
+        import fcntl
+        fh = open(self.st.lock, "w")
+        self.addCleanup(fh.close)
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        out = io.StringIO()
+        with mock.patch.object(pw, "LOCK_WAIT_S", 1), contextlib.redirect_stdout(out):
+            self.assertEqual(pw.cmd_run(self.st), 4)
+        self.assertIn("another pr-watch runner is active", out.getvalue())
+        self.assertEqual(self.calls("webhook forward"), [])
+
+    def test_main_dispatches_run(self):
+        with mock.patch.object(pw, "cmd_run", return_value=0) as run:
+            self.assertEqual(self.cli("run")[0], 0)
+        run.assert_called_once()
+
+
+class Helpers(_Tmp):
+    def sleeper(self, *extra):
+        p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"] + list(extra))
+        self.addCleanup(lambda: (p.poll() is None and p.kill(), p.wait()))
+        return p
+
+    def test_unreadable_and_non_object_config_are_refused(self):
+        self.state.mkdir(parents=True)
+        (self.state / "config.json").write_text("{not json")
+        rc, _, err = self.cli("list")
+        self.assertEqual(rc, 2)
+        self.assertIn("cannot read", err)
+        (self.state / "config.json").write_text("[]")
+        rc, _, err = self.cli("list")
+        self.assertIn("is not a JSON object", err)
+
+    def test_hook_listing_failures_answer_none(self):
+        with mock.patch.object(pw, "gh", return_value=subprocess.CompletedProcess([], 1, "", "x")):
+            self.assertIsNone(pw.forwarder_hook_ids("acme/widgets"))
+        with mock.patch.object(pw, "gh", return_value=subprocess.CompletedProcess([], 0, "12 abc", "")):
+            self.assertIsNone(pw.forwarder_hook_ids("acme/widgets"))
+
+    def test_state_copy_dir_is_its_own_state_dir(self):
+        fake = self.tmp / "ws" / "state" / "pr-watch" / "pr_watch.py"
+        with mock.patch.object(pw, "__file__", str(fake)):
+            self.assertEqual(pw.resolve_state_dir(), fake.parent.resolve())
+
+    def test_process_helpers_and_stale_forwarders(self):
+        fwd = self.sleeper("webhook", "forward")
+        other = self.sleeper("unrelated")
+        self.assertTrue(pw.pid_alive(fwd.pid))
+        self.assertTrue(pw.is_forwarder(fwd.pid))
+        self.assertFalse(pw.is_forwarder(other.pid))
+        st = pw.State(self.state)
+        st.ensure()
+        pw.write_json(st.forwarders, {"acme/widgets": fwd.pid, "acme/other": other.pid})
+        pw.kill_stale_forwarders(st)
+        self.assertEqual(fwd.wait(timeout=10), -signal.SIGTERM)
+        self.assertIsNone(other.poll())
+        self.assertEqual(json.loads(st.forwarders.read_text()), {})
+        self.assertFalse(pw.pid_alive(fwd.pid))
+
+    def test_runner_pid_needs_a_live_pr_watch_process(self):
+        st = pw.State(self.state)
+        st.ensure()
+        self.assertIsNone(pw.runner_pid(st))
+        p = self.sleeper()
+        st.runner_pid.write_text(f"{p.pid}\n")
+        self.assertIsNone(pw.runner_pid(st))
+        with mock.patch.object(pw, "pid_command", return_value="python3 pr_watch.py run"):
+            self.assertEqual(pw.runner_pid(st), p.pid)
+
+    def test_add_signals_a_live_runner(self):
+        p = self.sleeper()
+        with mock.patch.object(pw, "runner_pid", return_value=p.pid):
+            self.assertEqual(self.cli("add", "--repo", "acme/widgets", "--author", "alice")[0], 0)
+        self.assertEqual(p.wait(timeout=10), -signal.SIGHUP)
+
+    def test_status_lists_live_forwarders_and_recorded_ids(self):
+        self.cli("add", "--repo", "acme/widgets", "--author", "alice")
+        st = pw.State(self.state)
+        fwd = self.sleeper("webhook", "forward")
+        pw.write_json(st.forwarders, {"acme/widgets": fwd.pid})
+        pw.write_json(st.hooks, {"acme/widgets": [11, 12]})
+        rc, out, _ = self.cli("status")
+        self.assertIn(f"forwarder acme/widgets: pid {fwd.pid}", out)
+        self.assertIn("recorded hook ids acme/widgets: 11 12", out)
+
+    def test_cleanup_reports_ids_it_could_not_delete(self):
+        st = pw.State(self.state)
+        st.ensure()
+        pw.write_json(st.hooks, {"acme/widgets": [11]})
+        with mock.patch.object(pw, "delete_hook", return_value=False):
+            rc, out, _ = self.cli("cleanup")
+        self.assertEqual(rc, 1)
+        self.assertIn('could not delete: {"acme/widgets": [11]}', out)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
