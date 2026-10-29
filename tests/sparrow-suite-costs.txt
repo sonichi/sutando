@@ -1,2 +1,39 @@
-# seconds  path — measured on ubuntu-latest: per-file seconds publish_gate.sh printed in CI.
+# seconds  path — measured on ubuntu-latest: per-file seconds publish_gate.sh printed in CI run 40894145940 (2026-10-29).
 # A missing file counts as 1s; the table only steers balance, never which files run.
+3 packages/ag2-sparrow/tests/test_ack_retry.py
+1 packages/ag2-sparrow/tests/test_adapter_boundaries.py
+10 packages/ag2-sparrow/tests/test_adapter_differential.py
+0 packages/ag2-sparrow/tests/test_adapter_relay_loop.py
+0 packages/ag2-sparrow/tests/test_agent_profile_host_id.py
+13 packages/ag2-sparrow/tests/test_claude_cloud_session_adapter.py
+59 packages/ag2-sparrow/tests/test_claude_code_adapter.py
+48 packages/ag2-sparrow/tests/test_claude_code_connect.py
+40 packages/ag2-sparrow/tests/test_claude_code_install.py
+24 packages/ag2-sparrow/tests/test_claude_routine_adapter.py
+5 packages/ag2-sparrow/tests/test_cloud_session_contract.py
+8 packages/ag2-sparrow/tests/test_cloud_session_interlock.py
+13 packages/ag2-sparrow/tests/test_codex_connector.py
+94 packages/ag2-sparrow/tests/test_codex_local_connect.py
+0 packages/ag2-sparrow/tests/test_dns_fallback.py
+5 packages/ag2-sparrow/tests/test_dns_timeout.py
+0 packages/ag2-sparrow/tests/test_env_token_quotes.py
+0 packages/ag2-sparrow/tests/test_event_consumer.py
+1 packages/ag2-sparrow/tests/test_event_inbox_channel.py
+1 packages/ag2-sparrow/tests/test_event_wiring.py
+1 packages/ag2-sparrow/tests/test_gateway_status.py
+79 packages/ag2-sparrow/tests/test_hatch_adapter.py
+22 packages/ag2-sparrow/tests/test_hatch_served_setup.py
+0 packages/ag2-sparrow/tests/test_human_action.py
+0 packages/ag2-sparrow/tests/test_inflight_recovery.py
+1 packages/ag2-sparrow/tests/test_launch_diagnostics.py
+35 packages/ag2-sparrow/tests/test_lock_heartbeat_thread.py
+9 packages/ag2-sparrow/tests/test_on_task_wake.py
+0 packages/ag2-sparrow/tests/test_poll_stall_exit.py
+11 packages/ag2-sparrow/tests/test_pool_advertisement_push.py
+0 packages/ag2-sparrow/tests/test_setup_fetch.py
+0 packages/ag2-sparrow/tests/test_signal_exit_log.py
+11 packages/ag2-sparrow/tests/test_task_lifecycle.py
+0 packages/ag2-sparrow/tests/test_vault_token_tier.py
+8 packages/ag2-sparrow/tests/test_wheel_contents.py
+0 packages/ag2-sparrow/tests/test_worker_profile_labels.py
+1 packages/ag2-sparrow/tests/test_write_task_atomic.py
