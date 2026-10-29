@@ -305,7 +305,6 @@ def read_prefs(ws: Path) -> dict:
         for k in prefs:
             if isinstance(d.get(k), bool):
                 prefs[k] = d[k]
-        # The room the ask-first card goes to (the owner's DM); a string, unlike the switches.
     except Exception:
         pass
     return prefs
