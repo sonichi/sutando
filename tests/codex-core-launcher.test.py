@@ -2762,6 +2762,16 @@ class CoreWindowRestartTests(unittest.TestCase):
         self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
         self.assertEqual(self.panes(), before)
 
+    def test_a_core_cli_under_a_sibling_name_still_blocks_the_heal(self):
+        fake = Path(tempfile.mkdtemp()) / "claude"
+        fake.symlink_to(shutil.which("sleep"))
+        self.addCleanup(shutil.rmtree, fake.parent, True)
+        self.session_with(("monitor", ["sleep", "300"]), ("gateway-x", [str(fake), "300"]))
+        before = self.panes()
+        result = self.case.run_launcher(env_extra={"SUTANDO_TMUX_SOCKET": self.sock})
+        self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
+        self.assertEqual(self.panes(), before, "a second core must not be created")
+
     def test_a_live_core_is_reused_not_healed(self):
         self.session_with(("core", [str(self.case.bin / "codex"), "-C", "live"]), ("gateway-x", ["sleep", "300"]))
         before = self.panes()
