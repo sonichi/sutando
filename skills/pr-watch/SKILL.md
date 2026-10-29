@@ -1,6 +1,6 @@
 ---
 name: pr-watch
-description: "Event-driven GitHub PR watching. Use when the owner wants to be kept on top of pull requests: re-review a person's PRs whenever they change, react when a review is requested from the owner, or note merges, closes and submitted reviews, without polling and without a Monitor that expires after 30 minutes. A Claude Code mod runs `gh webhook forward` for each watched repo and turns each relevant event into a new turn of this session."
+description: "Event-driven GitHub PR watching. Use when the owner wants to be kept on top of pull requests: re-review a person's PRs whenever they change, follow up on any PR the owner has already reviewed, react when a review is requested from the owner, or note merges, closes and submitted or dismissed reviews, without polling and without a Monitor that expires after 30 minutes. A Claude Code mod runs `gh webhook forward` for each watched repo and turns each relevant event into a new turn of this session."
 user-invocable: true
 ---
 
@@ -8,14 +8,22 @@ user-invocable: true
 
 Watches GitHub pull requests by event, not by polling. A Claude Code mod (a plugin of function
 hooks) starts `pr_watch.py run` when the session starts; the runner keeps one
-`gh webhook forward` per watched repo and prints one line per relevant event. The mod submits
-each line as a new prompt (`$.prompt.submit`), so every event becomes its own turn once the
-session is idle. Nothing polls GitHub, and nothing expires the way a `Monitor` does at 30 minutes.
+`gh webhook forward` per watched repo and prints one line per relevant event. Nothing polls
+GitHub, and nothing expires the way a `Monitor` does at 30 minutes.
+
+How an event reaches the session depends on whether a turn is running:
+
+- **Idle:** the mod submits the event as a new prompt (`$.prompt.submit`), which starts a turn.
+- **Turn running:** a submitted prompt would only wait for the turn to end, so the mod holds the
+  event and attaches it to the next tool result of the main loop (the tool call's `context`,
+  which the model reads right after that tool's output). Events still held when the turn ends
+  are submitted together as one prompt. Subagents' tool calls never carry them.
 
 ## When to use it
 
 - "Re-review Alice's PRs whenever she pushes", "tell me when Bob's PR merges".
 - "Ping me when someone requests my review on acme/widgets."
+- "Keep an eye on every PR I've reviewed there, whoever wrote it."
 - Any standing PR watch that should survive past one Monitor window.
 
 Not for one-off checks of a single PR: read it with `gh pr view` instead.
@@ -26,9 +34,16 @@ Per watched repo (`config.json`), filtered by `pr_watch.py`:
 
 | Event | Forwarded when | Line |
 |---|---|---|
-| `pull_request` `opened`, `synchronize`, `reopened`, `ready_for_review`, `closed` | the PR author is a watched `--author` (`*` = anyone) | `PR_EVENT o/r#N <action> author=… head=<sha8> merged=true\|false` |
+| `pull_request` `opened`, `synchronize`, `reopened`, `ready_for_review`, `closed` | the PR author is a watched `--author` (`*` = anyone) | `PR_EVENT o/r#N <action> author=… head=<sha8> merged=true\|false reason=author` |
+| `pull_request` `synchronize`, `reopened`, `ready_for_review`, `closed` | the watch has `--reviewed` and one of the `--me` logins has submitted a review on the PR, whoever wrote it | `PR_EVENT o/r#N <action> author=… head=<sha8> merged=… reason=reviewed` |
 | `pull_request` `review_requested` | the requested reviewer is one of the `--me` logins, on any PR in the repo | `PR_EVENT o/r#N review_requested reviewer=… author=… head=…` |
 | `pull_request_review` `submitted` | on a watched author's PR | `PR_EVENT o/r#N review_submitted by=… state=approved\|changes_requested\|commented author=… head=…` |
+| `pull_request_review` `dismissed` | the dismissed review is by one of the `--me` logins, on any PR in the repo | `PR_EVENT o/r#N review_dismissed reviewer=… author=… head=…` |
+
+An event matching both the author rule and the reviewed rule yields one line, `reason=author`.
+The webhook payload does not list a PR's reviewers, so the reviewed rule asks
+`GET repos/{repo}/pulls/{n}/reviews` (see Costs). When that call fails or times out (10 s), the
+event is forwarded anyway with `reason=reviewed reviewed=unknown`, never dropped.
 
 Only logins, numbers, states and short shas reach the prompt; titles and bodies never do, so a
 PR's text cannot steer the session. The agent reads the PR itself when it acts.
@@ -45,6 +60,7 @@ PR's text cannot steer the session. The agent reads the PR itself when it acts.
 ```bash
 S=skills/pr-watch/scripts/pr_watch.py
 python3 $S add --repo acme/widgets --author alice --author bob --me owner-login
+python3 $S add --repo acme/gadgets --me owner-login --reviewed   # every PR owner-login reviewed
 python3 $S install-mod --mods-dir "<the session's mods folder>"
 ```
 
@@ -74,7 +90,7 @@ forwarder without a reload.
 
 ```json
 {
-  "watches": [{"repo": "acme/widgets", "authors": ["alice"], "me": ["owner-login"]}],
+  "watches": [{"repo": "acme/widgets", "authors": ["alice"], "me": ["owner-login"], "reviewed": true}],
   "prompt": "[pr-watch] {event}\nStanding ask from the owner: ..."
 }
 ```
@@ -83,6 +99,8 @@ forwarder without a reload.
 The default tells the agent to re-review at the new head, review what is requested from the
 owner, note merges and closes, and tell the owner only when something needs them. The mod
 re-reads it on every event, so an edit takes effect at once.
+
+`reviewed` (set by `add --reviewed`) needs at least one `me` login other than `*`.
 
 ## Limits, and how they are handled
 
@@ -109,12 +127,26 @@ re-reads it on every event, so an edit takes effect at once.
 
 ## Costs
 
-- Each forwarded event is a full agent turn. A busy author pushing often means many turns; keep
-  `--author` lists tight. Identical lines within 60 s are dropped by the mod.
+- Each forwarded event is a full agent turn, or, mid-turn, extra context on a tool result. A busy
+  author pushing often means many turns; keep `--author` lists tight. Identical lines within 60 s
+  are dropped by the mod.
+- In a `--reviewed` repo, a `synchronize`, `reopened`, `ready_for_review` or `closed` event on a PR
+  not covered by the author rule costs one reviews API call. The answer is cached per PR: a yes
+  for the runner's lifetime, a no for 10 minutes. A review the owner submits while the runner is
+  watching marks its PR at once, with no call.
 - One `gh webhook forward` process and a few GitHub API calls per repo at (re)start; nothing
   between events.
 - `gh webhook forward` is a development tool from GitHub; its hooks are visible to every repo
   admin under Settings → Webhooks while the watch runs.
+
+## Editing the mod
+
+Two rules; breaking either makes the engine refuse the module, and on a reload the old version
+stays loaded with its runner already killed:
+
+- **Never pass `$` to a helper function.** Use `$` only inside the hook that received it; helpers
+  take plain values (`takeLines`, `messageFor`, `takeEvents`, `withContext` in `register.ts`).
+- **No `node:*` imports** in the hooks module; start processes with `$.process.spawn`.
 
 ## Files
 
