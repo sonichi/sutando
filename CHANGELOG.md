@@ -13,7 +13,7 @@ A terminal-run core gets the same move from the CLI. The release also brings Win
 local runtime daemon with a canonical CLI, a supervised multi-worker pool, a rebuilt voice relay,
 and decision cards for owner questions.
 
-1188 PRs since v0.12.0: 294 features, 648 fixes.
+1201 PRs since v0.12.0: 296 features, 657 fixes.
 
 ### Added
 
@@ -32,7 +32,7 @@ and decision cards for owner questions.
 
 ### Fixed
 
-- 648 fixes, concentrated in delivery, the gateway and bridges, the worker pool, voice, and health reporting. Notable: a bridge that died without releasing the poller lock no longer blocks its replacement for 90 s (#5313); a login-expired worker is reported, not respawned (#4885); web voice playback no longer adds a 16–20 kHz artifact on 48 kHz devices (#4240); voice answers "which room are you in?" from the room the session is bound to (#5713).
+- 657 fixes, concentrated in delivery, the gateway and bridges, the worker pool, voice, and health reporting. Notable: a bridge that died without releasing the poller lock no longer blocks its replacement for 90 s (#5313); a login-expired worker is reported, not respawned (#4885); web voice playback no longer adds a 16–20 kHz artifact on 48 kHz devices (#4240); voice answers "which room are you in?" from the room the session is bound to (#5713).
 - Connections follow the room: room tools, every gateway client and each named lane act through the connection serving the room's server, never the legacy one they inherited; MCP endpoint, owner and status readers follow the primary connection, not the legacy sidecar. (#5977, #5978, #5980, #5982, #5983)
 - A terminal Codex core starts the local agent API and resolves `CLAUDE_CONFIG_DIR`; restarting or healing a Codex core replaces only the core window and keeps sibling gateway windows. (#5976, #5979)
 - ag2-sparrow: Hatch install replaces a Sparrow serving another id or an older token, and its text names the product s.space. (#5990, #5998)
