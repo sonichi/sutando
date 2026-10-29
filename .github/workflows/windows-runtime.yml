@@ -3,9 +3,16 @@ name: Windows runtime
 on:
   pull_request:
     branches: [main, staging-interaction-planes, support-windows-11]
+    types: [opened, synchronize, reopened, labeled]
   push:
     branches: [main, staging-interaction-planes]
+  schedule:
+    # Off-peak daily; the job-level `if` below is what actually gates execution.
+    - cron: '37 8 * * *'
+  workflow_dispatch: {}
 
+# IMPORTANT: tests must never emit product telemetry; removing or weakening this makes CI test runs
+# count as real users on the admin DAU. Enforced by tests/telemetry-test-optout-guard.test.py.
 env:
   SUTANDO_TELEMETRY: "0"
 
@@ -14,6 +21,11 @@ jobs:
     name: PowerShell + Windows runtime
     runs-on: windows-latest
     timeout-minutes: 20
+    # Not a required check (see main's ruleset); skip on ordinary push/PR to save CI minutes.
+    if: >-
+      github.event_name == 'schedule' ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'windows-ci'))
 
     steps:
       - name: Checkout
@@ -30,10 +42,8 @@ jobs:
         with:
           python-version: '3.11'
 
-      # bodhi-realtime-agent ships a prebuilt dist, but its git dependency
-      # postinstall uses POSIX `[ ... ]` syntax that cmd.exe cannot parse.
-      # Skipping lifecycle scripts is the Windows clean-install path; the next
-      # step fails closed if the required prebuilt package is absent.
+      # bodhi-realtime-agent ships a prebuilt dist from npm; lifecycle scripts stay
+      # skipped and the next step fails closed if that dist is absent.
       - name: Install dependencies (Windows)
         run: npm ci --ignore-scripts
 
@@ -217,6 +227,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { $failures += 'single-instance.test.py failed' }
           python tests/file-lock.test.py
           if ($LASTEXITCODE -ne 0) { $failures += 'file-lock.test.py failed' }
+          python tests/holder-lock.test.py
+          if ($LASTEXITCODE -ne 0) { $failures += 'holder-lock.test.py failed' }
           python tests/outbox-windows.test.py
           if ($LASTEXITCODE -ne 0) { $failures += 'outbox-windows.test.py failed' }
           python tests/proactive-recovery-process-probe.test.py

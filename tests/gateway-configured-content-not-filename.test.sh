@@ -35,7 +35,8 @@ drive_startup() {  # $1=.env body  $2=sibling body  $3=PY ("" exercises the degr
   mkdir -p "$d/repo/scripts" "$d/repo/src" "$d/home" "$d/logs"
   cp "$REPO/scripts/python-binary.sh" "$REPO/scripts/channel-env.sh" "$d/repo/scripts/"
   cp "$REPO/src/channel_env_resolve.py" "$REPO/src/channel_env_containment.py" \
-     "$REPO/src/channel_token.py" "$d/repo/src/"
+     "$REPO/src/channel_token.py" "$REPO/src/gateway_credential_sources.py" "$d/repo/src/"
+  mkdir -p "$d/repo/shared"; cp "$REPO/shared/ag2_gateway_credentials.py" "$d/repo/shared/"
   printf '#!/bin/bash\nif [ "${1:-}" = "claude-home-path" ]; then\n  if [ -n "${2:-}" ]; then echo "%s/home/$2"; else echo "%s/home"; fi\n  exit 0\nfi\nexit 0\n' \
       "$d" "$d" > "$d/repo/scripts/sutando-config.sh"; chmod +x "$d/repo/scripts/sutando-config.sh"
   printf 'import os\nprint("BRIDGE_STARTED token=%%s tier=%%s" %% (os.environ.get("REMOTE_TASK_TOKEN") or "<none>", os.environ.get("REMOTE_TASK_TIER") or "<none>"))\n' \

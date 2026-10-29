@@ -59,14 +59,17 @@ export function pickRecentActivity(content: string): string[] {
 /**
  * Build a concise context summary for the Gemini voice agent.
  * Gives Gemini awareness of the current system state and user context.
+ * `extraLines` are lines optional skills contribute about where the session is.
  */
-export function buildVoiceAgentContext(): string {
+export function buildVoiceAgentContext(opts: { extraLines?: string[] } = {}): string {
 	const userProfile = readMemory('user_profile.md');
 	const lines: string[] = [];
 
 	if (userProfile) {
 		lines.push('USER CONTEXT:', userProfile.slice(0, 500), '');
 	}
+
+	if (opts.extraLines?.length) lines.push(...opts.extraLines, '');
 
 	// Read build log summary
 	const buildLog = join(WORKSPACE_DIR, 'build_log.md');

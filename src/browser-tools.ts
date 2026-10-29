@@ -18,6 +18,7 @@ import { demoStateRef } from './recording-state.js';
 import { resolveWorkspace } from './workspace_default.js';
 import { isMacOS, isWindows, macOSOnlyError, resizeImage } from './platform.js';
 import { readCaptureToken } from './util_paths.js';
+import { meetingHoldsModel } from './meeting-input-hold.js';
 import { setupHint, scrollOutcome } from './osascript-setup-hint.js';
 import { withScheme } from './url-scheme.js';
 
@@ -25,6 +26,10 @@ const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
 
 /** Send text to Gemini via sendRealtimeInput when available, otherwise sendContent. */
 export function injectText(session: any, text: string) {
+	if (meetingHoldsModel(session)) {
+		console.log(`${ts()} [InjectText] not sent: meeting mode (transcription)`);
+		return;
+	}
 	try {
 		const transport = session?.transport;
 		if (typeof transport?.session?.sendRealtimeInput === 'function') {
@@ -37,6 +42,26 @@ export function injectText(session: any, text: string) {
 	} catch (err) {
 		console.error(`${ts()} [InjectText] Error:`, err);
 	}
+}
+
+/** Send context through `transport.sendContent` with `turnComplete: false`. The pinned Gemini
+ *  transport ignores that flag and sends realtime text, so a spoken reply is still possible. */
+export function injectSilentContext(session: any, text: string): boolean {
+	if (meetingHoldsModel(session)) {
+		console.log(`${ts()} [InjectSilent] not sent: meeting mode (transcription)`);
+		return false;
+	}
+	try {
+		const transport = session?.transport;
+		if (typeof transport?.sendContent === 'function') {
+			transport.sendContent([{ role: 'user', text }], false);
+			return true;
+		}
+		console.warn(`${ts()} [InjectSilent] transport has no sendContent — context dropped`);
+	} catch (err) {
+		console.error(`${ts()} [InjectSilent] Error:`, err);
+	}
+	return false;
 }
 
 // Vision model — override via .env (default: flash-lite for this trivial 20-word task)

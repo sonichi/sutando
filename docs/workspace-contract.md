@@ -59,7 +59,7 @@ Resolved by `bash scripts/sutando-config.sh workspace` (the M0 helper). Helpers 
 ├── relay/                  ← inter-session continuity notes (consumed by catchup)
 ├── skills/                 ← user's personal/custom skills (local-only)
 ├── build_log.md            ← single-file done/in-flight/next snapshot (append-only)
-└── pending-questions.md    ← unanswered questions awaiting owner input
+└── pending-questions.md    ← legacy, read-only history (live questions: room database, `src/pending_questions_reader.py list`)
 ```
 
 The workspace root holds **only** the top-level dirs above plus the two markdown files. Loose `.json` files belong under `state/`. The repo root holds code/skills/config (a separate concern).
@@ -75,7 +75,7 @@ When the agent writes a new file under `<repo>/workspace/`, walk this list top-t
 5. **Append-only chrono event stream?** → `logs/<component>.log`.
 6. **Long-form human-readable content?** → `notes/<slug>.md`.
 7. **Done/in-flight/next snapshot?** → append to `build_log.md`.
-8. **Blocked question for the owner?** → append to `pending-questions.md`.
+8. **Blocked question for the owner?** → `python3 scripts/ask-owner.py`.
 9. **Durable input data?** → `data/<topic>/`.
 10. **Continuity note for the next session?** → `relay/relay-<ts>.md` (consumed by `src/session-handoff.sh`).
 11. **Personal skill the user adds for their own use?** → `skills/<skill-name>/` (local-only, not contributed to `skills/` at the repo root).

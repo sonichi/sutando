@@ -14,8 +14,9 @@ This runner is the reliable path. It is invoked by launchd
 (``com.sutando.cron-runner``) every 60s, independent of any Claude session.
 Each tick it reads the per-host ``crons.json``, decides which entries are DUE
 since their last recorded fire, and emits a task file into ``tasks/`` for each.
-A ``shell_command`` entry runs directly from the repository root with output
-logged; a prompt-backed entry goes through the watcher pipeline. Same OS-level → emit-task → process
+A ``shell_command`` entry runs in a detached child from the repository root,
+outside both this tick and the core session, with output logged per job; a
+prompt-backed entry goes through the watcher pipeline. Same OS-level → emit-task → process
 pipeline the launchd health-check fallback already uses.
 
 Ownership / no double-fire
@@ -91,6 +92,8 @@ CRONS_FILE = WORKSPACE / "hosts" / host_slug() / "crons.json"
 TASKS_DIR = WORKSPACE / "tasks"
 STATE_FILE = WORKSPACE / "state" / "cron-runner-state.json"
 CORE_ALIVE_FILE = WORKSPACE / "state" / "cores" / f"{host_slug()}.alive"
+# Read by health-check: the record that due fires are being held for a dead heartbeat.
+HOLD_FILE = WORKSPACE / "state" / "cron-runner-hold.json"
 REPO_ROOT = SRC_DIR.parent
 
 # Look back at most this far when catching up a missed fire. Bounds work after
@@ -374,6 +377,36 @@ def local_core_alive(now_epoch: Optional[int] = None) -> bool:
     return 0 <= age < CORE_ALIVE_MAX_AGE_SECONDS
 
 
+def _core_alive_reason(now_epoch: float) -> str:
+    """Why local_core_alive() said no, for the hold record and the log line."""
+    try:
+        age = now_epoch - CORE_ALIVE_FILE.stat().st_mtime
+    except OSError:
+        return f"core heartbeat missing ({CORE_ALIVE_FILE})"
+    return f"core heartbeat stale ({int(age)}s old, limit {CORE_ALIVE_MAX_AGE_SECONDS}s)"
+
+
+def _record_hold(held: list, now_epoch: int) -> None:
+    """Publish (or clear) the held-fires record; a hold left silent is how schedules vanished."""
+    hold_file = STATE_FILE.parent / HOLD_FILE.name
+    if not held:
+        hold_file.unlink(missing_ok=True)
+        return
+    prior = _load_json(hold_file, {})
+    since = prior.get("since") if isinstance(prior, dict) else None
+    reason = _core_alive_reason(now_epoch)
+    record = {
+        "since": since if isinstance(since, int) else now_epoch,
+        "updated_at": now_epoch,
+        "held": sorted(set(held) | set(prior.get("held", []) if isinstance(prior, dict) else [])),
+        "reason": reason,
+    }
+    _atomic_write_text(hold_file, json.dumps(record))
+    _ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now_epoch))
+    print(f"{_ts} cron-runner: holding due fire(s) {', '.join(sorted(set(held)))}: {reason}",
+          file=sys.stderr)
+
+
 def _load_json(path: Path, default):
     try:
         return json.loads(path.read_text())
@@ -430,15 +463,28 @@ def _sanitize_name(name: str) -> str:
     return cron_task_id.sanitize_name(name)
 
 
-def _shell_log_path() -> Path:
-    """Return the durable log path for direct shell-command jobs."""
+def _shell_job_key(name: str) -> str:
+    """Readable slug plus a digest of the exact name; the slug alone is lossy
+    (`a b` and `a-b` collide, non-Latin names become `unnamed`)."""
+    import hashlib
+    digest = hashlib.sha256(name.encode("utf-8")).hexdigest()[:12]
+    return f"{_sanitize_name(name)}-{digest}"
+
+
+def _shell_log_path(name: str) -> Path:
+    """Return the durable per-job log path for a direct shell-command job."""
     # Derive this from the state path so tests and callers that inject a
     # workspace by replacing STATE_FILE keep all runner state together.
-    return STATE_FILE.parent.parent / "logs" / "cron-runner.log"
+    return STATE_FILE.parent.parent / "logs" / "cron" / f"{_shell_job_key(name)}.log"
 
 
-# A hung or chatty job must not stall the tick that holds the state lock, nor
-# grow the log unboundedly. Per-entry override: `shell_timeout_s`.
+def _shell_lock_path(name: str) -> Path:
+    """Per-job lock held for the life of one run; a busy lock means skip the fire."""
+    return STATE_FILE.parent / "cron-shell-locks" / f"{_shell_job_key(name)}.lock"
+
+
+# A hung job would hold its own lock and skip every later fire; a chatty one
+# would grow the log unboundedly. Per-entry override: `shell_timeout_s`.
 SHELL_COMMAND_TIMEOUT_S = 300
 SHELL_OUTPUT_LIMIT = 64 * 1024
 
@@ -487,8 +533,8 @@ def _run_shell_command(name: str, command: str, timeout_s: int = SHELL_COMMAND_T
     owned by the user and runs from the repository root, matching the cwd a
     task-backed cron receives when the core executes it.
 
-    Bounded in time and output: the caller holds the shared state lock for the
-    whole tick, so an unbounded command would suppress every later job.
+    Bounded in time and output: a run holds its job lock until it exits, so an
+    unbounded command would suppress every later fire of that job.
     """
     started = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     try:
@@ -530,10 +576,7 @@ def _run_shell_command(name: str, command: str, timeout_s: int = SHELL_COMMAND_T
         f"stderr:\n{stderr}"
         "\n"
     )
-    log_path = _shell_log_path()
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    with log_path.open("a") as handle:
-        handle.write(log)
+    _append_shell_log(name, log)
 
     if stdout:
         print(f"cron-runner: shell_command {name} stdout:\n{stdout}", end="")
@@ -547,7 +590,88 @@ def _run_shell_command(name: str, command: str, timeout_s: int = SHELL_COMMAND_T
     return returncode
 
 
+def _append_shell_log(name: str, text: str) -> None:
+    log_path = _shell_log_path(name)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a") as handle:
+        handle.write(text)
+
+
+def _run_shell_job(name: str, command: str, timeout_s: int) -> Optional[int]:
+    """Run one fire under the job's non-blocking lock; None when a previous run
+    still holds it, so a slow job never stacks a second copy of itself."""
+    lock_path = _shell_lock_path(name)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        try:
+            lock_fd(fd, blocking=False)
+        except OSError:
+            _ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            msg = f"[{_ts}] shell_command job={name!r} skipped: previous run still in progress\n"
+            _append_shell_log(name, msg)
+            print(f"cron-runner: {msg.strip()}", file=sys.stderr)
+            return None
+        try:
+            return _run_shell_command(name, command, timeout_s)
+        finally:
+            unlock_fd(fd)
+    finally:
+        os.close(fd)
+
+
+def _launch_shell_job(name: str, command: str, timeout_s: int) -> "subprocess.Popen[bytes]":
+    """Start the job in its own session and return without waiting.
+
+    The tick holds the shared state lock, and launchd starts no new tick while
+    one runs, so an inline job would delay every other launchd cron.
+    """
+    argv = [
+        sys.executable, str(Path(__file__).resolve()), "--shell-job",
+        f"--name={name}", "--timeout", str(timeout_s),
+        "--state-file", str(STATE_FILE), "--cwd", str(REPO_ROOT),
+        "--", command,
+    ]
+    return subprocess.Popen(
+        argv, cwd=str(REPO_ROOT), stdin=subprocess.DEVNULL,
+        start_new_session=True, close_fds=True,
+    )
+
+
+def _shell_job_main(argv: list) -> int:
+    """Entry point of the detached child started by :func:`_launch_shell_job`."""
+    global STATE_FILE, REPO_ROOT
+    import argparse
+    parser = argparse.ArgumentParser(prog="cron-runner.py --shell-job")
+    parser.add_argument("--name", required=True)
+    parser.add_argument("--timeout", type=int, required=True)
+    parser.add_argument("--state-file", required=True)
+    parser.add_argument("--cwd", required=True)
+    parser.add_argument("command")
+    args = parser.parse_args(argv)
+    STATE_FILE = Path(args.state_file)
+    REPO_ROOT = Path(args.cwd)
+    rc = _run_shell_job(args.name, args.command, args.timeout)
+    return 0 if rc is None else rc
+
+
 def emit_task(name: str, entry: dict) -> Path:
+    # A worker can claim between an ownership check and unlink: published
+    # payloads stay immutable until retired. Serialize emitters per job.
+    prefix = f"{cron_task_id.TASK_PREFIX}{_sanitize_name(name)}-"
+    with _state_lock(TASKS_DIR / f".{prefix}emit"):
+        pending = sorted(
+            (p for p in TASKS_DIR.glob(f"{prefix}*.txt")
+             if p.name[len(prefix):-4].isdigit()),
+            key=lambda p: int(p.name[len(prefix):-4]),
+        )
+        if pending:
+            print(f"cron-runner: coalesced {name!r} into outstanding {pending[0].stem}", file=sys.stderr)
+            return pending[0]
+        return _emit_new_task(name, entry)
+
+
+def _emit_new_task(name: str, entry: dict) -> Path:
     now_ms = int(time.time() * 1000)
     ts_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     # A launchd cron either carries a direct `prompt` or a `prompt_skill`
@@ -556,7 +680,6 @@ def emit_task(name: str, entry: dict) -> Path:
         body_task = f"/{entry['prompt_skill']}"
     else:
         body_task = entry.get("prompt", "")
-    safe_name = _sanitize_name(name)
     task_id = cron_task_id.task_id(name, now_ms)
     # Defang forged header/fence lines in the (config-supplied) body, then place
     # `task:` last so a multi-line prompt body cannot forge the structured
@@ -572,24 +695,6 @@ def emit_task(name: str, entry: dict) -> Path:
         f"task: {body_task}\n"
     )
     TASKS_DIR.mkdir(parents=True, exist_ok=True)
-    # Coalesce pending fires: if a prior emission for this same entry is still
-    # unconsumed (the core was down or busy), remove it before writing the new
-    # one, so a long outage leaves exactly ONE task per entry — the newest —
-    # instead of one file per missed slot (a */30 entry over a 6h outage would
-    # otherwise queue 12). Design converged with Chi + Sutando-Pro in #dev
-    # 2026-07-18. We keep the per-fire timestamped id (rather than a literally
-    # stable filename) so the orphan-check completion-marker contract
-    # (results/<id>.txt) is untouched — a consumed+archived result can never
-    # collide with a future fire's unique id. The suffix.isdigit() guard keeps
-    # the sweep from matching a different entry whose slug shares this prefix
-    # (e.g. cleaning "sync" must not delete "sync-workspace"'s pending task).
-    prefix = f"{cron_task_id.TASK_PREFIX}{safe_name}-"
-    for stale in TASKS_DIR.glob(f"{prefix}*.txt"):
-        if stale.name[len(prefix):-4].isdigit():
-            try:
-                stale.unlink()
-            except OSError:
-                pass
     path = TASKS_DIR / f"{task_id}.txt"
     # HMAC envelope (#3014 writer census): stamp at this writer's edge, fail-open
     # so a stamping error costs the stamp and never the fire.
@@ -598,7 +703,7 @@ def emit_task(name: str, entry: dict) -> Path:
         body = stamp_text(body, WORKSPACE)
     except Exception:
         pass
-    path.write_text(body)
+    _atomic_write_text(path, body)
     _emit_cron_telemetry()
     return path
 
@@ -634,6 +739,7 @@ def run(now_epoch: Optional[int] = None) -> list:
     # concurrent reconciler (Codex boot) can neither observe a half-written
     # state nor have its just-seeded migration boundary clobbered by our
     # write-back. See _state_lock for the race this closes.
+    held: list = []
     with _state_lock(STATE_FILE):
         state = _load_json(STATE_FILE, {})
         for entry in crons:
@@ -667,12 +773,20 @@ def run(now_epoch: Optional[int] = None) -> list:
                 # Direct shell jobs must stay claimable and idempotent like prompt jobs; only
                 # the execution differs.
                 if shell_command is not None:
-                    _run_shell_command(
-                        name, shell_command, _shell_timeout_for(entry))
-                    emitted.append(name)
+                    try:
+                        proc = _launch_shell_job(
+                            name, shell_command, _shell_timeout_for(entry))
+                        print(f"cron-runner: launched shell_command {name} (pid {proc.pid})")
+                        emitted.append(name)
+                    except OSError as exc:
+                        _append_shell_log(
+                            name, f"shell_command job={name!r} launch failed: {exc}\n")
+                        print(f"cron-runner: shell_command {name} launch failed: {exc}",
+                              file=sys.stderr)
                 elif not core_alive:
                     # Preserve the previous boundary so a short outage can
                     # recover this slot after the heartbeat returns.
+                    held.append(name)
                     continue
                 else:
                     lateness = now_epoch - due_epoch
@@ -693,10 +807,14 @@ def run(now_epoch: Optional[int] = None) -> list:
 
         if crons:  # only persist once we've actually read a config
             _atomic_write_text(STATE_FILE, json.dumps(state))
+        if held or core_alive:
+            _record_hold(held, now_epoch)
     return emitted
 
 
 if __name__ == "__main__":
+    if sys.argv[1:2] == ["--shell-job"]:
+        sys.exit(_shell_job_main(sys.argv[2:]))
     names = run()
     if names:
         _ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())

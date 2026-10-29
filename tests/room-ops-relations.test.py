@@ -19,6 +19,11 @@ import sys
 import unittest
 from unittest import mock
 
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 _ROOM_OPS = pathlib.Path(__file__).resolve().parents[1] / "skills" / "agent-room-ops"
 sys.path.insert(0, str(_ROOM_OPS))
 import mention as mn, relations as rl, room_ops, say as sy  # noqa: E401,E402
@@ -64,11 +69,14 @@ class RelationFieldsTests(unittest.TestCase):
         self.assertIn("reply_to", str(ctx.exception))
         self.assertIn("evt1", str(ctx.exception))
 
-    def test_no_thread_surface_is_offered(self):
-        # The gateway cannot honour a thread relation, so asking for one must be
-        # impossible rather than silently downgraded to a citation.
-        with self.assertRaises(TypeError):
-            rl.relation_fields(thread_root=EV)
+    def test_thread_root_is_its_own_field_checked_like_a_citation(self):
+        # The gateway builds the m.thread relation from this id; a bad id is
+        # refused here rather than posted outside the thread.
+        self.assertEqual(rl.relation_fields(thread_root=EV), {"thread_root": EV})
+        self.assertEqual(rl.relation_fields(reply_to=EV, thread_root="$root"),
+                         {"reply_to": EV, "thread_root": "$root"})
+        with self.assertRaises(rl.RelationError):
+            rl.relation_fields(thread_root="root-without-dollar")
 
 
 class SayCitationTests(unittest.TestCase):
@@ -86,7 +94,7 @@ class SayCitationTests(unittest.TestCase):
         self.assertEqual(calls[0]["body"], "hi")
         self.assertEqual(calls[0]["op"], "message")
 
-    def test_nothing_claims_thread_membership(self):
+    def test_a_citation_alone_claims_no_thread_membership(self):
         calls = []
         with _seam(sy, calls):
             sy.say("hi", ROOM, "@a:hs", reply_to=EV)
@@ -162,6 +170,22 @@ class CitationCliTests(unittest.TestCase):
                 rc = room_ops._main(["mention", "peer", "ping", ROOM, "--reply-to", EV])
         self.assertEqual(rc, 0)
         m.assert_called_once_with("peer", "ping", ROOM, None, reply_to=EV)
+
+    def test_agents_verb_lists_the_registry(self):
+        with mock.patch.object(room_ops._resolve, "list_agents",
+                               return_value={"ok": True, "agents": []}) as m:
+            with mock.patch("sys.stdout"):
+                rc = room_ops._main(["agents"])
+        self.assertEqual(rc, 0)
+        m.assert_called_once_with()
+
+    def test_mention_thread_root_flag_reaches_mention(self):
+        with mock.patch.object(room_ops._mention, "mention",
+                               return_value={"ok": True, "event_id": "$e"}) as m:
+            with mock.patch("sys.stdout"):
+                rc = room_ops._main(["mention", "peer", "ping", ROOM, "--thread-root", EV])
+        self.assertEqual(rc, 0)
+        m.assert_called_once_with("peer", "ping", ROOM, None, reply_to=None, thread_root=EV)
 
     def test_help_says_a_citation_is_not_a_thread(self):
         # The surface a caller reads first must carry the limitation, not only

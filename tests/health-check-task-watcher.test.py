@@ -44,6 +44,12 @@ Exit code: 0 on pass, 1 on fail.
 """
 
 from __future__ import annotations
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import contextlib
 import importlib.util
 import io
@@ -104,9 +110,10 @@ def run_check(*, core_alive: bool, pid_text: str | None, argv: str | None = None
         make_workspace(Path(td), core_alive=core_alive, pid_text=pid_text)
         saved = (hc.WORKSPACE_DIR, hc._proc_argv, hc._watcher_trees,
                  hc._ps_snapshot, hc._pid_parent, hc._pid_instance_id,
-                 hc._pid_actor_id)
+                 hc._pid_actor_id, hc._proc_argv_vector)
         try:
             hc.WORKSPACE_DIR = Path(td)
+            hc._proc_argv_vector = lambda pid: None
             if argv is not None:
                 hc._proc_argv = lambda pid: argv
             hc._watcher_trees = lambda *a, **k: (trees or {})
@@ -120,7 +127,7 @@ def run_check(*, core_alive: bool, pid_text: str | None, argv: str | None = None
         finally:
             (hc.WORKSPACE_DIR, hc._proc_argv, hc._watcher_trees,
              hc._ps_snapshot, hc._pid_parent, hc._pid_instance_id,
-             hc._pid_actor_id) = saved
+             hc._pid_actor_id, hc._proc_argv_vector) = saved
 
 
 @contextlib.contextmanager
@@ -136,9 +143,10 @@ def supervised_watcher(*, pid: str = "7100", pid_text: str | None = None,
         ws = make_workspace(Path(td), core_alive=True, pid_text=pid_text)
         saved = (hc.WORKSPACE_DIR, hc._proc_argv, hc._watcher_trees,
                  hc._ps_snapshot, hc._pid_parent, hc._pid_instance_id,
-                 hc._pid_actor_id)
+                 hc._pid_actor_id, hc._proc_argv_vector)
         try:
             hc.WORKSPACE_DIR = ws
+            hc._proc_argv_vector = lambda p: None
             hc._proc_argv = lambda p: argv
             hc._watcher_trees = lambda *a, **k: {pid: {pid}}
             hc._ps_snapshot = lambda *a, **k: ""
@@ -149,7 +157,7 @@ def supervised_watcher(*, pid: str = "7100", pid_text: str | None = None,
         finally:
             (hc.WORKSPACE_DIR, hc._proc_argv, hc._watcher_trees,
              hc._ps_snapshot, hc._pid_parent, hc._pid_instance_id,
-             hc._pid_actor_id) = saved
+             hc._pid_actor_id, hc._proc_argv_vector) = saved
 
 
 def case_r_supervised_watcher_exposes_restamp_pid() -> list[str]:
@@ -539,7 +547,7 @@ def case_c_dead_pid_warns() -> list[str]:
 
 def case_d_pid_reuse_warns() -> list[str]:
     # kill -0 alone would call this alive — the argv check is what catches it.
-    r = run_check(core_alive=True, pid_text="4242", argv="/usr/sbin/cupsd -l")
+    r = run_check(core_alive=True, pid_text="4194305", argv="/usr/sbin/cupsd -l")
     if r["status"] != "warn":
         return [f"d) PID reuse should warn, got {r['status']}"]
     if "reuse" not in r["detail"]:
@@ -548,7 +556,7 @@ def case_d_pid_reuse_warns() -> list[str]:
 
 
 def case_e_live_watcher_is_ok() -> list[str]:
-    r = run_check(core_alive=True, pid_text="4242", argv="bash src/watch-tasks-stream.sh")
+    r = run_check(core_alive=True, pid_text="4194305", argv="bash src/watch-tasks-stream.sh")
     if r["status"] != "ok":
         return [f"e) live watcher should be ok, got {r['status']} ({r['detail']})"]
     return []
@@ -622,9 +630,9 @@ def case_j_extra_tree_warns() -> list[str]:
     """A live sentinel does not mean a healthy watcher layer: an orphan from an
     earlier start keeps draining tasks/ too, so every task is processed twice.
     Observed 2026-07-21 — two monitors reported the same TASK_FILE."""
-    r = run_check(core_alive=True, pid_text="4242",
+    r = run_check(core_alive=True, pid_text="4194305",
                   argv="bash src/watch-tasks-stream.sh",
-                  trees={"4200": {"4200", "4242"}, "9000": {"9000", "9001"}})
+                  trees={"4200": {"4200", "4194305"}, "9000": {"9000", "9001"}})
     fails = []
     if r["status"] != "warn":
         fails.append(f"j) an untracked extra tree should warn, got {r['status']}")
@@ -639,9 +647,9 @@ def case_k_sentinels_own_tree_is_not_an_extra() -> list[str]:
     """The sentinel records the SCRIPT's pid, not its shell wrapper's, so the
     tree containing it must be recognised as the tracked one — otherwise the
     check tells the operator to kill the watcher it just told them to keep."""
-    r = run_check(core_alive=True, pid_text="4242",
+    r = run_check(core_alive=True, pid_text="4194305",
                   argv="bash src/watch-tasks-stream.sh",
-                  trees={"4200": {"4200", "4242", "4243"}})
+                  trees={"4200": {"4200", "4194305", "4194306"}})
     if r["status"] != "ok":
         return [f"k) sole tree owning the sentinel should be ok, got {r['status']} ({r['detail']})"]
     return []
@@ -831,6 +839,21 @@ def case_ab_ambiguous_flattened_argv_declines_rather_than_guesses():
     return fails
 
 
+def case_ac_fake_pid_fixtures_ignore_unrelated_real_processes():
+    original = hc._proc_argv_vector
+    def probe(pid):
+        return ["python3", "unrelated-test-process.py"]
+
+    try:
+        hc._proc_argv_vector = probe
+        fails = case_s_fix_restamps_and_recheck_is_ok()
+        if hc._proc_argv_vector is not probe:
+            fails.append("ac) fixture did not restore the process-vector probe")
+        return fails
+    finally:
+        hc._proc_argv_vector = original
+
+
 def main() -> int:
     cases = [
         ("a", case_a_no_core_is_ok),
@@ -870,6 +893,7 @@ def main() -> int:
         ("z", case_z_an_unreadable_watcher_identity_offers_no_repair_target),
         ("aa", case_aa_argv_classification_binds_to_the_executed_script),
         ("ab", case_ab_ambiguous_flattened_argv_declines_rather_than_guesses),
+        ("ac", case_ac_fake_pid_fixtures_ignore_unrelated_real_processes),
     ]
     all_failures = []
     for label, fn in cases:

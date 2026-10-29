@@ -69,8 +69,14 @@ KNOWN_TOP = {
     "name", "scope", "version", "owner", "license", "description", "stability",
     "agent_compatibility", "dependencies", "permissions", "contract",
     "provenance", "enabled", "access_tier", "tools", "server", "startup", "config",
-    "hooks",
+    "hooks", "documented_for_core", "core_description", "supervised_worker",
+    "pending_questions_store", "claude_plugin", "orphan_reaper", "audience",
 }
+AUDIENCES = {"user", "developer"}
+# Fields a runtime scan activates straight from <repo>/skills, past the installers'
+# audience check, so a developer-only skill may not declare them.
+RUNTIME_ACTIVATED = ("tools", "hooks", "claude_plugin", "supervised_worker",
+                     "pending_questions_store", "documented_for_core")
 # Signals a skill actually touches the network (used for the permission cross-check).
 # No trailing \b: signals ending in a space/paren (`curl `, `fetch(`) are followed
 # by a non-word char, and a trailing \b there kills the match — so `curl -s …` and
@@ -104,6 +110,51 @@ def _lint_manifest(skill_dir: Path) -> tuple[list[str], list[str]]:
     for k in m:
         if k not in KNOWN_TOP:
             warn(f"unknown manifest field '{k}'")
+
+    # supervised_worker: sparrowd reads this to decide what to keep running, and
+    # it names no skill, so a malformed block is a silently unsupervised daemon.
+    sw = m.get("supervised_worker")
+    if sw is not None:
+        if not isinstance(sw, dict):
+            err("supervised_worker must be an object")
+        else:
+            for k in sw:
+                if k not in {"name", "script", "interpreter"}:
+                    warn(f"unknown supervised_worker field '{k}'")
+            wname = sw.get("name")
+            if not isinstance(wname, str) or not re.match(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$", wname):
+                err("supervised_worker.name must be a plain name, not a path")
+            script = sw.get("script")
+            if not isinstance(script, str) or not script:
+                err("supervised_worker.script is required")
+            elif script.startswith("/") or ".." in Path(script).parts:
+                err("supervised_worker.script must stay inside the skill directory")
+            elif not (skill_dir / script).is_file():
+                err(f"supervised_worker.script does not exist: {script}")
+            interp = sw.get("interpreter")
+            if not isinstance(interp, dict) or not isinstance(interp.get("config"), str) \
+                    or not interp["config"]:
+                err("supervised_worker.interpreter.config is required "
+                    "(the config key naming the interpreter)")
+            elif interp["config"] not in (m.get("config") or {}):
+                warn(f"supervised_worker.interpreter.config '{interp['config']}' "
+                     "is not declared in the config block")
+
+    # Script fields core discovers by name (src/skill_roots.py): each must be a relative .py file
+    # that resolves inside the skill, symlinks followed, the containment discovery applies.
+    for field in ("pending_questions_store", "orphan_reaper"):
+        pqs = m.get(field)
+        if pqs is None:
+            continue
+        if not isinstance(pqs, str) or not pqs.endswith(".py") or not pqs[:-3]:
+            err(f"{field} must be a relative path to a .py script")
+        elif pqs.startswith("/") or ".." in Path(pqs).parts or any(c.isspace() for c in pqs):
+            err(f"{field} must stay inside the skill directory")
+        elif not (skill_dir / pqs).is_file():
+            err(f"{field} does not exist: {pqs}")
+        elif not (skill_dir / pqs).resolve().is_relative_to(skill_dir.resolve()):
+            err(f"{field} must resolve inside the skill directory; {pqs} resolves to "
+                f"{(skill_dir / pqs).resolve()}")
 
     # required
     for req in ("name", "version", "owner", "stability"):
@@ -161,6 +212,15 @@ def _lint_manifest(skill_dir: Path) -> tuple[list[str], list[str]]:
         ui = prov.get("upstream_intent")
         if ui is not None and ui not in INTENTS:
             err(f"provenance.upstream_intent '{ui}' not in {sorted(INTENTS)}")
+
+    aud = m.get("audience")
+    if "audience" in m and aud not in AUDIENCES:
+        err(f"audience {aud!r} not in {sorted(AUDIENCES)} (installers treat it as developer-only)")
+    if "audience" in m and aud != "user":
+        for field in RUNTIME_ACTIVATED:
+            if m.get(field) not in (None, False):
+                err(f"developer-only skill declares '{field}', which runtime scans activate on "
+                    f"every install regardless of audience")
 
     # tools imply manifest-loaded
     if "tools" in m:

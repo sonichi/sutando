@@ -43,10 +43,12 @@ for _p in (str(_SRC), str(_REPO / "packages" / "ag2-sparrow")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from proactive_routing import (BRIDGE_CHANNELS, proactive_destination,  # noqa: E402
-                               should_claim_proactive)
+from proactive_routing import (BRIDGE_CHANNELS, body_target_channel,  # noqa: E402
+                               proactive_destination, should_claim_proactive)
 from workspace_default import resolve_workspace  # noqa: E402
 from util_paths import claude_home_path, shared_personal_path  # noqa: E402
+from voice_room_membership import (CHECK_DIR_NAME, VERDICT_TTL_S,  # noqa: E402
+                                   RoomMembershipVerifier, members_from_room_op)
 
 WS = resolve_workspace()
 
@@ -83,6 +85,31 @@ for _root in (
 # (``rtc._ack_disabled_until = 0.0``) must hit the same namespace the running code
 # uses. A cached ``import ag2_sparrow.remote_gateway_bridge`` gives neither.
 _IMPL = _REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" / "remote_gateway_bridge.py"
+_WORKER_LABEL_SCRIPT = (_REPO / "skills" / "worker-pool" / "scripts"
+                        / "apply_profile_label_overrides.py")
+
+
+def _sutando_apply_worker_label_overrides(labels: dict, config_version: int,
+                                          profile_mxid: str) -> dict:
+    """Hand validated owner labels to the optional worker-pool skill."""
+    import json
+    import subprocess
+
+    result = subprocess.run(
+        [sys.executable, str(_WORKER_LABEL_SCRIPT), "--workspace", str(WS),
+         "--config-version", str(config_version), "--profile-mxid", profile_mxid],
+        input=json.dumps(labels), text=True, capture_output=True, timeout=15,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"worker label apply failed (rc={result.returncode}): "
+                           f"{result.stderr.strip()[:240]}")
+    return json.loads(result.stdout)
+
+
+# An install without worker-pool has no callback and makes no profile read.
+_SUTANDO_WORKER_LABEL_APPLIER = (_sutando_apply_worker_label_overrides
+                                 if _WORKER_LABEL_SCRIPT.is_file() else None)
 
 # Runtime self-report, injected BEFORE the exec (anything after it is
 # unreachable when the exec'd source's own __main__ guard fires; see #3285).
@@ -184,14 +211,113 @@ def _routed_bridge_still_owns(routed: str, path: Path, now: float) -> bool:
     return (now - last) < _PROACTIVE_ABANDONED_S
 
 
+def _gateway_room_members(room: str):
+    """Joined mxids as the gateway reads them for this agent; None on any error."""
+    return members_from_room_op(
+        _req("POST", "/v1/room", {"op": "members", "room_id": room}, timeout=10))  # noqa: F821
+
+
+# An unusable owner reading is remembered this long: the gate runs every
+# outbound scan, and each re-read is a blocking gateway call on that thread.
+VOICE_OWNER_RETRY_S = 5.0
+_VOICE_OWNER = {"mxid": "", "at": 0.0, "bad_at": None}
+_voice_owner_clock = time.time
+
+
+def _voice_owner_read_failed(err: Exception) -> None:
+    _log(f"voice-room: owner read failed: {err}")  # noqa: F821
+
+
+def _voice_room_owner() -> str:
+    """The owner the gateway registry binds to this agent, cached for one TTL.
+    Kept apart from _gateway_owner(): that one also rewrites the DM hint global."""
+    now = _voice_owner_clock()
+    if _VOICE_OWNER["mxid"] and now - _VOICE_OWNER["at"] < VERDICT_TTL_S:
+        return _VOICE_OWNER["mxid"]
+    bad_at = _VOICE_OWNER["bad_at"]
+    if bad_at is not None and 0 <= now - bad_at < VOICE_OWNER_RETRY_S:
+        return ""
+    identity = _reenroll_identity()  # noqa: F821
+    try:
+        answer = _req("GET", "/v1/agents", timeout=10)  # noqa: F821
+    except Exception as e:  # noqa: BLE001
+        _voice_owner_read_failed(e)
+        answer = None
+    agents = answer.get("agents") if isinstance(answer, dict) else None
+    row = next((r for r in (agents or []) if isinstance(r, dict) and r.get("id") == identity), None)
+    owner = str((row or {}).get("owner") or "")
+    if not (owner.startswith("@") and ":" in owner):
+        _VOICE_OWNER.update(mxid="", bad_at=now)
+        return ""
+    _VOICE_OWNER.update(mxid=owner, at=now, bad_at=None)
+    return owner
+
+
+VOICE_ROOM_VERIFIER = RoomMembershipVerifier(
+    WS / "state" / CHECK_DIR_NAME, members=_gateway_room_members,
+    agent_mxid=lambda: _reenroll_identity(), owner_mxid=_voice_room_owner, log=lambda m: _log(m))  # noqa: F821
+_VOICE_ROOM_HELD: set = set()
+
+
+def _voice_result_room(path: Path) -> "str | None":
+    """The room a voice result addresses through its own `[channel: !room]`
+    line, None for the owner-DM shape, "" for a file that cannot be read or
+    decoded (no room verifies as "", so it is held)."""
+    try:
+        route, room, _ = _proactive_route(path.read_text(encoding="utf-8"))  # noqa: F821
+    except (OSError, ValueError):
+        return ""
+    return room if route == "send" else None
+
+
+def _voice_room_allowed(name: str, room: str) -> bool:
+    """The result named `name` may post into `room` only once the gateway
+    confirms owner AND agent are joined; an unreadable room ("") never may."""
+    if room and VOICE_ROOM_VERIFIER.verified(room):
+        _VOICE_ROOM_HELD.discard(name)
+        return True
+    if name not in _VOICE_ROOM_HELD:
+        _VOICE_ROOM_HELD.add(name)
+        why = f"{room} is not a verified owner+agent room" if room else "its body could not be read"
+        _log(f"voice-room: holding {name} — {why}")  # noqa: F821
+    return False
+
+
+def _voice_result_room_verified(path: Path) -> bool:
+    """Pre-claim: the room the file names on disk right now must verify."""
+    room = _voice_result_room(path)
+    return True if room is None else _voice_room_allowed(path.name, room)
+
+
+def _tagged_voice_result(name: str) -> bool:
+    """The task bridge's gateway-tagged room shape. An untagged forward is any
+    bridge's to deliver and is never held here."""
+    return name.startswith("proactive-result-") and proactive_destination(name) == _CHANNEL
+
+
+def _ag2space_proactive_room_gate(path: Path, room: str) -> bool:
+    """Post-claim: the room the CLAIMED body names must verify as well — the
+    pre-claim peek can have read a body still being written."""
+    return not _tagged_voice_result(path.name) or _voice_room_allowed(path.name, room)
+
+
 def _ag2space_proactive_claim_gate(path: Path) -> bool:
     """Claim when routing says the owner lives here; otherwise claim only what
     no other bridge will ever take (see _routed_bridge_still_owns)."""
+    if _tagged_voice_result(path.name) and not _voice_result_room_verified(path):
+        return False
+    dest = proactive_destination(path.name)
     # A filename destination outranks everything below, incl. the grace:
     # a destined file strands visibly rather than leak to the gateway room.
-    dest = proactive_destination(path.name)
     if dest is not None:
         return dest == _CHANNEL
+    # A body addressed to a room outranks activity routing;
+    # the drain has already refused a room on another homeserver.
+    try:
+        if body_target_channel(path.read_text(encoding="utf-8", errors="ignore")) == _CHANNEL:
+            return True
+    except OSError:
+        return False  # racing consumer already claimed it
     state = WS / "state" / "last-owner-activity.json"
     if should_claim_proactive(state, _CHANNEL):
         return True
@@ -212,10 +338,112 @@ def _ag2space_proactive_claim_gate(path: Path) -> bool:
         return False  # racing consumer already claimed it
 
 
+def _ag2space_owner_dm_upgraded(room: str, replacement: str) -> None:
+    """Ask the owner to re-invite the agent; detached, --unless-open dedupes the row; a failed launch raises."""
+    import subprocess
+    try:
+        subprocess.Popen(
+            [sys.executable, str(_REPO / "scripts" / "ask-owner.py"),
+             "Your DM with me was upgraded to a new room I'm not in. "
+             "Please invite me there and repoint my DM.", "--unless-open"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True)
+    except OSError as e:
+        _log(f"owner-DM upgrade: ask-owner did not start ({e})")  # noqa: F821
+        raise
+
+
+def _ag2space_proactive_dispatch_gate(task_id: str):
+    """Right before a message about a task is sent: why it must not be, or None."""
+    from proactive_dispatch_gate import dispatch_veto
+    return dispatch_veto(task_id, WS)
+
+
+def _ag2space_worker_holder(workspace, task_id: str):
+    """The worker holding the task, through the unanswered-tasks probe's delegation to worker-pool."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("unanswered_tasks_probe", _REPO / "scripts" / "unanswered-tasks.py")
+    probe = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(probe)
+    return probe._holder(workspace, task_id)
+
+
+def _ag2space_proactive_ack_gate(task_id: str, item_id: str):
+    """Right before a task's initial ack is sent: why a pickup, the card or a progress notice now covers it, or None."""
+    from proactive_dispatch_gate import initial_ack_veto
+    return initial_ack_veto(task_id, item_id, WS, _ag2space_worker_holder)
+
+
+def _lane_dedupe_gate(task: dict):
+    """A message another of this install's lanes queued, or one the lane its owner names will answer;
+    seats are other agents, never asked."""
+    import lane_dedupe
+    try:
+        from connections import event_owner_lanes
+        owners = event_owner_lanes(task, WS)
+    except Exception as e:  # noqa: BLE001 - no owner read keeps the first-come guard
+        _log(f"lane dedupe: owner lanes unreadable ({type(e).__name__}); first lane answers")  # noqa: F821
+        owners = []
+    mode = _INTAKE_MODE  # noqa: F821
+    deadline = mode["deadline"]
+    wait_s = None if deadline is None else max(0.0, deadline - time.monotonic())
+    try:
+        return lane_dedupe.duplicate_reason(WS / "state", task, GATEWAY_INSTANCE, log=_log,  # noqa: F821
+                                            owner_lanes=owners, wait_s=wait_s, defer=mode["defer"])
+    except lane_dedupe.OwnerPending:
+        return INTAKE_DEFER  # noqa: F821
+
+
+_STATUS_ACK_MANIFEST = _REPO / "skills" / "status-ack" / "manifest.json"
+
+
+def _legacy_keeps_proactive_room() -> bool:
+    from connections import legacy_keeps_proactive_room
+    return legacy_keeps_proactive_room(WS)
+
+
+def _legacy_stand_down():
+    from connections import legacy_parked
+    return "the legacy connection is parked; unpark it to resume" if legacy_parked(WS) else None
+
+
+def _owns_unaddressed() -> bool:
+    from connections import owns_unaddressed
+    return owns_unaddressed(GATEWAY_INSTANCE, WS)  # noqa: F821
+
+
+def _status_ack_gate(environ=None):
+    """The initial-ack dispatch gate only while status-ack is enabled; off, or unreadable, it is
+    not installed, so no status-ack code runs on any proactive send."""
+    try:
+        from skill_config import enabled
+        on = enabled("STATUS_ACK_ENABLED", _STATUS_ACK_MANIFEST, environ)
+    except Exception:  # noqa: BLE001 - a switch that cannot be read is off
+        return None
+    return _ag2space_proactive_ack_gate if on else None
+
+
+def _ag2space_proactive_route_gate(task_id: str, room: str, thread_root):
+    """Right before a message about a task is sent: why its room and thread are not the task's own, or None."""
+    from proactive_dispatch_gate import route_veto
+    return route_veto(task_id, room, thread_root, WS)
+
+
 # Assigned AFTER the exec: the canonical module's own `PROACTIVE_CLAIM_GATE =
 # None` default runs inside it and would overwrite an earlier assignment.
 PROACTIVE_CLAIM_GATE = _ag2space_proactive_claim_gate
+PROACTIVE_ROOM_GATE = _ag2space_proactive_room_gate
+OWNER_DM_UPGRADED_NOTIFY = _ag2space_owner_dm_upgraded
+PROACTIVE_DISPATCH_GATE = _ag2space_proactive_dispatch_gate
+PROACTIVE_ACK_GATE = _status_ack_gate()
+PROACTIVE_ROUTE_GATE = _ag2space_proactive_route_gate
+TASK_INTAKE_GATE = _lane_dedupe_gate if not gateway_credential_sources.is_seat(os.environ) else None  # noqa: F821
+PROACTIVE_ROOM_KEEP = _legacy_keeps_proactive_room if not GATEWAY_INSTANCE else None  # noqa: F821
+OWNS_UNADDRESSED = _owns_unaddressed
+STAND_DOWN_GATE = (_legacy_stand_down if not GATEWAY_INSTANCE  # noqa: F821
+                   and not gateway_credential_sources.is_seat(os.environ) else None)  # noqa: F821
 
 if _RUN_MAIN:  # pragma: no cover — script-entry tail; the subprocess suite drives it
     __name__ = "__main__"
+    VOICE_ROOM_VERIFIER.start()
     main()  # noqa: F821  (defined by the exec above)

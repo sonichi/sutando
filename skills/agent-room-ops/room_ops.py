@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# DEPRECATION NOTICE: room ops is being replaced by the AG2 Space MCP; use its room Actions.
+# Kept only as the fallback when the MCP is unreachable (see SKILL.md).
 """room-ops — an agent's room-participation capability collection (one skill).
 
 A single gateway-only client surface for everything an agent does in a room beyond
@@ -20,6 +22,7 @@ graceful-degrade); this file is the unified CLI that dispatches to them.
     python3 room_ops.py events list
     python3 room_ops.py events pull [--cursor N] [--wait S]
     python3 room_ops.py events stream [--cursor-file PATH] [--once] [--max-events N]
+    python3 room_ops.py capabilities                                 # supported commands + say flags
 
 Every subcommand prints a structured JSON result and **exits 0** for any
 structured result (a graceful `ok:false` "no context / no-op" is not a failed
@@ -34,6 +37,8 @@ from __future__ import annotations
 import json
 import os
 import sys
+import datetime
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(__file__))
 import read as _read       # noqa: E402
@@ -46,6 +51,8 @@ import say as _say         # noqa: E402
 import rooms as _rooms     # noqa: E402
 import members as _members # noqa: E402
 import events as _events   # noqa: E402
+import history as _history # noqa: E402
+import _gateway            # noqa: E402
 
 
 def _record_say(res):
@@ -129,7 +136,7 @@ def _dispatch_events(a):
             try:
                 filters = json.loads(a.filters)
             except ValueError as e:
-                # Structured error, exit 0 — same convention as doc's --file failure.
+                # Structured error, exit 0, like every other ok:false result.
                 return {"ok": False, "reason": f"--filters is not valid JSON: {e}"}
         return _events.subscribe(a.room_id, types, filters=filters, agent_mxid=a.agent_mxid)
     if a.events_cmd == "unsubscribe":
@@ -140,6 +147,15 @@ def _dispatch_events(a):
 
 
 def _main(argv):
+    """A room whose server has no usable connection is a hard failure, never a quiet no-op."""
+    try:
+        return _run(argv)
+    except _gateway.RoomConnectionError as e:
+        print(json.dumps({"ok": False, "reason": str(e)}, indent=2))
+        return 1
+
+
+def _run(argv):
     import argparse
     ap = argparse.ArgumentParser(prog="room_ops", description="Agent room-participation ops (gateway-only, gated).")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -164,15 +180,6 @@ def _main(argv):
     p.add_argument("--caption", default=None)
     p.add_argument("--agent", dest="agent_mxid", default=os.environ.get("AGENT_MXID"))
 
-    p = sub.add_parser("doc", help="read/write/delete a room Context document")
-    p.add_argument("action", choices=["get", "put", "rm"])
-    p.add_argument("room")
-    p.add_argument("--folder", default="room-live-context")
-    p.add_argument("--name", help="document filename (e.g. TODO.md)")
-    p.add_argument("--file", help="put: local file to upload (else stdin)")
-    p.add_argument("--message", help="put: commit message")
-    p.add_argument("--agent")
-
     p = sub.add_parser("join", help="accept this agent's own pending room invite")
     p.add_argument("room_id")
     p.add_argument("--agent", dest="agent_mxid", default=os.environ.get("AGENT_MXID"))
@@ -186,7 +193,7 @@ def _main(argv):
         g.add_argument("--ack", choices=sorted(_react.ACK))
         p.add_argument("--agent", dest="agent_mxid", default=os.environ.get("AGENT_MXID"))
 
-    p = sub.add_parser("rooms", help="list this agent's joined rooms")
+    p = sub.add_parser("rooms", help="list this agent's joined rooms (primary connection)")
     p.add_argument("--agent", dest="agent_mxid", default=os.environ.get("AGENT_MXID"))
 
     p = sub.add_parser("members", help="list a room's members (user_id, display name, kind)")
@@ -211,16 +218,18 @@ def _main(argv):
     e.add_argument("--agent", dest="agent_mxid", default=os.environ.get("AGENT_MXID"))
     e = esub.add_parser("list", help="list this agent's own subscriptions")
     e.add_argument("--agent", dest="agent_mxid", default=os.environ.get("AGENT_MXID"))
-    e = esub.add_parser("pull", help="one long-poll round for pending events")
+    e = esub.add_parser("pull", help="one long-poll round for pending events (primary connection)")
     e.add_argument("--cursor", type=int, default=0)
     e.add_argument("--wait", type=int, default=_events.DEFAULT_WAIT)
-    e = esub.add_parser("stream", help="SSE-follow events; one JSON line per event")
+    e = esub.add_parser("stream", help="SSE-follow events; one JSON line per event (primary connection)")
     e.add_argument("--cursor-file", default=None,
                    help="durable resume cursor (enables reconnect-with-backoff)")
     e.add_argument("--cursor", type=int, default=None,
                    help="explicit start cursor (no --cursor-file)")
     e.add_argument("--once", action="store_true", help="exit after the first event")
     e.add_argument("--max-events", type=int, default=None)
+
+    sub.add_parser("agents", help="list this account's registered agents with owners (/v1/agents, primary connection)")
 
     p = sub.add_parser("resolve", help="resolve a friendly handle -> agent mxid (via /v1/agents)")
     p.add_argument("handle")
@@ -234,10 +243,14 @@ def _main(argv):
                    help="event id ($abc) to cite as the message replied to. This is a "
                         "CITATION: the post stays in the main timeline. It does NOT put "
                         "the post in a Matrix thread — the gateway has no field for that.")
+    p.add_argument("--thread-root", dest="thread_root", default=None, metavar="EVENT",
+                   help="event id ($abc) of the thread to post the mention IN (rel_type "
+                        "m.thread, built by the gateway); it leaves the main timeline.")
 
     p = sub.add_parser("say", help="post a plain message into a room (mentions no one)")
     p.add_argument("room_id")
-    p.add_argument("message")
+    p.add_argument("message", nargs="?")
+    p.add_argument("--body-file", help="UTF-8 message file; exclusive with positional message")
     p.add_argument("--agent", dest="agent_mxid", default=os.environ.get("AGENT_MXID"))
     p.add_argument("--worker", default=None,
                    help="worker id to stamp on the event (space.ag2.worker) so the "
@@ -247,6 +260,14 @@ def _main(argv):
                    help="event id ($abc) to cite as the message replied to. This is a "
                         "CITATION: the post stays in the main timeline. It does NOT put "
                         "the post in a Matrix thread — the gateway has no field for that.")
+    p.add_argument("--extra-content", dest="extra_content", default=None, metavar="JSON",
+                   help="a JSON object of space.ag2.* keys to carry on the event beside the "
+                        "body (a document comment's anchor, say); other keys are dropped by "
+                        "the gateway")
+    p.add_argument("--thread-root", dest="thread_root", default=None, metavar="EVENT",
+                   help="event id ($abc) of the thread to post IN (rel_type m.thread, built by "
+                        "the gateway): a reply under a document comment, say. Unlike "
+                        "--reply-to, this leaves the main timeline.")
 
     p = sub.add_parser("grant", help="make a room authoritative — its access policy "
                                      "GRANTS access, overriding agents' local allowFrom (#429)")
@@ -259,9 +280,24 @@ def _main(argv):
                    help="disable the grant (authoritative=false); leaves other policy fields intact")
     p.add_argument("--agent", dest="agent_mxid", default=os.environ.get("AGENT_MXID"))
 
+    p = sub.add_parser("history", help="read all joined rooms with window pagination and coverage receipts (primary connection)")
+    p.add_argument("--since", required=True, help="ISO 8601 time with timezone")
+    p.add_argument("--until", help="ISO 8601 time with timezone; default now")
+    p.add_argument("--pages", type=int, default=20)
+    p.add_argument("--agent", dest="agent_mxid", default=os.environ.get("AGENT_MXID"))
+
+    sub.add_parser("capabilities", help="print, as JSON, the subcommands and `say` flags this "
+                                        "copy supports, so a caller can pick a capable copy")
+
     ap.add_argument("--strict", action="store_true",
                     help="exit 1 on ok:false; must precede the subcommand (default: always 0)")
     a = ap.parse_args(argv)
+    if a.cmd == "capabilities":
+        say_flags = sorted(o for act in sub.choices["say"]._actions for o in act.option_strings
+                           if o.startswith("--") and o != "--help")
+        print(json.dumps({"ok": True, "commands": sorted(sub.choices), "say": say_flags,
+                          "say_extra_content_checked": True}, indent=2))
+        return 0
     if a.cmd == "read":
         res = _read.read_room(a.room_id, a.agent_mxid, a.limit, before=a.before,
                               oldest_first=a.oldest_first)
@@ -269,26 +305,6 @@ def _main(argv):
         res = _media.fetch_media(a.ref, a.agent_mxid, a.room_id)
     elif a.cmd == "send":
         res = _media.send_media(a.room_id, a.path, a.agent_mxid, caption=a.caption)
-    elif a.cmd == "doc":
-        import doc as _doc
-        if a.action == "get":
-            res = _doc.doc_get(a.room, folder=a.folder, name=a.name, agent_mxid=a.agent)
-        elif a.action == "put":
-            import sys as _sys
-            try:
-                content = open(a.file).read() if a.file else _sys.stdin.read()
-            except (OSError, UnicodeDecodeError) as e:
-                content = None
-                res = {"ok": False, "reason": f"cannot read --file {a.file}: {e}"}
-            if content is not None:
-                res = _doc.doc_put(a.room, content, folder=a.folder,
-                                   name=a.name or "CONTEXT.md", message=a.message,
-                                   agent_mxid=a.agent)
-        else:
-            if not a.name:
-                res = {"ok": False, "reason": "--name is required for rm"}
-            else:
-                res = _doc.doc_rm(a.room, a.name, folder=a.folder, agent_mxid=a.agent)
     elif a.cmd == "join":
         res = _join.join_room(a.room_id, a.agent_mxid)
     elif a.cmd == "rooms":
@@ -299,15 +315,49 @@ def _main(argv):
         if a.events_cmd == "stream":
             return _events_stream(a)  # prints JSONL itself; summary is one line
         res = _dispatch_events(a)
+    elif a.cmd == "agents":
+        res = _resolve.list_agents()
     elif a.cmd == "resolve":
         res = _resolve.resolve_user(a.handle)
     elif a.cmd == "mention":
-        res = _mention.mention(a.handle, a.message, a.room_id, a.agent_mxid,
-                               reply_to=a.reply_to)
+        res = _mention.mention(a.handle, a.message, a.room_id, a.agent_mxid, reply_to=a.reply_to,
+                               **({"thread_root": a.thread_root} if a.thread_root else {}))
+    elif a.cmd == "history":
+        try:
+            start = datetime.datetime.fromisoformat(a.since.replace("Z", "+00:00"))
+            end = datetime.datetime.fromisoformat(a.until.replace("Z", "+00:00")) if a.until else datetime.datetime.now(datetime.timezone.utc)
+            if not start.tzinfo or not end.tzinfo:
+                raise ValueError("timestamps require timezone")
+            res = _history.history(start.timestamp() * 1000, end.timestamp() * 1000, a.pages, a.agent_mxid)
+        except (ValueError, TypeError):
+            res = {"ok": False, "complete_available_history": False, "reason": "Invalid history window or membership data"}
     elif a.cmd == "say":
+        if (a.message is None) == (a.body_file is None):
+            print(json.dumps({"ok": False, "reason": "say requires exactly one positional message or --body-file"}))
+            return 2
+        if a.body_file is not None:
+            try:
+                a.message = Path(a.body_file).read_text(encoding="utf-8")
+            except (OSError, UnicodeError):
+                print(json.dumps({"ok": False, "reason": "Cannot read UTF-8 message file"}))
+                return 2
         _kw = {"reply_to": a.reply_to}
         if a.worker:
             _kw["worker"] = a.worker
+        if a.extra_content:
+            try:
+                _extra = json.loads(a.extra_content)
+            except ValueError as e:
+                refusal = f"--extra-content is not valid JSON: {e}"
+            else:
+                refusal = _say.extra_content_problem(_extra)
+            if refusal:
+                # A malformed payload is the caller's bug, never a transient no-op: exit 1.
+                print(json.dumps(_say._result(False, room_id=a.room_id, reason=refusal), indent=2))
+                return 1
+            _kw["extra_content"] = _extra
+        if a.thread_root:
+            _kw["thread_root"] = a.thread_root
         res = _say.say(a.message, a.room_id, a.agent_mxid, **_kw)
         _record_say(res)
     elif a.cmd == "grant":

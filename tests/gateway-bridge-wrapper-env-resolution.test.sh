@@ -15,27 +15,33 @@ PY="$(require_python "$REPO" "run the gateway wrapper env-resolution test")" || 
 # An isolated repo: the real wrapper and the real resolver, a stub bridge that
 # reports the token it was handed, and NO evict helper — the wrapper skips
 # eviction when that file is absent, so this can never touch a live bridge.
-run_case() {  # $1=.env body  $2=relay-client.env body -> prints the stub's line
-  d=$(mktemp -d); mkdir -p "$d/src/launchd" "$d/scripts" "$d/home/channels/ag2space"
+run_case() {  # $1=.env body  $2=relay-client.env body  $3=optional NAME=value passed in the process env
+  d=$(mktemp -d); mkdir -p "$d/src/launchd" "$d/scripts" "$d/home/channels/ag2space" \
+      "$d/ws/state/channel-bridge-supervisor" "$d/ws/results" "$d/shims"
   cp "$REPO/src/launchd/gateway-bridge-wrapper.sh" "$d/src/launchd/"
   cp "$REPO/scripts/channel-env.sh" "$REPO/scripts/python-binary.sh" "$d/scripts/"
-  # the resolver plus the two modules it imports — a real resolution, not a stub
-  mkdir -p "$d/src"
+  # the resolver plus the modules it imports — a real resolution, not a stub
   cp "$REPO/src/channel_env_resolve.py" "$REPO/src/channel_env_containment.py" \
-     "$REPO/src/channel_token.py" "$d/src/"
+     "$REPO/src/channel_token.py" "$REPO/src/gateway_credential_sources.py" "$d/src/"
+  mkdir -p "$d/shared"; cp "$REPO/shared/ag2_gateway_credentials.py" "$d/shared/"
   # Faithful to the real helper: `claude-home-path [suffix]` appends the suffix,
-  # so the pre-fix wrapper's own lookup works here and case 2 is a real control.
-  printf '#!/bin/bash\nif [ "${1:-}" = "claude-home-path" ]; then\n  if [ -n "${2:-}" ]; then echo "%s/home/$2"; else echo "%s/home"; fi\n  exit 0\nfi\nexit 0\n' \
-      "$d" "$d" > "$d/scripts/sutando-config.sh"; chmod +x "$d/scripts/sutando-config.sh"
-  printf 'import os\nprint("BRIDGE_STARTED token=%%s tier=%%s" %% (os.environ.get("REMOTE_TASK_TOKEN") or "<none>", os.environ.get("REMOTE_TASK_TIER") or "<none>"))\n' \
+  # `workspace` names the supervisor's state dir.
+  printf '#!/bin/bash\ncase "${1:-}" in\n  workspace) echo "%s/ws" ;;\n  claude-home-path) if [ -n "${2:-}" ]; then echo "%s/home/$2"; else echo "%s/home"; fi ;;\nesac\nexit 0\n' \
+      "$d" "$d" "$d" > "$d/scripts/sutando-config.sh"; chmod +x "$d/scripts/sutando-config.sh"
+  # The stub bridge reports the token it was handed, then stands down (rc 75), ending the wrapper.
+  printf 'import os, sys\nprint("BRIDGE_STARTED token=%%s tier=%%s" %% (os.environ.get("REMOTE_TASK_TOKEN") or "<none>", os.environ.get("REMOTE_TASK_TIER") or "<none>"))\nsys.exit(75)\n' \
       > "$d/src/remote-gateway-bridge.py"
+  printf 'import time\nwhile True: time.sleep(0.2)\n' > "$d/src/sparrowd.py"
+  printf '#!/bin/bash\nexec "%s" "$@"\n' "$PY" > "$d/shims/python3"
+  printf '#!/bin/bash\nexit 0\n' > "$d/shims/osascript"; chmod +x "$d/shims/python3" "$d/shims/osascript"
   printf '%s' "$1" > "$d/home/channels/ag2space/.env"
   printf '%s' "$2" > "$d/home/channels/ag2space/relay-client.env"
   # Hermetic regardless of the calling shell's own env: an ambient gateway
   # credential must never leak into this test's stdout or steer its outcome.
   ( cd "$d" && unset REMOTE_TASK_TOKEN REMOTE_TASK_TIER AG2_REMOTE_TOKEN \
-        AG2_REMOTE_TIER REMOTE_MEDIA_MARKER
-    SUTANDO_PY="$PY" bash src/launchd/gateway-bridge-wrapper.sh 2>&1 ) | tail -1
+        AG2_REMOTE_TIER REMOTE_MEDIA_MARKER AG2_DEVICE_ENV
+    env ${3:+"$3"} SUTANDO_PY="$PY" PATH="$d/shims:$PATH" SUTANDO_GATEWAY_BRIDGE_RESTART_DELAY=1 \
+        bash src/launchd/gateway-bridge-wrapper.sh 2>&1 ) | grep -E 'BRIDGE_STARTED|nothing to run' | tail -1
   rm -rf "$d"
 }
 
@@ -79,6 +85,36 @@ out="$(run_case 'export REMOTE_TASK_TOKEN=exported-token
 echo "  export form   -> $out"
 case "$out" in *"token=exported-token"*) check 0 "export-form token in .env still starts the bridge" ;;
                *) check 1 "export-form token in .env still starts the bridge" ;; esac
+
+# 6. A blank (whitespace-only) `.env` value is no token by the shared rule: the
+#    sibling's real token is used, and with no sibling the wrapper stands down
+#    instead of launching a bridge that would exit for lack of a token.
+out="$(run_case 'REMOTE_TASK_TOKEN="   "
+' 'REMOTE_TASK_TOKEN=sibling-token
+')"
+echo "  blank .env    -> $out"
+case "$out" in *"token=sibling-token"*) check 0 "blank .env token falls through to the sibling" ;;
+               *) check 1 "blank .env token falls through to the sibling" ;; esac
+out="$(run_case 'REMOTE_TASK_TOKEN="   "
+' '')"
+echo "  blank, alone  -> $out"
+case "$out" in *"nothing to run"*) check 0 "blank token and no sibling: clean stand-down" ;;
+               *) check 1 "blank token and no sibling: clean stand-down" ;; esac
+
+# 7. A token the process environment supplied is not replaced by a sibling's.
+out="$(run_case '' 'REMOTE_TASK_TOKEN=sibling-token
+' 'REMOTE_TASK_TOKEN=env-token')"
+echo "  env token     -> $out"
+case "$out" in *"token=env-token"*) check 0 "environment-provided token keeps precedence over a sibling" ;;
+               *) check 1 "environment-provided token keeps precedence over a sibling" ;; esac
+
+# 8. The resolver reads the export form too, so `.env` keeps precedence over a sibling.
+out="$(run_case 'export REMOTE_TASK_TOKEN=exported-token
+' 'REMOTE_TASK_TOKEN=sibling-token
+')"
+echo "  export + sib  -> $out"
+case "$out" in *"token=exported-token"*) check 0 "export-form .env token outranks a sibling" ;;
+               *) check 1 "export-form .env token outranks a sibling" ;; esac
 
 echo
 if [ "$fail" -eq 0 ]; then echo "PASS — $pass checks green"; else echo "FAIL — $fail failed, $pass passed"; exit 1; fi

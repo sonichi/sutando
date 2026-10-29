@@ -270,20 +270,30 @@ nothing and the whole class would go invisible. Requirements:
 ### Escalation delivery contract (the `needs-authorization` path must actually deliver)
 
 `needs-authorization` is only a real gate if the escalation reaches the owner.
-The reused path (`pending-questions.md` + macOS-notify) does **not** guarantee
-that today, measured on a live host: the reader counts only entries **above the
-file's `# Resolved` divider**, so an append at EOF lands below it and is
-silently uncounted (same defect class PR #2521 fixed in `auth-preflight-gate.sh`);
-the notify path is cooldown-gated and skipped most cron fires; and the queue was
-46-deep. An escalation that is written-but-uncounted, or counted-but-unnotified,
-degrades `needs-authorization` into a **silent indefinite deny** — at which point
-the layer's guarantee is "nothing privileged happens" rather than "the owner
-decides." The layer therefore requires:
+The reused path is the owner pending question (`scripts/ask-owner.py`, which writes a
+row of the Pending questions database in the owner's room through the store an
+installed skill declares, holds it in the workspace outbox while the room is
+unreachable, queues the owner's DM and fires macOS-notify). It does **not** by itself
+guarantee delivery: the room write can fail (the question is then held locally and
+listed as "not yet in the room" until a reconcile files it), the DM queue is drained
+by a bridge that may be down, and there is no scheduled reminder at all — a
+reminder is sent only on demand (`src/check-pending-questions.py --notify`), and that
+on-demand reminder still has a cooldown of its own: an unchanged question set is not
+raised again for a day unless `--force` is passed. (The earlier failure modes this
+section measured — an append landing below the per-host file's `# Resolved` divider
+and so uncounted, and a cooldown-gated per-cron notify that skipped most fires —
+belonged to the retired per-host `pending-questions.md` path; that file is read-only
+history now. The divider is gone with it; the cooldown is not — it no longer gates a
+cron, because no cron fires the reminder.) An escalation
+that is written-but-unfiled, or filed-but-unnotified, degrades `needs-authorization`
+into a **silent indefinite deny** — at which point the layer's guarantee is "nothing
+privileged happens" rather than "the owner decides." The layer therefore requires:
 
 - **Write-then-assert:** an escalation is not considered recorded until the
-  layer reads it back and confirms it *counts* (lands above the divider, is
-  addressable). A write whose read-back fails is a failed escalation, surfaced,
-  not assumed delivered.
+  layer reads it back and confirms it *counts* — the ask id is listed by
+  `src/pending_questions_reader.py list` as a row of the database, not merely
+  held. A write whose read-back fails is a failed escalation, surfaced, not
+  assumed delivered.
 - **A defined terminal state for a never-answered grant.** An unanswered
   `needs-authorization` stays denied (fail-closed) and never times out *into*
   allow; the request remains observably pending so it can be re-surfaced, rather
@@ -336,10 +346,12 @@ becomes expensive later).
   since merged the code, so "reuses shipped code" is now literal, not aspirational.)
 - **Delegation:** the `delegate` decision is today's `codex exec --sandbox
   read-only` path, promoted from ad hoc to a first-class outcome.
-- **Escalation:** `needs-authorization` reuses `pending-questions.md` + the
+- **Escalation:** `needs-authorization` reuses `scripts/ask-owner.py` (the
+  room-database row via the declared store, the outbox hold, the DM queue) + the
   macOS-notify path already used for owner decisions — but only under the
   write-then-assert delivery contract above, because that path does not
-  guarantee delivery as-is (silent EOF-below-divider miss, notify cooldown).
+  guarantee delivery as-is (a held-not-filed row, a bridge that is down, and no
+  scheduled reminder).
 - **Audit:** one append-only record per request (who / capability / decision /
   **verified outcome**), same shape as AG2Platform/agent-universe#118 ("audit log
   for all staff actions", merged) — log-before-mutate, reconcile the real result,

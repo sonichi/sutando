@@ -14,6 +14,11 @@ import urllib.error
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(__file__))
+sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "tests"))
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
 
 # Shadow the vault boundary before any gateway() call can reach it. gateway() now
 # resolves the token from the Keychain when the env has none — and this file's
@@ -43,7 +48,6 @@ import read as rd  # noqa: E402
 import media as md  # noqa: E402
 import react as rc  # noqa: E402
 import join as jn  # noqa: E402
-import doc as dc  # noqa: E402
 import room_ops  # noqa: E402
 
 HS = "@agent.a:hs"
@@ -68,6 +72,10 @@ class EnvCase(unittest.TestCase):
             _gateway, "_channel_env_file", lambda: None)
         self._env_file_patch.start()
         self.addCleanup(self._env_file_patch.stop)
+        # Nor the host's connections record: room routing is pinned in tests/.
+        self._route_patch = mock.patch.object(_gateway, "_room_credential", lambda room_id: None)
+        self._route_patch.start()
+        self.addCleanup(self._route_patch.stop)
 
     def tearDown(self):
         _clear()
@@ -342,68 +350,6 @@ class JoinTests(EnvCase):
             self.assertIn("not a joined member", jn.join_room(ROOM, HS, gate=None)["reason"])
 
 
-class DocTests(EnvCase):
-    def test_missing_room(self):
-        self.assertFalse(dc.doc_get("", HS)["ok"])
-
-    def test_gate_deny(self):
-        os.environ["RELAY_URL"] = "https://r"
-        self.assertIn("gate denied", dc.doc_put(ROOM, "x", agent_mxid=HS, gate={})["reason"])
-
-    def test_no_relay(self):
-        self.assertIn("no gateway", dc.doc_get(ROOM, agent_mxid=HS, gate=None)["reason"])
-
-    def test_get_envelope(self):
-        os.environ["RELAY_URL"] = "https://r"
-        cap = {}
-        fake = {"ok": True, "file": "TODO.md", "folder": "room-todo", "content": "# T"}
-        with mock.patch.object(dc, "http_json",
-                               side_effect=lambda m, u, h, p: (cap.update(url=u, payload=p), (200, fake))[1]):
-            res = dc.doc_get(ROOM, folder="room-todo", name="TODO.md", agent_mxid=HS, gate=None)
-        self.assertTrue(res["ok"])
-        self.assertTrue(cap["url"].endswith("/v1/room"))
-        self.assertEqual(cap["payload"]["op"], "prep_get")
-        self.assertEqual(cap["payload"]["folder"], "room-todo")
-        self.assertEqual(res["content"], "# T")
-
-    def test_put_envelope_b64(self):
-        os.environ["RELAY_URL"] = "https://r"
-        cap = {}
-        fake = {"ok": True, "file": "notes.md", "sha": "abc123"}
-        with mock.patch.object(dc, "http_json",
-                               side_effect=lambda m, u, h, p: (cap.update(payload=p), (200, fake))[1]):
-            res = dc.doc_put(ROOM, "hello", folder="scratch", name="notes.md",
-                             message="m", agent_mxid=HS, gate=None)
-        self.assertTrue(res["ok"] and res["sha"] == "abc123")
-        self.assertEqual(cap["payload"]["op"], "prep_put")
-        self.assertEqual(base64.b64decode(cap["payload"]["content_b64"]).decode(), "hello")
-        self.assertEqual(cap["payload"]["message"], "m")
-
-    def test_rm_envelope(self):
-        os.environ["RELAY_URL"] = "https://r"
-        cap = {}
-        with mock.patch.object(dc, "http_json",
-                               side_effect=lambda m, u, h, p: (cap.update(payload=p), (200, {"ok": True}))[1]):
-            res = dc.doc_rm(ROOM, "old.md", folder="room-memo", agent_mxid=HS, gate=None)
-        self.assertTrue(res["ok"])
-        self.assertEqual(cap["payload"]["op"], "prep_delete")
-        self.assertEqual(cap["payload"]["filename"], "old.md")
-
-    def test_gateway_error_degrades(self):
-        os.environ["RELAY_URL"] = "https://r"
-        with mock.patch.object(dc, "http_json",
-                               return_value=(200, {"error": "bad folder (1-3 safe path segments, no leading dots)"})):
-            res = dc.doc_put(ROOM, "x", folder="../etc", agent_mxid=HS, gate=None)
-        self.assertFalse(res["ok"])
-        self.assertIn("bad folder", res["reason"])
-
-    def test_403_degrades(self):
-        os.environ["RELAY_URL"] = "https://r"
-        err = urllib.error.HTTPError("u", 403, "no", {}, None)
-        with mock.patch.object(dc, "http_json", side_effect=err):
-            self.assertIn("not a joined member", dc.doc_get(ROOM, agent_mxid=HS, gate=None)["reason"])
-
-
 # ----- unified CLI ----- #
 class CliTests(EnvCase):
     def test_read_exits_zero(self):
@@ -426,18 +372,6 @@ class CliTests(EnvCase):
 
     def test_join_exits_zero_on_no_gateway(self):
         self.assertEqual(room_ops._main(["join", ROOM, "--agent", HS]), 0)
-
-    def test_doc_put_missing_file_structured_error(self):
-        # P2 (PR #2050 review): --file read failure must yield the structured
-        # ok:false envelope, not a traceback.
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            rc_ = room_ops._main(["doc", "put", ROOM, "--file", "/nope/missing.md", "--agent", HS])
-        self.assertEqual(rc_, 0)
-        res = json.loads(buf.getvalue())
-        self.assertFalse(res["ok"])
-        self.assertIn("cannot read --file", res["reason"])
-
 
 class GatewayTokenOnboardingTests(EnvCase):
     """The combined one-token onboarding contract (REMOTE_TASK_TOKEN='url|secret')."""
@@ -1304,15 +1238,16 @@ class EventAccumulatorTests(unittest.TestCase):
         lines = open(paths[0]).read().split("\n")
         self.assertEqual(lines[0], f"id: {base[:-4]}")
         self.assertTrue(lines[1].startswith("timestamp: ") and lines[1].endswith("Z"))
+        self.assertTrue(lines[2].startswith("local_time: "))
         # Origin must be explicit at a glance: the [taskify] marker leads the
         # task line and the promoted-from suffix names the room.
-        self.assertTrue(lines[2].startswith("task: [taskify] "))
-        self.assertIn(f"(promoted from 3 subscribed events in {ROOM})", lines[2])
-        self.assertEqual(lines[3], "source: events-promotion")
-        self.assertEqual(lines[4], f"channel_id: {ROOM}")
-        self.assertEqual(lines[5], "priority: low")          # never outranks humans
-        self.assertEqual(lines[6], "model_hint: efficient")  # cheap-model eligible
-        self.assertEqual(lines[7], "access_tier: ambient")  # trust boundary: never owner
+        self.assertTrue(lines[3].startswith("task: [taskify] "))
+        self.assertIn(f"(promoted from 3 subscribed events in {ROOM})", lines[3])
+        self.assertEqual(lines[4], "source: events-promotion")
+        self.assertEqual(lines[5], f"channel_id: {ROOM}")
+        self.assertEqual(lines[6], "priority: low")          # never outranks humans
+        self.assertEqual(lines[7], "model_hint: efficient")
+        self.assertEqual(lines[8], "access_tier: ambient")  # trust boundary: never owner
         prov_line = next(ln for ln in lines if ln.startswith("provenance: "))
         prov = json.loads(prov_line.split("provenance: ", 1)[1])
         self.assertEqual(prov["source_event_ids"], ["$a", "$b", "$c"])
@@ -1465,11 +1400,12 @@ class RelationFieldsTests(unittest.TestCase):
     def test_whitespace_is_stripped(self):
         self.assertEqual(rl.relation_fields(reply_to="  $evt1  "), {"reply_to": EV})
 
-    def test_no_thread_surface_is_offered(self):
-        # The gateway cannot honour a thread relation, so asking for one must be
-        # impossible rather than silently downgraded to this citation.
-        with self.assertRaises(TypeError):
-            rl.relation_fields(thread_root=EV)
+    def test_thread_root_becomes_its_own_field_and_is_checked_like_a_citation(self):
+        self.assertEqual(rl.relation_fields(thread_root=EV), {"thread_root": EV})
+        self.assertEqual(rl.relation_fields(reply_to=EV, thread_root="$root"),
+                         {"reply_to": EV, "thread_root": "$root"})
+        with self.assertRaises(rl.RelationError):
+            rl.relation_fields(thread_root="root-without-dollar")
 
 
 class SayCitationTests(EnvCase):
@@ -1494,12 +1430,31 @@ class SayCitationTests(EnvCase):
         self.assertEqual(cap["payload"]["body"], "hi")
         self.assertEqual(cap["payload"]["op"], "message")
 
-    def test_no_thread_relation_is_ever_sent(self):
-        # Pins the review's requirement: nothing on this path may claim thread
-        # membership the gateway cannot deliver.
+    def test_a_citation_alone_never_claims_a_thread(self):
+        # A reply-to is a citation; only an explicit thread_root asks for the thread.
         _res, cap = self._post(reply_to=EV)
         self.assertNotIn("thread_root", cap["payload"])
         self.assertNotIn("m.relates_to", cap["payload"])
+
+    def test_thread_root_rides_the_payload_as_the_gateways_own_field(self):
+        res, cap = self._post(thread_root="$root")
+        self.assertTrue(res["ok"])
+        self.assertEqual(cap["payload"]["thread_root"], "$root")
+        self.assertNotIn("m.relates_to", cap["payload"], "the gateway builds the relation, not this side")
+
+    def test_extra_content_rides_the_payload_beside_the_body(self):
+        anchor = {"space.ag2.collab.doc.comment": {"anchor": {"quote": "x"}, "v": 1}}
+        res, cap = self._post(extra_content=anchor)
+        self.assertTrue(res["ok"])
+        self.assertEqual(cap["payload"]["extra_content"]["space.ag2.collab.doc.comment"],
+                         anchor["space.ag2.collab.doc.comment"])
+        self.assertEqual(cap["payload"]["body"], "hi")
+
+    def test_extra_content_keeps_the_worker_stamp(self):
+        os.environ["SUTANDO_WORKER_SEAT"] = "7"
+        _res, cap = self._post(extra_content={"space.ag2.x": 1})
+        self.assertEqual(cap["payload"]["extra_content"]["space.ag2.worker"]["id"], "worker-7")
+        self.assertEqual(cap["payload"]["extra_content"]["space.ag2.x"], 1)
 
     def test_bad_id_refuses_before_the_network(self):
         os.environ["RELAY_URL"] = "https://r"
@@ -1555,6 +1510,22 @@ class CitationCLITests(EnvCase):
             with contextlib.redirect_stdout(io.StringIO()):
                 room_ops._main(["say", ROOM, "hi", "--reply-to", EV])
         self.assertEqual(cap["kw"], {"reply_to": EV})
+
+    def test_say_extra_content_flag_is_parsed_and_reaches_the_function(self):
+        cap = {}
+        with mock.patch.object(room_ops._say, "say",
+                               side_effect=lambda *a, **k: (cap.update(kw=k), {"ok": True})[1]):
+            with contextlib.redirect_stdout(io.StringIO()):
+                room_ops._main(["say", ROOM, "hi", "--extra-content", '{"space.ag2.k": {"v": 1}}'])
+        self.assertEqual(cap["kw"], {"reply_to": None, "extra_content": {"space.ag2.k": {"v": 1}}})
+
+    def test_say_extra_content_that_is_not_an_object_is_refused_before_the_function(self):
+        out = io.StringIO()
+        with mock.patch.object(room_ops._say, "say", side_effect=AssertionError("called")):
+            with contextlib.redirect_stdout(out):
+                rc = room_ops._main(["say", ROOM, "hi", "--extra-content", '["not", "an", "object"]'])
+        self.assertEqual(rc, 1)
+        self.assertIs(json.loads(out.getvalue())["ok"], False)
 
     def test_mention_flag_reaches_the_function(self):
         cap = {}
@@ -1702,6 +1673,7 @@ class DegradeReasonFromTests(unittest.TestCase):
 
     def test_no_body_falls_back_to_the_status_text(self):
         self.assertEqual(_gateway.degrade_reason_from(self._err(403, "")), _gateway.degrade_reason(403))
+
 
 
 if __name__ == "__main__":

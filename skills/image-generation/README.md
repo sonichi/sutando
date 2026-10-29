@@ -1,11 +1,10 @@
 # image-generation
 
-A Claude Code skill for AI agents.
+Generate or edit images with a Gemini image model, and videos with Veo, from a Sutando task.
 
 ## Install
 
 ```bash
-# Clone and install
 git clone https://github.com/sonichi/sutando.git
 cd sutando
 bash skills/install.sh
@@ -18,23 +17,25 @@ ln -s /path/to/sutando/skills/image-generation "$CLAUDE_CONFIG_DIR/skills/image-
 
 ## What's included
 
-1 scripts:
-- `generate.py` — image generation and editing via Gemini API
+- `scripts/generate.py` — image generation and editing over the Gemini REST API (standard
+  library only); video generation through the `google-genai` SDK when it is installed. Prints one
+  JSON line (`{"ok": true, "path": ...}` or `{"ok": false, "error": ..., "message": ..., "remedy": ...}`).
 
 ## Usage
 
 - "Generate an image of a sunset over mountains"
 - "Edit this photo to replace the background"
-- "Add text overlay to this image"
 - "Create a logo with a dark theme"
 - "Make this image look like a watercolor painting"
 
+The file is written under `<workspace>/results/media/` and attached to the reply.
+
 ## Requirements
 
-- `google-genai` Python package (`pip3 install google-genai`)
-- `Pillow` Python package (`pip3 install Pillow`)
-- `GEMINI_API_KEY` in `.env` or environment
-- Claude Code installed
+- A Gemini key: the managed key of a desktop install, or `GEMINI_API_KEY` / `GEMINI_VOICE_API_KEY`
+  in the environment or `.env`. Without one the script reports `no_key` (exit 2).
+- Optional: `Pillow` (input resizing, jpg/webp conversion); `google-genai` for `--video` only
+  (reported as `sdk_missing` when absent).
 
 ## License
 

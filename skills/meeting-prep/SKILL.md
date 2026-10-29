@@ -25,9 +25,13 @@ $CLAUDE_CONFIG_DIR/skills/google-calendar/scripts/google-calendar.py events list
 
 3. **Look up each attendee.** For each attendee (skip the owner):
 
-   a. **Contacts** — search by email:
+   a. **Contacts** — the Station first: the People store (`people__list_people`) and a connected
+   contacts app (`composio_find {"apps": ["google contacts"]}` → `composio_exec`); then the owner's
+   own MCP contact tools when present. The native macOS Contacts app only when the owner asked for
+   it in this conversation (it raises a permission prompt; this skill also runs unattended, so
+   never pass the flag on its own):
    ```bash
-   python3 $CLAUDE_CONFIG_DIR/skills/macos-tools/scripts/contacts.py search "email@example.com"
+   python3 $CLAUDE_CONFIG_DIR/skills/macos-tools/scripts/contacts.py search "email@example.com" --owner-asked
    ```
 
    b. **Recent emails** — search Gmail for recent threads with this person:

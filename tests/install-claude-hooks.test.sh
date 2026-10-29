@@ -85,11 +85,10 @@ RUN_OUT3="$(TRANSCRIPT_PATH=/dev/null bash -c "$PC_CMD" 2>&1)"
 ok "PreCompact handoff stored command executes the intended script" \
    "$([ "$RUN_OUT3" = "HANDOFF-RAN" ] && echo 0 || echo 1)"
 
-# The archive hook is a bare `cp`, so it cannot create its own destination. The
-# assertion that matters is not "the directory exists" but "the stored command
-# executed by a shell actually archives a file" — the same standard as above.
-ok "installer created the archive hook's destination directory" \
-   "$([ -d "$HOME/Desktop/sutando-conversations" ] && echo 0 || echo 1)"
+# The archiver makes its own destination on first use, so a managed install must
+# leave no empty ~/Desktop/sutando-conversations behind.
+ok "installer leaves no empty archive folder behind" \
+   "$([ ! -d "$HOME/Desktop/sutando-conversations" ] && echo 0 || echo 1)"
 
 AR_CMD="$(cmds PreCompact | grep sutando-conversations || true)"
 printf 'transcript\n' > "$ROOT/transcript.jsonl"
@@ -328,7 +327,10 @@ json.dump({"hooks": {"PreCompact": [{"hooks": [{"type": "command", "command":
     'cp "$CUSTOM_TRANSCRIPT_PATH" "$HOME/Desktop/sutando-conversations/$(date +%Y-%m-%dT%H-%M-%S).jsonl"'
 }]}]}}, open(os.environ["C_SETTINGS"], "w"), indent=2)
 PY
-bash "$CREPO/src/install-claude-hooks.sh" >/dev/null 2>&1
+# A fresh HOME: the shared one already holds the folder from section 1, so a
+# check against it would pass whether or not the installer made it.
+mkdir -p "$CROOT/home"
+HOME="$CROOT/home" bash "$CREPO/src/install-claude-hooks.sh" >/dev/null 2>&1
 CCMDS="$(python3 -c "
 import json, os
 d = json.load(open(os.environ['C_SETTINGS']))
@@ -336,6 +338,15 @@ print(chr(10).join(h['command'] for g in d['hooks'].get('PreCompact', []) for h 
 ")"
 ok "operator's custom transcript-archive command survives re-run" \
    "$(echo "$CCMDS" | grep -q 'CUSTOM_TRANSCRIPT_PATH' && echo 0 || echo 1)"
+# A bare `cp` cannot create its destination, so a kept custom archiver needs the
+# installer to make the folder — otherwise every compaction archive is lost silently.
+ok "the kept custom bare-cp archiver gets its destination folder" \
+   "$([ -d "$CROOT/home/Desktop/sutando-conversations" ] && echo 0 || echo 1)"
+printf 'custom\n' > "$CROOT/custom.jsonl"
+HOME="$CROOT/home" CUSTOM_TRANSCRIPT_PATH="$CROOT/custom.jsonl" \
+  bash -c "$(echo "$CCMDS" | grep 'CUSTOM_TRANSCRIPT_PATH')" >/dev/null 2>&1
+ok "and the custom archiver's stored command actually archives a file" \
+   "$([ "$(ls "$CROOT/home/Desktop/sutando-conversations" 2>/dev/null | wc -l | tr -d ' ')" = 1 ] && echo 0 || echo 1)"
 # Match OUR script, not just the destination: the operator's custom command above
 # also names sutando-conversations, so a destination-only grep passes vacuously.
 ok "our archive hook is still installed alongside it" \
@@ -376,8 +387,11 @@ print(chr(10).join(h['command'] for g in d['hooks'].get('PreCompact', [])
 
 LROOT="$(mktemp -d "${TMPDIR:-/tmp}/sutando hooks legacy.XXXXXX")"
 seed_legacy_repo "$LROOT/repo with spaces"
-bash "$LROOT/repo with spaces/src/install-claude-hooks.sh" >/dev/null 2>&1
+mkdir -p "$LROOT/home"
+HOME="$LROOT/home" bash "$LROOT/repo with spaces/src/install-claude-hooks.sh" >/dev/null 2>&1
 LCMDS="$(archive_cmds "$LROOT/repo with spaces/.claude/settings.json")"
+ok "migrating to the archive-transcript.sh form makes no eager folder" \
+   "$([ ! -d "$LROOT/home/Desktop/sutando-conversations" ] && echo 0 || echo 1)"
 ok "legacy bare-cp archiver is removed on upgrade" \
    "$(echo "$LCMDS" | grep -qF 'cp "$TRANSCRIPT_PATH"' && echo 1 || echo 0)"
 ok "and replaced by the archive-transcript.sh form" \
@@ -388,14 +402,34 @@ rm -rf "$LROOT"
 
 OROOT="$(mktemp -d "${TMPDIR:-/tmp}/sutando hooks legacy omit.XXXXXX")"
 seed_legacy_repo "$OROOT/repo with spaces"
-SUTANDO_HOOKS_OMIT_TRANSCRIPT_ARCHIVE=1 \
+mkdir -p "$OROOT/home"
+HOME="$OROOT/home" SUTANDO_HOOKS_OMIT_TRANSCRIPT_ARCHIVE=1 \
   bash "$OROOT/repo with spaces/src/install-claude-hooks.sh" >/dev/null 2>&1
 OCMDS="$(archive_cmds "$OROOT/repo with spaces/.claude/settings.json")"
 ok "under the omit flag the opt-in survives untouched" \
    "$(echo "$OCMDS" | grep -qF 'cp "$TRANSCRIPT_PATH"' && echo 0 || echo 1)"
 ok "and no archiver is installed in its place" \
    "$(echo "$OCMDS" | grep -q 'archive-transcript\.sh' && echo 1 || echo 0)"
+# The kept legacy `cp` is what the unattended health-check repair leaves in place;
+# it still has to archive, so its destination must exist after the run.
+ok "the kept legacy bare-cp archiver gets its destination folder" \
+   "$([ -d "$OROOT/home/Desktop/sutando-conversations" ] && echo 0 || echo 1)"
+printf 'legacy\n' > "$OROOT/transcript.jsonl"
+HOME="$OROOT/home" TRANSCRIPT_PATH="$OROOT/transcript.jsonl" bash -c "$OCMDS" >/dev/null 2>&1
+ok "and the legacy archiver's stored command actually archives a file" \
+   "$([ "$(ls "$OROOT/home/Desktop/sutando-conversations" 2>/dev/null | wc -l | tr -d ' ')" = 1 ] && echo 0 || echo 1)"
 rm -rf "$OROOT"
+
+# No bare `cp` registered and the archiver omitted: the run must leave no folder.
+NROOT="$(mktemp -d "${TMPDIR:-/tmp}/sutando hooks none.XXXXXX")"
+seed_legacy_repo "$NROOT/repo with spaces"
+echo '{}' > "$NROOT/repo with spaces/.claude/settings.json"
+mkdir -p "$NROOT/home"
+HOME="$NROOT/home" SUTANDO_HOOKS_OMIT_TRANSCRIPT_ARCHIVE=1 \
+  bash "$NROOT/repo with spaces/src/install-claude-hooks.sh" >/dev/null 2>&1
+ok "an omit-flag run with no bare-cp archiver registered makes no folder" \
+   "$([ ! -d "$NROOT/home/Desktop/sutando-conversations" ] && echo 0 || echo 1)"
+rm -rf "$NROOT"
 
 # ---- upgrade path: a pre-existing runner-first skill hook must be MIGRATED ----
 # The outage case: a re-run must replace the old `python3 <path>` entry, not add beside it.

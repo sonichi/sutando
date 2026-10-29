@@ -135,14 +135,10 @@ fi
 # 3) Build log tail + pending questions + cold-review log (small files, copy whole)
 _bl="${WS}/build_log.md"; [ -f "$_bl" ] || _bl="${REPO}/build_log.md"
 tail -150 "$_bl" > "$OUT/build_log-tail.md" 2>/dev/null || true
-# pending-questions.md is per-host (hosts/<host>/, #1717 F1 convention); probe
-# there FIRST, then the flat workspace root and repo root (back-compat for
-# pre-revamp / un-migrated layouts). Mirrors personal_path()'s read-side probe
-# order (#1718) so self-diagnose reads the same file the writers target.
-_pq="${WS}/hosts/$(_sd_host)/pending-questions.md"
-[ -f "$_pq" ] || _pq="${WS}/pending-questions.md"
-[ -f "$_pq" ] || _pq="${REPO}/pending-questions.md"
-cp "$_pq" "$OUT/pending-questions.md" 2>/dev/null || true
+# Pending questions come from core's reader over the declared store (room database +
+# outbox); the retired per-host file is not read. A failure lands in .err, never aborts.
+python3 "$REPO/src/pending_questions_reader.py" list --json \
+	> "$OUT/pending-questions.json" 2> "$OUT/pending-questions.err" || true
 cp "$NOTES_DIR/cold-review-log.md" "$OUT/cold-review-log.md" 2>/dev/null || true
 
 # 4) Voice-agent log — filter to window, grep for signal lines, keep it bounded.

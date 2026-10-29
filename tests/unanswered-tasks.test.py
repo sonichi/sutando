@@ -241,8 +241,7 @@ with tempfile.TemporaryDirectory() as d:
           "quiet when the dedup target is the SAME room and sender (what dedup is for)")
 
 
-# A [no-send] / [REPLIED] holder never delivered, so the bridge requeues. This
-# is `dedup_holder_delivered`'s verdict, not a rule restated here.
+# A REPLIED holder asserts an out-of-band answer; no-send does not.
 for marker in ("[no-send]", "[REPLIED]"):
     with tempfile.TemporaryDirectory() as d:
         import os
@@ -254,8 +253,11 @@ for marker in ("[no-send]", "[REPLIED]"):
         (root / "results" / "task-src.txt").write_text("[deduped: task-dst]\n")
         (root / "results" / "task-dst.txt").write_text(marker + "\n")
         rows = uat.unanswered(root, 120)
-        check(len(rows) == 1 and rows[0][2].startswith("HOLDER-SKIPPED"),
-              f"a {marker} holder is not a delivery — flagged, as the bridge requeues it")
+        if marker == "[REPLIED]":
+            check(rows == [], "a REPLIED holder was answered through another route")
+        else:
+            check(len(rows) == 1 and rows[0][2].startswith("HOLDER-SKIPPED"),
+                  "a no-send holder is flagged, as the bridge requeues it")
 
 
 # The guard must fire on an EMPTY queue too: a lazy per-task import means a

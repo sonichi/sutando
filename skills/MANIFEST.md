@@ -69,6 +69,38 @@ The two-directory scan lets a user keep personal tools (per-talk highlight maps,
 
 Order: public first, then private. If a private skill shares a tool name with a public one, the unique-name assertion fails at startup — by design, the loader does not silently shadow.
 
+## Session hooks: `setup(ctx)` and `voiceSurface()`
+
+A tools entry point may export two optional hooks besides `tools`. Both are
+product-neutral: the host names no skill, and works unchanged when none exports them.
+
+**`setup(ctx)`** runs once per voice session, synchronously, after the session
+exists. `ctx` (`SkillSetupCtx`, `src/skill-setup-runner.ts`) carries:
+
+| Member | Purpose |
+|---|---|
+| `session`, `injectText(session, text)` | the live session and the realtime text inject |
+| `clientAttached()` | true while a client is attached |
+| `sendClientFrame(frame)` | send one JSON frame to the attached client; `false` when none took it |
+| `onClientFrame(handler)` | offered every client JSON frame the host does not own; return `true` to claim it |
+| `onClientDisconnected(handler)` | the client left: drop per-client state |
+| `injectContext(text)` | a framed system line the model should know, retried until the session is live |
+| `setVoiceSessionOrigin(origin)`, `getVoiceSessionOrigin()` | where delegated work came from (`VoiceSessionOrigin`, `src/task-bridge.ts`); `null` is the owner DM |
+| `setVoiceTaskOriginResolver(fn)` | recover a task's origin from its header lines after a restart |
+
+A handler that throws or rejects is logged and never reaches another skill's handler.
+
+**`voiceSurface()`** is evaluated once at load and returns what the skill adds to
+the **web voice session only** (`VoiceSurfaceContribution`):
+
+| Field | Effect |
+|---|---|
+| `tools` | declared on the voice session and listed in its prompt; never on the phone tool table. Return `[]` when the install cannot serve them, so the tool is gated at exposure |
+| `promptRules` | lines added to the voice prompt's RULES block |
+| `contextLines()` | lines added to the voice context, re-evaluated at every prompt build |
+
+With no contribution the voice prompt is byte-identical to the default.
+
 ## Config-only manifests (non-tools skills)
 
 A skill that contributes **no** runtime tools may still ship a `manifest.json` purely to **declare config** — omit `tools` and the loader applies `config → process.env` (setdefault) then skips the tools import (step 2 above). This is how a pipeline skill keeps its channel ids / feature flags / toggles out of ad-hoc `os.environ[...]` literals and in one declared place (the `config` block is the source of truth + default).
@@ -82,6 +114,118 @@ CLI arg  >  env override  >  manifest.json config[key]  >  another config file (
 ```
 
 Read the manifest directly when needed — e.g. `publish-wire-episode.py:manifest_config()` reads `skills/wire-newsroom/manifest.json` `config[key]`; `wire-monitor` uses `${ENV:-$(cat state/wire-report-channel)}`. Never wire a bare invented `os.environ[...]` as the *primary* source.
+
+## Supervised workers (`supervised_worker`)
+
+A skill whose feature needs a **long-running loop** declares it here, and `sparrowd` supervises it. The declaration is how the core learns the worker exists: `src/sparrowd.py` scans `skills/*/manifest.json` and **names no skill**, because a skill is optional and self-contained (`docs/architecture-boundaries.md` → "Optional adapter capabilities").
+
+```json
+"supervised_worker": {
+  "name": "example-presence",
+  "script": "scripts/presence_daemon.py",
+  "interpreter": { "config": "EXAMPLE_PYTHON", "needs": "pycrdt + websockets" }
+}
+```
+
+- `name` — the supervisor's worker name; a plain name, not a path (it reaches a state dir and a log line).
+- `script` — relative to the skill directory, and it must resolve **inside** it. A manifest is attacker-adjacent (`skills/trusted-capabilities` installs third-party skills), so traversal is refused rather than trusted.
+- `interpreter.config` — the config key naming the interpreter, read **env first, then this manifest's `config` block**. It is required and never guessed: these loops may import packages the core's own python does not have, and started under the wrong one the worker crash-loops under the supervisor, which reads as a broken daemon rather than a missing setting. Unset is a skipped worker with a reason on stderr.
+- `interpreter.needs` — optional; quoted back in that reason so the operator knows what the interpreter must provide.
+
+**Prefer the env override for the interpreter on a desktop install.** The engine tree is replaced on every update, so a value edited into the tracked `manifest.json` does not survive an upgrade; an export does.
+
+## Pending-questions store adapter (`pending_questions_store`)
+
+`"pending_questions_store": "scripts/<adapter>.py"` declares the script that IS the store of owner
+pending questions — its `room_store(workspace)` opens the room database, `gather`/`waiting`/`count`
+read it (read-only; `unavailable: True` and `done: None` when the room cannot be read, never a zero),
+`reconcile_pass` replays the local outbox and close records, `resolve` closes a row, `ask_owner`
+records a question and `remind(argv, workspace, resolved=None)` runs the reminder — `resolved` is optional:
+the core entry passes its one resolution of the adapter when `remind` accepts the keyword, and a
+two-arg `remind(argv, workspace)` still works. The field is in `schemas/skill-manifest.schema.json`
+(a relative `.py` path, no `..`), and `scripts/lint-skill.py` checks the script exists inside the skill. Core reaches it only through
+`src/pending_questions_reader.py`, which takes the adapter path its caller injects and names no
+skill; each edge (the thin entries, the reader CLI, agent-api, the dashboard, the briefing,
+friction-detector, obsidian-mirror) resolves that path with `src/skill_roots.py` —
+`declared("pending_questions_store", workspace)` scans that FIELD alone across both installed
+roots, `<repo>/skills` and `<workspace>/skills` (the pair `skills/install.sh` links; the script must
+resolve inside its skill), and refuses when more than one installed skill declares it, in one root
+or one per root — except the same skill name in both roots, where the shipped copy wins and the owner's is shadowed, the rule `skills/install.sh` applies; a `--store-adapter <path>` flag overrides the scan. The reminder
+(`pending_questions_remind.py`) reads an adapter through exactly these entry points: `reconcile_pass(workspace)`,
+its errors kept as notes, then `gather(workspace)` — a `gather` keyword is not part of the contract.
+With none declared there is no store: readers report `unavailable` with that reason (never a
+zero), a close is refused with it, and `scripts/ask-owner.py` does only what core can — it queues
+the owner's DM through the proactive path and keeps one generic record under
+`<workspace>/state/ask-owner/` (`src/local_record.py`), saying that nothing lists or closes it.
+The outbox, the ask-id grammar and every question schema are the declaring skill's.
+
+## Audience (`audience`)
+
+`"audience": "developer"` marks a skill for people developing Sutando, kept out of ordinary
+installs. Absent or `"user"` (the default) means every install.
+
+| Value | Linked by the installers |
+|---|---|
+| absent, `"user"` | always |
+| `"developer"` | only where sutando config sets `skills.developer` to `true` |
+| anything else, or an unreadable `manifest.json` | as `"developer"` |
+
+An unknown value fails closed: a typo in a developer skill must keep it away from users, not
+ship it to them. `scripts/lint-skill.py` rejects it, so a repo skill cannot merge with one.
+
+The opt-in is a host setting, not skill config, so the `CLI > env > manifest > config-file >
+state` precedence above does not apply: `skills.developer` is read from the merged
+`sutando.config.json` / `sutando.config.local.json` / `<workspace>/sutando.config.local.json`
+only, and only a JSON `true` opts in.
+
+```json
+{ "skills": { "developer": true } }
+```
+
+`src/skill_audience.py` owns the decision and every installer calls it: `skills/install.sh`
+(both roots, `<repo>/skills` and `<workspace>/skills`, into the Claude and Codex skills
+dirs), `skills/install.ps1`, and `health-check.py --fix` (`skill-symlinks`). A developer
+skill already linked on a host without the opt-in is left in place with a note; nothing deletes
+it. `skills/refresh-skill.sh` only refreshes links that already exist, so it needs no check.
+
+Runtime scans (`tools`, `hooks`, `claude_plugin`, `supervised_worker`,
+`pending_questions_store`, `documented_for_core`) read `<repo>/skills` directly, past the
+installers, so `scripts/lint-skill.py` refuses those fields on a developer-only skill.
+
+## Orphan reaper (`orphan_reaper`)
+
+`"orphan_reaper": "scripts/<reaper>.py"` declares the script that finds, and stops, orphaned test
+processes. Core reaches it only through `src/system_load.py`, which takes the path its caller
+injects and names no skill. `src/health-check.py` resolves it with `skill_roots.declared("orphan_reaper",
+roots=[claude_home_path("skills")])`: only a skill **installed** (linked there by `skills/install.sh`)
+counts, never the shipped copy in `<repo>/skills`; containment and the one-declarer rule are as for
+`pending_questions_store`. The contract health-check relies on:
+
+- no arguments: report only, exit 0, one `would stop <kind>=<id> pids=<pid,...> ...` line per target,
+  then a summary line carrying `mode=report ... candidates=<n>`;
+- no summary line means it did nothing (another run holds its lock, or it failed);
+- exit status 2 is a usage error and is never retried;
+- `--reap --spotlight`: stop the candidates, then the same summary with `mode=reap ... terminated=<n>
+  killed=<n> aborted=<n>`. A health-check pass without `--fix` never runs this. Every `health-check.py
+  --fix` run does, in the same run that warns, at most once per high-load episode (recorded in
+  health-check's state), when the warning's action is `reap-once`; a repeated `--fix` in the episode
+  stops nothing. The desktop app runs `--fix` every 30 minutes and at startup, so with the opt-in a
+  desktop host reaps automatically on that timer; the launchd fallback runs without `--fix`.
+
+With none installed, the `system-load` warning says its cause is unclassified. A warning ends its
+detail with `cause=<leftover-test-processes|other|unclassified> action=<reap-once|none>` and carries
+the same two keys in `--json`. `action=reap-once` means `--fix` **will** reap:
+the cause is leftover test processes, the reaper has not run this episode, and
+`SUTANDO_HEALTH_LOAD_REAP` is exactly `1`. `action=none` means `--fix` will not reap for any reason
+(another cause, already ran or failed this episode, or reaping off, which is the default); with
+`cause=leftover-test-processes` the core can still run the reaper by hand.
+
+## Claude plugin (`claude_plugin`)
+
+`"claude_plugin": "./plugin"` names a Claude Code plugin directory inside the skill. The Claude
+launchers (core and Claude pool workers) pass each enabled skill's directory as `--plugin-dir`.
+The path must resolve to a real directory inside the skill folder and the manifest must be
+`"enabled": true`; anything else is skipped with a note on stderr. Codex seats ignore it.
 
 ## Currently active manifest skills
 
@@ -146,6 +290,7 @@ backend swap, never a re-format.
 | `version` | yes | SemVer. MAJOR=breaking, MINOR=compat feature, PATCH=fix/eval |
 | `owner` | yes | who maintains it (handle / team / org) |
 | `stability` | yes | `stable` \| `experimental` \| `deprecated` |
+| `audience` | opt | `user` (default) \| `developer`; see [Audience](#audience-audience) |
 | `license` | rec | SPDX id (default: repo license) |
 | `description` | rec | one-line summary (code review + registry) |
 | `agent_compatibility` | opt | SemVer range of the agent runtime, e.g. `">=0.9 <2.0"` |
@@ -154,6 +299,7 @@ backend swap, never a re-format.
 | `contract` | opt | `{inputs, outputs, guarantees}` — what downstream depends on across versions |
 | `provenance` | opt | `{source_repo, forked_from, upstream_intent}` — keeps forks trackable |
 | `enabled`, `access_tier`, `tools`, `server`, `startup`, `config` | — | manifest-loaded skills only (see above) |
+| `documented_for_core`, `core_description` | opt | a skill the core runs (no `tools`): `core_description` is read by `loadCoreDocumentedSkills()` (`src/inline-tools.ts`) into the voice prompt, so voice delegates it through `work` instead of saying it cannot |
 
 `permissions` is a **declaration the linter cross-checks**: e.g. `network: false`
 on a skill whose code calls `fetch`/`urllib` is flagged, because a permission that

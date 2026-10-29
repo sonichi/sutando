@@ -38,7 +38,9 @@ trap cleanup_all EXIT
 # A real process whose argv matches the reaper's `ps ... | grep watch-tasks-stream`.
 spawn_fake_watcher() {
   local dir="$1" script="$1/watch-tasks-stream.sh"
-  printf '#!/usr/bin/env bash\nsleep 120\n' > "$script"
+  # NOT `#!/usr/bin/env bash`: that leaves `env` as argv[0] with the script as
+  # its operand, which watcher_identity.py classifies as NOT a watcher.
+  printf '#!/bin/bash\nsleep 120\n' > "$script"
   chmod +x "$script"
   # stdout/stderr MUST be redirected: this runs inside $( ), and a background
   # child inheriting that pipe keeps it open, so the substitution would block
@@ -46,9 +48,11 @@ spawn_fake_watcher() {
   "$script" >/dev/null 2>&1 & local pid=$!
   KILL_LIST+=("$pid")
   echo "$pid" >> "$PIDFILE"   # survives the $( ) the caller wraps this in
-  # Wait until ps can actually see it, so the test never races the fixture.
-  for _ in 1 2 3 4 5 6 7 8 9 10; do
-    ps -p "$pid" -o args= 2>/dev/null | grep -q "watch-tasks-stream" && break
+  # Wait until the IDENTITY HELPER calls it a watcher, which is the property
+  # the reaper gates on. A `ps | grep` matches the pre-exec argv too, so the
+  # fixture was handed over while it was still the shape the helper rejects.
+  for _ in $(seq 1 30); do
+    [ "$(python3 -S -I "$REPO/src/watcher_identity.py" "$pid" 2>/dev/null | head -1)" = watcher ] && break
     sleep 0.1
   done
   printf '%s' "$pid"
@@ -227,22 +231,27 @@ EOF
         "f4/$_rc) helper rc=$_rc does not abort the reaper under set -e"
 done
 
-# f5 — `ps` failing is not "not a watcher". A denied ps skipped the ownership
-# check and still released the sentinel, deleting a live watcher's file.
-cat > "$TMP/psfail.sh" <<EOF
+# f5 — an UNANSWERABLE identity probe is not "not a watcher". The property is
+# unchanged; the seam moved. The reaper no longer reads `ps` in this shell, it
+# shells out to watcher_identity.py, and a subprocess cannot inherit a shell
+# function — so stubbing `ps` measured nothing at all.
+cat > "$TMP/idfail.sh" <<EOF
 . "$REPO/src/watcher_sentinel.sh"
 . "$REPO/src/startup-runtime.sh" 2>/dev/null || true
-ps() { echo "ps: Operation not permitted" >&2; return 1; }
+# The classifier itself is unanswerable: the reaper must treat that as unknown.
+_reaper_watcher_verdict() { return 1; }
 OWN=0; REL=0
 sentinel_pid_wrote_file() { OWN=1; return 2; }
 sentinel_release_if_owner() { REL=1; }
 PF="\$(mktemp)"; echo 99999 > "\$PF"
-reap_stale_task_watcher "\$PF" >/dev/null 2>&1
+reap_stale_task_watcher "\$PF" >"$TMP/f5.out" 2>&1
 echo "OWN=\$OWN REL=\$REL"
 EOF
-_ps="$(bash "$TMP/psfail.sh" 2>/dev/null)"
-check "$(printf '%s' "$_ps" | grep -q 'REL=0' && echo 0 || echo 1)" \
-      "f5) an unanswerable ps does NOT release the sentinel (got: $_ps)"
+_id="$(bash "$TMP/idfail.sh" 2>/dev/null)"
+check "$(printf '%s' "$_id" | grep -q 'REL=0' && echo 0 || echo 1)" \
+      "f5) an unanswerable identity probe does NOT release the sentinel (got: $_id)"
+check "$(grep -q 'cannot determine whether pid' "$TMP/f5.out" && echo 0 || echo 1)" \
+      "f5) ...and says it could not tell, rather than failing silently"
 
 echo
 echo "passed $PASS, failed $FAIL"

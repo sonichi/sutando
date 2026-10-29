@@ -115,6 +115,8 @@ describe('buildAgentState — frame shape and vectors (design 1a′)', () => {
 			[{ sessionState: 'CLOSED', clientAttached: true }, 'backoff'],
 			[{ sessionState: 'CLOSED', backoffUntil: 2_000_000 }, 'backoff'],
 			[{ sessionState: 'CLOSED' }, 'idle'],
+			[{ sessionState: 'UPSTREAM_LOST', clientAttached: true }, 'backoff'],
+			[{ sessionState: 'UPSTREAM_LOST' }, 'idle'],
 			[{ sessionState: 'CREATED' }, 'idle'],
 		];
 		for (const [inputs, expected] of vectors) {

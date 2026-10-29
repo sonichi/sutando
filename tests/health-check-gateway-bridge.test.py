@@ -28,6 +28,11 @@ import tempfile
 import unittest.mock
 from pathlib import Path
 
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 REPO = Path(__file__).resolve().parent.parent
 
 spec = importlib.util.spec_from_file_location("health_check", REPO / "src" / "health-check.py")
@@ -35,6 +40,8 @@ hc = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(hc)
 
 FAILURES = []
+# No connections record: only the legacy token sources are under test here, never the host's rows.
+_NO_RECORD = Path(tempfile.mkdtemp(prefix="sutando-gw-no-record-"))
 
 
 def check(name, cond, detail=""):
@@ -76,6 +83,7 @@ def _run(*, channels_dir=None, env=None, pgrep_rc=1, pgrep_out="", pgrep_raises=
     run_mock = (unittest.mock.Mock(side_effect=OSError("pgrep exploded"))
                 if pgrep_raises else unittest.mock.Mock(side_effect=_pgrep(pgrep_rc, pgrep_out)))
     with unittest.mock.patch.dict(hc.os.environ, base, clear=True), \
+         unittest.mock.patch.object(hc, "WORKSPACE_DIR", _NO_RECORD), \
          unittest.mock.patch.object(
              hc, "claude_home_path",
              **({"side_effect": OSError("cannot resolve the channels dir")}
@@ -101,6 +109,7 @@ def _configured(*, env=None, channels_dir=None):
             if k not in ("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN")}
     base.update(env)
     with unittest.mock.patch.dict(hc.os.environ, base, clear=True), \
+         unittest.mock.patch.object(hc, "WORKSPACE_DIR", _NO_RECORD), \
          unittest.mock.patch.object(hc, "claude_home_path", return_value=channels_dir):
         return hc._gateway_configured()
 

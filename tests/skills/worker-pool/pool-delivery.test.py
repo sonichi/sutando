@@ -323,6 +323,44 @@ class TestSweep(Base):
         self.assertTrue(accepted.exists())
 
 
+class TestAliasRefused(Base):
+    """The writer refuses to publish through a recipient-named symlink: a record
+    would otherwise land in the TARGET's folder under this recipient's name."""
+
+    A = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    B = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+    def _root(self):
+        return pd.done_flag(self.ws.root, self.B, "task-0aliased000000000").parent.parent.parent
+
+    def _alias(self):
+        root = self._root()
+        (root / self.B / "done").mkdir(parents=True)
+        (root / self.A).symlink_to(root / self.B)
+        return root
+
+    def test_mark_done_through_an_aliased_recipient_dir_writes_nothing(self):
+        root = self._alias()
+        for published in (False, True):
+            with self.assertRaises(pd.RecipientAliasError):
+                pd.mark_done(self.ws.root, self.A, "task-0aliased000000001", published=published)
+        self.assertEqual(sorted(p.name for p in (root / self.B / "done").iterdir()), [],
+                         "a record was published into B's folder under A's name")
+
+    def test_an_aliased_done_dir_is_refused_too(self):
+        root = self._root()
+        (root / self.B / "done").mkdir(parents=True)
+        (root / self.A).mkdir()
+        (root / self.A / "done").symlink_to(root / self.B / "done")
+        with self.assertRaises(OSError):
+            pd.mark_done(self.ws.root, self.A, "task-0aliased000000002", published=True)
+        self.assertEqual(list((root / self.B / "done").iterdir()), [])
+
+    def test_control_a_real_recipient_dir_still_publishes(self):
+        pd.mark_done(self.ws.root, self.B, "task-0aliased000000003", published=True)
+        self.assertTrue(pd.done_flag(self.ws.root, self.B, "task-0aliased000000003").exists())
+
+
 class TestPayload(Base):
     def test_reads_the_bridges_task_file_as_text(self):
         self.ws.payload("task-1", "write the docs")
@@ -514,6 +552,215 @@ class TestResultReadiness(Base):
         self.accepted()
         self.ws.result("task-1", "the answer")
         self.assertEqual(pd.residue(self.root, "core", "task-1"), "completed")
+
+
+class TestInterruptedReconciliation(Base):
+    def deliver(self, task_id, suffix=".accepted"):
+        self.ws.payload(task_id)
+        entry = self.ws.deliver("worker-1", task_id)
+        if suffix != ".txt":
+            entry = pd.accept(entry)
+            if suffix == ".claimed":
+                entry = entry.rename(entry.with_suffix(suffix))
+        return entry
+
+    def snapshot(self):
+        return {str(p.relative_to(self.root)): p.read_bytes() for p in self.root.rglob("*")
+                if p.is_file() and not p.name.endswith(".lock")}
+
+    def test_releases_both_accepted_names_but_preserves_pending_payloads_and_ownership(self):
+        released = []
+        for suffix in (".accepted", ".claimed"):
+            for index, body in enumerate((None, "", " \n\t")):
+                tid = f"task-{suffix[1:]}-{index}"
+                entry = self.deliver(tid, suffix)
+                entry.write_text("sentinel content")
+                if body is not None:
+                    self.ws.result(tid, body)
+                released.append(tid)
+        self.deliver("task-pending", ".txt")
+        pd.mark_done(self.root, "worker-1", released[0], published=False)
+        before = self.snapshot()
+        self.assertEqual(pd.reconcile_interrupted(self.root, "worker-1"), sorted(released))
+        expected = {k.replace(".accepted", ".txt").replace(".claimed", ".txt"): v
+                    for k, v in before.items()}
+        self.assertEqual(self.snapshot(), expected)
+        self.assertEqual(pd.reconcile_interrupted(self.root, "worker-1"), [])
+        self.assertEqual(self.snapshot(), expected)
+
+    def test_ready_answers_terminal_flags_and_missing_payloads_are_preserved(self):
+        from result_publish import publish_text
+        for suffix in (".accepted", ".claimed"):
+            for kind in ("live", "archive", "terminal", "stale"):
+                tid = f"task-{suffix[1:]}-{kind}"
+                self.deliver(tid, suffix)
+                if kind in ("live", "archive"):
+                    dst = pd.result_path(self.root, tid)
+                    if kind == "archive":
+                        self.ws.result(tid, " \n")
+                        dst = dst.parent / "archive" / dst.name
+                    publish_text(dst, "synthetic answer")
+                    self.assertEqual(pd.residue(self.root, "worker-1", tid), "completed")
+                elif kind == "terminal":
+                    pd.mark_done(self.root, "worker-1", tid, published=True)
+                else:
+                    pd.payload_path(self.root, tid).unlink()
+        before = self.snapshot()
+        self.assertEqual(pd.reconcile_interrupted(self.root, "worker-1"), [])
+        self.assertEqual(self.snapshot(), before)
+
+    def test_prune_and_sweep_share_archived_readiness(self):
+        from result_publish import publish_text
+        tid = "task-archive"
+        entry = self.deliver(tid)
+        self.ws.result(tid, "")
+        publish_text(self.root / "results/archive" / f"{tid}.txt", "answer")
+        self.assertEqual(pd.sweep(self.root, "worker-1")["completed"], [tid])
+        self.assertTrue(entry.exists())
+        pd.mark_done(self.root, "worker-1", tid, published=True)
+        self.assertEqual(pd.prune_spent(self.root, "worker-1")["retired"], [tid])
+
+    def test_releases_exactly_died_mid_work_with_coexisting_sentinel_names(self):
+        suffixes = (".txt", ".accepted", ".claimed")
+        expected = []
+        preserved = {}
+        for mask in range(1, 8):
+            tid = f"task-coexist-{mask}"
+            self.ws.payload(tid)
+            folder = pd.deliveries_dir(self.root, "worker-1")
+            folder.mkdir(parents=True, exist_ok=True)
+            for bit, suffix in enumerate(suffixes):
+                if mask & (1 << bit):
+                    p = folder / (tid + suffix)
+                    p.write_text(suffix)
+                    preserved[p] = suffix
+            if pd.residue(self.root, "worker-1", tid) == "died-mid-work":
+                expected.append(tid)
+                source = folder / (tid + (".accepted" if mask & 2 else ".claimed"))
+                preserved[source.with_suffix(".txt")] = preserved.pop(source)
+        self.assertEqual(pd.reconcile_interrupted(self.root, "worker-1"), expected)
+        for path, body in preserved.items():
+            self.assertEqual(path.read_text(), body)
+        self.assertEqual(pd.reconcile_interrupted(self.root, "worker-1"), [])
+
+    def test_residue_and_recovery_use_the_same_classifier(self):
+        from unittest import mock
+        entry = self.deliver("task-classifier")
+        with mock.patch.object(pd, "classify_residue", return_value="pending"):
+            self.assertEqual(pd.residue(self.root, "worker-1", "task-classifier"), "pending")
+            self.assertEqual(pd.reconcile_interrupted(self.root, "worker-1"), [])
+        self.assertTrue(entry.is_file())
+
+    def test_conflicting_holders_fail_closed_without_changing_sentinels(self):
+        for suffix in (".txt", ".accepted", ".claimed"):
+            with self.subTest(suffix=suffix):
+                tid = "task-conflict-" + suffix[1:]
+                entry = self.deliver(tid)
+                other = self.ws.deliver("worker-2", tid)
+                if suffix != ".txt":
+                    other = other.rename(other.with_suffix(suffix))
+                with self.assertRaises(OSError):
+                    pd.reconcile_interrupted(self.root, "worker-1")
+                self.assertTrue(entry.is_file())
+                self.assertTrue(other.is_file())
+                self.assertFalse(entry.with_suffix(".txt").exists())
+                entry.unlink()
+                other.unlink()
+
+    def test_vanished_entries_are_skipped_before_classification_or_rename(self):
+        from unittest import mock
+        entry = self.deliver("task-vanished")
+        find_in = pd.find_in
+
+        def vanish(dfd, tid):
+            entry.unlink()
+            return find_in(dfd, tid)
+
+        with mock.patch.object(pd, "find_in", side_effect=vanish):
+            self.assertEqual(pd.reconcile_interrupted(self.root, "worker-1"), [])
+        entry = self.deliver("task-vanished")
+        rename = os.rename
+
+        def vanish_on_rename(*args, **kwargs):
+            entry.unlink()
+            return rename(*args, **kwargs)
+
+        with mock.patch.object(pd.os, "rename", side_effect=vanish_on_rename):
+            self.assertEqual(pd.reconcile_interrupted(self.root, "worker-1"), [])
+
+    def test_holder_checks_never_nest_folder_locks(self):
+        import contextlib
+        import pool_router
+        from unittest import mock
+        self.deliver("task-locks")
+        arbitration = pd.arbitration
+        task_arbitration = pool_router.task_arbitration
+        locked = []
+        tasks = []
+
+        @contextlib.contextmanager
+        def checked_task(ws, tid):
+            self.assertEqual(locked, [])
+            with task_arbitration(ws, tid):
+                tasks.append(tid)
+                try:
+                    yield
+                finally:
+                    tasks.pop()
+
+        @contextlib.contextmanager
+        def checked(ws, who, **kwargs):
+            self.assertEqual(locked, [])
+            self.assertEqual(tasks, ["task-locks"])
+            with arbitration(ws, who, **kwargs) as dfd:
+                locked.append(who)
+                try:
+                    yield dfd
+                finally:
+                    locked.pop()
+
+        with mock.patch.object(pd, "arbitration", side_effect=checked), \
+                mock.patch.object(pool_router, "task_arbitration", side_effect=checked_task):
+            self.assertEqual(pd.reconcile_interrupted(self.root, "worker-1"), ["task-locks"])
+
+    def test_nonregular_entries_are_not_released(self):
+        entry = self.deliver("task-target")
+        folder = entry.parent
+        (folder / "task-link.accepted").symlink_to(entry)
+        (folder / "task-dir.claimed").mkdir()
+        self.assertEqual(pd.reconcile_interrupted(self.root, "worker-1"), ["task-target"])
+        self.assertTrue((folder / "task-link.accepted").is_symlink())
+        self.assertTrue((folder / "task-dir.claimed").is_dir())
+
+    def test_recipient_alias_is_refused_and_a_swap_cannot_redirect_the_transition(self):
+        from unittest import mock
+        import pool_router
+        entry = self.deliver("task-own")
+        self.ws.payload("task-other")
+        other = pd.accept(self.ws.deliver("worker-2", "task-other"))
+        folder, moved = entry.parent, entry.parent.with_name("original")
+        arb = pd.arbitration
+        committed = pool_router.committed_recipient
+        checked = []
+
+        def swap():
+            folder.rename(moved)
+            folder.symlink_to(other.parent, target_is_directory=True)
+
+        def owner(ws, tid):
+            result = committed(ws, tid)
+            checked.append(tid)
+            return result
+
+        with mock.patch.object(pool_router, "committed_recipient", side_effect=owner), \
+                mock.patch.object(pd, "arbitration", side_effect=lambda ws, who, **kw:
+                                  arb(ws, who, _after_lock=swap if checked else None, **kw)):
+            self.assertEqual(pd.reconcile_interrupted(self.root, "worker-1"), ["task-own"])
+        self.assertTrue((moved / "task-own.txt").is_file())
+        self.assertTrue(other.is_file())
+        with self.assertRaises(OSError):
+            pd.reconcile_interrupted(self.root, "worker-1")
+        self.assertTrue(other.is_file())
 
 
 class TestAcceptIsExclusive(Base):
@@ -763,6 +1010,22 @@ class TestMarkDoneCli(Base):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertTrue(pd.is_done_flag(pd.done_flag(self.root, "worker-3", "task-1")))
 
+    def test_prune_spent_cli_retires_a_finished_sentinel_but_keeps_inflight_work(self):
+        self.ws.payload("task-finished")
+        finished = pd.accept(self.ws.deliver("worker-3", "task-finished"))
+        self.ws.result("task-finished")
+        pd.mark_done(self.root, "worker-3", "task-finished", published=True)
+        self.ws.payload("task-inflight")
+        inflight = pd.accept(self.ws.deliver("worker-3", "task-inflight"))
+
+        rc, out = self._main("prune-spent")
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(out), {"retired": ["task-finished"],
+                                           "stale": [], "kept": ["task-inflight"]})
+        self.assertFalse(finished.exists())
+        self.assertTrue(inflight.exists())
+
 
 class TestClearPending(Base):
     """A hold the worker will not finish is withdrawn; a finish is never undone."""
@@ -829,10 +1092,12 @@ class TestClearPending(Base):
         self.ws.deliver("worker-3", "task-1"); self.ws.payload("task-1")
         pd.mark_done(self.root, "worker-3", "task-1", published=False)
         seen = {}
-        real_find = pd.find
+        real_find_in = pd.find_in
 
-        def find_under_scrutiny(workspace, recipient, task_id):
-            with open(pd.deliveries_dir(workspace, recipient) / pd.LOCK_NAME, "a+") as fh:
+        def find_under_scrutiny(dir_fd, task_id):
+            # The body reads through the anchored `find_in`; the lock is the same
+            # file, so a path-opened probe still tells whether it is held.
+            with open(pd.deliveries_dir(self.root, "worker-3") / pd.LOCK_NAME, "a+") as fh:
                 try:
                     fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 except BlockingIOError:
@@ -840,11 +1105,11 @@ class TestClearPending(Base):
                 else:
                     fcntl.flock(fh, fcntl.LOCK_UN)
                     seen["held"] = False
-            return real_find(workspace, recipient, task_id)
+            return real_find_in(dir_fd, task_id)
 
-        with mock.patch.object(pd, "find", find_under_scrutiny):
+        with mock.patch.object(pd, "find_in", find_under_scrutiny):
             pd.clear_pending(self.root, "worker-3", "task-1")
-        self.assertIs(seen.get("held"), True, "find ran outside the arbitration lock")
+        self.assertIs(seen.get("held"), True, "find_in ran outside the arbitration lock")
         self.assertIsNone(pd.find(self.root, "worker-3", "task-1"))
 
     def test_abandon_leaves_a_finished_delivery_for_the_sweep(self):

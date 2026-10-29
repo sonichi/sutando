@@ -78,6 +78,19 @@ export SUTANDO_TELEMETRY=0
 …or create the file `<workspace>/state/telemetry-disabled`. In the desktop app,
 use the Privacy toggle in Settings.
 
+Telemetry is also off when the install id would be stored under a system temp
+location (`/tmp`, `/var/tmp`, the macOS per-user `/var/folders/<x>/<y>/T`, or
+`%LOCALAPPDATA%\Temp` / `%SystemRoot%\Temp` on Windows), as test harnesses do
+with a throwaway `HOME`. The POSIX locations are fixed; the Windows ones are read
+from `LOCALAPPDATA` and `SystemRoot`, which the environment can override. An
+install that deliberately runs with such a disposable `HOME` is not counted
+either: it would mint a new id on every run and count each run as a new user.
+`SUTANDO_TELEMETRY=1` (or an explicit `SUTANDO_TELEMETRY_ID_FILE`) overrides this.
+
+Containers that run with `HOME=/tmp`, as some OpenShift-style images do, stop
+sending telemetry for this reason. Such images should set
+`SUTANDO_TELEMETRY_ID_FILE` to a persistent path, or set `SUTANDO_TELEMETRY=1`.
+
 ## Transparency
 
 - All telemetry lives in one file: [`src/telemetry.py`](src/telemetry.py).

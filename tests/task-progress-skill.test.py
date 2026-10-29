@@ -2,6 +2,11 @@
 """Tests for skills/task-progress/scripts/notify.py."""
 from __future__ import annotations
 
+from _helpers.hermetic_env import isolate_os_environ, isolated_child_env
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import contextlib
 import importlib.util
 import io
@@ -518,7 +523,7 @@ class TestSendRemoteGateway(unittest.TestCase):
             captured["payload"] = json.loads(req.data)
             return mock_resp
 
-        clean_env = {k: v for k, v in os.environ.items()
+        clean_env = {k: v for k, v in isolated_child_env().items()
                      if k not in ("REMOTE_TASK_URL", "REMOTE_TASK_TOKEN")}
         with patch.object(self.mod, "_env_file",
                           return_value={"REMOTE_TASK_URL": "https://gw.example/relay",
@@ -536,7 +541,7 @@ class TestSendRemoteGateway(unittest.TestCase):
         # AG2_REMOTE_TOKEN=url|secret, so a genuine "no creds anywhere" case must
         # clear them too (else an ambient AG2_REMOTE_TOKEN resolves and this passes).
         _drop = ("REMOTE_TASK_URL", "REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN", "AG2_REMOTE_URL")
-        clean_env = {k: v for k, v in os.environ.items() if k not in _drop}
+        clean_env = {k: v for k, v in isolated_child_env().items() if k not in _drop}
         # Pin the containment guard to a temp tree — see _hermetic_channels_root.
         clean_env["CLAUDE_CONFIG_DIR"] = self._hermetic_channels_root()
         clean_env.pop("CLAUDE_HOME", None)
@@ -590,7 +595,7 @@ class TestSendRemoteGateway(unittest.TestCase):
         desktop app's core session has the real one exported."""
         _drop = ("REMOTE_TASK_URL", "REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN",
                  "AG2_REMOTE_URL", "CLAUDE_HOME", "SUTANDO_APP_SUPPORT")
-        env = {k: v for k, v in os.environ.items() if k not in _drop}
+        env = {k: v for k, v in isolated_child_env().items() if k not in _drop}
         env["CLAUDE_CONFIG_DIR"] = config_dir
         if app_support is not None:
             env["SUTANDO_APP_SUPPORT"] = app_support
@@ -704,7 +709,7 @@ class TestSendRemoteGateway(unittest.TestCase):
             return mock_resp
 
         _drop = ("REMOTE_TASK_URL", "REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN", "AG2_REMOTE_URL")
-        clean_env = {k: v for k, v in os.environ.items() if k not in _drop}
+        clean_env = {k: v for k, v in isolated_child_env().items() if k not in _drop}
         # Pin the containment guard to a temp tree — see _hermetic_channels_root.
         clean_env["CLAUDE_CONFIG_DIR"] = self._hermetic_channels_root()
         clean_env.pop("CLAUDE_HOME", None)
@@ -773,7 +778,7 @@ class TestSendRemoteGateway(unittest.TestCase):
             return mock_resp
 
         _drop = ("REMOTE_TASK_URL", "REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN", "AG2_REMOTE_URL")
-        clean_env = {k: v for k, v in os.environ.items() if k not in _drop}
+        clean_env = {k: v for k, v in isolated_child_env().items() if k not in _drop}
         # Pin the containment guard to a temp tree — see _hermetic_channels_root.
         clean_env["CLAUDE_CONFIG_DIR"] = self._hermetic_channels_root()
         clean_env.pop("CLAUDE_HOME", None)
@@ -824,7 +829,7 @@ class TestGatewaySourceTraversal(unittest.TestCase):
             [sys.executable, str(SCRIPT), "--source", "../evil",
              "--channel-id", "!room:server", "--message", "hi"],
             capture_output=True, text=True,
-            env={**os.environ, "CLAUDE_CONFIG_DIR": str(self.cfg)},
+            env={**isolated_child_env(), "CLAUDE_CONFIG_DIR": str(self.cfg)},
         )
         self.assertEqual(r.returncode, 1)
         self.assertIn("invalid gateway source", r.stderr)
@@ -880,12 +885,12 @@ class TestCLI(unittest.TestCase):
         self.assertNotEqual(r.returncode, 0)
 
     def test_unconfigured_gateway_source_fails_open(self):
-        # A source outside the built-ins routes to the remote-gateway sender;
+        # A non-built-in source with a gateway room id routes to the gateway sender;
         # with no channels/<source>/.env it must fail (exit 1) with a hint —
         # never traceback, never block.
         r = subprocess.run(
             [sys.executable, str(SCRIPT), "--source", "whatsapp",
-             "--channel-id", "D123", "--message", "hi"],
+             "--channel-id", "!room:server", "--message", "hi"],
             capture_output=True, text=True,
             env={"PATH": "/usr/bin:/bin", "CLAUDE_CONFIG_DIR": "/nonexistent"},
         )

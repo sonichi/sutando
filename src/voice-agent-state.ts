@@ -115,9 +115,10 @@ export function mapUpstream(args: {
 	) {
 		return { upstream: 'connecting' };
 	}
-	// CLOSED / CREATED / unknown: upstream is down. With a client attached
+	// CLOSED / UPSTREAM_LOST (parked, bodhi >= 0.4) / CREATED / unknown:
+	// upstream is down. With a client attached
 	// (or a fatal-backoff window pending) the agent is waiting to reconnect;
-	// with neither, this is the healthy idle-teardown fixed point.
+	// with neither, this is the healthy idle state (the idle teardown parks in UPSTREAM_LOST).
 	if (clientAttached || backoffUntil > now) return { upstream: 'backoff' };
 	return { upstream: 'idle' };
 }

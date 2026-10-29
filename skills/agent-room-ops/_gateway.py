@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# DEPRECATION NOTICE: room ops is being replaced by the AG2 Space MCP; use its room Actions.
+# Kept only as the fallback when the MCP is unreachable (see SKILL.md).
 """Shared gateway plumbing for the room-ops capabilities (read / media / react / …).
 
 Every room-ops module is a thin **gateway-only** client: it speaks the stable
@@ -182,8 +184,30 @@ def _credential_contract():
     return _gc
 
 
-def gateway():
+class RoomConnectionError(RuntimeError):
+    """The room's server has no usable connection on this install; never another server's token."""
+
+
+def _room_credential(room_id):
+    """(gateway_url, token) the core's `connections.room_credential` names for `room_id`, or None
+    to keep the single-connection chain below. Raises RoomConnectionError on its refusal."""
+    try:
+        if not _core_src_on_path():
+            return None
+        import connections
+    except Exception:
+        return None
+    try:
+        return connections.room_credential(room_id)
+    except connections.ConnectionsError as e:
+        raise RoomConnectionError(str(e)) from None
+
+
+def gateway(room_id=None):
     """Return (base_url, headers). base is '' when no gateway is configured.
+
+    On an install with several connections the connection is chosen by the
+    room's server (`connections.room_credential`); no room means the primary.
 
     PR2 of the credential-contract migration (#2668): parsing/precedence now
     delegates to the vendored shared contract; this facade keeps only the
@@ -200,17 +224,21 @@ def gateway():
     never shadows a fresher env token.
     """
     gc = _credential_contract()
-    raw, _name = gc.resolve_alias_precedence(
-        os.environ, ("GATEWAY_TOKEN", "RELAY_TOKEN", "REMOTE_TASK_TOKEN"))
-    if not raw:
-        raw = _from_channel_env(
-            ("GATEWAY_TOKEN", "RELAY_TOKEN", "REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN"))
-    if not raw:
-        raw = _token_from_vault()
-    explicit_url, _ = gc.resolve_alias_precedence(
-        os.environ, ("GATEWAY_URL", "RELAY_URL", "REMOTE_TASK_URL"))
-    if not explicit_url:
-        explicit_url = _from_channel_env(("GATEWAY_URL", "RELAY_URL", "REMOTE_TASK_URL"))
+    routed = _room_credential(room_id)
+    if routed is not None:
+        explicit_url, raw = routed
+    else:
+        raw, _name = gc.resolve_alias_precedence(
+            os.environ, ("GATEWAY_TOKEN", "RELAY_TOKEN", "REMOTE_TASK_TOKEN"))
+        if not raw:
+            raw = _from_channel_env(
+                ("GATEWAY_TOKEN", "RELAY_TOKEN", "REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN"))
+        if not raw:
+            raw = _token_from_vault()
+        explicit_url, _ = gc.resolve_alias_precedence(
+            os.environ, ("GATEWAY_URL", "RELAY_URL", "REMOTE_TASK_URL"))
+        if not explicit_url:
+            explicit_url = _from_channel_env(("GATEWAY_URL", "RELAY_URL", "REMOTE_TASK_URL"))
     creds = gc.normalize_credentials(raw, explicit_url=explicit_url,
                                      source="resolved" if raw else "none")
     headers = {"User-Agent": "sutando-room-ops/1"}

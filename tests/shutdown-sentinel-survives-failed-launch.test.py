@@ -86,8 +86,10 @@ def _window(src: str, pos: int, lines: int = 40) -> str:
 
 for pos in calls:
     w = _window(claude, pos)
+    # launch_claude_session (session-launch.sh) now does the create+poll
+    # internally; a caller checking its return has the same proof.
     verified = ("tmux_core_session_running" in w or "healed_idx" in w
-                or "command -v claude" in w)
+                or "command -v claude" in w or "launch_claude_session" in w)
     check(f"claude: clear at line {claude[:pos].count(chr(10))+1} follows a liveness proof",
           verified, "a clear with no preceding verification can open intake with no core")
 
@@ -97,7 +99,7 @@ check("codex: has clear call sites at all", bool(ccalls))
 for pos in ccalls:
     w = _window(codex, pos)
     check(f"codex: clear at line {codex[:pos].count(chr(10))+1} follows session creation or a binary check",
-          "new-session" in w or "command -v codex" in w)
+          "new-session" in w or "command -v codex" in w or "wait_core_up" in w)
 
 # 4. startup.sh cannot verify anything — it must delegate, not clear.
 startup = (REPO / "src" / "startup.sh").read_text(encoding="utf-8")

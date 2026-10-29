@@ -54,6 +54,12 @@ class ResultPath(unittest.TestCase):
         ws = _ws(archive={"task-b.too-old.1788000000.txt": "never sent\n"})
         self.assertIsNone(ds.result_path(ws / "results", "task-b"))
 
+    def test_result_prefix_collision_does_not_count_as_a_reply(self):
+        ws = _ws(archive={"task-b-extra.txt": "some other task's answer"})
+        self.assertIsNone(ds.result_path(ws / "results", "task-b"))
+        (ws / "results/archive/task-b-1788000001.txt").write_text("actual holder")
+        self.assertEqual(ds.result_path(ws / "results", "task-b").read_text(), "actual holder")
+
     def test_the_real_archive_shape_IS_found(self):
         """Control: without it, 'reject quarantine' could be 'reject everything'."""
         ws = _ws(archive={"task-b-1788000001.txt": "the reply\n"})
@@ -79,13 +85,104 @@ class Problems(unittest.TestCase):
         return ds.dedup_problem(ws / "results", tid,
                                 (ws / "tasks") if with_tasks else None, src_dir=SRC)
 
+    def test_destination_provider_namespace(self):
+        for source in ("telegram", "discord", "DISCORD"):
+            with self.subTest(source=source):
+                ws = _ws(results={"task-a.txt": "[deduped: task-b]", "task-b.txt": "[REPLIED]"},
+                         tasks={"task-a.txt": "source: discord\nchannel_id: 4242\nuser_id: 9001\n",
+                                "task-b.txt": f"source: {source}\nchat_id: 4242\nuser_id: 9001\n"})
+                if source == "telegram":
+                    problem = self._p(ws)
+                    self.assertIsNotNone(problem)
+                    self.assertIn("CROSS-ROOM", problem)
+                else:
+                    self.assertIsNone(self._p(ws))
+
+    def test_task_record_layouts_match_production_and_real_consumers(self):
+        from dedup_recovery import plan_dedup_recovery
+        cdt = _load(REPO / "skills/proactive-loop/scripts/check-dedup-targets.py", "cdt_layouts")
+        uat = _load(REPO / "scripts/unanswered-tasks.py", "uat_layouts")
+        for layout in ("task-b.txt", "task-b.claimed-core-1.txt", "task-b.assigned-worker.txt",
+                       "processed/task-b.txt", "archive/task-b.txt", "archive/2026-09/task-b.txt"):
+            for source in ("telegram", "discord"):
+                with self.subTest(layout=layout, source=source):
+                    ws = _ws(results={"task-a.txt": "[deduped: task-b]", "task-b.txt": "[REPLIED]"},
+                             tasks={"task-a.txt": "id: task-a\nsource: discord\nchannel_id: 4242\nuser_id: 9001\ntask: ask\n"})
+                    holder = ws / "tasks" / layout
+                    holder.parent.mkdir(parents=True, exist_ok=True)
+                    holder.write_text(f"id: task-b\nsource: {source}\nchat_id: 4242\nuser_id: 9001\ntask: holder\n")
+                    problem = self._p(ws)
+                    bad = cdt.check(ws, [ws / "results/task-a.txt"])
+                    rows = uat.unanswered(ws, min_age_sec=-1)
+                    self.assertEqual(bool(problem), source == "telegram")
+                    self.assertEqual(bool(bad), source == "telegram")
+                    self.assertEqual(any(row[0] == "task-a" for row in rows), source == "telegram")
+                    action, _ = plan_dedup_recovery(ws / "results", ws / "tasks", "task-a", "task-b", "4242", "task-new")
+                    self.assertEqual(action, "requeue" if source == "telegram" else "honour")
+                    self.assertTrue(ds.task_exists(ws / "tasks", "task-b"))
+
+    def test_malformed_target_never_reaches_any_audit_lookup(self):
+        for target in ("../secret", "/tmp/secret", "task-*", "task-a/b", ".."):
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as td:
+                tasks = Path(td) / "tasks"; tasks.mkdir()
+                (Path(td) / "secret.txt").write_text("user_id: PRIVATE-SENTINEL\n")
+                with mock.patch.object(ds, "task_field", side_effect=AssertionError("task lookup")), \
+                     mock.patch.object(ds, "result_path", side_effect=AssertionError("result lookup")):
+                    problem = ds.dedup_problem(Path(td) / "results", "task-a", tasks,
+                                              text=f"[deduped: {target}]", src_dir=SRC)
+                self.assertEqual(problem, "MALFORMED: invalid dedup target id")
+                self.assertNotIn("PRIVATE-SENTINEL", problem)
+                with mock.patch.object(ds, "result_path", side_effect=AssertionError("own result lookup")):
+                    self.assertEqual(ds.dedup_problem(Path(td), target, text="[REPLIED]", src_dir=SRC),
+                                     "MALFORMED: invalid task id")
+
+    def test_direct_lookup_helpers_refuse_malformed_ids(self):
+        for target in ("../secret", "/tmp/secret", "task-*", ".."):
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as td:
+                with mock.patch("task_archive.find_task_file", side_effect=AssertionError("unsafe task lookup")), \
+                     mock.patch("local_task_protocol.find_archived_task", side_effect=AssertionError("unsafe archive lookup")), \
+                     mock.patch.object(Path, "exists", side_effect=AssertionError("unsafe stat")), \
+                     mock.patch.object(Path, "glob", side_effect=AssertionError("unsafe glob")):
+                    self.assertFalse(ds.task_exists(Path(td), target))
+                    self.assertIsNone(ds.task_field(Path(td), target, "source"))
+                    self.assertIsNone(ds.result_path(Path(td), target))
+
+    def test_task_prefix_collision_is_not_holder_metadata(self):
+        ws = _ws(results={"task-a.txt": "[deduped: task-b]", "task-b.txt": "[REPLIED]"},
+                 tasks={"task-a.txt": "source: discord\nchannel_id: 4242\n"},
+                 task_archive={"task-b-extra.txt": "id: task-b-extra\nsource: telegram\nchat_id: 4242\n"})
+        self.assertFalse(ds.task_exists(ws / "tasks", "task-b"))
+        self.assertIsNone(ds.task_field(ws / "tasks", "task-b", "source"))
+        self.assertIsNone(self._p(ws))  # Unknown metadata is still the existing separate policy.
+        (ws / "tasks/archive/task-b.txt").write_text("id: task-b\nsource: discord\nchannel_id: 4242\n")
+        self.assertEqual(ds.task_field(ws / "tasks", "task-b", "source"), "discord")
+        self.assertIsNone(self._p(ws))
+
+    def test_task_header_extraction_delegates_to_shared_parser(self):
+        import local_task_protocol as protocol
+        ws = _ws(tasks={"task-a.txt": "source: discord\ntask: historical task-mid\nchat_id: 4242\nsource: telegram\n"})
+        with mock.patch.object(protocol, "parse_task_headers_lenient", wraps=protocol.parse_task_headers_lenient) as parser:
+            self.assertEqual(ds.task_field(ws / "tasks", "task-a", "source"), "discord")
+            self.assertEqual(ds.task_field(ws / "tasks", "task-a", "chat_id"), "4242")
+        self.assertEqual(parser.call_count, 2)
+
     def test_a_real_reply_is_clean(self):
         ws = _ws(results={"task-a.txt": "[deduped: task-b]\n", "task-b.txt": "the reply\n"})
+        self.assertIsNone(self._p(ws))
+
+    def test_replied_holder_is_clean(self):
+        ws = _ws(results={"task-a.txt": "[deduped: task-b]\n", "task-b.txt": "[REPLIED]\n"})
         self.assertIsNone(self._p(ws))
 
     def test_a_non_dedup_result_is_clean(self):
         ws = _ws(results={"task-a.txt": "an ordinary reply\n"})
         self.assertIsNone(self._p(ws))
+
+    def test_telegram_cross_chat_replied_is_named(self):
+        ws = _ws(results={"task-a.txt": "[deduped: task-b]", "task-b.txt": "[REPLIED]"},
+                 tasks={"task-a.txt": "chat_id: -1001\nuser_id: alice\n",
+                        "task-b.txt": "chat_id: -1002\nuser_id: alice\n"})
+        self.assertIn("CROSS-ROOM", self._p(ws))
 
     def test_cross_room_is_named(self):
         """The failure that motivated sharing: the holder delivers correctly, in

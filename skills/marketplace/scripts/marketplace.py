@@ -137,11 +137,16 @@ class Context:
 
 
 def build_context(args: argparse.Namespace) -> Context:
-    base, token = cloud_auth.read_cloud_auth(_workspace())
+    auth = cloud_auth.read_cloud_auth(_workspace())
+    base, token = auth
+    refusal = None if token else cloud_auth.refusal_message(auth)
+    if refusal:
+        raise Usage(refusal)
     if not token:
         raise Usage(
-            "Not signed in to Sutando Cloud. Sign in from the desktop app (it opens the "
-            "Marketplace sign-in), then ask again."
+            "Not signed in to Sutando Cloud (probed "
+            f"{base or cloud_auth.resolve_cloud_origin()}). Sign in from the desktop app "
+            "(it opens the Marketplace sign-in), then ask again."
         )
     dest = Path(args.dest_root).expanduser().resolve() if args.dest_root else claude_home_path("skills")
     return Context(

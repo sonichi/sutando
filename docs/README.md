@@ -25,9 +25,10 @@ Machine-readable ownership and lifecycle metadata lives in
 - [Worker pool design notes](worker-pool-design-notes.md) — the record behind the v1 design: rejected alternatives, the failure model taken from the #3860 draft, and the owner decisions it encodes.
 - [Migration transition window](migration-transition-window.md) — 30-day reader fallback.
 - [Learn from demonstration](learn-from-demonstration.md) — owner-taught preference capture.
-- [Tutorial delivery](tutorial-delivery.md) — walkthrough procedure.
+- [Tutorial delivery](tutorial-delivery.md) — the `tutorial` skill: voice walkthrough and the AG2 Space Getting started page.
 - [Graceful shutdown](graceful-shutdown.md) — which restart path signals the core to exit cleanly.
 - [Proactive loop rationale](proactive-loop-rationale.md) — the measurements and incidents behind each step of `skills/proactive-loop/SKILL.md`, which itself carries only the commands.
+- [Task watcher hosting modes](task-watcher-hosting-modes.md) — session watcher vs the supervisor's standby: the tag, the two per-inbox verdicts, the readiness proof, the handoff contract and its timings, the known gaps.
 - [CLAUDE.md moved detail](claude-md-moved-detail.md) — verbatim parking for relocated snippets.
 - [Subagent delegation](subagent-delegation.md) — when to spawn a subagent and how to pick its model.
 
@@ -54,7 +55,9 @@ Machine-readable ownership and lifecycle metadata lives in
 
 ## Reference
 
+- [Connections: one install, several homeservers](connections.md)
 - [Host CLI bindings](host-cli-bindings.md)
+- [DotSpace homeservers](dotspace.md) — which homeservers are AG2-operated, the well-known block, the `core.dotspace` config.
 - [Remote gateway protocol](remote-gateway-protocol.md)
 - [Slack bridge](slack-bridge.md)
 - [Generated `src/` module map](src-map.md)
@@ -71,8 +74,10 @@ Machine-readable ownership and lifecycle metadata lives in
 - [Claude Code hook contract v1](runtime/claude-hook-contract-v1.md)
 - [Workspace two-space model](workspace-design.md)
 - [Core health verdict + severity gate](design-core-health-verdict.md)
+- [Health snapshot: `GET /health`](health-snapshot.md)
 - [Pointer Teacher design](pointer-teacher-design.md)
 - [Credential resolution by capability (G8)](design-credential-capability-resolver.md)
+- [holder_lock: the one flock-and-holder primitive](design-holder-lock.md)
 - [ADR 0001: Pointer Teacher brain](adr/0001-pointer-teacher-brain.md)
 
 ## Documentation contract
@@ -103,3 +108,12 @@ Run the audit locally:
 ```bash
 python3 skills/release/scripts/docs_audit.py
 ```
+
+## Local reliability evaluation
+
+- [Retained learning windows](learning-window.md) — optional collector and pending-evidence contract.
+- [Concluded reliability evaluation](reliability-v3-results.md) — Rui's full-day testimony, measured components and limitations.
+
+- [GitHub verification receipts](github-verification.md) — bounded PR evidence and governed foreground publication.
+
+- [Outstanding cron payload preservation](cron-outstanding-payload.md) — immutable prompt tasks until retirement.

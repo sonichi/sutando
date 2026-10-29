@@ -18,6 +18,11 @@ import pathlib
 import unittest
 from unittest import mock
 
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 SRC = (pathlib.Path(__file__).resolve().parents[1] /
        "skills" / "agent-room-ops" / "room_ops.py")
 

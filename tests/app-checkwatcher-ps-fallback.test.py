@@ -69,18 +69,34 @@ checks = {
     "a boundary match is DEFINITE only at exactly two tokens; more tokens are UNDECIDABLE (nil), never a false dead":
         match_fn is not None and "parts.count == 2 ? true : nil" in match_fn.group(1),
     "the aggregator does not let a later definite-false line override an earlier undecidable one":
-        fn is not None and "sawUndecidable" in fn.group(1) and "sawUndecidable ? nil : false" in fn.group(1),
+        fn is not None and "sawUndecidable = true" in fn.group(1) and "if sawUndecidable { return nil }" in fn.group(1),
+    # A tagged watcher is 4+ tokens: under the two-token rule alone the app could
+    # never see one as alive, so a tagged line must answer by its inbox.
+    "a line tagged for THIS core's inbox reads alive (the success path is reachable for tagged watchers)":
+        fn is not None and "sessionWatcherInboxTag(line)" in fn.group(1) and "if tagged == myInbox { return true }" in fn.group(1),
+    "a line tagged for ANOTHER inbox is foreign, not undecidable and not alive":
+        fn is not None and "sawForeignWatcher = true" in fn.group(1) and "sawForeignWatcher" in fn.group(1),
+    "the inbox this core answers for honours SUTANDO_TASKS_DIR, canonicalized":
+        fn is not None and 'environment["SUTANDO_TASKS_DIR"]' in fn.group(1) and "canonicalInbox(" in fn.group(1),
 }
+tag_fn = re.search(r"func sessionWatcherInboxTag\(.*?-> String\? \{(.*?)\n    \}\n", text, re.S)
+flag_fn = re.search(r"func flagValue\(.*?-> String\? \{(.*?)\n    \}\n", text, re.S)
+canon_fn = re.search(r"func canonicalInbox\(.*?-> String \{(.*?)\n    \}\n", text, re.S)
+checks["the inbox tag parser, its flag reader and the canonicalizer are separate, testable functions"] = \
+    tag_fn is not None and flag_fn is not None and canon_fn is not None
 
 # Behavioral negative control: actually execute the extracted matcher against
 # synthetic ps rows. `want` is Bool? -- nil rows assert the UNDECIDABLE case.
-if match_fn is not None and boundary_fn is not None:
+if match_fn is not None and boundary_fn is not None and tag_fn is not None and flag_fn is not None and canon_fn is not None:
     def _as_private(m):
         body = m.group(0)
         name = re.match(r"func (\w+)", body).group(1)
         return "private func " + name + body[len("func " + name):]
     harness = '''
 import Foundation
+%s
+%s
+%s
 %s
 %s
 
@@ -113,8 +129,32 @@ for (desc, line, want) in lines {
     print((ok ? "ok   " : "FAIL ") + desc + " (got \\(String(describing: got)), want \\(String(describing: want)))")
     if !ok { failures += 1 }
 }
+// The tagged-line reader: every post-upgrade watcher is 4+ tokens and is decided by its
+// inbox tag, not by token count. The canonical form is what both sides compare.
+// Real directories: an inbox exists by the time anyone compares it (the watcher
+// creates it), and only an existing path has symlinks to resolve.
+for d in ["/tmp/sut-app-test/ws/tasks", "/tmp/sut-app-test/other/tasks"] {
+    try? FileManager.default.createDirectory(atPath: d, withIntermediateDirectories: true)
+}
+let mine = canonicalInbox("/tmp/sut-app-test/ws/tasks")
+let tagged: [(String, String, String?)] = [
+    ("tagged for this inbox, plain path", "5001 bash /opt/s/src/watch-tasks-stream.sh --role session --inbox /tmp/sut-app-test/ws/tasks", mine),
+    ("tagged for this inbox, trailing slash and /private prefix still the same inbox", "5002 bash /opt/s/src/watch-tasks-stream.sh --role session --inbox /private/tmp/sut-app-test/ws//tasks/", mine),
+    ("tagged with the = form and a positional operand first", "5003 bash /opt/s/src/watch-tasks-stream.sh /tmp/sut-app-test/ws/tasks --role=session --inbox=/tmp/sut-app-test/ws/tasks", mine),
+    ("tagged inbox whose path contains a space (the default desktop root)", "5004 bash /Users/x/Library/Application Support/Sutando/src/watch-tasks-stream.sh --role session --inbox /Users/x/Library/Application Support/Sutando/workspace/tasks", canonicalInbox("/Users/x/Library/Application Support/Sutando/workspace/tasks")),
+    ("tagged for a DIFFERENT inbox is a different inbox", "5005 bash /opt/s/src/watch-tasks-stream.sh --role session --inbox /tmp/sut-app-test/other/tasks", canonicalInbox("/tmp/sut-app-test/other/tasks")),
+    ("role other than session carries no session tag", "5006 bash /opt/s/src/watch-tasks-stream.sh --role standby --inbox /tmp/sut-app-test/ws/tasks", nil),
+    ("untagged worker-style invocation has no tag", "5007 bash /opt/s/src/watch-tasks-stream.sh /tmp/sut-app-test/ws/tasks", nil),
+]
+for (desc, line, want) in tagged {
+    let got = sessionWatcherInboxTag(Substring(line))
+    let ok = got == want
+    print((ok ? "ok   " : "FAIL ") + desc + " (got \\(String(describing: got)), want \\(String(describing: want)))")
+    if !ok { failures += 1 }
+}
+try? FileManager.default.removeItem(atPath: "/tmp/sut-app-test")
 exit(failures == 0 ? 0 : 1)
-''' % (_as_private(match_fn), _as_private(boundary_fn))
+''' % (_as_private(match_fn), _as_private(boundary_fn), _as_private(tag_fn), _as_private(flag_fn), _as_private(canon_fn))
     tmp = pathlib.Path("/tmp/_watcherline_negative_control.swift")
     tmp.write_text(harness)
     try:

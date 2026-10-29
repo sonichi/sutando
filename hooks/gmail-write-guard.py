@@ -19,8 +19,12 @@ while reads work fine —
 Nothing in the tools' own descriptions warns about this; an install can only
 discover it by getting burned. This hook is the generalized version of the
 per-install block Michael built: deny the connector's Gmail write tools BEFORE
-they run, with a reason that points the model at the app-password IMAP/SMTP
-path (see docs/built-in-tools.md → Email) that actually works.
+they run, with a reason that points the model at the path that works.
+
+Where the write goes instead: the Station Gmail connector (``composio_find`` →
+``composio_exec``), a different tool name that this guard does not match. The
+app-password IMAP/SMTP path is the last resort, only when the Station tools are
+absent; an owner with Gmail connected must never be told to make one by hand.
 
 Scope — deliberately narrow:
   * Only MCP tools (``mcp__…``) whose server/tool name mentions gmail.
@@ -57,8 +61,14 @@ REASON = (
     "'insufficient authentication scopes'; create_draft has a documented history of "
     "drafts not matching what gets sent, incl. a wrong-recipient send — field report "
     "05cb849a). Gmail READS through the connector are fine and remain allowed. "
-    "For this write, use the app-password IMAP/SMTP path instead (docs/built-in-tools.md "
-    "-> Email: scripts using imaplib/smtplib with the vaulted app password). "
+    "For this write use the Station Gmail connector instead: composio_find "
+    "{apps:['gmail'], query:'<what you need>'} then composio_exec with the action it "
+    "returns (GMAIL_SEND_EMAIL, GMAIL_CREATE_EMAIL_DRAFT, the label/archive actions). "
+    "Gmail not connected there: the connect-apps skill (one Connect card; never ask "
+    "the owner for an app password). After a send, read the sent message back "
+    "(composio_find query 'fetch the sent message') and confirm recipient + subject "
+    "before reporting it sent. Only when the Station tools are unavailable, fall back "
+    "to the app-password IMAP/SMTP path (docs/built-in-tools.md -> Email). "
     "If the connector's OAuth scopes get fixed upstream, set "
     "SUTANDO_ALLOW_GMAIL_CONNECTOR_WRITES=1 to lift this guard. [gmail-write-guard]"
 )

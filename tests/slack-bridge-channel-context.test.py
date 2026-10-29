@@ -5,6 +5,11 @@ Set SUTANDO_TEST_SOURCE_ROOT to run this test against another checkout.
 """
 from __future__ import annotations
 
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import os
 import sys
@@ -222,7 +227,9 @@ def history_failure(**_kwargs):
 
 
 bridge.app.client.history_handler = history_failure
-failure_task_id, failure_body = write_owner_task(top_event, "Who is the client?")
+# Fresh ts: reusing top_event's ts would be replay-dropped by already_admitted.
+failure_event = dict(top_event, ts="3003.000")
+failure_task_id, failure_body = write_owner_task(failure_event, "Who is the client?")
 check("history failure still writes the task", bool(failure_task_id))
 check(
     "history failure tells the agent not to assume client/support roles",

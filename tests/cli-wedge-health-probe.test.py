@@ -2,6 +2,12 @@
 """health-check's cli-wedge probe: absent socket / unreadable pane are readings
 of nothing (ok), a static pane with work outstanding warns, a retry loop warns,
 and idle never does. The tmux and heartbeat seams are replaced with fakes."""
+
+from _helpers.hermetic_env import isolate_os_environ, isolated_child_env
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import json
 import os
@@ -34,7 +40,10 @@ class CliWedgeProbe(unittest.TestCase):
         import cli_wedge
         self._cli_wedge = cli_wedge
         self._saved_pid_ancestors = cli_wedge._pid_ancestors
-        cli_wedge._pid_ancestors = lambda: [os.getpid(), os.getppid()]
+        chain = [os.getpid(), os.getppid()]
+        cli_wedge._pid_ancestors = lambda: chain
+        # A fixed fake pane PID can equal a real ancestor on the runner; this one never does.
+        pane_pid = max(chain) + 1
         # The check reads time.time(); the fake clock advances 60 s per beat so runs last.
         self._saved_time = hc.time
         import time as _time
@@ -69,7 +78,7 @@ class CliWedgeProbe(unittest.TestCase):
             "    sys.stderr.write(\"can't find pane: \" + t + \"\\n\"); sys.exit(1)\n"
             "if 'display-message' in a:\n"
             "    fmt = a[-1]\n"
-            "    print(os.environ.get('FAKE_PANE_ID', '%987654') + ':' + os.environ.get('FAKE_PANE_PID', '4242')) if 'pane_id' in fmt else print('4242:1788000000'); sys.exit(0)\n"
+            f"    print(os.environ.get('FAKE_PANE_ID', '%987654') + ':' + os.environ.get('FAKE_PANE_PID', '{pane_pid}')) if 'pane_id' in fmt else print('{pane_pid}:1788000000'); sys.exit(0)\n"
             f"ff = pathlib.Path({str(self.frames_file)!r}); idx = pathlib.Path({str(self.idx)!r})\n"
             "frames = ff.read_text().split('\\n===\\n')\n"
             "i = int(idx.read_text()) if idx.exists() else 0\n"
@@ -83,7 +92,7 @@ class CliWedgeProbe(unittest.TestCase):
         else:
             self.tmux = script
         hc._resolve_tmux_bin = lambda *a, **k: str(self.tmux)
-        hc._resolve_launch_env = lambda: dict(os.environ)
+        hc._resolve_launch_env = lambda: isolated_child_env()
 
     def write_alive(self, label, socket, session):
         import time as _time
@@ -244,6 +253,14 @@ class CliWedgeProbe(unittest.TestCase):
 
     def test_an_outside_caller_still_samples(self):
         with patch.dict(os.environ, {"TMUX_PANE": "%1"}):
+            c = self.check()
+        self.assertFalse(c["detail"].startswith("skipped"), c["detail"])
+        self.assertTrue((self.ws / "state" / "cli-wedge" / "window.jsonl").exists())
+
+    def test_a_runner_parent_pid_equal_to_the_old_fixed_pane_pid_still_samples(self):
+        self.tearDown()
+        with patch("os.getppid", return_value=4242):
+            self.setUp()
             c = self.check()
         self.assertFalse(c["detail"].startswith("skipped"), c["detail"])
         self.assertTrue((self.ws / "state" / "cli-wedge" / "window.jsonl").exists())

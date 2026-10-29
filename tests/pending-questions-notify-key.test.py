@@ -11,6 +11,12 @@ the proactive file; the cooldown just never consulted it.
 
 Every assertion below FAILS on the pre-fix module (it takes no argument and ignores content).
 """
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import sys
 import time
@@ -18,7 +24,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "src"))
-spec = importlib.util.spec_from_file_location("cpq", REPO / "src" / "check-pending-questions.py")
+spec = importlib.util.spec_from_file_location("cpq", REPO / "skills" / "pending-questions" / "scripts" / "pending_questions_remind.py")
 cpq = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(cpq)
 

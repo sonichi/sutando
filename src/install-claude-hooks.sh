@@ -160,9 +160,6 @@ if ! command -v jq >/dev/null 2>&1; then
 fi
 
 mkdir -p "$REPO_DIR/.claude"
-# The PreCompact archive hook is a bare `cp`, which cannot create its own
-# destination; without this the archiver fails on every compaction, silently.
-mkdir -p "$HOME/Desktop/sutando-conversations"
 if [ ! -f "$SETTINGS" ]; then
   echo '{}' > "$SETTINGS"
 fi
@@ -361,6 +358,14 @@ for entry in "${DEPRECATED_HOOKS[@]}"; do
   mv "$TMP" "$SETTINGS"
   REMOVED=$((REMOVED + 1))
 done
+
+# A bare `cp` archiver (legacy, or an operator's own) cannot create its destination;
+# the managed archive-transcript.sh makes its own, so only the bare form gets one.
+if jq -e '(.hooks // {}).PreCompact // [] | map(.hooks // []) | flatten
+          | map((.command // "") | test("^cp .*sutando-conversations/")) | any' \
+     "$SETTINGS" >/dev/null 2>&1; then
+  mkdir -p "$HOME/Desktop/sutando-conversations"
+fi
 
 echo "install-claude-hooks: added=$ADDED skipped=$SKIPPED removed=$REMOVED → $SETTINGS"
 

@@ -130,6 +130,18 @@ class TestIncarnations(Base):
         with self.assertRaises(wi.IdentityError):
             wi.start_incarnation(self.ws, w, "unknown-session")
 
+    def test_only_codex_may_start_a_run_without_a_session_id(self):
+        w = self._worker()
+        with self.assertRaisesRegex(wi.IdentityError, "only a Codex incarnation"):
+            wi.start_incarnation(self.ws, w, None, runtime="claude")
+        self.assertEqual(wi.incarnations(self.ws, w), [])
+
+    def test_a_codex_run_without_a_session_id_requires_an_existing_worker(self):
+        w = wi.new_worker_id()
+        with self.assertRaisesRegex(wi.IdentityError, "has no identity record"):
+            wi.start_incarnation(self.ws, w, None, runtime="codex")
+        self.assertFalse(wi.worker_dir(self.ws, w).exists())
+
     def test_ending_records_why(self):
         w = self._worker()
         i = wi.start_incarnation(self.ws, w, "s1")
@@ -226,6 +238,15 @@ class TestCreateWorker(Base):
     def test_resuming_without_a_session_id_is_refused(self):
         with self.assertRaises(wi.IdentityError):
             wi.create_worker(self.ws, runtime="claude", resume=True)
+
+    def test_codex_refuses_caller_assigned_session_or_lineage(self):
+        for kwargs in ({"session_id": "provided"},
+                       {"session_id": "provided", "resume": True},
+                       {"session_id": "provided", "fork_from": "ancestor"}):
+            with self.subTest(kwargs=kwargs):
+                with self.assertRaisesRegex(wi.IdentityError, "caller-assigned session id"):
+                    wi.create_worker(self.ws, runtime="codex", **kwargs)
+        self.assertFalse((self.ws / "state" / "workers").exists())
 
     def test_two_workers_may_share_one_working_directory(self):
         a = wi.create_worker(self.ws, runtime="claude", cwd="/dev/proj")

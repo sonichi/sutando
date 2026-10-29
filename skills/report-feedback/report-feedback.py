@@ -28,13 +28,17 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Optional
 
 # Cloud session lookup lives in src/cloud_auth.py; the names stay importable
 # here because tests and the redirect guard read them off this module.
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 import cloud_auth  # noqa: E402
 from file_lock import locked_file  # noqa: E402
+from git_binary import git_argv  # noqa: E402
+from chat_secret_filter import SLACK_TOKEN_PATTERN  # noqa: E402
 
 # Hosts /api/feedback may redirect between. Credentials are re-sent ONLY to
 # these; any other target aborts rather than forwarding the owner's token.
@@ -49,9 +53,9 @@ RETIRED_CLOUD_ORIGINS = cloud_auth.RETIRED_CLOUD_ORIGINS
 SIGNED_OUT_SENTINEL = cloud_auth.SIGNED_OUT_SENTINEL
 
 # Owner prefs written by the desktop Settings UI (host is the single writer).
-# autoReport defaults ON; sendLogs defaults OFF. The log excerpt is the part
-# that carries incidental owner data, so it is opt-in rather than opt-out.
-PREFS_DEFAULTS = {"autoReport": True, "sendLogs": False, "askFirst": False}
+# Both default OFF: an automatic report leaves the machine, so absence of the
+# file or key is not consent. Only an explicit true from the Settings toggle files.
+PREFS_DEFAULTS = {"autoReport": False, "sendLogs": False, "askFirst": False}
 # Ask-first: an automatic report is parked as a draft and the owner gets a card
 # (File / File without logs / Skip) instead of a filing; the reply files or drops it.
 DRAFTS_DIR = "feedback-drafts"
@@ -75,6 +79,120 @@ ASK_ACTIONS = [
 AUTO_STATE_FILE = "feedback-auto-reports.json"
 AUTO_DEDUPE_WINDOW_S = 24 * 3600
 AUTO_DAILY_CAP = 5
+HISTORICAL_HOLD_S = 72 * 3600
+
+
+def _git(repo: Path, *args: str) -> Optional[str]:
+    # Without this guard git can walk up and report an unrelated parent repo.
+    if not (repo / ".git").exists():
+        return None
+    try:
+        return subprocess.check_output(
+            git_argv("-C", str(repo), *args), stderr=subprocess.DEVNULL,
+            timeout=2, text=True, env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
+        ).strip() or None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _read_json(path: Path) -> dict:
+    try:
+        value = json.loads(path.read_text())
+        return value if isinstance(value, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _read_text(path: Path) -> Optional[str]:
+    try:
+        return path.read_text().strip() or None
+    except (OSError, ValueError):
+        return None
+
+
+def _commit(value) -> Optional[str]:
+    return value if isinstance(value, str) and re.fullmatch(r"[0-9a-f]{40,64}", value) else None
+
+
+def build_versions(repo: Optional[Path] = None) -> dict:
+    """Report checkout identities and existing bundle provenance without guessing releases."""
+    repo = repo or Path(__file__).resolve().parents[2]
+    engine = repo.parent
+    desktop = engine.parent
+    hosted = engine.name == "engine"
+    manifest = _read_json(engine / "ENGINE_MANIFEST.json") if hosted else {}
+    bundled_sha = _commit(manifest.get("sha"))
+    host_sha = _commit(_read_text(engine / "build-id.txt")) if hosted else None
+    host_version = _read_text(engine / "ag2space-version.txt") if hosted else None
+    versions = {
+        "sutando": {"version": "unknown", "commit": bundled_sha or "unknown"},
+        "ag2space": {"version": host_version or "unknown", "commit": host_sha or "unknown"},
+    }
+    if bundled_sha:
+        versions["sutando"]["build"] = bundled_sha + ("-dirty" if manifest.get("dirty") is True else "")
+    for name, source in (("sutando", repo), ("ag2space", desktop)):
+        is_source = name == "sutando" or (hosted and (desktop / "src-tauri/tauri.conf.json").is_file())
+        if not is_source or not (source / ".git").exists():
+            continue
+        info = versions[name]
+        if info["commit"] != "unknown":
+            info["bundled_commit"] = info["commit"]
+            if info.get("build"):
+                info["bundled_build"] = info["build"]
+        description = _git(source, "describe", "--tags", "--always", "--dirty")
+        version = description if name == "sutando" else _read_json(source / "src-tauri/tauri.conf.json").get("version")
+        info.update(version=version if isinstance(version, str) and version else "unknown",
+                    commit=_git(source, "rev-parse", "HEAD") or "unknown")
+        info.pop("build", None)
+        if description:
+            info["build"] = description
+    return versions
+
+
+def body_with_versions(body: str, versions: dict) -> str:
+    """Keep build identities visible to mirrors that only consume the body."""
+    lines = [body, "", "### Build versions"]
+    for key, label in (("sutando", "Sutando"), ("ag2space", "AG2Space")):
+        info = versions.get(key, {})
+        info = info if isinstance(info, dict) else {}
+        line = f"- {label}: {info.get('version') or 'unknown'} (commit: {info.get('commit') or 'unknown'})"
+        if info.get("build"):
+            line += f"; build: {info['build']}"
+        if info.get("bundled_commit"):
+            line += f"; bundled commit: {info['bundled_commit']}"
+        if info.get("bundled_build"):
+            line += f"; bundled build: {info['bundled_build']}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def recovery_report_content(rec: dict) -> tuple[str, dict]:
+    """Describe the persisted hold interval without changing the draft or recovery state."""
+    recovery = dict(rec["payload"]["recovery"])
+    timestamps = {}
+    for key, value in (("observed_at", rec.get("created")), ("released", recovery.get("released"))):
+        try:
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError("unknown timestamp")
+            timestamps[key] = datetime.fromtimestamp(value, timezone.utc).isoformat().replace("+00:00", "Z")
+        except (ValueError, OverflowError, OSError):
+            value = None
+            timestamps[key] = "unknown"
+        recovery[key] = value
+    observed, released = recovery["observed_at"], recovery["released"]
+    elapsed = (released - observed if observed is not None and released is not None
+               and released >= observed else None)
+    recovery["held_seconds"] = elapsed
+    recovery["historical"] = elapsed >= HISTORICAL_HOLD_S if elapsed is not None else None
+    duration = str(timedelta(seconds=elapsed)) if elapsed is not None else "unknown"
+    lines = [rec["payload"]["body"], "", "### Automatic report timing",
+             f"- Original observation (UTC): {timestamps['observed_at']}",
+             f"- Released (UTC): {timestamps['released']}",
+             f"- Elapsed hold duration: {duration}"]
+    if recovery["historical"]:
+        lines.extend(["", "**Historical report:** Held for at least 72 hours. This describes an earlier "
+                      "observation and may not reflect the current state."])
+    return "\n".join(lines), recovery
 
 
 def _redact(text: str) -> str:
@@ -97,7 +215,11 @@ def _redact(text: str) -> str:
         r"\1\2\3<redacted>",
         text,
     )
-    # Common provider token formats (sk-..., xox*-..., xapp-..., ghp_..., github_pat_..., AIza...)
+    # Slack tokens come from the engine's one family definition, so a rotated
+    # xoxe.xoxp- or an xapp- token is scrubbed exactly as the bridges scrub it.
+    text = SLACK_TOKEN_PATTERN.sub("<redacted-token>", text)
+    # Broad backstop kept from before the shared family: this excerpt leaves the
+    # machine, so underscore, letter-first and prose-shaped xox lookalikes go too.
     text = re.sub(
         r"\b(sk|xox[a-z]|xapp|ghp|gho|ghs|github_pat)[_-][A-Za-z0-9_\-]{6,}",
         "<redacted-token>",
@@ -126,7 +248,7 @@ def resolve_workspace() -> Path:
 
 
 # Wrappers, not aliases: each hands its sibling down as the injected reader, so
-# patching _keychain_get / read_keychain_auth here still steers the chain.
+# patching _keychain_get here still steers the chain (every Keychain key is a candidate).
 _normalize_base = cloud_auth.normalize_base
 _fnv1a64 = cloud_auth.fnv1a64
 origin_vault_key = cloud_auth.origin_vault_key
@@ -142,7 +264,7 @@ def read_keychain_auth():
 
 
 def read_cloud_auth(ws: Path):
-    return cloud_auth.read_cloud_auth(ws, keychain_auth=read_keychain_auth)
+    return cloud_auth.read_cloud_auth(ws, keychain_get=_keychain_get)
 
 
 def why_no_logs(ws: Path) -> str:
@@ -170,13 +292,12 @@ def read_prefs(ws: Path) -> dict:
 
     Written by the desktop Settings toggles ("File automatic bug reports",
     "Send logs with bug reports"). Missing file, missing key, or a non-bool
-    value all read as PREFS_DEFAULTS: autoReport ON, sendLogs OFF.
+    value all read as PREFS_DEFAULTS: autoReport OFF, sendLogs OFF.
 
-    The two defaults differ on purpose. Absence of the file must never disable
-    REPORTING on installs that predate the toggles. But absence is not consent
-    either, and the log excerpt is the part that carries incidental owner data
-    (paths with usernames, hostnames, workspace content), so it is opt-in: an
-    owner who has never opened Settings ships no logs.
+    Absence is not consent. An automatic report sends the owner's error context
+    to the cloud, and the log excerpt adds incidental owner data (paths with
+    usernames, hostnames, workspace content), so both are opt-in: an owner who
+    has never turned the toggles on files nothing automatically.
     """
     prefs = dict(PREFS_DEFAULTS)
     try:
@@ -184,7 +305,6 @@ def read_prefs(ws: Path) -> dict:
         for k in prefs:
             if isinstance(d.get(k), bool):
                 prefs[k] = d[k]
-        # The room the ask-first card goes to (the owner's DM); a string, unlike the switches.
     except Exception:
         pass
     return prefs
@@ -196,6 +316,7 @@ def _drafts_dir(ws: Path) -> Path:
 
 def write_draft(ws: Path, payload: dict, now: float | None = None) -> str:
     """Park a report the owner has not approved yet; returns the draft id."""
+    payload = {**payload, "versions": build_versions()}
     d = _drafts_dir(ws)
     d.mkdir(parents=True, exist_ok=True)
     draft_id = f"fb_{uuid.uuid4().hex[:10]}"
@@ -278,25 +399,23 @@ def decision_for_reply(text: str) -> str | None:
 def hitl_manager(ws: Path):
     """The engine's HITL store: the bridge projects what is created here and applies the clicks."""
     _engine_modules()
-    from hitl.manager import HitlManager, HitlStore, default_store  # type: ignore
+    from hitl.cards import manager_for  # type: ignore
 
-    return HitlManager(HitlStore(default_store(ws)))
+    return manager_for(ws)
 
 
 def register_ask(ws: Path, draft_id: str, title: str, device: str) -> str:
     """One HumanRequirement per draft: the card the owner sees, keyed to the draft by guard."""
     _engine_modules()
-    from hitl.schema import Action, HumanRequirement  # type: ignore
+    from hitl.cards import create_choice  # type: ignore
 
-    req = HumanRequirement(
-        kind="choice", runtime=HITL_RUNTIME, title="File a bug report?",
-        message=f"I hit what looks like a Sutando/AG2 Space defect: {title}. File it to the team?",
-        guard=draft_id, device={"id": f"{HITL_RUNTIME}:{draft_id}", "name": device},
-        actions=[Action(id=a["id"], kind=a["kind"], label=a["label"]) for a in ASK_ACTIONS],
-        subject={"draft_id": draft_id, "title": title},
-        turn_on_action=True,  # the click reaches the core as a task, so the Stop hook runs at once
-    )
-    return hitl_manager(ws).create(req).id
+    # turn_on_action (the helper's default): the click reaches the core as a task, so the Stop hook runs at once
+    return create_choice(
+        f"I hit what looks like a Sutando/AG2 Space defect: {title}. File it to the team?",
+        ASK_ACTIONS, draft_id, {"draft_id": draft_id, "title": title},
+        runtime=HITL_RUNTIME, title="File a bug report?",
+        device={"id": f"{HITL_RUNTIME}:{draft_id}", "name": device}, manager=hitl_manager(ws),
+    ).id
 
 
 def requirement_for_draft(manager, draft_id: str):
@@ -315,18 +434,16 @@ HELD_ACTIONS = [
 def register_held(ws: Path, manager, draft_id: str, title: str, device: str) -> str:
     """The post got no answer: a new card says so and asks again. Same guard grammar with a suffix,
     so the store dedupes a repeat and the click's task path is the same one."""
-    from hitl.schema import Action, HumanRequirement  # type: ignore
+    _engine_modules()
+    from hitl.cards import create_choice  # type: ignore
 
-    req = HumanRequirement(
-        kind="choice", runtime=HITL_RUNTIME, title="Bug report: filed or not?",
-        message=(f"The report \"{title}\" was sent but no answer came back, so it may or may not be filed. "
-                 f"File it again, or skip it?"),
-        guard=f"{draft_id}:held", device={"id": f"{HITL_RUNTIME}:{draft_id}:held", "name": device},
-        actions=[Action(id=a["id"], kind=a["kind"], label=a["label"]) for a in HELD_ACTIONS],
-        subject={"draft_id": draft_id, "title": title, "held": True},
-        turn_on_action=True,
-    )
-    return manager.create(req).id
+    return create_choice(
+        (f"The report \"{title}\" was sent but no answer came back, so it may or may not be filed. "
+         f"File it again, or skip it?"),
+        HELD_ACTIONS, f"{draft_id}:held", {"draft_id": draft_id, "title": title, "held": True},
+        runtime=HITL_RUNTIME, title="Bug report: filed or not?",
+        device={"id": f"{HITL_RUNTIME}:{draft_id}:held", "name": device}, manager=manager,
+    ).id
 
 
 def apply_clicks(ws: Path, prefs: dict, device: str, *, release_automatic: bool = True) -> dict:
@@ -539,8 +656,23 @@ def logs_excerpt(ws: Path):
         return None, []
 
 
-def post_feedback(url: str, payload: dict, token: str, _hops: int = 0) -> int:
-    """POST the report, following one 307/308 hop itself.
+def reference_id(resp) -> str | None:
+    """The report's id from the feedback API's `{"ok": true, "id": ...}` answer, or None:
+    a 2xx whose body is unreadable or names no id is still a filed report."""
+    try:
+        ref = json.loads(resp.read() or b"{}").get("id")
+    except (OSError, ValueError, AttributeError, TypeError):
+        return None
+    return ref if isinstance(ref, str) and ref else None
+
+
+def reference_note(receipt: dict) -> str:
+    return f" Reference: {receipt['id']}." if receipt.get("id") else ""
+
+
+def post_feedback(url: str, payload: dict, token: str, _hops: int = 0,
+                  receipt: dict | None = None) -> int:
+    """POST the report, following one 307/308 hop itself; `receipt` gets the report's `id`.
 
     urllib only auto-follows 307/308 for GET/HEAD — for POST it raises instead,
     so a cloud host that redirects (sutando.ag2.ai -> .space) makes every report
@@ -558,6 +690,8 @@ def post_feedback(url: str, payload: dict, token: str, _hops: int = 0) -> int:
     )
     try:
         with urllib.request.urlopen(req, timeout=20) as r:
+            if receipt is not None:
+                receipt["id"] = reference_id(r)
             return r.status
     except urllib.error.HTTPError as e:
         if e.code not in (307, 308) or _hops >= 2:
@@ -582,7 +716,7 @@ def post_feedback(url: str, payload: dict, token: str, _hops: int = 0) -> int:
             raise RuntimeError(
                 f"refusing to forward credentials over {split.scheme or 'no'} scheme to {host!r}"
             ) from e
-        return post_feedback(nxt, payload, token, _hops + 1)
+        return post_feedback(nxt, payload, token, _hops + 1, receipt)
 
 
 def decide(ws: Path, prefs: dict, draft_id: str, choice: str, *, owner_approved: bool = True) -> int:
@@ -612,15 +746,26 @@ def decide(ws: Path, prefs: dict, draft_id: str, choice: str, *, owner_approved:
     if rec["payload"].get("recovery") and not recovery_ready(rec):
         print(f"HELD: incident {draft_id} is awaiting recovery.")
         return 3
-    base, token = read_cloud_auth(ws)
+    auth = read_cloud_auth(ws)
+    base, token = auth
+    refusal = None if token else cloud_auth.refusal_message(auth)
+    if refusal:
+        print(f"ACCOUNT_REFUSED: {refusal} The draft stays parked.")
+        return 2
     if not token:
-        print("NOT_SIGNED_IN: not signed in to Sutando Cloud — the draft stays parked; sign in, then retry.")
+        print(f"NOT_SIGNED_IN: not signed in to Sutando Cloud (probed {base or resolve_cloud_origin()}) — the draft stays parked; sign in, then retry.")
         return 2
     d = rec["payload"]
     ctx: dict = {"source": "core-agent", "platform": platform.platform(), "python": platform.python_version(),
                  "auto": bool(d.get("auto")), "owner_approved": owner_approved, "idempotency_key": draft_id}
+    ctx["versions"] = d.get("versions") or {
+        name: {"version": "unknown", "commit": "unknown"} for name in ("sutando", "ag2space")
+    }
+    body = d["body"]
     if d.get("recovery"):
         ctx["recovery"] = d["recovery"]
+        if d.get("auto"):
+            body, ctx["recovery"] = recovery_report_content(rec)
     with_logs = choice == "file" and prefs["sendLogs"] and not d.get("no_logs")
     if with_logs:
         excerpt, names = logs_excerpt(ws)
@@ -631,10 +776,11 @@ def decide(ws: Path, prefs: dict, draft_id: str, choice: str, *, owner_approved:
             ctx["logs_omitted"] = why_no_logs(ws)
     else:
         ctx["logs_opted_out"] = True
-    payload = {"kind": d["kind"], "severity": d["severity"], "title": d["title"], "body": d["body"], "context": ctx}
+    payload = {"kind": d["kind"], "severity": d["severity"], "title": d["title"], "body": body_with_versions(body, ctx["versions"]), "context": ctx}
     mark_posting(ws, draft_id)
+    receipt: dict = {}
     try:
-        status = post_feedback(f"{base.rstrip('/')}/api/feedback", payload, token)
+        status = post_feedback(f"{base.rstrip('/')}/api/feedback", payload, token, receipt=receipt)
     except urllib.error.HTTPError as e:
         if 400 <= e.code < 500:
             unmark_posting(ws, draft_id)  # a client error proves no write: the draft is a draft again
@@ -648,7 +794,7 @@ def decide(ws: Path, prefs: dict, draft_id: str, choice: str, *, owner_approved:
         print(f"ERROR: {e} — draft {draft_id} held as in flight (it may have been filed); --decide it.")
         return 1
     mark_filed(ws, draft_id)  # the ledger was written when the card was asked; the receipt guards the retry
-    print(f"OK: filed {d['kind']} report ({status}) from draft {draft_id}.")
+    print(f"OK: filed {d['kind']} report ({status}) from draft {draft_id}.{reference_note(receipt)}")
     return 0
 
 
@@ -746,12 +892,18 @@ def _main() -> None:
         print(f"ASKED: draft {draft_id} parked as {req_id}; the bridge delivers the card. After the owner answers, run --apply.")
         return
 
-    base, token = read_cloud_auth(ws)
+    auth = read_cloud_auth(ws)
+    base, token = auth
+    refusal = None if token else cloud_auth.refusal_message(auth)
+    if refusal:
+        print(f"ACCOUNT_REFUSED: {refusal}")
+        sys.exit(2)
     if not token:
-        print("NOT_SIGNED_IN: not signed in to Sutando Cloud — ask the user to sign in (Settings → Sutando Cloud), then retry.")
+        print(f"NOT_SIGNED_IN: not signed in to Sutando Cloud (probed {base or resolve_cloud_origin()}) — ask the user to sign in (Settings → Sutando Cloud), then retry.")
         sys.exit(2)
 
     ctx: dict = {"source": "core-agent", "platform": platform.platform(), "python": platform.python_version()}
+    ctx["versions"] = build_versions()
     if a.auto:
         ctx["auto"] = True
     if not a.no_logs and prefs["sendLogs"]:
@@ -776,14 +928,15 @@ def _main() -> None:
         # rejects null (400 invalid_payload). Mirror the desktop form, which
         # sends the trimmed body (possibly ""). Fall back to the title so an
         # empty-body report still carries context.
-        "body": a.body.strip() or a.title.strip(),
+        "body": body_with_versions(a.body.strip() or a.title.strip(), ctx["versions"]),
         "context": ctx,
     }
+    receipt: dict = {}
     try:
-        status = post_feedback(f"{base.rstrip('/')}/api/feedback", payload, token)
+        status = post_feedback(f"{base.rstrip('/')}/api/feedback", payload, token, receipt=receipt)
         if a.auto:
             record_auto_report(ws, a.title)
-        print(f"OK: filed {a.kind} report ({status}).")
+        print(f"OK: filed {a.kind} report ({status}).{reference_note(receipt)}")
     except urllib.error.HTTPError as e:
         print(f"ERROR: feedback API {e.code}: {e.read().decode(errors='replace')[:300]}")
         sys.exit(1)
