@@ -309,6 +309,18 @@ try:
         open(os.path.join(ch, ".env"), "w").write("REMOTE_TASK_TOKEN=abc\n")
         check("_gateway_configured: .env with token -> True",
               rh._gateway_configured() is True)
+        # The resolver pulls in shared/; a helper loading this module from a bare src copy
+        # has none, and the answer is "can't tell", never a crash.
+        _saved_resolver = sys.modules.get("channel_env_resolve")
+        sys.modules["channel_env_resolve"] = None
+        try:
+            check("_gateway_configured: resolver not importable -> None",
+                  rh._gateway_configured() is None)
+        finally:
+            if _saved_resolver is None:
+                sys.modules.pop("channel_env_resolve", None)
+            else:
+                sys.modules["channel_env_resolve"] = _saved_resolver
 finally:
     for k, val in _saved_env.items():
         if val is None:
