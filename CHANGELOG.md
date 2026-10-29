@@ -8,7 +8,7 @@ All notable changes are documented here. Format follows [Keep a Changelog](https
 
 **Headline: one install, several homeservers, and the move to s.space.** A core now keeps a
 directory of gateway connections, one bridge per homeserver, and can promote a new homeserver
-(s.space) to primary while the old bridge still runs, parking the old one instead of dropping it.
+(s.space) to primary while the old bridge keeps running, so the old homeserver's rooms still get answers.
 A terminal-run core gets the same move from the CLI. The release also brings Windows support, a
 local runtime daemon with a canonical CLI, a supervised multi-worker pool, a rebuilt voice relay,
 and decision cards for owner questions.
@@ -17,7 +17,7 @@ and decision cards for owner questions.
 
 ### Added
 
-- **Connections**: one connection list with one bridge per homeserver and a verified two-step add (preview, then confirm); a bridge starts as soon as its connection is added over HTTP or the runtime API; disconnect and reconnect keep the token; `promote` makes a new homeserver primary while the old bridge runs, then stops and parks it, rolling back on any failure; a fresh code for the legacy row's server re-adopts it into a named row; a desktop signed in only on a secondary homeserver lists its connection and owns its proactive messages; the list and health check say when a primary flip needs a relaunch or the legacy row is not primary. CLI: `scripts/connections.py`; reference: `docs/connections.md`. (#5861, #5882, #5927, #5966, #5969, #5970, #5972)
+- **Connections**: one connection list with one bridge per homeserver and a verified two-step add (preview, then confirm); a bridge starts as soon as its connection is added over HTTP or the runtime API; disconnect and reconnect keep the token; `promote` makes a new homeserver primary while the old bridge runs, keeps the old one running as a secondary (`promote --park` stops and parks it), rolling back on any failure; `park INSTANCE` and `park-legacy` (the final cutover) retire connections on demand; a fresh code for the legacy row's server re-adopts it into a named row; a desktop signed in only on a secondary homeserver lists its connection and owns its proactive messages; the list and health check say when a primary flip needs a relaunch or the legacy row is not primary. CLI: `scripts/connections.py`; reference: `docs/connections.md`. (#5861, #5882, #5927, #5966, #5969, #5970, #5972)
 - **DotSpace resolution**: homeservers are resolved per connection from a registry (`core.dotspace.instances`, with ag2.space and s.space built in) instead of a hardcoded ag2.space. (#5856)
 - **Windows** support across the core services and the Claude Code core. (#1789)
 - **Sutando Server v0**: a local runtime daemon with a canonical CLI, instance registry and base views; idempotent task submission, task previews and an unfinished-task listing. (#3303, #4488, #5595, #5646, #5750)
@@ -26,24 +26,29 @@ and decision cards for owner questions.
 - **Owner questions and decision cards**: pending questions live in a room database; `ask-owner.py --default/--option` asks by decision card and each click reaches exactly one consumer; the HITL engine answers real permission dialogs. (#3705, #3745, #5027, #5946, #5947)
 - **Health**: one read-only health snapshot per agent at `GET /health`; probes for stopped crons, unread inboxes, checkout drift, high system load, and per-host user-defined checks. (#3412, #3669, #4038, #4613, #4840, #4944, #5730)
 - **ag2-sparrow**: local Claude Code and Codex connectors (`ag2-sparrow-claude-local`, `ag2-sparrow-codex-local`), Claude routine and Codex adapters, a Hatch self-upgrade with offline rollback, and setup and wording served by the backend. (#5611, #5612, #5628, #5665, #5676, #5695, #5761, #5855, #5860, #5871)
-- **Skills**: marketplace (install skills and activate cloud tools from chat), connect-apps (connect the owner's apps from chat, two accounts per app), import-claude-context, room-doc and Room Commons verbs for agents (pages, sheets, databases, boards, comments, summon), agent-activity, owner-agent-consult, collaboration-intelligence, claude-pi, tutorial, and a developer-only skill audience. (#3265, #3395, #3943, #4127, #4258, #4283, #4480, #4598, #4667, #4780, #5293, #5597, #5725)
+- **Skills**: marketplace (install skills and activate cloud tools from chat), connect-apps (connect the owner's apps from chat, two accounts per app), import-claude-context, Room Commons verbs for agents (pages, sheets, databases, boards, comments, summon), agent-activity, owner-agent-consult, collaboration-intelligence, claude-pi, tutorial, and a developer-only skill audience. (#3265, #3395, #3943, #4127, #4258, #4283, #4480, #4598, #4667, #4780, #5293, #5597, #5725)
 - Codex cores and workers on macOS redeem an available earned reset when the weekly allowance is exhausted at least 24 hours before renewal; set `SUTANDO_CODEX_AUTO_RESET_ENABLED=0` and restart to disable it. (#4829)
 - Conduct rules: reply where asked, reply in the owner's language, state blockers plainly, check skills before refusing, name the queue position. `src/task_queue.py` owns the pending list behind the watcher's `QUEUE:` line, the activity card and the voice `work` tool. (#4392)
 
 ### Fixed
 
 - 648 fixes, concentrated in delivery, the gateway and bridges, the worker pool, voice, and health reporting. Notable: a bridge that died without releasing the poller lock no longer blocks its replacement for 90 s (#5313); a login-expired worker is reported, not respawned (#4885); web voice playback no longer adds a 16–20 kHz artifact on 48 kHz devices (#4240); voice answers "which room are you in?" from the room the session is bound to (#5713).
+- Connections follow the room: room tools, every gateway client and each named lane act through the connection serving the room's server, never the legacy one they inherited; MCP endpoint, owner and status readers follow the primary connection, not the legacy sidecar. (#5977, #5978, #5980, #5982, #5983)
+- A terminal Codex core starts the local agent API and resolves `CLAUDE_CONFIG_DIR`; restarting or healing a Codex core replaces only the core window and keeps sibling gateway windows. (#5976, #5979)
+- ag2-sparrow: Hatch install replaces a Sparrow serving another id or an older token, and its text names the product s.space. (#5990, #5998)
 - Native Calendar, Reminders and Contacts are never opened without the owner's consent; the morning briefing reads the Google calendar by default.
 
 ### Security
 
 - Slack app-level, refresh, config-refresh, legacy, browser-session and rotated tokens are redacted before a task file is written, from one shared pattern. (#4892)
 - Credentials are redacted in sync-workspace output; cloud auth never returns a credential for another user; decision-card click claims and tokens stay off the wire; gateway URLs shaped like credentials are refused. (#4904, #4905, #5263, #5851, #5955)
+- report-feedback: automatic bug reports now default OFF when `state/feedback-prefs.json` (or its `autoReport` key) is absent, so nothing is filed until the owner turns the Settings toggle on; `sendLogs` stays OFF. (#5992)
 
 ### Changed
 
 - **Upgrade action for some installs:** a host whose morning briefing relied on the local Calendar or Reminders app (no Google connector) sets `MORNING_BRIEFING_CALENDAR_SOURCE=macos` once, or the owner grants consent with `skills/macos-tools/scripts/native_pim_consent.py`.
-- **Moving to s.space:** a desktop install (v0.8.0-rc.17 or later) adds s.space from Settings → Connections → Add homeserver. A terminal-run core stays on ag2.space until its owner adds an s.space connection and promotes it (`docs/connections.md`). ag2.space keeps working during the transition.
+- **Moving to s.space:** a desktop install (v0.8.0-rc.17 or later) adds s.space from Settings → Connections → Add homeserver. A terminal-run core stays on ag2.space until its owner adds an s.space connection and promotes it (`docs/connections.md`). ag2.space keeps working during the transition, and the health check (`sspace-migration`) warns a terminal-run core that is still only on ag2.space. (#5971)
+- `promote` now keeps the old connection running as a secondary instead of parking it; pass `--park` for the previous behaviour. A message two lanes receive is answered by the lane its agent is addressed on, else the primary. (#5996)
 - The built-in voice model default is `gemini-3.8-live`; existing config files are unchanged. (#5442)
 - Discord's `other` access tier is spelled `guest`; readers still accept `other`. (#3926)
 - Per-user settings are also read from `<workspace>/sutando.config.local.json`, so they survive an engine replace. (#5111)

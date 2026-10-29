@@ -32,9 +32,88 @@ ALLOW: dict[str, "tuple[str, ...] | None"] = {
     "packages/ag2-sparrow/ag2_sparrow/dotspace.py": None,
     "src/health-check.py": ("ag2.space mobile", "ag2.space gateway not configured"),
     "skills/task-progress/scripts/notify.py": ("(e.g. dev.ag2.space)",),
-    "skills/skill-usage-report/manifest.json": ('"AG2_CLOUD_ORIGIN": "https://sutando.ag2.space"',),
-    "packages/ag2-sparrow/ag2_sparrow/adapters/hatch/cli.py": ("@my-agent:ag2.space", "@your-agent:ag2.space"),
-    "packages/ag2-sparrow/ag2_sparrow/adapters/hatch/ag2-sparrow-hatch.sh": ("@your-agent:ag2.space",),
+    "packages/ag2-sparrow/ag2_sparrow/adapters/hatch/cli.py": (
+        "@my-agent:ag2.space",
+        "@your-agent:ag2.space",
+        "(s.space listener)",
+        "the s.space Agent Portal",
+        "in an s.space room",
+        "no s.space room",
+        "the s.space gateway",
+        "agent's s.space MXID",
+    ),
+    "packages/ag2-sparrow/ag2_sparrow/adapters/hatch/ag2-sparrow-hatch.sh": (
+        "@your-agent:ag2.space",
+        "No s.space message reaches",
+        "s.space task(s) need answers",
+    ),
+    # The product name s.space in prose a person or agent reads, never a host a caller acts on.
+    "src/policy/guardrail.py": (
+        "\"s.space\", \"GUEST tier\"",
+        "the s.space broker attests",
+    ),
+    "packages/ag2-sparrow/ag2_sparrow/team_guardrail.py": (
+        "\"s.space\", \"GUEST tier\"",
+        "the s.space broker attests",
+    ),
+    "packages/ag2-sparrow/ag2_sparrow/adapters/claude_cloud_session/session_adapter.py": (
+        "standing s.space instructions",
+    ),
+    "packages/ag2-sparrow/ag2_sparrow/adapters/claude_code/ag2space-inbox/hooks/hooks.json": (
+        "s.space inbox connector",
+    ),
+    "packages/ag2-sparrow/ag2_sparrow/adapters/claude_code/ag2space-inbox/hooks/register.ts": (
+        "[s.space task ",
+        "an [s.space task ...]",
+        "one s.space task",
+    ),
+    "packages/ag2-sparrow/ag2_sparrow/adapters/claude_code/cli.py": (
+        "an s.space agent",
+        "code from s.space",
+        "the s.space backend URL",
+        "when s.space told",
+    ),
+    "packages/ag2-sparrow/ag2_sparrow/adapters/claude_code/inbox.py": (
+        "[s.space] This attempt",
+        "[s.space] The session",
+    ),
+    "packages/ag2-sparrow/ag2_sparrow/adapters/claude_code/shape.py": (
+        "as an s.space agent",
+    ),
+    "packages/ag2-sparrow/ag2_sparrow/adapters/claude_routine/routine_adapter.py": (
+        "owner's s.space ",
+    ),
+    "packages/ag2-sparrow/ag2_sparrow/adapters/codex/connect_cli.py": (
+        "as an s.space agent",
+        "as an s.space ",
+        "the s.space backend URL",
+        "code from s.space",
+        "when s.space told",
+    ),
+    "packages/ag2-sparrow/ag2_sparrow/adapters/hatch/builtin-runtime-text.json": (
+        "new s.space messages",
+        "owner's s.space DM",
+    ),
+    "packages/ag2-sparrow/ag2_sparrow/adapters/hatch/hook-definition.json": (
+        "new s.space messages",
+    ),
+    "packages/ag2-sparrow/ag2_sparrow/adapters/hatch/keepalive.py": (
+        "an s.space task",
+    ),
+    "packages/ag2-sparrow/ag2_sparrow/connect_bridge.py": (
+        "code in s.space once",
+    ),
+    "packages/ag2-sparrow/ag2_sparrow/connect_common.py": (
+        "removed in s.space;",
+        "the relay URL s.space returned",
+        "copy it from s.space again",
+        "\"s.space code: \"",
+        "s.space is still redeeming",
+        "s.space is busy",
+        "new one in s.space\"",
+        "s.space refused the code",
+        "s.space's answer",
+    ),
 }
 
 TEST_FILE = re.compile(r"(^test_.*\.py$)|(_test\.py$)|(\.test\.(py|ts)$)")

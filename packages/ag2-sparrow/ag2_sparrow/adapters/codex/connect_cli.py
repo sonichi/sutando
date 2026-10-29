@@ -37,7 +37,7 @@ SANDBOXES = ("read-only", "workspace-write")
 ENV_KEEP = ("PATH", "HOME", "USER")
 REQUIRED_KEYS = ("CODEX", "INBOX_DIR", "RESULTS_DIR")
 CONFIG_KEYS = ("CODEX", "INBOX_DIR", "RESULTS_DIR", "CODEX_HOME", "SANDBOX", "ALLOW_NON_OWNER", "MODEL") + cb.CONFIG_KEYS
-LOCAL = Shape(name=SHAPE, command=COMMAND, description="the Codex connector as an AG2 Space agent",
+LOCAL = Shape(name=SHAPE, command=COMMAND, description="the Codex connector as an s.space agent",
               cli="Codex CLI", min_version=MIN_CODEX, version_anchor=r"^codex",
               version_note="the app-server stdio shape was measured there", required_keys=REQUIRED_KEYS,
               config_keys=CONFIG_KEYS, env_keep=ENV_KEEP,
@@ -322,7 +322,7 @@ def session_options(p) -> None:
 
 
 def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(prog=COMMAND, description="The Codex connector on this machine as an AG2 Space "
+    ap = argparse.ArgumentParser(prog=COMMAND, description="The Codex connector on this machine as an s.space "
                                  "agent (Codex CLI %s+)." % _v(MIN_CODEX))
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("install", help="record the settings, write the unit, have the manager start the connector "
@@ -335,11 +335,11 @@ def main(argv=None) -> int:
     p.set_defaults(func=install, parser=p)
     c = sub.add_parser("connect", help="experimental, off in this release: refused unless enabled")
     c.add_argument("--experimental-connect", action="store_true", default=False, help=argparse.SUPPRESS)
-    c.add_argument("--base", help="the AG2 Space backend URL the code was issued by")
-    c.add_argument("--code", help="the one-time code from AG2 Space (starts with acp.): - reads it from stdin; "
+    c.add_argument("--base", help="the s.space backend URL the code was issued by")
+    c.add_argument("--code", help="the one-time code from s.space (starts with acp.): - reads it from stdin; "
                    "omitted, connect asks for it. A code given here is kept by ps and shell history")
     c.add_argument("--trust-relay-host", help="accept a relay URL on this host although it is not --base's host "
-                   "or under it (only when AG2 Space told you to)")
+                   "or under it (only when s.space told you to)")
     session_options(c)
     c.set_defaults(func=connect, parser=c)
     run_help = (f"what the manager runs: the launcher of the connector on its own app-server; refused unless "

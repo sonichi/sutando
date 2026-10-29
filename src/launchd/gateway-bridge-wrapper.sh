@@ -1,5 +1,5 @@
 #!/bin/bash
-# Wrapper for the launchd-managed ag2.space gateway bridge
+# Wrapper for the launchd-managed gateway bridge
 # (src/remote-gateway-bridge.py).
 #
 # Why a wrapper (not a bare ProgramArguments python3 call): the bridge needs

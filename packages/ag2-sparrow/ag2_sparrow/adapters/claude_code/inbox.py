@@ -24,9 +24,9 @@ from . import hmac_policy
 from .shape import LOCAL
 
 EXIT_OK, EXIT_REFUSED, EXIT_USAGE, EXIT_PROGRESS = 0, 1, 2, 3
-INTERRUPTED_BODY = ("[AG2 Space] This attempt was interrupted before the session answered; send the request "
+INTERRUPTED_BODY = ("[s.space] This attempt was interrupted before the session answered; send the request "
                     "again if it is still wanted.")
-PROTOCOL_FAILURE = "[AG2 Space] The session's turn ended without a reply (%s); send the request again if still wanted."
+PROTOCOL_FAILURE = "[s.space] The session's turn ended without a reply (%s); send the request again if still wanted."
 ROOT_VAR = "AG2_SPARROW_ROOT"
 CONFIG_DIR_VAR = "AG2_SPARROW_CONFIG_DIR"
 ALLOW_NON_OWNER = "ALLOW_NON_OWNER"

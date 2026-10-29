@@ -74,12 +74,12 @@ python3 skills/report-feedback/report-feedback.py --decide <draft-id> file|file_
 
 When **you** (not the user) determine that a bug or error is caused by Sutando itself or AG2 Space — engine services, bridges, the desktop app, AG2 Space connectivity, or the AG2 cloud — queue it with `--auto`. Never `--auto`-file problems in the user's own projects or code, third-party tools/sites/APIs, or expected failures (bad input, credentials the owner simply hasn't provided).
 
-`--auto` enforces the owner's Settings toggles (read from `<workspace>/state/feedback-prefs.json`, written by the desktop app). When the file is absent the two defaults differ:
+`--auto` enforces the owner's Settings toggles (read from `<workspace>/state/feedback-prefs.json`, written by the desktop app). When the file or a key is absent, both default OFF:
 
-- **File automatic bug reports** — defaults **ON**. Off → the script prints `SKIPPED` and exits 3. Respect it — do not retry or route around it.
+- **File automatic bug reports** — defaults **OFF** (absence of the prefs file is not consent). Off → the script prints `SKIPPED` and exits 3. Respect it — do not retry or route around it.
 - **Send logs with bug reports** — defaults **OFF**, i.e. opt-in. Off → the log excerpt is omitted from every report (auto and manual), same as `--no-logs`.
 
-The split is deliberate. Absence of the file must not disable reporting on installs that predate the toggles, but absence is not consent either, and the log excerpt is the part that carries incidental owner data — paths containing usernames, hostnames, workspace content. An owner who has never opened Settings ships no logs.
+Absence is not consent. An automatic report sends the owner's error context to the cloud, and the log excerpt adds incidental owner data — paths containing usernames, hostnames, workspace content. An owner who has never turned the toggles on files nothing automatically and ships no logs.
 
 Auto reports are also deduped (an identical title within 24h) and rate-limited (5 per 24h) via `<workspace>/state/feedback-auto-reports.json`. A `SKIPPED` exit (3) is a normal outcome, not an error — just move on. Only after `OK: filed` (not `HELD`), tell the owner in one short sentence (e.g. "I've filed a bug report about this"); the Settings toggle is the consent surface, so don't ask permission first.
 

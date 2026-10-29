@@ -83,6 +83,10 @@ does the privileged Matrix ops + authoritative membership enforcement.
 | `unreact <room> <event>` | remove the agent's reaction | discord remove-on-reply |
 | `join <room>` | accept the agent's own pending invite | discord guild-join on invite |
 
+On an install connected to several servers, a verb that names a room acts through the connection
+serving that room's server. `rooms`, `history`, `agents`, `resolve` and `events list|pull|stream`
+name none, so they act through the primary connection only.
+
 ```bash
 python3 skills/agent-room-ops/room_ops.py read   '!room:hs' --limit 20 --agent '@a:hs'
 python3 skills/agent-room-ops/room_ops.py fetch  'mxc://hs/abc' --room '!room:hs' --agent '@a:hs'

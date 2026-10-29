@@ -34,6 +34,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -423,6 +424,114 @@ class TestShellWrapper(_Base):
         self.assertNotEqual(r.returncode, 0)
         self.assertEqual(r.stdout.strip(), "")
         self.assertNotEqual(r.stderr.strip(), "")
+
+
+class TestRoomRouting(_Base):
+    """`--room` delegates the connection choice to `connections.connection_for_room`
+    and only maps its row onto a channel dir; the choice itself is pinned in
+    tests/connections-room-routing.test.py."""
+
+    def _row(self, instance, server):
+        return {"instance": instance, "server": server}
+
+    def _routed(self, answer=None, refuse=None):
+        import connections
+        asked = []
+
+        def fake(room_id, workspace=None):
+            asked.append(room_id)
+            if refuse:
+                raise connections.NoConnectionForRoom(refuse)
+            return answer
+        p = unittest.mock.patch.object(connections, "connection_for_room", fake)
+        p.start()
+        self.addCleanup(p.stop)
+        return asked
+
+    def test_named_connection_gets_its_own_channel_dir(self):
+        channels, _ = self._channel()
+        own = channels / "dev-s-space-ag2space"
+        own.mkdir()
+        (own / ".env").write_text(TOKEN_LINE)
+        (channels / "ag2space" / ".env").write_text(TOKEN_LINE)
+        asked = self._routed(self._row("dev-s-space", "dev.s.space"))
+        self.assertEqual(m.resolve_room_channel_env(channels, "ag2space", "!r:dev.s.space"), own / ".env")
+        self.assertEqual(asked, ["!r:dev.s.space"])
+
+    def test_legacy_connection_gets_the_ag2space_channel(self):
+        channels, chan = self._channel()
+        (chan / ".env").write_text(TOKEN_LINE)
+        self._routed(self._row("", "ag2.space"))
+        self.assertEqual(m.resolve_room_channel_env(channels, "s-space-ag2space", "!r:ag2.space"), chan / ".env")
+
+    def test_single_connection_keeps_the_given_source(self):
+        channels, chan = self._channel()
+        (chan / ".env").write_text(TOKEN_LINE)
+        self._routed(None)
+        self.assertEqual(m.resolve_room_channel_env(channels, "ag2space", "!r:example.org"), chan / ".env")
+
+    def test_named_connection_without_a_file_is_refused_by_name(self):
+        import connections
+        channels, chan = self._channel()
+        (chan / ".env").write_text(TOKEN_LINE)
+        self._routed(self._row("example-org", "example.org"))
+        with self.assertRaises(connections.NoConnectionForRoom) as cm:
+            m.resolve_room_channel_env(channels, "ag2space", "!r:example.org")
+        self.assertIn("example-org", str(cm.exception))
+
+    def test_cli_room_refusal_exits_one_with_nothing_on_stdout(self):
+        channels, chan = self._channel()
+        (chan / ".env").write_text(TOKEN_LINE)
+        self._routed(refuse="no connection for server other.net")
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = m.main(["x", str(channels), "ag2space", "--room", "!r:other.net"])
+        self.assertEqual((rc, out.getvalue()), (1, ""))
+        self.assertIn("other.net", err.getvalue())
+
+    def test_cli_room_success_prints_the_routed_path(self):
+        channels, _ = self._channel()
+        own = channels / "s-space-ag2space"
+        own.mkdir()
+        (own / ".env").write_text(TOKEN_LINE)
+        self._routed(self._row("s-space", "s.space"))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = m.main(["x", str(channels), "ag2space", "--room", "!r:s.space"])
+        self.assertEqual((rc, out.getvalue().strip()), (0, str(own / ".env")))
+
+    def test_cli_bad_room_flag_is_usage(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(m.main(["x", "c", "ag2space", "--nope", "r"]), 2)
+
+    def _stub_python(self) -> Path:
+        stub = self._tmpdir() / "py"
+        stub.write_text('#!/bin/sh\nshift\necho "$@"\n')
+        stub.chmod(0o755)
+        return stub
+
+    def _wrapper(self, *args, **env):
+        environ = isolated_child_env()
+        environ["CLAUDE_CONFIG_DIR"] = str(self._tmpdir())
+        environ.update(env)
+        return subprocess.run(["bash", str(REPO / "scripts" / "channel-env.sh"), *args],
+                              capture_output=True, text=True, env=environ)
+
+    def test_wrapper_hands_the_room_to_the_resolver(self):
+        r = self._wrapper("ag2space", "--room", "!r:dev.s.space", SUTANDO_PY=str(self._stub_python()))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue(r.stdout.strip().endswith("/channels ag2space --room !r:dev.s.space"), r.stdout)
+
+    def test_wrapper_without_room_passes_no_flag(self):
+        r = self._wrapper("ag2space", SUTANDO_PY=str(self._stub_python()))
+        self.assertTrue(r.stdout.strip().endswith("/channels ag2space"), r.stdout)
+
+    def test_wrapper_rejects_a_bare_room_flag(self):
+        for args in (("ag2space", "--room"), ("ag2space", "--room", ""), ("ag2space", "--x", "y")):
+            r = self._wrapper(*args)
+            self.assertEqual(r.returncode, 2, args)
+            self.assertEqual(r.stdout, "")
 
 
 if __name__ == "__main__":

@@ -1610,7 +1610,7 @@ REDEEM_BACKOFF_S = (1, 2, 4, 8, 16)     # one wait per 503 or 202 before the nex
 RETRY_AFTER_MAX_S = 30
 STANDALONE_TIER = "owner"   # no core on the host to cap it (plan 9.2); the key is required
 LOOPBACK_HOSTS = ("127.0.0.1", "::1", "localhost")
-GONE = {"agent_revoked": "the agent was removed in AG2 Space; add it again there for a new code"}
+GONE = {"agent_revoked": "the agent was removed in s.space; add it again there for a new code"}
 
 
 def endpoint_problem(url: str, what: str) -> str:
@@ -1634,13 +1634,13 @@ def _relay_host_ok(relay_host: str, base_host: str) -> bool:
 def relay_problem(base: str, relay_url: str, trusted_host: str = "") -> str:
     """'' when the relay URL the backend returned may be written: https, and on the base's host (or under it)
     unless the owner named its host with --trust-relay-host; else why not."""
-    why = endpoint_problem(relay_url, "the relay URL AG2 Space returned")
+    why = endpoint_problem(relay_url, "the relay URL s.space returned")
     if why:
         return why
     host = (urllib.parse.urlsplit(relay_url).hostname or "").lower()
     base_host = urllib.parse.urlsplit(base).hostname or ""
     if not _relay_host_ok(host, base_host) and host != trusted_host.lower():
-        return (f"the relay URL AG2 Space returned is on {host}, not {base_host} or a host under it; if that relay "
+        return (f"the relay URL s.space returned is on {host}, not {base_host} or a host under it; if that relay "
                 f"is expected, connect again with a new code and --trust-relay-host {host}")
     return ""
 
@@ -1651,7 +1651,7 @@ def code_problem(base: str, code: str) -> str:
     if why:
         return why
     if not (code or "").startswith(CODE_PREFIX) or len(code) <= len(CODE_PREFIX) or any(c.isspace() for c in code):
-        return f"the code is not an agent code (it starts with {CODE_PREFIX}); copy it from AG2 Space again"
+        return f"the code is not an agent code (it starts with {CODE_PREFIX}); copy it from s.space again"
     return ""
 
 
@@ -1664,7 +1664,7 @@ def read_code(arg, stdin=None, prompt=None) -> "tuple[str, str]":
     if arg is None:
         if not stdin.isatty():
             return "", "no code: pass --code - and pipe the code in, or run connect in a terminal to be asked for it"
-        return (prompt or getpass.getpass)("AG2 Space code: ").strip(), ""
+        return (prompt or getpass.getpass)("s.space code: ").strip(), ""
     print("warning: a code on the command line is kept by ps and shell history; next time use --code - or the "
           "prompt", file=sys.stderr)
     return arg.strip(), ""
@@ -1716,20 +1716,20 @@ def redeem_code(base: str, code: str, opener=None, sleep=None) -> "tuple[dict | 
             sleep(_retry_after(answer, wait) if status == 202 else wait)
             continue
         if status == 202:
-            return None, "AG2 Space is still redeeming the code; run connect again with the same code in a minute"
+            return None, "s.space is still redeeming the code; run connect again with the same code in a minute"
         if status == 503:
-            return None, "AG2 Space is busy (HTTP 503 on every try); the code is still valid, try again in a minute"
+            return None, "s.space is busy (HTTP 503 on every try); the code is still valid, try again in a minute"
         if status == 404:
             reason = next((answer[k] for k in ("error", "reason", "state") if isinstance(answer.get(k), str)), "")
-            return None, GONE.get(reason, "the code was already used or has expired; make a new one in AG2 Space")
+            return None, GONE.get(reason, "the code was already used or has expired; make a new one in s.space")
         if status != 200:
-            return None, f"AG2 Space refused the code (HTTP {status})"
+            return None, f"s.space refused the code (HTTP {status})"
         fields = {k: answer.get(k) for k in ("relay_url", "bearer", "agent_id")}
         for value in (fields["bearer"], fields["relay_url"]):
             if isinstance(value, str) and value:
                 diagnostics.register_secret(value)
         if not all(isinstance(v, str) and v.strip() for v in fields.values()):
-            return None, "AG2 Space's answer had no relay_url, bearer or agent_id; the code is spent, make a new one"
+            return None, "s.space's answer had no relay_url, bearer or agent_id; the code is spent, make a new one"
         diagnostics.register_gateway_url(fields["relay_url"])
         return {k: v.strip() for k, v in fields.items()}, ""
     return None, "unreachable"  # pragma: no cover - the loop always returns

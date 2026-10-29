@@ -822,7 +822,7 @@ def main() -> int:
           "AG2 Space has no NOTIFY step")
     # room_ops.py falls back to a channel env file only when url+token are
     # absent from the environment; WHICH file carries them differs per onboarding.
-    _env_hint = 'set -a; . "$(bash scripts/channel-env.sh ag2space)"; set +a'
+    _env_hint = 'set -a; . "$(bash scripts/channel-env.sh ag2space --room \'!room:ag2.space\')"; set +a'
     check(sum(_env_hint in ln for ln in sk.splitlines()) == 1,
           "the env prelude rides the sole gateway-calling step (context-first)")
     # CHANNEL_DIR defaults to "ag2space", so every assertion above passes even
@@ -835,7 +835,7 @@ def main() -> int:
     finally:
         rtc.CHANNEL_DIR, rtc.LOCAL_TIER = _saved_dir, _saved_tier2
     check("channel-env.sh dev-ag2space" in skd
-          and "channel-env.sh ag2space)" not in skd,
+          and "channel-env.sh ag2space " not in skd,
           "a non-default CHANNEL_DIR reaches the env prelude, not the default")
     check(sum("channel-env.sh dev-ag2space" in ln for ln in skd.splitlines()) == 1,
           "the sole gateway-calling step names the task's own channel dir, not the default")

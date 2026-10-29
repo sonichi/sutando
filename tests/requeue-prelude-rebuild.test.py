@@ -87,9 +87,9 @@ def _run_cases(build_requeued_task, render_skill_prelude):
     out = build_requeued_task(stored_task(), "task-dev~task-req222", 1,
                               "!other:dev.ag2.space", "task-holder",
                               channel_dir="dev-ag2space")
-    check("channel-env.sh dev-ag2space)" in out,
+    check("channel-env.sh dev-ag2space --room" in out,
           "requeued prelude names the injecting caller's lane")
-    check("channel-env.sh ag2space)" not in out,
+    check("channel-env.sh ag2space --room" not in out,
           "the birth prelude's superseded lane dir is gone")
     check(out.count("===SKILL INSTRUCTIONS") == 1,
           "exactly one prelude block after requeue")
@@ -126,15 +126,15 @@ def _run_cases(build_requeued_task, render_skill_prelude):
     out4 = build_requeued_task(diverged, "task-req555", 1,
                                "!other:dev.ag2.space", "task-holder",
                                channel_dir="ag2space")
-    check("channel-env.sh ag2space)" in out4,
+    check("channel-env.sh ag2space --room" in out4,
           "injected lane dir wins over a diverging source header")
-    check("channel-env.sh remote)" not in out4,
+    check("channel-env.sh remote --room" not in out4,
           "the broker PROVIDER fallback never names the lane")
 
     out5 = build_requeued_task(stored_task(source="slack"), "task-req666", 1,
                                "!other:dev.ag2.space", "task-holder",
                                channel_dir="ag2space")
-    check("channel-env.sh ag2space)" in out5 and "channel-env.sh slack)" not in out5,
+    check("channel-env.sh ag2space --room" in out5 and "channel-env.sh slack --room" not in out5,
           "cross-provider source header cannot steal the lane from the injected dir")
 
     # --- no injection: Slack/Discord write their own templates, so the
@@ -160,7 +160,7 @@ def _run_cases(build_requeued_task, render_skill_prelude):
     # opting out of injection is opting out of re-rendering entirely.
     out7 = build_requeued_task(stored_task(), "task-req888", 1,
                                "!other:dev.ag2.space", "task-holder")
-    check("channel-env.sh ag2space)" in out7,
+    check("channel-env.sh ag2space --room" in out7,
           "no injection -> even a stale gateway prelude is carried, not guessed")
 
     # --- renderer is the single owner: the bridge carries no inline template ---
