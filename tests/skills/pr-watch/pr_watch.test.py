@@ -458,6 +458,8 @@ class InProcess(_Tmp):
             self.st.config.write_text(json.dumps(cfg))
             os.kill(pid, signal.SIGHUP)
             time.sleep(2.5)
+            # A run.pid already gone at exit is tolerated.
+            self.st.runner_pid.unlink()
             os.kill(pid, signal.SIGTERM)
 
         t = threading.Thread(target=drive)
@@ -491,6 +493,68 @@ class InProcess(_Tmp):
             self.assertEqual(pw.cmd_run(self.st), 4)
         self.assertIn("another pr-watch runner is active", out.getvalue())
         self.assertEqual(self.calls("webhook forward"), [])
+
+    def test_forward_once_waits_on_a_hook_it_did_not_create(self):
+        self.hookfile.write_text("55\n")
+        delay, lines = self.forward()
+        self.assertEqual(delay, pw.CONFLICT_DELAY_S)
+        self.assertEqual(lines, ["PR_WATCH_NOTE acme/widgets: another webhook forwarder already holds "
+                                 "this repo (hook 55); GitHub allows one, retrying later"])
+        self.assertEqual(self.calls("api -X DELETE"), [])
+        self.assertEqual(self.calls("webhook forward"), [])
+
+    def test_loop_forwards_until_the_repo_is_gone_then_drops_its_record(self):
+        runner = pw.Runner(self.st)
+        gone = threading.Event()
+        pw.record_hooks(self.st, "acme/widgets", [91])
+        rounds = []
+
+        def once(repo):
+            rounds.append(repo)
+            if len(rounds) == 2:
+                gone.set()
+            return 0
+        with mock.patch.object(runner, "forward_once", side_effect=once):
+            runner.loop("acme/widgets", gone)
+        self.assertEqual(rounds, ["acme/widgets", "acme/widgets"])
+        self.assertEqual(self.calls("api -X DELETE"), ["api -X DELETE repos/acme/widgets/hooks/91"])
+
+    def test_stderr_reader_logs_and_flags_the_422(self):
+        runner = pw.Runner(self.st)
+        proc = subprocess.Popen([sys.executable, "-c", "import sys; sys.stderr.write('warn\\nHTTP 422: Hook already exists\\n')"],
+                                stderr=subprocess.PIPE, text=True)
+        flag = threading.Event()
+        path = self.state / "logs" / "x.err"
+        runner._stderr(proc, path, flag)
+        proc.wait()
+        self.assertTrue(flag.is_set())
+        self.assertEqual(path.read_text(), "warn\nHTTP 422: Hook already exists\n")
+
+    def test_record_keeps_only_the_new_forwarder_hook(self):
+        runner = pw.Runner(self.st)
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        self.addCleanup(lambda: (proc.kill(), proc.wait()))
+        self.hookfile.write_text("55\n77\n")
+        with mock.patch.object(pw.time, "sleep"):
+            runner._record("acme/widgets", [55], proc)
+        self.assertEqual(json.loads(self.st.hooks.read_text()), {"acme/widgets": [77]})
+
+    def test_shutdown_stops_live_forwarders_and_kills_one_that_ignores_sigterm(self):
+        runner = pw.Runner(self.st)
+        polite = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        stubborn = subprocess.Popen([sys.executable, "-c", "import signal, sys, time\n"
+                                     "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                                     "print('ready', flush=True)\ntime.sleep(60)"], stdout=subprocess.PIPE, text=True)
+        self.assertEqual(stubborn.stdout.readline().strip(), "ready")
+        self.addCleanup(stubborn.stdout.close)
+        runner.procs = {"acme/a": polite, "acme/b": stubborn}
+        pw.record_hooks(self.st, "acme/a", [5])
+        runner.shutdown()
+        self.assertTrue(runner.stop.is_set())
+        self.assertEqual(polite.returncode, -signal.SIGTERM)
+        self.assertEqual(stubborn.wait(timeout=5), -signal.SIGKILL)
+        self.assertEqual(json.loads(self.st.hooks.read_text()), {})
+        self.assertEqual(json.loads(self.st.forwarders.read_text()), {})
 
     def test_main_dispatches_run(self):
         with mock.patch.object(pw, "cmd_run", return_value=0) as run:
@@ -539,6 +603,21 @@ class Helpers(_Tmp):
         self.assertIsNone(other.poll())
         self.assertEqual(json.loads(st.forwarders.read_text()), {})
         self.assertFalse(pw.pid_alive(fwd.pid))
+
+    def test_pid_alive_counts_a_process_it_may_not_signal(self):
+        with mock.patch.object(pw.os, "kill", side_effect=PermissionError):
+            self.assertTrue(pw.pid_alive(4242))
+
+    def test_stale_forwarder_already_gone_is_skipped(self):
+        st = pw.State(self.state)
+        st.ensure()
+        pw.write_json(st.forwarders, {"acme/widgets": 4242})
+        with mock.patch.object(pw, "pid_alive", return_value=True), \
+                mock.patch.object(pw, "is_forwarder", return_value=True), \
+                mock.patch.object(pw.os, "kill", side_effect=ProcessLookupError) as kill:
+            pw.kill_stale_forwarders(st)
+        kill.assert_called_once_with(4242, signal.SIGTERM)
+        self.assertEqual(json.loads(st.forwarders.read_text()), {})
 
     def test_runner_pid_needs_a_live_pr_watch_process(self):
         st = pw.State(self.state)
