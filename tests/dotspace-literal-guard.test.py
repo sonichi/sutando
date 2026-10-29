@@ -34,6 +34,8 @@ ALLOW: dict[str, "tuple[str, ...] | None"] = {
     "skills/task-progress/scripts/notify.py": ("(e.g. dev.ag2.space)",),
     "packages/ag2-sparrow/ag2_sparrow/adapters/hatch/cli.py": ("@my-agent:ag2.space", "@your-agent:ag2.space"),
     "packages/ag2-sparrow/ag2_sparrow/adapters/hatch/ag2-sparrow-hatch.sh": ("@your-agent:ag2.space",),
+    "skills/tutorial/scripts/getting_started.py": ("A short tour of s.space",),
+    "skills/tutorial/scripts/tour_page.py": ("A short tour of s.space",),
 }
 
 TEST_FILE = re.compile(r"(^test_.*\.py$)|(_test\.py$)|(\.test\.(py|ts)$)")
