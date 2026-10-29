@@ -1,5 +1,5 @@
 import { test, expect } from 'claude-code/testing'
-import { Dedupe, DEFAULT_PROMPT, messageFor, takeEvents, takeLines, withContext } from '../hooks/register'
+import { Dedupe, messageFor, parseTemplate, takeEvents, takeLines, withContext } from '../hooks/register'
 
 test('only complete event lines are taken; the partial tail is carried', () => {
   const r = takeLines('noise\nPR_EVENT a/b#1 closed author=x head=abc merged=true\nPR_EVENT a/b#2 synch')
@@ -29,10 +29,21 @@ test('a repeated line inside the window is dropped, and passes again after it', 
   expect(d.fresh('PR_EVENT a/b#1 closed', 61_001)).toBe(true)
 })
 
-test('the prompt template fills {event}, and falls back to the default', () => {
+test('the prompt template fills {event}; with none yet the bare lines are sent', () => {
   expect(messageFor('see {event} now', ['PR_EVENT a/b#1 opened'])).toBe('see PR_EVENT a/b#1 opened now')
-  expect(messageFor(undefined, ['PR_EVENT x'])).toBe(DEFAULT_PROMPT.replace('{event}', 'PR_EVENT x'))
+  expect(messageFor(undefined, ['PR_EVENT x', 'PR_EVENT y'])).toBe('PR_EVENT x\nPR_EVENT y')
+  expect(messageFor('  ', ['PR_EVENT x'])).toBe('PR_EVENT x')
   expect(messageFor('no placeholder', ['PR_EVENT x'])).toBe('[pr-watch] PR_EVENT x\nno placeholder')
+})
+
+test('the runner template line is taken, the last one wins, and a bad one is ignored', () => {
+  const r = takeLines('PR_WATCH_PROMPT_TEMPLATE "one {event}"\nPR_WATCH_PROMPT_TEMPLATE "two\\n{event}"\nPR_EVENT a/b#1 opened\n')
+  expect(r.template).toBe('two\n{event}')
+  expect(r.events).toEqual(['PR_EVENT a/b#1 opened'])
+  expect(messageFor(r.template, r.events)).toBe('two\nPR_EVENT a/b#1 opened')
+  expect(takeLines('PR_WATCH_PROMPT_TEMPLATE {not json\nPR_EVENT x\n').template).toBe(undefined)
+  expect(takeLines('PR_EVENT x\n').template).toBe(undefined)
+  expect(parseTemplate('PR_WATCH_PROMPT_TEMPLATE 42')).toBe(undefined)
 })
 
 test('events that waited are joined into one message', () => {

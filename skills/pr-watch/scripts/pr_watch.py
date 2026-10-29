@@ -9,16 +9,22 @@ Subcommands:
   status                                                 runner, forwarders and recorded hook ids
   install-mod --mods-dir DIR                             write the Claude Code mod into DIR/pr-watch
   cleanup [--force]                                      delete the hook ids this skill recorded
+  config get [KEY] | config set KEY VALUE                read or set a setting (the config.json layer)
+  track --pr O/R#N [--author A] [--state S] [--head SHA8] [--verdict V] [--event TEXT] [--link URL]
+                                                         record a PR's outcome; publish the tracker page
   run                                                    the forwarder supervisor the mod spawns
 
-`run` prints one `PR_EVENT ...` line per relevant event on stdout and `PR_WATCH_NOTE ...` lines for
-problems the session should see. State lives in <workspace>/state/pr-watch/, never in the mod folder.
-Standard library only, plus the `gh` CLI with the cli/gh-webhook extension.
+`run` prints `PR_WATCH_PROMPT_TEMPLATE <json>` on start and on SIGHUP, one `PR_EVENT ...` line per
+relevant event, and `PR_WATCH_NOTE ...` lines for problems the session should see. State lives in
+<workspace>/state/pr-watch/, never in the mod folder. Settings: manifest.json `config`, read as
+CLI > env > manifest > config.json. Standard library only, plus `gh` with cli/gh-webhook.
 """
 from __future__ import annotations
 
 import argparse
+import datetime
 import fcntl
+import html
 import json
 import os
 import re
@@ -30,10 +36,28 @@ import threading
 import time
 from pathlib import Path
 from typing import Callable, Dict, FrozenSet, Iterable, List, Optional, Tuple
+from urllib.parse import urlparse
 
 SKILL_DIR = Path(__file__).resolve().parents[1]  # lint-workspace-resolution: allow-repo-root
+REPO_ROOT = SKILL_DIR.parents[1]
 MOD_SRC = SKILL_DIR / "mod"
 MOD_NAME = "pr-watch"
+
+
+def _is_state_copy(here: Path) -> bool:
+    return here.name == MOD_NAME and here.parent.name == "state"
+
+
+# install-mod copies the manifest beside the runner copy, which runs without a checkout around it.
+MANIFEST = (Path(__file__).resolve().parent / "manifest.json" if _is_state_copy(Path(__file__).resolve().parent)
+            else SKILL_DIR / "manifest.json")
+SETTINGS = ("PR_WATCH_PROMPT", "PR_WATCH_TRACKER_ROOM", "PR_WATCH_TRACKER_TITLE", "PR_WATCH_COMMONS_SCRIPT")
+TEMPLATE_MARK = "PR_WATCH_PROMPT_TEMPLATE "
+NOTE_MARK = "PR_WATCH_NOTE "
+COMMONS_TIMEOUT_S = 60
+TRACK_STATES = ("open", "merged", "closed")
+TRACK_VERDICTS = ("approved", "changes_requested", "commented", "none")
+PAGE_KIND_RE = re.compile(r"^html-[A-Za-z0-9_.-]+$")
 
 EVENTS = "pull_request,pull_request_review"
 PR_ACTIONS = ("opened", "synchronize", "reopened", "ready_for_review", "closed")
@@ -54,11 +78,9 @@ SKIP_IN_MOD = ("node_modules", "tsconfig.json", ".claude-plugin/types", "hooks/p
 REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 LOGIN_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})(?:\[bot\])?$")
 
-DEFAULT_PROMPT = (
-    "[pr-watch] {event}\n"
-    "Standing ask from the owner: keep watching these pull requests. If the head moved, re-review "
-    "at the new head. If a review was requested from the owner, review it. Note merges and closes. "
-    "Tell the owner only when something needs them; otherwise finish quietly."
+TRACK_HINT = (
+    " Then record the outcome: the pr-watch skill's `pr_watch.py track --pr <repo>#<n>` with --state, "
+    "--head, --verdict and --event."
 )
 
 
@@ -69,9 +91,9 @@ def resolve_state_dir(explicit: Optional[str] = None) -> Path:
         return Path(explicit).expanduser().resolve()
     here = Path(__file__).resolve().parent
     # The copy install-mod places in the state dir runs without a checkout around it.
-    if here.name == MOD_NAME and here.parent.name == "state":
+    if _is_state_copy(here):
         return here
-    sys.path.insert(0, str(SKILL_DIR.parents[1] / "src"))
+    sys.path.insert(0, str(REPO_ROOT / "src"))
     from workspace_default import resolve_workspace
     ws = resolve_workspace()
     return Path(ws) / "state" / MOD_NAME
@@ -86,6 +108,7 @@ class State:
         self.runner_pid = root / "run.pid"
         self.lock = root / "run.lock"
         self.logs = root / "logs"
+        self.tracker = root / "tracker.json"
 
     def ensure(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
@@ -115,8 +138,79 @@ def load_config(st: State) -> dict:
     if not isinstance(cfg, dict):
         raise SystemExit(f"pr-watch: {st.config} is not a JSON object")
     cfg.setdefault("watches", [])
-    cfg.setdefault("prompt", DEFAULT_PROMPT)
     return cfg
+
+
+# ---- settings --------------------------------------------------------------------------------
+
+def manifest_config() -> dict:
+    try:
+        cfg = json.loads(MANIFEST.read_text()).get("config") or {}
+    except (OSError, ValueError, AttributeError):
+        return {}
+    return cfg if isinstance(cfg, dict) else {}
+
+
+def setting_source(name: str, cli: Optional[str] = None, st: Optional[State] = None) -> Tuple[str, str]:
+    """(value, layer) for a setting, most specific first: CLI > env > manifest > config.json.
+
+    An empty value at any layer counts as unset, so the manifest's empty default falls through."""
+    if name not in SETTINGS:
+        raise SystemExit(f"pr-watch: unknown setting {name!r}; one of {', '.join(SETTINGS)}")
+    if cli:
+        return cli, "cli"
+    if os.environ.get(name):
+        return os.environ[name], "env"
+    declared = manifest_config().get(name)
+    if isinstance(declared, str) and declared:
+        return declared, "manifest"
+    if st is not None:
+        stored = (read_json(st.config, {}).get("settings") or {}).get(name)
+        if isinstance(stored, str) and stored:
+            return stored, "config.json"
+    return "", "unset"
+
+
+def setting(name: str, cli: Optional[str] = None, st: Optional[State] = None) -> str:
+    return setting_source(name, cli, st)[0]
+
+
+def prompt_template(st: State) -> str:
+    """The event prompt the mod fills `{event}` into; `{track}` is the tracker hint, when a room is set."""
+    t = setting("PR_WATCH_PROMPT", st=st)
+    return t.replace("{track}", TRACK_HINT if setting("PR_WATCH_TRACKER_ROOM", st=st) else "")
+
+
+def commons_script(st: State, cli: Optional[str] = None) -> Path:
+    p = Path(setting("PR_WATCH_COMMONS_SCRIPT", cli, st)).expanduser()
+    return p if p.is_absolute() else REPO_ROOT / p
+
+
+def cmd_config(st: State, action: str, key: Optional[str], value: Optional[str]) -> int:
+    if action == "get":
+        if key:
+            print(setting(key, st=st))
+            return 0
+        print(json.dumps({k: dict(zip(("value", "from"), setting_source(k, st=st))) for k in SETTINGS}, indent=2))
+        return 0
+    if not key or value is None:
+        raise SystemExit("pr-watch: config set KEY VALUE")
+    setting_source(key)
+    st.ensure()
+    cfg = load_config(st)
+    settings = cfg.setdefault("settings", {})
+    if value:
+        settings[key] = value
+    else:
+        settings.pop(key, None)
+    write_json(st.config, cfg)
+    notify_runner(st)
+    now, layer = setting_source(key, st=st)
+    if layer in ("env", "manifest") and now != value:
+        print(f"pr-watch: {key} saved, but the {layer} value still wins over config.json")
+    else:
+        print(f"{key} = {json.dumps(value)}")
+    return 0
 
 
 def _logins(values: Iterable[str]) -> List[str]:
@@ -426,7 +520,10 @@ class Runner:
             sys.stdout.flush()
 
     def note(self, text: str) -> None:
-        self.emit("PR_WATCH_NOTE " + text.replace("\n", " "))
+        self.emit(NOTE_MARK + text.replace("\n", " "))
+
+    def emit_template(self) -> None:
+        self.emit(TEMPLATE_MARK + json.dumps(prompt_template(self.st)))
 
     def _save_forwarders(self) -> None:
         with self.procs_lock:
@@ -559,10 +656,12 @@ def cmd_run(st: State) -> int:
     reload = threading.Event()
     signal.signal(signal.SIGHUP, lambda *_: reload.set())
     try:
+        runner.emit_template()
         runner.sync()
         while not runner.stop.wait(1):
             if reload.is_set():
                 reload.clear()
+                runner.emit_template()
                 runner.sync()
     finally:
         runner.shutdown()
@@ -570,6 +669,176 @@ def cmd_run(st: State) -> int:
             st.runner_pid.unlink()
         except OSError:
             pass
+    return 0
+
+
+# ---- tracker ---------------------------------------------------------------------------------
+
+PR_REF_RE = re.compile(r"^([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#([0-9]+)$")
+COLUMNS = ("PR", "Author", "State", "Head reviewed", "Verdict", "Last event", "Updated")
+
+TRACKER_CSS = """
+:root { --bg: #ffffff; --fg: #1f2328; --muted: #59636e; --line: #d1d9e0; --head: #f6f8fa;
+  --link: #0969da; --open: #1a7f37; --merged: #8250df; --closed: #cf222e; }
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #0d1117; --fg: #e6edf3; --muted: #9198a1; --line: #3d444d; --head: #151b23;
+    --link: #4493f8; --open: #3fb950; --merged: #ab7df8; --closed: #f85149; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; padding: 16px; background: var(--bg); color: var(--fg);
+  font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+h1 { font-size: 20px; margin: 0 0 4px; }
+.note { color: var(--muted); font-size: 12px; margin: 0 0 12px; }
+.wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+table { border-collapse: collapse; width: 100%; min-width: 640px; }
+th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { background: var(--head); font-weight: 600; white-space: nowrap; }
+a { color: var(--link); text-decoration: none; }
+code { font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; }
+.s-open { color: var(--open); } .s-merged { color: var(--merged); } .s-closed { color: var(--closed); }
+.empty { color: var(--muted); }
+"""
+
+
+def _now() -> str:
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _esc(value) -> str:
+    return html.escape("" if value is None else str(value), quote=True)
+
+
+def _link(url, label: str) -> str:
+    """An anchor for an http(s) url; anything else is the escaped label alone."""
+    try:
+        ok = isinstance(url, str) and urlparse(url).scheme in ("http", "https") and bool(urlparse(url).netloc)
+    except ValueError:
+        ok = False
+    return f'<a href="{_esc(url)}" rel="noopener noreferrer">{_esc(label)}</a>' if ok else _esc(label)
+
+
+def tracker_order(rows: Iterable[dict]) -> List[dict]:
+    """Open PRs first, then most recently updated first."""
+    by_time = sorted(rows, key=lambda r: str(r.get("updated_at") or ""), reverse=True)
+    return sorted(by_time, key=lambda r: r.get("state") != "open")
+
+
+def render_tracker(rows: Iterable[dict], title: str, now: str) -> str:
+    """A self-contained HTML page of the tracked PRs; every value is escaped."""
+    body = []
+    for r in tracker_order(rows):
+        label = f"{r.get('repo', '')}#{r.get('number', '')}"
+        state = str(r.get("state") or "")
+        cls = f' class="s-{state}"' if state in TRACK_STATES else ""
+        cells = [_link(r.get("link"), label), _esc(r.get("author")), f"<span{cls}>{_esc(state)}</span>",
+                 f"<code>{_esc(r.get('head'))}</code>", _esc(r.get("verdict")), _esc(r.get("event")),
+                 _esc(r.get("updated_at"))]
+        body.append("<tr>" + "".join(f"<td>{c}</td>" for c in cells) + "</tr>")
+    if not body:
+        body.append(f'<tr><td class="empty" colspan="{len(COLUMNS)}">No pull requests tracked yet.</td></tr>')
+    head = "".join(f"<th>{_esc(c)}</th>" for c in COLUMNS)
+    return ("<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n"
+            "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
+            "<meta name=\"color-scheme\" content=\"light dark\">\n"
+            f"<title>{_esc(title)}</title>\n<style>{TRACKER_CSS}</style>\n</head>\n<body>\n"
+            f"<h1>{_esc(title)}</h1>\n"
+            f"<p class=\"note\">Generated by pr-watch; edits here are overwritten. Updated {_esc(now)}.</p>\n"
+            f"<div class=\"wrap\"><table>\n<thead><tr>{head}</tr></thead>\n<tbody>\n"
+            + "\n".join(body) + "\n</tbody>\n</table></div>\n</body>\n</html>\n")
+
+
+class PublishError(Exception):
+    pass
+
+
+def _verb(args: List[str]) -> str:
+    return next((a for a in args if a in ("pages", "page-add", "read", "replace")), "room_commons")
+
+
+def run_commons(script: Path, args: List[str]) -> str:
+    try:
+        r = subprocess.run([sys.executable, str(script)] + args, capture_output=True, text=True,
+                           timeout=COMMONS_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        raise PublishError(f"{_verb(args)} timed out after {COMMONS_TIMEOUT_S}s")
+    except OSError as exc:
+        raise PublishError(f"{_verb(args)}: {exc}")
+    if r.returncode != 0:
+        why = (r.stderr or r.stdout or "").strip().splitlines()
+        raise PublishError(f"{_verb(args)} exited {r.returncode}: {why[-1] if why else 'no output'}")
+    return r.stdout
+
+
+def _commons_json(script: Path, args: List[str]):
+    out = run_commons(script, args)
+    try:
+        return json.loads(out)
+    except ValueError:
+        raise PublishError(f"{_verb(args)} printed no JSON")
+
+
+def publish_tracker(st: State, data: dict, room: str, title: str, script: Path) -> str:
+    """Write the whole tracker page into the room, creating it when it is missing."""
+    page = render_tracker(data.get("rows", {}).values(), title, _now())
+    kind = data.get("page_kind") if data.get("page_room") == room else None
+    if kind:
+        listed = _commons_json(script, ["--json", "pages", room])
+        if not isinstance(listed, list):
+            raise PublishError("pages printed no list")
+        if kind not in {p.get("kind") for p in listed if isinstance(p, dict)}:
+            kind = None
+    if not kind:
+        made = _commons_json(script, ["--json", "page-add", "--kind", "html", room, title])
+        kind = made.get("kind") if isinstance(made, dict) else None
+        if not isinstance(kind, str) or not PAGE_KIND_RE.match(kind):
+            raise PublishError(f"page-add returned no html page kind: {str(made)[:80]}")
+        data["page_kind"], data["page_room"] = kind, room
+        write_json(st.tracker, data)
+    got = _commons_json(script, ["--json", "--kind", kind, "read", room])
+    current = got.get("text") if isinstance(got, dict) else None
+    if not isinstance(current, str):
+        raise PublishError("read returned no page text")
+    if current != page:
+        run_commons(script, ["--kind", kind, "replace", "--", room, current, page])
+    return kind
+
+
+def cmd_track(st: State, args: argparse.Namespace) -> int:
+    m = PR_REF_RE.match(args.pr or "")
+    if not m:
+        raise SystemExit(f"pr-watch: --pr must be OWNER/REPO#N, got {args.pr!r}")
+    repo, number = m.group(1), int(m.group(2))
+    if args.author and not LOGIN_RE.match(args.author):
+        raise SystemExit(f"pr-watch: not a GitHub login: {args.author!r}")
+    st.ensure()
+    data = read_json(st.tracker, {})
+    if not isinstance(data, dict):
+        raise SystemExit(f"pr-watch: {st.tracker} is not a JSON object")
+    rows = data.setdefault("rows", {})
+    key = f"{repo}#{number}"
+    row = rows.get(key) or {"repo": repo, "number": number, "link": f"https://github.com/{repo}/pull/{number}"}
+    for field in ("author", "state", "head", "verdict", "event", "link"):
+        value = getattr(args, field)
+        if value is not None:
+            row[field] = value
+    row["updated_at"] = _now()
+    rows[key] = row
+    write_json(st.tracker, data)
+    room = setting("PR_WATCH_TRACKER_ROOM", args.room, st)
+    if not room:
+        print(f"recorded {key}; no tracker room set (PR_WATCH_TRACKER_ROOM), so nothing was published")
+        return 0
+    script = commons_script(st)
+    if not script.is_file():
+        print(f"{NOTE_MARK}tracker publish skipped: no room-commons script at {script} (PR_WATCH_COMMONS_SCRIPT)")
+        return 0
+    title = setting("PR_WATCH_TRACKER_TITLE", args.title, st) or "PR watch"
+    try:
+        kind = publish_tracker(st, data, room, title, script)
+    except PublishError as exc:
+        print(f"{NOTE_MARK}tracker publish failed: {str(exc)[:200]}; recorded {key}, the next track republishes")
+        return 0
+    print(f"recorded {key}; tracker published to {room} --kind {kind} ({len(rows)} PRs)")
     return 0
 
 
@@ -612,6 +881,7 @@ def cmd_install_mod(st: State, mods_dir: str) -> int:
         shutil.copyfile(src, out)
     runner = st.root / "pr_watch.py"
     shutil.copyfile(Path(__file__).resolve(), runner)
+    shutil.copyfile(MANIFEST, st.root / "manifest.json")
     (dest / "hooks").mkdir(parents=True, exist_ok=True)
     (dest / "hooks" / "paths.ts").write_text(
         "// Written by pr_watch.py install-mod; the state dir lives outside this folder.\n"
@@ -652,6 +922,20 @@ def main(argv: Optional[List[str]] = None) -> int:
     i.add_argument("--mods-dir", required=True)
     c = sub.add_parser("cleanup")
     c.add_argument("--force", action="store_true")
+    cf = sub.add_parser("config")
+    cf.add_argument("action", choices=("get", "set"))
+    cf.add_argument("key", nargs="?", choices=SETTINGS)
+    cf.add_argument("value", nargs="?")
+    t = sub.add_parser("track")
+    t.add_argument("--pr", required=True, help="OWNER/REPO#N")
+    t.add_argument("--author")
+    t.add_argument("--state", choices=TRACK_STATES)
+    t.add_argument("--head", help="the short sha that was reviewed")
+    t.add_argument("--verdict", choices=TRACK_VERDICTS)
+    t.add_argument("--event", help="what happened, in a few words")
+    t.add_argument("--link")
+    t.add_argument("--room", help="override PR_WATCH_TRACKER_ROOM")
+    t.add_argument("--title", help="override PR_WATCH_TRACKER_TITLE")
     sub.add_parser("run")
     args = ap.parse_args(argv)
     st = State(resolve_state_dir(args.state_dir))
@@ -682,6 +966,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         return cmd_install_mod(st, args.mods_dir)
     if args.cmd == "cleanup":
         return cmd_cleanup(st, args.force)
+    if args.cmd == "config":
+        return cmd_config(st, args.action, args.key, args.value)
+    if args.cmd == "track":
+        return cmd_track(st, args)
     return cmd_run(st)
 
 

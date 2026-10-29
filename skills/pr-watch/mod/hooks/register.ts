@@ -6,20 +6,28 @@ const RESPAWN_MS = 30_000
 // pr_watch.py run: 3 means gh or its webhook extension is missing, 4 that another runner holds the lock.
 const NO_RESPAWN = new Set([3, 4])
 
-export const DEFAULT_PROMPT =
-  '[pr-watch] {event}\n' +
-  'Standing ask from the owner: keep watching these pull requests. If the head moved, re-review at the new head. ' +
-  'If a review was requested from the owner, review it. Note merges and closes. ' +
-  'Tell the owner only when something needs them; otherwise finish quietly.'
+const TEMPLATE_MARK = 'PR_WATCH_PROMPT_TEMPLATE '
 
-/** The complete `PR_EVENT` and `PR_WATCH_NOTE` lines in `buffer`, and the unfinished tail. */
-export function takeLines(buffer: string): { events: string[]; notes: string[]; rest: string } {
+/** The template a `PR_WATCH_PROMPT_TEMPLATE <json>` line carries, or undefined when it carries none. */
+export function parseTemplate(line: string): string | undefined {
+  try {
+    const t: unknown = JSON.parse(line.slice(TEMPLATE_MARK.length))
+    return typeof t === 'string' ? t : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/** The complete event, note and template lines in `buffer`, and the unfinished tail; `template` is the last one sent. */
+export function takeLines(buffer: string): { events: string[]; notes: string[]; template?: string; rest: string } {
   const parts = buffer.split('\n')
   const rest = parts.pop() ?? ''
   const lines = parts.map((l) => l.trim())
+  const templates = lines.filter((l) => l.startsWith(TEMPLATE_MARK)).map(parseTemplate).filter((t) => t !== undefined)
   return {
     events: lines.filter((l) => l.startsWith('PR_EVENT ')),
     notes: lines.filter((l) => l.startsWith('PR_WATCH_NOTE ')).map((l) => l.slice('PR_WATCH_NOTE '.length)),
+    template: templates.length ? templates[templates.length - 1] : undefined,
     rest,
   }
 }
@@ -36,11 +44,11 @@ export class Dedupe {
   }
 }
 
-/** One message for any number of event lines, built from the config's template. */
+/** One message for any number of event lines, from the runner's template; the bare lines before one arrives. */
 export function messageFor(template: unknown, lines: readonly string[]): string {
-  const t = typeof template === 'string' && template.trim() ? template : DEFAULT_PROMPT
   const event = lines.join('\n')
-  return t.includes('{event}') ? t.split('{event}').join(event) : `[pr-watch] ${event}\n${t}`
+  if (typeof template !== 'string' || !template.trim()) return event
+  return template.includes('{event}') ? template.split('{event}').join(event) : `[pr-watch] ${event}\n${template}`
 }
 
 /** The message for the waiting lines, or null when none wait; the caller clears them once delivered. */
@@ -59,7 +67,7 @@ export function withContext<R extends CallResult>(r: R, text: string): R | null 
 // Module state: a reload starts these over, and session.start respawns the runner that fills them.
 let pending: string[] = []
 let turnRunning = false
-let template: unknown
+let template: string | undefined
 
 export const register: Register = (on) => {
   on('session.start', async ($, e, next) => {
@@ -78,16 +86,12 @@ export const register: Register = (on) => {
           if (r.done) { end = r.value as { code: number | null }; break }
           const piece = r.value
           if (piece.stream !== 'stdout') continue
-          const { events, notes, rest } = takeLines(buffer + piece.text)
-          buffer = rest
-          for (const n of notes) $.ui.log(`pr-watch: ${n}`)
-          for (const line of events) {
+          const taken = takeLines(buffer + piece.text)
+          buffer = taken.rest
+          if (taken.template !== undefined) template = taken.template
+          for (const n of taken.notes) $.ui.log(`pr-watch: ${n}`)
+          for (const line of taken.events) {
             if (!dedupe.fresh(line, await $.clock.now())) continue
-            try {
-              template = JSON.parse(await $.fs.read(`${STATE_DIR}/config.json`)).prompt
-            } catch {
-              template = undefined
-            }
             pending.push(line)
             if (turnRunning) continue
             const text = takeEvents(pending, template)

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """skills/pr-watch/scripts/pr_watch.py: the watch-config CLI, the event filter over fixture
 payloads for each forwarded event type, the JSON stream splitter, the hook-id record (only
-recorded ids are ever deleted, through a fake `gh` on PATH) and install-mod's file placement."""
+recorded ids are ever deleted, through a fake `gh` on PATH), install-mod's file placement, the
+settings precedence, the prompt template line, and the tracker (render, record, publish)."""
 import contextlib
 import importlib.util
 import io
@@ -36,6 +37,11 @@ def fixture(name):
 
 class _Tmp(unittest.TestCase):
     def setUp(self):
+        env = mock.patch.dict(os.environ)
+        env.start()
+        self.addCleanup(env.stop)
+        for key in pw.SETTINGS:
+            os.environ.pop(key, None)
         self._td = tempfile.TemporaryDirectory()
         self.addCleanup(self._td.cleanup)
         self.tmp = Path(self._td.name)
@@ -58,7 +64,7 @@ class ConfigCli(_Tmp):
         self.assertEqual(rc, 0)
         cfg = json.loads((self.state / "config.json").read_text())
         self.assertEqual(cfg["watches"], WATCHES)
-        self.assertIn("{event}", cfg["prompt"])
+        self.assertNotIn("prompt", cfg)
         rc, out, _ = self.cli("list")
         self.assertEqual(json.loads(out), WATCHES)
         rc, _, _ = self.cli("remove", "--repo", "ACME/widgets")
@@ -71,11 +77,11 @@ class ConfigCli(_Tmp):
         w = json.loads((self.state / "config.json").read_text())["watches"]
         self.assertEqual(w, [{"repo": "acme/widgets", "authors": ["alice", "dave"], "me": ["me1"]}])
 
-    def test_add_keeps_a_custom_prompt(self):
-        self.state.mkdir(parents=True)
-        (self.state / "config.json").write_text(json.dumps({"prompt": "custom {event}"}))
+    def test_add_keeps_stored_settings(self):
+        self.cli("config", "set", "PR_WATCH_TRACKER_ROOM", "!room:server")
         self.cli("add", "--repo", "acme/widgets", "--author", "alice")
-        self.assertEqual(json.loads((self.state / "config.json").read_text())["prompt"], "custom {event}")
+        cfg = json.loads((self.state / "config.json").read_text())
+        self.assertEqual(cfg["settings"], {"PR_WATCH_TRACKER_ROOM": "!room:server"})
 
     def test_bad_input_is_refused(self):
         self.assertNotEqual(self.cli("add", "--repo", "widgets", "--author", "a")[0], 0)
@@ -409,6 +415,7 @@ class InstallMod(_Tmp):
         runner = self.state / "pr_watch.py"
         self.assertTrue(runner.is_file())
         self.assertIn(json.dumps(str(runner.resolve())), paths)
+        self.assertEqual((self.state / "manifest.json").read_text(), pw.MANIFEST.read_text())
 
     def test_refuses_a_state_dir_inside_the_mod(self):
         mods = self.tmp / "dev-mods"
@@ -428,6 +435,8 @@ class InstallMod(_Tmp):
         m = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(m)
         self.assertEqual(m.resolve_state_dir(), self.state.resolve())
+        self.assertEqual(m.MANIFEST, (self.state / "manifest.json").resolve())
+        self.assertIn("{event}", m.setting("PR_WATCH_PROMPT"))
 
 
 RUN_GH = """#!/usr/bin/env python3
@@ -494,6 +503,9 @@ class Runner(_Tmp):
 
     def test_events_become_lines_and_the_recorded_hook_is_deleted_on_stop(self):
         self.start(["pull_request.labeled", "pull_request.opened", "pull_request_review.submitted"])
+        template = self.proc.stdout.readline().strip()
+        self.assertTrue(template.startswith(pw.TEMPLATE_MARK), template)
+        self.assertIn("{event}", json.loads(template[len(pw.TEMPLATE_MARK):]))
         first = self.proc.stdout.readline().strip()
         second = self.proc.stdout.readline().strip()
         self.assertEqual(first, "PR_EVENT acme/widgets#7 opened author=alice head=a1b2c3d4 merged=false reason=author")
@@ -509,6 +521,7 @@ class Runner(_Tmp):
 
     def test_a_hook_it_did_not_create_is_reported_and_never_deleted(self):
         self.start(["pull_request.opened"], preexisting="55\n")
+        self.assertTrue(self.proc.stdout.readline().startswith(pw.TEMPLATE_MARK))
         note = self.proc.stdout.readline().strip()
         self.assertTrue(note.startswith("PR_WATCH_NOTE acme/widgets: another webhook forwarder"), note)
         self.stop()
@@ -647,6 +660,8 @@ class InProcess(_Tmp):
         t.join()
         self.assertEqual(rc, 0)
         self.assertIn("PR_EVENT acme/widgets#7 opened", out.getvalue())
+        templates = [l for l in out.getvalue().splitlines() if l.startswith(pw.TEMPLATE_MARK)]
+        self.assertEqual(len(templates), 2, "one on start, one on SIGHUP")
         self.assertIn("api -X DELETE repos/acme/widgets/hooks/77", self.calls("api -X DELETE"))
         self.assertEqual(json.loads(self.st.hooks.read_text()), {})
         self.assertFalse(self.st.runner_pid.exists())
@@ -830,6 +845,281 @@ class Helpers(_Tmp):
             rc, out, _ = self.cli("cleanup")
         self.assertEqual(rc, 1)
         self.assertIn('could not delete: {"acme/widgets": [11]}', out)
+
+
+class Settings(_Tmp):
+    """CLI > env > manifest.json config > config.json, with an empty value at any layer unset."""
+
+    def manifest(self, **config):
+        path = self.tmp / "manifest.json"
+        path.write_text(json.dumps({"name": "pr-watch", "config": config}))
+        patch = mock.patch.object(pw, "MANIFEST", path)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def test_each_layer_beats_the_ones_below_it(self):
+        st = pw.State(self.state)
+        self.manifest(PR_WATCH_TRACKER_TITLE="")
+        self.assertEqual(pw.setting_source("PR_WATCH_TRACKER_TITLE", st=st), ("", "unset"))
+        self.cli("config", "set", "PR_WATCH_TRACKER_TITLE", "from-config")
+        self.assertEqual(pw.setting_source("PR_WATCH_TRACKER_TITLE", st=st), ("from-config", "config.json"))
+        self.manifest(PR_WATCH_TRACKER_TITLE="from-manifest")
+        self.assertEqual(pw.setting_source("PR_WATCH_TRACKER_TITLE", st=st), ("from-manifest", "manifest"))
+        os.environ["PR_WATCH_TRACKER_TITLE"] = "from-env"
+        self.assertEqual(pw.setting_source("PR_WATCH_TRACKER_TITLE", st=st), ("from-env", "env"))
+        self.assertEqual(pw.setting("PR_WATCH_TRACKER_TITLE", "from-cli", st), "from-cli")
+        os.environ["PR_WATCH_TRACKER_TITLE"] = ""
+        self.assertEqual(pw.setting("PR_WATCH_TRACKER_TITLE", st=st), "from-manifest")
+
+    def test_the_shipped_manifest_declares_every_setting(self):
+        cfg = json.loads(pw.MANIFEST.read_text())["config"]
+        self.assertEqual(sorted(cfg), sorted(pw.SETTINGS))
+        self.assertIn("{event}", cfg["PR_WATCH_PROMPT"])
+        self.assertIn("{track}", cfg["PR_WATCH_PROMPT"])
+        self.assertEqual(cfg["PR_WATCH_TRACKER_ROOM"], "")
+        self.assertEqual(pw.commons_script(pw.State(self.state)),
+                         REPO / "skills" / "room-commons" / "scripts" / "room_commons.py")
+
+    def test_an_unknown_setting_is_refused(self):
+        with self.assertRaises(SystemExit):
+            pw.setting("PR_WATCH_NOPE")
+        self.assertEqual(self.cli("config", "set", "PR_WATCH_NOPE", "x")[0], 2)
+
+    def test_config_set_and_get(self):
+        rc, out, _ = self.cli("config", "set", "PR_WATCH_TRACKER_ROOM", "!room:server")
+        self.assertEqual((rc, out.strip()), (0, 'PR_WATCH_TRACKER_ROOM = "!room:server"'))
+        self.assertEqual(self.cli("config", "get", "PR_WATCH_TRACKER_ROOM")[1].strip(), "!room:server")
+        every = json.loads(self.cli("config", "get")[1])
+        self.assertEqual(every["PR_WATCH_TRACKER_ROOM"], {"value": "!room:server", "from": "config.json"})
+        self.assertEqual(every["PR_WATCH_TRACKER_TITLE"]["from"], "manifest")
+        self.cli("config", "set", "PR_WATCH_TRACKER_ROOM", "")
+        self.assertEqual(self.cli("config", "get", "PR_WATCH_TRACKER_ROOM")[1].strip(), "")
+        self.assertEqual(json.loads((self.state / "config.json").read_text())["settings"], {})
+
+    def test_config_set_says_when_a_higher_layer_still_wins(self):
+        os.environ["PR_WATCH_TRACKER_ROOM"] = "!env:server"
+        rc, out, _ = self.cli("config", "set", "PR_WATCH_TRACKER_ROOM", "!room:server")
+        self.assertEqual(rc, 0)
+        self.assertIn("the env value still wins", out)
+
+    def test_config_set_signals_a_live_runner(self):
+        with mock.patch.object(pw, "notify_runner") as notify:
+            self.cli("config", "set", "PR_WATCH_TRACKER_ROOM", "!room:server")
+        notify.assert_called_once()
+
+
+class TemplateLine(_Tmp):
+    def emitted(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            pw.Runner(pw.State(self.state)).emit_template()
+        line = out.getvalue()
+        self.assertTrue(line.startswith(pw.TEMPLATE_MARK) and line.endswith("\n") and line.count("\n") == 1, line)
+        return json.loads(line[len(pw.TEMPLATE_MARK):])
+
+    def test_the_runner_emits_the_resolved_template_as_one_json_line(self):
+        t = self.emitted()
+        self.assertTrue(t.startswith("[pr-watch] {event}\n"))
+        self.assertNotIn("{track}", t)
+        self.assertNotIn("track --pr", t)
+
+    def test_the_tracker_hint_appears_only_with_a_room(self):
+        self.cli("config", "set", "PR_WATCH_TRACKER_ROOM", "!room:server")
+        t = self.emitted()
+        self.assertIn(pw.TRACK_HINT, t)
+        self.assertNotIn("{track}", t)
+
+    def test_env_overrides_the_template(self):
+        os.environ["PR_WATCH_PROMPT"] = "custom {event}{track}"
+        self.assertEqual(self.emitted(), "custom {event}")
+
+
+FAKE_COMMONS = r"""
+import json, os, sys
+store_path, log = os.environ["FAKE_COMMONS_STORE"], os.environ["FAKE_COMMONS_LOG"]
+with open(log, "a") as fh:
+    fh.write(json.dumps(sys.argv[1:]) + "\n")
+store = json.load(open(store_path)) if os.path.exists(store_path) else {"pages": {}, "n": 0}
+a, kind = sys.argv[1:], "html"
+while a[0].startswith("--"):
+    if a[0] == "--kind":
+        kind = a[1]; a = a[2:]
+    else:
+        a = a[1:]
+verb, a = a[0], a[1:]
+if verb == os.environ.get("FAKE_COMMONS_FAIL"):
+    sys.stderr.write("boom: no credential\n"); sys.exit(2)
+def save():
+    json.dump(store, open(store_path, "w"))
+if verb == "pages":
+    print(json.dumps([{"id": None, "kind": "html", "title": "Main"}] +
+                     [{"id": k[5:], "kind": k, "title": v["title"]} for k, v in store["pages"].items()]))
+elif verb == "page-add":
+    assert a[:2] == ["--kind", "html"], a
+    store["n"] += 1
+    k = "html-p%d" % store["n"]
+    store["pages"][k] = {"title": a[3], "text": ""}
+    save(); print(json.dumps({"ok": True, "id": k[5:], "kind": k, "title": a[3], "folder": None}))
+elif verb == "read":
+    print(json.dumps({"chars": 0, "peers": [], "text": store["pages"][kind]["text"]}))
+elif verb == "replace":
+    assert a[0] == "--", a
+    room, old, new = a[1:]
+    text = store["pages"][kind]["text"]
+    if old not in text:
+        sys.stderr.write("text to replace is not in the document\n"); sys.exit(1)
+    store["pages"][kind]["text"] = text.replace(old, new, 1)
+    save(); print(json.dumps({"ok": True}))
+"""
+
+
+class Tracker(_Tmp):
+    def setUp(self):
+        super().setUp()
+        self.script = self.tmp / "fake_commons.py"
+        self.script.write_text(FAKE_COMMONS)
+        self.store = self.tmp / "store.json"
+        self.log = self.tmp / "commons.log"
+        os.environ.update({"FAKE_COMMONS_STORE": str(self.store), "FAKE_COMMONS_LOG": str(self.log),
+                           "PR_WATCH_COMMONS_SCRIPT": str(self.script)})
+        self.ticks = iter(f"2026-01-01T00:00:{i:02d}Z" for i in range(60))
+        patch = mock.patch.object(pw, "_now", side_effect=lambda: next(self.ticks))
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def track(self, *argv):
+        return self.cli("track", *argv)
+
+    def data(self):
+        return json.loads((self.state / "tracker.json").read_text())
+
+    def verbs(self):
+        if not self.log.exists():
+            return []
+        return [next(a for a in json.loads(l) if not a.startswith("-") and not a.startswith("html"))
+                for l in self.log.read_text().splitlines()]
+
+    def page(self, kind):
+        return json.loads(self.store.read_text())["pages"][kind]["text"]
+
+    def test_unset_room_only_records(self):
+        rc, out, _ = self.track("--pr", "acme/widgets#7", "--author", "alice", "--state", "open")
+        self.assertEqual(rc, 0)
+        self.assertEqual(out.strip(), "recorded acme/widgets#7; no tracker room set (PR_WATCH_TRACKER_ROOM), "
+                                      "so nothing was published")
+        self.assertEqual(self.data()["rows"]["acme/widgets#7"]["author"], "alice")
+        self.assertEqual(self.verbs(), [])
+
+    def test_upsert_keeps_earlier_fields_and_stamps_updated_at(self):
+        self.track("--pr", "acme/widgets#7", "--author", "alice", "--state", "open", "--head", "a1b2c3d4")
+        self.track("--pr", "acme/widgets#8", "--author", "bob", "--state", "merged")
+        self.track("--pr", "acme/widgets#7", "--verdict", "approved", "--event", "re-reviewed")
+        rows = self.data()["rows"]
+        self.assertEqual(sorted(rows), ["acme/widgets#7", "acme/widgets#8"])
+        self.assertEqual(rows["acme/widgets#7"], {
+            "repo": "acme/widgets", "number": 7, "link": "https://github.com/acme/widgets/pull/7",
+            "author": "alice", "state": "open", "head": "a1b2c3d4", "verdict": "approved",
+            "event": "re-reviewed", "updated_at": "2026-01-01T00:00:02Z"})
+        self.assertEqual(rows["acme/widgets#8"]["updated_at"], "2026-01-01T00:00:01Z")
+
+    def test_order_is_open_first_then_newest(self):
+        rows = [{"repo": "a/b", "number": 1, "state": "merged", "updated_at": "2026-01-03T00:00:00Z"},
+                {"repo": "a/b", "number": 2, "state": "open", "updated_at": "2026-01-01T00:00:00Z"},
+                {"repo": "a/b", "number": 3, "state": "open", "updated_at": "2026-01-02T00:00:00Z"},
+                {"repo": "a/b", "number": 4, "state": "closed", "updated_at": "2026-01-04T00:00:00Z"}]
+        self.assertEqual([r["number"] for r in pw.tracker_order(rows)], [3, 2, 4, 1])
+
+    def test_bad_input_is_refused(self):
+        self.assertNotEqual(self.track("--pr", "acme/widgets")[0], 0)
+        self.assertNotEqual(self.track("--pr", "acme/widgets#7", "--state", "draft")[0], 0)
+        self.assertNotEqual(self.track("--pr", "acme/widgets#7", "--author", "<x>")[0], 0)
+        self.assertFalse((self.state / "tracker.json").exists())
+
+    def test_render_escapes_every_value_and_links_only_http(self):
+        rows = [{"repo": "acme/widgets", "number": 7, "author": "<script>alert(1)</script>", "state": "open",
+                 "head": "a1b2", "verdict": "approved", "event": "pushed <script>x()</script> & more",
+                 "link": "javascript:alert(1)", "updated_at": "2026-01-01T00:00:00Z"},
+                {"repo": "acme/widgets", "number": 8, "state": "merged", "link": "https://github.com/acme/widgets/pull/8",
+                 "updated_at": "2026-01-01T00:00:00Z"}]
+        out = pw.render_tracker(rows, "Title <b>", "2026-01-02T00:00:00Z")
+        self.assertNotIn("<script>", out)
+        self.assertNotIn("<b>", out)
+        self.assertIn("&lt;script&gt;alert(1)&lt;/script&gt;", out)
+        self.assertIn("pushed &lt;script&gt;x()&lt;/script&gt; &amp; more", out)
+        self.assertNotIn("javascript:", out)
+        self.assertIn("<td>acme/widgets#7</td>", out)
+        self.assertIn('<a href="https://github.com/acme/widgets/pull/8" rel="noopener noreferrer">acme/widgets#8</a>', out)
+        self.assertIn("@media (prefers-color-scheme: dark)", out)
+        self.assertIn('name="viewport"', out)
+        self.assertIn("Generated by pr-watch; edits here are overwritten.", out)
+        self.assertLess(out.index("acme/widgets#7"), out.index("acme/widgets#8"))
+
+    def test_render_with_no_rows_says_so(self):
+        self.assertIn("No pull requests tracked yet.", pw.render_tracker([], "PR watch", "now"))
+
+    def test_first_publish_creates_the_page_then_later_ones_replace_it(self):
+        self.cli("config", "set", "PR_WATCH_TRACKER_ROOM", "!room:server")
+        rc, out, _ = self.track("--pr", "acme/widgets#7", "--author", "alice", "--state", "open")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("tracker published to !room:server --kind html-p1", out)
+        self.assertEqual(self.verbs(), ["page-add", "read", "replace"])
+        self.assertEqual(json.loads(self.log.read_text().splitlines()[0]),
+                         ["--json", "page-add", "--kind", "html", "!room:server", "PR watch"])
+        self.assertEqual((self.data()["page_kind"], self.data()["page_room"]), ("html-p1", "!room:server"))
+        self.assertIn("acme/widgets#7", self.page("html-p1"))
+        self.log.unlink()
+        self.track("--pr", "acme/widgets#8", "--author", "bob", "--state", "merged")
+        self.assertEqual(self.verbs(), ["pages", "read", "replace"])
+        text = self.page("html-p1")
+        self.assertEqual(text.count("<!doctype html>"), 1)
+        self.assertIn("acme/widgets#7", text)
+        self.assertIn("acme/widgets#8", text)
+
+    def test_a_removed_page_is_created_again(self):
+        self.cli("config", "set", "PR_WATCH_TRACKER_ROOM", "!room:server")
+        self.track("--pr", "acme/widgets#7", "--state", "open")
+        store = json.loads(self.store.read_text())
+        del store["pages"]["html-p1"]
+        self.store.write_text(json.dumps(store))
+        rc, out, _ = self.track("--pr", "acme/widgets#7", "--state", "merged")
+        self.assertIn("--kind html-p2", out)
+        self.assertEqual(self.data()["page_kind"], "html-p2")
+
+    def test_a_new_room_gets_its_own_page(self):
+        self.cli("config", "set", "PR_WATCH_TRACKER_ROOM", "!room:server")
+        self.track("--pr", "acme/widgets#7", "--state", "open")
+        self.log.unlink()
+        rc, out, _ = self.track("--pr", "acme/widgets#7", "--room", "!other:server")
+        self.assertEqual(self.verbs(), ["page-add", "read", "replace"])
+        self.assertEqual(self.data()["page_room"], "!other:server")
+
+    def test_a_failed_publish_keeps_the_row_and_exits_zero(self):
+        self.cli("config", "set", "PR_WATCH_TRACKER_ROOM", "!room:server")
+        os.environ["FAKE_COMMONS_FAIL"] = "page-add"
+        rc, out, _ = self.track("--pr", "acme/widgets#7", "--author", "alice", "--state", "open")
+        self.assertEqual(rc, 0)
+        self.assertEqual(out.strip(), "PR_WATCH_NOTE tracker publish failed: page-add exited 2: boom: no credential; "
+                                      "recorded acme/widgets#7, the next track republishes")
+        self.assertIn("acme/widgets#7", self.data()["rows"])
+        self.assertNotIn("page_kind", self.data())
+        os.environ.pop("FAKE_COMMONS_FAIL")
+        self.track("--pr", "acme/widgets#8", "--state", "open")
+        self.assertIn("acme/widgets#7", self.page("html-p1"))
+
+    def test_a_publish_that_times_out_is_a_note(self):
+        self.cli("config", "set", "PR_WATCH_TRACKER_ROOM", "!room:server")
+        with mock.patch.object(pw.subprocess, "run", side_effect=subprocess.TimeoutExpired("x", 60)):
+            rc, out, _ = self.track("--pr", "acme/widgets#7")
+        self.assertEqual(rc, 0)
+        self.assertIn("PR_WATCH_NOTE tracker publish failed: page-add timed out after 60s", out)
+
+    def test_a_missing_commons_script_is_noted_and_skipped(self):
+        self.cli("config", "set", "PR_WATCH_TRACKER_ROOM", "!room:server")
+        os.environ["PR_WATCH_COMMONS_SCRIPT"] = str(self.tmp / "nope.py")
+        rc, out, _ = self.track("--pr", "acme/widgets#7")
+        self.assertEqual(rc, 0)
+        self.assertTrue(out.startswith("PR_WATCH_NOTE tracker publish skipped: no room-commons script"), out)
+        self.assertIn("acme/widgets#7", self.data()["rows"])
 
 
 if __name__ == "__main__":
