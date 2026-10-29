@@ -45,6 +45,28 @@ class ValidateTests(Base):
                                      for k, v in rec().items()}))
         self.assertNotIn("extra", out)
 
+    def test_completed_task_is_optional_bounded_and_contains_only_metadata(self):
+        receipt = {"prompt_sha256": "a" * 64, "accepted_at": NOW - 8,
+                   "completed_at": NOW - 3, "core_incarnation": "42:Tue Oct  6 02:00:00 2026"}
+        self.assertEqual(ro.validate(rec(completed_task=receipt))["completed_task"], receipt)
+        self.assertNotIn("completed_task", ro.validate(rec(completed_task=None)))
+        self.assertEqual(ro.validate(rec(completed_task={**receipt, "prompt": "private"}))["completed_task"], receipt)
+        for change in ({"prompt_sha256": "x" * 64}, {"prompt_sha256": "a" * 63},
+                       {"core_incarnation": ""}, {"core_incarnation": "x" * 161},
+                       {"core_incarnation": "42\nsecret"}, {"accepted_at": True},
+                       {"accepted_at": NOW}, {"completed_at": NOW + 1},
+                       {"completed_at": float("nan")}):
+            with self.assertRaises(ValueError):
+                ro.validate(rec(completed_task={**receipt, **change}))
+        for state in ({"phase": "requesting"}, {"motion": "moving"},
+                      {"condition": "abnormal", "reason": "quota-limit"}):
+            with self.assertRaises(ValueError):
+                ro.validate(rec(completed_task=receipt, **state))
+        self.assertTrue(ro.write(rec(completed_task=receipt), self.ws))
+        stored, why = ro.load(self.ws, "core", NOW)
+        self.assertIsNone(why)
+        self.assertEqual(stored["completed_task"], receipt)
+
     def test_bad_values_reject_the_whole_record(self):
         for over in ({"schema": 2}, {"seat": "worker"}, {"seat": WID.upper()}, {"seat": WID[:-1]},
                      {"phase": "sleeping"}, {"motion": "fast"}, {"condition": "ok"}, {"reason": "boom"},

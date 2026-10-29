@@ -10571,7 +10571,12 @@ def check_codex_task_notifier() -> dict:
                 "session could not be verified"
             ),
         }
-    return _probe_codex_task_notifier(target)
+    probe = _probe_codex_task_notifier(target)
+    from delivery.codex_pickup import warning
+    stalled = warning(WORKSPACE_DIR)
+    if stalled and probe["status"] == "ok":
+        return {"name": "codex-task-notifier", "status": "warn", "detail": stalled}
+    return probe
 
 
 def _claude_runtime_selected() -> bool:

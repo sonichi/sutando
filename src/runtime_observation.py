@@ -81,6 +81,23 @@ def validate(record) -> dict:
         out[key] = record[key]
     if (out["condition"] == "abnormal") != (out["reason"] is not None):
         raise ValueError("reason is required exactly when abnormal")
+    completed = record.get("completed_task")
+    if completed is not None:
+        if not isinstance(completed, dict):
+            raise ValueError("bad completed_task")
+        digest = completed.get("prompt_sha256")
+        incarnation = completed.get("core_incarnation")
+        accepted, finished = completed.get("accepted_at"), completed.get("completed_at")
+        if (not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest)
+                or not isinstance(incarnation, str) or not 1 <= len(incarnation) <= 160
+                or "\n" in incarnation or "\r" in incarnation
+                or not _epoch(accepted) or not _epoch(finished)
+                or accepted > finished or finished > out["heartbeat_at"]
+                or out["phase"] != "idle" or out["motion"] != "idle"
+                or out["condition"] != "healthy"):
+            raise ValueError("bad completed_task")
+        out["completed_task"] = {"prompt_sha256": digest, "core_incarnation": incarnation,
+                                 "accepted_at": float(accepted), "completed_at": float(finished)}
     return out
 
 

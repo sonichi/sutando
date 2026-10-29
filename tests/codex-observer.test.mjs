@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
 import fs from 'node:fs';
+import crypto from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -281,7 +282,7 @@ test('discovery keeps only open rollouts, only their classification, and retries
   await o.discover();
   assert.equal(o.target, null, 'an unreadable sibling could be a second top-level rollout');
   assert.deepEqual([...o.metas.keys()], ['/main']);
-  assert.deepEqual(o.metas.get('/main'), {parent_thread_id: null, agent_path: null});
+  assert.deepEqual(o.metas.get('/main'), {parent_thread_id: null, agent_path: null, subagent: false});
   metas['/sub'] = {id: 's', parent_thread_id: 'm'};
   await o.discover();
   assert.equal(o.target, '/main', 'repaired as a subagent');
@@ -389,4 +390,141 @@ test('fileDeps.write runs the engine writer with the workspace and the record on
   assert.deepEqual(fs.readFileSync(out, 'utf8').split('\n'),
     ['/eng/src/runtime_observation.py', 'write', '--workspace', '/ws dir', '{"seat":"core"}']);
   fs.rmSync(dir, {recursive: true});
+});
+
+const receiptStart = (id = 'turn-a') => [ev('task_started', {turn_id: id}),
+  {type: 'turn_context', payload: {turn_id: id}}];
+const userInput = (text = 'synthetic task prompt') => item('message', '2026-10-06T02:57:51.000Z',
+  {role: 'user', content: [{type: 'input_text', text}]});
+const receiptEnd = (id = 'turn-a') => [said('2026-10-06T02:57:52.000Z'),
+  ev('task_complete', {turn_id: id}, '2026-10-06T02:57:53.000Z')];
+const receiptIdent = {observerId: 'o', startedAt: 1, session: 's', coreIncarnation: '42:Tue Oct  6 02:00:00 2026'};
+const receiptRecord = (state) => buildRecord(state, receiptIdent, 1791255480);
+
+test('completion receipt hashes exact accepted input within the matching observed turn', () => {
+  const prompt = 'synthetic task prompt\nwith exact whitespace ';
+  const state = run([...receiptStart(), userInput(prompt), ...receiptEnd()]);
+  assert.deepEqual(receiptRecord(state).completed_task, {
+    prompt_sha256: crypto.createHash('sha256').update(prompt).digest('hex'),
+    accepted_at: Date.parse('2026-10-06T02:57:51.000Z') / 1000,
+    completed_at: Date.parse('2026-10-06T02:57:53.000Z') / 1000,
+    core_incarnation: receiptIdent.coreIncarnation,
+  });
+  assert(!JSON.stringify(state).includes(prompt));
+  assert(!JSON.stringify(receiptRecord(state)).includes(prompt));
+  assert.equal(buildRecord(state, {observerId: 'o', startedAt: 1, session: 's'}, 1791255480).completed_task, undefined);
+});
+
+test('missing, reordered, mismatched and multi-input turn evidence earns no receipt', () => {
+  const cases = [
+    [userInput(), ...receiptEnd()],
+    [ev('task_started', {turn_id: 'turn-a'}), userInput(), ...receiptEnd()],
+    [userInput(), ...receiptStart(), ...receiptEnd()],
+    [...receiptStart(), userInput(), ...receiptEnd('turn-b')],
+    [...receiptStart(), userInput(), userInput('manual steering'), ...receiptEnd()],
+    [...receiptStart(), userInput(), ...receiptStart('turn-b'), ...receiptEnd('turn-b')],
+    [...receiptStart(), said(), userInput(), ...receiptEnd()],
+    [...receiptStart(), userInput(), {type: 'turn_context', payload: {turn_id: 'other'}}, ...receiptEnd()],
+    [...receiptStart(), {...userInput(), timestamp: 'bad-date'}, ...receiptEnd()],
+    [...receiptStart(), userInput(), ev('task_complete', {turn_id: 'turn-a'})],
+    [...receiptStart(), userInput(), said(), ev('task_complete', {turn_id: 'turn-a'}, 'bad-date')],
+  ];
+  for (const lines of cases) assert.equal(receiptRecord(run(lines)).completed_task, undefined);
+});
+
+test('failed or aborted turns clear task correlation and never acknowledge the prior prompt', () => {
+  for (const ending of [ev('turn_aborted'), ev('task_complete', {turn_id: 'turn-a', error: quota})]) {
+    const state = run([...receiptStart(), userInput(), said(), ending]);
+    assert.equal(receiptRecord(state).completed_task, undefined);
+    run(receiptEnd(), state);
+    assert.equal(receiptRecord(state).completed_task, undefined);
+  }
+});
+
+test('new/manual input clears the old receipt and advances its publication sequence', () => {
+  for (const input of [ev('task_started', {turn_id: 'manual'}), userInput('manual message'), ev('turn_aborted')]) {
+    const state = run([...receiptStart(), userInput(), ...receiptEnd()]);
+    const seq = state.seq;
+    run([input], state);
+    assert(state.seq > seq);
+    assert.equal(receiptRecord(state).completed_task, undefined);
+  }
+});
+
+test('observer restart reconstructs only a complete correlated turn from the top-level tail', async () => {
+  const text = jl(...receiptStart(), userInput(), ...receiptEnd());
+  for (let restart = 0; restart < 2; restart++) {
+    const files = {'/main': {meta: {}, text}, '/sub': {meta: {parent_thread_id: 'parent'}, text}};
+    const f = fake(files);
+    f.deps.coreIncarnation = async () => receiptIdent.coreIncarnation;
+    const observer = new Observer({session: 's'}, f.deps);
+    await observer.tick();
+    await f.flush();
+    assert.equal(f.writes.at(-1).rec.completed_task.core_incarnation, receiptIdent.coreIncarnation);
+  }
+  const f = fake({'/main': {meta: {}, text: jl(userInput(), ...receiptEnd())}});
+  f.deps.coreIncarnation = async () => receiptIdent.coreIncarnation;
+  const observer = new Observer({session: 's'}, f.deps);
+  await observer.tick(); await f.flush();
+  assert.equal(f.writes.at(-1).rec.completed_task, undefined);
+});
+
+test('ambiguous or subagent-only rollout never produces a completion receipt', async () => {
+  const text = jl(...receiptStart(), userInput(), ...receiptEnd());
+  for (const files of [{'/sub': {meta: {parent_thread_id: 'parent'}, text}},
+    {'/sub': {meta: {source: {subagent: {thread_spawn: {parent_thread_id: 'parent'}}}}, text}},
+    {'/one': {meta: {}, text}, '/two': {meta: {}, text}}]) {
+    const f = fake(files); f.deps.coreIncarnation = async () => receiptIdent.coreIncarnation;
+    const observer = new Observer({session: 's'}, f.deps);
+    await observer.tick(); await f.flush();
+    assert.equal(f.writes.length, 0);
+  }
+});
+
+test('receipt survives the production schema writer without the input body', async () => {
+  const ws = fs.mkdtempSync(path.join(os.tmpdir(), 'observer-receipt-'));
+  try {
+    const record = receiptRecord(run([...receiptStart(), userInput('private synthetic prompt'), ...receiptEnd()]));
+    writeRecord(ws, record);
+    const stored = fs.readFileSync(path.join(ws, 'state/runtime-observations/core.json'), 'utf8');
+    assert.deepEqual(JSON.parse(stored).completed_task, record.completed_task);
+    assert(!stored.includes('private synthetic prompt'));
+  } finally { fs.rmSync(ws, {recursive: true, force: true}); }
+});
+
+test('core incarnation uses the notifier whitespace contract for single-digit days', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'observer-incarnation-'));
+  const oldPath = process.env.PATH;
+  try {
+    fs.writeFileSync(path.join(dir, 'ps'), '#!/bin/sh\n[ "$LC_ALL" = C ] && [ "$TZ" = UTC ] || exit 1\nprintf " Thu Oct  8 02:00:00 2026 \\n"\n', {mode: 0o755});
+    process.env.PATH = `${dir}:${oldPath}`;
+    const deps = fileDeps({});
+    assert.equal(await deps.coreIncarnation(42), '42:Thu Oct 8 02:00:00 2026');
+    fs.writeFileSync(path.join(dir, 'ps'), '#!/bin/sh\nexit 1\n', {mode: 0o755});
+    assert.equal(await deps.coreIncarnation(42), '');
+  } finally {
+    process.env.PATH = oldPath;
+    fs.rmSync(dir, {recursive: true, force: true});
+  }
+});
+
+test('a new core incarnation reselects even the same rollout without refreshing old acceptance time', async () => {
+  const text = jl(...receiptStart(), userInput(), ...receiptEnd());
+  const files = {'/main': {meta: {}, text}};
+  const f = fake(files);
+  let incarnation = '42:Tue Oct 6 02:00:00 2026';
+  f.deps.coreIncarnation = async () => incarnation;
+  const observer = new Observer({session: 's'}, f.deps);
+  await observer.discover(); await f.flush();
+  const before = f.writes.at(-1).rec.completed_task;
+  incarnation = '42:Tue Oct 6 04:00:00 2026';
+  await observer.discover(); await f.flush();
+  const after = f.writes.at(-1).rec.completed_task;
+  assert.equal(after.core_incarnation, incarnation);
+  assert.equal(after.accepted_at, before.accepted_at);
+  assert.equal(after.completed_at, before.completed_at);
+  assert(after.accepted_at < Date.parse('2026-10-06T04:00:00Z') / 1000);
+  incarnation = '';
+  await observer.discover(); await f.flush();
+  assert.equal(f.writes.at(-1).rec.completed_task, undefined);
 });

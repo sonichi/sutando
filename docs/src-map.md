@@ -258,7 +258,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`telegram-bridge.py`** — Telegram bridge for Sutando — polls bot messages, writes to tasks/, sends replies from results/.
 - **`telemetry.py`** — Anonymous, opt-out product telemetry for Sutando (PostHog).
 - **`tmp-paths.ts`** — Shared cross-platform temp-file paths used by both writers and readers.
-- **`tmux-pane-keys.sh`** — tmux-pane-keys.sh [--tmux BIN] --python PY -S SOCKET -t TARGET [--timeout SECS] -- <send-keys args...> tmux-pane-keys.sh [--tmux BIN] --python PY -S SOCKET -t PANE [--timeout SECS] --fence PREDICATE ACTION Leaves pane mode and sends in one tmux step, bounded; or runs ACTION only while the format PREDICATE holds for PANE, else orphans the ticket (exit 1, nothing sent).
+- **`tmux-pane-keys.sh`** — tmux-pane-keys.sh [--tmux BIN] --python PY -S SOCKET -t TARGET [--timeout SECS] [--expected-pid PID] -- <send-keys args...> tmux-pane-keys.sh [--tmux BIN] --python PY -S SOCKET -t PANE [--timeout SECS] --fence PREDICATE ACTION Leaves pane mode and sends in one tmux step, bounded; or runs ACTION only while the format PREDICATE holds for PANE, else orphans the ticket (exit 1, nothing sent).
 - **`tmux-probe-cli.py`** — Tiny CLI over tmux_probe.has_session(), for callers (start-cli.sh's relay loop) that cannot import Python but must not duplicate its ABSENT_SIGNATURES.
 - **`tmux-status.ts`** — Tmux-pane status scraper.
 - **`tmux_pane_keys.py`** — Shared tmux pane-key argv and crash-safe send guard.
@@ -372,6 +372,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 
 - **`__init__.py`** — _(no header comment)_
 - **`channel_key.py`** — Per-channel pull path for task-result files in `results/`.
+- **`codex_pickup.py`** — Codex idle pickup: correlate a completed parent turn and keep bounded local timing evidence.
 - **`disposal.py`** — Terminal disposal of a result file: claim the generation read, verify it, quarantine it once; recover the claims a crashed owner left behind.
 - **`nudge_gate.py`** — Whether a supervisor with no session-role watcher should nudge, alert, or arm.
 - **`pane_gate.py`** — Pane idle-gate and line delivery for a core CLI pane — the consumer-side policy every external task-notifier shares.

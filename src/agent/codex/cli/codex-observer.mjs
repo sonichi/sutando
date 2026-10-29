@@ -8,7 +8,7 @@ import { execFile } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 
 export const OBSERVER = 'codex-observer';
-export const VERSION = '0.1.0';
+export const VERSION = '0.2.0';
 const TICK_MS = 1000;
 const DISCOVER_EVERY = 10;
 const FLUSH_DELAY_MS = 250;
@@ -20,7 +20,7 @@ const TOOL_OUTPUTS = new Set(['function_call_output', 'custom_tool_call_output',
 
 export function newState() {
   return {phase: 'unknown', motion: 'unknown', condition: 'unknown', reason: null, seq: 0, changedAt: 0,
-    conditionSince: null, lastSuccessAt: null, turnSucceeded: false};
+    conditionSince: null, lastSuccessAt: null, turnSucceeded: false, activeTask: null, completedTask: null};
 }
 
 export function errorReason(error) {
@@ -41,9 +41,43 @@ function epoch(ts, fallback) {
   return Number.isFinite(ms) ? ms / 1000 : fallback;
 }
 
+// The user item has no turn_id: accept it only after the matching start/context pair.
+// Only its exact digest survives; incomplete tails and extra inputs provide no receipt.
+function taskChange(state, line) {
+  const p = line?.payload || {};
+  const at = epoch(line?.timestamp, null);
+  const validId = (id) => typeof id === 'string' && id.length > 0 && id.length <= 128;
+  const clear = {activeTask: null, completedTask: null};
+  if (line?.type === 'event_msg' && p.type === 'task_started') {
+    return {...clear, activeTask: validId(p.turn_id) && at > 0
+      ? {turnId: p.turn_id, startedAt: at, contextSeen: false} : null};
+  }
+  if (line?.type === 'turn_context') {
+    if (!state.activeTask || p.turn_id !== state.activeTask.turnId) return clear;
+    return {activeTask: {...state.activeTask, contextSeen: true}};
+  }
+  if (line?.type === 'response_item' && p.type === 'message' && p.role === 'user') {
+    const active = state.activeTask;
+    if (!active?.contextSeen || active.promptSha256 || state.turnSucceeded || !(at >= active.startedAt)
+        || p.content?.length !== 1 || p.content[0]?.type !== 'input_text'
+        || typeof p.content[0].text !== 'string' || !p.content[0].text) return clear;
+    return {completedTask: null, activeTask: {...active, acceptedAt: at,
+      promptSha256: crypto.createHash('sha256').update(p.content[0].text, 'utf8').digest('hex')}};
+  }
+  if (line?.type === 'event_msg' && p.type === 'turn_aborted') return clear;
+  if (line?.type === 'event_msg' && p.type === 'task_complete') {
+    const active = state.activeTask;
+    if (p.error || !state.turnSucceeded || !active?.promptSha256
+        || p.turn_id !== active.turnId || !(at >= active.acceptedAt)) return clear;
+    return {activeTask: null, completedTask: {prompt_sha256: active.promptSha256,
+      accepted_at: active.acceptedAt, completed_at: at}};
+  }
+  return null;
+}
+
 // One rollout line -> change, or null. A failure is the error on the turn's completion; it
 // stands until a model output proves a later request completed.
-export function lineChange(state, line) {
+function healthChange(state, line) {
   const p = line?.payload || {};
   if (line?.type === 'event_msg') {
     if (p.type === 'task_started') {
@@ -65,12 +99,21 @@ export function lineChange(state, line) {
   return null;
 }
 
+export function lineChange(state, line) {
+  const health = healthChange(state, line);
+  const task = taskChange(state, line);
+  return health || task ? {...health, ...task} : null;
+}
+
 // Applies a change at `at` (epoch s); true when the record changed.
 export function apply(state, change, at) {
   if (!change) return false;
   let changed = false;
   if (change.success) { state.lastSuccessAt = at; changed = true; }
   if ('turnSucceeded' in change) state.turnSucceeded = change.turnSucceeded;
+  for (const key of ['activeTask', 'completedTask']) {
+    if (key in change) { state[key] = change[key]; changed = true; }
+  }
   const was = {condition: state.condition, reason: state.reason};
   for (const key of ['phase', 'motion', 'condition', 'reason']) {
     if (change[key] !== undefined && change[key] !== state[key]) { state[key] = change[key]; state.changedAt = at; changed = true; }
@@ -87,6 +130,8 @@ export function apply(state, change, at) {
 
 export function buildRecord(state, ident, now) {
   return {
+    ...(state.completedTask && ident.coreIncarnation
+      ? {completed_task: {...state.completedTask, core_incarnation: ident.coreIncarnation}} : {}),
     schema: 1, observer: OBSERVER, observer_version: VERSION, observer_id: ident.observerId,
     observer_started_at: ident.startedAt, seat: 'core', session: ident.session, claude_session_id: null,
     seq: state.seq, changed_at: state.changedAt || ident.startedAt, condition_since: state.conditionSince,
@@ -99,7 +144,7 @@ export function buildRecord(state, ident, now) {
 // rollouts name a parent; an unreadable one could be top-level, so it is as ambiguous as a second.
 export function pickRollout(metas) {
   if (metas.some((m) => !m)) return null;
-  const top = metas.filter((m) => !m.parent_thread_id && !m.agent_path);
+  const top = metas.filter((m) => !m.parent_thread_id && !m.agent_path && !m.subagent);
   return top.length === 1 ? top[0].path : null;
 }
 
@@ -148,6 +193,11 @@ export class Observer {
       return false;
     }
     this.gone = 0;
+    const incarnation = this.deps.coreIncarnation ? await this.deps.coreIncarnation(panePid) : '';
+    if (incarnation !== this.ident.coreIncarnation) {
+      this.select(null);
+      this.ident.coreIncarnation = incarnation;
+    }
     const paths = await this.deps.openRollouts(panePid);
     // Only the open files' classification is kept; an unreadable session_meta is retried.
     const kept = new Map();
@@ -155,7 +205,7 @@ export class Observer {
       let kind = this.metas.get(p);
       if (!kind) {
         const meta = await this.deps.readMeta(p);
-        if (meta) kind = {parent_thread_id: meta.parent_thread_id || null, agent_path: meta.agent_path || null};
+        if (meta) kind = {parent_thread_id: meta.parent_thread_id || null, agent_path: meta.agent_path || null, subagent: Boolean(meta.source?.subagent)};
       }
       if (kind) kept.set(p, kind);
     }
@@ -302,6 +352,10 @@ export function fileDeps(opts, io = fs) {
     after: (ms, fn) => setTimeout(fn, ms),
     panePid: async () => Number(((await run('tmux', ['-S', opts.tmuxSocket, 'list-panes', '-t', `=${opts.session}`,
       '-F', '#{pane_pid}'])) || '').split('\n')[0]) || 0,
+    coreIncarnation: async (panePid) => {
+      const started = await run('env', ['LC_ALL=C', 'TZ=UTC', 'ps', '-o', 'lstart=', '-p', String(panePid)]);
+      return started?.trim() ? `${panePid}:${started.trim().replace(/\s+/g, ' ')}` : '';
+    },
     openRollouts: async (panePid) => {
       return lsofRollouts(descendants(panePid, (await run('ps', ['-A', '-o', 'pid=,ppid='])) || ''));
     },
