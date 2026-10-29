@@ -4,7 +4,7 @@ All notable changes are documented here. Format follows [Keep a Changelog](https
 
 ## [Unreleased]
 
-## [v0.13.0] — unreleased (proposed)
+## [v0.13.0] — 2026-10-29
 
 **Headline: one install, several homeservers, and the move to s.space.** A core now keeps a
 directory of gateway connections, one bridge per homeserver, and can promote a new homeserver
