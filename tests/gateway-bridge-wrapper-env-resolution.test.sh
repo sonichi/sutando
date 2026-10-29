@@ -116,5 +116,16 @@ echo "  export + sib  -> $out"
 case "$out" in *"token=exported-token"*) check 0 "export-form .env token outranks a sibling" ;;
                *) check 1 "export-form .env token outranks a sibling" ;; esac
 
+# 9. Homeserver-agnostic: the pick is by content, so the server the token is for
+#    (named only by REMOTE_TASK_URL here) cannot change which file is used.
+for host in alpha.example.invalid beta.example.invalid gamma.example.invalid; do
+  out="$(run_case "MATRIX_HOMESERVER=https://$host
+" "REMOTE_TASK_URL=https://$host/relay
+REMOTE_TASK_TOKEN=token-for-$host
+")"
+  case "$out" in *"token=token-for-$host"*) check 0 "sibling token found for a $host lane" ;;
+                 *) check 1 "sibling token found for a $host lane" ;; esac
+done
+
 echo
 if [ "$fail" -eq 0 ]; then echo "PASS — $pass checks green"; else echo "FAIL — $fail failed, $pass passed"; exit 1; fi
