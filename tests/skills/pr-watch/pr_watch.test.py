@@ -83,6 +83,17 @@ class ConfigCli(_Tmp):
         self.assertNotEqual(self.cli("add", "--repo", "acme/widgets", "--author", "bad login")[0], 0)
         self.assertFalse((self.state / "config.json").exists())
 
+    def test_reviewed_flag_needs_a_me_login_and_is_kept_on_merge(self):
+        self.assertNotEqual(self.cli("add", "--repo", "acme/widgets", "--reviewed")[0], 0)
+        self.assertNotEqual(self.cli("add", "--repo", "acme/widgets", "--me", "*", "--reviewed")[0], 0)
+        self.assertFalse((self.state / "config.json").exists())
+        self.assertEqual(self.cli("add", "--repo", "acme/widgets", "--me", "owner-me", "--reviewed")[0], 0)
+        self.cli("add", "--repo", "ACME/widgets", "--author", "alice")
+        w = json.loads((self.state / "config.json").read_text())["watches"]
+        self.assertEqual(w, [{"repo": "acme/widgets", "authors": ["alice"], "me": ["owner-me"], "reviewed": True}])
+        rc, out, _ = self.cli("add", "--repo", "acme/other", "--me", "owner-me", "--reviewed")
+        self.assertEqual(json.loads(out)["reviewed"], True)
+
     def test_remove_unknown_repo_fails(self):
         self.assertEqual(self.cli("remove", "--repo", "acme/none")[0], 1)
 
@@ -101,14 +112,14 @@ class EventFilter(unittest.TestCase):
 
     def test_author_pull_request_actions(self):
         self.assertEqual(self.line("pull_request.opened"),
-                         "PR_EVENT acme/widgets#7 opened author=alice head=a1b2c3d4 merged=false")
+                         "PR_EVENT acme/widgets#7 opened author=alice head=a1b2c3d4 merged=false reason=author")
         self.assertEqual(self.line("pull_request.synchronize"),
-                         "PR_EVENT acme/widgets#7 synchronize author=alice head=0badc0de merged=false")
+                         "PR_EVENT acme/widgets#7 synchronize author=alice head=0badc0de merged=false reason=author")
         self.assertIn(" reopened ", self.line("pull_request.reopened"))
         self.assertIn(" ready_for_review ", self.line("pull_request.ready_for_review"))
         self.assertEqual(self.line("pull_request.closed_merged"),
-                         "PR_EVENT acme/widgets#7 closed author=alice head=0badc0de merged=true")
-        self.assertTrue(self.line("pull_request.closed_unmerged").endswith("merged=false"))
+                         "PR_EVENT acme/widgets#7 closed author=alice head=0badc0de merged=true reason=author")
+        self.assertTrue(self.line("pull_request.closed_unmerged").endswith("merged=false reason=author"))
 
     def test_other_actions_and_authors_are_dropped(self):
         self.assertIsNone(self.line("pull_request.labeled"))
@@ -148,6 +159,153 @@ class EventFilter(unittest.TestCase):
         line = pw.classify(p, WATCHES)
         self.assertNotIn("\n", line)
         self.assertNotIn(" PR_EVENT", line)
+
+
+REVIEWED = [{"repo": "acme/widgets", "authors": [], "me": ["owner-me"], "reviewed": True}]
+
+
+class ReviewedRule(unittest.TestCase):
+    def setUp(self):
+        self.asked = []
+
+    def answer(self, value):
+        def fn(repo, number, me):
+            self.asked.append((repo, number, me))
+            return value
+        return fn
+
+    def test_my_review_forwards_any_authors_pr(self):
+        line = pw.classify(fixture("pull_request.synchronize"), REVIEWED, self.answer(True))
+        self.assertEqual(line, "PR_EVENT acme/widgets#7 synchronize author=alice head=0badc0de "
+                               "merged=false reason=reviewed")
+        self.assertEqual(self.asked, [("acme/widgets", 7, ["owner-me"])])
+        for name in ("pull_request.closed_merged", "pull_request.reopened", "pull_request.ready_for_review"):
+            self.assertTrue(pw.classify(fixture(name), REVIEWED, self.answer(True)).endswith("reason=reviewed"))
+
+    def test_no_review_of_mine_is_not_forwarded(self):
+        self.assertIsNone(pw.classify(fixture("pull_request.synchronize"), REVIEWED, self.answer(False)))
+
+    def test_unknown_review_state_is_forwarded_and_says_so(self):
+        line = pw.classify(fixture("pull_request.synchronize"), REVIEWED, self.answer(None))
+        self.assertTrue(line.endswith("merged=false reason=reviewed reviewed=unknown"), line)
+        self.assertTrue(pw.classify(fixture("pull_request.synchronize"), REVIEWED).endswith("reviewed=unknown"))
+
+    def test_only_the_listed_actions_and_only_when_asked_for(self):
+        self.assertIsNone(pw.classify(fixture("pull_request.opened"), REVIEWED, self.answer(True)))
+        self.assertIsNone(pw.classify(fixture("pull_request.labeled"), REVIEWED, self.answer(True)))
+        plain = [dict(REVIEWED[0], reviewed=False)]
+        self.assertIsNone(pw.classify(fixture("pull_request.synchronize"), plain, self.answer(True)))
+        star = [dict(REVIEWED[0], me=["*"])]
+        self.assertIsNone(pw.classify(fixture("pull_request.synchronize"), star, self.answer(True)))
+        self.assertEqual(self.asked, [])
+
+    def test_author_and_reviewed_match_yields_one_author_line_without_a_lookup(self):
+        both = [dict(REVIEWED[0], authors=["alice"])]
+        line = pw.classify(fixture("pull_request.synchronize"), both, self.answer(True))
+        self.assertEqual(line, "PR_EVENT acme/widgets#7 synchronize author=alice head=0badc0de "
+                               "merged=false reason=author")
+        self.assertEqual(self.asked, [])
+
+    def test_a_bad_pr_number_reads_as_unknown(self):
+        p = fixture("pull_request.synchronize")
+        p["pull_request"]["number"] = "x"
+        self.assertTrue(pw.classify(p, REVIEWED, self.answer(True)).endswith("reviewed=unknown"))
+
+    def test_my_dismissed_review_is_forwarded(self):
+        p = fixture("pull_request_review.dismissed")
+        p["review"]["user"]["login"] = "Owner-Me"
+        self.assertEqual(pw.classify(p, REVIEWED), "PR_EVENT acme/widgets#7 review_dismissed "
+                                                   "reviewer=Owner-Me author=alice head=0badc0de")
+        plain_me = [{"repo": "acme/widgets", "authors": [], "me": ["owner-me"]}]
+        self.assertIsNotNone(pw.classify(p, plain_me))
+
+    def test_someone_elses_dismissed_review_is_not(self):
+        self.assertIsNone(pw.classify(fixture("pull_request_review.dismissed"), REVIEWED))
+        p = fixture("pull_request_review.dismissed")
+        p["review"]["user"] = {}
+        self.assertIsNone(pw.classify(p, REVIEWED))
+
+
+class Clock:
+    def __init__(self):
+        self.t = 1000.0
+
+    def __call__(self):
+        return self.t
+
+
+class ReviewedCache(unittest.TestCase):
+    def lookup(self, outputs):
+        clock = Clock()
+        lk = pw.ReviewedLookup(ttl=600, timeout=5, clock=clock)
+        calls = []
+
+        def fake_gh(args, check=False, timeout=None):
+            calls.append((args, timeout))
+            out = outputs.pop(0)
+            if isinstance(out, BaseException):
+                raise out
+            return subprocess.CompletedProcess(args, out[0], out[1], "")
+        p = mock.patch.object(pw, "gh", side_effect=fake_gh)
+        p.start()
+        self.addCleanup(p.stop)
+        return lk, clock, calls
+
+    def test_asks_the_reviews_api_once_and_matches_any_me_login(self):
+        lk, _, calls = self.lookup([(0, "bob\nOWNER-ME\n")])
+        self.assertTrue(lk("acme/widgets", 7, ["owner-me"]))
+        self.assertTrue(lk("ACME/widgets", 7, ["owner-me"]))
+        self.assertEqual(len(calls), 1)
+        args, timeout = calls[0]
+        self.assertEqual(args[:2], ["api", "repos/acme/widgets/pulls/7/reviews"])
+        self.assertIn("--paginate", args)
+        self.assertEqual(args[-2:], ["--jq", ".[].user.login"])
+        self.assertEqual(timeout, 5)
+
+    def test_a_no_is_cached_for_the_ttl_and_a_yes_for_good(self):
+        lk, clock, calls = self.lookup([(0, "bob\n"), (0, "owner-me\n")])
+        self.assertFalse(lk("acme/widgets", 7, ["owner-me"]))
+        clock.t += 599
+        self.assertFalse(lk("acme/widgets", 7, ["owner-me"]))
+        self.assertEqual(len(calls), 1)
+        clock.t += 2
+        self.assertTrue(lk("acme/widgets", 7, ["owner-me"]))
+        clock.t += 10 ** 6
+        self.assertTrue(lk("acme/widgets", 7, ["owner-me"]))
+        self.assertEqual(len(calls), 2)
+
+    def test_failures_answer_unknown_and_are_not_cached(self):
+        lk, _, calls = self.lookup([(1, ""), subprocess.TimeoutExpired("gh", 5), OSError("no gh"), (0, "owner-me")])
+        self.assertIsNone(lk("acme/widgets", 7, ["owner-me"]))
+        self.assertIsNone(lk("acme/widgets", 7, ["owner-me"]))
+        self.assertIsNone(lk("acme/widgets", 7, ["owner-me"]))
+        self.assertTrue(lk("acme/widgets", 7, ["owner-me"]))
+        self.assertEqual(len(calls), 4)
+
+    def test_my_submitted_review_marks_the_pr_without_a_call(self):
+        lk, _, calls = self.lookup([(0, "")])
+        self.assertFalse(lk("acme/widgets", 7, ["owner-me"]))
+        p = fixture("pull_request_review.submitted")
+        p["review"]["user"]["login"] = "owner-me"
+        lk.observe(p, REVIEWED)
+        self.assertTrue(lk("acme/widgets", 7, ["owner-me"]))
+        self.assertEqual(len(calls), 1)
+
+    def test_observe_ignores_other_reviews_and_payloads(self):
+        lk, _, _ = self.lookup([])
+        lk.observe(fixture("pull_request_review.submitted"), REVIEWED)
+        lk.observe(fixture("pull_request.synchronize"), REVIEWED)
+        lk.observe(fixture("pull_request_review.submitted"), [{"repo": "acme/other", "me": ["bob"]}])
+        p = fixture("pull_request_review.submitted")
+        p["review"]["user"]["login"] = "owner-me"
+        p["pull_request"]["number"] = None
+        lk.observe(p, REVIEWED)
+        self.assertEqual(lk.cache, {})
+
+    def test_classify_with_the_real_lookup(self):
+        lk, _, _ = self.lookup([(0, "owner-me")])
+        line = pw.classify(fixture("pull_request.synchronize"), REVIEWED, lk)
+        self.assertTrue(line.endswith("reason=reviewed"), line)
 
 
 class JsonStream(unittest.TestCase):
@@ -338,7 +496,7 @@ class Runner(_Tmp):
         self.start(["pull_request.labeled", "pull_request.opened", "pull_request_review.submitted"])
         first = self.proc.stdout.readline().strip()
         second = self.proc.stdout.readline().strip()
-        self.assertEqual(first, "PR_EVENT acme/widgets#7 opened author=alice head=a1b2c3d4 merged=false")
+        self.assertEqual(first, "PR_EVENT acme/widgets#7 opened author=alice head=a1b2c3d4 merged=false reason=author")
         self.assertTrue(second.startswith("PR_EVENT acme/widgets#7 review_submitted by=bob"))
         hooks = self.state / "hooks.json"
         deadline = time.time() + 15
@@ -422,10 +580,29 @@ class InProcess(_Tmp):
     def test_forward_once_emits_records_and_deletes_its_hook(self):
         delay, lines = self.forward()
         self.assertEqual(delay, pw.RESTART_DELAY_S)
-        self.assertEqual(lines, ["PR_EVENT acme/widgets#7 opened author=alice head=a1b2c3d4 merged=false"])
+        self.assertEqual(lines, ["PR_EVENT acme/widgets#7 opened author=alice head=a1b2c3d4 merged=false reason=author"])
         self.assertEqual(self.calls("api -X DELETE"), ["api -X DELETE repos/acme/widgets/hooks/77"])
         self.assertEqual(json.loads(self.st.hooks.read_text()), {})
         self.assertEqual(json.loads(self.st.forwarders.read_text()), {})
+
+    def test_forwarder_asks_for_review_events_too(self):
+        self.forward()
+        fwd = self.calls("webhook forward")
+        self.assertEqual(len(fwd), 1)
+        self.assertIn("--events=pull_request,pull_request_review", fwd[0].split())
+
+    def test_forward_once_passes_the_review_lookup_to_the_filter(self):
+        self.cli("add", "--repo", "acme/widgets", "--me", "owner-me", "--reviewed")
+        cfg = json.loads(self.st.config.read_text())
+        cfg["watches"][0]["authors"] = []
+        self.st.config.write_text(json.dumps(cfg))
+        os.environ["FAKE_GH_EMIT"] = str(FIXTURES / "pull_request.synchronize.json")
+        runner = pw.Runner(self.st)
+        with mock.patch.object(runner.reviewed, "fetch", return_value=True) as fetch:
+            _, lines = self.forward(runner)
+        self.assertEqual(lines, ["PR_EVENT acme/widgets#7 synchronize author=alice head=0badc0de "
+                                 "merged=false reason=reviewed"])
+        fetch.assert_called_once_with("acme/widgets", 7, ["owner-me"])
 
     def test_forward_once_backs_off_on_a_422(self):
         os.environ["FAKE_GH_CONFLICT"] = "1"

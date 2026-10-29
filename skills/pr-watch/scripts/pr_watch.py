@@ -2,7 +2,8 @@
 """pr-watch: event-driven GitHub PR watching through `gh webhook forward`.
 
 Subcommands:
-  add --repo O/R [--author LOGIN ...] [--me LOGIN ...]   watch a repo (merges into an existing entry)
+  add --repo O/R [--author LOGIN ...] [--me LOGIN ...] [--reviewed]
+                                                         watch a repo (merges into an existing entry)
   remove --repo O/R                                      stop watching a repo
   list                                                   print the watch config
   status                                                 runner, forwarders and recorded hook ids
@@ -28,7 +29,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Callable, Dict, FrozenSet, Iterable, List, Optional, Tuple
 
 SKILL_DIR = Path(__file__).resolve().parents[1]  # lint-workspace-resolution: allow-repo-root
 MOD_SRC = SKILL_DIR / "mod"
@@ -36,6 +37,9 @@ MOD_NAME = "pr-watch"
 
 EVENTS = "pull_request,pull_request_review"
 PR_ACTIONS = ("opened", "synchronize", "reopened", "ready_for_review", "closed")
+REVIEWED_ACTIONS = ("synchronize", "closed", "reopened", "ready_for_review")
+REVIEWED_TTL_S = 600
+REVIEWED_TIMEOUT_S = 10
 FORWARDER_HOOK_NAME = "cli"
 FORWARDER_URL_MARK = "webhook-forwarder.github.com"
 HOOK_EXISTS = "Hook already exists"
@@ -125,19 +129,25 @@ def _logins(values: Iterable[str]) -> List[str]:
     return out
 
 
-def config_add(cfg: dict, repo: str, authors: List[str], me: List[str]) -> dict:
+def config_add(cfg: dict, repo: str, authors: List[str], me: List[str], reviewed: bool = False) -> dict:
     if not REPO_RE.match(repo):
         raise SystemExit(f"pr-watch: --repo must be OWNER/REPO, got {repo!r}")
-    if not authors and not me:
+    if not authors and not me and not reviewed:
         raise SystemExit("pr-watch: give at least one --author or --me")
-    for w in cfg["watches"]:
-        if w["repo"].lower() == repo.lower():
-            w["authors"] = _logins(list(w.get("authors", [])) + authors)
-            w["me"] = _logins(list(w.get("me", [])) + me)
-            return w
-    w = {"repo": repo, "authors": _logins(authors), "me": _logins(me)}
-    cfg["watches"].append(w)
-    return w
+    w = next((x for x in cfg["watches"] if x["repo"].lower() == repo.lower()), None)
+    merged = {"repo": w["repo"] if w else repo,
+              "authors": _logins(list((w or {}).get("authors", [])) + authors),
+              "me": _logins(list((w or {}).get("me", [])) + me)}
+    if reviewed or (w or {}).get("reviewed"):
+        if not _mine(merged["me"]):
+            raise SystemExit("pr-watch: --reviewed needs a --me login (not *)")
+        merged["reviewed"] = True
+    if w is None:
+        cfg["watches"].append(merged)
+    else:
+        w.clear()
+        w.update(merged)
+    return merged
 
 
 def config_remove(cfg: dict, repo: str) -> bool:
@@ -153,11 +163,19 @@ def _has(logins: Iterable[str], login: str) -> bool:
     return any(x == "*" or x.lower() == low for x in logins)
 
 
+def _mine(logins: Iterable[str]) -> List[str]:
+    return [m for m in logins if m != "*"]
+
+
 def _safe(value) -> str:
     return re.sub(r"[^A-Za-z0-9_.\-\[\]/#]", "?", str(value))[:80]
 
 
-def classify(payload: dict, watches: List[dict]) -> Optional[str]:
+# (repo, PR number, the watch's `me` logins) -> whether one of them reviewed it; None when unknown.
+ReviewedFn = Callable[[str, int, List[str]], Optional[bool]]
+
+
+def classify(payload: dict, watches: List[dict], reviewed: Optional[ReviewedFn] = None) -> Optional[str]:
     """One `PR_EVENT ...` line for a payload a watch asks for, else None."""
     repo = (payload.get("repository") or {}).get("full_name") or ""
     watch = next((w for w in watches if w["repo"].lower() == repo.lower()), None)
@@ -169,26 +187,43 @@ def classify(payload: dict, watches: List[dict]) -> Optional[str]:
     author = (pr.get("user") or {}).get("login") or ""
     head = ((pr.get("head") or {}).get("sha") or "")[:8]
     where = f"{_safe(repo)}#{_safe(number)}"
+    me = _mine(watch.get("me", []))
     review = payload.get("review")
     if isinstance(review, dict):
+        by = (review.get("user") or {}).get("login") or ""
+        if action == "dismissed":
+            if not by or not _has(me, by):
+                return None
+            return (f"PR_EVENT {where} review_dismissed reviewer={_safe(by)} "
+                    f"author={_safe(author)} head={_safe(head)}")
         if action != "submitted" or not _has(watch.get("authors", []), author):
             return None
-        by = (review.get("user") or {}).get("login") or ""
         state = (review.get("state") or "").lower()
         commit = (review.get("commit_id") or "")[:8]
         return (f"PR_EVENT {where} review_submitted by={_safe(by)} state={_safe(state)} "
                 f"author={_safe(author)} head={_safe(commit or head)}")
     if action == "review_requested":
         reviewer = (payload.get("requested_reviewer") or {}).get("login") or ""
-        if not reviewer or not _has([m for m in watch.get("me", []) if m != "*"], reviewer):
+        if not reviewer or not _has(me, reviewer):
             return None
         return (f"PR_EVENT {where} review_requested reviewer={_safe(reviewer)} "
                 f"author={_safe(author)} head={_safe(head)}")
-    if action in PR_ACTIONS and _has(watch.get("authors", []), author):
-        merged = "true" if pr.get("merged") else "false"
-        return (f"PR_EVENT {where} {action} author={_safe(author)} head={_safe(head)} "
-                f"merged={merged}")
-    return None
+    if action not in PR_ACTIONS:
+        return None
+    base = (f"PR_EVENT {where} {action} author={_safe(author)} head={_safe(head)} "
+            f"merged={'true' if pr.get('merged') else 'false'}")
+    # The author rule wins without a lookup, so a PR matching both yields one line.
+    if _has(watch.get("authors", []), author):
+        return base + " reason=author"
+    if not watch.get("reviewed") or action not in REVIEWED_ACTIONS or not me:
+        return None
+    try:
+        seen = reviewed(repo, int(number), me) if reviewed else None
+    except (TypeError, ValueError):
+        seen = None
+    if seen is False:
+        return None
+    return base + " reason=reviewed" + ("" if seen else " reviewed=unknown")
 
 
 def split_json_stream(buffer: str) -> Tuple[List[dict], str]:
@@ -219,8 +254,65 @@ def split_json_stream(buffer: str) -> Tuple[List[dict], str]:
 
 # ---- GitHub hooks ----------------------------------------------------------------------------
 
-def gh(args: List[str], check: bool = False) -> subprocess.CompletedProcess:
-    return subprocess.run(["gh"] + args, capture_output=True, text=True, check=check)
+def gh(args: List[str], check: bool = False, timeout: Optional[float] = None) -> subprocess.CompletedProcess:
+    return subprocess.run(["gh"] + args, capture_output=True, text=True, check=check, timeout=timeout)
+
+
+class ReviewedLookup:
+    """Whether a `me` login reviewed a PR: one reviews API call per (repo, PR), cached.
+
+    A yes is kept for the runner's lifetime; a no is re-asked after `ttl` seconds."""
+
+    def __init__(self, ttl: float = REVIEWED_TTL_S, timeout: float = REVIEWED_TIMEOUT_S,
+                 clock: Callable[[], float] = time.monotonic):
+        self.ttl, self.timeout, self.clock = ttl, timeout, clock
+        self.cache: Dict[Tuple[str, int, FrozenSet[str]], Tuple[bool, float]] = {}
+        self.lock = threading.Lock()
+
+    @staticmethod
+    def _key(repo: str, number: int, me: Iterable[str]) -> Tuple[str, int, FrozenSet[str]]:
+        return repo.lower(), int(number), frozenset(m.lower() for m in me)
+
+    def __call__(self, repo: str, number: int, me: List[str]) -> Optional[bool]:
+        key = self._key(repo, number, me)
+        now = self.clock()
+        with self.lock:
+            hit = self.cache.get(key)
+        if hit and (hit[0] or now - hit[1] < self.ttl):
+            return hit[0]
+        found = self.fetch(repo, number, me)
+        if found is not None:
+            with self.lock:
+                self.cache[key] = (found, now)
+        return found
+
+    def fetch(self, repo: str, number: int, me: List[str]) -> Optional[bool]:
+        try:
+            r = gh(["api", f"repos/{repo}/pulls/{number}/reviews", "--paginate",
+                    "--jq", ".[].user.login"], timeout=self.timeout)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if r.returncode != 0:
+            return None
+        return any(_has(me, login) for login in r.stdout.split())
+
+    def observe(self, payload: dict, watches: List[dict]) -> None:
+        """A review submitted by a `me` login marks its PR reviewed without asking GitHub."""
+        review = payload.get("review")
+        pr = payload.get("pull_request")
+        repo = (payload.get("repository") or {}).get("full_name") or ""
+        if payload.get("action") != "submitted" or not isinstance(review, dict) or not isinstance(pr, dict):
+            return
+        by = (review.get("user") or {}).get("login") or ""
+        for w in watches:
+            me = _mine(w.get("me", []))
+            if w["repo"].lower() == repo.lower() and me and _has(me, by):
+                try:
+                    key = self._key(repo, pr.get("number"), me)
+                except (TypeError, ValueError):
+                    return
+                with self.lock:
+                    self.cache[key] = (True, self.clock())
 
 
 def forwarder_hook_ids(repo: str) -> Optional[List[int]]:
@@ -326,6 +418,7 @@ class Runner:
         self.threads: Dict[str, Tuple[threading.Thread, threading.Event]] = {}
         self.procs: Dict[str, subprocess.Popen] = {}
         self.procs_lock = threading.Lock()
+        self.reviewed = ReviewedLookup()
 
     def emit(self, line: str) -> None:
         with self.out_lock:
@@ -390,7 +483,9 @@ class Runner:
         for chunk in iter(proc.stdout.readline, ""):
             objs, buf = split_json_stream(buf + chunk)
             for payload in objs:
-                line = classify(payload, self.watches())
+                watches = self.watches()
+                self.reviewed.observe(payload, watches)
+                line = classify(payload, watches, self.reviewed)
                 if line:
                     self.emit(line)
         proc.wait()
@@ -547,6 +642,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     a.add_argument("--repo", required=True)
     a.add_argument("--author", action="append", default=[])
     a.add_argument("--me", action="append", default=[])
+    a.add_argument("--reviewed", action="store_true",
+                   help="also forward PRs any --me login has reviewed, whoever wrote them")
     r = sub.add_parser("remove")
     r.add_argument("--repo", required=True)
     sub.add_parser("list")
@@ -562,7 +659,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.cmd == "add":
         st.ensure()
         cfg = load_config(st)
-        w = config_add(cfg, args.repo, args.author, args.me)
+        w = config_add(cfg, args.repo, args.author, args.me, args.reviewed)
         write_json(st.config, cfg)
         notify_runner(st)
         print(json.dumps(w))
