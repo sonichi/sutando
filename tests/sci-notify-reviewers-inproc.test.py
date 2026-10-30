@@ -604,6 +604,8 @@ class AskWithoutPrUrlMustNameItsRepo(unittest.TestCase):
         self.assertEqual(rc, 7)
         self.assertIn("pass --repo OWNER/NAME", err)
         self.assertEqual(seen, [])
+        self.assertNotIn("gate capability NOT CHECKED", err,
+                         "the refusal replaces the warning on this path")
 
     def test_repo_flag_checks_access_and_drops_a_non_collaborator(self):
         rc, err, seen = self._run(["--send", "--repo", "o/private"],
@@ -611,6 +613,8 @@ class AskWithoutPrUrlMustNameItsRepo(unittest.TestCase):
         self.assertEqual(seen, ["o/private", "o/private"])
         self.assertIn("CANNOT GATE 'a': not a collaborator on o/private", err)
         self.assertNotEqual(rc, 0)
+        self.assertFalse([c for c in self.sent if "@a:x" in str(c)],
+                         "the non-collaborator must receive no send")
 
     def test_a_pr_url_in_the_message_wins_over_the_repo_flag(self):
         rc, err, seen = self._run(["--repo", "o/other"],

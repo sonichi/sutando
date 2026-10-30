@@ -696,7 +696,7 @@ def main() -> int:
     if a.kind == "ask" and targets:
         refs = _PR_URL.findall(a.message or "")
         repo = refs[0][0] if refs else a.repo
-        if not repo:
+        if not repo and not (a.send and not a.no_repo):
             print("gate capability NOT CHECKED: the message names no "
                   "github.com/<owner>/<repo>/pull/<n> URL, so there is no repo to "
                   "ask about — an unchecked send is not a checked one",
