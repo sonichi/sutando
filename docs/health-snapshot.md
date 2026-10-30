@@ -58,8 +58,8 @@ A `200` answer carries no CORS headers, so a web page on another origin cannot r
 | `alive` | `true` beat fresh, `false` beat stale or the supervisor saw the session crash, `null` no beat file |
 | `motion` | `idle`, `moving` or `unknown` |
 | `condition` | `healthy`, `abnormal` or `unknown` |
-| `reason` | why it is abnormal (see [Reasons](#reasons)), or `suspended` for a worker the pool's suspension took down; `null` otherwise |
-| `since` | epoch seconds the abnormal state was first seen, when the source knows it |
+| `reason` | why it is abnormal (see [Reasons](#reasons)), or `suspended` for a worker the pool's suspension took down or the owner paused; `null` otherwise |
+| `since` | epoch seconds the abnormal state was first seen, when the source knows it; for `suspended`, the suspension's `at` or the pause marker's mtime |
 
 `view=full` adds `sources` to each agent: every input with its workspace-relative `path`,
 `age_s`, the `value` it read, and the `opinion` it gave. Use it to see why a verdict was reached.
@@ -168,6 +168,12 @@ state as the reason. `retired` workers are left out of the response.
    `alive: false · unknown · unknown`, reason `suspended`, since the suspension's `at`, whatever
    its files say. A quit kills the tmux server outright, so no seat records its own end and its
    beat stays fresh for up to 90 s. The pool's resume lifts this.
+7. **A worker the owner paused** (`state/workers/<id>/paused` exists) that is not alive reads
+   the same way, since the marker's mtime: the pool will not restart it, so its stale beat is
+   the owner's choice, not an outage. A paused worker whose beat is still fresh reports as its
+   files say. Removing the marker lifts this. A marker that exists but cannot be read leaves
+   a worker that is not alive at `unknown · unknown`, reason `null`: whether the owner paused
+   it cannot be told. The pool treats such a worker as paused and does not restart it.
 
 ## Runtime observation
 
@@ -234,7 +240,7 @@ an empty `observation` source.
 | Reason | Source | Meaning |
 |---|---|---|
 | `offline` | beat | no beat for 90 s: the session is gone or its beat writer stopped |
-| `suspended` | `state/pool-suspended` | the app quit took this worker down; condition stays `unknown` and it never alerts |
+| `suspended` | `state/pool-suspended`, `state/workers/<id>/paused` | the app quit took this worker down, or the owner paused it and it is not alive; condition stays `unknown` and it never alerts |
 | `needs-login` | supervisor, cli_wedge | the CLI is at a sign-in prompt or refused a turn for lack of a login |
 | `login`, `permission`, `selection`, `turn-rejected`, `session-limit`, `usage-limit`, … | supervisor | a prompt that needs a person (the gate kind) |
 | `awaiting-input` | supervisor, cli_wedge | waiting for a person, kind unrecognised |

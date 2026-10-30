@@ -41,12 +41,13 @@ pd = _sibling("pool_delivery")
 
 _SRC = _HERE.parents[2] / "src"
 import cli_wedge as cw  # noqa: E402  (src/ is on the path via pool_delivery)
+import pool_suspension  # noqa: E402
 from delivery import pane_gate, task_dispatch as td  # noqa: E402
 
 STATE_REL = Path("state") / "pool-supervision.json"
 # An owner fact, so it is a marker beside the worker's records and not a roster
 # state: the core recompiles the roster, and a recompile must never lift a pause.
-PAUSED_MARKER = "paused"
+PAUSED_MARKER = pool_suspension.PAUSED_MARKER
 # States that are not candidates for recovery at all.
 NOT_SUPERVISED = ("retired",)
 
@@ -56,8 +57,15 @@ def state_path(workspace) -> Path:
 
 
 def is_paused(workspace, worker_id) -> bool:
-    """Only the owner writes or removes this file; nothing here ever does."""
-    return (wi.worker_dir(workspace, worker_id) / PAUSED_MARKER).exists()
+    """Only the owner writes or removes this file; nothing here ever does. A marker
+    that cannot be read counts as paused: a pause must never be restarted through."""
+    wi.worker_dir(workspace, worker_id)     # a malformed id is refused, not "unpaused"
+    try:
+        return pool_suspension.paused_at(workspace, worker_id) is not None
+    except OSError as e:
+        print(f"pool-supervise: {worker_id}: pause marker unreadable ({e}); treating it as paused",
+              file=sys.stderr)
+        return True
 
 
 def probe_session(workspace, worker_id, *, runner=subprocess.run) -> bool | None:
