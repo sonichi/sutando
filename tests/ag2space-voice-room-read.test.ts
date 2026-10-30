@@ -939,6 +939,7 @@ describe('navigate_space: the owner\'s own screen, moved by a nav marker in the 
 		// Desktop 2026-10-30 20:41Z/20:43Z: "go to the list of room comments" was ASR for the Commons list; the agent listed comment threads.
 		assert.match(tool.description, /"the list of room comments", "open the room comments", "go to the comments" with no document or thread named means the Commons list/);
 		assert.match(ROOM_READ_PROMPT_RULE, /speech often hears Commons as "comments"/);
+		assert.match(tool.description, /"document list", "list of documents", "show me the docs", "文档列表" — any ask for the list with no document named; one named, "open the Stevens doc", is a summon, not this/);
 		const r = (await tool.execute({ to: 'back' }, {} as never)) as { ok: boolean };
 		assert.equal(r.ok, true);
 		assert.match(ROOM_READ_PROMPT_RULE, /→ navigate_space at once, no confirmation/);
