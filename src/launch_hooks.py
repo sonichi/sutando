@@ -20,11 +20,13 @@ import os
 import stat
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from typing import Iterable, List, Optional, Tuple
 
 FIELD = "on_launch"
 SUFFIXES = (".py", ".sh")  # the schema's and the linter's contract, enforced here too
+DISCOVERY_SECONDS = 10.0  # the most a launch can wait here, whatever a skill root does
 
 
 def start(hooks: Iterable[Tuple[str, Path]], log_dir: Path, python: str,
@@ -68,20 +70,37 @@ def open_log(path: Path):
 
 
 def main() -> int:
-    """The edge: resolve the workspace and the declarers, start them, and always exit 0."""
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    try:
-        from skill_roots import declared_scripts, skill_roots
-        from workspace_default import resolve_workspace
-        workspace = resolve_workspace(migrate=False)
-        hooks = declared_scripts(FIELD, skill_roots(workspace), SUFFIXES)
-    except Exception as exc:  # noqa: BLE001 — a launch never fails on a hook
-        print(f"launch-hooks: none started ({type(exc).__name__})", file=sys.stderr)
-        return 0
-    for name, pid in start(hooks, Path(workspace) / "logs", sys.executable):
-        print(f"launch-hooks: started {name} (pid {pid})", file=sys.stderr)
+    """The edge: resolve the workspace and the declarers, start them, and always exit 0, within
+    DISCOVERY_SECONDS even when a read never returns (the work is then abandoned, not waited on)."""
+    done = threading.Event()
+
+    def work() -> None:
+        try:
+            _discover_and_start()
+        finally:
+            done.set()
+    threading.Thread(target=work, name="launch-hooks", daemon=True).start()
+    if not done.wait(DISCOVERY_SECONDS):
+        print("launch-hooks: none started (discovery timed out)", file=sys.stderr)
     return 0
 
 
+def _discover_and_start() -> None:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    try:
+        import skill_roots
+        from workspace_default import resolve_workspace
+        workspace = resolve_workspace(migrate=False)
+        hooks = skill_roots.declared_scripts(FIELD, skill_roots.skill_roots(workspace), SUFFIXES)
+    except Exception as exc:  # noqa: BLE001 — a launch never fails on a hook
+        print(f"launch-hooks: none started ({type(exc).__name__})", file=sys.stderr)
+        return
+    for name, pid in start(hooks, Path(workspace) / "logs", sys.executable):
+        print(f"launch-hooks: started {name} (pid {pid})", file=sys.stderr)
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    code = main()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(code)  # an abandoned discovery thread must not hold the exit

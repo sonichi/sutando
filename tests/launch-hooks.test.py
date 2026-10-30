@@ -199,6 +199,78 @@ class EdgeTest(_Tmp):
         self.assertEqual(sorted(p.name for p in (self.tmp / "ws" / "logs").iterdir()),
                          ["launch-hook-alpha.log", "launch-hook-beta.log"])
 
+    def run_main(self, roots: Path, seconds: float = 20) -> str:
+        """lh.main() over `roots` in a thread; its stderr, failing if it is still running after `seconds`."""
+        err, done = io.StringIO(), threading.Event()
+
+        def call():
+            with mock.patch.object(workspace_default, "resolve_workspace", return_value=self.tmp / "ws"), \
+                    mock.patch.object(skill_roots, "skill_roots", return_value=[roots]), \
+                    mock.patch.dict(os.environ, {"HOOK_OUT": str(self.out), "HOOK_PY": sys.executable}), \
+                    contextlib.redirect_stderr(err):
+                self.assertEqual(lh.main(), 0)
+            done.set()
+        threading.Thread(target=call, daemon=True).start()
+        self.assertTrue(done.wait(seconds), "lh.main() blocked: the launch would never hand off")
+        return err.getvalue()
+
+    @staticmethod
+    def release_fifo(fifo: Path) -> None:
+        with contextlib.suppress(OSError):
+            os.close(os.open(fifo, os.O_WRONLY | os.O_NONBLOCK))
+
+    @unittest.skipIf(os.name == "nt", "no FIFOs in a Windows tree")
+    def test_a_fifo_manifest_neither_blocks_discovery_nor_hides_a_later_hook(self):
+        roots = self.tmp / "skills"
+        (roots / "aa-fifo").mkdir(parents=True)
+        fifo = roots / "aa-fifo" / "manifest.json"
+        os.mkfifo(fifo)
+        # A blocked reader from a failing run is released, so the suite itself never hangs.
+        self.addCleanup(self.release_fifo, fifo)
+        self.skill(roots, "zz-good", {"on_launch": "scripts/a.py"}, "scripts/a.py")
+        self.assertEqual(re.findall(r"started (\S+)", self.run_main(roots, 5)), ["zz-good"])
+        wait_for(self.out / "a.py.json")
+
+    def test_an_oversized_or_non_regular_manifest_is_skipped_and_a_later_hook_still_starts(self):
+        roots = self.tmp / "skills"
+        self.skill(roots, "aa-big", {}, "scripts/a.py")
+        (roots / "aa-big" / "manifest.json").write_text(
+            json.dumps({"on_launch": "scripts/a.py", "pad": "x" * (skill_roots.MANIFEST_MAX_BYTES + 1)}))
+        (roots / "ab-dir" / "manifest.json").mkdir(parents=True)
+        self.skill(roots, "zz-good", {"on_launch": "scripts/a.py"}, "scripts/a.py")
+        self.assertEqual(re.findall(r"started (\S+)", self.run_main(roots)), ["zz-good"])
+
+    @unittest.skipIf(os.name == "nt", "symlinks need privileges on Windows")
+    def test_a_self_referential_hook_symlink_is_skipped_and_a_later_hook_still_starts(self):
+        roots = self.tmp / "skills"
+        self.skill(roots, "aa-loop", {"on_launch": "scripts/loop.py"})
+        (roots / "aa-loop" / "scripts" / "loop.py").symlink_to("loop.py")
+        self.skill(roots, "zz-good", {"on_launch": "scripts/a.py"}, "scripts/a.py")
+        self.assertEqual(re.findall(r"started (\S+)", self.run_main(roots)), ["zz-good"])
+
+    def test_any_error_resolving_one_declaration_skips_only_that_one(self):
+        # Python 3.9 to 3.12 raise RuntimeError for a symlink loop; pinned here on every interpreter.
+        roots = self.tmp / "skills"
+        self.skill(roots, "aa-bad", {"on_launch": "scripts/a.py"}, "scripts/a.py")
+        self.skill(roots, "zz-good", {"on_launch": "scripts/a.py"}, "scripts/a.py")
+        real = Path.resolve
+
+        def resolve(path, *a, **k):
+            if "aa-bad" in str(path) and str(path).endswith(".py"):
+                raise RuntimeError("Symlink loop from " + str(path))
+            return real(path, *a, **k)
+        with mock.patch.object(Path, "resolve", resolve):
+            found = skill_roots.declared_scripts(lh.FIELD, roots, lh.SUFFIXES)
+        self.assertEqual([n for n, _ in found], ["zz-good"])
+
+    def test_main_hands_off_when_discovery_never_returns(self):
+        release = threading.Event()
+        self.addCleanup(release.set)
+        with mock.patch.object(lh, "DISCOVERY_SECONDS", 0.5), \
+                mock.patch.object(skill_roots, "declared_scripts", lambda *a, **k: release.wait()):
+            err = self.run_main(self.tmp / "skills", 5)
+        self.assertIn("launch-hooks: none started (discovery timed out)", err)
+
     def test_main_exits_0_when_the_scan_fails(self):
         err = io.StringIO()
         with mock.patch.object(workspace_default, "resolve_workspace", side_effect=RuntimeError("no config")), \
@@ -296,6 +368,24 @@ class DispatcherTest(_Tmp):
         while not (self.out / "demo.done").exists() and time.monotonic() < deadline:
             time.sleep(0.05)
         self.assertTrue((self.out / "demo.done").exists(), "the hook never finished")
+
+    def test_a_fifo_manifest_in_the_workspace_never_holds_the_launch(self):
+        ws, stamp = self.tmp / "ws", self.tmp / "launched"
+        (ws / "skills" / "aa-fifo").mkdir(parents=True)
+        fifo = ws / "skills" / "aa-fifo" / "manifest.json"
+        os.mkfifo(fifo)
+        self.addCleanup(EdgeTest.release_fifo, fifo)
+        repo = self.engine(ws)
+        env = {k: v for k, v in self.env.items() if k not in ("SUTANDO_PY", "SUTANDO_WORKSPACE")}
+        env.update({"SUTANDO_CORE_RUNTIME": "claude", "HOOK_STALL": str(self.tmp / "no-stall"),
+                    "LAUNCH_STAMP": str(stamp), "SUTANDO_TMUX_SOCKET": str(self.tmp / "tmux.sock")})
+        try:
+            run = subprocess.run(["bash", str(repo / "src" / "agent" / "start-cli.sh")], env=env,
+                                 capture_output=True, text=True, timeout=30)
+        except subprocess.TimeoutExpired:
+            self.fail("a FIFO manifest held the launch")
+        self.assertTrue(stamp.exists(), run.stderr)
+        self.assertIn("launch-hooks: started demo", run.stderr)
 
     def test_the_dispatcher_and_the_runner_name_no_skill(self):
         dispatcher = (REPO / "src" / "agent" / "start-cli.sh").read_text()
