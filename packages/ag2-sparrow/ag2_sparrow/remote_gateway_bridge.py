@@ -415,18 +415,10 @@ def _broker_tid(local_tid: str) -> str:
     return gateway_instance.broker_tid(local_tid, GATEWAY_INSTANCE)
 
 
-_LOCAL_TID_RE = re.compile(rf"task-{_INSTANCE_RE.pattern}~([A-Za-z0-9._-]{{1,64}})")
-
-
 def _valid_local_tid(tid: str) -> bool:
     """A safe LOCAL id: either a plain wire-valid id (primary/legacy) or a
-    named-instance encoding whose embedded broker id is itself wire-valid.
-    Centralizes the widened bound so every local consumer accepts what
-    `_local_tid` can produce (max ≈ 5+32+1+64 chars — filename-safe)."""
-    if _valid_tid(tid):
-        return True
-    m = _LOCAL_TID_RE.fullmatch(tid)
-    return bool(m) and m.group(1) not in (".", "..")
+    named-instance encoding, judged by the rule every local consumer shares."""
+    return _valid_tid(tid) or local_task_protocol.valid_local_task_id(tid)
 
 
 def _task_pending(tid: str) -> bool:
@@ -2701,11 +2693,11 @@ OWNER_ACTIVITY_FILE = _STATE / "last-owner-activity.json"  # sutando-only; harml
 
 # Blocker (review 2026-06-13): the gateway is untrusted, so a task `id` flows
 # into filesystem paths (task write + result read-back/POST). Reject anything
-_TID_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
+_TID_RE = local_task_protocol.BROKER_ID_RE
 
 
 def _valid_tid(tid: str) -> bool:
-    return bool(_TID_RE.fullmatch(tid)) and tid not in (".", "..")
+    return local_task_protocol.valid_broker_id(tid)
 
 
 def _one_line(value) -> str:

@@ -21,9 +21,9 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from . import diagnostics, file_lock, gateway_credentials, task_io
+from . import diagnostics, file_lock, gateway_credentials, local_task_protocol, task_io
 
-INSTANCE_RE = re.compile(r"[A-Za-z0-9_-]{1,32}")
+INSTANCE_RE = local_task_protocol.INSTANCE_ID_RE
 
 
 def suffix(instance: str) -> str:

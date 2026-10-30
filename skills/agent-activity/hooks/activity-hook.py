@@ -26,7 +26,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
 from file_lock import locked_file  # noqa: E402
-from local_task_protocol import find_result  # noqa: E402
+from local_task_protocol import find_result, valid_local_task_id  # noqa: E402
 from result_markers import parse_markers  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
 
@@ -34,7 +34,8 @@ WRITER = Path(__file__).resolve().parent.parent / "scripts" / "activity.py"  # l
 SKIP_TOOLS = {"Read", "Glob", "Grep", "TodoWrite"}
 MAXLEN = 100
 TEXT_MAX = 240
-TASK_ID = r"task-(?!cron-|bench-|workstream-|project-grouping-)[A-Za-z0-9][\w-]*"  # chat tasks in, bookkeeping out
+# `~` joins a gateway instance to its broker id; such an id must also pass the shared lane rule.
+TASK_ID = r"task-(?!cron-|bench-|workstream-|project-grouping-)[A-Za-z0-9][\w~-]*"  # chat tasks in, bookkeeping out
 TASK_REF = re.compile(rf"\b{TASK_ID}\b")
 
 
@@ -122,7 +123,7 @@ def processing_task_id(command: str, ws: Path) -> str | None:
             pass
         return path.stem
     m = TASK_REF.search(command)
-    return m.group(0) if m else None
+    return m.group(0) if m and _lane_ok(m.group(0)) else None
 
 
 def bind(p: dict, task_id: str, session_id: str) -> None:
@@ -147,13 +148,17 @@ TASK_FILE = re.compile(rf"tasks[\\/]+({TASK_ID})\.txt\b")  # tasks/archive/… h
 RESULT_FILE = re.compile(rf"results[\\/]+({TASK_ID})\.txt\b")
 
 
+def _lane_ok(tid: str) -> bool:
+    return "~" not in tid or valid_local_task_id(tid)
+
+
 def task_file_refs(text: str) -> list[str]:
     """Task ids of task files a tool input names (tasks/<id>.txt, not results/ or archive paths)."""
-    return list(dict.fromkeys(TASK_FILE.findall(text)))
+    return [t for t in dict.fromkeys(TASK_FILE.findall(text)) if _lane_ok(t)]
 
 
 def result_file_refs(text: str) -> list[str]:
-    return list(dict.fromkeys(RESULT_FILE.findall(text)))
+    return [t for t in dict.fromkeys(RESULT_FILE.findall(text)) if _lane_ok(t)]
 
 
 def task_header(ws: Path, task_id: str) -> tuple[dict, str | None] | None:

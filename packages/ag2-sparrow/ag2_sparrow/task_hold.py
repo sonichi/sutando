@@ -35,14 +35,7 @@ SINCE_SKEW_S = 5.0
 
 def valid_tid(tid: str) -> bool:
     """A live task id, optionally under a named gateway instance (`task-<inst>~<id>`)."""
-    if not isinstance(tid, str):
-        return False
-    if local_task_protocol.valid_task_id(tid):
-        return True
-    inst, sep, broker = tid[len("task-"):].partition("~")
-    return (tid.startswith("task-") and bool(sep)
-            and gateway_instance.INSTANCE_RE.fullmatch(inst) is not None
-            and local_task_protocol.valid_task_id(broker))
+    return local_task_protocol.valid_local_task_id(tid)
 
 
 def _name(tid: str) -> str:
