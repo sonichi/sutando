@@ -22,14 +22,43 @@ _NEVER_ONE_CLICK = re.compile(r"trust the files|Do you trust|Bypass Permissions|
                               r"Fable limit|usage credits|hit your (?:session|usage|weekly) limit", re.I)
 _OPTION = re.compile(r"^\s*(❯)?\s*(\d+)\.\s+(.*\S)\s*$")
 _FRAME = re.compile(r"^[\s─━│┃┌┐└┘╭╮╰╯├┤┬┴┼═║╔╗╚╝]*$")
+_EDGE = frozenset("─━═╭┌╔")  # a rule or a box top: where a dialog starts
 _HINT = re.compile(r"Esc to cancel|Enter to (confirm|select)|↑/↓|shift\+tab|Tab to", re.I)
+_FOOTER = re.compile(r"^⏵|←\s*for agents|esc to interrupt|\? for shortcuts", re.I)
 _YES = re.compile(r"^\s*yes\b", re.I)
 _NO = re.compile(r"^\s*no\b", re.I)
 
 
 def guard_for(session: str, prompt: Optional[str], state: str) -> str:
-    """The episode key: same session + same dialog text = same requirement."""
-    return hashlib.sha256(f"{session}\n{prompt or state}".encode()).hexdigest()[:16]
+    """The episode key: same session + same dialog = same requirement."""
+    episode = dialog_identity(prompt) or prompt or state
+    return hashlib.sha256(f"{session}\n{episode}".encode()).hexdigest()[:16]
+
+
+def dialog_identity(prompt: Optional[str]) -> Optional[str]:
+    """The live dialog's own text, from the rule or box top above it (an edit's inner diff box
+    counts) to its last option, caret and borders dropped. Live = a caret block with only hints
+    and footer below it; anything else returns None and the whole prompt keys the guard."""
+    blocks = option_blocks(prompt)
+    live = next((b for b in reversed(blocks) if b[2] is not None), None)
+    if live is None:
+        return None
+    start, labels, _ = live
+    lines = (prompt or "").splitlines()
+    end = [i for i in range(start, len(lines)) if _OPTION.match(lines[i])][len(labels) - 1]
+    for line in lines[end + 1:]:
+        s = line.strip()
+        if s and not (_FRAME.match(s) or _HINT.search(s) or _FOOTER.search(s)):
+            return None  # a gate below the list: the list is not what it asks
+    body: List[str] = []
+    for line in reversed(lines[:start]):
+        s = line.strip()
+        if _OPTION.match(line) or s.startswith("✓") or s[:1] in _EDGE:
+            break  # the dialog's top edge, or an older dialog above it
+        s = s.strip("│┃║ ")
+        if s and not _HINT.search(s):
+            body.append(s)
+    return "\n".join(body[::-1] + labels)
 
 
 # A usage limit is one episode per seat however its screen repaints (banner, menu, refused

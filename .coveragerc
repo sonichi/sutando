@@ -54,6 +54,7 @@ omit =
     packages/ag2-sparrow/ag2_sparrow/outbox_cli.py
     packages/ag2-sparrow/ag2_sparrow/holder_lock.py
     packages/ag2-sparrow/ag2_sparrow/task_priority.py
+    packages/ag2-sparrow/ag2_sparrow/agent_turn.py
     packages/ag2-sparrow/ag2_sparrow/task_lifecycle.py
     packages/ag2-sparrow/ag2_sparrow/pool_record.py
     packages/ag2-sparrow/ag2_sparrow/cli_wedge_patterns.py

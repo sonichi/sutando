@@ -2249,7 +2249,8 @@ class Tunables(unittest.TestCase):
             "keepawake_interval_s": 1, "stuck_task_age_s": 10 ** 9,
             "hook_silent_age_s": 600, "heartbeat_cadence_s": "fast"}}, logs.append)
         self.assertEqual(got, {"keepawake_interval_s": 300, "stuck_task_age_s": 7200,
-                               "hook_silent_age_s": 600, "heartbeat_cadence_s": 60})
+                               "hook_silent_age_s": 600, "heartbeat_cadence_s": 60,
+                               "listener_disconnect_age_s": 300})
         self.assertEqual(len(logs), 3, logs)
         self.assertTrue(any("keepawake_interval_s=1 is outside [300, 3600]" in l for l in logs))
 

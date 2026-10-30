@@ -11,7 +11,7 @@ A manifest-loaded skill is a directory containing:
 - `tools.ts` (if `manifest.tools` is set) — exports `tools: ToolDefinition[]`, picked up at agent startup
 - optional `server.py` / `start.sh` / other runtime infrastructure the tools rely on
 
-At voice-agent startup, `loadSkillManifestTools()` in `src/inline-tools.ts` scans the public `skills/` directory **and** the optional `$SUTANDO_MEMORY_DIR/skills/` directory (legacy `$SUTANDO_PRIVATE_DIR` honored for one release per #870), dynamically imports each tools entry point, and merges the exported tool definitions into `inlineTools`.
+At voice-agent startup, `loadSkillManifestTools()` in `src/inline-tools.ts` scans `<repo>/skills`, `<workspace>/skills`, the optional `$SUTANDO_MEMORY_DIR/skills/` (legacy `$SUTANDO_PRIVATE_DIR` honored for one release per #870), each `$SUTANDO_EXTERNAL_PLUGIN_DIRS` entry's `skills/` and every sibling checkout's `skills/`, dynamically imports each tools entry point, and merges the exported tool definitions into `inlineTools` (see "Loader behavior" for the order and how duplicates resolve).
 
 The same `inlineTools` list is also pushed into the phone agent's tool table (see `skills/phone-conversation/scripts/conversation-server.ts:587`), so any tool a manifest-loaded skill contributes is automatically available to:
 
@@ -53,7 +53,10 @@ Tools that need an instant response (sub-second round-trip) live in `src/inline-
 ```text
 1. Build dirsToScan = [
      <repo>/skills,
-     $SUTANDO_MEMORY_DIR/skills (if set; legacy $SUTANDO_PRIVATE_DIR also honored)
+     <workspace>/skills,
+     $SUTANDO_MEMORY_DIR/skills (if set; legacy $SUTANDO_PRIVATE_DIR also honored),
+     <each $SUTANDO_EXTERNAL_PLUGIN_DIRS entry>/skills,
+     <each sibling checkout of the repo>/skills
    ]
 2. For each dir, read each subdirectory:
    - If no manifest.json, skip.
@@ -61,13 +64,14 @@ Tools that need an instant response (sub-second round-trip) live in `src/inline-
    - Apply manifest.config -> process.env (setdefault semantics).
    - If manifest.tools is unset, skip (config-only skill).
    - Dynamic-import the tools file. If it exports an array `tools`, append.
-3. The merged array is appended into `inlineTools` at module load.
-4. `assertUniqueToolNames(inlineTools)` enforces no name collisions.
+3. The skill tools are deduped by tool name, last-write-wins in scan order.
+4. The merged array is appended into `inlineTools` at module load, and
+   `assertUniqueToolNames(inlineTools)` refuses a skill tool that collides with a built-in one.
 ```
 
-The two-directory scan lets a user keep personal tools (per-talk highlight maps, per-deck deictic targets, scratch tools) in their private memory-sync repo with real git history, without forking the public repo.
+The extra roots let a user keep personal tools (per-talk highlight maps, per-deck deictic targets, scratch tools) in their workspace or private memory-sync repo with real git history, and let a plugin live in its own checkout, without forking the public repo.
 
-Order: public first, then private. If a private skill shares a tool name with a public one, the unique-name assertion fails at startup — by design, the loader does not silently shadow.
+Order: public first, then workspace, private, external plugins and siblings. A later root's skill shadows an earlier one's tool of the same name (last-write-wins), so the same skill found in two roots, or two skills declaring one tool name, registers that tool once; only a clash with a built-in inline tool fails at startup.
 
 ## Session hooks: `setup(ctx)` and `voiceSurface()`
 
@@ -188,9 +192,41 @@ dirs), `skills/install.ps1`, and `health-check.py --fix` (`skill-symlinks`). A d
 skill already linked on a host without the opt-in is left in place with a note; nothing deletes
 it. `skills/refresh-skill.sh` only refreshes links that already exist, so it needs no check.
 
-Runtime scans (`tools`, `hooks`, `claude_plugin`, `supervised_worker`,
-`pending_questions_store`, `documented_for_core`) read `<repo>/skills` directly, past the
-installers, so `scripts/lint-skill.py` refuses those fields on a developer-only skill.
+Runtime scans read skill directories themselves, past the installers, so `scripts/lint-skill.py`
+refuses their fields on a developer-only skill. Which directories depends on the consumer:
+
+- `tools` (`src/inline-tools.ts`): `<repo>/skills`, `<workspace>/skills`, `$SUTANDO_MEMORY_DIR/skills`
+  when set, each `$SUTANDO_EXTERNAL_PLUGIN_DIRS` entry's `skills/`, and sibling checkouts' `skills/`;
+- `documented_for_core` (`src/inline-tools.ts`): `<repo>/skills`, `<workspace>/skills` and
+  `$SUTANDO_MEMORY_DIR/skills`;
+- `pending_questions_store` and `on_launch` (`src/skill_roots.py`): `<repo>/skills` and
+  `<workspace>/skills`;
+- `hooks` (`src/skill_hooks.py`), `claude_plugin` (`src/skill-manifest-config.sh`) and
+  `supervised_worker` (`src/sparrowd.py`): `<repo>/skills` only.
+
+## Launch hook (`on_launch`)
+
+`"on_launch": "scripts/<hook>.py"` (or `.sh`) declares a script to start once per core launch.
+Both core launchers run `src/launch_hooks.py` before they start the runtime: on POSIX the dispatcher
+`src/agent/start-cli.sh`, which every launch goes through (`src/startup.sh` execs it, and so does
+the desktop app on each start, update, watchdog restart and reload); on Windows
+`scripts/start-cli.ps1`, which `src/startup.ps1` runs, on both its window and `-NoWindow` paths.
+`src/launch_hooks.py` resolves every enabled declarer with `skill_roots.declared_scripts` across
+`<repo>/skills` and `<workspace>/skills` and starts each one, naming no skill. The contract:
+
+- run with no arguments: `<python> <script>` for a `.py`, `bash <script>` for a `.sh`; any other
+  suffix is never run, even from a manifest that skipped lint;
+- in its own session (on Windows, detached in its own process group), stdin from the null device,
+  output appended to `<workspace>/logs/launch-hook-<skill>.log`, which must be a regular file (a
+  symlink, FIFO or anything else there means that hook is not started);
+- nobody waits for it, so it must finish on its own and bound its own I/O; a hook that cannot start
+  is reported on stderr, the others still start, and the launch never fails for it;
+- a manifest is read only when it is a regular file of at most 1 MiB, opened without waiting, and a
+  manifest that cannot be read or resolved skips only its own skill. The launcher waits at most
+  10 seconds for discovery and start, whatever a skill root does.
+
+Several skills may declare one; each runs on every launch, a restart included, so a hook must be
+cheap when it has nothing to do.
 
 ## Orphan reaper (`orphan_reaper`)
 
@@ -278,7 +314,7 @@ validator: [`scripts/lint-skill.py`](../scripts/lint-skill.py).
 
 **Design principle — transport-agnostic.** The manifest + a checksum + a lockfile
 are the format; where a package is *resolved from* (a git repo today, a hosted
-registry later, e.g. AG2 Space) is a separate concern. git→hosted is a resolver
+registry later, e.g. s.space) is a separate concern. git→hosted is a resolver
 backend swap, never a re-format.
 
 ### Fields (superset of the tool-loader fields above)

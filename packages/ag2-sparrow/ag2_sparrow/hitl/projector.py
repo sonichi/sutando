@@ -181,7 +181,8 @@ def project_pass(manager: HitlManager, send: Sender, room_id: str, clock: Option
                  describe: Optional[Callable[[BaseException], str]] = None,
                  monotonic: Optional[Clock] = None) -> ProjectionPass:
     """Drive every requirement whose revision is ahead of its projection, then
-    send each follow-up notice that is due as a NEW message.
+    send each follow-up notice that is due as a NEW message. Each goes to its
+    requirement's `room` when set, else to `room_id`.
 
     A rejected send is skipped (nothing recorded) so the next drive retries it.
     A 400, 413 or 422 never stops the other cards in the pass. It is charged to its card
@@ -200,7 +201,8 @@ def project_pass(manager: HitlManager, send: Sender, room_id: str, clock: Option
             continue
         target = manager.projection_target(req.id)
         payload: Dict = {
-            "room_id": room_id,
+            # A card names its room when it belongs to one conversation; the reply gate checks it.
+            "room_id": req.room or room_id,
             "body": fallback_body(req),
             "dedupe_key": f"hitl:{req.id}:{req.revision}",
             "extra_content": {WIRE_FIELD: req.to_wire()},
@@ -277,7 +279,7 @@ def _send_notices(manager: HitlManager, send: Sender, room_id: str, now: float,
         notice = {"notice": n.notice, "ids": [r.id for r, _ in n.members],
                   "runtime": n.req.runtime, "device": device.get("id") or "",
                   "host": device.get("host") or ""}
-        answer = send(wire_safe({"room_id": room_id, "op": "message",
+        answer = send(wire_safe({"room_id": n.req.room or room_id, "op": "message",
                                  "body": renotify.body(n.notice, n.req, now, since=n.since, queued=n.queued),
                                  "dedupe_key": renotify.dedupe_key(n.notice, n.req, ledger, n.reminders),
                                  "extra_content": {NOTICE_FIELD: notice}}))

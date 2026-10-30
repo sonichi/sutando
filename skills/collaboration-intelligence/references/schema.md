@@ -148,7 +148,7 @@ access_scope: room-id | private | organization | public
 
 Per-record `observed_at` says how old a fact you *have* is. It cannot say anything about a fact you do **not** have — and an empty result is the most common thing a map returns. Without store-level freshness, "this person is not in the map" and "the map has not looked since Tuesday" are the same answer, and the second one silently reads as the first.
 
-Record it per source, not once for the whole store: sources go stale independently, and a store that swept AG2 Space an hour ago and GitHub last week is fresh and stale at the same time.
+Record it per source, not once for the whole store: sources go stale independently, and a store that swept s.space an hour ago and GitHub last week is fresh and stale at the same time.
 
 ```yaml
 store_freshness:

@@ -1800,16 +1800,22 @@ exit 0
         watcher.write_text("#!/bin/bash\nprintf 'TASK_FILE: task-one.txt\\nTASK_FILE: task-two.txt\\n'\nwhile [ ! -s \"$SUTANDO_RESULTS_DIR/task-two.txt\" ]; do sleep 0.05; done\n")
         watcher.chmod(0o755)
         count = Path(self.tmp.name) / "submit-count"
+        # Like a live composer, typed text shows in the pane until C-m submits it, so
+        # the prompt stages on the first check instead of exhausting the stage retries.
         self._write_exe("tmux", '''#!/bin/bash
 printf '%s\\n' "$*" >> "$TMUX_LOG"
-for _a in "$@"; do [ "$_a" = capture-pane ] && { printf '\\xe2\\x80\\xba \\n\\xe2\\x86\\x90 for agents\\n'; exit 0; }; done
 [ "${1:-}" = -S ] && shift 2
 if [ "${1:-}" = has-session ]; then exit 0; fi
 if [ "${1:-}" = capture-pane ]; then
-  printf '›\\n⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents\\n'
+  printf '\\xe2\\x80\\xba %s\\n\\xe2\\x86\\x90 for agents\\n' "$(cat "$STAGE" 2>/dev/null)"
   exit 0
 fi
+if [ "${1:-}" = send-keys ]; then
+  all="$*"
+  case "$all" in *" -l -- "*) printf '%s' "${all#* -l -- }" > "$STAGE"; exit 0;; esac
+fi
 if [ "${1:-}" = send-keys ] && [ "${*: -1}" = C-m ]; then
+  rm -f "$STAGE"
   n=0; [ -f "$SUBMIT_COUNT" ] && n=$(cat "$SUBMIT_COUNT")
   n=$((n + 1)); printf '%s' "$n" > "$SUBMIT_COUNT"
   if [ "$n" = 1 ]; then name=task-one.txt; else name=task-two.txt; fi
@@ -1818,6 +1824,7 @@ fi
 exit 0
 ''')
         env = dict(os.environ, PATH=f"{self.bin}:/usr/bin:/bin", TMUX_LOG=str(self.log),
+                   STAGE=str(Path(self.tmp.name) / "staged"),
                    SUBMIT_COUNT=str(count), SUTANDO_TMUX_SOCKET=str(Path(self.tmp.name) / "test.sock"),
                    SUTANDO_TMUX_SESSION="sutando-core", SUTANDO_TASKS_DIR=str(tasks),
                    SUTANDO_RESULTS_DIR=str(results), SUTANDO_NOTIFIER_POLL_INTERVAL="0.02",
@@ -1828,6 +1835,7 @@ exit 0
                                 capture_output=True, text=True, timeout=15)
         elapsed = time.monotonic() - started
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("did not stage", result.stderr)
         self.assertGreaterEqual(elapsed, 0.20)
         calls = self._tmux_calls()
         self.assertLess(calls.index("task-one.txt"), calls.index("task-two.txt"))

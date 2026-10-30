@@ -35,7 +35,7 @@ sets `MORNING_BRIEFING_CALENDAR_SOURCE=macos` once. Step 1 below still runs on e
 
 **A missing connector is one line of text, never a card.** If `composio_find` reports the owner's
 calendar or mail app `connected: false`, say so in the briefing ("Google Calendar isn't connected;
-connect it in AG2 Space") and move on. The briefing is not an owner request: never post a connect
+connect it in s.space") and move on. The briefing is not an owner request: never post a connect
 card or start a `connect-apps` wait from it.
 
 **Step 1 — Base data (canonical; runs on EVERY host, including hosts that skipped Step 0):**

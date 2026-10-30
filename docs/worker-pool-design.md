@@ -52,7 +52,7 @@ unique base and display labels resolve to a worker ID where intent is captured.
 A human name shared by workers is refused. New broker display names equal to
 `core`, any existing worker ID, or shaped like a full 32-hex ID are refused.
 Registration refuses a new ID already used as another worker's name. The
-optional `display_label` from AG2 Space also changes the name shown to people;
+optional `display_label` from s.space also changes the name shown to people;
 removing it restores the base label. Human status renders the effective name
 with the full ID, such as
 `kc-reviewer-ryan (274cb60d473744dba54040a9de119877)`.
@@ -61,7 +61,7 @@ with the full ID, such as
 |---|---|---|
 | `worker_id` | `7c54b230a8d94ea9b86f52d70134ac68` | routing, directories, binding references, message headers; immutable |
 | `label` | `worker-1`, `code reviewer` | base routing alias; renameable |
-| `display_label` | `kc-reviewer-ryan` | optional AG2 Space display override; unique names can address the worker |
+| `display_label` | `kc-reviewer-ryan` | optional s.space display override; unique names can address the worker |
 | `incarnation_id` | minted per session | which run of that worker accepted an attempt |
 
 **The id is `uuid.uuid4().hex`** — 32 lowercase hex, exactly the
@@ -269,10 +269,15 @@ Also: per-worker namespaced state, `.tmp-<worker>` staging, no-clobber archive.
 | `live` | the worker's beat | nothing |
 | `recovering` | the core | restart the runtime; deliveries keep arriving meanwhile |
 | `abandoned` | the core | release its `.accepted` sentinels back to `.txt` for the same worker |
-| `retired` | the core | remove it from the roster; the router then sends its traffic to the core |
+| `retired` | the owner (`pool_manage.py retire`) | not supervised or advertised; the router treats it as absent and sends its traffic to the core |
 
-The router never reads `state`. These rows are the health-check's, and whatever
-marks a worker `abandoned` is the same process that recovers it.
+The router reads `state` only to treat `retired` as absent from the roster, and delivery
+re-checks it under the recipient's folder lock, so retirement fences routing before the hand-off. The other rows
+are the health-check's, and whatever marks a worker `abandoned` is the same process that
+recovers it. `pool_manage.py` is the owner's command for a worker's lifecycle: `stop`
+(the per-worker `paused` marker, then its sessions are killed), `retire`, `enable` and `remove`.
+Retiring or removing a worker that owes deliveries is refused unless the owner passes
+`--hand-off`: the explicit handoff of the takeover rules below, moving each owed task to the core.
 
 **Stale is not dead.** A beat is an mtime, 30 s, considered stale at 90 s, and a
 future-dated beat counts as stale too. A host sleep expires every beat at once. That

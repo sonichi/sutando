@@ -349,6 +349,8 @@ jobs:
           npm install --no-save --no-audit --no-fund --prefix "$RUNNER_TEMP/claude-cli" @anthropic-ai/claude-code@2.1.303
           cd packages/ag2-sparrow/ag2_sparrow/adapters/claude_code
           timeout -k 5 120 "$RUNNER_TEMP/claude-cli/node_modules/.bin/claude" plugin test ag2space-inbox
+          cd "$GITHUB_WORKSPACE/skills/pr-watch"
+          timeout -k 5 120 "$RUNNER_TEMP/claude-cli/node_modules/.bin/claude" plugin test mod
 
   shell-standalone-tests:
     name: shell tests (lanes)
@@ -403,10 +405,15 @@ jobs:
   # The ag2-sparrow tag publish runs this gate on 3.11; its suites import files from
   # all over the repo, so it runs on every PR rather than behind a paths filter.
   sparrow-publish-gate:
-    name: ag2-sparrow publish gate (python 3.11)
+    name: ag2-sparrow publish gate (python 3.11, ${{ matrix.shard }}/3)
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
+    # The same gate the tag publish runs whole, split by measured cost; leg 1 adds the drift guard.
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
     timeout-minutes: 15
     steps:
       - name: Checkout
@@ -418,19 +425,19 @@ jobs:
           python-version: '3.11'
 
       - name: Test before publish (package suites + src-drift guard)
-        run: bash packages/ag2-sparrow/tools/publish_gate.sh
+        run: bash packages/ag2-sparrow/tools/publish_gate.sh 3 ${{ matrix.shard }}
 
   python-standalone-tests:
-    name: python standalone tests (${{ matrix.shard }}/9)
+    name: python standalone tests (${{ matrix.shard }}/15)
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
-    # Legs 1-7 share the files by measured cost; legs 8-9 run the load-sensitive
+    # Legs 1-13 share the files by measured cost; legs 14-15 run the load-sensitive
     # suites (see the step). The coverage-gate job combines every leg's data.
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9]
+        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
     # Split out of `tsc + tests` so the three suites run beside each other rather
     # than one after another. Same environment, same commands — only sequencing.
     # 20, not 15: the suite now runs under coverage instrumentation (the only
@@ -476,6 +483,8 @@ jobs:
         run: |
           # Records are collected per file and replayed below in the leg's own
           # order (heaviest first), so `failed_files` keeps that order.
+          # Cost-shared legs; the matrix is these plus the load-sensitive pair after them.
+          SHARED_LEGS=13
           failed=0
           failed_files=()
           WORKERS="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)"
@@ -485,12 +494,12 @@ jobs:
           # `skills` too: a skill owns its own tests/, so a suite that moves into one
           # keeps running; the root is optional, so it is added only when present.
           bash scripts/discover-python-tests.sh > "$RECDIR/all"
-          # Legs 8-9 run the listed load-sensitive suites (a timing suite beside a CPU-heavy
-          # neighbour misses its own window); legs 1-7 get the rest.
+          # The two legs after the shared ones run the listed load-sensitive suites (a timing
+          # suite beside a CPU-heavy neighbour misses its own window); the shared legs get the rest.
           LIST=tests/python-load-sensitive-suites.txt
-          if [ "${SHARD:-1}" -ge 8 ]; then
-            # Leg 9 runs the list's `serial` suites alone, so they never share a runner's CPU.
-            KIND=only; WORKERS=2; [ "${SHARD:-1}" = 9 ] && { KIND=serial; WORKERS=1; }
+          if [ "${SHARD:-1}" -gt "$SHARED_LEGS" ]; then
+            # The last leg runs the list's `serial` suites alone, so they never share a runner's CPU.
+            KIND=only; WORKERS=2; [ "${SHARD:-1}" = $((SHARED_LEGS + 2)) ] && { KIND=serial; WORKERS=1; }
             bash scripts/select-load-sensitive-suites.sh "$KIND" "$LIST" "$RECDIR" < "$RECDIR/all" > "$RECDIR/sensitive"
             bash scripts/shard-by-cost.sh 1 1 tests/python-suite-costs.txt < "$RECDIR/sensitive" > "$RECDIR/files"
             SELECTED="$RECDIR/sensitive"
@@ -500,7 +509,7 @@ jobs:
             bash scripts/select-load-sensitive-suites.sh without "$LIST" "$RECDIR" < "$RECDIR/all" > "$RECDIR/rest"
             # Measured cost, heaviest first onto the lightest leg: every file lands in
             # exactly one leg, and the legs finish together instead of by line parity.
-            bash scripts/shard-by-cost.sh 7 "${SHARD:-1}" tests/python-suite-costs.txt < "$RECDIR/rest" > "$RECDIR/files"
+            bash scripts/shard-by-cost.sh "$SHARED_LEGS" "${SHARD:-1}" tests/python-suite-costs.txt < "$RECDIR/rest" > "$RECDIR/files"
             KIND=without SELECTED="$RECDIR/rest"
           fi
           # Runs whatever the branches did: no receipt, or a list edited after selection, exits 4.

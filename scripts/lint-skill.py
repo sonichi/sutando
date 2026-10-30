@@ -70,13 +70,13 @@ KNOWN_TOP = {
     "agent_compatibility", "dependencies", "permissions", "contract",
     "provenance", "enabled", "access_tier", "tools", "server", "startup", "config",
     "hooks", "documented_for_core", "core_description", "supervised_worker",
-    "pending_questions_store", "claude_plugin", "orphan_reaper", "audience",
+    "pending_questions_store", "claude_plugin", "orphan_reaper", "audience", "on_launch",
 }
 AUDIENCES = {"user", "developer"}
 # Fields a runtime scan activates straight from <repo>/skills, past the installers'
 # audience check, so a developer-only skill may not declare them.
 RUNTIME_ACTIVATED = ("tools", "hooks", "claude_plugin", "supervised_worker",
-                     "pending_questions_store", "documented_for_core")
+                     "pending_questions_store", "documented_for_core", "on_launch")
 # Signals a skill actually touches the network (used for the permission cross-check).
 # No trailing \b: signals ending in a space/paren (`curl `, `fetch(`) are followed
 # by a non-word char, and a trailing \b there kills the match — so `curl -s …` and
@@ -140,14 +140,15 @@ def _lint_manifest(skill_dir: Path) -> tuple[list[str], list[str]]:
                 warn(f"supervised_worker.interpreter.config '{interp['config']}' "
                      "is not declared in the config block")
 
-    # Script fields core discovers by name (src/skill_roots.py): each must be a relative .py file
+    # Script fields core discovers by name (src/skill_roots.py): each must be a relative script
     # that resolves inside the skill, symlinks followed, the containment discovery applies.
-    for field in ("pending_questions_store", "orphan_reaper"):
-        pqs = m.get(field)
-        if pqs is None:
+    for field, exts in (("pending_questions_store", (".py",)), ("orphan_reaper", (".py",)),
+                        ("on_launch", (".py", ".sh"))):
+        if field not in m:  # absent is fine; present means a script, so null is an error
             continue
-        if not isinstance(pqs, str) or not pqs.endswith(".py") or not pqs[:-3]:
-            err(f"{field} must be a relative path to a .py script")
+        pqs = m[field]
+        if not isinstance(pqs, str) or not any(pqs.endswith(e) and pqs[:-len(e)] for e in exts):
+            err(f"{field} must be a relative path to a {' or '.join(exts)} script")
         elif pqs.startswith("/") or ".." in Path(pqs).parts or any(c.isspace() for c in pqs):
             err(f"{field} must stay inside the skill directory")
         elif not (skill_dir / pqs).is_file():

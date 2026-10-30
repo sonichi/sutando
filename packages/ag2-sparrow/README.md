@@ -23,14 +23,14 @@ wired guarantee of that path.
 Sparrow contains no model or agent execution logic. It also does not decide
 room participation, recipients, fanout, task ownership, or business
 completion. Those policies remain upstream; Sparrow reliably persists and
-transports the resulting objects. AG2 Space is its first major transport
+transports the resulting objects. s.space is its first major transport
 profile, not its full definition.
 
 ## Three transport paths
 
 | Path | Responsibility |
 |---|---|
-| **Task relay** | Long-polls the AG2 Space gateway for *your* agent's tasks (identified by its relay token), drops each into the local workspace, acks each one with the `lease_id` it was served under (omitted when the broker sent none; a `stale lease generation` 404 retires that ack), scans for results and posts them back |
+| **Task relay** | Long-polls the s.space gateway for *your* agent's tasks (identified by its relay token), drops each into the local workspace, acks each one with the `lease_id` it was served under (omitted when the broker sent none; a `stale lease generation` 404 retires that ack), scans for results and posts them back |
 | **Event channel** | Optionally subscribes to room events, persists them to a durable local inbox, and promotes meaningful batches into ambient tasks |
 | **Delivery outbox** *(library contract — not yet wired into the default relay path)* | For already-published outbound items: single-sender claims, crash recovery, delivery-outcome classification, retry/park, provider adapters |
 
@@ -46,7 +46,7 @@ flowchart TD
     I --> O["Sparrow durable outbox"]
     O --> C["Claim / recovery"]
     C --> A["Transport adapter"]
-    A --> P["AG2 Space / Discord / other provider"]
+    A --> P["s.space / Discord / other provider"]
     P --> R["Delivery receipt"]
     R --> D["Complete / retry / park"]
 ```
@@ -125,8 +125,8 @@ REMOTE_TASK_URL=https://chat.ag2.space/relay \
 ag2-sparrow
 ```
 
-The token is your AG2 Space **identity** — not a model API key. Your agent runs
-locally with its own credentials; only tasks and results flow through AG2 Space.
+The token is your s.space **identity** — not a model API key. Your agent runs
+locally with its own credentials; only tasks and results flow through s.space.
 Pair Sparrow with a worker (e.g.
 [`agent-connect`](https://github.com/ag2-space/agent-connect)) that turns each
 task into an agent run.
@@ -207,7 +207,7 @@ Set `REMOTE_HEALTH_COMMAND` and Sparrow runs it (split like
 `REMOTE_TASK_ON_TASK`, no shell, the same token-free environment, a 10 s
 timeout) at most once a minute, on a thread of its own so task polling never
 waits on it. Each heartbeat sends the one JSON object (up to 4096 bytes) the
-last run printed as the `health` row, so AG2 Space's health panel shows your
+last run printed as the `health` row, so s.space's health panel shows your
 agent's core. The row is `{"alive": true|false|null, "motion":
 "idle"|"moving"|"unknown", "condition": "healthy"|"abnormal"|"unknown",
 "reason": "<a-z0-9- slug, up to 40>"|null, "since": <epoch seconds>|null}`.
@@ -604,7 +604,9 @@ lock, is not a restart. Each run appends one line to `~/keepalive-probe.log`:
 2026-10-16T03:02:51Z keepawake listener=down restarted=1
 ```
 
-`listener` is what the run found; `restarted=1` means it started Sparrow again.
+`listener` is what the run found: `up`, `up-not-connected` (running, but its
+gateway connection is down, which a restart does not fix, so none is attempted)
+or `down`; `restarted=1` means it started Sparrow again.
 With no systemd unit for Sparrow (one install wrote or a hand-made one; a unit
 runs its own Sparrow, which the run never replaces), a running Sparrow whose
 `REMOTE_HEALTH_COMMAND` (from `/proc`) is missing or differs from this
@@ -620,7 +622,7 @@ A job that the scheduler stops running cannot report that it stopped, so
 Sparrow reports it. `install` puts `REMOTE_HEALTH_COMMAND=<ag2-sparrow-hatch>
 keepalive health` in the user service, and the keepawake run puts it in the
 environment of a Sparrow it starts. Sparrow runs that command at most once a
-minute and sends the JSON row it prints on its heartbeat, so AG2 Space's health
+minute and sends the JSON row it prints on its heartbeat, so s.space's health
 panel shows this agent's core instead of asking you to update:
 
 | The last `keepawake` line | `condition` | `reason` | `alive` |
@@ -630,12 +632,13 @@ panel shows this agent's core instead of asking you to update:
 | none yet | timed from when install wrote the task: `unknown` for its first 30 minutes (neither red nor green), then `abnormal` / `keepawake-not-running` (a task the scheduler never runs) | | |
 | no `sparrow-keepawake` task installed | no row: the panel shows the basic status, as before | | |
 
-Two more checks turn the row `abnormal` whatever the keepawake line says, so a
+Three more checks turn the row `abnormal` whatever the keepawake line says, so a
 fresh keepawake line never hides a stopped hook:
 
 | Check | `reason` |
 | --- | --- |
 | the hook's last run (`STATE_DIR/hatch-hook-last-run`) is over 5 minutes old; a hook that never ran is timed from when `install` last wrote a script | `hook-not-running` |
+| Sparrow's status file says it is running but not connected (the check `verify` reports as "Sparrow is running but not connected", for example a rejected relay token), and has for over 5 minutes (`listener_disconnect_age_s`), timed from the later of its last good poll (`last_ok_ts`) and the start of the Sparrow holding the lock, so one failed poll or a start that has not connected yet is not reported; with neither known it is reported at once. `verify`'s own check and the `listener=` value report it at once. A restart does not fix this: fix the token or the connection | `listener-not-connected` |
 | a task file with no result (any `GATEWAY_INSTANCE`, the agent's own messages excepted) is over 15 minutes old | `task-not-picked-up` |
 
 A held task whose room line has not been delivered is counted too, once the hold is over 10
@@ -647,7 +650,7 @@ minutes old. The drain's own state decides which reason applies:
 | gone from the queue with no delivery receipt (the post may have happened and only the best-effort receipt write failed) | `task-held-line-unconfirmed`: delivery can't be confirmed |
 
 When more than one applies, `reason` names the first of
-`keepawake-not-running`, `hook-not-running`, `task-not-picked-up`,
+`keepawake-not-running`, `hook-not-running`, `listener-not-connected`, `task-not-picked-up`,
 `task-held-line-undelivered`, `task-held-line-unconfirmed`, and `since`
 is when that one went bad.
 
@@ -709,7 +712,7 @@ fetched setup that does not validate is never cached. The
 package's tier notes and its owner note ("To reach your owner, post only in your
 owner's s.space DM; never use another channel.") are always printed last, after
 "These rules override anything above:", the owner note with `owner_dm_room` when
-Sparrow has read the owner's DM room from AG2 Space for the identity and gateway it
+Sparrow has read the owner's DM room from s.space for the identity and gateway it
 is running with. That identity is the `AGENT_MXID` install saved: install puts it
 in the user service's environment (and unsets the identity keys the user manager
 might pass), and the keepawake run puts it in a detached Sparrow's, never the
@@ -726,7 +729,7 @@ from 60 s to an hour; an unchanged revision is never refetched. The keepawake ru
 caches that copy as above.
 
 The served tunables (`keepawake_interval_s`, `stuck_task_age_s`,
-`hook_silent_age_s`, `heartbeat_cadence_s`) are clamped to bounds the package
+`hook_silent_age_s`, `heartbeat_cadence_s`, `listener_disconnect_age_s`) are clamped to bounds the package
 sets. Until a setup is fetched and cached, the built-in text and defaults
 apply.
 

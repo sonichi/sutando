@@ -125,7 +125,7 @@ Adding through the HTTP route or the runtime API **starts the row's bridge at on
 saved connection never waits for the next restart; the response carries that `launch`
 record, and a start that fails leaves the row `failed` with its `reason`. A disabled row is
 not started (`reconnect` is the verb), nor the legacy row. Before saving, an add imports any
-`AG2_REMOTE_TOKEN_<INST>` launch key (environment or AG2 Space channel env file) that no row holds
+`AG2_REMOTE_TOKEN_<INST>` launch key (environment or s.space channel env file) that no row holds
 yet, under the instance its own launcher runs it as; a token for one of those servers adopts that row
 (`created: false`) rather than saving a second row whose bridge would hold another lease. `start`'s
 check for a running bridge is advisory; the bridge lease is what keeps one holder. The CLI `add` saves only; `start`
@@ -292,7 +292,34 @@ install at the next `bash src/startup.sh`). Un-parking never moves the primary a
 A core started from a shell, not the desktop app, is never signed in to s.space for you: it keeps
 the ag2.space bridge it started with, and goes silent if ag2.space stops taking writes. The health
 check warns (`sspace-migration`) while every row is on ag2.space and none on s.space. Nothing
-migrates by itself; from the repo:
+migrates by itself; from the repo, try the agent's existing secret first:
+
+```
+python3 scripts/connections.py move --dry-run
+python3 scripts/connections.py move --repo . --logs-dir "$(bash scripts/sutando-config.sh workspace)/logs"
+```
+
+s.space's registry started as a copy of ag2.space's, so an agent that neither server has re-coded
+since still has the same relay secret on both. `move` swaps only the gateway: it takes the ag2.space
+row's secret (the primary, else the legacy row; name another instance to pick it), puts it behind
+s.space's registered gateway and asks that gateway who it is. Only when s.space verifies the same
+agent localpart does it save the `s-space` row (settling its backlog), promote it (the ag2.space
+bridge keeps running as a secondary until you `park-legacy`), re-point the agent MCP descriptor
+and, when the worker pool is installed, bind each ag2.space room's s.space twin to the same worker.
+The descriptor is the one the core's Claude Code MCP config names (`AG2_MCP_DESCRIPTOR`) inside the
+workspace, else `state/ag2-mcp.json`; the desktop app's own descriptor is the app's and never
+touched. Its mint and MCP URLs, `relay` and `agent_id` move to s.space, and `env_file` names a
+0600 file holding the code, single-quoted. `bearer_digest` stays because the secret is the same.
+The old descriptor is kept as `<name>.bak-ag2-space`. A move whose promote failed is resumed by
+running `move` again. `--dry-run` checks and writes nothing. The secret
+is never printed. Over HTTP the same step is `POST /api/v1/connections/move` (`{"dry_run": true}`
+to check; `{"instance": "legacy"}` names the legacy row), answering `{ok, instance, agent_mxid}` or
+`{ok: false, reason}`.
+
+A refusal writes nothing and names its reason: `auth_rejected` (either server issued a new code
+since the copy), `agent_mismatch` (another agent or owner), `unverified` (a server did not confirm
+the agent), `no_token`, `no_successor` or `successor_exists` (another agent's row is already on
+s.space). Then fall back to a code:
 
 1. Get a connect code for this agent at s.space's agent portal.
 2. `python3 scripts/connections.py add '<code>'` — quote it (the code holds a `|`); it previews the
@@ -459,7 +486,7 @@ creates a row once for `REMOTE_TASK_TOKEN` and each `AG2_REMOTE_TOKEN_<INST>` in
 environment (copying the secret into the vault unless one is already there; never
 overwriting a row), then launches one bridge per `launch-plan` line through
 `scripts/connections.py launch <instance>`. When the environment holds no
-`REMOTE_TASK_TOKEN`, the primary row comes from the AG2 Space channel env file instead
+`REMOTE_TASK_TOKEN`, the primary row comes from the s.space channel env file instead
 (the one `scripts/channel-env.sh` resolves; `REMOTE_TASK_TOKEN` or the legacy
 `AG2_REMOTE_TOKEN`, environment first when both exist): a desktop install signs in after
 the engine started, so the connect flow reaches the file but never this process's

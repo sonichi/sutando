@@ -23,22 +23,6 @@ import time
 STABLE_WATCHER_BODY = "#!/bin/sh\nsleep 30; :\n"
 
 
-def process_exited(pid: int) -> bool:
-    """Execution ended; the owning parent may still need to reap a zombie."""
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return True
-    except PermissionError:
-        return False
-    try:
-        state = subprocess.run(["ps", "-p", str(pid), "-o", "stat="],
-                               capture_output=True, text=True, timeout=5)
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-    return state.returncode == 0 and state.stdout.strip().startswith("Z")
-
-
 def group_members(pgid: int) -> list[int]:
     """Live pids whose process group is pgid, from an all-process listing: a
     numeric `ps -g` means a session on procps, so the PGID column is filtered
@@ -49,6 +33,19 @@ def group_members(pgid: int) -> list[int]:
         raise RuntimeError(f"ps gave no process table (rc={r.returncode}): {r.stderr.strip()}")
     return [int(pid) for pid, pg, stat, *_ in rows
             if pg == str(pgid) and not stat.startswith("Z")]
+
+
+def has_exited(pid: int) -> bool:
+    """True once `pid` has exited, a zombie its parent has not reaped yet included.
+    A pid reused by another user's process reads as exited too."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return True
+    r = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True)
+    return r.stdout.strip().startswith("Z") or not r.stdout.strip()
 
 
 def kill_group(pgid: int, wait_s: float = 2.0) -> None:

@@ -279,7 +279,7 @@ and the self-report is idle. Result: `alive: true` (fresh heartbeat), `idle · h
 - **Moving can lag** by up to 120 s for a task that never writes a result, and by up to 90 s from
   a stale `running` self-report.
 
-## Reaching AG2 Space
+## Reaching s.space
 
 The gateway bridge computes this snapshot in-process, so a Mac or cloud Sutando without agent-api
 still reports. It sends the core's `alive`/`motion`/`condition`/`reason`/`since` on the heartbeat

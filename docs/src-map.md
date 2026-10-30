@@ -25,6 +25,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`agent-api.py`** — Sutando agent API — simple HTTP endpoint for agent-to-agent communication.
 - **`agent_availability.py`** — Two room-visible projections of one private runtime: what this agent is doing on THIS task, and whether it can take more work.
 - **`agent_endpoint.py`** — Agent Endpoint resolver — resolve(endpoint, mode) → a transport route.
+- **`agent_turn.py`** — Per-invocation turn context and the 3-outcome turn gate for relay tasks.
 - **`archive-stale-results.py`** — Archive stale `results/*.txt` files to `results/archive-YYYY-MM-DD/`.
 - **`archive-transcript.sh`** — Archive the conversation transcript on PreCompact.
 - **`artifact-cache-tools.ts`** — Active artifact cache — load a file once, answer repeated queries from in-process memory.
@@ -127,6 +128,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`install-health-check-launchd.sh`** — Install / uninstall the launchd-supervised health-check FALLBACK job.
 - **`install-sutando-app-launchd.sh`** — Install / uninstall / check the launchd-supervised Sutando.app job.
 - **`lane_dedupe.py`** — Cross-lane duplicate guard: one room message becomes one task, answered by its owner lane when known.
+- **`launch_hooks.py`** — Launch hooks: the scripts installed skills declare with the manifest field `on_launch`, each started once per core launch, detached, so no launch waits on or fails because of one.
 - **`live-agent-runtime.ts`** — LiveAgentRuntime — step 5a-2 of the interaction-planes refactor.
 - **`local_api_gate.py`** — The one gate for the loopback HTTP services' privileged routes.
 - **`local_record.py`** — Local JSON records: one object per file under a directory, each written whole in one rename and read back only when its file name is a safe single path segment that the record itself names.
@@ -218,7 +220,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`skill_config.py`** — A skill's config value, read CLI > env > the skill's manifest `config` block (skills/MANIFEST.md).
 - **`skill_hooks.py`** — Discovery for skill-declared Claude Code hooks (`hooks` in a skill manifest).
 - **`skill_install.py`** — Atomic, fail-closed installs of skill directories into the core's skills dir.
-- **`skill_roots.py`** — Where installed skills live, and what their manifests declare — the one Python scan of the sanctioned roots: the engine's `<repo>/skills` and the owner's `<workspace>/skills`, the pair `skills/install.sh` links (the TS loader `loadSkillManifestTools` scans the same two).
+- **`skill_roots.py`** — Where installed skills live, and what their manifests declare — the one Python scan of the sanctioned roots: the engine's `<repo>/skills` and the owner's `<workspace>/skills`, the pair `skills/install.sh` links (the TS loader `loadSkillManifestTools` scans these and more; consumers and their roots are listed in skills/MANIFEST.md).
 - **`skip_marker_ownership.ts`** — Suppression is universal; retirement authority is scoped to the consumer that dispatched the task.
 - **`slack-bridge.py`** — Slack bridge for Sutando — receives DMs + @mentions via Socket Mode, writes to tasks/, sends replies from results/.
 - **`slack_access.py`** — Slack access-record semantics — the three states, owned in one place.

@@ -154,6 +154,54 @@ class TestRoomEnv(Base):
         self.assertIsNone(channel_credentials.room_env(("U",), ("T",), ROOMS["s.space"]))
 
 
+class TestRoomAgentMxid(Base):
+    """channel_credentials.room_agent_mxid: the identity on the connection room_env routes to."""
+
+    def rows(self, **fields):
+        path = connections.record_path(self.three.workspace)
+        rec = json.loads(path.read_text())
+        for r in rec["connections"]:
+            r.update(fields.get(r["server"], {}))
+        path.write_text(json.dumps(rec))
+
+    def test_each_room_gets_its_own_servers_identity_from_its_channel_file(self):
+        for server in SERVERS:
+            self.three.channel_file(server, f"AGENT_MXID=@kai.agent:{server}\n")
+        for server, room in ROOMS.items():
+            self.assertEqual(channel_credentials.room_agent_mxid(room), f"@kai.agent:{server}", server)
+
+    def test_a_recorded_row_identity_wins_and_another_servers_is_never_used(self):
+        self.rows(**{"dev.s.space": {"agent_mxid": "@rec.agent:dev.s.space"}})
+        self.three.channel_file("dev.s.space", "AGENT_MXID=@kai.agent:dev.s.space\n")
+        self.three.channel_file("s.space", "AGENT_MXID=@kai.agent:ag2.space\n")
+        self.assertEqual(channel_credentials.room_agent_mxid(ROOMS["dev.s.space"]), "@rec.agent:dev.s.space")
+        self.assertEqual(channel_credentials.room_agent_mxid(ROOMS["s.space"]), "")
+
+    def test_the_channel_dir_may_be_named_by_the_environment_or_the_launch_key_file(self):
+        inst = SERVERS["s.space"][0]
+        var = "REMOTE_TASK_CHANNEL_DIR_" + connections._inst_var(inst)
+        lane = self.three.config / "channels" / "lane" / ".env"
+        lane.parent.mkdir(parents=True)
+        lane.write_text("AGENT_MXID=@kai.agent:s.space\n")
+        with mock.patch.dict(os.environ, {var: "lane"}):
+            self.assertEqual(channel_credentials.room_agent_mxid(ROOMS["s.space"]), "@kai.agent:s.space")
+        self.three.channel_file("ag2.space", f"REMOTE_TASK_TOKEN={token('ag2.space')}\n{var}=lane\n")
+        self.assertEqual(channel_credentials.room_agent_mxid(ROOMS["s.space"]), "@kai.agent:s.space")
+
+    def test_one_connection_keeps_the_callers_resolution_and_an_unreadable_home_names_none(self):
+        self.three.channel_file("dev.s.space", "AGENT_MXID=@kai.agent:dev.s.space\n")
+        with mock.patch("util_paths.claude_home_path", side_effect=OSError("no home")), \
+                self.assertLogs("connections", "DEBUG") as logs:
+            self.assertEqual(connections._launch_file_value("X"), "")
+            self.assertEqual(connections._channel_dir_value("dev-s-space", "AGENT_MXID"), "")
+        self.assertEqual([r.getMessage() for r in logs.records],
+                         ["connections: launch key file unreadable (OSError)",
+                          "connections: channel env dev-s-space unreadable (OSError)"])
+        connections.record_path(self.three.workspace).write_text(json.dumps(
+            {"schema_version": connections.SCHEMA_VERSION, "connections": []}))
+        self.assertIsNone(channel_credentials.room_agent_mxid(ROOMS["dev.s.space"]))
+
+
 class TestOwnerRoomAccess(Base):
     """Caller 1: the pending-questions and Crons room databases."""
 
