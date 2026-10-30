@@ -983,10 +983,48 @@ export type NavigateResult =
 	| { ok: true; to: NavDestination; room: string | null; posted_in: string; event_id: string | null; ms: number }
 	| { ok: false; error: string; candidates?: string[]; rooms?: string[] };
 
+/** How many unnamed rooms the owner-DM lookup reads the members of before giving up. */
+export const OWNER_DM_MAX_CHECKS = 20;
+const ownerDms = new WeakMap<McpClient, RoomRef>();
+/** The DM this agent shares with its owner: a room whose members are exactly the two of them. Unnamed
+ *  rooms are checked first (a DM has no name); found once per client, then cached. */
+export async function ownerDm(client: McpClient, me: string, owner: string, deps: Pick<ReadRoomDeps, 'log'>): Promise<RoomRef | null> {
+	const cached = ownerDms.get(client);
+	if (cached) return cached;
+	const all: { room_id: string; name: string | null }[] = [];
+	let cursor: string | undefined;
+	for (let page = 0; page < ROOM_INDEX_MAX_PAGES; page++) {
+		let payload: Record<string, unknown> | null;
+		try {
+			const res = await client.callTool('room.list', { scope: 'self', limit: ROOM_INDEX_PAGE, ...(cursor ? { cursor } : {}) }, ROOM_READ_CALL_TIMEOUT_MS);
+			payload = res.isError ? null : mcpPayload(res);
+		} catch { payload = null; }
+		if (!payload) break;
+		for (const r of Array.isArray(payload.rooms) ? payload.rooms : []) {
+			const room = r as { room_id?: unknown; name?: unknown };
+			if (typeof room.room_id === 'string') all.push({ room_id: room.room_id, name: typeof room.name === 'string' && room.name.trim() ? room.name.trim() : null });
+		}
+		cursor = typeof payload.next_cursor === 'string' && payload.next_cursor ? payload.next_cursor : undefined;
+		if (!cursor) break;
+	}
+	const ordered = [...all.filter(r => r.name === null), ...all.filter(r => r.name !== null)].slice(0, OWNER_DM_MAX_CHECKS);
+	for (const r of ordered) {
+		const ref = { room_id: r.room_id, name: r.name ?? 'your DM' };
+		const m = await roomRead(client, ref, 'room.members.list', {}, deps);
+		if (!m.ok) continue;
+		const ids = (Array.isArray(m.result.members) ? m.result.members : []).map(x => String((x as { user_id?: unknown }).user_id ?? ''));
+		if (ids.length === 2 && ids.includes(me) && ids.includes(owner)) {
+			ownerDms.set(client, ref);
+			return ref;
+		}
+	}
+	return null;
+}
+
 /**
  * Moves the owner's own screen: `commons` shows the Commons list of `room` (the session's room when none),
- * `back` leaves the screen they are on. Posted as a message in the session's room with the nav marker,
- * which the owner's clients act on; the message itself is one line saying where they are going.
+ * `back` leaves the screen they are on. The nav marker is posted only in the DM this agent shares with its
+ * owner, never in the session room, so nothing shows in a shared room; the owner's clients act on it.
  */
 export async function navigateOwner(args: { to?: string; room?: string }, deps: ReadRoomDeps): Promise<NavigateResult> {
 	const t0 = Date.now();
@@ -994,19 +1032,20 @@ export async function navigateOwner(args: { to?: string; room?: string }, deps: 
 	if (!client) return { ok: false, error: 'not_connected' };
 	const to = (args.to ?? '').trim();
 	if (!(NAV_DESTINATIONS as readonly string[]).includes(to)) return { ok: false, error: 'bad_destination' };
-	const here = await targetRoom(undefined, deps);
-	if (!here.ok) return here;
 	const list = to === 'commons' ? await targetRoom(args.room, deps) : null;
 	if (list && !list.ok) return list;
 	const owner = await ownerId(client);
 	if (!owner) return { ok: false, error: 'no_owner' };
+	const me = await selfId(client);
+	const dm = me ? await ownerDm(client, me, owner, deps) : null;
+	if (!dm) return { ok: false, error: 'no_dm' };
 	const listRoom = list && list.ok ? list.room : null;
 	const marker: Record<string, unknown> = { v: 1, to, invitee: owner, ...(listRoom ? { room_id: listRoom.room_id } : {}) };
 	const body = listRoom ? `Opening the Commons of ${listRoom.name}.` : 'Going back.';
-	const done = await roomExecute(client, here.room, 'room.message.send', { body, extra_content: { [NAV_MARKER]: marker } }, deps);
+	const done = await roomExecute(client, dm, 'room.message.send', { body, extra_content: { [NAV_MARKER]: marker } }, deps);
 	if (!done.ok) return done;
-	deps.log?.(`[RoomRead] navigate ${to}${listRoom ? ` (${listRoom.name})` : ''} in ${here.room.name}`);
-	return { ok: true, to: to as NavDestination, room: listRoom?.name ?? null, posted_in: here.room.name, event_id: typeof done.result.event_id === 'string' ? done.result.event_id : null, ms: Date.now() - t0 };
+	deps.log?.(`[RoomRead] navigate ${to}${listRoom ? ` (${listRoom.name})` : ''} in the owner DM`);
+	return { ok: true, to: to as NavDestination, room: listRoom?.name ?? null, posted_in: 'your DM', event_id: typeof done.result.event_id === 'string' ? done.result.event_id : null, ms: Date.now() - t0 };
 }
 
 export function createNavigateSpaceTool(deps: ReadRoomDeps): ToolDefinition {
@@ -1018,7 +1057,7 @@ export function createNavigateSpaceTool(deps: ReadRoomDeps): ToolDefinition {
 			'"back" leaves the screen they are on, one step ("go back", "回去", "退出文档", "close the page"), so page → list → room walks back the way they came. ' +
 			'Speech often hears "Commons" as "comments": "the list of room comments", "open the room comments", "go to the comments" with no document or thread named means the Commons list — call this with "commons", never list comment threads for it. ' +
 			'Runs at once — no read-back, no yes — then say in a few words where they are now. Only the user\'s own screen moves (their phone and web client), never anyone else\'s. ' +
-			'Errors: "bad_destination" — only "commons" or "back"; "no_owner" — say it could not be done; ' + ROOM_NAME_ERRORS +
+			'Errors: "bad_destination" — only "commons" or "back"; "no_owner" or "no_dm" — say it could not be done; ' + ROOM_NAME_ERRORS +
 			'"not_connected", "timeout" or "unavailable" — say it could not be done right now; ' + OUTCOME_UNKNOWN_ERROR,
 		parameters: z.object({
 			to: z.enum(NAV_DESTINATIONS).describe('"commons" for a room\'s Commons list; "back" to leave the current screen.'),

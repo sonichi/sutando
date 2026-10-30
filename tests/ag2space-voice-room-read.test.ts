@@ -880,74 +880,87 @@ describe('read_room lines carry each message\'s event_id and its time, whatever 
 });
 
 
-describe('navigate_space: the owner\'s own screen, moved by a nav marker in the session\'s room (Susan 2026-10-30)', () => {
+describe('navigate_space: the owner\'s own screen, moved by a nav marker posted only in the owner DM (Susan 2026-10-30; review: never in a shared room)', () => {
 	type Call = { name: string; args: Record<string, unknown> };
-	const fake = (handler: (name: string, args: Record<string, unknown>) => unknown) => {
+	const ME = '@bot:ag2.space';
+	const OWNER = '@owner:ag2.space';
+	const DM = '!dm:ag2.space';
+	const fake = (opts: { dmMembers?: string[]; rooms?: Array<{ room_id: string; name: string | null }> } = {}) => {
 		const calls: Call[] = [];
-		return { calls, client: { async callTool(name: string, args: Record<string, unknown>) { calls.push({ name, args }); const r = handler(name, args); if (r instanceof Error) throw r; return r; }, close() {} } };
+		const listed = opts.rooms ?? [{ room_id: '!shared:ag2.space', name: 'Paper QA' }, { room_id: '!other-dm:ag2.space', name: null }, { room_id: DM, name: null }];
+		const members: Record<string, string[]> = { '!other-dm:ag2.space': [ME, '@bob:ag2.space'], [DM]: opts.dmMembers ?? [ME, OWNER], '!shared:ag2.space': [ME, OWNER, '@bob:ag2.space'] };
+		const client = { async callTool(name: string, args: Record<string, unknown>) {
+			calls.push({ name, args });
+			if (name === 'ag2.whoami') return { structuredContent: { actor: { id: ME }, runtime: { owner_id: OWNER } } };
+			if (name === 'room.list') return { structuredContent: { rooms: listed } };
+			if (name === 'room.action.read') return { structuredContent: { status: 'completed', result: { members: (members[String(args.room_id)] ?? []).map(user_id => ({ user_id })) } } };
+			return { structuredContent: { status: 'completed', result: { event_id: '$nav' } } };
+		}, close() {} };
+		return { calls, client };
 	};
-	const done = (result: Record<string, unknown>) => ({ structuredContent: { status: 'completed', result } });
-	const rooms = [{ room_id: '!dm:ag2.space', name: 'Susan & Bot' }, { room_id: '!paper:ag2.space', name: 'Paper QA' }];
-	const handler = (name: string) => name === 'ag2.whoami' ? { structuredContent: { actor: { id: '@bot:ag2.space' }, runtime: { owner_id: '@owner:ag2.space' } } } : done({ event_id: '$nav' });
-	const deps = (client: { callTool: (n: string, a: Record<string, unknown>) => Promise<unknown>; close(): void }, current: { id: string; name: string } | null = { id: '!dm:ag2.space', name: 'Susan & Bot' }) =>
+	const rooms = [{ room_id: '!shared:ag2.space', name: 'Paper QA' }, { room_id: '!other:ag2.space', name: 'Design' }];
+	const deps = (client: unknown, current: { id: string; name: string } | null = { id: '!shared:ag2.space', name: 'Paper QA' }) =>
 		({ client: () => client as never, currentRoom: () => current, index: { rooms: () => rooms, refresh: async () => rooms, fetchedAt: () => Date.now() }, log: () => {} });
+	const sends = (calls: Call[]) => calls.filter(c => c.name === 'room.action.execute');
 
-	it('"go to the Commons list": the marker names the session\'s room and the owner, posted in that room, at once', async () => {
-		const f = fake(handler);
+	it('"go to the Commons list" from a shared room: the marker goes to the owner DM, naming the session room; nothing is posted in the shared room', async () => {
+		const f = fake();
 		const r = await navigateOwner({ to: 'commons' }, deps(f.client));
-		assert.deepEqual(r, { ok: true, to: 'commons', room: 'Susan & Bot', posted_in: 'Susan & Bot', event_id: '$nav', ms: r.ok ? r.ms : -1 });
-		const send = f.calls.find(c => c.name === 'room.action.execute')!;
-		assert.equal(send.args.room_id, '!dm:ag2.space');
-		assert.equal(send.args.action, 'room.message.send');
-		assert.deepEqual(send.args.arguments, { body: 'Opening the Commons of Susan & Bot.', extra_content: { [NAV_MARKER]: { v: 1, to: 'commons', invitee: '@owner:ag2.space', room_id: '!dm:ag2.space' } } });
-		assert.equal(typeof send.args.operation_id, 'string');
+		assert.deepEqual(r, { ok: true, to: 'commons', room: 'Paper QA', posted_in: 'your DM', event_id: '$nav', ms: r.ok ? r.ms : -1 });
+		const s = sends(f.calls);
+		assert.equal(s.length, 1);
+		assert.equal(s[0].args.room_id, DM);
+		assert.deepEqual(s[0].args.arguments, { body: 'Opening the Commons of Paper QA.', extra_content: { [NAV_MARKER]: { v: 1, to: 'commons', invitee: OWNER, room_id: '!shared:ag2.space' } } });
 	});
 
-	it('another room\'s list by name: the marker names that room, the message still goes to the session\'s room', async () => {
-		const f = fake(handler);
-		const r = await navigateOwner({ to: 'commons', room: 'Paper QA' }, deps(f.client));
-		assert.ok(r.ok && r.room === 'Paper QA' && r.posted_in === 'Susan & Bot');
-		const send = f.calls.find(c => c.name === 'room.action.execute')!;
-		assert.equal(send.args.room_id, '!dm:ag2.space');
-		assert.equal(((send.args.arguments as { extra_content: Record<string, { room_id: string }> }).extra_content)[NAV_MARKER].room_id, '!paper:ag2.space');
+	it('the DM is the room whose members are exactly the agent and its owner, not another unnamed room; it is found once', async () => {
+		const f = fake();
+		await navigateOwner({ to: 'back' }, deps(f.client));
+		await navigateOwner({ to: 'back' }, deps(f.client));
+		assert.equal(f.calls.filter(c => c.name === 'room.list').length, 1);
+		assert.ok(sends(f.calls).every(c => c.args.room_id === DM));
+		assert.deepEqual(sends(f.calls)[0].args.arguments, { body: 'Going back.', extra_content: { [NAV_MARKER]: { v: 1, to: 'back', invitee: OWNER } } });
 	});
 
-	it('"go back": no room in the marker', async () => {
-		const f = fake(handler);
-		const r = await navigateOwner({ to: 'back', room: 'ignored by back? no: back names no room' }, deps(f.client));
-		assert.ok(r.ok && r.to === 'back' && r.room === null);
-		const send = f.calls.find(c => c.name === 'room.action.execute')!;
-		assert.deepEqual(send.args.arguments, { body: 'Going back.', extra_content: { [NAV_MARKER]: { v: 1, to: 'back', invitee: '@owner:ag2.space' } } });
+	it('another room\'s list by name: the marker names that room, and still goes to the DM', async () => {
+		const f = fake();
+		const r = await navigateOwner({ to: 'commons', room: 'Design' }, deps(f.client));
+		assert.ok(r.ok && r.room === 'Design' && r.posted_in === 'your DM');
+		assert.equal(sends(f.calls)[0].args.room_id, DM);
+		assert.equal(((sends(f.calls)[0].args.arguments as { extra_content: Record<string, { room_id: string }> }).extra_content)[NAV_MARKER].room_id, '!other:ag2.space');
 	});
 
-	it('refused, and nothing posted: a destination it does not know, no session room, a misheard room, no owner, no client', async () => {
-		const f = fake(handler);
+	it('no DM with the owner: refused, and nothing is posted anywhere', async () => {
+		const f = fake({ dmMembers: [ME, OWNER, '@bob:ag2.space'] });
+		assert.deepEqual(await navigateOwner({ to: 'back' }, deps(f.client)), { ok: false, error: 'no_dm' });
+		assert.equal(sends(f.calls).length, 0);
+	});
+
+	it('refused before anything: unknown destination, misheard room, no owner, no client', async () => {
+		const f = fake();
 		assert.deepEqual(await navigateOwner({ to: 'settings' }, deps(f.client)), { ok: false, error: 'bad_destination' });
-		assert.deepEqual(await navigateOwner({ to: 'back' }, deps(f.client, null)), { ok: false, error: 'no_room' });
-		assert.deepEqual(await navigateOwner({ to: 'commons', room: 'Paper QB' }, deps(f.client)), { ok: false, error: 'not_found', rooms: ['Susan & Bot', 'Paper QA'] });
-		assert.equal(f.calls.filter(c => c.name === 'room.action.execute').length, 0);
-		const noOwner = fake((name) => name === 'ag2.whoami' ? { structuredContent: { actor: { id: '@bot2:ag2.space' }, runtime: {} } } : done({}));
-		assert.deepEqual(await navigateOwner({ to: 'back' }, deps(noOwner.client)), { ok: false, error: 'no_owner' });
+		assert.deepEqual(await navigateOwner({ to: 'commons', room: 'Paper QB' }, deps(f.client)), { ok: false, error: 'not_found', rooms: ['Paper QA', 'Design'] });
+		const noOwner = { async callTool(name: string) { return name === 'ag2.whoami' ? { structuredContent: { actor: { id: ME }, runtime: {} } } : { structuredContent: {} }; }, close() {} };
+		assert.deepEqual(await navigateOwner({ to: 'back' }, deps(noOwner)), { ok: false, error: 'no_owner' });
 		assert.deepEqual(await navigateOwner({ to: 'back' }, { ...deps(f.client), client: () => null }), { ok: false, error: 'not_connected' });
+		assert.equal(sends(f.calls).length, 0);
 	});
 
-	it('the tool: at once, own screen only, both destinations; it answers through navigateOwner', async () => {
-		const f = fake(handler);
+	it('the tool: at once, own screen only, both destinations; Commons misheard as comments; the document list is the Doc surface', async () => {
+		const f = fake();
 		const tool = createNavigateSpaceTool(deps(f.client));
 		assert.equal(tool.name, 'navigate_space');
 		assert.equal(tool.execution, 'inline');
 		assert.match(tool.description, /Runs at once — no read-back, no yes/);
 		assert.match(tool.description, /Only the user's own screen moves/);
 		assert.match(tool.description, /"back" leaves the screen they are on, one step/);
-		// Desktop 2026-10-30 20:41Z/20:43Z: "go to the list of room comments" was ASR for the Commons list; the agent listed comment threads.
 		assert.match(tool.description, /"the list of room comments", "open the room comments", "go to the comments" with no document or thread named means the Commons list/);
-		assert.match(ROOM_READ_PROMPT_RULE, /speech often hears Commons as "comments"/);
-		// Owner 2026-10-30 21:20Z: the Commons list is the surfaces' entry list; "document list" is the Doc surface.
 		assert.match(tool.description, /Not this: "document list", "list of documents", "show me the docs", "文档列表" mean the Doc surface and its pages — run_room_action room\.commons\.summon with arguments_json \{"kind": "markdown"\} \(no page\)/);
-		assert.match(ROOM_READ_PROMPT_RULE, /"Document list", "show me the docs", "文档列表" is the Doc surface with its pages, not the Commons list/);
-		const r = (await tool.execute({ to: 'back' }, {} as never)) as { ok: boolean };
-		assert.equal(r.ok, true);
+		assert.match(tool.description, /"no_owner" or "no_dm"/);
+		assert.equal(((await tool.execute({ to: 'back' }, {} as never)) as { ok: boolean }).ok, true);
 		assert.match(ROOM_READ_PROMPT_RULE, /→ navigate_space at once, no confirmation/);
+		assert.match(ROOM_READ_PROMPT_RULE, /speech often hears Commons as "comments"/);
+		assert.match(ROOM_READ_PROMPT_RULE, /"Document list", "show me the docs", "文档列表" is the Doc surface with its pages, not the Commons list/);
 	});
 });
 
