@@ -380,5 +380,142 @@ log_notifier() { :; }
         self.assertFalse(marked)
 
 
+class RetryCadenceTests(unittest.TestCase):
+    def test_retry_interval_cli_reports_without_mutating_pickup_state(self):
+        with tempfile.TemporaryDirectory() as temp:
+            ws = Path(temp)
+            write(idle_record(), ws)
+            with mock.patch.object(sys, "argv", ["pickup", "retry-interval", temp, "core", "7:start"]), \
+                    mock.patch.object(sys, "stdout", new_callable=io.StringIO) as output:
+                self.assertEqual(pickup.main(), 0)
+                self.assertEqual(output.getvalue(), "1\n")
+            self.assertFalse((ws/"state/codex-pickup.json").exists())
+
+    def test_matching_healthy_turn_is_fast_and_uncertain_state_backs_off(self):
+        with tempfile.TemporaryDirectory() as temp:
+            ws = Path(temp)
+            self.assertEqual(pickup.retry_interval(ws, "core", "7:start"), 30)
+            for patch in [dict(), dict(phase="tool", motion="moving")]:
+                rec = idle_record()
+                rec.update(patch)
+                write(rec, ws)
+                self.assertEqual(pickup.retry_interval(ws, "core", "7:start"), 1)
+            for patch in [dict(condition="abnormal", reason="quota-limit"),
+                          dict(phase="unknown", motion="unknown"),
+                          dict(core_incarnation="8:other"), dict(session="other"),
+                          dict(observer="other"), dict(heartbeat_at=time.time()-100)]:
+                rec = idle_record()
+                rec.update(patch)
+                write(rec, ws)
+                self.assertEqual(pickup.retry_interval(ws, "core", "7:start"), 30)
+
+    def test_recorded_hold_or_refusal_backs_off_without_releasing_any_marker(self):
+        with tempfile.TemporaryDirectory() as temp:
+            ws = Path(temp)
+            write(idle_record(), ws)
+            mark(ws, "task-a.txt", "7:start", "prompt")
+            record_event(ws, "held", "task-a.txt")
+            self.assertEqual(pickup.retry_interval(ws, "core", "7:start"), 30)
+            self.assertTrue((paths(ws)[0]/"task-a.txt").exists())
+            self.assertFalse((paths(ws)[1]/"task-a.txt").exists())
+            record_event(ws, "yielded", "task-a.txt")
+            self.assertEqual(pickup.retry_interval(ws, "core", "7:start"), 1)
+            record_event(ws, "refused", "task-a.txt", reason="observer", incarnation="7:start")
+            self.assertEqual(pickup.retry_interval(ws, "core", "7:start"), 30)
+            state = ws/"state/codex-pickup.json"
+            for contents in ["[", "[]", " "*65537]:
+                state.write_text(contents)
+                self.assertEqual(pickup.retry_interval(ws, "core", "7:start"), 30)
+            with mock.patch.object(pickup, "load", return_value=(idle_record(), None)), \
+                    mock.patch.object(Path, "stat", side_effect=PermissionError):
+                self.assertEqual(pickup.retry_interval(ws, "core", "7:start"), 30)
+
+    def run_loop(self, runtime, configured=None, duration=2.4, announce=False, queued=True,
+                 expected_exit=None, read_error=False):
+        with tempfile.TemporaryDirectory() as temp:
+            ws = Path(temp)
+            (ws/"queue").mkdir()
+            if queued:
+                (ws/"queue/task-a.txt").write_text("normal")
+            write(runtime, ws)
+            source = Path(os.environ.get("PICKUP_TEST_NOTIFIER", REPO/"src/agent/codex/cli/task-notifier.sh")).read_text()
+            match = re.search(r"^queue_retry_interval\(\) \{.*?^\}", source, re.M|re.S)
+            normalize = re.search(r"^normalize_retry_interval\(\) \{.*?^\}", source, re.M|re.S)
+            start = source.index('# `read || rc=$?`')
+            tail = source[start:]
+            fifo = ws/"events"
+            os.mkfifo(fifo)
+            fd = os.open(fifo, os.O_RDWR)
+            script = '''set -euo pipefail
+core_incarnation() { printf '7:start'; }
+pickup_event() { :; }
+reconcile_finished_pickups() { :; }
+enqueue_announced_task() { :; }
+log_notifier() { printf '%s\\n' "$*" >&2; }
+process_announced_queue() { printf 'tick\\n' >> "$WORKSPACE_DIR/ticks"; }
+''' + (normalize.group() + "\nnormalize_retry_interval || exit 2\n" if normalize else "") \
+                + (match.group() if match else "") + "\n" \
+                + ("read() { return 1; }\n" if read_error else "") + tail
+            env = {"PATH": os.environ["PATH"], "HOME": temp, "WORKSPACE_DIR": temp,
+                   "queue_dir": str(ws/"queue"), "event_dir": temp,
+                   "RESPONSIVE": "1", "RETRY_INTERVAL": configured or "30",
+                   "SESSION": "core", "PICKUP_PY": str(REPO/"src/delivery/codex_pickup.py"),
+                   "NOTIFIER_PY": sys.executable, "watcher_pid": str(os.getpid())}
+            if configured is not None:
+                env["SUTANDO_NOTIFIER_RETRY_INTERVAL"] = configured
+            proc = subprocess.Popen(["/bin/bash", "-c", script], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            try:
+                began = time.monotonic()
+                if expected_exit is not None:
+                    try:
+                        stdout, stderr = proc.communicate(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        self.fail("notifier retried instead of refusing an invalid wait")
+                    self.assertEqual(proc.returncode, expected_exit, stderr)
+                    self.assertFalse((ws/"ticks").exists(), "read failure retried queued work")
+                    self.assertTrue((ws/"queue/task-a.txt").exists())
+                    return stderr.decode()
+                if announce:
+                    os.write(fd, b"TASK_FILE: task-b.txt\n")
+                    while not (ws/"ticks").exists() and time.monotonic()-began < 1.5:
+                        time.sleep(.02)
+                    self.assertTrue((ws/"ticks").exists(), "held cadence delayed a new watcher event")
+                else:
+                    time.sleep(duration)
+                self.assertIsNone(proc.poll(), "notifier stopped instead of waiting")
+                return (ws/"ticks").read_text().count("tick") if (ws/"ticks").exists() else 0
+            finally:
+                proc.terminate()
+                proc.communicate(timeout=3)
+                os.close(fd)
+
+    def test_real_loop_honors_explicit_retry_interval(self):
+        self.assertEqual(self.run_loop(idle_record(), configured="3", duration=3.5), 1)
+
+    def test_real_fifo_refuses_invalid_intervals_before_retrying_work(self):
+        for interval in ["0", "-1", "0.5", "oops", "9999999999999999999999999999999"]:
+            with self.subTest(interval=interval):
+                stderr = self.run_loop(idle_record(), configured=interval, expected_exit=2)
+                self.assertIn("integer from 1 to 3600 seconds", stderr)
+
+    def test_real_fifo_sixty_second_interval_and_leading_zeros_still_wake_on_events(self):
+        self.assertEqual(self.run_loop(idle_record(), configured="60", announce=True), 1)
+        self.assertEqual(self.run_loop(idle_record(), configured="0003", announce=True), 1)
+
+    def test_read_failure_with_live_watcher_does_not_count_as_timeout(self):
+        stderr = self.run_loop(idle_record(), configured="3", read_error=True, expected_exit=1)
+        self.assertIn("read failed before the retry deadline", stderr)
+
+    def test_real_loop_backs_off_quota_hold_but_watcher_event_is_immediate(self):
+        rec = idle_record()
+        rec.update(condition="abnormal", reason="quota-limit")
+        self.assertEqual(self.run_loop(rec), 0)
+        self.assertEqual(self.run_loop(rec, announce=True), 1)
+
+    def test_real_loop_keeps_fast_healthy_receipt_poll_and_quiet_empty_queue(self):
+        self.assertGreaterEqual(self.run_loop(idle_record()), 2)
+        self.assertEqual(self.run_loop(idle_record(), queued=False), 0)
+
+
 if __name__ == "__main__":
     unittest.main()

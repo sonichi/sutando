@@ -342,9 +342,8 @@ def inflight_is_live(inflight_dir: "Path | str", filename: str, incarnation: str
     any marker live: not knowing which core is running is not evidence the
     prompt was never submitted.
 
-    Liveness is judged on the FIRST line only. `mark_partial_paste` writes a
-    second line (the leftover composer text) after the same incarnation; a
-    plain `mark_inflight` record never has one, so this is backward compatible.
+    Liveness uses only the first line; a second line can hold a partial paste
+    or an accepted-prompt digest without changing incarnation matching.
     """
     path = _inflight_path(inflight_dir, filename)
     try:

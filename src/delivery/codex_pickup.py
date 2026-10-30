@@ -37,6 +37,27 @@ def ready(workspace, session, incarnation, now=None):
                 and record["condition"] == "healthy")
 
 
+def retry_interval(workspace, session, incarnation, now=None):
+    record, _ = load(workspace, "core", time.time() if now is None else now)
+    if (not record or not incarnation or record["observer"] != "codex-observer"
+            or record["session"] != session or record.get("core_incarnation") != incarnation
+            or record["condition"] != "healthy" or record["phase"] in {"unknown", "failed", "waiting"}
+            or record["motion"] == "unknown"):
+        return 30
+    path = Path(workspace) / "state" / "codex-pickup.json"
+    try:
+        if path.stat().st_size > 65536:
+            return 30
+        state = json.loads(path.read_text())
+        if not isinstance(state, dict) or state.get("blocked") or state.get("admission"):
+            return 30
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError):
+        return 30
+    return 1
+
+
 def yielded(workspace, filename, incarnation, session, timeout=3600, now=None):
     inflight, acknowledged = paths(workspace)
     if not incarnation or not inflight_is_live(inflight, filename, incarnation):
@@ -165,6 +186,9 @@ def main():
     try:
         if command == "ready":
             return 0 if ready(workspace, *args) else 1
+        if command == "retry-interval":
+            print(retry_interval(workspace, *args))
+            return 0
         if command == "send":
             return send_keys(workspace, *args)
         if command == "mark":

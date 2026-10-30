@@ -33,6 +33,17 @@ CORE_READY_TIMEOUT="${SUTANDO_NOTIFIER_CORE_READY_TIMEOUT:-300}"
 # Wait this long for a watcher event before retrying a task a refusal left queued.
 # Integer seconds: bash 3.2's `read -t` rejects a fractional timeout.
 RETRY_INTERVAL="${SUTANDO_NOTIFIER_RETRY_INTERVAL:-30}"
+normalize_retry_interval() {
+  case "$RETRY_INTERVAL" in
+    ''|*[!0-9]*) printf '%s\n' 'task-notifier: retry interval must be an integer from 1 to 3600 seconds' >&2; return 2 ;;
+  esac
+  while [ "${RETRY_INTERVAL#0}" != "$RETRY_INTERVAL" ]; do RETRY_INTERVAL="${RETRY_INTERVAL#0}"; done
+  if [ -z "$RETRY_INTERVAL" ] || [ "${#RETRY_INTERVAL}" -gt 4 ] || [ "$RETRY_INTERVAL" -gt 3600 ]; then
+    printf '%s\n' 'task-notifier: retry interval must be an integer from 1 to 3600 seconds' >&2
+    return 2
+  fi
+}
+normalize_retry_interval || exit 2
 # Submit verification: re-press C-m while the prompt is still staged in the
 # composer and no result has appeared. See submit_and_confirm.
 SUBMIT_RETRIES="${SUTANDO_NOTIFIER_SUBMIT_RETRIES:-6}"
@@ -722,16 +733,31 @@ process_announced_queue() {
   done
 }
 
+queue_retry_interval() {
+  local queued incarnation
+  if [ "$RESPONSIVE" = 1 ] && [ -z "${SUTANDO_NOTIFIER_RETRY_INTERVAL:-}" ]; then
+    for queued in "$queue_dir"/*; do
+      [ -e "$queued" ] || continue
+      incarnation="$(core_incarnation)" || { printf '%s\n' "$RETRY_INTERVAL"; return; }
+      "$NOTIFIER_PY" "$PICKUP_PY" retry-interval "$WORKSPACE_DIR" "$SESSION" "$incarnation" \
+        || printf '%s\n' "$RETRY_INTERVAL"
+      return
+    done
+  fi
+  printf '%s\n' "$RETRY_INTERVAL"
+}
+
 # `read || rc=$?`, NOT `read; rc=$?` -- under `set -e` the bare form dies before
 # the assignment runs, leaving the timeout branch below unreachable.
 if [ "$RESPONSIVE" = 1 ]; then
   pickup_event startup
   reconcile_finished_pickups
-  RETRY_INTERVAL=1
 fi
 while :; do
   event="" rrc=0
-  IFS= read -r -t "$RETRY_INTERVAL" event || rrc=$?
+  retry_interval="$(queue_retry_interval)"
+  wait_started=$SECONDS
+  IFS= read -r -t "$retry_interval" event || rrc=$?
   if [ "$rrc" -eq 0 ]; then
     case "$event" in
       "TASK_FILE: "*)
@@ -744,6 +770,10 @@ while :; do
   # macOS's /bin/bash (3.2) returns 1 for a read TIMEOUT and for EOF alike, so
   # the code cannot tell them apart -- ask whether the watcher is still alive.
   if kill -0 "$watcher_pid" 2>/dev/null; then
+    if { [ "$rrc" -ne 1 ] && [ "$rrc" -le 128 ]; } || [ "$((SECONDS - wait_started))" -lt "$retry_interval" ]; then
+      log_notifier "watcher read failed before the retry deadline (status $rrc); leaving queued work unsent"
+      exit 1
+    fi
     process_announced_queue  # retry the same announced task; never rescans
     continue
   fi

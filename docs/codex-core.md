@@ -123,6 +123,11 @@ restarts and later observer turns do not replay delegated work. Related workstre
 context remains available until the result is found or the task payload disappears.
 Startup and shutdown reconcile retained artifacts, including tasks completed while
 the notifier was down and therefore omitted from the watcher’s pending sweep.
+Without an explicit `SUTANDO_NOTIFIER_RETRY_INTERVAL`, matching healthy turns are
+checked every second; empty, refused, uncertain or held queues wait 30 seconds.
+An explicit interval must be an integer from 1 to 3600 seconds; invalid values
+refuse notifier startup with a diagnostic. Watcher task announcements wake either wait
+immediately; these intervals do not change admission or recovery eligibility.
 A new core incarnation invalidates the prior incarnation's markers, as in the
 existing shared marker contract; restarting the core is not a duplicate-free retry
 for work that might have completed externally.
