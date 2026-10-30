@@ -91,16 +91,17 @@ def main() -> int:
     """The edge: resolve the workspace and the declarers, start them, and always exit 0, within
     DISCOVERY_SECONDS even when a read never returns (the work is then abandoned, not waited on)."""
     done = threading.Event()
-
-    def work() -> None:
-        try:
-            _discover_and_start()
-        finally:
-            done.set()
-    threading.Thread(target=work, name="launch-hooks", daemon=True).start()
+    threading.Thread(target=_work, args=(done,), name="launch-hooks", daemon=True).start()
     if not done.wait(DISCOVERY_SECONDS):
         print("launch-hooks: none started (discovery timed out)", file=sys.stderr)
     return 0
+
+
+def _work(done: threading.Event) -> None:
+    try:
+        _discover_and_start()
+    finally:
+        done.set()
 
 
 def _discover_and_start() -> None:

@@ -163,6 +163,25 @@ class RunnerTest(_Tmp):
         self.assertEqual(outside.read_text(), "untouched\n")
         self.assertFalse((self.out / "pipe.py.json").exists() or (self.out / "link.py.json").exists())
 
+    @unittest.skipIf(os.name == "nt", "plants a symlink and opens a device")
+    def test_a_log_that_is_not_a_regular_file_is_refused_before_and_after_the_open(self):
+        self.logs.mkdir()
+        outside = self.tmp / "outside.log"
+        outside.write_text("untouched\n")
+        (self.logs / "launch-hook-link.log").symlink_to(outside)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            started = lh.start([("link", self.hook("link.py", PY_HOOK))], self.logs, sys.executable, self.env)
+        self.assertEqual(started, [])
+        self.assertIn("launch-hooks: link: not started (log: OSError)", err.getvalue())
+        self.assertEqual(outside.read_text(), "untouched\n")
+        # Replaced between the lstat and the open: the fstat refuses it, and the fd is closed.
+        with mock.patch.object(lh.os, "lstat", side_effect=FileNotFoundError), \
+                mock.patch.object(lh.os, "close", wraps=os.close) as closed:
+            with self.assertRaises(OSError):
+                lh.open_log(Path(os.devnull))
+        self.assertEqual(closed.call_count, 1)
+
     def test_a_script_that_is_neither_py_nor_sh_is_never_run(self):
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
@@ -272,10 +291,34 @@ class EdgeTest(_Tmp):
     def test_main_hands_off_when_discovery_never_returns(self):
         release = threading.Event()
         self.addCleanup(release.set)
+        err, began = io.StringIO(), time.monotonic()
         with mock.patch.object(lh, "DISCOVERY_SECONDS", 0.5), \
-                mock.patch.object(skill_roots, "declared_scripts", lambda *a, **k: release.wait() and []):
-            err = self.run_main(self.tmp / "skills", 5)
-        self.assertIn("launch-hooks: none started (discovery timed out)", err)
+                mock.patch.object(workspace_default, "resolve_workspace", return_value=self.tmp / "ws"), \
+                mock.patch.object(skill_roots, "declared_scripts", lambda *a, **k: release.wait() and []), \
+                contextlib.redirect_stderr(err):
+            self.assertEqual(lh.main(), 0)  # in this thread: it is the call that must return
+        self.assertLess(time.monotonic() - began, 5)
+        self.assertIn("launch-hooks: none started (discovery timed out)", err.getvalue())
+
+    def test_the_discovery_work_starts_the_declarers_and_signals_done(self):
+        roots, done, err = self.tmp / "skills", threading.Event(), io.StringIO()
+        self.skill(roots, "alpha", {"on_launch": "scripts/a.py"}, "scripts/a.py")
+        with mock.patch.object(workspace_default, "resolve_workspace", return_value=self.tmp / "ws"), \
+                mock.patch.object(skill_roots, "skill_roots", return_value=[roots]), \
+                mock.patch.dict(os.environ, {"HOOK_OUT": str(self.out), "HOOK_PY": sys.executable}), \
+                contextlib.redirect_stderr(err):
+            lh._work(done)
+        self.assertTrue(done.is_set())
+        self.assertEqual(re.findall(r"started (\S+)", err.getvalue()), ["alpha"])
+        wait_for(self.out / "a.py.json")
+
+    def test_the_discovery_work_signals_done_and_starts_nothing_when_the_scan_fails(self):
+        done, err = threading.Event(), io.StringIO()
+        with mock.patch.object(workspace_default, "resolve_workspace", side_effect=RuntimeError("no config")), \
+                contextlib.redirect_stderr(err):
+            lh._work(done)
+        self.assertTrue(done.is_set())
+        self.assertIn("launch-hooks: none started (RuntimeError)", err.getvalue())
 
     def test_main_exits_0_when_the_scan_fails(self):
         err = io.StringIO()
@@ -389,22 +432,6 @@ class WindowsTest(_Tmp):
         started = lh.start([("one", self.hook("one.py", PY_HOOK))], self.logs, sys.executable, self.env)
         self.assertEqual([n for n, _ in started], ["one"])
         self.assertEqual(wait_for(self.out / "one.py.json")["stdin"], "")
-
-
-class WindowsLauncherTest(unittest.TestCase):
-    """scripts/start-cli.ps1, the Windows core launcher src/startup.ps1 runs, starts the hooks before
-    either launch path; tests/windows-launch-hooks.test.ps1 runs it on the Windows job."""
-
-    def test_the_hooks_run_after_the_already_running_exit_and_before_both_launch_paths(self):
-        text = (REPO / "scripts" / "start-cli.ps1").read_text(encoding="utf-8")
-        calls = [m.start() for m in re.finditer(r"Join-Path \$REPO 'src/launch_hooks\.py'", text)]
-        self.assertEqual(len(calls), 1, "one launch_hooks.py call")
-        already = text.index("sutando-core already running")
-        foreground = text.index("& $claudeCmd.Source @claudeArgs")
-        window = text.index("Start-Process -FilePath")
-        self.assertLess(already, calls[0])
-        self.assertLess(calls[0], min(foreground, window))
-        self.assertIn("Resolve-SutandoPython", text[already:calls[0] + 80])
 
 
 STALL_HOOK = """import os, time

@@ -134,5 +134,20 @@ class Declarations(_Tmp):
         self.assertEqual(skill_roots.declared(FIELD, roots=[self.engine]).script, None)
 
 
+
+class ReadManifest(_Tmp):
+    def test_only_a_regular_file_within_the_cap_is_read(self):
+        d = Path(tempfile.mkdtemp(dir=self.tmp))
+        ok, big, folder = d / "ok.json", d / "big.json", d / "dir.json"
+        ok.write_text('{"a": 1}')
+        big.write_text('"' + "x" * skill_roots.MANIFEST_MAX_BYTES + '"')
+        folder.mkdir()
+        self.assertEqual(skill_roots.read_manifest(ok), {"a": 1})
+        self.assertRaises(ValueError, skill_roots.read_manifest, big)
+        self.assertRaises(OSError, skill_roots.read_manifest, folder)
+        if hasattr(os, "mkfifo"):  # opened without waiting for a writer, then refused
+            os.mkfifo(d / "fifo.json")
+            self.assertRaises(OSError, skill_roots.read_manifest, d / "fifo.json")
+
 if __name__ == "__main__":
     unittest.main()
