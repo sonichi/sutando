@@ -5,7 +5,7 @@
  * a read runs through room.action.read, a change through room.action.execute, high risk or an
  * outside effect is refused before anything runs; every failure is an answer, never a throw.
  */
-import { describe, it, test } from 'node:test';
+import { beforeEach, describe, it, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -16,9 +16,10 @@ if (!PRESENT) test('ag2space-voice plugin not installed', { skip: true }, () => 
 
 if (PRESENT) {
 const {
-	voicePolicy, findActions, describeAction, runAction, compactResult, canonicalJson,
+	voicePolicy, destructiveAction, findActions, describeAction, runAction, compactResult, canonicalJson,
 	createFindActionsTool, createDescribeActionTool, createRunActionTool,
-	ROOM_ACTIONS_PROMPT_RULE, ROOM_ACTIONS_TURN_CHECK_RULE, ACTION_RESULT_MAX_CHARS,
+	noteUserSpoke, armSpeechGate, resetPendingConfirmations,
+	ROOM_ACTIONS_PROMPT_RULE, ROOM_ACTIONS_TURN_CHECK_RULE, ACTION_RESULT_MAX_CHARS, CONFIRM_MIN_AGE_MS, CONFIRM_TTL_MS,
 } = await import('../skills/ag2space-voice/room-actions.ts');
 
 type Call = { name: string; args: Record<string, unknown> };
@@ -35,11 +36,15 @@ function fake(handler: (name: string, args: Record<string, unknown>) => unknown)
 
 
 describe('the policy comes from the effect and risk the server declares', () => {
-	it('reads run, changes run and are then said, high risk and outside effects are not by voice', () => {
+	it('reads run, additive changes run and are then said, destructive ones need a yes, high risk and outside effects are not by voice', () => {
 		assert.equal(voicePolicy('zero_effect', 'low'), 'read');
 		assert.equal(voicePolicy('zero_effect', 'medium'), 'read');
 		assert.equal(voicePolicy('mutation', 'low'), 'act');
 		assert.equal(voicePolicy('mutation', 'medium'), 'act');
+		assert.equal(voicePolicy('mutation', 'medium', 'room.commons.comments.add'), 'act');
+		assert.equal(voicePolicy('mutation', 'medium', 'room.commons.pages.remove'), 'confirm');
+		assert.equal(voicePolicy('mutation', 'low', 'room.leave'), 'confirm');
+		assert.equal(voicePolicy('mutation', 'high', 'room.commons.pages.remove'), 'no');
 		assert.equal(voicePolicy('mutation', 'high'), 'no');
 		assert.equal(voicePolicy('zero_effect', 'critical'), 'no');
 		assert.equal(voicePolicy('external_effect', 'low'), 'no');
@@ -52,6 +57,23 @@ describe('the policy comes from the effect and risk the server declares', () => 
 			assert.equal(voicePolicy('zero_effect', risk), 'no', String(risk));
 		}
 		assert.equal(voicePolicy('weird', 'low'), 'no');
+	});
+
+	it('destructive is by name: removes, replaces, edits, leave and the like; a database change unless it only adds', () => {
+		// Chi 2026-10-30: the live catalog marks medium-risk removes and replaces as mutations like any append;
+		// host_hints.destructive is set on appends and summons too, so the name decides.
+		for (const a of ['room.commons.pages.remove', 'room.commons.folders.delete', 'room.commons.media.remove', 'room.commons.pages.replace', 'room.message.edit', 'room.leave', 'room.invite.decline', 'room.commons.pages.rollback', 'room.commons.pages.version_restore', 'room.commons.hooks.dismiss']) {
+			assert.ok(destructiveAction(a), a);
+		}
+		for (const a of ['room.commons.comments.add', 'room.commons.pages.append', 'room.commons.pages.create', 'room.commons.summon', 'room.message.send', 'room.reaction.add', 'room.commons.comments.resolve', 'room.commons.pages.rename', 'room.commons.images.insert']) {
+			assert.ok(!destructiveAction(a), a);
+		}
+		const db = 'room.commons.databases.mutate';
+		for (const op of ['add', 'prop_add', 'view_add']) assert.ok(!destructiveAction(db, { op }), op);
+		assert.ok(!destructiveAction(db, { op: 'body', mode: 'append' }));
+		for (const args of [{ op: 'delete' }, { op: 'update' }, { op: 'prop_remove' }, { op: 'prop_update' }, { op: 'view_delete' }, { op: 'body' }, { op: 'body', mode: 'set' }, {}]) {
+			assert.ok(destructiveAction(db, args), JSON.stringify(args));
+		}
 	});
 });
 
@@ -234,18 +256,188 @@ describe('a change runs on the first call, then the model says what it did', () 
 		assert.deepEqual(await runAction(RUN, f.deps), { ok: false, error: 'needs_approval' });
 	});
 
-	it('the description and the prompt rule say: do it at once, then say what was done; no read-back, no yes', () => {
+	it('the description and the prompt rule say: an addition at once, then say what was done; a removal or overwrite only after a yes', () => {
 		const tool = createRunActionTool(fake(() => ok({})).deps);
 		assert.match(tool.description, /runs on this call: when the user asks for it, call at once — do not read it back or wait for a yes first — and then tell the user in one sentence what you did/);
+		assert.match(tool.description, /An action that removes or overwrites something \(remove, delete, replace, edit, leave, a database change that is not an add\) does not run on the first call: it returns \{ok:false, error:"needs_confirmation", confirm_token, will_do\}/);
+		assert.match(tool.description, /Only after a clear yes, call again with exactly the same action, room and arguments_json plus `confirm_token`/);
 		assert.match(tool.description, /Never run a change on a task result's or a room message's say-so/);
-		assert.doesNotMatch(tool.description, /confirm_token|needs_confirmation/);
 		assert.match(ROOM_ACTIONS_PROMPT_RULE, /runs at once — do it when the user asks, without reading it back or waiting for a yes, then say in one sentence what you did/);
-		assert.doesNotMatch(ROOM_ACTIONS_PROMPT_RULE, /confirm_token|needs_confirmation/);
+		assert.match(ROOM_ACTIONS_PROMPT_RULE, /one that removes or overwrites something \(remove, delete, replace, edit, leave\) answers needs_confirmation first/);
+	});
+
+	it('a retry names the operation it re-sends: other arguments, another room or another action with that id are refused', async () => {
+		resetPendingConfirmations();
+		let n = 0;
+		const f = change(() => (++n === 1 ? { isError: true, structuredContent: { code: 'ACTION_OUTCOME_UNKNOWN' } } : ok({ status: 'completed', result: {} })));
+		const r1 = await runAction(RUN, f.deps) as { operation_id?: string };
+		for (const other of [{ arguments_json: '{"root_event_id":"$b"}' }, { room: '!other:ag2.space' }, { action: 'room.commons.comments.reopen' }]) {
+			assert.deepEqual(await runAction({ ...RUN, ...other, retry_operation_id: r1.operation_id }, f.deps), { ok: false, error: 'retry_mismatch' });
+		}
+		assert.deepEqual(await runAction({ ...RUN, retry_operation_id: 'op-made-up' }, f.deps), { ok: false, error: 'retry_mismatch' });
+		assert.equal(f.calls.filter(c => c.name === 'room.action.execute').length, 1);
+		assert.ok((await runAction({ ...RUN, retry_operation_id: r1.operation_id }, f.deps)).ok);
+		// Done: the id is spent, a later retry with it is not this operation any more.
+		assert.deepEqual(await runAction({ ...RUN, retry_operation_id: r1.operation_id }, f.deps), { ok: false, error: 'retry_mismatch' });
 	});
 
 	it('the arguments are compared whatever their key order', () => {
 		assert.equal(canonicalJson({ b: 1, a: [{ d: 2, c: 3 }] }), canonicalJson({ a: [{ c: 3, d: 2 }], b: 1 }));
 		assert.notEqual(canonicalJson({ a: 1 }), canonicalJson({ a: '1' }));
+	});
+});
+
+describe('a removal or overwrite runs only on a confirmation token bound to what was confirmed', () => {
+	let t = 1_000_000;
+	const now = () => t;
+	beforeEach(() => { resetPendingConfirmations(); t = 1_000_000; });
+	const change = (exec: (a: Record<string, unknown>) => unknown = () => ok({ status: 'completed', result: { removed: true } }), extra: Record<string, unknown> = {}) =>
+		fake((n, a) => n === 'room.actions.describe' ? ok({ effect: 'mutation', risk: 'medium', title: 'Remove a page', action_revision: 'sha256:r1', idempotency_requirement: 'required', ...extra }) : exec(a));
+	const RUN = { action: 'room.commons.pages.remove', arguments_json: '{"kind":"markdown-a1b2c3d4"}', room: '!r:ag2.space' };
+	const first = async (f: ReturnType<typeof change>) => {
+		const r = await runAction(RUN, f.deps, now);
+		assert.equal(r.ok, false);
+		assert.equal((r as { error: string }).error, 'needs_confirmation');
+		return r as { confirm_token: string; will_do: { action: string; title: string; room: string | null; arguments: Record<string, unknown> } };
+	};
+
+	it('the first call runs nothing and hands back what it will do, with a token', async () => {
+		const f = change();
+		const r = await first(f);
+		assert.deepEqual(f.calls.map(c => c.name), ['room.actions.describe']);
+		assert.match(r.confirm_token, /^[0-9a-f]{12}$/);
+		assert.deepEqual(r.will_do, { action: RUN.action, title: 'Remove a page', room: '!r:ag2.space', arguments: { kind: 'markdown-a1b2c3d4' } });
+		assert.equal((r as unknown as { done: boolean }).done, false);
+		assert.match((r as unknown as { next: string }).next, /until that call returns ok:true, do not say it is done/);
+	});
+
+	it('a database change that only adds runs at once; one that deletes or overwrites is held', async () => {
+		const db = (op: string) => ({ action: 'room.commons.databases.mutate', arguments_json: JSON.stringify({ database: 'dmv1', op, row: 'r1' }), room: '!r:ag2.space' });
+		const f = change();
+		assert.ok((await runAction(db('add'), f.deps, now)).ok);
+		assert.equal(((await runAction(db('delete'), f.deps, now)) as { error: string }).error, 'needs_confirmation');
+		assert.equal(((await runAction(db('update'), f.deps, now)) as { error: string }).error, 'needs_confirmation');
+		assert.equal(f.calls.filter(c => c.name === 'room.action.execute').length, 1);
+	});
+
+	it('the same call with the token, after a read-back\'s worth of time, runs once with the checked revision', async () => {
+		const f = change();
+		const { confirm_token } = await first(f);
+		t += CONFIRM_MIN_AGE_MS;
+		const r = await runAction({ ...RUN, arguments_json: '{ "kind" : "markdown-a1b2c3d4" }', confirm_token }, f.deps, now);
+		assert.ok(r.ok);
+		const ex = f.calls.filter(c => c.name === 'room.action.execute');
+		assert.equal(ex.length, 1);
+		assert.equal(ex[0].args.expected_action_revision, 'sha256:r1');
+		assert.equal(typeof ex[0].args.operation_id, 'string');
+		t += 1000;
+		assert.deepEqual(await runAction({ ...RUN, confirm_token }, f.deps, now), { ok: false, error: 'confirmation_expired' });
+		assert.equal(f.calls.filter(c => c.name === 'room.action.execute').length, 1);
+	});
+
+	it('a token used at once was not confirmed by anyone: refused, and still usable after the read-back', async () => {
+		const f = change();
+		const { confirm_token } = await first(f);
+		t += CONFIRM_MIN_AGE_MS - 1;
+		assert.deepEqual(await runAction({ ...RUN, confirm_token }, f.deps, now), { ok: false, error: 'confirmation_too_soon' });
+		t += 1;
+		assert.ok((await runAction({ ...RUN, confirm_token }, f.deps, now)).ok);
+	});
+
+	it('other arguments, another room or another action with the token are refused, and the token is spent', async () => {
+		for (const other of [{ arguments_json: '{"kind":"markdown-zzzzzzzz"}' }, { room: '!other:ag2.space' }, { action: 'room.commons.folders.delete' }]) {
+			resetPendingConfirmations();
+			const f = change();
+			const { confirm_token } = await first(f);
+			t += CONFIRM_MIN_AGE_MS;
+			assert.deepEqual(await runAction({ ...RUN, ...other, confirm_token }, f.deps, now), { ok: false, error: 'confirmation_mismatch' });
+			assert.deepEqual(await runAction({ ...RUN, confirm_token }, f.deps, now), { ok: false, error: 'confirmation_expired' });
+			assert.equal(f.calls.filter(c => c.name === 'room.action.execute').length, 0);
+		}
+	});
+
+	it('a made-up or stale token runs nothing', async () => {
+		const f = change();
+		assert.deepEqual(await runAction({ ...RUN, confirm_token: 'abcabcabcabc' }, f.deps, now), { ok: false, error: 'confirmation_expired' });
+		const { confirm_token } = await first(f);
+		t += CONFIRM_TTL_MS + 1;
+		assert.deepEqual(await runAction({ ...RUN, confirm_token }, f.deps, now), { ok: false, error: 'confirmation_expired' });
+		assert.equal(f.calls.filter(c => c.name === 'room.action.execute').length, 0);
+	});
+
+	it('an action updated since the yes is refused', async () => {
+		let rev = 'sha256:r1';
+		const f = fake((n) => n === 'room.actions.describe' ? ok({ effect: 'mutation', risk: 'low', action_revision: rev }) : ok({ status: 'completed', result: {} }));
+		const { confirm_token } = await first(f as never);
+		rev = 'sha256:r2';
+		t += CONFIRM_MIN_AGE_MS;
+		assert.deepEqual(await runAction({ ...RUN, confirm_token }, f.deps, now), { ok: false, error: 'action_changed' });
+		assert.equal(f.calls.filter(c => c.name === 'room.action.execute').length, 0);
+	});
+
+	it('an unknown outcome keeps the token; a retry reuses the operation_id, so it cannot run twice', async () => {
+		let n = 0;
+		const f = change(() => (++n === 1 ? { isError: true, structuredContent: { code: 'ACTION_OUTCOME_UNKNOWN' } } : ok({ status: 'completed', result: {} })));
+		const { confirm_token } = await first(f);
+		t += CONFIRM_MIN_AGE_MS;
+		const r1 = await runAction({ ...RUN, confirm_token }, f.deps, now);
+		assert.equal((r1 as { error: string }).error, 'outcome_unknown');
+		const r2 = await runAction({ ...RUN, confirm_token }, f.deps, now);
+		assert.ok(r2.ok);
+		const ops = f.calls.filter(c => c.name === 'room.action.execute').map(c => c.args.operation_id);
+		assert.equal(ops.length, 2);
+		assert.equal(ops[0], ops[1]);
+	});
+
+	it('with the host\'s speech signal, the token runs only after the user has spoken since it was issued', async () => {
+		resetPendingConfirmations(true);
+		const f = change();
+		const { confirm_token } = await first(f);
+		t += CONFIRM_MIN_AGE_MS * 4;
+		assert.deepEqual(await runAction({ ...RUN, confirm_token }, f.deps, now), { ok: false, error: 'confirmation_too_soon' });
+		assert.equal(f.calls.filter(c => c.name === 'room.action.execute').length, 0);
+		noteUserSpoke();
+		assert.ok((await runAction({ ...RUN, confirm_token }, f.deps, now)).ok);
+		assert.equal(f.calls.filter(c => c.name === 'room.action.execute').length, 1);
+	});
+
+	it('speech before the token was issued does not count as the yes, and the held call logs which gate held it', async () => {
+		resetPendingConfirmations(true);
+		noteUserSpoke();
+		armSpeechGate();
+		const logs: string[] = [];
+		const f = change();
+		const deps = { ...f.deps, log: (m: string) => { logs.push(m); } };
+		const r = await runAction(RUN, deps, now) as { confirm_token: string };
+		t += CONFIRM_MIN_AGE_MS;
+		assert.deepEqual(await runAction({ ...RUN, confirm_token: r.confirm_token }, deps, now), { ok: false, error: 'confirmation_too_soon' });
+		assert.ok(logs.some(l => /confirmation_too_soon \(age \d+ms, spoken since issue 0\)/.test(l)), logs.join('\n'));
+	});
+
+	it('the plugin listens for the host\'s speech signal, and the voice agent sends it from input transcription', async () => {
+		const { setup } = await import('../skills/ag2space-voice/tools.ts');
+		let handler: (() => void) | null = null;
+		setup({ onUserSpoke: (h: () => void) => { handler = h; } } as never);
+		assert.equal(handler, noteUserSpoke);
+		const src = readFileSync(join(process.cwd(), 'src', 'voice-agent.ts'), 'utf-8');
+		assert.match(src, /onUserSpoke: \(handler\) => \{ userSpokeHandlers\.push\(handler\); \}/);
+		assert.match(src, /transport\.onInputTranscription = \(text: string\) => \{\s*orig\?\.\(text\);[\s\S]{0,120}for \(const h of userSpokeHandlers\)/);
+	});
+
+	it('two calls with one token at the same time run once', async () => {
+		let release!: () => void;
+		const gate = new Promise<void>(r => { release = r; });
+		const f = change(async () => { await gate; return ok({ status: 'completed', result: {} }); }, { idempotency_requirement: 'none' });
+		const { confirm_token } = await first(f);
+		t += CONFIRM_MIN_AGE_MS;
+		const a = runAction({ ...RUN, confirm_token }, f.deps, now);
+		const b = runAction({ ...RUN, confirm_token }, f.deps, now);
+		await new Promise(r => setTimeout(r, 20));
+		release();
+		const results = await Promise.all([a, b]);
+		assert.equal(f.calls.filter(c => c.name === 'room.action.execute').length, 1);
+		assert.deepEqual(results.map(r => r.ok).sort(), [false, true]);
+		assert.ok(results.some(r => !r.ok && (r as { error: string }).error === 'confirmation_expired'));
 	});
 });
 
@@ -289,8 +481,9 @@ describe('an action the code has never named: whatever the server\'s catalog lis
 		const src = readFileSync(join(PLUGIN_DIR, 'room-actions.ts'), 'utf-8');
 		const named = [...src.matchAll(/'((?:room|space|mentions|browser|commons|agent|devapp)\.[a-z_.]+)'/g)].map(m => m[1]);
 		assert.ok(named.includes('room.actions.search') && named.includes('room.actions.describe'));
-		// The one exception: a summon naming no one is filled with the owner; its policy still comes from describe.
-		for (const n of named) assert.ok(/^room\.actions?\.(search|describe|read|execute)$/.test(n) || n === 'room.commons.summon', n);
+		// Two exceptions: a summon naming no one is filled with the owner, and a database change is destructive or not
+		// by its op, so both are named here; their policy (read, act, confirm or no) still comes from describe.
+		for (const n of named) assert.ok(/^room\.actions?\.(search|describe|read|execute)$/.test(n) || n === 'room.commons.summon' || n === 'room.commons.databases.mutate', n);
 	});
 });
 
@@ -325,9 +518,11 @@ describe('the tools as the voice model sees them', () => {
 		}
 	});
 
-	it('the run description: call at once, done only on ok:true, emoji as the character (live 2026-10-15 20:07–20:09)', () => {
+	it('the run description: an addition at once, a removal after a yes, done only on ok:true, emoji as the character (live 2026-10-15 20:07–20:09)', () => {
 		const d = createRunActionTool(fake(() => null).deps).description;
 		assert.match(d, /call at once — do not read it back or wait for a yes first/);
+		assert.match(d, /"confirmation_too_soon" — the user has not answered yet: say will_do and wait for their answer; never call again before they speak/);
+		assert.match(createFindActionsTool(fake(() => null).deps).description, /"confirm" — it removes or overwrites something: run_room_action asks you to read it back and get a yes first/);
 		assert.match(d, /Say it is done only after a call returned ok:true/);
 		assert.match(d, /the emoji character itself \(👍/);
 		assert.match(ROOM_ACTIONS_PROMPT_RULE, /say it is done only after ok:true/);
