@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -23,12 +22,15 @@ from pathlib import Path
 # A record stamped further ahead than this is not clock skew, it is corruption.
 FUTURE_SKEW_S = 5.0
 
-# The bridge's GATEWAY_INSTANCE shape; anything else in the selector is ignored.
-_LANE_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*(\.[a-z0-9][a-z0-9_-]*)*$")
+# Selector values that mean "every lane", never one lane's file.
+_NOT_A_LANE = ("all", "primary")
 
 
 def active_lane() -> str | None:
-    """The desktop's signed-in gateway lane ($SUTANDO_APP_SUPPORT/channels/active-gateway-lane), or None."""
+    """The desktop's signed-in gateway lane: the first line of
+    $SUTANDO_APP_SUPPORT/channels/active-gateway-lane when it is an instance name by the bridge's own
+    bound (connections.INSTANCE_RE) other than all/primary. None otherwise, and for a process started
+    without that variable (a shell-run job), which therefore reads the primary connection's sidecar."""
     root = (os.environ.get("SUTANDO_APP_SUPPORT") or "").strip()
     if not root:
         return None
@@ -37,7 +39,8 @@ def active_lane() -> str | None:
     except (OSError, UnicodeDecodeError):
         return None
     lane = lines[0].strip() if lines else ""
-    return lane if _LANE_RE.match(lane) and lane not in ("all", "primary") else None
+    from connections import INSTANCE_RE
+    return lane if INSTANCE_RE.fullmatch(lane) and lane not in _NOT_A_LANE else None
 
 
 def status_path(state_dir) -> Path:
@@ -46,8 +49,11 @@ def status_path(state_dir) -> Path:
     lane = active_lane()
     if lane:
         p = Path(state_dir) / f"gateway-status.{lane}.json"
-        if p.exists():
-            return p
+        try:
+            if p.exists():
+                return p
+        except OSError:
+            pass
     from connections import primary_sidecar_name
     return Path(state_dir) / primary_sidecar_name(state_dir)
 

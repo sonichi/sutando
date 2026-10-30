@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """The sidecar readers resolve the desktop's active lane to state/gateway-status.<lane>.json,
-falling back to state/gateway-status.json. Exit code: 0 on pass, 1 on fail."""
+falling back to the primary connection's sidecar (state/gateway-status.json without a primary row).
+A selector outside the bridge's instance bound is no lane and must never raise. Exit code: 0 on pass, 1 on fail."""
 
 from __future__ import annotations
 
@@ -73,16 +74,16 @@ check("core-input-watch reads the active lane", ciw._gateway_status(str(STATE)) 
 ss = load("ss_active_lane", "services_status.py")
 ss.STATE_DIR = STATE
 row = next(s for s in ss.service_registry() if s["id"] == "gateway")
-if True:
-    check("services_status probes the active lane", row["probe"][1] == STATE / "gateway-status.s_dspace.json",
-          str(row["probe"][1]))
+check("services_status probes the active lane", row["probe"][1] == STATE / "gateway-status.s_dspace.json",
+      str(row["probe"][1]))
 state, _detail, _since = ss.probe_gateway(gs.status_path(STATE), "no-such-pattern", NOW, lambda *a, **k: None)
 check("services_status reports the lane connected", state == "running", state)
 
-# --- selector that names no usable lane: the unsuffixed file is read
-for sel in (None, "", "all", "primary", "../etc", "S_DSPACE"):
+# --- selector that names no usable lane: no lane, and the unsuffixed file is read
+for sel in (None, "", "all", "primary", "../etc", "s.dspace", "s dspace", "a" * 33, "a" * 256):
     select(sel)
-    check(f"selector {sel!r} falls back to gateway-status.json",
+    check(f"selector {sel[:12] if sel else sel!r} is not a lane", gs.active_lane() is None, repr(gs.active_lane()))
+    check(f"selector {sel[:12] if sel else sel!r} falls back to gateway-status.json",
           gs.status_path(STATE) == STATE / "gateway-status.json", str(gs.status_path(STATE)))
 
 # --- legacy single file still works
@@ -96,6 +97,26 @@ check("legacy: core-input-watch reads gateway-status.json", ciw._gateway_status(
 select("s_dspace")
 check("missing lane file falls back", gs.status_path(STATE) == STATE / "gateway-status.json", str(gs.status_path(STATE)))
 check("missing lane file: health-check still reads the legacy file", hc._gateway_serving() is True)
+
+# --- selector past the instance bound (33 and 256 chars): nothing raises, every reader reads the primary file
+for n in (33, 256):
+    select("a" * n)
+    try:
+        check(f"{n}-char selector: resolver falls back", gs.status_path(STATE) == STATE / "gateway-status.json")
+        check(f"{n}-char selector: health-check reads the primary file", hc._gateway_serving() is True)
+        check(f"{n}-char selector: core-input-watch reads the primary file", ciw._gateway_status(str(STATE)) is True)
+        row = next(s for s in ss.service_registry() if s["id"] == "gateway")
+        check(f"{n}-char selector: services_status probes the primary file",
+              row["probe"][1] == STATE / "gateway-status.json", str(row["probe"][1]))
+    except OSError as e:
+        check(f"{n}-char selector raised", False, repr(e))
+
+# --- stale primary beside a serving active lane: the lane answers, not the stale file
+(STATE / "gateway-status.json").write_text(json.dumps({"ts": NOW - 17000, "connected": True, "last_ok_ts": NOW - 17000}))
+(STATE / "gateway-status.s_dspace.json").write_text(json.dumps(SERVING))
+select("s_dspace")
+check("stale primary: health-check reads the serving lane", hc._gateway_serving() is True, repr(hc._gateway_serving()))
+check("stale primary: core-input-watch reads the serving lane", ciw._gateway_status(str(STATE)) is True)
 
 if failures:
     print("FAIL:\n  " + "\n  ".join(failures))
