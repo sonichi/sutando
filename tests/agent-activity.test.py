@@ -506,6 +506,15 @@ class Hook(unittest.TestCase):
         # a task file that does not exist binds nothing
         self.assertEqual(hook.handle(self.pre("S1", "Read", {"file_path": "tasks/task-000000.txt"}), self.p, self.run), [])
 
+    def test_a_gateway_instance_task_binds_under_its_whole_id(self):
+        tid = "task-ag2space_dlocal~task-9c65da61713b5c635f"
+        (self.ws / "tasks" / f"{tid}.txt").write_text(f"id: {tid}\nchannel_id: !r:s\nuser_id: @o:s\ntask: sleep 90\n")
+        out = hook.handle(self.pre("S1", "Read", {"file_path": str(self.ws / "tasks" / f"{tid}.txt")}), self.p, self.run)
+        self.assertEqual(out[0][0], "processing")
+        self.assertEqual(self.runs[-1][self.runs[-1].index("--task-id") + 1], tid)
+        self.assertEqual(hook.load_json(self.p["bind"], {}), {tid: "S1"})
+        self.assertEqual(hook.result_file_refs(f"echo DONE > results/{tid}.txt"), [tid])
+
     def test_a_late_touch_of_an_answered_task_neither_binds_nor_reopens_it(self):
         # The result exists (answered by a dedup or an earlier session): a re-read, a dedup check
         # naming the file, or another session's touch must not write a Processing row after the Done.

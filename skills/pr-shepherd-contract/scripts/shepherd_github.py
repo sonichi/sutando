@@ -26,7 +26,7 @@ from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
 
-from local_task_protocol import valid_task_id  # noqa: E402
+from local_task_protocol import valid_local_task_id  # noqa: E402
 from shepherd_contract import (  # noqa: E402
     Actor,
     ObservedEvent,
@@ -175,11 +175,11 @@ def _contract_path(task_id: str) -> Path:
     """The only place a task_id becomes a path. Unvalidated ids escape the
     directory (`../../x`), and the repository already owns the gate.
 
-    EXACT str first: a subclass can satisfy valid_task_id() on its underlying
+    EXACT str first: a subclass can satisfy valid_local_task_id() on its underlying
     value while __format__ renders something else into the path."""
     if type(task_id) is not str:
         raise ValueError(f"task_id must be an exact str, got {type(task_id).__name__}")
-    if not valid_task_id(task_id):
+    if not valid_local_task_id(task_id):
         raise ValueError(f"refusing to build a path from invalid task_id: {task_id!r}")
     return state_dir() / f"{task_id}.json"
 
