@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""The `state/pool-suspended` marker has ONE reader, and all three callers delegate to it.
+"""The `state/pool-suspended` marker has ONE reader, and all three callers delegate to it;
+the per-worker `state/workers/<id>/paused` marker likewise has one reader, shared by the
+pool's supervisor and the health snapshot.
 
   * CONTRACT — pool_suspension decides whether the pool is suspended and normalises the record.
   * DELEGATION — health_snapshot, health-check and the pool's remedy go through it, each
@@ -16,6 +18,7 @@ isolate_os_environ()
 
 import importlib.util
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -81,6 +84,16 @@ class Contract(Base):
             susp.read(self.ws)
 
 
+class PausedContract(Base):
+    def test_no_marker_is_not_paused_and_a_marker_reads_its_mtime(self):
+        wdir = self.ws / "state" / "workers" / "w1"
+        wdir.mkdir(parents=True)
+        self.assertIsNone(susp.paused_at(wdir))
+        (wdir / susp.PAUSED_MARKER).touch()
+        os.utime(wdir / susp.PAUSED_MARKER, (42, 42))
+        self.assertEqual(susp.paused_at(wdir), 42)
+
+
 class Delegation(Base):
     RECORD = {"reason": "from-the-reader", "at": 9, "stopped": []}
 
@@ -108,6 +121,20 @@ class Delegation(Base):
         self.assertEqual(rem.suspended_path(self.ws), susp.path(self.ws))
         susp.path(self.ws).mkdir()
         self.assertIsNone(rem.suspension(self.ws))
+
+    def test_the_pool_supervisor_and_the_snapshot_read_the_pause_through_it(self):
+        sup = _load("sup_paused", REPO / "skills" / "worker-pool" / "scripts" / "pool_supervise.py")
+        hs = _load("hs_paused", REPO / "src" / "health_snapshot.py")
+        wid = "a" * 32
+        self.assertEqual(sup.PAUSED_MARKER, susp.PAUSED_MARKER)
+        with mock.patch.object(sup.pool_suspension, "paused_at", return_value=7) as read:
+            self.assertTrue(sup.is_paused(self.ws, wid))
+        read.assert_called_once_with(self.ws / "state" / "workers" / wid)
+        (self.ws / "state" / "roster.json").write_text(json.dumps({"workers": {wid: {"state": "live"}}}))
+        with mock.patch.object(hs.pool_suspension, "paused_at", return_value=7) as read:
+            row = hs.snapshot(self.ws, agent="workers", now=100.0)["agents"][0]
+        read.assert_called_once_with(self.ws / "state" / "workers" / wid)
+        self.assertEqual((row["reason"], row["since"]), ("suspended", 7))
 
 
 if __name__ == "__main__":

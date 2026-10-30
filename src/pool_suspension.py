@@ -6,6 +6,9 @@ health snapshot and health-check. Each renders it its own way; what lives here i
 part they must agree on: whether the pool is suspended, and the normalised record.
 
 A marker that is not the JSON record still suspends; it just names no workers.
+
+The owner's per-worker pause, `state/workers/<id>/paused`, is read here too: the pool's
+supervisor and the health snapshot must agree on which workers the owner stopped.
 """
 from __future__ import annotations
 
@@ -18,6 +21,7 @@ from workspace_default import resolve_workspace  # noqa: E402
 
 REL = Path("state") / "pool-suspended"
 DEFAULT_REASON = "suspended"
+PAUSED_MARKER = "paused"
 
 
 def path(workspace=None) -> Path:
@@ -49,3 +53,11 @@ def read(workspace=None) -> dict | None:
     except FileNotFoundError:
         return None
     return normalise(text)
+
+
+def paused_at(worker_dir) -> float | None:
+    """When the owner paused the worker whose records are in `worker_dir`; None while it is not paused."""
+    try:
+        return (Path(worker_dir) / PAUSED_MARKER).stat().st_mtime
+    except OSError:
+        return None
