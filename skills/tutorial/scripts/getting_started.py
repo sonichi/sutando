@@ -53,7 +53,7 @@ import urllib.parse
 import uuid
 import urllib.request
 from pathlib import Path
-from typing import Callable, Dict, List, Mapping, Optional
+from typing import Callable, Dict, Iterable, List, Mapping, Optional
 
 REPO = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO / "src"))
@@ -324,15 +324,16 @@ def candidates(pages: List[dict]) -> List[dict]:
             and str(p.get("kind", "")).startswith("html-")]
 
 
-def owned(page: dict, text: str, agent: Optional[str]) -> Optional[bool]:
+def owned(page: dict, text: str, agent: Optional[str], aliases: Iterable[str] = ()) -> Optional[bool]:
     """Whether a candidate is this agent's tutorial page: its text carries this agent's marker (the
-    create writes it with the first body, so an empty page is never one). None: no agent id."""
+    create writes it with the first body, so an empty page is never one). None: no agent id.
+    `aliases`: this agent's ids on its other connections, which an earlier run may have tagged."""
     if not agent:
         return None
     by = page.get("by") or ""
     if by and by != agent:
         return False
-    return owner_marker(agent) in text
+    return any(owner_marker(a) in text for a in (agent, *aliases) if a)
 
 
 def plan(rooms: Dict[str, dict], room: str, pages: Optional[List[dict]] = None) -> dict:
@@ -396,12 +397,12 @@ class Commons:
             raise PublishError(f"room-commons {args[0]} failed ({done.returncode}): {said[:400]}")
         return done.stdout
 
-    def reconcile(self, pages: List[dict], agent: Optional[str]) -> Optional[str]:
+    def reconcile(self, pages: List[dict], agent: Optional[str], aliases: Iterable[str] = ()) -> Optional[str]:
         """The one unrecorded page that is this agent's tutorial page, else None; refuses to guess
         when ownership is unclear or more than one page qualifies."""
         mine, unclear = [], []
         for p in candidates(pages):
-            verdict = owned(p, self.read(p["kind"]), agent)
+            verdict = owned(p, self.read(p["kind"]), agent, aliases)
             (mine if verdict else unclear if verdict is None else []).append(p["kind"])
         if unclear or len(mine) > 1:
             raise PublishError(
@@ -456,20 +457,21 @@ def _fill(commons: Commons, kind: str, page: str) -> None:
 
 def publish(commons: Commons, marker: Path, name: str, owner: Optional[str] = None,
             summon: bool = False, core: str = "unknown", audience: str = "dm",
-            agent: Optional[str] = None, prompts: object = None, roles: object = None) -> dict:
+            agent: Optional[str] = None, prompts: object = None, roles: object = None,
+            aliases: Iterable[str] = ()) -> dict:
     page = render_page(name, core, audience, agent, prompts, roles)
     with _locked(marker):
         rooms = load_marker(marker)
         pages = commons.listed_pages()
         step = plan(rooms, commons.room, pages)
         if step["action"] == "reconcile":
-            found = commons.reconcile(pages, agent)
+            found = commons.reconcile(pages, agent, aliases)
             step = ({"action": "adopt", "kind": found, "pending": True} if found
                     else {"action": "create", "kind": None, "pending": False})
         elif step["action"] == "resume" and candidates(pages):
             # The create may have landed and the server forgotten its operation id: a page this
             # agent tagged is that page, so finish it rather than re-issue the create.
-            found = commons.reconcile(pages, agent)
+            found = commons.reconcile(pages, agent, aliases)
             if found:
                 _record(marker, rooms, commons.room, {"kind": found, "state": "pending"})
                 step = {"action": "update", "kind": found, "pending": True}
@@ -605,7 +607,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                          name, args.owner, args.summon,
                          detect_core() if args.core == "auto" else args.core, args.audience,
                          agent or agent_mxid() or None, load_prompts(args.prompts),
-                         args.roles)
+                         args.roles, aliases=(agent_mxid(),) if agent else ())
     except (PublishError, ValueError) as exc:
         print(json.dumps({"ok": False, "reason": redact(str(exc), env)}))
         return 4

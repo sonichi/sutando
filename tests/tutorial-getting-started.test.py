@@ -1129,6 +1129,26 @@ class RoutedIdentityTest(unittest.TestCase):
         self.assertEqual(self.door.ops, [])
         self.assertIn(gs.owner_marker(mine), db["pages"]["html-p1"])
 
+    def test_a_page_an_earlier_run_tagged_with_the_primary_identity_is_still_this_agents(self):
+        # Listed by the room's identity, tagged with the primary one: what the unrouted run wrote.
+        self.state.write_text(json.dumps({"pages": {"html-p1": gs.render_page("Kai", "codex", "dm", "@kai.agent:ag2.space")},
+                                          "by": {"html-p1": "@kai.agent:dev.s.space"}, "calls": [], "next": 2}))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            code = gs.main(["publish", "--room", self.room, "--name", "Kai", "--core", "codex",
+                            "--room-commons", str(self.stub)])
+        self.assertEqual((code, json.loads(out.getvalue())["kind"]), (0, "html-p1"), out.getvalue())
+        db = json.loads(self.state.read_text())
+        self.assertEqual(sorted(db["pages"]), ["html-p1"], "a second Getting started page was created")
+        self.assertIn(gs.owner_marker("@kai.agent:dev.s.space"), db["pages"]["html-p1"])
+
+    def test_another_agents_page_is_never_taken_for_an_alias(self):
+        page = {"kind": "html-p1", "by": "@someone.agent:dev.s.space"}
+        text = gs.render_page("Kai", "codex", "dm", "@kai.agent:ag2.space")
+        self.assertFalse(gs.owned(page, text, "@kai.agent:dev.s.space", ("@kai.agent:ag2.space",)))
+        self.assertTrue(gs.owned({**page, "by": ""}, text, "@kai.agent:dev.s.space", ("@kai.agent:ag2.space",)))
+        self.assertFalse(gs.owned({**page, "by": ""}, text, "@kai.agent:dev.s.space"))
+
     def test_the_rooms_identity_comes_from_its_own_connection(self):
         import channel_credentials
         self.assertEqual(channel_credentials.room_agent_mxid(self.room), "@kai.agent:dev.s.space")
