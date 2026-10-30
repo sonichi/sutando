@@ -30,13 +30,26 @@ lower-precedence candidate.
 | `REMOTE_TASK_PROVIDER` | no | `remote` | Label written as a task's `source:` when the task omits one. |
 | `REMOTE_TASK_POLL_WAIT` | no | `25` | Long-poll seconds requested per `/v1/tasks` call. |
 | `REMOTE_TASK_ON_TASK` | no | — | Wake command run once per newly queued task file. Split with `shlex` and run without a shell, the file path appended as the last argument; `SPARROW_TASK_ID` and `SPARROW_TASK_FILE` are set and every relay credential is removed from its environment. Sparrow does not wait for it, kill it, or retry it; a non-zero exit or a start failure is logged once. |
+| `REMOTE_TASK_POLL_STALL_EXIT_S` | no | `600` | Seconds without a completed poll after which a live-but-stalled bridge stops its outbound worker, waits for any send it has in flight to finish (without polling meanwhile), and exits with code `69` so its restart owner relaunches it (`0` disables). Measured on the monotonic clock, so time the host spends asleep never counts, and re-anchored when an auth wait on a human ends, so a re-link never counts either. The launchd wrapper relaunches on `69` without an owner alert. |
+| `SUTANDO_BRIDGE_RESTART_OWNER` | no | — | Name of whatever relaunches the bridge on exit (the launchd plist sets `launchd`). Unset, the stall is logged and written to `gateway-status.json` but the process keeps retrying, because a bare `&` lane has nothing to bring it back. |
 | `REMOTE_TASK_TIER` | no | `owner` | Local access tier stamped on every inbound task; `owner` for the personal-agent model, set `team`/`guest` for a shared gateway (see Security); `other` is accepted as the legacy spelling of `guest`. |
-| `REMOTE_PROACTIVE_ROOM` *(.env too)* | no | — | The SYSTEM destination only. Owner-directed `results/proactive-*.txt` nudges and runtime prompt cards go to the gateway's `owner_dm_room` for this agent (`GET /v1/agents`), a reading kept identity-bound on disk (`state/owner-routing.json`) across restarts and outages and never replaced by an answer without one; with no reading yet they are HELD (file left in place, retried every 30 s, logged), never sent here. Unset → read from this instance's `channels/<dir>/.env`. A file naming its own room (`[channel: !room]`) never needs it; the drain runs whether or not it is set. |
+| `REMOTE_PROACTIVE_ROOM` *(.env too)* | no | — | The SYSTEM destination only. Owner-directed `results/proactive-*.txt` nudges and runtime prompt cards go to the gateway's `owner_dm_room` for this agent (`GET /v1/agents`), a reading kept identity-bound on disk (`state/owner-routing.json`) across restarts and outages and never replaced by an answer without one. A room is adopted as the owner DM only when `/v1/room` `{"op": "members"}` lists no one but the agent and its owner, re-checked on every refresh; a room with anyone else clears the reading, and an unreadable member list never adopts a new room. Only a record marked `"private": true` is loaded; one saved before this check, including a migrated legacy record, is not. With no reading they are HELD (file left in place, retried every 30 s, logged), never sent here. Unset → read from this instance's `channels/<dir>/.env`. A file naming its own room (`[channel: !room]`) never needs it; the drain runs whether or not it is set. |
+| `REMOTE_TASK_LIFECYCLE_V2` | no | off | `1` turns on the task lifecycle calls below (lease generation, per-task beats, cancel, ledger reconcile). |
+| `REMOTE_TASK_TURN_CONTEXT` | no | off | `1`, with `REMOTE_TASK_LIFECYCLE_V2`, writes each attempt's turn file and gates its result on the turn's room actions. |
 | `REMOTE_ALERT_ROOM` | no | none (gateway alert disabled) | Explicit owner-only room id for core-independent health alerts sent by the launchd fallback. Never inferred from last activity because that room may be shared. |
 
 **Use the split form** (`REMOTE_TASK_URL` + `REMOTE_TASK_TOKEN`) — it's the recommended way to configure the bridge.
 
 > **Legacy / bootstrap shortcut:** the bridge also accepts a *combined* token of the form `REMOTE_TASK_TOKEN="https://relay.example.com|<secret>"` (URL and secret joined by `|`), which it splits at startup. This exists only so a one-shot onboarding string can carry both halves. If you use it, **quote it in `.env`** — an unquoted `|` is a shell pipe when the file is sourced. Prefer the split form for anything persistent.
+
+> **A declared agent bridge under sparrowd** (a claude-local install on a host
+> whose supervisor is sparrowd) reads neither variable from the environment: it
+> strips every host token and gateway URL name, so the agent's token never meets
+> the host's endpoint. Its token comes from the vault key `AG2_RELAY_TOKEN_<worker>`,
+> and its URL from inside that token (the combined form) or, for a bare secret,
+> from `AG2_RELAY_URL_<worker>`. A URL inside the token wins.
+> `python3 src/sparrow_agent_bridge.py --preflight` lists each declared agent and
+> the one `vault set` that fixes one that will not start.
 
 Older installs using `AG2_REMOTE_URL` / `AG2_REMOTE_TOKEN` remain supported by
 both the bridge launcher and the core-independent health-alert sender during
@@ -71,7 +84,7 @@ Return `{"tasks": []}` on long-poll timeout. The client uses an HTTP timeout of
 
 A task object **must** carry a unique `"id"`. Recognized string fields
 (`task`, `source`, `channel_id`, `user_id`, `priority`, …) are newline-confined
-and written into the local task file the core consumes. For AG2 Space, the
+and written into the local task file the core consumes. For s.space, the
 broker also supplies its room-policy `access_tier` attestation.
 
 Owner replies to runtime action cards are interpreted before local task-file
@@ -93,7 +106,7 @@ fit the verb — is refused by name rather than resolved from the sentence, and
 the room always comes from `channel_id`, never from `picker_args`. A broker
 that sends no `picker_command` keeps the prose fallback.
 
-An AG2 Space broker may additionally send `"session_scope": "room"`. The
+An s.space broker may additionally send `"session_scope": "room"`. The
 bridge writes only that exact value as a trusted pre-body header; missing,
 unknown, or malformed values are omitted, preserving the main-session path for
 older brokers, bridges, and Sutando installations. An optional task handler may
@@ -103,11 +116,11 @@ room-specific provider session.
 **`capabilities` (the poll's proof).** Every poll carries
 `&capabilities=voice-outcome-v1`, the voice-outcome contract the heartbeat also
 declares (below). One agent's credential may be used by more than one bridge, so
-an AG2 Space broker serves a voice relay ask only to a poll that names the
+an s.space broker serves a voice relay ask only to a poll that names the
 contract itself, and serves a poll without it the tasks behind that ask; a relay
 that predates the parameter ignores it.
 
-**`ack_first` (acknowledging first).** An AG2 Space broker marks a voice relay ask
+**`ack_first` (acknowledging first).** An s.space broker marks a voice relay ask
 it serves with `"ack_first": true`, at most one per response. The bridge handles
 a task served with that exact boolean before the rest of the response, on its
 own, and publishes it to the core only once its ack is accepted:
@@ -241,7 +254,7 @@ body: { "id": "ask-…", "body": "", "status": "failed",
 `"capabilities": ["voice-outcome-v1"]` and an explicit boolean `dm_only`: `true`
 when the body carries `[dm-only]` anywhere (a standalone marker line is stripped
 from `body`; an inline mention stays in it), `false` otherwise, a skip and a fold
-included. An AG2 Space broker reads the two only for a voice relay ask, and treats
+included. An s.space broker reads the two only for a voice relay ask, and treats
 such an ask's result without them as private: an older bridge strips the marker
 line and sends no `dm_only`, so its private answers still reach only the owner.
 Both are part of the payload the outbox stores, so a retry, also after a restart,
@@ -308,7 +321,7 @@ body: {
 
 `voice-outcome-v1` declares the voice-outcome contract: the poll's proof and
 acknowledging an `ack_first` task before publishing it under `GET /v1/tasks`, and
-`dm_only` and `consolidated_into` under `POST /v1/results`. An AG2 Space broker
+`dm_only` and `consolidated_into` under `POST /v1/results`. An s.space broker
 keeps the declaration to decide whether a new call may use the voice relay; the
 poll and every result carry the contract again, because a Mac can be downgraded
 after the declaration was read.
@@ -340,7 +353,7 @@ Sutando checkout (no `health` row) forwards the self-report unchanged, or nothin
 A relay that answers the heartbeat with `404` or `405` is retried after 60 s, doubling to at most
 30 minutes, so a relay that deploys the route is picked up without a restart.
 
-`team-collaborator` tells the AG2 Space control plane that this gateway
+`team-collaborator` tells the s.space control plane that this gateway
 understands the per-agent Collaborator control layered over Team. Gateways
 without it safely keep Team on their prior restricted path.
 
@@ -357,6 +370,91 @@ from [`GET /health`](health-snapshot.md) and the `worker_health.v1` capability:
 the broker times freshness by when it received the heartbeat. A change in the row
 sends the heartbeat at once, without waiting for the interval. A gateway with no
 Sutando checkout around it sends neither field.
+
+### Task lifecycle *(opt-in: `REMOTE_TASK_LIFECYCLE_V2=1`)*
+
+- **Ack** adds `worker_id` (one lease-holder id per install, `state/relay-lease-worker-id`) and
+  `protocol_version: 2`, and records the `execution_generation` its 200 reports. An answer on
+  either ack path carrying a fencing `error_code` (`stale_execution_generation`, `task_cancelled`,
+  `task_not_found`, `task_already_terminal`, on a 404 or a 409) fences the attempt, retires its
+  pending ack and, for a published task, stops the core (below) — except a stale older lease
+  when a newer serve of the same task is pending here, which that serve's ack decides.
+- **`POST /v1/tasks/heartbeat`** `{worker_id, tasks:[{task_id, worker_id, execution_generation}]}`
+  is sent every 15 s for every attempt with a generation, for as long as the bridge holds it, even
+  while the client heartbeat (60 s) is backing off: it is the only way a Stop reaches a running
+  task. While one is held, the task long poll returns when the next beat is due. An attempt whose
+  task file has left the queue with no result, no claim and no turn activity for 10 min is never
+  going to be answered: its beats stop and it is posted as `status: failed` with `no_send`. So is
+  one still queued whose task file the core took up (a turn row newer than the file) and then left
+  with no turn activity and no result for 30 min while the core's health row reads it idle (2 h when
+  that reading is unknown; never while it reads moving, i.e. mid-turn on a long tool call); a task file the core has not reached yet keeps
+  beating however long it waits. Until then the in-flight reconcile keeps the id, rather than
+  dropping it as completed elsewhere. A
+  `task_errors` entry of `stale_execution_generation`, `task_not_found` or
+  `task_already_terminal` fences the attempt (its result is settled, never posted), and the first
+  also stops the core. That stop is withdrawn, if the core has not taken it yet, when a newer
+  generation of the task is acked here. If the core took it already, the newer attempt it then
+  leaves with no result and no queued task file is posted as `status: failed` with `no_send`. The other
+  two, from a beat or an ack, withdraw the task file if the core has not
+  taken it up (no turn row newer than the file), and otherwise stop the core; the log names the
+  broker's `reason` when it sends one. `task_cancelled` is a **cooperative Stop**: the core gets one
+  `CANCEL_INSTRUCTION` task (`source: relay-control`, whose result is retired locally and never
+  posted), and nothing is fenced. Once the core has handled that control task, a result it wrote
+  for the task is posted normally and no cancel-ack is sent; with no result, or one with nothing to
+  deliver (`no_send` or an empty body), the stop is confirmed on `POST /v1/tasks/<id>/cancel-ack`
+  and that result, or any later one, is settled, never posted (not as `no_action_needed` either). A `task_cancelled` on the ack
+  means the task is not started: its file is withdrawn like a closed task's (the core is stopped
+  only if it has taken it up), and it is cancel-acked at once. A 404 disables the per-task beat.
+- **Results** add `execution_generation` and `worker_id`; a fenced attempt's result is settled
+  without a post. A result written before its task's ack named the lease waits for it. On a broker that has
+  ever named a lease (`state/relay-broker-contract.json`) it keeps waiting, until the ack lands,
+  the attempt is fenced, or the server closes the task; on one never seen to, it waits 120 s and
+  is then posted without lease fields, still gated on the journal records that name the task. A
+  task served again before its ack keeps its first publication time as the journal boundary. A result answered `409 task_already_terminal | stale_execution_generation |
+  task_cancelled` or `400 waiting_input_without_blocker` is settled, not quarantined.
+- **`GET /v1/tasks/active?status=outstanding`** is read every five minutes, fully paged. An attempt
+  the server does not list (acked, or first published when no ack ever answered, more than 120 s
+  ago) is only logged: absence is not a terminal status, so it is fenced only when its beat or ack
+  answers with one. Server tasks this node does not hold are written to
+  `state/relay-outstanding-tasks.json`.
+- With `REMOTE_TASK_LIFECYCLE_V2=1`, a served task carrying `wake` is left unacked, whether or not this node saw its first
+  attempt: running it without its answer, or closing it as a redelivery, would lose the answer.
+
+With `REMOTE_TASK_TURN_CONTEXT=1` too, the ack writes the attempt's read-only turn file
+`state/turns/<task_id>_g<gen>_<ulid>.json` (`src/agent_turn.py`), which the MCP proxy binds room
+actions to and journals in `state/room-actions.jsonl`. The file is written to a temp file, fsynced and
+`link()`ed into place, so it is never seen half-written or replaced. When the result settles the turn
+gets a `.closed` fence, written while holding the proxy's `room-actions.jsonl.lock` (an `O_EXCL` file
+of `<pid> <token> <start_ms>`; a dead pid's lock is broken, a live one is waited on up to 2 s), so a
+close never lands between the proxy's check and its intent append. At start every turn whose task
+is no longer in flight is closed. The result is
+then decided by the turn's journal: skipped when a room action already closed the task; posted as
+`status: waiting_input` + `no_send` while the task waits for a human; posted with `no_send` when a
+`room.message.send` in the turn carried the same text (`body_sha256`); otherwise posted as
+`status: completed`. An outcome whose `applied_*` fields are null (a task the ledger does not know) is
+unknown: neither terminal nor suspended, so only the same-text check applies to it. Records the
+proxy could not bind but that name the task, written since it was published, count as the turn's.
+A journal line that does not parse makes the journal unreadable (`failed` + `no_send`), except an
+unterminated last line younger than 30 s, an append in progress, which defers the result.
+
+### `GET /v1/setup` *(optional)*
+
+The agent's own `agent.setup.steps` result (served text, tunables, package pin), for the
+bearer's agent. The heartbeat reply's `setup_revision` announces which revision applies; the
+gateway fetches only when that differs from the copy it holds, with a 10 s deadline.
+
+```
+success: 200 {"schema_version": 1, "agent_mxid": "<mxid>", "revision": "<rev>",
+              "kind": "acp", "vendor": "<vendor>", "text_schema_version": 1 | null,
+              "runtime_text": {...} | null, "tunables": {...} | null,
+              "package": {...} | null, ...}
+```
+
+The gateway keeps the result in `state/served-setup[.<instance>].json` only when the whole
+of it validates: `schema_version` 1, the announced revision, its own agent, and
+`text_schema_version` 1 with all four listener blocks, or all four `null`. Anything else, an
+HTTP error, or a timeout writes nothing, keeps the last good copy, and is retried after 60 s,
+doubling to at most an hour; a newly announced revision is tried at once.
 
 ### `POST /v1/workers` *(optional)*
 
@@ -494,9 +592,9 @@ HTTP 401/403 (while polling recovers authentication), 408, 425, 429, 5xx and
 transport failures are retryable. Other 4xx responses,
 malformed envelopes and explicit decline envelopes are permanent refusals and
 park on the first attempt. This policy applies to the gateway **task-result**
-leg only; proactive room sends and other providers keep their existing retry
-policy. Providers without an idempotent-send or reconciliation capability still
-park an ambiguous outcome rather than retrying it automatically.
+leg only; proactive room sends follow "Proactive room sends" below. Providers
+without an idempotent-send or reconciliation capability still park an ambiguous
+outcome rather than retrying it automatically.
 
 The outbox item stores its start, absolute deadline, next eligible time and
 failure count atomically under the delivery claim lock. A restart retains these
@@ -548,6 +646,67 @@ Existing parked records and historical quarantined replies are **not** migrated
 or replayed automatically, except a relay ask's result an older bridge parked
 (below). Live nonterminal records without a schedule acquire one on their next
 claim.
+
+### Proactive room sends
+
+Each `results/proactive-*.txt` is one outbox item (`results/.outbox-ag2space-proactive/`),
+keyed by its file stem plus a SHA-256 prefix of its body (`<stem>~<16 hex>`): a new body
+under a delivered name is a new send, while the room and thread, re-resolved on every pass,
+are not part of the key. The room, thread and body stored when the item is first published
+are what is sent, as one `POST /v1/room` `op: message` with that item's `dedupe_key` (and
+`thread_root` when it posts in a thread). The logged `outbox_cli.py requeue <item> --body-id
+<stem> --body-sha256 <digest>` restores exactly that item's quarantined body (one name can
+hold several parked generations) under its file name, which maps back to the same item; the
+CLI refuses an empty digest, and a missing one while several bodies are parked, before it
+changes anything. When the body cannot be read at park time, no runnable command is printed.
+A stored destination that no longer matches the resolved one (an owner DM that moved after a
+refusal) parks the item `destination-changed` and moves the file to `results/undelivered/`;
+it is never re-routed, and the logged release sends it to its stored room. The guard applies
+to every dispatch except one a person released: the CLI's requeue records the release bound
+to the stored payload (`operator_release`), and an automatic requeue (a room-upgrade resend)
+records none. Parking takes the item's lock and refuses an item that is delivered, holds a
+receipt or a dispatch mark, or is held by a live claim (a dead owner's claim past its reclaim
+window is released first). A delivered file that cannot be archived is renamed to a hidden
+`.<stem>.delivered-<ts>` that no bridge globs, and a later pass moves it into `archive/`; it
+is never unlinked and never put back under its live name. If even the hidden rename fails it
+stays claimed; a restart's orphan recovery may then return it to its live name, where its
+DELIVERED item is archived without a resend. Every handback to a live name uses a
+no-replace rename, so a newer file a producer wrote there is never overwritten.
+
+The file is still claimed by rename (`.sending.<pid>`, recovered by `_recover_orphan_proactive`
+when its owner dies): that is what keeps the other bridges polling `results/proactive-*.txt`
+off it. It does not decide delivery; the outbox item's claim and dispatch mark do, so a file
+recovered back to `.txt` maps to the same item and is never sent twice. The outbox owns the claim, the retry and the outcome; the drain only
+moves the file as the outcome says. The room send is neither idempotent nor reconcilable,
+so:
+
+- **Only a Matrix event id confirms.** It is recorded on the item (`provider_ref`) before
+  the item is marked delivered; the file is then archived. A bare `{"ok": true}` never
+  confirms, and there is no setting that trusts it.
+- **An uncertain send is parked, never resent.** A timeout, a 5xx, an accept with no event
+  id, or a process that died after the send began leaves the item `PARKED`
+  (`outcome-unknown`) and moves the file to `results/undelivered/`. The log names the
+  `outbox_cli.py requeue` command; check the room first, since a requeue may post twice.
+  A process that died after the event id was recorded settles the item as delivered.
+- **Unreadable item records.** An item record that exists but cannot be parsed is never
+  read as a new item. It reads `PARKED` (`unreadable-item`) with its send in doubt, so no
+  drain sends it. `outbox_cli.py --root <root> list` shows it by its file name
+  (`file=<name>.json`, no item id). `requeue` refuses it with exit 6 and leaves its body in
+  `results/undelivered/`. To release it: check the room first, since it may already have
+  posted. Then move the record file out of `<root>/.items/` (keep it for diagnosis), and
+  move its body from `results/undelivered/` back to `results/<stem>.txt`. The next pass
+  publishes it as a new item and sends it once.
+- **A definite refusal is retried** on the outbox's schedule (the same window and backoff
+  as task results, counted on the item, so a restart keeps the count): 401/403, 408, 425,
+  429, and a connection that was refused or a host that did not resolve. Another 4xx parks
+  at once. A 400 naming an upgraded owner DM holds the file until the DM is repointed.
+- **A message about a task** is named `proactive-about-<task id>--<ts>.txt`
+  (`proactive_routing.about_task_filename`). In the task's own room it posts in the task's
+  thread: an ask already in a thread keeps that thread's root, a top-level ask is rooted at
+  its source message. Right before its send it is checked again: an answered, ended or
+  cancelled task, or one waiting on the owner, withdraws it (archived, item parked
+  `withdrawn:<reason>`, nothing posted). The task's result is checked by the bridge; the
+  rest by the host's `PROACTIVE_DISPATCH_GATE` (Sutando: `src/proactive_dispatch_gate.py`).
 
 ### A relay ask's result (no ceiling)
 
@@ -669,7 +828,7 @@ not promise downstream Matrix delivery.
   fail closed to Guest. Every serialized wire field is newline-confined, and the
   bridge emits the resolved `access_tier:` independently, so message text cannot
   forge a higher tier.
-- A broker-attested AG2 Space **Team** tier plus exact boolean
+- A broker-attested s.space **Team** tier plus exact boolean
   `collaborator: true` is the explicit trusted-runtime opt-in. The legacy wire
   tier remains Guest with `requested_access_tier: team`, so older gateways stay
   restricted. A capable bridge promotes that signed combination and adds one
@@ -709,7 +868,7 @@ not promise downstream Matrix delivery.
 
 A minimal relay needs only: an authenticated queue behind `GET /v1/tasks`
 (long-poll or return-immediately), an `ack` sink, a `results` sink, and a
-heartbeat sink. The four endpoints above are the entire contract — anything that
+heartbeat sink. Those four endpoints are the entire required contract — anything that
 implements them can drive Sutando.
 
 
@@ -737,7 +896,7 @@ without the health checker. A passing report alone does not invent a core
 status. If the gateway or host is down, no heartbeat can be sent; the broker's
 existing contact timeout still yields disconnected/unknown.
 
-The AG2 Space dashboard already classifies `error` as unhealthy, so this
+The s.space dashboard already classifies `error` as unhealthy, so this
 requires updating Sutando's health checker and restarting its gateway bridge;
 no dashboard schema change is needed. Reporting starts after the first health
 check completes and follows the installed check cadence.

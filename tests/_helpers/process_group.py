@@ -35,6 +35,19 @@ def group_members(pgid: int) -> list[int]:
             if pg == str(pgid) and not stat.startswith("Z")]
 
 
+def has_exited(pid: int) -> bool:
+    """True once `pid` has exited, a zombie its parent has not reaped yet included.
+    A pid reused by another user's process reads as exited too."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return True
+    r = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True)
+    return r.stdout.strip().startswith("Z") or not r.stdout.strip()
+
+
 def kill_group(pgid: int, wait_s: float = 2.0) -> None:
     for sig in (signal.SIGTERM, signal.SIGKILL):
         members = group_members(pgid)

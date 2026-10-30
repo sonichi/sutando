@@ -117,7 +117,7 @@ class RuntimeDispatcher:
                  actor_id: str,
                  executors: Mapping[str, Callable[[dict], dict]] = EXECUTORS,
                  agents_view=None, identity_view=None, tasks_view=None,
-                 runtime_view=None, schedules_view=None,
+                 runtime_view=None, schedules_view=None, connections_view=None,
                  capability_registry: Optional[EphemeralCapabilityRegistry] = None,
                  granted_methods: frozenset = frozenset()):
         self.store = store
@@ -134,6 +134,7 @@ class RuntimeDispatcher:
         self.tasks = tasks_view
         self.runtime = runtime_view
         self.schedules = schedules_view
+        self.connections = connections_view
         self.capability_registry = (
             capability_registry if capability_registry is not None
             else EphemeralCapabilityRegistry())
@@ -290,6 +291,34 @@ class RuntimeDispatcher:
                 raise ProtocolError(-32601,
                                     "schedule surface is not configured on this daemon")
             return self.schedules.list_schedules()
+        if method.startswith("connection."):
+            if self.connections is None:
+                raise ProtocolError(-32601,
+                                    "connections surface is not configured on this daemon")
+            if method == "connection.list":
+                return self.connections.list_connections()
+            if method == "connection.known_servers":
+                return self.connections.known_servers()
+            if method == "connection.add":
+                return self.connections.add(params)
+            if method == "connection.remove":
+                return self.connections.remove(params)
+            if method == "connection.set_primary":
+                return self.connections.set_primary(params)
+            if method == "connection.promote":
+                return self.connections.promote(params)
+            if method == "connection.unpark":
+                return self.connections.unpark(params)
+            if method == "connection.park":
+                return self.connections.park(params)
+            if method == "connection.park_legacy":
+                return self.connections.park_legacy(params)
+            if method == "connection.disconnect":
+                return self.connections.disconnect(params)
+            if method == "connection.reconnect":
+                return self.connections.reconnect(params)
+            if method == "connection.update_token":
+                return self.connections.update_token(params)
         if method.startswith("task."):
             return self._task(method, params)
         raise ProtocolError(-32601, f"unknown method {method}")

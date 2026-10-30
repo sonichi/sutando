@@ -65,7 +65,7 @@ adapter checks nothing about it beyond the single-process lock. The binary enfor
 
 ## Setup (once)
 
-1. Create the session interactively: `claude --cloud "AG2 Space agent"`. It prints
+1. Create the session interactively: `claude --cloud "s.space agent"`. It prints
    `Created cloud session: … View: https://claude.ai/code/session_… Resume with: claude --teleport session_…`.
    Keep the `session_…` id. The adapter never creates sessions.
 2. Open the session's page, and in the composer's **+** → **Connectors** menu switch the **ag2 space**
@@ -92,7 +92,7 @@ reply.
 Text:
 
 ```
-[sparrow task] Follow your standing AG2 Space instructions for this message: …
+[sparrow task] Follow your standing s.space instructions for this message: …
 room=<channel_id> thread=<thread_root or none> tier=<owner|team|guest> collaborator=<true|false> task_id=<id> channel_kind=<dm|room|unknown> [owner_dm=<room id>]
 note: <NON_OWNER_NOTE>            (non-owner tiers only)
 <UNTRUSTED_TASK_<nonce>>

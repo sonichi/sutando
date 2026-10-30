@@ -19,13 +19,10 @@ import time
 import unittest
 from pathlib import Path
 
-from _helpers.hermetic_env import isolate_os_environ, isolated_child_env
+from _helpers.hermetic_env import isolate_os_environ, isolated_child_env, runtime_harness
 
-
-scratch_file = (Path(os.environ["SUTANDO_RUNTIME_SOCKET"]).parent / "environment.json"
-                if os.environ.get("SUTANDO_RUNTIME_SOCKET") else None)
-scratch = json.loads(scratch_file.read_text()) if scratch_file and scratch_file.is_file() else {}
-isolate_os_environ(**scratch)
+isolate_os_environ(**runtime_harness()[1])
+scratch_file, scratch = runtime_harness()
 
 ROOT = Path(__file__).resolve().parent.parent
 SERVER = ROOT / "src" / "runtime-api" / "server.py"

@@ -5,7 +5,8 @@ on:
   push:
     branches: [main]
 
-# Tests must never emit product telemetry (no PostHog writes from CI).
+# IMPORTANT: tests must never emit product telemetry; removing or weakening this makes CI test runs
+# count as real users on the admin DAU. Enforced by tests/telemetry-test-optout-guard.test.py.
 env:
   SUTANDO_TELEMETRY: "0"
 
@@ -204,9 +205,9 @@ jobs:
           timeout -k 5 120 python3 scripts/lint-old-collab-literals.py
 
   # The suites that used to run after the typecheck in the job above, now beside
-  # it: three runners of ~2 min each instead of one of ~5, same commands, same env.
-  node-and-oot-tests:
-    name: node + out-of-tree python tests
+  # it: node, out-of-tree python and the Mod harness each on their own runner.
+  node-tests:
+    name: node tests (ts + esm)
     needs: changes
     # Job-level, not per step: a docs-only diff skips the whole runner, and the
     # aggregator below treats that skip as a pass only when `changes` said so.
@@ -228,61 +229,6 @@ jobs:
 
       - name: Install Python test deps
         run: python3 -m pip install 'detect-secrets>=1.5.0' 'discord.py>=2.3'
-
-      # Python tests that live OUTSIDE tests/ and so are invisible to the
-      # `find tests -name '*.test.py'` discovery. Same reason the skill-manifest
-      # test is wired by hand. Without this they run only when someone
-      # remembers to run them locally, which is indistinguishable from passing.
-      # Notably src/remote-gateway-bridge.test.py — the suite the transport
-      # change process requires for ANY package change — and tools/test_no_drift.py,
-      # which is the guard against src/ and the package silently diverging.
-      - name: Run out-of-tree Python tests
-        run: |
-          timeout -k 5 120 python3 src/remote-gateway-bridge.test.py
-          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_gateway_status.py
-          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_dns_timeout.py
-          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_dns_fallback.py
-          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_ack_retry.py
-          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_inflight_recovery.py
-          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_write_task_atomic.py
-          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_on_task_wake.py
-          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_pool_advertisement_push.py
-          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_lock_heartbeat_thread.py
-          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_worker_profile_labels.py
-          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_agent_profile_host_id.py
-          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_event_inbox_channel.py
-          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_event_consumer.py
-          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_event_wiring.py
-          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_human_action.py
-          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_launch_diagnostics.py
-          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_vault_token_tier.py
-          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_env_token_quotes.py
-          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_signal_exit_log.py
-          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_hatch_adapter.py
-          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_claude_code_adapter.py
-          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_codex_connector.py
-          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_claude_routine_adapter.py
-          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_claude_cloud_session_adapter.py
-          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_adapter_relay_loop.py
-          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_adapter_boundaries.py
-          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_task_lifecycle.py
-          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_cloud_session_contract.py
-          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_cloud_session_interlock.py
-          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_adapter_differential.py
-          timeout -k 5 120 python3 packages/ag2-sparrow/tools/test_no_drift.py
-          timeout -k 5 300 python3 packages/ag2-sparrow/tests/test_wheel_contents.py
-          timeout -k 5 120 python3 skills/agent-room-ops/test_room_ops.py
-          timeout -k 5 120 python3 skills/make-viral-video/scripts/test_source_tag.py
-
-      # The claude-local Mod tests run only under the CLI engine harness (`claude plugin
-      # test`), which needs no login. The CLI version is pinned so a release cannot move the harness.
-      - name: Run the claude-local Mod harness tests
-        env:
-          CLAUDE_CODE_ENABLE_FUNCTION_HOOKS: '1'
-        run: |
-          npm install --no-save --no-audit --no-fund --prefix "$RUNNER_TEMP/claude-cli" @anthropic-ai/claude-code@2.1.303
-          cd packages/ag2-sparrow/adapters/claude-code
-          timeout -k 5 120 "$RUNNER_TEMP/claude-cli/node_modules/.bin/claude" plugin test ag2space-inbox
 
       # TypeScript only. `npm test` also chains `npm run test:py`, and the
       # dedicated `python-standalone-tests` job below runs the identical
@@ -322,6 +268,89 @@ jobs:
             fi
           done < <(find tests -name '*.test.mjs' -not -path '*/node_modules/*' | sort)
           exit "$failed"
+
+  oot-python-tests:
+    name: out-of-tree python tests
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies (clean)
+        run: npm ci
+
+      - name: Install Python test deps
+        run: python3 -m pip install 'detect-secrets>=1.5.0' 'discord.py>=2.3'
+
+      # Suites outside discovery. One a tests/ delegator runs whole (runpy.run_path,
+      # run_name="__main__") is not listed: the python legs already run it.
+      - name: Run out-of-tree Python tests
+        run: |
+          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_gateway_status.py
+          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_poll_stall_exit.py
+          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_dns_timeout.py
+          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_dns_fallback.py
+          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_ack_retry.py
+          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_inflight_recovery.py
+          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_write_task_atomic.py
+          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_pool_advertisement_push.py
+          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_lock_heartbeat_thread.py
+          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_worker_profile_labels.py
+          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_agent_profile_host_id.py
+          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_event_inbox_channel.py
+          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_event_consumer.py
+          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_event_wiring.py
+          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_launch_diagnostics.py
+          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_vault_token_tier.py
+          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_env_token_quotes.py
+          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_signal_exit_log.py
+          timeout -k 5 120 python3 packages/ag2-sparrow/tools/test_no_drift.py
+          timeout -k 5 300 python3 packages/ag2-sparrow/tests/test_wheel_contents.py
+          timeout -k 5 120 python3 skills/agent-room-ops/test_room_ops.py
+          timeout -k 5 120 python3 skills/make-viral-video/scripts/test_source_tag.py
+
+  mod-harness-tests:
+    name: claude-local Mod harness
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies (clean)
+        run: npm ci
+
+      - name: Install Python test deps
+        run: python3 -m pip install 'detect-secrets>=1.5.0' 'discord.py>=2.3'
+
+      # The claude-local Mod tests run only under the CLI engine harness (`claude plugin
+      # test`), which needs no login. The CLI version is pinned so a release cannot move the harness.
+      - name: Run the claude-local Mod harness tests
+        env:
+          CLAUDE_CODE_ENABLE_FUNCTION_HOOKS: '1'
+        run: |
+          npm install --no-save --no-audit --no-fund --prefix "$RUNNER_TEMP/claude-cli" @anthropic-ai/claude-code@2.1.303
+          cd packages/ag2-sparrow/ag2_sparrow/adapters/claude_code
+          timeout -k 5 120 "$RUNNER_TEMP/claude-cli/node_modules/.bin/claude" plugin test ag2space-inbox
+          cd "$GITHUB_WORKSPACE/skills/pr-watch"
+          timeout -k 5 120 "$RUNNER_TEMP/claude-cli/node_modules/.bin/claude" plugin test mod
 
   shell-standalone-tests:
     name: shell tests (lanes)
@@ -373,17 +402,42 @@ jobs:
       - name: Run shell standalone tests (serial tail)
         run: bash scripts/run-shell-suites.sh tail 3 ${{ matrix.shard }}
 
-  python-standalone-tests:
-    name: python standalone tests (${{ matrix.shard }}/9)
+  # The ag2-sparrow tag publish runs this gate on 3.11; its suites import files from
+  # all over the repo, so it runs on every PR rather than behind a paths filter.
+  sparrow-publish-gate:
+    name: ag2-sparrow publish gate (python 3.11, ${{ matrix.shard }}/3)
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
-    # Legs 1-7 share the files by measured cost; legs 8-9 run the load-sensitive
+    # The same gate the tag publish runs whole, split by measured cost; leg 1 adds the drift guard.
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Test before publish (package suites + src-drift guard)
+        run: bash packages/ag2-sparrow/tools/publish_gate.sh 3 ${{ matrix.shard }}
+
+  python-standalone-tests:
+    name: python standalone tests (${{ matrix.shard }}/15)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    # Legs 1-13 share the files by measured cost; legs 14-15 run the load-sensitive
     # suites (see the step). The coverage-gate job combines every leg's data.
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9]
+        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
     # Split out of `tsc + tests` so the three suites run beside each other rather
     # than one after another. Same environment, same commands — only sequencing.
     # 20, not 15: the suite now runs under coverage instrumentation (the only
@@ -429,6 +483,8 @@ jobs:
         run: |
           # Records are collected per file and replayed below in the leg's own
           # order (heaviest first), so `failed_files` keeps that order.
+          # Cost-shared legs; the matrix is these plus the load-sensitive pair after them.
+          SHARED_LEGS=13
           failed=0
           failed_files=()
           WORKERS="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)"
@@ -438,12 +494,12 @@ jobs:
           # `skills` too: a skill owns its own tests/, so a suite that moves into one
           # keeps running; the root is optional, so it is added only when present.
           bash scripts/discover-python-tests.sh > "$RECDIR/all"
-          # Legs 8-9 run the listed load-sensitive suites (a timing suite beside a CPU-heavy
-          # neighbour misses its own window); legs 1-7 get the rest.
+          # The two legs after the shared ones run the listed load-sensitive suites (a timing
+          # suite beside a CPU-heavy neighbour misses its own window); the shared legs get the rest.
           LIST=tests/python-load-sensitive-suites.txt
-          if [ "${SHARD:-1}" -ge 8 ]; then
-            # Leg 9 runs the list's `serial` suites alone, so they never share a runner's CPU.
-            KIND=only; WORKERS=2; [ "${SHARD:-1}" = 9 ] && { KIND=serial; WORKERS=1; }
+          if [ "${SHARD:-1}" -gt "$SHARED_LEGS" ]; then
+            # The last leg runs the list's `serial` suites alone, so they never share a runner's CPU.
+            KIND=only; WORKERS=2; [ "${SHARD:-1}" = $((SHARED_LEGS + 2)) ] && { KIND=serial; WORKERS=1; }
             bash scripts/select-load-sensitive-suites.sh "$KIND" "$LIST" "$RECDIR" < "$RECDIR/all" > "$RECDIR/sensitive"
             bash scripts/shard-by-cost.sh 1 1 tests/python-suite-costs.txt < "$RECDIR/sensitive" > "$RECDIR/files"
             SELECTED="$RECDIR/sensitive"
@@ -453,7 +509,7 @@ jobs:
             bash scripts/select-load-sensitive-suites.sh without "$LIST" "$RECDIR" < "$RECDIR/all" > "$RECDIR/rest"
             # Measured cost, heaviest first onto the lightest leg: every file lands in
             # exactly one leg, and the legs finish together instead of by line parity.
-            bash scripts/shard-by-cost.sh 7 "${SHARD:-1}" tests/python-suite-costs.txt < "$RECDIR/rest" > "$RECDIR/files"
+            bash scripts/shard-by-cost.sh "$SHARED_LEGS" "${SHARD:-1}" tests/python-suite-costs.txt < "$RECDIR/rest" > "$RECDIR/files"
             KIND=without SELECTED="$RECDIR/rest"
           fi
           # Runs whatever the branches did: no receipt, or a list edited after selection, exits 4.
@@ -588,7 +644,7 @@ jobs:
     # Carries the name the `main` ruleset requires. Splitting a suite into its
     # own job removes it from the required-context list; this keeps one gate
     # that fails when any suite fails, so a split cannot weaken protection.
-    needs: [changes, typecheck-and-test, node-and-oot-tests, shell-standalone-tests, shell-tail-tests, python-standalone-tests]
+    needs: [changes, typecheck-and-test, node-tests, oot-python-tests, mod-harness-tests, shell-standalone-tests, shell-tail-tests, python-standalone-tests, sparrow-publish-gate]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -623,8 +679,11 @@ jobs:
           }
           check "changes"                 "${{ needs.changes.result }}"
           check "typecheck-and-test"      "${{ needs.typecheck-and-test.result }}"
-          check "node-and-oot-tests"      "${{ needs.node-and-oot-tests.result }}"
+          check "node-tests"              "${{ needs.node-tests.result }}"
+          check "oot-python-tests"        "${{ needs.oot-python-tests.result }}"
+          check "mod-harness-tests"       "${{ needs.mod-harness-tests.result }}"
           check "shell-standalone-tests"  "${{ needs.shell-standalone-tests.result }}"
           check "shell-tail-tests"        "${{ needs.shell-tail-tests.result }}"
           check "python-standalone-tests" "${{ needs.python-standalone-tests.result }}"
+          check "sparrow-publish-gate"    "${{ needs.sparrow-publish-gate.result }}"
           exit "$rc"

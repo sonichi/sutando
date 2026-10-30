@@ -123,7 +123,7 @@ def _is_refused_limit(signal: dict) -> bool:
             and bool(_REFUSED_LIMIT.search(signal.get("prompt") or "")))
 
 
-_RESET_AT = re.compile(r"resets?\s+(?:at\s+)?(\d{1,2}(?::\d{2})?\s*[ap]m)", re.I)
+_RESET_AT = re.compile(r"resets?\s+(?:at\s+)?((?:[A-Z][a-z]{2}\s+\d{1,2}\s+at\s+)?\d{1,2}(?::\d{2})?\s*[ap]m)", re.I)
 
 
 def _limit_remedy(signal: dict) -> str:
@@ -243,7 +243,7 @@ def compose_message(signal: dict, surface: str = "") -> str:
     if kind == "turn-rejected":
         msg += (" — the core sits at its idle prompt but refuses every turn it is sent; each"
                 " ends in that line, so nothing queued for it runs")
-    if kind == "session-limit" or _is_refused_limit(signal):
+    if kind in ("session-limit", "usage-limit") or _is_refused_limit(signal):
         msg += _limit_remedy(signal)
     elif signal.get("kind") == "fable-limit-unfocused":
         msg += (" — Claude Code's Fable weekly-limit dialog is up but the focused option is"
@@ -374,14 +374,15 @@ def run_cycle(signal, state_file, *, macos=True, source="", channel="", dry_run=
     msg = compose_message(signal, surface=source)
     if dry_run:
         return msg
-    macos_ok = bool(_macos_notify(msg)) if macos else False
-    # Debounce only on a confirmed delivery: the selected channel when there is
-    # one (macOS alone must not suppress it), else the macOS notification.
+    # The app pops its own notification for a channel message the gateway accepted (2xx), so
+    # macOS is the fallback only. Debounce on that send; macOS alone must not suppress it.
     if source and channel:
         delivered = _channel_notify(msg, source, channel, extra=alert_content(signal))
+        if not delivered and macos:
+            _macos_notify(msg)
         reason = "channel send failed"
     else:
-        delivered = macos_ok
+        delivered = bool(_macos_notify(msg)) if macos else False
         reason = "no route and macOS " + ("notification failed" if macos else "disabled")
     if delivered:
         _save_last_hash(state_file, new_hash)

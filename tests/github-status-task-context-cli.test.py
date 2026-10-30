@@ -1,4 +1,8 @@
 """Publication task context reaches the existing owner through both real CLIs."""
+from _helpers.hermetic_env import isolate_os_environ
+
+isolate_os_environ()
+
 import importlib.util
 import json
 import unittest

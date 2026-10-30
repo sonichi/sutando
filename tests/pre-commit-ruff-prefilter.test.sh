@@ -11,7 +11,11 @@ bad () { printf '  FAIL %s\n' "$1"; fails=$((fails + 1)); }
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 cd "$TMP" || exit 1
-git init -q .
+# Explicit -b main: this fixture is a plain (non-worktree) checkout, so the
+# new non-main-branch guard applies to it too. Without this, `git init`'s
+# default branch name (e.g. "master" on Linux CI) makes every real commit
+# below spuriously refused by that guard instead of by ruff.
+git init -q -b main .
 git config user.email t@example.com
 git config user.name t
 mkdir -p .githooks scripts workspace

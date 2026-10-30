@@ -52,7 +52,7 @@ def _result(ok, *, members=None, reason=None, unidentified=0):
 
 def room_members(room_id: str, agent_mxid=None):
     """→ {ok, members, reason, unidentified}; each member is {user_id, display_name, kind}."""
-    base, headers = gateway()
+    base, headers = gateway(room_id)
     if not base:
         return _result(False, reason="no gateway configured")
     try:

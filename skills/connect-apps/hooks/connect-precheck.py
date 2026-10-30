@@ -41,7 +41,7 @@ SESSIONS_NAME = "connect-precheck.sessions.json"
 MAX_SESSIONS = 50
 MAX_TEXT = 2000
 MAX_CONNECTED = 15
-TASK_ID = r"task-(?!cron-|bench-|workstream-|project-grouping-)[A-Za-z0-9][\w-]*"
+TASK_ID = r"task-(?!cron-|bench-|workstream-|project-grouping-)[A-Za-z0-9][\w~-]*"
 # An optional absolute prefix, then tasks/<id>.txt; tasks/archive/… never matches.
 TASK_FILE = re.compile(rf"((?:/[^\s\"'`]*?/)?tasks/({TASK_ID})\.txt)\b")
 HEADER_LINE = re.compile(r"^([A-Za-z_]+): ?(.*)$")

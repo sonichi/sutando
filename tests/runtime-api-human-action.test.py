@@ -10,6 +10,12 @@ requests and are idempotent-safe on terminal ones.
 Run: python3 tests/runtime-api-human-action.test.py
 Exit: 0 on pass, 1 on fail.
 """
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import asyncio
 import sys
 import tempfile

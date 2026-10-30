@@ -150,6 +150,11 @@
       "type": "string",
       "pattern": "^(?!/)(?!(.*/)?\\.\\.(/|$))[^\\s]+\\.py$",
       "description": "A script that reports (no arguments) or stops (--reap) orphaned test processes, relative to the skill directory and resolving inside it. health-check runs it, from the installed (linked) skills dir only, to classify sustained load; at most one installed skill may declare it (skills/MANIFEST.md)."
+    },
+    "on_launch": {
+      "type": "string",
+      "pattern": "^(?!/)(?!(.*/)?\\.\\.(/|$))[^\\s]+\\.(py|sh)$",
+      "description": "A script to start once per core launch, relative to the skill directory and resolving inside it: a .py runs under the engine's python, anything else under bash. src/launch_hooks.py starts every enabled declarer detached and never waits on it (skills/MANIFEST.md)."
     }
   },
   "allOf": [

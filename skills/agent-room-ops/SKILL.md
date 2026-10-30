@@ -6,11 +6,11 @@ and fixed recent limits cannot establish all-room coverage. Fallback text posts
 support `--strict say ROOM --body-file FILE` and require receipt inspection.
 
 > **DEPRECATED — room ops (`POST <gateway>/v1/room`) is being removed.** Use the
-> **AG2 Space MCP** room Actions instead. `room_ops.py` is kept only as a
+> **s.space MCP** room Actions instead. `room_ops.py` is kept only as a
 > **fallback for when the MCP is unreachable** (or for the gaps listed below) —
 > never the first path.
 
-## Use the AG2 Space MCP first
+## Use the s.space MCP first
 
 Call room Actions through the existing façade tools only — `room.actions.search`,
 `room.actions.describe`, `room.action.read` (zero-effect reads),
@@ -30,7 +30,6 @@ The normative op→Action map is the backend contract
 | `react` / `unreact` | `room.action.execute` | `room.message.react` / `room.message.unreact` |
 | `send` (upload) | `room.action.execute` | `room.media.upload` |
 | `fetch` | `room.action.execute` | `room.media.link` (an expiring viewer link, not a local file) |
-| `doc get` / `put` / `rm` (retiring, no MCP twin) | `room.action.read` / `room.action.execute` | Room Commons instead: pages `room.commons.pages.create` / `room.commons.pages.read` / `room.commons.pages.append`, databases `room.commons.databases.*` |
 | `events emit` | `room.action.execute` | `room.event.send` |
 | state read / write | `room.action.read` / `room.action.execute` | `room.state.read` / `room.state.write` |
 
@@ -83,7 +82,10 @@ does the privileged Matrix ops + authoritative membership enforcement.
 | `react <room> <event>` | add an `m.reaction` (ack) | discord `add_reaction` (👀/✅) |
 | `unreact <room> <event>` | remove the agent's reaction | discord remove-on-reply |
 | `join <room>` | accept the agent's own pending invite | discord guild-join on invite |
-| `doc get\|put\|rm <room>` | **retiring** with the room vault it reads; use Room Commons pages and databases for durable room state | — |
+
+On an install connected to several servers, a verb that names a room acts through the connection
+serving that room's server. `rooms`, `history`, `agents`, `resolve` and `events list|pull|stream`
+name none, so they act through the primary connection only.
 
 ```bash
 python3 skills/agent-room-ops/room_ops.py read   '!room:hs' --limit 20 --agent '@a:hs'
@@ -145,7 +147,7 @@ when the owner joins). Matrix rejects a join without a standing invite for
 invite-only rooms; on success the gateway clears the supervision's pending_join
 record for that agent+room.
 
-## Platform conventions — how to operate on AG2 Space
+## Platform conventions — how to operate on s.space
 
 Load-once operating rules for ANY agent on the platform (owner directive
 2026-07-24: conventions live here in the skill, not injected per-task). If you
@@ -217,8 +219,6 @@ layer (its CLAUDE.md equivalent) at connect time.
   databases (`room.commons.databases.list` / `.query` / `.mutate`).
   Write documents there instead of pasting long content into chat; post the
   page's name + a 1-3 line summary in the room.
-- The room vault behind `doc get|put|rm` is being retired; don't start new
-  state there.
 
 **Acknowledgement & etiquette**
 - Don't manually react 🫡 for pickup — the platform shows each agent's

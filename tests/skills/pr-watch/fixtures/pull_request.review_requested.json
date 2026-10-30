@@ -1,0 +1,33 @@
+{
+  "action": "review_requested",
+  "number": 9,
+  "pull_request": {
+    "number": 9,
+    "state": "open",
+    "merged": false,
+    "title": "x",
+    "user": {
+      "login": "carol"
+    },
+    "head": {
+      "sha": "c0ffee000000",
+      "ref": "feat"
+    },
+    "base": {
+      "ref": "main"
+    }
+  },
+  "requested_reviewer": {
+    "login": "Owner-Me"
+  },
+  "repository": {
+    "full_name": "acme/widgets",
+    "name": "widgets",
+    "owner": {
+      "login": "acme"
+    }
+  },
+  "sender": {
+    "login": "carol"
+  }
+}

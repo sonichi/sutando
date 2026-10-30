@@ -150,6 +150,44 @@ class TaskMediaRoute(unittest.TestCase):
         self.assertEqual(media[0][2]["filename"], "chart.png")
         self.assertTrue(self._result_posts(), "and the result itself is delivered")
 
+    def test_team_task_directory_swap_is_refused_before_upload(self):
+        mod = self.mod
+        mod.LOCAL_TIER = "team"
+        mod._load_tier_map = lambda: {}
+        self._allow_this_workspace_results(mod)
+        mod._write_task(self._team_signal_task("task-team-swap"))
+        task_dir = mod.RESULTS_DIR / "task-team-swap"
+        other_dir = mod.RESULTS_DIR / "task-team-other"
+        task_dir.mkdir()
+        other_dir.mkdir()
+        (task_dir / "chart.png").write_bytes(b"approved")
+        (other_dir / "chart.png").write_bytes(b"other task bytes")
+        attachment = task_dir / "chart.png"
+        self._result(mod, "task-team-swap", f"the chart [file: {attachment}]")
+        backup = mod.RESULTS_DIR / "task-team-swap-backup"
+        upload = mod._upload_task_attachment
+
+        def swap_then_upload(wire_id, ordinal, path, confine_root=None):
+            task_dir.rename(backup)
+            task_dir.symlink_to(other_dir, target_is_directory=True)
+            try:
+                if confine_root is None:
+                    return upload(wire_id, ordinal, path)
+                return upload(wire_id, ordinal, path, confine_root=confine_root)
+            finally:
+                task_dir.unlink()
+                backup.rename(task_dir)
+
+        with patch.object(mod, "_upload_task_attachment", side_effect=swap_then_upload):
+            mod._post_ready_results({"task-team-swap"})
+        self.assertEqual(self._media_posts(), [],
+                         "a replacement task directory never supplies upload bytes")
+        results = self._result_posts()
+        self.assertEqual(len(results), 1)
+        body = results[0][2]["body"]
+        self.assertIn("[attachment not sent:", body)
+        self.assertIn("outside the task's media directory", body)
+
     def test_ordinary_team_task_gets_no_allowance(self):
         mod = self.mod
         mod.LOCAL_TIER = "team"
@@ -186,6 +224,71 @@ class TaskMediaRoute(unittest.TestCase):
         except Exception:
             pass
         self.assertEqual(self._media_posts(), [], "guest/unknown provenance never earns the Team allowance")
+
+    def test_task_media_upload_without_provenance_fails_closed(self):
+        # The task file is gone: confinement can't be resolved, so the upload
+        # must withhold — never fall back to the plain allowlist read.
+        mod = self.mod
+        attachment = self._attachment()
+        status, reason = mod._upload_task_attachment(
+            "task-missing", 0, attachment, confine_root=mod._CONFINE_UNRESOLVED)
+        self.assertEqual(status, "note")
+        self.assertEqual(self._media_posts(), [])
+        self.assertIn("provenance", reason)
+
+    def test_confined_read_reports_oversize_and_read_failure(self):
+        mod = self.mod
+        root = mod.RESULTS_DIR / "task-conf-read"
+        root.mkdir(parents=True, exist_ok=True)
+        f = root / "a.bin"
+        f.write_bytes(b"12345")
+        with patch.object(mod, "is_path_sendable", return_value=True):
+            with patch.object(mod, "MAX_MEDIA_BYTES", 2):
+                self.assertIn("exceeds", mod._read_attachment(str(f), confine_root=root)[2])
+            with patch.object(mod.base64, "b64encode", side_effect=OSError("boom")):
+                self.assertIn("read failed", mod._read_attachment(str(f), confine_root=root)[2])
+
+    def test_missing_task_file_selects_the_unresolved_confinement_path(self):
+        # Past the marker parser, the delivery loop must map a missing task file
+        # to _CONFINE_UNRESOLVED: the upload is refused and reported in-band.
+        mod = self.mod
+        mod.LOCAL_TIER = "team"
+        mod._load_tier_map = lambda: {}
+        self._allow_this_workspace_results(mod)
+        mod._write_task(self._team_signal_task("task-team-gone"))
+        for f in mod.TASKS_DIR.glob("task-team-gone*"):
+            f.unlink()
+        own = mod.RESULTS_DIR / "task-team-gone"
+        own.mkdir(parents=True, exist_ok=True)
+        (own / "chart.png").write_bytes(b"payload")
+        self._result(mod, "task-team-gone", f"x [file: {own / 'chart.png'}]")
+        with patch.object(mod, "_guarded_result_body",
+                          side_effect=lambda tid, raw: (raw, None)):
+            mod._post_ready_results({"task-team-gone"})
+        self.assertEqual(self._media_posts(), [])
+        posts = self._result_posts()
+        self.assertEqual(len(posts), 1)
+        self.assertIn("provenance", posts[0][2]["body"])
+
+    def test_missing_task_file_marker_is_withheld_before_the_loop(self):
+        # Production order: a missing task file resolves to guest upstream, so
+        # the marker is withheld for review before the delivery loop sees it.
+        mod = self.mod
+        mod.LOCAL_TIER = "team"
+        mod._load_tier_map = lambda: {}
+        self._allow_this_workspace_results(mod)
+        mod._write_task(self._team_signal_task("task-team-gone2"))
+        for f in mod.TASKS_DIR.glob("task-team-gone2*"):
+            f.unlink()
+        own = mod.RESULTS_DIR / "task-team-gone2"
+        own.mkdir(parents=True, exist_ok=True)
+        (own / "chart.png").write_bytes(b"payload")
+        self._result(mod, "task-team-gone2", f"x [file: {own / 'chart.png'}]")
+        mod._post_ready_results({"task-team-gone2"})
+        self.assertEqual(self._media_posts(), [])
+        self.assertEqual(self._result_posts(), [])
+        # Left for retry, not delivered — the withheld marker is intact.
+        self.assertIn("[file:", (mod.RESULTS_DIR / "task-team-gone2.txt").read_text())
 
     def test_team_dedup_requeue_attaches_from_the_original_tasks_dir(self):
         """A requeue's body is the ORIGINAL body (media instruction naming the

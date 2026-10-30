@@ -24,6 +24,7 @@ import fnmatch
 import hashlib
 import json
 import os
+import re
 import stat
 import sys
 import tempfile
@@ -36,11 +37,13 @@ from typing import NamedTuple
 # derives its classification from parse_markers rather than a parallel grammar.
 try:  # pragma: no cover - the packaged twin exercises the relative imports
     from .result_markers import parse_markers  # packaged sibling (ag2-sparrow)
-    from .local_task_protocol import canonical_access_tier, parse_task_headers
+    from .local_task_protocol import canonical_access_tier, find_archived_task, parse_task_headers
+    from .task_archive import find_task_file
     from .file_lock import lock_fd, unlock_fd
 except ImportError:
     from result_markers import parse_markers  # monorepo src/ on sys.path
-    from local_task_protocol import canonical_access_tier, parse_task_headers
+    from local_task_protocol import canonical_access_tier, find_archived_task, parse_task_headers
+    from task_archive import find_task_file
     from file_lock import lock_fd, unlock_fd
 
 TEAM_LEAK_RESULT = (
@@ -88,6 +91,22 @@ class TeamResultLeakError(RuntimeError):
     """A Team result carried a delivery-control marker or a likely secret."""
 
 
+# An internal error carries this host's paths and state ids; it is the owner's to read, never a
+# guarded reader's. Paths match only under per-user and temp roots (POSIX, Windows), never `/x/y`.
+INTERNAL_ERROR_DETAIL = "internal error detail"
+_INTERNAL_ERROR_RE = re.compile(
+    r"\[(?:Errno|WinError) \d+\]"
+    r"|Traceback \(most recent call last\)"
+    r"|(?<![\w.~/-])(?:/(?:Users|home|root|tmp|var/tmp|private/(?:var|tmp)|var/folders)|~/Library)/[^\s'\"`]+"
+    r"|(?<![\w.~/-])[A-Za-z]:[\\/]Users[\\/][^\s'\"`]+")
+
+
+def carries_internal_error_detail(body) -> bool:
+    """True when the text a reader would see quotes a raw OS error, a traceback, or a local path.
+    Marker values are excluded: an admitted `[file:]` path is consumed by the transport, never shown."""
+    return bool(_INTERNAL_ERROR_RE.search(parse_markers(body or "").body or ""))
+
+
 def resolve_access_tier(task_file) -> str:
     """Read a task's effective tier without letting a task-last body escalate.
 
@@ -122,6 +141,15 @@ def resolve_access_tier(task_file) -> str:
     return tier if tier in {"owner", "team", "guest"} else "guest"
 
 
+def resolve_route_tier(tier, tasks_dir: Path, task_id: str) -> str:
+    """The tier a reply is guarded with: the route's own tier when it carries one,
+    else the task file's (live, claimed, or archived); no task file anywhere is guest."""
+    if tier and tier != "unknown":
+        return tier
+    task_file = find_task_file(tasks_dir, task_id) or find_archived_task(tasks_dir, task_id)
+    return resolve_access_tier(task_file) if task_file else "guest"
+
+
 def sensitive_data_filter_enabled(task_file, tier=None) -> bool:
     """Disable only for paired Team collaborator and filter-off stamps."""
     if tier != "team":
@@ -144,6 +172,63 @@ def sensitive_data_filter_enabled(task_file, tier=None) -> bool:
         if line.startswith("collaborator:")
     ]
     return filter_values != ["false"] or collaborator_values != ["true"]
+
+
+def trusted_attach_root(root) -> str | None:
+    """Return a real, non-symlink task root or None."""
+    try:
+        absolute = os.path.abspath(os.fspath(root))
+        metadata = os.lstat(absolute)
+    except (OSError, TypeError, ValueError):
+        return None
+    if not stat.S_ISDIR(metadata.st_mode):
+        return None
+    real = os.path.realpath(absolute)
+    expected = os.path.join(
+        os.path.realpath(os.path.dirname(absolute)), os.path.basename(absolute))
+    return real if real == expected else None
+
+
+def open_confined_attachment(path, root) -> int:
+    """Open a regular file below a trusted root without following symlinks."""
+    trusted_root = trusted_attach_root(root)
+    if trusted_root is None:
+        raise ValueError("untrusted task media directory")
+    try:
+        absolute_path = os.path.normpath(os.path.abspath(os.fspath(path)))
+        absolute_root = os.path.normpath(os.path.abspath(os.fspath(root)))
+        relative = os.path.relpath(absolute_path, absolute_root)
+    except (OSError, TypeError, ValueError) as exc:
+        raise ValueError("invalid attachment path") from exc
+    if (os.path.isabs(relative) or relative in ("", ".", "..")
+            or relative.startswith(".." + os.sep)):
+        raise ValueError("attachment is outside the task media directory")
+    components = relative.split(os.sep)
+    if any(part in ("", ".", "..") for part in components):
+        raise ValueError("invalid attachment path")
+
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    root_fd = os.open(trusted_root, directory_flags)
+    current_fd = root_fd
+    try:
+        for component in components[:-1]:
+            next_fd = os.open(component, directory_flags, dir_fd=current_fd)
+            if current_fd != root_fd:
+                os.close(current_fd)
+            current_fd = next_fd
+        file_fd = os.open(
+            components[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=current_fd)
+        try:
+            if not stat.S_ISREG(os.fstat(file_fd).st_mode):
+                raise OSError("attachment is not a regular file")
+        except BaseException:
+            os.close(file_fd)
+            raise
+        return file_fd
+    finally:
+        if current_fd != root_fd:
+            os.close(current_fd)
+        os.close(root_fd)
 
 
 def load_team_result_scanner(repo: Path):
@@ -183,7 +268,8 @@ def attach_markers_confined(body: str, attach_roots) -> bool:
     it would resolve against a cwd or a home directory this policy cannot
     vouch for. An empty `attach_roots` confines nothing.
     """
-    roots = [os.path.realpath(str(r)) for r in (attach_roots or ()) if str(r).strip()]
+    roots = [trusted for r in (attach_roots or ())
+             if str(r).strip() and (trusted := trusted_attach_root(r))]
     if not roots:
         return False
     values = [a.value for a in parse_markers(body or "").actions if a.kind == "attach"]
@@ -221,6 +307,8 @@ def scan_team_result(body: str, repo: Path, secret_filter=None,
     # Marker checks stay above this narrow scanner opt-out.
     if not scan_sensitive_data:
         return body
+    if carries_internal_error_detail(body):
+        raise TeamResultLeakError(INTERNAL_ERROR_DETAIL)
     filter_chat_secrets = secret_filter or load_team_result_scanner(repo)
     try:
         result = filter_chat_secrets(body)

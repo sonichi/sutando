@@ -12,6 +12,11 @@ kickstart, which never names voice-agent.
 Run: python3 tests/health-check-voice-guarded-fix.test.py
 """
 
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import os
 import tempfile

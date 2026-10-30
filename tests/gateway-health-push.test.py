@@ -90,7 +90,8 @@ class Snapshot(Base):
                 mock.patch.object(rgb, "HEALTH_TTL_S", 0.0):
             self.assertIsNone(rgb._health_snapshot())
             self.assertIsNone(rgb._health_snapshot())
-        self.assertEqual(logs, ["health snapshot unavailable: OSError: gone"])
+        self.assertEqual(len(logs), 1, logs)  # once per error, and only its type and location
+        self.assertRegex(logs[0], r"^health snapshot unavailable: OSError at [\w.-]+:\d+$")
 
 
 class Rows(unittest.TestCase):
@@ -202,7 +203,7 @@ class SignedInIdentity(Base):
         path = self.ws / "state" / "gateway-status.json"
         with mock.patch.object(rgb, "GATEWAY_STATUS_FILE", path), \
                 mock.patch.object(rgb, "_reenroll_identity", return_value=ME):
-            rgb._emit_gateway_status(connected)
+            rgb._emit_gateway_status(connected, poll_ok_ts=rgb.time.time() if connected else None)
         return json.loads(path.read_text())
 
     def test_the_sidecar_names_the_identity_only_while_connected(self):

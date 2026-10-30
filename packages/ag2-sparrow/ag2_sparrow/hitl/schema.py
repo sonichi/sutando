@@ -17,6 +17,31 @@ from .host import device_host
 WIRE_FIELD = "space.ag2.hitl"
 # Follow-up notice tag: which cards a reminder or recovery message is about.
 NOTICE_FIELD = "space.ag2.hitl_notice"
+# The subject fields a card may show. The rest of `subject` is the producer's own bookkeeping
+# (claims, tokens, leases, session keys) and never leaves the host.
+WIRE_SUBJECT_FIELDS = ("tool", "input", "options", "choices")
+
+
+# Canonical JSON's integer range; a number outside it is refused like a float.
+WIRE_INT_MAX = 2 ** 53 - 1
+
+
+def wire_safe(value: Any) -> Any:
+    """`value` with only canonical-JSON numbers at any depth: an integral float within
+    +-WIRE_INT_MAX becomes an int, any other float or out-of-range int its repr string."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, float):
+        if value.is_integer() and -WIRE_INT_MAX <= value <= WIRE_INT_MAX:
+            return int(value)
+        return repr(value)
+    if isinstance(value, int):
+        return value if -WIRE_INT_MAX <= value <= WIRE_INT_MAX else repr(value)
+    if isinstance(value, dict):
+        return {k: wire_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [wire_safe(v) for v in value]
+    return value
 
 KINDS = frozenset(
     {"auth", "permission", "choice", "confirmation", "billing", "external_action",
@@ -165,15 +190,16 @@ class HumanRequirement:
             wire["device"] = device
         if self.actions:
             wire["actions"] = [a.to_wire() for a in self.actions]
-        if self.subject:
-            wire["subject"] = dict(self.subject)
+        subject = {k: self.subject[k] for k in WIRE_SUBJECT_FIELDS if k in (self.subject or {})}
+        if subject:
+            wire["subject"] = subject
         if self.expires_at is not None:
             wire["expires_at"] = self.expires_at
         if self.turn_on_action:
             wire["turn_on_action"] = True
         # `answer` is inbound-only (what the human typed back); a card never
         # renders it, so it is persisted but deliberately not on the wire.
-        return wire
+        return wire_safe(wire)
 
 
 class StaleRequirementError(Exception):

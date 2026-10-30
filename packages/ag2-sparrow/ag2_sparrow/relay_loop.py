@@ -287,6 +287,11 @@ class RelayLoop:
     def step(self, name, seen):
         raise NotImplementedError
 
+    def contained(self, name, unit, *args):
+        """One task's unit of loop work (its recovering probe, its step): the boundary where an adapter decides
+        which failures cost only that task. The base contains nothing."""
+        return unit(*args)
+
     def recovering(self, name):
         """True for a task whose earlier attempt is already counted; it skips the send gates."""
         return False
@@ -334,7 +339,7 @@ class RelayLoop:
             if n not in self.seen_at:
                 self.seen_at[n] = self.first_seen(n, now)
         for n in names:
-            if self.recovering(n):
+            if self.contained(n, self.recovering, n):
                 return n, 0.0
         ready = [n for n in names if self.not_before.get(n[:-4], 0) <= now]
         if not ready:
@@ -385,7 +390,7 @@ class RelayLoop:
             if name is None:
                 self.sleep(min(max(wait, 0.01), self.args.poll * 50))
                 continue
-            if self.step(name, seen):
+            if self.contained(name, self.step, name, seen):
                 done += 1
                 if self.args.once and done >= self.args.once:
                     return
