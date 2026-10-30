@@ -985,15 +985,31 @@ export type NavigateResult =
 
 /** How many unnamed rooms the owner-DM lookup reads the members of before giving up. */
 export const OWNER_DM_MAX_CHECKS = 20;
+/** The lookup stops here, well inside the tool timeout, so a send never lands after the model gave up. */
+export const OWNER_DM_LOOKUP_BUDGET_MS = 15_000;
 const ownerDms = new WeakMap<McpClient, RoomRef>();
+
+/** Whether `room` has exactly the agent and its owner as members; false when its roster cannot be read. */
+async function onlyUs(client: McpClient, room: RoomRef, me: string, owner: string, deps: Pick<ReadRoomDeps, 'log'>): Promise<boolean> {
+	const m = await roomRead(client, room, 'room.members.list', {}, deps);
+	if (!m.ok) return false;
+	const ids = (Array.isArray(m.result.members) ? m.result.members : []).map(x => String((x as { user_id?: unknown }).user_id ?? ''));
+	return ids.length === 2 && ids.includes(me) && ids.includes(owner);
+}
+
 /** The DM this agent shares with its owner: a room whose members are exactly the two of them. Unnamed
- *  rooms are checked first (a DM has no name); found once per client, then cached. */
-export async function ownerDm(client: McpClient, me: string, owner: string, deps: Pick<ReadRoomDeps, 'log'>): Promise<RoomRef | null> {
+ *  rooms are checked first (a DM has no name), then the rest in list order. A found DM is kept, and its
+ *  roster is read again before every use: once anyone else is in it, it is dropped and looked up anew. */
+export async function ownerDm(client: McpClient, me: string, owner: string, deps: Pick<ReadRoomDeps, 'log'>, now: () => number = Date.now): Promise<RoomRef | null> {
 	const cached = ownerDms.get(client);
-	if (cached) return cached;
+	if (cached) {
+		if (await onlyUs(client, cached, me, owner, deps)) return cached;
+		ownerDms.delete(client);
+	}
+	const deadline = now() + OWNER_DM_LOOKUP_BUDGET_MS;
 	const all: { room_id: string; name: string | null }[] = [];
 	let cursor: string | undefined;
-	for (let page = 0; page < ROOM_INDEX_MAX_PAGES; page++) {
+	for (let page = 0; page < ROOM_INDEX_MAX_PAGES && now() < deadline; page++) {
 		let payload: Record<string, unknown> | null;
 		try {
 			const res = await client.callTool('room.list', { scope: 'self', limit: ROOM_INDEX_PAGE, ...(cursor ? { cursor } : {}) }, ROOM_READ_CALL_TIMEOUT_MS);
@@ -1009,11 +1025,9 @@ export async function ownerDm(client: McpClient, me: string, owner: string, deps
 	}
 	const ordered = [...all.filter(r => r.name === null), ...all.filter(r => r.name !== null)].slice(0, OWNER_DM_MAX_CHECKS);
 	for (const r of ordered) {
+		if (now() >= deadline) break;
 		const ref = { room_id: r.room_id, name: r.name ?? 'your DM' };
-		const m = await roomRead(client, ref, 'room.members.list', {}, deps);
-		if (!m.ok) continue;
-		const ids = (Array.isArray(m.result.members) ? m.result.members : []).map(x => String((x as { user_id?: unknown }).user_id ?? ''));
-		if (ids.length === 2 && ids.includes(me) && ids.includes(owner)) {
+		if (await onlyUs(client, ref, me, owner, deps)) {
 			ownerDms.set(client, ref);
 			return ref;
 		}
@@ -1056,7 +1070,7 @@ export function createNavigateSpaceTool(deps: ReadRoomDeps): ToolDefinition {
 			'`to` "commons" shows the Commons list of a room — the entry list of its surfaces (Doc, Whiteboard, Sheet, Database…), the current room\'s or `room`\'s by name ("go to the Commons list", "打开 commons 列表", "show me what is in <room>\'s Commons"). Not this: "document list", "list of documents", "show me the docs", "文档列表" mean the Doc surface and its pages — run_room_action room.commons.summon with arguments_json {"kind": "markdown"} (no page); one document named, "open the Stevens doc", is a summon to that page. ' +
 			'"back" leaves the screen they are on, one step ("go back", "回去", "退出文档"), so page → list → room walks back the way they came. ' +
 			'Speech often hears "Commons" as "comments": "the list of room comments", "open the room comments", "go to the comments" with no document or thread named means the Commons list — call this with "commons", never list comment threads for it. ' +
-			'Runs at once — no read-back, no yes — then say in a few words where they are now. Only the user\'s own screen moves (their phone and web client), never anyone else\'s. ' +
+			'Runs at once — no read-back, no yes. It asks the user\'s own app to move (their phone and web client, never anyone else\'s) and nothing confirms the move, so on ok say you asked: "I\'ve asked your screen to open the Commons list", "I\'ve asked your screen to go back" — never that they are already there. ' +
 			'Errors: "bad_destination" — only "commons" or "back"; "no_owner" or "no_dm" — say it could not be done; ' + ROOM_NAME_ERRORS +
 			'"not_connected", "timeout" or "unavailable" — say it could not be done right now; ' + OUTCOME_UNKNOWN_ERROR,
 		parameters: z.object({
