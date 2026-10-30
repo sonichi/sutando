@@ -34,6 +34,8 @@ lower-precedence candidate.
 | `SUTANDO_BRIDGE_RESTART_OWNER` | no | — | Name of whatever relaunches the bridge on exit (the launchd plist sets `launchd`). Unset, the stall is logged and written to `gateway-status.json` but the process keeps retrying, because a bare `&` lane has nothing to bring it back. |
 | `REMOTE_TASK_TIER` | no | `owner` | Local access tier stamped on every inbound task; `owner` for the personal-agent model, set `team`/`guest` for a shared gateway (see Security); `other` is accepted as the legacy spelling of `guest`. |
 | `REMOTE_PROACTIVE_ROOM` *(.env too)* | no | — | The SYSTEM destination only. Owner-directed `results/proactive-*.txt` nudges and runtime prompt cards go to the gateway's `owner_dm_room` for this agent (`GET /v1/agents`), a reading kept identity-bound on disk (`state/owner-routing.json`) across restarts and outages and never replaced by an answer without one. A room is adopted as the owner DM only when `/v1/room` `{"op": "members"}` lists no one but the agent and its owner, re-checked on every refresh; a room with anyone else clears the reading, and an unreadable member list never adopts a new room. Only a record marked `"private": true` is loaded; one saved before this check, including a migrated legacy record, is not. With no reading they are HELD (file left in place, retried every 30 s, logged), never sent here. Unset → read from this instance's `channels/<dir>/.env`. A file naming its own room (`[channel: !room]`) never needs it; the drain runs whether or not it is set. |
+| `REMOTE_TASK_LIFECYCLE_V2` | no | off | `1` turns on the task lifecycle calls below (lease generation, per-task beats, cancel, ledger reconcile). |
+| `REMOTE_TASK_TURN_CONTEXT` | no | off | `1`, with `REMOTE_TASK_LIFECYCLE_V2`, writes each attempt's turn file and gates its result on the turn's room actions. |
 | `REMOTE_ALERT_ROOM` | no | none (gateway alert disabled) | Explicit owner-only room id for core-independent health alerts sent by the launchd fallback. Never inferred from last activity because that room may be shared. |
 
 **Use the split form** (`REMOTE_TASK_URL` + `REMOTE_TASK_TOKEN`) — it's the recommended way to configure the bridge.
@@ -368,6 +370,100 @@ from [`GET /health`](health-snapshot.md) and the `worker_health.v1` capability:
 the broker times freshness by when it received the heartbeat. A change in the row
 sends the heartbeat at once, without waiting for the interval. A gateway with no
 Sutando checkout around it sends neither field.
+
+### Task lifecycle *(opt-in: `REMOTE_TASK_LIFECYCLE_V2=1`)*
+
+- **Ack** adds `worker_id` (one lease-holder id per install, `state/relay-lease-worker-id`) and
+  `protocol_version: 2`, and records the `execution_generation` its 200 reports. An answer on
+  either ack path carrying a fencing `error_code` (`stale_execution_generation`, `task_cancelled`,
+  `task_not_found`, `task_already_terminal`, on a 404 or a 409) fences the attempt, retires its
+  pending ack and, for a published task, stops the core (below) — except a stale older lease
+  when a newer serve of the same task is pending here, which that serve's ack decides.
+- **`POST /v1/tasks/heartbeat`** `{worker_id, tasks:[{task_id, worker_id, execution_generation}]}`
+  is sent every 15 s for every attempt with a generation, for as long as the bridge holds it, even
+  while the client heartbeat (60 s) is backing off: it is the only way a Stop reaches a running
+  task. While one is held, the task long poll returns when the next beat is due. An attempt whose
+  task file has left the queue with no result, no claim and no turn activity for 10 min is never
+  going to be answered: its beats stop and it is posted as `status: failed` with `no_send`. So is
+  one still queued whose task file the core took up (a turn row newer than the file) and then left
+  with no turn activity and no result for 30 min while the core's health row reads it idle (2 h when
+  that reading is unknown; never while it reads moving, i.e. mid-turn on a long tool call), and that one
+  also gets a `CANCEL_INSTRUCTION`, so a turn parked on a terminal prompt is answered by the Stop path's
+  Escape (with `SUTANDO_STOP_INTERRUPT=1`); a task file the core has not reached yet keeps
+  beating however long it waits. Until then the in-flight reconcile keeps the id, rather than
+  dropping it as completed elsewhere. A
+  `task_errors` entry of `stale_execution_generation`, `task_not_found` or
+  `task_already_terminal` fences the attempt (its result is settled, never posted), and the first
+  also stops the core. That stop is withdrawn, if the core has not taken it yet, when a newer
+  generation of the task is acked here. If the core took it already, the newer attempt it then
+  leaves with no result and no queued task file is posted as `status: failed` with `no_send`. The other
+  two, from a beat or an ack, withdraw the task file if the core has not
+  taken it up (no turn row newer than the file), and otherwise stop the core; the log names the
+  broker's `reason` when it sends one. `task_cancelled` is a **cooperative Stop**: the core gets one
+  `CANCEL_INSTRUCTION` task (`source: relay-control`, whose result is retired locally and never
+  posted), and nothing is fenced. Once the core has handled that control task, a result it wrote
+  for the task is posted normally and no cancel-ack is sent; with no result, or one with nothing to
+  deliver (`no_send` or an empty body), the stop is confirmed on `POST /v1/tasks/<id>/cancel-ack`
+  and that result, or any later one, is settled, never posted (not as `no_action_needed` either). A `task_cancelled` on the ack
+  means the task is not started: its file is withdrawn like a closed task's (the core is stopped
+  only if it has taken it up), and it is cancel-acked at once. A 404 disables the per-task beat.
+- **Results** add `execution_generation` and `worker_id`; a fenced attempt's result is settled
+  without a post. A result written before its task's ack named the lease waits for it. On a broker that has
+  ever named a lease (`state/relay-broker-contract.json`) it keeps waiting, until the ack lands,
+  the attempt is fenced, or the server closes the task; on one never seen to, it waits 120 s and
+  is then posted without lease fields, still gated on the journal records that name the task. A
+  task served again before its ack keeps its first publication time as the journal boundary. A result answered `409 task_already_terminal | stale_execution_generation |
+  task_cancelled` or `400 waiting_input_without_blocker` is settled, not quarantined.
+- **`GET /v1/tasks/active?status=outstanding`** is read every five minutes, fully paged. An attempt
+  the server does not list (acked, or first published when no ack ever answered, more than 120 s
+  ago) is only logged: absence is not a terminal status, so it is fenced only when its beat or ack
+  answers with one. Server tasks this node does not hold are written to
+  `state/relay-outstanding-tasks.json`.
+- With `REMOTE_TASK_LIFECYCLE_V2=1`, a served task carrying `wake` is never closed as a redelivery, and never
+  run without its answer. Without turn context, for an `ack_first` wake, or for an episode already run
+  here, it is left unacked, whether or not this node saw its first attempt. With the flag off it is an
+  ordinary task, as before.
+
+With `REMOTE_TASK_TURN_CONTEXT=1` too, the ack writes the attempt's read-only turn file
+`state/turns/<task_id>_g<gen>_<ulid>.json` (`src/agent_turn.py`), which the MCP proxy binds room
+actions to and journals in `state/room-actions.jsonl`. The file is written to a temp file, fsynced and
+`link()`ed into place, so it is never seen half-written or replaced. When the result settles the turn
+gets a `.closed` fence, written while holding the proxy's `room-actions.jsonl.lock` (an `O_EXCL` file
+of `<pid> <token> <start_ms>`; a dead pid's lock is broken, a live one is waited on up to 2 s), so a
+close never lands between the proxy's check and its intent append. At start every turn whose task
+is no longer in flight is closed. The result is
+then decided by the turn's journal: skipped when a room action already closed the task; posted as
+`status: waiting_input` + `no_send` while the task waits for a human; posted with `no_send` when a
+`room.message.send` in the turn carried the same text (`body_sha256`); otherwise posted as
+`status: completed`. An outcome whose `applied_*` fields are null (a task the ledger does not know) is
+unknown: neither terminal nor suspended, so only the same-text check applies to it. Records the
+proxy could not bind but that name the task, written since it was published, count as the turn's.
+A journal line that does not parse makes the journal unreadable (`failed` + `no_send`), except an
+unterminated last line younger than 30 s, an append in progress, which defers the result.
+
+Each task file then carries one writer-owned line telling the agent to ask a question that blocks
+it with `room.question.ask` on its exact `task_id`, to send anything the room should read with
+`room.message.send` before asking, and that its result file is never posted while the question is
+open (`waiting_input` + `no_send`). A wake (the same task re-served with
+`wake.resolved_blockers` after the answer) runs once per `blocker_episode_id`
+(`state/relay-wake-episodes.json`): it is queued again under the same id, with each answer appended
+to the task's line as quoted room data, and it is acked at the same generation into a new turn.
+Its result rides its own outbox item `<id>.wake-<episode>`, so the first attempt's delivered record
+neither blocks nor stands in for it. A wake served while an earlier attempt of the same id is still settling here
+(its result unarchived, its task still queued, or its id still to retire) is left unacked until
+the broker serves it again, so the earlier attempt's settle can never retire the wake. Every
+branch that archives a result and retires its id does both as one step under the same lock. The
+recovery judgement that a result was already disposed of is made inside that step too, and a
+settle never archives a task whose open wake has not delivered its own result.
+
+A task that asks this agent a room question (`task["room_question"]`) carries the question's
+`question_id`, `expected_revision`, `prompt`, `options`, `allow_free_text`, `response_mode`,
+`target_members` and `expires_at` as one line of quoted room data. Unless its `can_answer` is
+`false`, a second writer-owned line tells the agent to answer it once with `room.question.answer`
+through `room.action.execute_safe` (revision and `can_answer` from `room.question.inspect`), then
+write a `[no-send]` one-line result. The turn gate reads only outcomes about its own task: an
+outcome naming another task's `task_id` neither suspends nor settles this one. A resolved blocker
+that carries an `answers` list is rendered answer by answer.
 
 ### `GET /v1/setup` *(optional)*
 

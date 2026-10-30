@@ -215,7 +215,7 @@ const _ZWSP = '​';
 // Mirrors local_task_protocol.KNOWN_HEADER_KEYS (53 keys) — injection-guard-sweep
 // asserts this regex covers every py key. reply_chain_ids added with PR #2310.
 const _CONF_HEADER_RE = new RegExp(
-	'^(?:id|timestamp|session_scope|task|source|access_tier|user_id|channel_id|priority|lane|' +
+	'^(?:id|timestamp|session_scope|task|source|access_tier|user_id|channel_id|priority|lane|wake_episode|' +
 	'interaction_type|source_message_id|channel_name|guild_name|attempts|' +
 	'sender_name|room_name|parent_message_id|reply_chain_ids|reminder|' +
 	'author_name|author_id|' +

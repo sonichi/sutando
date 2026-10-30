@@ -180,6 +180,8 @@ KNOWN_HEADER_KEYS = (
     "addressed_to", "callSid", "caller",
     # The relay's judgement of a voice task: quick or long; the core dispatches on it.
     "lane",
+    # The question episode a woken task resumes: its file is a new turn of an id answered before.
+    "wake_episode",
     # Thread membership, distinct from the reply target above; the room is
     # carried because a relation only resolves inside its own room.
     "thread_root", "source_room_id",
@@ -251,6 +253,28 @@ def valid_task_id(tid: str) -> bool:
     intentionally stricter than the archive lookup gate.
     """
     return bool(TASK_ID_RE.match(tid or ""))
+
+
+# A named gateway instance prefixes its broker's id: `task-<instance>~<broker id>`.
+INSTANCE_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,32}")
+# The gateway's wire grammar for a broker task id (`task-<hex>`, `ask-<hex>`, `sc-ask-<hex>`, …).
+BROKER_ID_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
+
+
+def valid_broker_id(tid) -> bool:
+    """A task id as the gateway sends it on the wire: never `.` or `..`, which name directories."""
+    return isinstance(tid, str) and BROKER_ID_RE.fullmatch(tid) is not None and tid not in (".", "..")
+
+
+def valid_local_task_id(tid) -> bool:
+    """A live task id, or one a named gateway instance owns (`task-<instance>~<broker id>`)."""
+    if not isinstance(tid, str):
+        return False
+    if valid_task_id(tid):
+        return True
+    inst, sep, broker = tid[len("task-"):].partition("~")
+    return (tid.startswith("task-") and bool(sep) and INSTANCE_ID_RE.fullmatch(inst) is not None
+            and valid_broker_id(broker))
 
 
 def valid_archive_lookup_id(tid: str) -> bool:

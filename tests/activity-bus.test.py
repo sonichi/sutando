@@ -584,6 +584,8 @@ class Wiring(unittest.TestCase):
 
     def test_a_cancel_instruction_names_its_target(self):
         self.assertEqual(bus.cancel_target("CANCEL_INSTRUCTION: stop processing task-abc12 if still in flight."), "task-abc12")
+        self.assertEqual(bus.cancel_target("CANCEL_INSTRUCTION: stop processing task-lane~task-9f if still in flight."),
+                         "task-lane~task-9f", "a gateway instance's id keeps its broker half")
         self.assertIsNone(bus.cancel_target("please cancel my subscription"))
 
     def test_a_consolidated_completion_resolves_the_holder_event_from_its_task_file(self):

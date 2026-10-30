@@ -61,7 +61,7 @@ ROWS: "list[tuple[str, dict[str, tuple[str, list[tuple[str, str]]]]]]" = [
                     [(DISCORD, r"ts = int\(time.time\(\) \* 1000\)")]),
         "ag2space": ("`task-<inst>~<broker_id>` (provider-derived, "
                      "per-instance collision-proof)",
-                     [(AG2, r"_LOCAL_TID_RE = re.compile")]),
+                     [(AG2, r"return _valid_tid\(tid\) or local_task_protocol.valid_local_task_id\(tid\)")]),
         "slack": ("`task-<epoch-ms>` minted by the bridge",
                   [(SLACK, r'task_id = f"task-\{ts\}"')]),
     }),
