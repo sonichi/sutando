@@ -79,6 +79,11 @@ check("services_status probes the active lane", row["probe"][1] == STATE / "gate
 state, _detail, _since = ss.probe_gateway(gs.status_path(STATE), "no-such-pattern", NOW, lambda *a, **k: None)
 check("services_status reports the lane connected", state == "running", state)
 
+# --- no desktop app-support dir (a shell-run job): no lane
+os.environ["SUTANDO_APP_SUPPORT"] = ""
+check("without SUTANDO_APP_SUPPORT there is no lane", gs.active_lane() is None, repr(gs.active_lane()))
+os.environ["SUTANDO_APP_SUPPORT"] = str(APP)
+
 # --- selector that names no usable lane: no lane, and the unsuffixed file is read
 for sel in (None, "", "all", "primary", "../etc", "s.dspace", "s dspace", "a" * 33, "a" * 256):
     select(sel)
@@ -110,6 +115,30 @@ for n in (33, 256):
               row["probe"][1] == STATE / "gateway-status.json", str(row["probe"][1]))
     except OSError as e:
         check(f"{n}-char selector raised", False, repr(e))
+
+# --- the lane file's existence probe raises: the primary file answers, nothing propagates
+(STATE / "gateway-status.s_dspace.json").write_text(json.dumps(SERVING))
+select("s_dspace")
+_real_exists = Path.exists
+
+
+def _exists_raising_for_the_lane(self, *a, **k):
+    if self.name == "gateway-status.s_dspace.json":
+        raise OSError(63, "File name too long")
+    return _real_exists(self, *a, **k)
+
+
+Path.exists = _exists_raising_for_the_lane
+try:
+    check("exists() raises: resolver falls back to the primary file",
+          gs.status_path(STATE) == STATE / "gateway-status.json", str(gs.status_path(STATE)))
+    check("exists() raises: health-check reads the primary file", hc._gateway_serving() is True)
+    check("exists() raises: core-input-watch reads the primary file", ciw._gateway_status(str(STATE)) is True)
+except OSError as e:
+    check("exists() raising propagated", False, repr(e))
+finally:
+    Path.exists = _real_exists
+check("exists() restored: the lane file is read again", gs.status_path(STATE) == STATE / "gateway-status.s_dspace.json")
 
 # --- stale primary beside a serving active lane: the lane answers, not the stale file
 (STATE / "gateway-status.json").write_text(json.dumps({"ts": NOW - 17000, "connected": True, "last_ok_ts": NOW - 17000}))
