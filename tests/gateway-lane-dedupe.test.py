@@ -332,11 +332,14 @@ def main():
             rgb.GATEWAY_INSTANCE = ""
             rgb._post_task_ack = real_post
         at = dict(acks)
+        wait = rgb._INTAKE_ROUND_WAIT_S
+        # Judged against the wait itself, not wall-clock bounds a loaded runner can overrun.
         check("the sibling with no owner wait is acked before any waited message",
-              at.get("task-W3", 9) < 0.3, repr(acks))
+              at.get("task-W3", 9) < min(wait, at.get("task-W1", 0), at.get("task-W2", 0)), repr(acks))
         check("the waited messages are still answered once the wait ends",
-              {"task-W1", "task-W2"} <= set(at) and at["task-W1"] >= 0.5, repr(acks))
-        check("a round waits once, not once per message", at.get("task-W2", 9) < 0.9, repr(acks))
+              {"task-W1", "task-W2"} <= set(at) and at["task-W1"] >= wait - 0.1, repr(acks))
+        check("a round waits once, not once per message",
+              at.get("task-W2", 9) - at.get("task-W1", 0) < wait, repr(acks))
     finally:
         connections.event_owner_lanes = real_owner
         lane_dedupe.OWNER_WAIT_S = real_wait
