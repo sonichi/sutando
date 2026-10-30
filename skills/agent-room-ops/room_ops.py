@@ -179,6 +179,9 @@ def _run(argv):
     p.add_argument("path")
     p.add_argument("--caption", default=None)
     p.add_argument("--agent", dest="agent_mxid", default=os.environ.get("AGENT_MXID"))
+    p.add_argument("--thread-root", dest="thread_root", default=None, metavar="EVENT",
+                   help="event id ($abc) of the thread to post the upload IN (rel_type "
+                        "m.thread, built by the gateway); it leaves the main timeline.")
 
     p = sub.add_parser("join", help="accept this agent's own pending room invite")
     p.add_argument("room_id")
@@ -304,7 +307,8 @@ def _run(argv):
     elif a.cmd == "fetch":
         res = _media.fetch_media(a.ref, a.agent_mxid, a.room_id)
     elif a.cmd == "send":
-        res = _media.send_media(a.room_id, a.path, a.agent_mxid, caption=a.caption)
+        res = _media.send_media(a.room_id, a.path, a.agent_mxid, caption=a.caption,
+                                thread_root=a.thread_root)
     elif a.cmd == "join":
         res = _join.join_room(a.room_id, a.agent_mxid)
     elif a.cmd == "rooms":
