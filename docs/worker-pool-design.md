@@ -275,6 +275,8 @@ The router reads `state` only to treat `retired` as absent from the roster. The 
 are the health-check's, and whatever marks a worker `abandoned` is the same process that
 recovers it. `pool_manage.py` is the owner's command for a worker's lifecycle: `stop`
 (the per-worker `paused` marker, then its sessions are killed), `retire`, `enable` and `remove`.
+Retiring or removing a worker that owes deliveries is refused unless the owner passes
+`--hand-off`: the explicit handoff of the takeover rules below, moving each owed task to the core.
 
 **Stale is not dead.** A beat is an mtime, 30 s, considered stale at 90 s, and a
 future-dated beat counts as stale too. A host sleep expires every beat at once. That

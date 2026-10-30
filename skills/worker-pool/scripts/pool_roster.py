@@ -553,21 +553,28 @@ def _locked_worker(workspace, target: str):
     return raw, workers, wid
 
 
-def set_worker_state(workspace, target: str, state: str) -> "tuple[str, str, dict | None]":
+def set_worker_state(workspace, target: str, state: str, *, unbind: bool = False
+                     ) -> "tuple[str, str, dict | None, list]":
     """Move one worker to `state` under the roster lock. Returns (worker id, old
-    state, roster), roster None on a no-op. Retiring a bound worker is refused."""
+    state, roster, unbound rooms), roster None on a no-op. Retiring a bound worker
+    is refused unless `unbind`, which drops its bindings in the same transaction."""
     if state not in STATES:
         raise RosterError(f"state must be one of {STATES}: {state!r}")
     with _locked(workspace):
         _, workers, wid = _locked_worker(workspace, target)
         old = workers[wid].get("state")
-        if old == state:
-            return wid, old, None
-        bindings = load_bindings(workspace)
-        if state == "retired" and rooms_bound_to(bindings, wid):
-            raise WorkerBound(wid, rooms_bound_to(bindings, wid))
+        bindings = dict(load_bindings(workspace))
+        rooms = rooms_bound_to(bindings, wid) if state == "retired" else []
+        if old == state and not rooms:
+            return wid, old, None, []
+        if rooms and not unbind:
+            raise WorkerBound(wid, rooms)
+        for room in rooms:
+            bindings.pop(room)
+        if rooms:
+            save_bindings(workspace, bindings)
         workers[wid]["state"] = state
-        return wid, old, compile_roster(workspace, workers, bindings)
+        return wid, old, compile_roster(workspace, workers, bindings), rooms
 
 
 def remove_worker(workspace, target: str) -> "tuple[str, dict, dict]":

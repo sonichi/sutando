@@ -56,8 +56,29 @@ def state_path(workspace) -> Path:
 
 
 def is_paused(workspace, worker_id) -> bool:
-    """Only the owner writes or removes this file (`pool_manage.py stop` / `enable`)."""
+    """Only the owner writes or removes this file, through `set_paused`."""
     return (wi.worker_dir(workspace, worker_id) / PAUSED_MARKER).exists()
+
+
+def set_paused(workspace, worker_id, paused: bool) -> None:
+    """The owner's pause (`pool_manage.py stop` / `enable`)."""
+    marker = wi.worker_dir(workspace, worker_id) / PAUSED_MARKER
+    if paused:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.touch()
+    else:
+        marker.unlink(missing_ok=True)
+
+
+def run_socket(workspace, worker_id) -> str | None:
+    """The tmux socket of the worker's open run, else of its last run; None when it never ran.
+    A wrong socket answers "no server running" for a host whose real socket is fine."""
+    runs = [r for r in wi.incarnations(workspace, worker_id) if isinstance(r, dict)]
+    open_runs = [r for r in runs if r.get("ended_at") is None]
+    for run in reversed(open_runs or runs):
+        if (run.get("tmux") or {}).get("socket"):
+            return str(run["tmux"]["socket"])
+    return None
 
 
 def probe_session(workspace, worker_id, *, runner=subprocess.run) -> bool | None:

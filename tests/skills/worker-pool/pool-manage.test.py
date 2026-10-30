@@ -39,8 +39,15 @@ def _load(name):
 
 pm = _load("pool_manage")
 rem, pr, wi, sup = pm.rem, pm.pr, pm.wi, pm.sup
+pdm = rem.pd
 import pool_advertise as pa  # noqa: E402
+import pool_attribution as pattr  # noqa: E402
+
+import pool_route_handler as handler  # noqa: E402
 import pool_router as router  # noqa: E402
+
+sys.path.insert(0, str(REPO / "src"))
+from delivery import task_dispatch as td  # noqa: E402
 
 WID, OTHER = "a" * 32, "b" * 32
 SEAT = f"sutando-worker-{WID}"
@@ -235,14 +242,132 @@ class RosterWriters(Base):
     def test_set_worker_state_validates_and_is_a_no_op_when_unchanged(self):
         with self.assertRaises(pr.RosterError):
             pr.set_worker_state(self.ws, WID, "asleep")
-        wid, old, roster = pr.set_worker_state(self.ws, "pool worker 1", "live")
-        self.assertEqual((wid, old, roster), (WID, "live", None))
+        out = pr.set_worker_state(self.ws, "pool worker 1", "live")
+        self.assertEqual(out, (WID, "live", None, []))
 
     def test_remove_worker_refuses_a_bound_retired_worker(self):
         pr.set_worker_state(self.ws, WID, "retired")
         (self.ws / "state" / "bindings.json").write_text(json.dumps({"bindings": {"!r:x": WID}}))
         with self.assertRaises(pr.WorkerBound):
             pr.remove_worker(self.ws, WID)
+
+
+class OwedDeliveries(Base):
+    """A worker that owes a pending AND an accepted delivery. Retire/remove either
+    refuse or hand both to the core; a replay after either never targets the worker;
+    a late result from the old worker is neither run twice nor lost."""
+
+    def setUp(self):
+        super().setUp()
+        (self.ws / "tasks").mkdir()
+        (self.ws / "results").mkdir()
+        for t in ("task-p", "task-a"):
+            (self.ws / "tasks" / f"{t}.txt").write_text(f"id: {t}\ntask: hi\n")
+            self.assertEqual(router.route(self.ws, {"id": t, "requested_worker": WID})["delivered"], [WID])
+        pdm.accept(self.ws / "deliveries" / WID / "task-a.txt")
+        pdm.mark_done(self.ws, WID, "task-a", published=False)
+
+    def core_queue(self):
+        return list(td.pending_candidates(self.ws / "tasks", self.ws / "results",
+                                          deliveries_dir=self.ws / "deliveries"))
+
+    def replay(self, t):
+        """The core watcher's replay decision: DECLINE hands the task to the core."""
+        code, targets, _ = handler.classify(self.ws, {"id": t, "requested_worker": WID})
+        return {"code": code, "targets": targets}
+
+    def assert_core_owns(self, t):
+        self.assertIsNone(router.committed_recipient(self.ws, t))
+        self.assertEqual(self.replay(t)["code"], handler.DECLINE)
+        self.assertEqual(pdm.find(self.ws, WID, t), None)
+        self.assertIsNone(pattr.worker_for_task(self.ws, t))
+        self.assertIn(f"{t}.txt", self.core_queue())
+
+    def test_before_the_fix_shape_replay_follows_the_committed_worker(self):
+        self.assertEqual(self.replay("task-a"), {"code": 0, "targets": [WID]})
+        self.assertEqual(self.core_queue(), [])
+
+    def test_stop_refuses_an_owing_worker_unless_forced_and_force_keeps_the_work(self):
+        rc, out = self.main("stop", WID)
+        self.assertEqual((rc, out["result"]), (2, "refused"))
+        self.assertIn("task-a", out["why"])
+        self.assertFalse(sup.is_paused(self.ws, WID))
+        self.assertEqual(self.tmux.killed(), [])
+        rc, out = self.main("stop", WID, "--force")
+        self.assertEqual((rc, out["owed_kept"]), (0, ["task-a", "task-p"]))
+        self.assertEqual(self.replay("task-a"), {"code": 0, "targets": [WID]})
+
+    def test_retire_refuses_without_hand_off_and_changes_nothing(self):
+        rc, out = self.main("retire", WID)
+        self.assertEqual((rc, out["result"]), (2, "refused"))
+        self.assertEqual(self.row()["state"], "live")
+        self.assertFalse(sup.is_paused(self.ws, WID))
+        self.assertEqual(self.tmux.killed(), [])
+        self.assertIsNotNone(pdm.find(self.ws, WID, "task-a"))
+
+    def test_retire_hand_off_moves_pending_and_accepted_to_the_core(self):
+        rc, out = self.main("retire", WID, "--hand-off")
+        self.assertEqual((rc, out["result"]), (0, "retired"))
+        self.assertEqual(sorted(out["handed_off"]), ["task-a", "task-p"])
+        self.assertFalse(pdm.pending_flag(self.ws, WID, "task-a").exists())
+        for t in ("task-a", "task-p"):
+            self.assert_core_owns(t)
+
+    def test_replay_after_remove_targets_the_core(self):
+        self.main("retire", WID, "--hand-off")
+        rc, out = self.main("remove", WID)
+        self.assertEqual((rc, out["result"]), (0, "removed"))
+        for t in ("task-a", "task-p"):
+            self.assert_core_owns(t)
+            self.assertFalse((self.ws / "deliveries" / WID / f"{t}.accepted").exists())
+
+    def test_a_result_landing_before_the_hand_off_stays_the_workers_and_is_not_rerun(self):
+        real = pm._take_down
+
+        def late(ws, wid, runner):
+            out = real(ws, wid, runner)
+            (self.ws / "results" / "task-a.txt").write_text("task: task-a\nthe worker's reply\n")
+            return out
+        with mock.patch.object(pm, "_take_down", late):
+            rc, out = self.main("retire", WID, "--hand-off")
+        self.assertEqual((rc, out["handed_off"], out["kept"]), (0, ["task-p"], {"task-a": "completed"}))
+        self.assertEqual(pattr.worker_for_task(self.ws, "task-a"), WID)
+        self.assertNotIn("task-a.txt", self.core_queue())
+        self.assertTrue(td.has_ready_result(self.ws / "results", "task-a.txt"))
+
+    def test_a_late_result_after_the_hand_off_is_delivered_once_not_rerun(self):
+        self.main("retire", WID, "--hand-off")
+        self.assertIn("task-a.txt", self.core_queue())
+        (self.ws / "results" / "task-a.txt").write_text("task: task-a\nthe worker's reply\n")
+        self.assertNotIn("task-a.txt", self.core_queue())
+        self.assertTrue(td.has_ready_result(self.ws / "results", "task-a.txt"))
+        self.assertEqual(self.replay("task-a")["code"], handler.DECLINE)
+
+    def test_hand_off_never_runs_while_a_session_cannot_be_confirmed_gone(self):
+        self.tmux = lambda argv, **kw: subprocess.CompletedProcess(argv, 1, "", "server exited unexpectedly")
+        rc, out = self.main("retire", WID, "--hand-off")
+        self.assertEqual((rc, out["result"]), (1, "failed"))
+        self.assertEqual(self.row()["state"], "live")
+        self.assertEqual(router.committed_recipient(self.ws, "task-a"), WID)
+
+
+class SelfTarget(Base):
+    def test_a_worker_cannot_stop_or_retire_itself(self):
+        with mock.patch.dict("os.environ", {"SUTANDO_INSTANCE_ID": WID}):
+            for verb in ("stop", "retire"):
+                rc, out = self.main(verb, WID)
+                self.assertEqual((rc, out["result"]), (2, "refused"))
+        self.assertEqual(self.tmux.killed(), [])
+
+
+class RetireRollback(Base):
+    def test_a_failed_take_down_leaves_the_worker_live_and_bound(self):
+        pr.bind_room(self.ws, "!room:example", WID)
+        self.tmux = lambda argv, **kw: subprocess.CompletedProcess(argv, 1, "", "server exited unexpectedly")
+        rc, out = self.main("retire", WID, "--unbind")
+        self.assertEqual((rc, out["result"]), (1, "failed"))
+        self.assertEqual(self.row()["state"], "live")
+        self.assertEqual(pr.load_bindings(self.ws), {"!room:example": WID})
 
 
 if __name__ == "__main__":

@@ -186,11 +186,61 @@ def clear_pending(workspace, recipient: str, task_id: str) -> Path:
         # Decide under the lock accept/release rename under; the flag check above is
         # not synchronized with mark_done, and a flag landing late only retires a finish.
         with arbitration(workspace, recipient) as dfd:
-            name = find_in(dfd, task_id)
-            if name is not None:
-                with contextlib.suppress(FileNotFoundError):
-                    os.unlink(name, dir_fd=dfd)
+            _withdraw_locked(workspace, recipient, task_id, dfd)
     return pend
+
+
+def _withdraw_locked(workspace, recipient: str, task_id: str, dfd: int) -> None:
+    """Drop this recipient's hold on `task_id`: its `.pending` record and its sentinel.
+    The caller holds the folder's `arbitration` (`dfd`)."""
+    with contextlib.suppress(FileNotFoundError):
+        os.unlink(pending_flag(workspace, recipient, task_id))
+    name = find_in(dfd, task_id)
+    if name is not None:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(name, dir_fd=dfd)
+
+
+# What a worker still owes: delivered and unanswered, accepted or not.
+OWED_RESIDUE = ("pending", "died-mid-work")
+
+
+def hand_off_to_core(workspace: Path, recipient: str) -> dict:
+    """The owner's hand-off: every task `recipient` still owes goes back to the core.
+
+    For each owed task the sentinel, the `.pending` record and the attribution are
+    withdrawn together, so a replay no longer follows the committed delivery and the
+    core's queue (tasks/ minus held work) counts it as unprocessed. A task with a
+    ready result is never moved: that reply is delivered as the worker's and the core
+    does not run it again. The caller must have confirmed the worker's session gone.
+    Returns {"handed_off": [...], "kept": {task_id: residue state}}.
+    """
+    import pool_attribution
+    import pool_router
+
+    ws = Path(workspace)
+    require_recipient(recipient)
+    task_ids = sorted({parse_sentinel(p.name)[0] for p in accepted(ws, recipient) + pending(ws, recipient)
+                       if is_regular_file(p)})
+    out = {"handed_off": [], "kept": {}}
+    # Same order as reconcile_interrupted: task locks, then the folder lock.
+    with contextlib.ExitStack() as locks:
+        for task_id in task_ids:
+            locks.enter_context(pool_router.task_arbitration(ws, task_id))
+        try:
+            owners = {task_id: pool_router.committed_recipient(ws, task_id) for task_id in task_ids}
+        except pool_router.RouterRefused as e:
+            raise OSError(str(e)) from e
+        with arbitration(ws, recipient) as dfd:
+            for task_id in task_ids:
+                state = _residue_state(ws, recipient, task_id, find_in(dfd, task_id))
+                if owners[task_id] != recipient or state not in OWED_RESIDUE:
+                    out["kept"][task_id] = state if owners[task_id] == recipient else "not-owned"
+                    continue
+                _withdraw_locked(ws, recipient, task_id, dfd)
+                pool_attribution.revoke(ws, task_id, recipient)
+                out["handed_off"].append(task_id)
+    return out
 
 
 def writer_path() -> Path:

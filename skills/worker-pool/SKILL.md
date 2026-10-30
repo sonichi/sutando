@@ -22,7 +22,7 @@ contracts are in [`docs/worker-pool-design.md`](../../docs/worker-pool-design.md
 - `worker_identity.py` — worker / session / incarnation records.
 - `pool_router.py` — resolve one task to its recipients from the roster.
 - `pool_route_handler.py` — the core watcher's task-event handler (`SUTANDO_TASK_EVENT_HANDLER`): declines unbound work, delivers bound work as sentinels.
-- `pool_delivery.py` — a recipient's own folder: sentinels in, accept, release, done flags.
+- `pool_delivery.py` — a recipient's own folder: sentinels in, accept, release, done flags, and the owner's `hand_off_to_core`.
 - `pool_ask.py` — ask another instance a question through the front door (below).
 - `pool_sessions.py` — read-only: which worker tmux sessions a viewer could attach, and the exact-match argv for each. Adds no state and nothing in the pool calls it; it exists for the desktop app's terminal picker. It deliberately does not describe the core, whose socket resolution belongs to the app.
 
@@ -39,29 +39,41 @@ Killing a worker's tmux session does not stop it: the remedy timer's next sweep
 Use `pool_manage.py`, which records the owner's decision where the remedy, the
 sweep and the router read it. Run from the repo root; `--workspace` defaults to
 the resolved workspace. Each verb prints one JSON line; exit 0 done, 1 failed,
-2 refused (unknown or ambiguous name, `core`, a bound worker).
+2 refused (unknown or ambiguous name, `core`, the caller's own worker, a bound
+worker, or a worker that still owes work).
 
 ```bash
 python3 skills/worker-pool/scripts/pool_manage.py list [--json]
-python3 skills/worker-pool/scripts/pool_manage.py stop   <worker id or label>
-python3 skills/worker-pool/scripts/pool_manage.py retire <worker> [--unbind]
+python3 skills/worker-pool/scripts/pool_manage.py stop   <worker id or label> [--force]
+python3 skills/worker-pool/scripts/pool_manage.py retire <worker> [--unbind] [--hand-off]
 python3 skills/worker-pool/scripts/pool_manage.py enable <worker> [--no-start]
-python3 skills/worker-pool/scripts/pool_manage.py remove <worker>
+python3 skills/worker-pool/scripts/pool_manage.py remove <worker> [--hand-off]
 ```
 
-- `stop` writes the worker's `paused` marker under the remedy lock, then kills
-  its `-watcher` supervisor, `-input` watcher and seat sessions on the socket it
-  last ran on, and closes its open run as `killed`. A paused worker is not
-  restarted by a sweep, `--resume` or `--restart`. Routing is unchanged: work
-  addressed to it waits in its inbox until it is enabled.
-- `retire` is `stop` plus roster state `retired`: not supervised, not
+- `stop` writes the worker's pause (`pool_supervise.set_paused`) under the remedy
+  lock, then kills its `-watcher` supervisor, `-input` watcher and seat sessions
+  on the socket it last ran on, and closes its open run as `killed`. A paused
+  worker is not restarted by a sweep, `--resume` or `--restart`. Routing does
+  not change: bound-room and requested-worker tasks keep arriving in its inbox
+  and wait for `enable`. A worker that owes a delivery is refused unless
+  `--force`; the owed work stays its own and resumes after `enable`.
+- `retire` is `stop`, then roster state `retired`: not supervised, not
   advertised, and the router sends work addressed to it to the core. Refused
-  while a room is bound to it; `--unbind` unbinds those rooms first.
-- `enable` sets a retired worker back to `live`, removes the marker, and runs
-  the owner restart (`pool_remedy --restart`), which resumes its conversation.
-  `--no-start` only lifts the stop.
-- `remove` drops a retired worker's roster row. Its records under
-  `state/workers/<id>/` and its `deliveries/<id>/` folder stay as history.
+  while a room is bound to it (`--unbind` drops those bindings in the same roster
+  transaction), and while it owes a delivery, pending or accepted, unless
+  `--hand-off`. The hand-off (`pool_delivery.hand_off_to_core`) runs only once its
+  sessions are confirmed gone. It withdraws the sentinel, the `.pending` record and
+  the attribution together, so a replay is declined to the core and the core's
+  queue counts the task. A task whose result already landed is kept as the
+  worker's reply, never run again. If tmux cannot confirm the sessions gone,
+  nothing but the pause has changed.
+- `enable` sets a retired worker back to `live`, lifts the pause, and runs the
+  owner restart (`pool_remedy --restart`), which resumes its conversation.
+  With `--no-start` it only lifts them; the sweep's death ladder then restarts
+  the dead session like any other, after its sustained ticks.
+- `remove` drops a retired worker's roster row (same `--hand-off` rule). Its
+  records under `state/workers/<id>/` and its `deliveries/<id>/` folder stay as
+  history.
 
 ## Codex CLI workers
 
