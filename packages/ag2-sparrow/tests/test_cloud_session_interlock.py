@@ -56,6 +56,7 @@ import sys, time
 from ag2_sparrow import holder_lock as _hl, relay_loop as _rl, task_io as _tio
 from ag2_sparrow.adapters.codex import codex_connector as _cc
 _log, _handler = open(%r, "a", buffering=1), _tio._terminated
+_signal_generation = 0
 
 
 def _note(*words):
@@ -74,12 +75,19 @@ def _spy(name, fn):
 
 
 def _spy_handler(signum, frame):
+    global _signal_generation
+    _signal_generation += 1
     _note("signal", signum)
     _handler(signum, frame)
 
 
 def _check(fn):
-    return lambda: (lambda got: (_note("check", got), got)[1])(fn())
+    def checked():
+        generation = _signal_generation
+        got = fn()
+        _note("check", got, generation)
+        return got
+    return checked
 
 
 for _name in [n for n in dir(_hl) if not n.startswith("_")]:
@@ -273,7 +281,7 @@ class InterlockTest(unittest.TestCase):
         step (directories, probes, first init) is over by then."""
         log = self.base / ("%s.ready" % kind)
         started = self.start(kind, SPY % str(log))
-        wait_for(lambda: log.exists() and "check 0" in [w for w, _ in spied(log)],
+        wait_for(lambda: log.exists() and "check 0 0" in [w for w, _ in spied(log)],
                  "the %s serve loop to start" % kind)
         return started
 
@@ -357,7 +365,7 @@ class InterlockTest(unittest.TestCase):
                 self.work = self.base / kind
                 log = self.base / ("%s.spy" % kind)
                 child, held_by = self.start(kind, SPY % str(log))
-                wait_for(lambda: log.exists() and "check 0" in [w for w, _ in spied(log)],
+                wait_for(lambda: log.exists() and "check 0 0" in [w for w, _ in spied(log)],
                          "the %s serve loop to run" % kind)
                 os.kill(held_by[1], signal.SIGTERM)
                 child.wait(WAIT)
@@ -366,8 +374,10 @@ class InterlockTest(unittest.TestCase):
                 self.assertEqual([w for w, _ in lines if w.startswith("handler ")], [],
                                  "the signal handler called holder_lock")
                 at = [w for w, _ in lines].index("signal %d" % signal.SIGTERM)
-                after = [(w, t) for w, t in lines[at + 1:] if w != "main read_holder"]
-                self.assertEqual([w for w, _ in after[:2]], ["check %d" % signal.SIGTERM, "main release"],
+                # A pre-signal read may reach its logger only after the handler returns.
+                after = [(w, t) for w, t in lines[at + 1:] if w not in ("main read_holder", "check 0 0")]
+                self.assertEqual([w.rsplit(" ", 1)[0] if w.startswith("check ") else w for w, _ in after[:2]],
+                                 ["check %d" % signal.SIGTERM, "main release"],
                                  "the next loop step stops, and release comes from the loop's caller")
                 self.assertLess(after[1][1] - lines[at][1], 1.0, "release within one 0.05s step")
                 self.assertIsInstance(holder_lock.read_holder(str(self.work)), holder_lock.Missing,
