@@ -75,6 +75,7 @@ import ipaddress
 import socket
 import ssl
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -2201,6 +2202,13 @@ def _spawn(argv: list, env: dict, log_path: Path) -> "subprocess.Popen":
     return proc
 
 
+def _reap_when_done(child) -> None:
+    """Wait on a spawned bridge in the background, so its exit is reaped at once, not left a zombie."""
+    wait = getattr(child, "wait", None)
+    if wait is not None:
+        threading.Thread(target=wait, name=f"bridge-reaper-{child.pid}", daemon=True).start()
+
+
 def _exited(pid: int) -> bool:
     """Whether `pid` has ended: our own child by its exit status, any other by the kernel."""
     child = _CHILDREN.get(pid)
@@ -2213,6 +2221,9 @@ def _exited(pid: int) -> bool:
     if waitid is not None:
         try:  # an exited, unreaped child of this process: seen without reaping it
             if waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None:
+                return True
+        except ChildProcessError:
+            if _ps_zombie(pid):  # another process's child, exited and never reaped by its parent
                 return True
         except OSError:
             pass
@@ -2241,6 +2252,11 @@ def _zombie(pid: int) -> bool:
         return False
     else:
         return False
+    return _ps_zombie(pid)
+
+
+def _ps_zombie(pid: int) -> bool:
+    """Whether ps reads `pid` as a zombie; False when ps cannot answer."""
     ps = "/bin/ps" if os.path.exists("/bin/ps") else "ps"
     try:
         out = subprocess.run([ps, "-o", "stat=", "-p", str(pid)], capture_output=True, text=True, timeout=5).stdout
@@ -2342,6 +2358,7 @@ def launch(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Mappi
             pid = int(getattr(child, "pid", child))
             if hasattr(child, "poll"):
                 _CHILDREN[pid] = child
+                _reap_when_done(child)
             if env.get("SUTANDO_BRIDGE_LOCK", "1") == "0":
                 return _record_launch(instance, workspace, ok=True, pid=pid, lease="disabled")
             lease, holder = _await_lease(instance, pid, workspace, max(0.0, deadline - time.monotonic()))

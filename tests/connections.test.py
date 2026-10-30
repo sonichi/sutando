@@ -18,6 +18,7 @@ isolate_os_environ(SUTANDO_SUPPRESS_CCD_FALLBACK_BANNER="1")
 import contextlib
 import json
 import os
+import signal
 import socket
 import subprocess
 import sys
@@ -3900,6 +3901,48 @@ class ZombieWithoutWaitid(Base):
         pid = C.bridge_pid(self.INST, self.ws)
         self.assertTrue(pid)
         self.assert_stops_promptly(pid)
+
+
+@unittest.skipIf(os.name == "nt" or not hasattr(os, "waitid"), "zombies are a POSIX state; waitid present")
+class ForeignZombieWithWaitid(ZombieWithoutWaitid):
+    """With os.waitid present, another process's exited, unreaped bridge reads as stopped too."""
+
+    def setUp(self):
+        Base.setUp(self)
+        patcher = unittest.mock.patch.object(C, "STOP_TIMEOUT_S", 10)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.add()
+        self.add(TOKEN_B, fetch=agents("@s:beta-fixture.net"))
+        self.args = [self.BRIDGE, str(ROOT / "src"), str(self.ws), C._bridge_role(self.INST)]
+
+    test_our_exited_unreaped_child_is_stopped = None
+
+
+@unittest.skipIf(os.name == "nt", "zombies are a POSIX state")
+class LaunchedBridgeIsReaped(Base):
+    """A bridge `launch` spawned is reaped as soon as it exits, with nobody polling it."""
+
+    def test_an_exited_launched_bridge_leaves_no_zombie(self):
+        self.add()
+        self.add(TOKEN_B, fetch=agents("@s:beta-fixture.net"))
+        spawned = []
+
+        def spawn(argv, env, log_path):
+            proc = bridge_lease.start(self.ws, env["GATEWAY_INSTANCE"], wait=False)
+            self.children.append(proc)
+            spawned.append(proc)
+            return proc
+        C.launch("beta-fixture-net", repo=self.ws / "repo", logs_dir=self.ws / "logs", environ={},
+                 workspace=self.ws, vault=self.vault, spawn=spawn)
+        proc = spawned[0]
+        os.kill(proc.pid, signal.SIGKILL)
+        deadline = time.monotonic() + 5
+        while proc.returncode is None and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertIsNotNone(proc.returncode, "the exited bridge was reaped without a poll")
+        with self.assertRaises(ChildProcessError):
+            os.waitpid(proc.pid, os.WNOHANG)
 
 
 @unittest.skipIf(os.name == "nt", "zombies are a POSIX state")
