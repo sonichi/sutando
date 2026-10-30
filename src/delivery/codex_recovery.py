@@ -19,6 +19,8 @@ from workspace_default import write_status
 
 BOOTSTRAP_PROMPT = "Reply exactly READY. Do not use tools."
 BACKOFF_S = 30
+RENDER_TIMEOUT_S = 2
+RENDER_POLL_S = 0.05
 
 
 def candidate(workspace, session, incarnation, now):
@@ -87,12 +89,33 @@ def recover(workspace, session, incarnation, socket, target, now=None):
                      "terminal_at": record["failed_task"]["completed_at"]}, workspace)
         if not same_incarnation(incarnation) or send_keys(socket, target, incarnation, "-l", "--", BOOTSTRAP_PROMPT) != 0:
             return False
-        current = candidate(workspace, session, incarnation, time.time() if supplied_now is None else now)
-        if not current or current["failed_task"] != record["failed_task"]:
-            return False
-        if composer_text(capture(socket, target), CODEX) != BOOTSTRAP_PROMPT:
-            return False
-        return same_incarnation(incarnation) and send_keys(socket, target, incarnation, "C-m") == 0
+        deadline = time.monotonic() + RENDER_TIMEOUT_S
+        while True:
+            current = candidate(workspace, session, incarnation, time.time() if supplied_now is None else now)
+            if not current or current["failed_task"] != record["failed_task"]:
+                print("codex recovery refused: post-paste candidate changed", file=sys.stderr)
+                return False
+            if not same_incarnation(incarnation):
+                print("codex recovery refused: post-paste incarnation changed", file=sys.stderr)
+                return False
+            text = composer_text(capture(socket, target), CODEX)
+            if text == BOOTSTRAP_PROMPT:
+                current = candidate(workspace, session, incarnation, time.time() if supplied_now is None else now)
+                if not current or current["failed_task"] != record["failed_task"]:
+                    print("codex recovery refused: post-paste candidate changed", file=sys.stderr)
+                    return False
+                if time.monotonic() > deadline:
+                    print("codex recovery refused: post-paste render timeout", file=sys.stderr)
+                    return False
+                return same_incarnation(incarnation) and send_keys(socket, target, incarnation, "C-m") == 0
+            if text is None or not BOOTSTRAP_PROMPT.startswith(text):
+                print("codex recovery refused: post-paste composer mismatch", file=sys.stderr)
+                return False
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                print("codex recovery refused: post-paste render timeout", file=sys.stderr)
+                return False
+            time.sleep(min(RENDER_POLL_S, remaining))
 
 
 def main():

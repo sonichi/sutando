@@ -1,6 +1,6 @@
 """Recovery exercises production observation validation, durable grants and fenced key transport."""
 from datetime import datetime, timezone
-from contextlib import redirect_stdout
+from contextlib import redirect_stdout, redirect_stderr
 import io
 import json
 import os
@@ -261,6 +261,137 @@ raise SystemExit(recovery.main())
         self.assertIn("api-error", warning(self.ws))
         record_event(self.ws, "submitted", "private-task.txt")
         self.assertIsNone(warning(self.ws))
+
+
+class RenderBoundaryTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.ws = Path(self.tmp.name)
+        self.now = time.time()
+        self.record = failed_record(self.now)
+        write(self.record, self.ws)
+        self.elapsed = 0.0
+        self.pasted = False
+        self.keys = []
+        self.frames = []
+        self.render_at = 0.15
+        self.text = recovery.BOOTSTRAP_PROMPT
+        self.after_sleep = lambda: None
+        self.after_capture = lambda: None
+        self.identity = True
+        self.partial = False
+        mock.patch.object(recovery.time, "monotonic", side_effect=lambda: self.elapsed).start()
+        mock.patch.object(recovery.time, "sleep", side_effect=self.sleep).start()
+        mock.patch.object(recovery, "same_incarnation", side_effect=lambda _: self.identity).start()
+        mock.patch.object(recovery, "send_keys", side_effect=self.send).start()
+        mock.patch.object(recovery.subprocess, "run", side_effect=self.tmux).start()
+        self.addCleanup(mock.patch.stopall)
+
+    def sleep(self, seconds):
+        self.elapsed += seconds
+        self.after_sleep()
+
+    def send(self, *args):
+        self.assertTrue((self.ws / "state/codex-recovery.json").is_file())
+        self.keys.append(args[-1])
+        self.pasted = True
+        return 0
+
+    def tmux(self, argv, **kwargs):
+        self.assertEqual(argv, ["tmux", "-S", "socket", "capture-pane", "-e", "-p", "-t", "%7"])
+        text = self.text if self.pasted and self.elapsed >= self.render_at else ""
+        if self.partial and self.pasted and self.elapsed < self.render_at:
+            text = recovery.BOOTSTRAP_PROMPT[:10]
+        frame = "› " + text + "\ngpt-test · 100% left"
+        self.frames.append((self.elapsed, text))
+        if self.pasted:
+            self.after_capture()
+        return subprocess.CompletedProcess(argv, 0, stdout=frame)
+
+    def attempt(self):
+        return recovery.recover(self.ws, "core", INCARNATION, "socket", "%7", now=self.now)
+
+    def test_async_tmux_render_waits_for_exact_probe_without_repasting(self):
+        self.assertTrue(self.attempt())
+        self.assertEqual(self.keys, [recovery.BOOTSTRAP_PROMPT, "C-m"])
+        self.assertGreaterEqual(self.elapsed, self.render_at)
+        self.assertIn((0.0, ""), self.frames[1:])
+        grant = (self.ws / "state/codex-recovery.json").read_bytes()
+        self.assertFalse(self.attempt())
+        self.assertEqual((self.ws / "state/codex-recovery.json").read_bytes(), grant)
+        self.assertEqual(len(self.keys), 2)
+
+    def test_partial_render_can_only_reach_enter_after_exact_match(self):
+        self.partial = True
+        self.assertTrue(self.attempt())
+        self.assertEqual(self.frames[-1][1], recovery.BOOTSTRAP_PROMPT)
+        self.assertEqual(self.keys, [recovery.BOOTSTRAP_PROMPT, "C-m"])
+
+    def test_no_render_times_out_once_with_no_enter(self):
+        self.render_at = 10
+        with redirect_stderr(io.StringIO()) as diagnostic:
+            self.assertFalse(self.attempt())
+        self.assertAlmostEqual(self.elapsed, recovery.RENDER_TIMEOUT_S)
+        self.assertEqual(self.keys, [recovery.BOOTSTRAP_PROMPT])
+        self.assertIn("post-paste render timeout", diagnostic.getvalue())
+        self.assertNotIn(recovery.BOOTSTRAP_PROMPT, diagnostic.getvalue())
+        self.assertFalse(self.attempt())
+        self.assertEqual(len(self.keys), 1)
+
+    def test_changed_candidate_during_render_wait_refuses_enter(self):
+        def invalidate():
+            mark(self.ws, "owner-intent", INCARNATION, "private")
+        self.after_sleep = invalidate
+        with redirect_stderr(io.StringIO()) as diagnostic:
+            self.assertFalse(self.attempt())
+        self.assertEqual(self.keys, [recovery.BOOTSTRAP_PROMPT])
+        self.assertIn("post-paste candidate changed", diagnostic.getvalue())
+        self.assertNotIn("private", diagnostic.getvalue())
+
+    def test_changed_receipt_during_render_wait_refuses_enter(self):
+        def replace():
+            record = {**self.record, "seq": 2,
+                      "failed_task": {**self.record["failed_task"], "turn_id": "replacement"}}
+            write(record, self.ws)
+        self.after_sleep = replace
+        with redirect_stderr(io.StringIO()) as diagnostic:
+            self.assertFalse(self.attempt())
+        self.assertEqual(self.keys, [recovery.BOOTSTRAP_PROMPT])
+        self.assertIn("post-paste candidate changed", diagnostic.getvalue())
+
+    def test_changed_incarnation_during_render_wait_refuses_enter(self):
+        self.after_sleep = lambda: setattr(self, "identity", False)
+        with redirect_stderr(io.StringIO()) as diagnostic:
+            self.assertFalse(self.attempt())
+        self.assertEqual(self.keys, [recovery.BOOTSTRAP_PROMPT])
+        self.assertIn("post-paste incarnation changed", diagnostic.getvalue())
+
+    def test_candidate_change_while_capturing_exact_probe_refuses_enter(self):
+        self.render_at = 0
+        self.after_capture = lambda: mark(self.ws, "intent", INCARNATION, "private")
+        with redirect_stderr(io.StringIO()) as diagnostic:
+            self.assertFalse(self.attempt())
+        self.assertEqual(self.keys, [recovery.BOOTSTRAP_PROMPT])
+        self.assertIn("post-paste candidate changed", diagnostic.getvalue())
+
+    def test_slow_capture_cannot_enter_after_deadline(self):
+        self.render_at = 0
+        self.after_capture = lambda: setattr(self, "elapsed", 3)
+        with redirect_stderr(io.StringIO()) as diagnostic:
+            self.assertFalse(self.attempt())
+        self.assertEqual(self.keys, [recovery.BOOTSTRAP_PROMPT])
+        self.assertIn("post-paste render timeout", diagnostic.getvalue())
+
+    def test_other_composer_text_refuses_immediately_and_logs_no_content(self):
+        self.render_at = 0
+        self.text = "private owner draft"
+        with redirect_stderr(io.StringIO()) as diagnostic:
+            self.assertFalse(self.attempt())
+        self.assertEqual(self.elapsed, 0)
+        self.assertEqual(self.keys, [recovery.BOOTSTRAP_PROMPT])
+        self.assertIn("post-paste composer mismatch", diagnostic.getvalue())
+        self.assertNotIn(self.text, diagnostic.getvalue())
 
 
 class TransportBoundaryTests(unittest.TestCase):

@@ -148,7 +148,12 @@ tasks require explicit recovery or disposition. They remain queued without repla
 Pre-admission refusals are deduplicated in local diagnostics and reported by health.
 The fixed tool-free READY check fits a normal 80-column pane. Recovery requires
 one fully visible composer row and a recognized footer; wrapped or ambiguous drafts
-are refused without folding whitespace.
+are refused without folding whitespace. After one paste, recovery polls for up to
+2 seconds on a monotonic clock for the exact probe, accepting only empty or exact
+byte-prefix renderings while waiting. Each check refreshes the candidate receipt
+and process incarnation; unknown or foreign composer content fails closed. Existing
+subprocess timeouts still apply, so this is not a hard 2-second wall-clock limit.
+Recovery never pastes again, and a timeout or refusal leaves the claim spent.
 If a recovery paste leaves a READY check draft or the staged text does not match,
 the claim remains spent. Inspect the pane and manually clear only the draft you
 recognize; automation never clears an unknown human composer to retry recovery.
