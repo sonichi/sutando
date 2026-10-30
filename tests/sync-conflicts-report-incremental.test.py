@@ -175,6 +175,83 @@ class TestIncrementalEqualsFull(_Base):
         self.assertEqual(self._main(str(self.ws))[0], 1)
 
 
+class TestFailSafeBranches(_Base):
+    """A stat or cache-write failure may cost speed, never a wrong report."""
+
+    def _fail_stat_in_stat_key(self, target: Path):
+        # Only the stat inside the real _stat_key fails; exists()/is_file() still work.
+        real_key, real_stat = MOD._stat_key, Path.stat
+        inside = []
+
+        def key(p):
+            inside.append(True)
+            try:
+                return real_key(p)
+            finally:
+                inside.pop()
+
+        def stat(self_, *a, **kw):
+            if inside and self_ == target:
+                raise OSError("simulated stat failure")
+            return real_stat(self_, *a, **kw)
+        MOD._stat_key = key
+        Path.stat = stat
+        self.addCleanup(setattr, MOD, "_stat_key", real_key)
+        self.addCleanup(setattr, Path, "stat", real_stat)
+
+    def test_a_stat_failure_rescans_the_copy_instead_of_serving_the_cache(self):
+        self._live("memory/n.md", "base\n")
+        saved = self._saved("memory/n.md", "base\npeer fact\n")
+        self._live("memory/m.md", "base\n")
+        self._saved("memory/m.md", "base\nother fact\n")
+        rc, expected = self._main(str(self.ws))
+        self.assertEqual(rc, 1)
+        self.assertIn("n.md", expected)
+        # Poison the cache: a served hit would now report nothing.
+        path = self.ws / "state" / MOD.CACHE_NAME
+        data = json.loads(path.read_text())
+        for e in data["entries"].values():
+            e["row"] = "clean"
+        path.write_text(json.dumps(data))
+
+        self.assertIsNone(MOD._stat_key(self.ws / "no-such-file"))
+        self._fail_stat_in_stat_key(saved)
+        calls = self._count_scans()
+        rc, out = self._main(str(self.ws))
+        self.assertIn(Path("memory/n.md"), calls, "a copy whose stat failed was not rescanned")
+        self.assertNotIn(Path("memory/m.md"), calls, "an unaffected copy was rescanned")
+        self.assertIn("n.md", out, "a stat failure let a poisoned cache row hide the copy")
+        ck = f"{self.batch.name}/memory/n.md"
+        entries = json.loads(path.read_text())["entries"]
+        self.assertNotIn(ck, entries, "a row with no stat key was cached")
+
+    def test_a_live_stat_failure_also_rescans(self):
+        live = self._live("memory/n.md", "base\n")
+        self._saved("memory/n.md", "base\npeer fact\n")
+        self.assertEqual(self._main(str(self.ws))[0], 1)
+        self._fail_stat_in_stat_key(live)
+        calls = self._count_scans()
+        rc, out = self._main(str(self.ws))
+        self.assertEqual((rc, [str(c) for c in calls]), (1, ["memory/n.md"]))
+
+    def test_a_cache_that_cannot_be_written_still_gives_the_correct_report(self):
+        self._live("memory/n.md", "base\n")
+        self._saved("memory/n.md", "base\npeer fact\n")
+        self._live("memory/m.md", "base\nmerged\n")
+        self._saved("memory/m.md", "base\nmerged\n")
+        expected = self._main(str(self.ws))
+        self.assertEqual(expected[0], 1)
+        # `state` as a regular file: every write under it raises OSError.
+        shutil.rmtree(self.ws / "state")
+        (self.ws / "state").write_text("not a directory\n")
+        calls = self._count_scans()
+        self.assertEqual(self._main(str(self.ws)), expected)
+        self.assertEqual(self._main(str(self.ws)), expected)
+        self.assertEqual(len(calls), 4, "without a cache every copy is rescanned each run")
+        self.assertEqual(self._main(str(self.ws), "--full"), expected)
+        self.assertTrue((self.ws / "state").is_file())
+
+
 class TestDailyGate(_Base):
     def setUp(self):
         super().setUp()
