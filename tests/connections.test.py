@@ -1627,6 +1627,56 @@ class Identity(Base):
         self.assertEqual(self.vault.store["AG2_REMOTE_TOKEN_ALPHA_FIXTURE_NET"], "https://chat.alpha-fixture.net|secret-alpha-2")
 
 
+class SkipBacklog(Base):
+    """A connection added with skip_backlog has its bridge settle every task stamped before it."""
+
+    def test_a_created_row_records_not_before_and_its_bridge_env_carries_it(self):
+        t0 = int(time.time())
+        preview = C.preview_connection(TOKEN_B, fetch=agents("@s:beta-fixture.net"))
+        row, created = C.add_connection(TOKEN_B, added_by="login", expected_server="beta-fixture.net", preview=preview,
+                                        workspace=self.ws, vault=self.vault, skip_backlog=True)
+        self.assertTrue(created)
+        self.assertTrue(t0 <= row["not_before"] <= int(time.time()))
+        entry = C.plan_entry("beta-fixture-net", {}, workspace=self.ws)
+        self.assertEqual(entry["not_before"], row["not_before"])
+        env = C.launch_env(entry, {C.NOT_BEFORE_ENV: "1"}, vault=self.vault)
+        self.assertEqual(env[C.NOT_BEFORE_ENV], str(row["not_before"]))
+
+    def test_an_existing_row_keeps_its_own_and_a_plain_add_records_none(self):
+        row, _ = self.add(TOKEN_B, fetch=agents("@s:beta-fixture.net"))
+        self.assertNotIn("not_before", row)
+        preview = C.preview_connection(TOKEN_B, fetch=agents("@s:beta-fixture.net"))
+        again, created = C.add_connection(TOKEN_B, added_by="login", expected_server="beta-fixture.net",
+                                          preview=preview, workspace=self.ws, vault=self.vault, skip_backlog=True)
+        self.assertFalse(created)
+        self.assertNotIn("not_before", again)
+        entry = C.plan_entry("beta-fixture-net", {}, workspace=self.ws)
+        self.assertNotIn("not_before", entry)
+        env = C.launch_env(entry, {C.NOT_BEFORE_ENV: "1793000000"}, vault=self.vault)
+        self.assertEqual(env[C.NOT_BEFORE_ENV], "", "an inherited bound never reaches a row without one")
+
+    def test_a_malformed_not_before_is_a_schema_error(self):
+        self.add(TOKEN_B, fetch=agents("@s:beta-fixture.net"))
+        path = C.record_path(self.ws)
+        good = json.loads(path.read_text())
+        for bad in ("1793000000", True, -1, 1.5):
+            raw = json.loads(json.dumps(good))
+            raw["connections"][0]["not_before"] = bad
+            path.write_text(json.dumps(raw))
+            with self.assertRaises(C.SchemaError, msg=repr(bad)):
+                C._read(path)
+
+    def test_backlog_reason_compares_the_task_stamp_with_the_bound(self):
+        bound = 1793000000  # 2026-10-26T07:33:20Z
+        self.assertIn("backlog", C.backlog_reason({"timestamp": "2026-10-26T07:33:19Z"}, str(bound)))
+        self.assertIsNone(C.backlog_reason({"timestamp": "2026-10-26T07:33:20Z"}, bound))
+        self.assertIsNone(C.backlog_reason({"timestamp": "2026-10-27T00:00:00Z"}, bound))
+        for task in ({}, {"timestamp": ""}, {"timestamp": "yesterday"}, {"timestamp": 1792000000}):
+            self.assertIsNone(C.backlog_reason(task, bound), task)
+        for unbounded in ("", None, "soon"):
+            self.assertIsNone(C.backlog_reason({"timestamp": "2020-01-01T00:00:00Z"}, unbounded))
+
+
 class Disconnect(Base):
     def setUp(self):
         super().setUp()

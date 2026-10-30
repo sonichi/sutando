@@ -69,6 +69,7 @@ import signal
 import subprocess
 import sys
 import contextlib
+import datetime
 import hashlib
 import http.client
 import ipaddress
@@ -805,6 +806,9 @@ def _validate_row(row: object, index: int) -> dict:
     for key in ("disabled", "parked"):
         if key in row and not isinstance(row[key], bool):
             raise SchemaError(f"connections.json: row {index} field {key} is not a boolean")
+    nb = row.get("not_before")
+    if nb is not None and (isinstance(nb, bool) or not isinstance(nb, int) or nb < 0):
+        raise SchemaError(f"connections.json: row {index} not_before is not an epoch second")
     keys = row.get("launch_keys", [])
     if not isinstance(keys, list) or not all(isinstance(k, str) and _ENV_VAR_RE.match(k) for k in keys):
         raise SchemaError(f"connections.json: row {index} launch_keys is not a list of AG2_REMOTE_TOKEN_<INST> names")
@@ -1033,8 +1037,12 @@ def channel_launch_keys(environ: Optional[Mapping[str, str]] = None) -> dict:
 def add_connection(token: str, *, added_by: str, expected_server: str, instance: Optional[str] = None,
                    preview: Optional[dict] = None, fetch: Optional[Callable] = None,
                    resolver=None, getaddrinfo=None, workspace: Optional[Path] = None,
-                   vault=None, environ: Optional[Mapping[str, str]] = None, kill=None) -> "tuple[dict, bool]":
+                   vault=None, environ: Optional[Mapping[str, str]] = None, kill=None,
+                   skip_backlog: bool = False) -> "tuple[dict, bool]":
     """Save the token as a row once its gateway still answers to `expected_server`.
+
+    With `skip_backlog`, a row this call creates records `not_before` (now, epoch seconds): its
+    bridge settles every task stamped earlier unqueued (`backlog_reason`). An existing row keeps its own.
 
     Launch keys not yet in the record (`channel_launch_keys`) are imported first, under the instance
     their launcher already runs them as, so a token for one of their servers adopts that row instead
@@ -1108,6 +1116,8 @@ def add_connection(token: str, *, added_by: str, expected_server: str, instance:
                        verified=bool(seen.get("verified")),
                        server_source=str(seen.get("server_source") or "gateway"),
                        identity=seen)
+            if skip_backlog:
+                row["not_before"] = int(time.time())
             rows.append(row)
             rec[REMOVED_KEY] = [x for x in rec[REMOVED_KEY] if x != ref]
     except Exception:
@@ -2058,7 +2068,8 @@ def launch_plan(environ: Optional[Mapping[str, str]] = None, *,
             continue
         plan.append({"instance": r["instance"], "token_ref": r["token_ref"],
                      "channel_dir": channel_dir_for(r["instance"], environ), "primary": r["primary"],
-                     "agent_mxid": r.get("agent_mxid") or ""})
+                     "agent_mxid": r.get("agent_mxid") or "",
+                     **({"not_before": r["not_before"]} if r.get("not_before") is not None else {})})
     for inst, var in env_token_vars(environ):
         if inst in seen_inst or var in seen_ref:
             continue
@@ -2142,8 +2153,30 @@ def launch_env(entry: Mapping[str, object], environ: Optional[Mapping[str, str]]
         "REMOTE_TASK_TOKEN_FILE": _token_file(entry, environ),
         "REMOTE_TASK_CHANNEL_DIR": str(entry["channel_dir"]),
         "REMOTE_PROACTIVE_ROOM": environ.get("REMOTE_PROACTIVE_ROOM", "") if entry.get("primary") else "",
+        NOT_BEFORE_ENV: str(entry["not_before"]) if isinstance(entry.get("not_before"), int) else "",
     })
     return env
+
+
+# The bridge's intake reads its row's `not_before` here; empty when the row has none.
+NOT_BEFORE_ENV = "SUTANDO_INTAKE_NOT_BEFORE"
+
+
+def backlog_reason(task: Mapping[str, object], not_before: object) -> Optional[str]:
+    """Why a task stamped before its connection's `not_before` is settled unqueued; None to deliver
+    it (no bound, or a timestamp that is missing or unreadable)."""
+    try:
+        bound = int(str(not_before).strip())
+    except ValueError:
+        return None
+    stamp = str(task.get("timestamp") or "").strip()
+    try:
+        at = datetime.datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
+    except ValueError:
+        return None
+    if at.timestamp() >= bound:
+        return None
+    return f"backlog: stamped {stamp}, before this connection was added"
 
 
 def _verified_agent(token: str, fetch=None, getaddrinfo=None) -> str:
