@@ -1398,6 +1398,53 @@ def connection_for_room(room_id: Optional[str], workspace: Optional[Path] = None
     return dict(row)
 
 
+def room_agent_mxid(room_id: Optional[str], *, workspace: Optional[Path] = None,
+                    environ: Optional[Mapping[str, str]] = None) -> Optional[str]:
+    """The agent identity a room operation acts as, from the row `connection_for_room` routes it to:
+    the row's recorded `agent_mxid`, else AGENT_MXID in the row's channel env file, kept only when it
+    names that row's server. None keeps the caller's own resolution; '' when the row names none."""
+    row = connection_for_room(room_id, workspace)
+    if row is None:
+        return None
+    environ = os.environ if environ is None else environ
+    instance = str(row["instance"])
+    var = "REMOTE_TASK_CHANNEL_DIR_" + _inst_var(instance) if instance else ""
+    channel_dir = (environ.get(var) or _launch_file_value(var) or channel_dir_for(instance, environ)) if instance else None
+    servers = _row_servers(row)
+    for mxid in (row.get("agent_mxid"), _channel_dir_value(channel_dir, "AGENT_MXID")):
+        if isinstance(mxid, str) and _STRICT_MXID_RE.fullmatch(mxid.strip()) and server_of_mxid(mxid.strip()) in servers:
+            return mxid.strip()
+    return ""
+
+
+def _launch_file_value(name: str) -> str:
+    """`name` in the AG2 Space channel env file the launch keys are read from; '' when none."""
+    try:
+        from channel_env_resolve import resolve_launch_key_env
+        from channel_token import token_from_env_file
+        from util_paths import claude_home_path
+        path = resolve_launch_key_env(claude_home_path("channels"), "ag2space")
+        return (token_from_env_file(name, path) or "").strip() if path else ""
+    except Exception:  # noqa: BLE001 - no channel home or an unreadable file is simply no value
+        return ""
+
+
+def _channel_dir_value(channel_dir: Optional[str], name: str) -> str:
+    """`name` in `channels/<channel_dir>`'s env file (None: the legacy row's channel); '' when none.
+    Read whether or not the file holds a token: an identity file need not carry one."""
+    try:
+        from channel_credentials import CHANNEL
+        from channel_env_resolve import candidates, channel_env_is_contained, device_env
+        from channel_token import token_from_env_file
+        from util_paths import claude_home_path
+        home, source = claude_home_path("channels"), channel_dir or CHANNEL
+        files = [device_env(source)] + [c for c in candidates(home / source)
+                                        if channel_env_is_contained(c, home, source)]
+        return next((v.strip() for v in (token_from_env_file(name, f) for f in files if f) if v and v.strip()), "")
+    except Exception:  # noqa: BLE001 - no channel home or an unreadable file is simply no value
+        return ""
+
+
 def _channel_dir_tokens(channel_dir: Optional[str]) -> list:
     """Relay tokens in `channels/<channel_dir>`'s env file; None is the legacy row's channel."""
     try:

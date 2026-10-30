@@ -5,7 +5,8 @@ own process may not have sourced. `channel_credentials(names)` returns the liste
 the file the shared resolver picks (`channel_env_resolve`), read through `channel_token`. It
 returns nothing when the environment already names any of them, so a token never mixes with a
 URL from another source. On an install with several connections, `room_env(...)` names the
-credential of the connection serving a room instead (`connections.room_credential`). Stdlib only.
+credential of the connection serving a room instead (`connections.room_credential`), and
+`room_agent_mxid(room)` the agent identity on that same connection. Stdlib only.
 """
 from __future__ import annotations
 
@@ -59,3 +60,12 @@ def room_env(url_vars: Iterable[str], token_vars: Iterable[str], room: Optional[
     if not connections.gateway_url_of(token):
         token = f"{gateway_url}|{token}"
     return {**{v: "" for v in (*url_vars, *token_vars)}, token_vars[0]: token}
+
+
+def room_agent_mxid(room: Optional[str], *, environ: Optional[Mapping[str, str]] = None,
+                    workspace: Optional[Path] = None) -> Optional[str]:
+    """The agent identity on the connection serving `room`, the one `room_env` routes to. None keeps
+    the caller's own resolution (one connection); '' when that connection names none, so another
+    server's identity is never used; `NoConnectionForRoom` is raised as `room_env` raises it."""
+    import connections
+    return connections.room_agent_mxid(room, workspace=workspace, environ=environ)

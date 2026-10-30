@@ -1089,6 +1089,61 @@ class FakeActions:
         return {"kind": self.kind or made[operation_id], "surface": "html", "operation_id": operation_id}
 
 
+
+class RoutedIdentityTest(unittest.TestCase):
+    """Two connections whose agent ids differ by server: the page a room's own server's identity
+    tagged is this agent's, whatever the primary channel's AGENT_MXID names (#5980 routes the call)."""
+
+    def setUp(self):
+        from _helpers.three_connections import ThreeConnections, ROOMS
+        self.tmp = Path(tempfile.mkdtemp(prefix="tutorial-routed-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.three, self.room = ThreeConnections(self), ROOMS["dev.s.space"]
+        self.three.channel_file("ag2.space", "AGENT_MXID=@kai.agent:ag2.space\n")
+        self.three.channel_file("dev.s.space", "AGENT_MXID=@kai.agent:dev.s.space\n")
+        self.stub, self.state = self.tmp / "room_commons.py", self.tmp / "room.json"
+        self.stub.write_text(STUB)
+        # As on a desktop install: the process names the primary channel's identity.
+        env = {"STUB_STATE": str(self.state), "AGENT_MXID": "@kai.agent:ag2.space"}
+        for patcher in (mock.patch.dict(os.environ, env),
+                        mock.patch.object(gs, "_workspace", return_value=self.three.workspace)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.door = FakeActions(self.state, by="@kai.agent:dev.s.space")
+        door = mock.patch.object(gs, "connect_actions", return_value=self.door)
+        door.start()
+        self.addCleanup(door.stop)
+
+    def test_a_plain_publish_finds_the_page_its_rooms_identity_made_and_never_creates_a_second(self):
+        mine = "@kai.agent:dev.s.space"
+        self.state.write_text(json.dumps({"pages": {"html-p1": gs.render_page("Kai", "codex", "dm", mine)},
+                                          "by": {"html-p1": mine}, "calls": [], "next": 2}))
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = gs.main(["publish", "--room", self.room, "--name", "Kai", "--core", "codex",
+                            "--room-commons", str(self.stub)])
+        self.assertEqual(code, 0, out.getvalue() + err.getvalue())
+        self.assertEqual(json.loads(out.getvalue())["kind"], "html-p1")
+        db = json.loads(self.state.read_text())
+        self.assertEqual(sorted(db["pages"]), ["html-p1"], "a second Getting started page was created")
+        self.assertEqual(self.door.ops, [])
+        self.assertIn(gs.owner_marker(mine), db["pages"]["html-p1"])
+
+    def test_the_rooms_identity_comes_from_its_own_connection(self):
+        import channel_credentials
+        self.assertEqual(channel_credentials.room_agent_mxid(self.room), "@kai.agent:dev.s.space")
+        self.assertEqual(channel_credentials.room_agent_mxid("!room:ag2.space"), "@kai.agent:ag2.space")
+
+    def test_a_room_whose_connection_names_no_identity_is_refused_not_given_anothers(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            code = gs.main(["publish", "--room", "!room:s.space", "--name", "Kai", "--core", "codex",
+                            "--room-commons", str(self.stub)])
+        self.assertEqual(code, 4)
+        self.assertIn("no agent identity", json.loads(out.getvalue())["reason"])
+        self.assertFalse(self.state.exists() and json.loads(self.state.read_text())["pages"])
+
+
 class PublishTest(unittest.TestCase):
     ROOM = "!dm:ag2.space"
     ME = "@agent:example.test"

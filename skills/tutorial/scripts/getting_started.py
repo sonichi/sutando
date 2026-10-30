@@ -185,6 +185,13 @@ def profile_name(mxid: str, fetch: Optional[Callable[[str], bytes]] = None) -> s
     return " ".join(name.split())[:NAME_MAX] if isinstance(name, str) else ""
 
 
+def room_agent_mxid(room: Optional[str]) -> Optional[str]:
+    """This agent's mxid on the connection serving `room` (channel_credentials.room_agent_mxid):
+    None on a one-connection install, where agent_mxid() is the answer."""
+    from channel_credentials import room_agent_mxid as routed
+    return routed(room)
+
+
 def agent_mxid(environ: Optional[Mapping[str, str]] = None) -> str:
     """This agent's mxid: $AGENT_MXID, else the AG2 Space channel env file's."""
     from channel_credentials import channel_value
@@ -584,14 +591,20 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 3
     try:
         env = commons_env(script, room=args.room)
+        agent = args.agent_mxid or room_agent_mxid(args.room)
     except Exception as exc:  # noqa: BLE001 - the room's server has no usable connection
         print(json.dumps({"ok": False, "reason": redact(str(exc), os.environ)}))
+        return 4
+    if agent == "":
+        # Another server's identity would tag a page this agent then never recognises as its own.
+        print(json.dumps({"ok": False, "reason": "no agent identity for the connection serving this room; "
+                                                 "pass --agent-mxid"}))
         return 4
     try:
         result = publish(Commons(script, args.room, env), marker_path(_workspace()),
                          name, args.owner, args.summon,
                          detect_core() if args.core == "auto" else args.core, args.audience,
-                         args.agent_mxid or agent_mxid() or None, load_prompts(args.prompts),
+                         agent or agent_mxid() or None, load_prompts(args.prompts),
                          args.roles)
     except (PublishError, ValueError) as exc:
         print(json.dumps({"ok": False, "reason": redact(str(exc), env)}))
