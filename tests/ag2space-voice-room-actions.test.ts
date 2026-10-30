@@ -255,6 +255,7 @@ describe('a change runs on the first call, then the model says what it did', () 
 		assert.match(ROOM_ACTIONS_PROMPT_RULE, /for a named document, kind is that page's own kind from search_commons \(markdown-a1b2c3d4\), never the bare surface \(markdown\)/);
 		// Phone/desktop 2026-10-30 22:0xZ: the call service drew the page list on the agent's own call tile and the agent said it was "on your screen".
 		assert.match(ROOM_ACTIONS_PROMPT_RULE, /never draw a page, a list or its contents on your own call screen or any display of yours/);
+		assert.match(ROOM_ACTIONS_PROMPT_RULE, /show_in_live puts text on your call video, not on the user's screen/);
 	});
 
 	it('an approval the room requires is said', async () => {
