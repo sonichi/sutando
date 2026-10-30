@@ -57,6 +57,7 @@ def capture(socket, target):
 
 
 def recover(workspace, session, incarnation, socket, target, now=None):
+    workspace = Path(workspace)
     supplied_now = now
     now = time.time() if now is None else now
     path = Path(workspace) / "state/codex-recovery.json"

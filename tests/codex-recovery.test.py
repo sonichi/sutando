@@ -1,5 +1,7 @@
 """Recovery exercises production observation validation, durable grants and fenced key transport."""
 from datetime import datetime, timezone
+from contextlib import redirect_stdout
+import io
 import json
 import os
 from pathlib import Path
@@ -83,6 +85,63 @@ class RecoveryTests(unittest.TestCase):
         self.publish(self.record)
         self.assertFalse(self.attempt())
         self.send.assert_not_called()
+
+    def test_unparseable_process_start_cannot_grant_a_probe(self):
+        for incarnation in ["missing-date", "7:not-a-date"]:
+            with self.subTest(incarnation=incarnation):
+                record = failed_record(self.now)
+                record["core_incarnation"] = incarnation
+                record["failed_task"]["core_incarnation"] = incarnation
+                self.publish(record)
+                self.assertIsNone(recovery.candidate(self.ws, "core", incarnation, self.now))
+        self.capture.assert_not_called()
+        self.send.assert_not_called()
+        self.assertFalse((self.ws / "state/codex-recovery.json").exists())
+
+    def test_cli_probe_is_single_use_and_transport_timeout_is_non_success(self):
+        argv = ["recovery", str(self.ws), "core", INCARNATION, "socket", "%7"]
+        self.capture.side_effect = subprocess.TimeoutExpired("tmux", 5)
+        with mock.patch.object(sys, "argv", argv):
+            self.assertEqual(recovery.main(), 2)
+        self.send.assert_not_called()
+        self.assertFalse((self.ws / "state/codex-recovery.json").exists())
+        self.capture.side_effect = ["›\ngpt-test · 100% left",
+                                    "› " + recovery.BOOTSTRAP_PROMPT + "\ngpt-test · 100% left"]
+        with mock.patch.object(sys, "argv", argv):
+            self.assertEqual(recovery.main(), 0)
+            self.assertEqual(recovery.main(), 1)
+        self.assertEqual(self.send.call_count, 2)
+        self.assertFalse((self.ws / "results").exists())
+
+    def test_subprocess_cli_uses_string_workspace_and_never_reuses_a_grant(self):
+        wrapper = self.ws / "recovery-cli.py"
+        wrapper.write_text("import sys\nfrom pathlib import Path\n"
+                           + "sys.path.insert(0, " + repr(str(REPO / "src")) + ")\n"
+                           + '''from delivery import codex_recovery as recovery
+root = Path(sys.argv[1])
+panes = iter(["›\\ngpt-test · 100% left",
+              "› " + recovery.BOOTSTRAP_PROMPT + "\\ngpt-test · 100% left"])
+recovery.capture = lambda *args: next(panes)
+recovery.same_incarnation = lambda incarnation: True
+def send(*args):
+    assert (root / "state/codex-recovery.json").is_file()
+    assert args[-1] in (recovery.BOOTSTRAP_PROMPT, "C-m")
+    with (root / "keys").open("a") as stream:
+        stream.write("enter\\n" if args[-1] == "C-m" else "paste\\n")
+    return 0
+recovery.send_keys = send
+raise SystemExit(recovery.main())
+''')
+        command = [sys.executable, str(wrapper), str(self.ws), "core", INCARNATION, "socket", "%7"]
+        first = subprocess.run(command, capture_output=True, text=True, timeout=15)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertEqual((self.ws / "keys").read_text(), "paste\nenter\n")
+        grant = (self.ws / "state/codex-recovery.json").read_bytes()
+        second = subprocess.run(command, capture_output=True, text=True, timeout=15)
+        self.assertEqual(second.returncode, 1, second.stderr)
+        self.assertEqual((self.ws / "keys").read_text(), "paste\nenter\n")
+        self.assertEqual((self.ws / "state/codex-recovery.json").read_bytes(), grant)
+        self.assertFalse((self.ws / "results").exists())
 
     def test_backoff_stale_wrong_session_and_incarnation_stay_closed(self):
         for patch in [{"session": "other"},
@@ -168,6 +227,52 @@ class RecoveryTests(unittest.TestCase):
         self.assertIn("api-error", warning(self.ws))
         record_event(self.ws, "submitted", "private-task.txt")
         self.assertIsNone(warning(self.ws))
+
+
+class TransportBoundaryTests(unittest.TestCase):
+    def test_process_identity_requires_a_live_pid_and_its_exact_utc_start(self):
+        incarnation = "19:Fri Oct 30 16:00:00 2026"
+        answers = [subprocess.CompletedProcess([], 0, stdout="  Fri Oct 30 16:00:00 2026\n"),
+                   subprocess.CompletedProcess([], 0, stdout="Fri Oct 30 16:00:01 2026\n"),
+                   subprocess.CompletedProcess([], 1, stdout="")]
+        with mock.patch.object(recovery.subprocess, "run", side_effect=answers) as run:
+            self.assertTrue(recovery.same_incarnation(incarnation))
+            self.assertFalse(recovery.same_incarnation(incarnation))
+            self.assertFalse(recovery.same_incarnation(incarnation))
+            self.assertEqual(run.call_count, 3)
+            self.assertEqual(run.call_args.args[0], ["ps", "-o", "lstart=", "-p", "19"])
+            self.assertEqual(run.call_args.kwargs["timeout"], 5)
+            self.assertEqual(run.call_args.kwargs["env"]["LC_ALL"], "C")
+            self.assertEqual(run.call_args.kwargs["env"]["TZ"], "UTC")
+            run.reset_mock()
+            self.assertFalse(recovery.same_incarnation("not-a-pid:start"))
+            run.assert_not_called()
+
+    def test_capture_preserves_terminal_attributes_and_propagates_transport_failure(self):
+        pane = "›\n\x1b[2mgpt-test · 100% left\x1b[0m\n"
+        with mock.patch.object(recovery.subprocess, "run",
+                               return_value=subprocess.CompletedProcess([], 0, stdout=pane)) as run:
+            self.assertEqual(recovery.capture("isolated.sock", "%19"), pane)
+            self.assertEqual(run.call_args.args[0],
+                             ["tmux", "-S", "isolated.sock", "capture-pane", "-e", "-p", "-t", "%19"])
+            self.assertTrue(run.call_args.kwargs["check"])
+            self.assertEqual(run.call_args.kwargs["timeout"], 5)
+        with mock.patch.object(recovery.subprocess, "run",
+                               side_effect=subprocess.CalledProcessError(1, "tmux")):
+            with self.assertRaises(subprocess.CalledProcessError):
+                recovery.capture("isolated.sock", "%19")
+
+    def test_prompt_cli_is_tool_free_and_malformed_invocation_is_not_success(self):
+        output = io.StringIO()
+        with mock.patch.object(sys, "argv", ["recovery", "prompt"]), \
+                mock.patch.object(recovery, "capture") as capture, \
+                mock.patch.object(recovery.subprocess, "run") as run, redirect_stdout(output):
+            self.assertEqual(recovery.main(), 0)
+            capture.assert_not_called()
+            run.assert_not_called()
+        self.assertEqual(output.getvalue(), recovery.BOOTSTRAP_PROMPT + "\n")
+        with mock.patch.object(sys, "argv", ["recovery"]):
+            self.assertEqual(recovery.main(), 2)
 
 
 if __name__ == "__main__":

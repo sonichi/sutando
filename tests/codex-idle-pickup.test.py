@@ -117,6 +117,30 @@ class CommandTests(unittest.TestCase):
         self.assertTrue((paths(self.ws)[1] / "task-a.txt").is_file())
         self.assertTrue(marker.is_file())
 
+    def test_cli_refusal_diagnostics_distinguish_missing_identity_and_observer(self):
+        self.assertEqual(self.invoke("refused", "private-task.txt", "core", "7:start"), 0)
+        self.assertIn("observer-missing", warning(self.ws))
+        write(idle_record(), self.ws)
+        self.assertEqual(self.invoke("refused", "private-task.txt", "core", "8:replacement"), 0)
+        self.assertIn("observer-incarnation-mismatch", warning(self.ws))
+        record = idle_record()
+        record.update(seq=3, observer="another-runtime")
+        write(record, self.ws)
+        self.assertEqual(self.invoke("refused", "private-task.txt", "core", "7:start"), 0)
+        self.assertIn("observer-mismatch", warning(self.ws))
+        evidence = (self.ws / "state/codex-pickup.json").read_text()
+        self.assertNotIn("private-task.txt", evidence)
+        self.assertNotIn("8:replacement", evidence)
+        self.assertEqual(json.loads(evidence)["counts"]["refused"], 3)
+        self.assertFalse(paths(self.ws)[0].exists())
+
+    def test_cli_recovery_delegates_and_missing_observation_cannot_create_a_grant(self):
+        self.assertEqual(self.invoke("recover", "core", "7:start", "socket", "%7"), 1)
+        self.assertFalse((self.ws / "state/codex-recovery.json").exists())
+        with mock.patch("delivery.codex_recovery.recover", return_value=True) as recover:
+            self.assertEqual(self.invoke("recover", "core", "7:start", "socket", "%7"), 0)
+            recover.assert_called_once_with(str(self.ws), "core", "7:start", "socket", "%7")
+
     def test_cli_refuses_oversized_prompt_invalid_request_and_write_failure(self):
         self.assertEqual(self.invoke("mark", "task-a.txt", "7:start", stdin="x" * (1024 * 1024 + 1)), 2)
         self.assertFalse(paths(self.ws)[0].exists())

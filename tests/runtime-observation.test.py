@@ -57,6 +57,21 @@ class ValidateTests(Base):
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):
                 ro.validate(rec(completed_task=invalid))
 
+    def test_invalid_recovery_metadata_cannot_replace_the_last_observation(self):
+        original = rec(last_completed_at=NOW - 3)
+        self.assertTrue(ro.write(original, self.ws))
+        path = ro.record_path(self.ws, "core")
+        stored = path.read_bytes()
+        for invalid in [True, "recent", 0, float("nan"), float("inf"), NOW + 1]:
+            with self.subTest(last_completed_at=invalid), self.assertRaises(ValueError):
+                ro.write(rec(last_completed_at=invalid), self.ws)
+            self.assertEqual(path.read_bytes(), stored)
+        for invalid in [[], "receipt", True, 1]:
+            with self.subTest(failed_task=invalid), self.assertRaises(ValueError):
+                ro.write(rec(failed_task=invalid), self.ws)
+            self.assertEqual(path.read_bytes(), stored)
+        self.assertEqual(ro.load(self.ws, "core", NOW)[0]["last_completed_at"], NOW - 3)
+
     def test_completed_task_is_optional_bounded_and_contains_only_metadata(self):
         receipt = {"prompt_sha256": "a" * 64, "accepted_at": NOW - 8,
                    "completed_at": NOW - 3, "core_incarnation": "42:Tue Oct  6 02:00:00 2026"}
