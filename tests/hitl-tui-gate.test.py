@@ -126,6 +126,13 @@ class TestRequirement(unittest.TestCase):
                 "  Do you want to make this edit to a.py?\n  ❯ 1. Yes\n    2. No\n")
         self.assertNotEqual(req("permission", edit.format(2)).guard, req("permission", edit.format(3)).guard)
 
+    def test_a_numbered_list_above_a_press_enter_gate_does_not_key_it(self):
+        for plan in ("Plan:\n 1. migrate db\n 2. deploy\n", "Pick one:\n ❯ 1. migrate db\n   2. deploy\n"):
+            run = req("press-enter", plan + "Press Enter to run migration\n")
+            delete = plan + "Press Enter to delete backups\n"
+            self.assertNotEqual(run.guard, req("press-enter", delete).guard)
+            self.assertIsNone(G.keys_for(clicked(run, "continue"), delete, "blocked-human"))
+
 
 class TestKeys(unittest.TestCase):
     def test_yes_with_the_caret_already_on_yes_is_just_enter(self):
