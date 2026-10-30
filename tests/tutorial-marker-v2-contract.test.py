@@ -1235,17 +1235,27 @@ class ConversionMatrixTest(unittest.TestCase):
 
     def test_an_audience_is_absent_dm_or_room_on_the_entry_and_its_previous_in_every_state(self):
         absent = object()
+        bases_prev = {"creating": {"state": "creating", "operation_id": "op"},
+                      "pending": {"kind": "html-a", "state": "pending", "operation_id": "op"},
+                      "updating": {"kind": "html-a", "state": "updating"}}
         bases = {"complete": lambda a: {"kind": "html-a", "hash": "h", **a},
                  "creating": lambda a: {"state": "creating", "operation_id": "op", **a},
                  "pending": lambda a: {"kind": "html-a", "state": "pending", "operation_id": "op", **a},
                  "updating": lambda a: {"kind": "html-a", "state": "updating", **a},
-                 "previous": lambda a: {"state": "creating", "operation_id": "op", "previous": {**self.PREV, **a}}}
+                 # previous.audience under every state that carries a previous, the entry's own unset
+                 **{f"previous/{st}": (lambda st: lambda a: {**bases_prev[st], "previous": {**self.PREV, **a}})(st)
+                    for st in ("creating", "pending", "updating")}}
         for state, build in bases.items():
             for value in (absent, None, "dm", "room", "owner", "", {}, 1):
                 entry = build({} if value is absent else {"audience": value})
                 with self.subTest(state=state, audience="absent" if value is absent else value):
                     if value is absent or value in ("dm", "room"):
-                        marker(m2(v1_file({"!r": entry})))
+                        got = m2(v1_file({"!r": entry}))
+                        marker(got)
+                        if state.startswith("previous/") or state == "complete":
+                            # The recorded authority is carried as written: absent stays None, never defaulted.
+                            self.assertEqual(got["rooms"]["!r"]["current"]["audience"],
+                                             None if value is absent else value)
                     else:
                         self.assertRaises(Refused, m2, v1_file({"!r": entry}))
 
