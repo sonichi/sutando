@@ -38,6 +38,7 @@ TUNABLES = {
     "stuck_task_age_s": (15 * 60, 5 * 60, 2 * 60 * 60),
     "hook_silent_age_s": (5 * 60, 2 * 60, 60 * 60),
     "heartbeat_cadence_s": (60, 30, 90),
+    "listener_disconnect_age_s": (5 * 60, 60, 60 * 60),
 }
 
 

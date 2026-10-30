@@ -638,7 +638,7 @@ fresh keepawake line never hides a stopped hook:
 | Check | `reason` |
 | --- | --- |
 | the hook's last run (`STATE_DIR/hatch-hook-last-run`) is over 5 minutes old; a hook that never ran is timed from when `install` last wrote a script | `hook-not-running` |
-| Sparrow's status file says it is running but not connected (the check `verify` reports as "Sparrow is running but not connected", for example a rejected relay token); `since` is its last good poll (`last_ok_ts`), when it has one. A restart does not fix this: fix the token or the connection | `listener-not-connected` |
+| Sparrow's status file says it is running but not connected (the check `verify` reports as "Sparrow is running but not connected", for example a rejected relay token), and has for over 5 minutes (`listener_disconnect_age_s`), timed from the later of its last good poll (`last_ok_ts`) and the start of the Sparrow holding the lock, so one failed poll or a start that has not connected yet is not reported; with neither known it is reported at once. `verify`'s own check and the `listener=` value report it at once. A restart does not fix this: fix the token or the connection | `listener-not-connected` |
 | a task file with no result (any `GATEWAY_INSTANCE`, the agent's own messages excepted) is over 15 minutes old | `task-not-picked-up` |
 
 A held task whose room line has not been delivered is counted too, once the hold is over 10
@@ -729,7 +729,7 @@ from 60 s to an hour; an unchanged revision is never refetched. The keepawake ru
 caches that copy as above.
 
 The served tunables (`keepawake_interval_s`, `stuck_task_age_s`,
-`hook_silent_age_s`, `heartbeat_cadence_s`) are clamped to bounds the package
+`hook_silent_age_s`, `heartbeat_cadence_s`, `listener_disconnect_age_s`) are clamped to bounds the package
 sets. Until a setup is fetched and cached, the built-in text and defaults
 apply.
 

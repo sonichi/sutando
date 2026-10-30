@@ -11,8 +11,8 @@ environment) and sends the row on its heartbeat. The row is healthy while the la
 keepawake line is under two intervals old, unknown while a task that has not run yet
 is that young, else abnormal (`keepawake-not-running`). A fresh keepawake line does not
 mask the hook: the row is also abnormal when the hook has not run in HOOK_STALE_S
-(`hook-not-running`), Sparrow runs but its gateway connection is down (`listener-not-connected`,
-ranked above a waiting task, which it causes), a task has waited over TASK_PICKUP_S (`task-not-picked-up`), or a held
+(`hook-not-running`), Sparrow runs but its gateway connection has been down over the
+listener_disconnect_age_s tunable (`listener-not-connected`, ranked above a waiting task, which it causes), a task has waited over TASK_PICKUP_S (`task-not-picked-up`), or a held
 task's room line is still queued or parked after HELD_LINE_DELIVER_S (`task-held-line-undelivered`)
 or left the queue with no receipt (`task-held-line-unconfirmed`).
 `keepalive report` lists the log's gaps, and reads the lines of the earlier
@@ -177,6 +177,16 @@ def listener_not_connected(cfg: dict, now: float) -> bool:
 def listener_label(cfg: dict, now: float, up: bool) -> str:
     """The `listener=` value for a listener_up result."""
     return "down" if not up else "up-not-connected" if listener_not_connected(cfg, now) else "up"
+
+
+def disconnected_since(cfg: dict) -> "float | None":
+    """The later of Sparrow's last good poll and the start of the Sparrow holding the lock, which
+    a restart that has not connected yet still needs; None when neither is known."""
+    state, instance = _state_dir(cfg), _instance(cfg)
+    last_ok = bounded_number((_status_snapshot(state, instance) or {}).get("last_ok_ts"), 0, 1e11)
+    began = bounded_number((_cli._lock_record(state, instance) or {}).get("acquired_at"), 0, 1e11)
+    known = [t for t in (last_ok, began) if t is not None]
+    return max(known) if known else None
 
 
 def _found(directory: Path, name: str) -> "list[Path]":
@@ -1116,9 +1126,10 @@ def health_row(cfg: dict, log: Path, now: float | None = None) -> dict | None:
         problems.append((HOOK_NOT_RUNNING, hook + hook_stale_s))
     # Before TASK_NOT_PICKED_UP: a lost connection is why a task waits, so it is the reason sent.
     if listener_not_connected(cfg, now):
-        last_ok = bounded_number((_status_snapshot(_state_dir(cfg), _instance(cfg)) or {})
-                                 .get("last_ok_ts"), 0, 1e11)
-        problems.append((LISTENER_NOT_CONNECTED, last_ok))
+        down_s = tune["listener_disconnect_age_s"]
+        since = disconnected_since(cfg)
+        if since is None or not _within(now, since, down_s):
+            problems.append((LISTENER_NOT_CONNECTED, None if since is None else since + down_s))
     oldest, held, stuck = open_tasks(cfg, now)
     if oldest is not None and now - oldest > tune["stuck_task_age_s"]:
         problems.append((TASK_NOT_PICKED_UP, oldest + tune["stuck_task_age_s"]))

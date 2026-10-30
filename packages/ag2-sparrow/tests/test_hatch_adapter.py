@@ -2192,8 +2192,49 @@ class Keepalive(Base):
         row = self.health()
         self.assertEqual((row["condition"], row["reason"]),
                          ("abnormal", keepalive.LISTENER_NOT_CONNECTED))
-        self.assertAlmostEqual(row["since"], time.time() - 3600, delta=5)
+        hold = runtime_text.TUNABLES["listener_disconnect_age_s"][0]
+        self.assertAlmostEqual(row["since"], time.time() - 3600 + hold, delta=5)
         self.assertEqual(hc.validate(row), (row, None))
+
+    def not_connected(self, last_ok_ago=None, acquired_ago=None):
+        self.sparrow_status(connected=False, error="poll failed")
+        if last_ok_ago is not None:
+            status = self.state / "gateway-status.json"
+            status.write_text(json.dumps({**json.loads(status.read_text()),
+                                          "last_ok_ts": int(time.time()) - last_ok_ago}))
+        if acquired_ago is not None:
+            (self.state / "locks").mkdir(exist_ok=True)
+            now = int(time.time())
+            (self.state / "locks" / "gateway-bridge.lock").write_text(json.dumps({
+                "role": "gateway-bridge", "workspace": str(self.state.parent), "pid": os.getpid(),
+                "host": hatch_cli.workspace_lock._host_label(), "acquired_at": now - acquired_ago,
+                "heartbeat_at": now, "schema_version": 1}))
+
+    def test_a_disconnect_is_held_down_until_it_outlasts_the_tunable(self):
+        self.installed()
+        self.keepawake_at(time.time() - 60)
+        self.hook_ran()
+        hold = runtime_text.TUNABLES["listener_disconnect_age_s"][0]
+        cases = {  # (last good poll ago, lock acquired ago) -> reported
+            "one failed poll on a long-running Sparrow": ((30, 86400), False),
+            "a start that has not connected yet": ((None, 30), False),
+            "a restart after a long outage, not connected yet": ((86400, 30), False),
+            "a disconnect sustained past the hold": ((hold + 60, 86400), True),
+            "a start that never connected": ((None, hold + 60), True),
+            "no last good poll and no lock": ((None, None), True),
+        }
+        for name, ((last_ok_ago, acquired_ago), reported) in cases.items():
+            with self.subTest(name):
+                shutil.rmtree(self.state / "locks", ignore_errors=True)
+                self.not_connected(last_ok_ago, acquired_ago)
+                row = self.health()
+                self.assertEqual((row["condition"], row["reason"]),
+                                 ("abnormal", keepalive.LISTENER_NOT_CONNECTED) if reported
+                                 else ("healthy", None))
+                self.assertEqual(hc.validate(row), (row, None))
+                # verify's own check is not held down.
+                self.assertIn("FAIL sparrow: Sparrow is running but not connected: poll failed",
+                              self.cli("verify").stdout)
 
     def test_keepawake_restarts_through_the_installed_service(self):
         self.installed()
