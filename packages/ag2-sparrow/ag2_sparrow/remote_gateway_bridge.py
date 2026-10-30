@@ -752,7 +752,7 @@ def _hitl_owner() -> str:
         try:
             owner = _registry_owner(timeout=10)[0]
         except Exception as e:  # noqa: BLE001 - offline: unknown until the retry window passes
-            _log(f"hitl: owner lookup failed ({e})")
+            _log(f"hitl: owner lookup failed ({diagnostics.describe(e)})")
             owner = ""
         if not owner:
             _HITL_OWNER.update(mxid="", bad_at=now)
