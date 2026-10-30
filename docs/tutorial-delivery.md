@@ -15,7 +15,9 @@ The procedure lives in the `tutorial` skill: [`skills/tutorial/SKILL.md`](../ski
 
 - **The feature list.** The steps come from `skills/tutorial/feature-list.json` (one step per
   feature: title, two body parts, where to try it, a paste prompt, screenshots, the release that
-  added it). `--list <file|https URL>` swaps the list; nothing is fetched by default, only https
+  added it, and optionally the repo paths it `watches`). A watched path that changes in a release
+  without a revision bump or a matching `reviewed_at` makes the release audit warn
+  (`docs/release-process.md` §4.2). `--list <file|https URL>` swaps the list; nothing is fetched by default, only https
   is fetched (redirects included), a list is at most 1 MiB and 24 steps, and a list that does not
   validate (markup, a placeholder other than `{name}`, a missing field) is reported on stderr and
   the skill's own file is used.

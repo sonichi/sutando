@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "revision": "tutorial.2026-10-23.1",
+  "revision": "tutorial.2026-10-30.1",
   "steps": [
     {
       "id": "dm",
@@ -108,7 +108,10 @@
           "alt": "The headphone icon in the room header"
         }
       ],
-      "since_release": "2026-10-15"
+      "since_release": "2026-10-15",
+      "watches": [
+        "skills/ag2space-voice/"
+      ]
     },
     {
       "id": "apps",
@@ -131,7 +134,10 @@
         }
       ],
       "since_release": "2026-10-15",
-      "paste": "Connect my Google Calendar."
+      "paste": "Connect my Google Calendar.",
+      "watches": [
+        "skills/connect-apps/"
+      ]
     },
     {
       "id": "activity",
@@ -148,7 +154,10 @@
           "alt": "The bell at the top of the room list"
         }
       ],
-      "since_release": "2026-10-15"
+      "since_release": "2026-10-15",
+      "watches": [
+        "skills/agent-activity/"
+      ]
     },
     {
       "id": "mobile",
@@ -178,7 +187,10 @@
       "screenshot": null,
       "since_release": "2026-10-15",
       "paste": "Import my Claude Code history.",
-      "runtime": "claude"
+      "runtime": "claude",
+      "watches": [
+        "skills/import-claude-context/"
+      ]
     }
   ]
 }

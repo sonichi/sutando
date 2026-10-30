@@ -273,6 +273,25 @@ class ListTest(unittest.TestCase):
         self.refuse(many_steps(40), "steps", "at most 24", "got 40")
         self.assertEqual(len(tp.parse_list(many_steps(tp.STEPS_MAX)).steps), tp.STEPS_MAX)
 
+    def test_watches_and_reviewed_at_are_validated(self):
+        self.assertEqual(tp.parse_list(with_step(watches=["skills/connect-apps/", "src/x.py"])).steps[0].watches,
+                         ("skills/connect-apps/", "src/x.py"))
+        self.assertEqual(tp.parse_list(with_step(watches=None)).steps[0].watches, ())
+        for bad in ("skills/x/", ["/abs/path"], ["../up"], ["a/../b"], ["./a"], [""], [3], ["a b"],
+                    ["a/"] * (tp.WATCHES_MAX + 1)):
+            self.refuse(with_step(watches=bad), "step dm", "watches")
+        self.assertEqual(tp.parse_list(good_list(reviewed_at="v0.14.0")).revision, tp.FEATURES.revision)
+        for bad in ("v0.14.0-rc.1", "0.14.0", "v0.14", 14):
+            self.refuse(good_list(reviewed_at=bad), "reviewed_at")
+
+    def test_every_shipped_watch_exists_in_the_repo(self):
+        repo = tp.LIST_PATH.parents[2]
+        by = {s.id: s.watches for s in tp.FEATURES.steps}
+        self.assertTrue(any(by.values()))
+        for sid, watches in by.items():
+            for w in watches:
+                self.assertTrue((repo / w).exists(), f"step {sid} watches missing {w}")
+
     def test_markup_and_stray_placeholders_are_refused_in_the_title_and_both_body_parts(self):
         tag = "<script>fetch('https://x.test')</script>"
         self.refuse(with_step(title=f"Your DM {tag}"), "step dm title", "'<'")

@@ -17,7 +17,7 @@ ALLOWED_AUDIENCES = {"users", "operators", "contributors", "maintainers", "agent
 ALLOWED_STATUSES = {"canonical", "active", "draft", "historical"}
 REQUIRED_METADATA = {"title", "audience", "status", "canonical_for", "last_verified"}
 FEATURE_LIST = "skills/tutorial/feature-list.json"
-USER_FACING_PREFIXES = ("src/", "skills/")
+RELEASE_TAG = re.compile(r"^v\d+\.\d+\.\d+$")
 
 
 def repo_root_from_script() -> Path:
@@ -166,52 +166,63 @@ def git(repo: Path, *args: str) -> Optional[str]:
     return result.stdout if result.returncode == 0 else None
 
 
-def feature_list_revision(repo: Path, ref: str) -> Optional[str]:
+def release_tag(repo: Path) -> Optional[str]:
+    """The highest plain vMAJ.MIN.PATCH tag reachable from HEAD; -rc/-pre and other suffixes never count."""
+    tags = git(repo, "tag", "--merged", "HEAD", "--list", "v*")
+    plain = [t for t in (tags or "").split() if RELEASE_TAG.match(t)]
+    if not plain:
+        return None
+    return max(plain, key=lambda t: tuple(int(n) for n in t[1:].split(".")))
+
+
+def feature_list_at(repo: Path, ref: str) -> dict:
     blob = git(repo, "show", f"{ref}:{FEATURE_LIST}")
-    if blob is None:
-        return None
     try:
-        return json.loads(blob).get("revision")
-    except (json.JSONDecodeError, AttributeError):
-        return None
+        data = json.loads(blob) if blob is not None else {}
+    except json.JSONDecodeError:
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
-def user_facing_docs(repo: Path) -> Set[str]:
-    try:
-        documents = json.loads((repo / "docs" / "catalog.json").read_text(encoding="utf-8"))["documents"]
-    except (OSError, json.JSONDecodeError, KeyError, TypeError):
-        return {"README.md"}
-    users = {path for path, meta in documents.items()
-             if isinstance(meta, dict) and "users" in (meta.get("audience") or [])}
-    return users | {"README.md"}
+def watched(path: str, watch: str) -> bool:
+    if watch.endswith("/"):
+        return path.startswith(watch)
+    return path == watch or path.startswith(watch + "/")
 
 
 def audit_feature_list(repo: Path, since: Optional[str] = None) -> List[str]:
-    """Warn when user-facing paths changed since the last release tag but the tour's revision did not."""
+    """Warn when a path a tour step watches changed since the last release tag, the tour's revision
+    did not, and `reviewed_at` does not record that tag."""
     repo = repo.resolve()
-    if since is None:
-        tag = git(repo, "describe", "--tags", "--abbrev=0", "--match", "v[0-9]*", "HEAD")
-        if not tag:
-            return []
-        since = tag.strip()
+    since = since or release_tag(repo)
+    if not since:
+        return []
     changed = git(repo, "diff", "--name-only", since, "HEAD")
     if changed is None:
         return [f"feature-list check skipped: cannot diff {since}..HEAD"]
-    docs = user_facing_docs(repo)
-    user_facing = sorted(
-        path for path in changed.splitlines()
-        if path != FEATURE_LIST and (path.startswith(USER_FACING_PREFIXES) or path in docs)
-    )
-    if not user_facing:
-        return []
-    old, new = feature_list_revision(repo, since), feature_list_revision(repo, "HEAD")
-    if old != new:
-        return []
-    return [
-        f"{FEATURE_LIST}: revision {new!r} unchanged since {since}, but {len(user_facing)} "
-        f"user-facing file(s) changed (e.g. {user_facing[0]}); update the Getting started tour "
-        "and bump its revision, or confirm nothing it shows changed"
+    head = feature_list_at(repo, "HEAD")
+    steps = [s for s in head.get("steps") or [] if isinstance(s, dict)]
+    warnings = [
+        f"{FEATURE_LIST}: step {step.get('id')} watches {watch}, which does not exist"
+        for step in steps for watch in step.get("watches") or []
+        if not (repo / watch).exists()
     ]
+    if head.get("reviewed_at") == since:
+        return warnings
+    if feature_list_at(repo, since).get("revision") != head.get("revision"):
+        return warnings
+    paths = changed.splitlines()
+    hit = [
+        step.get("id") for step in steps
+        if any(watched(path, w) for w in step.get("watches") or [] for path in paths)
+    ]
+    if hit:
+        warnings.append(
+            f"{FEATURE_LIST}: paths watched by step(s) {', '.join(map(str, hit))} changed since {since} "
+            f"but revision {head.get('revision')!r} did not; update those steps and bump revision, "
+            f"or set \"reviewed_at\": \"{since}\" if the tour is unaffected"
+        )
+    return warnings
 
 
 def run(repo: Path) -> Tuple[List[str], int, int]:
@@ -228,7 +239,7 @@ def run(repo: Path) -> Tuple[List[str], int, int]:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo-root", type=Path, default=repo_root_from_script())
-    parser.add_argument("--since", help="release ref to compare against (default: last v* tag)")
+    parser.add_argument("--since", help="release ref to compare against (default: highest plain vX.Y.Z tag)")
     args = parser.parse_args()
     errors, docs_count, checked_count = run(args.repo_root)
     for warning in audit_feature_list(args.repo_root, args.since):

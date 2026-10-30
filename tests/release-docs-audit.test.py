@@ -2,6 +2,7 @@
 """Behavioral coverage for the release skill documentation audit."""
 
 import json
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -56,10 +57,17 @@ def git(root: Path, *args: str) -> None:
     )
 
 
-def write_feature_list(root: Path, revision: str) -> None:
+def write_feature_list(root: Path, revision: str, reviewed_at: str = "") -> None:
     path = root / "skills" / "tutorial" / "feature-list.json"
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({"schema_version": 1, "revision": revision, "steps": []}))
+    data = {"schema_version": 1, "revision": revision, "steps": [
+        {"id": "calls", "watches": ["skills/voice/"]},
+        {"id": "apps", "watches": ["src/apps.py"]},
+        {"id": "rooms"},
+    ]}
+    if reviewed_at:
+        data["reviewed_at"] = reviewed_at
+    path.write_text(json.dumps(data))
 
 
 def released_fixture(root: Path) -> None:
@@ -67,6 +75,9 @@ def released_fixture(root: Path) -> None:
     write_feature_list(root, "tutorial.1")
     (root / "src").mkdir()
     (root / "src" / "app.py").write_text("print(1)\n")
+    (root / "src" / "apps.py").write_text("print(1)\n")
+    (root / "skills" / "voice").mkdir(parents=True)
+    (root / "skills" / "voice" / "call.py").write_text("print(1)\n")
     git(root, "init", "-q")
     git(root, "add", "-A")
     git(root, "commit", "-qm", "release")
@@ -78,9 +89,14 @@ def commit_all(root: Path, message: str) -> None:
     git(root, "commit", "-qm", message)
 
 
+FAILED: list = []
+
+
 def check(label: str, condition: bool, detail: str = "") -> None:
     if not condition:
-        raise AssertionError(f"{label}: {detail}")
+        FAILED.append(label)
+        print(f"FAIL {label}: {detail.strip()[:300]}")
+        return
     print(f"ok   {label}")
 
 
@@ -125,30 +141,64 @@ def main() -> int:
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
         released_fixture(root)
-        (root / "src" / "app.py").write_text("print(2)\n")
-        commit_all(root, "user-facing change")
+        (root / "skills" / "voice" / "call.py").write_text("print(2)\n")
+        commit_all(root, "watched change")
         result = run(root)
         check(
-            "user-facing change with unchanged feature-list revision warns, exit 0",
-            result.returncode == 0 and "WARN" in result.stderr and "feature-list.json" in result.stderr,
+            "watched path change with unchanged revision warns naming the step, exit 0",
+            result.returncode == 0 and "step(s) calls changed since v0.1.0" in result.stderr,
             result.stderr,
         )
+
+        write_feature_list(root, "tutorial.1", reviewed_at="v0.0.9")
+        commit_all(root, "stale acknowledgement")
+        result = run(root)
+        check("reviewed_at naming an older tag does not silence", "step(s) calls" in result.stderr, result.stderr)
+
+        write_feature_list(root, "tutorial.1", reviewed_at="v0.1.0")
+        commit_all(root, "acknowledge")
+        result = run(root)
+        check("reviewed_at equal to the baseline tag silences", "WARN" not in result.stderr, result.stderr)
 
         write_feature_list(root, "tutorial.2")
         commit_all(root, "bump tour")
         result = run(root)
-        check("bumped feature-list revision clears the warning", "WARN" not in result.stderr, result.stderr)
+        check("bumped revision clears the warning", "WARN" not in result.stderr, result.stderr)
 
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
         released_fixture(root)
+        (root / "src" / "app.py").write_text("print(2)\n")
         (root / "CONTRIBUTING.md").write_text("# Contributing\n")
-        commit_all(root, "contributor-only change")
+        commit_all(root, "unwatched change")
         result = run(root)
-        check("non-user-facing change does not warn", result.returncode == 0 and "WARN" not in result.stderr,
+        check("unwatched src/ change does not warn", result.returncode == 0 and "WARN" not in result.stderr,
               result.stderr)
 
-    print("ALL PASS (8 checks)")
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        released_fixture(root)
+        (root / "src" / "apps.py").write_text("print(2)\n")
+        commit_all(root, "watched file change")
+        git(root, "tag", "-a", "v0.2.0-rc.1", "-m", "rc")
+        git(root, "tag", "-a", "v0.2.0-pre-x", "-m", "pre")
+        result = run(root)
+        check("-rc/-pre tags are not the baseline", "step(s) apps changed since v0.1.0" in result.stderr,
+              result.stderr)
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        released_fixture(root)
+        shutil.rmtree(root / "skills" / "voice")
+        commit_all(root, "remove watched dir")
+        result = run(root)
+        check("a watched path that does not exist warns", "watches skills/voice/, which does not exist"
+              in result.stderr, result.stderr)
+
+    if FAILED:
+        print(f"FAILED {len(FAILED)} of 12 checks")
+        return 1
+    print("ALL PASS (12 checks)")
     return 0
 
 

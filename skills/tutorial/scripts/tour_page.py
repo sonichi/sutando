@@ -2,7 +2,7 @@
 
 The steps come from a feature list, `feature-list.json` beside this skill's scripts (or one passed
 in): `{schema_version, revision, steps[{id, title, body[what, how], surface, screenshot, since_release,
-paste?, runtime?}]}`, the owner-step shape AG2 Space's backend serves. `parse_list` validates it and
+paste?, runtime?, watches?}], reviewed_at?}`, the owner-step shape AG2 Space's backend serves. `parse_list` validates it and
 `render_page(name, core, ..., features, media)` renders it; the page records the list's `revision` in
 its ownership meta tag, so a later run can tell whether its list is newer. Each screenshot is an
 asset reference `{asset, fallback_file, alt}`: when `media` maps the asset name to the room's
@@ -41,6 +41,9 @@ FALLBACK_FILE = re.compile(r"^assets/([a-z0-9][a-z0-9-]*\.jpg)$")
 # Room media as room-commons' room_pdf.py accepts it from room.media.upload.
 MXC = re.compile(r"^mxc://[A-Za-z0-9][A-Za-z0-9.-]{0,253}(?::\d{1,5})?/[A-Za-z0-9_-]{1,255}$")
 RELEASE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+RELEASE_TAG = re.compile(r"^v\d+\.\d+\.\d+$")
+WATCH = re.compile(r"^(?!.*(?:^|/)\.\.?(?:/|$))[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*/?$")
+WATCHES_MAX = 16
 SURFACES = ("dm", "room", "mobile")
 RUNTIMES = ("claude", "codex")
 BODY_PARTS = 2
@@ -70,6 +73,7 @@ class Section(NamedTuple):
     images: Tuple[Shot, ...] = ()
     runtime: Optional[str] = None
     since_release: str = ""
+    watches: Tuple[str, ...] = ()
 
 
 class FeatureList(NamedTuple):
@@ -247,13 +251,18 @@ def _step(raw: object, n: int, assets: Path) -> Section:
     runtime = raw.get("runtime")
     if runtime is not None and runtime not in RUNTIMES:
         raise ValueError(f"{where}: runtime must be one of {', '.join(RUNTIMES)} or absent, got {runtime!r}")
-    return Section(sid, title, what, how, paste, surface, tuple(images), runtime, since)
+    watches = raw.get("watches", [])
+    if not isinstance(watches, list) or len(watches) > WATCHES_MAX or not all(
+            isinstance(w, str) and WATCH.match(w) for w in watches):
+        raise ValueError(f"{where}: watches must list at most {WATCHES_MAX} repo-relative paths, got {watches!r}")
+    return Section(sid, title, what, how, paste, surface, tuple(images), runtime, since, tuple(watches))
 
 
 def parse_list(data: object, assets: Optional[Path] = None) -> FeatureList:
     """The feature list in `data` (a parsed JSON document), validated: schema_version 1, a
     well-formed revision, and at least one step with a unique id, a two-part body, a known surface,
-    screenshots that exist under `assets` with alt text, a release date and an optional runtime.
+    screenshots that exist under `assets` with alt text, a release date, an optional runtime and
+    optional watched paths; an optional `reviewed_at` is a plain release tag.
     Anything else raises ValueError naming the step and field, so a bad list never renders."""
     assets = ASSETS if assets is None else assets
     if not isinstance(data, dict):
@@ -263,6 +272,9 @@ def parse_list(data: object, assets: Optional[Path] = None) -> FeatureList:
     revision = data.get("revision")
     if revision_key(revision) is None:
         raise ValueError(f"revision must look like tutorial.YYYY-MM-DD.N, got {revision!r}")
+    reviewed = data.get("reviewed_at")
+    if reviewed is not None and (not isinstance(reviewed, str) or not RELEASE_TAG.match(reviewed)):
+        raise ValueError(f"reviewed_at must be a release tag like v1.2.3, got {reviewed!r}")
     raw_steps = data.get("steps")
     if not isinstance(raw_steps, list) or not raw_steps:
         raise ValueError("steps must be a non-empty list")
