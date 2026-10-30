@@ -11,11 +11,14 @@ Subcommands:
   cleanup [--force]                                      delete the hook ids this skill recorded
   config get [KEY] | config set KEY VALUE                read or set a setting (the config.json layer)
   track --pr O/R#N [--author A] [--state S] [--head SHA8] [--verdict V] [--event TEXT] [--link URL]
-                                                         record a PR's outcome; publish the tracker page
+        [--about TEXT] [--ask TEXT | --ask-clear]        record a PR's outcome; publish the tracker page
+  tracker-kind --kind html-ID --room ROOM                record the page a session publish wrote to
   run                                                    the forwarder supervisor the mod spawns
 
 `run` prints `PR_WATCH_PROMPT_TEMPLATE <json>` on start and on SIGHUP, one `PR_EVENT ...` line per
-relevant event, and `PR_WATCH_NOTE ...` lines for problems the session should see. State lives in
+relevant event (upserting that PR's row in tracker.json), and `PR_WATCH_NOTE ...` lines for problems
+the session should see. `track` prints `PR_WATCH_PUBLISH ...` when the session must publish the page
+itself (PR_WATCH_TRACKER_PUBLISH=session, or the CLI publish failed). State lives in
 <workspace>/state/pr-watch/, never in the mod folder. Settings: manifest.json `config`, read as
 CLI > env > manifest > config.json. Standard library only, plus `gh` with cli/gh-webhook.
 """
@@ -51,13 +54,19 @@ def _is_state_copy(here: Path) -> bool:
 # install-mod copies the manifest beside the runner copy, which runs without a checkout around it.
 MANIFEST = (Path(__file__).resolve().parent / "manifest.json" if _is_state_copy(Path(__file__).resolve().parent)
             else SKILL_DIR / "manifest.json")
-SETTINGS = ("PR_WATCH_PROMPT", "PR_WATCH_TRACKER_ROOM", "PR_WATCH_TRACKER_TITLE", "PR_WATCH_COMMONS_SCRIPT")
+SETTINGS = ("PR_WATCH_PROMPT", "PR_WATCH_TRACKER_ROOM", "PR_WATCH_TRACKER_TITLE", "PR_WATCH_COMMONS_SCRIPT",
+            "PR_WATCH_TRACKER_PUBLISH")
 TEMPLATE_MARK = "PR_WATCH_PROMPT_TEMPLATE "
 NOTE_MARK = "PR_WATCH_NOTE "
+PUBLISH_MARK = "PR_WATCH_PUBLISH "
+PUBLISH_MODES = ("cli", "session")
 COMMONS_TIMEOUT_S = 60
 TRACK_STATES = ("open", "merged", "closed")
 TRACK_VERDICTS = ("approved", "changes_requested", "commented", "none")
 PAGE_KIND_RE = re.compile(r"^html-[A-Za-z0-9_.-]+$")
+ABOUT_MAX = 300
+ABOUT_SHOWN = 90
+ASK_MAX = 600
 
 EVENTS = "pull_request,pull_request_review"
 PR_ACTIONS = ("opened", "synchronize", "reopened", "ready_for_review", "closed")
@@ -80,7 +89,13 @@ LOGIN_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})(?:\[bot\])?$")
 
 TRACK_HINT = (
     " Then record the outcome: the pr-watch skill's `pr_watch.py track --pr <repo>#<n>` with --state, "
-    "--head, --verdict and --event."
+    "--head, --verdict and --event; when the owner must decide, add --ask with the question, your "
+    "recommendation and the options (--ask-clear once settled). If it prints `PR_WATCH_PUBLISH "
+    "room=<room> kind=<kind> path=<file> title=<title>`, publish that file's whole content to that "
+    "room with your room tools: "
+    "`room.commons.pages.replace` with mode `whole` on that kind, or, when kind=new or that page is gone, "
+    "`room.commons.pages.create` with kind html, that title and the file as body. Then run "
+    "`pr_watch.py tracker-kind --kind <the page's html-... kind> --room <room>` so later publishes reuse it."
 )
 
 
@@ -109,6 +124,8 @@ class State:
         self.lock = root / "run.lock"
         self.logs = root / "logs"
         self.tracker = root / "tracker.json"
+        self.tracker_lock = root / "tracker.lock"
+        self.tracker_html = root / "tracker.html"
         self.backoff = root / "backoff.json"
 
     def ensure(self) -> None:
@@ -130,6 +147,31 @@ def write_json(path: Path, data) -> None:
     tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
     tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
     os.replace(tmp, path)
+
+
+def write_text_atomic(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def update_tracker(st: State, change: Callable[[dict], None]) -> dict:
+    """Read tracker.json, apply `change`, write it back, all under one lock; returns the new data.
+
+    The runner and `track` both write it, from different processes."""
+    st.root.mkdir(parents=True, exist_ok=True)
+    with open(st.tracker_lock, "a") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            data = read_json(st.tracker, {})
+            if not isinstance(data, dict):
+                raise SystemExit(f"pr-watch: {st.tracker} is not a JSON object")
+            change(data)
+            write_json(st.tracker, data)
+            return data
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
 
 
 # ---- config ----------------------------------------------------------------------------------
@@ -205,6 +247,8 @@ def cmd_config(st: State, action: str, key: Optional[str], value: Optional[str])
     if not key or value is None:
         raise SystemExit("pr-watch: config set KEY VALUE")
     setting_source(key)
+    if key == "PR_WATCH_TRACKER_PUBLISH" and value and value not in PUBLISH_MODES:
+        raise SystemExit(f"pr-watch: {key} must be one of {', '.join(PUBLISH_MODES)}, got {value!r}")
     st.ensure()
     cfg = load_config(st)
     settings = cfg.setdefault("settings", {})
@@ -328,6 +372,58 @@ def classify(payload: dict, watches: List[dict], reviewed: Optional[ReviewedFn] 
     if seen is False:
         return None
     return base + " reason=reviewed" + ("" if seen else " reviewed=unknown")
+
+
+def payload_row(payload: dict) -> Optional[Tuple[str, dict]]:
+    """(row key, the fields a webhook payload knows) for tracker.json; never verdict or event."""
+    repo = (payload.get("repository") or {}).get("full_name") or ""
+    pr = payload.get("pull_request")
+    if not REPO_RE.match(repo) or not isinstance(pr, dict):
+        return None
+    number = pr.get("number")
+    if not isinstance(number, int) or isinstance(number, bool) or number <= 0:
+        return None
+    fields: dict = {"repo": repo, "number": number}
+    state = "merged" if pr.get("merged") else pr.get("state")
+    if state in TRACK_STATES:
+        fields["state"] = state
+    head = (pr.get("head") or {}).get("sha")
+    if isinstance(head, str) and re.match(r"^[0-9a-f]{8,}$", head):
+        fields["head"] = head[:8]
+    author = (pr.get("user") or {}).get("login")
+    if isinstance(author, str) and LOGIN_RE.match(author):
+        fields["author"] = author
+    link = pr.get("html_url")
+    fields["link"] = link if _is_http(link) else f"https://github.com/{repo}/pull/{number}"
+    title = pr.get("title")
+    if isinstance(title, str) and title.strip():
+        fields["title"] = " ".join(title.split())[:ABOUT_MAX]
+    return f"{repo}#{number}", fields
+
+
+def settle(row: dict) -> None:
+    """A merged or closed PR asks nothing of the owner any more."""
+    if row.get("state") in ("merged", "closed"):
+        row.pop("ask", None)
+
+
+def upsert_from_payload(st: State, payload: dict) -> bool:
+    """Bring the PR's row up to date from the payload, keeping what the agent recorded."""
+    found = payload_row(payload)
+    if found is None:
+        return False
+    key, fields = found
+
+    def change(data: dict) -> None:
+        rows = data.setdefault("rows", {})
+        row = rows.get(key) or {}
+        row.update(fields)
+        settle(row)
+        row["updated_at"] = _now()
+        rows[key] = row
+
+    update_tracker(st, change)
+    return True
 
 
 def split_json_stream(buffer: str) -> Tuple[List[dict], str]:
@@ -627,6 +723,7 @@ class Runner:
                 self.reviewed.observe(payload, watches)
                 line = classify(payload, watches, self.reviewed)
                 if line:
+                    self.track_row(payload)
                     self.emit(line)
         proc.wait()
         with self.procs_lock:
@@ -637,6 +734,12 @@ class Runner:
             return self.back_off(repo, f"GitHub refused a second forwarder ({HOOK_EXISTS})",
                                  f"{repo}: GitHub refused a second forwarder ({HOOK_EXISTS}); retrying later")
         return RESTART_DELAY_S
+
+    def track_row(self, payload: dict) -> None:
+        try:
+            upsert_from_payload(self.st, payload)
+        except (OSError, SystemExit) as exc:
+            self.note(f"tracker row not updated: {str(exc)[:200]}")
 
     def _stderr(self, proc: subprocess.Popen, path: Path, conflict: threading.Event) -> None:
         assert proc.stderr is not None
@@ -721,14 +824,14 @@ def cmd_run(st: State) -> int:
 # ---- tracker ---------------------------------------------------------------------------------
 
 PR_REF_RE = re.compile(r"^([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#([0-9]+)$")
-COLUMNS = ("PR", "Author", "State", "Head reviewed", "Verdict", "Last event", "Updated")
+COLUMNS = ("PR", "About", "Author", "State", "Head reviewed", "Verdict", "Last event", "Updated")
 
 TRACKER_CSS = """
 :root { --bg: #ffffff; --fg: #1f2328; --muted: #59636e; --line: #d1d9e0; --head: #f6f8fa;
-  --link: #0969da; --open: #1a7f37; --merged: #8250df; --closed: #cf222e; }
+  --link: #0969da; --open: #1a7f37; --merged: #8250df; --closed: #cf222e; --ask: #9a6700; }
 @media (prefers-color-scheme: dark) {
   :root { --bg: #0d1117; --fg: #e6edf3; --muted: #9198a1; --line: #3d444d; --head: #151b23;
-    --link: #4493f8; --open: #3fb950; --merged: #ab7df8; --closed: #f85149; }
+    --link: #4493f8; --open: #3fb950; --merged: #ab7df8; --closed: #f85149; --ask: #d29922; }
 }
 * { box-sizing: border-box; }
 body { margin: 0; padding: 16px; background: var(--bg); color: var(--fg);
@@ -746,6 +849,12 @@ a { color: var(--link); text-decoration: none; }
 code { font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; }
 .s-open { color: var(--open); } .s-merged { color: var(--merged); } .s-closed { color: var(--closed); }
 .empty { color: var(--muted); }
+.needs { margin: 0 0 16px; padding: 10px 12px; border: 1px solid var(--ask); border-radius: 6px; }
+.needs h2 { font-size: 15px; margin: 0 0 6px; color: var(--ask); }
+.needs ul { margin: 0; padding-left: 18px; } .needs li { margin: 6px 0; }
+.ask { white-space: pre-wrap; margin: 2px 0 0; }
+tr.asks td:first-child { box-shadow: inset 3px 0 0 var(--ask); }
+.badge { color: var(--ask); font-size: 11px; font-weight: 600; margin-left: 6px; white-space: nowrap; }
 """
 
 # Click a column header to sort by it; a second click reverses. Values sort as text (ISO times included).
@@ -771,12 +880,16 @@ def _esc(value) -> str:
     return html.escape("" if value is None else str(value), quote=True)
 
 
+def _is_http(url) -> bool:
+    try:
+        return isinstance(url, str) and urlparse(url).scheme in ("http", "https") and bool(urlparse(url).netloc)
+    except ValueError:
+        return False
+
+
 def _link(url, label: str) -> str:
     """An anchor for an http(s) url; anything else is the escaped label alone."""
-    try:
-        ok = isinstance(url, str) and urlparse(url).scheme in ("http", "https") and bool(urlparse(url).netloc)
-    except ValueError:
-        ok = False
+    ok = _is_http(url)
     return f'<a href="{_esc(url)}" rel="noopener noreferrer">{_esc(label)}</a>' if ok else _esc(label)
 
 
@@ -786,17 +899,49 @@ def tracker_order(rows: Iterable[dict]) -> List[dict]:
     return sorted(by_time, key=lambda r: r.get("state") != "open")
 
 
+def _about(r: dict) -> str:
+    """What the PR is about: the agent's --about, else the PR title the runner saw."""
+    for k in ("about", "title"):
+        v = r.get(k)
+        if isinstance(v, str) and v.strip():
+            return v
+    return ""
+
+
+def _about_cell(r: dict) -> str:
+    full = _about(r)
+    shown = full if len(full) <= ABOUT_SHOWN else full[:ABOUT_SHOWN - 1].rstrip() + "\u2026"
+    return f'<span title="{_esc(full)}">{_esc(shown)}</span>' if full else ""
+
+
+def _needs_panel(rows: List[dict]) -> str:
+    asking = [r for r in rows if isinstance(r.get("ask"), str) and r["ask"].strip()]
+    if not asking:
+        return ""
+    items = []
+    for r in asking:
+        label = f"{r.get('repo', '')}#{r.get('number', '')}"
+        about = _about(r)
+        items.append(f"<li>{_link(r.get('link'), label)}" + (f" &middot; {_esc(about)}" if about else "")
+                     + f"<p class=\"ask\">{_esc(r['ask'])}</p></li>")
+    return (f'<section class="needs" aria-label="Needs you"><h2>Needs you ({len(asking)})</h2>\n<ul>\n'
+            + "\n".join(items) + "\n</ul></section>\n")
+
+
 def render_tracker(rows: Iterable[dict], title: str, now: str) -> str:
     """A self-contained HTML page of the tracked PRs; every value is escaped."""
     body = []
-    for r in tracker_order(rows):
+    ordered = tracker_order(rows)
+    for r in ordered:
         label = f"{r.get('repo', '')}#{r.get('number', '')}"
         state = str(r.get("state") or "")
         cls = f' class="s-{state}"' if state in TRACK_STATES else ""
-        cells = [_link(r.get("link"), label), _esc(r.get("author")), f"<span{cls}>{_esc(state)}</span>",
+        asks = isinstance(r.get("ask"), str) and bool(r["ask"].strip())
+        pr_cell = _link(r.get("link"), label) + ('<span class="badge">needs you</span>' if asks else "")
+        cells = [pr_cell, _about_cell(r), _esc(r.get("author")), f"<span{cls}>{_esc(state)}</span>",
                  f"<code>{_esc(r.get('head'))}</code>", _esc(r.get("verdict")), _esc(r.get("event")),
                  _esc(r.get("updated_at"))]
-        body.append("<tr>" + "".join(f"<td>{c}</td>" for c in cells) + "</tr>")
+        body.append(("<tr class=\"asks\">" if asks else "<tr>") + "".join(f"<td>{c}</td>" for c in cells) + "</tr>")
     if not body:
         body.append(f'<tr><td class="empty" colspan="{len(COLUMNS)}">No pull requests tracked yet.</td></tr>')
     head = "".join(f"<th><button type=\"button\">{_esc(c)}</button></th>" for c in COLUMNS)
@@ -806,6 +951,7 @@ def render_tracker(rows: Iterable[dict], title: str, now: str) -> str:
             f"<title>{_esc(title)}</title>\n<style>{TRACKER_CSS}</style>\n</head>\n<body>\n"
             f"<h1>{_esc(title)}</h1>\n"
             f"<p class=\"note\">Generated by pr-watch; edits here are overwritten. Updated {_esc(now)}.</p>\n"
+            + _needs_panel(ordered) +
             f"<div class=\"wrap\"><table>\n<thead><tr>{head}</tr></thead>\n<tbody>\n"
             + "\n".join(body) + f"\n</tbody>\n</table></div>\n<script>{TRACKER_JS}</script>\n</body>\n</html>\n")
 
@@ -840,10 +986,22 @@ def _commons_json(script: Path, args: List[str]):
         raise PublishError(f"{_verb(args)} printed no JSON")
 
 
-def publish_tracker(st: State, data: dict, room: str, title: str, script: Path) -> str:
-    """Write the whole tracker page into the room, creating it when it is missing."""
-    page = render_tracker(data.get("rows", {}).values(), title, _now())
+def recorded_kind(data: dict, room: str) -> Optional[str]:
     kind = data.get("page_kind") if data.get("page_room") == room else None
+    return kind if isinstance(kind, str) and PAGE_KIND_RE.match(kind) else None
+
+
+def hand_back(st: State, page: str, data: dict, room: str, title: str) -> str:
+    """Write the page for the session to publish with its own room tools; the line that asks it to."""
+    write_text_atomic(st.tracker_html, page)
+    kind = recorded_kind(data, room) or "new"
+    return (f"{PUBLISH_MARK}room={room} kind={kind} path={json.dumps(str(st.tracker_html))} "
+            f"title={json.dumps(title)}")
+
+
+def publish_tracker(st: State, data: dict, room: str, title: str, script: Path, page: str) -> str:
+    """Write the whole tracker page into the room, creating it when it is missing."""
+    kind = recorded_kind(data, room)
     if kind:
         listed = _commons_json(script, ["--json", "pages", room])
         if not isinstance(listed, list):
@@ -856,7 +1014,7 @@ def publish_tracker(st: State, data: dict, room: str, title: str, script: Path) 
         if not isinstance(kind, str) or not PAGE_KIND_RE.match(kind):
             raise PublishError(f"page-add returned no html page kind: {str(made)[:80]}")
         data["page_kind"], data["page_room"] = kind, room
-        write_json(st.tracker, data)
+        update_tracker(st, lambda d: d.update(page_kind=kind, page_room=room))
     got = _commons_json(script, ["--json", "--kind", kind, "read", room])
     current = got.get("text") if isinstance(got, dict) else None
     if not isinstance(current, str):
@@ -871,37 +1029,73 @@ def cmd_track(st: State, args: argparse.Namespace) -> int:
     if not m:
         raise SystemExit(f"pr-watch: --pr must be OWNER/REPO#N, got {args.pr!r}")
     repo, number = m.group(1), int(m.group(2))
+    if args.ask is not None and (not args.ask.strip() or len(args.ask) > ASK_MAX):
+        raise SystemExit(f"pr-watch: --ask must be 1 to {ASK_MAX} characters; use --ask-clear to remove one")
+    if args.about is not None and len(args.about) > ABOUT_MAX:
+        raise SystemExit(f"pr-watch: --about must be at most {ABOUT_MAX} characters")
     if args.author and not LOGIN_RE.match(args.author):
         raise SystemExit(f"pr-watch: not a GitHub login: {args.author!r}")
+    mode = publish_mode(st)
     st.ensure()
-    data = read_json(st.tracker, {})
-    if not isinstance(data, dict):
-        raise SystemExit(f"pr-watch: {st.tracker} is not a JSON object")
-    rows = data.setdefault("rows", {})
     key = f"{repo}#{number}"
-    row = rows.get(key) or {"repo": repo, "number": number, "link": f"https://github.com/{repo}/pull/{number}"}
-    for field in ("author", "state", "head", "verdict", "event", "link"):
-        value = getattr(args, field)
-        if value is not None:
-            row[field] = value
-    row["updated_at"] = _now()
-    rows[key] = row
-    write_json(st.tracker, data)
+
+    def change(data: dict) -> None:
+        rows = data.setdefault("rows", {})
+        row = rows.get(key) or {"repo": repo, "number": number,
+                                "link": f"https://github.com/{repo}/pull/{number}"}
+        for field in ("author", "state", "head", "verdict", "event", "link", "about", "ask"):
+            value = getattr(args, field)
+            if value is not None:
+                row[field] = value
+        if args.ask_clear:
+            row.pop("ask", None)
+        settle(row)
+        row["updated_at"] = _now()
+        rows[key] = row
+
+    data = update_tracker(st, change)
+    rows = data["rows"]
     room = setting("PR_WATCH_TRACKER_ROOM", args.room, st)
     if not room:
         print(f"recorded {key}; no tracker room set (PR_WATCH_TRACKER_ROOM), so nothing was published")
         return 0
+    title = setting("PR_WATCH_TRACKER_TITLE", args.title, st) or "PR watch"
+    page = render_tracker(rows.values(), title, _now())
+    if mode == "session":
+        print(f"recorded {key}; publish the tracker page with your room tools ({len(rows)} PRs)")
+        print(hand_back(st, page, data, room, title))
+        return 0
     script = commons_script(st)
     if not script.is_file():
         print(f"{NOTE_MARK}tracker publish skipped: no room-commons script at {script} (PR_WATCH_COMMONS_SCRIPT)")
+        print(hand_back(st, page, data, room, title))
         return 0
-    title = setting("PR_WATCH_TRACKER_TITLE", args.title, st) or "PR watch"
     try:
-        kind = publish_tracker(st, data, room, title, script)
+        kind = publish_tracker(st, data, room, title, script, page)
     except PublishError as exc:
-        print(f"{NOTE_MARK}tracker publish failed: {str(exc)[:200]}; recorded {key}, the next track republishes")
+        print(f"{NOTE_MARK}tracker publish failed: {str(exc)[:200]}; recorded {key}, "
+              "publish it with your room tools")
+        print(hand_back(st, page, data, room, title))
         return 0
     print(f"recorded {key}; tracker published to {room} --kind {kind} ({len(rows)} PRs)")
+    return 0
+
+
+def publish_mode(st: State) -> str:
+    mode = setting("PR_WATCH_TRACKER_PUBLISH", st=st) or "cli"
+    if mode not in PUBLISH_MODES:
+        raise SystemExit(f"pr-watch: PR_WATCH_TRACKER_PUBLISH must be one of {', '.join(PUBLISH_MODES)}, "
+                         f"got {mode!r}")
+    return mode
+
+
+def cmd_tracker_kind(st: State, kind: str, room: str) -> int:
+    if not PAGE_KIND_RE.match(kind):
+        raise SystemExit(f"pr-watch: --kind must be an html-<id> page kind, got {kind!r}")
+    if not room.strip() or any(c.isspace() for c in room):
+        raise SystemExit(f"pr-watch: --room must be a room id, got {room!r}")
+    update_tracker(st, lambda d: d.update(page_kind=kind, page_room=room))
+    print(f"tracker page for {room} is --kind {kind}")
     return 0
 
 
@@ -1008,8 +1202,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     t.add_argument("--verdict", choices=TRACK_VERDICTS)
     t.add_argument("--event", help="what happened, in a few words")
     t.add_argument("--link")
+    t.add_argument("--about", help="what the PR is about; overrides the PR title the runner saw")
+    asked = t.add_mutually_exclusive_group()
+    asked.add_argument("--ask", help=f"what the owner must decide: question, recommendation, options "
+                                     f"(at most {ASK_MAX} characters); shown under Needs you")
+    asked.add_argument("--ask-clear", action="store_true", help="remove the PR's ask")
     t.add_argument("--room", help="override PR_WATCH_TRACKER_ROOM")
     t.add_argument("--title", help="override PR_WATCH_TRACKER_TITLE")
+    tk = sub.add_parser("tracker-kind")
+    tk.add_argument("--kind", required=True, help="the html-<id> kind the session published to")
+    tk.add_argument("--room", required=True)
     sub.add_parser("run")
     args = ap.parse_args(argv)
     st = State(resolve_state_dir(args.state_dir))
@@ -1044,6 +1246,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         return cmd_config(st, args.action, args.key, args.value)
     if args.cmd == "track":
         return cmd_track(st, args)
+    if args.cmd == "tracker-kind":
+        return cmd_tracker_kind(st, args.kind, args.room)
     return cmd_run(st)
 
 

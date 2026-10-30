@@ -5,7 +5,7 @@
   "license": "MIT",
   "stability": "experimental",
   "access_tier": "owner",
-  "description": "Event-driven GitHub PR watching: a Claude Code mod runs `gh webhook forward` per watched repo and turns each relevant pull_request / pull_request_review event into a session turn, with no polling and no Monitor expiry. Opt-in: the mod is installed into a dev-mods folder by `pr_watch.py install-mod`, never auto-loaded. Its settings are declared in `config` (read CLI > env > manifest > state config.json); `track` keeps an optional HTML tracker page in a configured Commons room.",
+  "description": "Event-driven GitHub PR watching: a Claude Code mod runs `gh webhook forward` per watched repo and turns each relevant pull_request / pull_request_review event into a session turn, with no polling and no Monitor expiry. Opt-in: the mod is installed into a dev-mods folder by `pr_watch.py install-mod`, never auto-loaded. Its settings are declared in `config` (read CLI > env > manifest > state config.json); `track` keeps an optional HTML tracker page in a configured Commons room, handing the page back to the session to publish with its own room tools when the room-commons CLI cannot (or PR_WATCH_TRACKER_PUBLISH=session); the runner keeps each event's PR row current.",
   "permissions": {
     "network": true,
     "filesystem": "read-write",
@@ -15,7 +15,8 @@
     "PR_WATCH_PROMPT": "[pr-watch] {event}\nStanding ask from the owner: keep watching these pull requests. If the head moved, re-review at the new head. If a review was requested from the owner, review it. Note merges and closes. Tell the owner only when something needs them; otherwise finish quietly.{track}",
     "PR_WATCH_TRACKER_ROOM": "",
     "PR_WATCH_TRACKER_TITLE": "PR watch",
-    "PR_WATCH_COMMONS_SCRIPT": "skills/room-commons/scripts/room_commons.py"
+    "PR_WATCH_COMMONS_SCRIPT": "skills/room-commons/scripts/room_commons.py",
+    "PR_WATCH_TRACKER_PUBLISH": ""
   },
   "provenance": {
     "source_repo": "https://github.com/sonichi/sutando"

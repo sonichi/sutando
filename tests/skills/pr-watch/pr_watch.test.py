@@ -2,7 +2,8 @@
 """skills/pr-watch/scripts/pr_watch.py: the watch-config CLI, the event filter over fixture
 payloads for each forwarded event type, the JSON stream splitter, the hook-id record (only
 recorded ids are ever deleted, through a fake `gh` on PATH), install-mod's file placement, the
-settings precedence, the prompt template line, and the tracker (render, record, publish)."""
+settings precedence, the prompt template line, and the tracker (render, record, publish, the
+hand-back to the session, and the runner's row upsert)."""
 import contextlib
 import importlib.util
 import io
@@ -469,7 +470,7 @@ if a[:2] == ["webhook", "forward"]:
     with open(hooks, "a") as fh:
         fh.write("77\\n")
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
-    for name in os.environ["FAKE_GH_EMIT"].split():
+    for name in os.environ["FAKE_GH_EMIT"].split(os.pathsep):
         sys.stdout.write(open(name).read()); sys.stdout.flush()
     while True:
         time.sleep(0.2)
@@ -493,7 +494,7 @@ class Runner(_Tmp):
         self.cli("add", "--repo", "acme/widgets", "--author", "alice", "--me", "owner-me")
         env = {"PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}", "HOME": str(self.tmp),
                "FAKE_GH_LOG": str(self.log), "FAKE_GH_HOOKFILE": str(hookfile),
-               "FAKE_GH_EMIT": " ".join(str(FIXTURES / f"{n}.json") for n in emit)}
+               "FAKE_GH_EMIT": os.pathsep.join(str(FIXTURES / f"{n}.json") for n in emit)}
         script = REPO / "skills" / "pr-watch" / "scripts" / "pr_watch.py"
         self.proc = subprocess.Popen([sys.executable, str(script), "--state-dir", str(self.state), "run"],
                                      stdout=subprocess.PIPE, text=True, env=env)
@@ -563,7 +564,7 @@ if a[:2] == ["webhook", "forward"]:
         sys.stderr.write("HTTP 422: Hook already exists on this repository\\n"); sys.exit(1)
     with open(env["FAKE_GH_HOOKFILE"], "a") as fh:
         fh.write("77\\n")
-    for name in env.get("FAKE_GH_EMIT", "").split():
+    for name in filter(None, env.get("FAKE_GH_EMIT", "").split(os.pathsep)):
         sys.stdout.write(open(name).read()); sys.stdout.flush()
     time.sleep(float(env.get("FAKE_GH_HOLD", "3")))
     sys.exit(0)
@@ -585,7 +586,7 @@ class InProcess(_Tmp):
         self.hookfile = self.tmp / "hooks.txt"
         self.env = {"PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
                     "FAKE_GH_LOG": str(self.log), "FAKE_GH_HOOKFILE": str(self.hookfile),
-                    "FAKE_GH_EMIT": " ".join(str(FIXTURES / f"{n}.json") for n in
+                    "FAKE_GH_EMIT": os.pathsep.join(str(FIXTURES / f"{n}.json") for n in
                                              ("pull_request.labeled", "pull_request.opened"))}
         p = mock.patch.dict(os.environ, self.env)
         p.start()
@@ -611,6 +612,12 @@ class InProcess(_Tmp):
         self.assertEqual(self.calls("api -X DELETE"), ["api -X DELETE repos/acme/widgets/hooks/77"])
         self.assertEqual(json.loads(self.st.hooks.read_text()), {})
         self.assertEqual(json.loads(self.st.forwarders.read_text()), {})
+
+    def test_forward_once_upserts_the_row_of_each_emitted_event(self):
+        self.forward()
+        rows = json.loads(self.st.tracker.read_text())["rows"]
+        self.assertEqual(list(rows), ["acme/widgets#7"], "the labeled event emits nothing and adds no row")
+        self.assertEqual((rows["acme/widgets#7"]["state"], rows["acme/widgets#7"]["head"]), ("open", "a1b2c3d4"))
 
     def test_forwarder_asks_for_review_events_too(self):
         self.forward()
@@ -1024,6 +1031,9 @@ class TemplateLine(_Tmp):
         t = self.emitted()
         self.assertIn(pw.TRACK_HINT, t)
         self.assertNotIn("{track}", t)
+        for word in (pw.PUBLISH_MARK.strip(), "room.commons.pages.replace", "whole",
+                     "room.commons.pages.create", "tracker-kind", "--ask"):
+            self.assertIn(word, t)
 
     def test_env_overrides_the_template(self):
         os.environ["PR_WATCH_PROMPT"] = "custom {event}{track}"
@@ -1201,13 +1211,191 @@ class Tracker(_Tmp):
         os.environ["FAKE_COMMONS_FAIL"] = "page-add"
         rc, out, _ = self.track("--pr", "acme/widgets#7", "--author", "alice", "--state", "open")
         self.assertEqual(rc, 0)
-        self.assertEqual(out.strip(), "PR_WATCH_NOTE tracker publish failed: page-add exited 2: boom: no credential; "
-                                      "recorded acme/widgets#7, the next track republishes")
+        note, line = out.strip().splitlines()
+        self.assertEqual(note, "PR_WATCH_NOTE tracker publish failed: page-add exited 2: boom: no credential; "
+                               "recorded acme/widgets#7, publish it with your room tools")
+        self.assertTrue(line.startswith("PR_WATCH_PUBLISH room=!room:server kind=new "), line)
         self.assertIn("acme/widgets#7", self.data()["rows"])
         self.assertNotIn("page_kind", self.data())
         os.environ.pop("FAKE_COMMONS_FAIL")
         self.track("--pr", "acme/widgets#8", "--state", "open")
         self.assertIn("acme/widgets#7", self.page("html-p1"))
+
+    def handed_back(self, out):
+        line = out.strip().splitlines()[-1]
+        self.assertTrue(line.startswith(pw.PUBLISH_MARK), line)
+        room, kind, rest = line[len(pw.PUBLISH_MARK):].split(" ", 2)
+        path_part, title_part = rest.split(" title=")
+        self.assertTrue(path_part.startswith("path="))
+        return {"room": room[len("room="):], "kind": kind[len("kind="):],
+                "path": Path(json.loads(path_part[len("path="):])), "title": json.loads(title_part)}
+
+    def test_a_failed_publish_hands_the_page_back_to_the_session(self):
+        self.cli("config", "set", "PR_WATCH_TRACKER_ROOM", "!room:server")
+        os.environ["PR_WATCH_TRACKER_TITLE"] = "My PRs"
+        os.environ["FAKE_COMMONS_FAIL"] = "page-add"
+        rc, out, _ = self.track("--pr", "acme/widgets#7", "--author", "alice", "--state", "open")
+        self.assertEqual(rc, 0)
+        back = self.handed_back(out)
+        self.assertEqual(back, {"room": "!room:server", "kind": "new", "path": (self.state / "tracker.html").resolve(),
+                                "title": "My PRs"})
+        page = back["path"].read_text()
+        self.assertTrue(page.startswith("<!doctype html>"))
+        self.assertIn("acme/widgets#7", page)
+        self.assertEqual([p.name for p in self.state.iterdir() if p.name.endswith(".tmp")], [])
+        rc, out, _ = self.cli("tracker-kind", "--kind", "html-ab12cd34", "--room", "!room:server")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual((self.data()["page_kind"], self.data()["page_room"]), ("html-ab12cd34", "!room:server"))
+        self.assertIn("acme/widgets#7", self.data()["rows"])
+        os.environ["FAKE_COMMONS_FAIL"] = "pages"
+        rc, out, _ = self.track("--pr", "acme/widgets#8", "--state", "open")
+        self.assertEqual(self.handed_back(out)["kind"], "html-ab12cd34")
+        self.assertIn("acme/widgets#8", (self.state / "tracker.html").read_text())
+
+    def test_session_mode_never_runs_the_cli(self):
+        self.cli("config", "set", "PR_WATCH_TRACKER_ROOM", "!room:server")
+        rc, out, _ = self.cli("config", "set", "PR_WATCH_TRACKER_PUBLISH", "session")
+        self.assertEqual(rc, 0, out)
+        rc, out, _ = self.track("--pr", "acme/widgets#7", "--state", "open")
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.verbs(), [])
+        self.assertEqual(out.strip().splitlines()[0],
+                         "recorded acme/widgets#7; publish the tracker page with your room tools (1 PRs)")
+        self.assertEqual(self.handed_back(out)["kind"], "new")
+        self.cli("tracker-kind", "--kind", "html-p9", "--room", "!room:server")
+        rc, out, _ = self.track("--pr", "acme/widgets#7", "--room", "!other:server")
+        self.assertEqual(self.handed_back(out)["kind"], "new", "a page kind belongs to its room")
+        rc, out, _ = self.track("--pr", "acme/widgets#7")
+        self.assertEqual(self.handed_back(out)["kind"], "html-p9")
+        self.assertEqual(self.verbs(), [])
+
+    def test_a_bad_publish_mode_is_refused(self):
+        self.assertNotEqual(self.cli("config", "set", "PR_WATCH_TRACKER_PUBLISH", "nope")[0], 0)
+        os.environ["PR_WATCH_TRACKER_PUBLISH"] = "nope"
+        self.assertNotEqual(self.track("--pr", "acme/widgets#7")[0], 0)
+        self.assertFalse((self.state / "tracker.json").exists())
+
+    def test_tracker_kind_refuses_what_is_not_an_html_page_kind(self):
+        for kind in ("markdown-ab12cd34", "html", "html-a b", "db:d1"):
+            self.assertNotEqual(self.cli("tracker-kind", "--kind", kind, "--room", "!room:server")[0], 0, kind)
+        self.assertNotEqual(self.cli("tracker-kind", "--kind", "html-p1", "--room", "!a b")[0], 0)
+        self.assertFalse((self.state / "tracker.json").exists())
+
+    def test_a_missing_commons_script_hands_the_page_back(self):
+        self.cli("config", "set", "PR_WATCH_TRACKER_ROOM", "!room:server")
+        os.environ["PR_WATCH_COMMONS_SCRIPT"] = str(self.tmp / "nope.py")
+        rc, out, _ = self.track("--pr", "acme/widgets#7")
+        self.assertEqual(self.handed_back(out)["kind"], "new")
+
+    def test_the_runner_upsert_keeps_the_agents_verdict_and_event(self):
+        st = pw.State(self.state)
+        self.track("--pr", "acme/widgets#7", "--author", "alice", "--state", "open", "--head", "11111111",
+                   "--verdict", "approved", "--event", "reviewed at 11111111")
+        self.assertTrue(pw.upsert_from_payload(st, fixture("pull_request.closed_merged")))
+        row = self.data()["rows"]["acme/widgets#7"]
+        self.assertEqual(row, {
+            "repo": "acme/widgets", "number": 7, "link": "https://github.com/acme/widgets/pull/7",
+            "author": "alice", "state": "merged", "head": "0badc0de", "verdict": "approved",
+            "event": "reviewed at 11111111", "title": "x", "updated_at": "2026-01-01T00:00:01Z"})
+
+    def test_the_runner_upsert_creates_a_row_and_never_a_verdict(self):
+        st = pw.State(self.state)
+        payload = fixture("pull_request_review.submitted")
+        payload["pull_request"]["html_url"] = "https://github.com/acme/widgets/pull/7"
+        self.assertTrue(pw.upsert_from_payload(st, payload))
+        row = self.data()["rows"]["acme/widgets#7"]
+        self.assertEqual(row["state"], "open")
+        self.assertNotIn("verdict", row)
+        self.assertNotIn("event", row)
+        bad = fixture("pull_request.opened")
+        bad["pull_request"]["html_url"] = "javascript:alert(1)"
+        bad["pull_request"]["user"]["login"] = "<x>"
+        bad["pull_request"]["number"] = 9
+        pw.upsert_from_payload(st, bad)
+        row = self.data()["rows"]["acme/widgets#9"]
+        self.assertEqual(row["link"], "https://github.com/acme/widgets/pull/9")
+        self.assertNotIn("author", row)
+        self.assertFalse(pw.upsert_from_payload(st, {"repository": {"full_name": "acme/widgets"}}))
+
+    def test_concurrent_writers_lose_no_row(self):
+        st = pw.State(self.state)
+        payloads = []
+        for n in range(1, 21):
+            p = fixture("pull_request.opened")
+            p["pull_request"]["number"] = n
+            payloads.append(p)
+        patch = mock.patch.object(pw, "_now", return_value="2026-01-01T00:00:00Z")
+        patch.start()
+        self.addCleanup(patch.stop)
+        threads = [threading.Thread(target=pw.upsert_from_payload, args=(st, p)) for p in payloads]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(len(self.data()["rows"]), 20)
+
+    def test_about_comes_from_the_title_and_track_overrides_it(self):
+        st = pw.State(self.state)
+        payload = fixture("pull_request.opened")
+        payload["pull_request"]["title"] = "Add  <b>widgets</b>\n& more"
+        pw.upsert_from_payload(st, payload)
+        row = self.data()["rows"]["acme/widgets#7"]
+        self.assertEqual(row["title"], "Add <b>widgets</b> & more")
+        self.assertEqual(pw._about(row), "Add <b>widgets</b> & more")
+        self.track("--pr", "acme/widgets#7", "--about", "Widget support")
+        pw.upsert_from_payload(st, payload)
+        row = self.data()["rows"]["acme/widgets#7"]
+        self.assertEqual(pw._about(row), "Widget support", "a later event keeps the agent's --about")
+        self.assertNotEqual(self.track("--pr", "acme/widgets#7", "--about", "x" * (pw.ABOUT_MAX + 1))[0], 0)
+
+    def test_the_about_column_is_escaped_and_truncated_with_the_full_text_in_title(self):
+        long = "<i>" + "a" * 120 + '"x"'
+        out = pw.render_tracker([{"repo": "a/b", "number": 1, "title": long}], "PR watch", "now")
+        self.assertNotIn("<i>", out)
+        self.assertIn(f'title="{pw._esc(long)}"', out)
+        shown = out.split(f'title="{pw._esc(long)}">')[1].split("</span>")[0]
+        self.assertTrue(shown.endswith("\u2026"), shown)
+        self.assertLessEqual(len(shown), pw.ABOUT_SHOWN + 10)
+        self.assertLess(out.index("<button type=\"button\">PR</button>"), out.index(">About</button>"))
+        self.assertLess(out.index(">About</button>"), out.index(">Author</button>"))
+
+    def test_needs_you_panel_shows_each_ask_above_the_table_escaped(self):
+        rows = [{"repo": "a/b", "number": 1, "state": "open", "about": "Fix <x>",
+                 "link": "https://github.com/a/b/pull/1",
+                 "ask": "Merge now? I recommend yes.\nOptions: <script>bad()</script> merge / wait"},
+                {"repo": "a/b", "number": 2, "state": "open"}]
+        out = pw.render_tracker(rows, "PR watch", "now")
+        self.assertEqual(out.count("<script>"), 1, "only the page's own sort script")
+        self.assertIn("Needs you (1)", out)
+        panel = out[out.index('<section class="needs"'):out.index("</section>")]
+        self.assertLess(out.index("</section>"), out.index("<table>"))
+        self.assertIn('<a href="https://github.com/a/b/pull/1" rel="noopener noreferrer">a/b#1</a>', panel)
+        self.assertIn("Fix &lt;x&gt;", panel)
+        self.assertIn("Merge now? I recommend yes.\nOptions: &lt;script&gt;bad()&lt;/script&gt; merge / wait", panel)
+        self.assertNotIn("a/b#2", panel)
+        self.assertEqual(out.count('<tr class="asks">'), 1)
+        self.assertEqual(out.count('<span class="badge">needs you</span>'), 1)
+        self.assertNotIn('class="needs"', pw.render_tracker(rows[1:], "PR watch", "now"))
+
+    def test_an_ask_is_set_cleared_and_bounded(self):
+        self.track("--pr", "acme/widgets#7", "--state", "open", "--ask", "Merge? Recommend yes.")
+        self.assertEqual(self.data()["rows"]["acme/widgets#7"]["ask"], "Merge? Recommend yes.")
+        self.track("--pr", "acme/widgets#7", "--ask-clear")
+        self.assertNotIn("ask", self.data()["rows"]["acme/widgets#7"])
+        self.assertNotEqual(self.track("--pr", "acme/widgets#7", "--ask", "x" * (pw.ASK_MAX + 1))[0], 0)
+        self.assertNotEqual(self.track("--pr", "acme/widgets#7", "--ask", "  ")[0], 0)
+        self.assertNotEqual(self.track("--pr", "acme/widgets#7", "--ask", "a", "--ask-clear")[0], 0)
+
+    def test_an_ask_clears_when_the_pr_merges_or_closes(self):
+        st = pw.State(self.state)
+        self.track("--pr", "acme/widgets#7", "--state", "open", "--ask", "Merge?")
+        pw.upsert_from_payload(st, fixture("pull_request.synchronize"))
+        self.assertIn("ask", self.data()["rows"]["acme/widgets#7"], "an open PR keeps its ask")
+        pw.upsert_from_payload(st, fixture("pull_request.closed_merged"))
+        self.assertNotIn("ask", self.data()["rows"]["acme/widgets#7"])
+        self.track("--pr", "acme/widgets#8", "--state", "open", "--ask", "Close it?")
+        self.track("--pr", "acme/widgets#8", "--state", "closed")
+        self.assertNotIn("ask", self.data()["rows"]["acme/widgets#8"])
 
     def test_a_publish_that_times_out_is_a_note(self):
         self.cli("config", "set", "PR_WATCH_TRACKER_ROOM", "!room:server")
