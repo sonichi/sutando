@@ -3969,6 +3969,9 @@ class StartSparrow(Base):
             with mock.patch.object(hatch_cli, "_proc_stat", return_value=b""), \
                     mock.patch.object(hatch_cli.os, "kill", side_effect=kills):
                 self.assertEqual(hatch_cli.live_lock_holder(record), None if want else os.getpid(), kills)
+        # EPERM: a pid that exists but cannot be signalled is "cannot be told", never gone.
+        with mock.patch.object(hatch_cli.os, "kill", side_effect=PermissionError()):
+            self.assertFalse(hatch_cli.process_gone(os.getpid()))
 
     @unittest.skipUnless(Path("/proc/self/stat").exists(), "needs /proc")
     def test_a_real_zombie_counts_as_gone(self):
