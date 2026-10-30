@@ -257,7 +257,7 @@
    ],
    "status": "canonical",
    "canonical_for": "engine releases and workspace migration policy",
-   "last_verified": null
+   "last_verified": "2026-10-30"
   },
   "docs/remote-gateway-protocol.md": {
    "title": "Remote gateway protocol",

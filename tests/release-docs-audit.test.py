@@ -48,6 +48,36 @@ def run(root: Path) -> subprocess.CompletedProcess:
     )
 
 
+def git(root: Path, *args: str) -> None:
+    subprocess.run(
+        ["git", "-C", str(root), "-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid",
+         "-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false", *args],
+        capture_output=True, text=True, check=True,
+    )
+
+
+def write_feature_list(root: Path, revision: str) -> None:
+    path = root / "skills" / "tutorial" / "feature-list.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"schema_version": 1, "revision": revision, "steps": []}))
+
+
+def released_fixture(root: Path) -> None:
+    write_fixture(root)
+    write_feature_list(root, "tutorial.1")
+    (root / "src").mkdir()
+    (root / "src" / "app.py").write_text("print(1)\n")
+    git(root, "init", "-q")
+    git(root, "add", "-A")
+    git(root, "commit", "-qm", "release")
+    git(root, "tag", "-a", "v0.1.0", "-m", "v0.1.0")
+
+
+def commit_all(root: Path, message: str) -> None:
+    git(root, "add", "-A")
+    git(root, "commit", "-qm", message)
+
+
 def check(label: str, condition: bool, detail: str = "") -> None:
     if not condition:
         raise AssertionError(f"{label}: {detail}")
@@ -92,7 +122,33 @@ def main() -> int:
         result = run(root)
         check("invalid verification date fails", result.returncode == 1 and "last_verified" in result.stderr)
 
-    print("ALL PASS (5 checks)")
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        released_fixture(root)
+        (root / "src" / "app.py").write_text("print(2)\n")
+        commit_all(root, "user-facing change")
+        result = run(root)
+        check(
+            "user-facing change with unchanged feature-list revision warns, exit 0",
+            result.returncode == 0 and "WARN" in result.stderr and "feature-list.json" in result.stderr,
+            result.stderr,
+        )
+
+        write_feature_list(root, "tutorial.2")
+        commit_all(root, "bump tour")
+        result = run(root)
+        check("bumped feature-list revision clears the warning", "WARN" not in result.stderr, result.stderr)
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        released_fixture(root)
+        (root / "CONTRIBUTING.md").write_text("# Contributing\n")
+        commit_all(root, "contributor-only change")
+        result = run(root)
+        check("non-user-facing change does not warn", result.returncode == 0 and "WARN" not in result.stderr,
+              result.stderr)
+
+    print("ALL PASS (8 checks)")
     return 0
 
 

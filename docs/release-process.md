@@ -160,6 +160,7 @@ Soft gates (warn, don't block):
 
 - Open issues tagged `release-blocker` on this version's milestone.
 - `CHANGELOG-PENDING.md` shouldn't be empty (otherwise: why are we cutting?).
+- `skills/tutorial/feature-list.json`'s `revision` should change when user-facing files (`src/`, `skills/`, user-audience docs) changed since the last tag. The release curator updates the Getting started tour and bumps the revision, or records why nothing it shows changed. `skills/release/scripts/docs_audit.py` prints the warning.
 
 ### 4.3 Signed tag
 

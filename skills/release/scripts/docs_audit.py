@@ -4,6 +4,7 @@
 import argparse
 import json
 import re
+import subprocess
 import sys
 from datetime import date
 from pathlib import Path
@@ -15,6 +16,8 @@ LINK_RE = re.compile(r"!?\[[^\]]*\]\(([^)]+)\)")
 ALLOWED_AUDIENCES = {"users", "operators", "contributors", "maintainers", "agents"}
 ALLOWED_STATUSES = {"canonical", "active", "draft", "historical"}
 REQUIRED_METADATA = {"title", "audience", "status", "canonical_for", "last_verified"}
+FEATURE_LIST = "skills/tutorial/feature-list.json"
+USER_FACING_PREFIXES = ("src/", "skills/")
 
 
 def repo_root_from_script() -> Path:
@@ -156,6 +159,61 @@ def audit_catalog(repo: Path, expected: Set[str]) -> List[str]:
     return errors
 
 
+def git(repo: Path, *args: str) -> Optional[str]:
+    result = subprocess.run(
+        ["git", "-C", str(repo), *args], capture_output=True, text=True, check=False
+    )
+    return result.stdout if result.returncode == 0 else None
+
+
+def feature_list_revision(repo: Path, ref: str) -> Optional[str]:
+    blob = git(repo, "show", f"{ref}:{FEATURE_LIST}")
+    if blob is None:
+        return None
+    try:
+        return json.loads(blob).get("revision")
+    except (json.JSONDecodeError, AttributeError):
+        return None
+
+
+def user_facing_docs(repo: Path) -> Set[str]:
+    try:
+        documents = json.loads((repo / "docs" / "catalog.json").read_text(encoding="utf-8"))["documents"]
+    except (OSError, json.JSONDecodeError, KeyError, TypeError):
+        return {"README.md"}
+    users = {path for path, meta in documents.items()
+             if isinstance(meta, dict) and "users" in (meta.get("audience") or [])}
+    return users | {"README.md"}
+
+
+def audit_feature_list(repo: Path, since: Optional[str] = None) -> List[str]:
+    """Warn when user-facing paths changed since the last release tag but the tour's revision did not."""
+    repo = repo.resolve()
+    if since is None:
+        tag = git(repo, "describe", "--tags", "--abbrev=0", "--match", "v[0-9]*", "HEAD")
+        if not tag:
+            return []
+        since = tag.strip()
+    changed = git(repo, "diff", "--name-only", since, "HEAD")
+    if changed is None:
+        return [f"feature-list check skipped: cannot diff {since}..HEAD"]
+    docs = user_facing_docs(repo)
+    user_facing = sorted(
+        path for path in changed.splitlines()
+        if path != FEATURE_LIST and (path.startswith(USER_FACING_PREFIXES) or path in docs)
+    )
+    if not user_facing:
+        return []
+    old, new = feature_list_revision(repo, since), feature_list_revision(repo, "HEAD")
+    if old != new:
+        return []
+    return [
+        f"{FEATURE_LIST}: revision {new!r} unchanged since {since}, but {len(user_facing)} "
+        f"user-facing file(s) changed (e.g. {user_facing[0]}); update the Getting started tour "
+        "and bump its revision, or confirm nothing it shows changed"
+    ]
+
+
 def run(repo: Path) -> Tuple[List[str], int, int]:
     repo = repo.resolve()
     expected = docs_files(repo)
@@ -170,8 +228,11 @@ def run(repo: Path) -> Tuple[List[str], int, int]:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo-root", type=Path, default=repo_root_from_script())
+    parser.add_argument("--since", help="release ref to compare against (default: last v* tag)")
     args = parser.parse_args()
     errors, docs_count, checked_count = run(args.repo_root)
+    for warning in audit_feature_list(args.repo_root, args.since):
+        print(f"docs-audit: WARN: {warning}", file=sys.stderr)
     if errors:
         for error in errors:
             print(f"docs-audit: ERROR: {error}", file=sys.stderr)

@@ -43,6 +43,11 @@ an approved release PR.
    python3 skills/release/scripts/docs_audit.py
    ```
 
+   A `WARN` about `skills/tutorial/feature-list.json` means user-facing files
+   changed since the last tag but the Getting started tour's `revision` did
+   not. Whoever cuts the release updates that file's steps for what ships and
+   bumps `revision`, or records in the proposal why the tour is unaffected.
+
 6. Perform a docs-impact pass. For every user-visible or contract change,
    identify the canonical document in `docs/catalog.json`. Update that document,
    its `last_verified` date, README navigation when appropriate, migration or
