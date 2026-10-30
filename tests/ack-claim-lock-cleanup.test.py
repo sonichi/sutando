@@ -5,7 +5,7 @@
   b) a lock whose record still exists, or that is younger than retention, stays
   c) a lock another publisher holds survives
   d) a publisher that has opened the lock but not yet acquired it: cleanup waits for it, never
-     unlinks the inode under it, and removes the lock only after the publisher is done
+     unlinks the inode under it, and a later sweep removes the lock after the publisher is done
      CONTROL (d): without the directory lock, cleanup unlinks during that window and the
      publisher's inode check has to reopen
   e) the directory lock itself is never removed
@@ -81,6 +81,7 @@ def interleave(ws: Path, lock: Path):
     go.set()
     pub.join(10)
     cleaner.join(10)
+    assert not pub.is_alive() and not cleaner.is_alive(), "publisher or cleaner did not finish"
     return during, done, calls
 
 
@@ -112,10 +113,13 @@ def main() -> int:
 
     ws = ws_()
     lock = released_lock(ws)
+    now = os.stat(lock).st_mtime + 2 * RET
     (waited, intact), done, calls = interleave(ws, lock)
     check(not waited and intact, "d) cleanup waits while a publisher is between open and acquire; the inode stays")
-    check(done == [[f"lock:{lock.stem}"]] and not lock.exists() and len(calls) == 1,
-          f"d) once the publisher is done, cleanup removes the lock ({done}, {len(calls)} open(s))")
+    removed = ack_claim.prune_orphan_locks(ws, now, RET)
+    check(done in ([[]], [[f"lock:{lock.stem}"]]) and done[0] + removed == [f"lock:{lock.stem}"]
+          and not lock.exists() and len(calls) == 1,
+          f"d) a post-publisher sweep removes any lock skipped while held ({done}, {removed}, {len(calls)} open(s))")
 
     ws = ws_()
     lock = released_lock(ws)
