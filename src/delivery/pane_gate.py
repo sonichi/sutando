@@ -258,8 +258,10 @@ class Outcome:
     message: str
 
 
-def _prompt_glyph(raw: str, adapter: RuntimeAdapter) -> Optional[str]:
-    plain = _SGR.sub("", raw).lstrip(" \t")
+def _prompt_glyph(raw: str, adapter: RuntimeAdapter, allow_indent: bool = True) -> Optional[str]:
+    plain = _SGR.sub("", raw)
+    if allow_indent:
+        plain = plain.lstrip(" \t")
     return next((glyph for glyph in (adapter.glyph, *adapter.alternate_glyphs)
                  if plain.startswith(glyph)), None)
 
@@ -368,7 +370,7 @@ def composer_text(capture: str, adapter: RuntimeAdapter = CLAUDE) -> Optional[st
     if adapter.composer_requires_single_line:
         rows = capture.split("\n")
         start = next((i for i in range(len(rows) - 1, -1, -1)
-                      if _prompt_glyph(rows[i], adapter) is not None), None)
+                      if _prompt_glyph(rows[i], adapter, allow_indent=False) is not None), None)
         footer = next((i for i in range(len(rows) - 1, -1, -1) if rows[i].strip()), None)
         if (start is None or footer is None or footer <= start
                 or not adapter.idle_ready.search(_SGR.sub("", rows[footer]))):

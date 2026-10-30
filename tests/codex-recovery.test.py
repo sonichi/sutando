@@ -68,6 +68,7 @@ class RecoveryTests(unittest.TestCase):
         bodies = [prompt + " extra", prompt + " ", prompt + "\t", prompt + "\r",
                   prompt + "\v", prompt + "\x1b[2J", prompt + "\x1b[2m extra\x1b[0m",
                   prompt + "\n  user text", prompt + "\n\n",
+                  "unknown draft\n  › " + prompt, prompt + "\n  » " + prompt,
                   prompt + "\n" + footer, prompt + "\n  ⚠ 2 warnings · f2 to view",
                   "Sutando managed liveness check. Reply exactly READY. Do not use tools, read\n"
                   "  or write files, or send messages."]

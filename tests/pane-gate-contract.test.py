@@ -78,9 +78,10 @@ class PersonOnlyGates(unittest.TestCase):
 class GateEvidence(unittest.TestCase):
     def test_completed_recap_requires_completion_context(self):
         recap = "※ recap: if you typed X, press Enter there to send it."
-        pane = recap + "\nNothing needs you this round.\n❯ \n" + FOOTER
-        self.assertNotRegex(pg.gate_evidence(pane), pg.AWAIT_HINT)
-        self.assertEqual(state(pane, "claude"), "idle-ready")
+        for composer in ("❯ ", "  ❯ "):
+            pane = recap + "\nNothing needs you this round.\n" + composer + "\n" + FOOTER
+            self.assertNotRegex(pg.gate_evidence(pane), pg.AWAIT_HINT)
+            self.assertEqual(state(pane, "claude"), "idle-ready")
         self.assertIn(recap, pg.gate_evidence(recap + "\n❯ "))
 
     def test_unknown_dialog_evidence_survives_idle_chrome(self):
@@ -256,6 +257,13 @@ class CodexSingleLineComposer(unittest.TestCase):
         for capture in [f"› {self.PROMPT}", f"› {self.PROMPT}\n  unknown status",
                         f"› {self.PROMPT}\n\n{self.FOOTER}\n  unexpected row"]:
             self.assertIsNone(pg.composer_text(capture, pg.CODEX))
+
+    def test_indented_glyph_is_a_continuation_not_a_new_empty_or_exact_composer(self):
+        for prefix in ["unknown draft", self.PROMPT]:
+            for glyph in ["›", "»"]:
+                capture = f"› {prefix}\n  {glyph} {self.PROMPT}\n\n{self.FOOTER}\n"
+                self.assertIsNone(pg.composer_text(capture, pg.CODEX))
+        self.assertIsNone(pg.composer_text(f"  › {self.PROMPT}\n{self.FOOTER}\n", pg.CODEX))
 
     def test_visible_spaces_and_control_bytes_are_never_folded_into_a_match(self):
         for suffix in [" ", " extra", "\t", "\r", "\v", "\x1f", "\x1b[2J", "\x1b[2m extra\x1b[0m"]:
