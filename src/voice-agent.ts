@@ -91,6 +91,7 @@ import {
 import {
 	createAgentStateProvider,
 	createIsolatedIdleRestore,
+	createVerifierHooks,
 	publishCapabilitiesMarker,
 	publishLifecycleSnapshot,
 	type AgentStateV1,
@@ -1146,11 +1147,7 @@ function whenSessionActive(s: VoiceSession): Promise<void> {
 			: {}),
 		// Step 11/12: when the pinned bodhi supports `?probe=1` probe
 		// interception, hand it the agent.state builder — probes get one
-		// frame + close 1000 without ever touching `this.client`. The Z3
-		// isolated idle-restore arms here too: a probe is the only
-		// probe-shaped hook this repo controls until bodhi exposes a
-		// dedicated probe/verifier-close callback (seam documented on
-		// `createIsolatedIdleRestore().arm`).
+		// frame + close 1000 without ever touching `this.client`.
 		...(bodhiSupportsProbeState
 			? {
 				probeState: (): AgentStateV1 => {
@@ -1160,6 +1157,18 @@ function whenSessionActive(s: VoiceSession): Promise<void> {
 				},
 			}
 			: {}),
+		// A `?verify=1` connection runs only these hooks, never the real-client attach.
+		...createVerifierHooks({
+			emitImmediate: () => emitAgentState({ immediate: true }),
+			sessionState: (): string => String(session.sessionManager.state),
+			wake: (): void => {
+				// The redial bodhi makes when a real client attaches to a parked session.
+				const { attemptEpoch } = session.recoverUpstream({ reason: 'human-retry', skipContextInjection: false, holdSyntheticUntilFreshSpeech: false });
+				console.log(`${ts()} [AgentState] verifier attached: redialing the parked upstream, attempt ${attemptEpoch}`);
+			},
+			armIdleRestore: () => probeIdleRestore.arm(),
+			log: (m) => console.error(`${ts()} ${m}`),
+		}),
 		hooks: {
 			onSessionStart: (e) => {
 				resetSessionGateState();
@@ -1241,8 +1250,8 @@ function whenSessionActive(s: VoiceSession): Promise<void> {
 	// =========================================================================
 	// `agent.state` emission + lifecycle snapshot (Step 12 + amendment A9).
 	// One emitter, three triggers: an immediate frame on every accepted real
-	// connection, a repeat frame on every upstream transition, and an atomic
-	// `state/voice-lifecycle.json` publish on every relevant transition
+	// or verifier connection, a repeat frame on every upstream transition, and
+	// an atomic `state/voice-lifecycle.json` publish on every relevant transition
 	// (client attach/detach, initialized flip, upstream change). This module
 	// is the ONLY writer of the lifecycle file (A9) — WS2's control consumer
 	// reads it cross-process.
@@ -1269,7 +1278,7 @@ function whenSessionActive(s: VoiceSession): Promise<void> {
 			console.error(`${ts()} [AgentState] frame send failed: ${(err as Error)?.message ?? err}`);
 		}
 	};
-	const emitAgentState = (opts: { immediate?: boolean } = {}): void => {
+	const emitAgentState = (opts: { immediate?: boolean } = {}): AgentStateV1 => {
 		const frame = buildAgentState();
 		// A transition includes reason/category changes within 'failed'
 		// (e.g. auth-invalid → quota-exceeded after a key rotation) — those
@@ -1295,6 +1304,7 @@ function whenSessionActive(s: VoiceSession): Promise<void> {
 				onError: (err) => console.error(`${ts()} [AgentState] lifecycle snapshot write failed: ${(err as Error)?.message ?? err}`),
 			});
 		}
+		return frame;
 	};
 	// Upstream transitions: bodhi's sessionManager publishes
 	// `session.stateChange` on every transitionTo() — the same seam the
