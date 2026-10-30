@@ -899,6 +899,67 @@ class CrashBoundaries(unittest.TestCase):
         self.assertRegex(row["body"], r"\*\*Sent:\*\* card hitl_\w+ for ag2space owner-dm")
         self.assertFalse(ask.asked_recently(row["body"], self.ws / "results"), "not a send: resurfaces")
 
+class CardRoom(unittest.TestCase):
+    """A card for a task from the owner's own AG2 Space DM is posted in, and answered from, that DM,
+    so the click returns to the session bound to it; any other origin keeps the default owner DM."""
+    DM = "!worker-dm:s.space"
+    OWNER = "@owner:s.space"
+
+    def _task(self, ws: Path, headers: str) -> str:
+        tf = ws / "tasks" / "task-1.txt"
+        tf.parent.mkdir(exist_ok=True)
+        tf.write_text("id: task-1\nsource: ag2space\n" + headers + "task: do the thing\n")
+        return str(tf)
+
+    def _card(self, task_headers=None):
+        ws = _ws("ag2space")
+        m = _manager(ws)
+        tf = self._task(ws, task_headers) if task_headers is not None else None
+        out = _ask("Merge #1?", task_file=tf, workspace=ws, host="h", default_action="merge it",
+                   options=OPTIONS, manager=m)
+        self.assertTrue(out["card"], out)
+        return out, m.get(out["card"]), m
+
+    def test_a_task_from_the_owners_dm_puts_the_card_in_that_dm(self):
+        out, req, _ = self._card(f"channel_id: {self.DM}\nchannel_kind: dm\naccess_tier: owner\n")
+        self.assertEqual(req.room, self.DM)
+        self.assertIn(self.DM, out["where"])
+        self.assertRegex(out["sent_line"], r"\*\*Sent:\*\* card hitl_\w+ for ag2space !worker-dm:s\.space")
+
+    def test_source_room_id_names_the_dm_too(self):
+        _, req, _ = self._card(f"source_room_id: {self.DM}\nchannel_kind: dm\naccess_tier: owner\n")
+        self.assertEqual(req.room, self.DM)
+
+    def test_without_a_task_file_the_card_has_no_room(self):
+        out, req, _ = self._card()
+        self.assertEqual(req.room, "")
+        self.assertIn("owner-dm", out["where"])
+
+    def test_a_shared_room_or_a_non_owner_task_falls_back_to_the_default_owner_dm(self):
+        for label, hdrs in (("shared room", f"channel_id: {self.DM}\nchannel_kind: room\naccess_tier: owner\n"),
+                            ("no dm evidence", f"channel_id: {self.DM}\naccess_tier: owner\n"),
+                            ("team tier", f"channel_id: {self.DM}\nchannel_kind: dm\naccess_tier: team\n")):
+            with self.subTest(label):
+                out, req, _ = self._card(hdrs)
+                self.assertEqual(req.room, "", "never a decision card in a room that is not the owner's DM")
+                self.assertIn("owner-dm", out["where"])
+
+    def test_a_click_from_the_cards_room_applies_and_turns_and_another_room_is_stale(self):
+        from hitl.replies import HitlReplyHandler
+        _, req, m = self._card(f"channel_id: {self.DM}\nchannel_kind: dm\naccess_tier: owner\n")
+        click = {"hitl_id": req.id, "expected_revision": req.revision, "action_id": "approve",
+                 "guard": req.guard}
+        handler = HitlReplyHandler(m, self.OWNER)
+        self.assertEqual(handler.offer_task({"id": "t-x", "channel_id": "!core-dm:s.space",
+                                             "user_id": self.OWNER, "hitl_action": dict(click)}), "rejected")
+        self.assertIn("another room", handler.last_reason)
+        self.assertIsNone(m.get(req.id).chosen_action)
+        self.assertEqual(handler.offer_task({"id": "t-y", "channel_id": self.DM,
+                                             "user_id": self.OWNER, "hitl_action": dict(click)}), "applied")
+        self.assertTrue(handler.last_turn, "the click goes on as a task in the card's room")
+        self.assertEqual(m.get(req.id).chosen_action, "approve")
+
+
 class EdgePaths(unittest.TestCase):
     def test_the_card_carries_the_row_link(self):
         msg = ask.card_message("Q?", None, "go", None, (), link="https://row.test.invalid/1")
