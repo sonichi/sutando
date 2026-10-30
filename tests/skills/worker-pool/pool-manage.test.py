@@ -276,6 +276,15 @@ class OwedBase(Base):
         code, targets, _ = handler.classify(self.ws, {"id": t, "requested_worker": WID})
         return {"code": code, "targets": targets}
 
+    def watcher_replay(self, t):
+        """What the core watcher's handler does with one task file, end to end."""
+        code, targets, roster = handler.classify(self.ws, {"id": t, "requested_worker": WID})
+        if code == 0:
+            out = router.route(self.ws, {"id": t, "requested_worker": WID}, roster)
+            if out.get("fenced") and not (out.get("delivered") or out.get("already")):
+                return handler.DECLINE
+        return code
+
     def assert_core_owns(self, t):
         self.assertIsNone(router.committed_recipient(self.ws, t))
         self.assertEqual(self.replay(t)["code"], handler.DECLINE)
@@ -345,12 +354,126 @@ class OwedDeliveries(OwedBase):
         self.assertTrue(td.has_ready_result(self.ws / "results", "task-a.txt"))
         self.assertEqual(self.replay("task-a")["code"], handler.DECLINE)
 
-    def test_hand_off_never_runs_while_a_session_cannot_be_confirmed_gone(self):
+    def test_a_failed_take_down_keeps_routing_closed_and_ownership_recoverable(self):
         self.tmux = lambda argv, **kw: subprocess.CompletedProcess(argv, 1, "", "server exited unexpectedly")
         rc, out = self.main("retire", WID, "--hand-off")
         self.assertEqual((rc, out["result"]), (1, "failed"))
-        self.assertEqual(self.row()["state"], "live")
+        # Routing stays closed: the fence is not lifted by the failure.
+        self.assertEqual(self.row()["state"], "retired")
+        (self.ws / "tasks" / "task-new.txt").write_text("id: task-new\ntask: hi\n")
+        self.assertEqual(self.watcher_replay("task-new"), handler.DECLINE)
+        self.assertIsNone(pdm.find(self.ws, WID, "task-new"))
+        # Owned work is not stranded: still the worker's, nothing withdrawn.
         self.assertEqual(router.committed_recipient(self.ws, "task-a"), WID)
+        self.assertEqual(pattr.worker_for_task(self.ws, "task-a"), WID)
+        # Recoverable: a retry with a working tmux finishes the hand-off.
+        self.tmux = FakeTmux()
+        rc, out = self.main("retire", WID, "--hand-off")
+        self.assertEqual((rc, out["result"], sorted(out["handed_off"])), (0, "retired", ["task-a", "task-p"]))
+        for t in ("task-a", "task-p"):
+            self.assert_core_owns(t)
+
+    def test_a_task_routed_during_teardown_is_never_committed_to_the_worker(self):
+        stale = pr.load_roster(self.ws)
+        real = pm.stop_sessions
+
+        def arrives(ws, wid, *, runner):
+            (self.ws / "tasks" / "task-new.txt").write_text("id: task-new\ntask: hi\n")
+            self.watcher_replay("task-new")
+            # A pass that read the roster before the fence, delivering now.
+            router.route(self.ws, {"id": "task-new", "requested_worker": WID}, stale)
+            return real(ws, wid, runner=runner)
+        with mock.patch.object(pm, "stop_sessions", arrives):
+            rc, out = self.main("retire", WID, "--hand-off")
+        self.assertEqual((rc, out["result"]), (0, "retired"))
+        self.assertIsNone(router.committed_recipient(self.ws, "task-new"))
+        self.assertIsNone(pdm.find(self.ws, WID, "task-new"))
+        self.assertIn("task-new.txt", self.core_queue())
+        for t in ("task-a", "task-p"):
+            self.assert_core_owns(t)
+
+    def test_a_replay_after_withdrawal_cannot_recommit_before_the_roster_transition(self):
+        real = pdm.hand_off_to_core
+
+        def then_replay(ws, wid):
+            moved = real(ws, wid)
+            for t in moved["handed_off"]:
+                self.watcher_replay(t)
+            return moved
+        with mock.patch.object(pdm, "hand_off_to_core", then_replay):
+            rc, out = self.main("retire", WID, "--hand-off")
+        self.assertEqual((rc, out["result"]), (0, "retired"))
+        for t in ("task-a", "task-p"):
+            self.assert_core_owns(t)
+
+    def test_a_route_with_a_pre_fence_roster_is_fenced_and_the_handler_declines(self):
+        stale = pr.load_roster(self.ws)
+        pr.set_worker_state(self.ws, WID, "retired", keep_bindings=True)
+        (self.ws / "tasks" / "task-new.txt").write_text("id: task-new\ntask: hi\n")
+        out = router.route(self.ws, {"id": "task-new", "requested_worker": WID}, stale)
+        self.assertEqual((out["fenced"], out["delivered"]), ([WID], []))
+        self.assertIsNone(pattr.worker_for_task(self.ws, "task-new"))
+        task = self.ws / "tasks" / "task-new.txt"
+        task.write_text(f"id: task-new\nrequested_worker: {WID}\ntask: hi\n")
+        with mock.patch.object(handler, "classify", return_value=(0, [WID], stale)):
+            rc = handler.main(["--task-file", str(task), "--workspace", str(self.ws)])
+        self.assertEqual(rc, handler.DECLINE)
+
+
+class TeardownArrival(OwedBase):
+    """The worker owes nothing when retire starts, so no owed-work snapshot can see the
+    task that arrives during teardown; only the fence keeps it off the worker."""
+
+    def setUp(self):
+        Base.setUp(self)
+        (self.ws / "tasks").mkdir()
+        (self.ws / "results").mkdir()
+
+    def retire_with_arrival(self, *flags):
+        stale = pr.load_roster(self.ws)
+        real = pm.stop_sessions
+
+        def arrives(ws, wid, *, runner):
+            (self.ws / "tasks" / "task-new.txt").write_text("id: task-new\ntask: hi\n")
+            self.watcher_replay("task-new")
+            router.route(self.ws, {"id": "task-new", "requested_worker": WID}, stale)
+            return real(ws, wid, runner=runner)
+        with mock.patch.object(pm, "stop_sessions", arrives):
+            return self.main("retire", WID, *flags)
+
+    def test_without_hand_off(self):
+        rc, out = self.retire_with_arrival()
+        self.assertEqual((rc, out["result"]), (0, "retired"))
+        self.assert_core_owns("task-new")
+
+    def test_with_hand_off(self):
+        rc, out = self.retire_with_arrival("--hand-off")
+        self.assertEqual((rc, out["result"]), (0, "retired"))
+        self.assert_core_owns("task-new")
+
+
+class FenceEdges(OwedBase):
+    def test_work_seen_only_after_the_fence_reopens_and_refuses_without_hand_off(self):
+        calls = iter([[], ["task-a"]])
+        with mock.patch.object(pm, "_outstanding", side_effect=lambda ws, w: next(calls)):
+            rc, out = self.main("retire", WID)
+        self.assertEqual((rc, out["result"]), (2, "refused"))
+        self.assertEqual(self.row()["state"], "live")
+        self.assertEqual(self.tmux.killed(), [])
+
+    def test_work_landing_after_teardown_without_hand_off_stays_owned_and_fenced(self):
+        calls = iter([[], [], ["task-a"]])
+        with mock.patch.object(pm, "_outstanding", side_effect=lambda ws, w: next(calls)):
+            rc, out = self.main("retire", WID)
+        self.assertEqual((rc, out["result"], out["owed_kept"]), (1, "failed", ["task-a"]))
+        self.assertEqual(self.row()["state"], "retired")
+        self.assertEqual(router.committed_recipient(self.ws, "task-a"), WID)
+
+    def test_delivery_refuses_when_the_roster_cannot_be_read(self):
+        (self.ws / "tasks" / "task-x.txt").write_text("id: task-x\ntask: hi\n")
+        (self.ws / "state" / "roster.json").write_text("{not json")
+        with self.assertRaises(router.UnreadableEvidence):
+            router.deliver_one(self.ws, WID, "task-x")
 
 
 class SelfTarget(Base):
@@ -363,13 +486,17 @@ class SelfTarget(Base):
 
 
 class RetireRollback(Base):
-    def test_a_failed_take_down_leaves_the_worker_live_and_bound(self):
+    def test_a_failed_take_down_leaves_bindings_and_routing_to_the_core(self):
         pr.bind_room(self.ws, "!room:example", WID)
         self.tmux = lambda argv, **kw: subprocess.CompletedProcess(argv, 1, "", "server exited unexpectedly")
         rc, out = self.main("retire", WID, "--unbind")
         self.assertEqual((rc, out["result"]), (1, "failed"))
-        self.assertEqual(self.row()["state"], "live")
+        self.assertEqual(self.row()["state"], "retired")
         self.assertEqual(pr.load_bindings(self.ws), {"!room:example": WID})
+        code, _, _ = handler.classify(self.ws, {"id": "t", "channel_id": "!room:example"})
+        self.assertEqual(code, handler.DECLINE)
+        rc, out = self.main("enable", WID, "--no-start")
+        self.assertEqual((rc, self.row()["state"]), (0, "live"))
 
 
 class EdgePaths(Base):

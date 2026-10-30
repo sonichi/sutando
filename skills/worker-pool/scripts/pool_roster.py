@@ -553,18 +553,27 @@ def _locked_worker(workspace, target: str):
     return raw, workers, wid
 
 
-def set_worker_state(workspace, target: str, state: str, *, unbind: bool = False
-                     ) -> "tuple[str, str, dict | None, list]":
+def is_retired(workspace, worker_id: str) -> bool:
+    """The retirement fence, read fresh from disk apart from any pass's roster snapshot.
+    An absent roster retired nobody; one present but unreadable raises RosterError."""
+    raw = _load_existing_roster_strict(workspace)
+    row = ((raw or {}).get("workers") or {}).get(worker_id)
+    return isinstance(row, dict) and row.get("state") == "retired"
+
+
+def set_worker_state(workspace, target: str, state: str, *, unbind: bool = False,
+                     keep_bindings: bool = False) -> "tuple[str, str, dict | None, list]":
     """Move one worker to `state` under the roster lock. Returns (worker id, old
     state, roster, unbound rooms), roster None on a no-op. Retiring a bound worker
-    is refused unless `unbind`, which drops its bindings in the same transaction."""
+    is refused unless `unbind`, which drops its bindings in the same transaction,
+    or `keep_bindings`: the router already sends a retired worker's rooms to the core."""
     if state not in STATES:
         raise RosterError(f"state must be one of {STATES}: {state!r}")
     with _locked(workspace):
         _, workers, wid = _locked_worker(workspace, target)
         old = workers[wid].get("state")
         bindings = dict(load_bindings(workspace))
-        rooms = rooms_bound_to(bindings, wid) if state == "retired" else []
+        rooms = rooms_bound_to(bindings, wid) if state == "retired" and not keep_bindings else []
         if old == state and not rooms:
             return wid, old, None, []
         if rooms and not unbind:

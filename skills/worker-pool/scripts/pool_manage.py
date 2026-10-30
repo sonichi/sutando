@@ -142,8 +142,6 @@ def stop(workspace, target, *, force=False, runner=subprocess.run) -> dict:
 
 
 def _hand_off(workspace, wid, owed, hand_off) -> dict:
-    if not owed:
-        return {"handed_off": [], "kept": {}}
     if not hand_off:
         raise Refused(f"{wid} still owes {len(owed)} task(s): {', '.join(owed)}; "
                       "pass --hand-off to give them to the core")
@@ -151,25 +149,40 @@ def _hand_off(workspace, wid, owed, hand_off) -> dict:
 
 
 def retire(workspace, target, *, unbind=False, hand_off=False, runner=subprocess.run) -> dict:
-    """Every refusal comes before any write; the take-down comes before the roster
-    changes, so a tmux failure leaves the worker live and bound, only paused."""
+    """Fence, then take down, then hand off, then drop bindings. The fence (roster state
+    `retired`, which the router re-checks under the delivery lock) comes first, so no
+    new or replayed task can commit to the worker once the owed set is read."""
     wid, _ = _worker(workspace, target)
     _not_self(wid, False)
     rooms = pr.rooms_bound_to(pr.load_bindings(workspace), wid)
     if rooms and not unbind:
         raise Refused(str(pr.WorkerBound(wid, rooms)) + " (or pass --unbind)")
+    if not hand_off and _outstanding(workspace, wid):
+        _hand_off(workspace, wid, _outstanding(workspace, wid), False)
+    _, old, _, _ = pr.set_worker_state(workspace, wid, "retired", keep_bindings=True)
     owed = _outstanding(workspace, wid)
     if owed and not hand_off:
+        # Nothing was taken down yet: reopening is the refusal, not a failure.
+        pr.set_worker_state(workspace, wid, old)
         _hand_off(workspace, wid, owed, False)
     t = _take_down(workspace, wid, runner)
-    base = {"worker_id": wid, "action": "retire", "paused": True,
+    base = {"worker_id": wid, "action": "retire", "paused": True, "previous_state": old,
             "sessions": t["sessions"], "closed_runs": t["closed_runs"]}
     if not t["down"]:
-        return {**base, "result": "failed", "why": "tmux could not confirm every session gone; "
-                "the worker is paused but still live, bound and owning its work"}
-    moved = _hand_off(workspace, wid, owed, hand_off)
-    _, old, _, unbound = pr.set_worker_state(workspace, wid, "retired", unbind=unbind)
-    return {**base, "result": "retired", "previous_state": old, "unbound": unbound,
+        return {**base, "result": "failed", "owed_kept": owed,
+                "why": "tmux could not confirm every session gone; the worker stays retired "
+                       "(routing closed) and paused, owning its work: re-run retire, or enable"}
+    if hand_off:
+        moved = pd.hand_off_to_core(Path(workspace), wid)
+    else:
+        late = _outstanding(workspace, wid)
+        if late:
+            return {**base, "result": "failed", "owed_kept": late,
+                    "why": "work arrived during retirement; the worker stays retired and "
+                           "paused, owning it: re-run retire --hand-off, or enable"}
+        moved = {"handed_off": [], "kept": {}}
+    _, _, _, unbound = pr.set_worker_state(workspace, wid, "retired", unbind=unbind)
+    return {**base, "result": "retired", "unbound": unbound,
             "handed_off": moved["handed_off"], "kept": moved["kept"]}
 
 
@@ -190,6 +203,7 @@ def enable(workspace, repo, target, *, start=True, runner=None, spawn=None) -> d
 
 
 def remove(workspace, target, *, hand_off=False, runner=subprocess.run) -> dict:
+    """A retired worker is already fenced, so its owed set cannot grow while this runs."""
     wid, row = _worker(workspace, target)
     if row.get("state") != "retired":
         raise Refused(f"worker {wid} is {row.get('state')!r}; retire it before removing it")
@@ -200,7 +214,7 @@ def remove(workspace, target, *, hand_off=False, runner=subprocess.run) -> dict:
     if not t["down"]:
         return {"worker_id": wid, "action": "remove", "result": "failed", "sessions": t["sessions"],
                 "why": "tmux could not confirm every session gone; the row was kept"}
-    moved = _hand_off(workspace, wid, owed, hand_off)
+    moved = pd.hand_off_to_core(Path(workspace), wid) if hand_off else {"handed_off": []}
     pr.remove_worker(workspace, wid)
     return {"worker_id": wid, "action": "remove", "result": "removed", "sessions": t["sessions"],
             "label": pr.display_label(row, wid), "handed_off": moved["handed_off"]}

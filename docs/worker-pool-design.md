@@ -271,7 +271,8 @@ Also: per-worker namespaced state, `.tmp-<worker>` staging, no-clobber archive.
 | `abandoned` | the core | release its `.accepted` sentinels back to `.txt` for the same worker |
 | `retired` | the owner (`pool_manage.py retire`) | not supervised or advertised; the router treats it as absent and sends its traffic to the core |
 
-The router reads `state` only to treat `retired` as absent from the roster. The other rows
+The router reads `state` only to treat `retired` as absent from the roster, and delivery
+re-checks it under the recipient's folder lock, so retirement fences routing before the hand-off. The other rows
 are the health-check's, and whatever marks a worker `abandoned` is the same process that
 recovers it. `pool_manage.py` is the owner's command for a worker's lifecycle: `stop`
 (the per-worker `paused` marker, then its sessions are killed), `retire`, `enable` and `remove`.

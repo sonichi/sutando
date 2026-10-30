@@ -212,17 +212,37 @@ def hand_off_to_core(workspace: Path, recipient: str) -> dict:
     withdrawn together, so a replay no longer follows the committed delivery and the
     core's queue (tasks/ minus held work) counts it as unprocessed. A task with a
     ready result is never moved: that reply is delivered as the worker's and the core
-    does not run it again. The caller must have confirmed the worker's session gone.
+    does not run it again. The caller must have retired the worker in the roster first
+    (the fence `pool_router.deliver_one` re-checks) and confirmed its session gone.
     Returns {"handed_off": [...], "kept": {task_id: residue state}}.
     """
+    ws = Path(workspace)
+    require_recipient(recipient)
+    out = {"handed_off": [], "kept": {}}
+    # A pass that began before the fence can still land one sentinel; the lock-held
+    # listing at the end of each pass is authoritative, so repeat until it is empty.
+    while True:
+        left = _hand_off_pass(ws, recipient, out)
+        if not left:
+            return out
+
+
+def _owed_names(dfd: int) -> set:
+    names = set()
+    for name in os.listdir(dfd):
+        got = parse_sentinel(name)
+        if got is not None:
+            names.add(got[0])
+    return names
+
+
+def _hand_off_pass(ws: Path, recipient: str, out: dict) -> set:
+    """One locked pass; returns task ids sentinel'd here that this pass did not decide."""
     import pool_attribution
     import pool_router
 
-    ws = Path(workspace)
-    require_recipient(recipient)
     task_ids = sorted({parse_sentinel(p.name)[0] for p in accepted(ws, recipient) + pending(ws, recipient)
-                       if is_regular_file(p)})
-    out = {"handed_off": [], "kept": {}}
+                       if is_regular_file(p)} - set(out["kept"]))
     # Same order as reconcile_interrupted: task locks, then the folder lock.
     with contextlib.ExitStack() as locks:
         for task_id in task_ids:
@@ -240,7 +260,7 @@ def hand_off_to_core(workspace: Path, recipient: str) -> dict:
                 _withdraw_locked(ws, recipient, task_id, dfd)
                 pool_attribution.revoke(ws, task_id, recipient)
                 out["handed_off"].append(task_id)
-    return out
+            return _owed_names(dfd) - set(out["kept"]) - set(task_ids)
 
 
 def writer_path() -> Path:
