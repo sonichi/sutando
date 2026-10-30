@@ -3958,6 +3958,18 @@ class StartSparrow(Base):
                 self.assertEqual(hatch_cli.live_lock_holder(record), want, state)
                 self.assertEqual(hatch_cli.process_gone(os.getpid()), want is None, state)
 
+    def test_a_holder_reaped_between_the_probe_and_the_stat_read_is_gone(self):
+        # Its parent reaps the zombie after kill(0) answers and before /proc/<pid>/stat is read.
+        record = {"pid": os.getpid(), "heartbeat_at": int(time.time()),
+                  "host": hatch_cli.workspace_lock._host_label()}
+        for kills, want in (([None, ProcessLookupError()], True), ([None, None], False)):
+            with mock.patch.object(hatch_cli, "_proc_stat", return_value=b""), \
+                    mock.patch.object(hatch_cli.os, "kill", side_effect=kills):
+                self.assertEqual(hatch_cli.process_gone(os.getpid()), want, kills)
+            with mock.patch.object(hatch_cli, "_proc_stat", return_value=b""), \
+                    mock.patch.object(hatch_cli.os, "kill", side_effect=kills):
+                self.assertEqual(hatch_cli.live_lock_holder(record), None if want else os.getpid(), kills)
+
     @unittest.skipUnless(Path("/proc/self/stat").exists(), "needs /proc")
     def test_a_real_zombie_counts_as_gone(self):
         proc = subprocess.Popen([sys.executable, "-c", "pass"])

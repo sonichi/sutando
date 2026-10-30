@@ -530,18 +530,29 @@ def _proc_stat(pid: int) -> bytes:
         return b""
 
 
+def _pid_answers(pid: int) -> "bool | None":
+    """True while `pid` answers signal 0, False once no process has it, None when that cannot be told."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except (OSError, OverflowError):
+        return None
+    return True
+
+
 def process_gone(pid: int) -> bool:
     """Whether `pid` has exited, a zombie included; False when that cannot be told. A pid outside
     `outbox.valid_pid` is gone: no process can own it."""
     if outbox.valid_pid(pid) is None:
         return True
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return True
-    except (OSError, OverflowError):
-        return False
+    answers = _pid_answers(pid)
+    if answers is not True:
+        return answers is False
     stat = _proc_stat(pid)
+    if not stat:
+        # A zombie reaped between the probe and the read leaves no stat; a host without /proc does too.
+        return _pid_answers(pid) is False
     return stat[stat.rfind(b")") + 1:].split()[:1] == [b"Z"]
 
 
