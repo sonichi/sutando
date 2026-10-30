@@ -197,6 +197,47 @@ class TaskRelayClickTests(unittest.TestCase):
             rgb._handle_hitl_action(self._task(hitl_action=dict(t["hitl_action"])))
         self.assertEqual(len(reads), 1, "the registry is read once within the TTL")
 
+    def test_unset_variable_owner_label_reply_to_the_card_is_applied(self):
+        """The desktop shape: no SPARROW_HA_OWNER, and the owner answers by replying to the card."""
+        os.environ.pop("SPARROW_HA_OWNER", None)
+        self.mgr.record_projection(self.req.id, self.req.revision, "$card-desktop")
+        with self._registry(OWNER):
+            out = rgb._handle_hitl_action(self._task(access_tier="owner", reply_to_event="$card-desktop",
+                                                     task="Allow"))
+        self.assertEqual(out, "applied")
+        self.assertEqual(self._on_disk().chosen_action, "allow")
+
+    def test_unset_variable_non_owner_identical_reply_is_not_applied(self):
+        os.environ.pop("SPARROW_HA_OWNER", None)
+        self.mgr.record_projection(self.req.id, self.req.revision, "$card-desktop-other")
+        with self._registry(OWNER):
+            out = rgb._handle_hitl_action(self._task(user_id="@someone-else:ag2.space", access_tier="owner",
+                                                     reply_to_event="$card-desktop-other", task="Allow"))
+        self.assertIs(out, False, "a non-owner's typed label stays a message")
+        self.assertIsNone(self._on_disk().chosen_action)
+
+    def test_registry_owner_on_another_homeserver_is_never_the_owner(self):
+        os.environ.pop("SPARROW_HA_OWNER", None)
+        with self._registry("@owner:elsewhere.example"):
+            click = self._task(user_id="@owner:elsewhere.example",
+                               hitl_action={"hitl_id": self.req.id, "expected_revision": self.req.revision,
+                                            "action_id": "allow", "guard": self.req.guard})
+            self.assertIs(rgb._handle_hitl_action(click), False)
+        self.assertIsNone(self._on_disk().chosen_action)
+
+    def test_event_channel_claimant_acts_on_the_owner_it_claimed_with(self):
+        """A refresh between claims() and offer() must not re-judge the owner's own click."""
+        os.environ.pop("SPARROW_HA_OWNER", None)
+        claimant = rgb._HitlClicks(rgb._hitl_reply_handler("", log=lambda m: None), log=lambda m: None)
+        e = {"type": "message.created", "event_id": "$claimed", "room_id": "!dm:ag2.space", "actor_id": OWNER,
+             "content": {"space.ag2.hitl.action": {"hitl_id": self.req.id, "expected_revision": self.req.revision,
+                                                   "action_id": "allow", "guard": self.req.guard}}}
+        with self._registry(OWNER):
+            self.assertTrue(claimant.claims(e))
+        with mock.patch.object(rgb, "_hitl_owner", lambda: ""):
+            claimant.offer(e)
+        self.assertEqual(self._on_disk().chosen_action, "allow")
+
     def test_registry_owner_does_not_let_a_non_owner_resolve(self):
         os.environ.pop("SPARROW_HA_OWNER", None)
         with self._registry(OWNER):
@@ -547,12 +588,14 @@ class EventChannelWiringTests(unittest.TestCase):
         self.assertIsInstance(self._chain(handler)[0], DecisionHandler)
         self.assertEqual(posters, [])
 
-    def test_unset_owner_wires_only_the_hitl_claimant(self):
+    def test_unset_owner_wires_only_the_hitl_claimants(self):
         from ag2_sparrow.event_consumer import TaskifyHandler
         os.environ.pop("SPARROW_HA_OWNER", None)
         os.environ["SPARROW_HA_ROOM"] = "!cards:ag2.space"
         handler, posters = self._wire()
-        self.assertEqual([type(h) for h in self._chain(handler)], [rgb._HitlClicks, TaskifyHandler])
+        chain = self._chain(handler)
+        self.assertEqual([type(h) for h in chain], [rgb._ClaudeLocalClicks, rgb._HitlClicks, TaskifyHandler])
+        self.assertIsNone(chain[0].owner, "claude-local clicks read the owner at each click")
         self.assertEqual(posters, [], "no owner, no decision cards")
 
 

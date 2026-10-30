@@ -125,6 +125,16 @@ class LoaderVoiceRoomTests(_LoaderFixture):
         self.mod._VOICE_OWNER.update(mxid="", at=0.0, bad_at=None)
         return now
 
+    def test_owner_read_goes_through_the_shared_registry_parse(self):
+        """No local identity: no registry read, never the owner of a row keyed by ""."""
+        self._clock()
+        self.mod._reenroll_identity = lambda: ""
+        self.gw.req = lambda *a, **k: (self.gw.calls.append(a[:2]) or
+                                       {"agents": [{"id": "", "owner": "@other:example.org"}]})
+        self.mod._req = self.gw.req
+        self.assertEqual(self.mod._voice_room_owner(), "")
+        self.assertEqual(self._agents_reads(), 0)
+
     def test_owner_is_read_once_per_ttl_and_only_when_well_formed(self):
         now = self._clock()
         self.assertEqual(self.mod._voice_room_owner(), OWNER)

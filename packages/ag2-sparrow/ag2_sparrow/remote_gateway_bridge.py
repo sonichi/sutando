@@ -1800,18 +1800,22 @@ class _HitlClicks:
         self._probe = probe  # owner-less: used only to recognise a click's shape
         self._log = log
         self._handlers: dict = {}
+        self._claimed_owner = ""
         self.last_path = None
 
     def claims(self, event: dict) -> bool:
+        self._claimed_owner = ""
         if not self._probe.claims(event):
             return False
-        if _hitl_owner():
+        self._claimed_owner = _hitl_owner()
+        if self._claimed_owner:
             return True
         self._log(f"{_HITL_OWNER_UNKNOWN} ({event.get('event_id') or '?'})")
         return False
 
     def offer(self, event: dict) -> list:
-        owner = _hitl_owner()
+        # The owner read when the click was claimed: a refresh in between must not re-judge it.
+        owner = self._claimed_owner or _hitl_owner()
         handler = self._handlers.get(owner)
         if handler is None:
             handler = self._handlers[owner] = _hitl_reply_handler(owner, log=self._log)
@@ -1834,7 +1838,7 @@ def _claude_local_accepter():
 
 def _owner_dm_text(task: dict) -> bool:
     """The owner's own top-level, unquoted, unforwarded, unrelayed message in the projected owner DM."""
-    owner = os.environ.get("SPARROW_HA_OWNER") or ""
+    owner = _hitl_owner()
     uid = str(task.get("user_id") or "")
     if not owner or uid != owner:
         return False
@@ -1876,7 +1880,7 @@ def _handle_claude_local(task: dict):
             return f"rejected:{reply} stop cards are open; use the card's own button"
     else:
         return False
-    owner = os.environ.get("SPARROW_HA_OWNER") or ""
+    owner = _hitl_owner()
     uid = str(task.get("user_id") or "")
     owner_ok = bool(owner) and uid == owner and _tier_for(uid, _normalized_tier(task.get("access_tier"))) == "owner"
     try:
@@ -1919,7 +1923,8 @@ class _ClaudeLocalClicks:
     """An event-channel click on a claude-local card, claimed ahead of the default store's handler so
     it reaches the adapter's accepter and never the default store or taskify."""
 
-    def __init__(self, owner: str, log=print):
+    def __init__(self, owner: "str | None", log=print):
+        # None: the owner is _hitl_owner(), read at each click; "" never matches anyone.
         self.owner, self.log, self.last_path, self.last_outcome = owner, log, None, None
 
     @staticmethod
@@ -1944,7 +1949,8 @@ class _ClaudeLocalClicks:
             try:
                 reply = ActionReply.from_wire(dict(self._payload(event), room=str(event.get("room_id") or ""),
                                                    sender=actor))
-                problem = _click_owner_problem(self.owner, actor, event.get("access_tier"))
+                owner = _hitl_owner() if self.owner is None else self.owner
+                problem = _click_owner_problem(owner, actor, event.get("access_tier"))
                 self.last_outcome = (f"rejected:{problem}" if problem else
                                      accepter.accept(reply, state_dir=_STATE, log=self.log, owner_ok=True))
             except MalformedActionError as e:
@@ -8614,9 +8620,10 @@ def _maybe_start_event_channel() -> None:
         if ha_owner:
             from .human_action import ActionStore, CardPoster, DecisionHandler
             store = ActionStore(str(_STATE / "human-actions"))
-            claimants += [DecisionHandler(store, ha_owner, log=_log), _ClaudeLocalClicks(ha_owner, log=_log)]
-        # HITL card clicks ride an owner-only claimant ahead of taskify; its owner
-        # falls back to the registry, so it is wired whether or not ha_owner is set.
+            claimants.append(DecisionHandler(store, ha_owner, log=_log))
+        # HITL card clicks ride owner-only claimants ahead of taskify; their owner falls
+        # back to the registry (_hitl_owner), so they are wired whether or not ha_owner is set.
+        claimants.append(_ClaudeLocalClicks(ha_owner or None, log=_log))
         probe = _hitl_reply_handler("", log=_log)
         if probe is not None:
             claimants.append(_HitlClicks(probe, log=_log))
