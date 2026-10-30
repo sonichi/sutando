@@ -84,6 +84,13 @@ class CliTests(unittest.TestCase):
             self.assertNotIn("secret-alpha", stream)
             self.assertNotIn("secret-beta", stream)
 
+    def test_move_with_nothing_to_move_refuses_and_names_the_fallback(self):
+        proc = self.run_cli("move", "--dry-run")
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertIn("move refused: no_successor", proc.stderr)
+        self.assertIn("connections.py add '<code>'", proc.stdout)
+        self.assertFalse((self.ws / "state" / "connections.json").exists(), "a refusal writes nothing")
+
     def test_add_previews_then_asks(self):
         proc = self.run_cli("add", TOKEN_A, stdin="n\n")
         self.assertEqual(proc.returncode, 1, proc.stderr)
@@ -455,6 +462,31 @@ class InProcess(unittest.TestCase):
         self.assertEqual((rc, out), (0, "primary is now s-space (s.space); (legacy) keeps running as a secondary\n"))
         self.run_main(["promote", "s-space", "--park", *argv], promote=promote)
         self.assertEqual(seen, [False, True])
+
+    def test_move_prints_the_result_or_the_code_fallback(self):
+        seen = []
+
+        def moved(inst, **kw):
+            seen.append((inst, kw["dry_run"], kw["repo"]))
+            return {"ok": True, "instance": "s-space", "agent_mxid": "@a:s.space", "from": "", "dry_run": kw["dry_run"],
+                    "mcp": "repointed", "rooms": [{"twin": "!r:s.space", "error": None},
+                                                  {"twin": "!q:s.space", "error": "RosterError"}]}
+        rc, out, _ = self.run_main(["move", "--repo", "/r", "--logs-dir", "/l"], try_reuse_move=moved)
+        self.assertEqual((rc, out), (0, "moved (legacy) to s-space as @a:s.space; agent MCP: repointed; "
+                                        "rooms mirrored: 1 (1 refused: !q:s.space)\n"))
+        rc, out, _ = self.run_main(["move", "legacy", "--dry-run"], try_reuse_move=moved)
+        self.assertTrue(out.startswith("would move (legacy) to s-space"), out)
+        self.assertEqual([x[:2] for x in seen], [(None, False), ("", True)], "'legacy' names the legacy row")
+        rc, _, err = self.run_main(["move"], try_reuse_move=moved)
+        self.assertEqual(rc, 2)
+        self.assertIn("--repo and --logs-dir", err)
+        refused = lambda inst, **kw: {"ok": False, "reason": "auth_rejected", "detail": "s.space does not accept it",
+                                      "server": "s.space", "added": False}
+        rc, out, err = self.run_main(["move", "--dry-run"], try_reuse_move=refused)
+        self.assertEqual(rc, 1)
+        self.assertIn("move refused: auth_rejected (s.space does not accept it)", err)
+        self.assertEqual(out, "next: get a connect code at s.space's agent portal, then run "
+                              "python3 scripts/connections.py add '<code>'\n")
 
     def test_park_and_park_legacy_print_what_they_parked(self):
         rc, out, _ = self.run_main(["park", ""], park=lambda inst, workspace=None: {

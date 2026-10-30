@@ -292,7 +292,29 @@ install at the next `bash src/startup.sh`). Un-parking never moves the primary a
 A core started from a shell, not the desktop app, is never signed in to s.space for you: it keeps
 the ag2.space bridge it started with, and goes silent if ag2.space stops taking writes. The health
 check warns (`sspace-migration`) while every row is on ag2.space and none on s.space. Nothing
-migrates by itself; from the repo:
+migrates by itself; from the repo, try the agent's existing secret first:
+
+```
+python3 scripts/connections.py move --dry-run
+python3 scripts/connections.py move --repo . --logs-dir "$(bash scripts/sutando-config.sh workspace)/logs"
+```
+
+s.space's registry started as a copy of ag2.space's, so an agent that neither server has re-coded
+since still has the same relay secret on both. `move` swaps only the gateway: it takes the ag2.space
+row's secret (the primary, else the legacy row; name another instance to pick it), puts it behind
+s.space's registered gateway and asks that gateway who it is. Only when s.space verifies the same
+agent localpart does it save the `s-space` row (settling its backlog), promote it (the ag2.space
+bridge keeps running as a secondary until you `park-legacy`), re-point the agent MCP descriptor
+(`state/ag2-mcp.json`: mint and MCP URLs, `agent_id`, and an `env_file` holding the code, the old
+descriptor kept as `ag2-mcp.json.bak-ag2-space`) and, when the worker pool is installed, bind each
+ag2.space room's s.space twin to the same worker. `--dry-run` checks and writes nothing. The secret
+is never printed. Over HTTP the same step is `POST /api/v1/connections/move` (`{"dry_run": true}`
+to check; `{"instance": "legacy"}` names the legacy row), answering `{ok, instance, agent_mxid}` or
+`{ok: false, reason}`.
+
+A refusal writes nothing and names its reason: `auth_rejected` (either server issued a new code
+since the copy), `agent_mismatch`, `unverified` (s.space did not answer), `no_token`,
+`no_successor` or `successor_exists` (promote that row instead). Then fall back to a code:
 
 1. Get a connect code for this agent at s.space's agent portal.
 2. `python3 scripts/connections.py add '<code>'` — quote it (the code holds a `|`); it previews the

@@ -25,6 +25,7 @@ import sys
 import tempfile
 import threading
 import time
+import types
 import unittest
 import unittest.mock
 import urllib.error
@@ -4657,6 +4658,203 @@ class LingeringBridge(Base):
                         vault=self.vault, spawn=self.spawn, kill=os.kill, fetch=agents("@s:beta-fixture.net"))
         self.assert_lingering(ctx)
         self.assertEqual(self.spawned, [], "no second bridge while the old one lives")
+
+
+
+MOVE_REGISTRY = {"instances": [
+    {"server": "s.space", "gateway_host": "chat.s.space", "mcp_url": "https://mcp.s.space/mcp"},
+    {"server": "ag2.space", "gateway_host": "chat.ag2.space", "mcp_url": "https://mcp.ag2.space/mcp"}]
+    + [e for e in REGISTRY["instances"] if e["server"] not in ("s.space", "ag2.space")]}
+LEGACY_TOKEN = "https://chat.ag2.space/relay|secret-legacy-xyz"
+SECRET = "secret-legacy-xyz"
+
+
+def move_resolver(host):
+    return dotspace.dotspace_for(host, fetch=dotspace.NO_FETCH, config=MOVE_REGISTRY)
+
+
+class MoveFixtures(PromoteFixtures):
+    """A legacy ag2.space row and two gateways: ag2.space and s.space, each answering for its own agent."""
+
+    def setUp(self):
+        Base.setUp(self)
+        self.events, self.spawned_env, self.asked, self.connects = [], [], [], True
+        self.spawn = self.connecting_spawn()
+        self.s_agents, self.s_error = ["@sutando-x:s.space"], None
+        C.import_from_env({"REMOTE_TASK_TOKEN": LEGACY_TOKEN}, workspace=self.ws, vault=self.vault,
+                          resolver=move_resolver)
+        self.assertEqual([r["server"] for r in self.rows()], ["ag2.space"])
+
+    def fetch(self, url, token, address=None):
+        host = C.host_of_url(url)
+        self.asked.append((host, C.secret_of(token)))
+        if host == "chat.s.space":
+            if self.s_error:
+                raise urllib.error.HTTPError(url, self.s_error, "nope", {}, None)
+            return {"agents": [{"id": i} for i in self.s_agents]}
+        return {"agents": [{"id": "@sutando-x:ag2.space"}]}
+
+    def move(self, **kw):
+        kw.setdefault("fetch", self.fetch)
+        kw.setdefault("whoami", lambda u, t, a=None: self.fail("a single-agent listing needs no whoami"))
+        return C.try_reuse_move(repo=self.ws / "repo", logs_dir=self.ws / "logs", workspace=self.ws,
+                                environ={}, vault=self.vault, resolver=move_resolver, spawn=self.spawn,
+                                kill=self.kill, channels_home=self.ws / "channels", **kw)
+
+    def snapshot(self):
+        return {p.relative_to(self.ws): p.read_bytes() for p in sorted(self.ws.rglob("*")) if p.is_file()}, \
+            dict(self.vault.store)
+
+    def descriptor(self, **fields):
+        d = {"version": 1, "lane": "primary", "env_file": "/old/relay-client.env", "env_key": "REMOTE_TASK_TOKEN",
+             "mint_url": "https://chat.ag2.space/api/v1/mcp/agent-access-tokens",
+             "mcp_url": "https://mcp.ag2.space/mcp", "ca_bundle": None, "agent_id": "@sutando-x:ag2.space", **fields}
+        path = self.ws / "state" / C.MCP_DESCRIPTOR_NAME
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(d))
+        return path
+
+
+class Move(MoveFixtures):
+    """`try_reuse_move`: the legacy secret behind the successor's gateway, saved and promoted only
+    when the successor names the same agent; every refusal writes nothing."""
+
+    def test_successor_code_swaps_only_the_gateway_host(self):
+        row = self.rows()[0]
+        self.assertEqual(C.successor_code(row, {}, vault=self.vault, space_of=move_resolver),
+                         "https://chat.s.space/relay|" + SECRET)
+
+    def test_reuse_accepted_adds_the_successor_row_and_makes_it_primary(self):
+        t0 = int(time.time())
+        out = self.move()
+        self.assertEqual((out["ok"], out["instance"], out["agent_mxid"], out["from"]),
+                         (True, "s-space", "@sutando-x:s.space", ""))
+        rows = self.by_inst()
+        self.assertEqual((rows["s-space"]["primary"], rows[""]["primary"]), (True, False))
+        self.assertEqual((rows["s-space"]["server"], rows["s-space"]["agent_mxid"], rows["s-space"]["added_by"]),
+                         ("s.space", "@sutando-x:s.space", "owner"))
+        self.assertGreaterEqual(rows["s-space"]["not_before"], t0, "the moved row settles its backlog")
+        self.assertEqual(self.vault.store["AG2_REMOTE_TOKEN_S_SPACE"], "https://chat.s.space/relay|" + SECRET)
+        self.assertEqual(C.bridge_pid("s-space", self.ws), self.child())
+        self.assertIn(("chat.s.space", SECRET), self.asked)
+
+    def test_auth_rejected_writes_nothing(self):
+        self.s_error = 401
+        before = self.snapshot()
+        out = self.move()
+        self.assertEqual((out["ok"], out["reason"], out["server"]), (False, "auth_rejected", "s.space"))
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual(self.children, [], "no bridge was started")
+
+    def test_another_agent_on_the_successor_is_refused(self):
+        self.s_agents = ["@someone-else:s.space"]
+        before = self.snapshot()
+        out = self.move()
+        self.assertEqual((out["ok"], out["reason"]), (False, "agent_mismatch"))
+        self.assertEqual(self.snapshot(), before)
+
+    def test_an_unverified_successor_answer_is_refused(self):
+        self.s_agents = []
+        out = self.move(whoami=http_error(404))
+        self.assertEqual((out["ok"], out["reason"]), (False, "unverified"))
+        self.assertEqual(list(self.by_inst()), [""])
+
+    def test_a_server_without_a_successor_is_refused(self):
+        C.import_from_env({"AG2_REMOTE_TOKEN_BETA": TOKEN_B}, workspace=self.ws, vault=self.vault)
+        before = self.snapshot()
+        out = self.move(instance="beta")
+        self.assertEqual((out["ok"], out["reason"]), (False, "no_successor"))
+        with C._transaction(self.ws) as rec:
+            rec["rows"] = [r for r in rec["rows"] if r["instance"]]
+        self.assertEqual(self.move()["reason"], "no_successor")
+        self.assertEqual(self.asked, [], "nothing was probed")
+        self.assertEqual(self.snapshot()[1], before[1])
+
+    def test_a_row_without_a_token_is_refused(self):
+        del self.vault.store["REMOTE_TASK_TOKEN"]
+        before = self.snapshot()
+        out = self.move()
+        self.assertEqual((out["ok"], out["reason"]), (False, "no_token"))
+        self.assertEqual((self.snapshot(), self.asked), (before, []))
+
+    def test_an_existing_successor_row_is_refused(self):
+        self.add("https://chat.s.space/relay|another", fetch=agents("@sutando-x:s.space"))
+        out = self.move()
+        self.assertEqual((out["ok"], out["reason"]), (False, "successor_exists"))
+
+    def test_dry_run_checks_and_writes_nothing(self):
+        self.descriptor()
+        before = self.snapshot()
+        out = self.move(dry_run=True)
+        self.assertEqual((out["ok"], out["dry_run"], out["mcp"]), (True, True, "would_repoint"))
+        self.assertEqual(self.snapshot(), before)
+
+    def test_the_mcp_descriptor_is_repointed_with_a_backup_and_a_private_env_file(self):
+        path = self.descriptor()
+        old = path.read_bytes()
+        out = self.move()
+        self.assertEqual(out["mcp"], "repointed")
+        d = json.loads(path.read_text())
+        env_file = self.ws / "channels" / "s-space-ag2space" / C.MOVE_ENV_FILE
+        self.assertEqual({k: d[k] for k in ("mint_url", "mcp_url", "agent_id", "env_file", "env_key", "lane")},
+                         {"mint_url": "https://chat.s.space/api/v1/mcp/agent-access-tokens",
+                          "mcp_url": "https://mcp.s.space/mcp", "agent_id": "@sutando-x:s.space",
+                          "env_file": str(env_file), "env_key": "REMOTE_TASK_TOKEN", "lane": "primary"})
+        self.assertEqual(env_file.read_text(), "REMOTE_TASK_TOKEN=https://chat.s.space/relay|" + SECRET + "\n")
+        self.assertEqual(env_file.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(path.with_name(C.MCP_DESCRIPTOR_NAME + ".bak-ag2-space").read_bytes(), old)
+
+    def test_an_mcp_descriptor_on_another_server_or_absent_is_left_alone(self):
+        self.assertEqual(self.move(dry_run=True)["mcp"], "absent")
+        path = self.descriptor(mint_url="https://chat.s.space/api/v1/mcp/agent-access-tokens",
+                               mcp_url="https://mcp.s.space/mcp")
+        before = path.read_bytes()
+        self.assertEqual(self.move()["mcp"], "unchanged")
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_worker_room_bindings_are_mirrored_to_their_successor_twins(self):
+        bound = []
+        bindings = {"!abc:ag2.space": "w1", "!def:ag2.space": "core", "!def:s.space": "w2", "!x:other.org": "w3"}
+        rooms = types.SimpleNamespace(load=lambda: dict(bindings), bind=lambda room, w: bound.append((room, w)))
+        out = self.move(room_bindings=rooms)
+        self.assertEqual(bound, [("!abc:s.space", "w1")], "a twin already bound keeps its binding")
+        self.assertEqual(out["rooms"], [{"room": "!abc:ag2.space", "twin": "!abc:s.space", "worker": "w1", "error": None}])
+
+    def test_a_refused_binding_is_reported_and_the_move_stands(self):
+        def bind(room, worker):
+            raise RuntimeError("roster refused")
+        rooms = types.SimpleNamespace(load=lambda: {"!abc:ag2.space": "w1"}, bind=bind)
+        out = self.move(room_bindings=rooms)
+        self.assertEqual((out["ok"], out["rooms"][0]["error"]), (True, "RuntimeError"))
+
+    def test_room_bindings_come_from_an_injected_roster_script_only(self):
+        self.assertIsNone(C.room_bindings_from_script(self.ws / "absent.py", self.ws))
+        script = self.ws / "roster.py"
+        script.write_text("import json\nfrom pathlib import Path\n"
+                          "def roster_path(ws): return Path(ws) / 'state' / 'roster.json'\n"
+                          "def load_bindings(ws): return json.loads((Path(ws) / 'state' / 'bindings.json').read_text())\n"
+                          "def bind_room(ws, room, w):\n"
+                          "    p = Path(ws) / 'state' / 'bindings.json'; b = load_bindings(ws); b[room] = w\n"
+                          "    p.write_text(json.dumps(b))\n")
+        self.assertIsNone(C.room_bindings_from_script(script, self.ws), "no roster yet")
+        (self.ws / "state" / "roster.json").write_text("{}")
+        (self.ws / "state" / "bindings.json").write_text(json.dumps({"!abc:ag2.space": "w1"}))
+        self.move(room_bindings=C.room_bindings_from_script(script, self.ws))
+        self.assertEqual(json.loads((self.ws / "state" / "bindings.json").read_text()),
+                         {"!abc:ag2.space": "w1", "!abc:s.space": "w1"})
+
+    def test_the_secret_never_appears_in_any_result(self):
+        self.descriptor()
+        results = [self.move(dry_run=True)]
+        self.s_error = 401
+        results.append(self.move())
+        self.s_error, self.s_agents = None, ["@other:s.space"]
+        results.append(self.move())
+        self.s_agents = ["@sutando-x:s.space"]
+        results.append(self.move())
+        self.assertTrue(results[-1]["ok"])
+        for out in results:
+            self.assertNotIn(SECRET, json.dumps(out))
 
 
 if __name__ == "__main__":

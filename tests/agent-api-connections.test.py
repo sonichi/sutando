@@ -616,6 +616,32 @@ s, b, _ = req("GET", "/api/v1/connections")
 check("two named rows and no primary list with no_primary true",
       s == 200 and len((b or {}).get("connections", [])) == 2 and b.get("no_primary") is True, f"{s} {b}")
 
+print("== POST move: reuse the existing secret on the successor, before asking for a code ==")
+(WS / "state" / "connections.json").unlink(missing_ok=True)
+s, b, _ = req("POST", "/api/v1/connections/move", {"dry_run": True})
+check("with nothing to move it answers 200 ok false no_successor",
+      s == 200 and (b or {}).get("ok") is False and b.get("reason") == "no_successor", f"{s} {b}")
+s, b, _ = req("GET", "/api/v1/connections/move")
+check("GET move is 405, never read as an instance", s == 405, f"{s} {b}")
+for bad in ({"dry_run": "yes"}, {"instance": 5}):
+    s, b, _ = req("POST", "/api/v1/connections/move", bad)
+    check(f"a malformed body {bad} is 400", s == 400, f"{s} {b}")
+_calls = []
+_real_move = C.try_reuse_move
+C.try_reuse_move = lambda instance=None, **kw: (_calls.append((instance, kw)) or
+                                                {"ok": True, "instance": "s-space", "agent_mxid": "@a:s.space"})
+try:
+    s, b, _ = req("POST", "/api/v1/connections/move", {"instance": "legacy"})
+finally:
+    C.try_reuse_move = _real_move
+inst, kw = _calls[0] if _calls else (None, {})
+check("the route delegates to try_reuse_move with the legacy row named '' and the module's fakes",
+      inst == "" and kw.get("added_by") == "ui" and kw.get("dry_run") is False and Path(kw.get("workspace")).resolve() == WS.resolve()
+      and kw.get("spawn") is spawn and kw.get("fetch") is fetch, f"{inst} {kw}")
+check("and answers its result unchanged", s == 200 and b == {"ok": True, "instance": "s-space", "agent_mxid": "@a:s.space"},
+      f"{s} {b}")
+check("without a worker-pool roster no room binder is passed", kw.get("room_bindings") is None, kw)
+
 server.server_close()
 print()
 if failures:

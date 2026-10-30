@@ -184,10 +184,16 @@ def connections_bearer() -> str:
     return local_api_gate.local_api_token(WORKSPACE_DIR, API_TOKEN)
 
 
+def pool_room_bindings(repo: Path, workspace: Path):
+    """The worker pool's room bindings when that skill is installed, else None."""
+    return _connections.room_bindings_from_script(
+        Path(repo) / "skills" / "worker-pool" / "scripts" / "pool_roster.py", workspace)
+
+
 def connections_http(method: str, path: str, body: dict, query: Optional[dict] = None, *,
                      workspace: Optional[Path] = None, repo: Optional[Path] = None,
                      logs_dir: Optional[Path] = None, vault=None, fetch=None, spawn=None,
-                     kill=None, getaddrinfo=None) -> "tuple[int, Optional[dict]]":
+                     kill=None, getaddrinfo=None, whoami=None) -> "tuple[int, Optional[dict]]":
     """(status, payload) for one request under CONNECTIONS_PREFIX; payload None = empty body.
     The HTTP shape of the connections domain: GET lists, GET known-servers offers the registry,
     POST previews or (confirm) creates and starts the bridge, DELETE removes, POST <instance>/primary moves the primary,
@@ -195,7 +201,8 @@ def connections_http(method: str, path: str, body: dict, query: Optional[dict] =
     POST <instance>/park parks a secondary, POST park-legacy parks every row but the primary (the cutover),
     POST <instance>/unpark brings a parked row back, POST <instance>/disconnect stops and disables,
     POST <instance>/reconnect relaunches,
-    POST <instance>/token replaces the secret with a new code for the same connection;
+    POST <instance>/token replaces the secret with a new code for the same connection,
+    POST move moves a connection to its successor server with its existing secret (`try_reuse_move`);
     <instance> `legacy` names the legacy row. Dispatch only; every rule lives in src/connections.py."""
     ws = Path(workspace) if workspace is not None else WORKSPACE_DIR
     repo = Path(repo) if repo is not None else REPO_DIR
@@ -216,6 +223,20 @@ def connections_http(method: str, path: str, body: dict, query: Optional[dict] =
             if method != "GET":
                 return 405, {"error": "method not allowed"}
             return 200, {"servers": _connections.known_servers(ws)}
+        if parts == ["move"]:
+            if method != "POST":
+                return 405, {"error": "method not allowed"}
+            instance, dry_run = body.get("instance"), body.get("dry_run", False)
+            if instance is not None and not isinstance(instance, str):
+                return 400, {"error": "instance must be a string"}
+            if not isinstance(dry_run, bool):
+                return 400, {"error": "dry_run must be a boolean"}
+            instance = "" if instance == _connections.LEGACY_PATH_SEGMENT else instance
+            out = _connections.try_reuse_move(instance, repo=repo, logs_dir=logs_dir, workspace=ws, vault=vault,
+                                              fetch=fetch, whoami=whoami, getaddrinfo=getaddrinfo, spawn=spawn,
+                                              kill=kill, added_by="ui", dry_run=dry_run,
+                                              room_bindings=pool_room_bindings(repo, ws))
+            return 200, out
         if parts == ["park-legacy"]:
             if method != "POST":
                 return 405, {"error": "method not allowed"}
