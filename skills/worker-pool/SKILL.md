@@ -17,7 +17,8 @@ contracts are in [`docs/worker-pool-design.md`](../../docs/worker-pool-design.md
 - `rename_worker.py` — change a worker's base routing alias after creation: `python3 skills/worker-pool/scripts/rename_worker.py --worker <id-or-label> --label "<new alias>" [--workspace W]`. The id and its tmux session name stay.
 - `apply_profile_label_overrides.py` — apply an AG2 Space profile's complete worker display-label map from JSON stdin with `--workspace W --profile-mxid M --config-version N`.
 - `worker_bootstrap.py` — a worker session's first-turn decision (worker vs core mode) from its env.
-- `pool_roster.py` — owner bindings + compiled roster; `register_worker` is the locked read-merge-write.
+- `pool_roster.py` — owner bindings + compiled roster; `register_worker` is the locked read-merge-write. `set_worker_state` / `remove_worker` are its writers for a worker's lifecycle.
+- `pool_manage.py` — stop, retire, re-enable or remove a worker (below).
 - `worker_identity.py` — worker / session / incarnation records.
 - `pool_router.py` — resolve one task to its recipients from the roster.
 - `pool_route_handler.py` — the core watcher's task-event handler (`SUTANDO_TASK_EVENT_HANDLER`): declines unbound work, delivers bound work as sentinels.
@@ -30,6 +31,37 @@ python3 skills/worker-pool/scripts/pool_sessions.py list --workspace "$WS" [--ro
 ```
 
 Suites live at `tests/skills/worker-pool/`.
+
+## Managing workers: stop, retire, enable, remove
+
+Killing a worker's tmux session does not stop it: the remedy timer's next sweep
+(every 5 minutes) sees a dead session and resumes it on the same conversation.
+Use `pool_manage.py`, which records the owner's decision where the remedy, the
+sweep and the router read it. Run from the repo root; `--workspace` defaults to
+the resolved workspace. Each verb prints one JSON line; exit 0 done, 1 failed,
+2 refused (unknown or ambiguous name, `core`, a bound worker).
+
+```bash
+python3 skills/worker-pool/scripts/pool_manage.py list [--json]
+python3 skills/worker-pool/scripts/pool_manage.py stop   <worker id or label>
+python3 skills/worker-pool/scripts/pool_manage.py retire <worker> [--unbind]
+python3 skills/worker-pool/scripts/pool_manage.py enable <worker> [--no-start]
+python3 skills/worker-pool/scripts/pool_manage.py remove <worker>
+```
+
+- `stop` writes the worker's `paused` marker under the remedy lock, then kills
+  its `-watcher` supervisor, `-input` watcher and seat sessions on the socket it
+  last ran on, and closes its open run as `killed`. A paused worker is not
+  restarted by a sweep, `--resume` or `--restart`. Routing is unchanged: work
+  addressed to it waits in its inbox until it is enabled.
+- `retire` is `stop` plus roster state `retired`: not supervised, not
+  advertised, and the router sends work addressed to it to the core. Refused
+  while a room is bound to it; `--unbind` unbinds those rooms first.
+- `enable` sets a retired worker back to `live`, removes the marker, and runs
+  the owner restart (`pool_remedy --restart`), which resumes its conversation.
+  `--no-start` only lifts the stop.
+- `remove` drops a retired worker's roster row. Its records under
+  `state/workers/<id>/` and its `deliveries/<id>/` folder stay as history.
 
 ## Codex CLI workers
 

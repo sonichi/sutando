@@ -56,7 +56,7 @@ def state_path(workspace) -> Path:
 
 
 def is_paused(workspace, worker_id) -> bool:
-    """Only the owner writes or removes this file; nothing here ever does."""
+    """Only the owner writes or removes this file (`pool_manage.py stop` / `enable`)."""
     return (wi.worker_dir(workspace, worker_id) / PAUSED_MARKER).exists()
 
 

@@ -205,9 +205,11 @@ def targets_for(roster: dict, source: str, requested_worker=None) -> list:
 
 
 def unknown_targets(roster: dict, targets) -> list:
-    """Targets absent from the roster. The router fails such a task by name
-    rather than substituting a reachable recipient."""
-    known = set(roster.get("workers") or {}) | {CORE}
+    """Targets absent from the roster, or retired in it. The router sends such a
+    task to the core rather than substituting another reachable recipient."""
+    workers = roster.get("workers") or {}
+    known = {w for w, row in workers.items()
+             if not (isinstance(row, dict) and row.get("state") == "retired")} | {CORE}
     return [t for t in targets if t not in known]
 
 
@@ -521,6 +523,66 @@ def apply_profile_label_overrides(workspace, labels: dict, config_version: int,
         return {"changed": True, "stale": False, "roster_version": updated["version"],
                 "worker_label_config_version": config_version if not pending else previous,
                 "pending_worker_ids": pending}
+
+
+class WorkerBound(RosterError):
+    """Retiring or removing a worker that rooms are still bound to would route
+    those rooms' traffic nowhere the owner chose."""
+
+    def __init__(self, worker_id: str, rooms: list):
+        super().__init__(f"worker {worker_id} is bound to {len(rooms)} room(s): "
+                         f"{', '.join(rooms)}; unbind them first")
+        self.worker_id, self.rooms = worker_id, rooms
+
+
+def rooms_bound_to(bindings: dict, worker_id: str) -> list:
+    return sorted(room for room, t in (bindings or {}).items()
+                  if worker_id in (t if isinstance(t, list) else [t]))
+
+
+def _locked_worker(workspace, target: str):
+    """(roster, workers, worker id) for a mutation already holding `_locked`."""
+    raw = _load_existing_roster_strict(workspace)
+    if raw is None:
+        raise RosterError("no roster; no workers to manage")
+    validate_workers(raw.get("workers"))
+    workers = {w: dict(row) for w, row in (raw.get("workers") or {}).items()}
+    wid = resolve_label(raw, target)
+    if wid == CORE or wid not in workers:
+        raise RosterError(f"{target!r} is not a worker id or label")
+    return raw, workers, wid
+
+
+def set_worker_state(workspace, target: str, state: str) -> "tuple[str, str, dict | None]":
+    """Move one worker to `state` under the roster lock. Returns (worker id, old
+    state, roster), roster None on a no-op. Retiring a bound worker is refused."""
+    if state not in STATES:
+        raise RosterError(f"state must be one of {STATES}: {state!r}")
+    with _locked(workspace):
+        _, workers, wid = _locked_worker(workspace, target)
+        old = workers[wid].get("state")
+        if old == state:
+            return wid, old, None
+        bindings = load_bindings(workspace)
+        if state == "retired" and rooms_bound_to(bindings, wid):
+            raise WorkerBound(wid, rooms_bound_to(bindings, wid))
+        workers[wid]["state"] = state
+        return wid, old, compile_roster(workspace, workers, bindings)
+
+
+def remove_worker(workspace, target: str) -> "tuple[str, dict, dict]":
+    """Drop a retired worker's row from the roster. Its identity records and
+    delivery folder stay on disk as history. Returns (worker id, row, roster)."""
+    with _locked(workspace):
+        _, workers, wid = _locked_worker(workspace, target)
+        row = workers[wid]
+        if row.get("state") != "retired":
+            raise RosterError(f"worker {wid} is {row.get('state')!r}; retire it before removing it")
+        bindings = load_bindings(workspace)
+        if rooms_bound_to(bindings, wid):
+            raise WorkerBound(wid, rooms_bound_to(bindings, wid))
+        del workers[wid]
+        return wid, row, compile_roster(workspace, workers, bindings)
 
 
 def unbind_room(workspace, room: str) -> dict:
