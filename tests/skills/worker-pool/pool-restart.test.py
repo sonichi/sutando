@@ -29,6 +29,8 @@ from unittest import mock
 
 REPO = Path(__file__).resolve().parents[3]
 SCRIPTS = REPO / "skills" / "worker-pool" / "scripts"
+sys.path.insert(0, str(REPO / "tests"))
+from _helpers.process_group import has_exited  # noqa: E402
 
 
 def _load(name):
@@ -133,13 +135,8 @@ int main(int argc, char **argv) {
                               capture_output=True, text=True, timeout=timeout)
 
     def alive(self, pid):
-        try:
-            os.kill(pid, 0)
-            return True
-        except ProcessLookupError:
-            return False
-        except PermissionError:
-            return False  # the pid was reaped and reused by another user's process
+        # The fixture tmux server can miss a pane's SIGCHLD under load; an unreaped zombie has exited.
+        return not has_exited(pid)
 
     reap_seconds = WAIT_SECONDS
 
