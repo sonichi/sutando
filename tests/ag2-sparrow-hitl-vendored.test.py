@@ -6,6 +6,7 @@ import ast
 import subprocess
 import sys
 import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 
@@ -15,6 +16,61 @@ HITL = ("__init__.py", "schema.py", "host.py", "manager.py", "projector.py", "re
 
 
 class VendoredHitl(unittest.TestCase):
+    def test_package_projector_guards_cards_and_notices_without_a_top_level_policy(self):
+        code = textwrap.dedent('''
+            import sys, tempfile
+            from pathlib import Path
+            from unittest import mock
+            sys.path.insert(0, sys.argv[1])
+            sys.modules['room_message'] = None
+            from ag2_sparrow import room_message
+            from ag2_sparrow.hitl import projector
+            from ag2_sparrow.hitl.manager import HitlManager, HitlStore
+            from ag2_sparrow.hitl.schema import HumanRequirement
+            assert projector.room_message is room_message
+            for notice in ('reminder', 'recovery', 'failed'):
+                with tempfile.TemporaryDirectory() as directory:
+                    manager = HitlManager(HitlStore(Path(directory)))
+                    req = manager.create(HumanRequirement(kind='auth', runtime='claude',
+                                                         message='Sign in', guard='contract'))
+                    sender = mock.Mock(return_value={'event_id': '$created'})
+                    with mock.patch.object(projector, 'WIRE_FIELD', 'body'):
+                        try:
+                            projector.project(manager, sender, '!room:example.invalid', clock=lambda: 100)
+                        except ValueError:
+                            pass
+                        else:
+                            raise AssertionError('invalid card accepted')
+                    sender.assert_not_called()
+                    assert manager.needs_projection(req.id)
+                    if notice == 'failed':
+                        manager.refuse_projection(req.id, req.revision, 'HTTP 400', 1, lambda n: {})
+                    else:
+                        projector.project(manager, sender, '!room:example.invalid', clock=lambda: 100)
+                    if notice == 'recovery':
+                        manager.resolve(req.id)
+                        manager.record_projection(req.id, manager.get(req.id).revision, None)
+                    before = manager.store.projection(req.id)
+                    sender.reset_mock()
+                    with mock.patch.object(projector, 'NOTICE_FIELD', 'body'):
+                        try:
+                            projector.project(manager, sender, '!room:example.invalid', clock=lambda: 2000)
+                        except ValueError:
+                            pass
+                        else:
+                            raise AssertionError('invalid notice accepted')
+                    sender.assert_not_called()
+                    assert manager.store.projection(req.id) == before
+                    projector.project(manager, sender, '!room:example.invalid', clock=lambda: 2000)
+                    sender.assert_called_once()
+                    assert manager.store.projection(req.id) != before
+            print('OK')
+        ''')
+        with tempfile.TemporaryDirectory() as cwd:
+            result = subprocess.run([sys.executable, '-I', '-c', code, str(PKG)],
+                                    cwd=cwd, capture_output=True, text=True)
+        self.assertEqual((result.returncode, result.stdout.strip()), (0, 'OK'), result.stderr)
+
     def test_every_hitl_module_is_vendored_byte_identical(self):
         sync = (PKG / "tools" / "sync_from_src.py").read_text()
         for name in HITL:

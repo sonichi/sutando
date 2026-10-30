@@ -85,6 +85,7 @@ import urllib.request
 from collections.abc import Callable
 from pathlib import Path
 
+from . import room_message
 from .dotspace import NO_FETCH as _NO_FETCH, dotspace_for as _dotspace_for
 
 # Prefer IPv4 for connections to any DotSpace gateway/relay (e.g. chat.ag2.space): they
@@ -2854,6 +2855,9 @@ def _req(method: str, path: str, payload: dict | None = None, timeout: int = _RE
         timeout = min(timeout, deadline - time.monotonic())
         if timeout <= 0:
             raise TimeoutError("request deadline already passed")
+    if (method == "POST" and urllib.parse.urlsplit(path).path == "/v1/room"
+            and isinstance(payload, dict) and payload.get("op") in ("message", "edit")):
+        payload = room_message.room_message_payload(payload)
     with _gateway_call():
         data = json.dumps(payload).encode() if payload is not None else None
         req = urllib.request.Request(f"{URL}{path}", data=data, method=method)

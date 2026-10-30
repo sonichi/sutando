@@ -297,12 +297,13 @@ def violations(source: str, name: str = "<sample>") -> "list[str]":
     if not scope:
         return []
     tree = ast.parse(source)
+    nodes = list(ast.walk(tree))
     imp = Imports(tree)
     source = _source_path(name)
     library = HELPERS_DIR in source.parents
     paths = PathNames(tree, imp)
     parents = {}
-    for p in ast.walk(tree):
+    for p in nodes:
         for c in ast.iter_child_nodes(p):
             parents[c] = p
 
@@ -314,7 +315,7 @@ def violations(source: str, name: str = "<sample>") -> "list[str]":
         return None
 
     canon, modules, canonical_sites = set(), {}, set()
-    for n in ast.walk(tree):
+    for n in nodes:
         if isinstance(n, ast.ImportFrom) and n.level == 0:
             for a in n.names:
                 if CANONICAL.get(n.module or "") == a.name:
@@ -334,8 +335,8 @@ def violations(source: str, name: str = "<sample>") -> "list[str]":
     # A watched name bound anywhere else (import-as, assignment, def, loop, with, except) is not the isolator.
     watched = ISOLATORS | canon | {k.split(".")[0] for k in modules}
     foreign, rebound = [], set()
-    alias_import = {a: n for n in ast.walk(tree) if isinstance(n, (ast.Import, ast.ImportFrom)) for a in n.names}
-    for n in ast.walk(tree):
+    alias_import = {a: n for n in nodes if isinstance(n, (ast.Import, ast.ImportFrom)) for a in n.names}
+    for n in nodes:
         if isinstance(n, ast.alias):
             local = (n.asname or n.name).split(".")[0]
             site = n
@@ -369,7 +370,9 @@ def violations(source: str, name: str = "<sample>") -> "list[str]":
         f = c.func
         if isinstance(f, ast.Name):
             return f.id in canon and f.id not in rebound
-        base = ast.unparse(f.value) if isinstance(f, ast.Attribute) else ""
+        if not isinstance(f, ast.Attribute) or f.attr not in CANONICAL.values():
+            return False
+        base = ast.unparse(f.value)
         return (bool(base) and base.split(".")[0] not in rebound
                 and CANONICAL.get(modules.get(base, "")) == f.attr)
 
@@ -427,7 +430,6 @@ def violations(source: str, name: str = "<sample>") -> "list[str]":
             isinstance(a, ast.Assign) and any(isinstance(t, ast.Name) and t.id == env.id for t in a.targets)
             and any(b in ast.unparse(a.value) for b in BUILDERS) for a in ast.walk(fn))
 
-    nodes = list(ast.walk(tree))
     module_iso = sorted(n.lineno for n in nodes if isolates(n) and enclosing_def(n) is None)
     runs = sorted((n for n in nodes if runs_code(n) and not covered(n)), key=lambda n: n.lineno)
     out = []
@@ -765,12 +767,16 @@ class SelfTest(unittest.TestCase):
         self.assertIn("foreign-isolator", " ".join(elsewhere))
 
     def test_the_dotted_canonical_form_counts_and_rebinding_it_does_not(self):
-        dotted = "import _helpers.hermetic_env\n_helpers.hermetic_env.isolate_os_environ()\n"
-        self.assertEqual(violations(dotted + GATEWAY_IMPORT), [])
-        for tail in ("_helpers = None\n", "_helpers.hermetic_env.isolate_os_environ = print\n",
-                     "import json as _helpers\n"):
-            with self.subTest(tail=tail):
-                self.assertIn("foreign-isolator", " ".join(violations(dotted + tail + GATEWAY_IMPORT)))
+        for module, function in CANONICAL.items():
+            for alias in (None, "helper"):
+                name = alias or module
+                dotted = f"import {module}" + (f" as {alias}" if alias else "") + f"\n{name}.{function}()\n"
+                with self.subTest(module=module, alias=alias):
+                    self.assertEqual(violations(dotted + GATEWAY_IMPORT), [])
+                root = name.split(".")[0]
+                for tail in (f"{root} = None\n", f"{name}.{function} = print\n", f"import json as {root}\n"):
+                    with self.subTest(module=module, alias=alias, tail=tail):
+                        self.assertIn("foreign-isolator", " ".join(violations(dotted + tail + GATEWAY_IMPORT)))
 
     def test_prelude_imports_count_by_where_they_resolve_not_by_name(self):
         isolate = CANON + "isolate_os_environ()\n" + GATEWAY_IMPORT
