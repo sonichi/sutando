@@ -273,7 +273,7 @@ class EdgeTest(_Tmp):
         release = threading.Event()
         self.addCleanup(release.set)
         with mock.patch.object(lh, "DISCOVERY_SECONDS", 0.5), \
-                mock.patch.object(skill_roots, "declared_scripts", lambda *a, **k: release.wait()):
+                mock.patch.object(skill_roots, "declared_scripts", lambda *a, **k: release.wait() and []):
             err = self.run_main(self.tmp / "skills", 5)
         self.assertIn("launch-hooks: none started (discovery timed out)", err)
 
