@@ -271,7 +271,7 @@ def validate_current_roster(workspace) -> None:
 
 def compile_roster(workspace, workers: dict, bindings=None, version=None,
                    *, worker_label_config_version=None,
-                   worker_label_profile_mxid=None) -> dict:
+                   worker_label_profile_mxid=None, removed=None) -> dict:
     """Build the roster the router reads. Refuses declarations it cannot honour
     rather than emitting a roster that routes somewhere unintended."""
     bindings = dict(bindings if bindings is not None else load_bindings(workspace))
@@ -297,9 +297,12 @@ def compile_roster(workspace, workers: dict, bindings=None, version=None,
     roster = {"version": version if version is not None else int(prev.get("version", 0)) + 1,
               "compiled_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
               "workers": dict(workers or {}), "bindings": bindings}
-    for field in ("config_version", "worker_label_config_version", "worker_label_profile_mxid"):
+    for field in ("config_version", "worker_label_config_version", "worker_label_profile_mxid",
+                  "removed"):
         if field in prev:
             roster[field] = prev[field]
+    if removed is not None:
+        roster["removed"] = sorted(set(removed))
     if worker_label_profile_mxid is not None:
         if roster.get("worker_label_profile_mxid") != worker_label_profile_mxid:
             roster.pop("worker_label_config_version", None)
@@ -391,7 +394,9 @@ def register_worker(workspace, worker_id: str, label: str, room=None, runtime=No
             # The next registration reloads bindings.json, not the roster: a
             # binding held only in the compiled roster is discarded by it.
             save_bindings(workspace, bindings)
-        return compile_roster(workspace, workers, bindings)
+        tombstones = set((_load_existing_roster_strict(workspace) or {}).get("removed") or [])
+        return compile_roster(workspace, workers, bindings,
+                              removed=tombstones - {worker_id} if worker_id in tombstones else None)
 
 
 def bind_room(workspace, room: str, target: str) -> dict:
@@ -553,12 +558,17 @@ def _locked_worker(workspace, target: str):
     return raw, workers, wid
 
 
-def is_retired(workspace, worker_id: str) -> bool:
-    """The retirement fence, read fresh from disk apart from any pass's roster snapshot.
-    An absent roster retired nobody; one present but unreadable raises RosterError."""
+def admits_deliveries(workspace, worker_id: str) -> bool:
+    """The retirement fence, read fresh from disk apart from any pass's roster snapshot:
+    a retired row, or the tombstone `remove_worker` leaves in `removed`, admits nothing.
+    An absent roster fences nobody; one present but unreadable raises RosterError."""
     raw = _load_existing_roster_strict(workspace)
-    row = ((raw or {}).get("workers") or {}).get(worker_id)
-    return isinstance(row, dict) and row.get("state") == "retired"
+    if raw is None:
+        return True
+    if worker_id in (raw.get("removed") or []):
+        return False
+    row = (raw.get("workers") or {}).get(worker_id)
+    return not (isinstance(row, dict) and row.get("state") == "retired")
 
 
 def set_worker_state(workspace, target: str, state: str, *, unbind: bool = False,
@@ -598,7 +608,9 @@ def remove_worker(workspace, target: str) -> "tuple[str, dict, dict]":
         if rooms_bound_to(bindings, wid):
             raise WorkerBound(wid, rooms_bound_to(bindings, wid))
         del workers[wid]
-        return wid, row, compile_roster(workspace, workers, bindings)
+        # The tombstone keeps the retirement fence after the row is gone.
+        tombstones = set((_load_existing_roster_strict(workspace) or {}).get("removed") or [])
+        return wid, row, compile_roster(workspace, workers, bindings, removed=tombstones | {wid})
 
 
 def unbind_room(workspace, room: str) -> dict:

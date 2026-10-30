@@ -220,7 +220,7 @@ def deliver_one(workspace, recipient: str, task_id: str,
             return "no-payload"
         # Re-read under the lock the hand-off takes: a pass holding a roster read
         # before a retirement must not commit new work to the retiring worker.
-        if recipient != pr.CORE and _retired(workspace, recipient):
+        if recipient != pr.CORE and not _admits(workspace, recipient):
             return "fenced"
         try:
             os.close(os.open(task_id + pd.PENDING_SUFFIX, os.O_CREAT | os.O_EXCL, 0o644, dir_fd=dfd))
@@ -235,11 +235,11 @@ def deliver_one(workspace, recipient: str, task_id: str,
     return "delivered"
 
 
-def _retired(workspace, recipient: str) -> bool:
+def _admits(workspace, recipient: str) -> bool:
     try:
-        return pr.is_retired(workspace, recipient)
+        return pr.admits_deliveries(workspace, recipient)
     except pr.RosterError as e:
-        raise UnreadableEvidence(f"cannot tell whether {recipient} is retired: {e}") from e
+        raise UnreadableEvidence(f"cannot tell whether {recipient} admits deliveries: {e}") from e
 
 
 def _attribute(workspace, recipient: str, task_id: str) -> None:

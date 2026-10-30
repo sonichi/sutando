@@ -60,7 +60,8 @@ python3 skills/worker-pool/scripts/pool_manage.py remove <worker> [--hand-off]
 - `retire` fences the worker first: roster state `retired`, so the router sends
   work addressed to it to the core, and every delivery re-checks that state under
   the folder lock the hand-off takes, so a pass that read the roster earlier cannot
-  commit a new task to it either. Then it is taken down like `stop`, then owed work
+  commit a new task to it either; once `remove`d, the tombstone it leaves in the
+  roster's `removed` list keeps that fence. Then it is taken down like `stop`, then owed work
   is handed off, then its bindings are dropped. Refused before any write while a
   room is bound to it (unless `--unbind`) and while it owes a delivery, pending or
   accepted (unless `--hand-off`). The hand-off (`pool_delivery.hand_off_to_core`)
@@ -75,7 +76,8 @@ python3 skills/worker-pool/scripts/pool_manage.py remove <worker> [--hand-off]
   owner restart (`pool_remedy --restart`), which resumes its conversation.
   With `--no-start` it only lifts them; the sweep's death ladder then restarts
   the dead session like any other, after its sustained ticks.
-- `remove` drops a retired worker's roster row (same `--hand-off` rule). Its
+- `remove` drops a retired worker's roster row (same `--hand-off` rule), leaving
+  its id in the roster's `removed` list so late deliveries stay fenced. Its
   records under `state/workers/<id>/` and its `deliveries/<id>/` folder stay as
   history.
 

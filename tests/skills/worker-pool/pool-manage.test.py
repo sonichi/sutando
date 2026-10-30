@@ -476,6 +476,69 @@ class FenceEdges(OwedBase):
             router.deliver_one(self.ws, WID, "task-x")
 
 
+class RemovalKeepsTheFence(OwedBase):
+    """A route that read the live worker, paused before delivery, and resumed after
+    retire + remove must not commit to the removed worker: no row admits nothing."""
+
+    def setUp(self):
+        Base.setUp(self)
+        (self.ws / "tasks").mkdir()
+        (self.ws / "results").mkdir()
+
+    def test_a_route_resuming_after_remove_falls_back_to_the_core(self):
+        (self.ws / "tasks" / "task-late.txt").write_text("id: task-late\ntask: hi\n")
+        live = pr.load_roster(self.ws)
+        self.assertEqual(self.main("retire", WID)[1]["result"], "retired")
+        self.assertEqual(self.main("remove", WID)[1]["result"], "removed")
+        # The default production route, resuming with the roster it read while live.
+        with mock.patch.object(pr, "load_roster", return_value=live):
+            out = router.route(self.ws, {"id": "task-late", "requested_worker": WID})
+        self.assertEqual((out["fenced"], out["delivered"]), ([WID], []))
+        self.assertIsNone(router.committed_recipient(self.ws, "task-late"))
+        self.assertIsNone(pattr.worker_for_task(self.ws, "task-late"))
+        self.assertIn("task-late.txt", self.core_queue())
+        self.assertEqual(self.watcher_replay("task-late"), handler.DECLINE)
+
+    def run_handler(self, task_id, live):
+        task = self.ws / "tasks" / f"{task_id}.txt"
+        task.write_text(f"id: {task_id}\nrequested_worker: {WID}\ntask: hi\n")
+        with mock.patch.object(handler, "classify", return_value=(0, [WID], live)):
+            return handler.main(["--task-file", str(task), "--workspace", str(self.ws)])
+
+    def test_unreadable_at_delivery_fails_closed_but_a_removed_row_goes_to_the_core(self):
+        live = pr.load_roster(self.ws)
+        good = pr.roster_path(self.ws).read_text()
+        # Unreadable: cannot tell, so neither the worker nor the core gets it.
+        pr.roster_path(self.ws).write_text("{corrupt")
+        self.assertEqual(self.run_handler("task-u", live), handler.MUST_HANDLE)
+        self.assertIsNone(pdm.find(self.ws, WID, "task-u"))
+        self.assertIsNone(pattr.worker_for_task(self.ws, "task-u"))
+        # Read, and the row is gone: confirmed not a recipient, so the core takes it.
+        pr.roster_path(self.ws).write_text(good)
+        self.main("retire", WID)
+        self.main("remove", WID)
+        self.assertEqual(self.run_handler("task-r", live), handler.DECLINE)
+        self.assertIsNone(pdm.find(self.ws, WID, "task-r"))
+
+    def test_the_tombstone_survives_other_roster_writes_and_a_re_registration_clears_it(self):
+        self.main("retire", WID)
+        self.main("remove", WID)
+        pr.rename_worker(self.ws, OTHER, "renamed")
+        self.assertIn(WID, pr.load_roster(self.ws)["removed"])
+        self.assertFalse(pr.admits_deliveries(self.ws, WID))
+        self.assertTrue(pr.admits_deliveries(self.ws, OTHER))
+        pr.register_worker(self.ws, WID, "back", runtime="claude")
+        self.assertNotIn(WID, pr.load_roster(self.ws)["removed"])
+        self.assertTrue(pr.admits_deliveries(self.ws, WID))
+
+    def test_an_absent_roster_still_delivers_as_before(self):
+        (self.ws / "tasks" / "task-x.txt").write_text("id: task-x\ntask: hi\n")
+        snapshot = pr.load_roster(self.ws)
+        pr.roster_path(self.ws).unlink()
+        self.assertEqual(router.deliver_one(self.ws, WID, "task-x"), "delivered")
+        self.assertIsNotNone(snapshot)
+
+
 class SelfTarget(Base):
     def test_a_worker_cannot_stop_or_retire_itself(self):
         with mock.patch.dict("os.environ", {"SUTANDO_INSTANCE_ID": WID}):
