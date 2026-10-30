@@ -1627,6 +1627,82 @@ class Identity(Base):
         self.assertEqual(self.vault.store["AG2_REMOTE_TOKEN_ALPHA_FIXTURE_NET"], "https://chat.alpha-fixture.net|secret-alpha-2")
 
 
+def whoami_says(mxid):
+    """A gateway whoami naming `mxid` as the bearer's own agent."""
+    return lambda url, token, address=None: {"agent_mxid": mxid}
+
+
+class OwnerScopedListing(Base):
+    """A gateway whose /v1/agents lists every agent of the owner names the bearer's own by whoami."""
+
+    FLEET = staticmethod(agents("@other:alpha-fixture.net", "@sutando:alpha-fixture.net", "@third:alpha-fixture.net"))
+
+    def test_whoami_settles_a_fleet_listing_and_the_entry_supplies_the_fields(self):
+        p = C.preview_connection(TOKEN_A, fetch=self.FLEET, whoami=whoami_says("@sutando:alpha-fixture.net"))
+        self.assertEqual((p["verified"], p["server_source"], p["agent_mxid"], p["owner_mxid"]),
+                         (True, "identity", "@sutando:alpha-fixture.net", "@owner:alpha-fixture.net"))
+
+    def test_whoami_for_another_server_or_a_failed_one_verifies_nothing(self):
+        for whoami in (whoami_says("@sutando:beta-fixture.net"), whoami_says("not-an-mxid"),
+                       http_error(404), unreachable, lambda *a: ["@sutando:alpha-fixture.net"]):
+            p = C.preview_connection(TOKEN_A, fetch=self.FLEET, whoami=whoami)
+            self.assertEqual((p["verified"], p["agent_mxid"], p["authenticated"]), (False, None, True))
+
+    def test_an_unregistered_gateway_is_never_verified_by_whoami(self):
+        p = C.preview_connection(UNREGISTERED, fetch=self.FLEET, whoami=whoami_says("@sutando:gw.unregistered-fixture.net"))
+        self.assertFalse(p["verified"])
+
+    def test_a_rejected_token_asks_no_whoami(self):
+        p = C.preview_connection(TOKEN_A, fetch=http_error(401), whoami=lambda *a: self.fail("asked whoami"))
+        self.assertEqual((p["authenticated"], p["verified"]), (False, False))
+
+    def test_the_default_probe_asks_whoami_on_the_same_pinned_gateway(self):
+        asked = []
+
+        def fake(gateway_url, token, address, path, *, connect=None):
+            asked.append((gateway_url, address, path))
+            if path == "/v1/agents":
+                return self.FLEET(gateway_url, token)
+            return {"agent_mxid": "@sutando:alpha-fixture.net"}
+        with unittest.mock.patch.object(C, "_fetch_json", fake):
+            p = C.preview_connection(TOKEN_A, getaddrinfo=public_getaddrinfo)
+        self.assertTrue(p["verified"])
+        self.assertEqual([a[2] for a in asked], ["/v1/agents", "/v1/whoami"])
+        self.assertEqual({a[1] for a in asked}, {"93.184.216.34"})
+
+    def test_the_legacy_env_row_and_a_named_one_learn_their_agents(self):
+        C.import_from_env({"REMOTE_TASK_TOKEN": TOKEN_A, "AG2_REMOTE_TOKEN_BETA": TOKEN_B},
+                          workspace=self.ws, vault=self.vault)
+        self.assertEqual([r.get("agent_mxid") for r in self.rows()], [None, None])
+        mine = {"secret-alpha": "@sutando:alpha-fixture.net", "secret-beta": "@b:beta-fixture.net"}
+        environ = {"REMOTE_TASK_TOKEN": TOKEN_A, "AG2_REMOTE_TOKEN_BETA": TOKEN_B}
+        learned = C.learn_missing_identities(self.ws, environ=environ, vault=self.vault, fetch=self.FLEET,
+                                             whoami=lambda u, t, a=None: {"agent_mxid": mine[C.secret_of(t)]})
+        self.assertEqual(sorted(learned), ["", "beta"])
+        self.assertEqual({r["instance"]: r.get("agent_mxid") for r in self.rows()},
+                         {"": "@sutando:alpha-fixture.net", "beta": "@b:beta-fixture.net"})
+        self.assertEqual(C.learn_missing_identities(self.ws, environ=environ, vault=self.vault,
+                                                    fetch=lambda *a: self.fail("probed a known row")), [])
+
+    def test_a_row_without_a_token_or_a_disabled_one_is_left_alone(self):
+        C.import_from_env({"REMOTE_TASK_TOKEN": TOKEN_A}, workspace=self.ws, vault=self.vault)
+        self.assertEqual(C.learn_missing_identities(self.ws, environ={}, vault=self.vault,
+                                                    fetch=lambda *a: self.fail("probed without a token")), [])
+        self.assertIsNone(self.rows()[0].get("agent_mxid"))
+
+    def test_the_learner_loop_runs_once_and_stops(self):
+        stop = threading.Event()
+        calls = []
+
+        def once(ws, **kw):
+            calls.append(ws)
+            stop.set()
+            raise RuntimeError("a failed pass is swallowed")
+        with unittest.mock.patch.object(C, "learn_missing_identities", once):
+            C.run_identity_learner(stop, self.ws, interval_s=0.01)
+        self.assertEqual(calls, [self.ws])
+
+
 class Disconnect(Base):
     def setUp(self):
         super().setUp()

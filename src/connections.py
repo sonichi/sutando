@@ -527,6 +527,16 @@ def _fetch_agents(gateway_url: str, token: str, address: str, *, connect=None) -
     """The gateway's own `GET /v1/agents` under the token's bearer, over a connection pinned to
     the vetted `address` with the URL's host as SNI and Host. Anything but 200 raises HTTPError
     with that status: a redirect is never followed."""
+    return _fetch_json(gateway_url, token, address, "/v1/agents", connect=connect)
+
+
+def _fetch_whoami(gateway_url: str, token: str, address: str, *, connect=None) -> dict:
+    """The gateway's `GET /v1/whoami`: the agent its registry resolves the bearer to, never a
+    client claim. Pinned and refused exactly as `_fetch_agents`."""
+    return _fetch_json(gateway_url, token, address, "/v1/whoami", connect=connect)
+
+
+def _fetch_json(gateway_url: str, token: str, address: str, path: str, *, connect=None) -> dict:
     parts = urllib.parse.urlsplit(gateway_url)
     host = parts.hostname or ""
     port = parts.port or 443
@@ -534,7 +544,7 @@ def _fetch_agents(gateway_url: str, token: str, address: str, *, connect=None) -
     conn = http.client.HTTPConnection(host, port, timeout=PROBE_TIMEOUT_S)
     conn.sock = sock  # the transport is the pinned one; connect() is never reached
     try:
-        conn.request("GET", parts.path.rstrip("/") + "/v1/agents", headers={
+        conn.request("GET", parts.path.rstrip("/") + path, headers={
             "Host": f"{parts.hostname}:{port}" if parts.port else parts.hostname,
             "Authorization": f"Bearer {secret_of(token)}",
             "Accept": "application/json", "User-Agent": "sutando-gateway-client/1.0"})
@@ -599,7 +609,7 @@ def gateway_host_ok(host: str) -> bool:
 
 
 def preview_connection(token: str, *, fetch: Optional[Callable] = None, resolver=None,
-                       getaddrinfo=None) -> dict:
+                       getaddrinfo=None, whoami: Optional[Callable] = None) -> dict:
     """What saving this token would record, without saving: the gateway URL as issued, the
     server and where it came from (`server_source`), and whether the token authenticated
     (`authenticated` None when the gateway gave no verdict).
@@ -607,7 +617,9 @@ def preview_connection(token: str, *, fetch: Optional[Callable] = None, resolver
     The gateway's agent listing can CONFIRM an identity, never establish one: `verified` is
     true only when the listing names one agent whose server is the DotSpace the resolver
     registers for the gateway host. An unregistered host stays the server itself, whatever the
-    listing claims. The gateway URL must be https and its host a public server name: an http
+    listing claims. A listing of several agents (an owner-scoped one) is settled by the gateway's
+    `whoami` for the bearer, taken only for an agent of that same server; a caller that injects
+    `fetch` without `whoami` asks no whoami. The gateway URL must be https and its host a public server name: an http
     URL, an address, a reserved or single-label name, or a name resolving to any non-public
     address is refused as invalid_gateway before any probe; the probe is pinned to the vetted
     address."""
@@ -629,6 +641,8 @@ def preview_connection(token: str, *, fetch: Optional[Callable] = None, resolver
     if address is None:
         out["error"] = "unreachable (resolution)"
         return out
+    if whoami is None and fetch is None:
+        whoami = _fetch_whoami
     fetch = _fetch_agents if fetch is None else fetch
     try:
         answer = fetch(url, token, address)
@@ -646,7 +660,22 @@ def preview_connection(token: str, *, fetch: Optional[Callable] = None, resolver
         if isinstance(agents, list) else []
     if registered and len(named) == 1 and server_of_mxid(named[0]["id"]) == registered:
         out.update(_identity_of(named[0]), server_source="identity", verified=True)
+    elif registered and whoami is not None:
+        mine = _whoami_agent(whoami, url, token, address)
+        if mine and server_of_mxid(mine) == registered:
+            entry = next((a for a in named if a["id"] == mine), {"id": mine})
+            out.update(_identity_of(entry), server_source="identity", verified=True)
     return out
+
+
+def _whoami_agent(whoami: Callable, url: str, token: str, address: str) -> str:
+    """The agent mxid the gateway's whoami names for the bearer; '' when it names none or fails."""
+    try:
+        answer = whoami(url, token, address)
+    except Exception:  # noqa: BLE001 - an older gateway without whoami leaves the listing's verdict
+        return ""
+    mxid = answer.get("agent_mxid") if isinstance(answer, dict) else None
+    return mxid if isinstance(mxid, str) and server_of_mxid(mxid) else ""
 
 
 def _identity_of(agent: Mapping[str, object]) -> dict:
@@ -2172,6 +2201,38 @@ def _learn_missing_identity(instance: str, environ: Mapping[str, str], workspace
         learn_identity(instance, preview_connection(token, fetch=fetch, getaddrinfo=getaddrinfo), workspace=workspace)
     except ConnectionsError:
         pass  # launch_env refuses the row that is still without one
+
+
+def learn_missing_identities(workspace: Optional[Path] = None, *, environ: Optional[Mapping[str, str]] = None,
+                             vault=None, fetch=None, getaddrinfo=None, whoami=None) -> list:
+    """Learn, onto every enabled row that names no agent (the legacy row included), the identity its
+    own token answers to; the instances that learned one. A row whose token or probe fails is left."""
+    learned = []
+    for row in read_rows(workspace):
+        if row.get("agent_mxid") or row.get("disabled") or row.get("parked"):
+            continue
+        try:
+            _, token = connection_credential(row, environ, vault=vault)
+            seen = preview_connection(token, fetch=fetch, getaddrinfo=getaddrinfo, whoami=whoami)
+            if learn_identity(str(row["instance"]), seen, workspace=workspace).get("agent_mxid"):
+                learned.append(str(row["instance"]))
+        except ConnectionsError:
+            continue
+    return learned
+
+
+IDENTITY_LEARN_INTERVAL_S = 60.0
+
+
+def run_identity_learner(stop_event, workspace: Optional[Path] = None, *,
+                         interval_s: float = IDENTITY_LEARN_INTERVAL_S, vault=None) -> None:
+    """Until `stop_event`: `learn_missing_identities` now, then every `interval_s`; never raises."""
+    while not stop_event.is_set():
+        try:
+            learn_missing_identities(workspace, vault=vault)
+        except Exception:  # noqa: BLE001 - a failed pass only waits for the next one
+            pass
+        stop_event.wait(interval_s)
 
 
 def _agent_identity():

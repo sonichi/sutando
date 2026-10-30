@@ -1925,6 +1925,9 @@ if __name__ == "__main__":
         daemon=True,
     )
     workstream_maintenance.start()
+    # Rows imported from the environment name no agent until their own token is asked.
+    threading.Thread(target=_connections.run_identity_learner, args=(workstream_maintenance_stop, WORKSPACE_DIR),
+                     name="connections-identity", daemon=True).start()
     local_ip = _resolve_local_ip()
     print(f"Sutando Agent API → http://{bind}:{PORT}")
     print("  POST /task  — submit a task")
