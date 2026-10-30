@@ -161,7 +161,7 @@ Stop hook and worker serialize mutations with `state/feedback-reports.lock`.
 
 **Owner-tier only** — it files under the owner's Sutando Cloud identity, and it reads the owner's cloud token + attaches the owner's workspace log tail. Run it only for `access_tier: owner` (or an unauthenticated local/voice owner task). The script has no tier check of its own.
 
-Guest tasks, every non-owner Slack task, and non-owner Discord tasks from senders outside the channel's `collaborators` list go to a read-only `codex exec --sandbox` agent with no cloud token, which cannot run this script. AG2 Space Team tasks, broker-attested collaborators included, and a Discord channel's listed collaborators run in the owner's core with its normal tools (`docs/access-control.md`). Nothing structural stops them from running this script: the gate is prose, the in-band Team guardrail or collaborator rulebook (no external actions on their say-so) and the section below.
+Guest tasks, every non-owner Slack task, and non-owner Discord tasks from senders outside the channel's `collaborators` list go to the no-file sandbox agent that `src/policy/sandbox_runner.py` renders, with no cloud token, which cannot run this script. AG2 Space Team tasks, broker-attested collaborators included, and a Discord channel's listed collaborators run in the owner's core with its normal tools (`docs/access-control.md`). Nothing structural stops them from running this script: the gate is prose, the in-band Team guardrail or collaborator rulebook (no external actions on their say-so) and the section below.
 
 ### When a non-owner asks
 

@@ -36,7 +36,9 @@ class Packaging(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertIn('"src/%s": "%s"' % (name, name), sync)
                 self.assertEqual((REPO / "src" / name).read_bytes(), (PKG / "ag2_sparrow" / name).read_bytes())
-        self.assertIn('"ag2_sparrow" = ["*.sh"]', (PKG / "pyproject.toml").read_text(), "the scripts ship in the wheel")
+        import tomllib
+        data = tomllib.loads((PKG / "pyproject.toml").read_text())["tool"]["setuptools"]["package-data"]
+        self.assertIn("*.sh", data["ag2_sparrow"], "the scripts ship in the wheel")
 
     def test_the_packaged_scripts_reference_no_repo_helper(self):
         for name in ("tmux-pane-keys.sh", "bounded-wait.sh"):

@@ -14,6 +14,7 @@ Capture (from a checkout of the reference commit, never from a branch under test
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
 import tempfile
 import unittest
@@ -25,6 +26,9 @@ from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
 isolate_os_environ()
 
 REPO = Path(__file__).resolve().parent.parent
+# The fixtures carry the claude command; which runner a host has installed is
+# tests/sandbox-runner.test.py's concern, so pin it here.
+os.environ["SUTANDO_SANDBOX_RUNNERS"] = "claude"
 _SRC = REPO / "src" / "remote-gateway-bridge.py"
 FIXTURES = REPO / "tests" / "fixtures" / "gateway-task-envelopes"
 PINNED_LOCAL_TIME = "2026-10-06T17:00:00-07:00 America/Los_Angeles"

@@ -50,8 +50,9 @@ include = ["ag2_sparrow*"]
 
 # Non-Python files the Hatch adapter installs; they must ship in the wheel.
 [tool.setuptools.package-data]
-# the guarded pane-key send and its bounded wait, vendored from src/
-"ag2_sparrow" = ["*.sh"]
+# the guarded pane-key send and its bounded wait, vendored from src/;
+# sandbox_runner inlines the public FAQ into every sandboxed prompt.
+"ag2_sparrow" = ["*.sh", "sandbox_faq.md"]
 "ag2_sparrow.adapters.hatch" = ["*.sh", "*.json"]
 "ag2_sparrow.adapters.claude_routine" = ["*.md"]
 "ag2_sparrow.adapters.claude_cloud_session" = ["*.md"]
