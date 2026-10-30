@@ -17,6 +17,8 @@ front of a loopback port. The rules live here once:
   * `private_history_request_allowed` — the agent API's owner-history gate: with a configured
     `SUTANDO_API_TOKEN` the bearer must match (else 401); without one, only a loopback client
     sending no Origin may read (else 403), so a browser page never reaches localhost history.
+  * `local_owner_request_allowed` — owner task/media access: a bearer passes directly; otherwise
+    only loopback clients with a loopback Host and absent or loopback Origin are allowed.
 
 A route that does not go through this module has no gate.
 """
@@ -169,3 +171,36 @@ def private_history_request_allowed(client_ip: str, origin: Optional[str], autho
     if loopback and not origin:
         return 200, None
     return 403, "task history requires a local proxy or API token"
+
+
+def local_owner_request_allowed(client_ip, origin, host, authorization, *, expected_token: str,
+                                bound_port: Optional[int], require_bearer: bool = False,
+                                content_type: Optional[str] = None) -> "tuple[int, Optional[str]]":
+    """(status, reason) for owner-only agent API routes.
+
+    A matching bearer bypasses client, Host, Origin and content-type checks.
+    Otherwise only a loopback client on a loopback Host may proceed.
+    """
+    if authorization:
+        if bearer_matches(authorization, expected_token):
+            return 200, None
+        return 401, "unauthorized"
+    if require_bearer:
+        return 401, "unauthorized"
+    try:
+        loopback = ipaddress.ip_address(client_ip).is_loopback
+    except ValueError:
+        loopback = False
+    if not loopback:
+        return 401, "unauthorized"
+    if _authority_host(host) not in _LOOPBACK_HOSTS:
+        return 403, "host not allowed"
+    port = _authority_port(host)
+    if bound_port is not None and port is not None and port != bound_port:
+        return 403, "host not allowed"
+    if not loopback_origin(origin or ""):
+        return 403, "cross-origin request refused"
+    if (content_type is not None and origin and
+            content_type.split(";", 1)[0].strip().lower() != "application/json"):
+        return 403, "Content-Type must be application/json"
+    return 200, None

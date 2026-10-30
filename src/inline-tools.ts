@@ -413,7 +413,7 @@ export const typeTextTool: ToolDefinition = {
 				if (savedClipboard) {
 					execFileSync('pbcopy', [], { input: savedClipboard, encoding: 'utf-8', timeout: 2_000, env: utf8Env });
 				}
-				console.log(`${ts()} [TypeText] pasted (multi-line, mode=${mode}): ${text.slice(0, 40)}...`);
+				console.log(`${ts()} [TypeText] pasted (multi-line, mode=${mode}, ${text.length} chars)`);
 				return { status: 'typed', text };
 			} catch (err) {
 				return keystrokeOutcome('Paste', err instanceof Error ? err.message : String(err));
@@ -432,7 +432,7 @@ export const typeTextTool: ToolDefinition = {
 				execFileSync('osascript', ['-e', 'tell application "System Events" to key code 124'], { timeout: 3_000 });
 			}
 			execFileSync('osascript', ['-e', `tell application "System Events" to keystroke "${safeText}"`], { timeout: 5_000 });
-			console.log(`${ts()} [TypeText] typed (mode=${mode}): ${text.slice(0, 40)}`);
+			console.log(`${ts()} [TypeText] typed (mode=${mode}, ${text.length} chars)`);
 			return { status: 'typed', text };
 		} catch (err) {
 			return keystrokeOutcome('Type', err instanceof Error ? err.message : String(err));
@@ -643,12 +643,12 @@ export const clipboardTool: ToolDefinition = {
 		try {
 			if (action === 'read') {
 				const content = clipboardRead();
-				console.log(`${ts()} [Clipboard] read: ${content.slice(0, 40)}`);
+				console.log(`${ts()} [Clipboard] read (${content.length} chars)`);
 				return { status: 'read', content };
 			} else {
 				if (!text) return { error: 'No text provided to write' };
 				clipboardWrite(text);
-				console.log(`${ts()} [Clipboard] wrote: ${text.slice(0, 40)}`);
+				console.log(`${ts()} [Clipboard] wrote (${text.length} chars)`);
 				return { status: 'written', text };
 			}
 		} catch (err) {

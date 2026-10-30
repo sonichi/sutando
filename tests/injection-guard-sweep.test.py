@@ -300,25 +300,25 @@ _check(
     "agent-api.py handle_twilio_transcription must also define safe_caller "
     "(two handlers use this pattern — check both voice and transcription)",
 )
-# All four agent-api.py task writers must declare access_tier: owner explicitly
-# before task: — self-documenting and immune to a future default-tier change.
-# Anchor on the f-string source field literal so we hit the task_content block,
-# not the function-name or comment that contains the same substring.
-for _src_literal, _src_label in (
-    ('"source: twilio_voice\\n"',   "twilio_voice"),
-    ('"source: twilio_sms\\n"',     "twilio_sms"),
-    ('"source: twilio_voicemail\\n"', "twilio_voicemail"),
-    ('"source: api\\n"',            "api"),
+# Each writer must emit an explicit access_tier before task:, with Twilio using
+# its computed sender tier and the API writer declaring owner.
+for _src_literal, _src_label, _tier_field in (
+    ('"source: twilio_voice\\n"', "twilio_voice",
+     "access_tier: {_twilio_sender_tier(caller)}\\n"),
+    ('"source: twilio_sms\\n"', "twilio_sms",
+     "access_tier: {_twilio_sender_tier(sender)}\\n"),
+    ('"source: twilio_voicemail\\n"', "twilio_voicemail",
+     "access_tier: {_twilio_sender_tier(caller)}\\n"),
+    ('"source: api\\n"', "api", "access_tier: owner\\n"),
 ):
     _tw_start = _aa.find(_src_literal)
     _tw_task  = _aa.find("task:", _tw_start) if _tw_start >= 0 else -1
-    _tw_tier  = _aa.find("access_tier: owner", _tw_start) if _tw_start >= 0 else -1
+    _tw_tier = _aa.find(_tier_field, _tw_start) if _tw_start >= 0 else -1
     _check(
-        f"agent-api: {_src_label} — access_tier: owner before task:",
+        f"agent-api: {_src_label} — explicit access_tier before task:",
         _tw_start >= 0 and _tw_tier >= 0 and _tw_task >= 0 and _tw_tier < _tw_task,
-        f"agent-api.py {_src_label} task_content must declare access_tier: owner "
-        f"before task: — makes trust level self-documenting and safe if the implicit "
-        f"default ever changes",
+        f"agent-api.py {_src_label} task_content must emit an explicit access_tier "
+        f"before task: — safe if the implicit default ever changes",
     )
 
 # ---------------------------------------------------------------------------

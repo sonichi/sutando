@@ -27,6 +27,8 @@ def load(name):
 def get(module, path):
     handler = module.Handler.__new__(module.Handler)
     handler.path = path
+    handler.client_address = ("127.0.0.1", 43123)
+    handler.headers = {"Host": "127.0.0.1", "Origin": "http://127.0.0.1"}
     handler.wfile = io.BytesIO()
     handler.send_response = Mock()
     handler.send_header = Mock()
@@ -83,7 +85,7 @@ class HttpProcessProbes(unittest.TestCase):
                     "questions_unavailable": None,
                 })
                 handler.send_header.assert_any_call("Content-Type", "application/json")
-                handler.send_header.assert_any_call("Access-Control-Allow-Origin", "*")
+                handler.send_header.assert_any_call("Access-Control-Allow-Origin", "http://127.0.0.1")
 
     def test_missing_process_tools_do_not_abort_either_route(self):
         _, dashboard = get(self.dashboard, "/")

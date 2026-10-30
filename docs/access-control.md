@@ -12,6 +12,16 @@ To allow additional senders after onboarding: add their numeric Telegram user ID
 
 Telegram tasks include an `access_tier` field set by the bridge (same tiers as Discord).
 
+## Phone and SMS access control
+
+Twilio voice, SMS, and voicemail tasks derive `access_tier` from `OWNER_NUMBER`
+through `src/phone_owner.py`. The comma-separated owner list and sender number
+are normalized to digits; only a matching configured number receives `owner`.
+When `OWNER_NUMBER` is unset or empty, every sender remains restricted as
+`other`. A transcription callback without `From` resolves the sender from the
+recent signed voice webhook record for its `CallSid`; missing or expired records
+remain restricted.
+
 ## Discord access control
 
 Discord tasks include an `access_tier` field set by the bridge:

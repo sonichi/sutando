@@ -99,6 +99,42 @@ class Gate(unittest.TestCase):
         self.assertFalse(G.loopback_origin("http://localhost.evil.example"))
 
 
+class LocalOwnerGate(unittest.TestCase):
+    def allowed(self, client_ip="127.0.0.1", origin=None, host="127.0.0.1:7843", authorization="",
+                token="t", port=7843, require_bearer=False, content_type=None):
+        return G.local_owner_request_allowed(
+            client_ip, origin, host, authorization, expected_token=token, bound_port=port,
+            require_bearer=require_bearer, content_type=content_type)
+
+    def test_matching_bearer_bypasses_client_host_origin_and_content_type(self):
+        self.assertEqual(self.allowed(
+            client_ip="192.168.1.5", origin="https://evil.example", host="evil.example:7843",
+            authorization="Bearer t", content_type="text/plain"), (200, None))
+
+    def test_bearer_is_required_when_present_or_configured(self):
+        self.assertEqual(self.allowed(authorization="Bearer wrong"), (401, "unauthorized"))
+        self.assertEqual(self.allowed(client_ip="192.168.1.5"), (401, "unauthorized"))
+        self.assertEqual(self.allowed(require_bearer=True), (401, "unauthorized"))
+
+    def test_loopback_client_must_use_loopback_host_on_bound_port(self):
+        self.assertEqual(self.allowed(host="evil.example:7843"), (403, "host not allowed"))
+        self.assertEqual(self.allowed(host="127.0.0.1:9999"), (403, "host not allowed"))
+        self.assertEqual(self.allowed(client_ip="not-an-ip"), (401, "unauthorized"))
+
+    def test_loopback_client_must_use_loopback_origin(self):
+        self.assertEqual(self.allowed(origin="https://evil.example"),
+                         (403, "cross-origin request refused"))
+        self.assertEqual(self.allowed(origin="null"), (403, "cross-origin request refused"))
+
+    def test_content_type_is_checked_only_for_origin_requests(self):
+        self.assertEqual(self.allowed(origin="http://localhost:8080", content_type="text/plain"),
+                         (403, "Content-Type must be application/json"))
+        self.assertEqual(self.allowed(origin="http://localhost:8080",
+                                      content_type="application/json; charset=utf-8"), (200, None))
+        self.assertEqual(self.allowed(content_type="application/x-www-form-urlencoded"), (200, None))
+        self.assertEqual(self.allowed(origin="http://localhost:8080", content_type=None), (200, None))
+
+
 class PrivateHistoryGate(unittest.TestCase):
     REFUSED = (403, "task history requires a local proxy or API token")
 

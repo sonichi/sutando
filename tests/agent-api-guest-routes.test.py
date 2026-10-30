@@ -59,7 +59,8 @@ class FakeRFile:
 def make_handler(path: str, headers: dict, body: bytes = b"", auth: bool = True):
     h = agent_api.Handler.__new__(agent_api.Handler)
     h.path = path
-    h.headers = headers
+    h.client_address = ("127.0.0.1", 43123)
+    h.headers = {"Host": "127.0.0.1", **headers}
     h.rfile = FakeRFile(body)
     h._responses = []
     h.check_auth = lambda: (auth if auth else h._responses.append((401, {"error": "unauthorized"})) or False)

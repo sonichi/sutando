@@ -47,7 +47,8 @@ class FakeRFile:
 def make_handler(headers: dict, body: bytes = b"", auth: bool = True):
     h = agent_api.Handler.__new__(agent_api.Handler)
     h.path = "/task"
-    h.headers = headers
+    h.headers = {"Host": "127.0.0.1", **headers}
+    h.client_address = ("127.0.0.1", 12345)
     h.rfile = FakeRFile(body)
     h._responses = []
     h.check_auth = lambda: auth

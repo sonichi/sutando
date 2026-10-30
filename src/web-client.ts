@@ -23,6 +23,7 @@ import { readBodyCapped } from './http-body-limit.js';
 const HTTP_PORT = Number(process.env.CLIENT_PORT) || 8080;
 const HTTP_HOST = process.env.CLIENT_HOST || '0.0.0.0'; // '0.0.0.0' binds to all interfaces for EC2
 const WS_PORT = Number(process.env.PORT) || 9900;
+const AGENT_API_PORT = Number(process.env.SUTANDO_AGENT_API_PORT || process.env.AGENT_API_PORT) || 7843;
 const DEFAULT_WS_URL = `ws://localhost:${WS_PORT}`;
 // Opt-in LAN sharing. The voice WS (WS_PORT) binds loopback only, so a browser
 // on another device on the same network can't reach it. When enabled, this
@@ -1858,8 +1859,7 @@ function startTaskPolling() {
   if (taskPollTimer) return;
   taskPollTimer = setInterval(async () => {
     try {
-      const hostname = window.location.hostname;
-      const resp = await fetch('http://' + hostname + ':7843/tasks/active');
+      const resp = await fetch('/api/dashboard/tasks/active');
       const data = await resp.json();
       // Replace taskMap with API data (preserve expanded state and WebSocket-delivered results)
       const apiTasks = new Set();
@@ -2833,8 +2833,7 @@ window.toggle = toggle;
 
 // ─── Suggestion chips ─────────────────────────────────────
 function copyLogs() {
-  var apiBase = 'http://' + location.hostname + ':7843';
-  fetch(apiBase + '/logs/voice').then(function(r) { return r.json(); }).then(function(d) {
+  fetch('/api/dashboard/logs/voice').then(function(r) { return r.json(); }).then(function(d) {
     var text = (d.lines || []).join(String.fromCharCode(10));
     navigator.clipboard.writeText(text).then(function() {
       addSystem('Logs copied to clipboard (last 30 lines). Paste in Discord or GitHub issue.');
@@ -3215,7 +3214,7 @@ function getSuggestionChips() {
 function esc(s) { var d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
 
 function renderDynamicContent(c) {
-  const media = API_BASE + '/media/';
+  const media = '/api/dashboard/media/';
   const src = c.src || '';
   const fullSrc = src.startsWith('http') ? src : media + src;
   const title = c.title ? '<div class="dr-media-title">' + esc(c.title) + '</div>' : '';
@@ -4262,6 +4261,19 @@ function isLoopbackAddress(address: string | undefined): boolean {
 	return address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1';
 }
 
+function isLoopbackHost(host: string | undefined): boolean {
+	if (!host) return false;
+	try {
+		const parsed = new URL(`http://${host}`);
+		const hostname = parsed.hostname.toLowerCase();
+		return !parsed.username && !parsed.password && parsed.pathname === '/'
+			&& (hostname === 'localhost' || hostname.endsWith('.localhost')
+				|| hostname === '127.0.0.1' || hostname === '[::1]');
+	} catch {
+		return false;
+	}
+}
+
 /** /voice-tasks/view: the task table on one page, refreshed every second from /voice-tasks. */
 const VOICE_TASKS_VIEW_HTML = `<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
@@ -4298,6 +4310,62 @@ tick();setInterval(tick,1000);
 const server = createServer((req, res) => {
 	const url = new URL(req.url || '/', `http://${req.headers.host}`);
 
+	let dashboardApiPath: string | null = null;
+	if (url.pathname === '/api/dashboard/tasks/active') dashboardApiPath = '/tasks/active';
+	else if (url.pathname === '/api/dashboard/logs/voice') dashboardApiPath = '/logs/voice';
+	else if (url.pathname.startsWith('/api/dashboard/media/')) {
+		dashboardApiPath = `/media/${url.pathname.slice('/api/dashboard/media/'.length)}`;
+	}
+	if (dashboardApiPath !== null) {
+		if (req.method !== 'GET') {
+			res.writeHead(405, { 'Content-Type': 'application/json', 'Allow': 'GET' });
+			res.end(JSON.stringify({ error: 'method not allowed' }));
+			return;
+		}
+		// Same-origin GET fetch sends no Origin, so it is enforced only when
+		// present; 'same-site' stays out — another localhost port would embed media.
+		let sameOriginLoopback: boolean;
+		try {
+			const origin = req.headers.origin ? new URL(req.headers.origin) : null;
+			const host = req.headers.host ? new URL(`http://${req.headers.host}`) : null;
+			const fetchSite = String(req.headers['sec-fetch-site'] ?? '');
+			const sameSiteFetch = fetchSite === '' || fetchSite === 'same-origin' || fetchSite === 'none';
+			sameOriginLoopback = sameSiteFetch && (origin === null
+				|| (!!host
+					&& (origin.protocol === 'http:' || origin.protocol === 'https:')
+					&& origin.host.toLowerCase() === host.host.toLowerCase()
+					&& isLoopbackHost(origin.host)));
+		} catch {
+			sameOriginLoopback = false;
+		}
+		if (!isLoopbackAddress(req.socket.remoteAddress) || !sameOriginLoopback || !isLoopbackHost(req.headers.host)) {
+			res.writeHead(403, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+			res.end(JSON.stringify({ error: 'forbidden' }));
+			return;
+		}
+		const headers: Record<string, string> = {};
+		if (process.env.SUTANDO_API_TOKEN) headers.Authorization = `Bearer ${process.env.SUTANDO_API_TOKEN}`;
+		const proxyReq = httpRequest({
+			host: '127.0.0.1',
+			port: AGENT_API_PORT,
+			path: dashboardApiPath,
+			method: 'GET',
+			headers,
+		}, proxyRes => {
+			res.writeHead(proxyRes.statusCode || 502, {
+				'Content-Type': String(proxyRes.headers['content-type'] || 'application/octet-stream'),
+				'Cache-Control': 'private, no-store',
+			});
+			proxyRes.pipe(res);
+		});
+		proxyReq.on('error', () => {
+			res.writeHead(502, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+			res.end(JSON.stringify({ error: 'agent api unavailable' }));
+		});
+		proxyReq.end();
+		return;
+	}
+
 	// Task history carries owner prompts and result bodies. Keep it behind the
 	// dashboard's same-origin server, forward the configured bearer token, and
 	// reject LAN callers unless the owner explicitly enabled LAN sharing.
@@ -4319,7 +4387,7 @@ const server = createServer((req, res) => {
 		if (token) headers.Authorization = `Bearer ${token}`;
 		const proxyReq = httpRequest({
 			host: '127.0.0.1',
-			port: 7843,
+			port: AGENT_API_PORT,
 			path: isHistory ? '/tasks/history' : '/tasks/workstreams/infer',
 			method: expectedMethod,
 			headers,
