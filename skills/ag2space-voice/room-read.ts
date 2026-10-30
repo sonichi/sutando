@@ -972,8 +972,69 @@ export function createListRoomsTool(deps: { index: RoomIndex; log?: (m: string) 
 	};
 }
 
+/** The marker the owner's own clients read to move their screen: to a room's Commons list, or back one screen
+ *  (fluffy CommonsSummonOpener; the web's agentOpens). Only the owner's screen moves, as a summon's auto-open does. */
+export const NAV_MARKER = 'space.ag2.collab.nav';
+export const NAV_DESTINATIONS = ['commons', 'back'] as const;
+export type NavDestination = (typeof NAV_DESTINATIONS)[number];
+
+export type NavigateResult =
+	| { ok: true; to: NavDestination; room: string | null; posted_in: string; event_id: string | null; ms: number }
+	| { ok: false; error: string; candidates?: string[]; rooms?: string[] };
+
+/**
+ * Moves the owner's own screen: `commons` shows the Commons list of `room` (the session's room when none),
+ * `back` leaves the screen they are on. Posted as a message in the session's room with the nav marker,
+ * which the owner's clients act on; the message itself is one line saying where they are going.
+ */
+export async function navigateOwner(args: { to?: string; room?: string }, deps: ReadRoomDeps): Promise<NavigateResult> {
+	const t0 = Date.now();
+	const client = deps.client();
+	if (!client) return { ok: false, error: 'not_connected' };
+	const to = (args.to ?? '').trim();
+	if (!(NAV_DESTINATIONS as readonly string[]).includes(to)) return { ok: false, error: 'bad_destination' };
+	const here = await targetRoom(undefined, deps);
+	if (!here.ok) return here;
+	const list = to === 'commons' ? await targetRoom(args.room, deps) : null;
+	if (list && !list.ok) return list;
+	const owner = await ownerId(client);
+	if (!owner) return { ok: false, error: 'no_owner' };
+	const listRoom = list && list.ok ? list.room : null;
+	const marker: Record<string, unknown> = { v: 1, to, invitee: owner, ...(listRoom ? { room_id: listRoom.room_id } : {}) };
+	const body = listRoom ? `Opening the Commons of ${listRoom.name}.` : 'Going back.';
+	const done = await roomExecute(client, here.room, 'room.message.send', { body, extra_content: { [NAV_MARKER]: marker } }, deps);
+	if (!done.ok) return done;
+	deps.log?.(`[RoomRead] navigate ${to}${listRoom ? ` (${listRoom.name})` : ''} in ${here.room.name}`);
+	return { ok: true, to: to as NavDestination, room: listRoom?.name ?? null, posted_in: here.room.name, event_id: typeof done.result.event_id === 'string' ? done.result.event_id : null, ms: Date.now() - t0 };
+}
+
+export function createNavigateSpaceTool(deps: ReadRoomDeps): ToolDefinition {
+	return {
+		name: 'navigate_space',
+		description:
+			'Move the user\'s own screen in the AG2 Space app, as run_room_action room.commons.summon opens a page for them. ' +
+			'`to` "commons" shows the Commons list of a room — the current one, or `room` by name ("go to the Commons list", "打开 commons 列表", "show me what is in <room>\'s Commons"); ' +
+			'"back" leaves the screen they are on, one step ("go back", "回去", "退出文档", "close the page"), so page → list → room walks back the way they came. ' +
+			'Runs at once — no read-back, no yes — then say in a few words where they are now. Only the user\'s own screen moves (their phone and web client), never anyone else\'s. ' +
+			'Errors: "bad_destination" — only "commons" or "back"; "no_owner" — say it could not be done; ' + ROOM_NAME_ERRORS +
+			'"not_connected", "timeout" or "unavailable" — say it could not be done right now; ' + OUTCOME_UNKNOWN_ERROR,
+		parameters: z.object({
+			to: z.enum(NAV_DESTINATIONS).describe('"commons" for a room\'s Commons list; "back" to leave the current screen.'),
+			room: z.string().optional().describe('For "commons": the room whose Commons list to show, by name. Omit for the current room.'),
+		}),
+		execution: 'inline',
+		timeout: ROOM_INDEX_COLD_TIMEOUT_MS + ROOM_COMMONS_TIMEOUT_MS + 1000,
+		async execute(args) {
+			const a = (args ?? {}) as { to: string; room?: string };
+			const r = await navigateOwner(a, deps);
+			deps.log?.(`[RoomRead] navigate_space ${a.to} → ${r.ok ? `posted in ${r.ms}ms` : r.error}`);
+			return r;
+		},
+	};
+}
+
 /** The prompt rule that goes with the tool; present only when the tool is declared. */
-export const ROOM_READ_PROMPT_RULE = '- ROOM MESSAGES: a question about an AG2 Space room is answered from the room, every time, never from memory or an earlier answer — what a room holds and who can read it change, so an earlier answer or task result about a room is never the answer now. "What\'s new in <room>", "did <person> reply there" → read_room. "What was said about <PR/topic/person> in <room>", "what was the review of <PR> there", anything that may be earlier than the latest messages → search_room, then read_room with `around` for the discussion. What a message in a room means, or why someone said it, is answered from that message: read_room with `around` for its full text, then explain. A room\'s documents, pages, notes, plans or tables ("is there a doc about X in <room>", "what does the design page say") → search_commons, then read_page for a whole page. A note the user wants written into a room\'s Commons ("write this down in <room>", "add to the design page: …") → say back the exact title, text and room, and call write_page only after a clear yes; a comment or 留言 on a page → add_comment the same way, never an appended line; something to say or post in a room\'s chat ("tell <room> that …", "reply to <person>: …") → send_message the same way, @-mentioning someone only when the user asked to. After the yes, the call comes in that same turn. Never submit work to read, search or explain a room or its documents, or to write a note, a comment or a message into one; submit work only when the room\'s messages do not hold the answer and the user wants it looked up elsewhere. Pass the room name as it appears in the ROOMS line, not as it was heard; a "not_found" lists the rooms — pick the one meant and call again.';
+export const ROOM_READ_PROMPT_RULE ='- ROOM MESSAGES: a question about an AG2 Space room is answered from the room, every time, never from memory or an earlier answer — what a room holds and who can read it change, so an earlier answer or task result about a room is never the answer now. "What\'s new in <room>", "did <person> reply there" → read_room. "What was said about <PR/topic/person> in <room>", "what was the review of <PR> there", anything that may be earlier than the latest messages → search_room, then read_room with `around` for the discussion. What a message in a room means, or why someone said it, is answered from that message: read_room with `around` for its full text, then explain. A room\'s documents, pages, notes, plans or tables ("is there a doc about X in <room>", "what does the design page say") → search_commons, then read_page for a whole page. A note the user wants written into a room\'s Commons ("write this down in <room>", "add to the design page: …") → say back the exact title, text and room, and call write_page only after a clear yes; a comment or 留言 on a page → add_comment the same way, never an appended line; something to say or post in a room\'s chat ("tell <room> that …", "reply to <person>: …") → send_message the same way, @-mentioning someone only when the user asked to. After the yes, the call comes in that same turn. Never submit work to read, search or explain a room or its documents, or to write a note, a comment or a message into one; submit work only when the room\'s messages do not hold the answer and the user wants it looked up elsewhere. Pass the room name as it appears in the ROOMS line, not as it was heard; a "not_found" lists the rooms — pick the one meant and call again. To move the user\'s own screen — a room\'s Commons list ("go to the Commons list", "commons 列表") or one step back ("go back", "回去", "退出文档") → navigate_space at once, no confirmation; to open a page, the summon in OTHER AG2 SPACE ACTIONS.';
 
 /** What the relay agent\'s turn check is told: a room question is the voice model\'s own, never a task for the core. */
 export const ROOM_TURN_CHECK_RULE = '- none: a question about an AG2 Space room\'s messages or documents — what is new there, who replied, what someone said there about a PR, topic or person, what a message there means, whether the room has a doc, page, note or table about something and what it says — is answered by the assistant itself, which reads and searches the room. It is never work, even when it names a PR. A note, comment or message the user wants written into a room — into its documents ("write this down in <room>", "add to the page", "comment on the doc", 留言) or its chat ("tell <room> that …", "reply to <person> in <room>") — is also the assistant\'s own (it asks for the text if it is missing, reads it back, then writes it): none, even while the text is still missing — never ask. Only another action (review a PR, merge, change code or settings, anything outside the room) is work.';

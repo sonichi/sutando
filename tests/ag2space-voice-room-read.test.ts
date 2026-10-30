@@ -27,6 +27,7 @@ const {
 	searchRoom, createSearchRoomTool, toHitLines, ROOM_SEARCH_DEFAULT_LIMIT, ROOM_TURN_CHECK_RULE,
 	searchCommons, readPage, toCommonsHits, createSearchCommonsTool, createReadPageTool, ROOM_COMMONS_DEFAULT_LIMIT, ROOM_COMMONS_TIMEOUT_MS, ROOM_PAGE_MAX_BYTES, ROOM_PAGE_MAX_CHARS,
 	writePage, createWritePageTool, ROOM_WRITE_TEXT_MAX, addComment, createAddCommentTool, sendMessage, createSendMessageTool,
+	navigateOwner, createNavigateSpaceTool, NAV_MARKER,
 	ROOM_READ_BODY_MAX, ROOM_READ_DEFAULT_LIMIT, ROOM_READ_PROMPT_RULE,
 } = await import(pathToFileURL(join(PLUGIN_DIR, 'room-read.ts')).href);
 
@@ -348,7 +349,7 @@ describe('readRoom: every outcome is something the model can say', () => {
 	it('read_room is declared as a tool that fetches the answer, so the turn check does not also send the turn', () => {
 		const src = readFileSync(join(PLUGIN_DIR, 'tools.ts'), 'utf-8');
 		assert.match(src, /answeringTools: \[\.\.\.\(where \? \[where\.name\] : \[\]\), \.\.\.roomRead\.tools\.map\(\(t\) => t\.name\)\]/);
-		assert.match(src, /tools: \[read, search, commons, page, write, comment, message, list, \.\.\.open\]/, 'list_rooms, search_room, search_commons, read_page, write_page, add_comment and send_message are declared with read_room');
+		assert.match(src, /tools: \[read, search, commons, page, write, comment, message, navigate, list, \.\.\.open\]/, 'list_rooms, search_room, search_commons, read_page, write_page, add_comment, send_message and navigate_space are declared with read_room');
 		assert.match(src, /roomIndexContextLines\(index\)/, 'the room names are in every prompt');
 		assert.match(src, /_rooms\.refresh\(\)\.then\(/, 'the index is the warm-up');
 	});
@@ -419,7 +420,7 @@ describe('searchRoom: what was said about something, however far back', () => {
 		assert.match(ROOM_TURN_CHECK_RULE, /^- none: a question about an AG2 Space room's messages/);
 		assert.match(ROOM_TURN_CHECK_RULE, /never work, even when it names a PR/);
 		const src = readFileSync(join(PLUGIN_DIR, 'tools.ts'), 'utf-8');
-		assert.match(src, /tools: \[read, search, commons, page, write, comment, message, list, \.\.\.open\]/, 'search_room, search_commons, read_page, write_page, add_comment and send_message are declared with read_room, all answering tools through the same map');
+		assert.match(src, /tools: \[read, search, commons, page, write, comment, message, navigate, list, \.\.\.open\]/, 'search_room, search_commons, read_page, write_page, add_comment, send_message and navigate_space are declared with read_room, all answering tools through the same map');
 		assert.match(src, /turnCheckRules: \[ROOM_TURN_CHECK_RULE, ROOM_ACTIONS_TURN_CHECK_RULE\]/, 'the turn check is told');
 	});
 });
@@ -872,6 +873,72 @@ describe('read_room lines carry each message\'s event_id and its time, whatever 
 		assert.deepEqual(lines.map(l => l.event_id), [undefined, '$old', '$new']);
 		assert.ok(lines[2].at && lines[1].at);
 		assert.equal(lines[0].at, '');
+	});
+});
+
+
+describe('navigate_space: the owner\'s own screen, moved by a nav marker in the session\'s room (Susan 2026-10-30)', () => {
+	type Call = { name: string; args: Record<string, unknown> };
+	const fake = (handler: (name: string, args: Record<string, unknown>) => unknown) => {
+		const calls: Call[] = [];
+		return { calls, client: { async callTool(name: string, args: Record<string, unknown>) { calls.push({ name, args }); const r = handler(name, args); if (r instanceof Error) throw r; return r; }, close() {} } };
+	};
+	const done = (result: Record<string, unknown>) => ({ structuredContent: { status: 'completed', result } });
+	const rooms = [{ room_id: '!dm:ag2.space', name: 'Susan & Bot' }, { room_id: '!paper:ag2.space', name: 'Paper QA' }];
+	const handler = (name: string) => name === 'ag2.whoami' ? { structuredContent: { actor: { id: '@bot:ag2.space' }, runtime: { owner_id: '@owner:ag2.space' } } } : done({ event_id: '$nav' });
+	const deps = (client: { callTool: (n: string, a: Record<string, unknown>) => Promise<unknown>; close(): void }, current: { id: string; name: string } | null = { id: '!dm:ag2.space', name: 'Susan & Bot' }) =>
+		({ client: () => client as never, currentRoom: () => current, index: { rooms: () => rooms, refresh: async () => rooms, fetchedAt: () => Date.now() }, log: () => {} });
+
+	it('"go to the Commons list": the marker names the session\'s room and the owner, posted in that room, at once', async () => {
+		const f = fake(handler);
+		const r = await navigateOwner({ to: 'commons' }, deps(f.client));
+		assert.deepEqual(r, { ok: true, to: 'commons', room: 'Susan & Bot', posted_in: 'Susan & Bot', event_id: '$nav', ms: r.ok ? r.ms : -1 });
+		const send = f.calls.find(c => c.name === 'room.action.execute')!;
+		assert.equal(send.args.room_id, '!dm:ag2.space');
+		assert.equal(send.args.action, 'room.message.send');
+		assert.deepEqual(send.args.arguments, { body: 'Opening the Commons of Susan & Bot.', extra_content: { [NAV_MARKER]: { v: 1, to: 'commons', invitee: '@owner:ag2.space', room_id: '!dm:ag2.space' } } });
+		assert.equal(typeof send.args.operation_id, 'string');
+	});
+
+	it('another room\'s list by name: the marker names that room, the message still goes to the session\'s room', async () => {
+		const f = fake(handler);
+		const r = await navigateOwner({ to: 'commons', room: 'Paper QA' }, deps(f.client));
+		assert.ok(r.ok && r.room === 'Paper QA' && r.posted_in === 'Susan & Bot');
+		const send = f.calls.find(c => c.name === 'room.action.execute')!;
+		assert.equal(send.args.room_id, '!dm:ag2.space');
+		assert.equal(((send.args.arguments as { extra_content: Record<string, { room_id: string }> }).extra_content)[NAV_MARKER].room_id, '!paper:ag2.space');
+	});
+
+	it('"go back": no room in the marker', async () => {
+		const f = fake(handler);
+		const r = await navigateOwner({ to: 'back', room: 'ignored by back? no: back names no room' }, deps(f.client));
+		assert.ok(r.ok && r.to === 'back' && r.room === null);
+		const send = f.calls.find(c => c.name === 'room.action.execute')!;
+		assert.deepEqual(send.args.arguments, { body: 'Going back.', extra_content: { [NAV_MARKER]: { v: 1, to: 'back', invitee: '@owner:ag2.space' } } });
+	});
+
+	it('refused, and nothing posted: a destination it does not know, no session room, a misheard room, no owner, no client', async () => {
+		const f = fake(handler);
+		assert.deepEqual(await navigateOwner({ to: 'settings' }, deps(f.client)), { ok: false, error: 'bad_destination' });
+		assert.deepEqual(await navigateOwner({ to: 'back' }, deps(f.client, null)), { ok: false, error: 'no_room' });
+		assert.deepEqual(await navigateOwner({ to: 'commons', room: 'Paper QB' }, deps(f.client)), { ok: false, error: 'not_found', rooms: ['Susan & Bot', 'Paper QA'] });
+		assert.equal(f.calls.filter(c => c.name === 'room.action.execute').length, 0);
+		const noOwner = fake((name) => name === 'ag2.whoami' ? { structuredContent: { actor: { id: '@bot2:ag2.space' }, runtime: {} } } : done({}));
+		assert.deepEqual(await navigateOwner({ to: 'back' }, deps(noOwner.client)), { ok: false, error: 'no_owner' });
+		assert.deepEqual(await navigateOwner({ to: 'back' }, { ...deps(f.client), client: () => null }), { ok: false, error: 'not_connected' });
+	});
+
+	it('the tool: at once, own screen only, both destinations; it answers through navigateOwner', async () => {
+		const f = fake(handler);
+		const tool = createNavigateSpaceTool(deps(f.client));
+		assert.equal(tool.name, 'navigate_space');
+		assert.equal(tool.execution, 'inline');
+		assert.match(tool.description, /Runs at once — no read-back, no yes/);
+		assert.match(tool.description, /Only the user's own screen moves/);
+		assert.match(tool.description, /"back" leaves the screen they are on, one step/);
+		const r = (await tool.execute({ to: 'back' }, {} as never)) as { ok: boolean };
+		assert.equal(r.ok, true);
+		assert.match(ROOM_READ_PROMPT_RULE, /→ navigate_space at once, no confirmation/);
 	});
 });
 
