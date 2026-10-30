@@ -27,7 +27,7 @@ const {
 	searchRoom, createSearchRoomTool, toHitLines, ROOM_SEARCH_DEFAULT_LIMIT, ROOM_TURN_CHECK_RULE,
 	searchCommons, readPage, toCommonsHits, createSearchCommonsTool, createReadPageTool, ROOM_COMMONS_DEFAULT_LIMIT, ROOM_COMMONS_TIMEOUT_MS, ROOM_PAGE_MAX_BYTES, ROOM_PAGE_MAX_CHARS,
 	writePage, createWritePageTool, ROOM_WRITE_TEXT_MAX, addComment, createAddCommentTool, sendMessage, createSendMessageTool,
-	ROOM_READ_BODY_MAX, ROOM_READ_DEFAULT_LIMIT, ROOM_READ_PROMPT_RULE,
+	ROOM_READ_BODY_MAX, ROOM_READ_DEFAULT_LIMIT, ROOM_READ_PROMPT_RULE, mcpFailure,
 } = await import(pathToFileURL(join(PLUGIN_DIR, 'room-read.ts')).href);
 
 const dirs: string[] = [];
@@ -224,6 +224,27 @@ describe('the room index: the rooms the agent can read, with their real names', 
 		fail = true;
 		assert.deepEqual(await tool.execute({}, {} as never), { ok: false, error: 'unavailable', rooms: ['Sutando Triage'] });
 	});
+
+	it('mcpFailure: the proxy names the credential state; everything else stays timeout or unavailable', () => {
+		assert.equal(mcpFailure('tools/call timed out after 6000ms'), 'timeout');
+		assert.equal(mcpFailure('room.list: no registry bearer in lane env'), 'no_credential');
+		for (const code of ['AGENT_CREDENTIAL_STALE', 'AGENT_CREDENTIAL_REVOKED', 'AGENT_CREDENTIAL_UNKNOWN', 'AGENT_CREDENTIAL_INELIGIBLE'])
+			assert.equal(mcpFailure(`room.list: AG2 MCP could not obtain a token (no call was made): mint: bearer rejected (${code}, not recoverable)`), 'credential_refused', code);
+		assert.equal(mcpFailure('room.list: AG2 MCP authentication failed after re-mint: the agent credential is invalid or revoked'), 'credential_refused');
+		// A code-less 401 is a wrong endpoint, not a refused credential.
+		assert.equal(mcpFailure("room.list: AG2 MCP could not obtain a token (no call was made): mint: 401 without a `code` field — x is not core-api's mint endpoint (wrong mint_url), not a bad bearer"), 'unavailable');
+		assert.equal(mcpFailure('ag2-space MCP exited (1)'), 'unavailable');
+	});
+
+	it('list_rooms reports a missing credential as no_credential, not unavailable', async () => {
+		const f = fake(() => new Error('room.list: no registry bearer in lane env'));
+		const tool = createListRoomsTool({ index: createRoomIndex({ client: () => f.client }) });
+		assert.deepEqual(await tool.execute({}, {} as never), { ok: false, error: 'no_credential', rooms: [] });
+	});
+
+	it('the prompt rule tells the model a credential error means reconnect, not "unavailable"', () => {
+		assert.match(ROOM_READ_PROMPT_RULE, /"no_credential" or "credential_refused" from any room tool means your AG2 Space connection needs the owner to reconnect it/);
+	});
 });
 
 describe('readRoom: every outcome is something the model can say', () => {
@@ -298,11 +319,24 @@ describe('readRoom: every outcome is something the model can say', () => {
 		assert.deepEqual(await readRoom({ room: '!a:x' }, { client: () => slow.client, currentRoom: () => null, index: idx([], slow.client) }), { ok: false, error: 'timeout' });
 		const down = fake(() => new Error('ag2-space MCP exited (1)'));
 		assert.deepEqual(await readRoom({ room: '!a:x' }, { client: () => down.client, currentRoom: () => null, index: idx([], down.client) }), { ok: false, error: 'unavailable' });
+		// The proxy's own error texts: a missing credential and a refused one need the owner to reconnect.
+		const noBearer = fake(() => new Error('room.action.read: no registry bearer in lane env'));
+		assert.deepEqual(await readRoom({ room: '!a:x' }, { client: () => noBearer.client, currentRoom: () => null, index: idx([], noBearer.client) }), { ok: false, error: 'no_credential' });
+		const revoked = fake(() => new Error('room.action.read: AG2 MCP could not obtain a token (no call was made): mint: bearer rejected (AGENT_CREDENTIAL_REVOKED, not recoverable). The credential in AG2_REMOTE_TOKEN (/x/.env) was refused; access was revoked by the owner'));
+		assert.deepEqual(await readRoom({ room: '!a:x' }, { client: () => revoked.client, currentRoom: () => null, index: idx([], revoked.client) }), { ok: false, error: 'credential_refused' });
 		const refused = fake(() => ({ isError: true, content: [{ type: 'text', text: '{"code":"ROOM_ACCESS_DENIED"}' }] }));
 		assert.deepEqual(await readRoom({ room: '!a:x' }, { client: () => refused.client, currentRoom: () => null, index: idx([], refused.client) }), { ok: false, error: 'ROOM_ACCESS_DENIED' });
 		// A miss whose refresh fails is still not_found, with what the index last held.
 		const stale = idx([{ room_id: '!a:x', name: 'Sutando Triage' }], down.client);
 		assert.deepEqual(await readRoom({ room: 'Sutando Triaging' }, { client: () => down.client, currentRoom: () => null, index: stale }), { ok: false, error: 'not_found', rooms: ['Sutando Triage'] });
+	});
+
+	it('a room named while the credential is missing or refused says reconnect, not not_found, even from an empty index', async () => {
+		const noBearer = fake(() => new Error('room.list: no registry bearer in lane env'));
+		const cold = createRoomIndex({ client: () => noBearer.client as never });
+		assert.deepEqual(await readRoom({ room: 'Qingyun Group' }, { client: () => noBearer.client, currentRoom: () => null, index: cold }), { ok: false, error: 'no_credential' });
+		const revoked = fake(() => new Error('room.list: AG2 MCP authentication failed after re-mint'));
+		assert.deepEqual(await readRoom({ room: 'Qingyun Group' }, { client: () => revoked.client, currentRoom: () => null, index: createRoomIndex({ client: () => revoked.client as never }) }), { ok: false, error: 'credential_refused' });
 	});
 
 	it('around a search hit: the read is placed at that message, not the latest', async () => {
@@ -559,6 +593,17 @@ describe('write_page: a spoken note into a room\'s Commons, after the user\'s ye
 		assert.equal(unknown.ok, false);
 		assert.equal((unknown as { error: string }).error, 'outcome_unknown');
 		assert.equal(slow.calls.length, 1);
+	});
+
+	it('a write refused for a missing or rejected credential ran nothing: reconnect, with no operation_id; any other throw stays outcome_unknown', async () => {
+		const noBearer = fake(() => new Error('room.action.execute: no registry bearer in lane env'));
+		assert.deepEqual(await writePage({ room: '!a:x', title: 't', text: 'n' }, deps(noBearer.client, [])), { ok: false, error: 'no_credential' });
+		const revoked = fake(() => new Error('room.action.execute: mint: bearer rejected (AGENT_CREDENTIAL_REVOKED, not recoverable)'));
+		assert.deepEqual(await sendMessage({ room: '!a:x', text: 'hi' }, deps(revoked.client, [])), { ok: false, error: 'credential_refused' });
+		const broke = fake(() => new Error('ag2-space MCP exited (1)'));
+		const r = await sendMessage({ room: '!a:x', text: 'hi' }, deps(broke.client, []));
+		assert.equal((r as { error: string }).error, 'outcome_unknown');
+		assert.equal(typeof (r as { operation_id?: string }).operation_id, 'string');
 	});
 
 	it('the tool is inline; its description and the rules make the read-back and the user\'s yes the condition, and keep the turn check out', async () => {

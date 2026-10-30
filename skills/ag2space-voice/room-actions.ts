@@ -5,7 +5,7 @@ import { randomBytes, randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
 import {
-	mcpPayload, ownerId, roomExecute, roomRead, targetRoom, OUTCOME_UNKNOWN, OUTCOME_UNKNOWN_ERROR, ROOM_COMMONS_TIMEOUT_MS, ROOM_INDEX_COLD_TIMEOUT_MS, ROOM_NAME_ERRORS,
+	mcpFailure, mcpPayload, ownerId, roomExecute, roomRead, targetRoom, OUTCOME_UNKNOWN, OUTCOME_UNKNOWN_ERROR, ROOM_COMMONS_TIMEOUT_MS, ROOM_INDEX_COLD_TIMEOUT_MS, ROOM_NAME_ERRORS,
 	type ReadRoomDeps, type RoomRef,
 } from './room-read.js';
 
@@ -52,7 +52,7 @@ async function catalogCall(deps: ReadRoomDeps, tool: string, scope: Scope, room:
 	} catch (err) {
 		const why = err instanceof Error ? err.message : String(err);
 		deps.log?.(`[RoomActions] ${tool} failed: ${why}`);
-		return { ok: false, error: /timed out/.test(why) ? 'timeout' : 'unavailable' };
+		return { ok: false, error: mcpFailure(why) };
 	}
 }
 
