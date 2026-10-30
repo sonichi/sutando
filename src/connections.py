@@ -110,6 +110,8 @@ LEGACY_PATH_SEGMENT = "legacy"
 RESERVED_INSTANCES = ("known-servers", "token", "park-legacy", LEGACY_PATH_SEGMENT)
 _ENV_VAR_RE = re.compile(r"^AG2_REMOTE_TOKEN_([A-Za-z0-9_]+)$")
 _MXID_RE = re.compile(r"^@[^:]+:([A-Za-z0-9.-]+)(?::\d+)?$")
+# Matched whole: a gateway's whoami is a new input, and its id reaches a process environment.
+_STRICT_MXID_RE = re.compile(r"@[a-z0-9._=/+-]+:[A-Za-z0-9.-]+(?::[0-9]{1,5})?")
 _REQUIRED = ("server", "instance", "gateway_url", "token_ref", "primary", "added_by", "added_at", "verified",
              "server_source")
 # What the gateway's agent listing says about the one agent a verified preview names; never a secret.
@@ -618,7 +620,8 @@ def preview_connection(token: str, *, fetch: Optional[Callable] = None, resolver
     true only when the listing names one agent whose server is the DotSpace the resolver
     registers for the gateway host. An unregistered host stays the server itself, whatever the
     listing claims. A listing of several agents (an owner-scoped one) is settled by the gateway's
-    `whoami` for the bearer, taken only for an agent of that same server; a caller that injects
+    `whoami` for the bearer, taken only for an agent of that same server that a non-empty listing
+    also names; a caller that injects
     `fetch` without `whoami` asks no whoami. The gateway URL must be https and its host a public server name: an http
     URL, an address, a reserved or single-label name, or a name resolving to any non-public
     address is refused as invalid_gateway before any probe; the probe is pinned to the vetted
@@ -662,8 +665,8 @@ def preview_connection(token: str, *, fetch: Optional[Callable] = None, resolver
         out.update(_identity_of(named[0]), server_source="identity", verified=True)
     elif registered and whoami is not None:
         mine = _whoami_agent(whoami, url, token, address)
-        if mine and server_of_mxid(mine) == registered:
-            entry = next((a for a in named if a["id"] == mine), {"id": mine})
+        entry = next((a for a in named if a["id"] == mine), None if named else {"id": mine})
+        if mine and server_of_mxid(mine) == registered and entry is not None:
             out.update(_identity_of(entry), server_source="identity", verified=True)
     return out
 
@@ -675,7 +678,7 @@ def _whoami_agent(whoami: Callable, url: str, token: str, address: str) -> str:
     except Exception:  # noqa: BLE001 - an older gateway without whoami leaves the listing's verdict
         return ""
     mxid = answer.get("agent_mxid") if isinstance(answer, dict) else None
-    return mxid if isinstance(mxid, str) and server_of_mxid(mxid) else ""
+    return mxid if isinstance(mxid, str) and _STRICT_MXID_RE.fullmatch(mxid) else ""
 
 
 def _identity_of(agent: Mapping[str, object]) -> dict:
@@ -2187,51 +2190,78 @@ def _verified_agent(token: str, fetch=None, getaddrinfo=None) -> str:
     return mxid if isinstance(mxid, str) else ""
 
 
+def _learn_row_identity(row: Mapping[str, object], token_of: Callable, workspace: Optional[Path], *,
+                        fetch=None, getaddrinfo=None, whoami=None) -> Optional[bool]:
+    """Learn onto one enabled row that names no agent the identity its token (`token_of(row)`)
+    answers to; True when it learned one, False when it asked and did not, None when the row needs
+    no asking. The record is written only for a verified preview."""
+    if row.get("agent_mxid") or row.get("disabled") or row.get("parked"):
+        return None
+    try:
+        token = token_of(row)
+        if not token:
+            return False
+        seen = preview_connection(token, fetch=fetch, getaddrinfo=getaddrinfo, whoami=whoami)
+        if not seen.get("verified"):
+            return False
+        return bool(learn_identity(str(row["instance"]), seen, workspace=workspace).get("agent_mxid"))
+    except ConnectionsError:
+        return False
+
+
 def _learn_missing_identity(instance: str, environ: Mapping[str, str], workspace: Optional[Path], vault,
                             fetch=None, getaddrinfo=None) -> None:
-    """Learn onto a launchable named row that has no agent the identity its own token answers to."""
+    """Learn onto a launchable named row that has no agent the identity the token its bridge runs on
+    answers to; launch_env refuses the row that is still without one."""
     row = _row_named(instance, workspace)
-    if not instance or row is None or row.get("agent_mxid") or row.get("disabled") or row.get("parked"):
+    if not instance or row is None:
         return
-    ref = str(row["token_ref"])
-    token = (environ.get(ref) or "").strip() or _vault_get(_vault(vault), ref)
-    if not token:
-        return  # launch_env names the missing token
-    try:
-        learn_identity(instance, preview_connection(token, fetch=fetch, getaddrinfo=getaddrinfo), workspace=workspace)
-    except ConnectionsError:
-        pass  # launch_env refuses the row that is still without one
 
-
-def learn_missing_identities(workspace: Optional[Path] = None, *, environ: Optional[Mapping[str, str]] = None,
-                             vault=None, fetch=None, getaddrinfo=None, whoami=None) -> list:
-    """Learn, onto every enabled row that names no agent (the legacy row included), the identity its
-    own token answers to; the instances that learned one. A row whose token or probe fails is left."""
-    learned = []
-    for row in read_rows(workspace):
-        if row.get("agent_mxid") or row.get("disabled") or row.get("parked"):
-            continue
-        try:
-            _, token = connection_credential(row, environ, vault=vault)
-            seen = preview_connection(token, fetch=fetch, getaddrinfo=getaddrinfo, whoami=whoami)
-            if learn_identity(str(row["instance"]), seen, workspace=workspace).get("agent_mxid"):
-                learned.append(str(row["instance"]))
-        except ConnectionsError:
-            continue
-    return learned
+    def token_of(r):
+        ref = str(r["token_ref"])
+        return (environ.get(ref) or "").strip() or _vault_get(_vault(vault), ref)
+    _learn_row_identity(row, token_of, workspace, fetch=fetch, getaddrinfo=getaddrinfo)
 
 
 IDENTITY_LEARN_INTERVAL_S = 60.0
+IDENTITY_LEARN_MAX_BACKOFF_S = 3600.0
+
+
+def learn_missing_identities(workspace: Optional[Path] = None, *, environ: Optional[Mapping[str, str]] = None,
+                             vault=None, fetch=None, getaddrinfo=None, whoami=None,
+                             backoff: Optional[dict] = None, clock: Callable[[], float] = time.monotonic,
+                             interval_s: float = IDENTITY_LEARN_INTERVAL_S) -> list:
+    """Learn, onto every enabled row that names no agent (the legacy row included), the identity its
+    own token answers to; the instances that learned one. With `backoff` (instance -> (due, delay)),
+    a row that did not learn waits twice as long each pass, up to `IDENTITY_LEARN_MAX_BACKOFF_S`."""
+    learned = []
+    for row in read_rows(workspace):
+        inst = str(row["instance"])
+        if backoff is not None and inst in backoff and clock() < backoff[inst][0]:
+            continue
+        got = _learn_row_identity(row, lambda r: connection_credential(r, environ, vault=vault)[1], workspace,
+                                  fetch=fetch, getaddrinfo=getaddrinfo, whoami=whoami)
+        if got:
+            learned.append(inst)
+        if backoff is not None:
+            if got is False:
+                delay = min(backoff[inst][1] * 2, IDENTITY_LEARN_MAX_BACKOFF_S) if inst in backoff else interval_s
+                backoff[inst] = (clock() + delay, delay)
+            else:
+                backoff.pop(inst, None)
+    return learned
 
 
 def run_identity_learner(stop_event, workspace: Optional[Path] = None, *,
                          interval_s: float = IDENTITY_LEARN_INTERVAL_S, vault=None) -> None:
-    """Until `stop_event`: `learn_missing_identities` now, then every `interval_s`; never raises."""
+    """Until `stop_event`: `learn_missing_identities` now, then every `interval_s`, each row that
+    did not learn backing off; never raises."""
+    backoff: dict = {}
     while not stop_event.is_set():
         try:
-            learn_missing_identities(workspace, vault=vault)
-        except Exception:  # noqa: BLE001 - a failed pass only waits for the next one
-            pass
+            learn_missing_identities(workspace, vault=vault, backoff=backoff, interval_s=interval_s)
+        except Exception as e:  # noqa: BLE001 - a failed pass only waits for the next one
+            logging.getLogger(__name__).warning("connections: identity pass failed (%s)", type(e).__name__)
         stop_event.wait(interval_s)
 
 
