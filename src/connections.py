@@ -1444,7 +1444,8 @@ def promote(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Mapp
 
     In order: under the record lock, clear the row's `parked` flag and flip the primary to it, so
     `launch_env` gives its bridge the proactive room; stop the row's bridge if one runs (it was
-    launched as a secondary, without the room) and `start` it; wait up to `CONNECT_TIMEOUT_S` for
+    launched as a secondary, without the room) and `start` it, unless that bridge is already connected:
+    then it keeps running through the flip and the row carries `relaunch_needed`; wait up to `CONNECT_TIMEOUT_S` for
     that bridge's own status to show the gateway accepted its token; then, under one hold of the
     record lock, confirm the flip. The old owner's bridge (`_owner_row` before the flip) keeps
     running as a secondary unless `park`: then it is stopped by the stop path `disconnect` uses and
@@ -1481,8 +1482,10 @@ def promote(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Mapp
     start_kw = dict(repo=repo, logs_dir=logs_dir, environ=environ, workspace=workspace, vault=vault,
                     spawn=spawn, python=python)
     try:
-        if not was_primary:
-            undo["relaunched"] = bool(_stop_row(snapshot, workspace, kill))
+        if not was_primary and not _connected_bridge(snapshot, workspace):
+            # A stop that signals and then is refused has still taken it down: rollback restarts it.
+            undo["relaunched"] = any(bridge_pid(i, workspace) for i in [instance] + alias_instances(snapshot))
+            _stop_row(snapshot, workspace, kill)
         launch = start(instance, **start_kw)
         if not launch.get("ok"):
             raise NewPrimaryNotStarted(instance, str(launch.get("reason") or "launch_failed"))
@@ -1532,6 +1535,17 @@ def promote(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Mapp
                changed=parked is not None or bool(legacy_stopped) or was_parked or not was_primary,
                relaunch_needed=launch.get("lease") in ("already_running", "alias_running") and not was_primary)
     return out
+
+
+def _connected_bridge(row: Mapping[str, object], workspace: Optional[Path]) -> int:
+    """The pid of the row's bridge when it holds the lease and its own status says connected; else 0."""
+    inst = str(row["instance"])
+    try:
+        pid = bridge_pid(inst, workspace)
+    except BridgeLeaseIndeterminate:
+        return 0
+    sidecar = _sidecar(inst, workspace)
+    return pid if pid and sidecar.get("pid") == pid and sidecar.get("connected") and not _writer_gone(sidecar) else 0
 
 
 def _promote_legacy(workspace: Optional[Path], kill, park: bool = False) -> dict:

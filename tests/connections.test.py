@@ -2560,11 +2560,39 @@ class Promote(PromoteFixtures):
         self.assertEqual(self.spawned_env, [(self.BETA, self.ROOM)], "primary at spawn time, room in its env")
         self.assertIs(out["relaunch_needed"], False)
 
+    def test_a_connected_secondary_keeps_running_through_the_flip_and_asks_for_a_relaunch(self):
+        self.legacy()
+        first = C.start(self.BETA, repo=self.ws / "repo", logs_dir=self.ws / "logs", environ={"REMOTE_PROACTIVE_ROOM": self.ROOM},
+                        workspace=self.ws, vault=self.vault, spawn=self.spawn)
+        out = self.promote(self.BETA, environ={"REMOTE_PROACTIVE_ROOM": self.ROOM})
+        self.assertNotIn(("kill", first["pid"]), self.events, "a connected bridge is never stopped by the promote")
+        self.assertEqual(len(self.spawned_env), 1, "nothing was relaunched")
+        self.assertEqual((out["launch"]["lease"], out["relaunch_needed"], C.primary_instance(self.ws)),
+                         ("already_running", True, self.BETA))
+        self.assertEqual(C.bridge_pid(self.BETA, self.ws), first["pid"])
+
+    def test_a_secondary_whose_stop_took_it_down_and_then_was_refused_is_started_again(self):
+        self.legacy()
+        first = C.start(self.BETA, repo=self.ws / "repo", logs_dir=self.ws / "logs", environ={}, workspace=self.ws,
+                        vault=self.vault, spawn=self.spawn)
+        self.sidecar(self.BETA, connected=False, pid=first["pid"])
+        real = C.stop_bridge
+
+        def stops_then_refuses(instance, **kw):
+            pid = real(instance, **kw)
+            raise C.BridgeStillRunning(instance, pid, "process still running after it released its lease")
+        with unittest.mock.patch.object(C, "stop_bridge", stops_then_refuses), self.assertRaises(C.BridgeStillRunning):
+            self.promote(self.BETA)
+        self.assertTrue(C.bridge_pid(self.BETA, self.ws), "the rollback started the stopped bridge again")
+        self.assertNotEqual(C.bridge_pid(self.BETA, self.ws), first["pid"])
+        self.assertEqual(C.primary_instance(self.ws), "")
+
     def test_a_running_secondary_is_relaunched_as_the_primary_with_the_room(self):
         self.legacy()
         first = C.start(self.BETA, repo=self.ws / "repo", logs_dir=self.ws / "logs", environ={"REMOTE_PROACTIVE_ROOM": self.ROOM},
                         workspace=self.ws, vault=self.vault, spawn=self.spawn)
         self.assertEqual(self.spawned_env, [("", "")], "started as a secondary, without the room")
+        self.sidecar(self.BETA, connected=False, pid=first["pid"])
         out = self.promote(self.BETA, environ={"REMOTE_PROACTIVE_ROOM": self.ROOM})
         self.assertIn(("kill", first["pid"]), self.events, "the secondary bridge is stopped")
         self.assertEqual(self.spawned_env[-1], (self.BETA, self.ROOM))
@@ -2609,8 +2637,9 @@ class Promote(PromoteFixtures):
 
     def test_a_secondary_stopped_for_the_relaunch_comes_back_when_the_promote_rolls_back(self):
         self.legacy()
-        C.start(self.BETA, repo=self.ws / "repo", logs_dir=self.ws / "logs", environ={}, workspace=self.ws,
-                vault=self.vault, spawn=self.spawn)
+        first = C.start(self.BETA, repo=self.ws / "repo", logs_dir=self.ws / "logs", environ={}, workspace=self.ws,
+                        vault=self.vault, spawn=self.spawn)
+        self.sidecar(self.BETA, connected=False, pid=first["pid"])
         self.connects = False
         with self.assertRaises(C.NewPrimaryNotConnected):
             self.promote(self.BETA, connect_timeout_s=0.5)
