@@ -2571,6 +2571,10 @@ class Promote(PromoteFixtures):
                          ("already_running", True, self.BETA))
         self.assertEqual(C.bridge_pid(self.BETA, self.ws), first["pid"])
 
+    def test_a_lease_that_proves_no_holder_is_not_a_connected_bridge(self):
+        with unittest.mock.patch.object(C, "bridge_pid", side_effect=C.BridgeLeaseIndeterminate(self.BETA, "unreadable")):
+            self.assertEqual(C._connected_bridge({"instance": self.BETA}, self.ws), 0)
+
     def test_a_secondary_whose_stop_took_it_down_and_then_was_refused_is_started_again(self):
         self.legacy()
         first = C.start(self.BETA, repo=self.ws / "repo", logs_dir=self.ws / "logs", environ={}, workspace=self.ws,
