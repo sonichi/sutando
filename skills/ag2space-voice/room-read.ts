@@ -14,8 +14,9 @@ import type { ToolDefinition } from 'bodhi-realtime-agent';
 import { expandHome } from '../../src/util_paths.js';
 import type { VoiceSessionRoom } from './session-context.js';
 
-/** The registration name both the desktop app and skills/ag2-space-mcp write. */
-export const AG2_MCP_SERVER_NAME = 'ag2-space';
+/** The registration name the desktop app writes; installs registered before the rename still carry the second. */
+export const AG2_MCP_SERVER_NAME = 's-space';
+export const AG2_MCP_SERVER_NAMES = [AG2_MCP_SERVER_NAME, 'ag2-space'] as const;
 /** First call mints a token (~2 s measured); warm reads ~0.2 s. */
 export const ROOM_READ_CALL_TIMEOUT_MS = 6_000;
 export const ROOM_READ_DEFAULT_LIMIT = 15;
@@ -47,13 +48,14 @@ export const ROOM_WRITE_TEXT_MAX = 4_000;
 
 export interface McpStdioEntry { command: string; args?: string[]; env?: Record<string, string> }
 
-/** The core's `ag2-space` MCP entry from its Claude config, or null when this install has none. */
+/** The core's s.space MCP entry (or its pre-rename `ag2-space` key) from its Claude config, or null when this install has none. */
 export function findAg2SpaceMcpEntry(env: NodeJS.ProcessEnv = process.env): McpStdioEntry | null {
 	const ccd = env.CLAUDE_CONFIG_DIR;
 	const file = ccd ? join(expandHome(ccd), '.claude.json') : join(homedir(), '.claude.json');
 	try {
 		const cfg = JSON.parse(readFileSync(file, 'utf-8')) as { mcpServers?: Record<string, unknown> };
-		const e = cfg.mcpServers?.[AG2_MCP_SERVER_NAME] as { type?: string; command?: unknown; args?: unknown; env?: unknown } | undefined;
+		const key = AG2_MCP_SERVER_NAMES.find((k) => cfg.mcpServers?.[k] !== undefined);
+		const e = (key ? cfg.mcpServers?.[key] : undefined) as { type?: string; command?: unknown; args?: unknown; env?: unknown } | undefined;
 		if (!e || (e.type && e.type !== 'stdio') || typeof e.command !== 'string' || !e.command) return null;
 		const args = Array.isArray(e.args) ? e.args.filter((a): a is string => typeof a === 'string') : [];
 		const envOut: Record<string, string> = {};

@@ -15,6 +15,7 @@ Format: `- Brief description of what changed. ([#NNN])`
 ## Fixed
 
 <!-- fix() PRs go here -->
+- task-orphan-check: a task's age is how long it has waited in this inbox (its `local_time:` header), not since the sender sent it, so messages held at the broker while the app was closed are answered on relaunch instead of archived as orphans. Only a `local_time:` above `task:` counts, so a body line cannot make a fresh task from an older writer look orphaned. ([#5929])
 
 ## Changed
 

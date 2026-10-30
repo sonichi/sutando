@@ -35,6 +35,17 @@ after(() => { for (const d of dirs) rmSync(d, { recursive: true, force: true });
 const tmp = () => { const d = mkdtempSync(join(tmpdir(), 'room-read-')); dirs.push(d); return d; };
 
 describe('the voice agent starts the MCP server the core registered', () => {
+	it('reads the s-space entry first, and the pre-rename ag2-space key when it is the only one', () => {
+		const d = tmp();
+		const entry = (cmd) => ({ type: 'stdio', command: cmd, args: ['/app/ag2-mcp-proxy.mjs'], env: { AG2_MCP_DESCRIPTOR: '/app/d.json' } });
+		writeFileSync(join(d, '.claude.json'), JSON.stringify({ mcpServers: { 's-space': entry('/new/node') } }));
+		assert.equal(findAg2SpaceMcpEntry({ CLAUDE_CONFIG_DIR: d })?.command, '/new/node', 's-space alone');
+		writeFileSync(join(d, '.claude.json'), JSON.stringify({ mcpServers: { 'ag2-space': entry('/old/node'), 's-space': entry('/new/node') } }));
+		assert.equal(findAg2SpaceMcpEntry({ CLAUDE_CONFIG_DIR: d })?.command, '/new/node', 's-space wins over ag2-space');
+		writeFileSync(join(d, '.claude.json'), JSON.stringify({ mcpServers: { 'ag2-space': entry('/old/node') } }));
+		assert.equal(findAg2SpaceMcpEntry({ CLAUDE_CONFIG_DIR: d })?.command, '/old/node', 'pre-rename key still read');
+	});
+
 	it('reads the ag2-space stdio entry from CLAUDE_CONFIG_DIR/.claude.json', () => {
 		const d = tmp();
 		writeFileSync(join(d, '.claude.json'), JSON.stringify({ mcpServers: {

@@ -85,7 +85,7 @@ def main():
     room = {"channel_id": "!room:example.org", "source_room_id": "!room:example.org"}
 
     # 8a. Delegation: a connection lane's loader installs the module's gate.
-    check("the loader installs the lane dedupe gate", rgb.TASK_INTAKE_GATE is rgb._lane_dedupe_gate)
+    check("the loader installs the intake gate", rgb.TASK_INTAKE_GATE is rgb._intake_gate)
 
     # 1. Same event, two lanes.
     first = on_lane("", "task-A1", source_message_id="$ev1", **room)
@@ -138,6 +138,19 @@ def main():
     on_lane("sspace", "task-G1", source_message_id="$ev1", **room)
     check("a raising gate fails open", (rgb.TASKS_DIR / "task-sspace~task-G1.txt").exists())
     rgb.TASK_INTAKE_GATE = real_gate
+
+    # A connection added with skip_backlog: a task stamped before its bound is settled unqueued.
+    os.environ["SUTANDO_INTAKE_NOT_BEFORE"] = "1793000000"
+    try:
+        old = on_lane("sspace", "task-K1", timestamp="2026-10-25T00:00:00Z", **room)
+        new = on_lane("sspace", "task-K2", timestamp="2026-10-27T00:00:00Z", **room)
+    finally:
+        del os.environ["SUTANDO_INTAKE_NOT_BEFORE"]
+    check("a backlog task is settled, not queued",
+          old == ("task-sspace~task-K1", True) and not (rgb.TASKS_DIR / "task-sspace~task-K1.txt").exists()
+          and (rgb.RESULTS_DIR / "task-sspace~task-K1.txt").exists(), repr(old))
+    check("one log line says why", any("backlog" in m and "task-sspace~task-K1" in m for m in logs), repr(logs[-3:]))
+    check("a task stamped after the bound is queued", new is not None and (rgb.TASKS_DIR / "task-sspace~task-K2.txt").exists())
 
     # 4. TTL.
     ttl_dir = tmp / "ttl"

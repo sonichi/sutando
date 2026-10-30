@@ -18,6 +18,7 @@ isolate_os_environ(SUTANDO_SUPPRESS_CCD_FALLBACK_BANNER="1")
 import contextlib
 import json
 import os
+import signal
 import socket
 import subprocess
 import sys
@@ -1759,6 +1760,56 @@ class OwnerScopedListing(Base):
         self.assertEqual(calls, [self.ws])
 
 
+class SkipBacklog(Base):
+    """A connection added with skip_backlog has its bridge settle every task stamped before it."""
+
+    def test_a_created_row_records_not_before_and_its_bridge_env_carries_it(self):
+        t0 = int(time.time())
+        preview = C.preview_connection(TOKEN_B, fetch=agents("@s:beta-fixture.net"))
+        row, created = C.add_connection(TOKEN_B, added_by="login", expected_server="beta-fixture.net", preview=preview,
+                                        workspace=self.ws, vault=self.vault, skip_backlog=True)
+        self.assertTrue(created)
+        self.assertTrue(t0 <= row["not_before"] <= int(time.time()))
+        entry = C.plan_entry("beta-fixture-net", {}, workspace=self.ws)
+        self.assertEqual(entry["not_before"], row["not_before"])
+        env = C.launch_env(entry, {C.NOT_BEFORE_ENV: "1"}, vault=self.vault)
+        self.assertEqual(env[C.NOT_BEFORE_ENV], str(row["not_before"]))
+
+    def test_an_existing_row_keeps_its_own_and_a_plain_add_records_none(self):
+        row, _ = self.add(TOKEN_B, fetch=agents("@s:beta-fixture.net"))
+        self.assertNotIn("not_before", row)
+        preview = C.preview_connection(TOKEN_B, fetch=agents("@s:beta-fixture.net"))
+        again, created = C.add_connection(TOKEN_B, added_by="login", expected_server="beta-fixture.net",
+                                          preview=preview, workspace=self.ws, vault=self.vault, skip_backlog=True)
+        self.assertFalse(created)
+        self.assertNotIn("not_before", again)
+        entry = C.plan_entry("beta-fixture-net", {}, workspace=self.ws)
+        self.assertNotIn("not_before", entry)
+        env = C.launch_env(entry, {C.NOT_BEFORE_ENV: "1793000000"}, vault=self.vault)
+        self.assertEqual(env[C.NOT_BEFORE_ENV], "", "an inherited bound never reaches a row without one")
+
+    def test_a_malformed_not_before_is_a_schema_error(self):
+        self.add(TOKEN_B, fetch=agents("@s:beta-fixture.net"))
+        path = C.record_path(self.ws)
+        good = json.loads(path.read_text())
+        for bad in ("1793000000", True, -1, 1.5):
+            raw = json.loads(json.dumps(good))
+            raw["connections"][0]["not_before"] = bad
+            path.write_text(json.dumps(raw))
+            with self.assertRaises(C.SchemaError, msg=repr(bad)):
+                C._read(path)
+
+    def test_backlog_reason_compares_the_task_stamp_with_the_bound(self):
+        bound = 1793000000  # 2026-10-26T07:33:20Z
+        self.assertIn("backlog", C.backlog_reason({"timestamp": "2026-10-26T07:33:19Z"}, str(bound)))
+        self.assertIsNone(C.backlog_reason({"timestamp": "2026-10-26T07:33:20Z"}, bound))
+        self.assertIsNone(C.backlog_reason({"timestamp": "2026-10-27T00:00:00Z"}, bound))
+        for task in ({}, {"timestamp": ""}, {"timestamp": "yesterday"}, {"timestamp": 1792000000}):
+            self.assertIsNone(C.backlog_reason(task, bound), task)
+        for unbounded in ("", None, "soon"):
+            self.assertIsNone(C.backlog_reason({"timestamp": "2020-01-01T00:00:00Z"}, unbounded))
+
+
 class Disconnect(Base):
     def setUp(self):
         super().setUp()
@@ -2692,11 +2743,43 @@ class Promote(PromoteFixtures):
         self.assertEqual(self.spawned_env, [(self.BETA, self.ROOM)], "primary at spawn time, room in its env")
         self.assertIs(out["relaunch_needed"], False)
 
+    def test_a_connected_secondary_keeps_running_through_the_flip_and_asks_for_a_relaunch(self):
+        self.legacy()
+        first = C.start(self.BETA, repo=self.ws / "repo", logs_dir=self.ws / "logs", environ={"REMOTE_PROACTIVE_ROOM": self.ROOM},
+                        workspace=self.ws, vault=self.vault, spawn=self.spawn)
+        out = self.promote(self.BETA, environ={"REMOTE_PROACTIVE_ROOM": self.ROOM})
+        self.assertNotIn(("kill", first["pid"]), self.events, "a connected bridge is never stopped by the promote")
+        self.assertEqual(len(self.spawned_env), 1, "nothing was relaunched")
+        self.assertEqual((out["launch"]["lease"], out["relaunch_needed"], C.primary_instance(self.ws)),
+                         ("already_running", True, self.BETA))
+        self.assertEqual(C.bridge_pid(self.BETA, self.ws), first["pid"])
+
+    def test_a_lease_that_proves_no_holder_is_not_a_connected_bridge(self):
+        with unittest.mock.patch.object(C, "bridge_pid", side_effect=C.BridgeLeaseIndeterminate(self.BETA, "unreadable")):
+            self.assertEqual(C._connected_bridge({"instance": self.BETA}, self.ws), 0)
+
+    def test_a_secondary_whose_stop_took_it_down_and_then_was_refused_is_started_again(self):
+        self.legacy()
+        first = C.start(self.BETA, repo=self.ws / "repo", logs_dir=self.ws / "logs", environ={}, workspace=self.ws,
+                        vault=self.vault, spawn=self.spawn)
+        self.sidecar(self.BETA, connected=False, pid=first["pid"])
+        real = C.stop_bridge
+
+        def stops_then_refuses(instance, **kw):
+            pid = real(instance, **kw)
+            raise C.BridgeStillRunning(instance, pid, "process still running after it released its lease")
+        with unittest.mock.patch.object(C, "stop_bridge", stops_then_refuses), self.assertRaises(C.BridgeStillRunning):
+            self.promote(self.BETA)
+        self.assertTrue(C.bridge_pid(self.BETA, self.ws), "the rollback started the stopped bridge again")
+        self.assertNotEqual(C.bridge_pid(self.BETA, self.ws), first["pid"])
+        self.assertEqual(C.primary_instance(self.ws), "")
+
     def test_a_running_secondary_is_relaunched_as_the_primary_with_the_room(self):
         self.legacy()
         first = C.start(self.BETA, repo=self.ws / "repo", logs_dir=self.ws / "logs", environ={"REMOTE_PROACTIVE_ROOM": self.ROOM},
                         workspace=self.ws, vault=self.vault, spawn=self.spawn)
         self.assertEqual(self.spawned_env, [("", "")], "started as a secondary, without the room")
+        self.sidecar(self.BETA, connected=False, pid=first["pid"])
         out = self.promote(self.BETA, environ={"REMOTE_PROACTIVE_ROOM": self.ROOM})
         self.assertIn(("kill", first["pid"]), self.events, "the secondary bridge is stopped")
         self.assertEqual(self.spawned_env[-1], (self.BETA, self.ROOM))
@@ -2741,8 +2824,9 @@ class Promote(PromoteFixtures):
 
     def test_a_secondary_stopped_for_the_relaunch_comes_back_when_the_promote_rolls_back(self):
         self.legacy()
-        C.start(self.BETA, repo=self.ws / "repo", logs_dir=self.ws / "logs", environ={}, workspace=self.ws,
-                vault=self.vault, spawn=self.spawn)
+        first = C.start(self.BETA, repo=self.ws / "repo", logs_dir=self.ws / "logs", environ={}, workspace=self.ws,
+                        vault=self.vault, spawn=self.spawn)
+        self.sidecar(self.BETA, connected=False, pid=first["pid"])
         self.connects = False
         with self.assertRaises(C.NewPrimaryNotConnected):
             self.promote(self.BETA, connect_timeout_s=0.5)
@@ -4032,6 +4116,48 @@ class ZombieWithoutWaitid(Base):
         pid = C.bridge_pid(self.INST, self.ws)
         self.assertTrue(pid)
         self.assert_stops_promptly(pid)
+
+
+@unittest.skipIf(os.name == "nt" or not hasattr(os, "waitid"), "zombies are a POSIX state; waitid present")
+class ForeignZombieWithWaitid(ZombieWithoutWaitid):
+    """With os.waitid present, another process's exited, unreaped bridge reads as stopped too."""
+
+    def setUp(self):
+        Base.setUp(self)
+        patcher = unittest.mock.patch.object(C, "STOP_TIMEOUT_S", 10)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.add()
+        self.add(TOKEN_B, fetch=agents("@s:beta-fixture.net"))
+        self.args = [self.BRIDGE, str(ROOT / "src"), str(self.ws), C._bridge_role(self.INST)]
+
+    test_our_exited_unreaped_child_is_stopped = None
+
+
+@unittest.skipIf(os.name == "nt", "zombies are a POSIX state")
+class LaunchedBridgeIsReaped(Base):
+    """A bridge `launch` spawned is reaped as soon as it exits, with nobody polling it."""
+
+    def test_an_exited_launched_bridge_leaves_no_zombie(self):
+        self.add()
+        self.add(TOKEN_B, fetch=agents("@s:beta-fixture.net"))
+        spawned = []
+
+        def spawn(argv, env, log_path):
+            proc = bridge_lease.start(self.ws, env["GATEWAY_INSTANCE"], wait=False)
+            self.children.append(proc)
+            spawned.append(proc)
+            return proc
+        C.launch("beta-fixture-net", repo=self.ws / "repo", logs_dir=self.ws / "logs", environ={},
+                 workspace=self.ws, vault=self.vault, spawn=spawn)
+        proc = spawned[0]
+        os.kill(proc.pid, signal.SIGKILL)
+        deadline = time.monotonic() + 5
+        while proc.returncode is None and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertIsNotNone(proc.returncode, "the exited bridge was reaped without a poll")
+        with self.assertRaises(ChildProcessError):
+            os.waitpid(proc.pid, os.WNOHANG)
 
 
 @unittest.skipIf(os.name == "nt", "zombies are a POSIX state")
