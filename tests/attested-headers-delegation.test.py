@@ -11,6 +11,7 @@ REPO = Path(__file__).resolve().parent.parent
 CONSUMERS = (
     REPO / "skills" / "pending-questions" / "scripts" / "pending_questions_ask.py",
     REPO / "skills" / "worker-pool" / "scripts" / "worker_picker_commands.py",
+    REPO / "src" / "core_limit_hold.py",
 )
 OWNER = REPO / "src" / "task_envelope.py"
 

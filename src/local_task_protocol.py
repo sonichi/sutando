@@ -341,9 +341,34 @@ def split_reply_context(text: str) -> "tuple[dict | None, str]":
     return (reply, rest) if reply is not None else (None, text)
 
 
+# A run of >=3 leading '=' opens a writer's ===SKILL …=== / ===SUTANDO …=== block;
+# task_body_guard defangs any such line a sender typed.
+BRIDGE_FENCE_RE = re.compile(r"^={3,}", re.M)
+
+
+def sender_words(parsed: TaskHeaders) -> str:
+    """The sender's own message in a parsed task: the one `task:` line under
+    `task_layout: mid` (every later line is the writer's), else the body up to
+    the first writer block."""
+    if (parsed.headers.get("task_layout") or "").strip() == "mid":
+        return parsed.body.split("\n", 1)[0].strip()
+    return BRIDGE_FENCE_RE.split(parsed.body, 1)[0].strip()
+
+
 def reply_action_text(text: str) -> str:
     """The answer after broker context and the leading Matrix reply quote."""
-    body = split_reply_context(text)[1].lstrip()
+    reply, body = split_reply_context(text)
+    body = body.lstrip()
+    if reply and body.startswith(">") and "\n" not in body:
+        # A one-line task folds the quote's newlines into spaces; the answer follows its last line.
+        quoted = [line.strip() for line in str(reply.get("body") or "").split("\n") if line.strip()]
+        at = 0
+        for line in quoted:
+            found = body.find(line, at)
+            if found < 0:
+                return ""
+            at = found + len(line)
+        return body[at:].strip() if quoted else ""
     # Only "\n" ends a Matrix quote line; splitlines() would end one at U+2028 and friends.
     lines = body.split("\n")
     for i, line in enumerate(lines):

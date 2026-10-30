@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Step 2 of /task-orphan-check, as a script: classify every live task in
-`<workspace>/tasks/` as done / worker-held / fresh / orphan / import-resume, read-only.
+`<workspace>/tasks/` as done / held / worker-held / fresh / orphan / import-resume, read-only.
 
 The skill was prose-only ("marker-or-not + age-vs-5min"); its own note said to
 promote the classification to a script once the rules grew past that. They
@@ -20,6 +20,11 @@ Verdicts (first match wins):
                   (`done`, `staged`, `discarded`, `forgot`) — the run this
                   task started reached its end; a staged digest waits on an
                   owner reply, which arrives as a new task.
+  held            the core-limit hold took it in: it arrived while the core
+                  was paused for a provider limit (`held_tasks` in
+                  state/core-limit-hold.json, read through core_limit_hold).
+                  The owner was told it waits: left in tasks/ for the
+                  watcher's sweep, never archived, never DM'd.
   worker-held     a worker seat holds a router sentinel for it
                   (deliveries/<recipient>/<id>{.txt,.accepted,.claimed},
                   skills/worker-pool/scripts/worker_delivery.py): the task is that worker's to
@@ -92,6 +97,7 @@ REPO = SCRIPT_DIR.parents[2]  # skills/task-orphan-check/scripts -> repo root
 if str(REPO / "src") not in sys.path:
     sys.path.insert(0, str(REPO / "src"))
 
+import core_limit_hold  # noqa: E402
 import local_task_protocol as ltp  # noqa: E402
 
 # The worker-pool skill is optional: without it there is no router, so nobody can
@@ -223,7 +229,7 @@ def channel_label(headers: dict) -> str:
     return f"{name} ({cid})" if name else (cid or "DM")
 
 
-def classify_task(path: Path, workspace: Path, now: float) -> dict:
+def classify_task(path: Path, workspace: Path, now: float, held: frozenset | None = None) -> dict:
     text = path.read_text(errors="replace")
     # Shape-union parser: this pass classifies files from every writer and
     # era (the desktop's import writer is task-mid, the bridges' are task-last).
@@ -248,6 +254,12 @@ def classify_task(path: Path, workspace: Path, now: float) -> dict:
     marker = completion_marker(workspace / "results", task_id)
     if marker:
         row.update(verdict="done", reason=f"completion marker found at {marker}")
+        return row
+    if held is not None and (task_id in held or path.stem in held):
+        row.update(verdict="held",
+                   reason="arrived while the core was paused for a provider limit (state/"
+                          "core-limit-hold.json); waits for the core — left in tasks/ for the "
+                          "watcher's sweep, never archived, never listed in the recovery DM")
         return row
 
     # holder_of raises on any stat failure but ENOENT; an unreadable deliveries/
@@ -345,9 +357,10 @@ def classify_workspace(workspace: Path, now: float | None = None) -> dict:
         return out
     # The watcher's glob is `*.txt` at the top level; whatever it would emit is
     # in scope here, and its `.deferred` suffix (skill step 3) falls outside.
+    held = core_limit_hold.held_task_ids(workspace)
     for path in sorted(p for p in tasks_dir.glob("*.txt") if p.is_file()):
         try:
-            row = classify_task(path, workspace, now)
+            row = classify_task(path, workspace, now, held)
         except OSError as exc:  # unreadable file: conservative, surface it
             row = {"file": path.name, "id": path.stem, "verdict": "orphan",
                    "reason": f"unreadable task file ({exc}); treated as orphan"}
