@@ -44,7 +44,7 @@ if str(_PKG) not in sys.path:
 sys.path.insert(0, str(_TESTS))
 
 from _helpers.gateway_relay import Bridges, Relay  # noqa: E402
-from ag2_sparrow import delivery_core, outbox, remote_gateway_bridge as gw  # noqa: E402
+from ag2_sparrow import delivery_core, outbox, remote_gateway_bridge as gw, room_context  # noqa: E402
 
 CONTRACT = ["voice-outcome-v1"]
 OWNER = "@owner:ag2.space"
@@ -842,7 +842,7 @@ class Heartbeat(unittest.TestCase):
                 patch.object(gw, "_req") as req:
             self.assertTrue(gw._post_heartbeat(set(), force=True))
         capabilities = req.call_args.args[2]["capabilities"]
-        for entry in ("task-ack", "result-skip-markers", "voice-outcome-v1"):
+        for entry in ("task-ack", "result-skip-markers", "voice-outcome-v1", "room-context-v1"):
             self.assertIn(entry, capabilities)
 
 
@@ -1107,21 +1107,58 @@ class ThroughTheLoop(unittest.TestCase):
         self.assertEqual([r["id"] for r in self.relay.results], [ASK_A])
 
     def test_an_updated_bridges_poll_is_served_a_relay_ask_and_an_old_ones_is_not(self):
-        self.relay.queue.extend([voice_ask(ASK_A), typed_task(TYPED_A)])
+        self.relay.queue.extend([voice_ask(ASK_A), typed_task(TYPED_A, room_context={"synthetic": "not for legacy"},
+                                                                  room_context_binding={"synthetic": "not for legacy"})])
         # The poll an older bridge sends: no contract, so the relay ask keeps its place.
         with urllib.request.urlopen(f"{self.relay.url}/v1/tasks?wait=1", timeout=10) as resp:
             old = json.loads(resp.read())
         self.assertEqual([t["id"] for t in old["tasks"]], [TYPED_A])
+        self.assertNotIn("room_context", old["tasks"][0])
+        self.assertNotIn("room_context_binding", old["tasks"][0])
         self.assertEqual([t["id"] for t in self.relay.queue], [ASK_A])
+        for near_match in ("voice-outcome-v10", "not-voice-outcome-v1"):
+            with urllib.request.urlopen(f"{self.relay.url}/v1/tasks?wait=1&capabilities={near_match}", timeout=10) as resp:
+                self.assertEqual(json.loads(resp.read())["tasks"], [])
         polled = len(self.relay.polls)
         bridge = self.bridges.start()
         self.bridges.wait_for(self.task.exists, bridge, "the relay ask published")
         self.bridges.polls_after(bridge)
         self.bridges.stop(bridge)
-        self.assertIn((ASK_A, "wait=1&capabilities=voice-outcome-v1"), self.relay.served)
+        self.assertIn((ASK_A, "wait=1&capabilities=voice-outcome-v1,room-context-v1"), self.relay.served)
         self.assertTrue(self.relay.polls[polled:])
-        self.assertTrue(all(q.endswith("&capabilities=voice-outcome-v1") for q in self.relay.polls[polled:]),
-                        "a poll of the updated bridge did not carry the contract")
+        self.assertTrue(all(q == "wait=1&capabilities=voice-outcome-v1,room-context-v1" for q in self.relay.polls[polled:]),
+                        "a poll of the updated bridge did not carry both contracts")
+
+    def test_combined_poll_receives_context_and_preserves_voice_ack_and_result_contracts(self):
+        self.relay.token = "hermetic-test-token"
+        self.bridges.env.update(AGENT_MXID="@agent:example.test", REMOTE_TASK_TIER="owner")
+        now = int(time.time())
+        binding = dict(schema_version=1, context_id="ctx-wire", agent_id="@agent:example.test",
+                       room_id=ROOM, task_id=TYPED_A, anchor_event_id="$typed-question", access_tier="owner",
+                       policy_revision="policy-wire", membership_epoch="membership-wire", visibility="mentions",
+                       observed_at=now, expires_at=now + 600)
+        context = dict(binding, status="partial", coverage=dict(completeness="unknown", truncated=False),
+                       room=dict(name="Synthetic project", category="Research"),
+                       readme=dict(text="WIRE_BRIEFING", content_hash="hash-wire", truncated=False),
+                       messages=[])
+        self.relay.queue.extend([typed_task(TYPED_A, source_message_id="$typed-question",
+                                           room_context_binding=binding, room_context=context), voice_ask(ASK_A)])
+        bridge = self.bridges.start()
+        typed_file = self.ws / "tasks" / (TYPED_A + ".txt")
+        self.bridges.wait_for(lambda: self.task.exists() and typed_file.exists(), bridge, "voice and context tasks published")
+        received, _, reason = room_context.from_headers(room_context._parse(typed_file.read_text()).headers)
+        self.assertEqual(reason, "accepted")
+        self.assertEqual(received, context)
+        self.assertEqual(self.relay.acks[0], ASK_A)
+        (self.ws / "results" / (ASK_A + ".txt")).write_text("[dm-only]\nPRIVATE_VOICE_REPLY")
+        (self.ws / "results" / (TYPED_A + ".txt")).write_text("ROOM_REPLY")
+        self.bridges.wait_for(lambda: len(self.relay.results) == 2, bridge, "voice and typed results accepted")
+        self.bridges.stop(bridge)
+        self.assertTrue(all(query == "wait=1&capabilities=voice-outcome-v1,room-context-v1" for query in self.relay.polls))
+        results = {result["id"]: result for result in self.relay.results}
+        self.assertEqual(results[ASK_A], dict(id=ASK_A, body="PRIVATE_VOICE_REPLY", capabilities=CONTRACT, dm_only=True))
+        self.assertEqual(results[TYPED_A], dict(id=TYPED_A, body="ROOM_REPLY", capabilities=CONTRACT, dm_only=False))
+        self.assertTrue(all(bearer == "Bearer hermetic-test-token" for _, bearer in self.relay.posted))
 
     def test_a_relay_ask_is_acknowledged_before_the_rest_of_its_batch(self):
         not_relay = voice_ask(ASK_B, ack_first="true")      # only the exact boolean counts

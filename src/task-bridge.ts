@@ -106,6 +106,7 @@ const _HEADER_KEYS = [
 	'from', 'call_sid', 'hint', 'instructions', 'transcript',
 	'schedule_name', 'schedule_slot',
 	'content_modalities', 'media_form', 'attachments', 'platform_card',
+	'room_context', 'room_context_binding', 'room_context_status',
 	'instance_id', 'collaborator', 'requested_worker', 'wire_source', 'picker_command', 'picker_args', 'hitl_click', 'owner_mentioned', 'task_layout', 'local_time',
 	'lane',
 ];

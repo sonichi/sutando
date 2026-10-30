@@ -16,7 +16,7 @@ import time
 import uuid
 from pathlib import Path
 
-from . import local_task_protocol, result_disposal, task_priority
+from . import local_task_protocol, result_disposal, room_context, task_priority
 from .task_io import (NON_OWNER_REFUSED, admission, is_collaborator, load_done, non_owner_note,  # noqa: F401
                       parse_task, record_done, stop_requested, stoppable_sleep, write_atomic)
 
@@ -57,7 +57,9 @@ def build_payload(task_id, headers, message, operator_lines=(), note=None, text_
     room_left = text_max - len(head) - len(opening) - len(tail)
     if len(message) > room_left:
         message = message[:max(room_left - len(TRUNCATED), 0)] + TRUNCATED
-    return room, head + opening + message + tail
+    payload = head + opening + message + tail
+    context = room_context.render(headers, max_chars=text_max - len(payload) - 1)
+    return room, payload + ("\n" + context if context else "")
 
 
 def count_arg(text):

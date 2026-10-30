@@ -33,6 +33,7 @@ from pathlib import Path
 MAP = {
     "src/task_archive.py": "task_archive.py",
     "src/local_task_protocol.py": "local_task_protocol.py",
+    "src/room_context.py": "room_context.py",
     "src/result_markers.py": "result_markers.py",
     "src/delivery/readiness.py": "result_ready.py",
     # the one results/ publisher: the bridge stages and renames through it

@@ -196,6 +196,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`result_publish.py`** — One publisher for every `results/` body: staged beside the target, fsynced, renamed whole.
 - **`result_ready.py`** — Alias of `delivery.readiness` (phase-1a restructure); one transition window.
 - **`result_router.py`** — Alias of `delivery.router` (phase-1a restructure); one transition window.
+- **`room_context.py`** — Validate and render transient, broker-supplied room context without fetching history.
 - **`runtime-health.py`** — runtime-health.py — derive this Sutando core's live health as one JSON object.
 - **`runtime_observation.py`** — Runtime observations: one leased record per seat, written by whatever observes that seat's CLI.
 - **`scan-call-logs.py`** — Proactive call log scanner — detects issues and classifies by actionability.

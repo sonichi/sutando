@@ -674,12 +674,23 @@ task_payload() {
   printf '%s' "${p:-$TASKS_DIR/$1}"
 }
 
+
+task_read_instruction() {
+  local payload
+  payload="$(task_payload "$1")"
+  if [ -f "$REPO/src/room_context.py" ]; then
+    "$NOTIFIER_PY" "$REPO/src/room_context.py" instruction "$payload"
+  else
+    printf '%s' "$payload"
+  fi
+}
+
 # The notifier only ever delivers as the STANDBY (a session watcher stands it
 # down), so the prompt says so and names the re-arm: the session reading it is
 # looking at exactly the problem the Stop hook would otherwise block on later.
 task_prompt() {
   printf 'Sutando task ready: %s. Read %s, follow CLAUDE.md, complete the task, and write the result to %s/%s. Delivered by the standby: no session-role watcher holds %s. Re-arm yours via the Monitor tool: bash "%s/src/watch-tasks-stream.sh" "%s" --role session --inbox "%s"' \
-    "$1" "$(task_payload "$1")" "$RESULTS_DIR" "$1" "$TASKS_DIR" "$REPO" "$TASKS_DIR" "$TASKS_DIR"
+    "$1" "$(task_read_instruction "$1")" "$RESULTS_DIR" "$1" "$TASKS_DIR" "$REPO" "$TASKS_DIR" "$TASKS_DIR"
 }
 
 # The nudge (supervisor --nudge): restore the session's OWN watcher instead of

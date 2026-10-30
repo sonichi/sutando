@@ -389,14 +389,14 @@ class LongPollTimeoutTest(unittest.TestCase):
         self.assertEqual(loop.clock.slept, [])
         self.assertIn((True, {"poll_ok_ts": loop.clock.time()}), loop.status)
 
-    def test_every_poll_carries_the_voice_outcome_contract(self):
+    def test_every_poll_carries_both_voice_outcome_and_room_context_contracts(self):
         # One agent's credential may serve more than one bridge, so the broker serves
         # a voice relay ask only to a poll that names the contract itself.
         with _Loop(self.gw, poll_raises=None, advance=1.0) as loop:
             loop._alive = [True, True, False]
             loop.run()
         self.assertEqual(loop.polls, [f"/v1/tasks?wait={self.gw.POLL_WAIT}"
-                                      "&capabilities=voice-outcome-v1"] * 2)
+                                      "&capabilities=voice-outcome-v1,room-context-v1"] * 2)
 
 
 class AckFirstInTheLoopTest(unittest.TestCase):

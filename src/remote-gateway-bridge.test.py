@@ -47,6 +47,7 @@ def check(cond: bool, msg: str) -> None:
 
 # ── mock gateway ────────────────────────────────────────────────────────────
 STATE = {"tasks_served": 0, "results": [], "acks": [], "heartbeats": [],
+         "poll_paths": [],
          "auth_seen": [], "force_401": False, "force_ack_404": False,
          "room_posts": [], "force_room_502": False, "force_room_429": False, "force_room_empty_200": False,
          "force_room_ok_only": False, "force_room_400_body": None,
@@ -97,6 +98,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json")
             self.end_headers(); self.wfile.write(body); return
         if self.path.startswith("/v1/tasks"):
+            if self.path.startswith("/v1/tasks?"):
+                STATE["poll_paths"].append(self.path)
             tasks = [TASK] if STATE["tasks_served"] == 0 else []
             STATE["tasks_served"] += 1
             body = json.dumps({"tasks": tasks}).encode()
@@ -902,6 +905,9 @@ def main() -> int:
               "no core-status.json and no core beat → capability advertised, no positive status")
         check("team-collaborator" in h.get("capabilities", []),
               "heartbeat advertises explicit Team collaborator support")
+        check("room-context-v1" in h.get("capabilities", [])
+              and "voice-outcome-v1" in h.get("capabilities", []),
+              "wire heartbeat advertises the active room-context consumer beside the voice contract")
 
     # Presence: with a core-status.json, the heartbeat carries status+step so the
     # broker's presence sweep can derive the agent's activity + human text.
@@ -2386,6 +2392,7 @@ def main() -> int:
     STATE["force_ack_404"] = False
     STATE["force_heartbeat_404"] = False
     real_hb = rtc._post_heartbeat
+    poll_paths_before_main = len(STATE["poll_paths"])
     hb_calls = {"n": 0}
     def _hb_bounded(inflight_arg):
         hb_calls["n"] += 1
@@ -2400,6 +2407,9 @@ def main() -> int:
     finally:
         rtc._post_heartbeat = real_hb
     check(hb_calls["n"] == 3, "main: one full loop iteration ran (reconcile wired)")
+    check(STATE["poll_paths"][poll_paths_before_main:] == [
+              f"/v1/tasks?wait={rtc.POLL_WAIT}&capabilities=voice-outcome-v1,room-context-v1"],
+          "wire poll preserves wait and voice proof alongside the confirmed room-context capability")
 
     # #2267 parity: a token pasted into a room message must never persist —
     # not in the task file, not in the owner-presence summary.

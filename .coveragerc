@@ -34,6 +34,7 @@ omit =
     # modules; tests/ag2-sparrow-drift.test.py enforces the mapping.
     packages/ag2-sparrow/ag2_sparrow/task_archive.py
     packages/ag2-sparrow/ag2_sparrow/local_task_protocol.py
+    packages/ag2-sparrow/ag2_sparrow/room_context.py
     packages/ag2-sparrow/ag2_sparrow/result_markers.py
     packages/ag2-sparrow/ag2_sparrow/result_ready.py
     packages/ag2-sparrow/ag2_sparrow/result_disposal.py

@@ -341,6 +341,17 @@ task_payload() {
   fi
 }
 
+
+task_read_instruction() {
+  local payload
+  payload="$(task_payload "$1")"
+  if [ -f "$REPO/src/room_context.py" ]; then
+    "$NOTIFIER_PY" "$REPO/src/room_context.py" instruction "$payload"
+  else
+    printf '%s' "$payload"
+  fi
+}
+
 submit_task() {
   local filename="$1" wait_for_result="${2:-0}" prompt started delivery_rc=0
   case "$filename" in
@@ -353,9 +364,9 @@ submit_task() {
     mark_worker_stage "$filename" done
     return 0
   fi
-  prompt="Sutando task ready: $filename. Read $(task_payload "$filename"), follow AGENTS.md, complete the task, and write the result to $RESULTS_DIR/$filename."
+  prompt="Sutando task ready: $filename. Read $(task_read_instruction "$filename"), follow AGENTS.md, complete the task, and write the result to $RESULTS_DIR/$filename."
   if [ -n "${WORKER_INSTANCE:-}" ]; then
-    prompt="Sutando task ready: $filename. Worker $WORKER_INSTANCE: read $(task_payload "$filename"), complete only this delivered task, use AGENTS.md for code conventions but skip core operations, do not create task files, and write the result to $RESULTS_DIR/$filename."
+    prompt="Sutando task ready: $filename. Worker $WORKER_INSTANCE: read $(task_read_instruction "$filename"), complete only this delivered task, use AGENTS.md for code conventions but skip core operations, do not create task files, and write the result to $RESULTS_DIR/$filename."
   fi
   if ! tmux -S "$TMUX_SOCKET" has-session -t "=$SESSION" 2>/dev/null; then
     if [ "$wait_for_result" = "1" ]; then exit 0; fi

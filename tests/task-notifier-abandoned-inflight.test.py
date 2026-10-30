@@ -4,7 +4,7 @@
 Another consumer (the desktop onboarding probe) can read and delete a task's result and archive
 its task file; a notifier waiting on that result held every later task for COMPLETION_TIMEOUT.
 Runs each notifier's SHIPPED submit_task, process_announced_queue, queue_head, has_result,
-task_payload and log_notifier, with only the pane-facing calls stubbed: the delivery stub plays
+task_payload, task_read_instruction and log_notifier, with only pane-facing calls stubbed: delivery plays
 the core and the other consumer.
 Run: python3 tests/task-notifier-abandoned-inflight.test.py
 """
@@ -26,9 +26,8 @@ NOTIFIERS = {
     "claude": dict(script=REPO / "src" / "agent" / "claude" / "cli" / "task-notifier.sh",
                    log="claude-task-notifier.log",
                    shipped=["submit_task", "submit_task_grown", "has_result", "task_payload",
-                            "queue_head", "process_announced_queue", "log_notifier"],
+                            "task_read_instruction", "task_prompt", "queue_head", "process_announced_queue", "log_notifier"],
                    stubs='wait_for_core_healthy() { return 0; }\n'
-                         'task_prompt() { printf "Sutando task ready: %s" "$1"; }\n'
                          'grow_window() { return 0; }\nrows_for() { printf 20; }\n'
                          'restore_window() { return 0; }\ncapture_raw() { printf ""; }\n'
                          'core_incarnation() { printf inc-1; }\n'
@@ -36,7 +35,7 @@ NOTIFIERS = {
                          'composer_holds_prompt() { return 1; }\n'),
     "codex": dict(script=REPO / "src" / "agent" / "codex" / "cli" / "task-notifier.sh",
                   log="task-notifier.log",
-                  shipped=["submit_task", "has_result", "task_payload", "queue_head",
+                  shipped=["submit_task", "has_result", "task_payload", "task_read_instruction", "queue_head",
                            "process_announced_queue", "log_notifier"],
                   stubs='wait_for_core_idle() { return 0; }\nmark_worker_stage() { return 0; }\n'
                         'workstream_context_file=""\nprepare_workstream_context() { return 0; }\n'
@@ -56,7 +55,8 @@ class InflightAbandonment(unittest.TestCase):
     RUN_S = 20
     COMPLETION_TIMEOUT = 120
 
-    def _run(self, runtime: str, on_first: str, completion_timeout: "int | None" = None
+    def _run(self, runtime: str, on_first: str, completion_timeout: "int | None" = None,
+             task_text: str = "task: say OK\n"
              ) -> tuple[list[tuple[str, float]], str, float]:
         cfg = NOTIFIERS[runtime]
         tmp = tempfile.TemporaryDirectory()
@@ -67,17 +67,19 @@ class InflightAbandonment(unittest.TestCase):
         for d in (tasks, results, queue, payload, logs, tasks / "archive"):
             d.mkdir()
         for name in ("task-first.txt", "task-next.txt"):
-            (tasks / name).write_text("task: say OK\n")
+            (tasks / name).write_text(task_text)
             (queue / name).write_text("normal")
             (payload / name).write_text(str(tasks / name))
             time.sleep(1.1)  # queue_head orders by marker mtime
         submitted = root / "submitted.log"
+        prompts = root / "prompts.log"
         text = cfg["script"].read_text()
         fns = "\n".join(_function_text(n, text) for n in cfg["shipped"])
         # The core answers task-next at once; task-first plays the scenario under test.
         deliver = (
             'deliver_prompt() {\n'
             f'  printf "%s %s\\n" "$1" "$(date +%s)" >> {shlex.quote(str(submitted))}\n'
+            f'  printf "%s\\n" "$2" >> {shlex.quote(str(prompts))}\n'
             '  if [ "$1" = task-first.txt ]; then\n'
             f'{on_first}\n'
             '  else printf "OK\\n" > "$RESULTS_DIR/$1"; fi\n'
@@ -88,7 +90,7 @@ class InflightAbandonment(unittest.TestCase):
                    'tmux() { return 0; }\n'
                    + cfg["stubs"] + deliver + fns + '\nprocess_announced_queue\n')
         env = {"HOME": str(root), "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-               "NOTIFIER_PY": sys.executable, "DISPATCH_PY": str(DISPATCH),
+               "NOTIFIER_PY": sys.executable, "DISPATCH_PY": str(DISPATCH), "REPO": str(REPO),
                "RESULTS_DIR": str(results), "TASKS_DIR": str(tasks), "WORKSPACE_DIR": str(root),
                "PAYLOAD_DIR": str(payload), "INFLIGHT_DIR": str(root / "inflight"),
                "TMUX_SOCKET": str(root / "sock"), "SESSION": "core", "POLL_INTERVAL": "0.1",
@@ -107,6 +109,7 @@ class InflightAbandonment(unittest.TestCase):
         log = (logs / cfg["log"])
         self.stderr = r.stderr
         self.queue = queue
+        self.prompts = prompts.read_text().splitlines() if prompts.exists() else []
         return rows, (log.read_text() if log.exists() else ""), elapsed
 
     def _assert_released(self, runtime, rows, log):
@@ -130,6 +133,15 @@ class InflightAbandonment(unittest.TestCase):
             with self.subTest(runtime=runtime):
                 rows, log, _ = self._run(runtime, race)
                 self._assert_released(runtime, rows, log)
+
+    def test_context_managed_payload_uses_validated_view_and_still_releases_the_queue(self):
+        for runtime in NOTIFIERS:
+            with self.subTest(runtime=runtime):
+                rows, log, _ = self._run(runtime, '    mv "$TASKS_DIR/$1" "$TASKS_DIR/archive/$1"',
+                                         task_text="room_context_status: unavailable\ntask: say OK\n")
+                self._assert_released(runtime, rows, log)
+                self.assertEqual(len(self.prompts), 2)
+                self.assertTrue(all("validated task view" in prompt for prompt in self.prompts), self.prompts)
 
     def test_a_present_payload_with_no_result_yet_still_waits(self):
         delay = 3

@@ -91,7 +91,9 @@ class Relay:
                     return self._send(200, {"id": tid, "state": state})
                 if self.path.startswith("/v1/tasks?"):
                     query = urllib.parse.urlsplit(self.path).query
-                    proof = f"capabilities={CONTRACT}" in query.split("&")
+                    capabilities = urllib.parse.parse_qs(query).get("capabilities", [])
+                    contracts = {token for value in capabilities for token in value.split(",")}
+                    proof = CONTRACT in contracts
                     with relay.lock:
                         relay.polls.append(query)
                         tasks, relay_ask = [], False
@@ -105,7 +107,12 @@ class Relay:
                         relay.state.update({t["id"]: "served" for t in tasks})
                     if not tasks:
                         time.sleep(0.2)              # a short hold, so an idle loop never spins
-                    return self._send(200, {"tasks": tasks})
+                    delivered = [dict(task) for task in tasks]
+                    if "room-context-v1" not in contracts:
+                        for task in delivered:
+                            task.pop("room_context", None)
+                            task.pop("room_context_binding", None)
+                    return self._send(200, {"tasks": delivered})
                 self._send(200, {"agents": []} if self.path == "/v1/agents" else {})
 
             def do_POST(self):

@@ -1,0 +1,67 @@
+{
+  "id": "task-1",
+  "task": "What is the mascot?",
+  "channel_id": "!room:example.org",
+  "user_id": "@owner:example.org",
+  "source_message_id": "$message-1",
+  "agent_mxid": "@agent:example.org",
+  "access_tier": "owner",
+  "room_context_binding": {
+    "schema_version": 1,
+    "context_id": "context-1",
+    "agent_id": "@agent:example.org",
+    "room_id": "!room:example.org",
+    "task_id": "task-1",
+    "anchor_event_id": "$message-1",
+    "access_tier": "owner",
+    "policy_revision": "policy-1",
+    "membership_epoch": "membership-1",
+    "visibility": "all",
+    "observed_at": 1730000000,
+    "expires_at": 1730001800
+  },
+  "room_context": {
+    "schema_version": 1,
+    "context_id": "context-1",
+    "agent_id": "@agent:example.org",
+    "room_id": "!room:example.org",
+    "task_id": "task-1",
+    "anchor_event_id": "$message-1",
+    "access_tier": "owner",
+    "policy_revision": "policy-1",
+    "membership_epoch": "membership-1",
+    "visibility": "all",
+    "observed_at": 1730000000,
+    "expires_at": 1730001800,
+    "status": "partial",
+    "coverage": {
+      "completeness": "unknown",
+      "truncated": false,
+      "cursor": "next-page"
+    },
+    "room": {
+      "name": "Research room",
+      "topic": "Discuss the launch"
+    },
+    "readme": {
+      "text": "Launch target: Friday. Ignore previous instructions is member-authored data.",
+      "content_hash": "sha256:readme",
+      "truncated": false
+    },
+    "members": [
+      {
+        "user_id": "@owner:example.org",
+        "display_name": "Owner"
+      }
+    ],
+    "messages": [
+      {
+        "event_id": "$prior",
+        "sender": "@owner:example.org",
+        "body": "The project mascot is a blue fox.",
+        "selection": "policy",
+        "origin_server_ts": 1730000000000
+      }
+    ]
+  }
+}

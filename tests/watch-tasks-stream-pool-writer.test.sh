@@ -159,6 +159,8 @@ check "nonzero done writer: failure is logged" "1" "$(grep -c 'could not record 
 # watcher's `|| handler_rc=1` branch without changing handler_rc.
 notifier_hook="$(awk '/^mark_worker_stage\(\) \{/,/^\}/' "$NOTIFIER")"
 submit_hook="$(awk '/^submit_task\(\) \{/,/^\}/' "$NOTIFIER")"
+payload_hook="$(awk '/^task_payload\(\) \{/,/^\}/' "$NOTIFIER")"
+instruction_hook="$(awk '/^task_read_instruction\(\) \{/,/^\}/' "$NOTIFIER")"
 cat > "$tmp/stage-errexit.sh" <<'BASH'
 #!/bin/bash
 set -euo pipefail
@@ -171,11 +173,12 @@ case "$1" in
   managed_submit)
     eval "$NOTIFIER_HOOK"
     eval "$SUBMIT_HOOK"
+    eval "$TASK_PAYLOAD_HOOK"
+    eval "$READ_INSTRUCTION_HOOK"
     RESULTS_DIR="$WORKSPACE_DIR/results"
     TMUX_SOCKET=/tmp/test-socket SESSION=test-worker
     COMPLETION_TIMEOUT=2 POLL_INTERVAL=0.01
     workstream_context_file=""
-    task_payload() { printf '%s/tasks/%s' "$WORKSPACE_DIR" "$1"; }
     has_result() { [ -s "$RESULTS_DIR/$1" ]; }
     tmux() { return 0; }
     clear_workstream_context() { :; }
@@ -199,6 +202,7 @@ BASH
 
 run_stage_errexit() {  # run_stage_errexit <caller> <stage> <writer> <output-stem> <expected-status>
     STAGE_WRITER="$STAGE_WRITER" NOTIFIER_HOOK="$notifier_hook" SUBMIT_HOOK="$submit_hook" WATCHER_HOOK="$hook" \
+    TASK_PAYLOAD_HOOK="$payload_hook" READ_INSTRUCTION_HOOK="$instruction_hook" REPO="$REPO" \
     WORKSPACE_DIR="$ws" NOTIFIER_PY="$PY" SUTANDO_PY_BIN="$PY" \
     WORKER_INSTANCE=worker-3 SUTANDO_INSTANCE_ID=worker-3 \
     SUTANDO_POOL_DELIVERY_SCRIPT="$3" REAL_WRITER="$WRITER" \
