@@ -487,6 +487,10 @@ class InProcess(unittest.TestCase):
         self.assertIn("move refused: auth_rejected (s.space does not accept it)", err)
         self.assertEqual(out, "next: get a connect code at s.space's agent portal, then run "
                               "python3 scripts/connections.py add '<code>'\n")
+        half = lambda inst, **kw: {"ok": False, "reason": "new_primary_not_connected", "detail": "", "server": "s.space",
+                                   "added": True, "instance": "s-space"}
+        rc, out, _ = self.run_main(["move", "--repo", "/r", "--logs-dir", "/l"], try_reuse_move=half)
+        self.assertEqual((rc, out), (1, "next: the s-space row is saved; run move again to finish (it resumes)\n"))
 
     def test_park_and_park_legacy_print_what_they_parked(self):
         rc, out, _ = self.run_main(["park", ""], park=lambda inst, workspace=None: {

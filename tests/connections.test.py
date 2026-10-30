@@ -16,6 +16,7 @@ from _helpers.hermetic_env import isolate_os_environ, isolated_child_env
 isolate_os_environ(SUTANDO_SUPPRESS_CCD_FALLBACK_BANNER="1")
 
 import contextlib
+import hashlib
 import json
 import os
 import signal
@@ -4667,6 +4668,7 @@ MOVE_REGISTRY = {"instances": [
     + [e for e in REGISTRY["instances"] if e["server"] not in ("s.space", "ag2.space")]}
 LEGACY_TOKEN = "https://chat.ag2.space/relay|secret-legacy-xyz"
 SECRET = "secret-legacy-xyz"
+DIGEST = hashlib.sha256(SECRET.encode()).hexdigest()
 
 
 def move_resolver(host):
@@ -4698,9 +4700,10 @@ class MoveFixtures(PromoteFixtures):
         kw.setdefault("fetch", self.fetch)
         kw.setdefault("whoami", lambda u, t, a=None: self.fail("a single-agent listing needs no whoami"))
         kw.setdefault("resolver", move_resolver)
+        kw.setdefault("channels_home", self.ws / "channels")
         return C.try_reuse_move(repo=self.ws / "repo", logs_dir=self.ws / "logs", workspace=self.ws,
                                 environ={}, vault=self.vault, spawn=self.spawn,
-                                kill=self.kill, channels_home=self.ws / "channels", **kw)
+                                kill=self.kill, **kw)
 
     def snapshot(self):
         return {p.relative_to(self.ws): p.read_bytes() for p in sorted(self.ws.rglob("*")) if p.is_file()}, \
@@ -4709,11 +4712,15 @@ class MoveFixtures(PromoteFixtures):
     def descriptor(self, **fields):
         d = {"version": 1, "lane": "primary", "env_file": "/old/relay-client.env", "env_key": "REMOTE_TASK_TOKEN",
              "mint_url": "https://chat.ag2.space/api/v1/mcp/agent-access-tokens",
-             "mcp_url": "https://mcp.ag2.space/mcp", "ca_bundle": None, "agent_id": "@sutando-x:ag2.space", **fields}
+             "mcp_url": "https://mcp.ag2.space/mcp", "ca_bundle": None, "agent_id": "@sutando-x:ag2.space",
+             "relay": "https://chat.ag2.space/relay", "bearer_digest": DIGEST, **fields}
         path = self.ws / "state" / C.MCP_DESCRIPTOR_NAME
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(d))
         return path
+
+    def descriptor_json(self):
+        return json.loads((self.ws / "state" / C.MCP_DESCRIPTOR_NAME).read_text())
 
 
 class Move(MoveFixtures):
@@ -4778,10 +4785,21 @@ class Move(MoveFixtures):
         self.assertEqual((out["ok"], out["reason"]), (False, "no_token"))
         self.assertEqual((self.snapshot(), self.asked), (before, []))
 
-    def test_an_existing_successor_row_is_refused(self):
-        self.add("https://chat.s.space/relay|another", fetch=agents("@sutando-x:s.space"))
+    def test_an_existing_successor_row_for_another_agent_is_refused(self):
+        self.add("https://chat.s.space/relay|another", fetch=agents("@someone:s.space"))
         out = self.move()
         self.assertEqual((out["ok"], out["reason"]), (False, "successor_exists"))
+
+    def test_a_half_move_whose_promote_failed_is_resumed(self):
+        self.descriptor()
+        self.connects = False
+        with unittest.mock.patch.object(C, "CONNECT_TIMEOUT_S", 0.2):
+            self.assertEqual(self.move()["added"], True)
+        self.assertEqual(self.descriptor_json()["mcp_url"], "https://mcp.ag2.space/mcp", "nothing re-pointed yet")
+        self.connects = True
+        out = self.move()
+        self.assertEqual((out["ok"], out["resumed"], out["instance"], out["mcp"]), (True, True, "s-space", "repointed"))
+        self.assertTrue(self.by_inst()["s-space"]["primary"])
 
     def test_dry_run_checks_and_writes_nothing(self):
         self.descriptor()
@@ -4797,18 +4815,26 @@ class Move(MoveFixtures):
         self.assertEqual(out["mcp"], "repointed")
         d = json.loads(path.read_text())
         env_file = self.ws / "channels" / "s-space-ag2space" / C.MOVE_ENV_FILE
-        self.assertEqual({k: d[k] for k in ("mint_url", "mcp_url", "agent_id", "env_file", "env_key", "lane")},
+        self.assertEqual({k: d[k] for k in ("mint_url", "mcp_url", "agent_id", "env_file", "env_key", "lane",
+                                             "relay", "bearer_digest")},
                          {"mint_url": "https://chat.s.space/api/v1/mcp/agent-access-tokens",
                           "mcp_url": "https://mcp.s.space/mcp", "agent_id": "@sutando-x:s.space",
-                          "env_file": str(env_file), "env_key": "REMOTE_TASK_TOKEN", "lane": "primary"})
-        self.assertEqual(env_file.read_text(), "REMOTE_TASK_TOKEN=https://chat.s.space/relay|" + SECRET + "\n")
+                          "env_file": str(env_file), "env_key": "REMOTE_TASK_TOKEN", "lane": "primary",
+                          "relay": "https://chat.s.space/relay", "bearer_digest": DIGEST})
+        self.assertEqual(env_file.read_text(), "REMOTE_TASK_TOKEN='https://chat.s.space/relay|" + SECRET + "'\n")
+        from channel_token import token_from_env_file
+        self.assertEqual(token_from_env_file("REMOTE_TASK_TOKEN", env_file), "https://chat.s.space/relay|" + SECRET)
+        sourced = subprocess.run(["sh", "-c", f'set -a; . "{env_file}"; printf %s "$REMOTE_TASK_TOKEN"'],
+                                 capture_output=True, text=True, env=isolated_child_env())
+        self.assertEqual((sourced.returncode, sourced.stdout), (0, "https://chat.s.space/relay|" + SECRET),
+                         "sourcing runs nothing after the |")
         self.assertEqual(env_file.stat().st_mode & 0o777, 0o600)
         self.assertEqual(path.with_name(C.MCP_DESCRIPTOR_NAME + ".bak-ag2-space").read_bytes(), old)
 
     def test_an_mcp_descriptor_on_another_server_or_absent_is_left_alone(self):
         self.assertEqual(self.move(dry_run=True)["mcp"], "absent")
         path = self.descriptor(mint_url="https://chat.s.space/api/v1/mcp/agent-access-tokens",
-                               mcp_url="https://mcp.s.space/mcp")
+                               mcp_url="https://mcp.s.space/mcp", relay="https://chat.s.space/relay")
         before = path.read_bytes()
         self.assertEqual(self.move()["mcp"], "unchanged")
         self.assertEqual(path.read_bytes(), before)
@@ -4863,7 +4889,25 @@ class Move(MoveFixtures):
                 raise C.InvalidToken("invalid_gateway")
             return real(token, **kw)
         with unittest.mock.patch.object(C, "preview_connection", preview):
-            self.assertEqual(self.move()["reason"], "agent_mismatch")
+            self.assertEqual(self.move()["reason"], "unverified")
+
+    def test_an_old_gateway_that_no_longer_confirms_the_agent_is_unverified(self):
+        real = self.fetch
+
+        def fetch(url, token, address=None):
+            if "chat.ag2.space" in url:
+                raise urllib.error.HTTPError(url, 401, "nope", {}, None)
+            return real(url, token, address)
+        self.assertEqual(self.move(fetch=fetch)["reason"], "unverified")
+
+    def test_another_owner_on_the_successor_is_refused(self):
+        real = self.fetch
+
+        def fetch(url, token, address=None):
+            answer = real(url, token, address)
+            owner = "@owner:s.space" if "chat.s.space" in url else "@someone-else:ag2.space"
+            return {"agents": [dict(a, owner=owner) for a in answer["agents"]]}
+        self.assertEqual(self.move(fetch=fetch)["reason"], "agent_mismatch")
 
     def test_an_unreadable_descriptor_or_a_successor_without_mcp_is_reported_and_left(self):
         path = self.ws / "state" / C.MCP_DESCRIPTOR_NAME
@@ -4876,6 +4920,36 @@ class Move(MoveFixtures):
         bare = {"instances": [dict(e, mcp_url="") for e in MOVE_REGISTRY["instances"]]}
         out = self.move(dry_run=True, resolver=lambda h: dotspace.dotspace_for(h, fetch=dotspace.NO_FETCH, config=bare))
         self.assertEqual(out["mcp"], "no_successor_endpoints")
+
+    def test_a_failed_descriptor_write_is_reported_and_the_move_stands(self):
+        self.descriptor()
+        blocker = self.ws / "not-a-dir"
+        blocker.write_text("")
+        out = self.move(channels_home=blocker)
+        self.assertEqual((out["ok"], out["mcp"]), (True, "write_failed"))
+        self.assertEqual(self.descriptor_json()["mcp_url"], "https://mcp.ag2.space/mcp")
+
+    def test_the_stale_digest_of_another_secret_is_dropped(self):
+        self.descriptor(bearer_digest="0" * 64)
+        self.assertEqual(self.move()["mcp"], "repointed")
+        self.assertNotIn("bearer_digest", self.descriptor_json())
+
+    def test_the_descriptor_is_the_one_the_core_mcp_config_names_inside_the_workspace(self):
+        config = self.ws / "claude.json"
+        named = self.ws / "elsewhere" / "d.json"
+        config.write_text(json.dumps({"mcpServers": {"host": {"env": {"AG2_MCP_DESCRIPTOR": "/outside/d.json"}},
+                                                     "core": {"env": {"AG2_MCP_DESCRIPTOR": str(named)}}}}))
+        self.assertEqual(C.mcp_descriptor_path(self.ws, config), named)
+        config.write_text(json.dumps({"mcpServers": {"host": {"env": {"AG2_MCP_DESCRIPTOR": "/outside/d.json"}}}}))
+        self.assertEqual(C.mcp_descriptor_path(self.ws, config), self.ws.resolve() / "state" / C.MCP_DESCRIPTOR_NAME)
+        config.write_text("{broken")
+        self.assertEqual(C.mcp_descriptor_path(self.ws, config).name, C.MCP_DESCRIPTOR_NAME)
+        named.parent.mkdir()
+        named.write_text((self.descriptor()).read_text())
+        config.write_text(json.dumps({"mcpServers": {"core": {"env": {"AG2_MCP_DESCRIPTOR": str(named)}}}}))
+        self.assertEqual(self.move(mcp_config=config)["mcp"], "repointed")
+        self.assertEqual(json.loads(named.read_text())["mcp_url"], "https://mcp.s.space/mcp")
+        self.assertEqual(self.descriptor_json()["mcp_url"], "https://mcp.ag2.space/mcp", "only the named one")
 
     def test_the_env_file_defaults_under_the_claude_home_channels(self):
         self.descriptor()

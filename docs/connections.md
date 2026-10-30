@@ -305,16 +305,21 @@ row's secret (the primary, else the legacy row; name another instance to pick it
 s.space's registered gateway and asks that gateway who it is. Only when s.space verifies the same
 agent localpart does it save the `s-space` row (settling its backlog), promote it (the ag2.space
 bridge keeps running as a secondary until you `park-legacy`), re-point the agent MCP descriptor
-(`state/ag2-mcp.json`: mint and MCP URLs, `agent_id`, and an `env_file` holding the code, the old
-descriptor kept as `ag2-mcp.json.bak-ag2-space`) and, when the worker pool is installed, bind each
-ag2.space room's s.space twin to the same worker. `--dry-run` checks and writes nothing. The secret
+and, when the worker pool is installed, bind each ag2.space room's s.space twin to the same worker.
+The descriptor is the one the core's Claude Code MCP config names (`AG2_MCP_DESCRIPTOR`) inside the
+workspace, else `state/ag2-mcp.json`; the desktop app's own descriptor is the app's and never
+touched. Its mint and MCP URLs, `relay` and `agent_id` move to s.space, and `env_file` names a
+0600 file holding the code, single-quoted. `bearer_digest` stays because the secret is the same.
+The old descriptor is kept as `<name>.bak-ag2-space`. A move whose promote failed is resumed by
+running `move` again. `--dry-run` checks and writes nothing. The secret
 is never printed. Over HTTP the same step is `POST /api/v1/connections/move` (`{"dry_run": true}`
 to check; `{"instance": "legacy"}` names the legacy row), answering `{ok, instance, agent_mxid}` or
 `{ok: false, reason}`.
 
 A refusal writes nothing and names its reason: `auth_rejected` (either server issued a new code
-since the copy), `agent_mismatch`, `unverified` (s.space did not answer), `no_token`,
-`no_successor` or `successor_exists` (promote that row instead). Then fall back to a code:
+since the copy), `agent_mismatch` (another agent or owner), `unverified` (a server did not confirm
+the agent), `no_token`, `no_successor` or `successor_exists` (another agent's row is already on
+s.space). Then fall back to a code:
 
 1. Get a connect code for this agent at s.space's agent portal.
 2. `python3 scripts/connections.py add '<code>'` — quote it (the code holds a `|`); it previews the

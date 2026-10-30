@@ -171,9 +171,9 @@ def cmd_move(args) -> int:
     if not out["ok"]:
         print(f"connections: move refused: {out['reason']}" + (f" ({out['detail']})" if out.get("detail") else ""),
               file=sys.stderr)
-        if out["reason"] == "successor_exists":
-            print("next: python3 scripts/connections.py promote <that instance> --repo . --logs-dir <logs>")
-        else:
+        if out.get("added"):
+            print(f"next: the {out.get('instance')} row is saved; run move again to finish (it resumes)")
+        elif out["reason"] != "successor_exists":
             print(f"next: get a connect code at {out.get('server') or 'the successor server'}'s agent portal, "
                   "then run python3 scripts/connections.py add '<code>'")
         return 1
