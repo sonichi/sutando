@@ -58,7 +58,7 @@ function taskChange(state, line) {
   }
   if (line?.type === 'response_item' && p.type === 'message' && p.role === 'user') {
     const active = state.activeTask;
-    const startupContext = p.content?.length === 2 && p.content.every((part) => part?.type === 'input_text'
+    const startupContext = Array.isArray(p.content) && p.content.length === 2 && p.content.every((part) => part?.type === 'input_text'
       && typeof part.text === 'string') && p.content[0].text.startsWith('# AGENTS.md instructions for ')
       && p.content[0].text.trimEnd().endsWith('</INSTRUCTIONS>')
       && p.content[1].text.startsWith('<environment_context>')

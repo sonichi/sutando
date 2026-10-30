@@ -584,5 +584,7 @@ test('real CLI first-turn metadata before context never replaces the authoritati
     [receiptStart()[0], {...startupContext(), payload: {...startupContext().payload, content: startupContext().payload.content.slice(0, 1)}}, receiptStart()[1], userInput()],
     [receiptStart()[0], startupContext(), userInput()],
     [...first, userInput('actual duplicate')],
+    [receiptStart()[0], {...startupContext(), payload: {...startupContext().payload, content: 'ab'}}, receiptStart()[1], userInput()],
+    [receiptStart()[0], {...startupContext(), payload: {...startupContext().payload, content: {length: 2}}}, receiptStart()[1], userInput()],
   ]) assert.equal(receiptRecord(run([...input, ...receiptEnd()])).completed_task, undefined);
 });
