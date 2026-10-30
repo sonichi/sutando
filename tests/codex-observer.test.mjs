@@ -562,3 +562,27 @@ test('only a complete matching failed root turn publishes a typed terminal recei
   run([ev('task_started', {turn_id: 'next'})], state);
   assert.equal(receiptRecord(state).failed_task, undefined);
 });
+
+const startupContext = () => item('message', '2026-10-06T02:57:50.100Z', {role: 'user', content: [
+  {type: 'input_text', text: '# AGENTS.md instructions for synthetic-project\n<INSTRUCTIONS>\nFixture rules.\n</INSTRUCTIONS>'},
+  {type: 'input_text', text: '<environment_context>\n<cwd>synthetic-project</cwd>\n</environment_context>'},
+]});
+
+test('real CLI first-turn metadata before context never replaces the authoritative prompt', () => {
+  const first = [receiptStart()[0], startupContext(), receiptStart()[1], userInput()];
+  const succeeded = receiptRecord(run([...first, ...receiptEnd()]));
+  assert.equal(succeeded.completed_task.prompt_sha256, crypto.createHash('sha256').update('synthetic task prompt').digest('hex'));
+  assert.equal(succeeded.last_completed_at, succeeded.completed_task.completed_at);
+  const failed = receiptRecord(run([...first, ev('task_complete', {turn_id: 'turn-a',
+    error: {codex_error_info: 'server_overloaded'}}, '2026-10-06T02:57:53.000Z')]));
+  assert.equal(failed.failed_task.prompt_sha256, succeeded.completed_task.prompt_sha256);
+  assert.equal(failed.failed_task.error_kind, 'server-overloaded');
+  assert.equal(failed.completed_task, undefined);
+  for (const input of [
+    [receiptStart()[0], startupContext(), startupContext(), receiptStart()[1], userInput()],
+    [...receiptStart(), startupContext(), userInput()],
+    [receiptStart()[0], {...startupContext(), payload: {...startupContext().payload, content: startupContext().payload.content.slice(0, 1)}}, receiptStart()[1], userInput()],
+    [receiptStart()[0], startupContext(), userInput()],
+    [...first, userInput('actual duplicate')],
+  ]) assert.equal(receiptRecord(run([...input, ...receiptEnd()])).completed_task, undefined);
+});

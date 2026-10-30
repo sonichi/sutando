@@ -58,6 +58,14 @@ function taskChange(state, line) {
   }
   if (line?.type === 'response_item' && p.type === 'message' && p.role === 'user') {
     const active = state.activeTask;
+    const startupContext = p.content?.length === 2 && p.content.every((part) => part?.type === 'input_text'
+      && typeof part.text === 'string') && p.content[0].text.startsWith('# AGENTS.md instructions for ')
+      && p.content[0].text.trimEnd().endsWith('</INSTRUCTIONS>')
+      && p.content[1].text.startsWith('<environment_context>')
+      && p.content[1].text.trimEnd().endsWith('</environment_context>');
+    if (active && !active.contextSeen && !active.startupContextSeen && startupContext && at >= active.startedAt) {
+      return {activeTask: {...active, startupContextSeen: true}};
+    }
     if (!active?.contextSeen || active.promptSha256 || state.turnSucceeded || !(at >= active.startedAt)
         || p.content?.length !== 1 || p.content[0]?.type !== 'input_text'
         || typeof p.content[0].text !== 'string' || !p.content[0].text) return clear;
