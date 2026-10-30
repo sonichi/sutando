@@ -32,7 +32,7 @@ export async function handleSessionContextFrame(ctx: Pick<SkillSetupCtx, 'sendCl
 }
 
 export function setup(ctx: SkillSetupCtx): void {
-	// A change held for a spoken yes needs the user to have spoken since it was held.
+	// A destructive change held for a spoken yes needs the user to have spoken since it was held.
 	if (typeof ctx?.onUserSpoke === 'function') {
 		ctx.onUserSpoke(noteUserSpoke);
 		armSpeechGate();
