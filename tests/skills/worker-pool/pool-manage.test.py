@@ -252,7 +252,7 @@ class RosterWriters(Base):
             pr.remove_worker(self.ws, WID)
 
 
-class OwedDeliveries(Base):
+class OwedBase(Base):
     """A worker that owes a pending AND an accepted delivery. Retire/remove either
     refuse or hand both to the core; a replay after either never targets the worker;
     a late result from the old worker is neither run twice nor lost."""
@@ -283,6 +283,8 @@ class OwedDeliveries(Base):
         self.assertIsNone(pattr.worker_for_task(self.ws, t))
         self.assertIn(f"{t}.txt", self.core_queue())
 
+
+class OwedDeliveries(OwedBase):
     def test_before_the_fix_shape_replay_follows_the_committed_worker(self):
         self.assertEqual(self.replay("task-a"), {"code": 0, "targets": [WID]})
         self.assertEqual(self.core_queue(), [])
@@ -368,6 +370,88 @@ class RetireRollback(Base):
         self.assertEqual((rc, out["result"]), (1, "failed"))
         self.assertEqual(self.row()["state"], "live")
         self.assertEqual(pr.load_bindings(self.ws), {"!room:example": WID})
+
+
+class EdgePaths(Base):
+    def test_refusals_for_names_rosters_and_unreadable_owed_work(self):
+        pr.rename_worker(self.ws, OTHER, "dup")
+        roster = json.loads((self.ws / "state" / "roster.json").read_text())
+        roster["workers"][WID]["display_label"] = "dup"
+        (self.ws / "state" / "roster.json").write_text(json.dumps(roster))
+        self.assertEqual(self.main("stop", "dup")[0], 2)
+        with mock.patch.object(sup, "work_outstanding", return_value=None):
+            rc, out = self.main("stop", WID)
+        self.assertEqual((rc, out["result"]), (2, "refused"))
+        self.assertIn("cannot tell", out["why"])
+        for path in ("roster.json",):
+            (self.ws / "state" / path).unlink()
+        self.assertEqual(self.main("stop", WID)[0], 2)
+        self.assertEqual(self.main("list")[0], 2)
+        with self.assertRaises(pr.RosterError):
+            pr.set_worker_state(self.ws, WID, "retired")
+
+    def test_roster_writer_refusals(self):
+        with self.assertRaises(pr.RosterError):
+            pr.set_worker_state(self.ws, "ghost", "retired")
+        pr.bind_room(self.ws, "!r:x", WID)
+        with self.assertRaises(pr.WorkerBound):
+            pr.set_worker_state(self.ws, WID, "retired")
+        with self.assertRaises(pr.RosterError):
+            pr.remove_worker(self.ws, OTHER)
+
+    def test_a_worker_with_no_recorded_run_has_no_session_to_kill(self):
+        self.assertIsNone(sup.run_socket(self.ws, "c" * 32))
+        with mock.patch.object(sup, "run_socket", return_value=None):
+            rc, out = self.main("stop", WID)
+        self.assertEqual((rc, out["sessions"]), (0, {}))
+
+    def test_a_kill_that_raises_still_reports_by_the_re_probe(self):
+        real = self.tmux
+
+        def flaky(argv, **kw):
+            if "kill-session" in argv:
+                real(argv)
+                raise OSError("tmux vanished")
+            return real(argv, **kw)
+        self.tmux = flaky
+        rc, out = self.main("stop", WID)
+        self.assertEqual((rc, out["result"]), (0, "stopped"))
+
+    def test_enable_reports_a_failed_restart(self):
+        with mock.patch.object(rem, "restart", return_value={"result": "failed", "detail": {"why": "x"}}):
+            out = pm.enable(self.ws, REPO, WID)
+        self.assertEqual(out["result"], "failed")
+
+    def test_list_text_and_a_malformed_row(self):
+        roster = json.loads((self.ws / "state" / "roster.json").read_text())
+        roster["workers"]["d" * 32] = "not-a-row"
+        (self.ws / "state" / "roster.json").write_text(json.dumps(roster))
+        rc, lines = self.main("list")
+        self.assertEqual(rc, 0)
+        self.assertTrue(any("pool worker 1" in ln for ln in lines))
+        self.assertFalse(any("d" * 32 in ln for ln in lines))
+
+
+class EdgeOwed(OwedBase):
+    def test_remove_refuses_owed_work_and_fails_on_an_unconfirmed_take_down(self):
+        pr.set_worker_state(self.ws, WID, "retired")
+        rc, out = self.main("remove", WID)
+        self.assertEqual((rc, out["result"]), (2, "refused"))
+        self.tmux = lambda argv, **kw: subprocess.CompletedProcess(argv, 1, "", "server exited unexpectedly")
+        rc, out = self.main("remove", WID, "--hand-off")
+        self.assertEqual((rc, out["result"]), (1, "failed"))
+        self.assertIsNotNone(self.row())
+
+    def test_conflicting_evidence_fails_the_hand_off_and_moves_nothing(self):
+        pattr.attribution_path(self.ws, "task-a").write_text("not-a-worker-id")
+        rc, out = self.main("retire", WID, "--hand-off")
+        self.assertEqual((rc, out["result"]), (1, "failed"))
+        self.assertIsNotNone(pdm.find(self.ws, WID, "task-a"))
+
+    def test_revoke_removes_only_a_record_naming_that_worker(self):
+        self.assertFalse(pattr.revoke(self.ws, "task-a", OTHER))
+        self.assertFalse(pattr.revoke(self.ws, "task-none", WID))
+        self.assertTrue(pattr.revoke(self.ws, "task-a", WID))
 
 
 if __name__ == "__main__":
