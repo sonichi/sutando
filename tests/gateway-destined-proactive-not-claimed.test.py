@@ -26,6 +26,11 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from _helpers.hermetic_env import hermetic_env, isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 REPO = Path(__file__).resolve().parent.parent
 
 failures: list[str] = []
@@ -77,10 +82,15 @@ class Handler(BaseHTTPRequestHandler):
         raw = self.rfile.read(ln) if ln else b"{}"
         if self.path.startswith("/v1/room"):
             try:
-                with LOCK:
-                    STATE["room_posts"].append(json.loads(raw))
+                req = json.loads(raw)
             except ValueError:
-                pass
+                req = None
+            if isinstance(req, dict) and req.get("op") == "members":  # a membership read is not a post
+                self._json({"members": [{"user_id": "@mock-agent:example.org"}, {"user_id": "@o:example.org"}]})
+                return
+            if req is not None:
+                with LOCK:
+                    STATE["room_posts"].append(req)
         self._json({"ok": True, "event_id": "$mock"})
 
 
@@ -100,7 +110,7 @@ sdir.mkdir(parents=True)
 (rdir / "proactive-100.txt").write_text("undestined control body")
 (rdir / "proactive-101.to-discord.txt").write_text("discord destined body")
 
-env = dict(os.environ)
+env = hermetic_env()
 env.update({"SUTANDO_TEST_MODE": "1", "SUTANDO_WORKSPACE": tmp,
             "REMOTE_TASK_URL": f"http://127.0.0.1:{port}",
             "REMOTE_TASK_TOKEN": "testtoken",

@@ -1,0 +1,32 @@
+{
+  "action": "synchronize",
+  "number": 7,
+  "before": "a1b2c3d4",
+  "after": "0badc0de9999",
+  "pull_request": {
+    "number": 7,
+    "state": "open",
+    "merged": false,
+    "title": "x",
+    "user": {
+      "login": "alice"
+    },
+    "head": {
+      "sha": "0badc0de9999",
+      "ref": "feat"
+    },
+    "base": {
+      "ref": "main"
+    }
+  },
+  "repository": {
+    "full_name": "acme/widgets",
+    "name": "widgets",
+    "owner": {
+      "login": "acme"
+    }
+  },
+  "sender": {
+    "login": "alice"
+  }
+}

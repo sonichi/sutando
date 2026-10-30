@@ -8,6 +8,12 @@ working-state e2e would need a live core, which CI doesn't have.
 
     python3 tests/runtime-health.test.py
 """
+
+from _helpers.hermetic_env import isolate_os_environ, isolated_child_env
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import json
 import os
@@ -16,6 +22,7 @@ import subprocess
 import tempfile
 import sys
 import time
+import types
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _spec = importlib.util.spec_from_file_location(
@@ -106,6 +113,16 @@ for _name, _pane in (
     check(f"needs_login agrees with worker_auth_state.auth_expired: {_name}",
           rh.needs_login(_pane) is was.auth_expired(_pane))
 
+# 1a') A Codex core reads its own `•` response as signed in again, as the seat monitor does.
+_CODEX_REFUSED = "› /startup\nAuthentication required\n"
+_CODEX_BACK = _CODEX_REFUSED + "› hi\n• Hello.\n\n» Ask Codex to do anything\n"
+check("needs_login: a codex response after the refusal clears it for runtime codex",
+      rh.needs_login(_CODEX_BACK, "codex") is False and was.auth_expired(_CODEX_BACK, "codex") is False)
+check("needs_login: the same pane read as claude still needs login",
+      rh.needs_login(_CODEX_BACK) is True)
+check("needs_login: a codex spinner after the refusal is not a sign-in",
+      rh.needs_login(_CODEX_REFUSED + "• Working (0m 9s • esc to interrupt)\n", "codex") is True)
+
 # 1b) _tmux_socket(): a detached probe does not inherit SUTANDO_TMUX_SOCKET, so the
 #     import-time default reports a live core as offline. Prefer the recorded socket.
 _sock_tmp = tempfile.mkdtemp()
@@ -181,7 +198,7 @@ if _env_before is not None:
 shutil.rmtree(_sock_tmp, ignore_errors=True)
 
 # 3) offline end-to-end: a socket with no session → health=offline, authed=null.
-env = dict(os.environ)
+env = isolated_child_env()
 env["SUTANDO_TMUX_SOCKET"] = "/tmp/rh-test-nonexistent-%d.sock" % os.getpid()
 p = subprocess.run(
     [sys.executable, os.path.join(REPO, "src", "runtime-health.py")],
@@ -526,6 +543,21 @@ check("derive: CONTROL /startup in the composer but nothing queued -> idle",
 check("derive: CONTROL a Claude draft does not hold its queue -> idle",
       _derive_blocked_case(f"❯ /startup\n{_FOOTER}", queued=1, runtime="claude")["health"] == "idle")
 check("severity_of: blocked is warn", rh.severity_of("blocked") == "warn")
+# 2026-10-22: Codex 0.160's first launch in a git checkout sat on this prompt for half an hour
+# while health said "Agent is online and idle".
+_CODEX_TRUST = ("  Folder access\n\n  /private/tmp/x/sutando-5764\n\n"
+                "  Trust this folder? Codex can read, edit, and run files here, subject to\n"
+                "  your permission settings. Your trust decision will be saved.\n\n"
+                "\u203a 1. Trust and continue\n  2. Quit\n\n  enter continue \u00b7 esc quit\n")
+d = _derive_blocked_case(_CODEX_TRUST, queued=0)
+check("derive: a Codex folder-trust prompt is blocked even with nothing queued",
+      d["health"] == "blocked" and "folder-trust prompt" in d["detail"] and "cannot take tasks" in d["detail"])
+d = _derive_blocked_case(_CODEX_TRUST, queued=2)
+check("derive: ...and with a queue, the detail names it",
+      d["health"] == "blocked" and "2 task(s) queued" in d["detail"] and "folder-trust" in d["detail"])
+check("derive: CONTROL a Codex picker the core's own turn raised is not person-only -> idle",
+      _derive_blocked_case("  Select Model and Effort\n\u203a 4. gpt-5.5 (current)\n", queued=0)["health"]
+      == "idle")
 check("derive: a session that cannot name its runtime is not judged -> idle",
       _derive_blocked_case(_REJECTED, queued=1, runtime="")["health"] == "idle")
 check("_queued_tasks: an unreadable workspace counts as no queue, never a crash",
@@ -537,6 +569,14 @@ try:
           rh._pane_blocks_dispatch(tempfile.mkdtemp()) is None)
 finally:
     rh.cli_wedge.core_target = _ocw
+_opb = rh._pane_blocks_dispatch
+rh._pane_blocks_dispatch = lambda ws, queued=True: types.SimpleNamespace(state="wedged", reason="stalled")
+try:
+    d = _derive_blocked_case("", queued=1)
+    check("derive: any other holding verdict is named by its state and reason",
+          d["health"] == "blocked" and "wedged (stalled)" in d["detail"])
+finally:
+    rh._pane_blocks_dispatch = _opb
 
 print("\n" + ("PASS — runtime-health green" if fails == 0 else "FAIL — %d failing" % fails))
 sys.exit(fails)

@@ -101,7 +101,12 @@ class CloudOriginPrecedence(unittest.TestCase):
         self.assertIn(
             "AG2_CLOUD_ORIGIN", m["config"], "manifest does not declare AG2_CLOUD_ORIGIN"
         )
-        self.assertTrue(str(m["config"]["AG2_CLOUD_ORIGIN"]).startswith("http"))
+        # Declared empty: a value here would outrank the install's own DotSpace cloud.
+        self.assertEqual(m["config"]["AG2_CLOUD_ORIGIN"], "")
+        sys.path.insert(0, str(SKILL.parents[1] / "src"))
+        import dotspace  # noqa: E402
+
+        self.assertEqual(report_usage.resolve_cloud_origin({}, shipped), dotspace.default_cloud_origin())
 
     def test_retired_origin_reads_as_current_from_env_and_manifest(self):
         """The shared list in src/cloud_auth.py decides what is retired; a

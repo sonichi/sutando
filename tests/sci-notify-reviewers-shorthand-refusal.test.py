@@ -33,6 +33,8 @@ def _load():
     spec = importlib.util.spec_from_file_location("_nr_short", SCRIPT)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
+    # A repo with no CODEOWNERS; the gate's own suite is notify-reviewers-codeowners.
+    mod.codeowner_gate = lambda *a, **k: (True, [])
     return mod
 
 
@@ -129,8 +131,9 @@ class Shorthand(unittest.TestCase):
         self.assertGreater(len(self.calls), 0, 'the ask must actually be sent')
 
     def test_CONTROL_an_ask_with_no_pr_at_all_still_sends(self):
-        rc, _ = self._run("can you look at the roster when you get a moment?")
-        self.assertEqual(rc, 0, "an ask need not concern a PR; refusing it breaks the tool")
+        rc, _ = self._run("can you look at the roster when you get a moment?",
+                          extra=["--no-repo", "roster question, no code"])
+        self.assertEqual(rc, 0, "an ask need not concern a PR; --no-repo says so explicitly")
         self.assertGreater(len(self.calls), 0, 'the ask must actually be sent')
 
     def test_a_notice_is_not_refused(self):

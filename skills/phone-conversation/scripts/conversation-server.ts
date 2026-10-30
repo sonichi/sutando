@@ -153,7 +153,7 @@ const OWNER_TZ = process.env.OWNER_TZ ?? 'America/Los_Angeles';
 // template is copied into place so the operator has a file to edit. If the
 // copy fails (or the template is gone), loadVoiceConfig falls back to its
 // built-in defaults (schema: src/voice-config.ts). Phone ships with the
-// package default 2.5+search:true.
+// package default 3.8 Live + search:true.
 const VOICE_MODEL = process.env.VOICE_MODEL || 'gemini-2.5-flash';
 const _phoneSkillDir = dirname(dirname(fileURLToPath(import.meta.url)));
 const PHONE_VOICE_CONFIG_PATH = join(WORKSPACE_DIR, 'config', 'phone-conversation.json');
@@ -212,10 +212,10 @@ const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replac
 
 /** U+200B — zero-width space; not whitespace, so it survives .trimStart(). */
 const _ZWSP = '​';
-// Mirrors local_task_protocol.KNOWN_HEADER_KEYS (52 keys) — injection-guard-sweep
+// Mirrors local_task_protocol.KNOWN_HEADER_KEYS (53 keys) — injection-guard-sweep
 // asserts this regex covers every py key. reply_chain_ids added with PR #2310.
 const _CONF_HEADER_RE = new RegExp(
-	'^(?:id|timestamp|session_scope|task|source|access_tier|user_id|channel_id|priority|' +
+	'^(?:id|timestamp|session_scope|task|source|access_tier|user_id|channel_id|priority|lane|' +
 	'interaction_type|source_message_id|channel_name|guild_name|attempts|' +
 	'sender_name|room_name|parent_message_id|reply_chain_ids|reminder|' +
 	'author_name|author_id|' +
@@ -223,7 +223,7 @@ const _CONF_HEADER_RE = new RegExp(
 	'thread_root|source_room_id|channel_kind|' +
 	'receiving_instance|' +
 	'call_sid|hint|instructions|transcript|schedule_name|schedule_slot|content_modalities|media_form|' +
-	'attachments|platform_card|instance_id|collaborator|requested_worker|wire_source|picker_command|picker_args|hitl_click|owner_mentioned|task_layout)\\s*:',
+	'attachments|platform_card|instance_id|collaborator|requested_worker|wire_source|picker_command|picker_args|hitl_click|owner_mentioned|task_layout|local_time)\\s*:',
 	'i',
 );
 const _CONF_FENCE_RE = /^={3,}/;

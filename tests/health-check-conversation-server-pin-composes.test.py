@@ -21,6 +21,11 @@ Run: python3 tests/health-check-conversation-server-pin-composes.test.py
 """
 from __future__ import annotations
 
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import os
 import tempfile

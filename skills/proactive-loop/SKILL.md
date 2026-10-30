@@ -32,8 +32,8 @@ caps this file and refuses date stamps in it).
 ## Per pass
 `WORKSPACE="$(bash scripts/sutando-config.sh workspace)"` once; quote every `"$WORKSPACE/..."` path.
 
-0. **Status.** `bash scripts/core-status.sh running "<what the owner is waiting on>"`; rewrite on every
-   pivot; `bash scripts/core-status.sh idle` at the end. Never `>` the JSON yourself.
+0. **Status.** `bash scripts/core-status.sh running "<work>"` on each pivot.
+   Finish with step 1’s idle command; never redirect the JSON.
 0.5. **Quota tier** (Claude core):
    `python3 $CLAUDE_CONFIG_DIR/skills/quota-tracker/scripts/read-quota.py | python3 skills/proactive-loop/scripts/quota-tier.py`
    → `TIER <FULL|MEDIUM|LIGHT|MINIMAL> (bound by …)`. Then
@@ -58,14 +58,14 @@ caps this file and refuses date stamps in it).
    When this core consumes a task itself, move `$WORKSPACE/tasks/<id>.txt` to
    `$WORKSPACE/tasks/archive/<id>.txt` after writing its result; bridges and the Windows dispatcher
    archive their own claims.
-   Before idle: `python3 scripts/unanswered-tasks.py --workspace "$WORKSPACE" && bash scripts/core-status.sh idle`
+   Before idle: `python3 scripts/unanswered-tasks.py --workspace "$WORKSPACE" && bash scripts/core-status.sh idle "" --loop-complete`
    (1 = a task got no result, so idle does not run).
 1.5. **Connect waits.** `python3 skills/connect-apps/scripts/connectors.py rearm` restarts the waiter of
    any pending connector wait that lost it; idempotent, and a failure never blocks the pass.
-2. **Questions.** Nothing surfaces on a pass: a question reaches the owner once, when asked
-   (`scripts/ask-owner.py`); `src/check-pending-questions.py --notify` reminds only when he asks,
-   flagless it files what the outbox holds, sends nothing. `src/pending_questions_reader.py list`
-   only when he asks or you are blocked on an answer.
+2. **Questions.** A question reaches the owner once, when asked (`scripts/ask-owner.py`). Flagless,
+   `src/check-pending-questions.py` files the outbox and sends a stored card's one-time pointer, no
+   reminders; `--notify` reminds only when he asks. `src/pending_questions_reader.py list` only when
+   he asks or you are blocked on an answer.
 3. **Health.** `python3 src/health-check.py`; fix with `--fix` what it can. A warn is a pointer into the
    record: before investigating, `grep -in "<entity from the warn TEXT>" "$H/current-track.md"` and `pending_questions_reader.py list --json | grep -i "<entity>"`
    with `H="$WORKSPACE/hosts/$(bash scripts/sutando-config.sh host-label)"`; a zero means try another

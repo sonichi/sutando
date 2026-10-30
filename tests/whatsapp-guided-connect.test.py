@@ -150,8 +150,9 @@ stub.write_text(
     'else echo "not authenticated"; exit 1; fi;;\n'
     '  "chats list") [ -f "$MARK" ] && exit 0 || exit 1;;\n'
     '  "auth --events") trap \'kill $SP 2>/dev/null; exit 0\' TERM; '
+    'touch "$MARK"; '
     'echo \'{"event":"connected","data":{},"ts":3}\' >&2; '
-    f'touch "$MARK"; sleep 30 & SP=$!; wait $SP; exit 0;;\n'
+    'sleep 30 & SP=$!; wait $SP; exit 0;;\n'
     'esac\nexit 0\n')
 t0 = __import__("time").time()
 out = subprocess.run([sys.executable, str(SCRIPT), "--timeout", "60"],
@@ -395,8 +396,10 @@ stub.write_text(
     '  "auth status") if [ -f "$MARK" ]; then echo authenticated; exit 0; '
     'else echo "not authenticated"; exit 1; fi;;\n'
     '  "chats list") [ -f "$MARK" ] && exit 0 || exit 1;;\n'
-    '  "auth --events") echo \'{"event":"connected","data":{},"ts":9}\' >&2; '
-    f'touch "$MARK"; exit 0;;\n'
+    # The session is stored before `connected` is announced: the script terminates
+    # auth as soon as it reads that event, so a later write can be cut off.
+    '  "auth --events") touch "$MARK"; '
+    'echo \'{"event":"connected","data":{},"ts":9}\' >&2; exit 0;;\n'
     'esac\nexit 0\n')
 out = subprocess.run([sys.executable, str(SCRIPT), "--timeout", "30"],
                      capture_output=True, text=True, env=env, timeout=60)

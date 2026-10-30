@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -35,6 +36,7 @@ import pool_roster as pr  # noqa: E402
 import spawn_worker as sw  # noqa: E402
 
 from workspace_default import resolve_workspace  # noqa: E402
+from util_paths import task_event_handler_config_path  # noqa: E402
 
 REFUSED = 2
 
@@ -75,6 +77,10 @@ def preflight(workspace, repo, room: str) -> None:
         raise Refused(f"repo is not a directory: {repo}")
     if room is not None and not str(room).strip():
         raise Refused("--room was given but empty")
+    try:
+        pr.validate_current_roster(workspace)
+    except pr.RosterError as e:
+        raise Refused(str(e)) from e
     if not sw.per_instance_sentinel_supported(repo):
         raise Refused("this checkout writes ONE watcher sentinel for every "
                       "watcher, so a second watcher would erase the core's "
@@ -82,18 +88,31 @@ def preflight(workspace, repo, room: str) -> None:
     if room is not None:
         # Publishing a binding with no router sends that room's work to the
         # core instead — silently, and the binding says otherwise.
-        handler = os.environ.get("SUTANDO_TASK_EVENT_HANDLER", "")
+        config = task_event_handler_config_path(Path(workspace) / "state")
+        diagnostic = (
+            "binding a room needs the core's task-event handler: declare an "
+            f"executable file in {config} (the handler field), or set "
+            "SUTANDO_TASK_EVENT_HANDLER to one. Creating an unbound "
+            "worker (no --room) does not need one.")
+        try:
+            lookup = subprocess.run(
+                ["bash", "-c", 'source "$1" && task_event_handler "$2"',
+                 "create-worker", str(_REPO / "src/agent/task-event-handler-lookup.sh"),
+                 str(config)],
+                capture_output=True, timeout=10)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            raise Refused(f"{diagnostic} (handler lookup failed: {e})") from e
+        # Text-mode capture would normalize carriage returns within filenames.
+        handler = os.fsdecode(lookup.stdout.removesuffix(b"\n"))
         # A REGULAR file: `X_OK` alone is satisfied by a searchable directory,
         # which the watcher cannot execute, so the binding would still be unrouted.
-        if (not handler or not os.path.isfile(handler)
+        if (lookup.returncode != 0 or not handler or not os.path.isfile(handler)
                 or not os.access(handler, os.X_OK)):
+            invalid = handler or os.environ.get("SUTANDO_TASK_EVENT_HANDLER", "")
             raise Refused(
-                "binding a room needs the core's task-event handler: set "
-                "SUTANDO_TASK_EVENT_HANDLER to an executable and re-arm the "
-                "core's watcher with it, then retry. Creating an unbound "
-                "worker (no --room) does not need one."
-                + (f" (it names {handler!r}, which is not an executable file)"
-                   if handler else ""))
+                diagnostic
+                + (f" (it names {invalid!r}, which is not an executable file)"
+                   if invalid else ""))
 
 
 def compile_with(workspace, worker_id: str, label: str, room, runtime=None) -> dict:

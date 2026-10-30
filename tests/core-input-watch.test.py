@@ -13,10 +13,16 @@ Run: python3 tests/core-input-watch.test.py
 """
 from __future__ import annotations
 
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import json
 import os
 import unittest
+from pathlib import Path as _Path
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _SRC = os.path.join(_HERE, "..", "src", "core-input-watch.py")
@@ -68,6 +74,23 @@ _FABLE_LIMIT_UNFOCUSED = _FABLE_LIMIT.replace(
     "  ❯ Switch to Opus 5 and continue\n    Continue with Fable 5.1",
     "    Switch to Opus 5 and continue\n  ❯ Continue with Fable 5.1")
 assert _FABLE_LIMIT_UNFOCUSED != _FABLE_LIMIT
+# A worker seat's turn opened by a Monitor event and refused at the Fable weekly limit,
+# as the session transcript recorded it on 2026-09-28; the pane layout is reconstructed.
+_FABLE_REFUSED_MONITOR = (
+    "⏺ Monitor event: \"Streaming task watcher (worker 17c6c322 inbox)\"\n\n"
+    "⏺ You've reached your Fable limit. Run /usage-credits to continue or switch models with /model.\n\n"
+    "✻ Worked for 0s\n\n" + _IDLE)
+# A worker's pane on 2026-10-19: every refused turn, Monitor-event ones included, ends on the
+# refusal as its own ⎿ line; the subagent's error above it quotes the same text mid-line.
+_FABLE_AGENT_ERROR = ("⏺ Agent \"...\" failed: Agent terminated early due to an API error: You've reached your Fable\n"
+                      "limit. Run /usage-credits to continue or switch models with /model. "
+                      "(error type rate_limit, HTTP 429, ...)\n")
+_FABLE_REFUSAL_LINE = "  ⎿  You've reached your Fable limit. Run /usage-credits to continue or switch models with /model.\n"
+_FABLE_REFUSED_20261019 = (
+    _FABLE_AGENT_ERROR + _FABLE_REFUSAL_LINE + "\n"
+    "✻ Worked for 1s · done 4:32 PM\n\n"
+    "⏺ Monitor event: [Monitor expired after 30m ...]\n" + _FABLE_REFUSAL_LINE + "\n"
+    "✻ Crunched for 1s · done 4:47 PM\n\n" + _IDLE)
 # The core's terminal on 2026-09-07 (#4015): every /startup was refused in 0-1s and the CLI
 # went straight back to its idle footer, so no gate was ever on screen.
 _REFUSAL_LINE = ("You're out of usage credits. Run /usage-credits to keep using Fable 5.1 "
@@ -87,6 +110,51 @@ _STARTUP_OK_TURN = ("❯ /startup\n"
 
 
 class TestClassify(unittest.TestCase):
+    def test_completed_recap_and_control_are_idle(self):
+        pane = ("❯ /proactive-loop\n"
+                "※ recap: if you typed X in a worker window, press Enter there to send it.\n"
+                "Nothing needs you this round.\n❯ \n⏵⏵ bypass permissions on · ← for agents")
+        for frame in (pane, pane.replace("press Enter", "submit it")):
+            with self.subTest(frame=frame):
+                result = compose_state(frame, "idle", True, styled_pane=frame)
+                self.assertEqual((result[0], result[2], result[3]), ("idle-ready", None, None))
+
+    def test_real_unknown_dialogs_near_idle_chrome(self):
+        footer = "⏵⏵ bypass permissions on · ← for agents"
+        ghost = "❯ \x1b[2mshow me how to navigate\x1b[0m"
+        for hint in ("Enter to confirm · Esc to cancel", "Keyboard: Enter to confirm",
+                     "Keyboard: Enter to confirm.", "Keyboard: Enter to confirm your choice",
+                     "Please press Enter to overwrite the file.",
+                     "※ Please press Enter to overwrite the file.",
+                     "※ recap: Please press Enter to overwrite the file."):
+            for dialog in (hint, "Overwrite the existing config file?\n" + hint):
+                for prefix, suffix in (("", ""), ("", "\n" + footer),
+                                       ("", "\n" + ghost), ("", "\n❯ \n" + footer),
+                                       (footer + "\n", "\n❯ ")):
+                    styled = prefix + dialog + suffix
+                    with self.subTest(frame=styled):
+                        result = compose_state(_mod._ANSI_SGR.sub("", styled), "idle", True,
+                                               styled_pane=styled)
+                        self.assertEqual((result[0], result[3]), ("blocked-human", "unknown"))
+                        self.assertIsNone(auto_answer(result[3]))
+
+    def test_recap_requires_completion_and_preserves_other_dialogs(self):
+        recap = "※ recap: if you typed X, press Enter there to send it."
+        self.assertEqual(classify(recap + "\n❯ ")[0], "unknown")
+        pane = recap + "\nNothing needs you this round.\nOverwrite the file?\nEnter to confirm\n❯ "
+        self.assertEqual(compose_state(pane, "idle", True)[3], "unknown")
+
+    def test_gate_composition_preserves_answer_policy(self):
+        for pane, kind, state, answer in (
+                (_PERMISSION_WITH_FOOTER, "permission", "blocked-human", None),
+                (_LOGIN_MENU, "login", "blocked-human", None),
+                (_BYPASS, "bypass-permissions", "blocked-known", None),
+                (_PRESS_ENTER, "press-enter", "blocked-known", "Enter")):
+            with self.subTest(kind=kind):
+                result = compose_state(pane, "idle", True)
+                self.assertEqual((result[0], result[3]), (state, kind))
+                self.assertEqual(auto_answer(kind), answer)
+
     def test_bypass_flags(self):
         self.assertEqual(classify(_BYPASS)[0], "bypass-permissions")
 
@@ -197,6 +265,95 @@ class TestClassify(unittest.TestCase):
         # ...while the real dialog, whose body wraps onto a second line, still qualifies.
         wrapped = _FABLE_LIMIT.replace("uses\n  usage credits", "uses\n  usage\n  credits")
         self.assertEqual(classify(wrapped)[0], "fable-limit")
+
+    def test_a_monitor_started_turn_refused_at_the_fable_limit_is_switched(self):
+        # A worker's turn opens on a Monitor event, not a `❯` line, and the CLI refuses it
+        # with one plain line and no dialog (worker seat 2026-09-28).
+        st, _d, prompt, kind = compose_state(_FABLE_REFUSED_MONITOR, "idle", True)
+        self.assertEqual((st, kind), ("blocked-known", "fable-limit-refused"))
+        self.assertIn("reached your Fable limit", prompt)
+        self.assertEqual(auto_answer("fable-limit-refused"), ("/model opus", "Enter"))
+
+    def test_the_2026_10_19_worker_pane_is_switched(self):
+        st, _d, prompt, kind = compose_state(_FABLE_REFUSED_20261019, "idle", True)
+        self.assertEqual((st, kind), ("blocked-known", "fable-limit-refused"))
+        self.assertTrue(prompt.startswith("You've reached your Fable limit"), prompt)
+        # The first refused turn alone, its own ⎿ line under the subagent's error, fires too.
+        first = _FABLE_AGENT_ERROR + _FABLE_REFUSAL_LINE + "\n✻ Worked for 1s · done 4:32 PM\n\n" + _IDLE
+        self.assertEqual(compose_state(first, "idle", True)[3], "fable-limit-refused")
+
+    def test_a_subagent_error_quoting_the_refusal_is_not_the_session_refused(self):
+        # The quote mid-line, whether its line goes on past `/model.` or stops there.
+        for agent in (_FABLE_AGENT_ERROR, _FABLE_AGENT_ERROR.replace(" (error type rate_limit, HTTP 429, ...)", "")):
+            pane = agent + "\n✻ Worked for 1s · done 4:32 PM\n\n" + _IDLE
+            self.assertIsNone(_mod.fable_refusal(pane), agent)
+            self.assertNotEqual(compose_state(pane, "idle", True)[3], "fable-limit-refused")
+
+    def test_continue_waits_for_the_switch_to_settle(self):
+        pending = {"key": ("continue", "Enter"), "at": 100.0}
+        # A picker or a still-running switch keeps it pending; idle-ready sends it once.
+        self.assertEqual(_mod.follow_up_step(pending, "blocked-human", 101.0, _IDLE), (None, pending))
+        self.assertEqual(_mod.follow_up_step(pending, "running", 101.0, _IDLE), (None, pending))
+        self.assertEqual(_mod.follow_up_step(pending, "idle-ready", 102.0, _IDLE), (("continue", "Enter"), None))
+        # Past the window it is dropped unsent, whatever the pane then reads.
+        self.assertEqual(_mod.follow_up_step(pending, "idle-ready", 100.0 + _mod.FOLLOW_UP_WINDOW_S + 1, _IDLE),
+                         (None, None))
+        self.assertEqual(_mod.follow_up_step(None, "idle-ready", 102.0, _IDLE), (None, None))
+
+    def test_a_retyped_switch_stays_in_its_episode_until_a_long_gap(self):
+        gap = _mod.TYPED_EPISODE_GAP_S
+        self.assertEqual(_mod.typed_episode(None, None, 100.0), 100.0)
+        self.assertEqual(_mod.typed_episode(100.0, 100.0, 100.0 + _mod.TYPED_ANSWER_COOLDOWN_S + 5), 100.0)
+        self.assertEqual(_mod.typed_episode(700.0, 100.0, 700.0 + gap), 100.0)
+        self.assertEqual(_mod.typed_episode(700.0, 100.0, 700.0 + gap + 1), 700.0 + gap + 1)
+
+    def test_a_draft_at_idle_ready_keeps_continue_unsent(self):
+        pending = {"key": ("continue", "Enter"), "at": 100.0}
+        draft = _IDLE.replace("❯ ", "❯ half-typed reply")
+        self.assertEqual(compose_state(draft, "idle", True)[0], "idle-ready")
+        self.assertEqual(_mod.follow_up_step(pending, "idle-ready", 102.0, draft), (None, pending))
+        # The draft outlasting the window drops it unsent; the draft is never submitted.
+        self.assertEqual(_mod.follow_up_step(pending, "idle-ready", 100.0 + _mod.FOLLOW_UP_WINDOW_S + 1, draft),
+                         (None, None))
+        self.assertEqual(_mod.follow_up_step(pending, "idle-ready", 103.0, _IDLE), (("continue", "Enter"), None))
+
+    def test_the_refusal_wrapped_over_two_lines_is_still_seen(self):
+        pane = _FABLE_REFUSED_MONITOR.replace(" or switch models", "\n  or switch models")
+        self.assertEqual(compose_state(pane, "idle", True)[3], "fable-limit-refused")
+
+    def test_a_tool_output_quoting_the_refusal_is_not_a_refusal(self):
+        pane = _FABLE_REFUSED_MONITOR.replace(
+            "⏺ You've reached", "⏺ Bash(grep -r Fable limit src/)\n  ⎿  You've reached")
+        self.assertNotEqual(compose_state(pane, "idle", True)[3], "fable-limit-refused")
+
+    def test_the_refusal_followed_by_later_output_is_not_current(self):
+        pane = _FABLE_REFUSED_MONITOR.replace(
+            "✻ Worked for 0s", "⏺ Done — PR opened.\n\n✻ Worked for 4m 12s")
+        self.assertNotEqual(compose_state(pane, "idle", True)[3], "fable-limit-refused")
+
+    def test_a_typed_draft_blocks_the_switch(self):
+        pane = _FABLE_REFUSED_MONITOR.replace("❯ \n", "❯ half-typed reply\n")
+        self.assertNotEqual(compose_state(pane, "idle", True)[3], "fable-limit-refused")
+
+    def test_send_keys_types_a_tuple_literally_and_enter_as_a_key(self):
+        from unittest.mock import patch
+        calls = []
+
+        class _R:
+            returncode = 0
+        orig_run, orig_sleep = _mod.subprocess.run, _mod.time.sleep
+        _mod.subprocess.run = lambda argv, **kw: calls.append(argv) or _R()
+        _mod.time.sleep = lambda s: None
+        try:
+            with patch.object(_mod.cli_wedge, "core_target", return_value="=seat:0"):
+                self.assertTrue(_mod.send_keys("/s", "seat", ("/model opus", "Enter", "continue", "Enter")))
+                self.assertTrue(_mod.send_keys("/s", "seat", "Enter"))
+        finally:
+            _mod.subprocess.run, _mod.time.sleep = orig_run, orig_sleep
+        argv = __import__("tmux_pane_keys").argv
+        self.assertEqual(calls, [argv("/s", "=seat:0", "-l", "/model opus"), argv("/s", "=seat:0", "Enter"),
+                                 argv("/s", "=seat:0", "-l", "continue"), argv("/s", "=seat:0", "Enter"),
+                                 argv("/s", "=seat:0", "Enter")])
 
     def test_fable_limit_and_session_limit_stay_distinct(self):
         # One is a switch the monitor may take; the other is a wait/spend decision.
@@ -312,6 +469,90 @@ class TestGhostComposerComposeState(unittest.TestCase):
     def test_with_styled_pane_it_does_not_block(self):
         st, *_ = compose_state(self.PLAIN, "idle", True, styled_pane=self.STYLED)
         self.assertNotEqual(st, "blocked-human")
+
+
+
+# The core reading a test file mid-turn: its tool output quotes a boxed selection
+# dialog, caret and key hints included, above the live spinner and empty composer.
+_TOOL_OUTPUT_DIALOG = (
+    "⏺ Read(tests/core-input-watch.test.py)\n"
+    "  ⎿  ╭───────────────────────────────────────────────────╮\n"
+    "     │ Overwrite the existing config file?               │\n"
+    "     │ ❯ 1. Yes                                          │\n"
+    "     │   2. No                                           │\n"
+    "     │ Enter to select · ↑/↓ to navigate · Esc to cancel │\n"
+    "     ╰───────────────────────────────────────────────────╯\n")
+_SPINNER = "✻ Perambulating… (1m 46s · ↓ 2.1k tokens · esc to interrupt)\n"
+_LIVE_SELECTION = ("  Overwrite the existing config file?\n"
+                   "  ❯ 1. Yes\n    2. No\n"
+                   "  Enter to select · ↑/↓ to navigate · Esc to cancel")
+
+
+class TestToolOutputIsNotAGate(unittest.TestCase):
+    """A dialog quoted in tool output is transcript; only rows below the turn's
+    spinner or completion line are the live input region."""
+
+    def test_working_pane_quoting_a_dialog_is_running_not_blocked_human(self):
+        pane = _TOOL_OUTPUT_DIALOG + _SPINNER + _IDLE_FOOTER
+        self.assertIsNone(classify(pane))
+        st, _d, prompt, kind = compose_state(pane, "working", True)
+        self.assertEqual((st, kind, prompt), ("running", None, None))
+
+    def test_finished_turn_quoting_a_dialog_is_idle_ready(self):
+        pane = _TOOL_OUTPUT_DIALOG + "✻ Worked for 2m 14s · done 12:55 PM\n" + _IDLE_FOOTER
+        self.assertIsNone(classify(pane))
+        self.assertEqual(compose_state(pane, "idle", True)[0], "idle-ready")
+
+    def test_a_real_selection_below_quoted_output_still_flags(self):
+        pane = _TOOL_OUTPUT_DIALOG + _SPINNER + _LIVE_SELECTION
+        kind, excerpt = classify(pane)
+        self.assertEqual(kind, "selection")
+        self.assertNotIn("Read(", excerpt)
+        self.assertEqual(compose_state(pane, "working", True)[0], "blocked-human")
+
+    def test_a_real_permission_prompt_mid_turn_still_flags(self):
+        pane = (_TOOL_OUTPUT_DIALOG + _SPINNER + "⏺ Bash(rm -rf build)\n"
+                "  Do you want to proceed?\n  Allow this action\n  Esc to cancel")
+        self.assertEqual(compose_state(pane, "working", True)[:4:3], ("blocked-human", "permission"))
+
+# Live Claude Code v2.1.296 shapes: the spinner row carries no "esc to interrupt";
+# the busy footer below it does.
+_LIVE_SPINNER = "✳ Moonwalking… (15s · ↓ 237 tokens)\n"
+_BUSY_FOOTER = "  ⏵⏵ bypass permissions on · 1 monitor · esc to interrupt · ← for agents\n"
+
+
+class TestTheBusyFooterIsNotTheTurnRow(unittest.TestCase):
+    """The live region is cut at the spinner, never at the footer: a dialog drawn
+    between them is live, and tool output above the spinner is transcript."""
+
+    LOGIN_PANE = (
+        "───────────────────────────────── sutando-core ─\n"
+        "Browser didn't open? Use the url below to sign in:\n"
+        "https://claude.ai/oauth/authorize?code=true&client_id=abc&scope=user%3Aprofile\n"
+        "Paste code here if prompted > \n"
+        "Esc to cancel\n"
+        "  ⏵⏵ bypass permissions on · 1 monitor · esc to interrupt · ← for agents\n"
+        "[sutando-c0:2.1.261* 2:monitor                       \"✳ sutando-core\" 00:55 06-Sep-26\n")
+    PERMISSION_UNDER_SPINNER = (
+        _TOOL_OUTPUT_DIALOG + _LIVE_SPINNER + "⏺ Bash(rm -rf build)\n"
+        "  Do you want to proceed?\n  ❯ 1. Yes\n    2. No\n"
+        "  Esc to cancel · Tab to amend\n" + _BUSY_FOOTER)
+
+    def verdicts(self, pane):
+        v = _mod._pg_classify_pane(pane, _mod.CLAUDE)
+        return (classify(pane) or (None,))[0], compose_state(pane, "working", True)[0], f"{v.state}:{v.reason}"
+
+    def test_login_dialog_above_the_busy_footer_is_login(self):
+        self.assertEqual(self.verdicts(self.LOGIN_PANE), ("login", "blocked-human", "busy:login"))
+
+    def test_permission_dialog_between_spinner_and_busy_footer_is_blocked_human(self):
+        kind, state, verdict = self.verdicts(self.PERMISSION_UNDER_SPINNER)
+        self.assertIn(kind, ("selection", "permission"))
+        self.assertEqual((state, verdict), ("blocked-human", "busy:selection"))
+
+    def test_quoted_dialog_above_the_live_spinner_is_running(self):
+        pane = _TOOL_OUTPUT_DIALOG + _LIVE_SPINNER + _BUSY_FOOTER
+        self.assertEqual(self.verdicts(pane), (None, "running", "busy:working"))
 
 
 class TestUnobservedProbeIsNotHung(unittest.TestCase):
@@ -924,10 +1165,10 @@ class TestComposerText(unittest.TestCase):
 class TestAutoAnswer(unittest.TestCase):
     """M4 decision safety: only strictly-safe gates auto-answer; all else escalates."""
 
-    def test_allowlist_is_exactly_press_enter_and_fable_limit(self):
+    def test_allowlist_is_exactly_press_enter_and_the_fable_switches(self):
         self.assertEqual(auto_answer("press-enter"), "Enter")
         self.assertEqual(auto_answer("fable-limit"), "Enter")
-        self.assertEqual(set(_mod._AUTO_ANSWER), {"press-enter", "fable-limit"})
+        self.assertEqual(set(_mod._AUTO_ANSWER), {"press-enter", "fable-limit", "fable-limit-refused"})
 
     def test_login_never_auto_answered(self):
         self.assertIsNone(auto_answer("login"))
@@ -1009,7 +1250,7 @@ class TestCodexIdleIsNotHung(unittest.TestCase):
         d = tempfile.mkdtemp()
         p = os.path.join(d, "tmux")
         with open(p, "w") as f:
-            f.write("#!/bin/sh\n" + body + "\n")
+            f.write("#!/bin/sh\n. " + json.dumps(os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib", "tmux-fake-unwrap.sh")) + "\n" + body + "\n")
         os.chmod(p, os.stat(p).st_mode | stat.S_IEXEC)
         return d
 
@@ -1103,11 +1344,86 @@ class TestMainAutoAnswerWiring(unittest.TestCase):
         self.assertEqual(len(sent), 1)
         self.assertNotIn("auto_answered", payload)
 
+    def test_a_refused_turn_types_only_the_switch_on_its_tick(self):
+        sent, payload = self._tick([], pane=_FABLE_REFUSED_MONITOR)
+        self.assertEqual(sent, [("/tmp/x.sock", "sutando-core", ("/model opus", "Enter"))])
+        self.assertEqual(payload["auto_answered"]["kind"], "fable-limit-refused")
+        self.assertEqual(payload["auto_answered"]["episode"], payload["auto_answered"]["at"])
+
     def test_no_auto_answer_flag_reports_only(self):
         sent, payload = self._tick(["--no-auto-answer"])
         self.assertEqual(sent, [])
         self.assertEqual(payload["kind"], "fable-limit")
         self.assertNotIn("auto_answered", payload)
+
+    def _ticks(self, panes, extra_args=()):
+        """Run main() across len(panes) real loop iterations (no --once): one
+        capture() result per tick, time.sleep stubbed to stop once every pane
+        has been consumed."""
+        import sys
+        import tempfile
+        from unittest.mock import patch
+
+        class _Stop(Exception):
+            pass
+
+        sent, calls = [], []
+        pane_iter = iter(panes)
+
+        def fake_capture(s, sess):
+            return next(pane_iter)
+
+        def fake_sleep(s):
+            calls.append(s)
+            if len(calls) >= len(panes):
+                raise _Stop
+
+        out = os.path.join(tempfile.mkdtemp(), "core-supervisor.json")
+
+        class _RH:
+            TMUX_SOCKET = SESSION = None
+
+            def derive(self):
+                return {"health": "unknown"}
+        argv = ["core-input-watch.py", "--socket", "/tmp/x.sock", "--out", out,
+                "--stable", "1", *extra_args]
+        # session_runtime's real tmux call polls time.sleep, which would spend fake_sleep's ticks.
+        with patch.object(_mod, "capture_styled", fake_capture), \
+                patch.object(_mod, "session_runtime", lambda *a: None), \
+                patch.object(_mod, "_load_runtime_health", lambda: _RH()), \
+                patch.object(_mod, "gateway_alive", lambda *a: True), \
+                patch.object(_mod, "_ensure_tmux_on_path", lambda: None), \
+                patch.object(_mod, "send_keys", lambda s, sess, k: sent.append((s, sess, k)) or True), \
+                patch.object(_mod.time, "sleep", fake_sleep), \
+                patch.object(sys, "argv", argv):
+            try:
+                main()
+            except _Stop:
+                pass
+        return sent
+
+    def test_a_pending_follow_up_fires_once_idle_clears(self):
+        # Tick 1 types the refused-turn switch and arms the follow-up; tick 2's
+        # plain idle pane (no refusal line) fires it instead of re-typing.
+        sent = self._ticks([_FABLE_REFUSED_MONITOR, _IDLE])
+        self.assertEqual(sent, [
+            ("/tmp/x.sock", "sutando-core", ("/model opus", "Enter")),
+            ("/tmp/x.sock", "sutando-core", ("continue", "Enter")),
+        ])
+
+    def test_a_draft_at_idle_ready_holds_the_follow_up_in_the_loop(self):
+        draft = _IDLE.replace("❯ ", "❯ half-typed reply")
+        sent = self._ticks([_FABLE_REFUSED_MONITOR, draft, draft])
+        self.assertEqual(sent, [("/tmp/x.sock", "sutando-core", ("/model opus", "Enter"))])
+
+    def test_a_second_refusal_within_the_cooldown_is_not_retyped(self):
+        # tick2 (idle) resets answered_prompt; tick3's recurring refusal must
+        # not be retyped inside TYPED_ANSWER_COOLDOWN_S.
+        sent = self._ticks([_FABLE_REFUSED_MONITOR, _IDLE, _FABLE_REFUSED_MONITOR])
+        self.assertEqual(sent, [
+            ("/tmp/x.sock", "sutando-core", ("/model opus", "Enter")),
+            ("/tmp/x.sock", "sutando-core", ("continue", "Enter")),
+        ])
 
 
 class TestSendKeys(unittest.TestCase):
@@ -1121,7 +1437,7 @@ class TestSendKeys(unittest.TestCase):
         log = os.path.join(d, "argv.log")
         p = os.path.join(d, "tmux")
         with open(p, "w") as f:
-            f.write("#!/bin/sh\nprintf '%s\\n' \"$@\" > " + json.dumps(log) + "\n"
+            f.write("#!/bin/sh\n. " + json.dumps(os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib", "tmux-fake-unwrap.sh")) + "\nprintf '%s\\n' \"$@\" > " + json.dumps(log) + "\n"
                     + "[ \"$3\" = list-windows ] && { echo 1; " + script + "; }\n" + script + "\n")
         os.chmod(p, os.stat(p).st_mode | stat.S_IEXEC)
         return d, log
@@ -1129,17 +1445,18 @@ class TestSendKeys(unittest.TestCase):
     def test_zero_exit_is_true_and_the_key_reaches_the_session_pane(self):
         from unittest.mock import patch
         d, log = self._with_fake_tmux("exit 0")
+        sock = os.path.join(d, "x.sock")
         with patch.dict(os.environ, {"PATH": d + os.pathsep + os.environ.get("PATH", "")}):
-            self.assertTrue(_mod.send_keys("/tmp/x.sock", "sutando-core", "Enter"))
+            self.assertTrue(_mod.send_keys(sock, "sutando-core", "Enter"))
         with open(log) as f:
             self.assertEqual(f.read().split("\n")[:6],
-                             ["-S", "/tmp/x.sock", "send-keys", "-t", "=sutando-core:1", "Enter"])
+                             ["-S", sock, "send-keys", "-t", "=sutando-core:1", "Enter"])
 
     def test_non_zero_exit_is_false(self):
         from unittest.mock import patch
         d, _ = self._with_fake_tmux("exit 1")
         with patch.dict(os.environ, {"PATH": d + os.pathsep + os.environ.get("PATH", "")}):
-            self.assertFalse(_mod.send_keys("/tmp/x.sock", "sutando-core", "Enter"))
+            self.assertFalse(_mod.send_keys(os.path.join(d, "x.sock"), "sutando-core", "Enter"))
 
     def test_an_unrunnable_tmux_is_false_not_an_exception(self):
         from unittest.mock import patch
@@ -1272,7 +1589,7 @@ class TestMainOnce(unittest.TestCase):
             self.assertTrue(_mod.send_keys("s.sock", "seat", "Enter"))
         self.assertEqual([c.args for c in target.call_args_list], [("s.sock", "seat")] * 2)
         cap.assert_called_once_with("s.sock", "=seat:1")
-        self.assertEqual(seen, [["tmux", "-S", "s.sock", "send-keys", "-t", "=seat:1", "Enter"]])
+        self.assertEqual(seen, [__import__("tmux_pane_keys").argv("s.sock", "=seat:1", "Enter")])
 
     def test_no_core_window_means_no_capture_and_no_keys(self):
         from unittest.mock import patch
@@ -1316,6 +1633,257 @@ class TestMainOnce(unittest.TestCase):
             _mod.capture_styled, _mod._load_runtime_health = orig_cap, orig_load
         # stable=2, first tick → prompt seen once (< 2) → debounced to running.
         self.assertEqual(sig["state"], "running")
+
+
+# A worker pane captured live 2026-10-11 (worker-a): a stale usage-limit banner under
+# the composer while turns kept finishing, with the CLI's optional feedback survey above it.
+_SURVEY = ("● How is Claude doing this session? (optional)\n"
+           "  1: Bad    2: Fine   3: Good   0: Dismiss\n"
+           "                                        ✔ Update installed · Restart to update\n")
+_WORKER_FOOTER = ("──────── seat-1 ─\n❯ \n────────\n")
+_LIMIT_BANNER = ("  ⚠ Usage limit reached · limit resets Oct 13 at 11pm\n"
+                 "    Continuing automatically at Oct 13 at 11pm · esc to cancel\n")
+_BYPASS_FOOTER = "  ⏵⏵ bypass permissions on · 1 monitor · ← for agents · ↓ to manage"
+_EARLIER_TURN = ("⏺ The task watcher on my inbox hit its 30-minute limit, so I restarted it.\n"
+                 "✻ Churned for 27s · done 1:55 PM · 1 monitor still running\n")
+_LATER_TURN = ("⏺ Monitor(Streaming task watcher (worker-a inbox))\n"
+               "  ⎿  Monitor started · task task-a · timeout 1800s\n"
+               "✻ Brewed for 22s · done 1:58 PM · 1 monitor still running\n")
+_LIVE_BEFORE = _EARLIER_TURN + _SURVEY + _WORKER_FOOTER + _LIMIT_BANNER + _BYPASS_FOOTER
+_LIVE_PANE = _EARLIER_TURN + _LATER_TURN + _SURVEY + _WORKER_FOOTER + _LIMIT_BANNER + _BYPASS_FOOTER
+
+
+class TestStaleLimitBanner(unittest.TestCase):
+    """A usage-limit banner the seat has outrun (a turn finished after it was first seen)
+    is not a block; one with no later turn is a session-limit gate, never `unknown`."""
+
+    def _compose(self, pane, before):
+        stale, baseline = _mod.limit_step(before, None, "/nonexistent-ws")
+        self.assertFalse(stale)
+        stale, _ = _mod.limit_step(pane, baseline, "/nonexistent-ws")
+        return compose_state(pane, "idle", True, limit_stale=stale)
+
+    def test_live_pane_with_turns_finishing_under_the_banner_is_not_blocked(self):
+        state = self._compose(_LIVE_PANE, _LIVE_BEFORE)
+        self.assertEqual(state[0], "idle-ready")
+
+    def test_banner_with_no_later_turn_escalates_as_a_usage_limit(self):
+        state = self._compose(_LIVE_BEFORE, _LIVE_BEFORE)
+        self.assertEqual(state[:2], ("blocked-human", "awaiting user: usage-limit"))
+        self.assertEqual(state[3], "usage-limit")
+        self.assertIsNone(auto_answer("usage-limit"))
+
+    def test_first_sight_of_the_banner_is_never_stale(self):
+        stale, _ = _mod.limit_step(_LIVE_PANE, None, "/nonexistent-ws")
+        self.assertFalse(stale)
+        self.assertEqual(compose_state(_LIVE_PANE, "idle", True)[3], "usage-limit")
+
+    def test_the_wait_line_alone_is_a_usage_limit_never_unknown(self):
+        pane = _WORKER_FOOTER + "    Continuing automatically at 11pm · esc to cancel\n" + _BYPASS_FOOTER
+        self.assertEqual(classify(pane)[0], "usage-limit")
+
+    def test_the_wait_line_under_hit_your_session_limit_stays_session_limit(self):
+        self.assertEqual(classify(_SESSION_LIMIT)[0], "session-limit")
+
+    def test_a_refused_turn_under_the_banner_is_no_evidence(self):
+        refused = "❯ /startup\n  ⎿  You've hit your usage limit\n✻ Cooked for 1s · done 2:01 PM\n"
+        pane = _EARLIER_TURN + refused + _SURVEY + _WORKER_FOOTER + _LIMIT_BANNER + _BYPASS_FOOTER
+        stale, _ = _mod.limit_step(pane, _mod.limit_baseline(_LIVE_BEFORE), "/nonexistent-ws")
+        self.assertFalse(stale)
+
+    def test_a_refused_turn_of_two_seconds_or_more_is_no_evidence(self):
+        for line in ("  ⎿  You've hit your usage limit · resets Oct 13 at 11pm",
+                     "  ⎿  You're out of usage credits. Run /usage-credits to keep going."):
+            refused = f"❯ /startup\n{line}\n✻ Cooked for 2s · done 2:01 PM\n"
+            pane = _EARLIER_TURN + refused + _SURVEY + _WORKER_FOOTER + _LIMIT_BANNER + _BYPASS_FOOTER
+            stale, _ = _mod.limit_step(pane, _mod.limit_baseline(_LIVE_BEFORE), "/nonexistent-ws")
+            self.assertFalse(stale, line)
+            self.assertEqual(compose_state(pane, "idle", True, limit_stale=stale)[3], "usage-limit")
+
+    def test_a_refusal_in_an_earlier_turn_does_not_discount_a_later_one(self):
+        pane = ("❯ /startup\n  ⎿  You've hit your usage limit\n✻ Cooked for 2s · done 1:57 PM\n"
+                + _LATER_TURN + _SURVEY + _WORKER_FOOTER + _LIMIT_BANNER + _BYPASS_FOOTER)
+        stale, _ = _mod.limit_step(pane, _mod.limit_baseline(_LIVE_BEFORE), "/nonexistent-ws")
+        self.assertTrue(stale)
+
+    def _polls(self, panes):
+        """Drive limit_step + compose_state over successive captures, as the loop does."""
+        baseline, out = None, []
+        for pane in panes:
+            stale, baseline = _mod.limit_step(pane, baseline, "/nonexistent-ws")
+            st = compose_state(pane, "idle", True, limit_stale=stale)
+            out.append((st[0], st[3]))
+        return out
+
+    def test_a_refused_turn_after_the_stale_verdict_turns_it_off(self):
+        refused = "❯ /startup\n  ⎿  You've hit your usage limit\n✻ Cooked for 2s · done 2:05 PM\n"
+        third = _EARLIER_TURN + _LATER_TURN + refused + _SURVEY + _WORKER_FOOTER + _LIMIT_BANNER + _BYPASS_FOOTER
+        self.assertEqual(self._polls([_LIVE_BEFORE, _LIVE_PANE, third]),
+                         [("blocked-human", "usage-limit"), ("idle-ready", None),
+                          ("blocked-human", "usage-limit")])
+
+    def test_a_new_banner_after_the_stale_verdict_turns_it_off(self):
+        third = _LIVE_PANE.replace("Oct 13", "Oct 20")
+        self.assertEqual(self._polls([_LIVE_BEFORE, _LIVE_PANE, third]),
+                         [("blocked-human", "usage-limit"), ("idle-ready", None),
+                          ("blocked-human", "usage-limit")])
+
+    def test_a_turn_that_runs_after_a_refusal_makes_it_stale_again(self):
+        refused = "❯ /startup\n  ⎿  You've hit your usage limit\n✻ Cooked for 2s · done 2:05 PM\n"
+        ran = "⏺ Done.\n✻ Worked for 9s · done 2:30 PM\n"
+        body = _EARLIER_TURN + _LATER_TURN + refused
+        tail = _SURVEY + _WORKER_FOOTER + _LIMIT_BANNER + _BYPASS_FOOTER
+        self.assertEqual(self._polls([_LIVE_BEFORE, body + tail, body + ran + tail])[1:],
+                         [("blocked-human", "usage-limit"), ("idle-ready", None)])
+
+    def test_stripping_a_stale_banner_keeps_refusals_inside_turns(self):
+        refusal = "  ⎿  You've hit your usage limit"
+        stripped = _mod.strip_limit_banners(f"❯ /startup\n{refusal}\n✻ Cooked for 2s · done 2:05 PM\n"
+                                            + _WORKER_FOOTER + _LIMIT_BANNER + _BYPASS_FOOTER)
+        self.assertIn(refusal, stripped)
+        self.assertNotIn("Usage limit reached", stripped)
+        self.assertNotIn("Continuing automatically", stripped)
+
+    def test_a_changed_suffix_on_the_same_turn_is_not_a_new_turn(self):
+        pane = _LIVE_BEFORE.replace("1 monitor still running", "2 monitors still running")
+        stale, _ = _mod.limit_step(pane, _mod.limit_baseline(_LIVE_BEFORE), "/nonexistent-ws")
+        self.assertFalse(stale)
+
+    def test_stale_banner_never_hides_a_real_prompt_below_the_survey(self):
+        pane = (_EARLIER_TURN + _LATER_TURN + _SURVEY + _WORKER_FOOTER
+                + "  Do you want to proceed?\n  Allow this action\n  Esc to cancel\n"
+                + _LIMIT_BANNER + _BYPASS_FOOTER)
+        stale, _ = _mod.limit_step(pane, _mod.limit_baseline(_LIVE_BEFORE), "/nonexistent-ws")
+        self.assertTrue(stale)
+        self.assertEqual(compose_state(pane, "idle", True, limit_stale=stale)[:2],
+                         ("blocked-human", "awaiting user: permission"))
+
+    def test_the_room_notice_reads_a_usage_limit(self):
+        import core_gate_notice
+        self.assertEqual(core_gate_notice.reason("blocked-human", "usage-limit"), "it hit a usage limit")
+
+    def test_survey_alone_is_unchanged(self):
+        self.assertIsNone(classify(_EARLIER_TURN + _SURVEY + _WORKER_FOOTER + _BYPASS_FOOTER))
+
+    def test_survey_with_a_real_permission_prompt_below_still_escalates(self):
+        pane = _SURVEY + "  Do you want to proceed?\n  Allow this action\n  Esc to cancel\n" + _BYPASS_FOOTER
+        self.assertEqual(classify(pane)[0], "permission")
+
+    def test_non_limit_abnormal_lines_are_never_stripped(self):
+        pane = "Paste code here if prompted >\n" + _LIMIT_BANNER
+        self.assertIn("Paste code here", _mod.strip_limit_banners(pane))
+
+
+# Three false pages on worker seats, owner-marked false: a stale limit banner under an idle or
+# working composer, with nothing on screen waiting for an answer.
+_STALE_BANNER = ("  ⚠ Usage limit reached · continuing automatically at 2am · esc to cancel\n"
+                 "  ⚠ /usage-credits to continue now\n")
+_RULE = "────────────────────────────────────────\n"
+_SEAT_FOOTER = "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents"
+_ALERT_WORKING = ("● Sent the reviewer a cross-session message.\n"
+                  "✻ Thinking… (12s · esc to interrupt)\n" + _RULE + "❯ \n" + _RULE
+                  + _STALE_BANNER + _SEAT_FOOTER)
+_ALERT_WAITING_PROSE = ("● Waiting on the reviewer's approval; nothing is needed from the owner.\n"
+                        "  the witness with the owner's relay-pause call waits on that approval;"
+                        " the inbox watcher is armed.\n" + _RULE + "❯ \n" + _RULE
+                        + _STALE_BANNER + _SEAT_FOOTER)
+_ALERT_DONE = ("● room-destination change that's already shipped.\n"
+               "✻ Worked for 2m 27s · done 2:23 PM · 1 monitor still running\n"
+               "  ✔ Update installed · Restart to update\n" + _RULE + "❯ \n" + _RULE
+               + _STALE_BANNER + _SEAT_FOOTER)
+_REFUSED_LIMIT_TURN = ("❯ check the inbox\n  ⎿  You've hit your session limit · resets 2am\n"
+                       "✻ Worked for 0s\n" + _RULE + "❯ \n" + _RULE + _SEAT_FOOTER)
+_LIMIT_MENU = ("  ⎿  You've hit your weekly limit · resets Sep 27 at 2am\n"
+               "  What do you want to do?\n  ❯ 1. Stop and wait for limit to reset\n"
+               "    2. Switch to extra usage\n  Enter to confirm · Esc to cancel\n")
+_PERMISSION = ("● I need to run a command.\n  Bash command\n    rm -rf build\n"
+               "  Do you want to proceed?\n  ❯ 1. Yes\n    2. No\n  Esc to cancel\n")
+
+
+class TestStaleBannerOnASeatDoesNotPage(unittest.TestCase):
+    """A seat watcher pages a gate only on a prompt on screen; a limit banner holding a
+    worker's queued work is the pool supervisor's to page, since only it reads that queue."""
+
+    def _seat(self, panes, owes=False):
+        baseline, out = None, []
+        for pane in panes:
+            stale, baseline = _mod.limit_step(pane, baseline, "/nonexistent-ws", owes_work=owes)
+            st = compose_state(pane, "idle", True, limit_stale=stale, styled_pane=pane)
+            out.append(st[0])
+        return out
+
+    def test_the_three_false_pages_read_as_not_blocked_on_a_seat(self):
+        for name, pane in (("working", _ALERT_WORKING), ("waiting prose", _ALERT_WAITING_PROSE),
+                           ("finished turn", _ALERT_DONE)):
+            with self.subTest(alert=name):
+                self.assertNotIn("blocked-human", self._seat([pane] * 3))
+
+    def test_the_prose_alone_was_never_the_trigger(self):
+        pane = _ALERT_WAITING_PROSE.replace(_STALE_BANNER, "")
+        self.assertEqual(compose_state(pane, "idle", True)[0], "idle-ready")
+
+    def test_control_the_core_with_queued_work_still_pages_a_banner_nothing_outran(self):
+        self.assertEqual(self._seat([_ALERT_DONE] * 3, owes=True), ["blocked-human"] * 3)
+
+    def test_controls_a_real_prompt_pages_on_a_seat(self):
+        for name, pane, kind in (("refused limit turn", _REFUSED_LIMIT_TURN, "turn-rejected"),
+                                 ("limit menu", _LIMIT_MENU, "selection"),
+                                 ("permission dialog", _PERMISSION, "selection"),
+                                 ("permission under a stale banner",
+                                  _PERMISSION + _STALE_BANNER + _SEAT_FOOTER, "selection")):
+            with self.subTest(control=name):
+                stale, _ = _mod.limit_step(pane, None, "/nonexistent-ws", owes_work=False)
+                st = compose_state(pane, "idle", True, limit_stale=stale)
+                self.assertEqual((st[0], st[3]), ("blocked-human", kind))
+
+    def test_an_unforeseen_dialog_still_pages_under_a_stale_banner(self):
+        pane = ("  Overwrite the existing config file?\n  (Enter to confirm · Esc to cancel)\n"
+                + _STALE_BANNER + _SEAT_FOOTER)
+        stale, _ = _mod.limit_step(pane, None, "/nonexistent-ws", owes_work=False)
+        self.assertEqual(compose_state(pane, "idle", True, limit_stale=stale)[0], "blocked-human")
+        self.assertEqual(compose_state(pane.replace(_STALE_BANNER, ""), "idle", True)[:2],
+                         ("blocked-human", "awaiting user: unknown"))
+
+    def test_owes_work_is_the_cores_queue_and_never_a_worker_seats(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            ws = _Path(td)
+            self.assertIs(_mod.owes_work("worker-seat", ws), False)
+            self.assertIs(_mod.owes_work("", ws), False)
+            (ws / "tasks").mkdir()
+            (ws / "tasks" / "task-1.txt").write_text("task: x\n")
+            self.assertIs(_mod.owes_work("", ws), True)
+            self.assertIs(_mod.owes_work("worker-seat", ws), False)
+
+    @unittest.skipIf(os.geteuid() == 0, "root reads a mode-000 directory")
+    def test_an_unreadable_queue_keeps_the_limit_block_and_an_empty_one_strips_it(self):
+        """A count that could not be read is unknown, not zero: the banner holds on the core
+        seat exactly as with work owed, and only a readable empty queue lets it go."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            ws = _Path(td)
+            tasks = ws / "tasks"
+            tasks.mkdir()
+            tasks.chmod(0)
+            try:
+                owes = _mod.owes_work("", ws)
+                self.assertIsNone(owes)
+                stale, baseline = _mod.limit_step(_ALERT_DONE, None, ws, owes_work=owes)
+                self.assertFalse(stale)
+                st = compose_state(_ALERT_DONE, "idle", True, limit_stale=stale, styled_pane=_ALERT_DONE)
+                self.assertEqual((st[0], st[3]), ("blocked-human", "usage-limit"))
+                # Unknown holds like owed, no harder: a turn that ran since still outruns it.
+                stale, _ = _mod.limit_step(_LIVE_PANE, _mod.limit_step(_LIVE_BEFORE, None, ws, owes_work=owes)[1],
+                                           ws, owes_work=owes)
+                self.assertTrue(stale)
+            finally:
+                tasks.chmod(0o700)
+            owes = _mod.owes_work("", ws)
+            self.assertIs(owes, False)
+            stale, _ = _mod.limit_step(_ALERT_DONE, None, ws, owes_work=owes)
+            self.assertTrue(stale)
+            st = compose_state(_ALERT_DONE, "idle", True, limit_stale=stale, styled_pane=_ALERT_DONE)
+            self.assertEqual(st[0], "idle-ready")
 
 
 if __name__ == "__main__":

@@ -15,8 +15,10 @@ import { tmpdir } from 'node:os';
 import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
 import { renderItems } from './voice-conversation-summary.js';
+import type { WorkLane } from './work-request-check.js';
 import { resolveWorkspace } from './workspace_default.js';
 import { tryStampText } from './task_envelope.js';
+import { localTimeValue } from './local_time.js';
 import { claudeHomePath } from './util_paths.js';
 import { isSkipMarked, mayRetireSkipMarked, bodyIsSkipMarked, dedupTarget, stripVoiceControlLines, type TaskOrigin } from './skip_marker_ownership.js';
 import { createVoiceTaskStore, planReconcile } from './relay-agent.js';
@@ -104,7 +106,8 @@ const _HEADER_KEYS = [
 	'from', 'call_sid', 'hint', 'instructions', 'transcript',
 	'schedule_name', 'schedule_slot',
 	'content_modalities', 'media_form', 'attachments', 'platform_card',
-	'instance_id', 'collaborator', 'requested_worker', 'wire_source', 'picker_command', 'picker_args', 'hitl_click', 'owner_mentioned', 'task_layout',
+	'instance_id', 'collaborator', 'requested_worker', 'wire_source', 'picker_command', 'picker_args', 'hitl_click', 'owner_mentioned', 'task_layout', 'local_time',
+	'lane',
 ];
 const _HEADER_RE = new RegExp(`^(?:${_HEADER_KEYS.join('|')})\\s*:`, 'i');
 const _FENCE_RE = /^={3,}/;
@@ -151,6 +154,7 @@ export function writeChatTask(taskDescription: string): string {
 	const content = [
 		`id: ${taskId}`,
 		`timestamp: ${timestamp}`,
+		`local_time: ${localTimeValue(new Date(timestamp))}`,
 		`source: chat`,
 		`interaction_type: tool_initiated`,
 		`channel_id: local-chat`,
@@ -223,17 +227,25 @@ function _usableOrigin(origin: VoiceSessionOrigin | null | undefined): VoiceSess
 }
 
 let _voiceSessionOrigin: VoiceSessionOrigin | null = null;
-// Bumped whenever the bound origin changes, so a call can tell its session has moved.
-let _voiceOriginGeneration = 0;
 let _voiceTaskOriginResolver: VoiceTaskOriginResolver | null = null;
 const _taskOrigins = new Map<string, VoiceSessionOrigin>();
+// Bumped when the words a waiting call would read may belong to another session or origin.
+let _voiceContextRevision = 0;
 
 /** Bind (or, with null, release) the origin of the live voice session. A task carries the
  *  origin current when it was asked for; a malformed origin binds nothing. */
 export function setVoiceSessionOrigin(origin: VoiceSessionOrigin | null): void {
 	const next = _usableOrigin(origin);
-	if (next?.channel !== _voiceSessionOrigin?.channel || next?.target !== _voiceSessionOrigin?.target) _voiceOriginGeneration += 1;
+	// A re-announce of the same origin is not a move: an in-flight call keeps its words.
+	if (next?.channel !== _voiceSessionOrigin?.channel || next?.target !== _voiceSessionOrigin?.target) _voiceContextRevision++;
 	_voiceSessionOrigin = next;
+}
+
+/** The live client is gone: release its origin and close every open transcript window,
+ *  bound origin or not, since the next client reads through the same turns provider. */
+export function endVoiceClientSession(): void {
+	_voiceSessionOrigin = null;
+	_voiceContextRevision++;
 }
 
 /** One turn of the live voice session as the runtime keeps it: `user` items are the
@@ -255,6 +267,11 @@ export type VoiceTurnsSnapshot = {
 };
 type VoiceTurnsProvider = () => ReadonlyArray<VoiceTurn> | VoiceTurnsSnapshot | null | undefined;
 let _voiceTurns: VoiceTurnsProvider | null = null;
+type VoiceTurnsBinding = { provider: VoiceTurnsProvider | null; revision: number };
+
+function captureVoiceTurns(): VoiceTurnsBinding {
+	return { provider: _voiceTurns, revision: _voiceContextRevision };
+}
 
 /** Bind (or, with null, release) a reader of the live session's turns. A task written
  *  afterwards carries the owner's last spoken words verbatim, beside the model's own
@@ -263,11 +280,12 @@ let _voiceTurns: VoiceTurnsProvider | null = null;
  *  the tool ran, so the transcript block structurally lacked the utterance itself). */
 export function setVoiceTurnsProvider(fn: VoiceTurnsProvider | null): void {
 	_voiceTurns = fn;
+	_voiceContextRevision++;
 }
 
-function _readSnapshot(): VoiceTurnsSnapshot | null {
+function _readSnapshot(provider: VoiceTurnsProvider | null = _voiceTurns): VoiceTurnsSnapshot | null {
 	let raw: ReturnType<VoiceTurnsProvider>;
-	try { raw = _voiceTurns?.(); } catch { return null; }
+	try { raw = provider?.(); } catch { return null; }
 	if (!raw) return null;
 	if (Array.isArray(raw)) return { items: raw };
 	const snap = raw as VoiceTurnsSnapshot;
@@ -298,8 +316,8 @@ const _NOT_OWNER_WORDS = ['[System:', '[Uploaded file:'];
 /** The real user utterances of the CURRENT turn (newest last): user items after the last
  *  assistant item, plus the transcription still buffered by the runtime. Bound to the turn
  *  that triggered the call: a previous turn's words never stand in for this one's. */
-export function _spokenTurns(count = 2): string[] {
-	const snap = _readSnapshot();
+export function _spokenTurns(count = 2, provider: VoiceTurnsProvider | null = _voiceTurns): string[] {
+	const snap = _readSnapshot(provider);
 	if (!snap) return [];
 	const items = Array.isArray(snap.items) ? snap.items : [];
 	const spoken: string[] = [];
@@ -325,8 +343,8 @@ export const RECENT_SPEECH_MS = 10_000;
 
 /** Whether waiting for a transcription makes sense: the owner spoke recently, or the
  *  runtime cannot say. A model-initiated turn (no recent speech) has nothing to wait for. */
-export function _speechMayBeLanding(now = Date.now()): boolean {
-	const snap = _readSnapshot();
+export function _speechMayBeLanding(now = Date.now(), provider: VoiceTurnsProvider | null = _voiceTurns): boolean {
+	const snap = _readSnapshot(provider);
 	const at = snap?.lastUserSpeechAt;
 	if (typeof at !== 'number' || !Number.isFinite(at)) return true;
 	return now - at <= RECENT_SPEECH_MS;
@@ -335,13 +353,22 @@ export function _speechMayBeLanding(now = Date.now()): boolean {
 /** The current turn's utterances, waiting up to `maxMs` for a late transcription chunk
  *  when none has arrived yet (the runtime flushes only what it has when the tool fires);
  *  no wait for a turn the model started on its own. */
-export async function _awaitSpokenTurns(count = 2, maxMs = SPOKEN_WAIT_MS, sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms)), isCurrent: () => boolean = () => true): Promise<string[]> {
-	if (!_voiceTurns) return [];
-	// Words read after the session moved belong to the new session, not to this call.
-	const read = () => { const spoken = _spokenTurns(count); return isCurrent() ? spoken : null; };
+export async function _awaitSpokenTurns(
+	count = 2, maxMs = SPOKEN_WAIT_MS,
+	sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms)),
+	binding = captureVoiceTurns(),
+): Promise<string[]> {
+	const { provider, revision } = binding;
+	if (!provider) return [];
+	// Re-checked after every read: the session can move during the read itself.
+	const read = () => {
+		if (revision !== _voiceContextRevision) return null;
+		const spoken = _spokenTurns(count, provider);
+		return revision === _voiceContextRevision ? spoken : null;
+	};
 	const first = read();
 	if (first === null) return [];
-	if (first.length > 0 || !_speechMayBeLanding()) return first;
+	if (first.length > 0 || !_speechMayBeLanding(Date.now(), provider)) return first;
 	const deadline = Date.now() + maxMs;
 	for (;;) {
 		await sleep(SPOKEN_POLL_MS);
@@ -431,7 +458,7 @@ const DEFAULT_TASK_TIMEOUT_MS = 60 * 60 * 1000; // 1 hour default
 // from submission (user feedback P1-4: a 10-minute task timed out in the queue
 // behind other work, the agent said it "ran out of time", and the task file
 // was archived out from under the core).
-type PendingTask = { submittedAt: number; timeoutMs: number; dmOnTimeout: boolean; taskText: string; startedAt?: number };
+type PendingTask = { submittedAt: number; timeoutMs: number; dmOnTimeout: boolean; taskText: string; startedAt?: number; lane?: WorkLane };
 const _pendingTasks = new Map<string, PendingTask>();
 /** Test-only: the pending map, to seed and inspect around _sweepTimeouts. */
 export const _pendingTasksForTest = _pendingTasks;
@@ -502,7 +529,7 @@ function _hasResult(taskId: string): boolean {
 }
 
 /** The relay agent's task table: one row per voice task; survives a voice-agent restart. */
-export const voiceTaskStore = createVoiceTaskStore(join(REPO_DIR, 'state', 'voice-tasks.json'));
+export const voiceTaskStore = createVoiceTaskStore();
 
 /** The task's result text, live or archived (this month or last); null when there is none. */
 function _readResultText(taskId: string): string | null {
@@ -534,14 +561,14 @@ export function voiceTaskState(taskId: string): VoiceTaskState {
 }
 
 /** Voice tasks still awaiting a result, latest first: this process's pending ones plus the table's (after a restart). */
-function _openVoiceTasks(): Array<{ id: string; text: string; submittedAt: number }> {
-	const open = new Map<string, { id: string; text: string; submittedAt: number }>();
+function _openVoiceTasks(): Array<{ id: string; text: string; submittedAt: number; lane?: WorkLane }> {
+	const open = new Map<string, { id: string; text: string; submittedAt: number; lane?: WorkLane }>();
 	for (const [id, row] of voiceTaskStore.list()) {
 		if (row.submittedAt === undefined || row.cancelRequested) continue;
 		const state = voiceTaskState(id);
-		if (state === 'queued' || state === 'started') open.set(id, { id, text: row.text ?? '', submittedAt: row.submittedAt });
+		if (state === 'queued' || state === 'started') open.set(id, { id, text: row.text ?? '', submittedAt: row.submittedAt, lane: row.lane });
 	}
-	for (const [id, p] of _pendingTasks) open.set(id, { id, text: p.taskText, submittedAt: p.submittedAt });
+	for (const [id, p] of _pendingTasks) open.set(id, { id, text: p.taskText, submittedAt: p.submittedAt, lane: p.lane });
 	return [...open.values()].filter((t) => !_cancelledVoiceTasks.has(t.id)).sort((a, b) => b.submittedAt - a.submittedAt);
 }
 
@@ -577,6 +604,16 @@ export interface VoiceTaskRow {
 	state: VoiceTaskState;
 	/** How the result reached the user, once it has. */
 	delivery?: 'spoken' | 'injected' | 'dm';
+	/** Ended with nothing to hear: nothing is pending for the user. */
+	retired?: boolean;
+}
+
+/** A finished voice task's result text, for a status answer that can say it at once; null when none is on disk. */
+export function voiceTaskResultText(taskId: string): string | null {
+	const row = voiceTaskStore.get(taskId);
+	const source = row?.answeredBy ?? taskId;
+	const text = _hasResult(source) ? _readResultText(source) : null;
+	return text ? stripVoiceControlLines(text).trim() : null;
 }
 
 /** The relay agent's view for status answers: voice tasks from the last few hours, oldest first. */
@@ -586,7 +623,7 @@ export function voiceTaskRows(now = Date.now()): VoiceTaskRow[] {
 		if (row.submittedAt === undefined || now - row.submittedAt > STATUS_WINDOW_MS) continue;
 		let state: VoiceTaskRow['state'] = voiceTaskState(id);
 		if (row.cancelRequested && _hasResult(id)) state = 'done';
-		rows.push({ id, text: row.text ?? '', submittedAt: row.submittedAt, state, delivery: row.delivery });
+		rows.push({ id, text: row.text ?? '', submittedAt: row.submittedAt, state, delivery: row.delivery, ...(row.retired ? { retired: true } : {}) });
 	}
 	return rows;
 }
@@ -607,7 +644,13 @@ function _hasLiveOfflineCopy(taskId: string): boolean {
 }
 
 /** Delivers an owed result or notice to the user (the relay agent's queue). */
-export type RelayDeliver = (text: string, note: string | undefined, meta: { taskId?: string; framed?: boolean }) => void;
+export type RelayDeliver = (text: string, note: string | undefined, meta: { taskId?: string; framed?: boolean; about?: string }) => void;
+
+/** The "not picked up" notice for this task still holds: still queued, and nothing about it reached the user. */
+export function notPickedStillTrue(taskId: string): boolean {
+	const row = voiceTaskStore.get(taskId);
+	return !row?.delivery && !row?.supersededBy && !row?.cancelRequested && voiceTaskState(taskId) === 'queued';
+}
 
 /**
  * The relay agent's reconcile pass: for every recent voice task, compare what the core did with
@@ -640,15 +683,18 @@ export function reconcileVoiceTasks(deliver: RelayDeliver, isInFlight: (taskId: 
 			const minutes = Math.floor((now - (row.submittedAt ?? now)) / 60000);
 			console.log(`${ts()} [RelayAgent] ${id}: not picked up after ${minutes}m; telling the user`);
 			voiceTaskStore.noteNotPicked(id);
-			deliver(framedSystem(`The user's task "${(row.text ?? '').slice(0, 80).replace(/"/g, "'")}" has not been picked up by the core after ${minutes} minutes. It is still queued; the core may be busy or down. Tell the user in one sentence.`), undefined, { framed: true });
+			deliver(framedSystem(`The user's task "${(row.text ?? '').slice(0, 80).replace(/"/g, "'")}" has not been picked up by the core after ${minutes} minutes. It is still queued; the core may be busy or down. Tell the user in one sentence.`), undefined, { framed: true, about: id });
 		}
 	}
 }
 
 /** How many of the user's other voice tasks are still open ahead of `taskId`. */
 export function voiceTasksAhead(taskId: string): number {
-	const self = voiceTaskStore.get(taskId)?.submittedAt ?? Date.now();
-	return _openVoiceTasks().filter((t) => t.id !== taskId && t.submittedAt <= self).length;
+	const me = voiceTaskStore.get(taskId);
+	const self = me?.submittedAt ?? _pendingTasks.get(taskId)?.submittedAt ?? Date.now();
+	// A quick task waits only behind quick ones: the core does it at once, apart from the long work it has.
+	const quick = (me?.lane ?? _pendingTasks.get(taskId)?.lane) === 'quick';
+	return _openVoiceTasks().filter((t) => t.id !== taskId && t.submittedAt <= self && (t.lane === 'quick') === quick).length;
 }
 
 /** A task the voice agent submitted: only these may be reported as cancelled outright. */
@@ -865,10 +911,11 @@ export function _forwardOfflineThenArchive(
 
 /** Every header line of a voice task above `task:`; one writer for the work and cancel tools. An
  *  origin-bound task stays `source: voice`, takes the target as `channel_id`, and adds the adapter's keys. */
-export function buildVoiceTaskHeader(taskId: string, timestamp: string, ownerId: string, origin: VoiceSessionOrigin | null): string {
+export function buildVoiceTaskHeader(taskId: string, timestamp: string, ownerId: string, origin: VoiceSessionOrigin | null, lane?: WorkLane): string {
 	const lines = [
 		`id: ${taskId}`,
 		`timestamp: ${timestamp}`,
+		`local_time: ${localTimeValue(new Date(timestamp))}`,
 		`source: voice`,
 		`interaction_type: realtime_audio`,
 		// Media-form axis on live-plane tasks: the payload originates from a continuous
@@ -880,6 +927,9 @@ export function buildVoiceTaskHeader(taskId: string, timestamp: string, ownerId:
 		if (!_HEADER_KEYS.includes(key) || typeof value !== 'string') continue;
 		lines.push(`${key}: ${value.replace(/[\r\n]+/g, ' ')}`);
 	}
+	// The relay's check judged it quick (one lookup, command or short generation) or long (building, writing,
+	// research): the core does a quick one at once and gives a long one to a subagent, so neither waits on the other.
+	if (lane) lines.push(`lane: ${lane}`);
 	lines.push(`user_id: ${ownerId}`, 'access_tier: owner', 'priority: urgent');
 	return lines.join('\n') + '\n';
 }
@@ -1037,7 +1087,20 @@ export function queuedAheadInstruction(queuedAhead: number): string {
 }
 
 /** What the model is told when `work` has queued the task; the result follows when the core finishes. */
-export const WORK_PENDING_MESSAGE = 'Task has been queued and is being processed. The result will be spoken when ready. Do NOT tell the user the task is done — say you are working on it.';
+/** Said instead of the plain acknowledgement for an out-of-the-ordinary submission (a queue position). */
+export const WORK_SUBMITTED_MESSAGE = 'The task is with the core; this work call returns its result when it is done. Do NOT tell the user the task is done.';
+
+/** What a `work` call carries from the moment it was made: where it was asked, and the words around it. */
+export type WorkOrigin = { origin: VoiceSessionOrigin | null; turns: VoiceTurnsBinding; recentAtAsk: string };
+const WORK_ORIGIN = Symbol('workOrigin');
+
+/** The task belongs to the origin, and the words, it was asked from, even if the session moves or the adapter mutates its record later. */
+export function captureWorkOrigin(): WorkOrigin {
+	const origin = _voiceSessionOrigin ? { ..._voiceSessionOrigin, headers: { ..._voiceSessionOrigin.headers } } : null;
+	let recentAtAsk = '';
+	try { recentAtAsk = _voiceContextAtAsk() ?? getRecentConversation(4); } catch { /* best effort */ }
+	return { origin, turns: captureVoiceTurns(), recentAtAsk };
+}
 
 export const workTool: ToolDefinition = {
 	name: 'work',
@@ -1046,7 +1109,20 @@ export const workTool: ToolDefinition = {
 		'research, writing, translation, file changes, system queries, explanations, analysis. ' +
 		'This is how Sutando thinks and acts. Results are spoken back when ready.',
 	parameters: z.object({
-		task: z.string().describe('Full description of the task to perform'),
+		task: z
+			.string()
+			.describe(
+				'Full description of the task to perform. Keep dates as the user said them ("today", "yesterday", ' +
+				'"the day before yesterday", "this week"), never with a calendar date added: your date can be a day off, ' +
+				'and the core turns them into dates in the owner\'s time zone.'
+			),
+		replaces: z
+			.string()
+			.optional()
+			.describe(
+				'Only when this request corrects one the user made earlier in this conversation ' +
+				'(e.g. a misheard number): the words that identify that earlier request, e.g. "51167".'
+			),
 		timeout_minutes: z
 			.number()
 			.optional()
@@ -1067,21 +1143,16 @@ export const workTool: ToolDefinition = {
 				'a timeout DM that shouldn\'t have gone through.'
 			),
 	}),
-	// Runs as the relay agent subagent: the model hears the pending message now, the result when the core finishes.
+	// NON_BLOCKING with no pendingMessage: the call stays open and the result returns under its own id
+	// (WHEN_IDLE). A pendingMessage would answer the call at once and close it.
 	execution: 'background',
-	pendingMessage: WORK_PENDING_MESSAGE,
+	behavior: 'NON_BLOCKING',
 	async execute(args) {
 		const { task, timeout_minutes, dm_on_timeout } = args as {
 			task: string;
 			timeout_minutes?: number;
 			dm_on_timeout?: boolean;
 		};
-		// Read before the first await: the session can move to another origin while this call
-		// waits, and the task belongs to the origin, and the words, it was asked from.
-		const origin = _voiceSessionOrigin;
-		const originGeneration = _voiceOriginGeneration;
-		let recentAtAsk = '';
-		try { recentAtAsk = _voiceContextAtAsk() ?? getRecentConversation(4); } catch { /* best effort */ }
 
 		// Redirect pure screen-viewing tasks to inline tools (faster, no round-trip)
 		// Narrow match: only "describe/look at my screen" — not scroll, screenshot,
@@ -1090,6 +1161,9 @@ export const workTool: ToolDefinition = {
 		if (screenViewOnly.test(task)) {
 			return { status: 'rejected', message: 'Use describe_screen inline tool directly for screen viewing.' };
 		}
+
+		// Read before the first await, unless the relay agent captured it when the call began.
+		const { origin, turns, recentAtAsk } = (args as { [WORK_ORIGIN]?: WorkOrigin })[WORK_ORIGIN] ?? captureWorkOrigin();
 
 		// Fast path: handle known patterns inline for ~3s vs ~15s via file bridge.
 		// Same pattern as conversation-server's tryFastPath.
@@ -1172,7 +1246,8 @@ export const workTool: ToolDefinition = {
 		}
 		// Reserved before the first await: an identical call during the spoken-turn wait
 		// must meet this entry in the dedup check above, not write a second task file.
-		const pendingEntry = () => ({ submittedAt: Date.now(), timeoutMs, dmOnTimeout: dm_on_timeout === true, taskText: task });
+		const lane: WorkLane | undefined = (args as { lane?: unknown }).lane === 'quick' ? 'quick' : (args as { lane?: unknown }).lane === 'long' ? 'long' : undefined;
+		const pendingEntry = () => ({ submittedAt: Date.now(), timeoutMs, dmOnTimeout: dm_on_timeout === true, taskText: task, lane });
 		_pendingTasks.set(taskId, pendingEntry());
 		try {
 			const timestamp = new Date().toISOString();
@@ -1193,7 +1268,7 @@ export const workTool: ToolDefinition = {
 			// wording against real speech instead of trusting it.
 			let spokenBlock = '';
 			try {
-				const spoken = await _awaitSpokenTurns(2, SPOKEN_WAIT_MS, undefined, () => _voiceOriginGeneration === originGeneration);
+				const spoken = await _awaitSpokenTurns(2, SPOKEN_WAIT_MS, undefined, turns);
 				if (spoken.length > 0) {
 					spokenBlock =
 						`\n\n--- spoken (the owner's last words, verbatim as transcribed, or as typed into the voice session; the task line ` +
@@ -1216,7 +1291,7 @@ export const workTool: ToolDefinition = {
 			const originGuidance = origin?.contextLine ? `\n${origin.contextLine.replace(/[\r\n]+/g, ' ')}` : '';
 			_rememberTaskOrigin(taskId, origin);
 			const content =
-				buildVoiceTaskHeader(taskId, timestamp, ownerId, origin) +
+				buildVoiceTaskHeader(taskId, timestamp, ownerId, origin, lane) +
 				`task: ${confineUserContent(task)}${originGuidance}${spokenBlock}${contextBlock}\n`;
 			await _delegation.submitTask(taskId, content);
 		} catch (err) {
@@ -1228,10 +1303,10 @@ export const workTool: ToolDefinition = {
 		// default was producing unwanted DMs). Caller must explicitly pass
 		// dm_on_timeout: true on critical tasks where they want the fallback.
 		_pendingTasks.set(taskId, pendingEntry());
-		voiceTaskStore.add(taskId, task);
+		voiceTaskStore.add(taskId, task, undefined, lane);
 		// Record owner activity for status-aware-pivot in proactive loop
 		writeOwnerActivity('voice', task);
-		console.log(`${ts()} [TaskBridge] Task ${taskId}: ${task.slice(0, 100)}`);
+		console.log(`${ts()} [TaskBridge] Task ${taskId}${lane ? ` (${lane})` : ''}: ${task.slice(0, 100)}`);
 		_sendTaskStatus?.(taskId, 'working', task.slice(0, 60));
 		// The user's own voice tasks still open ahead of this one, from the relay agent's table.
 		const queuedAhead = voiceTasksAhead(taskId);
@@ -1240,7 +1315,7 @@ export const workTool: ToolDefinition = {
 			taskId,
 			queuedAhead,
 			watcherOnline,
-			message: (watcherOnline ? WORK_PENDING_MESSAGE
+			message: (watcherOnline ? WORK_SUBMITTED_MESSAGE
 				: 'Task has been saved. The processing engine will pick it up on its next pass (within a few minutes). Tell the user the task is queued and will be handled shortly.')
 				+ queuedAheadInstruction(queuedAhead),
 		};
@@ -1248,7 +1323,8 @@ export const workTool: ToolDefinition = {
 };
 
 /** The `work` call as the relay agent runs it: the tool's own submission, then the core's result. */
-export const submitWorkTask = (args: Record<string, unknown>) => workTool.execute(args, undefined as never) as Promise<Record<string, unknown>>;
+export const submitWorkTask = (args: Record<string, unknown>, at?: WorkOrigin) =>
+	workTool.execute(at ? { ...args, [WORK_ORIGIN]: at } : args, undefined as never) as Promise<Record<string, unknown>>;
 
 // cancelTask tool moved — canonical version is `cancelTaskTool` in inline-tools.ts.
 
@@ -1297,6 +1373,8 @@ export async function logSessionBoundaryAsync(reason: string = 'user_goodbye'): 
  *  The `SESSION_END` sentinel is unique so the reader can locate
  *  it without regex gymnastics. */
 export function logSessionBoundary(reason: string = 'user_goodbye'): void {
+	// A farewell is said inside the session ("research X, bye"): words still landing stay with
+	// that task. The client leaving afterwards closes the window (endVoiceClientSession).
 	const line = `${new Date().toISOString()}|SESSION_END|${reason}\n`;
 	try { appendFileSync(CONVERSATION_LOG, line); } catch { /* best effort */ }
 	recordSessionBoundary(reason); // #603 sqlite mirror
@@ -1388,6 +1466,7 @@ export function startContextDropWatcher(onContextDrop: (content: string) => void
 					const taskContent =
 						`id: ${taskId}\n` +
 						`timestamp: ${new Date().toISOString()}\n` +
+						`local_time: ${localTimeValue()}\n` +
 						`source: context-drop\n` +
 						`interaction_type: system_event\n` +
 						`channel_id: local-hotkey\n` +
@@ -1621,11 +1700,10 @@ export function _sweepTimeouts(onResult: (msg: string) => void, now: number = Da
 			if (dmOnTimeout) {
 				try {
 					const proactiveTs = Math.floor(Date.now() / 1000);
-					const proactivePath = join(RESULT_DIR, `proactive-timeout-${taskId}-${proactiveTs}.txt`);
 					const dmBody = taskSnippet
 						? `⏱ Task '${taskSnippet}' timed out after ${minutes}m. The processing engine may need to be restarted, or the task may need a longer timeout via timeout_minutes.`
 						: `⏱ Task ${taskId} timed out after ${minutes}m.`;
-					writeFileSync(proactivePath, dmBody);
+					publishResultFile(`proactive-timeout-${taskId}-${proactiveTs}.txt`, dmBody);
 					console.log(`${ts()} [TaskBridge] Wrote DM-on-timeout proactive file for ${taskId}`);
 				} catch (e) {
 					console.error(`${ts()} [TaskBridge] Failed to emit DM-on-timeout for ${taskId}:`, e);
@@ -1744,6 +1822,13 @@ export function startResultWatcher(onResult: ResultListener, isClientConnected: 
 					if (answeredIn && voiceTaskStore.get(taskId)) {
 						voiceTaskStore.setAnsweredBy(taskId, answeredIn);
 						console.log(`${ts()} [RelayAgent] ${taskId}: answered in ${answeredIn}`);
+						// That result already reached the model: this task's call has nothing more coming.
+						const went = voiceTaskStore.get(taskId)?.delivery;
+						if (went === 'spoken' || went === 'injected') _onVoiceTaskEnded?.(taskId, 'delivered_separately');
+					} else if (voiceTaskStore.get(taskId)) {
+						// Nothing to hear for this task: the table must not count it as pending (2026-10-12 00:33:
+						// two tasks retired this way were counted, and the user heard "6" for 4).
+						voiceTaskStore.markRetired(taskId);
 					}
 					_sendTaskStatus?.(taskId, 'done', result.slice(0, 60), result);
 					_deliveredResults.add(file);

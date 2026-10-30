@@ -52,7 +52,7 @@ unique base and display labels resolve to a worker ID where intent is captured.
 A human name shared by workers is refused. New broker display names equal to
 `core`, any existing worker ID, or shaped like a full 32-hex ID are refused.
 Registration refuses a new ID already used as another worker's name. The
-optional `display_label` from AG2 Space also changes the name shown to people;
+optional `display_label` from s.space also changes the name shown to people;
 removing it restores the base label. Human status renders the effective name
 with the full ID, such as
 `kc-reviewer-ryan (274cb60d473744dba54040a9de119877)`.
@@ -61,7 +61,7 @@ with the full ID, such as
 |---|---|---|
 | `worker_id` | `7c54b230a8d94ea9b86f52d70134ac68` | routing, directories, binding references, message headers; immutable |
 | `label` | `worker-1`, `code reviewer` | base routing alias; renameable |
-| `display_label` | `kc-reviewer-ryan` | optional AG2 Space display override; unique names can address the worker |
+| `display_label` | `kc-reviewer-ryan` | optional s.space display override; unique names can address the worker |
 | `incarnation_id` | minted per session | which run of that worker accepted an attempt |
 
 **The id is `uuid.uuid4().hex`** â€” 32 lowercase hex, exactly the
@@ -252,6 +252,10 @@ Fixed order: result, then done-flag, then archive. Residue is then unambiguous â
 **result with no flag** means completed, never re-run; **an accepted sentinel with no result** means
 died mid-work, released to the same worker.
 
+Releasing interrupted work is at-least-once execution: a resumed conversation
+can repeat side effects performed before the interruption. A ready answer, live
+or archived, prevents release; completion of an earlier side effect alone does not.
+
 `finish` is the single completion path and refuses unless the caller holds the
 the acceptance, the first body line echoes `task: <id>`, and the body is non-empty. A refusal
 writes nothing. The echo exists because a worker holding two acceptances once wrote each
@@ -265,10 +269,15 @@ Also: per-worker namespaced state, `.tmp-<worker>` staging, no-clobber archive.
 | `live` | the worker's beat | nothing |
 | `recovering` | the core | restart the runtime; deliveries keep arriving meanwhile |
 | `abandoned` | the core | release its `.accepted` sentinels back to `.txt` for the same worker |
-| `retired` | the core | remove it from the roster; the router then sends its traffic to the core |
+| `retired` | the owner (`pool_manage.py retire`) | not supervised or advertised; the router treats it as absent and sends its traffic to the core |
 
-The router never reads `state`. These rows are the health-check's, and whatever
-marks a worker `abandoned` is the same process that recovers it.
+The router reads `state` only to treat `retired` as absent from the roster, and delivery
+re-checks it under the recipient's folder lock, so retirement fences routing before the hand-off. The other rows
+are the health-check's, and whatever marks a worker `abandoned` is the same process that
+recovers it. `pool_manage.py` is the owner's command for a worker's lifecycle: `stop`
+(the per-worker `paused` marker, then its sessions are killed), `retire`, `enable` and `remove`.
+Retiring or removing a worker that owes deliveries is refused unless the owner passes
+`--hand-off`: the explicit handoff of the takeover rules below, moving each owed task to the core.
 
 **Stale is not dead.** A beat is an mtime, 30 s, considered stale at 90 s, and a
 future-dated beat counts as stale too. A host sleep expires every beat at once. That
@@ -309,7 +318,19 @@ owes work would read as stuck; a running Claude turn's timer keeps it changing.
 session meets the same network error, rate limit, API error or retry, and loses the
 turn in flight. With the same sustain and stale line, once per episode:
 
-- a gate or a limit escalates, as a gate always has;
+- a gate or a limit escalates, as a gate always has, only while the frame stays
+  unchanged across ticks with clocks, spinners, status glyphs and bare counts ("1
+  monitor still running") normalised away: on a held pane those tick without a turn
+  finishing, and a turn that finishes changes more than a number. Bare digits are
+  normalised out of the frame id, so two successive finished turns whose text differs
+  only by a number ("Delivered item 41", then "Delivered item 42") compare equal in
+  the wait rung. On a real pane turns accumulate, so this only bites a pane that
+  redraws a single line in place, and it fails toward one extra card on a progressing
+  worker, never toward a hidden block. A limit banner the
+  CLI leaves painted after a re-login sits under a session that keeps working: a turn
+  running above it reads as working, and a frame that moves clears the episode. The
+  seat's own input watcher does not page that banner, since it cannot read the
+  worker's queue; a refused limit turn, the limit menu or any dialog still pages there;
 - abnormal text raises a card that quotes the banner line and names the cause. On a
   seat routed through the credential proxy, a retry, API or network cause offers the
   proxy restart (`launchctl kickstart -k gui/$(id -u)/com.sutando.credential-proxy`,
@@ -474,6 +495,19 @@ parses the headers with `local_task_protocol`, never by hand.
 ```
 
 A sentinel is empty, so an assignment carries no roster `version`; the router reports the version of the pass in its status output only.
+
+`create_worker.py` validates an existing roster through
+`pool_roster.validate_current_roster` before previewing or launching a worker.
+Normal and `--dry-run` creation refuse unreadable or malformed rosters and worker
+shapes rejected by that validator, reporting the reason before creating an
+identity, delivery inbox, session, watcher or recovery timer. An absent roster
+remains a valid starting point. This check neither repairs the roster nor adds
+validation beyond the existing validator's policy.
+
+Registration still performs its final checks under the roster lock. If the
+roster becomes invalid after preflight, creation reports the newly created
+worker's id and explains that it will receive nothing until the roster names
+it; the live worker and its records are retained.
 
 The broker's complete `display.worker_labels` map is applied atomically under
 the roster lock. `worker_label_config_version` tracks the last fully applied

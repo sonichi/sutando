@@ -86,7 +86,7 @@ class SpawnRetained(SpawnRefused):
 
 
 def _run(argv, **kw):
-    return subprocess.run(argv, capture_output=True, text=True, **kw)
+    return subprocess.run(argv, **{"capture_output": True, "text": True, **kw})
 
 
 def per_instance_sentinel_supported(repo, runner=_run) -> bool:
@@ -130,7 +130,9 @@ def session_probe(name: str, socket=None, runner=_run) -> tuple:
     """
     socket = socket or default_socket()
     try:
-        r = runner(["tmux", "-S", socket, "has-session", "-t", f"={name}"])
+        # Captured whatever the runner: absence is read from stderr, so a bare runner reads "unknown".
+        r = runner(["tmux", "-S", socket, "has-session", "-t", f"={name}"],
+                   capture_output=True, text=True)
     except Exception as e:                                   # noqa: BLE001
         return "unknown", f"tmux could not be run: {e}"
     rc = getattr(r, "returncode", None)
@@ -157,7 +159,7 @@ def session_exists(name: str, socket=None, runner=_run) -> bool:
 
 
 def core_runtime(repo, runner=_run) -> str:
-    """The runtime the core is configured for; a worker runs the same one."""
+    """The runtime the core is configured for; fresh workers default to it."""
     r = runner(["bash", str(Path(repo) / "scripts" / "sutando-config.sh"), "core-runtime"])
     return ((r.stdout or "").strip() if r.returncode == 0 else "") or "claude"
 
@@ -315,6 +317,20 @@ def spawn(workspace, repo, *, runtime=None, cwd: str = "",
     the only part that starts reading.
     """
     socket = socket or default_socket()
+    # Rooms are bound to a worker's id and inbox, so re-minting either would
+    # leave every binding pointing at nothing. Only the run is new.
+    resumed_id = wi.worker_for_session(workspace, resume) if resume else None
+    if resume and not resumed_id:
+        raise SpawnRefused(
+            f"no worker in this workspace has session {resume!r} in its lineage; "
+            "refusing rather than resuming a conversation into a stranger's record")
+    if resumed_id:
+        session = next((row for row in wi.sessions(workspace, resumed_id)
+                        if row.get("session_id") == resume), {})
+        if not runtime:
+            runtime = session.get("runtime")
+        if not cwd:
+            cwd = (session.get("transcript") or {}).get("cwd", "")
     runtime = resolve_runtime(repo, runtime, runner)
     if runtime == "codex" and resume:
         raise SpawnRefused("Codex cannot resume without a recorded CLI session id")
@@ -331,13 +347,6 @@ def spawn(workspace, repo, *, runtime=None, cwd: str = "",
             "this checkout writes ONE watcher sentinel for every watcher, so a "
             "second watcher would erase the core's stamp — refusing to spawn")
 
-    # Rooms are bound to a worker's id and inbox, so re-minting either would
-    # leave every binding pointing at nothing. Only the run is new.
-    resumed_id = wi.worker_for_session(workspace, resume) if resume else None
-    if resume and not resumed_id:
-        raise SpawnRefused(
-            f"no worker in this workspace has session {resume!r} in its lineage; "
-            "refusing rather than resuming a conversation into a stranger's record")
     session_id = resume or (None if runtime == "codex" else str(uuid.uuid4()))
 
     # Preconditions are answered BEFORE the first durable write: a refusal after
@@ -421,7 +430,9 @@ def main(argv=None) -> int:
     ap.add_argument("--repo", default=str(_REPO))
     ap.add_argument("--folder", default="", help="the worker's working directory")
     ap.add_argument("--label", default="")
-    ap.add_argument("--runtime", default="", help="default: the core's configured runtime")
+    ap.add_argument("--runtime", default="",
+                    help="default: the core's configured runtime for fresh workers; "
+                         "the recorded session's runtime for --resume")
     ap.add_argument("--socket", default="")
     ap.add_argument("--new", action="store_true", help="fresh session (default)")
     ap.add_argument("--resume", default="", metavar="SESSION_ID",

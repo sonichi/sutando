@@ -32,7 +32,7 @@ import { createGoogleGenerativeAI } from '@ai-sdk/google';
 import { z } from 'zod';
 import { existsSync, readFileSync, unlinkSync, mkdirSync, copyFileSync, appendFileSync, writeFileSync, realpathSync } from 'node:fs';
 import { notify as platformNotify } from './platform.js';
-import { inlineTools, personalSkillSetups, personalVoiceSurface, describeVoiceTasks } from './inline-tools.js';
+import { inlineTools, personalSkillSetups, personalVoiceSurface, describeVoiceTasks, voiceTaskCounts, voiceTaskStatusSnapshot, heardByUser, resultsNotYetTold } from './inline-tools.js';
 import { createClientFrameHub } from './client-frame-hub.js';
 import { runSkillSetups } from './skill-setup-runner.js';
 import { setVisionSession, startVisionControlServer, stopVisionControlServer, setSessionToolUpdater, setVisionSpeechEvidence, getVisionEgressStats, isStreaming, stopStreaming as stopVisionStreaming } from './vision-tools.js';
@@ -59,7 +59,7 @@ function assertMacOS() {
 		process.exit(1);
 	}
 }
-import { voiceTaskRows, workTool, submitWorkTask, voiceTaskStore, resetNoteViewingDebounce, logConversationAsync, logSessionBoundaryAsync, getRecentConversation, getSecondsSinceLastTurn, setTaskStatusCallback, setVoiceSessionOrigin, getVoiceSessionOrigin, setVoiceTaskOriginResolver, setVoiceTurnsProvider, setVoiceTaskEndedListener, publishResultFile, submitVoiceSessionEndTask } from './task-bridge.js';
+import { voiceTaskRows, workTool, submitWorkTask, captureWorkOrigin, voiceTaskStore, resetNoteViewingDebounce, logConversationAsync, logSessionBoundaryAsync, getRecentConversation, getSecondsSinceLastTurn, setTaskStatusCallback, setVoiceSessionOrigin, endVoiceClientSession, getVoiceSessionOrigin, setVoiceTaskOriginResolver, setVoiceTurnsProvider, setVoiceTaskEndedListener, publishResultFile, submitVoiceSessionEndTask, voiceTaskResultText } from './task-bridge.js';
 import { createCallEndReporter, sessionEndTask } from './voice-session-end.js';
 import { framedSystem } from './inject-framing.js';
 import { deliverWithRetry } from './inject-delivery.js';
@@ -73,8 +73,10 @@ import { classifyFatalExitCode, isFatalExit, markFatalExit, writeCrashRecordAndE
 import { acquireVoiceLock, releaseOnExitUnlessFatal, resolveLockPython, voiceLockGuardPath } from './voice-lock.js';
 import { recordToolCall } from './conversation-store.js';
 import { buildGreeting, buildInstructions, type VoiceConfigContext } from './voice-agent-config.js';
-import { wireDurableChannels, createSessionRecorder } from './live-agent-runtime.js';
-import { RelayAgent, relayAgentSubagentConfig } from './relay-agent.js';
+import { wireDurableChannels, createSessionRecorder , heldByPacer} from './live-agent-runtime.js';
+import { RelayAgent, relayAgentSubagentConfig, createSpeechGate, recentConversationLines, createAskDelivery } from './relay-agent.js';
+import { createVoiceTaskStatusWriter } from './voice-task-status-writer.js';
+import { createGeminiTurnClassifier, createGeminiWorkCheck, WORK_CHECK_MODEL } from './work-request-check.js';
 import {
 	classifyTransportClose,
 	fatalCloseForRecovery,
@@ -89,6 +91,7 @@ import {
 import {
 	createAgentStateProvider,
 	createIsolatedIdleRestore,
+	createVerifierHooks,
 	publishCapabilitiesMarker,
 	publishLifecycleSnapshot,
 	type AgentStateV1,
@@ -268,6 +271,11 @@ function acquirePidLock(): void {
 
 // Model configuration — override via .env for cost/quality tuning
 const VOICE_MODEL = process.env.VOICE_MODEL || 'gemini-2.5-flash';
+/** How long the model may stay silent after the user's turn before stall recovery starts (bodhi's default 5 s). */
+const VOICE_RESPONSE_WATCHDOG_MS = Math.max(2_000, Number(process.env.VOICE_RESPONSE_WATCHDOG_MS) || 5_000);
+/** When the model stalls, bodhi first re-sends the user's last utterance as a complete turn on the same connection;
+ *  only if that fails does it reconnect. Off: VOICE_WATCHDOG_REPLAY=0. */
+const VOICE_WATCHDOG_REPLAY = process.env.VOICE_WATCHDOG_REPLAY !== '0';
 // Per-user voice config (native-audio model + googleSearch grounding) is
 // data, not code: it lives in the workspace, NOT in the git repo.
 //   live config: $SUTANDO_WORKSPACE/config/voice-agent.json
@@ -279,8 +287,8 @@ const VOICE_MODEL = process.env.VOICE_MODEL || 'gemini-2.5-flash';
 // src/voice-config.ts. voice-agent ships with Gemini 3.8 Live and
 // googleSearch=false for low-latency voice conversations; this PR does not
 // claim a new code-heavy workload benchmark. Phone inherits the
-// package default (2.5+search) unless its own config overrides it.
-import { loadVoiceConfig, migrateLegacyModel, revertModelMigration, resolveSessionTuning } from './voice-config.js';
+// package default (3.8 Live + search) unless its own config overrides it.
+import { loadVoiceConfig, migrateLegacyModel, revertModelMigration, resolveSessionTuning, resolveRelayCheck } from './voice-config.js';
 import { fireGuardedRestart, isVoiceAgentLaunchdManaged, restartAfterModelRevert } from './voice-config-switch.js';
 const _voiceAgentDir = dirname(fileURLToPath(import.meta.url));
 const VOICE_AGENT_CONFIG_PATH = join(WORKSPACE_DIR, 'config', 'voice-agent.json');
@@ -311,6 +319,8 @@ const VOICE_SHADOW_STT = VOICE_AGENT_CONFIG.shadowStt === true;
 // "divergenceCorrection": true additionally speaks a self-correction when
 // the shadow pass disagrees. Requires shadowStt.
 const VOICE_DIVERGENCE_CORRECTION = VOICE_AGENT_CONFIG.divergenceCorrection === true;
+// The relay agent's text-model checks: on by default; "relayCheck": false turns them off, {"model": …} picks the model.
+const RELAY_CHECK = resolveRelayCheck(VOICE_AGENT_CONFIG, WORK_CHECK_MODEL);
 // Phase 0.5 seams (design §2.1/§2.2): OFF unless configured — with nothing
 // set the VoiceSession config carries neither key and the wire behaviour is
 // byte-identical to the previous build (the Phase 0.5 gate). A half-set or
@@ -485,17 +495,27 @@ const getTaskStatus: ToolDefinition = {
 	description:
 		'Check the tasks the user asked for by voice and where each stands now (queued, in progress, cancel requested, done, and whether the user heard the result). ' +
 		'Use for status/progress questions like "any pending tasks?", "how many tasks are there?", "are you working on something?". ' +
+		'pendingTasks is the number to give for "how many pending": tasks the core is still working on. A finished result the user has not heard is not pending: it is in resultsNotYetTold. ' +
+		'resultsNotYetTold lists finished results the user has not heard, with the result text: say each of them now, in a sentence, before the count; the user asking "did you lose one?" is usually one of these. ' +
 		'Always call it for these: never answer from memory, the state changes. Do NOT call work just to check progress.',
 	parameters: z.object({}),
 	execution: 'inline',
 	execute: async () => {
 		// The relay agent's table, the same source as the in-line count and get_core_status.
 		const rows = voiceTaskRows();
-		const open = rows.filter((r) => r.state === 'queued' || r.state === 'started');
+		// Pending is what the core still works on; a finished result not yet told is listed apart, to be said first.
+		const counts = voiceTaskCounts(rows, voiceTaskResultText);
+		// What the tool said, so a wrong number out loud can be laid against it (2026-10-12: "one" for 4).
+		console.log(`${ts()} [RelayAgent] get_task_status: pending ${counts.pending} (the core is working on ${counts.working}, done not heard ${counts.doneNotHeard})`);
 		// Counts and states only: a yes/no "in progress" flag was read as "all of them are being worked on".
 		return {
-			openTasks: open.length,
-			tasks: rows.map((r) => ({ task: r.text.slice(0, 60), state: r.state, heard: r.delivery === 'spoken' || r.delivery === 'injected' })),
+			pendingTasks: counts.pending,
+			stillBeingWorkedOn: counts.working,
+			doneNotYetHeard: counts.doneNotHeard,
+			unknownState: counts.unknown,
+			tasks: rows.map((r) => ({ task: r.text.slice(0, 60), state: r.state, heard: heardByUser(r), ...(r.retired ? { endedWithNothingToSay: true } : {}) })),
+			// A finished result the user has not heard goes with its text, so "did you lose one?" is answered on the spot.
+			resultsNotYetTold: resultsNotYetTold(rows, voiceTaskResultText, new Set(heldByPacer())),
 			description: describeVoiceTasks(rows),
 		};
 	},
@@ -587,6 +607,8 @@ let voiceSessionRef: VoiceSession | null = null;
 // the sessionEnding turn.end sweep.
 // Runs right before a clear: the call's report keeps what is about to go.
 let beforeConversationClear: () => void = () => {};
+// Skills told each time the user's speech is transcribed (onUserSpoke).
+const userSpokeHandlers: Array<() => void> = [];
 // The compressed summary of the older conversation (bodhi keeps the slot, sutando fills it).
 const conversationSummary = createConversationSummarizer({
 	context: () => voiceSessionRef?.conversationContext ?? null,
@@ -634,6 +656,10 @@ function resolveCurrentMode(): ModeState {
 }
 
 const mainAgentTools: ToolDefinition[] = [workTool, getTaskStatus, switchModeTool, ...inlineTools, ...personalVoiceSurface.tools];
+/** Tools that answer the turn themselves (skill fetches, cancelling a task): the relay agent's turn check
+ *  leaves those turns alone, so "cancel that task" is never also sent to the core. A status call is not one:
+ *  a request the voice model routed to get_task_status still reaches the turn check. */
+const answeringTools = new Set([...personalVoiceSurface.answeringTools, 'cancel_task']);
 
 // Injection seam for the tuned factories in voice-agent-config.ts: this
 // module owns the session-gate + mode state; the config module owns the
@@ -978,10 +1004,42 @@ async function main() {
 	});
 
 	// The relay agent runs every `work` call as a bodhi subagent: submit, then return the core's result.
+	// A `work` call waits until the user has finished speaking (subscribed once the session exists).
+	const speechGate = createSpeechGate();
+/** Resolves once the session is ACTIVE: now, or at the next transition to it. */
+function whenSessionActive(s: VoiceSession): Promise<void> {
+	if ((s.sessionManager as { state?: string }).state === 'ACTIVE') return Promise.resolve();
+	return new Promise<void>((resolve) => {
+		const off = s.eventBus.subscribe('session.stateChange', (e: { toState?: string }) => {
+			if (e?.toState !== 'ACTIVE') return;
+			if (typeof off === 'function') (off as () => void)();
+			resolve();
+		});
+	});
+}
+
+	const relayAsk = createAskDelivery({
+		inject: (text) => { void sessionRef?.injectText(text, { mode: 'live' }); },
+		log: (m) => console.log(`${ts()} ${m}`),
+	});
 	const relayAgent = new RelayAgent({
 		submit: submitWorkTask,
+		captureOrigin: captureWorkOrigin,
 		store: voiceTaskStore,
+		speech: speechGate,
+		// A text model, not the voice model, decides whether a request is complete enough to submit.
+		check: RELAY_CHECK ? createGeminiWorkCheck({ apiKey: () => GEMINI_VOICE_API_KEY, model: RELAY_CHECK.model, log: (m) => console.log(`${ts()} ${m}`) }) : undefined,
+		// From the live conversation, not conversation.log: the log is written asynchronously, so a check that
+		// starts right after a turn would miss the voice model's own reply (2026-10-12 00:06: it missed "哪一个餐馆？"
+		// and sent "那个餐馆的 menu" with the blank in it).
+		recentConversation: () => recentConversationLines(sessionRef?.conversationContext.items ?? [], 8) || getRecentConversation(8),
+		// Every finished user turn too, whatever tool the voice model chose: is it a request for the core?
+		// A skill's tools answer some turns themselves (read_room): the check is told, so it does not send those to the core.
+		classify: RELAY_CHECK ? createGeminiTurnClassifier({ apiKey: () => GEMINI_VOICE_API_KEY, model: RELAY_CHECK.model, log: (m) => console.log(`${ts()} ${m}`), extraRules: personalVoiceSurface.turnCheckRules }) : undefined,
 		notice: (text) => { sessionRef?.tryPublishSystemNotification(text); },
+		// A question for the user is said as live input once the model stops speaking, not queued as a notification.
+		ask: (text) => { relayAsk.ask(text); },
+		whenActive: () => (sessionRef ? whenSessionActive(sessionRef) : Promise.resolve()),
 		log: (msg) => console.log(`${ts()} ${msg}`),
 	});
 	setVoiceTaskEndedListener((taskId, why) => { relayAgent.endCall(taskId, why); });
@@ -997,6 +1055,16 @@ async function main() {
 		log: (m) => console.log(`${ts()} ${m}`),
 	});
 	beforeConversationClear = () => callEnd.collect();
+
+	// The task table lives in memory; the status page (/voice-tasks on the web client) reads a copy,
+	// written asynchronously after each change, as bodhi's history stores write the conversation.
+	const voiceTaskStatus = createVoiceTaskStatusWriter({
+		path: statusPath('voice-task-status.json', WORKSPACE_DIR),
+		snapshot: () => voiceTaskStatusSnapshot(voiceTaskRows()),
+		log: (m) => console.error(`${ts()} ${m}`),
+	});
+	voiceTaskStore.onChange(() => voiceTaskStatus.changed());
+	voiceTaskStatus.changed();
 
 	const session = new VoiceSession({
 		sessionId: SESSION_ID,
@@ -1018,6 +1086,10 @@ async function main() {
 		inputAudioTranscription: true,
 		whisperProvider: meetingTranscriber,
 		orchestrationMode: 'actor',
+		// Stall recovery: the silence that starts it is tunable per install, and stage one replays the
+		// retained utterance in place instead of reconnecting.
+		responseWatchdogMs: VOICE_RESPONSE_WATCHDOG_MS,
+		watchdogReplayRecovery: VOICE_WATCHDOG_REPLAY,
 		// A lost upstream parks in UPSTREAM_LOST with the WS listener up; bodhi's
 		// upstreamRecovery decides when to redial, park an idle upstream and back off.
 		upstreamLossPolicy: 'hold',
@@ -1038,7 +1110,7 @@ async function main() {
 			callEnd.clientDisconnected();
 			// An origin belongs to the client that announced it; the next client announces its own.
 			if (getVoiceSessionOrigin()) console.log(`${ts()} [SessionOrigin] client gone — origin released`);
-			setVoiceSessionOrigin(null);
+			endVoiceClientSession();
 			clientFrames.disconnected();
 		},
 		// P7 Tranche B: feed the ledger the two provider facts it cannot infer —
@@ -1075,11 +1147,7 @@ async function main() {
 			: {}),
 		// Step 11/12: when the pinned bodhi supports `?probe=1` probe
 		// interception, hand it the agent.state builder — probes get one
-		// frame + close 1000 without ever touching `this.client`. The Z3
-		// isolated idle-restore arms here too: a probe is the only
-		// probe-shaped hook this repo controls until bodhi exposes a
-		// dedicated probe/verifier-close callback (seam documented on
-		// `createIsolatedIdleRestore().arm`).
+		// frame + close 1000 without ever touching `this.client`.
 		...(bodhiSupportsProbeState
 			? {
 				probeState: (): AgentStateV1 => {
@@ -1089,6 +1157,18 @@ async function main() {
 				},
 			}
 			: {}),
+		// A `?verify=1` connection runs only these hooks, never the real-client attach.
+		...createVerifierHooks({
+			emitImmediate: () => emitAgentState({ immediate: true }),
+			sessionState: (): string => String(session.sessionManager.state),
+			wake: (): void => {
+				// The redial bodhi makes when a real client attaches to a parked session.
+				const { attemptEpoch } = session.recoverUpstream({ reason: 'human-retry', skipContextInjection: false, holdSyntheticUntilFreshSpeech: false });
+				console.log(`${ts()} [AgentState] verifier attached: redialing the parked upstream, attempt ${attemptEpoch}`);
+			},
+			armIdleRestore: () => probeIdleRestore.arm(),
+			log: (m) => console.error(`${ts()} ${m}`),
+		}),
 		hooks: {
 			onSessionStart: (e) => {
 				resetSessionGateState();
@@ -1118,6 +1198,7 @@ async function main() {
 				// recordToolCall(). Pushing here would duplicate in
 				// session_events.
 				console.log(`${ts()} [Tool] ${e.toolName} (${e.execution})`);
+				if (answeringTools.has(e.toolName)) relayAgent.noteAnsweringTool(e.toolName);
 				// Flag the web-client that a tool is in flight so the avatar
 				// can show the blue `.working` pulse and the menu bar can
 				// switch to the slow-deep-swing signature. `source=tool` pins
@@ -1169,8 +1250,8 @@ async function main() {
 	// =========================================================================
 	// `agent.state` emission + lifecycle snapshot (Step 12 + amendment A9).
 	// One emitter, three triggers: an immediate frame on every accepted real
-	// connection, a repeat frame on every upstream transition, and an atomic
-	// `state/voice-lifecycle.json` publish on every relevant transition
+	// or verifier connection, a repeat frame on every upstream transition, and
+	// an atomic `state/voice-lifecycle.json` publish on every relevant transition
 	// (client attach/detach, initialized flip, upstream change). This module
 	// is the ONLY writer of the lifecycle file (A9) — WS2's control consumer
 	// reads it cross-process.
@@ -1197,7 +1278,7 @@ async function main() {
 			console.error(`${ts()} [AgentState] frame send failed: ${(err as Error)?.message ?? err}`);
 		}
 	};
-	const emitAgentState = (opts: { immediate?: boolean } = {}): void => {
+	const emitAgentState = (opts: { immediate?: boolean } = {}): AgentStateV1 => {
 		const frame = buildAgentState();
 		// A transition includes reason/category changes within 'failed'
 		// (e.g. auth-invalid → quota-exceeded after a key rotation) — those
@@ -1223,12 +1304,19 @@ async function main() {
 				onError: (err) => console.error(`${ts()} [AgentState] lifecycle snapshot write failed: ${(err as Error)?.message ?? err}`),
 			});
 		}
+		return frame;
 	};
 	// Upstream transitions: bodhi's sessionManager publishes
 	// `session.stateChange` on every transitionTo() — the same seam the
 	// health monitor's state reads observe. ACTIVE proves the credential
 	// works again, so it clears the persisted terminal classification (R8)
 	// before the frame is built.
+	// A fresh dial (recoverUpstream) abandons the old connection's calls: a reply to one is dropped at bodhi's
+	// fence. The open calls end at that boundary so each result goes the other way. A resume keeps them.
+	session.eventBus.subscribe('session.reconnectBoundary', () => {
+		const ended = relayAgent.noteBoundary();
+		if (ended.length) console.log(`${ts()} [RelayAgent] connection replaced: ${ended.length} open work call(s) ended; their results are delivered another way (${ended.join(', ')})`);
+	});
 	session.eventBus.subscribe('session.stateChange', (e) => {
 		if ((e as { toState?: string })?.toState === 'ACTIVE') {
 			clearTerminalClassification();
@@ -1252,7 +1340,7 @@ async function main() {
 
 	// Wire voice-failure classifier: when the Gemini Live transport closes
 	// with a non-retryable reason (credits depleted, quota exceeded, key
-	// invalid, model not found), surface an actionable message via the
+	// invalid, ephemeral token expired, model not found), surface an actionable message via the
 	// proactive-result channel + an OS notification. Throttled per category
 	// so the 30s reconnect loop doesn't spam.
 	(() => {
@@ -1282,11 +1370,10 @@ async function main() {
 			// task feed and the Discord/Telegram bridges if configured.
 			try {
 				const tsMs = Date.now();
-				const path = join(WORKSPACE_DIR, 'results', `proactive-voice-${c.category}-${tsMs}.txt`);
 				const body = c.userActionUrl
 					? `${c.userMessage} ${c.userActionUrl}`
 					: c.userMessage;
-				writeFileSync(path, body);
+				publishResultFile(`proactive-voice-${c.category}-${tsMs}.txt`, body);
 			} catch (e) {
 				console.error(`${ts()} [VoiceFailure] proactive write failed: ${(e as Error)?.message ?? e}`);
 			}
@@ -1358,6 +1445,17 @@ async function main() {
 			} catch { /* test-only */ }
 		}, 250);
 	}
+	// Skills told when the user speaks (onUserSpoke): a change held for a spoken yes is not released by the model alone.
+	(() => {
+		const transport = (session as unknown as { transport?: { onInputTranscription?: (text: string) => void } }).transport;
+		if (!transport) return;
+		const orig = typeof transport.onInputTranscription === 'function' ? transport.onInputTranscription.bind(transport) : null;
+		transport.onInputTranscription = (text: string) => {
+			orig?.(text);
+			if (typeof text !== 'string' || !text.trim()) return;
+			for (const h of userSpokeHandlers) { try { h(); } catch { /* a skill's own fault */ } }
+		};
+	})();
 	// Native audio streams transcript and audio concurrently, so suppression reaches only
 	// the REMAINING chunks of a turn — anything already sent cannot be recalled.
 	(() => {
@@ -1404,7 +1502,7 @@ async function main() {
 	// Durable-channel wiring (context drops, note viewing, task results →
 	// session injection) moved verbatim to live-agent-runtime.ts (step 5a-2).
 	// The Cartesia stuck-session fallback is adapter-provided via opts.
-	const durable = wireDurableChannels(session, { cartesiaApiKey: CARTESIA_API_KEY, generateSpeech, relay: relayAgent });
+	const durable = wireDurableChannels(session, { cartesiaApiKey: CARTESIA_API_KEY, generateSpeech, injectLive: (text, onDelivered) => relayAsk.ask(text, onDelivered), relay: relayAgent });
 
 	// P7 D7.3: the transcript cursor lives in the clear helper so every clear
 	// path rebases it with the items array (G-P7-8).
@@ -1419,8 +1517,12 @@ async function main() {
 	// tells the bridge whether a transcription may still be landing (no stamp within
 	// 10 s = the model started this turn itself, so the task write does not wait).
 	let lastUserSpeechAt: number | undefined;
-	session.eventBus.subscribe('speech.user_started', () => { lastUserSpeechAt = Date.now(); });
-	session.eventBus.subscribe('speech.user_ended', () => { lastUserSpeechAt = Date.now(); });
+	session.eventBus.subscribe('speech.user_started', (e: { source?: string }) => { lastUserSpeechAt = Date.now(); speechGate.onUserSpeechStarted(e); });
+	session.eventBus.subscribe('speech.user_ended', (e: { source?: string }) => { lastUserSpeechAt = Date.now(); speechGate.onUserSpeechEnded(e); });
+	session.eventBus.subscribe('response.first_audio', () => speechGate.onModelAudio());
+	// The relay's question for the user waits only while the model is speaking.
+	session.eventBus.subscribe('response.first_audio', () => relayAsk.onModelAudio());
+	session.eventBus.subscribe('turn.end', () => relayAsk.onTurnEnd());
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any
 	const speechHost = session as any;
 	setVoiceTurnsProvider(() => ({
@@ -1458,6 +1560,8 @@ async function main() {
 				// speech and shouldn't unlock end_session.
 				if (item.role === 'user' && item.content && !item.content.startsWith('[System:')) {
 					userTurnCount++;
+					// The relay agent looks at every request, not only the ones the voice model sent with work.
+					relayAgent.onUserTurn(item.content);
 				}
 			}
 		}
@@ -1497,6 +1601,7 @@ async function main() {
 		setVoiceSessionOrigin,
 		getVoiceSessionOrigin,
 		setVoiceTaskOriginResolver,
+		onUserSpoke: (handler) => { userSpokeHandlers.push(handler); },
 	}, (msg, detail) => console.error(`${ts()} ${msg}`, detail));
 
 	// Audio-duck relay: flag the slide server (localhost:7877) when Sutando is

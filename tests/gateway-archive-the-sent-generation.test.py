@@ -21,11 +21,12 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from _helpers.hermetic_gateway import assert_hermetic, isolate_then_import  # noqa: E402
+_GW, _IMPORT_READS = isolate_then_import()   # before anything else imports the bridge
+
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / 'packages' / 'ag2-sparrow'))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _helpers.hermetic_gateway import assert_hermetic, isolate_then_import  # noqa: E402
-_GW, _IMPORT_READS = isolate_then_import()   # before anything else imports the bridge
 from ag2_sparrow import outbox, remote_gateway_bridge as gw, undelivered_quarantine
 # The canonical module, so the coverage gate (source = src) sees the archive run
 # under the bridge; the vendored copy is pinned byte-equal by the delegation test.
@@ -1090,8 +1091,8 @@ class BridgeImportIsHermetic(unittest.TestCase):
         assert_hermetic(self, _IMPORT_READS)
 
     def test_the_checker_flags_a_host_read_and_a_vault_lookup(self):
-        from _helpers.hermetic_gateway import host_reads
-        flagged = host_reads([('file', str(Path.home() / '.claude' / 'channels' / 'x.env')),
+        from _helpers.hermetic_gateway import HOST_HOME, host_reads
+        flagged = host_reads([('file', str(HOST_HOME / '.claude' / 'channels' / 'x.env')),
                               ('proc', 'security find-generic-password -s REMOTE_TASK_TOKEN -w')])
         self.assertEqual(len(flagged), 2, flagged)
 

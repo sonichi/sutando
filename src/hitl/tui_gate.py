@@ -22,14 +22,76 @@ _NEVER_ONE_CLICK = re.compile(r"trust the files|Do you trust|Bypass Permissions|
                               r"Fable limit|usage credits|hit your (?:session|usage|weekly) limit", re.I)
 _OPTION = re.compile(r"^\s*(❯)?\s*(\d+)\.\s+(.*\S)\s*$")
 _FRAME = re.compile(r"^[\s─━│┃┌┐└┘╭╮╰╯├┤┬┴┼═║╔╗╚╝]*$")
+_EDGE = frozenset("─━═╭┌╔")  # a rule or a box top: where a dialog starts
 _HINT = re.compile(r"Esc to cancel|Enter to (confirm|select)|↑/↓|shift\+tab|Tab to", re.I)
+_FOOTER = re.compile(r"^⏵|←\s*for agents|esc to interrupt|\? for shortcuts", re.I)
 _YES = re.compile(r"^\s*yes\b", re.I)
 _NO = re.compile(r"^\s*no\b", re.I)
 
 
 def guard_for(session: str, prompt: Optional[str], state: str) -> str:
-    """The episode key: same session + same dialog text = same requirement."""
-    return hashlib.sha256(f"{session}\n{prompt or state}".encode()).hexdigest()[:16]
+    """The episode key: same session + same dialog = same requirement."""
+    episode = dialog_identity(prompt) or prompt or state
+    return hashlib.sha256(f"{session}\n{episode}".encode()).hexdigest()[:16]
+
+
+def dialog_identity(prompt: Optional[str]) -> Optional[str]:
+    """The live dialog's own text, from the rule or box top above it (an edit's inner diff box
+    counts) to its last option, caret and borders dropped. Live = a caret block with only hints
+    and footer below it; anything else returns None and the whole prompt keys the guard."""
+    blocks = option_blocks(prompt)
+    live = next((b for b in reversed(blocks) if b[2] is not None), None)
+    if live is None:
+        return None
+    start, labels, _ = live
+    lines = (prompt or "").splitlines()
+    end = [i for i in range(start, len(lines)) if _OPTION.match(lines[i])][len(labels) - 1]
+    for line in lines[end + 1:]:
+        s = line.strip()
+        if s and not (_FRAME.match(s) or _HINT.search(s) or _FOOTER.search(s)):
+            return None  # a gate below the list: the list is not what it asks
+    body: List[str] = []
+    for line in reversed(lines[:start]):
+        s = line.strip()
+        if _OPTION.match(line) or s.startswith("✓") or s[:1] in _EDGE:
+            break  # the dialog's top edge, or an older dialog above it
+        s = s.strip("│┃║ ")
+        if s and not _HINT.search(s):
+            body.append(s)
+    return "\n".join(body[::-1] + labels)
+
+
+# A usage limit is one episode per seat however its screen repaints (banner, menu, refused
+# turn): its cards share one guard, so every supervisor's card for it dedups onto one.
+LIMIT_EPISODE = "usage-limit"
+
+
+def limit_guard(session: str) -> str:
+    return f"{LIMIT_EPISODE}:{session}"
+
+
+def limit_card(req: HumanRequirement) -> bool:
+    return (req.subject or {}).get("episode") == LIMIT_EPISODE
+
+
+def limit_card_holds(req: HumanRequirement, pane: Optional[str], runtime: Optional[str] = None,
+                     outrun: bool = False) -> bool:
+    """A usage-limit card stays open while its limit stands on `pane`; every resolver asks this."""
+    if not limit_card(req):
+        return False
+    from delivery.pane_gate import limit_standing
+    return limit_standing(pane, runtime, outrun)
+
+
+def limit_unblock(session: Optional[str] = None, runtime: Optional[str] = None) -> str:
+    """How the owner lifts a usage limit, for the card body; the steps are the runtime's own."""
+    where = f"open its terminal (tmux session {session})" if session else "open its terminal"
+    if runtime == "codex":
+        return (f"It continues when the limit resets. To unblock it sooner, {where} and run "
+                "`codex login` to switch to another account.")
+    return (f"It continues when the limit resets. To unblock it sooner, {where} and run "
+            "/usage-credits to use extra credits, /login to switch to another account, "
+            "or /model to switch to a model with usage left.")
 
 
 def option_blocks(prompt: Optional[str]) -> List[Tuple[int, List[str], Optional[int]]]:
@@ -89,10 +151,12 @@ def _open_terminal() -> Action:
 
 def requirement_for(state: str, gate: Optional[str], prompt: Optional[str],
                     session: str, detail: str, fallback_message: str,
-                    runtime: Optional[str] = None) -> HumanRequirement:
+                    runtime: Optional[str] = None,
+                    episode: Optional[str] = None) -> HumanRequirement:
     """The requirement a gate deserves; unparseable or non-semantic gates keep the
     blocked card with no button, so a key is never guessed. A session with no stamped
-    runtime predates the stamp and ran Claude, so `runtime` falls back to "claude"."""
+    runtime predates the stamp and ran Claude, so `runtime` falls back to "claude".
+    `episode` LIMIT_EPISODE keys the card on the seat, not the screen, and announces it once."""
     options, caret = parse_options(prompt)
     subject: Dict[str, object] = {
         "session": session,
@@ -106,10 +170,11 @@ def requirement_for(state: str, gate: Optional[str], prompt: Optional[str],
     kind, title, message, actions = FALLBACK_KIND, f"{session} · {state}", fallback_message, []
     option_for_action: Dict[str, int] = {}
 
-    if _NEVER_ONE_CLICK.search(prompt or "") or (gate is not None and gate not in SEMANTIC_GATES and state != "logged-out"):
-        pass  # keeps the blocked card: never a one-click answer on a trust/spend gate
+    if (episode == LIMIT_EPISODE or _NEVER_ONE_CLICK.search(prompt or "")
+            or (gate is not None and gate not in SEMANTIC_GATES and state != "logged-out")):
+        pass  # keeps the blocked card: never a one-click answer on a trust/spend gate or a limit
     elif gate == "login" or state == "logged-out":
-        kind, title = "auth", "Claude needs to be reconnected"
+        kind, title = "auth", "Claude needs you to sign in again"
         message = "Your Claude session has expired. Sign in again to continue."
         actions = [Action(id="authenticate", kind="authenticate", label="Sign in to Claude")]
     elif gate == "press-enter":
@@ -132,9 +197,13 @@ def requirement_for(state: str, gate: Optional[str], prompt: Optional[str],
             actions = [Action(id=f"opt{i + 1}", kind="select", label=o) for i, o in enumerate(options)]
 
     subject["option_for_action"] = option_for_action
+    guard = guard_for(session, prompt, state)
+    if episode == LIMIT_EPISODE:
+        guard = limit_guard(session)
+        subject.update(episode=episode, remind=False)
     return HumanRequirement(
         kind=kind, runtime=runtime or "claude", message=message, title=title,
-        guard=guard_for(session, prompt, state),
+        guard=guard,
         device={"id": session, "name": session},
         actions=actions + [_open_terminal()],
         subject=subject,

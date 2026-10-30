@@ -32,6 +32,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "fixtures"))
 from clean_watcher_env import clean_env  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _helpers.process_group import popen_bound  # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
 FAILURES: list[str] = []
@@ -88,10 +90,10 @@ class Workspace:
         self.generation += 1
         # stderr is kept: a FAIL with nothing to read cannot be diagnosed.
         errf = open(self.tmp / f"watcher-{self.generation}.err", "w+")
-        p = subprocess.Popen(["bash", "src/watch-tasks-stream.sh", str(self.ws / "tasks"),
+        p = popen_bound(["bash", "src/watch-tasks-stream.sh", str(self.ws / "tasks"),
                               "--role", "standby", "--inbox", str(self.ws / "tasks")],
                              cwd=str(REPO), env=self.env(), stdout=subprocess.PIPE,
-                             stderr=errf, start_new_session=True)
+                             stderr=errf)
         os.set_blocking(p.stdout.fileno(), False)
         return Watcher(self, p, errf)
 

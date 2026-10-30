@@ -160,9 +160,10 @@ def _is_discord_channel_id(value: str) -> bool:
 from result_markers import parse_markers, has_skip_action  # noqa: E402
 import mention_gate  # noqa: E402  — owner @-mention ingestion gate (skills/mention-gate)
 from policy.guardrail import engage_rulebook, DISCORD_PROVENANCE  # noqa: E402
-from policy.egress.result import guard_result_for_tier, resolve_access_tier as _resolve_task_tier  # noqa: E402
+from policy.egress.result import guard_result_for_tier, resolve_route_tier  # noqa: E402
 
 from delivery.readiness import read_ready_result  # noqa: E402
+from result_publish import publish_text  # noqa: E402
 from dedup_recovery import fresh_reask_id, plan_dedup_recovery, report_disposition  # noqa: E402
 from discord_addressee import is_addressed_in_shared_channel, reference_is_reply  # noqa: E402  # pragma: no cover — bridge not unit-imported; addressee logic is covered in discord_addressee.py
 from reply_chain import format_parent_reference, format_reply_chain, format_reply_chain_ids, format_reply_chain_truncation, should_fetch_reply_context, walk_reply_chain  # noqa: E402  # pragma: no cover — bridge not unit-imported; chain formatting is covered in reply_chain.py
@@ -4275,6 +4276,7 @@ async def _handle_discord_message(message, force=False):
             # sender can set (channel_name, guild_name) may precede the tier.
             f"access_tier: {access_tier}\n"
             f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
+            f"local_time: {local_task_protocol.local_time_value()}\n"
             f"source: discord\n"
             f"interaction_type: message\n"
             f"{media_headers}"
@@ -4986,10 +4988,7 @@ async def poll_results():
                 # skipped the cleanup block at the bottom of this loop.
                 # Non-owner results are scanned before ANY marker below. The tier
                 # map dies on restart, so unknown is re-read from the task file.
-                _guard_tier = _task_tier
-                if _guard_tier == "unknown":
-                    _guard_tf = find_task_file(TASKS_DIR, task_id)
-                    _guard_tier = _resolve_task_tier(_guard_tf) if _guard_tf else "guest"
+                _guard_tier = resolve_route_tier(_task_tier, TASKS_DIR, task_id)
                 # A Discord channel is a human surface: the suppression is journaled
                 # under STATE_DIR and closed silently rather than posted as prose.
                 try:
@@ -6058,12 +6057,9 @@ async def poll_dm_fallback():
                         )
                     # Either non-owner or unresolved-channel path: rewrite the
                     # result file with the marker stripped so the dm-result.py
-                    # subprocess (below) DMs clean text. Atomic-ish write —
-                    # the only other consumer of results/ at this point is
-                    # voice-agent's task-bridge, which is read-only and would
-                    # tolerate an intermediate marker-vs-clean view.
+                    # subprocess (below) DMs clean text.
                     try:
-                        f.write_text(clean_body + ("\n" if not clean_body.endswith("\n") else ""), encoding="utf-8")
+                        publish_text(f, clean_body + ("\n" if not clean_body.endswith("\n") else ""))
                     except OSError as e:
                         print(f"  [dm-fallback channel-redirect] write-back failed on {f.name}: {e}", flush=True)
 

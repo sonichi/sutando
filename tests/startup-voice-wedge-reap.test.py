@@ -34,6 +34,8 @@ import tempfile
 import time
 import uuid
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _helpers.process_group import popen_bound  # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
 PY = sys.executable or "python3"
@@ -82,8 +84,8 @@ def spawn_listener_group(port, entry_path):
         "s.listen(1)\n"
         "time.sleep(120)\n"
     )
-    p = subprocess.Popen(
-        [PY, "-c", code, str(entry_path), str(port)], start_new_session=True
+    p = popen_bound(
+        [PY, "-c", code, str(entry_path), str(port)]
     )
     deadline = time.time() + 10
     while time.time() < deadline:
@@ -97,8 +99,8 @@ def spawn_listener_group(port, entry_path):
 
 
 def spawn_sleeper():
-    return subprocess.Popen(
-        [PY, "-c", "import time; time.sleep(120)"], start_new_session=True
+    return popen_bound(
+        [PY, "-c", "import time; time.sleep(120)"]
     )
 
 

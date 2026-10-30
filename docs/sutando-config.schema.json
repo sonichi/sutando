@@ -30,6 +30,28 @@
           "minimum": 1,
           "default": 10,
           "description": "Commits behind origin/<expected_branch> before health-check's live-checkout-branch probe warns that the checkout is stale. Being ON the right branch is only half of being current \u2014 a checkout can sit on main and still run weeks-old code. Deliberately not 1: main moves several times a day, so warning on any delta trains the reader to ignore the probe. Invalid values (non-integer, zero, negative) fall back to 10 rather than crashing the health check or warning on a current checkout. No env-var override."
+        },
+        "dotspace": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "The DotSpaces (agent-native Matrix homeservers AG2 operates) this install may connect to. Omit the block to keep the built-in list (ag2.space, dev.ag2.space, s.space, dev.s.space); see docs/dotspace.md.",
+          "properties": {
+            "instances": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["server"],
+                "properties": {
+                  "server": {"type": "string", "minLength": 1, "description": "The homeserver name (the part of an mxid after the first colon)."},
+                  "gateway_host": {"type": "string", "description": "The sparrow gateway / relay host, e.g. chat.ag2.space."},
+                  "cloud_origin": {"type": "string", "description": "This instance's Sutando Cloud origin, e.g. https://sutando.ag2.space; empty when it has none."},
+                  "link_via": {"type": "string", "description": "matrix.to ?via= server; defaults to server."},
+                  "prefer_ipv4": {"type": "boolean", "default": true}
+                }
+              }
+            }
+          }
         }
       }
     },
@@ -165,6 +187,18 @@
         }
       }
     },
+    "skills": {
+      "type": "object",
+      "description": "How skills are installed on this host. See skills/MANIFEST.md, `audience`.",
+      "additionalProperties": false,
+      "properties": {
+        "developer": {
+          "type": "boolean",
+          "default": false,
+          "description": "Link developer-only skills (manifest `audience`: `developer`, or an unknown value) into the core's skills dirs. Only JSON true opts in; any other value is false. Read by resolve_skills_developer() in src/sutando_config.py, through src/skill_audience.py, the decision every installer calls."
+        }
+      }
+    },
     "bridges": {
       "type": "object",
       "description": "Bridge-wide toggles shared by the Discord/Telegram/Slack bridges.",
@@ -232,7 +266,39 @@
     },
     "env": {
       "type": "object",
-      "description": "Non-secret config values mirroring the flat env-var namespace (issue #1724). Read by config_get(); secrets stay in .env / vault.",
+      "description": "Non-secret config values mirroring the flat env-var namespace (issue #1724). Read by config_get(), which prefers this stanza and falls back to the process environment (deprecated, with a one-time warning); secrets stay in .env / vault. Known keys are listed below; any other string key is allowed.",
+      "properties": {
+        "SUTANDO_HEALTH_LOOP_STALE_SEC": {
+          "type": "string",
+          "default": "600",
+          "description": "health-check core-proactive-loop: seconds core-status.json may read `running` without advancing before it warns."
+        },
+        "SUTANDO_HEALTH_QUEUE_AGE_SEC": {
+          "type": "string",
+          "default": "300",
+          "description": "health-check task-queue: age in seconds the oldest pending task must reach, together with SUTANDO_HEALTH_QUEUE_COUNT pending tasks, before it warns."
+        },
+        "SUTANDO_HEALTH_QUEUE_COUNT": {
+          "type": "string",
+          "default": "3",
+          "description": "health-check task-queue: pending-task count that, together with SUTANDO_HEALTH_QUEUE_AGE_SEC, makes it warn."
+        },
+        "SUTANDO_HEALTH_LOAD_RATIO": {
+          "type": "string",
+          "default": "1.5",
+          "description": "health-check system-load: a pass is high when the 1-min load average exceeds this times the core count. A malformed or non-positive value falls back to the default."
+        },
+        "SUTANDO_HEALTH_LOAD_REAP": {
+          "type": "string",
+          "default": "0",
+          "description": "health-check system-load: only exactly `1` lets every `health-check.py --fix` run (the desktop app's 30-minute pass included, so reaping is automatic there) run the installed orphan reaper, at most once per high-load episode. Anything else, unset included, is off: --fix does not reap and the warning says `reaping is off (SUTANDO_HEALTH_LOAD_REAP=1 enables it)` with action=none, keeping cause=leftover-test-processes so the core can still run the reaper by hand. A normal pass never reaps."
+        },
+        "SUTANDO_HEALTH_LOAD_PASSES": {
+          "type": "string",
+          "default": "3",
+          "description": "health-check system-load: consecutive high passes before it warns (one spike never does). A malformed or non-positive value falls back to the default."
+        }
+      },
       "additionalProperties": {
         "type": "string"
       }

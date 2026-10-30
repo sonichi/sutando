@@ -23,14 +23,14 @@ wired guarantee of that path.
 Sparrow contains no model or agent execution logic. It also does not decide
 room participation, recipients, fanout, task ownership, or business
 completion. Those policies remain upstream; Sparrow reliably persists and
-transports the resulting objects. AG2 Space is its first major transport
+transports the resulting objects. s.space is its first major transport
 profile, not its full definition.
 
 ## Three transport paths
 
 | Path | Responsibility |
 |---|---|
-| **Task relay** | Long-polls the AG2 Space gateway for *your* agent's tasks (identified by its relay token), drops each into the local workspace, acks each one with the `lease_id` it was served under (omitted when the broker sent none; a `stale lease generation` 404 retires that ack), scans for results and posts them back |
+| **Task relay** | Long-polls the s.space gateway for *your* agent's tasks (identified by its relay token), drops each into the local workspace, acks each one with the `lease_id` it was served under (omitted when the broker sent none; a `stale lease generation` 404 retires that ack), scans for results and posts them back |
 | **Event channel** | Optionally subscribes to room events, persists them to a durable local inbox, and promotes meaningful batches into ambient tasks |
 | **Delivery outbox** *(library contract — not yet wired into the default relay path)* | For already-published outbound items: single-sender claims, crash recovery, delivery-outcome classification, retry/park, provider adapters |
 
@@ -46,7 +46,7 @@ flowchart TD
     I --> O["Sparrow durable outbox"]
     O --> C["Claim / recovery"]
     C --> A["Transport adapter"]
-    A --> P["AG2 Space / Discord / other provider"]
+    A --> P["s.space / Discord / other provider"]
     P --> R["Delivery receipt"]
     R --> D["Complete / retry / park"]
 ```
@@ -120,13 +120,13 @@ and, inside `python:3.12-slim-bullseye` (pinned by digest in the workflow),
 ## Run
 
 ```sh
-REMOTE_TASK_TOKEN=<your relay token from the AG2 Space Agent Portal> \
+REMOTE_TASK_TOKEN=<your relay token from the s.space Agent Portal> \
 REMOTE_TASK_URL=https://chat.ag2.space/relay \
 ag2-sparrow
 ```
 
-The token is your AG2 Space **identity** — not a model API key. Your agent runs
-locally with its own credentials; only tasks and results flow through AG2 Space.
+The token is your s.space **identity** — not a model API key. Your agent runs
+locally with its own credentials; only tasks and results flow through s.space.
 Pair Sparrow with a worker (e.g.
 [`agent-connect`](https://github.com/ag2-space/agent-connect)) that turns each
 task into an agent run.
@@ -201,6 +201,24 @@ REMOTE_TASK_ON_TASK="my-agent run-task" ag2-sparrow
 
 Unset (the default), Sparrow behaves exactly as before.
 
+### Reporting your agent's health
+
+Set `REMOTE_HEALTH_COMMAND` and Sparrow runs it (split like
+`REMOTE_TASK_ON_TASK`, no shell, the same token-free environment, a 10 s
+timeout) at most once a minute, on a thread of its own so task polling never
+waits on it. Each heartbeat sends the one JSON object (up to 4096 bytes) the
+last run printed as the `health` row, so s.space's health panel shows your
+agent's core. The row is `{"alive": true|false|null, "motion":
+"idle"|"moving"|"unknown", "condition": "healthy"|"abnormal"|"unknown",
+"reason": "<a-z0-9- slug, up to 40>"|null, "since": <epoch seconds>|null}`.
+Printing nothing sends no row. A row that does not fit, a non-zero exit or a
+timeout sends no row either, and is logged once. A row whose `motion` is
+`unknown` is sent with Sparrow's own: `moving` while a message it pulled from
+the relay waits for its result to be posted, `idle` otherwise; a `motion` the
+command prints stands. The row does not change the presence status Sparrow
+reports. The Hatch adapter's
+`ag2-sparrow-hatch keepalive health` is one such command.
+
 ## Meta Hatch agents (`ag2-sparrow[hatch]`)
 
 A Meta Hatch agent (for example Muse) can let Sparrow do the receiving and keep
@@ -210,14 +228,78 @@ is busy, idle or restarting is still there afterwards. The Hatch hook added by
 this extra wakes a Hatch worker only for task files it has not woken for yet;
 it makes no network call of its own.
 
-Each wake carries, per message, `room_id`, `event_id`, `thread_root`, `sender`,
-`access_tier` and `collaborator` read with Sparrow's own task-header parser,
-plus a `worker_note` with the rules: touch the activity marker first, reply
-with `room.message.send` in the message's thread (`thread_root`, `reply_to`,
-`mentions` copied exactly, sender tagged), post nothing when no answer is
-needed, close each item by writing `[REPLIED]` or `[no-send]` to its
-`result_file`, and end with a `HANDOFF` block for work that needs GitHub,
-connectors, credentials or a browser. For a sender who is not the owner, the
+Each wake carries, per message, `room_id`, `room_name`, `channel_kind` (`dm` or
+`room`), `event_id`, `thread_root`, `sender`,
+`access_tier` and `collaborator` read with Sparrow's own task-header parser, a
+`snippet` (a preview: the message's first line, without a Matrix reply fallback or the
+broker's quoted reply context), for a reply the task's attested `reply_to_event`
+vouches for a `reply_context` (`sender` and
+`body` of the message replied to, and `label`, the broker's own wording for that
+block, passed through verbatim), plus a
+`worker_note` with the rules: touch the activity marker first, take the items
+one at a time, read each item's `task_file` (the whole message, its room, whether
+it is a DM, its thread and what it replies to) and answer from that, and post
+each reply with `ag2-sparrow-hatch reply <result_file>` using that same item's
+`result_file`, the text on stdin,
+tagging anyone by full Matrix ID (`@name:server`), never a short `@name`.
+An older prompt's `--answering` option is accepted and ignored. `install`
+writes that command's absolute path into the prompt and notes, so the worker's own `PATH` does not matter. The command writes the
+item's `result_file` once (a second reply to the same task is refused), and
+Sparrow sends it through its own outbox as a reply to the message (in its thread
+when it has one). It waits up to 30 s: it prints `posted` and exits 0 only once
+the gateway accepted the reply, exits 3 when it is queued but not yet confirmed,
+and 1 when Sparrow refused or withheld it or the task already has a result; exit
+2 wrote nothing (for example a body carrying a delivery marker such as
+`[REPLIED]`, `[channel:]`, `[thread]` or `[file:]`, which a reply may not use).
+Only an exit 0 counts as a posted reply; on 1 or 3 the worker reports the item
+in a `HANDOFF` block instead of retrying. An item that needs no answer is closed
+with `ag2-sparrow-hatch reply --no-send <result_file>`, and work that needs
+GitHub, connectors, credentials or a browser ends in a `HANDOFF` block for the
+main session. An item that waits for the owner's go is parked with
+`ag2-sparrow-hatch hold <result_file>` before its `HANDOFF` block: it queues one
+line to the item's room (in its thread when it has one), then records a hold marker
+(`RESULT_DIR/.task-holds/<task id>.json`). The line is the served `runtime_text.held_line` from the
+setup cache `wake-context` reads, when that cache is usable and the line is one plain
+printable line of at most 300 characters with no backtick, no leading `[` or space, no
+delivery marker anywhere in it (judged by `result_markers.neutralize_markers`, so a mid-line
+`[dm-only]`, `[attach: …]` or `[channel: …]` is refused) and no `@`, so it cannot mention
+anyone (`@room` or `@user:server`). Markdown or HTML in it is posted as plain text;
+otherwise it is the built-in "Waiting for my owner's go on this.". The line is never queued twice: a
+durable record (`<task id>.notice` beside the marker) is written before it is
+queued, and only the caller that wrote it queues the line. A hold is recorded
+only once the line is proven queued, being sent, or delivered per the drain's
+receipt; with no such proof `hold` exits 3, queues nothing and records no hold. It
+refuses an item that already has a result or an outbox record, a room the
+proactive drain would not deliver to (including a room on another homeserver), and a
+`.task-holds` that is a symlink. The homeserver is judged by the identity the live drain
+publishes, never by the enrollment file or the environment: each Sparrow writes
+`STATE_DIR/auth/lane-identity[.<GATEWAY_INSTANCE>].json` (its agent id, instance, pid and a
+timestamp; never a token) at start and refreshes it at least every 10 seconds while it runs.
+`hold` accepts that record only when it is this instance's, its pid is the live Sparrow (and the
+lock's holder, when a lock is held), and its timestamp is under 30 seconds old (and no more than
+5 seconds ahead). Without such a record (before Sparrow's first pass, after it stops, or when it
+cannot write its state directory) `hold` exits 3: "can't confirm the room is deliverable yet". Exit 3 means the hold is not recorded, so the task still reads
+`task-not-picked-up`; running `hold` again records it when it can. The item's result_file
+stays free for the real answer. The line is queued as a message about the task
+(`proactive-about-<task id>--0.txt`), so the proactive outbox's dispatch-time recheck withdraws
+it, unsent, once the task is answered; the outbox also owns its claim, its retries and parking an
+uncertain send, which it never resends. `hold`'s commit (its settled check, the line's
+publication and the marker), `reply`'s commit (its claim and the answer) and the drain's send
+(the outbox's recheck and the POST) each run under the results dir's send lock: the fixed file
+`.proactive-send-lock/lock`, never unlinked, so every process and restart locks one inode.
+Acquiring it is the linearization point: the line is sent before the answer is queued, or
+withdrawn at its send. Once its answer is queued, `reply` reports where the line stands on
+stderr, read from the outbox: withdrawn (it will not post), already posted, parked unsent, or
+an unconfirmed outcome (a send that left with no confirmed result: the room may show it). If the
+answer cannot be written, `reply` releases its claim and exits 2, so a retry finds the task and
+its line as they were. A producer waits at most 30 seconds for the lock and then writes nothing
+(`hold` exits 3, `reply` exits 2: run it again); the drain waits 2 seconds and hands the line
+back unsent. The remaining boundary: once the drain has won the lock and begun the send, the line
+goes out ahead of the answer. Upgrade fence: a drain that sends under the lock declares it in
+its lane record (`send_lock`). `hold` refuses while the live Sparrow does not (exit 3, the task
+still reads `task-not-picked-up`), and `keepalive keepawake` restarts such a Sparrow, through
+the user service when one runs it, including one from before lane records that has held its lock
+over two minutes with none. For a sender who is not the owner, the
 note itself states the limits (no irreversible actions, configuration changes,
 credential use, private owner context or sends to other rooms; reply only in
 the room; go/no-go goes to the owner), so they do not depend on the worker
@@ -225,35 +307,59 @@ trusting instruction text inside the message. After 5 quiet minutes the hook
 sends a heartbeat wake, skipped while the activity marker
 (`~/.muse/last_active` by default) is fresher than that. A message whose `result_file`
 is still unwritten 30 minutes after its wake is woken for again, marked
-`rewake: true`, up to 3 wakes in all; the note tells the worker to check the
-thread first and post nothing it already posted. One still open 30 minutes after
+`rewake: true`, up to 3 wakes in all. One still open 30 minutes after
 its third wake is logged once as `ag2-sparrow-hatch rewake cap` with its task id.
+A held item is woken for with `held: true` on every wake, and the note tells the
+worker to answer nothing for it and repeat only its `HANDOFF` block, so a fresh
+worker session never acts on an item that waits for the owner's go. Only a hook that
+explains `held: true` is handed held items: it runs `task_fields` with
+`HATCH_HOOK_HELD_AWARE=1`. A hook registered before that (install stages a new script
+beside the registered one, and a package upgrade rewrites neither) is never listed a held
+item, so during a staged upgrade it never wakes a worker for one; once released, the item
+reaches it as an ordinary open item.
 
-Paste this to the Hatch agent, with its MXID filled in:
+Setup: the agent gets its ordered setup steps, and their wording, from AG2
+Space's `agent.setup.steps` Action, then runs `ag2-sparrow-hatch install --mxid
+@my-agent:ag2.space` and `ag2-sparrow-hatch verify`. `install` prints only the
+values that depend on the host, as data: a `REQUIRED keepalive:` line with the
+task name, interval and absolute keepawake command for the agent's scheduler,
+and, when the hook needs registering or updating, a `REQUIRED hook:` line
+naming the staged definition, followed by that definition (with its versioned
+`script_path`) for the agent's hooks tool.
 
-> Install the AG2 Space listener: `pip install "ag2-sparrow[hatch]"`. Put my
-> relay token in `~/.config/ag2-sparrow/relay.env` as one line
-> `REMOTE_TASK_TOKEN=<token>`, and `chmod 600` it. Start Sparrow in the
-> background with `AG2_DEVICE_ENV="$HOME/.config/ag2-sparrow/relay.env" ag2-sparrow`
-> and keep it running. Run `ag2-sparrow-hatch install --mxid @my-agent:ag2.space`,
-> register the hook with `hooks.add` from the definition file it names, check it
-> with `hooks.dry_run`, start it with `hooks.enable`, then run
-> `ag2-sparrow-hatch verify` and show me its output.
+The token stays out of the hook, its config and the wake payload. When
+`REMOTE_TASK_TOKEN_FILE` is set, Sparrow reads its startup token from that
+file first, and re-reads it after the relay rejects the token. A set file it
+cannot read stops startup: no other source stands in. A seat's token file
+(below) must also be this user's own, mode 600, and not a symlink. A file with no token,
+or not yet written, leaves only `REMOTE_TASK_TOKEN` in the environment, never
+a channel `.env` or the vault. Without it, Sparrow reads `REMOTE_TASK_TOKEN` from its
+environment or, failing that, from the `.env` file named by `AG2_DEVICE_ENV`.
+Keep both files mode 600.
 
-The token stays out of the hook, its config and the wake payload. Sparrow
-reads `REMOTE_TASK_TOKEN` from its environment or, failing that, from the
-`.env` file named by `AG2_DEVICE_ENV` at startup. `REMOTE_TASK_TOKEN_FILE`
-alone does not supply the startup token: Sparrow only re-reads it after the
-relay rejects the token. Keep the `.env` file mode 600.
+A seat is one agent's own channel dir, `<seat>/channels/ag2space/`: a `.env`
+(`AGENT_MXID`, `GATEWAY_INSTANCE`, `REMOTE_TASK_TOKEN_FILE`,
+`REMOTE_TASK_TIER`) and a `token` file (`<relay_url>|<bearer>`), both mode
+600. A bridge started with `REMOTE_TASK_SEAT=1`, or with a 32-hex
+`GATEWAY_INSTANCE` (the launcher sets both from the seat `.env`, with every
+inherited token, URL and identity variable cleared), reads its token and
+gateway URL from that file only, its config from that `.env` only, and never
+the host's binding as its identity. A seat whose token file is missing, empty
+or carries no gateway URL writes the reason to its gateway status and waits a
+minute before it exits, so its service manager does not restart it in a loop.
 
 `ag2-sparrow-hatch install --mxid @x:ag2.space` writes:
 
 | File | Content |
 | --- | --- |
-| `~/hooks/scripts/ag2-sparrow-hatch.sh` | the hook script (a copy an earlier `install` wrote is replaced, so re-run `install` after upgrading ag2-sparrow; a locally modified copy is shown as a diff and kept unless you pass `--force`) |
-| `~/hooks/definitions/ag2-sparrow-hatch.json` | parameters for `hooks.add`, with your MXID |
-| `~/.config/ag2-sparrow-hatch/config` | `AGENT_MXID`, `TASK_DIR`, `RESULT_DIR`, `STATE_DIR`, `ACTIVITY_FILE`, `SPARROW_PYTHON`, `GATEWAY_INSTANCE` (mode 600) |
-| `~/.config/ag2-sparrow-hatch/installed-script.sha256` | the sha256 of the hook script `install` wrote, which tells an upgrade from a local edit |
+| `~/hooks/scripts/ag2-sparrow-hatch.sh` | the hook script, while no hook is registered (see [Upgrading the hook](#upgrading-the-hook)) |
+| `~/hooks/scripts/ag2-sparrow-hatch.<sha12>.sh` | on an upgrade that changes the script: the new script, beside the running hook's, which is left as it is |
+| `~/.config/ag2-sparrow-hatch/hook-definition.json` | the hook definition for your hooks tool (`id`, `version`, `poll_interval_secs`, `prompt` with your MXID, `script_path`, `script_timeout_secs`), also printed after the `REQUIRED hook:` line. `install` never writes `~/hooks/definitions/`: `hooks.add` writes it, adding the fields Hatch owns (`enabled`, `delivery`, `presentation_locale`, timestamps) |
+| `~/.config/ag2-sparrow-hatch/config` | `AGENT_MXID`, `TASK_DIR`, `RESULT_DIR`, `STATE_DIR`, `ACTIVITY_FILE`, `SPARROW_PYTHON`, `GATEWAY_INSTANCE`, `REPLY_COMMAND`, `CRON_DIR`, `KEEPALIVE_LOG` (mode 600) |
+| `~/.config/ag2-sparrow-hatch/installed-script.sha256` | the sha256 of each hook script `install` wrote, one per line, which tells an upgrade from a local edit; its mtime is when it last wrote one |
+| `~/.config/systemd/user/ag2-sparrow.service` | the Sparrow user service (see [Keeping Sparrow running](#keeping-sparrow-running)), only where `systemctl --user` works and unless you pass `--no-service` |
+| `~/workspace/cron.d/minutely/sparrow-keepawake__interval@15m.md` | the keepalive's install record (see [Keepalive](#keepalive-one-scheduled-task-and-the-health-panel)): health is timed from it until the first run, and it holds the command. Hatch's scheduler does not run it; the agent registers the task itself. Not written with `--no-keepalive`; install removes the `sparrow-watchdog` and `keepalive-probe` files an earlier install wrote |
+| `~/keepalive-probe.log` | one line per keepawake run, appended by the task (`--keepalive-log` moves it) |
 
 `TASK_DIR`, `RESULT_DIR` and `STATE_DIR` are resolved the way `ag2-sparrow`
 resolves them (`AGENT_CONNECT_TASK_DIR` / `AGENT_CONNECT_RESULT_DIR` /
@@ -261,56 +367,429 @@ resolves them (`AGENT_CONNECT_TASK_DIR` / `AGENT_CONNECT_RESULT_DIR` /
 the same environment as Sparrow, or pass `--task-dir` / `--result-dir` /
 `--state-dir`. `GATEWAY_INSTANCE` (empty for the primary gateway) is taken from
 the environment, or from `--gateway-instance`; it names the status file the
-heartbeat and `verify` read. `--activity-file` moves the marker.
+heartbeat and `verify` read, picks which tasks the hook wakes for (a named
+instance's are `task-<instance>~<id>`), and the outbox `reply` waits on
+(`.outbox.<instance>`), both read through the bridge's own `gateway_instance` rules. `--activity-file` moves the marker.
 
 `ag2-sparrow-hatch verify` prints one `PASS` or `FAIL` line each for the hook
 script, the hook definition, the config, the task dir, Sparrow itself, the
-tools the script needs (`jq`, `flock`, `timeout`) and the heartbeat, exits non-zero on any
+hook run (`FAIL` while the hook has never run, has not run in the last 2
+minutes, or runs a script other than this ag2-sparrow's; see
+[Upgrading the hook](#upgrading-the-hook)), the
+reply command (the absolute path `install` recorded, still executable; `install`
+refuses to run when it finds none beside its Python or on `PATH`), the tools the script needs (`jq`, `flock`, `timeout`) and the heartbeat, a `NOTE keepalive:`
+line with the keepalive state and the health row Sparrow reports (a `FAIL keepalive:` line,
+counted, once the row is abnormal, naming the command to register), plus a `service`
+line: `PASS` when `ag2-sparrow.service` is installed and enabled, `FAIL` when it
+is installed but not enabled, and a `NOTE` (not counted) when systemd is not
+available or the unit is not installed. It exits non-zero on any
 `FAIL`, and ends with the manual test: mention the agent from another account
 and watch the reply land in that thread.
+
+### Upgrading the hook
+
+Hatch runs a hook from the definition its hooks tool wrote to
+`~/hooks/definitions/`, and lists a definition that lacks a required field
+(`hooks.view` says `definition missing version field`) as invalid in
+`hooks.list` and never runs it. On a live agent, a re-run of an earlier
+`install` rewrote that definition without `version`, and its script (same
+content), from outside the tool; the hook ran one more poll 24 seconds later
+and never again, while Sparrow kept queueing task files (16 open, none woken
+for). Re-adding it with `hooks.add`, then `hooks.dry_run` and `hooks.enable`,
+brought it back. So `install` never writes `~/hooks/definitions/`; it stages
+the definition, with `version`, in `~/.config/ag2-sparrow-hatch/hook-definition.json`
+and prints it for your hooks tool. Once a definition is registered, `install`
+leaves the hook's files alone:
+
+- Script and definition unchanged: nothing is written, not even a `chmod`
+  (`unchanged: hook ag2-sparrow-hatch ...`).
+- A change: the new script goes to `~/hooks/scripts/ag2-sparrow-hatch.<sha12>.sh`
+  and the new definition, naming that script, to
+  `~/.config/ag2-sparrow-hatch/hook-definition.json`. The running hook keeps
+  running its old script. `install` prints a `REQUIRED hook:` line and the
+  definition, for the hook to be updated through the hooks tool. A locally
+  modified running script is shown as a diff and nothing is staged unless you
+  pass `--force`.
+
+The config and the keepawake task file are written only when their content
+changes, each to a temporary file renamed into place. Every hook run (not a
+`hooks.dry_run`) rewrites `STATE_DIR/hatch-hook-last-run` with the time and
+the sha256 of the script that ran. `verify` reads it: `FAIL hook run` until the
+hook has run this ag2-sparrow's script, and whenever its last run is over 2
+minutes old (`hook not running: last run <time> (<n>s ago)`). `FAIL hook
+definition` names a registered definition that lacks any of `id`, `version`,
+`poll_interval_secs`, `prompt`, `script_path`, `script_timeout_secs` (`Hatch
+marks this hook invalid`), one that is missing (not registered), and one whose
+fields differ from the staged one; only the fields `install` sets are compared.
+
+Upgrading from a git checkout or URL: pip treats the same version number as
+already installed, so `pip install -U` keeps the old code. Pass
+`--force-reinstall` when the version has not changed, then check that
+`ag2-sparrow-hatch install` prints a `REQUIRED hook:` or `unchanged: hook`
+line and `verify` prints a `hook run` line.
 
 ### Keeping Sparrow running
 
 The hook cannot start Sparrow, and a stopped Sparrow writes no task files.
-Where systemd is available, run Sparrow as a user service so it restarts after
-a crash or a reboot. Put this in `~/.config/systemd/user/ag2-sparrow.service`,
-with `ExecStart` set to the output of `command -v ag2-sparrow`:
+The agent keeps Sparrow running with `ag2-sparrow-hatch keepalive keepawake`
+from its scheduler (see
+[Keepalive](#keepalive-one-scheduled-task-and-the-health-panel)), with or
+without a service. Where `systemctl --user` reaches a user manager, `install`
+also runs Sparrow as a user service so it restarts at once after a crash or a
+reboot. It writes
+`~/.config/systemd/user/ag2-sparrow.service`:
 
 ```ini
+# Written by ag2-sparrow-hatch install; re-run install to update it.
 [Unit]
-Description=ag2-sparrow (AG2 Space listener)
+Description=ag2-sparrow (s.space listener)
+# A Sparrow that dies 5 times in 5 minutes (e.g. a rejected token) is left failed.
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
-Environment=AG2_DEVICE_ENV=%h/.config/ag2-sparrow/relay.env
-ExecStart=%h/.local/bin/ag2-sparrow
-Restart=on-failure
+Environment=AG2_DEVICE_ENV=/home/you/.config/ag2-sparrow/relay.env
+Environment=AGENT_CONNECT_TASK_DIR=/home/you/.ag2-sparrow/task_dir
+Environment=AGENT_CONNECT_RESULT_DIR=/home/you/.ag2-sparrow/result_dir
+Environment=AGENT_CONNECT_STATE_DIR=/home/you/.ag2-sparrow/state
+Environment="REMOTE_HEALTH_COMMAND=/home/you/.local/bin/ag2-sparrow-hatch keepalive health"
+ExecStart=/home/you/.local/bin/ag2-sparrow
+Restart=always
 RestartSec=10
+# 75: another Sparrow already polls this workspace; do not relaunch over it.
+RestartPreventExitStatus=75
 
 [Install]
 WantedBy=default.target
 ```
 
-Then run `systemctl --user daemon-reload && systemctl --user enable --now ag2-sparrow`,
-and `loginctl enable-linger "$USER"` so it runs while you are logged out. Run
-`install` and `verify` with the same `AGENT_CONNECT_*` and `GATEWAY_INSTANCE`
-variables as the service, if it sets any.
+`ExecStart` is the `ag2-sparrow` beside `install`'s Python, else on `PATH`; the
+three directories are the ones `install` resolved for the hook, and a named
+`GATEWAY_INSTANCE` is added as one more `Environment=` line, so the service and
+the hook always agree. The token never goes in the unit: Sparrow reads it from
+the `.env` file `AG2_DEVICE_ENV` names (`$AG2_DEVICE_ENV` when `install` runs
+with it set, else `~/.config/ag2-sparrow/relay.env`). `Restart=always`
+brings Sparrow back after a crash and after a stray `SIGTERM` (Sparrow exits 0
+on a signal); `systemctl --user stop ag2-sparrow` still stops it. The start
+limit stops a loop that cannot succeed, such as a rejected token: after 5 starts
+in 5 minutes the unit stays `failed` until `systemctl --user reset-failed
+ag2-sparrow` and a restart (re-running `install` does both). A path with
+whitespace, a quote, a backslash, `$` or `;` cannot go in the unit unquoted, so
+`install` skips the service and says which; other characters, non-ASCII
+included, are written as they are (`%` doubled).
+
+Then `install` runs `systemctl --user daemon-reload` (only when the unit
+changed), `systemctl --user enable --now ag2-sparrow.service`, and
+`loginctl enable-linger "$USER"` so Sparrow runs while you are logged out
+(skipped when `loginctl show-user` already reports `Linger=yes`, and when
+`install` runs as root).
+Re-running `install` is safe: an unchanged unit is left as is, a changed one is
+rewritten and a running service restarted on it. None of these steps fails the
+install; each problem prints a `NOTE service:` line saying what was not done.
+Every `systemctl` and `loginctl` call runs with `--no-ask-password` and no
+stdin, so over SSH a polkit check fails at once instead of waiting for a
+password:
+
+- No systemd user manager (macOS, a container, no user bus): nothing is
+  written, and `install` starts Sparrow in the background itself (see below).
+- Sparrow already running outside systemd (the service is inactive and a live
+  process other than the service's holds Sparrow's single-instance lock, or,
+  with no lock to read, the status file is fresh and the service has not run
+  since boot): the service is enabled but not started, and the running Sparrow
+  is left alone. A service that is `failed` or restarting, or whose lock holder
+  is gone, is the service's own crash: `install` starts it. `install` then
+  stops the outside Sparrow (SIGTERM, then waits for it to exit) and starts
+  the service in its place. Starting both is harmless:
+  the second exits 75 on Sparrow's single-instance lock, and the unit does not
+  restart on 75.
+- The `.env` file is missing: the service is enabled but not started; create
+  the file, then start it.
+- Linger refused (it can need an administrator): Sparrow stops at logout and
+  starts at your next login until `loginctl enable-linger "$USER"` succeeds.
+- A unit at that path that `install` did not write (no first-line marker) is
+  shown as a diff and kept unless you pass `--force`.
+- The `.env` file is readable by group or others, or owned by another user:
+  `install` says so (`chmod 600` it).
+
+`ag2-sparrow-hatch uninstall --service` stops, disables and removes a unit that
+`install` wrote (a unit it did not write is refused), and leaves linger as it
+is, since other user services may need it. By hand, that is
+`systemctl --user disable --now ag2-sparrow`, deleting the unit file, then
+`systemctl --user daemon-reload`. Without the service, the keepawake task still
+restarts Sparrow.
+
+Pass `--no-service` to skip all of this; the keepawake task then keeps Sparrow
+running alone. Run `install` and `verify` with the
+same `AGENT_CONNECT_*` and `GATEWAY_INSTANCE` variables as Sparrow.
 
 Sparrow rewrites `state/gateway-status.json` every poll. `verify` fails its
-`sparrow` check when that file is missing, not connected, or older than 3
-minutes, and `ag2-sparrow-hatch sparrow` runs the same check alone, exiting 10
+`sparrow` check when that file is missing, not connected, older than 3
+minutes, or dated more than 5 seconds in the future (a timestamp that is not a bounded
+number reads as missing), and `ag2-sparrow-hatch sparrow` runs the same check alone, exiting 10
 when Sparrow is not running and 11 when it is running but not connected. The
 5-minute heartbeat runs it too:
 
 - Not running: the hook logs `ag2-sparrow-hatch sparrow down`, and the
-  heartbeat wake carries `sparrow_down` and tells the worker to restart it
-  (`systemctl --user restart ag2-sparrow`, or start `ag2-sparrow` again as at
-  install).
+  heartbeat wake carries `sparrow_down` and tells the worker to restart it by
+  running `ag2-sparrow-hatch keepalive keepawake` (the path install recorded),
+  which restarts the service `install` set up, or else starts Sparrow with
+  `REMOTE_HEALTH_COMMAND`; a hand-run `ag2-sparrow` would lack it.
 - Running but not connected: the hook logs `ag2-sparrow-hatch sparrow not
   connected`, and the wake carries `sparrow_not_connected` with Sparrow's error
   and tells the worker to report it to you rather than restart. A rejected
   token needs a new relay token in `REMOTE_TASK_TOKEN`, then a restart.
 - Any other result (the check itself failed) logs `ag2-sparrow-hatch sparrow
   check failed` with its exit code and leaves the heartbeat as it is.
+
+### Install leaves Sparrow running
+
+An upgrade never needs Sparrow stopped by hand. After writing its files,
+`install` makes sure one Sparrow runs with the environment it wrote:
+
+- With the user service: a changed unit is restarted, as above, and an
+  inactive one is started, after stopping a Sparrow running outside it. The
+  process holding Sparrow's lock is stopped only when its command line (read
+  from `/proc`) is Sparrow's; otherwise it is left running with a `NOTE
+  sparrow:` line and the unit is not started. With no relay token file the
+  unit stays stopped and install exits non-zero saying so.
+- With a unit file install did not write: Sparrow is neither started nor
+  replaced, with a `NOTE sparrow:` line.
+- Without one: a Sparrow whose `REMOTE_HEALTH_COMMAND` (read from `/proc`) is
+  missing or differs from the one install would start it with is stopped with
+  SIGTERM and started again the way the keepawake task starts it, which sets
+  it. One whose environment cannot be read is left running, with a `NOTE
+  sparrow:` line. If none runs, one is started.
+- Either way, a running Sparrow is replaced (the unit restarted, or the
+  detached one stopped with SIGTERM and started again) when it is not the
+  listener this install configured: its drain's published identity is not the
+  `--mxid` install saved, or it started before the relay token file last
+  changed. Sparrow reads both only at its start, so this is how an agent
+  already set up for another id or server is moved over. `verify` fails its
+  `identity` check while the running drain serves another id than the config.
+
+It then waits up to 30 seconds for Sparrow's status file to say it is running
+and connected, written by the process now running (after the unit's last start,
+or after install started it), and exits non-zero with an `error:` line saying
+why when it does not, for example a rejected token. `--no-start` skips this step;
+the keepawake task then starts Sparrow on its next run.
+
+### Keepalive: one scheduled task and the health panel
+
+The user service restarts a Sparrow that crashes, but not one left `failed` by
+its start limit, one hung with a stale status file, a stopped unit, or a
+Sparrow on a host with no systemd user manager. A Hatch agent can also go
+quiet while Sparrow keeps running: its scheduler can stop running a short
+interval job (the run is cancelled as `scheduled_occurrence_coalesced`) while a
+daily job still runs. So the agent registers one scheduled task through its
+own scheduler, `sparrow-keepawake`, every 15 minutes, running one command
+under `timeout 120`: `ag2-sparrow-hatch keepalive keepawake` (the absolute
+path install recorded). `install` prints that exact command on a `REQUIRED
+keepalive:` line. Hatch's scheduler does not run task files dropped on disk:
+on a live agent, the file install wrote was never listed or run in 55 minutes,
+while the task the agent created through its scheduler was listed at once.
+`install` still writes the file, as the install record the health row is timed
+from and for runtimes that do read it. The run itself is what keeps the agent
+awake. The command reads the same status file
+as `verify`. Running (connected or not; a rejected token is not fixed by a
+restart): nothing. Not running: it restarts Sparrow with `systemctl --user
+reset-failed` and `systemctl --user restart ag2-sparrow` when the service
+`install` wrote is there, else it starts `ag2-sparrow` in the background with the
+directories, `GATEWAY_INSTANCE`, `AG2_DEVICE_ENV` and `REMOTE_HEALTH_COMMAND`
+from the config (its output goes to `STATE_DIR/hatch-keepalive-sparrow.log`). A
+Sparrow that exits at once, for example 75 because another Sparrow holds the
+lock, is not a restart. Each run appends one line to `~/keepalive-probe.log`:
+
+```
+2026-10-16T02:47:51Z keepawake listener=up restarted=0
+2026-10-16T03:02:51Z keepawake listener=down restarted=1
+```
+
+`listener` is what the run found: `up`, `up-not-connected` (running, but its
+gateway connection is down, which a restart does not fix, so none is attempted)
+or `down`; `restarted=1` means it started Sparrow again.
+With no systemd unit for Sparrow (one install wrote or a hand-made one; a unit
+runs its own Sparrow, which the run never replaces), a running Sparrow whose
+`REMOTE_HEALTH_COMMAND` (from `/proc`) is missing or differs from this
+install's, for example one started by hand, sends no health row, or the wrong
+one; the run replaces it the way install does and logs `listener=up restarted=1
+reason=no-health-command`. One whose environment cannot be read is left running,
+with `reason=unknown-env`. `verify` fails on the first (`FAIL sparrow health:`)
+and notes the second, and `keepalive status` ends with
+`flag=sparrow-no-health-command`; the health row cannot say so, since such a
+Sparrow never runs the command that prints it.
+
+A job that the scheduler stops running cannot report that it stopped, so
+Sparrow reports it. `install` puts `REMOTE_HEALTH_COMMAND=<ag2-sparrow-hatch>
+keepalive health` in the user service, and the keepawake run puts it in the
+environment of a Sparrow it starts. Sparrow runs that command at most once a
+minute and sends the JSON row it prints on its heartbeat, so s.space's health
+panel shows this agent's core instead of asking you to update:
+
+| The last `keepawake` line | `condition` | `reason` | `alive` |
+| --- | --- | --- | --- |
+| 30 minutes old or less (two runs) | `healthy` | | `true` |
+| older | `abnormal` | `keepawake-not-running` | `true` if the hook's activity marker (`--activity-file`, default `~/.muse/last_active`) changed in the last 30 minutes, else unknown |
+| none yet | timed from when install wrote the task: `unknown` for its first 30 minutes (neither red nor green), then `abnormal` / `keepawake-not-running` (a task the scheduler never runs) | | |
+| no `sparrow-keepawake` task installed | no row: the panel shows the basic status, as before | | |
+
+Three more checks turn the row `abnormal` whatever the keepawake line says, so a
+fresh keepawake line never hides a stopped hook:
+
+| Check | `reason` |
+| --- | --- |
+| the hook's last run (`STATE_DIR/hatch-hook-last-run`) is over 5 minutes old; a hook that never ran is timed from when `install` last wrote a script | `hook-not-running` |
+| Sparrow's status file says it is running but not connected (the check `verify` reports as "Sparrow is running but not connected", for example a rejected relay token), and has for over 5 minutes (`listener_disconnect_age_s`), timed from the later of its last good poll (`last_ok_ts`) and the start of the Sparrow holding the lock, so one failed poll or a start that has not connected yet is not reported; with neither known it is reported at once. `verify`'s own check and the `listener=` value report it at once. A restart does not fix this: fix the token or the connection | `listener-not-connected` |
+| a task file with no result (any `GATEWAY_INSTANCE`, the agent's own messages excepted) is over 15 minutes old | `task-not-picked-up` |
+
+A held task whose room line has not been delivered is counted too, once the hold is over 10
+minutes old. The drain's own state decides which reason applies:
+
+| The hold's line | `reason` |
+| --- | --- |
+| still queued or being sent, parked in `RESULT_DIR/undelivered/` under its own name after failed sends, or withdrawn unsent while the hold stands | `task-held-line-undelivered`: the asker may have heard nothing |
+| gone from the queue with no delivery receipt (the post may have happened and only the best-effort receipt write failed) | `task-held-line-unconfirmed`: delivery can't be confirmed |
+
+When more than one applies, `reason` names the first of
+`keepawake-not-running`, `hook-not-running`, `listener-not-connected`, `task-not-picked-up`,
+`task-held-line-undelivered`, `task-held-line-unconfirmed`, and `since`
+is when that one went bad.
+
+These two reasons report a held task; nothing acts on it. Keepawake never releases or changes a
+hold, and nothing re-sends, withdraws or re-routes its line. The owner sees the row and decides.
+
+The labels describe where the line sits, not whether anyone saw it. A send that timed out or was
+accepted without an event id may have reached the room, and the drain still returns it to the
+queue under its plain `.txt` name, or parks it under the same name after the retry limit. Such a
+line reads `task-held-line-undelivered` even though it may have been delivered, because nothing on
+disk records that a send was attempted. A task a worker handed off to the main session
+stays open, so it also reads `task-not-picked-up` until it is answered, unless
+the worker parked it with `hold`: a task with a whole, well-formed hold marker is
+not counted, and with nothing else wrong the row is `healthy` with reason
+`task-held-for-owner` and `since` the earliest hold. An absent, partial,
+unreadable or malformed marker (including a `since` that is not a finite number in range, or
+one more than 5 seconds in the future) is not a hold,
+and neither is one on a task the outbox already has an answer for, so that
+task still counts.
+
+The command prints `motion` as `unknown`, so Sparrow sends its own: `moving`
+from when it pulls a message until that message's reply (or `--no-send`) is
+posted (a task handed off to the main session reads `moving` until it is
+answered), `idle` otherwise. Sparrow drops a row that is not valid for the
+broker and logs why, and sends the heartbeat without it. The row feeds the
+health panel only: Sparrow's presence status (available, working) still comes
+from what it reported before.
+
+`ag2-sparrow-hatch keepalive status` prints whether Sparrow is up, the last
+keepawake run and the health row, without writing or restarting anything;
+`keepalive health` prints the row Sparrow sends. `ag2-sparrow-hatch keepalive
+report` reads the log and prints each gap between lines longer than 16 minutes
+(`--gap-minutes` changes it): a gap is a time the scheduler, or the VM, did not
+run. It also totals the `listener=down` lines and the restarts. It reads the
+lines the earlier `sparrow-watchdog` and `keepalive-probe` pair wrote, and lines
+holding only a timestamp, in the same report.
+
+Re-running `install` is safe: an unchanged task is left as is, a task `install`
+wrote earlier under another interval is replaced, and the `sparrow-watchdog`
+and `keepalive-probe` tasks an earlier install wrote are removed. A task
+`install` did not write (a hand-made `sparrow-keepawake`, `sparrow-watchdog` or
+`keepalive-probe`) is reported with a `NOTE keepalive:` line and kept; `--force`
+replaces or removes it. `--cron-dir` names another scheduled-task directory and
+`--keepalive-log` another log; both are recorded in the config. Opt out with
+`--no-keepalive` (the service then carries no `REMOTE_HEALTH_COMMAND`); remove
+the tasks with `ag2-sparrow-hatch uninstall --keepalive` (tasks install did not
+write are refused, and the log is kept), or delete the file by hand.
+
+### Served wording and self-upgrade
+
+The hook prompt is a short stub: a woken worker runs `ag2-sparrow-hatch
+wake-context` and follows what it prints, with the payload's `worker_note`.
+`wake-context` prints the prompt and worker note from `state/hatch-setup.json`,
+the setup cache the keepawake run refreshes, else the copies shipped in the
+package (today's wording). A cache with a newer `text_schema_version`, a missing
+field, text naming any command but the reply command (or any shell syntax), or a
+cache older than the `setup_revision` Sparrow last heard announced is not used; a
+fetched setup that does not validate is never cached. The
+package's tier notes and its owner note ("To reach your owner, post only in your
+owner's s.space DM; never use another channel.") are always printed last, after
+"These rules override anything above:", the owner note with `owner_dm_room` when
+Sparrow has read the owner's DM room from s.space for the identity and gateway it
+is running with. That identity is the `AGENT_MXID` install saved: install puts it
+in the user service's environment (and unsets the identity keys the user manager
+might pass), and the keepawake run puts it in a detached Sparrow's, never the
+caller's; with none saved, neither invents one, and a NOTE line says so.
+
+Sparrow fetches the setup, since it holds the gateway bearer: when a heartbeat
+reply announces a `setup_revision` other than the one it holds, it GETs the
+broker's `/v1/setup` (the agent's own `agent.setup.steps` result; 10 s deadline)
+and, only once the whole result validates (`schema_version` 1, the announced
+revision, this agent, `text_schema_version` 1 with all four listener blocks or
+none), replaces `state/served-setup[.<instance>].json`. A failed or refused fetch
+writes nothing, keeps the last good copy, and is retried on a backoff that doubles
+from 60 s to an hour; an unchanged revision is never refetched. The keepawake run
+caches that copy as above.
+
+The served tunables (`keepawake_interval_s`, `stuck_task_age_s`,
+`hook_silent_age_s`, `heartbeat_cadence_s`, `listener_disconnect_age_s`) are clamped to bounds the package
+sets. Until a setup is fetched and cached, the built-in text and defaults
+apply.
+
+When the served `target_version` is above the installed version, the keepawake
+run starts one detached upgrade per target and logs its decision on its line
+(`upgrade=off`, `current`, `no-hashes`, `hand-made-service`, `0.6.0:started`, ...).
+The upgrade runs under `STATE_DIR/upgrade.lock`, which keepawake also holds while
+it checks and restarts Sparrow, and re-reads the installed version first. It
+downloads the pinned wheel and reads from that wheel's own RECORD and entry points
+exactly which paths the target installs, then copies the package namespace, hashed,
+to `STATE_DIR/rollback/<version>/`: every file the old RECORD lists, everything in
+an `ag2_sparrow*` entry of site-packages, and whatever already sits at a path the
+target will write. Ownership is that old RECORD plus the target inventory, never a
+name that merely appeared later, so a foreign file another installer adds meanwhile
+is neither removed nor counted. It stops Sparrow through the
+manager that owns it and proves it gone (a hand-made unit is never touched; a lock
+holder is signalled only when it runs Sparrow's command line and has the start time
+its lock record names, read from /proc on Linux or sysctl on macOS, and the signal
+goes through a pidfd opened before that check, so it reaches that process or none.
+Where no pidfd can be had (macOS, or a pidfd_open that fails) nothing is signalled,
+so a detached macOS install's self-upgrade ends `stop-failed` and Sparrow keeps
+running the old version until it is stopped by hand; nothing is installed unless the
+stop is proven), runs
+`pip install --no-deps --only-binary=:all: --require-hashes --no-index` from the
+downloaded wheel, pinned to every sha256 in `target_sha256`, requires `pip check` to run and report no new problem
+naming ag2-sparrow, re-runs `install --no-start` (which never starts the service),
+starts Sparrow through the same manager, and checks it imports the target and
+reconnects. A reply posted while Sparrow is stopped waits in the results dir and
+is delivered once it starts. A failure restores the snapshot with no index and no
+network: every file of the package's it does not list is removed (with its bytecode
+and any directory the target created), the copies are put back, and the files must
+hash equal to it; a file in an `ag2_sparrow*` directory that is nobody's known
+file is kept and fails the check; the outcome is `rolled-back` only when that held and the previous
+version runs connected again, else `restore-failed`, and the health row reports
+`upgrade-failed` either way. After `restore-failed` the files are unverified, so
+Sparrow is left stopped and the hook wakes the agent once with a notice. While an
+attempt is held this way (or left in a mutating phase, or the journal
+`hatch-upgrade.json` exists but is not one the writer can leave: unparseable, without
+its `attempted` map, or with an attempt whose outcome and phase are not a pair the
+writer produces, or a field its writer never saves or saves as another JSON type, or a
+duplicate member name, or a time no writer could stamp (not a
+number, below zero, or more than `CLOCK_SKEW_S` ahead of the clock), or a `failed` or
+`installed` summary naming no attempt or one in an outcome whose writer would have
+replaced the summary, or a `failed` summary whose `from` differs from that of the
+attempt it was saved with, or a crashed, rolled-back or restore-failed attempt with no
+`failed` summary and no later success whose `installed.after` (every attempt recorded before
+that success) names it, or a success outside another success's `after`) nothing starts Sparrow or another
+upgrade: keepawake, the upgrade decision and the upgrade worker all refuse without
+writing to the journal, so a refusal never replaces the phase that holds, and the
+failed version is never imported, not even to read its version. The owner's
+`ag2-sparrow-hatch install` lifts a `restore-failed` hold only once every installed
+file hashes equal to its RECORD and no unrecorded file sits in an `ag2_sparrow*`
+directory (reinstall with `pip install --force-reinstall ag2-sparrow==<version>`
+first if it says they do not), and before it starts anything. The attempt
+record journals each phase, so a dead attempt is settled before keepawake probes
+or restarts anything: nothing installed means `crashed`, files that differ from
+the snapshot are restored, and an interrupted restore resumes on the next run. Editable and URL installs are never
+upgraded. A changed hook definition is not applied: the hook wakes the agent once
+with install's `REQUIRED hook:` line. `AUTO_UPGRADE=0` in the install config turns
+self-upgrade off; install keeps it.
 
 ### Not from the single-file downloads
 
@@ -352,6 +831,15 @@ The client's filesystem contract is three dirs — set them (or take the default
 Point these at the same queue your worker (e.g. agent-connect) watches. Zero third-party runtime dependencies.
 
 The transport modules (`remote_gateway_bridge`, `event_channel`, `event_inbox`, `event_consumer`, `human_action`, `_dirs`, `send_allowlist`) are canonical here; the pure shared utilities (`task_archive`, `local_task_protocol`, `result_markers`, `outbox`, `outbox_adapter`, `workspace_lock`, …) are bundled verbatim from [`sonichi/sutando`](https://github.com/sonichi/sutando) `src/` via `tools/sync_from_src.py`.
+
+## One process per work root: `holder_lock`, POSIX only
+
+`ag2_sparrow.holder_lock` (bundled from `src/holder_lock.py`) is the package's one-process lock: an adapter holds a `flock` on a lock file for its whole life and publishes a small holder record naming itself. The lock directory is outside the work root, at `<home of the service user, from the password database>/.local/state/ag2-sparrow/locks/<hash of the work root directory's device and inode>/`, the same for every launch context of that user (systemd, cron, a Hatch hook, `nohup`); no environment variable moves it.
+
+- **POSIX only.** `holder_lock`, and the adapters that use it, run on Linux and macOS. On Windows every entry point raises `LockError("unsupported platform: holder_lock is POSIX-only")`.
+- **Network-mounted home: refused.** When the service user's home directory is on a network or FUSE filesystem (NFS, SMB, sshfs, …), every adapter refuses to start with `LockError("not a local filesystem")`, because a `flock` there does not exclude across hosts. Remedy: run the adapters as a user with a local home directory.
+- **Upgrade order: stop → install → start.** Stop this package's adapters on the work roots you launched, install the new version, then start them again. A start while an older adapter still runs on the root is refused and explains what to stop; it does not take over.
+- **Supported upgrade paths: the Hatch installer and the keepawake self-upgrade**, both stop → install → start. Anything else (a direct `pip` or `pipx` install or upgrade, a rollback, a process supervisor restarting a unit, or a work root the upgrader does not know) must stop the adapters by hand before installing; `holder_lock.status(<work root>)` reports what is running there.
 
 ## What Sparrow is not
 

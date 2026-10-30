@@ -375,7 +375,8 @@ def behavioral() -> list:
             fails.append("an id's record counts only if it holds the body the id was issued to")
         live = guard.withheld_review_artifact(state, "task-ledger", "B body")
         record = json.loads(live.read_text())
-        if not guard.update_record(live, dict(record, status="kept_private")):
+        if not guard.update_record(live, dict(record, status="kept_private"),
+                                   expect=guard.record_version(record)):
             fails.append("an update of a live record is written")
         if not guard.archive_record(live) or live.exists() or not (live.parent / "archive" / live.name).exists():
             fails.append("a resolved record moves into archive/ under the ledger lock")
@@ -384,7 +385,8 @@ def behavioral() -> list:
         if guard.archive_record(live):
             fails.append("archiving a record that is gone reports failure")
         reviewed = guard.withheld_review_artifact(state, "task-ledger", "B body")
-        if guard.update_record(reviewed, {"withheld_body": "B body", "status": "x"}):
+        if guard.update_record(reviewed, {"withheld_body": "B body", "status": "x"},
+                               expect=guard.record_version(json.loads(reviewed.read_text()))):
             fails.append("an archived decision is immutable: no update writes it")
         twin = guard.withheld_review_path(state, "task-twin")
         guard._reserve(twin, guard._body_digest("T body"))
@@ -401,7 +403,8 @@ def behavioral() -> list:
                 fails.append("the archive move itself never replaces a decision")
         finally:
             guard._owns_its_id = owns
-        if guard.update_record(twin, {"withheld_body": "other body"}):
+        if guard.update_record(twin, {"withheld_body": "other body"},
+                               expect=guard.record_version(json.loads(twin.read_text()))):
             fails.append("an update never changes the body a record holds")
         listing = state / "listing" / guard.WITHHELD_RESULT_DIR
         acted, frozen = guard.actionable_records(listing)
@@ -431,7 +434,7 @@ def behavioral() -> list:
         if frozen or not blocker.exists() or [p.name for p, _r in acted] != ["wr_own.json"]:
             fails.append("a record that cannot be frozen still never acts")
         gone = guard.withheld_review_path(state, "task-gone")
-        if guard.update_record(gone, {"withheld_body": "x"}) or gone.exists():
+        if guard.update_record(gone, {"withheld_body": "x"}, expect=guard.record_version({})) or gone.exists():
             fails.append("an update never recreates a record that is gone or archived")
     return fails
 
@@ -457,8 +460,8 @@ def structural() -> list:
     # An unknown tier must be re-derived from the durable task file: the
     # in-memory tier map is not restored on restart.
     window = bridge[max(0, call - 800):markers] if call > 0 else ""
-    if "_resolve_task_tier" not in window:
-        fails.append("an unknown tier must be resolved from the task file before guarding")
+    if "resolve_route_tier(" not in window:
+        fails.append("an unknown tier must be resolved by the shared resolve_route_tier before guarding")
 
     # One implementation: consumers import the policy, never restate it.
     for name, src, label in ((BRIDGE.name, bridge, "bridge"),):

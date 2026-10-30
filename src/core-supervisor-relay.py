@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import glob
 import json
 import os
 import platform
@@ -59,7 +60,7 @@ UNREADABLE_SIGNAL = {
 }
 # Gates the monitor answered by itself but the owner should still hear about:
 # the core changed something (its model) without anyone asking.
-SOFT_NOTICE_KINDS = {"fable-limit"}
+SOFT_NOTICE_KINDS = {"fable-limit", "fable-limit-refused"}
 
 
 def _soft_notice(signal: dict):
@@ -72,10 +73,10 @@ def _soft_notice(signal: dict):
 
 def _sig_hash(signal: dict) -> str:
     """Stable hash of the escalation-relevant fields (state + prompt); a soft
-    notice hashes its own record, so it fires once however the state moves on."""
+    notice hashes its record's episode (else its time), so a re-typed switch is one notice."""
     aa = _soft_notice(signal)
     if aa and signal.get("state") not in HARD_ESCALATE:
-        key = f"auto\x00{aa.get('kind')}\x00{aa.get('at')}"
+        key = f"auto\x00{aa.get('kind')}\x00{aa.get('episode', aa.get('at'))}"
     else:
         key = f"{signal.get('state')}\x00{signal.get('prompt') or ''}"
     return hashlib.sha1(key.encode()).hexdigest()
@@ -122,7 +123,7 @@ def _is_refused_limit(signal: dict) -> bool:
             and bool(_REFUSED_LIMIT.search(signal.get("prompt") or "")))
 
 
-_RESET_AT = re.compile(r"resets?\s+(?:at\s+)?(\d{1,2}(?::\d{2})?\s*[ap]m)", re.I)
+_RESET_AT = re.compile(r"resets?\s+(?:at\s+)?((?:[A-Z][a-z]{2}\s+\d{1,2}\s+at\s+)?\d{1,2}(?::\d{2})?\s*[ap]m)", re.I)
 
 
 def _limit_remedy(signal: dict) -> str:
@@ -206,6 +207,12 @@ def compose_message(signal: dict, surface: str = "") -> str:
     """The owner-facing 'action needed' line: what's stuck + a prompt excerpt. `surface` is
     the channel it goes to, which decides whether a choice card can be named."""
     aa = _soft_notice(signal)
+    if aa and signal.get("state") not in HARD_ESCALATE and aa.get("kind") == "fable-limit-refused":
+        who = f"worker {signal['seat']}" if signal.get("seat") else "the core"
+        return (f"ℹ️ Fable weekly limit reached — {who} had a turn refused, so its monitor typed"
+                " `/model opus`, and types `continue` once the pane is idle with an empty composer."
+                " Whether the switch took is not checked: if its terminal still shows the Fable"
+                " refusal, it did not. /model there picks a model; /usage-credits keeps Fable on credits.")
     if aa and signal.get("state") not in HARD_ESCALATE:
         return ("ℹ️ Fable weekly limit reached — the core pressed Enter on the focused"
                 " \"Switch to <fallback> and continue\" of Claude Code's limit dialog, which"
@@ -236,7 +243,7 @@ def compose_message(signal: dict, surface: str = "") -> str:
     if kind == "turn-rejected":
         msg += (" — the core sits at its idle prompt but refuses every turn it is sent; each"
                 " ends in that line, so nothing queued for it runs")
-    if kind == "session-limit" or _is_refused_limit(signal):
+    if kind in ("session-limit", "usage-limit") or _is_refused_limit(signal):
         msg += _limit_remedy(signal)
     elif signal.get("kind") == "fable-limit-unfocused":
         msg += (" — Claude Code's Fable weekly-limit dialog is up but the focused option is"
@@ -285,9 +292,11 @@ def compose_message(signal: dict, surface: str = "") -> str:
 def _macos_notify(message: str) -> bool:  # pragma: no cover - external I/O (osascript)
     """True only when osascript ran and exited 0."""
     try:
+        script = ("on run argv\n"
+                  "display notification (item 1 of argv) with title (item 2 of argv)\n"
+                  "end run")
         r = subprocess.run(
-            ["osascript", "-e",
-             f'display notification {json.dumps(message)} with title "Sutando · Agent Shepherd"'],
+            ["osascript", "-e", script, "--", message, "Sutando · Agent Shepherd"],
             capture_output=True, timeout=8)
         return r.returncode == 0
     except Exception:
@@ -365,14 +374,15 @@ def run_cycle(signal, state_file, *, macos=True, source="", channel="", dry_run=
     msg = compose_message(signal, surface=source)
     if dry_run:
         return msg
-    macos_ok = bool(_macos_notify(msg)) if macos else False
-    # Debounce only on a confirmed delivery: the selected channel when there is
-    # one (macOS alone must not suppress it), else the macOS notification.
+    # The app pops its own notification for a channel message the gateway accepted (2xx), so
+    # macOS is the fallback only. Debounce on that send; macOS alone must not suppress it.
     if source and channel:
         delivered = _channel_notify(msg, source, channel, extra=alert_content(signal))
+        if not delivered and macos:
+            _macos_notify(msg)
         reason = "channel send failed"
     else:
-        delivered = macos_ok
+        delivered = bool(_macos_notify(msg)) if macos else False
         reason = "no route and macOS " + ("notification failed" if macos else "disabled")
     if delivered:
         _save_last_hash(state_file, new_hash)
@@ -493,6 +503,28 @@ def resolve_active_target(activity_path):
     return "", ""
 
 
+def relay_seat_notices(core_signal, state_file, **kw):
+    """Soft notices from the pool seats' signals beside the core's. A seat's hard gates
+    already reach the owner as its own HITL card, so only what it answered itself is sent.
+    A sibling counts as a seat only when its signal names one (`--seat`), never by filename."""
+    if os.path.basename(core_signal) != "core-supervisor.json":
+        return []
+    out = []
+    for path in sorted(glob.glob(os.path.join(os.path.dirname(core_signal), "core-supervisor.*.json"))):
+        seat = os.path.basename(path)[len("core-supervisor."):-len(".json")]
+        try:
+            with open(path) as f:
+                signal = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if not isinstance(signal, dict) or not signal.get("seat") or not _soft_notice(signal):
+            continue
+        msg = run_cycle(signal, f"{state_file}.{seat}" if state_file else "", **kw)
+        if msg:
+            out.append(("DRY-RUN " if kw.get("dry_run") else "escalated: ") + msg)
+    return out
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Escalate a hard-blocked core to the owner.")
     ap.add_argument("--signal", required=True, help="path to core-supervisor.json")
@@ -504,6 +536,8 @@ def main(argv=None):
                          "active channel when --notify-source/--notify-channel aren't given")
     ap.add_argument("--no-macos", action="store_true", help="suppress the macOS notification")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--no-seats", action="store_true",
+                    help="skip the pool seats' core-supervisor.<seat>.json beside --signal")
     a = ap.parse_args(argv)
 
     # Explicit --notify-* wins; else auto-resolve the owner's active channel.
@@ -527,6 +561,10 @@ def main(argv=None):
     if not isinstance(signal, dict):
         signal = dict(UNREADABLE_SIGNAL)
 
+    if not a.no_seats:
+        for line in relay_seat_notices(a.signal, a.state_file, macos=not a.no_macos,
+                                       source=source, channel=channel, dry_run=a.dry_run):
+            print(line)
     outcome = {}
     msg = run_cycle(signal, a.state_file, macos=not a.no_macos,
                     source=source, channel=channel, dry_run=a.dry_run, outcome=outcome)

@@ -24,6 +24,11 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from _helpers.hermetic_env import hermetic_env, isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 from voice_room_membership import CHECK_DIR_NAME, REQUEST_SUFFIX, VERDICT_SUFFIX  # noqa: E402
@@ -125,7 +130,7 @@ ok.write_text(f"[channel: {OK_ROOM}]\nverified room body")
 (cdir / f"k-forged{REQUEST_SUFFIX}").write_text(json.dumps({"room_id": FORGED_ROOM, "requested_at": time.time()}))
 (cdir / f"k-ok{REQUEST_SUFFIX}").write_text(json.dumps({"room_id": OK_ROOM, "requested_at": time.time()}))
 
-env = dict(os.environ)
+env = hermetic_env()
 env.update({"SUTANDO_TEST_MODE": "1", "SUTANDO_WORKSPACE": tmp,
             "REMOTE_TASK_URL": f"http://127.0.0.1:{port}",
             "REMOTE_TASK_TOKEN": "testtoken",

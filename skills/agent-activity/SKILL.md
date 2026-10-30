@@ -49,7 +49,7 @@ python3 $S/activity.py done "the drawer is one rolling line" --task-id task-…
 
 Prefer `--task-file <workspace>/tasks/task-….txt`: it fills the task id, `from`, `text` and the room
 from the task's own headers, so a row is always tagged with the room the message came from. Without
-it, `--room` defaults to the room of the owner's latest AG2 Space message (`state/last-owner-activity.json`).
+it, `--room` defaults to the room of the owner's latest s.space message (`state/last-owner-activity.json`).
 With the hook installed, `processing` and `done` are written for you (see below); hand-written rows
 are for anything extra the owner asks to see.
 

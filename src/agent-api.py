@@ -118,6 +118,8 @@ REPO_DIR = Path(__file__).parent.parent
 sys.path.insert(0, str(Path(__file__).parent))
 from git_binary import git_argv  # noqa: E402
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
+import connections as _connections  # noqa: E402
+import local_api_gate  # noqa: E402
 from sutando_config import config_get  # noqa: E402
 from sutando_platform import probe_pids  # noqa: E402
 import local_task_protocol  # noqa: E402
@@ -171,6 +173,158 @@ def _emit_task_processed(content: str) -> None:
 
 # Simple token auth — set SUTANDO_API_TOKEN in .env for remote access security
 API_TOKEN = os.environ.get("SUTANDO_API_TOKEN", "")
+
+# Connections over HTTP: the web client's transport to src/connections.py (docs/connections.md).
+# Every route, GET included, needs the local API bearer; the gate is local_api_gate's.
+CONNECTIONS_PREFIX = "/api/v1/connections"
+CONNECTIONS_BODY_CAP = 16384
+
+
+def connections_bearer() -> str:
+    return local_api_gate.local_api_token(WORKSPACE_DIR, API_TOKEN)
+
+
+def pool_room_bindings(repo: Path, workspace: Path):
+    """The worker pool's room bindings when that skill is installed, else None."""
+    return _connections.room_bindings_from_script(
+        Path(repo) / "skills" / "worker-pool" / "scripts" / "pool_roster.py", workspace)
+
+
+def connections_http(method: str, path: str, body: dict, query: Optional[dict] = None, *,
+                     workspace: Optional[Path] = None, repo: Optional[Path] = None,
+                     logs_dir: Optional[Path] = None, vault=None, fetch=None, spawn=None,
+                     kill=None, getaddrinfo=None, whoami=None) -> "tuple[int, Optional[dict]]":
+    """(status, payload) for one request under CONNECTIONS_PREFIX; payload None = empty body.
+    The HTTP shape of the connections domain: GET lists, GET known-servers offers the registry,
+    POST previews or (confirm) creates and starts the bridge, DELETE removes, POST <instance>/primary moves the primary,
+    POST <instance>/promote moves it while the old primary runs (`{"park": true}` also parks the old one),
+    POST <instance>/park parks a secondary, POST park-legacy parks every row but the primary (the cutover),
+    POST <instance>/unpark brings a parked row back, POST <instance>/disconnect stops and disables,
+    POST <instance>/reconnect relaunches,
+    POST <instance>/token replaces the secret with a new code for the same connection,
+    POST move moves a connection to its successor server with its existing secret (`try_reuse_move`);
+    <instance> `legacy` names the legacy row. Dispatch only; every rule lives in src/connections.py."""
+    ws = Path(workspace) if workspace is not None else WORKSPACE_DIR
+    repo = Path(repo) if repo is not None else REPO_DIR
+    logs_dir = Path(logs_dir) if logs_dir is not None else ws / "logs"
+    query = query or {}
+    parts = [x for x in path[len(CONNECTIONS_PREFIX):].split("/") if x]
+    # The legacy row's instance is "", which no path segment can carry.
+    if parts[:1] == [_connections.LEGACY_PATH_SEGMENT]:
+        parts[0] = ""
+    try:
+        if method == "GET" and not parts:
+            rows = _connections.list_connections(ws, vault=vault)
+            return 200, {"connections": [_connections.status_for(r, ws) for r in rows],
+                         "capabilities": list(_connections.CAPABILITIES),
+                         "no_primary": _connections.no_primary(ws)}
+        # A fixed name, matched before any <instance> route so it is never read as a slug.
+        if parts == ["known-servers"]:
+            if method != "GET":
+                return 405, {"error": "method not allowed"}
+            return 200, {"servers": _connections.known_servers(ws)}
+        if parts == ["move"]:
+            if method != "POST":
+                return 405, {"error": "method not allowed"}
+            instance, dry_run = body.get("instance"), body.get("dry_run", False)
+            if instance is not None and not isinstance(instance, str):
+                return 400, {"error": "instance must be a string"}
+            if not isinstance(dry_run, bool):
+                return 400, {"error": "dry_run must be a boolean"}
+            instance = "" if instance == _connections.LEGACY_PATH_SEGMENT else instance
+            out = _connections.try_reuse_move(instance, repo=repo, logs_dir=logs_dir, workspace=ws, vault=vault,
+                                              fetch=fetch, whoami=whoami, getaddrinfo=getaddrinfo, spawn=spawn,
+                                              kill=kill, added_by="ui", dry_run=dry_run,
+                                              room_bindings=pool_room_bindings(repo, ws))
+            return 200, out
+        if parts == ["park-legacy"]:
+            if method != "POST":
+                return 405, {"error": "method not allowed"}
+            return 200, _connections.park_legacy(workspace=ws, kill=kill)
+        if method == "POST" and not parts:
+            token = body.get("token")
+            if not isinstance(token, str) or not token.strip():
+                return 400, {"error": "missing required field: token"}
+            confirm = body.get("confirm", False)
+            if not isinstance(confirm, bool):
+                return 400, {"error": "confirm must be a boolean"}
+            preview = _connections.preview_connection(token, fetch=fetch, getaddrinfo=getaddrinfo)
+            if not confirm:
+                return 200, {"preview": preview}
+            expected = body.get("expected_server")
+            if not isinstance(expected, str) or not expected.strip():
+                return 400, {"error": "confirm needs expected_server (the server the preview showed)"}
+            skip_backlog = body.get("skip_backlog", False)
+            if not isinstance(skip_backlog, bool):
+                return 400, {"error": "skip_backlog must be a boolean"}
+            try:
+                row, created = _connections.add_connection(
+                    token, added_by=str(body.get("added_by", "ui")), expected_server=expected,
+                    instance=body.get("instance"), preview=preview, workspace=ws, vault=vault, kill=kill,
+                    skip_backlog=skip_backlog)
+            except _connections.ConnectionMismatch as e:
+                return 409, {"error": "mismatch", "server_from_token": e.derived, "expected_server": e.claimed}
+            launch = _connections.start_added(row, repo=repo, logs_dir=logs_dir, workspace=ws,
+                                              vault=vault, spawn=spawn)
+            return (201 if created else 200), {"created": created, "launch": launch,
+                                               "connection": _connections.status_for(row, ws)}
+        if len(parts) == 1 and method == "DELETE":
+            force = str((query.get("force") or [""])[0]).lower() in ("1", "true", "yes")
+            try:
+                _connections.remove_connection(parts[0], force=force, workspace=ws, vault=vault, kill=kill)
+            except _connections.Refusal as e:
+                return 409, {"error": e.CODE}
+            except _connections.PrimaryProtected:
+                return 409, {"error": "primary"}
+            return 204, None
+        if len(parts) == 2 and method == "POST" and parts[1] == "primary":
+            row = _connections.set_primary(parts[0], workspace=ws)
+            return 200, {"connection": _connections.status_for(row, ws)}
+        if len(parts) == 2 and method == "POST" and parts[1] == "promote":
+            park = body.get("park", False)
+            if not isinstance(park, bool):
+                return 400, {"error": "park must be a boolean"}
+            row = _connections.promote(parts[0], repo=repo, logs_dir=logs_dir, workspace=ws, vault=vault,
+                                       spawn=spawn, kill=kill, park=park)
+            return 200, {"connection": _connections.status_for(row, ws), "previous": row["previous"],
+                         "kept": row["kept"], "stopped_pid": row["stopped_pid"], "launch": row["launch"],
+                         "changed": row["changed"], "relaunch_needed": row["relaunch_needed"]}
+        if len(parts) == 2 and method == "POST" and parts[1] == "park":
+            row = _connections.park(parts[0], workspace=ws, kill=kill)
+            return 200, {"connection": _connections.status_for(row, ws), "stopped_pid": row["stopped_pid"]}
+        if len(parts) == 2 and method == "POST" and parts[1] == "unpark":
+            row = _connections.unpark(parts[0], repo=repo, logs_dir=logs_dir, workspace=ws, vault=vault, spawn=spawn)
+            return 200, {"connection": _connections.status_for(row, ws), "launch": row["launch"]}
+        if len(parts) == 2 and method == "POST" and parts[1] == "disconnect":
+            row = _connections.disconnect(parts[0], workspace=ws, kill=kill)
+            return 200, {"connection": _connections.status_for(row, ws)}
+        if len(parts) == 2 and method == "POST" and parts[1] == "reconnect":
+            record = _connections.reconnect(parts[0], repo=repo, logs_dir=logs_dir, workspace=ws,
+                                            vault=vault, spawn=spawn, kill=kill, fetch=fetch,
+                                            getaddrinfo=getaddrinfo)
+            return 202, {"launch": record}
+        if len(parts) == 2 and method == "POST" and parts[1] == "token":
+            token = body.get("token")
+            if not isinstance(token, str) or not token.strip():
+                return 400, {"error": "missing required field: token"}
+            row = _connections.update_token(parts[0], token, repo=repo, logs_dir=logs_dir, workspace=ws,
+                                            vault=vault, spawn=spawn, kill=kill, fetch=fetch,
+                                            getaddrinfo=getaddrinfo)
+            return 200, {"connection": _connections.status_for(row, ws)}
+        return 404, {"error": "not found"}
+    except _connections.Refusal as e:
+        # One rule for every state refusal: 409 with the module's own code.
+        return 409, {"error": e.CODE}
+    except _connections.VaultUnavailable:
+        return 503, {"error": "vault_unavailable"}
+    except _connections.InvalidToken as e:
+        return 400, {"error": "invalid_gateway" if "invalid_gateway" in str(e) else str(e)}
+    except _connections.UnknownConnection as e:
+        return 404, {"error": str(e)}
+    except _connections.SchemaError as e:
+        return 500, {"error": str(e)}
+    except _connections.ConnectionsError as e:
+        return 400, {"error": str(e)}
 
 RESULT_DIR = WORKSPACE_DIR / "results"
 TASK_DIR.mkdir(parents=True, exist_ok=True)
@@ -902,37 +1056,98 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def check_private_history_auth(self) -> bool:
         """Fail closed for browsers and non-loopback clients without a token."""
-        import hmac as _hmac
-
-        if API_TOKEN:
-            token = self.headers.get("Authorization", "").replace("Bearer ", "")
-            if _hmac.compare_digest(token, API_TOKEN):
-                return True
-            self.send_private_json(401, {"error": "unauthorized"})
+        status, why = local_api_gate.private_history_request_allowed(
+            self.client_address[0], self.headers.get("Origin"), self.headers.get("Authorization", ""),
+            configured_token=API_TOKEN)
+        if status != 200:
+            self.send_private_json(status, {"error": why})
             return False
-        try:
-            loopback = ipaddress.ip_address(self.client_address[0]).is_loopback
-        except ValueError:
-            loopback = False
-        # The same-origin web-client proxy and local CLI callers send no
-        # Origin. A browser page always does for cross-origin fetches, so this
-        # also blocks hostile sites from reading localhost history.
-        if loopback and not self.headers.get("Origin"):
-            return True
-        self.send_private_json(403, {"error": "task history requires a local proxy or API token"})
-        return False
+        return True
 
     def do_OPTIONS(self):
+        if urlparse(self.path).path.startswith(CONNECTIONS_PREFIX):
+            # No wildcard grant here: a loopback page may preflight, nothing else gets a header.
+            self.send_response(204)
+            origin = self.headers.get("Origin", "")
+            if origin and local_api_gate.loopback_origin(origin):
+                self.send_header("Access-Control-Allow-Origin", origin)
+                self.send_header("Vary", "Origin")
+                self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+                self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+            self.end_headers()
+            return
         self.send_response(200)
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
         self.end_headers()
+
+    def _send_connections(self, status: int, payload: "dict | None") -> None:
+        """JSON (or an empty body); the cross-origin grant echoes a loopback Origin only, never a
+        wildcard, on refusals too: without it a webview reads a 401 as a network failure and can
+        never drop a stale bearer. A non-loopback Origin gets no grant at any status."""
+        self.send_response(status)
+        origin = self.headers.get("Origin", "")
+        if origin and local_api_gate.loopback_origin(origin):
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
+        self.send_header("Cache-Control", "no-store")
+        if payload is not None:
+            self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        if payload is not None:
+            self.wfile.write(json.dumps(payload).encode())
+
+    def _connections_route(self, method: str) -> None:
+        """Consume the body, then the shared gate (loopback Host on this port, loopback or
+        absent Origin, the local API bearer, always), then dispatch."""
+        parsed = urlparse(self.path)
+        body: dict = {}
+        if method != "GET":
+            try:
+                length = int(self.headers.get("Content-Length", 0) or 0)
+            except (TypeError, ValueError):
+                self._send_connections(400, {"error": "invalid Content-Length"})
+                return
+            if length < 0 or length > CONNECTIONS_BODY_CAP:
+                self._send_connections(413, {"error": "request too large"})
+                return
+            raw = self.rfile.read(length) if length else b""
+            if raw.strip():
+                try:
+                    body = json.loads(raw)
+                except ValueError:
+                    self._send_connections(400, {"error": "invalid JSON"})
+                    return
+                if not isinstance(body, dict):
+                    self._send_connections(400, {"error": "body must be a JSON object"})
+                    return
+        try:
+            bound_port = int(self.server.server_address[1])
+        except (AttributeError, TypeError, ValueError, IndexError):
+            bound_port = None
+        status, why = local_api_gate.bearer_request_allowed(
+            self.headers.get("Origin"), self.headers.get("Host", ""), self.headers.get("Authorization", ""),
+            expected_token=connections_bearer(), bound_port=bound_port)
+        if why:
+            self._send_connections(status, {"error": why})
+            return
+        from urllib.parse import parse_qs
+        status, payload = connections_http(method, parsed.path, body, parse_qs(parsed.query))
+        self._send_connections(status, payload)
+
+    def do_DELETE(self):
+        if urlparse(self.path).path.startswith(CONNECTIONS_PREFIX):
+            self._connections_route("DELETE")
+            return
+        self.send_json(404, {"error": "not found"})
 
     def do_GET(self):
         path = urlparse(self.path).path
         if path == "/ping":
             self.send_json(200, {"pong": True})
+        elif path.startswith(CONNECTIONS_PREFIX):
+            self._connections_route("GET")
         elif path == "/core-status":
             # Read loop status file for web UI
             status_file = status_read_path("core-status.json", WORKSPACE_DIR)
@@ -1175,9 +1390,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         """Check API token if configured. Returns True if authorized."""
         if not API_TOKEN:
             return True  # No token = no auth required (local use)
-        import hmac as _hmac
-        token = self.headers.get("Authorization", "").replace("Bearer ", "")
-        if _hmac.compare_digest(token, API_TOKEN):
+        if local_api_gate.bearer_matches(self.headers.get("Authorization", ""), API_TOKEN):
             return True
         self.send_json(401, {"error": "unauthorized"})
         return False
@@ -1299,6 +1512,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.handle_twilio_transcription(form_data)
             else:
                 self.send_json(404, {"error": "not found"})
+            return
+
+        if path.startswith(CONNECTIONS_PREFIX):
+            self._connections_route("POST")
             return
 
         if path == "/voice/toggle":
@@ -1720,6 +1937,7 @@ if __name__ == "__main__":
     # lsof guard, so nothing restarted it (2026-07-04 incident; same fix as
     # dashboard, #1709).
     server = http.server.ThreadingHTTPServer((bind, PORT), Handler)
+    connections_bearer()  # the desktop shell reads state/agent-api.token; mint it before the first client
     workstream_maintenance_stop = threading.Event()
     workstream_maintenance = threading.Thread(
         target=task_workstreams.run_classifier_maintenance,
@@ -1732,6 +1950,9 @@ if __name__ == "__main__":
         daemon=True,
     )
     workstream_maintenance.start()
+    # Rows imported from the environment name no agent until their own token is asked.
+    threading.Thread(target=_connections.run_identity_learner, args=(workstream_maintenance_stop, WORKSPACE_DIR),
+                     name="connections-identity", daemon=True).start()
     local_ip = _resolve_local_ip()
     print(f"Sutando Agent API → http://{bind}:{PORT}")
     print("  POST /task  — submit a task")

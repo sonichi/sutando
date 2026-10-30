@@ -15,7 +15,7 @@
  * missing. Schema:
  *
  *   {
- *     "model": "gemini-2.5-flash-native-audio-preview-12-2025",
+ *     "model": "gemini-3.8-live",
  *     "googleSearch": true,
  *     "owner_mode": false,
  *     "channels": { "<voice_channel_id>": { "owner_mode": true } }
@@ -23,13 +23,11 @@
  *
  * Missing file → defaults. Partial file → fill in missing keys from defaults.
  *
- * Defaults: 2.5 + search:true. Rationale: 2.5+search is the only combo that
- * works on BOTH the MAIN and VOICE Gemini keys (3.1+search needs paid-tier
- * entitlement that only MAIN currently has on most setups; 3.1 without search
- * works on either key but loses Web grounding by default — that's degrading
- * capability rather than picking a safe baseline). The browser voice-agent
- * surface explicitly ships a newer `.example` template; phone inherits this
- * package default unless its own config overrides it.
+ * Defaults: 3.8 Live + search:true. The model is MIGRATED_MODEL, the one every
+ * seeded install moves to; search stays true because that migration keeps each
+ * install's search setting, so a config-less install runs what a migrated
+ * install seeded with the old 2.5 + search:true default runs. The browser
+ * voice-agent template turns search off; phone's template carries this default.
  */
 
 import { readFileSync, existsSync, writeFileSync, renameSync, copyFileSync } from 'fs';
@@ -52,6 +50,10 @@ export interface VoiceConfig {
 	divergenceCorrection: boolean;
 	/** Per-channel overrides, keyed by voice channel id. */
 	channels: Record<string, VoiceChannelConfig>;
+	/** The relay agent's text-model checks (is a request complete, is it a request for the core, was it
+	 *  already sent). ABSENT = on with the default model. `false` = off: requests go as the voice model
+	 *  writes them. `{ "model": "…" }` picks the model; `{ "enabled": false }` is also off. */
+	relayCheck?: { enabled?: boolean; model?: string } | false;
 	/** Phase 0.5 seam (design §2.1): context-window compression. ABSENT = take
 	 *  whatever the built-in default says. `{}` = on with the SERVER's defaults
 	 *  (trigger at 80% of the model limit, target half the trigger). Explicit
@@ -76,7 +78,7 @@ export interface VoiceConfig {
 }
 
 export const VOICE_CONFIG_DEFAULTS: VoiceConfig = {
-	model: 'gemini-2.5-flash-native-audio-preview-12-2025',
+	model: 'gemini-3.8-live',
 	googleSearch: true,
 	owner_mode: false,
 	shadowStt: false,
@@ -384,4 +386,16 @@ export function revertModelMigration(configPath: string, now: Date = new Date())
 	writeFileSync(tmp, JSON.stringify(next, null, 2) + '\n');
 	renameSync(tmp, configPath);
 	return { reverted: true, model, reason: 'migrated model unavailable' };
+}
+
+/** The relay check's model, or null when the owner turned the check off. Anything malformed means the default. */
+export function resolveRelayCheck(cfg: Pick<VoiceConfig, 'relayCheck'>, defaultModel: string): { model: string } | null {
+	const rc = cfg.relayCheck as unknown;
+	if (rc === false) return null;
+	if (rc && typeof rc === 'object') {
+		const o = rc as { enabled?: unknown; model?: unknown };
+		if (o.enabled === false) return null;
+		if (typeof o.model === 'string' && o.model.trim()) return { model: o.model.trim() };
+	}
+	return { model: defaultModel };
 }

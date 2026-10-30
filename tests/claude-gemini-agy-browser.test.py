@@ -50,6 +50,8 @@ A fake Chrome serves /json/version on a free port and a mock agy records its arg
  27. Ownership of the reported group is revalidated before every signal: a group whose leader's start
      time changed (a reused PGID), or one that is not the launcher's own, is never signalled; start
      reports it and keeps the handshake directory.
+ 28. A fake Chrome exits once the process named by FIXTURE_OWNER_PID/START (this test) is gone, so a test
+     killed before its `finally` runs leaves no fixture behind.
 
 Run: python3 tests/claude-gemini-agy-browser.test.py
 """
@@ -64,11 +66,13 @@ import time
 import urllib.request
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _helpers.process_group import OWNER_LIFELINE_PY, owner_env  # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
 SCRIPT = REPO / "skills" / "claude-gemini" / "scripts" / "agy-browser.sh"
 
-FAKE_CHROME = f"#!{sys.executable}\n" + """
+FAKE_CHROME = f"#!{sys.executable}\n" + OWNER_LIFELINE_PY + """
 import http.server, os, signal, sys, time
 port = int(next(a.split("=", 1)[1] for a in sys.argv if a.startswith("--remote-debugging-port=")))
 with open(os.environ["CHROME_LOG"], "a") as f:
@@ -196,8 +200,28 @@ def main() -> None:
             MCP_STATE=str(tmp / "mcp.state"),
             AGY_LIST_COUNT=str(tmp / "agy-list.count"),
             SUTANDO_PY=sys.executable,
+            **owner_env(),
         )
         args = ["--port", str(port), "--profile", str(profile), "--chrome", str(chrome)]
+
+        owner = subprocess.Popen(["sleep", "300"])
+        life_port = free_port()
+        orphan = subprocess.Popen([str(chrome), f"--user-data-dir={tmp / 'lifeline'}",
+                                   f"--remote-debugging-port={life_port}"],
+                                  env=dict(env, **owner_env(owner.pid), CHROME_LOG=str(tmp / "lifeline.log")))
+        try:
+            wait_up(life_port, "lifeline fake Chrome")
+            owner.send_signal(signal.SIGTERM)
+            owner.wait(timeout=10)
+            try:
+                orphan.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                raise AssertionError("a fake Chrome outlived the process that owns it")
+        finally:
+            for p in (owner, orphan):
+                if p.poll() is None:
+                    p.kill()
+                    p.wait()
         try:
             rc, out = run(env, "start", *args)
             assert rc == 0, f"start failed: {out}"
@@ -1078,7 +1102,7 @@ exec "{sys.executable}" "$@"
         (bin_dir / "agy").unlink()
         rc, out = run(env, "start", *args)
         assert rc != 0 and "agy not found" in out, f"start without agy should refuse: {out}"
-    print("PASS 29/29 agy-browser.sh")
+    print("PASS 30/30 agy-browser.sh")
 
 
 if __name__ == "__main__":

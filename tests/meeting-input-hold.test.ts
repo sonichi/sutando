@@ -61,7 +61,7 @@ describe('meeting mode holds direct model input', () => {
 		const mode = { value: 'transcription' as 'agent' | 'transcription' };
 		const s = fakeSession(mode);
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		wireDurableChannels(s as any, { relay: relay() });
+		wireDurableChannels(s as any, { relay: relay(), handoffConfirmMs: 100 });
 		writeFileSync(join(TMP, 'results', 'task-1.txt'), 'Health check: all services up.');
 		await tick(5_000);
 		assert.deepEqual(s.sent, [], 'nothing reaches the model during the meeting');
@@ -75,7 +75,7 @@ describe('meeting mode holds direct model input', () => {
 		const mode = { value: 'transcription' as 'agent' | 'transcription' };
 		const s = fakeSession(mode);
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		const durable = wireDurableChannels(s as any, { relay: relay() });
+		const durable = wireDurableChannels(s as any, { relay: relay(), handoffConfirmMs: 100 });
 		// Straight into the queue: the watcher started by the test above would claim a result file.
 		durable.enqueue({ text: 'Test result: the build finished successfully.', taskId: 'task-2' });
 		durable.enqueue({ text: '[System: The phone call just completed.]\n\nCall transcript:\nThe dentist confirmed Tuesday at 3 pm.', framed: true });
@@ -109,7 +109,7 @@ describe('results the session cannot take', () => {
 		const s = fakeSession(mode);
 		s.sessionManager.isActive = false;   // reconnecting, and it does not come back
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		const durable = wireDurableChannels(s as any, { relay: relay(), notReadyRetriesMs: [10, 10] });
+		const durable = wireDurableChannels(s as any, { relay: relay(), notReadyRetriesMs: [10, 10], handoffConfirmMs: 100 });
 		for (const pr of ['3509', '5140', '5167']) durable.enqueue({ text: `PR ${pr} status`, taskId: `task-${pr}` });
 		durable.enqueue({ text: '[System: The phone call just completed.]\n\nCall transcript:\nfirst call', framed: true });
 		durable.enqueue({ text: '[System: The phone call just completed.]\n\nCall transcript:\nsecond call', framed: true });
@@ -132,7 +132,7 @@ describe('results the session cannot take', () => {
 		const s = fakeSession(mode);
 		s.sessionManager.isActive = false;
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		const durable = wireDurableChannels(s as any, { relay: relay(), notReadyRetriesMs: Array(20).fill(200) });
+		const durable = wireDurableChannels(s as any, { relay: relay(), notReadyRetriesMs: Array(20).fill(200), handoffConfirmMs: 100 });
 		durable.enqueue({ text: 'PR 4200 status', taskId: 'task-4200' });
 		await tick(3_000);
 		s.sessionManager.isActive = true;   // the reconnect completes
