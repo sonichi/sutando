@@ -67,6 +67,28 @@ class RealTmux(unittest.TestCase):
             time.sleep(0.1)
         self.assertIn("Sutando task ready", self.tmux("capture-pane", "-p", "-t", "=core:0").stdout)
 
+    def test_expected_pid_sends_only_to_same_process_outside_copy_mode(self):
+        pane = self.tmux("display-message", "-p", "-t", "=core:0", "#{pane_id}").stdout.strip()
+        pid = self.tmux("display-message", "-p", "-t", pane, "#{pane_pid}").stdout.strip()
+        self.tmux("copy-mode", "-t", pane)
+        landed = run("-S", self.sock, "-t", pane, "--expected-pid", pid, "--", "-l", "--", "EXPECTED-PID-POSITIVE")
+        self.assertEqual(landed.returncode, 0, landed.stderr)
+        self.assertEqual(self.in_mode(), "0")
+        refused = run("-S", self.sock, "-t", pane, "--expected-pid", str(int(pid)+1), "--", "-l", "--", "WRONG-PID-NEGATIVE")
+        self.assertEqual(refused.returncode, 1, refused.stderr)
+        captured = self.tmux("capture-pane", "-p", "-t", pane).stdout
+        self.assertIn("EXPECTED-PID-POSITIVE", captured)
+        self.assertNotIn("WRONG-PID-NEGATIVE", captured)
+
+    def test_expected_pid_withholds_if_hook_reenters_copy_mode(self):
+        pane = self.tmux("display-message", "-p", "-t", "=core:0", "#{pane_id}").stdout.strip()
+        pid = self.tmux("display-message", "-p", "-t", pane, "#{pane_pid}").stdout.strip()
+        self.tmux("set-hook", "-g", "after-copy-mode", "copy-mode -t " + pane)
+        refused = run("-S", self.sock, "-t", pane, "--expected-pid", pid, "--", "-l", "--", "MODE-NEGATIVE")
+        self.assertEqual(refused.returncode, 1, refused.stderr)
+        self.assertEqual(self.in_mode(), "1")
+        self.assertNotIn("MODE-NEGATIVE", self.tmux("capture-pane", "-p", "-t", pane).stdout)
+
     def test_without_the_helper_the_same_send_blocks(self):
         # The control: plain send-keys into copy mode waits on "(jump to forward)".
         self.tmux("copy-mode", "-t", "=core:0")

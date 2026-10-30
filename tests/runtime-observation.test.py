@@ -45,6 +45,55 @@ class ValidateTests(Base):
                                      for k, v in rec().items()}))
         self.assertNotIn("extra", out)
 
+    def test_optional_core_incarnation_is_preserved_and_bounded(self):
+        self.assertEqual(ro.validate(rec(core_incarnation="42:start"))["core_incarnation"], "42:start")
+        self.assertNotIn("core_incarnation", ro.validate(rec()))
+        for bad in ["", 42, "x" * 161, "42\nstart", "42\rstart"]:
+            with self.assertRaises(ValueError):
+                ro.validate(rec(core_incarnation=bad))
+
+    def test_completed_task_rejects_non_object_records(self):
+        for invalid in ([], "receipt", 1, True):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                ro.validate(rec(completed_task=invalid))
+
+    def test_invalid_recovery_metadata_cannot_replace_the_last_observation(self):
+        original = rec(last_completed_at=NOW - 3)
+        self.assertTrue(ro.write(original, self.ws))
+        path = ro.record_path(self.ws, "core")
+        stored = path.read_bytes()
+        for invalid in [True, "recent", 0, float("nan"), float("inf"), NOW + 1]:
+            with self.subTest(last_completed_at=invalid), self.assertRaises(ValueError):
+                ro.write(rec(last_completed_at=invalid), self.ws)
+            self.assertEqual(path.read_bytes(), stored)
+        for invalid in [[], "receipt", True, 1]:
+            with self.subTest(failed_task=invalid), self.assertRaises(ValueError):
+                ro.write(rec(failed_task=invalid), self.ws)
+            self.assertEqual(path.read_bytes(), stored)
+        self.assertEqual(ro.load(self.ws, "core", NOW)[0]["last_completed_at"], NOW - 3)
+
+    def test_completed_task_is_optional_bounded_and_contains_only_metadata(self):
+        receipt = {"prompt_sha256": "a" * 64, "accepted_at": NOW - 8,
+                   "completed_at": NOW - 3, "core_incarnation": "42:Tue Oct  6 02:00:00 2026"}
+        self.assertEqual(ro.validate(rec(completed_task=receipt))["completed_task"], receipt)
+        self.assertNotIn("completed_task", ro.validate(rec(completed_task=None)))
+        self.assertEqual(ro.validate(rec(completed_task={**receipt, "prompt": "private"}))["completed_task"], receipt)
+        for change in ({"prompt_sha256": "x" * 64}, {"prompt_sha256": "a" * 63},
+                       {"core_incarnation": ""}, {"core_incarnation": "x" * 161},
+                       {"core_incarnation": "42\nsecret"}, {"accepted_at": True},
+                       {"accepted_at": NOW}, {"completed_at": NOW + 1},
+                       {"completed_at": float("nan")}):
+            with self.assertRaises(ValueError):
+                ro.validate(rec(completed_task={**receipt, **change}))
+        for state in ({"phase": "requesting"}, {"motion": "moving"},
+                      {"condition": "abnormal", "reason": "quota-limit"}):
+            with self.assertRaises(ValueError):
+                ro.validate(rec(completed_task=receipt, **state))
+        self.assertTrue(ro.write(rec(completed_task=receipt), self.ws))
+        stored, why = ro.load(self.ws, "core", NOW)
+        self.assertIsNone(why)
+        self.assertEqual(stored["completed_task"], receipt)
+
     def test_bad_values_reject_the_whole_record(self):
         for over in ({"schema": 2}, {"seat": "worker"}, {"seat": WID.upper()}, {"seat": WID[:-1]},
                      {"phase": "sleeping"}, {"motion": "fast"}, {"condition": "ok"}, {"reason": "boom"},

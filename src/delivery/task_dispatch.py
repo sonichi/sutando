@@ -57,6 +57,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import stat
 import subprocess
 import sys
@@ -304,7 +305,7 @@ def _inflight_path(inflight_dir: "Path | str", filename: str) -> Path:
     return Path(inflight_dir) / filename
 
 
-def mark_inflight(inflight_dir: "Path | str", filename: str, incarnation: str) -> None:
+def mark_inflight(inflight_dir: "Path | str", filename: str, incarnation: str, prompt_digest: str = "") -> None:
     """Record that `filename`'s prompt was submitted to the core incarnation `incarnation`.
 
     Terminal history is a lossy record of what was submitted: the prompt scrolls
@@ -315,6 +316,8 @@ def mark_inflight(inflight_dir: "Path | str", filename: str, incarnation: str) -
     incarnation = incarnation.strip()
     if not incarnation:
         raise ValueError("an in-flight marker needs the core incarnation; empty would read as live forever")
+    if prompt_digest and not re.fullmatch(r"[0-9a-f]{64}", prompt_digest):
+        raise ValueError("invalid prompt digest")
     path = _inflight_path(inflight_dir, filename)
     path.parent.mkdir(parents=True, exist_ok=True)
     # A private temp file per writer: two notifiers marking at once must not
@@ -323,6 +326,8 @@ def mark_inflight(inflight_dir: "Path | str", filename: str, incarnation: str) -
     try:
         with os.fdopen(fd, "w") as fh:
             fh.write(incarnation + "\n")
+            if prompt_digest:
+                fh.write(prompt_digest + "\n")
         os.replace(tmp, path)
     except BaseException:
         Path(tmp).unlink(missing_ok=True)
@@ -337,9 +342,8 @@ def inflight_is_live(inflight_dir: "Path | str", filename: str, incarnation: str
     any marker live: not knowing which core is running is not evidence the
     prompt was never submitted.
 
-    Liveness is judged on the FIRST line only. `mark_partial_paste` writes a
-    second line (the leftover composer text) after the same incarnation; a
-    plain `mark_inflight` record never has one, so this is backward compatible.
+    Liveness uses only the first line; a second line can hold a partial paste
+    or an accepted-prompt digest without changing incarnation matching.
     """
     path = _inflight_path(inflight_dir, filename)
     try:

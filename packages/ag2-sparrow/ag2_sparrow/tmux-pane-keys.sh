@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# tmux-pane-keys.sh [--tmux BIN] --python PY -S SOCKET -t TARGET [--timeout SECS] -- <send-keys args...>
+# tmux-pane-keys.sh [--tmux BIN] --python PY -S SOCKET -t TARGET [--timeout SECS] [--expected-pid PID] -- <send-keys args...>
 # tmux-pane-keys.sh [--tmux BIN] --python PY -S SOCKET -t PANE [--timeout SECS] --fence PREDICATE ACTION
 # Leaves pane mode and sends in one tmux step, bounded; or runs ACTION only while the format PREDICATE
 # holds for PANE, else orphans the ticket (exit 1, nothing sent). Exit: status, 124 revoked timeout,
@@ -10,13 +10,14 @@ set -u
 WORK=""
 if [ "${1:-}" = --guarded ]; then WORK="$2"; shift 2; fi
 ARGS=("$@")
-TMUX_BIN=tmux; SOCK=""; TARGET=""; TIMEOUT=5; PY=""; FENCED=""; FENCE_PRED=""; FENCE_ACTION=""
+TMUX_BIN=tmux; SOCK=""; TARGET=""; TIMEOUT=5; PY=""; FENCED=""; FENCE_PRED=""; FENCE_ACTION=""; EXPECTED_PID=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --tmux) TMUX_BIN="${2:?}"; shift 2 ;;
     --python) PY="${2:?}"; shift 2 ;;
     -S) SOCK="${2:?}"; shift 2 ;;
     -t) TARGET="${2:?}"; shift 2 ;;
+    --expected-pid) EXPECTED_PID="${2:?}"; shift 2 ;;
     --timeout) TIMEOUT="${2:?}"; shift 2 ;;
     --fence) FENCE_PRED="${2:?}"; FENCE_ACTION="${3:?}"; FENCED=1; shift 3 ;;
     --) shift; break ;;
@@ -25,6 +26,8 @@ while [ $# -gt 0 ]; do
 done
 [ -n "$SOCK" ] && [ -n "$TARGET" ] && { [ $# -gt 0 ] || [ -n "$FENCED" ]; } \
   || { echo "tmux-pane-keys: need -S, -t and keys after -- (or --fence PREDICATE ACTION)" >&2; exit 2; }
+case "$EXPECTED_PID" in *[!0-9]*) echo "tmux-pane-keys: invalid expected pid" >&2; exit 2 ;; esac
+[ -z "$EXPECTED_PID" ] || [ -z "$FENCED" ] || { echo "tmux-pane-keys: expected pid takes keys, not an action" >&2; exit 2; }
 [ -z "$FENCED" ] || [ $# -eq 0 ] || { echo "tmux-pane-keys: --fence takes no keys" >&2; exit 2; }
 case "$TIMEOUT" in ''|*[!0-9]*) echo "tmux-pane-keys: --timeout takes whole seconds" >&2; exit 2 ;; esac
 
@@ -75,11 +78,16 @@ else
     case "$key" in *'\;') key="${key%\\;};" ;; *';') key="${key%;}" ;; esac
     KEYS="$KEYS $(tmux_quote "$key")"
   done
-  SEND="copy-mode -q -t $(tmux_quote "$TARGET") ; if-shell -F -t $(tmux_quote "$TARGET") '#{pane_in_mode}' $(tmux_quote "run-shell $(tmux_quote "$ORPHAN")") $(tmux_quote "$KEYS")"
+  if [ -n "$EXPECTED_PID" ]; then
+    SAFE="#{&&:#{==:#{pane_pid},$EXPECTED_PID},#{==:#{pane_in_mode},0}}"
+    SEND="copy-mode -q -t $(tmux_quote "$TARGET") ; if-shell -F -t $(tmux_quote "$TARGET") $(tmux_quote "$SAFE") $(tmux_quote "$KEYS") $(tmux_quote "run-shell $(tmux_quote "$ORPHAN")")"
+  else
+    SEND="copy-mode -q -t $(tmux_quote "$TARGET") ; if-shell -F -t $(tmux_quote "$TARGET") '#{pane_in_mode}' $(tmux_quote "run-shell $(tmux_quote "$ORPHAN")") $(tmux_quote "$KEYS")"
+  fi
 fi
 printf '%s\n' "$SEND" > "$WORK/cmd"
 bounded if-shell "$CLAIM" "$SEND"; rc=$?
 # Withheld is read from the orphaned ticket: a failing run-shell would put the pane in view mode (tmux < 3.5).
-[ -z "$FENCED" ] || [ "$rc" != 0 ] || [ ! -e "$TICKET.orphaned" ] || rc=1
+{ [ -z "$FENCED" ] && [ -z "$EXPECTED_PID" ]; } || [ "$rc" != 0 ] || [ ! -e "$TICKET.orphaned" ] || rc=1
 cat "$WORK/out"; cat "$WORK/err" >&2
 exit "$rc"
