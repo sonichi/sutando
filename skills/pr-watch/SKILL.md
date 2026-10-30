@@ -197,10 +197,11 @@ by itself. `--room` and `--title` override the settings.
   credential it finds, which may not be a member of the tracker room.
 
 **Rows without the agent.** The runner upserts the row of every event it forwards (one that
-produced a `PR_EVENT` line): state (`merged` when merged), head, author, link and PR title from the
-webhook payload, plus `updated_at`. It never sets or touches verdict, event, about or ask, and
+produced a `PR_EVENT` line): state (`merged` when merged), the PR's current head (`pr_head`), author,
+link and PR title from the webhook payload, plus `updated_at`. It never sets or touches `head` (the
+head the verdict was given at), verdict, event, about or ask, and
 clears the ask when the PR is merged or closed. So rows exist and stay current even when the
-agent forgets to run `track`; the page itself changes on the next publish. `track` and the runner
+agent forgets to run `track`; the page itself changes on the next publish. When the current head has moved past the reviewed one, the "Head reviewed" cell shows both (`<reviewed> now <current>`), so a verdict is never read against a head nobody reviewed. `track` and the runner
 write `tracker.json` under one lock (`tracker.lock`), so neither loses the other's write.
 
 The runner never publishes and never needs room credentials. A PR title is text anyone who can

@@ -617,7 +617,7 @@ class InProcess(_Tmp):
         self.forward()
         rows = json.loads(self.st.tracker.read_text())["rows"]
         self.assertEqual(list(rows), ["acme/widgets#7"], "the labeled event emits nothing and adds no row")
-        self.assertEqual((rows["acme/widgets#7"]["state"], rows["acme/widgets#7"]["head"]), ("open", "a1b2c3d4"))
+        self.assertEqual((rows["acme/widgets#7"]["state"], rows["acme/widgets#7"]["pr_head"]), ("open", "a1b2c3d4"))
 
     def test_forwarder_asks_for_review_events_too(self):
         self.forward()
@@ -1295,8 +1295,18 @@ class Tracker(_Tmp):
         row = self.data()["rows"]["acme/widgets#7"]
         self.assertEqual(row, {
             "repo": "acme/widgets", "number": 7, "link": "https://github.com/acme/widgets/pull/7",
-            "author": "alice", "state": "merged", "head": "0badc0de", "verdict": "approved",
-            "event": "reviewed at 11111111", "title": "x", "updated_at": "2026-01-01T00:00:01Z"})
+            "author": "alice", "state": "merged", "head": "11111111", "pr_head": "0badc0de",
+            "verdict": "approved", "event": "reviewed at 11111111", "title": "x",
+            "updated_at": "2026-01-01T00:00:01Z"})
+
+    def test_a_push_past_the_reviewed_head_shows_both_heads_never_moves_the_verdicts_head(self):
+        row = {"repo": "a/b", "number": 1, "head": "11111111", "pr_head": "0badc0de", "verdict": "approved"}
+        out = pw.render_tracker([row], "PR watch", "now")
+        self.assertIn('<code>11111111</code> <span class="stale">now <code>0badc0de</code></span>', out)
+        unreviewed = pw.render_tracker([{"repo": "a/b", "number": 2, "pr_head": "0badc0de"}], "PR watch", "now")
+        self.assertIn('<span class="stale">not reviewed: <code>0badc0de</code></span>', unreviewed)
+        same = pw.render_tracker([{"repo": "a/b", "number": 3, "head": "0badc0de", "pr_head": "0badc0de"}], "t", "now")
+        self.assertNotIn('class="stale"', same)
 
     def test_the_runner_upsert_creates_a_row_and_never_a_verdict(self):
         st = pw.State(self.state)

@@ -389,7 +389,8 @@ def payload_row(payload: dict) -> Optional[Tuple[str, dict]]:
         fields["state"] = state
     head = (pr.get("head") or {}).get("sha")
     if isinstance(head, str) and re.match(r"^[0-9a-f]{8,}$", head):
-        fields["head"] = head[:8]
+        # The PR's current head; `head` stays the one `track` recorded as reviewed.
+        fields["pr_head"] = head[:8]
     author = (pr.get("user") or {}).get("login")
     if isinstance(author, str) and LOGIN_RE.match(author):
         fields["author"] = author
@@ -854,6 +855,7 @@ code { font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; }
 .needs ul { margin: 0; padding-left: 18px; } .needs li { margin: 6px 0; }
 .ask { white-space: pre-wrap; margin: 2px 0 0; }
 tr.asks td:first-child { box-shadow: inset 3px 0 0 var(--ask); }
+.stale { color: var(--closed); font-size: 11px; white-space: nowrap; }
 .badge { color: var(--ask); font-size: 11px; font-weight: 600; margin-left: 6px; white-space: nowrap; }
 """
 
@@ -928,6 +930,15 @@ def _needs_panel(rows: List[dict]) -> str:
             + "\n".join(items) + "\n</ul></section>\n")
 
 
+def _head_cell(r: dict) -> str:
+    """The head the verdict was given at, and the PR's current head when a later push moved it."""
+    reviewed, current = r.get("head"), r.get("pr_head")
+    cell = f"<code>{_esc(reviewed)}</code>" if reviewed else ""
+    if current and current != reviewed:
+        cell += f' <span class="stale">{"now" if reviewed else "not reviewed:"} <code>{_esc(current)}</code></span>'
+    return cell
+
+
 def render_tracker(rows: Iterable[dict], title: str, now: str) -> str:
     """A self-contained HTML page of the tracked PRs; every value is escaped."""
     body = []
@@ -939,7 +950,7 @@ def render_tracker(rows: Iterable[dict], title: str, now: str) -> str:
         asks = isinstance(r.get("ask"), str) and bool(r["ask"].strip())
         pr_cell = _link(r.get("link"), label) + ('<span class="badge">needs you</span>' if asks else "")
         cells = [pr_cell, _about_cell(r), _esc(r.get("author")), f"<span{cls}>{_esc(state)}</span>",
-                 f"<code>{_esc(r.get('head'))}</code>", _esc(r.get("verdict")), _esc(r.get("event")),
+                 _head_cell(r), _esc(r.get("verdict")), _esc(r.get("event")),
                  _esc(r.get("updated_at"))]
         body.append(("<tr class=\"asks\">" if asks else "<tr>") + "".join(f"<td>{c}</td>" for c in cells) + "</tr>")
     if not body:
