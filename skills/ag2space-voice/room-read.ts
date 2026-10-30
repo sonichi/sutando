@@ -1054,7 +1054,7 @@ export function createNavigateSpaceTool(deps: ReadRoomDeps): ToolDefinition {
 		description:
 			'Move the user\'s own screen in the AG2 Space app, as run_room_action room.commons.summon opens a page for them. ' +
 			'`to` "commons" shows the Commons list of a room — the entry list of its surfaces (Doc, Whiteboard, Sheet, Database…), the current room\'s or `room`\'s by name ("go to the Commons list", "打开 commons 列表", "show me what is in <room>\'s Commons"). Not this: "document list", "list of documents", "show me the docs", "文档列表" mean the Doc surface and its pages — run_room_action room.commons.summon with arguments_json {"kind": "markdown"} (no page); one document named, "open the Stevens doc", is a summon to that page. ' +
-			'"back" leaves the screen they are on, one step ("go back", "回去", "退出文档", "close the page"), so page → list → room walks back the way they came. ' +
+			'"back" leaves the screen they are on, one step ("go back", "回去", "退出文档"), so page → list → room walks back the way they came. ' +
 			'Speech often hears "Commons" as "comments": "the list of room comments", "open the room comments", "go to the comments" with no document or thread named means the Commons list — call this with "commons", never list comment threads for it. ' +
 			'Runs at once — no read-back, no yes — then say in a few words where they are now. Only the user\'s own screen moves (their phone and web client), never anyone else\'s. ' +
 			'Errors: "bad_destination" — only "commons" or "back"; "no_owner" or "no_dm" — say it could not be done; ' + ROOM_NAME_ERRORS +
