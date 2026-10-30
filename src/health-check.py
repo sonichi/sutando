@@ -73,6 +73,7 @@ from sutando_platform import (  # noqa: E402
     find_pids,
     probe_pids,
     process_executable as _platform_process_executable,
+    process_owned_by_current_user as _platform_process_owned_by_current_user,
     process_snapshot as _platform_process_snapshot,
 )
 from workspace_layout import inspect_layout  # noqa: E402
@@ -767,6 +768,10 @@ def _proc_executable(pid: "str | int") -> "str | None":
     return _platform_process_executable(pid)
 
 
+def _proc_owned_by_me(pid: "str | int") -> bool:
+    return _platform_process_owned_by_current_user(pid)
+
+
 # The script must appear as its own argv token — a `-c` payload that merely
 # prints the name is not a bridge launch.
 def _argv_runs(argv: str, script: str) -> bool:
@@ -774,7 +779,7 @@ def _argv_runs(argv: str, script: str) -> bool:
 
 
 def _live_bridge_interpreters(script: str, ps_output: "str | None" = None,
-                              exe_of=None) -> "list[str]":
+                              exe_of=None, owned=None) -> "list[str]":
     """EVERY distinct interpreter currently running `script`, sorted.
 
     Multi-instance is a supported launch (startup-runtime.sh spawns one gateway
@@ -785,12 +790,17 @@ def _live_bridge_interpreters(script: str, ps_output: "str | None" = None,
         ps_output = _ps_snapshot()
     if ps_output is None:
         return []
-    exe_of = exe_of or _proc_executable
+    if exe_of is None:
+        exe_of = _proc_executable
+    if owned is None:
+        owned = _proc_owned_by_me
     me = str(os.getpid())
     found = set()
     for line in ps_output.splitlines():
         parts = line.split(None, 2)
         if len(parts) < 3 or parts[0] == me or not _argv_runs(parts[2], script):
+            continue
+        if not owned(parts[0]):
             continue
         exe = exe_of(parts[0])
         if exe and os.path.basename(exe).lower().startswith("python"):

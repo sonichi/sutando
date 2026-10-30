@@ -28,16 +28,38 @@ cat > "$stub_dir/curl" <<'SH'
 #!/bin/bash
 printf '%s' "$CURL_RESPONSE"
 SH
+cat > "$stub_dir/lsof" <<'SH'
+#!/bin/bash
+printf '%s' "$LSOF_OUTPUT"
+SH
 chmod +x "$stub_dir/curl"
+chmod +x "$stub_dir/lsof"
 PATH="$stub_dir:$PATH"
 export PATH
 
 CURL_RESPONSE='{"ok":true,"service":"sutando-observability-collector"}'
 export CURL_RESPONSE
+LSOF_OUTPUT="u$(id -u)"
+export LSOF_OUTPUT
 obs_collector_healthy 4000 || fail "collector identity should pass"
 
+LSOF_OUTPUT='u99999'
+if obs_collector_healthy 4000; then rc=0; else rc=$?; fi
+[ "$rc" -eq 2 ] || fail "another account's listener should return ownership status 2"
+
+LSOF_OUTPUT=''
+if obs_collector_healthy 4000; then rc=0; else rc=$?; fi
+[ "$rc" -eq 3 ] || fail "an unmeasurable listener should return status 3, not be called foreign"
+
+LSOF_OUTPUT="u$(id -u)
+u99999"
+if obs_collector_healthy 4000; then rc=0; else rc=$?; fi
+[ "$rc" -eq 2 ] || fail "a listener owned by mixed accounts should count as foreign"
+
+LSOF_OUTPUT="u$(id -u)"
 CURL_RESPONSE='{"ok":true,"service":"unrelated-local-service"}'
 export CURL_RESPONSE
-obs_collector_healthy 4000 && fail "foreign listener must fail closed"
+if obs_collector_healthy 4000; then rc=0; else rc=$?; fi
+[ "$rc" -eq 1 ] || fail "an owned listener with the wrong marker should return health status 1"
 
 echo "PASS: observability startup policy"

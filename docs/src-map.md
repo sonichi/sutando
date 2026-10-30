@@ -145,6 +145,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`migration_safety_helpers.sh`** — shellcheck shell=bash PR #1440 — auto-migration safety helpers (Mini review).
 - **`morning-briefing.py`** — Morning briefing for Sutando.
 - **`native-pim-consent.ts`** — Native PIM consent — the voice-process client of skills/macos-tools/scripts/native_pim_consent.py.
+- **`ngrok-tunnel-policy.sh`** — Bind webhook URL discovery to the supervised ngrok process's own API listener, and accept only well-formed https base URLs, optionally pinned to a host.
 - **`notify.sh`** — Sutando: notify the user across available channels
 - **`obsidian-mirror.py`** — Obsidian sync — one-shot sweep of agent state into the Sutando vault.
 - **`optional_script.py`** — Dependency-light runner for optional script-backed capabilities.

@@ -54,6 +54,7 @@ try:
     spec.loader.exec_module(hc)
 except SystemExit:
     pass
+import sutando_platform as platform  # noqa: E402
 
 failures = []
 
@@ -71,26 +72,27 @@ SPACED_BOTH = ("  76550 76531 /Users/x/App Support/rt/python/bin/python3"
                " /Users/x/My Sutando/src/remote-gateway-bridge.py\n")
 BUNDLED = "/Users/x/App Support/rt/python/bin/python3"
 exe_ok = lambda pid: BUNDLED if pid == "76550" else None
+owned = lambda _pid: True
 
 check("spaced interpreter path", hc._live_bridge_interpreters(
-    "remote-gateway-bridge.py", SPACED_INTERP, exe_ok), [BUNDLED])
+    "remote-gateway-bridge.py", SPACED_INTERP, exe_ok, owned=owned), [BUNDLED])
 
 # The round-1 regression: slicing argv at the last space before the script name
 # lands INSIDE a spaced script path, returning None -> false-green fallback.
 check("spaces in BOTH interpreter and script paths", hc._live_bridge_interpreters(
-    "remote-gateway-bridge.py", SPACED_BOTH, exe_ok), [BUNDLED])
+    "remote-gateway-bridge.py", SPACED_BOTH, exe_ok, owned=owned), [BUNDLED])
 
 # The probing shell's own argv contains the script name; its executable is not python.
 SELF = "  999 1 /bin/zsh -c grep remote-gateway-bridge.py somewhere\n"
 check("shell self-match is not a bridge", hc._live_bridge_interpreters(
-    "remote-gateway-bridge.py", SELF, lambda pid: "/bin/zsh"), [])
+    "remote-gateway-bridge.py", SELF, lambda pid: "/bin/zsh", owned=owned), [])
 
 check("no ps output -> None",
-      hc._live_bridge_interpreters("remote-gateway-bridge.py", "", exe_ok), [])
+      hc._live_bridge_interpreters("remote-gateway-bridge.py", "", exe_ok, owned=owned), [])
 check("absent bridge -> None",
-      hc._live_bridge_interpreters("not-running-bridge.py", SPACED_BOTH, exe_ok), [])
+      hc._live_bridge_interpreters("not-running-bridge.py", SPACED_BOTH, exe_ok, owned=owned), [])
 check("executable unresolvable -> None", hc._live_bridge_interpreters(
-    "remote-gateway-bridge.py", SPACED_BOTH, lambda pid: None), [])
+    "remote-gateway-bridge.py", SPACED_BOTH, lambda pid: None, owned=owned), [])
 
 # _proc_executable against the REAL ps: everything above injects exe_of, so
 # without this nothing exercises the helper that reads the process table.
@@ -99,8 +101,18 @@ if not _self or "python" not in os.path.basename(_self).lower():
     failures.append(f"_proc_executable on our own live PID should name a python, got {_self!r}")
 check("framework Python (capital P) is still a python", hc._live_bridge_interpreters(
     "remote-gateway-bridge.py", SPACED_BOTH,
-    lambda pid: "/L/Python.framework/Versions/3.14/Resources/Python.app/Contents/MacOS/Python"),
+    lambda pid: "/L/Python.framework/Versions/3.14/Resources/Python.app/Contents/MacOS/Python",
+    owned=owned),
     ["/L/Python.framework/Versions/3.14/Resources/Python.app/Contents/MacOS/Python"])
+
+check("the current process is owned by the current user",
+      platform.process_owned_by_current_user(os.getpid()), True)
+if hasattr(os, "getuid") and os.getuid() != 0:
+    check("pid 1 is owned by another user", platform.process_owned_by_current_user(1), False)
+else:
+    print("SKIP pid 1 ownership: current user is root")
+check("an impossible PID is not owned by the current user",
+      platform.process_owned_by_current_user(2**31 - 1), False)
 
 # startup-runtime.sh launches one gateway per AG2_REMOTE_TOKEN_*, so a scalar
 # both under-collects and makes the answer depend on ps row order.
@@ -109,16 +121,31 @@ TWO_A = ("  10 1 /healthy/python3 /x/src/remote-gateway-bridge.py\n"
 TWO_B = ("  20 1 /degraded/python3 /y/src/remote-gateway-bridge.py\n"
          "  10 1 /healthy/python3 /x/src/remote-gateway-bridge.py\n")
 two = lambda pid: {"10": "/healthy/python3", "20": "/degraded/python3"}.get(pid)
-_a = hc._live_bridge_interpreters("remote-gateway-bridge.py", TWO_A, two)
-_b = hc._live_bridge_interpreters("remote-gateway-bridge.py", TWO_B, two)
+_a = hc._live_bridge_interpreters("remote-gateway-bridge.py", TWO_A, two, owned=owned)
+_b = hc._live_bridge_interpreters("remote-gateway-bridge.py", TWO_B, two, owned=owned)
 check("two live gateways: BOTH collected", _a, ["/degraded/python3", "/healthy/python3"])
 check("selection is ps-row-order invariant", _a, _b)
+OWNERSHIP_ROWS = ("  100 1 /healthy/python3 /x/src/remote-gateway-bridge.py\n"
+                  "  200 1 /tmp/other-user/python3 /y/src/remote-gateway-bridge.py\n")
+looked_up = []
+
+
+def ownership_exe(pid):
+    looked_up.append(pid)
+    return {"100": "/healthy/python3", "200": "/tmp/other-user/python3"}.get(pid)
+
+
+check("foreign matching bridge is excluded",
+      hc._live_bridge_interpreters("remote-gateway-bridge.py", OWNERSHIP_ROWS,
+                                   ownership_exe, owned=lambda pid: pid == "100"),
+      ["/healthy/python3"])
+check("foreign PID is skipped before executable lookup", looked_up, ["100"])
 
 # `script in argv` over-matched: a -c payload that merely prints the name is not
 # a launch. The script must appear as its own argv token.
 DECOY = "  900 1 /decoy/python3 -c print('remote-gateway-bridge.py')\n"
 check("a -c decoy naming the script is not a bridge", hc._live_bridge_interpreters(
-    "remote-gateway-bridge.py", DECOY, lambda pid: "/decoy/python3"), [])
+    "remote-gateway-bridge.py", DECOY, lambda pid: "/decoy/python3", owned=owned), [])
 check("_proc_executable on an impossible PID -> None", hc._proc_executable(2**31 - 1), None)
 
 _platform_executable = hc._platform_process_executable
@@ -135,8 +162,10 @@ if set(hc._VAULT_SCANNER_SCRIPTS) != set(hc._VAULT_SCANNER_BRIDGES):
 # The COMPOSED check, driven through _ps_snapshot + the parser rather than a stub
 # of the helper, so a parser regression fails here too.
 _snap, _exe = hc._ps_snapshot, hc._proc_executable
+_owned = hc._proc_owned_by_me
 hc._ps_snapshot = lambda: SPACED_BOTH
 hc._proc_executable = lambda pid: BUNDLED if pid == "76550" else None
+hc._proc_owned_by_me = lambda pid: True
 
 r = hc.check_secret_scanner_mode()
 if r["status"] != "warn":
@@ -148,6 +177,7 @@ if BUNDLED not in r["detail"]:
 # borrowed: keying it on sys.executable failed where detect-secrets is absent.
 _run = hc.subprocess.run
 hc._proc_executable = lambda pid: sys.executable if pid == "76550" else None
+hc._proc_owned_by_me = lambda pid: True
 hc.subprocess.run = lambda *a, **k: types.SimpleNamespace(
     returncode=0, stdout="", stderr="")
 r = hc.check_secret_scanner_mode()
@@ -155,7 +185,7 @@ hc.subprocess.run = _run
 if r["status"] != "ok":
     failures.append(f"a healthy live interpreter must be ok, got {r['status']}")
 
-hc._ps_snapshot, hc._proc_executable = _snap, _exe
+hc._ps_snapshot, hc._proc_executable, hc._proc_owned_by_me = _snap, _exe, _owned
 
 if failures:
     for f in failures:

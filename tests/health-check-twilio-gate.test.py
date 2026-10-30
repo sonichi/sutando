@@ -149,7 +149,8 @@ def startup_gate(env_content: str | None, vault: dict[str, str], resolver: bool)
 
 
 def phone_block(env_content: str, vault: dict[str, str], server: str,
-                foreign_listener: bool = False, running: str | None = None) -> dict:
+                foreign_listener: bool = False, running: str | None = None,
+                expected_stderr: str = "") -> dict:
     """Run the real phone block with its services stubbed.
 
     `server` is what the stubbed conversation-server does: 'binds' (a child
@@ -199,7 +200,8 @@ def phone_block(env_content: str, vault: dict[str, str], server: str,
         ])
         r = subprocess.run(["bash", "-c", script], env=_shell_env(vault, resolver=True),
                            capture_output=True, text=True)
-        assert r.returncode == 0 and r.stderr == "", f"phone block failed rc={r.returncode}: {r.stderr}"
+        assert r.returncode == 0 and r.stderr == expected_stderr, \
+            f"phone block failed rc={r.returncode}: {r.stderr}"
         return {
             "launched": (Path(d) / "launched").exists(),
             "ngrok": (Path(d) / "ngrok-started").exists(),
@@ -211,6 +213,7 @@ PLACEHOLDER = "# TWILIO_ACCOUNT_SID=ACxxxxxxxxx\n# TWILIO_AUTH_TOKEN=xxx\n# TWIL
 ALL_THREE = "TWILIO_ACCOUNT_SID=AC123abc\nTWILIO_AUTH_TOKEN=tok\nTWILIO_PHONE_NUMBER=+14155550100\n"
 VAULT_ALL = {"TWILIO_ACCOUNT_SID": "ACvault", "TWILIO_AUTH_TOKEN": "tokvault", "TWILIO_PHONE_NUMBER": "+14155550100"}
 VAULT_SID_TOKEN = {"TWILIO_ACCOUNT_SID": "ACvault", "TWILIO_AUTH_TOKEN": "tokvault"}
+NGROK_API_WARNING = "  ⚠ ngrok API not found on the ngrok process just started — WEBHOOK_BASE_URL not updated\n"
 
 # (name, .env content or None, vault values, expected, expected without the resolver)
 CASES = [
@@ -231,26 +234,26 @@ CASES = [
 ]
 
 # (name, .env content, vault values, server behaviour, foreign listener, already-running mode,
-#  expect launched, expect ngrok, expected output fragment)
+#  expect launched, expect ngrok, expected output fragment, expected stderr)
 BLOCK_CASES = [
     ("1) vault SID + token, no number: phone stack stays off", PLACEHOLDER, VAULT_SID_TOKEN, "binds", False, None,
-     False, False, "no Twilio creds"),
-    ("2) all three, server binds: tunnel opens", ALL_THREE, {}, "binds", False, None,
-     True, True, "ngrok (https://t.ngrok-free.app)"),
+     False, False, "no Twilio creds", ""),
+    ("2) all three, server binds: unverified tunnel API", ALL_THREE, {}, "binds", False, None,
+     True, True, "Starting ngrok tunnel...", NGROK_API_WARNING),
     ("3) all three, server exits: no tunnel to a dead port", ALL_THREE, {}, "exits", False, None,
-     True, False, "conversation server exited"),
+     True, False, "conversation server exited", ""),
     ("4) all three, server never binds: no tunnel", ALL_THREE, {}, "hangs", False, None,
-     True, False, "did not bind port 3100 within 1s"),
+     True, False, "did not bind port 3100 within 1s", ""),
     ("5) foreign listener on :3100, server exits (port in use): no tunnel to it", ALL_THREE, {}, "exits", True, None,
-     True, False, "held by pid"),
+     True, False, "held by pid", ""),
     ("6) foreign listener on :3100, server alive but not bound: no tunnel to it", ALL_THREE, {}, "hangs", True, None,
-     True, False, "held by pid"),
+     True, False, "held by pid", ""),
     ("7) already running, nothing listens: no tunnel", ALL_THREE, {}, "binds", False, "silent",
-     False, False, "nothing listens on port 3100"),
+     False, False, "nothing listens on port 3100", ""),
     ("8) already running, its pid listens: tunnel opens", ALL_THREE, {}, "binds", False, "listener",
-     False, True, "conversation server (already running)"),
+     False, True, "conversation server (already running)", NGROK_API_WARNING),
     ("9) already running, a foreign pid listens: no tunnel to it", ALL_THREE, {}, "binds", False, "foreign",
-     False, False, "held by pid"),
+     False, False, "held by pid", ""),
 ]
 
 
@@ -268,8 +271,9 @@ def main() -> int:
         if not ok:
             fails.append(name)
     print("phone block:")
-    for name, env, vault, server, foreign, running, want_launched, want_ngrok, fragment in BLOCK_CASES:
-        got = phone_block(env, vault, server, foreign_listener=foreign, running=running)
+    for name, env, vault, server, foreign, running, want_launched, want_ngrok, fragment, expected_stderr in BLOCK_CASES:
+        got = phone_block(env, vault, server, foreign_listener=foreign, running=running,
+                          expected_stderr=expected_stderr)
         ok = got["launched"] == want_launched and got["ngrok"] == want_ngrok and fragment in got["out"]
         status = "PASS" if ok else "FAIL"
         print(f"  {status} {name} (launched={got['launched']}, ngrok={got['ngrok']}, "

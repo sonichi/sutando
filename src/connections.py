@@ -86,9 +86,11 @@ from pathlib import Path
 from typing import Callable, Iterator, Mapping, Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.append(str(Path(__file__).resolve().parent.parent / "shared"))  # lint-workspace-resolution: allow-repo-root
 
 import workspace_lock  # noqa: E402
 from file_lock import locked_file  # noqa: E402
+from gateway_credential_sources import URL_KEYS  # noqa: E402
 
 STATE_NAME = "connections.json"
 LOCK_NAME = "connections.lock"
@@ -2201,12 +2203,13 @@ def launch_env(entry: Mapping[str, object], environ: Optional[Mapping[str, str]]
         "SUTANDO_SUPERVISED": "1",
         "GATEWAY_INSTANCE": str(entry["instance"]),
         "REMOTE_TASK_TOKEN": token,
-        "REMOTE_TASK_URL": "",
         "REMOTE_TASK_TOKEN_FILE": _token_file(entry, environ),
         "REMOTE_TASK_CHANNEL_DIR": str(entry["channel_dir"]),
         "REMOTE_PROACTIVE_ROOM": environ.get("REMOTE_PROACTIVE_ROOM", "") if entry.get("primary") else "",
         NOT_BEFORE_ENV: str(entry["not_before"]) if isinstance(entry.get("not_before"), int) else "",
     })
+    for key in URL_KEYS:
+        env[key] = ""
     return env
 
 

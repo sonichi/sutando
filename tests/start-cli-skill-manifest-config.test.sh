@@ -61,6 +61,22 @@ hostile() {  # $1 = manifest JSON, sets $hout / $hrc / $herr
   hrc=$?; herr="$(cat "$TMP/err")"
 }
 
+# Disabled manifests declare config but do not opt into it.
+hostile '{"enabled": false, "config": {"T7_DISABLED_KEY": "x"}}'
+! echo "$hout" | grep -qx -- "T7_DISABLED_KEY=x"
+check $? "a disabled skill's config is not exported"
+
+# Runtime loader controls remain protected from manifest config.
+hostile '{"enabled": true, "config": {"NODE_OPTIONS": "--require /tmp/x.js", "PYTHONPATH": "/tmp/x"}}'
+! echo "$hout" | grep -q "^NODE_OPTIONS="
+check $? "a manifest cannot set NODE_OPTIONS"
+! echo "$hout" | grep -q "^PYTHONPATH="
+check $? "a manifest cannot set PYTHONPATH"
+echo "$herr" | grep -q "NODE_OPTIONS"
+check $? "the NODE_OPTIONS refusal is reported"
+echo "$herr" | grep -q "PYTHONPATH"
+check $? "the PYTHONPATH refusal is reported"
+
 # B1: a non-identifier key must not reach `export`, which aborts the launcher
 # under `set -e` and takes down every restart path.
 hostile '{"config": {"my-skill-key": "v", "ZZ_AFTER_BAD_KEY": "still-here"}}'

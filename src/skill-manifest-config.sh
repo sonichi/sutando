@@ -21,13 +21,22 @@ IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 # whatever it declares. Modelled on the desktop supervisor scrubber, which
 # lives in another repository, so the two lists are maintained separately and
 # no CI here can observe drift between them.
-PROTECTED = {"PATH", "IFS", "ENV", "BASH_ENV", "SHELLOPTS", "BASHOPTS", "PS4", "HOME", "SHELL"}
+PROTECTED = {
+    "PATH", "IFS", "ENV", "BASH_ENV", "SHELLOPTS", "BASHOPTS", "PS4", "HOME", "SHELL",
+    "NODE_OPTIONS", "NODE_PATH", "NODE_REPL_EXTERNAL_MODULE",
+    "PYTHONPATH", "PYTHONSTARTUP", "PYTHONHOME", "PYTHONINSPECT",
+    "PERL5OPT", "PERL5LIB", "RUBYOPT", "RUBYLIB",
+    "JAVA_TOOL_OPTIONS", "_JAVA_OPTIONS",
+}
 PROTECTED_PREFIX = ("LD_", "DYLD_", "BASH_FUNC_", "__BASH_FUNC")
 
 try:
-    cfg = json.load(open(sys.argv[1])).get("config") or {}
+    manifest = json.load(open(sys.argv[1]))
 except Exception:
-    cfg = {}
+    manifest = {}
+if isinstance(manifest, dict) and manifest.get("enabled") is False:
+    sys.exit(0)
+cfg = (manifest.get("config") or {}) if isinstance(manifest, dict) else {}
 if not isinstance(cfg, dict):
     cfg = {}
 for k, v in cfg.items():

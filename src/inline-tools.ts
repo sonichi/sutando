@@ -16,7 +16,7 @@
 
 import { execFileSync } from 'node:child_process';
 import { writeFileSync, unlinkSync, readdirSync, readFileSync, existsSync, statSync, mkdirSync } from 'node:fs';
-import { join, extname, dirname, delimiter } from 'node:path';
+import { join, extname, dirname, delimiter, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { z } from 'zod';
 import { requirePython } from './python-binary.js';
@@ -1364,20 +1364,43 @@ async function loadSkillManifestTools(): Promise<{ owner: ToolDefinition[]; anyC
 		const expanded = expandHome(privateRoot);
 		dirsToScan.push(join(expanded, 'skills'));
 	}
-	// External plugin checkouts: an optional voice-surface plugin can live
-	// ENTIRELY in its own sibling repo, so this host keeps no in-repo copy and
-	// names no plugin. Mirrors src/discord-bridge.py's hook loader — scan
-	// $SUTANDO_EXTERNAL_PLUGIN_DIRS (os.pathsep-separated) + every sibling
-	// checkout's skills/. The dedupe-by-name below makes a stray duplicate safe.
-	for (const d of (process.env.SUTANDO_EXTERNAL_PLUGIN_DIRS || '').split(delimiter)) {
-		if (d.trim()) dirsToScan.push(join(d.trim(), 'skills'));
+	// External plugin checkouts are trusted only when explicitly listed. An entry may
+	// be a checkout root (its skills/ is scanned) or a skills dir directly.
+	const externalPluginDirs = (process.env.SUTANDO_EXTERNAL_PLUGIN_DIRS || '')
+		.split(delimiter).map(d => d.trim()).filter(Boolean);
+	for (const d of externalPluginDirs) {
+		dirsToScan.push(join(d, 'skills'), d);
 	}
 	try {
 		const siblingsRoot = dirname(REPO_ROOT); // dir holding sibling checkouts
-		const ownSkills = join(REPO_ROOT, 'skills');
+		const ownRoot = resolve(REPO_ROOT);
+		const listedRoots = new Set(externalPluginDirs.map(d => resolve(d)));
 		for (const sib of readdirSync(siblingsRoot)) {
-			const sibSkills = join(siblingsRoot, sib, 'skills');
-			if (sibSkills !== ownSkills && existsSync(sibSkills)) dirsToScan.push(sibSkills);
+			try {
+				const siblingRoot = resolve(siblingsRoot, sib);
+				const siblingSkills = join(siblingRoot, 'skills');
+				if (siblingRoot === ownRoot || listedRoots.has(siblingRoot) || !statSync(siblingSkills).isDirectory()) continue;
+				let contributes = false;
+				for (const name of readdirSync(siblingSkills)) {
+					try {
+						const skillDir = join(siblingSkills, name);
+						if (!statSync(skillDir).isDirectory()) continue;
+						const manifestPath = join(skillDir, 'manifest.json');
+						if (!existsSync(manifestPath)) continue;
+						const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as {
+							enabled?: boolean;
+							tools?: string;
+						};
+						if (manifest.enabled === true && typeof manifest.tools === 'string' && manifest.tools.length > 0) {
+							contributes = true;
+							break;
+						}
+					} catch { /* malformed manifests are not executable candidates */ }
+				}
+				if (contributes) {
+					console.warn(`[skill-loader] not loading ${siblingSkills}: sibling checkouts load only when listed in SUTANDO_EXTERNAL_PLUGIN_DIRS`);
+				}
+			} catch { /* one unreadable sibling does not hide the others */ }
 		}
 	} catch { /* siblings root unreadable — skip */ }
 	const owner: ToolDefinition[] = [];

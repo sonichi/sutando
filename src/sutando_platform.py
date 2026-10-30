@@ -167,6 +167,48 @@ def process_executable(pid: str | int) -> str | None:
         return None
 
 
+def process_owned_by_current_user(pid: str | int) -> bool:
+    """Whether `pid` belongs to the current user; false when ownership is unavailable."""
+    try:
+        pid_value = int(pid)
+        if pid_value <= 0:
+            return False
+        if is_windows():
+            script = (
+                "[Console]::OutputEncoding = [Text.UTF8Encoding]::new(); "
+                f"$p = Get-CimInstance Win32_Process -Filter 'ProcessId = {pid_value}' "
+                "-ErrorAction Stop; "
+                "if (-not $p) { Write-Output '0'; exit 0 }; "
+                "$o = Invoke-CimMethod -InputObject $p -MethodName GetOwner -ErrorAction Stop; "
+                "$owner = \"$($o.Domain)\\$($o.User)\"; "
+                "$current = [Security.Principal.WindowsIdentity]::GetCurrent().Name; "
+                "if ($o.ReturnValue -eq 0 -and $owner -ieq $current) { Write-Output '1' } "
+                "else { Write-Output '0' }"
+            )
+            result = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
+                timeout=WINDOWS_CIM_TIMEOUT,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            )
+            return result.returncode == 0 and (result.stdout or "").strip() == "1"
+        if hasattr(os, "getuid"):
+            result = subprocess.run(
+                ["ps", "-o", "uid=", "-p", str(pid_value)],
+                timeout=5.0,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            return result.returncode == 0 and (result.stdout or "").strip() == str(os.getuid())
+        return False
+    except Exception:
+        return False
+
+
 def process_snapshot() -> str | None:
     """Return a `PID PPID ARGS` process table, or None when unavailable."""
     try:

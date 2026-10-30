@@ -242,21 +242,60 @@ REPO = resolve_workspace()
 #   "message_hook": {"module": "scripts/foo.py", "matches": "fn_a", "handle": "fn_b"}
 # where matches(text)->bool and handle(message, self_user_id)->str.
 #
-# Search dirs: $SUTANDO_EXTERNAL_PLUGIN_DIRS (os.pathsep-separated), each sibling
-# checkout's skills/ (../<repo>/skills), the in-repo skills/, the workspace skills/.
+# Search dirs: $SUTANDO_EXTERNAL_PLUGIN_DIRS (os.pathsep-separated), the
+# in-repo skills/, and the workspace skills/.
 def _load_plugin_message_hooks():
     hooks = []
     here = Path(__file__).resolve()
     search = []
+    external_dirs = set()
     for d in os.environ.get("SUTANDO_EXTERNAL_PLUGIN_DIRS", "").split(os.pathsep):
         if d.strip():
-            search.append(Path(d.strip()))
+            plugin_dir = Path(d.strip())
+            # Entries are checkout roots (hooks live in <root>/skills); a path
+            # already pointing at a skills dir is accepted for back-compat.
+            search.append(plugin_dir / "skills")
+            search.append(plugin_dir)
+            try:
+                external_dirs.add((plugin_dir / "skills").resolve())
+                external_dirs.add(plugin_dir.resolve())
+            except Exception:
+                pass
     siblings_root = here.parent.parent.parent  # dir that holds sibling checkouts
     try:
         if siblings_root.is_dir():
             for sib in sorted(siblings_root.iterdir()):
-                if (sib / "skills").is_dir():
-                    search.append(sib / "skills")
+                try:
+                    sibling_skills = sib / "skills"
+                    if not sibling_skills.is_dir():
+                        continue
+                    if sib.resolve() == here.parent.parent.resolve() or sibling_skills.resolve() in external_dirs:
+                        continue
+                    contributes = False
+                    for sub in sorted(sibling_skills.iterdir()):
+                        mf = sub / "manifest.json"
+                        if not mf.is_file():
+                            continue
+                        try:
+                            manifest = json.loads(mf.read_text())
+                        except Exception:
+                            continue
+                        spec = manifest.get("message_hook")
+                        if (not manifest.get("enabled", False) or not isinstance(spec, dict)
+                                or not all(isinstance(spec.get(key), str) and spec.get(key)
+                                           for key in ("module", "matches", "handle"))):
+                            continue
+                        if (sub / spec["module"]).is_file():
+                            contributes = True
+                            break
+                    if contributes:
+                        print(
+                            f"  [plugin-hook] not loading {sibling_skills}: sibling checkouts load only when "
+                            "listed in SUTANDO_EXTERNAL_PLUGIN_DIRS",
+                            flush=True,
+                        )
+                except Exception:
+                    continue
     except Exception:
         pass
     search.append(here.parent.parent / "skills")

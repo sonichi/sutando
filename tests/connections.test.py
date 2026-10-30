@@ -33,12 +33,14 @@ import urllib.error
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "shared"))
 sys.path.insert(0, str(ROOT / "src"))
 
 import connections as C  # noqa: E402
 import dotspace  # noqa: E402
 import workspace_lock  # noqa: E402
 from _helpers import bridge_lease  # noqa: E402
+import gateway_credential_sources as G  # noqa: E402
 
 agent_identity = C._agent_identity()
 
@@ -1313,6 +1315,19 @@ class Launching(Base):
         self.vault.store.clear()
         with self.assertRaises(C.NoToken):
             C.launch_env(entry, base, vault=self.vault)
+
+    def test_launch_env_clears_every_gateway_url_alias(self):
+        self.add(TOKEN_B, fetch=agents("@s:beta-fixture.net"))
+        entry = C.plan_entry("beta-fixture-net", {}, workspace=self.ws)
+        base = {
+            "REMOTE_TASK_TOKEN": TOKEN_B,
+            "REMOTE_TASK_URL": "",
+            "AG2_REMOTE_URL": "https://other-gateway.example/relay",
+        }
+        env = C.launch_env(entry, base, vault=self.vault)
+        self.assertEqual(env["AG2_REMOTE_URL"], "")
+        self.assertEqual(env["REMOTE_TASK_URL"], "")
+        self.assertEqual(G.discover(env).url, TOKEN_B.split("|", 1)[0])
 
     def test_launch_spawns_the_bridge_and_records_the_pid(self):
         self.add(TOKEN_B, fetch=agents("@s:beta-fixture.net"))

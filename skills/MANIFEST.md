@@ -11,7 +11,7 @@ A manifest-loaded skill is a directory containing:
 - `tools.ts` (if `manifest.tools` is set) — exports `tools: ToolDefinition[]`, picked up at agent startup
 - optional `server.py` / `start.sh` / other runtime infrastructure the tools rely on
 
-At voice-agent startup, `loadSkillManifestTools()` in `src/inline-tools.ts` scans the public `skills/` directory **and** the optional `$SUTANDO_MEMORY_DIR/skills/` directory (legacy `$SUTANDO_PRIVATE_DIR` honored for one release per #870), dynamically imports each tools entry point, and merges the exported tool definitions into `inlineTools`.
+At voice-agent startup, `loadSkillManifestTools()` in `src/inline-tools.ts` scans the public `skills/` directory **and** the optional `$SUTANDO_MEMORY_DIR/skills/` directory (legacy `$SUTANDO_PRIVATE_DIR` honored for one release per #870), dynamically imports each tools entry point, and merges the exported tool definitions into `inlineTools`. External plugin checkouts load only when listed in `$SUTANDO_EXTERNAL_PLUGIN_DIRS` (os.pathsep-separated checkout roots or skills dirs) — sibling checkouts are no longer auto-discovered; a dev checkout that relied on that must list the checkout explicitly. The Discord bridge's message-hook loader uses the same list.
 
 The same `inlineTools` list is also pushed into the phone agent's tool table (see `skills/phone-conversation/scripts/conversation-server.ts:587`), so any tool a manifest-loaded skill contributes is automatically available to:
 
