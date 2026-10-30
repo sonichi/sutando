@@ -39,7 +39,6 @@ import mimetypes
 import os
 import uuid
 import re
-import secrets
 import shlex
 import shutil
 import sys
@@ -85,6 +84,7 @@ def _slack_claims_name(name: str, body=None) -> bool:
                                           body=body, other_bridges_configured=_other_bridges_configured())
 from owner_activity import write_owner_activity as _write_owner_activity_shared  # noqa: E402
 import slack_access  # noqa: E402
+import tofu_enrollment  # noqa: E402
 
 # Observability: emit channel.slack.<in|out> into the local obs spine
 # (src/observability). Guarded so a missing module never crashes the bridge.
@@ -224,13 +224,8 @@ def archive_file(src: Path, kind: str, task_id: str) -> bool:
 
 ACCESS_FILE = channel_access_path("slack")
 
-# TOFU enrollment code — set at startup when access.json doesn't exist.
-# The first DM must include this code to become owner. RETAINED for the whole
-# process lifetime (never cleared) so the gate stays armed if access.json is
-# deleted externally later (#899). None only when access.json already existed
-# at startup (bridge already enrolled). See telegram-bridge.py for the same
-# mechanism.
-_TOFU_ENROLLMENT_CODE: str | None = None
+# Set in main() when access.json is absent; None means enrollment is closed.
+_TOFU_ENROLLMENT: "tofu_enrollment.EnrollmentChallenge | None" = None
 
 # In-memory mirror of access.json. Updated on every successful read.
 # Used by tofu_onboard() to detect and recover from external deletions
@@ -1017,36 +1012,32 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
         # Don't let a probe failure block real work; just skip the log line.
         pass
 
-    # Access control via TOFU
-    global _TOFU_ENROLLMENT_CODE
     allowed = load_allowed()
+    if allowed is None and (_restore_access_from_cache() or _restore_access_from_disk()):
+        allowed = load_allowed() or set()
     if allowed is None:
-        # TOFU state — require enrollment code before auto-onboarding as owner,
-        # so an attacker who can DM the bot can't claim ownership first.
-        # Enrollment is DM-only: channel @mentions also route here but carry no
-        # channel_type=="im", so drop them — a leaked code must not be claimable
-        # from a shared channel.
+        # Enrollment is DM-only; mentions in shared channels are ignored.
         if event.get("channel_type") != "im":
             print(f"  TOFU: ignored non-DM event from {user_id} — enrollment is DM-only", flush=True)
             return None
         channel = event.get("channel") or user_id
-        if _TOFU_ENROLLMENT_CODE and _TOFU_ENROLLMENT_CODE not in (text or ""):
+        verdict = tofu_enrollment.check_enrollment(_TOFU_ENROLLMENT, text)
+        if verdict != tofu_enrollment.ACCEPTED:
             try:
                 app.client.chat_postMessage(
                     channel=channel,
-                    text=(
-                        "Enrollment code required.\n"
-                        "Check the bridge startup log for your code and send it here."
-                    ),
+                    text=tofu_enrollment.reply_for(verdict),
                 )
             except Exception:
                 pass
-            print(f"  TOFU: rejected enrollment from {user_id} — code not presented", flush=True)
+            print(f"  TOFU: {verdict} enrollment attempt from {user_id}", flush=True)
             return None
-        allowed = tofu_onboard(user_id, username)
-        # Keep _TOFU_ENROLLMENT_CODE valid for the process lifetime (do NOT clear
-        # it) so the gate stays armed if access.json is deleted externally later
-        # (#899), instead of falling through to an unguarded tofu_onboard().
+        try:
+            allowed = tofu_onboard(user_id, username)
+        except Exception:
+            tofu_enrollment.release_enrollment(_TOFU_ENROLLMENT)
+            raise
+        tofu_enrollment.commit_enrollment(_TOFU_ENROLLMENT)
     # Every _write_task call is a DM (handle_message) or an @mention
     # (handle_mention), so a non-allowlisted sender here DID address the bot —
     # ack them (rate-limited) before the fail-closed drop so it isn't silent.
@@ -1903,7 +1894,7 @@ def _recover_orphan_sending_files() -> int:
 
 
 def main():  # pragma: no cover
-    global _TOFU_ENROLLMENT_CODE
+    global _TOFU_ENROLLMENT
     _single_instance_acquire("slack-bridge")
     print("Slack bridge started. Socket Mode connecting...", flush=True)
     _recover_orphan_sending_files()
@@ -1920,16 +1911,10 @@ def main():  # pragma: no cover
     # (owner CR #2161). Idempotent: no-op once a tierMap exists.
     _ensure_tier_map_seeded()
 
-    # TOFU enrollment code: generated when access.json doesn't exist so
-    # the first DM must present it before being auto-enrolled as owner.
     if not ACCESS_FILE.exists():
-        _TOFU_ENROLLMENT_CODE = secrets.token_hex(3)  # 6-char hex, 16M combinations
-        print("", flush=True)
-        print("  *** TOFU enrollment required ***", flush=True)
-        print(f"  Enrollment code: {_TOFU_ENROLLMENT_CODE}", flush=True)
-        print("  Send this code in your first DM to register as owner.", flush=True)
-        print("  Anyone who sends this code first becomes owner — keep it private.", flush=True)
-        print("", flush=True)
+        _TOFU_ENROLLMENT = tofu_enrollment.EnrollmentChallenge()
+        for line in tofu_enrollment.banner_lines(_TOFU_ENROLLMENT):
+            print(line, flush=True)
 
     threading.Thread(target=result_watcher, name="slack-result-watcher", daemon=True).start()
     threading.Thread(target=_no_events_hint_thread, name="slack-no-events-hint", daemon=True).start()

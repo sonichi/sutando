@@ -1,25 +1,9 @@
 #!/usr/bin/env python3
-"""
-Functional tests for the Slack bridge TOFU enrollment-code gate.
+"""Functional tests for Slack's first-owner enrollment gate.
 
-Security finding #3: without a gate, any attacker who sends the first DM
-to the Slack bot claims owner-tier access via TOFU. The fix generates a
-6-char hex enrollment code at startup (printed to the operator log) and
-requires that code to be present in the first DM before auto-enrolling.
-
-Test contract:
-  (a) Code required but NOT in message text → _write_task returns None,
-      sends a rejection chat message, does not consume the code.
-  (b) Code IS in message text → TOFU enrollment proceeds, tofu_onboard called
-      once, and the code is RETAINED (not cleared) so the gate stays armed if
-      access.json is later deleted externally (#899 / security finding #3).
-  (c) _TOFU_ENROLLMENT_CODE is None (restart where access.json exists, so the
-      TOFU branch is unreachable in practice) → enrollment proceeds without
-      the code check (backward compat; existing behavior preserved).
-  (d) Channel @mention while in TOFU state → never onboards, even with the
-      code present; enrollment is DM-only (channel_type == "im").
-  (e) Regression: enroll → delete access.json → next DM without the code is
-      rejected (the retained code keeps the gate armed across #899 deletion).
+Enrollment requires the entire direct-message text to match the current
+single-use code. Missing challenges are closed, and prior access is restored
+before any new enrollment attempt.
 
 Run: python3 tests/slack-bridge-tofu-enroll.test.py
 Exit: 0 on pass, 1 on fail.
@@ -45,10 +29,6 @@ import bridge_paths  # noqa: E402
 REPO = Path(__file__).resolve().parent.parent
 
 
-# ---------------------------------------------------------------------------
-# Module loader (mirrors slack-bridge-tier-map.test.py pattern)
-# ---------------------------------------------------------------------------
-
 def _load_slack_bridge():
     os.environ.setdefault("SLACK_BOT_TOKEN", "xoxb-test-placeholder")
     os.environ.setdefault("SLACK_APP_TOKEN", "xapp-test-placeholder")
@@ -58,6 +38,7 @@ def _load_slack_bridge():
     class _StubApp:
         def __init__(self, *a, **kw):
             self.client = types.SimpleNamespace(chat_postMessage=lambda **kw: None)
+
         def event(self, _):
             return lambda fn: fn
 
@@ -70,14 +51,14 @@ def _load_slack_bridge():
         sys.modules["slack_bolt"] = stub_bolt
 
     if "slack_bolt.adapter" not in sys.modules:
-        adapter_pkg = types.ModuleType("slack_bolt.adapter")
-        sys.modules["slack_bolt.adapter"] = adapter_pkg
+        sys.modules["slack_bolt.adapter"] = types.ModuleType("slack_bolt.adapter")
     if "slack_bolt.adapter.socket_mode" not in sys.modules:
         sm_mod = types.ModuleType("slack_bolt.adapter.socket_mode")
         sm_mod.SocketModeHandler = object
         sys.modules["slack_bolt.adapter.socket_mode"] = sm_mod
 
     import importlib.util
+
     bridge_path = REPO / "src" / "slack-bridge.py"
     spec = importlib.util.spec_from_file_location("slack_bridge_tofu_enroll", bridge_path)
     sys.path.insert(0, str(REPO / "src"))
@@ -88,10 +69,6 @@ def _load_slack_bridge():
 
 BRIDGE = _load_slack_bridge()
 
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
 def _make_dm_event(user_id: str, text: str, channel: str = "D_TEST") -> dict:
     return {
@@ -104,17 +81,15 @@ def _make_dm_event(user_id: str, text: str, channel: str = "D_TEST") -> dict:
 
 
 class _TempBridgeState:
-    """Context manager: patch ACCESS_FILE + TASKS_DIR to temp dirs, restore on exit."""
-
     def __enter__(self):
         self._td = tempfile.mkdtemp(prefix="sutando-bridge-state-")
         self._orig_access = BRIDGE.ACCESS_FILE
         self._orig_tasks = BRIDGE.TASKS_DIR
+        self._orig_post = BRIDGE.app.client.chat_postMessage
 
         BRIDGE.ACCESS_FILE = Path(self._td) / "access.json"
         BRIDGE.TASKS_DIR = Path(self._td) / "tasks"
         BRIDGE.TASKS_DIR.mkdir(parents=True, exist_ok=True)
-
         # Ensure the workspace path used by write_owner_activity exists.
         ws = Path(self._td) / "workspace"
         ws.mkdir()
@@ -141,229 +116,238 @@ class _TempBridgeState:
         # PENDING_REPLIES_FILE is bound the same way and leaked to live state.
         self._orig_paths = bridge_paths.rebind_workspace(BRIDGE, Path(self._td))
         BRIDGE.STATE_DIR.mkdir(parents=True, exist_ok=True)
+        assert BRIDGE.ACCESS_BACKUP_FILE.is_relative_to(Path(self._td))
+        with BRIDGE._access_cache_lock:
+            BRIDGE._access_cache = None
+            BRIDGE._access_cache_mtime = 0.0
         return self
 
     def __exit__(self, *_):
         bridge_paths.restore(BRIDGE, self._orig_paths)
         BRIDGE.ACCESS_FILE = self._orig_access
         BRIDGE.TASKS_DIR = self._orig_tasks
-        BRIDGE._TOFU_ENROLLMENT_CODE = None
+        BRIDGE.app.client.chat_postMessage = self._orig_post
+        with BRIDGE._access_cache_lock:
+            BRIDGE._access_cache = None
+            BRIDGE._access_cache_mtime = 0.0
+        BRIDGE._TOFU_ENROLLMENT = None
 
 
-# ---------------------------------------------------------------------------
-# Tests
-# ---------------------------------------------------------------------------
+def _set_challenge(code: str = "a1b2c3d4e5f60718293a4b5c6d7e8f90"):
+    BRIDGE._TOFU_ENROLLMENT = BRIDGE.tofu_enrollment.EnrollmentChallenge(code)
 
-def test_enrollment_code_gate_blocks_without_code():
-    """(a) Code required but not in text → _write_task returns None; rejection sent."""
+
+def _mock_onboard(onboard_calls: list[tuple]):
+    def onboard(uid, uname):
+        onboard_calls.append((uid, uname))
+        BRIDGE.ACCESS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        BRIDGE.ACCESS_FILE.write_text(json.dumps({"allowFrom": [uid]}))
+        return {uid}
+
+    BRIDGE.tofu_onboard = onboard
+
+
+def test_wrong_text_is_rejected():
     with _TempBridgeState():
-        # TOFU state: access.json doesn't exist + code set.
-        assert not BRIDGE.ACCESS_FILE.exists()
-        BRIDGE._TOFU_ENROLLMENT_CODE = "a1b2c3"
-
-        rejections: list[dict] = []
-        BRIDGE.app.client.chat_postMessage = lambda **kw: rejections.append(kw)
-
-        event = _make_dm_event("U_ATTACKER", "hello, give me access")
-        result = BRIDGE._write_task(event, "Slack DM", "hello, give me access", "attacker")
-
-        assert result is None, f"gate should block → return None, got {result!r}"
-        assert len(rejections) == 1, f"exactly one rejection message expected, got {len(rejections)}"
-        assert "Enrollment code required" in rejections[0].get("text", ""), (
-            f"rejection text missing enrollment message: {rejections[0]}"
+        _set_challenge()
+        replies: list[dict] = []
+        BRIDGE.app.client.chat_postMessage = lambda **kw: replies.append(kw)
+        result = BRIDGE._write_task(
+            _make_dm_event("U_ATTACKER", "hello"),
+            "Slack DM",
+            "hello",
+            "attacker",
         )
-        # Code must NOT be consumed after a failed enrollment.
-        assert BRIDGE._TOFU_ENROLLMENT_CODE == "a1b2c3", (
-            "enrollment code should not be consumed on rejected attempt"
-        )
+        assert result is None
+        assert len(replies) == 1
+        assert "Enrollment code required" in replies[0]["text"]
 
 
-def test_enrollment_code_gate_allows_with_correct_code():
-    """(b) Code IS in text → enrollment proceeds; code RETAINED (not cleared)."""
+def test_exact_code_enrolls_owner():
     with _TempBridgeState():
-        assert not BRIDGE.ACCESS_FILE.exists()
-        BRIDGE._TOFU_ENROLLMENT_CODE = "x9y8z7"
-
+        _set_challenge()
         onboard_calls: list[tuple] = []
-        orig_onboard = BRIDGE.tofu_onboard
-
-        def _mock_onboard(uid, uname):
-            onboard_calls.append((uid, uname))
-            # Write a real access.json so downstream code in _write_task works.
-            BRIDGE.ACCESS_FILE.parent.mkdir(parents=True, exist_ok=True)
-            BRIDGE.ACCESS_FILE.write_text(json.dumps({"allowFrom": [uid]}))
-            return {uid}
-
-        BRIDGE.tofu_onboard = _mock_onboard
+        original = BRIDGE.tofu_onboard
+        _mock_onboard(onboard_calls)
         try:
-            event = _make_dm_event("U_OWNER", "my code is x9y8z7")
-            result = BRIDGE._write_task(event, "Slack DM", "my code is x9y8z7", "realowner")
+            code = BRIDGE._TOFU_ENROLLMENT.code
+            BRIDGE._write_task(
+                _make_dm_event("U_OWNER", code),
+                "Slack DM",
+                code,
+                "realowner",
+            )
         finally:
-            BRIDGE.tofu_onboard = orig_onboard
-
-        # tofu_onboard must have been called exactly once with the right uid.
-        assert len(onboard_calls) == 1, f"tofu_onboard should be called once, got {onboard_calls}"
-        assert onboard_calls[0][0] == "U_OWNER"
-        # Enrollment code must be RETAINED after successful enrollment so the
-        # gate stays armed against a later external access.json deletion (#899).
-        assert BRIDGE._TOFU_ENROLLMENT_CODE == "x9y8z7", (
-            "enrollment code must be retained (not cleared) after successful enrollment"
-        )
+            BRIDGE.tofu_onboard = original
+        assert onboard_calls == [("U_OWNER", "realowner")]
 
 
-def test_channel_mention_never_onboards():
-    """(d) Channel @mention in TOFU state must NOT onboard, even with the code."""
+def test_substring_is_rejected():
     with _TempBridgeState():
-        assert not BRIDGE.ACCESS_FILE.exists()
-        BRIDGE._TOFU_ENROLLMENT_CODE = "chan42"
-
+        _set_challenge()
         onboard_calls: list[tuple] = []
-        orig_onboard = BRIDGE.tofu_onboard
-        BRIDGE.tofu_onboard = lambda uid, uname: onboard_calls.append((uid, uname)) or {uid}
+        original = BRIDGE.tofu_onboard
+        _mock_onboard(onboard_calls)
+        replies: list[dict] = []
+        BRIDGE.app.client.chat_postMessage = lambda **kw: replies.append(kw)
+        code = BRIDGE._TOFU_ENROLLMENT.code
+        text = "my code is " + code
+        try:
+            result = BRIDGE._write_task(
+                _make_dm_event("U_ATTACKER", text), "Slack DM", text, "attacker"
+            )
+        finally:
+            BRIDGE.tofu_onboard = original
+        assert result is None
+        assert onboard_calls == []
+        assert "Enrollment code required" in replies[0]["text"]
 
-        # app_mention events do NOT carry channel_type=="im" — model a channel
-        # mention that even includes the leaked code in its text.
-        mention_event = {
-            "user": "U_CHAN_ATTACKER",
+
+def test_five_wrong_attempts_close_enrollment():
+    with _TempBridgeState():
+        _set_challenge()
+        replies: list[dict] = []
+        onboard_calls: list[tuple] = []
+        original = BRIDGE.tofu_onboard
+        _mock_onboard(onboard_calls)
+        BRIDGE.app.client.chat_postMessage = lambda **kw: replies.append(kw)
+        try:
+            for _ in range(5):
+                BRIDGE._write_task(
+                    _make_dm_event("U_ATTACKER", "wrong"), "Slack DM", "wrong", "attacker"
+                )
+            code = BRIDGE._TOFU_ENROLLMENT.code
+            result = BRIDGE._write_task(
+                _make_dm_event("U_ATTACKER", code), "Slack DM", code, "attacker"
+            )
+        finally:
+            BRIDGE.tofu_onboard = original
+        assert result is None
+        assert onboard_calls == []
+        assert replies[-1]["text"] == BRIDGE.tofu_enrollment.reply_for(BRIDGE.tofu_enrollment.CLOSED)
+
+
+def test_missing_challenge_is_closed():
+    with _TempBridgeState():
+        BRIDGE._TOFU_ENROLLMENT = None
+        replies: list[dict] = []
+        onboard_calls: list[tuple] = []
+        original = BRIDGE.tofu_onboard
+        _mock_onboard(onboard_calls)
+        BRIDGE.app.client.chat_postMessage = lambda **kw: replies.append(kw)
+        try:
+            result = BRIDGE._write_task(_make_dm_event("U_FIRST", "hey"), "Slack DM", "hey", "firstuser")
+        finally:
+            BRIDGE.tofu_onboard = original
+        assert result is None
+        assert onboard_calls == []
+        assert replies[-1]["text"] == BRIDGE.tofu_enrollment.reply_for(BRIDGE.tofu_enrollment.CLOSED)
+
+
+def test_channel_mention_does_not_spend_challenge():
+    with _TempBridgeState():
+        _set_challenge()
+        onboard_calls: list[tuple] = []
+        original = BRIDGE.tofu_onboard
+        _mock_onboard(onboard_calls)
+        replies: list[dict] = []
+        BRIDGE.app.client.chat_postMessage = lambda **kw: replies.append(kw)
+        code = BRIDGE._TOFU_ENROLLMENT.code
+        mention = {
+            "user": "U_ATTACKER",
             "channel": "C_PUBLIC",
-            "text": "hey <@BOT> chan42",
+            "text": code,
             "ts": "1700000000.000009",
         }
         try:
-            result = BRIDGE._write_task(mention_event, "Slack mention", "hey <@BOT> chan42", "attacker")
+            result = BRIDGE._write_task(mention, "Slack mention", code, "attacker")
+            assert result is None
+            assert replies == []
+            result = BRIDGE._write_task(
+                _make_dm_event("U_OWNER", code), "Slack DM", code, "owner"
+            )
         finally:
-            BRIDGE.tofu_onboard = orig_onboard
-
-        assert result is None, "channel mention in TOFU state must return None"
-        assert onboard_calls == [], (
-            f"channel mention must NOT onboard even with the code, got {onboard_calls}"
-        )
-        assert BRIDGE._TOFU_ENROLLMENT_CODE == "chan42", "code must survive an ignored mention"
+            BRIDGE.tofu_onboard = original
+        assert onboard_calls == [("U_OWNER", "owner")]
 
 
-def test_code_survives_enrollment_and_regates_after_deletion():
-    """(e) Regression: enroll → delete access.json → next DM w/o code is rejected.
-
-    The enrollment code is not consumed on success, so re-entering TOFU state
-    after an external #899 deletion stays gated instead of auto-onboarding the
-    next sender."""
+def test_deleted_access_file_is_restored_for_trusted_owner():
     with _TempBridgeState():
-        # Reset the module access cache so step 1 is a genuine first-time TOFU.
-        with BRIDGE._access_cache_lock:
-            BRIDGE._access_cache = None
-        BRIDGE._TOFU_ENROLLMENT_CODE = "keep42"
-
-        def _mock_onboard(uid, uname):
-            BRIDGE.ACCESS_FILE.parent.mkdir(parents=True, exist_ok=True)
-            BRIDGE.ACCESS_FILE.write_text(json.dumps({"allowFrom": [uid], "tofuOwner": uid}))
-            return {uid}
-
-        orig_onboard = BRIDGE.tofu_onboard
+        _set_challenge()
         BRIDGE.app.client.chat_postMessage = lambda **kw: None
-        BRIDGE.tofu_onboard = _mock_onboard
-        try:
-            # 1. Owner enrolls with the code.
-            BRIDGE._write_task(_make_dm_event("U_OWNER", "code keep42"),
-                               "Slack DM", "code keep42", "owner")
-            assert BRIDGE.ACCESS_FILE.exists(), "owner enrollment should create access.json"
-            assert BRIDGE._TOFU_ENROLLMENT_CODE == "keep42", "code must survive enrollment"
-
-            # 2. access.json deleted externally (#899) → re-enter TOFU state.
-            BRIDGE.ACCESS_FILE.unlink()
-
-            # 3. Attacker DM WITHOUT the code → rejected, not onboarded.
-            onboard_calls: list[tuple] = []
-            BRIDGE.tofu_onboard = lambda uid, uname: onboard_calls.append(uid) or {uid}
-            result = BRIDGE._write_task(_make_dm_event("U_ATTACKER", "let me in"),
-                                        "Slack DM", "let me in", "attacker")
-        finally:
-            BRIDGE.tofu_onboard = orig_onboard
-
-        assert result is None, "post-deletion DM without code must be rejected"
-        assert onboard_calls == [], (
-            f"attacker must NOT be onboarded post-deletion, got {onboard_calls}"
+        code = BRIDGE._TOFU_ENROLLMENT.code
+        BRIDGE._write_task(_make_dm_event("U_OWNER", code), "Slack DM", code, "owner")
+        assert BRIDGE.ACCESS_FILE.exists()
+        BRIDGE.ACCESS_FILE.unlink()
+        result = BRIDGE._write_task(
+            _make_dm_event("U_ATTACKER", "hello"), "Slack DM", "hello", "attacker"
         )
+        assert result is None
+        restored = json.loads(BRIDGE.ACCESS_FILE.read_text())
+        assert "U_OWNER" in restored["allowFrom"]
+        assert "U_ATTACKER" not in restored["allowFrom"]
 
 
-def test_no_enrollment_code_skips_gate():
-    """(c) _TOFU_ENROLLMENT_CODE is None → proceeds to tofu_onboard without code check."""
+def test_enrollment_check_delegates_to_policy():
     with _TempBridgeState():
-        assert not BRIDGE.ACCESS_FILE.exists()
-        BRIDGE._TOFU_ENROLLMENT_CODE = None  # post-enrollment or already-configured restart
-
-        onboard_calls: list[tuple] = []
-        orig_onboard = BRIDGE.tofu_onboard
-
-        def _mock_onboard(uid, uname):
-            onboard_calls.append((uid, uname))
-            BRIDGE.ACCESS_FILE.parent.mkdir(parents=True, exist_ok=True)
-            BRIDGE.ACCESS_FILE.write_text(json.dumps({"allowFrom": [uid]}))
-            return {uid}
-
-        BRIDGE.tofu_onboard = _mock_onboard
-        try:
-            event = _make_dm_event("U_FIRST", "hey")
-            BRIDGE._write_task(event, "Slack DM", "hey", "firstuser")
-        finally:
-            BRIDGE.tofu_onboard = orig_onboard
-
-        assert len(onboard_calls) == 1, (
-            f"code=None should not gate; tofu_onboard should be called, got {onboard_calls}"
+        _set_challenge()
+        calls: list[tuple] = []
+        original_check = BRIDGE.tofu_enrollment.check_enrollment
+        BRIDGE.tofu_enrollment.check_enrollment = (
+            lambda challenge, text: calls.append((challenge, text))
+            or BRIDGE.tofu_enrollment.REJECTED
         )
+        BRIDGE.app.client.chat_postMessage = lambda **kw: None
+        try:
+            result = BRIDGE._write_task(
+                _make_dm_event("U_ATTACKER", "delegated"),
+                "Slack DM",
+                "delegated",
+                "attacker",
+            )
+        finally:
+            BRIDGE.tofu_enrollment.check_enrollment = original_check
+        assert result is None
+        assert calls == [(BRIDGE._TOFU_ENROLLMENT, "delegated")]
 
 
 def test_rejection_reply_uses_event_channel():
-    """(a-extra) Rejection message is sent to the event's channel, not fallback."""
     with _TempBridgeState():
-        BRIDGE._TOFU_ENROLLMENT_CODE = "code99"
-
+        _set_challenge()
         captured: list[dict] = []
         BRIDGE.app.client.chat_postMessage = lambda **kw: captured.append(kw)
-
         event = _make_dm_event("U_ATTACKER", "wrong", channel="D_SPECIFIC_CHAN")
         BRIDGE._write_task(event, "Slack DM", "wrong", "attacker")
-
-        assert captured, "rejection message must be sent"
-        assert captured[0].get("channel") == "D_SPECIFIC_CHAN", (
-            f"rejection should go to event channel, got {captured[0].get('channel')!r}"
-        )
+        assert captured
+        assert captured[0]["channel"] == "D_SPECIFIC_CHAN"
 
 
 def test_rejection_api_failure_is_swallowed():
-    """(a-fault) chat_postMessage raises → exception swallowed, _write_task still returns None."""
     with _TempBridgeState():
-        BRIDGE._TOFU_ENROLLMENT_CODE = "fail11"
+        _set_challenge()
 
-        def _raise(**kw):
+        def raise_error(**kw):
             raise RuntimeError("Slack API down")
 
-        BRIDGE.app.client.chat_postMessage = _raise
-
-        event = _make_dm_event("U_ATTACKER", "no code here")
-        result = BRIDGE._write_task(event, "Slack DM", "no code here", "attacker")
-
-        assert result is None, (
-            "rejection path must return None even when chat_postMessage raises"
+        BRIDGE.app.client.chat_postMessage = raise_error
+        result = BRIDGE._write_task(
+            _make_dm_event("U_ATTACKER", "wrong"), "Slack DM", "wrong", "attacker"
         )
-        # Code must NOT be consumed when rejected (whether API call succeeded or not).
-        assert BRIDGE._TOFU_ENROLLMENT_CODE == "fail11", (
-            "enrollment code must survive a rejected (API-failure) enrollment attempt"
-        )
+        assert result is None
 
-
-# ---------------------------------------------------------------------------
-# Driver
-# ---------------------------------------------------------------------------
 
 def main() -> int:
     tests = [
-        ("a-code-blocks-without-code", test_enrollment_code_gate_blocks_without_code),
-        ("b-code-allows-with-correct-code", test_enrollment_code_gate_allows_with_correct_code),
-        ("c-no-code-skips-gate", test_no_enrollment_code_skips_gate),
-        ("d-channel-mention-never-onboards", test_channel_mention_never_onboards),
-        ("e-code-survives-enrollment-regates-after-deletion", test_code_survives_enrollment_and_regates_after_deletion),
-        ("a-extra-reply-channel", test_rejection_reply_uses_event_channel),
-        ("a-fault-api-failure-swallowed", test_rejection_api_failure_is_swallowed),
+        ("rejects wrong text", test_wrong_text_is_rejected),
+        ("accepts the exact code", test_exact_code_enrolls_owner),
+        ("rejects a code embedded in a longer message", test_substring_is_rejected),
+        ("closes enrollment after five wrong attempts", test_five_wrong_attempts_close_enrollment),
+        ("closes enrollment when no challenge exists", test_missing_challenge_is_closed),
+        ("ignores channel mentions without spending the challenge", test_channel_mention_does_not_spend_challenge),
+        ("restores deleted access for the trusted owner", test_deleted_access_file_is_restored_for_trusted_owner),
+        ("delegates enrollment checks to shared policy", test_enrollment_check_delegates_to_policy),
+        ("replies in the event channel", test_rejection_reply_uses_event_channel),
+        ("swallows reply API failures", test_rejection_api_failure_is_swallowed),
     ]
     failures = 0
     for label, fn in tests:
@@ -380,7 +364,7 @@ def main() -> int:
     if failures:
         print(f"\n{failures}/{len(tests)} tests failed.", file=sys.stderr)
         return 1
-    print(f"\nAll {len(tests)} TOFU enrollment gate tests passed.")
+    print(f"\nAll {len(tests)} Slack enrollment tests passed.")
     return 0
 
 

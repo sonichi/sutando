@@ -52,9 +52,10 @@ pip3 install slack_bolt
 ## First run + TOFU onboarding
 
 `src/startup.sh` picks up the env file and starts `src/slack-bridge.py`
-automatically. On first DM after the bridge starts, the sender is
-auto-enrolled as owner — same trust-on-first-use flow Telegram uses (see
-`CLAUDE.md` → "Telegram access control"). The access list lives at
+automatically. When `access.json` is absent the bridge prints a one-time
+enrollment code to its log at startup; send that code, and nothing else,
+as a DM to enroll as owner — same trust-on-first-use flow Telegram uses
+(see `CLAUDE.md` → "Telegram access control"). The access list lives at
 `$CLAUDE_CONFIG_DIR/channels/slack/access.json` (same resolution as the `.env` path above).
 
 To allow additional senders later, add their Slack user IDs to `allowFrom`

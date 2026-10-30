@@ -16,7 +16,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import secrets
 import shutil
 import sys
 import time
@@ -70,6 +69,7 @@ from sutando_config import config_get, config_get_env_first  # noqa: E402
 from task_archive import find_task_file  # noqa: E402
 from task_archive import archive_file as _shared_archive_file  # noqa: E402
 from single_instance import acquire as _single_instance_acquire  # noqa: E402
+import tofu_enrollment  # noqa: E402
 import progress_stream  # noqa: E402  (opt-in owner progress streaming, SUTANDO_PROGRESS_STREAM=1)
 from vault_intercept import intercept_vault_commands, redact_vault_commands  # noqa: E402
 from chat_secret_filter import filter_chat_secrets, secret_handling_instruction  # noqa: E402
@@ -205,12 +205,8 @@ def archive_file(src: "Path", kind: str, task_id: str) -> bool:
 # Load access config
 ACCESS_FILE = channel_access_path("telegram")
 
-# TOFU enrollment code — set at startup when access.json doesn't exist.
-# The first DM must include this code to become owner. RETAINED for the
-# whole process lifetime (never cleared) so the gate stays armed if
-# access.json is deleted externally later (#899). None only when
-# access.json already existed at startup (bridge already enrolled).
-_TOFU_ENROLLMENT_CODE: str | None = None
+# Set in main() when access.json is absent; None means enrollment is closed.
+_TOFU_ENROLLMENT: "tofu_enrollment.EnrollmentChallenge | None" = None
 
 def load_allowed():
     """Return the set of allowed sender IDs, OR None if access.json doesn't exist.
@@ -290,6 +286,26 @@ def tofu_onboard(sender_id, username):
     write_private_text(ACCESS_FILE, json.dumps(payload, indent=2) + "\n")  # don't inherit umask 644 — file holds owner's Telegram user ID
     print(f"  TOFU: auto-onboarded @{username} (id={sender_id}) as owner — wrote {ACCESS_FILE}")
     return {sender_id}
+
+
+def _admit_first_owner(sender_id, username, chat_id, chat_is_private, text):
+    """Return the allowlist after a first-owner enrollment attempt, or None if not admitted."""
+    if not chat_is_private:
+        print(f"  TOFU: ignored non-private message from @{username} — enrollment is DM-only", flush=True)
+        return None
+    verdict = tofu_enrollment.check_enrollment(_TOFU_ENROLLMENT, text)
+    if verdict != tofu_enrollment.ACCEPTED:
+        api("sendMessage", chat_id=chat_id, text=tofu_enrollment.reply_for(verdict))
+        print(f"  TOFU: {verdict} enrollment attempt from @{username}", flush=True)
+        return None
+    try:
+        allowed = tofu_onboard(sender_id, username)
+    except Exception:
+        tofu_enrollment.release_enrollment(_TOFU_ENROLLMENT)
+        raise
+    tofu_enrollment.commit_enrollment(_TOFU_ENROLLMENT)
+    return allowed
+
 
 def api(method, **params):
     url = f"https://api.telegram.org/bot{TOKEN}/{method}"
@@ -731,8 +747,18 @@ def log_privacy_setting(get_me):
     )
 
 
+def _init_enrollment():
+    """Issue and announce the startup enrollment code when no access file exists."""
+    global _TOFU_ENROLLMENT
+    if ACCESS_FILE.exists():
+        return None
+    _TOFU_ENROLLMENT = tofu_enrollment.EnrollmentChallenge()
+    for line in tofu_enrollment.banner_lines(_TOFU_ENROLLMENT):
+        print(line, flush=True)
+    return _TOFU_ENROLLMENT
+
+
 def main():  # pragma: no cover
-    global _TOFU_ENROLLMENT_CODE
     _single_instance_acquire("telegram-bridge")
     print("Telegram bridge started. Polling for messages...", flush=True)
     print(log_privacy_setting(lambda: api("getMe")), flush=True)
@@ -740,21 +766,7 @@ def main():  # pragma: no cover
     # loop starts. See _recover_orphan_sending_files for rationale.
     _recover_orphan_sending_files()
 
-    # TOFU enrollment code: generated when access.json doesn't exist so
-    # the first DM must present it before being auto-enrolled as owner.
-    # Prevents an attacker who can DM the bot from grabbing ownership before
-    # the legitimate owner does. Stays valid for the whole process lifetime
-    # (never cleared after enrollment) so the gate remains armed if access.json
-    # is deleted externally later (#899); only a restart with access.json
-    # present leaves it None (TOFU branch is then unreachable anyway).
-    if not ACCESS_FILE.exists():
-        _TOFU_ENROLLMENT_CODE = secrets.token_hex(3)  # 6-char hex, 16M combinations
-        print("", flush=True)
-        print("  *** TOFU enrollment required ***", flush=True)
-        print(f"  Enrollment code: {_TOFU_ENROLLMENT_CODE}", flush=True)
-        print("  Send this code in your first DM to register as owner.", flush=True)
-        print("  Anyone who sends this code first becomes owner — keep it private.", flush=True)
-        print("", flush=True)
+    _init_enrollment()
 
     offset = None
     allowed = load_allowed()
@@ -818,24 +830,11 @@ def main():  # pragma: no cover
                 # Reload access list periodically
                 allowed = load_allowed()
                 if allowed is None:
-                    # First-ever DM after install — access.json doesn't exist.
-                    # Require the enrollment code before auto-onboarding as owner.
-                    # This prevents an attacker who can DM the bot from claiming
-                    # ownership before the legitimate owner does.
-                    if _TOFU_ENROLLMENT_CODE and _TOFU_ENROLLMENT_CODE not in (text or ""):
-                        api("sendMessage", chat_id=chat_id, text=(
-                            "Enrollment code required.\n"
-                            "Check the bridge startup log for your code and send it here."
-                        ))
-                        print(f"  TOFU: rejected enrollment from @{username} — code not presented", flush=True)
+                    allowed = _admit_first_owner(
+                        sender_id, username, chat_id, chat_is_private, text
+                    )
+                    if allowed is None:
                         continue
-                    allowed = tofu_onboard(sender_id, username)
-                    # Do NOT clear _TOFU_ENROLLMENT_CODE after enrollment. If
-                    # access.json is later deleted while the bridge keeps running
-                    # (#899), load_allowed() returns None again; keeping the code
-                    # valid for the process lifetime keeps the gate armed so the
-                    # next DM must still present it, instead of falling through to
-                    # an unguarded tofu_onboard(). Single secret, single owner.
                 if sender_id not in allowed:
                     print(f"  Dropped message from non-allowed @{username}")
                     continue

@@ -1,22 +1,8 @@
 #!/usr/bin/env python3
-"""
-Structural + module-state tests for Telegram bridge TOFU enrollment-code gate.
+"""Functional tests for Telegram's first-owner enrollment gate.
 
-Security finding #3: without a gate, the first DM to the Telegram bot
-auto-enrolls the sender as owner via TOFU. The fix generates a 6-char hex
-enrollment code at startup (printed to the operator log) and requires the
-code to be present in the first DM before auto-enrolling.
-
-This test verifies:
-  (a) Module-level _TOFU_ENROLLMENT_CODE starts as None after import.
-  (b) The module exposes _TOFU_ENROLLMENT_CODE so main() can set it.
-  (c) Structural check: enrollment code generation is wired into main().
-  (d) Structural check: the gate condition is present in the poll loop.
-  (e) Structural check: code is RETAINED (not cleared) after tofu_onboard, so
-      a later external access.json deletion (#899) re-enters TOFU state still
-      gated. Functional proof of the enroll→delete→reject sequence lives in
-      tests/slack-bridge-tofu-enroll.test.py (identical gate logic).
-  (f) Structural check: startup banner prints are wired (operator-visible log).
+Private messages must contain the entire current code. The shared challenge
+policy closes missing, expired, used, and exhausted challenges.
 
 Run: python3 tests/telegram-bridge-tofu-enroll.test.py
 Exit: 0 on pass, 1 on fail.
@@ -33,7 +19,6 @@ import importlib.util
 import os
 import re
 import sys
-import tempfile
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -56,119 +41,224 @@ SRC = BRIDGE_SRC.read_text()
 
 
 def _main_body() -> str:
-    """Extract the text starting at 'def main():' (first 6000 chars)."""
     pos = SRC.find("def main():")
     assert pos != -1, "def main(): not found in telegram-bridge.py"
     return SRC[pos: pos + 6000]
 
 
-# ---------------------------------------------------------------------------
-# (a) Module-level _TOFU_ENROLLMENT_CODE defaults to None
-# ---------------------------------------------------------------------------
-
-def test_tofu_enrollment_code_default_is_none():
-    """(a) _TOFU_ENROLLMENT_CODE is None on fresh module load (bridge not in TOFU state)."""
-    assert hasattr(BRIDGE, "_TOFU_ENROLLMENT_CODE"), (
-        "bridge module must expose _TOFU_ENROLLMENT_CODE"
-    )
-    assert BRIDGE._TOFU_ENROLLMENT_CODE is None, (
-        f"expected None (no TOFU state at module load), got {BRIDGE._TOFU_ENROLLMENT_CODE!r}"
-    )
+def _new_challenge(code: str = "a1b2c3d4e5f60718293a4b5c6d7e8f90"):
+    BRIDGE._TOFU_ENROLLMENT = BRIDGE.tofu_enrollment.EnrollmentChallenge(code)
+    return BRIDGE._TOFU_ENROLLMENT
 
 
-# ---------------------------------------------------------------------------
-# (b) Module state is writable (main() can set it)
-# ---------------------------------------------------------------------------
-
-def test_tofu_enrollment_code_is_settable():
-    """(b) Module-level _TOFU_ENROLLMENT_CODE can be set — confirms global scope works."""
-    orig = BRIDGE._TOFU_ENROLLMENT_CODE
+def test_exact_private_message_enrolls_owner():
+    challenge = _new_challenge()
+    onboard_calls: list[tuple] = []
+    original_onboard = BRIDGE.tofu_onboard
+    BRIDGE.tofu_onboard = lambda uid, username: onboard_calls.append((uid, username)) or {uid}
     try:
-        BRIDGE._TOFU_ENROLLMENT_CODE = "abc999"
-        assert BRIDGE._TOFU_ENROLLMENT_CODE == "abc999", (
-            "module-level _TOFU_ENROLLMENT_CODE must be writable"
+        result = BRIDGE._admit_first_owner(
+            "123", "owner", 123, True, challenge.code
         )
     finally:
-        BRIDGE._TOFU_ENROLLMENT_CODE = orig
+        BRIDGE.tofu_onboard = original_onboard
+        BRIDGE._TOFU_ENROLLMENT = None
+    assert result == {"123"}
+    assert onboard_calls == [("123", "owner")]
 
 
-# ---------------------------------------------------------------------------
-# (c) Structural: code generation wired into main()
-# ---------------------------------------------------------------------------
+def test_code_embedded_in_longer_message_is_rejected():
+    challenge = _new_challenge()
+    replies: list[dict] = []
+    onboard_calls: list[tuple] = []
+    original_api = BRIDGE.api
+    original_onboard = BRIDGE.tofu_onboard
+    BRIDGE.api = lambda method, **params: replies.append({"method": method, **params})
+    BRIDGE.tofu_onboard = lambda uid, username: onboard_calls.append((uid, username)) or {uid}
+    try:
+        result = BRIDGE._admit_first_owner(
+            "123", "owner", 123, True, "my code is " + challenge.code
+        )
+    finally:
+        BRIDGE.api = original_api
+        BRIDGE.tofu_onboard = original_onboard
+        BRIDGE._TOFU_ENROLLMENT = None
+    assert result is None
+    assert onboard_calls == []
+    assert "Enrollment code required" in replies[0]["text"]
 
-def test_main_generates_enrollment_code():
-    """(c) main() generates secrets.token_hex enrollment code when ACCESS_FILE missing."""
-    body = _main_body()
-    assert re.search(r"secrets\.token_hex\(", body), (
-        "main() must call secrets.token_hex() to generate the enrollment code"
+
+def test_non_private_message_does_not_spend_challenge():
+    challenge = _new_challenge()
+    replies: list[dict] = []
+    onboard_calls: list[tuple] = []
+    original_api = BRIDGE.api
+    original_onboard = BRIDGE.tofu_onboard
+    BRIDGE.api = lambda method, **params: replies.append({"method": method, **params})
+    BRIDGE.tofu_onboard = lambda uid, username: onboard_calls.append((uid, username)) or {uid}
+    try:
+        result = BRIDGE._admit_first_owner(
+            "123", "owner", 456, False, challenge.code
+        )
+        assert result is None
+        assert replies == []
+        assert onboard_calls == []
+        result = BRIDGE._admit_first_owner(
+            "123", "owner", 123, True, challenge.code
+        )
+    finally:
+        BRIDGE.api = original_api
+        BRIDGE.tofu_onboard = original_onboard
+        BRIDGE._TOFU_ENROLLMENT = None
+    assert result == {"123"}
+    assert onboard_calls == [("123", "owner")]
+
+
+def test_missing_challenge_returns_closed_reply():
+    BRIDGE._TOFU_ENROLLMENT = None
+    replies: list[dict] = []
+    onboard_calls: list[tuple] = []
+    original_api = BRIDGE.api
+    original_onboard = BRIDGE.tofu_onboard
+    BRIDGE.api = lambda method, **params: replies.append({"method": method, **params})
+    BRIDGE.tofu_onboard = lambda uid, username: onboard_calls.append((uid, username)) or {uid}
+    try:
+        result = BRIDGE._admit_first_owner("123", "owner", 123, True, "hello")
+    finally:
+        BRIDGE.api = original_api
+        BRIDGE.tofu_onboard = original_onboard
+    assert result is None
+    assert onboard_calls == []
+    assert replies[-1]["text"] == BRIDGE.tofu_enrollment.reply_for(BRIDGE.tofu_enrollment.CLOSED)
+
+
+def test_five_wrong_attempts_close_enrollment():
+    challenge = _new_challenge()
+    replies: list[dict] = []
+    onboard_calls: list[tuple] = []
+    original_api = BRIDGE.api
+    original_onboard = BRIDGE.tofu_onboard
+    BRIDGE.api = lambda method, **params: replies.append({"method": method, **params})
+    BRIDGE.tofu_onboard = lambda uid, username: onboard_calls.append((uid, username)) or {uid}
+    try:
+        for _ in range(5):
+            assert BRIDGE._admit_first_owner(
+                "456", "attacker", 456, True, "wrong"
+            ) is None
+        assert BRIDGE._admit_first_owner(
+            "456", "attacker", 456, True, challenge.code
+        ) is None
+    finally:
+        BRIDGE.api = original_api
+        BRIDGE.tofu_onboard = original_onboard
+        BRIDGE._TOFU_ENROLLMENT = None
+    assert onboard_calls == []
+    assert replies[-1]["text"] == BRIDGE.tofu_enrollment.reply_for(BRIDGE.tofu_enrollment.CLOSED)
+
+
+def test_enrollment_check_delegates_to_policy():
+    challenge = _new_challenge()
+    calls: list[tuple] = []
+    replies: list[dict] = []
+    original_check = BRIDGE.tofu_enrollment.check_enrollment
+    original_api = BRIDGE.api
+    BRIDGE.tofu_enrollment.check_enrollment = (
+        lambda current, text: calls.append((current, text))
+        or BRIDGE.tofu_enrollment.REJECTED
     )
-    assert re.search(r"_TOFU_ENROLLMENT_CODE\s*=\s*secrets\.token_hex", body), (
-        "main() must assign the generated code to _TOFU_ENROLLMENT_CODE"
-    )
-    assert re.search(r"if not ACCESS_FILE\.exists\(\)", body), (
-        "code generation must be conditional on ACCESS_FILE not existing"
-    )
+    BRIDGE.api = lambda method, **params: replies.append({"method": method, **params})
+    try:
+        result = BRIDGE._admit_first_owner("123", "owner", 123, True, "delegated")
+    finally:
+        BRIDGE.tofu_enrollment.check_enrollment = original_check
+        BRIDGE.api = original_api
+        BRIDGE._TOFU_ENROLLMENT = None
+    assert result is None
+    assert calls == [(challenge, "delegated")]
 
 
-# ---------------------------------------------------------------------------
-# (d) Structural: gate condition in poll loop
-# ---------------------------------------------------------------------------
+def test_failed_onboard_releases_the_code_for_retry():
+    challenge = _new_challenge()
+    calls: list[tuple] = []
+    replies: list[dict] = []
+    original_api = BRIDGE.api
+    original_onboard = BRIDGE.tofu_onboard
+    state = {"fail": True}
 
-def test_poll_loop_contains_gate_condition():
-    """(d) Enrollment gate check (_TOFU_ENROLLMENT_CODE not in text) is in the poll loop."""
-    assert re.search(
-        r"_TOFU_ENROLLMENT_CODE\s+and\s+_TOFU_ENROLLMENT_CODE\s+not\s+in",
-        SRC,
-    ), (
-        "TOFU enrollment gate check must appear in the bridge source "
-        "(_TOFU_ENROLLMENT_CODE not in text)"
-    )
+    def fake_onboard(uid, username):
+        calls.append((uid, username))
+        if state["fail"]:
+            raise OSError("disk full")
+        return {uid}
 
-
-# ---------------------------------------------------------------------------
-# (e) Structural: code RETAINED (not cleared) after successful enrollment
-# ---------------------------------------------------------------------------
-
-def test_enrollment_code_retained_after_onboard():
-    """(e) _TOFU_ENROLLMENT_CODE must NOT be cleared after tofu_onboard.
-
-    Security finding #3 follow-up: clearing the code left the gate inert if
-    access.json was later deleted externally (#899) — the next DM re-entered
-    tofu_onboard() with no code check. Keeping the code valid for the process
-    lifetime keeps the gate armed on that re-TOFU path."""
-    assert not re.search(
-        r"tofu_onboard\([^)]*\)\s*\n\s*_TOFU_ENROLLMENT_CODE\s*=\s*None",
-        SRC,
-    ), (
-        "_TOFU_ENROLLMENT_CODE must NOT be cleared immediately after tofu_onboard() — "
-        "keeping it valid keeps the post-deletion (#899) re-TOFU path gated"
-    )
-
-
-# ---------------------------------------------------------------------------
-# (f) Structural: startup banner is printed (operator-visible log)
-# ---------------------------------------------------------------------------
-
-def test_startup_banner_present():
-    """(f) main() prints an operator-visible enrollment code banner."""
-    body = _main_body()
-    assert re.search(r"Enrollment code:", body), (
-        "main() must print 'Enrollment code: ...' so the operator can see it"
-    )
+    BRIDGE.api = lambda method, **params: replies.append({"method": method, **params})
+    BRIDGE.tofu_onboard = fake_onboard
+    try:
+        try:
+            BRIDGE._admit_first_owner("123", "owner", 123, True, challenge.code)
+            raise AssertionError("first attempt should propagate the write failure")
+        except OSError:
+            pass
+        # The reservation must have been released: the same code can retry,
+        # and a concurrent sender cannot steal the slot in between.
+        assert challenge.check(challenge.code) == BRIDGE.tofu_enrollment.ACCEPTED
+        challenge.release()
+        state["fail"] = False
+        result = BRIDGE._admit_first_owner("123", "owner", 123, True, challenge.code)
+        assert result == {"123"}
+        assert challenge.check(challenge.code) == BRIDGE.tofu_enrollment.CLOSED
+    finally:
+        BRIDGE.api = original_api
+        BRIDGE.tofu_onboard = original_onboard
+        BRIDGE._TOFU_ENROLLMENT = None
+    assert calls == [("123", "owner"), ("123", "owner")]
 
 
-# ---------------------------------------------------------------------------
-# Driver
-# ---------------------------------------------------------------------------
+def test_init_enrollment_issues_and_announces_code_only_when_unenrolled(capsys=None):
+    import io
+    import contextlib
+    import tempfile
+
+    original_access = BRIDGE.ACCESS_FILE
+    BRIDGE._TOFU_ENROLLMENT = None
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            missing = Path(td) / "access.json"
+            BRIDGE.ACCESS_FILE = missing
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                challenge = BRIDGE._init_enrollment()
+            assert isinstance(challenge, BRIDGE.tofu_enrollment.EnrollmentChallenge)
+            assert BRIDGE._TOFU_ENROLLMENT is challenge
+            assert f"Enrollment code: {challenge.code}" in buf.getvalue()
+
+            missing.write_text('{"allowFrom": ["1"]}')
+            BRIDGE._TOFU_ENROLLMENT = None
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                assert BRIDGE._init_enrollment() is None
+            assert BRIDGE._TOFU_ENROLLMENT is None
+            assert "Enrollment code" not in buf.getvalue()
+    finally:
+        BRIDGE.ACCESS_FILE = original_access
+        BRIDGE._TOFU_ENROLLMENT = None
+
+
+def test_poll_loop_calls_first_owner_helper():
+    assert "_admit_first_owner(" in _main_body()
+
 
 def main() -> int:
     tests = [
-        ("a-default-none", test_tofu_enrollment_code_default_is_none),
-        ("b-settable", test_tofu_enrollment_code_is_settable),
-        ("c-code-gen-in-main", test_main_generates_enrollment_code),
-        ("d-gate-in-poll-loop", test_poll_loop_contains_gate_condition),
-        ("e-code-retained-after-onboard", test_enrollment_code_retained_after_onboard),
-        ("f-banner-printed", test_startup_banner_present),
+        ("accepts an exact private-message code", test_exact_private_message_enrolls_owner),
+        ("rejects a code embedded in longer text", test_code_embedded_in_longer_message_is_rejected),
+        ("ignores non-private messages without spending the challenge", test_non_private_message_does_not_spend_challenge),
+        ("closes when no challenge exists", test_missing_challenge_returns_closed_reply),
+        ("closes after five wrong attempts", test_five_wrong_attempts_close_enrollment),
+        ("delegates enrollment checks to shared policy", test_enrollment_check_delegates_to_policy),
+        ("releases the code for retry after a failed onboard", test_failed_onboard_releases_the_code_for_retry),
+        ("issues the startup code only when unenrolled", test_init_enrollment_issues_and_announces_code_only_when_unenrolled),
+        ("uses the enrollment helper in the poll loop", test_poll_loop_calls_first_owner_helper),
     ]
     failures = 0
     for label, fn in tests:
@@ -185,7 +275,7 @@ def main() -> int:
     if failures:
         print(f"\n{failures}/{len(tests)} tests failed.", file=sys.stderr)
         return 1
-    print(f"\nAll {len(tests)} Telegram TOFU enrollment gate tests passed.")
+    print(f"\nAll {len(tests)} Telegram enrollment tests passed.")
     return 0
 
 
