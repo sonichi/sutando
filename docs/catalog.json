@@ -370,7 +370,7 @@
    ],
    "status": "active",
    "canonical_for": "the tutorial skill's two modes: the voice walkthrough and the AG2 Space Getting started page",
-   "last_verified": "2026-10-15"
+   "last_verified": "2026-10-24"
   },
   "docs/voice-agent-test-framework.md": {
    "title": "Voice-agent test framework",

@@ -1,0 +1,184 @@
+{
+  "schema_version": 1,
+  "revision": "tutorial.2026-10-23.1",
+  "steps": [
+    {
+      "id": "dm",
+      "title": "Your DM",
+      "body": [
+        "Your DM with {name} is where you ask for things for yourself. What you ask for yourself (research, mail, calendar) comes back in your DM, never in a room.",
+        "Ask {name} in your DM:"
+      ],
+      "surface": "dm",
+      "screenshot": null,
+      "since_release": "2026-10-15",
+      "paste": "What can you do for me today?"
+    },
+    {
+      "id": "rooms",
+      "title": "Rooms",
+      "body": [
+        "Humans and agents talk in the same chat.",
+        "Press + at the top of the room list and choose Room. Then open the room menu (&#8942;), choose Invite, and add {name}."
+      ],
+      "surface": "room",
+      "screenshot": [
+        {
+          "asset": "room-list-add",
+          "fallback_file": "assets/room-list-add.jpg",
+          "alt": "The + button at the top of the room list"
+        },
+        {
+          "asset": "new-room-dialog",
+          "fallback_file": "assets/new-room-dialog.jpg",
+          "alt": "The New Chat Room dialog"
+        },
+        {
+          "asset": "room-menu-invite",
+          "fallback_file": "assets/room-menu-invite.jpg",
+          "alt": "The room menu, with Invite"
+        }
+      ],
+      "since_release": "2026-10-15"
+    },
+    {
+      "id": "commons",
+      "title": "Commons",
+      "body": [
+        "Each room's shared Docs, HTML pages, PDFs, whiteboards, sheets and databases. Open them with the Commons icon in the room header.",
+        "Ask {name} in a room:"
+      ],
+      "surface": "room",
+      "screenshot": [
+        {
+          "asset": "room-header-commons",
+          "fallback_file": "assets/room-header-commons.jpg",
+          "alt": "The room header; Commons is the second icon"
+        },
+        {
+          "asset": "commons-surfaces",
+          "fallback_file": "assets/commons-surfaces.jpg",
+          "alt": "Commons: Doc, Whiteboard, HTML, PDF, Sheet and Database"
+        }
+      ],
+      "since_release": "2026-10-15",
+      "paste": "Make a plan for our team offsite in Commons."
+    },
+    {
+      "id": "agents",
+      "title": "Connect other agents",
+      "body": [
+        "Bring agents from the apps you already use into your rooms.",
+        "Press + at the top of the room list, choose Agent, then Use an agent from another app, and pick the app you already use: Dot (by OpenAI, in ChatGPT), Grok Bot (in Grok) or Muse (by Meta)."
+      ],
+      "surface": "room",
+      "screenshot": null,
+      "since_release": "2026-10-15"
+    },
+    {
+      "id": "teamwork",
+      "title": "Teamwork",
+      "body": [
+        "@-mention any agent in a room to hand it work; it replies in the thread.",
+        "In a room with another agent, type @ and ask {name}:"
+      ],
+      "surface": "room",
+      "screenshot": [
+        {
+          "asset": "composer-mention",
+          "fallback_file": "assets/composer-mention.jpg",
+          "alt": "The @ button in the message composer"
+        }
+      ],
+      "since_release": "2026-10-15",
+      "paste": "Research the three best note-taking apps for a small team, then ask another agent in this room to review your answer."
+    },
+    {
+      "id": "calls",
+      "title": "Calls &amp; voice",
+      "body": [
+        "Talk live with {name} in your DM, or with people in any room.",
+        "Press the headphone icon in the room header (Start call). In your DM, {name} answers; in a room, start the call and pick your agent under &ldquo;Bring an agent?&rdquo;."
+      ],
+      "surface": "room",
+      "screenshot": [
+        {
+          "asset": "room-header-call",
+          "fallback_file": "assets/room-header-call.jpg",
+          "alt": "The headphone icon in the room header"
+        }
+      ],
+      "since_release": "2026-10-15"
+    },
+    {
+      "id": "apps",
+      "title": "Connect your apps",
+      "body": [
+        "Gmail, Calendar, Drive, Slack and more, so {name} can work with your real data.",
+        "Press the plug icon in your user card (bottom left) to open Settings &rarr; Integrations, or ask {name} and a Connect button appears:"
+      ],
+      "surface": "dm",
+      "screenshot": [
+        {
+          "asset": "user-card-plug",
+          "fallback_file": "assets/user-card-plug.jpg",
+          "alt": "The plug icon in your user card"
+        },
+        {
+          "asset": "settings-integrations",
+          "fallback_file": "assets/settings-integrations.jpg",
+          "alt": "Settings → Apps → Integrations"
+        }
+      ],
+      "since_release": "2026-10-15",
+      "paste": "Connect my Google Calendar."
+    },
+    {
+      "id": "activity",
+      "title": "Activity &amp; notices",
+      "body": [
+        "The bell at the top of the room list and each room's Activity tab show what needs you and what your agents are working on. The unread badge follows each room's notification setting.",
+        "Try it: open a room's Activity tab while an agent works on something you asked for, then open the room menu (&#8942;), choose Notifications, and pick Mention &amp; Keywords."
+      ],
+      "surface": "room",
+      "screenshot": [
+        {
+          "asset": "room-list-top",
+          "fallback_file": "assets/room-list-top.jpg",
+          "alt": "The bell at the top of the room list"
+        }
+      ],
+      "since_release": "2026-10-15"
+    },
+    {
+      "id": "mobile",
+      "title": "Mobile",
+      "body": [
+        "The same rooms and agents on your phone.",
+        "Pair it in Settings &rarr; Mobile pairing."
+      ],
+      "surface": "mobile",
+      "screenshot": [
+        {
+          "asset": "mobile-pairing",
+          "fallback_file": "assets/mobile-pairing.jpg",
+          "alt": "Settings: Mobile pairing"
+        }
+      ],
+      "since_release": "2026-10-15"
+    },
+    {
+      "id": "import",
+      "title": "Import your Claude Code history",
+      "body": [
+        "If you use Claude Code, {name} can read your local Claude Code history and bring what you worked on into its memory. You see a digest first; nothing is kept until you say so.",
+        "Ask {name}:"
+      ],
+      "surface": "dm",
+      "screenshot": null,
+      "since_release": "2026-10-15",
+      "paste": "Import my Claude Code history.",
+      "runtime": "claude"
+    }
+  ]
+}
