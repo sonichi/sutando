@@ -2089,8 +2089,14 @@ exit 0
             text=True,
         )
         try:
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                if self.log.exists() and "capture-pane" in self.log.read_text():
+                    break
+                time.sleep(0.02)
+            self.assertIn("capture-pane", self.log.read_text() if self.log.exists() else "")
             with self.assertRaises(subprocess.TimeoutExpired):
-                process.communicate(timeout=1)
+                process.communicate(timeout=0.3)
         finally:
             if process.poll() is None:
                 os.killpg(process.pid, signal.SIGTERM)
