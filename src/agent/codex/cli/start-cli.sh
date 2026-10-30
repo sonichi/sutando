@@ -278,6 +278,11 @@ CODEX_ARGS=(
 if [ -n "${SUTANDO_CORE_MODEL:-}" ]; then
   CODEX_ARGS+=(-m "$SUTANDO_CORE_MODEL")
 fi
+# Only process creation consumes this prompt; adopting an existing core never sends it.
+. "$REPO/scripts/python-binary.sh"
+_BOOTSTRAP_PY="$(require_python "$REPO" "prepare managed Codex bootstrap")" || exit 1
+_BOOTSTRAP_PROMPT="$("$_BOOTSTRAP_PY" "$REPO/src/delivery/codex_recovery.py" prompt)" || exit 1
+CODEX_ARGS+=("$_BOOTSTRAP_PROMPT")
 
 # A git checkout's first Codex launch stops on "Trust this folder?", which a headless core
 # never answers; see src/codex_project_trust.py. Best effort: a failure leaves the prompt.

@@ -20,7 +20,7 @@ const TOOL_OUTPUTS = new Set(['function_call_output', 'custom_tool_call_output',
 
 export function newState() {
   return {phase: 'unknown', motion: 'unknown', condition: 'unknown', reason: null, seq: 0, changedAt: 0,
-    conditionSince: null, lastSuccessAt: null, turnSucceeded: false, activeTask: null, completedTask: null};
+    conditionSince: null, lastSuccessAt: null, lastCompletedAt: null, turnSucceeded: false, activeTask: null, completedTask: null, failedTask: null};
 }
 
 export function errorReason(error) {
@@ -47,7 +47,7 @@ function taskChange(state, line) {
   const p = line?.payload || {};
   const at = epoch(line?.timestamp, null);
   const validId = (id) => typeof id === 'string' && id.length > 0 && id.length <= 128;
-  const clear = {activeTask: null, completedTask: null};
+  const clear = {activeTask: null, completedTask: null, failedTask: null};
   if (line?.type === 'event_msg' && p.type === 'task_started') {
     return {...clear, activeTask: validId(p.turn_id) && at > 0
       ? {turnId: p.turn_id, startedAt: at, contextSeen: false} : null};
@@ -61,15 +61,20 @@ function taskChange(state, line) {
     if (!active?.contextSeen || active.promptSha256 || state.turnSucceeded || !(at >= active.startedAt)
         || p.content?.length !== 1 || p.content[0]?.type !== 'input_text'
         || typeof p.content[0].text !== 'string' || !p.content[0].text) return clear;
-    return {completedTask: null, activeTask: {...active, acceptedAt: at,
+    return {completedTask: null, failedTask: null, activeTask: {...active, acceptedAt: at,
       promptSha256: crypto.createHash('sha256').update(p.content[0].text, 'utf8').digest('hex')}};
   }
   if (line?.type === 'event_msg' && p.type === 'turn_aborted') return clear;
   if (line?.type === 'event_msg' && p.type === 'task_complete') {
     const active = state.activeTask;
+    if (p.error && active?.promptSha256 && p.turn_id === active.turnId && at >= active.acceptedAt) {
+      return {...clear, failedTask: {turn_id: active.turnId, prompt_sha256: active.promptSha256,
+        accepted_at: active.acceptedAt, completed_at: at,
+        error_kind: p.error.codex_error_info === 'server_overloaded' ? 'server-overloaded' : errorReason(p.error)}};
+    }
     if (p.error || !state.turnSucceeded || !active?.promptSha256
         || p.turn_id !== active.turnId || !(at >= active.acceptedAt)) return clear;
-    return {activeTask: null, completedTask: {prompt_sha256: active.promptSha256,
+    return {activeTask: null, lastCompletedAt: at, completedTask: {prompt_sha256: active.promptSha256,
       accepted_at: active.acceptedAt, completed_at: at}};
   }
   return null;
@@ -111,7 +116,7 @@ export function apply(state, change, at) {
   let changed = false;
   if (change.success) { state.lastSuccessAt = at; changed = true; }
   if ('turnSucceeded' in change) state.turnSucceeded = change.turnSucceeded;
-  for (const key of ['activeTask', 'completedTask']) {
+  for (const key of ['activeTask', 'completedTask', 'failedTask', 'lastCompletedAt']) {
     if (key in change) { state[key] = change[key]; changed = true; }
   }
   const was = {condition: state.condition, reason: state.reason};
@@ -130,8 +135,11 @@ export function apply(state, change, at) {
 
 export function buildRecord(state, ident, now) {
   return {
+    ...(state.lastCompletedAt ? {last_completed_at: state.lastCompletedAt} : {}),
     ...(state.completedTask && ident.coreIncarnation
       ? {completed_task: {...state.completedTask, core_incarnation: ident.coreIncarnation}} : {}),
+    ...(state.failedTask && state.phase === 'failed' && state.condition === 'abnormal' && ident.coreIncarnation
+      ? {failed_task: {...state.failedTask, core_incarnation: ident.coreIncarnation}} : {}),
     ...(ident.coreIncarnation ? {core_incarnation: ident.coreIncarnation} : {}),
     schema: 1, observer: OBSERVER, observer_version: VERSION, observer_id: ident.observerId,
     observer_started_at: ident.startedAt, seat: 'core', session: ident.session, claude_session_id: null,

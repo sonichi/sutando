@@ -105,9 +105,10 @@ The managed core notifier keeps reading task announcements while a previously
 submitted task awaits its final result. Every new submission, including the first
 one after notifier restart, requires a fresh, healthy, idle observer record bound
 to the same core process incarnation. Missing, unknown, stale or moving runtime
-state blocks submission even if the terminal looks idle. A newly started core with
-no authoritative turn state waits until a real interactive turn completes; there
-is no pane-only fallback. The observer must be restarted to emit incarnation data.
+state blocks submission even if the terminal looks idle. The launcher gives a genuinely new CLI process a fixed managed liveness prompt:
+reply READY without tools, files, or external messages. Existing processes are never
+sent this bootstrap on adoption or notifier restart. The normal observer must see
+the resulting successful turn before task admission; there is no pane-only fallback. The observer must be restarted to emit incarnation data.
 It admits another task only when the
 terminal is positively idle and empty, and the observer has witnessed the exact
 submitted prompt in a successfully completed **parent** turn. The receipt binds
@@ -130,8 +131,17 @@ Missing proof falls back to waiting for the task's result. After the existing
 completion deadline, an uncertain submission is retained **without automatic
 replay**, and `codex-task-notifier` health reports a warning. A crash between the
 intent record and Enter can therefore require operator inspection. No automatic
-restart or unsafe keystroke recovery is performed. A typing failure before Enter
-is still retried; this change does not establish its underlying cause.
+restart or unsafe keystroke recovery is performed. A fully observed failed root turn carries a separate terminal receipt; it never
+acknowledges a task. For `server_overloaded` only, the notifier can send the same
+liveness prompt after a fixed 30-second backoff when no in-flight or yielded task
+markers remain and the positively empty pane and process incarnation still match.
+A durable claim is written before typing. At most one probe is allowed until a
+later successfully completed correlated turn, including across notifier restarts and uncertain
+keystroke outcomes. A failed probe therefore cannot loop requests. Login, quota,
+unclassified API errors, aborted turns, incomplete history and unresolved submitted
+tasks require explicit recovery or disposition. They remain queued without replay.
+Pre-admission refusals are deduplicated in local diagnostics and reported by health.
+A typing failure before Enter is still retried; this change does not establish its underlying cause.
 
 For a trial, restart the managed notifier and observer to load the new code. The
 local `state/codex-pickup.json` records startup code hashes, fixed event counters,

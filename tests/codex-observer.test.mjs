@@ -534,3 +534,31 @@ test('record binds current core incarnation even before a completed parent task'
   assert.equal(record.core_incarnation, '42:start');
   assert.equal(record.completed_task, undefined);
 });
+
+test('only a complete matching failed root turn publishes a typed terminal receipt', () => {
+  const end = (id = 'turn-a', info = 'server_overloaded') => ev('task_complete',
+    {turn_id: id, error: {codex_error_info: info}}, '2026-10-06T02:57:53.000Z');
+  const state = run([...receiptStart(), userInput(), end()]);
+  const record = receiptRecord(state);
+  assert.equal(record.condition, 'abnormal');
+  assert.equal(record.completed_task, undefined);
+  assert.equal(record.failed_task.error_kind, 'server-overloaded');
+  assert.equal(record.failed_task.turn_id, 'turn-a');
+  const ws = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-failed-receipt-'));
+  try {
+    writeRecord(ws, record);
+    const saved = JSON.parse(fs.readFileSync(path.join(ws, 'state/runtime-observations/core.json')));
+    assert.deepEqual(saved.failed_task, record.failed_task);
+    assert(!JSON.stringify(saved).includes('synthetic task prompt'));
+  } finally { fs.rmSync(ws, {recursive: true}); }
+  for (const lines of [
+    [userInput(), end()],
+    [ev('task_started', {turn_id: 'turn-a'}), userInput(), end()],
+    [...receiptStart(), userInput(), end('other')],
+    [...receiptStart(), userInput(), ev('turn_aborted'), end()],
+    [...receiptStart(), userInput(), userInput('extra'), end()],
+    [...receiptStart(), userInput(), {...end(), timestamp: 'bad-date'}],
+  ]) assert.equal(receiptRecord(run(lines)).failed_task, undefined);
+  run([ev('task_started', {turn_id: 'next'})], state);
+  assert.equal(receiptRecord(state).failed_task, undefined);
+});

@@ -16,7 +16,7 @@ from file_lock import locked_file
 from runtime_observation import load
 from workspace_default import write_status
 
-EVENTS = {"startup", "enqueued", "submitted", "yielded", "completed", "send_failed", "abandoned", "held"}
+EVENTS = {"startup", "enqueued", "submitted", "yielded", "completed", "send_failed", "abandoned", "held", "refused"}
 
 
 def paths(workspace):
@@ -65,7 +65,7 @@ def yielded(workspace, filename, incarnation, session, timeout=3600, now=None):
     return True
 
 
-def record_event(workspace, event, filename="", returncode=None):
+def record_event(workspace, event, filename="", returncode=None, reason=None, incarnation=None):
     if event not in EVENTS:
         raise ValueError("unknown pickup event")
     workspace = Path(workspace)
@@ -83,6 +83,14 @@ def record_event(workspace, event, filename="", returncode=None):
             old = {}
         if not isinstance(old, dict):
             old = {}
+        admission = old.get("admission")
+        if event == "refused":
+            admission = {"task_key": row["task_key"], "reason": reason,
+                         "incarnation_key": hashlib.sha256(incarnation.encode()).hexdigest()[:20]}
+            if old.get("admission") == admission:
+                return
+        elif event in {"startup", "submitted", "completed", "abandoned"}:
+            admission = None
         blocked = old.get("blocked")
         if not isinstance(blocked, dict):
             blocked = None
@@ -111,7 +119,20 @@ def record_event(workspace, event, filename="", returncode=None):
                 "notifier": "agent/codex/cli/task-notifier.sh", "pickup": "delivery/codex_pickup.py",
                 "observer": "agent/codex/cli/codex-observer.mjs"}.items()}
         write_status("codex-pickup.json", {"schema": 1, "updated_at": now, "pid": os.getppid(),
-                     "code": code, "blocked": blocked, "counts": counts, "recent": recent + [row]}, workspace)
+                     "code": code, "blocked": blocked, "admission": admission, "counts": counts, "recent": recent + [row]}, workspace)
+
+
+def refused(workspace, filename, session, incarnation):
+    record, why = load(workspace, "core", time.time())
+    if not record:
+        reason = "observer-" + str(why)
+    elif record.get("core_incarnation") != incarnation or record["session"] != session:
+        reason = "observer-incarnation-mismatch"
+    elif record["observer"] != "codex-observer":
+        reason = "observer-mismatch"
+    else:
+        reason = record["reason"] or "lifecycle-" + record["phase"]
+    record_event(workspace, "refused", filename, reason=reason, incarnation=incarnation)
 
 
 def warning(workspace):
@@ -120,6 +141,9 @@ def warning(workspace):
         if path.stat().st_size > 65536:
             return None
         record = json.loads(path.read_text())
+        admission = record.get("admission") if isinstance(record, dict) else None
+        if isinstance(admission, dict) and isinstance(admission.get("reason"), str):
+            return "task admission is held: " + admission["reason"] + "; awaiting verified CLI readiness or recovery"
         blocked = record.get("blocked") if isinstance(record, dict) else None
         if isinstance(blocked, dict) and blocked.get("reason") == "unconfirmed-parent-turn":
             return "a task has no confirmed parent-turn receipt after the completion deadline; retained without replay"
@@ -150,11 +174,16 @@ def main():
             mark(workspace, *args, prompt)
         elif command == "yielded":
             return 0 if yielded(workspace, *args) else 1
+        elif command == "recover":
+            from delivery.codex_recovery import recover
+            return 0 if recover(workspace, *args) else 1
+        elif command == "refused":
+            refused(workspace, *args)
         elif command == "record":
             record_event(workspace, *args)
         else:
             return 2
-    except (OSError, ValueError, KeyError, TypeError):
+    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
         return 2
     return 0
 

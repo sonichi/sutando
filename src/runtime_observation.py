@@ -104,6 +104,32 @@ def validate(record) -> dict:
             raise ValueError("bad completed_task")
         out["completed_task"] = {"prompt_sha256": digest, "core_incarnation": incarnation,
                                  "accepted_at": float(accepted), "completed_at": float(finished)}
+    last_completed = record.get("last_completed_at")
+    if last_completed is not None:
+        if not _epoch(last_completed) or last_completed > out["heartbeat_at"]:
+            raise ValueError("bad last_completed_at")
+        out["last_completed_at"] = float(last_completed)
+    failed = record.get("failed_task")
+    if failed is not None:
+        if not isinstance(failed, dict):
+            raise ValueError("bad failed_task")
+        digest, turn = failed.get("prompt_sha256"), failed.get("turn_id")
+        incarnation = failed.get("core_incarnation")
+        accepted, finished = failed.get("accepted_at"), failed.get("completed_at")
+        kind = failed.get("error_kind")
+        if (not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest)
+                or not isinstance(turn, str) or not 1 <= len(turn) <= 128
+                or any(ord(c) < 32 for c in turn)
+                or incarnation != out.get("core_incarnation") or not incarnation
+                or not _epoch(accepted) or not _epoch(finished) or accepted > finished
+                or finished > out["heartbeat_at"] or out["phase"] != "failed"
+                or out["motion"] != "idle" or out["condition"] != "abnormal"
+                or kind not in ("server-overloaded", "api-error", "quota-limit", "needs-login")
+                or out["reason"] != ("api-error" if kind == "server-overloaded" else kind)):
+            raise ValueError("bad failed_task")
+        out["failed_task"] = {"turn_id": turn, "prompt_sha256": digest,
+                              "core_incarnation": incarnation, "accepted_at": float(accepted),
+                              "completed_at": float(finished), "error_kind": kind}
     return out
 
 

@@ -145,6 +145,7 @@ class CodexCoreLauncherTests(unittest.TestCase):
             "src/delivery/readiness.py",
             "src/delivery/task_dispatch.py",
             "src/delivery/codex_pickup.py",
+            "src/delivery/codex_recovery.py",
             "src/runtime_observation.py",
             "src/local_task_protocol.py",
             "src/result_markers.py",
@@ -582,6 +583,7 @@ if [ "${1:-}" = print ]; then [ -f "$LAUNCHCTL_STATE" ]; else exit 0; fi
         calls = self._assert_no_schedule_reconcile(env_extra={"TMUX_ACTIVE_RUNTIME": "codex"})
         self.assertNotIn("new-session -d -s sutando-core ", calls)
         self.assertNotIn("kill-session", calls)
+        self.assertNotIn("Sutando managed liveness check.", calls)
 
     def test_direct_codex_launcher_honors_no_schedule_reconcile(self):
         self._assert_no_schedule_reconcile(launcher="src/agent/codex/cli/start-cli.sh")
@@ -675,6 +677,7 @@ if [ "${1:-}" = print ]; then [ -f "$LAUNCHCTL_STATE" ]; else exit 0; fi
         self.assertIn("--search", calls)
         self.assertIn("-c check_for_update_on_startup=false", calls)
         self.assertIn("-m gpt-test", calls)
+        self.assertIn("Sutando managed liveness check. Reply exactly READY.", calls)
         self.assertIn("new-session -d -s sutando-core-watcher", calls)
         self.assertIn("task-notifier-supervisor.sh", calls)
         self.assertIn("SUTANDO_NOTIFIER_VERSION=", calls)

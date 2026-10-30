@@ -636,8 +636,9 @@ reconcile_finished_pickups() {
 
 process_responsive_queue() {
   local ordered tier filename incarnation live_rc
-  incarnation="$(core_incarnation)" || return 0
   ordered="$(ls -1tr "$queue_dir" 2>/dev/null)"
+  [ -n "$ordered" ] || return 0
+  incarnation="$(core_incarnation)" || return 0
   while IFS= read -r filename; do
     [ -n "$filename" ] || continue
     if has_result "$filename"; then
@@ -664,7 +665,16 @@ process_responsive_queue() {
       "$NOTIFIER_PY" "$DISPATCH_PY" inflight-live "$INFLIGHT_DIR" "$filename" "$incarnation" || live_rc=$?
       [ "$live_rc" != 0 ] || continue
       [ "$live_rc" = 1 ] || return 0
-      "$NOTIFIER_PY" "$PICKUP_PY" ready "$WORKSPACE_DIR" "$SESSION" "$incarnation" || return 0
+      if ! "$NOTIFIER_PY" "$PICKUP_PY" ready "$WORKSPACE_DIR" "$SESSION" "$incarnation"; then
+        "$NOTIFIER_PY" "$PICKUP_PY" refused "$WORKSPACE_DIR" "$filename" "$SESSION" "$incarnation" || true
+        if core_is_idle; then
+          local recovery_target
+          recovery_target="$(core_target)" || return 0
+          recovery_target="$(tmux -S "$TMUX_SOCKET" display-message -p -t "$recovery_target" '#{pane_id}')" || return 0
+          "$NOTIFIER_PY" "$PICKUP_PY" recover "$WORKSPACE_DIR" "$SESSION" "$incarnation" "$TMUX_SOCKET" "$recovery_target" || true
+        fi
+        return 0
+      fi
       if ! core_is_idle; then
         clear_automation_leftover && core_is_idle || return 0
       fi
