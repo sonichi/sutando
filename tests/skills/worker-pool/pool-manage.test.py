@@ -15,6 +15,8 @@ from __future__ import annotations
 import importlib.util
 import io
 import json
+import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -225,6 +227,60 @@ class Remove(Base):
         self.assertIsNotNone(self.row(OTHER))
         pr.validate_current_roster(self.ws)
         self.assertTrue(wi.worker_dir(self.ws, WID).is_dir())
+
+
+class BareRunTmux(FakeTmux):
+    """Like a bare `subprocess.run`: no stderr comes back unless the caller asks to capture it."""
+
+    def __call__(self, argv, **kw):
+        r = super().__call__(argv, **kw)
+        return r if kw.get("capture_output") else subprocess.CompletedProcess(argv, r.returncode)
+
+
+class CliWithAnUncapturingRunner(Base):
+    def setUp(self):
+        super().setUp()
+        self.tmux = BareRunTmux(self.tmux.alive)
+
+    def test_stop_confirms_the_sessions_gone_and_closes_the_run(self):
+        rc, out = self.main("stop", WID)
+        self.assertEqual((rc, out["result"]), (0, "stopped"))
+        self.assertEqual(set(out["sessions"].values()), {"killed"})
+        self.assertEqual([r["end_reason"] for r in wi.incarnations(self.ws, WID)], ["killed"])
+
+    def test_retire_unbind_and_remove_complete(self):
+        pr.bind_room(self.ws, "!room:example", WID)
+        rc, out = self.main("retire", WID, "--unbind")
+        self.assertEqual((rc, out["result"]), (0, "retired"))
+        self.assertEqual(out["unbound"], ["!room:example"])
+        self.assertEqual(pr.load_bindings(self.ws), {})
+        rc, out = self.main("remove", WID)
+        self.assertEqual((rc, out["result"]), (0, "removed"))
+
+
+
+@unittest.skipUnless(shutil.which("tmux"), "tmux not installed")
+class CliAgainstRealTmux(unittest.TestCase):
+    def test_the_script_stops_a_worker_on_a_live_server(self):
+        short = tempfile.mkdtemp(prefix="pm-", dir="/tmp")  # a unix socket path has a length limit
+        self.addCleanup(shutil.rmtree, short, True)
+        sock = os.path.join(short, "s")
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        ws = Path(td.name) / "ws"
+        (ws / "state").mkdir(parents=True)
+        wi.create_worker(ws, runtime="claude", tmux_socket=sock, worker_id=WID, cwd=str(REPO))
+        pr.register_worker(ws, WID, "pool worker 1", runtime="claude")
+        tmux = lambda *a: subprocess.run(["tmux", "-S", sock, *a], capture_output=True, text=True)
+        self.addCleanup(tmux, "kill-server")
+        for name in ("keepalive", SEAT, SEAT + "-watcher", SEAT + "-input"):
+            tmux("new-session", "-d", "-s", name, "sleep 600")
+        r = subprocess.run([sys.executable, str(SCRIPTS / "pool_manage.py"), "--workspace", str(ws),
+                            "stop", WID], capture_output=True, text=True, timeout=60)
+        out = json.loads(r.stdout.strip().splitlines()[-1])
+        self.assertEqual((r.returncode, out["result"]), (0, "stopped"), r.stdout + r.stderr)
+        self.assertEqual(set(out["sessions"].values()), {"killed"})
+        self.assertEqual(tmux("ls", "-F", "#{session_name}").stdout.split(), ["keepalive"])
 
 
 class Listing(Base):
