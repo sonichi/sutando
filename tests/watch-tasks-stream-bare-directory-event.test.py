@@ -156,14 +156,38 @@ def test_eof_from_fswatch_relaunches_it_and_ends_the_watcher_only_past_the_budge
     h = Harness()
     tail = ["pgrep", "-f", f"tail -n \\+1 -f {h.feed}"]
     tails = lambda: set(subprocess.run(tail, capture_output=True, text=True).stdout.split())
+
+    def startup_accepted():
+        try:
+            return h.proc.poll() is None and any(
+                p.read_text().strip() == str(h.proc.pid)
+                for p in (h.ws / "state").glob("watch-tasks-stream*.pid"))
+        except OSError:
+            return False
+
     try:
         h.start(SUTANDO_FSWATCH_RESTART_MAX="1")
-        time.sleep(1.0)
+        ready = wait_for(startup_accepted)
+        check("fswatch startup is accepted before its writer is stopped", ready,
+              f"rc={h.proc.poll()}")
+        if not ready:
+            return
         first = tails()
+        check("the initial fswatch writer is running", bool(first))
+        if not first:
+            return
         # The stub tails the feed; killing it closes the FIFO's write end.
         subprocess.run(["pkill", "-f", f"tail -n \\+1 -f {h.feed}"], check=False)
-        check("EOF on the event stream relaunches fswatch, the watcher stays",
-              wait_for(lambda: tails() - first and h.proc.poll() is None, timeout=10.0))
+        relaunched = wait_for(lambda: tails() - first and h.proc.poll() is None, timeout=10.0)
+        check("EOF on the event stream relaunches fswatch, the watcher stays", relaunched)
+        if not relaunched:
+            return
+        task = h.task("task-after-relaunch.txt")
+        h.deliver_file_event(task)
+        serving = wait_for(lambda: h.dispatch_count(task.name) == 1 and h.proc.poll() is None)
+        check("the relaunched watcher serves a task before its writer is stopped", serving)
+        if not serving:
+            return
         subprocess.run(["pkill", "-f", f"tail -n \\+1 -f {h.feed}"], check=False)
         check("a second EOF past the relaunch budget ends the watcher, status 1",
               wait_for(lambda: h.proc.poll() == 1, timeout=10.0), f"rc={h.proc.poll()}")

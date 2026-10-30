@@ -23,6 +23,7 @@ REPO = Path(__file__).resolve().parents[3]
 SCRIPTS = REPO / "skills/worker-pool/scripts"
 sys.path.insert(0, str(REPO / "tests"))
 from _helpers.hermetic_env import hermetic_env  # noqa: E402
+from _helpers.process_group import process_exited  # noqa: E402
 
 socket_setting = os.environ.get("SUTANDO_RUNTIME_SOCKET")
 environment_file = Path(socket_setting).parent / "environment.json" if socket_setting else None
@@ -273,7 +274,7 @@ class WorkerConfigDirectoryTests(unittest.TestCase):
 
     def interrupt(self, row, name):
         os.kill(row["pid"], signal.SIGINT)
-        self.wait_for(lambda: not self.pid_exists(row["pid"]), "interrupted runtime exit")
+        self.wait_for(lambda: process_exited(row["pid"]), "interrupted runtime exit")
         self.wait_for(lambda: self.tmux("has-session", "-t", "=" + name,
                                        expected=None).returncode == 1, "worker session exit")
 

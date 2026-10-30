@@ -1757,25 +1757,33 @@ exit 0
         watcher.write_text("#!/bin/bash\nprintf 'TASK_FILE: task-one.txt\\nTASK_FILE: task-two.txt\\n'\n")
         watcher.chmod(0o755)
         count = Path(self.tmp.name) / "submit-count"
+        pane = Path(self.tmp.name) / "staged-prompt"
+        early = Path(self.tmp.name) / "early-submit"
         self._write_exe("tmux", '''#!/bin/bash
 printf '%s\\n' "$*" >> "$TMUX_LOG"
-for _a in "$@"; do [ "$_a" = capture-pane ] && { printf '\\xe2\\x80\\xba \\n\\xe2\\x86\\x90 for agents\\n'; exit 0; }; done
 [ "${1:-}" = -S ] && shift 2
 if [ "${1:-}" = has-session ]; then exit 0; fi
 if [ "${1:-}" = capture-pane ]; then
+  [ -s "$PANE_BUF" ] && { cat "$PANE_BUF"; exit 0; }
   printf '›\\n⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents\\n'
   exit 0
+fi
+if [ "${1:-}" = send-keys ] && [ "${*: -1}" != C-m ]; then
+  printf '› %s\\n← for agents\\n' "${*: -1}" > "$PANE_BUF"
 fi
 if [ "${1:-}" = send-keys ] && [ "${*: -1}" = C-m ]; then
   n=0; [ -f "$SUBMIT_COUNT" ] && n=$(cat "$SUBMIT_COUNT")
   n=$((n + 1)); printf '%s' "$n" > "$SUBMIT_COUNT"
+  [ "$n" = 1 ] || [ -f "$SUTANDO_RESULTS_DIR/task-one.txt" ] || : > "$EARLY_SUBMIT"
+  : > "$PANE_BUF"
   if [ "$n" = 1 ]; then name=task-one.txt; else name=task-two.txt; fi
   (sleep 0.12; printf 'done\\n' > "$SUTANDO_RESULTS_DIR/$name") >/dev/null 2>&1 &
 fi
 exit 0
 ''')
         env = dict(os.environ, PATH=f"{self.bin}:/usr/bin:/bin", TMUX_LOG=str(self.log),
-                   SUBMIT_COUNT=str(count), SUTANDO_TMUX_SOCKET=str(Path(self.tmp.name) / "test.sock"),
+                   SUBMIT_COUNT=str(count), PANE_BUF=str(pane), EARLY_SUBMIT=str(early),
+                   SUTANDO_TMUX_SOCKET=str(Path(self.tmp.name) / "test.sock"),
                    SUTANDO_TMUX_SESSION="sutando-core", SUTANDO_TASKS_DIR=str(tasks),
                    SUTANDO_RESULTS_DIR=str(results), SUTANDO_NOTIFIER_POLL_INTERVAL="0.02",
                    SUTANDO_NOTIFIER_COMPLETION_TIMEOUT="5")
@@ -1790,6 +1798,7 @@ exit 0
         self.assertLess(calls.index("task-one.txt"), calls.index("task-two.txt"))
         self.assertTrue((results / "task-one.txt").exists())
         self.assertTrue((results / "task-two.txt").exists())
+        self.assertFalse(early.exists(), "a second submit preceded the first result")
 
     def test_managed_notifier_waits_for_idle_then_submits_in_watcher_announced_order(self):
         # Priority now lives in the watcher's sweep (closes #3017); this stub
