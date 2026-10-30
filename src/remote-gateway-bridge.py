@@ -394,6 +394,12 @@ def _lane_dedupe_gate(task: dict):
         return INTAKE_DEFER  # noqa: F821
 
 
+def _intake_gate(task: dict):
+    """A task from before this connection was added (its row's `not_before`), else the lane dedupe."""
+    from connections import NOT_BEFORE_ENV, backlog_reason
+    return backlog_reason(task, os.environ.get(NOT_BEFORE_ENV, "")) or _lane_dedupe_gate(task)
+
+
 _STATUS_ACK_MANIFEST = _REPO / "skills" / "status-ack" / "manifest.json"
 
 
@@ -437,7 +443,7 @@ OWNER_DM_UPGRADED_NOTIFY = _ag2space_owner_dm_upgraded
 PROACTIVE_DISPATCH_GATE = _ag2space_proactive_dispatch_gate
 PROACTIVE_ACK_GATE = _status_ack_gate()
 PROACTIVE_ROUTE_GATE = _ag2space_proactive_route_gate
-TASK_INTAKE_GATE = _lane_dedupe_gate if not gateway_credential_sources.is_seat(os.environ) else None  # noqa: F821
+TASK_INTAKE_GATE = _intake_gate if not gateway_credential_sources.is_seat(os.environ) else None  # noqa: F821
 PROACTIVE_ROOM_KEEP = _legacy_keeps_proactive_room if not GATEWAY_INSTANCE else None  # noqa: F821
 OWNS_UNADDRESSED = _owns_unaddressed
 STAND_DOWN_GATE = (_legacy_stand_down if not GATEWAY_INSTANCE  # noqa: F821

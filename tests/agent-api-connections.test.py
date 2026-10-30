@@ -269,6 +269,10 @@ check("confirm started each new bridge, the existing one again while it was down
       SPAWNED == ["alpha-fixture-net", "alpha-fixture-net", "beta-fixture-net"] and b["launch"]["ok"] is True, (SPAWNED, b))
 check("the second lane does not take the primary", b["connection"]["primary"] is False and b["connection"]["running"] is False, b)
 SPAWNED.clear()
+s, b, _ = req("POST", "/api/v1/connections", {"token": TOKEN_B, "confirm": True, "expected_server": "beta-fixture.net",
+                                              "skip_backlog": "yes"})
+check("a non-boolean skip_backlog is 400", (s, b) == (400, {"error": "skip_backlog must be a boolean"}), f"{s} {b}")
+check("the existing row has no backlog bound", "not_before" not in (C.read_rows(WS)[1]), C.read_rows(WS)[1])
 
 print("== refusals the review asked for ==")
 s, b, _ = req("POST", "/api/v1/connections", {"token": "https://rejecting-fixture.net|bad", "confirm": True,

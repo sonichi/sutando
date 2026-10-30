@@ -349,6 +349,8 @@ jobs:
           npm install --no-save --no-audit --no-fund --prefix "$RUNNER_TEMP/claude-cli" @anthropic-ai/claude-code@2.1.303
           cd packages/ag2-sparrow/ag2_sparrow/adapters/claude_code
           timeout -k 5 120 "$RUNNER_TEMP/claude-cli/node_modules/.bin/claude" plugin test ag2space-inbox
+          cd "$GITHUB_WORKSPACE/skills/pr-watch"
+          timeout -k 5 120 "$RUNNER_TEMP/claude-cli/node_modules/.bin/claude" plugin test mod
 
   shell-standalone-tests:
     name: shell tests (lanes)

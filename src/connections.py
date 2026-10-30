@@ -69,12 +69,14 @@ import signal
 import subprocess
 import sys
 import contextlib
+import datetime
 import hashlib
 import http.client
 import ipaddress
 import socket
 import ssl
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -834,6 +836,9 @@ def _validate_row(row: object, index: int) -> dict:
     for key in ("disabled", "parked"):
         if key in row and not isinstance(row[key], bool):
             raise SchemaError(f"connections.json: row {index} field {key} is not a boolean")
+    nb = row.get("not_before")
+    if nb is not None and (isinstance(nb, bool) or not isinstance(nb, int) or nb < 0):
+        raise SchemaError(f"connections.json: row {index} not_before is not an epoch second")
     keys = row.get("launch_keys", [])
     if not isinstance(keys, list) or not all(isinstance(k, str) and _ENV_VAR_RE.match(k) for k in keys):
         raise SchemaError(f"connections.json: row {index} launch_keys is not a list of AG2_REMOTE_TOKEN_<INST> names")
@@ -1062,8 +1067,12 @@ def channel_launch_keys(environ: Optional[Mapping[str, str]] = None) -> dict:
 def add_connection(token: str, *, added_by: str, expected_server: str, instance: Optional[str] = None,
                    preview: Optional[dict] = None, fetch: Optional[Callable] = None,
                    resolver=None, getaddrinfo=None, workspace: Optional[Path] = None,
-                   vault=None, environ: Optional[Mapping[str, str]] = None, kill=None) -> "tuple[dict, bool]":
+                   vault=None, environ: Optional[Mapping[str, str]] = None, kill=None,
+                   skip_backlog: bool = False) -> "tuple[dict, bool]":
     """Save the token as a row once its gateway still answers to `expected_server`.
+
+    With `skip_backlog`, a row this call creates records `not_before` (now, epoch seconds): its
+    bridge settles every task stamped earlier unqueued (`backlog_reason`). An existing row keeps its own.
 
     Launch keys not yet in the record (`channel_launch_keys`) are imported first, under the instance
     their launcher already runs them as, so a token for one of their servers adopts that row instead
@@ -1137,6 +1146,8 @@ def add_connection(token: str, *, added_by: str, expected_server: str, instance:
                        verified=bool(seen.get("verified")),
                        server_source=str(seen.get("server_source") or "gateway"),
                        identity=seen)
+            if skip_backlog:
+                row["not_before"] = int(time.time())
             rows.append(row)
             rec[REMOVED_KEY] = [x for x in rec[REMOVED_KEY] if x != ref]
     except Exception:
@@ -1473,7 +1484,8 @@ def promote(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Mapp
 
     In order: under the record lock, clear the row's `parked` flag and flip the primary to it, so
     `launch_env` gives its bridge the proactive room; stop the row's bridge if one runs (it was
-    launched as a secondary, without the room) and `start` it; wait up to `CONNECT_TIMEOUT_S` for
+    launched as a secondary, without the room) and `start` it, unless that bridge is already connected:
+    then it keeps running through the flip and the row carries `relaunch_needed`; wait up to `CONNECT_TIMEOUT_S` for
     that bridge's own status to show the gateway accepted its token; then, under one hold of the
     record lock, confirm the flip. The old owner's bridge (`_owner_row` before the flip) keeps
     running as a secondary unless `park`: then it is stopped by the stop path `disconnect` uses and
@@ -1510,8 +1522,10 @@ def promote(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Mapp
     start_kw = dict(repo=repo, logs_dir=logs_dir, environ=environ, workspace=workspace, vault=vault,
                     spawn=spawn, python=python)
     try:
-        if not was_primary:
-            undo["relaunched"] = bool(_stop_row(snapshot, workspace, kill))
+        if not was_primary and not _connected_bridge(snapshot, workspace):
+            # A stop that signals and then is refused has still taken it down: rollback restarts it.
+            undo["relaunched"] = any(bridge_pid(i, workspace) for i in [instance] + alias_instances(snapshot))
+            _stop_row(snapshot, workspace, kill)
         launch = start(instance, **start_kw)
         if not launch.get("ok"):
             raise NewPrimaryNotStarted(instance, str(launch.get("reason") or "launch_failed"))
@@ -1561,6 +1575,17 @@ def promote(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Mapp
                changed=parked is not None or bool(legacy_stopped) or was_parked or not was_primary,
                relaunch_needed=launch.get("lease") in ("already_running", "alias_running") and not was_primary)
     return out
+
+
+def _connected_bridge(row: Mapping[str, object], workspace: Optional[Path]) -> int:
+    """The pid of the row's bridge when it holds the lease and its own status says connected; else 0."""
+    inst = str(row["instance"])
+    try:
+        pid = bridge_pid(inst, workspace)
+    except BridgeLeaseIndeterminate:
+        return 0
+    sidecar = _sidecar(inst, workspace)
+    return pid if pid and sidecar.get("pid") == pid and sidecar.get("connected") and not _writer_gone(sidecar) else 0
 
 
 def _promote_legacy(workspace: Optional[Path], kill, park: bool = False) -> dict:
@@ -2087,7 +2112,8 @@ def launch_plan(environ: Optional[Mapping[str, str]] = None, *,
             continue
         plan.append({"instance": r["instance"], "token_ref": r["token_ref"],
                      "channel_dir": channel_dir_for(r["instance"], environ), "primary": r["primary"],
-                     "agent_mxid": r.get("agent_mxid") or ""})
+                     "agent_mxid": r.get("agent_mxid") or "",
+                     **({"not_before": r["not_before"]} if r.get("not_before") is not None else {})})
     for inst, var in env_token_vars(environ):
         if inst in seen_inst or var in seen_ref:
             continue
@@ -2171,8 +2197,30 @@ def launch_env(entry: Mapping[str, object], environ: Optional[Mapping[str, str]]
         "REMOTE_TASK_TOKEN_FILE": _token_file(entry, environ),
         "REMOTE_TASK_CHANNEL_DIR": str(entry["channel_dir"]),
         "REMOTE_PROACTIVE_ROOM": environ.get("REMOTE_PROACTIVE_ROOM", "") if entry.get("primary") else "",
+        NOT_BEFORE_ENV: str(entry["not_before"]) if isinstance(entry.get("not_before"), int) else "",
     })
     return env
+
+
+# The bridge's intake reads its row's `not_before` here; empty when the row has none.
+NOT_BEFORE_ENV = "SUTANDO_INTAKE_NOT_BEFORE"
+
+
+def backlog_reason(task: Mapping[str, object], not_before: object) -> Optional[str]:
+    """Why a task stamped before its connection's `not_before` is settled unqueued; None to deliver
+    it (no bound, or a timestamp that is missing or unreadable)."""
+    try:
+        bound = int(str(not_before).strip())
+    except ValueError:
+        return None
+    stamp = str(task.get("timestamp") or "").strip()
+    try:
+        at = datetime.datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
+    except ValueError:
+        return None
+    if at.timestamp() >= bound:
+        return None
+    return f"backlog: stamped {stamp}, before this connection was added"
 
 
 def _verified_agent(token: str, fetch=None, getaddrinfo=None) -> str:
@@ -2262,6 +2310,13 @@ def _spawn(argv: list, env: dict, log_path: Path) -> "subprocess.Popen":
     return proc
 
 
+def _reap_when_done(child) -> None:
+    """Wait on a spawned bridge in the background, so its exit is reaped at once, not left a zombie."""
+    wait = getattr(child, "wait", None)
+    if wait is not None:
+        threading.Thread(target=wait, name=f"bridge-reaper-{child.pid}", daemon=True).start()
+
+
 def _exited(pid: int) -> bool:
     """Whether `pid` has ended: our own child by its exit status, any other by the kernel."""
     child = _CHILDREN.get(pid)
@@ -2274,6 +2329,9 @@ def _exited(pid: int) -> bool:
     if waitid is not None:
         try:  # an exited, unreaped child of this process: seen without reaping it
             if waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None:
+                return True
+        except ChildProcessError:
+            if _ps_zombie(pid):  # another process's child, exited and never reaped by its parent
                 return True
         except OSError:
             pass
@@ -2302,6 +2360,11 @@ def _zombie(pid: int) -> bool:
         return False
     else:
         return False
+    return _ps_zombie(pid)
+
+
+def _ps_zombie(pid: int) -> bool:
+    """Whether ps reads `pid` as a zombie; False when ps cannot answer."""
     ps = "/bin/ps" if os.path.exists("/bin/ps") else "ps"
     try:
         out = subprocess.run([ps, "-o", "stat=", "-p", str(pid)], capture_output=True, text=True, timeout=5).stdout
@@ -2403,6 +2466,7 @@ def launch(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Mappi
             pid = int(getattr(child, "pid", child))
             if hasattr(child, "poll"):
                 _CHILDREN[pid] = child
+                _reap_when_done(child)
             if env.get("SUTANDO_BRIDGE_LOCK", "1") == "0":
                 return _record_launch(instance, workspace, ok=True, pid=pid, lease="disabled")
             lease, holder = _await_lease(instance, pid, workspace, max(0.0, deadline - time.monotonic()))
