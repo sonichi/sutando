@@ -26,7 +26,7 @@ def load_fixture():
 fixture = load_fixture()
 rem, REPO = fixture.rem, fixture.REPO
 sys.path.insert(0, str(REPO / "tests"))
-from _helpers.process_group import popen_bound
+from _helpers.process_group import popen_bound, process_exited
 
 pd, wi, sw = rem.pd, rem.wi, rem.sw
 import pool_router as router
@@ -125,7 +125,7 @@ class RestartDeliveries(unittest.TestCase):
     def interrupt(self):
         before = self.h.observe(self.name, self.sid, self.folder)
         os.kill(before["pid"], signal.SIGTERM)
-        self.h.wait_for(lambda: not self.h.alive(before["pid"]), seconds=15)
+        self.h.wait_for(lambda: process_exited(before["pid"]), seconds=15)
         self.h.wait_for(lambda: sw.session_state(self.name, str(self.h.socket)) == "absent", seconds=15)
         return before
 

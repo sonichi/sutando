@@ -29,6 +29,8 @@ from unittest import mock
 
 REPO = Path(__file__).resolve().parents[3]
 SCRIPTS = REPO / "skills" / "worker-pool" / "scripts"
+sys.path.insert(0, str(REPO / "tests"))
+from _helpers.process_group import process_exited  # noqa: E402
 
 
 def _load(name):
@@ -225,7 +227,7 @@ int main(int argc, char **argv) {
         name = wi.tmux_session_name(wid)
         before = self.observe(name, a, a_dir)
         os.kill(before["pid"], signal.SIGTERM)
-        gone = self.poll_until(lambda: not self.alive(before["pid"]))
+        gone = self.poll_until(lambda: process_exited(before["pid"]))
         self.assertTrue(gone, f"pane pid {before['pid']} survived SIGTERM for {WAIT_SECONDS} s")
         self.wait_for(lambda: sw.session_state(name, str(self.socket)) == "absent")
         runs = wi.incarnations(self.ws, wid)
