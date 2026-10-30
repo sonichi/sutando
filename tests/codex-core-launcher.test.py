@@ -975,6 +975,13 @@ if [ "${1:-}" = print ]; then [ -f "$LAUNCHCTL_STATE" ]; else exit 0; fi
         self.assertIn("already running (codex)", result.stdout)
         self.assertNotIn("new-window", self._tmux_calls())
 
+    def test_adopting_a_live_core_does_not_prepare_a_new_bootstrap(self):
+        (self.root / "src/delivery/codex_recovery.py").unlink()
+        result = self.run_launcher(env_extra={"TMUX_ACTIVE_RUNTIME": "codex"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("already running (codex)", result.stdout)
+        self.assertNotIn("Sutando managed liveness check", self._tmux_calls())
+
     def test_restart_with_unreadable_panes_falls_back_to_the_session(self):
         result = self.run_launcher("--restart", env_extra={"TMUX_ACTIVE_RUNTIME": "codex", "FAKE_PANES_UNREADABLE": "1"})
         self.assertEqual(result.returncode, 0, result.stderr)

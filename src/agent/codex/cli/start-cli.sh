@@ -278,12 +278,6 @@ CODEX_ARGS=(
 if [ -n "${SUTANDO_CORE_MODEL:-}" ]; then
   CODEX_ARGS+=(-m "$SUTANDO_CORE_MODEL")
 fi
-# Only process creation consumes this prompt; adopting an existing core never sends it.
-. "$REPO/scripts/python-binary.sh"
-_BOOTSTRAP_PY="$(require_python "$REPO" "prepare managed Codex bootstrap")" || exit 1
-_BOOTSTRAP_PROMPT="$("$_BOOTSTRAP_PY" "$REPO/src/delivery/codex_recovery.py" prompt)" || exit 1
-CODEX_ARGS+=("$_BOOTSTRAP_PROMPT")
-
 # A git checkout's first Codex launch stops on "Trust this folder?", which a headless core
 # never answers; see src/codex_project_trust.py. Best effort: a failure leaves the prompt.
 ensure_codex_project_trust() {
@@ -505,6 +499,12 @@ ensure_codex_auto_reset_timer() {
 # ensure_codex_scheduler owns execution:codex-task entries plus the canonical
 # five-minute main loop while this runtime is selected.
 resolve_heartbeat_python
+prepare_codex_bootstrap() {
+  local prompt
+  [ -n "$_HB_PY" ] || { echo "start-cli: no runnable Python for managed Codex bootstrap" >&2; return 1; }
+  prompt="$("$_HB_PY" "$REPO/src/delivery/codex_recovery.py" prompt)" || return 1
+  CODEX_ARGS+=("$prompt")
+}
 if [ "$RECONCILE_SCHEDULES" = 1 ]; then
   ensure_durable_schedules
   ensure_codex_scheduler
@@ -639,6 +639,7 @@ if ! tmux_available; then
     echo "  ⚠ codex not found — not clearing the shutdown sentinel, no core can start." >&2
     exit 127
   fi
+  prepare_codex_bootstrap || exit 1
   ensure_codex_project_trust
   stash_shutdown_sentinel
   clear_shutdown_sentinel
@@ -692,6 +693,7 @@ heal_core_window() {
     return 3
   fi
   echo "  ⚠ $SESSION exists but its Codex core is gone — healing core window (sibling windows preserved)" >&2
+  prepare_codex_bootstrap || return 1
   for _win in $(sutando_core_window_ids "$TMUX_SOCKET" "$SESSION" all codex); do
     tmux -S "$TMUX_SOCKET" kill-window -t "$_win" 2>/dev/null || true
   done
@@ -729,6 +731,7 @@ fi
 # Creates the core session, waits for has-session within the configured budget
 # (new-session rc=0 only means tmux accepted it), then starts the helpers.
 start_core_session_and_helpers() {
+  prepare_codex_bootstrap || return 1
   ensure_codex_project_trust
   tmux -S "$TMUX_SOCKET" new-session -d -s "$SESSION" "${CORE_ENV_ARGS[@]}" codex "${CODEX_ARGS[@]}"
   wait_core_up "$SESSION" session_exists "$SESSION" || return 1

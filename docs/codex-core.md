@@ -141,7 +141,10 @@ keystroke outcomes. A failed probe therefore cannot loop requests. Login, quota,
 unclassified API errors, aborted turns, incomplete history and unresolved submitted
 tasks require explicit recovery or disposition. They remain queued without replay.
 Pre-admission refusals are deduplicated in local diagnostics and reported by health.
-A typing failure before Enter is still retried; this change does not establish its underlying cause.
+If a recovery paste leaves a READY check draft or the staged text does not match,
+the claim remains spent. Inspect the pane and manually clear only the draft you
+recognize; automation never clears an unknown human composer to retry recovery.
+For task pickup, a typing failure before Enter is still retried; this change does not establish its underlying cause.
 
 For a trial, restart the managed notifier and observer to load the new code. The
 local `state/codex-pickup.json` records startup code hashes, fixed event counters,
