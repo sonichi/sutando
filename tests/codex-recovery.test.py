@@ -1,4 +1,5 @@
 """Recovery exercises production observation validation, durable grants and fenced key transport."""
+from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
@@ -15,14 +16,16 @@ from delivery import codex_recovery as recovery
 from delivery.codex_pickup import mark, ready, refused, record_event, warning
 from runtime_observation import write, validate
 
+INCARNATION = "7:" + datetime.fromtimestamp(time.time()-100, timezone.utc).strftime("%a %b %d %H:%M:%S %Y")
+
 
 def failed_record(now, kind="server-overloaded"):
     return dict(schema=1, seat="core", observer="codex-observer", observer_version="test",
                 observer_id="test", observer_started_at=now-100, session="core", claude_session_id=None,
                 heartbeat_at=now, changed_at=now-40, seq=1, condition_since=now-40,
                 last_success_at=None, phase="failed", motion="idle", condition="abnormal",
-                reason="api-error" if kind == "server-overloaded" else kind, core_incarnation="7:start",
-                failed_task=dict(turn_id="turn", prompt_sha256="a"*64, core_incarnation="7:start",
+                reason="api-error" if kind == "server-overloaded" else kind, core_incarnation=INCARNATION,
+                failed_task=dict(turn_id="turn", prompt_sha256="a"*64, core_incarnation=INCARNATION,
                                  accepted_at=now-50, completed_at=now-40, error_kind=kind))
 
 
@@ -45,19 +48,19 @@ class RecoveryTests(unittest.TestCase):
         write({**record, "seq": self.seq}, self.ws)
 
     def attempt(self):
-        return recovery.recover(self.ws, "core", "7:start", "socket", "%7", now=self.now)
+        return recovery.recover(self.ws, "core", INCARNATION, "socket", "%7", now=self.now)
 
     def test_terminal_error_allows_only_one_probe_and_never_grants_ready(self):
-        self.assertFalse(ready(self.ws, "core", "7:start", now=self.now))
+        self.assertFalse(ready(self.ws, "core", INCARNATION, now=self.now))
         self.assertTrue(self.attempt())
         self.assertEqual([x.args[-1] for x in self.send.call_args_list], [recovery.BOOTSTRAP_PROMPT, "C-m"])
         self.assertFalse(self.attempt())
-        self.assertFalse(ready(self.ws, "core", "7:start", now=self.now))
+        self.assertFalse(ready(self.ws, "core", INCARNATION, now=self.now))
         self.assertEqual(self.send.call_count, 2)
         self.assertNotIn("a" * 64, (self.ws/"state/codex-recovery.json").read_text())
 
     def test_unresolved_owner_intent_never_replays_or_releases_next_task(self):
-        mark(self.ws, "task-a.txt", "7:start", "private task")
+        mark(self.ws, "task-a.txt", INCARNATION, "private task")
         self.assertFalse(self.attempt())
         self.send.assert_not_called()
         self.assertTrue((self.ws/"state/codex-notifier-inflight/task-a.txt").is_file())
@@ -74,6 +77,13 @@ class RecoveryTests(unittest.TestCase):
         self.assertFalse(self.attempt())
         self.send.assert_not_called()
 
+    def test_resumed_old_terminal_tail_cannot_grant_a_current_process_probe(self):
+        self.record["failed_task"]["accepted_at"] = self.now-1000
+        self.record["failed_task"]["completed_at"] = self.now-900
+        self.publish(self.record)
+        self.assertFalse(self.attempt())
+        self.send.assert_not_called()
+
     def test_backoff_stale_wrong_session_and_incarnation_stay_closed(self):
         for patch in [{"session": "other"},
                       {"core_incarnation": "8:new", "failed_task": None}]:
@@ -84,7 +94,7 @@ class RecoveryTests(unittest.TestCase):
         rec["failed_task"]["completed_at"] = self.now-1
         self.publish(rec)
         self.assertFalse(self.attempt())
-        self.assertIsNone(recovery.candidate(self.ws, "core", "7:start", self.now+100))
+        self.assertIsNone(recovery.candidate(self.ws, "core", INCARNATION, self.now+100))
         self.send.assert_not_called()
 
     def test_busy_unknown_unreadable_or_real_draft_never_gets_input(self):
@@ -121,10 +131,10 @@ class RecoveryTests(unittest.TestCase):
 
     def test_corrupt_grant_never_retries_and_new_success_rearms_once(self):
         path = self.ws/"state/codex-recovery.json"
-        for raw in ["bad", "[]", "x"*4097, '{"incarnation":"7:start"}']:
+        for raw in ["bad", "[]", "x"*4097, '{"incarnation":INCARNATION}']:
             path.write_text(raw)
             self.assertFalse(self.attempt())
-        path.write_text(json.dumps({"incarnation":"7:start", "claimed_at":self.now-100, "terminal_at":self.now-110}))
+        path.write_text(json.dumps({"incarnation":INCARNATION, "claimed_at":self.now-100, "terminal_at":self.now-110}))
         self.record["last_completed_at"] = self.now-60
         self.publish(self.record)
         self.assertTrue(self.attempt())
@@ -151,7 +161,7 @@ class RecoveryTests(unittest.TestCase):
             with self.assertRaises(ValueError): validate({**self.record, "failed_task":{**self.record["failed_task"], **patch}})
 
     def test_refusal_warning_is_deduplicated_private_and_cleared_on_submission(self):
-        for _ in range(2): refused(self.ws, "private-task.txt", "core", "7:start")
+        for _ in range(2): refused(self.ws, "private-task.txt", "core", INCARNATION)
         path = self.ws/"state/codex-pickup.json"
         self.assertEqual(json.loads(path.read_text())["counts"]["refused"], 1)
         self.assertNotIn("private-task", path.read_text())

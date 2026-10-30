@@ -1,6 +1,7 @@
 """Bounded Codex liveness probes; terminal errors never acknowledge or replay an owner task."""
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import json
 import math
 import os
@@ -25,7 +26,12 @@ def candidate(workspace, session, incarnation, now):
     if not record or record["observer"] != "codex-observer" or record["session"] != session:
         return None
     receipt = record.get("failed_task")
+    try:
+        started_at = datetime.strptime(incarnation.split(":", 1)[1], "%a %b %d %H:%M:%S %Y").replace(tzinfo=timezone.utc).timestamp()
+    except (ValueError, IndexError):
+        return None
     if (not incarnation or record.get("core_incarnation") != incarnation or not receipt
+            or receipt["accepted_at"] < started_at
             or receipt["error_kind"] != "server-overloaded"
             or now - receipt["completed_at"] < BACKOFF_S):
         return None
