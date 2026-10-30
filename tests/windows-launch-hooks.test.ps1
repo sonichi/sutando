@@ -24,7 +24,8 @@ try {
     function Invoke-Launch([string]$helperBody) {
         Set-Content -LiteralPath $helper -Encoding utf8 -Value $helperBody
         Remove-Item -LiteralPath $order -ErrorAction SilentlyContinue
-        & pwsh -NoProfile -File (Join-Path $fake 'scripts/start-cli.ps1') -NoWindow
+        # The launcher's banner goes to the host, never into this function's return value.
+        & pwsh -NoProfile -File (Join-Path $fake 'scripts/start-cli.ps1') -NoWindow | Out-Host
         if ($LASTEXITCODE -ne 0) { throw "start-cli.ps1 exited $LASTEXITCODE" }
         return (@(Get-Content -LiteralPath $order) | ForEach-Object { $_.Trim() }) -join ','
     }
