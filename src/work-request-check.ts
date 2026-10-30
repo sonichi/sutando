@@ -3,6 +3,7 @@
  * - a check on a `work` request before it is submitted: can the core act on it as written, is something
  *   missing that only the user can supply (which PR, which file, who), or was it already sent?
  * - a look at every finished user turn, whichever tool the voice model chose: is it a request for the core?
+ * - a look at every spoken assistant turn while a result waits to be told: did the turn tell it?
  *
  * The voice model decides fluently and does not stop to ask (2026-10-12: four prompt revisions,
  * zero questions asked; a blank request was submitted or an answer was invented). A text model
@@ -103,16 +104,24 @@ export function parseWorkCheck(text: string, openTasks: OpenTask[] = []): WorkCh
  * or a request already sent?
  */
 export type TurnVerdict =
-	| { action: 'work'; task: string }
+	/** `acknowledged`: the assistant's reply to this turn already told the user it is on this request (2026-10-21 18:38:35
+	 *  "Understood, I'll make sure to check…"), so the submit is not acknowledged a second time. `corrects`: the open task
+	 *  this request corrects or spells out (a misheard name); one the user heard acknowledged is not acknowledged again. */
+	| { action: 'work'; task: string; acknowledged?: true; corrects?: string }
 	| { action: 'none' }
 	| { action: 'ask'; question: string }
-	| { action: 'duplicate'; of: string };
+	| { action: 'duplicate'; of: string }
+	/** The assistant said it already did something this turn that no tool call or delivered result backs (2026-10-21
+	 *  17:39:23 "I've replaced the V2 plan…" with no tool call). `task` when only the core can do it. */
+	| { action: 'unbacked'; claim: string; task?: string };
 
 export interface TurnInput {
 	/** What the user just said (one turn, or several when they went on speaking). */
 	utterance: string;
 	recentConversation: string;
 	openTasks?: OpenTask[];
+	/** This turn's tool calls with their status, and the results delivered to the voice model in it (thisTurnToolLines). */
+	thisTurn?: string;
 }
 
 export type TurnClassifier = (input: TurnInput, signal?: AbortSignal) => Promise<TurnVerdict>;
@@ -131,20 +140,34 @@ export function turnClassifierPrompt(i: TurnInput, extraRules: readonly string[]
 		'- A yes to the assistant\'s own offer to do something ("你是想让我查一下 5332 吗？" -> "对") is that request: work.',
 		'- A question whether an earlier request was done, lost or already answered ("did you lose that one?", "是不是丢了一个", "did you tell me the PR count?") is none: the assistant answers it from its task list, and the core is not asked again.',
 		'- none: chit-chat, thanks, any other yes/no reply, a question about the assistant\'s own task list ("how many tasks are pending", "is it done yet") with no new thing named, a public fact or general-knowledge question, or anything already being answered.',
+		// 2026-10-21 17:39:17: "Did you see it 923?" (a video at 9:23 in the room), already answered, was sent to the core.
+		'- A question about a message, video or picture at some time or place ("did you see the 9:23 one?", "did you watch it?"), or about something the assistant has just answered, is none: the assistant looks or answers itself.',
+		// 2026-10-21 18:38:35: "Understood, I'll make sure to check for pull requests by Sonicchi.", then the submit's notice
+		// made it say "I'm looking into those pull requests now." as well.
+		'- With work, add "acknowledged":true when the assistant\'s reply to this turn (its lines after the user\'s last line in the recent words) already tells the user it is on this request ("let me look into", "I\'ll check that", "understood, I\'ll look for…"), even cut off. Leave it out when that reply says nothing about doing it.',
+		// 2026-10-21 18:56:16: "c h i s o n a c h i" spelled out the request sent a turn before; the reply was "Mm-hm.".
+		'- With work, add "corrects":"<id>" when the user is correcting or spelling out one of the open tasks below (a misheard name, a missing piece) rather than asking for something new.',
 		'- duplicate: the same request as one of the open tasks below (same thing, same ask, worded differently or misheard).',
 		'- ask: it is a request for the core but a specific thing is missing and the recent words do not supply it, or you cannot tell whether they want the core to act. One short question in the user\'s language.',
-		...extraRules,
+		// 2026-10-21 17:39:23, 17:40:00: "I've replaced the V2 plan…", "I've created a separate page … v3", no tool call in either turn.
+		'- unbacked: the assistant\'s reply to this turn (its lines after the user\'s last line in the recent words) says it already did something — did, created, wrote, updated, replaced, sent, deleted, opened — that no tool call this turn with "ok" did and no delivered result reports. claim = that sentence. Saying it is doing it or will do it, or that a task is with the core, is not a claim; nor is repeating what a delivered or earlier result said. Add task (the request for the core, as for work) only when only the core can do it and no open task is it already. When the assistant claimed it did what the user asked, decide unbacked, not work.',
+		// The skills' rules name what the assistant's own tools do: they win over "messages, notes" above (17:39:17).
+		...(extraRules.length ? ['The rules below come from the assistant\'s own tools and take precedence over the split above: what they say the assistant does itself is none, even when it is about messages or notes.', ...extraRules] : []),
 		'Reply with JSON only, one of:',
-		'{"action":"work","task":"..."}',
+		'{"action":"work","task":"...","acknowledged":true} (acknowledged only when the assistant already said it is on it; "corrects" as above)',
 		'{"action":"none"}',
 		'{"action":"duplicate","of":"<id of the open task>"}',
 		'{"action":"ask","question":"..."}',
+		'{"action":"unbacked","claim":"...","task":"..."} (task only when the core must do it)',
 		'',
 		'Recent words (oldest first):',
 		i.recentConversation.trim() || '(none)',
 		'',
 		'Open tasks (sent, not answered yet):',
 		openTasksBlock(i.openTasks),
+		'',
+		'This turn, after the user spoke — the assistant\'s tool calls (name, arguments, result) and the results delivered to it:',
+		i.thisTurn?.trim() || '(none)',
 		'',
 		'What the user just said:',
 		i.utterance.trim(),
@@ -156,21 +179,89 @@ export function parseTurnVerdict(text: string, openTasks: OpenTask[] = []): Turn
 	const m = /\{[\s\S]*\}/.exec(text);
 	if (!m) return { action: 'none' };
 	try {
-		const d = JSON.parse(m[0]) as { action?: unknown; task?: unknown; question?: unknown; of?: unknown };
-		if (d.action === 'work' && typeof d.task === 'string' && d.task.trim()) return { action: 'work', task: d.task.trim() };
+		const d = JSON.parse(m[0]) as { action?: unknown; task?: unknown; question?: unknown; of?: unknown; claim?: unknown; acknowledged?: unknown; corrects?: unknown };
+		if (d.action === 'unbacked' && typeof d.claim === 'string' && d.claim.trim()) {
+			const task = typeof d.task === 'string' ? d.task.trim() : '';
+			return task ? { action: 'unbacked', claim: d.claim.trim(), task } : { action: 'unbacked', claim: d.claim.trim() };
+		}
+		if (d.action === 'work' && typeof d.task === 'string' && d.task.trim()) {
+			// Only an id that is really open, as for duplicate.
+			const corrects = typeof d.corrects === 'string' && openTasks.some((t) => t.id === d.corrects) ? d.corrects : undefined;
+			return { action: 'work', task: d.task.trim(), ...(d.acknowledged === true ? { acknowledged: true as const } : {}), ...(corrects ? { corrects } : {}) };
+		}
 		if (d.action === 'ask' && typeof d.question === 'string' && d.question.trim()) return { action: 'ask', question: d.question.trim() };
 		if (d.action === 'duplicate' && typeof d.of === 'string' && openTasks.some((t) => t.id === d.of)) return { action: 'duplicate', of: d.of };
 	} catch { /* not JSON */ }
 	return { action: 'none' };
 }
 
+/** A result that came back through its work call and has not been heard yet. */
+export interface WaitingResult {
+	id: string;
+	/** What the user asked. */
+	request: string;
+	result: string;
+}
+
+export interface HeardInput {
+	results: WaitingResult[];
+	/** The assistant's spoken lines since the results came back, oldest first. */
+	assistantWords: string;
+	/** The user cut the last turn off. */
+	cutOff: boolean;
+}
+
+/** The ids of the results the assistant's words told the user; null when there is no verdict (the caller's own rule decides). */
+export type HeardCheck = (input: HeardInput, signal?: AbortSignal) => Promise<string[] | null>;
+
+/** A result is given this much: a summary's answer can sit past the first sentences. */
+export const HEARD_RESULT_MAX = 600;
+
+/**
+ * Did the assistant's words tell the user a waiting result? A phrase pattern decided it and failed on each new wording
+ * (2026-10-21 18:56:52: "you merged three yesterday" for "You merged 3 pull requests yesterday", judged unsaid, nudged
+ * and said again); looser patterns took holding lines for the answer.
+ */
+export function heardCheckPrompt(i: HeardInput): string {
+	const quote = (s: string) => `"${s.replace(/\s+/g, ' ').replace(/"/g, "'").trim()}"`;
+	const clip = (s: string) => { const t = s.replace(/\s+/g, ' ').trim(); return t.length > HEARD_RESULT_MAX ? `${t.slice(0, HEARD_RESULT_MAX - 1)}…` : t; };
+	return [
+		'A voice assistant is waiting to tell the user the results below; each answers a request the user made. Decide which of them the assistant\'s words already told the user.',
+		'Rules:',
+		'- A result is told when the words give the user its main answer, in any wording or language: "you merged three yesterday" tells "You merged 3 pull requests yesterday: number 5641, 5648 and 5650". Not every detail needs saying.',
+		'- Saying it is checking or working on it, naming the request without its answer, or a different answer does not tell it. Nor does an answer to something else that happens to share a word or number.',
+		'- An answer cut off before its main point does not tell it.',
+		'Reply with JSON only: {"told":["<id>", ...]}, an empty list when none was told.',
+		'',
+		'Results waiting to be told (id: asked -> result):',
+		...i.results.map((r) => `${r.id}: ${quote(r.request)} -> ${clip(r.result)}`),
+		'',
+		`The assistant's words since these results came back, oldest first${i.cutOff ? ' (the last turn was cut off by the user)' : ''}:`,
+		i.assistantWords.trim() || '(none)',
+	].join('\n');
+}
+
+/** The ids told, only ones that were asked about; null when the reply is not a verdict. */
+export function parseHeardVerdict(text: string, results: WaitingResult[]): string[] | null {
+	const m = /\{[\s\S]*\}/.exec(text);
+	if (!m) return null;
+	try {
+		const told = (JSON.parse(m[0]) as { told?: unknown }).told;
+		if (!Array.isArray(told)) return null;
+		return results.map((r) => r.id).filter((id) => told.includes(id));
+	} catch {
+		return null;
+	}
+}
+
 /** Where a check prompt's instructions end and the turn being judged begins. */
-const INPUT_MARK = '\nRecent words (oldest first):';
+const INPUT_MARKS = ['\nRecent words (oldest first):', '\nResults waiting to be told'];
 
 /** The instructions go in as the system instruction and the turn as the user message: sent as one block,
  *  the rules together tripped Gemini's prompt filter (PROHIBITED_CONTENT) on harmless requests. */
 export function checkRequestBody(prompt: string): Record<string, unknown> {
-	const at = prompt.indexOf(INPUT_MARK);
+	const found = INPUT_MARKS.map((m) => prompt.indexOf(m)).filter((k) => k > 0);
+	const at = found.length ? Math.min(...found) : -1;
 	const contents = (text: string) => [{ role: 'user', parts: [{ text }] }];
 	return at > 0
 		? { systemInstruction: { parts: [{ text: prompt.slice(0, at) }] }, contents: contents(prompt.slice(at + 1)) }
@@ -238,8 +329,23 @@ export function createGeminiTurnClassifier(opts: { apiKey: () => string | undefi
 		if (r.text === null && r.blocked && opts.extraRules?.length) r = await ask();
 		if (r.text === null) return { action: 'none' };
 		const verdict = parseTurnVerdict(r.text, input.openTasks);
-		const detail = verdict.action === 'work' ? ` (${verdict.task})` : verdict.action === 'ask' ? ` (${verdict.question})` : verdict.action === 'duplicate' ? ` of ${verdict.of}` : '';
+		const detail = verdict.action === 'work' ? ` (${verdict.task})${verdict.acknowledged ? ' [already acknowledged]' : ''}${verdict.corrects ? ` [corrects ${verdict.corrects}]` : ''}` : verdict.action === 'unbacked' ? ` ("${verdict.claim}"${verdict.task ? `; task=${verdict.task}` : ''})` : verdict.action === 'ask' ? ` (${verdict.question})` : verdict.action === 'duplicate' ? ` of ${verdict.of}` : '';
 		opts.log?.(`[RelayAgent] turn check: ${verdict.action}${detail} in ${Date.now() - t0}ms`);
 		return verdict;
+	};
+}
+
+/** One call, no retry: a verdict later than the relay waits for is not used (it falls back to its own rule). */
+export function createGeminiHeardCheck(opts: { apiKey: () => string | undefined; model?: string; timeoutMs?: number; log?: (m: string) => void }): HeardCheck {
+	const model = opts.model ?? WORK_CHECK_MODEL;
+	return async (input, signal) => {
+		const apiKey = opts.apiKey();
+		if (!apiKey) return null;
+		const t0 = Date.now();
+		const { text } = await geminiJson({ apiKey, model, timeoutMs: opts.timeoutMs ?? WORK_CHECK_TIMEOUT_MS, prompt: heardCheckPrompt(input), signal, log: opts.log, what: 'heard check' });
+		if (text === null) return null;
+		const told = parseHeardVerdict(text, input.results);
+		opts.log?.(`[RelayAgent] heard check: ${told === null ? 'no verdict' : `told [${told.join(', ')}] of [${input.results.map((r) => r.id).join(', ')}]`} in ${Date.now() - t0}ms`);
+		return told;
 	};
 }

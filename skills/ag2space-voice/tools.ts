@@ -113,7 +113,10 @@ export function voiceSurface(): VoiceSurfaceContribution {
 		tools: [...(where ? [navigateUiTool, where] : []), ...roomRead.tools],
 		promptRules: [...(where ? [NAVIGATION_PROMPT_RULE, CURRENT_ROOM_PROMPT_RULE] : []), ...roomRead.promptRules],
 		contextLines: () => [...roomContextLines(_binding?.current() ?? null), ...roomRead.contextLines()],
-		answeringTools: [...(where ? [where.name] : []), ...roomRead.tools.map((t) => t.name)],
+		// A page write is not an answer: an append can stand in for a rewrite the user asked for, so the turn check
+		// still judges a turn that wrote (2026-10-21 17:36:54: "write_page answers this turn; the turn check sends nothing").
+		answeringTools: [...(where ? [where.name] : []), ...roomRead.tools.map((t) => t.name).filter((n) => n !== 'write_page')],
+		writingTools: roomRead.tools.some((t) => t.name === 'write_page') ? ['write_page'] : [],
 		turnCheckRules: [...(where ? [CURRENT_ROOM_TURN_CHECK_RULE] : []), ...roomRead.turnCheckRules],
 	};
 }

@@ -34,7 +34,10 @@ export function createVoiceTaskStatusWriter(opts: {
 	return {
 		changed() {
 			dirty = true;
-			if (!writing) writing = writeOnce().finally(() => { writing = null; });
+			// The copy is taken on the next turn of the event loop, not inside the change: a work call's row is added
+			// while the relay agent still lists the call as being sent, and it leaves that list only a few microtasks
+			// later, once its submit returns. Taken at once, the copy counted that request twice.
+			if (!writing) writing = new Promise<void>((r) => setImmediate(r)).then(writeOnce).finally(() => { writing = null; });
 		},
 		async flush() {
 			while (writing) await writing;

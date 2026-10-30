@@ -37,6 +37,8 @@ export interface VoiceSurfaceContribution {
 	contextLines?: () => string[];
 	/** Tools that fetch the answer themselves: a turn the voice model answers with one is not also sent to the core. */
 	answeringTools?: string[];
+	/** Tools that change something the user asked for: a turn with one is still judged by the turn check, even when an answering tool also ran. */
+	writingTools?: string[];
 	/** Rule lines for the relay agent's turn check: what the voice model answers itself and the core is never asked. */
 	turnCheckRules?: string[];
 }
@@ -51,6 +53,7 @@ export function collectVoiceSurface(
 	const promptRules: string[] = [];
 	const contextFns: Array<() => string[]> = [];
 	const answeringTools: string[] = [];
+	const writingTools: string[] = [];
 	const turnCheckRules: string[] = [];
 	for (const hook of hooks) {
 		try {
@@ -60,6 +63,7 @@ export function collectVoiceSurface(
 			if (Array.isArray(c.promptRules)) promptRules.push(...c.promptRules.filter(l => typeof l === 'string' && l));
 			if (typeof c.contextLines === 'function') contextFns.push(c.contextLines);
 			if (Array.isArray(c.answeringTools)) answeringTools.push(...c.answeringTools.filter(n => typeof n === 'string' && n));
+			if (Array.isArray(c.writingTools)) writingTools.push(...c.writingTools.filter(n => typeof n === 'string' && n));
 			if (Array.isArray(c.turnCheckRules)) turnCheckRules.push(...c.turnCheckRules.filter(l => typeof l === 'string' && l));
 		} catch (err) {
 			log('[voice-surface] hook threw:', err instanceof Error ? err.message : err);
@@ -77,7 +81,7 @@ export function collectVoiceSurface(
 		}
 		return out;
 	};
-	return { tools, promptRules, contextLines, answeringTools, turnCheckRules };
+	return { tools, promptRules, contextLines, answeringTools, writingTools, turnCheckRules };
 }
 
 function isThenable(v: unknown): v is PromiseLike<unknown> {

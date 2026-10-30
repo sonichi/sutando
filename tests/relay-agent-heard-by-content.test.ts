@@ -77,6 +77,46 @@ describe('a returned result is heard only when the model says it', () => {
 		assert.equal(voiceTaskStore.get(id)?.delivery, 'spoken');
 	});
 
+	it('a nudge due while the model is mid-turn waits for the turn: none when that turn says the result', async () => {
+		// 2026-10-20 18:14:09: the nudge for the Use Case 03 summary went in while the model was saying it; it said it again.
+		const id = voiceTask('watch the Use Case 03 video and summarize it');
+		submitted = { status: 'pending', taskId: id, queuedAhead: 0, watcherOnline: true };
+		const call = relay.invoke('Execute tool: work', { task: 'watch the Use Case 03 video and summarize it' });
+		await tick(0);
+		writeFileSync(join(TMP, 'results', `${id}.txt`), 'The Use Case 03 video is a 38-second demo: a person and an agent edit one page; the agent formats the notes as a list and adds the missing video link.');
+		await Promise.race([call, tick(5_000)]);
+		const before = notices.length;
+		session.emit('turn.start');
+		session.emit('response.first_audio');
+		await tick(600); // past the nudge time, the model still speaking
+		assert.equal(notices.length, before, 'no nudge into a turn in progress');
+		items.push({ role: 'assistant', content: 'The Use Case three video shows a person and an agent collaborating on a document to format a list and add a video link.' });
+		session.emit('turn.end', { turnId: 'tu1' });
+		assert.equal(voiceTaskStore.get(id)?.delivery, 'spoken');
+		await tick(100);
+		assert.equal(notices.length, before, 'and none after it: the turn said it');
+	});
+
+	it('a nudge due mid-turn goes as soon as a turn ends without the result', async () => {
+		const id = voiceTask('summarize the launch plan');
+		submitted = { status: 'pending', taskId: id, queuedAhead: 0, watcherOnline: true };
+		const call = relay.invoke('Execute tool: work', { task: 'summarize the launch plan' });
+		await tick(0);
+		writeFileSync(join(TMP, 'results', `${id}.txt`), 'The launch plan has four phases; the beta opens on November 12.');
+		await Promise.race([call, tick(5_000)]);
+		const before = notices.length;
+		session.emit('turn.start');
+		session.emit('response.first_audio');
+		await tick(600);
+		assert.equal(notices.length, before);
+		items.push({ role: 'assistant', content: 'Sure, here is a joke about skeletons.' });
+		session.emit('turn.end', { turnId: 'tu2' });
+		assert.equal(notices.length, before + 1, 'nudged once the turn ended');
+		assert.match(notices[notices.length - 1], /summarize the launch plan/);
+		modelSays('The launch plan has four phases and the beta opens on November 12.', 'tu3');
+		assert.equal(voiceTaskStore.get(id)?.delivery, 'spoken');
+	});
+
 	it('a turn that carries a number from the result counts at once, with no nudge', async () => {
 		const before = notices.length;
 		const id = voiceTask('check PR 5617');
@@ -87,6 +127,42 @@ describe('a returned result is heard only when the model says it', () => {
 		await Promise.race([call, tick(5_000)]);
 		modelSays('Pull request 5617 was merged on Saturday.', 't4');
 		assert.equal(voiceTaskStore.get(id)?.delivery, 'spoken');
+		await tick(600);
+		assert.equal(notices.length, before, 'no nudge for a result that was said');
+	});
+
+	// Live 2026-10-20 11:14 (desktop voice): the answer was "3", said as "three" inside a turn that also carried another
+	// result. The evidence was only 19/13/october/sutando, so the relay nudged and handed it over again, and the
+	// user heard it three times.
+	it('a small-number answer said before its own noun counts, even inside a combined turn', async () => {
+		const before = notices.length;
+		const request = 'Count the number of pull requests merged by myself yesterday.';
+		const id = voiceTask(request);
+		submitted = { status: 'pending', taskId: id, queuedAhead: 0, watcherOnline: true };
+		const call = relay.invoke('Execute tool: work', { task: request });
+		await tick(0);
+		writeFileSync(join(TMP, 'results', `${id}.txt`), 'Yesterday, October 19, you merged 3 pull requests in the Sutando repository, out of 13 merged in total that day. 3 of your own pull requests were also merged yesterday.');
+		await Promise.race([call, tick(5_000)]);
+		modelSays('The Use Case three video shows a person and an agent collaborating on a document to format a list and add a video link, and you merged three pull requests yesterday. I currently have one pending task, which is building the San Francisco restroom finder app.', 't88');
+		assert.equal(voiceTaskStore.get(id)?.delivery, 'spoken', 'the answer was said');
+		await tick(600);
+		assert.equal(notices.length, before, 'no nudge and no second hand-over for a result that was said');
+	});
+
+	// Replay 2026-10-21 18:39 (ws-113802): "You merged 3 pull requests yesterday: number 5641, ..." was said as
+	// "Regarding how many pull requests you merged yesterday, you merged three of them." The noun came first, the
+	// number after it, so the relay judged it unsaid, nudged, and the model said it a second time.
+	it('a small-number answer said after its noun ("three of them") counts', async () => {
+		const before = notices.length;
+		const request = 'How many pull requests did I merge yesterday?';
+		const id = voiceTask(request);
+		submitted = { status: 'pending', taskId: id, queuedAhead: 0, watcherOnline: true };
+		const call = relay.invoke('Execute tool: work', { task: request });
+		await tick(0);
+		writeFileSync(join(TMP, 'results', `${id}.txt`), 'You merged 3 pull requests yesterday: number 5641, number 5648 and number 5650.');
+		await Promise.race([call, tick(5_000)]);
+		modelSays('Regarding how many pull requests you merged yesterday, you merged three of them.', 't89');
+		assert.equal(voiceTaskStore.get(id)?.delivery, 'spoken', 'the answer was said');
 		await tick(600);
 		assert.equal(notices.length, before, 'no nudge for a result that was said');
 	});
@@ -123,6 +199,63 @@ describe('resultEvidence / turnSaysResult', () => {
 
 	// The live transcript never writes digits: "98" is spoken as "ninetyeight" or "九十八", and a matcher that looks
 	// for the digits nudges and re-hands a result the user has already heard.
+	it('a small number counts only next to the result\'s own noun', () => {
+		const e = resultEvidence('Yesterday, October 19, you merged 3 pull requests in the Sutando repository, out of 13 merged in total that day.', 'Count the number of pull requests merged by myself yesterday.');
+		assert.ok(turnSaysResult('You merged three pull requests yesterday.', e), 'spelled out, before its noun');
+		assert.ok(turnSaysResult('You merged 3 pull requests.', e), 'digits, before its noun');
+		assert.equal(turnSaysResult('I currently have three pending tasks.', e), false, 'the same number before another noun is not it');
+		assert.equal(turnSaysResult('There are three of them.', e), false);
+		const merged = resultEvidence('You merged 3 pull requests yesterday: number 5641, number 5648 and number 5650.', 'How many pull requests did I merge yesterday?');
+		assert.ok(turnSaysResult('Regarding how many pull requests you merged yesterday, you merged three of them.', merged), 'the number after its noun, named earlier in the turn');
+		assert.ok(turnSaysResult('Pull requests you merged yesterday: three.', merged), 'the number alone, its noun named');
+		assert.equal(turnSaysResult("I'm checking how many pull requests you merged yesterday.", merged), false, 'the noun with no number is the question, not the answer');
+		assert.equal(turnSaysResult("I'm checking your pull requests; you have three pending tasks.", merged), false, 'the number counting another noun');
+		assert.equal(turnSaysResult('You merged three of them.', merged), false, 'the number with its noun never named');
+		// Holding turns that name the noun and a number that is not the count: "one of", "one more", "at 3 pm", "one by one".
+		assert.equal(turnSaysResult('I will check your pull requests at 3 pm.', merged), false, 'a number followed by another word is not the count');
+		assert.equal(turnSaysResult('Three of the pull requests are still loading.', merged), false, 'the number before its noun with words between');
+		assert.equal(turnSaysResult('I am checking pull requests now, three more to go.', merged), false, 'the number after its noun but not closing the sentence');
+		assert.equal(turnSaysResult('Three. Let me check your pull requests.', merged), false, 'the number in another sentence than its noun');
+		const one = resultEvidence('You merged 1 pull request yesterday: number 5641.', 'How many pull requests did I merge yesterday?');
+		assert.ok(turnSaysResult('You merged one pull request yesterday.', one), 'one, right before its noun');
+		assert.equal(turnSaysResult('One of the pull requests is still loading, give me a second.', one), false, '"one of" is not the count');
+		assert.equal(turnSaysResult('I am checking pull requests now, one more moment.', one), false, '"one more" is not the count');
+		assert.equal(turnSaysResult('Let me go through your pull requests one by one.', one), false, '"one by one" is not the count');
+		assert.equal(turnSaysResult('Checking your pull requests, one at a time.', one), false, '"one at a time" is not the count');
+		assert.equal(turnSaysResult('Your pull requests: one of them.', one), false, '"one" after its noun is a pronoun, not the count');
+		const asked = resultEvidence('5 tasks are open.', 'are 5 tasks open?');
+		assert.equal(turnSaysResult('Five tasks are open.', asked), false, 'a phrase the request already had is not the answer');
+	});
+
+	// Review of #5774 (2026-10-22): the word after a small number was taken as its noun even when it was an adjective
+	// ("new", "open") or a function word ("and"), so an unrelated turn with the same number counted as the result said,
+	// and that result was never nudged or handed over again.
+	it('a small number counts only before the result\'s own noun, never its adjective or a function word', () => {
+		const msg = resultEvidence('You have 1 new message from Alice about invoice 4521.');
+		assert.equal(turnSaysResult('You have one new task in the queue.', msg), false, 'same number and adjective, another noun');
+		assert.ok(turnSaysResult('You have one new message from Alice.', msg), 'the noun after the adjective is said');
+		const prs = resultEvidence('There are 2 open pull requests waiting for your review.');
+		assert.equal(turnSaysResult('I have two open questions.', prs), false, 'same number and adjective, another noun');
+		assert.ok(turnSaysResult('There are two open pull requests waiting.', prs), 'the noun after the adjective is said');
+		assert.equal(turnSaysResult('one and two and three', resultEvidence('Found 2 and closed them.')), false, 'a function word is not a noun');
+		const invoices = resultEvidence('You have 3 invoices waiting.');
+		assert.ok(turnSaysResult('You have three invoices.', invoices), 'the noun ending its sentence counts');
+		assert.deepEqual(resultEvidence('3 tasks.').phrases, [], 'a stop word stays stopped in the plural');
+	});
+
+	// Review of #5774: "three minutes" or "two days" is said in many a turn about something else; a time unit after a
+	// small number is how long or when, never the count a result is about.
+	it('a small number before a time unit is not the result said', () => {
+		const build = resultEvidence('Your build finished in 3 minutes.');
+		assert.equal(turnSaysResult('I will check back in three minutes.', build), false, 'minutes is not a noun the result counts');
+		assert.ok(turnSaysResult('Your build finished in three minutes.', build), 'the result\'s own words still count');
+		const due = resultEvidence('The Acme report is due in 2 days for the renewal.');
+		assert.equal(turnSaysResult('Remind me again in two days.', due), false, 'days is not a noun the result counts');
+		for (const unit of ['seconds', 'minute', 'hours', 'days', 'weeks', 'month', 'years', 'percent', 'times']) {
+			assert.deepEqual(resultEvidence(`It took 3 ${unit}.`).phrases, [], `3 ${unit} is not a count phrase`);
+		}
+	});
+
 	it('a number the transcript spells out counts: English, hyphen-free, pairwise for four digits, Chinese', () => {
 		const prs = resultEvidence('98 PRs merged in sonichi/sutando in the last seven days — 2026-10-12 through today. Newest is #5717.');
 		assert.equal(turnSaysResult('To follow up on the PRs, there were ninetyeight merged in the repository last week.', prs), true);

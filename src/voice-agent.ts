@@ -32,7 +32,7 @@ import { createGoogleGenerativeAI } from '@ai-sdk/google';
 import { z } from 'zod';
 import { existsSync, readFileSync, unlinkSync, mkdirSync, copyFileSync, appendFileSync, writeFileSync, realpathSync } from 'node:fs';
 import { notify as platformNotify } from './platform.js';
-import { inlineTools, personalSkillSetups, personalVoiceSurface, describeVoiceTasks, voiceTaskCounts, voiceTaskStatusSnapshot, heardByUser, resultsNotYetTold } from './inline-tools.js';
+import { inlineTools, personalSkillSetups, personalVoiceSurface, voiceTaskReport, voiceTaskStatusSnapshot, voiceTasksBeingSent, setVoiceTasksBeingSent, heardByUser, resultsNotYetTold } from './inline-tools.js';
 import { createClientFrameHub } from './client-frame-hub.js';
 import { runSkillSetups } from './skill-setup-runner.js';
 import { setVisionSession, startVisionControlServer, stopVisionControlServer, setSessionToolUpdater, setVisionSpeechEvidence, getVisionEgressStats, isStreaming, stopStreaming as stopVisionStreaming } from './vision-tools.js';
@@ -74,9 +74,9 @@ import { acquireVoiceLock, releaseOnExitUnlessFatal, resolveLockPython, voiceLoc
 import { recordToolCall } from './conversation-store.js';
 import { buildGreeting, buildInstructions, type VoiceConfigContext } from './voice-agent-config.js';
 import { wireDurableChannels, createSessionRecorder , heldByPacer} from './live-agent-runtime.js';
-import { RelayAgent, relayAgentSubagentConfig, createSpeechGate, recentConversationLines, createAskDelivery } from './relay-agent.js';
+import { RelayAgent, relayAgentSubagentConfig, createModelTurnWatch, createSpeechGate, recentConversationLines, thisTurnToolLines, createAskDelivery, wireUserSpeech } from './relay-agent.js';
 import { createVoiceTaskStatusWriter } from './voice-task-status-writer.js';
-import { createGeminiTurnClassifier, createGeminiWorkCheck, WORK_CHECK_MODEL } from './work-request-check.js';
+import { createGeminiHeardCheck, createGeminiTurnClassifier, createGeminiWorkCheck, WORK_CHECK_MODEL } from './work-request-check.js';
 import {
 	classifyTransportClose,
 	fatalCloseForRecovery,
@@ -495,28 +495,35 @@ const getTaskStatus: ToolDefinition = {
 	description:
 		'Check the tasks the user asked for by voice and where each stands now (queued, in progress, cancel requested, done, and whether the user heard the result). ' +
 		'Use for status/progress questions like "any pending tasks?", "how many tasks are there?", "are you working on something?". ' +
-		'pendingTasks is the number to give for "how many pending": tasks the core is still working on. A finished result the user has not heard is not pending: it is in resultsNotYetTold. ' +
+		'pendingTasks is the number to give for "how many pending": tasks the core is still working on plus requests still being sent to it (beingSentToCore: accepted, and waiting for the user to finish, being checked or being submitted). A finished result the user has not heard is not pending: it is in resultsNotYetTold. ' +
 		'resultsNotYetTold lists finished results the user has not heard, with the result text: say each of them now, in a sentence, before the count; the user asking "did you lose one?" is usually one of these. ' +
 		'Always call it for these: never answer from memory, the state changes. Do NOT call work just to check progress.',
 	parameters: z.object({}),
 	execution: 'inline',
 	execute: async () => {
-		// The relay agent's table, the same source as the in-line count and get_core_status.
+		// The relay agent's table and its requests not yet sent, the same source as get_core_status and /voice-tasks.
 		const rows = voiceTaskRows();
-		// Pending is what the core still works on; a finished result not yet told is listed apart, to be said first.
-		const counts = voiceTaskCounts(rows, voiceTaskResultText);
+		const sending = voiceTasksBeingSent();
+		// Pending is what the core still works on and what is still being sent to it (nbe2e 17:13:24: "pending 0" while
+		// the request was in its check); a finished result not yet told is listed apart, to be said first.
+		const report = voiceTaskReport(rows, sending, voiceTaskResultText);
+		const counts = report.counts;
 		// What the tool said, so a wrong number out loud can be laid against it (2026-10-12: "one" for 4).
-		console.log(`${ts()} [RelayAgent] get_task_status: pending ${counts.pending} (the core is working on ${counts.working}, done not heard ${counts.doneNotHeard})`);
+		console.log(`${ts()} [RelayAgent] get_task_status: pending ${counts.pending} (the core is working on ${counts.working}, being sent ${counts.sending}, done not heard ${counts.doneNotHeard})`);
 		// Counts and states only: a yes/no "in progress" flag was read as "all of them are being worked on".
 		return {
 			pendingTasks: counts.pending,
 			stillBeingWorkedOn: counts.working,
+			beingSentToCore: counts.sending,
 			doneNotYetHeard: counts.doneNotHeard,
 			unknownState: counts.unknown,
-			tasks: rows.map((r) => ({ task: r.text.slice(0, 60), state: r.state, heard: heardByUser(r), ...(r.retired ? { endedWithNothingToSay: true } : {}) })),
+			tasks: [
+				...sending.map((e) => ({ task: e.task.slice(0, 60), state: 'being sent', heard: false })),
+				...rows.map((r) => ({ task: r.text.slice(0, 60), state: r.state, heard: heardByUser(r), ...(r.retired ? { endedWithNothingToSay: true } : {}) })),
+			],
 			// A finished result the user has not heard goes with its text, so "did you lose one?" is answered on the spot.
 			resultsNotYetTold: resultsNotYetTold(rows, voiceTaskResultText, new Set(heldByPacer())),
-			description: describeVoiceTasks(rows),
+			description: report.description,
 		};
 	},
 };
@@ -660,6 +667,8 @@ const mainAgentTools: ToolDefinition[] = [workTool, getTaskStatus, switchModeToo
  *  leaves those turns alone, so "cancel that task" is never also sent to the core. A status call is not one:
  *  a request the voice model routed to get_task_status still reaches the turn check. */
 const answeringTools = new Set([...personalVoiceSurface.answeringTools, 'cancel_task']);
+/** Tools that write what the user asked for (a page append): the turn check still judges the turn, even after a read. */
+const writingTools = new Set(personalVoiceSurface.writingTools);
 
 // Injection seam for the tuned factories in voice-agent-config.ts: this
 // module owns the session-gate + mode state; the config module owns the
@@ -1018,10 +1027,23 @@ function whenSessionActive(s: VoiceSession): Promise<void> {
 	});
 }
 
+	// The task table lives in memory; the status page (/voice-tasks on the web client) reads a copy,
+	// written asynchronously after each change, as bodhi's history stores write the conversation.
+	// Requests the relay agent has not sent yet are in it too, and rewrite it as they come and go.
+	const voiceTaskStatus = createVoiceTaskStatusWriter({
+		path: statusPath('voice-task-status.json', WORKSPACE_DIR),
+		snapshot: () => voiceTaskStatusSnapshot(voiceTaskRows(), Date.now(), voiceTasksBeingSent()),
+		log: (m) => console.error(`${ts()} ${m}`),
+	});
+	voiceTaskStore.onChange(() => voiceTaskStatus.changed());
+	voiceTaskStatus.changed();
+
 	const relayAsk = createAskDelivery({
 		inject: (text) => { void sessionRef?.injectText(text, { mode: 'live' }); },
 		log: (m) => console.log(`${ts()} ${m}`),
 	});
+	// The model's turns, for the relay: a work call the model already said it is on is not acknowledged again.
+	const modelTurns = createModelTurnWatch();
 	const relayAgent = new RelayAgent({
 		submit: submitWorkTask,
 		captureOrigin: captureWorkOrigin,
@@ -1035,13 +1057,22 @@ function whenSessionActive(s: VoiceSession): Promise<void> {
 		recentConversation: () => recentConversationLines(sessionRef?.conversationContext.items ?? [], 8) || getRecentConversation(8),
 		// Every finished user turn too, whatever tool the voice model chose: is it a request for the core?
 		// A skill's tools answer some turns themselves (read_room): the check is told, so it does not send those to the core.
+		// What this turn's tools did and what was delivered: a claim with nothing behind it is caught (2026-10-21 17:39:23).
+		thisTurn: (userText, since) => thisTurnToolLines(sessionRef?.conversationContext.items ?? [], userText, since),
 		classify: RELAY_CHECK ? createGeminiTurnClassifier({ apiKey: () => GEMINI_VOICE_API_KEY, model: RELAY_CHECK.model, log: (m) => console.log(`${ts()} ${m}`), extraRules: personalVoiceSurface.turnCheckRules }) : undefined,
+		// Whether a spoken turn told the user a result waiting to be heard: a text model judges it, not a phrase pattern.
+		heard: RELAY_CHECK ? createGeminiHeardCheck({ apiKey: () => GEMINI_VOICE_API_KEY, model: RELAY_CHECK.model, log: (m) => console.log(`${ts()} ${m}`) }) : undefined,
 		notice: (text) => { sessionRef?.tryPublishSystemNotification(text); },
+		// Context only, no reply asked for: a request the voice model already acknowledged is not acknowledged again.
+		context: (text) => { void sessionRef?.injectText(text, { mode: 'quiet' }); },
+		modelTurns,
 		// A question for the user is said as live input once the model stops speaking, not queued as a notification.
 		ask: (text) => { relayAsk.ask(text); },
 		whenActive: () => (sessionRef ? whenSessionActive(sessionRef) : Promise.resolve()),
+		onInFlightChange: () => voiceTaskStatus.changed(),
 		log: (msg) => console.log(`${ts()} ${msg}`),
 	});
+	setVoiceTasksBeingSent(() => relayAgent.inFlightRequests());
 	setVoiceTaskEndedListener((taskId, why) => { relayAgent.endCall(taskId, why); });
 
 	// When the user hangs up, the core gets a task about that call.
@@ -1055,16 +1086,6 @@ function whenSessionActive(s: VoiceSession): Promise<void> {
 		log: (m) => console.log(`${ts()} ${m}`),
 	});
 	beforeConversationClear = () => callEnd.collect();
-
-	// The task table lives in memory; the status page (/voice-tasks on the web client) reads a copy,
-	// written asynchronously after each change, as bodhi's history stores write the conversation.
-	const voiceTaskStatus = createVoiceTaskStatusWriter({
-		path: statusPath('voice-task-status.json', WORKSPACE_DIR),
-		snapshot: () => voiceTaskStatusSnapshot(voiceTaskRows()),
-		log: (m) => console.error(`${ts()} ${m}`),
-	});
-	voiceTaskStore.onChange(() => voiceTaskStatus.changed());
-	voiceTaskStatus.changed();
 
 	const session = new VoiceSession({
 		sessionId: SESSION_ID,
@@ -1198,7 +1219,8 @@ function whenSessionActive(s: VoiceSession): Promise<void> {
 				// recordToolCall(). Pushing here would duplicate in
 				// session_events.
 				console.log(`${ts()} [Tool] ${e.toolName} (${e.execution})`);
-				if (answeringTools.has(e.toolName)) relayAgent.noteAnsweringTool(e.toolName);
+				if (writingTools.has(e.toolName)) relayAgent.noteWritingTool(e.toolName);
+				else if (answeringTools.has(e.toolName)) relayAgent.noteAnsweringTool(e.toolName);
 				// Flag the web-client that a tool is in flight so the avatar
 				// can show the blue `.working` pulse and the menu bar can
 				// switch to the slow-deep-swing signature. `source=tool` pins
@@ -1517,12 +1539,18 @@ function whenSessionActive(s: VoiceSession): Promise<void> {
 	// tells the bridge whether a transcription may still be landing (no stamp within
 	// 10 s = the model started this turn itself, so the task write does not wait).
 	let lastUserSpeechAt: number | undefined;
-	session.eventBus.subscribe('speech.user_started', (e: { source?: string }) => { lastUserSpeechAt = Date.now(); speechGate.onUserSpeechStarted(e); });
-	session.eventBus.subscribe('speech.user_ended', (e: { source?: string }) => { lastUserSpeechAt = Date.now(); speechGate.onUserSpeechEnded(e); });
+	wireUserSpeech(session.eventBus, {
+		onUserSpeechStarted: (e) => { lastUserSpeechAt = Date.now(); speechGate.onUserSpeechStarted(e); },
+		onUserSpeechEnded: (e) => { lastUserSpeechAt = Date.now(); speechGate.onUserSpeechEnded(e); },
+		onUserSpeechAborted: (e) => speechGate.onUserSpeechAborted(e),
+	});
 	session.eventBus.subscribe('response.first_audio', () => speechGate.onModelAudio());
 	// The relay's question for the user waits only while the model is speaking.
 	session.eventBus.subscribe('response.first_audio', () => relayAsk.onModelAudio());
 	session.eventBus.subscribe('turn.end', () => relayAsk.onTurnEnd());
+	session.eventBus.subscribe('turn.start', () => modelTurns.onTurnStart());
+	session.eventBus.subscribe('response.first_audio', () => modelTurns.onModelAudio());
+	session.eventBus.subscribe('turn.end', () => modelTurns.onTurnEnd());
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any
 	const speechHost = session as any;
 	setVoiceTurnsProvider(() => ({

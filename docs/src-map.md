@@ -147,6 +147,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`native-pim-consent.ts`** — Native PIM consent — the voice-process client of skills/macos-tools/scripts/native_pim_consent.py.
 - **`notify.sh`** — Sutando: notify the user across available channels
 - **`obsidian-mirror.py`** — Obsidian sync — one-shot sweep of agent state into the Sutando vault.
+- **`open-file-tool.ts`** — open_file: opens a file with the OS default handler.
 - **`optional_script.py`** — Dependency-light runner for optional script-backed capabilities.
 - **`orphan_result_routes.py`** — Routes for results whose task a bridge never saw.
 - **`osascript-setup-hint.ts`** — Extract the user-actionable sentence from an osascript failure.
