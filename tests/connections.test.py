@@ -4697,8 +4697,9 @@ class MoveFixtures(PromoteFixtures):
     def move(self, **kw):
         kw.setdefault("fetch", self.fetch)
         kw.setdefault("whoami", lambda u, t, a=None: self.fail("a single-agent listing needs no whoami"))
+        kw.setdefault("resolver", move_resolver)
         return C.try_reuse_move(repo=self.ws / "repo", logs_dir=self.ws / "logs", workspace=self.ws,
-                                environ={}, vault=self.vault, resolver=move_resolver, spawn=self.spawn,
+                                environ={}, vault=self.vault, spawn=self.spawn,
                                 kill=self.kill, channels_home=self.ws / "channels", **kw)
 
     def snapshot(self):
@@ -4842,6 +4843,62 @@ class Move(MoveFixtures):
         self.move(room_bindings=C.room_bindings_from_script(script, self.ws))
         self.assertEqual(json.loads((self.ws / "state" / "bindings.json").read_text()),
                          {"!abc:ag2.space": "w1", "!abc:s.space": "w1"})
+
+    def test_the_successor_mapping_reads_the_registry_offline_and_none_without_the_resolver(self):
+        self.assertEqual((C.successor_server("ag2.space"), C.successor_server("s.space")), ("s.space", ""))
+        with unittest.mock.patch.dict(sys.modules, {"dotspace": None}):
+            self.assertEqual(C.successor_server("ag2.space"), "")
+
+    def test_a_learned_old_agent_is_compared_without_asking_the_old_gateway(self):
+        with C._transaction(self.ws) as rec:
+            rec["rows"][0]["agent_mxid"] = "@sutando-x:ag2.space"
+        self.assertTrue(self.move(dry_run=True)["ok"])
+        self.assertEqual([h for h, _ in self.asked], ["chat.s.space"])
+
+    def test_an_old_agent_that_cannot_be_read_is_a_mismatch(self):
+        real = C.preview_connection
+
+        def preview(token, **kw):
+            if "chat.ag2.space" in token:
+                raise C.InvalidToken("invalid_gateway")
+            return real(token, **kw)
+        with unittest.mock.patch.object(C, "preview_connection", preview):
+            self.assertEqual(self.move()["reason"], "agent_mismatch")
+
+    def test_an_unreadable_descriptor_or_a_successor_without_mcp_is_reported_and_left(self):
+        path = self.ws / "state" / C.MCP_DESCRIPTOR_NAME
+        path.parent.mkdir(parents=True, exist_ok=True)
+        for body in ("{broken", "[1]"):
+            path.write_text(body)
+            self.assertEqual(self.move(dry_run=True)["mcp"], "unreadable")
+            self.assertEqual(path.read_text(), body)
+        self.descriptor()
+        bare = {"instances": [dict(e, mcp_url="") for e in MOVE_REGISTRY["instances"]]}
+        out = self.move(dry_run=True, resolver=lambda h: dotspace.dotspace_for(h, fetch=dotspace.NO_FETCH, config=bare))
+        self.assertEqual(out["mcp"], "no_successor_endpoints")
+
+    def test_the_env_file_defaults_under_the_claude_home_channels(self):
+        self.descriptor()
+        home = self.ws / "claude-home"
+        with unittest.mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(home)}):
+            out = C.try_reuse_move(repo=self.ws / "repo", logs_dir=self.ws / "logs", workspace=self.ws, environ={},
+                                   vault=self.vault, resolver=move_resolver, spawn=self.spawn, kill=self.kill,
+                                   fetch=self.fetch, whoami=lambda *a: {})
+        self.assertEqual(out["mcp"], "repointed")
+        d = json.loads((self.ws / "state" / C.MCP_DESCRIPTOR_NAME).read_text())
+        self.assertEqual(Path(d["env_file"]).resolve(), (home / "channels" / "s-space-ag2space" / C.MOVE_ENV_FILE).resolve())
+
+    def test_a_refused_add_or_promote_names_its_code(self):
+        self.vault.store["AG2_REMOTE_TOKEN_S_SPACE"] = "https://chat.s.space/relay|unowned"
+        out = self.move()
+        self.assertEqual((out["ok"], out["reason"], out["added"]), (False, "vault_key_in_use", False))
+        del self.vault.store["AG2_REMOTE_TOKEN_S_SPACE"]
+        self.connects = False
+        with unittest.mock.patch.object(C, "CONNECT_TIMEOUT_S", 0.2):
+            out = self.move()
+        self.assertEqual((out["ok"], out["added"], out["instance"]), (False, True, "s-space"))
+        self.assertEqual(out["reason"], C.NewPrimaryNotConnected.CODE)
+        self.assertNotIn(SECRET, json.dumps(out))
 
     def test_the_secret_never_appears_in_any_result(self):
         self.descriptor()

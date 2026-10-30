@@ -2861,8 +2861,6 @@ def successor_code(row: Mapping[str, object], environ: Optional[Mapping[str, str
     except NoConnectionForRoom:
         raise MoveRefused("no_token", f"no token for connection {row['instance'] or '(legacy)'}") from None
     secret = secret_of(token) if gateway_url_of(token) else token.strip()
-    if not secret:
-        raise MoveRefused("no_token", f"no token for connection {row['instance'] or '(legacy)'}")
     path = urllib.parse.urlsplit(str(row["gateway_url"])).path.rstrip("/")
     return urllib.parse.urlunsplit(("https", space.gateway_host, path, "", "")) + "|" + secret
 
