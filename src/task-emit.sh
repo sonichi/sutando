@@ -36,7 +36,8 @@ activity_cancel_target() {
 	[ -n "$task_file" ] && [ -f "$task_file" ] || return 0
 	local bus="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/activity_bus.py"
 	[ -f "$bus" ] || return 0
-	target="$(grep -oE 'CANCEL_INSTRUCTION:[[:space:]]*stop processing[[:space:]]+task-[A-Za-z0-9._-]+' "$task_file" 2>/dev/null | grep -oE 'task-[A-Za-z0-9._-]+$' | head -1)"
+	# The bus refuses a lane id (task-<instance>~<broker id>) the shared lane-id rule rejects.
+	target="$(grep -oE 'CANCEL_INSTRUCTION:[[:space:]]*stop processing[[:space:]]+task-[A-Za-z0-9._~-]+' "$task_file" 2>/dev/null | grep -oE 'task-[A-Za-z0-9._~-]+$' | head -1)"
 	[ -n "$target" ] || return 0
 	( "${SUTANDO_PY_BIN:-python3}" "$bus" transition CANCELLED --task-id "$target" --reason "cancel requested" >/dev/null 2>&1 & ) 2>/dev/null || true
 	return 0

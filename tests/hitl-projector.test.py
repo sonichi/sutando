@@ -89,6 +89,26 @@ class ProjectorTests(unittest.TestCase):
         self.assertIn("✓ Signed in — Sutando has continued its work.", edit["body"])
         self.assertNotIn("econnect", edit["body"])
 
+    def test_a_card_with_a_room_is_created_and_edited_there_and_one_without_goes_to_the_default(self):
+        asking = "!worker-dm:ag2.space"
+        roomed = self.mgr.create(make_req(kind="choice", guard="g-room", room=asking))
+        plain = self.mgr.create(make_req(kind="choice", guard="g-plain"))
+        project(self.mgr, self.send, ROOM)
+        rooms = {p["extra_content"][WIRE_FIELD]["id"]: p["room_id"] for p in self.send.sent}
+        self.assertEqual(rooms, {roomed.id: asking, plain.id: ROOM})
+        self.mgr.resolve(roomed.id)
+        project(self.mgr, self.send, ROOM)
+        edit = self.send.sent[-1]
+        self.assertEqual((edit["op"], edit["room_id"]), ("edit", asking), "the edit is in the CREATE's room")
+
+    def test_a_cards_follow_up_notice_goes_to_its_room(self):
+        asking = "!worker-dm:ag2.space"
+        self.mgr.create(make_req(room=asking, created_at=1000.0, updated_at=1000.0))
+        project(self.mgr, self.send, ROOM, clock=lambda: 1000.0)
+        project(self.mgr, self.send, ROOM, clock=lambda: 1000.0 + 31 * 60)
+        notices = [p for p in self.send.sent if NOTICE_FIELD in p["extra_content"]]
+        self.assertEqual([p["room_id"] for p in notices], [asking])
+
     def test_idempotent_between_changes(self):
         req = self.mgr.create(make_req())
         project(self.mgr, self.send, ROOM)

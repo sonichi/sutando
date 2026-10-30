@@ -92,7 +92,9 @@ exactly the options as given, with no Approve — and `subject.choices` holding 
 - **Order.** The card is built and its id allocated; the question is held in the outbox and its
   row is written, both naming that id (`**Sent:** card hitl_<id> for ag2space owner-dm (decision
   card) at <time>`); only then is the card stored, for the AG2 Space gateway to post in the
-  owner's DM. No card exists without a durable question. The ask reports
+  owner's DM: the asking task's own conversation when that is his AG2 Space DM (`req.room`, so
+  his click reaches the session bound to that room), else the gateway's default owner DM. No
+  card exists without a durable question. The ask reports
   `stored, not yet shown: decision card hitl_<id>`: storing is not showing.
 - **One surface.** Once a card exists, no text is sent for that question. `create_card` returns
   stored, not stored or unknown: a store that raised but whose card file is there, or one that

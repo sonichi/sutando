@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""Regression pin: the python legs (seven cost-sharded plus the load-sensitive pair), as ci.yml's
+"""Regression pin: the python legs (cost-sharded, then the load-sensitive pair), as ci.yml's
 own step computes them, partition discovery.
 
-Runs the `Run Python standalone tests` step body from ci.yml once per leg (SHARD=1..9)
+Runs the `Run Python standalone tests` step body from ci.yml once per matrix leg
 in a fixture that has every discovered path, the real selector, sharder, cost table and
 list, and a stub lane runner that records the file list and worker count it is handed.
 Whatever the workflow does to pick a leg's files — selector, sharder, or anything that
 replaces them — is what gets measured. It must hold that every discovered suite runs in
-exactly one leg, the listed load-sensitive suites in leg 8 (heaviest first, two workers)
-except those tagged `serial`, which run alone in leg 9, and legs 1-7 none of them; and a list with a stale or duplicate entry must stop every
+exactly one leg, the listed load-sensitive suites in the second-to-last leg (heaviest first, two
+workers) except those tagged `serial`, which run alone in the last, and the shared legs none of them; and a list with a stale or duplicate entry must stop every
 leg with the selector's exit 3, so a leg that reads the list without the selector fails.
 
 Run: python3 tests/python-ci-legs-partition.test.py
@@ -67,9 +67,18 @@ def build_fixture(td: Path, discovered) -> Path:
     return fx
 
 
-# The leg layout ci.yml encodes: cost-sharded legs, then the load-sensitive pair.
-SHARED_LEGS = range(1, 8)
-LOAD_LEG, SERIAL_LEG = 8, 9
+def matrix_legs() -> int:
+    job = CI.read_text().split("\n  python-standalone-tests:\n", 1)[1]
+    m = re.search(r"^ {8}shard: \[([0-9, ]+)\]$", job, re.M)
+    if not m:
+        raise AssertionError("could not find python-standalone-tests' `shard:` matrix in ci.yml")
+    return len(m.group(1).split(","))
+
+
+# The leg layout ci.yml encodes: cost-sharded legs, then the load-sensitive pair as the last two.
+SERIAL_LEG = matrix_legs()
+LOAD_LEG = SERIAL_LEG - 1
+SHARED_LEGS = range(1, LOAD_LEG)
 ALL_LEGS = range(1, SERIAL_LEG + 1)
 
 
@@ -164,7 +173,7 @@ def main() -> int:
     # No `serial` tag left: the serial leg must stop with a reason, not run nothing.
     untagged = real.replace(f"{serial[0]} serial", serial[0]) if serial else real
     rc, files, _w, err, _r = run_legs(fx, untagged, 8, (SERIAL_LEG,))[SERIAL_LEG]
-    if rc != 3 or f"leg {SERIAL_LEG}: the selector emitted no serial suites" not in err:
+    if rc != 3 or "serial leg: the selector emitted no serial suites" not in err:
         fails.append(f"no `serial` suite: leg {SERIAL_LEG} exited {rc} without the empty-leg reason: {err.strip()!r}")
 
     td_obj.cleanup()

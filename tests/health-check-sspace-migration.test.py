@@ -56,19 +56,26 @@ class SspaceMigrationProbe(unittest.TestCase):
         self.assertEqual(out["name"], "sspace-migration")
         self.assertEqual(out["status"], "warn")
         self.assertIn("python3 scripts/connections.py add '<code>'", out["detail"])
+        self.assertLess(out["detail"].index("connections.py move --repo . --logs-dir"),
+                        out["detail"].index("connections.py add"), "the existing secret is tried first")
         self.assertIn("python3 scripts/connections.py promote s-space --repo . --logs-dir", out["detail"])
         self.assertEqual(connections.record_path(self.ws).read_bytes(), before, "the probe never writes")
 
     def test_commands_parse_with_the_real_cli(self):
         self.write([_row("ag2.space", "", primary=True)])
         detail = hc.check_sspace_migration(self.ws)["detail"]
+        detail = detail.replace('"$(bash scripts/sutando-config.sh workspace)/logs"', "/w/logs")
+        verbs = []
         for line in re.findall(r"python3 scripts/connections\.py ([^&(]+?)(?: &&| \(|$)", detail):
-            argv = shlex.split(line.replace('"$(bash scripts/sutando-config.sh workspace)/logs"', "/w/logs"))
+            argv = shlex.split(line)
             args = cli.build_parser().parse_args(argv)
-            self.assertIn(args.verb, ("add", "promote"))
+            verbs.append(args.verb)
+            if args.verb == "move":
+                self.assertEqual((args.instance, args.logs_dir), (None, Path("/w/logs")))
             if args.verb == "promote":
                 self.assertEqual(args.instance, connections.instance_for("s.space"))
                 self.assertIsInstance(args.logs_dir, Path)
+        self.assertEqual(verbs, ["move", "add", "promote"])
 
     def test_warns_for_provisional_gateway_host_row(self):
         self.write([_row("chat.ag2.space", "ag2-space", primary=True)])

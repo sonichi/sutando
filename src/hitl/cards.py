@@ -41,9 +41,10 @@ def as_action(a: Any) -> Action:
 def choice_request(question: str, actions: Iterable[Any], guard: str, subject: Dict[str, Any], *,
                    runtime: str, title: str = "", device: Optional[Dict[str, str]] = None,
                    kind: str = CHOICE_KIND, turn_on_action: bool = True,
-                   req_id: Optional[str] = None) -> HumanRequirement:
+                   req_id: Optional[str] = None, room: str = "") -> HumanRequirement:
     """One button per action. `guard` keys the card to the producer's own record, so the
-    store dedupes a repeat; with `turn_on_action` the applied click reaches the core as a task."""
+    store dedupes a repeat; with `turn_on_action` the applied click reaches the core as a task.
+    `room` is the owner-only room the card is posted in and answered from; empty, the owner's DM."""
     acts = [as_action(a) for a in actions]
     if not acts:
         raise ValueError("a choice card needs at least one action")
@@ -51,7 +52,7 @@ def choice_request(question: str, actions: Iterable[Any], guard: str, subject: D
         raise ValueError("action ids must be unique on one card")
     req = HumanRequirement(kind=kind, runtime=runtime, message=question, title=title, guard=guard,
                            device=device, actions=acts, subject=dict(subject or {}),
-                           turn_on_action=turn_on_action)
+                           turn_on_action=turn_on_action, room=room)
     if req_id is not None:
         req.id = req_id
     return req

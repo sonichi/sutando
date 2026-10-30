@@ -16,9 +16,11 @@ neutralized (`[ file:`), so no text can become a drain action.
 A question with a default or options that is bound for AG2 Space is asked as a decision card
 instead (`hitl.cards`; guard = ask id). Order: the card is built and its id pre-allocated, the
 question is held (outbox, then the caller's row) naming that id, and only then is the card stored
-(`create_card`), so no card ever exists without a durable question. Once a card exists no text is
-sent; text is the ask only when the card cannot be built or stored. Nothing here sees the DM, so
-the reminder never texts beside a live card. The clicks are `pending_questions_clicks`'s.
+(`create_card`), so no card ever exists without a durable question. A card for a task from the
+owner's own AG2 Space DM is posted in that DM, so his click returns to the session that asked.
+Once a card exists no text is sent; text is the ask only when the card cannot be built or stored.
+Nothing here sees the DM, so the reminder never texts beside a live card. The clicks are
+`pending_questions_clicks`'s.
 """
 from __future__ import annotations
 
@@ -383,6 +385,12 @@ def card_consequences(default_action: Optional[str], options) -> dict:
                                                     card_choices(default_action, options))}
 
 
+def card_room(dest: Destination) -> str:
+    """The room a card is posted in: the task's own conversation, which `destination_from_task`
+    names only for an owner-tier AG2 Space DM; empty (the gateway's owner DM) otherwise."""
+    return (dest.channel or "") if dest.bridge == CARD_BRIDGE else ""
+
+
 def card_message(question: str, context: Optional[str], default_action: Optional[str],
                  reason: Optional[str], options, link: Optional[str] = None,
                  intro: Optional[str] = None) -> str:
@@ -402,7 +410,7 @@ def card_message(question: str, context: Optional[str], default_action: Optional
 
 def build_card(ask_id: str, question: str, context: Optional[str], host: str,
                default_action: Optional[str], reason: Optional[str], options,
-               link: Optional[str] = None, intro: Optional[str] = None):
+               link: Optional[str] = None, intro: Optional[str] = None, room: str = ""):
     """The question's card, built but not stored, with its id already allocated."""
     from hitl.cards import choice_request, new_id  # noqa: PLC0415
     return choice_request(
@@ -410,7 +418,7 @@ def build_card(ask_id: str, question: str, context: Optional[str], host: str,
         card_actions(default_action, options), ask_id,
         {"ask_id": ask_id, "choices": card_consequences(default_action, options)},
         runtime=CARD_RUNTIME, title=f"Question from the {host} core",
-        device={"id": f"{CARD_RUNTIME}:{ask_id}", "name": host}, req_id=new_id())
+        device={"id": f"{CARD_RUNTIME}:{ask_id}", "name": host}, req_id=new_id(), room=room)
 
 
 def write_proactive(results: Path, name: str, body: str) -> Path:
@@ -465,11 +473,12 @@ def queue_question(question: str, context: Optional[str] = None, task_file: Opti
     card = None
     if wants_card(default_action, options) and card_reaches_owner(dest, ws):
         try:
-            card = build_card(ask_id, question, context, host, default_action, reason, options, link, intro)
+            card = build_card(ask_id, question, context, host, default_action, reason, options, link, intro,
+                              card_room(dest))
         except Exception as e:  # noqa: BLE001 — asked as text below
             out["card_error"] = f"{type(e).__name__}: {e}"
     if card is not None:
-        out["bridge"], out["where"] = CARD_BRIDGE, f"{CARD_BRIDGE} owner-dm (decision card)"
+        out["bridge"], out["where"] = CARD_BRIDGE, f"{CARD_BRIDGE} {card.room or 'owner-dm'} (decision card)"
         out["sent_line"] = f"**Sent:** card {card.id} for {out['where']} at {_iso(time.time())}"
         try:
             out["outbox"] = str(Outbox(ws).save(out["question"], out["sent_line"], now))

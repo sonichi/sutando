@@ -14,6 +14,13 @@
                                its own rooms as a secondary (--park: stop it and park its row).
                                Refused by code: disabled_cannot_be_primary, legacy_bridge_not_running,
                                new_primary_not_started, bridge_still_running (rolled back)
+  move [INSTANCE] --repo DIR --logs-dir DIR [--dry-run]
+                               move a connection (default: the primary or legacy row on a server with a
+                               successor) to the successor server with the agent's existing secret: add the
+                               successor row, promote it, re-point the agent MCP descriptor and mirror worker
+                               room bindings. On a refusal (auth_rejected, agent_mismatch, no_successor,
+                               no_token, unverified, successor_exists) it prints the code fallback and exits 1.
+                               --dry-run checks the secret and writes nothing
   park INSTANCE                stop a secondary's bridge and park its row ('' = the legacy row);
                                refused on the primary (primary_cannot_park)
   park-legacy                  the cutover: park every connection but the primary (no_primary when none)
@@ -144,6 +151,38 @@ def cmd_promote(args) -> int:
     if row.get("relaunch_needed"):
         tail += "; its bridge runs without the proactive room: restart it"
     print(f"primary is now {row['instance'] or '(legacy)'} ({row['server']}){tail}")
+    return 0
+
+
+def pool_room_bindings(repo: Path, workspace):
+    """The worker pool's room bindings when that skill is installed, else None."""
+    return connections.room_bindings_from_script(
+        Path(repo) / "skills" / "worker-pool" / "scripts" / "pool_roster.py", workspace)
+
+
+def cmd_move(args) -> int:
+    if not args.dry_run and (args.repo is None or args.logs_dir is None):
+        print("connections: move needs --repo and --logs-dir (or --dry-run)", file=sys.stderr)
+        return 2
+    instance = "" if args.instance == connections.LEGACY_PATH_SEGMENT else args.instance
+    out = connections.try_reuse_move(instance, repo=args.repo, logs_dir=args.logs_dir, workspace=args.workspace,
+                                     dry_run=args.dry_run,
+                                     room_bindings=pool_room_bindings(args.repo or REPO, args.workspace))
+    if not out["ok"]:
+        print(f"connections: move refused: {out['reason']}" + (f" ({out['detail']})" if out.get("detail") else ""),
+              file=sys.stderr)
+        if out.get("added"):
+            print(f"next: the {out.get('instance')} row is saved; run move again to finish (it resumes)")
+        elif out["reason"] != "successor_exists":
+            print(f"next: get a connect code at {out.get('server') or 'the successor server'}'s agent portal, "
+                  "then run python3 scripts/connections.py add '<code>'")
+        return 1
+    rooms = out.get("rooms") or []
+    failed = [r for r in rooms if r.get("error")]
+    verb = "would move" if out["dry_run"] else "moved"
+    print(f"{verb} {out['from'] or '(legacy)'} to {out['instance']} as {out['agent_mxid']}; "
+          f"agent MCP: {out['mcp']}; rooms mirrored: {len(rooms) - len(failed)}"
+          + (f" ({len(failed)} refused: {', '.join(r['twin'] for r in failed)})" if failed else ""))
     return 0
 
 
@@ -299,6 +338,10 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("promote"); _launch_args(s)
     s.add_argument("--park", action="store_true", help="stop the old primary's bridge and park its row")
     s.set_defaults(fn=cmd_promote)
+    s = sub.add_parser("move"); s.add_argument("instance", nargs="?", default=None)
+    s.add_argument("--repo", type=Path, default=None); s.add_argument("--logs-dir", type=Path, default=None)
+    s.add_argument("--dry-run", action="store_true", help="check the existing secret on the successor; write nothing")
+    s.set_defaults(fn=cmd_move)
     s = sub.add_parser("park"); s.add_argument("instance"); s.set_defaults(fn=cmd_park)
     sub.add_parser("park-legacy").set_defaults(fn=cmd_park_legacy)
     s = sub.add_parser("unpark"); _launch_args(s); s.set_defaults(fn=cmd_unpark)
