@@ -42,7 +42,8 @@ gate = os.environ.get("HOOK_GATE")
 while gate and not os.path.exists(gate):
     time.sleep(0.05)
 out = os.path.join(os.environ["HOOK_OUT"], os.path.basename(__file__) + ".json")
-json.dump({"exe": sys.executable, "sid": os.getsid(0), "stdin": sys.stdin.read()}, open(out, "w"))
+sid = os.getsid(0) if hasattr(os, "getsid") else None
+json.dump({"exe": sys.executable, "sid": sid, "stdin": sys.stdin.read()}, open(out, "w"))
 print("py hook ran")
 """
 SH_HOOK = """out="$HOOK_OUT/$(basename "$0").json"
@@ -76,6 +77,7 @@ class _Tmp(unittest.TestCase):
 
 
 class RunnerTest(_Tmp):
+    @unittest.skipIf(os.name == "nt", "a .sh hook, sessions and FIFOs are POSIX")
     def test_a_py_hook_runs_under_the_given_python_and_anything_else_under_bash_detached(self):
         py, sh = self.hook("one.py", PY_HOOK), self.hook("two.sh", SH_HOOK)
         # This process's stdin carries data; a hook must not inherit it.
@@ -105,6 +107,7 @@ class RunnerTest(_Tmp):
         self.assertIn("py hook ran", (self.logs / "launch-hook-one.log").read_text())
         self.assertIn("sh hook ran", (self.logs / "launch-hook-two.log").read_text())
 
+    @unittest.skipIf(os.name == "nt", "os.kill(pid, 0) is a probe only on POSIX")
     def test_start_returns_while_the_hook_still_runs(self):
         gate = self.tmp / "gate"
         env = {**self.env, "HOOK_GATE": str(gate)}
@@ -121,6 +124,7 @@ class RunnerTest(_Tmp):
         gate.touch()
         wait_for(self.out / "slow.py.json")
 
+    @unittest.skipIf(os.name == "nt", "a .sh hook, sessions and FIFOs are POSIX")
     def test_a_hook_that_cannot_start_is_reported_and_the_others_still_start(self):
         bad, good = self.hook("bad.py", PY_HOOK), self.hook("good.sh", SH_HOOK)
         err = io.StringIO()
@@ -140,6 +144,7 @@ class RunnerTest(_Tmp):
         self.assertFalse(t.is_alive(), "start() blocked")
         return got[0]
 
+    @unittest.skipIf(os.name == "nt", "a .sh hook, sessions and FIFOs are POSIX")
     def test_a_fifo_or_a_symlink_at_the_log_path_starts_nothing_and_blocks_nothing(self):
         self.logs.mkdir()
         os.mkfifo(self.logs / "launch-hook-pipe.log")
@@ -176,6 +181,7 @@ class EdgeTest(_Tmp):
             (d / script).write_text(body)
         (d / "manifest.json").write_text(json.dumps(manifest))
 
+    @unittest.skipIf(os.name == "nt", "a .sh hook, sessions and FIFOs are POSIX")
     def test_main_starts_every_enabled_contained_declarer_and_nothing_else(self):
         roots = self.tmp / "skills"
         self.skill(roots, "alpha", {"on_launch": "scripts/a.py"}, "scripts/a.py")
@@ -291,6 +297,7 @@ class ContractTest(_Tmp):
         for bad in ("../x.py", "/abs/x.py", "scripts/../x.py", "scripts/a b.py", "scripts/x.txt", "", "x.py/.."):
             self.assertFalse(re.match(pattern, bad), bad)
 
+    @unittest.skipIf(os.name == "nt", "plants a symlink")
     def test_the_linter_validates_the_field_rather_than_only_allowing_it(self):
         def run(value, link=None):
             d = self.tmp / "sk"
@@ -316,6 +323,88 @@ class ContractTest(_Tmp):
         self.assertIn("relative path to a .py or .sh script", run("scripts/hook.txt")[0])
         self.assertIn("relative path to a .py or .sh script", run(7)[0])
         self.assertIn("relative path to a .py or .sh script", run(None)[0])
+
+
+@contextlib.contextmanager
+def windows_os():
+    """This process's os module without the POSIX-only names a Windows build lacks."""
+    with mock.patch.dict(lh.os.__dict__):
+        for missing in ("O_NOFOLLOW", "O_NONBLOCK", "set_blocking"):
+            lh.os.__dict__.pop(missing, None)
+        yield
+
+
+class WindowsTest(_Tmp):
+    """The Windows path, where os has no O_NOFOLLOW, O_NONBLOCK or sessions; it runs for real on the
+    Windows runtime job, and here with those names removed."""
+
+    def test_the_log_opens_as_a_regular_file_without_the_posix_flags(self):
+        self.logs.mkdir()
+        with windows_os():
+            with lh.open_log(self.logs / "launch-hook-a.log") as log:
+                log.write(b"one\n")
+            with lh.open_log(self.logs / "launch-hook-a.log") as log:
+                log.write(b"two\n")
+        self.assertEqual((self.logs / "launch-hook-a.log").read_bytes(), b"one\ntwo\n")
+
+    @unittest.skipIf(os.name == "nt", "a FIFO and a symlink need POSIX to be planted")
+    def test_without_the_posix_flags_a_symlink_or_fifo_log_is_refused_and_nothing_blocks(self):
+        self.logs.mkdir()
+        os.mkfifo(self.logs / "launch-hook-pipe.log")
+        outside = self.tmp / "outside.log"
+        outside.write_text("untouched\n")
+        (self.logs / "launch-hook-link.log").symlink_to(outside)
+        hooks = [("pipe", self.hook("pipe.py", PY_HOOK)), ("link", self.hook("link.py", PY_HOOK)),
+                 ("fine", self.hook("fine.py", PY_HOOK))]
+        err, got, done = io.StringIO(), [], threading.Event()
+
+        def call():
+            with windows_os(), contextlib.redirect_stderr(err):
+                got.append(lh.start(hooks, self.logs, sys.executable, self.env))
+            done.set()
+        threading.Thread(target=call, daemon=True).start()
+        self.addCleanup(EdgeTest.release_fifo, self.logs / "launch-hook-pipe.log")
+        self.assertTrue(done.wait(10), "start() blocked on the log")
+        self.assertEqual([n for n, _ in got[0]], ["fine"], err.getvalue())
+        self.assertEqual(outside.read_text(), "untouched\n")
+
+    def test_on_windows_a_hook_is_started_detached_in_its_own_process_group(self):
+        seen = {}
+
+        class Proc:
+            pid = 4242
+
+        def popen(argv, **kw):
+            seen.update(kw, argv=argv)
+            return Proc()
+        with mock.patch.object(lh, "WINDOWS", True), mock.patch.object(lh.subprocess, "Popen", popen):
+            started = lh.start([("a", self.hook("a.py", PY_HOOK))], self.logs, sys.executable, self.env)
+        self.assertEqual(started, [("a", 4242)])
+        self.assertNotIn("start_new_session", seen)
+        self.assertEqual(seen["creationflags"], lh.DETACHED_PROCESS | lh.CREATE_NEW_PROCESS_GROUP)
+        self.assertIs(seen["stdin"], subprocess.DEVNULL)
+
+    @unittest.skipIf(os.name != "nt", "a real detached start on Windows")
+    def test_a_py_hook_really_starts_and_writes_its_log_on_windows(self):
+        started = lh.start([("one", self.hook("one.py", PY_HOOK))], self.logs, sys.executable, self.env)
+        self.assertEqual([n for n, _ in started], ["one"])
+        self.assertEqual(wait_for(self.out / "one.py.json")["stdin"], "")
+
+
+class WindowsLauncherTest(unittest.TestCase):
+    """scripts/start-cli.ps1, the Windows core launcher src/startup.ps1 runs, starts the hooks before
+    either launch path; tests/windows-launch-hooks.test.ps1 runs it on the Windows job."""
+
+    def test_the_hooks_run_after_the_already_running_exit_and_before_both_launch_paths(self):
+        text = (REPO / "scripts" / "start-cli.ps1").read_text(encoding="utf-8")
+        calls = [m.start() for m in re.finditer(r"Join-Path \$REPO 'src/launch_hooks\.py'", text)]
+        self.assertEqual(len(calls), 1, "one launch_hooks.py call")
+        already = text.index("sutando-core already running")
+        foreground = text.index("& $claudeCmd.Source @claudeArgs")
+        window = text.index("Start-Process -FilePath")
+        self.assertLess(already, calls[0])
+        self.assertLess(calls[0], min(foreground, window))
+        self.assertIn("Resolve-SutandoPython", text[already:calls[0] + 80])
 
 
 STALL_HOOK = """import os, time

@@ -8,7 +8,8 @@ src/agent/start-cli.sh) injects them into `start()`. The contract a hook relies 
 
 - run with no arguments: `<python> <script>` for a `.py`, `bash <script>` for a `.sh`; any other
   suffix is never run, whatever a manifest that skipped lint declares;
-- in its own session, stdin from /dev/null, stdout and stderr appended to
+- in its own session (on Windows, detached in its own process group), stdin from the null device,
+  stdout and stderr appended to
   `<workspace>/logs/launch-hook-<skill>.log`, which must be a regular file (a symlink, FIFO or
   anything else there means the hook is not started, and nothing blocks on it);
 - nobody waits for it, so it must finish on its own; one that cannot start is reported on stderr
@@ -16,6 +17,7 @@ src/agent/start-cli.sh) injects them into `start()`. The contract a hook relies 
 """
 from __future__ import annotations
 
+import contextlib
 import os
 import stat
 import subprocess
@@ -26,6 +28,9 @@ from typing import Iterable, List, Optional, Tuple
 
 FIELD = "on_launch"
 SUFFIXES = (".py", ".sh")  # the schema's and the linter's contract, enforced here too
+WINDOWS = os.name == "nt"
+DETACHED_PROCESS = getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+CREATE_NEW_PROCESS_GROUP = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
 DISCOVERY_SECONDS = 10.0  # the most a launch can wait here, whatever a skill root does
 
 
@@ -48,21 +53,34 @@ def start(hooks: Iterable[Tuple[str, Path]], log_dir: Path, python: str,
         try:
             with log:
                 proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
-                                        start_new_session=True, close_fds=True, env=env)
+                                        close_fds=True, env=env, **_detached())
             started.append((name, proc.pid))
         except OSError as exc:
             print(f"launch-hooks: {name}: not started ({type(exc).__name__})", file=sys.stderr)
     return started
 
 
+def _detached() -> dict:
+    if WINDOWS:
+        return {"creationflags": DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP}
+    return {"start_new_session": True}
+
+
 def open_log(path: Path):
     """The hook's log for appending: a regular file, never followed through a symlink, and never
-    waited on (a FIFO with no reader fails at once). Anything else raises OSError."""
-    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+    waited on (a FIFO with no reader fails at once). Anything else raises OSError. Where os lacks
+    O_NOFOLLOW or O_NONBLOCK (Windows), an lstat before the open refuses the same targets."""
+    with contextlib.suppress(FileNotFoundError):
+        if not stat.S_ISREG(os.lstat(path).st_mode):
+            raise OSError(f"{path.name} is not a regular file")
+    nonblock = getattr(os, "O_NONBLOCK", 0)
+    flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | nonblock
+    fd = os.open(path, flags | getattr(os, "O_BINARY", 0), 0o600)
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             raise OSError(f"{path.name} is not a regular file")
-        os.set_blocking(fd, True)
+        if nonblock:
+            os.set_blocking(fd, True)
         return os.fdopen(fd, "ab")
     except BaseException:
         os.close(fd)
