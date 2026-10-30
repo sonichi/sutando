@@ -559,7 +559,7 @@ def render_page(name: str, core: str = "unknown", audience: str = "dm", agent: O
         f"<title>{PAGE_TITLE}</title>{HEAD_SCRIPT}{STYLE % {'light': light, 'darkvars': dark}}</head><body>"
         "<main id=\"tour\" data-mode=\"step\">"
         f"<header class=\"hero\">{HERO}<div><h1>Getting started with {who}</h1>"
-        f"<p class=\"lead\">A short tour of AG2 Space. Each part has one thing to try; Copy puts "
+        f"<p class=\"lead\">A short tour of s.space. Each part has one thing to try; Copy puts "
         f"a prompt on your clipboard to paste into a chat with {who}.</p>{picked}</div></header>"
         "<div class=\"progress\"><div class=\"progress-label\" id=\"progress-label\" aria-hidden=\"true\">"
         f"0 of {len(secs)} done</div>"

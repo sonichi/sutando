@@ -32,6 +32,7 @@ cd "$REPO"
 # Shared with the codex launcher: one owner for the in-session restart policy.
 . "$REPO/src/agent/restart-guard.sh"
 . "$REPO/src/agent/core-runtime-record.sh"
+. "$REPO/src/agent/core-window.sh"
 # Named check before sourcing: an unexplained "No such file or directory" from
 # a bare `.` here reads as a broken launcher, not a fixture/checkout missing
 # this file's own sibling — a real trap for a scratch-repo test fixture.
@@ -567,8 +568,7 @@ if claude_named_tmux_session_exists; then
   # occupied (e.g. a sibling drifted there) the fallback creates the core at a
   # nonzero index, and selecting a hardcoded :0 would activate the WRONG window
   # (review-caught: attach/Console then shows the gateway, not the healed core).
-  healed_idx="$(tmux -S "$TMUX_SOCKET" new-window -dP -F '#{window_index}' -t "$SESSION:0" ${ENV_ARGS[@]+"${ENV_ARGS[@]}"} ${CWD_ARGS[@]+"${CWD_ARGS[@]}"} "${CORE_CMD[@]}" 2>/dev/null \
-    || tmux -S "$TMUX_SOCKET" new-window -dP -F '#{window_index}' -t "$SESSION" ${ENV_ARGS[@]+"${ENV_ARGS[@]}"} ${CWD_ARGS[@]+"${CWD_ARGS[@]}"} "${CORE_CMD[@]}")" \
+  healed_idx="$(sutando_new_core_window "$TMUX_SOCKET" "$SESSION" ${ENV_ARGS[@]+"${ENV_ARGS[@]}"} ${CWD_ARGS[@]+"${CWD_ARGS[@]}"} "${CORE_CMD[@]}")" \
     || healed_idx=""
   if [ -z "$healed_idx" ]; then
     # No window at all: a watcher left from the dead core would type into a sibling.

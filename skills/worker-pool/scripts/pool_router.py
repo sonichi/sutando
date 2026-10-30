@@ -218,6 +218,10 @@ def deliver_one(workspace, recipient: str, task_id: str,
             return "already"
         if not pd.payload_path(Path(workspace), task_id).is_file():
             return "no-payload"
+        # Re-read under the lock the hand-off takes: a pass holding a roster read
+        # before a retirement must not commit new work to the retiring worker.
+        if recipient != pr.CORE and not _admits(workspace, recipient):
+            return "fenced"
         try:
             os.close(os.open(task_id + pd.PENDING_SUFFIX, os.O_CREAT | os.O_EXCL, 0o644, dir_fd=dfd))
         except FileExistsError:
@@ -229,6 +233,13 @@ def deliver_one(workspace, recipient: str, task_id: str,
         # fact. Recording earlier attributed refusals that never delivered.
         _attribute(workspace, recipient, task_id)
     return "delivered"
+
+
+def _admits(workspace, recipient: str) -> bool:
+    try:
+        return pr.admits_deliveries(workspace, recipient)
+    except pr.RosterError as e:
+        raise UnreadableEvidence(f"cannot tell whether {recipient} admits deliveries: {e}") from e
 
 
 def _attribute(workspace, recipient: str, task_id: str) -> None:
@@ -276,12 +287,12 @@ def route(workspace, task: dict, roster=FROM_DISK, _between_suffix_checks=None, 
 
         # Liveness is not consulted: a durable sentinel is found by a worker that starts later.
         # "no-payload" stays its own list: folded into `already` a refusal reads as delivered.
-        buckets = {"delivered": [], "already": [], "no-payload": []}
+        buckets = {"delivered": [], "already": [], "no-payload": [], "fenced": []}
         for t in targets:
             buckets[deliver_one(workspace, t, task_id, _arbitration_seams=_arbitration_seams)].append(t)
     return {"task_id": task_id, "version": r.get("version"), "targets": targets,
             "delivered": buckets["delivered"], "already": buckets["already"],
-            "skipped": buckets["no-payload"],
+            "skipped": buckets["no-payload"], "fenced": buckets["fenced"],
             "redirected": unknown, "error": None}
 
 

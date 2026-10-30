@@ -57,10 +57,10 @@ LANE_GRACE_S = 120
 REASON_HINTS = {
     HOOK_NOT_RUNNING: f"the hook has not run in the last {HOOK_STALE_S // 60} minutes; see "
                       "the hook run line above",
-    TASK_NOT_PICKED_UP: f"an AG2 Space task has been open over {TASK_PICKUP_S // 60} minutes: "
+    TASK_NOT_PICKED_UP: f"an s.space task has been open over {TASK_PICKUP_S // 60} minutes: "
                         "the hook is not waking a worker for it, or a worker handed it off "
                         "without running hold",
-    TASK_HELD: "a worker parked an AG2 Space task for your go (ag2-sparrow-hatch hold)",
+    TASK_HELD: "a worker parked an s.space task for your go (ag2-sparrow-hatch hold)",
     TASK_HELD_UNDELIVERED: f"a task was held over {HELD_LINE_DELIVER_S // 60} minutes ago and its "
                            "room notice is still queued, being sent, was parked after failed "
                            "sends or was withdrawn unsent, so the asker may have heard nothing: check Sparrow's proactive "
@@ -465,6 +465,24 @@ def health_env_problem(cfg: dict, pid: "int | None") -> "str | None":
     return None if ok else NO_HEALTH_COMMAND
 
 
+def stale_listener(cfg: dict, pid: int) -> "str | None":
+    """Why Sparrow `pid` is not the listener this install configured, which it reads only at its
+    start: its drain serves another id than the saved AGENT_MXID, or the token file changed after it
+    started. None when neither is shown, including when its start time cannot be read."""
+    wrong = _cli.live_identity_mismatch(cfg, _instance(cfg))
+    if wrong is not None:
+        return f"serves {wrong[1]}, not {cfg.get('AGENT_MXID')}, the AGENT_MXID install saved"
+    device_env = _cli.device_env_path()
+    try:
+        changed = device_env.stat().st_mtime
+        began = calendar.timegm(time.strptime(agent_identity.start_time(pid) or "",
+                                              "%Y-%m-%dT%H:%M:%SZ"))
+    except (OSError, ValueError):
+        return None
+    # The start time is whole seconds, so only a change a full second after it is later.
+    return f"started before {device_env} changed" if changed >= began + 1 else None
+
+
 def unmanaged_health_problem(cfg: dict) -> "tuple[int | None, str | None]":
     """For a Sparrow no unit runs: the pid holding its lock, and health_env_problem.
     (None, None) when a systemd unit (ours or hand-made) runs Sparrow."""
@@ -688,11 +706,12 @@ def quiesce_sparrow(cfg: dict) -> "tuple[bool, str, str | None]":
 
 def ensure_sparrow(cfg: dict, health: bool) -> int:
     """Leave a Sparrow running and connected: start one if none runs, replace one outside
-    the installed service, or (with `health`) one that lacks REMOTE_HEALTH_COMMAND."""
+    the installed service, one that is a stale_listener, or (with `health`) one that lacks
+    REMOTE_HEALTH_COMMAND."""
     state, instance = _state_dir(cfg), _instance(cfg)
     started = time.time()
-    owner, holder, fresh = resolve_sparrow(cfg)
-    holder = holder if fresh else None
+    owner, alive, fresh = resolve_sparrow(cfg)
+    holder = alive if fresh else None
     if owner == UNIT_UNREACHABLE:
         return _unit_state_unknown(cfg, holder, "systemctl --user did not answer")
     if owner == "other":
@@ -700,6 +719,7 @@ def ensure_sparrow(cfg: dict, health: bool) -> int:
               "neither starts nor replaces the Sparrow it runs; run ag2-sparrow-hatch verify")
         return 0
     start, stopped, since = False, None, None
+    stale = stale_listener(cfg, alive) if owner is None and alive is not None else None
     if owner == "ours":
         props = _cli._unit_props()
         if props is None:
@@ -710,6 +730,10 @@ def ensure_sparrow(cfg: dict, health: bool) -> int:
             # install_service may have just restarted the unit: only its new process counts.
             since = _wall_from_monotonic_us(props.get("ExecMainStartTimestampMonotonic")) \
                 or started
+            why = stale_listener(cfg, props["MainPID"]) if props["MainPID"] else None
+            if why:
+                print(f"replacing: Sparrow (pid {props['MainPID']}) {why}")
+                start = True
         else:
             device_env = _cli.device_env_path()
             if not device_env.is_file():
@@ -729,6 +753,15 @@ def ensure_sparrow(cfg: dict, health: bool) -> int:
                     return 1
                 stopped = holder
             start = True
+    elif stale:
+        ok, how = replace_sparrow(cfg, alive, stale)
+        if not ok:
+            # Without a pidfd nothing is signalled (stop_proven), so the stop is left to the user.
+            print(f"error: Sparrow was not replaced: {how}. Stop it with: kill -TERM {alive} ; then "
+                  "run ag2-sparrow-hatch install again", file=sys.stderr)
+            return 1
+        print(f"started: {how}")
+        return _await_connected(state, instance, started)
     elif holder is not None:
         problem = health_env_problem(cfg, holder)
         if problem == UNKNOWN_ENV:

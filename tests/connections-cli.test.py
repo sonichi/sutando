@@ -84,6 +84,13 @@ class CliTests(unittest.TestCase):
             self.assertNotIn("secret-alpha", stream)
             self.assertNotIn("secret-beta", stream)
 
+    def test_move_with_nothing_to_move_refuses_and_names_the_fallback(self):
+        proc = self.run_cli("move", "--dry-run")
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertIn("move refused: no_successor", proc.stderr)
+        self.assertIn("connections.py add '<code>'", proc.stdout)
+        self.assertFalse((self.ws / "state" / "connections.json").exists(), "a refusal writes nothing")
+
     def test_add_previews_then_asks(self):
         proc = self.run_cli("add", TOKEN_A, stdin="n\n")
         self.assertEqual(proc.returncode, 1, proc.stderr)
@@ -217,7 +224,7 @@ class CliTests(unittest.TestCase):
         self.assertIn("AG2_REMOTE_TOKEN_DEV: connection removed earlier; unset the variable", proc.stdout)
         self.assertNotIn("imported dev", proc.stdout)
 
-    def test_a_corrupt_record_fails_the_plan_loudly_and_env_only_launch_still_works(self):
+    def test_a_corrupt_record_fails_the_plan_loudly_and_env_only_launch_needs_a_named_agent(self):
         (self.ws / "state").mkdir(parents=True, exist_ok=True)
         (self.ws / "state" / "connections.json").write_text('{"schema_version": 1, "connections": [{"tru')
         proc = self.run_cli("launch-plan")
@@ -232,13 +239,9 @@ class CliTests(unittest.TestCase):
         out = box / "env-only.txt"
         proc = self.run_cli("launch", "dev", "--repo", str(repo), "--logs-dir", str(box / "logs"), "--env-only",
                             env_extra={"AG2_REMOTE_TOKEN_DEV": TOKEN_B, "FAKE_OUT": str(out)})
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        for _ in range(50):
-            if out.exists():
-                break
-            import time
-            time.sleep(0.1)
-        self.assertEqual(out.read_text(), "dev")
+        self.assertEqual(proc.returncode, 1, "a gateway that names no agent: refused, not inherited")
+        self.assertIn("has no recorded agent", proc.stderr)
+        self.assertFalse(out.exists())
 
     def test_launch_and_reconnect_run_the_bridge_entry_point(self):
         box = Path(self.tmp.name)
@@ -250,6 +253,10 @@ class CliTests(unittest.TestCase):
             "+ os.environ['REMOTE_TASK_CHANNEL_DIR'] + ' ' + repr(os.environ['REMOTE_PROACTIVE_ROOM']))\n")
         out = box / "launched.txt"
         self.run_cli("add", TOKEN_B, "--yes", "--expected-server", "beta-fixture.net")
+        record_file = self.ws / "state" / "connections.json"
+        record = json.loads(record_file.read_text())
+        record["connections"][0]["agent_mxid"] = "@me:beta-fixture.net"  # what a reachable gateway would name
+        record_file.write_text(json.dumps(record))
         proc = self.run_cli("launch", "beta-fixture-net", "--repo", str(repo), "--logs-dir", str(box / "logs"),
                             env_extra={"FAKE_OUT": str(out), "REMOTE_PROACTIVE_ROOM": "!room:x"})
         self.assertEqual(proc.returncode, 0, proc.stderr)
@@ -271,6 +278,9 @@ class CliTests(unittest.TestCase):
 
         launch_args = ("--repo", str(repo), "--logs-dir", str(box / "logs"))
         self.run_cli("disconnect", "beta-fixture-net")
+        record = json.loads(record_file.read_text())
+        del record["connections"][0]["agent_mxid"]  # unverified again: a rotation it cannot confirm is accepted
+        record_file.write_text(json.dumps(record))
         proc = self.run_cli("update-token", "beta-fixture-net", TOKEN_A, *launch_args)
         self.assertEqual(proc.returncode, 1, "a code for another server is refused")
         self.assertIn("token_server_mismatch", proc.stderr)
@@ -280,7 +290,7 @@ class CliTests(unittest.TestCase):
         proc = self.run_cli("update-token", "beta-fixture-net", "-", *launch_args, stdin=rotated + "\n")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("updated token of beta-fixture-net (beta-fixture.net; vault key AG2_REMOTE_TOKEN_BETA_FIXTURE_NET replaced; "
-                      "relaunched, pid ", proc.stdout)
+                      "relaunch failed: no_identity)", proc.stdout, "no agent named: the bridge is not started")
         self.assert_no_secret(proc)
         self.assertEqual((self.keychain / "AG2_REMOTE_TOKEN_BETA_FIXTURE_NET").read_text(), rotated)
         rows = json.loads(self.run_cli("list", "--json").stdout)
@@ -419,6 +429,82 @@ class InProcess(unittest.TestCase):
         rc, out, err = self.run_main(["set-primary", "dev"], set_primary=refused)
         self.assertEqual((rc, out), (1, ""))
         self.assertIn("connections: disabled_cannot_be_primary: dev", err)
+
+    def test_promote_unpark_and_legacy_parked_print_and_exit_by_the_module(self):
+        argv = ["--repo", "/r", "--logs-dir", "/l"]
+        moved = {"instance": "s-space", "server": "s.space", "changed": True, "previous": "", "stopped_pid": 41}
+        rc, out, _ = self.run_main(["promote", "s-space", *argv], promote=lambda inst, **kw: dict(moved))
+        self.assertEqual((rc, out), (0, "primary is now s-space (s.space); parked (legacy) (stopped pid 41)\n"))
+        rc, out, _ = self.run_main(["promote", "s-space", *argv], promote=lambda inst, **kw: dict(moved, changed=False))
+        self.assertEqual((rc, out), (0, "s-space is already primary\n"))
+
+        def refused(inst, **kw):
+            raise self.cli.connections.BridgeStillRunning("", 41)
+        rc, _, err = self.run_main(["promote", "s-space", *argv], promote=refused)
+        self.assertEqual(rc, 1)
+        self.assertIn("connections: bridge_still_running", err)
+        rc, out, _ = self.run_main(["unpark", "", *argv], unpark=lambda inst, **kw: {"instance": "", "launch": None})
+        self.assertEqual((rc, out), (0, "unparked (legacy) (its launchers resume it)\n"))
+        rc, out, _ = self.run_main(["unpark", "dev", *argv], unpark=lambda inst, **kw: {
+            "instance": "dev", "launch": {"ok": False, "reason": "no_token"}})
+        self.assertEqual((rc, out), (1, "unparked dev (start failed: no_token)\n"))
+        self.assertEqual(self.run_main(["legacy-parked"], legacy_parked=lambda ws=None: True)[0], 0)
+        self.assertEqual(self.run_main(["legacy-parked"], legacy_parked=lambda ws=None: False)[0], 1)
+
+    def test_promote_keeps_the_old_lane_unless_asked_to_park_it(self):
+        argv = ["--repo", "/r", "--logs-dir", "/l"]
+        seen = []
+
+        def promote(inst, **kw):
+            seen.append(kw["park"])
+            return {"instance": "s-space", "server": "s.space", "changed": True, "previous": None, "kept": ""}
+        rc, out, _ = self.run_main(["promote", "s-space", *argv], promote=promote)
+        self.assertEqual((rc, out), (0, "primary is now s-space (s.space); (legacy) keeps running as a secondary\n"))
+        self.run_main(["promote", "s-space", "--park", *argv], promote=promote)
+        self.assertEqual(seen, [False, True])
+
+    def test_move_prints_the_result_or_the_code_fallback(self):
+        seen = []
+
+        def moved(inst, **kw):
+            seen.append((inst, kw["dry_run"], kw["repo"]))
+            return {"ok": True, "instance": "s-space", "agent_mxid": "@a:s.space", "from": "", "dry_run": kw["dry_run"],
+                    "mcp": "repointed", "rooms": [{"twin": "!r:s.space", "error": None},
+                                                  {"twin": "!q:s.space", "error": "RosterError"}]}
+        rc, out, _ = self.run_main(["move", "--repo", "/r", "--logs-dir", "/l"], try_reuse_move=moved)
+        self.assertEqual((rc, out), (0, "moved (legacy) to s-space as @a:s.space; agent MCP: repointed; "
+                                        "rooms mirrored: 1 (1 refused: !q:s.space)\n"))
+        rc, out, _ = self.run_main(["move", "legacy", "--dry-run"], try_reuse_move=moved)
+        self.assertTrue(out.startswith("would move (legacy) to s-space"), out)
+        self.assertEqual([x[:2] for x in seen], [(None, False), ("", True)], "'legacy' names the legacy row")
+        rc, _, err = self.run_main(["move"], try_reuse_move=moved)
+        self.assertEqual(rc, 2)
+        self.assertIn("--repo and --logs-dir", err)
+        refused = lambda inst, **kw: {"ok": False, "reason": "auth_rejected", "detail": "s.space does not accept it",
+                                      "server": "s.space", "added": False}
+        rc, out, err = self.run_main(["move", "--dry-run"], try_reuse_move=refused)
+        self.assertEqual(rc, 1)
+        self.assertIn("move refused: auth_rejected (s.space does not accept it)", err)
+        self.assertEqual(out, "next: get a connect code at s.space's agent portal, then run "
+                              "python3 scripts/connections.py add '<code>'\n")
+        half = lambda inst, **kw: {"ok": False, "reason": "new_primary_not_connected", "detail": "", "server": "s.space",
+                                   "added": True, "instance": "s-space"}
+        rc, out, _ = self.run_main(["move", "--repo", "/r", "--logs-dir", "/l"], try_reuse_move=half)
+        self.assertEqual((rc, out), (1, "next: the s-space row is saved; run move again to finish (it resumes)\n"))
+
+    def test_park_and_park_legacy_print_what_they_parked(self):
+        rc, out, _ = self.run_main(["park", ""], park=lambda inst, workspace=None: {
+            "instance": "", "parked": True, "stopped_pid": 41})
+        self.assertEqual((rc, out), (0, "parked (legacy) (stopped pid 41)\n"))
+        rc, out, _ = self.run_main(["park-legacy"], park_legacy=lambda workspace=None: {
+            "primary": "s-space", "parked": ["", "dev"], "stopped": {"": 41}})
+        self.assertEqual((rc, out), (0, "parked (legacy), dev; s-space stays primary\n"))
+
+        def refused(inst, workspace=None):
+            raise self.cli.connections.PrimaryCannotPark(inst)
+        rc, _, err = self.run_main(["park", "s-space"], park=refused)
+        self.assertEqual(rc, 1)
+        self.assertIn("connections: primary_cannot_park", err)
 
 
 if __name__ == "__main__":

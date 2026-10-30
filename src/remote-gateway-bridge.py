@@ -375,9 +375,29 @@ def _ag2space_proactive_ack_gate(task_id: str, item_id: str):
 
 
 def _lane_dedupe_gate(task: dict):
-    """A message another of this install's lanes already queued; seats are other agents, never asked."""
+    """A message another of this install's lanes queued, or one the lane its owner names will answer;
+    seats are other agents, never asked."""
     import lane_dedupe
-    return lane_dedupe.duplicate_reason(WS / "state", task, GATEWAY_INSTANCE, log=_log)  # noqa: F821
+    try:
+        from connections import event_owner_lanes
+        owners = event_owner_lanes(task, WS)
+    except Exception as e:  # noqa: BLE001 - no owner read keeps the first-come guard
+        _log(f"lane dedupe: owner lanes unreadable ({type(e).__name__}); first lane answers")  # noqa: F821
+        owners = []
+    mode = _INTAKE_MODE  # noqa: F821
+    deadline = mode["deadline"]
+    wait_s = None if deadline is None else max(0.0, deadline - time.monotonic())
+    try:
+        return lane_dedupe.duplicate_reason(WS / "state", task, GATEWAY_INSTANCE, log=_log,  # noqa: F821
+                                            owner_lanes=owners, wait_s=wait_s, defer=mode["defer"])
+    except lane_dedupe.OwnerPending:
+        return INTAKE_DEFER  # noqa: F821
+
+
+def _intake_gate(task: dict):
+    """A task from before this connection was added (its row's `not_before`), else the lane dedupe."""
+    from connections import NOT_BEFORE_ENV, backlog_reason
+    return backlog_reason(task, os.environ.get(NOT_BEFORE_ENV, "")) or _lane_dedupe_gate(task)
 
 
 _STATUS_ACK_MANIFEST = _REPO / "skills" / "status-ack" / "manifest.json"
@@ -386,6 +406,16 @@ _STATUS_ACK_MANIFEST = _REPO / "skills" / "status-ack" / "manifest.json"
 def _legacy_keeps_proactive_room() -> bool:
     from connections import legacy_keeps_proactive_room
     return legacy_keeps_proactive_room(WS)
+
+
+def _legacy_stand_down():
+    from connections import legacy_parked
+    return "the legacy connection is parked; unpark it to resume" if legacy_parked(WS) else None
+
+
+def _owns_unaddressed() -> bool:
+    from connections import owns_unaddressed
+    return owns_unaddressed(GATEWAY_INSTANCE, WS)  # noqa: F821
 
 
 def _status_ack_gate(environ=None):
@@ -413,8 +443,11 @@ OWNER_DM_UPGRADED_NOTIFY = _ag2space_owner_dm_upgraded
 PROACTIVE_DISPATCH_GATE = _ag2space_proactive_dispatch_gate
 PROACTIVE_ACK_GATE = _status_ack_gate()
 PROACTIVE_ROUTE_GATE = _ag2space_proactive_route_gate
-TASK_INTAKE_GATE = _lane_dedupe_gate if not gateway_credential_sources.is_seat(os.environ) else None  # noqa: F821
+TASK_INTAKE_GATE = _intake_gate if not gateway_credential_sources.is_seat(os.environ) else None  # noqa: F821
 PROACTIVE_ROOM_KEEP = _legacy_keeps_proactive_room if not GATEWAY_INSTANCE else None  # noqa: F821
+OWNS_UNADDRESSED = _owns_unaddressed
+STAND_DOWN_GATE = (_legacy_stand_down if not GATEWAY_INSTANCE  # noqa: F821
+                   and not gateway_credential_sources.is_seat(os.environ) else None)  # noqa: F821
 
 if _RUN_MAIN:  # pragma: no cover — script-entry tail; the subprocess suite drives it
     __name__ = "__main__"

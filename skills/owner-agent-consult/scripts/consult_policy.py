@@ -196,7 +196,7 @@ def live_task(task_id: str, workspace: Optional[Path]) -> dict:
         return {"ok": False, "reason": reason}
     if workspace is None:
         return no("workspace unknown")
-    if not ltp.valid_task_id(task_id or ""):
+    if not ltp.valid_local_task_id(task_id or ""):
         return no(f"{task_id!r} is not a task id")
     tasks = Path(workspace) / "tasks"
     path = find_task_file(tasks, task_id)
@@ -296,7 +296,7 @@ def task_can_post(workspace: Path, task_id: Optional[str]) -> bool:
     """True while `task_id` is live in this inbox with no result."""
     import local_task_protocol as ltp
     from task_archive import find_task_file
-    if not task_id or not ltp.valid_task_id(task_id):
+    if not task_id or not ltp.valid_local_task_id(task_id):
         return False
     if find_task_file(Path(workspace) / "tasks", task_id) is None:
         return False

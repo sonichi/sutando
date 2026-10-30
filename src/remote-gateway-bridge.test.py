@@ -822,7 +822,7 @@ def main() -> int:
           "AG2 Space has no NOTIFY step")
     # room_ops.py falls back to a channel env file only when url+token are
     # absent from the environment; WHICH file carries them differs per onboarding.
-    _env_hint = 'set -a; . "$(bash scripts/channel-env.sh ag2space)"; set +a'
+    _env_hint = 'set -a; . "$(bash scripts/channel-env.sh ag2space --room \'!room:ag2.space\')"; set +a'
     check(sum(_env_hint in ln for ln in sk.splitlines()) == 1,
           "the env prelude rides the sole gateway-calling step (context-first)")
     # CHANNEL_DIR defaults to "ag2space", so every assertion above passes even
@@ -835,7 +835,7 @@ def main() -> int:
     finally:
         rtc.CHANNEL_DIR, rtc.LOCAL_TIER = _saved_dir, _saved_tier2
     check("channel-env.sh dev-ag2space" in skd
-          and "channel-env.sh ag2space)" not in skd,
+          and "channel-env.sh ag2space " not in skd,
           "a non-default CHANNEL_DIR reaches the env prelude, not the default")
     check(sum("channel-env.sh dev-ag2space" in ln for ln in skd.splitlines()) == 1,
           "the sole gateway-calling step names the task's own channel dir, not the default")
@@ -1766,6 +1766,29 @@ def main() -> int:
     check(len(STATE["room_posts"]) == n_posts and (rtc.RESULTS_DIR / "proactive-t1f.txt").exists(),
           "a named secondary never consumes an unaddressed nudge, whatever room the pin or the registry names")
     (rtc.RESULTS_DIR / "proactive-t1f.txt").unlink(); rtc.GATEWAY_INSTANCE = _inst
+    check(rtc.OWNS_UNADDRESSED is rtc._owns_unaddressed, "the host answers which bridge is the primary")
+    _saved_owns = rtc.OWNS_UNADDRESSED
+    rtc.GATEWAY_INSTANCE, rtc.OWNS_UNADDRESSED = "dev", lambda: True  # the record made this lane the primary
+    n_posts = len(STATE["room_posts"]); (rtc.RESULTS_DIR / "proactive-t1h.txt").write_text("nudge for the new primary\n")
+    rtc._post_proactive()
+    check(len(STATE["room_posts"]) == n_posts + 1 and STATE["room_posts"][-1]["room_id"] == "!dm:example.org"
+          and not (rtc.RESULTS_DIR / "proactive-t1h.txt").exists(),
+          "a named lane the record made primary delivers an unaddressed nudge to its owner DM")
+    rtc.GATEWAY_INSTANCE, rtc.OWNS_UNADDRESSED = _inst, lambda: False  # the unsuffixed bridge once a lane is primary
+    n_posts = len(STATE["room_posts"]); (rtc.RESULTS_DIR / "proactive-t1i.txt").write_text("not the legacy's\n")
+    rtc._post_proactive()
+    check(len(STATE["room_posts"]) == n_posts and (rtc.RESULTS_DIR / "proactive-t1i.txt").exists(),
+          "the unsuffixed bridge leaves unaddressed nudges once a named lane is primary")
+    rtc.OWNS_UNADDRESSED = lambda: (_ for _ in ()).throw(OSError("x"))
+    check(rtc.owns_unaddressed() is True, "a failed primary check keeps the launch-time rule")
+    (rtc.RESULTS_DIR / "proactive-t1i.txt").unlink(); rtc.OWNS_UNADDRESSED = _saved_owns
+    _real_resolve, _asked = rtc.resolve_destination, []
+    rtc.resolve_destination = lambda audience, **kw: _asked.append(audience) or ""
+    rtc.OWNS_UNADDRESSED = lambda: False
+    check(rtc._project_hitl() == 0 and not _asked, "a bridge that is not the primary projects no cards")
+    rtc.GATEWAY_INSTANCE, rtc.OWNS_UNADDRESSED = "dev", lambda: True
+    check(rtc._project_hitl() == 0 and _asked == [rtc.OWNER_PRIVATE], "a named primary looks for the owner DM to project cards")
+    rtc.resolve_destination, rtc.GATEWAY_INSTANCE, rtc.OWNS_UNADDRESSED = _real_resolve, _inst, _saved_owns
     rtc._reenroll_identity = lambda: "@agent-t:example.org"
     rtc._ROUTING.update(owner_dm="", persisted="", next=0.0, loaded=False)
     STATE["agents"] = [{"id": "@agent-t:example.org", "owner": "@owner:example.org", "owner_dm_room": "!dm:example.org"}]

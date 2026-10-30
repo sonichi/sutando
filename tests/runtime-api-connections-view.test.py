@@ -110,7 +110,7 @@ class ViewTests(unittest.TestCase):
         return asyncio.run(self.disp.handle(method, params))
 
     def test_list_is_empty_without_a_record(self):
-        self.assertEqual(self.call("connection.list"), {"connections": []})
+        self.assertEqual(self.call("connection.list"), {"connections": [], "capabilities": ["legacy_readopt", "promote_keeps_lanes"]})
 
     def test_list_on_an_empty_record_imports_the_channel_file_token_through_the_view_vault(self):
         home = self.ws / "claude-home"
@@ -128,7 +128,7 @@ class ViewTests(unittest.TestCase):
         self.assertEqual((preview["server"], preview["agent_mxid"], preview["verified"], preview["authenticated"]),
                          ("alpha-fixture.net", "@sutando:alpha-fixture.net", True, True))
         self.assertEqual(preview["gateway_url"], "https://chat.alpha-fixture.net")
-        self.assertEqual(self.call("connection.list"), {"connections": []}, "a preview saves nothing")
+        self.assertEqual(self.call("connection.list"), {"connections": [], "capabilities": ["legacy_readopt", "promote_keeps_lanes"]}, "a preview saves nothing")
         self.assertEqual(self.vault.store, {})
 
         out = self.call("connection.add", token=TOKEN_A, confirm=True, expected_server="alpha-fixture.net",
@@ -208,6 +208,62 @@ class ViewTests(unittest.TestCase):
         self.assertIn("restart.sh --stop-only", str(cm.exception))
         self.assertEqual(connections.primary_instance(self.ws), "", "nothing moved")
 
+    def test_promote_moves_the_primary_off_a_running_legacy_bridge_and_unpark_brings_it_back(self):
+        from _helpers import bridge_lease
+        started = []
+        inner = bridge_lease.spawner(self.ws, started=started)
+
+        def spawn(argv, env, log_path):
+            proc = inner(argv, env, log_path)
+            status = self.ws / "state" / f"gateway-status.{env['GATEWAY_INSTANCE']}.json"
+            status.parent.mkdir(parents=True, exist_ok=True)
+            status.write_text(json.dumps({"pid": proc.pid, "connected": True}))
+            return proc
+        self.view.spawn, self.view.kill = spawn, None
+        connections.import_from_env({"REMOTE_TASK_TOKEN": TOKEN_A}, workspace=self.ws, vault=self.vault)
+        connections.add_connection(TOKEN_B, added_by="owner", expected_server="beta-fixture.net", workspace=self.ws,
+                                   vault=self.vault, preview=connections.preview_connection(TOKEN_B, fetch=self.gateway,
+                                                                                            getaddrinfo=public_getaddrinfo))
+        legacy = bridge_lease.start(self.ws, "")
+        try:
+            out = self.call("connection.promote", instance="beta-fixture-net")
+            self.assertEqual((out["connection"]["primary"], out["previous"], out["kept"], out["stopped_pid"],
+                              out["changed"], out["relaunch_needed"]), (True, None, "", 0, True, False))
+            self.assertEqual(out["launch"]["pid"], started[0].pid)
+            self.assertEqual(connections.bridge_pid("", self.ws), legacy.pid, "the legacy lane keeps running")
+            with self.assertRaises(ProtocolError) as cm:
+                self.call("connection.promote", instance="beta-fixture-net", park="yes")
+            self.assertEqual(cm.exception.code, -32602)
+            with self.assertRaises(ProtocolError) as cm:
+                self.call("connection.park", instance="beta-fixture-net")
+            self.assertTrue(str(cm.exception).startswith("primary_cannot_park"))
+            out = self.call("connection.park_legacy")
+            legacy.wait(5)
+            self.assertEqual((out["primary"], out["parked"], out["stopped"]), ("beta-fixture-net", [""], {"": legacy.pid}))
+            listed = {r["instance"]: r for r in self.call("connection.list")["connections"]}
+            self.assertEqual((listed[""]["state"], listed[""]["reason"], listed[""]["parked"]), ("parked", "parked", True))
+            out = self.call("connection.unpark", instance="")
+            self.assertEqual((out["connection"]["parked"], out["launch"]), (False, None))
+            with self.assertRaises(ProtocolError) as cm:
+                self.call("connection.promote", instance="")
+            self.assertEqual(cm.exception.code, CONFLICT)
+            self.assertTrue(str(cm.exception).startswith("legacy_bridge_not_running"))
+        finally:
+            bridge_lease.stop(legacy)
+            for proc in started:
+                bridge_lease.stop(proc)
+
+    def test_park_legacy_without_a_primary_is_a_conflict(self):
+        with self.assertRaises(ProtocolError) as cm:
+            self.call("connection.park_legacy")
+        self.assertEqual(cm.exception.code, CONFLICT)
+
+    def test_promote_and_unpark_of_an_unknown_instance_are_invalid_params(self):
+        for method in ("connection.promote", "connection.park", "connection.unpark"):
+            with self.assertRaises(ProtocolError) as cm:
+                self.call(method, instance="nope")
+            self.assertEqual(cm.exception.code, -32602, method)
+
     def test_confirm_against_a_moved_identity_is_a_conflict(self):
         preview = self.call("connection.add", token=TOKEN_A)["preview"]
         self.assertEqual((preview["server"], preview["verified"]), ("alpha-fixture.net", True))
@@ -217,7 +273,7 @@ class ViewTests(unittest.TestCase):
         self.assertTrue(str(cm.exception).startswith("mismatch"))
         self.assertIn("alpha-fixture.net", str(cm.exception))
         self.assertNotIn("secret-alpha", str(cm.exception))
-        self.assertEqual(self.call("connection.list"), {"connections": []})
+        self.assertEqual(self.call("connection.list"), {"connections": [], "capabilities": ["legacy_readopt", "promote_keeps_lanes"]})
         self.assertEqual(self.vault.store, {})
 
     def test_status_state_and_set_primary(self):

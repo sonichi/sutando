@@ -1,5 +1,5 @@
 #!/bin/bash
-# Wrapper for the launchd-managed ag2.space gateway bridge
+# Wrapper for the launchd-managed gateway bridge
 # (src/remote-gateway-bridge.py).
 #
 # Why a wrapper (not a bare ProgramArguments python3 call): the bridge needs
@@ -40,9 +40,26 @@ fi
 # dropping an environment-provided one.
 _ENV_REMOTE_TASK_TOKEN="${REMOTE_TASK_TOKEN:-}"; _ENV_AG2_REMOTE_TOKEN="${AG2_REMOTE_TOKEN:-}"
 _ENV_REMOTE_TASK_TIER="${REMOTE_TASK_TIER:-}"; _ENV_AG2_REMOTE_TIER="${AG2_REMOTE_TIER:-}"
-if _RELAY_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels/ag2space/.env 2>/dev/null)"; then
-    [ -f "$_RELAY_ENV" ] && { set -a; . "$_RELAY_ENV"; set +a; }
-fi
+# `.env` first (policy, shell-form credentials), then the file the shared resolver
+# names as holding the token, unless the process environment supplied one.
+_load_channel_env() {
+    local dot="" tok=""
+    dot="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels/ag2space/.env 2>/dev/null)" || dot=""
+    [ -n "$dot" ] && [ -f "$dot" ] && { set -a; . "$dot"; set +a; }
+    if [ -z "${_ENV_REMOTE_TASK_TOKEN}${_ENV_AG2_REMOTE_TOKEN}" ]; then
+        tok="$(bash "$REPO/scripts/channel-env.sh" ag2space 2>/dev/null)" || tok=""
+        [ -n "$tok" ] && [ -f "$tok" ] && [ "$tok" != "$dot" ] && { set -a; . "$tok"; set +a; }
+    fi
+    # Only the shared rule's "blank" verdict (rc 3) drops it; an unrunnable check keeps it.
+    local v rc
+    for v in REMOTE_TASK_TOKEN AG2_REMOTE_TOKEN; do
+        rc=0
+        printf '%s' "${!v:-}" | python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); from channel_token import clean_relay_token as c; sys.exit(0 if c(sys.stdin.read()) else 3)' "$REPO/src" 2>/dev/null || rc=$?
+        [ "$rc" -ne 3 ] || eval "$v="
+    done
+    return 0
+}
+_load_channel_env
 
 # Map legacy AG2_REMOTE_* → REMOTE_TASK_* (the names the bridge reads).
 # Default tier is "owner" for the personal-agent model (PR #2018, 2026-07-08): a
@@ -165,7 +182,7 @@ while [ "$STOPPING" = 0 ]; do
   # environment-provided values, re-read the .env, redo the legacy mapping.
   REMOTE_TASK_TOKEN="$_ENV_REMOTE_TASK_TOKEN"; AG2_REMOTE_TOKEN="$_ENV_AG2_REMOTE_TOKEN"
   REMOTE_TASK_TIER="$_ENV_REMOTE_TASK_TIER"; AG2_REMOTE_TIER="$_ENV_AG2_REMOTE_TIER"
-  [ -n "${_RELAY_ENV:-}" ] && [ -f "$_RELAY_ENV" ] && { set -a; . "$_RELAY_ENV"; set +a; }
+  _load_channel_env
   REMOTE_TASK_TOKEN="${REMOTE_TASK_TOKEN:-${AG2_REMOTE_TOKEN:-}}"
   REMOTE_TASK_TIER="${REMOTE_TASK_TIER:-${AG2_REMOTE_TIER:-owner}}"
   export REMOTE_TASK_TOKEN REMOTE_TASK_TIER
@@ -176,6 +193,22 @@ while [ "$STOPPING" = 0 ]; do
     exit 0
   fi
   tend_agents_supervisor
+  # A primary move parked the legacy row: launch nothing, keep tending the agent bridges, and
+  # resume on its own once the row is unparked.
+  if python3 "$REPO/scripts/connections.py" legacy-parked >/dev/null 2>&1; then
+    [ "${_PARKED_SAID:-0}" = 1 ] || echo "[gateway-bridge-wrapper] the legacy connection is parked; waiting for unpark" >&2
+    _PARKED_SAID=1
+    rm -f "$MARKER"
+    sleep "$RESTART_DELAY" &
+    CHILD_PID=$!
+    set +e
+    wait "$CHILD_PID"
+    set -e
+    CHILD_PID=''
+    continue
+  fi
+  [ "${_PARKED_SAID:-0}" = 1 ] && { echo "[gateway-bridge-wrapper] the legacy connection is unparked; launching" >&2; date +%s > "$MARKER"; }
+  _PARKED_SAID=0
   # Once a named row holds the primary this legacy bridge is a secondary: it must not
   # inherit the proactive room, or two bridges post nudges. Otherwise the variable is
   # passed through as is, unset included: the bridge reads the device env only when unset.
@@ -197,6 +230,8 @@ while [ "$STOPPING" = 0 ]; do
   set -e
   CHILD_PID=''
   [ "$STOPPING" = 0 ] || break
+  # Stopped by a primary move (or stood down on it): no alert, and the loop above waits.
+  python3 "$REPO/scripts/connections.py" legacy-parked >/dev/null 2>&1 && continue
   [ "$CHILD_RC" -eq 75 ] && { stop_agents_supervisor; rm -f "$MARKER"; exit 0; }
   # rc 69 is the bridge's poll-stall exit: an outage, already in its log and status file.
   if [ "$CHILD_RC" -eq 69 ]; then

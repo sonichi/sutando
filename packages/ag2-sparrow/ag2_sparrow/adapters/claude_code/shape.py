@@ -8,7 +8,7 @@ from ...connect_bridge import bridge_shape
 from ...connect_common import Shape
 
 LOCAL = Shape(name="claude-local", command="ag2-sparrow-claude-local",
-              description="a Claude Code session in a tmux pane as an AG2 Space agent", cli="Claude Code CLI",
+              description="a Claude Code session in a tmux pane as an s.space agent", cli="Claude Code CLI",
               min_version=(2, 1, 287), version_anchor=r"\(Claude Code\)",
               version_note="the Mods API it uses arrived there",
               required_keys=("CLAUDE", "PLUGIN_DIR", "INBOX_DIR", "RESULTS_DIR", "SESSION_ID", "HITL_STORE"),

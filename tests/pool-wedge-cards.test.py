@@ -153,6 +153,23 @@ class NoWedgeActsOnTheSession(unittest.TestCase):
                 self.assertEqual(t.acted(), [], (which, label))
 
 
+class WedgeCardsUseTheHelper(unittest.TestCase):
+    def test_every_card_path_is_built_by_hitl_cards_and_stored_in_the_workspace_store(self):
+        from hitl import cards
+        paths = [(HUMAN, PANES["gate"]), (HUMAN, PANES["limit"]), (FROZEN, PANES["frozen"]),
+                 (CAUSE, PANES["abnormal"]), (LOGIN, PANES["logged-out"])]
+        for which, pane in paths:
+            with self.subTest(which=which, pane=pane[:20]):
+                ws = pool()
+                with patch.object(cards, "choice_request", wraps=cards.choice_request) as cr:
+                    out = wc.raise_card(ws, WID, which, runner=Tmux(pane), routed=lambda *a: False)
+                self.assertEqual(out["outcome"], "carded")
+                cr.assert_called_once()
+                stored = cards.manager_for(ws).get(out["hitl_id"])
+                self.assertIsNotNone(stored, "stored through the workspace's own store handle")
+                self.assertEqual(stored.guard, cr.call_args.args[2])
+
+
 class HumanCard(unittest.TestCase):
     def test_gate_and_limit_offer_only_the_workers_terminal_and_deduplicate(self):
         for pane in (PANES["gate"], PANES["limit"]):

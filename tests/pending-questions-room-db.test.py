@@ -434,6 +434,21 @@ class TestAskOwner(_Ws):
         self.assertEqual(seen["outbox_at_write"], [f"{out['ask_id']}.json"], "no temp file, the entry whole")
         self.assertEqual(self.outbox(), [])
 
+    def test_no_row_is_written_without_a_held_record(self):
+        class Counting(InProcClient):
+            writes = 0
+
+            def add_row(self, schema, row, cells, body):
+                Counting.writes += 1
+                return super().add_row(schema, row, cells, body)
+        db = self.db(Counting())
+        with mock.patch.object(pqa.Outbox, "save", side_effect=OSError("disk full")):
+            out = self.ask("q?", store=db)
+        self.assertEqual(Counting.writes, 0, "the room is not written when the question could not be held")
+        self.assertEqual(db.open_entries(), [])
+        self.assertIn("NOT written", out["db_error"])
+        self.assertIsNotNone(out["proactive_file"], "the owner is still asked")
+
     def test_a_database_failure_leaves_the_outbox_entry_and_says_so(self):
         out = self.ask("q?", store=self.db(InProcClient(fail="service refused")))
         self.assertIn("service refused", out["db_error"])
@@ -851,16 +866,11 @@ class TestDelegation(unittest.TestCase):
             self.assertNotRegex(self.src(rel), r"room[-_]collab|room[-_]commons", rel)
             self.assertNotRegex(self.src(rel), r"pending_questions_room_db|skills/pending-questions", rel)
 
-    def test_the_skills_ask_queues_then_holds_then_writes_the_row_and_only_with_a_held_record(self):
+    def test_the_skills_ask_writes_no_row_and_no_ledger_of_its_own(self):
+        # Ordering is pinned by behaviour: TestAskOwner's outbox-before-write and no-row tests,
+        # and decision-card's OrderAndSingleSurface.
         s = self.src(self.SKILL + "pending_questions_room_db.py")
-        self.assertIn("core_ask.queue_question(", s)
-        self.assertIn('if out["outbox"] is None:', s)
-        self.assertLess(s.index("core_ask.queue_question("), s.index('if out["outbox"] is None:'))
-        self.assertLess(s.index('if out["outbox"] is None:'), s.index("write_question(q, store, out[\"sent_line\"])"))
         self.assertNotRegex(s, r"\bledger\.|FileStore|pending-questions\.md")
-        core = self.src(self.SKILL + "pending_questions_ask.py")
-        self.assertIn("Outbox(ws).save(out[\"question\"], out[\"sent_line\"], now)", core)
-        self.assertLess(core.index("write_proactive(ws"), core.index("Outbox(ws).save("), "queue, then hold")
 
     def test_the_store_confirms_the_exact_ask_id_before_the_outbox_entry_goes(self):
         s = self.src(self.SKILL + "pending_questions_store.py")

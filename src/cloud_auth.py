@@ -59,9 +59,9 @@ DEFAULT_CLOUD_ORIGIN = dotspace.default_cloud_origin()
 # The shared production Cloud. A retired-origin, bare-key or base-less stored credential belongs
 # HERE, whatever instance this install is on; it is never re-paired with another origin.
 PRODUCTION_CLOUD_ORIGIN = dotspace.PRODUCTION_CLOUD_ORIGIN
-# sutando.ag2.ai 307s to .space and clients drop Authorization across the
-# cross-origin redirect, so a bearer sent there reads back as a bogus 401.
-RETIRED_CLOUD_ORIGINS = ("https://sutando.ag2.ai",)
+# Earlier hosts of the production Cloud. A bearer sent to one can cross a redirect that drops
+# Authorization and read back as a bogus 401, so it always goes to PRODUCTION_CLOUD_ORIGIN.
+RETIRED_CLOUD_ORIGINS = tuple(f"https://{host}" for host in dotspace.RETIRED_CLOUD_HOSTS)
 # What the desktop host overwrites the Keychain token with on sign-out (its
 # vault CLI has no delete verb); must read as "not signed in".
 SIGNED_OUT_SENTINEL = "__signed_out__"

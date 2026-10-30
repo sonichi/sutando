@@ -184,30 +184,63 @@ def connections_bearer() -> str:
     return local_api_gate.local_api_token(WORKSPACE_DIR, API_TOKEN)
 
 
+def pool_room_bindings(repo: Path, workspace: Path):
+    """The worker pool's room bindings when that skill is installed, else None."""
+    return _connections.room_bindings_from_script(
+        Path(repo) / "skills" / "worker-pool" / "scripts" / "pool_roster.py", workspace)
+
+
 def connections_http(method: str, path: str, body: dict, query: Optional[dict] = None, *,
                      workspace: Optional[Path] = None, repo: Optional[Path] = None,
                      logs_dir: Optional[Path] = None, vault=None, fetch=None, spawn=None,
-                     kill=None, getaddrinfo=None) -> "tuple[int, Optional[dict]]":
+                     kill=None, getaddrinfo=None, whoami=None) -> "tuple[int, Optional[dict]]":
     """(status, payload) for one request under CONNECTIONS_PREFIX; payload None = empty body.
     The HTTP shape of the connections domain: GET lists, GET known-servers offers the registry,
     POST previews or (confirm) creates and starts the bridge, DELETE removes, POST <instance>/primary moves the primary,
-    POST <instance>/disconnect stops and disables, POST <instance>/reconnect relaunches,
-    POST <instance>/token replaces the secret with a new code for the same connection.
-    Dispatch only; every rule lives in src/connections.py."""
+    POST <instance>/promote moves it while the old primary runs (`{"park": true}` also parks the old one),
+    POST <instance>/park parks a secondary, POST park-legacy parks every row but the primary (the cutover),
+    POST <instance>/unpark brings a parked row back, POST <instance>/disconnect stops and disables,
+    POST <instance>/reconnect relaunches,
+    POST <instance>/token replaces the secret with a new code for the same connection,
+    POST move moves a connection to its successor server with its existing secret (`try_reuse_move`);
+    <instance> `legacy` names the legacy row. Dispatch only; every rule lives in src/connections.py."""
     ws = Path(workspace) if workspace is not None else WORKSPACE_DIR
     repo = Path(repo) if repo is not None else REPO_DIR
     logs_dir = Path(logs_dir) if logs_dir is not None else ws / "logs"
     query = query or {}
     parts = [x for x in path[len(CONNECTIONS_PREFIX):].split("/") if x]
+    # The legacy row's instance is "", which no path segment can carry.
+    if parts[:1] == [_connections.LEGACY_PATH_SEGMENT]:
+        parts[0] = ""
     try:
         if method == "GET" and not parts:
             rows = _connections.list_connections(ws, vault=vault)
-            return 200, {"connections": [_connections.status_for(r, ws) for r in rows]}
+            return 200, {"connections": [_connections.status_for(r, ws) for r in rows],
+                         "capabilities": list(_connections.CAPABILITIES),
+                         "no_primary": _connections.no_primary(ws)}
         # A fixed name, matched before any <instance> route so it is never read as a slug.
         if parts == ["known-servers"]:
             if method != "GET":
                 return 405, {"error": "method not allowed"}
             return 200, {"servers": _connections.known_servers(ws)}
+        if parts == ["move"]:
+            if method != "POST":
+                return 405, {"error": "method not allowed"}
+            instance, dry_run = body.get("instance"), body.get("dry_run", False)
+            if instance is not None and not isinstance(instance, str):
+                return 400, {"error": "instance must be a string"}
+            if not isinstance(dry_run, bool):
+                return 400, {"error": "dry_run must be a boolean"}
+            instance = "" if instance == _connections.LEGACY_PATH_SEGMENT else instance
+            out = _connections.try_reuse_move(instance, repo=repo, logs_dir=logs_dir, workspace=ws, vault=vault,
+                                              fetch=fetch, whoami=whoami, getaddrinfo=getaddrinfo, spawn=spawn,
+                                              kill=kill, added_by="ui", dry_run=dry_run,
+                                              room_bindings=pool_room_bindings(repo, ws))
+            return 200, out
+        if parts == ["park-legacy"]:
+            if method != "POST":
+                return 405, {"error": "method not allowed"}
+            return 200, _connections.park_legacy(workspace=ws, kill=kill)
         if method == "POST" and not parts:
             token = body.get("token")
             if not isinstance(token, str) or not token.strip():
@@ -221,10 +254,14 @@ def connections_http(method: str, path: str, body: dict, query: Optional[dict] =
             expected = body.get("expected_server")
             if not isinstance(expected, str) or not expected.strip():
                 return 400, {"error": "confirm needs expected_server (the server the preview showed)"}
+            skip_backlog = body.get("skip_backlog", False)
+            if not isinstance(skip_backlog, bool):
+                return 400, {"error": "skip_backlog must be a boolean"}
             try:
                 row, created = _connections.add_connection(
                     token, added_by=str(body.get("added_by", "ui")), expected_server=expected,
-                    instance=body.get("instance"), preview=preview, workspace=ws, vault=vault)
+                    instance=body.get("instance"), preview=preview, workspace=ws, vault=vault, kill=kill,
+                    skip_backlog=skip_backlog)
             except _connections.ConnectionMismatch as e:
                 return 409, {"error": "mismatch", "server_from_token": e.derived, "expected_server": e.claimed}
             launch = _connections.start_added(row, repo=repo, logs_dir=logs_dir, workspace=ws,
@@ -243,6 +280,21 @@ def connections_http(method: str, path: str, body: dict, query: Optional[dict] =
         if len(parts) == 2 and method == "POST" and parts[1] == "primary":
             row = _connections.set_primary(parts[0], workspace=ws)
             return 200, {"connection": _connections.status_for(row, ws)}
+        if len(parts) == 2 and method == "POST" and parts[1] == "promote":
+            park = body.get("park", False)
+            if not isinstance(park, bool):
+                return 400, {"error": "park must be a boolean"}
+            row = _connections.promote(parts[0], repo=repo, logs_dir=logs_dir, workspace=ws, vault=vault,
+                                       spawn=spawn, kill=kill, park=park)
+            return 200, {"connection": _connections.status_for(row, ws), "previous": row["previous"],
+                         "kept": row["kept"], "stopped_pid": row["stopped_pid"], "launch": row["launch"],
+                         "changed": row["changed"], "relaunch_needed": row["relaunch_needed"]}
+        if len(parts) == 2 and method == "POST" and parts[1] == "park":
+            row = _connections.park(parts[0], workspace=ws, kill=kill)
+            return 200, {"connection": _connections.status_for(row, ws), "stopped_pid": row["stopped_pid"]}
+        if len(parts) == 2 and method == "POST" and parts[1] == "unpark":
+            row = _connections.unpark(parts[0], repo=repo, logs_dir=logs_dir, workspace=ws, vault=vault, spawn=spawn)
+            return 200, {"connection": _connections.status_for(row, ws), "launch": row["launch"]}
         if len(parts) == 2 and method == "POST" and parts[1] == "disconnect":
             row = _connections.disconnect(parts[0], workspace=ws, kill=kill)
             return 200, {"connection": _connections.status_for(row, ws)}
@@ -1898,6 +1950,9 @@ if __name__ == "__main__":
         daemon=True,
     )
     workstream_maintenance.start()
+    # Rows imported from the environment name no agent until their own token is asked.
+    threading.Thread(target=_connections.run_identity_learner, args=(workstream_maintenance_stop, WORKSPACE_DIR),
+                     name="connections-identity", daemon=True).start()
     local_ip = _resolve_local_ip()
     print(f"Sutando Agent API → http://{bind}:{PORT}")
     print("  POST /task  — submit a task")

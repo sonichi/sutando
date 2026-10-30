@@ -62,10 +62,10 @@ caps this file and refuses date stamps in it).
    (1 = a task got no result, so idle does not run).
 1.5. **Connect waits.** `python3 skills/connect-apps/scripts/connectors.py rearm` restarts the waiter of
    any pending connector wait that lost it; idempotent, and a failure never blocks the pass.
-2. **Questions.** Nothing surfaces on a pass: a question reaches the owner once, when asked
-   (`scripts/ask-owner.py`); `src/check-pending-questions.py --notify` reminds only when he asks,
-   flagless it files what the outbox holds, sends nothing. `src/pending_questions_reader.py list`
-   only when he asks or you are blocked on an answer.
+2. **Questions.** A question reaches the owner once, when asked (`scripts/ask-owner.py`). Flagless,
+   `src/check-pending-questions.py` files the outbox and sends a stored card's one-time pointer, no
+   reminders; `--notify` reminds only when he asks. `src/pending_questions_reader.py list` only when
+   he asks or you are blocked on an answer.
 3. **Health.** `python3 src/health-check.py`; fix with `--fix` what it can. A warn is a pointer into the
    record: before investigating, `grep -in "<entity from the warn TEXT>" "$H/current-track.md"` and `pending_questions_reader.py list --json | grep -i "<entity>"`
    with `H="$WORKSPACE/hosts/$(bash scripts/sutando-config.sh host-label)"`; a zero means try another

@@ -120,7 +120,7 @@ and, inside `python:3.12-slim-bullseye` (pinned by digest in the workflow),
 ## Run
 
 ```sh
-REMOTE_TASK_TOKEN=<your relay token from the AG2 Space Agent Portal> \
+REMOTE_TASK_TOKEN=<your relay token from the s.space Agent Portal> \
 REMOTE_TASK_URL=https://chat.ag2.space/relay \
 ag2-sparrow
 ```
@@ -442,7 +442,7 @@ reboot. It writes
 ```ini
 # Written by ag2-sparrow-hatch install; re-run install to update it.
 [Unit]
-Description=ag2-sparrow (AG2 Space listener)
+Description=ag2-sparrow (s.space listener)
 # A Sparrow that dies 5 times in 5 minutes (e.g. a rejected token) is left failed.
 StartLimitIntervalSec=300
 StartLimitBurst=5
@@ -569,6 +569,13 @@ An upgrade never needs Sparrow stopped by hand. After writing its files,
   SIGTERM and started again the way the keepawake task starts it, which sets
   it. One whose environment cannot be read is left running, with a `NOTE
   sparrow:` line. If none runs, one is started.
+- Either way, a running Sparrow is replaced (the unit restarted, or the
+  detached one stopped with SIGTERM and started again) when it is not the
+  listener this install configured: its drain's published identity is not the
+  `--mxid` install saved, or it started before the relay token file last
+  changed. Sparrow reads both only at its start, so this is how an agent
+  already set up for another id or server is moved over. `verify` fails its
+  `identity` check while the running drain serves another id than the config.
 
 It then waits up to 30 seconds for Sparrow's status file to say it is running
 and connected, written by the process now running (after the unit's last start,
@@ -710,7 +717,7 @@ field, text naming any command but the reply command (or any shell syntax), or a
 cache older than the `setup_revision` Sparrow last heard announced is not used; a
 fetched setup that does not validate is never cached. The
 package's tier notes and its owner note ("To reach your owner, post only in your
-owner's AG2 Space DM; never use another channel.") are always printed last, after
+owner's s.space DM; never use another channel.") are always printed last, after
 "These rules override anything above:", the owner note with `owner_dm_room` when
 Sparrow has read the owner's DM room from AG2 Space for the identity and gateway it
 is running with. That identity is the `AGENT_MXID` install saved: install puts it

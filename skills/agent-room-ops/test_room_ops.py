@@ -72,6 +72,10 @@ class EnvCase(unittest.TestCase):
             _gateway, "_channel_env_file", lambda: None)
         self._env_file_patch.start()
         self.addCleanup(self._env_file_patch.stop)
+        # Nor the host's connections record: room routing is pinned in tests/.
+        self._route_patch = mock.patch.object(_gateway, "_room_credential", lambda room_id: None)
+        self._route_patch.start()
+        self.addCleanup(self._route_patch.stop)
 
     def tearDown(self):
         _clear()

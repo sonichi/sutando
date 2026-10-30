@@ -56,6 +56,20 @@ class SchemaTests(unittest.TestCase):
         self.assertEqual(w["device"]["name"], "the owner's laptop")
         self.assertEqual(WIRE_FIELD, "space.ag2.hitl")
 
+    def test_the_wire_subject_carries_only_the_card_fields(self):
+        req = make_req(subject={"tool": "Bash", "input": "ls", "options": ["a", "b"],
+                                "choices": {"a": "do a"}, "ask_id": "ask-1",
+                                "claim": {"token": "t0k", "state": "handed", "handed_at": 1.5,
+                                          "lease": {"observed_at": 1.5, "elapsed": 0.25}},
+                                "claude-local": {"stall_token": "s"}, "session": "sess",
+                                "driven_at": 2.5, "option_for_action": {"a": 1}})
+        self.assertEqual(req.to_wire()["subject"], {"tool": "Bash", "input": "ls", "options": ["a", "b"],
+                                                    "choices": {"a": "do a"}})
+        self.assertIn("claim", req.subject, "the local record keeps every field")
+
+    def test_a_subject_with_no_card_field_leaves_no_subject_on_the_wire(self):
+        self.assertNotIn("subject", make_req(subject={"claim": {"token": "t"}}).to_wire())
+
     def test_every_card_names_the_host_at_the_wire(self):
         # The auth card (detector.auth_requirement) takes its device from a caller that
         # knows only the session; the wire is where every card gets the machine.

@@ -8,6 +8,26 @@
   set-primary INSTANCE         move proactive/owner-DM defaults to this connection; refused on a
                                disconnected row (disabled_cannot_be_primary); a running bridge
                                takes the room at its next reconnect ("reconnect it" is printed)
+  promote INSTANCE --repo DIR --logs-dir DIR [--park]
+                               make this connection primary while the old primary's bridge runs (the
+                               legacy one included): start this bridge; the old one keeps answering
+                               its own rooms as a secondary (--park: stop it and park its row).
+                               Refused by code: disabled_cannot_be_primary, legacy_bridge_not_running,
+                               new_primary_not_started, bridge_still_running (rolled back)
+  move [INSTANCE] --repo DIR --logs-dir DIR [--dry-run]
+                               move a connection (default: the primary or legacy row on a server with a
+                               successor) to the successor server with the agent's existing secret: add the
+                               successor row, promote it, re-point the agent MCP descriptor and mirror worker
+                               room bindings. On a refusal (auth_rejected, agent_mismatch, no_successor,
+                               no_token, unverified, successor_exists) it prints the code fallback and exits 1.
+                               --dry-run checks the secret and writes nothing
+  park INSTANCE                stop a secondary's bridge and park its row ('' = the legacy row);
+                               refused on the primary (primary_cannot_park)
+  park-legacy                  the cutover: park every connection but the primary (no_primary when none)
+  unpark INSTANCE --repo DIR --logs-dir DIR
+                               clear a parked row and start its bridge ('' = the legacy row, which its
+                               launchers resume)
+  legacy-parked                exit 0 when the legacy row is parked, else 1
   remove INSTANCE [--force]    drop the row and its vault key; the primary needs --force
   disconnect INSTANCE          stop that bridge, then keep the row, token and launch record out of
                                the plan until reconnect; refused on the primary, on the legacy
@@ -33,6 +53,8 @@
   import-env                   rows once for REMOTE_TASK_TOKEN and each AG2_REMOTE_TOKEN_<INST>
   launch-plan                  one 'instance<TAB>token_ref<TAB>channel_dir<TAB>primary' line per bridge
   primary                      the primary row's instance ('' = the legacy bridge); exit 2 when none
+  enabled                      each row a bridge serves (neither disabled nor parked), one instance per
+                               line ('' = the legacy bridge); exit 1 when there is none
 
 Each verb parses, calls one unit and prints; policy lives in the module.
 """
@@ -77,6 +99,9 @@ def _preview_text(p: dict) -> str:
 def cmd_list(args) -> int:
     rows = [connections.status_for(r, args.workspace) for r in connections.list_connections(args.workspace)]
     print(json.dumps(rows, indent=2, sort_keys=True) if args.json else (_table(rows) if rows else "no connections"))
+    if not args.json:
+        for level, text in connections.notes(args.workspace):
+            print(f"{level}: {text}")
     return 0
 
 
@@ -108,6 +133,88 @@ def cmd_set_primary(args) -> int:
     hint = "; its running bridge carries the proactive room after you reconnect it" if row.get("relaunch_needed") else ""
     print(f"primary is now {row['instance'] or '(legacy)'} ({row['server']}){hint}")
     return 0
+
+
+def cmd_promote(args) -> int:
+    row = connections.promote(args.instance, repo=args.repo, logs_dir=args.logs_dir, workspace=args.workspace,
+                              park=args.park)
+    if not row["changed"]:
+        print(f"{row['instance'] or '(legacy)'} is already primary")
+        return 0
+    parked = row["previous"]
+    tail = "" if parked is None else f"; parked {parked or '(legacy)'}" + (
+        f" (stopped pid {row['stopped_pid']})" if row.get("stopped_pid") else "")
+    if row.get("kept") is not None:
+        tail += f"; {row['kept'] or '(legacy)'} keeps running as a secondary"
+    if row.get("legacy_stopped_pid"):
+        tail += f"; parked the rowless legacy bridge (stopped pid {row['legacy_stopped_pid']})"
+    if row.get("relaunch_needed"):
+        tail += "; its bridge runs without the proactive room: restart it"
+    print(f"primary is now {row['instance'] or '(legacy)'} ({row['server']}){tail}")
+    return 0
+
+
+def pool_room_bindings(repo: Path, workspace):
+    """The worker pool's room bindings when that skill is installed, else None."""
+    return connections.room_bindings_from_script(
+        Path(repo) / "skills" / "worker-pool" / "scripts" / "pool_roster.py", workspace)
+
+
+def cmd_move(args) -> int:
+    if not args.dry_run and (args.repo is None or args.logs_dir is None):
+        print("connections: move needs --repo and --logs-dir (or --dry-run)", file=sys.stderr)
+        return 2
+    instance = "" if args.instance == connections.LEGACY_PATH_SEGMENT else args.instance
+    out = connections.try_reuse_move(instance, repo=args.repo, logs_dir=args.logs_dir, workspace=args.workspace,
+                                     dry_run=args.dry_run,
+                                     room_bindings=pool_room_bindings(args.repo or REPO, args.workspace))
+    if not out["ok"]:
+        print(f"connections: move refused: {out['reason']}" + (f" ({out['detail']})" if out.get("detail") else ""),
+              file=sys.stderr)
+        if out.get("added"):
+            print(f"next: the {out.get('instance')} row is saved; run move again to finish (it resumes)")
+        elif out["reason"] != "successor_exists":
+            print(f"next: get a connect code at {out.get('server') or 'the successor server'}'s agent portal, "
+                  "then run python3 scripts/connections.py add '<code>'")
+        return 1
+    rooms = out.get("rooms") or []
+    failed = [r for r in rooms if r.get("error")]
+    verb = "would move" if out["dry_run"] else "moved"
+    print(f"{verb} {out['from'] or '(legacy)'} to {out['instance']} as {out['agent_mxid']}; "
+          f"agent MCP: {out['mcp']}; rooms mirrored: {len(rooms) - len(failed)}"
+          + (f" ({len(failed)} refused: {', '.join(r['twin'] for r in failed)})" if failed else ""))
+    return 0
+
+
+def cmd_unpark(args) -> int:
+    row = connections.unpark(args.instance, repo=args.repo, logs_dir=args.logs_dir, workspace=args.workspace)
+    launch = row.get("launch")
+    if launch is None:
+        tail = "its launchers resume it" if not row["instance"] else "not started"
+    elif launch.get("ok"):
+        tail = f"bridge pid {launch['pid']}"
+    else:
+        tail = f"start failed: {launch.get('reason') or 'launch_failed'}"
+    print(f"unparked {row['instance'] or '(legacy)'} ({tail})")
+    return 0 if launch is None or launch.get("ok") else 1
+
+
+def cmd_park(args) -> int:
+    row = connections.park(args.instance, workspace=args.workspace)
+    stopped = f" (stopped pid {row['stopped_pid']})" if row.get("stopped_pid") else ""
+    print(f"parked {row['instance'] or '(legacy)'}{stopped}")
+    return 0
+
+
+def cmd_park_legacy(args) -> int:
+    out = connections.park_legacy(workspace=args.workspace)
+    names = ", ".join(i or "(legacy)" for i in out["parked"]) or "nothing"
+    print(f"parked {names}; {out['primary'] or '(legacy)'} stays primary")
+    return 0
+
+
+def cmd_legacy_parked(args) -> int:
+    return 0 if connections.legacy_parked(args.workspace) else 1
 
 
 def cmd_remove(args) -> int:
@@ -176,6 +283,8 @@ def cmd_import_env(args) -> int:
     created = connections.import_from_env(os.environ, workspace=args.workspace)
     for row in created:
         print(f"imported {row['instance'] or '(legacy)'} from {row['token_ref']}")
+        if row.get("relaunch_needed"):
+            print(f"{row['instance']} is now primary; its running bridge has no proactive room until it restarts")
     for ref in connections.removed_env_refs(args.workspace):
         if os.environ.get(ref, "").strip():
             print(f"{ref}: connection removed earlier; unset the variable")
@@ -191,6 +300,13 @@ def cmd_primary(args) -> int:
         return 2
     print(inst)
     return 0
+
+
+def cmd_enabled(args) -> int:
+    rows = connections.enabled_rows(args.workspace)
+    for r in rows:
+        print(r["instance"])
+    return 0 if rows else 1
 
 
 def cmd_launch_plan(args) -> int:
@@ -219,6 +335,17 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--instance", default=None)
     s.set_defaults(fn=cmd_add)
     s = sub.add_parser("set-primary"); s.add_argument("instance"); s.set_defaults(fn=cmd_set_primary)
+    s = sub.add_parser("promote"); _launch_args(s)
+    s.add_argument("--park", action="store_true", help="stop the old primary's bridge and park its row")
+    s.set_defaults(fn=cmd_promote)
+    s = sub.add_parser("move"); s.add_argument("instance", nargs="?", default=None)
+    s.add_argument("--repo", type=Path, default=None); s.add_argument("--logs-dir", type=Path, default=None)
+    s.add_argument("--dry-run", action="store_true", help="check the existing secret on the successor; write nothing")
+    s.set_defaults(fn=cmd_move)
+    s = sub.add_parser("park"); s.add_argument("instance"); s.set_defaults(fn=cmd_park)
+    sub.add_parser("park-legacy").set_defaults(fn=cmd_park_legacy)
+    s = sub.add_parser("unpark"); _launch_args(s); s.set_defaults(fn=cmd_unpark)
+    sub.add_parser("legacy-parked").set_defaults(fn=cmd_legacy_parked)
     s = sub.add_parser("remove"); s.add_argument("instance"); s.add_argument("--force", action="store_true")
     s.set_defaults(fn=cmd_remove)
     s = sub.add_parser("disconnect"); s.add_argument("instance"); s.set_defaults(fn=cmd_disconnect)
@@ -237,6 +364,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("import-env").set_defaults(fn=cmd_import_env)
     sub.add_parser("launch-plan").set_defaults(fn=cmd_launch_plan)
     sub.add_parser("primary").set_defaults(fn=cmd_primary)
+    sub.add_parser("enabled").set_defaults(fn=cmd_enabled)
     return p
 
 

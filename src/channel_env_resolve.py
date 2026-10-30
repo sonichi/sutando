@@ -36,6 +36,7 @@ call it on any host without importing a stack.
 from __future__ import annotations
 
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -102,12 +103,73 @@ def resolve_channel_env(channels_dir, source: str) -> Path | None:
     return None
 
 
+LAUNCH_KEY_RE = re.compile(r"^\s*(AG2_REMOTE_TOKEN_[A-Za-z0-9_]+)=", re.M)
+
+
+def _has_launch_key(path: Path) -> bool:
+    try:
+        names = LAUNCH_KEY_RE.findall(path.read_text())
+    except (OSError, UnicodeDecodeError):
+        return False
+    return any(token_from_env_file(var, path) for var in names)
+
+
+def resolve_launch_key_env(channels_dir, source: str) -> Path | None:
+    """`resolve_channel_env`'s pick, else the first file in the same order and under the same
+    containment that holds a launch key: a host signed in only on a secondary homeserver writes
+    `AG2_REMOTE_TOKEN_<INST>` and no primary token."""
+    picked = resolve_channel_env(channels_dir, source)
+    if picked is not None:
+        return picked
+    named = (os.environ.get(DEVICE_ENV_VAR) or "").strip() if source == DEVICE_ENV_SOURCE else ""
+    if named and Path(named).is_file() and _has_launch_key(Path(named)):
+        return Path(named)
+    channel_dir = Path(channels_dir) / source
+    if not channel_dir.is_dir():
+        return None
+    for candidate in candidates(channel_dir):
+        if channel_env_is_contained(candidate, channels_dir, source) and _has_launch_key(candidate):
+            return candidate
+    return None
+
+
+def resolve_room_channel_env(channels_dir, source: str, room_id: str) -> Path | None:
+    """The env file for the connection that serves `room_id` (`connections.connection_for_room`):
+    a named row's own channel dir, the legacy row's AG2 Space channel, else `source` as before.
+    Raises `connections.NoConnectionForRoom` when that connection has no file here."""
+    import connections
+    row = connections.connection_for_room(room_id)
+    if row is None:
+        return resolve_channel_env(channels_dir, source)
+    if not row["instance"]:
+        return resolve_channel_env(channels_dir, DEVICE_ENV_SOURCE)
+    channel_dir = connections.channel_dir_for(row["instance"])
+    picked = resolve_channel_env(channels_dir, channel_dir)
+    if picked is None:
+        raise connections.NoConnectionForRoom(
+            f"connection {row['instance']} for server {row['server']} has no env file under "
+            f"{channels_dir}/{channel_dir}; room_ops.py resolves its token by room itself")
+    return picked
+
+
 def main(argv: list[str]) -> int:
-    if len(argv) != 3:
-        print("usage: channel_env_resolve.py <channels-dir> <source>", file=sys.stderr)
+    args = argv[1:]
+    room = ""
+    if len(args) == 4 and args[2] == "--room":
+        room, args = args[3], args[:2]
+    if len(args) != 2:
+        print("usage: channel_env_resolve.py <channels-dir> <source> [--room <room-id>]", file=sys.stderr)
         return 2
-    channels_dir, source = argv[1], argv[2]
-    resolved = resolve_channel_env(channels_dir, source)
+    channels_dir, source = args
+    if room:
+        import connections
+        try:
+            resolved = resolve_room_channel_env(channels_dir, source, room)
+        except connections.ConnectionsError as e:
+            print(f"channel-env: {e}", file=sys.stderr)
+            return 1
+    else:
+        resolved = resolve_channel_env(channels_dir, source)
     if resolved is None and not os.path.isdir(os.path.join(channels_dir, source)):
         print(f"channel-env: no channel dir {os.path.join(channels_dir, source)}", file=sys.stderr)
         return 1
