@@ -569,9 +569,10 @@ const startupContext = () => item('message', '2026-10-06T02:57:50.100Z', {role: 
 ]});
 
 test('real CLI first-turn metadata before context never replaces the authoritative prompt', () => {
-  const first = [receiptStart()[0], startupContext(), receiptStart()[1], userInput()];
+  const prompt = execFileSync(PY, [REPO + 'src/delivery/codex_recovery.py', 'prompt']).toString().replace(/\n$/, '');
+  const first = [receiptStart()[0], startupContext(), receiptStart()[1], userInput(prompt)];
   const succeeded = receiptRecord(run([...first, ...receiptEnd()]));
-  assert.equal(succeeded.completed_task.prompt_sha256, crypto.createHash('sha256').update('synthetic task prompt').digest('hex'));
+  assert.equal(succeeded.completed_task.prompt_sha256, crypto.createHash('sha256').update(prompt).digest('hex'));
   assert.equal(succeeded.last_completed_at, succeeded.completed_task.completed_at);
   const failed = receiptRecord(run([...first, ev('task_complete', {turn_id: 'turn-a',
     error: {codex_error_info: 'server_overloaded'}}, '2026-10-06T02:57:53.000Z')]));

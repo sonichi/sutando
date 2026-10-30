@@ -583,7 +583,7 @@ if [ "${1:-}" = print ]; then [ -f "$LAUNCHCTL_STATE" ]; else exit 0; fi
         calls = self._assert_no_schedule_reconcile(env_extra={"TMUX_ACTIVE_RUNTIME": "codex"})
         self.assertNotIn("new-session -d -s sutando-core ", calls)
         self.assertNotIn("kill-session", calls)
-        self.assertNotIn("Sutando managed liveness check.", calls)
+        self.assertNotIn("Reply exactly READY. Do not use tools.", calls)
 
     def test_direct_codex_launcher_honors_no_schedule_reconcile(self):
         self._assert_no_schedule_reconcile(launcher="src/agent/codex/cli/start-cli.sh")
@@ -677,7 +677,7 @@ if [ "${1:-}" = print ]; then [ -f "$LAUNCHCTL_STATE" ]; else exit 0; fi
         self.assertIn("--search", calls)
         self.assertIn("-c check_for_update_on_startup=false", calls)
         self.assertIn("-m gpt-test", calls)
-        self.assertIn("Sutando managed liveness check. Reply exactly READY.", calls)
+        self.assertIn("Reply exactly READY. Do not use tools.", calls)
         self.assertIn("new-session -d -s sutando-core-watcher", calls)
         self.assertIn("task-notifier-supervisor.sh", calls)
         self.assertIn("SUTANDO_NOTIFIER_VERSION=", calls)
@@ -980,7 +980,7 @@ if [ "${1:-}" = print ]; then [ -f "$LAUNCHCTL_STATE" ]; else exit 0; fi
         result = self.run_launcher(env_extra={"TMUX_ACTIVE_RUNTIME": "codex"})
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("already running (codex)", result.stdout)
-        self.assertNotIn("Sutando managed liveness check", self._tmux_calls())
+        self.assertNotIn("Reply exactly READY. Do not use tools.", self._tmux_calls())
 
     def test_restart_with_unreadable_panes_falls_back_to_the_session(self):
         result = self.run_launcher("--restart", env_extra={"TMUX_ACTIVE_RUNTIME": "codex", "FAKE_PANES_UNREADABLE": "1"})

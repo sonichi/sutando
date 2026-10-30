@@ -52,6 +52,39 @@ class RecoveryTests(unittest.TestCase):
     def attempt(self):
         return recovery.recover(self.ws, "core", INCARNATION, "socket", "%7", now=self.now)
 
+    def test_short_probe_and_colored_footer_send_once_through_production_guard(self):
+        footer = "  \x1b[38;5;223mgpt-test default\x1b[39m · /tmp/test…  ⚠ 2 warnings · f2 to view"
+        self.assertLessEqual(len(recovery.BOOTSTRAP_PROMPT) + 2, 80)
+        self.capture.side_effect = ["›\n" + footer,
+                                   "\x1b[1m›\x1b[0m " + recovery.BOOTSTRAP_PROMPT + "\n\n" + footer]
+        self.assertTrue(self.attempt())
+        self.assertFalse(self.attempt())
+        self.assertEqual([call.args[-1] for call in self.send.call_args_list],
+                         [recovery.BOOTSTRAP_PROMPT, "C-m"])
+
+    def test_ambiguous_or_extra_composer_input_spends_claim_without_enter(self):
+        prompt = recovery.BOOTSTRAP_PROMPT
+        footer = "  \x1b[38;5;223mgpt-test default\x1b[39m · /tmp/test…  ⚠ 2 warnings · f2 to view"
+        bodies = [prompt + " extra", prompt + " ", prompt + "\t", prompt + "\r",
+                  prompt + "\v", prompt + "\x1b[2J", prompt + "\x1b[2m extra\x1b[0m",
+                  prompt + "\n  user text", prompt + "\n\n",
+                  prompt + "\n" + footer, prompt + "\n  ⚠ 2 warnings · f2 to view",
+                  "Sutando managed liveness check. Reply exactly READY. Do not use tools, read\n"
+                  "  or write files, or send messages."]
+        captures = ["› " + body + "\n\n" + footer for body in bodies]
+        captures += ["› " + prompt, "› " + prompt + "\n  unknown status"]
+        for capture in captures:
+            with self.subTest(capture=capture), tempfile.TemporaryDirectory() as directory:
+                workspace = Path(directory)
+                write(self.record, workspace)
+                self.capture.side_effect = ["›\n" + footer, capture]
+                self.send.reset_mock()
+                self.assertFalse(recovery.recover(workspace, "core", INCARNATION, "socket", "%7", self.now))
+                self.assertEqual([call.args[-1] for call in self.send.call_args_list], [prompt])
+                self.assertTrue((workspace / "state/codex-recovery.json").is_file())
+                self.assertFalse(recovery.recover(workspace, "core", INCARNATION, "socket", "%7", self.now))
+                self.assertEqual(self.send.call_count, 1)
+
     def test_terminal_error_allows_only_one_probe_and_never_grants_ready(self):
         self.assertFalse(ready(self.ws, "core", INCARNATION, now=self.now))
         self.assertTrue(self.attempt())

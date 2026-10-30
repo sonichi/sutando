@@ -208,6 +208,7 @@ class RuntimeAdapter:
     automation_leftovers: Tuple[str, ...] = ()
     # The runtime's dispatcher waits for idle-ready, so a draft holds every queued task.
     pending_blocks_dispatch: bool = False
+    composer_requires_single_line: bool = False
 
 
 CLAUDE = RuntimeAdapter(
@@ -229,6 +230,7 @@ CODEX = RuntimeAdapter(
     # Codex rejects Claude's /startup and leaves it in the composer.
     automation_leftovers=("/startup",),
     pending_blocks_dispatch=True,
+    composer_requires_single_line=True,
 )
 ADAPTERS = {CLAUDE.name: CLAUDE, CODEX.name: CODEX}
 
@@ -354,6 +356,7 @@ def composer_text(capture: str, adapter: RuntimeAdapter = CLAUDE) -> Optional[st
     EXACT-equality staging checks -- core-input-watch.py's `_composer_text`
     aliases this rather than re-deriving it.
 
+    Single-line adapters require a visible footer and preserve all typed bytes.
     From the bottommost prompt line to the end of the capture. Below an editable
     composer the CLI renders its own frame -- box rule(s), at most one idle-footer
     row, at most one hint/tip row -- so the strip removes exactly those, once each,
@@ -362,6 +365,28 @@ def composer_text(capture: str, adapter: RuntimeAdapter = CLAUDE) -> Optional[st
     LAST matching row of each kind is ever popped, and never a second time. The cut
     at the closing rule follows the same rule: the LAST rule row, never an interior one.
     """
+    if adapter.composer_requires_single_line:
+        rows = capture.split("\n")
+        start = next((i for i in range(len(rows) - 1, -1, -1)
+                      if _prompt_glyph(rows[i], adapter) is not None), None)
+        footer = next((i for i in range(len(rows) - 1, -1, -1) if rows[i].strip()), None)
+        if (start is None or footer is None or footer <= start
+                or not adapter.idle_ready.search(_SGR.sub("", rows[footer]))):
+            return None
+        block = rows[start:footer]
+        if len(block) > 1 and block[-1] == "":
+            block.pop()
+        if len(block) != 1:
+            return None
+        glyph = _prompt_glyph(block[0], adapter)
+        raw = block[0][block[0].find(glyph) + len(glyph):]
+        ghostless, ghosts = _GHOST.subn("", raw)
+        if ghosts and _SGR.sub("", ghostless) in ("", " ", "\u00a0"):
+            return ""
+        while _SGR.match(raw):
+            raw = raw[_SGR.match(raw).end():]
+        text = raw[1:] if raw[:1] in (" ", "\u00a0") else raw
+        return None if re.search(r"[\x00-\x1f\x7f]", text) else text
     lines = [ln for ln in capture.splitlines() if ln.strip()]
     start = None
     for i in range(len(lines) - 1, -1, -1):

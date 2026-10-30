@@ -141,6 +141,9 @@ keystroke outcomes. A failed probe therefore cannot loop requests. Login, quota,
 unclassified API errors, aborted turns, incomplete history and unresolved submitted
 tasks require explicit recovery or disposition. They remain queued without replay.
 Pre-admission refusals are deduplicated in local diagnostics and reported by health.
+The fixed tool-free READY check fits a normal 80-column pane. Recovery requires
+one fully visible composer row and a recognized footer; wrapped or ambiguous drafts
+are refused without folding whitespace.
 If a recovery paste leaves a READY check draft or the staged text does not match,
 the claim remains spent. Inspect the pane and manually clear only the draft you
 recognize; automation never clears an unknown human composer to retry recovery.

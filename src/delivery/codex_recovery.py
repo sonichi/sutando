@@ -17,7 +17,7 @@ from file_lock import locked_file
 from runtime_observation import load
 from workspace_default import write_status
 
-BOOTSTRAP_PROMPT = "Sutando managed liveness check. Reply exactly READY. Do not use tools, read or write files, or send messages."
+BOOTSTRAP_PROMPT = "Reply exactly READY. Do not use tools."
 BACKOFF_S = 30
 
 
