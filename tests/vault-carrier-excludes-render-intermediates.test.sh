@@ -319,6 +319,51 @@ check "...the real generate_exclude accepts the refresh (rc=0)" \
 check "...and both carve-outs are now present (migration actually reaches it)" \
     test "$(carveouts_in "$UPG")" -eq 4
 
+# An OWNED BUILT-IN deny (not a vault.sync.exclude carve-out) must migrate too, or
+# an upgraded workspace stages the crash temp the rule exists to keep out.
+BI_RULE='hosts/*/build_log.md.snap.??????'
+builtin_in() { grep -cxF "$BI_RULE" "$1/.git/info/exclude" || true; }
+
+check "the composer emits the owned built-in deny (fixture is representative)" \
+    test "$(compose_rules | grep -cxF "$BI_RULE")" -eq 1
+
+UPG_BI="$TEST_ROOT/upgrade-builtin-deny"
+seed_older_install "$UPG_BI" "$BI_RULE"
+check "an older GENERATED install starts without the owned built-in deny" \
+    test "$(builtin_in "$UPG_BI")" -eq 0
+check "...the real generate_exclude ACCEPTS the refresh (rc=0)" \
+    test "$(upgrade_rc "$UPG_BI")" -eq 0
+check "...and the built-in deny is now present (migration actually reaches it)" \
+    test "$(builtin_in "$UPG_BI")" -eq 1
+
+# The rule landing is not the point; NOT STAGING the temp is. Drive the real
+# generate_exclude in a real repo, then the real `git add -A`.
+STG="$TEST_ROOT/upgrade-builtin-staging"
+seed_older_install "$STG" "$BI_RULE"
+git init -q "$STG"
+mkdir -p "$STG/hosts/H"
+printf 'log\n'  > "$STG/hosts/H/build_log.md"
+printf 'temp\n' > "$STG/hosts/H/build_log.md.snap.AB12cd"
+check "before migration the crash temp IS staged (the defect being fixed)" \
+    test "$( (cd "$STG" && git add -A >/dev/null 2>&1; git -C "$STG" ls-files --cached hosts/H/build_log.md.snap.AB12cd | wc -l) )" -eq 1
+git -C "$STG" rm -q --cached -r . >/dev/null 2>&1 || true
+# Bare call: under `set -e` a refusing generate_exclude would abort the suite and
+# silently skip the two assertions below — the ones that actually discriminate.
+upgrade_rc "$STG" >/dev/null || true
+check "after migration a real git add -A does NOT stage the crash temp" \
+    test "$( (cd "$STG" && git add -A >/dev/null 2>&1; git -C "$STG" ls-files --cached hosts/H/build_log.md.snap.AB12cd | wc -l) )" -eq 0
+check "control: ...while the real build_log beside it IS still staged" \
+    test "$(git -C "$STG" ls-files --cached hosts/H/build_log.md | wc -l)" -eq 1
+
+# Control: widening to built-ins must not weaken the operator guard.
+UPG_BI_OP="$TEST_ROOT/upgrade-builtin-operator-edited"
+seed_older_install "$UPG_BI_OP" "$BI_RULE"
+echo '!operator/keeps/this' >> "$UPG_BI_OP/.git/info/exclude"
+check "control: an operator-edited file is STILL refused even for a built-in (rc=1)" \
+    test "$(upgrade_rc "$UPG_BI_OP")" -eq 1
+check "control: ...and the built-in was not force-added behind the refusal" \
+    test "$(builtin_in "$UPG_BI_OP")" -eq 0
+
 UPG_OP="$TEST_ROOT/upgrade-operator-edited"
 seed_older_install "$UPG_OP" 'notes/generated/' 'notes/media/'
 echo '!my/operator/rule' >> "$UPG_OP/.git/info/exclude"
@@ -345,6 +390,41 @@ check "comment-only drift does not block the refresh (rc=0)" \
     test "$(upgrade_rc "$UPG_CMT")" -eq 0
 check "...and the carve-outs landed despite the stale comment" \
     test "$(carveouts_in "$UPG_CMT")" -eq 4
+check "...and the operator's comment SURVIVES the refresh (preserved, not dropped)" \
+    grep -qxF '# an older header line that no longer ships' "$UPG_CMT/.git/info/exclude"
+
+# Acceptance case: the owned deny must LAND while an operator comment beside it
+# SURVIVES. Refusing the refresh preserved the comment but left the deny out.
+UPG_BOTH="$TEST_ROOT/upgrade-deny-and-comment"
+seed_older_install "$UPG_BOTH" 'notes/generated/' 'notes/media/'
+grep -vxF "$BI_RULE" "$UPG_BOTH/.git/info/exclude" > "$UPG_BOTH/.git/info/exclude.t" &&
+    mv "$UPG_BOTH/.git/info/exclude.t" "$UPG_BOTH/.git/info/exclude"
+printf '# why we keep notes/raw: it is my scratch area\n' >> "$UPG_BOTH/.git/info/exclude"
+check "deny+comment: the refresh is allowed (rc=0)" \
+    test "$(upgrade_rc "$UPG_BOTH")" -eq 0
+check "...the owned deny LANDS" \
+    test "$(builtin_in "$UPG_BOTH")" -eq 1
+check "...and the operator's comment survives beside it" \
+    grep -qxF '# why we keep notes/raw: it is my scratch area' "$UPG_BOTH/.git/info/exclude"
+
+# Idempotency: the preserved section is OURS, so two consecutive runs on the settled
+# file must be byte-identical, or the exclude grows every sync.
+_idem_before="$(cat "$UPG_BOTH/.git/info/exclude")"
+upgrade_rc "$UPG_BOTH" > /dev/null
+_idem_after="$(cat "$UPG_BOTH/.git/info/exclude")"
+check "idempotent: a second tick leaves the file byte-identical" \
+    test "$_idem_before" = "$_idem_after"
+check "...exactly ONE preserved marker, not one per tick" \
+    test "$(grep -cxF '# --- preserved from the previous exclude (sync-workspace) ---' \
+        "$UPG_BOTH/.git/info/exclude")" -eq 1
+upgrade_rc "$UPG_BOTH" > /dev/null
+upgrade_rc "$UPG_BOTH" > /dev/null
+check "...still one marker after four ticks total" \
+    test "$(grep -cxF '# --- preserved from the previous exclude (sync-workspace) ---' \
+        "$UPG_BOTH/.git/info/exclude")" -eq 1
+check "...and the operator note is still a single copy" \
+    test "$(grep -cxF '# why we keep notes/raw: it is my scratch area' \
+        "$UPG_BOTH/.git/info/exclude")" -eq 1
 
 check "the refusal chain consults the carve-out recognizer" \
     grep -qF '_is_safe_carveout_addition "$exclude_path" "$tmp_path"' <<< "$SYNC_CODE"
@@ -392,6 +472,35 @@ check "the carve-out recognizer runs on the WIDENED content" \
 check "the widened temp file is removed on every return path" \
     test "$(grep -c 'rm -f "$widened"' <<< "$SYNC_CODE")" -ge 2
 
+
+# An operator-edited exclude may predate the built-in denies; the guard (loaded from the script, a
+# missing one leaves the stub that keeps nothing out) must still keep the temps out after git add -A.
+_unstage_reserved_temps() { :; }
+eval "$(sed -n '/^_unstage_reserved_temps() {/,/^}$/p' "$SYNC_SH")"
+log() { :; }
+OPS="$TEST_ROOT/operator-rule-staging"
+seed_older_install "$OPS" "$BI_RULE" 'hosts/*/.build_log.snapshot-sha.repair.??????'
+echo '!my/operator/rule' >> "$OPS/.git/info/exclude"
+git init -q "$OPS"
+mkdir -p "$OPS/hosts/H"
+printf 'log\n'  > "$OPS/hosts/H/build_log.md"
+printf 'temp\n' > "$OPS/hosts/H/build_log.md.snap.AB12cd"
+printf 'sha\n'  > "$OPS/hosts/H/.build_log.snapshot-sha.repair.CD34ef"
+upgrade_rc "$OPS" >/dev/null || true
+check "operator-edited: the refresh is refused, so the built-in deny never lands (the exposure)" \
+    test "$(builtin_in "$OPS")" -eq 0
+(cd "$OPS" && git add -A >/dev/null 2>&1) || true
+check "operator-edited: a real git add -A stages BOTH reserved temps (the defect)" \
+    test "$(git -C "$OPS" ls-files --cached -- hosts/H/build_log.md.snap.AB12cd hosts/H/.build_log.snapshot-sha.repair.CD34ef | wc -l | tr -d ' ')" -eq 2
+(cd "$OPS" && _unstage_reserved_temps) || true
+check "...the push-path guard keeps both out of the index regardless of the exclude file" \
+    test "$(git -C "$OPS" ls-files --cached -- hosts/H/build_log.md.snap.AB12cd hosts/H/.build_log.snapshot-sha.repair.CD34ef | wc -l | tr -d ' ')" -eq 0
+check "...while the real build_log beside them stays staged" \
+    test "$(git -C "$OPS" ls-files --cached hosts/H/build_log.md | wc -l | tr -d ' ')" -eq 1
+check "...and the guard runs in the push path right after git add -A" \
+    bash -c 'grep -A1 -E "^    git add -A$" <<< "$1" | grep -q "_unstage_reserved_temps"' _ "$SYNC_CODE"
+check "...and after every staging site: push (git add -A), init (git add -A || true), pre-pull (git add --ignore-removal .)" \
+    test "$(grep -A1 -E '^    git add (-A|--ignore-removal \.)( 2>/dev/null \|\| true)?$' <<< "$SYNC_CODE" | grep -c '_unstage_reserved_temps')" -eq 3
 echo
 echo "Total: $((pass + fail)) — pass: $pass, fail: $fail"
 [ "$fail" -eq 0 ]
