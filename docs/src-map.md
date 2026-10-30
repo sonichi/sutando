@@ -128,6 +128,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`install-health-check-launchd.sh`** — Install / uninstall the launchd-supervised health-check FALLBACK job.
 - **`install-sutando-app-launchd.sh`** — Install / uninstall / check the launchd-supervised Sutando.app job.
 - **`lane_dedupe.py`** — Cross-lane duplicate guard: one room message becomes one task, answered by its owner lane when known.
+- **`launch_hooks.py`** — Launch hooks: the scripts installed skills declare with the manifest field `on_launch`, each started once per core launch, detached, so no launch waits on or fails because of one.
 - **`live-agent-runtime.ts`** — LiveAgentRuntime — step 5a-2 of the interaction-planes refactor.
 - **`local_api_gate.py`** — The one gate for the loopback HTTP services' privileged routes.
 - **`local_record.py`** — Local JSON records: one object per file under a directory, each written whole in one rename and read back only when its file name is a safe single path segment that the record itself names.

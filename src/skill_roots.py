@@ -41,9 +41,10 @@ def skill_roots(workspace=None) -> list:
     return roots
 
 
-def declared_scripts(field: str, roots) -> list:
+def declared_scripts(field: str, roots, suffixes=None) -> list:
     """(skill name, script) per enabled manifest under `roots` declaring `field` with a script that
-    resolves inside its skill. `roots`: one directory or several."""
+    resolves inside its skill, and ends in one of `suffixes` when given. `roots`: one directory or
+    several. A declaration that cannot be resolved is skipped; the others still count."""
     dirs = [Path(roots)] if isinstance(roots, (str, Path)) else [Path(d) for d in roots]
     out: list = []
     seen: set = set()
@@ -60,9 +61,15 @@ def declared_scripts(field: str, roots) -> list:
             rel = data.get(field) if isinstance(data, dict) else None
             if not isinstance(rel, str) or not rel or data.get("enabled") is False:
                 continue
-            skill = manifest.parent.resolve()
-            script = (skill / rel).resolve()
-            if script.is_relative_to(skill) and script.is_file():
+            if suffixes is not None and not rel.endswith(tuple(suffixes)):
+                continue
+            try:
+                skill = manifest.parent.resolve()
+                script = (skill / rel).resolve()
+                ok = script.is_relative_to(skill) and script.is_file()
+            except (OSError, ValueError):  # a NUL byte, an overlong path: this manifest only
+                continue
+            if ok:
                 out.append((name, script))
     return out
 
