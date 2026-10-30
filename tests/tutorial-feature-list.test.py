@@ -108,6 +108,11 @@ OLD_LIST = tp.FeatureList(tp.FEATURES.revision,
                           tuple(as_shots(s) for s in OLD_SECTIONS) + (OLD_IMPORT_SECTION._replace(runtime="claude"),))
 MXC_OF = {name: f"mxc://ag2.example/{i:02d}{name.replace('-', '')}" for i, name in enumerate(tp.asset_names(tp.FEATURES))}
 
+# The rendered content each shipped revision was cut with. A change to a rendered field fails
+# test_a_rendered_change_needs_a_revision_bump until `revision` is bumped and its key added here.
+RENDERED_AT = {
+    "tutorial.2026-10-23.1": "3b15c27a9160728fa8c3bd1da5693cdd5ec81d16064ada057888b7781dec32d8",
+}
 STEP_IDS = ["dm", "rooms", "commons", "agents", "teamwork", "calls", "apps", "activity", "mobile", "import"]
 ASSET_CAP = 60_000
 PAGE_CAP = 300_000
@@ -283,6 +288,22 @@ class ListTest(unittest.TestCase):
         self.assertEqual(tp.parse_list(good_list(reviewed_at="v0.14.0")).revision, tp.FEATURES.revision)
         for bad in ("v0.14.0-rc.1", "0.14.0", "v0.14", 14):
             self.refuse(good_list(reviewed_at=bad), "reviewed_at")
+
+    def test_a_rendered_change_needs_a_revision_bump(self):
+        self.assertIn(tp.FEATURES.revision, RENDERED_AT, "a new revision: add its content_key to RENDERED_AT")
+        self.assertEqual(tp.content_key(tp.FEATURES), RENDERED_AT[tp.FEATURES.revision],
+                         "a rendered field changed: bump revision and add its content_key to RENDERED_AT")
+
+    def test_release_metadata_is_not_rendered_content(self):
+        key = tp.content_key(tp.FEATURES)
+        self.assertEqual(tp.content_key(tp.parse_list(with_step(watches=["src/"]))), key)
+        self.assertEqual(tp.content_key(tp.parse_list(good_list(reviewed_at="v9.9.9"))), key)
+        for change in ({"title": "Your inbox"}, {"body": ["What.", "How."]}, {"paste": "Hi"},
+                       {"surface": "room"}, {"since_release": "2026-11-01"}, {"runtime": "codex"},
+                       {"screenshot": [{"asset": "x", "fallback_file": "assets/room-list-add.jpg", "alt": "a"}]}):
+            self.assertNotEqual(tp.content_key(tp.parse_list(with_step(**change))), key, change)
+        page = tp.render_page("Blue", "claude")
+        self.assertEqual(tp.render_page("Blue", "claude", features=tp.parse_list(with_step(watches=["src/"]))), page)
 
     def test_every_shipped_watch_exists_in_the_repo(self):
         repo = tp.LIST_PATH.parents[2]

@@ -296,6 +296,12 @@ def parse_list(data: object, assets: Optional[Path] = None) -> FeatureList:
     return FeatureList(revision, steps)
 
 
+def content_key(features: FeatureList) -> str:
+    """sha256 of the fields the page renders; release metadata (`watches`, `reviewed_at`) is left
+    out, so a change to it needs no revision bump and rebuilds no page."""
+    rendered = [s._replace(watches=()) for s in features.steps]
+    return hashlib.sha256(json.dumps(rendered, sort_keys=True).encode("utf-8")).hexdigest()
+
 def read_regular(path: Path, cap: int, what: str = "file") -> bytes:
     """At most `cap` bytes of a regular file, from one descriptor opened without blocking (a
     writer-less FIFO would hang a plain open) and checked before the read, so no special file

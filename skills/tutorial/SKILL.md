@@ -213,17 +213,20 @@ so one validated format can serve both:
   single asset name is a list here because a step carries up to three crops.
 - `since_release`: the release date (`YYYY-MM-DD`) that introduced the feature.
 - `runtime` (optional): `claude` or `codex`; the step appears on that core only.
-- `watches` (optional): repo-relative paths (a trailing `/` means a directory) whose change can
+- `watches` (optional, release metadata): repo-relative paths (a trailing `/` means a directory) whose change can
   make the step out of date, at most 16. Point them at the engine code the step shows (a skill
   directory, say). Leave them off a step that shows only the desktop client, which lives in
   another repo. A step without watches never triggers the release warning below.
-- `reviewed_at` (optional, top level): the plain release tag (`vX.Y.Z`) at which the release
+- `reviewed_at` (optional, top level, release metadata): the plain release tag (`vX.Y.Z`) at which the release
   curator checked the tour and found it unaffected.
 - `title` and both `body` parts are plain text: no `<` or `>` (write entities such as `&rarr;`),
   and `{name}` is the only placeholder (a literal brace is `{{` or `}}`); all three render the
   same way. A list, file or URL, is at most 1 MiB.
-- `revision`: `tutorial.YYYY-MM-DD.N`. Any change to the list bumps it; two revisions order by
-  date, then N.
+- `revision`: `tutorial.YYYY-MM-DD.N`. Any change to a rendered field bumps it; two revisions
+  order by date, then N. `watches` and `reviewed_at` are release metadata: the page never shows
+  them, so changing them needs no bump and rebuilds no page. `content_key` hashes the rendered
+  fields, and the tutorial tests pin it per revision in `RENDERED_AT`, so a rendered change
+  without a bump fails.
 
 Workflow when the client changes or a release adds a feature: edit `feature-list.json` (text,
 `paste`, `screenshot` crops), bump `revision`, run the tutorial tests (they validate the list and
