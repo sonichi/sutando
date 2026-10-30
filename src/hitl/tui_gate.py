@@ -21,7 +21,7 @@ SEMANTIC_GATES = frozenset({"permission", "selection", "press-enter", "login"})
 _NEVER_ONE_CLICK = re.compile(r"trust the files|Do you trust|Bypass Permissions|Yes, I accept|"
                               r"Fable limit|usage credits|hit your (?:session|usage|weekly) limit", re.I)
 _OPTION = re.compile(r"^\s*(❯)?\s*(\d+)\.\s+(.*\S)\s*$")
-_FRAME = re.compile(r"^[\s─━│┃┌┐└┘╭╮╰╯├┤┬┴┼═║╔╗╚╝]*$")
+_FRAME = re.compile(r"^[\s─━│┃┌┐└┘╭╮╰╯├┤┬┴┼═║╔╗╚╝╌╍┄┅┈┉]*$")
 _EDGE = frozenset("─━═╭┌╔")  # a rule or a box top: where a dialog starts
 _HINT = re.compile(r"Esc to cancel|Enter to (confirm|select)|↑/↓|shift\+tab|Tab to", re.I)
 _FOOTER = re.compile(r"^⏵|←\s*for agents|esc to interrupt|\? for shortcuts", re.I)
@@ -181,8 +181,9 @@ def requirement_for(state: str, gate: Optional[str], prompt: Optional[str],
         kind, title = "confirmation", "Agent needs your confirmation"
         message = question(prompt, detail)
         actions = [Action(id="continue", kind="continue", label="Continue")]
-    elif options:
+    elif options and caret is not None:
         # Kind follows the OPTIONS: classify() names a Yes/No dialog `selection`.
+        # No caret means keys_for can never answer it, so a button would only go stale.
         yes = next((i for i, o in enumerate(options) if _YES.match(o)), None)
         no = next((i for i, o in enumerate(options) if _NO.match(o)), None)
         message = question(prompt, detail)

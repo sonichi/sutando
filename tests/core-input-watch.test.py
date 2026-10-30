@@ -1465,6 +1465,50 @@ class TestSendKeys(unittest.TestCase):
             self.assertFalse(_mod.send_keys("/tmp/x.sock", "sutando-core", "Enter"))
 
 
+class TestStyledPermissionCaretRow(unittest.TestCase):
+    """Claude Code 2.1 styles the selected option's number grey (SGR 38;5;246): the caret
+    row must stay dialog evidence, or the card loses its Yes button and every click goes stale."""
+
+    # The bottom of a real capture-pane -e frame of a Bash permission dialog.
+    STYLED = (
+        " Bash command\n"
+        "\x1b[38;5;246m Run the specified bash command\x1b[39m\n"
+        "\x1b[38;5;246m" + "╌" * 60 + "\x1b[39m\n"
+        " sh -c 'for f in ./x; do rm \"$f\"; done'\n"
+        "\x1b[38;5;246m" + "╌" * 60 + "\x1b[39m\n"
+        " This command requires approval\n"
+        "\n"
+        " Do you want to proceed?\n"
+        " \x1b[38;5;153m❯\x1b[39m \x1b[38;5;246m1. \x1b[38;5;153mYes\x1b[39m\n"
+        "   \x1b[38;5;246m2. \x1b[39mYes, and don’t ask again for: sh -c 'for f in ./x; do rm \"$f\"; done'\n"
+        "   \x1b[38;5;246m3. \x1b[39mNo\n"
+        "\n"
+        " \x1b[38;5;246mEsc to cancel · Tab to amend\x1b[39m\n")
+
+    def _card(self):
+        from hitl import tui_gate
+        plain = _mod._ANSI_SGR.sub("", self.STYLED)
+        state, detail, prompt, kind = compose_state(plain, "idle", True, styled_pane=self.STYLED)
+        self.assertEqual(state, "blocked-human")
+        self.assertIn("❯ 1. Yes", prompt)
+        return tui_gate, prompt, state, tui_gate.requirement_for(
+            state, kind, prompt, "s", detail, "fallback")
+
+    def test_the_card_offers_yes_and_no(self):
+        _, _, _, req = self._card()
+        self.assertEqual(req.kind, "permission")
+        self.assertEqual([a.label for a in req.actions], ["No", "Yes", "Open terminal"])
+        self.assertNotIn("╌", req.message)
+        self.assertIn("This command requires approval Do you want to proceed?", req.message)
+
+    def test_yes_is_typed_into_the_dialog_on_screen(self):
+        tui_gate, prompt, state, req = self._card()
+        req.chosen_action = "allow"
+        self.assertEqual(tui_gate.keys_for(req, prompt, state), ["Enter"])
+        req.chosen_action = "deny"
+        self.assertEqual(tui_gate.keys_for(req, prompt, state), ["Down", "Down", "Enter"])
+
+
 class TestEnsureTmuxOnPath(unittest.TestCase):
     """Mini-verified 2026-07-14: a detached spawn without Homebrew on PATH made bare
     `tmux` fail → healthy core mis-read as crashed. The monitor must self-heal PATH."""

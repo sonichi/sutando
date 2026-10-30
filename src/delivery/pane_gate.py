@@ -435,7 +435,8 @@ def gate_evidence(tail: str, styled_tail: Optional[str] = None,
         signatures = any(rx.search(row) for _, rx in adapter.gate_signatures)
         if adapter.idle_ready.search(row) and not signatures:
             continue
-        if i == composer_i and line and line.placeholder and not line.text.strip():
+        # A dialog's caret row styles its option number grey, which reads as a ghost composer.
+        if i == composer_i and line and line.placeholder and not line.text.strip() and not signatures:
             continue
         # A marker alone cannot distinguish a live instruction from completed output.
         if (completed and i < composer_i and not signatures

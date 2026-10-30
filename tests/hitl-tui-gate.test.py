@@ -221,5 +221,20 @@ class TestNeverAOneClickOnATrustOrSpendGate(unittest.TestCase):
         self.assertEqual(G.SEMANTIC_GATES, {"permission", "selection", "press-enter", "login"})
 
 
+class TestNoCaretKeepsTheBlockedCard(unittest.TestCase):
+    """Without a caret keys_for can never answer, so the card must not offer a button."""
+
+    def test_options_without_a_caret_get_no_buttons(self):
+        flat = PERM.replace("  ❯ 1. Yes", "    1. Yes")
+        r = req("permission", flat)
+        self.assertEqual(r.kind, G.FALLBACK_KIND)
+        self.assertEqual([a.id for a in r.actions], ["open_terminal"])
+        self.assertEqual(r.message, FALLBACK)
+
+    def test_a_dashed_rule_is_frame_not_question(self):
+        dashed = "  " + "╌" * 40 + "\n  Do you want to proceed?\n  ❯ 1. Yes\n    2. No"
+        self.assertEqual(G.question(dashed, "d"), "Do you want to proceed?")
+
+
 if __name__ == "__main__":
     unittest.main()
