@@ -285,6 +285,28 @@ class MediaTests(EnvCase):
         self.assertTrue(res["ok"])
         sent = json.loads(cap["data"])
         self.assertEqual(base64.b64decode(sent["content_b64"]), b"IMG")
+        self.assertNotIn("thread_root", sent)   # no flag -> main timeline, as before
+
+    def test_send_forwards_thread_root(self):
+        os.environ["RELAY_URL"] = "https://r"
+        cap = {}
+
+        def fake(method, url, headers=None, data=None):
+            cap["data"] = data
+            return 200, b"{}", {}
+
+        with mock.patch.object(md, "http_request", side_effect=fake):
+            res = room_ops._main(["send", ROOM, self.f, "--agent", HS, "--thread-root", EV])
+        self.assertEqual(res, 0)
+        self.assertEqual(json.loads(cap["data"])["thread_root"], EV)
+
+    def test_send_refuses_a_malformed_thread_root_before_any_network_call(self):
+        os.environ["RELAY_URL"] = "https://r"
+        with mock.patch.object(md, "http_request",
+                               side_effect=AssertionError("posted unthreaded")):
+            res = md.send_media(ROOM, self.f, HS, gate=None, thread_root="abc")
+        self.assertFalse(res["ok"])
+        self.assertIn("thread_root must be a Matrix event id", res["reason"])
 
 
 # ----- react ----- #

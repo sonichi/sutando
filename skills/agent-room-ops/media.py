@@ -16,6 +16,7 @@ import tempfile
 
 from _gateway import (gate_allows, load_gate, gateway, http_request, degrade_reason,
                     quote, HTTPError, URLError)
+from relations import RelationError, relation_fields
 
 MAX_BYTES = 25 * 1024 * 1024
 
@@ -98,11 +99,20 @@ def fetch_media(ref, agent_mxid=None, room_id=None, *, gate=None, dest_dir=None)
     return _result(True, path=out, ref=ref, room_id=room_id, bytes_=len(body))
 
 
-def send_media(room_id, path, agent_mxid=None, *, gate=None, caption=None):
-    """Upload a local file via the gateway, which posts it as the agent."""
+def send_media(room_id, path, agent_mxid=None, *, gate=None, caption=None, thread_root=None):
+    """Upload a local file via the gateway, which posts it as the agent.
+
+    `thread_root` posts it in that message's thread (rel_type m.thread, built by
+    the gateway) instead of the main timeline; see relations.relation_fields.
+    """
     agent_mxid = agent_mxid or os.environ.get("AGENT_MXID")
     if not room_id:
         return _result(False, reason="no room_id given")
+    # Before the gate: a bad id is the caller's typo, and an unthreaded post would be the wrong place.
+    try:
+        rel = relation_fields(thread_root=thread_root)
+    except RelationError as e:
+        return _result(False, room_id=room_id, reason=str(e))
     # Gate FIRST — cheapest deny; don't stat/read files for an unauthorized agent.
     gate = load_gate() if gate is None else gate
     if not gate_allows(agent_mxid, room_id, gate):
@@ -129,7 +139,7 @@ def send_media(room_id, path, agent_mxid=None, *, gate=None, caption=None):
     headers = {**headers, "Content-Type": "application/json"}
     payload = json.dumps({"filename": _safe_name(os.path.basename(path)),
                           "content_b64": base64.b64encode(content).decode("ascii"),
-                          "caption": caption}).encode()
+                          "caption": caption, **rel}).encode()
     url = f"{base}/v1/rooms/{quote(room_id)}/media"
     try:
         http_request("POST", url, headers, data=payload)
