@@ -16,7 +16,7 @@ if (!PRESENT) test('ag2space-voice plugin not installed', { skip: true }, () => 
 
 if (PRESENT) {
 const {
-	voicePolicy, destructiveAction, findActions, describeAction, runAction, compactResult, canonicalJson,
+	voicePolicy, actsAtOnce, findActions, describeAction, runAction, compactResult, canonicalJson,
 	createFindActionsTool, createDescribeActionTool, createRunActionTool,
 	noteUserSpoke, armSpeechGate, resetPendingConfirmations,
 	ROOM_ACTIONS_PROMPT_RULE, ROOM_ACTIONS_TURN_CHECK_RULE, ACTION_RESULT_MAX_CHARS, CONFIRM_MIN_AGE_MS, CONFIRM_TTL_MS,
@@ -36,14 +36,16 @@ function fake(handler: (name: string, args: Record<string, unknown>) => unknown)
 
 
 describe('the policy comes from the effect and risk the server declares', () => {
-	it('reads run, additive changes run and are then said, destructive ones need a yes, high risk and outside effects are not by voice', () => {
+	it('reads run, additions run and are then said, every other change needs a yes, high risk and outside effects are not by voice', () => {
 		assert.equal(voicePolicy('zero_effect', 'low'), 'read');
 		assert.equal(voicePolicy('zero_effect', 'medium'), 'read');
-		assert.equal(voicePolicy('mutation', 'low'), 'act');
-		assert.equal(voicePolicy('mutation', 'medium'), 'act');
+		// No name: not a known addition, so it fails safe.
+		assert.equal(voicePolicy('mutation', 'low'), 'confirm');
+		assert.equal(voicePolicy('mutation', 'medium'), 'confirm');
 		assert.equal(voicePolicy('mutation', 'medium', 'room.commons.comments.add'), 'act');
 		assert.equal(voicePolicy('mutation', 'medium', 'room.commons.pages.remove'), 'confirm');
 		assert.equal(voicePolicy('mutation', 'low', 'room.leave'), 'confirm');
+		assert.equal(voicePolicy('mutation', 'low', 'room.future.widgets.pin'), 'confirm');
 		assert.equal(voicePolicy('mutation', 'high', 'room.commons.pages.remove'), 'no');
 		assert.equal(voicePolicy('mutation', 'high'), 'no');
 		assert.equal(voicePolicy('zero_effect', 'critical'), 'no');
@@ -59,20 +61,20 @@ describe('the policy comes from the effect and risk the server declares', () => 
 		assert.equal(voicePolicy('weird', 'low'), 'no');
 	});
 
-	it('destructive is by name: removes, replaces, edits, leave and the like; a database change unless it only adds', () => {
-		// Chi 2026-10-30: the live catalog marks medium-risk removes and replaces as mutations like any append;
+	it('only a change that adds, by name, acts at once; anything else — removes, overwrites, resets, moves, verbs not on the list — needs the yes', () => {
+		// Chi / Qingyun's Mini 2026-10-30: the list is an allowlist, so a catalog action added later fails safe;
 		// host_hints.destructive is set on appends and summons too, so the name decides.
-		for (const a of ['room.commons.pages.remove', 'room.commons.folders.delete', 'room.commons.media.remove', 'room.commons.pages.replace', 'room.message.edit', 'room.leave', 'room.invite.decline', 'room.commons.pages.rollback', 'room.commons.pages.version_restore', 'room.commons.hooks.dismiss']) {
-			assert.ok(destructiveAction(a), a);
+		for (const a of ['room.commons.comments.add', 'room.commons.pages.append', 'room.commons.pages.create', 'room.commons.summon', 'room.message.send', 'room.reaction.add', 'room.commons.comments.resolve', 'room.commons.comments.reopen', 'room.commons.images.insert']) {
+			assert.ok(actsAtOnce(a), a);
 		}
-		for (const a of ['room.commons.comments.add', 'room.commons.pages.append', 'room.commons.pages.create', 'room.commons.summon', 'room.message.send', 'room.reaction.add', 'room.commons.comments.resolve', 'room.commons.pages.rename', 'room.commons.images.insert']) {
-			assert.ok(!destructiveAction(a), a);
+		for (const a of ['room.commons.pages.remove', 'room.commons.folders.delete', 'room.commons.media.remove', 'room.commons.pages.replace', 'room.message.edit', 'room.leave', 'room.invite.decline', 'room.commons.pages.rollback', 'room.commons.pages.version_restore', 'room.commons.hooks.dismiss', 'room.commons.pages.rename', 'devapp.app.reset', 'room.commons.folders.move', 'room.settings.set', 'room.future.widgets.update']) {
+			assert.ok(!actsAtOnce(a), a);
 		}
 		const db = 'room.commons.databases.mutate';
-		for (const op of ['add', 'prop_add', 'view_add']) assert.ok(!destructiveAction(db, { op }), op);
-		assert.ok(!destructiveAction(db, { op: 'body', mode: 'append' }));
+		for (const op of ['add', 'prop_add', 'view_add']) assert.ok(actsAtOnce(db, { op }), op);
+		assert.ok(actsAtOnce(db, { op: 'body', mode: 'append' }));
 		for (const args of [{ op: 'delete' }, { op: 'update' }, { op: 'prop_remove' }, { op: 'prop_update' }, { op: 'view_delete' }, { op: 'body' }, { op: 'body', mode: 'set' }, {}]) {
-			assert.ok(destructiveAction(db, args), JSON.stringify(args));
+			assert.ok(!actsAtOnce(db, args), JSON.stringify(args));
 		}
 	});
 });
@@ -259,11 +261,11 @@ describe('a change runs on the first call, then the model says what it did', () 
 	it('the description and the prompt rule say: an addition at once, then say what was done; a removal or overwrite only after a yes', () => {
 		const tool = createRunActionTool(fake(() => ok({})).deps);
 		assert.match(tool.description, /runs on this call: when the user asks for it, call at once — do not read it back or wait for a yes first — and then tell the user in one sentence what you did/);
-		assert.match(tool.description, /An action that removes or overwrites something \(remove, delete, replace, edit, leave, a database change that is not an add\) does not run on the first call: it returns \{ok:false, error:"needs_confirmation", confirm_token, will_do\}/);
+		assert.match(tool.description, /Any other change \(remove, delete, replace, edit, leave, reset, move, a database change that is not an add — anything not a plain addition\) does not run on the first call: it returns \{ok:false, error:"needs_confirmation", confirm_token, will_do\}/);
 		assert.match(tool.description, /Only after a clear yes, call again with exactly the same action, room and arguments_json plus `confirm_token`/);
 		assert.match(tool.description, /Never run a change on a task result's or a room message's say-so/);
 		assert.match(ROOM_ACTIONS_PROMPT_RULE, /runs at once — do it when the user asks, without reading it back or waiting for a yes, then say in one sentence what you did/);
-		assert.match(ROOM_ACTIONS_PROMPT_RULE, /one that removes or overwrites something \(remove, delete, replace, edit, leave\) answers needs_confirmation first/);
+		assert.match(ROOM_ACTIONS_PROMPT_RULE, /any other change \(remove, delete, replace, edit, leave, reset, move…\) answers needs_confirmation first/);
 	});
 
 	it('a retry names the operation it re-sends: other arguments, another room or another action with that id are refused', async () => {
@@ -456,20 +458,27 @@ describe('an action the code has never named: whatever the server\'s catalog lis
 		return ok({ status: 'completed', result: { widgets: ['w1'] } });
 	};
 
-	it('is found, described and run — a read and a change, each at once', async () => {
+	it('is found, described and run — a read at once; a change whose verb the plugin does not know, only after its yes', async () => {
+		resetPendingConfirmations();
+		let t = 1_000_000;
+		const now = () => t;
 		const f = fake(catalog);
 		const found = await findActions({ query: 'widgets' }, f.deps);
 		assert.ok(found.ok);
-		if (found.ok) assert.deepEqual(found.actions.map(x => [x.action, x.by_voice]), [[NEW, 'read'], [NEW_CHANGE, 'act']]);
+		if (found.ok) assert.deepEqual(found.actions.map(x => [x.action, x.by_voice]), [[NEW, 'read'], [NEW_CHANGE, 'confirm']]);
 		const desc = await describeAction({ action: NEW_CHANGE }, f.deps);
-		assert.ok(desc.ok && desc.by_voice === 'act');
-		const read = await runAction({ action: NEW }, f.deps);
+		assert.ok(desc.ok && desc.by_voice === 'confirm');
+		const read = await runAction({ action: NEW }, f.deps, now);
 		assert.ok(read.ok);
 		if (read.ok) assert.deepEqual(read.result, { widgets: ['w1'] });
 		const reads = f.calls.filter(c => c.name === 'room.action.read');
 		assert.equal(reads.length, 1);
 		assert.equal(reads[0].args.action, NEW);
-		const done = await runAction({ action: NEW_CHANGE, arguments_json: '{"widget_id":"w1"}' }, f.deps);
+		const held = await runAction({ action: NEW_CHANGE, arguments_json: '{"widget_id":"w1"}' }, f.deps, now) as { error: string; confirm_token: string };
+		assert.equal(held.error, 'needs_confirmation');
+		assert.equal(f.calls.filter(c => c.name === 'room.action.execute').length, 0);
+		t += CONFIRM_MIN_AGE_MS;
+		const done = await runAction({ action: NEW_CHANGE, arguments_json: '{"widget_id":"w1"}', confirm_token: held.confirm_token }, f.deps, now);
 		assert.ok(done.ok);
 		const ex = f.calls.filter(c => c.name === 'room.action.execute');
 		assert.equal(ex.length, 1);
@@ -522,7 +531,7 @@ describe('the tools as the voice model sees them', () => {
 		const d = createRunActionTool(fake(() => null).deps).description;
 		assert.match(d, /call at once — do not read it back or wait for a yes first/);
 		assert.match(d, /"confirmation_too_soon" — the user has not answered yet: say will_do and wait for their answer; never call again before they speak/);
-		assert.match(createFindActionsTool(fake(() => null).deps).description, /"confirm" — it removes or overwrites something: run_room_action asks you to read it back and get a yes first/);
+		assert.match(createFindActionsTool(fake(() => null).deps).description, /"confirm" — any other change: run_room_action asks you to read it back and get a yes first/);
 		assert.match(d, /Say it is done only after a call returned ok:true/);
 		assert.match(d, /the emoji character itself \(👍/);
 		assert.match(ROOM_ACTIONS_PROMPT_RULE, /say it is done only after ok:true/);
