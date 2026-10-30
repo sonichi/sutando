@@ -1425,7 +1425,8 @@ def _launch_file_value(name: str) -> str:
         from util_paths import claude_home_path
         path = resolve_launch_key_env(claude_home_path("channels"), "ag2space")
         return (token_from_env_file(name, path) or "").strip() if path else ""
-    except Exception:  # noqa: BLE001 - no channel home or an unreadable file is simply no value
+    except Exception as e:  # noqa: BLE001 - no channel home or an unreadable file is simply no value
+        logging.getLogger(__name__).debug("connections: launch key file unreadable (%s)", type(e).__name__)
         return ""
 
 
@@ -1441,7 +1442,9 @@ def _channel_dir_value(channel_dir: Optional[str], name: str) -> str:
         files = [device_env(source)] + [c for c in candidates(home / source)
                                         if channel_env_is_contained(c, home, source)]
         return next((v.strip() for v in (token_from_env_file(name, f) for f in files if f) if v and v.strip()), "")
-    except Exception:  # noqa: BLE001 - no channel home or an unreadable file is simply no value
+    except Exception as e:  # noqa: BLE001 - no channel home or an unreadable file is simply no value
+        logging.getLogger(__name__).debug("connections: channel env %s unreadable (%s)",
+                                          channel_dir or "<primary>", type(e).__name__)
         return ""
 
 

@@ -190,9 +190,13 @@ class TestRoomAgentMxid(Base):
 
     def test_one_connection_keeps_the_callers_resolution_and_an_unreadable_home_names_none(self):
         self.three.channel_file("dev.s.space", "AGENT_MXID=@kai.agent:dev.s.space\n")
-        with mock.patch("util_paths.claude_home_path", side_effect=OSError("no home")):
+        with mock.patch("util_paths.claude_home_path", side_effect=OSError("no home")), \
+                self.assertLogs("connections", "DEBUG") as logs:
             self.assertEqual(connections._launch_file_value("X"), "")
             self.assertEqual(connections._channel_dir_value("dev-s-space", "AGENT_MXID"), "")
+        self.assertEqual([r.getMessage() for r in logs.records],
+                         ["connections: launch key file unreadable (OSError)",
+                          "connections: channel env dev-s-space unreadable (OSError)"])
         connections.record_path(self.three.workspace).write_text(json.dumps(
             {"schema_version": connections.SCHEMA_VERSION, "connections": []}))
         self.assertIsNone(channel_credentials.room_agent_mxid(ROOMS["dev.s.space"]))
