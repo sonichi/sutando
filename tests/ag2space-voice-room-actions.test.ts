@@ -251,6 +251,8 @@ describe('a change runs on the first call, then the model says what it did', () 
 		assert.equal((f.calls.find(c => c.name === 'room.action.execute')!.args as { arguments: { invitee: string } }).arguments.invitee, '@chi:ag2.space');
 		assert.deepEqual(await runAction({ action: 'room.commons.summon', arguments_json: '{"kind":"board"}', room: '!r:ag2.space' }, f.deps), { ok: false, error: 'no_invitee' });
 		assert.match(ROOM_ACTIONS_PROMPT_RULE, /room\.commons\.summon/);
+		// Phone 2026-10-30 22:12Z: "summon me to Commons bug 复现步骤" was sent with kind markdown, so the phone opened the Doc list, not the page.
+		assert.match(ROOM_ACTIONS_PROMPT_RULE, /for a named document, kind is that page's own kind from search_commons \(markdown-a1b2c3d4\), never the bare surface \(markdown\)/);
 	});
 
 	it('an approval the room requires is said', async () => {
