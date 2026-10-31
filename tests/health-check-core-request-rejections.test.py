@@ -206,7 +206,7 @@ class TestCoreRequestRejections(unittest.TestCase):
         self.assertIn("counting model=claude-opus-5", c["detail"], c)
 
     def test_a_settings_alias_counts_its_own_wire_model_rejections(self):
-        """#5177: settings.json holds the alias (`opus`) while the proxy records
+        """settings.json holds the alias (`opus`) while the proxy records
         the wire id (`claude-opus-5`); a literal `==` made `mine` empty forever,
         so 20 of this core's own 429s reported ok."""
         self._write([self._rej(60 * k, model="claude-opus-5") for k in range(1, 6)])
