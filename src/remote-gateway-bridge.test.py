@@ -914,6 +914,39 @@ def main() -> int:
     hb = STATE["heartbeats"][-1] if STATE["heartbeats"] else {}
     check(hb.get("status") == "running" and hb.get("step") == "opening PR #20",
           "heartbeat carries core-status status+step when core-status.json present")
+    metadata_path = rtc.WS / "state" / "core-runtime.json"
+    metadata_path.write_text(json.dumps({"runtime": "codex", "model": "gpt-5-codex"}))
+    rtc._post_heartbeat(set(), force=True)
+    check(STATE["heartbeats"][-1].get("core") == "codex"
+          and STATE["heartbeats"][-1].get("model") == "gpt-5-codex",
+          "heartbeat forwards launcher core and model metadata")
+    for raw, public in (
+            ("opus[1m]", "opus[1m]"), ("claude-opus-4-1-20250805", "claude-opus-4-1-20250805"),
+            ("arn:aws:bedrock:us-east-1:123456789012:inference-profile/us.anthropic.claude-opus-4",
+             "claude"),
+            ("us.anthropic.claude-sonnet-4-20250514-v1:0", "claude"),
+            ("projects/acme-prod-4471/locations/us-east5/publishers/anthropic/models/claude-opus-4",
+             "claude"),
+            ("acme-internal-llm-proxy", None), ("x" * 80, None), (7, None)):
+        check(rtc._public_model(raw) == public, f"model {raw!r} is published as {public!r}")
+    switch_path = rtc.WS / "state" / "model-switch.json"
+    metadata_path.write_text(json.dumps({"runtime": "claude", "model": "opus",
+                                         "started_at": 1_800_000_000.0}))
+    switch_path.write_text(json.dumps({"model": "sonnet", "accepted": True,
+                                       "ts": "2027-01-15T08:00:00Z"}))
+    check(rtc._read_core_metadata().get("model") == "sonnet",
+          "an accepted switch after launch replaces the launch model")
+    switch_path.write_text(json.dumps({"model": "sonnet", "accepted": True,
+                                       "ts": "2026-01-01T00:00:00Z"}))
+    check(rtc._read_core_metadata().get("model") == "opus",
+          "a switch recorded before this launch is ignored")
+    switch_path.write_text('{"model": "sonnet", "accepted": true, "ts": 5}')
+    check(rtc._read_core_metadata().get("model") == "opus",
+          "a malformed switch record falls back to the launch model")
+    switch_path.unlink()
+    metadata_path.write_text('[]')
+    check(rtc._read_core_metadata() == {}, "malformed core metadata is ignored")
+    metadata_path.unlink()
     # An idle status drops the (stale) step so the sweep reads 'available'.
     (rtc.WS / "state" / "core-status.json").write_text(
         json.dumps({"status": "idle", "ts": time.time()}))

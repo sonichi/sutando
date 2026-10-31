@@ -381,6 +381,8 @@ does not match the pane's process leaves the record unchanged and says so on
 stderr; the Codex launcher also appends to `session-starts.log` only for a
 confirmed new session. A failed launch leaves the last confirmed observation intact;
 `started_at` is the tmux session creation time, not the time of an attach.
+`model` is the configured launch model (`SUTANDO_CORE_MODEL`, then the runtime's
+settings), or null when neither names one.
 The file is a launch observation, not a current liveness or task-delivery proof.
 Check the session stamp and actual process, then capture a real received-task →
 delivered-reply round trip after an authorized outside-core restart.

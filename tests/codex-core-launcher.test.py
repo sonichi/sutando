@@ -707,6 +707,16 @@ if [ "${1:-}" = print ]; then [ -f "$LAUNCHCTL_STATE" ]; else exit 0; fi
         self.assertEqual(runtime["session"], "sutando-core")
         self.assertEqual(len((state / "session-starts.log").read_text().splitlines()), 1)
         self.assertIn("new-session -d -s sutando-core", self._tmux_calls())
+        self.assertEqual(runtime["runtime"], "codex")
+
+    def test_the_runtime_record_carries_the_configured_launch_model(self):
+        self._write_exe("tmux", SESSION_UP_AFTER_CREATE_TMUX)
+        self.fake_core_pane("codex")
+        result = self.run_launcher(env_extra={"SUTANDO_CORE_MODEL": "gpt-5-codex"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        runtime = json.loads(
+            (self.root / "workspace" / "state" / "core-runtime.json").read_text())
+        self.assertEqual((runtime["runtime"], runtime["model"]), ("codex", "gpt-5-codex"))
 
     def _launch_in_a_git_checkout(self, python):
         subprocess.run(["git", "init", "-q", str(self.root)], check=True)

@@ -326,6 +326,16 @@ keeps the declaration to decide whether a new call may use the voice relay; the
 poll and every result carry the contract again, because a Mac can be downgraded
 after the declaration was read.
 
+`core` and `model` are optional display metadata from `state/core-runtime.json`,
+whose one writer is `src/core_runtime_record.py`, run by both CLI launchers once the
+session is confirmed. `model` is the model of an accepted switch recorded in
+`state/model-switch.json` after that session's `started_at`, else the configured launch
+model (`SUTANDO_CORE_MODEL`, then the runtime's own settings; null when unknown). Only a
+plain model id or CLI alias is sent; a provider-qualified id (a Bedrock ARN or
+inference profile, a Vertex resource path, a proxy name) is reduced to its vendor
+family (`claude`, `gpt`, `codex`, `gemini`) or omitted, because it can name an
+account, project or host.
+
 `status` and `step` come from the core's
 `state/core-status.json`, with the health-check overlay described under
 [Independent health-check reporting](#independent-health-check-reporting). The

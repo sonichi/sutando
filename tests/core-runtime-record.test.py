@@ -54,6 +54,37 @@ class WriterTests(unittest.TestCase):
                 self.assertIn(f"core runtime record: {failure}", err.getvalue())
             self.assertEqual(path.read_bytes(), before)
 
+    def test_configured_model_prefers_the_override_then_runtime_settings(self):
+        env = {"CLAUDE_CONFIG_DIR": str(self.ws), "CODEX_HOME": str(self.ws),
+               "SUTANDO_CORE_MODEL": ""}
+        with mock.patch.dict(os.environ, env):
+            self.assertIsNone(self.writer.configured_model("claude"))
+            (self.ws / "settings.json").write_text('{"model": " opus "}')
+            self.assertEqual(self.writer.configured_model("claude"), "opus")
+            (self.ws / "settings.json").write_text("[]")
+            self.assertIsNone(self.writer.configured_model("claude"))
+            (self.ws / "config.toml").write_text('model = "test-codex-model"\n')
+            want = "test-codex-model" if sys.version_info >= (3, 11) else None
+            self.assertEqual(self.writer.configured_model("codex"), want)
+            os.environ["SUTANDO_CORE_MODEL"] = "override"
+            self.assertEqual(self.writer.configured_model("claude"), "override")
+
+    def test_cli_records_the_configured_model_with_the_confirmed_runtime(self):
+        argv = ["core-runtime-record", str(self.ws), "codex", "sutando-core", "123",
+                "--socket", str(self.ws / "t.sock")]
+        path = self.ws / "state/core-runtime.json"
+        for model, want in (("gpt-5-codex", "gpt-5-codex"), ("bad\nmodel", None),
+                            ("x" * 201, None), ("", None)):
+            with self.subTest(model=model), \
+                    mock.patch.dict(os.environ, {"SUTANDO_CORE_MODEL": model,
+                                                 "CODEX_HOME": str(self.ws / "none")}), \
+                    mock.patch.object(sys, "argv", argv), \
+                    mock.patch.object(self.writer, "pane_runtimes", return_value={"codex"}):
+                self.writer.main()
+                row = json.loads(path.read_text())
+                self.assertEqual((row["runtime"], row["model"], row["started_at"]),
+                                 ("codex", want, 123))
+
     def test_cli_reports_a_pane_it_cannot_inspect(self):
         argv = ["core-runtime-record", str(self.ws), "claude", "sutando-core", "123",
                 "--socket", str(self.ws / "t.sock")]
@@ -112,7 +143,8 @@ class WriterTests(unittest.TestCase):
         path = self.writer.publish(self.ws, "claude", 'a"b', 123)
         before = path.read_bytes()
         for args in (("other", "s", 123), ("codex", "s\n", 123),
-                     ("codex", "s", float("nan")), ("codex", "s", -1)):
+                     ("codex", "s", float("nan")), ("codex", "s", -1),
+                     ("codex", "s", 123, "m\x7f"), ("codex", "s", 123, 7)):
             with self.assertRaises(ValueError):
                 self.writer.publish(self.ws, *args)
             self.assertEqual(path.read_bytes(), before)
@@ -132,7 +164,7 @@ class WriterTests(unittest.TestCase):
             while not done.is_set():
                 try:
                     row = json.loads(path.read_text())
-                    self.assertEqual(set(row), {"runtime", "session", "started_at"})
+                    self.assertEqual(set(row), {"runtime", "model", "session", "started_at"})
                     self.assertIn(row["runtime"], ("claude", "codex"))
                     observed.append(row)
                 except Exception as exc:
