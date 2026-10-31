@@ -238,14 +238,14 @@ class TestPickerCommandsStayWithTheController(Base):
         self.assertEqual(h.main(["--task-file", str(p), "--workspace", str(self.ws), "--probe"]), h.DECLINE)
 
     def test_the_same_room_without_the_picker_mark_still_routes(self):
-        # A task-* id: `worker-pin-1` is no id a worker's sentinel can carry (#5638).
+        # A task-* id: `worker-pin-1` is no id a worker's sentinel can carry.
         self.roster()
         f = self._picker_file(wire=False, name="task-pin-1")
         self.assertEqual(h.main(["--task-file", f, "--workspace", str(self.ws), "--probe"]), 0)
 
 
 class TestIdsNoSentinelCanCarry(Base):
-    """#5638: `voice-end-<hex>` was delivered to a bound worker, whose resolver
+    """`voice-end-<hex>` was delivered to a bound worker, whose resolver
     rejects the sentinel, while the core's holder check still read it as held."""
 
     VOICE_END = "voice-end-dd249c1dd88b8ef9a5f4c8ad"

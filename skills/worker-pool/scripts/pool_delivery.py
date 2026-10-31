@@ -85,7 +85,7 @@ def carries(task_id: str) -> bool:
 
     A sentinel that fails `parse_sentinel` is never resolved by the worker, yet
     still reads as held to every "is it delegated?" reader, so the task is
-    answered by nobody (#5638: `voice-end-<hex>`)."""
+    answered by nobody (seen with `voice-end-<hex>`)."""
     return bool(task_id) and parse_sentinel(f"{task_id}{PENDING_SUFFIX}") is not None
 
 
