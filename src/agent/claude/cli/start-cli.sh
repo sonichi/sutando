@@ -445,15 +445,18 @@ ensure_core_heartbeat() {
 
 # Core-only: a pool worker is never the subject of the Agent Shepherd monitor.
 ensure_core_monitor() {
-  local ws mon_out relay_pid_file relay_state
+  local ws mon_out mon_log relay_pid_file relay_state
   ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" || return 0
   [ -n "$ws" ] || return 0
   mon_out="$ws/state/core-supervisor.json"
+  # Per workspace: a scratch core on another socket must not truncate the production log.
+  mon_log="$ws/logs/core-input-watch.log"
+  mkdir -p "$ws/logs" 2>/dev/null || mon_log=/dev/null
   # Monitor (PR #2100): launch unless one for this exact socket+out is running.
   if [ -n "$PY" ] && ! pgrep -f "core-input-watch\.py .*--socket ${TMUX_SOCKET}( |$)" > /dev/null 2>&1; then
     "$PY" "$REPO/src/core-input-watch.py" \
       --socket "$TMUX_SOCKET" --session "$SESSION" --out "$mon_out" \
-      > /tmp/core-input-watch.log 2>&1 &
+      > "$mon_log" 2>&1 &
   fi
   # Communicator relay (PR #2101): the monitor only WRITES core-supervisor.json;
   # nothing escalated it, so a hard-blocker (blocked-human / logged-out) on a
@@ -470,7 +473,7 @@ ensure_core_monitor() {
     # backgrounded loop does not inherit/hold this script's stdout/stderr — else a
     # caller that captures start-cli.sh's output (e.g. tests/start-cli-*.test.py)
     # blocks on the pipe until this infinite loop closes it (never) and times out.
-    # Mirrors the monitor launch above, which redirects to /tmp/core-input-watch.log.
+    # Mirrors the monitor launch above, which redirects to the workspace's logs/.
     # An if-block with a simple command, not `A && ( … ) &`: the `&` on an
     # AND-list forks a wrapper subshell that keeps the caller's stdout/stderr
     # (only the inner subshell gets the redirect) and waits on this infinite
