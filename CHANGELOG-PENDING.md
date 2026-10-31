@@ -16,6 +16,7 @@ Format: `- Brief description of what changed. ([#NNN])`
 ## Fixed
 
 <!-- fix() PRs go here -->
+- task notifier: a task whose submitted prompt an API-error turn (502, overload, rate limit) lost is re-delivered — a `StopFailure` hook in the core (or a pool worker, never a guest session) records the failure against the task whose prompt started that turn, and the notifier releases the in-flight hold after a 30s→600s backoff, or at once after the next successful turn, at most 3 times per task — instead of waiting out the 1 h completion timeout. ([#5168])
 - task-orphan-check: a task's age is how long it has waited in this inbox (its `local_time:` header), not since the sender sent it, so messages held at the broker while the app was closed are answered on relaunch instead of archived as orphans. Only a `local_time:` above `task:` counts, so a body line cannot make a fresh task from an older writer look orphaned. ([#5929])
 
 ## Changed
