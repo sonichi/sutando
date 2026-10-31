@@ -741,7 +741,7 @@ def run(now_epoch: Optional[int] = None) -> list:
     # write-back. See _state_lock for the race this closes.
     held: list = []
     with _state_lock(STATE_FILE):
-        # A state file proves this runner has ticked here before (#5316).
+        # A state file proves this runner has ticked here before.
         ticked_before = STATE_FILE.exists()
         state = _load_json(STATE_FILE, {})
         for entry in crons:

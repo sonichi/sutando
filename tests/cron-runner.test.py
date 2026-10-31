@@ -453,7 +453,7 @@ def test_run_no_state_catches_up():
 
 
 def test_run_entry_added_to_a_ticking_runner_baselines_instead_of_catching_up():
-    # #5316: a new entry fired a slot from before it existed; 07:30 keeps the
+    # A new entry fired a slot from before it existed; 07:30 keeps the
     # 07:00 slot inside the lateness budget, which would otherwise drop it.
     import json
     with tempfile.TemporaryDirectory() as d:
